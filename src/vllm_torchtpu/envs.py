@@ -293,7 +293,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_INDEX_FOLD_OPT: str = ""
     TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT: int = 8
     TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT: bool = False
-    TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC: bool = False
+    TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC: bool = True
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
@@ -1914,20 +1914,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_MINIMAX_M3_INDEX_FOLD_OPT", ""
     ),
     # MiniMax M3 head-parallel MSA prefill page exchange
-    # (`msa_dcp_heads.exchange_head_pages`): pages whose copies a rank keeps
-    # in flight (default 8), and DIRECT=1 copies every page straight to every
-    # replica of its KV head instead of forwarding inside the replica group.
+    # (`msa_dcp_heads.exchange_head_pages`): DIRECT=1 copies every page straight
+    # to every replica of its KV head instead of forwarding inside the replica
+    # group; IN_FLIGHT is retained as a legacy no-op (copies issue unthrottled).
     "TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT", 8
     ),
     "TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT": env_bool(
         "TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT", default=False
     ),
-    # ASYNC=1: the first round's page copies start ahead of the decode rows'
-    # DCP attention and the selection merge and are retired after them
-    # (a start / wait pair of kernels), so the exchange overlaps that work.
+    # ASYNC=1 (default): the first round's page copies start ahead of the
+    # decode rows' DCP attention and the selection merge and are retired after
+    # them (a start / wait pair of kernels), overlapping that work.
     "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC": env_bool(
-        "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC", default=False
+        "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC", default=True
     ),
     # MiniMax M3 MSA prefill page cache table (`msa_attention_lse._page_cache`):
     # how its sorts run. Empty keeps three stable sorts (two of two operands);

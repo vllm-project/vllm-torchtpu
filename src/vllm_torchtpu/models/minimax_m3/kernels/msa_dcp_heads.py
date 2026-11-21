@@ -294,6 +294,166 @@ def live_part(live: jax.Array, replica, replicas: int, part: int) -> jax.Array:
     return jnp.clip((live - replica + replicas - 1) // replicas, 0, part)
 
 
+def _wait_pages(flat_ref, count: jax.Array, max_pages: int, sem) -> None:
+    """Retire ``count`` equal-sized page transfers on ``sem`` using
+    ``O(log2(max_pages))`` predicated power-of-two slice waits instead of a
+    one-page-per-iteration scalar loop."""
+    bit = 1
+    while bit <= max_pages:
+        b = bit
+
+        def wait_slice(b=b):
+            sl = flat_ref.at[pl.ds(0, b)]
+            pltpu.make_async_copy(sl, sl, sem).wait()
+
+        pl.when((count & b) != 0)(wait_slice)
+        bit <<= 1
+
+
+def _start_stage1_copies(
+    pages_ref,
+    kv_ref,
+    sc_ref,
+    kv_out,
+    sc_out,
+    counts: list[jax.Array],
+    me: jax.Array,
+    *,
+    axis: str,
+    dcp: int,
+    replicas: int,
+    part: int,
+    head_width: int,
+    direct: bool,
+    send_sem,
+    recv_sem,
+    local_sem,
+) -> None:
+    """Issue Stage-1 page (and optional scale-page) copies for every part:
+    local HBM DMA when ``d == me``, remote ICI DMA otherwise."""
+    heads = dcp // replicas
+    for j in range(replicas):
+
+        def body(i, carry, j=j):
+            p = pages_ref[j * part + i]
+            slot = (j * dcp + me) * part + i
+            kv_dst = kv_out.at[slot]
+            sc_src = sc_ref.at[p] if sc_ref is not None else None
+            sc_dst = sc_out.at[slot] if sc_out is not None else None
+            targets = range(dcp) if direct else range(heads)
+            for t in targets:
+                head = t // replicas if direct else t
+                d = t if direct else head * replicas + j
+                cols = pl.ds(head * head_width, head_width)
+                kv_src = kv_ref.at[p, :, :, cols]
+
+                def copy_local(
+                    kv_src=kv_src, kv_dst=kv_dst, sc_src=sc_src, sc_dst=sc_dst
+                ):
+                    pltpu.make_async_copy(kv_src, kv_dst, local_sem).start()
+                    if sc_src is not None and sc_dst is not None:
+                        pltpu.make_async_copy(sc_src, sc_dst, local_sem).start()
+
+                def copy_remote(
+                    d=d, kv_src=kv_src, kv_dst=kv_dst, sc_src=sc_src, sc_dst=sc_dst
+                ):
+                    pltpu.make_async_remote_copy(
+                        kv_src,
+                        kv_dst,
+                        send_sem,
+                        recv_sem,
+                        device_id={axis: d},
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+                    if sc_src is not None and sc_dst is not None:
+                        pltpu.make_async_remote_copy(
+                            sc_src,
+                            sc_dst,
+                            send_sem,
+                            recv_sem,
+                            device_id={axis: d},
+                            device_id_type=pl.DeviceIdType.MESH,
+                        ).start()
+
+                pl.when(me == d)(copy_local)
+                pl.when(me != d)(copy_remote)
+            return carry
+
+        jax.lax.fori_loop(0, counts[j], body, 0)
+
+
+def _retire_and_forward_pages(
+    kv_out,
+    sc_out,
+    counts: list[jax.Array],
+    me: jax.Array,
+    *,
+    axis: str,
+    dcp: int,
+    replicas: int,
+    part: int,
+    direct: bool,
+    send_sem,
+    recv_sem,
+    fwd_sem,
+    local_sem,
+) -> None:
+    """Retire Stage-1 copies and, when ``not direct`` and ``replicas > 1``,
+    forward this replica's received part to sibling replicas of the same head."""
+    max_pages = replicas * dcp * part
+    heads = dcp // replicas
+    replica = me % replicas
+    mine = jnp.where(replica == 0, counts[0], counts[-1])
+    for j in range(1, replicas - 1):
+        mine = jnp.where(replica == j, counts[j], mine)
+    total_live = sum(counts)
+
+    def wait_both(n_pages: jax.Array, sem) -> None:
+        _wait_pages(kv_out, n_pages, max_pages, sem)
+        if sc_out is not None:
+            _wait_pages(sc_out, n_pages, max_pages, sem)
+
+    local_n = total_live if direct else mine
+    remote_sends = total_live * (dcp - 1) if direct else total_live * heads - mine
+    remote_recvs = (total_live if direct else mine) * (dcp - 1)
+    wait_both(local_n, local_sem)
+    wait_both(remote_sends, send_sem)
+    wait_both(remote_recvs, recv_sem)
+    if direct or replicas <= 1:
+        return
+
+    def fwd_body(i, carry):
+        base = replica * dcp * part
+        for k in range(1, replicas):
+            peer = me - replica + (replica + k) % replicas
+            for src in range(dcp):
+                slot = base + src * part + i
+                kp = kv_out.at[slot]
+                pltpu.make_async_remote_copy(
+                    kp,
+                    kp,
+                    send_sem,
+                    fwd_sem,
+                    device_id={axis: peer},
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+                if sc_out is not None:
+                    sp = sc_out.at[slot]
+                    pltpu.make_async_remote_copy(
+                        sp,
+                        sp,
+                        send_sem,
+                        fwd_sem,
+                        device_id={axis: peer},
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+        return carry
+
+    jax.lax.fori_loop(0, mine, fwd_body, 0)
+    wait_both(mine * (replicas - 1) * dcp, send_sem)
+    wait_both((total_live - mine) * dcp, fwd_sem)
+
+
 def exchange_head_pages(
     kv_cache: jax.Array,
     pages: jax.Array,
@@ -307,48 +467,34 @@ def exchange_head_pages(
     interpret: bool = False,
     in_flight: int = _EXCHANGE_PAGES_IN_FLIGHT,
     direct: bool = False,
-) -> jax.Array:
+    scale_cache: jax.Array | None = None,
+):
     """Inside a ``shard_map`` over `axis`: every rank's pages of the KV head
     this rank (``rank``, ``int32[1]``) owns, ``[replicas, dcp, L / replicas,
-    R, P, head_width]``: ``[j, src, i]`` is rank ``src``'s page ``pages[j *
-    L / replicas + i]``, for the `live_part` of ``live`` (``int32[1]``)
-    pages of each part ``j``; the others are left unset.
+    R, P, head_width]`` (and, when `scale_cache` is passed, the matching
+    ``[replicas, dcp, L / replicas, SCALE_ROWS, 128]`` scale pages).
 
-    Rank ``src`` copies each live page's head-``h`` columns straight from its
-    cache into rank ``h * replicas + j``'s output by remote DMA (one copy
-    per page and destination, all destinations in flight at once), and
-    every rank forwards what it received to the other replicas of its head
-    (one chip's cores at c64). A static XLA gather, all-to-all and
-    all-gather moved the whole buffer whatever the context, relaid the pages
-    out around each collective and ran the all-to-all at one link's
-    bandwidth.
-
-    `in_flight`: pages whose copies a rank keeps in flight. `direct`: rank
-    ``src`` copies every part straight to every replica of the head (no
-    forwarding stage, ``replicas`` times the source's sends)."""
+    Self-targeted Stage-1 copies (`d == me`) run as local HBM DMAs rather than
+    ICI loopback transfers, and semaphore retirement uses ``O(log2 N)`` binary
+    slice waits."""
+    del in_flight  # copies issue unthrottled and retire via binary slice waits
     _, rows, packing, _ = kv_cache.shape
     num_pages = pages.shape[0]
     part = num_pages // replicas
-    # Slots past the live pages stay unset: harmless while no key reaches
-    # them and while any byte pattern of the 4-bit cache dequantizes finite.
+    max_pages = replicas * dcp * part
     if kv_cache.dtype != jnp.uint8:
         raise ValueError(f"4-bit (uint8) caches only, got {kv_cache.dtype}")
+    with_scales = scale_cache is not None
 
-    def remote(src, dst, send_sem, recv_sem, device):
-        return pltpu.make_async_remote_copy(
-            src,
-            dst,
-            send_sem,
-            recv_sem,
-            device_id={axis: device},
-            device_id_type=pl.DeviceIdType.MESH,
-        )
-
-    def kernel(
-        pages_ref, live_ref, rank_ref, kv_ref, out_ref, send_sem, recv_sem, fwd_sem
-    ):
+    def kernel(pages_ref, live_ref, rank_ref, *refs):
+        if with_scales:
+            kv_ref, sc_ref, kv_out, sc_out = refs[:4]
+            send_sem, recv_sem, fwd_sem, local_sem = refs[4:]
+        else:
+            kv_ref, kv_out = refs[:2]
+            sc_ref = sc_out = None
+            send_sem, recv_sem, fwd_sem, local_sem = refs[2:]
         me = rank_ref[0]
-        replica = me % replicas
         counts = [live_part(live_ref[0], j, replicas, part) for j in range(replicas)]
         barrier = pltpu.get_barrier_semaphore()
         for d in range(dcp):
@@ -358,88 +504,87 @@ def exchange_head_pages(
                 device_id={axis: jnp.int32(d)},
                 device_id_type=pl.DeviceIdType.MESH,
             )
-        # Every rank has entered the call: its output buffer is live.
         pl.semaphore_wait(barrier, dcp)
+        _start_stage1_copies(
+            pages_ref,
+            kv_ref,
+            sc_ref,
+            kv_out,
+            sc_out,
+            counts,
+            me,
+            axis=axis,
+            dcp=dcp,
+            replicas=replicas,
+            part=part,
+            head_width=head_width,
+            direct=direct,
+            send_sem=send_sem,
+            recv_sem=recv_sem,
+            local_sem=local_sem,
+        )
+        _retire_and_forward_pages(
+            kv_out,
+            sc_out,
+            counts,
+            me,
+            axis=axis,
+            dcp=dcp,
+            replicas=replicas,
+            part=part,
+            direct=direct,
+            send_sem=send_sem,
+            recv_sem=recv_sem,
+            fwd_sem=fwd_sem,
+            local_sem=local_sem,
+        )
 
-        def sends(i, op, j=None):
-            for d in range(dcp):
-                head, jd = divmod(d, replicas)
-                jj = jd if j is None else j
+    kv_flat_shape = jax.ShapeDtypeStruct(
+        (max_pages, rows, packing, head_width), kv_cache.dtype
+    )
+    any_mem = pl.BlockSpec(memory_space=pl.ANY)
+    if with_scales:
+        assert scale_cache is not None
+        sc_flat_shape = jax.ShapeDtypeStruct(
+            (max_pages, scale_cache.shape[1], scale_cache.shape[2]),
+            scale_cache.dtype,
+        )
+        kv_flat, sc_flat = pl.pallas_call(
+            kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=3,
+                grid=(1,),
+                in_specs=[any_mem, any_mem],
+                out_specs=(any_mem, any_mem),
+                scratch_shapes=[pltpu.SemaphoreType.DMA(())] * 4,
+            ),
+            out_shape=(kv_flat_shape, sc_flat_shape),
+            compiler_params=pltpu.CompilerParams(collective_id=_EXCHANGE_COLLECTIVE_ID),
+            interpret=pltpu.InterpretParams() if interpret else False,
+            name="minimax_m3_msa_dcp_exchange_head_pages",
+        )(pages, live, rank, kv_cache, scale_cache)
+        return (
+            kv_flat.reshape(replicas, dcp, part, rows, packing, head_width),
+            sc_flat.reshape(
+                replicas, dcp, part, scale_cache.shape[1], scale_cache.shape[2]
+            ),
+        )
 
-                def send(d=d, head=head, jj=jj):
-                    columns = pl.ds(head * head_width, head_width)
-                    src = kv_ref.at[pages_ref[jj * part + i], :, :, columns]
-                    op(remote(src, out_ref.at[jj, me, i], send_sem, recv_sem, d))
-
-                pl.when(i < counts[jj])(send)
-
-        def pipelined(n, copies):
-            """Start ``copies(i, op)`` for ``i < n``, a bounded number in
-            flight (equal-sized copies on one semaphore: any wait retires
-            one)."""
-            ahead = in_flight
-
-            def step(i, carry):
-                copies(i, lambda c: c.start())
-                pl.when(i >= ahead)(lambda: copies(i - ahead, lambda c: c.wait_send()))
-                return carry
-
-            def drain(i, carry):
-                copies(i, lambda c: c.wait_send())
-                return carry
-
-            jax.lax.fori_loop(0, n, step, 0)
-            jax.lax.fori_loop(jnp.maximum(n - ahead, 0), n, drain, 0)
-
-        def page_wait(sem):
-            def wait(i, carry):
-                page = out_ref.at[0, 0, 0]
-                pltpu.make_async_copy(page, page, sem).wait()
-                return carry
-
-            return wait
-
-        if direct:
-            # Every part to every replica of its head: no forwarding stage.
-            for j in range(replicas):
-                pipelined(counts[j], functools.partial(sends, j=j))
-            jax.lax.fori_loop(0, sum(counts) * dcp, page_wait(recv_sem), 0)
-            return
-        pipelined(counts[0], sends)
-
-        mine = jnp.where(replica == 0, counts[0], counts[-1])
-        for j in range(1, replicas - 1):
-            mine = jnp.where(replica == j, counts[j], mine)
-        jax.lax.fori_loop(0, mine * dcp, page_wait(recv_sem), 0)
-
-        # Forward the received pages to the head's other replicas.
-        def forwards(i, op):
-            for k in range(1, replicas):
-                peer = me - replica + (replica + k) % replicas
-                for src in range(dcp):
-                    page = out_ref.at[replica, src, i]
-                    op(remote(page, page, send_sem, fwd_sem, peer))
-
-        pipelined(mine, forwards)
-        theirs = sum(counts) - mine
-        jax.lax.fori_loop(0, theirs * dcp, page_wait(fwd_sem), 0)
-
-    return pl.pallas_call(
+    kv_flat = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             grid=(1,),
-            in_specs=[pl.BlockSpec(memory_space=pl.ANY)],
-            out_specs=pl.BlockSpec(memory_space=pl.ANY),
-            scratch_shapes=[pltpu.SemaphoreType.DMA(())] * 3,
+            in_specs=[any_mem],
+            out_specs=any_mem,
+            scratch_shapes=[pltpu.SemaphoreType.DMA(())] * 4,
         ),
-        out_shape=jax.ShapeDtypeStruct(
-            (replicas, dcp, part, rows, packing, head_width), kv_cache.dtype
-        ),
+        out_shape=kv_flat_shape,
         compiler_params=pltpu.CompilerParams(collective_id=_EXCHANGE_COLLECTIVE_ID),
         interpret=pltpu.InterpretParams() if interpret else False,
         name="minimax_m3_msa_dcp_exchange_head_pages",
     )(pages, live, rank, kv_cache)
+    return kv_flat.reshape(replicas, dcp, part, rows, packing, head_width)
 
 
 EXCHANGE_ASYNC_ENV = "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC"
@@ -454,7 +599,7 @@ def exchange_async() -> bool:
     on = bool(envs.TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC)
     if on and not _async_logged:
         _async_logged = True
-        init_logger(__name__).warning(
+        init_logger(__name__).info(
             "%s=1: head-parallel MSA page exchange started ahead of the "
             "decode-row attention and the selection merge, retired after them.",
             EXCHANGE_ASYNC_ENV,
@@ -480,23 +625,33 @@ def exchange_head_pages_start(
     head_width: int,
     direct: bool = True,
     interpret: bool = False,
+    scale_cache: jax.Array | None = None,
 ):
     """`exchange_head_pages` as a start / `exchange_head_pages_wait` pair:
-    starts every page copy of this rank (`direct`: every part to every
-    replica of its head; else part ``j`` to replica ``j``, forwarded by the
-    wait) and returns the future ``(out, send_sem, recv_sem, fwd_sem)`` with the
-    copies in flight, so the caller's work in between overlaps them. The
-    pages are read from `kv_cache` until the wait: the caller keeps it
-    unchanged (an operand of the program, written before the start)."""
+    starts every Stage-1 page (and optional scale-page) copy of this rank and
+    returns the future with the copies in flight, so the caller's work in
+    between overlaps them.
+
+    No ``has_side_effects``: under the serving ``shard_map`` (`pallas.jax_op`)
+    the SPMD partitioner rejects a side-effecting custom call without an
+    explicit sharding; the live future outputs and `optimization_barrier` fences
+    preserve call ordering."""
     _, rows, packing, _ = kv_cache.shape
     num_pages = pages.shape[0]
     part = num_pages // replicas
+    max_pages = replicas * dcp * part
     if kv_cache.dtype != jnp.uint8:
         raise ValueError(f"4-bit (uint8) caches only, got {kv_cache.dtype}")
+    with_scales = scale_cache is not None
 
-    def kernel(
-        pages_ref, live_ref, rank_ref, kv_ref, out_ref, send_sem, recv_sem, fwd_sem
-    ):
+    def kernel(pages_ref, live_ref, rank_ref, *refs):
+        if with_scales:
+            kv_ref, sc_ref, kv_out, sc_out = refs[:4]
+            send_sem, recv_sem, fwd_sem, local_sem = refs[4:]
+        else:
+            kv_ref, kv_out = refs[:2]
+            sc_ref = sc_out = None
+            send_sem, recv_sem, fwd_sem, local_sem = refs[2:]
         del fwd_sem  # the wait's forwarding semaphore, live from here on
         me = rank_ref[0]
         counts = [live_part(live_ref[0], j, replicas, part) for j in range(replicas)]
@@ -509,54 +664,61 @@ def exchange_head_pages_start(
                 device_id_type=pl.DeviceIdType.MESH,
             )
         pl.semaphore_wait(barrier, dcp)
+        _start_stage1_copies(
+            pages_ref,
+            kv_ref,
+            sc_ref,
+            kv_out,
+            sc_out,
+            counts,
+            me,
+            axis=axis,
+            dcp=dcp,
+            replicas=replicas,
+            part=part,
+            head_width=head_width,
+            direct=direct,
+            send_sem=send_sem,
+            recv_sem=recv_sem,
+            local_sem=local_sem,
+        )
 
-        def start_part(j, only=None):
-            def body(i, carry):
-                for d in range(dcp):
-                    head, jd = divmod(d, replicas)
-                    if only is not None and jd != j:
-                        continue
-                    columns = pl.ds(head * head_width, head_width)
-                    src = kv_ref.at[pages_ref[j * part + i], :, :, columns]
-                    pltpu.make_async_remote_copy(
-                        src,
-                        out_ref.at[j, me, i],
-                        send_sem,
-                        recv_sem,
-                        device_id={axis: d},
-                        device_id_type=pl.DeviceIdType.MESH,
-                    ).start()
-                return carry
-
-            jax.lax.fori_loop(0, counts[j], body, 0)
-
-        for j in range(replicas):
-            start_part(j, only=None if direct else True)
+    any_mem = pl.BlockSpec(memory_space=pl.ANY)
+    sem_mem = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
+    sem_type = pltpu.SemaphoreType.DMA(())
+    kv_flat_shape = jax.ShapeDtypeStruct(
+        (max_pages, rows, packing, head_width), kv_cache.dtype
+    )
+    if with_scales:
+        assert scale_cache is not None
+        sc_flat_shape = jax.ShapeDtypeStruct(
+            (max_pages, scale_cache.shape[1], scale_cache.shape[2]),
+            scale_cache.dtype,
+        )
+        return pl.pallas_call(
+            kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=3,
+                grid=(1,),
+                in_specs=[any_mem, any_mem],
+                out_specs=(any_mem, any_mem, sem_mem, sem_mem, sem_mem, sem_mem),
+            ),
+            out_shape=(kv_flat_shape, sc_flat_shape) + (sem_type,) * 4,
+            compiler_params=pltpu.CompilerParams(collective_id=_EXCHANGE_COLLECTIVE_ID),
+            interpret=pltpu.InterpretParams() if interpret else False,
+            name="minimax_m3_msa_dcp_exchange_start",
+        )(pages, live, rank, kv_cache, scale_cache)
 
     return pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             grid=(1,),
-            in_specs=[pl.BlockSpec(memory_space=pl.ANY)],
-            out_specs=(
-                pl.BlockSpec(memory_space=pl.ANY),
-                pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
-                pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
-                pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
-            ),
+            in_specs=[any_mem],
+            out_specs=(any_mem, sem_mem, sem_mem, sem_mem, sem_mem),
         ),
-        out_shape=(
-            jax.ShapeDtypeStruct(
-                (replicas, dcp, part, rows, packing, head_width), kv_cache.dtype
-            ),
-            pltpu.SemaphoreType.DMA(()),
-            pltpu.SemaphoreType.DMA(()),
-            pltpu.SemaphoreType.DMA(()),
-        ),
-        compiler_params=pltpu.CompilerParams(
-            collective_id=_EXCHANGE_COLLECTIVE_ID, has_side_effects=True
-        ),
+        out_shape=(kv_flat_shape,) + (sem_type,) * 4,
+        compiler_params=pltpu.CompilerParams(collective_id=_EXCHANGE_COLLECTIVE_ID),
         interpret=pltpu.InterpretParams() if interpret else False,
         name="minimax_m3_msa_dcp_exchange_start",
     )(pages, live, rank, kv_cache)
@@ -573,92 +735,88 @@ def exchange_head_pages_wait(
     direct: bool = True,
     in_flight: int = _EXCHANGE_PAGES_IN_FLIGHT,
     interpret: bool = False,
-) -> jax.Array:
+):
     """Retires `exchange_head_pages_start`'s copies (and, unless `direct`,
-    forwards the received part to the head's other replicas): the same
-    buffer `exchange_head_pages` returns."""
-    # fwd_sem comes from the start: a peer may forward pages before this
-    # rank enters the wait, when a scratch semaphore would not exist yet.
-    out, send_sem, recv_sem, fwd_sem = future
-    part = out.shape[2]
-    out_shape = jax.ShapeDtypeStruct(out.shape, out.dtype)
+    forwards the received part to the head's other replicas): returns the same
+    reshaped buffer(s) as `exchange_head_pages`."""
+    del in_flight
+    with_scales = len(future) == 6
+    if with_scales:
+        kv_flat, sc_flat, send_sem, recv_sem, fwd_sem, local_sem = future
+    else:
+        kv_flat, send_sem, recv_sem, fwd_sem, local_sem = future
+        sc_flat = None
+    max_pages, rows, packing, head_width = kv_flat.shape
+    part = max_pages // (replicas * dcp)
+    kv_shape = jax.ShapeDtypeStruct(kv_flat.shape, kv_flat.dtype)
 
-    def kernel(live_ref, rank_ref, buf_ref, send_sem, recv_sem, fwd_sem, out_ref):
-        del buf_ref  # aliased to out_ref
+    def kernel(live_ref, rank_ref, *refs):
+        if with_scales:
+            kv_in, sc_in = refs[:2]
+            send_s, recv_s, fwd_s, loc_s = refs[2:6]
+            kv_out, sc_out = refs[6:8]
+            del kv_in, sc_in
+        else:
+            kv_in = refs[0]
+            send_s, recv_s, fwd_s, loc_s = refs[1:5]
+            kv_out = refs[5]
+            sc_out = None
+            del kv_in
         me = rank_ref[0]
-        replica = me % replicas
         counts = [live_part(live_ref[0], j, replicas, part) for j in range(replicas)]
-        mine = jnp.where(replica == 0, counts[0], counts[-1])
-        for j in range(1, replicas - 1):
-            mine = jnp.where(replica == j, counts[j], mine)
+        _retire_and_forward_pages(
+            kv_out,
+            sc_out,
+            counts,
+            me,
+            axis=axis,
+            dcp=dcp,
+            replicas=replicas,
+            part=part,
+            direct=direct,
+            send_sem=send_s,
+            recv_sem=recv_s,
+            fwd_sem=fwd_s,
+            local_sem=loc_s,
+        )
 
-        def page_wait(sem):
-            def wait(i, carry):
-                page = out_ref.at[0, 0, 0]
-                pltpu.make_async_copy(page, page, sem).wait()
-                return carry
+    any_mem = pl.BlockSpec(memory_space=pl.ANY)
+    sem_mem = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
+    if with_scales:
+        assert sc_flat is not None
+        sc_shape = jax.ShapeDtypeStruct(sc_flat.shape, sc_flat.dtype)
+        kv_res, sc_res = pl.pallas_call(
+            kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                grid=(1,),
+                in_specs=[any_mem, any_mem, sem_mem, sem_mem, sem_mem, sem_mem],
+                out_specs=(any_mem, any_mem),
+            ),
+            out_shape=(kv_shape, sc_shape),
+            input_output_aliases={2: 0, 3: 1},
+            interpret=pltpu.InterpretParams() if interpret else False,
+            name="minimax_m3_msa_dcp_exchange_wait",
+        )(live, rank, kv_flat, sc_flat, send_sem, recv_sem, fwd_sem, local_sem)
+        return (
+            kv_res.reshape(replicas, dcp, part, rows, packing, head_width),
+            sc_res.reshape(replicas, dcp, part, sc_flat.shape[1], sc_flat.shape[2]),
+        )
 
-            return wait
-
-        # Our sends: one per page and destination (direct: every rank; else
-        # the ranks of the page's part, one per head).
-        issued = sum(counts) * (dcp if direct else dcp // replicas)
-        jax.lax.fori_loop(0, issued, page_wait(send_sem), 0)
-        recv_n = sum(counts) if direct else mine
-        jax.lax.fori_loop(0, recv_n * dcp, page_wait(recv_sem), 0)
-        if direct:
-            return
-
-        def forwards(i, op):
-            for k in range(1, replicas):
-                peer = me - replica + (replica + k) % replicas
-                for src in range(dcp):
-                    page = out_ref.at[replica, src, i]
-                    op(
-                        pltpu.make_async_remote_copy(
-                            page,
-                            page,
-                            send_sem,
-                            fwd_sem,
-                            device_id={axis: peer},
-                            device_id_type=pl.DeviceIdType.MESH,
-                        )
-                    )
-
-        ahead = in_flight
-
-        def step(i, carry):
-            forwards(i, lambda c: c.start())
-            pl.when(i >= ahead)(lambda: forwards(i - ahead, lambda c: c.wait_send()))
-            return carry
-
-        def drain(i, carry):
-            forwards(i, lambda c: c.wait_send())
-            return carry
-
-        jax.lax.fori_loop(0, mine, step, 0)
-        jax.lax.fori_loop(jnp.maximum(mine - ahead, 0), mine, drain, 0)
-        jax.lax.fori_loop(0, (sum(counts) - mine) * dcp, page_wait(fwd_sem), 0)
-
-    return pl.pallas_call(
+    kv_res = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             grid=(1,),
-            in_specs=[
-                pl.BlockSpec(memory_space=pl.ANY),
-                pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
-                pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
-                pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
-            ],
-            out_specs=pl.BlockSpec(memory_space=pl.ANY),
+            in_specs=[any_mem, sem_mem, sem_mem, sem_mem, sem_mem],
+            out_specs=any_mem,
         ),
-        out_shape=out_shape,
+        out_shape=kv_shape,
         input_output_aliases={2: 0},
-        compiler_params=pltpu.CompilerParams(has_side_effects=True),
         interpret=pltpu.InterpretParams() if interpret else False,
         name="minimax_m3_msa_dcp_exchange_wait",
-    )(live, rank, out, send_sem, recv_sem, fwd_sem)
+    )(live, rank, kv_flat, send_sem, recv_sem, fwd_sem, local_sem)
+    return kv_res.reshape(replicas, dcp, part, rows, packing, head_width)
 
 
 def _exchange_pages(
@@ -682,16 +840,15 @@ def _exchange_pages(
     src) * L / replicas + i``; only the pages `exchange_head_pages` calls
     live (`live` logical blocks) are set.
 
-    The pages move by `exchange_head_pages`. The ``replicas`` ranks of a KV
-    head each receive a ``1 / replicas`` part of the scales over an
-    all-to-all and share them with an all-gather inside the replica group
-    (one chip's cores at c64).
+    Both the 4-bit KV pages and their scale pages move together inside the
+    page-exchange kernel(s) for only the ``live`` logical blocks ( eliminating
+    the full-buffer `scale_cache[pages]` gather and XLA collectives).
 
-    `future`: the pages' copies were started by `exchange_head_pages_start`
-    (direct = `exchange_direct()`); they are retired here, after `deps`
-    (an optimization barrier orders the wait after them)."""
+    `future`: the pages' and scale pages' copies were started by
+    `exchange_head_pages_start` (direct = `exchange_direct()`); they are
+    retired here, after `deps` (an optimization barrier orders the wait after
+    them)."""
     num_pages = pages.shape[0]
-    part = num_pages // replicas
     _, rows, packing, _ = kv_cache.shape
     heads = dcp // replicas
     if kv_cache.shape[3] != heads * head_width:
@@ -707,14 +864,14 @@ def _exchange_pages(
     if (direct or in_flight != _EXCHANGE_PAGES_IN_FLIGHT) and not _exchange_logged:
         _exchange_logged = True
         init_logger(__name__).warning(
-            "MSA DCP page exchange: %d pages in flight, direct=%s "
-            "(TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT / _DIRECT).",
-            in_flight,
+            "MSA DCP page exchange: direct=%s (TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT); "
+            "TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT=%d is ignored (unthrottled).",
             direct,
+            in_flight,
         )
     if future is not None:
         future, _ = jax.lax.optimization_barrier((future, deps))
-        recv = exchange_head_pages_wait(
+        recv, recv_sc = exchange_head_pages_wait(
             future,
             live.reshape(1),
             rank.reshape(1),
@@ -725,10 +882,8 @@ def _exchange_pages(
             in_flight=in_flight,
             interpret=interpret,
         )
-        # The scales' XLA collectives run after the page copies retire.
-        recv, scale_cache = jax.lax.optimization_barrier((recv, scale_cache))
     else:
-        recv = exchange_head_pages(
+        recv, recv_sc = exchange_head_pages(
             kv_cache,
             pages,
             live.reshape(1),
@@ -740,22 +895,17 @@ def _exchange_pages(
             interpret=interpret,
             in_flight=in_flight,
             direct=direct,
-        )
-    # Destination rank d = h * replicas + j gets part j of head h.
-    sc = scale_cache[pages][:, : 2 * heads]  # K/V rows of every head
-    sc = sc.reshape(replicas, part, heads, 2, sc.shape[-1])
-    # [dcp, part * 2, lanes]: a [.., 2, lanes] block pads its (8, 128) tiles
-    # four times over.
-    send_sc = jnp.moveaxis(sc, 2, 0).reshape(dcp, part * 2, sc.shape[-1])
-    recv_sc = jax.lax.all_to_all(send_sc, axis, 0, 0, tiled=True)
-    if replicas > 1:
-        groups = [list(range(h * replicas, (h + 1) * replicas)) for h in range(heads)]
-        recv_sc = jax.lax.all_gather(
-            recv_sc, axis, axis_index_groups=groups, tiled=True
+            scale_cache=scale_cache,
         )
     recv = recv.reshape(num_pages * dcp, rows, packing, head_width)
-    recv_sc = recv_sc.reshape(num_pages * dcp, 2, recv_sc.shape[-1])
-    recv_sc = jnp.pad(recv_sc, ((0, 0), (0, msa_fp4.SCALE_ROWS - 2), (0, 0)))
+    sc_flat = recv_sc.reshape(
+        num_pages * dcp, scale_cache.shape[1], scale_cache.shape[2]
+    )
+    head = jnp.reshape(rank, (-1,))[0] // replicas
+    kv_sc = sc_flat[:, :2]
+    for h in range(1, heads):
+        kv_sc = jnp.where(head == h, sc_flat[:, 2 * h : 2 * h + 2], kv_sc)
+    recv_sc = jnp.pad(kv_sc, ((0, 0), (0, msa_fp4.SCALE_ROWS - 2), (0, 0)))
     return recv, recv_sc
 
 
@@ -1033,7 +1183,7 @@ def _head_parallel_attend(
     first = jnp.min(jnp.where(hp_req, seq_idx, max_num_seqs))
     plan = plan_round(first)
     future, extra = None, None
-    if between is not None and exchange_async():
+    if between is not None and exchange_async() and not interpret:
         future = exchange_head_pages_start(
             kv_cache,
             round_pages(plan),
@@ -1045,6 +1195,7 @@ def _head_parallel_attend(
             head_width=head_width,
             direct=exchange_direct(replicas),
             interpret=interpret,
+            scale_cache=scale_cache,
         )
         # The overlapped work starts after the copies.
         future, q, candidates = jax.lax.optimization_barrier((future, q, candidates))
@@ -1166,7 +1317,7 @@ def attend_and_merge(
     tokens = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
     hp_args = (q, kv_cache, scale_cache, candidates, seq_lens, block_tables)
     hp_args += (cu_q_lens, hp_req, tokens)
-    if exchange_async():
+    if exchange_async() and not interpret:
         # The page exchange overlaps the decode rows' attention.
         hp_out, dcp_out = _head_parallel_attend(
             *hp_args,
