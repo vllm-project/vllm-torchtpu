@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
+    TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -89,6 +90,7 @@ if TYPE_CHECKING:
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
+    TPU_NORM_WEIGHT_HOIST: bool = False
     TPU_GREEDY_TOP_TOKENS: bool = False
     TPU_DP_VOCAB_PARALLEL: bool = False
     DP_SCHED_ENABLED: bool = False
@@ -744,6 +746,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # T/tp tokens, and the next layer all-gathers. Qwen3.5 MoE with
     # EP and TP > 1 only.
     "TPU_MOE_SEQUENCE_PARALLEL": env_bool("TPU_MOE_SEQUENCE_PARALLEL", default=False),
+    # With TPU_MOE_SEQUENCE_PARALLEL: all-gather the rows before the attention
+    # and GDN in-projections as fp8 with per-row scales, half the bytes. The
+    # fp8 projections compute the same result; an unquantized one (the GDN's
+    # b/a) sees fp8-rounded rows.
+    "TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER": env_bool(
+        "TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER", default=False
+    ),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
@@ -816,6 +825,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to the in-tree experimental RPA kernel modules; see
     # compilation/kernel_reload.py.
     "TPU_KERNEL_RELOAD_MODULES": lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
+    # Keep each GemmaRMSNorm's (1 + weight) as a buffer computed once after
+    # loading instead of recomputing it in every forward.
+    "TPU_NORM_WEIGHT_HOIST": env_bool("TPU_NORM_WEIGHT_HOIST"),
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),

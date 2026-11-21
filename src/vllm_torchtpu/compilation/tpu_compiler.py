@@ -297,6 +297,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
     "vllm_torchtpu/layers/adapter/fused_moe_ep_v3.py",
+    # A layer piece that changes the compiled graph when its switch is on.
+    "vllm_torchtpu/layers/adapter/norm_weight_hoist.py",
     # Used by small_all_reduce_op.py while K3 migrated off it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",
     # And the mesh they export with: `build_ep_mesh` decides the axis, the

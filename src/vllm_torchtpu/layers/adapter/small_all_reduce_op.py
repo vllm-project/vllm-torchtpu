@@ -163,11 +163,35 @@ def prebuild() -> None:
     )
 
 
+_EXPORT_RANK_STACK: list[torch.Tensor] = []
+
+
+def _active_rank() -> torch.Tensor | None:
+    return _EXPORT_RANK_STACK[-1] if _EXPORT_RANK_STACK else _RANK
+
+
+def _in_trace_context() -> bool:
+    return bool(_EXPORT_RANK_STACK) or shape_variants.in_warmup()
+
+
+class export_rank_context:
+    """Scope an explicit per-rank `[1]` int32 buffer for AOT FX export."""
+
+    def __init__(self, rank: torch.Tensor) -> None:
+        self._rank = rank
+
+    def __enter__(self) -> None:
+        _EXPORT_RANK_STACK.append(self._rank)
+
+    def __exit__(self, *_exc: object) -> None:
+        _EXPORT_RANK_STACK.pop()
+
+
 def _fits(x: torch.Tensor, width_multiple: int) -> bool:
     """Static checks: whether this call site can take a kernel at all."""
     return (
         torch.compiler.is_compiling()
-        and shape_variants.in_warmup()
+        and _in_trace_context()
         and x.dim() == 2
         and x.dtype == torch.bfloat16
         and x.shape[1] % width_multiple == 0
@@ -179,21 +203,23 @@ def retain(out: torch.Tensor) -> torch.Tensor:
     that skips the kernel while its other side calls it: the warmup hands a
     bucket over only between traces that lift the same buffers. A read whose
     result is dead would be eliminated, so the zero rides on ``out``."""
-    if _RANK is None or not shape_variants.in_warmup():
+    rank = _active_rank()
+    if rank is None or not _in_trace_context():
         return out
-    value = _RANK[0].to(out.dtype)
+    value = rank[0].to(out.dtype)
     return out + (value - value)
 
 
 def all_reduce_or(x: torch.Tensor, ranks, fallback) -> torch.Tensor:
     """The sum of ``x`` over the group ``ranks``: the kernel for a small block
     when the group is the mesh, ``fallback(x)`` otherwise."""
-    if _AR_OP is None or tuple(ranks) != _MESH_RANKS:
+    rank = _active_rank()
+    if _AR_OP is None or rank is None or tuple(ranks) != _MESH_RANKS:
         return fallback(x)
     if not _fits(x, _CORES * LANES):
         return fallback(x)
     if x.shape[0] <= MAX_ROWS:
-        return _AR_OP(x, _RANK)
+        return _AR_OP(x, rank)
     return retain(fallback(x))
 
 
@@ -201,8 +227,9 @@ def dp_combine_or(x: torch.Tensor, fallback) -> torch.Tensor:
     """The DP MoE combine of ``x`` ([dp * rows, hidden], block r for DP rank
     r): the kernel for a small block when the DP group is the mesh,
     ``fallback(x)`` otherwise."""
-    if _RS_OP is None or not _DP_COMBINE or not _fits(x, LANES):
+    rank = _active_rank()
+    if _RS_OP is None or rank is None or not _DP_COMBINE or not _fits(x, LANES):
         return fallback(x)
     if x.shape[0] <= _CORES * COMBINE_MAX_ROWS:
-        return _RS_OP(x, _RANK)
+        return _RS_OP(x, rank)
     return retain(fallback(x))

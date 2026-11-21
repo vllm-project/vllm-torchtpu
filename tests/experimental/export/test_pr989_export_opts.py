@@ -1,0 +1,164 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""CPU unit tests for Qwen3.5 TP8_EP export optimization wiring."""
+
+from types import SimpleNamespace
+from unittest import mock
+
+import pytest
+import torch
+from torch import nn
+
+from vllm_torchtpu.experimental.export import universal_adapter
+from vllm_torchtpu.layers.adapter import norm_weight_hoist, small_all_reduce_op
+
+
+def _make_adapter(model: nn.Module) -> universal_adapter.UniversalVllmExportableLLM:
+    adapter = object.__new__(universal_adapter.UniversalVllmExportableLLM)
+    adapter._vllm_config = None
+    adapter._export_config = SimpleNamespace(
+        max_model_len=128,
+        max_num_seqs=4,
+        block_size=16,
+        vocab_size=32,
+        tensor_parallel_size=8,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        uses_mrope=False,
+        is_multimodal=False,
+    )
+    adapter._model = model
+    adapter._mtp_draft = None
+    adapter._draft_model = None
+    adapter._patched_rope_modules = 0
+    return adapter
+
+
+def test_hoisted_norm_weights_stay_out_of_constant_names() -> None:
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))):
+        norm = GemmaRMSNorm(16, eps=1e-6)
+
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.norm = norm
+            self.register_buffer("small_buf", torch.tensor([3], dtype=torch.int32))
+
+    model = _Model()
+    try:
+        assert norm_weight_hoist.install(model) == 1
+        adapter = _make_adapter(model)
+        constants = adapter.constant_names()
+        params = adapter.abstract_params()
+        assert "norm._tpu_weight_plus_one" in params
+        assert "norm._tpu_weight_plus_one" not in constants
+        assert "small_buf" in constants
+    finally:
+        if hasattr(GemmaRMSNorm, "_tpu_weight_plus_one"):
+            delattr(GemmaRMSNorm, "_tpu_weight_plus_one")
+        if hasattr(GemmaRMSNorm, "_tpu_norm_weight_hoisted"):
+            delattr(GemmaRMSNorm, "_tpu_norm_weight_hoisted")
+
+
+def test_small_all_reduce_export_context_and_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_torchtpu import envs
+
+    monkeypatch.setenv("TPU_SMALL_ALL_REDUCE", "1")
+    assert envs.TPU_SMALL_ALL_REDUCE
+
+    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+    fake_rank = torch.tensor([2], dtype=torch.int32)
+
+    def _fake_ar(x: torch.Tensor, rank: torch.Tensor) -> torch.Tensor:
+        calls.append((x, rank))
+        return x * 2
+
+    monkeypatch.setattr(small_all_reduce_op, "_RANK", fake_rank)
+    monkeypatch.setattr(small_all_reduce_op, "_AR_OP", _fake_ar)
+    monkeypatch.setattr(small_all_reduce_op, "_MESH_RANKS", tuple(range(8)))
+    monkeypatch.setattr(small_all_reduce_op, "_CORES", 1)
+
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.p = nn.Parameter(torch.ones(1))
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            small = small_all_reduce_op.all_reduce_or(
+                x[:4], range(8), lambda t: t + 100
+            )
+            big = small_all_reduce_op.all_reduce_or(
+                torch.ones(128, 128, dtype=torch.bfloat16),
+                range(8),
+                lambda t: t,
+            )
+            return small.sum() + big.sum()
+
+    model = _Model()
+    assert universal_adapter._patch_small_all_reduce(model) == 1
+    assert hasattr(model, universal_adapter._SMALL_AR_RANK_BUFFER)
+    adapter = _make_adapter(model)
+    assert universal_adapter._SMALL_AR_RANK_BUFFER in adapter.constant_names()
+
+    x = torch.ones(4, 128, dtype=torch.bfloat16)
+    with mock.patch.object(torch.compiler, "is_compiling", return_value=True):
+        out = torch.func.functional_call(
+            model, dict(model.named_parameters(), **dict(model.named_buffers())), (x,)
+        )
+    assert len(calls) == 1
+    assert calls[0][1].tolist() == [2]
+    assert torch.is_tensor(out)
+
+
+def test_qwen3_next_patch_enables_fp8_gather(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.model_executor.models import qwen3_next
+
+    from vllm_torchtpu.models.vllm import qwen3_next_patch
+
+    orig_decoder = qwen3_next.Qwen3NextDecoderLayer.forward
+    orig_model = qwen3_next.Qwen3NextModel.forward
+    orig_attn = qwen3_next.Qwen3NextAttention.forward
+    orig_flag = qwen3_next_patch._fp8_gather
+    try:
+        monkeypatch.setenv("TPU_MOE_SEQUENCE_PARALLEL", "1")
+        monkeypatch.setenv("TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER", "1")
+        qwen3_next_patch.maybe_patch_qwen3_next()
+        assert qwen3_next_patch._fp8_gather is True
+        assert qwen3_next.Qwen3NextAttention.forward is (
+            qwen3_next_patch.patched_attention_forward
+        )
+    finally:
+        qwen3_next.Qwen3NextDecoderLayer.forward = orig_decoder
+        qwen3_next.Qwen3NextModel.forward = orig_model
+        qwen3_next.Qwen3NextAttention.forward = orig_attn
+        qwen3_next_patch._fp8_gather = orig_flag
+
+
+def test_recurrent_state_specs_respect_mamba_ssm_cache_dtype() -> None:
+    class _Layer:
+        def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+            return ((4, 64), (16, 128, 128))
+
+        def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
+            return (torch.float32, torch.bfloat16)
+
+    specs = universal_adapter._recurrent_state_specs(_Layer(), num_slots=8, tp_size=8)
+    assert specs[0].dtype == "f32"
+    assert specs[1].dtype == "bf16"
+    assert specs[1].shape == (8, 16, 128, 128)

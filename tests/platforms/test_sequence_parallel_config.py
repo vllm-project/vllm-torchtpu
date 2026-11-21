@@ -179,3 +179,49 @@ def test_sequence_parallel_rejects_pipeline_parallel(configure_sp_moe):
         match="does not support pipeline parallelism",
     ):
         configure_sp_moe(vllm_config)
+
+
+@pytest.fixture(scope="module")
+def check_fp8_gather():
+    """Stub optional dependencies and yield _check_sequence_parallel_fp8_gather."""
+    stubs = {
+        mod: MagicMock()
+        for mod in (
+            "torch_tpu",
+            "torch_tpu._internal",
+            "torch_tpu._internal.compile",
+            "torch_tpu._internal.utils",
+            "portpicker",
+        )
+        if mod not in sys.modules
+    }
+    with patch.dict(sys.modules, stubs):
+        from vllm_torchtpu.platforms.tpu_platform import (
+            _check_sequence_parallel_fp8_gather,
+        )
+
+        yield _check_sequence_parallel_fp8_gather
+
+
+@pytest.mark.parametrize(
+    "sequence_parallel,pcp,error",
+    [
+        (True, 1, None),
+        (False, 1, "TPU_MOE_SEQUENCE_PARALLEL=1"),
+        (True, 2, "prefill context parallelism"),
+    ],
+)
+def test_fp8_gather_needs_sequence_parallelism_without_pcp(
+    check_fp8_gather, monkeypatch, sequence_parallel, pcp, error
+):
+    import vllm_torchtpu.envs as envs
+
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", sequence_parallel)
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp)
+    )
+    if error is None:
+        check_fp8_gather(vllm_config)
+    else:
+        with pytest.raises(ValueError, match=error):
+            check_fp8_gather(vllm_config)

@@ -23,6 +23,10 @@ serves every bucket under TPU_MOE_SEQUENCE_PARALLEL=1:
   preserve exact symbolic output dimensions across TorchDynamo traces.
 - The pad before the reduce-scatter is eliminated, removing redundant padding
   computations across layers.
+
+With TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER the decoder layer's all-gather
+carries this rank's rows quantized to fp8 with per-row scales, and the
+attention and GDN in-projections take them as `prequant`.
 """
 
 from itertools import islice
@@ -38,12 +42,17 @@ from vllm.model_executor.models import qwen3_next
 from vllm.sequence import IntermediateTensors
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
 UPSTREAM_DECODER_LAYER_FORWARD = qwen3_next.Qwen3NextDecoderLayer.forward
 UPSTREAM_MODEL_FORWARD = qwen3_next.Qwen3NextModel.forward
+UPSTREAM_ATTENTION_FORWARD = qwen3_next.Qwen3NextAttention.forward
+
+# Set once by `maybe_patch_qwen3_next`; a constant to the traced forward.
+_fp8_gather = False
 
 
 def _check_tokens_divide_by_tp(num_tokens: int) -> None:
@@ -67,16 +76,27 @@ def patched_decoder_layer_forward(
     else:
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-    if self.use_attn_reduce_scatter_for_moe:
+    attn_kwargs = {}
+    if self.use_attn_reduce_scatter_for_moe and _fp8_gather:
+        # Each rank quantizes its own rows once; the in-projections take the
+        # gathered fp8 rows and scales, and read only the row count of
+        # `hidden_states`.
+        x_q, x_s = linear_common.quantize_rows(hidden_states)
+        x_q = tensor_model_parallel_all_gather(x_q, 0).narrow(0, 0, full_num_tokens)
+        x_s = tensor_model_parallel_all_gather(x_s, 0).narrow(0, 0, full_num_tokens)
+        attn_kwargs["prequant"] = (x_q, x_s)
+        hidden_states = x_q
+    elif self.use_attn_reduce_scatter_for_moe:
         hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
         hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
 
     if self.layer_type == "linear_attention":
-        hidden_states = self.linear_attn(hidden_states=hidden_states)
+        hidden_states = self.linear_attn(hidden_states=hidden_states, **attn_kwargs)
     elif self.layer_type == "full_attention":
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             positions=positions,
+            **attn_kwargs,
         )
     else:
         raise ValueError("Invalid layer_type")
@@ -121,6 +141,25 @@ def patched_decoder_layer_forward(
             )
 
     return hidden_states, residual
+
+
+def patched_attention_forward(
+    self,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Qwen3NextAttention.forward, with the in-projection from gathered fp8
+    rows when the decoder passes them; otherwise vLLM's own."""
+    if prequant is None:
+        return UPSTREAM_ATTENTION_FORWARD(self, positions, hidden_states)
+    qkv = linear_common.project_rows(self.qkv_proj, hidden_states, prequant)
+    q, k, v, gate = self._project_qkv_gate(qkv, positions)
+    attn_output = self.attn(q, k, v)
+    if gate is not None:
+        attn_output = attn_output * torch.sigmoid(gate)
+    output, _ = self.o_proj(attn_output)
+    return output
 
 
 def patched_model_forward(
@@ -190,8 +229,12 @@ def maybe_patch_qwen3_next(*args: object, **kwargs: object) -> None:
     """Install trace-stable forwards when TPU_MOE_SEQUENCE_PARALLEL=1."""
     if not envs.TPU_MOE_SEQUENCE_PARALLEL:
         return None
+    global _fp8_gather
     qwen3_next.Qwen3NextDecoderLayer.forward = patched_decoder_layer_forward
     qwen3_next.Qwen3NextModel.forward = patched_model_forward
+    _fp8_gather = envs.TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER
+    if _fp8_gather:
+        qwen3_next.Qwen3NextAttention.forward = patched_attention_forward
     logger.info(
         "Applied TPU patch: Qwen3.5 MoE trace-stable sequence-parallel forward."
     )

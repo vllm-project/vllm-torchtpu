@@ -490,6 +490,10 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
                 )
 
         mesh = _create_single_device_tpu_mesh()
+        if tpu_envs.TPU_EXPERT_PLACEMENT:
+            from vllm_torchtpu.layers.adapter import expert_placement
+
+            expert_placement.reset_model_state()
         with contextlib.ExitStack() as stack:
             with contextlib.suppress(Exception):
                 from vllm_torchtpu.layers.adapter.quantization import (
@@ -534,17 +538,32 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
             if separate_draft is not None:
                 object.__setattr__(model, draft_model.DRAFT_MODEL_ATTR, separate_draft)
 
+            from vllm_torchtpu.layers.adapter import linear_common, norm_weight_hoist
             from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
 
+            norm_weight_hoist.install_if_enabled(model)
+            if draft is not None:
+                norm_weight_hoist.install_if_enabled(draft)
+            if tpu_envs.TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER:
+                linear_common._get_quantize_rows_op()
+                linear_common._get_prequant_matmul_op()
             if tpu_envs.TPU_GDN_FUSED_NORM_QUANT:
                 from vllm_torchtpu.layers.adapter import gated_norm_quant_op
 
                 gated_norm_quant_op.install(model)
+            if tpu_envs.TPU_SMALL_ALL_REDUCE:
+                from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+                small_all_reduce_op.prebuild()
             moe_lowtok_scores.log_summary()
             if tpu_envs.MOE_FUSED_EP_KERNEL_IMPL == "v3":
                 from vllm_torchtpu.layers.adapter import fused_moe_ep_v3
 
                 fused_moe_ep_v3.log_arming_summary()
+            if tpu_envs.TPU_EXPERT_PLACEMENT:
+                from vllm_torchtpu.layers.adapter import expert_placement
+
+                expert_placement.check_routers_permuted()
             return model
 
 
@@ -921,6 +940,40 @@ def _patch_sequence_parallel_chunk(model: nn.Module) -> int:
     return 1
 
 
+_SMALL_AR_RANK_BUFFER = "export_small_ar_rank"
+
+
+def _patch_small_all_reduce(model: nn.Module) -> int:
+    """Routes `small_all_reduce_op` through a per-rank buffer during export."""
+    from vllm_torchtpu import envs as tpu_envs
+
+    if not tpu_envs.TPU_SMALL_ALL_REDUCE or hasattr(model, _SMALL_AR_RANK_BUFFER):
+        return 0
+    from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+    if small_all_reduce_op._RANK is None:
+        small_all_reduce_op.prebuild()
+    rank = small_all_reduce_op._RANK
+    if rank is None:
+        return 0
+    first_tensor = next(model.parameters(), next(model.buffers(), None))
+    device = first_tensor.device if first_tensor is not None else rank.device
+    model.register_buffer(
+        _SMALL_AR_RANK_BUFFER,
+        rank.detach().to(device=device, dtype=torch.int32).clone(),
+        persistent=False,
+    )
+    orig_forward = model.forward
+
+    def sar_forward(*args: Any, **kwargs: Any) -> Any:
+        rank_buf = getattr(model, _SMALL_AR_RANK_BUFFER)
+        with small_all_reduce_op.export_rank_context(rank_buf):
+            return orig_forward(*args, **kwargs)
+
+    model.forward = sar_forward
+    return 1
+
+
 def _backbone_kwargs(
     backbone: nn.Module,
     *,
@@ -1132,11 +1185,13 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 )
         _patch_row_parallel_input_split(self._model)
         _patch_sequence_parallel_chunk(self._model)
+        _patch_small_all_reduce(self._model)
         for draft in (self._mtp_draft, self._draft_model):
             if draft is not None:
                 # Kept off the target's module tree, like the RoPE patch above.
                 _patch_row_parallel_input_split(draft)
                 _patch_sequence_parallel_chunk(draft)
+                _patch_small_all_reduce(draft)
         if not self._export_config.uses_mrope and any(
             getattr(m, "_in_graph_rope_dim_modalities", None) is not None
             or rope_patch.compute_mrope_dim_modalities(m) is not None
@@ -1359,7 +1414,14 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
     def constant_names(self) -> set[str]:
         """Names in `abstract_params()` that are buffers rather than parameters."""
         params = {name for name, _ in self._model.named_parameters()}
-        return {name for name in self._buffers() if name not in params}
+        # Hoisted norm weights (`_tpu_weight_plus_one`) have hidden_size floats
+        # per layer; keep them as replicated checkpoint weights instead of inline
+        # metadata constants.
+        return {
+            name
+            for name in self._buffers()
+            if name not in params and name.rsplit(".", 1)[-1] != "_tpu_weight_plus_one"
+        }
 
     def constant_axis_values(self, name: str) -> list[Any]:
         """Values of buffer `name` on every tensor-parallel rank, in rank order.

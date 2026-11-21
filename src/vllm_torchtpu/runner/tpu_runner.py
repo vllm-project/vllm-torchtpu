@@ -1537,6 +1537,10 @@ class TPUModelRunner(GPUModelRunner):
         """
         if model is None:
             return
+        # TPU_NORM_WEIGHT_HOIST: the norms' (1 + w) computed once after loading.
+        from vllm_torchtpu.layers.adapter import norm_weight_hoist
+
+        norm_weight_hoist.install_if_enabled(self.model)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches(model)
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
@@ -6259,6 +6263,10 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_topk_buffer is not None:
                 # -1 is "no token": a row of it attends to nothing.
                 self._pp_topk_buffer.fill_(-1)
+        # TPU_NORM_WEIGHT_HOIST: the norms' (1 + w) computed once after loading.
+        from vllm_torchtpu.layers.adapter import norm_weight_hoist
+
+        norm_weight_hoist.install_if_enabled(self.model)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches(self.model)
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
@@ -6425,6 +6433,8 @@ class TPUModelRunner(GPUModelRunner):
 
     def _initialize_quantization_kernels(self):
         from vllm_torchtpu.layers.adapter.linear_common import (
+            _get_prequant_matmul_op,
+            _get_quantize_rows_op,
             _get_quantized_matmul_fp4_op,
             _get_quantized_matmul_op,
         )
@@ -6434,6 +6444,10 @@ class TPUModelRunner(GPUModelRunner):
             _get_quantized_matmul_op()
             # Same for the NVFP4 W4A16 matmul op.
             _get_quantized_matmul_fp4_op()
+            # Same for the sequence-parallel fp8 gather's two ops.
+            if envs.TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER:
+                _get_quantize_rows_op()
+                _get_prequant_matmul_op()
 
     def _initialize_attention_kernels(self, force: bool = False) -> None:
         """Pre-build Pallas RPA and custom attention kernels before torch.compile."""
