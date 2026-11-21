@@ -135,7 +135,7 @@ def indexed_options(B: int | None = None) -> dict:
 
 
 def thr_fast_options(B: int | None) -> dict:
-    """VLLM_TPU_MK_QSA_THR_FAST_BUCKETS="16:te,32:te" (default unset; exact): the `B`-row
+    """VLLM_TPU_MK_QSA_THR_FAST_BUCKETS="16:te,32:te" or "16:te;32:te" (default unset; exact): the `B`-row
     kernel's VLLM_TPU_MK_QSA_THR_FAST value (`QSAFullIndexedBlock.thr_fast`); other buckets
     keep VLLM_TPU_MK_QSA_THR_FAST. c32 (main-KV DCP-2) b16/b32: "1" (ter2)'s compaction tier
     copies slow every rank's select by 60-69 us; "te" has no tiers. Empty when unset or `B`
@@ -143,7 +143,8 @@ def thr_fast_options(B: int | None) -> dict:
     raw = os.environ.get("VLLM_TPU_MK_QSA_THR_FAST_BUCKETS", "")
     if not raw or B is None:
         return {}
-    table = dict(kv.split(":", 1) for kv in raw.split(",") if kv)
+    # ";" also separates entries: the served recipe's EXTRA_SERVER_ENV splits on ",".
+    table = dict(kv.split(":", 1) for kv in raw.replace(";", ",").split(",") if kv)
     v = table.get(str(B))
     return {} if v is None else {"thr_fast": v}
 
