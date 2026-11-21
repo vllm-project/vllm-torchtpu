@@ -150,21 +150,16 @@ def _apply_rotary_emb(
 def _build_device_vector_f32(
     values: tuple[float, ...],
     device: torch.device,
-    *,
-    base: float | None = None,
-    rotary_dim: int | None = None,
 ) -> torch.Tensor:
-    """Materializes a 1-D float32 frequency vector as pure in-graph HLO ops."""
-    if base is not None and rotary_dim is not None and rotary_dim == len(values) * 2:
-        dim_idx = torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
-        std_inv = 1.0 / (float(base) ** (dim_idx / float(rotary_dim)))
-        if device.type != "cpu":
-            return std_inv
-        ref = torch.tensor(values, dtype=torch.float32, device="cpu")
-        if torch.allclose(std_inv, ref, rtol=1e-5, atol=1e-6):
-            return std_inv
-    if device.type == "cpu":
-        return torch.tensor(values, dtype=torch.float32, device=device)
+    """Materializes the host-computed fp32 `inv_freq` as an in-graph constant.
+
+    The values are embedded bit-exactly (one scalar constant per frequency,
+    folded by XLA into a single literal) rather than recomputed on the device
+    as `base ** (2i / d)`: TPU `pow` is only accurate to ~8 ulp, which at
+    position p becomes an angle error of `p * inv_freq * 5e-7` (up to 0.06 rad
+    at 1M positions), while the embedded constants reproduce a CPU-built table
+    bit-exactly after bf16 rounding.
+    """
     return torch.stack(
         [torch.full((), float(v), dtype=torch.float32, device=device) for v in values]
     )
@@ -197,23 +192,34 @@ def _in_graph_cos_sin(
     inv_freq: tuple[float, ...],
     cache_dtype: torch.dtype,
     dtype: torch.dtype,
-    *,
-    base: float | None = None,
-    rotary_dim: int | None = None,
 ) -> torch.Tensor:
     """Returns `[cos | sin]` rows in `dtype` for `[N]` or `[N, D/2]` positions."""
-    inv = _build_device_vector_f32(
-        inv_freq,
-        pos_for_freq.device,
-        base=base,
-        rotary_dim=rotary_dim,
-    )
+    inv = _build_device_vector_f32(inv_freq, pos_for_freq.device)
     freqs = (
         torch.outer(pos_for_freq.to(torch.float32), inv)
         if pos_for_freq.ndim == 1
         else pos_for_freq.to(torch.float32) * inv
     )
     return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(cache_dtype).to(dtype)
+
+
+def _rotate_in_graph(
+    self: Any,
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Rotates `x[..., :rotary_dim]` in-graph and preserves any trailing channels."""
+    shape = x.shape
+    x = x.view(num_tokens, -1, self.head_size)
+    rotary_dim = self.rotary_dim
+    # Skip the no-op slice / cat on full-RoPE heads.
+    x_rot = x if rotary_dim == self.head_size else x[..., :rotary_dim]
+    out = _apply_rotary_emb(x_rot, cos, sin, self.is_neox_style)
+    if rotary_dim < self.head_size:
+        out = torch.cat((out, x[..., rotary_dim:]), dim=-1)
+    return out.reshape(shape)
 
 
 def _in_graph_rope_forward(
@@ -241,28 +247,12 @@ def _in_graph_rope_forward(
         self._in_graph_rope_inv_freq,
         self._in_graph_rope_cache_dtype,
         query.dtype,
-        base=float(getattr(self, "base", 10000.0)),
-        rotary_dim=int(getattr(self, "rotary_dim", 0)),
     )
     cos, sin = cos_sin.chunk(2, dim=-1)
 
-    query_shape = query.shape
-    query = query.view(num_tokens, -1, self.head_size)
-    query_rot = _apply_rotary_emb(
-        query[..., : self.rotary_dim], cos, sin, self.is_neox_style
-    )
-    query = torch.cat((query_rot, query[..., self.rotary_dim :]), dim=-1).reshape(
-        query_shape
-    )
+    query = _rotate_in_graph(self, query, cos, sin, num_tokens)
     if key is not None:
-        key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_size)
-        key_rot = _apply_rotary_emb(
-            key[..., : self.rotary_dim], cos, sin, self.is_neox_style
-        )
-        key = torch.cat((key_rot, key[..., self.rotary_dim :]), dim=-1).reshape(
-            key_shape
-        )
+        key = _rotate_in_graph(self, key, cos, sin, num_tokens)
     return query, key
 
 
