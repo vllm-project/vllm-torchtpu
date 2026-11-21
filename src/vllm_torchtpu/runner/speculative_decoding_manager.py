@@ -21,10 +21,15 @@ import torch
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
+from vllm_torchtpu.layers.core.attention_metadata import stage_h2d_upload
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+
+def _max_index(indices: np.ndarray) -> int:
+    return int(indices.max()) if indices.size > 0 else 0
 
 
 @dataclass
@@ -59,11 +64,15 @@ class SpecDecodeMetadata:
     # scheduling execute_model re-sources the drafts from the device and
     # uploads this only for a chunk with nothing substituted.
     deferred_draft_token_ids_cpu: np.ndarray | None = None
+    # Largest input_ids index extract_draft_token_ids reads
+    # (logits_indices[target_logits_indices + 1]); lets the caller cut
+    # input_ids to a copy of the logits length before the on-device extract.
+    max_draft_input_index: int = 0
 
-    def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
+    def upload_deferred_draft_token_ids(self, runner: TPUModelRunner) -> torch.Tensor:
         assert self.deferred_draft_token_ids_cpu is not None
-        return torch.from_numpy(self.deferred_draft_token_ids_cpu).to(
-            device, non_blocking=True
+        return stage_h2d_upload(
+            runner, torch.from_numpy(self.deferred_draft_token_ids_cpu)
         )
 
 
@@ -311,15 +320,16 @@ class SpeculativeDecodingManager:
             # draft_token_ids depends on this step's input_ids_cpu content —
             # always re-extracted and re-transferred.
             all_token_ids = self.runner.input_ids_cpu.numpy()
-            draft_token_ids = all_token_ids[logits_indices[target_logits_indices + 1]]
+            draft_input_indices = logits_indices[target_logits_indices + 1]
+            draft_token_ids = all_token_ids[draft_input_indices]
             padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)
             padded_draft_token_ids[: draft_token_ids.shape[0]] = draft_token_ids
             return SpecDecodeMetadata(
                 draft_token_ids=(
                     None
                     if defer_draft_token_ids
-                    else torch.from_numpy(padded_draft_token_ids).to(
-                        self.runner.device, non_blocking=True
+                    else stage_h2d_upload(
+                        self.runner, torch.from_numpy(padded_draft_token_ids)
                     )
                 ),
                 draft_lengths=self._meta_cache.draft_lengths,
@@ -332,6 +342,7 @@ class SpeculativeDecodingManager:
                 deferred_draft_token_ids_cpu=(
                     padded_draft_token_ids if defer_draft_token_ids else None
                 ),
+                max_draft_input_index=_max_index(draft_input_indices),
             )
 
         # [num_reqs]
@@ -376,7 +387,8 @@ class SpeculativeDecodingManager:
 
         # Compute the draft token ids for validation.
         all_token_ids = self.runner.input_ids_cpu.numpy()
-        draft_token_ids = all_token_ids[logits_indices[target_logits_indices + 1]]
+        draft_input_indices = logits_indices[target_logits_indices + 1]
+        draft_token_ids = all_token_ids[draft_input_indices]
 
         # Padding
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
@@ -421,39 +433,40 @@ class SpeculativeDecodingManager:
         padded_group_indices = np.zeros(padded_logits_length, dtype=np.int32)
         padded_group_indices[: group_indices.shape[0]] = group_indices
 
-        # CPU -> TPU copy.
-        device = self.runner.device
-
+        # CPU -> TPU copies of per-call host arrays: staged, so each array
+        # stays alive until the transfer has finished (the index tensors are
+        # cached and reused by later steps).
         metadata = SpecDecodeMetadata(
             draft_token_ids=(
                 None
                 if defer_draft_token_ids
-                else torch.from_numpy(padded_draft_token_ids).to(
-                    device, non_blocking=True
+                else stage_h2d_upload(
+                    self.runner, torch.from_numpy(padded_draft_token_ids)
                 )
             ),
-            draft_lengths=torch.from_numpy(padded_num_draft_tokens).to(
-                device, non_blocking=True
+            draft_lengths=stage_h2d_upload(
+                self.runner, torch.from_numpy(padded_num_draft_tokens)
             ),
             draft_lengths_cpu=num_draft_tokens,
-            target_logits_indices=torch.from_numpy(padded_target_logits_indices).to(
-                device, non_blocking=True
+            target_logits_indices=stage_h2d_upload(
+                self.runner, torch.from_numpy(padded_target_logits_indices)
             ),
-            bonus_logits_indices=torch.from_numpy(padded_bonus_logits_indices).to(
-                device, non_blocking=True
+            bonus_logits_indices=stage_h2d_upload(
+                self.runner, torch.from_numpy(padded_bonus_logits_indices)
             ),
-            final_logits_indices=torch.from_numpy(padded_logits_indices).to(
-                device, non_blocking=True
+            final_logits_indices=stage_h2d_upload(
+                self.runner, torch.from_numpy(padded_logits_indices)
             ),
-            segment_ids=torch.from_numpy(padded_segment_ids).to(
-                device, non_blocking=True
+            segment_ids=stage_h2d_upload(
+                self.runner, torch.from_numpy(padded_segment_ids)
             ),
-            group_indices=torch.from_numpy(padded_group_indices).to(
-                device, non_blocking=True
+            group_indices=stage_h2d_upload(
+                self.runner, torch.from_numpy(padded_group_indices)
             ),
             deferred_draft_token_ids_cpu=(
                 padded_draft_token_ids if defer_draft_token_ids else None
             ),
+            max_draft_input_index=_max_index(draft_input_indices),
         )
         # draft_lengths_cpu aliases the caller's array; copy so a later caller
         # mutation can't diverge the cache from its key.

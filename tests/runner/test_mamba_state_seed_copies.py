@@ -28,6 +28,7 @@ MMLU-with-prefix-caching parity; this file pins the block-selection logic
 directly and cheaply.
 """
 
+import contextlib
 import inspect
 from types import SimpleNamespace
 
@@ -112,7 +113,7 @@ def _make_self(
         # the runner is constructed).
         cache_config=SimpleNamespace(block_size=BLOCK_SIZE),
         block_size=BLOCK_SIZE,
-        device="cpu",
+        device=torch.device("cpu"),
         mamba_slot_read_offsets=read_offsets,
         _pending_mamba_state_copies=[],
         _unfenced_h2d_sources=[],
@@ -575,6 +576,30 @@ def test_spec_crossing_offset_past_the_row_falls_back_to_the_state_block():
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(10, 11)]
 
 
+def test_spec_crossing_uniform_candidates_skip_spec_seed_sources_and_reset_offset():
+    # Prefix-cache resume (no prior state_pos) with ckpt_window=3 builds
+    # uniform candidate rows [src, src, src]; the CPU fast path must skip
+    # _spec_seed_sources while still resetting the destination read offset.
+    read_offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    read_offsets[11] = 2
+    fake, _ = _make_self(
+        ["a"],
+        [2 * BLOCK_SIZE],
+        [[[9, 10, 11, 12]]],
+        state_pos={},
+        ckpt_window=3,
+        read_offsets=read_offsets,
+    )
+    # A prefix-cache resume is a new owner: its offsets are not seeded yet.
+    fake._mamba_offset_seeded.clear()
+    called = []
+    fake._spec_seed_sources = lambda *a, **k: called.append(a)
+    _collect(fake, _sched({"a": BLOCK_SIZE}))
+    assert called == []
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(10, 11)]
+    assert int(fake.mamba_slot_read_offsets[11]) == 0
+
+
 @pytest.mark.skipif(
     not _HAS_SPLIT, reason="split expansion only exists on the batched-RPA PR"
 )
@@ -839,6 +864,7 @@ def test_async_rejections_seed_only_at_actual_state_crossing(
     fake.scheduler_config = SimpleNamespace(async_scheduling=True)
     fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     fake._pre_async_results = SimpleNamespace(
+        request_seq_lens=[(0, None, 0, "a")],
         req_id_to_index_copy={"a": 0},
         num_draft_per_req={0: 3},
         spec_decode_num_rejected_tokens=torch.tensor([rejected]),
@@ -870,6 +896,7 @@ def test_async_state_seed_away_from_boundary_does_not_wait():
     fake.scheduler_config = SimpleNamespace(async_scheduling=True)
     fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     fake._pre_async_results = SimpleNamespace(
+        request_seq_lens=[(0, None, 0, "a")],
         req_id_to_index_copy={"a": 0},
         num_draft_per_req={0: 3},
         spec_decode_num_rejected_tokens=torch.tensor([3]),
@@ -892,6 +919,7 @@ def test_async_state_seed_uses_previous_request_order():
     fake.scheduler_config = SimpleNamespace(async_scheduling=True)
     fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     fake._pre_async_results = SimpleNamespace(
+        request_seq_lens=[(0, None, 0, "a"), (1, None, 0, "b")],
         req_id_to_index_copy={"a": 0, "b": 1},
         num_draft_per_req={0: 3, 1: 3},
         wait_for_copy=lambda: torch.tensor([[77, -1, -1, -1], [77, 88, 99, 11]]),
@@ -900,6 +928,35 @@ def test_async_state_seed_uses_previous_request_order():
     _collect(fake, _sched({"a": 4, "b": 4}))
     assert fake._pending_mamba_state_copies == []
     np.testing.assert_array_equal(fake.input_batch.num_computed_tokens_cpu, before)
+
+
+def test_async_state_seed_reads_the_previous_batch_row_not_the_source_position():
+    """A later chunk's substitution source position counts the padded rows of
+    the chunks before it, while the previous step's draft counts and sampled
+    rows are keyed by batch row."""
+    fake, _ = _make_self(
+        ["a"],
+        [383],
+        [[[5, 6, 7, 8, 9]]],
+        state_pos={"a": 0},
+        state_block_size=384,
+        ckpt_window=4,
+        read_offsets=torch.zeros(NUM_BLOCKS, dtype=torch.int32),
+    )
+    fake.scheduler_config = SimpleNamespace(async_scheduling=True)
+    fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    # In the previous step's batch "a" sits at row 1, the first row of a
+    # second chunk behind a chunk padded to 8 rows: its source position is 8,
+    # the first chunk's padded length, while its batch row is 1.
+    fake._pre_async_results = SimpleNamespace(
+        request_seq_lens=[(0, None, 0, "b"), (1, None, 0, "a")],
+        req_id_to_index_copy={"b": 0, "a": 8},
+        num_draft_per_req={0: 0, 1: 3},
+        wait_for_copy=lambda: torch.tensor([[77, -1, -1, -1], [77, -1, -1, -1]]),
+    )
+    _collect(fake, _sched({"a": 4}))
+    assert fake._pending_mamba_state_copies == []
+    assert fake._mamba_state_pos["a"] == 0
 
 
 def test_async_state_seed_can_return_to_previous_column_after_rejection():
@@ -916,6 +973,7 @@ def test_async_state_seed_can_return_to_previous_column_after_rejection():
     fake.scheduler_config = SimpleNamespace(async_scheduling=True)
     fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     fake._pre_async_results = SimpleNamespace(
+        request_seq_lens=[(0, None, 0, "a")],
         req_id_to_index_copy={"a": 0},
         num_draft_per_req={0: 3},
         wait_for_copy=lambda: torch.tensor([[77, -1, -1, -1]]),
@@ -943,6 +1001,7 @@ def test_async_state_seed_keeps_actual_crossing_when_all_drafts_accepted():
     fake.scheduler_config = SimpleNamespace(async_scheduling=True)
     fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     fake._pre_async_results = SimpleNamespace(
+        request_seq_lens=[(0, None, 0, "a")],
         req_id_to_index_copy={"a": 0},
         num_draft_per_req={0: 3},
         wait_for_copy=lambda: torch.tensor([[77, 88, 99, 11]]),
@@ -1051,3 +1110,63 @@ def test_prefill_checkpoint_block_is_never_a_seed_copy_operand(layout, window):
         if ckpt is not None:
             assert ckpt != 0
             assert all(ckpt not in pair for pair in pairs)
+
+
+@pytest.mark.parametrize(
+    "window, split, warms_spec_seed",
+    [(3, 1, True), (1, 1, False), (3, 2, False)],
+)
+def test_rollback_warmup_compiles_the_fused_spec_seed_program(
+    monkeypatch, window, split, warms_spec_seed
+):
+    # Synthetic warmup requests never cross a block, so serving would compile
+    # the fused spec-seed gather + rollback reset on the first crossing unless
+    # warmup runs it at every bucket length, with the checkpoint width,
+    # dtypes, distinct state/rollback tensors and grad mode serving uses.
+    calls = []
+
+    def fused(offsets, state_t, ckpt_t, rollback_dst_t):
+        calls.append(
+            (
+                tuple(state_t.shape),
+                state_t.dtype,
+                tuple(ckpt_t.shape),
+                ckpt_t.dtype,
+                tuple(rollback_dst_t.shape),
+                rollback_dst_t.dtype,
+                state_t is rollback_dst_t,
+                torch.is_grad_enabled(),
+            )
+        )
+        return torch.zeros(state_t.shape[0], dtype=torch.int32)
+
+    monkeypatch.setattr(runner_mod, "_spec_seed_and_rollback_compiled", fused)
+    monkeypatch.setattr(
+        runner_mod,
+        "_rollback_offsets_seed_compiled",
+        runner_mod._rollback_offsets_seed_impl,
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "_rollback_offsets_migrate_compiled",
+        runner_mod._rollback_offsets_migrate_impl,
+    )
+    monkeypatch.setattr(runner_mod, "synchronize_tensors", lambda *_a, **_k: None)
+    fake = SimpleNamespace(
+        mamba_slot_read_offsets=torch.zeros(NUM_BLOCKS, dtype=torch.int32),
+        _mamba_ckpt_window=window,
+        _pool_block_split=split,
+        _mamba_copy_plan=[(0, [])],
+        kv_cache_config=None,
+        max_num_reqs=10,
+        _bucket_len=TPUModelRunner._bucket_len,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+    )
+
+    TPUModelRunner._precompile_mamba_rollback_helpers(fake)
+
+    expected = [
+        ((n,), torch.long, (n, window), torch.int32, (n,), torch.long, False, False)
+        for n in (8, 32)
+    ]
+    assert calls == (expected if warms_spec_seed else [])

@@ -75,6 +75,9 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
             for r in req_ids
         },
         num_prompt_logprobs={},
+        _ZERO_PLACEHOLDERS=TPUModelRunner._ZERO_PLACEHOLDERS,
+        _cached_output_req_ids_key=None,
+        _cached_req_id_to_index_snap={},
         _pre_async_results=None,
         _pp_handoff=None,
         _dp_step_other_decode=False,
@@ -125,6 +128,12 @@ def _host_copy_state(chunks, lengths, **kwargs):
         copy_ready_event=MagicMock(),
         **kwargs,
     )
+
+
+def _pre_copy_state(tokens):
+    """The copy state of a previous step whose sampled tokens reached the
+    host as `tokens`, as `AsyncPreResults.copy_state` holds it."""
+    return _host_copy_state([tokens], [tokens.shape[0]])
 
 
 def _blocking_logprobs_lists(chunks):

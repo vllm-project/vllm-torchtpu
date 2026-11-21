@@ -355,7 +355,7 @@ def test_spec_decode_metadata_deferred_draft_token_ids(device):
             nd, cu, 4
         )
         assert ref.deferred_draft_token_ids_cpu is None
-        uploaded = md.upload_deferred_draft_token_ids(device)
+        uploaded = md.upload_deferred_draft_token_ids(manager.runner)
         assert uploaded.device.type == device.type
         assert torch.equal(uploaded.cpu(), ref.draft_token_ids.cpu())
 

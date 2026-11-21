@@ -20,7 +20,11 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
-from runner_output_test_utils import _host_copy_state, _sample_tokens_runner
+from runner_output_test_utils import (
+    _host_copy_state,
+    _pre_copy_state,
+    _sample_tokens_runner,
+)
 from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -403,7 +407,7 @@ def test_settle_uses_the_real_rollback_with_a_moved_request():
         request_seq_lens=[(0, a, 4, "a")],
         discard_sampled_tokens_req_indices=[],
         req_id_to_index_copy={"a": 0},
-        copy_state=SimpleNamespace(wait=lambda: None, sampled_token_ids_cpu=sampled),
+        copy_state=_pre_copy_state(sampled),
         num_draft_per_req={0: 3},
     )
     assert runner._min_tokens_batch_state() == {1: (4, 2, (9,), False)}
@@ -426,7 +430,7 @@ def test_update_states_tracks_new_requests_and_forgets_finished_ones():
     scheduler_output = SimpleNamespace(
         finished_req_ids={"old"},
         preempted_req_ids=None,
-        scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=set()),
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[], resumed_req_ids=set()),
         kv_cache_block_copies=None,
         scheduled_new_reqs=[new_req],
     )
@@ -457,7 +461,9 @@ def test_update_states_keeps_preempted_and_resumed_requests():
         scheduler_output = SimpleNamespace(
             finished_req_ids=set(),
             preempted_req_ids=preempted,
-            scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=resumed),
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=sorted(resumed), resumed_req_ids=resumed
+            ),
             kv_cache_block_copies=None,
             scheduled_new_reqs=[],
         )

@@ -77,6 +77,8 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         _dp_step_other_decode=False,
         num_prompt_logprobs={},
         _thinking_budget=None,
+        _cached_output_req_ids_key=None,
+        _cached_req_id_to_index_snap={},
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
             draft_chunks=[],
@@ -255,3 +257,52 @@ def test_spec_kv_fence_runs_after_drafter_before_connector_save(is_async):
     assert output.sampled_token_ids == [[7]]
     expected = ["draft", "fence", "rearm"] if is_async else ["draft", "rearm"]
     assert events == expected + ["save", "poll", "clear"]
+
+
+class _LoadErrorConnector:
+    """A connector that reports one failed block, with or without the group
+    index only the TPU connectors define."""
+
+    def __init__(self, group_index=None):
+        if group_index is not None:
+            self.get_block_ids_with_load_errors_group_index = lambda: group_index
+
+    def get_transfer_results(self, finished_req_ids):
+        return SimpleNamespace(
+            finished_sending=None, finished_recving=None, failed_recving=set()
+        )
+
+    def get_block_ids_with_load_errors(self):
+        return {5}
+
+    def build_connector_worker_meta(self):
+        return None
+
+    def get_kv_connector_stats(self):
+        return None
+
+    def clear_connector_metadata(self):
+        pass
+
+
+@pytest.mark.parametrize("group_index", [None, 2], ids=["vllm", "tpu"])
+def test_load_errors_report_a_group_only_when_the_connector_has_one(group_index):
+    """vLLM's connector base class has no get_block_ids_with_load_errors_group_index;
+    a connector without it still reports its failed blocks, with no group."""
+    runner = SimpleNamespace(_stage_timing=MagicMock())
+    runner._stage_timing.take_samples.return_value = ([], [])
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+            return_value=_LoadErrorConnector(group_index),
+        ),
+    ):
+        result = TPUModelRunner.get_finished_kv_transfers(
+            runner, SimpleNamespace(finished_req_ids=set())
+        )
+    invalid_block_ids, invalid_block_group_index = result[4], result[5]
+    assert invalid_block_ids == {5}
+    assert invalid_block_group_index == group_index

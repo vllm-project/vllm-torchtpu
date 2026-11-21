@@ -20,6 +20,10 @@ from typing import Any
 # `kv_connector_extra_config["connectors"]`: vLLM's and the TPU one.
 MULTI_CONNECTORS = ("MultiConnector", "TPUMultiConnector")
 
+# Connectors whose transfer statistics are `TpuKVConnectorStats`, the sink of
+# the runner's `RunnerStageTiming` samples.
+STAGE_TIMING_CONNECTORS = ("TPUConnector", "TPURaidenConnector")
+
 
 def kv_connector_names(
     kv_transfer_config: Any, multi_connectors: Container[str] = MULTI_CONNECTORS

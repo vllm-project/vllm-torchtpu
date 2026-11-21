@@ -770,6 +770,8 @@ class TpuPlatform(Platform):
     def get_compile_backend(cls) -> str:
         return "vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor"
 
+    _dp_tokens_tpu_cache: dict[tuple[torch.dtype, tuple[int, ...]], torch.Tensor] = {}
+
     @classmethod
     def set_additional_forward_context(cls, *args, **kwargs) -> dict:
         """Move DP metadata onto the TPU for DP+EP.
@@ -781,7 +783,13 @@ class TpuPlatform(Platform):
         if dp_metadata is not None:
             t = dp_metadata.num_tokens_across_dp_cpu
             if t.device.type == "cpu":
-                tpu_t = t.to("tpu")
+                values = (int(t.item()),) if t.numel() == 1 else tuple(t.tolist())
+                key = (t.dtype, values)
+                tpu_t = cls._dp_tokens_tpu_cache.get(key)
+                if tpu_t is None:
+                    tpu_t = t.to("tpu")
+                    if len(cls._dp_tokens_tpu_cache) < 512:
+                        cls._dp_tokens_tpu_cache[key] = tpu_t
                 try:
                     dp_metadata.num_tokens_across_dp_cpu = tpu_t
                 except Exception:

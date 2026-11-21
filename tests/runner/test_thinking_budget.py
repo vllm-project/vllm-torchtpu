@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 import torch
 from runner_input_test_utils import _make_sample_runner
+from runner_output_test_utils import _pre_copy_state
 from vllm import SamplingParams
 from vllm.config.reasoning import ReasoningConfig
 from vllm.sampling_params import StructuredOutputsParams
@@ -1133,6 +1134,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             wait_for_copy=lambda: (
                 events0.append("copy") or torch.tensor([[42]], dtype=torch.int64)
             ),
+            copy_state=_pre_copy_state(torch.tensor([[42]], dtype=torch.int64)),
         )
         logits0 = torch.zeros((4, 128))
         logits0[0, 55] = 8.0
@@ -1167,6 +1169,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
             wait_for_copy=lambda: (
                 events1.append("copy") or torch.tensor([[11]], dtype=torch.int64)
             ),
+            copy_state=_pre_copy_state(torch.tensor([[11]], dtype=torch.int64)),
         )
         logits1 = torch.zeros((4, 128))
         logits1[:, 55] = 8.0

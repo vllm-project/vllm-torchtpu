@@ -21,9 +21,10 @@ strictly; the platform calls it while it checks the config, so a malformed
 section fails at startup.
 """
 
-import dataclasses
 from dataclasses import dataclass
 from typing import Any
+
+from vllm_torchtpu import config_section
 
 SECTION = "tpu_collectives"
 
@@ -43,39 +44,14 @@ def parse(raw: Any) -> CollectivesOptions:
     """The ``tpu_collectives`` section as options; None gives the defaults.
 
     Strict: an unknown key, or a value whose type is not exactly the field's
-    (``1`` for a bool, say), raises ``ValueError``.
+    (``1`` for a bool, say), raises ``ValueError`` (``config_section.parse``).
     """
-    if raw is None:
-        return CollectivesOptions()
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"additional_config.{SECTION} must be a JSON object, "
-            f"got {type(raw).__name__}"
-        )
-    fields = {f.name: f.type for f in dataclasses.fields(CollectivesOptions)}
-    unknown = sorted(set(raw) - set(fields))
-    if unknown:
-        raise ValueError(
-            f"additional_config.{SECTION} has unknown keys {unknown}; "
-            f"valid keys: {sorted(fields)}"
-        )
-    for name, value in raw.items():
-        want = fields[name]
-        assert isinstance(want, type)  # the annotations are classes, not strings
-        if type(value) is not want:
-            raise ValueError(
-                f"additional_config.{SECTION}.{name} must be a "
-                f"{want.__name__}, got {value!r}"
-            )
-    return CollectivesOptions(**raw)
+    return config_section.parse(CollectivesOptions, SECTION, raw)
 
 
 def get(vllm_config: Any) -> CollectivesOptions:
     """The engine's collectives options."""
-    additional = vllm_config.additional_config
-    if not isinstance(additional, dict):
-        return CollectivesOptions()
-    return parse(additional.get(SECTION))
+    return config_section.get(CollectivesOptions, SECTION, vllm_config)
 
 
 def validate(vllm_config: Any) -> None:

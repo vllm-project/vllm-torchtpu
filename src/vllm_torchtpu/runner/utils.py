@@ -27,6 +27,7 @@ from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner import runner_options
 
 logger = init_logger(__name__)
 
@@ -49,13 +50,19 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_prefill_only_kv_len_threshold"
 )
 
-# Diagnostics-only knob: it steers profiling and never changes the compiled
-# graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps it out of the
-# TPU compile cache key.
+# Host-only section: the runner's host-side options (`runner_options`, which
+# owns the name) never change a compiled program.
+RUNNER_OPTIONS_SECTION = runner_options.SECTION
+
+# Diagnostics-only knobs and host-only sections: they steer profiling or the
+# host and never change the compiled graph, so
+# `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the TPU compile
+# cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
     {
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
         PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+        RUNNER_OPTIONS_SECTION,
     }
 )
 

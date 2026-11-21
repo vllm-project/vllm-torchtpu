@@ -19,6 +19,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 import torch
+from runner_output_test_utils import _pre_copy_state
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -48,6 +49,7 @@ def test_async_results_do_not_overwrite_recomputed_request(transition, num_draft
     )
     runner._last_sequence_layout_plan = None
     runner.pcp_manager = None
+    runner._async_subst_prep_cache = {}
     runner.speculative_config = (
         SimpleNamespace(num_speculative_tokens=num_drafts) if num_drafts else None
     )
@@ -63,6 +65,7 @@ def test_async_results_do_not_overwrite_recomputed_request(transition, num_draft
         spec_decode_num_rejected_tokens=rejected if num_drafts else None,
         num_draft_per_req={0: num_drafts, 1: num_drafts},
         wait_for_copy=lambda: copied,
+        copy_state=_pre_copy_state(copied),
     )
     runner._pre_async_results = previous
     runner._install_spec_token_room_guard = lambda: None

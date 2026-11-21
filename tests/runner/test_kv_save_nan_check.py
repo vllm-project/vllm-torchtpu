@@ -257,6 +257,8 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         _min_tokens_batch_state=lambda: {},
         vllm_config=SimpleNamespace(),
         maybe_setup_kv_connector=lambda *_args, **_kwargs: None,
+        _cached_output_req_ids_key=None,
+        _cached_req_id_to_index_snap={},
         input_batch=SimpleNamespace(
             num_reqs=2,
             req_ids=["r0", "r1"],
@@ -282,7 +284,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         _flush_mamba_state_seed_copies=lambda: None,
         _reset_read_offsets_for_new_requests=lambda *_args: None,
         input_ids=torch.zeros(2, dtype=torch.int32),
-        _apply_async_token_substitution=lambda ids, *_args: ids,
+        _apply_async_token_substitution=lambda ids, *_args, **_kwargs: ids,
         _record_input_staging_fence=lambda: None,
         _get_model_inputs=lambda ids, _mm: (ids, None),
         _token_padding_update=lambda _n: None,

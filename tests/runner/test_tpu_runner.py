@@ -26,6 +26,7 @@ import torch
 from runner_output_test_utils import (
     _assert_same_logprobs_lists,
     _blocking_logprobs_lists,
+    _pre_copy_state,
     _sample_tokens_runner,
 )
 from vllm.config import (
@@ -52,6 +53,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_torchtpu.distributed.kv_transfer.connector_names import MULTI_CONNECTORS
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
 )
@@ -81,6 +83,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
     AsyncPreResults,
     AsyncTPUModelRunnerOutput,
+    extract_draft_token_ids,
 )
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
@@ -906,6 +909,7 @@ def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
         _last_sequence_layout_plan=None,
         pcp_manager=None,
         input_batch=SimpleNamespace(req_ids=req_ids),
+        _async_subst_prep_cache={},
     )
     cur, src = TPUModelRunner._prepare_async_token_substitution_indices(
         fake,
@@ -1959,8 +1963,12 @@ class TestReorderBatchForRpa:
         runner = MagicMock(spec=TPUModelRunner)
         runner.input_batch = MagicMock()
         runner._masked_dense_groups_requests = groups_requests
+        runner._static_verify_q_len = None
         runner._reorder_batch_for_rpa = TPUModelRunner._reorder_batch_for_rpa.__get__(
             runner
+        )
+        runner._order_prefills_and_publish_swaps = (
+            TPUModelRunner._order_prefills_and_publish_swaps.__get__(runner)
         )
         return runner
 
@@ -2058,6 +2066,33 @@ class TestReorderBatchForRpa:
         assert runner._reorder_batch_for_rpa(sched) == (1, 2)
         assert runner._num_static_verify_reqs == 0
 
+    def test_ordered_batches_recount_static_verify_windows(self):
+        """Already-ordered batches skip the partition passes; the static
+        verify count must still be this step's, not the previous step's."""
+        runner = self._make_runner()
+        runner._static_verify_q_len = 4
+        self._batch(runner, ["dc", "full", "short", "full2"])
+        sched = self._sched(
+            {"dc": 1, "full": 4, "short": 2, "full2": 4},
+            spec_reqs=("full", "short", "full2"),
+        )
+        assert runner._reorder_batch_for_rpa(sched) == (1, 4)
+        assert runner._num_static_verify_reqs == 2
+        ids = runner.input_batch.req_ids
+        assert set(ids[1:3]) == {"full", "full2"} and ids[3] == "short"
+        # Ordered verify step whose full-length windows already lead.
+        self._batch(runner, ["dc", "full", "full2"])
+        sched = self._sched(
+            {"dc": 1, "full": 4, "full2": 4}, spec_reqs=("full", "full2")
+        )
+        assert runner._reorder_batch_for_rpa(sched) == (1, 3)
+        assert runner._num_static_verify_reqs == 2
+        # Ordered step without verify windows.
+        self._batch(runner, ["d1", "d2", "pf"])
+        sched = self._sched({"d1": 1, "d2": 1, "pf": 8})
+        assert runner._reorder_batch_for_rpa(sched) == (2, 2)
+        assert runner._num_static_verify_reqs == 0
+
     def test_masked_dense_orders_by_kv_length(self):
         runner = self._make_runner(groups_requests=True)
         self._batch(
@@ -2102,6 +2137,33 @@ class TestReorderBatchForRpa:
             "tie_a": 3900,
             "tie_b": 3400,
         }
+
+    @pytest.mark.parametrize(
+        "req_ids, computed, refreshes",
+        [
+            # Segments already in order: only the KV-length order swaps.
+            (["decode", "short", "long"], [9000, 1000, 7000], 1),
+            # The decode moves to the front, then the KV-length order swaps.
+            (["short", "decode", "long"], [1000, 9000, 7000], 1),
+            # The decode moves to the front; the KV order already holds.
+            (["long", "decode", "short"], [7000, 9000, 1000], 1),
+            # Nothing moves.
+            (["decode", "long", "short"], [9000, 7000, 1000], 0),
+        ],
+    )
+    def test_swaps_are_published_once_per_step(self, req_ids, computed, refreshes):
+        """vLLM applies `swap_states` swaps to its batch state in
+        `refresh_metadata`, which `_update_states` ran before this reorder, so
+        a step whose reorder or KV-length order swaps any request refreshes
+        once and drops the output's request-index snapshot."""
+        runner = self._make_runner(groups_requests=True)
+        self._batch(runner, req_ids, computed=computed)
+        runner._cached_output_req_ids_key = ("previous step",)
+        sched = self._sched({"decode": 1, "short": 512, "long": 32})
+        assert runner._reorder_batch_for_rpa(sched) == (1, 1)
+        assert runner.input_batch.req_ids == ["decode", "long", "short"]
+        assert runner.input_batch.refresh_metadata.call_count == refreshes
+        assert (runner._cached_output_req_ids_key is None) == bool(refreshes)
 
     @pytest.mark.parametrize("groups_requests", [False, None])
     def test_order_kept_unless_grouping_applies(self, groups_requests):
@@ -2286,7 +2348,7 @@ class TestMambaSlotReadOffsets:
         )
         # Must not raise even with real-looking args.
         runner._update_mamba_slot_read_offsets(
-            [torch.tensor([1, 4])], torch.tensor([[10, -1]]), 2
+            [torch.tensor([1, 4])], torch.tensor([[10, -1]])
         )
 
     def test_verify_offsets_are_num_accepted_minus_one(self):
@@ -2298,7 +2360,7 @@ class TestMambaSlotReadOffsets:
         next_tokens = torch.tensor(
             [[10, 11, 12], [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]]
         )
-        runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 2)
+        runner._update_mamba_slot_read_offsets([state_indices], next_tokens)
         assert int(runner.mamba_slot_read_offsets[1]) == 2  # 3 valid - 1
         assert int(runner.mamba_slot_read_offsets[4]) == 0  # 1 valid - 1
 
@@ -2309,7 +2371,7 @@ class TestMambaSlotReadOffsets:
         runner.mamba_slot_read_offsets[1] = 2
         runner.mamba_slot_read_offsets[4] = 1
         runner._update_mamba_slot_read_offsets(
-            [torch.tensor([1, 4], dtype=torch.int32)], None, 2
+            [torch.tensor([1, 4], dtype=torch.int32)], None
         )
         assert int(runner.mamba_slot_read_offsets[1]) == 0
         assert int(runner.mamba_slot_read_offsets[4]) == 0
@@ -2319,10 +2381,10 @@ class TestMambaSlotReadOffsets:
         land there harmlessly and never touch an active group base."""
         runner = self._make_runner(num_blocks=8)
         runner.mamba_slot_read_offsets[1] = 2
-        # num_reqs = 1 active (slot 1); position 1 is padding -> slot 0.
+        # One active request (slot 1); position 1 is padding -> slot 0.
         state_indices = torch.tensor([1, 0], dtype=torch.int32)
         next_tokens = torch.tensor([[10, 11], [INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
-        runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 1)
+        runner._update_mamba_slot_read_offsets([state_indices], next_tokens)
         assert int(runner.mamba_slot_read_offsets[1]) == 1  # 2 valid - 1
         # Null slot only ever gets 0; active groups untouched by the tail.
         assert int(runner.mamba_slot_read_offsets[0]) == 0
@@ -2336,14 +2398,28 @@ class TestMambaSlotReadOffsets:
         next_tokens = torch.tensor(
             [[10, 11, 12], [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]]
         )
-        runner._update_mamba_slot_read_offsets([group0, group1], next_tokens, 2)
+        runner._update_mamba_slot_read_offsets([group0, group1], next_tokens)
         for block, expected in ((3, 2), (7, 0), (11, 2), (5, 0)):
             assert int(runner.mamba_slot_read_offsets[block]) == expected
 
     def test_unified_empty_group_list_is_noop(self):
         runner = self._make_runner(num_blocks=8)
-        runner._update_mamba_slot_read_offsets([], torch.tensor([[1, 2]]), 1)
+        runner._update_mamba_slot_read_offsets([], torch.tensor([[1, 2]]))
         assert int(runner.mamba_slot_read_offsets.sum()) == 0
+
+    def test_bucketed_next_tokens_shorter_than_state_indices_padded_in_graph(self):
+        """When next_tokens has shape [padded_num_reqs, K+1] while state_indices
+        has shape [target_num_reqs] (B < width), _update_read_offsets_verify_impl
+        pads offsets in-graph and leaves null-tail slots at 0."""
+        runner = self._make_runner(num_blocks=16)
+        state_indices = torch.tensor([1, 4, 0, 0], dtype=torch.int32)
+        next_tokens = torch.tensor(
+            [[10, 11, 12], [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]]
+        )
+        runner._update_mamba_slot_read_offsets([state_indices], next_tokens)
+        assert int(runner.mamba_slot_read_offsets[1]) == 2
+        assert int(runner.mamba_slot_read_offsets[4]) == 0
+        assert int(runner.mamba_slot_read_offsets[0]) == 0
 
 
 class TestReadOffsetsClearedOnReallocation:
@@ -2464,6 +2540,83 @@ class TestReadOffsetsClearedOnReallocation:
         runner._reset_read_offsets_for_new_requests(0, 2)
         assert len(calls) == (5 if lockstep else 3)
         assert int(runner.mamba_slot_read_offsets[5]) == 0
+
+    def test_continuing_batch_uses_keep_zero_dev_without_mutating_keep_dev(self):
+        """Under EP-DP lockstep a batch with no new request still launches the
+        reset, through the persistent all-False keep_zero_dev mask, without
+        copying keep_cpu into keep_dev. (Without lockstep it is skipped.)"""
+        runner = self._make_runner(lockstep=True)
+        self._set_batch(runner, ["a", "b"], [5, 6])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        _, keep_dev, keep_zero_dev, _ = runner._read_offset_reset_scratch(
+            2, torch.device("cpu")
+        )
+        assert list(keep_dev) == [True, True]
+        assert list(keep_zero_dev) == [False, False]
+        runner.mamba_slot_read_offsets[5] = 2
+        runner.mamba_slot_read_offsets[6] = 1
+        # Next step with the same requests: keep_dev is not overwritten because
+        # keep_zero_dev is passed directly, and live offsets remain intact.
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert list(keep_dev) == [True, True]
+        assert list(keep_zero_dev) == [False, False]
+        assert int(runner.mamba_slot_read_offsets[5]) == 2
+        assert int(runner.mamba_slot_read_offsets[6]) == 1
+
+    def test_continuing_batch_skips_reset_kernel_when_not_lockstep(self, monkeypatch):
+        import vllm_torchtpu.runner.tpu_runner as tr_mod
+
+        calls = []
+        orig_reset = tr_mod._reset_read_offsets
+        monkeypatch.setattr(
+            tr_mod,
+            "_reset_read_offsets",
+            lambda *a, **k: (calls.append(a), orig_reset(*a, **k))[1],
+        )
+        runner = self._make_runner()
+        runner._dp_lockstep_enabled = lambda: False
+        self._set_batch(runner, ["a", "b"], [5, 6])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert len(calls) == 1
+        stacked = runner._attn_metadata_builder_ctx._stacked_mamba_groups
+        assert isinstance(stacked, torch.Tensor)
+
+        # Second step with the same requests: no new requests and not in
+        # lockstep, so it returns before _reset_read_offsets and before it
+        # touches ctx; the groups the first step stacked stay there for
+        # post-verify reuse.
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert len(calls) == 1
+        assert runner._attn_metadata_builder_ctx._stacked_mamba_groups is stacked
+
+    def test_reuses_pre_stacked_mamba_groups_from_ctx(self, monkeypatch):
+        import vllm_torchtpu.runner.tpu_runner as tr_mod
+
+        stack_calls = []
+        monkeypatch.setattr(
+            tr_mod,
+            "_stack_or_single_mamba_groups",
+            lambda groups: (
+                stack_calls.append(groups),
+                torch.stack(groups, dim=0),
+            )[1],
+        )
+        runner = self._make_runner()
+        g0 = torch.tensor([5, 6], dtype=torch.int32)
+        g1 = torch.tensor([1, 2], dtype=torch.int32)
+        pre_stacked = torch.stack([g0, g1], dim=0)
+        runner.input_batch.req_ids = ["a", "b"]
+        runner.input_batch.req_id_to_index = {"a": 0, "b": 1}
+        runner.requests = {"a": None, "b": None}
+        ctx = SimpleNamespace(
+            mamba_state_indices=None,
+            unified_mamba_state_indices=[g0, g1],
+            _stacked_mamba_groups=pre_stacked,
+            _stacked_mamba_groups_ids=(id(g0), id(g1)),
+        )
+        runner._attn_metadata_builder_ctx = ctx
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert stack_calls == []
 
 
 class TestUnifiedReadOffsetMigration:
@@ -2691,18 +2844,18 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
     request's query, so a trimmed count slides the verify window forward and
     the sampler validates the wrong drafts.
     """
-    runner = SimpleNamespace(
-        input_batch=SimpleNamespace(
-            token_ids_cpu=np.zeros((4, 2048), dtype=np.int32),
-            num_tokens_no_spec=np.array([10, 2038, 2048, 0], dtype=np.int32),
-            req_id_to_index={"roomy": 0, "edge": 1, "full": 2},
-            spec_token_ids=[[] for _ in range(4)],
-        ),
-        requests={},
-    )
+    from vllm.v1.worker.gpu_input_batch import InputBatch
+
+    ib = object.__new__(InputBatch)
+    ib.token_ids_cpu = np.zeros((4, 2048), dtype=np.int32)
+    ib.is_token_ids = np.zeros((4, 2048), dtype=bool)
+    ib.num_tokens_no_spec = np.array([10, 2038, 2048, 0], dtype=np.int32)
+    ib.req_id_to_index = {"roomy": 0, "edge": 1, "full": 2}
+    ib.spec_token_ids = [[] for _ in range(4)]
+    runner = SimpleNamespace(input_batch=ib, requests={})
     calls = []
-    runner.input_batch.update_req_spec_token_ids = lambda request, scheduled: (
-        calls.append((request.req_id, list(scheduled[request.req_id])))
+    ib.update_req_spec_token_ids = lambda request, scheduled: calls.append(
+        (request.req_id, list(scheduled[request.req_id]))
     )
     TPUModelRunner._install_spec_token_room_guard(runner)
 
@@ -2712,25 +2865,72 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
         for rid in ("roomy", "edge", "full")
     }
     for rid in ("roomy", "edge", "full"):
-        runner.input_batch.update_req_spec_token_ids(requests[rid], scheduled)
+        ib.update_req_spec_token_ids(requests[rid], scheduled)
 
-    # Only what fits is staged into token_ids_cpu.
-    assert [(r, len(ids)) for r, ids in calls] == [
-        ("roomy", 15),
-        ("edge", 10),
-        ("full", 0),
-    ]
+    # "roomy" fits and is staged by the guard itself; the others go through
+    # the wrapped method with only what fits.
+    assert ib.token_ids_cpu[0, 10:25].tolist() == [1] * 15
+    assert ib.is_token_ids[0, 10:25].all() and not ib.is_token_ids[0, 25:].any()
+    assert [(r, len(ids)) for r, ids in calls] == [("edge", 10), ("full", 0)]
     # ...and the clamped write keeps the first drafts, not the last.
-    assert calls[1][1] == [2] * 10
+    assert calls[0][1] == [2] * 10
     # The scheduler's counts are restored, so the verify window stays aligned
     # with num_scheduled_tokens.
     assert [len(scheduled[r]) for r in ("roomy", "edge", "full")] == [15, 15, 15]
     assert [requests[r].prev_num_draft_len for r in ("roomy", "edge", "full")] == [
-        0,
+        15,
         15,
         15,
     ]
-    assert [len(runner.input_batch.spec_token_ids[i]) for i in (1, 2)] == [15, 15]
+    assert [len(ib.spec_token_ids[i]) for i in (0, 1, 2)] == [15, 15, 15]
+
+
+@pytest.mark.parametrize(
+    "drafts", [None, [], [7], [7, 8], [7, 8, 9], [7, 8, 9, 10, 11]]
+)
+def test_spec_token_room_guard_fast_path_matches_upstream(drafts):
+    """With room for every draft, the guard stages the drafts itself instead of
+    calling vLLM's InputBatch.update_req_spec_token_ids. It must leave the
+    batch, the request and the scheduled dict exactly as the pinned upstream
+    method does (which writes no per-request token count)."""
+    from vllm.v1.worker.gpu_input_batch import InputBatch
+
+    def batch():
+        # The fields update_req_spec_token_ids reads and writes.
+        ib = object.__new__(InputBatch)
+        ib.req_id_to_index = {"a": 0, "b": 1}
+        ib.num_tokens_no_spec = np.array([5, 9], dtype=np.int32)
+        ib.token_ids_cpu = np.full((2, 16), -1, dtype=np.int32)
+        ib.is_token_ids = np.zeros((2, 16), dtype=bool)
+        ib.spec_token_ids = [[1, 2], [3]]
+        return ib
+
+    def scheduled():
+        return {} if drafts is None else {"b": list(drafts)}
+
+    ref, ref_req, ref_scheduled = batch(), SimpleNamespace(req_id="b"), scheduled()
+    ref_req.prev_num_draft_len = 4
+    InputBatch.update_req_spec_token_ids(ref, ref_req, ref_scheduled)
+
+    runner = SimpleNamespace(input_batch=batch())
+    upstream_calls = []
+    upstream = runner.input_batch.update_req_spec_token_ids
+    runner.input_batch.update_req_spec_token_ids = lambda *a: (
+        upstream_calls.append(a),
+        upstream(*a),
+    )
+    TPUModelRunner._install_spec_token_room_guard(runner)
+    req, sched = SimpleNamespace(req_id="b", prev_num_draft_len=4), scheduled()
+    runner.input_batch.update_req_spec_token_ids(req, sched)
+
+    ib = runner.input_batch
+    np.testing.assert_array_equal(ib.token_ids_cpu, ref.token_ids_cpu)
+    np.testing.assert_array_equal(ib.is_token_ids, ref.is_token_ids)
+    assert ib.spec_token_ids == ref.spec_token_ids
+    assert req.prev_num_draft_len == ref_req.prev_num_draft_len
+    assert sched == ref_scheduled
+    # Every case here took the guard's own path, not upstream's.
+    assert upstream_calls == []
 
 
 class TestBuildAttentionMetadataForLayers:
@@ -2855,6 +3055,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         _fenced_h2d_sources=[],
         _free_h2d_sources={},
         _registered_h2d_sources=set(),
+        _h2d_reuse={},
         _token_padding_state=None,
         pcp_manager=None,
         sequence_layout_planner=SimpleNamespace(
@@ -3091,9 +3292,11 @@ class TestInputStagingFence:
             TPUModelRunner._dummy_run(
                 runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=dp_lockstep
             )
-            # Only this run's staged table is still held, by its own fence.
+            # At most this run's staged table is still held, by its own fence.
+            # A run whose staged table equals the previous upload reuses that
+            # device tensor and stages nothing, so buffers never accumulate.
             assert runner._unfenced_h2d_sources == []
-            assert len(runner._fenced_h2d_sources) == 1
+            assert len(runner._fenced_h2d_sources) <= 1
             assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
         assert len(_FakeTpuEvent.instances) == 3
         assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])
@@ -3185,6 +3388,7 @@ class TestAsyncSpecDecodeTokenAccounting:
             discard_sampled_tokens_req_indices=[],
             num_draft_per_req=num_draft_0,
             wait_for_copy=copy_mock_0.wait_for_copy,
+            copy_state=_pre_copy_state(copy_mock_0.wait_for_copy.return_value),
         )
         TPUModelRunner._modify_prev_results(runner)
 
@@ -3226,6 +3430,7 @@ class TestAsyncSpecDecodeTokenAccounting:
             discard_sampled_tokens_req_indices=[],
             num_draft_per_req=num_draft_1,
             wait_for_copy=copy_mock_1.wait_for_copy,
+            copy_state=_pre_copy_state(copy_mock_1.wait_for_copy.return_value),
         )
         TPUModelRunner._modify_prev_results(runner)
 
@@ -3269,6 +3474,7 @@ class TestAsyncSpecDecodeTokenAccounting:
             discard_sampled_tokens_req_indices=[],
             num_draft_per_req=num_draft_2,
             wait_for_copy=copy_mock_2.wait_for_copy,
+            copy_state=_pre_copy_state(copy_mock_2.wait_for_copy.return_value),
         )
         TPUModelRunner._modify_prev_results(runner)
 
@@ -3315,6 +3521,7 @@ class TestAsyncSpecDecodeTokenAccounting:
             discard_sampled_tokens_req_indices=[],
             num_draft_per_req={0: 3, 1: 3},
             wait_for_copy=copy_mock.wait_for_copy,
+            copy_state=_pre_copy_state(copy_mock.wait_for_copy.return_value),
         )
 
         TPUModelRunner._modify_prev_results(runner)
@@ -3343,6 +3550,7 @@ class TestAsyncSpecDecodeTokenAccounting:
             discard_sampled_tokens_req_indices=[],
             num_draft_per_req=None,
             wait_for_copy=copy_mock.wait_for_copy,
+            copy_state=_pre_copy_state(copy_mock.wait_for_copy.return_value),
         )
 
         TPUModelRunner._modify_prev_results(runner)
@@ -3405,6 +3613,7 @@ class TestAsyncSpecDecodeTokenAccounting:
             discard_sampled_tokens_req_indices=[],
             num_draft_per_req={0: 3},
             wait_for_copy=copy_mock.wait_for_copy,
+            copy_state=_pre_copy_state(copy_mock.wait_for_copy.return_value),
         )
         TPUModelRunner._modify_prev_results(runner)
 
@@ -3552,6 +3761,7 @@ def test_flush_keeps_zero_token_async_results_until_waited():
 
     class FakeCopyState:
         sampled_token_ids_cpu = torch.tensor([[7]], dtype=torch.int32)
+        sampled_token_ids_list = [[7]]
 
         def wait(self):
             events.append("wait")
@@ -3559,7 +3769,13 @@ def test_flush_keeps_zero_token_async_results_until_waited():
     copy_state = FakeCopyState()
     weakref.finalize(copy_state, events.append, "freed")
     runner = SimpleNamespace(
-        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-prefill"]),
+        input_batch=SimpleNamespace(
+            num_reqs=1,
+            req_ids=["req-prefill"],
+            req_id_to_index={"req-prefill": 0},
+            num_tokens_no_spec=np.zeros(1, dtype=np.int32),
+            token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
+        ),
         _pre_async_results=AsyncPreResults(
             req_ids=["req-prefill"],
             next_tokens_tpu=torch.tensor([7], dtype=torch.int32),
@@ -4342,3 +4558,177 @@ class TestLogitsAtDpVocabRows:
             TPUModelRunner._logits_at_dp_vocab_rows(
                 runner, torch.zeros(9, 2), torch.arange(9)
             )
+
+
+def test_stage_timing_disabled_skips_thread_and_events():
+    from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
+
+    timing = RunnerStageTiming(0, enabled=False)
+    assert timing._enabled is False
+    with timing.stage("main_forward"):
+        pass
+    with timing.host_stage("prep"):
+        pass
+    assert not timing._pending
+    assert timing.take_samples() == ([], [])
+
+
+def test_dp_num_tokens_across_dp_caches_cpu_tensors():
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner._dp_tokens_cpu_cache = {}
+    runner._dp_lockstep_enabled = lambda: False
+    runner.parallel_config = SimpleNamespace(
+        data_parallel_size=1,
+        use_sequence_parallel_moe=True,
+    )
+    t1 = runner._dp_num_tokens_across_dp(64)
+    t2 = runner._dp_num_tokens_across_dp(64)
+    t3 = runner._dp_num_tokens_across_dp(16)
+    assert t1 is not None
+    assert t1 is t2
+    assert t1.tolist() == [64]
+    assert t3 is not None and t3.tolist() == [16]
+
+    runner.parallel_config.use_sequence_parallel_moe = False
+    assert runner._dp_num_tokens_across_dp(64) is None
+
+
+def test_kv_transfer_uses_stage_timing():
+    cfg_none = SimpleNamespace(kv_transfer_config=None)
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_none) is False
+
+    cfg_offload = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="TPURaidenOffloadingConnector",
+            kv_connector_extra_config={},
+        )
+    )
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_offload) is False
+
+    cfg_raiden = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="TPURaidenConnector",
+            kv_connector_extra_config={},
+        )
+    )
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_raiden) is True
+
+    cfg_multi_with_tpu = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="TPUMultiConnector",
+            kv_connector_extra_config={
+                "connectors": [
+                    {"kv_connector": "TPURaidenOffloadingConnector"},
+                    {"kv_connector": "TPUConnector"},
+                ]
+            },
+        )
+    )
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_multi_with_tpu) is True
+
+
+@pytest.mark.parametrize("multi", MULTI_CONNECTORS)
+@pytest.mark.parametrize(
+    "children,want",
+    [
+        (["TPURaidenOffloadingConnector", "TPURaidenConnector"], True),
+        (["OffloadingConnector"], False),
+        ([], False),
+    ],
+)
+def test_kv_transfer_stage_timing_reads_every_multi_connector(multi, children, want):
+    """Every multi-connector `connector_names` knows is walked the same way,
+    so a name added there cannot silently turn the stage timings off."""
+    cfg = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector=multi,
+            kv_connector_extra_config={
+                "connectors": [{"kv_connector": c} for c in children]
+            },
+        )
+    )
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg) is want
+
+
+def test_update_states_clears_prev_draft_len_of_scheduled_cached_requests():
+    """The base runner's async draft correction reads prev_num_draft_len of
+    every scheduled cached request; one scheduled without drafts after
+    drafting in the previous step must be cleared too."""
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    runner = object.__new__(TPUModelRunner)
+    states = {
+        rid: SimpleNamespace(prev_num_draft_len=3)
+        for rid in ("drafting", "budget_cut", "unscheduled")
+    }
+    from vllm_torchtpu.runner.min_tokens import MinTokensTracker
+
+    runner.requests = states
+    runner._min_tokens = MinTokensTracker()
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    runner.scheduler_config = SimpleNamespace(async_scheduling=True)
+    runner._pre_async_results = None
+    runner._install_spec_token_room_guard = lambda: None
+    runner._mamba_state_pos = {}
+    runner._mamba_offset_seeded = set()
+    runner._mamba_slot_by_req_id = {}
+    runner._free_mamba_slots = []
+    output = SchedulerOutput.make_empty()
+    output.scheduled_cached_reqs.req_ids = ["drafting", "budget_cut"]
+    output.scheduled_spec_decode_tokens = {"drafting": [-1, -1, -1]}
+    seen: dict[str, int] = {}
+
+    def base_update(_output):
+        seen.update({rid: s.prev_num_draft_len for rid, s in states.items()})
+
+    with patch.object(GPUModelRunner, "_update_states", side_effect=base_update):
+        runner._update_states(output)
+
+    assert seen == {"drafting": 0, "budget_cut": 0, "unscheduled": 3}
+
+
+@pytest.mark.parametrize(
+    "num_draft_tokens,cu_num_scheduled_tokens,num_input,trimmed",
+    [
+        ([3, 2], [4, 7], 16, True),  # every draft input lies below 8 rows
+        ([3, 2], [4, 7], 8, False),  # nothing to cut
+        ([0, 2], [10, 13], 16, False),  # a draft input at row 12 >= 8
+    ],
+    ids=["padded_decode", "unpadded_decode", "prefill_first"],
+)
+def test_draft_extract_reads_the_same_drafts_from_the_cut_input(
+    num_draft_tokens, cu_num_scheduled_tokens, num_input, trimmed
+):
+    """The draft extract takes `input_ids` cut to the logits length only when
+    the metadata's largest draft input index lies below it, as a copy, and
+    reads the same drafts as from the whole input. Both build paths set the
+    index: the second build of the same layout comes from the cache."""
+    runner = MagicMock()
+    runner.device = torch.device("cpu")
+    runner.arange_np = np.arange(100, dtype=np.int32)
+    runner.num_tokens_paddings = [8, 16, 32, 64]
+    input_ids = torch.arange(1, num_input + 1, dtype=torch.int32)
+    runner.input_ids_cpu = input_ids
+    manager = SpeculativeDecodingManager(runner)
+    layout = (
+        np.array(num_draft_tokens, dtype=np.int32),
+        np.array(cu_num_scheduled_tokens, dtype=np.int32),
+        4,
+    )
+    fresh = manager.get_spec_decode_metadata(*layout)
+    cached = manager.get_spec_decode_metadata(*layout)
+    assert cached.final_logits_indices is fresh.final_logits_indices  # a cache hit
+    for metadata in (fresh, cached):
+        cut = tpu_runner._draft_extract_input_ids(input_ids, metadata)
+        length = metadata.final_logits_indices.shape[0]
+        assert cut.shape[0] == (length if trimmed else num_input)
+        if trimmed:
+            # A copy, not a view of the input.
+            assert cut.untyped_storage().data_ptr() != (
+                input_ids.untyped_storage().data_ptr()
+            )
+        args = (metadata.final_logits_indices, metadata.target_logits_indices)
+        assert torch.equal(
+            extract_draft_token_ids(cut, *args),
+            extract_draft_token_ids(input_ids, *args),
+        )

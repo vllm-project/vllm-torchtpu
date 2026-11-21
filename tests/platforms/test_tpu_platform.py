@@ -431,6 +431,26 @@ class TestTpuPlatform:
         with pytest.raises(NotImplementedError, match="rejection_sample_method"):
             TpuPlatform.check_and_update_config(vllm_config)
 
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_refuses_async_scheduling_for_ngram(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        """Only a hidden-state drafter runs under async scheduling, so only it
+        rolls back rejected drafts in `_prepare_inputs`, and the runner warms
+        that program (`_precompile_rejected_token_subtraction`) only for it."""
+        vllm_config.speculative_config = MagicMock(
+            rejection_sample_method="standard", method="ngram"
+        )
+        vllm_config.speculative_config.use_eagle.return_value = False
+        vllm_config.scheduler_config.async_scheduling = True
+        with pytest.raises(
+            NotImplementedError, match="speculative method 'ngram' is not supported"
+        ):
+            TpuPlatform.check_and_update_config(vllm_config)
+
     @pytest.mark.parametrize(
         "section,is_moe,error",
         [
@@ -1687,3 +1707,54 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
     with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
         _validate_peer_replay_config()
+
+
+def test_set_additional_forward_context_caches_dp_num_tokens_tpu_tensor(monkeypatch):
+    """Repeated calls with the same num_tokens_across_dp tuple reuse the cached
+    device tensor instead of calling .to('tpu') on every forward context."""
+    monkeypatch.setattr(TpuPlatform, "_dp_tokens_tpu_cache", {})
+    to_calls = []
+
+    class FakeCpuTensor:
+        def __init__(self, vals, dtype=torch.int32):
+            self.device = SimpleNamespace(type="cpu")
+            self.dtype = dtype
+            self._vals = list(vals)
+
+        def numel(self):
+            return len(self._vals)
+
+        def item(self):
+            return self._vals[0]
+
+        def tolist(self):
+            return list(self._vals)
+
+        def to(self, device):
+            to_calls.append((tuple(self._vals), device, self.dtype))
+            return SimpleNamespace(dtype=self.dtype, vals=tuple(self._vals))
+
+    dp_metadata_1 = SimpleNamespace(num_tokens_across_dp_cpu=FakeCpuTensor([64]))
+    dp_metadata_2 = SimpleNamespace(num_tokens_across_dp_cpu=FakeCpuTensor([64]))
+    dp_metadata_3 = SimpleNamespace(num_tokens_across_dp_cpu=FakeCpuTensor([16]))
+
+    TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata_1)
+    TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata_2)
+    assert dp_metadata_1.num_tokens_across_dp_cpu.vals == (64,)
+    assert (
+        dp_metadata_2.num_tokens_across_dp_cpu is dp_metadata_1.num_tokens_across_dp_cpu
+    )
+    assert to_calls == [((64,), "tpu", torch.int32)]
+
+    TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata_3)
+    assert dp_metadata_3.num_tokens_across_dp_cpu.vals == (16,)
+    assert len(to_calls) == 2
+
+    # The same counts in another dtype get their own entry, reused after.
+    for _ in range(2):
+        dp_metadata = SimpleNamespace(
+            num_tokens_across_dp_cpu=FakeCpuTensor([64], dtype=torch.int64)
+        )
+        TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata)
+        assert dp_metadata.num_tokens_across_dp_cpu.dtype == torch.int64
+    assert to_calls[2:] == [((64,), "tpu", torch.int64)]
