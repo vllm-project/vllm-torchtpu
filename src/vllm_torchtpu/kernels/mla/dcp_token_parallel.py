@@ -765,18 +765,36 @@ def _project_hrv_pair_halves_local(
     split_rows = layout.split_rows
     pairs = [(i, i ^ 1) for i in range(layout.dcp_size)]
     w_peer = lax.ppermute(w_local, axis_name, pairs)
-    perm_shift = [(i, i + 1) for i in range(layout.dcp_size - 1)]
-    carried_hrv = lax.ppermute(
-        own_hrv[:, num_rows - split_rows :, :], axis_name, perm_shift
-    )
-    if use_pallas:
-        mine, peer, x_scale = shift_quant_split_3d.shift_quant_split_3d_fp8(
-            lead_hrv, carried_hrv, own_hrv, rank_vec
+    if use_pallas and shift_quant_split_3d.supports_shift_quant_split_3d_remote(
+        own_hrv.shape[0],
+        num_rows,
+        split_rows,
+        own_hrv.shape[2],
+        own_hrv.dtype,
+        layout.dcp_size,
+    ):
+        # Avoid a separate bf16[H, S, V] lax.ppermute across all layers: quantize
+        # and push the tail slice in FP8 (half the bytes) overlapped with the body.
+        mine, peer, x_scale = shift_quant_split_3d.shift_quant_split_3d_fp8_remote(
+            lead_hrv,
+            own_hrv,
+            rank_vec,
+            dcp_size=layout.dcp_size,
+            axis_name=axis_name,
         )
     else:
-        mine, peer, x_scale = shift_quant_split_3d.shift_quant_split_3d_ref(
-            lead_hrv, carried_hrv, own_hrv, rank_vec
+        perm_shift = [(i, i + 1) for i in range(layout.dcp_size - 1)]
+        carried_hrv = lax.ppermute(
+            own_hrv[:, num_rows - split_rows :, :], axis_name, perm_shift
         )
+        if use_pallas:
+            mine, peer, x_scale = shift_quant_split_3d.shift_quant_split_3d_fp8(
+                lead_hrv, carried_hrv, own_hrv, rank_vec
+            )
+        else:
+            mine, peer, x_scale = shift_quant_split_3d.shift_quant_split_3d_ref(
+                lead_hrv, carried_hrv, own_hrv, rank_vec
+            )
     dims = (((1,), (0,)), ((), ()))
     y = lax.dot_general(
         mine, w_local, dims, preferred_element_type=jnp.float32

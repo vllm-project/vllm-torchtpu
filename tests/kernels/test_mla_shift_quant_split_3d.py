@@ -547,3 +547,181 @@ def test_should_fallback_cleanly_for_bf16_pair_halves_and_reject_partial_oproj_a
             w_o_scale=None,  # type: ignore[arg-type] -- intentional guard test
             num_tokens=num_tokens,
         )
+
+
+def test_should_validate_supported_shapes_for_remote_shift_quant_split_3d():
+    assert sq3d.supports_shift_quant_split_3d_remote(
+        64, 1024, 64, 256, jnp.bfloat16, 16, allow_non_tpu=True
+    )
+    assert sq3d.supports_shift_quant_split_3d_remote(
+        4, 192, 64, 128, jnp.bfloat16, 2, allow_non_tpu=True
+    )
+    assert sq3d.supports_shift_quant_split_3d_remote(
+        4, 96, 32, 128, jnp.bfloat16, 4, allow_non_tpu=True
+    )
+    # Reject dcp_size<2, <3 row blocks, unsupported split_rows, tight VMEM.
+    assert not sq3d.supports_shift_quant_split_3d_remote(
+        64, 1024, 64, 256, jnp.bfloat16, 1, allow_non_tpu=True
+    )
+    assert not sq3d.supports_shift_quant_split_3d_remote(
+        4, 128, 64, 128, jnp.bfloat16, 4, allow_non_tpu=True
+    )
+    assert not sq3d.supports_shift_quant_split_3d_remote(
+        4, 288, 96, 128, jnp.bfloat16, 4, allow_non_tpu=True
+    )
+    assert not sq3d.supports_shift_quant_split_3d_remote(
+        64,
+        1024,
+        64,
+        256,
+        jnp.bfloat16,
+        16,
+        vmem_limit_bytes=7 * 1024 * 1024,
+        allow_non_tpu=True,
+    )
+    assert not sq3d.supports_shift_quant_split_3d_remote(
+        4, 192, 64, 128, jnp.float32, 4, allow_non_tpu=True
+    )
+    assert not sq3d.supports_shift_quant_split_3d_remote(
+        3, 192, 64, 128, jnp.bfloat16, 4, allow_non_tpu=True
+    )
+    assert not sq3d.supports_shift_quant_split_3d_remote(
+        4, 192, 64, 64, jnp.bfloat16, 4, allow_non_tpu=True
+    )
+    if jax.default_backend() != "tpu":
+        assert not sq3d.supports_shift_quant_split_3d_remote(
+            64, 1024, 64, 256, jnp.bfloat16, 16
+        )
+
+
+def test_should_reject_invalid_inputs_in_shift_quant_split_3d_fp8_remote():
+    good_lead = jnp.zeros((4, 64, 128), jnp.bfloat16)
+    good_own = jnp.zeros((4, 192, 128), jnp.bfloat16)
+    rk = jnp.asarray([0], jnp.int32)
+
+    with pytest.raises(ValueError, match="3D"):
+        sq3d.shift_quant_split_3d_fp8_remote(
+            jnp.zeros((64, 512), jnp.bfloat16), good_own, rk, dcp_size=4, axis_name=AXIS
+        )
+    with pytest.raises(ValueError, match="incompatible"):
+        sq3d.shift_quant_split_3d_fp8_remote(
+            jnp.zeros((2, 64, 128), jnp.bfloat16),
+            good_own,
+            rk,
+            dcp_size=4,
+            axis_name=AXIS,
+        )
+    with pytest.raises(ValueError, match="bfloat16"):
+        sq3d.shift_quant_split_3d_fp8_remote(
+            good_lead.astype(jnp.float32), good_own, rk, dcp_size=4, axis_name=AXIS
+        )
+    with pytest.raises(ValueError, match="dcp_size"):
+        sq3d.shift_quant_split_3d_fp8_remote(
+            good_lead, good_own, rk, dcp_size=1, axis_name=AXIS
+        )
+    with pytest.raises(ValueError, match="Unsupported remote"):
+        sq3d.shift_quant_split_3d_fp8_remote(
+            good_lead,
+            jnp.zeros((4, 128, 128), jnp.bfloat16),
+            rk,
+            dcp_size=4,
+            axis_name=AXIS,
+        )
+
+
+@pytest.mark.parametrize(
+    ("num_rows", "split_rows"),
+    [
+        (192, 64),  # minimal n_body == 2 with BM=64
+        (256, 64),  # n_body == 3 with BM=64 (exercises drain of b-2)
+        (96, 32),  # minimal n_body == 2 with BM=32
+    ],
+)
+def test_should_match_ref_bit_exact_with_remote_push_and_race_detection(
+    num_rows: int, split_rows: int
+):
+    if jax.device_count() < 4:
+        pytest.skip("requires 4 JAX devices for multi-rank remote shift_quant test")
+    dcp_size = 4
+    num_heads = 4
+    head_dim = 128
+    mesh = Mesh(np.array(jax.devices()[:dcp_size]), (AXIS,))
+    sh_dcp = NamedSharding(mesh, P(AXIS))
+    sh_rep = NamedSharding(mesh, P())
+
+    rng = np.random.default_rng(700 + num_rows * 13 + split_rows)
+    head_scales = np.linspace(0.5, 4.0, num_heads, dtype=np.float32)[:, None, None]
+    # Run two distinct consecutive batches in one shard_map to test barrier reuse.
+    owns, leads = [], []
+    for batch_idx in range(2):
+        own_f32 = (
+            rng.standard_normal((dcp_size, num_heads, num_rows, head_dim)).astype(
+                np.float32
+            )
+            * head_scales[None, ...]
+            * (0.7 + 0.5 * batch_idx)
+        )
+        lead_f32 = (
+            rng.standard_normal((num_heads, split_rows, head_dim)).astype(np.float32)
+            * head_scales
+        )
+        # Anti-cancellation sentinel on rank (dcp_size - 1) shifted-out tail rows.
+        own_f32[dcp_size - 1, :, num_rows - split_rows :, :] = -SENTINEL
+        # Zero rows (scale -> 1.0) and large values (> FP8_MAX clipping).
+        lead_f32[:, 0, :] = 0.0
+        own_f32[:, :, 0, :] = 0.0
+        own_f32[1, 0, num_rows - split_rows + 1, 0] = 650.0
+        own_f32[2, num_heads - 1, 1, head_dim - 1] = -780.0
+        owns.append(
+            jax.device_put(
+                jnp.asarray(
+                    own_f32.reshape(dcp_size * num_heads, num_rows, head_dim),
+                    jnp.bfloat16,
+                ),
+                sh_dcp,
+            )
+        )
+        leads.append(jax.device_put(jnp.asarray(lead_f32, jnp.bfloat16), sh_rep))
+    rank_ids = jax.device_put(jnp.arange(dcp_size, dtype=jnp.int32), sh_dcp)
+    perm_shift = [(i, i + 1) for i in range(dcp_size - 1)]
+
+    def _ref(l0, o0, l1, o1, rk):
+        c0 = jax.lax.ppermute(o0[:, num_rows - split_rows :, :], AXIS, perm_shift)
+        c1 = jax.lax.ppermute(o1[:, num_rows - split_rows :, :], AXIS, perm_shift)
+        return (
+            *sq3d.shift_quant_split_3d_ref(l0, c0, o0, rk),
+            *sq3d.shift_quant_split_3d_ref(l1, c1, o1, rk),
+        )
+
+    def _got(l0, o0, l1, o1, rk):
+        kw = dict(dcp_size=dcp_size, axis_name=AXIS, interpret=_interpret_flag())
+        return (
+            *sq3d.shift_quant_split_3d_fp8_remote(l0, o0, rk, **kw),
+            *sq3d.shift_quant_split_3d_fp8_remote(l1, o1, rk, **kw),
+        )
+
+    ref_out = jax.shard_map(
+        _ref,
+        mesh=mesh,
+        in_specs=(P(), P(AXIS), P(), P(AXIS), P(AXIS)),
+        out_specs=(P(AXIS),) * 6,
+        check_vma=False,
+    )(leads[0], owns[0], leads[1], owns[1], rank_ids)
+    got_out = jax.shard_map(
+        _got,
+        mesh=mesh,
+        in_specs=(P(), P(AXIS), P(), P(AXIS), P(AXIS)),
+        out_specs=(P(AXIS),) * 6,
+        check_vma=False,
+    )(leads[0], owns[0], leads[1], owns[1], rank_ids)
+
+    for idx in (0, 1, 3, 4):
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(got_out[idx], jnp.uint8)),
+            np.asarray(jax.lax.bitcast_convert_type(ref_out[idx], jnp.uint8)),
+        )
+    for idx in (2, 5):
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(got_out[idx], jnp.uint32)),
+            np.asarray(jax.lax.bitcast_convert_type(ref_out[idx], jnp.uint32)),
+        )
