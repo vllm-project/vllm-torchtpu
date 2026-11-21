@@ -213,32 +213,15 @@ def _get_sigmoid_gate_o_proj_op() -> Callable:
 
 
 def _is_fp8_per_channel_linear(proj: Any) -> bool:
-    """Whether `proj` is a flipped, bias-free FP8 per-channel linear whose
-    method serves pre-quantized rows, so the fused ops' W8A8 matmul on rows
-    they quantize computes what its `apply` would (not so for a method that
-    runs small steps W8A16, TPU_FP8_LINEAR_W8A16_MAX_ROWS)."""
-    weight = getattr(proj, "weight", None)
-    weight_scale = getattr(proj, "weight_scale", None)
-    if weight is None or weight_scale is None:
+    """Whether the fused ops' W8A8 matmul on rows they quantize computes what
+    `proj`'s `apply` would: `proj` takes pre-quantized rows
+    (`_takes_prequant_rows`), and its 2-D weight is flipped to (k, n) and adds
+    no bias."""
+    if not (_takes_prequant_rows(proj) and getattr(proj, WEIGHT_FLIPPED_ATTR, False)):
         return False
-    if not isinstance(weight, torch.Tensor) or not isinstance(
-        weight_scale, torch.Tensor
-    ):
-        return False
-    if weight.dtype != torch.float8_e4m3fn or weight.ndim != 2:
-        return False
-    if weight_scale.shape != (weight.shape[-1],):
-        return False
-    if not getattr(proj, WEIGHT_FLIPPED_ATTR, False):
-        return False
-    method = getattr(proj, "quant_method", None)
-    if not (
-        isinstance(method, linear_common.PrequantLinearMethod)
-        and method.serves_prequant_rows(proj)
-    ):
-        return False
-    return getattr(proj, "bias", None) is None or bool(
-        getattr(proj, "skip_bias_add", False)
+    return proj.weight.ndim == 2 and (
+        getattr(proj, "bias", None) is None
+        or bool(getattr(proj, "skip_bias_add", False))
     )
 
 
