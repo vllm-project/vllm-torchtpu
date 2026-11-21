@@ -2039,6 +2039,11 @@ def _unified_indexer_mla_core(
                     g_nope, g_rope = gather_latent(
                         nope, rope, mla_page_ids[:cap], axis_name, read_pages
                     )
+                    if cap * dcp * ps >= 32768:
+                        # Avoid XLA deferring the large g_nope all-gather behind all
+                        # StreamIdxTC chunks (~33..119 us/L exposed tail for >=32K):
+                        # anchor g_nope against nat so it drains alongside idx-K AG.
+                        g_nope, nat = lax.optimization_barrier((g_nope, nat))
                     positions = select_topk(q_idx_sel, w_idx_sel, nat, rr_sel, table)
                 positions = _unalign_zigzag_r0_positions(
                     positions, rank, layout.split_rows, r0_shifted
@@ -2801,6 +2806,11 @@ def _unified_indexer_in_branch_qb_core(
                     g_nope, g_rope = gather_latent(
                         nope, rope, mla_page_ids[:cap], axis_name, read_pages
                     )
+                    if cap * dcp * ps >= 32768:
+                        # Avoid XLA deferring the large g_nope all-gather behind all
+                        # StreamIdxTC chunks (~33..119 us/L exposed tail for >=32K):
+                        # anchor g_nope against nat so it drains alongside idx-K AG.
+                        g_nope, nat = lax.optimization_barrier((g_nope, nat))
                     positions = select_topk(q_idx_sel, w_idx_sel, nat, rr_sel, table)
                 positions = _unalign_zigzag_r0_positions(
                     positions, rank, layout.split_rows, r0_shifted
