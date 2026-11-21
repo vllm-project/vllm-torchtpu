@@ -5090,6 +5090,7 @@ class TPUModelRunner(GPUModelRunner):
             carry = None
         if pending_rejected_sub is not None:
             from vllm_torchtpu.runner.tpu_runner_async_output import (
+                _compiled_carry_subtract_and_substitute_draft_token_ids,
                 _compiled_subtract_and_substitute_draft_token_ids,
                 _compiled_subtract_and_substitute_placeholder_token,
                 _compiled_subtract_num_rejected_tokens,
@@ -5123,10 +5124,6 @@ class TPUModelRunner(GPUModelRunner):
                     if draft_token_program:
                         assert spec_decode_metadata is not None
                         if carry is not None:
-                            from vllm_torchtpu.runner.tpu_runner_async_output import (
-                                _compiled_carry_subtract_and_substitute_draft_token_ids,
-                            )
-
                             (
                                 seq_lens,
                                 self.position_ids,

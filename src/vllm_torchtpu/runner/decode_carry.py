@@ -99,7 +99,7 @@ class CarryState:
     padded_total: int
     total: int
     src_seq: int
-    S: np.ndarray
+    host_seq_lens: np.ndarray
     seq_pad: np.ndarray
     pos: np.ndarray
     seq_lens: torch.Tensor
@@ -114,7 +114,7 @@ class CarryState:
         "padded_total",
         "total",
         "src_seq",
-        "S",
+        "host_seq_lens",
         "seq_pad",
         "pos",
         "seq_lens",
@@ -239,7 +239,7 @@ def _check(
     except KeyError:
         return None
     s_now = np.asarray(runner.seq_lens_np[:num_reqs], dtype=np.int64)
-    d_s = s_now - st.S
+    d_s = s_now - st.host_seq_lens
     if not np.all(d_s + r_prev == st.step_delta):
         return None
     if not np.array_equal(
@@ -290,7 +290,7 @@ def record(
     st.padded_total = int(padded_total_num_scheduled_tokens)
     st.total = int(total_num_scheduled_tokens)
     st.src_seq = src_seq
-    st.S = np.array(runner.seq_lens_np[:num_reqs], dtype=np.int64)
+    st.host_seq_lens = np.array(runner.seq_lens_np[:num_reqs], dtype=np.int64)
     st.seq_pad = np.array(runner.seq_lens_np[num_reqs:target_num_reqs])
     st.pos = _host_positions(runner, st.total).copy()
     st.seq_lens = seq_lens
