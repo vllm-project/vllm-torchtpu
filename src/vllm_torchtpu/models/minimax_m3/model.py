@@ -19,6 +19,7 @@ from collections.abc import Callable, Iterable, Iterator
 
 import torch
 from torch import nn
+from vllm import ir
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -58,6 +59,29 @@ from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
 logger = init_logger(__name__)
 
 
+class _GemmaRMSNorm(GemmaRMSNorm):
+    """GemmaRMSNorm whose f32 ``1 + weight`` is computed once after loading
+    (`shift_weight`): forward_native recomputes it per call, one XLA op per
+    norm per step."""
+
+    def shift_weight(self) -> None:
+        self.register_buffer(
+            "weight_plus_one", self.weight.detach().float() + 1.0, persistent=False
+        )
+
+    def gemma_weight(self) -> torch.Tensor:
+        w = getattr(self, "weight_plus_one", None)
+        return self.weight.float() + 1.0 if w is None else w
+
+    def forward_native(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        weight = self.gemma_weight()
+        if residual is None:
+            return ir.ops.rms_norm(x, weight, self.variance_epsilon)
+        return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
+
+
 class MiniMaxM3DecoderLayer(nn.Module):
     def __init__(self, vllm_config: VllmConfig, layer_id: int, prefix: str) -> None:
         super().__init__()
@@ -82,8 +106,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 quant_config,
                 prefix=f"{prefix}.mlp",
             )
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
+        self.input_layernorm = _GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = _GemmaRMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -203,7 +227,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
     def _norm_gather(
         self,
-        norm: GemmaRMSNorm,
+        norm: "_GemmaRMSNorm",
         shard: torch.Tensor,
         update: torch.Tensor | None,
         fp8: bool,
@@ -214,8 +238,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         ``e4m3_out`` returns the gathered e4m3 rows and their scales."""
         fused = envs.TPU_MINIMAX_M3_SP_FUSED_NORM and _fits_sp_norm(shard)
         if update is not None and fp8 and fused:
-            weight = norm.weight.float() + 1.0
-            shard, q, scale = self._add_norm_quant(shard, update, weight)
+            shard, q, scale = self._add_norm_quant(shard, update, norm.gemma_weight())
         else:
             if update is not None:
                 shard = shard + update
@@ -321,7 +344,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
     def _norm_gather_pieces(
         self,
-        norm: GemmaRMSNorm,
+        norm: "_GemmaRMSNorm",
         shard: torch.Tensor,
         update: torch.Tensor | None,
         fp8: bool,
@@ -448,7 +471,7 @@ class MiniMaxM3Model(nn.Module):
             MiniMaxM3DecoderLayer(vllm_config, idx, prefix=f"{prefix}.layers.{idx}")
             for idx in range(config.num_hidden_layers)
         )
-        self.norm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = _GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.sp_mode = _sp_mode() if self.tp_size > 1 else "off"
         # Residual-stream entries of these layers (k = output of layer k-1,
@@ -577,6 +600,9 @@ class MiniMaxM3Model(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        for module in self.modules():
+            if isinstance(module, _GemmaRMSNorm):
+                module.shift_weight()
         bound = max(layer.self_attn.score_bound() for layer in self.layers)
         on = msa_attention_lse.configure_max_free(bound)
         logger.info("MiniMax-M3 MSA score bound %.1f: max-free softmax %s", bound, on)
