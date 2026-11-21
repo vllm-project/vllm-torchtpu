@@ -278,3 +278,17 @@ def test_real_registries_accept_a_normal_start(monkeypatch, _clean_environ, _war
         monkeypatch.setenv(name, "1")
     TpuPlatform.validate_environ(hard_fail=True)
     _warning.assert_not_called()
+
+
+def test_replaced_name_points_to_its_replacement():
+    """VLLM_ATTENTION_BACKEND is gone from vLLM; the warning names the engine
+    argument that replaced it instead of a near-miss spelling."""
+    found = find_unread_env_vars(
+        ["VLLM_ATTENTION_BACKEND"], set(), {"VLLM_ATTENTION_CHUNK_SIZE"}
+    )
+    assert found == [
+        UnreadEnvVar("VLLM_ATTENTION_BACKEND", replacement="--attention-backend")
+    ]
+    assert str(found[0]) == (
+        "VLLM_ATTENTION_BACKEND (no longer read by vLLM; use --attention-backend)"
+    )

@@ -41,6 +41,13 @@ from dataclasses import dataclass
 # sharing a prefix do not.
 _TYPO_CUTOFF = 0.9
 
+# Variables that vLLM no longer reads, mapped to what replaced them. They are
+# still common in older scripts and recipes, and setting them does nothing.
+REPLACED_ENV_VARS = {
+    # Removed upstream in favor of the engine argument (AttentionConfig.backend).
+    "VLLM_ATTENTION_BACKEND": "--attention-backend",
+}
+
 # Names this package writes into os.environ for itself or for the libraries it
 # drives (torch_tpu, libtpu, vLLM, Ray). They are set on purpose, so they are
 # never reported.
@@ -85,8 +92,11 @@ class UnreadEnvVar:
 
     name: str
     suggestion: str | None = None
+    replacement: str | None = None
 
     def __str__(self) -> str:
+        if self.replacement is not None:
+            return f"{self.name} (no longer read by vLLM; use {self.replacement})"
         if self.suggestion is None:
             return self.name
         return f"{self.name} (did you mean {self.suggestion}?)"
@@ -140,6 +150,9 @@ def find_unread_env_vars(
     unread = []
     for name in sorted(set(set_names) - known):
         if name.startswith(external_prefixes):
+            continue
+        if name in REPLACED_ENV_VARS:
+            unread.append(UnreadEnvVar(name, replacement=REPLACED_ENV_VARS[name]))
             continue
         if name.startswith("VLLM_"):
             unread.append(UnreadEnvVar(name, _closest(name, known_vllm)))
