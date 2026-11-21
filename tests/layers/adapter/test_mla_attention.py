@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +22,7 @@ from vllm.model_executor.layers.linear import DCPGroupColumnParallelLinear
 from vllm.model_executor.layers.mla import MLAModules
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.mla.v2.tuned_params import TunableParams, TuningKey
 from vllm_torchtpu.layers.adapter import attention as attention_adapter
 from vllm_torchtpu.layers.adapter import cp_mla_attention as cp_mla
 from vllm_torchtpu.layers.adapter.attention import (
@@ -89,6 +91,8 @@ def test_mla_attention_interface_mixed_q_split(monkeypatch):
     monkeypatch.setattr(envs, "MIXED_Q_SPLIT", None)
     monkeypatch.setattr(envs, "MIXED_NUM_QUERIES_PER_BLOCK", None)
     monkeypatch.setattr(envs, "MIXED_NUM_KV_PAGES_PER_BLOCK", None)
+    tuned = MagicMock(wraps=attention_interface.get_tuned_params)
+    monkeypatch.setattr(attention_interface, "get_tuned_params", tuned)
     new_cache, out = attention_interface.mla_attention(
         q_TNA=q,
         q_rope_TNH=q_rope,
@@ -98,8 +102,17 @@ def test_mla_attention_interface_mixed_q_split(monkeypatch):
         md=md,
         mesh=mesh,
         num_attention_heads=num_heads,
-        qk_nope_head_dim=lkv_dim,
+        qk_nope_head_dim=128,
         sm_scale=0.1,
+    )
+    mixed_key, decode_key = [call.args[0] for call in tuned.call_args_list]
+    assert mixed_key.case == "mixed"
+    assert decode_key == TuningKey(
+        case="batched_decode",
+        max_num_tokens=num_tokens,
+        actual_num_q_heads=num_heads,
+        actual_lkv_dim=128,
+        actual_r_dim=r_dim,
     )
     mock_mla_kernel.assert_called_once()
     args, kwargs = mock_mla_kernel.call_args
@@ -125,7 +138,7 @@ def test_mla_attention_interface_mixed_q_split(monkeypatch):
         md=md,
         mesh=mesh,
         num_attention_heads=num_heads,
-        qk_nope_head_dim=lkv_dim,
+        qk_nope_head_dim=128,
         sm_scale=0.1,
     )
     mock_mla_kernel.assert_called_once()
@@ -133,6 +146,36 @@ def test_mla_attention_interface_mixed_q_split(monkeypatch):
     assert kwargs["num_kv_pages_per_block"][1:] == (1, 4)
     assert kwargs["num_queries_per_block"][1:] == (16, 64)
     assert kwargs["mixed_q_split"] == 16
+
+    # 3. A live shape in the decode table takes its tile without the config key
+    mock_mla_kernel.reset_mock()
+    tuned.reset_mock()
+    monkeypatch.setitem(
+        attention_interface.live_keyed_decode_params,
+        replace(mixed_key, case="batched_decode"),
+        TunableParams(
+            decode_batch_size=2,
+            num_kv_pages_per_block=7,
+            num_queries_per_block=1,
+            vmem_limit_bytes=62914560,
+        ),
+    )
+    attention_interface.mla_attention(
+        q_TNA=q,
+        q_rope_TNH=q_rope,
+        k_SA=k,
+        k_rope_SH=k_rope,
+        kv_cache=cache,
+        md=md,
+        mesh=mesh,
+        num_attention_heads=num_heads,
+        qk_nope_head_dim=128,
+        sm_scale=0.1,
+    )
+    assert [call.args[0].case for call in tuned.call_args_list] == ["mixed"]
+    _, kwargs = mock_mla_kernel.call_args
+    assert kwargs["num_kv_pages_per_block"][0] == 7
+    assert kwargs["decode_batch_size"] == 2
 
 
 def test_pallas_mla_attention_backend():

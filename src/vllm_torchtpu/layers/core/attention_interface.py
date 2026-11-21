@@ -14,6 +14,7 @@
 import functools
 import math
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, cast
 
 import jax
@@ -47,7 +48,11 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     update_sparse_mla_kv_cache,
     update_sparse_mla_kv_cache_dcp,
 )
-from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
+from vllm_torchtpu.kernels.mla.v2.tuned_params import (
+    TuningKey,
+    get_tuned_params,
+    live_keyed_decode_params,
+)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
@@ -788,7 +793,6 @@ def mla_attention(
             actual_r_dim=actual_r_dim,
             kv_dtype=kv_dtype_str,
         )
-        decode_tuned = get_tuned_params(decode_key)
 
         _, page_size_per_kv_packing, kv_packing, _ = cache.shape
         max_num_seqs = seq_lens.shape[0]
@@ -806,6 +810,9 @@ def mla_attention(
             pages_per_seq=block_tables.shape[0] // max_num_seqs,
         )
         mixed_tuned = get_tuned_params(mixed_key)
+        decode_tuned = live_keyed_decode_params.get(
+            replace(mixed_key, case="batched_decode")
+        ) or get_tuned_params(decode_key)
 
         # Pass explicit block ratio tuples for (decode, prefill, mixed) stages
         num_kv_pages_per_blocks = (
