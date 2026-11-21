@@ -81,23 +81,38 @@ class Radix:
         prefix, remaining, total, count = self.pivot(jnp.int32(quota))
         keep_all = total <= quota
         done = keep_all | (remaining == count)
-        remaining_bits = jnp.int32(FP32_BITS - RADIX_BITS)
-        for shift in reversed(range(0, FP32_BITS - RADIX_BITS, RADIX_BITS)):
+
+        # A loop, not unrolled: each copy of the refinement adds program
+        # that the SparseCore loads on every call.
+        def refine_byte(step, state):
+            prefix, remaining, remaining_bits, done = state
+            shift = FP32_BITS - 2 * RADIX_BITS - step * RADIX_BITS
+            # Unsigned, so the key shifts stay logical.
+            low = shift.astype(jnp.uint32)
             self.clear()
 
             @plsc.parallel_loop(0, jnp.where(done, 0, chunks), unroll=8)
-            def refine(i, shift=shift, prefix=prefix):
+            def refine(i):
                 bits = values[pl.ds(i * lanes, lanes)].view(jnp.uint32)
-                match = (bits >> (shift + RADIX_BITS)) == prefix.astype(jnp.uint32)
-                digits = ((bits >> shift) & RADIX_MASK).astype(jnp.int32)
+                match = (bits >> (low + RADIX_BITS)) == prefix.astype(jnp.uint32)
+                digits = ((bits >> low) & RADIX_MASK).astype(jnp.int32)
                 counts, last = plsc.scan_count(digits, mask=match)
                 plsc.addupdate_scatter(self.histogram, [digits], counts, mask=last)
 
             bucket, next_remaining, _, count = self.pivot(remaining)
-            prefix = jnp.where(done, prefix, (prefix << RADIX_BITS) | bucket)
             remaining = jnp.where(done, remaining, next_remaining)
-            remaining_bits = jnp.where(done, remaining_bits, shift)
-            done |= remaining == count
+            return (
+                jnp.where(done, prefix, (prefix << RADIX_BITS) | bucket),
+                remaining,
+                jnp.where(done, remaining_bits, shift),
+                done | (remaining == count),
+            )
+
+        state = (prefix, remaining, jnp.int32(FP32_BITS - RADIX_BITS), done)
+        steps = (FP32_BITS - RADIX_BITS) // RADIX_BITS
+        prefix, remaining, remaining_bits, done = jax.lax.fori_loop(
+            0, steps, refine_byte, state
+        )
         lower = prefix.astype(jnp.uint32) << remaining_bits.astype(jnp.uint32)
         floor = jnp.uint32(ORDERED_NEG_INF + 1)
         gate = jnp.where(keep_all, floor, jnp.maximum(lower, floor))
