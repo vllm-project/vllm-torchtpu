@@ -399,6 +399,24 @@ def test_a_chip_the_kernel_is_not_built_for_is_refused(
     assert "local_experts" not in armed
 
 
+def test_a_chip_record_that_cannot_be_read_refuses_the_layer(armed, monkeypatch):
+    """Weight load reads the chip record; when JAX cannot read it (here the
+    device kind it raises on outside a TPU process), prebuild refuses the
+    layer with the reason instead of failing the load."""
+
+    def unreadable():
+        raise ValueError("Unsupported TPU device kind: cpu")
+
+    monkeypatch.setattr(pltpu, "get_tpu_info", unreadable)
+    reason = v3._unsupported_kernel_reason(
+        _mesh(), topk=2, hidden=128, inter=256, local_experts=4
+    )
+    assert reason is not None and "chip record could not be read" in reason
+    assert "Unsupported TPU device kind: cpu" in reason
+    assert not _prebuild(_layer(slots=4))
+    assert "local_experts" not in armed
+
+
 @pytest.mark.parametrize("ep", [6, 64])
 def test_a_mesh_width_the_transport_cannot_take_is_refused(armed, monkeypatch, ep):
     """The transport takes a power-of-two mesh of at most MAX_SHARDS (32)."""
