@@ -23,10 +23,15 @@ from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runne
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
 from vllm_torchtpu.layers.adapter import expert_placement
+from vllm_torchtpu.layers.adapter.fused_moe_decode import (
+    anchor_rank_buffer_for_trace,
+    fused_moe_decode_runner_forward,
+)
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
 
@@ -127,9 +132,14 @@ class VllmMoERunner(MoERunner):
         # Not super()._fused_output_is_reduced: under torch.compile dynamo
         # reads that as truthy, and the routed output then skips its TP
         # all-reduce.
-        # A layer armed by fused_moe_decode reduces shared + routed itself.
-        if getattr(self, "_fused_moe_decode_armed", False) and not getattr(
-            self.moe_config, "skip_final_all_reduce", False
+        # A layer armed by fused_moe_decode reduces shared + routed itself,
+        # unless static bucket dispatch is active (where m <= max_tokens returns
+        # directly from fused_moe_decode_runner_forward and m > max_tokens falls
+        # through to super().forward() unreduced).
+        if (
+            getattr(self, "_fused_moe_decode_armed", False)
+            and not getattr(self, "_fused_moe_decode_static_dispatch", False)
+            and not getattr(self.moe_config, "skip_final_all_reduce", False)
         ):
             return True
         # A layer armed by moe_tp_decode reduces shared + routed in its op.
@@ -150,6 +160,43 @@ class VllmMoERunner(MoERunner):
             or adaptive_fused_moe_supported(owner)
             or _upstream_fused_output_is_reduced(self)
         )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        shared_experts_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        static_dispatch = (
+            getattr(self, "_fused_moe_decode_static_dispatch", False)
+            and shared_experts_input is None
+        )
+        if static_dispatch:
+            max_tokens = getattr(self, "_fused_moe_decode_max_tokens", 0)
+            # Only backbone warmup (shape_variants.warmup()) traces each side
+            # of a token-count branch separately. Modules compiled outside
+            # warmup (e.g. an MTP drafter) take fused_moe_decode_runner_forward
+            # unconditionally so no SymInt guard is recorded; _layer handles
+            # m > max_tokens inside shard_map.
+            can_branch = (
+                not torch.compiler.is_compiling()
+                or shape_variants.aot_cache_tag() is not None
+            )
+            if not can_branch or hidden_states.shape[0] <= max_tokens:
+                return fused_moe_decode_runner_forward(
+                    self,
+                    hidden_states,
+                    router_logits,
+                    input_ids=input_ids,
+                )
+        out = super().forward(
+            hidden_states,
+            router_logits,
+            input_ids=input_ids,
+            shared_experts_input=shared_experts_input,
+        )
+        return anchor_rank_buffer_for_trace(out) if static_dispatch else out
 
     def _fused_ep_owns_pcp_collectives(self) -> bool:
         # The fused EP kernel is armed per layer after checking that layer's
