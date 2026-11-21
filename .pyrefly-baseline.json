@@ -286,6 +286,11 @@
       "concise_description": "Object of class `NoneType` has no attribute `vmem_capacity_bytes`"
     },
     {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/runtime_shim/backend.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `program` from `vllm_torchtpu.models.kimi_k3.megakernel`"
+    },
+    {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `object` has no attribute `ndim`"
