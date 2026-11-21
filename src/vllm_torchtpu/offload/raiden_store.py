@@ -1686,6 +1686,17 @@ def resolve_attention_geometry(
     return spec0, kernel_block_size, per_block_shape
 
 
+def resolve_model_owned_pool_geometry(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> tuple | None:
+    """Geometry a model-owned unified pool declares for itself
+    (offload/model_owned_pool), or None."""
+    from vllm_torchtpu.offload.model_owned_pool import model_owned_pool
+
+    pool = model_owned_pool(vllm_config)
+    return None if pool is None else pool.geometry(vllm_config, kv_cache_config)
+
+
 def resolve_kernel_geometry(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> tuple[int, tuple[int, ...] | set[tuple[int, ...]], object, int]:
@@ -1695,6 +1706,9 @@ def resolve_kernel_geometry(
     Shared between the scheduler (capacity sizing, sub-hash factor) and worker ranks
     (device view reconstruction) to guarantee exact geometry parity.
     """
+    model_geometry = resolve_model_owned_pool_geometry(vllm_config, kv_cache_config)
+    if model_geometry is not None:
+        return model_geometry
     if has_multi_shapes_kv_caches(vllm_config):
         return _resolve_multi_shapes_kv_geometry(kv_cache_config)
     spec0, kernel_block_size, per_block_shape = resolve_attention_geometry(
