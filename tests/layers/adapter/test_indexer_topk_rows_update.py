@@ -26,6 +26,8 @@ from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     _topk_rows,
     _topk_rows_update_jax,
 )
+from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.utils import synchronize_tensors
 
 
 def _reference(buf, topk_tokens, num_tokens, topk_indices):
@@ -130,31 +132,88 @@ def test_reuse_layers_read_the_donated_rows(rows, width, topk, num_tokens, compi
     _check_two_layers(stale, topk, num_tokens, topk_a, topk_b, compiled=compiled)
 
 
-@pytest.mark.tpu_test
-def test_mtp_restore_after_donated_write():
-    """`Eagle3Proposer` holds the table and writes it outside the donated op:
-    IndexShare snapshots step 0's rows, a later donated write clobbers them,
-    and `_mtp_restore_topk` puts them back. The table must stay a valid,
-    writable tensor across all of it."""
-    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+class _FakeMtpModel:
+    """The draft's `compact_topk_indices` over one table, written as vLLM's
+    `DeepSeekMultiTokenPredictor` writes it."""
 
-    stale, topk_a, topk_b = _inputs(64, 32, 32, 16, 16, n=2)
-    layers, fwd = _check_two_layers(stale, 32, 16, topk_a, topk_b, compiled=True)
+    def __init__(self, buf: torch.Tensor):
+        self.buf = buf
+
+    def compact_topk_indices(self, slot_ids: torch.Tensor) -> None:
+        self.buf[: slot_ids.numel()] = self.buf[slot_ids]
+
+
+_ROWS, _WIDTH = 64, 32  # the table: max_num_batched_tokens x index_topk
+
+
+def _mtp_table(compiled):
+    """A table the two-layer forward has written (donating it twice), the
+    forward, a stand-in proposer holding the table, and the table's contents."""
+    stale, topk_a, topk_b = _inputs(_ROWS, _WIDTH, _WIDTH, _ROWS, _ROWS, n=2)
+    layers, fwd = _check_two_layers(
+        stale, _WIDTH, _ROWS, topk_a, topk_b, compiled=compiled
+    )
     buf = layers.topk_indices_buffer
-    proposer = types.SimpleNamespace(_mtp_topk_buffers=[buf])
+    proposer = types.SimpleNamespace(
+        _mtp_topk_buffers=[buf],
+        draft_model=types.SimpleNamespace(model=_FakeMtpModel(buf)),
+    )
+    return buf, fwd, proposer, buf.cpu(), topk_a, topk_b
 
-    # Step 0 compaction: last-token rows of two requests to the front, snapshot.
-    gather = torch.tensor([3, 11], device="tpu")
-    buf[: gather.shape[0]] = buf.index_select(0, gather)
-    saved = [buf[: gather.shape[0]].clone()]
-    want_saved = saved[0].cpu()
 
-    # The next chunk's donated write clobbers rows [0:16].
-    fwd(topk_b.to("tpu"), topk_a.to("tpu"), 16)
-    assert not torch.equal(buf[:2].cpu(), want_saved)
+def _donated_write(fwd, table, first, second):
+    """Another step-0 forward over the whole chunk: two donated row updates.
+    Returns the table contents it leaves."""
+    fwd(first.to("tpu"), second.to("tpu"), _ROWS)
+    after = _reference(table.clone(), _WIDTH, _ROWS, first)
+    return _reference(after, _WIDTH, _ROWS, second)
 
-    Eagle3Proposer._mtp_restore_topk(proposer, saved)
-    torch.testing.assert_close(buf[:2].cpu(), want_saved, rtol=0, atol=0)
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("clobber", ["next_chunk", "dp_padding_chunk"])
+@pytest.mark.parametrize("num_rows", [_ROWS, 2], ids=["full_table", "sub_slice"])
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+def test_mtp_restore_after_donated_write(compiled, num_rows, clobber):
+    """`Eagle3Proposer` holds the table and writes it outside the donated op.
+    IndexShare compacts and snapshots step 0's rows; another step-0 forward --
+    the next chunk's, or an EP-DP padding chunk's under DP lockstep -- donates
+    the table; `_mtp_restore_topk` then puts the rows back. torch_tpu may
+    satisfy a clone of a view that covers the whole table by aliasing the
+    table's buffer, so a full-table snapshot must be a buffer of its own or
+    the restore reads a donated buffer. The table must stay a valid, writable
+    tensor across all of it."""
+    buf, fwd, proposer, table, topk_a, topk_b = _mtp_table(compiled)
+    g = torch.Generator().manual_seed(num_rows)
+
+    # Chunk 0, step 0: its requests' last-token rows to the front, snapshot.
+    gather0 = torch.randperm(_ROWS, generator=g)[:num_rows]
+    want0 = table[gather0]
+    saved0 = Eagle3Proposer._mtp_compact_and_save(proposer, gather0.to("tpu"))
+    table[:num_rows] = want0
+    # Submitted before the next forward, as the compiled carry and lm-head
+    # programs that run in between would.
+    synchronize_tensors(saved0, wait=False)
+
+    # The other step-0 forward donates the table.
+    table = _donated_write(fwd, table, topk_b, topk_a)
+    saved1 = want1 = None
+    if clobber == "next_chunk":
+        # Chunk 1 compacts and snapshots its own rows from the same table.
+        gather1 = torch.randperm(_ROWS, generator=g)[:num_rows]
+        want1 = table[gather1]
+        saved1 = Eagle3Proposer._mtp_compact_and_save(proposer, gather1.to("tpu"))
+    assert not torch.equal(buf[:num_rows].cpu(), want0)
+
+    eq = dict(rtol=0, atol=0)
+    # Loop step 1 is step-major: each chunk's rows go back before its forward.
+    Eagle3Proposer._mtp_restore_topk(proposer, saved0)
+    torch.testing.assert_close(buf[:num_rows].cpu(), want0, **eq)
+    if saved1 is not None:
+        Eagle3Proposer._mtp_restore_topk(proposer, saved1)
+        torch.testing.assert_close(buf[:num_rows].cpu(), want1, **eq)
+        # Loop step 2: chunk 0's snapshot is still whole.
+        Eagle3Proposer._mtp_restore_topk(proposer, saved0)
+        torch.testing.assert_close(buf[:num_rows].cpu(), want0, **eq)
     # ... and the table still accepts the next donated write.
-    rows_a, reuse_a, _, _ = fwd(topk_a.to("tpu"), topk_a.to("tpu"), 16)
-    torch.testing.assert_close(reuse_a.cpu(), rows_a.cpu(), rtol=0, atol=0)
+    rows_a, reuse_a, _, _ = fwd(topk_a.to("tpu"), topk_a.to("tpu"), _ROWS)
+    torch.testing.assert_close(reuse_a.cpu(), rows_a.cpu(), **eq)

@@ -2071,6 +2071,53 @@ def test_second_chunk_step0_clobbers_first_chunk_rows_and_restore_fixes_it():
     assert torch.equal(live[:2], torch.full((2, 4), 99, dtype=torch.int32))
 
 
+@pytest.mark.parametrize("clobber", ["next_chunk", "dp_padding_chunk"])
+# full_buffer is the case the fix is for (the aliasing clone covers the whole
+# table); sub_slice passes with or without it and only checks coverage.
+@pytest.mark.parametrize("num_rows", [6, 2], ids=["full_buffer", "sub_slice"])
+def test_snapshot_is_a_buffer_of_its_own_when_clone_aliases(
+    monkeypatch, num_rows, clobber
+):
+    """Another step-0 forward -- the next chunk's, or an EP-DP padding chunk's
+    under DP lockstep -- writes the buffer between a chunk's snapshot and its
+    restore, and on TPU that write donates the buffer. torch_tpu may satisfy
+    a clone of a view that covers its whole base by aliasing the base's
+    buffer; CPU torch always copies, so mimic that, and replace fresh_buffer
+    by its TPU branch (`+ 0`). The snapshot must keep the chunk's rows."""
+    real_clone = torch.Tensor.clone
+
+    def aliasing_clone(self, *args, **kwargs):
+        base = self._base if self._base is not None else self
+        if self.is_contiguous() and self.numel() == base.numel():
+            return self.view(self.shape)
+        return real_clone(self, *args, **kwargs)
+
+    buf = torch.zeros(6, 4, dtype=torch.int32)
+    proposer = _mtp_proposer_with_buffer(buf)
+    live = proposer._mtp_topk_buffers[0]
+    live.copy_(torch.arange(6 * 4, dtype=torch.int32).reshape(6, 4))
+    gather = torch.arange(num_rows).flip(0)
+    chunk0_rows = live[gather]  # advanced indexing: a copy
+    monkeypatch.setattr(torch.Tensor, "clone", aliasing_clone)
+    monkeypatch.setattr(
+        "vllm_torchtpu.spec_decode.eagle3.fresh_buffer", lambda t: t + 0
+    )
+
+    saved0 = proposer._mtp_compact_and_save(gather)
+    live.fill_(99)  # the other step-0 forward's write
+    saved1 = None
+    if clobber == "next_chunk":
+        # Chunk 1 compacts and snapshots its own rows from the same buffer.
+        saved1 = proposer._mtp_compact_and_save(torch.arange(num_rows))
+
+    assert saved0[0].untyped_storage().data_ptr() != live.untyped_storage().data_ptr()
+    proposer._mtp_restore_topk(saved0)
+    assert torch.equal(live[:num_rows], chunk0_rows)
+    if saved1 is not None:
+        proposer._mtp_restore_topk(saved1)
+        assert torch.equal(live[:num_rows], torch.full_like(chunk0_rows, 99))
+
+
 def test_skip_topk_toggle_is_noop_without_sharing():
     buf = torch.zeros(8, 4, dtype=torch.int32)
     proposer = _mtp_proposer_with_buffer(buf, share=False)

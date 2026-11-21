@@ -50,7 +50,7 @@ from vllm_torchtpu.spec_decode.utils import (
     maybe_share_embeddings,
     maybe_share_lm_head,
 )
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 # Sentinel for rejected / padding slots in the rejection-sampler output (and the
 # async substitution tensors). Matches RejectionSampler.PLACEHOLDER_TOKEN_ID and
@@ -711,7 +711,11 @@ class Eagle3Proposer:
         assert self.draft_model is not None
         self.draft_model.model.compact_topk_indices(gather_indices)
         num_rows = gather_indices.shape[0]
-        return [buf[:num_rows].clone() for buf in self._mtp_topk_buffers]
+        # A buffer of its own: torch_tpu may satisfy a clone of a view by
+        # aliasing the table's buffer (fresh_buffer documents this for copy_),
+        # and the next step-0 forward -- another chunk's, or an EP-DP padding
+        # chunk's -- donates that buffer before _mtp_restore_topk reads it.
+        return [fresh_buffer(buf[:num_rows]) for buf in self._mtp_topk_buffers]
 
     def _mtp_restore_topk(self, saved: list[torch.Tensor]) -> None:
         """Put this chunk's step-0 rows back at the front before its forward."""
