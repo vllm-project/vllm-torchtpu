@@ -41,6 +41,7 @@ from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels import fp8_linear
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -55,7 +56,7 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
 )
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -72,6 +73,11 @@ def _upcast_e4m3(w: jax.Array) -> jax.Array:
 # Built at import: torch_tpu cannot create a jax_op inside a traced forward.
 _materialized_bf16 = pallas.jax_op("pallas::minimax_m3_upcast_e4m3", _upcast_e4m3)
 _materialized_bf16.register_fake(lambda w: torch.empty_like(w, dtype=torch.bfloat16))
+
+_fp8_linear = pallas.jax_op("pallas::minimax_m3_fp8_linear", fp8_linear.fp8_linear)
+_fp8_linear.register_fake(
+    lambda x, w, s: x.new_empty((x.shape[0], w.shape[1]), dtype=x.dtype)
+)
 
 
 QUANT_METHOD = "mxfp8"
@@ -208,9 +214,18 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
             "weight_scale",
             torch.nn.Parameter(scale.to(torch.bfloat16), requires_grad=False),
         )
+        # apply reads the scale as one [1, N] row (the kernel's layout) on every
+        # path, so traces of all token buckets take the same inputs. It is a
+        # copy of weight_scale, set only here; weight_scale stays 1-D for the
+        # MoE kernels that read the shared expert's.
+        layer.weight_scale_row = fresh_buffer(layer.weight_scale.data.view(1, -1))
+        layer.fp8_linear_max_rows = 0
         setattr(layer, WEIGHT_FLIPPED_ATTR, True)
         if weight.device.type == "tpu":
-            synchronize_tensors([layer.weight, layer.weight_scale])
+            layer.fp8_linear_max_rows = fp8_linear.max_rows(*weight.shape)
+            synchronize_tensors(
+                [layer.weight, layer.weight_scale, layer.weight_scale_row]
+            )
         logger.info_once(
             "MXFP8 linears run on e4m3 weights with per-channel power-of-two scales."
         )
@@ -231,12 +246,17 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         if layer.weight.dtype != torch.float8_e4m3fn:
             return VllmUnquantizedLinearMethod().apply(layer, x, bias)
         rows = math.prod(x.shape[:-1])
+        if x.dtype == torch.bfloat16 and 0 < rows <= layer.fp8_linear_max_rows:
+            out = _fp8_linear(
+                x.reshape(rows, x.shape[-1]), layer.weight, layer.weight_scale_row
+            )
+            return out.view(*x.shape[:-1], out.shape[-1])
         if rows >= _UPCAST_MIN_ROWS and x.dtype == torch.bfloat16:
             weight = _materialized_bf16(layer.weight)
         else:
             weight = layer.weight.to(x.dtype)
         # The scale is a power of two, so this rounds once, like x @ bf16(W).
-        return torch.matmul(x, weight) * layer.weight_scale
+        return torch.matmul(x, weight) * layer.weight_scale_row
 
 
 class MiniMaxM3Nvfp4MoEMethod(VllmNvfp4MoEMethod):
