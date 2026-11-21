@@ -56,15 +56,26 @@ def test_throttle_on_dcp4_defaults(base7):
     assert _pas(on=False, inflight=16)._decode_inflight_reserved_blocks() == 7
 
 
-def test_only_the_in_flight_cap_refuses_a_load(base7):
+# vLLM's own reservation below the 128-block minimum, and above it.
+@pytest.mark.parametrize("base", [7, 200])
+def test_only_the_in_flight_cap_refuses_a_load(base):
     """Over 0 to 112 running and 0 to 40 in-flight requests, the throttle
-    refuses a load exactly when 16 are in flight, and otherwise reserves 8
-    blocks per running or in-flight request, at least 128."""
-    for running in range(113):
-        for inflight in range(41):
-            s = _pas(inflight=inflight, running=running)
-            want = 1 << 30 if inflight >= 16 else max(128, 8 * (running + inflight))
-            assert s._decode_inflight_reserved_blocks() == want, (running, inflight)
+    refuses a load exactly when 16 are in flight, and otherwise reserves the
+    largest of vLLM's own reservation, 128 blocks and 8 blocks per running or
+    in-flight request."""
+    with patch.object(
+        Scheduler, "_inflight_prefill_reserved_blocks", return_value=base
+    ):
+        for running in range(113):
+            for inflight in range(41):
+                s = _pas(inflight=inflight, running=running)
+                want = (
+                    1 << 30
+                    if inflight >= 16
+                    else max(base, 128, 8 * (running + inflight))
+                )
+                got = s._decode_inflight_reserved_blocks()
+                assert got == want, (running, inflight)
 
 
 def test_throttle_reaches_the_vllm_hook(base7):
