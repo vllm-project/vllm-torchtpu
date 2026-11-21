@@ -16,12 +16,12 @@
 import functools
 from unittest.mock import MagicMock, patch
 
-import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from tests.kernels.experimental.batched_rpa.rpa_test_utils import rpa_kernel_names
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
 
@@ -206,7 +206,8 @@ def _rpa_kernel_names(**kwargs):
     call = functools.partial(
         wrapper.ragged_paged_attention, sm_scale=head_dim**-0.5, **kwargs
     )
-    jaxpr = jax.make_jaxpr(call)(
+    return rpa_kernel_names(
+        call,
         q,
         k,
         k,
@@ -215,22 +216,7 @@ def _rpa_kernel_names(**kwargs):
         jnp.zeros(seqs * pages_per_seq, jnp.int32),
         jnp.asarray(cu_q_lens),
         jnp.asarray([0, 1, 1], jnp.int32),
-    ).jaxpr
-    names = []
-
-    def walk(j):
-        for eqn in j.eqns:
-            if eqn.primitive.name == "pallas_call":
-                names.append(eqn.params["name"])
-                continue
-            for value in eqn.params.values():
-                for sub in value if isinstance(value, (list, tuple)) else [value]:
-                    sub = getattr(sub, "jaxpr", sub)
-                    if hasattr(sub, "eqns"):
-                        walk(sub)
-
-    walk(jaxpr)
-    return [n for n in names if n.startswith("RPA")]
+    )
 
 
 @pytest.mark.parametrize("decode_batch_size", [8, 4])
@@ -249,4 +235,5 @@ def test_the_jitted_wrapper_passes_the_decode_batch_size_to_its_decode_kernel(
         n for n in names if f"-b{decode_batch_size}-" in n
     ], names
     assert len([n for n in names if n.startswith(decode)]) == 1, names
+    assert len([n for n in names if n.startswith(mixed)]) == 1, names
     assert all("-b2-" in n for n in names if n.startswith(mixed)), names
