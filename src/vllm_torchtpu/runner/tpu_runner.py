@@ -3829,7 +3829,7 @@ class TPUModelRunner(GPUModelRunner):
                 subst_cache[subst_key] = substitution_indices
         else:
             # Both index rows in one host-to-device copy.
-            substitution_indices = _h2d_temp(
+            substitution_indices = stage_h2d_upload(
                 self,
                 torch.from_numpy(
                     _padded_substitution_indices(
@@ -4407,7 +4407,7 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 if deferred_mamba_indices is not None:
                     self._update_mamba_slot_read_offsets(
-                        deferred_mamba_indices, nt_chunk, num_reqs
+                        deferred_mamba_indices, nt_chunk
                     )
                 src_padded, spec_num_rejected = _compiled_assemble_spec_and_rejected(
                     nt_chunk,
@@ -4484,7 +4484,6 @@ class TPUModelRunner(GPUModelRunner):
                     self._update_mamba_slot_read_offsets(
                         deferred_mamba_indices,
                         nt0,
-                        nr0,
                     )
                 src_padded, spec_num_rejected = (
                     _compiled_assemble_two_chunks_spec_and_rejected(
@@ -4521,7 +4520,6 @@ class TPUModelRunner(GPUModelRunner):
             self._update_mamba_slot_read_offsets(
                 deferred_mamba_indices,
                 next_tokens_per_chunk[0],
-                state.num_reqs_list[0],
             )
 
         if (
