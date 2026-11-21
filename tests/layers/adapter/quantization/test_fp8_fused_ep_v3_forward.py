@@ -155,6 +155,43 @@ def _layer(sequence_parallel_flag):
     )
 
 
+def test_the_fused_kernel_graph_keeps_the_copy_tables(monkeypatch, v3):
+    """A layer with few-token copy tables: its other compiled shapes take the
+    scores op, which reads the four tables, so a fused-kernel step's graph
+    reads them too (``_retain_copy_tables``) and every compiled shape keeps the
+    same graph inputs. Traced, with dead code dropped, each table still feeds
+    the output."""
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    monkeypatch.setattr(fused_moe_ep_v3, "tensor_parallel_size", lambda: 1)
+    monkeypatch.setattr(
+        fused_moe_ep_v3,
+        "fused_moe_ep",
+        lambda x, w13, w2, s13, s2, logits: x + logits[:, :1].to(x.dtype),
+    )
+    v3.method._moe_lowtok_scores_op = Mock(name="scores_op")
+
+    def step(x, logits, tables, prim, copy, hot1h):
+        layer = _layer(False)
+        layer._lowtok_has_copies = True
+        layer._lowtok_tables, layer._lowtok_prim = tables, prim
+        layer._lowtok_copy, layer._lowtok_hot1h = copy, hot1h
+        return v3.method.apply_monolithic(layer, x, logits)
+
+    graph = make_fx(step)(
+        torch.zeros(GATE, 8, dtype=torch.bfloat16),
+        torch.zeros(GATE, 2),
+        torch.zeros(4, dtype=torch.int32),
+        torch.zeros(4, dtype=torch.int32),
+        torch.zeros(4, dtype=torch.int32),
+        torch.zeros(2, 4, dtype=torch.bool),
+    ).graph
+    graph.eliminate_dead_code()
+    assert v3.fused == [] and v3.scores == []
+    inputs = [node for node in graph.nodes if node.op == "placeholder"]
+    assert [len(node.users) > 0 for node in inputs] == [True] * 6
+
+
 @pytest.mark.parametrize(
     "tp, sp_active, min_rows, rows, scores_op, path",
     [
