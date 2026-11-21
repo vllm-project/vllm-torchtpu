@@ -639,11 +639,11 @@ def _changed_files(ctx: BuildContext, *, env: Mapping[str, str]) -> list[str]:
         )
         return [line for line in tree.stdout.splitlines() if line]
 
-    if ctx.source != "schedule":
+    if ctx.source != "schedule" and not (ctx.nightly_env or ctx.torchtpu_nightly_env):
         # Any other build is of a commit, which on main is the squash merge of
         # one PR, so its diff against its parent is the whole change. Not a
-        # scheduled build: the nightly tests main as it stands, whatever its
-        # last commit touched.
+        # scheduled or nightly-flagged build: nightlies test main as it stands,
+        # whatever its last commit touched.
         _git("fetch", "origin", ctx.commit, "--depth=2", "--quiet", env=env)
         return _diff_names([f"{ctx.commit}^", ctx.commit], env=env)
 
