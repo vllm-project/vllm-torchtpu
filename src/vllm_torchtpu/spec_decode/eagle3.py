@@ -2263,7 +2263,7 @@ class Eagle3Proposer:
         runner = self.runner
         num_reqs = chunk.num_reqs
         start = chunk.start_index
-        from vllm_torchtpu.runner.tpu_runner import _h2d_temp
+        from vllm_torchtpu.layers.core.attention_metadata import stage_h2d_upload
 
         # The async (next_tokens_device) path recomputes last_token_indices and
         # num_rejected fully on-device below; only compute host arrays when
@@ -2314,7 +2314,9 @@ class Eagle3Proposer:
                     len(scheduler_output.scheduled_spec_decode_tokens.get(rid, ()))
                     for rid in req_ids
                 ]
-                draft_lengths_dev = _h2d_temp(runner, torch.from_numpy(num_draft_np))
+                draft_lengths_dev = stage_h2d_upload(
+                    runner, torch.from_numpy(num_draft_np)
+                )
             pad_key = (p, num_reqs, str(runner.device))
             pad_req_idx = self._async_pad_req_idx_cache.get(pad_key)
             if pad_req_idx is None:
@@ -2332,7 +2334,7 @@ class Eagle3Proposer:
                         + scheduler_output.num_scheduled_tokens[req_ids[i]]
                     )
                     ov_np[i] = req_state.get_token_id(seq_len)
-                ov_tokens_dev = _h2d_temp(runner, torch.from_numpy(ov_np))
+                ov_tokens_dev = stage_h2d_upload(runner, torch.from_numpy(ov_np))
             step0_pad_len = self._step0_pad_len
             prep_step1 = (
                 self._prep_step1_inputs
@@ -2434,8 +2436,10 @@ class Eagle3Proposer:
                 lti_p_np[:num_reqs] = last_token_indices_np
                 ntids_p_np = np.full(p, ov_v[-1], dtype=np.int32)
                 ntids_p_np[:num_reqs] = ov_v
-                last_token_indices = _h2d_temp(runner, torch.from_numpy(lti_p_np))
-                next_token_ids = _h2d_temp(runner, torch.from_numpy(ntids_p_np))
+                last_token_indices = stage_h2d_upload(
+                    runner, torch.from_numpy(lti_p_np)
+                )
+                next_token_ids = stage_h2d_upload(runner, torch.from_numpy(ntids_p_np))
             else:
                 next_token_ids = device_seed[start : start + num_reqs].to(torch.int32)
                 if ov_i:
@@ -2448,7 +2452,7 @@ class Eagle3Proposer:
                             + scheduler_output.num_scheduled_tokens[req_ids[i]]
                         )
                         ov_np[i] = req_state.get_token_id(seq_len)
-                    ov_dev = _h2d_temp(runner, torch.from_numpy(ov_np))
+                    ov_dev = stage_h2d_upload(runner, torch.from_numpy(ov_np))
                     next_token_ids = torch.where(ov_dev >= 0, ov_dev, next_token_ids)
                 runner_paddings = getattr(runner, "num_reqs_paddings", None)
                 if (
@@ -2468,9 +2472,11 @@ class Eagle3Proposer:
                     # pyrefly: ignore[unbound-name]
                     lti_p_np = np.full(p, last_token_indices_np[-1], dtype=np.int64)
                     lti_p_np[:num_reqs] = last_token_indices_np
-                    last_token_indices = _h2d_temp(runner, torch.from_numpy(lti_p_np))
+                    last_token_indices = stage_h2d_upload(
+                        runner, torch.from_numpy(lti_p_np)
+                    )
                 else:
-                    last_token_indices = _h2d_temp(
+                    last_token_indices = stage_h2d_upload(
                         runner,
                         # pyrefly: ignore[unbound-name]
                         torch.from_numpy(last_token_indices_np),
@@ -2514,8 +2520,8 @@ class Eagle3Proposer:
                 p, next_token_ids_np[-1], dtype=next_token_ids_np.dtype
             )
             ntids_p_np[:num_reqs] = next_token_ids_np
-            last_token_indices = _h2d_temp(runner, torch.from_numpy(lti_p_np))
-            next_token_ids = _h2d_temp(runner, torch.from_numpy(ntids_p_np))
+            last_token_indices = stage_h2d_upload(runner, torch.from_numpy(lti_p_np))
+            next_token_ids = stage_h2d_upload(runner, torch.from_numpy(ntids_p_np))
             draft_input_ids = self._draft_seed_input_ids(
                 chunk.input_ids, last_token_indices, next_token_ids
             )
@@ -2524,7 +2530,7 @@ class Eagle3Proposer:
             if step0_pad_len > p:
                 s0_lti_np = np.zeros(step0_pad_len, dtype=np.int64)
                 s0_lti_np[:p] = lti_p_np
-                self._last_step0_gather_indices = _h2d_temp(
+                self._last_step0_gather_indices = stage_h2d_upload(
                     runner, torch.from_numpy(s0_lti_np)
                 )
             elif step0_pad_len == p:
@@ -2545,12 +2551,12 @@ class Eagle3Proposer:
             padded_lti_np = np.zeros(p, dtype=np.int64)
             # pyrefly: ignore[unbound-name]
             padded_lti_np[:num_reqs] = last_token_indices_np
-            gather_indices = _h2d_temp(runner, torch.from_numpy(padded_lti_np))
+            gather_indices = stage_h2d_upload(runner, torch.from_numpy(padded_lti_np))
             step0_pad_len = self._step0_pad_len
             if step0_pad_len > p:
                 s0_lti_np = np.zeros(step0_pad_len, dtype=np.int64)
                 s0_lti_np[:num_reqs] = last_token_indices_np
-                self._last_step0_gather_indices = _h2d_temp(
+                self._last_step0_gather_indices = stage_h2d_upload(
                     runner, torch.from_numpy(s0_lti_np)
                 )
             elif step0_pad_len == p:
