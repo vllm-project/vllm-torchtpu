@@ -74,6 +74,18 @@ vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
   }'
 ```
 
+With `--attention-backend CUSTOM` and the seq-along-lane KV cache layout
+(`VLLM_KV_CACHE_LAYOUT=HND`), the Raiden layout fingerprint includes the
+attention kernel page, and vLLM picks the largest supported page that divides
+each engine's block size: 128 or 256 tokens, or up to 4096 tokens on an engine
+with prefill context parallelism. The setting below applies only to an engine
+with a KV transfer config, this backend and this layout; any other engine logs a
+warning and keeps vLLM's page. When the prefill and decode block sizes differ
+(for example 2304 and 640 tokens), the two engines page differently and every
+transfer is refused with "Layout fingerprint mismatch". Give both engines the
+same page:
+`--additional-config '{"tpu_kv_transfer": {"kernel_page_tokens": 128}}'`.
+
 ### Step 3: Launch Decode Instance (`kv_consumer`)
 
 ```bash

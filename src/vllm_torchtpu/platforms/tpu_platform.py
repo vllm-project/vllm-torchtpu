@@ -881,6 +881,8 @@ class TpuPlatform(Platform):
         from vllm_torchtpu.layers.adapter.attention import (
             PallasAttentionBackend,
             PallasBatchedRPAAttentionBackend,
+            PallasMLAttentionBackend,
+            check_kv_transfer_page,
         )
 
         # Lazy: importing vllm_torchtpu.layers loads the model layers, which need
@@ -921,6 +923,19 @@ class TpuPlatform(Platform):
                 "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
             )
         kv_cache_layout = get_flashinfer_layout_string(layout)
+        # A malformed tpu_kv_transfer section fails here, and a page this engine
+        # will not apply is logged; a page outside the engine's kernel page list
+        # fails when its layers pick their kernel block sizes. The check gets the
+        # backend the layers will run: an MLA model runs FLASH_ATTN_MLA whatever
+        # --attention-backend names (get_attn_backend_cls).
+        model_config = vllm_config.model_config
+        check_kv_transfer_page(
+            vllm_config,
+            layout,
+            PallasMLAttentionBackend
+            if model_config is not None and model_config.use_mla
+            else backend,
+        )
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
             kv_cache_layout=kv_cache_layout,
