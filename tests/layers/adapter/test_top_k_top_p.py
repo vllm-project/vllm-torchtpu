@@ -79,3 +79,15 @@ def test_apply_top_k_top_p_per_request():
     result = sampling.apply_top_k_top_p(logits, top_k, top_p)
     torch.testing.assert_close(result, expected)
     torch.testing.assert_close(logits, original)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_apply_top_k_top_p_none_matches_neutral(dtype):
+    """None skips a search; it must equal passing neutral values for every row."""
+    logits = torch.randn(3, 64, generator=torch.Generator().manual_seed(0)).to(dtype)
+    top_k = torch.zeros((3, 1), dtype=torch.int32)
+    top_p = torch.ones((3, 1))
+    neutral = sampling.apply_top_k_top_p(logits, top_k, top_p)
+    assert torch.equal(sampling.apply_top_k_top_p(logits, None, None), neutral)
+    assert torch.equal(sampling.apply_top_k_top_p(logits, None, top_p), neutral)
+    assert torch.equal(sampling.apply_top_k_top_p(logits, top_k, None), neutral)

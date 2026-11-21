@@ -240,12 +240,18 @@ def topp_mask(
 
 
 def apply_top_k_top_p(
-    logits: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
+    logits: torch.Tensor, top_k: torch.Tensor | None, top_p: torch.Tensor | None
 ) -> torch.Tensor:
-    should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
-    topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
-    masked_logits = torch.where(should_apply_topk, topk_masked, logits)
+    """Per-row top-k then top-p masking; top_k <= 0 or top_p >= 1 leaves a row
+    as it is. None means no row filters by it, which skips that search."""
+    masked_logits = logits
+    if top_k is not None:
+        should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
+        topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
+        masked_logits = torch.where(should_apply_topk, topk_masked, logits)
 
-    should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
-    topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE)
-    return torch.where(should_apply_topp, topp_masked, masked_logits)
+    if top_p is not None:
+        should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
+        topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE)
+        masked_logits = torch.where(should_apply_topp, topp_masked, masked_logits)
+    return masked_logits

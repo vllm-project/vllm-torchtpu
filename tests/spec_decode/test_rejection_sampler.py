@@ -490,6 +490,36 @@ def test_rejection_sampler_random_all_accepted_uses_bonus(device):
     assert torch.equal(output, expected)
 
 
+def test_rejection_sampler_random_without_filters_matches_neutral(device):
+    """top_k/top_p None (no row filters) samples exactly as neutral values do."""
+    gen = torch.Generator().manual_seed(0)
+    num_tokens, vocab = 6, 64
+    draft_token_ids = torch.randint(0, vocab, (num_tokens,), generator=gen)
+    target_logits = torch.randn(num_tokens, vocab, generator=gen)
+    accept_u = torch.rand(num_tokens, generator=gen)
+    recover_u = torch.rand(num_tokens, vocab, generator=gen)
+    common = dict(
+        draft_token_ids=draft_token_ids.to(torch.int32).to(device),
+        num_draft_tokens=torch.tensor([3, 3], dtype=torch.int32, device=device),
+        target_logits=target_logits.to(device),
+        bonus_token_ids=torch.tensor([7, 9], dtype=torch.int32, device=device),
+        segment_ids=torch.tensor([0, 0, 0, 1, 1, 1], device=device),
+        group_indices=torch.tensor([0, 1, 2, 0, 1, 2], device=device),
+        max_draft_tokens=3,
+        temperatures=torch.full((num_tokens, 1), 0.8, device=device),
+        accept_u=accept_u.to(device),
+        recover_u=recover_u.to(device),
+        do_sampling=True,
+    )
+    sampler = RejectionSampler()
+    neutral = sampler(
+        top_k=torch.zeros((num_tokens, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((num_tokens, 1), device=device),
+        **common,
+    )
+    assert torch.equal(sampler(top_k=None, top_p=None, **common), neutral)
+
+
 @pytest.mark.parametrize("padding_token_id", [-1, 0])
 def test_rejection_sampler_random_ignores_padded_draft_slots(device, padding_token_id):
     """Ignore static-shape padding beyond the declared draft length."""

@@ -117,8 +117,10 @@ class RejectionSampler:
           group_indices: Indices within each segment.
           max_draft_tokens: The maximum number of draft tokens.
           temperatures: Per-draft-token temperatures, padded to target_logits.
-          top_k: Per-draft-token top-k values, padded to target_logits.
-          top_p: Per-draft-token top-p values, padded to target_logits.
+          top_k: Per-draft-token top-k values, padded to target_logits; None
+            when no row filters by top-k.
+          top_p: Per-draft-token top-p values, padded to target_logits; None
+            when no row filters by top-p.
           accept_u: Uniform random values for draft accept/reject decisions.
           recover_u: Uniform random values used to sample recovered tokens.
           do_sampling: Whether to use probabilistic rejection sampling. False
@@ -129,16 +131,10 @@ class RejectionSampler:
           accepted tokens and bonus tokens, padded with PLACEHOLDER_TOKEN_ID.
         """
         if do_sampling:
-            if (
-                temperatures is None
-                or top_k is None
-                or top_p is None
-                or accept_u is None
-                or recover_u is None
-            ):
+            if temperatures is None or accept_u is None or recover_u is None:
                 raise ValueError(
                     "Non-greedy rejection sampling requires temperatures, "
-                    "top_k, top_p, accept_u, and recover_u."
+                    "accept_u, and recover_u."
                 )
             return _random_rejection_sample_with_segment(
                 draft_token_ids,
@@ -464,8 +460,8 @@ def _random_rejection_sample_with_segment(
     group_indices: torch.Tensor,
     max_draft_tokens: int,
     temperatures: torch.Tensor,
-    top_k: torch.Tensor,
-    top_p: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
     accept_u: torch.Tensor,
     recover_u: torch.Tensor,
     synthetic_conditional_rates: torch.Tensor | None,

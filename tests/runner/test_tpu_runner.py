@@ -3231,7 +3231,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         sample_from_logits_func=fake_sample_from_logits,
     )
     TPUModelRunner._precompile_sample_from_logits(precompile_runner)
-    assert seen_u_dtypes == [torch.float32, torch.float32]
+    assert seen_u_dtypes == [torch.float32] * 3
     seen_u_dtypes.clear()
 
     # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
@@ -3363,3 +3363,33 @@ def test_padded_sampling_params_reuse_the_last_upload():
     changed = build(runner, 0, 3, logits)
     assert changed[0] is not first[0]
     assert changed[0].view(-1).tolist() == pytest.approx([0.5, 1.0, 0.0, 1.0])
+
+
+@pytest.mark.parametrize(
+    "top_k, top_p, padded_top_k",
+    [
+        ([100, 0], [1.0, 1.0], None),
+        ([5, 0], [1.0, 1.0], [5, 0, 0, 0]),
+        ([0, 100], [1.0, 0.9], [0, 0, 0, 0]),
+    ],
+)
+def test_padded_sampling_params_skip_filters_no_row_uses(top_k, top_p, padded_top_k):
+    """top-k >= vocab and top-p == 1 filter nothing; when no active row filters,
+    both come back None so the samplers skip their searches."""
+    runner = SimpleNamespace(
+        vocab_size=100,
+        input_batch=SimpleNamespace(
+            temperature_cpu_tensor=torch.ones(2),
+            top_k_cpu_tensor=torch.tensor(top_k, dtype=torch.int32),
+            top_p_cpu_tensor=torch.tensor(top_p),
+        ),
+        _padded_sampling_params={},
+    )
+    _, k, p = TPUModelRunner._build_padded_sampling_params(
+        runner, 0, 2, torch.zeros(4, 8)
+    )
+    if padded_top_k is None:
+        assert k is None and p is None
+    else:
+        assert k.view(-1).tolist() == padded_top_k
+        assert p.view(-1).tolist() == pytest.approx(top_p + [1.0, 1.0])
