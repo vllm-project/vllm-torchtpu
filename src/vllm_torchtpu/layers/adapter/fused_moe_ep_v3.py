@@ -778,48 +778,56 @@ def _unsupported_kernel_reason(
     keeps the grouped-matmul path.
     """
     device = mesh.devices.flat[0]
-    # `supported_on` reads this process's chip record for a TPU device. JAX
-    # raises when the record cannot be read (a device kind it does not know,
-    # or no backend); the kernel's checks cannot run then, and neither could
-    # the kernel, so the layer is refused rather than the load failing.
-    try:
-        supported = supported_on(device)
-    except (ValueError, RuntimeError) as error:
-        return f"the TPU chip record could not be read at weight load: {error}"
-    if not supported:
-        return (
-            f"the kernel is built and tested on TPU generations "
-            f"{SUPPORTED_GENERATIONS} only, and the mesh's devices are "
-            f"{device.device_kind}"
+    # JAX's chip-record read (`pltpu.get_tpu_info`, which `supported_on` and
+    # the VMEM fit make) takes the chip from the abstract mesh in context and,
+    # with none, from JAX's own default device, whatever mesh the caller
+    # holds. Under this mesh's abstract mesh it reads the chip the mesh's
+    # devices name, which is what the kernel's shard bodies read: in serving,
+    # torch_tpu's compile-only devices, named after the chip its runtime
+    # reports.
+    with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+        # JAX raises when the record cannot be read (a device kind it does
+        # not know); the kernel's checks cannot run then, and neither could
+        # the kernel, so the layer is refused rather than the load failing.
+        try:
+            supported = supported_on(device)
+        except (ValueError, RuntimeError) as error:
+            return f"the TPU chip record could not be read at weight load: {error}"
+        if not supported:
+            return (
+                f"the kernel is built and tested on TPU generations "
+                f"{SUPPORTED_GENERATIONS} only, and the mesh's devices are "
+                f"{device.device_kind}"
+            )
+        # The FFN program's build check: rows of whole LANES-lane blocks and
+        # experts at least one block wide.
+        if hidden < LANES or hidden % LANES or inter < LANES:
+            return (
+                f"hidden={hidden}, inter={inter}: the kernel's FFN takes rows "
+                f"of whole {LANES}-lane blocks and an intermediate width of at "
+                f"least {LANES}"
+            )
+        config = served_config(
+            hidden=hidden, inter=inter, experts_per_shard=local_experts, top_k=topk
         )
-    # The FFN program's build check: rows of whole LANES-lane blocks and
-    # experts at least one block wide.
-    if hidden < LANES or hidden % LANES or inter < LANES:
-        return (
-            f"hidden={hidden}, inter={inter}: the kernel's FFN takes rows of "
-            f"whole {LANES}-lane blocks and an intermediate width of at least "
-            f"{LANES}"
-        )
-    config = served_config(
-        hidden=hidden, inter=inter, experts_per_shard=local_experts, top_k=topk
-    )
-    try:
-        transport.check_width(mesh.shape[EP_AXIS_NAME])
-        expert_buffers_that_fit(
-            local_experts,
-            TILE_ROWS,
-            hidden,
-            inter,
-            config=config,
-            weight_format=WEIGHT_FORMAT,
-            activation_block=config.activation_block,
-            result_rows=config.result_rows,
-            token_block=config.token_rows_block,
-        )
-    except ValueError as error:
-        # Each raises ValueError only to refuse: a mesh width the transport
-        # cannot take, or not even two whole-expert weight slots in VMEM.
-        return str(error)
+        try:
+            transport.check_width(mesh.shape[EP_AXIS_NAME])
+            expert_buffers_that_fit(
+                local_experts,
+                TILE_ROWS,
+                hidden,
+                inter,
+                config=config,
+                weight_format=WEIGHT_FORMAT,
+                activation_block=config.activation_block,
+                result_rows=config.result_rows,
+                token_block=config.token_rows_block,
+            )
+        except ValueError as error:
+            # Each raises ValueError only to refuse: a mesh width the
+            # transport cannot take, or not even two whole-expert weight
+            # slots in VMEM.
+            return str(error)
     return None
 
 
