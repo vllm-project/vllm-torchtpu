@@ -75,8 +75,6 @@ class Operands:
     w2: object  # [G, inter, hidden]
     w1_scales: object  # [G, cols] f32, or None (bf16 weights)
     w2_scales: object  # [G, hidden] f32, or None
-    w1_bias: object  # [G, cols] f32 or None
-    w2_bias: object  # [G, hidden] f32 or None
     transport_send_sem: object = None  # pallas mode: the start call's
     transport_receive_sems: object = None  # two semaphores
 
@@ -104,8 +102,6 @@ class Scratch:
     w2: object  # [weight slots, inter, hidden]
     w1_scales: object  # [G, cols] resident, or None
     w2_scales: object  # [G, hidden] resident, or None
-    w1_bias: object  # [G, cols] or None
-    w2_bias: object  # [G, hidden] or None
     row_scales: object  # [result slots, planes, window rows, LANES] i32
     result_rows: object  # [result slots, tile rows, result blocks, LANES]
     result_scales: object  # [result slots, tile blocks, 1, ROW_BLOCK] f32
@@ -218,9 +214,6 @@ def build_ffn_kernel(
     weight_format,
     routed_rows,
     activation="silu",
-    has_w1_bias=False,
-    has_w2_bias=False,
-    no_gate=False,
     pallas_transport=False,
     weight_slots=WEIGHT_SLOTS_DEFAULT,
     weight_prefetch=WEIGHT_PREFETCH_DEFAULT,
@@ -268,9 +261,8 @@ def build_ffn_kernel(
     has_result_scales = result_rows == "fp8"
     if pallas_transport:
         transport.check_width(num_shards)
-    activations = ffn.NO_GATE_ACTIVATIONS if no_gate else ffn.ACTIVATIONS
-    if activation not in activations:
-        raise ValueError(f"activation {activation!r} is not one of {activations}")
+    if activation not in ffn.ACTIVATIONS:
+        raise ValueError(f"activation {activation!r} is not one of {ffn.ACTIVATIONS}")
     _check_build(
         tile_rows=tile_rows,
         hidden=hidden,
@@ -299,9 +291,6 @@ def build_ffn_kernel(
         weight_slots=weight_slots,
         result_slots=result_slots,
         weight_format=weight_format,
-        has_w1_bias=has_w1_bias,
-        has_w2_bias=has_w2_bias,
-        no_gate=no_gate,
         activation_block=activation_block,
         result_dtype=result_dtype,
         token_block=token_block,
@@ -314,9 +303,6 @@ def build_ffn_kernel(
         weight_slots=weight_slots,
         result_slots=result_slots,
         weight_format=weight_format,
-        has_w1_bias=has_w1_bias,
-        has_w2_bias=has_w2_bias,
-        no_gate=no_gate,
         activation_block=activation_block,
         result_dtype=result_dtype,
         token_block=token_block,
@@ -343,8 +329,6 @@ def build_ffn_kernel(
         w2=True,
         w1_scales=form.has_scales,
         w2_scales=form.has_scales,
-        w1_bias=has_w1_bias,
-        w2_bias=has_w2_bias,
         transport_send_sem=pallas_transport,
         transport_receive_sems=pallas_transport,
     )
@@ -354,8 +338,6 @@ def build_ffn_kernel(
         w2=True,
         w1_scales=form.has_scales,
         w2_scales=form.has_scales,
-        w1_bias=has_w1_bias,
-        w2_bias=has_w2_bias,
         row_scales=True,
         result_rows=True,
         result_scales=True,
@@ -393,9 +375,6 @@ def build_ffn_kernel(
         shard_index_operand=shard_index_operand,
         experts_per_shard=experts_per_shard,
         form=form,
-        has_w1_bias=has_w1_bias,
-        has_w2_bias=has_w2_bias,
-        no_gate=no_gate,
         activation=activation,
         weight_slots=weight_slots,
         weight_prefetch=weight_prefetch,
@@ -521,7 +500,6 @@ def build_ffn_kernel(
     name = (
         "fused_ep_moe"
         f"{'' if form.name == WeightFormat.FP8 else '_' + form.name}"
-        f"{'_w1bias' if has_w1_bias else ''}{'_w2bias' if has_w2_bias else ''}"
         f"{'_pallas' if pallas_transport else ''}"
         f"{'_a' + str(activation_block) if activation_block else ''}"
         f"{'_k' + str(token_block) if token_block != activation_block else ''}"
@@ -578,8 +556,6 @@ def build_ffn_kernel(
         w2,
         w1_scales,
         w2_scales,
-        w1_bias=None,
-        w2_bias=None,
         *,
         arrival_rows,
         transport_sems=None,
@@ -593,14 +569,10 @@ def build_ffn_kernel(
         for operand, present, name_ in (
             (w1_scales, form.has_scales, "w1_scales"),
             (w2_scales, form.has_scales, "w2_scales"),
-            (w1_bias, has_w1_bias, "w1_bias"),
-            (w2_bias, has_w2_bias, "w2_bias"),
         ):
             if (operand is not None) != present:
                 raise ValueError(
-                    f"the kernel was built for {weight_format} weights with "
-                    f"has_w1_bias={has_w1_bias} and "
-                    f"has_w2_bias={has_w2_bias}, "
+                    f"the kernel was built for {weight_format} weights, "
                     f"and {name_} is "
                     f"{'present' if operand is not None else 'absent'}"
                 )
@@ -623,9 +595,6 @@ def build_ffn_kernel(
         scales = tuple(
             s.astype(jnp.float32) for s in (w1_scales, w2_scales) if s is not None
         )
-        biases = tuple(
-            b.astype(jnp.float32) for b in (w1_bias, w2_bias) if b is not None
-        )
         arrivals, arrival_scales, _, _ = pallas_call(arrival_rows)(
             *tables,
             expert_rows.astype(jnp.int32),
@@ -641,7 +610,6 @@ def build_ffn_kernel(
             w1,
             w2,
             *scales,
-            *biases,
             *(cast("tuple", transport_sems) if pallas_transport else ()),
         )
         return arrivals, arrival_scales.reshape(arrival_rows)
@@ -660,7 +628,7 @@ def ffn_kernel(*, shard_index_operand=False, **kwargs):
     shard_index_operand, which the build reads (the operand mode adds
     one scalar-prefetch table and changes the unpacking), so a build made in
     one mode is never handed to the other. The cache is unbounded: one
-    program per (token bucket, format, bias set, activation, config, mode)."""
+    program per (token bucket, format, activation, config, mode)."""
     key = tuple(sorted(kwargs.items())) + (
         ("shard_index_operand", shard_index_operand),
     )
