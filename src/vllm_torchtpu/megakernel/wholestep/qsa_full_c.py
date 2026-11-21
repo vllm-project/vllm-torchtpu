@@ -188,7 +188,12 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qx_rope", pltpu.VMEM((2, 1, 128), F32)),
             ScratchReq("qx_old", pltpu.VMEM((2, MICRO, 1, 4, 256), f8)),
             ScratchReq("qx_sem", pltpu.SemaphoreType.DMA((6,))),
-        ] if self.xreq_loads else []) + (self._shard_scratch(ex) if self.shard_index else []) + (
+        ] if self.xreq_loads else []) + ([
+            # `req_async`: the new group's output stores, banked by request parity (q mod 2).
+            ScratchReq("qa_ck", pltpu.VMEM((2, 1, ix.IDX_DIM), BF16)),
+            ScratchReq("qa_rnew", pltpu.VMEM((2, 8, ix.IDX_DIM), BF16)),
+            ScratchReq("qa_sem", pltpu.SemaphoreType.DMA((4,))),
+        ] if self.req_async else []) + (self._shard_scratch(ex) if self.shard_index else []) + (
             self._union_scratch(ex) if self.union_attn else []
         ) + (self._dcp_scratch(g, ex) if self.dcp > 1 else [])
 
@@ -560,10 +565,12 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
     # ------------------------------------------------------------ in kernel
     @_scoped("qsa_newgrp")
     def _new_group(
-        self, ctx: Any, l: Any, q: int, raw_q: jax.Array, bank: Any = None
+        self, ctx: Any, l: Any, q: int, raw_q: jax.Array, bank: Any = None, sbank: Any = None
     ) -> jax.Array:
         """Compressed key of request `q`'s group completed this step; writes its outputs.
-        `bank`: its loads were issued ahead (`_xreq_loads`) into that bank."""
+        `bank`: its loads were issued ahead (`_xreq_loads`) into that bank. `sbank`
+        (`req_async`): its stores go out of that bank and are left in flight
+        (`_wait_new_group_stores`)."""
         ex, scr, g, T = ctx.ex, ctx.scr, ctx.g, ctx.ex.T
         c0 = ctx.extra[CTXQ][q]
         if bank is not None:
@@ -571,7 +578,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 cp.wait()
             ring = scr["qx_ring"][bank].astype(F32)
             rope = scr["qx_rope"][bank]
-            return self._new_group_body(ctx, l, q, raw_q, c0, ring, rope)
+            return self._new_group_body(ctx, l, q, raw_q, c0, ring, rope, sbank)
         loads = [
             pltpu.make_async_copy(src, dst, scr["qc_sem"].at[i])
             for src, dst, i in (
@@ -587,11 +594,26 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             for cp in loads:
                 cp.wait()
         return self._new_group_body(
-            ctx, l, q, raw_q, c0, scr["qc_ring"][...].astype(F32), None
+            ctx, l, q, raw_q, c0, scr["qc_ring"][...].astype(F32), None, sbank
         )
 
+    def _new_group_stores(self, ctx: Any, l: Any, q: Any, sbank: Any) -> list:
+        """`req_async`: request `q`'s two output stores out of bank `sbank`."""
+        scr, o = ctx.scr, ctx.stream.sp.block_ord(l, self.name)
+        return [
+            pltpu.make_async_copy(src.at[sbank], ctx.O[dst].at[o, q], scr["qa_sem"].at[2 * sbank + i])
+            for i, (src, dst) in enumerate(((scr["qa_ck"], CK_NEW), (scr["qa_rnew"], RING_NEW)))
+        ]
+
+    def _wait_new_group_stores(self, ctx: Any, l: Any, sbank: Any) -> None:
+        """`req_async`: wait bank `sbank`'s two stores (the wait needs only the semaphore and
+        the byte count; request 0's descriptor has both)."""
+        for cp in self._new_group_stores(ctx, l, 0, sbank):
+            cp.wait()
+
     def _new_group_body(
-        self, ctx: Any, l: Any, q: Any, raw_q: jax.Array, c0: Any, ring: jax.Array, rope: Any
+        self, ctx: Any, l: Any, q: Any, raw_q: jax.Array, c0: Any, ring: jax.Array, rope: Any,
+        sbank: Any = None,
     ) -> jax.Array:
         ex, scr, g, T = ctx.ex, ctx.scr, ctx.g, ctx.ex.T
         p3 = c0 + jax.lax.rem(3 - jax.lax.rem(c0, 4) + 4, 4)  # first position = 3 mod 4
@@ -624,7 +646,16 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         cur_rows = jnp.zeros((8, ix.IDX_DIM), F32)
         for t in range(T):
             cur_rows = jnp.where(p_l == c0 + t, raw_q[t : t + 1], cur_rows)
-        scr["qc_rnew"][...] = jnp.where(p_l >= c0, cur_rows, ring).astype(BF16)
+        rnew = jnp.where(p_l >= c0, cur_rows, ring).astype(BF16)
+        if sbank is not None:  # `req_async`: the bank's stores of request q - 2 first
+            pl.when(q >= 2)(lambda: self._wait_new_group_stores(ctx, l, sbank))
+            scr["qa_ck"][sbank] = ck.astype(BF16)
+            scr["qa_rnew"][sbank] = rnew
+            for cp in self._new_group_stores(ctx, l, q, sbank):
+                cp.start()
+            return ck, p3 // 4
+        scr["qc_ck"][...] = ck.astype(BF16)
+        scr["qc_rnew"][...] = rnew
         o = ctx.stream.sp.block_ord(l, self.name)
         stores = [
             pltpu.make_async_copy(src, ctx.O[dst].at[o, q], scr["qc_sem"].at[2 + i])
@@ -1033,7 +1064,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     def _():
                         issue_loads(jnp.minimum(q + 1, nreq - 1), 1 - bank)
 
-                ck, gc = self._new_group(ctx, l, q, scr["qc_irq"][q], bank)
+                ck, gc = self._new_group(
+                    ctx, l, q, scr["qc_irq"][q], bank,
+                    jax.lax.rem(q, 2) if self.req_async else None,
+                )
 
                 def own() -> None:
                     score_merge(
@@ -1057,6 +1091,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     issue_loads(0, 0)
 
             jax.lax.fori_loop(0, n_loop, req, 0)
+            if self.req_async:  # each used bank's last stores are still in flight
+                for b in range(2):
+                    pl.when(n_loop > b)(lambda b=b: self._wait_new_group_stores(ctx, l, b))
             if self.shard_index:
                 self._exchange_selection(ctx)
         elif self.shard_index:
@@ -1345,9 +1382,12 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         uoff = pl.multiple_of(rk * KU, 128) if self.dcp > 1 else 0
 
         xreq = self.xreq_prefetch
+        rasync = self.req_async_ids
 
-        def stage_ids(q: Any, bank: Any) -> None:
-            """Request `q`'s union ids (physical with `union_phys`) into `qu_row[bank]`."""
+        def stage_ids(q: Any, bank: Any, wait: bool = True) -> None:
+            """Request `q`'s union ids (physical with `union_phys`) into `qu_row[bank]`.
+            `wait=False` (`req_async`): the copies into `qu_row` are left in flight
+            (`wait_ids`)."""
             # This rank's union: under DCP only the groups it owns (the pair rank's rows are
             # neither streamed nor scored here).
             src = scr["qu_id"].at[q, :, pl.ds(uoff, KU)]
@@ -1386,9 +1426,26 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 ]
                 for c in cs:
                     c.start()
-                for c in cs:
-                    c.wait()
+                if wait:
+                    for c in cs:
+                        c.wait()
             return n_u
+
+        def wait_ids() -> None:
+            """`req_async`: wait the `qu_row` copies `stage_ids(.., wait=False)` issued (the
+            waits need only the semaphores and byte counts)."""
+            with sc("qsa_u_ids", 2):
+                for c in (
+                    pltpu.make_async_copy(
+                        scr["qu_id"].at[0, :, pl.ds(0, KU)], scr["qu_row"].at[pl.ds(0, 1), pl.ds(0, KU)],
+                        scr["qu_sem"].at[0],
+                    ),
+                    pltpu.make_async_copy(
+                        scr["qi_z"], scr["qu_row"].at[pl.ds(0, 1), pl.ds(KU, 128)],
+                        scr["qu_sem"].at[1],
+                    ),
+                ):
+                    c.wait()
 
         def req(q: Any, carry: Any) -> Any:
             if xreq:
@@ -1407,6 +1464,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     (nlive, 1 - bank, self.tab_base(ctx, l) + qn, scr["qu_n"][qn, rk]),
                 )
                 n_u = scr["qu_n"][q, rk]
+            elif rasync:  # staged by the previous request (or before the loop)
+                outs, bank, stream = carry, 0, None
+                n_u = scr["qu_n"][q, rk]
             else:
                 outs, bank, stream = carry, 0, None
                 n_u = stage_ids(q, 0)
@@ -1419,6 +1479,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 qs = [jnp.concatenate([scr["qf_q"][r], scr["qd_q"][r]], axis=0) for r in rs]
             else:
                 qs = [scr["qf_q"][r] for r in rs]
+            if rasync:
+                wait_ids()
             with sc("qsa_u_attend", 2):
                 res = ua.attend_request(
                     T=T, nh=nh * self.dcp, pool=ctx.extra[POOL], ring=scr["qf_ring"],
@@ -1435,6 +1497,12 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     dcp=self.dcp, sc=ctx.stream.sc,
                     **(dict(ids_row=bank, stream=stream) if xreq else {}),
                 )
+            if rasync:  # request q's ids are read: the next request's go into `qu_row`
+
+                @pl.when(q + 1 < n_loop)
+                def _():
+                    stage_ids(jnp.minimum(q + 1, nreq - 1), 0, wait=False)
+
             if self.dcp > 1:
                 for r, (att, lse) in zip(rs, res):
                     lse = jnp.broadcast_to(lse, (2 * nh, 128))
@@ -1470,6 +1538,12 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             return sbase + (n_u * ua.MICRO + ua.TILE - 1) // ua.TILE
 
         n_loop = self._n_live(ctx) if self.skip_idle else nreq
+        if rasync:
+
+            @pl.when(n_loop > 0)
+            def _():
+                stage_ids(0, 0, wait=False)
+
         if not xreq:
             return list(jax.lax.fori_loop(0, n_loop, req, zeros))
         @pl.when(n_loop > 0)

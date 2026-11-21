@@ -126,6 +126,7 @@ def indexed_options(B: int | None = None) -> dict:
         compressed_dcp=compressed_dcp(),
         async_dma=envs.VLLM_TPU_MK_QSEL_ASYNC,
         xreq_prefetch=envs.VLLM_TPU_MK_QSA_XREQ_PREFETCH,
+        req_async=envs.VLLM_TPU_MK_QSA_REQ_ASYNC,
         select_nvis=envs.VLLM_TPU_MK_QSA_SELECT_NVIS,
         manager_pages=KEY_MP,
         key_slots=key_slots_for(B),
