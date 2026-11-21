@@ -10524,7 +10524,12 @@ class TPUModelRunner(GPUModelRunner):
                             torch.zeros(width, dtype=torch.int32, device=offsets.device)
                             for _ in range(num_idx_groups)
                         ]
+                        # sample_tokens' assembly stacks the groups in its
+                        # caller's grad mode, the read-offset methods below
+                        # under no_grad.
                         stacked = _stack_mamba_groups_compiled(*dummy_groups)
+                        with torch.no_grad():
+                            _stack_mamba_groups_compiled(*dummy_groups)
                     else:
                         stacked = torch.zeros(
                             width, dtype=torch.int32, device=offsets.device
@@ -10532,8 +10537,6 @@ class TPUModelRunner(GPUModelRunner):
                     _, _, keep_zero_dev, null = self._read_offset_reset_scratch(
                         width, offsets.device
                     )
-                    _reset_read_offsets_compiled(offsets, keep_zero_dev, stacked, null)
-                    _clear_read_offsets_compiled(offsets, stacked)
                     # A chunk of this width holds at most `width` requests,
                     # and its sampled rows are padded to its count's request
                     # bucket, which exceeds the width when an SMEM cap made the
@@ -10541,19 +10544,27 @@ class TPUModelRunner(GPUModelRunner):
                     max_rows = _get_padded_num_reqs_with_upper_limit(
                         width, self.max_num_reqs
                     )
-                    for num_reqs in self.num_reqs_paddings:
-                        if num_reqs > max_rows:
-                            continue
-                        for tok_dtype in (torch.int32, torch.int64):
-                            dummy_next = torch.full(
-                                (num_reqs, k_plus_1),
-                                INVALID_TOKEN_ID,
-                                dtype=tok_dtype,
-                                device=offsets.device,
-                            )
-                            _update_read_offsets_verify_compiled(
-                                offsets, stacked, dummy_next
-                            )
+                    # _reset_read_offsets_for_new_requests and
+                    # _update_mamba_slot_read_offsets run these under no_grad,
+                    # and dynamo guards on grad mode.
+                    with torch.no_grad():
+                        _reset_read_offsets_compiled(
+                            offsets, keep_zero_dev, stacked, null
+                        )
+                        _clear_read_offsets_compiled(offsets, stacked)
+                        for num_reqs in self.num_reqs_paddings:
+                            if num_reqs > max_rows:
+                                continue
+                            for tok_dtype in (torch.int32, torch.int64):
+                                dummy_next = torch.full(
+                                    (num_reqs, k_plus_1),
+                                    INVALID_TOKEN_ID,
+                                    dtype=tok_dtype,
+                                    device=offsets.device,
+                                )
+                                _update_read_offsets_verify_compiled(
+                                    offsets, stacked, dummy_next
+                                )
                     if assembly_shapes is not None:
                         req_loop_pairs, two_chunk_pairs = assembly_shapes
                         for num_reqs, p in req_loop_pairs:

@@ -1390,6 +1390,107 @@ def test_read_offset_warmup_covers_a_width_an_smem_cap_set(
         } <= warmed_verify
 
 
+def test_the_warmed_read_offset_programs_serve_without_compiling(monkeypatch):
+    """Dynamo guards on grad mode. The real stack, reset, clear and verify
+    programs, warmed by _precompile_mamba_rollback_helpers and then served as
+    a step serves them: the reset from execute_model and the clear and verify
+    from sample_tokens, each through its no_grad method, and the stack both
+    there and in sample_tokens' assembly, in that entry's own mode. No serving
+    call compiles."""
+    bases = (
+        "_stack_mamba_groups",
+        "_reset_read_offsets",
+        "_clear_read_offsets",
+        "_update_read_offsets_verify",
+    )
+    compiles: list[str] = []
+    for base in bases:
+
+        def backend(gm, example_inputs, base=base):
+            compiles.append(base)
+            return gm.forward
+
+        program = torch.compile(
+            getattr(tpu_runner, f"{base}_impl"),
+            backend=backend,
+            fullgraph=True,
+            dynamic=False,
+        )
+        # Off TPU the serving wrappers call the impl; both names get the program.
+        monkeypatch.setattr(tpu_runner, f"{base}_compiled", program)
+        monkeypatch.setattr(tpu_runner, f"{base}_impl", program)
+    for name in (
+        "_rollback_offsets_seed_compiled",
+        "_rollback_offsets_migrate_compiled",
+    ):
+        monkeypatch.setattr(tpu_runner, name, lambda *_a: None)
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+    width, k = 16, 3
+    # Two mamba groups, so the groups are stacked by a program.
+    groups = [torch.zeros(width, dtype=torch.int32) for _ in range(2)]
+    runner = SimpleNamespace(
+        max_num_reqs=16,
+        num_reqs_paddings=[8, 16],
+        num_reqs_max_model_len=16,
+        num_reqs_most_model_len=None,
+        mamba_slot_read_offsets=torch.zeros(64, dtype=torch.int32),
+        _mamba_ckpt_window=1,
+        _pool_block_split=1,
+        _mamba_copy_plan=[(0, []), (1, [])],
+        kv_cache_config=None,
+        speculative_config=SimpleNamespace(num_speculative_tokens=k),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        _is_async_drafter=True,
+        _read_offset_scratch={},
+        _bucket_len=tpu_runner.TPUModelRunner._bucket_len,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _attn_metadata_builder_ctx=SimpleNamespace(
+            mamba_state_indices=None,
+            unified_mamba_state_indices=groups,
+            _stacked_mamba_groups=None,
+            _stacked_mamba_groups_ids=None,
+        ),
+        input_batch=SimpleNamespace(req_ids=["a", "b"]),
+        requests={"a": None, "b": None},
+        _mamba_offset_seeded=set(),
+        _dp_lockstep_enabled=lambda: False,
+    )
+    for method in (
+        "_read_offset_reset_scratch",
+        "_mamba_state_index_groups",
+        "_reset_read_offsets_for_new_requests",
+        "_update_mamba_slot_read_offsets",
+    ):
+        setattr(
+            runner, method, getattr(tpu_runner.TPUModelRunner, method).__get__(runner)
+        )
+
+    def execute_model():
+        runner._reset_read_offsets_for_new_requests(0, 2)
+
+    def sample_tokens():
+        runner._update_mamba_slot_read_offsets(groups, None, 2)
+        for rows in (8, width):
+            for dtype in (torch.int32, torch.int64):
+                next_tokens = torch.zeros((rows, k + 1), dtype=dtype)
+                runner._update_mamba_slot_read_offsets(groups, next_tokens, 2)
+        tpu_runner._stack_or_single_mamba_groups(groups)
+
+    torch._dynamo.reset()
+    try:
+        with torch._dynamo.config.patch(
+            cache_size_limit=1024, accumulated_recompile_limit=1024
+        ):
+            tpu_runner.TPUModelRunner._precompile_mamba_rollback_helpers(runner)  # type: ignore[arg-type]
+            assert set(compiles) == set(bases), compiles
+            warmed = len(compiles)
+            _inside("execute_model", execute_model)
+            _inside("sample_tokens", sample_tokens)
+        assert compiles[warmed:] == []
+    finally:
+        torch._dynamo.reset()
+
+
 @pytest.mark.parametrize(
     ("async_scheduling", "async_drafter", "sampled", "discarded", "deferred"),
     [
