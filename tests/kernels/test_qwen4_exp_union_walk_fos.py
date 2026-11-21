@@ -56,7 +56,14 @@ def test_variant_names_bound_and_engaged(kernels, name):
     kw, suffix = VARIANTS[name]
     step = _packed_step(31, SPARE[0], SPARE[1])
     names = [n for n in _walk_names(step, GL, **kw) if "_gathered" in n]
-    assert names and all(n.endswith(suffix) for n in names), names
+    served_names = set(n for n in _walk_names(step, GL) if "_gathered" in n)
+    if kw.get("fos") == 2:
+        # fos=2 runs the variant with the lse output (the guard's input) and traces the served walk as the guard's re-walk
+        # branch (CEN4 j-a0ae9ccf: the names were ..._rb_fos2_lse plus the served ..._glean).
+        assert any(n.endswith(suffix + "_lse") for n in names), names
+        assert all(n.endswith(suffix + "_lse") or n in served_names for n in names), names
+    else:
+        assert names and all(n.endswith(suffix) for n in names), names
     assert not any("_rb" in n for n in _walk_names(step, GL)), "flags off must keep the served kernel"
     base = _walk(step, GL)
     out = _walk(step, GL, **kw)
