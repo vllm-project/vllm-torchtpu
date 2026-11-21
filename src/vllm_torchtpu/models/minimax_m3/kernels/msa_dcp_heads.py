@@ -98,6 +98,8 @@ def merge_partials(
     lse: jax.Array,
     axis: str,
     *,
+    rank: jax.Array,
+    dcp: int,
     rs_out_precision: bool,
     interpret: bool = False,
 ) -> jax.Array:
@@ -113,8 +115,40 @@ def merge_partials(
         out.dtype if rs_out_precision else jnp.float32,
         interpret=interpret,
     )
-    merged = jax.lax.psum_scatter(weighted, axis, scatter_dimension=0, tiled=True)
+    if dcp == 4:
+        merged = _pair_first_reduce_scatter(weighted, axis, rank)
+    else:
+        merged = jax.lax.psum_scatter(
+            weighted, axis, scatter_dimension=0, tiled=True
+        )
     return msa_fp4.unrotate_output(merged.astype(out.dtype)).transpose(1, 0, 2)
+
+
+def _pair_first_reduce_scatter(x: jax.Array, axis: str, rank: jax.Array):
+    """``psum_scatter`` of ``x [4 Hl, T, D]`` over a DCP group of 4 (rank
+    ``r`` keeps head block ``r``), in two exchanges: ranks ``r`` and ``r ^ 1``
+    (one chip's cores) swap the blocks of the other parity and sum, then
+    ranks ``r`` and ``r ^ 2`` swap the block the other keeps and sum. Only
+    one block per rank crosses between the chips, where the reduce-scatter
+    sent three (c64 decode twin: 30 us per layer for 3.1 MB, j-09d6a5c6).
+    Sums in f32."""
+    heads = x.shape[0] // 4
+    blocks = x.reshape(4, heads, *x.shape[1:])
+    even, odd = blocks[0::2], blocks[1::2]  # blocks {0, 2}, {1, 3}
+    parity, half = rank % 2 == 0, rank // 2 == 0
+    pair = jax.lax.ppermute(
+        jnp.where(parity, odd, even), axis, [(r, r ^ 1) for r in range(4)]
+    )
+    summed = jnp.where(parity, even, odd).astype(jnp.float32) + pair.astype(
+        jnp.float32
+    )  # this parity's blocks {p, p + 2}
+    keep = jnp.where(half, summed[0], summed[1])
+    other = jax.lax.ppermute(
+        jnp.where(half, summed[1], summed[0]).astype(x.dtype),
+        axis,
+        [(r, r ^ 2) for r in range(4)],
+    )
+    return keep + other.astype(jnp.float32)
 
 
 def merge_partials_all_to_all(
@@ -246,7 +280,13 @@ def _dcp_attend(
     if all_to_all:
         return merge_partials_all_to_all(out, lse, axis, dcp=dcp, interpret=interpret)
     return merge_partials(
-        out, lse, axis, rs_out_precision=rs_out_precision, interpret=interpret
+        out,
+        lse,
+        axis,
+        rank=rank,
+        dcp=dcp,
+        rs_out_precision=rs_out_precision,
+        interpret=interpret,
     )
 
 

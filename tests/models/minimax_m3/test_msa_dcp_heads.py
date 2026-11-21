@@ -296,3 +296,26 @@ def test_unrotate_to_rows_matches_unrotate_output(num_tokens):
     np.testing.assert_array_equal(
         np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
     )
+
+
+def test_pair_first_reduce_scatter_matches_psum_scatter():
+    """The two-exchange reduce-scatter of a DCP group of 4 keeps block r on
+    rank r, summed over the group as `psum_scatter` sums it (f32 sums)."""
+    if len(jax.devices()) < 4:
+        pytest.skip("needs 4 devices")
+    mesh = Mesh(np.asarray(jax.devices()[:4]), ("dcp",))
+    rng = np.random.default_rng(7)
+    x = jnp.asarray(rng.standard_normal((4 * 16, 24, 128)), jnp.float32)
+    ranks = jnp.arange(4, dtype=jnp.int32)
+
+    def body(fn):
+        return jax.shard_map(
+            fn, mesh=mesh, in_specs=(P("dcp"), P("dcp")), out_specs=P("dcp"),
+            check_vma=False,
+        )(x, ranks)
+
+    got = body(lambda a, r: msa_dcp_heads._pair_first_reduce_scatter(a, "dcp", r[0]))
+    want = body(
+        lambda a, r: jax.lax.psum_scatter(a, "dcp", scatter_dimension=0, tiled=True)
+    )
+    np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-5, atol=1e-5)
