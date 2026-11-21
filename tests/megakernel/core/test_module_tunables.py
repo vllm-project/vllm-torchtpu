@@ -113,6 +113,8 @@ def test_exact_flip_list_covers_registry():
         assert isinstance(spec.config, SynthHybrid)
     full_spec = synth_full_scale_spec(moe_tp=False, R=8)
     assert full_spec.config.L == 60 and full_spec.config.E == 512
+    ov_spec = synth_hybrid_spec(SynthHybrid(), R=2, L=2, att_every=2)
+    assert ov_spec.config.L == 2 and ov_spec.config.att_every == 2
 
 
 def test_tiles_field_defaults_turn_perf_flags_off():

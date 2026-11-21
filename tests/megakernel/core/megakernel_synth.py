@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from tests.megakernel.core.megakernel_fakes import (
@@ -52,6 +53,8 @@ def synth_hybrid_spec(
             | overrides
         )
         g = FakeGeometry(**base)
+    elif overrides:
+        g = replace(g, **overrides)
     gqa, gdn, moe = GQAModule(), GDNModule(), MoEModule()
     decls = [
         gqa.cache_decl(g) if (i + 1) % g.att_every == 0 else gdn.cache_decl(g)
