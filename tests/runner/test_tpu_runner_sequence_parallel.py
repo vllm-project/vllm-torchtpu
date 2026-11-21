@@ -24,8 +24,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.config import ParallelConfig
 
-from vllm_torchtpu.layers.adapter import sequence_parallel
+from vllm_torchtpu import _patch_sequence_parallel_moe_admission, envs
+from vllm_torchtpu.layers.adapter import sequence_parallel, token_padding
 from vllm_torchtpu.layers.adapter.token_padding import TokenPaddingState
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -39,6 +41,21 @@ THRESHOLD = 512
 def sp_on(monkeypatch):
     monkeypatch.setattr(sequence_parallel, "enabled", lambda: True)
     monkeypatch.setattr(sequence_parallel, "min_rows", lambda *a: THRESHOLD)
+
+
+@pytest.fixture
+def admission(monkeypatch):
+    """vLLM's ParallelConfig under the TPU's sequence-parallel MoE admission
+    with TPU_MOE_SEQUENCE_PARALLEL=1: admitted with expert parallelism and
+    TP > 1 only."""
+    monkeypatch.setattr(
+        ParallelConfig,
+        "use_sequence_parallel_moe",
+        ParallelConfig.use_sequence_parallel_moe,
+    )
+    monkeypatch.setattr(ParallelConfig, "_tpu_no_sp_moe_patch", False, raising=False)
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    _patch_sequence_parallel_moe_admission()
 
 
 @pytest.mark.parametrize("rows,sliced", [(8, False), (511, False), (512, True)])
@@ -68,11 +85,12 @@ def test_forward_model_leaves_sequence_parallel_off_when_disabled(monkeypatch):
     assert sequence_parallel.is_active() is False
 
 
-def _padding_runner(tp, max_tokens=1024):
+def _padding_runner(tp, max_tokens=1024, parallel_config=None):
     return SimpleNamespace(
         _token_padding_state=TokenPaddingState.create(max_tokens, device="cpu"),
         _last_sequence_layout_plan=None,
-        parallel_config=SimpleNamespace(tensor_parallel_size=tp),
+        parallel_config=parallel_config
+        or SimpleNamespace(tensor_parallel_size=tp, use_sequence_parallel_moe=True),
     )
 
 
@@ -105,19 +123,36 @@ def test_the_full_mask_is_written_unless_the_rows_are_sliced(
     assert runner._token_padding_state.get_local_valid_tokens().item() == valid
 
 
-@pytest.mark.parametrize("tp_rank,rank_valid", [(0, 128), (2, 44), (3, 0)])
-def test_a_model_that_follows_the_form_gets_the_slice_by_default(
-    sp_on, monkeypatch, tp_rank, rank_valid
+@pytest.mark.parametrize("tp_rank", range(4))
+@pytest.mark.parametrize("enable_expert_parallel", [False, True])
+def test_the_moe_drops_exactly_the_padding_rows(
+    sp_on, admission, monkeypatch, enable_expert_parallel, tp_rank
 ):
-    """Once the model follows each step's form (the Qwen3.5 model patch), the
-    default decision is the target forward's: a 512-row sequence-parallel step
-    is sliced, so each rank's mask is its own slice."""
+    """512 rows over TP4, the first 300 real, once the model follows each
+    step's form (the Qwen3.5 model patch). The default decision is the target
+    forward's, and vLLM's decoder layers slice the rows only where
+    sequence-parallel MoE is admitted: with expert parallelism each rank's MoE
+    reads its own 128 rows, without it every rank's MoE reads all 512. Either
+    way the MoE keeps the routing weights of exactly the real rows."""
     monkeypatch.setattr(sequence_parallel, "_FOLLOWS_STEP_FORM", True)
     monkeypatch.setattr(tpu_runner, "get_tensor_model_parallel_rank", lambda: tp_rank)
-    runner = _padding_runner(tp=4)
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=4,
+        enable_expert_parallel=enable_expert_parallel,
+        distributed_executor_backend="mp",
+    )
+    runner = _padding_runner(tp=4, parallel_config=parallel_config)
     TPUModelRunner._token_padding_update(runner, 512, num_valid_tokens=300)
-    assert _mask(runner, 128) == [i >= rank_valid for i in range(128)]
-    assert runner._token_padding_state.get_local_valid_tokens().item() == rank_valid
+    first, rows = (128 * tp_rank, 128) if enable_expert_parallel else (0, 512)
+    with token_padding.use_padding_state(runner._token_padding_state):
+        _, weights = token_padding.zero_routing_weights_for_padding(
+            torch.zeros(rows, 2, dtype=torch.int32),
+            torch.ones(rows, 2),
+            is_local_tensor=True,
+        )
+    kept = [first + i for i in range(rows) if bool(weights[i].all())]
+    assert kept == [row for row in range(first, first + rows) if row < 300]
+    assert runner._token_padding_state.get_local_valid_tokens().item() == len(kept)
 
 
 def test_an_explicit_replicated_decision_overrides_the_slice(sp_on, monkeypatch):
