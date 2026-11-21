@@ -18,6 +18,38 @@ releases the `wait` once the retry passes and runs the uploader step. The
 `oncall-fix` label raises job and Kueue workload priority without changing the
 suite.
 
+By default, the `tests` lane's TPU steps run only on TPU v7x. To also run them
+on TPU v6e, start a build with the environment variable
+`CI_TPU_GENERATIONS=all` (set it in the Buildkite UI or API). The build then
+runs each of those steps twice, once on each chip, and shows the two sets side
+by side. Any other value is rejected, and so is a build that sets
+`KUBE_SHAPE_SINGLE` or `KUBE_SHAPE_MULTI`: the generation brings its shapes.
+
+The v6e steps do not pass yet, and they are not `soft_fail`, so a build with
+`CI_TPU_GENERATIONS=all` is expected to fail: for one, the `tests_omni` tests
+are not qualified for v6e's 32 GB of HBM. No build has to set it. Use it on a
+manual build to see where v6e stands, and not on a merge-queue, release or
+integration build.
+
+`CI_TPU_GENERATIONS` chooses the chips for the `tests` lane only. A build with
+`NIGHTLY=1` also runs the nightly model and feature tests for both chips (the
+"TPU v6e nightly Tests" and "TPU v7x nightly Tests" groups) and the nightly
+report, whatever `CI_TPU_GENERATIONS` is set to.
+
+In the Buildkite UI, the name of each of the `tests` lane's TPU steps starts
+with the chip it runs on (`v6e ...` or `v7x ...`).
+
+A TPU step in `pipeline_tests.yml` is written once, with no generation in its
+`label` or `key`. For each generation, `bootstrap.py` reads the file through
+`buildkite-agent pipeline upload --dry-run`, puts the generation's name (`v6e`,
+`v7x`) before every label and group name, and the name and an underscore
+(`v6e_`, `v7x_`) before every key the file defines (and before a `depends_on`
+that names one), then uploads the result. If that fails, the upload fails; a
+file never goes up unstamped. A step outside the file that waits on one of its
+steps names the prefixed key, as the nightly report in `pipeline_verify.yml`
+does. A new generation is an entry in `tpu_generations.py` (`TpuGeneration`)
+and no change to a step.
+
 `pipeline_perf.yml` holds the perf/eval
 steps. Post-merge builds do not run them, and PR builds run them only when the
 PR has the `run-perf-eval` label (or `run-full-ci`, which sets `NIGHTLY=1` and
