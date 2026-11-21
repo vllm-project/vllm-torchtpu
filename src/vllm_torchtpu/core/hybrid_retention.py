@@ -155,8 +155,10 @@ def retention_wanted(vllm_config: Any) -> bool:
     """Whether a scheduler should keep hybrid-state snapshots: on a KV producer
     (a prefill leg). ``HybridStateRetention.enabled`` then also requires
     a Mamba group, a full-attention group and prefix caching."""
-    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
-    return getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
+    kv_transfer_config = vllm_config.kv_transfer_config
+    return (
+        kv_transfer_config is not None and kv_transfer_config.kv_role == "kv_producer"
+    )
 
 
 class HybridStateRetention:

@@ -3022,7 +3022,9 @@ class TestInitializeAttentionKernelsThreshold:
     `reorder_batch_threshold`. Sharded drafts keep their K+1-wide decode tile;
     replicated (`draft_tensor_parallel_size == 1`) drafts relocated to the
     local RPA kernel are pinned to 1, which pulls the shared threshold down
-    to 1."""
+    to 1. A tp=1 draft on a pipeline stage whose target is also tp=1 is not
+    replicated relative to the target: it keeps the target's kernel and its
+    K+1-wide tile."""
 
     def _make_runner(self, widths, draft_names=(), draft_tp=2, target_tp=8, pp=1):
         from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
