@@ -871,8 +871,7 @@ def _accept_uniforms(uniforms: torch.Tensor, num_tokens: int) -> torch.Tensor:
     return uniforms[:, -SYNTHETIC_ACCEPT_LANES:].reshape(-1)[:num_tokens]
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def synthetic_verify_rows_from_uniforms(
+def synthetic_verify_rows_from_uniforms_body(
     draft_token_ids: torch.Tensor,
     num_draft_tokens: torch.Tensor,
     segment_ids: torch.Tensor,
@@ -886,7 +885,6 @@ def synthetic_verify_rows_from_uniforms(
     """`synthetic_verify_rows` with its accept uniforms taken from the last
     `SYNTHETIC_ACCEPT_LANES` lanes of ``uniforms`` (row-major,
     `synthetic_uniforms_shape`)."""
-    accept_u = _accept_uniforms(uniforms, draft_token_ids.shape[0])
     return _synthetic_verify_rows(
         draft_token_ids,
         num_draft_tokens,
@@ -895,7 +893,7 @@ def synthetic_verify_rows_from_uniforms(
         target_logits_indices,
         bonus_logits_indices,
         final_logits_indices,
-        accept_u,
+        _accept_uniforms(uniforms, draft_token_ids.shape[0]),
         synthetic_conditional_rates,
     )
 
@@ -988,8 +986,7 @@ def _synthetic_verify_rows(
     return accepted_count, rows, recover_draft
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def synthetic_sample_and_assemble(
+def synthetic_sample_and_assemble_body(
     logits: torch.Tensor,
     recover_draft: torch.Tensor,
     accepted_count: torch.Tensor,
@@ -1039,8 +1036,7 @@ def synthetic_sample_and_assemble(
     )
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def synthetic_sample_rows_and_assemble(
+def synthetic_sample_rows_and_assemble_body(
     logit_rows: torch.Tensor,
     rank: torch.Tensor,
     recover_draft: torch.Tensor,
@@ -1123,6 +1119,25 @@ def synthetic_sample_rows_and_assemble(
         group_indices,
         max_draft_tokens,
     )
+
+
+# Compiled, each its own program; `TPUModelRunner.synthetic_verify_and_sample`
+# traces the plain bodies into one with the plan and the LM head.
+synthetic_verify_rows_from_uniforms = torch.compile(
+    synthetic_verify_rows_from_uniforms_body,
+    backend="tpu",
+    fullgraph=True,
+    dynamic=False,
+)
+synthetic_sample_and_assemble = torch.compile(
+    synthetic_sample_and_assemble_body, backend="tpu", fullgraph=True, dynamic=False
+)
+synthetic_sample_rows_and_assemble = torch.compile(
+    synthetic_sample_rows_and_assemble_body,
+    backend="tpu",
+    fullgraph=True,
+    dynamic=False,
+)
 
 
 def _gather_and_assemble(

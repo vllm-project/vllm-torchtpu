@@ -158,6 +158,7 @@ if TYPE_CHECKING:
     TPU_SPEC_SYNTHETIC_ROW_SPLIT_MIN_ROWS: int = 1
     TPU_DFLASH_FUSED_KV_INPUTS: bool = False
     TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS: bool = False
+    TPU_SPEC_SYNTHETIC_FUSED_VERIFY: bool = False
     TPU_DSPARK_MARKOV_KERNEL: bool = True
     TPU_DSPARK_FUSED_MLP: str = "0"
     TPU_SAMPLER_TOP_P_KERNEL: bool = True
@@ -1182,6 +1183,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # warmup compiled it at. Same input ids and drafts.
     "TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS": env_bool(
         "TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS", default=False
+    ),
+    # Under the synthetic one-row verify, run the accept plan, the LM head and
+    # the sampler as one compiled program (`synthetic_verify_and_sample`)
+    # instead of three, at the shapes the warmup compiled it for. Same
+    # uniforms and tokens.
+    "TPU_SPEC_SYNTHETIC_FUSED_VERIFY": env_bool(
+        "TPU_SPEC_SYNTHETIC_FUSED_VERIFY", default=False
     ),
     # The DSpark greedy Markov chain over a vocab-parallel LM head runs its K
     # steps as one kernel with remote-DMA exchanges

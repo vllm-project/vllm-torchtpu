@@ -132,12 +132,15 @@ from vllm_torchtpu.layers.adapter.sample import top_p_sample
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     RejectionSampler,
     synthetic_sample_and_assemble,
+    synthetic_sample_and_assemble_body,
     synthetic_sample_rows_and_assemble,
+    synthetic_sample_rows_and_assemble_body,
     synthetic_shard_width,
     synthetic_uniforms_fit,
     synthetic_uniforms_shape,
     synthetic_verify_rows,
     synthetic_verify_rows_from_uniforms,
+    synthetic_verify_rows_from_uniforms_body,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
@@ -1236,6 +1239,9 @@ class TPUModelRunner(GPUModelRunner):
         # `program_key`s of the arguments the warmup compiled
         # `_substitute_and_extract_drafts` at.
         self._substitute_drafts_warm: set[tuple] = set()
+        # `_synthetic_fused_key`s the warmup compiled `synthetic_verify_and_sample`
+        # for (`TPU_SPEC_SYNTHETIC_FUSED_VERIFY`).
+        self._synthetic_fused_warm: set[tuple] = set()
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank, has_kv_transfer_group)
@@ -4902,34 +4908,44 @@ class TPUModelRunner(GPUModelRunner):
             and not self._min_tokens.any_in(self.input_batch.req_id_to_index)
         )
 
+    def _draw_synthetic_uniforms(self, md: SpecDecodeMetadata) -> bool:
+        """Draw the chunk's one synthetic uniform draw into ``md`` when the
+        accepts fit it (`synthetic_uniforms_fit`); returns whether they did."""
+        assert md.draft_token_ids is not None
+        num_reqs = md.draft_lengths.shape[0]
+        if not synthetic_uniforms_fit(md.draft_token_ids.shape[0], num_reqs):
+            return False
+        # One RNG program for the accepts and the recovery sampler.
+        md.synthetic_uniforms = torch.rand(
+            self._synthetic_uniforms_shape(num_reqs),
+            dtype=torch.float32,
+            device=md.draft_token_ids.device,
+            generator=self._get_sampling_generator(),
+        )
+        return True
+
     def _plan_synthetic_verify(self, md: SpecDecodeMetadata) -> torch.Tensor:
         """Decide the chunk's synthetic accepts and return the hidden-state
         row to compute logits for, one per padded request."""
         assert md.draft_token_ids is not None
+        if self._draw_synthetic_uniforms(md):
+            return self._decide_synthetic_verify(
+                md, synthetic_verify_rows_from_uniforms, md.synthetic_uniforms
+            )
+        accept_u = torch.rand(
+            md.draft_token_ids.shape,
+            dtype=torch.float32,
+            device=md.draft_token_ids.device,
+            generator=self._get_sampling_generator(),
+        )
+        return self._decide_synthetic_verify(md, synthetic_verify_rows, accept_u)
+
+    def _decide_synthetic_verify(
+        self, md: SpecDecodeMetadata, verify: Callable, uniforms: torch.Tensor
+    ) -> torch.Tensor:
+        """`_plan_synthetic_verify` on drawn ``uniforms``."""
         assert self.rejection_sampler is not None
         assert self.rejection_sampler.synthetic_conditional_rates is not None
-        num_reqs = md.draft_lengths.shape[0]
-        device = md.draft_token_ids.device
-        if synthetic_uniforms_fit(md.draft_token_ids.shape[0], num_reqs):
-            # One RNG program for the accepts and the recovery sampler.
-            md.synthetic_uniforms = torch.rand(
-                self._synthetic_uniforms_shape(num_reqs),
-                dtype=torch.float32,
-                device=device,
-                generator=self._get_sampling_generator(),
-            )
-            verify, uniforms = (
-                synthetic_verify_rows_from_uniforms,
-                md.synthetic_uniforms,
-            )
-        else:
-            verify = synthetic_verify_rows
-            uniforms = torch.rand(
-                md.draft_token_ids.shape,
-                dtype=torch.float32,
-                device=device,
-                generator=self._get_sampling_generator(),
-            )
         accepted_count, rows, recover_draft = verify(
             md.draft_token_ids,
             md.draft_lengths,
@@ -4996,12 +5012,27 @@ class TPUModelRunner(GPUModelRunner):
         """Plan the synthetic verify and compute its logits: one row per
         padded request (`compute_selected_logits`), or this rank's block of
         those rows when they split over the TP ranks
-        (`compute_selected_logit_rows`, marked on ``md``)."""
-        rows = self._plan_synthetic_verify(md)
-        if not self._synthetic_rows_split(rows.shape[0]):
-            md.synthetic_row_rank = None
+        (`compute_selected_logit_rows`, marked on ``md``).
+
+        With `TPU_SPEC_SYNTHETIC_FUSED_VERIFY` and the accepts in the one
+        draw, only draw the uniforms (the same draw at the same point of the
+        stream) and return ``hidden_states``: the plan and the LM head run in
+        the sampler's program (`_sample_synthetic_verify_fused`)."""
+        num_reqs = md.draft_lengths.shape[0]
+        split = self._synthetic_rows_split(num_reqs)
+        md.synthetic_row_rank = self._synthetic_row_rank if split else None
+        if envs.TPU_SPEC_SYNTHETIC_FUSED_VERIFY and self._draw_synthetic_uniforms(md):
+            md.synthetic_hidden_states = hidden_states
+            return hidden_states
+        return self._synthetic_logits(
+            hidden_states, self._plan_synthetic_verify(md), md
+        )
+
+    def _synthetic_logits(
+        self, hidden_states: torch.Tensor, rows: torch.Tensor, md: SpecDecodeMetadata
+    ) -> torch.Tensor:
+        if md.synthetic_row_rank is None:
             return self.compute_selected_logits(hidden_states, rows)
-        md.synthetic_row_rank = self._synthetic_row_rank
         return self.compute_selected_logit_rows(hidden_states, rows)
 
     def _synthetic_rows_split(self, padded_num_reqs: int) -> bool:
@@ -5066,11 +5097,146 @@ class TPUModelRunner(GPUModelRunner):
             md.group_indices,
             self.speculative_config.num_speculative_tokens,
             **layout,
-            topk_candidates=self._sampler_topk_candidates(
+            **self._synthetic_sampler_variant(cur_start_idx, cur_end_idx),
+        )
+
+    def _synthetic_sampler_variant(
+        self, cur_start_idx: int, cur_end_idx: int
+    ) -> dict[str, Any]:
+        """The synthetic sampler's static arguments for this chunk."""
+        return {
+            "topk_candidates": self._sampler_topk_candidates(
                 cur_start_idx, cur_end_idx, None
             ),
-            apply_topk_topp=self._sampler_applies_topk_topp(),
-            apply_top_k=self._sampler_applies_top_k(),
+            "apply_topk_topp": self._sampler_applies_topk_topp(),
+            "apply_top_k": self._sampler_applies_top_k(),
+        }
+
+    def _synthetic_fused_key(
+        self, hidden_rows: int, num_tokens: int, num_reqs: int, variant: dict
+    ) -> tuple:
+        """What `synthetic_verify_and_sample` compiles per: the hidden-state
+        rows, the verify length, the padded requests and the variant (the row
+        split and the draw's layout follow from the requests)."""
+        return (hidden_rows, num_tokens, num_reqs, *sorted(variant.items()))
+
+    def _sample_synthetic_verify_fused(
+        self, md: SpecDecodeMetadata, cur_start_idx: int, cur_end_idx: int
+    ) -> torch.Tensor:
+        """`_sample_synthetic_verify` of a chunk whose plan and LM head were
+        left to it (`_synthetic_verify_logits`): one compiled program when the
+        warmup compiled this shape, else the three warmed programs. Same
+        tokens either way."""
+        hidden_states, md.synthetic_hidden_states = md.synthetic_hidden_states, None
+        assert hidden_states is not None and md.draft_token_ids is not None
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        num_reqs = md.draft_lengths.shape[0]
+        variant = self._synthetic_sampler_variant(cur_start_idx, cur_end_idx)
+        key = self._synthetic_fused_key(
+            hidden_states.shape[0], md.draft_token_ids.shape[0], num_reqs, variant
+        )
+        if key not in self._synthetic_fused_warm:
+            logger.warning_once(
+                "Synthetic fused verify not precompiled for %s; "
+                "running its three programs.",
+                key,
+            )
+            rows = self._decide_synthetic_verify(
+                md, synthetic_verify_rows_from_uniforms, md.synthetic_uniforms
+            )
+            logits = self._synthetic_logits(hidden_states, rows, md)
+            return self._sample_synthetic_verify(
+                logits, md, cur_start_idx, cur_end_idx, None
+            )
+        # float32: the program casts them to the logits' dtype, the rounding
+        # the upload at that dtype does.
+        temperatures, top_k, top_p = self._padded_sampling_params(
+            cur_start_idx, cur_end_idx, num_reqs, torch.float32, hidden_states.device
+        )
+        return self.synthetic_verify_and_sample(
+            hidden_states,
+            md.draft_token_ids,
+            md.draft_lengths,
+            md.segment_ids,
+            md.group_indices,
+            md.target_logits_indices,
+            md.bonus_logits_indices,
+            md.final_logits_indices,
+            md.synthetic_uniforms,
+            self.rejection_sampler.synthetic_conditional_rates,
+            temperatures,
+            top_k,
+            top_p,
+            md.synthetic_row_rank,
+            self.speculative_config.num_speculative_tokens,
+            **variant,
+        )
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def synthetic_verify_and_sample(
+        self,
+        hidden_states: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        final_logits_indices: torch.Tensor,
+        uniforms: torch.Tensor,
+        synthetic_conditional_rates: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        rank: torch.Tensor | None,
+        max_draft_tokens: int,
+        topk_candidates: int = 0,
+        apply_topk_topp: bool = True,
+        apply_top_k: bool = True,
+    ) -> torch.Tensor:
+        """`synthetic_verify_rows_from_uniforms`, the LM head on the rows it
+        picks (`compute_selected_logits`, or `compute_selected_logit_rows`
+        with ``rank``) and `synthetic_sample_and_assemble` (or its row split)
+        as one program."""
+        accepted_count, rows, recover_draft = synthetic_verify_rows_from_uniforms_body(
+            draft_token_ids,
+            num_draft_tokens,
+            segment_ids,
+            group_indices,
+            target_logits_indices,
+            bonus_logits_indices,
+            final_logits_indices,
+            uniforms,
+            synthetic_conditional_rates,
+        )
+        layout: dict[str, int] = {}
+        if rank is None:
+            logits = self._selected_logits(hidden_states, rows)
+            sample, rows_args = synthetic_sample_and_assemble_body, ()
+        else:
+            logits = self._selected_logit_rows(hidden_states, rows)
+            sample, rows_args = synthetic_sample_rows_and_assemble_body, (rank,)
+            assert self._synthetic_shard is not None
+            layout = dict(zip(("row_width", "vocab"), self._synthetic_shard))
+        return sample(
+            logits,
+            *rows_args,
+            recover_draft,
+            accepted_count,
+            temperatures.to(logits.dtype),
+            top_k,
+            top_p,
+            uniforms,
+            draft_token_ids,
+            num_draft_tokens,
+            segment_ids,
+            group_indices,
+            max_draft_tokens,
+            **layout,
+            topk_candidates=topk_candidates,
+            apply_topk_topp=apply_topk_topp,
+            apply_top_k=apply_top_k,
         )
 
     def _sample_spec_verify_chunk(
@@ -5093,6 +5259,8 @@ class TPUModelRunner(GPUModelRunner):
         each row's greedy token instead (no request is below min_tokens then).
         """
         assert md.draft_token_ids is not None, "deferred draft_token_ids never filled"
+        if md.synthetic_hidden_states is not None:
+            return self._sample_synthetic_verify_fused(md, cur_start_idx, cur_end_idx)
         if md.synthetic_verify is not None:
             return self._sample_synthetic_verify(
                 logits, md, cur_start_idx, cur_end_idx, sampling_generator
@@ -7393,6 +7561,79 @@ class TPUModelRunner(GPUModelRunner):
                 **variant,
             )
             synchronize_tensors(out)
+        if envs.TPU_SPEC_SYNTHETIC_FUSED_VERIFY and one_draw:
+            self._precompile_synthetic_fused_verify(
+                draft_token_ids,
+                target_logits_indices,
+                segment_ids,
+                group_indices,
+                draft_lengths,
+                bonus_logits_indices,
+                recover_u,
+                variants,
+            )
+
+    def _precompile_synthetic_fused_verify(
+        self,
+        draft_token_ids: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        uniforms: torch.Tensor,
+        variants: list[dict],
+    ) -> None:
+        """`synthetic_verify_and_sample` at one (padded_logits_length,
+        padded_num_reqs) pair, on hidden states of a decode-only step (one
+        row per verified position) and in every sampler variant; other
+        shapes take its three programs (`_sample_synthetic_verify_fused`)."""
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        num_tokens = draft_token_ids.shape[0]
+        num_reqs = draft_lengths.shape[0]
+        hidden = torch.zeros(
+            (num_tokens, self.model_config.get_hidden_size()),
+            dtype=self._hidden_states_dtype,
+        ).to(self.device)
+        # As `_padded_sampling_params` uploads them for the fused program.
+        temps = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
+        top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(self.device)
+        top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
+        rank = (
+            self._synthetic_row_rank if self._synthetic_rows_split(num_reqs) else None
+        )
+        for variant in variants:
+            full = {
+                "topk_candidates": 0,
+                "apply_topk_topp": True,
+                "apply_top_k": True,
+                **variant,
+            }
+            with torch.no_grad():
+                out = self.synthetic_verify_and_sample(
+                    hidden,
+                    draft_token_ids,
+                    draft_lengths,
+                    segment_ids,
+                    group_indices,
+                    target_logits_indices,
+                    bonus_logits_indices,
+                    # Its own tensor, as in serving: dynamo guards on aliasing.
+                    torch.zeros_like(target_logits_indices),
+                    uniforms,
+                    self.rejection_sampler.synthetic_conditional_rates,
+                    temps,
+                    top_k,
+                    top_p,
+                    rank,
+                    self.speculative_config.num_speculative_tokens,
+                    **full,
+                )
+            synchronize_tensors(out)
+            self._synthetic_fused_warm.add(
+                self._synthetic_fused_key(num_tokens, num_tokens, num_reqs, full)
+            )
 
     def _precompile_top_token_verify(
         self,
@@ -9052,11 +9293,22 @@ class TPUModelRunner(GPUModelRunner):
     ) -> torch.Tensor:
         if self.is_pooling_model:
             return torch.empty((0,), device=hidden_states.device)
+        return self._selected_logits(hidden_states, indices_do_sample)
+
+    def _selected_logits(
+        self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
+    ) -> torch.Tensor:
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logit_rows(
+        self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
+    ) -> torch.Tensor:
+        """Compiled `_selected_logit_rows`."""
+        return self._selected_logit_rows(hidden_states, indices_do_sample)
+
+    def _selected_logit_rows(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
     ) -> torch.Tensor:
         """``compute_selected_logits`` split by rows over the TP ranks: this

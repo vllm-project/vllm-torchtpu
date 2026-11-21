@@ -70,6 +70,10 @@ class SpecDecodeMetadata:
     # (`rejection_sampler.synthetic_uniforms_shape`): per request the
     # recovery uniforms, then the accept uniforms.
     synthetic_uniforms: torch.Tensor | None = None
+    # The target's hidden states when the synthetic verify's plan and LM head
+    # wait for the sampler's program (`TPU_SPEC_SYNTHETIC_FUSED_VERIFY`); the
+    # step's logits entry then holds these too.
+    synthetic_hidden_states: torch.Tensor | None = None
 
     def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
         assert self.deferred_draft_token_ids_cpu is not None
