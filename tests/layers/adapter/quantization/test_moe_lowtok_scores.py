@@ -171,6 +171,33 @@ def test_layer_a_fused_path_owns_is_declined_not_refused(
 
 
 @pytest.mark.parametrize(
+    "use_ep, line",
+    [
+        (True, "moe_lowtok: 1/1 MoE layers armed (scores 1, ids 0)"),
+        (False, "moe_lowtok: 0/1 MoE layers armed (scores 0, ids 0); 1 x the "),
+    ],
+    ids=["entry-armed", "no-entry"],
+)
+def test_fused_ep_v3_owns_only_a_layer_without_an_entry(
+    enabled, monkeypatch, use_ep, line
+):
+    """Fused EP v3 takes the steps at or above its row gate and the armed
+    entry serves the steps below it, so the summary counts such a layer as
+    armed; a v3 layer without an entry is the fused kernel's."""
+    from vllm_torchtpu.layers.adapter import fused_moe_ep_v3
+
+    monkeypatch.setattr(
+        fused_moe_ep_v3, "fused_moe_ep_supported", lambda m: m.owner == "v3"
+    )
+    logs = _logs(monkeypatch)
+    scores.prebuild(method("v3"), make_layer(use_ep=use_ep), "silu")
+    scores.log_summary()
+    logs.warning.assert_not_called()
+    (message, *args), _ = logs.info.call_args
+    assert (message % tuple(args)).startswith(line)
+
+
+@pytest.mark.parametrize(
     "option, value",
     [
         ("custom_routing_function", lambda **kw: None),
