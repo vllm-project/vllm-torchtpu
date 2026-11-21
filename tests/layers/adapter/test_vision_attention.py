@@ -12,18 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_torchtpu.layers.adapter.vision_attention import TpuMMEncoderAttention
+from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 
-def make_attention(num_heads=2, head_size=4, scale=1.0, num_kv_heads=None):
+def make_attention(
+    num_heads: int = 2,
+    head_size: int = 4,
+    scale: float = 1.0,
+    num_kv_heads: int | None = None,
+    attn_backend: AttentionBackendEnum = AttentionBackendEnum.FLASH_ATTN,
+) -> TpuMMEncoderAttention:
     attn = TpuMMEncoderAttention.__new__(TpuMMEncoderAttention)
     torch.nn.Module.__init__(attn)
     attn.num_heads = num_heads
     attn.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
     attn.head_size = head_size
     attn.scale = scale
+    attn.attn_backend = attn_backend
+    attn._forward_method = attn.forward_oot
     return attn
 
 
@@ -84,3 +95,46 @@ def test_vision_attention_falls_back_for_cross_attention(monkeypatch):
     assert called["args"][0] is query
     assert called["args"][1] is key
     assert called["args"][2] is value
+
+
+def test_platform_vit_attn_backend_defaults_and_overrides():
+    supported = TpuPlatform.get_supported_vit_attn_backends()
+    assert supported == [
+        AttentionBackendEnum.FLASH_ATTN,
+        AttentionBackendEnum.TORCH_SDPA,
+    ]
+    assert (
+        TpuPlatform.get_vit_attn_backend(head_size=64, dtype=torch.bfloat16)
+        == AttentionBackendEnum.FLASH_ATTN
+    )
+    assert (
+        TpuPlatform.get_vit_attn_backend(
+            head_size=64,
+            dtype=torch.bfloat16,
+            backend=AttentionBackendEnum.TORCH_SDPA,
+        )
+        == AttentionBackendEnum.TORCH_SDPA
+    )
+    with pytest.raises(ValueError, match="not supported on TPU"):
+        TpuPlatform.get_vit_attn_backend(
+            head_size=64,
+            dtype=torch.bfloat16,
+            backend=AttentionBackendEnum.TRITON_ATTN,
+        )
+
+
+def test_vision_attention_routes_torch_sdpa_to_forward_native(monkeypatch):
+    def fail_op(*args, **kwargs):
+        raise AssertionError("Pallas kernel should not run for TORCH_SDPA")
+
+    monkeypatch.setattr(TpuMMEncoderAttention, "_vision_op", fail_op)
+
+    attn = make_attention(attn_backend=AttentionBackendEnum.TORCH_SDPA)
+    query = torch.ones(1, 4, 2, 4)
+    monkeypatch.setattr(
+        attn,
+        "forward_native",
+        lambda q, k, v, cu, ms, sl: torch.full_like(q, 3.0),
+    )
+    out = attn.forward_oot(query, query, query)
+    assert torch.equal(out, torch.full_like(query, 3.0))
