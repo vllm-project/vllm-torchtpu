@@ -1,0 +1,216 @@
+{
+  "schema": "advisor.presets.deployments.v1",
+  "deployments": {
+    "glm-5.2": {
+      "source": "GLM-5.2 colocated serving layout: TP16 x DCP8 decode with 3 draft tokens, TP16 x EP16 x DCP16 decode at high concurrency, and TP16 prefill on the same server",
+      "decode": {
+        "tp": 16,
+        "dcp": 8,
+        "spec_tokens": 3
+      },
+      "prefill": {
+        "tp": 16
+      },
+      "saturation": {
+        "tp": 16,
+        "ep": 16,
+        "dcp": 16
+      }
+    },
+    "kimi-k3": {
+      "source": "Kimi-K3 serving layout: TP32 x EP32 x DCP32 decode with a speculative drafter and 8-row verify, TP16 x DP2 x EP32 x DCP16 decode at high concurrency, and TP32 x EP32 x PCP32 prefill in 13 compiled calls per window",
+      "unmodeled_notes": [
+        "Sequence-parallel split of token-wise operations between layers",
+        "Latent projection tensor-sharded within a chip (TPU_LATENT_PROJ_INTRA_CHIP_TP in the serving recipe)",
+        "Draft model forward step",
+        "Draft count that varies with decode batch size (the preset prices one draft count)",
+        "Host time between device steps"
+      ],
+      "decode": {
+        "tp": 32,
+        "ep": 32,
+        "dcp": 32,
+        "spec_tokens": 7,
+        "megakernel": {
+          "source": "Decode megakernel on TP32 x EP32 x DCP32: one call serves up to 128 rows across 8 expert owner groups (4 TP ranks per group sharing 112 of the 896 experts), runs each expert on its own grouped rows, and executes 94 attention/MLP all-reduces (93 attention layers plus 1 dense-MLP prefix layer while 92 MoE layers use group-8 routed transport), 8-group routed transport, and 32-way DCP gathers",
+          "source_ref": "scripts/vllm/benchmarking/configs/kimi-k3-megakernel/recipe-base.sh",
+          "scopes": [
+            "whole_step"
+          ],
+          "ranks": 32,
+          "max_rows": 128,
+          "phases": [
+            "decode",
+            "verify"
+          ],
+          "moe_layout": "grouped",
+          "expert_owner_groups": 8,
+          "collectives": {
+            "all_reduces": 94,
+            "steps": [
+              {
+                "kind": "routed_transport",
+                "group_size": 8,
+                "calls_per_layer": 2
+              },
+              {
+                "kind": "dcp_gather",
+                "group_size": 32,
+                "calls_per_layer": 2
+              }
+            ]
+          }
+        }
+      },
+      "prefill": {
+        "tp": 32,
+        "ep": 32,
+        "pcp": 32,
+        "layer_groups": [
+          4,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          1
+        ]
+      },
+      "prefill_windows": [
+        512,
+        1024,
+        2048,
+        4096,
+        8192
+      ],
+      "saturation": {
+        "tp": 16,
+        "ep": 32,
+        "dp": 2,
+        "dcp": 16,
+        "megakernel": {
+          "source": "Decode megakernel on TP16 x DP2 x EP32 x DCP16: one call covers both attention replicas, serves up to 128 rows across 8 expert owner groups (4 ranks per group sharing 112 of the 896 experts), runs each expert on its own grouped rows, and executes 94 attention/MLP all-reduces (93 attention layers plus 1 dense-MLP prefix layer while 92 MoE layers use group-8 routed transport), 8-group routed transport, and 16-way DCP gathers",
+          "source_ref": "scripts/vllm/benchmarking/configs/kimi-k3-megakernel/recipe-base.sh",
+          "scopes": [
+            "whole_step"
+          ],
+          "ranks": 16,
+          "max_rows": 128,
+          "phases": [
+            "decode",
+            "verify"
+          ],
+          "attention_dp_in_call": true,
+          "moe_layout": "grouped",
+          "expert_owner_groups": 8,
+          "collectives": {
+            "all_reduces": 94,
+            "steps": [
+              {
+                "kind": "routed_transport",
+                "group_size": 8,
+                "calls_per_layer": 2
+              },
+              {
+                "kind": "dcp_gather",
+                "group_size": 16,
+                "calls_per_layer": 2
+              }
+            ]
+          }
+        }
+      }
+    },
+    "qwen3.5-397b": {
+      "source": "Qwen3.5-397B disaggregated serving layout: TP8 x EP8 x DCP4 decode with 3 draft tokens, PP8 prefill, and TP2 x DP4 x EP8 decode at high concurrency",
+      "decode": {
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "spec_tokens": 3,
+        "megakernel": {
+          "source": "Decode megakernel on TP8 x EP8 x DCP4: one call serves up to 112 rows, split calls serve up to 800 rows per step, rows up to 12 reshard experts to TP inside the call before switching to EP above 12 rows, split_kv exchanges partial attention across 4 DCP peers, and each expert runs on a masked batch",
+          "source_ref": "unpublished",
+          "scopes": [
+            "whole_step"
+          ],
+          "ranks": 8,
+          "max_rows": 112,
+          "max_total_rows": 800,
+          "phases": [
+            "decode",
+            "verify"
+          ],
+          "moe_layout": "masked",
+          "expert_mode_by_rows": [
+            {
+              "max_rows": 12,
+              "mode": "tp"
+            },
+            {
+              "max_rows": 800,
+              "mode": "ep"
+            }
+          ],
+          "collectives": {
+            "steps": [
+              {
+                "kind": "split_kv",
+                "group_size": 4,
+                "calls_per_layer": 2
+              }
+            ]
+          }
+        }
+      },
+      "prefill": {
+        "tp": 1,
+        "ep": 1,
+        "pp": 8
+      },
+      "saturation": {
+        "tp": 2,
+        "ep": 8,
+        "dp": 4
+      },
+      "prefill_windows": [
+        2176
+      ],
+      "megakernel_layouts": [
+        {
+          "tp": 8,
+          "ep": 8,
+          "megakernel": {
+            "source": "Colocated decode megakernel on TP8 x EP8: one call serves up to 64 rows without splitting, split_kv exchanges partial attention across 4 KV-split peers per KV head (TP8 / 2 KV heads = 4), and each expert runs on a masked batch",
+            "source_ref": "src/vllm_torchtpu/megakernel/core",
+            "scopes": [
+              "whole_step"
+            ],
+            "ranks": 8,
+            "max_rows": 64,
+            "phases": [
+              "decode",
+              "verify"
+            ],
+            "moe_layout": "masked",
+            "collectives": {
+              "steps": [
+                {
+                  "kind": "split_kv",
+                  "group_size": 4,
+                  "calls_per_layer": 2
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

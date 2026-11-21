@@ -1,0 +1,1393 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Specifications and profile tests for the TPU megakernel advisor."""
+
+from __future__ import annotations
+
+import ast
+import copy
+import dataclasses
+import json
+import re
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+from vllm_torchtpu.megakernel import advisor
+from vllm_torchtpu.megakernel.advisor import (
+    chips,
+    constants,
+    jax_bridge,
+    models,
+    specs,
+)
+from vllm_torchtpu.megakernel.core import errors
+
+SOURCE_PREFIXES = ("FACT:", "DERIVED:", "ASSUMED:", "CHOSEN:")
+
+
+SHIPPED_PRESET_COUNT = 13
+HF_CONFIG_DIR = Path(__file__).resolve().parent / "data" / "advisor" / "hf_configs"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load_config_snapshots() -> dict[str, dict[str, object]]:
+    """Load saved HuggingFace config snapshots keyed by preset slug."""
+    return {
+        snapshot_path.stem: json.loads(snapshot_path.read_text(encoding="utf-8"))
+        for snapshot_path in sorted(HF_CONFIG_DIR.glob("*.json"))
+    }
+
+
+# Shared HF config fixtures for custom architectures removed from models.json
+# (tested strictly via model_profile_from_hf_config / --model <config.json>).
+# 61 layers: 3 uncompressed dense-prefix layers + 58 sparse-CSA layers at ~1/12
+# KV retention gives average retention (3 + 58 * 0.08176) / 61 = 0.126921.
+DEEPSEEK_V4_CFG: dict[str, object] = {
+    "model_type": "deepseek_v4",
+    "num_hidden_layers": 61,
+    "first_k_dense_replace": 3,
+    "hidden_size": 7168,
+    "intermediate_size": 18432,
+    "moe_intermediate_size": 2048,
+    "shared_expert_intermediate_size": 2048,
+    "num_attention_heads": 128,
+    "num_key_value_heads": 1,
+    "head_dim": 512,
+    "v_head_dim": 512,
+    "num_experts": 256,
+    "num_experts_per_tok": 8,
+    "kv_compress_factor": 0.12692110655737704,
+    "mhc_num_streams": 4,
+}
+
+QWEN4_EXP_CFG: dict[str, object] = {
+    "model_type": "qwen4_exp",
+    "num_hidden_layers": 48,
+    "hidden_size": 2048,
+    "intermediate_size": 6144,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 4,
+    "head_dim": 128,
+    "full_attention_interval": 4,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 32,
+    "num_experts": 128,
+    "num_experts_per_tok": 8,
+    "moe_intermediate_size": 768,
+    "shared_expert_intermediate_size": 768,
+    "hc_mult": 4,
+}
+
+HOMOGENEOUS_DSA_CFG: dict[str, object] = {
+    "model_type": "glm_moe_dsa",
+    "num_hidden_layers": 32,
+    "first_k_dense_replace": 0,
+    "hidden_size": 4096,
+    "intermediate_size": 8192,
+    "moe_intermediate_size": 1024,
+    "n_shared_experts": 1,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 32,
+    "q_lora_rank": 1024,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+    "n_routed_experts": 64,
+    "num_experts_per_tok": 8,
+    "index_topk": 2048,
+    "index_head_dim": 128,
+    "index_n_heads": 16,
+}
+
+
+DEEPSEEK_V3_CFG: dict[str, object] = {
+    "model_type": "deepseek_v3",
+    "num_hidden_layers": 61,
+    "first_k_dense_replace": 3,
+    "hidden_size": 7168,
+    "intermediate_size": 18432,
+    "moe_intermediate_size": 2048,
+    "num_attention_heads": 128,
+    "num_key_value_heads": 128,
+    "q_lora_rank": 1536,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+    "n_routed_experts": 256,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 8,
+    "quantization_config": {"quant_method": "fp8"},
+}
+
+QWEN35_397B_CFG: dict[str, object] = {
+    "model_type": "qwen3_5_moe",
+    "num_hidden_layers": 60,
+    "hidden_size": 4096,
+    "intermediate_size": 1024,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "full_attention_interval": 4,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 64,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "num_experts": 512,
+    "num_experts_per_tok": 10,
+    "moe_intermediate_size": 1024,
+    "shared_expert_intermediate_size": 1024,
+    "quantization_config": {"quant_method": "fp8"},
+}
+
+
+def _load_kimi_k3_pro_dsa_and_ignore() -> tuple[object, object]:
+    """Load `dsa_config` and `quantization_config.ignore` from Kimi-K3.1-Pro JSON."""
+    payload = json.loads(
+        (HF_CONFIG_DIR / "kimi-k3.1-pro.json").read_text(encoding="utf-8")
+    )
+    text_cfg = payload["config"]["text_config"]
+    return (
+        copy.deepcopy(text_cfg["dsa_config"]),
+        copy.deepcopy(text_cfg["quantization_config"]["ignore"]),
+    )
+
+
+_KIMI_K3_PRO_DSA_AND_IGNORE = _load_kimi_k3_pro_dsa_and_ignore()
+_KIMI_K3_PRO_DSA_CONFIG = _KIMI_K3_PRO_DSA_AND_IGNORE[0]
+_KIMI_K3_PRO_QUANT_IGNORE = _KIMI_K3_PRO_DSA_AND_IGNORE[1]
+
+KIMI_K3_PRO_CFG: dict[str, object] = {
+    "model_type": "kimi_linear",
+    "num_hidden_layers": 93,
+    "first_k_dense_replace": 1,
+    "hidden_size": 7168,
+    "intermediate_size": 33792,
+    "moe_intermediate_size": 3072,
+    "shared_expert_intermediate_size": 6144,
+    "routed_expert_hidden_size": 3584,
+    "num_attention_heads": 96,
+    "num_key_value_heads": 96,
+    "q_lora_rank": 1536,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+    "num_experts": 896,
+    "num_experts_per_token": 16,
+    "linear_attn_config": {
+        "kda_layers": list(range(69)),
+        "num_heads": 96,
+        "head_k_dim": 128,
+        "head_v_dim": 128,
+        "short_conv_kernel_size": 4,
+    },
+    "dsa_config": _KIMI_K3_PRO_DSA_CONFIG,
+    "quantization_config": {
+        "quant_method": "fp8",
+        "expert_dtype": "mxfp4",
+        "ignore": _KIMI_K3_PRO_QUANT_IGNORE,
+    },
+}
+
+
+def test_tpu7x_dual_core_defaults() -> None:
+    """Verify TPU v7x resolves to dual-core defaults."""
+    chip_spec = chips.resolve_chip_spec("tpu7x")
+    assert chip_spec.name == "tpu7x"
+    expected_devices, expected_cores = 2, 1
+    assert chip_spec.devices_per_chip == expected_devices
+    assert chip_spec.cores_per_device == expected_cores
+    expected_usable_vmem = 62 * (1 << 20)  # 62 MiB usable VMEM
+    expected_capacity_vmem = 64 * (1 << 20)  # 64 MiB total VMEM
+    assert chip_spec.vmem_usable_bytes == expected_usable_vmem
+    assert chip_spec.vmem_capacity_bytes == expected_capacity_vmem
+
+
+def test_single_core_escape_hatch() -> None:
+    """Verify single-core escape hatch preserves 1-core spec on TPU v7x."""
+    chip_spec = chips.resolve_chip_spec("tpu7x", megacore=False)
+    assert chip_spec.name == "tpu7x"
+    assert chip_spec.cores_per_device == 1
+    expected_usable_vmem = 62 * (1 << 20)  # 62 MiB usable VMEM
+    expected_capacity_vmem = 64 * (1 << 20)  # 64 MiB total VMEM
+    assert chip_spec.vmem_usable_bytes == expected_usable_vmem
+    assert chip_spec.vmem_capacity_bytes == expected_capacity_vmem
+
+
+def test_auto_chip_detect_tpu7x_two_cores_per_chip_no_error() -> None:
+    """Verify --chip auto resolves tpu7x cleanly even when JAX sees 2 cores/chip."""
+    with (
+        mock.patch.object(chips, "detect_tpu_from_sysfs", return_value=None),
+        mock.patch.object(jax_bridge, "probe_jax_tpu_info", return_value=("7x", 2)),
+    ):
+        chip_spec = chips.resolve_chip_spec("auto")
+    assert chip_spec.name == "tpu7x"
+    assert chip_spec.cores_per_device == 1
+    expected_devices = 2
+    assert chip_spec.devices_per_chip == expected_devices
+
+
+def test_all_preset_chips_load() -> None:
+    """Verify all built-in chip specs load and have valid physical parameters."""
+    for name in ("tpu7x", "v6e"):
+        chip_spec = chips.resolve_chip_spec(name)
+        assert chip_spec.vmem_capacity_bytes > 0
+        assert chip_spec.hbm_capacity_bytes > 0
+        assert chip_spec.hbm_bw_bytes_per_s > 0
+        assert chip_spec.bf16_flops_per_s > 0
+
+    for name in ("v5p", "v5e", "v4"):
+        with pytest.raises(chips.UnsupportedChipError):
+            chips.resolve_chip_spec(name)
+
+
+def test_chip_spec_json_override(tmp_path: Path) -> None:
+    """Verify loading a custom chip spec JSON overrides hardware parameters."""
+    custom_json = tmp_path / "custom_chip.json"
+    payload = {
+        "name": "custom_v7",
+        "cores_per_device": 1,
+        "vmem_capacity_bytes": 64 * (1 << 20),  # 64 MiB
+        "vmem_usable_bytes": 58 * (1 << 20),  # 58 MiB
+        "hbm_capacity_bytes": 128 * (1 << 30),  # 128 GiB
+        "hbm_bw_bytes_per_s": 2400e9,
+        "bf16_flops_per_s": 1150e12,
+        "fp8_flops_per_s": 2300e12,
+        "ici_egress_bw_bytes_per_s": 450e9,
+        "ici_link_bw_bytes_per_s": 150e9,
+        "collective_latency_us_bracket": [1.2, 1.2],
+        "sources": {"spec": "custom user chip spec JSON"},
+    }
+    custom_json.write_text(json.dumps(payload), encoding="utf-8")
+    loaded = chips.resolve_chip_spec("custom", chip_spec_path=custom_json)
+    assert loaded.name == "custom_v7"
+    assert loaded.vmem_usable_bytes == payload["vmem_usable_bytes"]
+    assert loaded.cores_per_device == 1
+
+
+def test_tpu7x_collective_latency_bracket_is_clean_round_prior() -> None:
+    """Verify tpu7x collective latency bracket uses clean round prior bounds."""
+    chip_spec = chips.resolve_chip_spec("tpu7x")
+    expected_bracket = (1.0, 5.0)
+    assert chip_spec.collective_latency_us_bracket == expected_bracket
+
+
+def test_resolve_chip_spec_unknown_raises() -> None:
+    """Verify resolving an unknown chip name raises MegakernelConfigError."""
+    with pytest.raises(errors.MegakernelConfigError, match="Unknown chip="):
+        chips.resolve_chip_spec("nonexistent_chip_xyz")
+
+
+def test_all_preset_models_resolve() -> None:
+    """Verify all registered model presets resolve to valid ModelProfile."""
+    for slug in models.MODEL_PRESETS:
+        profile = models.resolve_model_profile(slug)
+        assert profile.name == slug
+        assert profile.num_layers > 0
+        assert profile.hidden_size > 0
+        assert profile.num_attention_heads > 0
+
+
+def test_hf_config_autodiscovery_deepseek_v3() -> None:
+    """Verify DeepSeek-V3 HF config auto-discovery sets MLA parameters."""
+    profile = models.model_profile_from_hf_config(DEEPSEEK_V3_CFG)
+    assert profile.num_layers == DEEPSEEK_V3_CFG["num_hidden_layers"]
+    exp_moe, exp_experts, exp_top_k, exp_q_lora, exp_kv_lora = 58, 256, 8, 1536, 512
+    assert profile.num_moe_layers == exp_moe
+    assert profile.num_experts == exp_experts
+    assert profile.top_k == exp_top_k
+    assert profile.q_lora_rank == exp_q_lora
+    assert profile.kv_lora_rank == exp_kv_lora
+
+
+def test_hf_config_autodiscovery_qwen3_next_hybrid() -> None:
+    """Verify Qwen3.5 hybrid linear-attention config autodiscovery."""
+    profile = models.model_profile_from_hf_config(QWEN35_397B_CFG)
+    assert profile.num_layers == QWEN35_397B_CFG["num_hidden_layers"]
+    exp_attn, exp_lin, exp_experts, exp_top_k = 15, 45, 512, 10
+    assert profile.num_attention_layers == exp_attn
+    assert profile.num_linear_layers == exp_lin
+    assert profile.num_experts == exp_experts
+    assert profile.top_k == exp_top_k
+
+
+def test_hf_config_autodiscovery_dense_llama() -> None:
+    """Verify dense LLaMA style config autodiscovery."""
+    cfg = {
+        "model_type": "llama",
+        "num_hidden_layers": 32,
+        "hidden_size": 4096,
+        "intermediate_size": 11008,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+    }
+    profile = models.model_profile_from_hf_config(cfg)
+    assert profile.num_layers == cfg["num_hidden_layers"]
+    assert profile.num_attention_layers == cfg["num_hidden_layers"]
+    assert profile.num_linear_layers == 0
+    assert profile.num_experts == 0
+
+
+def test_hf_config_autodiscovery_kimi_k25_native_int4() -> None:
+    """Verify Kimi-K3 nested linear_attn_config and mxfp4 expert quantization."""
+    profile = models.model_profile_from_hf_config(KIMI_K3_PRO_CFG)
+    assert profile.num_layers == KIMI_K3_PRO_CFG["num_hidden_layers"]
+    exp_lin, exp_routed_h = 69, 3584
+    assert profile.num_linear_layers == exp_lin
+    assert profile.routed_expert_hidden_size == exp_routed_h
+    assert profile.expert_dtype == "mxfp4"
+
+
+def test_hf_config_autodiscovery_glm5_mla_dsa() -> None:
+    """Verify GLM-5 MLA/DSA architecture config autodiscovery."""
+    cfg = {
+        "model_type": "glm_moe",
+        "num_hidden_layers": 78,
+        "first_k_dense_replace": 3,
+        "hidden_size": 6144,
+        "intermediate_size": 12288,
+        "moe_intermediate_size": 2048,
+        "num_attention_heads": 96,
+        "num_key_value_heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "num_experts": 256,
+        "num_experts_per_tok": 8,
+    }
+    profile = models.model_profile_from_hf_config(cfg)
+    assert profile.num_layers == cfg["num_hidden_layers"]
+    exp_moe, exp_experts = 75, 256
+    assert profile.num_moe_layers == exp_moe
+    assert profile.num_experts == exp_experts
+
+
+def test_preset_models_json_schema() -> None:
+    """Verify models.json and deployments.json load and conform to schema."""
+    presets_dir = Path(models.__file__).resolve().parent / "data" / "presets"
+    models_json = presets_dir / "models.json"
+    deployments_json = presets_dir / "deployments.json"
+    assert models_json.is_file()
+    assert deployments_json.is_file()
+    models_data = json.loads(models_json.read_text(encoding="utf-8"))
+    assert "presets" in models_data
+    min_presets = 10
+    assert len(models_data["presets"]) >= min_presets
+    for moe_slug in ("mixtral-8x22b", "llama-4-maverick", "gpt-oss-120b"):
+        assert models_data["presets"][moe_slug]["moe_intermediate_size"] > 0
+    deployments_data = json.loads(deployments_json.read_text(encoding="utf-8"))
+    assert "deployments" in deployments_data
+
+
+def test_detect_sysfs_and_hf_snapshot_accept_injected_paths(tmp_path: Path) -> None:
+    """Verify public sysfs and HF snapshot path-injection helpers exist and work."""
+    pci_dev = tmp_path / "pci" / "0000:00:04.0"
+    pci_dev.mkdir(parents=True)
+    (pci_dev / "vendor").write_text("0x1ae0\n", encoding="utf-8")
+    (pci_dev / "device").write_text("0x0076\n", encoding="utf-8")
+    detected = chips.detect_tpu_from_sysfs(tmp_path / "pci")
+    assert detected == "tpu7x"
+    chip_spec = chips.resolve_chip_spec(detected)
+    expected_devices = 2
+    assert (chip_spec.name, chip_spec.devices_per_chip) == ("tpu7x", expected_devices)
+
+    hf_home = tmp_path / "hf_home"
+    repo_dir = hf_home / "hub" / "models--testorg--testmodel"
+    snap_dir = repo_dir / "snapshots" / "abc123rev"
+    snap_dir.mkdir(parents=True)
+    cfg_file = snap_dir / "config.json"
+    cfg_payload = {
+        "model_type": "llama",
+        "num_hidden_layers": 16,
+        "hidden_size": 2048,
+        "num_attention_heads": 16,
+    }
+    cfg_file.write_text(json.dumps(cfg_payload), encoding="utf-8")
+    ref_main = repo_dir / "refs" / "main"
+    ref_main.parent.mkdir(parents=True, exist_ok=True)
+    ref_main.write_text("abc123rev\n", encoding="utf-8")
+
+    resolved = models.resolve_hf_snapshot_config("testorg/testmodel", hf_home=hf_home)
+    assert resolved == cfg_file
+    profile = models.resolve_model_profile(resolved)
+    assert profile.num_layers == cfg_payload["num_hidden_layers"]
+
+
+def test_tpu7x_int8_peak_equals_bf16_rate() -> None:
+    """Verify tpu7x int8 peak FLOP/s equals the BF16 rate (1155 TFLOP/s)."""
+    c7x = chips.resolve_chip_spec("tpu7x")
+    assert c7x.int8_flops_per_s == c7x.bf16_flops_per_s
+    assert c7x.peak_flops("int8") == c7x.bf16_flops_per_s
+
+
+def test_chip_sources_cover_every_field() -> None:
+    """Verify every built-in ChipSpec value field has a prefixed source entry."""
+    skip = {"name", "topologies", "sources", "tpu_info"}
+    value_fields = {f.name for f in dataclasses.fields(chips.ChipSpec)} - skip
+    for name, spec in chips.BUILTIN_CHIP_SPECS.items():
+        assert spec.sources is not None, f"{name} missing sources"
+        assert value_fields <= set(spec.sources.keys()), (
+            f"{name} missing field sources: {value_fields - set(spec.sources.keys())}"
+        )
+        for key in value_fields:
+            src_val = spec.sources[key]
+            assert src_val.startswith(SOURCE_PREFIXES), (
+                f"{name}.{key} source missing class prefix: {src_val!r}"
+            )
+
+
+def test_jax_bridge_checks_every_exposed_field() -> None:
+    """Verify verify_chip_spec_against_jax checks all 6 tpu_info fields."""
+    for name in ("tpu7x", "v6e"):
+        cs = chips.resolve_chip_spec(name)
+        assert chips.verify_chip_spec_against_jax(cs) == []
+
+    for name in ("v5p", "v5e", "v4"):
+        with pytest.raises(chips.UnsupportedChipError):
+            chips.resolve_chip_spec(name)
+
+    bad_7x = dataclasses.replace(
+        chips.resolve_chip_spec("tpu7x"), int8_flops_per_s=2.31e15
+    )
+    mismatches = chips.verify_chip_spec_against_jax(bad_7x)
+    assert any("int8_flops_per_s" in m for m in mismatches)
+
+
+def test_dense_prefix_predicate_matches_non_homogeneous_reasons() -> None:
+    """Verify dense_prefix_moe is derived when 0 < moe_layers < num_layers."""
+    cfg = {
+        **DEEPSEEK_V3_CFG,
+        "num_hidden_layers": 4,
+        "first_k_dense_replace": 1,
+    }
+    model_profile = models.model_profile_from_hf_config(cfg)
+    assert (model_profile.num_layers, model_profile.num_moe_layers) == (4, 3)
+    assert "dense_prefix_moe" in model_profile.layer_families
+
+
+def test_load_measurements_bundled_uses_requested_chip() -> None:
+    """Verify load_measurements('bundled', chip_name=...) uses requested chip."""
+    m7x = specs.load_measurements("bundled", chip_name="tpu7x")
+    assert m7x.source_kind == "architectural_prior"
+    with pytest.raises(errors.MegakernelConfigError, match="v6e"):
+        specs.load_measurements("bundled", chip_name="v6e")
+
+
+def test_hf_config_autodiscovery_deepseek_v4_csa_and_mhc() -> None:
+    """Verify deepseek_v4 CSA layer token, compress_ratios, and mhc_num_streams."""
+    cfg: dict[str, object] = {
+        "model_type": "deepseek_v4",
+        "num_hidden_layers": 4,
+        "hidden_size": 7168,
+        "intermediate_size": 18432,
+        "moe_intermediate_size": 2048,
+        "num_attention_heads": 128,
+        "num_key_value_heads": 128,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 8,
+        "layer_types": ["mla", "csa", "csa", "csa"],
+        "compress_ratios": [1.0, 0.1, 0.1, 0.1],
+        "mhc_num_streams": 4,
+    }
+    model_profile = models.model_profile_from_hf_config(cfg)
+    assert model_profile.architecture_unverified is False
+    assert model_profile.kv_compress_factor == pytest.approx(0.325)
+    assert model_profile.residual_streams == cfg["mhc_num_streams"]
+    assert "sparse_csa" in model_profile.layer_families
+    assert "hyper_connection" in model_profile.layer_families
+
+
+def test_hf_config_autodiscovery_qwen4_exp_hyper_connections() -> None:
+    """Verify qwen4_exp HCA, indexed_attention, and hc_mult residual streams."""
+    cfg: dict[str, object] = {
+        "model_type": "qwen4_exp",
+        "num_hidden_layers": 4,
+        "hidden_size": 2048,
+        "intermediate_size": 6144,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 16,
+        "layer_types": ["hca", "indexed_attention", "gdn", "gdn"],
+        "hc_mult": 4,
+    }
+    model_profile = models.model_profile_from_hf_config(cfg)
+    assert model_profile.architecture_unverified is False
+    assert model_profile.residual_streams == cfg["hc_mult"]
+    assert "hyper_connection" in model_profile.layer_families
+
+
+def test_hf_config_compress_ratios_divisors_and_geometry_validation() -> None:
+    """Verify divisor compress_ratios invert and invalid ratios/heads fail closed."""
+    cfg_div = {
+        **DEEPSEEK_V3_CFG,
+        "num_hidden_layers": 4,
+        "first_k_dense_replace": 0,
+        "compress_ratios": [1.0, 10.0, 10.0, 10.0],
+        "quantization_config": {"quant_method": "gptq", "bits": 8},
+    }
+    model_profile = models.model_profile_from_hf_config(cfg_div)
+    assert model_profile.kv_compress_factor == pytest.approx(0.325)
+    assert model_profile.weight_dtype == "int8"
+
+    with pytest.raises(models.UnsupportedArchitectureError, match="compress_ratios"):
+        models.model_profile_from_hf_config(
+            {**cfg_div, "compress_ratios": [1.0, -2.0, 0.5, 0.5]}
+        )
+
+    with pytest.raises(models.UnsupportedArchitectureError, match="num_kv_heads"):
+        models.model_profile_from_hf_config(
+            {**DEEPSEEK_V3_CFG, "num_key_value_heads": 256}
+        )
+
+    with pytest.raises(models.UnsupportedArchitectureError, match="head_dim"):
+        models.model_profile_from_hf_config(
+            {
+                "model_type": "llama",
+                "num_hidden_layers": 4,
+                "hidden_size": 256,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "head_dim": 6,
+            }
+        )
+
+
+def test_fail_closed_spec_loaders_and_specs_bounds(tmp_path: Path) -> None:
+    """Verify chip overrides, measurements, RingPlan, and EfficiencySpec fail closed."""
+    bad_chip = tmp_path / "bad_chip.json"
+    bad_chip.write_text(
+        json.dumps(
+            {
+                "vmem_capacity_bytes": 64 * (1 << 20),
+                "hbm_capacity_bytes": 100 * (1 << 30),
+                "hbm_bw_bytes_per_s": 3.0e12,
+                "bf16_flops_per_s": 1.0e15,
+                "collective_latency_us_bracket": [1.0, 2.0, 3.0],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(errors.MegakernelConfigError, match="2-element"):
+        chips.load_chip_spec_file(bad_chip)
+
+    with pytest.raises(errors.MegakernelConfigError, match="numeric"):
+        specs.load_measurements(
+            {
+                "schema": constants.MEASUREMENTS_SCHEMA,
+                "launch_gap_us": {"p50": "not-a-float"},
+            }
+        )
+
+    with pytest.raises(errors.MegakernelConfigError, match=r"RingPlan\.dense_slots"):
+        specs.RingPlan(dense_slots=0)
+
+    with pytest.raises(errors.MegakernelConfigError, match=r"EfficiencySpec\.eta_hbm"):
+        specs.EfficiencySpec(eta_hbm=1.5)
+
+
+def _extract_assign_names(node: ast.stmt) -> list[str]:
+    """Return assigned top-level variable names from an AST statement."""
+    if isinstance(node, ast.Assign):
+        return [t.id for t in node.targets if isinstance(t, ast.Name)]
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return [node.target.id]
+    return []
+
+
+def test_no_private_underscore_module_constants() -> None:
+    """Verify advisor Python modules define zero private `_`-prefixed constants."""
+    advisor_dir = Path(models.__file__).resolve().parent
+    offenders = [
+        f"{py_path.name}:{name}"
+        for py_path in sorted(advisor_dir.glob("*.py"))
+        for node in ast.parse(
+            py_path.read_text(encoding="utf-8"), filename=str(py_path)
+        ).body
+        for name in _extract_assign_names(node)
+        if name.startswith("_") and not name.startswith("__")
+    ]
+    assert offenders == [], f"Found private module constants: {offenders}"
+
+
+def test_unlisted_model_type_fails_closed() -> None:
+    """Verify unlisted model_type fails closed with UnsupportedArchitectureError."""
+    with pytest.raises(
+        models.UnsupportedArchitectureError, match="Unsupported architecture"
+    ):
+        models.model_profile_from_hf_config(
+            {
+                "model_type": "unlisted_custom_architecture",
+                "num_hidden_layers": 4,
+                "hidden_size": 256,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "head_dim": 64,
+            }
+        )
+
+
+def test_deepseek_v4_zero_compress_ratio_swa_layers() -> None:
+    """Verify compress_ratios 0/0.0 treats SWA layers as uncompressed (1.0)."""
+    cfg = {
+        **DEEPSEEK_V3_CFG,
+        "compress_ratios": [0, 2, 0.0, 2.0],
+    }
+    profile = models.model_profile_from_hf_config(cfg)
+    expected_ratio = 0.75
+    assert profile.kv_compress_factor == pytest.approx(expected_ratio)
+
+
+def test_custom_chip_spec_rejects_unsupported_megacore(tmp_path: Path) -> None:
+    """Verify custom chip spec with supports_megacore=False rejects megacore=True."""
+    custom_spec_file = tmp_path / "custom_chip.json"
+    custom_spec_file.write_text(
+        json.dumps(
+            {
+                "name": "custom_single_core",
+                "hbm_capacity_bytes": 32 * 1024 * 1024 * 1024,
+                "hbm_bw_bytes_per_s": 1.6e12,
+                "vmem_capacity_bytes": 32 * 1024 * 1024,
+                "bf16_flops_per_s": 5.0e14,
+                "collective_latency_us_bracket": [1.0, 2.0],
+                "supports_megacore": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(chips.UnsupportedChipError, match="supports_megacore"):
+        chips.resolve_chip_spec(
+            "custom_single_core",
+            chip_spec_path=custom_spec_file,
+            megacore=True,
+        )
+
+
+def test_all_preset_models_preserve_support_status() -> None:
+    """Verify all 13 preset models preserve within_core_limits vs hypothetical."""
+    expected_within_core = {
+        "qwen3.5-0.8b",
+        "qwen3.5-397b",
+        "qwen3.8-2.4t",
+        "mistral-large",
+        "llama-3.1-405b",
+        "mixtral-8x22b",
+        "llama-4-maverick",
+        "gpt-oss-120b",
+        "qwen3-30b-a3b",
+    }
+    total_presets = SHIPPED_PRESET_COUNT
+    assert len(models.MODEL_PRESETS) == total_presets
+    for name in models.MODEL_PRESETS:
+        model_profile = models.resolve_model_profile(name)
+        has_unmodeled = any(
+            fam not in specs.SUPPORTED_ONCHIP_FAMILIES
+            for fam in model_profile.layer_families
+        )
+        if name in expected_within_core:
+            assert not has_unmodeled, f"{name} should have all supported layer families"
+        else:
+            assert has_unmodeled, f"{name} should decline to hypothetical"
+
+
+def test_dtype_source_provenance_and_default_fallback() -> None:
+    """Verify dtype_source provenance across presets, quant_config, and defaults."""
+    p_q35 = models.resolve_model_profile("qwen3.5-397b")
+    assert p_q35.dtype_source == "preset (qwen3.5-397b)"
+
+    p_flag = models.resolve_model_profile("qwen3.5-397b", weight_dtype="bf16")
+    assert p_flag.dtype_source == "flag"
+    assert p_flag.weight_dtype == "bf16"
+
+    cfg_quant = {
+        "model_type": "qwen2",
+        "num_hidden_layers": 4,
+        "hidden_size": 1024,
+        "num_attention_heads": 8,
+        "quantization_config": {"quant_method": "fp8"},
+    }
+    p_quant = models.model_profile_from_hf_config(cfg_quant)
+    assert p_quant.dtype_source == "quantization_config"
+
+    cfg_torch_dt = {
+        "model_type": "qwen2",
+        "num_hidden_layers": 4,
+        "hidden_size": 1024,
+        "num_attention_heads": 8,
+        "torch_dtype": "bfloat16",
+    }
+    p_torch_dt = models.model_profile_from_hf_config(cfg_torch_dt)
+    assert p_torch_dt.dtype_source == "default (torch_dtype; no quantization_config)"
+
+    cfg_bare = {
+        "model_type": "qwen2",
+        "num_hidden_layers": 4,
+        "hidden_size": 1024,
+        "num_attention_heads": 8,
+    }
+    p_bare = models.model_profile_from_hf_config(cfg_bare)
+    assert p_bare.dtype_source == "default (bf16 fallback; no quantization_config)"
+
+
+def test_quantization_peak_flops_and_hf_subchannel_parsing() -> None:
+    """Verify W8A16/W8A8 peak FLOP rates and HuggingFace sub-channel config parsing."""
+    c7x = chips.resolve_chip_spec("tpu7x")
+    cv6e = chips.resolve_chip_spec("v6e")
+
+    assert c7x.peak_flops("fp8", "bf16") == c7x.bf16_flops_per_s
+    assert c7x.peak_flops("fp8", "fp8") == c7x.fp8_flops_per_s
+    assert c7x.peak_flops("bf16", "bf16") == c7x.bf16_flops_per_s
+    assert cv6e.peak_flops("fp8", "bf16") == cv6e.bf16_flops_per_s
+    assert cv6e.peak_flops("fp8", "fp8") == cv6e.fp8_flops_per_s
+
+    cfg_subchannel = {
+        "model_type": "qwen2",
+        "num_hidden_layers": 4,
+        "hidden_size": 1024,
+        "num_attention_heads": 8,
+        "quantization_config": {
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+            "activation_scheme": "none",
+        },
+    }
+    p_subchannel = models.model_profile_from_hf_config(cfg_subchannel)
+    expected_block_k = 128
+    assert p_subchannel.weight_block_k == expected_block_k
+    assert p_subchannel.act_dtype == "bf16"
+    assert p_subchannel.weight_dtype == "fp8"
+
+
+def test_kimi_k3_declares_eight_expert_owner_groups() -> None:
+    """Verify Kimi-K3 decode and saturation presets declare 8 expert owner groups."""
+    kimi_preset = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
+    assert kimi_preset.decode is not None
+    assert kimi_preset.decode.megakernel is not None
+    # Kimi-K3's 32-rank megakernel shards each expert across 4 TP ranks (32 // 4 == 8).
+    tp_ranks_per_expert_group = 4
+    expected_owner_groups = kimi_preset.decode.ep // tp_ranks_per_expert_group
+    assert kimi_preset.decode.megakernel["expert_owner_groups"] == expected_owner_groups
+    assert kimi_preset.saturation is not None
+    assert kimi_preset.saturation.megakernel is not None
+    assert (
+        kimi_preset.saturation.megakernel["expert_owner_groups"]
+        == expected_owner_groups
+    )
+
+
+@pytest.mark.parametrize("bad_groups", [0, True, "8", 6, 64])
+def test_parse_parallel_layout_rejects_invalid_expert_owner_groups(
+    bad_groups: object,
+) -> None:
+    """Reject non-int, out-of-range, or ep-non-dividing expert_owner_groups."""
+    ep_size = 32
+    with pytest.raises(errors.MegakernelConfigError, match="expert_owner_groups"):
+        models.parse_parallel_layout(
+            {
+                "tp": 32,
+                "ep": ep_size,
+                "megakernel": {
+                    "source": "unit test invalid owner groups",
+                    "scopes": ["whole_step"],
+                    "ranks": 32,
+                    "expert_owner_groups": bad_groups,
+                },
+            }
+        )
+
+
+def test_validate_declared_layouts_rejects_non_dividing_or_unknown_owner_groups() -> (
+    None
+):
+    """Reject owner_groups that do not divide num_experts or unknown preset slugs."""
+    non_dividing_layout = models.parse_parallel_layout(
+        {
+            "tp": 6,
+            "ep": 6,
+            "megakernel": {
+                "source": "unit test non-dividing owner groups",
+                "scopes": ["whole_step"],
+                "ranks": 6,
+                "expert_owner_groups": 6,
+            },
+        }
+    )
+    prefill_layout = models.parse_parallel_layout({"tp": 32, "ep": 16, "pcp": 32})
+    bad_preset = models.DeploymentPreset(
+        decode=non_dividing_layout,
+        prefill=prefill_layout,
+    )
+    with pytest.raises(errors.MegakernelConfigError, match="divide num_experts"):
+        models.validate_declared_layouts("kimi-k3", bad_preset)
+    with pytest.raises(KeyError):
+        models.validate_declared_layouts("unknown-preset-slug", bad_preset)
+
+
+def test_declared_collectives_and_expert_modes_validate_schema() -> None:
+    """Validate declared collective steps, expert row rules, and 6-axis pcp keys."""
+    kimi_preset = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
+    assert kimi_preset.decode is not None
+    assert kimi_preset.decode.megakernel is not None
+    kimi_decode_coll = advisor.parse_declared_collectives(
+        kimi_preset.decode.megakernel["collectives"]
+    )
+    assert kimi_decode_coll is not None
+    expected_kimi_all_reduces = 94
+    assert kimi_decode_coll.all_reduces == expected_kimi_all_reduces
+    assert [step.kind for step in kimi_decode_coll.steps] == [
+        "routed_transport",
+        "dcp_gather",
+    ]
+
+    qwen_preset = advisor.DEPLOYMENT_PRESETS["qwen3.5-397b"]
+    assert qwen_preset.decode is not None
+    assert qwen_preset.decode.megakernel is not None
+    raw_rules = qwen_preset.decode.megakernel["expert_mode_by_rows"]
+    parsed_rules = advisor.parse_expert_mode_rules(raw_rules)
+    tp_row_limit = 12
+    ep_row_limit = 800
+    assert [(rule.max_rows, rule.mode) for rule in parsed_rules] == [
+        (tp_row_limit, "tp"),
+        (ep_row_limit, "ep"),
+    ]
+    qwen_decode_coll = advisor.parse_declared_collectives(
+        qwen_preset.decode.megakernel["collectives"]
+    )
+    assert qwen_decode_coll is not None
+    assert [
+        (step.kind, step.group_size, step.calls_per_layer)
+        for step in qwen_decode_coll.steps
+    ] == [
+        ("split_kv", 4, 2),
+    ]
+
+    for bad_collectives in (
+        {"all_reduces": -1},
+        {"all_reduces": True},
+        {"steps": [{"kind": "unknown_op", "group_size": 4}]},
+        {"steps": [{"kind": "split_kv", "group_size": 6}]},
+        {"steps": [{"kind": "split_kv", "group_size": 1}]},
+        {"steps": [{"kind": "split_kv", "group_size": 4, "calls_per_layer": 0}]},
+    ):
+        with pytest.raises(errors.MegakernelConfigError):
+            models.parse_parallel_layout(
+                {
+                    "tp": 8,
+                    "ep": 8,
+                    "megakernel": {
+                        "source": "invalid collective schema check",
+                        "scopes": ["whole_step"],
+                        "ranks": 8,
+                        "collectives": bad_collectives,
+                    },
+                }
+            )
+
+    for bad_rules in (
+        [],
+        [{"max_rows": 0, "mode": "tp"}],
+        [{"max_rows": 16, "mode": "tp"}, {"max_rows": 12, "mode": "ep"}],
+        [{"max_rows": 12, "mode": "tp"}, {"max_rows": 12, "mode": "ep"}],
+        [{"max_rows": 12, "mode": "invalid_mode"}],
+    ):
+        with pytest.raises(errors.MegakernelConfigError):
+            models.parse_parallel_layout(
+                {
+                    "tp": 8,
+                    "ep": 8,
+                    "megakernel": {
+                        "source": "invalid expert_mode_by_rows check",
+                        "scopes": ["whole_step"],
+                        "ranks": 8,
+                        "expert_mode_by_rows": bad_rules,
+                    },
+                }
+            )
+
+    pcp_one_layout = models.parse_parallel_layout(
+        {
+            "tp": 32,
+            "ep": 16,
+            "pcp": 1,
+            "megakernel": {
+                "source": "pcp=1 prefill layout",
+                "scopes": ["whole_step"],
+                "phases": ["prefill"],
+                "ranks": 32,
+            },
+        }
+    )
+    pcp_two_layout = models.parse_parallel_layout(
+        {
+            "tp": 32,
+            "ep": 16,
+            "pcp": 2,
+            "megakernel": {
+                "source": "pcp=2 prefill layout",
+                "scopes": ["whole_step"],
+                "phases": ["prefill"],
+                "ranks": 32,
+            },
+        }
+    )
+    distinct_pcp_preset = models.DeploymentPreset(
+        decode=models.parse_parallel_layout({"tp": 32, "ep": 32, "dcp": 32}),
+        prefill=pcp_one_layout,
+        megakernel_layouts=(pcp_two_layout,),
+    )
+    models.validate_declared_layouts("kimi-k3", distinct_pcp_preset)
+
+    duplicate_pcp_preset = models.DeploymentPreset(
+        decode=models.parse_parallel_layout({"tp": 32, "ep": 32, "dcp": 32}),
+        prefill=pcp_two_layout,
+        megakernel_layouts=(pcp_two_layout,),
+    )
+    with pytest.raises(errors.MegakernelConfigError, match="Duplicate megakernel"):
+        models.validate_declared_layouts("kimi-k3", duplicate_pcp_preset)
+
+
+def test_hf_config_autodiscovery_glm_moe_dsa_indexer_schedule() -> None:
+    """Verify glm_moe_dsa HF config parses DSA dimensions, schedules, and errors."""
+    num_layers = 78
+    num_full_indexers = 21
+    indexer_types = ["full"] * num_full_indexers + ["shared"] * (
+        num_layers - num_full_indexers
+    )
+    glm_config: dict[str, object] = {
+        "model_type": "glm_moe_dsa",
+        "num_hidden_layers": num_layers,
+        "first_k_dense_replace": 3,
+        "hidden_size": 6144,
+        "intermediate_size": 12288,
+        "moe_intermediate_size": 2048,
+        "n_shared_experts": 1,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 64,
+        "q_lora_rank": 2048,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 192,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 256,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 8,
+        "index_topk": 2048,
+        "index_head_dim": 128,
+        "index_n_heads": 32,
+        "indexer_types": indexer_types,
+        "quantization_config": {
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+        },
+    }
+    profile = models.model_profile_from_hf_config(glm_config, name="glm-5.2-hf")
+    assert not profile.architecture_unverified
+    assert models.has_dsa_profile(profile)
+    assert profile.num_indexer_layers == num_full_indexers
+    assert profile.index_topk == glm_config["index_topk"]
+    assert profile.index_head_dim == glm_config["index_head_dim"]
+    assert profile.index_n_heads == glm_config["index_n_heads"]
+    assert "dsa" in profile.layer_families
+    assert "dsa" in specs.SUPPORTED_ONCHIP_FAMILIES
+    assert not profile.is_periodic
+    expected_record_bytes = (
+        (
+            profile.index_head_dim
+            + (profile.index_head_dim // constants.INDEXER_SCALE_BLOCK_SIZE)
+            + constants.WORD_ALIGN_BYTES
+            - 1
+        )
+        // constants.WORD_ALIGN_BYTES
+    ) * constants.WORD_ALIGN_BYTES
+    assert models.indexer_record_bytes(profile.index_head_dim) == expected_record_bytes
+
+    # Numeric index_topk_pattern entries (>0 marks full, 0 marks shared).
+    numeric_layers = 4
+    numeric_config = {
+        **glm_config,
+        "num_hidden_layers": numeric_layers,
+        "first_k_dense_replace": 0,
+        "index_topk_pattern": [1, 0, 1, 0],
+    }
+    numeric_config.pop("indexer_types")
+    numeric_profile = models.model_profile_from_hf_config(
+        numeric_config, name="glm-dsa-numeric"
+    )
+    expected_numeric_full = numeric_layers // 2
+    assert numeric_profile.num_indexer_layers == expected_numeric_full
+    assert not numeric_profile.is_periodic
+
+    # Periodic frequency schedule with skip offset resolves scheduled layers.
+    freq_layers = 16
+    skip_offset = 4
+    topk_freq = 4
+    freq_config = {
+        **glm_config,
+        "num_hidden_layers": freq_layers,
+        "first_k_dense_replace": 0,
+        "index_topk_freq": topk_freq,
+        "index_skip_topk_offset": skip_offset,
+    }
+    freq_config.pop("indexer_types")
+    freq_profile = models.model_profile_from_hf_config(freq_config, name="glm-dsa-freq")
+    # Layers [4..15] have 12 active layers; every 4th (indices 7, 11, 15) is full.
+    expected_freq_layers = (freq_layers - skip_offset) // topk_freq
+    assert freq_profile.num_indexer_layers == expected_freq_layers
+    assert not freq_profile.is_periodic
+
+    # Malformed explicit schedules fail fast with UnsupportedArchitectureError.
+    with pytest.raises(models.UnsupportedArchitectureError):
+        models.model_profile_from_hf_config(
+            {**glm_config, "indexer_types": ["full", "shared"]},
+            name="glm-bad-len",
+        )
+    with pytest.raises(models.UnsupportedArchitectureError):
+        models.model_profile_from_hf_config(
+            {**glm_config, "indexer_types": ["typo"] * num_layers},
+            name="glm-bad-token",
+        )
+    with pytest.raises(models.UnsupportedArchitectureError):
+        models.model_profile_from_hf_config(
+            {**glm_config, "indexer_types": ["shared"] * num_layers},
+            name="glm-all-shared",
+        )
+
+
+def test_preset_glm52_matches_glm_moe_dsa_hf_config() -> None:
+    """Verify shipped glm-5.2 preset matches zai-org/GLM-5.2-FP8 geometry."""
+    profile = models.resolve_model_profile("glm-5.2")
+    # zai-org/GLM-5.2-FP8 config.json has 78 layers: 21 full + 57 shared indexers.
+    shared_indexer_layers = 57
+    assert profile.model_type == "glm_moe_dsa"
+    assert models.has_dsa_profile(profile)
+    assert profile.intermediate_size == 2 * profile.hidden_size
+    assert profile.q_lora_rank == 4 * profile.kv_lora_rank
+    assert profile.qk_nope_head_dim == 3 * profile.qk_rope_head_dim
+    assert profile.index_topk == 4 * profile.kv_lora_rank
+    assert profile.index_head_dim == constants.INDEXER_SCALE_BLOCK_SIZE
+    assert profile.index_n_heads == profile.num_attention_heads // 2
+    assert profile.num_indexer_layers == profile.num_layers - shared_indexer_layers
+    assert profile.weight_block_k == constants.INDEXER_SCALE_BLOCK_SIZE
+    assert "dsa" in profile.layer_families
+    assert "dense_prefix_moe" in profile.layer_families
+
+
+def test_all_shipped_presets_cite_retrievable_hf_config() -> None:
+    """Verify every shipped preset cites a concrete HuggingFace config.json."""
+    assert len(models.MODEL_PRESETS) == SHIPPED_PRESET_COUNT
+    for removed in ("deepseek-v4", "qwen4-exp"):
+        assert removed not in models.MODEL_PRESETS
+        assert removed not in models.REGISTERED_MODEL_ALIASES
+    for slug, source in models.MODEL_PRESET_SOURCES.items():
+        assert source.startswith("HuggingFace "), f"{slug}: {source}"
+        assert source.endswith("config.json"), f"{slug}: {source}"
+        assert "/" in source, f"{slug}: missing org/repo in {source}"
+
+
+def test_hf_config_deepseek_v4_compress_rates_mapping() -> None:
+    """Verify deepseek_v4 compress_rates dict, error paths, and qwen4_exp_text parse."""
+    csa_rate = 4.0
+    hca_rate = 128.0
+    num_test_layers = 4
+    deepseek_config: dict[str, object] = {
+        **DEEPSEEK_V3_CFG,
+        "model_type": "deepseek_v4",
+        "num_hidden_layers": num_test_layers,
+        "first_k_dense_replace": 0,
+        "layer_types": [
+            "compressed_sparse_attention",
+            "heavily_compressed_attention",
+            "deepseek_sparse_attention",
+            "sliding_attention",
+        ],
+        "compress_rates": {
+            "compressed_sparse_attention": csa_rate,
+            "heavily_compressed_attention": hca_rate,
+        },
+        "mhc_num_streams": 4,
+    }
+    profile = models.model_profile_from_hf_config(deepseek_config, name="ds-v4-custom")
+    # 1 layer at 1/4 + 1 layer at 1/128 + 2 uncompressed layers at 1.0, averaged over 4.
+    expected_factor = (1.0 / csa_rate + 1.0 / hca_rate + 1.0 + 1.0) / num_test_layers
+    assert profile.kv_compress_factor == pytest.approx(expected_factor, abs=1e-9)
+    assert "sparse_csa" in profile.layer_families
+    assert "hyper_connection" in profile.layer_families
+
+    # Without layer_types, compress_rates averages across mapped rate values.
+    no_layers_config = dict(deepseek_config)
+    no_layers_config.pop("layer_types")
+    no_layers_profile = models.model_profile_from_hf_config(
+        no_layers_config, name="ds-v4-no-layers"
+    )
+    expected_avg_rates = (1.0 / csa_rate + 1.0 / hca_rate) / 2.0
+    assert no_layers_profile.kv_compress_factor == pytest.approx(
+        expected_avg_rates, abs=1e-9
+    )
+
+    # Empty or non-positive compress_rates fail fast.
+    with pytest.raises(models.UnsupportedArchitectureError):
+        models.model_profile_from_hf_config(
+            {**deepseek_config, "compress_rates": {}}, name="ds-v4-empty-rates"
+        )
+    with pytest.raises(models.UnsupportedArchitectureError):
+        models.model_profile_from_hf_config(
+            {**deepseek_config, "compress_rates": {"compressed_sparse_attention": 0}},
+            name="ds-v4-zero-rate",
+        )
+
+    # Verify multimodal text sub-config model_type qwen4_exp_text is recognized.
+    qwen4_text_profile = models.model_profile_from_hf_config(
+        {**QWEN4_EXP_CFG, "model_type": "qwen4_exp_text"}, name="qwen4-text-hf"
+    )
+    assert not qwen4_text_profile.architecture_unverified
+    assert "hyper_connection" in qwen4_text_profile.layer_families
+
+
+def test_presets_match_cited_config() -> None:
+    """Verify every shipped preset with a config snapshot matches its parsed profile."""
+    snapshots = _load_config_snapshots()
+    assert snapshots
+    ignored_fields = {"name", "dtype_source", "kv_dtype", "state_dtype"}
+    dtype_fields = {"weight_dtype", "expert_dtype", "act_dtype", "weight_block_k"}
+    mismatches: list[str] = []
+    for preset_name, snapshot_payload in snapshots.items():
+        config_mapping = snapshot_payload["config"]
+        assert isinstance(config_mapping, dict)
+        text_subconfig = config_mapping.get("text_config")
+        text_mapping = text_subconfig if isinstance(text_subconfig, dict) else {}
+        dtype_basis = models.MODEL_PRESET_DTYPE_BASIS[preset_name]
+        if dtype_basis == "assumed":
+            has_quantization_config = (
+                "quantization_config" in config_mapping
+                or "quantization_config" in text_mapping
+            )
+            assert not has_quantization_config, (
+                f"{preset_name} has quantization_config despite dtype_basis='assumed'"
+            )
+        has_intermediate_key = any(
+            key in config_mapping or key in text_mapping
+            for key in ("intermediate_size", "ffn_dim")
+        )
+        parsed_profile = advisor.model_profile_from_hf_config(config_mapping)
+        preset_profile = advisor.MODEL_PRESETS[preset_name]
+        for profile_field in dataclasses.fields(models.ModelProfile):
+            field_name = profile_field.name
+            if field_name in ignored_fields:
+                continue
+            if field_name == "intermediate_size" and not has_intermediate_key:
+                continue
+            if field_name in dtype_fields and dtype_basis != "config":
+                continue
+            preset_value = getattr(preset_profile, field_name)
+            config_value = getattr(parsed_profile, field_name)
+            if field_name == "model_type":
+                preset_value = str(preset_value).removesuffix("_text")
+                config_value = str(config_value).removesuffix("_text")
+            if preset_value != config_value:
+                detail = f"preset={preset_value} config={config_value}"
+                mismatches.append(f"{preset_name}.{field_name}: {detail}")
+    assert mismatches == []
+
+
+def test_every_preset_has_snapshot_or_is_listed_unverified() -> None:
+    """Verify each preset has a matching snapshot or is explicitly marked unverified."""
+    revision_pattern = re.compile(r"[0-9a-f]{40}")
+    for preset_name in advisor.MODEL_PRESETS:
+        dtype_basis = models.MODEL_PRESET_DTYPE_BASIS[preset_name]
+        snapshot_path = HF_CONFIG_DIR / f"{preset_name}.json"
+        expects_snapshot = dtype_basis != "unverified"
+        assert snapshot_path.is_file() == expects_snapshot
+        if expects_snapshot:
+            snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            repo_id = str(snapshot_payload["repo_id"])
+            revision = str(snapshot_payload["revision"])
+            assert repo_id in models.MODEL_PRESET_SOURCES[preset_name]
+            assert revision_pattern.fullmatch(revision) is not None
+
+
+def test_config_path_honors_quantization_ignore_list() -> None:
+    """Verify HF config parsing honors per-module quantization skip lists."""
+    snapshots = _load_config_snapshots()
+    # Each expectation follows from that snapshot config's own skip list.
+    kimi_config = snapshots["kimi-k3"]["config"]
+    assert isinstance(kimi_config, dict)
+    kimi_profile = advisor.model_profile_from_hf_config(kimi_config)
+    assert kimi_profile.weight_dtype == "bf16"
+    assert kimi_profile.expert_dtype == "mxfp4"
+    assert kimi_profile.act_dtype == "bf16"
+
+    gpt_oss_config = snapshots["gpt-oss-120b"]["config"]
+    assert isinstance(gpt_oss_config, dict)
+    gpt_oss_profile = advisor.model_profile_from_hf_config(gpt_oss_config)
+    assert gpt_oss_profile.weight_dtype == "bf16"
+    assert gpt_oss_profile.expert_dtype == "mxfp4"
+
+    for preset_name in ("qwen3.5-397b", "glm-5.2"):
+        model_config = snapshots[preset_name]["config"]
+        assert isinstance(model_config, dict)
+        model_profile = advisor.model_profile_from_hf_config(model_config)
+        assert model_profile.weight_dtype == "fp8"
+        assert model_profile.expert_dtype == "fp8"
+
+    mla_config = copy.deepcopy(snapshots["deepseek-v3"]["config"])
+    assert isinstance(mla_config, dict)
+    mla_config["quantization_config"] = {
+        "quant_method": "fp8",
+        "modules_to_not_convert": [
+            "model.layers.*.self_attn.q_a_proj",
+            "model.layers.*.self_attn.kv_a_proj_with_mqa",
+        ],
+    }
+    mla_profile = advisor.model_profile_from_hf_config(mla_config)
+    assert mla_profile.weight_dtype == "bf16"
+    assert mla_profile.expert_dtype == "fp8"
+
+    qwen_base = snapshots["qwen3.5-397b"]["config"]
+    assert isinstance(qwen_base, dict)
+    qwen_text = qwen_base["text_config"]
+    assert isinstance(qwen_text, dict)
+    qwen_layer_types = qwen_text["layer_types"]
+    assert isinstance(qwen_layer_types, list)
+    qwen_full_modules = [
+        f"model.language_model.layers.{layer_idx}.self_attn.q_proj"
+        for layer_idx, layer_type in enumerate(qwen_layer_types)
+        if layer_type == "full_attention"
+    ]
+    for modules, expected_weight_dtype in (
+        (["model.language_model.layers.3.self_attn.q_proj"], "fp8"),
+        (qwen_full_modules, "bf16"),
+    ):
+        qwen_case_config = copy.deepcopy(qwen_base)
+        qwen_quant = qwen_case_config["quantization_config"]
+        assert isinstance(qwen_quant, dict)
+        qwen_quant["modules_to_not_convert"] = modules
+        qwen_case_profile = advisor.model_profile_from_hf_config(qwen_case_config)
+        assert qwen_case_profile.weight_dtype == expected_weight_dtype
+        assert qwen_case_profile.expert_dtype == "fp8"
+
+    kv_only_config = copy.deepcopy(snapshots["deepseek-v3"]["config"])
+    assert isinstance(kv_only_config, dict)
+    kv_only_config["quantization_config"] = {
+        "quant_method": "fp8",
+        "modules_to_not_convert": ["kv_a_proj_with_mqa"],
+    }
+    kv_only_profile = advisor.model_profile_from_hf_config(kv_only_config)
+    assert kv_only_profile.weight_dtype == "fp8"
+    assert kv_only_profile.expert_dtype == "fp8"
+
+
+def test_hf_config_parses_dsa_config() -> None:
+    """Verify nested dsa_config populates DSA dimensions and indexer layer counts."""
+    snapshots = _load_config_snapshots()
+    kimi_pro_config = snapshots["kimi-k3.1-pro"]["config"]
+    assert isinstance(kimi_pro_config, dict)
+    text_subconfig = kimi_pro_config["text_config"]
+    assert isinstance(text_subconfig, dict)
+    dsa_config = text_subconfig["dsa_config"]
+    assert isinstance(dsa_config, dict)
+    dsa_layers = dsa_config["dsa_layers"]
+    assert isinstance(dsa_layers, list)
+
+    kimi_pro_profile = advisor.model_profile_from_hf_config(kimi_pro_config)
+    assert kimi_pro_profile.index_topk == dsa_config["index_topk"]
+    assert kimi_pro_profile.index_head_dim == dsa_config["index_head_dim"]
+    assert kimi_pro_profile.index_n_heads == dsa_config["index_num_heads"]
+    assert kimi_pro_profile.num_indexer_layers == len(dsa_layers)
+    assert "dsa" in kimi_pro_profile.layer_families
+
+    kimi_config = snapshots["kimi-k3"]["config"]
+    assert isinstance(kimi_config, dict)
+    kimi_profile = advisor.model_profile_from_hf_config(kimi_config)
+    assert kimi_profile.index_topk == 0
+
+
+def test_declared_blocks_cite_openable_source() -> None:
+    """Verify each declared source_ref is a repo file, https URL, or unpublished."""
+    seen_blocks = 0
+    for deployment_preset in advisor.DEPLOYMENT_PRESETS.values():
+        candidate_layouts = (
+            deployment_preset.decode,
+            deployment_preset.prefill,
+            deployment_preset.saturation,
+            *deployment_preset.megakernel_layouts,
+        )
+        for layout in candidate_layouts:
+            if layout is None or layout.megakernel is None:
+                continue
+            seen_blocks += 1
+            megakernel_block = layout.megakernel
+            source_ref = megakernel_block.get("source_ref")
+            assert isinstance(source_ref, str)
+            assert source_ref
+            assert (
+                source_ref == "unpublished"
+                or source_ref.startswith("https://")
+                or (REPO_ROOT / source_ref).exists()
+            )
+    assert seen_blocks >= 1
+
+
+def test_preset_loaders_reject_malformed_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify config and preset parsers fail loudly on malformed fields."""
+    bad_skip_cfg = copy.deepcopy(DEEPSEEK_V3_CFG)
+    bad_skip_cfg["quantization_config"] = {
+        "quant_method": "fp8",
+        "ignore": ["re:[unclosed"],
+    }
+    with pytest.raises(
+        models.UnsupportedArchitectureError,
+        match="Invalid quantization skip pattern",
+    ):
+        advisor.model_profile_from_hf_config(bad_skip_cfg)
+
+    bad_deployments = {
+        "deployments": {
+            "broken-notes": {
+                "decode": {"tp": 8, "ep": 1},
+                "prefill": {"tp": 8, "ep": 1},
+                "unmodeled_notes": "not-a-list",
+            }
+        }
+    }
+    (tmp_path / "deployments.json").write_text(
+        json.dumps(bad_deployments), encoding="utf-8"
+    )
+    bad_models = {"presets": {"broken-basis": {"dtype_basis": "bogus"}}}
+    (tmp_path / "models.json").write_text(json.dumps(bad_models), encoding="utf-8")
+    monkeypatch.setattr(models, "PRESETS_DIR", tmp_path)
+    with pytest.raises(
+        errors.MegakernelConfigError,
+        match="unmodeled_notes must be a list of strings",
+    ):
+        models.load_deployment_presets()
+    with pytest.raises(
+        errors.MegakernelConfigError,
+        match="dtype_basis must be one of",
+    ):
+        models.load_preset_dtype_basis()
