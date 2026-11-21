@@ -96,9 +96,11 @@ def _per_token_k_scale():
     return jnp.asarray(rng.uniform(0.05, 0.9, (1, 1, 1, _S)), jnp.float32)
 
 
-# (head_dim, scale_q, scale_k, per-token k scales): none folds exactly, and
-# with head_dim 128 (sm_scale not a power of two) merging any second factor
-# into sm_scale rounds differently from multiplying by each in turn.
+# (head_dim, scale_q, scale_k, per-token k scales): none folds exactly. With
+# head_dim 128 (sm_scale not a power of two) merging any second factor into
+# sm_scale rounds differently from multiplying by each in turn. With head_dim
+# 256 (sm_scale 1/16, a power of two) only the static q scale, the per-token
+# scales or the k_scale keep the fold off.
 _INEXACT = {
     "k_scale": (128, None, 0.37, False),
     "q_scale": (128, 2.5, None, False),
@@ -107,6 +109,9 @@ _INEXACT = {
     # sm_scale 1/sqrt(128) times this k_scale is exactly 0.125 in double, but
     # neither factor is a power of two, so the plain path rounds twice.
     "k_scale_cancels_sm_scale": (128, None, 1.414213562373095, False),
+    "k_scale_hd256": (256, None, 0.37, False),
+    "q_scale_hd256": (256, 2.5, None, False),
+    "per_token_hd256": (256, None, None, True),
 }
 
 
@@ -132,12 +137,15 @@ def test_inexact_scale_takes_the_plain_multiplies(mode, case):
 
 
 @pytest.mark.parametrize("mode", [configs.RpaCase.DECODE, configs.RpaCase.MIXED])
-@pytest.mark.parametrize("scale_k", [None, 1.0])
-def test_power_of_two_scale_folds_into_q_exactly(mode, scale_k):
-    """head_dim 256 with k_scale 1 (the Qwen3.5 fp8 layers): sm_scale = 1/16 is
-    folded into q, and the scores keep the plain path's bits."""
+@pytest.mark.parametrize(
+    ("scale_k", "folded"), [(None, 1 / 16), (1.0, 1 / 16), (0.5, 1 / 32), (16.0, 1.0)]
+)
+def test_power_of_two_scale_folds_into_q_exactly(mode, scale_k, folded):
+    """head_dim 256: sm_scale = 1/16 times a power-of-two k_scale is folded into
+    q (k_scale 1 is the Qwen3.5 fp8 layers; with k_scale 16 the product is 1,
+    so q is left as it is), and the scores keep the plain path's bits."""
     cfgs = _cfgs(mode, 256, jnp.bfloat16, scale_k=scale_k)
-    assert flash_attention.q_folded_scale(cfgs) == 1 / 16
+    assert flash_attention.q_folded_scale(cfgs) == folded
     diet = _scores(cfgs, scale_k, diet=True)
     plain = _scores(cfgs, scale_k, diet=False)
     for name, a, b in zip(("p", "m_next", "l_next"), diet, plain):
