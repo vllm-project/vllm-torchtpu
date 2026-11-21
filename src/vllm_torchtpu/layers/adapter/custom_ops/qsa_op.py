@@ -209,6 +209,66 @@ def build_pooled_qsa_op():
 
 
 @functools.cache
+def build_pooled_qsa_nocond_op():
+    """``build_pooled_qsa_op`` for VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND (q38 PSTEP-IDX):
+    its own op, so the flag-off op, its schema and its kernel keys stay as they
+    are. ``indexer_group_base`` (the layer's scheduling-group range) is a static
+    argument, so each QSA layer gets its own exported module."""
+    from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import pooled_qsa_nocond_step
+
+    op = pallas.jax_op(
+        "qwen4_exp::pooled_qsa_nocond", pooled_qsa_nocond_step, donate_argnums=(10,)
+    )
+
+    @op.register_fake
+    def fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+        indexer_group_base=0,
+    ):
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((qgate.shape[0], qgate.shape[-1] // 2)),
+            positions.new_empty(
+                (qgate.shape[0], token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
+        )
+
+    def run(*args, **kwargs):
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        updated, output, blocks = op(*args, **kwargs)
+        args[10].copy_(updated)
+        return output, blocks
+
+    return run
+
+
+@functools.cache
 def build_pooled_qsa_select_op() -> Callable[..., tuple[torch.Tensor, ...]]:
     """``build_pooled_qsa_op`` up to the indexer, for an attention computed in the
     Qwen3.8 segment megakernel: returns ``(q, gate, pages, kv_lens)``."""

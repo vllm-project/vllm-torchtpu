@@ -8,6 +8,11 @@ selection-independent ops cannot run beside the SparseCore top-k waits (M, j-154
 TensorCore wait per QSA layer at 6,400 rows). With the flag, StreamIndex runs ``early_exit_select``: the
 scoring path always runs and the fast-path rows are taken by a select on the same predicate.
 
+T70g fix (PSTEP-IDX3): the select engages only with the layer's own scheduling-group range (``indexer_group_base``,
+passed by the flag-on op ``pooled_qsa_nocond_step``), because without the cond every QSA layer's chunk groups share
+one computation and a layer that hits a trace cache would reuse an earlier layer's ids ('annotation groups with
+gaps' on the device, T70g j-e61e85e4). The two-layer compile itself is proved by the deviceless tpu7x AOT harness.
+
 The real StreamIndex kernel runs in TPU interpret mode on CPU with the JAX reference top-k standing in for
 the SparseCore selector (test_qwen4_exp_shared_stream_indexer's harness). Rule 23: excess precision is pinned
 off in this file (both arms run the same Pallas bodies inside different program structure), and a one-ulp
@@ -35,9 +40,11 @@ from test_qwen4_exp_shared_stream_indexer import (  # noqa: E402,F401 (interpret
 )
 
 from vllm_torchtpu import envs  # noqa: E402
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config as sconfig  # noqa: E402
 from vllm_torchtpu.kernels.qwen4_exp import pooled_qsa  # noqa: E402
 
 FLAG = "VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND"
+BASE = sconfig.LAYER_SCHEDULING_GROUP_FIRST + 3 * sconfig.LAYER_SCHEDULING_GROUP_STRIDE
 _MISSING = object()
 
 
@@ -93,14 +100,16 @@ def _spy(monkeypatch, backend=None):
 
     def spy(*args, **kwargs):
         seen.append((kwargs.get("enable_early_exit"), kwargs.get("early_exit_select", False)))
+        assert kwargs.get("scheduling_group_base") == (BASE if seen[-1][1] else None), kwargs
         return real(*args, **kwargs)
 
     monkeypatch.setattr(pooled_qsa, "streamindex_topk", spy)
     return seen
 
 
-def _select(args, k):
-    return np.asarray(pooled_qsa.select_blocks(**args, ratio=RATIO, block_topk=k))
+def _select(args, k, base=None):
+    extra = {} if base is None else {"indexer_group_base": base}
+    return np.asarray(pooled_qsa.select_blocks(**args, ratio=RATIO, block_topk=k, **extra))
 
 
 def _visible(args):
@@ -122,7 +131,7 @@ def test_no_cond_is_bit_identical_to_the_cond(monkeypatch, interpret, envset, ca
     assert seen and all(s == (True, False) for s in seen), seen
     seen.clear()
     envset(FLAG, 1)
-    on = _select(args, k)
+    on = _select(args, k, BASE)
     assert seen and all(s == (False, True) for s in seen), seen
     np.testing.assert_array_equal(on, off)
     fast = int(np.max(np.asarray(args["context"]) + np.asarray(q_lens))) // RATIO <= k
@@ -150,9 +159,13 @@ def test_flag_off_passes_no_new_kwarg(monkeypatch, envset):
 
     monkeypatch.setattr(pooled_qsa, "streamindex_topk", capture)
     envset(FLAG, None)
-    with pytest.raises(Stop):
-        pooled_qsa.select_blocks(**inputs(0, [24, 0], [600, 0], 24, "integer"), ratio=RATIO, block_topk=BLOCK_TOPK)
+    for extra in ({}, {"indexer_group_base": BASE}):
+        with pytest.raises(Stop):
+            pooled_qsa.select_blocks(**inputs(0, [24, 0], [600, 0], 24, "integer"), ratio=RATIO,
+                                     block_topk=BLOCK_TOPK, **extra)
+    assert len(seen) == 2 and seen[0] == seen[1], seen
     assert seen[0]["enable_early_exit"] is True and "early_exit_select" not in seen[0]
+    assert "scheduling_group_base" not in seen[0]
 
 
 def test_engagement_line(monkeypatch, envset, caplog):
@@ -167,12 +180,146 @@ def test_engagement_line(monkeypatch, envset, caplog):
     lines = []
     monkeypatch.setattr(
         pooled_qsa, "_log_prefill_no_cond",
-        lambda t, c, e: lines.append((t, c, e)),
+        lambda t, c, e, b: lines.append((t, c, e, b)),
     )
     envset(FLAG, 1)
-    with pytest.raises(Stop):
-        pooled_qsa.select_blocks(**inputs(0, [24, 0], [600, 0], 24, "integer"), ratio=RATIO, block_topk=BLOCK_TOPK)
-    assert lines == [(24, None, True)]
+    for extra in ({"indexer_group_base": BASE}, {}):
+        with pytest.raises(Stop):
+            pooled_qsa.select_blocks(**inputs(0, [24, 0], [600, 0], 24, "integer"), ratio=RATIO,
+                                     block_topk=BLOCK_TOPK, **extra)
+    assert lines == [(24, None, True, BASE), (24, None, False, None)]
+
+
+def test_engagement_line_text_keeps_the_reader_form(caplog):
+    """The locked engagement reader (q38_pidx_nceng.py ENG_RE, re.search) must still parse the line: the group base
+    is appended after the closing parenthesis."""
+    import logging
+    import re
+
+    eng_re = re.compile(r'q38 PSTEP-IDX prefill indexer no-cond (ENGAGED|NOT ENGAGED): tokens (\d+), chunk (\S+?) '
+                        r'\(VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND\)')
+    pooled_qsa._Q38_PREFILL_NO_COND_LOGGED.clear()
+    with caplog.at_level(logging.INFO):
+        pooled_qsa._log_prefill_no_cond(6400, 640, True, BASE)
+        pooled_qsa._log_prefill_no_cond(6400, 640, True, BASE + sconfig.LAYER_SCHEDULING_GROUP_STRIDE)
+        pooled_qsa._log_prefill_no_cond(6400, 640, True, BASE)
+    text = [r.getMessage() for r in caplog.records if "PSTEP-IDX prefill indexer no-cond" in r.getMessage()]
+    assert len(text) == 2, text
+    for t, b in zip(text, (BASE, BASE + sconfig.LAYER_SCHEDULING_GROUP_STRIDE)):
+        m = eng_re.search(t)
+        assert m and m.groups() == ("ENGAGED", "6400", "640"), t
+        assert t.endswith(f" group base {b}"), t
+
+
+def test_flag_on_without_a_group_base_keeps_the_cond(monkeypatch, interpret, envset):
+    """A call without the layer's range (any op other than the no-cond op) keeps today's cond, bit for bit."""
+    q_lens, context, tokens, k, chunk = CASES["long_k16_chunk8"]
+    args = inputs(7, q_lens, context, tokens, "integer")
+    envset("VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK", chunk)
+    envset("VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY", None)
+    seen = _spy(monkeypatch)
+    envset(FLAG, None)
+    off = _select(args, k)
+    envset(FLAG, 1)
+    on = _select(args, k)
+    assert seen == [(True, False), (True, False)], seen
+    np.testing.assert_array_equal(on, off)
+
+
+class _GroupSpy(ReferenceTopK):
+    """ReferenceTopK that overlaps scoring (so the chunk pipeline is annotated) and records the group of each top-k."""
+
+    overlaps_scoring = True
+    ids: list = []
+
+    def select(self, score_bits, k, row_lengths, *, scheduling_group_id, return_scores):
+        _GroupSpy.ids.append(scheduling_group_id)
+        return super().select(score_bits, k, row_lengths, scheduling_group_id=scheduling_group_id,
+                              return_scores=return_scores)
+
+    def __hash__(self):
+        return 2
+
+    def __eq__(self, other):
+        return isinstance(other, _GroupSpy)
+
+
+def test_group_ids_come_from_the_layer_range(monkeypatch, interpret, envset):
+    """Flag on with a base: chunk g's top-k carries group base + g (the last chunk none), the process counter is never
+    touched, and two layers with their own ranges get disjoint ids even when the second call would hit the jit cache
+    of the first (same shapes and statics apart from the base)."""
+    q_lens, context, tokens, k, chunk = CASES["long_k16_chunk8"]
+    args = inputs(9, q_lens, context, tokens, "integer")
+    envset("VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK", chunk)
+    envset("VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY", None)
+    envset(FLAG, 1)
+    real = functools.partial(streamindex.streamindex_topk, topk_backend=_GroupSpy())
+    monkeypatch.setattr(pooled_qsa, "streamindex_topk", real)
+
+    def no_counter(count):
+        raise AssertionError("reserve_scheduling_group_ids called on the based path")
+
+    monkeypatch.setattr(sconfig, "reserve_scheduling_group_ids", no_counter)
+    chunks = tokens // chunk
+    other = BASE + sconfig.LAYER_SCHEDULING_GROUP_STRIDE
+    got = {}
+    for base in (BASE, other):
+        _GroupSpy.ids = []
+        _select(args, k, base)
+        got[base] = list(_GroupSpy.ids)
+    assert got[BASE] == [BASE + g for g in range(chunks - 1)] + [None], got
+    assert got[other] == [other + g for g in range(chunks - 1)] + [None], got
+    assert not set(got[BASE]) - {None} & set(got[other]) - {None}
+    print(f"Q38_PSTEP_IDX_GROUPS chunks={chunks} layer_a={got[BASE]} layer_b={got[other]}")
+
+
+def test_scheduling_group_base_validation():
+    args = dict(q=jnp.zeros((8, 4, 128), jnp.bfloat16), indexer_weights=jnp.zeros((8, 4), jnp.float32),
+                cache_kv=jnp.zeros((4, 16, 2, 128), jnp.bfloat16), seq_lens=jnp.zeros((2,), jnp.int32),
+                page_indices=jnp.zeros((8,), jnp.int32), cu_q_lens=jnp.zeros((3,), jnp.int32),
+                distribution=jnp.zeros((3,), jnp.int32))
+    for bad in (dict(scheduling_group_base=BASE), dict(scheduling_group_base=BASE, enable_early_exit=True),
+                dict(scheduling_group_base=0, early_exit_select=True)):
+        with pytest.raises(ValueError, match="scheduling_group_base|early_exit_select"):
+            streamindex.streamindex_topk(**args, k=16, compression_ratio=4, num_kv_pages_per_block=1,
+                                         num_queries_per_block=8, **bad)
+
+
+def test_layer_range_is_checked_against_the_chunk_count(monkeypatch, interpret, envset):
+    q_lens, context, tokens, k, chunk = CASES["long_k16_chunk8"]
+    args = inputs(11, q_lens, context, tokens, "integer")
+    envset("VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK", chunk)
+    envset("VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY", None)
+    envset(FLAG, 1)
+    monkeypatch.setattr(pooled_qsa, "streamindex_topk",
+                        functools.partial(streamindex.streamindex_topk, topk_backend=_GroupSpy()))
+    monkeypatch.setattr(sconfig, "LAYER_SCHEDULING_GROUP_STRIDE", tokens // chunk - 2)
+    with pytest.raises(ValueError, match="more than a layer's range"):
+        _select(args, k, BASE + 1)
+
+
+def test_layer_scheduling_group_base(monkeypatch):
+    monkeypatch.setattr(sconfig, "_layer_scheduling_group_bases", {})
+    a = sconfig.layer_scheduling_group_base("model.layers.6.self_attn")
+    b = sconfig.layer_scheduling_group_base("model.layers.11.self_attn")
+    assert a == sconfig.LAYER_SCHEDULING_GROUP_FIRST
+    assert b == a + sconfig.LAYER_SCHEDULING_GROUP_STRIDE
+    assert sconfig.layer_scheduling_group_base("model.layers.6.self_attn") == a
+    sconfig.reset_scheduling_group_ids()  # a new program restarts the counter, never the layer ranges
+    assert sconfig.layer_scheduling_group_base("model.layers.11.self_attn") == b
+    assert sconfig.reserve_scheduling_group_ids(15) == 1 and a > 15
+
+
+def test_flag_off_op_and_step_are_unchanged():
+    """The flag-off torch op wraps pooled_qsa_step with today's signature (its schema and torch_tpu kernel key come
+    from it); the no-cond op is a separate step with one extra static argument."""
+    import inspect
+
+    off = inspect.signature(pooled_qsa.pooled_qsa_step)
+    on = inspect.signature(pooled_qsa.pooled_qsa_nocond_step)
+    assert "indexer_group_base" not in off.parameters
+    assert list(on.parameters) == list(off.parameters) + ["indexer_group_base"]
+    assert on.parameters["indexer_group_base"].default == 0
 
 
 def test_early_exit_select_validation():
@@ -195,7 +342,7 @@ def test_positive_control_one_ulp_score_change_is_not_identical(monkeypatch, int
     envset("VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK", chunk)
     envset(FLAG, 1)
     _spy(monkeypatch)
-    base = _select(args, k)
+    base = _select(args, k, BASE)
 
     class OneUlp(ReferenceTopK):
         """Adds one ulp to the first row's best-ranked loser that ties the k-th winner (integer data ties often)."""
@@ -217,7 +364,7 @@ def test_positive_control_one_ulp_score_change_is_not_identical(monkeypatch, int
             return isinstance(other, OneUlp)
 
     _spy(monkeypatch, OneUlp())
-    bumped = _select(args, k)
+    bumped = _select(args, k, BASE)
     assert not np.array_equal(bumped, base), "one-ulp positive control read identical"
     print(f"Q38_PSTEP_IDX_POSCTL case={case} identical=0")
 

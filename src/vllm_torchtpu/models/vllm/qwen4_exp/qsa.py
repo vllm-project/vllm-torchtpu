@@ -598,16 +598,41 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         keywords.pop("main_slot", None)
         keywords.pop("max_query_len", None)
         keywords.pop("cmp_stats", None)
+        keywords.pop("indexer_group_base", None)
         if self.max_query_len > 1:
             keywords["max_query_len"] = self.max_query_len
         if slot:
             keywords["compressed_slot"] = slot
         if main_slot >= 0:
             keywords["main_slot"] = main_slot
-        self._op = partial(build_pooled_qsa_op(), **keywords)
+        if vllm_torchtpu_envs.VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND:
+            # q38 PSTEP-IDX: the no-cond op with this layer's own scheduling-group
+            # range for the ragged prefill indexer (T70g j-e61e85e4).
+            from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+                config as streamindex_config,
+            )
+            from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                build_pooled_qsa_nocond_op,
+            )
+
+            self._op = partial(
+                build_pooled_qsa_nocond_op(),
+                indexer_group_base=streamindex_config.layer_scheduling_group_base(
+                    self.prefix
+                ),
+                **keywords,
+            )
+        else:
+            self._op = partial(build_pooled_qsa_op(), **keywords)
         from . import compare_core_stats
 
         if compare_core_stats.enabled() and "mtp" not in self.prefix:
+            if vllm_torchtpu_envs.VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND:
+                # The no-cond op has no compare-core stats output (merge of both lines).
+                raise ValueError(
+                    "VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS cannot be combined with "
+                    "VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND"
+                )
             # VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS: the op folds its counters into this layer's buffer.
             self._op = partial(self._op, cmp_stats=compare_core_stats.register(self, pool.device))
         self._rows_op = partial(build_pooled_qsa_rows_op(), **keywords)

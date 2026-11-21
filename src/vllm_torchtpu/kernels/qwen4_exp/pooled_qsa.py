@@ -1229,19 +1229,23 @@ PREFILL_PAGE_TABLE_SMEM_BYTES = 512 * 1024
 _Q38_PREFILL_NO_COND_LOGGED: set = set()
 
 
-def _log_prefill_no_cond(tokens: int, chunk: int | None, engaged: bool) -> None:
-    """q38 PSTEP-IDX engagement line (rule 13): one INFO line per traced ragged prefill indexer shape and process
-    when VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND is set. 'ENGAGED' = the early-exit cond is replaced by a select;
-    'NOT ENGAGED' = a sharded / DCP indexer keeps its own path. Trace time only (a compile-cache hit prints nothing)."""
-    key = (tokens, chunk, engaged)
+def _log_prefill_no_cond(
+    tokens: int, chunk: int | None, engaged: bool, group_base: int | None = None
+) -> None:
+    """q38 PSTEP-IDX engagement line (rule 13): one INFO line per traced ragged prefill indexer shape, layer group
+    base and process when VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND is set. 'ENGAGED' = the early-exit cond is replaced
+    by a select; 'NOT ENGAGED' = a sharded / DCP indexer, or a call without a layer group base (an op other than
+    the layer's no-cond op), keeps the cond. Trace time only (a compile-cache hit prints nothing)."""
+    key = (tokens, chunk, engaged, group_base)
     if key in _Q38_PREFILL_NO_COND_LOGGED:
         return
     _Q38_PREFILL_NO_COND_LOGGED.add(key)
     from vllm_torchtpu.logger import init_logger
 
     init_logger(__name__).info(
-        "q38 PSTEP-IDX prefill indexer no-cond %s: tokens %d, chunk %s (VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND)",
-        "ENGAGED" if engaged else "NOT ENGAGED", tokens, chunk,
+        "q38 PSTEP-IDX prefill indexer no-cond %s: tokens %d, chunk %s (VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND)"
+        " group base %s",
+        "ENGAGED" if engaged else "NOT ENGAGED", tokens, chunk, group_base,
     )
 
 
@@ -1278,6 +1282,7 @@ def select_blocks(
     shard=None,
     dcp=None,
     after_scoring=None,
+    indexer_group_base=None,
 ):
     """Read BF16 key tiles directly from the carrier, without a cache conversion.
 
@@ -1292,12 +1297,21 @@ def select_blocks(
     indexer reads (the main K/V write). It runs after the last scoring read of
     ``pool``, free to overlap the last SparseCore top-k (mode 1 puts both in one
     XLA scheduling group), and the call returns ``(blocks, updated pool)``.
+
+    ``indexer_group_base`` (VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND): the layer's
+    fixed scheduling-group range (``streamindex_topk`` ``scheduling_group_base``).
+    The ragged prefill indexer drops its early-exit cond only with one.
     """
     if dcp is None:
         return _select_blocks(
             query, pool, lengths, table, req, starts, context, ratio=ratio,
             block_topk=block_topk, slot=slot, max_query_len=max_query_len,
             shard=shard, after_scoring=after_scoring,
+            **(
+                {"indexer_group_base": indexer_group_base}
+                if indexer_group_base is not None
+                else {}
+            ),
         )
     if shard is not None:
         raise ValueError("select_blocks: shard= and dcp= are exclusive")
@@ -1326,6 +1340,7 @@ def _select_blocks(
     shard=None,
     dcp=None,
     after_scoring=None,
+    indexer_group_base=None,
 ):
     """``select_blocks``; under ``dcp`` the local top-k as int32 [T, k, 2]
     (score bits, global group id).
@@ -1456,12 +1471,17 @@ def _select_blocks(
             pages = expand_pages(table).reshape(len(table), -1)
         # q38 PSTEP-IDX (VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND): the same
         # result as the early-exit cond, taken by a select, so XLA can run the
-        # layer's selection-independent ops beside the SparseCore top-k.
+        # layer's selection-independent ops beside the SparseCore top-k. Only
+        # with the layer's own scheduling-group range: without the cond every
+        # layer's chunk groups share one computation (T70g j-e61e85e4).
         no_cond = (
-            envs.VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND and shard is None and dcp is None
+            envs.VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND
+            and shard is None
+            and dcp is None
+            and indexer_group_base is not None
         )
         if envs.VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND:
-            _log_prefill_no_cond(len(query), chunk_tokens, no_cond)
+            _log_prefill_no_cond(len(query), chunk_tokens, no_cond, indexer_group_base)
         return topk(
             jnp.pad(query, ((0, 0), (0, 0), (0, width - query.shape[-1]))),
             jnp.full(query.shape[:2], query.shape[-1] ** -0.5, jnp.float32),
@@ -1476,7 +1496,11 @@ def _select_blocks(
             num_queries_per_block=(1,) + (envs.VLLM_TPU_QSA_PREFILL_INDEXER_BQ,) * 2,
             decode_req_batch_size=8,
             enable_early_exit=not no_cond,
-            **({"early_exit_select": True} if no_cond else {}),
+            **(
+                {"early_exit_select": True, "scheduling_group_base": indexer_group_base}
+                if no_cond
+                else {}
+            ),
             chunk_tokens=chunk_tokens,
             components=qsa_indexing(ratio - 1, table_expansion=expansion),
             # VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: as the decode flag, for
@@ -1888,6 +1912,7 @@ def _pooled_qsa(
     compressed_dcp: bool = False,
     indexer_writes: bool = True,
     token_shard_decode: bool = False,
+    indexer_group_base: int | None = None,
 ) -> tuple[jax.Array, ...]:
     """One QSA layer over the unified pool.
 
@@ -2109,6 +2134,12 @@ def _pooled_qsa(
             slot=compressed_slot,
             max_query_len=max_query_len,
             **({"after_scoring": deferred[0]} if overlap else {}),
+            # q38 PSTEP-IDX: only pooled_qsa_nocond_step passes one.
+            **(
+                {"indexer_group_base": indexer_group_base}
+                if indexer_group_base is not None
+                else {}
+            ),
         )
         if overlap:
             blocks, pool = blocks
@@ -2695,6 +2726,73 @@ def pooled_qsa_step(
         compressed_slot,
         main_slot,
         max_query_len=max_query_len,
+    )
+
+
+def pooled_qsa_nocond_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    indexer_group_base: int = 0,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_step`` for VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND (q38 PSTEP-IDX).
+
+    ``indexer_group_base`` (> 0) is the layer's fixed scheduling-group range for
+    the ragged prefill indexer without its early-exit cond. As a static argument
+    of this op it is part of torch_tpu's kernel key and of the jit keys below, so
+    a stage's QSA layers never share one exported module and its group ids
+    (T70g j-e61e85e4: 'annotation groups with gaps' on every 2-QSA stage). 0
+    keeps the cond. The flag-off op (``pooled_qsa_step``) is unchanged.
+    """
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        indexer_group_base=indexer_group_base if indexer_group_base > 0 else None,
     )
 
 
