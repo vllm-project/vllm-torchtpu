@@ -136,6 +136,9 @@ NON_FULL_ATTN_TOKENS: frozenset[str] = frozenset(
 ACTIVATION_BYTES_BF16: float = 2.0
 MATMUL_FLOP_PER_MAC: float = 2.0
 CAUSAL_MIDPOINT_HALF: float = 0.5
+# Draft fc weight maps concatenated token embedding and target hidden state
+# (two hidden-size vectors) to one hidden vector.
+DRAFT_PROJECTION_HIDDEN_VECTORS: float = 2.0
 UNIT_KILO: float = 1.0e3
 UNIT_MEGA: float = 1.0e6
 UNIT_GIGA: float = 1.0e9

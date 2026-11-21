@@ -25,6 +25,10 @@ from tests.compilation.test_graph_fingerprint import (
     _trace_all_reduce_graph,
     install_group_stand_ins,
 )
+from vllm_torchtpu.compilation.tpu_compiler import (
+    _TPU_COMPILE_ENV_IGNORED,
+    _tpu_compile_env_factors,
+)
 from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
 
 
@@ -406,6 +410,19 @@ class TestTpuCompilerCache:
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED
         assert not serving_only & set(_tpu_compile_env_factors())
+
+    def test_hf_env_vars_excluded_from_tpu_compile_cache_key(self) -> None:
+        """Hugging Face local cache and auth tokens must not pollute compile cache."""
+        hf_vars = {
+            "HF_HUB_CACHE",
+            "HF_HOME",
+            "HF_TOKEN",
+            "HUGGING_FACE_HUB_TOKEN",
+            "HF_HUB_OFFLINE",
+            "TRANSFORMERS_OFFLINE",
+        }
+        assert hf_vars <= _TPU_COMPILE_ENV_IGNORED
+        assert not hf_vars & set(_tpu_compile_env_factors())
 
     def test_every_registry_entry_is_hashed_or_deliberately_ignored(self):
         """The two sets must partition the registry, so a new entry forces a
