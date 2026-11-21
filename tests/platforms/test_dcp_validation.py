@@ -30,10 +30,14 @@ import torch
 # Initialize vLLM's plugin registry before importing the plugin package.
 import vllm  # noqa: F401
 from vllm.config import KVTransferConfig, ModelConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+    MultiConnector,
+)
 from vllm.transformers_utils.config import get_config, get_hf_text_config
 
 from vllm_torchtpu.platforms.dcp_validation import (
     DcpStaticSupportValidator,
+    _child_configs,
     admissible_dcp_sizes,
 )
 
@@ -408,12 +412,6 @@ def test_multiconnector_children_are_the_configs_vllm_builds_them_from(connector
     private _get_connector_classes_and_configs, compared here so that a change
     in vLLM fails this test rather than the check), each with its entry's own
     extra config, where use_raiden_connector lives."""
-    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
-        MultiConnector,
-    )
-
-    from vllm_torchtpu.platforms.dcp_validation import _child_configs
-
     config = _vllm_config(connector=connector)
     ours = [child.kv_transfer_config for child in _child_configs(config)]
     vllms = [
@@ -431,12 +429,6 @@ def test_multiconnector_children_are_the_configs_vllm_builds_them_from(connector
 def test_multiconnector_children_cannot_set_their_own_engine_id():
     """vLLM's MultiConnector refuses an entry with its own engine_id, and so
     does the check's reading of it."""
-    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
-        MultiConnector,
-    )
-
-    from vllm_torchtpu.platforms.dcp_validation import _child_configs
-
     own_id = {**_OFFLOAD, "engine_id": "offload-0"}
     config = _vllm_config(connector=_multi("kv_producer", _RAIDEN, own_id))
     with pytest.raises(TypeError, match="engine_id"):
