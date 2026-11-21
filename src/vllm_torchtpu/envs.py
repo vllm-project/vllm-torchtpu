@@ -114,7 +114,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_RING_DMA_BATCH: int = 0
     VLLM_TPU_QSA_COMPRESSED_RUN_WRITE: bool = True
     VLLM_TPU_QSA_COMPRESSED_RUN_WRITE_MIN_TOKENS: int = 512
-    VLLM_TPU_QSA_MAIN_RUN_WRITE: bool = False
+    VLLM_TPU_QSA_MAIN_RUN_WRITE: bool = True
     VLLM_TPU_QSA_MAIN_RUN_WRITE_MIN_TOKENS: int = 512
     VLLM_TPU_QSA_MAIN_RUN_WRITE_TILE: int = 512
     VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
@@ -818,7 +818,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (kernels/qwen4_exp/main_write.py): one DMA per run of consecutive rows
     # (power-of-two pieces), all in flight, instead of per-row DMAs in every
     # 128-token tile that is not page aligned and fully valid.
-    "VLLM_TPU_QSA_MAIN_RUN_WRITE": env_bool("VLLM_TPU_QSA_MAIN_RUN_WRITE", default=False),
+    "VLLM_TPU_QSA_MAIN_RUN_WRITE": env_bool("VLLM_TPU_QSA_MAIN_RUN_WRITE", default=True),
     # With VLLM_TPU_QSA_MAIN_RUN_WRITE: steps with fewer rows keep the tiled writers.
     "VLLM_TPU_QSA_MAIN_RUN_WRITE_MIN_TOKENS": env_nonnegative_int(
         "VLLM_TPU_QSA_MAIN_RUN_WRITE_MIN_TOKENS", 512
