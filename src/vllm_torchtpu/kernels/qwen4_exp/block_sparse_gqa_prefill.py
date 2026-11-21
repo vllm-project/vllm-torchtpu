@@ -17,7 +17,10 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.batched_rpa import utils
 from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import PAIRED_PAGE_VMEM_MIB
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
-from vllm_torchtpu.kernels.qwen4_exp.row_segments import copy_row_segments
+from vllm_torchtpu.kernels.qwen4_exp.row_segments import (
+    align_row_blocks,
+    copy_row_segments,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -1898,7 +1901,9 @@ def _aligned_block_sources(starts, offsets, real, rows, query_block, max_tokens)
     ``j < count[b]``, then fill rows. Returns ``(first, count)``, int32
     ``[max_tokens // query_block]``. Same placement as the
     ``.at[slots].set(mode="drop")`` scatter (``starts[0] == 0``, sorted
-    ``starts``), so the aligned tensors are bit-identical.
+    ``starts``), so tensors aligned row by row from it are bit-identical (the
+    VLLM_TPU_QSA_PREFILL_ALIGN_DMA page table only on the rows the core reads,
+    see ``align_table`` in ``block_sparse_gqa_attention``).
     """
     assert max_tokens % query_block == 0, (max_tokens, query_block)
     block = jnp.arange(max_tokens // query_block, dtype=jnp.int32) * query_block
@@ -2032,9 +2037,26 @@ def block_sparse_gqa_attention(
                     count,
                     max_length=query_block,
                 )
+            if dma:
+                return align_row_blocks(
+                    array, first, count, block=query_block, fill=fill
+                )
             if envs.VLLM_TPU_QSA_PREFILL_ALIGN_GATHER:
                 return _gather_aligned_blocks(array, first, count, query_block, fill)
             return jnp.full(shape, fill, array.dtype).at[slots].set(array, mode="drop")
+
+        def align_table(table):
+            if not dma:
+                return align(table, 0)
+            # The core reads one page-table row per query block, its first
+            # (``page_table.reshape(nblocks, query_block, -1)[:, 0]`` in
+            # _block_sparse_gqa_prefill and _prepare_metadata_bounded): give
+            # every row of a block that row, 0 for an empty block. A core
+            # reading other rows must drop this.
+            rows = table[jnp.clip(first, 0, len(table) - 1)]
+            rows = jnp.where((count > 0)[:, None], rows, 0)
+            shape = (len(first), query_block, table.shape[1])
+            return jnp.broadcast_to(rows[:, None], shape).reshape(max_tokens, -1)
 
         back = jnp.minimum(slots, max_tokens - 1)
 
@@ -2056,7 +2078,7 @@ def block_sparse_gqa_attention(
             align(query, 0),
             align(blocks, -1),
             align(lengths, 0),
-            align(page_table, 0),
+            align_table(page_table),
             cache,
             ratio=ratio,
             kv_heads=kv_heads,

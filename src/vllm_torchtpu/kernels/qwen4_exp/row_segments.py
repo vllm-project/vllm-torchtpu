@@ -88,3 +88,69 @@ def copy_row_segments(
         src,
         dst,
     )
+
+
+_ROW_TILE = 8  # rows per HBM tile of a 32-bit [rows, width] array
+
+
+def _block_kernel(
+    start_ref, shift_ref, count_ref, src_ref, out_ref, window, sem, *, fill
+):
+    b = pl.program_id(0)
+    copy = pltpu.make_async_copy(
+        src_ref.at[pl.ds(pl.multiple_of(start_ref[b], _ROW_TILE), window.shape[0])],
+        window,
+        sem,
+    )
+    copy.start()
+    copy.wait()
+    rows = out_ref.shape[0]
+    shift = (window.shape[0] - shift_ref[b]) % window.shape[0]
+    x = pltpu.roll(window[...], shift, 0)[:rows]
+    keep = lax.broadcasted_iota(jnp.int32, x.shape, 0) < count_ref[b]
+    out_ref[...] = jnp.where(keep, x, jnp.asarray(fill, x.dtype))
+
+
+def align_row_blocks(src, first, count, *, block, fill, interpret=False):
+    """``out[b * block + j] = src[first[b] + j]`` for ``j < count[b]``, else ``fill``.
+
+    For a ``[rows]`` or ``[rows, width]`` array, whose row dimension is tiled
+    in HBM so a DMA cannot start at any row: each block DMAs a tile-aligned
+    window of ``block + 8`` rows into VMEM and rotates its first row into
+    place. Needs ``first[b] + count[b] <= rows``. VMEM per step: the window
+    plus two output blocks and the rotate / select temporaries, about
+    5 x block x width x 4 bytes (5 MiB at 512 x 512), inside the default
+    scoped limit for the QSA shapes.
+    """
+    vector = src.ndim == 1
+    if vector:
+        src = src[:, None]
+    if src.ndim != 2 or src.dtype.itemsize != 4 or block % _ROW_TILE:
+        raise ValueError(f"row blocks of {src.shape} by {block}")
+    rows = max(-(-src.shape[0] // _ROW_TILE) * _ROW_TILE, block + _ROW_TILE)
+    if rows != src.shape[0]:
+        src = jnp.pad(src, ((0, rows - src.shape[0]), (0, 0)))
+    window = block + _ROW_TILE
+    # The window [start, start + window) holds rows [first, first + count).
+    start = jnp.clip(first - first % _ROW_TILE, 0, rows - window)
+    shift = jnp.clip(first - start, 0, window - 1)
+    out = pl.pallas_call(
+        functools.partial(_block_kernel, fill=fill),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(first.shape[0],),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec((block, src.shape[1]), lambda b, *_: (b, 0)),
+            scratch_shapes=[
+                pltpu.VMEM((window, src.shape[1]), src.dtype),
+                pltpu.SemaphoreType.DMA,
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+        out_shape=jax.ShapeDtypeStruct(
+            (first.shape[0] * block, src.shape[1]), src.dtype
+        ),
+        interpret=interpret,
+        name="align_row_blocks",
+    )(start.astype(jnp.int32), shift.astype(jnp.int32), count.astype(jnp.int32), src)
+    return out[:, 0] if vector else out

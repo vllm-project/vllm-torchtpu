@@ -2519,9 +2519,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_ALIGN_GATHER": env_bool("VLLM_TPU_QSA_PREFILL_ALIGN_GATHER"),
     # QSA prefill block alignment: move the [rows, heads, dim] query into the
     # aligned layout and the attention output back to token order as one DMA
-    # per contiguous row run (row_segments.copy_row_segments) instead of a
-    # per-row scatter / gather. Bit-identical; inputs of fewer than 3
-    # dimensions follow VLLM_TPU_QSA_PREFILL_ALIGN_GATHER.
+    # per contiguous row run (row_segments.copy_row_segments), the 32-bit
+    # blocks / lengths through a tile-aligned VMEM window per query block
+    # (row_segments.align_row_blocks), and give each aligned block its first
+    # page-table row (the only one the kernel reads), instead of per-row
+    # scatters and gathers. The attention output is bit-identical.
     "VLLM_TPU_QSA_PREFILL_ALIGN_DMA": env_bool("VLLM_TPU_QSA_PREFILL_ALIGN_DMA"),
     # Main-KV DCP attention: route the partial output and its lse as two arrays
     # instead of one [.., D + 1] channel (a padded f32 concat plus the slices

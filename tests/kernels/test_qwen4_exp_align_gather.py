@@ -23,7 +23,10 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import sorted_search
 from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill as bsp
-from vllm_torchtpu.kernels.qwen4_exp.row_segments import copy_row_segments
+from vllm_torchtpu.kernels.qwen4_exp.row_segments import (
+    align_row_blocks,
+    copy_row_segments,
+)
 
 # (gather, sorted, dma)
 COMBOS = [(g, s, False) for g, s in itertools.product([False, True], [False, True])]
@@ -65,7 +68,10 @@ def recorder(monkeypatch):
 
         jax.debug.callback(keep, query, blocks, lengths, page_table)
         value = query.astype(jnp.float32) * (lengths[:, None, None] + 1)
-        value = value + page_table[:, :1, None].astype(jnp.float32)
+        # Like the real core, read one page-table row per query block.
+        table = page_table.reshape(-1, query_block, page_table.shape[1])[:, :1, :1]
+        table = jnp.broadcast_to(table, (len(query) // query_block, query_block, 1))
+        value = value + table.reshape(-1, 1, 1).astype(jnp.float32)
         value = value + blocks[:, :1, None].astype(jnp.float32) * 0.5
         if kw.get("return_lse"):
             lse = jnp.where(lengths[:, None] > 0, value[:, :, 0], -jnp.inf)
@@ -142,8 +148,16 @@ def test_aligned_inputs_and_output_match(
         )
     base_inputs, base_out = results[False, False, False]
     for key, (inputs, out) in results.items():
-        for a, b in zip(inputs, base_inputs):
+        *rows, table = inputs
+        for a, b in zip(rows, base_inputs):
             _assert_same(a, b)
+        # The core reads one page-table row per query block, its first.
+        def firsts(t):
+            return t.reshape(-1, query_block, t.shape[1])[:, 0]
+
+        _assert_same(firsts(table), firsts(base_inputs[3]))
+        if not key[2]:
+            _assert_same(table, base_inputs[3])
         for a, b in zip(out, base_out):
             _assert_same(a, b)
 
@@ -186,9 +200,10 @@ def test_aligned_blocks_vs_scatter(query_block, extra_blocks):
         starts = np.r_[0, np.cumsum(real)].astype(np.int32)
         padded = -(-real // query_block) * query_block
         offsets = np.r_[0, np.cumsum(padded)].astype(np.int32)
-        req = np.minimum(np.searchsorted(starts[1:], np.arange(tokens), side="right"), nreq - 1)
-        valid = np.arange(tokens) < starts[-1]
-        slots = np.where(valid, offsets[req] + np.arange(tokens) - starts[req], max_tokens)
+        token = np.arange(tokens)
+        req = np.minimum(np.searchsorted(starts[1:], token, side="right"), nreq - 1)
+        valid = token < starts[-1]
+        slots = np.where(valid, offsets[req] + token - starts[req], max_tokens)
         data = rng.integers(0, 1 << 30, (tokens, 3)).astype(np.int32)
         want = np.full((max_tokens, 3), -1, np.int32)
         keep = slots < max_tokens
@@ -223,6 +238,38 @@ def test_copy_row_segments(interpret):
             max_length=64,
         )
         _assert_same(got, want)
+
+
+@pytest.mark.parametrize("width", [None, 1, 24])
+@pytest.mark.parametrize("query_block", [32, 128])
+def test_align_row_blocks_vs_scatter(interpret, width, query_block):
+    """The tile-aligned VMEM window plus rotate gives the scatter's layout."""
+    rng = np.random.default_rng(width or 0)
+    for _ in range(20):
+        nreq = int(rng.integers(1, 12))
+        real = rng.integers(0, 3 * query_block, nreq) * (rng.random(nreq) < 0.8)
+        tokens = max(int(real.sum() + rng.integers(0, 40)), 1)
+        max_tokens = (-(-tokens // query_block) + int(rng.integers(0, 3))) * query_block
+        starts = np.r_[0, np.cumsum(real)].astype(np.int32)
+        padded = -(-real // query_block) * query_block
+        offsets = np.r_[0, np.cumsum(padded)].astype(np.int32)
+        token = np.arange(tokens)
+        req = np.minimum(np.searchsorted(starts[1:], token, side="right"), nreq - 1)
+        valid = token < starts[-1]
+        slots = np.where(valid, offsets[req] + token - starts[req], max_tokens)
+        shape = (tokens,) if width is None else (tokens, width)
+        data = rng.integers(0, 1 << 30, shape).astype(np.int32)
+        want = np.full((max_tokens, *shape[1:]), -1, np.int32)
+        keep = slots < max_tokens
+        want[slots[keep]] = data[keep]
+        first, count = bsp._aligned_block_sources(
+            jnp.asarray(starts), jnp.asarray(offsets), jnp.asarray(real, jnp.int32),
+            tokens, query_block, max_tokens,
+        )
+        got = align_row_blocks(
+            jnp.asarray(data), first, count, block=query_block, fill=-1
+        )
+        np.testing.assert_array_equal(np.asarray(got), want)
 
 
 # ---- Part 2: the real kernel in interpret mode, DCP ranks 0 and 1 ----
