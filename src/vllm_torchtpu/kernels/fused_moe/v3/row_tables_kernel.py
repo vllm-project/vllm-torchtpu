@@ -221,6 +221,7 @@ def scatter_row_tables(
     chunk=None,
     chunk_max=SCATTER_CHUNK_PAIRS_DEFAULT,
     ring=SCATTER_RING_DEFAULT,
+    routed_rows=None,
 ):
     """Fills the two row tables on the sparse cores, in place.
 
@@ -235,10 +236,11 @@ def scatter_row_tables(
         Token t's scale in plane p is the f32 bits of word
         (t // tokens_per_shard) * message_words + scale_offset +
         p * plane_words + t % tokens_per_shard.
-      token_table: [routed_rows] int32, zeroed.
+      token_table: [table rows] int32, zeroed, at least routed_rows rows;
+        the rows from routed_rows on stay zero.
       scale_table: [n_scales * scale words] int32, zeroed; plane p of a
-        row's scales at word p * scale words + row, scale words >=
-        routed_rows.
+        row's scales at word p * scale words + row, scale words >= the
+        token table's rows.
       n_scales: scale words per token (one, or one per activation block).
       plane_words: words between one token's scale planes in its shard's
         routing message.
@@ -254,6 +256,9 @@ def scatter_row_tables(
         and whose ring of buffers fits a vector subcore's VMEM.
       chunk_max: the longest chunk None may take.
       ring: chunks in flight per subcore.
+      routed_rows: the drop row: a pair whose routed row is at or past it
+        lands nowhere. The token table's length when None; at most that
+        length (the table may be padded past the routed rows).
 
     Returns:
       (token_table, scale_table) filled: the token of each routed row and
@@ -314,17 +319,23 @@ def scatter_row_tables(
             f"for {n_scales} planes of {tokens_per_shard} scales at word "
             f"{scale_offset}"
         )
-    routed_rows = token_table.shape[0]
+    table_rows = token_table.shape[0]
+    if routed_rows is None:
+        routed_rows = table_rows
+    if not 0 < routed_rows <= table_rows:
+        raise ValueError(
+            f"the drop row {routed_rows} is outside the token table's {table_rows} rows"
+        )
     if scale_table.shape[0] % n_scales:
         raise ValueError(
             f"the scale table ({scale_table.shape[0]} words) is "
             f"not {n_scales} equal planes"
         )
     scale_words = scale_table.shape[0] // n_scales
-    if scale_words < routed_rows:
+    if scale_words < table_rows:
         raise ValueError(
             f"a scale plane ({scale_words} words) is shorter "
-            f"than the token table ({routed_rows}). The FFN "
+            f"than the token table ({table_rows}). The FFN "
             "kernel's window reads run past the last routed row"
         )
     if ring < 2:
@@ -395,7 +406,7 @@ def scatter_row_tables(
             message_tokens=message_tokens,
         ),
         out_types=[
-            jax.ShapeDtypeStruct((routed_rows,), jnp.int32),
+            jax.ShapeDtypeStruct((table_rows,), jnp.int32),
             jax.ShapeDtypeStruct((n_scales * scale_words,), jnp.int32),
         ],
         mesh=mesh,
