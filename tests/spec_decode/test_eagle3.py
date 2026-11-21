@@ -820,7 +820,7 @@ def test_prepare_draft_inputs_async_device_with_discard(device):
     discarded request's seed token on-device via ov_tokens while staying on the
     bucketed _draft_async_prepare_inputs path."""
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=[f"r{i}" for i in range(8)]),
         device=device,
         requests={
@@ -829,10 +829,6 @@ def test_prepare_draft_inputs_async_device_with_discard(device):
         },
         num_tokens_paddings=[16, 32, 64, 128],
         _dp_lockstep_enabled=lambda: False,
-        # The runner's input-staging fence (stage_h2d_upload).
-        _unfenced_h2d_sources=[],
-        _registered_h2d_sources=set(),
-        _free_h2d_sources={},
     )
     scheduler_output = SimpleNamespace(
         num_scheduled_tokens={"r0": 4, "r1": 8},
@@ -3457,7 +3453,7 @@ def test_prepare_draft_inputs_device_seed_pure_partial_prefill_uses_bucketed_fas
     bucket-padded last_token_indices and next_token_ids directly on CPU without
     slicing or mutating device_seed."""
     proposer = _make_proposer(draft_tp=1)
-    proposer.runner = SimpleNamespace(
+    proposer.runner = _staged_runner(
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={
@@ -3473,10 +3469,6 @@ def test_prepare_draft_inputs_device_seed_pure_partial_prefill_uses_bucketed_fas
         num_tokens_paddings=[4, 8, 16],
         num_reqs_paddings=[2, 4, 8],
         _dp_lockstep_enabled=lambda: False,
-        # The runner's input-staging fence (stage_h2d_upload).
-        _unfenced_h2d_sources=[],
-        _registered_h2d_sources=set(),
-        _free_h2d_sources={},
     )
     chunk = _make_chunk(
         input_ids=torch.tensor(
@@ -4206,7 +4198,7 @@ def test_the_declined_chunk_program_is_built_at_load(monkeypatch, max_p, builds)
         Eagle3Proposer, "_build_mtp_step0_gather_loop_model", build_loop_step
     )
     if builds == "nothing":
-        with pytest.raises(NotImplementedError, match="could not be built"):
+        with pytest.raises(NotImplementedError, match="no loop-step program"):
             proposer._build_draft_loop_programs()
         return
     proposer._build_draft_loop_programs()

@@ -958,10 +958,12 @@ class Eagle3Proposer:
         self._build_mtp_step0_gather_loop_model()
         if self._mtp_loop_model is None:
             raise NotImplementedError(
-                "MTP fused draft loop: the loop-step program for the steps 1+ "
+                "MTP fused draft loop: no loop-step program for the steps 1+ "
                 "of a chunk the loop program declines under the step-0 "
-                "post-attention gather could not be built (see the warning "
-                "above). Serve this draft without the fused draft loop."
+                "post-attention gather (the draft has no _dynamic_arg_dims or "
+                "no step-0 gather installed, or the build raised, which a "
+                "warning above reports). Serve this draft without the fused "
+                "draft loop."
             )
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
