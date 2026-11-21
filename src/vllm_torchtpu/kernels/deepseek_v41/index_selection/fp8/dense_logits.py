@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Paged FP8 MQA logits for TPU v7."""
 
+import math
 from dataclasses import replace
 from functools import partial, reduce
 from typing import cast
@@ -27,15 +28,20 @@ from .common import (
 from .tuned import PACKED_FP8_MQA_CONFIG, paged_mqa_key_tile, paged_mqa_query_tile
 
 
+def _page_address(pages, layout, first_bank_rows):
+    """The bank-local row << 2 and the bank bit of page IDs."""
+    global_rows = layout.page_offset + pages * layout.page_stride
+    bank = (global_rows >= first_bank_rows).astype(jnp.int32)
+    return ((global_rows - bank * first_bank_rows) << 2) | bank
+
+
 def _encode_page_table(page_ids, layout, first_bank_rows):
-    """Records hold the bank-local row << 2, a valid bit and the bank bit."""
+    """Records hold the page address and a valid bit (1 << 1)."""
     valid = (page_ids >= 0) & (page_ids < layout.pages)
     # Spread masked reads: repeating page zero serializes a partially filled tile.
     safe = jnp.where(valid, page_ids, jnp.arange(page_ids.shape[-1]) % layout.pages)
-    global_rows = layout.page_offset + safe * layout.page_stride
-    bank = (global_rows >= first_bank_rows).astype(jnp.int32)
-    local_rows = global_rows - bank * first_bank_rows
-    return (local_rows << 2) | (valid.astype(jnp.int32) << 1) | bank
+    address = _page_address(safe, layout, first_bank_rows)
+    return address | (valid.astype(jnp.int32) << 1)
 
 
 def _block_maxima(values, block):
@@ -116,8 +122,9 @@ class _DenseKernel:
         _dma_rows(self.q, dst, sem, query.count, wait, src_start=query.start)
 
     def release_outputs(self, pair):
-        # counts: rows pending per score slot [0, 4), [4, 6) unused and
-        # -inf padding row copies [6, 8) per query slot.
+        # counts: rows pending per score slot [0, 4), [4, 6) unused, -inf
+        # padding row copies [6, 8) per query slot and live pages [8, 12)
+        # per page-table slot.
         for slot in (2 * pair, 2 * pair + 1)[: self.tiles]:
             src = self.scores.at[slot]
             _dma_rows(src, src, self.write_sem.at[slot], self.counts[slot], wait=True)
@@ -128,6 +135,26 @@ class _DenseKernel:
         dst = self.out.at[pl.ds(0, 1), pl.ds(0, self.key_tile)]
         row = pltpu.make_async_copy(src, dst, self.pad_sem.at[pair])
         lax.fori_loop(0, self.counts[6 + pair], lambda i, _: row.wait(), None)
+
+    def mask_dead_pages(self, page_slot):
+        """Point pages past the owner's longest row at distinct pages.
+
+        Tables hold the null page there, and repeated reads of one page
+        serialize. Their records are invalid, as for masked IDs.
+        """
+        layout, pages, first = self.layout, self.tile_pages, page_slot * self.page_count
+        live, unroll = self.counts[8 + page_slot], math.gcd(8, pages)
+
+        def spread(chunk, _):
+            for j in range(unroll):
+                i = chunk * unroll + j
+                page = i if pages <= layout.pages else i % layout.pages
+                address = _page_address(page, layout, self.pool[0].shape[0])
+                record = self.pages[first + i]
+                self.pages[first + i] = jnp.where(i < live, record, address)
+
+        start = jnp.clip(live, 0, pages) // unroll
+        lax.fori_loop(start, pages // unroll, spread, None)
 
     def load_page(self, i, page_slot, slot):
         record = self.page_record(i, page_slot)
@@ -176,9 +203,12 @@ class _DenseKernel:
         rows = enumerate(self.row_ids(query))
         return [jnp.where(i < query.count, self.lengths[r], 0) for i, r in rows]
 
+    def longest(self, query):
+        return reduce(jnp.maximum, self.row_lengths(query), jnp.int32(0))
+
     def live_tiles(self, query):
-        limit = reduce(jnp.maximum, self.row_lengths(query), jnp.int32(0))
-        return pl.cdiv(jnp.minimum(limit, self.out.shape[1]), self.key_tile)
+        limit = jnp.minimum(self.longest(query), self.out.shape[1])
+        return pl.cdiv(limit, self.key_tile)
 
     def query_block(self, state):
         return _QueryBlock(self, state).run()
@@ -188,12 +218,13 @@ class _DenseKernel:
         initial = [self.next_query(QueryTile(self.begin, zero, zero))]
         for _ in range(2):
             initial.append(self.next_query(initial[-1]))
-        for slot in range(8):
+        for slot in range(self.counts.shape[0]):
             self.counts[slot] = zero
         if self.fill_unscored:
             self.padding[...] = jnp.full(self.padding.shape, -jnp.inf, jnp.float32)
-        self.copy_queries(initial[0], 0, zero=True)
         tiles = tuple(self.live_tiles(q) for q in initial)
+        # Query tiles without live key tiles (padding rows) skip their queries.
+        pl.when(tiles[0] > 0)(partial(self.copy_queries, initial[0], 0, zero=True))
         # Reuse tracks the resident request and how many of its tiles are loaded.
         ready = (jnp.int32(-1), zero) if self.reuse_keys else zero
         state = (*initial, tiles, zero, zero, ready)
@@ -218,6 +249,15 @@ class _QueryBlock:
         # tile per group they reach into the group after the lookahead.
         self.table_tiles = self.total_tiles + self.far_tiles
         self.first_row = self.query.start - kernel.begin
+        self.groups = (self.query, self.following, self.lookahead, self.farthest)
+        self.ends = (
+            self.tile_count,
+            self.tile_count + self.next_tiles,
+            self.total_tiles,
+        )
+        # Streamed tiles mask the pages past their group's longest row.
+        streamed = self.groups[: 1 if kernel.reuse_keys else None]
+        self.longest = [kernel.longest(g) for g in streamed]
 
     def key_slot(self, tile):
         if self.k.reuse_keys:
@@ -243,10 +283,12 @@ class _QueryBlock:
 
     def owner(self, future):
         """Request row and local tile of a future tile."""
-        ends = (self.tile_count, self.tile_count + self.next_tiles, self.total_tiles)
-        groups = (self.query, self.following, self.lookahead, self.farthest)
-        row = _pick(future, ends, [g.page_row for g in groups])
-        return row, future - _pick(future, ends, (0, *ends))
+        row = self.pick(future, [g.page_row for g in self.groups])
+        return row, future - self.pick(future, (0, *self.ends))
+
+    def pick(self, future, values):
+        """values[g] of the group g that owns a future tile."""
+        return _pick(future, self.ends, values)
 
     def load_table(self, future, wait=False):
         k = self.k
@@ -255,6 +297,14 @@ class _QueryBlock:
         dst = k.pages.at[pl.ds(slot * k.page_count, k.page_count)]
         dma = pltpu.make_async_copy(k.table.at[row, tile], dst, k.page_sem.at[slot])
         (dma.wait if wait else dma.start)()
+        # Resident tiles serve every group of the request: they load whole.
+        if k.reuse_keys:
+            return
+        if wait:
+            k.mask_dead_pages(slot)
+        else:
+            live = self.pick(future, self.longest) - tile * k.key_tile
+            k.counts[8 + slot] = pl.cdiv(live, k.layout.page_size)
 
     def fill_keys(self, tile):
         # Complete K tiles stay resident across query groups of one request.
@@ -395,11 +445,27 @@ class _QueryBlock:
         sem = k.pad_sem.at[self.q_slot]
         _dma_rows(k.padding, dst, sem, self.query.count, dst_start=self.first_row)
 
+    def score_tiles(self):
+        k, q_slot = self.k, self.q_slot
+        k.copy_queries(self.query, q_slot, wait=True)
+        rows = k.row_ids(self.query)
+        weight = jnp.concatenate([k.weights[r][:, None] for r in rows])
+        selector = _weighted_selector(k.selector, k.weights, rows, sublanes=k.sublanes)
+        self.reduction = (_head_order(weight, k.q_tile, k.sublanes), selector)
+        queries = k.queries[pl.ds(q_slot * k.q_tile, k.q_tile)]
+        queries = queries.reshape(k.q_tile * k.heads, k.dim)
+        self.lhs = _head_order(queries, k.q_tile, k.sublanes)
+        if k.tiles == 1:
+            self.step_tile(jnp.int32(0), None)
+        else:
+            lax.fori_loop(0, self.tile_count, self.step_tile, None)
+
     def run(self):
         k, query, q_slot = self.k, self.query, self.q_slot
-        k.copy_queries(self.following, 1 - q_slot, zero=True)
+        following = partial(k.copy_queries, self.following, 1 - q_slot, zero=True)
+        pl.when(self.next_tiles > 0)(following)
         self.lengths_vector = jnp.stack(k.row_lengths(query))
-        self.maximum_length = reduce(jnp.maximum, k.row_lengths(query))
+        self.maximum_length = self.longest[0]
         # The previous query already prefetched up to three tiles from these
         # three groups. Fill the newly visible part of the farthest group.
         for i in range(3):
@@ -415,18 +481,7 @@ class _QueryBlock:
             for i in range(2):
                 needed = (i >= self.ready) & (i < self.total_tiles)
                 pl.when(needed)(partial(self.prefill, i))
-        k.copy_queries(query, q_slot, wait=True)
-        rows = k.row_ids(query)
-        weight = jnp.concatenate([k.weights[r][:, None] for r in rows])
-        selector = _weighted_selector(k.selector, k.weights, rows, sublanes=k.sublanes)
-        self.reduction = (_head_order(weight, k.q_tile, k.sublanes), selector)
-        queries = k.queries[pl.ds(q_slot * k.q_tile, k.q_tile)]
-        queries = queries.reshape(k.q_tile * k.heads, k.dim)
-        self.lhs = _head_order(queries, k.q_tile, k.sublanes)
-        if k.tiles == 1:
-            pl.when(scored)(partial(self.step_tile, jnp.int32(0), None))
-        else:
-            lax.fori_loop(0, self.tile_count, self.step_tile, None)
+        pl.when(scored)(self.score_tiles)
 
         # The last two tiles' writes stay in flight until this slot pair
         # is reused; tile t publishes from score slot t & 1.
@@ -560,7 +615,7 @@ def fp8_paged_mqa_logits(
             pltpu.VMEM((2 * tile, heads, dim), q.dtype),
             pltpu.VMEM((config.key_buffers, key_rows, dim), jnp.int32),
             pltpu.VMEM((4, tile, config.key_tile), jnp.float32),
-            pltpu.SMEM((8,), jnp.int32),
+            pltpu.SMEM((12,), jnp.int32),
             pltpu.SMEM((4 * page_count,), jnp.int32),
             pltpu.VMEM((tile, config.key_tile), jnp.float32),
         )

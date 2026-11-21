@@ -299,3 +299,76 @@ def test_block_maxima_match_scores(weight_sign):
         )
         expected = scores[row, : blocks * block].reshape(blocks, block).max(-1)
         np.testing.assert_array_equal(maxima[row, :blocks], expected)
+
+
+@pytest.mark.parametrize(
+    "rows,owned,max_model_len,reuse_keys,block",
+    [
+        # Decode bucket: one request with five drafts, then padding rows.
+        (16, 6, 524288, False, 8),
+        # Prefill chunk whose rows share resident keys.
+        (256, 256, 262144, True, 0),
+    ],
+)
+def test_null_page_tails_match_masked_tails(
+    rows, owned, max_model_len, reuse_keys, block
+):
+    """Tables hold the null page past a request's rows; it scores as masked."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("Packed FP8 scoring requires TPU")
+    rng = np.random.default_rng(11)
+    page_size = 128
+    layout = PackedFP8Layout(max_model_len // page_size + 64, page_size=page_size)
+    words = rng.integers(0, 2**32, (layout.pages, layout.page_rows, 128), np.uint64)
+    words = words.astype(np.uint32)
+    octets = words.view(np.uint8)
+    octets[(octets & 0x7F) == 0x7F] &= 0xFE  # No E4M3FN NaNs.
+    words[:, PAGE_ROWS - 1] = np.float32(2.0**-6).view(np.uint32)
+    pool = jnp.asarray(words.reshape(-1, 128).view(np.int32))
+    q = jnp.asarray(rng.normal(size=(rows, 32, 128)), jnp.float8_e4m3fn)
+    weights = jnp.asarray(rng.uniform(-0.1, 0.1, (rows, 32)), jnp.float32)
+    offsets = jnp.asarray([0, owned, rows], jnp.int32)
+    pages = rng.permutation(np.arange(1, layout.pages))[: max_model_len // page_size]
+
+    def run(lengths, tail):
+        visible = -(-lengths.max() // page_size)
+        table = np.full((2, pages.size), tail, np.int32)
+        table[0, :visible] = pages[:visible]
+        return jax.tree.map(
+            np.asarray,
+            fp8_paged_mqa_logits(
+                q,
+                pool,
+                weights,
+                jnp.asarray(lengths, jnp.int32),
+                jnp.asarray(table),
+                query_start_loc=offsets,
+                max_model_len=max_model_len,
+                q_scale=jnp.ones_like(weights),
+                query_size=6,
+                cache_layout=layout,
+                reuse_keys=reuse_keys,
+                fill_unscored=False,
+                block_maxima=block,
+            ),
+        )
+
+    # Rows end early in, midway through and at the end of a tile.
+    spread = 3 * np.arange(owned) if owned < rows else 293 * np.arange(rows)
+    for base in (1, 30000, 65536 - 20, 65536 + 9000, 3 * 65536 + 40000):
+        lengths = np.zeros(rows, np.int64)
+        lengths[:owned] = np.minimum(base + spread, max_model_len)
+        null, masked = run(lengths, 0), run(lengths, -1)
+        null, masked = (x if block else (x,) for x in (null, masked))
+        for row, length in enumerate(lengths):
+            end = -(-length // 8) * 8
+            np.testing.assert_array_equal(
+                null[0][row, :end].view(np.int32), masked[0][row, :end].view(np.int32)
+            )
+            assert np.isfinite(null[0][row, :length]).all()
+            if block:
+                blocks = -(-length // block)
+                np.testing.assert_array_equal(
+                    null[1][row, :blocks].view(np.int32),
+                    masked[1][row, :blocks].view(np.int32),
+                )
