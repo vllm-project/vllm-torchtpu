@@ -67,3 +67,20 @@ def test_non_rank0_silent(caplog, monkeypatch):
     with caplog.at_level(logging.INFO):
         wc.log_mk_options(4, _spec(), Tiles())
     assert not [r for r in caplog.records if "MK options" in r.getMessage()]
+
+
+def test_draft_label_logged_separately(caplog, monkeypatch):
+    from vllm_torchtpu.megakernel_runtime.qwen38_draft import draft_spec
+
+    monkeypatch.setattr(wc, "_LOGGED_MK_OPTIONS", set())
+    dspec = draft_spec(G, 2, budget=64, max_groups=2048, vocab_shard=1024)
+    with caplog.at_level(logging.INFO):
+        wc.log_mk_options(4, _spec(), Tiles())
+        wc.log_mk_options(4, dspec, Tiles(), label="MK draft")
+        wc.log_mk_options(4, dspec, Tiles(), label="MK draft")
+    lines = [r.getMessage() for r in caplog.records if "options b" in r.getMessage()]
+    assert [ln.split(":")[0] for ln in lines] == [
+        "qwen38 MK options b4", "qwen38 MK draft options b4"
+    ]
+    # The draft keeps the 2-slot key ring and no manager pages.
+    assert "key_slots=2" in lines[1] and "keymp=0" in lines[1]

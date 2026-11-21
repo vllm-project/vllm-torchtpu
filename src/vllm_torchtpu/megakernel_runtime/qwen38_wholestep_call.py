@@ -135,7 +135,7 @@ def indexed_options(B: int | None = None) -> dict:
     )
 
 
-_LOGGED_MK_OPTIONS: set[int] = set()
+_LOGGED_MK_OPTIONS: set[tuple[str, int]] = set()
 
 # (label, attribute) read from the built QSA indexed block, in log order. Attributes a
 # block does not have (older or newer kernels) are skipped, so the line never fails.
@@ -192,7 +192,7 @@ def _find_qsa_block(spec: Any) -> Any:
     return None
 
 
-def mk_options_line(B: int, spec: Any, tiles: Any) -> str:
+def mk_options_line(B: int, spec: Any, tiles: Any, label: str = "MK") -> str:
     """One line with the options the `B`-row whole-step kernel was actually built with: read
     from the built QSA block and the bucket's tiles (never re-parsed from the env)."""
     blk = _find_qsa_block(spec)
@@ -200,7 +200,7 @@ def mk_options_line(B: int, spec: Any, tiles: Any) -> str:
     if blk is not None:
         parts += [f"{k}={_fmt(getattr(blk, a))}" for k, a in _MK_BLOCK_FIELDS if hasattr(blk, a)]
     parts += [f"{k}={_fmt(getattr(tiles, k))}" for k in _MK_TILE_FIELDS if hasattr(tiles, k)]
-    return f"qwen38 MK options b{B}: " + " ".join(parts)
+    return f"qwen38 {label} options b{B}: " + " ".join(parts)
 
 
 def _is_rank0() -> bool:
@@ -212,18 +212,19 @@ def _is_rank0() -> bool:
         return True
 
 
-def log_mk_options(B: int, spec: Any, tiles: Any) -> None:
+def log_mk_options(B: int, spec: Any, tiles: Any, label: str = "MK") -> None:
     """Startup self-check (rank 0, once per row bucket): proves from the server log which MK
-    options each bucket's kernel really got. Logging only; the spec is not touched."""
-    if B in _LOGGED_MK_OPTIONS:
+    options each bucket's kernel really got. Logging only; the spec is not touched.
+    `label`: "MK" (main whole-step call) or "MK draft" (the draft-step kernel)."""
+    if (label, B) in _LOGGED_MK_OPTIONS:
         return
-    _LOGGED_MK_OPTIONS.add(B)
+    _LOGGED_MK_OPTIONS.add((label, B))
     if not _is_rank0():
         return
     try:
-        line = mk_options_line(B, spec, tiles)
+        line = mk_options_line(B, spec, tiles, label)
     except Exception as e:  # never let the log break a build
-        line = f"qwen38 MK options b{B}: unavailable ({type(e).__name__}: {e})"
+        line = f"qwen38 {label} options b{B}: unavailable ({type(e).__name__}: {e})"
     from vllm_torchtpu.logger import init_logger
 
     init_logger(__name__).info(line)
