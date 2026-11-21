@@ -107,7 +107,13 @@ def _row_routes(scores, gate_l):
 
 
 def _combine_arrivals(
-    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+    arrivals,
+    arrival_scales,
+    pos,
+    mirror_pos,
+    topk_weights,
+    out_dtype,
+    gather_on_tensorcore=False,
 ):
     """Combine arrivals [rows, lane blocks, 128] into [t_local, hidden].
 
@@ -122,9 +128,12 @@ def _combine_arrivals(
     Where the kernel path applies (kernel.combine_step_tokens) the row gather
     and the weighted sum are one Mosaic call: XLA answers `arrivals[rows]`
     with a SparseCore gather whose output is in HBM at any size, so the rows
-    are written out and read straight back before the sum sees them.
-    Everywhere else the gather is not offloaded and there is no round trip to
-    remove, so the fused XLA epilogue below stays.
+    are written out and read straight back before the sum sees them. Below
+    kernel.COMBINE_MIN_TOKENS the gather is not offloaded and there is no
+    round trip to remove, so the fused XLA epilogue below stays -- except with
+    `gather_on_tensorcore` (host.slab_tables_on_tensorcore), on a chip whose
+    SparseCore takes no gather at all: there XLA gathers on the TensorCore one
+    element at a time, and the kernel combines decode steps as well.
 
     Both paths fold the arrival row's scale and the router weight into one
     coefficient over K * t_local values, so each of the K * t_local * hidden
@@ -142,7 +151,7 @@ def _combine_arrivals(
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
     row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
     coef = row_scales * topk_weights.astype(jnp.float32)
-    if combine_step_tokens(t_local):
+    if combine_step_tokens(t_local, gather_on_tensorcore):
         combine = build_combine_kernel(
             t_local=t_local,
             topk=topk,
@@ -150,6 +159,7 @@ def _combine_arrivals(
             lane_blocks=lane_blocks,
             wire_dtype=arrivals.dtype,
             out_dtype=out_dtype,
+            gather_on_tensorcore=gather_on_tensorcore,
         )
         return combine(arrivals, coef, rows)
     rows_fp8 = arrivals[pos.T.reshape(-1)]  # f8 [K*t, lane blocks, 128]
@@ -915,7 +925,13 @@ def fused_ep_moe_v2(
             )
         )
         combined = _combine_arrivals(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+            arrivals,
+            arrival_scales,
+            pos,
+            mirror_pos,
+            topk_weights,
+            out_dtype,
+            gather_on_tensorcore=tables_on_tensorcore,
         )
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.

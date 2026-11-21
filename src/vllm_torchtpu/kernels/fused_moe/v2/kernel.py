@@ -2372,7 +2372,11 @@ COMBINE_GROUP = 16
 COMBINE_CHUNK = 16
 # Below this many local tokens XLA does not offload the gather at all (b64 and
 # b32 emit no OFFLOAD_GATHER), so there is no round trip to remove and a second
-# Mosaic call's fixed cost would be the whole effect.
+# Mosaic call's fixed cost would be the whole effect -- on a chip whose
+# SparseCore takes the gather. Where XLA's gather runs on the TensorCore one
+# element at a time (host.slab_tables_on_tensorcore: TPU8i), the kernel is the
+# faster combine below it too, on the single-parity schedule
+# (combine_step_tokens, gather_on_tensorcore).
 COMBINE_MIN_TOKENS = 256
 COMBINE_PARITIES = 4
 # Steps of row lead. A step's rows are waited at its head, so at one step of
@@ -2382,31 +2386,70 @@ COMBINE_PARITIES = 4
 COMBINE_LEAD = 2
 
 
-def combine_step_tokens(t_local):
-    """Tokens a combine step stages, or 0 where this path does not apply.
+def _combine_is_pipelined(t_local, tb):
+    """Whether `tb`-token steps fit the parity-rotated combine schedule.
 
     The step loop is unrolled by parity so that every VMEM store has a static
-    buffer index, which needs an even step count; the group width has to divide
-    the step; and the fixed cost is only worth paying above COMBINE_MIN_TOKENS.
+    buffer index, which needs a step count the rotation divides; the group
+    width has to divide the step; and the fixed cost is only worth paying from
+    COMBINE_MIN_TOKENS up.
     """
-    if t_local < COMBINE_MIN_TOKENS:
-        return 0
+    if t_local < COMBINE_MIN_TOKENS or tb < COMBINE_GROUP:
+        return False
+    steps = t_local // tb
+    return bool(
+        not t_local % tb
+        and not tb % COMBINE_GROUP
+        and steps > COMBINE_LEAD
+        and steps >= COMBINE_PARITIES
+        and not steps % COMBINE_PARITIES
+    )
+
+
+def combine_step_tokens(t_local, gather_on_tensorcore=False):
+    """Tokens a combine step stages, or 0 where this path does not apply.
+
+    From COMBINE_MIN_TOKENS up, the largest step the parity-rotated schedule
+    takes (_combine_is_pipelined). Below it, only with `gather_on_tensorcore`
+    (host.slab_tables_on_tensorcore): XLA's gather would run on the TensorCore
+    one element at a time, so the kernel combines decode steps too, on the
+    single-parity schedule -- each step's rows issued, waited, reduced and
+    stored in turn. Its step is the largest width up to COMBINE_TOKENS that
+    divides `t_local` and holds whole reduction chunks and output groups: a
+    multiple of COMBINE_GROUP, or one sublane tile (8 tokens), which then is
+    the whole chunk and group. `t_local` has to be a whole number of sublane
+    tiles.
+    """
     tb = COMBINE_TOKENS
     while tb >= COMBINE_GROUP:
-        steps = t_local // tb
-        if (
-            not t_local % tb
-            and not tb % COMBINE_GROUP
-            and steps > COMBINE_LEAD
-            and steps >= COMBINE_PARITIES
-            and not steps % COMBINE_PARITIES
-        ):
+        if _combine_is_pipelined(t_local, tb):
             return tb
         tb //= 2
+    if (
+        not gather_on_tensorcore
+        or t_local >= COMBINE_MIN_TOKENS
+        or t_local % host.U32_SUBLANE_TILE
+    ):
+        return 0
+    for tb in range(
+        min(COMBINE_TOKENS, t_local), host.U32_SUBLANE_TILE - 1, -host.U32_SUBLANE_TILE
+    ):
+        whole = not tb % COMBINE_GROUP or tb == host.U32_SUBLANE_TILE
+        if whole and not t_local % tb:
+            return tb
     return 0
 
 
-def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype):
+def _build_combine_kernel(
+    *,
+    t_local,
+    topk,
+    hidden,
+    lane_blocks,
+    wire_dtype,
+    out_dtype,
+    gather_on_tensorcore=False,
+):
     """out[i] = sum_k coef[i, k] * arrivals[pos[i * topk + k]].
 
     `pos` is a scalar-prefetch table of arrival rows, already clamped into the
@@ -2421,11 +2464,23 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
     therefore runs in the ROW's layout and only its bf16 result is relaid out,
     so the sublane shuffle sees one bf16 token per group instead of topk
     packed-f8 rows, and the live accumulator is one token wide.
+
+    Below COMBINE_MIN_TOKENS (`gather_on_tensorcore` only, see
+    combine_step_tokens) there are too few steps to rotate, so they run one
+    after another on a single buffer.
     """
-    tb = combine_step_tokens(t_local)
+    tb = combine_step_tokens(t_local, gather_on_tensorcore)
+    if not tb:
+        raise ValueError(
+            f"no combine step fits t_local={t_local} "
+            f"(gather_on_tensorcore={gather_on_tensorcore})"
+        )
+    pipelined = _combine_is_pipelined(t_local, tb)
     steps = t_local // tb
-    gt = COMBINE_GROUP
+    gt = COMBINE_GROUP if pipelined else min(COMBINE_GROUP, tb)
     groups = tb // gt
+    chunk_w = COMBINE_CHUNK if pipelined else min(COMBINE_CHUNK, tb)
+    parities = COMBINE_PARITIES if pipelined else 1
     lanes = HIDDEN_LANE_BLOCK
 
     def kernel(
@@ -2453,6 +2508,32 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
                 )
                 acc = term if acc is None else acc + term
             tile_vm[i] = cast(jax.Array, acc).astype(out_dtype)
+
+        if not pipelined:
+            for step in range(steps):
+                base = step * tb
+                for i in range(tb):
+                    for k in range(topk):
+                        start_row(base, 0, i, k)
+                pltpu.make_async_copy(
+                    rows_vm.at[0], rows_vm.at[0], row_sems.at[0]
+                ).wait()
+
+                def one_chunk_small(chunk, carry, base=base):
+                    for u in range(chunk_w):
+                        reduce_token(base, 0, chunk * chunk_w + u)
+                    return carry
+
+                lax.fori_loop(0, tb // chunk_w, one_chunk_small, jnp.int32(0))
+                for g in range(groups):
+                    out_vm[0, pl.ds(g * gt, gt)] = tile_vm[pl.ds(g * gt, gt)].reshape(
+                        gt, hidden
+                    )
+                pltpu.make_async_copy(
+                    out_vm.at[0], out_hbm.at[pl.ds(step * tb, tb)], out_sems.at[0]
+                ).start()
+                pltpu.make_async_copy(out_vm.at[0], out_vm.at[0], out_sems.at[0]).wait()
+            return
 
         def one_step(step, parity):
             # The step's rows were started a step ago; the next step's are
@@ -2515,13 +2596,11 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
             in_specs=[hbm],
             out_specs=hbm,
             scratch_shapes=(
-                pltpu.VMEM(
-                    (COMBINE_PARITIES, topk * tb, lane_blocks, lanes), wire_dtype
-                ),
+                pltpu.VMEM((parities, topk * tb, lane_blocks, lanes), wire_dtype),
                 pltpu.VMEM((tb, lane_blocks, lanes), out_dtype),
-                pltpu.VMEM((COMBINE_PARITIES, tb, hidden), out_dtype),
-                pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
-                pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
+                pltpu.VMEM((parities, tb, hidden), out_dtype),
+                pltpu.SemaphoreType.DMA((parities,)),
+                pltpu.SemaphoreType.DMA((parities,)),
             ),
             grid=(),
         ),

@@ -586,6 +586,30 @@ def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens():
     )
 
 
+def test_combine_step_tokens_below_the_floor_needs_a_tensorcore_gather():
+    """Below COMBINE_MIN_TOKENS the kernel combine needs gather_on_tensorcore.
+
+    Its step divides t_local and holds whole reduction chunks and output
+    groups (a multiple of COMBINE_GROUP, or one sublane tile); from
+    COMBINE_MIN_TOKENS up the flag changes nothing.
+    """
+    for t_local in (8, 16, 24, 32, 40, 48, 56, 64, 96, 128, 192, 248):
+        assert kernel.combine_step_tokens(t_local) == 0
+        tb = kernel.combine_step_tokens(t_local, gather_on_tensorcore=True)
+        assert tb and not t_local % tb and tb <= kernel.COMBINE_TOKENS
+        assert not tb % kernel.COMBINE_GROUP or tb == host.U32_SUBLANE_TILE
+    # Serving decode (1,536 tokens over EP32: 48 a shard) is one 48-token step.
+    assert kernel.combine_step_tokens(48, gather_on_tensorcore=True) == 48
+    assert kernel.combine_step_tokens(24, gather_on_tensorcore=True) == 8
+    assert kernel.combine_step_tokens(128, gather_on_tensorcore=True) == 64
+    for t_local in (4, 12, 30):  # not whole sublane tiles
+        assert kernel.combine_step_tokens(t_local, gather_on_tensorcore=True) == 0
+    for t_local in (256, 264, 512, 1024):
+        assert kernel.combine_step_tokens(
+            t_local, gather_on_tensorcore=True
+        ) == kernel.combine_step_tokens(t_local)
+
+
 @pytest.mark.parametrize("scoring_fn", ["softmax", "sigmoid", "sqrtsoftplus"])
 def test_row_routes_rejects_nan_and_neg_inf_across_all_scoring_fns(scoring_fn):
     """Both NaN-masked rows and -inf replica-padded rows must return False."""
