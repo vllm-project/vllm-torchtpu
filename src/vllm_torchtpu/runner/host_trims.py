@@ -59,7 +59,10 @@ import os
 import sys
 from typing import Any
 
+from vllm_torchtpu import utils
+from vllm_torchtpu.compilation import fast_dispatch
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner import fast_forward_context, runner_options
 
 logger = init_logger(__name__)
 
@@ -83,16 +86,12 @@ _configured = False
 def rule(vllm_config: Any) -> bool:
     """Whether the batch-1 host trims apply to this engine: it decodes (it is
     not a pure KV producer) and its ``max_num_seqs`` is 1."""
-    scheduler_config = getattr(vllm_config, "scheduler_config", None)
-    if getattr(scheduler_config, "max_num_seqs", None) != 1:
+    if vllm_config.scheduler_config.max_num_seqs != 1:
         return False
-    kv = getattr(vllm_config, "kv_transfer_config", None)
+    kv = vllm_config.kv_transfer_config
     if kv is None:
         return True
-    return not (
-        bool(getattr(kv, "is_kv_producer", False))
-        and not bool(getattr(kv, "is_kv_consumer", False))
-    )
+    return not (kv.is_kv_producer and not kv.is_kv_consumer)
 
 
 def configure(vllm_config: Any) -> None:
@@ -100,10 +99,6 @@ def configure(vllm_config: Any) -> None:
     this process. Called when the runner is built, before any step runs."""
     global ENABLED, AOT_SKIP_GUARDS, CONN_STATS_EVERY, SWITCH_US, GC_FREEZE
     global STEP_HOOK, _configured
-    from vllm_torchtpu import utils
-    from vllm_torchtpu.compilation import fast_dispatch
-    from vllm_torchtpu.runner import fast_forward_context, runner_options
-
     enabled = rule(vllm_config)
     options = runner_options.get(vllm_config)
     ENABLED = enabled
@@ -121,7 +116,7 @@ def configure(vllm_config: Any) -> None:
         "Batch-1 host trims: %s (max_num_seqs=%s); tpu_runner.switch_interval_us=%d "
         "gc_freeze=%s",
         "on" if enabled else "off",
-        getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", None),
+        vllm_config.scheduler_config.max_num_seqs,
         SWITCH_US,
         GC_FREEZE,
     )
