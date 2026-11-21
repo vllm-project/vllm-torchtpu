@@ -432,6 +432,26 @@ class TestTpuPlatform:
         with pytest.raises(NotImplementedError, match="rejection_sample_method"):
             TpuPlatform.check_and_update_config(vllm_config)
 
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_refuses_async_scheduling_for_ngram(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        """Only a hidden-state drafter runs under async scheduling, so only it
+        rolls back rejected drafts in `_prepare_inputs`, and the runner warms
+        that program (`_precompile_rejected_token_subtraction`) only for it."""
+        vllm_config.speculative_config = MagicMock(
+            rejection_sample_method="standard", method="ngram"
+        )
+        vllm_config.speculative_config.use_eagle.return_value = False
+        vllm_config.scheduler_config.async_scheduling = True
+        with pytest.raises(
+            NotImplementedError, match="speculative method 'ngram' is not supported"
+        ):
+            TpuPlatform.check_and_update_config(vllm_config)
+
     @pytest.mark.parametrize(
         "section,is_moe,error",
         [
