@@ -106,51 +106,78 @@ def merge_partials(
     """`ops.msa.merge_head_partials` inside the SPMD program: head-major
     partials ``out [H, T, D]``, ``lse [H, T]`` -> this rank's heads,
     unrotated, ``[T, H / dcp, D]``."""
-    lse = lse.astype(jnp.float32).T  # token-major across the gather
-    lses = jax.lax.all_gather(lse, axis, axis=0)
-    weighted = weigh_partials(
-        out,
-        lse,
-        lses,
-        out.dtype if rs_out_precision else jnp.float32,
-        interpret=interpret,
-    )
     if dcp == 4:
         # Pays when ranks r and r ^ 1 are one chip's cores (the DCP mesh's
         # contiguous ranks); correct for any device order.
-        merged = _pair_first_reduce_scatter(weighted, axis, rank)
+        merged = _pair_first_merge(
+            out, lse.astype(jnp.float32), axis, rank, rs_out_precision
+        )
     else:
+        lse = lse.astype(jnp.float32).T  # token-major across the gather
+        lses = jax.lax.all_gather(lse, axis, axis=0)
+        weighted = weigh_partials(
+            out,
+            lse,
+            lses,
+            out.dtype if rs_out_precision else jnp.float32,
+            interpret=interpret,
+        )
         merged = jax.lax.psum_scatter(weighted, axis, scatter_dimension=0, tiled=True)
     return msa_fp4.unrotate_output(merged.astype(out.dtype)).transpose(1, 0, 2)
 
 
-def _pair_first_reduce_scatter(x: jax.Array, axis: str, rank: jax.Array):
-    """``psum_scatter`` of ``x [4 Hl, T, D]`` over a DCP group of 4 (rank
-    ``r`` keeps head block ``r``), in two exchanges: ranks ``r`` and ``r ^ 1``
-    (one chip's cores) swap the blocks of the other parity and sum, then
-    ranks ``r`` and ``r ^ 2`` swap the block the other keeps and sum. Only
-    one block per rank crosses between the chips, where the reduce-scatter
-    sent three (c64 decode twin: 30 us per layer for 3.1 MB, j-09d6a5c6).
-    Sums in f32; the pair's sum crosses the chips rounded to ``x.dtype``
-    (bf16 with `TPU_DCP_RS_OUT_PRECISION`), as the reduce-scatter's partial
-    sums travel, in another order."""
-    heads = x.shape[0] // 4
-    blocks = x.reshape(4, heads, *x.shape[1:])
-    even, odd = blocks[0::2], blocks[1::2]  # blocks {0, 2}, {1, 3}
+def _combine(o1, l1, o2, l2):
+    """Two partials of the same heads merged by their log-sum-exps: ``o
+    [..., T, D]`` (normalized), ``l [..., T]`` f32 -> (f32 ``o``, ``l``). A
+    zero-weight partial (no key attended, -inf LSE) drops out."""
+    peak = jnp.maximum(l1, l2)
+    peak = jnp.where(jnp.isinf(peak), 0.0, peak)
+    w1, w2 = jnp.exp(l1 - peak), jnp.exp(l2 - peak)
+    total = w1 + w2
+    o = jnp.where(w1[..., None] > 0, o1.astype(jnp.float32) * w1[..., None], 0.0)
+    o = o + jnp.where(w2[..., None] > 0, o2.astype(jnp.float32) * w2[..., None], 0.0)
+    o = jnp.where(total[..., None] > 0, o / total[..., None], 0.0)
+    return o, peak + jnp.log(total)
+
+
+def _pair_first_merge(
+    out: jax.Array, lse: jax.Array, axis: str, rank: jax.Array, rs_out_precision: bool
+):
+    """The LSE merge of a DCP group of 4 (rank ``r`` keeps head block ``r``)
+    from head-major partials ``out [4 Hl, T, D]`` and ``lse [4 Hl, T]`` f32,
+    in two exchanges that carry each block's LSEs with it: ranks ``r`` and
+    ``r ^ 1`` (one chip's cores) swap the blocks of the other parity and
+    combine them, then ranks ``r`` and ``r ^ 2`` swap the block the other
+    keeps and combine. No LSE all-gather and no weighting pass, and one block
+    per rank crosses between the chips, where an LSE all-gather, a weighting
+    pass and a reduce-scatter sent three (c64 decode twin j-cd5ebe6f, per
+    layer: LSE all-gather 8-15 us, weighting 4 us). Combines in f32; the
+    pair's combined block crosses the chips in ``out.dtype``, or in f32
+    without `TPU_DCP_RS_OUT_PRECISION`."""
+    heads = out.shape[0] // 4
+    blocks = out.reshape(4, heads, *out.shape[1:])
+    lses = lse.reshape(4, heads, lse.shape[-1])
     parity, half = rank % 2 == 0, rank // 2 == 0
-    pair = jax.lax.ppermute(
-        jnp.where(parity, odd, even), axis, [(r, r ^ 1) for r in range(4)]
-    )
-    summed = jnp.where(parity, even, odd).astype(jnp.float32) + pair.astype(
-        jnp.float32
+    pair = [(r, r ^ 1) for r in range(4)]
+    o, lg = (
+        jnp.where(parity, x[0::2], x[1::2]) for x in (blocks, lses)
     )  # this parity's blocks {p, p + 2}
-    keep = jnp.where(half, summed[0], summed[1])
-    other = jax.lax.ppermute(
-        jnp.where(half, summed[1], summed[0]).astype(x.dtype),
-        axis,
-        [(r, r ^ 2) for r in range(4)],
+    got_o, got_l = (
+        jax.lax.ppermute(jnp.where(parity, x[1::2], x[0::2]), axis, pair)
+        for x in (blocks, lses)
     )
-    return keep + other.astype(jnp.float32)
+    o, lg = _combine(o, lg, got_o, got_l)
+    cross = [(r, r ^ 2) for r in range(4)]
+    keep_o, keep_l = jnp.where(half, o[0], o[1]), jnp.where(half, lg[0], lg[1])
+    other_o = jax.lax.ppermute(
+        jnp.where(half, o[1], o[0]).astype(
+            out.dtype if rs_out_precision else jnp.float32
+        ),
+        axis,
+        cross,
+    )
+    other_l = jax.lax.ppermute(jnp.where(half, lg[1], lg[0]), axis, cross)
+    return _combine(keep_o, keep_l, other_o, other_l)[0]
 
 
 def merge_partials_all_to_all(

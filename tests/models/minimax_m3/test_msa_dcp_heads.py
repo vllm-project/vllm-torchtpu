@@ -298,27 +298,35 @@ def test_unrotate_to_rows_matches_unrotate_output(num_tokens):
     )
 
 
-def test_pair_first_reduce_scatter_matches_psum_scatter():
-    """The two-exchange reduce-scatter of a DCP group of 4 keeps block r on
-    rank r, summed over the group as `psum_scatter` sums it (f32 sums)."""
+def test_pair_first_merge_matches_lse_merge():
+    """The two-exchange LSE merge of a DCP group of 4 keeps head block r on
+    rank r, equal to the log-sum-exp-weighted sum of every rank's partial
+    (a -inf LSE: a rank that attended nothing for that head and token)."""
     if len(jax.devices()) < 4:
         pytest.skip("needs 4 devices")
     mesh = Mesh(np.asarray(jax.devices()[:4]), ("dcp",))
     rng = np.random.default_rng(7)
-    x = jnp.asarray(rng.standard_normal((4 * 16, 24, 128)), jnp.float32)
+    heads, tokens = 4, 24
+    out = rng.standard_normal((4, 4 * heads, tokens, 128)).astype(np.float32)
+    lse = (rng.standard_normal((4, 4 * heads, tokens)) * 4).astype(np.float32)
+    lse[1, 3, 5] = -np.inf
+    lse[:, 6, 2] = -np.inf  # no rank attended
+    out[1, 3, 5] = 0.0
+    out[:, 6, 2] = 0.0
     ranks = jnp.arange(4, dtype=jnp.int32)
-
-    def body(fn):
-        return jax.shard_map(
-            fn,
-            mesh=mesh,
-            in_specs=(P("dcp"), P("dcp")),
-            out_specs=P("dcp"),
-            check_vma=False,
-        )(x, ranks)
-
-    got = body(lambda a, r: msa_dcp_heads._pair_first_reduce_scatter(a, "dcp", r[0]))
-    want = body(
-        lambda a, r: jax.lax.psum_scatter(a, "dcp", scatter_dimension=0, tiled=True)
+    got = jax.shard_map(
+        lambda o, lg, r: msa_dcp_heads._pair_first_merge(o, lg, "dcp", r[0], True),
+        mesh=mesh,
+        in_specs=(P("dcp"), P("dcp"), P("dcp")),
+        out_specs=P("dcp"),
+        check_vma=False,
+    )(
+        jnp.asarray(out.reshape(-1, tokens, 128)),
+        jnp.asarray(lse.reshape(-1, tokens)),
+        ranks,
     )
-    np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-5, atol=1e-5)
+    w = np.nan_to_num(np.exp(lse - np.logaddexp.reduce(lse, axis=0)))
+    want = (w[..., None] * out).sum(0).reshape(4, heads, tokens, 128)
+    np.testing.assert_allclose(
+        np.asarray(got).reshape(4, heads, tokens, 128), want, rtol=1e-5, atol=1e-5
+    )
