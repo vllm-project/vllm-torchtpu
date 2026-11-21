@@ -775,6 +775,8 @@ _subst_prefix_extract_compiled = _static_shape_args(
 _substitute_placeholder_token_static = static_shape_args_owned(
     _substitute_placeholder_token
 )
+# The uncompiled function, for regions that inline it (VLLM_TPU_PREFWD_PREP_FOLD).
+_substitute_placeholder_token_impl = _substitute_placeholder_token.__wrapped__
 
 
 def _subtract_num_rejected_tokens_compiled(*args):
@@ -999,6 +1001,9 @@ def _prep_fold_impl(
     scalars,
     previous,
     current,
+    input_ids=None,
+    cur_input_indices=None,
+    pre_next_tokens_indices=None,
     *,
     num_tokens: int,
     ids_dtype: torch.dtype,
@@ -1016,9 +1021,15 @@ def _prep_fold_impl(
     (`fused_step_inputs`, functional). The existing functions, unchanged, in
     the order the unfolded step runs them; integer ops only, so the outputs
     are bitwise the unfolded ones. Returns (seq_lens, positions, input ids,
-    drafts, context, history, slots, valid_tokens, record)."""
+    drafts, context, history, slots, valid_tokens, record).
+
+    With `input_ids` (and fast substitution's padded `num_tokens`-long index
+    pair) the substitution is not the 1:1 slice: it is
+    `_substitute_placeholder_token` on a copy of `input_ids` from the flat
+    int64 source (`_warmed_next_tokens`), then `extract_draft_token_ids`."""
     from vllm_torchtpu.models.vllm.qwen4_exp.inputs import fused_step_inputs
     from vllm_torchtpu.runner.tpu_runner_async_output import (
+        extract_draft_token_ids,
         subtract_num_rejected_tokens,
     )
 
@@ -1029,9 +1040,18 @@ def _prep_fold_impl(
         seq_lens_subtract_indices,
         positions_subtract_indices,
     )
-    ids, drafts = _subst_prefix_extract_impl(
-        next_tokens, num_tokens, ids_dtype, logits_indices, target_logits_indices
-    )
+    if input_ids is None:
+        ids, drafts = _subst_prefix_extract_impl(
+            next_tokens, num_tokens, ids_dtype, logits_indices, target_logits_indices
+        )
+    else:
+        ids = _substitute_placeholder_token_impl(
+            input_ids.clone(),
+            cur_input_indices,
+            pre_next_tokens_indices,
+            next_tokens.reshape(-1).to(torch.int64),
+        )
+        drafts = extract_draft_token_ids(ids, logits_indices, target_logits_indices)
     prepped = fused_step_inputs(
         starts,
         seq_lens,
@@ -1066,13 +1086,17 @@ def _prep_fold_reference(*args, fault: bool = False, **static):
     )
 
     seq_lens, positions, num_rejected, seq_idx, pos_idx, src, logits, target = args[:8]
-    starts, state_indices, store, scalars, previous, current = args[8:]
+    starts, state_indices, store, scalars, previous, current = args[8:14]
+    subst = args[14:]
     if fault:
         seq_lens = seq_lens - 1
     seq_lens, positions = subtract_num_rejected_tokens(
         seq_lens, positions, num_rejected, seq_idx, pos_idx
     )
-    ids = _subst_prefix_impl(src, static["num_tokens"], static["ids_dtype"])
+    if subst and subst[0] is not None:
+        ids = _substitute_placeholder_token_impl(subst[0].clone(), *subst[1:], src)
+    else:
+        ids = _subst_prefix_impl(src, static["num_tokens"], static["ids_dtype"])
     drafts = extract_draft_token_ids(ids, logits, target)
     prepped = fused_step_inputs(
         starts,
@@ -1099,7 +1123,7 @@ def _prep_fold_key(args, static) -> tuple:
     arguments. Serving folds only keys warmup compiled."""
     leaves: list[torch.Tensor] = []
     for a in args:
-        leaves.extend(a if isinstance(a, tuple) else (a,))
+        leaves.extend(a if isinstance(a, tuple) else () if a is None else (a,))
     first = {}
     sig = tuple(
         (tuple(t.shape), t.dtype, first.setdefault(id(t), i))
@@ -1122,6 +1146,21 @@ def _prep_fold_shapes(
             for rows in {n, _get_padded_num_reqs_with_upper_limit(n, max_num_reqs)}:
                 shapes.add((rows, n * width))
     return shapes
+
+
+def _prep_fold_scatter_shapes(
+    max_num_reqs: int, width: int, num_tokens_paddings: list[int]
+) -> set[tuple[int, int]]:
+    """(rejected-count rows, token bucket) of the steady verify steps the fold
+    serves with the substitution scatter (verify tokens not filling the bucket,
+    or rows that moved): every request count, in the bucket holding its
+    `n * width` tokens, exact and bucketed rows."""
+    return {
+        (rows, tokens)
+        for rows, tokens, _ in _subtract_rejected_shapes(
+            max_num_reqs, width, num_tokens_paddings, {0}, False
+        )
+    }
 
 
 logger = init_logger(__name__)
@@ -3528,43 +3567,13 @@ class TPUModelRunner(GPUModelRunner):
             # H2D uploads
             # Avoids Eager XLA overhead by relying on the compiled kernel + cached
             # index tensors
-            subst_key = (
-                len(input_ids),
-                tuple(token_in_tpu_cur_input_indices),
-                tuple(token_in_tpu_pre_next_tokens_indices),
-            )
-            if (
-                getattr(self, "_cached_subst_key", None) == subst_key
-                and hasattr(self, "_cached_cur_input_indices")
-                and hasattr(self, "_cached_pre_next_tokens_indices")
-            ):
-                cur_input_indices = self._cached_cur_input_indices
-                pre_next_tokens_indices = self._cached_pre_next_tokens_indices
-            else:
-                idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
-                _missing_mask = np.ones(len(input_ids), dtype=bool)
-                _missing_mask[token_in_tpu_cur_input_indices] = False
-                missing_values = np.flatnonzero(_missing_mask).astype(np.int32)
-                padded_token_in_tpu_cur_input_indices = np.concatenate(
-                    (token_in_tpu_cur_input_indices, missing_values)
-                )
-
-                padded_token_in_tpu_pre_next_tokens_indices = np.pad(
+            cur_input_indices, pre_next_tokens_indices = (
+                self._cached_substitution_indices(
+                    len(input_ids),
+                    token_in_tpu_cur_input_indices,
                     token_in_tpu_pre_next_tokens_indices,
-                    (0, idx_pad_len),
-                    mode="constant",
-                    constant_values=-1,
                 )
-
-                cur_input_indices = stage_h2d_upload(
-                    self, torch.from_numpy(padded_token_in_tpu_cur_input_indices)
-                )
-                pre_next_tokens_indices = stage_h2d_upload(
-                    self, torch.from_numpy(padded_token_in_tpu_pre_next_tokens_indices)
-                )
-                self._cached_subst_key = subst_key
-                self._cached_cur_input_indices = cur_input_indices
-                self._cached_pre_next_tokens_indices = pre_next_tokens_indices
+            )
         else:
             idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
             _missing_mask = np.ones(len(input_ids), dtype=bool)
@@ -3601,6 +3610,54 @@ class TPUModelRunner(GPUModelRunner):
             if envs.VLLM_TPU_WARMED_SUBSTITUTE_SOURCE
             else self._pre_async_results.next_tokens_tpu,
         )
+
+    def _cached_substitution_indices(
+        self,
+        num_ids: int,
+        token_in_tpu_cur_input_indices: np.ndarray,
+        token_in_tpu_pre_next_tokens_indices: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fast token substitution's padded `num_ids`-long device index pair
+        for `_substitute_placeholder_token`, reused while the host indices
+        repeat (see `_apply_async_token_substitution`)."""
+        subst_key = (
+            num_ids,
+            tuple(token_in_tpu_cur_input_indices),
+            tuple(token_in_tpu_pre_next_tokens_indices),
+        )
+        if (
+            getattr(self, "_cached_subst_key", None) == subst_key
+            and hasattr(self, "_cached_cur_input_indices")
+            and hasattr(self, "_cached_pre_next_tokens_indices")
+        ):
+            cur_input_indices = self._cached_cur_input_indices
+            pre_next_tokens_indices = self._cached_pre_next_tokens_indices
+        else:
+            idx_pad_len = num_ids - len(token_in_tpu_cur_input_indices)
+            _missing_mask = np.ones(num_ids, dtype=bool)
+            _missing_mask[token_in_tpu_cur_input_indices] = False
+            missing_values = np.flatnonzero(_missing_mask).astype(np.int32)
+            padded_token_in_tpu_cur_input_indices = np.concatenate(
+                (token_in_tpu_cur_input_indices, missing_values)
+            )
+
+            padded_token_in_tpu_pre_next_tokens_indices = np.pad(
+                token_in_tpu_pre_next_tokens_indices,
+                (0, idx_pad_len),
+                mode="constant",
+                constant_values=-1,
+            )
+
+            cur_input_indices = stage_h2d_upload(
+                self, torch.from_numpy(padded_token_in_tpu_cur_input_indices)
+            )
+            pre_next_tokens_indices = stage_h2d_upload(
+                self, torch.from_numpy(padded_token_in_tpu_pre_next_tokens_indices)
+            )
+            self._cached_subst_key = subst_key
+            self._cached_cur_input_indices = cur_input_indices
+            self._cached_pre_next_tokens_indices = pre_next_tokens_indices
+        return cur_input_indices, pre_next_tokens_indices
 
     def _substitute_next_lens(self) -> list[int]:
         """next_tokens lengths `_precompile_substitute_placeholder_token` warms."""
@@ -4253,8 +4310,9 @@ class TPUModelRunner(GPUModelRunner):
         """VLLM_TPU_PREFWD_PREP_FOLD, host side: whether this chunk can run its
         prep as the folded program (`_try_prep_fold` checks the rest), and if so
         its substitution indices (host only, so computed early). Folds only the
-        one-chunk steady verify step whose substitution is the 1:1 slice of the
-        previous step's source; everything else keeps today's programs."""
+        one-chunk verify step that substitutes tokens from the previous step's
+        source (the 1:1 slice or the scatter, `_try_prep_fold` picks); everything
+        else keeps today's programs."""
         adapter = self.model_adapter
         pre = self._pre_async_results
         if not (
@@ -4274,16 +4332,12 @@ class TPUModelRunner(GPUModelRunner):
             and layout_plan.kind is SequenceLayoutKind.ALL
             and adapter is not None
             and getattr(adapter, "prep_fold_supported", lambda: False)()
-            and int(num_scheduled_tokens_per_req.sum())
-            == padded_total_num_scheduled_tokens
-            and pre.next_tokens_tpu.numel() >= padded_total_num_scheduled_tokens
         ):
             return None
         cur, src = self._prepare_async_token_substitution_indices(
             start_index, num_reqs, num_scheduled_tokens_per_req
         )
-        identity = np.arange(padded_total_num_scheduled_tokens, dtype=np.int32)
-        if not (np.array_equal(cur, identity) and np.array_equal(src, identity)):
+        if len(cur) == 0:
             return None
         return cur, src
 
@@ -4296,6 +4350,7 @@ class TPUModelRunner(GPUModelRunner):
         mamba_state_indices: torch.Tensor | None,
         start_index: int,
         num_reqs: int,
+        subst_indices: tuple[np.ndarray, np.ndarray],
     ) -> torch.Tensor | None:
         """VLLM_TPU_PREFWD_PREP_FOLD: run the chunk's rejected-count correction,
         token substitution, verified-draft gather and model-adapter step inputs
@@ -4313,6 +4368,23 @@ class TPUModelRunner(GPUModelRunner):
             return None
         assert self._pre_async_results is not None
         assert self._pre_async_results.spec_decode_num_rejected_tokens is not None
+        src = self._pre_async_results.next_tokens_tpu
+        cur, pre = subst_indices
+        identity = np.arange(num_tokens, dtype=np.int32)
+        if (
+            np.array_equal(cur, identity)
+            and np.array_equal(pre, identity)
+            and src.numel() >= num_tokens
+        ):
+            # The 1:1 slice of the previous step's source.
+            subst_args = ()
+        else:
+            # The scatter, on fast substitution's padded num_tokens-long indices
+            # (the same cached uploads the unfolded path would use).
+            subst_args = (
+                self.input_ids,
+                *self._cached_substitution_indices(num_tokens, cur, pre),
+            )
         adapter_args, static = self.model_adapter.prep_fold_args(
             start_index, num_reqs, query_start_loc, mamba_state_indices
         )
@@ -4321,10 +4393,11 @@ class TPUModelRunner(GPUModelRunner):
             self.position_ids,
             self._pre_async_results.spec_decode_num_rejected_tokens,
             *subtract_idx,
-            self._pre_async_results.next_tokens_tpu,
+            src,
             md.final_logits_indices,
             md.target_logits_indices,
             *adapter_args,
+            *subst_args,
         )
         static = dict(num_tokens=num_tokens, ids_dtype=self.input_ids.dtype, **static)
         key = _prep_fold_key(args, static)
@@ -4903,6 +4976,7 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_state_indices,
                 start_index,
                 num_reqs,
+                prep_fold_subst,
             )
             if folded_seq_lens is not None:
                 seq_lens = folded_seq_lens
@@ -9543,8 +9617,21 @@ class TPUModelRunner(GPUModelRunner):
         targets = {
             n for n in (self.num_reqs_max_model_len, self.num_reqs_most_model_len) if n
         }
-        shapes = _prep_fold_shapes(self.max_num_reqs, 1 + k, self.num_tokens_paddings)
+        width = 1 + k
+        paths = {
+            "1:1 slice": (
+                _prep_fold_shapes(self.max_num_reqs, width, self.num_tokens_paddings),
+                False,
+            ),
+            "scatter": (
+                _prep_fold_scatter_shapes(
+                    self.max_num_reqs, width, self.num_tokens_paddings
+                ),
+                True,
+            ),
+        }
         keys: set[tuple] = set()
+        counts: dict[str, int] = {}
 
         def dev(shape, dtype, fill=0):
             return torch.full(shape, fill, dtype=dtype).to(self.device)
@@ -9554,30 +9641,47 @@ class TPUModelRunner(GPUModelRunner):
                 starts = dev((target + 1,), self.query_start_loc_cpu.dtype)
                 state = dev((target,), torch.int32)
                 adapter_args, static = adapter.prep_fold_warm_args(starts, state)
-                for rows, tokens in sorted(shapes):
-                    if rows > target:
-                        continue
-                    for src_dtype in (torch.int32, torch.int64):
-                        args = (
-                            dev((target,), self.seq_lens_cpu.dtype),
-                            dev((tokens,), self.positions_cpu.dtype),
-                            dev((rows,), torch.int32),
-                            dev((target,), torch.int32, -1),
-                            dev((tokens,), torch.int32, -1),
-                            dev((bound,), src_dtype),
-                            dev((tokens,), torch.int32),
-                            dev((tokens,), torch.int32),
-                            *adapter_args,
+                for path, (shapes, scatter) in paths.items():
+                    for rows, tokens in sorted(shapes):
+                        if rows > target:
+                            continue
+                        subst_args = (
+                            (
+                                dev((tokens,), self.input_ids_cpu.dtype),
+                                torch.arange(tokens, dtype=torch.int32).to(self.device),
+                                dev((tokens,), torch.int32, -1),
+                            )
+                            if scatter
+                            else ()
                         )
-                        kw = dict(num_tokens=tokens, ids_dtype=self.input_ids_cpu.dtype)
-                        kw.update(static)
-                        out = _prep_fold_compiled(*args, **kw)
-                        synchronize_tensors([*out[:-1], *out[-1]])
-                        keys.add(_prep_fold_key(args, kw))
+                        for src_dtype in (torch.int32, torch.int64):
+                            args = (
+                                dev((target,), self.seq_lens_cpu.dtype),
+                                dev((tokens,), self.positions_cpu.dtype),
+                                dev((rows,), torch.int32),
+                                dev((target,), torch.int32, -1),
+                                dev((tokens,), torch.int32, -1),
+                                dev((bound,), src_dtype),
+                                dev((tokens,), torch.int32),
+                                dev((tokens,), torch.int32),
+                                *adapter_args,
+                                *subst_args,
+                            )
+                            kw = dict(
+                                num_tokens=tokens, ids_dtype=self.input_ids_cpu.dtype
+                            )
+                            kw.update(static)
+                            out = _prep_fold_compiled(*args, **kw)
+                            synchronize_tensors([*out[:-1], *out[-1]])
+                            key = _prep_fold_key(args, kw)
+                            if key not in keys:
+                                keys.add(key)
+                                counts[path] = counts.get(path, 0) + 1
         self._prep_fold_keys = frozenset(keys)
         logger.info(
-            "PREFWD_PREP_FOLD: warmed %d keys in %.1f s",
+            "PREFWD_PREP_FOLD: warmed %d keys (%s) in %.1f s",
             len(keys),
+            ", ".join(f"{path}: {counts.get(path, 0)}" for path in paths),
             time.perf_counter() - start,
         )
 
