@@ -407,11 +407,12 @@ def lower_torch_forward_to_mlir(
         ):
             qsl = user_args["query_start_loc"]
             num_seqs = user_args["req_dist"][2].clamp(0, qsl.shape[0] - 1)
-            num_valid = qsl[num_seqs]
+            qsl_idx = torch.arange(qsl.shape[0], device=qsl.device, dtype=torch.int32)
+            num_valid = (qsl * (qsl_idx == num_seqs).to(torch.int32)).sum()
             mask = (
                 torch.arange(
                     bucket_size,
-                    device=num_valid.device,
+                    device=qsl.device,
                     dtype=torch.int32,
                 )
                 >= num_valid

@@ -608,3 +608,95 @@ def test_lower_forward_installs_token_padding_when_skip_padded_tokens_enabled(
     )
     assert seen_masks == [((8,), torch.bool)]
     assert token_padding._padding_state is None
+
+
+def test_lower_forward_token_padding_traces_under_tpu_fx(monkeypatch):
+    import contextlib
+
+    import torch_tpu
+    from torch_tpu._internal.compile import tpu_torch_compile
+
+    from vllm_torchtpu.experimental.export import exporter, tpu_lowering
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    del torch_tpu
+    if getattr(torch, "_C", None) and hasattr(
+        torch.utils, "rename_privateuse1_backend"
+    ):
+        with contextlib.suppress(RuntimeError):
+            torch.utils.rename_privateuse1_backend("tpu")
+
+    class _Model:
+        export_config = api.TextOnlyLLMExportConfig(
+            model_name="tiny-pad-fx",
+            vocab_size=32,
+            hidden_size=8,
+            num_layers=1,
+            num_q_heads=2,
+            num_kv_heads=2,
+            head_dim=4,
+            block_size=4,
+            num_blocks=8,
+            max_num_seqs=4,
+            max_model_len=16,
+            eos_token_id=2,
+            dtype="bf16",
+            token_buckets=(8,),
+            req_buckets=(4,),
+            emit_byte_tokenizer=True,
+        )
+
+        def forward(
+            self,
+            weights,
+            kv_caches,
+            *,
+            input_ids,
+            positions,
+            kv_lens,
+            block_tables,
+            query_start_loc,
+            req_dist,
+        ):
+            del positions, kv_lens, block_tables, query_start_loc, req_dist
+            out = weights["w"][input_ids % 32]
+            _, out = token_padding.zero_routing_weights_for_padding(out, out)
+            return list(kv_caches), out
+
+    captured = {}
+
+    def _fake_traverse(*, result_tensors, argument_tensors, module_name, **_kw):
+        captured["num_results"] = len(result_tensors)
+        captured["num_args"] = len(argument_tensors)
+        captured["module_name"] = module_name
+        return SimpleNamespace(module="fake_module")
+
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    monkeypatch.setattr(tpu_torch_compile, "traverse_and_compile", _fake_traverse)
+    monkeypatch.setattr(
+        tpu_torch_compile, "serialize_mlir_text", lambda _m: "module @m {}"
+    )
+    monkeypatch.setattr(tpu_lowering, "set_aliasing_outputs", lambda txt, _m: txt)
+    token_padding.set_padding_state(None)
+
+    cfg = _Model.export_config
+    user_inputs = exporter._user_inputs(cfg, 8, 3, "block_tables")
+    mlir = tpu_lowering.lower_torch_forward_to_mlir(
+        _Model(),
+        user_inputs=user_inputs,
+        forward_names=["w"],
+        params_map={"w": api.ShapeDtypeStruct((32, 8), "bf16")},
+        state_specs=[],
+        bucket_size=8,
+    )
+    assert mlir == "module @m {}"
+    assert captured == {
+        "num_results": 1,
+        "num_args": 7,
+        "module_name": "forward_bucket8",
+    }
+    assert token_padding._padding_state is None
