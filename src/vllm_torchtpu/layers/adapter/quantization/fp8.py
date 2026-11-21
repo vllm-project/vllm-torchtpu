@@ -1974,7 +1974,10 @@ def _fused_kernel_takes(rows: int, gate: int) -> bool:
     bounds the same symbol from above at 128 rows) then specializes the
     symbol, which vLLM's dynamic-shape trace rejects.
     """
-    from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import tensor_parallel_size
+    from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+        sequence_parallel_rows_per_rank,
+        tensor_parallel_size,
+    )
 
     tp = tensor_parallel_size()
     if tp > 1:
@@ -1982,6 +1985,6 @@ def _fused_kernel_takes(rows: int, gate: int) -> bool:
 
         if not _sp.is_active():
             return False
-        if _sp.min_rows() // tp >= gate:
+        if sequence_parallel_rows_per_rank(tp) >= gate:
             return True
     return rows >= gate

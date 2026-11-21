@@ -130,6 +130,18 @@ def test_tensor_parallel_gate_refuses_a_first_sliced_bucket_below_it(
         v3.check_kernel_threshold(ep=8, tp=8, lowtok_cap=448)
 
 
+def test_tensor_parallel_gate_is_checked_on_the_threshold_itself(groups, monkeypatch):
+    """DP4 x TP2 (gate 32) at a 48-row sequence-parallel threshold: a sliced
+    step can have as few as 24 rows per rank, below the gate (the FP8
+    method's gate reads the same 24 rows), even though a 64-row step would
+    reach it. The few-token cap is refused."""
+    monkeypatch.setattr(sequence_parallel, "DEFAULT_MIN_ROWS", 48)
+    groups(4, 2)
+    assert v3.sequence_parallel_rows_per_rank(2) == 24
+    with pytest.raises(ValueError, match="leave steps between the two kernels"):
+        v3.check_kernel_threshold(ep=8, tp=2, lowtok_cap=448)
+
+
 def test_tensor_parallel_gate_is_checked_at_the_first_sliced_bucket(
     groups, monkeypatch
 ):
