@@ -953,6 +953,59 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             configs.KVLayout.HEAD_ALONG_SUBLANE,
             configs.KVLayout.SEQ_ALONG_LANE,
         ],
+        dtype=[jnp.float32, jnp.bfloat16],
+        test_case=["decode", "partial_query_block"],
+    )
+    def test_ragged_paged_attention_unattended_nan_in_v(
+        self,
+        kv_layout: configs.KVLayout,
+        dtype: Any,
+        test_case: str,
+    ):
+        """NaNs in unattended KV page tails and unused batch slots must not
+        poison the attention output via 0.0 * NaN = NaN: V is masked on load
+        (SEQ_ALONG_LANE) or the kernel zeroes its KV buffers per call
+        (HEAD_ALONG_SUBLANE). Covers pure decode (every sequence in the DECODE
+        range, so the DECODE kernel runs, with bq_sz 1 as single-token decode
+        uses it, which takes the stitch's one-token path) and a partial query
+        block (q_len < bq_sz, MIXED).
+        """
+        num_heads = (16, 2)
+        head_dim = 128
+        page_size = 128 if kv_layout == configs.KVLayout.SEQ_ALONG_LANE else 16
+        num_pages = 100
+
+        seq_lens = (
+            [(1, 10), (1, 25), (1, 80)]
+            if test_case == "decode"
+            else [(37, 50)]  # Partial query block where q_len < bq_sz (e.g. 37 < 64)
+        )
+
+        distribution = None
+        blocks = {}
+        if test_case == "decode":
+            distribution = jnp.array([len(seq_lens)] * 3, dtype=jnp.int32)
+            blocks = dict(bq_sz=1, bq_csz=1)
+
+        self._test_ragged_paged_attention(
+            seq_lens,
+            num_heads,
+            head_dim,
+            page_size,
+            dtype,
+            dtype,
+            num_pages,
+            kv_layout=kv_layout,
+            bkv_sz=128,
+            distribution=distribution,
+            **blocks,
+        )
+
+    @parameterized.product(
+        kv_layout=[
+            configs.KVLayout.HEAD_ALONG_SUBLANE,
+            configs.KVLayout.SEQ_ALONG_LANE,
+        ],
     )
     def test_ragged_paged_attention_1m_context(self, kv_layout):
         kv_len = 1024 * 1024

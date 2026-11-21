@@ -374,6 +374,7 @@ def generate_mask(
     shape: tuple[int, int, int, int],
     *,
     bq_start: int,
+    stitch_meta: StitchMetadata,
     step_meta: ComputeMetadata,
     cfgs: configs.RpaConfigs,
 ) -> jax.Array:
@@ -398,7 +399,10 @@ def generate_mask(
         # Step 2
         #   offset = causal_offset - bq_start
         offset = step_meta.causal_offset[b_idx] - bq_start
-        mask_b = q_kv_diff >= offset
+        n_valid = (
+            stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
+        )
+        mask_b = jnp.logical_and(q_kv_diff >= offset, kv_iota < n_valid)
         if (sliding_window := cfgs.model.sliding_window) is not None:
             mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
 
@@ -641,6 +645,7 @@ def rpa_body(
                 cfgs.bkv_sz,
             ),
             bq_start=bq_start,
+            stitch_meta=stitch_meta,
             step_meta=step_meta,
             cfgs=cfgs,
         )
