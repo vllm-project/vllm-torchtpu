@@ -466,6 +466,11 @@ def write_main_cache(
     )
 
 
+# Steps with fewer key rows (decode and draft steps, small chunks) take the gather
+# in `compressed_pairs`.
+_PAIR_SHIFT_MIN_ROWS = 128
+
+
 def _pair_values_by_shift(keys, local, mask, ratio):
     """``keys[clip(local)]`` for the rows ``mask`` keeps, without a gather.
 
@@ -538,7 +543,13 @@ def compressed_pairs(
         - context[req, None]
     )
     mask = (local >= starts[req, None]) & (local < starts[req + 1, None])
-    if envs.VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT and len(local) == len(keys):
+    # The shift select replaces a prefill step's per-row gather; on a step under
+    # _PAIR_SHIFT_MIN_ROWS its cond and constant operands cost more than the gather.
+    if (
+        envs.VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT
+        and len(local) == len(keys)
+        and len(keys) >= _PAIR_SHIFT_MIN_ROWS
+    ):
         values = _pair_values_by_shift(keys, local, mask, ratio)
     else:
         values = keys[jnp.clip(local, 0, len(keys) - 1)]

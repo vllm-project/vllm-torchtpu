@@ -1267,6 +1267,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # statically shifted copies of the keys (offsets within two compression
     # groups of the token) instead of a gather; a lax.cond falls back to the
     # gather when a written row's offset is out of range (bit-identical pool).
+    # Steps under pooled_qsa._PAIR_SHIFT_MIN_ROWS key rows keep the gather.
     "VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT": env_bool("VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT"),
     # Whole-step megakernel decode: write all QSA layers' step tokens with
     # layer-stacked ops (one main K/V scatter, one compressed-key writer call)

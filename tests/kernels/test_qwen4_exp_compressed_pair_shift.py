@@ -72,7 +72,7 @@ def test_pair_shift_falls_back_on_out_of_range_rows(monkeypatch):
     # group members are far away, so the shift path must hand over to the gather.
     pool = jnp.zeros((64, 256, 1, 128), jnp.bfloat16)
     table = jnp.arange(64, dtype=jnp.int32).reshape(1, 64)
-    keys, complete, req, logical, starts, context = _step((64,), (0,), seed=1)
+    keys, complete, req, logical, starts, context = _step((256,), (0,), seed=1)
     logical = logical.at[10].set(43)
     complete = (logical % RATIO) == RATIO - 1
     step = (keys, complete, req, logical, starts, context)
@@ -81,3 +81,18 @@ def test_pair_shift_falls_back_on_out_of_range_rows(monkeypatch):
     mask = want[2]
     assert mask[10].any()
     np.testing.assert_array_equal(got[3][mask], want[3][mask])
+
+
+def test_pair_shift_skips_decode_sized_steps(monkeypatch):
+    # Below pooled_qsa._PAIR_SHIFT_MIN_ROWS the flag leaves the gather in place.
+    def no_shift(*args):
+        raise AssertionError("decode-sized step took the shift path")
+
+    monkeypatch.setattr(pooled_qsa, "_pair_values_by_shift", no_shift)
+    pool = jnp.zeros((64, 256, 1, 128), jnp.bfloat16)
+    table = jnp.arange(4 * 16, dtype=jnp.int32).reshape(4, 16) % 64
+    step = _step((1, 1, 1, 1), (37, 4, 130, 6), seed=3)
+    want = _pairs(False, monkeypatch, pool, table, step, None)
+    got = _pairs(True, monkeypatch, pool, table, step, None)
+    for g, w in zip(got, want):
+        np.testing.assert_array_equal(g, w)
