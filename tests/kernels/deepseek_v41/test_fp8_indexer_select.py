@@ -12,10 +12,18 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
     PackedFP8Layout,
     quantize_index_rows,
 )
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.candidates import (
+    prepare_candidates,
+)
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.dense_logits import (
     fp8_paged_mqa_logits,
 )
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.sparse_logits import (
+    candidate_windows,
+    fp8_gathered_mqa_logits,
+)
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_fp8 import (
+    _select_from_prepared_candidates,
     select_fp8_indexer_jax,
 )
 
@@ -200,3 +208,105 @@ def test_long_decode_row_beside_a_prefill_chunk_selects_top_scores():
         if length:
             rest = np.delete(scores[row, :length], ids)
             assert scores[row, ids].min() >= rest.max()
+
+
+# Served decode: one request's six MTP rows padded to the 16-row bucket, or an
+# idle rank whose rows are all padding.
+@pytest.mark.parametrize("live", [6, 0], ids=["six_mtp_rows", "all_padding"])
+def test_candidate_decode_scores_windows_and_selects_top_candidates(live):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Packed FP8 candidate scoring requires TPU")
+    rng = np.random.default_rng(17)
+    rows, candidates_per_row, block, width = 16, 2048, 8, 1 << 20
+    layout = PackedFP8Layout(1024, page_size=PAGE)
+    keys = jax.random.normal(
+        jax.random.key(7), (layout.pages * PAGE, 128), jnp.bfloat16
+    )
+    pool = _pack(keys, layout)
+    table = rng.permutation(layout.pages).astype(np.int32)
+    table = np.resize(table, (1, width // PAGE))
+    seq = 127_927
+    lengths = np.zeros(rows, np.int32)
+    lengths[:live] = seq - live + 1 + np.arange(live)
+    # Neighbouring rows share most candidate blocks, as published ones do.
+    shared = rng.choice(seq // block, candidates_per_row, replace=False)
+    candidates = np.full((rows, candidates_per_row), -1, np.int32)
+    for row in range(live):
+        ids = shared.copy()
+        swap = rng.random(ids.size) < 0.1
+        ids[swap] = rng.choice(seq // block, swap.sum())
+        ids = np.unique(ids)
+        extra = np.setdiff1d(np.arange(seq // block), ids)
+        ids = np.concatenate([ids, rng.choice(extra, candidates_per_row - ids.size)])
+        candidates[row] = np.sort(ids)
+    requests = np.where(np.arange(rows) < live, 0, -1).astype(np.int32)
+    prepared = jax.jit(prepare_candidates, static_argnums=(4, 5, 6))(
+        (pool,),
+        jnp.asarray(table),
+        jnp.asarray(candidates),
+        jnp.asarray(requests),
+        layout,
+        block,
+        width,
+    )
+    q = jnp.asarray(rng.normal(size=(rows, 32, 128)), jnp.float8_e4m3fn)
+    weights = jnp.asarray(rng.uniform(0.01, 0.1, (rows, 32)), jnp.float32)
+    n = jnp.asarray(lengths)
+
+    windows = candidate_windows(
+        prepared.candidate_block_ids,
+        prepared.block_spans,
+        jnp.where(prepared.valid_queries, n, 0),
+        block,
+    )
+    scores = np.asarray(
+        fp8_gathered_mqa_logits(
+            q,
+            prepared.keys,
+            weights,
+            windows,
+            query_start_loc=prepared.offsets,
+            output_width=candidates_per_row * block,
+        )
+    )
+    # Each row's two windows, in output columns from its union start.
+    windows = np.asarray(windows)
+    columns = np.arange(scores.shape[1]) + windows[:, :1]
+    visible = ((columns >= windows[:, :1]) & (columns < windows[:, 2:3])) | (
+        (columns >= windows[:, 1:2]) & (columns < windows[:, 3:4])
+    )
+    assert (scores[~visible] == -np.inf).all()
+    assert np.isfinite(scores[visible]).all()
+    assert (visible[:live].sum(1) > TOPK).all() and not visible[live:].any()
+
+    selected = np.asarray(
+        jax.jit(_select_from_prepared_candidates, static_argnums=range(4, 8))(
+            q, weights, n, tuple(prepared), TOPK, block, True, width
+        )
+    )
+    assert (selected[live:] == -1).all()
+    if not live:
+        return
+    reference = np.asarray(
+        fp8_paged_mqa_logits(
+            q[:live],
+            pool,
+            weights[:live],
+            n[:live],
+            jnp.asarray(table),
+            query_start_loc=jnp.asarray([0, live], jnp.int32),
+            max_model_len=width,
+            q_scale=jnp.ones_like(weights[:live]),
+            query_size=6,
+            cache_layout=layout,
+        )
+    )
+    for row in range(live):
+        tokens = (candidates[row][:, None] * block + np.arange(block)).ravel()
+        tokens = tokens[tokens < lengths[row]]
+        ids = selected[row]
+        assert np.unique(ids).size == ids.size == TOPK
+        assert np.isin(ids, tokens).all()
+        kth = np.sort(reference[row, tokens])[-TOPK]
+        tolerance = 2e-2 * np.abs(reference[row, tokens]).max()
+        assert reference[row, ids].min() >= kth - tolerance

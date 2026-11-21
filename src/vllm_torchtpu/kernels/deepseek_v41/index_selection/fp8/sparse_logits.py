@@ -62,16 +62,29 @@ def _kernel(
     offsets, windows, query_start, inputs, out, scratch, *, config, info, resident
 ):
     q, weights, pool = inputs
-    queries, keys, scores, counts, read_sem, write_sem, q_sem = scratch
+    queries, keys, scores, counts, read_sem, write_sem, q_sem = scratch[:7]
+    neg_inf, filled, fill_sem = scratch[7:]
     keys = pltpu.annotate(keys, no_store=True)
     weights = pltpu.annotate(weights, no_store=True)
     tokens, heads, dim = weights.shape[0], weights.shape[1], q.shape[-1]
     q_tile, mxu, sublanes = config.query_tile, info.mxu_column_size, info.num_sublanes
     pairs = PACKED_FP8_PREPARED_PAIRS
-    begin, width = query_start[()], out.shape[1]
+    begin, width, end = query_start[()], out.shape[1], query_start[()] + out.shape[0]
     group_rows = pool.shape[0] // (offsets.shape[0] - 1)
+
+    def empty(row):
+        start, split, end1, end2 = (windows[row * 4 + i] for i in range(4))
+        return (end1 <= start) & (end2 <= split)
+
+    # Trailing groups whose rows all have empty windows (padding) never enter
+    # the scoring loop; their rows publish -inf directly.
+    tail = lax.while_loop(lambda r: (r > begin) & empty(r - 1), lambda r: r - 1, end)
+    last_group = lax.while_loop(
+        lambda g: (g > 0) & (offsets[g] >= tail), lambda g: g - 1, offsets.shape[0] - 2
+    )
+    live_end = jnp.where(tail > begin, jnp.minimum(offsets[last_group + 1], end), begin)
     next_query = partial(
-        _next_query_tile, offsets=offsets, tile_size=q_tile, end=begin + out.shape[0]
+        _next_query_tile, offsets=offsets, tile_size=q_tile, end=live_end
     )
     lanes = jnp.arange(PAGE_RECORDS)
     owners = _head_order(
@@ -156,8 +169,31 @@ def _kernel(
             (positions >= split) & (positions < end2)
         )
 
-    def finish(query, slot):
-        # Rotate the second row to its window start, mask both rows and publish.
+    def finish(query, slot, *, skip_dead=False):
+        # Rows with only empty windows publish -inf from a shared buffer, so
+        # the slot's next user has no write to wait for. Masks stay unbranched
+        # where they hide under MXU fill; elsewhere dead groups skip them.
+        dead = limit(query) == 0
+        if skip_dead:
+            pl.when(~dead)(lambda: mask(query, slot))
+        else:
+            mask(query, slot)
+        count = jnp.where(dead, 0, query.count)
+        _dma_rows(
+            output(slot),
+            out,
+            write_sem.at[slot],
+            count,
+            src_start=query.start - offsets[query.page_row],
+            dst_start=query.start - begin,
+        )
+        fills = query.count - count
+        _dma_rows(neg_inf, out, fill_sem, fills, dst_start=query.start - begin)
+        filled[0] += fills
+        counts[slot] = count
+
+    def mask(query, slot):
+        # Rotate the second row to its window start and mask both rows.
         # Every output column is overwritten, so the buffer needs no -inf fill.
         query_rows = rows(query)
         start = windows[query_rows[1] * 4]
@@ -178,15 +214,6 @@ def _kernel(
         scores[slot, 0:1, pl.ds(0, width)] = jnp.where(
             visible(query_rows[0], 0), first, -jnp.inf
         ).reshape(1, -1)
-        _dma_rows(
-            output(slot),
-            out,
-            write_sem.at[slot],
-            query.count,
-            src_start=query.start - offsets[query.page_row],
-            dst_start=query.start - begin,
-        )
-        counts[slot] = query.count
 
     def key_parts(buffer, fragment):
         return [
@@ -215,9 +242,9 @@ def _kernel(
         for p, query in enumerate(tiles[key_ahead * pairs :]):
             load_keys(query, key_buffer(step + key_ahead, p))
 
-        def finish_previous():
+        def finish_previous(skip_dead=False):
             for p, query in enumerate(previous):
-                finish(query, slot_of(step - 1, p))
+                finish(query, slot_of(step - 1, p), skip_dead=skip_dead)
 
         def context(p, query):
             slot, buffer = slot_of(step, p), key_buffer(step, p)
@@ -306,7 +333,7 @@ def _kernel(
         span = reduce(jnp.maximum, [limit(query) for query in group])
         live = span > 0
         pl.when(live)(lambda: lax.switch(pl.cdiv(span, prefix * mxu) - 1, branches))
-        pl.when(~live)(finish_previous)
+        pl.when(~live)(lambda: finish_previous(skip_dead=True))
         following = list(tiles[pairs:])
         for _ in range(pairs):
             following.append(next_query(following[-1]))
@@ -318,6 +345,14 @@ def _kernel(
         tiles.append(next_query(tiles[-1]))
     for slot in range(2 * pairs):
         counts[slot] = zero
+    neg_inf[...] = jnp.full(neg_inf.shape, -jnp.inf, neg_inf.dtype)
+
+    @pl.loop(live_end, end)
+    def _(row):
+        target = out.at[pl.ds(row - begin, 1)]
+        pltpu.make_async_copy(neg_inf.at[pl.ds(0, 1)], target, fill_sem).start()
+
+    filled[0] = end - live_end
     for p in range(pairs):
         load_query(tiles[p], slot_of(zero, p))
     for g in range(key_ahead):
@@ -325,15 +360,17 @@ def _kernel(
             load_keys(tiles[g * pairs + p], key_buffer(jnp.int32(g), p))
     placeholder = tuple(tiles[0]._replace(count=zero) for _ in range(pairs))
     _, steps, last = lax.while_loop(
-        lambda state: state[0][0].start < begin + out.shape[0],
+        lambda state: state[0][0].start < live_end,
         body,
         (tuple(tiles), zero, placeholder),
     )
     # The first iteration finished empty placeholders; finish the last group.
     for p, query in enumerate(last):
-        finish(query, slot_of(steps - 1, p))
+        finish(query, slot_of(steps - 1, p), skip_dead=True)
     for slot in range(2 * pairs):
         release(slot)
+    fill = pltpu.make_async_copy(neg_inf.at[pl.ds(0, 1)], out.at[pl.ds(0, 1)], fill_sem)
+    lax.fori_loop(0, filled[0], lambda _, carry: (fill.wait(), carry)[1], 0)
 
 
 @jax.jit(static_argnames=("output_width", "query_count"))
@@ -392,6 +429,9 @@ def fp8_gathered_mqa_logits(
         pltpu.SemaphoreType.DMA((config.key_buffers,)),
         pltpu.SemaphoreType.DMA((slots, q_tile)),
         pltpu.SemaphoreType.DMA((slots,)),
+        pltpu.VMEM((q_tile, width), jnp.float32),
+        pltpu.SMEM((1,), jnp.int32),
+        pltpu.SemaphoreType.DMA,
     )
     hbm, vmem = (pl.BlockSpec(memory_space=s) for s in (pltpu.HBM, pltpu.VMEM))
     return pl.pallas_call(
