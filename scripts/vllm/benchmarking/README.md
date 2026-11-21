@@ -109,6 +109,33 @@ python3 scripts/vllm/benchmarking/check_regression.py \
   --baseline scripts/vllm/benchmarking/baselines/eval/<config>.<task>.baseline.json
 ```
 
+### Accuracy uses the mean of several runs
+
+Pass `--results-dir` once per run, both to calibrate a baseline and to check
+against one. The accuracy value is the mean over the runs. The standard error
+depends on the number of runs N:
+
+- Fewer than 5 runs: the mean of the standard errors the runs reported, kept
+  only when every run reported one. The gate is as wide as for a single run.
+- 5 or more runs: the measured spread, `stdev(values) / sqrt(N)`, in place of
+  the per-run `lm_eval` estimate. Runs that agree exactly give 0, so a
+  deterministic task falls back to the flat tolerance on its side. This gate
+  can be tighter than the single-run gate.
+
+The spread of fewer than 5 runs is too rough an estimate to narrow a gate with.
+The allowed drop is the same formula as above.
+
+A metric that any of the runs lacks is dropped, so a run that lost a task fails
+the check as a missing result. `--calibrate` exits `2` instead of writing a
+baseline when a run is empty or lacks a metric that another run has. Calibrated
+entries record `num_runs`, also for a single run.
+
+```bash
+python3 scripts/vllm/benchmarking/check_regression.py \
+  --mode eval --calibrate --task-filter <task> \
+  --results-dir <RUN1> --results-dir <RUN2> --results-dir <RUN3>
+```
+
 ## Accuracy Evaluation (`lm_eval`)
 
 ### Tasks

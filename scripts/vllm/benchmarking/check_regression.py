@@ -17,6 +17,8 @@
 Usage:
     check_regression.py --mode <perf|eval> --results-dir <dir> --baseline <baseline.json> [--tolerance 0.05]
     check_regression.py --mode <perf|eval> --calibrate --results-dir <dir> [<dir2> ...]
+
+Eval mode accepts --results-dir several times and compares the mean of the runs.
 """  # noqa: E501
 
 from __future__ import annotations
@@ -264,6 +266,57 @@ def load_eval_results(results_dir: Path) -> dict[str, dict]:
     return out
 
 
+# Fewest runs whose spread replaces the per-run reported stderr. The spread of
+# N runs has N - 1 degrees of freedom; below 5 runs it is too rough an estimate
+# to narrow a gate with, so fewer runs keep the single-run stderr and only the
+# value is averaged.
+MIN_RUNS_FOR_EMPIRICAL_STDERR = 5
+
+
+def aggregate_eval_runs(runs: Sequence[dict[str, dict]]) -> dict[str, dict]:
+    """Collapse the results of N runs into one entry per task.
+
+    Each accuracy value becomes the mean over the runs. Its stderr depends on
+    N:
+
+    - N < MIN_RUNS_FOR_EMPIRICAL_STDERR: the mean of the stderrs the runs
+      reported, present only when every run reported one. The gate is then as
+      wide as for a single run.
+    - N >= MIN_RUNS_FOR_EMPIRICAL_STDERR: the empirical standard error of the
+      mean, ``stdev(values) / sqrt(N)``. Runs that agree exactly give 0.0, so
+      a deterministic task falls back to the flat tolerance on its side.
+
+    A metric that any run lacks is left out, so a run that lost a task shows
+    up as a missing result instead of a mean over fewer runs.
+    """
+    if not runs:
+        return {}
+    n = len(runs)
+    out: dict[str, dict] = {}
+    for task in sorted(set().union(*runs)):
+        entries = [run.get(task, {}) for run in runs]
+        entry: dict[str, float] = {}
+        for k in ACC_KEYS:
+            values = [e[k] for e in entries if k in e]
+            if not values:
+                continue
+            if len(values) < n:
+                print(
+                    f"Warning: {task} {k} is in {len(values)} of {n} runs; dropped.",
+                    file=sys.stderr,
+                )
+                continue
+            entry[k] = statistics.fmean(values)
+            reported = [e[stderr_key(k)] for e in entries if stderr_key(k) in e]
+            if n >= MIN_RUNS_FOR_EMPIRICAL_STDERR:
+                entry[stderr_key(k)] = statistics.stdev(values) / math.sqrt(n)
+            elif len(reported) == n:
+                entry[stderr_key(k)] = statistics.fmean(reported)
+        if entry:
+            out[task] = {**entry, "num_runs": n}
+    return out
+
+
 class PrimaryMetric(NamedTuple):
     name: str
     value: float
@@ -430,18 +483,33 @@ def check_eval(
 def calibrate_eval(
     results_dirs: list[Path], task_filter: set[str] | None
 ) -> dict[str, dict]:
-    collected: dict[str, dict[str, list[float]]] = {}
-    for d in results_dirs:
-        for task, metrics in load_eval_results(d).items():
-            if task_filter is not None and task not in task_filter:
-                continue
-            slot = collected.setdefault(task, {})
-            for k, v in metrics.items():
-                slot.setdefault(k, []).append(float(v))
+    """Build an eval baseline as the mean of the runs in `results_dirs`.
 
-    baseline = {}
-    for task, metrics in collected.items():
-        baseline[task] = {k: statistics.median(vs) for k, vs in metrics.items()}
+    Raises ValueError when a run has no selected task or lacks a metric that
+    another run has, so a broken run cannot shrink or empty the baseline.
+    """
+    runs = []
+    for d in results_dirs:
+        run = {
+            task: metrics
+            for task, metrics in load_eval_results(d).items()
+            if task_filter is None or task in task_filter
+        }
+        if not run:
+            raise ValueError(f"no selected eval results under {d}")
+        runs.append(run)
+    baseline = aggregate_eval_runs(runs)
+    dropped = sorted(
+        {
+            f"{task} {k}"
+            for run in runs
+            for task, metrics in run.items()
+            for k in ACC_KEYS
+            if k in metrics and k not in baseline.get(task, {})
+        }
+    )
+    if dropped:
+        raise ValueError(f"not in every run: {'; '.join(dropped)}")
     return baseline
 
 
@@ -458,7 +526,8 @@ def main() -> int:
         type=Path,
         action="append",
         required=True,
-        help="Directory containing result files. Repeat for calibrate.",
+        help="Directory containing result files. Repeat for calibrate, or in "
+        "eval mode to compare the mean of several runs.",
     )
     parser.add_argument(
         "--baseline", type=Path, help="Baseline JSON to compare against."
@@ -513,15 +582,19 @@ def main() -> int:
                     "humaneval_plus_tpu",
                     "mbpp_plus_tpu",
                 }
-            baseline = calibrate_eval(args.results_dir, task_filter)
+            try:
+                baseline = calibrate_eval(args.results_dir, task_filter)
+            except ValueError as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 2
         json.dump(baseline, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
         return 0
 
     if args.baseline is None:
         parser.error("--baseline is required unless --calibrate is set")
-    if len(args.results_dir) != 1:
-        parser.error("--results-dir may only be given once in check mode")
+    if args.mode == "perf" and len(args.results_dir) != 1:
+        parser.error("--results-dir may only be given once in perf check mode")
 
     if args.mode == "perf":
         results = load_perf_results(args.results_dir[0])
@@ -532,13 +605,16 @@ def main() -> int:
             )
             return 2
     else:
-        results = load_eval_results(args.results_dir[0])
-        if not results:
-            print(
-                f"ERROR: no results_*.json found under {args.results_dir[0]}",
-                file=sys.stderr,
-            )
-            return 2
+        runs = [load_eval_results(d) for d in args.results_dir]
+        for results_dir, run in zip(args.results_dir, runs):
+            if not run:
+                print(
+                    f"ERROR: no results_*.json found under {results_dir}",
+                    file=sys.stderr,
+                )
+                return 2
+        # One run passes through untouched; several are gated on their mean.
+        results = runs[0] if len(runs) == 1 else aggregate_eval_runs(runs)
 
     with args.baseline.open() as fh:
         baseline = json.load(fh)
