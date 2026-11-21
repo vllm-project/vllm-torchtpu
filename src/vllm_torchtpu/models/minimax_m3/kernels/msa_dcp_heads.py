@@ -117,6 +117,53 @@ def merge_partials(
     return msa_fp4.unrotate_output(merged.astype(out.dtype)).transpose(1, 0, 2)
 
 
+def merge_partials_all_to_all(
+    out: jax.Array,
+    lse: jax.Array,
+    axis: str,
+    *,
+    dcp: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """`merge_partials` by one all-to-all: each rank's head block of the
+    partial goes to its owner, its LSEs riding as one more 16-bit head row,
+    and `msa_dcp.merge_partials` weighs, sums in f32 and unrotates in one
+    pass. For the decode rows of a head-parallel step, whose LSE all-gather
+    and reduce-scatter waited out late ranks (c64 mixed twin, j-741c6acc vs
+    j-613b69cd: 288.6 -> 282.0 ms per step); a decode step keeps the
+    reduce-scatter, which moves its partial faster than an all-to-all
+    (30 vs 47 us per layer at c64 b46)."""
+    num_heads, num_tokens, head_dim = out.shape
+    heads = num_heads // dcp
+    width = 2 * heads
+    if out.dtype.itemsize != 2 or width > head_dim:
+        raise ValueError(
+            f"16-bit partials of at most {head_dim // 2} heads per rank, got "
+            f"{out.dtype} {out.shape} over {dcp} ranks"
+        )
+    lse = lse.astype(jnp.float32).T.reshape(num_tokens, dcp, heads).transpose(1, 0, 2)
+    bits = jax.lax.bitcast_convert_type(lse, jnp.uint16)  # [dcp, T, Hl, 2]
+    bits = bits.reshape(dcp, 1, num_tokens, width)
+    bits = jnp.pad(bits, ((0, 0), (0, 0), (0, 0), (0, head_dim - width)))
+    send = jnp.concatenate(
+        [
+            jax.lax.bitcast_convert_type(out, jnp.uint16).reshape(
+                dcp, heads, num_tokens, head_dim
+            ),
+            bits,
+        ],
+        axis=1,
+    )  # [dcp, Hl + 1, T, D]: block r goes to rank r
+    got = jax.lax.all_to_all(send, axis, 0, 0, tiled=True)
+    parts = jax.lax.bitcast_convert_type(got[:, :heads], out.dtype)
+    lses = jax.lax.bitcast_convert_type(
+        got[:, heads, :, :width].reshape(dcp, num_tokens, heads, 2), jnp.float32
+    )
+    hadamard = jnp.asarray(msa_fp4.hadamard(head_dim), out.dtype)
+    merged = msa_dcp.merge_partials(parts, lses, hadamard, interpret=interpret)
+    return merged.reshape(num_tokens, heads, head_dim)
+
+
 _WEIGH_BLOCK_TOKENS = 64
 
 
@@ -175,9 +222,11 @@ def _dcp_attend(
     topk,
     rs_out_precision,
     interpret,
+    all_to_all=False,
 ):
     """The DCP attention of rows ``q [R, Hl, D]`` (this rank's rotated query
-    heads) with this rank's packed ``candidates [R, G * 2 * topk]``."""
+    heads) with this rank's packed ``candidates [R, G * 2 * topk]``, merged
+    by `merge_partials` or, with `all_to_all`, `merge_partials_all_to_all`."""
     q_all = jax.lax.all_gather(q, axis, axis=1, tiled=True)
     cand_all = jax.lax.all_gather(candidates, axis, axis=0)
     out, lse = msa_dcp.msa_attend_dcp(
@@ -194,6 +243,8 @@ def _dcp_attend(
         scale_cache=scale_cache,
         interpret=interpret,
     )
+    if all_to_all:
+        return merge_partials_all_to_all(out, lse, axis, dcp=dcp, interpret=interpret)
     return merge_partials(
         out, lse, axis, rs_out_precision=rs_out_precision, interpret=interpret
     )
@@ -768,6 +819,7 @@ def attend_and_merge(
         block_tables,
         cu_d,
         rs_out_precision=rs_out_precision,
+        all_to_all=True,
         **common,
     )
     tokens = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
