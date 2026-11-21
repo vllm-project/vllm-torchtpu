@@ -90,6 +90,23 @@ class TestTpuCompilerCache:
 
         assert disabled != enabled
 
+    def test_tpu_hash_covers_unregistered_megakernel_env(self):
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            base = compute_tpu_compilation_hash(self._config())
+            with patch.dict(os.environ, {"VLLM_TPU_MK_QSA_THR_FAST": "1"}):
+                thr = compute_tpu_compilation_hash(self._config())
+            with patch.dict(os.environ, {"VLLM_TPU_MK_BUCKET_TUNE_WIDE": "1"}):
+                wide = compute_tpu_compilation_hash(self._config())
+            again = compute_tpu_compilation_hash(self._config())
+
+        assert len({base, thr, wide}) == 3
+        assert again == base
+
     def test_tpu_hash_ignores_the_phased_profiler_switch(self):
         """Selecting a profiler must not bust the compile cache: otherwise a
         profiled run recompiles everything, and so does the next plain one."""

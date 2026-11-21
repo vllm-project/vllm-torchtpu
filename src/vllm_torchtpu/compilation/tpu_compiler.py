@@ -458,6 +458,24 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
     return factors
 
 
+def _unregistered_mk_env_factors() -> dict[str, str]:
+    """Megakernel env knobs read straight from os.environ (not in the envs registry).
+
+    Several whole-step kernel options (e.g. VLLM_TPU_MK_QSA_THR_FAST,
+    VLLM_TPU_MK_BUCKET_TUNE_WIDE) are read with os.environ.get at trace time, so
+    they change the lowered kernels but were missing from the cache key: an arm
+    that differs only in such a flag silently reused another arm's executables.
+    Hash every set VLLM_TPU_MK_* variable that the registry does not cover.
+    """
+    return {
+        name: value
+        for name, value in sorted(os.environ.items())
+        if name.startswith("VLLM_TPU_MK_")
+        and name not in envs.environment_variables
+        and name not in _TPU_COMPILE_ENV_IGNORED
+    }
+
+
 def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     """Hash TPU-specific factors used by both AOT and piecewise caches."""
     cache_config = vllm_config.cache_config
@@ -470,6 +488,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "jaxlib": importlib_metadata.version("jaxlib"),
         "libtpu": importlib_metadata.version("libtpu"),
         "env": _tpu_compile_env_factors(),
+        "mk_raw_env": _unregistered_mk_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
         "parallel": {
             "effective_data_parallel_size": utils.get_dp_size(
