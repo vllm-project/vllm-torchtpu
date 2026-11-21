@@ -4254,6 +4254,37 @@ def test_truncate_rope_caches_keeps_speculative_slack(monkeypatch):
     )
 
 
+def test_precompile_timed_and_sample_tokens_share_dynamo_trace():
+    """A graph traced inside _precompile_timed is reused by sample_tokens.
+
+    Both run under no_grad even when the caller has grad enabled, so Dynamo's
+    grad mode guard matches and the graph is not traced again.
+    """
+    from torch._dynamo.testing import CompileCounter
+
+    counter = CompileCounter()
+    compiled_add = torch.compile(lambda x: x + 1, backend=counter, fullgraph=True)
+    x = torch.zeros(4)
+    grad_states = []
+    runner = SimpleNamespace(
+        execute_model_state=None,
+        _pp_is_last=False,
+        _sample_tokens_pp_intermediate_stage=lambda: (
+            grad_states.append(torch.is_grad_enabled()),
+            compiled_add(x),
+        )[-1],
+        _update_num_xla_graphs=lambda _name: None,
+    )
+    with torch.enable_grad():
+        with TPUModelRunner._precompile_timed(runner, "test_pass"):
+            assert not torch.is_grad_enabled()
+            compiled_add(x)
+        TPUModelRunner.sample_tokens(runner, None)
+        assert torch.is_grad_enabled()
+    assert grad_states == [False]
+    assert counter.frame_count == 1
+
+
 class TestLogitsAtDpVocabRows:
     """TPU_DP_VOCAB_PARALLEL: every logits batch reaches the compiled logits
     program at the step's DP-wide request bucket, padded and sliced outside
