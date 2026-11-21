@@ -25,6 +25,7 @@ a program. The layer's own TPU test, which comes with the layer, runs it end
 to end on an eight-core TPU host.
 """
 
+import contextlib
 import functools
 
 import jax
@@ -35,21 +36,27 @@ from jax._src.pallas.mosaic import tpu_info
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.fused_moe.v3 import combine, device, select_kernel
-
-LANES = 128
+from vllm_torchtpu.kernels.fused_moe.v3.layout import LANES
 
 
 def _tpu7x():
     return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
 
 
-@pytest.fixture
-def interpret(monkeypatch):
+@contextlib.contextmanager
+def _interpret_mode(monkeypatch):
     """TPU interpret mode with a TPU7x chip record (the programs size their
     VMEM from it)."""
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
     monkeypatch.setattr(tpu_info, "get_tpu_info", _tpu7x)
     with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()):
+        yield
+
+
+@pytest.fixture
+def interpret(monkeypatch):
+    """The program in TPU interpret mode on CPU."""
+    with _interpret_mode(monkeypatch):
         yield
 
 
@@ -64,9 +71,7 @@ def interpret_or_chip(request, monkeypatch):
     if request.param == "tpu":
         yield
         return
-    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
-    monkeypatch.setattr(tpu_info, "get_tpu_info", _tpu7x)
-    with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()):
+    with _interpret_mode(monkeypatch):
         yield
 
 
