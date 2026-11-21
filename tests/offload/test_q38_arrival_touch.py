@@ -149,17 +149,20 @@ def _abort(sched, *req_ids):
 
 
 def _cached_turn(sched, req_id, tokens):
-    """A finished turn: scheduled once (its blocks hashed at allocation), then ended, so its prefix sits in the free
-    queue as cached blocks; then one empty schedule pass, as in serving, where a returner arrives seconds after its
-    previous turn. (With vllm_torchtpu._patch_vllm_same_step_prefix_hits active, blocks hashed in a pass are no hit
-    until the next pass starts.)"""
-    sched.add_request(_req(req_id, tokens))
-    out = sched.schedule()
-    assert [r.req_id for r in out.scheduled_new_reqs] == [req_id]
-    _abort(sched, req_id)
-    assert not sched.schedule().scheduled_new_reqs
-    req = _req(req_id + "-probe", tokens + [7])
-    _, hit, _ = sched.kv_cache_manager.coordinator.find_longest_cache_hit(req.block_hashes, req.num_tokens - 1)
+    """A finished turn whose prefix sits in the free queue as cached blocks: allocated (hashed) and freed through the
+    scheduler's own KV cache manager, as a turn that prefilled and finished seconds ago leaves it. (Not through
+    schedule + abort: a request aborted before its step's output is processed does not leave a usable prefix here,
+    dev run j-0f4adcd0.) The same-step patch's unwritten set is cleared as the next pass would."""
+    kvm = sched.kv_cache_manager
+    req = _req(req_id, tokens)
+    blocks, hit, _ = kvm.get_computed_blocks(req)
+    assert kvm.allocate_slots(req, req.num_tokens - hit, num_new_computed_tokens=hit,
+                              new_computed_blocks=blocks) is not None
+    req.num_computed_tokens = req.num_tokens
+    kvm.free(req)
+    kvm.block_pool.__dict__.get("_tpu_unwritten_block_ids", set()).clear()
+    probe = _req(req_id + "-probe", tokens + [7])
+    _, hit, _ = kvm.coordinator.find_longest_cache_hit(probe.block_hashes, probe.num_tokens - 1)
     assert hit == len(tokens) // BS * BS, f"precondition: the finished turn is cached ({hit})"
 
 
@@ -271,7 +274,7 @@ def test_pinned_prefix_survives_the_wait(monkeypatch, restore_scheduler):
     sched, hit_on = _returner_run(monkeypatch, on=True)
     assert hit_on == 30 * BS, f"PIN flag on: the pinned prefix survives the churn ({hit_on})"
     s = _pins(sched).stats
-    assert (s["arrivals"], s["pinned"], s["pinned_blocks"]) == (2, 1, 30), f"PIN counters {s}"
+    assert (s["arrivals"], s["pinned"], s["pinned_blocks"]) == (1, 1, 30), f"PIN counters {s}"
 
 
 def test_pin_is_released_when_the_request_is_scheduled(monkeypatch, restore_scheduler):
@@ -426,7 +429,7 @@ def engine_patches():
 def _pp8(monkeypatch, evict_state):
     """Served PP8 prefill groups: another conversation computed a shared head (J blocks) and one block more. Split
     chain (``evict_state``, the measured hole): HBM's LRU took its state checkpoints and the turn shares only the head.
-    Convergent: the checkpoints stay and the turn continues the other conversation's J + 1 full blocks."""
+    Convergent: the checkpoints stay and the turn continues the other conversation's whole prompt."""
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -454,7 +457,7 @@ def _pp8(monkeypatch, evict_state):
     if evict_state:
         turn = _request("turn", head + _tokens(3 * BLOCK, 9) + _tokens(2000, 10))
     else:
-        turn = _request("turn", list(other.prompt_token_ids[: (J + 1) * BLOCK]) + _tokens(2000, 10))
+        turn = _request("turn", list(other.prompt_token_ids) + _tokens(2000, 10))
     return kvm, turn, J, BLOCK
 
 
@@ -503,10 +506,14 @@ def test_served_groups_pin_the_attention_run_and_the_state_checkpoint(monkeypatc
     assert all(b.block_hash is not None for g in groups for b in g if not b.is_null), "HYBRID a pinned block lost its hash"
     pool.free_blocks(drained)
     # The scheduler's own choice (divergent, falling back to convergent when the tier has nothing) adopts pinned blocks only.
-    blocks, hit = (div_blocks, div_hit) if div_hit else (conv_blocks, conv_hit)
-    assert kvm.allocate_slots(turn, 0 if hit else turn.num_tokens, num_new_computed_tokens=hit,
-                              new_computed_blocks=blocks, num_external_computed_tokens=BLOCK if hit else 0,
-                              delay_cache_blocks=True) is not None
+    if div_hit > conv_hit:  # divergent: the head is adopted and the tier's load supplies the rest
+        blocks, hit = div_blocks, div_hit
+        assert kvm.allocate_slots(turn, 0, num_new_computed_tokens=hit, new_computed_blocks=blocks,
+                                  num_external_computed_tokens=BLOCK, delay_cache_blocks=True) is not None
+    else:  # convergent: a local hit, the rest computed
+        blocks, hit = conv_blocks, conv_hit
+        assert kvm.allocate_slots(turn, turn.num_tokens - hit, num_new_computed_tokens=hit,
+                                  new_computed_blocks=blocks) is not None
     adopted = {id(b) for g in blocks.blocks for b in g if not b.is_null}
     assert adopted <= pinned, "HYBRID the scheduler adopted a block the pin did not hold"
     pins.release(kvm, "turn", "rel_sched")
