@@ -100,6 +100,8 @@ def test_tpu_ar_worker_init_device_builds_ar_model_runner(
         "requires_full_payload_input": False,
         "custom_process_next_stage_input_func": None,
         "stage_connector_config": None,
+        # The worker looks up a model-registered runner by architecture.
+        "_architecture": "Qwen2ForCausalLM",
     }.items():
         object.__setattr__(model_config, name, value)
 
