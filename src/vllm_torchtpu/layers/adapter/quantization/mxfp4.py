@@ -1040,7 +1040,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 layer.w2_weight,
                 layer._tpu_fused_w13_scale,
                 layer._tpu_fused_w2_scale,
-                router_logits,
+                _mask_padding_logits(router_logits),
                 _with_image_bias(layer, score_bias_operand(layer), input_ids, rows),
                 hash_topk_ids_operand(layer, input_ids),
                 expert_placement.expert_slot_table(layer),
@@ -1091,13 +1091,51 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             layer.w2_weight,
             layer._tpu_fused_w13_scale,
             layer._tpu_fused_w2_scale,
-            router_logits,
+            _mask_padding_logits(router_logits),
             _with_image_bias(layer, score_bias_operand(layer), input_ids, rows),
             hash_topk_ids_operand(layer, input_ids),
             expert_placement.expert_slot_table(layer),
             expert_load.operand(layer),
             shared_expert=shared_expert,
         )
+
+
+def _mask_padding_logits(router_logits: torch.Tensor) -> torch.Tensor:
+    """Router logits with the padding rows of this step set to -inf.
+
+    The fused EP MoE routes a row whose logits are not finite to no expert
+    (the same rule that drops replica padding), so a padding row then costs
+    no expert weight reads and no exchange. The padding mask comes from the
+    stage that compacted the rows, if any (the CED decoder stage passes
+    ``token_padding_mask``), else from the runner's per-step mask
+    (``token_padding.mark_padding``). Without a mask of the right length the
+    logits are returned unchanged. Active only with
+    ``TPU_FUSED_MOE_EP_MASK_PADDING``.
+
+    Args:
+        router_logits: [rows, experts] logits of this rank's own rows.
+
+    Returns:
+        The logits, with every padding row filled with -inf.
+    """
+    if not envs.TPU_FUSED_MOE_EP_MASK_PADDING:
+        return router_logits
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    rows = router_logits.shape[0]
+    mask = None
+    if is_forward_context_available():
+        mask = get_forward_context().additional_kwargs.get("token_padding_mask")
+    if mask is None and token_padding._padding_state is not None:
+        mask = token_padding._padding_state.get_local_padding_mask(rows)
+    if mask is None or mask.shape[0] != rows:
+        return router_logits
+    return router_logits.masked_fill(mask[:, None], float("-inf"))
 
 
 def _with_image_bias(layer, bias, input_ids, rows):
