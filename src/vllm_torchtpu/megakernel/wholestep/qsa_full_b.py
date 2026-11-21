@@ -100,6 +100,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         select_nvis: int = 0,
         nvis_rows: tuple = (32, 64),
         xmerge: bool = False,
+        thr_fast: str | None = None,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -276,7 +277,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
         # thresholds and the row compaction (r). "1" = "ter2" (exos c16 mix best; three
         # tiers' static copies slowed every rank's select at b16); letters pick parts.
         # VLLM_TPU_MK_QSA_THR_EXIT = "bit,every": first while-loop bit, passes per trip.
-        fast = os.environ.get("VLLM_TPU_MK_QSA_THR_FAST", "0")
+        # `thr_fast` (not None): this kernel's value instead of the env (per row bucket:
+        # VLLM_TPU_MK_QSA_THR_FAST_BUCKETS, `qwen38_wholestep_call.thr_fast_options`).
+        fast = thr_fast if thr_fast is not None else os.environ.get("VLLM_TPU_MK_QSA_THR_FAST", "0")
         fast = "ter2" if fast == "1" else "" if fast == "0" else fast
         ex_bit, ex_every = (int(x) for x in
                             os.environ.get("VLLM_TPU_MK_QSA_THR_EXIT", "19,2").split(","))

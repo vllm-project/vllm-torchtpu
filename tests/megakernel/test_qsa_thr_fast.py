@@ -141,3 +141,48 @@ def test_kernel_thr_fast_bit_identical(monkeypatch, ctx, zero):
         got = run()
         for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new"), (7, "ids")):
             np.testing.assert_array_equal(got[i], base[i], err_msg=f"{name} {fast} {exit_}")
+
+
+# ------------------------------------------------- per-bucket override (THR_FAST_BUCKETS)
+def test_thr_fast_buckets_options(monkeypatch):
+    """VLLM_TPU_MK_QSA_THR_FAST_BUCKETS gives the listed buckets their own value and leaves
+    every other bucket (and the bucket-less specs) without the option: spec unchanged."""
+    from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_call import thr_fast_options
+
+    monkeypatch.delenv("VLLM_TPU_MK_QSA_THR_FAST_BUCKETS", raising=False)
+    assert thr_fast_options(16) == {}
+    monkeypatch.setenv("VLLM_TPU_MK_QSA_THR_FAST_BUCKETS", "16:te,32:te")
+    assert thr_fast_options(16) == {"thr_fast": "te"}
+    assert thr_fast_options(32) == {"thr_fast": "te"}
+    assert thr_fast_options(24) == {} and thr_fast_options(None) == {}
+
+
+@pytest.mark.parametrize("env,kw", [("1", "te"), ("0", "te"), ("te", "1"), ("te", None)])
+def test_thr_fast_kwarg_overrides_env(monkeypatch, env, kw):
+    """The block's `thr_fast` kwarg sets exactly what the env value would (the kernel reads
+    only these fields), and None falls back to the env."""
+    from vllm_torchtpu.megakernel.wholestep.qsa_full_b import QSAFullIndexedBlock
+
+    fields = lambda b: (b.thr_kw, b.thr_tiers, b.cmp_tiers, b.tier_two)  # noqa: E731
+    mk = lambda **k: QSAFullIndexedBlock(max_groups=2048, pages_per_seq=64, **k)  # noqa: E731
+    monkeypatch.setenv("VLLM_TPU_MK_QSA_THR_FAST", kw if kw is not None else env)
+    want = fields(mk())
+    monkeypatch.setenv("VLLM_TPU_MK_QSA_THR_FAST", env)
+    assert fields(mk(thr_fast=kw)) == want
+
+
+def test_kernel_thr_fast_te_bit_identical(monkeypatch):
+    """THR_FAST=te (the per-bucket c32 b16/b32 value: tie skip + early exit, no tiers) gives
+    bit-identical ids, residuals, keys and rings to off, all-zero keys included."""
+    from test_wholestep import _run_c
+
+    for ctx, zero in (([3000, 6000], False), ([6000, 100], True)):
+        ck_fn = (lambda ck: jnp.zeros_like(ck)) if zero else None
+        run = lambda: _run_c(long=True, rank_ids=True, union=True, ctx=ctx,  # noqa: E731
+                             max_groups=2048, ck_fn=ck_fn)
+        monkeypatch.setenv("VLLM_TPU_MK_QSA_THR_FAST", "0")
+        base = run()
+        monkeypatch.setenv("VLLM_TPU_MK_QSA_THR_FAST", "te")
+        got = run()
+        for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new"), (7, "ids")):
+            np.testing.assert_array_equal(got[i], base[i], err_msg=f"{name} te {ctx} {zero}")
