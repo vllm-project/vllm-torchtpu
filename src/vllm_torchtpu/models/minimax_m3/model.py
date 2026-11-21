@@ -15,7 +15,7 @@
 
 import contextlib
 import functools
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 
 import torch
 from torch import nn
@@ -305,6 +305,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
             return shard, tensor_model_parallel_reduce_scatter(ffn(gathered), 0)
         # The MoE's padding mask is indexed by row: give it piece-major rows.
         rows = functools.partial(_piece_major_rows, shard.shape[0] * tp, tp, n)
+        if envs.TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE and not self.is_moe_layer:
+            per = shard.shape[0] * tp // n
+            out_updates = []
+            for i, piece in enumerate(gathered):
+                piece_rows = functools.partial(_rows_slice, rows, i * per, per)
+                with token_padding.padding_of_rows(piece_rows):
+                    out = ffn(piece)
+                out_updates.append(tensor_model_parallel_reduce_scatter(out, 0))
+            return shard, torch.cat(out_updates)
         with token_padding.padding_of_rows(rows):
             out = ffn(gathered)
         out_updates = [tensor_model_parallel_reduce_scatter(o, 0) for o in out.chunk(n)]
@@ -359,6 +368,15 @@ def _piece_major_rows(
     pieces' order: piece i holds every rank's i-th row block of its shard."""
     x = x[:tokens].view(tp_size, pieces, -1, *x.shape[1:])
     return x.transpose(0, 1).flatten(0, 2)
+
+
+def _rows_slice(
+    rows: Callable[[torch.Tensor], torch.Tensor],
+    start: int,
+    length: int,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    return rows(x)[start : start + length]
 
 
 def _ffn_pieces(shard_rows: int, tp_size: int) -> int:

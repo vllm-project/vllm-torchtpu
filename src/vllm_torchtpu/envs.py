@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     TPU_MOE_TC_COMBINE_PIECES: int = 1
     TPU_MINIMAX_M3_SP_ATTN_PIECES: bool = False
     TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES: bool = True
+    TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE: bool = False
     TPU_TP_PALLAS_SMALL_ALL_GATHER: bool = False
     TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS: int = 4096
     TPU_MINIMAX_M3_MSA_WIDE_TILES: str = "off"
@@ -858,6 +859,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (off: only the attention side, qkv_proj and o_proj, runs per piece).
     "TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES": env_bool(
         "TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES", default=True
+    ),
+    # With TPU_MINIMAX_M3_SP_FFN_PIECES: run a dense layer's FFN once per
+    # gathered piece instead of once over all pieces, so a piece's
+    # reduce-scatter overlaps the next piece's FFN. (MoE layers keep one
+    # pass: per piece the fp4 experts are re-streamed and re-quantized.)
+    "TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE": env_bool(
+        "TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE", default=False
     ),
     # With the Pallas TP all-reduce armed: all-gather small tensors (an SP
     # step's e4m3 row scales, the DSpark draft's context fc columns, the
