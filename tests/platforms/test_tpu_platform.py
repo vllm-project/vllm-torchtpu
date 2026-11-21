@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import copy
 import math
 import os
@@ -278,6 +279,21 @@ def set_mock_attn_to_vllm_config(vllm_config, page_size, min_page_size):
     mock_attn.get_attn_backend.return_value = mock_impl
     new_vllm_config.compilation_config.static_forward_context = {"layer": mock_attn}
     return new_vllm_config, mock_impl
+
+
+@contextlib.contextmanager
+def _live_vllm_envs():
+    """vLLM's envs read live, as in the front end: an engine core earlier in
+    this process may have turned vLLM's env cache on."""
+    from vllm import envs as vllm_envs
+
+    was_cached = vllm_envs._is_envs_cache_enabled()
+    vllm_envs.disable_envs_cache()
+    try:
+        yield
+    finally:
+        if was_cached:
+            vllm_envs.enable_envs_cache()
 
 
 class TestTpuPlatform:
@@ -697,6 +713,24 @@ class TestTpuPlatform:
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
     )
+    def test_check_and_update_config_forwards_knobs_to_ray_dp_actors(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, monkeypatch
+    ):
+        vllm_config.parallel_config.data_parallel_backend = "ray"
+        # setenv, not delenv: monkeypatch then removes the value the code writes.
+        monkeypatch.setenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
+        monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+
+        with _live_vllm_envs():
+            TpuPlatform.check_and_update_config(vllm_config)
+
+        names = os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"].split(",")
+        assert "TPU_MOE_SKIP_PADDED_TOKENS" in names
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
     def test_check_and_update_config_rejects_budget_above_compile_sizes(
         self, mock_prepare_env, mock_apply_patches, vllm_config
     ):
@@ -1096,6 +1130,60 @@ class TestTpuPlatform:
         from vllm_torchtpu.utils import get_device_name
 
         assert get_device_name() == expected_name
+
+
+class TestForwardKnobsToRayDpActors:
+    """vLLM's Ray data-parallel engine actors copy only vLLM's own env names
+    and the ones in VLLM_RAY_EXTRA_ENV_VARS_TO_COPY; the platform adds its set
+    knobs there before the front end starts them."""
+
+    @pytest.fixture(autouse=True)
+    def _live_envs(self):
+        with _live_vllm_envs():
+            yield
+
+    @staticmethod
+    def _config(backend="ray"):
+        return SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_backend=backend)
+        )
+
+    def test_set_knobs_join_the_operators_list(self, monkeypatch):
+        monkeypatch.setenv(
+            "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "NEW_MODEL_DESIGN, TPU_EXPERT_PLACEMENT"
+        )
+        monkeypatch.setenv("TPU_EXPERT_PLACEMENT", "/tmp/placement.json")
+        monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+        # Written by this package in every process: derived again there.
+        monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "2x2x1")
+        # Each host's own topology.
+        monkeypatch.setenv("TPU_HOST_BOUNDS", "1,1,1")
+        monkeypatch.delenv("TPU_ROPE_CACHE_ROW_MAJOR", raising=False)
+
+        TpuPlatform._forward_knobs_to_ray_dp_actors(self._config())
+
+        names = os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"].split(",")
+        assert names[:2] == ["NEW_MODEL_DESIGN", "TPU_EXPERT_PLACEMENT"]
+        assert names.count("TPU_EXPERT_PLACEMENT") == 1
+        assert "TPU_MOE_SKIP_PADDED_TOKENS" in names
+        assert "TORCH_TPU_TOPOLOGY" not in names
+        assert "TPU_HOST_BOUNDS" not in names
+        assert "TPU_ROPE_CACHE_ROW_MAJOR" not in names
+
+    def test_vllm_then_copies_the_knob_to_the_actors(self, monkeypatch):
+        from vllm.ray.ray_env import get_env_vars_to_copy
+
+        monkeypatch.setenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
+        monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+        assert "TPU_MOE_SKIP_PADDED_TOKENS" not in get_env_vars_to_copy()
+        TpuPlatform._forward_knobs_to_ray_dp_actors(self._config())
+        assert "TPU_MOE_SKIP_PADDED_TOKENS" in get_env_vars_to_copy()
+
+    def test_other_data_parallel_backends_are_left_alone(self, monkeypatch):
+        monkeypatch.delenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", raising=False)
+        monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+        TpuPlatform._forward_knobs_to_ray_dp_actors(self._config("mp"))
+        assert "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY" not in os.environ
 
 
 class TestPhasedProfilingConfigValidation:

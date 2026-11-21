@@ -635,8 +635,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # never reads those blocks. Applies only where that holds (GDN layers, no
     # speculative decoding, no KV connector); everything else keeps vLLM's
     # stock accounting either way. Read by the model runner;
-    # TpuPlatform.additional_env_vars carries it to Ray workers. See
-    # core/runner_slot_mamba.py.
+    # TpuPlatform.additional_env_vars forwards it to Ray data-parallel engine
+    # actors. See core/runner_slot_mamba.py.
     "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS": env_bool(
         "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", default=True
     ),
