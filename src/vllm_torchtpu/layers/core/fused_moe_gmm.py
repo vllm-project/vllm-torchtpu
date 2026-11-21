@@ -19,6 +19,7 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels import fp8_linear
 from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
@@ -769,6 +770,8 @@ def shared_expert_mlp(
     SharedExpert describes."""
 
     def projection(v, w, scale):
+        if v.dtype == jnp.bfloat16 and 0 < v.shape[0] <= fp8_linear.max_rows(*w.shape):
+            return fp8_linear.fp8_linear(v, w, scale)
         w = w.astype(jnp.bfloat16)
         if v.shape[0] >= _SHARED_UPCAST_MIN_ROWS:
             w = jax.lax.optimization_barrier(w)
