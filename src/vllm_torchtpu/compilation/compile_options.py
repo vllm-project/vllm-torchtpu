@@ -23,9 +23,10 @@ it is built, before any compiled function runs; until then those functions
 behave as plain ``torch.compile`` ones.
 """
 
-import dataclasses
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
+
+from vllm_torchtpu import config_section
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -45,41 +46,20 @@ def parse(raw: Any) -> CompileOptions:
     """The ``tpu_compile`` section as options; None gives the defaults.
 
     Strict: an unknown key, or a value whose type is not exactly the field's
-    (``1`` for a bool, say), raises ``ValueError``.
+    (``1`` for a bool, say), raises ``ValueError`` (``config_section.parse``).
     """
-    if raw is None:
-        return CompileOptions()
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"additional_config.{SECTION} must be a JSON object, "
-            f"got {type(raw).__name__}"
-        )
-    fields = {f.name: f.type for f in dataclasses.fields(CompileOptions)}
-    unknown = sorted(set(raw) - set(fields))
-    if unknown:
-        raise ValueError(
-            f"additional_config.{SECTION} has unknown keys {unknown}; "
-            f"valid keys: {sorted(fields)}"
-        )
-    for name, value in raw.items():
-        want = fields[name]
-        assert isinstance(want, type)  # the annotations are classes, not strings
-        if type(value) is not want:
-            raise ValueError(
-                f"additional_config.{SECTION}.{name} must be a "
-                f"{want.__name__}, got {value!r}"
-            )
-    return CompileOptions(**raw)
+    return config_section.parse(CompileOptions, SECTION, raw)
 
 
 def get(vllm_config: "VllmConfig | None") -> CompileOptions:
     """The engine's compile options. ``TpuPlatform.check_and_update_config``
     calls this, so a malformed section fails at startup. None (a worker built
     without a config, as the spawned-process patch test builds one) gives the
-    defaults."""
+    defaults, and so does an ``additional_config`` that is not a dict
+    (``config_section.get``)."""
     if vllm_config is None:
         return CompileOptions()
-    return parse(cast("dict[str, Any]", vllm_config.additional_config).get(SECTION))
+    return config_section.get(CompileOptions, SECTION, vllm_config)
 
 
 def apply(vllm_config: "VllmConfig | None") -> CompileOptions:
