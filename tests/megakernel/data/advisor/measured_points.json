@@ -1,0 +1,34 @@
+{
+  "schema": "advisor.measured_points.v2",
+  "description": "Measured megakernel step times for advisor validation. A point is either a recorded benchmark job (job_id) or a number from a public source (source_url, marked approximate, with stated assumptions).",
+  "points": [
+    {
+      "id": "kimi_k3_public_decode_step_1_sequence_7_drafts",
+      "provenance_kind": "public_source",
+      "source_url": "https://inferact.ai/news/tpu-megakernels",
+      "source_quote": "At ~8.5 ms per decode step, the megakernel can deliver over 700 tokens per second to a single user.",
+      "approximate": true,
+      "assumptions": [
+        "Context length is not published; 4096 tokens assumed.",
+        "The published step may include draft-model time, which the advisor does not price."
+      ],
+      "model": "kimi-k3",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "layout": "TP32 x EP32 x DCP32",
+      "rows": 8,
+      "rows_quote": "Each kernel launch evaluates 1 anchor and 7 proposed continuations in a single step.",
+      "workload": {
+        "phase": "verify",
+        "batch": 1,
+        "spec_tokens": 7,
+        "context": 4096,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 32
+      },
+      "step_time_us": 8500.0,
+      "n": 1
+    }
+  ]
+}
