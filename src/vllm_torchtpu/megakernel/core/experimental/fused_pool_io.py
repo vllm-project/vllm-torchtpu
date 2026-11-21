@@ -63,7 +63,7 @@ tests cover the arithmetic but not every TPU lowering:
   (`PoolLayout.conv_page_rows`);
   TPU writes the live rows only and relies on the zero-initialized staging page.
 The TPU paths are exercised by `@pytest.mark.tpu_test` in
-`tests/megakernel/core/test_pool_f32_conv_step.py`.
+`tests/megakernel/core/test_fused_pool_io_tpu.py`.
 
 The fused GDN recurrence is always head-major (`GDNTunables.gdn_head_major=True`
 numerics); compare it against the split path with that flag enabled.

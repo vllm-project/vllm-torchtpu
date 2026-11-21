@@ -265,11 +265,11 @@ def test_f32_conv_pooled_step_matches_reference_and_keeps_conv_exact(T: int, B: 
     ],
 )
 def test_f32_conv_fused_matches_split_bitwise(T: int, wide_qkv: bool, conv_dtype: Any):
-    """Fused pool I/O (`T in (1, 4)`, `conv_stage in (False, True)`) with
-    `conv_dtype in (bf16, f32)` matches head-major split pool I/O bit-for-bit on
-    hidden outputs and non-`rec` pool bytes (`kc`, `vc`, `conv`), and within
-    1 bf16 ULP on `rec` on XLA:CPU (full TPU bit-exactness in
-    `test_fused_pool_io_tpu.py`)."""
+    """Fused pool I/O (`T in (1, 4)`, `conv_stage in (False, True)`) matches
+    head-major split pool I/O: bitwise on `f32`-conv hidden outputs (at `T=1`
+    and `t=0` of `T=4`) and on KV/conv pool bytes, within 8 `bf16` ULPs on CPU
+    for `bf16`-conv hidden outputs across `L=4` (TPU bitwise coverage for both
+    `bf16` and `f32` conv is in `test_fused_pool_io_tpu.py`)."""
     mesh = _cpu_mesh(2)
     tp = NamedSharding(mesh, P("tp"))
     g = _wide_conv_geom() if wide_qkv else _tiny_geom()
@@ -355,10 +355,30 @@ def test_f32_conv_fused_matches_split_bitwise(T: int, wide_qkv: bool, conv_dtype
             np.asarray(r_cs).view(np.uint8), np.asarray(r_f).view(np.uint8)
         )
 
+    is_f32_conv = jnp.dtype(conv_dtype) == jnp.dtype(F32)
     if T == 1:
-        np.testing.assert_array_equal(
-            np.asarray(hid_fused).view(np.uint8), np.asarray(hid_split).view(np.uint8)
-        )
+        if is_f32_conv:
+            np.testing.assert_array_equal(
+                np.asarray(hid_fused).view(np.uint8),
+                np.asarray(hid_split).view(np.uint8),
+            )
+        else:
+            # On Intel XLA:CPU, batched `(B, QKV)`/`[CB, KD, VD]` split vs
+            # per-sequence `(1, QKV)`/`[1, KD, VD]` fused GDN conv+recurrence
+            # can differ by 1 `bf16` ULP, propagating to <= 4 `bf16` ULPs
+            # (`4 * 2**-7`) across `L=4`; allow `8 * 2**-7` (`2**-4`) on `hid`
+            # while keeping padded rows, KV, conv, and non-`rec` pool bytes
+            # bitwise (TPU bitwise coverage is in `test_fused_pool_io_tpu.py`).
+            np.testing.assert_array_equal(
+                np.asarray(mk.unfold(hid_fused, 2)[:, B:]).view(np.uint8),
+                np.asarray(mk.unfold(hid_split, 2)[:, B:]).view(np.uint8),
+            )
+            np.testing.assert_allclose(
+                np.asarray(hid_fused, np.float32),
+                np.asarray(hid_split, np.float32),
+                rtol=8 * 2**-7,
+                atol=1e-3,
+            )
         for k in ("kc", "vc", "conv"):
             np.testing.assert_array_equal(
                 np.asarray(st_fused[k]).view(np.uint8),
@@ -373,16 +393,25 @@ def test_f32_conv_fused_matches_split_bitwise(T: int, wide_qkv: bool, conv_dtype
         )
         _non_rec_pool_bytes_equal(raw_fused, raw_split, lay, ex_split.R, ckpt)
     else:
-        # Causal `t == 0` outputs and layer-0 conv across all `T` checkpoints are
-        # bit-exact on XLA:CPU; `t >= 1` tokens can inherit 1 bf16 ULP from
-        # batched `(B, QKV)` vs single-row `(1, QKV)` CPU FMA / recurrence
-        # (full `T=4` bit-exactness on TPU is in `test_fused_pool_io_tpu.py`).
+        # Causal `t == 0` (`f32` conv) outputs and layer-0 conv across all `T`
+        # checkpoints are bit-exact on XLA:CPU; `t >= 1` tokens can inherit 1
+        # bf16 ULP from batched `(B, QKV)` vs single-row `(1, QKV)` CPU FMA /
+        # recurrence (full `T=4` bit-exactness on TPU is in
+        # `test_fused_pool_io_tpu.py`).
         hid_fu_b = np.asarray(mk.unfold(hid_fused, 2)[:, :B], np.float32)
         hid_sp_b = np.asarray(mk.unfold(hid_split, 2)[:, :B], np.float32)
-        np.testing.assert_array_equal(
-            np.asarray(mk.unfold(hid_fused, 2)[:, :B:T]).view(np.uint8),
-            np.asarray(mk.unfold(hid_split, 2)[:, :B:T]).view(np.uint8),
-        )
+        if is_f32_conv:
+            np.testing.assert_array_equal(
+                np.asarray(mk.unfold(hid_fused, 2)[:, :B:T]).view(np.uint8),
+                np.asarray(mk.unfold(hid_split, 2)[:, :B:T]).view(np.uint8),
+            )
+        else:
+            np.testing.assert_allclose(
+                hid_fu_b[:, ::T],
+                hid_sp_b[:, ::T],
+                rtol=8 * 2**-7,
+                atol=1e-3,
+            )
         np.testing.assert_allclose(hid_fu_b, hid_sp_b, rtol=2.5e-2, atol=2.5e-2)
         assert (
             float(np.mean(np.isclose(hid_fu_b, hid_sp_b, rtol=2**-4, atol=3e-3)))
