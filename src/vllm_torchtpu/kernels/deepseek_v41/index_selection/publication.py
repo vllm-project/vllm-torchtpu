@@ -118,8 +118,9 @@ class Radix:
         gate = jnp.where(keep_all, floor, jnp.maximum(lower, floor))
         return total, lower, gate, remaining, done
 
-    def emit(self, values, chunks, quota, selection, destination, ids=None):
-        """Write `ids(i)` (default: positions) of the selected keys, -1 after."""
+    def emit(self, values, chunks, quota, selection, destination, ids=None, offset=0):
+        """Write `ids(i)` (default: positions) of the selected keys, -1 after,
+        from `destination[offset]` on."""
         lanes, ids = self.lanes, ids or self.positions
         total, lower, gate, remaining, done = selection
 
@@ -127,11 +128,12 @@ class Radix:
             jnp.minimum(total // lanes * lanes, quota), quota, lanes, unroll=4
         )
         def initialize(i):
-            destination[pl.ds(i, lanes)] = jnp.full(lanes, -1, jnp.int32)
+            destination[pl.ds(offset + i, lanes)] = jnp.full(lanes, -1, jnp.int32)
 
         def store(i, count, selected):
             ranks = plsc.cumsum(selected.astype(jnp.int32))
-            plsc.store_scatter(destination, [count + ranks - 1], ids(i), mask=selected)
+            slots = offset + count + ranks - 1
+            plsc.store_scatter(destination, [slots], ids(i), mask=selected)
             return count + plsc.all_reduce_population_count(selected)
 
         @plsc.parallel_loop(
