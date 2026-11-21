@@ -468,7 +468,7 @@ class _GatherProjections(_OProjReduceScatter):
                     if indexer is None:
                         q_c_qrows = qc_head_shift_op(q_c_local, tp_op.rank)
                         return (q_c_qrows, kv_lora_local, positions_local), None
-                    if getattr(
+                    if envs.TPU_DCP_TP_SHARDED_INDEXER_K and getattr(
                         getattr(
                             getattr(indexer, "indexer_op", None), "topk_op_tp", None
                         ),

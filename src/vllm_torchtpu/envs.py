@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES: bool = True
     TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES: bool = True
     TPU_DCP_TP_SHARDED_KV_WRITE: bool = True
+    TPU_DCP_TP_SHARDED_INDEXER_K: bool = False
     TPU_DCP_TP_UNIFIED_INDEXER_IN_BRANCH_QB: bool = True
     TPU_DCP_TP_UNIFIED_INDEXER_MLA: bool = True
     TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP: int = 12
@@ -891,6 +892,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all_to_all instead of all-gathering bf16 kv_lora to every rank.
     "TPU_DCP_TP_SHARDED_KV_WRITE": env_bool(
         "TPU_DCP_TP_SHARDED_KV_WRITE", default=True
+    ),
+    # Gate sequence-sharded indexer wk_weights_proj + all-to-all K cache write
+    # (off by default to keep large-bucket compilation time bounded).
+    "TPU_DCP_TP_SHARDED_INDEXER_K": env_bool(
+        "TPU_DCP_TP_SHARDED_INDEXER_K", default=False
     ),
     # Number of alternating forward/reverse sequence-parallel bands per rank for
     # token-parallel DCP prefill (1 = contiguous sharding; even >= 2, e.g. 4,

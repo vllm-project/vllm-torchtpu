@@ -1168,6 +1168,7 @@ def test_should_shift_qc_and_weights_together_when_indexer_serves_sharded_k() ->
         group = sp._ShardedKVGatherProjections(positions, tp)  # noqa: SLF001 -- exercises per-step gatherer contract directly
         with (
             patch.object(envs, "TPU_DCP_TP_SHARDED_KV_WRITE", True),
+            patch.object(envs, "TPU_DCP_TP_SHARDED_INDEXER_K", True),
             patch.object(envs, "TPU_DCP_TP_PREFILL_LOCAL_OPROJ", True),
             patch.object(tp_op_mod, "applies", return_value=True),
             patch.object(tp_op_mod, "serves_sequence_row_oproj", return_value=True),
@@ -1200,6 +1201,108 @@ def test_should_shift_qc_and_weights_together_when_indexer_serves_sharded_k() ->
             got_w_qrows, full_kw[:, k_dim:].index_select(0, q_idx), rtol=0, atol=0
         )
         torch.testing.assert_close(got_k_pos, positions[lo:hi], rtol=0, atol=0)
+
+
+def test_should_keep_indexer_kw_all_gather_under_zigzag_when_sharded_k_is_off() -> None:
+    tp, nb, s, rows_local, q_lora, kv_dim, k_dim, w_dim = 4, 4, 2, 16, 16, 12, 8, 4
+    num_tokens = tp * rows_local
+    torch.manual_seed(78)
+    full_qc = torch.randn(num_tokens, q_lora, dtype=torch.bfloat16)
+    full_kv = torch.randn(num_tokens, kv_dim, dtype=torch.bfloat16)
+    full_kw = torch.randn(num_tokens, k_dim + w_dim, dtype=torch.bfloat16)
+    full_x = torch.arange(num_tokens, dtype=torch.float32).unsqueeze(-1)
+    positions = 4096 + torch.arange(num_tokens, dtype=torch.int32)
+    cols_qc = (s * q_lora) // rows_local
+
+    # Build the real per-rank all-gather table in zigzag rank-major order.
+    rank_inputs = [
+        sp.own_rows_zigzag(full_x, torch.tensor(rk, dtype=torch.int32), tp, nb)
+        for rk in range(tp)
+    ]
+    rank_parts = []
+    for x_r in rank_inputs:
+        idx = x_r.squeeze(-1).long()
+        qc_head = full_qc[idx][:s].reshape(rows_local, cols_qc)
+        rank_parts.append(torch.cat([qc_head, full_kw[idx]], dim=-1))
+    gathered_all = torch.cat(rank_parts, dim=0)
+
+    for r in range(tp):
+        rank_t = torch.tensor(r, dtype=torch.int32)
+        ag_calls: list[int] = []
+        tp_op = SimpleNamespace(
+            layout=dcp_token_parallel.TokenParallelLayout(
+                dcp_size=tp,
+                page_size=16,
+                interleave_size=4,
+                max_pages=8,
+                split_rows=s,
+                zigzag_bands=nb,
+            ),
+            q_replicated=True,
+            rank=rank_t,
+            serves_sharded_kv=True,
+            qc_head_shift_op=lambda *_a: (_ for _ in ()).throw(
+                AssertionError("unexpected qc_head_shift_op call")
+            ),
+        )
+        mla = SimpleNamespace(
+            fused_qkv_a_proj=lambda x: (
+                torch.cat(
+                    [full_qc[x.squeeze(-1).long()], full_kv[x.squeeze(-1).long()]],
+                    dim=-1,
+                ),
+                None,
+            ),
+            indexer=SimpleNamespace(
+                head_dim=k_dim,
+                wk_weights_proj=lambda x: (full_kw[x.squeeze(-1).long()], None),
+                indexer_op=SimpleNamespace(
+                    topk_op_tp=SimpleNamespace(q_own_rows=True, serves_sharded_k=True)
+                ),
+            ),
+            skip_topk=False,
+            is_sparse=True,
+            g_proj=None,
+            o_proj=SimpleNamespace(),
+            mla_attn=SimpleNamespace(sparse_mla_tp_op=tp_op),
+            gate_is_fused=False,
+            kimi_preprocess=None,
+            q_lora_rank=q_lora,
+        )
+        group = sp._ShardedKVGatherProjections(positions, tp, zigzag_bands=nb)  # noqa: SLF001 -- verifies unsharded zigzag fallback contract
+        with (
+            patch.object(envs, "TPU_DCP_TP_SHARDED_KV_WRITE", True),
+            patch.object(envs, "TPU_DCP_TP_SHARDED_INDEXER_K", False),
+            patch.object(envs, "TPU_DCP_TP_PREFILL_LOCAL_OPROJ", True),
+            patch.object(tp_op_mod, "applies", return_value=True),
+            patch.object(tp_op_mod, "serves_sequence_row_oproj", return_value=True),
+            patch.object(sp, "get_tensor_model_parallel_world_size", return_value=tp),
+            patch.object(
+                sp.fused_moe_ep, "rank_operand", return_value=rank_t.view(1, 1)
+            ),
+            patch.object(
+                sp,
+                "tensor_model_parallel_all_gather",
+                side_effect=lambda t, dim, _calls=ag_calls: (
+                    _calls.append(t.shape[-1]),
+                    gathered_all,
+                )[1],
+            ),
+        ):
+            pre_qkv, pre_kw = group.project_gather(mla, rank_inputs[r], num_tokens)
+
+        assert ag_calls == [cols_qc + k_dim + w_dim]
+        assert isinstance(pre_qkv, tuple) and len(pre_qkv) == 3
+        assert isinstance(pre_kw, torch.Tensor)
+        got_qc, got_kv_local, got_pos_local = pre_qkv
+        q_idx = tp_op_mod.q_rows(tp_op, num_tokens)
+        own_idx = rank_inputs[r].squeeze(-1).long()
+        torch.testing.assert_close(
+            got_qc, full_qc.index_select(0, q_idx), rtol=0, atol=0
+        )
+        torch.testing.assert_close(got_kv_local, full_kv[own_idx], rtol=0, atol=0)
+        torch.testing.assert_close(got_pos_local, positions[own_idx], rtol=0, atol=0)
+        torch.testing.assert_close(pre_kw, full_kw, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("permuted", [True, False])
