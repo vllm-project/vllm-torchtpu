@@ -18,7 +18,8 @@ from typing import Any
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from . import device
+from vllm_torchtpu.kernels.fused_moe.v2.host import array_vmem_bytes
+
 from .config import RESULT_SLOTS_DEFAULT, WEIGHT_SLOTS_DEFAULT
 from .formats import WeightFormat, weight_form
 from .layout import (
@@ -51,9 +52,11 @@ def scratch_arrays(
     token_block=None,
 ):
     """The kernel's VMEM scratch, as (name, shape, dtype), in the order the
-    kernel body unpacks it. activation_block: the row scales come in
-    hidden // activation_block planes (one at 0), a window of each per
-    tile. result_dtype: the result rows' element type (fp8 or bf16).
+    kernel body unpacks it. activation_block, token_block: the token rows'
+    scales come in one plane per token block of a row, token_block values
+    wide (activation_block when token_block is None, one plane when the
+    block is 0), a window of each plane per tile. result_dtype: the result
+    rows' element type (fp8 or bf16).
 
     Token rows and result rows are staged as [rows, lane blocks, LANES]: an
     eight-bit array's rows tile to 32 sublanes, so a flat [rows, hidden]
@@ -66,8 +69,6 @@ def scratch_arrays(
     lane_blocks = row_lane_blocks(hidden)
     result_blocks = result_lane_blocks(hidden)
     tile_blocks = tile_rows // ROW_BLOCK
-    # The token rows' scale planes: one per token block (the activation
-    # block when the caller names none).
     planes_block = activation_block if token_block is None else token_block
     scale_planes = hidden // planes_block if planes_block else 1
     weights: list[tuple[str, tuple[int, ...], Any]] = [
@@ -163,6 +164,4 @@ def estimate_bytes(
         token_block=token_block,
     )
     arrays += tile_body_arrays(tile_rows, hidden, inter, weight_format=weight_format)
-    return sum(
-        device.array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays
-    )
+    return sum(array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)

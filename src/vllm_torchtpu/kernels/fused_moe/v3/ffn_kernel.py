@@ -14,7 +14,6 @@
 """Top-level Pallas kernel entrypoint for Fused EP MoE v3 expert FFN execution."""
 
 import dataclasses
-import logging
 import threading
 from typing import Any, cast
 
@@ -23,6 +22,8 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.logger import init_logger
 
 from . import device, ffn, layout, transport, vmem
 from . import ffn_body as body
@@ -38,7 +39,7 @@ from .config import (
 from .formats import WeightFormat, weight_form
 from .layout import LANES, ROW_BLOCK
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -233,14 +234,15 @@ def build_ffn_kernel(
     runs it (see `run` below). pallas_transport: the token buffer is the
     transport start call's gathered_rows buffer, still landing, and its two
     semaphores are operands. activation_block: values per fp8 scale of a
-    row of each matmul's input (0: one scale per row); the row scales
-    arrive as hidden // activation_block planes of the scale table.
+    row of each matmul's input (0: one scale per row).
     shard_index_operand: the program takes the shard's own index as one
     more scalar-prefetch operand (run's `shard_index`) instead of reading
     the mesh axis, and addresses its peers in that form
     (layout.device_coords); the torch bridge's form.
     token_block: the token rows' own rounding block when it differs
-    (None: activation_block; 0: one scale per row).
+    (None: activation_block; 0: one scale per row). The token rows' scales
+    arrive as one plane of the scale table per token block of a row (one
+    plane at 0).
     result_rows: "fp8" (rows with one scale per row) or "bf16" (rows
     alone: the scale scratch and both scale outputs are still allocated,
     and nothing is written to them or transferred).
