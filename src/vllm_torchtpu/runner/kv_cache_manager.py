@@ -247,8 +247,8 @@ def _warn_if_kv_cache_is_padded(
 
 @dataclasses.dataclass(frozen=True)
 class _CompactMambaSizing:
-    """Inputs of the compact-mamba attention block count, kept from
-    get_kv_cache_spec until the KV budget is known (see
+    """Inputs of the compact-mamba block count, kept from get_kv_cache_spec
+    until the KV budget is known (see
     `KVCacheManager.size_compact_mamba_kv_cache`)."""
 
     attn_page_size_bytes: int
@@ -257,6 +257,15 @@ class _CompactMambaSizing:
     num_mamba_groups: int
     group_size: int
     mamba_num_blocks: int
+    # Exact per-slot bytes summed across all Mamba layers on this worker.
+    # Used for attention-free models so multi-page-size Mamba layers do not
+    # overcount HBM by `max(page_size) * num_mamba_groups`.
+    mamba_slot_bytes: int | None = None
+
+    @property
+    def is_attention_free(self) -> bool:
+        """True for Mamba-only models with no attention KV groups."""
+        return self.num_attn_groups == 0
 
     @property
     def mamba_per_tensor_bytes(self) -> int:
@@ -267,9 +276,18 @@ class _CompactMambaSizing:
             * self.unpadded_mamba_page_size_bytes
         )
 
+    @property
+    def mamba_total_bytes(self) -> int:
+        """Total compact Mamba slot bytes across all Mamba layers."""
+        if self.mamba_slot_bytes is not None:
+            return self.mamba_num_blocks * self.mamba_slot_bytes
+        return self.group_size * self.mamba_per_tensor_bytes
+
     def attn_blocks_that_fit(self, avail: int) -> int:
         """Attention blocks per layer that fit in `avail` next to the mamba
-        slots; zero or negative when none do."""
+        slots; zero or negative when none do (or for attention-free models)."""
+        if self.num_attn_groups == 0 or self.attn_page_size_bytes <= 0:
+            return 0
         return (avail // self.group_size - self.mamba_per_tensor_bytes) // (
             self.num_attn_groups * self.attn_page_size_bytes
         )
@@ -356,10 +374,16 @@ class KVCacheManager:
             self._update_attention_page_size_padded(layers, block_size)
             if has_mamba:
                 self._update_mamba_page_size_padded(layers, block_size)
+        elif (
+            has_mamba
+            and self.runner.model_config.is_attention_free
+            and not self.runner._unified_kv_layout
+        ):
+            self._select_attention_free_compact_mamba_layout(layers)
 
-        # Compact-mamba sizing (above) gave the GDN layers their own slot
-        # arrays, indexed by the runner's per-request slot ids: their scheduler
-        # blocks are never read.
+        # Compact-mamba sizing (above) gave GDN and Mamba-2/Mamba-3 layers
+        # their own slot arrays, indexed by the runner's per-request slot ids:
+        # their scheduler blocks are never read.
         runner_owns_mamba_slots = (
             not self.runner._unified_kv_layout
             and not self.runner._uniform_mamba_layout
@@ -957,9 +981,7 @@ class KVCacheManager:
         # spec (shapes × dtype-size), ignoring any existing padding.
         first_mamba_spec = mamba_modules[0].get_kv_cache_spec(self.runner.vllm_config)
         assert isinstance(first_mamba_spec, MambaSpec)
-        unpadded_mamba_page_size = dataclasses.replace(
-            first_mamba_spec, page_size_padded=None
-        ).page_size_bytes
+        unpadded_mamba_page_size = first_mamba_spec.real_page_size_bytes
 
         # Derive vLLM's kv-cache group layout. vLLM splits each type into
         # equal-sized groups of `group_size` layers. Their native placements
@@ -1047,6 +1069,44 @@ class KVCacheManager:
                 attn_page_size_bytes, int(uniform_page_size_bytes), group_size
             )
 
+    def _select_attention_free_compact_mamba_layout(
+        self,
+        layers: dict[str, AttentionLayerBase],
+    ) -> None:
+        """Cap attention-free Mamba layers at `max_num_reqs * stride + 1` slots.
+
+        Without this, vLLM sizes `num_blocks` across all available HBM,
+        allocating millions of idle Mamba state tensors even though prefix
+        caching is off and each active request needs only one recurrent slot.
+        """
+        mamba_specs: dict[str, MambaSpec] = {}
+        for layer_name, module in layers.items():
+            if isinstance(module, MambaBase):
+                spec = module.get_kv_cache_spec(self.runner.vllm_config)
+                if isinstance(spec, MambaSpec):
+                    mamba_specs[layer_name] = spec
+        if not mamba_specs:
+            return
+        # Pass a copy: `get_kv_cache_groups` mutates the input dict in-place
+        # when `disable_hybrid_kv_cache_manager=True`.
+        num_mamba_groups = len(
+            get_kv_cache_groups(
+                self.runner.vllm_config,
+                cast("dict[str, KVCacheSpec]", dict(mamba_specs)),
+            )
+        )
+        unpadded_page_sizes = [
+            int(spec.real_page_size_bytes) for spec in mamba_specs.values()
+        ]
+        self._maybe_select_compact_mamba_layout(
+            attn_page_size_bytes=0,
+            unpadded_mamba_page_size_bytes=max(unpadded_page_sizes),
+            num_attn_groups=0,
+            num_mamba_groups=num_mamba_groups,
+            group_size=len(mamba_specs),
+            mamba_slot_bytes=sum(unpadded_page_sizes),
+        )
+
     def _available_kv_cache_hbm(self) -> int:
         """KV-cache HBM budget for the block-count override paths.
 
@@ -1075,6 +1135,8 @@ class KVCacheManager:
         num_attn_groups: int,
         num_mamba_groups: int,
         group_size: int,
+        *,
+        mamba_slot_bytes: int | None = None,
     ) -> None:
         """Cap mamba layers at `max_num_reqs + 1` recurrent slots so the freed
         HBM grows the attention pool.
@@ -1088,10 +1150,10 @@ class KVCacheManager:
         forever. The compact layout caps mamba at `max_num_reqs + 1` (the `+1`
         is the null/sentinel slot), which is strictly better for any model
         where `num_blocks > max_num_reqs` — i.e. all production hybrid configs
-        we run. Cost: the GDN op must index mamba state by per-request slot id
-        (`AttentionMetadata.mamba_state_indices`) rather than by
-        `block_tables[:, 0]`, since the mamba leading dim is now smaller than
-        the attention pool.
+        we run. Cost: the recurrent op (GDN, Mamba-2, Mamba-3) must index mamba
+        state by per-request slot id (`AttentionMetadata.mamba_state_indices`)
+        rather than by `block_tables[:, 0]`, since the mamba leading dim is now
+        smaller than the attention pool.
 
         When the attention pool is sized
         --------------------------------
@@ -1099,14 +1161,18 @@ class KVCacheManager:
         includes the profile run's activations, and a count pinned here would
         make the worker skip the profile run. So this only selects the layout
         (failing early if the mamba slots cannot fit: the post-profile budget
-        is no larger); `size_compact_mamba_kv_cache` sets the attention block
-        count after the profile run.
+        is no larger); `size_compact_mamba_kv_cache` sets the block count after
+        the profile run.
 
         A `num_gpu_blocks_override` already set (`--num-gpu-blocks-override`)
-        pins the attention pool to that count instead of the budget's: the
-        mamba slots stay compact, and HBM the pin leaves unused stays free, so
-        a deployment can allocate only the KV its traffic needs. The uniform
-        layout would instead pad every attention block to the mamba page.
+        pins the attention pool to that count on hybrid models: the mamba slots
+        stay compact (sized by `--max-num-seqs`), and HBM the pin leaves unused
+        stays free, so a deployment can allocate only the KV its traffic needs.
+        On attention-free models `--max-num-seqs` sets the compact slot count,
+        so `--num-gpu-blocks-override` does not change the allocated Mamba
+        slots and still fails early if those slots do not fit in HBM. The
+        uniform layout would instead pad every attention block to the mamba
+        page.
 
         Sizing math
         -----------
@@ -1135,9 +1201,9 @@ class KVCacheManager:
 
         On success: sets `_mamba_num_blocks` and, unless the count is pinned,
         keeps the inputs for `size_compact_mamba_kv_cache`. Raises when the KV
-        budget cannot hold the mamba slots (unless the count is pinned); the
-        remaining precondition-fail paths leave both unset so the caller
-        falls back to uniform sizing.
+        budget cannot hold the mamba slots (for attention-free models, even
+        when the count is pinned); the remaining precondition-fail paths leave
+        both unset so the caller falls back to uniform sizing.
         """
         if self.runner._uniform_mamba_layout:
             logger.info("Compact mamba sizing skipped.")
@@ -1172,33 +1238,40 @@ class KVCacheManager:
             mamba_num_blocks=(
                 self.runner.max_num_reqs * self.runner._mamba_slot_stride + 1
             ),
+            mamba_slot_bytes=mamba_slot_bytes,
         )
         if pinned_blocks is not None:
             # The worker skips its profile run for a pinned count, and there
             # is nothing to size after it.
-            budget_blocks = max(sizing.attn_blocks_that_fit(avail), 0)
-            if pinned_blocks > budget_blocks:
-                logger.warning(
-                    "[kv-sizing] num_gpu_blocks_override=%d attention blocks "
-                    "exceed the %d the measured KV budget holds next to %d "
-                    "compact mamba slots; the allocation may not fit in HBM.",
-                    pinned_blocks,
-                    budget_blocks,
-                    sizing.mamba_num_blocks,
-                )
+            if sizing.is_attention_free:
+                self._validate_attention_free_compact_mamba_fit(sizing, avail)
+            else:
+                budget_blocks = max(sizing.attn_blocks_that_fit(avail), 0)
+                if pinned_blocks > budget_blocks:
+                    logger.warning(
+                        "[kv-sizing] num_gpu_blocks_override=%d attention blocks "
+                        "exceed the %d the measured KV budget holds next to %d "
+                        "compact mamba slots; the allocation may not fit in HBM.",
+                        pinned_blocks,
+                        budget_blocks,
+                        sizing.mamba_num_blocks,
+                    )
             self.runner._mamba_num_blocks = sizing.mamba_num_blocks
             self._log_compact_mamba_split(
                 int(pinned_blocks), sizing, avail, pinned=True
             )
             return
         # Raises now, before the profile run, if the mamba slots cannot fit.
-        self._compact_mamba_attn_num_blocks(sizing, avail)
+        if sizing.is_attention_free:
+            self._validate_attention_free_compact_mamba_fit(sizing, avail)
+        else:
+            self._compact_mamba_attn_num_blocks(sizing, avail)
         self.runner._mamba_num_blocks = sizing.mamba_num_blocks
         self._compact_mamba_sizing = sizing
 
     def size_compact_mamba_kv_cache(self, avail: int) -> None:
         """Set `cache_config.num_gpu_blocks_override` to the compact-mamba
-        attention block count that fits in `avail`.
+        block count that fits in `avail`.
 
         `TPUWorker.determine_available_memory` calls this with the KV budget
         it hands vLLM: measured after its profile run, or
@@ -1209,9 +1282,37 @@ class KVCacheManager:
         sizing = self._compact_mamba_sizing
         if sizing is None:
             return
-        attn_num_blocks = self._compact_mamba_attn_num_blocks(sizing, avail)
-        self.runner.cache_config.num_gpu_blocks_override = attn_num_blocks
-        self._log_compact_mamba_split(attn_num_blocks, sizing, avail)
+        if sizing.is_attention_free:
+            self._validate_attention_free_compact_mamba_fit(sizing, avail)
+            # Each request needs `stride` blocks per Mamba KV cache group when
+            # vLLM's stock MambaManager allocates them, plus 1 null/sentinel block.
+            num_blocks = sizing.num_mamba_groups * (sizing.mamba_num_blocks - 1) + 1
+        else:
+            num_blocks = self._compact_mamba_attn_num_blocks(sizing, avail)
+        self.runner.cache_config.num_gpu_blocks_override = num_blocks
+        self._log_compact_mamba_split(num_blocks, sizing, avail)
+
+    @staticmethod
+    def _validate_attention_free_compact_mamba_fit(
+        sizing: _CompactMambaSizing, avail: int
+    ) -> None:
+        """Verify compact Mamba slots for an attention-free model fit in `avail`."""
+        mamba_total = sizing.mamba_total_bytes
+        per_slot_bytes = (
+            sizing.mamba_slot_bytes
+            if sizing.mamba_slot_bytes is not None
+            else sizing.group_size
+            * sizing.num_mamba_groups
+            * sizing.unpadded_mamba_page_size_bytes
+        )
+        if avail < mamba_total:
+            raise ValueError(
+                f"Compact-mamba KV sizing does not fit: mamba slots need "
+                f"{mamba_total} B across {sizing.group_size} layers "
+                f"(mamba_num_blocks={sizing.mamba_num_blocks} x "
+                f"per_slot_total={per_slot_bytes} B), "
+                f"but the KV budget is {avail} B. {_COMPACT_MAMBA_FIT_HINT}"
+            )
 
     @staticmethod
     def _log_compact_mamba_split(
@@ -1228,7 +1329,19 @@ class KVCacheManager:
             * attn_num_blocks
             * sizing.attn_page_size_bytes
         )
-        mamba_bytes = sizing.group_size * sizing.mamba_per_tensor_bytes
+        mamba_bytes = sizing.mamba_total_bytes
+        if sizing.is_attention_free:
+            logger.info(
+                "Compact-mamba KV cache (attention-free): "
+                "num_gpu_blocks_override=%d, _mamba_num_blocks=%d. "
+                "HBM: mamba=%.2f GiB / avail=%.2f GiB.%s",
+                attn_num_blocks,
+                sizing.mamba_num_blocks,
+                mamba_bytes / (2**30),
+                avail / (2**30),
+                " Blocks pinned by num_gpu_blocks_override." if pinned else "",
+            )
+            return
         logger.info(
             "Compact-mamba KV cache: num_gpu_blocks_override=%d (attn), "
             "_mamba_num_blocks=%d. HBM split: attn=%.2f GiB; "

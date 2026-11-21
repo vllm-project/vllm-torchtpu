@@ -23,6 +23,10 @@ import pytest
 from vllm_torchtpu.layers.core.causal_conv1d import ragged_causal_conv1d
 from vllm_torchtpu.layers.core.mamba_utils import (
     clip_query_start_loc,
+    gather_active_mamba_states,
+    pack_ragged_ssm_chunks,
+    run_replicated_shard_map,
+    scatter_mamba_states,
     token_sequence_ids,
 )
 
@@ -486,7 +490,7 @@ def test_ragged_causal_conv1d_validates_inputs() -> None:
         )
 
 
-def test_clip_query_start_loc() -> None:
+def test_clip_query_start_loc_and_tight_chunk_packing_bounds() -> None:
     qsl = jnp.array([0, 3, 9, 99, 999], dtype=jnp.int32)
     dist = jnp.array([0, 2, 2], dtype=jnp.int32)
     num_valid, eff_qsl, q_lens = clip_query_start_loc(qsl, dist)
@@ -504,3 +508,95 @@ def test_clip_query_start_loc() -> None:
     np.testing.assert_array_equal(
         np.asarray(q_lens_none), np.array([3, 6], dtype=np.int32)
     )
+
+    # Small bucket (T=16, max_reqs=256, chunk_size=64) bounds static chunk count
+    # to <= 16 chunks (SISO) and <= 8 chunks (skip_single_token_seqs=True).
+    num_tokens, max_reqs, chunk_size = 16, 256, 64
+    X = jnp.ones((num_tokens, 4, 8), dtype=jnp.float32)
+    B = jnp.ones((num_tokens, 2, 8), dtype=jnp.float32)
+    C = jnp.ones((num_tokens, 2, 8), dtype=jnp.float32)
+    decay = -0.1 * jnp.ones((num_tokens, 4), dtype=jnp.float32)
+    qsl_256 = jnp.concatenate(
+        [
+            jnp.array([0, 6, 16], dtype=jnp.int32),
+            jnp.full((max_reqs - 2,), 16, dtype=jnp.int32),
+        ]
+    )
+    dist_256 = jnp.array([0, 2, 2], dtype=jnp.int32)
+
+    X_c, B_c, C_c, decay_c, _, _, _, _ = pack_ragged_ssm_chunks(
+        X, B, C, decay, qsl_256, dist_256, chunk_size
+    )
+    assert X_c.shape == (16, 4, chunk_size, 8)
+    assert B_c.shape == C_c.shape == (16, 2, chunk_size, 8)
+    assert decay_c.shape == (16, 4, chunk_size)
+
+    X_mimo = jnp.arange(num_tokens * 4 * 2 * 8, dtype=jnp.float32).reshape(
+        num_tokens, 4, 2, 8
+    )
+    B_mimo = jnp.ones((num_tokens, 2, 2, 8), dtype=jnp.float32)
+    C_mimo = jnp.ones((num_tokens, 2, 2, 8), dtype=jnp.float32)
+    X_c_skip, _, _, _, reset_skip, last_skip, _, _ = pack_ragged_ssm_chunks(
+        X_mimo,
+        B_mimo,
+        C_mimo,
+        decay,
+        qsl_256,
+        dist_256,
+        chunk_size,
+        compute_dtype=jnp.float32,
+        skip_single_token_seqs=True,
+    )
+    assert X_c_skip.shape == (8, 4, chunk_size * 2, 8)
+    assert bool(reset_skip[0]) and bool(reset_skip[1])
+    assert int(last_skip[0]) == 0 and int(last_skip[1]) == 1
+    np.testing.assert_allclose(
+        np.asarray(X_c_skip[0, :, : 6 * 2, :]),
+        np.asarray(X_mimo[:6].transpose(1, 0, 2, 3).reshape(4, 12, 8)),
+    )
+    np.testing.assert_allclose(
+        np.asarray(X_c_skip[1, :, : 10 * 2, :]),
+        np.asarray(X_mimo[6:16].transpose(1, 0, 2, 3).reshape(4, 20, 8)),
+    )
+
+
+def test_run_replicated_shard_map_rejects_multi_device_mesh() -> None:
+    class _FakeTwoCoreMesh:
+        size = 2
+        shape = {"model": 2}
+
+    with pytest.raises(ValueError, match="single-device worker mesh"):
+        run_replicated_shard_map(
+            lambda x: (x, x, x),
+            _FakeTwoCoreMesh(),  # type: ignore[arg-type]
+            jnp.ones((2, 4)),
+        )
+
+
+def test_active_bounded_state_gather_and_scatter() -> None:
+    """Verify `gather_active_mamba_states` and `scatter_mamba_states` bounds."""
+    pool = jnp.arange(6 * 2 * 4, dtype=jnp.float32).reshape(6, 2, 4)
+    safe_slots = jnp.array([3, 1, 5, 2], dtype=jnp.int32)
+    # Rows 2 and 3 have `should_read=True` past `num_active=2` and must stay 0.0:
+    should_read = jnp.array([True, False, True, True], dtype=bool)
+    gathered = gather_active_mamba_states(
+        pool, safe_slots, should_read, num_active=jnp.int32(2)
+    )
+    np.testing.assert_allclose(np.asarray(gathered[0]), np.asarray(pool[3]))
+    np.testing.assert_allclose(np.asarray(gathered[1]), 0.0)
+    np.testing.assert_allclose(np.asarray(gathered[2:]), 0.0)
+
+    # Fresh prefill (`should_read` all False) returns zeros cleanly:
+    gathered_zero = gather_active_mamba_states(
+        pool, safe_slots, jnp.zeros((4,), dtype=bool), num_active=jnp.int32(2)
+    )
+    np.testing.assert_allclose(np.asarray(gathered_zero), 0.0)
+
+    updates = jnp.full((4, 2, 4), -9.0, dtype=jnp.float32)
+    slots = jnp.array([4, -1, 0, 2], dtype=jnp.int32)
+    valid = jnp.array([True, False, True, True], dtype=bool)
+    # `num_active=2` limits updates to rows 0..1 (slots 0 & 2 stay untouched):
+    updated = scatter_mamba_states(pool, slots, valid, updates, num_active=jnp.int32(2))
+    np.testing.assert_allclose(np.asarray(updated[4]), -9.0)
+    np.testing.assert_allclose(np.asarray(updated[0]), np.asarray(pool[0]))
+    np.testing.assert_allclose(np.asarray(updated[2]), np.asarray(pool[2]))

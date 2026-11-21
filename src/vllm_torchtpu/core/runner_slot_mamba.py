@@ -11,27 +11,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GDN groups that take no scheduler blocks on the compact-mamba layout.
+"""GDN and Mamba-2/Mamba-3 groups that take no scheduler blocks on the compact layout.
 
 With prefix caching off, vLLM's MambaManager gives every request one block per
-mamba group from the pool it shares with attention. On the compact-mamba
-layout (``TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0``) the runner never reads those
-blocks for GDN layers: it keeps GDN state in its own ``max_num_reqs + 1`` slot
-arrays, indexed by per-request slot ids it assigns itself
-(``TPUModelRunner._build_mamba_state_indices``), and gives the attention pool
-everything else. For Qwen3.8-2.4T (3 GDN groups) at 8k input / 1k output that
-is 3 of the 75 blocks the scheduler charges each request.
+mamba group from the block pool. On the compact-mamba layout
+(``TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0``) the runner never reads those blocks
+for GDN or Mamba-2/Mamba-3 layers (Mamba-3 also reports the ``MAMBA2`` backend):
+it keeps their recurrent state in its own ``max_num_reqs + 1`` slot arrays
+(sized by ``--max-num-seqs``), indexed by per-request slot ids it assigns itself
+(``TPUModelRunner._build_mamba_state_indices``). On hybrid models this frees
+those blocks for the attention pool (for Qwen3.8-2.4T with 3 GDN groups at
+8k input / 1k output, 3 of the 75 blocks charged per request); on
+attention-free Mamba-2/Mamba-3 models there is no attention pool and
+``--max-num-seqs`` sets the number of state slots.
 
-Where the runner owns the slots, it hands vLLM its GDN specs as
+Where the runner owns the slots, it hands vLLM its eligible Mamba specs as
 ``RunnerSlotMambaSpec``. vLLM picks each group's manager from the spec's class,
 and TpuPlatform registers ``RunnerSlotMambaManager`` for this one: a
 MambaManager that allocates nothing. The coordinator, block pool and the rest
 of the scheduler stay on vLLM's stock caching-off path.
 
 That holds on the compact layout (the unified pool stores GDN state in those
-very blocks), for GDN layers, with mamba cache mode "none", no speculative
-decoding and no KV connector. It is derived from the config, so it is on by
-default; everything else keeps vLLM's MambaSpec and MambaManager.
+very blocks), for GDN and Mamba-2/Mamba-3 layers, with mamba cache mode "none",
+no speculative decoding and no KV connector. It is derived from the config, so
+it is on by default; everything else keeps vLLM's MambaSpec and MambaManager.
 TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 is a debug escape hatch back to the stock
 accounting, which charges blocks the runner never reads.
 
@@ -64,7 +67,7 @@ logger = init_logger(__name__)
 
 @dataclasses.dataclass(frozen=True)
 class RunnerSlotMambaSpec(MambaSpec):
-    """A GDN MambaSpec whose state slots the TPU runner assigns itself.
+    """A GDN or Mamba-2/Mamba-3 MambaSpec whose slots the TPU runner assigns itself.
 
     Registered by register_runner_slot_mamba_spec, not @register_kv_cache_spec:
     a registration at import time would run before vLLM's built-in specs and
@@ -87,8 +90,8 @@ class RunnerSlotMambaManager(MambaManager):
     ) -> None:
         super().__init__(kv_cache_spec, block_pool, **kwargs)
         logger.info_once(
-            "[runner_slot_mamba] GDN groups take no scheduler blocks: the "
-            "runner owns their state slots. TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 "
+            "[runner_slot_mamba] GDN/Mamba-2/Mamba-3 groups take no scheduler blocks: "
+            "the runner owns their state slots. TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 "
             "restores vLLM's accounting."
         )
 
@@ -116,15 +119,18 @@ def _ineligible_reason(
 ) -> str | None:
     if not runner_owns_slots:
         return (
-            "the runner does not own the GDN slots (the unified KV pool, or "
+            "the runner does not own the Mamba slots (the unified KV pool, or "
             "compact-mamba sizing did not apply)"
         )
     # Exact class only: a subclass may carry fields RunnerSlotMambaSpec cannot
     # take, or be registered to a manager of its own.
     if type(spec) is not MambaSpec:
         return f"its spec is {type(spec).__name__}, not MambaSpec"
-    if spec.mamba_type != MambaAttentionBackendEnum.GDN_ATTN:
-        return f"it applies to GDN layers only, not {spec.mamba_type.name}"
+    if spec.mamba_type not in (
+        MambaAttentionBackendEnum.GDN_ATTN,
+        MambaAttentionBackendEnum.MAMBA2,
+    ):
+        return f"it applies to GDN/Mamba-2 layers only, not {spec.mamba_type.name}"
     # The spec's own mamba_cache_mode is copied from this config. The mode
     # tracks prefix caching: vLLM sets "align" for hybrid models whenever
     # caching is on and "none" when it is off (MambaModelConfig), and
@@ -146,9 +152,9 @@ def maybe_runner_slot_mamba_spec(
     slots, otherwise `spec` unchanged. TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 keeps
     every spec unchanged.
 
-    `runner_owns_slots`: the runner indexes GDN state by its own per-request
-    slot ids (the compact-mamba layout), so the layer's scheduler blocks are
-    never read.
+    `runner_owns_slots`: the runner indexes GDN and Mamba-2/Mamba-3 state by
+    its own per-request slot ids (the compact-mamba layout), so the layer's
+    scheduler blocks are never read.
     """
     if not envs.TPU_SKIP_MAMBA_SCHEDULER_BLOCKS or not isinstance(spec, MambaSpec):
         return spec
@@ -173,7 +179,7 @@ def check_runner_slot_groups(
     mamba slot pool.
 
     The scheduler gives such a group no blocks, so its block-table rows stay
-    empty. Without the runner's slot ids the GDN op falls back to
+    empty. Without the runner's slot ids the recurrent op falls back to
     `block_tables[:, 0]`, block 0 for every request: all requests would share
     one recurrent state, with no error.
 

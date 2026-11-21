@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared CustomOp cache and step-metadata helpers for recurrent TPU layers."""
+"""Shared CustomOp registration, validation, and cache helpers for recurrent layers."""
 
 from __future__ import annotations
 
@@ -20,9 +20,18 @@ import itertools
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+import jax
 import torch
 from torch_tpu._internal import pallas
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
+
+from vllm_torchtpu.gdn_pool_layout import (
+    unified_kv_layout_enabled_for_architecture,
+)
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_vllm_model_wrapper_context,
+)
 
 if TYPE_CHECKING:
 
@@ -48,9 +57,9 @@ if TYPE_CHECKING:
         def mamba_request_distribution(self) -> torch.Tensor | None: ...
 
 
-# Shared across recurrent layers (GDN here, plus standalone Mamba layers in PR
-# #3422) with identical static configs so JaxCallable traces and lowers one XLA
-# graph per unique configuration rather than once per layer.
+# Shared across recurrent layers (GDN, Mamba-2, Mamba-3) with identical static
+# configs so JaxCallable traces and lowers one XLA graph per unique configuration
+# rather than once per layer.
 _shared_mamba_ops: dict[
     tuple[str, tuple[Any, ...], tuple[int, ...], tuple[int, ...]], Any
 ] = {}
@@ -74,7 +83,7 @@ def get_shared_mamba_jax_op(
     Important contract for callers:
       - ``donate_argnums`` is required because pooled recurrent layers donate a
         single unified pool tensor (e.g. ``(3,)``) whereas standalone 2-state
-        Mamba layers (PR #3422) donate ``(conv_state, ssm_state)`` (``(1, 2)``).
+        Mamba layers donate ``(conv_state, ssm_state)`` (``(1, 2)``).
       - Keep all optional (``None``-able) tensor operands **after** every
         donated operand in ``wrapped_fn``'s positional signature. ``None``
         arguments are dropped across the TorchTPU ``pallas.jax_op`` boundary,
@@ -155,6 +164,131 @@ def get_shared_mamba_jax_op(
         return cast(torch.Tensor, result[num_donated])
 
     return _shared_op_impl
+
+
+def validate_tpu_mamba_config(
+    layer_name: str,
+    *,
+    cache_config: CacheConfig | None,
+    vllm_config: VllmConfig | None = None,
+    num_spec: int = 0,
+    use_replayssm: bool = False,
+) -> None:
+    """Validate unsupported TPU Mamba configurations at startup or layer build."""
+    if cache_config is not None and (
+        cache_config.enable_prefix_caching
+        or cache_config.mamba_cache_mode in ("all", "align")
+    ):
+        raise NotImplementedError(
+            f"Prefix caching is not yet supported for {layer_name} on TPU. "
+            "Pass --no-enable-prefix-caching."
+        )
+    if vllm_config is not None:
+        model_config = vllm_config.model_config
+        architecture = model_config.architecture if model_config is not None else None
+        if unified_kv_layout_enabled_for_architecture(architecture):
+            raise NotImplementedError(
+                f"Unified single-tensor Mamba block pool "
+                f"(TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL) is not yet supported for "
+                f"{layer_name} on TPU."
+            )
+    if num_spec > 0 or (
+        vllm_config is not None and vllm_config.speculative_config is not None
+    ):
+        raise NotImplementedError(
+            f"Speculative decoding is not yet supported for {layer_name} on TPU."
+        )
+    if vllm_config is not None and vllm_config.parallel_config is not None:
+        if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+            raise NotImplementedError(
+                f"Prefill context parallelism (PCP > 1) is not yet supported for "
+                f"{layer_name} on TPU."
+            )
+        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            raise NotImplementedError(
+                f"Decode context parallelism (DCP > 1) is not yet supported for "
+                f"{layer_name} on TPU."
+            )
+    replayssm_enabled = use_replayssm or (
+        cache_config is not None and cache_config.use_replayssm
+    )
+    if replayssm_enabled:
+        raise NotImplementedError(
+            f"--use-replayssm is not supported for {layer_name} on TPU."
+        )
+
+
+def resolve_tpu_mamba_mesh_and_validate(
+    layer_name: str,
+    *,
+    cache_config: CacheConfig | None,
+    num_spec: int = 0,
+    use_replayssm: bool = False,
+) -> jax.sharding.Mesh:
+    """Validate TPU Mamba config first, then read the active wrapper mesh."""
+    current_vllm_cfg = get_current_vllm_config_or_none()
+    validate_tpu_mamba_config(
+        layer_name,
+        cache_config=cache_config,
+        vllm_config=current_vllm_cfg,
+        num_spec=num_spec,
+        use_replayssm=use_replayssm,
+    )
+    vllm_context = get_vllm_model_wrapper_context()
+    ctx_vllm_cfg = cast(VllmConfig | None, vllm_context.vllm_config)
+    if ctx_vllm_cfg is not None and ctx_vllm_cfg is not current_vllm_cfg:
+        validate_tpu_mamba_config(
+            layer_name,
+            cache_config=cache_config,
+            vllm_config=ctx_vllm_cfg,
+            num_spec=num_spec,
+            use_replayssm=use_replayssm,
+        )
+    return vllm_context.mesh
+
+
+def use_fused_jax_rms_norm(norm: Any, tp_size: int) -> bool:
+    """Return True when ``norm`` needs no cross-rank PyTorch collective."""
+    return norm.weight is None or norm.n_groups % tp_size == 0
+
+
+def unpack_mamba_kv_cache(
+    kv_cache: tuple[torch.Tensor, ...] | torch.Tensor | None,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Unpack the 2-tensor Mamba state cache, or return ``None`` during warmup."""
+    if kv_cache is None:
+        return None
+    if isinstance(kv_cache, torch.Tensor) or len(kv_cache) != 2:
+        count = 1 if isinstance(kv_cache, torch.Tensor) else len(kv_cache)
+        raise NotImplementedError(
+            f"Unified single-tensor Mamba block pool is not yet supported for "
+            f"{layer_name} on TPU (expected 2 state tensors, got {count})."
+        )
+    state0, state1 = kv_cache
+    if state0.numel() == 0:
+        return None
+    return state0, state1
+
+
+def finish_mamba_forward(
+    ssm_output: torch.Tensor,
+    projected_states: torch.Tensor,
+    *,
+    apply_py_norm: bool,
+    gate_size: int,
+    is_mimo: bool,
+    norm: Any,
+    out_proj: Any,
+) -> torch.Tensor:
+    """Apply optional PyTorch TP RMSNorm fallback and ``out_proj``."""
+    if apply_py_norm:
+        gate = None if is_mimo else projected_states[..., :gate_size]
+        hidden_states = norm(ssm_output, gate)
+    else:
+        hidden_states = ssm_output
+    output, _ = out_proj(hidden_states)
+    return cast(torch.Tensor, output)
 
 
 def extract_mamba_step_metadata(

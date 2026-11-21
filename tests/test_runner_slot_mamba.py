@@ -134,7 +134,7 @@ class TestGate:
     @pytest.mark.parametrize(
         "config_kwargs, owns_slots, reason",
         [
-            ({}, False, "does not own the GDN slots"),
+            ({}, False, "does not own the Mamba slots"),
             ({"speculative": True}, True, "speculative decoding"),
             ({"mamba_cache_mode": "align"}, True, "mamba cache mode"),
             ({"kv_connector": True}, True, "KV connector"),
@@ -153,14 +153,23 @@ class TestGate:
         log.assert_called_once()
         assert reason in log.call_args.args[1]
 
-    def test_non_gdn_mamba_keeps_stock_spec(self, flag_default):
+    def test_mamba2_swaps_to_runner_slot_spec(self, flag_default):
         spec = _gdn_spec(mamba_type=MambaAttentionBackendEnum.MAMBA2)
+        out = maybe_runner_slot_mamba_spec(spec, _vllm_config(), runner_owns_slots=True)
+        assert type(out) is RunnerSlotMambaSpec
+        assert isinstance(out, MambaSpec)
+        for f in dataclasses.fields(spec):
+            assert getattr(out, f.name) == getattr(spec, f.name), f.name
+        assert out.page_size_bytes == spec.page_size_bytes
+
+    def test_unsupported_mamba_type_keeps_stock_spec(self, flag_default):
+        spec = _gdn_spec(mamba_type=MambaAttentionBackendEnum.MAMBA1)
         with patch.object(runner_slot_mamba.logger, "debug_once") as log:
             out = maybe_runner_slot_mamba_spec(
                 spec, _vllm_config(), runner_owns_slots=True
             )
         assert out is spec
-        assert "GDN layers only" in log.call_args.args[1]
+        assert "GDN/Mamba-2 layers only" in log.call_args.args[1]
 
     def test_mamba_subclass_keeps_its_spec(self, flag_default):
         @dataclasses.dataclass(frozen=True)
@@ -354,3 +363,35 @@ class TestSchedulerAccounting:
         manager.free(req)
         assert manager.block_pool.get_num_free_blocks() == 130
         assert len(self._fill(manager, 14)) == 13
+
+    def test_attention_free_mamba2_runner_slot_lifecycle(self):
+        """Attention-free Mamba-2/Mamba-3 with only a RunnerSlotMambaSpec group
+        admits, decodes, and frees cleanly with compact num_blocks = max_reqs + 1."""
+        mamba_spec = _gdn_spec(
+            RunnerSlotMambaSpec, mamba_type=MambaAttentionBackendEnum.MAMBA2
+        )
+        config = KVCacheConfig(
+            num_blocks=5,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(["layers.0", "layers.1"], mamba_spec)],
+        )
+        manager = KVCacheManager(
+            kv_cache_config=config,
+            max_model_len=MAX_MODEL_LEN,
+            scheduler_block_size=MAX_MODEL_LEN,
+            hash_block_size=MAX_MODEL_LEN,
+            enable_caching=False,
+        )
+        req = self._request(0)
+        blocks = manager.allocate_slots(req, TOKENS)
+        assert blocks is not None
+        assert manager.get_block_ids(req.request_id) == ([],)
+        assert manager.usage == 0.0
+        # Decode step allocates zero scheduler blocks.
+        req.num_computed_tokens = TOKENS
+        decode_blocks = manager.allocate_slots(req, 1)
+        assert decode_blocks is not None
+        assert manager.get_block_ids(req.request_id) == ([],)
+        assert manager.block_pool.get_num_free_blocks() == 4
+        manager.free(req)
+        assert manager.block_pool.get_num_free_blocks() == 4
