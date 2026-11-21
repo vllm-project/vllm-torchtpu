@@ -200,6 +200,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
     VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS: int = 0
+    VLLM_TPU_SEGMENT_TOKENIZE_PART_CHARS: int = 0
     VLLM_TPU_DETOK_PRIME_SUFFIX: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
@@ -1297,6 +1298,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # split and looked up piece by piece.
     "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS": env_nonnegative_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS", 0
+    ),
+    # Cut a new prompt piece of at least 2N chars after newlines, every N chars
+    # or more, so encode_batch spreads one long tool result over cores
+    # (segment_tokenize.py). 0 keeps every piece whole.
+    "VLLM_TPU_SEGMENT_TOKENIZE_PART_CHARS": env_int(
+        "VLLM_TPU_SEGMENT_TOKENIZE_PART_CHARS", 0
     ),
     # API server: prime each request's decode stream with the shortest prompt
     # suffix of 4 to 23 tokens that decodes to whole characters, instead of

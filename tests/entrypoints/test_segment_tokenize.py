@@ -146,6 +146,46 @@ def test_packed_ids_equal_the_ids_through_prefix_reuse():
     assert reused_total > 0
 
 
+def test_cut_long_pieces_match_full_encode():
+    tok = _toy_tokenizer()
+    seg = SegmentTokenizer(tok, max_cached_tokens=10_000, part_chars=16)
+    assert seg._part_chars == 16
+    rng = random.Random(1)
+    cuts = 0
+    for _ in range(2000):
+        text = _random_text(rng, rng.randrange(1, 60))
+        pieces = [p for p in seg._split.split(text) if p]
+        cuts += len(seg._cut(pieces)[0]) - len(pieces)
+        assert seg.encode(text) == tok.encode(text, add_special_tokens=False).ids
+    assert cuts > 1000
+
+
+def test_cut_needs_parts_that_pre_tokenize_as_the_whole(monkeypatch):
+    import vllm_torchtpu.segment_tokenize as st
+
+    def ids(tok, text):
+        return tok.encode(text, add_special_tokens=False).ids
+
+    warnings = []
+    monkeypatch.setattr(st.logger, "warning", lambda *args: warnings.append(args))
+    # GPT-2's ByteLevel regex splits "w \nx" into " ", "\n", "x" but the part
+    # "w \n" alone into " \n"; add_prefix_space also puts a space before "x".
+    for add_prefix_space in (False, True):
+        tok = _toy_tokenizer()
+        tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=add_prefix_space)
+        assert ids(tok, "abcd \n") + ids(tok, "efgh") != ids(tok, "abcd \nefgh")
+        assert SegmentTokenizer(tok, 10_000, part_chars=4)._part_chars == 0
+        assert "ByteLevel" in warnings[-1][1] and "\\n" in warnings[-1][2]
+    tok = _toy_tokenizer()  # its split regex keeps "\s*[\r\n]+" as 1 pre-token
+    seg = SegmentTokenizer(tok, 10_000, part_chars=4)
+    assert seg._part_chars == 4
+    for text in ["abcd \nefgh", "abcd\r\nefgh", "abcd\t\nefgh", "abcdefgh\nijkl"]:
+        assert len(seg._cut([text])[0]) == 2
+        assert seg.encode(text) == ids(tok, text)
+    tok.pre_tokenizer = pre_tokenizers.Metaspace()
+    assert SegmentTokenizer(tok, 10_000, part_chars=16)._part_chars == 0
+
+
 def test_cold_pieces_encode_in_parallel():
     tok = _toy_tokenizer()
     seg = SegmentTokenizer(tok, max_cached_tokens=10_000)

@@ -55,6 +55,19 @@ proper prefix of an added token for some ``p <= s``, which is checked, and
 such an end is not reused. The ids before ``e`` are then those of the same
 pieces, and the rest is split from ``e`` as the full scan would.
 
+Long pieces (``VLLM_TPU_SEGMENT_TOKENIZE_PART_CHARS=N``): ``encode_batch``
+runs one input per core, so one long new piece (a tool result) still runs on
+one core. With N > 0 a new piece of at least 2N chars is cut, every N chars or
+more, right after a newline that is followed by a printable ASCII char, and
+its parts are encoded in the same ``encode_batch`` call. BPE encodes each
+pre-token alone, so the ids stay the same when each part, pre-tokenized alone,
+gives the pre-tokens it has inside the whole piece. A pre-token starting at the
+cut is not enough: GPT-2's ByteLevel regex splits ``"w \\nx"`` into ``" "``,
+``"\\n"``, ``"x"`` but the part ``"w \\n"`` alone into ``" \\n"``. DeepSeek's
+split regex keeps ``\\s*[\\r\\n]+`` as 1 pre-token in both. The cut is used only
+when the backend's own pre-tokenizer passes every probe of
+``_cut_probe_failure``.
+
 Trusted ids: before a request leaves the API server, vLLM checks that every
 prompt id is in the vocabulary with a ``max()`` and ``min()`` over the whole
 id list, on the event loop. Every id this module returns comes from the
@@ -90,6 +103,10 @@ _FIRST_COMPARED_CHARS = 4096
 # Texts that differ in the last chars before a position cannot share a prefix
 # up to it; comparing this many first skips most prompts of other conversations.
 _AGREEING_CHARS = 64
+
+# Where a long piece may be cut: right after a newline followed by a printable
+# ASCII char, where the parts must pre-tokenize as the whole (_cut_probe_failure).
+_CUT = re.compile(r"\n(?=[!-~])")
 
 
 @dataclass
@@ -182,6 +199,56 @@ def _prepends_on_first_split_only(backend: Any) -> bool:
         )
 
     return first_only(json.loads(backend.to_str()).get("pre_tokenizer"))
+
+
+def _cut_probe_failure(backend: Any) -> str | None:
+    """None when a cut at ``_CUT`` keeps the ids in every probe, else the failed
+    probe. A probe passes when the text before the cut and the text after it,
+    pre-tokenized alone, give the pre-tokens of the whole; the probes cover each
+    printable ASCII char after the newline and each kind of char before it."""
+    pre = backend.pre_tokenizer
+    if pre is None:
+        return "no pre-tokenizer"
+    if not _normalizer_keeps_text(backend):
+        return "a normalizer that changes the text"
+    befores = [
+        "a",
+        "Z",
+        "7",
+        "123",
+        ".",
+        ":",
+        "}",
+        " ",
+        "  ",
+        "\t",
+        "\r",
+        "\n",
+        "\n\n",
+        ".\n",
+        " \n",
+        "\r\n",
+        "\t\n",
+        "\u00e9",
+        "\u6771",
+        "\U0001f600",
+        "\u00a0",
+    ]
+    afters = [chr(c) for c in range(0x21, 0x7F)]
+    tails = ["", "x", "1", " ", "\n", "abc def", "\u6771"]
+
+    def words(text: str) -> list[str]:
+        return [word for word, _ in pre.pre_tokenize_str(text)]
+
+    # Each part is pre-tokenized once, so the probes cost 1 call per whole text.
+    rights = {after + tail: words(after + tail) for after in afters for tail in tails}
+    for before in befores:
+        left = "w" + before + "\n"
+        left_words = words(left)
+        for right, right_words in rights.items():
+            if words(left + right) != left_words + right_words:
+                return f"{left!r} + {right!r} pre-tokenize unlike {left + right!r}"
+    return None
 
 
 def _overlapping_pair(first: list[str], second: list[str]) -> tuple[str, str] | None:
@@ -314,6 +381,7 @@ class SegmentTokenizer:
         max_cached_tokens: int,
         max_prompts: int = 0,
         packed: bool = False,
+        part_chars: int = 0,
     ):
         # Private copy: transformers mutates truncation/padding on the shared
         # backend per call, which must not leak into these encodes.
@@ -341,6 +409,17 @@ class SegmentTokenizer:
         self._lock = threading.Lock()
         self._recent = RecentPrompts(alts, max_prompts) if max_prompts > 0 else None
         self._packed = packed
+        failure = _cut_probe_failure(self._backend) if part_chars > 0 else None
+        if failure is not None:
+            logger.warning(
+                "VLLM_TPU_SEGMENT_TOKENIZE_PART_CHARS: cutting after a newline "
+                "would change the ids under the pre-tokenizer %r (%s); long "
+                "pieces stay whole.",
+                str(self._backend.pre_tokenizer),
+                failure,
+            )
+            part_chars = 0
+        self._part_chars = part_chars
         self.hits = 0
         self.misses = 0
 
@@ -429,9 +508,12 @@ class SegmentTokenizer:
                     todo.append(piece)
             self.misses += len(todo)
         if todo:
-            encs = self._backend.encode_batch(todo, add_special_tokens=False)
-            for piece, enc in zip(todo, encs):
-                found[piece] = list(map(self._ints.__getitem__, enc.ids))
+            parts, owners = self._cut(todo)
+            encs = self._backend.encode_batch(parts, add_special_tokens=False)
+            for piece in todo:
+                found[piece] = []
+            for owner, enc in zip(owners, encs):
+                found[todo[owner]].extend(map(self._ints.__getitem__, enc.ids))
             with self._lock:
                 for piece in todo:
                     if len(piece) >= _MIN_CACHED_CHARS:
@@ -446,6 +528,25 @@ class SegmentTokenizer:
             else:
                 out.extend(found[piece])
         return TokenizedPrompt(text, out, token_starts, token_ends, ids_through_token)
+
+    def _cut(self, pieces: list[str]) -> tuple[list[str], list[int]]:
+        """The parts to encode and the index of the piece each part belongs to.
+        Parts of one piece are in order; a piece shorter than 2 parts stays whole."""
+        size = self._part_chars
+        parts: list[str] = []
+        owners: list[int] = []
+        for i, piece in enumerate(pieces):
+            start = 0
+            while size and len(piece) - start >= 2 * size:
+                m = _CUT.search(piece, start + size)
+                if m is None:
+                    break
+                parts.append(piece[start : m.start() + 1])
+                owners.append(i)
+                start = m.start() + 1
+            parts.append(piece[start:])
+            owners.append(i)
+        return parts, owners
 
     def _insert(self, piece: str, ids: list[int]) -> None:
         if len(ids) > self._max_cached_tokens:
@@ -518,7 +619,11 @@ _INSTANCES_LOCK = threading.Lock()
 
 
 def get_segment_tokenizer(
-    tokenizer: Any, max_cached_tokens: int, max_prompts: int = 0, packed: bool = False
+    tokenizer: Any,
+    max_cached_tokens: int,
+    max_prompts: int = 0,
+    packed: bool = False,
+    part_chars: int = 0,
 ):
     """One ``SegmentTokenizer`` per vLLM tokenizer object, or None if ineligible."""
     with _INSTANCES_LOCK:
@@ -533,7 +638,9 @@ def get_segment_tokenizer(
         else:
             reason = SegmentTokenizer.eligible(backend)
         if reason is None:
-            seg = SegmentTokenizer(backend, max_cached_tokens, max_prompts, packed)
+            seg = SegmentTokenizer(
+                backend, max_cached_tokens, max_prompts, packed, part_chars
+            )
             logger.info(
                 "VLLM_TPU_SEGMENT_TOKENIZE: piecewise prompt tokenization on "
                 "(%d added tokens, cache %d tokens, ~12 B/token, prefix reuse "
@@ -570,13 +677,14 @@ def patch_renderer_segment_tokenize() -> None:
     max_cached = envs.VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS
     max_prompts = envs.VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS
     packed_ids = envs.VLLM_TPU_PACKED_PROMPT_IDS
+    part_chars = envs.VLLM_TPU_SEGMENT_TOKENIZE_PART_CHARS
 
     def _tokenize_prompt(self, prompt, params):
         kwargs = params.get_encode_kwargs()
         if kwargs.get("add_special_tokens") or self._wants_offsets(prompt, params):
             return orig(self, prompt, params)
         seg = get_segment_tokenizer(
-            self.get_tokenizer(), max_cached, max_prompts, packed_ids
+            self.get_tokenizer(), max_cached, max_prompts, packed_ids, part_chars
         )
         if seg is None:
             return orig(self, prompt, params)
