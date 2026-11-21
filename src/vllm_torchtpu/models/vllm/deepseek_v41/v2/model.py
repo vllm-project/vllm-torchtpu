@@ -60,7 +60,7 @@ from .ced import (
     start_decoder_replay_coordination,
 )
 from .dspark_sampling import initialize_logits_head
-from .engram import Engram, NgramHashState, engram_cache_slots
+from .engram import Engram, NgramHashState, engram_cache_slots, initialize_engram_gate
 from .host_engram import (
     HOST_ENGRAM_KEY,
     HostEngramInputs,
@@ -1570,6 +1570,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         initialize_shifted_mhc()
         initialize_mhc_post()
         initialize_flat_collapse()
+        initialize_engram_gate()
         initialize_paged_attention()
         with (
             device_hooks(

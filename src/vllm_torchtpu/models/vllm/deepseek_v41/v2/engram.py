@@ -14,6 +14,7 @@ from ..common.engram import (
     _load_local_rows,
     _unpack_bytes,
     dequant_fp8_rows,
+    initialize_engram_gate,
     register_row_slice,
     upstream,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "_load_local_rows",
     "_unpack_bytes",
     "dequant_fp8_rows",
+    "initialize_engram_gate",
     "register_row_slice",
     "upstream",
 ]

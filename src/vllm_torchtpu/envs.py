@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_PALLAS_GATE: bool = True
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
@@ -488,6 +489,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # dispatch time ahead of the encoder. Same hashes and cache contents.
     "TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP", default=True
+    ),
+    # Gate the Engram value into the hc streams with one Pallas pass
+    # (kernels/deepseek_v41/engram_gate.py) instead of XLA's FP32 [T, M, D]
+    # passes. Only the order of the sums over D differs.
+    "TPU_DEEPSEEK_V41_ENGRAM_PALLAS_GATE": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_PALLAS_GATE", default=True
     ),
     # Deprecated aliases, resolved by the DSV41 serving-policy verifier.
     # v1 was removed; the verifier rejects it with a clear message.

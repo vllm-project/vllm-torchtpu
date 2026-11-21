@@ -10,7 +10,7 @@ import mmap
 import tempfile
 from contextlib import ExitStack
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import jax
 import numpy as np
@@ -505,6 +505,60 @@ def _fused_hash_op():
         )
         _FUSED_HASH_OP = op
     return _FUSED_HASH_OP
+
+
+_GATE_OPS: dict[bool, Any] = {}
+
+
+def initialize_engram_gate() -> None:
+    """Register the ``engram_gate`` ops (unmasked, masked) outside any trace;
+    models with Engram layers call this at init."""
+    if _GATE_OPS:
+        return
+    from jax.sharding import PartitionSpec as P
+    from torch_tpu._internal import pallas
+
+    from vllm_torchtpu.kernels.deepseek_v41.engram_gate import engram_gate
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_pallas_op_mesh,
+    )
+
+    # jax_op requires every argument named and annotated.
+    def gate(
+        hidden: jax.Array,
+        kv: jax.Array,
+        q_weight: jax.Array,
+        k_weight: jax.Array,
+        eps: float,
+        clamp: float,
+    ) -> jax.Array:
+        return engram_gate(hidden, kv, q_weight, k_weight, eps=eps, clamp=clamp)
+
+    def masked_gate(
+        hidden: jax.Array,
+        kv: jax.Array,
+        q_weight: jax.Array,
+        k_weight: jax.Array,
+        token_mask: jax.Array,
+        eps: float,
+        clamp: float,
+    ) -> jax.Array:
+        return engram_gate(
+            hidden, kv, q_weight, k_weight, token_mask, eps=eps, clamp=clamp
+        )
+
+    for masked, fn in ((False, gate), (True, masked_gate)):
+        arrays = 5 if masked else 4
+        op = pallas.jax_op(
+            "pallas::dsv41_engram_gate" + ("_masked" if masked else ""),
+            fn,
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...], (P(),) * arrays + (None,) * 2
+            ),
+        )
+        op.register_fake(lambda hidden, *_: torch.empty_like(hidden))
+        _GATE_OPS[masked] = op
 
 
 _FUSED_PREP_OP = None
@@ -1354,6 +1408,22 @@ class Engram(upstream.Engram):
         else:
             embedded = self.embed(hash_ids)
         kv = self.wkv(embedded.flatten(-2))
+        if (
+            envs.TPU_DEEPSEEK_V41_ENGRAM_PALLAS_GATE
+            and _GATE_OPS
+            and hidden_states.device.type == "tpu"
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[0] > 0
+            and self.dim % 128 == 0
+        ):
+            # One pass over the flat streams instead of XLA's FP32 [T, M, D] passes.
+            args = (hidden_states.flatten(1), kv, self.q_weight, self.k_weight)
+            if token_mask is not None:
+                args += (token_mask,)
+            out = _GATE_OPS[token_mask is not None](
+                *args, float(self.eps), float(self.clamp_value)
+            )
+            return out.view_as(hidden_states)
         keys = (
             kv[:, : self.hc_mult * self.dim]
             .unflatten(-1, (self.hc_mult, self.dim))
