@@ -14,8 +14,12 @@
 """TPU_GREEDY_TOP_TOKENS: the vocabulary-parallel argmax against the
 full-logits argmax, and when a step may take it."""
 
+import contextlib
+import inspect
 import logging
 import math
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -36,19 +40,64 @@ from vllm.sampling_params import StructuredOutputsParams
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.lora.torch_punica_tpu import PunicaWrapperTPU
-from vllm_torchtpu.runner import greedy_top_tokens, min_tokens
+from vllm_torchtpu.runner import greedy_top_tokens, min_tokens, tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+
+@pytest.fixture(autouse=True)
+def _tpu_logits_processor_heads(monkeypatch):
+    """The patch registry installs the TPU heads at platform activation and
+    worker init; these tests apply the same callback and restore vLLM's
+    LogitsProcessor afterwards."""
+    monkeypatch.setattr(
+        LogitsProcessor, "get_top_tokens", LogitsProcessor.get_top_tokens
+    )
+    monkeypatch.setattr(
+        LogitsProcessor,
+        "get_topk_candidates",
+        getattr(LogitsProcessor, "get_topk_candidates", None),
+        raising=False,
+    )
+    greedy_top_tokens.patch_logits_processor_heads()
+
+
+def test_importing_the_module_does_not_patch_logits_processor():
+    """Only the registered patch replaces vLLM's methods; an import alone
+    (tpu_runner imports this module in every process) leaves them alone."""
+    code = (
+        "from vllm.model_executor.layers.logits_processor import LogitsProcessor\n"
+        "upstream = LogitsProcessor.get_top_tokens\n"
+        "from vllm_torchtpu.runner import greedy_top_tokens as g\n"
+        "assert LogitsProcessor.get_top_tokens is upstream\n"
+        "assert not hasattr(LogitsProcessor, 'get_topk_candidates')\n"
+        "g.patch_logits_processor_heads()\n"
+        "assert LogitsProcessor.get_top_tokens is g.tpu_get_top_tokens\n"
+        "assert LogitsProcessor.get_topk_candidates is g.tpu_get_topk_candidates\n"
+        "print('ok')\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip().endswith("ok")
 
 
 class _HeadShard(torch.nn.Module):
     """One rank's slice of a vocab-parallel LM head (rows [start, start+n))."""
 
-    def __init__(self, weight, start, tp_size, num_pad):
+    def __init__(self, weight, start, tp_size, num_pad, org_vocab_size=None):
         super().__init__()
         self.weight = weight
         self.tp_size = tp_size
         self.shard_indices = SimpleNamespace(
             org_vocab_start_index=start, num_org_vocab_padding=num_pad
+        )
+        # The whole head's vocabulary, padded and real (VocabParallelEmbedding).
+        self.org_vocab_size_padded = weight.shape[0] * tp_size
+        self.org_vocab_size = (
+            self.org_vocab_size_padded - num_pad
+            if org_vocab_size is None
+            else org_vocab_size
         )
         self.quant_method = SimpleNamespace(
             apply=lambda layer, x, bias=None: x @ layer.weight.T
@@ -79,7 +128,7 @@ def _shards(weight, tp_size):
         start = rank * per_rank
         num_pad = max(0, start + per_rank - vocab) if start < vocab else per_rank
         shards.append(
-            _HeadShard(padded[start : start + per_rank], start, tp_size, num_pad)
+            _HeadShard(padded[start : start + per_rank], start, tp_size, num_pad, vocab)
         )
     return shards
 
@@ -235,6 +284,15 @@ def test_structured_output_falls_back_to_full_logits():
     )
 
 
+def test_target_head_stays_stock_under_ep_dp_with_a_tp_head():
+    # Busy engines would choose fast/stock per step; idle lockstep dummies
+    # always replay the stock logits program.
+    assert greedy_top_tokens.target_head_dp_mode(False, 8) == "fast"
+    assert greedy_top_tokens.target_head_dp_mode(True, 1) == "fast"
+    assert greedy_top_tokens.target_head_dp_mode(True, 2) == "stock"
+    assert greedy_top_tokens.target_head_dp_mode(True, 8) == "stock"
+
+
 def test_resolve_head_owner_finds_the_nested_language_model():
     owner = _Owner(_shards(torch.zeros(8, 2), 2)[0])
     model = torch.nn.Module()
@@ -304,6 +362,112 @@ def test_runner_step_choice():
     # A mixed greedy / sampled batch verifies on the full logits.
     spec.input_batch, spec.requests = _batch(greedy, SamplingParams(temperature=0.6))
     assert not spec._greedy_top_tokens_this_step()
+
+
+def test_runner_topk_candidates_step_choice(monkeypatch):
+    from vllm_torchtpu import envs
+
+    sampled = SamplingParams(temperature=0.6, top_k=20)
+    runner = _runner(torch.zeros(8, 2))
+    runner.input_batch, runner.requests = _batch(sampled)
+    # Main's default (no candidate blocks) keeps the full logits.
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 0)
+    assert not runner._topk_candidates_this_step()
+
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 40)
+    assert runner._topk_candidates_this_step()
+
+    # A request below min_tokens needs the full logits to mask its stops.
+    runner._min_tokens.add(
+        "r0",
+        SamplingParams(temperature=0.6, top_k=20, min_tokens=4, stop_token_ids=[2]),
+    )
+    assert not runner._topk_candidates_this_step()
+    runner._min_tokens = min_tokens.MinTokensTracker()
+    assert runner._topk_candidates_this_step()
+
+    # A LoRA lm_head: the candidates would drop its delta.
+    runner._greedy_head_owner = _lora_owner(monkeypatch)
+    assert not greedy_top_tokens.topk_candidates_supported(runner._greedy_head_owner)
+    assert not runner._topk_candidates_this_step()
+
+    runner._greedy_head_owner = None
+    assert not runner._topk_candidates_this_step()
+
+
+def test_candidate_head_warmup_follows_the_serving_gate(monkeypatch):
+    """The candidate heads are warmed only where steps can serve from them:
+    with the option on and a head that gives candidates, not under an lm_head
+    LoRA and not with the option off."""
+    from vllm_torchtpu import envs
+
+    runner = _runner(torch.zeros(8, 2))
+    calls = []
+    runner.compute_selected_topk_candidates = lambda *args: calls.append(args)
+    runner.model_config = SimpleNamespace(get_hidden_size=lambda: 2)
+    runner.num_tokens_paddings = [16]
+    runner._selected_logits_lengths = lambda _num_tokens: [8]
+    runner._hidden_states_dtype = torch.float32
+    runner.device = torch.device("cpu")
+    runner._precompile_timed = lambda _name: contextlib.nullcontext()
+    runner.get_pcp_planner = lambda: SimpleNamespace(
+        uses_selected_logits_hidden_states=False
+    )
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda _out: None)
+
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 40)
+    TPUModelRunner._precompile_compute_topk_candidates(runner)
+    assert len(calls) == 1
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 0)
+    TPUModelRunner._precompile_compute_topk_candidates(runner)
+    assert len(calls) == 1
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 40)
+    runner._greedy_head_owner = _lora_owner(monkeypatch)
+    TPUModelRunner._precompile_compute_topk_candidates(runner)
+    assert len(calls) == 1
+
+
+def test_the_candidate_block_verify_takes_some_but_not_all_of_the_vocabulary():
+    """Serving and its warmup share the rule: the candidate blocks must be
+    some of the vocabulary but not all of it."""
+    assert tpu_runner._candidate_block_verify_fits(40, 248320)
+    assert not tpu_runner._candidate_block_verify_fits(0, 248320)
+    assert not tpu_runner._candidate_block_verify_fits(248320 // 128, 248320)
+
+
+def test_runner_keeps_thinking_budget_steps_off_the_topk_candidates(monkeypatch):
+    from vllm.config.reasoning import ReasoningConfig
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.runner.thinking_budget_tracker import ThinkingBudgetTracker
+
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 40)
+    sampled = SamplingParams(temperature=0.6, top_k=20)
+    runner = _runner(torch.zeros(8, 2))
+    runner.input_batch, runner.requests = _batch(sampled, sampled)
+    reasoning = ReasoningConfig(reasoning_parser="qwen3")
+    reasoning._reasoning_start_token_ids = [5]
+    reasoning._reasoning_end_token_ids = [6]
+    reasoning._natural_reasoning_end_token_ids = [6]
+    reasoning._enabled = True
+    runner._thinking_budget = ThinkingBudgetTracker(
+        reasoning, max_num_reqs=4, device=torch.device("cpu")
+    )
+    # Thinking budgets configured, but no request has one.
+    assert runner._topk_candidates_this_step()
+
+    # A budgeted request outside the batch leaves the step on the candidates.
+    runner._thinking_budget.add(
+        "elsewhere", SamplingParams(thinking_token_budget=8), [1]
+    )
+    assert runner._topk_candidates_this_step()
+
+    # One in the batch needs the full logits: its chunk processors cannot
+    # rewrite packed candidates.
+    runner._thinking_budget.add("r1", SamplingParams(thinking_token_budget=8), [1])
+    assert not runner._topk_candidates_this_step()
+    runner._thinking_budget.discard(["r1"])
+    assert runner._topk_candidates_this_step()
 
 
 K = 3
@@ -401,6 +565,57 @@ def test_synthetic_verify_on_top_tokens_matches_full_logits(monkeypatch, seed):
     assert torch.equal(top, full)
 
 
+@pytest.mark.parametrize(("synthetic", "seed"), [(False, 0), (True, 0), (True, 3)])
+def test_fused_greedy_verify_matches_the_unfused_path(monkeypatch, synthetic, seed):
+    # On TPU, _sample_spec_verify_chunk runs the greedy verify as one program
+    # from the logits or from the top tokens; same tokens as the two-step path.
+    from vllm_torchtpu.runner import tpu_runner
+
+    runner, logits, tokens, md = _verify_chunk(monkeypatch, synthetic=synthetic)
+    sampler = runner.rejection_sampler
+    accept_u = (
+        torch.rand(
+            md.draft_token_ids.shape, generator=torch.Generator().manual_seed(seed)
+        )
+        if synthetic
+        else None
+    )
+    args = (
+        md.bonus_logits_indices,
+        md.target_logits_indices,
+        md.draft_token_ids,
+        md.draft_lengths,
+        md.segment_ids,
+        md.group_indices,
+        K,
+        accept_u,
+        sampler.synthetic_conditional_rates,
+        sampler.synthetic_mode,
+    )
+    with torch.compiler.set_stance("force_eager"):
+        from_logits = tpu_runner._fused_greedy_verify_from_logits(logits, *args)
+        from_tokens = tpu_runner._fused_greedy_verify_from_top_tokens(tokens, *args)
+
+    full = _sample(runner, logits, md, top_tokens=False, seed=seed)
+    assert torch.equal(from_logits, full)
+    assert torch.equal(from_tokens, full)
+
+
+def test_sampler_draws_in_graph_only_for_the_candidate_samplers_on_tpu(monkeypatch):
+    from vllm_torchtpu import envs
+
+    runner = _runner(torch.zeros(8, 2))
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 40)
+    runner.device = torch.device("cpu")
+    assert not runner._sampler_draws_in_graph()
+    runner.device = SimpleNamespace(type="tpu", index=0)
+    assert runner._sampler_draws_in_graph()
+    # Without the candidate samplers every draw stays on the sampling
+    # generator, so main's random stream is unchanged.
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 0)
+    assert not runner._sampler_draws_in_graph()
+
+
 def test_rejection_sampler_refuses_argmax_for_sampling():
     with pytest.raises(ValueError, match="needs target_logits"):
         RejectionSampler()(
@@ -447,3 +662,723 @@ def test_log_step_path_logs_each_path_once():
         "TPU_GREEDY_TOP_TOKENS: a speculative verify step took the top tokens",
         "TPU_GREEDY_TOP_TOKENS: a non-speculative step took the top tokens",
     ]
+
+
+def _resolved_owners(weight, tp_size, quantize, python_pad):
+    """One resolved head owner per TP shard, with vLLM's stock LogitsProcessor
+    (each shard quantized to W8A8 FP8 first with `quantize`). With
+    `python_pad`, every shard's Python padding count is overwritten after its
+    tensor buffers are registered, so only the buffer knows the padding."""
+    owners = []
+    for shard in _shards(weight, tp_size):
+        if quantize:
+            greedy_top_tokens.quantize_lm_head(shard, "fp8")
+        owner = _Owner(shard)
+        owner.logits_processor.vocab_size = weight.shape[0]
+        greedy_top_tokens.resolve_head_owner(owner, dp_lockstep=False)
+        if python_pad is not None:
+            shard.shard_indices.num_org_vocab_padding = python_pad
+        owners.append(owner)
+    return owners
+
+
+def _vocab_parallel_top_tokens_dim0(
+    weight, hidden_states, tp_size, monkeypatch, quantize=False, python_pad=None
+):
+    """Play back tensor_model_parallel_all_gather honoring dim=0 (as
+    DeviceCommunicatorBase.all_gather does on TPU)."""
+    owners = _resolved_owners(weight, tp_size, quantize, python_pad)
+
+    recorded = []
+    seen_dims = []
+
+    def record_dim0(tensor, dim=-1):
+        seen_dims.append(dim)
+        recorded.append(tensor)
+        if dim == 0:
+            return tensor.repeat(tp_size, *([1] * (tensor.ndim - 1)))
+        return tensor.repeat(1, tp_size)
+
+    monkeypatch.setattr(lp_module, "tensor_model_parallel_all_gather", record_dim0)
+    for owner in owners:
+        greedy_top_tokens.top_tokens(owner, hidden_states)
+
+    monkeypatch.setattr(
+        lp_module,
+        "tensor_model_parallel_all_gather",
+        lambda tensor, dim=-1: torch.cat(recorded, dim=dim),
+    )
+    out = greedy_top_tokens.top_tokens(owners[0], hidden_states)
+    if tp_size > 1:
+        assert all(d == 0 for d in seen_dims)
+        assert all(
+            t.dtype == torch.float32 and t.shape == (hidden_states.shape[0], 2)
+            for t in recorded
+        )
+    return out
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+def test_tpu_dim0_and_buffer_top_tokens_match_full_logits_argmax(
+    monkeypatch, dtype, tp_size
+):
+    gen = torch.Generator().manual_seed(100 + tp_size)
+    weight = torch.randn(301, 32, generator=gen).to(dtype)
+    hidden_states = torch.randn(17, 32, generator=gen).to(dtype)
+
+    got = _vocab_parallel_top_tokens_dim0(weight, hidden_states, tp_size, monkeypatch)
+
+    assert got.dtype == torch.int64 and got.shape == (17, 1)
+    assert torch.equal(got, _full_logits_tokens(weight, hidden_states))
+
+
+@pytest.mark.parametrize("tp_size", [1, 4])
+def test_bfloat16_negative_zero_and_positive_zero_ties(monkeypatch, tp_size):
+    weight = torch.full((16, 2), -1.0, dtype=torch.bfloat16)
+    # Row 0: token 1 has -0.0 (-1.0 * 0.0 + 0.0), token 5 has +0.0, rest are -2.0.
+    weight[:, 1] = -2.0
+    weight[1, 1] = torch.tensor(-0.0, dtype=torch.bfloat16)
+    weight[5, 1] = torch.tensor(0.0, dtype=torch.bfloat16)
+    hidden_states = torch.tensor([[0.0, 1.0]], dtype=torch.bfloat16)
+
+    got = _vocab_parallel_top_tokens_dim0(weight, hidden_states, tp_size, monkeypatch)
+
+    assert got.item() == 1
+    assert torch.equal(got, _full_logits_tokens(weight, hidden_states))
+
+
+@pytest.mark.parametrize("quantize", [False, True], ids=["bf16", "w8a8"])
+@pytest.mark.parametrize("path", ["top_tokens", "topk_candidates"])
+def test_every_rank_masks_its_padding_from_the_head_buffer(monkeypatch, path, quantize):
+    """Each rank masks its vocab padding with the head's num_org_vocab_padding
+    buffer, a program input, so every rank runs one compiled program. Here the
+    shards' Python padding counts are zeroed, so a path that decided or masked
+    from them would let a padding row (built to win) through."""
+    gen = torch.Generator().manual_seed(7)
+    vocab, tp_size = 301, 4  # 76 rows per rank; the last rank pads 3
+    weight = torch.randn(vocab, 32, generator=gen) * 0.01
+    hidden_states = torch.rand(7, 32, generator=gen) + 0.1
+    if path == "top_tokens":
+        got = _vocab_parallel_top_tokens_dim0(
+            weight, hidden_states, tp_size, monkeypatch, quantize, python_pad=0
+        )
+        assert int(got.max()) < vocab
+        if not quantize:
+            assert torch.equal(got, _full_logits_tokens(weight, hidden_states))
+    else:
+        packed = _vocab_parallel_topk_candidates_dim0(
+            weight, hidden_states, tp_size, monkeypatch, quantize, python_pad=0
+        )
+        num_cand = greedy_top_tokens.LOCAL_TOPK_CANDIDATES * tp_size
+        cand_logits, cand_ids = packed[:, :num_cand], packed[:, num_cand:]
+        assert int(cand_ids[cand_logits > -1e30].max()) < vocab
+
+
+def _vocab_parallel_topk_candidates_dim0(
+    weight, hidden_states, tp_size, monkeypatch, quantize=False, python_pad=None
+):
+    """Play back tensor_model_parallel_all_gather honoring dim=0 for
+    tpu_get_topk_candidates across all TP shards."""
+    owners = _resolved_owners(weight, tp_size, quantize, python_pad)
+
+    recorded = []
+    seen_dims = []
+
+    def record_dim0(tensor, dim=-1):
+        seen_dims.append(dim)
+        recorded.append(tensor)
+        if dim == 0:
+            return tensor.repeat(tp_size, *([1] * (tensor.ndim - 1)))
+        return tensor.repeat(1, tp_size)
+
+    monkeypatch.setattr(lp_module, "tensor_model_parallel_all_gather", record_dim0)
+    for owner in owners:
+        greedy_top_tokens.topk_candidates(owner, hidden_states)
+
+    monkeypatch.setattr(
+        lp_module,
+        "tensor_model_parallel_all_gather",
+        lambda tensor, dim=-1: torch.cat(recorded, dim=dim),
+    )
+    out = greedy_top_tokens.topk_candidates(owners[0], hidden_states)
+    k_local = greedy_top_tokens.LOCAL_TOPK_CANDIDATES
+    if tp_size > 1:
+        assert all(d == 0 for d in seen_dims)
+        assert all(
+            t.dtype == torch.float32 and t.shape == (hidden_states.shape[0], k_local, 2)
+            for t in recorded
+        )
+    return out
+
+
+class _StepStopped(Exception):
+    pass
+
+
+class _EntryRunner:
+    """A runner stand-in that runs `call` at execute_model's first read of it,
+    inside the grad mode execute_model gives its body, then stops."""
+
+    def __init__(self, call):
+        self._call = call
+
+    def __getattr__(self, name):
+        self._call()
+        raise _StepStopped
+
+
+# Per family of sampling programs: the two programs execute_model calls under
+# its no_grad, and the warm-up that compiles them.
+_WARMED_PROGRAMS = {
+    "topk_candidates": (
+        "compute_selected_topk_candidates",
+        "compute_topk_candidates_from_hidden_states",
+        "_precompile_compute_topk_candidates",
+    ),
+    "top_tokens": (
+        "compute_selected_top_tokens",
+        "compute_top_tokens_from_hidden_states",
+        "_precompile_compute_top_tokens",
+    ),
+}
+
+
+def _serving_compiles(monkeypatch, pcp, family):
+    """Compile the family's real programs on a CPU head, warm them with the
+    runner's warm-up, then call them from inside execute_model at a warmed
+    shape; return what that call compiled."""
+    selected_name, from_hidden_name, warm_name = _WARMED_PROGRAMS[family]
+    torch._dynamo.reset()
+    try:
+        gen = torch.Generator().manual_seed(5)
+        owner = _Owner(_HeadShard(torch.randn(256, 16, generator=gen), 0, 1, 0))
+        greedy_top_tokens.resolve_head_owner(owner, dp_lockstep=False)
+        compiles = []
+
+        def backend(gm, example_inputs):
+            compiles.append(len(example_inputs))
+            return gm.forward
+
+        def compiled(method):
+            fn = inspect.unwrap(getattr(TPUModelRunner, method))
+            return torch.compile(fn, backend=backend, fullgraph=True, dynamic=False)
+
+        selected, from_hidden = compiled(selected_name), compiled(from_hidden_name)
+        runner = SimpleNamespace(
+            _greedy_head_owner=owner,
+            model_config=SimpleNamespace(get_hidden_size=lambda: 16),
+            num_tokens_paddings=[8, 16],
+            num_reqs_paddings=[4, 8],
+            max_num_reqs=8,
+            _is_async_drafter=False,
+            _hidden_states_dtype=torch.float32,
+            device=torch.device("cpu"),
+            _precompile_timed=lambda _label: contextlib.nullcontext(),
+            get_pcp_planner=lambda: SimpleNamespace(
+                uses_selected_logits_hidden_states=pcp
+            ),
+            # The top-token warm-up warms the candidates first; not under test.
+            _precompile_compute_topk_candidates=lambda: None,
+        )
+        setattr(runner, selected_name, lambda h, i: selected(runner, h, i))
+        setattr(runner, from_hidden_name, lambda h: from_hidden(runner, h))
+        runner._selected_logits_lengths = lambda n: (
+            TPUModelRunner._selected_logits_lengths(runner, n)
+        )
+        runner._from_hidden_states_lengths = lambda: (
+            TPUModelRunner._from_hidden_states_lengths(runner)
+        )
+        monkeypatch.setattr(tpu_runner, "_packed_candidates_owner", lambda o: o)
+        monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+        getattr(TPUModelRunner, warm_name)(runner)
+        warmed = len(compiles)
+        assert warmed, "the warm-up compiled nothing"
+
+        def serve():
+            getattr(runner, selected_name)(
+                torch.zeros(16, 16), torch.zeros(8, dtype=torch.int32)
+            )
+            if pcp:
+                getattr(runner, from_hidden_name)(torch.zeros(8, 16))
+
+        with pytest.raises(_StepStopped):
+            TPUModelRunner.execute_model(_EntryRunner(serve), None)
+        return compiles[warmed:]
+    finally:
+        torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("pcp", [False, True])
+def test_the_warmed_topk_candidates_serve_execute_model_without_compiling(
+    monkeypatch, pcp
+):
+    """execute_model computes a step's packed top-k candidates under its
+    no_grad, and dynamo guards on grad mode. The real candidate programs,
+    warmed by _precompile_compute_topk_candidates and then called from inside
+    execute_model at a warmed shape, do not compile again."""
+    assert _serving_compiles(monkeypatch, pcp, "topk_candidates") == []
+
+
+@pytest.mark.parametrize("pcp", [False, True])
+def test_the_warmed_top_tokens_serve_execute_model_without_compiling(monkeypatch, pcp):
+    """The same for the greedy top-token programs, which execute_model also
+    calls under its no_grad: warmed by _precompile_compute_top_tokens, they do
+    not compile again."""
+    assert _serving_compiles(monkeypatch, pcp, "top_tokens") == []
+
+
+@pytest.mark.parametrize("vocab_size", [301, 2100])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_tpu_topk_candidates_contain_global_top20(
+    monkeypatch, vocab_size, dtype, tp_size
+):
+    gen = torch.Generator().manual_seed(200 + vocab_size + tp_size)
+    # Give every row 20 clearly separated top tokens placed across several
+    # blocks of 64 per shard so both the 2-stage block reducer (shard_vocab >=
+    # 2048, 32 blocks of 64) and the direct topk fallback (shard_vocab < 2048)
+    # preserve the exact global Top-20.
+    weight = (torch.randn(vocab_size, 16, generator=gen) * 0.1).to(dtype)
+    hidden_states = torch.zeros(5, 16, dtype=dtype)
+    per_rank = math.ceil(vocab_size / tp_size)
+    for r in range(5):
+        hidden_states[r, r % 16] = 1.0
+        # Choose up to 8 blocks of 64 inside each shard
+        eligible_ids = []
+        for rank in range(tp_size):
+            shard_start = rank * per_rank
+            shard_end = min(vocab_size, (rank + 1) * per_rank)
+            if shard_end <= shard_start:
+                continue
+            n_blocks = math.ceil((shard_end - shard_start) / 64)
+            chosen_blks = torch.randperm(n_blocks, generator=gen)[: min(8, n_blocks)]
+            for b in chosen_blks.tolist():
+                b_start = shard_start + b * 64
+                b_end = min(shard_end, b_start + 64)
+                eligible_ids.extend(range(b_start, b_end))
+        perm = torch.randperm(len(eligible_ids), generator=gen)[:20]
+        top_ids = [eligible_ids[i] for i in perm.tolist()]
+        for rank_idx, tid in enumerate(top_ids):
+            weight[tid, r % 16] = float(50 - rank_idx)
+
+    packed = _vocab_parallel_topk_candidates_dim0(
+        weight, hidden_states, tp_size, monkeypatch
+    )
+    num_cand = greedy_top_tokens.LOCAL_TOPK_CANDIDATES * tp_size
+    assert packed.dtype == torch.float32
+    assert packed.shape == (5, 2 * num_cand)
+
+    cand_logits = packed[:, :num_cand]
+    cand_ids = packed[:, num_cand:].to(torch.int64)
+    # Out-of-vocab padding tokens must never appear as valid unmasked candidates.
+    valid_mask = cand_logits > -1e30
+    assert int(cand_ids[valid_mask].max().item()) < vocab_size
+
+    full_logits = (hidden_states @ weight.T).to(torch.float32)
+    ref_top20_vals, ref_top20_ids = torch.topk(full_logits, k=20, dim=-1)
+    cand_top20_vals, cand_top20_pos = torch.topk(cand_logits, k=20, dim=-1)
+    cand_top20_ids = torch.gather(cand_ids, 1, cand_top20_pos)
+
+    assert torch.equal(cand_top20_ids, ref_top20_ids)
+    assert torch.allclose(cand_top20_vals, ref_top20_vals, atol=1e-4, rtol=1e-4)
+
+
+def test_topk_candidates_step_eligible():
+    greedy = SamplingParams(temperature=0)
+    top20 = SamplingParams(temperature=0.6, top_k=20, top_p=0.95)
+    top32 = SamplingParams(temperature=0.6, top_k=32, top_p=1.0)
+    top64 = SamplingParams(temperature=0.6, top_k=64, top_p=0.95)
+    no_topk = SamplingParams(temperature=0.6, top_k=-1, top_p=0.95)
+
+    # Pure top-k <= 32 or mixed greedy + top-k <= 32 is eligible.
+    assert greedy_top_tokens.topk_candidates_step_eligible(*_batch(top20, top32))
+    assert greedy_top_tokens.topk_candidates_step_eligible(*_batch(greedy, top20))
+
+    # Pure greedy uses greedy_top_tokens.step_eligible instead.
+    assert not greedy_top_tokens.topk_candidates_step_eligible(*_batch(greedy, greedy))
+    # Logprobs require full logits.
+    assert not greedy_top_tokens.topk_candidates_step_eligible(
+        *_batch(top20, max_num_logprobs=1)
+    )
+    # Unbounded top_k or top_k > 32 falls back to full logits.
+    assert not greedy_top_tokens.topk_candidates_step_eligible(*_batch(top20, top64))
+    assert not greedy_top_tokens.topk_candidates_step_eligible(*_batch(top20, no_topk))
+    # Structured outputs or penalties fall back to full logits.
+    grammar = SamplingParams(
+        temperature=0.6,
+        top_k=20,
+        structured_outputs=StructuredOutputsParams(regex="[ab]+"),
+    )
+    assert not greedy_top_tokens.topk_candidates_step_eligible(*_batch(top20, grammar))
+    penalized = SamplingParams(temperature=0.6, top_k=20, presence_penalty=0.5)
+    assert not greedy_top_tokens.topk_candidates_step_eligible(
+        *_batch(top20, penalized)
+    )
+
+
+def test_log_topk_candidates_step_path_logs_each_path_once():
+    if hasattr(vllm_logger, "_print_info_once"):
+        vllm_logger._print_info_once.cache_clear()
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logger = logging.getLogger("vllm")
+    # As in test_log_step_path_logs_each_path_once: the record must reach the
+    # "vllm" logger whatever level or logging.disable() another test left.
+    old_level = logger.level
+    old_disable = logging.root.manager.disable
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logging.disable(logging.NOTSET)
+    try:
+        greedy_top_tokens.log_topk_candidates_step_path(
+            True, ["__spec_warmup_0__", None]
+        )
+        greedy_top_tokens.log_topk_candidates_step_path(False, ["__spec_warmup_b2_0__"])
+        assert records == []
+        for is_spec_step in (True, False, True, False):
+            greedy_top_tokens.log_topk_candidates_step_path(
+                is_spec_step, ["__spec_warmup_1__", "r0"]
+            )
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+        logging.disable(old_disable)
+    assert [r.getMessage() for r in records] == [
+        "TPU_GREEDY_TOP_TOKENS: a speculative verify step took vocab-parallel "
+        "top-32 candidates",
+        "TPU_GREEDY_TOP_TOKENS: a non-speculative step took vocab-parallel "
+        "top-32 candidates",
+    ]
+
+
+def test_runner_selected_logits_lengths_includes_spec_verify_buckets():
+    runner = _runner(
+        torch.zeros(64, 8),
+        SimpleNamespace(
+            num_speculative_tokens=3,
+            use_eagle=lambda: True,
+            method="mtp",
+        ),
+    )
+    runner.max_num_reqs = 16
+    runner.num_reqs_paddings = [1, 2, 4, 8, 16]
+    runner.num_tokens_paddings = [16, 24, 32, 40, 48, 56, 64, 128]
+    runner._pp_is_last = True
+    runner._mtp_prefill_only = False
+    lengths = runner._selected_logits_lengths(64)
+    for expected_len in (16, 24, 32, 40, 48, 56, 64):
+        assert expected_len in lengths
+
+
+def test_runner_sample_from_packed_candidates_and_verify_chunk(monkeypatch):
+    gen = torch.Generator().manual_seed(42)
+    weight = torch.randn(128, 16, generator=gen) * 0.1
+    # Row 0 (req 0 draft 0): token 10 dominates
+    # Row 1 (req 0 draft 1): token 20 dominates
+    # Row 2 (req 0 bonus): token 30 dominates
+    # Row 3 (req 1 draft 0): token 90 dominates
+    # Row 4 (req 1 bonus): token 100 dominates
+    hidden_states = torch.zeros(5, 16)
+    for r, tok in enumerate([10, 20, 30, 90, 100]):
+        hidden_states[r, r] = 1.0
+        weight[tok, r] = 50.0
+
+    spec_config = SimpleNamespace(
+        num_speculative_tokens=2,
+        rejection_sample_method="strict",
+        synthetic_acceptance_rates=None,
+    )
+    runner = _runner(weight, spec_config)
+    runner.vocab_size = 128
+    runner.rejection_sampler = RejectionSampler(spec_config, torch.device("cpu"))
+    runner.input_batch = SimpleNamespace(
+        temperature_cpu_tensor=torch.full((2,), 0.6, dtype=torch.float32),
+        top_k_cpu_tensor=torch.full((2,), 20, dtype=torch.int32),
+        top_p_cpu_tensor=torch.full((2,), 0.95, dtype=torch.float32),
+    )
+
+    packed = _vocab_parallel_topk_candidates_dim0(weight, hidden_states, 2, monkeypatch)
+    runner._greedy_head_owner.lm_head.tp_size = 2
+    num_cand = packed.shape[-1] // 2
+
+    # 1. sample_from_packed_candidates picks the dominant tokens
+    # [10, 20, 30, 90, 100].
+    temps = torch.full((5, 1), 0.6, dtype=torch.float32)
+    u = torch.full((5, num_cand), 0.5, dtype=torch.float32)
+    top_k = torch.full((5, 1), 20, dtype=torch.int32)
+    top_p = torch.full((5, 1), 0.95, dtype=torch.float32)
+    with torch.compiler.set_stance("force_eager"):
+        sampled = TPUModelRunner.sample_from_packed_candidates(
+            runner, packed, temps, u, top_k, top_p
+        )
+    assert sampled.view(-1).tolist() == [10, 20, 30, 90, 100]
+
+    # 2. Verify _sample_spec_verify_chunk with topk_candidates_packed=True:
+    # req 0 drafts [10, 99] -> draft 0 (10) accepted, draft 1 (99) rejected and
+    # recovers 20
+    # req 1 drafts [90] -> draft 0 (90) accepted + bonus 100
+    md = SimpleNamespace(
+        draft_token_ids=torch.tensor([10, 99, 90], dtype=torch.int32),
+        draft_lengths=torch.tensor([2, 1], dtype=torch.int32),
+        target_logits_indices=torch.tensor([0, 1, 3], dtype=torch.int32),
+        bonus_logits_indices=torch.tensor([2, 4], dtype=torch.int32),
+        segment_ids=torch.tensor([0, 0, 1], dtype=torch.int64),
+        group_indices=torch.tensor([0, 1, 0], dtype=torch.int32),
+    )
+    with torch.compiler.set_stance("force_eager"):
+        out = TPUModelRunner._sample_spec_verify_chunk(
+            runner,
+            packed,
+            md,
+            None,
+            None,
+            0,
+            2,
+            False,
+            torch.Generator().manual_seed(0),
+            top_tokens=False,
+            topk_candidates_packed=True,
+        )
+    assert out.tolist() == [[10, 20, -1], [90, 100, -1]]
+
+
+def test_head_and_vocab_shard_buffers_are_int32():
+    from vllm.model_executor.layers import vocab_parallel_embedding as vpe
+
+    import vllm_torchtpu
+
+    vllm_torchtpu._patch_vllm_vocab_parallel_embedding()
+
+    head = _HeadShard(torch.zeros((16, 8)), start=16, tp_size=4, num_pad=2)
+    greedy_top_tokens._ensure_head_shard_buffers(head)
+    assert head.org_vocab_start_index.dtype == torch.int32
+    assert head.num_org_vocab_padding.dtype == torch.int32
+
+    # Existing int64 buffers are upgraded to int32.
+    head.org_vocab_start_index = torch.tensor(16, dtype=torch.int64)
+    head.num_org_vocab_padding = torch.tensor(2, dtype=torch.int64)
+    greedy_top_tokens._ensure_head_shard_buffers(head)
+    assert head.org_vocab_start_index.dtype == torch.int32
+    assert head.num_org_vocab_padding.dtype == torch.int32
+
+    inp = torch.tensor([0, 16, 17, 30, 31], dtype=torch.int32)
+    masked, mask = vpe.get_masked_input_and_mask(
+        inp,
+        torch.tensor(16, dtype=torch.int32),
+        torch.tensor(30, dtype=torch.int32),
+        torch.tensor(2, dtype=torch.int32),
+        torch.tensor(32, dtype=torch.int32),
+        torch.tensor(32, dtype=torch.int32),
+    )
+    assert masked.dtype == torch.int32
+    assert masked.tolist() == [0, 0, 1, 0, 0]
+    assert mask.tolist() == [True, False, False, True, True]
+
+
+def _fused_candidate_block_inputs(blocks: int):
+    """Two requests: req 0 has two drafts, req 1 has one (rows d, d, bonus)."""
+    gen = torch.Generator().manual_seed(7)
+    num_cand = blocks * 128
+    return dict(
+        logits=torch.randn(5, blocks * 128 * 2, generator=gen),
+        draft_token_ids=torch.tensor([3, 9, 5], dtype=torch.int32),
+        num_draft_tokens=torch.tensor([2, 1], dtype=torch.int32),
+        bonus_logits_indices=torch.tensor([2, 4], dtype=torch.int32),
+        target_logits_indices=torch.tensor([0, 1, 3], dtype=torch.int32),
+        segment_ids=torch.tensor([0, 0, 1], dtype=torch.int64),
+        group_indices=torch.tensor([0, 1, 0], dtype=torch.int32),
+        max_draft_tokens=2,
+        req_temperatures=torch.ones((2, 1)),
+        req_top_k=torch.full((2, 1), blocks // 2, dtype=torch.int32),
+        req_top_p=torch.ones((2, 1)),
+        accept_u=None,
+        u_all=torch.rand((5, num_cand + 1), generator=gen),
+        topk_candidates=blocks,
+    )
+
+
+def test_fused_candidate_blocks_cut_off_at_half_the_block_count(monkeypatch):
+    # The runner takes the candidate-block path only while every request has
+    # 1 <= top_k <= blocks // 2, so the fused sampler's k-th value needs a
+    # top-(blocks // 2): 20 at TPU_SAMPLER_TOPK_CANDIDATES=40. Packed top-32
+    # candidates keep a top-32.
+    from vllm_torchtpu.layers.adapter.sample import rejection_sampler as rs
+
+    real = rs.apply_top_k_top_p
+    widths: list[int] = []
+
+    def spy(logits, top_k, top_p, topk_candidates=0, max_k=0):
+        widths.append(max_k)
+        return real(logits, top_k, top_p, topk_candidates, max_k=max_k)
+
+    def full_width(logits, top_k, top_p, topk_candidates=0, max_k=0):
+        return real(logits, top_k, top_p, topk_candidates, max_k=8)
+
+    sampler = RejectionSampler()
+    monkeypatch.setattr(rs, "apply_top_k_top_p", spy)
+    with torch.compiler.set_stance("force_eager"):
+        out = sampler.fused_verify_and_sample_candidates(
+            **_fused_candidate_block_inputs(8)
+        )
+    assert widths == [4]
+
+    # The same tokens as the block-count width it replaces.
+    monkeypatch.setattr(rs, "apply_top_k_top_p", full_width)
+    with torch.compiler.set_stance("force_eager"):
+        out_full = sampler.fused_verify_and_sample_candidates(
+            **_fused_candidate_block_inputs(8)
+        )
+    assert torch.equal(out, out_full)
+
+    widths.clear()
+    monkeypatch.setattr(rs, "apply_top_k_top_p", spy)
+    packed = _fused_candidate_block_inputs(8)
+    packed["logits"] = torch.randn(5, 2 * 64)
+    packed["u_all"] = torch.rand((5, 64 + 1))
+    packed["topk_candidates"] = 0
+    with torch.compiler.set_stance("force_eager"):
+        sampler.fused_verify_and_sample_candidates(**packed)
+    assert widths == [32]
+
+
+@pytest.mark.parametrize("vocab_size", [301, 2100])
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_w8a8_topk_candidates_are_each_shards_top32(monkeypatch, vocab_size, tp_size):
+    """A W8A8 FP8 head takes `_quantized_head_local_topk` (its CPU path here):
+    every rank's 32 candidates must be exactly the top 32 of the logits the
+    quantized head computes for its full-logits path, with those logits."""
+    gen = torch.Generator().manual_seed(300 + vocab_size + tp_size)
+    weight = torch.randn(vocab_size, 16, generator=gen)
+    hidden_states = torch.randn(5, 16, generator=gen)
+
+    packed = _vocab_parallel_topk_candidates_dim0(
+        weight, hidden_states, tp_size, monkeypatch, quantize=True
+    )
+
+    k = greedy_top_tokens.LOCAL_TOPK_CANDIDATES
+    assert packed.shape == (5, 2 * k * tp_size)
+    cand_logits = packed[:, : k * tp_size]
+    cand_ids = packed[:, k * tp_size :].to(torch.int64)
+    for rank, shard in enumerate(_shards(weight, tp_size)):
+        head = greedy_top_tokens.quantize_lm_head(shard, "fp8")
+        assert head._quant_mode == "fp8"
+        # The quantized head's full logits (its in-place quant method's math).
+        logits = greedy_top_tokens._apply_w8a8_lm_head(head, hidden_states)
+        num_pad = shard.shard_indices.num_org_vocab_padding
+        if num_pad:
+            logits[:, -num_pad:] = -float("inf")
+        start = shard.shard_indices.org_vocab_start_index
+        want_vals, want_idx = torch.topk(logits, k, dim=-1)
+        got_ids = cand_ids[:, rank * k : (rank + 1) * k]
+        got_vals = cand_logits[:, rank * k : (rank + 1) * k]
+        for row in range(5):
+            assert sorted(got_ids[row].tolist()) == sorted(
+                (want_idx[row] + start).tolist()
+            )
+            torch.testing.assert_close(
+                got_vals[row].sort().values,
+                want_vals[row].float().sort().values,
+                rtol=0,
+                atol=0,
+            )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("num_pad", [0, 3])
+def test_w8a8_head_pallas_ops_on_tpu(num_pad):
+    """The registered jax_op bridges of the W8A8 head (fused max and fused
+    top-32, each with and without vocab padding) run on TPU and pick each
+    row's clear winner, as the host path does."""
+    import torch_tpu  # noqa: F401
+
+    gen = torch.Generator().manual_seed(11)
+    vocab_shard, hidden = 256, 128
+    weight = torch.randn(vocab_shard, hidden, generator=gen) * 0.01
+    hidden_states = torch.randn(8, hidden, generator=gen)
+    winners = (5, 17, 40, 63, 100, 128, 200, 250 - num_pad)
+    for row, token in enumerate(winners):
+        weight[token] = hidden_states[row] * 4.0
+    if num_pad:
+        # Padding rows that would win if the mask were missing.
+        weight[-num_pad:] = hidden_states.sum(0) * 100.0
+    tpu = torch.device("tpu")
+    heads = {
+        dev: greedy_top_tokens.quantize_lm_head(
+            _HeadShard(weight.to(dev), 0, 1, num_pad), "fp8"
+        )
+        for dev in ("cpu", tpu)
+    }
+    want = torch.tensor(winners, dtype=torch.int32)
+
+    _, cpu_ids = greedy_top_tokens._quantized_head_local_max(
+        heads["cpu"], hidden_states
+    )
+    _, tpu_ids = greedy_top_tokens._quantized_head_local_max(
+        heads[tpu], hidden_states.to(tpu)
+    )
+    assert torch.equal(cpu_ids, want)
+    assert torch.equal(tpu_ids.cpu().to(torch.int32), want)
+
+    vals, ids = greedy_top_tokens._quantized_head_local_topk(
+        heads[tpu], hidden_states.to(tpu)
+    )
+    vals, ids = vals.cpu(), ids.cpu().to(torch.int64)
+    k = greedy_top_tokens.LOCAL_TOPK_CANDIDATES
+    assert vals.shape == ids.shape == (8, k)
+    top = vals.argmax(dim=-1, keepdim=True)
+    assert torch.equal(ids.gather(1, top).squeeze(1), want.to(torch.int64))
+    assert bool((ids < vocab_shard - num_pad).all())
+    assert all(len(set(r.tolist())) == k for r in ids)
+
+
+def test_quantize_lm_head_is_w8a8_fp8_or_bf16_only():
+    gen = torch.Generator().manual_seed(3)
+    weight = torch.randn(64, 8, generator=gen)
+    hidden_states = torch.randn(6, 8, generator=gen)
+    # One clear winner per row, so FP8 rounding cannot change the argmax.
+    for row, token in enumerate((5, 17, 40, 63, 0, 33)):
+        weight[token] = hidden_states[row] * 4.0
+
+    head = greedy_top_tokens.quantize_lm_head(_HeadShard(weight, 0, 1, 0), "fp8")
+    assert head._quant_mode == "fp8"
+    assert head._w8a8_weight_kn.dtype == torch.float8_e4m3fn
+    assert torch.equal(
+        greedy_top_tokens.top_tokens(_Owner(head), hidden_states),
+        _full_logits_tokens(weight, hidden_states),
+    )
+
+    bf16 = greedy_top_tokens.quantize_lm_head(_HeadShard(weight, 0, 1, 0), "bf16")
+    assert bf16._quant_mode is None
+    assert not hasattr(bf16, "_w8a8_weight_kn")
+
+    # The draft head stays at the checkpoint's precision, so no other
+    # quantized head format exists.
+    for mode in ("fp4", "w4a8", "fp4_g128"):
+        with pytest.raises(ValueError, match="Unsupported LM-head quantization"):
+            greedy_top_tokens.quantize_lm_head(_HeadShard(weight, 0, 1, 0), mode)
+
+
+@pytest.mark.parametrize(
+    "vocab_size,padded",
+    [(248320, False), (151936, False), (50257, True)],
+    ids=["qwen3_5_397b", "vocab_151936", "vocab_50257"],
+)
+def test_vocab_padding_is_decided_from_the_head(vocab_size, padded):
+    """vLLM's LogitsProcessor has no padded_vocab_size, so the head paths (W8A8
+    and BF16) decide from the head: padding exists when org_vocab_size_padded exceeds
+    org_vocab_size, the same answer on every rank. The Qwen3.5-397B vocabulary
+    (248320) is a multiple of vLLM's 64-entry padding, so its heads have none
+    at any TP size; a 50257-token vocabulary pads to 50304."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        DEFAULT_VOCAB_PADDING_SIZE,
+        pad_vocab_size,
+    )
+
+    assert "padded_vocab_size" not in inspect.getsource(LogitsProcessor)
+    head = SimpleNamespace(
+        org_vocab_size=vocab_size,
+        org_vocab_size_padded=pad_vocab_size(vocab_size, DEFAULT_VOCAB_PADDING_SIZE),
+    )
+    assert greedy_top_tokens._has_vocab_padding(head) is padded

@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for the per-chunk sampling helpers of ``TPUModelRunner``."""
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -22,7 +23,8 @@ import torch
 from vllm import SamplingParams
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
-from vllm_torchtpu.runner import min_tokens
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import CANDIDATE_BLOCK
+from vllm_torchtpu.runner import min_tokens, tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 NEG_INF = float("-inf")
@@ -512,3 +514,316 @@ def test_spec_verify_chunk_processors_run_after_grammar_and_min_tokens(
 
     assert seen == [(NEG_INF, NEG_INF)]
     assert out[0].tolist() == [30, 31, 35]
+
+
+# Processors and the packed top-k candidate paths: the fused verifies have no
+# processor hooks, and packed candidates are neither logits nor greedy tokens.
+
+
+class _TpuTopTokens:
+    """Greedy top tokens whose device reads as TPU, so the TPU-only fused
+    verify branch is the one under test."""
+
+    def __init__(self, values: torch.Tensor):
+        self.values = values
+        self.device = SimpleNamespace(type="tpu")
+
+
+def test_spec_verify_chunk_top_tokens_with_processors_skips_the_fused_verify(
+    monkeypatch,
+) -> None:
+    runner = _runner(spec_k=2)
+    fused = MagicMock(side_effect=AssertionError("fused verify with processors"))
+    monkeypatch.setattr(tpu_runner, "_fused_greedy_verify_from_top_tokens", fused)
+    gather = runner.spec_bonus_and_target_tokens
+    runner.spec_bonus_and_target_tokens = lambda tokens, *args: gather(
+        tokens.values, *args
+    )
+    logits = torch.full((4, 128), -20.0)
+    for row, tok in enumerate((30, 31, 32)):
+        logits[row, tok] = 6.0
+    tokens = _TpuTopTokens(torch.argmax(logits, -1, keepdim=True))
+    args = (
+        _verify_md([30, 31]),
+        None,
+        SimpleNamespace(scheduled_spec_decode_tokens={}),
+        0,
+        1,
+        True,
+        torch.Generator().manual_seed(0),
+        True,
+        {},
+    )
+    events: list[str] = []
+
+    out = runner._sample_spec_verify_chunk(
+        tokens, *args, [_SpecRecorder("p1", events, bonus=33)]
+    )
+
+    assert out[0].tolist() == [30, 31, 33]
+    assert events == ["p1.prepare_tokens", "p1.finish:[30, 31, 33]"]
+    # Without processors the same TPU chunk takes the fused verify.
+    fused.side_effect = None
+    fused.return_value = sentinel = torch.zeros((4, 3), dtype=torch.int64)
+    assert runner._sample_spec_verify_chunk(tokens, *args) is sentinel
+
+
+class _ReachedGather(Exception):
+    """Raised by the full-logits gather: the chunk took the non-fused path."""
+
+
+def test_spec_verify_chunk_with_processors_skips_the_candidate_verify() -> None:
+    runner = _runner(all_greedy=False, spec_k=2)
+    runner._sampler_topk_candidates = lambda *_args: 1
+    runner._build_padded_sampling_params = (
+        lambda _start, _end, logits, padded_num_reqs=None: (
+            torch.full((padded_num_reqs or logits.shape[0], 1), 0.7),
+            torch.full((padded_num_reqs or logits.shape[0], 1), 2, dtype=torch.int32),
+            torch.ones((padded_num_reqs or logits.shape[0], 1)),
+        )
+    )
+    fused = MagicMock(return_value=torch.zeros((4, 3), dtype=torch.int64))
+    runner.rejection_sampler.fused_verify_and_sample_candidates = fused
+    runner.spec_gather_bonus_and_target_logits = MagicMock(side_effect=_ReachedGather)
+    args = (
+        torch.zeros((4, 2 * CANDIDATE_BLOCK)),
+        _verify_md([30, 31]),
+        None,
+        SimpleNamespace(scheduled_spec_decode_tokens={}),
+        0,
+        1,
+        False,
+        torch.Generator().manual_seed(0),
+        False,
+        {},
+    )
+
+    # A sampled chunk within the candidate blocks takes the fused verify ...
+    assert runner._sample_spec_verify_chunk(*args) is fused.return_value
+    # ... unless it has processors: they need the gathered logits.
+    with pytest.raises(_ReachedGather):
+        runner._sample_spec_verify_chunk(*args, [_SpecRecorder("p1", [])])
+    assert fused.call_count == 1
+
+
+def test_packed_topk_candidates_never_meet_a_processor() -> None:
+    runner = _runner(all_greedy=False, spec_k=2)
+    packed = torch.zeros((4, 64))
+    events: list[str] = []
+
+    with pytest.raises(AssertionError, match="reached a plain chunk"):
+        runner._sample_plain_chunk(
+            packed,
+            cur_start_idx=0,
+            cur_end_idx=1,
+            top_tokens=False,
+            all_greedy=False,
+            sampling_generator=None,
+            grammar_output=None,
+            scheduler_output=SimpleNamespace(scheduled_spec_decode_tokens={}),
+            is_spec_step=False,
+            min_toks={},
+            processors=[_PlainRecorder("p1", 50, 100.0, events)],
+            topk_candidates_packed=True,
+        )
+    with pytest.raises(AssertionError, match="reached a verify chunk"):
+        runner._sample_spec_verify_chunk(
+            packed,
+            _verify_md([30, 31]),
+            None,
+            SimpleNamespace(scheduled_spec_decode_tokens={}),
+            0,
+            1,
+            False,
+            None,
+            False,
+            {},
+            [_SpecRecorder("p1", events)],
+            True,
+        )
+    # Neither path ran a hook on the packed values.
+    assert events == []
+
+
+def _sample_packed(packed, temperatures, u, top_k, top_p):
+    runner = SimpleNamespace(
+        _apply_temperature=TPUModelRunner._apply_temperature.__get__(object())
+    )
+    fn = inspect.unwrap(TPUModelRunner.sample_from_packed_candidates)
+    return fn(runner, packed, temperatures, u, top_k, top_p)
+
+
+def _sample_packed_before_the_tie_rule(packed, temperatures, u, top_k, top_p):
+    """sample_from_packed_candidates as it was before greedy rows took the
+    lowest tied token id: the reference for every other row."""
+    num_cand = packed.shape[-1] // 2
+    cand_logits = packed[:, :num_cand]
+    cand_token_ids = packed[:, num_cand:].to(torch.int64)
+    is_greedy = temperatures <= tpu_runner.SAMPLING_EPS
+    scaled = cand_logits / torch.where(temperatures == 0.0, 1.0, temperatures)
+    masked = tpu_runner.apply_top_k_top_p(
+        scaled, top_k, top_p, max_k=min(32, scaled.shape[-1])
+    )
+    tiny, eps = torch.finfo(u.dtype).tiny, torch.finfo(u.dtype).eps
+    noisy = masked - torch.log(-torch.log(torch.clamp(u, min=tiny, max=1.0 - eps)))
+    final = torch.where(is_greedy, cand_logits, noisy)
+    return torch.gather(cand_token_ids, -1, torch.argmax(final, dim=-1, keepdim=True))
+
+
+def test_packed_candidates_greedy_rows_take_the_lowest_tied_token_id() -> None:
+    # The packed producer lists tied maxima in token-id order; the sampler
+    # keeps the rule for any order, here token 50 before token 7.
+    logits = torch.tensor([[1.0, 3.0, 2.0, 3.0], [1.0, 3.0, 2.0, 3.0]])
+    token_ids = torch.tensor([[9.0, 50.0, 8.0, 7.0], [9.0, 50.0, 8.0, 7.0]])
+    packed = torch.cat([logits, token_ids], dim=-1)
+    temperatures = torch.tensor([[0.0], [0.7]])
+    u = torch.full((2, 4), 0.5)
+    top_k = torch.tensor([[1], [1]], dtype=torch.int32)
+    top_p = torch.ones((2, 1))
+    out = _sample_packed(packed, temperatures, u, top_k, top_p)
+    # The greedy row takes the full vocabulary's first argmax among the tie.
+    assert out[0].tolist() == [7]
+    # The sampled row is unchanged.
+    ref = _sample_packed_before_the_tie_rule(packed, temperatures, u, top_k, top_p)
+    assert out[1].tolist() == ref[1].tolist()
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("u_in_graph", [False, True], ids=["u_given", "u_in_graph"])
+@pytest.mark.parametrize("rows", [8, 16, 32])
+def test_compiled_packed_sampler_on_tpu_matches_the_host(rows, u_in_graph) -> None:
+    """The compiled sample_from_packed_candidates gives the host's tokens on
+    TPU at 256 candidates: greedy rows (one with a tie, the higher token id
+    listed first) and top-k 1 sampled rows, whose token depends on neither
+    the noise nor its last bits. `u_in_graph` runs the variant serving
+    compiles, which draws its uniforms in-graph (u=None). The module runs
+    every test under force_eager, so this one restores the default stance
+    around the TPU call."""
+    gen = torch.Generator().manual_seed(rows)
+    num_cand = 256
+    logits = torch.randn((rows, num_cand), generator=gen)
+    token_ids = (
+        torch.randperm(248320, generator=gen)[: rows * num_cand]
+        .reshape(rows, num_cand)
+        .to(torch.float32)
+    )
+    logits[0, 3] = logits[0, 9] = logits[0].max() + 1.0
+    token_ids[0, 3], token_ids[0, 9] = 900.0, 12.0
+    packed = torch.cat([logits, token_ids], dim=-1)
+    temperatures = torch.full((rows, 1), 0.7)
+    temperatures[: rows // 2] = 0.0
+    u = torch.rand((rows, num_cand), generator=gen)
+    top_k = torch.ones((rows, 1), dtype=torch.int32)
+    top_p = torch.ones((rows, 1))
+    host = _sample_packed(packed, temperatures, u, top_k, top_p)
+    assert host[0].item() == 12
+    runner = SimpleNamespace(
+        _apply_temperature=TPUModelRunner._apply_temperature.__get__(object())
+    )
+    device = torch.device("tpu")
+    with torch.compiler.set_stance("default"):
+        out = TPUModelRunner.sample_from_packed_candidates(
+            runner,
+            packed.to(device),
+            temperatures.to(device),
+            None if u_in_graph else u.to(device),
+            top_k.to(device),
+            top_p.to(device),
+        )
+    assert torch.equal(out.cpu(), host)
+
+
+@pytest.mark.parametrize("u_in_graph", [False, True], ids=["u_given", "u_in_graph"])
+@pytest.mark.parametrize("rows", [8, 16])
+def test_the_traced_packed_sampler_matches_the_host(rows, u_in_graph) -> None:
+    """The CPU counterpart of the TPU test above: dynamo traces
+    sample_from_packed_candidates whole (fullgraph, static shapes) under the
+    default stance and the eager backend runs the captured graph, which gives
+    the host's tokens for greedy rows (one with a tie, the higher token id
+    listed first) and top-k 1 sampled rows. It covers the traced program, not
+    its TPU lowering, which only the TPU test runs."""
+    fn = inspect.unwrap(TPUModelRunner.sample_from_packed_candidates)
+    gen = torch.Generator().manual_seed(rows)
+    num_cand = 64
+    logits = torch.randn((rows, num_cand), generator=gen)
+    token_ids = (
+        torch.randperm(4096, generator=gen)[: rows * num_cand]
+        .reshape(rows, num_cand)
+        .to(torch.float32)
+    )
+    logits[0, 3] = logits[0, 9] = logits[0].max() + 1.0
+    token_ids[0, 3], token_ids[0, 9] = 900.0, 12.0
+    packed = torch.cat([logits, token_ids], dim=-1)
+    temperatures = torch.full((rows, 1), 0.7)
+    temperatures[: rows // 2] = 0.0
+    u = torch.rand((rows, num_cand), generator=gen)
+    top_k = torch.ones((rows, 1), dtype=torch.int32)
+    top_p = torch.ones((rows, 1))
+    host = _sample_packed(packed, temperatures, u, top_k, top_p)
+    assert host[0].item() == 12
+    runner = SimpleNamespace(
+        _apply_temperature=TPUModelRunner._apply_temperature.__get__(object())
+    )
+    torch._dynamo.reset()
+    try:
+        with torch.compiler.set_stance("default"):
+            traced = torch.compile(fn, backend="eager", fullgraph=True, dynamic=False)
+            out = traced(
+                runner, packed, temperatures, None if u_in_graph else u, top_k, top_p
+            )
+    finally:
+        # Drop the eager backend's entries so later tests compile afresh.
+        torch._dynamo.reset()
+    assert torch.equal(out, host)
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_packed_candidates_rows_without_a_greedy_tie_sample_as_before(seed) -> None:
+    """Sampled rows, and greedy rows whose maximum is unique, give exactly the
+    token they gave before the tie rule."""
+    gen = torch.Generator().manual_seed(seed)
+    rows, num_cand = 16, 64
+    logits = torch.randn((rows, num_cand), generator=gen)
+    token_ids = torch.randperm(4096, generator=gen)[: rows * num_cand]
+    packed = torch.cat(
+        [logits, token_ids.reshape(rows, num_cand).to(torch.float32)], dim=-1
+    )
+    temperatures = torch.where(torch.rand((rows, 1), generator=gen) < 0.3, 0.0, 0.7).to(
+        torch.float32
+    )
+    u = torch.rand((rows, num_cand), generator=gen)
+    top_k = torch.randint(1, 33, (rows, 1), generator=gen, dtype=torch.int32)
+    top_p = torch.where(torch.rand((rows, 1), generator=gen) < 0.5, 0.95, 1.0)
+    out = _sample_packed(packed, temperatures, u, top_k, top_p)
+    ref = _sample_packed_before_the_tie_rule(packed, temperatures, u, top_k, top_p)
+    assert torch.equal(out, ref)
+
+
+def test_in_graph_draws_seed_the_device_generator_or_refuse(monkeypatch) -> None:
+    """The candidate samplers draw in-graph from the TPU default generator;
+    every rank seeds it alike, and a missing generator is an error, not a
+    silent skip."""
+    seeded = []
+
+    class _Generator:
+        def manual_seed(self, seed):
+            seeded.append(seed)
+
+    runner = SimpleNamespace(
+        _sampling_generator=None,
+        model_config=SimpleNamespace(seed=7),
+        device=torch.device("cpu"),
+        _sampler_draws_in_graph=lambda: True,
+    )
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(default_generators=[_Generator()]), raising=False
+    )
+    TPUModelRunner._get_sampling_generator(runner)
+    assert seeded == [7]
+
+    runner._sampling_generator = None
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(default_generators=[]), raising=False
+    )
+    with pytest.raises(RuntimeError, match="TPU device 0"):
+        TPUModelRunner._get_sampling_generator(runner)

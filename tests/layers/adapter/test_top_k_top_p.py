@@ -180,3 +180,110 @@ def test_rejection_sampler_topk_candidates_cpu_parity():
     expected = sampling.apply_top_k_top_p(logits, top_k, top_p, topk_candidates=0)
     result = sampling.apply_top_k_top_p(logits, top_k, top_p, topk_candidates=64)
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def test_topk_mask_max_k_parity_with_ties():
+    gen = torch.Generator().manual_seed(7)
+    logits = torch.randn(16, 256, generator=gen)
+    # Introduce multi-way ties at and below the top-k boundary.
+    logits[:, :50] = torch.round(logits[:, :50] * 2.0) / 2.0
+    top_k = torch.randint(0, 33, (16, 1), generator=gen, dtype=torch.int32)
+    top_p = torch.tensor([[0.85 if i % 2 == 0 else 1.0] for i in range(16)])
+
+    expected = sampling.apply_top_k_top_p(logits, top_k, top_p, max_k=0)
+    result = sampling.apply_top_k_top_p(logits, top_k, top_p, max_k=32)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def _fused_candidates_cpu(rows, draft_ids, temps, accept_u, u_all):
+    """Run the fused candidate verify-and-sample program eagerly on packed
+    candidates: request i's draft row is `rows[i]`, its bonus row
+    `rows[batch + i]`; each row is `(candidate logits, candidate ids)`."""
+    from vllm_torchtpu.layers.adapter.sample import rejection_sampler as rs
+
+    batch = len(draft_ids)
+    packed = torch.tensor(
+        [list(logits) + [float(i) for i in ids] for logits, ids in rows],
+        dtype=torch.float32,
+    )
+    num_cand = packed.shape[1] // 2
+    return rs._fused_spec_verify_and_sample_candidates._torchdynamo_orig_callable(
+        packed,
+        torch.tensor(draft_ids, dtype=torch.int32),
+        torch.ones(batch, dtype=torch.int32),
+        torch.arange(batch, 2 * batch, dtype=torch.int32),
+        torch.arange(batch, dtype=torch.int32),
+        torch.arange(batch, dtype=torch.int64),
+        torch.zeros(batch, dtype=torch.int32),
+        1,
+        torch.tensor(temps, dtype=torch.float32).reshape(-1, 1),
+        torch.full((batch, 1), num_cand, dtype=torch.int32),
+        torch.ones((batch, 1), dtype=torch.float32),
+        torch.tensor(accept_u, dtype=torch.float32),
+        torch.tensor(u_all, dtype=torch.float32),
+        None,
+        False,
+        0,
+    ).tolist()
+
+
+# Request 0 is greedy and its two top candidates tie (ids 7 and 3, so the first
+# argmax is 3); request 1 samples at T = 1 from one dominant candidate.
+_TIED = ([5.0, 5.0, 1.0, 0.0], [7, 3, 9, 11])
+_SAMPLED_DRAFT = ([10.0, 0.0, 0.0, 0.0], [20, 21, 22, 23])
+_SAMPLED_BONUS = ([10.0, 0.0, 0.0, 0.0], [30, 31, 32, 33])
+# Bonus noise that favours the first tied candidate (id 7).
+_U_ALL = [[0.99, 0.01, 0.5, 0.5], [0.5] * 4, [0.5] * 4, [0.5] * 4]
+
+
+@pytest.mark.parametrize(
+    "greedy_draft,greedy_u,expected_greedy",
+    [
+        # The first argmax is accepted whatever the draw, and the bonus is the
+        # first argmax too, not the tied id the noise favours.
+        (3, 0.9, [3, 3]),
+        # A tied id that is not the first argmax is rejected, whatever the
+        # draw, and recovers the first argmax.
+        (7, 0.1, [3, -1]),
+    ],
+)
+def test_fused_candidates_greedy_rows_take_the_first_argmax(
+    greedy_draft, greedy_u, expected_greedy
+):
+    out = _fused_candidates_cpu(
+        [_TIED, _SAMPLED_DRAFT, _TIED, _SAMPLED_BONUS],
+        [greedy_draft, 20],
+        [0.0, 1.0],
+        [greedy_u, 0.5],
+        _U_ALL,
+    )
+    assert out == [expected_greedy, [20, 30]]
+
+
+def test_fused_candidates_reject_a_zero_probability_draft_at_u_zero():
+    # Draft 99 is not a candidate (p = 0); a uniform draw of exactly 0.0 must
+    # still reject it and recover from the target, as main's sampler does.
+    out = _fused_candidates_cpu(
+        [_SAMPLED_DRAFT, _SAMPLED_DRAFT, _SAMPLED_BONUS, _SAMPLED_BONUS],
+        [99, 20],
+        [1.0, 1.0],
+        [0.0, 0.0],
+        [[0.5] * 4] * 4,
+    )
+    assert out == [[20, -1], [20, 30]]
+
+
+def test_fused_candidates_greedy_row_recovers_the_first_argmax():
+    # Three candidates tie (ids 7, 3, 9; first argmax 3) and the draft is the
+    # last of them, so the greedy row rejects it. Its recovered token must be
+    # the first argmax whatever the noise, which here favours the other
+    # remaining tie (id 7).
+    tied3 = ([5.0, 5.0, 5.0, 0.0], [7, 3, 9, 11])
+    out = _fused_candidates_cpu(
+        [tied3, _SAMPLED_DRAFT, tied3, _SAMPLED_BONUS],
+        [9, 20],
+        [0.0, 1.0],
+        [0.1, 0.5],
+        [[0.5] * 4, [0.5] * 4, [0.99, 0.01, 0.5, 0.5], [0.5] * 4],
+    )
+    assert out == [[3, -1], [20, 30]]
