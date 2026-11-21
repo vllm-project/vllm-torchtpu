@@ -43,18 +43,72 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Module:
-    """The module holding ``lm_head`` and its ``logits_processor``.
+class _LogitsProbe(torch.nn.Module):
+    """Sentinel logits_processor used to verify passthrough ``compute_logits``."""
 
-    Qwen3.5's wrapper keeps both on ``language_model``. Raises when the model
-    cannot be served by the vocabulary-parallel argmax.
+    def __init__(self, expected_head: torch.nn.Module) -> None:
+        super().__init__()
+        self.expected_head = expected_head
+        self.sentinel_in = object()
+        self.sentinel_out = object()
+        self.matched = False
+
+    def forward(
+        self,
+        lm_head: torch.nn.Module,
+        hidden_states: object,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> object:
+        expected_bias = getattr(self.expected_head, "bias", None)
+        self.matched = (
+            lm_head is self.expected_head
+            and hidden_states is self.sentinel_in
+            and (embedding_bias is None or embedding_bias is expected_bias)
+        )
+        return self.sentinel_out
+
+
+def _verify_passthrough_compute_logits(
+    model: torch.nn.Module, owner: torch.nn.Module, *, flag_name: str
+) -> None:
+    """Rejects models whose ``compute_logits`` transforms inputs or outputs
+    around ``owner.logits_processor(owner.lm_head, hidden_states)``."""
+    compute_logits = getattr(model, "compute_logits", None)
+    if not callable(compute_logits):
+        return
+    probe = _LogitsProbe(cast(torch.nn.Module, owner.lm_head))
+    orig_processor = owner.logits_processor
+    owner.logits_processor = probe
+    try:
+        out = compute_logits(probe.sentinel_in)
+    except (AttributeError, TypeError):
+        out = None
+    finally:
+        owner.logits_processor = orig_processor
+    if not probe.matched or out is not probe.sentinel_out:
+        raise NotImplementedError(
+            f"{flag_name}: {type(model).__name__}.compute_logits performs "
+            "custom pre- or post-processing beyond logits_processor(lm_head, "
+            f"hidden_states); unset {flag_name} for this model."
+        )
+
+
+def find_vocab_parallel_head_owner(
+    model: torch.nn.Module, *, flag_name: str
+) -> torch.nn.Module:
+    """Locates the module holding ``lm_head`` and ``logits_processor``.
+
+    Qwen3.5's wrapper keeps both on ``language_model``. Raises
+    ``NotImplementedError`` when the model defines a TPU-specific or
+    non-passthrough ``compute_logits``, lacks a sharded ``lm_head``, or uses a
+    non-positive logit scale.
     """
     compute_logits = getattr(type(model), "compute_logits", None)
     if getattr(compute_logits, "__module__", "").startswith("vllm_torchtpu."):
         raise NotImplementedError(
-            f"TPU_GREEDY_TOP_TOKENS: {type(model).__name__} computes its logits "
-            "in a TPU-specific compute_logits that get_top_tokens does not "
-            "reproduce; unset TPU_GREEDY_TOP_TOKENS for this model."
+            f"{flag_name}: {type(model).__name__} computes its logits "
+            "in a TPU-specific compute_logits that vocabulary-parallel sampling "
+            f"does not reproduce; unset {flag_name} for this model."
         )
     for module in model.modules():
         processor = getattr(module, "logits_processor", None)
@@ -71,16 +125,27 @@ def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Mo
             break
     else:
         raise NotImplementedError(
-            f"TPU_GREEDY_TOP_TOKENS: {type(model).__name__} has no module with "
-            "an lm_head and a logits_processor.get_top_tokens; unset "
-            "TPU_GREEDY_TOP_TOKENS for this model."
+            f"{flag_name}: {type(model).__name__} has no module with "
+            f"an lm_head and a supported logits_processor; unset "
+            f"{flag_name} for this model."
         )
     assert processor is not None and head is not None
     if processor.scale <= 0.0:
         raise NotImplementedError(
-            "TPU_GREEDY_TOP_TOKENS: the argmax reduction needs a positive "
-            f"logit scale, got {processor.scale}; unset TPU_GREEDY_TOP_TOKENS."
+            f"{flag_name}: vocabulary-parallel sampling needs a positive "
+            f"logit scale, got {processor.scale}; unset {flag_name}."
         )
+    _verify_passthrough_compute_logits(model, module, flag_name=flag_name)
+    return module
+
+
+def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Module:
+    """The module holding ``lm_head`` and its ``logits_processor``.
+
+    Raises when the model cannot be served by the vocabulary-parallel argmax.
+    """
+    module = find_vocab_parallel_head_owner(model, flag_name="TPU_GREEDY_TOP_TOKENS")
+    head = cast("VocabParallelEmbedding", module.lm_head)
     if dp_lockstep and head.tp_size > 1:
         # An idle engine issues the full-logits collective in lockstep with
         # its busy peers, which would be waiting in the pair exchange.
@@ -108,13 +173,31 @@ def top_tokens(owner: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Ten
     return tokens.to(torch.int64).view(-1, 1)
 
 
+def is_synthetic_warmup(req_ids: Sequence[str | None]) -> bool:
+    """True when ``req_ids`` holds only synthetic warmup requests (``__..__``)."""
+    return all(req_id is None or req_id.startswith("__") for req_id in req_ids)
+
+
+def has_structured_output(
+    input_batch: InputBatch, requests: Mapping[str, CachedRequestState]
+) -> bool:
+    """True when any active request in ``input_batch`` sets ``structured_outputs``."""
+    for req_id in input_batch.req_ids:
+        if req_id is None:
+            continue
+        params = requests[req_id].sampling_params
+        if params is not None and params.structured_outputs is not None:
+            return True
+    return False
+
+
 def log_step_path(is_spec_step: bool, req_ids: Sequence[str | None]) -> None:
     """Logs, once per path, that a step's tokens came from the top tokens.
 
     Steps holding only the runner's synthetic warmup requests (ids
     ``__..__``) are skipped, so the line marks served traffic.
     """
-    if all(req_id is None or req_id.startswith("__") for req_id in req_ids):
+    if is_synthetic_warmup(req_ids):
         return
     if is_spec_step:
         logger.info_once(
@@ -134,14 +217,10 @@ def step_eligible(
     logits to mask."""
     if not input_batch.all_greedy or input_batch.max_num_logprobs is not None:
         return False
-    for req_id in input_batch.req_ids:
-        if req_id is None:
-            continue
-        params = requests[req_id].sampling_params
-        if params is not None and params.structured_outputs is not None:
-            logger.warning_once(
-                "TPU_GREEDY_TOP_TOKENS: steps with a structured-output request "
-                "gather the full logits"
-            )
-            return False
+    if has_structured_output(input_batch, requests):
+        logger.warning_once(
+            "TPU_GREEDY_TOP_TOKENS: steps with a structured-output request "
+            "gather the full logits"
+        )
+        return False
     return True

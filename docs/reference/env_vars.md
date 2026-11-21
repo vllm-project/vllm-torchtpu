@@ -144,3 +144,11 @@ Both are off by default; set both (`--additional-config '{"tpu_moe_topk_weights_
 | `TPU_TRACE_MODE` | `"TRACE_COMPUTE"` | SparseCore trace mode (`"TRACE_COMPUTE"`, `"TRACE_COMPUTE_AND_DMA"`, etc.). |
 | `TPU_NUM_SPARSE_CORES_TO_TRACE` | `1` | Number of SparseCores to trace when SparseCore tracing is active. |
 | `TPU_KERNEL_ITER_MODE` | `False` | Enables fast Pallas kernel hot-reloading without restarting the vLLM server (`TPU_KERNEL_RELOAD_MODULES`). |
+
+---
+
+## 7. Sampling & Logits
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `TPU_DISTRIBUTED_SAMPLING` | `False` | Samples eligible non-greedy chunks (`1 <= top_k <= 100` with any `top_p`, or pure temperature where no non-greedy row in the chunk sets `top_k` or `top_p < 1`) directly from each TP rank's vocabulary-parallel LM head shard (`runner/distributed_sampling.py`), avoiding the `[batch, vocab]` logit `all-gather` and full-vocabulary uniform RNG draw. In `top_k` mode each shard keeps the top 4–6 entries per 256-lane column, which is approximate if more higher-ranked tokens collide in the same lane on one shard. Slices with `top_p` without `top_k`, `top_k > 100`, or mixed modes, and steps with logprobs, structured outputs, `min_tokens`, `repetition_penalty`, or `thinking_token_budget` fall back to full-logits sampling; speculative decoding, `TP == 1`, LoRA LM heads, `TPU_DP_VOCAB_PARALLEL`, EP lockstep, and custom `compute_logits` raise `NotImplementedError` when enabled. Off by default until cross-model sampling accuracy evals and throughput A/B are collected. |
