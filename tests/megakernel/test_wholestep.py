@@ -293,7 +293,8 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
            shared_kv: bool = False, cdcp: bool = False, cdcp_keys: bool = True, ck_fn=None,
            async_dma: bool = False, B: int | None = None, xreq: int = 0,
            skip_idle: bool = False, xmerge: bool = False, key_mp: int = 0, key_slots: int = 2,
-           req_async: int = 0, nvis_balance: bool = False, uattn_lite: bool = False):
+           req_async: int = 0, nvis_balance: bool = False, uattn_lite: bool = False,
+           key_lanes: int = 0):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -335,7 +336,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
                    bounded_chunks=True, shard_index=shard, union_attn=union,
                    union_stats=stats, union_phys=phys, loop_requests=loop, dcp=dcp,
                    compressed_dcp=cdcp, xreq_prefetch=xreq, skip_idle=skip_idle,
-                   manager_pages=key_mp, key_slots=key_slots,
+                   manager_pages=key_mp, key_slots=key_slots, ck_lanes=key_lanes,
                    **(dict(xmerge=True) if xmerge else {}),
                    **(dict(req_async=req_async) if req_async else {}),
                    **(dict(nvis_balance=True) if nvis_balance else {}),
@@ -720,6 +721,11 @@ def test_key_stream_ring_and_manager_pages_bit_identical(monkeypatch, kw):
         got = run(key_mp=mp, key_slots=ks)
         for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new"), (7, "ids")):
             np.testing.assert_array_equal(got[i], base[i], err_msg=f"{name} mp={mp} slots={ks}")
+    # wholekeylanes=128: only the real lanes of each carrier row, alone and with manager pages.
+    for mp, ks in ((0, 4), (4, 3)):
+        got = run(key_mp=mp, key_slots=ks, key_lanes=128)
+        for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new"), (7, "ids")):
+            np.testing.assert_array_equal(got[i], base[i], err_msg=f"{name} mp={mp} lanes=128")
     monkeypatch.setattr(qsa_full_b, "SCORE_ARM", "compute")
     bad = run(key_slots=3)
     assert not np.array_equal(bad[7], base[7]), "stale-ring scores must change the selection"

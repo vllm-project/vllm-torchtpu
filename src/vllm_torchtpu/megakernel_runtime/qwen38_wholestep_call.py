@@ -93,6 +93,10 @@ KEY_MP: int = 0
 # the row bucket (`key_slots_for`).
 KEY_SLOTS: int = 2
 KEY_SLOTS_AUTO = -1
+# `...,wholekeylanes=128`: the key stream copies only the 128 real lanes of each 256-lane
+# carrier row (`QSAFullIndexedBlock.ck_lanes`), so the ring holds dense [1024, 128] BF16 keys
+# and needs no lane slice. 0 = the whole carrier row. Same keys, same scores.
+KEY_LANES: int = 0
 
 
 def key_slots_for(B: int | None) -> int:
@@ -134,6 +138,7 @@ def indexed_options(B: int | None = None) -> dict:
         **nvis_balance_options(B),
         # VLLM_TPU_MK_UATTN_LITE: only when set, so the spec is unchanged when off.
         **({"uattn_lite": True} if UNION_ATTN and envs.VLLM_TPU_MK_UATTN_LITE else {}),
+        **({"ck_lanes": KEY_LANES} if KEY_LANES else {}),
     )
 
 
