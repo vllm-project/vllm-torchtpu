@@ -223,6 +223,7 @@ def attend_request(
     sc: Any = None,
     ids_row: Any = 0,
     stream: Any = None,
+    lite: bool = False,
 ) -> list[Any]:
     """Gated sparse attention of one request's `T` rows over their union: `T` `[nh, 256]` F32.
 
@@ -247,6 +248,10 @@ def attend_request(
     (else its first `min(ntiles, nslots - 1)` were). `nxt = (live, ids_row, table_row, n_union)`
     of the next request (its ids already staged in `ids[ids_row]`). Every issued tile is waited
     by its own request; the caller carries `base + ntiles` to the next request.
+    `lite` (VLLM_TPU_MK_UATTN_LITE): fewer per-tile ops, same bytes. One code-expand matmul per
+    tile (the tile's half picks its expand matrix first), and under `dcp` > 1 one select for
+    V's NaN sanitize and scale, with no length mask: the sanitize leaves every V finite, and a
+    slot past `n_union` has `p` = 0 exactly, so its `p * v` adds an exact zero as before.
     """
     sc = sc or (lambda *_: contextlib.nullcontext())
     per_page = pool.shape[1] // MICRO
@@ -350,19 +355,26 @@ def attend_request(
     def _tile_body(t: Any, s: Any, carry: Any) -> Any:
       with sc("u_unpack", 3):
         win = codes[:, pl.ds(pl.multiple_of((t // 2) * 128, 128), 128)].astype(F32).astype(BF16)
-        tok_code = jnp.where(
-            jax.lax.rem(t, 2) == 0,
-            jnp.dot(win, expand[0], preferred_element_type=F32),
-            jnp.dot(win, expand[1], preferred_element_type=F32),
-        ).astype(I32)
+        if lite:
+            ex = jnp.where(jax.lax.rem(t, 2) == 0, expand[0], expand[1])
+            tok_code = jnp.dot(win, ex, preferred_element_type=F32).astype(I32)
+        else:
+            tok_code = jnp.where(
+                jax.lax.rem(t, 2) == 0,
+                jnp.dot(win, expand[0], preferred_element_type=F32),
+                jnp.dot(win, expand[1], preferred_element_type=F32),
+            ).astype(I32)
         tok = t * TILE + jax.lax.broadcasted_iota(I32, (1, TILE), 1)
         k8, v8 = _unpack_kv(ring.at[s], off, interpret)
         key = k8.astype(F32) * scale_k
         tok_col = t * TILE + jax.lax.broadcasted_iota(I32, (TILE, 1), 0)
         value = v8.astype(F32)
-        if dcp > 1:  # unowned slots hold the pair rank's rows (FP8: may be NaN)
-            value = jnp.where(value == value, value, 0.0)
-        value = jnp.where(tok_col < length, value * scale_v, 0.0)
+        if lite and dcp > 1:  # sanitize + scale in one select; no length mask (see `lite`)
+            value = jnp.where(value == value, value * scale_v, 0.0)
+        else:
+            if dcp > 1:  # unowned slots hold the pair rank's rows (FP8: may be NaN)
+                value = jnp.where(value == value, value, 0.0)
+            value = jnp.where(tok_col < length, value * scale_v, 0.0)
       with sc("u_rows", 3):
         if stack:
             m, l, acc = carry

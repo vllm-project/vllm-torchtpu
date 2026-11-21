@@ -1586,6 +1586,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     dcp=self.dcp, sc=ctx.stream.sc,
                     **(dict(ids_row=bank, stream=stream) if xreq else {}),
                     **(dict(ids_row=bank) if rbank else {}),
+                    **(dict(lite=True) if self.uattn_lite else {}),
                 )
             if rasync and not rbank:  # request q's ids are read: the next request's go into `qu_row`
 

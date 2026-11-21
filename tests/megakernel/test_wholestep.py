@@ -293,7 +293,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
            shared_kv: bool = False, cdcp: bool = False, cdcp_keys: bool = True, ck_fn=None,
            async_dma: bool = False, B: int | None = None, xreq: int = 0,
            skip_idle: bool = False, xmerge: bool = False, key_mp: int = 0, key_slots: int = 2,
-           req_async: int = 0, nvis_balance: bool = False):
+           req_async: int = 0, nvis_balance: bool = False, uattn_lite: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -338,7 +338,8 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
                    manager_pages=key_mp, key_slots=key_slots,
                    **(dict(xmerge=True) if xmerge else {}),
                    **(dict(req_async=req_async) if req_async else {}),
-                   **(dict(nvis_balance=True) if nvis_balance else {}))
+                   **(dict(nvis_balance=True) if nvis_balance else {}),
+                   **(dict(uattn_lite=True) if uattn_lite else {}))
     spec = wholestep_spec(
         G,
         R,
@@ -1479,6 +1480,20 @@ def test_main_skip_idle_and_xmerge_bit_identical(monkeypatch, B):
     both = _main_run(monkeypatch, B, skip_idle=True, xmerge=True)
     _assert_live_identical(base, skip, nlive)
     _assert_live_identical(base, both, nlive)
+
+
+@pytest.mark.parametrize("B,dcp,kw", [
+    (8, 1, {}), (8, 2, {}), (8, 2, dict(skip_idle=True, xmerge=True)), (8, 1, dict(phys=True)),
+])
+def test_uattn_lite_bit_identical(monkeypatch, B, dcp, kw):
+    """VLLM_TPU_MK_UATTN_LITE on the served main-call form (request loop, cross-request
+    prefetch): every live output byte-identical to the default union attention, with and
+    without main-KV DCP, skip_idle + xmerge, and physical ids."""
+    nlive = 4 if not kw.get("skip_idle") else B // 4
+    base = _main_run(monkeypatch, B, dcp, **kw)
+    lite = _main_run(monkeypatch, B, dcp, uattn_lite=True, **kw)
+    assert np.isfinite(base[0]).all()
+    _assert_live_identical(base, lite, nlive)
 
 
 def test_qsa_xmerge_lost_union_is_caught(monkeypatch):

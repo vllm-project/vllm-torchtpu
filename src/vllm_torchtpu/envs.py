@@ -189,6 +189,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_QSA_SELECT_NVIS: int = 0
     VLLM_TPU_MK_AR_HIER_SMALL: bool = False
     VLLM_TPU_MK_QSA_XMERGE: bool = False
+    VLLM_TPU_MK_UATTN_LITE: bool = False
     VLLM_TPU_MK_WHOLE_SKIP_IDLE: bool = False
     VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_MK_WHOLE_L45: bool = False
@@ -1340,6 +1341,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP): the selection exchange and the union exchange of each QSA layer go out as one
     # all-gather (`QSAFullIndexedBlock.xmerge`). Exact: same int32 payloads, one transfer.
     "VLLM_TPU_MK_QSA_XMERGE": env_bool("VLLM_TPU_MK_QSA_XMERGE"),
+    # Whole-step megakernel union attention: per-tile op cuts (`attend_request`'s `lite`): one
+    # code-expand matmul per tile instead of two, and under main-KV DCP one select for V's NaN
+    # sanitize + scale with no length mask. Exact: same scores, p and PV terms bit for bit.
+    "VLLM_TPU_MK_UATTN_LITE": env_bool("VLLM_TPU_MK_UATTN_LITE"),
     # Whole-step megakernel (main call, with `wholeloop=1`): the QSA request loops stop
     # after the last live request (`skip_idle`, as the MK draft already does), so the idle
     # request slots of a bucket's tile do no work. Live rows are byte-identical.
