@@ -152,11 +152,12 @@ def _pack_routing_exchange(pairs, scale_bits, counts, layout):
 
 
 def _combine_arrivals_fs(
-    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype, decode=True
 ):
     """v2's `_combine_arrivals`, with the arrival-scale lookup done inside the
     combine kernel (see kernel._build_combine_fs_kernel) where that kernel
-    applies; v2's XLA epilogue everywhere else."""
+    applies, the one-pass decode combine (kernel._build_combine_decode_kernel)
+    at decode sizes where `decode`, and v2's XLA epilogue everywhere else."""
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
@@ -164,7 +165,7 @@ def _combine_arrivals_fs(
     # Neither position is ever negative.
     rows = jnp.minimum(pos, recv_rows - 1)
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
-    if decode_combine_applies(t_local):
+    if decode and decode_combine_applies(t_local):
         combine = build_combine_decode_kernel(
             t_local=t_local,
             topk=topk,
@@ -262,12 +263,18 @@ def _scale_slab_onehot(slab_row, scale_bits, scale_rows):
     """``zeros([scale_rows * 128]).at[slab_row].add(scale_bits, mode="drop")``
     as one one-hot matmul, returned as the f32 [scale_rows, 128] slab.
 
-    Exact for any bit pattern because every routed pair lands on a slab row of
-    its own: row r = 128 * hi + lo, an [4 * scale_rows, n] operand holds each
-    pair's four bit-pattern bytes on its hi row and an [n, 128] one-hot picks
-    its lo lane, so every output is one byte (< 256, exact in bf16) times 1.0
-    summed with zeros in f32. Rows past the slab (the off-shard sentinel)
-    match no hi row and drop. On the SparseCore the scatter delays the
+    Exact for any bit pattern on every row the expert kernel reads, because each
+    routed pair lands on a slab row of its own: row r = 128 * hi + lo, an
+    [4 * scale_rows, n] operand holds each pair's four bit-pattern bytes on its
+    hi row and an [n, 128] one-hot picks its lo lane, so every output is one
+    byte (< 256, exact in bf16) times 1.0 summed with zeros in f32. Rows past
+    the slab (routing_pairs_from_tables' off-shard sentinel) match no hi row
+    and drop. host.local_slab_rows instead sends every off-shard pair below
+    this shard to the sink row `shard_stride`, inside the slab's spare
+    sublane: there the byte sums carry and differ from the scatter-add's
+    (equally meaningless) sum, which is harmless only because nothing reads
+    that row (host.act_scale_slab_rows). plan_kernel._build_pair_tables builds the
+    same slab in-kernel by the same argument. On the SparseCore the scatter delays the
     pre-push queued behind it; here it is one small matmul in VMEM.
     """
     lanes = HIDDEN_LANE_BLOCK
@@ -342,6 +349,7 @@ def fused_ep_moe_push(
     split_exchange=False,
     onehot_scale_slab=False,
     pair_kernel=False,
+    decode_combine=True,
     expert_slot=None,
     expert_load=None,
     shared_expert=None,
@@ -393,7 +401,11 @@ def fused_ep_moe_push(
     (`_scale_slab_onehot`) instead of a SparseCore scatter, and with
     `exchange_tables` and `kernel_plan_tables` `pair_kernel` builds such a
     step's per-pair tables and scale slab in one kernel from the exchanged
-    payload (plan_kernel.build_pair_tables). The
+    payload (plan_kernel.build_pair_tables), and `decode_combine` combines a
+    step of at most kernel.COMBINE_TOKENS tokens a shard with the one-pass
+    decode kernel instead of v2's XLA epilogue (on by default here, unlike
+    the other two: it was the only combine at those sizes before the knob
+    existed). The
     caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
@@ -1058,7 +1070,13 @@ def fused_ep_moe_push(
                 (t_local, topk),
             )
         combined = _combine_arrivals_fs(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+            arrivals,
+            arrival_scales,
+            pos,
+            mirror_pos,
+            topk_weights,
+            out_dtype,
+            decode=decode_combine,
         )
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
@@ -1284,6 +1302,7 @@ def fused_ep_moe_push(
         bool(split_exchange),
         bool(onehot_scale_slab),
         bool(pair_kernel),
+        bool(decode_combine),
     )
     out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
     out_specs = out_specs if len(out_specs) > 1 else out_specs[0]

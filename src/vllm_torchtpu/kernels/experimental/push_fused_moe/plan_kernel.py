@@ -772,7 +772,9 @@ def _build_pair_tables(ep, g, t_local, topk, block, e_total, scale_rows, interpr
 
         # The scale slab: source s's pair q on one of this shard's experts
         # lands on run_base[s, e - first] plus its rank among the source's
-        # pairs on that expert, and carries its token's row-scale bits.
+        # pairs on that expert, and carries its token's row-scale bits. Built
+        # as layer._scale_slab_onehot builds it (same exactness argument),
+        # with the operand rows ordered byte-major per source.
         first = me * g
         token_of = (sub >= lane * topk) & (sub < (lane + 1) * topk)  # [q, t]
         r_a = lax.broadcasted_iota(i32, (a_rows, LANES), 0)
@@ -855,8 +857,9 @@ def build_pair_tables(
     call = _build_pair_tables(
         ep, g, t_local, topk, block, e_total, scale_rows, interpret
     )
-    # The payload and the slab are left where XLA places them: pinned to HBM,
-    # the kernel waits on the payload's HBM read (bench: 3.3 vs 1.95 us).
+    # No with_memory_space_constraint on the payload or the slab (unlike the
+    # decode combine): pinning them made the kernel wait on the payload's HBM
+    # read (layer bench: 3.3 vs 1.95 us).
     pos, mir, slab = call(
         jnp.asarray(me, jnp.int32).reshape(1),
         exchange_out,
