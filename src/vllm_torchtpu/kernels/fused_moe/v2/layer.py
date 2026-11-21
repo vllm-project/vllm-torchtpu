@@ -24,6 +24,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.fused_moe.v2 import combine_small
 from vllm_torchtpu.kernels.fused_moe.v2.direct_all_gather import (
     direct_all_gather,
     supports_direct_all_gather,
@@ -191,6 +193,23 @@ def _combine_arrivals(
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
     hidden = lane_blocks * lanes
+    if envs.MOE_FUSED_EP_V2_COMBINE_ONE_CALL and combine_small.fits(
+        t_local=t_local,
+        topk=topk,
+        tile_m=tile_m,
+        scale_dtype=arrival_scales.dtype,
+    ):
+        combine = combine_small.build_one_call_combine(
+            t_local=t_local,
+            topk=topk,
+            recv_rows=recv_rows,
+            lane_blocks=lane_blocks,
+            mirror_sublanes=mirror_sublanes,
+            tile_m=tile_m,
+            wire_dtype=arrivals.dtype,
+            out_dtype=out_dtype,
+        )
+        return combine(arrivals, arrival_scales, pos, mirror_pos, topk_weights)
     # A gather clamps an out-of-range index to the last one; a DMA does not,
     # and a sublane index clamped on its own would pair the last sublane with
     # the wrong lane. Neither position is ever negative.
