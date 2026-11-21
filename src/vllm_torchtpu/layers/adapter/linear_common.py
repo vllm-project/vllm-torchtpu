@@ -22,6 +22,10 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.kernels.attn_out_fp8 import (
+    attn_out_fp8_matmul,
+    can_use_attn_out_fp8,
+)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.logger import init_logger
@@ -51,6 +55,12 @@ KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 # (`dummy_loader`, `reload/layerwise`), where a second flip would transpose
 # back and silently corrupt the values.
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
+
+# Set on an attention block's `o_proj` at load time (`tag_attn_out_projections`)
+# to the per-rank `(num_kv_heads, q_per_kv, head_dim)` of the attention whose
+# output feeds it, so FP8 `apply` can quantize that output in its native
+# head-major layout.
+ATTN_OUT_HEAD_LAYOUT_ATTR = "_tpu_attn_out_head_layout"
 
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
@@ -253,6 +263,138 @@ def quantized_matmul_fp4(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_fp4_op()(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
+
+
+def _attn_out_quantized_matmul_jax(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    num_kv_heads: int,
+    q_per_kv: int,
+    head_dim: int,
+    w8a16_max_rows: int = 0,
+) -> jax.Array:
+    """`o_proj` FP8 matmul reading the attention output in its native layout.
+
+    Token count is static per bucket here, so the kernel/fallback choice adds
+    no TorchDynamo guards. Buckets the kernel does not cover, W8A16 buckets
+    and blockwise weight scales keep the regular `_quantized_matmul_jax` path.
+    """
+    rows, k = x.shape
+    use_kernel = (
+        w_s.ndim == 1
+        and jnp.issubdtype(w_q.dtype, jnp.floating)
+        and not 0 < rows <= w8a16_max_rows
+        and k == num_kv_heads * q_per_kv * head_dim
+        and can_use_attn_out_fp8(rows, num_kv_heads, q_per_kv, head_dim)
+    )
+    if not use_kernel:
+        return _quantized_matmul_jax(x, w_q, w_s, w8a16_max_rows)
+    return attn_out_fp8_matmul(x, w_q, w_s, num_kv_heads, q_per_kv, head_dim)
+
+
+_attn_out_quantized_matmul_op: Callable | None = None
+_attn_out_quantized_matmul_op_lock = Lock()
+
+
+def _get_attn_out_quantized_matmul_op() -> Callable:
+    global _attn_out_quantized_matmul_op
+    if _attn_out_quantized_matmul_op is not None:
+        return _attn_out_quantized_matmul_op
+
+    with _attn_out_quantized_matmul_op_lock:
+        if _attn_out_quantized_matmul_op is not None:
+            return _attn_out_quantized_matmul_op
+
+        op = pallas.jax_op(
+            "pallas::attn_out_quantized_matmul", _attn_out_quantized_matmul_jax
+        )
+
+        def _fake_attn_out_quantized_matmul(
+            x: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+            num_kv_heads: int,
+            q_per_kv: int,
+            head_dim: int,
+            w8a16_max_rows: int = 0,
+        ):
+            del w_s, num_kv_heads, q_per_kv, head_dim, w8a16_max_rows
+            return torch.empty(
+                x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device
+            )
+
+        op.register_fake(_fake_attn_out_quantized_matmul)
+        _attn_out_quantized_matmul_op = op
+        return op
+
+
+def attn_out_quantized_matmul(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    head_layout: tuple[int, int, int],
+    w8a16_max_rows: int = 0,
+) -> torch.Tensor:
+    """Torch entry for `o_proj` fed directly by the attention output.
+
+    `head_layout` is the per-rank `(num_kv_heads, q_per_kv, head_dim)` of the
+    attention layer whose flattened output `x` is.
+    """
+    if x.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
+            f"{w_q.shape[0]}."
+        )
+    num_kv_heads, q_per_kv, head_dim = head_layout
+    orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
+    x_2d = x.reshape(-1, x.shape[-1])
+    out_2d = _get_attn_out_quantized_matmul_op()(
+        x_2d, w_q, w_s, num_kv_heads, q_per_kv, head_dim, w8a16_max_rows
+    )
+    return out_2d.reshape(orig_out_shape)
+
+
+def tag_attn_out_projections(model: torch.nn.Module) -> int:
+    """Record the attention head layout on each attention block's `o_proj`.
+
+    Looks for modules owning both an `attn` (vLLM `Attention`) and an
+    `o_proj`, the layout every decoder in vLLM uses. The tag lets the FP8
+    linear method read the attention output in the layout the attention
+    kernel wrote it. Returns the number of tagged projections.
+    """
+    tagged = 0
+    for module in model.modules():
+        attn = getattr(module, "attn", None)
+        o_proj = getattr(module, "o_proj", None)
+        if attn is None or o_proj is None:
+            continue
+        num_heads = getattr(attn, "num_heads", None)
+        num_kv_heads = getattr(attn, "num_kv_heads", None)
+        head_dim = getattr(attn, "head_size", None)
+        in_features = getattr(o_proj, "input_size_per_partition", None)
+        if not (
+            isinstance(num_heads, int)
+            and isinstance(num_kv_heads, int)
+            and isinstance(head_dim, int)
+            and isinstance(in_features, int)
+        ):
+            continue
+        if num_heads <= 0 or num_kv_heads <= 0 or head_dim <= 0 or in_features <= 0:
+            continue
+        if num_heads % num_kv_heads != 0 or in_features != num_heads * head_dim:
+            continue
+        setattr(
+            o_proj,
+            ATTN_OUT_HEAD_LAYOUT_ATTR,
+            (num_kv_heads, num_heads // num_kv_heads, head_dim),
+        )
+        tagged += 1
+    if tagged:
+        # Build the op now: TorchDynamo cannot enter the lock in the getter
+        # when `apply` is traced.
+        _get_attn_out_quantized_matmul_op()
+    return tagged
 
 
 def sharded_quantized_matmul(
