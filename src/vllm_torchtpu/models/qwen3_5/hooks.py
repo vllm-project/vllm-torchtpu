@@ -31,6 +31,14 @@ entries (``validation/``). Every other engine keeps main's behaviour.
   without prefill or decode context parallelism (the entries' PP8 prefill
   legs). Every other engine keeps the unit unset, so a PCP prefill leg
   resolves its hash block size from its KV cache groups.
+- The MTP draft path (``mtp_draft_path``, a rule registered in
+  ``spec_decode/draft_path_rules.py``): greedy top tokens, fast token
+  substitution and the fused MTP draft loop for an MTP draft of that
+  checkpoint shape on TPU7x. The rule reads only the checkpoint shape and
+  the chip, not the role or the layout. A set env key still decides its own
+  path (``TPU_GREEDY_TOP_TOKENS``, ``VLLM_TPU_FAST_TOKEN_SUBSTITUTION``,
+  ``VLLM_TPU_FUSED_DRAFT_LOOP``); every other engine keeps them off unless
+  set.
 """
 
 from __future__ import annotations
@@ -64,15 +72,18 @@ def _chip_family() -> str | None:
     return None if chip_version is None else chip_version.value
 
 
+def _has_calibrated_shape(model_config) -> bool:
+    """Whether the checkpoint has the calibrated shape (Qwen3.5-397B-A17B's
+    text config), whatever the device."""
+    text = model_config.hf_text_config
+    return all(getattr(text, k, None) == v for k, v in _CALIBRATED_SHAPE.items())
+
+
 def _is_calibrated(model_config) -> bool:
     """Whether the defaults were measured for this checkpoint and device:
     the calibrated checkpoint shape on a TPU7x device. Any other shape, a
     smaller device or an unknown device keeps main's behaviour."""
-    text = getattr(model_config, "hf_text_config", None)
-    for key, value in _CALIBRATED_SHAPE.items():
-        if getattr(text, key, None) != value:
-            return False
-    return _chip_family() == _CALIBRATED_CHIP
+    return _has_calibrated_shape(model_config) and _chip_family() == _CALIBRATED_CHIP
 
 
 def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
@@ -104,6 +115,32 @@ def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
         )
         return
     cache_config.prefix_match_unit = 128
+
+
+def mtp_draft_path(vllm_config: VllmConfig) -> bool:
+    """Qwen3.5's draft-path rule (spec_decode/draft_path_rules.py): a Qwen3.5
+    target with an MTP draft runs greedy top tokens, fast token substitution
+    and the fused MTP draft loop by default. Like every default in this file,
+    only for the checkpoint shape and device they were validated on
+    (_is_calibrated); any other Qwen3.5 engine keeps main's opt-in keys.
+    Read once at engine and drafter start, not per step."""
+    spec = vllm_config.speculative_config
+    model_config = vllm_config.model_config
+    if (
+        spec is None
+        or spec.method != "mtp"
+        or not settings.is_qwen3_5(model_config)
+        or not _has_calibrated_shape(model_config)
+    ):
+        return False
+    chip = _chip_family()
+    if chip is None:
+        logger.warning_once(
+            "Qwen3.5 MTP: this checkpoint's draft-path defaults were validated "
+            "on TPU7x, but this host's TPU chip is unknown (is "
+            "TPU_ACCELERATOR_TYPE set?), so they stay off."
+        )
+    return chip == _CALIBRATED_CHIP
 
 
 def apply_serving_defaults(vllm_config: VllmConfig) -> None:

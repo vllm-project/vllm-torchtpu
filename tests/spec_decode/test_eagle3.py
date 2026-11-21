@@ -50,7 +50,10 @@ def _make_proposer(
         tensor_parallel_size=target_tp, pipeline_parallel_size=1
     )
     vllm_config = SimpleNamespace(
-        speculative_config=speculative_config, parallel_config=parallel_config
+        speculative_config=speculative_config,
+        parallel_config=parallel_config,
+        # No target model, so no registered draft-path rule applies.
+        model_config=None,
     )
     return Eagle3Proposer(
         runner=mock.MagicMock(
@@ -3378,6 +3381,50 @@ def test_draft_post_step0_fused_matches_unfused_carries_and_step1_inputs(advance
     assert stacked.shape == (4, 3)
     assert torch.equal(stacked[:, 0], tok0_ref)
 
+    # When step0 post-attn gather outputs [max_loop_p, H], _MtpFusedLoop slices
+    # hidden_states[:positions.shape[-1]] internally and produces identical tokens.
+    h_padded = torch.cat([h_f.clone(), torch.full((12, 4), 99.0)], dim=0)
+    stacked_from_padded = loop_mod(None, pos1_f.clone(), h_padded, seq1_f.clone())
+    assert torch.equal(stacked_from_padded, stacked)
+
+    # _draft_async_prepare_inputs with positions and base_seq_lens returns
+    # identical pos_step1 and seq_lens_step1 without needing _draft_post_step0_fused.
+    input_ids = torch.arange(8, dtype=torch.int32)
+    next_tokens = torch.tensor(
+        [[101, 102, 103, -1], [201, 202, 203, 204]], dtype=torch.int32
+    )
+    draft_lengths = torch.tensor([3, 3], dtype=torch.int32)
+    qsl = torch.tensor([0, 4, 5, 5, 5], dtype=torch.int32)
+    pad_req_idx = torch.tensor([0, 1, 1, 1], dtype=torch.int64)
+    _, rej_a, s0_gi_a, pos1_a, seq1_a = (
+        Eagle3Proposer._draft_async_prepare_inputs.__wrapped__.__wrapped__(
+            proposer,
+            input_ids,
+            next_tokens,
+            draft_lengths,
+            qsl,
+            pad_req_idx,
+            None,
+            16,
+            positions,
+            base_seq_lens,
+        )
+    )
+    _, pos1_gi, seq1_gi = (
+        Eagle3Proposer._draft_post_step0_fused.__wrapped__.__wrapped__(
+            proposer,
+            hidden,
+            positions,
+            s0_gi_a[:4],
+            base_seq_lens,
+            rej_a,
+        )
+    )
+    assert torch.equal(rej_a, rejected)
+    assert s0_gi_a.shape == (16,)
+    assert torch.equal(pos1_a, pos1_gi)
+    assert torch.equal(seq1_a, seq1_gi)
+
 
 @pytest.mark.parametrize("hidden_rows", [4, 8])
 @pytest.mark.parametrize("max_p", [0, 8])
@@ -3577,6 +3624,7 @@ def test_run_mtp_fused_loop_records_row_form_and_proposes_step0(
     proposer._draft_sequence_parallel = draft_sp
     proposer.runner.max_num_reqs = 8
     proposer._loop_bucket = lambda _num_reqs: 8
+    proposer._padded_loop_bucket = lambda _num_reqs: 8
     monkeypatch.setattr(e3.sequence_parallel, "min_rows", lambda: 8)
     active = []
     monkeypatch.setattr(e3.sequence_parallel, "set_active", active.append)
@@ -3609,6 +3657,87 @@ def test_run_mtp_fused_loop_records_row_form_and_proposes_step0(
     assert input_ids is None
     assert hidden_shape == (8, 4)
     assert seq_lens_arg is seq_lens
+
+
+@pytest.mark.parametrize("program", ["fused_loop", "loop_step"])
+def test_loop_programs_trace_once_outside_the_warmup_with_one_row_form(
+    monkeypatch, program
+):
+    """A loop program is traced by its first call, inside the spec warm-up's
+    shape_variants.warmup() window, but as outside it
+    (shape_variants.outside_warmup): no ladder retraces it, so a loop bucket
+    its guards refused would stay a raising closure. Its one trace serves
+    every loop bucket with the smallest one's row form: replicated here
+    (loop buckets 8 to 16, min_rows 16), also for a chunk at 16, where a
+    per-bucket form would hand a sliced padding mask to a replicated
+    program."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+    from vllm_torchtpu.compilation import shape_variants
+
+    proposer, _ = _forward_draft_harness(monkeypatch)
+    proposer._draft_sequence_parallel = True
+    proposer.runner.max_num_reqs = 16
+    proposer._padded_loop_bucket = lambda _num_reqs: 8
+    proposer._loop_bucket = lambda _num_reqs: 16
+    proposer._max_loop_bucket = lambda: 16
+    monkeypatch.setattr(e3.sequence_parallel, "min_rows", lambda: 16)
+    active = []
+    monkeypatch.setattr(e3.sequence_parallel, "set_active", active.append)
+    traced_in_window = []
+    if program == "fused_loop":
+        md = SimpleNamespace(seq_lens=torch.zeros(4, dtype=torch.int32))
+        proposer._build_draft_attn_metadata = lambda **_kwargs: {"a": md}
+
+        def fused_loop(input_ids, positions, hidden_states, seq_lens_arg):
+            traced_in_window.append(shape_variants.in_warmup())
+            return torch.zeros((hidden_states.shape[0], 3), dtype=torch.int32)
+
+        proposer._mtp_fused_loop = fused_loop
+        proposer._mtp_fused_loop_warm = False
+
+        def run():
+            proposer._run_mtp_fused_loop(
+                chunk=SimpleNamespace(num_reqs=9),
+                positions=torch.zeros(16, dtype=torch.int32),
+                hidden_states=torch.zeros((16, 4)),
+                num_rejected_np=None,
+                num_rejected_dev=None,
+                loop_query_start_loc=torch.zeros(17, dtype=torch.int32),
+                loop_request_distribution=torch.zeros(3, dtype=torch.int32),
+            )
+
+    else:
+        log = []
+        proposer.draft_model = _RecordingProgram("draft", log)
+
+        class _LoopStep(_RecordingProgram):
+            def __call__(self, **kwargs):
+                traced_in_window.append(shape_variants.in_warmup())
+                return super().__call__(**kwargs)
+
+        proposer._mtp_loop_model = _LoopStep("loop", log)
+        proposer._mtp_loop_model_warm = False
+
+        def run():
+            proposer._forward_draft(
+                chunk=SimpleNamespace(num_reqs=9),
+                input_ids=torch.zeros(16, dtype=torch.int32),
+                positions=torch.zeros(16, dtype=torch.int32),
+                target_hidden_states=torch.zeros((16, 2)),
+                step_idx=1,
+                seq_lens_delta=1,
+                num_rejected_np=None,
+            )
+
+    with shape_variants.warmup():
+        run()
+        run()
+        assert shape_variants.in_warmup()
+
+    # The first call traces outside the window, the compiled runs after it
+    # inside; the form is the smallest loop bucket's (8 < 16) at every call.
+    assert traced_in_window == [False, True, True]
+    assert active == [False, False]
 
 
 def _check_prep_emits_padded_step0_gather_indices(

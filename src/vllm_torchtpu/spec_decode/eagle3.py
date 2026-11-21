@@ -36,6 +36,7 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.layers.adapter import (
     sequence_parallel,
     small_all_reduce_op,
@@ -54,14 +55,18 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+from vllm_torchtpu.spec_decode import draft_path_rules
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
     _static_shape_args,
     dp_lockstep_num_reqs,
+    fused_draft_loop_enabled,
+    greedy_top_tokens_enabled,
     iter_mtp_shared_heads,
     maybe_share_embeddings,
     maybe_share_lm_head,
+    target_lm_head_of,
 )
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -329,6 +334,49 @@ class Eagle3Proposer:
             and int(num_tokens) >= sequence_parallel.min_rows()
         )
 
+    def draft_form_varies_with_rows(self) -> bool:
+        """Whether the draft's forward slices some token buckets over TP and
+        keeps others replicated (sequence-parallel MoE under a row threshold),
+        so its compiled program needs one trace per side of `min_rows`
+        (`shape_variants.warmup()` with retraces)."""
+        return self._draft_sequence_parallel and sequence_parallel.min_rows() > 0
+
+    def _loop_rows_sliced(self) -> bool:
+        """The row form of the loop programs (`_mtp_fused_loop`,
+        `_mtp_loop_model`) at every loop bucket.
+
+        Their one trace runs outside the warm-up's per-side traces
+        (`shape_variants.outside_warmup`), so it serves every loop bucket with
+        one form: sliced when even the smallest loop bucket reaches
+        `min_rows`, else replicated, which is correct at any row count.
+        """
+        return self._draft_sequence_parallel and self._draft_rows_sliced(
+            self._padded_loop_bucket(1)
+        )
+
+    def _trace_loop_program(
+        self, program: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> None:
+        """Trace and compile a loop program on its first call: once, outside the
+        warm-up's per-side traces, so no loop bucket is left to a retrace that
+        never comes. Warns once when that one form keeps rows replicated at
+        loop buckets that reach `min_rows`."""
+        if (
+            self._draft_sequence_parallel
+            and not self._loop_rows_sliced()
+            and self._draft_rows_sliced(self._max_loop_bucket())
+        ):
+            logger.warning_once(
+                "MTP draft loop programs run with replicated rows at every loop "
+                "bucket, including those at or above the sequence-parallel row "
+                "threshold (%d): they are traced once for all loop buckets "
+                "(largest %d), and replicated rows are correct at any count.",
+                sequence_parallel.min_rows(),
+                self._max_loop_bucket(),
+            )
+        with shape_variants.outside_warmup():
+            program(*args, **kwargs)
+
     def _rank_padding_counts(
         self, num_valid_tokens: int, num_tokens: int, rows_sliced: bool
     ) -> tuple[int, int]:
@@ -437,6 +485,7 @@ class Eagle3Proposer:
 
         self._validate_mtp_layer_count()
         self._init_draft_greedy_head()
+        self._release_unread_draft_bf16_head(target_model)
         self._init_mtp_index_sharing()
         self._build_draft_loop_programs()
 
@@ -456,11 +505,13 @@ class Eagle3Proposer:
             )
 
     def _init_draft_greedy_head(self) -> None:
-        """Resolve the draft's greedy head for TPU_GREEDY_TOP_TOKENS.
+        """Resolve the draft's greedy head (greedy_top_tokens_enabled).
 
         The draft's tokens then come from the vocab-parallel argmax
         (`LogitsProcessor.get_top_tokens`, patched by greedy_top_tokens), as
-        the target's do. The draft's head runs at the precision it holds. A
+        the target's do. The draft's head runs at the checkpoint's BF16
+        precision: the draft gets a BF16 copy when the target's head is
+        quantized in place (greedy_top_tokens.keep_bf16_head_for_draft). A
         draft with a draft->target id map, or one the argmax cannot serve,
         keeps compute_logits + argmax.
         """
@@ -468,16 +519,18 @@ class Eagle3Proposer:
         draft_model = self.draft_model
         if (
             draft_model is None
-            or not envs.TPU_GREEDY_TOP_TOKENS
+            or not greedy_top_tokens_enabled(self.vllm_config)
             or getattr(draft_model, "draft_id_to_target_id", None) is not None
         ):
             return
         from vllm_torchtpu.runner import greedy_top_tokens
 
         try:
-            owner = greedy_top_tokens.resolve_head_owner(
-                draft_model, self.runner._dp_lockstep_enabled()
-            )
+            # Resolved as off EP-DP lockstep even under it: the draft's argmax
+            # runs in _draft_propose_token on busy engines and in an idle
+            # engine's run_dp_dummy_draft alike, so every rank emits the same
+            # collectives in the same order, whatever the sampling params.
+            owner = greedy_top_tokens.resolve_head_owner(draft_model, False)
         except NotImplementedError as e:
             logger.warning_once(
                 "Draft greedy head not available (%s); the draft keeps "
@@ -485,11 +538,35 @@ class Eagle3Proposer:
                 str(e),
             )
             return
+        if self._dp_lockstep_sharded() and not self._draft_replicated:
+            # EP-DP lockstep, TP-sharded draft: every rank runs every draft
+            # pass at the same loop bucket, so the BF16 head is split over the
+            # whole DP x TP group.
+            owner = greedy_top_tokens.vocab_parallel_draft_owner(owner)
         self._draft_greedy_head_owner = owner
         logger.info(
-            "TPU_GREEDY_TOP_TOKENS enabled for draft proposer (%s, quant=%s).",
+            "Greedy draft head on (%s): %s, quant=%s.",
+            "TPU_GREEDY_TOP_TOKENS"
+            if envs.TPU_GREEDY_TOP_TOKENS
+            else "draft-path rule "
+            + ", ".join(draft_path_rules.matching(self.vllm_config)),
             type(owner).__name__,
             getattr(owner.lm_head, "_quant_desc", "bf16"),
+        )
+
+    def _release_unread_draft_bf16_head(self, target_model: torch.nn.Module) -> None:
+        """Under EP-DP lockstep the vocab-parallel draft head clones its slice
+        of the BF16 copy of the target's head, so the copy (the TP shard, about
+        1 GB per device at DP4 x TP2) is released once that head is built; the
+        draft's tokens are unchanged. With any other greedy head, or without
+        one, the draft still reads the copy and it is kept."""
+        from vllm_torchtpu.runner import greedy_top_tokens
+
+        assert self.draft_model is not None
+        greedy_top_tokens.release_twin_behind_vocab_parallel_head(
+            self._draft_greedy_head_owner,
+            self.draft_model,
+            target_lm_head_of(target_model),
         )
 
     def _validate_mtp_layer_count(self) -> None:
@@ -762,9 +839,11 @@ class Eagle3Proposer:
     def _build_mtp_fused_loop(self) -> None:
         """Compile an MTP draft's loop steps 1..K-1 as one program, so the
         host dispatches once per propose for them instead of twice per step.
-        Opt-in with `VLLM_TPU_FUSED_DRAFT_LOOP=1`; off, the per-step loop runs.
-        Not under EP-DP lockstep, where propose always runs the per-step loop,
-        so neither the program nor its warm-up would ever be used.
+        On where VLLM_TPU_FUSED_DRAFT_LOOP turns it on or, with the key
+        unset, where a model-provided draft-path rule holds
+        (fused_draft_loop_enabled); off, the per-step loop runs. Not under
+        EP-DP lockstep, where propose always runs the per-step loop, so
+        neither the program nor its warm-up would ever be used.
 
         Only for the plain case: IndexShare restores top-k rows between steps
         on the host, a draft->target id map would need its gather in the
@@ -779,8 +858,11 @@ class Eagle3Proposer:
         draft_model = self.draft_model
         if (
             draft_model is None
-            or not envs.VLLM_TPU_FUSED_DRAFT_LOOP
-            or self.runner._dp_lockstep_enabled()
+            or not fused_draft_loop_enabled(
+                self.vllm_config,
+                draft_kv_shared=self._draft_kv_shared,
+                dp_lockstep=self.runner._dp_lockstep_enabled(),
+            )
             or self.speculative_config.method != "mtp"
             or self._share_mtp_indices
             or not self.advance_draft_positions
@@ -884,9 +966,9 @@ class Eagle3Proposer:
         max_p = self._mtp_fused_loop_max_p
         if max_p > 0 and hidden_states.shape[0] < max_p:
             hidden_states = _maybe_pad_dim0(hidden_states, max_p)
-        # Every loop step runs at this one row count, so one decision covers
-        # the program; it must match the draft forward's own row gating.
-        rows_sliced = self._draft_rows_sliced(num_tokens)
+        # The loop program has one row form for every loop bucket; record it
+        # for the MoE dispatch / combine and the padding mask.
+        rows_sliced = self._loop_rows_sliced()
         sequence_parallel.set_active(rows_sliced)
         loop_padding_state = self._get_loop_token_padding_state()
         if loop_padding_state is not None:
@@ -922,7 +1004,9 @@ class Eagle3Proposer:
                 # again compiled. The repeat rewrites the same KV entries;
                 # seq_lens is put back first because the program advanced it.
                 seq_lens_step1 = seq_lens.clone()
-                self._mtp_fused_loop(None, positions, hidden_states, seq_lens)
+                self._trace_loop_program(
+                    self._mtp_fused_loop, None, positions, hidden_states, seq_lens
+                )
                 seq_lens.copy_(seq_lens_step1)
                 self._mtp_fused_loop_warm = True
             return self._mtp_fused_loop(None, positions, hidden_states, seq_lens)
@@ -1656,7 +1740,6 @@ class Eagle3Proposer:
                 )
                 return (
                     draft_input_ids,
-                    gather_indices,
                     num_rejected_out,
                     step0_gather_indices,
                     pos_step1,
@@ -2365,7 +2448,6 @@ class Eagle3Proposer:
             if prep_step1 and step0_pad_len > 0:
                 (
                     draft_input_ids,
-                    gather_indices,
                     num_rejected_out,
                     self._last_step0_gather_indices,
                     pos_step1,
@@ -2381,6 +2463,7 @@ class Eagle3Proposer:
                     chunk.position_ids,
                     chunk.attn_ctx.seq_lens,
                 )
+                gather_indices = self._last_step0_gather_indices
                 self._last_prep_step1 = (pos_step1, seq_lens_step1)
             elif prep_step1:
                 (
@@ -3046,13 +3129,19 @@ class Eagle3Proposer:
         )
 
         num_tokens = input_ids.shape[0]
+        model = self._draft_model_for_step(step_idx)
         # Record this step's row form before the compiled forward: the draft
         # runs under sequence-parallel MoE like the target (main #1562), so
         # its rows are sliced at or above min_rows and replicated below it or
-        # under the step-0 post-attention gather. The MoE dispatch / combine
-        # read this; a mismatch with the model's own chunking all-reduces
-        # sliced rows (silently wrong output).
-        rows_sliced = self._draft_rows_sliced(num_tokens, step0_gather_indices)
+        # under the step-0 post-attention gather; a loop-step program keeps
+        # its one form (_loop_rows_sliced). The MoE dispatch / combine read
+        # this; a mismatch with the model's own chunking all-reduces sliced
+        # rows (silently wrong output).
+        rows_sliced = (
+            self._loop_rows_sliced()
+            if model is self._mtp_loop_model
+            else self._draft_rows_sliced(num_tokens, step0_gather_indices)
+        )
         sequence_parallel.set_active(rows_sliced)
         num_valid_tokens = self._draft_valid_tokens(chunk, step_idx, num_tokens)
 
@@ -3064,7 +3153,6 @@ class Eagle3Proposer:
         if self.speculative_config.method == "mtp":
             kwargs["spec_step_idx"] = step_idx
 
-        model = self._draft_model_for_step(step_idx)
         if model is self._mtp_loop_model:
             loop_padding_state = self._get_loop_token_padding_state()
             if loop_padding_state is not None:
@@ -3140,7 +3228,7 @@ class Eagle3Proposer:
                 # reject, so run the step once more now that it's compiled.
                 # The repeat writes the same KV entries again, and a loop step
                 # only reads the top-k table.
-                model(**kwargs)
+                self._trace_loop_program(model, **kwargs)
                 self._mtp_loop_model_warm = True
             out = model(**kwargs)
 
@@ -3493,7 +3581,7 @@ class Eagle3Proposer:
             set_model_tag("eagle_head"),
             runner._precompile_timed("drafter compute_logits"),
         ):
-            for n in all_sizes:
+            for n in sorted(all_sizes):
                 dummy_hidden = torch.zeros(
                     (n, hidden_size),
                     dtype=runner._hidden_states_dtype,

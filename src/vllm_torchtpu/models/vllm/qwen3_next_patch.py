@@ -99,11 +99,13 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader import base_loader
 from vllm.model_executor.models import qwen3_next, qwen3_next_mtp
 from vllm.sequence import IntermediateTensors
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.layers.adapter import (
     fused_moe_ep,
     fused_moe_ep_v3,
@@ -156,6 +158,25 @@ def step0_post_attn_gather_context(indices: torch.Tensor | None):
         yield
     finally:
         _step0_gather_indices = prev
+
+
+def _step0_effective_gather_indices(
+    positions: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Slice `_step0_gather_indices` to 4 or 8 rows on small token buckets (`T<=4`
+    and `T<=8`) during `shape_variants.warmup()` so post-attention `o_proj`,
+    `small_all_reduce`, `norm_fp8_gate_and_se`, `moe_lowtok`, and `self.norm`
+    execute on 4 or 8 rows instead of the full `max_loop_p` rows."""
+    gather_idx = _step0_gather_indices
+    if gather_idx is None:
+        return None
+    if positions is not None and shape_variants.in_warmup():
+        s0 = positions.shape[-1]
+        if gather_idx.shape[0] > 4 and s0 <= 4:
+            return gather_idx[:4]
+        if gather_idx.shape[0] > 8 and s0 <= 8:
+            return gather_idx[:8]
+    return gather_idx
 
 
 def is_step0_post_attn_gather_installed(draft_model: Any) -> bool:
@@ -313,7 +334,7 @@ def _forward_qwen3_next_attn_from_qkv(
 ) -> torch.Tensor:
     q, k, v, gate = attn_layer._project_qkv_gate(qkv, positions)
     attn_output = attn_layer.attn(q, k, v)
-    gather_idx = _step0_gather_indices
+    gather_idx = _step0_effective_gather_indices(positions)
     if gather_idx is not None:
         attn_output = torch.index_select(attn_output, 0, gather_idx)
         if gate is not None:
@@ -963,6 +984,30 @@ def _patched_gemma_rmsnorm_forward_native(
     return x if residual is None else (x, residual)
 
 
+def _draft_borrows_target_head() -> bool:
+    """Whether the engine being loaded runs a draft that borrows the target's
+    LM head: an EAGLE/MTP, DFlash or DSpark draft (the proposers that bind it
+    in maybe_share_lm_head). An n-gram drafter has no head.
+    """
+    from vllm.config import get_current_vllm_config
+
+    spec = get_current_vllm_config().speculative_config
+    return spec is not None and (
+        spec.use_eagle() or spec.method in ("dflash", "dspark")
+    )
+
+
+def _quantize_target_lm_head() -> bool:
+    """The Qwen3.5 `quantize_target_lm_head` setting of the engine being
+    loaded; False for any other model (Qwen3-Next keeps its BF16 head)."""
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    if not qwen3_5_settings.is_qwen3_5(vllm_config.model_config):
+        return False
+    return qwen3_5_settings.get(vllm_config).quantize_target_lm_head
+
+
 def setup_qwen3_next_v6_after_loading(model: Any) -> None:
     """Post-weight-load setup for fused router/shared-expert FP8 weights, Pallas
     sigmoid-gate o_proj and GDN weight layout."""
@@ -974,6 +1019,16 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
         for module in model.modules()
     ):
         return
+    from vllm.model_executor.models import qwen3_5_mtp
+
+    is_mtp_wrapper = isinstance(
+        model,
+        (
+            qwen3_next_mtp.Qwen3NextMTP,
+            qwen3_5_mtp.Qwen3_5MTP,
+            qwen3_5_mtp.Qwen3_5MoeMTP,
+        ),
+    )
     hoisted_norm_tensors: list[torch.Tensor] = []
     for module in model.modules():
         if isinstance(module, GemmaRMSNorm):
@@ -1019,6 +1074,19 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
             module, "_pcp_streaming_configured"
         ):
             maybe_flip_gdn_in_proj_qkvz_weight(module)
+        elif (
+            type(module) is ParallelLMHead
+            and not is_mtp_wrapper
+            and _quantize_target_lm_head()
+        ):
+            from vllm_torchtpu.runner import greedy_top_tokens
+
+            # A draft that borrows this head (Qwen3.5 MTP has none of its
+            # own) must keep the checkpoint's BF16 head: keep a BF16 twin
+            # before the in-place quantization drops the weight.
+            if _draft_borrows_target_head():
+                greedy_top_tokens.keep_bf16_head_for_draft(module)
+            greedy_top_tokens.quantize_lm_head(module, mode="fp8", in_place=True)
     if hoisted_norm_tensors:
         synchronize_tensors(hoisted_norm_tensors)
     # Reclaim what the weight rewrites above left behind before the KV cache
@@ -1319,7 +1387,7 @@ def patched_decoder_layer_forward(
             positions=positions,
             **attn_kwargs,
         )
-        gather_idx = _step0_gather_indices
+        gather_idx = _step0_effective_gather_indices(positions)
         if gather_idx is not None:
             residual = torch.index_select(residual, 0, gather_idx)
     else:
@@ -1480,6 +1548,16 @@ def patched_mtp_forward(
     hidden_states, _ = self.norm(hidden_states, residual)
     if sp:
         hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+    # Restore the step-0 gather's row count after the 4- or 8-row slice on
+    # small buckets (_step0_effective_gather_indices): callers get max_loop_p rows.
+    if (
+        _step0_gather_indices is not None
+        and hidden_states.shape[0] < _step0_gather_indices.shape[0]
+    ):
+        hidden_states = F.pad(
+            hidden_states,
+            (0, 0, 0, _step0_gather_indices.shape[0] - hidden_states.shape[0]),
+        )
     return hidden_states
 
 

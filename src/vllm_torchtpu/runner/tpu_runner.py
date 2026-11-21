@@ -121,6 +121,9 @@ from vllm_torchtpu.gdn_pool_layout import (
 )
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
+    pcp_local_token_counts,
+)
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
     dp_vocab_parallel,
@@ -201,6 +204,7 @@ from vllm_torchtpu.runner.pcp import (
     mla_kv_page_size,
     validate_pcp_manager_layers,
 )
+from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import pcp_rank_token_counts
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -224,6 +228,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUModelRunnerOutput,
     LogprobsChunk,
 )
+from vllm_torchtpu.spec_decode import draft_path_rules
 from vllm_torchtpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
     StepCostTable,
@@ -234,7 +239,9 @@ from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _static_shape_args,
+    fast_token_substitution_enabled,
     fit_rows,
+    greedy_top_tokens_enabled,
     handoff_seed_tokens,
     normalize_draft_config,
 )
@@ -1484,9 +1491,15 @@ class TPUModelRunner(GPUModelRunner):
         self.sliding_window = self.model_config.get_sliding_window()
         self.block_size = cache_config.block_size
         self.most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
-        self._fast_token_substitution: bool = bool(
-            envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
+        self._fast_token_substitution: bool = fast_token_substitution_enabled(
+            vllm_config
         )
+        if vllm_config.speculative_config is not None:
+            logger.info(
+                "Draft-path rule for this engine: %s.",
+                ", ".join(draft_path_rules.matching(vllm_config))
+                or "none (the opt-in env keys apply)",
+            )
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
         # This ensures that calculations derived from max_num_blocks_per_req
@@ -7963,7 +7976,7 @@ class TPUModelRunner(GPUModelRunner):
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
         if (
-            envs.TPU_GREEDY_TOP_TOKENS
+            greedy_top_tokens_enabled(self.vllm_config)
             and self._pp_is_last
             and not self.is_pooling_model
         ):
@@ -7979,7 +7992,7 @@ class TPUModelRunner(GPUModelRunner):
                 )
             else:
                 logger.info(
-                    "TPU_GREEDY_TOP_TOKENS under expert-parallel data parallelism "
+                    "Greedy top tokens under expert-parallel data parallelism "
                     "with a tensor-parallel LM head: the target keeps full logits "
                     "(the program idle engines replay); the draft head keeps the "
                     "vocab-parallel argmax."
@@ -10152,7 +10165,9 @@ class TPUModelRunner(GPUModelRunner):
 
         The prompt lengths fill every per-rank token bucket
         (``num_tokens_paddings`` are per rank; a context-parallel step
-        spreads the prompt over the ranks), so no live prompt is the first to
+        spreads the prompt over the ranks, and each bucket's prompt is the
+        longest that puts at most that many tokens on any rank,
+        _longest_prompt_for_rank_bucket), so no live prompt is the first to
         run its bucket. The KV profile never runs the draft, so the largest
         bucket is where the draft's own program temporaries, such as an MoE
         token gather, first have to fit.
@@ -10160,25 +10175,51 @@ class TPUModelRunner(GPUModelRunner):
         Under a pipeline every stage runs the synthetic prefills, since the
         last stage's forward takes its input from the hand-off, and there is
         no retry: a stage retrying alone would leave the others waiting.
+
+        A draft whose sequence-parallel MoE slices token buckets at or above
+        min_rows and keeps smaller ones replicated (a context-parallel
+        producer; sequence-parallel MoE excludes pipelines) gets one trace per
+        side, as in _warmup_spec_decode: the sweep runs in
+        shape_variants.warmup() and retraces the draft at a refused bucket.
         """
         if not envs.SPEC_WARMUP:
+            if not self.enforce_eager:
+                self._require_draft_traces_per_side("SPEC_WARMUP=0")
             return
         if self.enforce_eager or self.speculative_config is None:
             return
-        pcp = max(1, int(self.parallel_config.prefill_context_parallel_size))
         longest = min(
             self.max_model_len, int(self.scheduler_config.max_num_batched_tokens)
         )
         prompt_lens = sorted(
-            {min(int(bucket) * pcp, longest) for bucket in self.num_tokens_paddings}
+            {
+                self._longest_prompt_for_rank_bucket(int(bucket), longest)
+                for bucket in self.num_tokens_paddings
+            }
         )
         n0 = self.num_xla_graphs
         pipeline = self.parallel_config.pipeline_parallel_size > 1
+        drafter = self.drafter
+        per_side = (
+            isinstance(drafter, Eagle3Proposer)
+            and drafter.draft_model is not None
+            and drafter.draft_form_varies_with_rows()
+        )
         with (
             _suspend_kv_transfer_group(),
             self._precompile_timed("MTP real prefill warmup"),
+            (
+                shape_variants.warmup() if per_side else contextlib.nullcontext()
+            ) as buckets,
         ):
             for P in prompt_lens:
+                # The draft runs at the step's per-rank token bucket.
+                if buckets is not None and buckets.needs_retrace(
+                    _get_padded_token_len(
+                        self.num_tokens_paddings, self._rank_step_tokens(P)
+                    )
+                ):
+                    self._retrace_eagle_draft()
                 if pipeline:
                     if not self._warmup_one_mtp_prefill(P):
                         raise RuntimeError(
@@ -10193,6 +10234,8 @@ class TPUModelRunner(GPUModelRunner):
                             "refusing to start a producer whose first live "
                             "proposal would hit the same failure"
                         )
+            if buckets is not None:
+                self._check_draft_buckets_built(buckets)
         logger.info(
             "MTP prefill warmup at P=%s compiled %d graphs",
             prompt_lens,
@@ -10667,11 +10710,17 @@ class TPUModelRunner(GPUModelRunner):
         cross-step chain (step N reads the AsyncPreResults parked by step N-1).
 
         Bounded + value-insensitive: only shapes matter, so token/position VALUES
-        are irrelevant. Wrapped so any failure degrades to "no warmup" (the first
-        request just pays the bounded recompiles, as before) rather than breaking
-        serving.
+        are irrelevant. A failed synthetic step is logged and skipped after
+        the one-request sweep's single retry (the first live step of that
+        shape then pays its compiles). The start is refused when the MTP draft
+        is left with a reachable token bucket no trace built
+        (_check_draft_buckets_built), or its first pass above max_model_len
+        fails twice: a live step would hit a raising bucket or the other
+        side's graph.
         """
         if not envs.SPEC_WARMUP:
+            if not self.enforce_eager:
+                self._require_draft_traces_per_side("SPEC_WARMUP=0")
             return  # escape hatch / A-B toggle
         if self.enforce_eager:
             return
@@ -10692,29 +10741,59 @@ class TPUModelRunner(GPUModelRunner):
             # (1) First-pass / first-decode shapes depend on the prompt length:
             # sweep one synthetic request per prompt-token bucket at nr=1. Each
             # runs the REAL two-phase propose+verify+sampling dispatch, so
-            # torch-tpu emits the same fused programs serving will hit.
-            for i, P in enumerate(self.num_tokens_paddings):
-                # A single request's prompt can't exceed max_model_len; skip
-                # token buckets above it (they only arise as batched totals,
-                # covered by the num_reqs sweep below). Without this, a P >
-                # max_model_len synthetic prompt overflows token_ids_cpu
-                # (shape [.., max_model_len]) when max_num_batched_tokens >
-                # max_model_len, e.g. small max_model_len configs.
-                if int(P) > self.max_model_len:
-                    continue
-                # Greedy and non-greedy (do_sampling=True) verify+sample are
-                # DISTINCT fused programs, so sweep both at every prompt bucket.
-                for greedy in (True, False):
-                    if not self._warmup_one_spec_request(
-                        int(P), idx=i, quiet=True, greedy=greedy
-                    ):
-                        # First attempt cold-compiles the draft forward; a
-                        # SymInt from that cold compile can leak into the
-                        # dynamic=False gather wrapper on the first bucket. Retry
-                        # once now that the forward is compiled and returns
-                        # concrete-shaped tensors (this attempt logs loudly if it
-                        # also fails).
-                        self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
+            # torch-tpu emits the same fused programs serving will hit. The
+            # draft's forward may branch on its token count (the step-0
+            # gather's row slice, the sequence-parallel row threshold), so the
+            # sweep runs in shape_variants.warmup(): a bucket the draft's
+            # current trace refused gets a retrace. The loop programs keep one
+            # trace (Eagle3Proposer._trace_loop_program).
+            with shape_variants.warmup() as buckets:
+                for i, P in self._spec_warmup_prompt_buckets():
+                    if int(P) > self.max_model_len:
+                        # A single request's prompt can't exceed max_model_len
+                        # (its prompt would overflow token_ids_cpu), so only a
+                        # batched step reaches this bucket. Run the draft's
+                        # first pass there only if no trace has built it.
+                        total = self._spec_step_total(P)
+                        if buckets.needs_retrace(P) and total is not None:
+                            self._retrace_eagle_draft()
+                            # The first attempt cold-compiles the retraced
+                            # draft, which can fail once as in the sweep
+                            # below; retry once. A second failure refuses the
+                            # start: the retrace dropped the refusals and the
+                            # draft's trace, so going on would leave the
+                            # draft to one trace after the window, with one
+                            # form for every bucket.
+                            if not self._warmup_spec_first_pass(
+                                total, idx=i, quiet=True
+                            ) and not self._warmup_spec_first_pass(total, idx=i):
+                                raise RuntimeError(
+                                    "spec-decode warmup could not run the MTP "
+                                    f"draft's first pass of {total} tokens for "
+                                    f"token bucket {P} (above max_model_len="
+                                    f"{self.max_model_len}) after retracing the "
+                                    "draft (see the warning or error above); "
+                                    "refusing to start a server whose draft "
+                                    "would serve that bucket with the other "
+                                    "side's graph"
+                                )
+                        continue
+                    if buckets.needs_retrace(P):
+                        self._retrace_eagle_draft()
+                    # Greedy and non-greedy (do_sampling=True) verify+sample are
+                    # DISTINCT fused programs, so sweep both at every prompt bucket.
+                    for greedy in (True, False):
+                        if not self._warmup_one_spec_request(
+                            P, idx=i, quiet=True, greedy=greedy
+                        ):
+                            # First attempt cold-compiles the draft forward; a
+                            # SymInt from that cold compile can leak into the
+                            # dynamic=False gather wrapper on the first bucket. Retry
+                            # once now that the forward is compiled and returns
+                            # concrete-shaped tensors (this attempt logs loudly if it
+                            # also fails).
+                            self._warmup_one_spec_request(P, idx=i, greedy=greedy)
+                self._check_draft_buckets_built(buckets)
             # (2) Batched spec steps. A bucketed-draft proposer depends on no
             # exact request count, so one count per program-bucket combination
             # (`_spec_warmup_bucket_grid`), each with a short decode run and a
@@ -10760,6 +10839,249 @@ class TPUModelRunner(GPUModelRunner):
                         self._warmup_spec_batch(R, prompt_buckets[-1], greedy=True)
                         self._warmup_spec_batch(R, prompt_buckets[-1], greedy=False)
         logger.info("spec-decode warmup compiled %d graphs", self.num_xla_graphs - n0)
+
+    def _spec_warmup_prompt_buckets(self) -> list[tuple[int, int]]:
+        """(index, token bucket) pairs of the nr=1 prompt sweep, in sweep
+        order: the bucket of a one-request decode step (1 + K tokens) first,
+        then the rest ascending. Every request's decode steps run the draft at
+        that bucket, so the first trace builds it, and a request whose own
+        trace refuses it later finds it handed over."""
+        assert self.speculative_config is not None
+        paddings = [int(P) for P in self.num_tokens_paddings]
+        order = list(enumerate(paddings))
+        decode = _get_padded_token_len(
+            paddings, 1 + self.speculative_config.num_speculative_tokens
+        )
+        if decode <= self.max_model_len:
+            order.insert(0, order.pop(paddings.index(decode)))
+        return order
+
+    def _spec_step_total(self, bucket: int) -> int | None:
+        """The most tokens one step's prompts can schedule that still pad to
+        `bucket`, or None when no step reaches it: a step schedules at most
+        max_num_batched_tokens tokens, and each of at most max_num_seqs
+        requests at most max_model_len - 1 prompt tokens."""
+        total = min(
+            bucket,
+            int(self.scheduler_config.max_num_batched_tokens),
+            int(self.scheduler_config.max_num_seqs) * (self.max_model_len - 1),
+        )
+        return total if total > self._token_bucket_below(bucket) else None
+
+    def _token_bucket_below(self, bucket: int) -> int:
+        """The largest token bucket below `bucket`, 0 below the smallest: a
+        step pads to `bucket` exactly when its token count is above this one
+        and at most `bucket`."""
+        return max(
+            (int(size) for size in self.num_tokens_paddings if size < bucket),
+            default=0,
+        )
+
+    def _rank_step_tokens(self, num_tokens: int) -> int:
+        """The most tokens one rank holds of a step of `num_tokens` tokens, as
+        serving splits them: the sequence layout planner deals a step's tokens
+        as one stream in cp_kv_cache_interleave_size chunks from rank 0
+        (pcp_local_token_counts), so rank 0 holds the most whatever the
+        prompts; the PCP manager cuts each prompt into a head and a tail chunk
+        per rank (pcp_rank_token_counts), counted here for one prompt. Without
+        context parallelism the rank holds them all."""
+        pcp = int(self.parallel_config.prefill_context_parallel_size)
+        if self.pcp_manager is not None:
+            split = self.pcp_manager.sharding_plan.split_mask([num_tokens])
+            return max(pcp_rank_token_counts([num_tokens], split.tolist(), pcp))
+        return int(
+            pcp_local_token_counts(
+                [num_tokens], pcp, int(self.parallel_config.cp_kv_cache_interleave_size)
+            ).max()
+        )
+
+    def _longest_prompt_for_rank_bucket(self, bucket: int, longest: int) -> int:
+        """The longest prompt of at most `longest` tokens that puts at most
+        `bucket` tokens on any rank (_rank_step_tokens): the MTP prefill
+        warm-up's prompt for that per-rank token bucket. A rank holds at most
+        the whole prompt and at least 1/prefill_context_parallel_size of it,
+        and its share never shrinks as the prompt grows, so the length lies
+        between `bucket` and `bucket` times that size."""
+        pcp = max(1, int(self.parallel_config.prefill_context_parallel_size))
+        lo, hi = min(bucket, longest), min(bucket * pcp, longest)
+        if lo == hi or self._rank_step_tokens(hi) <= bucket:
+            return hi
+        while lo < hi - 1:
+            mid = (lo + hi) // 2
+            if self._rank_step_tokens(mid) <= bucket:
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    def _max_rank_step_tokens(self) -> int:
+        """The most tokens one step puts on this rank: a step of
+        max_num_batched_tokens tokens as the PCP manager (its
+        max_local_num_tokens cap, which also covers several prompts) or the
+        sequence layout planner (_rank_step_tokens) splits it; all of it
+        without context parallelism."""
+        if self.pcp_manager is not None:
+            return int(self.pcp_manager.max_local_num_tokens)
+        return self._rank_step_tokens(int(self.scheduler_config.max_num_batched_tokens))
+
+    def _draft_bucket_reachable(self, bucket: int, max_rank_tokens: int) -> bool:
+        """Whether a live step can run the draft at token bucket `bucket` on
+        this rank: some step's token count on this rank (at most
+        `max_rank_tokens`, _max_rank_step_tokens) pads to it, and, above
+        max_model_len, several prompts can fill it (_spec_step_total)."""
+        if self._token_bucket_below(bucket) >= max_rank_tokens:
+            return False
+        return bucket <= self.max_model_len or self._spec_step_total(bucket) is not None
+
+    def _retrace_eagle_draft(self) -> None:
+        """Give the MTP/EAGLE draft a fresh trace inside shape_variants.warmup()
+        (see shape_variants.retrace); other drafters compile apart."""
+        drafter = self.drafter
+        if isinstance(drafter, Eagle3Proposer) and drafter.draft_model is not None:
+            shape_variants.retrace(drafter.draft_model, drafter.draft_vllm_config)
+
+    def _check_draft_buckets_built(
+        self, buckets: shape_variants.BucketExecutables
+    ) -> None:
+        """Refuse to start when the draft's warm-up left a reachable token
+        bucket to a trace that never came: it would stay a raising closure
+        and fail the first live step that pads to it. A bucket no step
+        reaches (_draft_bucket_reachable) is only reported.
+
+        Without context parallelism (the spec-decode warm-up) such a bucket
+        is one whose synthetic step failed. A context-parallel producer's
+        warm-up runs every per-rank bucket one prompt reaches and refuses the
+        start at a failed step, so such a bucket is one that only a step of
+        several prompts reaches, when max_model_len is below the token
+        budget."""
+        if not buckets.refused:
+            return
+        max_rank_tokens = self._max_rank_step_tokens()
+        unreachable = sorted(
+            b
+            for b in buckets.refused
+            if not self._draft_bucket_reachable(b, max_rank_tokens)
+        )
+        if unreachable:
+            logger.warning(
+                "MTP draft token buckets %s stay uncompiled: no step reaches them "
+                "(a step puts at most %d tokens on this rank, of "
+                "max_num_batched_tokens=%d, and holds at most max_num_seqs=%d "
+                "prompts of max_model_len - 1 = %d tokens).",
+                unreachable,
+                max_rank_tokens,
+                self.scheduler_config.max_num_batched_tokens,
+                self.scheduler_config.max_num_seqs,
+                self.max_model_len - 1,
+            )
+        left = sorted(set(buckets.refused) - set(unreachable))
+        if not left:
+            return
+        if int(self.parallel_config.prefill_context_parallel_size) > 1:
+            cause = (
+                "The context-parallel warm-up runs one prompt per bucket, of at "
+                f"most max_model_len={self.max_model_len} tokens, and a step "
+                "of several prompts reaches these buckets with up to "
+                "max_num_batched_tokens="
+                f"{self.scheduler_config.max_num_batched_tokens} tokens: raise "
+                "max_model_len to max_num_batched_tokens."
+            )
+        else:
+            cause = "Their failed synthetic steps are logged above."
+        raise shape_variants.ShapeSpecializationError(
+            f"the MTP draft's warm-up left token buckets {left} uncompiled: no "
+            f"synthetic step built them. {cause}"
+        )
+
+    def _require_draft_traces_per_side(self, reason: str) -> None:
+        """Refuse a start that would trace the MTP draft once, at its first
+        live step, when its sequence-parallel MoE slices token buckets at or
+        above min_rows and keeps smaller ones replicated: one trace would bake
+        one form into every bucket, while each step records its own form for
+        the MoE dispatch and the padding mask."""
+        drafter = self.drafter
+        if (
+            isinstance(drafter, Eagle3Proposer)
+            and drafter.draft_model is not None
+            and drafter.draft_form_varies_with_rows()
+        ):
+            raise NotImplementedError(
+                f"{reason} leaves the MTP draft to be traced once, at its first "
+                "live step, but its sequence-parallel MoE slices token buckets "
+                f"of {sequence_parallel.min_rows()} rows or more and keeps "
+                "smaller ones replicated, which takes one trace per side (the "
+                "spec-decode warm-up's shape_variants ladder). Keep "
+                "SPEC_WARMUP=1, or serve with TPU_MOE_SEQUENCE_PARALLEL=0."
+            )
+
+    def _warmup_spec_first_pass(
+        self, total: int, idx: int, quiet: bool = False
+    ) -> bool:
+        """Run one synthetic prefill step of `total` tokens through target
+        sampling and the draft's first pass, split over the fewest requests
+        whose prompts fit max_model_len: a token bucket above max_model_len is
+        reached only by a batched step. Returns True on success. With `quiet`
+        a failure is logged as a warning for the caller's one retry, as in
+        _warmup_one_spec_request."""
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+
+        assert self.kv_cache_config is not None
+        cap = self.max_model_len - 1
+        lens = [cap] * (total // cap) + ([total % cap] if total % cap else [])
+        group_nblks = [
+            group.kv_cache_spec.max_num_blocks_per_req(self.vllm_config, cap + 1)
+            for group in self.kv_cache_config.kv_cache_groups
+        ]
+        nblk = max(group_nblks)
+        if int(self.kv_cache_config.num_blocks) <= len(lens) * nblk + 1:
+            logger.warning(
+                "skip spec-decode warmup first pass of %d tokens: not enough kv blocks",
+                total,
+            )
+            return False
+        rids = [f"__spec_warmup_fp{idx}_{j}__" for j in range(len(lens))]
+        try:
+            # Disjoint low block ranges from block 1, as _warmup_spec_batch.
+            reqs = [
+                NewRequestData(
+                    req_id=rid,
+                    prompt_token_ids=[0] * n,
+                    mm_features=[],
+                    sampling_params=SamplingParams(temperature=0.0),
+                    pooling_params=None,
+                    block_ids=tuple(
+                        list(range(1 + j * nblk, 1 + j * nblk + g)) for g in group_nblks
+                    ),
+                    num_computed_tokens=0,
+                    lora_request=None,
+                )
+                for j, (rid, n) in enumerate(zip(rids, lens))
+            ]
+            so = SchedulerOutput.make_empty()
+            so.scheduled_new_reqs = reqs
+            so.num_scheduled_tokens = dict(zip(rids, lens))
+            so.total_num_scheduled_tokens = total
+            assert self.execute_model(so) is None
+            self.sample_tokens(None)
+            self.take_draft_token_ids()
+        except Exception:
+            if quiet:
+                logger.warning(
+                    "spec-decode warmup first pass of %d tokens: first attempt "
+                    "failed; retrying. Under DP/EP this can desynchronize ranks "
+                    "— if startup hangs after this line, that is the cause.",
+                    total,
+                    exc_info=True,
+                )
+            else:
+                logger.exception(
+                    "spec-decode warmup first pass of %d tokens failed", total
+                )
+            return False
+        finally:
+            self._warmup_spec_decode_cleanup(rids)
+        return True
 
     def _spec_warmup_bucket_grid(self, mixed: bool) -> list[int]:
         """Request counts to warm: the first count at which any program bucket

@@ -38,6 +38,7 @@ from vllm.model_executor.layers import logits_processor as lp_module
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.sampling_params import StructuredOutputsParams
 
+from tests.runner.greedy_top_tokens_test_utils import set_greedy_top_tokens
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.lora.torch_punica_tpu import PunicaWrapperTPU
 from vllm_torchtpu.runner import greedy_top_tokens, min_tokens, tpu_runner
@@ -291,6 +292,33 @@ def test_target_head_stays_stock_under_ep_dp_with_a_tp_head():
     assert greedy_top_tokens.target_head_dp_mode(True, 1) == "fast"
     assert greedy_top_tokens.target_head_dp_mode(True, 2) == "stock"
     assert greedy_top_tokens.target_head_dp_mode(True, 8) == "stock"
+
+
+def test_draft_head_resolves_under_ep_dp_lockstep(monkeypatch):
+    """DP4 x TP2: the draft's argmax program is the same on busy and idle
+    engines, so the proposer resolves its head owner as off lockstep, where
+    the target's would refuse."""
+    from vllm_torchtpu.spec_decode import eagle3
+
+    owner = _Owner(_shards(torch.zeros(8, 2), 2)[0])
+    seen = []
+
+    def resolve(model, dp_lockstep):
+        seen.append(dp_lockstep)
+        return owner
+
+    set_greedy_top_tokens(monkeypatch)
+    monkeypatch.setattr(greedy_top_tokens, "resolve_head_owner", resolve)
+    proposer = SimpleNamespace(
+        draft_model=SimpleNamespace(draft_id_to_target_id=None),
+        vllm_config=SimpleNamespace(),
+        runner=SimpleNamespace(_dp_lockstep_enabled=lambda: True),
+        _dp_lockstep_sharded=lambda: False,
+        _draft_replicated=True,
+    )
+    eagle3.Eagle3Proposer._init_draft_greedy_head(proposer)
+    assert seen == [False]
+    assert proposer._draft_greedy_head_owner is owner
 
 
 def test_resolve_head_owner_finds_the_nested_language_model():

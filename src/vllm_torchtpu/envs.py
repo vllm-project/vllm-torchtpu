@@ -87,7 +87,7 @@ if TYPE_CHECKING:
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
-    TPU_GREEDY_TOP_TOKENS: bool = False
+    TPU_GREEDY_TOP_TOKENS: bool | None = None
     TPU_DP_VOCAB_PARALLEL: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
@@ -207,8 +207,8 @@ if TYPE_CHECKING:
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
-    VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
-    VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool | None = None
+    VLLM_TPU_FUSED_DRAFT_LOOP: bool | None = None
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -795,7 +795,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_KERNEL_RELOAD_MODULES": lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
-    "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    # Unset (None), a model's draft-path rule decides
+    # (spec_decode/draft_path_rules.py); off without one.
+    "TPU_GREEDY_TOP_TOKENS": env_optional_bool("TPU_GREEDY_TOP_TOKENS"),
     # Shard the input embedding and lm_head over every DP x TP rank (the EP
     # group) instead of the TP group. Needs DP with EP (lockstep DP engines);
     # ignored with PP, context parallelism, speculative decoding, LoRA, pooling
@@ -1276,15 +1278,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
-    "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    # Unset (None), a model's draft-path rule decides; off without one.
+    "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_optional_bool(
+        "VLLM_TPU_FAST_TOKEN_SUBSTITUTION"
+    ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
-    # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
+    # (spec_decode/mtp_fused_loop.py) instead of one program per step. Unset
+    # (None), a model's draft-path rule decides; off without one.
     # TODO: support the two cases that still take the per-step loop:
     #   - GLM-5.2 / Gemma-4 MTP: IndexShare's per-chunk top-k restore, and a
     #     KV-sharing draft's fixed positions and seq_lens.
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
-    "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    "VLLM_TPU_FUSED_DRAFT_LOOP": env_optional_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
     # 0 searches the full vocab. Used only when every active request has

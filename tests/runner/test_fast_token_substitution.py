@@ -27,8 +27,10 @@ from vllm_torchtpu.runner.tpu_runner import (
 
 
 def test_env_flag_parsing(monkeypatch):
+    # Unset reads as None: the key is not configured, so a model's draft-path
+    # rule decides (spec_decode/utils.fast_token_substitution_enabled).
     monkeypatch.delenv("VLLM_TPU_FAST_TOKEN_SUBSTITUTION", raising=False)
-    assert envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION is False
+    assert envs.environment_variables["VLLM_TPU_FAST_TOKEN_SUBSTITUTION"]() is None
 
     monkeypatch.setenv("VLLM_TPU_FAST_TOKEN_SUBSTITUTION", "1")
     assert envs.environment_variables["VLLM_TPU_FAST_TOKEN_SUBSTITUTION"]() is True

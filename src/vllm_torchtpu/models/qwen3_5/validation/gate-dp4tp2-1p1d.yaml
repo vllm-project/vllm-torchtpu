@@ -33,11 +33,12 @@ legs:
       "--speculative-config": "{\"method\":\"mtp\",\"num_speculative_tokens\":3}"
 decode_megakernel: "off"
 arms:
-  # The changes that add the FP8 trade-off settings add them to tradeoffs_on.
+  # The FP8 trade-off settings: on in tradeoffs_on, and off again in
+  # tradeoffs_off, since the arms merge over the point's legs, which run them on.
   tradeoffs_off:
-    additional_config: {}
+    additional_config: {qwen3_5: {quantize_target_lm_head: false}}
   tradeoffs_on:
-    additional_config: {}
+    additional_config: {qwen3_5: {quantize_target_lm_head: true}}
 suite:
   gsm8k: {samples: 1319, chat_template_kwargs: {enable_thinking: true}, metric: strict-match}
   longbench: {}

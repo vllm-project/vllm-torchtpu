@@ -284,7 +284,10 @@ def test_with_an_mtp_drafter_buckets_keep_mains_rule_until_the_draft_form_is_rec
     assert configure(records=True) == [8, 24, 48, 96, 1024]
 
 
-@pytest.mark.parametrize("method", ["eagle", "ngram"])
+# Every method but mtp fails the platform's MTP-only check, eagle and eagle3
+# too, though their Eagle3Proposer also records each draft forward's row form
+# (sequence_parallel.gates_rows).
+@pytest.mark.parametrize("method", ["eagle", "eagle3", "ngram", "dflash", "dspark"])
 def test_sequence_parallel_rejects_non_mtp_speculative(configure_sp_moe, method):
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,

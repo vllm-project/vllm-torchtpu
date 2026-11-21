@@ -63,7 +63,9 @@ their KV cache by `--gpu-memory-utilization`.
 ## Reading a gate entry
 
 `legs` derive from the point named in `base_point`, with one replica each and
-the listed `serve_args_override`. `arms` differ only in `additional_config`;
-the changes that add the FP8 trade-off settings add them to `tradeoffs_on`.
+the listed `serve_args_override`. `arms` differ only in `additional_config`,
+which merges over the legs: the FP8 trade-off settings are on in
+`tradeoffs_on` and set off again in `tradeoffs_off`, since the point legs
+run them on.
 `references` are earlier gates at the same layout (GSM8K strict-match, 1,319
 samples, thinking on), with the tree each ran described in words.

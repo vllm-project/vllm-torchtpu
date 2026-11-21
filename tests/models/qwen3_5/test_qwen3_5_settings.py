@@ -16,10 +16,12 @@
 from __future__ import annotations
 
 import dataclasses
+import pathlib
 from types import SimpleNamespace
 from typing import Literal
 
 import pytest
+import yaml
 
 from vllm_torchtpu.models.qwen3_5 import settings
 
@@ -151,3 +153,63 @@ def test_get_defaults_without_a_section(additional):
 def test_get_rejects_a_section_on_another_model(arch):
     with pytest.raises(ValueError, match="are not Qwen3.5"):
         settings.get(_vllm_config(arch, {"qwen3_5": {}}))
+
+
+def _engine(num_experts: int, additional) -> SimpleNamespace:
+    """A Qwen3.5 engine of Qwen3.5-397B-A17B's text config, or another
+    checkpoint's expert count."""
+    text = SimpleNamespace(
+        num_experts=num_experts, hidden_size=4096, num_hidden_layers=60
+    )
+    model_config = SimpleNamespace(architectures=[QWEN35], hf_text_config=text)
+    return SimpleNamespace(model_config=model_config, additional_config=additional)
+
+
+@pytest.mark.parametrize(
+    ("chip", "num_experts", "accepted"),
+    [
+        ("7x", 512, True),
+        ("v6e", 512, False),
+        (None, 512, False),
+        ("7x", 256, False),
+    ],
+)
+def test_quantize_target_lm_head_is_refused_where_nothing_runs_it(
+    monkeypatch, chip, num_experts, accepted
+):
+    """The target-head quantization runs with the Qwen3.5 model patch, only for
+    Qwen3.5-397B-A17B's checkpoint shape on TPU7x. Elsewhere (another chip, a
+    chip that cannot be read, another Qwen3.5 checkpoint) the setting would be
+    accepted and change nothing, so the engine refuses to start; the default
+    value is accepted everywhere."""
+    from vllm_torchtpu.models.qwen3_5 import hooks
+
+    monkeypatch.setattr(hooks, "_chip_family", lambda: chip)
+    on = _engine(num_experts, {"qwen3_5": {"quantize_target_lm_head": True}})
+    if accepted:
+        assert settings.get(on).quantize_target_lm_head is True
+    else:
+        with pytest.raises(NotImplementedError, match="quantize_target_lm_head"):
+            settings.get(on)
+    off = _engine(num_experts, {"qwen3_5": {"quantize_target_lm_head": False}})
+    assert settings.get(off).quantize_target_lm_head is False
+
+
+def test_validation_entries_keep_quantize_target_lm_head(monkeypatch):
+    """Every leg of every validation entry sets quantize_target_lm_head for
+    Qwen3.5-397B-A17B on TPU7x, where it is accepted."""
+    from vllm_torchtpu.models.qwen3_5 import hooks
+
+    monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
+    entries = sorted(
+        (pathlib.Path(settings.__file__).parent / "validation").glob(
+            "p[0-9][0-9]-*.yaml"
+        )
+    )
+    assert entries
+    for path in entries:
+        legs = yaml.safe_load(path.read_text())["legs"]
+        for leg in ("prefill", "decode"):
+            additional = legs[leg]["additional_config"]
+            assert additional["qwen3_5"]["quantize_target_lm_head"] is True
+            assert settings.get(_engine(512, additional)).quantize_target_lm_head

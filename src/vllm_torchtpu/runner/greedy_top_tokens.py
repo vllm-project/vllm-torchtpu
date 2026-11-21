@@ -42,7 +42,9 @@ samples and verifies over the ``32 * tp_size`` candidates.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping, Sequence
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -421,6 +423,10 @@ def tpu_get_top_tokens(
     if self.scale <= 0.0:
         raise ValueError(
             f"scale must be > 0.0 for greedy argmax reduction, got {self.scale}"
+        )
+    if isinstance(lm_head, _VocabParallelDraftHead):
+        return _vocab_parallel_draft_top_tokens(
+            self, lm_head, hidden_states, embedding_bias
         )
     tp_size = lm_head.tp_size
     quant_mode = getattr(lm_head, "_quant_mode", None)
@@ -881,10 +887,340 @@ def quantize_lm_head(
             delattr(head, "weight")
         logger.info_once(
             "Quantized shared ParallelLMHead in-place to W8A8 FP8: "
-            "_w8a8_weight_kn=%s, freed BF16 weight.",
+            "_w8a8_weight_kn=%s, %s.",
             tuple(w_fp8_kn.shape),
+            "BF16 weight kept for the draft's own head"
+            if draft_bf16_head_of(head) is not None
+            else "freed BF16 weight",
         )
     return head
+
+
+class _DraftHeadOwnerProxy(torch.nn.Module):
+    """Owner proxy pairing ``logits_processor`` with a draft ``lm_head`` (the
+    vocab-parallel draft head)."""
+
+    def __init__(
+        self, logits_processor: LogitsProcessor, lm_head: torch.nn.Module
+    ) -> None:
+        super().__init__()
+        self.logits_processor = logits_processor
+        self.lm_head = lm_head
+
+
+def _materialize(tensor: torch.Tensor) -> None:
+    """Run the deferred graph that produces a TPU tensor now
+    (synchronize_tensors); other devices compute eagerly."""
+    if tensor.device.type == "tpu":
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        synchronize_tensors([tensor])
+
+
+class _VocabParallelDraftHead(torch.nn.Module):
+    """The draft's BF16 greedy head split over all DP x TP ranks.
+
+    Under EP-DP lockstep every DP engine's TP group holds the same TP shard
+    of the head, so each draft pass streams ``vocab / tp`` rows per rank (at
+    DP4 x TP2: 124,160 x 4,096 BF16, ~1 GB) for that engine's own few rows.
+    Here DP rank ``d`` of TP rank ``t`` keeps only the ``d``-th of ``dp``
+    equal slices of its TP shard, i.e. global vocabulary slice
+    ``t * dp + d``. A pass all-gathers every engine's hidden rows over DP,
+    computes its slice's logits for all of them with the head's own quant
+    method (the same BF16 matmul, mask and local max as the per-TP-group
+    path), all-gathers the ``(value, index)`` pairs over the EP group
+    (= DP x TP), puts them in vocabulary order and keeps this engine's rows.
+    The argmax over slices in vocabulary order takes the first maximum, so
+    ties resolve to the lowest token id, as ``torch.argmax`` does over the
+    full logits. Each rank streams ``1 / dp`` of the bytes.
+
+    Every rank must run each pass, with the same row count: true under
+    EP-DP lockstep for a TP-sharded draft, where busy and idle engines run
+    the same ``_draft_propose_token`` programs at the step's coordinated loop
+    bucket (``Eagle3Proposer._loop_bucket``).
+    Rank-specific values (vocab start, padding, DP rank) are tensor buffers
+    so every rank compiles the same program.
+    """
+
+    def __init__(
+        self,
+        base_head: torch.nn.Module,
+        dp_rank: int,
+        dp_size: int,
+        tp_size: int,
+    ) -> None:
+        super().__init__()
+        weight = cast("torch.Tensor", base_head.weight)
+        shard_vocab = int(weight.shape[0])
+        if shard_vocab % dp_size:
+            raise ValueError(
+                f"TP shard of {shard_vocab} rows does not split into {dp_size} "
+                "equal DP slices"
+            )
+        n = shard_vocab // dp_size
+        si: Any = base_head.shard_indices
+        shard_pad = int(si.num_org_vocab_padding)
+        valid = max(0, min(n, shard_vocab - shard_pad - dp_rank * n))
+        start = int(si.org_vocab_start_index) + dp_rank * n
+        self.weight = torch.nn.Parameter(
+            weight.detach()[dp_rank * n : (dp_rank + 1) * n].clone(),
+            requires_grad=False,
+        )
+        # Materialize the slice now, as quantize_lm_head does its weights: a
+        # deferred clone would keep the whole source head alive past its
+        # release, into the KV cache's memory profile.
+        _materialize(self.weight)
+        self.quant_method = base_head.quant_method
+        self.tp_size = tp_size
+        self.dp_size = dp_size
+        self.num_slices = dp_size * tp_size
+        self.shard_indices = SimpleNamespace(
+            org_vocab_start_index=start, num_org_vocab_padding=n - valid
+        )
+        device = weight.device
+        self.register_buffer(
+            "org_vocab_start_index",
+            torch.tensor(start, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "num_org_vocab_padding",
+            torch.tensor(n - valid, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "vp_dp_rank",
+            torch.tensor([dp_rank], dtype=torch.int64, device=device),
+            persistent=False,
+        )
+        # Pairs arrive in EP-group order (rank dp * tp_size + tp, checked in
+        # vocab_parallel_draft_owner); slice k belongs to tp = k // dp_size,
+        # dp = k % dp_size. perm[k] is that rank's position in the gather.
+        perm = [(k % dp_size) * tp_size + k // dp_size for k in range(self.num_slices)]
+        self.register_buffer(
+            "vp_slice_order",
+            torch.tensor(perm, dtype=torch.int64, device=device),
+            persistent=False,
+        )
+        self._quant_mode = None
+        self._quant_group_size = None
+        self._quant_desc = "bf16"
+
+
+def _vocab_parallel_draft_top_tokens(
+    processor: LogitsProcessor,
+    lm_head: Any,
+    hidden_states: torch.Tensor,
+    embedding_bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """``tpu_get_top_tokens`` for a ``_VocabParallelDraftHead``: the same
+    logits, mask and local max as its BF16 fallback path, over all DP
+    engines' rows and this rank's vocabulary slice."""
+    from vllm.distributed.parallel_state import get_dp_group, get_ep_group
+
+    dp_size = int(lm_head.dp_size)
+    num_slices = int(lm_head.num_slices)
+    rows = hidden_states.shape[0]
+    all_rows = get_dp_group().all_gather(hidden_states, dim=0)
+    logits = processor._apply_head(lm_head, all_rows, embedding_bias)
+    if processor.soft_cap is not None:
+        logits = torch.tanh(logits / processor.soft_cap) * processor.soft_cap
+    if processor.scale != 1.0:
+        logits = logits * processor.scale
+    slice_vocab = logits.shape[-1]
+    col_idx = torch.arange(slice_vocab, device=logits.device, dtype=torch.int32)
+    valid_cols = slice_vocab - lm_head.num_org_vocab_padding.to(
+        device=logits.device, dtype=torch.int32
+    )
+    logits = logits.masked_fill((col_idx >= valid_cols).unsqueeze(0), -float("inf"))
+    local_max_vals, local_max_indices = logits.max(dim=-1)
+    global_indices = local_max_indices.to(torch.int32) + (
+        lm_head.org_vocab_start_index.to(device=logits.device, dtype=torch.int32)
+    )
+    local_pair = torch.stack(
+        [local_max_vals.float(), global_indices.float()], dim=-1
+    )  # [dp * rows, 2]
+    gathered = get_ep_group().all_gather(local_pair, dim=0)
+    gathered = gathered.view(num_slices, dp_size, rows, 2)
+    gathered = gathered.index_select(0, lm_head.vp_slice_order)
+    mine = gathered.index_select(1, lm_head.vp_dp_rank).squeeze(1)  # [slices, rows, 2]
+    max_slice = mine[:, :, 0].argmax(dim=0, keepdim=True)
+    top_tokens = mine[:, :, 1].gather(dim=0, index=max_slice)
+    return top_tokens.squeeze(0).to(torch.int64)
+
+
+def vocab_parallel_draft_owner(owner: torch.nn.Module) -> torch.nn.Module:
+    """``owner`` with its BF16 head replaced by a ``_VocabParallelDraftHead``
+    when the DP / EP / TP group sizes allow it (EP group = DP x TP, TP shard
+    divisible by DP); ``owner`` unchanged otherwise. The EP group must order
+    its ranks ``dp * tp_size + tp``, or it raises. The caller decides that the
+    draft runs under EP-DP lockstep with a TP-sharded head."""
+    from vllm.distributed.parallel_state import (
+        get_dp_group,
+        get_ep_group,
+        get_tp_group,
+    )
+
+    head = cast("VocabParallelEmbedding", owner.lm_head)
+    weight: Any = getattr(head, "weight", None)
+    if (
+        getattr(head, "_quant_mode", None) is not None
+        or not isinstance(weight, torch.Tensor)
+        or weight.dtype != torch.bfloat16
+    ):
+        return owner
+    dp, ep, tp = get_dp_group(), get_ep_group(), get_tp_group()
+    dp_size, tp_size = int(dp.world_size), int(tp.world_size)
+    reason = None
+    if dp_size <= 1:
+        reason = "a single DP engine"
+    elif int(head.tp_size) != tp_size:
+        reason = f"head tp_size {head.tp_size} != TP group {tp_size}"
+    elif int(ep.world_size) != dp_size * tp_size:
+        reason = f"EP group {ep.world_size} != DP {dp_size} x TP {tp_size}"
+    elif weight.shape[0] % dp_size:
+        reason = f"TP shard of {weight.shape[0]} rows not divisible by DP {dp_size}"
+    if reason is not None:
+        logger.warning(
+            "Vocab-parallel draft head: keeping the per-TP-group draft head (%s).",
+            reason,
+        )
+        return owner
+    # The checks above read group sizes, the same on every rank, so every rank
+    # keeps or replaces its head alike. This one reads the rank's own place in
+    # the EP group: under an EP order other than DP-major it could hold on
+    # some ranks (rank (0, 0) always does) and not on others, and the head's
+    # DP and EP collectives would run on part of the group. vLLM builds the EP
+    # group DP-major (initialize_model_parallel), so refuse anything else.
+    if int(ep.rank_in_group) != int(dp.rank_in_group) * tp_size + int(tp.rank_in_group):
+        raise NotImplementedError(
+            f"Vocab-parallel draft head: EP rank {ep.rank_in_group} != DP rank "
+            f"{dp.rank_in_group} x {tp_size} + TP rank {tp.rank_in_group}. It "
+            "needs the EP group in DP-major order (rank dp * tp_size + tp), as "
+            "vLLM's initialize_model_parallel builds it."
+        )
+    vp_head = _VocabParallelDraftHead(head, int(dp.rank_in_group), dp_size, tp_size)
+    logger.info(
+        "Vocab-parallel draft head: draft lm_head over DP%d x TP%d "
+        "= %d slices; this rank: vocab [%d, %d), weight %s %s (was %s per TP "
+        "group). Same BF16 logits; ties to the lowest token id.",
+        dp_size,
+        tp_size,
+        dp_size * tp_size,
+        vp_head.shard_indices.org_vocab_start_index,
+        vp_head.shard_indices.org_vocab_start_index + vp_head.weight.shape[0],
+        tuple(vp_head.weight.shape),
+        str(vp_head.weight.dtype).replace("torch.", ""),
+        tuple(weight.shape),
+    )
+    return _DraftHeadOwnerProxy(
+        cast("LogitsProcessor", owner.logits_processor), vp_head
+    )
+
+
+# The draft's BF16 head, kept on the target head when the target's is
+# quantized in place (see keep_bf16_head_for_draft). Stored outside
+# ``_modules`` so the target never lists it as a submodule.
+_DRAFT_BF16_HEAD_ATTR = "_tpu_draft_bf16_head"
+
+
+def bf16_head_twin(head: torch.nn.Module) -> torch.nn.Module:
+    """A second ``ParallelLMHead`` holding ``head``'s current BF16 weight.
+
+    The twin is a shallow copy with its own parameter, buffer and submodule
+    tables, so freeing ``head``'s weight (``quantize_lm_head(...,
+    in_place=True)``) leaves the twin's weight, quant method and shard
+    layout as loaded. The weight tensor is the same one, not a copy: no
+    extra memory is used until the target's weight is dropped.
+    """
+    twin = copy.copy(head)
+    state = twin.__dict__
+    for table in ("_parameters", "_buffers", "_modules"):
+        if table in state:
+            state[table] = type(state[table])(state[table])
+    if "_non_persistent_buffers_set" in state:
+        state["_non_persistent_buffers_set"] = set(state["_non_persistent_buffers_set"])
+    state.pop(_DRAFT_BF16_HEAD_ATTR, None)
+    for name in ("_w8a8_weight_kn", "_w8a8_scale"):
+        state.get("_buffers", {}).pop(name, None)
+    state["_quant_mode"] = None
+    state["_quant_group_size"] = None
+    state["_quant_desc"] = "bf16"
+    return twin
+
+
+def keep_bf16_head_for_draft(head: torch.nn.Module) -> torch.nn.Module | None:
+    """Keeps a BF16 twin of ``head`` for the draft before ``head`` is
+    quantized in place. Returns the twin, or None when ``head`` has no BF16
+    weight left to keep (already quantized)."""
+    weight: Any = getattr(head, "weight", None)
+    if not isinstance(weight, torch.Tensor) or getattr(head, "_quant_mode", None):
+        return None
+    twin = bf16_head_twin(head)
+    object.__setattr__(head, _DRAFT_BF16_HEAD_ATTR, twin)
+    logger.info(
+        "Kept a BF16 copy of the target lm_head for the draft: weight %s %s.",
+        tuple(weight.shape),
+        str(weight.dtype).replace("torch.", ""),
+    )
+    return twin
+
+
+def draft_bf16_head_of(target_head: object) -> torch.nn.Module | None:
+    """The BF16 head kept for the draft on ``target_head``, if any."""
+    return getattr(target_head, "__dict__", {}).get(_DRAFT_BF16_HEAD_ATTR)
+
+
+def release_draft_bf16_head(target_head: object, reason: str) -> None:
+    """Drops the BF16 head kept for a draft that no longer reads it; ``reason``
+    says why in the log."""
+    state = getattr(target_head, "__dict__", None)
+    if state is not None and state.pop(_DRAFT_BF16_HEAD_ATTR, None) is not None:
+        logger.info("Released the BF16 copy of the target's lm_head: %s.", reason)
+
+
+def release_twin_behind_vocab_parallel_head(
+    owner: torch.nn.Module | None,
+    draft_model: torch.nn.Module,
+    target_head: object,
+) -> bool:
+    """Drops the BF16 head kept for the draft once only a vocab-parallel draft
+    head reads it, and says whether it did.
+
+    ``_VocabParallelDraftHead`` clones its slice of that head, so with such an
+    ``owner`` the draft's tokens no longer read the BF16 head; it stays alive
+    only through the draft's own reference and the target head's. Both go: the
+    draft's modules that held it hold the vocab-parallel head instead. With any
+    other owner, or none (compute_logits + argmax reads the draft's head), the
+    BF16 head is kept."""
+    if owner is None or not isinstance(owner.lm_head, _VocabParallelDraftHead):
+        return False
+    twin = draft_bf16_head_of(target_head)
+    if twin is None:
+        return False
+    holders = [
+        (module, name)
+        for module in draft_model.modules()
+        for name, child in module.named_children()
+        if child is twin
+    ]
+    for module, name in holders:
+        setattr(module, name, owner.lm_head)
+    release_draft_bf16_head(
+        target_head, "the vocab-parallel draft head holds its own slice"
+    )
+    return True
+
+
+def head_precision(head: object) -> str:
+    """``bf16`` / ``w8a8`` / ``w4a8_g<N>``: the precision a head computes in."""
+    desc = getattr(head, "_quant_desc", None)
+    if desc:
+        return str(desc)
+    weight: Any = getattr(head, "weight", None)
+    if isinstance(weight, torch.Tensor):
+        return str(weight.dtype).replace("torch.", "").replace("bfloat16", "bf16")
+    return "unknown"
 
 
 def target_head_dp_mode(dp_lockstep: bool, tp_size: int) -> str:
@@ -898,7 +1234,9 @@ def target_head_dp_mode(dp_lockstep: bool, tp_size: int) -> str:
     always replay the stock one; collectives pair across ranks in emission
     order, so the target stays on the stock path there. The draft is not
     affected: its tokens are always a greedy argmax, and an idle engine's
-    dummy draft runs the same ``_draft_propose_token`` program.
+    dummy draft runs the same ``_draft_propose_token`` program, so the
+    draft's head owner is resolved as off lockstep
+    (``Eagle3Proposer._init_draft_greedy_head``).
     """
     if dp_lockstep and tp_size > 1:
         return "stock"

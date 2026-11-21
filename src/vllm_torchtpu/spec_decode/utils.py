@@ -28,11 +28,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.utils import PPMissingLayer
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.sequence_layout import (
     AllSequenceLayoutPlanner,
     SequenceLayoutPlan,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner import greedy_top_tokens
+from vllm_torchtpu.spec_decode import draft_path_rules
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
@@ -94,6 +97,37 @@ def _static_shape_args(fn):
         return fn(*args)
 
     return wrapper
+
+
+def greedy_top_tokens_enabled(vllm_config: Any) -> bool:
+    """TPU_GREEDY_TOP_TOKENS when it is set, else a model-provided draft-path
+    rule (spec_decode/draft_path_rules.py). Greedy steps (all requests greedy,
+    no logprobs, no grammar) then take the vocab-parallel argmax; the tokens
+    are those of the full-logits argmax."""
+    knob = envs.TPU_GREEDY_TOP_TOKENS
+    return draft_path_rules.holds(vllm_config) if knob is None else knob
+
+
+def fast_token_substitution_enabled(vllm_config: Any) -> bool:
+    """VLLM_TPU_FAST_TOKEN_SUBSTITUTION when it is set, else a model-provided
+    draft-path rule."""
+    knob = envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
+    return draft_path_rules.holds(vllm_config) if knob is None else knob
+
+
+def fused_draft_loop_enabled(
+    vllm_config: Any, *, draft_kv_shared: bool, dp_lockstep: bool
+) -> bool:
+    """Never under EP-DP lockstep, where propose runs the per-step loop (main
+    lists it as unsupported by the fused loop). Otherwise
+    VLLM_TPU_FUSED_DRAFT_LOOP when it is set, else a model-provided draft-path
+    rule, which also leaves out a draft that shares the target's KV cache."""
+    if dp_lockstep:
+        return False
+    knob = envs.VLLM_TPU_FUSED_DRAFT_LOOP
+    if knob is not None:
+        return knob
+    return draft_path_rules.holds(vllm_config) and not draft_kv_shared
 
 
 def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:
@@ -418,6 +452,16 @@ def populate_draft_lm_head_from_target(
     )
 
 
+def target_lm_head_of(target_model: torch.nn.Module) -> torch.nn.Module | None:
+    """The target's LM head, on its language model when it wraps one."""
+    target_lm = (
+        cast("SupportsMultiModal", target_model).get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
+    return getattr(target_lm, "lm_head", None)
+
+
 def maybe_share_lm_head(
     draft_model: torch.nn.Module,
     target_model: torch.nn.Module,
@@ -426,12 +470,7 @@ def maybe_share_lm_head(
     force_share: bool = False,
     materialize_if_mismatched: bool = True,
 ) -> None:
-    target_lm = (
-        cast("SupportsMultiModal", target_model).get_language_model()
-        if hasattr(target_model, "get_language_model")
-        else target_model
-    )
-    target_lm_head = getattr(target_lm, "lm_head", None)
+    target_lm_head = target_lm_head_of(target_model)
 
     if target_lm_head is None:
         raise RuntimeError("Draft expects the target model to have an lm_head.")
@@ -447,7 +486,16 @@ def maybe_share_lm_head(
         )
         share_lm_head = True
 
-    if share_lm_head:
+    if not share_lm_head:
+        greedy_top_tokens.release_draft_bf16_head(
+            target_lm_head, "the draft has its own lm_head"
+        )
+    else:
+        # The target's head may be quantized in place (W8A8 FP8, the Qwen3.5
+        # quantize_target_lm_head setting); the draft then takes the BF16 twin
+        # kept for it, so it computes at the checkpoint's precision.
+        bf16_head = greedy_top_tokens.draft_bf16_head_of(target_lm_head)
+        draft_lm_head = target_lm_head if bf16_head is None else bf16_head
         if tp_layout_matches:
             logger.info(
                 "Sharing the target's lm_head with the draft using the same TP layout."
@@ -460,7 +508,7 @@ def maybe_share_lm_head(
             shared_heads = list(iter_mtp_shared_heads(draft_model))
             for shared_head in shared_heads:
                 del shared_head.head
-                shared_head.head = target_lm_head
+                shared_head.head = draft_lm_head
             if shared_heads:
                 logger.info(
                     "Shared the target's lm_head with %d MTP "
@@ -469,19 +517,46 @@ def maybe_share_lm_head(
                 )
 
             if hasattr(draft_model, "lm_head"):
-                draft_model.lm_head = target_lm_head
+                draft_model.lm_head = draft_lm_head
             elif hasattr(draft_model, "model") and hasattr(
                 draft_model.model, "lm_head"
             ):
-                draft_model.model.lm_head = target_lm_head
+                draft_model.model.lm_head = draft_lm_head
             elif not shared_heads:
-                draft_model.lm_head = target_lm_head
+                draft_model.lm_head = draft_lm_head
         elif materialize_if_mismatched:
             logger.info(
                 "Populating draft's own lm_head with a host-gathered, "
                 "per-worker replicated copy of the target lm_head."
             )
-            populate_draft_lm_head_from_target(draft_model, target_lm_head)
+            populate_draft_lm_head_from_target(
+                draft_model, cast("VocabParallelEmbedding", draft_lm_head)
+            )
+        if not tp_layout_matches:
+            # The draft did not bind the BF16 twin: it keeps the head it
+            # loaded, or the replicated copy just gathered from the twin.
+            greedy_top_tokens.release_draft_bf16_head(
+                target_lm_head,
+                "the draft keeps another TP layout's head (its own, or a "
+                "replicated copy gathered from this one)",
+            )
+        if tp_layout_matches or materialize_if_mismatched:
+            if not tp_layout_matches:
+                source = "a replicated copy the draft gathered from " + (
+                    "the BF16 copy of the checkpoint head"
+                    if bf16_head is not None
+                    else "the target's head"
+                )
+            elif bf16_head is not None:
+                source = "the draft's own BF16 copy of the checkpoint head"
+            else:
+                source = "the draft shares the target's head module"
+            logger.info(
+                "Draft lm_head precision: %s (target lm_head: %s; %s).",
+                greedy_top_tokens.head_precision(draft_lm_head),
+                greedy_top_tokens.head_precision(target_lm_head),
+                source,
+            )
 
     # We must override _gather_logits for replicated draft models even if we don't share
     # the lm_head, because the draft model's logits_processor will still try to gather
