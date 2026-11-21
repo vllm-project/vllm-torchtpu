@@ -114,6 +114,7 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batche
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
     dp_vocab_parallel,
+    expert_count_tap,
     expert_placement,
     token_padding,
 )
@@ -153,6 +154,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+    AllSequenceLayoutPlanner,
     SequenceLayoutKind,
     SequenceLayoutPlanner,
     create_sequence_layout_planner,
@@ -4342,6 +4344,7 @@ class TPUModelRunner(GPUModelRunner):
             # Before anything reads the step layout, the DP token sync
             # included: the rest of the step runs on the trimmed copy.
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
+        expert_count_tap.maybe_dump()
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
@@ -6216,6 +6219,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # No placed layers or target depth left over from an earlier load.
         expert_placement.reset_model_state()
+        expert_count_tap.reset_model_state()
 
         model_loader = get_model_loader(self.load_config)
         logger.info("Loading model from scratch...")
@@ -6345,6 +6349,10 @@ class TPUModelRunner(GPUModelRunner):
                 max_padded_tokens, self.device
             )
             token_padding.set_padding_state(self._token_padding_state)
+        expert_count_tap.require_padding_mask(
+            self._token_padding_state is not None,
+            isinstance(self.sequence_layout_planner, AllSequenceLayoutPlanner),
+        )
 
         # Last: arming needs the drafter's MTP layer and the padding mask.
         if envs.USE_MOE_TP_DECODE_KERNEL:

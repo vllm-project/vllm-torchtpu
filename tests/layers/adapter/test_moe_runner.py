@@ -209,3 +209,69 @@ def test_binder_hooks_the_layer_route_reads(capture_runner):
 
     assert len(calls) == 1
     assert calls[0][0] == 7 and calls[0][1] is ids
+
+
+@pytest.mark.parametrize(
+    ("dp_size", "pcp_size", "internal_mk", "armed", "expected"),
+    [
+        (1, 1, False, False, (False, False)),
+        (4, 1, False, False, (True, False)),
+        (4, 1, True, False, (False, False)),  # the method owns its dispatch
+        (1, 2, False, False, (False, True)),
+        (4, 2, False, False, (True, True)),
+        (4, 2, True, True, (False, False)),  # armed fused EP: PCP too
+    ],
+)
+def test_rows_gathered_follows_maybe_dispatch(
+    dp_size, pcp_size, internal_mk, armed, expected
+):
+    quant_method = SimpleNamespace(supports_internal_mk=internal_mk)
+    if armed:
+        setattr(quant_method, FUSED_MOE_EP_OP_ATTR, "op")
+    runner = VllmMoERunner.__new__(VllmMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.routed_experts = SimpleNamespace(quant_method=quant_method)
+    runner.moe_config = SimpleNamespace(
+        dp_size=dp_size,
+        pcp_size=pcp_size,
+        is_sequence_parallel=False,
+        moe_parallel_config=SimpleNamespace(use_all2all_kernels=False),
+    )
+    assert runner._rows_gathered() == expected
+
+
+def test_the_count_tap_sees_every_layer_the_runner_applies(monkeypatch):
+    """The tap records what the quant method is handed, then it runs."""
+    from vllm_torchtpu.layers.adapter import expert_count_tap
+
+    recorded = []
+    monkeypatch.setattr(expert_count_tap, "is_tapped", lambda layer: True)
+    monkeypatch.setattr(
+        expert_count_tap,
+        "record",
+        lambda layer, logits, ids, **gathered: recorded.append(
+            (layer, logits, ids, gathered)
+        ),
+    )
+    applied = []
+    monkeypatch.setattr(
+        MoERunner, "_apply_quant_method", lambda self, **kw: applied.append(kw)
+    )
+    runner = VllmMoERunner.__new__(VllmMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.routed_experts = SimpleNamespace()
+    monkeypatch.setattr(runner, "_rows_gathered", lambda: (True, False))
+    hidden, logits, ids = torch.zeros(2, 8), torch.zeros(2, 4), torch.tensor([3, 1])
+    runner._apply_quant_method(
+        hidden_states=hidden,
+        router_logits=logits,
+        shared_experts_input=None,
+        input_ids=ids,
+    )
+    ((layer, got_logits, got_ids, gathered),) = recorded
+    assert layer is runner.routed_experts
+    assert got_logits is logits and got_ids is ids
+    assert gathered.pop("hidden_states") is hidden
+    assert gathered == {"over_dp": True, "over_pcp": False}
+    assert applied[0]["router_logits"] is logits
+    assert applied[0]["input_ids"] is ids
