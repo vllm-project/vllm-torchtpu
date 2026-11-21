@@ -41,6 +41,7 @@ the blockwise Pallas kernel path instead.
 
 from __future__ import annotations
 
+import enum
 from collections.abc import Callable
 from math import gcd
 from typing import TYPE_CHECKING, Literal, cast
@@ -410,6 +411,19 @@ def _quantize_and_format_single_moe_weight(
 # Bytes of the float32 copy one requantization chunk dequantizes at a time.
 # The quantized chunk, its scales and the formatting temporaries come on top.
 _REQUANT_CHUNK_BYTES = 1 << 30
+
+
+class MoePath(enum.Enum):
+    """The paths ``VllmFp8MoEMethodTPU.served_before_fused_decode`` answers,
+    in ``apply_monolithic``'s order. The fused few-token op arms only for a
+    layer fused EP v3 serves."""
+
+    ADAPTIVE_FUSED_MOE = "adaptive fused MoE"
+    FUSED_EP_V2 = "fused EP v2"
+    TP_DECODE_KERNEL = "the TP decode MoE kernel"
+    FUSED_EP_V3 = "fused EP v3"
+    LOWTOK_SCORES = "the few-token scores entry"
+    GROUPED_OWN_COLLECTIVES = "the grouped path with its own collectives"
 
 
 def _requantize_expert_chunks(
@@ -1137,6 +1151,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             )
             self._tpu_fused_ep_eligible = layer._tpu_fused_ep_eligible
             setattr(self, FUSED_MOE_EP_OP_ATTR, None)
+            # Imported here: moe_lowtok_fused_op imports
+            # quantization.moe_lowtok_scores, and this package's __init__
+            # imports this module.
+            from vllm_torchtpu.layers.adapter import moe_lowtok_fused_op
+
+            # After v3's prebuild, from the layer's one MoE decision: the fused
+            # few-token op serves only steps of a layer fused EP v3 serves
+            # (_apply_owning_dispatch_v3).
+            if self.served_before_fused_decode(layer) is MoePath.FUSED_EP_V3:
+                moe_lowtok_fused_op.maybe_prebuild(layer, self._moe_lowtok_scores_op)
         else:
             _ep_op = prebuild_fused_moe_ep(
                 layer,
@@ -1172,7 +1196,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             num_primary_experts=self._gmm_primary_experts,
         )
 
-    def served_before_fused_decode(self, layer: RoutedExperts) -> str | None:
+    def served_before_fused_decode(self, layer: RoutedExperts) -> MoePath | None:
         """The path `apply_monolithic` serves this layer by before it reaches
         the fused MoE decode kernel's check, or None.
 
@@ -1190,17 +1214,17 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
 
         if self._use_adaptive_fused_moe:
-            return "adaptive fused MoE"
+            return MoePath.ADAPTIVE_FUSED_MOE
         if fused_moe_ep_supported(self):
-            return "fused EP v2"
+            return MoePath.FUSED_EP_V2
         if moe_tp_decode_supported(self):
-            return "the TP decode MoE kernel"
+            return MoePath.TP_DECODE_KERNEL
         if envs.USE_MOE_FUSED_EP_KERNEL and fused_moe_ep_v3_supported(self):
-            return "fused EP v3"
+            return MoePath.FUSED_EP_V3
         if self._moe_lowtok_scores_op is not None:
-            return "the few-token scores entry"
+            return MoePath.LOWTOK_SCORES
         if enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER:
-            return "the grouped path with its own collectives"
+            return MoePath.GROUPED_OWN_COLLECTIVES
         return None
 
     def apply_monolithic(
@@ -1349,7 +1373,12 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         layer = cast("TpuRoutedExperts", layer)
         from vllm.distributed.parallel_state import get_ep_group
 
-        from vllm_torchtpu.layers.adapter import small_all_reduce_op
+        # moe_lowtok_fused_op is imported here for the import cycle named in
+        # process_weights_after_loading.
+        from vllm_torchtpu.layers.adapter import (
+            moe_lowtok_fused_op,
+            small_all_reduce_op,
+        )
         from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
             fused_moe_ep,
             fused_moe_ep_supported,
@@ -1370,17 +1399,25 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 value = experts_start.to(out.dtype)
                 out = out + (value - value)
             out = small_all_reduce_op.retain(out)
+            out = moe_lowtok_fused_op.retain(out)
             return token_padding.retain_padding_graph_input(out)
 
         ep = get_ep_group()
         sequence_parallel_flag = layer.moe_config.is_sequence_parallel
+        if moe_lowtok_fused_op.serves(
+            layer, self._moe_lowtok_scores_op, sequence_parallel_flag
+        ):
+            out = moe_lowtok_fused_op.apply(layer, x, router_logits)
+            out = small_all_reduce_op.retain(out)
+            return retain_fused_ep_graph_inputs(out)
         dispatched = ep.dispatch_router_logits(x, router_logits, sequence_parallel_flag)
         assert len(dispatched) == 2
         gathered_x, gathered_logits = dispatched
         out = self.apply_monolithic_external_dispatch(
             layer, gathered_x, gathered_logits
         )
-        return retain_fused_ep_graph_inputs(ep.combine(out, sequence_parallel_flag))
+        out = moe_lowtok_fused_op.retain(ep.combine(out, sequence_parallel_flag))
+        return retain_fused_ep_graph_inputs(out)
 
     def apply_monolithic_external_dispatch(
         self,

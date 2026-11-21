@@ -58,6 +58,8 @@ def _mains_default(monkeypatch):
     monkeypatch.setattr(util, "RECIPROCAL_SCALE", False)
     monkeypatch.setattr(gmm_v2, "RHS_STREAM", False)
     monkeypatch.setattr(gmm_v2, "TUNED_FP8_MOE", False)
+    # apply_kernel_numerics selects the two-sort routing on the 397B shape.
+    monkeypatch.setattr(fused_moe_gmm, "NONEP_PERMUTE", "sorts")
     monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
     # The few-token kernel's armed cap and the grouped path's routed-ids
     # switch it sets; both start unarmed and are restored after each test.

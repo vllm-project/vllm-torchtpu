@@ -284,6 +284,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # The small-collective bridge, whose kernels sit behind torch custom-op
     # boundaries.
     "vllm_torchtpu/layers/adapter/small_all_reduce_op.py",
+    # The fused few-token MoE step, built with sharded_jax_op behind a torch
+    # custom-op boundary.
+    "vllm_torchtpu/layers/adapter/moe_lowtok_fused_op.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
     # export is chosen from their source, so an edit here has to invalidate

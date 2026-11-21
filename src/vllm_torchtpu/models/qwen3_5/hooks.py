@@ -250,8 +250,9 @@ def is_measured_target(model_config) -> bool:
         return True
     logger.info_once(
         "Qwen3.5 kernel levers (reciprocal-scale quantize, tuned and streamed "
-        "FP8 MoE grouped matmul, few-token MoE kernel) left at main's "
-        "arithmetic: they were measured for Qwen3.5-397B-A17B on TPU7x only."
+        "FP8 MoE grouped matmul, two-sort non-EP MoE routing, few-token MoE "
+        "kernel) left at main's arithmetic and code: they were measured for "
+        "Qwen3.5-397B-A17B on TPU7x only."
     )
     return False
 
@@ -263,22 +264,30 @@ def apply_kernel_numerics(model_config) -> bool:
     The Qwen3.5 PD stack was tuned and evaluated with the quantize helpers'
     reciprocal scale (kernels/quantized_matmul/util.RECIPROCAL_SCALE), the
     grouped matmul's hand-streamed whole-expert slabs
-    (kernels/megablox/gmm_v2.RHS_STREAM), and its tuned FP8 MoE tiling and
-    rhs-scale hoist (gmm_v2.TUNED_FP8_MOE), all off by default; turn them on
-    before the model's kernels are traced. Other models keep main's arithmetic
-    and code. Returns False without a model config and for any model other
-    than the measured target: the patch registry marks a patch done by its
-    target, not by model, so a later load of the measured target in the same
-    process still turns them on. Returns True once they are on.
+    (kernels/megablox/gmm_v2.RHS_STREAM) and its tuned FP8 MoE tiling and
+    rhs-scale hoist (gmm_v2.TUNED_FP8_MOE), all off by default, and the
+    two-sort routing metadata of the non-EP grouped-matmul MoE where an
+    argsort builds it (layers/core/fused_moe_gmm.NONEP_PERMUTE, "sorts" by
+    default; same metadata, one sort fewer); select them before the model's
+    kernels are traced. Other models keep main's arithmetic and code. Returns
+    False without a model config and for any model other than the measured
+    target: the patch registry marks a patch done by its target, not by
+    model, so a later load of the measured target in the same process still
+    turns them on. Returns True once they are on.
     """
     if not is_measured_target(model_config):
         return False
+    # Imported where the rule applies, not at the module top: every vLLM
+    # process imports this module through the general plugin
+    # (register_models), and only the measured target needs these kernels.
     from vllm_torchtpu.kernels.megablox import gmm_v2
     from vllm_torchtpu.kernels.quantized_matmul import util
+    from vllm_torchtpu.layers.core import fused_moe_gmm
 
     util.set_reciprocal_scale(True)
     gmm_v2.set_rhs_stream(True)
     gmm_v2.set_tuned_fp8_moe(True)
+    fused_moe_gmm.set_nonep_permute("two_sorts")
     return True
 
 

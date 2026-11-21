@@ -107,6 +107,24 @@ _COUNTING_SORT_SCATTER_MAX_ROWS = _COUNTING_SORT_BLOCK
 # cache on it (layers/adapter/fused_moe.py), so an op built under one cap is
 # never reused under another.
 _MOE_LOWTOK_MAX_TOKENS = 0
+# The routing metadata construction of the non-EP path wherever neither the
+# counting sort nor the single packed sort builds it (above the single-sort row
+# cap, and at any row count with TPU_MOE_COUNTING_SORT and TPU_MOE_SINGLE_SORT
+# both off; prepare_routed_gmm_inputs' nonep_permute) that the grouped-matmul
+# MoE op is built with: "sorts" by default, so every model keeps the three
+# sorts; a model rule selects "two_sorts" before its kernels are built
+# (set_nonep_permute).
+NONEP_PERMUTE = "sorts"
+_NONEP_PERMUTES = ("sorts", "two_sorts")
+
+
+def set_nonep_permute(permute: str) -> None:
+    """Build the grouped-matmul MoE op with this non-EP routing metadata
+    construction ("sorts" or "two_sorts")."""
+    global NONEP_PERMUTE
+    if permute not in _NONEP_PERMUTES:
+        raise ValueError(f"unknown non-EP permute {permute!r}")
+    NONEP_PERMUTE = permute
 
 
 def set_lowtok_max_tokens(rows: int) -> None:
@@ -378,6 +396,7 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
+    nonep_permute: str = "sorts",
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
@@ -387,7 +406,17 @@ def prepare_routed_gmm_inputs(
     (inside this JIT) and marks non-local entries with a negative id which
     the mask filters out. Always running the masked branch keeps a single
     code path.
+
+    ``nonep_permute`` selects the metadata construction of the non-EP path
+    wherever neither the counting sort nor the single packed sort builds it
+    (above the single-sort row cap, and at any row count with
+    TPU_MOE_COUNTING_SORT and TPU_MOE_SINGLE_SORT both off): "sorts" (the
+    forward permutation, its inverse, and the token ids by a packed sort or,
+    when the keys do not pack, a gather) or "two_sorts" (the token ids by
+    division of the forward permutation).
     """
+    if nonep_permute not in _NONEP_PERMUTES:
+        raise ValueError(f"unknown non-EP permute {nonep_permute!r}")
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
     topk_weights_flat = topk_weights_local.flatten()
@@ -450,6 +479,17 @@ def prepare_routed_gmm_inputs(
         and (argsort_revert_indices is None or not packable)
         else None
     )
+    # The non-EP path without the counting sort or the single packed sort
+    # (above the single-sort cap, or with both turned off): one argsort for
+    # the forward permutation, then either a second argsort (its inverse) and
+    # a packed sort (the token ids), or the token ids by division.
+    if (
+        nonep_permute == "two_sorts"
+        and not use_ep
+        and sorted_indices is not None
+        and argsort_revert_indices is None
+    ):
+        token_indices_sorted = sorted_indices // topk
 
     if argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
@@ -708,6 +748,7 @@ def moe_gmm(
         "skip_padded_tokens",
         "lowtok_max_tokens",
         "num_primary_experts",
+        "nonep_permute",
     ),
 )
 def fused_moe_func(
@@ -730,6 +771,7 @@ def fused_moe_func(
     skip_padded_tokens: bool = False,
     lowtok_max_tokens: int = 0,
     num_primary_experts: int | None = None,
+    nonep_permute: str = "sorts",
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -760,6 +802,10 @@ def fused_moe_func(
     is every local slot, and the next shard's first ids would be taken as
     local and summed a second time. ``None`` (the default) is the full slot
     count, the behaviour without a placement.
+
+    ``nonep_permute`` picks the routing metadata construction of the
+    whole-expert (non-EP) path (see ``prepare_routed_gmm_inputs``); the
+    default keeps the three sorts.
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -871,6 +917,7 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
+        nonep_permute=nonep_permute,
     )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
