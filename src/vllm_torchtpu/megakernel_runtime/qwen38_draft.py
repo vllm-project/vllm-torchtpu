@@ -85,8 +85,8 @@ def draft_spec(g: Any, R: int, *, budget: int, max_groups: int, vocab_shard: int
     dcp = draft_kv_dcp()
     opts.update(dcp=dcp, compressed_dcp=bool(opts.get("compressed_dcp")) and dcp > 1)
     # The draft builds its own per-page key table (`qsa_step_inputs` without manager pages)
-    # and keeps the 2-slot key ring.
-    opts.update(manager_pages=0, key_slots=2)
+    # and keeps the 2-slot key ring of full carrier rows.
+    opts.update(manager_pages=0, key_slots=2, ck_lanes=0)
     return wholestep_spec(
         g,
         R,

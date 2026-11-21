@@ -93,6 +93,10 @@ KEY_MP: int = 0
 # the row bucket (`key_slots_for`).
 KEY_SLOTS: int = 2
 KEY_SLOTS_AUTO = -1
+# `...,wholekeylanes=128`: the key stream copies only lanes [0, 128) of each 256-lane FP8
+# carrier row, the lanes the scores read (`QSAFullIndexedBlock.ck_lanes`): half the bytes and
+# half the VMEM per key-ring slot. 0 = all 256 lanes. Same keys, same scores.
+KEY_LANES: int = 0
 
 
 def key_slots_for(B: int | None) -> int:
@@ -129,6 +133,7 @@ def indexed_options(B: int | None = None) -> dict:
         select_nvis=envs.VLLM_TPU_MK_QSA_SELECT_NVIS,
         manager_pages=KEY_MP,
         key_slots=key_slots_for(B),
+        ck_lanes=KEY_LANES,
     )
 
 

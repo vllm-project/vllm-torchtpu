@@ -102,6 +102,8 @@ def main():
                     "--kb 512 for N > 1: a 512-token block column holds 4 consecutive pages)")
     ap.add_argument("--key-slots", type=int, default=2,
                     help="key-stream ring slots (VLLM_TPU_MEGAKERNEL wholekeyslots=N; -1 = auto)")
+    ap.add_argument("--key-lanes", type=int, default=0, choices=(0, 128),
+                    help="key-stream carrier lanes per row (VLLM_TPU_MEGAKERNEL wholekeylanes=128)")
     ap.add_argument("--kb", type=int, default=128, choices=(128, 512),
                     help="pool block tokens (the served tables address 512-token blocks)")
     ap.add_argument("--score-arm", default="", choices=("", "dma", "compute"),
@@ -144,7 +146,7 @@ def main():
         pltpu.get_tpu_info = lambda: chip
     wsc.SHARD_INDEX, wsc.UNION_ATTN, wsc.LOOP_REQUESTS = a.shard, a.union, a.loop
     wsc.UNION_PHYS = a.phys
-    wsc.KEY_MP, wsc.KEY_SLOTS = a.key_mp, a.key_slots
+    wsc.KEY_MP, wsc.KEY_SLOTS, wsc.KEY_LANES = a.key_mp, a.key_slots, a.key_lanes
     if a.score_arm:
         from vllm_torchtpu.megakernel.wholestep import qsa_full_b
 
