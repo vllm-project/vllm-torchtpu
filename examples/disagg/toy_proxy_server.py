@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
@@ -713,6 +713,41 @@ async def models():
     client = app.state.decode_clients[0]["client"]
     response = await client.get("/v1/models")
     return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+async def _forward_to_prefill(path: str, request: Request) -> Response:
+    """Send the request body to the first prefill instance and return its reply
+    unchanged, status and body included."""
+    client = request.app.state.prefill_clients[0]["client"]
+    response = await client.post(
+        path,
+        content=await request.body(),
+        headers={"Content-Type": "application/json"},
+    )
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        media_type=response.headers.get("content-type"),
+    )
+
+
+@app.post("/tokenize")
+async def tokenize(request: Request):
+    """Tokenize on a prefill instance, the engine that tokenizes the prompts of
+    the requests this proxy forwards.
+
+    `vllm bench serve` calls /tokenize and /detokenize on the server to trim
+    its random and prefix_repetition prompts to the requested input length when
+    its local tokenizer disagrees with the server's. Without them it warns and
+    skips the alignment.
+    """
+    return await _forward_to_prefill("/tokenize", request)
+
+
+@app.post("/detokenize")
+async def detokenize(request: Request):
+    """The inverse of /tokenize, on the same instance."""
+    return await _forward_to_prefill("/detokenize", request)
 
 
 @app.get("/healthcheck")
