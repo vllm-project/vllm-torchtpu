@@ -150,11 +150,17 @@ def _abort(sched, *req_ids):
 
 def _cached_turn(sched, req_id, tokens):
     """A finished turn: scheduled once (its blocks hashed at allocation), then ended, so its prefix sits in the free
-    queue as cached blocks."""
+    queue as cached blocks; then one empty schedule pass, as in serving, where a returner arrives seconds after its
+    previous turn. (With vllm_torchtpu._patch_vllm_same_step_prefix_hits active, blocks hashed in a pass are no hit
+    until the next pass starts.)"""
     sched.add_request(_req(req_id, tokens))
     out = sched.schedule()
     assert [r.req_id for r in out.scheduled_new_reqs] == [req_id]
     _abort(sched, req_id)
+    assert not sched.schedule().scheduled_new_reqs
+    req = _req(req_id + "-probe", tokens + [7])
+    _, hit, _ = sched.kv_cache_manager.coordinator.find_longest_cache_hit(req.block_hashes, req.num_tokens - 1)
+    assert hit == len(tokens) // BS * BS, f"precondition: the finished turn is cached ({hit})"
 
 
 def _churn(sched, keep_free=0):
@@ -222,11 +228,13 @@ def _script(monkeypatch):
     sched.add_request(_req("Y1", _toks(15 * BS + 3, 12)))
     step()
     _abort(sched, "X1")
+    step()
     sched.add_request(_req("X2", x1 + _toks(2 * BS, 13)))
     sched.add_request(_req("Z1", _toks(25 * BS, 14)))
-    _churn(sched, keep_free=20)
+    _churn(sched, keep_free=5)
     step()
     _abort(sched, "Y1", "Z1")
+    step()
     sched.add_request(_req("X3", x1 + _toks(3 * BS + 5, 15)))
     sched.add_request(_req("W1", _toks(10 * BS, 16)))
     _abort(sched, "W1")
@@ -441,6 +449,8 @@ def _pp8(monkeypatch, evict_state):
         for b in state:
             if b.block_hash is not None:
                 kvm.block_pool._maybe_evict_cached_block(b)
+    # The next schedule pass would clear the same-step patch's unwritten set (no-op when the patch is not active).
+    kvm.block_pool.__dict__.get("_tpu_unwritten_block_ids", set()).clear()
     if evict_state:
         turn = _request("turn", head + _tokens(3 * BLOCK, 9) + _tokens(2000, 10))
     else:
@@ -564,10 +574,16 @@ def test_tier_refresh_asks_each_class_once_and_loads_nothing(monkeypatch, local_
         if c not in want_by_class:
             assert names == [], f"TIER class {c} asked without keys: {names}"
             continue
-        assert names == ["lookup", "release"], f"TIER class {c}: one pinned lookup and one release, got {names}"
-        hashes, enable_global, pin_found = new[0].args
-        assert hashes == want_by_class[c] and pin_found and not enable_global, f"TIER class {c} lookup keys / pin"
-        assert new[1].args[0] == want_by_class[c], f"TIER class {c} releases what it pinned"
+        # host_tier_hit_tokens probes first (pin_found=False, LRU untouched); then one pinned lookup and one release.
+        probes = [call for call in new if call.name == "lookup" and not call.args[2]]
+        pinned = [call for call in new if call.name == "lookup" and call.args[2]]
+        released = [call for call in new if call.name == "release"]
+        assert len(pinned) == 1 and len(released) == 1 and len(probes) + 2 == len(new), (
+            f"TIER class {c}: probes, then one pinned lookup and one release, got {names}")
+        assert new[-2] is pinned[0] and new[-1] is released[0], f"TIER class {c} order {names}"
+        hashes, enable_global, _ = pinned[0].args
+        assert hashes == want_by_class[c] and not enable_global, f"TIER class {c} lookup keys / local only"
+        assert released[0].args[0] == want_by_class[c], f"TIER class {c} releases what it pinned"
         assert all(e.pin_count == 0 for e in store.entries.values()), f"TIER class {c} left a pin"
     moved = [c.name for i, st in enumerate(stores) for c in st.calls[marks[i]:] if c.name not in ("lookup", "release")]
     assert moved == [], f"TIER the refresh called {moved}"
