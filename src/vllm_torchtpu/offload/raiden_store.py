@@ -250,7 +250,6 @@ class RaidenLoadStoreSpec(LoadStoreSpec):
         self.keys = keys
         self.pinned = pinned
         self.key_sources = key_sources or {}
-        self.tokens_by_source: dict[CacheHitSource, int] | None = None
 
     def __repr__(self) -> str:
         return (

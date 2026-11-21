@@ -1,6 +1,6 @@
 # KV Cache Offloading Metrics
 
-With `TPURaidenOffloadingConnector`, alone or as a child of `TPUMultiConnector`, the `/metrics` endpoint shows which tier served each prefix-cache hit: the engine's host DRAM pool, the pool of another engine, or the storage tier. For all other metrics, see [Production Metrics](https://docs.vllm.ai/en/latest/usage/metrics/) in the vLLM documentation.
+With `TPURaidenOffloadingConnector`, alone or as a child of `TPUMultiConnector`, the `/metrics` endpoint shows which tier served each prefix-cache hit: the engine's host DRAM pool, a host DRAM pool reached through the global registry (another engine or a store node), or the storage tier. For all other metrics, see [Production Metrics](https://docs.vllm.ai/en/latest/usage/metrics/) in the vLLM documentation.
 
 ## `vllm:prompt_tokens_cached_by_source`
 
@@ -10,9 +10,9 @@ vLLM's counter of cached prompt tokens, by the tier that supplied them. The conn
 | :--- | :--- |
 | `device` | The prefix cache in TPU memory (HBM). |
 | `host` | The engine's host DRAM pool. |
-| `p2p` | The host DRAM pool of another engine. |
+| `p2p` | A block read through the global registry, from another engine or from a store node. |
 | `disk` | The storage tier. |
-| `external_unspecified` | No tier: tokens of a hit that the connector cannot assign to a tier, for example because the blocks were evicted before the load started. |
+| `external_unspecified` | No tier reported: tokens pulled from a prefill engine by `TPURaidenConnector` under `TPUMultiConnector` (which sets no hit source), or tokens of an offload hit that `TPURaidenOffloadingConnector` cannot assign to a tier (for example because the blocks were evicted before the load started). |
 
 It is a counter, so a scrape shows it as `vllm:prompt_tokens_cached_by_source_total`. It counts a request's tokens when the scheduler admits the request, and does not count them again when the request is admitted again after a preemption.
 

@@ -24,25 +24,8 @@ from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm_torchtpu.offload.metrics import (
     SubBlockSourceCounts,
     compute_load_tokens_by_source,
-    external_sources_with_tokens,
     split_external_hit,
 )
-
-
-def test_external_sources_with_tokens() -> None:
-    raw = {
-        CacheHitSource.DEVICE: 16,
-        CacheHitSource.HOST: 64,
-        CacheHitSource.P2P: 0,
-        CacheHitSource.DISK: 128,
-        CacheHitSource.EXTERNAL_UNSPECIFIED: 32,
-    }
-    assert external_sources_with_tokens(raw) == {
-        CacheHitSource.HOST: 64,
-        CacheHitSource.DISK: 128,
-        CacheHitSource.EXTERNAL_UNSPECIFIED: 32,
-    }
-
 
 _KEY_0 = make_offload_key(b"key0", 0)
 _KEY_1 = make_offload_key(b"key1", 0)

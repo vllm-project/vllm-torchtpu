@@ -39,27 +39,6 @@ logger = init_logger(__name__)
 SubBlockSourceCounts = tuple[tuple[CacheHitSource, int], ...]
 
 
-def external_sources_with_tokens(
-    tokens_by_source: Mapping[CacheHitSource, int],
-) -> dict[CacheHitSource, int]:
-    """Keep the external sources that have at least one token.
-
-    For example, `{DEVICE: 16, HOST: 64, P2P: 0, DISK: 128}` becomes
-    `{HOST: 64, DISK: 128}`: `DEVICE` is local HBM, never an offload tier.
-    Checks `isinstance(source, CacheHitSource)` explicitly because
-    `CacheHitSource` inherits from `str` (`"host" == CacheHitSource.HOST`).
-    """
-    return {
-        source: count
-        for source, count in tokens_by_source.items()
-        if (
-            count > 0
-            and isinstance(source, CacheHitSource)
-            and source != CacheHitSource.DEVICE
-        )
-    }
-
-
 def split_external_hit(
     tokens_by_source: Mapping[CacheHitSource, int], num_external_tokens: int
 ) -> dict[CacheHitSource, int]:
@@ -177,4 +156,4 @@ def compute_load_tokens_by_source(
                 sources[resolved] = sources.get(resolved, 0) + (boundary - position)
         active[source] += delta
         position = boundary
-    return external_sources_with_tokens(sources)
+    return sources

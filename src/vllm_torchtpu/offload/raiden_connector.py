@@ -104,7 +104,6 @@ from vllm_torchtpu.offload.raiden_store import (
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
-    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -232,21 +231,30 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(src_spec, RaidenLoadStoreSpec)
         return src_spec
 
-    def update_state_after_alloc(
-        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
-    ):
-        super().update_state_after_alloc(request, blocks, num_external_tokens)
+    def get_external_cache_hit_sources(
+        self, request: Request, num_external_tokens: int
+    ) -> dict[CacheHitSource, int]:
+        """Split the request's external prefix-cache hit by source tier.
+
+        vLLM's scheduler records the result in
+        `vllm:prompt_tokens_cached_by_source` when it admits a non-preempted
+        request, right after `update_state_after_alloc` populates the load spec
+        from `prepare_load`. For example, a 1536-token hit with 768 tokens in
+        host DRAM and 768 on disk returns `{HOST: 768, DISK: 768}`.
+        """
         if num_external_tokens == 0:
-            return
+            return {}
         src_spec = self._load_spec(request.request_id)
         if not src_spec.pinned:
-            # Evicted before prepare_load acquired pins: no confirmed Raiden
-            # cache hit and no transfer job will run on the store.
-            return
+            # Evicted before `prepare_load` acquired pins: the load fails, and
+            # the scheduler recomputes or fails the request per
+            # `kv_load_failure_policy`. The scheduler has already counted the
+            # tokens as hits, so report them as unspecified.
+            return split_external_hit({}, num_external_tokens)
         req_status = self._req_status[request.request_id]
         start_token = req_status.num_locally_computed_tokens
         group_configs = self.config.kv_group_configs
-        src_spec.tokens_by_source = compute_load_tokens_by_source(
+        tokens_by_source = compute_load_tokens_by_source(
             start_token=start_token,
             end_token=start_token + num_external_tokens,
             load_key_ranges=req_status.load_key_ranges,
@@ -260,26 +268,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 if isinstance(group.kv_cache_spec, MambaSpec)
             },
         )
-
-    def get_external_cache_hit_sources(
-        self, request: Request, num_external_tokens: int
-    ) -> dict[CacheHitSource, int]:
-        """Split the request's external prefix-cache hit by source tier.
-
-        vLLM's scheduler records the result in
-        `vllm:prompt_tokens_cached_by_source`. It calls this right after
-        `update_state_after_alloc`, which computes the split from the tiers
-        that `prepare_load` returned. For example, a 1536-token hit with 768
-        tokens in host DRAM and 768 on disk returns `{HOST: 768, DISK: 768}`.
-        """
-        if num_external_tokens == 0:
-            return {}
-        # `update_state_after_alloc` computes no split for an unpinned load:
-        # the load fails, and the scheduler recomputes or fails the request,
-        # per `kv_load_failure_policy`. The scheduler has already counted the
-        # tokens as hits, so they are reported as unspecified.
-        tokens_by_source = self._load_spec(request.request_id).tokens_by_source
-        return split_external_hit(tokens_by_source or {}, num_external_tokens)
+        return split_external_hit(tokens_by_source, num_external_tokens)
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
