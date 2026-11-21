@@ -153,3 +153,37 @@ def test_fos2_plain_mask_form(kernels):
     r = _rl2(out, rows, ref)
     print(f"PQFOS fos2_plain rel_l2_vs_f64 {r:.6f} (served walk {_rl2(base, rows, ref):.6f})")
     assert r <= SMOKE_RL2, r
+
+
+def _poison_tails(step, rows, cached, code=0x7F):
+    """The step with every request's never-written tail slots (positions length..next multiple of 4) set to an E4M3 NaN
+    code in all four packed bytes (K and V of both KV heads): the bytes a torch.empty FP8 pool can hold there."""
+    q, gate, blocks, lengths, table, pool, starts = step
+    raw = np.array(np.asarray(jax.device_get(pool)).view(np.uint8))
+    tab, st = np.asarray(table), np.asarray(starts)
+    hit = 0
+    for r, (n, ctx) in enumerate(zip(rows, cached)):
+        end = ctx + n
+        for t in range(end, -(-end // 4) * 4):
+            raw[tab[st[r], t // 3200], t % 3200] = code
+            hit += 1
+    pool = jax.lax.bitcast_convert_type(jax.numpy.asarray(raw), jax.numpy.float8_e4m3fn)
+    return (q, gate, blocks, lengths, table, pool, starts), hit
+
+
+def test_lean_tile_never_written_tail_slots_stay_finite(kernels):
+    """T66a j-91b6d83f (PSTEP-FOSNAN): a chunk whose last length is not a multiple of 4 reads its tail group's never-written
+    slots. With NaN codes there, fos2_lt must stay finite and give its finite-pool output bits on live rows (the served
+    `written` select's products); the served walk and fos2 (no lean tile) are finite as well. Fails without the fix."""
+    rows, cached = SPARE
+    assert any((n + c) % 4 for n, c in zip(rows, cached)), "the step must end some request off a group boundary"
+    step = _packed_step(38, rows, cached)
+    hot, hit = _poison_tails(step, rows, cached)
+    assert hit > 0
+    live = np.flatnonzero(np.asarray(step[3]) > 0)
+    for kw in (dict(bf16_softmax=True, fos=2, lean_tile=True), dict(bf16_softmax=True, fos=2), {}):
+        clean, dirty = _walk(step, GL, **kw), _walk(hot, GL, **kw)
+        bad = int((~np.isfinite(dirty[live].astype(np.float32))).sum())
+        print(f"PQFOS tail-slot NaN codes {kw or 'served'}: non-finite live elements {bad}")
+        assert bad == 0, (kw, bad)
+        np.testing.assert_array_equal(np.asarray(dirty)[live].view(np.uint16), np.asarray(clean)[live].view(np.uint16))

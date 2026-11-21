@@ -678,7 +678,8 @@ def _walk_kernel(
     #   (max, mass, accumulator) stays FP32. fos (needs bf16_softmax): 1 = lag-1 offset (exp against the carried max,
     #   rescale after P.V); 2 = static offset 0 (no row max, no rescale; the caller must re-run the exact walk when a row
     #   overflows or loses all its mass). lean_tile (needs bf16_softmax; L-B): the FP8 keys and values go to the MXU as
-    #   weights without the FP32 decode or the value guard (finite pools only, as vguard_none).
+    #   weights without the FP32 decode; the packed words of unwritten ranks are zeroed first (PSTEP-FOSNAN: the served
+    #   `written` select's products; without it T66a's chunk-end tail slots of the torch.empty FP8 pool gave NaN logits).
     # vguard_none (q38 UNION-BUILD, gathered walk only): no value guard at all (QA-1's vguard_lean keeps the `written` select).
     #   Every live union rank's token is below the group's longest length (the union holds only groups some row of the group
     #   sees), so `written` is true on every rank whose probability can be non-zero; the ranks it can turn off are padding
@@ -1104,12 +1105,16 @@ def _walk_kernel(
                 rows = line_ref.shape[0]
                 pltpu.make_async_copy(lines_hbm.at[pl.ds(0, rows)], line_ref, sem_ref).wait()
 
-    def split_kv(kv_ref):
+    def split_kv(kv_ref, keep=None):
         cache_words = kv_ref.bitcast(jnp.uint32).reshape(-1, head_dim)
         pairs = []
         head_axes = kv_ref.shape[1]
         for head_axis in range(head_axes):
             words_ = utils.strided_load(cache_words, head_axis, kv_tile * head_axes, head_axes)
+            if keep is not None:
+                # WALK-FOS lean tile (PSTEP-FOSNAN fix): the packed K / V words of unwritten ranks are zeroed before the
+                # FP8 words reach the MXU (see compute_tile).
+                words_ = jnp.where(keep, words_, jnp.zeros_like(words_))
             pairs.extend(
                 utils.convert_to_target_bitwidth(
                     words_, target_bitwidth=32 // packing, kv_dtype=kv_ref.dtype
@@ -1140,10 +1145,18 @@ def _walk_kernel(
         decode_scope = sc("decode")
         decode_scope.__enter__()
         key_values = []
-        for key, value in split_kv(kv_ref)[:kv_heads]:
+        # WALK-FOS lean tile (PSTEP-FOSNAN fix of T66a j-91b6d83f's NaN logits): the served walk zeroes the values of
+        # unwritten ranks (`written`, the vguard_lean select). Without it, a chunk whose last length is not a multiple of
+        # the ratio (T66a's probe: 3,199 rows ending at 35,199) reads its tail group's never-written slots, which hold
+        # whatever the FP8 pool's bytes are (the pool is torch.empty, kv_cache_materializer.py); an E4M3 NaN code there
+        # gives 0 x NaN = NaN in the P.V dot for every row of the query group while the mass stays finite, so the fos=2
+        # lse guard cannot see it. lean_tile therefore zeroes the packed words of unwritten ranks (K and V; the keys there
+        # are never visible), the same products as the served select on any pool.
+        lean_keep = written if (bf16_softmax and lean_tile) else None
+        for key, value in split_kv(kv_ref, keep=lean_keep)[:kv_heads]:
             if bf16_softmax:
-                # WALK-FOS: lean_tile feeds the FP8 words to the MXU as they are (no decode, no guard); otherwise BF16
-                # keys (qk16's exact operands) and BF16 values under the served value guard.
+                # WALK-FOS: lean_tile feeds the FP8 words to the MXU without the decode (unwritten ranks zeroed above);
+                # otherwise BF16 keys (qk16's exact operands) and BF16 values under the served value guard.
                 if not lean_tile:
                     key = key.astype(jnp.bfloat16)
                     value = value.astype(jnp.bfloat16)
