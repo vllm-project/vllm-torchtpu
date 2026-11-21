@@ -362,3 +362,110 @@ def test_validate_model_hf_config_eligibility_checks():
         _StubModel, {**base_cfg, "hidden_size": [1024]}
     )
     assert not bad_type_res.eligible and bad_type_res.code == "invalid_geometry"
+
+
+def test_validate_multi_key_alias_field_specs_and_default_cfg_norms():
+    """`validate` resolves `FIELD_ALIASES` and `(key, default)` tuples and calls
+    `validate_norms` directly when `default_hf_config` is set."""
+    attn = _StubAttnModule.bind("self_attn")
+    gdn = GDN.bind("linear_attn")
+    in_norm = Norm.bind(
+        "input_layernorm", zero_centered=True, eps=("layer_norm_epsilon", 1e-5)
+    )
+    post_norm = Norm.bind("post_attention_layernorm", zero_centered=True)
+    final_norm_b = Norm.bind("model.norm", zero_centered=True)
+
+    # 1. `norm_zc_and_eps` with `(hf_key, default)` tuple spec + `"H"` alias.
+    assert norm_zc_and_eps(in_norm, {"H": 1024}) == (True, 1e-5)
+    assert norm_zc_and_eps(in_norm, {"H": 1024, "layer_norm_epsilon": 2e-5}) == (
+        True,
+        2e-5,
+    )
+
+    # 2. Unpinned `MoE.bind("mlp")` resolves `FIELD_ALIASES` (`"E"`, `"experts"`).
+    class _AliasMoEModel:
+        default_hf_config = {"hidden_size": 1024, "num_hidden_layers": 4, "E": 128}
+        geometry = FromHF(
+            hidden=("n_embd", 1024),
+            layers=("n_layer", 4),
+            eps=("layer_norm_epsilon", 1e-5),
+        )
+        schedule = Schedule(
+            mixer=Every(n=2, last=attn, rest=gdn),
+            ffn=MoE.bind("mlp"),
+            pre_norm=in_norm,
+            post_norm=post_norm,
+        )
+        final_norm = final_norm_b
+
+        @classmethod
+        def _from_hf_decl(cls) -> FromHF:
+            return cls.geometry
+
+        @classmethod
+        def derive_geometry(cls, hf_cfg: Any) -> ModelGeometry:
+            res = cls.geometry.resolve(hf_cfg)
+            return ModelGeometry(
+                L=int(res["layers"]),
+                att_every=2,
+                H=int(res["hidden"]),
+                NH=8,
+                NKV=2,
+                HD=128,
+                ROT=64,
+                KH=8,
+                VH=8,
+                KD=128,
+                VD=128,
+                E=128,
+                TOPK=2,
+                I=512,
+                IS=512,
+            )
+
+    assert validate_model_hf_config(_AliasMoEModel, {"E": 128}).eligible
+    assert validate_model_hf_config(_AliasMoEModel, {"experts": 128}).eligible
+    zero_alias = validate_model_hf_config(_AliasMoEModel, {"E": 0})
+    assert not zero_alias.eligible and zero_alias.code == "non_moe_checkpoint"
+
+    # 3. Tuple `(hf_key, default)` specs on `FromHF` and `MoE.bind(..., experts=...)`.
+    class _TupleSpecModel(_AliasMoEModel):
+        default_hf_config = {}
+        schedule = Schedule(
+            mixer=Every(n=2, last=attn, rest=gdn),
+            ffn=MoE.bind("mlp", experts=("n_routed_experts", 128)),
+            pre_norm=in_norm,
+            post_norm=post_norm,
+        )
+
+    assert validate_model_hf_config(_TupleSpecModel, {}).eligible
+    tup_dense = validate_model_hf_config(_TupleSpecModel, {"n_routed_experts": 0})
+    assert not tup_dense.eligible and tup_dense.code == "non_moe_checkpoint"
+    tup_mismatch = validate_model_hf_config(_TupleSpecModel, {"n_embd": 2048})
+    assert not tup_mismatch.eligible and tup_mismatch.code == "geometry_mismatch"
+
+    # 4. Direct `validate_norms` check in `validate_model_def` when `default_hf_config`
+    # is present (runs before `derive_geometry`).
+    class _BadNormWithDefCfg:
+        default_hf_config = {"n_embd": 1024, "n_layer": 2}
+        geometry = _AliasMoEModel.geometry
+        schedule = Schedule(
+            mixer=Every(n=2, last=attn, rest=gdn),
+            ffn=MoE.bind("mlp", experts=("n_routed_experts", 128)),
+            pre_norm=Norm.bind("input_layernorm", zero_centered=True),
+            post_norm=Norm.bind("post_attention_layernorm", zero_centered=False),
+        )
+        final_norm = final_norm_b
+        pool_layout_override = None
+        profiles = None
+
+        @classmethod
+        def _from_hf_decl(cls) -> FromHF:
+            return cls.geometry
+
+        @classmethod
+        def derive_geometry(cls, hf_cfg: Any) -> Any:
+            raise AssertionError("validate_norms must fail before derive_geometry")
+
+    with pytest.raises(MegakernelConfigError, match="zero_centered=False"):
+        validate_model_def(_BadNormWithDefCfg, "bad_def_zc", (), (), _BadNormWithDefCfg)
