@@ -120,10 +120,11 @@ def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
 def mtp_draft_path(vllm_config: VllmConfig) -> bool:
     """Qwen3.5's draft-path rule (spec_decode/draft_path_rules.py): a Qwen3.5
     target with an MTP draft runs greedy top tokens, fast token substitution
-    and the fused MTP draft loop by default. Like every default in this file,
-    only for the checkpoint shape and device they were validated on
-    (_is_calibrated); any other Qwen3.5 engine keeps main's opt-in keys.
-    Read once at engine and drafter start, not per step."""
+    and the fused MTP draft loop by default, and batch-1 async decode runs the
+    runner's decode carry. Like every default in this file, only for the
+    checkpoint shape and device they were validated on (_is_calibrated); any
+    other Qwen3.5 engine keeps main's opt-in keys. Read once at engine and
+    drafter start, not per step."""
     spec = vllm_config.speculative_config
     model_config = vllm_config.model_config
     if (

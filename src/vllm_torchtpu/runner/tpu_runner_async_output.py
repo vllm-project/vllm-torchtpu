@@ -204,6 +204,10 @@ class AsyncPreResults:
     # it does not count proposals for the next step. Bootstrap/non-spec: 0 or
     # absent entry (None for an entirely non-spec result).
     num_draft_per_req: dict[int, int] | None = None
+    # The decode carry's number for these results (decode_carry.tag_results),
+    # so a carry can tell which step's rejected counts it saw. None while the
+    # carry is off.
+    decode_carry_seq: int | None = None
 
     def wait_for_copy(self) -> torch.Tensor | None:
         if self.copy_state is None:
@@ -413,6 +417,56 @@ def subtract_and_substitute_draft_token_ids(
     return seq_lens, positions, input_ids, draft_token_ids
 
 
+def carry_subtract_and_substitute_draft_token_ids(
+    seq_lens_prev: torch.Tensor,
+    positions_prev: torch.Tensor,
+    step_delta: int,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    input_ids_prev: torch.Tensor,
+    substitution_indices: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Steady-state form of `subtract_and_substitute_draft_token_ids` that needs
+    no host upload of seq_lens / positions / input_ids.
+
+    Inputs are the previous step's corrected device tensors. In steady async
+    spec decode (same requests, same 1+K tokens each, the host's optimistic
+    counts advanced by exactly `step_delta` minus the previous step's rejected
+    count, which the runner checks on the host before taking this path), the
+    host's next optimistic values equal `prev + step_delta` on every slot the
+    subtraction touches (index >= 0); the other slots (padding) keep their
+    values, which the host also left unchanged. Every real input slot is
+    substituted from `next_tokens_tpu`, so `input_ids_prev` only supplies the
+    (zero) padding. The result is bit-identical to uploading the host values
+    and calling `subtract_and_substitute_draft_token_ids`.
+    """
+    zero_s = seq_lens_prev.new_zeros(())
+    seq_lens = seq_lens_prev + torch.where(
+        seq_lens_subtract_indices >= 0, zero_s + step_delta, zero_s
+    )
+    zero_p = positions_prev.new_zeros(())
+    pos_add = torch.where(positions_subtract_indices >= 0, zero_p + step_delta, zero_p)
+    if positions_prev.ndim == 2:
+        pos_add = pos_add.unsqueeze(0)
+    positions = positions_prev + pos_add
+    return subtract_and_substitute_draft_token_ids(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+        input_ids_prev,
+        substitution_indices,
+        next_tokens_tpu,
+        logits_indices,
+        target_logits_indices,
+    )
+
+
 def compute_num_rejected(
     next_tokens: torch.Tensor, num_draft: torch.Tensor
 ) -> torch.Tensor:
@@ -487,6 +541,36 @@ def _compiled_subtract_and_substitute_placeholder_token(
         input_ids,
         substitution_indices,
         next_tokens_tpu,
+    )
+
+
+@_static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_carry_subtract_and_substitute_draft_token_ids(
+    seq_lens_prev: torch.Tensor,
+    positions_prev: torch.Tensor,
+    step_delta: int,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    input_ids_prev: torch.Tensor,
+    substitution_indices: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return carry_subtract_and_substitute_draft_token_ids(
+        seq_lens_prev,
+        positions_prev,
+        step_delta,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
+        input_ids_prev,
+        substitution_indices,
+        next_tokens_tpu,
+        logits_indices,
+        target_logits_indices,
     )
 
 

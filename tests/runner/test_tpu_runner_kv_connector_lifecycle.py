@@ -75,6 +75,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     runner = SimpleNamespace(
         _pp_handoff=None,
         _dp_step_other_decode=False,
+        _decode_carry_enabled=False,
         num_prompt_logprobs={},
         _thinking_budget=None,
         _cached_output_req_ids_key=None,
