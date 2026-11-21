@@ -18,6 +18,7 @@ Qwen3.5 TP8 per-device geometry (4 q heads, 1 KV head, head_dim 256), HND
 mid-block and mid-page. Every byte past a request's KV length, and every page
 no request owns, is an fp8 NaN, so the outputs also show that those bytes stay
 out of the native matmuls (V is masked past each request's KV length on load).
+test_decode_fp8_kv also runs the row-scaled modes on an e5m2 KV cache.
 """
 
 import jax
@@ -33,19 +34,24 @@ pytestmark = pytest.mark.tpu_test
 _NQ, _NKV, _HD, _PAGE, _QLEN = 4, 1, 256, 128, 4
 _SM_SCALE = 1.0 / 16.0
 _FP8 = jnp.float8_e4m3fn
+_E5M2 = jnp.float8_e5m2
 
 
 def _cdiv(a, b):
     return (a + b - 1) // b
 
 
-def _rand_fp8(key, shape):
+def _rand_fp8(key, shape, dtype=_FP8):
+    """Random `dtype` values: random sign and mantissa bits, and one of the
+    four exponents 2^-2 to 2^1."""
+    nmant, bias = jnp.finfo(dtype).nmant, 1 - jnp.finfo(dtype).minexp
     bits = jax.random.bits(key, shape, jnp.uint8)
-    byte = (bits & 0b10000111) | ((((bits >> 3) & 0b11) + 5) << 3)
-    return jax.lax.bitcast_convert_type(byte.astype(jnp.uint8), _FP8)
+    sign_mant = bits & (0x80 | ((1 << nmant) - 1))
+    byte = sign_mant | ((((bits >> nmant) & 0b11) + bias - 2) << nmant)
+    return jax.lax.bitcast_convert_type(byte.astype(jnp.uint8), dtype)
 
 
-def _inputs(kv_lens_list, seed=0):
+def _inputs(kv_lens_list, seed=0, dtype=_FP8):
     k1, k2, k3, k4 = jax.random.split(jax.random.key(seed), 4)
     reqs = len(kv_lens_list)
     max_num_seqs = max(8, _cdiv(reqs, 8) * 8)
@@ -56,7 +62,7 @@ def _inputs(kv_lens_list, seed=0):
     page_indices = np.full((max_num_seqs * pps,), num_pages - 1, np.int32)
     page_indices[:used] = perm
     shape = (num_pages, 2 * _NKV, _HD // 4, 4, _PAGE)
-    cache = jax.lax.bitcast_convert_type(_rand_fp8(k1, shape), jnp.uint8)
+    cache = jax.lax.bitcast_convert_type(_rand_fp8(k1, shape, dtype), jnp.uint8)
     nan = jnp.uint8(0x7F)
     owned = np.zeros(num_pages, bool)
     owned[perm] = True
@@ -67,8 +73,8 @@ def _inputs(kv_lens_list, seed=0):
             cache = cache.at[p, :, :, :, kv_len % _PAGE :].set(nan)
     t = reqs * _QLEN
     q = (jax.random.normal(k2, (t, _NQ, _HD)) * 2.0).astype(jnp.bfloat16)
-    k = _rand_fp8(k3, (t, _NKV, _HD))
-    v = _rand_fp8(k4, (t, _NKV, _HD))
+    k = _rand_fp8(k3, (t, _NKV, _HD), dtype)
+    v = _rand_fp8(k4, (t, _NKV, _HD), dtype)
     kv_lens = np.zeros((max_num_seqs,), np.int32)
     kv_lens[:reqs] = kv_lens_list
     cu = np.full((max_num_seqs + 1,), reqs * _QLEN, np.int32)
@@ -77,7 +83,7 @@ def _inputs(kv_lens_list, seed=0):
         q=q,
         k=k,
         v=v,
-        kv_cache=jax.lax.bitcast_convert_type(cache, _FP8),
+        kv_cache=jax.lax.bitcast_convert_type(cache, dtype),
         kv_lens=jnp.asarray(kv_lens),
         page_indices=jnp.asarray(page_indices),
         cu_q_lens=jnp.asarray(cu),
@@ -115,16 +121,28 @@ _MODES = {
     "qk_split_pv_split": (configs.NativeFp8(qk=_SPLIT, pv=_SPLIT), 0.06),
     "qk_pv": (configs.NativeFp8(qk=_ROW, pv=_ROW), 0.12),
 }
+# test_decode_fp8_kv's (KV dtype, mode, bound). e5m2 keeps 2 mantissa bits to
+# e4m3's 3, so each operand a native mode casts to it is rounded with twice the
+# step; its bounds are the e4m3 ones doubled. SPLIT is refused on e5m2.
+_KV_CASES = [
+    pytest.param(_FP8, mode, tol, id=f"e4m3-{mode}")
+    for mode, (_, tol) in _MODES.items()
+] + [
+    pytest.param(_E5M2, mode, 2 * _MODES[mode][1], id=f"e5m2-{mode}")
+    for mode in ("pv", "qk_pv")
+]
 
 
-def _check_decode(kv_lens_list, native_fp8, tol, decode_exp2=False, scales=(1.0, 1.0)):
+def _check_decode(
+    kv_lens_list, native_fp8, tol, decode_exp2=False, scales=(1.0, 1.0), kv_dtype=_FP8
+):
     """Runs the decode call of these tests, with the tiles and call structure of
     the Qwen3.5 decode shapes the modes are tuned for, and compares it with the
     f32 reference at the same k_scale and v_scale."""
     if not jtu.is_device_tpu_at_least(version=7):
         pytest.skip("Expect TPU v7+ (native fp8 MXU)")
     k_scale, v_scale = scales
-    inp = _inputs(kv_lens_list)
+    inp = _inputs(kv_lens_list, dtype=kv_dtype)
     ref = _reference(inp, kv_lens_list, k_scale=k_scale, v_scale=v_scale)
     out, _ = wrapper.ragged_paged_attention(
         inp["q"],
@@ -154,11 +172,10 @@ def _check_decode(kv_lens_list, native_fp8, tol, decode_exp2=False, scales=(1.0,
 _KV_LENS = [[300], [5000, 9000 + 37, 131], [33000 + 61] + [4096 * 3] * 4]
 
 
-@pytest.mark.parametrize("mode", list(_MODES))
+@pytest.mark.parametrize(("kv_dtype", "mode", "tol"), _KV_CASES)
 @pytest.mark.parametrize("kv_lens_list", _KV_LENS)
-def test_decode_fp8_kv(mode, kv_lens_list):
-    native_fp8, tol = _MODES[mode]
-    _check_decode(kv_lens_list, native_fp8, tol)
+def test_decode_fp8_kv(kv_dtype, mode, tol, kv_lens_list):
+    _check_decode(kv_lens_list, _MODES[mode][0], tol, kv_dtype=kv_dtype)
 
 
 _STATIC = configs.Fp8Operand.STATIC
