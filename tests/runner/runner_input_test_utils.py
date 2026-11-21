@@ -397,6 +397,8 @@ def _make_sample_runner(
         _update_mamba_slot_read_offsets=lambda *_args: None,
         _update_num_xla_graphs=lambda *_args: None,
         _drafts_per_chunk=TPUModelRunner._drafts_per_chunk,
+        # One chunk per step: the async-spec source holds max_num_reqs rows.
+        _async_spec_source_rows=lambda: max_num_reqs,
         _stage_timing=MagicMock(),
     )
     runner._stage_timing.take_samples.return_value = ([], [])

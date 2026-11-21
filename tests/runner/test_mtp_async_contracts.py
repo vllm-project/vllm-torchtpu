@@ -88,6 +88,9 @@ def make_runner(device, monkeypatch, k):
     runner._last_sequence_layout_plan = None
     runner.pcp_manager = None
     runner._fast_token_substitution = False
+    # No warmed substitution lengths: the source passes through unpadded
+    # (these tests check substitution, not the warm-up padding).
+    runner._substitute_lens_cache = []
     # Real upstream batch operations and CPU token buffers. The kernels being
     # checked (offset reset / source assembly / substitution / D2H) use TPU.
     runner.input_batch = InputBatch(
@@ -343,6 +346,7 @@ def substitution_runner(device, k):
     runner._last_sequence_layout_plan = None
     runner.pcp_manager = None
     runner._fast_token_substitution = False
+    runner._substitute_lens_cache = []
     return runner
 
 
