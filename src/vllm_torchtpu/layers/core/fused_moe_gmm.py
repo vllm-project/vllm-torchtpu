@@ -411,10 +411,9 @@ def prepare_routed_gmm_inputs(
     wherever neither the counting sort nor the single packed sort builds it
     (above the single-sort row cap, and at any row count with
     TPU_MOE_COUNTING_SORT and TPU_MOE_SINGLE_SORT both off): "sorts" (the
-    forward permutation, its
-    inverse, and the token ids by a packed sort or, when the keys do not
-    pack, a gather) or "two_sorts" (the token ids by division of the forward
-    permutation).
+    forward permutation, its inverse, and the token ids by a packed sort or,
+    when the keys do not pack, a gather) or "two_sorts" (the token ids by
+    division of the forward permutation).
     """
     if nonep_permute not in _NONEP_PERMUTES:
         raise ValueError(f"unknown non-EP permute {nonep_permute!r}")
