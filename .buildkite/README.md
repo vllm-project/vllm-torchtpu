@@ -64,7 +64,9 @@ has how to cut a release. Its nightly step runs
 `scripts/publish_nightly_images.sh` on `main`, pushing the `ci`, `dev` and
 `prod` images to GAR as `nightly-YYYYMMDD` and `latest`, and the `dev` image to
 Docker Hub ([`vllm/vllm-torchtpu`](https://hub.docker.com/r/vllm/vllm-torchtpu/tags))
-as `nightly-YYYYMMDD-<commit>-<vllm>` and `nightly`. A release publishes the
+as `nightly-YYYYMMDD-<commit>-<vllm>` and `nightly`. Each nightly image
+carries the commit it was built from in the `org.opencontainers.image.revision`
+label, which maps a GAR `nightly-YYYYMMDD` tag to a commit. A release publishes the
 `prod` image as `vX.Y.Z`, and `latest` if the approver chooses (see
 `docs/getting_started/docker.md`). `pipeline_nightly_image.yml` is the same
 nightly step for the `vllm-torchtpu-nightly-image` pipeline, which runs until

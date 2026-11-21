@@ -30,6 +30,13 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 # releases/vX.Y.Z pushes prod as vX.Y.Z, or under RELEASE_VERSION for a
 # pre-release. The approver chooses whether to move latest (never for a
 # pre-release) and whether an existing tag may be overwritten.
+#
+# Every image carries the commit it was built from as the OCI label
+# org.opencontainers.image.revision. The GAR tags name no commit and
+# .dockerignore keeps .git out of the image, so the label is how a reader
+# maps nightly-YYYYMMDD to a commit, without pulling the image:
+#   docker buildx imagetools inspect <image>:nightly-YYYYMMDD \
+#     --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}'
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/../release/lib.sh"
 
@@ -53,6 +60,18 @@ case "${BRANCH}" in
     die "nightly images are published from main or releases/vX.Y.Z, not '${BRANCH}'."
     ;;
 esac
+
+# The checked-out tree is what the images are built from, so its HEAD is the
+# revision; BUILDKITE_COMMIT is the fallback for a checkout without git
+# metadata, and is not trusted first because it can read "HEAD" when a build
+# is created without a commit.
+REVISION="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || true)"
+if [[ ! "${REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
+  REVISION="${BUILDKITE_COMMIT:-}"
+fi
+if [[ ! "${REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
+  die "cannot tell which commit the images are built from: no git HEAD in ${REPO_ROOT} and BUILDKITE_COMMIT='${BUILDKITE_COMMIT:-}' is not a full commit SHA."
+fi
 
 # Docker Hub gets a release only from a build someone approved. A scheduled
 # nightly of a release branch skips the approval step, so it stops at GAR.
@@ -90,7 +109,7 @@ if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
     if [[ "${VLLM_REF}" =~ ^[0-9a-f]{40}$ ]]; then
       VLLM_REF="${VLLM_REF:0:7}"
     fi
-    DOCKERHUB_TAG="nightly-${DATE}-${BUILDKITE_COMMIT:0:7}-${VLLM_REF}"
+    DOCKERHUB_TAG="nightly-${DATE}-${REVISION:0:7}-${VLLM_REF}"
     DOCKERHUB_LATEST_TAG="nightly"
   fi
 
@@ -133,7 +152,8 @@ for TARGET in "${TARGETS[@]}"; do
   LATEST_IMAGE="${IMAGE_NAME}:${LATEST_TAG}"
 
   echo "--- :docker: Building Nightly Image (${TARGET}): ${DATE_IMAGE}"
-  ./docker/build_image.sh --target "${TARGET}" -t "${DATE_IMAGE}"
+  ./docker/build_image.sh --target "${TARGET}" -t "${DATE_IMAGE}" \
+    --label "org.opencontainers.image.revision=${REVISION}"
 
   echo "--- :docker: Tagging as ${LATEST_IMAGE}"
   docker tag "${DATE_IMAGE}" "${LATEST_IMAGE}"
