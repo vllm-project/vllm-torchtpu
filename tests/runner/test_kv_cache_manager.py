@@ -291,6 +291,9 @@ class TestKVCacheManager:
         self.runner.lora_slot_write_hbm_bytes.return_value = 0
         # No buffered hand-off, so no buffers are reserved for it.
         self.runner.pp_handoff_hbm_reserve_bytes.return_value = 0
+        # Dummy value. post_profile_hbm_reserves reads it to size the
+        # routed-experts reserve, which is 0 because capture is off.
+        self.runner.num_tokens_paddings = []
         self.runner.post_profile_hbm_reserves = (
             TPUModelRunner.post_profile_hbm_reserves.__get__(self.runner)
         )

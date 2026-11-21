@@ -168,6 +168,7 @@ from vllm_torchtpu.runner import (
     chunk_processors,
     greedy_top_tokens,
     prompt_logprobs,
+    routed_experts,
     spec_boundary_state,
     thinking_budget_tracker,
 )
@@ -718,6 +719,7 @@ class TPUModelRunner(GPUModelRunner):
     _dp_step_other_decode: bool = False
     _adaptive_verification: AdaptiveVerificationManager | None = None
     _thinking_budget: thinking_budget_tracker.ThinkingBudgetTracker | None = None
+    _routed_experts: routed_experts.RoutedExpertsCapture | None = None
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
     # pin's mask, whose dtype follows the draft tokens.
     _tp_rank0_confidence_mask: torch.Tensor | None = None
@@ -1965,6 +1967,18 @@ class TPUModelRunner(GPUModelRunner):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
         if self.pcp_manager is not None:
             self.pcp_manager.set_page_size(mla_kv_page_size(kv_cache_config))
+        if self.vllm_config.aux_output_config.enabled:
+            # Before warmup traces the backbone: a compiled forward keeps the
+            # hooks bound when it was traced.
+            self._routed_experts = routed_experts.RoutedExpertsCapture(
+                self.vllm_config, self.model, kv_cache_config
+            )
+
+    def close_routed_experts(self) -> None:
+        """Closes the routed-experts connector at shutdown, as vLLM's runner
+        does."""
+        if self._routed_experts is not None:
+            self._routed_experts.close()
 
     def _init_prefill_checkpoint_units(self, kv_cache_config: KVCacheConfig) -> None:
         """Initializes the units the worker places prefill checkpoints with.
@@ -4344,6 +4358,14 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
         # Update cached state
         self._update_states(scheduler_output)
+        if self._routed_experts is not None:
+            # Before the zero-token return below: a step that schedules no
+            # tokens can still be the only one that reports some requests as
+            # finished, and the connector releases a request only when it sees
+            # that report.
+            self._routed_experts.begin_step(
+                scheduler_output.aux_output_connector_metadata
+            )
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
@@ -4666,6 +4688,10 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
+                )
+            if self._routed_experts is not None:
+                self._routed_experts.take_forward(
+                    num_tokens_padded, int(self.query_start_loc_np[num_reqs])
                 )
 
             if nan_check is not None:
@@ -5917,6 +5943,13 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens_real_lens,
                     logprobs=logprobs_chunks,
                 )
+        routed_experts_output = None
+        if self._routed_experts is not None:
+            routed_experts_output = self._routed_experts.prepare_output(
+                req_ids,
+                scheduler_output.num_scheduled_tokens,
+                self.input_batch.num_computed_tokens_cpu[: len(req_ids)],
+            )
 
         if self.scheduler_config.async_scheduling:
             self._modify_prev_results()
@@ -6160,6 +6193,7 @@ class TPUModelRunner(GPUModelRunner):
                 model_runner_output=model_runner_output,
                 copy_state=copy_state,
                 discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
+                routed_experts=routed_experts_output,
             )
 
         if not self.scheduler_config.async_scheduling:
@@ -6404,6 +6438,9 @@ class TPUModelRunner(GPUModelRunner):
             kv_connector=utils.estimate_kv_connector_hbm_reserve(self.vllm_config),
             lora_slot_write=self.lora_slot_write_hbm_bytes(),
             pp_handoff=self.pp_handoff_hbm_reserve_bytes(),
+            routed_experts=routed_experts.hbm_reserve_bytes(
+                self.vllm_config, self.num_tokens_paddings
+            ),
         )
 
     def _initialize_pallas_kernels(self):
