@@ -558,14 +558,16 @@ def outside_warmup() -> Iterator[None]:
     For a module no ladder retraces: a token-count branch reads the caller's
     decision instead of leaving a guard, so the one trace serves every bucket,
     and nothing is left to a later trace that would never come. A guard that
-    still refuses a bucket raises here, at compile time.
+    still refuses a bucket raises here, at compile time. A :func:`trace_only`
+    scope is suspended too: a trace here compiles its buckets itself.
     """
-    global _session
-    saved, _session = _session, None
+    global _session, _deferred
+    saved = _session, _deferred
+    _session, _deferred = None, None
     try:
         yield
     finally:
-        _session = saved
+        _session, _deferred = saved
 
 
 def runnable_for(

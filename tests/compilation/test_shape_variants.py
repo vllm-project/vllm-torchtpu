@@ -1313,6 +1313,19 @@ def test_outside_warmup_suspends_the_window_and_restores_it():
     assert not shape_variants.in_warmup()
 
 
+def test_outside_warmup_suspends_trace_only_and_restores_it():
+    """A trace inside outside_warmup() compiles its buckets itself, also under
+    trace_only(): a backend that deferred there would hit defer()'s check for
+    a window, which outside_warmup() has suspended."""
+    with shape_variants.warmup(), shape_variants.trace_only() as deferred:
+        with shape_variants.outside_warmup():
+            assert not shape_variants.deferring()
+            assert not shape_variants.in_warmup()
+        assert shape_variants.deferring()
+        assert shape_variants._deferred is deferred
+    assert not shape_variants.deferring()
+
+
 def test_input_delta_names_the_int_input_one_trace_dropped():
     metas = _int_metas()
     sources = {"s_pos": POSITIONS_SIZE, "s_hid": HIDDEN_SIZE}
