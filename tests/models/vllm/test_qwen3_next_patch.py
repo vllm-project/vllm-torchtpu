@@ -14,6 +14,7 @@
 """Pin upstream Qwen3.5 MoE forwards and verify the trace-stable SP forward
 patch and the FP8 fusions."""
 
+import contextlib
 import hashlib
 import importlib
 import inspect
@@ -33,6 +34,8 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.models import qwen3_5, qwen3_5_mtp, qwen3_next, qwen3_next_mtp
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -1853,6 +1856,141 @@ def test_decoder_layer_step0_gather_keeps_the_requested_residual_rows(monkeypatc
         )
     torch.testing.assert_close(out, hidden[[1, 3]])
     torch.testing.assert_close(new_residual, residual[[1, 3]] + hidden[[1, 3]])
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "in_warmup", "rows"),
+    [(4, False, 16), (4, True, 4), (5, True, 8), (8, True, 8), (12, True, 16)],
+)
+def test_step0_gather_slices_to_4_or_8_rows_only_inside_a_warmup(
+    num_tokens, in_warmup, rows
+):
+    """Inside shape_variants.warmup() a step of at most 4 or 8 tokens gathers
+    the first 4 or 8 rows of the step-0 gather, which hold every request a
+    step that small can have; outside it, or at more tokens, the whole
+    gather."""
+    gather = torch.arange(16)
+    window = shape_variants.warmup() if in_warmup else contextlib.nullcontext()
+    with step0_post_attn_gather_context(gather), window:
+        effective = patch_mod._step0_effective_gather_indices(
+            torch.zeros((3, num_tokens))
+        )
+    assert torch.equal(effective, gather[:rows])
+
+
+class _Step0GatherMtpLayer:
+    """An MTP layer on the patched decoder-layer forward whose attention runs
+    the real post-attention gather (`_forward_qwen3_next_attn_from_qkv`). The
+    MoE stand-in records the rows it receives and the padding mask it reads
+    over them."""
+
+    use_attn_reduce_scatter_for_moe = False
+    layer_type = "full_attention"
+    layer_scale = False
+
+    def __init__(self):
+        self.attn, _ = _attn_from_qkv_layer()
+        self.moe_rows: list[int] = []
+        self.moe_masks: list[list[bool]] = []
+
+    def __call__(self, positions, hidden_states, residual):
+        return patched_decoder_layer_forward(self, hidden_states, residual, positions)
+
+    def input_layernorm(self, x, residual=None):
+        return x if residual is None else (x, residual)
+
+    def self_attn(self, hidden_states, positions):
+        qkv = hidden_states.repeat(1, 4)
+        return patch_mod._forward_qwen3_next_attn_from_qkv(self.attn, qkv, positions)
+
+    def post_attention_layernorm(self, x, residual):
+        return x, residual + x
+
+    def mlp(self, x):
+        self.moe_rows.append(x.shape[0])
+        mask = token_padding.padding_mask_for(x.shape[0], is_local_tensor=True)
+        self.moe_masks.append(mask.tolist())
+        return x
+
+
+def _step0_gather_mtp_forward(monkeypatch, num_tokens, in_warmup):
+    """patched_mtp_forward over `num_tokens` rows of 8 under a 16-row step-0
+    gather of 2 requests (last tokens at rows 1 and 3, padding gathers row 0),
+    with the padding mask written as Eagle3Proposer writes it for that gather
+    (2 valid rows of 16)."""
+    monkeypatch.setattr(
+        patch_mod,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    layer = _Step0GatherMtpLayer()
+    model = SimpleNamespace(
+        num_mtp_layers=1,
+        layers=[layer],
+        embed_input_ids=lambda ids: torch.zeros(ids.shape[0], 8),
+        pre_fc_norm_embedding=lambda x: x,
+        pre_fc_norm_hidden=lambda x: x,
+        fc=lambda x: x[:, 8:],
+        norm=lambda h, r: (h + r, r),
+    )
+    hidden = torch.arange(num_tokens * 8, dtype=torch.float32).reshape(-1, 8) / 64
+    gather = torch.tensor([1, 3] + [0] * 14)
+    padding = token_padding.TokenPaddingState.create(16, "cpu")
+    padding.update(2, 16)
+    window = shape_variants.warmup() if in_warmup else contextlib.nullcontext()
+    with (
+        token_padding.use_padding_state(padding),
+        step0_post_attn_gather_context(gather),
+        window,
+    ):
+        out = patched_mtp_forward(
+            model,
+            input_ids=torch.zeros(num_tokens, dtype=torch.long),
+            positions=torch.arange(num_tokens),
+            hidden_states=hidden,
+        )
+    return out, layer, hidden, gather
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "moe_rows"), [(4, 4), (8, 8), (16, 16)], ids=["T4", "T8", "T16"]
+)
+def test_mtp_forward_runs_a_sliced_step0_gather_and_pads_back(
+    monkeypatch, num_tokens, moe_rows
+):
+    """Traced inside shape_variants.warmup(), a step of at most 4 or 8 tokens
+    runs the post-attention layers on the first 4 or 8 gathered rows only, and
+    patched_mtp_forward pads the result back to the gather's 16 rows; those
+    rows equal the unsliced forward's, and the padding rows are zero."""
+    out, layer, hidden, gather = _step0_gather_mtp_forward(
+        monkeypatch, num_tokens, in_warmup=True
+    )
+    full, full_layer, _, _ = _step0_gather_mtp_forward(
+        monkeypatch, num_tokens, in_warmup=False
+    )
+
+    assert layer.moe_rows == [moe_rows]
+    assert full_layer.moe_rows == [16]
+    assert out.shape == full.shape == (16, 8)
+    # Attention gives a = 6 h sigmoid(h) on the gathered rows (2 h gated by
+    # sigmoid(h), o_proj * 3); the post-attention norm makes the residual
+    # h + a, and the final norm returns a + (h + a).
+    rows = hidden[gather[:moe_rows]]
+    torch.testing.assert_close(out[:moe_rows], 12 * rows * torch.sigmoid(rows) + rows)
+    torch.testing.assert_close(out[:moe_rows], full[:moe_rows])
+    assert not out[moe_rows:].any()
+
+
+def test_a_sliced_step0_gather_reads_the_padding_mask_over_its_rows(monkeypatch):
+    """Eagle3Proposer writes the step-0 gather's mask for all 16 rows (2
+    valid). The MoE on the 4-row slice reads its first 4 entries, which mark
+    the same rows padding as the full gather does: a step of at most 4 tokens
+    has at most 4 requests, all at the front of the gather."""
+    _, layer, _, _ = _step0_gather_mtp_forward(monkeypatch, 4, in_warmup=True)
+    _, full_layer, _, _ = _step0_gather_mtp_forward(monkeypatch, 4, in_warmup=False)
+
+    assert layer.moe_masks == [[False, False, True, True]]
+    assert full_layer.moe_masks == [[False, False] + [True] * 14]
 
 
 @pytest.fixture
