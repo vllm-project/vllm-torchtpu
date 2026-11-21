@@ -46,6 +46,9 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from tests.runner.runner_input_test_utils import (
+    attention_layer_mock as _attention_layer_mock,
+)
 from vllm_torchtpu import utils
 from vllm_torchtpu.core.runner_slot_mamba import RunnerSlotMambaSpec
 from vllm_torchtpu.layers.adapter.attention import (
@@ -66,18 +69,6 @@ from vllm_torchtpu.runner.kv_cache_manager import (
 )
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_worker import TPUWorker
-
-
-def _attention_layer_mock():
-    """An `Attention` mock whose `get_attn_backend()` returns a real backend.
-
-    `get_kv_cache_spec` measures page padding through the backend the layer
-    reports. A bare `MagicMock` returns a mock shape, which iterates as empty
-    and silently makes that arithmetic meaningless.
-    """
-    layer = MagicMock(spec=Attention)
-    layer.get_attn_backend.return_value = PallasAttentionBackend
-    return layer
 
 
 class DummyMamba(MambaBase):
@@ -210,12 +201,14 @@ def test_get_kv_cache_spec_sparse_mla(monkeypatch, layout):
     runner.vllm_config.attention_config = None  # no HiSparse
     runner.use_spmd = False
     runner._hybrid_uniform_page_size_bytes = None
+    runner._subpage_kernel_block_size = None
     runner._unified_kv_layout = False
     runner._mamba_num_blocks = None
     runner._uniform_mamba_layout = False
     runner.shared_kv_cache_layers = {}
     runner.runner_only_attn_layers = set()
     runner.speculative_config = None
+    runner.pcp_manager = None
     runner.kv_cache_manager = KVCacheManager(runner)
     runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(runner)
     mock_mla = MagicMock(spec=MLAAttention)
@@ -283,6 +276,7 @@ class TestKVCacheManager:
         self.runner.cache_config = vllm_config.cache_config
         self.runner.scheduler_config = vllm_config.scheduler_config
         self.runner._hybrid_uniform_page_size_bytes = None
+        self.runner._subpage_kernel_block_size = None
         self.runner.max_num_reqs = 16
         self.runner.max_model_len = 1024
         self.runner.max_num_tokens = 2048
@@ -292,9 +286,10 @@ class TestKVCacheManager:
         self.runner.runner_only_attn_layers = set()
         self.runner.enforce_eager = False
         self.runner.speculative_config = None
+        self.runner.pcp_manager = None
         # No LoRA, so adapter swaps reserve no HBM.
         self.runner.lora_slot_write_hbm_bytes.return_value = 0
-        # No ring hand-off, so no buffers are reserved for it.
+        # No buffered hand-off, so no buffers are reserved for it.
         self.runner.pp_handoff_hbm_reserve_bytes.return_value = 0
         self.runner.post_profile_hbm_reserves = (
             TPUModelRunner.post_profile_hbm_reserves.__get__(self.runner)
@@ -2572,6 +2567,7 @@ def test_dsv4_request_caps_match_runner_refresh():
             max_model_len=1048576,
             most_model_len=65536,
             max_num_reqs=64,
+            max_num_local_reqs=64,
             max_num_tokens=1024,
             block_size=1024,
             max_num_blocks_per_req=1024,
@@ -2731,6 +2727,7 @@ def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
         shared_kv_cache_layers={},
         runner_only_attn_layers=set(),
         _hybrid_uniform_page_size_bytes=None,
+        _subpage_kernel_block_size=None,
         _unified_kv_layout=False,
         _uniform_mamba_layout=False,
         _mamba_num_blocks=None,

@@ -683,10 +683,13 @@ def _patch_multiproc_worker_global_rank_env() -> None:
     this shim exposes the unified single-host DP*TP slice to TorchTPU without
     changing the worker rank arguments passed through vLLM.
     """
+    import contextlib
     import os as _os
 
+    from vllm.utils.system_utils import set_env_var
     from vllm.v1.executor.multiproc_executor import WorkerProc
 
+    from vllm_torchtpu.executors.worker_spawn import exclusive_spawn
     from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
     if getattr(WorkerProc, "_tpu_global_rank_env_patch", False):
@@ -695,40 +698,51 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
     def _wrapped(vllm_config, local_rank, rank, *args, **kwargs):
         pc = vllm_config.parallel_config
-        binding = get_tpu_worker_binding(pc, rank, local_rank, env=_os.environ)
-        _os.environ.update(binding.as_env())
-        # VLLM_TPU_DEVICE_ORDER lists a physical device per local rank, so
-        # consecutive ranks (a two-device pipeline stage) can sit on different
-        # chips; TorchTPU reads TPU_VISIBLE_DEVICES at import, hence set here.
-        order = envs.VLLM_TPU_DEVICE_ORDER
-        if order:
-            device = [int(x) for x in order.split(",")][binding.local_rank]
-            _os.environ["TPU_VISIBLE_CHIPS"] = str(device)
-            _os.environ["TPU_VISIBLE_DEVICES"] = str(device)
+        # The binding goes through the parent's os.environ, so a spawn's env
+        # writes and process start must not overlap another's, whichever
+        # thread MultiprocExecutor starts it from. Large pipes let the start
+        # return before the child has imported.
+        with exclusive_spawn(pc.local_world_size):
+            binding = get_tpu_worker_binding(pc, rank, local_rank, env=_os.environ)
+            env = binding.as_env()
+            # VLLM_TPU_DEVICE_ORDER lists a physical device per local rank,
+            # so consecutive ranks (a two-device pipeline stage) can sit on
+            # different chips; TorchTPU reads TPU_VISIBLE_DEVICES at import,
+            # hence set here.
+            order = envs.VLLM_TPU_DEVICE_ORDER
+            if order:
+                device = [int(x) for x in order.split(",")][binding.local_rank]
+                env["TPU_VISIBLE_CHIPS"] = str(device)
+                env["TPU_VISIBLE_DEVICES"] = str(device)
+                logger.info(
+                    "Applied TPU patch: worker spawn env local rank %d -> device %d "
+                    "(VLLM_TPU_DEVICE_ORDER=%s)",
+                    binding.local_rank,
+                    device,
+                    order,
+                )
             logger.info(
-                "Applied TPU patch: worker spawn env local rank %d -> device %d "
-                "(VLLM_TPU_DEVICE_ORDER=%s)",
+                "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
+                "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
+                "(rank=%d local_rank=%d dp_rank=%d dp_size=%d offset=%d "
+                "init_local_rank=%d)",
+                binding.rank,
                 binding.local_rank,
-                device,
-                order,
+                binding.world_size,
+                binding.local_world_size,
+                rank,
+                local_rank,
+                binding.dp_rank,
+                binding.dp_size,
+                binding.local_rank_offset,
+                binding.init_local_rank,
             )
-        logger.info(
-            "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
-            "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
-            "(rank=%d local_rank=%d dp_rank=%d dp_size=%d offset=%d "
-            "init_local_rank=%d)",
-            binding.rank,
-            binding.local_rank,
-            binding.world_size,
-            binding.local_world_size,
-            rank,
-            local_rank,
-            binding.dp_rank,
-            binding.dp_size,
-            binding.local_rank_offset,
-            binding.init_local_rank,
-        )
-        return _orig(vllm_config, local_rank, rank, *args, **kwargs)
+            # The child copies os.environ when it starts; restore the parent's
+            # afterwards so this binding does not leak into the next spawn.
+            with contextlib.ExitStack() as stack:
+                for name, value in env.items():
+                    stack.enter_context(set_env_var(name, value))
+                return _orig(vllm_config, local_rank, rank, *args, **kwargs)
 
     WorkerProc.make_worker_process = staticmethod(_wrapped)
     WorkerProc._tpu_global_rank_env_patch = True
@@ -740,12 +754,10 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
 
     patch_registry.apply("engine_core")
     from vllm_torchtpu.core.pp_chunk_scheduler import patch_engine_core_for_pp_chunks
-    from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
-    from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_handoff
+    from vllm_torchtpu.distributed.pp_engine import patch_executor_for_pp_buffered
 
-    patch_executor_for_pp_handoff(kwargs.get("vllm_config"))
+    patch_executor_for_pp_buffered(kwargs.get("vllm_config"))
     patch_engine_core_for_pp_chunks(kwargs.get("vllm_config"))
-    patch_engine_core_for_lazy_push(kwargs.get("vllm_config"))
 
     from vllm.v1.engine.core import EngineCoreProc
 
@@ -1996,9 +2008,17 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     Prevents TorchTPU from baking rank-specific integer literals into the MLIR
     graph as scalar constants, ensuring identical CompilationCacheKeys across
     all TP ranks.
+
+    Also where TPU_DP_VOCAB_PARALLEL takes effect: stock embeddings and lm_heads
+    built without a parallel group of their own shard over every DP x TP rank
+    instead of the TP group (layers/adapter/dp_vocab_parallel.py).
     """
+    import inspect
+
     import torch
     import vllm.model_executor.layers.vocab_parallel_embedding as vpe
+
+    from vllm_torchtpu.layers.adapter import dp_vocab_parallel
 
     if getattr(
         vpe.VocabParallelEmbedding, "_tpu_vocab_parallel_embedding_patch", False
@@ -2006,9 +2026,34 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
         return
 
     original_init = vpe.VocabParallelEmbedding.__init__
+    init_signature = inspect.signature(original_init)
 
     def patched_init(self, *args, **kwargs):
+        dp_vocab_group = None
+        # Only the stock classes, whose forward and logits path the DP-vocab
+        # module replaces; a subclass may run its own.
+        if envs.TPU_DP_VOCAB_PARALLEL and type(self) in (
+            vpe.VocabParallelEmbedding,
+            vpe.ParallelLMHead,
+        ):
+            call = init_signature.bind(self, *args, **kwargs)
+            call.apply_defaults()
+            arg = call.arguments
+            if (
+                arg["parallel_group"] is None
+                and not arg["disable_tp"]
+                and arg["reduce_results"]
+            ):
+                dp_vocab_group = dp_vocab_parallel.group_for_new_layer(
+                    arg["num_embeddings"],
+                    arg["org_num_embeddings"],
+                    arg["padding_size"],
+                )
+            if dp_vocab_group is not None:
+                kwargs["parallel_group"] = dp_vocab_group
         original_init(self, *args, **kwargs)
+        if dp_vocab_group is not None:
+            setattr(self, dp_vocab_parallel.DP_VOCAB_ATTR, True)
         if not hasattr(self, "org_vocab_start_index"):
             self.register_buffer(
                 "org_vocab_start_index",
@@ -2045,6 +2090,8 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             )
 
     def patched_forward(self, input_):
+        if getattr(self, dp_vocab_parallel.DP_VOCAB_ATTR, False):
+            return dp_vocab_parallel.embedding_forward(self, input_)
         input_mask = None
         if self.tp_size > 1:
             masked_input, input_mask = vpe.get_masked_input_and_mask(

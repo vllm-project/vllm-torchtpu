@@ -473,3 +473,16 @@ def test_local_rank_discovery_reuses_exported_group_size(monkeypatch):
     monkeypatch.delenv("RUNAI_STREAMER_PROCESS_GROUP_SIZE")
     with patch("torch.distributed.is_initialized", return_value=False):
         assert params.find_local_ranks() == (1, 0, [[0]])
+
+
+def test_ep_rank_is_dp_major_over_dp_pcp_tp():
+    """The EP rank the loader and TPU_DP_VOCAB_PARALLEL both assume."""
+    from vllm_torchtpu import utils
+
+    ranks = [
+        utils.ep_rank(dp_rank=d, pcp_rank=p, pcp_size=2, tp_rank=t, tp_size=3)
+        for d in range(2)
+        for p in range(2)
+        for t in range(3)
+    ]
+    assert ranks == list(range(12))

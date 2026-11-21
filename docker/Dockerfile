@@ -7,6 +7,12 @@
 # before the first FROM so that a FROM line can read it.
 ARG BUILD_VLLM_RS=false
 
+# Whether to include rvllm, the native Rust serving runtime, in the images
+# (docker/build_image.sh --experimental-rvllm-url URL). Declared before the
+# first FROM so that a FROM line can read it.
+ARG WITH_EXPERIMENTAL_RVLLM=false
+ARG EXPERIMENTAL_RVLLM_DOWNLOAD_URL=""
+
 # vllm-router (vllm-project/router), the prefill/decode router the
 # disaggregated benchmarks put in front of an engine pair. Built from source
 # in a stage of its own; the pin is a build arg so a run can try another
@@ -75,6 +81,42 @@ WORKDIR /out
 # The flag picks one of the two; BuildKit builds only the stage picked.
 FROM vllm-rs-${BUILD_VLLM_RS} AS vllm-rs
 
+# rvllm, the native Rust serving runtime, included when WITH_EXPERIMENTAL_RVLLM=true.
+# Off by default. EXPERIMENTAL_RVLLM_DOWNLOAD_URL is a location holding `rvllm`
+# and its `metadata.json`, the same as the launcher's --rvllm-binary location
+# (src/vllm_torchtpu/experimental/rust/README.md). The binary is checked against
+# the sha256 in metadata.json and run once.
+FROM python:3.12-slim-bookworm AS rvllm-true
+
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+ARG EXPERIMENTAL_RVLLM_DOWNLOAD_URL
+WORKDIR /out
+# TODO: support private gs:// buckets; a gs:// location is fetched over public
+# HTTPS.
+RUN set -e; \
+    url="${EXPERIMENTAL_RVLLM_DOWNLOAD_URL%/}"; \
+    case "${url}" in \
+      https://*) ;; \
+      gs://*) url="https://storage.googleapis.com/${url#gs://}" ;; \
+      "") echo "EXPERIMENTAL_RVLLM_DOWNLOAD_URL must be set when WITH_EXPERIMENTAL_RVLLM=true" >&2; exit 1 ;; \
+      *) echo "EXPERIMENTAL_RVLLM_DOWNLOAD_URL must be https:// or gs://: ${url}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "${url}/metadata.json" -o /tmp/rvllm-metadata.json; \
+    curl -fsSL "${url}/rvllm" -o /out/rvllm; \
+    sha="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["sha256"])' /tmp/rvllm-metadata.json)"; \
+    echo "${sha}  /out/rvllm" | sha256sum -c -; \
+    rm /tmp/rvllm-metadata.json; \
+    chmod 0755 /out/rvllm; \
+    /out/rvllm --version
+
+# WITH_EXPERIMENTAL_RVLLM=false: no rvllm binary.
+FROM python:3.12-slim-bookworm AS rvllm-false
+WORKDIR /out
+
+# The flag picks one of the two; BuildKit builds only the stage picked.
+FROM rvllm-${WITH_EXPERIMENTAL_RVLLM} AS rvllm
+
 # Variant 1: The Runtime (Base Image with pre-installed dependencies)
 # This variant provides the core runtime environment with all external dependencies
 # (including torch-tpu) pre-installed.
@@ -85,10 +127,12 @@ FROM python:3.12-slim-bookworm AS base
 
 # curl for health checks, git so uv can clone the vllm source dependency, the
 # toolchain for packages that build from source, libgoogle-perftools4 for the
-# tcmalloc allocator enabled below, and numactl for vLLM's --numa-bind, which
-# launches each worker under it. build-essential already pulls in gcc, g++,
-# make and libc6-dev.
-RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 numactl && rm -rf /var/lib/apt/lists/*
+# tcmalloc allocator enabled below, numactl for vLLM's --numa-bind, which
+# launches each worker under it, and libibverbs1, which the tpu-sync-torch
+# extension links (for its Peregrine transport) and so needs at import even
+# when nothing uses RDMA. build-essential already pulls in gcc, g++, make and
+# libc6-dev.
+RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 numactl libibverbs1 && rm -rf /var/lib/apt/lists/*
 
 # tcmalloc for every derived image. Set after the install above, so that
 # intermediate steps do not fail preloading a library that is not there yet.
@@ -136,6 +180,9 @@ RUN if [ -e /usr/local/bin/vllm-rs ]; then \
       test -d "$pkg" && \
       ln -s /usr/local/bin/vllm-rs "$pkg/vllm-rs"; \
     fi
+
+# The native Rust serving runtime (rvllm), with WITH_EXPERIMENTAL_RVLLM=true: on PATH.
+COPY --from=rvllm /out/ /usr/local/bin/
 
 
 # Variant 2: The CI Environment (CI/CD Variant)

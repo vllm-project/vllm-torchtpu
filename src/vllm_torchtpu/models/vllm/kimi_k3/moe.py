@@ -284,13 +284,19 @@ class KimiMoE(nn.Module):
             latent, _ = self.routed_expert_down_proj(latent)
         routed = self.experts.routed_experts
         if sequence_parallel:
-            weights, ids = moe_routing.route(routed, latent, router_logits)
+            method = cast(
+                "VllmCompressedTensorsW4ANMxfp4MoEMethod", routed.quant_method
+            )
+            weights, ids = moe_routing.route(
+                routed,
+                latent,
+                router_logits,
+                topk_weights_float32=method._tpu_topk_weights_float32,
+            )
             latent, weights, ids = group.gather_moe_inputs(
                 latent, weights, ids, num_experts=self.gate.output_size
             )
-            output = cast(
-                "VllmCompressedTensorsW4ANMxfp4MoEMethod", routed.quant_method
-            ).apply_with_routing(routed, latent, weights, ids)
+            output = method.apply_with_routing(routed, latent, weights, ids)
         else:
             output = routed.quant_method.apply_monolithic(routed, latent, router_logits)
         output = (

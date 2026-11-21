@@ -364,7 +364,7 @@ class _A2AGroup:
 
 def _a2a_merge_whole(outputs, lses, monkeypatch, wrong_destination=False):
     """Every rank's all-to-all merge, run in lockstep, reassembled over heads."""
-    monkeypatch.setattr(cp_mla, "_all_to_all", lambda x, group: group.all_to_all(x))
+    monkeypatch.setattr(cp_mla, "all_to_all", lambda x, group: group.all_to_all(x))
     world = outputs.shape[0]
     hub = _ExchangeHub(world, wrong_destination)
 
@@ -490,6 +490,122 @@ def test_merge_picks_the_all_to_all(
         outputs[0], lses[0], is_backbone=is_backbone
     )
     assert calls == ([tokens] if expect_a2a else [])
+
+
+# ===================================================================== #
+# DCP spanning TP x PCP (the PCP manager).
+# ===================================================================== #
+
+
+class _LockstepHub:
+    """Collectives between threads, one thread per DCP rank: every rank posts
+    its tensor and reads its peers'."""
+
+    def __init__(self, world):
+        self.slots = [None] * world
+        self.barrier = threading.Barrier(world)
+
+    def exchange(self, rank, x):
+        self.slots[rank] = x
+        self.barrier.wait()
+        got = list(self.slots)
+        self.barrier.wait()
+        return got
+
+
+class _SubGroup:
+    """`members` (DCP ranks, in group order) of a `_LockstepHub`."""
+
+    def __init__(self, hub, members, rank):
+        self.world_size = len(members)
+        self.rank_in_group = members.index(rank)
+        self._hub, self._members, self._rank = hub, members, rank
+
+    def _peers(self, x):
+        got = self._hub.exchange(self._rank, x)
+        return [got[m] for m in self._members]
+
+    def all_gather(self, tensor, dim=0):
+        return torch.cat(self._peers(tensor), dim=dim)
+
+    def reduce_scatter(self, tensor, dim=-1):
+        total = sum(self._peers(tensor))
+        width = total.shape[dim] // self.world_size
+        return total.narrow(dim, self.rank_in_group * width, width)
+
+    def all_reduce(self, tensor):
+        return sum(self._peers(tensor))
+
+
+@pytest.mark.parametrize("a2a", [False, True])
+@pytest.mark.parametrize("pcp_size,tp_size", [(2, 2), (2, 4), (4, 1)])
+def test_merge_spanning_pcp_matches_the_reference(pcp_size, tp_size, a2a, monkeypatch):
+    """DCP rank (p, t) holds TP lane t's heads of PCP position p: the merge
+    weights over every DCP rank and returns lane t's head block. The
+    all-to-all merge assumes distinct heads per DCP rank, so it is skipped."""
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", a2a, raising=False)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 256, raising=False
+    )
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_RS_OUT_PRECISION", False, raising=False)
+    world, local_heads = pcp_size * tp_size, 3
+    rng = np.random.default_rng(pcp_size * 10 + tp_size)
+    outputs = torch.from_numpy(
+        rng.standard_normal((world, 8, tp_size * local_heads, 16)).astype(np.float32)
+    )
+    lses = torch.from_numpy(
+        (rng.standard_normal((world, 8, tp_size * local_heads)) * 4).astype(np.float32)
+    )
+    lses[1, 5] = float("-inf")
+    hub = _LockstepHub(world)
+    groups = threading.local()
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: groups.dcp)
+    monkeypatch.setattr(cp_mla, "get_tp_group_or_none", lambda: groups.tp)
+    monkeypatch.setattr(cp_mla, "get_pcp_group", lambda: groups.pcp)
+
+    def run(rank):
+        p, t = divmod(rank, tp_size)
+        groups.dcp = _SubGroup(hub, list(range(world)), rank)
+        groups.tp = _SubGroup(hub, [p * tp_size + i for i in range(tp_size)], rank)
+        groups.pcp = _SubGroup(hub, [i * tp_size + t for i in range(pcp_size)], rank)
+        return cp_mla.merge_lse_partials_scatter_heads(
+            outputs[rank], lses[rank], spans_pcp=True
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(world) as pool:
+        got = list(pool.map(run, range(world)))
+    reference = _reference_merge(outputs, lses)
+    for rank, block in enumerate(got):
+        t = rank % tp_size
+        np.testing.assert_allclose(
+            block.numpy(),
+            reference[:, t * local_heads : (t + 1) * local_heads],
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg=f"DCP rank {rank}",
+        )
+
+
+@pytest.mark.parametrize("lane", [0, 1])
+def test_head_gather_spanning_pcp_uses_the_tp_group(lane, monkeypatch):
+    """Only TP lanes hold distinct heads, so the gather is over TP, never
+    over the DCP group."""
+    rng = np.random.default_rng(41)
+    per_lane = torch.from_numpy(rng.standard_normal((2, 6, 3, 8)).astype(np.float32))
+    monkeypatch.setattr(
+        cp_mla, "get_tp_group_or_none", lambda: _HeadGatherGroup(per_lane, lane)
+    )
+    monkeypatch.setattr(
+        cp_mla, "get_dcp_group", lambda: pytest.fail("used the DCP group")
+    )
+
+    got = cp_mla.all_gather_heads(per_lane[lane], spans_pcp=True)
+    np.testing.assert_array_equal(got.numpy(), torch.cat(list(per_lane), 1).numpy())
+    nope, pe = cp_mla.all_gather_q_nope_pe_heads(
+        per_lane[lane][..., :5], per_lane[lane][..., 5:], 5, spans_pcp=True
+    )
+    np.testing.assert_array_equal(nope.numpy(), got[..., :5].numpy())
+    np.testing.assert_array_equal(pe.numpy(), got[..., 5:].numpy())
 
 
 # ===================================================================== #

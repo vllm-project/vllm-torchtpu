@@ -13,7 +13,10 @@
 # limitations under the License.
 """Static checks for pipeline parallelism on TPU."""
 
+import os
 from typing import Any
+
+from vllm_torchtpu.distributed.kv_transfer.connector_names import kv_connector_names
 
 
 def _torch_tpu_builds_stage_meshes() -> bool:
@@ -44,19 +47,10 @@ _FULL_ATTENTION_LAYER_TYPES = [
 _RAIDEN_CONNECTORS = ("TPURaidenConnector", "TPURaidenOffloadingConnector")
 
 
-def _kv_connector_names(kv_transfer_config: Any) -> list[str]:
-    """The connector a config names, or the children of a TPUMultiConnector."""
-    name = kv_transfer_config.kv_connector
-    if name != "TPUMultiConnector":
-        return [name]
-    extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
-    return [child["kv_connector"] for child in extra.get("connectors", [])]
-
-
 def _non_raiden_connectors(kv_transfer_config: Any) -> list[str]:
     return [
         name
-        for name in _kv_connector_names(kv_transfer_config)
+        for name in kv_connector_names(kv_transfer_config, ("TPUMultiConnector",))
         if name not in _RAIDEN_CONNECTORS
     ]
 
@@ -85,16 +79,37 @@ def _stage_without_full_attention(vllm_config: Any) -> str | None:
     return None
 
 
+# Pipeline env vars that no longer exist, with what to do instead. Set, they
+# would otherwise be ignored and the pipeline would run differently from what
+# the deployment asked for.
+_REMOVED_PIPELINE_ENVS = {
+    "TPU_PP_HANDOFF": (
+        "the buffered point-to-point hand-off is the only one. Unset it."
+    ),
+    "TPU_PP_RING_DEPTH": "set TPU_PP_HANDOFF_DEPTH instead.",
+    "TPU_PP_LAZY_PUSH": (
+        "it timed the pushes of the removed lockstep hand-off. Unset it."
+    ),
+    "TPU_PP_DYNAMIC_CHUNKS": (
+        "set TPU_PP_LONE_PROMPT_CHUNKS and TPU_PP_EQUAL_COST_CHUNKS instead."
+    ),
+}
+
+
 def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     """Reject configurations the TPU pipeline-parallel path does not serve.
 
     Raises NotImplementedError naming the unsupported feature, and
-    ValueError for a ring hand-off depth below one or deeper than a
-    device's receive flags allow.
+    ValueError for a removed pipeline env var that is still set or a
+    buffered hand-off depth below one or deeper than a device's receive
+    flags allow.
     """
     parallel_config = vllm_config.parallel_config
     if parallel_config.pipeline_parallel_size <= 1:
         return
+    for name, remedy in _REMOVED_PIPELINE_ENVS.items():
+        if name in os.environ:
+            raise ValueError(f"{name} has been removed; {remedy}")
 
     unsupported = None
     remedy = ""
@@ -184,22 +199,20 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
             f"Pipeline parallelism on TPU does not support {unsupported} yet.{remedy}"
         )
     from vllm_torchtpu import envs
-    from vllm_torchtpu.distributed.pp_push import ring_handoff
 
-    if ring_handoff():
-        if envs.TPU_PP_RING_DEPTH < 1:
-            # A stage queues at most this many forwards for the next one; with
-            # none it could hand nothing on.
-            raise ValueError(
-                f"TPU_PP_RING_DEPTH must be at least 1, got {envs.TPU_PP_RING_DEPTH}."
-            )
-        # Counts the activations and, for a model whose layers share a top-k
-        # index table, that table; the ring checks again with the tensors
-        # the model hands on.
-        from vllm_torchtpu.distributed.pp_ring import check_ring_receives
-
-        hf_config = vllm_config.model_config.hf_text_config
-        carried = 2 if getattr(hf_config, "index_topk", None) is not None else 1
-        check_ring_receives(
-            parallel_config.pipeline_parallel_size, envs.TPU_PP_RING_DEPTH, carried
+    if envs.TPU_PP_HANDOFF_DEPTH < 1:
+        # A stage queues at most this many forwards for the next one; with
+        # none it could hand nothing on.
+        raise ValueError(
+            f"TPU_PP_HANDOFF_DEPTH must be at least 1, got {envs.TPU_PP_HANDOFF_DEPTH}."
         )
+    # Counts the activations and, for a model whose layers share a top-k
+    # index table, that table; the hand-off checks again with the
+    # tensors the model hands on.
+    from vllm_torchtpu.distributed.pp_buffered import check_buffered_receives
+
+    hf_config = vllm_config.model_config.hf_text_config
+    carried = 2 if getattr(hf_config, "index_topk", None) is not None else 1
+    check_buffered_receives(
+        parallel_config.pipeline_parallel_size, envs.TPU_PP_HANDOFF_DEPTH, carried
+    )

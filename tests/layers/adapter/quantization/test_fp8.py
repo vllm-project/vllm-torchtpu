@@ -1440,7 +1440,7 @@ class TestMoERequantizationChunks:
         # the requantized pair, so the chunked pass takes a fresh layer.
         torch.manual_seed(0)
         layer, _ = self._layer(device, torch.float8_e4m3fn)
-        monkeypatch.setattr(fp8_mod, "_REQUANT_CHUNK_BYTES", chunk_bytes)
+        monkeypatch.setenv("TPU_MOE_REQUANT_CHUNK_BYTES", str(chunk_bytes))
         chunked = fp8_mod._process_fp8_moe_weights(layer, **kwargs)
         self._same(whole, chunked)
 
@@ -1450,6 +1450,20 @@ class TestMoERequantizationChunks:
         torch.manual_seed(0)
         layer, chunk_bytes = self._layer(device, torch.bfloat16)
         whole = fp8_mod._quantize_bf16_moe_weights(layer, activation="silu")
-        monkeypatch.setattr(fp8_mod, "_REQUANT_CHUNK_BYTES", chunk_bytes)
+        monkeypatch.setenv("TPU_MOE_REQUANT_CHUNK_BYTES", str(chunk_bytes))
         chunked = fp8_mod._quantize_bf16_moe_weights(layer, activation="silu")
         self._same(whole, chunked)
+
+    def test_chunk_bytes_default(self, monkeypatch):
+        from vllm_torchtpu import envs
+
+        monkeypatch.delenv("TPU_MOE_REQUANT_CHUNK_BYTES", raising=False)
+        assert envs.TPU_MOE_REQUANT_CHUNK_BYTES == 1 << 30
+
+    @pytest.mark.parametrize("value", ["0", "-1"])
+    def test_chunk_bytes_rejects_non_positive(self, monkeypatch, value):
+        from vllm_torchtpu import envs
+
+        monkeypatch.setenv("TPU_MOE_REQUANT_CHUNK_BYTES", value)
+        with pytest.raises(ValueError):
+            envs.TPU_MOE_REQUANT_CHUNK_BYTES  # noqa: B018

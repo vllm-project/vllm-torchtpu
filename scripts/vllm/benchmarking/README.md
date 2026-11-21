@@ -203,6 +203,14 @@ Results are saved to `benchmark_runs/` (gitignored). Each run creates a director
 - `server.log` — vLLM server output
 - `benchmark.log` — run metadata
 
+`publish_perf_dashboard.py` sends a results directory's
+`isl<N>_osl<N>_c<N>.json` files to the Performance tab of
+[ci.vllm.ai](https://ci.vllm.ai/perf), next to the GPU runs of the same model.
+A perf step opts in with `UPLOAD_TO_VLLM_CI: "1"` in its `env`;
+`run_eval_flow.sh` then publishes that step's own results after the database
+upload, and skips it on PRs and non-main branches like that upload. `--dry-run`
+prints the rows without posting them.
+
 ## Environment Variables
 
 | Variable | Default | Description |

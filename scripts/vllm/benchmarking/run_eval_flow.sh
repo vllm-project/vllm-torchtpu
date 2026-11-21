@@ -428,4 +428,21 @@ fi
 
 python3 scripts/vllm/benchmarking/upload_results.py "${UPLOAD_ARGS[@]}" || echo "Warning: results upload failed"
 
+# Opt-in per step, and under the same guard as the database upload, so a PR's
+# numbers never reach the dashboard. SHAPE's topology is the slice's chips.
+if [ "${UPLOAD_TO_VLLM_CI:-0}" = "1" ] && [ "$SKIP_BENCHMARK" = "0" ] && [[ " ${UPLOAD_ARGS[*]} " != *" --skip-db-upload "* ]]; then
+    echo "=== Publishing to the ci.vllm.ai Performance tab ==="
+    topology="${SHAPE:-}"
+    topology="${topology#*/}"
+    if [[ ! "$topology" =~ ^[0-9]+(x[0-9]+)*$ ]] || [ -z "${TPU_ACCELERATOR_TYPE:-}" ] || [ -z "${WORKLOAD_IMAGE:-}" ]; then
+        echo "Warning: UPLOAD_TO_VLLM_CI needs SHAPE=<machine-type>/<topology>, TPU_ACCELERATOR_TYPE and WORKLOAD_IMAGE; not publishing"
+    else
+        python3 scripts/vllm/benchmarking/publish_perf_dashboard.py "$RESULTS_DIR" \
+            --device "$TPU_ACCELERATOR_TYPE" \
+            --chips "$(( ${topology//x/*} ))" \
+            --image "$WORKLOAD_IMAGE" ||
+            echo "Warning: ci.vllm.ai publish failed"
+    fi
+fi
+
 exit "$fail"

@@ -24,6 +24,8 @@ from PIL import Image
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
+from tests_omni.omni_test_utils import compare_video_to_golden
+
 
 @dataclass(frozen=True)
 class WanTestConfig:
@@ -167,50 +169,6 @@ def get_wan_golden_path(filename: str) -> str:
     return os.path.join(golden_dir, filename)
 
 
-def compare_wan_video_to_golden(
-    video: np.ndarray, golden: np.ndarray
-) -> dict[str, float]:
-    """Compare two uint8 [F, H, W, 3] videos with the Flux golden-test metrics.
-
-    Returns the mean per-frame MAE and SSIM (single window, per channel), the
-    largest per-channel mean shift, and the video-to-golden ratios of
-    high-frequency energy (mean absolute Laplacian: drops with blur, rises with
-    noise) and of motion (mean absolute difference between consecutive frames).
-    """
-    if video.shape != golden.shape:
-        raise ValueError(f"video shape {video.shape} != golden {golden.shape}")
-    x = video.astype(np.float64) / 255.0
-    y = golden.astype(np.float64) / 255.0
-    hw = (1, 2)
-    mu_x, mu_y = x.mean(hw, keepdims=True), y.mean(hw, keepdims=True)
-    cov = ((x - mu_x) * (y - mu_y)).mean(hw, keepdims=True)
-    var_x, var_y = x.var(hw, keepdims=True), y.var(hw, keepdims=True)
-    c1, c2 = 0.01**2, 0.03**2
-    ssim = (
-        (2 * mu_x * mu_y + c1)
-        * (2 * cov + c2)
-        / ((mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2))
-    )
-    hf_x, hf_y = (
-        np.abs(
-            4 * v[:, 1:-1, 1:-1]
-            - v[:, :-2, 1:-1]
-            - v[:, 2:, 1:-1]
-            - v[:, 1:-1, :-2]
-            - v[:, 1:-1, 2:]
-        ).mean()
-        for v in (x, y)
-    )
-    motion_x, motion_y = (np.abs(np.diff(v, axis=0)).mean() for v in (x, y))
-    return {
-        "mae": float(np.abs(x - y).mean()),
-        "ssim": float(ssim.mean()),
-        "mean_shift": float(np.abs(mu_x.mean(0) - mu_y.mean(0)).max()),
-        "hf_ratio": float(hf_x / max(hf_y, 1e-9)),
-        "motion_ratio": float(motion_x / max(motion_y, 1e-9)),
-    }
-
-
 GOLDEN_PROMPT = (
     "A serene cinematic drone shot gliding smoothly over ancient "
     "snow-covered pagodas in the mist, golden sunrise reflections on river ice, "
@@ -340,7 +298,7 @@ def assert_wan_golden_parity(video_arr: np.ndarray, config: WanTestConfig) -> No
     golden = load_and_verify_wan_golden(config)
     # Same uint8 rounding as the golden generator.
     video_u8 = np.round(np.clip(video_arr, 0, 1) * 255).astype(np.uint8)
-    golden_metrics = compare_wan_video_to_golden(video_u8, golden)
+    golden_metrics = compare_video_to_golden(video_u8, golden)
     mae_max, ssim_min, shift_max = config.limits
     hf_lo, hf_hi = HF_ENERGY_RATIO_RANGE
     motion_lo, motion_hi = MOTION_RATIO_RANGE

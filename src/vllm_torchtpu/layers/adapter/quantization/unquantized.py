@@ -72,6 +72,11 @@ from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     should_quantize_on_load,
 )
+from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+    VllmFp8Config,
+    VllmFp8LinearMethodTPU,
+    VllmFp8MoEMethodTPU,
+)
 from vllm_torchtpu.layers.core.quant_methods import UNQUANTIZED, get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
@@ -197,11 +202,6 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             # Skip kv_b_proj: MLAAttention slices W_UK_T/W_UV from unquantized
             # kv_b_proj.weight and quantizes them separately after loading.
             if should_quantize_on_load(prefix) and "kv_b_proj" not in prefix.split("."):
-                from vllm_torchtpu.layers.adapter.quantization.fp8 import (
-                    VllmFp8Config,
-                    VllmFp8LinearMethodTPU,
-                )
-
                 fp8_config = VllmFp8Config(
                     is_checkpoint_fp8_serialized=False,
                     activation_scheme="dynamic",
@@ -223,6 +223,19 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         if isinstance(layer, RoutedExperts):
             # For MoE layers, use our custom TPU implementation
             moe_config = self.get_moe_config(layer)
+            if should_quantize_on_load(prefix):
+                if moe_config.has_bias:
+                    raise NotImplementedError(
+                        f"QUANTIZE_ON_LOAD_PREFIXES matched {prefix}, but FP8 MoE "
+                        "on-load quantization does not support expert bias"
+                    )
+                # BF16 experts are quantized to the MOE_REQUANTIZE_* format
+                # (per-channel FP8 by default) after loading.
+                fp8_config = VllmFp8Config(
+                    is_checkpoint_fp8_serialized=False,
+                    activation_scheme="dynamic",
+                )
+                return VllmFp8MoEMethodTPU(fp8_config, moe_config)
             return VllmUnquantizedFusedMoEMethod(moe_config)
 
         if isinstance(layer, Attention):
@@ -338,6 +351,7 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         prebuild_fused_moe_kernel(
+            topk_weights_float32=self._tpu_topk_weights_float32,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
@@ -360,9 +374,15 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
-        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        topk_weights, topk_ids = moe_routing.route(
+            layer,
+            x,
+            router_logits,
+            topk_weights_float32=self._tpu_topk_weights_float32,
+        )
 
         kwargs = {
+            "topk_weights_float32": self._tpu_topk_weights_float32,
             "hidden_states": x,
             "w1": layer.w13_weight,
             "w2": layer.w2_weight,

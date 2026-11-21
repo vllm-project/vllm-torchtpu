@@ -17,12 +17,20 @@ from __future__ import annotations
 
 import inspect
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
+import jax
+import jax.experimental.topologies as jax_topologies
+import numpy as np
 import pytest
 import torch
 import torch.fx.experimental._config as fx_config
+from jax.sharding import PartitionSpec as P
 from torch import nn
 from torch._dynamo import mark_dynamic
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv, statically_known_true
+from torch_tpu._internal.pallas import pallas as pallas_impl
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import CompilationMode, VllmConfig, set_current_vllm_config
 from vllm.model_executor.models import ModelRegistry
@@ -38,6 +46,8 @@ import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
 import vllm_torchtpu.models.vllm.kimi_k3.model as kimi_model
 import vllm_torchtpu.models.vllm.kimi_k3.moe as kimi_moe
 from vllm_torchtpu.compilation.shape_variants import trace_shape_env, unsupported_reason
+from vllm_torchtpu.distributed import pallas_shapes
+from vllm_torchtpu.kernels.kimi_k3.collectives import ring_tables
 from vllm_torchtpu.layers import register_layers
 from vllm_torchtpu.layers.adapter.custom_ops import kda_attention_op as kimi_custom_ops
 from vllm_torchtpu.models.vllm.kimi_k3 import (
@@ -46,8 +56,17 @@ from vllm_torchtpu.models.vllm.kimi_k3 import (
     KimiLinearForCausalLM,
     KimiModel,
     MultiHeadLatentAttention,
+    collective_ops,
+)
+from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import (
+    SP_AXIS_NAME,
+    FusedPrefillCollectives,
+    TokenShardCollectives,
 )
 from vllm_torchtpu.models.vllm.kimi_k3.layers import AttentionResidual, SituAndMul
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 @pytest.fixture(autouse=True)
@@ -1961,13 +1980,15 @@ def test_sp_moe_reduces_latent_before_norm_and_up_projection(monkeypatch, gather
     model.shared_experts = None
     model.experts = SimpleNamespace(
         routed_experts=SimpleNamespace(
-            quant_method=SimpleNamespace(apply_with_routing=experts)
+            quant_method=SimpleNamespace(
+                apply_with_routing=experts, _tpu_topk_weights_float32=False
+            )
         )
     )
     monkeypatch.setattr(
         module.moe_routing,
         "route",
-        lambda *args: (torch.full((1, 2), 0.5), torch.tensor([[3, 9]])),
+        lambda *args, **kwargs: (torch.full((1, 2), 0.5), torch.tensor([[3, 9]])),
     )
     dtype = torch.float32 if gather_mode == "plain" else torch.bfloat16
     x = torch.tensor([[1.0, 3.0, 4.0, 6.0]], dtype=dtype)
@@ -2633,3 +2654,334 @@ def test_kimi_k3_encoder_cudagraph_capture_rejects_budget_past_rope_table() -> N
         KimiK3ForConditionalGeneration.prepare_encoder_cudagraph_capture_inputs(
             stub, 1000, 1, 1, torch.device("cpu"), torch.float32
         )
+
+
+@pytest.fixture
+def k3_collective_ops_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[SimpleNamespace]:
+    """Build Kimi-K3 collective ops on an isolated 32-device tpu7x_2x2x4 mesh."""
+    topology = jax_topologies.get_topology_desc("tpu7x_2x2x4")
+    devices = list(topology.devices)
+    world_size = len(devices)
+    owners = tuple(range(world_size))
+    mesh = jax.sharding.Mesh(np.array(devices), (SP_AXIS_NAME,))
+    tables = ring_tables(devices, owners)
+
+    monkeypatch.setattr(pallas_impl, "get_global_shape", pallas_shapes.get_global_shape)
+    monkeypatch.setattr(pallas_impl, "get_local_shape", pallas_shapes.get_local_shape)
+    monkeypatch.setattr(collective_ops, "_OPS", {})
+    monkeypatch.setattr(collective_ops, "_mesh_and_tables", lambda: (mesh, tables))
+    monkeypatch.setattr(collective_ops, "ep_rank_order", lambda: owners)
+    monkeypatch.setattr(
+        collective_ops,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            world_size=world_size, rank_in_group=0, ranks=list(owners)
+        ),
+    )
+    vars(collective_ops)["_build_token_op"].cache_clear()
+    previous_ignore_forward_compatibility = bool(
+        jax.config.jax_export_ignore_forward_compatibility
+    )
+    jax.config.update("jax_export_ignore_forward_compatibility", val=True)
+
+    # Geometry defined once here matching the Kimi-K3 collective_ops builders:
+    # hidden 7168, MLA widths 1536/512/64/384, gather-project 1792,
+    # MoE latent 3584 with top-8 routing and 384 experts.
+    pair_size = 2  # Two logical devices per physical chip in mla_chip_layout.
+    mla_widths = (1536, 512, 64, 384)
+    try:
+        prefill = FusedPrefillCollectives("model.layers.0.attn")
+        pack_op, mla_op = prefill.mla_ops(1e-6)
+        yield SimpleNamespace(
+            mesh=mesh,
+            world_size=world_size,
+            pair_size=pair_size,
+            rows_per_rank=128,
+            hidden=7168,
+            mla_widths=mla_widths,
+            packed_gate_width=(world_size // pair_size) * mla_widths[3],
+            moe_latent_width=3584,
+            moe_topk=8,
+            moe_num_experts=384,
+            gather_project_width=1792,
+            prefill=prefill,
+            pack_op=pack_op,
+            mla_op=mla_op,
+            token_tp32=TokenShardCollectives(
+                SimpleNamespace(world_size=world_size, rank_in_group=0)
+            ),
+            token_tp2=TokenShardCollectives(
+                SimpleNamespace(world_size=pair_size, rank_in_group=0)
+            ),
+        )
+    finally:
+        jax.config.update(
+            "jax_export_ignore_forward_compatibility",
+            val=previous_ignore_forward_compatibility,
+        )
+        vars(collective_ops)["_build_token_op"].cache_clear()
+        # Release 32-device StableHLO export tables between CPU pytest items.
+        jax.clear_caches()
+
+
+def test_kimi_k3_collective_ops_size_outputs_per_rank(
+    k3_collective_ops_env: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify every K3 collective op builds a JaxCallable with per-rank outputs."""
+    env = k3_collective_ops_env
+    world_size = env.world_size
+    rows = env.rows_per_rank
+    full_rows = rows * world_size
+    pair_rows = rows * env.pair_size
+    hidden = env.hidden
+    mla_widths = env.mla_widths
+    gate_width = mla_widths[3]
+
+    mla_x = torch.zeros((rows, hidden), dtype=torch.bfloat16)
+    mla_weight = torch.zeros((hidden, sum(mla_widths)), dtype=torch.bfloat16)
+    mla_packed_gate = torch.zeros((hidden, env.packed_gate_width), dtype=torch.bfloat16)
+    qnorm = torch.ones((mla_widths[0],), dtype=torch.bfloat16)
+    kvnorm = torch.ones((mla_widths[1],), dtype=torch.bfloat16)
+
+    cases = (
+        (
+            "pack_mla_gate",
+            env.pack_op,
+            (mla_weight,),
+            [(hidden, env.packed_gate_width)],
+            [(hidden * world_size, env.packed_gate_width)],
+        ),
+        (
+            "mla_preprocess_sequence_parallel",
+            env.mla_op,
+            (mla_x, mla_weight, mla_packed_gate, qnorm, kvnorm, True),
+            [(full_rows, width) for width in mla_widths],
+            [(full_rows * world_size, width) for width in mla_widths],
+        ),
+        (
+            "mla_preprocess_replicated",
+            env.mla_op,
+            (mla_x, mla_weight, mla_packed_gate, qnorm, kvnorm, False),
+            [(rows, width) for width in mla_widths],
+            [(full_rows, width) for width in mla_widths],
+        ),
+        (
+            "moe_gather",
+            vars(env.prefill)["_moe_gather_op"],
+            (
+                torch.zeros((rows, env.moe_latent_width), dtype=torch.bfloat16),
+                torch.zeros((rows, env.moe_topk), dtype=torch.bfloat16),
+                torch.zeros((rows, env.moe_topk), dtype=torch.int32),
+            ),
+            [
+                (full_rows, env.moe_latent_width),
+                (full_rows, env.moe_topk),
+                (full_rows, env.moe_topk),
+            ],
+            [
+                (full_rows, env.moe_latent_width),
+                (full_rows, env.moe_topk),
+                (full_rows, env.moe_topk),
+            ],
+        ),
+        (
+            "ring_all_gather",
+            env.prefill.ag,
+            (mla_x,),
+            [(full_rows, hidden)],
+            [(full_rows, hidden)],
+        ),
+        (
+            "ring_reduce_scatter",
+            env.prefill.rs,
+            (torch.zeros((full_rows, hidden), dtype=torch.bfloat16),),
+            [(rows, hidden)],
+            [(full_rows, hidden)],
+        ),
+        (
+            "project_reduce_scatter",
+            env.prefill.project_rs,
+            (
+                torch.zeros((full_rows, gate_width), dtype=torch.bfloat16),
+                torch.zeros((gate_width, hidden), dtype=torch.bfloat16),
+            ),
+            [(rows, hidden)],
+            [(full_rows, hidden)],
+        ),
+        (
+            "gather_project",
+            env.prefill.gather_project,
+            (
+                mla_x,
+                torch.zeros((hidden, env.gather_project_width), dtype=torch.bfloat16),
+            ),
+            [(full_rows, env.gather_project_width)],
+            [(full_rows * world_size, env.gather_project_width)],
+        ),
+        (
+            "token_tp32_all_gather",
+            env.token_tp32.ag,
+            (mla_x,),
+            [(full_rows, hidden)],
+            [(full_rows * world_size, hidden)],
+        ),
+        (
+            "token_tp32_reduce_scatter",
+            env.token_tp32.rs,
+            (torch.zeros((full_rows, hidden), dtype=torch.bfloat16),),
+            [(rows, hidden)],
+            [(full_rows, hidden)],
+        ),
+        (
+            "token_tp2_all_gather",
+            env.token_tp2.ag,
+            (mla_x,),
+            [(pair_rows, hidden)],
+            [(pair_rows * world_size, hidden)],
+        ),
+        (
+            "token_tp2_reduce_scatter",
+            env.token_tp2.rs,
+            (torch.zeros((pair_rows, hidden), dtype=torch.bfloat16),),
+            [(rows, hidden)],
+            [(full_rows, hidden)],
+        ),
+    )
+
+    recorded: list[tuple[int, ...]] = []
+
+    def stub_empty(
+        shape: tuple[int, ...],
+        *,
+        dtype: torch.dtype | None = None,
+        **_kwargs: object,
+    ) -> torch.Tensor:
+        """Allocate CPU placeholders instead of device buffers."""
+        return torch.zeros(shape, dtype=dtype or torch.bfloat16)
+
+    def stub_call_custom_kernel(
+        _name: str,
+        _fingerprint: str,
+        *,
+        output_shapes: list[torch.Tensor],
+        **_kwargs: object,
+    ) -> list[torch.Tensor]:
+        """Record placeholder shapes built by JaxCallable.__call__."""
+        recorded.extend(tuple(out.shape) for out in output_shapes)
+        return output_shapes
+
+    monkeypatch.setattr(torch, "empty", stub_empty)
+    monkeypatch.setattr(
+        pallas_impl.tpu_torch_pallas,
+        "register_custom_kernel",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        pallas_impl.tpu_torch_pallas,
+        "call_custom_kernel",
+        stub_call_custom_kernel,
+    )
+
+    for name, custom_op, inputs, expected_local, expected_global in cases:
+        callable_obj = vars(custom_op)["_init_fn"]
+        assert type(callable_obj) is pallas_impl.JaxCallable, name
+        specs = callable_obj.output_partition_specs
+        assert isinstance(specs, tuple), name
+        assert len(specs) == len(expected_local), name
+        assert all(isinstance(spec, P) for spec in specs), name
+
+        recorded.clear()
+        callable_obj(*inputs)
+        assert recorded == expected_local, name
+
+        jax_args = [
+            pallas_impl.jax_placeholder(arg, env.mesh, spec)
+            if isinstance(arg, torch.Tensor)
+            else arg
+            for arg, spec in zip(
+                inputs, callable_obj.input_partition_specs, strict=True
+            )
+        ]
+        exported = callable_obj.exported(*jax_args)
+        actual_global = [tuple(aval.shape) for aval in exported.out_avals]
+        assert actual_global == expected_global, name
+
+
+def test_kimi_k3_collective_ops_preserve_fake_tensor_shapes(
+    k3_collective_ops_env: SimpleNamespace,
+) -> None:
+    """Verify FakeTensorMode preserves symbolic batch rows across K3 collective ops."""
+    env = k3_collective_ops_env
+    hidden = env.hidden
+    mla_widths = env.mla_widths
+    gate_width = mla_widths[3]
+
+    shape_env = ShapeEnv()
+    with FakeTensorMode(shape_env=shape_env):
+        local_rows = shape_env.create_unbacked_symint()
+        torch.sym_constrain_range_for_size(local_rows, min=1)
+        full_rows = local_rows * env.world_size
+        pair_rows = local_rows * env.pair_size
+        x_local = torch.empty((local_rows, hidden), dtype=torch.bfloat16)
+        x_full = torch.empty((full_rows, hidden), dtype=torch.bfloat16)
+        x_pair = torch.empty((pair_rows, hidden), dtype=torch.bfloat16)
+        mla_weight = torch.empty((hidden, sum(mla_widths)), dtype=torch.bfloat16)
+        packed = env.pack_op(mla_weight)
+        assert packed.shape == (hidden, env.packed_gate_width)
+        for sequence_parallel, expected_rows in (
+            (True, full_rows),
+            (False, local_rows),
+        ):
+            mla_outs = env.mla_op(
+                x_local,
+                mla_weight,
+                packed,
+                torch.empty((mla_widths[0],), dtype=torch.bfloat16),
+                torch.empty((mla_widths[1],), dtype=torch.bfloat16),
+                sequence_parallel,
+            )
+            for out_tensor, width in zip(mla_outs, mla_widths, strict=True):
+                assert statically_known_true(out_tensor.shape[0] == expected_rows)
+                assert out_tensor.shape[1] == width
+        moe_outs = env.prefill.gather_moe_inputs(
+            torch.empty((local_rows, env.moe_latent_width), dtype=torch.bfloat16),
+            torch.empty((local_rows, env.moe_topk), dtype=torch.bfloat16),
+            torch.empty((local_rows, env.moe_topk), dtype=torch.int32),
+            num_experts=env.moe_num_experts,
+        )
+        moe_widths = (env.moe_latent_width, env.moe_topk, env.moe_topk)
+        for out_tensor, width in zip(moe_outs, moe_widths, strict=True):
+            assert statically_known_true(out_tensor.shape[0] == full_rows)
+            assert out_tensor.shape[1] == width
+        for out_tensor, expected_rows, width in (
+            (env.prefill.all_gather(x_local, dim=0), full_rows, hidden),
+            (env.prefill.reduce_scatter(x_full, dim=0), local_rows, hidden),
+            (
+                env.prefill.gather_project(
+                    x_local,
+                    torch.empty(
+                        (hidden, env.gather_project_width), dtype=torch.bfloat16
+                    ),
+                ),
+                full_rows,
+                env.gather_project_width,
+            ),
+            (
+                env.prefill.project_rs(
+                    torch.empty((full_rows, gate_width), dtype=torch.bfloat16),
+                    torch.empty((gate_width, hidden), dtype=torch.bfloat16),
+                ),
+                local_rows,
+                hidden,
+            ),
+            (env.token_tp32.all_gather(x_local, dim=0), full_rows, hidden),
+            (env.token_tp32.reduce_scatter(x_full, dim=0), local_rows, hidden),
+            (env.token_tp2.all_gather(x_local, dim=0), pair_rows, hidden),
+            (env.token_tp2.reduce_scatter(x_pair, dim=0), local_rows, hidden),
+        ):
+            assert isinstance(out_tensor.shape[0], torch.SymInt)
+            assert statically_known_true(out_tensor.shape[0] == expected_rows)
+            assert out_tensor.shape[1] == width

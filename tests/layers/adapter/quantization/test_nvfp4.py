@@ -75,6 +75,8 @@ class FakeRoutedExperts(RoutedExperts):
         self.expert_placement_strategy = "linear"
         self.activation = FakeActivation(activation)
         self.use_grouped_topk = False
+        # Set by VllmMoERunner; moe_routing.route reads it.
+        self.capture_fn = None
 
 
 def make_linear_layer(input_size: int = 64, output_size: int = 32) -> LinearBase:
@@ -488,7 +490,7 @@ class TestNvfp4MoEMethod:
             assert mock_load.call_count == 2
             mock_reg.assert_called_once_with(layer, device=layer.w13_weight.device)
             mock_prebuild.assert_called_once_with(
-                topk=2, activation="silu", use_ep=False
+                topk_weights_float32=False, topk=2, activation="silu", use_ep=False
             )
 
         assert layer.w13_weight.shape == (E, H, two_i)

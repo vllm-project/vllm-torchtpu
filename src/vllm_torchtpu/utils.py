@@ -26,6 +26,7 @@ from vllm import utils
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.math_utils import largest_divisor as largest_divisor
 
 GBYTES = 1024 * 1024 * 1024
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -46,14 +47,6 @@ def enable_megacore() -> None:
 
 def get_megacore() -> bool:
     return _megacore
-
-
-def largest_divisor(x: int, cap: int) -> int:
-    """Largest divisor of `x` that is <= `cap`."""
-    for candidate in range(min(x, cap), 0, -1):
-        if x % candidate == 0:
-            return candidate
-    return 1
 
 
 def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
@@ -79,13 +72,29 @@ def min_over_group(value: int, cpu_group: Any) -> int:
     return int(t.item())
 
 
+def dp_engines_in_lockstep(parallel_config) -> bool:
+    """Whether EP couples the DP engines. Their MoE combine reduces partial
+    expert outputs across engines, so every engine must enter the same
+    collectives with matching token buckets each step; uncoupled DP engines
+    stay independently schedulable."""
+    return get_dp_size(parallel_config) > 1 and parallel_config.enable_expert_parallel
+
+
+def ep_rank(
+    *, dp_rank: int, tp_rank: int, tp_size: int, pcp_rank: int = 0, pcp_size: int = 1
+) -> int:
+    """vLLM's EP rank of a DP x PCP x TP rank: the EP group spans all three,
+    DP-major."""
+    return (dp_rank * pcp_size + pcp_rank) * tp_size + tp_rank
+
+
 def min_across_ep_dp(parallel_config, value: int) -> int:
     """Return the minimum of `value` across the DP engines coupled by EP.
 
     EP-coupled engines must compile identical programs, so a value baked into
     them (such as the KV cache size) has to agree; uncoupled engines keep theirs.
     """
-    if get_dp_size(parallel_config) == 1 or not parallel_config.enable_expert_parallel:
+    if not dp_engines_in_lockstep(parallel_config):
         return value
     from vllm.distributed.parallel_state import get_dp_group
 
@@ -225,7 +234,7 @@ class HbmReserves(NamedTuple):
       kv_connector:    what the KV connector allocates, such as the offload
                        H2D staging pool.
       lora_slot_write: what an adapter swap holds while it runs.
-      pp_handoff:      what the pipeline ring hand-off's buffers take.
+      pp_handoff:      what the buffered pipeline hand-off's buffers take.
     """
 
     kv_connector: int

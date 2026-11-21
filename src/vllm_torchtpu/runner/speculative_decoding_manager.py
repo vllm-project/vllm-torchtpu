@@ -185,8 +185,9 @@ class SpeculativeDecodingManager:
             this step (host-seed path only; the device paths derive this
             on-device).
           scheduler_output: vLLM SchedulerOutput; carries the per-step spec
-            token budget for ngram and the partial-prefill next-token lookup
-            for eagle3.
+            token budget (ngram, and the host drafts of the other proposers
+            under dynamic speculative decoding) and the partial-prefill
+            next-token lookup for eagle3.
           return_device: return the device drafts instead of caching a host
             list: one exact ``[num_reqs, K]`` tensor (eagle3) or one bucketed
             tensor per chunk (bucketed-draft proposers).
@@ -257,7 +258,16 @@ class SpeculativeDecodingManager:
                 assert isinstance(result, torch.Tensor | list)
                 return result
             assert isinstance(result, list)
-            self._draft_token_ids = cast("list[list[int]]", result)
+            draft_token_ids = cast("list[list[int]]", result)
+            if self.runner.speculative_config.uses_dynamic_speculative_decoding():
+                # The drafter always proposes num_speculative_tokens. Under
+                # async scheduling the scheduler's placeholders already cap the
+                # next step's drafts at this step's K; in sync mode it schedules
+                # every draft it gets, so cut them here, as upstream proposers do.
+                assert scheduler_output is not None
+                k = scheduler_output.num_spec_tokens_to_schedule
+                draft_token_ids = [drafts[:k] for drafts in draft_token_ids]
+            self._draft_token_ids = draft_token_ids
             return None
         else:
             raise NotImplementedError(

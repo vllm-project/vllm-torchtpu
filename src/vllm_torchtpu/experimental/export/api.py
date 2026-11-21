@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
@@ -97,13 +98,16 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
         emit_byte_tokenizer: Whether to emit a synthetic byte-level tokenizer.json
             (valid only for vocab_size <= 256 in small test models).
         hf_checkpoint_dir: Optional path to the HuggingFace checkpoint directory
-            containing tokenizer.json, generation_config.json, and safetensors
-            headers.
+            containing config.json, tokenizer.json, generation_config.json,
+            tokenizer_config.json, and safetensors headers.
         speculative_config: Speculative decoding the runtime runs, recorded as
             `serving_config.speculative_config` (vLLM's field names); None for none.
         max_verify_tokens: The draft tokens a step can verify beyond the drafter's,
             such as tokens a grammar forces: a recurrent model keeps a checkpoint per
             verify token, as it does per draft token. 0 for only the drafter's.
+        additional_config: Optional JSON-serializable backend/runtime configuration
+            copied from `vllm_config.additional_config` and recorded as
+            `serving_config.additional_config` when non-empty; None for none.
     """
 
     vocab_size: int = 151936
@@ -125,8 +129,14 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     uses_mrope: bool = False
     speculative_config: dict[str, Any] | None = None
     max_verify_tokens: int = 0
+    additional_config: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.additional_config is not None:
+            try:
+                json.dumps(self.additional_config)
+            except TypeError as exc:
+                raise TypeError("additional_config must be JSON-serializable") from exc
         if self.max_verify_tokens < 0:
             raise ValueError(
                 f"max_verify_tokens must be >= 0, got {self.max_verify_tokens}"

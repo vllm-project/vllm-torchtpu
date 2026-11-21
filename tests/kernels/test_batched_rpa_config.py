@@ -82,3 +82,30 @@ def test_calculate_block_sizes_generation(
         )
         assert decode_blocks.bq_sz >= decode_blocks.bq_c_sz >= expected_bq_c_min
         assert prefill_blocks.bq_sz >= prefill_blocks.bq_c_sz >= expected_bq_c_min
+
+
+@pytest.mark.parametrize("scale", ["dynamic_k_scale", "dynamic_v_scale"])
+def test_prepared_inputs_rejects_dynamic_scales(scale):
+    """Dynamic KV scales are applied by prepare_inputs, not alongside it."""
+    q = jnp.zeros((8, 2, 128), jnp.bfloat16)
+    kv = jnp.zeros((8, 1, 128), jnp.float8_e4m3fn)
+    tpu_info = _create_mock_tpu_info(7, chip_version="v7x")
+    tpu_info.num_sublanes = 8
+    with patch("jax.experimental.pallas.tpu.get_tpu_info", return_value=tpu_info):
+        prepared = wrapper.prepare_inputs(q, kv, kv, q.dtype, kv.dtype)
+        cache = jnp.zeros(
+            wrapper.get_kv_cache_shape(1, 128, 1, 128, kv.dtype), kv.dtype
+        )
+        with pytest.raises(ValueError, match=scale):
+            wrapper.ragged_paged_attention(
+                q,
+                kv,
+                kv,
+                cache,
+                jnp.array([8], jnp.int32),
+                jnp.array([0], jnp.int32),
+                jnp.array([0, 8], jnp.int32),
+                jnp.array([0, 0, 1], jnp.int32),
+                prepared_inputs=prepared,
+                **{scale: jnp.ones((8, 1), jnp.float32)},
+            )

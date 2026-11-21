@@ -132,13 +132,13 @@ class GDNConfig:
 
     @property
     def triangular_block_size(self) -> int:
-        """Sub-block size of the chunked KDA intra-chunk solve.
+        """Sub-block size of the chunked GDN and KDA intra-chunk solves.
 
-        The diagonal sub-blocks are evaluated on the VPU/XLU with exact
-        pairwise gate differences and the off-diagonal ones as MXU GEMMs,
-        so this trades the two units off against each other: raising it
-        moves work from MXU to XLU. More value heads already means more
-        XLU work, hence the smaller blocks there.
+        The diagonal sub-blocks are evaluated on the VPU/XLU (forward
+        substitution, plus KDA's exact pairwise gate differences) and the
+        off-diagonal ones as MXU GEMMs, so this trades the two units off
+        against each other: raising it moves work from MXU to XLU. More value
+        heads already means more XLU work, hence the smaller blocks there.
         """
         # Within-block forward substitution issues head_groups * B / 2 broadcasts
         # per token. At 1 head group (<= 8 heads), B = 16 is optimal.
@@ -146,14 +146,24 @@ class GDNConfig:
         #   B inversely with head_groups (head_groups * B <= 16).
         # - KDA also tiles Aqk and L into O(1 / B^2) sub-block matmuls per token,
         #   so scale B^2 inversely with head_groups (head_groups * B**2 <= 16**2).
-        head_groups = pl.cdiv(self.num_v_heads, 8)
+        #
+        # B must divide the chunk: the intra-chunk solve walks the chunk in
+        # whole sub-blocks and `invert_triangular_matrix` rejects a non-dividing
+        # B (e.g. 24 local value heads, Qwen3.5/3.6-27B at TP=2, would get
+        # B = 16 // 3 = 5, which does not divide a 128-row chunk).
+        # Chunk sizes are powers of two, so pick the largest power of two
+        # that satisfies the budget instead of the exact quotient.
+        head_groups = pl.cdiv(self.num_v_heads, self.HEADS_PER_GROUP)
         if self.is_kda:
             for b in (16, 8, 4):
                 if head_groups * b * b <= 256:
                     return b
             return 2
         # GDN: between-block updates scale as 1 / B.
-        return max(2, min(16, 16 // head_groups))
+        for b in (16, 8, 4):
+            if head_groups * b <= 16:
+                return b
+        return 2
 
     @property
     def use_recurrent(self) -> bool:
@@ -215,14 +225,47 @@ class GDNConfig:
     # wrapper sizes the tile against the same factor.
     DEFAULT_VMEM_FRACTION: ClassVar[float] = 0.80
     WINDOWED_VMEM_FRACTION: ClassVar[float] = 0.90
+    # 64 MiB TPU v7x VMEM capacity where dynamic tile timings were calibrated;
+    # capping heuristic sizing here prevents larger-VMEM chips from picking
+    # untimed tiles.
+    CALIBRATED_VMEM_CAPACITY_BYTES: ClassVar[int] = 64 * 1024 * 1024
+    # One TPU sublane group of 8 value heads; sizes triangular_block_size head
+    # groups and gates the KDA full-group prefill chunk cap.
+    HEADS_PER_GROUP: ClassVar[int] = 8
+    # Once n_v >= HEADS_PER_GROUP fills one sublane group, C = 64 saturates the
+    # KDA intra-chunk pipeline while C = 128 doubles per-token off-diagonal work.
+    MAX_KDA_FULL_GROUP_CHUNK: ClassVar[int] = 64
+    # Cap decode tiles at 16 sequences: larger tiles increase per-slot state DMA
+    # descriptors and register spills without reducing per-slot compute.
+    DECODE_TILE_SIZES: ClassVar[tuple[int, ...]] = (16, 8, 4, 2, 1)
+    MIXED_TILE_SIZES: ClassVar[tuple[int, ...]] = (128, 64, 32, 16, 8, 4, 2, 1)
 
     @classmethod
-    def get_vmem_limit_bytes(cls, window_size: int = 1) -> int:
-        """Returns the VMEM limit for a kernel keeping window_size checkpoints."""
+    def get_vmem_limit_bytes(
+        cls,
+        window_size: int = 1,
+        vmem_capacity_bytes: int | None = None,
+    ) -> int:
+        """Return the VMEM limit for a kernel keeping window_size checkpoints."""
+        capacity = (
+            pltpu.get_tpu_info().vmem_capacity_bytes
+            if vmem_capacity_bytes is None
+            else vmem_capacity_bytes
+        )
         fraction = (
             cls.WINDOWED_VMEM_FRACTION if window_size > 1 else cls.DEFAULT_VMEM_FRACTION
         )
-        return int(fraction * pltpu.get_tpu_info().vmem_capacity_bytes)
+        return int(fraction * capacity)
+
+    @classmethod
+    def get_tiling_vmem_limit_bytes(cls, window_size: int = 1) -> int:
+        """Return heuristic VMEM budget capped at CALIBRATED_VMEM_CAPACITY_BYTES."""
+        return min(
+            cls.get_vmem_limit_bytes(window_size),
+            cls.get_vmem_limit_bytes(
+                window_size, vmem_capacity_bytes=cls.CALIBRATED_VMEM_CAPACITY_BYTES
+            ),
+        )
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:
         conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)

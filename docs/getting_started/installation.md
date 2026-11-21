@@ -35,6 +35,7 @@ Choose your preferred installation method below:
 ## Prerequisites
 
 - **Python 3.12** (`>=3.12,<3.13`). Pre-built `tpu-sync-torch` and `torch_tpu` wheels target CPython 3.12.
+- **`libibverbs.so.1`**. The `tpu-sync-torch` extension links it and fails to import without it. The project's Docker image installs it; on a host or in a container that lacks it, install your distribution's `libibverbs1` package (for example `apt-get install libibverbs1`).
 - We recommend using `uv` for installing dependencies as it is significantly faster than standard `pip`.
 
 ---

@@ -430,6 +430,9 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
         return None
     if qm._tpu_activation_str != "silu":
         return None
+    if qm._tpu_topk_weights_float32:
+        # The kernel rounds the top-k weights to bfloat16.
+        return None
     if getattr(layer, "w13_bias", None) is not None or (
         getattr(layer, "w2_bias", None) is not None
     ):

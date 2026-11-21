@@ -330,25 +330,40 @@ def make_attention_cache_tensor(
 def can_share_attention_cache(
     specs: Sequence[KVCacheSpec],
     attn_backend: Any,
+    kernel_block_size: int | None = None,
 ) -> bool:
+    """Return whether `AttentionSpec`s can share one 4D region tensor.
+
+    `kernel_block_size` is the page size the pool is built with; `None` uses
+    the smallest `block_size` in `specs`. Specs may differ in `block_size`
+    when each one is a multiple of `kernel_block_size` and `split` native
+    kernel pages divide `page_size_bytes`.
+    """
     if not specs:
         return False
     first = specs[0]
     if not isinstance(first, AttentionSpec):
         return False
+    attn_specs: list[AttentionSpec] = []
     for spec in specs:
         if (
             not isinstance(spec, AttentionSpec)
             or isinstance(spec, MLAAttentionSpec)
             or spec.dtype != first.dtype
-            or spec.block_size != first.block_size
             or spec.page_size_bytes != first.page_size_bytes
         ):
             return False
+        attn_specs.append(spec)
+    if kernel_block_size is None:
+        kernel_block_size = min(s.block_size for s in attn_specs)
+    for spec in attn_specs:
+        if spec.block_size % kernel_block_size != 0:
+            return False
+        split = spec.block_size // kernel_block_size
         shape = attn_backend.get_kv_cache_shape(
-            1, spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype
+            1, kernel_block_size, spec.num_kv_heads, spec.head_size, spec.dtype
         )
-        if spec.page_size_bytes % (math.prod(shape) * spec.dtype.itemsize):
+        if spec.page_size_bytes % (split * math.prod(shape) * spec.dtype.itemsize):
             return False
     return True
 
@@ -358,10 +373,14 @@ def materialize_shared_attention_cache(
     layer_specs: Sequence[tuple[str, AttentionSpec]],
     tensor_size: int,
     num_blocks: int,
+    kernel_block_size: int,
     attn_backend: Any,
     device: torch.device,
 ) -> torch.Tensor:
-    """Allocate one tensor for attention groups sharing scheduler pages."""
+    """Allocate one tensor for attention groups sharing scheduler pages.
+
+    Axis 1 is `kernel_block_size`, the page size the block tables index.
+    """
     if not layer_specs:
         raise ValueError("layer_specs must contain an attention layer")
     spec = layer_specs[0][1]
@@ -370,20 +389,21 @@ def materialize_shared_attention_cache(
     for name, layer_spec in layer_specs:
         if (
             layer_spec.dtype != spec.dtype
-            or layer_spec.block_size != spec.block_size
+            or layer_spec.block_size % kernel_block_size != 0
             or layer_spec.page_size_bytes * num_blocks != tensor_size
         ):
             raise ValueError(f"Incompatible shared KV cache spec for {name}")
+        split = layer_spec.block_size // kernel_block_size
         shape = tuple(
             attn_backend.get_kv_cache_shape(
-                num_blocks,
-                spec.block_size,
+                num_blocks * split,
+                kernel_block_size,
                 layer_spec.num_kv_heads,
                 layer_spec.head_size,
                 spec.dtype,
             )
         )
-        if page_elements % math.prod(shape[1:]):
+        if page_elements % (split * math.prod(shape[1:])):
             raise ValueError(
                 f"Shared pool page must contain whole native pages for {name}"
             )
@@ -391,15 +411,15 @@ def materialize_shared_attention_cache(
     pool_shape = shapes[0]
     if (
         any(shape != pool_shape for shape in shapes)
-        or math.prod(pool_shape[1:]) != page_elements
+        or math.prod(pool_shape) != num_blocks * page_elements
     ):
         # Keep the packed dtype axis separate when reinterpreting head shapes.
         packing = 4 // spec.dtype.itemsize
         pool_shape = (
             num_blocks,
-            spec.block_size,
+            kernel_block_size,
             packing,
-            page_elements // (spec.block_size * packing),
+            page_elements // (kernel_block_size * packing),
         )
     return torch.zeros(pool_shape, dtype=spec.dtype, device=device)
 
