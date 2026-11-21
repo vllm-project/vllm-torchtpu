@@ -205,10 +205,9 @@ def build_routing_tables(
 
 
 def local_routed_rows(routing, shard, *, routed_rows_per_shard):
-    """`routing.routed_row` rebased onto this shard's routed rows. A pair
-    of another
-    shard is sent to routed_rows_per_shard, past the end, which a scatter with
-    mode="drop" ignores (never negative: that would wrap)."""
+    """`routing.routed_row` rebased onto this shard's routed rows. A pair of
+    another shard is sent to routed_rows_per_shard, past the end, which a
+    scatter with mode="drop" ignores (never negative: that would wrap)."""
     base = shard * routed_rows_per_shard
     return jnp.where(
         routing.routed_row < base,
