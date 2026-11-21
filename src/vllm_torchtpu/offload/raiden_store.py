@@ -121,6 +121,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Seconds the offload controller waits for every worker to register.
+_DEFAULT_EXPECTED_WORKERS_TIMEOUT_S = 600
+
 # Upper bound (seconds) on a scheduler-side drain of in-flight store/load
 # jobs whose source/destination blocks are about to be reused.
 _DRAIN_TIMEOUT_S = envs.VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S
@@ -332,6 +335,14 @@ class RaidenOffloadingManager(OffloadingManager):
         if store is None:
             from tpu_sync.api.torch.kv_cache_manager import _torch_impl
 
+            # The controller waits RAIDEN_EXPECTED_WORKERS_TIMEOUT_S (tpu_sync
+            # default 120 s) for every worker to register. A worker's
+            # KVCacheManager takes 100-145 s to build for GLM-5.2 with an 800
+            # GiB tier, longest on the head pod's first pipeline stage.
+            os.environ.setdefault(
+                "RAIDEN_EXPECTED_WORKERS_TIMEOUT_S",
+                str(_DEFAULT_EXPECTED_WORKERS_TIMEOUT_S),
+            )
             store_types = _torch_impl()
             logger.info(
                 "TPURaidenOffloadingConnector: blocking KVCacheStore construction "
