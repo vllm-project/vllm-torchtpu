@@ -588,6 +588,31 @@ def test_a_mesh_naming_another_chip_is_refused(
     assert "local_experts" not in armed
 
 
+def test_a_refused_layer_logs_no_kernel_settings(armed, monkeypatch):
+    """The weight-load check builds the served config without logging it:
+    a layer the transport refuses (here EP 6) leaves no settings line, which
+    is logged once the operation is built."""
+    lines = []
+    monkeypatch.setattr(v3.logger, "info_once", lambda msg, *a, **k: lines.append(msg))
+    monkeypatch.setattr(v3, "build_ep_mesh", lambda: _mesh(6))
+    layer = _layer(slots=4)
+    layer.global_num_experts = 24
+    assert not _prebuild(layer)
+    assert not [m for m in lines if "settings for" in m], lines
+
+
+def test_the_tp_width_outside_a_config_context_is_one(monkeypatch):
+    """vLLM's get_current_vllm_config raises AssertionError when no config is
+    set (outside set_current_vllm_config, as in the warm-up traces); the
+    width then reads 1, which is why prebuild records it at weight load."""
+    from vllm.config import get_current_vllm_config
+
+    monkeypatch.setattr("vllm.config.vllm._current_vllm_config", None)
+    with pytest.raises(AssertionError):
+        get_current_vllm_config()
+    assert v3._tensor_parallel_size() == 1
+
+
 @pytest.mark.parametrize("ep", [6, 64])
 def test_a_mesh_width_the_transport_cannot_take_is_refused(armed, monkeypatch, ep):
     """The transport takes a power-of-two mesh of at most MAX_SHARDS (32)."""

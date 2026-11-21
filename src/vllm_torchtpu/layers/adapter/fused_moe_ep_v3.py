@@ -47,8 +47,9 @@ these export and padding constraints:
 - with padding skipped (`TPU_MOE_SKIP_PADDED_TOKENS`), each rank's valid-row
   count is the kernel's `valid_tokens` operand: the select kernel routes a
   row past it nowhere and the transport zeroes its input row, so nothing of
-  it travels; its output row is padding the caller drops, with no defined
-  value. A rank with no valid rows still takes part in every collective.
+  it travels; its output row comes back as zero (`fused_ep_moe`'s contract)
+  and is padding the caller drops. A rank with no valid rows still takes part
+  in every collective.
 """
 
 import dataclasses
@@ -142,14 +143,18 @@ def apply_config_overrides(config: Config, overrides: Mapping[str, Any]) -> Conf
 
 
 def served_config(
-    *, hidden: int, inter: int, experts_per_shard: int, top_k: int
+    *, hidden: int, inter: int, experts_per_shard: int, top_k: int, log: bool = True
 ) -> Config:
     """The kernel's own settings for this shape (Config.for_shape), logged
-    once so every precision and structural choice is on record."""
+    once so every precision and structural choice is on record. The
+    weight-load check passes log=False: a layer it refuses never runs these
+    settings, so they are logged when the operation is built."""
     config = Config.for_shape(
         hidden=hidden, inter=inter, experts_per_shard=experts_per_shard, top_k=top_k
     )
     config = apply_config_overrides(config, _CONFIG_OVERRIDES)
+    if not log:
+        return config
     logger.info_once(
         "Fused EP MoE (latest kernel) settings for hidden=%d inter=%d "
         "experts_per_shard=%d top_k=%d: tile_rows=%d weight_format=%s "
@@ -530,12 +535,18 @@ def _expert_block_permutation(ep: int, device) -> torch.Tensor | None:
 
 
 def check_kernel_threshold(ep: int, tp: int, lowtok_cap: int = 0) -> None:
-    """The fused EP kernel and the few-token kernel meet at one row count, so
-    no step falls to the grouped-matmul path between them. Row counts are per
-    MoE call across the node: the few-token cap is in those units already (a
-    step's rows replicated under tensor parallelism, an engine's rows gathered
-    from every engine under data parallelism). ``lowtok_cap`` is the
-    few-token kernel's row cap, 0 when that kernel is not armed; then the
+    """Refuse thresholds that leave a gap between the few-token kernel and the
+    fused EP kernel. Without tensor parallelism the two meet at one row
+    count, so no step falls to the grouped-matmul path between them. Under
+    tensor parallelism the fused kernel takes only the sequence-parallel
+    steps, and a step between the few-token cap and the sequence-parallel
+    threshold takes the routed grouped-matmul path (the rule logged below
+    names that range); what must meet is the first sequence-parallel step's
+    share per rank and the fused kernel's gate. Row counts are per MoE call
+    across the node: the few-token cap is in those units already (a step's
+    rows replicated under tensor parallelism, an engine's rows gathered from
+    every engine under data parallelism). ``lowtok_cap`` is the few-token
+    kernel's row cap, 0 when that kernel is not armed; then the
     grouped-matmul path is the kernel below the fused one by choice."""
     if lowtok_cap <= 0:
         return
@@ -952,7 +963,11 @@ def _unsupported_kernel_reason(
                 f"least {LANES}"
             )
         config = served_config(
-            hidden=hidden, inter=inter, experts_per_shard=local_experts, top_k=topk
+            hidden=hidden,
+            inter=inter,
+            experts_per_shard=local_experts,
+            top_k=topk,
+            log=False,
         )
         try:
             transport.check_width(mesh.shape[EP_AXIS_NAME])
@@ -990,9 +1005,11 @@ def _tensor_parallel_size() -> int:
     Read off the config, not off `get_tp_group()`: the group coordinator is a
     mutable singleton that a draft model's weight load rewrites to width 1.
     """
-    try:
-        from vllm.config import get_current_vllm_config
+    from vllm.config import get_current_vllm_config
 
+    try:
         return int(get_current_vllm_config().parallel_config.tensor_parallel_size)
-    except Exception:  # noqa: BLE001 - no config outside a served model
+    except AssertionError:
+        # vLLM raises this when no config is set: outside a
+        # set_current_vllm_config() context, as in the warm-up traces.
         return 1
