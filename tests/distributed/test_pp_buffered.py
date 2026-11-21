@@ -124,7 +124,7 @@ def _build(monkeypatch, stages, columns=1, side=False, depth=2, transport=None):
     sharing one fake transport; keyed by (stage, column)."""
     from vllm.distributed import parallel_state
 
-    from vllm_torchtpu.distributed import pcp
+    from vllm_torchtpu.distributed import pipeline_stage
 
     transport = transport or _Transport(stride=columns)
     monkeypatch.setattr(torch.distributed, "isend", transport.isend)
@@ -149,9 +149,17 @@ def _build(monkeypatch, stages, columns=1, side=False, depth=2, transport=None):
         ),
     )
     monkeypatch.setattr(
-        pcp,
-        "get_pcp_group",
-        lambda: SimpleNamespace(rank_in_group=current["column"], world_size=columns),
+        pipeline_stage,
+        "get_pipeline_stage",
+        lambda: pipeline_stage.PipelineStage(
+            index=current["stage"],
+            count=stages,
+            ranks=tuple(
+                range(current["stage"] * columns, (current["stage"] + 1) * columns)
+            ),
+            position=current["column"],
+            group=None,
+        ),
     )
     handoffs = {}
     for stage in range(stages):

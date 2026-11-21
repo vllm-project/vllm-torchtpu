@@ -88,6 +88,8 @@ class Topology:
 
     @property
     def topology_name(self) -> str:
+        if self.pp > 1 and self.ptp > 1:
+            return f"pp{self.pp}tp{self.ptp}_prefill"
         if self.pp > 1:
             return f"pp{self.pp}pcp{self.pcp}_prefill"
         return f"pcp{self.pcp}tp{self.ptp}_prefill"
@@ -161,6 +163,10 @@ PCP4_TP2_ONE_KV_HEAD = Topology(
     key_heads=8,
     value_heads=32,
     layers_per_stage=4,
+)
+# TP inside each pipeline stage, into data-parallel decode replicas.
+PP2_TP2 = Topology(
+    pp=2, pcp=1, ptp=2, dtp=2, dcp=1, kv_heads=2, key_heads=16, value_heads=32, ddp=2
 )
 
 TOKENS = [1, 127, 128, 129, 1000, 3072, 8192, 8191, 12345]
@@ -409,6 +415,7 @@ def _produce(monkeypatch, topo: Topology, num_tokens: int, per_layer_tags: bool)
     )
     config = scheduler.vllm_config
     config.parallel_config.pipeline_parallel_size = topo.pp
+    config.parallel_config.world_size = topo.pp * topo.pcp * topo.ptp
     config.parallel_config.cp_kv_cache_interleave_size = KERNEL_PAGE
     config.kv_transfer_config.kv_connector_extra_config = {
         "destination_decode_context_parallel_size": topo.dcp
@@ -472,18 +479,20 @@ def _produce(monkeypatch, topo: Topology, num_tokens: int, per_layer_tags: bool)
                 facade = _FakeRaidenControllerFacade()
                 worker._raiden_controller_facade = facade
                 worker._raiden_controller_address = CONTROLLER
+                position = p * topo.ptp + t
                 with (
                     patch(
                         "vllm.distributed.parallel_state.get_pp_group",
                         return_value=SimpleNamespace(rank_in_group=stage),
                     ),
                     patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=p),
+                    patch(
+                        "vllm_torchtpu.distributed.pipeline_stage._STAGE",
+                        SimpleNamespace(position=position),
+                    ),
                 ):
                     rank = worker._local_raiden_transfer_rank()
-                    expected_rank = (
-                        stage * topo.pcp + p if topo.pp > 1 else p * topo.ptp + t
-                    )
-                    assert rank == expected_rank
+                    assert rank == stage * topo.pcp * topo.ptp + position
                     worker._validate_stage3_transfer_parallelism(topo.units)
                     unit = _unit(worker._raiden_work_unit_fields(rank))
                     worker._raiden_work_unit = unit
@@ -574,7 +583,7 @@ def _decode_request(monkeypatch, topo: Topology, params: dict, per_layer_tags: b
     worker.vllm_config.parallel_config.decode_context_parallel_size = topo.dcp
     _set_model(worker.vllm_config, topo)
     assert worker._raiden_qwen35_admission_topology() == (
-        f"dp{topo.ddp}tp{topo.dtp}_decode"
+        f"dp{topo.ddp}{f'tp{topo.dtp}' if topo.dtp > 1 else ''}_decode"
         if topo.ddp > 1
         else f"tp{topo.dtp}dcp{topo.dcp}_decode"
     )
@@ -823,7 +832,7 @@ def _check_fa_copy_dealing(topo: Topology, registrations: dict) -> None:
             if class_tag(entry.tag) != "fa":
                 continue
             for span in entry.spans:
-                copy = span.dst_unit_ordinal % dst_replicas // topo.dcp
+                copy = (span.dst_unit_ordinal or 0) % dst_replicas // topo.dcp
                 assert copy % src_replicas == replica, (unit, span)
 
 
@@ -907,6 +916,31 @@ def test_replicated_fa_head_deals_copies_oracle(monkeypatch, num_tokens):
         if class_tag(entry.tag) == "fa" and entry.spans
     }
     assert senders == {0, 1}
+
+
+@pytest.mark.parametrize(
+    "dtp,kv_heads",
+    [(2, 2), (2, 1), (4, 4), (1, 2)],
+    ids=["tp2", "tp2-one-kv-head", "tp4", "tp1"],
+)
+@pytest.mark.parametrize("num_tokens", TOKENS)
+def test_pp2_tp2_to_dp2_oracle(monkeypatch, dtp, kv_heads, num_tokens):
+    topo = dataclasses.replace(PP2_TP2, dtp=dtp, kv_heads=kv_heads)
+    registrations, transfer = _run_oracle(monkeypatch, topo, num_tokens, True)
+    assert len(transfer["src_units"]) == 4
+    assert len(transfer["dst_units"]) == dtp
+    fan_out = max(1, dtp // topo.ptp)
+    for unit, entries in registrations.items():
+        stage, t = divmod(_unit_rank(unit), topo.ptp)
+        # Each stage's units declare only that stage's layers.
+        assert {split_layer_tag(entry.tag)[1] for entry in entries} <= set(
+            topo.stage_layers(stage)
+        )
+        # A TP worker's KV and GDN heads reach the decode workers holding
+        # them: the one at its TP rank, two of TP4, or the only one of TP1.
+        expected = {None} if dtp == 1 else set(range(t * fan_out, (t + 1) * fan_out))
+        for entry in entries:
+            assert {span.dst_unit_ordinal for span in entry.spans} == expected
 
 
 def test_oracle_rejects_a_misrouted_span(monkeypatch):

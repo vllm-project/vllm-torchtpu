@@ -150,6 +150,9 @@ def _run_worker(result_dir: Path) -> None:
             group_name="pp_buffered_test",
         )
         from vllm_torchtpu.distributed import pp_buffered
+        from vllm_torchtpu.distributed.pipeline_stage import init_pipeline_stage
+
+        init_pipeline_stage()
 
         template = {
             "hidden_states": ((HIDDEN,), torch.bfloat16),
