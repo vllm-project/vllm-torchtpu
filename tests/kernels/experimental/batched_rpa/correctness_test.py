@@ -1200,7 +1200,11 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         from the same rules (their compute thresholds and VMEM differ), so
         there it checks only the decode lane count; the numerical comparison
         runs on every chip."""
-        on_tpu7x = pltpu.get_tpu_info().chip_version == pltpu.ChipVersion.TPU_7X
+        # Read the chip only on a TPU: elsewhere the helper skips the test.
+        on_tpu7x = (
+            jtu.is_device_tpu_at_least(version=4)
+            and pltpu.get_tpu_info().chip_version == pltpu.ChipVersion.TPU_7X
+        )
         self._test_ragged_paged_attention(
             [(4, 5000), (4, 1000), (4, 4300), (4, 600), (4, 2000), (300, 3100)],
             (4, 1),
