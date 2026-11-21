@@ -67,10 +67,20 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 # Suffixes of per-expert tensors that are safe to skip for non-local
-# experts. Anything else (dense, shared experts, gate, norms) is fetched by
-# every rank. ``.scale`` is DeepSeek-V4's per-expert block scale
-# (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts.
-_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
+# experts. Anything else (dense, shared experts, gate, norms, and NVFP4
+# ``.input_scale`` scalars needed for global activation-scale reductions) is
+# fetched by every rank. ``.scale`` is DeepSeek-V4's per-expert block scale
+# (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts;
+# ``.weight_scale_inv`` is block-scaled FP8's per-expert inverse scale; and
+# ``.weight_scale_2`` is ModelOpt NVFP4's per-expert global weight scale.
+_EXPERT_WEIGHT_SUFFIXES = (
+    ".weight",
+    ".weight_packed",
+    ".weight_scale",
+    ".weight_scale_inv",
+    ".weight_scale_2",
+    ".scale",
+)
 
 # Set to ``source.is_unused_weight`` while ``DefaultModelLoader._get_weights_iterator``
 # runs, so ``_should_skip_weight_tpu`` skips those tensors before ``get_tensor``.
