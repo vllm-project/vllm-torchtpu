@@ -102,6 +102,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         xmerge: bool = False,
         thr_fast: str | None = None,
         req_async: int = 0,
+        nvis_balance: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -297,6 +298,15 @@ class QSAFullIndexedBlock(QSAFullBlock):
                            early_exit=(ex_bit, ex_every) if "e" in fast else ())
         # Tiers for the thresholds (h) / the compaction (c) / both (r); "2": tiers S/2, S only
         # (each tier is one more static copy of the scan: code size).
+        # `nvis_balance` (VLLM_TPU_MK_QSA_NVIS_BALANCE_BUCKETS, per row bucket; exact): the
+        # sharded selection gives each run whole requests balanced by visible groups (the
+        # largest request with the smallest) instead of consecutive runs of `npr` requests.
+        # Needs the served request loop with `xmerge`; only buckets with two requests per run
+        # (`QSAFullCompleting._balanced`). Each request is still selected whole on one rank.
+        self.nvis_balance = (
+            bool(nvis_balance) and bool(shard_index) and bool(loop_requests) and self.xmerge
+            and not skip_idle and not compressed_dcp
+        )
         self.thr_tiers = "r" in fast or "h" in fast
         self.cmp_tiers = "r" in fast or "c" in fast
         self.tier_two = "2" in fast
@@ -517,7 +527,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
     # ------------------------------------------------------------ in kernel
     def _score_request(
         self, ctx: Any, q: int, qr: jax.Array, base: Any = 0, last: bool = True, row0: Any = None,
-        first: bool | None = None, c_off: Any = 0,
+        first: bool | None = None, c_off: Any = 0, nxt: Any = None,
     ) -> None:
         """Scores of request `q`'s `T` rows into `qi_s[q*T : (q+1)*T]` (chunk-major).
 
@@ -527,8 +537,10 @@ class QSAFullIndexedBlock(QSAFullBlock):
         first chunk is issued here. `first` (default `q == 0`) marks the first request of the
         rank's run when the indexer is sharded by request (`shard_index`). `compressed_dcp`:
         only this rank's own groups (`qsa_cktab` lists its pages), scored into chunks from
-        `c_off` on."""
+        `c_off` on. `nxt` (default q + 1): the request whose first chunk this request's last
+        chunk prefetches (`nvis_balance`: the run's next request)."""
         scr, T = ctx.scr, ctx.ex.T
+        nxt = q + 1 if nxt is None else nxt
         r0 = q * T if row0 is None else row0
         rows = slice(r0, r0 + T)
         if not self.carrier:
@@ -571,7 +583,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
 
         first = (q == 0) if first is None else first
         if self.key_slots > 2:
-            self._score_deep(ctx, q, qr, copies, rows, first, last, c_off)
+            self._score_deep(ctx, q, qr, copies, rows, first, last, c_off, nxt)
             return
 
         def issue_first() -> None:
@@ -612,7 +624,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
 
                 @pl.when((c + 1 == n_q) & jnp.logical_not(last))
                 def _():
-                    for cp in copies(0, 1 - s, q + 1):
+                    for cp in copies(0, 1 - s, nxt):
                         cp.start()
 
             self._consume(ctx, qr, s, rows, c_off + c)
@@ -641,7 +653,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
 
     def _score_deep(
         self, ctx: Any, q: Any, qr: jax.Array, copies: Any, rows: slice, first: Any, last: Any,
-        c_off: Any,
+        c_off: Any, nxt: Any = None,
     ) -> None:
         """`_score_request`'s key stream through a `key_slots`-slot ring (bounded chunks):
         `key_slots - 1` chunks are in flight while one is scored. Chunk `c` of the rank's
@@ -651,6 +663,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         the 2-slot ring does; the next request issues its chunks 1..KS-2 on entry. Same keys
         and the same scores as the 2-slot ring, only the copy schedule differs."""
         scr, T, KS = ctx.scr, ctx.ex.T, self.key_slots
+        nxt = q + 1 if nxt is None else nxt
         CG, NC = self.chunk_pages * GPK, self.n_chunks
         nv = ctx.extra[NVIS][q * T + T - 1]
         n_q = jnp.clip((nv + CG - 1) // CG, 1, NC)
@@ -675,7 +688,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
             pl.when(c + KS - 1 < n_q)(lambda: start(c + KS - 1))
             if last is not True:
                 # The next request's first chunk, into the slot after this request's last.
-                pl.when((c + 1 == n_q) & jnp.logical_not(last))(lambda: start(0, n_q, q + 1))
+                pl.when((c + 1 == n_q) & jnp.logical_not(last))(lambda: start(0, n_q, nxt))
             self._consume(ctx, qr, jax.lax.rem(c0 + c, KS), rows, c_off + c)
             return carry
 

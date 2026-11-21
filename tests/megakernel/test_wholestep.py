@@ -293,7 +293,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
            shared_kv: bool = False, cdcp: bool = False, cdcp_keys: bool = True, ck_fn=None,
            async_dma: bool = False, B: int | None = None, xreq: int = 0,
            skip_idle: bool = False, xmerge: bool = False, key_mp: int = 0, key_slots: int = 2,
-           req_async: int = 0):
+           req_async: int = 0, nvis_balance: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -337,7 +337,8 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
                    compressed_dcp=cdcp, xreq_prefetch=xreq, skip_idle=skip_idle,
                    manager_pages=key_mp, key_slots=key_slots,
                    **(dict(xmerge=True) if xmerge else {}),
-                   **(dict(req_async=req_async) if req_async else {}))
+                   **(dict(req_async=req_async) if req_async else {}),
+                   **(dict(nvis_balance=True) if nvis_balance else {}))
     spec = wholestep_spec(
         G,
         R,
@@ -1503,3 +1504,72 @@ def test_qsa_xmerge_lost_union_is_caught(monkeypatch):
     run = _main_run(monkeypatch, 16, xmerge=True)
     with pytest.raises(AssertionError):
         _assert_live_identical(base, run, 4)
+
+
+# VLLM_TPU_MK_QSA_NVIS_BALANCE_BUCKETS: main-call geometry (4 request slots, R = 2 -> two
+# requests per run). Contexts chosen so the balanced runs differ from the consecutive ones:
+# ragged 4 live ({0, 2} / {1, 3} instead of {0, 1} / {2, 3}), 3 live + an idle slot (odd
+# count), 2 live (the consecutive split leaves rank 1 with idle slots only), and ties.
+NVIS_BALANCE_CASES = [
+    # B, dcp, ctx, key_slots, req_async
+    (16, 1, [3001, 2000, 100, 777], 2, 0),
+    (16, 2, [3001, 2000, 100, 777], 4, 1),
+    (16, 1, [3001, 2000, 777, 0], 4, 1),
+    (16, 2, [3001, 2000, 0, 0], 2, 1),
+    (16, 1, [2000, 2000, 100, 2000], 4, 0),
+]
+
+
+def _nvis_balance_pair(monkeypatch, B, dcp, ctx, key_slots, req_async, mutate=None):
+    kw = dict(ctx=ctx, xmerge=True, key_slots=key_slots, req_async=req_async)
+    base = _main_run(monkeypatch, B, dcp, **kw)
+    if mutate is not None:
+        mutate()
+    return base, _main_run(monkeypatch, B, dcp, nvis_balance=True, **kw)
+
+
+@pytest.mark.parametrize("B,dcp,ctx,key_slots,req_async", NVIS_BALANCE_CASES)
+def test_nvis_balance_bit_identical(monkeypatch, B, dcp, ctx, key_slots, req_async):
+    """`nvis_balance`: the sharded selection's runs hold whole requests balanced by visible
+    groups (largest with smallest) instead of consecutive requests. Each request is still
+    selected whole by one rank, so every output is byte-identical (residual, ck_new, ring_new,
+    ids, kr/ir_new): ragged contexts, an odd live count with an idle slot, a rank that is idle
+    under the consecutive split, ties, the deep key ring, REQ_ASYNC, main-KV DCP-2."""
+    base, run = _nvis_balance_pair(monkeypatch, B, dcp, ctx, key_slots, req_async)
+    assert np.isfinite(base[0]).all()
+    _assert_xreq_identical(base, run)
+
+
+def test_nvis_balance_swapped_runs_are_caught(monkeypatch):
+    """Mutation: the two runs' requests swapped in the ownership table only (each rank selects
+    the other run's requests but packs its own run's slots); the comparison must fail (the
+    flag takes the balanced path and the exchange reads the owners' rows)."""
+    from vllm_torchtpu.megakernel.wholestep import qsa_full_c as qc
+
+    orig = qc.QSAFullStepBlock._balance_tables
+
+    def swapped(self, ctx):  # noqa: ANN001
+        orig(self, ctx)
+        for q in range(ctx.ex.MB // ctx.ex.T):
+            ctx.scr["qb_run"][q] = 1 - ctx.scr["qb_run"][q]
+
+    def mutate():
+        monkeypatch.setattr(qc.QSAFullStepBlock, "_balance_tables", swapped)
+
+    base, run = _nvis_balance_pair(monkeypatch, 16, 1, [3001, 2000, 100, 777], 2, 0, mutate)
+    with pytest.raises(AssertionError):
+        _assert_xreq_identical(base, run)
+
+
+def test_nvis_balance_buckets_env(monkeypatch):
+    """VLLM_TPU_MK_QSA_NVIS_BALANCE_BUCKETS: only the listed row buckets get the option;
+    unset / unlisted / the bucketless spec add nothing (spec unchanged)."""
+    from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_call as wc
+
+    monkeypatch.delenv("VLLM_TPU_MK_QSA_NVIS_BALANCE_BUCKETS", raising=False)
+    assert wc.nvis_balance_options(48) == {}
+    monkeypatch.setenv("VLLM_TPU_MK_QSA_NVIS_BALANCE_BUCKETS", "48,64")
+    assert wc.nvis_balance_options(48) == {"nvis_balance": True}
+    assert wc.nvis_balance_options(64) == {"nvis_balance": True}
+    assert wc.nvis_balance_options(16) == {}
+    assert wc.nvis_balance_options(None) == {}

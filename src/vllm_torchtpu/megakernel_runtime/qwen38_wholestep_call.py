@@ -131,7 +131,19 @@ def indexed_options(B: int | None = None) -> dict:
         manager_pages=KEY_MP,
         key_slots=key_slots_for(B),
         **thr_fast_options(B),
+        **nvis_balance_options(B),
     )
+
+
+def nvis_balance_options(B: int | None) -> dict:
+    """VLLM_TPU_MK_QSA_NVIS_BALANCE_BUCKETS="48,64" (default unset; exact): the `B`-row
+    kernel's sharded selection balances whole requests over the runs by visible groups
+    (`QSAFullIndexedBlock.nvis_balance`; buckets with two requests per run, c32 b48/b64).
+    Empty when unset or `B` is not listed, so the spec is unchanged."""
+    raw = os.environ.get("VLLM_TPU_MK_QSA_NVIS_BALANCE_BUCKETS", "")
+    if not raw or B is None:
+        return {}
+    return {"nvis_balance": True} if str(B) in raw.split(",") else {}
 
 
 def thr_fast_options(B: int | None) -> dict:
