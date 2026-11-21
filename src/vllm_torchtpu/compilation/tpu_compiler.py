@@ -335,11 +335,65 @@ _RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
 )
 
 
+# Sources and settings that model directories add to the compile cache key
+# (`register_compile_cache_key`): a model's Pallas kernels sit behind custom-op
+# boundaries like the shared ones, and its own settings are not in envs.py.
+_MODEL_CACHE_KEY_PATHS: dict[str, tuple[str, ...]] = {}
+# Subdirectories of every model directory that are always hashed.
+_MODEL_CACHE_KEY_SUBDIRS = ("kernels", "ops")
+# Per-owner callables returning the model settings that can change a compiled
+# graph; their results land under `model:<owner>` in the env factors.
+_MODEL_ENV_FACTORS: dict[str, Callable[[], dict[str, Any]]] = {}
+# Set once this process computed the compile hash; later registry changes raise.
+_COMPILE_HASH_COMPUTED = False
+
+
+def register_compile_cache_key(
+    owner: str,
+    *,
+    paths: tuple[str, ...] = (),
+    env_factors: Callable[[], dict[str, Any]] | None = None,
+) -> None:
+    """Add a model directory's sources and settings to the compile cache key.
+
+    `paths` are repo-relative files or directories (hashed like
+    `_RUNTIME_CACHE_KEY_PATHS`). `env_factors` returns every setting the
+    model's graphs, kernels and ops read that can change a compiled graph;
+    its values must be JSON-serializable. Registering the same owner again
+    replaces its entry.
+
+    The registry is per process: call this from the model directory's
+    registration hook, which runs in every process (worker included) before
+    the first compile. A call that changes the registry after this process
+    computed the compile hash raises, since the AOT and piecewise keys
+    already in use would not include it.
+    """
+    paths = tuple(paths)
+    if _COMPILE_HASH_COMPUTED and (
+        _MODEL_CACHE_KEY_PATHS.get(owner) != paths
+        or _MODEL_ENV_FACTORS.get(owner) is not env_factors
+    ):
+        raise RuntimeError(
+            f"register_compile_cache_key({owner!r}) called after the compile "
+            "hash was computed; register from the model's registration hook"
+        )
+    _MODEL_CACHE_KEY_PATHS[owner] = paths
+    if env_factors is None:
+        _MODEL_ENV_FACTORS.pop(owner, None)
+    else:
+        _MODEL_ENV_FACTORS[owner] = env_factors
+
+
+def _runtime_cache_key_paths() -> tuple[str, ...]:
+    model_paths = (p for _, ps in sorted(_MODEL_CACHE_KEY_PATHS.items()) for p in ps)
+    return (*_RUNTIME_CACHE_KEY_PATHS, *model_paths)
+
+
 def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
     """Return runtime source files that affect TPU custom-op lowering."""
     files_by_relpath: dict[str, Path] = {}
 
-    for rel_path in _RUNTIME_CACHE_KEY_PATHS:
+    for rel_path in _runtime_cache_key_paths():
         path = repo_root / rel_path
         if path.is_file():
             files_by_relpath[rel_path] = path
@@ -350,6 +404,24 @@ def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
                 files_by_relpath[child_relpath] = child
             continue
         logger.warning("[TpuCompilerAdaptor] Cache key source path missing: %s", path)
+
+    # Model directories (models/<model>/, not the upstream-backed models/vllm)
+    # keep their kernel copies and op bridges in kernels/ and ops/ at any
+    # depth (e.g. experimental/kernels); hash them like the shared ones.
+    models_root = repo_root / "vllm_torchtpu" / "models"
+    if models_root.is_dir():
+        for model_dir in sorted(models_root.iterdir()):
+            if not model_dir.is_dir() or model_dir.name in ("vllm", "__pycache__"):
+                continue
+            # Walk directories only; files are listed just inside the
+            # kernels/ and ops/ trees, which are not walked again.
+            for dirpath, dirnames, _ in os.walk(model_dir):
+                dirnames.sort()
+                for name in [d for d in dirnames if d in _MODEL_CACHE_KEY_SUBDIRS]:
+                    dirnames.remove(name)
+                    for child in sorted((Path(dirpath) / name).rglob("*.py")):
+                        child_relpath = child.relative_to(repo_root).as_posix()
+                        files_by_relpath[child_relpath] = child
 
     excluded_files = set(_RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
     excluded_dirs = tuple(
@@ -411,11 +483,15 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
             logger.warning(
                 "Skipping TPU compile environment variable %s: %s", name, exc
             )
+    for owner, model_factors in sorted(_MODEL_ENV_FACTORS.items()):
+        factors[f"model:{owner}"] = model_factors()
     return factors
 
 
 def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     """Hash TPU-specific factors used by both AOT and piecewise caches."""
+    global _COMPILE_HASH_COMPUTED
+    _COMPILE_HASH_COMPUTED = True
     # Deferred: tpu_info imports Pallas, which this module otherwise avoids.
     from vllm_torchtpu.tpu_info import get_libtpu_cache_key
 
