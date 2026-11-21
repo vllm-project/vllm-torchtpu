@@ -38,16 +38,22 @@ case "$SHARDING" in
   DP8_EP)
     # Data-parallel attention across all 8 cores + expert-parallel MoE.
     DP_SIZE=8
-    # New prefills are admitted every this many steps. Larger value trades
-    # TTFT for throughput. Default 8 keeps TTFT low.
-    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-8}"
+    # New prefills are admitted every step; the router's release below lines
+    # the engines' prompt steps up instead of a longer interval.
+    PREFILL_SCHEDULE_INTERVAL="${PREFILL_SCHEDULE_INTERVAL:-1}"
     SHARDING_ARGS=(
       --tensor-parallel-size=1
       --data-parallel-size=8
       --enable-expert-parallel
       --prefill-schedule-interval="$PREFILL_SCHEDULE_INTERVAL"
+      # One API server, so the router sees every arrival.
+      --api-server-count=1
     )
     export DP_SCHED_ENABLED=1
+    # The DP router holds new prompts and releases a group together.
+    export VLLM_TPU_DP_PLACEMENT="${VLLM_TPU_DP_PLACEMENT:-release}"
+    export VLLM_TPU_DP_RELEASE_THRESHOLD="${VLLM_TPU_DP_RELEASE_THRESHOLD:-8}"
+    export VLLM_TPU_DP_RELEASE_QUIET_MS="${VLLM_TPU_DP_RELEASE_QUIET_MS:-2000}"
     ;;
   TP8_EP)
     # Tensor-parallel attention across all 8 chips + expert-parallel MoE.
