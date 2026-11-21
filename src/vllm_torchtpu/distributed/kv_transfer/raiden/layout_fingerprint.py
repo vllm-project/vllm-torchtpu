@@ -47,6 +47,9 @@ ROW_CACHE_MINOR_TO_MAJOR = _row_major_minor_to_major(4)
 EXPECTED_FA_TILES = ((4, 128), (4, 1))
 FA_LAYOUT_FINGERPRINT_SCHEMA = "qwen35-fa-raw-layout-fingerprint-v1"
 GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA = "glm-mla-raw-layout-fingerprint-v1"
+# Declared rope channel order of the cached k_pe / indexer key (absent: the
+# checkpoint's interleaved order). See measured_glm_layout_fingerprint.
+GLM_ROPE_ORDER_HALF_SPLIT = "half_split"
 KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA = "kimi-k3-row-layout-fingerprint-v1"
 DSV4_LAYOUT_FINGERPRINT_SCHEMA = "dsv4-raw-layout-fingerprint-v1"
 
@@ -195,6 +198,7 @@ __all__ = [
     "EXPECTED_FA_TILES",
     "FA_LAYOUT_FINGERPRINT_SCHEMA",
     "GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA",
+    "GLM_ROPE_ORDER_HALF_SPLIT",
     "KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA",
     "canonical_layout_fingerprint",
     "expected_fa_minor_to_major",
@@ -271,6 +275,8 @@ def measured_glm_layout_fingerprint(
     package_version: Callable[[str], str] | None = None,
     hash_indexer: bool = True,
     indexer_seq_along_lane: bool = False,
+    mla_rope_half_split: bool = False,
+    indexer_rope_half_split: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Fingerprint of the admitted GLM cache layout, compared across peers.
 
@@ -285,6 +291,15 @@ def measured_glm_layout_fingerprint(
     ``indexer_seq_along_lane`` checks the indexer page by its lane width (one
     token per lane). Its page shape differs from the packed-row one, so the
     two layouts never fingerprint alike.
+
+    ``mla_rope_half_split`` / ``indexer_rope_half_split``: this engine caches
+    k_pe (the indexer key's rope channels) in half-split order, because its q
+    and k projections were permuted after load (TPU_MLA_ROPE_NEOX_PERMUTE /
+    TPU_INDEXER_ROPE_NEOX_PERMUTE). The page geometry is the same either way,
+    so no measured layout can see it, yet a peer that caches the interleaved
+    order computes wrong rope scores from these bytes (and vice versa). The
+    payload declares the half-split order; the interleaved order declares
+    nothing, so its fingerprint stays as before.
     """
     layouts = _measure_packed_row_layouts(
         manifest,
@@ -303,6 +318,10 @@ def measured_glm_layout_fingerprint(
         "page_tokens": int(page_tokens),
         "layouts": layouts,
     }
+    if mla_rope_half_split:
+        payload["mla_rope_order"] = GLM_ROPE_ORDER_HALF_SPLIT
+    if indexer_rope_half_split:
+        payload["indexer_rope_order"] = GLM_ROPE_ORDER_HALF_SPLIT
     return canonical_layout_fingerprint(payload), payload
 
 

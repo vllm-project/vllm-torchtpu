@@ -694,6 +694,62 @@ def _raiden_glm_dcp_identity() -> bool:
     return _use_raiden_glm_admission() and bool(tpu_envs.TPU_RAIDEN_GLM_DCP_IDENTITY)
 
 
+def _glm_rope_half_split(model: Any, hf_config: Any = None) -> tuple[bool, bool]:
+    """``(mla, indexer)``: whether this engine caches k_pe / the indexer key's
+    rope channels in half-split order (TPU_MLA_ROPE_NEOX_PERMUTE /
+    TPU_INDEXER_ROPE_NEOX_PERMUTE).
+
+    Read from the layers, never from the env alone: a layer sets
+    ``_rope_neox_permuted`` once its post-load permute ran, and a flag left at
+    its default skips the permute for a rope it cannot reorder. A pipeline
+    stage whose layers all reuse an earlier layer's top-k holds no indexer and
+    ships no indexer key; it declares what an indexer layer of its own would
+    cache. vLLM builds the indexer rope GPT-J style only when the model config
+    sets ``indexer_rope_interleave``, NeoX otherwise; the permute never
+    reorders a NeoX rope, so every engine caches those keys in the
+    checkpoint's own order and none declares it. Such a stage declares
+    half-split for the indexer only with the flag on, ``indexer_rope_interleave``
+    set, and a rope class the permute supports (its MLA layers'). Without the
+    model config to read, it refuses to guess."""
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUIndexer,
+        rope_half_split_supported,
+    )
+
+    if model is None:
+        if tpu_envs.TPU_MLA_ROPE_NEOX_PERMUTE or tpu_envs.TPU_INDEXER_ROPE_NEOX_PERMUTE:
+            raise RuntimeError(
+                "Raiden GLM admission reads the cached rope order from the "
+                "loaded model's layers (TPU_MLA_ROPE_NEOX_PERMUTE / "
+                "TPU_INDEXER_ROPE_NEOX_PERMUTE are on), but the runner has none"
+            )
+        return False, False
+    mla = indexer = has_indexer = rope_supported = False
+    for module in model.modules():
+        if isinstance(module, VllmTPUIndexer):
+            has_indexer = True
+            indexer = indexer or bool(getattr(module, "_rope_neox_permuted", False))
+        elif hasattr(module, "_rope_neox_permuted"):
+            # An MLA layer: it holds the flag from construction on.
+            mla = mla or bool(module._rope_neox_permuted)
+            rope_supported = rope_supported or rope_half_split_supported(
+                getattr(module, "rotary_emb", None),
+                int(getattr(module, "qk_rope_head_dim", 0) or 0),
+            )
+    if not has_indexer and tpu_envs.TPU_INDEXER_ROPE_NEOX_PERMUTE:
+        if hf_config is None:
+            raise RuntimeError(
+                "Raiden GLM admission: this pipeline stage holds no indexer "
+                "layer, so the indexer's rope order follows the model config's "
+                "indexer_rope_interleave, but no model config was given"
+            )
+        # The rule vLLM builds the indexer rope by (DeepSeek-V2 / GLM:
+        # is_neox_style = not indexer_rope_interleave, default False).
+        interleaved_rope = getattr(hf_config, "indexer_rope_interleave", False)
+        indexer = interleaved_rope is True and rope_supported
+    return mla, indexer
+
+
 def _glm_indexer_seq_along_lane(vllm_config: VllmConfig) -> bool:
     """Whether the GLM indexer K cache was allocated SEQ_ALONG_LANE, which
     only the DCP identity transfer admits."""
@@ -3476,7 +3532,10 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _measure_raiden_glm_layout(
-        manifest: Any, page_tokens: int, indexer_seq_along_lane: bool = False
+        manifest: Any,
+        page_tokens: int,
+        indexer_seq_along_lane: bool = False,
+        rope_half_split: tuple[bool, bool] = (False, False),
     ) -> tuple[str, dict[str, Any]]:
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
             measured_glm_layout_fingerprint,
@@ -3490,6 +3549,8 @@ class TPURaidenConnectorWorker:
             page_tokens=page_tokens,
             hash_indexer=not _use_per_layer_pool_tags() or _raiden_glm_dcp_identity(),
             indexer_seq_along_lane=indexer_seq_along_lane,
+            mla_rope_half_split=rope_half_split[0],
+            indexer_rope_half_split=rope_half_split[1],
         )
 
     def _measure_stage3_layout(self, manifest: Any) -> tuple[str, dict[str, Any], int]:
@@ -3534,6 +3595,10 @@ class TPURaidenConnectorWorker:
                 manifest,
                 page_tokens,
                 indexer_seq_along_lane=_glm_indexer_seq_along_lane(self.vllm_config),
+                rope_half_split=_glm_rope_half_split(
+                    getattr(self.runner, "model", None),
+                    getattr(self.vllm_config.model_config, "hf_text_config", None),
+                ),
             )
             return fingerprint, payload, page_tokens
         if _raiden_seq_on_lane_layout():
