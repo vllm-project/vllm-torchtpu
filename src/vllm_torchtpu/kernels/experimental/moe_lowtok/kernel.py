@@ -34,6 +34,8 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
+
 # Rows per call at or below which the MoE entry selects this kernel: the
 # measured crossover vs dense-expert MoE (j-a6af2846, j-d8af40dc). At 128 rows
 # it wins 1.14x (scores) / 1.09x (ids) on recorded skew; at 256 it is parity
@@ -100,7 +102,8 @@ def _vmem_budget(rows, hidden, inter, w13_parts, lanes, nc=0):
 
 def _quant_block(k):
     """Activation scale block along a contraction of width k."""
-    return min(k, _QUANT_BLOCK)
+    qblock = envs.TPU_MOE_LOWTOK_QUANT_BLOCK
+    return k if qblock <= 0 else min(k, qblock)
 
 
 def _quantize_blocks(v):

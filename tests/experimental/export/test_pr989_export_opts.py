@@ -21,7 +21,7 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_torchtpu.experimental.export import universal_adapter
+from vllm_torchtpu.experimental.export import api, universal_adapter
 from vllm_torchtpu.layers.adapter import norm_weight_hoist, small_all_reduce_op
 
 
@@ -521,3 +521,90 @@ def test_export_emits_sample_greedy_when_enabled(
     assert entry["outputs"][0]["shape"] == [4, 1]
     assert entry["outputs"][0]["dtype"] == "i64"
     assert entry["outputs"][0]["argument_type"] == "user_io"
+
+
+def test_lower_forward_installs_token_padding_when_skip_padded_tokens_enabled(
+    monkeypatch,
+):
+    from vllm_torchtpu.experimental.export import exporter, tpu_lowering
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    seen_masks = []
+
+    class _Model:
+        export_config = api.TextOnlyLLMExportConfig(
+            model_name="tiny-pad",
+            vocab_size=32,
+            hidden_size=8,
+            num_layers=1,
+            num_q_heads=2,
+            num_kv_heads=2,
+            head_dim=4,
+            block_size=4,
+            num_blocks=8,
+            max_num_seqs=4,
+            max_model_len=16,
+            eos_token_id=2,
+            dtype="bf16",
+            token_buckets=(8,),
+            req_buckets=(4,),
+            emit_byte_tokenizer=True,
+        )
+
+        def abstract_params(self):
+            return {"w": api.ShapeDtypeStruct((32, 8), "bf16")}
+
+        def forward(
+            self,
+            weights,
+            kv_caches,
+            *,
+            input_ids,
+            positions,
+            kv_lens,
+            block_tables,
+            query_start_loc,
+            req_dist,
+        ):
+            del positions, kv_lens, block_tables, query_start_loc, req_dist
+            mask = token_padding.local_padding_mask(input_ids.shape[0])
+            seen_masks.append(None if mask is None else (tuple(mask.shape), mask.dtype))
+            out = weights["w"][input_ids % 32]
+            if mask is not None:
+                out = torch.where(mask[:, None], torch.zeros_like(out), out)
+            return list(kv_caches), out
+
+    def _fake_lower_callable(fn, specs, **_kw):
+        args = []
+        for s in specs:
+            dt = torch.int32 if s.dtype == "i32" else torch.bfloat16
+            val = torch.ones if dt == torch.bfloat16 else torch.zeros
+            args.append(val(s.shape, dtype=dt))
+        # Simulate 2 active sequences totaling 5 valid tokens in a bucket of 8.
+        args[4][:3] = torch.tensor([0, 3, 5], dtype=torch.int32)  # query_start_loc
+        args[5][2] = 2  # req_dist[2]
+        out = fn(*args)
+        hidden = out[-1]
+        assert torch.all(hidden[:5] == 1)
+        assert torch.all(hidden[5:] == 0)
+        return "module @m {}"
+
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+    monkeypatch.setattr(
+        tpu_lowering, "lower_torch_callable_to_mlir", _fake_lower_callable
+    )
+    monkeypatch.setattr(tpu_lowering, "set_aliasing_outputs", lambda txt, _m: txt)
+    token_padding.set_padding_state(None)
+
+    cfg = _Model.export_config
+    user_inputs = exporter._user_inputs(cfg, 8, 3, "block_tables")
+    tpu_lowering.lower_torch_forward_to_mlir(
+        _Model(),
+        user_inputs=user_inputs,
+        forward_names=["w"],
+        params_map={"w": api.ShapeDtypeStruct((32, 8), "bf16")},
+        state_specs=[],
+        bucket_size=8,
+    )
+    assert seen_masks == [((8,), torch.bool)]
+    assert token_padding._padding_state is None

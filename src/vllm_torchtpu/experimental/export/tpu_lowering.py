@@ -25,8 +25,10 @@ from typing import Any
 import torch
 import torch.fx as fx
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.experimental.export import api
 from vllm_torchtpu.experimental.export.trace import trace
+from vllm_torchtpu.layers.adapter import token_padding
 
 
 @dataclasses.dataclass(frozen=True)
@@ -397,12 +399,33 @@ def lower_torch_forward_to_mlir(
             if name in w_dict:
                 w_dict[name] = w_dict[name].reshape(shape)
         kv_caches = list(args[state_start:trailing_start])
-        with record_module_outputs(taps or {}) as recorded:
-            updated_kvs, hidden_states, *extras = model.forward(
-                w_dict,
-                kv_caches,
-                **user_args,
+        prev_padding = token_padding._padding_state
+        if (
+            envs.TPU_MOE_SKIP_PADDED_TOKENS
+            and "query_start_loc" in user_args
+            and "req_dist" in user_args
+        ):
+            qsl = user_args["query_start_loc"]
+            num_seqs = user_args["req_dist"][2].clamp(0, qsl.shape[0] - 1)
+            num_valid = qsl[num_seqs]
+            mask = (
+                torch.arange(
+                    bucket_size,
+                    device=num_valid.device,
+                    dtype=torch.int32,
+                )
+                >= num_valid
             )
+            token_padding.set_padding_state(token_padding.TokenPaddingState(mask))
+        try:
+            with record_module_outputs(taps or {}) as recorded:
+                updated_kvs, hidden_states, *extras = model.forward(
+                    w_dict,
+                    kv_caches,
+                    **user_args,
+                )
+        finally:
+            token_padding.set_padding_state(prev_padding)
         if tap_names is not None:
             tap_names[:] = [n for n, _ in recorded]
         return (*updated_kvs, hidden_states, *extras, *(t for _, t in recorded))

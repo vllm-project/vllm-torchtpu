@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     TPU_MOE_COUNTING_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_LOWTOK: bool = False
+    TPU_MOE_LOWTOK_QUANT_BLOCK: int = 512
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -812,6 +813,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # calls of at most MOE_LOWTOK_MAX_TOKENS rows; the FP8 method also moves
     # a plain softmax top-k router into it. Exclusive with dense expert MoE.
     "TPU_MOE_LOWTOK": env_bool("TPU_MOE_LOWTOK"),
+    # Activation quantization block width along K for moe_lowtok. Values <= 0
+    # quantize whole rows in one scale/dot_general (matching per-channel weights).
+    "TPU_MOE_LOWTOK_QUANT_BLOCK": env_int("TPU_MOE_LOWTOK_QUANT_BLOCK", 512),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

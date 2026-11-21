@@ -452,3 +452,15 @@ def test_interpreted_scores_copies_load_balances_and_matches_oracle(interpret):
     w, ids = _router(scores, topk)
     want = _oracle(x, ids, w, w13, s13, w2, s2, 0)
     assert np.linalg.norm(total - want) / np.linalg.norm(want) < 0.06
+
+
+def test_interpreted_whole_row_quantization_with_quant_block_zero(
+    interpret, monkeypatch
+):
+    monkeypatch.setenv("TPU_MOE_LOWTOK_QUANT_BLOCK", "0")
+    kernel.moe_lowtok.clear_cache()
+    assert kernel._quant_block(4096) == 4096
+    x, ids, weights, w13, s13, w2, s2 = _ids_operands(11, 8, 8, 1024, 256, 4)
+    got = _ids_call(x, ids, weights, w13, s13, w2, s2)
+    want = _oracle(x, ids, weights, w13, s13, w2, s2, 0)
+    assert _rel_l2(got, want) < 0.06
