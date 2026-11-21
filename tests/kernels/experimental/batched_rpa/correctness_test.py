@@ -13,6 +13,7 @@
 # limitations under the License.
 """Correctness tests for batched ragged paged attention."""
 
+import re
 from typing import Any
 
 import jax
@@ -24,6 +25,7 @@ from jax._src import dtypes
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
 
+from tests.kernels.experimental.batched_rpa.rpa_test_utils import rpa_kernel_names
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
     utils,
@@ -33,27 +35,6 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 pytestmark = pytest.mark.tpu_test
 
 jax.config.parse_flags_with_absl()
-
-
-def _rpa_kernel_names(fn, *args) -> list[str]:
-    """The names of the RPA kernels (not the schedule kernels) `fn(*args)`
-    traces; a name carries the kernel's batch, bq and bkv tiles."""
-    names = []
-
-    def walk(jaxpr):
-        for eqn in jaxpr.eqns:
-            if eqn.primitive.name == "pallas_call":
-                if eqn.params["name"].startswith("RPA"):
-                    names.append(eqn.params["name"])
-                continue
-            for value in eqn.params.values():
-                for sub in value if isinstance(value, (list, tuple)) else [value]:
-                    sub = getattr(sub, "jaxpr", sub)
-                    if hasattr(sub, "eqns"):
-                        walk(sub)
-
-    walk(jax.make_jaxpr(fn)(*args).jaxpr)
-    return names
 
 
 @jax.jit
@@ -247,12 +228,15 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         tuned_tiles: bool | None = None,
         decode_batch_size: int | None = None,
         expect_kernel_tiles: tuple[str, ...] = (),
+        expect_decode_lanes: int | None = None,
     ):
         """tuned_tiles=None passes the block sizes above; True or False lets
         the wrapper pick its tiles with or without the tuned rules, for
         decode_batch_size decode lanes (the wrapper's default when None).
-        Each of expect_kernel_tiles ("-b<batch>-q<bq>-k<bkv>") must name the
-        tiles of one RPA kernel the call traces."""
+        Each of expect_kernel_tiles ("-b<batch>-q<bq>-k<bkv>") must end the
+        name of one RPA kernel the call traces, and with expect_decode_lanes
+        every DECODE kernel the call traces must work on that many
+        sequences."""
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # Tokens live on the lane dim, so page_size must be a multiple of 128.
             page_size = utils.align_to(page_size, 128)
@@ -455,13 +439,19 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             decode_query_size=decode_query_size,
             mask_invalid_v=mask_invalid_v,
         )
-        if expect_kernel_tiles:
-            names = _rpa_kernel_names(
+        if expect_kernel_tiles or expect_decode_lanes is not None:
+            names = rpa_kernel_names(
                 lambda *a: wrapper.ragged_paged_attention(*a, **call_kwargs),
                 *rpa_args,
             )
             for tiles in expect_kernel_tiles:
-                assert any(tiles in name for name in names), (tiles, names)
+                assert any(name.endswith(tiles) for name in names), (tiles, names)
+            if expect_decode_lanes is not None:
+                decode = f"RPA{configs.RpaCase.DECODE.symbol}-"
+                lanes = re.compile(rf"-b{expect_decode_lanes}-q\d+-k\d+$")
+                decode_names = [n for n in names if n.startswith(decode)]
+                assert decode_names, names
+                assert all(lanes.search(n) for n in decode_names), names
         output, updated_kv_cache = wrapper.ragged_paged_attention(
             *jax.tree.map(lambda x: x.copy(), rpa_args), **call_kwargs
         )
@@ -1048,8 +1038,12 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         (1024, 64, 1024, 2); the tuned case reaches the 4096-token decode KV
         block of the 85% VMEM cap and clamps the prefill bq to the 512-token
         bucket, (4, 4, 4096, 8) and (512, 128, 1024, 2); with 4 decode lanes
-        the decode tiles are (4, 4, 4096, 4). Each case also checks that the
-        traced kernels carry those tiles."""
+        the decode tiles are (4, 4, 4096, 4). On TPU7x each case also checks
+        that the traced kernels carry those tiles. Other chips get other tiles
+        from the same rules (their compute thresholds and VMEM differ), so
+        there it checks only the decode lane count; the numerical comparison
+        runs on every chip."""
+        on_tpu7x = pltpu.get_tpu_info().chip_version == pltpu.ChipVersion.TPU_7X
         self._test_ragged_paged_attention(
             [(4, 5000), (4, 1000), (4, 4300), (4, 600), (4, 2000), (300, 3100)],
             (4, 1),
@@ -1063,7 +1057,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             distribution=jnp.array([5, 5, 6], dtype=jnp.int32),
             tuned_tiles=tuned_tiles,
             decode_batch_size=decode_batch_size,
-            expect_kernel_tiles=tiles,
+            expect_kernel_tiles=tiles if on_tpu7x else (),
+            # The wrapper's default is 8 decode lanes.
+            expect_decode_lanes=decode_batch_size or 8,
         )
 
     @parameterized.product(
