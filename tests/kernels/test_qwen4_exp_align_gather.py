@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""VLLM_TPU_QSA_PREFILL_ALIGN_GATHER: the block-aligned layout built by a row
-gather is bit-identical to the ``.at[slots].set`` scatter layout.
+"""VLLM_TPU_QSA_PREFILL_ALIGN_GATHER: the block-aligned layout built by a
+block gather is bit-identical to the ``.at[slots].set`` scatter layout.
 
 Part 1 swaps the block-sparse core for a recorder and compares the aligned
 query / blocks / lengths / page_table it receives, plus the wrapper output,
@@ -140,8 +140,8 @@ def test_aligned_inputs_and_output_match(recorder, monkeypatch, mix, query_block
 
 
 @pytest.mark.parametrize("mix", MIXES[:6], ids=lambda m: f"{len(m[0])}req-{m[1]}tok")
-def test_scatter_inverse_fallback_matches(recorder, monkeypatch, mix):
-    """Above MAX_MASK_ELEMENTS the inverse map comes from an int32 scatter."""
+def test_sorted_search_fallback_matches(recorder, monkeypatch, mix):
+    """Above MAX_MASK_ELEMENTS the scatter's request lookup takes the while loop."""
     monkeypatch.setattr(sorted_search, "MAX_MASK_ELEMENTS", 1)
     real, tokens = mix
     query, gate, blocks, lengths, table, starts = _inputs(real, tokens, seed=3)
@@ -162,34 +162,34 @@ def test_scatter_inverse_fallback_matches(recorder, monkeypatch, mix):
         _assert_same(a, b)
 
 
-@pytest.mark.parametrize("max_tokens", [256, 288, 1024, 1056])
-def test_aligned_sources_vs_scatter(max_tokens):
-    """Direct check of the inverse map, including rows dropped past max_tokens."""
-    rng = np.random.default_rng(max_tokens)
+@pytest.mark.parametrize("query_block", [32, 128])
+@pytest.mark.parametrize("extra_blocks", [0, 1, 4])
+def test_aligned_blocks_vs_scatter(query_block, extra_blocks):
+    """Direct check of the block gather, including rows dropped past max_tokens
+    and blocks whose slice runs past the last token."""
+    rng = np.random.default_rng(query_block * 10 + extra_blocks)
     for _ in range(40):
         nreq = int(rng.integers(1, 40))
-        real = rng.integers(0, 80, nreq) * (rng.random(nreq) < 0.8)
-        tokens = int(real.sum() + rng.integers(0, 40))
-        tokens = max(tokens, 1)
+        real = rng.integers(0, 3 * query_block, nreq) * (rng.random(nreq) < 0.8)
+        tokens = max(int(real.sum() + rng.integers(0, 40)), 1)
+        bucket = -(-tokens // query_block) * query_block
+        max_tokens = bucket + extra_blocks * query_block
         starts = np.r_[0, np.cumsum(real)].astype(np.int32)
-        padded = (real + 31) // 32 * 32
+        padded = -(-real // query_block) * query_block
         offsets = np.r_[0, np.cumsum(padded)].astype(np.int32)
         req = np.minimum(np.searchsorted(starts[1:], np.arange(tokens), side="right"), nreq - 1)
         valid = np.arange(tokens) < starts[-1]
         slots = np.where(valid, offsets[req] + np.arange(tokens) - starts[req], max_tokens)
-        want = np.full(max_tokens, -1)
+        data = rng.integers(0, 1 << 30, (tokens, 3)).astype(np.int32)
+        want = np.full((max_tokens, 3), -1, np.int32)
         keep = slots < max_tokens
-        want[slots[keep]] = np.arange(tokens)[keep]
-        for limit in (sorted_search.MAX_MASK_ELEMENTS, 1):
-            sorted_search.MAX_MASK_ELEMENTS, old = limit, sorted_search.MAX_MASK_ELEMENTS
-            try:
-                source, filled = bsp._aligned_sources(
-                    jnp.asarray(starts), jnp.asarray(offsets), jnp.asarray(real, jnp.int32),
-                    tokens, max_tokens,
-                )
-            finally:
-                sorted_search.MAX_MASK_ELEMENTS = old
-            np.testing.assert_array_equal(np.where(filled, source, -1), want)
+        want[slots[keep]] = data[keep]
+        first, count = bsp._aligned_block_sources(
+            jnp.asarray(starts), jnp.asarray(offsets), jnp.asarray(real, jnp.int32),
+            tokens, query_block, max_tokens,
+        )
+        got = bsp._gather_aligned_blocks(jnp.asarray(data), first, count, query_block, -1)
+        np.testing.assert_array_equal(np.asarray(got), want)
 
 
 # ---- Part 2: the real kernel in interpret mode, DCP ranks 0 and 1 ----

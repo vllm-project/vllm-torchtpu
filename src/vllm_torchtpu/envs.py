@@ -2511,9 +2511,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (bit-identical, drops an f32 [T, heads, D] select per call).
     "VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED": env_bool("VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED"),
     # QSA prefill block alignment (block_sparse_gqa_attention.run_with_padding):
-    # build the aligned query / blocks / lengths / page_table with a row gather
-    # plus a fill select instead of a .at[slots].set scatter (c32 1024-row
-    # step: scatter_fusion bf16[1024,6,256] x12 = 1.26 ms). Bit-identical.
+    # build the aligned query / blocks / lengths / page_table with one
+    # query_block-row slice per aligned block plus a fill select instead of a
+    # .at[slots].set scatter (8K-row TP8 step: scatter_fusion bf16[8192,3,256]
+    # 0.97 ms per QSA layer). Bit-identical.
     "VLLM_TPU_QSA_PREFILL_ALIGN_GATHER": env_bool("VLLM_TPU_QSA_PREFILL_ALIGN_GATHER"),
     # Main-KV DCP attention: route the partial output and its lse as two arrays
     # instead of one [.., D + 1] channel (a padded f32 concat plus the slices
