@@ -132,6 +132,8 @@ def indexed_options(B: int | None = None) -> dict:
         key_slots=key_slots_for(B),
         **thr_fast_options(B),
         **nvis_balance_options(B),
+        # VLLM_TPU_MK_UATTN_LITE: only when set, so the spec is unchanged when off.
+        **({"uattn_lite": True} if UNION_ATTN and envs.VLLM_TPU_MK_UATTN_LITE else {}),
     )
 
 

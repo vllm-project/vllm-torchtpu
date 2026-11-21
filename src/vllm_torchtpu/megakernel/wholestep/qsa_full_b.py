@@ -103,6 +103,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         thr_fast: str | None = None,
         req_async: int = 0,
         nvis_balance: bool = False,
+        uattn_lite: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -219,6 +220,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
         # all-gather per QSA layer (`_exchange_merged`) instead of two. Both payloads are
         # ready at the same point and copied as int32, so every rank receives the same bytes.
         self.xmerge = bool(xmerge) and bool(shard_index) and bool(union_attn) and not compressed_dcp
+        # `uattn_lite` (VLLM_TPU_MK_UATTN_LITE): union attention's per-tile op cuts
+        # (`attend_request`'s `lite`); outputs unchanged.
+        self.uattn_lite = bool(uattn_lite) and bool(union_attn)
         assert not shard_index or per_request_scores, (
             "the sharded indexer selects per request"
         )
