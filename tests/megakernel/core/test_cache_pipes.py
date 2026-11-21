@@ -293,8 +293,9 @@ def test_flat_pooled_step_uses_cache_exec_act_mode(T: int, gpr: Any):
     ("T", "gpr", "fused", "bad", "msg"),
     [
         (4, "eligible", False, "roff", "read_offset"),
+        (1, False, True, "ckpt", "checkpoint write slot"),
     ],
-    ids=["gpr_read_offsets"],
+    ids=["gpr_read_offsets", "fused_ckpt_slot"],
 )
 def test_flat_pooled_step_checks_ckpt_bounds_in_kernel_io_paths(
     T: int, gpr: Any, fused: bool, bad: str, msg: str
@@ -352,8 +353,6 @@ def test_pooled_step_checks_rank_folded_metadata_per_rank():
 
 
 def test_pooled_steps_validate_only_the_resolved_exec_spec(monkeypatch):
-    monkeypatch.setattr(_builtins, "_LOADED", set(_builtins.BUILTINS))
-    monkeypatch.setattr(fused_io_hook, "_IMPL", object())
     """A valid `fused_pool_io=False` override is not rejected for the fused mode."""
     # f32 conv, 2048 conv channels per rank: the T=6 fused conv window (256 rows)
     # exceeds one 128-row conv page, while split pool I/O fits.
@@ -384,9 +383,7 @@ def test_pooled_steps_validate_only_the_resolved_exec_spec(monkeypatch):
     assert [cache_exec(e).fused_pool_io for e in built] == [False, False]
 
 
-def test_should_fuse_pool_io_requires_the_fused_conv_window_to_fit(monkeypatch):
-    monkeypatch.setattr(_builtins, "_LOADED", set(_builtins.BUILTINS))
-    monkeypatch.setattr(fused_io_hook, "_IMPL", object())
+def test_should_fuse_pool_io_requires_the_fused_conv_window_to_fit():
     """`"auto"` falls back to split when the fused conv window misses one page."""
     spec = _f32_conv(synth_hybrid_spec(L=2, att_every=2, R=R, KH=8, VH=16))
     ex_fit, ex_big = _make_paged_ex(B=4, T=1), _make_paged_ex(B=6, T=6)
@@ -481,6 +478,15 @@ def test_resolve_model_spec_dispatch():
             cache_common.resolve_model_spec(bad)
 
 
+def test_should_fuse_pool_io_with_registered_hook():
+    """With the fused implementation registered, `auto` and `True` fuse."""
+    spec = synth_hybrid_spec(L=2, att_every=2, R=2)
+    ex = _make_paged_ex(B=8, T=1, R=2)
+    assert fused_io_hook.fused_io_available()
+    assert cache.should_fuse_pool_io(spec, ex, fused_pool_io="auto") is True
+    assert cache.should_fuse_pool_io(spec, ex, fused_pool_io=True) is True
+
+
 def test_should_fuse_pool_io_without_registered_hook(monkeypatch):
     """`should_fuse_pool_io` checks `fused_io_available` for `auto` and `True`."""
     spec = synth_hybrid_spec(L=2, att_every=2, R=2)
@@ -494,16 +500,16 @@ def test_should_fuse_pool_io_without_registered_hook(monkeypatch):
         cache.should_fuse_pool_io(spec, ex, fused_pool_io=True)
 
 
-def test_cache_experimental_wrappers_build_fused_steps(monkeypatch):
-    """The experimental wrappers forward `fused_pool_io=True` and enforce donation."""
-    monkeypatch.setattr(_builtins, "_LOADED", set(_builtins.BUILTINS))
-    monkeypatch.setattr(fused_io_hook, "_IMPL", object())
+def test_cache_experimental_wrappers_build_fused_steps():
+    """The experimental wrappers build fused steps and keep the donation guard."""
     spec = synth_hybrid_spec(L=2, att_every=2, R=R, VH=4)
     ex = _make_paged_ex(B=4, T=1)
     mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
+    step = cache_experimental.make_fused_pooled_step(mesh, spec, ex)
+    assert step.info["use_fused"] is True
+    _, _, _, donated = cache_experimental.make_flat_fused_pooled_step(mesh, spec, ex)
+    assert donated
     with pytest.raises(MegakernelConfigError, match="donate_pools=True"):
         cache_experimental.make_flat_fused_pooled_step(
             mesh, spec, ex, donate_pools=False
         )
-    with pytest.raises(MegakernelConfigError, match="donate_pools=True"):
-        cache_experimental.make_fused_pooled_step(mesh, spec, ex, donate_pools=False)
