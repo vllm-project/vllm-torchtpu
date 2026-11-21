@@ -34,6 +34,12 @@ nothing at run time; branching in torch instead gives the two sides different
 graph inputs, which vLLM's per-bucket specialization of one traced graph
 refuses (``compilation.shape_variants``).
 
+For ``VllmMoERunner`` with ``dp_size == 1`` and ``pcp_size == 1``, arming
+instead leaves the shared expert and ``routed_scaling_factor`` intact so
+``VllmMoERunner.forward`` dispatches ``m <= max_tokens`` to the fused op and
+``m > max_tokens`` to stock ``MoERunner`` / ``fused_moe_gmm``, anchoring
+``_RANK_BUFFER`` into the fallback graph for ``shape_variants`` parity.
+
 Two shared-expert conventions are served, each as vLLM's MoERunner computes it
 with the kernel off: a shared expert gated by sigmoid(x . w_g) (Qwen3.5,
 ``expert_gate``) or an ungated ``DeepseekV2MLP`` (GLM-5.2). A
@@ -76,7 +82,11 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 FUSED_MOE_DECODE_OP_ATTR = "_fused_moe_decode_op"
-_RUNNER_ARMED_ATTR = "_fused_moe_decode_armed"
+# Distinct attributes by owner object: quant_method vs VllmMoERunner.
+_QM_STATIC_DISPATCH_ATTR = "_fused_moe_decode_qm_static_dispatch"
+RUNNER_ARMED_ATTR = "_fused_moe_decode_armed"
+RUNNER_STATIC_DISPATCH_ATTR = "_fused_moe_decode_runner_static_dispatch"
+RUNNER_MAX_TOKENS_ATTR = "_fused_moe_decode_runner_max_tokens"
 # The shared expert's tensors become non-persistent buffers of the routed layer,
 # so they stay module state Dynamo traces like any weight (a tensor reached
 # through a plain attribute makes traces of the same graph disagree on inputs).
@@ -99,7 +109,11 @@ _RANK_BUFFER_INDEX: int | None = None
 
 
 def fused_moe_decode_supported(quant_method: Any) -> bool:
-    return getattr(quant_method, FUSED_MOE_DECODE_OP_ATTR, None) is not None
+    """True when the quant method's monolithic forward should call fused_moe_decode
+    (False under static dispatch, where calls reaching it are m > max_tokens)."""
+    return getattr(
+        quant_method, FUSED_MOE_DECODE_OP_ATTR, None
+    ) is not None and not getattr(quant_method, _QM_STATIC_DISPATCH_ATTR, False)
 
 
 def _gmm_layer(
@@ -280,6 +294,8 @@ def _build_op(
 
     # torch_tpu infers static arguments from annotations: every operand is a
     # jax.Array. Per-rank operands are sharded on axis 0; the gate is replicated.
+    in_specs = (spec,) * 9 + (PartitionSpec(), spec, spec, spec)
+
     def fn(
         x: jax.Array,
         w1: jax.Array,
@@ -298,7 +314,7 @@ def _build_op(
         body = jax.shard_map(
             lambda *a: local(a[-1], *a[:-1]),
             mesh=mesh,
-            in_specs=(spec,) * 9 + (PartitionSpec(), spec, spec, spec),
+            in_specs=in_specs,
             out_specs=spec,
             check_vma=False,
         )
@@ -318,15 +334,65 @@ def _build_op(
             rank,
         )
 
+    op_fn: Any = fn
+    if not shared_gated:
+        # Omit the unused gate operand so ungated decode/prefill traces lift the
+        # same graph placeholders (and avoid allocating a dummy zero buffer).
+        in_specs = (spec,) * 12
+
+        def _ungated_body(*a: jax.Array) -> jax.Array:
+            x_, w1_, w2_, w1s_, w2s_, sw1_, sw1s_, sw2_, sw2s_, tw_, ti_, rk_ = a
+            return local(
+                rk_, x_, w1_, w2_, w1s_, w2s_, sw1_, sw1s_, sw2_, sw2s_, None, tw_, ti_
+            )
+
+        def _ungated_fn(
+            x: jax.Array,
+            w1: jax.Array,
+            w2: jax.Array,
+            w1_scale: jax.Array,
+            w2_scale: jax.Array,
+            shared_w1: jax.Array,
+            shared_w1_scale: jax.Array,
+            shared_w2: jax.Array,
+            shared_w2_scale: jax.Array,
+            tw: jax.Array,
+            ti: jax.Array,
+            rank: jax.Array,
+        ) -> jax.Array:
+            body = jax.shard_map(
+                _ungated_body,
+                mesh=mesh,
+                in_specs=in_specs,
+                out_specs=spec,
+                check_vma=False,
+            )
+            return body(
+                x,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                shared_w1,
+                shared_w1_scale,
+                shared_w2,
+                shared_w2_scale,
+                tw,
+                ti.astype(jnp.int32),
+                rank,
+            )
+
+        op_fn = _ungated_fn
+
     name = "pallas::fused_moe_decode" + (f"_{len(_OPS)}" if _OPS else "")
     # torch_tpu types the partition specs as tuples of axis names, but takes
     # (and fused_moe_ep passes) jax PartitionSpecs.
     # pyrefly: ignore[no-matching-overload]
     op = jax_op(
         name,
-        fn,
+        op_fn,
         mesh=mesh,
-        input_partition_specs=(spec,) * 9 + (PartitionSpec(), spec, spec, spec),
+        input_partition_specs=in_specs,
         output_partition_specs=spec,
     )
 
@@ -363,6 +429,12 @@ def _shared_slice(runner) -> tuple | None:
     if gate_up is None or down is None:
         return None
     if gate is None and not _shared_mlp_is_ungated_silu(mlp):
+        return None
+    if getattr(gate_up, "bias", None) is not None or (
+        getattr(down, "bias", None) is not None
+    ):
+        return None
+    if getattr(down, "reduce_results", False):
         return None
     shared_w1, shared_w1_scale = (
         getattr(gate_up, "weight", None),
@@ -412,6 +484,7 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
     layer, else None."""
     from vllm.distributed import get_tensor_model_parallel_world_size
 
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
     cfg = runner.moe_config
@@ -432,6 +505,15 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
         return None
     if qm._tpu_topk_weights_float32:
         # The kernel rounds the top-k weights to bfloat16.
+        return None
+    # Match fp8.py apply_monolithic's owns_collectives short-circuit precedence.
+    if (
+        pipelined_fused_moe.enable_pipelined_collective_and_compute()
+        or envs.TPU_MOE_FP8_ALL_GATHER
+    ):
+        return None
+    if getattr(layer, "hash_indices_table", None) is not None:
+        logger.debug("fused_moe_decode: skipping hash-routed layer")
         return None
     if getattr(layer, "w13_bias", None) is not None or (
         getattr(layer, "w2_bias", None) is not None
@@ -521,6 +603,8 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         return 0
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
+    from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
+
     runners = [m for m in model.modules() if isinstance(m, MoERunner)]
     if not runners:
         return 0
@@ -572,18 +656,9 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
                 f"experts ({_RANK_BUFFER_START} vs {start})"
             )
         shared_gated = shared[4] is not None
-        if not shared_gated:
-            # Placeholder for the op's fixed gate operand; the program ignores it.
-            shared = (
-                *shared[:4],
-                torch.zeros(
-                    (1, w13_weight.shape[1]),
-                    dtype=torch.bfloat16,
-                    device=w13_weight.device,
-                ),
-            )
+        qm = runner._quant_method
         setattr(
-            runner._quant_method,
+            qm,
             FUSED_MOE_DECODE_OP_ATTR,
             _build_op(
                 mesh,
@@ -595,14 +670,28 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
                 routed_scale,
             ),
         )
-        for name, tensor in zip(_SHARED_BUFFERS, shared):
-            layer.register_buffer(name, tensor, persistent=False)
-        runner._shared_experts = None
-        # The op scales the routed experts only; the runner would scale the
-        # op's shared + routed sum.
-        runner.routed_scaling_factor = 1.0
+        par = runner.moe_config.moe_parallel_config
+        can_static_dispatch = (
+            isinstance(runner, VllmMoERunner)
+            and int(getattr(par, "dp_size", 1)) == 1
+            and int(getattr(par, "pcp_size", 1)) == 1
+        )
+        setattr(qm, _QM_STATIC_DISPATCH_ATTR, can_static_dispatch)
+        if can_static_dispatch:
+            # Keep runner._shared_experts and runner.routed_scaling_factor
+            # intact so VllmMoERunner.forward dispatches m <= max_tokens to the
+            # kernel and m > max_tokens to the unmodified stock MoERunner path.
+            object.__setattr__(runner, RUNNER_STATIC_DISPATCH_ATTR, True)
+            object.__setattr__(runner, RUNNER_MAX_TOKENS_ATTR, max_tokens)
+        else:
+            for name, tensor in zip(_SHARED_BUFFERS, shared):
+                layer.register_buffer(name, tensor, persistent=False)
+            runner._shared_experts = None
+            # The op scales the routed experts only; the runner would scale the
+            # op's shared + routed sum.
+            runner.routed_scaling_factor = 1.0
         runner._forward_entry = runner._select_forward()
-        object.__setattr__(runner, _RUNNER_ARMED_ATTR, True)
+        object.__setattr__(runner, RUNNER_ARMED_ATTR, True)
         armed += 1
     # Every rank logs: the evidence that all ranks armed the same layers.
     logger.info(
@@ -622,6 +711,18 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
     return armed
 
 
+def _invoke_op(
+    op: Any,
+    base_args: tuple[torch.Tensor, ...],
+    shared_gate_weight: torch.Tensor | None,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    if shared_gate_weight is not None:
+        return op(*base_args, shared_gate_weight, topk_weights, topk_ids, _RANK_BUFFER)
+    return op(*base_args, topk_weights, topk_ids, _RANK_BUFFER)
+
+
 def fused_moe_decode(
     quant_method: Any, layer: Any, x: torch.Tensor, topk_weights, topk_ids
 ) -> torch.Tensor:
@@ -635,7 +736,7 @@ def fused_moe_decode(
         getattr(layer, name) for name in _SHARED_BUFFERS
     )
     op = getattr(quant_method, FUSED_MOE_DECODE_OP_ATTR)
-    return op(
+    base_args = (
         x,
         layer.w13_weight,
         layer.w2_weight,
@@ -645,11 +746,114 @@ def fused_moe_decode(
         shared_w1_scale,
         shared_w2,
         shared_w2_scale,
+    )
+    return _invoke_op(op, base_args, shared_gate_weight, topk_weights, topk_ids)
+
+
+def _anchor_tensors_for_trace(
+    out: torch.Tensor, *anchors: torch.Tensor | None
+) -> torch.Tensor:
+    if not torch.compiler.is_compiling():
+        return out
+    live = [a for a in anchors if a is not None]
+    if not live:
+        return out
+    elem = out if out.ndim == 0 else out[(0,) * out.ndim]
+    cond = elem.to(torch.float32) < 0
+    for anchor in live:
+        a = anchor if anchor.ndim == 0 else anchor[(0,) * anchor.ndim]
+        cond = torch.logical_or(cond, a.to(torch.float32) < 0)
+    return torch.where(cond, out, out)
+
+
+def anchor_rank_buffer_for_trace(out: torch.Tensor) -> torch.Tensor:
+    """Anchor ``_RANK_BUFFER`` into ``m > max_tokens`` FX inputs for
+    ``shape_variants`` parity (XLA folds ``select(p, out, out) -> out``)."""
+    return _anchor_tensors_for_trace(out, _RANK_BUFFER)
+
+
+def fused_moe_decode_runner_forward(
+    runner: Any,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+) -> torch.Tensor:
+    """Runner-level ``m <= max_tokens`` entry point for static dispatch.
+
+    Reads and FX-anchors live parameters in ``MoERunner.forward``'s exact
+    consumption order so ``split_module`` lifts identical ordered placeholders
+    across traces (and in-place weight updates apply without re-arming).
+
+    Mirrors vLLM ``MoERunner`` + ``VllmFp8MoEMethodTPU.apply_monolithic``:
+    1. ``layer._ensure_moe_quant_config_init()``
+    2. ``runner.gate(hidden_states)`` (when present)
+    3. Shared-expert FX anchor (``shared_w1..shared_gate`` before routing)
+    4. ``runner.router.prepare_monolithic_logits(router_logits)``
+    5. ``moe_routing.route(...)`` & ``zero_routing_weights_for_padding(...)``
+    6. EP routed-weight + ``_experts_start`` anchor (before ``_RANK_BUFFER``)
+    7. ``runner._maybe_add_zero_expert_output(out)``
+    """
+    from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+
+    layer = runner.routed_experts
+    layer._ensure_moe_quant_config_init()
+    if runner.gate is not None:
+        assert not getattr(runner, "_fse_fuse_gate", False), (
+            "fused_moe_decode does not admit fused shared_expert_gate"
+        )
+        router_logits, _ = runner.gate(hidden_states)
+
+    mlp = runner._shared_experts._layer
+    shared_w1, shared_w1_scale = mlp.gate_up_proj.weight, mlp.gate_up_proj.weight_scale
+    shared_w2, shared_w2_scale = mlp.down_proj.weight, mlp.down_proj.weight_scale
+    gate = getattr(mlp, "expert_gate", None)
+    shared_gate_weight = None if gate is None else gate.weight
+    hidden_states = _anchor_tensors_for_trace(
+        hidden_states,
+        shared_w1,
+        shared_w1_scale,
+        shared_w2,
+        shared_w2_scale,
+        shared_gate_weight,
+    )
+
+    router_logits = runner.router.prepare_monolithic_logits(router_logits)
+    qm = runner._quant_method
+    topk_weights, topk_ids = moe_routing.route(
+        layer,
+        hidden_states,
+        router_logits,
+        topk_weights_float32=getattr(qm, "_tpu_topk_weights_float32", False),
+    )
+    if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+        topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+            topk_ids, topk_weights, is_local_tensor=False
+        )
+
+    routed_args = (
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale_inv,
+        layer.w2_weight_scale_inv,
+    )
+    experts_start = getattr(layer, "_experts_start", None)
+    if experts_start is not None:
+        topk_ids = _anchor_tensors_for_trace(topk_ids, *routed_args, experts_start)
+    base_args = (
+        hidden_states,
+        *routed_args,
+        shared_w1,
+        shared_w1_scale,
+        shared_w2,
+        shared_w2_scale,
+    )
+    out = _invoke_op(
+        getattr(qm, FUSED_MOE_DECODE_OP_ATTR),
+        base_args,
         shared_gate_weight,
         topk_weights,
         topk_ids,
-        _RANK_BUFFER,
     )
+    return runner._maybe_add_zero_expert_output(out)
 
 
 def arm_runner_models(model_runner: Any) -> int:
