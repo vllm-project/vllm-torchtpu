@@ -560,7 +560,16 @@ def make_step(
         raw_outs = dict(zip(o_names[1:], out_vals[1:]))
         new_states = {k: v for k, v in states.items() if _is_mutable_state(k)}
         for m in modules:
-            new_states.update(m.host_update_states(g, ex, pos, new_states, raw_outs))
+            upd = m.host_update_states(g, ex, pos, new_states, raw_outs)
+            if "kv" in ex.skip:
+                upd = {k: v for k, v in upd.items() if k not in ("kc", "vc")}
+            if "gdn_state" in ex.skip:
+                upd = {
+                    k: v
+                    for k, v in upd.items()
+                    if k not in ("conv", "rec", "conv_ckpt", "rec_ckpt")
+                }
+            new_states.update(upd)
         return hid, new_states
 
     def _is_mutable_state(k: str) -> bool:

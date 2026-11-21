@@ -159,24 +159,45 @@ def test_kernel_build_ablations_and_scopes():
         assert info_abl["exec"].skip == frozenset({abl})
         assert step_abl.lower(pos_mk, hid_mk, w_mk, st_mk) is not None
 
-    # Execute `skip={"experts", "attn", "kv"}` (finite) and `skip={"comm"}`
-    # (ranks diverge when allreduce communication is ablated).
+    # Execute `skip={"kv"}` alone and `skip={"experts", "attn", "kv"}`: `kc`/`vc`
+    # remain byte-identical to `st_mk`, whereas un-skipped KV updates `kc`/`vc`.
+    ex_skip_kv = dataclasses.replace(
+        base_ex, debug=DebugOptions(skip=frozenset({"kv"}))
+    )
+    step_kv, _ = kernel.make_step(mesh, spec, ex_skip_kv)
+    _, out_st_kv = step_kv(pos_mk, hid_mk, w_mk, st_mk)
+    for k in ("kc", "vc"):
+        np.testing.assert_array_equal(
+            np.asarray(out_st_kv[k]).view(np.uint8),
+            np.asarray(st_mk[k]).view(np.uint8),
+        )
+
     ex_skip_eak = dataclasses.replace(
         base_ex,
         debug=DebugOptions(skip=frozenset({"experts", "attn", "kv"}), scopes=2),
     )
     step_eak, _ = kernel.make_step(mesh, spec, ex_skip_eak)
-    out_eak, _ = step_eak(pos_mk, hid_mk, w_mk, st_mk)
+    out_eak, out_st_eak = step_eak(pos_mk, hid_mk, w_mk, st_mk)
     jax.block_until_ready(out_eak)
     assert jnp.all(
         jnp.isfinite(out_eak.reshape(R, base_ex.M, spec.config.H)[:, : base_ex.B])
     )
+    for k in ("kc", "vc"):
+        np.testing.assert_array_equal(
+            np.asarray(out_st_eak[k]).view(np.uint8),
+            np.asarray(st_mk[k]).view(np.uint8),
+        )
 
     ex_skip_comm = dataclasses.replace(
         base_ex, debug=DebugOptions(skip=frozenset({"comm"}), scopes=1)
     )
     step_comm, _ = kernel.make_step(mesh, spec, ex_skip_comm)
-    out_comm, _ = step_comm(pos_mk, hid_mk, w_mk, st_mk)
+    out_comm, out_st_comm = step_comm(pos_mk, hid_mk, w_mk, st_mk)
+    for k in ("kc", "vc"):
+        assert not np.array_equal(
+            np.asarray(out_st_comm[k]).view(np.uint8),
+            np.asarray(st_mk[k]).view(np.uint8),
+        )
     out_comm_r = np.asarray(
         out_comm.reshape(R, base_ex.M, spec.config.H)[:, : base_ex.B]
     )
