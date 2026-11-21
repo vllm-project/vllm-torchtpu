@@ -114,7 +114,7 @@ def _arm(monkeypatch, engine, ep_size: int, sequence_parallel: bool = False) -> 
 @pytest.mark.parametrize("arch", QWEN3_5_ARCHS)
 def test_measured_checkpoint_on_tpu7x_takes_the_kernel_numerics(arch):
     assert hooks.is_measured_target(_model(SHAPE_397B, arch)) is True
-    assert hooks.apply_kernel_numerics(_model(SHAPE_397B, arch)) is None
+    assert hooks.apply_kernel_numerics(_model(SHAPE_397B, arch)) is True
     assert _levers() == ON
 
 
@@ -226,7 +226,7 @@ def _legs(path: pathlib.Path) -> dict:
 def test_validation_legs_take_the_levers_this_tree_gives_them(monkeypatch, path):
     legs = _legs(path)
     # Both legs serve the measured checkpoint on TPU7x: the kernel numerics.
-    assert hooks.apply_kernel_numerics(_model(SHAPE_397B)) is None
+    assert hooks.apply_kernel_numerics(_model(SHAPE_397B)) is True
     assert _levers() == ON
     # The decode leg: EP8 at TP2 or TP8, with its own MoE environment (fused
     # EP v3 and sequence-parallel MoE).
