@@ -25,6 +25,7 @@ import pytest
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.roofline as rf
+from tests.roofline.conftest import NEMOTRON_CFG
 from vllm_torchtpu.roofline import (
     CHIPS,
     TOPOLOGIES,
@@ -34,13 +35,17 @@ from vllm_torchtpu.roofline import (
     count_layer_types,
 )
 from vllm_torchtpu.roofline import constants as rf_constants
+from vllm_torchtpu.roofline import geometry as rf_geometry
 from vllm_torchtpu.roofline.constants import (
     BASE_DTYPE_BYTES,
+    BITS_PER_BYTE,
     DEFAULT_ICI_BW,
     DEFAULT_ICI_HOP_LATENCY_S,
     DEFAULT_ICI_LINK_BW,
+    DEFAULT_VECTOR_TO_BF16_RATIO,
     FP8_BYTES,
     TPU7X_ICI_LINKS_PER_CHIP,
+    UNIT_GIGA,
 )
 from vllm_torchtpu.roofline.geometry import (
     UnsupportedArchitectureError,
@@ -48,29 +53,6 @@ from vllm_torchtpu.roofline.geometry import (
     supports,
 )
 from vllm_torchtpu.roofline.partition import count_full_attn_layers
-
-QWEN35_CFG: dict[str, object] = {
-    "text_config": {
-        "hidden_size": 4096,
-        "num_hidden_layers": 60,
-        "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 15,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 2,
-        "head_dim": 256,
-        "attn_output_gate": True,
-        "linear_num_key_heads": 16,
-        "linear_num_value_heads": 64,
-        "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128,
-        "linear_conv_kernel_dim": 4,
-        "num_experts": 512,
-        "num_experts_per_tok": 10,
-        "moe_intermediate_size": 1024,
-        "shared_expert_intermediate_size": 1024,
-        "vocab_size": 248320,
-        "mtp_num_hidden_layers": 1,
-    }
-}
 
 
 def test_topologies_exclude_subhost_shapes() -> None:
@@ -107,7 +89,11 @@ def test_chip_table_matches_jax_tpu_info() -> None:
     assert chip.has_sparse_core is (info.sparse_core is not None)
     if info.sparse_core is not None:
         assert chip.dma_granule_bytes == info.sparse_core.dma_granule_size_bytes
-    assert (chip.ici_link_bw, chip.ici_bw, chip.ici_hop_latency_s) == (
+    assert (
+        chip.ici_link_bw,
+        chip.ici_bw,
+        chip.ici_hop_latency_s,
+    ) == (
         DEFAULT_ICI_LINK_BW,
         DEFAULT_ICI_BW,
         DEFAULT_ICI_HOP_LATENCY_S,
@@ -117,7 +103,13 @@ def test_chip_table_matches_jax_tpu_info() -> None:
 def test_core_has_no_engine_imports() -> None:
     """Ensure roofline core package has zero dependencies on torch or vllm."""
     pkg_dir = Path(__file__).resolve().parents[2] / "src/vllm_torchtpu/roofline"
-    banned = {"vllm", "torch", "torch_tpu", "numpy", "vllm_torchtpu"}
+    banned = {
+        "vllm",
+        "torch",
+        "torch_tpu",
+        "numpy",
+        "vllm_torchtpu",
+    }
     for py_file in sorted(pkg_dir.glob("*.py")):
         tree = ast.parse(py_file.read_text(), filename=str(py_file))
         for node in ast.walk(tree):
@@ -174,6 +166,7 @@ def test_from_hf_config_sliding_window_kda_and_zero_kv_heads() -> None:
         }
     )
     assert swa_geom.layer_types == ("sliding_attention",) * 4
+
     kda_geom = from_hf_config(
         {
             "hidden_size": 2048,
@@ -203,6 +196,7 @@ def test_linear_conv_kernel_dim_validation() -> None:
     }
     with pytest.raises(ValueError, match="linear_conv_kernel_dim"):
         from_hf_config(cfg_bad)
+
     cfg_non_linear = {
         "hidden_size": 4096,
         "num_hidden_layers": 4,
@@ -306,8 +300,13 @@ def test_supports_validator_fails_closed_on_unknown_arch() -> None:
             "layer_types": ["retnet_retention", "full_attention"],
             "vocab_size": 32000,
         },
-        {"vision_config": {"hidden_size": 1024}, "text_config": None},
-        {"vision_config": {"hidden_size": 1024}},
+        {
+            "vision_config": {"hidden_size": 1024},
+            "text_config": None,
+        },
+        {
+            "vision_config": {"hidden_size": 1024},
+        },
     ):
         with pytest.raises(rf.UnsupportedArchitectureError):
             rf.supports(bad_cfg)
@@ -349,6 +348,7 @@ def test_kimi_linear_and_hybrid_multimodel_configs() -> None:
     assert kg.conv_kernel == exp_conv_kernel
     assert kg.linear_k_heads == exp_k_heads
     assert kg.linear_k_dim == exp_k_dim
+
     llama4_cfg = {
         "model_type": "llama4_text",
         "hidden_size": 5120,
@@ -365,6 +365,7 @@ def test_kimi_linear_and_hybrid_multimodel_configs() -> None:
     lg = rf.from_hf_config(llama4_cfg)
     exp_moe_layers = 3
     assert lg.n_moe_layers == exp_moe_layers
+
     gemma4_cfg = {
         "model_type": "gemma4_text",
         "hidden_size": 3840,
@@ -385,6 +386,7 @@ def test_kimi_linear_and_hybrid_multimodel_configs() -> None:
     assert gg.global_head_dim == exp_global_head_dim
     assert gg.layer_types.count("full_attention") == exp_full_layers
     assert gg.layer_types.count("sliding_attention") == exp_sliding_layers
+
     minimax_cfg = {
         "model_type": "minimax_text_01",
         "hidden_size": 4096,
@@ -406,57 +408,309 @@ def test_kimi_linear_and_hybrid_multimodel_configs() -> None:
         "full_attention",
     )
     assert mg.conv_kernel == 0
-    nemotron_cfg = {
-        "model_type": "nemotron_h",
-        "hidden_size": 4096,
-        "num_hidden_layers": 6,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-        "mamba_num_heads": 64,
-        "mamba_head_dim": 64,
-        "conv_kernel": 4,
-        "hybrid_override_pattern": "M-M*ME",
-        "n_routed_experts": 16,
-        "num_experts_per_tok": 2,
-        "moe_intermediate_size": 2048,
-        "intermediate_size": 8192,
-        "vocab_size": 131072,
-    }
-    ng = rf.from_hf_config(nemotron_cfg)
+
+    ng = rf.from_hf_config(NEMOTRON_CFG)
     exp_ffn_only = 2
     assert ng.layer_types.count("ffn_only") == exp_ffn_only
     assert ng.n_moe_layers == 1
     assert ng.n_dense_layers == 1
+
     with pytest.raises(FileNotFoundError, match="Offline mode"):
         rf.load_hf_config("nonexistent-org/nonexistent-model-6a", offline=True)
 
 
 def test_ffn_only_hybrid_override_excluded_from_full_attn_count() -> None:
     """Verify ffn_only layers from hybrid_override are excluded from full-attn count."""
-    nemotron_cfg = {
-        "model_type": "nemotron_h",
-        "hidden_size": 4096,
-        "num_hidden_layers": 6,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-        "mamba_num_heads": 64,
-        "mamba_head_dim": 64,
-        "conv_kernel": 4,
-        "hybrid_override_pattern": "M-M*ME",
-        "n_routed_experts": 16,
-        "num_experts_per_tok": 2,
-        "moe_intermediate_size": 2048,
-        "intermediate_size": 8192,
-        "vocab_size": 131072,
-    }
-    ng = rf.from_hf_config(nemotron_cfg)
+    ng = rf.from_hf_config(NEMOTRON_CFG)
     exp_ffn_count = 2
     assert ng.layer_types.count("ffn_only") == exp_ffn_count
     assert ng.ffn_layer_counts() == (1, 1)
     assert ng.ffn_kinds == ("none", "dense", "none", "none", "none", "moe")
     assert count_full_attn_layers(ng) == 1
+
+
+def test_dcn_per_chip_derives_from_host_bandwidth() -> None:
+    """Verify per-chip DCN bandwidth is derived from host Gbit/s and chip count."""
+    chip = CHIPS["tpu7x"]
+    # 400 Gbit/s host NIC / 8 bits / 4 chips per host = 12.5 GB/s
+    expected_dcn_bw = (400.0e9 / 8.0) / 4.0
+    assert chip.dcn_bw == pytest.approx(expected_dcn_bw)
+    low = chips.from_jax(
+        "tpu7x",
+        pltpu.ChipVersion.TPU_7X,
+        ChipOverrides(dcn_host_gbit_per_s=200.0, chips_per_host=4),
+    )
+    high = chips.from_jax(
+        "tpu7x",
+        pltpu.ChipVersion.TPU_7X,
+        ChipOverrides(dcn_host_gbit_per_s=800.0, chips_per_host=4),
+    )
+    # 200 Gbit/s host NIC / 8 bits / 4 chips = 6.25 GB/s
+    assert low.dcn_bw == pytest.approx((200.0e9 / 8.0) / 4.0)
+    # 800 Gbit/s host NIC / 8 bits / 4 chips = 25.0 GB/s
+    assert high.dcn_bw == pytest.approx((800.0e9 / 8.0) / 4.0)
+
+
+def test_every_constant_has_kind_unit_scope_source() -> None:
+    """Verify every catalog constant carries value, unit, scope, kind, and source."""
+    tpu_info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    cat = CHIPS["tpu7x"].catalog()
+    expected_kinds = {
+        "hbm_bytes": "fact",
+        "hbm_bw": "fact",
+        "bf16_flops": "fact",
+        "fp8_flops": "fact",
+        "vmem_bytes": "fact",
+        "cores_per_chip": "fact",
+        "ici_link_bw": "derived",
+        "d2d_bw": "derived",
+        "ici_bw": "derived",
+        "dcn_bw": "derived",
+        "vector_flops": "derived",
+        "mxu_lhs_rows_bf16": "fact",
+        "mxu_lhs_rows_fp8": "fact",
+        "ici_hop_latency_s": "assumed",
+        "pcie_bw": "assumed",
+        "mxu_m_tile": "assumed",
+        "dcn_host_gbit_per_s": "assumed",
+        "chips_per_host": "assumed",
+        "page_table_byte_budget": "assumed",
+        "rpa_page_size_tokens": "assumed",
+        "default_gpu_memory_utilization": "config",
+    }
+    for key, exp_kind in expected_kinds.items():
+        assert key in cat, f"missing catalog key {key}"
+        entry = cat[key]
+        assert entry["kind"] == exp_kind
+        assert entry["scope"] in {"core", "chip", "host", "link"}
+        unit = entry["unit"]
+        source = entry["source"]
+        assert isinstance(unit, str)
+        assert bool(unit.strip())
+        assert isinstance(source, str)
+        assert bool(source.strip())
+        assert "value" in entry
+        if exp_kind == "assumed":
+            assert entry["bracket"] is not None
+    # 400 Gbit/s host NIC / 8 bits / 4 chips per host = 12.5 GB/s
+    assert cat["dcn_bw"]["value"] == pytest.approx((400.0e9 / 8.0) / 4.0)
+    assert cat["vector_flops"]["value"] == pytest.approx(CHIPS["tpu7x"].vector_flops)
+    assert cat["mxu_lhs_rows_bf16"]["value"] == tpu_info.get_sublane_tiling(
+        jnp.bfloat16
+    )
+    assert cat["mxu_lhs_rows_fp8"]["value"] == tpu_info.get_sublane_tiling(
+        jnp.float8_e4m3fn
+    )
+    bracket = cat["dcn_bw"]["bracket"]
+    assert isinstance(bracket, tuple)
+    assert list(bracket) == [(200.0e9 / 8.0) / 4.0, (800.0e9 / 8.0) / 4.0]
+
+
+def test_second_chip_entry_loads_without_code_change() -> None:
+    """Verify a second JAX ChipVersion loads via from_jax without code edits."""
+    tpu6e_info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_V6E, 1)
+    synth_link_bw = 50.0e9
+    synth_dcn_host_gbit = 200.0
+    synth_chips_per_host = 4
+    spec = chips.from_jax(
+        "tpu6e",
+        pltpu.ChipVersion.TPU_V6E,
+        ChipOverrides(
+            ici_link_bw=synth_link_bw,
+            dcn_host_gbit_per_s=synth_dcn_host_gbit,
+            chips_per_host=synth_chips_per_host,
+        ),
+    )
+    assert spec.name == "tpu6e"
+    assert spec.hbm_bytes == tpu6e_info.hbm_capacity_bytes
+    assert spec.cores_per_chip == 1
+    expected_d2d = float(TPU7X_ICI_LINKS_PER_CHIP) * synth_link_bw
+    assert spec.d2d_bw == pytest.approx(expected_d2d)
+    assert spec.ici_bw == pytest.approx(DEFAULT_ICI_BW)
+    expected_dcn = (synth_dcn_host_gbit * 1.0e9 / 8.0) / synth_chips_per_host
+    assert spec.dcn_bw == pytest.approx(expected_dcn)
+    cat = spec.catalog()
+    assert cat["hbm_bytes"]["value"] == tpu6e_info.hbm_capacity_bytes
+    assert cat["dcn_bw"]["value"] == pytest.approx(expected_dcn)
+
+
+def test_supports_closed_world_model_type_allowlist() -> None:
+    """Assert closed-world allowlist accepts head & served types and rejects others."""
+    # 1. Verify head-test and served model families are accepted
+    head_test_model_types = (
+        "llama",
+        "llama4_text",
+        "qwen3_moe",
+        "qwen3_5_moe",
+        "qwen3_8_moe",
+        "deepseek_v4",
+        "glm5",
+        "kimi_linear",
+        "gpt_oss",
+        "gemma4_text",
+        "minimax_text_01",
+    )
+    for model_type in head_test_model_types:
+        sample_config: dict[str, object] = {
+            "model_type": model_type,
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "vocab_size": 32000,
+        }
+        if model_type == "kimi_linear":
+            sample_config["linear_attn_config"] = {
+                "num_heads": 16,
+                "head_dim": 128,
+            }
+        rf.supports(sample_config)
+
+    # Hybrid SSM with GDN keys must be accepted
+    nemotron_valid: dict[str, object] = {
+        "model_type": "nemotron_h",
+        "hidden_size": 2048,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 16,
+        "mamba_num_heads": 64,
+        "vocab_size": 32000,
+    }
+    rf.supports(nemotron_valid)
+    expected_chips = frozenset(rf.CHIPS)
+    assert expected_chips == rf.SUPPORTED_CHIPS
+
+    # Served multimodal and custom causal architecture class names must pass supports()
+    served_arch_configs: tuple[dict[str, object], ...] = (
+        {
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "model_type": "qwen3_5_moe",
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "hidden_size": 4096,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 32,
+                "vocab_size": 248320,
+            },
+        },
+        {
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 4096,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 32,
+                "vocab_size": 248320,
+            },
+        },
+        {
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "model_type": "qwen4_exp",
+            "hidden_size": 4096,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 32,
+            "vocab_size": 151936,
+        },
+        {
+            "architectures": ["KimiK3ForConditionalGeneration"],
+            "model_type": "kimi_k3",
+            "hidden_size": 7168,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 64,
+            "vocab_size": 163840,
+        },
+    )
+    for served_cfg in served_arch_configs:
+        rf.supports(served_cfg)
+
+    # 2. Verify unlisted, pure-SSM, and non-causal types raise
+    # UnsupportedArchitectureError
+    rejected_configs: tuple[dict[str, object], ...] = (
+        {
+            "model_type": "bert",
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "vocab_size": 30522,
+        },
+        {
+            "model_type": "roberta",
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "vocab_size": 50265,
+        },
+        {
+            "model_type": "t5",
+            "hidden_size": 512,
+            "num_hidden_layers": 6,
+            "vocab_size": 32128,
+        },
+        {
+            "model_type": "mamba2",
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "vocab_size": 32000,
+        },
+        {
+            "model_type": "rwkv",
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "vocab_size": 32000,
+        },
+        {
+            "model_type": "falcon_mamba",
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "vocab_size": 32000,
+        },
+        {
+            "model_type": "unknown_future_ssm",
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "vocab_size": 32000,
+        },
+        # Hybrid SSM without GDN keys must fail closed
+        {
+            "model_type": "nemotron_h",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "vocab_size": 32000,
+        },
+    )
+    for bad_cfg in rejected_configs:
+        with pytest.raises(rf.UnsupportedArchitectureError):
+            rf.supports(bad_cfg)
+
+
+def test_explicit_gqa_token_stays_gqa_when_kv_lora_rank_positive() -> None:
+    """Verify count_layer_types keeps explicit gqa tokens when kv_lora_rank > 0."""
+    geom = from_hf_config(
+        {
+            "hidden_size": 4096,
+            "num_hidden_layers": 4,
+            "layer_types": ("gqa", "gqa", "dsa", "full_attention"),
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 32000,
+            "kv_lora_rank": 512,
+            "index_topk": 2048,
+        }
+    )
+    counts = rf_geometry.count_layer_types(geom)
+    expected_gqa_count = 2
+    expected_mla_count = 2
+    expected_dsa_count = 2
+    expected_swa_count = 0
+    expected_gdn_count = 0
+    expected_kda_count = 0
+    expected_total_count = 4
+    assert counts.gqa == expected_gqa_count
+    assert counts.mla == expected_mla_count
+    assert counts.dsa == expected_dsa_count
+    assert counts.swa == expected_swa_count
+    assert counts.gdn == expected_gdn_count
+    assert counts.kda == expected_kda_count
+    assert counts.attn_total == expected_total_count
 
 
 def test_chips_sources_contain_no_legacy_tpu_v5_or_v4_references() -> None:
@@ -686,3 +940,55 @@ def test_slice_topology_validates_axes_and_chip_overrides_decouples_ici() -> Non
     )
     for fp8_alias in ("float8_e8m0fnu", "e8m0", "float8_e5m2"):
         assert BASE_DTYPE_BYTES[fp8_alias] == FP8_BYTES
+
+
+def test_from_jax_applies_chip_overrides() -> None:
+    """Verify from_jax applies keyword and ChipOverrides rates over JAX info."""
+    tpu_info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    custom_cores = 4
+    custom_link_bw = 120.0 * UNIT_GIGA
+    custom_hop_s = 2.5e-6
+    base_overrides = ChipOverrides(
+        dcn_host_gbit_per_s=800.0,
+        chips_per_host=4,
+    )
+    spec_kw = chips.from_jax(
+        "tpu7x",
+        pltpu.ChipVersion.TPU_7X,
+        overrides=base_overrides,
+        cores_per_chip=custom_cores,
+        ici_link_bw=custom_link_bw,
+        ici_hop_latency_s=custom_hop_s,
+    )
+    expected_d2d = float(TPU7X_ICI_LINKS_PER_CHIP) * custom_link_bw
+    assert spec_kw.hbm_bytes == tpu_info.hbm_capacity_bytes
+    assert spec_kw.cores_per_chip == custom_cores
+    assert spec_kw.ici_hop_latency_s == pytest.approx(custom_hop_s, rel=1e-12)
+    assert spec_kw.d2d_bw == pytest.approx(expected_d2d, rel=1e-12)
+    assert spec_kw.ici_bw == pytest.approx(expected_d2d / custom_cores, rel=1e-12)
+    assert spec_kw.dcn_bw == pytest.approx(
+        (800.0 * UNIT_GIGA / BITS_PER_BYTE) / 4.0, rel=1e-12
+    )
+    assert spec_kw.vector_flops == pytest.approx(
+        float(tpu_info.bf16_ops_per_second) * DEFAULT_VECTOR_TO_BF16_RATIO, rel=1e-12
+    )
+
+    explicit = ChipOverrides(
+        d2d_bw=500.0 * UNIT_GIGA,
+        ici_bw=220.0 * UNIT_GIGA,
+        dcn_bw=40.0 * UNIT_GIGA,
+        vector_flops=12.0e12,
+    )
+    spec_exp = chips.from_jax(
+        "tpu7x", pltpu.ChipVersion.TPU_7X, overrides=explicit, ici_bw=210.0e9
+    )
+    assert spec_exp.d2d_bw == pytest.approx(500.0 * UNIT_GIGA, rel=1e-12)
+    assert spec_exp.ici_bw == pytest.approx(210.0e9, rel=1e-12)
+    assert spec_exp.dcn_bw == pytest.approx(40.0 * UNIT_GIGA, rel=1e-12)
+    assert spec_exp.vector_flops == pytest.approx(12.0e12, rel=1e-12)
+
+
+def test_from_jax_rejects_non_chip_version() -> None:
+    """Verify from_jax raises TypeError when version is not a ChipVersion."""
+    with pytest.raises(TypeError, match="ChipVersion"):
+        chips.from_jax("unknown_tpu", "unknown_tpu")

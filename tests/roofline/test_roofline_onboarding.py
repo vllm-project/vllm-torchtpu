@@ -11,21 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Onboarding audit, key-tracker, param-count oracle, and layer-selection tests."""
+"""Onboarding audit, key-tracker, param-count oracle, and inspect CLI tests."""
 
 from __future__ import annotations
+
+import json
+from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import pytest
 
 from tests.roofline.conftest import SMALL_HYBRID_MOE_CFG
 from vllm_torchtpu.roofline import (
+    CHIPS,
+    INSPECT_SCHEMA,
     Dtypes,
     KeyTracker,
     Parallel,
     SeqKvLayout,
+    UnsupportedArchitectureError,
     audit_hf_config,
+    cli,
     count_layer_types,
     from_hf_config,
+    hbm_breakdown_per_core_bytes,
+    kv_bytes_per_token_per_layer,
     param_counts,
     pass_costs,
 )
@@ -33,15 +43,20 @@ from vllm_torchtpu.roofline.constants import (
     GLU_MATMUL_COUNT,
     NON_GATED_MATMUL_COUNT,
 )
-from vllm_torchtpu.roofline.memory import (
-    compute_w_attn,
-    hbm_breakdown_per_core_bytes,
-)
-from vllm_torchtpu.roofline.modules import StepShape, kv_bytes_per_token_per_layer
+from vllm_torchtpu.roofline.memory import compute_w_attn
+from vllm_torchtpu.roofline.modules import StepShape
+from vllm_torchtpu.roofline.partition import _pp_layer_prefixes, pp_stage_breakdowns
 from vllm_torchtpu.roofline.solver import (
     _valid_gdn_degree,
     _valid_raiden_gdn_pair,
 )
+from vllm_torchtpu.roofline.step import (
+    UnpaddedFloorOptions,
+    unpadded_strict_resource_times,
+)
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 _UNIT_BYTE_TOL = 1e-6
 _KDA_EXPECTED_LAYERS = 6
@@ -57,6 +72,10 @@ _FOUR_LAYER_COUNT = 4
 _THREE_LAYER_COUNT = 3
 _TWO_LAYER_COUNT = 2
 _CONTEXT_1024 = 1024
+_PP_TWO = 2
+_PP_BATCH = 4
+_WIDE_PHYSICAL_ALIGN = 256
+_WEIGHT_REL_TOL = 1e-6
 
 
 def _mla_moe_cfg() -> dict[str, object]:
@@ -395,6 +414,154 @@ def test_param_counts_conservation_reference_models() -> None:
     _assert_tied_and_opt_param_conservation()
 
 
+def test_allow_unlisted_model_type_gate_and_cli_inspect(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify fail-closed model_type gating, CLI flag threading, and inspect JSON."""
+    unlisted_path = tmp_path / "unlisted_dense.json"
+    unlisted_path.write_text(
+        json.dumps(
+            {
+                "model_type": "novel_dense_v1",
+                "hidden_size": 512,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 64,
+                "intermediate_size": 1024,
+                "vocab_size": 32000,
+                "dtype": "bfloat16",
+            }
+        )
+    )
+    pure_ssm_path = tmp_path / "pure_ssm.json"
+    pure_ssm_path.write_text(
+        json.dumps(
+            {
+                "model_type": "novel_ssm_v1",
+                "hidden_size": 1024,
+                "num_hidden_layers": 4,
+                "ssm_cfg": {"d_state": 64},
+                "dtype": "bfloat16",
+            }
+        )
+    )
+
+    rc_blocked = cli.main(["inspect", "--config", str(unlisted_path), "--json"])
+    assert rc_blocked == cli.EXIT_ERROR
+    blocked_payload = json.loads(capsys.readouterr().out)
+    assert blocked_payload["schema_version"] == INSPECT_SCHEMA
+    assert blocked_payload["onboarding_tier"] == "tier1_config_needed"
+    assert blocked_payload["model_type_status"] == "unlisted_blocked"
+    assert blocked_payload["blocking_reasons"]
+
+    rc_allowed = cli.main(
+        [
+            "inspect",
+            "--config",
+            str(unlisted_path),
+            "--allow-unlisted-model-type",
+            "--json",
+        ]
+    )
+    assert rc_allowed == 0
+    allowed_payload = json.loads(capsys.readouterr().out)
+    assert allowed_payload["schema_version"] == INSPECT_SCHEMA
+    assert allowed_payload["onboarding_tier"] == "tier0_ready"
+    assert allowed_payload["model_type_status"] == "unlisted_structural_ok"
+    assert allowed_payload["param_counts"]["total_params"] > 0
+
+    rc_plan_blocked = cli.main(
+        ["plan", "--config", str(unlisted_path), "--tp", "1", "--json"]
+    )
+    capsys.readouterr()
+    assert rc_plan_blocked == cli.EXIT_ERROR
+
+    rc_plan_allowed = cli.main(
+        [
+            "plan",
+            "--config",
+            str(unlisted_path),
+            "--allow-unlisted-model-type",
+            "--tp",
+            "1",
+            "--json",
+        ]
+    )
+    plan_rows = json.loads(capsys.readouterr().out)
+    assert rc_plan_allowed == 0
+    assert len(plan_rows) > 0
+
+    rc_ssm = cli.main(
+        [
+            "inspect",
+            "--config",
+            str(pure_ssm_path),
+            "--allow-unlisted-model-type",
+            "--json",
+        ]
+    )
+    assert rc_ssm == cli.EXIT_ERROR
+    ssm_payload = json.loads(capsys.readouterr().out)
+    assert ssm_payload["schema_version"] == INSPECT_SCHEMA
+    assert ssm_payload["onboarding_tier"] == "tier2_primitive_needed"
+    assert ssm_payload["blocking_reasons"]
+
+
+def test_inspect_text_output_and_unlisted_tier2_blocker(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify _write_inspect_text output and tier-2 handling on unlisted dry-runs."""
+    unlisted_cfg: dict[str, object] = {
+        "model_type": "novel_dense_v2",
+        "hidden_size": 512,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+        "intermediate_size": 1024,
+        "vocab_size": 32000,
+        "dtype": "bfloat16",
+    }
+    cfg_path = tmp_path / "unlisted_text.json"
+    cfg_path.write_text(json.dumps(unlisted_cfg))
+
+    rc_text_ok = cli.main(
+        ["inspect", "--config", str(cfg_path), "--allow-unlisted-model-type"]
+    )
+    stdout_ok = capsys.readouterr().out
+    assert rc_text_ok == 0
+    assert f"schema_version: {INSPECT_SCHEMA}" in stdout_ok
+    assert "onboarding_tier: tier0_ready" in stdout_ok
+    assert "model_type_status: unlisted_structural_ok" in stdout_ok
+    assert "param_counts: total=" in stdout_ok
+
+    rc_text_blocked = cli.main(["inspect", "--config", str(cfg_path)])
+    stdout_blocked = capsys.readouterr().out
+    assert rc_text_blocked == cli.EXIT_ERROR
+    assert "onboarding_tier: tier1_config_needed" in stdout_blocked
+    assert "blocking_reasons:" in stdout_blocked
+
+    def _raise_tier2(
+        *_args: object,
+        **_kwargs: object,
+    ) -> object:
+        """Raise UnsupportedArchitectureError to simulate a tier-2 gap."""
+        msg = "simulated tier-2 primitive op"
+        raise UnsupportedArchitectureError(msg)
+
+    monkeypatch.setattr("vllm_torchtpu.roofline.hf_loader.from_hf_config", _raise_tier2)
+    tier2_audit = audit_hf_config(unlisted_cfg, allow_unlisted_model_type=False)
+    assert tier2_audit.onboarding_tier == "tier2_primitive_needed"
+    assert tier2_audit.model_type_status == "unlisted_blocked"
+    assert any(
+        "simulated tier-2 primitive op" in r for r in tier2_audit.blocking_reasons
+    )
+
+
 def test_partial_dsa_layers_and_kda_without_kimi_name() -> None:
     """Verify partial DSA KV/weight accounting and non-substring KDA checks."""
     base_mla = _mla_dense_8layer_cfg()
@@ -585,3 +752,97 @@ def test_dsa_layer_selection_masks_aliases_and_errors() -> None:
     ):
         with pytest.raises(ValueError, match="dsa_layers"):
             from_hf_config({**base_mla, "dsa_layers": bad_dsa_layers})
+
+
+def test_pp_tied_embeddings_preserves_layer_weights_and_chip_alignment() -> None:
+    """Verify PP tied-embedding stage weights conserve layers and chip KV alignment."""
+    geom = from_hf_config({**_opt_dense_cfg(), "tie_word_embeddings": True})
+    dt = Dtypes()
+    par_single = Parallel(tp=1, pp=1)
+    par_pp = Parallel(tp=1, pp=_PP_TWO)
+    layout = SeqKvLayout(seqs_per_dp=_PP_BATCH, context=_CONTEXT_1024)
+    wide_chip = replace(
+        CHIPS["tpu7x"],
+        name="wide_align_chip",
+        physical_alignment_elems=_WIDE_PHYSICAL_ALIGN,
+    )
+
+    bd_single = hbm_breakdown_per_core_bytes(
+        geom, dt, par_single, layout, chip=wide_chip
+    )
+    w_embed = float(geom.vocab * geom.hidden) * dt.lm_head
+    pref = _pp_layer_prefixes(geom, dt, par_single, layout, chip=wide_chip)
+    assert pref.weights[-1] == pytest.approx(
+        bd_single.weights - w_embed, rel=_WEIGHT_REL_TOL
+    )
+
+    _part_base, bd_base, _, ok_base = pp_stage_breakdowns(
+        geom,
+        dt,
+        par_pp,
+        (_CONTEXT_1024, _PP_BATCH),
+        chip=CHIPS["tpu7x"],
+    )
+    part_wide, bd_wide, _, ok_wide = pp_stage_breakdowns(
+        geom,
+        dt,
+        par_pp,
+        (_CONTEXT_1024, _PP_BATCH),
+        chip=wide_chip,
+    )
+    assert ok_base is True
+    assert ok_wide is True
+    assert part_wide == (_TWO_LAYER_COUNT, _TWO_LAYER_COUNT)
+    assert bd_wide.kv > bd_base.kv
+    assert float(_PP_TWO) * bd_wide.weights == pytest.approx(
+        bd_single.weights + w_embed, rel=_WEIGHT_REL_TOL
+    )
+
+
+def test_unpadded_zero_weights_strips_two_matrix_moe_sub_byte_unpack() -> None:
+    """Verify zero_weights strips exact 2-matrix MoE unpack vector FLOPs."""
+    non_gated_moe_geom = replace(
+        from_hf_config(_mla_moe_cfg()),
+        ffn_num_matrices=NON_GATED_MATMUL_COUNT,
+    )
+    parallel = Parallel(tp=1, moe="tp_slice")
+    step_shape = StepShape(batch=1, rows_per_seq=1, context=_CONTEXT_1024)
+    bf16_dtypes = Dtypes(
+        w_dense=2.0,
+        w_expert=2.0,
+        kv=2.0,
+        act="a16",
+        w_dense_dtype="bfloat16",
+        w_expert_dtype="bfloat16",
+        kv_dtype="bfloat16",
+    )
+    int4_expert_dtypes = replace(
+        bf16_dtypes,
+        w_expert=0.5,
+        w_expert_dtype="int4",
+    )
+
+    _, _, vector_bf16_zero_w, _ = unpadded_strict_resource_times(
+        non_gated_moe_geom,
+        CHIPS["tpu7x"],
+        parallel,
+        step_shape,
+        UnpaddedFloorOptions(dt=bf16_dtypes, zero_weights=True),
+    )
+    _, _, vector_int4_zero_w, _ = unpadded_strict_resource_times(
+        non_gated_moe_geom,
+        CHIPS["tpu7x"],
+        parallel,
+        step_shape,
+        UnpaddedFloorOptions(dt=int4_expert_dtypes, zero_weights=True),
+    )
+    _, _, vector_int4_with_w, _ = unpadded_strict_resource_times(
+        non_gated_moe_geom,
+        CHIPS["tpu7x"],
+        parallel,
+        step_shape,
+        UnpaddedFloorOptions(dt=int4_expert_dtypes, zero_weights=False),
+    )
+    assert vector_bf16_zero_w > 0.0
+    assert vector_int4_with_w > vector_int4_zero_w
+    assert vector_int4_zero_w == pytest.approx(vector_bf16_zero_w, rel=_WEIGHT_REL_TOL)

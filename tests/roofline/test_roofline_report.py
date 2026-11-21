@@ -32,6 +32,7 @@ from vllm_torchtpu.roofline import (
     render_html,
     solve_serving_plan,
 )
+from vllm_torchtpu.roofline.emit import pool_label
 from vllm_torchtpu.roofline.geometry import from_hf_config
 from vllm_torchtpu.roofline.report import MAX_EMBEDDED_CANDIDATES
 
@@ -137,12 +138,13 @@ def test_report_without_feasible_layout(sample_payload: SolvePayload) -> None:
     payload["warnings"] = ["SLO_UNMET: no feasible topology met latency constraints"]
     html = render_html(payload)
     assert "SLO_UNMET" in html
-    assert "No feasible layout met constraints" in html or "SLO_UNMET" in html
+    assert "SLO_UNMET: no feasible topology met latency constraints" in html
     assert "<svg" in html
 
 
 def test_report_caps_embedded_candidates(sample_payload: SolvePayload) -> None:
     """Payloads with large candidate counts downsample embedded JSON."""
+    expected_cap = 200
     payload: dict[str, object] = dict(sample_payload)
     cands = sample_payload["candidates"]
     base_cand = cands[0] if cands else {}
@@ -154,7 +156,8 @@ def test_report_caps_embedded_candidates(sample_payload: SolvePayload) -> None:
     assert match is not None
     raw_json = match.group(1).replace(r"<\/", "</")
     embedded = json.loads(raw_json)
-    assert len(embedded["candidates"]) <= MAX_EMBEDDED_CANDIDATES
+    assert expected_cap == MAX_EMBEDDED_CANDIDATES
+    assert len(embedded["candidates"]) == MAX_EMBEDDED_CANDIDATES
 
 
 def test_report_slo_unmet_recommended_renders_warning_banner(
@@ -168,9 +171,10 @@ def test_report_slo_unmet_recommended_renders_warning_banner(
 
     payload: dict[str, object] = dict(sample_payload)
     assert sample_payload["recommended"] is not None
-    rec_unmet = dict(sample_payload["recommended"])
-    rec_unmet["slo_met"] = False
-    payload["recommended"] = rec_unmet
+    recommended_ruled_out = dict(sample_payload["recommended"])
+    recommended_ruled_out["slo_met"] = False
+    recommended_ruled_out["slo_verdict"] = "ruled_out"
+    payload["recommended"] = recommended_ruled_out
     payload["top_k"] = []
     payload["warnings"] = []
     html_unmet = render_html(payload)
@@ -229,6 +233,55 @@ def test_render_html_clean_svg_and_assumptions_card(
     assert "; # decode" not in disagg_html
     assert "; vllm serve" not in disagg_html
 
+
+def test_report_card_renders_from_catalog(
+    sample_payload: SolvePayload,
+) -> None:
+    """Verify report card and solve payload render from the chip catalog."""
+    chip_spec = sample_payload["chip_spec"]
+    assert "jax_version" in chip_spec
+    assert isinstance(chip_spec["jax_version"], str)
+    assert bool(chip_spec["jax_version"])
+    assert "catalog" in chip_spec
+    cat = chip_spec["catalog"]
+    assert isinstance(cat, dict)
+    assert "dcn_bw" in cat
+    assert cat["dcn_bw"]["kind"] == "derived"
+    assert "source" in cat["dcn_bw"]
+    assert cat["hbm_bytes"]["display"] == "103.0 GB"
+    assert cat["bf16_flops"]["display"] == "1,155 TFLOP/s"
+    assert cat["fp8_flops"]["display"] == "2,300 TFLOP/s"
+    assert "Peak BF16 matrix-multiply throughput" in cat["bf16_flops"]["description"]
+
+    html = render_html(sample_payload)
+    assert "12.50 GB/s" in html or "12.5 GB/s" in html
+    assert "1,155 TFLOP/s" in html
+    assert "2,300 TFLOP/s" in html
+    assert "badge-fact" in html
+    assert "fact" in html.lower()
+    assert "derived" in html.lower()
+    assert "assumed" in html.lower()
+
+    custom_payload = json.loads(json.dumps(sample_payload))
+    custom_payload["chip_spec"]["dcn_bw"] = 18.75e9
+    custom_payload["chip_spec"]["pcie_bw"] = 32.0e9
+    custom_payload["chip_spec"]["catalog"]["dcn_bw"]["value"] = 18.75e9
+    custom_payload["chip_spec"]["catalog"]["pcie_bw"]["value"] = 32.0e9
+    custom_html = render_html(custom_payload)
+    assert "18.75 GB/s" in custom_html or "18.8 GB/s" in custom_html
+    assert "32.0 GB/s" in custom_html
+
+
+def test_executive_card_renders_bound_and_estimate_band(
+    sample_payload: SolvePayload,
+) -> None:
+    """Verify executive summary card renders bound ~ est TTFT and TPOT bands."""
+    html = render_html(sample_payload)
+    exec_section = html.split('id="executive-summary"', 1)[1].split("</section>", 1)[0]
+    assert "TTFT (bound ~ est)" in exec_section
+    assert "TPOT (bound ~ est)" in exec_section
+    assert " ~ " in exec_section
+
     # Assumptions card reflects chip_spec dynamically rather than hardcoding tpu7x.
     custom_chip = dc_replace(
         CHIPS["tpu7x"], name="custom_tpu_v6", hbm_bytes=32_000_000_000
@@ -251,6 +304,71 @@ def test_render_html_clean_svg_and_assumptions_card(
     assert "32.0 GB" in custom_html
 
 
+_BASE_POOL: dict[str, object] = {
+    "instances": 1,
+    "topology": "2x2x1",
+    "tp": 1,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "pcp": 1,
+    "kv_split": 1,
+}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        (
+            {"tp": 2, "dp": 4, "ep": 8},
+            "1x 2x2x1 (4 chips, 1 host, 8 cores): TP2 x DP4 x EP8",
+        ),
+        (
+            {"pp": 8},
+            "1x 2x2x1 (4 chips, 1 host, 8 cores): PP8",
+        ),
+        (
+            {"pp": 2, "pcp": 4, "ep": 4},
+            "1x 2x2x1 (4 chips, 1 host, 8 cores): EP4 x PP2 x PCP4",
+        ),
+        (
+            {"instances": 4, "topology": "2x2x2", "tp": 16, "kv_split": 2, "ep": 16},
+            "4x 2x2x2 (32 chips, 8 hosts, 64 cores): TP16 x EP16 x DCP2",
+        ),
+        ({"topology": "1x1x1"}, "1x 1x1x1: TP1"),
+    ],
+)
+def test_pool_label_omits_single_count_and_lists_axes(
+    overrides: dict[str, object],
+    expected: str,
+) -> None:
+    """Pool label includes count prefix; only axes above 1 are listed."""
+    assert pool_label({**_BASE_POOL, **overrides}) == expected
+
+
+def test_render_html_caps_svg_background_circles(
+    sample_payload: SolvePayload,
+) -> None:
+    """Verify SVG scatter caps background dots at <= 1200 and marks Top-k rings."""
+    max_bg_dots = 1200
+    payload: dict[str, object] = json.loads(json.dumps(sample_payload))
+    cands = list(sample_payload.get("candidates", ()))
+    base = dict(cands[0])
+    spread: list[dict[str, object]] = []
+    n_pts = 5000
+    for i in range(n_pts):
+        pt = dict(base)
+        pt["concurrency"] = (i % 128) + 1
+        pt["token_throughput_per_chip"] = 100.0 + float((i * 37) % 10000)
+        pt["est_interactivity_tok_s"] = 10.0 + float((i * 53) % 1000)
+        spread.append(pt)
+    payload["candidates"] = spread
+    html = render_html(payload)
+    bg_circles = len(re.findall(r'<circle [^>]*fill="#cbd5e1"', html))
+    assert 1 <= bg_circles <= max_bg_dots
+    assert "#10b981" in html
+
+
 def test_report_uses_explicit_concurrency_hit_rate_and_chip_headers(
     sample_payload: SolvePayload,
 ) -> None:
@@ -264,6 +382,41 @@ def test_report_uses_explicit_concurrency_hit_rate_and_chip_headers(
     assert not re.search(r"\d+c / \d+h", html)
 
 
+def test_report_undecided_recommended_renders_funnel_counts(
+    sample_payload: SolvePayload,
+) -> None:
+    """Render undecided recommendation without infeasible banner and show counts."""
+    undecided_payload: dict[str, object] = dict(sample_payload)
+    assert sample_payload["recommended"] is not None
+    recommended_undecided = dict(sample_payload["recommended"])
+    recommended_undecided["slo_met"] = False
+    recommended_undecided["slo_verdict"] = "undecided"
+    undecided_search = dict(sample_payload["search"])
+    expected_not_ruled_out = 11
+    expected_slo_met = 3
+    undecided_search["not_ruled_out"] = expected_not_ruled_out
+    undecided_search["slo_met"] = expected_slo_met
+    undecided_scenario = dict(sample_payload["scenario"])
+    undecided_scenario["tpot_slo_ms"] = 2.0
+    expected_hbm_fit = 15
+    undecided_search["hbm_fit"] = expected_hbm_fit
+    undecided_payload["scenario"] = undecided_scenario
+    undecided_payload["recommended"] = recommended_undecided
+    undecided_payload["search"] = undecided_search
+    undecided_payload["warnings"] = []
+    html_undecided = render_html(undecided_payload)
+    assert "INFEASIBLE" not in html_undecided
+    assert "recommended layout is infeasible" not in html_undecided
+    assert (
+        '        <div class="stat-label">Not Ruled Out</div>\n'
+        f'        <div class="stat-value">{expected_not_ruled_out}</div>\n'
+        '        <div class="funnel-sub">'
+        f"Ruled Out (bound &gt; SLO): {expected_hbm_fit - expected_not_ruled_out}<br>"
+        f"Est. Meets SLO: {expected_slo_met} &middot; "
+        f"Undecided: {expected_not_ruled_out - expected_slo_met}</div>"
+    ) in html_undecided
+
+
 def test_frontier_chart_plots_monotonic_2d_envelope_with_throughput_on_y(
     sample_payload: SolvePayload,
 ) -> None:
@@ -272,15 +425,15 @@ def test_frontier_chart_plots_monotonic_2d_envelope_with_throughput_on_y(
     # Include a lower-concurrency point at the same interactivity as a higher-tput point
     p_low = copy.deepcopy(payload["frontier"][0])
     p_low["concurrency"] = 1
-    p_low["p90_interactivity_tok_s"] = 1000.0
+    p_low["est_interactivity_tok_s"] = 1000.0
     p_low["token_throughput_per_chip"] = 2500.0
     p_high = copy.deepcopy(payload["frontier"][0])
     p_high["concurrency"] = 4
-    p_high["p90_interactivity_tok_s"] = 1000.0
+    p_high["est_interactivity_tok_s"] = 1000.0
     p_high["token_throughput_per_chip"] = 10000.0
     p_tput = copy.deepcopy(payload["frontier"][0])
     p_tput["concurrency"] = 64
-    p_tput["p90_interactivity_tok_s"] = 200.0
+    p_tput["est_interactivity_tok_s"] = 200.0
     p_tput["token_throughput_per_chip"] = 40000.0
     payload["frontier"] = [p_low, p_high, p_tput]
     payload["candidates"] = [p_low, p_high, p_tput]
@@ -381,7 +534,12 @@ def test_report_honest_l1_headings_funnel_and_excludes_ruled_out_frontier(
     assert "Best Parallelism:" not in html_base
     assert "SMEM page-table" in html_base
     assert "prefill logit workspace" in html_base
-    assert 'id="bound-families-table"' not in html_base
+    assert 'id="bound-families-table"' in html_base
+
+    payload_no_families = copy.deepcopy(sample_payload)
+    payload_no_families.pop("bound_families_by_concurrency", None)
+    html_no_families = render_html(payload_no_families)
+    assert 'id="bound-families-table"' not in html_no_families
 
     payload = copy.deepcopy(sample_payload)
     ruled_out_pts = []
@@ -482,3 +640,15 @@ def test_report_single_host_fit_renders_na_when_best_parallelism_is_none(
     html = render_html(payload)
     assert "Top-Ranked Single-Host Candidate: <code>N/A</code>" in html
     assert "<code>None</code>" not in html
+
+
+def test_report_renders_live_solve_handoff_families(
+    sample_payload: SolvePayload,
+) -> None:
+    """Verify real build_solve_payload output populates bound_families HTML section."""
+    assert "bound_families_by_concurrency" in sample_payload
+    assert "solver_assumptions" in sample_payload
+    html = render_html(sample_payload)
+    assert "Bound-Ordered Candidate Families (L1 Handoff)" in html
+    assert 'id="bound-families-table"' in html
+    assert "Solver Assumptions:" in html

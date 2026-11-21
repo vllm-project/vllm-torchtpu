@@ -17,11 +17,21 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
-from vllm_torchtpu.roofline import ParetoPoint
+from vllm_torchtpu.roofline import (
+    ParetoPoint,
+    hbm_breakdown_per_core_bytes,
+    sweep_prefix_hit_crossovers,
+)
 from vllm_torchtpu.roofline.constants import UNIT_MILLIS_PER_SECOND
 
 if TYPE_CHECKING:
-    from vllm_torchtpu.roofline import PoolMeshPlan
+    from vllm_torchtpu.roofline import (
+        ChipSpec,
+        Dtypes,
+        ModelGeometry,
+        PoolMeshPlan,
+        ServingPlan,
+    )
 
 QWEN35_CFG: dict[str, object] = {
     "text_config": {
@@ -90,6 +100,22 @@ NEMOTRON_CFG: dict[str, object] = {
 }
 
 
+def cold_crossover_sweep(
+    geom: ModelGeometry,
+    dtypes: Dtypes,
+    chip: ChipSpec,
+    plan_obj: ServingPlan,
+    *,
+    repeats: int = 3,
+) -> tuple[tuple[float, float] | None, float | None]:
+    """Run prefix-hit crossover sweep after clearing the HBM breakdown cache."""
+    last_result: tuple[tuple[float, float] | None, float | None] = (None, None)
+    for _ in range(repeats):
+        hbm_breakdown_per_core_bytes.cache_clear()
+        last_result = sweep_prefix_hit_crossovers(geom, dtypes, chip, plan_obj)
+    return last_result
+
+
 def make_pareto_point(
     decode_pool: PoolMeshPlan,
     concurrency: int,
@@ -120,4 +146,5 @@ def make_pareto_point(
         p_mixed=0.0 if prefill_pool is not None else 0.05,
         binding="hbm",
         slo_met=True,
+        slo_verdict="estimate_meets",
     )

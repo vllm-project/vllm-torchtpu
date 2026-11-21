@@ -15,7 +15,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Literal
+
 from jax.experimental.pallas import tpu as pltpu
+
+if TYPE_CHECKING:
+    from .chips import ChipSpec
 
 # Collective & TPU topology constants.
 AR_PHASES: int = 2
@@ -238,6 +243,33 @@ NO_FEASIBLE_LAYOUT_WARNING: str = (
     "No feasible layout met memory and latency constraints."
 )
 
+# Three-valued SLO feasibility verdicts and ascending rank order.
+type SloVerdict = Literal["ruled_out", "estimate_meets", "undecided"]
+
+SLO_VERDICT_RULED_OUT: SloVerdict = "ruled_out"
+SLO_VERDICT_UNDECIDED: SloVerdict = "undecided"
+SLO_VERDICT_ESTIMATE_MEETS: SloVerdict = "estimate_meets"
+
+SLO_VERDICT_RANK: dict[str, int] = {
+    SLO_VERDICT_RULED_OUT: 0,
+    SLO_VERDICT_UNDECIDED: 1,
+    SLO_VERDICT_ESTIMATE_MEETS: 2,
+}
+
+# Warning a serving plan carries when the recommended layout's SLO verdict is undecided.
+UNDECIDED_SLO_WARNING: str = (
+    "Recommended layout has SLO verdict 'undecided': its modeled estimate "
+    "misses the latency SLO, though the physical lower bound does not rule "
+    "the layout out."
+)
+
+# Informational warning emitted when closed-loop think_time_s is zero.
+ZERO_THINK_TIME_WARNING: str = (
+    "Closed-loop scenario evaluated with zero think time (think_time_s = 0.0): "
+    "steady-state residency follows active request arrival bounded by HBM, "
+    "SMEM, and prefill capacity limits."
+)
+
 # Versioned solve JSON payload and top-K diversity selection constants.
 SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v2"
 CHIP_SPEC_SCHEMA: str = "vllm_torchtpu.roofline.chip_spec/v1"
@@ -245,6 +277,13 @@ INSPECT_SCHEMA: str = "vllm_torchtpu.roofline.inspect/v1"
 VALID_CHIP_PROVENANCE: frozenset[str] = frozenset(
     {"public_spec", "jax_tpu_info", "measured_microbench", "projected"}
 )
+ACTIVATION_HULL_SCHEMA: str = "vllm_torchtpu.roofline.moe_activation_hull/v1"
+# Float64 slope rounding scales as ulp(active) / spacing (~1e-13 for 512
+# experts); 1e-9 experts/token absorbs JSON float formatting slack.
+HULL_CONCAVITY_SLOPE_TOLERANCE: float = 1e-9
+# Absorbs 6-decimal JSON rounding (0.5e-6 half-ULP with 2x margin,
+# unit: experts) when comparing exported knots to the Bernoulli cap.
+HULL_BERNOULLI_CAP_TOLERANCE: float = 1e-6
 MIN_TOP_LAYOUTS_FOR_FASTEST: int = 2
 MIN_TOP_LAYOUTS_FOR_BOUND_BEST: int = 3
 DEFAULT_TOP_K: int = 5
@@ -371,16 +410,145 @@ STEP_FLOOR_CACHE_MAXSIZE: int = 32768
 UNIT_COLL_CACHE_MAXSIZE: int = 32768
 BLOCK_PARALLEL_ENABLED: int = 2
 
-# Informational warning emitted when closed-loop think_time_s is zero.
-ZERO_THINK_TIME_WARNING: str = (
-    "Closed-loop scenario evaluated with zero think time: decode residency "
-    "matches concurrency up to the HBM/SMEM cap without client request pauses."
+# Shared structured solver assumption catalog consumed by CLI --assumptions,
+# solve JSON, and HTML reports.
+SOLVER_ASSUMPTIONS: tuple[dict[str, object], ...] = (
+    {
+        "name": "bound_ttft_envelope_formula",
+        "flag": "",
+        "kind": "assumption",
+        "value": "hit-rate-adjusted uncached prefill step floor",
+        "unit": "formula",
+        "description": (
+            "Hard and envelope TTFT lower bounds evaluate unpadded prefill at "
+            "the scenario prefix hit rate without heuristic residency scaling."
+        ),
+        "source": "solver",
+    },
+    {
+        "name": "bound_tpot_residency",
+        "flag": "",
+        "kind": "assumption",
+        "value": "least fixed-point steady-state residency",
+        "unit": "formula",
+        "description": (
+            "Decode TPOT lower bounds evaluate bottom-up from batch 1 up to the "
+            "HBM/SMEM residency cap using closed-loop steady-state arrival."
+        ),
+        "source": "solver",
+    },
+    {
+        "name": "bound_capacity_ceiling",
+        "flag": "",
+        "kind": "assumption",
+        "value": "unpadded linear work-conservation",
+        "unit": "req/s",
+        "description": (
+            "Pool capacity ceiling X_cap_pool divides unpadded per-token HBM, "
+            "matmul, vector, and collective cut bounds without padding bloat."
+        ),
+        "source": "solver",
+    },
+    {
+        "name": "eff_prefill_rounding",
+        "flag": "",
+        "kind": "assumption",
+        "value": "floor((1 - h) * isl) for bounds; ceil(...) for estimates",
+        "unit": "tokens",
+        "description": (
+            "Strict resource bounds use floored uncached prefill tokens while "
+            "serial estimates include minimum non-empty chunk/logit overhead."
+        ),
+        "source": "modules",
+    },
+    {
+        "name": "hbm_reserve_gb",
+        "flag": "--hbm-reserve-gb",
+        "kind": "constraint",
+        "value": DEFAULT_HBM_RESERVE_GB,
+        "unit": "GB",
+        "description": (
+            "Additional host/framework HBM reserve subtracted from usable "
+            "device memory when computing weights and KV page capacity."
+        ),
+        "source": "cli",
+    },
+    {
+        "name": "gpu_memory_utilization",
+        "flag": "",
+        "kind": "assumption",
+        "value": DEFAULT_GPU_MEMORY_UTILIZATION,
+        "unit": "fraction",
+        "description": (
+            "Usable HBM fraction before weights, runtime buffers, and KV cache."
+        ),
+        "source": "constants",
+    },
+    {
+        "name": "smem_page_table_budget",
+        "flag": "",
+        "kind": "assumption",
+        "value": (
+            int(
+                pltpu.get_tpu_info_for_chip(
+                    pltpu.ChipVersion.TPU_7X, 1
+                ).smem_capacity_bytes
+            )
+            // SMEM_PAGE_TABLE_DIVISOR
+        ),
+        "unit": "bytes",
+        "description": (
+            "On-chip SMEM byte cap constraining resident page-table entries "
+            "and maximum concurrent sequence residency."
+        ),
+        "source": "constants",
+    },
+    {
+        "name": "prefill_chunk_tokens",
+        "flag": "",
+        "kind": "assumption",
+        "value": DEFAULT_PREFILL_CHUNK,
+        "unit": "tokens",
+        "description": (
+            "Default chunk size used when evaluating chunked prefill schedules "
+            "under steady-state mixed concurrency."
+        ),
+        "source": "constants",
+    },
+    {
+        "name": "collective_latency_us",
+        "flag": "--collective-latency-us",
+        "kind": "calibration",
+        "value": DEFAULT_ICI_HOP_LATENCY_S / UNIT_MICRO,
+        "unit": "us",
+        "description": (
+            "Optional per-hop ICI collective calibration latency added only to "
+            "serial_estimate_s without relaxing physical bounds."
+        ),
+        "source": "cli",
+    },
+    {
+        "name": "ep_uniform_routing",
+        "flag": "--moe-activation",
+        "kind": "constraint",
+        "value": "uniform",
+        "unit": "mode",
+        "description": (
+            "Default routed MoE activation assumption unless superseded by a "
+            "supplied empirical hull or bounded load multiplier."
+        ),
+        "source": "occupancy",
+    },
 )
 
-ACTIVATION_HULL_SCHEMA: str = "vllm_torchtpu.roofline.moe_activation_hull/v1"
-# Float64 slope rounding scales as ulp(active) / spacing (~1e-13 for 512
-# experts); 1e-9 experts/token absorbs JSON float formatting slack.
-HULL_CONCAVITY_SLOPE_TOLERANCE: float = 1e-9
-# Absorbs 6-decimal JSON rounding (0.5e-6 half-ULP with 2x margin,
-# unit: experts) when comparing exported knots to the Bernoulli cap.
-HULL_BERNOULLI_CAP_TOLERANCE: float = 1e-6
+
+def get_solver_assumptions(
+    chip: ChipSpec | None = None,
+) -> list[dict[str, object]]:
+    """Return a fresh list of structured solver assumption entries."""
+    entries = [dict(entry) for entry in SOLVER_ASSUMPTIONS]
+    if chip is not None:
+        for entry in entries:
+            if entry["name"] == "smem_page_table_budget":
+                entry["value"] = chip.smem_page_table_bytes
+    return entries
