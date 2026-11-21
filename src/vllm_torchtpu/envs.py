@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     TPU_QWEN4_HC_DECODE_FOLD: bool = False
     TPU_QWEN4_HC_DECODE_TILE_ROWS: int = 0
     TPU_QWEN4_HC_DECODE_COMPARE: bool = False
+    TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID: bool = False
     TPU_QWEN4_HC_DECODE_WIDE: int = 0
     TPU_QWEN4_HC_PREFILL_ODD_TILES: bool = False
     TPU_QWEN4_HC_PREFILL_FUSED_MIX: bool = False
@@ -1562,6 +1563,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # from the down projection's MXU pass and writes the combined rows back
     # stream by stream. Other row counts keep hc_decode.py.
     "TPU_QWEN4_HC_DECODE_COMPARE": env_bool("TPU_QWEN4_HC_DECODE_COMPARE"),
+    # q38 HC-HIGHROWS-2 (CMP-S), only with TPU_QWEN4_HC_DECODE_COMPARE: the cmp
+    # kernel's mix term takes the served kernel's jax.nn.sigmoid of bf16(u)
+    # instead of 1 + tanh(u / 2); the op names gain _cmps. Set without
+    # TPU_QWEN4_HC_DECODE_COMPARE it is refused.
+    "TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID": env_bool(
+        "TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID"
+    ),
     # q38 HC-HIGHROWS, qwen4_exp with TPU_QWEN4_HC_DECODE_FUSED: 1 or 2 runs
     # the fused decode HC mix at 160-511 rows (a multiple of 16) as
     # hc_decode_wide.py (row blocks copied by hand under a byte budget, the

@@ -136,7 +136,9 @@ def _decode_mix_choice():
     TPU_QWEN4_HC_DECODE_WIDE (q38 HC-HIGHROWS, 0 = off) 1 / 2 runs
     hc_decode_wide.py's served-order / cmp-math mode at 160-511 rows (a
     multiple of 16); TPU_QWEN4_HC_DECODE_COMPARE runs hc_decode_cmp.py at
-    16-256 rows. They are exclusive. Unset, it is hc_decode_mix, untagged.
+    16-256 rows. They are exclusive. TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID
+    (q38 HC-HIGHROWS-2 CMP-S, only with COMPARE) takes the served sigmoid in
+    the cmp mix term (_cmps). Unset, it is hc_decode_mix, untagged.
     """
     wide = envs.TPU_QWEN4_HC_DECODE_WIDE
     if wide:
@@ -144,12 +146,20 @@ def _decode_mix_choice():
             raise ValueError(
                 f"TPU_QWEN4_HC_DECODE_WIDE={wide}: expected 0 (off), 1 or 2"
             )
-        if envs.TPU_QWEN4_HC_DECODE_COMPARE:
+        cmp_set = envs.TPU_QWEN4_HC_DECODE_COMPARE
+        if cmp_set or envs.TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID:
             raise ValueError(
                 "TPU_QWEN4_HC_DECODE_WIDE and TPU_QWEN4_HC_DECODE_COMPARE are "
                 "exclusive"
             )
         return functools.partial(hc_decode_mix_wide_auto, mode=wide), f"_w{wide}"
+    if envs.TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID:
+        if not envs.TPU_QWEN4_HC_DECODE_COMPARE:
+            raise ValueError(
+                "TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID needs "
+                "TPU_QWEN4_HC_DECODE_COMPARE=1"
+            )
+        return functools.partial(hc_decode_mix_auto, sigmoid=True), "_cmps"
     if envs.TPU_QWEN4_HC_DECODE_COMPARE:
         return hc_decode_mix_auto, "_cmp"
     return hc_decode_mix, ""

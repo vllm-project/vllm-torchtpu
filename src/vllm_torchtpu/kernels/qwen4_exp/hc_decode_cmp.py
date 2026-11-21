@@ -61,6 +61,10 @@ LANES = 128
 # 15.3 us a call at 256 rows against 17.9 with a 4 MiB budget and 21.8 with
 # every copy at entry and no overlap.
 DEFAULT_OPTS = (("lookahead", 8), ("overlap", True), ("up_whole", True))
+# q38 HC-HIGHROWS-2 (CMP-S, TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID): the same
+# schedule with the mix term's sigmoid taken as the served kernel takes it,
+# jax.nn.sigmoid(bf16(u)).
+SIGMOID_OPTS = DEFAULT_OPTS + (("sigmoid", True),)
 
 
 def cmp_applies(tokens: int) -> bool:
@@ -97,6 +101,7 @@ def _kernel(
     lookahead: int,
     overlap: bool,
     up_whole: bool,
+    sigmoid: bool = False,
 ):
     # mode (timing only): "full"; "dma" runs the copies and no compute;
     # "compute" runs the compute and no copies.
@@ -314,6 +319,12 @@ def _kernel(
 
     def mix_term(u_half, b):
         u = u_half.astype(jnp.bfloat16).astype(jnp.float32)
+        if sigmoid:
+            # CMP-S: u + u = bf16(u_full) exactly (halving is exact), so the term is
+            # exactly 2 x the served kernel's sigmoid(bf16(u_full)) x norm; the mean's
+            # 0.5 / hc below is unchanged.
+            norm_b = xn_vm[:, stream(b)].astype(jnp.float32)
+            return 2.0 * jax.nn.sigmoid(u + u) * norm_b
         return (1.0 + jnp.tanh(u)) * xn_vm[:, stream(b)].astype(jnp.float32)
 
     if up_whole:
@@ -373,8 +384,12 @@ def hc_decode_mix_auto(
     prev_injection=None,
     max_tile=0,
     interpret=False,
+    sigmoid=False,
 ):
     """``hc_decode_mix_cmp`` where ``cmp_applies``, else ``hc_decode_mix``.
+
+    ``sigmoid`` (CMP-S) runs the cmp schedule with the served sigmoid
+    (``SIGMOID_OPTS``).
 
     The choice is made on the concrete row count of the traced bucket, so the
     torch-side gate (``decode_token_tile``) is unchanged.
@@ -388,7 +403,10 @@ def hc_decode_mix_auto(
         interpret=interpret,
     )
     if cmp_applies(x.shape[0]):
-        return hc_decode_mix_cmp(x, weight, down, up, inject_weight, **kwargs)
+        opts = SIGMOID_OPTS if sigmoid else None
+        return hc_decode_mix_cmp(
+            x, weight, down, up, inject_weight, _opts=opts, **kwargs
+        )
     return hc_decode_mix(
         x, weight, down, up, inject_weight, max_tile=max_tile, **kwargs
     )
