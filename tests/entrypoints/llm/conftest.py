@@ -26,3 +26,15 @@ def pytest_runtest_makereport(item, call):
     """
     outcome = yield
     setattr(item, f"report_{call.when}", outcome.get_result())
+
+
+@pytest.fixture
+def local_tpu_chip_count() -> int:
+    """TPU chips on this host; skips the test when they cannot be read."""
+    try:
+        from tpu_info import device as tpu_device
+
+        _, num_chips = tpu_device.get_local_chips()
+        return num_chips
+    except Exception as e:
+        pytest.skip(f"Unable to detect local TPU chip count: {e}")
