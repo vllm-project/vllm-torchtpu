@@ -16,8 +16,9 @@
 Two long prefixes are interleaved, so the recurrent slot a resumed request
 picks up was last written by the *other* prefix. Attention KV comes back from
 the cache either way; only a real state restore makes the continuation match
-the uncached one. Comparing token ids rather than an expected answer means a
-wrong state shows up even when it does not change the final answer.
+the uncached one. Comparing token ids (optionally allowing a near-tie flip
+within --logprob-atol) rather than an expected answer means a wrong state shows
+up even when it does not change the final answer.
 """
 
 import argparse
@@ -44,18 +45,20 @@ def complete(
     max_tokens: int,
     timeout: int,
     headers: dict | None = None,
+    logprobs: int | None = None,
 ) -> dict:
+    payload: dict = {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "return_token_ids": True,
+    }
+    if logprobs is not None:
+        payload["logprobs"] = logprobs
     req = urllib.request.Request(
         f"{url}/v1/completions",
-        data=json.dumps(
-            {
-                "model": model,
-                "prompt": prompt,
-                "max_tokens": max_tokens,
-                "temperature": 0,
-                "return_token_ids": True,
-            }
-        ).encode(),
+        data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json", **(headers or {})},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -63,12 +66,60 @@ def complete(
     choice = body["choices"][0]
     usage = body.get("usage") or {}
     details = usage.get("prompt_tokens_details") or {}
+    lp = choice.get("logprobs") or {}
     return {
         "tokens": choice.get("token_ids") or [],
         "text": choice.get("text", ""),
         "prompt_tokens": usage.get("prompt_tokens"),
         "cached_tokens": details.get("cached_tokens") or 0,
+        "token_logprobs": lp.get("token_logprobs") or [],
+        "logprob_tokens": lp.get("tokens") or [],
+        "top_logprobs": lp.get("top_logprobs") or [],
     }
+
+
+def matches_reference(ref: dict, cur: dict, logprob_atol: float) -> bool:
+    if cur["tokens"] == ref["tokens"]:
+        return True
+    if logprob_atol <= 0:
+        return False
+    first = next(
+        (i for i, (a, b) in enumerate(zip(ref["tokens"], cur["tokens"])) if a != b),
+        None,
+    )
+    if first is None:
+        return False
+    ref_lps = ref["token_logprobs"]
+    cur_lps = cur["token_logprobs"]
+    ref_tops = ref["top_logprobs"]
+    cur_tops = cur["top_logprobs"]
+    ref_toks = ref["logprob_tokens"]
+    cur_toks = cur["logprob_tokens"]
+    if (
+        min(
+            len(ref_lps),
+            len(cur_lps),
+            len(ref_tops),
+            len(cur_tops),
+            len(ref_toks),
+            len(cur_toks),
+        )
+        <= first
+    ):
+        return False
+    for a, b in zip(ref_lps[:first], cur_lps[:first]):
+        if a is None or b is None or abs(a - b) > logprob_atol:
+            return False
+    ref_tok = ref_toks[first]
+    cur_tok = cur_toks[first]
+    ref_top = ref_tops[first] or {}
+    cur_top = cur_tops[first] or {}
+    if ref_tok not in cur_top or cur_tok not in ref_top:
+        return False
+    return (
+        abs(ref_top[ref_tok] - cur_top[ref_tok]) <= logprob_atol
+        and abs(ref_top[cur_tok] - cur_top[cur_tok]) <= logprob_atol
+    )
 
 
 def main() -> int:
@@ -81,6 +132,15 @@ def main() -> int:
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--timeout", type=int, default=600)
     p.add_argument(
+        "--logprob-atol",
+        type=float,
+        default=0.0,
+        help="When > 0, accept a warm-round token divergence as a near-tie if "
+        "all prior token logprobs match within this tolerance and both "
+        "competing tokens at the first divergent step appear in each run's "
+        "top-5 logprobs within this tolerance (0 requires exact token ids).",
+    )
+    p.add_argument(
         "--data-parallel-rank",
         type=int,
         help="Hold every request to this DP rank of the engine, with vLLM's "
@@ -92,6 +152,7 @@ def main() -> int:
     headers = {}
     if a.data_parallel_rank is not None:
         headers["X-data-parallel-rank"] = str(a.data_parallel_rank)
+    logprobs = 5 if a.logprob_atol > 0 else None
 
     tags = ["ALPHA", "BRAVO"]
     prompts = {
@@ -109,7 +170,13 @@ def main() -> int:
         for tag in tags:  # interleaved: the slot last held the other prefix
             try:
                 r = complete(
-                    url, a.model, prompts[tag], a.max_tokens, a.timeout, headers
+                    url,
+                    a.model,
+                    prompts[tag],
+                    a.max_tokens,
+                    a.timeout,
+                    headers,
+                    logprobs=logprobs,
                 )
             except (urllib.error.URLError, TimeoutError) as exc:
                 print(f"STATE_CONTAMINATION_REQUEST_FAILED {tag} r{rnd}: {exc}")
@@ -120,7 +187,7 @@ def main() -> int:
                 reference[tag] = r
                 verdict = "reference"
             else:
-                same = r["tokens"] == reference[tag]["tokens"]
+                same = matches_reference(reference[tag], r, a.logprob_atol)
                 if r["cached_tokens"] > 0:
                     hit_rounds += 1
                     if not same:
