@@ -1354,6 +1354,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
+    # Route `vllm serve` through the experimental Rust runtime when true.
+    "VLLM_TPU_EXPERIMENTAL_USE_RUST": env_bool("VLLM_TPU_EXPERIMENTAL_USE_RUST"),
     # The rvllm binary; takes the same values as the launcher's --rvllm-binary.
     # When unset, rvllm is looked up on PATH.
     "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": env_str(

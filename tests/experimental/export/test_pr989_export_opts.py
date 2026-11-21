@@ -700,3 +700,9 @@ def test_lower_forward_token_padding_traces_under_tpu_fx(monkeypatch):
         "module_name": "forward_bucket8",
     }
     assert token_padding._padding_state is None
+
+
+def test_experimental_use_rust_env_default_is_false():
+    from vllm_torchtpu import envs
+
+    assert envs.VLLM_TPU_EXPERIMENTAL_USE_RUST is False
