@@ -64,10 +64,11 @@ large depth, waits in that thread rather than stalling the sender.
 could hold more than 7 at once.
 
 The sender hands its output on from a helper thread. end_forward submits the
-ops that produce the outgoing tensors, records a device fence and queues the
-transfer; the helper waits on the fence, calls ``isend`` for each tensor and
-waits until the copies are done, keeping the tensors alive until then. The
-last stage queues the fence alone, which the helper only waits on.
+ops that produce the outgoing tensors, has the link stage them, records a
+device fence and queues the transfer; the helper waits on the fence, calls
+``isend`` for each tensor and waits until the copies are done, keeping the
+tensors alive until then. The last stage queues the fence alone, which the
+helper only waits on.
 ``isend`` returns only once the receiver has posted the matching receive:
 that is the credit, a stage cannot send a forward before the next stage has
 taken up its step. At most ``depth`` forwards wait in a stage's queue, the
@@ -217,6 +218,59 @@ def _first_and_last(x: torch.Tensor) -> tuple[float, float]:
     return float(x[0, 0].item()), float(x[-1, -1].item())
 
 
+class IciLink:
+    """One direction of a hop between two devices of one torch.distributed
+    world, whose devices share a slice's ICI, on one host or several:
+    ``isend`` to ``peer``, or ``irecv`` from it, one tagged transfer per
+    carried tensor."""
+
+    def __init__(
+        self,
+        peer: int,
+        specs: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+        device: torch.device,
+    ):
+        self.peer = peer
+        # The row shape and dtype of each carried tensor, in carried order.
+        self.specs = specs
+        self.device = device
+
+    def _tag(self, transfer: int, index: int) -> int:
+        return (transfer * len(self.specs) + index) % _TAG_SPAN
+
+    def receive(self, transfer: int, rows: int) -> tuple[torch.Tensor, ...]:
+        """Posts the receives of one transfer of ``rows`` rows and returns
+        the tensors they land in."""
+        import torch.distributed as dist
+
+        received = []
+        for index, (shape, dtype) in enumerate(self.specs):
+            tensor = torch.empty((rows, *shape), dtype=dtype, device=self.device)
+            # The returned work does not wait for the data; the forward that
+            # reads the tensor runs after it lands.
+            dist.irecv(tensor, src=self.peer, tag=self._tag(transfer, index))
+            received.append(tensor)
+        return tuple(received)
+
+    def stage(self, tensors: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+        """What ``send`` hands on for a forward's outputs: the outputs
+        themselves, which the runtime copies device to device."""
+        return tensors
+
+    def send(self, transfer: int, tensors: tuple[torch.Tensor, ...]) -> None:
+        """Sends one transfer's tensors and returns when the copies are
+        done."""
+        import torch.distributed as dist
+
+        works = [
+            dist.isend(x, dst=self.peer, tag=self._tag(transfer, i))
+            for i, x in enumerate(tensors)
+        ]
+        for work in works:
+            assert work is not None
+            work.wait()
+
+
 class PPBuffered:
     def __init__(
         self,
@@ -262,6 +316,15 @@ class PPBuffered:
         self.carried = (HIDDEN_STATES, *extras)
         self.template = dict(template)
         self.device = device
+        specs = tuple(self.template[key] for key in self.carried)
+        # The transport of the hop from the previous stage and of the hop to
+        # the next one.
+        self._inbound: IciLink | None = None
+        self._outbound: IciLink | None = None
+        if self.prev is not None:
+            self._inbound = IciLink(self.prev, specs, device)
+        if self.next is not None:
+            self._outbound = IciLink(self.next, specs, device)
         self.max_rows = int(max_rows)
         self.depth = int(depth)
         # Transfers started: the warmup's, then one per forward.
@@ -319,30 +382,19 @@ class PPBuffered:
             ),
         )
 
-    def _tag(self, transfer: int, index: int) -> int:
-        return (transfer * len(self.carried) + index) % _TAG_SPAN
-
     def _post(self, transfer: int, rows: int) -> tuple[torch.Tensor, ...]:
         """Posts the receives of one transfer of ``rows`` rows and returns
         the tensors they land in."""
-        import torch.distributed as dist
-
+        assert self._inbound is not None
         self._check_rows(transfer, rows)
         if transfer != self.posted_through + 1:
             raise RuntimeError(
                 f"PP buffered rank {self.rank}: posting transfer {transfer} after "
                 f"{self.posted_through}"
             )
-        received = []
-        for index, key in enumerate(self.carried):
-            shape, dtype = self.template[key]
-            tensor = torch.empty((rows, *shape), dtype=dtype, device=self.device)
-            # The returned work does not wait for the data; the forward that
-            # reads the tensor runs after it lands.
-            dist.irecv(tensor, src=self.prev, tag=self._tag(transfer, index))
-            received.append(tensor)
+        received = self._inbound.receive(transfer, rows)
         self.posted_through = transfer
-        return tuple(received)
+        return received
 
     def _check_rows(self, transfer: int, rows: int) -> None:
         if not 0 < rows <= self.max_rows:
@@ -373,8 +425,6 @@ class PPBuffered:
         the same column of the next stage, carrying the sender's global
         rank; checks that what arrived came from the same column of the
         previous stage."""
-        import torch.distributed as dist
-
         assert self.transfers == 0 and not self._posted
         self.transfers = 1
         rows = 2
@@ -384,7 +434,7 @@ class PPBuffered:
             # the next stage's post.
             if self.prev is not None:
                 received = self._post(self.transfers, rows)
-            if self.next is not None:
+            if self._outbound is not None:
                 sent = tuple(
                     torch.full(
                         (rows, *self.template[key][0]),
@@ -395,13 +445,8 @@ class PPBuffered:
                     for key in self.carried
                 )
                 _flush(sent)
-                works = [
-                    dist.isend(x, dst=self.next, tag=self._tag(self.transfers, i))
-                    for i, x in enumerate(sent)
-                ]
-                for work in works:
-                    assert work is not None
-                    work.wait()
+                staged = self._outbound.stage(sent)
+                self._outbound.send(self.transfers, staged)
             got = [_first_and_last(x) for x in received]
         except Exception as exc:
             raise RuntimeError(
@@ -592,7 +637,11 @@ class PPBuffered:
                 f"rows hands on {wrong}"
             )
         _flush(outgoing)
-        self._queue_send(self._current, outgoing, _fence())
+        assert self._outbound is not None
+        # Staged before the fence is recorded, so the fence covers whatever
+        # staging queues on the device.
+        staged = self._outbound.stage(outgoing)
+        self._queue_send(self._current, staged, _fence())
 
     def _queue_send(
         self, transfer: int, outgoing: tuple[torch.Tensor, ...], fence: "TpuEvent"
@@ -619,20 +668,14 @@ class PPBuffered:
         """Sends one transfer once its tensors are computed and returns when
         the copies are done; runs on the send thread. Once the fence shows
         the transfer's forward completed, its receives count as landed."""
-        import torch.distributed as dist
-
         with TraceAnnotation("PP:Send"):
             fence.synchronize()
             with self._cv:
                 self.landed_through = transfer
                 self._cv.notify_all()
-            works = [
-                dist.isend(x, dst=self.next, tag=self._tag(transfer, i))
-                for i, x in enumerate(outgoing)
-            ]
-            for work in works:
-                assert work is not None
-                work.wait()
+            if outgoing:
+                assert self._outbound is not None
+                self._outbound.send(transfer, outgoing)
 
     def _send_loop(self) -> None:
         while True:
