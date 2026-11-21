@@ -144,3 +144,4 @@ Both are off by default; set both (`--additional-config '{"tpu_moe_topk_weights_
 | `TPU_TRACE_MODE` | `"TRACE_COMPUTE"` | SparseCore trace mode (`"TRACE_COMPUTE"`, `"TRACE_COMPUTE_AND_DMA"`, etc.). |
 | `TPU_NUM_SPARSE_CORES_TO_TRACE` | `1` | Number of SparseCores to trace when SparseCore tracing is active. |
 | `TPU_KERNEL_ITER_MODE` | `False` | Enables fast Pallas kernel hot-reloading without restarting the vLLM server (`TPU_KERNEL_RELOAD_MODULES`). |
+| `VLLM_TPU_EMIT_PLACEMENT` | `True` | Writes the engine's parallel configuration to the server log as one `rank_placement` JSON line at API-server startup. `0`/`false`/`no`/`off` disables it. Does not affect the compile cache. |
