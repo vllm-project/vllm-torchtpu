@@ -15,7 +15,7 @@
 #
 # PP P/D disaggregation with the Raiden host offload tier, in one job on one
 # v7x host: PP4/TP1 prefill and DP4/TP1 decode through
-# examples/disagg/launch_qwen35_p4d2_v2_baseline.sh, TPUMultiConnector with
+# tools/disagg/launch_qwen35_p4d2_v2_baseline.sh, TPUMultiConnector with
 # TPURaidenConnector and TPURaidenOffloadingConnector on both engines, toy
 # proxy in front. Speculative decoding and async scheduling are off: pipeline
 # parallelism refuses both.
@@ -107,7 +107,7 @@ trap cleanup EXIT
 mkdir -p "${RUN_DIR}/logs" || exit 1
 cd "${repo_root}" || exit 1
 
-bash examples/disagg/launch_qwen35_p4d2_v2_baseline.sh 2>&1 | tee "${RUN_DIR}/logs/launch.log"
+bash tools/disagg/launch_qwen35_p4d2_v2_baseline.sh 2>&1 | tee "${RUN_DIR}/logs/launch.log"
 [[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "the P/D pair did not come up (see ${RUN_DIR}/logs)"
 
 for role in prefill decode; do

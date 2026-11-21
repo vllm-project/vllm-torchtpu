@@ -189,7 +189,7 @@ export STARTUP_TIMEOUT_S
 # The launcher refuses to start with this set; DSv4 has no GDN pooled layout.
 unset TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
 
-launcher="${repo_root}/examples/disagg/launch_dsv4_disagg_multihost.sh"
+launcher="${repo_root}/tools/disagg/launch_dsv4_disagg_multihost.sh"
 
 cd "${repo_root}" || exit 1
 
@@ -287,7 +287,7 @@ case "${ROLE}" in
       echo "--- Starting toy proxy server on port ${PROXY_PORT}"
       proxy_cmd=(
         "${PYTHON_BIN}"
-        "${repo_root}/examples/disagg/toy_proxy_server.py"
+        "${repo_root}/tools/disagg/toy_proxy_server.py"
         --host "0.0.0.0"
         --port "${PROXY_PORT}"
         --prefiller-hosts "${target_prefill_host}"

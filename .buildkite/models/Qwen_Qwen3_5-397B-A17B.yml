@@ -25,7 +25,7 @@ steps:
     commands:
       - |
         SHAPE=${MODEL_SHAPE_MULTI} .buildkite/kubernetes/run.sh \
-          bash -c 'SKIP_JAX_PRECOMPILE=1 VLLM_XLA_CHECK_RECOMPILATION=0 python examples/offline_inference.py --model Qwen/Qwen3.5-397B-A17B-FP8 --tensor-parallel-size 8 --enable-expert-parallel  --max-num-batched-tokens 256 --max-num-seqs 256  --limit-mm-per-prompt "{\"image\": 0, \"video\": 0}" --chat-template-kwargs="{\"enable_thinking\": false}"'
+          bash -c 'SKIP_JAX_PRECOMPILE=1 VLLM_XLA_CHECK_RECOMPILATION=0 python tools/offline_inference.py --model Qwen/Qwen3.5-397B-A17B-FP8 --tensor-parallel-size 8 --enable-expert-parallel  --max-num-batched-tokens 256 --max-num-seqs 256  --limit-mm-per-prompt "{\"image\": 0, \"video\": 0}" --chat-template-kwargs="{\"enable_thinking\": false}"'
 
   - label: "${TPU_VERSION:-tpu6e} Record unit test result for Qwen/Qwen3.5-397B-A17B-FP8"
     key: "${TPU_VERSION:-tpu6e}_record_Qwen_Qwen3_5-397B-A17B_UnitTest"
