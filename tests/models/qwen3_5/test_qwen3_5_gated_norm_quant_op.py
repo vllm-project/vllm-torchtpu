@@ -169,6 +169,14 @@ def _w8a16(attention):
     attention.out_proj.quant_method.w8a16_max_rows = 64
 
 
+class _BF16OnlyMethod:
+    """A linear method that cannot take pre-quantized rows."""
+
+
+def _bf16_only_method(attention):
+    attention.out_proj.quant_method = _BF16OnlyMethod()
+
+
 def _bias(attention):
     attention.out_proj.bias = torch.nn.Parameter(
         torch.zeros(attention.out_proj.weight.shape[1]), requires_grad=False
@@ -182,7 +190,8 @@ def _bias(attention):
         ("fp8_channel", _block_scales, "not per-channel"),
         ("fp8_channel", _sigmoid_gate, "gates with sigmoid"),
         ("fp8_channel", _bias, "has a bias"),
-        ("fp8_channel", _w8a16, "W8A16"),
+        ("fp8_channel", _w8a16, "does not serve pre-quantized rows .* W8A16"),
+        ("fp8_channel", _bf16_only_method, "_BF16OnlyMethod cannot take"),
     ],
 )
 def test_install_refuses_an_unsupported_layer(
@@ -204,6 +213,7 @@ def test_install_refuses_an_unsupported_layer(
         ("fp8_channel", _sigmoid_gate),
         ("fp8_channel", _bias),
         ("fp8_channel", _w8a16),
+        ("fp8_channel", _bf16_only_method),
     ],
 )
 def test_install_if_supported_keeps_an_unsupported_layer_unfused(

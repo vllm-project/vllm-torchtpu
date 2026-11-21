@@ -401,10 +401,13 @@ def _project_prequant(
 ) -> torch.Tensor:
     """One input projection of rows already quantized per row to FP8
     (values, scales), which the Qwen3.5 model patch hands the layer from its
-    sequence-parallel FP8 all-gather or fused input norm. A method that takes
-    such rows (`linear_common.PrequantLinearMethod`: the TPU FP8 and
-    unquantized linear methods) applies the layer to them directly; any other
-    method runs the layer's own forward on the dequantized rows."""
+    sequence-parallel FP8 all-gather or fused input norm when the layer's main
+    projection serves them. They are the only rows the layer has, so every
+    projection gets them, whether or not its method serves them as its
+    `apply` would (`serves_prequant_rows`): a
+    `linear_common.PrequantLinearMethod` (the TPU FP8 and unquantized linear
+    methods) applies the layer to them with `apply_prequant`; any other method
+    runs the layer's own forward on the dequantized rows."""
     x_q, x_s = prequant
     method = layer.quant_method
     if isinstance(method, PrequantLinearMethod):
