@@ -109,9 +109,10 @@ def unified_kv_layout_enabled_for_architecture(architecture: str | None) -> bool
 
 
 def pooled_gdn_conv_state_bytes(*, kernel_size: int, conv_dim: int) -> int:
-    """Live bytes of one slot's conv region: (kernel_size - 1) dense bf16
-    rows of conv_dim channels. The kernel keeps no spec-decode widening in
-    the pool (verify windows roll back via per-slot checkpoints instead)."""
+    """Live bytes of one slot's conv region: (kernel_size - 1) dense float32
+    rows of conv_dim channels (``DEFAULT_POOLED_GDN_CONV_STATE_DTYPE``). The
+    kernel keeps no spec-decode widening in the pool (verify windows roll back
+    via per-slot checkpoints instead)."""
     return (
         (kernel_size - 1)
         * conv_dim
