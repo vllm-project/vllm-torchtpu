@@ -1,0 +1,72 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""TPU roofline serving, memory, collective, and execution modeling."""
+
+from __future__ import annotations
+
+from .chips import (
+    CHIP_TOPOLOGIES,
+    CHIPS,
+    SUPPORTED_CHIPS,
+    TOPOLOGIES,
+    ChipOverrides,
+    ChipSpec,
+    SliceTopology,
+    load_chip_spec,
+    register_chip,
+    topologies_for_chip,
+)
+from .collectives import (
+    Collective,
+    CollectiveConfig,
+    torus_collective_s,
+)
+from .constants import (
+    BENIGN_HF_METADATA_KEYS,
+    INSPECT_SCHEMA,
+    NON_GATED_MLP_MODEL_TYPES,
+    SUPPORTED_MODEL_TYPES,
+)
+from .geometry import (
+    KeyTracker,
+    LayerCounts,
+    ModelGeometry,
+    count_layer_types,
+    from_hf_config,
+)
+
+__all__ = [
+    "BENIGN_HF_METADATA_KEYS",
+    "CHIPS",
+    "CHIP_TOPOLOGIES",
+    "INSPECT_SCHEMA",
+    "NON_GATED_MLP_MODEL_TYPES",
+    "SUPPORTED_CHIPS",
+    "SUPPORTED_MODEL_TYPES",
+    "TOPOLOGIES",
+    "ChipOverrides",
+    "ChipSpec",
+    "Collective",
+    "CollectiveConfig",
+    "KeyTracker",
+    "LayerCounts",
+    "ModelGeometry",
+    "SliceTopology",
+    "count_layer_types",
+    "from_hf_config",
+    "load_chip_spec",
+    "register_chip",
+    "topologies_for_chip",
+    "torus_collective_s",
+]
