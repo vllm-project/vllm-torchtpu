@@ -130,14 +130,14 @@ def runner_shapes(
     ckpt_window: int,
     max_pages_per_seq: int,
 ) -> list[RunnerShape]:
-    """The runner input shapes a bucket is warmed up with (one graph each)."""
-    T, B = bucket.T, bucket.B
-    cols = max(T, max(1, ckpt_window))
-    if token_paddings and req_block_pairs:
-        pads = [p for p in token_paddings if p >= B]
-        tok = pads[0] if pads else token_paddings[-1]
-        return [RunnerShape(tok, r, k, cols) for r, k in req_block_pairs]
-    return [RunnerShape(B, B // T, max_pages_per_seq, cols)]
+    """The runner input shapes a bucket is warmed up with (one graph each):
+    `Bucket.runner_shapes`, which the library's warmup plan also uses."""
+    return bucket.runner_shapes(
+        token_paddings,
+        req_block_pairs,
+        ckpt_window=ckpt_window,
+        max_pages_per_seq=max_pages_per_seq,
+    )
 
 
 def _log_step_mix(name: str, summary: Any) -> None:
