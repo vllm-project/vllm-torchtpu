@@ -181,6 +181,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.max_groups, self.pps, self.debug = max_groups, pages_per_seq, debug
         self.carrier, self.ck_width = carrier, ck_width
         self.mp, self.ck_lanes = manager_pages, ck_lanes or ck_width
+        self.key_lanes = self.ck_lanes  # carrier lanes the key stream copies (wholekeylanes)
         self.key_slots = int(key_slots)
         assert self.key_slots >= 2, key_slots
         assert self.key_slots == 2 or (carrier and bounded_chunks and not compressed_dcp), (
