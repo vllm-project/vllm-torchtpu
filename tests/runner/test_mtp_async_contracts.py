@@ -87,6 +87,8 @@ def make_runner(device, monkeypatch, k):
     runner._read_offset_scratch = {}
     runner._last_sequence_layout_plan = None
     runner.pcp_manager = None
+    # __init__ sets it; these steps' drafts come from no drafter.
+    runner.drafter = None
     runner._fast_token_substitution = False
     # Real upstream batch operations and CPU token buffers. The kernels being
     # checked (offset reset / source assembly / substitution / D2H) use TPU.
