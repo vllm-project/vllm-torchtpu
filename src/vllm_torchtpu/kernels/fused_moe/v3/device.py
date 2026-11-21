@@ -14,10 +14,7 @@
 """Chip-generation checks and VMEM queries for Fused EP MoE v3."""
 
 import jax
-import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
-
-from .layout import align_up
 
 # Supported TPU generations. Device properties are read at build time,
 # and check_generation rejects generations outside this set.
@@ -55,21 +52,6 @@ def vmem_limit(fraction=VMEM_FRACTION):
     """The VMEM budget of one kernel: `fraction` of the chip's capacity
     (Config.vmem_fraction)."""
     return int(pltpu.get_tpu_info().vmem_capacity_bytes * fraction)
-
-
-def array_vmem_bytes(shape, dtype, info):
-    """Bytes a VMEM array of this shape and dtype occupies: the minor
-    dimension padded to the lane count, the second-minor to the dtype's
-    sublane tiling, both read off the device record."""
-    itemsize = jnp.dtype(dtype).itemsize
-    if len(shape) == 1:
-        return align_up(shape[0], info.num_lanes) * itemsize
-    lanes = align_up(shape[-1], info.num_lanes)
-    sublanes = align_up(shape[-2], info.get_sublane_tiling(dtype))
-    rows = 1
-    for dim in shape[:-2]:
-        rows *= dim
-    return rows * sublanes * lanes * itemsize
 
 
 def jax_version():
