@@ -24,8 +24,10 @@
 
 import argparse
 import dataclasses
+import json
 import os
 import time
+from typing import Any
 
 import numpy as np
 from tqdm import tqdm
@@ -84,7 +86,17 @@ def main(args: argparse.Namespace):
     print(f"Average warmup latency: {np.mean(warmup_latencies):.4f}s")
 
     # Enable tracing on server
-    llm.start_profile()
+    profiler_kwargs: dict[str, Any] | None = None
+    if args.profiler_kwargs:
+        parsed_kwargs = json.loads(args.profiler_kwargs)
+        if not isinstance(parsed_kwargs, dict):
+            raise ValueError("--profiler-kwargs must be a JSON object/dictionary.")
+        profiler_kwargs = parsed_kwargs
+
+    llm.start_profile(
+        profile_prefix=args.profile_prefix,
+        profiler_kwargs=profiler_kwargs,
+    )
     if DELAY_MS == 0:
         time.sleep(1.0)
     profile_latencies = []
@@ -123,6 +135,22 @@ def parse_args():
         help=(
             "path to save the profiler output. Can be visualized "
             "with XProf or Tensorboard"
+        ),
+    )
+    parser.add_argument(
+        "--profile-prefix",
+        type=str,
+        default=None,
+        help="Optional subdirectory prefix under --profile-result-dir for this run.",
+    )
+    parser.add_argument(
+        "--profiler-kwargs",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON dictionary of dynamic TPU profiler options passed to "
+            "llm.start_profile (e.g., "
+            '\'{"host_tracer_level": 3, "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC"}\').'
         ),
     )
 
