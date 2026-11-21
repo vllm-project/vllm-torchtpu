@@ -64,6 +64,13 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         self._finalized = False
         self._conv: Callable[..., torch.Tensor] | None = None
         self._speculative_conv: Callable[..., torch.Tensor] | None = None
+        # q38 PLE-CS: (streams, split, TP rank) with VLLM_TPU_PLE_CHANNEL_SHARD, else None.
+        self._cs = channel_shard_spec(
+            parallel.tp_group.rank_in_group,
+            parallel.tp_group.world_size,
+            self.hc_count,
+            self.hidden_size,
+        )
 
     @property
     def storage(self) -> ResidentPLETable:
@@ -101,6 +108,8 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             raise ValueError(f"PLE history must have shape [slots,{self.state_shape}]")
         if history.dtype != torch.bfloat16:
             raise ValueError("PLE history must use BF16")
+        if self._cs is not None:
+            raise ValueError("VLLM_TPU_PLE_CHANNEL_SHARD needs the unified pool")
         self.cache_owners = (history,)
         self._conv = build_short_conv_op(self.conv_dilation)
 
@@ -111,6 +120,8 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         self._speculative_conv = build_pooled_speculative_short_conv_op(
             self.conv_dilation, self.conv_state_len
         )
+        if self._cs is not None:
+            self._bind_channel_shard(pool)
 
     def _lookup_ids(
         self, inputs: PLEInputs, valid_tokens: torch.Tensor
@@ -201,7 +212,16 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             self.storage.decode(raw),
             num_tokens if sequence_parallel else None,
         )
-        if speculative is None:
+        if self._cs is not None:
+            conv = self._channel_shard_conv(
+                self.norm_conv(gated),
+                inputs.query_start_loc,
+                state_indices,
+                has_initial_states,
+                speculative,
+                sequence_parallel,
+            )
+        elif speculative is None:
             conv = self._conv(
                 self.norm_conv(gated),
                 self.conv1d.weight[:, 0],
@@ -236,3 +256,144 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
 
             output = sp.shard(output)
         return output
+
+    def _bind_channel_shard(self, pool: torch.Tensor) -> None:
+        """q38 PLE-CS: this rank's stream operand and the stream ops (see ``channel_shard_spec``)."""
+        from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
+            build_pooled_short_conv_cs_op,
+            build_pooled_speculative_short_conv_cs_op,
+        )
+
+        streams, split, rank = self._cs
+        # An operand, not a constant: every TP rank traces one graph (as vocab_start).
+        self.register_buffer(
+            "cs_rank",
+            torch.tensor([rank], dtype=torch.int32, device=pool.device),
+            persistent=False,
+        )
+        args = (self.conv_dilation, self.conv_state_len, streams, split)
+        self._cs_conv = build_pooled_short_conv_cs_op(*args)
+        self._cs_speculative_conv = build_pooled_speculative_short_conv_cs_op(*args)
+        channels = self.hidden_size * self.hc_count
+        width = channels // streams
+        stream, part = divmod(rank, split)
+        _logger().info(
+            "q38 PLE-CS bound: %s TP rank %d computes HC stream %d (channels %d-%d of %d), "
+            "all-gathers part %d of %d (%d channels) over TP %d",
+            self.prefix,
+            rank,
+            stream,
+            stream * width,
+            (stream + 1) * width - 1,
+            channels,
+            part,
+            split,
+            width // split,
+            streams * split,
+        )
+
+    def _channel_shard_conv(
+        self,
+        values: torch.Tensor,
+        starts: torch.Tensor,
+        state_indices: torch.Tensor,
+        has_initial_states: torch.Tensor,
+        speculative: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+        sequence_parallel: bool,
+    ) -> torch.Tensor:
+        """q38 PLE-CS: the conv of this rank's HC stream, its piece all-gathered over TP in
+        rank order; bitwise the stock op's output (kernels/qwen4_exp/pool.py)."""
+        if sequence_parallel:
+            raise ValueError("VLLM_TPU_PLE_CHANNEL_SHARD does not run sequence-parallel steps")
+        weight = self.conv1d.weight[:, 0]
+        if speculative is None:
+            piece = self._cs_conv(
+                values,
+                weight,
+                self.cache_owners[0],
+                starts,
+                state_indices,
+                has_initial_states,
+                self.cs_rank,
+            )
+        else:
+            read_ids, ckpt_ids, windowed = speculative
+            piece = self._cs_speculative_conv(
+                values,
+                weight,
+                self.cache_owners[0],
+                starts,
+                state_indices,
+                has_initial_states,
+                read_ids,
+                ckpt_ids,
+                windowed,
+                self.cs_rank,
+            )
+        return self.parallel.tp_group.all_gather(piece, dim=-1)
+
+
+def _logger():
+    from vllm_torchtpu.logger import init_logger
+
+    return init_logger(__name__)
+
+
+def channel_shard_spec(
+    tp_rank: int, tp_size: int, hc_count: int, hidden_size: int, cfg=None
+) -> tuple[int, int, int] | None:
+    """q38 PLE-CS: (streams, split, tp_rank) for VLLM_TPU_PLE_CHANNEL_SHARD, or None when unset.
+
+    Rank r runs the PLE conv and its checkpoint windows on HC stream r // split (split = TP /
+    streams) and contributes part r % split of that stream's output to the TP all-gather, whose
+    rank order is then the channel order. A rank writes only its stream's checkpoint tokens, so
+    the flag is refused (ValueError) on every engine but a PD decode engine (kv_role
+    kv_consumer: its PLE pages arrive whole from prefill and no other engine reads them back) and
+    in every mode where a PLE conv call could bypass the stream path: prefill-context
+    parallelism, prefill sequence parallelism, VLLM_TPU_PLE_UNIFORM_COND, the HND pool layout,
+    the decode megakernel. ``cfg`` defaults to the current vLLM config (read only when set).
+    """
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.kernels.qwen4_exp.pool import channel_shard_streams
+
+    streams = channel_shard_streams()
+    if not streams:
+        return None
+    if cfg is None:
+        from vllm.config import get_current_vllm_config
+
+        cfg = get_current_vllm_config()
+    from types import SimpleNamespace
+
+    from vllm import envs as vllm_envs
+
+    from vllm_torchtpu.megakernel_runtime import _is_megakernel_requested
+
+    from .config import pd_transfer_config
+
+    reasons = []
+    if streams != hc_count:
+        reasons.append(f"it splits the {hc_count} HC streams, not {streams}")
+    transfer = pd_transfer_config(cfg)
+    if transfer is None or transfer.kv_role != "kv_consumer":
+        reasons.append("it runs only on a PD decode engine (kv_role kv_consumer)")
+    if int(getattr(cfg.parallel_config, "prefill_context_parallel_size", 1) or 1) > 1:
+        reasons.append("prefill context parallelism is on")
+    if envs.QWEN4_EXP_PREFILL_SP:
+        reasons.append("QWEN4_EXP_PREFILL_SP is set")
+    if envs.VLLM_TPU_PLE_UNIFORM_COND:
+        reasons.append("VLLM_TPU_PLE_UNIFORM_COND is set")
+    if vllm_envs.VLLM_KV_CACHE_LAYOUT == "HND":
+        reasons.append("the HND pool layout is not supported")
+    if _is_megakernel_requested(SimpleNamespace(vllm_config=cfg)):
+        reasons.append("the decode megakernel runs its own PLE")
+    split = tp_size // streams if streams and tp_size % streams == 0 else 0
+    if not split:
+        reasons.append(f"TP {tp_size} is not a multiple of {streams} streams")
+    elif hidden_size % split or (hidden_size // split) % 128:
+        reasons.append(f"a stream of {hidden_size} channels does not split {split} ways in lanes")
+    if reasons:
+        raise ValueError(
+            f"VLLM_TPU_PLE_CHANNEL_SHARD={streams} refused: " + "; ".join(reasons)
+        )
+    return streams, split, tp_rank

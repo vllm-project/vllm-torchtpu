@@ -133,3 +133,69 @@ def build_pooled_speculative_short_conv_op(dilation, state_len):
         return output
 
     return run
+
+
+# q38 PLE-CS (VLLM_TPU_PLE_CHANNEL_SHARD): the pooled convs on one HC stream's channel slice per
+# TP rank (kernels/qwen4_exp/pool.py). Each op returns this rank's piece of the conv output and
+# the caller all-gathers the pieces over TP (models/vllm/qwen4_exp/pooled_ple.py). ``rank`` is
+# an int32[1] operand, not a constant, so every TP rank traces one graph (as ``vocab_start``).
+@functools.cache
+def build_pooled_short_conv_cs_op(dilation, state_len, streams, split):
+    from vllm_torchtpu.kernels.qwen4_exp.pool import pooled_short_conv_cs
+
+    fn = functools.partial(
+        pooled_short_conv_cs,
+        dilation=dilation,
+        state_len=state_len,
+        streams=streams,
+        split=split,
+    )
+    op = pallas.jax_op(
+        f"qwen4_exp::pooled_short_conv_cs{streams}x{split}_{dilation}_{state_len}",
+        fn,
+        donate_argnums=(2,),
+    )
+
+    @op.register_fake
+    def fake(x, weight, pool, starts, ids, initial, rank):
+        piece = x.new_empty((x.shape[0], x.shape[1] // (streams * split)))
+        return torch.empty_like(pool), piece
+
+    def run(x, weight, pool, starts, ids, initial, rank):
+        updated, piece = op(x, weight, pool, starts, ids, initial, rank)
+        pool.copy_(updated)
+        return piece
+
+    return run
+
+
+@functools.cache
+def build_pooled_speculative_short_conv_cs_op(dilation, state_len, streams, split):
+    from vllm_torchtpu.kernels.qwen4_exp.pool import pooled_short_conv_speculative_cs
+
+    fn = functools.partial(
+        pooled_short_conv_speculative_cs,
+        dilation=dilation,
+        state_len=state_len,
+        streams=streams,
+        split=split,
+    )
+    op = pallas.jax_op(
+        f"qwen4_exp::pooled_spec_short_conv_cs{streams}x{split}_{dilation}_{state_len}",
+        fn,
+        donate_argnums=(2,),
+    )
+
+    @op.register_fake
+    def fake(x, weight, pool, starts, ids, initial, read_ids, ckpt_ids, windowed, rank):
+        piece = x.new_empty((x.shape[0], x.shape[1] // (streams * split)))
+        return torch.empty_like(pool), piece
+
+    def run(x, weight, pool, starts, ids, initial, read_ids, ckpt_ids, windowed, rank):
+        updated, piece = op(
+            x, weight, pool, starts, ids, initial, read_ids, ckpt_ids, windowed, rank
+        )
+        pool.copy_(updated)
+        return piece
+
+    return run

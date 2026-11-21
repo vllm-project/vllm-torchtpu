@@ -717,3 +717,436 @@ def pooled_short_conv_speculative(
     output, values, targets = jax.lax.cond(pred, uniform, stock, None)
     pool = write_region(pool, values, targets)
     return pool, output
+
+
+# q38 PLE-CS (VLLM_TPU_PLE_CHANNEL_SHARD, default "0" = off, hashed): the decode engine's PLE
+# short conv and its per-token checkpoint windows on one HC stream's channel slice per TP rank;
+# the caller all-gathers the conv output over TP (models/vllm/qwen4_exp/pooled_ple.py). This
+# section sits below everything else and only adds functions, so with the flag unset every line
+# above, and with them the stock kernels' Mosaic payloads and debug locations, is unchanged.
+#
+# The history region keeps the full [state_len, channels] BF16 layout, so prefill, the PD
+# transfer, page seeding and the host tier see no change. In a pool of 1024-byte tokens a region
+# of 10240 channels holds window row w in tokens [20 w, 20 w + 20), and stream s (2560 channels)
+# of that row is the run of 5 tokens at 20 w + 5 s (``cache_regions.region_rows`` geometry). The
+# stream reader and writers move whole tokens of those runs through the same typed views
+# (``typed_ldst.load_typed`` / ``store_typed``) as the full-region reader and writers; that view
+# maps each pool token to its own two BF16 rows, so a stream view is bit for bit the slice of the
+# full view. A rank writes only its stream's tokens and the other streams of its pool pages go
+# stale, so every PLE conv call of the engine must take this path (pooled_ple binds it for the
+# engine's lifetime). ``rank`` is an int32[1] operand, so every TP rank traces one program.
+import math as _math
+
+_CS_SEEN: set = set()
+# Request rows one grid step of the stream reader fetches (state_len DMAs each).
+CS_READ_ROWS = 4
+
+
+def channel_shard_streams() -> int:
+    """VLLM_TPU_PLE_CHANNEL_SHARD: HC streams the PLE conv channels split into (0 = stock op)."""
+    return int(envs.VLLM_TPU_PLE_CHANNEL_SHARD or "0")
+
+
+def stream_geometry(pool, channels: int, streams: int) -> tuple[int, int, int]:
+    """(row_tokens, stream_tokens, stream_rows) of a [state_len, channels] BF16 history region:
+    pool tokens per window row, pool tokens per stream run, and BF16 rows of ``pool.shape[-1]``
+    lanes in one run's typed view."""
+    token_bytes = _math.prod(pool.shape[2:]) * jnp.dtype(pool.dtype).itemsize
+    lanes = pool.shape[-1]
+    row_bytes = channels * 2
+    if channels % streams or row_bytes % (token_bytes * streams) or token_bytes % (lanes * 2):
+        raise ValueError(
+            f"PLE-CS: {channels} BF16 channels in {streams} streams are not whole "
+            f"{token_bytes}-byte pool tokens of {lanes} lanes"
+        )
+    row_tokens = row_bytes // token_bytes
+    stream_tokens = row_tokens // streams
+    stream_rows = stream_tokens * token_bytes // (lanes * 2)
+    assert stream_rows * lanes == channels // streams, (stream_rows, lanes, channels, streams)
+    return row_tokens, stream_tokens, stream_rows
+
+
+def read_region_stream(pool, ids, stream, *, state_len, channels, streams, selected=None):
+    """[len(ids), state_len, channels // streams] BF16: stream ``stream[0]`` of each id's history
+    region, bit for bit ``read_region(pool, ids, elements=state_len * channels, dtype=bf16)
+    .reshape(-1, state_len, channels)[:, :, s * w : (s + 1) * w]`` (ids <= 0 read page 0, as
+    there). With ``selected``, rows where it is False move no bytes and read zero (callers mask
+    them, as for ``read_selected_region``). One grid step fetches CS_READ_ROWS rows: it starts
+    every DMA of its rows (one per window row), waits them all, then stores the typed views."""
+    count = ids.shape[0]
+    row_tokens, stream_tokens, stream_rows = stream_geometry(pool, channels, streams)
+    assert state_len * row_tokens <= pool.shape[1], "state region exceeds its manager page"
+    lanes = pool.shape[-1]
+    payload = tuple(pool.shape[2:])
+    if count == 0:
+        return jnp.zeros((0, state_len, channels // streams), jnp.bfloat16)
+    per = min(CS_READ_ROWS, count)
+    padded = pl.cdiv(count, per) * per
+    blocks = jnp.pad(jnp.maximum(ids, 0).astype(jnp.int32), (0, padded - count))
+    sel = jnp.ones((count,), jnp.int32) if selected is None else selected.astype(jnp.int32)
+    sel = jnp.pad(sel, (0, padded - count))
+
+    def kernel(blocks_ref, sel_ref, stream_ref, source, out, staged, sem):
+        base = pl.program_id(0) * per
+        first = stream_ref[0] * stream_tokens
+
+        def copy(j, w):
+            return pltpu.make_async_copy(
+                source.at[blocks_ref[base + j], pl.ds(w * row_tokens + first, stream_tokens)],
+                staged.at[j, w],
+                sem,
+            )
+
+        for j in range(per):
+            @pl.when(sel_ref[base + j] > 0)
+            def _():
+                for w in range(state_len):
+                    copy(j, w).start()
+
+        for j in range(per):
+            @pl.when(sel_ref[base + j] > 0)
+            def _():
+                for w in range(state_len):
+                    copy(j, w).wait()
+
+        for j in range(per):
+            @pl.when(sel_ref[base + j] > 0)
+            def _():
+                for w in range(state_len):
+                    out[j, w] = typed_ldst.load_typed(staged.at[j, w], view_dtype=jnp.bfloat16)
+
+            @pl.when(sel_ref[base + j] <= 0)
+            def _():
+                out[j] = jnp.zeros((state_len, stream_rows, lanes), jnp.bfloat16)
+
+    values = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(padded // per,),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(
+                (per, state_len, stream_rows, lanes), lambda i, *_: (i, 0, 0, 0)
+            ),
+            scratch_shapes=[
+                pltpu.VMEM((per, state_len, stream_tokens) + payload, pool.dtype),
+                pltpu.SemaphoreType.DMA,
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct((padded, state_len, stream_rows, lanes), jnp.bfloat16),
+        name="q38_ple_cs_read",
+    )(blocks, sel, stream.astype(jnp.int32).reshape(1), pool)
+    return values[:count].reshape(count, state_len, stream_rows * lanes)
+
+
+def write_region_stream(
+    pool, values, ids, stream, *, state_len, channels, streams, skip_idle_source=False
+):
+    """``write_region`` of each id's stream run: row i of ``values`` ([count, state_len * w]
+    BF16, one stream's window) lands at stream ``stream[0]``'s tokens of page ``ids[i]``'s full
+    history region; ids <= 0 and every byte outside those tokens stay intact. The stock
+    writer's structure (one grid step per row; the row's DMAs waited before the next row)."""
+    count, elements = values.shape
+    row_tokens, stream_tokens, stream_rows = stream_geometry(pool, channels, streams)
+    lanes = pool.shape[-1]
+    assert elements == state_len * stream_rows * lanes, (elements, state_len, stream_rows)
+    assert state_len * row_tokens <= pool.shape[1], "state region exceeds its manager page"
+    if count == 0:
+        return pool
+    payload = tuple(pool.shape[2:])
+    values = values.reshape(count, state_len, stream_rows, lanes)
+    stream = stream.astype(jnp.int32).reshape(1)
+
+    def kernel(indices, stream_ref, *refs):
+        source, old, target = refs[-3:]
+        target_id = indices[pl.program_id(0)]
+
+        @pl.when(target_id > 0)
+        def store():
+            first = stream_ref[0] * stream_tokens
+
+            def copy(encoded, semaphore):
+                def dma(w):
+                    return pltpu.make_async_copy(
+                        encoded.at[w],
+                        target.at[target_id, pl.ds(w * row_tokens + first, stream_tokens)],
+                        semaphore,
+                    )
+
+                for w in range(state_len):
+                    typed_ldst.store_typed(encoded.at[w], source[0, w])
+                for w in range(state_len):
+                    dma(w).start()
+                for w in range(state_len):
+                    dma(w).wait()
+
+            pl.run_scoped(
+                copy,
+                pltpu.VMEM((state_len, stream_tokens) + payload, pool.dtype),
+                pltpu.SemaphoreType.DMA,
+            )
+
+    block = (1, state_len, stream_rows, lanes)
+    if skip_idle_source:
+        prefetch = (ids, stream, _last_selected_row(ids > 0))
+        source_spec = pl.BlockSpec(block, lambda i, indices, st, src: (src[i], 0, 0, 0))
+    else:
+        prefetch = (ids, stream)
+        source_spec = pl.BlockSpec(block, lambda i, indices, st: (i, 0, 0, 0))
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=len(prefetch),
+            grid=(count,),
+            in_specs=[source_spec, pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={len(prefetch) + 1: 0},
+        name="q38_ple_cs_write",
+    )(*prefetch, values, pool)
+
+
+def write_region_stream_ring(pool, values, ids, stream, *, state_len, channels, streams, depth=4):
+    """``write_region_stream`` with ``depth`` rows of checkpoint DMAs in flight: the ring of
+    ``write_region_ring`` (q38 PLE-WRDEFER), each row writing its state_len stream runs on its
+    slot's semaphore and waiting all of them before the slot is reused or at the drain. Written
+    ids are unique and positive, so no two DMAs touch the same bytes and the pool is bitwise
+    ``write_region_stream``'s."""
+    count, elements = values.shape
+    row_tokens, stream_tokens, stream_rows = stream_geometry(pool, channels, streams)
+    lanes = pool.shape[-1]
+    assert elements == state_len * stream_rows * lanes, (elements, state_len, stream_rows)
+    assert state_len * row_tokens <= pool.shape[1], "state region exceeds its manager page"
+    if count == 0:
+        return pool
+    depth = max(1, min(int(depth), count))
+    payload = tuple(pool.shape[2:])
+    values = values.reshape(count, state_len, stream_rows, lanes)
+    stream = stream.astype(jnp.int32).reshape(1)
+
+    def kernel(indices, stream_ref, source, old, target, staged, encoded, rsem, wsem):
+        first = stream_ref[0] * stream_tokens
+
+        def read(i, slot):
+            return pltpu.make_async_copy(source.at[i], staged.at[slot], rsem.at[slot])
+
+        def write(i, slot, w):
+            return pltpu.make_async_copy(
+                encoded.at[slot, w],
+                target.at[indices[i], pl.ds(w * row_tokens + first, stream_tokens)],
+                wsem.at[slot],
+            )
+
+        def wait_writes(i, slot):
+            for w in range(state_len):
+                write(i, slot, w).wait()
+
+        def row(i, slot):
+            @_when(i >= depth)
+            def _():
+                @pl.when(indices[i - depth] > 0)
+                def _():
+                    wait_writes(i - depth, slot)
+
+            @pl.when(indices[i] > 0)
+            def _():
+                read(i, slot).wait()
+                for w in range(state_len):
+                    typed_ldst.store_typed(encoded.at[slot, w], staged[slot, w])
+                for w in range(state_len):
+                    write(i, slot, w).start()
+
+            @_when(i + depth < count)
+            def _():
+                @pl.when(indices[i + depth] > 0)
+                def _():
+                    read(i + depth, slot).start()
+
+        for i in range(depth):  # read-ahead of the first ring
+            @pl.when(indices[i] > 0)
+            def _():
+                read(i, i).start()
+
+        def chunk(c, carry):
+            for slot in range(depth):
+                row(c * depth + slot, slot)
+            return carry
+
+        full = count // depth
+        jax.lax.fori_loop(0, full, chunk, 0)
+        for slot in range(count - full * depth):
+            row(full * depth + slot, slot)
+        for i in range(count - depth, count):  # drain
+            @pl.when(indices[i] > 0)
+            def _():
+                wait_writes(i, i % depth)
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=(1,),
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[
+                pltpu.VMEM((depth, state_len, stream_rows, lanes), values.dtype),
+                pltpu.VMEM((depth, state_len, stream_tokens) + payload, pool.dtype),
+                pltpu.SemaphoreType.DMA((depth,)),
+                pltpu.SemaphoreType.DMA((depth,)),
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={3: 0},
+        name="q38_ple_cs_wrdefer",
+    )(ids, stream, values, pool)
+
+
+def write_region_stream_any(pool, values, ids, stream, *, skip_idle_source=False, **geometry):
+    """The stream writer VLLM_TPU_PLE_WRDEFER selects, as ``write_region`` does for the full
+    region: the ring with K > 0 and ``skip_idle_source`` off, else the stock structure."""
+    depth = wrdefer_depth()
+    if depth and not skip_idle_source:
+        return write_region_stream_ring(pool, values, ids, stream, depth=depth, **geometry)
+    return write_region_stream(
+        pool, values, ids, stream, skip_idle_source=skip_idle_source, **geometry
+    )
+
+
+def _cs_inputs(x, weight, rank, streams, split):
+    """(x, weight) cut to stream ``rank // split``, that stream as int32[1], and the part
+    ``rank % split`` of the stream's output this rank contributes to the all-gather."""
+    width = x.shape[-1] // streams
+    r = rank.astype(jnp.int32).reshape(-1)[0]
+    stream, part = r // split, r % split
+    xs = jax.lax.dynamic_slice_in_dim(x, stream * width, width, axis=1)
+    ws = jax.lax.dynamic_slice_in_dim(weight, stream * width, width, axis=0)
+    return xs, ws, stream.reshape(1), part
+
+
+def _cs_piece(output, part, split):
+    """This rank's all-gather piece: part ``part`` of ``split`` of its stream's output."""
+    if split == 1:
+        return output
+    width = output.shape[-1] // split
+    return jax.lax.dynamic_slice_in_dim(output, part * width, width, axis=1)
+
+
+def _note_cs(kind, token_count, count, channels, streams, split, skip_idle) -> None:
+    """Trace-time engagement line, once per traced shape and kind."""
+    depth = 0 if skip_idle else wrdefer_depth()
+    key = (kind, token_count, count, channels, streams, split, depth, bool(skip_idle))
+    if key in _CS_SEEN:
+        return
+    _CS_SEEN.add(key)
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info(
+        "q38 PLE-CS traced: %s, %d tokens, %d request rows, stream of %d of %d channels, "
+        "all-gather piece %d channels, writer %s%s",
+        kind,
+        token_count,
+        count,
+        channels // streams,
+        channels,
+        channels // (streams * split),
+        f"ring depth {depth}" if depth else "stock",
+        ", idle rows skipped" if skip_idle else "",
+    )
+
+
+def pooled_short_conv_cs(
+    x, weight, pool, starts, ids, initial, rank, *, dilation, state_len, streams, split
+):
+    """``pooled_short_conv`` on stream ``rank // split`` (q38 PLE-CS). Returns (pool, piece):
+    piece = part ``rank % split`` of the stream's output, so the TP all-gather of the pieces in
+    rank order is the stock output bit for bit; the pool gets the stream's tokens of the stock
+    write and keeps every other byte."""
+    channels = x.shape[-1]
+    xs, ws, stream, part = _cs_inputs(x, weight, rank, streams, split)
+    geometry = dict(state_len=state_len, channels=channels, streams=streams)
+    _note_cs("pooled", x.shape[0], len(ids), channels, streams, split, False)
+    history = read_region_stream(pool, ids, stream, **geometry)
+    active = (ids > 0) & (starts[1:] > starts[:-1])
+    slots = jnp.where(active, jnp.arange(len(ids), dtype=jnp.int32), -1)
+    output, updated = short_conv(
+        xs,
+        ws,
+        history,
+        starts,
+        slots,
+        initial,
+        dilation=dilation,
+        request_owned_history=True,
+    )
+    pool = write_region_stream_any(
+        pool, updated.reshape(len(ids), -1), jnp.where(active, ids, 0), stream, **geometry
+    )
+    return pool, _cs_piece(output, part, split)
+
+
+def pooled_short_conv_speculative_cs(
+    x,
+    weight,
+    pool,
+    starts,
+    ids,
+    initial,
+    read_ids,
+    ckpt_ids,
+    windowed,
+    rank,
+    *,
+    dilation,
+    state_len,
+    streams,
+    split,
+):
+    """The stock ``pooled_short_conv_speculative`` (token and request paths,
+    VLLM_TPU_PLE_SKIP_IDLE_ROWS, VLLM_TPU_PLE_WRDEFER) on stream ``rank // split`` (q38 PLE-CS).
+    Returns (pool, piece) as ``pooled_short_conv_cs``: every written checkpoint gets the stream's
+    tokens of the stock checkpoint and no other byte of the pool changes."""
+    channels = x.shape[-1]
+    xs, ws, stream, part = _cs_inputs(x, weight, rank, streams, split)
+    starts, ids, initial, read_ids, ckpt_ids, windowed = step_request_rows(
+        x.shape[0], starts, ids, initial, read_ids, ckpt_ids, windowed
+    )
+    count, window = ckpt_ids.shape
+    lengths = starts[1:] - starts[:-1]
+    active = (ids > 0) & (lengths > 0)
+    skip_idle = envs.VLLM_TPU_PLE_SKIP_IDLE_ROWS
+    geometry = dict(state_len=state_len, channels=channels, streams=streams)
+    token_path = x.shape[0] <= count * window
+    _note_cs(
+        "speculative token path" if token_path else "speculative request path",
+        x.shape[0], count, channels, streams, split, skip_idle,
+    )
+    history = read_region_stream(
+        pool, read_ids, stream, selected=active if skip_idle else None, **geometry
+    )
+    slots = jnp.where(active, jnp.arange(count, dtype=jnp.int32), -1)
+    output, final = short_conv(
+        xs,
+        ws,
+        history,
+        starts,
+        slots,
+        initial,
+        dilation=dilation,
+        request_owned_history=True,
+    )
+    if token_path:
+        values, targets = token_checkpoints(
+            xs, history, starts, initial, active, ckpt_ids, windowed
+        )
+    else:
+        values, targets = request_checkpoints(
+            xs, history, final, starts, initial, active, ckpt_ids, windowed
+        )
+    pool = write_region_stream_any(
+        pool, values, targets, stream, skip_idle_source=skip_idle, **geometry
+    )
+    return pool, _cs_piece(output, part, split)

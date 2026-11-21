@@ -272,6 +272,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PLE_HISTORY_ROW_KERNEL: bool = False
     VLLM_TPU_PLE_WRDEFER: str = "0"
     VLLM_TPU_PLE_UNIFORM_COND: bool = False
+    VLLM_TPU_PLE_CHANNEL_SHARD: str = "0"
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -1411,6 +1412,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # uniform-window path (history for the T // window leading rows, static slices) and the
     # stock path; bitwise the stock op. Off = the stock op, no cond. Hashed (changes programs).
     "VLLM_TPU_PLE_UNIFORM_COND": env_bool("VLLM_TPU_PLE_UNIFORM_COND"),
+    # q38 PLE-CS: "4" runs the decode engine's PLE short conv and its per-token checkpoint
+    # windows on one HC stream's channel slice per TP rank (rank r: stream r // (TP / 4)) and
+    # all-gathers the conv output over TP (kernels/qwen4_exp/pool.py, pooled_ple.py). The pool
+    # keeps the full history layout; a rank reads and writes only its stream's tokens. Bitwise.
+    # Decode engines (PD kv_consumer) only; refused with PCP, prefill SP, UNIFORM_COND or HND.
+    # "0" = stock op. Hashed (changes device programs).
+    "VLLM_TPU_PLE_CHANNEL_SHARD": env_with_choices(
+        "VLLM_TPU_PLE_CHANNEL_SHARD", "0", ["0", "4"]
+    ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.
