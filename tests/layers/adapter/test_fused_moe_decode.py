@@ -269,3 +269,489 @@ def test_arm_runner_models_skips_a_draft_that_is_the_target(monkeypatch):
     runner.drafter = SimpleNamespace(draft_model=runner.model)
     assert bridge.arm_runner_models(runner) == 1
     assert armed == [(runner.model, "target model")]
+
+
+def test_shared_slice_declines_bias_and_reduce_results(monkeypatch):
+    import vllm.distributed
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    mlp_bias = DeepseekV2MLP(256, 128)
+    mlp_bias.down_proj.bias = torch.zeros(256)
+    assert bridge._admit(_glm_runner(mlp_bias), 2) is None
+
+    mlp_reduced = DeepseekV2MLP(256, 128)
+    mlp_reduced.down_proj.reduce_results = True
+    assert bridge._admit(_glm_runner(mlp_reduced), 2) is None
+
+
+# ---------------------------------------------------------------------------
+# Trace-time static bucket dispatch and shape_variants placeholder parity
+# ---------------------------------------------------------------------------
+
+_fmd_test_lib = torch.library.Library("tpu_fmd_static_dispatch_test", "FRAGMENT")
+_fmd_test_lib.define(
+    "decode_gated("
+    "Tensor x, Tensor w1, Tensor w2, Tensor w1s, Tensor w2s, "
+    "Tensor sw1, Tensor sw1s, Tensor sw2, Tensor sw2s, Tensor sg, "
+    "Tensor tw, Tensor ti, Tensor rk"
+    ") -> Tensor"
+)
+_fmd_test_lib.impl(
+    "decode_gated",
+    lambda x, w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s, sg, tw, ti, rk: (
+        x + sw1.float().sum() + sw2.float().sum() + sg.float().sum()
+    ),
+    "CPU",
+)
+torch.library.register_fake(
+    "tpu_fmd_static_dispatch_test::decode_gated",
+    lambda x, *_a: torch.empty_like(x),
+)
+_fmd_test_lib.define(
+    "decode_ungated("
+    "Tensor x, Tensor w1, Tensor w2, Tensor w1s, Tensor w2s, "
+    "Tensor sw1, Tensor sw1s, Tensor sw2, Tensor sw2s, "
+    "Tensor tw, Tensor ti, Tensor rk"
+    ") -> Tensor"
+)
+_fmd_test_lib.impl(
+    "decode_ungated",
+    lambda x, w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s, tw, ti, rk: (
+        x + sw1.float().sum() + sw2.float().sum()
+    ),
+    "CPU",
+)
+torch.library.register_fake(
+    "tpu_fmd_static_dispatch_test::decode_ungated",
+    lambda x, *_a: torch.empty_like(x),
+)
+_fmd_test_lib.define(
+    "gmm("
+    "Tensor x, Tensor w1, Tensor w2, Tensor w1s, Tensor w2s, "
+    "Tensor tw, Tensor ti, Tensor es"
+    ") -> Tensor"
+)
+_fmd_test_lib.impl("gmm", lambda x, *_a: x * 2.0, "CPU")
+torch.library.register_fake(
+    "tpu_fmd_static_dispatch_test::gmm",
+    lambda x, *_a: torch.empty_like(x),
+)
+_DECODE_GATED_OP = torch.ops.tpu_fmd_static_dispatch_test.decode_gated
+_DECODE_UNGATED_OP = torch.ops.tpu_fmd_static_dispatch_test.decode_ungated
+_GMM_OP = torch.ops.tpu_fmd_static_dispatch_test.gmm
+
+
+class _StubLinear(torch.nn.Module):
+    def __init__(self, k: int, n: int, *, scaled: bool = True):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.zeros((k, n), dtype=torch.bfloat16), requires_grad=False
+        )
+        self.bias = None
+        self.reduce_results = False
+        if scaled:
+            self.weight_scale = torch.nn.Parameter(
+                torch.ones(n, dtype=torch.float32), requires_grad=False
+            )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+        out = x @ self.weight.to(x.dtype)
+        if hasattr(self, "weight_scale"):
+            out = out * self.weight_scale.to(x.dtype)
+        return out, None
+
+
+class _StubSharedMLP(torch.nn.Module):
+    def __init__(self, h: int, i_s: int, *, gated: bool):
+        super().__init__()
+        self.gate_up_proj = _StubLinear(h, 2 * i_s, scaled=True)
+        self.down_proj = _StubLinear(i_s, h, scaled=True)
+        self.expert_gate = _StubLinear(h, 1, scaled=False) if gated else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gu, _ = self.gate_up_proj(x)
+        i_s = gu.shape[-1] // 2
+        out, _ = self.down_proj(torch.nn.functional.silu(gu[:, :i_s]) * gu[:, i_s:])
+        if self.expert_gate is not None:
+            out = torch.sigmoid(self.expert_gate(x)[0]) * out
+        return out
+
+
+class _StubSharedExperts(torch.nn.Module):
+    def __init__(self, layer: torch.nn.Module):
+        super().__init__()
+        self._layer = layer
+        self.output: torch.Tensor | None = None
+
+    def maybe_forward_async(self, shared_experts_input: torch.Tensor | None) -> bool:
+        return False
+
+    def __call__(self, shared_experts_input: torch.Tensor, order: object) -> None:
+        self.output = self._layer(shared_experts_input)
+
+
+class _StubRoutedExperts(torch.nn.Module):
+    def __init__(self, qm: VllmFp8MoEMethodTPU, e: int, h: int, i: int, *, ep: bool):
+        super().__init__()
+        self.quant_method = qm
+        self.w13_weight = torch.nn.Parameter(
+            torch.zeros((e, h, 2 * i), dtype=torch.bfloat16), requires_grad=False
+        )
+        self.w2_weight = torch.nn.Parameter(
+            torch.zeros((e, i, h), dtype=torch.bfloat16), requires_grad=False
+        )
+        self.w13_weight_scale_inv = torch.nn.Parameter(
+            torch.ones((e, 1, 1, 2 * i), dtype=torch.float32), requires_grad=False
+        )
+        self.w2_weight_scale_inv = torch.nn.Parameter(
+            torch.ones((e, 1, 1, h), dtype=torch.float32), requires_grad=False
+        )
+        self.register_buffer(
+            "_experts_start",
+            torch.tensor(0, dtype=torch.int32) if ep else None,
+            persistent=False,
+        )
+        self.moe_config = SimpleNamespace(experts_per_token=2)
+
+    def _ensure_moe_quant_config_init(self) -> None:
+        return None
+
+    def forward_monolithic(
+        self,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.quant_method.apply_monolithic(self, x, router_logits)
+
+
+def _build_static_dispatch_runner(
+    *,
+    gated: bool,
+    ep: bool,
+    max_tokens: int = 16,
+    routed_scale: float = 1.0,
+    layer_name: str = "model.layers.0.mlp.experts",
+):
+    from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
+
+    h, i, i_s, e = 8, 4, 4, 2
+    qm = VllmFp8MoEMethodTPU.__new__(VllmFp8MoEMethodTPU)
+    qm._tpu_activation_str = "silu"
+    qm._tpu_topk_weights_float32 = False
+    qm._use_adaptive_fused_moe = False
+    qm.moe_kernel = None
+    setattr(
+        qm,
+        bridge.FUSED_MOE_DECODE_OP_ATTR,
+        _DECODE_GATED_OP if gated else _DECODE_UNGATED_OP,
+    )
+    setattr(qm, bridge._STATIC_DISPATCH_ATTR, True)
+
+    par = SimpleNamespace(
+        use_ep=ep, ep_size=2 if ep else 1, dp_size=1, tp_size=2, pcp_size=1
+    )
+    moe_config = SimpleNamespace(
+        moe_parallel_config=par,
+        hidden_dim=h,
+        hidden_dim_unpadded=0,
+        is_sequence_parallel=False,
+        skip_final_all_reduce=False,
+        tp_size=2,
+        ep_size=2 if ep else 1,
+        dp_size=1,
+        pcp_size=1,
+        sp_size=1,
+        use_ep=ep,
+        in_dtype=torch.bfloat16,
+    )
+
+    runner = VllmMoERunner.__new__(VllmMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.layer_name = layer_name
+    runner.moe_config = moe_config
+    runner.router = SimpleNamespace()
+    runner.routed_experts = _StubRoutedExperts(qm, e, h, i, ep=ep)
+    runner._shared_experts = _StubSharedExperts(_StubSharedMLP(h, i_s, gated=gated))
+    runner.gate = None
+    runner.shared_expert_gate = None
+    runner._fse_fuse_gate = False
+    runner.routed_input_transform = None
+    runner.routed_output_transform = None
+    runner.routed_scaling_factor = routed_scale
+    runner._forward_entry = lambda h_, l_, s_, i_, _n, _u: runner._forward_impl(
+        h_, l_, s_, i_
+    )
+    object.__setattr__(runner, bridge._RUNNER_ARMED_ATTR, True)
+    object.__setattr__(runner, bridge._RUNNER_STATIC_DISPATCH_ATTR, True)
+    object.__setattr__(runner, bridge._RUNNER_MAX_TOKENS_ATTR, max_tokens)
+    return runner
+
+
+def _patch_cpu_moe_runtime(monkeypatch, *, all_reduce_calls: list | None = None):
+    from contextlib import nullcontext
+
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as vllm_mr
+
+    from vllm_torchtpu.layers.adapter import moe_routing
+    from vllm_torchtpu.layers.adapter.quantization import fp8 as fp8_mod
+
+    monkeypatch.setattr(
+        bridge, "_RANK_BUFFER", torch.tensor([[0, 0]], dtype=torch.int32)
+    )
+    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", False)
+    monkeypatch.setattr(envs, "TPU_MOE_FP8_ALL_GATHER", False)
+    monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", False)
+    monkeypatch.setattr(
+        fp8_mod, "enable_pipelined_collective_and_compute", lambda: False
+    )
+    monkeypatch.setattr(
+        moe_routing,
+        "route",
+        lambda layer, x, logits, topk_weights_float32=False: (
+            logits[:, :2],
+            torch.zeros((x.shape[0], 2), dtype=torch.int32, device=x.device),
+        ),
+    )
+
+    def _stub_gmm(**kwargs):
+        es = kwargs["experts_start"]
+        if es is None:
+            es = torch.zeros(
+                (), dtype=torch.int32, device=kwargs["hidden_states"].device
+            )
+        return _GMM_OP(
+            kwargs["hidden_states"],
+            kwargs["w1"],
+            kwargs["w2"],
+            kwargs["w1_scale"],
+            kwargs["w2_scale"],
+            kwargs["topk_weights"],
+            kwargs["topk_ids"],
+            es,
+        )
+
+    monkeypatch.setattr(fp8_mod, "fused_moe_gmm", _stub_gmm)
+
+    def _stub_all_reduce(x):
+        if all_reduce_calls is not None:
+            all_reduce_calls.append(x.shape[0])
+        return x * 3.0
+
+    monkeypatch.setattr(vllm_mr, "tensor_model_parallel_all_reduce", _stub_all_reduce)
+    monkeypatch.setattr(
+        vllm_mr.MoERunner, "_sequence_parallel_context", lambda self: nullcontext()
+    )
+
+
+def test_arm_static_dispatch_preserves_shared_experts_and_scaling(monkeypatch):
+    """Arming a VllmMoERunner with dp=1, pcp=1 keeps shared experts and
+    routed_scaling_factor intact so m > max_tokens runs unmodified MoERunner."""
+    import vllm.distributed
+
+    from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
+
+    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL", True)
+    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 64)
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(
+        bridge, "build_ep_mesh", lambda: SimpleNamespace(shape={EP_AXIS_NAME: 2})
+    )
+    monkeypatch.setattr(bridge, "ep_mesh_index", lambda: 0)
+    monkeypatch.setattr(bridge, "_check_vmem", lambda *a, **k: None)
+    monkeypatch.setattr(
+        bridge, "_check_same_arming_on_every_rank", lambda *a, **k: None
+    )
+    monkeypatch.setattr(bridge, "_RANK_BUFFER", None)
+    built_calls = []
+    monkeypatch.setattr(
+        bridge,
+        "_build_op",
+        lambda *a, **k: built_calls.append((a, k)) or _DECODE_UNGATED_OP,
+    )
+
+    mlp = DeepseekV2MLP(256, 128)
+    qm = VllmFp8MoEMethodTPU.__new__(VllmFp8MoEMethodTPU)
+    qm._tpu_activation_str = "silu"
+    qm._tpu_topk_weights_float32 = False
+    qm.moe_kernel = None
+    par = SimpleNamespace(
+        use_ep=True, ep_size=2, ep_rank=0, dp_size=1, tp_size=2, pcp_size=1
+    )
+
+    runner = VllmMoERunner.__new__(VllmMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.layer_name = "model.layers.0.mlp.experts"
+    runner.moe_config = SimpleNamespace(
+        moe_parallel_config=par,
+        in_dtype=torch.bfloat16,
+        skip_final_all_reduce=False,
+        experts_per_token=8,
+        num_experts=8,
+        ep_size=2,
+        ep_rank=0,
+    )
+    runner.routed_experts = SimpleNamespace(
+        quant_method=qm,
+        moe_config=runner.moe_config,
+        global_num_experts=8,
+        w13_weight=torch.zeros((4, 256, 256), dtype=torch.float8_e4m3fn),
+        w2_weight=torch.zeros((4, 128, 256), dtype=torch.float8_e4m3fn),
+        w13_weight_scale_inv=torch.ones((4, 1, 1, 256)),
+        w2_weight_scale_inv=torch.ones((4, 1, 1, 256)),
+        _experts_start=torch.tensor(0, dtype=torch.int32),
+    )
+    runner.routed_input_transform = None
+    runner.routed_output_transform = None
+    runner.routed_scaling_factor = 2.5
+    runner.shared_expert_gate = None
+    runner._shared_experts = SimpleNamespace(_layer=mlp)
+
+    model = torch.nn.Module()
+    model.add_module("runner", runner)
+
+    assert bridge.arm_fused_moe_decode(model) == 1
+    assert runner._shared_experts is not None
+    assert runner.routed_scaling_factor == 2.5
+    assert getattr(runner, bridge._RUNNER_STATIC_DISPATCH_ATTR) is True
+    assert getattr(runner, bridge._RUNNER_MAX_TOKENS_ATTR) == 64
+    assert bridge.fused_moe_decode_supported(qm) is False
+    assert runner._fused_output_is_reduced is False
+    assert built_calls[0][0][5] is False  # shared_gated=False
+
+
+def test_static_dispatch_eager_routing_and_live_weight_update(monkeypatch):
+    """m <= max_tokens calls the fused op directly against live shared weights;
+    m > max_tokens falls through to stock MoERunner + GMM + all-reduce."""
+    ar_calls: list[int] = []
+    _patch_cpu_moe_runtime(monkeypatch, all_reduce_calls=ar_calls)
+    runner = _build_static_dispatch_runner(
+        gated=True, ep=False, max_tokens=16, routed_scale=2.5
+    )
+
+    x_small = torch.ones((16, 8), dtype=torch.float32)
+    logits_small = torch.ones((16, 4), dtype=torch.float32)
+    out_before = runner(x_small, logits_small)
+    assert ar_calls == []  # decode op reduces internally
+    torch.testing.assert_close(out_before, x_small)
+
+    # In-place parameter mutation (e.g. RL weight sync) takes effect without re-arming.
+    runner._shared_experts._layer.gate_up_proj.weight.data.fill_(1.0)
+    out_after = runner(x_small, logits_small)
+    assert ar_calls == []
+    expected_delta = runner._shared_experts._layer.gate_up_proj.weight.numel()
+    torch.testing.assert_close(out_after, x_small + expected_delta)
+
+    # Above the token cap: unmodified stock path (shared + 2.5 * gmm, then all-reduce).
+    runner._shared_experts._layer.gate_up_proj.weight.data.zero_()
+    x_large = torch.ones((24, 8), dtype=torch.float32)
+    logits_large = torch.ones((24, 4), dtype=torch.float32)
+    out_large = runner(x_large, logits_large)
+    assert ar_calls == [24]
+    # shared=0, gmm=2*x, routed_scale=2.5, all_reduce=3* -> 15 * x.
+    torch.testing.assert_close(out_large, x_large * 15.0)
+
+
+@pytest.mark.parametrize("gated", [True, False])
+@pytest.mark.parametrize("ep", [False, True])
+def test_static_dispatch_shape_variants_placeholder_parity(monkeypatch, gated, ep):
+    """Both sides of the m <= max_tokens trace-time branch produce identical
+    FX placeholder signatures and 1-to-1 placeholder order across multiple
+    layers, with complementary shape_variants guards."""
+    from vllm_torchtpu.compilation import shape_variants
+
+    _patch_cpu_moe_runtime(monkeypatch)
+    r0 = _build_static_dispatch_runner(
+        gated=gated, ep=ep, max_tokens=16, layer_name="model.layers.0.mlp.experts"
+    )
+    r1 = _build_static_dispatch_runner(
+        gated=gated, ep=ep, max_tokens=16, layer_name="model.layers.1.mlp.experts"
+    )
+
+    class TwoLayerMoE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l0 = r0
+            self.l1 = r1
+
+        def forward(self, x: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+            x = self.l0(x, logits)
+            return self.l1(x, logits)
+
+    model = TwoLayerMoE()
+    captured: list[tuple[tuple, list[str], object]] = []
+
+    def capture_backend(gm, _example_inputs):
+        captured.append(
+            (
+                shape_variants.graph_signature(gm),
+                [n.name for n in gm.graph.nodes if n.op == "placeholder"],
+                shape_variants.trace_shape_env(gm),
+            )
+        )
+        return gm
+
+    with shape_variants.warmup():
+        for tokens in (16, 32):
+            torch._dynamo.reset()
+            compiled = torch.compile(model, backend=capture_backend, fullgraph=True)
+            x = torch.ones((tokens, 8), dtype=torch.float32)
+            logits = torch.ones((tokens, 4), dtype=torch.float32)
+            torch._dynamo.mark_dynamic(x, 0)
+            torch._dynamo.mark_dynamic(logits, 0)
+            compiled(x, logits)
+
+    (sig_dec, names_dec, env_dec), (sig_pre, names_pre, env_pre) = captured
+    assert sig_dec == sig_pre
+    assert names_dec == names_pre
+    assert shape_variants.unsupported_reason(env_dec, 16) is None
+    assert shape_variants.unsupported_reason(env_dec, 32) is not None
+    assert shape_variants.unsupported_reason(env_pre, 16) is not None
+    assert shape_variants.unsupported_reason(env_pre, 32) is None
+
+
+def test_static_dispatch_outside_warmup_emits_no_shape_guard(monkeypatch):
+    """Modules compiled outside shape_variants.warmup() (e.g. an MTP drafter)
+    must not branch on m <= max_tokens so one graph serves every bucket."""
+    from vllm_torchtpu.compilation import shape_variants
+
+    _patch_cpu_moe_runtime(monkeypatch)
+    runner = _build_static_dispatch_runner(gated=True, ep=False, max_tokens=16)
+    captured = []
+
+    def capture_backend(gm, _example_inputs):
+        captured.append(gm)
+        return gm
+
+    torch._dynamo.reset()
+    compiled = torch.compile(runner, backend=capture_backend, fullgraph=True)
+    x = torch.ones((32, 8), dtype=torch.float32)
+    logits = torch.ones((32, 4), dtype=torch.float32)
+    torch._dynamo.mark_dynamic(x, 0)
+    torch._dynamo.mark_dynamic(logits, 0)
+    compiled(x, logits)
+
+    env = shape_variants.trace_shape_env(captured[0])
+    assert shape_variants.unsupported_reason(env, 16) is None
+    assert shape_variants.unsupported_reason(env, 32) is None
+    assert any("decode_gated" in str(n.target) for n in captured[0].graph.nodes)
+
+
+def test_anchor_rank_buffer_for_trace_bitwise_identity(monkeypatch):
+    x = torch.tensor([0.0, -0.0, 1.5, float("nan")], dtype=torch.float32)
+    monkeypatch.setattr(bridge, "_RANK_BUFFER", None)
+    assert bridge.anchor_rank_buffer_for_trace(x) is x
+
+    monkeypatch.setattr(
+        bridge, "_RANK_BUFFER", torch.tensor([[2, 0]], dtype=torch.int32)
+    )
+    assert bridge.anchor_rank_buffer_for_trace(x) is x
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    anchored = bridge.anchor_rank_buffer_for_trace(x)
+    torch.testing.assert_close(anchored, x, equal_nan=True)
+    assert torch.equal(anchored.view(torch.int32), x.view(torch.int32))
