@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Intra-chip tensor parallelism for the latent-MoE projections.
+"""Column-parallel sharding of the latent-MoE projections.
 
 Kimi K3's routed experts run in a 3584-wide latent space, reached by a
 ``[7168, 3584]`` down-projection and left by a ``[3584, 7168]``
@@ -27,20 +27,29 @@ rather than summed by an all-reduce: for a 2-core group the all-gather moves
 half the bytes, and it keeps the arithmetic bit-identical to the replicated
 layer instead of resplitting a sum.
 
-Why the chip and not the full TP group: the exchange happens twice per layer
-across 92 layers, so it must stay on-package. Over all 32 ranks the collective
-latency would swamp the bandwidth saved.
+Two shard groups are used, chosen by ``make_latent_projection``:
+
+* Chips with several cores (opt-in, ``TPU_LATENT_PROJ_INTRA_CHIP_TP``): the
+  cores of one chip. The exchange happens twice per layer, so it stays
+  on-package; these chips do not shard over the full TP group.
+* Chips with one core (always on): the full TP group. There is no intra-chip
+  group to use, and the reason to shard is HBM rather than bandwidth: the two
+  projections are large unquantized weights that would otherwise be replicated
+  on every rank. The price is a cross-chip all-gather twice per layer.
 """
 
 from __future__ import annotations
 
 import torch
+from vllm.distributed import parallel_state
+from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tpu_info import get_num_cores_per_chip
 
 logger = init_logger(__name__)
 
@@ -55,11 +64,14 @@ def _warn_once(message: str, *args) -> None:
 
 
 class IntraChipColumnParallelLinear(ColumnParallelLinear):
-    """Column-parallel over one chip's cores, gathered back on the chip.
+    """Column-parallel over a shard group, gathered back over the same group.
+
+    The group is one chip's cores, or the full TP group on one-core chips (see
+    the module docstring); the class name predates the second case.
 
     Drop-in for ``ReplicatedLinear``: same output, same ``(tensor, bias)``
     return shape. ``ColumnParallelLinear`` supplies the sharded weight loader;
-    all this adds is doing the gather over the chip group instead of over TP.
+    all this adds is doing the gather over the given group.
     """
 
     def __init__(
@@ -75,7 +87,7 @@ class IntraChipColumnParallelLinear(ColumnParallelLinear):
         # `rank_in_group`, not the topology's core index: the all-gather below
         # concatenates shards in group-rank order, and the weight split has to
         # use the same order or the halves come back transposed.
-        self._chip_group = group
+        self.shard_group = group
         super().__init__(
             input_size,
             output_size,
@@ -94,7 +106,7 @@ class IntraChipColumnParallelLinear(ColumnParallelLinear):
     ) -> tuple[torch.Tensor, torch.nn.Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
         output_parallel = self.quant_method.apply(self, input_, bias)
-        output = self._chip_group.all_gather(output_parallel, dim=-1)
+        output = self.shard_group.all_gather(output_parallel, dim=-1)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
@@ -102,8 +114,8 @@ class IntraChipColumnParallelLinear(ColumnParallelLinear):
         return (
             f"in_features={self.input_size}, "
             f"out_features={self.output_size}, "
-            f"out_per_chip_core={self.output_size_per_partition}, "
-            f"chip_tp_size={self.tp_size}"
+            f"out_per_shard={self.output_size_per_partition}, "
+            f"shard_group_size={self.tp_size}"
         )
 
 
@@ -140,6 +152,40 @@ def shard_group_or_none(output_size: int):
     return group
 
 
+def _multi_rank_tp_group() -> GroupCoordinator | None:
+    """The TP group if it is initialized and has at least two ranks."""
+    if not parallel_state.model_parallel_is_initialized():
+        return None
+    group = parallel_state.get_tp_group()
+    if group is None or group.world_size < 2:
+        return None
+    return group
+
+
+def tp_shard_group_or_none(output_size: int) -> GroupCoordinator | None:
+    """The TP group to shard ``output_size`` across on one-core chips, or ``None``.
+
+    Sharding column-parallel across the TP group with an ``all_gather(dim=-1)``
+    divides the per-rank weight bytes by the TP size and keeps the contraction
+    arithmetic bit-identical to ``ReplicatedLinear``. Chips with several cores
+    never take this path; they use ``shard_group_or_none``.
+    """
+    group = _multi_rank_tp_group()
+    if group is None or get_num_cores_per_chip() != 1:
+        return None
+
+    if output_size % group.world_size != 0:
+        _warn_once(
+            "Latent projection output %d does not divide across %d TP ranks; "
+            "leaving it replicated.",
+            output_size,
+            group.world_size,
+        )
+        return None
+
+    return group
+
+
 def make_latent_projection(
     input_size: int,
     output_size: int,
@@ -148,9 +194,20 @@ def make_latent_projection(
     quant_config: QuantizationConfig | None,
     prefix: str,
 ) -> ReplicatedLinear | IntraChipColumnParallelLinear:
-    """The intra-chip sharded projection when it applies, else the replicated one."""
-    group = shard_group_or_none(output_size)
+    """The sharded projection when a shard group applies, else the replicated one."""
+    # The TP group first: on a one-core chip it is the only candidate, and
+    # asking for an intra-chip group there would warn about a fallback to
+    # replicated projections that does not happen.
+    group = tp_shard_group_or_none(output_size)
     if group is None:
+        group = shard_group_or_none(output_size)
+    if group is None:
+        if _multi_rank_tp_group() is not None and get_num_cores_per_chip() != 1:
+            _warn_once(
+                "Latent MoE projections are replicated on every TP rank: the "
+                "chip is not a one-core chip and no intra-chip shard group is "
+                "in use (TPU_LATENT_PROJ_INTRA_CHIP_TP)."
+            )
         return ReplicatedLinear(
             input_size,
             output_size,
@@ -163,8 +220,7 @@ def make_latent_projection(
     # message, so naming the layer would emit 184 near-identical lines per rank
     # instead of one per distinct projection.
     logger.info_once(
-        "Latent MoE projection [%d, %d] sharded across %d cores per chip "
-        "(%d columns each).",
+        "Latent MoE projection [%d, %d] sharded across %d ranks (%d columns each).",
         output_size,
         input_size,
         group.world_size,
