@@ -262,7 +262,8 @@ def _vmem_bytes(
         # expert's column blocks.
         width = mp + (-mp % _SPARSE_MAX_EXPERTS)
         grouping = mp * mp * 2 + mp * width * 6 + mp * _SPARSE_MAX_EXPERTS * 8
-        tokens += max(grouping, mp * (2 * i_s + _SHARED_COLS) * 4 * 2)
+        # (AOT tpu7x, 768-column units: 128 tokens fit, 144 exceed by 1 MB.)
+        tokens += max(grouping, mp * (2 * i_s + _SHARED_COLS) * 4)
         return slots * (weights + scales) + 3 * h * i_s + tokens
     scratch = 2 + 4 + 4 + 2 + (2 if i_s else 0)
     tokens = mp * h * scratch + 16 * mp * h
@@ -814,6 +815,8 @@ def dense_expert_moe_fp4(
     rank's first global expert id (EP; None: every expert is local)."""
     m, h = hidden.shape
     experts, i, _ = w2.shape
+    # `_group_by_expert` holds the local experts on one vreg's lanes.
+    assert not sparse_rows or experts <= _SPARSE_MAX_EXPERTS, experts
     i_s = 0 if shared is None else shared.w2.shape[0]
     info = pltpu.get_tpu_info()
     chunk = _chunk(m, h, i, i_s, info.vmem_capacity_bytes, sparse_rows)
@@ -858,7 +861,10 @@ def dense_expert_moe_fp4(
     sparse_scratch = []
     if sparse_rows:
         # `_group_by_expert`: rows 0..experts-1 the tokens, row experts the counts.
-        group_shape = (experts + 1 + (-(experts + 1)) % 8, max(-(-mp // lanes), 1) * lanes)
+        group_shape = (
+            experts + 1 + (-(experts + 1)) % 8,
+            max(-(-mp // lanes), 1) * lanes,
+        )
         sparse_scratch = [
             pltpu.VMEM(group_shape, jnp.int32),
             pltpu.SMEM(group_shape, jnp.int32),
