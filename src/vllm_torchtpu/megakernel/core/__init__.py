@@ -22,6 +22,9 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     from . import (
+        cache_common,
+        cache_flat,
+        cache_hlo,
         collectives,
         decls,
         derive,
@@ -45,6 +48,16 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         spec,
         validate,
         weights,
+    )
+    from .cache_common import (
+        should_fuse_pool_io,
+    )
+    from .cache_flat import (
+        make_flat_pooled_step,
+    )
+    from .cache_hlo import (
+        check_fused_pooled_step_hlo,
+        check_pooled_step_hlo,
     )
     from .collectives import (
         AllReduceRing,
@@ -180,6 +193,9 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
 # (e.g. `runtime.contract`) doesn't import jax through this package.
 _SUBMODULES = frozenset(
     {
+        "cache_common",
+        "cache_flat",
+        "cache_hlo",
         "collectives",
         "decls",
         "derive",
@@ -274,6 +290,8 @@ _LAZY: dict[str, str] = {
     "allocate_test_layout": ".pool",
     "build": ".kernel",
     "cache_exec": ".pool",
+    "check_fused_pooled_step_hlo": ".cache_hlo",
+    "check_pooled_step_hlo": ".cache_hlo",
     "conv_to_raw_page": ".pool",
     "default_eplb_cores": ".weights",
     "default_tiles": ".exec_spec",
@@ -289,6 +307,7 @@ _LAZY: dict[str, str] = {
     "kv_to_raw_page": ".pool",
     "list_models": ".model_def",
     "list_profiles": ".profile",
+    "make_flat_pooled_step": ".cache_flat",
     "make_pool_backend": ".pool",
     "make_step": ".kernel",
     "model_default_profile": ".profile",
@@ -302,6 +321,7 @@ _LAZY: dict[str, str] = {
     "raw_pages_to_ssm": ".pool",
     "register_model": ".model_def",
     "register_profile": ".profile",
+    "should_fuse_pool_io": ".cache_common",
     "ssm_to_raw_pages": ".pool",
     "stream": ".dma",
     "unfold": ".kernel",
@@ -377,7 +397,12 @@ __all__ = [
     "WeightSource",
     "allocate_test_layout",
     "build",
+    "cache_common",
     "cache_exec",
+    "cache_flat",
+    "cache_hlo",
+    "check_fused_pooled_step_hlo",
+    "check_pooled_step_hlo",
     "collectives",
     "conv_to_raw_page",
     "decls",
@@ -401,6 +426,7 @@ __all__ = [
     "kv_to_raw_page",
     "list_models",
     "list_profiles",
+    "make_flat_pooled_step",
     "make_pool_backend",
     "make_step",
     "model_def",
@@ -426,6 +452,7 @@ __all__ = [
     "register_profile",
     "runtime",
     "schedule",
+    "should_fuse_pool_io",
     "spec",
     "ssm_to_raw_pages",
     "stream",
