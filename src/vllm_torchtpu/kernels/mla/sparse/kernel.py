@@ -1558,6 +1558,83 @@ def send_layout_shape(
     return (world, SEND_PAD_ROWS + num_tokens * (num_heads // world), vdim)
 
 
+def pack_send_lse_words(
+    x_lse: jax.Array,
+    *,
+    num_tokens: int,
+    num_q_heads: int,
+    send_world: int,
+    send_lanes: int,
+    fault: str | None = None,
+) -> jax.Array:
+    """Pack block-reversed f32 `[T, lanes]` LSE rows into i32 `[W, lanes]` words.
+
+    Output lanes `[0, send_rows)` carry signed `hi16` and `[send_rows, 2*send_rows)`
+    carry signed `lo16`, where `send_rows = num_tokens * (num_q_heads // send_world)`.
+    Trailing lanes `[2*send_rows, send_lanes)` are zero.
+    """
+    send_per = num_q_heads // send_world
+    send_rows = num_tokens * send_per
+    bits = lax.bitcast_convert_type(x_lse, jnp.int32)
+    hi = lax.shift_right_arithmetic(bits, jnp.int32(16))
+    # Signed 16-bit representation of the low halfword for int16 packing.
+    lo = ((bits & 0xFFFF) ^ 0x8000) - 0x8000
+    # Sublane d is rolled right by d * send_per at the end (one strided roll);
+    # lane j of sublane d therefore maps to destination lane
+    # big_j = (j + d * send_per) mod send_lanes.
+    shape = (send_world, send_lanes)
+    big_j = (
+        lax.broadcasted_iota(jnp.int32, shape, 1)
+        + lax.broadcasted_iota(jnp.int32, shape, 0) * send_per
+    ) & (send_lanes - 1)
+    tok = lax.shift_right_logical(
+        big_j & (send_rows - 1), jnp.int32(send_per.bit_length() - 1)
+    )
+    tok = jnp.where(big_j < 2 * send_rows, tok, -1)
+    acc = jnp.zeros(shape, jnp.int32)
+    if send_rows >= num_q_heads:
+        lane = lax.broadcasted_iota(jnp.int32, x_lse.shape, 1)
+        lo_src = pltpu.roll(lo, send_rows, 1)
+        if fault == "send_lse_lo_skip":
+            lo_src = jnp.zeros_like(lo_src)
+        src = jnp.where(
+            lane < num_q_heads,
+            hi,
+            jnp.where(
+                (lane >= send_rows) & (lane < send_rows + num_q_heads), lo_src, 0
+            ),
+        )
+        for t in range(num_tokens):
+            shift = (t * send_per - (send_world - 1) * send_per) % send_lanes
+            row = src[t : t + 1, :]
+            if shift:
+                row = pltpu.roll(row, shift, 1)
+            acc = jnp.where(tok == t, jnp.broadcast_to(row, shape), acc)
+    else:
+        # Avoid packing hi and lo into one row when num_tokens < send_world:
+        # [send_rows, send_rows + num_q_heads) overlaps [0, num_q_heads), so
+        # hi would overwrite lo halfwords for ranks with overlapping lanes.
+        if fault == "send_lse_lo_skip":
+            lo = jnp.zeros_like(lo)
+        is_lo = big_j >= send_rows
+        for t in range(num_tokens):
+            hi_shift = (t * send_per - (send_world - 1) * send_per) % send_lanes
+            lo_shift = (
+                send_rows + t * send_per - (send_world - 1) * send_per
+            ) % send_lanes
+            hi_row = pltpu.roll(hi[t : t + 1, :], hi_shift, 1)
+            lo_row = lo[t : t + 1, :]
+            if lo_shift:
+                lo_row = pltpu.roll(lo_row, lo_shift, 1)
+            row = jnp.where(
+                is_lo,
+                jnp.broadcast_to(lo_row, shape),
+                jnp.broadcast_to(hi_row, shape),
+            )
+            acc = jnp.where(tok == t, row, acc)
+    return pltpu.roll(acc, 0, 1, stride=send_per, stride_axis=0)
+
+
 def xchg_live_row_tiers(
     slab_row0: int, send_per: int, num_tokens: int, xchg_rows: int
 ) -> tuple[int, ...]:
@@ -2464,44 +2541,14 @@ def _attention_kernel(
         x = jnp.concatenate(
             [fill_ref[i] for i in range(num_tokens // batch_size)], axis=0
         )  # f32 [tokens, lanes], block-reversed heads
-        bits = lax.bitcast_convert_type(x, jnp.int32)
-        hi = lax.shift_right_arithmetic(bits, jnp.int32(16))
-        # The low half as a signed 16-bit value (the packed merge's words).
-        lo = ((bits & 0xFFFF) ^ 0x8000) - 0x8000
-        lane = lax.broadcasted_iota(jnp.int32, x.shape, 1)
-        lo_src = pltpu.roll(lo, send_rows % lanes, 1) if send_rows % lanes else lo
-        if fault == "send_lse_lo_skip":
-            lo_src = jnp.zeros_like(lo_src)
-        src = jnp.where(
-            lane < num_q_heads,
-            hi,
-            jnp.where(
-                (lane >= send_rows) & (lane < send_rows + num_q_heads), lo_src, 0
-            ),
+        acc = pack_send_lse_words(
+            x,
+            num_tokens=num_tokens,
+            num_q_heads=num_q_heads,
+            send_world=send_world,
+            send_lanes=lanes,
+            fault=fault,
         )
-        # Sublane d of the result is rolled by d*L once at the end (one
-        # strided roll, shifts below a vreg width); before it, lane j of
-        # sublane d holds what lands at J = (j + d*L) mod lanes. Token t's
-        # source row, rolled by t*L - (W-1)*L, puts head d*L+l (lane
-        # (W-1-d)*L + l) at J = t*L + l and its lo half at rows + t*L + l, so
-        # each lane takes the token whose words cover its J.
-        shape = (send_world, lanes)
-        big_j = (
-            lax.broadcasted_iota(jnp.int32, shape, 1)
-            + lax.broadcasted_iota(jnp.int32, shape, 0) * send_per
-        ) & (lanes - 1)
-        tok = lax.shift_right_logical(
-            big_j & (send_rows - 1), jnp.int32(send_per.bit_length() - 1)
-        )
-        tok = jnp.where(big_j < 2 * send_rows, tok, -1)
-        acc = jnp.zeros(shape, jnp.int32)
-        for t in range(num_tokens):
-            shift = (t * send_per - (send_world - 1) * send_per) % lanes
-            row = src[t : t + 1, :]
-            if shift:
-                row = pltpu.roll(row, shift, 1)
-            acc = jnp.where(tok == t, jnp.broadcast_to(row, shape), acc)
-        acc = pltpu.roll(acc, 0, 1, stride=send_per, stride_axis=0)
         if lanes < o_dim:
             acc = jnp.concatenate(
                 [acc, jnp.zeros((send_world, o_dim - lanes), jnp.int32)], axis=1
