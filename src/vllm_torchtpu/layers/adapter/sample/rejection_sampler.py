@@ -814,7 +814,11 @@ def _fused_spec_verify_and_sample_candidates(
     # Temperature scaling cannot resolve greedy ties, so greedy rows of a mixed
     # batch decide by the first argmax instead, as in
     # _random_rejection_sample_with_segment: the tied candidate with the
-    # lowest token id, which is the full vocabulary's first argmax.
+    # lowest token id. That is the full vocabulary's first argmax unless more
+    # than 32 of one rank's tokens tie at the row max: a rank keeps its top 32
+    # (through at most 32 blocks, each holding a tied token), so only then can a
+    # tied token be dropped. On such a row the pick is still a token at the row
+    # max, though not necessarily the lowest.
     is_greedy = all_temps.reshape(-1) == 0
     max_cand_logits = all_cand_logits.max(dim=-1, keepdim=True).values
     greedy_token_ids = (
@@ -895,6 +899,9 @@ def _fused_spec_verify_and_sample_candidates(
     )
     recovered_scores = recovered_probs * target_inv_exp_noise
     max_scores, recovered_cand_idx = torch.max(recovered_scores, dim=-1, keepdim=True)
+    # max_scores is 0 only for a row with no recovery mass: synthetic rejection
+    # can reject a draft whose target is one-hot at the draft, which is then
+    # the row's unique argmax (as in _random_rejection_sample_with_segment).
     fallback_cand_idx = torch.argmax(target_cand_logits, dim=-1, keepdim=True)
     chosen_cand_idx = torch.where(max_scores > 0, recovered_cand_idx, fallback_cand_idx)
     recovered_token_ids = torch.gather(
