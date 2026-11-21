@@ -930,3 +930,655 @@ def shift_quant_split_3d_fp8_local(
         interpret=interpret,
     )(lead_hrv, own_hrv, rank_arr)
     return mine_q, peer_q, scale_padded[:, :1]
+
+
+DEFAULT_WUV_VMEM_LIMIT_BYTES = 56 * 1024 * 1024
+_WUV_CANDIDATE_ROW_BLOCKS = (128, 64, 32)
+
+
+def _wuv_vmem_scratch_bytes(
+    num_heads: int,
+    row_block: int,
+    lkv_dim: int,
+    head_dim: int,
+    *,
+    overlap_quant: bool,
+) -> int:
+    w_bytes = num_heads * lkv_dim * head_dim * 2
+    lat_bytes = 2 * num_heads * row_block * lkv_dim * 2
+    out_bufs = 2 if overlap_quant else 1
+    out_bytes = out_bufs * num_heads * row_block * head_dim * 2
+    q_bytes = 2 * row_block * num_heads * head_dim
+    scale_bytes = 2 * row_block * SCALE_PAD_COLS * 4
+    return w_bytes + lat_bytes + out_bytes + q_bytes + scale_bytes
+
+
+def select_wuv_row_block(
+    num_heads: int,
+    chunk_rows: int,
+    split_rows: int,
+    lkv_dim: int,
+    head_dim: int,
+    *,
+    overlap_quant: bool = True,
+    vmem_limit_bytes: int = DEFAULT_WUV_VMEM_LIMIT_BYTES,
+) -> int | None:
+    if (
+        num_heads <= 0
+        or num_heads % 2 != 0
+        or lkv_dim <= 0
+        or lkv_dim % 128 != 0
+        or head_dim <= 0
+        or head_dim % 128 != 0
+        or split_rows <= 0
+        or split_rows % 8 != 0
+        or chunk_rows <= 0
+    ):
+        return None
+    budget = vmem_limit_bytes - _VMEM_HEADROOM_BYTES
+    for rb in _WUV_CANDIDATE_ROW_BLOCKS:
+        if (
+            chunk_rows % rb == 0
+            and split_rows <= rb
+            and (rb - split_rows) % 8 == 0
+            and _wuv_vmem_scratch_bytes(
+                num_heads, rb, lkv_dim, head_dim, overlap_quant=overlap_quant
+            )
+            <= budget
+        ):
+            return rb
+    return None
+
+
+def supports_wuv_quant_split_3d_local(
+    num_heads: int,
+    num_rows: int,
+    chunk_rows: int,
+    split_rows: int,
+    lkv_dim: int,
+    head_dim: int,
+    dtype: Any,
+    *,
+    overlap_quant: bool = True,
+    vmem_limit_bytes: int = DEFAULT_WUV_VMEM_LIMIT_BYTES,
+) -> bool:
+    if jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
+        return False
+    if num_rows <= 0 or chunk_rows <= 0 or num_rows % chunk_rows != 0:
+        return False
+    if split_rows > chunk_rows:
+        return False
+    if (
+        select_wuv_row_block(
+            num_heads,
+            chunk_rows,
+            split_rows,
+            lkv_dim,
+            head_dim,
+            overlap_quant=overlap_quant,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+        is not None
+    ):
+        return True
+    if overlap_quant:
+        return (
+            select_wuv_row_block(
+                num_heads,
+                chunk_rows,
+                split_rows,
+                lkv_dim,
+                head_dim,
+                overlap_quant=False,
+                vmem_limit_bytes=vmem_limit_bytes,
+            )
+            is not None
+        )
+    return False
+
+
+def wuv_quant_split_3d_local_ref(
+    lead_hrl: jax.Array,
+    own_hrl_or_chunks: jax.Array | tuple[jax.Array, ...],
+    w_uv: jax.Array,
+    rank: jax.Array,
+    *,
+    num_valid_own_rows: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Reference for fused head-major W_UV + FP8 row-quant + pair-half split."""
+    own_hrl = (
+        jnp.concatenate(own_hrl_or_chunks, axis=1)
+        if isinstance(own_hrl_or_chunks, tuple)
+        else own_hrl_or_chunks
+    )
+    if num_valid_own_rows is not None:
+        n_valid = jnp.reshape(num_valid_own_rows, ()).astype(jnp.int32)
+        own_mask = (
+            jnp.arange(own_hrl.shape[1], dtype=jnp.int32)[None, :, None] < n_valid
+        )
+        own_hrl = jnp.where(own_mask, own_hrl, jnp.zeros((), own_hrl.dtype))
+    lead_hrv = jnp.einsum(
+        "hrl,hlv->hrv", lead_hrl, w_uv, preferred_element_type=jnp.float32
+    ).astype(jnp.bfloat16)
+    own_hrv = jnp.einsum(
+        "hrl,hlv->hrv", own_hrl, w_uv, preferred_element_type=jnp.float32
+    ).astype(jnp.bfloat16)
+    return shift_quant_split_3d_local_ref(lead_hrv, own_hrv, rank)
+
+
+def _start_chunk_slice(
+    chunk_refs: tuple[Any, ...],
+    chunk_idx: jax.Array | int,
+    row_off: jax.Array | int,
+    length: int,
+    dst_ref: Any,
+    sem: Any,
+) -> None:
+    aligned_off = row_off if isinstance(row_off, int) else pl.multiple_of(row_off, 8)
+    if len(chunk_refs) == 1:
+        pltpu.make_async_copy(
+            chunk_refs[0].at[:, pl.ds(aligned_off, length), :], dst_ref, sem
+        ).start()
+        return
+
+    for ci, ref in enumerate(chunk_refs):
+
+        def _branch(ref_=ref) -> None:
+            pltpu.make_async_copy(
+                ref_.at[:, pl.ds(aligned_off, length), :], dst_ref, sem
+            ).start()
+
+        pl.when(chunk_idx == ci)(_branch)
+
+
+def wuv_quant_split_3d_fp8_local(
+    lead_hrl: jax.Array,
+    own_hrl_or_chunks: jax.Array | tuple[jax.Array, ...],
+    w_uv: jax.Array,
+    rank: jax.Array,
+    *,
+    num_valid_own_rows: jax.Array | None = None,
+    row_block: int | None = None,
+    overlap_quant: bool = True,
+    vmem_limit_bytes: int = DEFAULT_WUV_VMEM_LIMIT_BYTES,
+    interpret: bool | Any = False,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Fuse `[H, S/R, L] @ [H, L, V]` + FP8 row-quant + pair-half split.
+
+    Consumes head-major MLA latent output `lead_hrl` (`bf16[H, S, L]`) and
+    either a single `own_hrl` (`bf16[H, R, L]`) or a tuple of equal chunks
+    (`bf16[H, R//C, L]`) directly with stationary VMEM `w_uv`.
+    """
+    chunks = (
+        tuple(own_hrl_or_chunks)
+        if isinstance(own_hrl_or_chunks, tuple)
+        else (own_hrl_or_chunks,)
+    )
+    num_chunks = len(chunks)
+    if num_chunks == 0:
+        raise ValueError("own_hrl_or_chunks must be non-empty")
+    num_heads, split_rows, lkv_dim = lead_hrl.shape
+    chunk_rows = int(chunks[0].shape[1])
+    num_rows = chunk_rows * num_chunks
+    for c in chunks:
+        if c.shape != (num_heads, chunk_rows, lkv_dim):
+            raise ValueError(
+                f"Chunk shape mismatch: {c.shape} vs {(num_heads, chunk_rows, lkv_dim)}"
+            )
+        if c.dtype != jnp.bfloat16:
+            raise ValueError("wuv_quant_split_3d_fp8_local requires bfloat16 inputs")
+    if lead_hrl.dtype != jnp.bfloat16 or w_uv.dtype != jnp.bfloat16:
+        raise ValueError("wuv_quant_split_3d_fp8_local requires bfloat16 inputs")
+    if w_uv.shape[:2] != (num_heads, lkv_dim):
+        raise ValueError(
+            f"w_uv shape mismatch: {w_uv.shape} vs ({num_heads}, {lkv_dim}, V)"
+        )
+    head_dim = int(w_uv.shape[2])
+
+    if row_block is None:
+        rb = select_wuv_row_block(
+            num_heads,
+            chunk_rows,
+            split_rows,
+            lkv_dim,
+            head_dim,
+            overlap_quant=overlap_quant,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+        if rb is None and overlap_quant:
+            overlap_quant = False
+            rb = select_wuv_row_block(
+                num_heads,
+                chunk_rows,
+                split_rows,
+                lkv_dim,
+                head_dim,
+                overlap_quant=False,
+                vmem_limit_bytes=vmem_limit_bytes,
+            )
+        if rb is None:
+            raise ValueError(
+                f"Unsupported shape for wuv_quant_split_3d_fp8_local: "
+                f"H={num_heads}, R={num_rows}, chunk={chunk_rows}, S={split_rows}, "
+                f"L={lkv_dim}, V={head_dim}"
+            )
+        row_block = rb
+
+    if chunk_rows % row_block != 0 or split_rows > row_block:
+        raise ValueError(
+            f"chunk_rows={chunk_rows} must be a multiple of row_block={row_block} "
+            f"and split_rows={split_rows} <= row_block"
+        )
+    n_rb = num_rows // row_block
+    use_overlap = bool(overlap_quant and n_rb >= 2)
+    half_heads = num_heads // 2
+    out_cols = half_heads * head_dim
+    w_chunks = 4 if num_heads % 4 == 0 else (2 if num_heads % 2 == 0 else 1)
+    hw = num_heads // w_chunks
+    tail_rows = row_block - split_rows
+    has_mask = num_valid_own_rows is not None
+    rank_vec = jnp.reshape(rank, (1,)).astype(jnp.int32)
+    if has_mask:
+        assert num_valid_own_rows is not None
+        meta_vec = jnp.stack(
+            [rank_vec[0], jnp.reshape(num_valid_own_rows, ()).astype(jnp.int32)]
+        )
+    else:
+        meta_vec = rank_vec
+
+    def _kernel(*refs):
+        lead_hbm = refs[0]
+        own_refs = tuple(refs[1 : 1 + num_chunks])
+        w_hbm = refs[1 + num_chunks]
+        meta_sm = refs[2 + num_chunks]
+        (
+            mine_hbm,
+            peer_hbm,
+            scale_hbm,
+            w_vm,
+            lat_vm,
+            out_vm,
+            mine_vm,
+            peer_vm,
+            scl_vm,
+            w_sems,
+            lat_sems,
+            out_sems,
+        ) = refs[3 + num_chunks :]
+
+        rank_i = meta_sm[0]
+        is_rank0 = rank_i == jnp.int32(0)
+        parity_odd = (rank_i & jnp.int32(1)) != jnp.int32(0)
+        n_valid = (
+            jnp.maximum(meta_sm[1], jnp.int32(0)) if has_mask else jnp.int32(num_rows)
+        )
+
+        def _start_lat(rb_i, slot):
+            sem = lat_sems.at[slot]
+
+            @pl.when(rb_i == 0)
+            def _rb0():
+                @pl.when(is_rank0)
+                def _r0():
+                    pltpu.make_async_copy(
+                        lead_hbm, lat_vm.at[slot, :, pl.ds(0, split_rows), :], sem
+                    ).start()
+                    if tail_rows > 0:
+                        pltpu.make_async_copy(
+                            own_refs[0].at[:, pl.ds(0, tail_rows), :],
+                            lat_vm.at[slot, :, pl.ds(split_rows, tail_rows), :],
+                            sem,
+                        ).start()
+
+                @pl.when(~is_rank0)
+                def _rn():
+                    pltpu.make_async_copy(
+                        own_refs[0].at[:, pl.ds(0, row_block), :],
+                        lat_vm.at[slot],
+                        sem,
+                    ).start()
+
+            @pl.when(rb_i > 0)
+            def _rbk():
+                r_n = rb_i * jnp.int32(row_block)
+                r_0 = r_n - jnp.int32(split_rows)
+
+                @pl.when(is_rank0)
+                def _r0k():
+                    if num_chunks == 1:
+                        pltpu.make_async_copy(
+                            own_refs[0].at[:, pl.ds(r_0, row_block), :],
+                            lat_vm.at[slot],
+                            sem,
+                        ).start()
+                    else:
+                        c_lo = lax.div(r_0, jnp.int32(chunk_rows))
+                        off_lo = lax.rem(r_0, jnp.int32(chunk_rows))
+                        crosses = off_lo > jnp.int32(chunk_rows - row_block)
+
+                        @pl.when(~crosses)
+                        def _no_cross():
+                            _start_chunk_slice(
+                                own_refs, c_lo, off_lo, row_block, lat_vm.at[slot], sem
+                            )
+
+                        @pl.when(crosses)
+                        def _cross():
+                            # Every rank-0 straddle starts at chunk_rows - split_rows
+                            # because chunk_rows % row_block == 0 and split <= rb.
+                            _start_chunk_slice(
+                                own_refs,
+                                c_lo,
+                                chunk_rows - split_rows,
+                                split_rows,
+                                lat_vm.at[slot, :, pl.ds(0, split_rows), :],
+                                sem,
+                            )
+                            if tail_rows > 0:
+                                _start_chunk_slice(
+                                    own_refs,
+                                    c_lo + jnp.int32(1),
+                                    0,
+                                    tail_rows,
+                                    lat_vm.at[slot, :, pl.ds(split_rows, tail_rows), :],
+                                    sem,
+                                )
+
+                @pl.when(~is_rank0)
+                def _rnk():
+                    if num_chunks == 1:
+                        pltpu.make_async_copy(
+                            own_refs[0].at[:, pl.ds(r_n, row_block), :],
+                            lat_vm.at[slot],
+                            sem,
+                        ).start()
+                    else:
+                        c_n = lax.div(r_n, jnp.int32(chunk_rows))
+                        off_n = lax.rem(r_n, jnp.int32(chunk_rows))
+                        _start_chunk_slice(
+                            own_refs, c_n, off_n, row_block, lat_vm.at[slot], sem
+                        )
+
+        def _wait_out(slot):
+            pltpu.make_async_copy(
+                mine_vm.at[slot], mine_vm.at[slot], out_sems.at[slot]
+            ).wait()
+            pltpu.make_async_copy(
+                peer_vm.at[slot], peer_vm.at[slot], out_sems.at[slot]
+            ).wait()
+            pltpu.make_async_copy(
+                scl_vm.at[slot], scl_vm.at[slot], out_sems.at[slot]
+            ).wait()
+
+        def _start_out(rb_out, slot):
+            r_out = rb_out * jnp.int32(row_block)
+            pltpu.make_async_copy(
+                mine_vm.at[slot],
+                mine_hbm.at[pl.ds(r_out, row_block)],
+                out_sems.at[slot],
+            ).start()
+            pltpu.make_async_copy(
+                peer_vm.at[slot],
+                peer_hbm.at[pl.ds(r_out, row_block)],
+                out_sems.at[slot],
+            ).start()
+            pltpu.make_async_copy(
+                scl_vm.at[slot],
+                scale_hbm.at[pl.ds(r_out, row_block)],
+                out_sems.at[slot],
+            ).start()
+
+        def _row_valid_mask(rb_i):
+            # Avoid (row_block, 1) i1 mask inside Mosaic select_n lowering.
+            row_idx = lax.broadcasted_iota(jnp.int32, (row_block, lkv_dim), 0)
+            g_row = rb_i * jnp.int32(row_block) + row_idx
+            own_limit = jnp.where(is_rank0, n_valid + jnp.int32(split_rows), n_valid)
+            return g_row < own_limit
+
+        def _quant_pair(out_slot, inv_scale, is_odd: bool, dst_slot):
+            def _qh(h_off: int, dst_ref) -> None:
+                for lh in range(half_heads):
+                    xh = out_vm[out_slot, h_off + lh].astype(jnp.float32)
+                    dst_ref[:, pl.ds(lh * head_dim, head_dim)] = jnp.clip(
+                        xh * inv_scale, -FP8_MAX, FP8_MAX
+                    ).astype(jnp.float8_e4m3fn)
+
+            if is_odd:
+                _qh(half_heads, mine_vm.at[dst_slot])
+                _qh(0, peer_vm.at[dst_slot])
+            else:
+                _qh(0, mine_vm.at[dst_slot])
+                _qh(half_heads, peer_vm.at[dst_slot])
+
+        # Issue all weight chunks + block 0 latent concurrently.
+        for wc in range(w_chunks):
+            pltpu.make_async_copy(
+                w_hbm.at[pl.ds(wc * hw, hw)],
+                w_vm.at[pl.ds(wc * hw, hw)],
+                w_sems.at[wc],
+            ).start()
+        _start_lat(jnp.int32(0), jnp.int32(0))
+
+        def _read_lat(slot, h: int, mask):
+            x = lat_vm[slot, h]
+            if has_mask:
+                return jnp.where(mask, x, jnp.zeros((), jnp.bfloat16))
+            return x
+
+        if not use_overlap:
+
+            def _body(rb_i, _):
+                slot = rb_i & jnp.int32(1)
+                nxt = rb_i + jnp.int32(1)
+
+                @pl.when(nxt < n_rb)
+                def _pref():
+                    _start_lat(nxt, nxt & jnp.int32(1))
+
+                @pl.when(rb_i >= 2)
+                def _wo():
+                    _wait_out(slot)
+
+                pltpu.make_async_copy(
+                    lat_vm.at[slot], lat_vm.at[slot], lat_sems.at[slot]
+                ).wait()
+                mask = _row_valid_mask(rb_i) if has_mask else None
+                row_max = jnp.zeros((row_block, 1), jnp.float32)
+                for wc in range(w_chunks):
+                    h0 = wc * hw
+
+                    def _wait_w(h0_=h0, wc_=wc):
+                        pltpu.make_async_copy(
+                            w_vm.at[pl.ds(h0_, hw)],
+                            w_vm.at[pl.ds(h0_, hw)],
+                            w_sems.at[wc_],
+                        ).wait()
+
+                    pl.when(rb_i == 0)(_wait_w)
+                    for hi in range(hw):
+                        h = h0 + hi
+                        acc = jnp.dot(
+                            _read_lat(slot, h, mask),
+                            w_vm[h],
+                            preferred_element_type=jnp.float32,
+                        )
+                        val = acc.astype(jnp.bfloat16)
+                        out_vm[0, h] = val
+                        row_max = jnp.maximum(
+                            row_max,
+                            jnp.max(
+                                jnp.abs(val.astype(jnp.float32)),
+                                axis=-1,
+                                keepdims=True,
+                            ),
+                        )
+                scale = row_max * jnp.float32(1.0 / FP8_MAX)
+                scale = jnp.where(scale == 0.0, jnp.float32(1.0), scale)
+                inv_scale = jnp.float32(1.0) / scale
+
+                @pl.when(parity_odd)
+                def _odd():
+                    _quant_pair(0, inv_scale, True, slot)
+
+                @pl.when(~parity_odd)
+                def _even():
+                    _quant_pair(0, inv_scale, False, slot)
+
+                scl_vm[slot] = jnp.broadcast_to(scale, (row_block, SCALE_PAD_COLS))
+                _start_out(rb_i, slot)
+                return None
+
+            lax.fori_loop(0, n_rb, _body, None)
+            for tail in range(min(2, n_rb)):
+                _wait_out((n_rb - 1 - tail) & 1)
+        else:
+            # Avoid dynamic parity checks inside the per-head loop: branch once outside.
+            _start_lat(jnp.int32(1), jnp.int32(1))
+            pltpu.make_async_copy(lat_vm.at[0], lat_vm.at[0], lat_sems.at[0]).wait()
+            mask0 = _row_valid_mask(jnp.int32(0)) if has_mask else None
+            rm0 = jnp.zeros((row_block, 1), jnp.float32)
+            for wc in range(w_chunks):
+                h0 = wc * hw
+                pltpu.make_async_copy(
+                    w_vm.at[pl.ds(h0, hw)],
+                    w_vm.at[pl.ds(h0, hw)],
+                    w_sems.at[wc],
+                ).wait()
+                for hi in range(hw):
+                    h = h0 + hi
+                    acc = jnp.dot(
+                        _read_lat(jnp.int32(0), h, mask0),
+                        w_vm[h],
+                        preferred_element_type=jnp.float32,
+                    )
+                    val = acc.astype(jnp.bfloat16)
+                    out_vm[0, h] = val
+                    rm0 = jnp.maximum(
+                        rm0,
+                        jnp.max(
+                            jnp.abs(val.astype(jnp.float32)),
+                            axis=-1,
+                            keepdims=True,
+                        ),
+                    )
+            s0 = rm0 * jnp.float32(1.0 / FP8_MAX)
+            s0 = jnp.where(s0 == 0.0, jnp.float32(1.0), s0)
+
+            def _run_pipe(is_odd: bool) -> None:
+                def _step(rb_i, prev_scale):
+                    slot = rb_i & jnp.int32(1)
+                    prev_slot = slot ^ jnp.int32(1)
+                    nxt = rb_i + jnp.int32(1)
+
+                    @pl.when(nxt < n_rb)
+                    def _pref():
+                        _start_lat(nxt, nxt & jnp.int32(1))
+
+                    @pl.when(rb_i >= 3)
+                    def _wo():
+                        _wait_out(prev_slot)
+
+                    pltpu.make_async_copy(
+                        lat_vm.at[slot], lat_vm.at[slot], lat_sems.at[slot]
+                    ).wait()
+                    mask = _row_valid_mask(rb_i) if has_mask else None
+                    prev_inv = jnp.float32(1.0) / prev_scale
+                    rm = jnp.zeros((row_block, 1), jnp.float32)
+                    for h in range(num_heads):
+                        acc = jnp.dot(
+                            _read_lat(slot, h, mask),
+                            w_vm[h],
+                            preferred_element_type=jnp.float32,
+                        )
+                        val = acc.astype(jnp.bfloat16)
+                        out_vm[slot, h] = val
+                        rm = jnp.maximum(
+                            rm,
+                            jnp.max(
+                                jnp.abs(val.astype(jnp.float32)),
+                                axis=-1,
+                                keepdims=True,
+                            ),
+                        )
+                        xh = out_vm[prev_slot, h].astype(jnp.float32)
+                        qh = jnp.clip(xh * prev_inv, -FP8_MAX, FP8_MAX).astype(
+                            jnp.float8_e4m3fn
+                        )
+                        if h < half_heads:
+                            col = pl.ds(h * head_dim, head_dim)
+                            if is_odd:
+                                peer_vm[prev_slot, :, col] = qh
+                            else:
+                                mine_vm[prev_slot, :, col] = qh
+                        else:
+                            col = pl.ds((h - half_heads) * head_dim, head_dim)
+                            if is_odd:
+                                mine_vm[prev_slot, :, col] = qh
+                            else:
+                                peer_vm[prev_slot, :, col] = qh
+                    scl_vm[prev_slot] = jnp.broadcast_to(
+                        prev_scale, (row_block, SCALE_PAD_COLS)
+                    )
+                    _start_out(rb_i - jnp.int32(1), prev_slot)
+                    sc = rm * jnp.float32(1.0 / FP8_MAX)
+                    return jnp.where(sc == 0.0, jnp.float32(1.0), sc)
+
+                last_sc = lax.fori_loop(1, n_rb, _step, s0)
+                lslot = (n_rb - 1) & 1
+                if n_rb >= 3:
+                    _wait_out(lslot)
+                linv = jnp.float32(1.0) / last_sc
+                _quant_pair(lslot, linv, is_odd, lslot)
+                scl_vm[lslot] = jnp.broadcast_to(last_sc, (row_block, SCALE_PAD_COLS))
+                _start_out(jnp.int32(n_rb - 1), jnp.int32(lslot))
+
+            @pl.when(parity_odd)
+            def _ro():
+                _run_pipe(True)
+
+            @pl.when(~parity_odd)
+            def _re():
+                _run_pipe(False)
+
+            for tail in range(min(2, n_rb)):
+                _wait_out((n_rb - 1 - tail) & 1)
+
+    n_out_bufs = 2 if use_overlap else 1
+    mine_q, peer_q, scale_padded = pl.pallas_call(
+        _kernel,
+        name=f"dcp_wuv_quant_local_3d_fp8_c{num_chunks}_b{row_block}",
+        grid=(),
+        in_specs=[
+            pl.BlockSpec(memory_space=pl.ANY),
+            *([pl.BlockSpec(memory_space=pl.ANY)] * num_chunks),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+        ],
+        out_specs=[
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+        ],
+        scratch_shapes=(
+            pltpu.VMEM((num_heads, lkv_dim, head_dim), jnp.bfloat16),
+            pltpu.VMEM((2, num_heads, row_block, lkv_dim), jnp.bfloat16),
+            pltpu.VMEM((n_out_bufs, num_heads, row_block, head_dim), jnp.bfloat16),
+            pltpu.VMEM((2, row_block, out_cols), jnp.float8_e4m3fn),
+            pltpu.VMEM((2, row_block, out_cols), jnp.float8_e4m3fn),
+            pltpu.VMEM((2, row_block, SCALE_PAD_COLS), jnp.float32),
+            pltpu.SemaphoreType.DMA((w_chunks,)),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((2,)),
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct((num_rows, out_cols), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((num_rows, out_cols), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((num_rows, SCALE_PAD_COLS), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+        interpret=interpret,
+    )(lead_hrl, *chunks, w_uv, meta_vec)
+    return mine_q, peer_q, scale_padded[:, :1]

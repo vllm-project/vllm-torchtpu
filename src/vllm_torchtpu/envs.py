@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_DCP_PREFILL_TOKEN_PARALLEL: bool = True
     TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT: bool = True
+    TPU_DCP_TP_FUSED_WUV_EPILOGUE: bool = True
     TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP: int = 8
     TPU_DCP_TP_IN_BRANCH_QB_MLA: bool = True
     TPU_DCP_TP_PREFILL_LOCAL_OPROJ: bool = True
@@ -885,6 +886,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the [H, R, V] -> [R, H*V] HBM transpose and inter-shard_map barrier.
     "TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT": env_bool(
         "TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT", default=True
+    ),
+    # With TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT and zigzag_bands > 1: emit
+    # chunked head-major [H, chunk, L] MLA latent outputs directly into a fused
+    # Pallas W_UV + FP8 row-quant + pair-half split kernel (zero concat/transpose).
+    "TPU_DCP_TP_FUSED_WUV_EPILOGUE": env_bool(
+        "TPU_DCP_TP_FUSED_WUV_EPILOGUE", default=True
     ),
     # With TPU_DCP_TP_PREFILL_LOCAL_OPROJ and TPU_MOE_PREFILL_SEQUENCE_PARALLEL:
     # keep kv_lora sequence-sharded across kv_a_layernorm, k_pe RoPE, and FP8

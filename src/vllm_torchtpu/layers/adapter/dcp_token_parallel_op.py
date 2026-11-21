@@ -284,6 +284,42 @@ def make_attend(
         )
         return out if out.shape[-1] == lkv_dim else out[..., :lkv_dim]
 
+    if envs.TPU_DCP_TP_FUSED_WUV_EPILOGUE:
+        chunk_kw = attend_chunk_kwargs(sparse_mla_chunk_kwargs())
+        chunk_rows = int(
+            chunk_kw.get(
+                "gather_and_attention_chunk_size",
+                sparse_mla_kernel.DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
+            )
+        )
+
+        def attend_hm(q, g_nope, g_rope, topk, num_rows, q_pe=None):
+            split_kw = {"q_pe": q_pe} if split_q and q_pe is not None else {}
+            chunks = sparse_mla_kernel.sparse_ragged_paged_attention(
+                q,
+                g_nope,
+                g_rope,
+                topk,
+                None,
+                jnp.stack([jnp.int32(0), num_rows.astype(jnp.int32)]),
+                jnp.array([0, 0, 1], jnp.int32),
+                sm_scale=sm_scale,
+                k_scale=k_scale,
+                cache_layout=cache_layout,
+                mixed_body_levers=mixed_body_levers,
+                head_major_out_chunks=True,
+                **attend_chunk_kwargs(sparse_mla_chunk_kwargs()),
+                **packed,
+                **split_kw,
+            )
+            assert isinstance(chunks, tuple)
+            return tuple(
+                c if c.shape[-1] == lkv_dim else c[..., :lkv_dim] for c in chunks
+            )
+
+        attend.head_major_chunks = attend_hm  # type: ignore[attr-defined]
+        attend.head_major_chunk_rows = chunk_rows  # type: ignore[attr-defined]
+
     return attend
 
 

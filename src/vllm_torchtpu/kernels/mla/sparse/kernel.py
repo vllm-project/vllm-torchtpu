@@ -1710,6 +1710,7 @@ def _attention_kernel(
     out_in: bool = False,
     send_exchange: tuple | None = None,
     recv_in: bool = False,
+    head_major_out: bool = False,
 ):
     # Fused exchange (`send_exchange` = (axis, lane_axis or None), with the
     # send layout on a one-step grid; TPU_MLA_FUSED_SMALL_A2A, see
@@ -1779,6 +1780,16 @@ def _attention_kernel(
     # double-buffered window DMAs (two-slot scratch trails the usual scratch).
     # Body lever "pair" (see below): its unpacked-KV ring is the last scratch
     # ref, after every other one.
+    bo_hm_x2_ref = None
+    if head_major_out:
+        assert (
+            not return_lse
+            and send_world == 0
+            and not preserve_suffix
+            and capped_windows is None
+        )
+        bo_hm_x2_ref = refs[-1]  # [2, num_q_heads, bsz, head_dim]
+        refs = refs[:-1]
     xchg_merge = bool(
         send_exchange is not None and len(send_exchange) > 4 and send_exchange[4]
     )
@@ -1940,7 +1951,13 @@ def _attention_kernel(
         blse_x2_ref = None
 
     assert o_hbm_ref is not None
-    assert q_hbm_ref.shape[1:] == o_hbm_ref.shape[1:]
+    if head_major_out:
+        assert (
+            o_hbm_ref.shape[0] == q_hbm_ref.shape[1]
+            and o_hbm_ref.shape[2] == q_hbm_ref.shape[2]
+        ), (o_hbm_ref.shape, q_hbm_ref.shape)
+    else:
+        assert q_hbm_ref.shape[1:] == o_hbm_ref.shape[1:]
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
     # "nofill" (decode levers): the one grid step stores every row's lse.
@@ -2413,6 +2430,19 @@ def _attention_kernel(
             )
             return
 
+        if head_major_out:
+            assert bo_hm_x2_ref is not None
+            hm_ref = bo_hm_x2_ref.at[bo_sem_idx]
+            if not wait:
+                # Avoid per-token strided writes into [H, bsz, L]: transpose once.
+                bo_hm_x2_ref[bo_sem_idx] = jnp.swapaxes(bo_x2_ref[0], 0, 1)
+                hm_row = pl.multiple_of(seq_idx_start - out_row_offset, batch_size)
+                dst = o_hbm_ref.at[:, pl.ds(hm_row, batch_size), :]
+                _async_copy(hm_ref, dst, sem, wait)
+            else:
+                _async_copy(src=hm_ref, dst=hm_ref, sem=sem, wait=True)
+            return
+
         if not wait:
             if send:
                 # This step's partial rows of every destination block.
@@ -2514,6 +2544,9 @@ def _attention_kernel(
 
     def store_out(bo_sem_idx, batch_idx, out):
         """Stores one token's [num_q_heads, >= o_dim] output into the bo tile."""
+        if head_major_out:
+            bo_x2_ref.at[0, batch_idx][...] = out[:, :o_dim]
+            return
         if not send:
             bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out[:, :o_dim]
             return
@@ -3616,6 +3649,7 @@ def prepare_outputs(
         "out_pieces_fault",
         "out_pieces_gather_first",
         "packed_rope",
+        "head_major_out_chunks",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -3673,6 +3707,7 @@ def sparse_ragged_paged_attention(
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
+    head_major_out_chunks: bool = False,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -4320,6 +4355,7 @@ def sparse_ragged_paged_attention(
             send_peer=send_peer,
             send_recv_in=send_recv_in,
             packed_rope=packed_rope,
+            head_major_out=head_major_out_chunks,
             **extra,
         )
 
@@ -4337,6 +4373,14 @@ def sparse_ragged_paged_attention(
     chunks_per_piece = max(1, piece_rows // gather_and_attention_chunk_size)
 
     prev_out = None
+    hm_chunks: list[jax.Array] = []
+    if head_major_out_chunks and (
+        return_lse or kv_write is not None or piece_rows or send_world
+    ):
+        raise ValueError(
+            "head_major_out_chunks requires no "
+            "return_lse/kv_write/out_pieces/send_world"
+        )
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         out_piece = None
@@ -4360,22 +4404,30 @@ def sparse_ragged_paged_attention(
         if pre[i] is not None:
             extra["pre_gathered"] = pre[i]
         if piece_rows and i:
-            # Merge pieces leave the attention calls independent, and XLA is
-            # then free to run them in any order (it reversed them). Keep the
-            # incumbent's order -- the merge's chunk order -- by handing call
-            # i its (read-only) q through a barrier with call i-1's output.
             extra["q_in"], _ = lax.optimization_barrier((q, prev_out))
+        elif head_major_out_chunks and i:
+            extra["q_in"], hm_chunks[-1] = lax.optimization_barrier((q, hm_chunks[-1]))
         result = run_chunk(i, piece_lse, **extra)
-        prev_out = result[0]
+        prev_out = result if head_major_out_chunks else result[0]
         if kv_write is not None:
             result, (cache_kv_nope, cache_kv_rope) = result
         if piece_rows:
             piece_outs.append(result[0])
             piece_lses.append(result[1])
+        elif head_major_out_chunks:
+            hm_chunks.append(result)
         elif return_lse:
             q, lse = result
         else:
             q = result
+
+    if head_major_out_chunks:
+        return tuple(
+            c
+            if (c.shape[0] == actual_num_q_heads and c.shape[2] == actual_head_dim)
+            else c[:actual_num_q_heads, :, :actual_head_dim]
+            for c in hm_chunks
+        )
 
     if piece_rows:
         if out_pieces_fault == "swap":
@@ -4518,6 +4570,7 @@ def sparse_attention_chunk(
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
+    head_major_out: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -4680,7 +4733,13 @@ def sparse_attention_chunk(
             q.dtype,
         )
 
-        bo_double_buf = bq_double_buf
+        if head_major_out:
+            bo_double_buf = pltpu.VMEM(
+                (1, batch_size, num_q_heads, q.shape[-1]),
+                q.dtype,
+            )
+        else:
+            bo_double_buf = bq_double_buf
         if send_world:
             # Destination-major partial tile: W slabs of bsz * L rows (fused
             # exchange: SEND_SLAB_ROW0 head rows first, the lse word row last).
@@ -4797,6 +4856,24 @@ def sparse_attention_chunk(
                     jnp.int16,
                 )
             )
+        if head_major_out:
+            if (
+                return_lse
+                or send_world
+                or preserve_suffix
+                or capped_windows is not None
+                or out_piece is not None
+            ):
+                raise ValueError(
+                    "head_major_out requires no return_lse/send_world/"
+                    "preserve_suffix/capped_windows/out_piece"
+                )
+            scratch_shapes.append(
+                pltpu.VMEM(
+                    (2, num_q_heads, batch_size, q.shape[-1]),
+                    q.dtype,
+                )
+            )
         bounds = [start_seq_idx, end_seq_idx]
         if preserve_suffix:
             bounds.append(token_end)
@@ -4832,10 +4909,11 @@ def sparse_attention_chunk(
             fault=prologue_fault,
             row_widths=tuple(row_widths) if capped_windows is not None else (),
             send_world=send_world,
-            out_row_offset=out_offset,
+            out_row_offset=start_pos if head_major_out else out_offset,
             out_in=out_carried is not None,
             send_exchange=send_exchange,
             recv_in=send_recv_in is not None,
+            head_major_out=head_major_out,
         )
         if (
             live_views is None
@@ -4950,10 +5028,17 @@ def sparse_attention_chunk(
                         else jax.ShapeDtypeStruct(shape=lse_shape, dtype=jnp.float32),
                     ]
                     if return_lse
+                    else jax.ShapeDtypeStruct(
+                        shape=(num_q_heads, chunk_size, q.shape[-1]),
+                        dtype=q.dtype,
+                    )
+                    if head_major_out
                     else jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
                 ),
                 input_output_aliases=(
-                    piece_aliases
+                    {}
+                    if head_major_out
+                    else piece_aliases
                     if out_piece is not None
                     else {num_prefetch: 0, lse_operand: 1}
                     if lse_fill and send_recv_in is not None

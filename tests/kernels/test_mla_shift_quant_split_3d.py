@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -724,4 +726,409 @@ def test_should_match_ref_bit_exact_with_remote_push_and_race_detection(
         np.testing.assert_array_equal(
             np.asarray(jax.lax.bitcast_convert_type(got_out[idx], jnp.uint32)),
             np.asarray(jax.lax.bitcast_convert_type(ref_out[idx], jnp.uint32)),
+        )
+
+
+def test_should_validate_supported_shapes_for_wuv_quant_split_3d_local():
+    assert sq3d.supports_wuv_quant_split_3d_local(
+        64, 1024, 256, 64, 512, 256, jnp.bfloat16
+    )
+    assert sq3d.supports_wuv_quant_split_3d_local(
+        4, 256, 64, 16, 128, 128, jnp.bfloat16
+    )
+    assert not sq3d.supports_wuv_quant_split_3d_local(
+        64, 1024, 256, 64, 512, 256, jnp.float32
+    )
+    assert not sq3d.supports_wuv_quant_split_3d_local(
+        3, 256, 64, 16, 128, 128, jnp.bfloat16
+    )
+    assert not sq3d.supports_wuv_quant_split_3d_local(
+        4, 250, 64, 16, 128, 128, jnp.bfloat16
+    )
+    assert not sq3d.supports_wuv_quant_split_3d_local(
+        4, 256, 64, 16, 64, 128, jnp.bfloat16
+    )
+    assert not sq3d.supports_wuv_quant_split_3d_local(
+        64, 1024, 256, 64, 512, 256, jnp.bfloat16, vmem_limit_bytes=8 * 1024 * 1024
+    )
+
+
+@pytest.mark.parametrize("use_chunks", [False, True])
+@pytest.mark.parametrize("overlap_quant", [False, True])
+def test_should_match_wuv_quant_split_local_ref_when_single_and_chunked(
+    use_chunks: bool, overlap_quant: bool
+):
+    rng = np.random.default_rng(1380 + int(use_chunks) * 10 + int(overlap_quant))
+    heads, rows, split_rows, lkv_dim, head_dim = 4, 256, 16, 128, 128
+    lead = jnp.asarray(
+        (rng.standard_normal((heads, split_rows, lkv_dim)) * 0.3).astype(np.float32),
+        jnp.bfloat16,
+    )
+    own = jnp.asarray(
+        (rng.standard_normal((heads, rows, lkv_dim)) * 0.3).astype(np.float32),
+        jnp.bfloat16,
+    )
+    w_uv = jnp.asarray(
+        (rng.standard_normal((heads, lkv_dim, head_dim)) * 0.2).astype(np.float32),
+        jnp.bfloat16,
+    )
+    own_arg: jax.Array | tuple[jax.Array, ...] = (
+        tuple(own[:, c * 64 : (c + 1) * 64, :] for c in range(4)) if use_chunks else own
+    )
+    interp = pltpu.InterpretParams(detect_races=True)
+    for rk in (0, 1, 2):
+        rank_arr = jnp.asarray([rk], jnp.int32)
+        ref_m, ref_p, ref_s = sq3d.wuv_quant_split_3d_local_ref(
+            lead, own_arg, w_uv, rank_arr
+        )
+        got_m, got_p, got_s = sq3d.wuv_quant_split_3d_fp8_local(
+            lead,
+            own_arg,
+            w_uv,
+            rank_arr,
+            row_block=32,
+            overlap_quant=overlap_quant,
+            interpret=interp,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(got_m, jnp.uint8)),
+            np.asarray(jax.lax.bitcast_convert_type(ref_m, jnp.uint8)),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(got_p, jnp.uint8)),
+            np.asarray(jax.lax.bitcast_convert_type(ref_p, jnp.uint8)),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(got_s, jnp.uint32)),
+            np.asarray(jax.lax.bitcast_convert_type(ref_s, jnp.uint32)),
+        )
+
+
+def test_should_mask_nonfinite_tail_rows_when_num_valid_own_rows_given():
+    rng = np.random.default_rng(1389)
+    heads, rows, split_rows, lkv_dim, head_dim = 4, 256, 16, 128, 128
+    lead = jnp.asarray(
+        (rng.standard_normal((heads, split_rows, lkv_dim)) * 0.3).astype(np.float32),
+        jnp.bfloat16,
+    )
+    own_np = (rng.standard_normal((heads, rows, lkv_dim)) * 0.3).astype(np.float32)
+    # Anti-cancellation positive control: poison un-visited rows with NaN.
+    n_valid = 110
+    own_np[:, n_valid:, :] = np.nan
+    own = jnp.asarray(own_np, jnp.bfloat16)
+    chunks = tuple(own[:, c * 64 : (c + 1) * 64, :] for c in range(4))
+    w_uv = jnp.asarray(
+        (rng.standard_normal((heads, lkv_dim, head_dim)) * 0.2).astype(np.float32),
+        jnp.bfloat16,
+    )
+    nv_arr = jnp.asarray(n_valid, jnp.int32)
+    interp = pltpu.InterpretParams(detect_races=True)
+    for rk in (0, 1, 2):
+        rank_arr = jnp.asarray([rk], jnp.int32)
+        ref_m, ref_p, ref_s = sq3d.wuv_quant_split_3d_local_ref(
+            lead, chunks, w_uv, rank_arr, num_valid_own_rows=nv_arr
+        )
+        got_m, got_p, got_s = sq3d.wuv_quant_split_3d_fp8_local(
+            lead,
+            chunks,
+            w_uv,
+            rank_arr,
+            num_valid_own_rows=nv_arr,
+            row_block=32,
+            overlap_quant=True,
+            interpret=interp,
+        )
+        assert np.all(np.isfinite(np.asarray(got_m, np.float32)))
+        assert np.all(np.isfinite(np.asarray(got_p, np.float32)))
+        assert np.all(np.isfinite(np.asarray(got_s, np.float32)))
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(got_m, jnp.uint8)),
+            np.asarray(jax.lax.bitcast_convert_type(ref_m, jnp.uint8)),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(got_p, jnp.uint8)),
+            np.asarray(jax.lax.bitcast_convert_type(ref_p, jnp.uint8)),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(got_s, jnp.uint32)),
+            np.asarray(jax.lax.bitcast_convert_type(ref_s, jnp.uint32)),
+        )
+
+
+def test_should_reject_invalid_inputs_in_wuv_quant_split_3d_fp8_local():
+    good_lead = jnp.zeros((4, 16, 128), jnp.bfloat16)
+    good_own = jnp.zeros((4, 128, 128), jnp.bfloat16)
+    good_w = jnp.zeros((4, 128, 128), jnp.bfloat16)
+    rk = jnp.asarray([0], jnp.int32)
+    with pytest.raises(ValueError, match="non-empty"):
+        sq3d.wuv_quant_split_3d_fp8_local(good_lead, (), good_w, rk)
+    with pytest.raises(ValueError, match="bfloat16"):
+        sq3d.wuv_quant_split_3d_fp8_local(
+            good_lead.astype(jnp.float32), good_own, good_w, rk
+        )
+    with pytest.raises(ValueError, match="Chunk shape mismatch"):
+        sq3d.wuv_quant_split_3d_fp8_local(
+            good_lead,
+            (
+                jnp.zeros((4, 64, 128), jnp.bfloat16),
+                jnp.zeros((4, 32, 128), jnp.bfloat16),
+            ),
+            good_w,
+            rk,
+        )
+    with pytest.raises(ValueError, match="w_uv shape mismatch"):
+        sq3d.wuv_quant_split_3d_fp8_local(
+            good_lead, good_own, jnp.zeros((2, 128, 128), jnp.bfloat16), rk
+        )
+
+
+def test_should_match_fused_wuv_dcp_token_parallel_end_to_end():
+    if len(jax.devices()) < 4:
+        pytest.skip("requires 4 host devices")
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:4]), (AXIS,))
+    dcp, heads, lkv_dim, head_dim, hidden = 4, 4, 128, 128, 32
+    split_rows, rows_per_rank, chunk_rows = 16, 128, 64
+    num_tokens = dcp * rows_per_rank
+    layout = tp.TokenParallelLayout(
+        dcp_size=dcp,
+        page_size=16,
+        interleave_size=4,
+        max_pages=4,
+        split_rows=split_rows,
+        gather_caps=(2, 4),
+        zigzag_bands=4,
+    )
+    rng = np.random.default_rng(13899)
+    q = jnp.asarray(
+        (rng.standard_normal((num_tokens, heads, lkv_dim)) * 0.25).astype(np.float32),
+        jnp.bfloat16,
+    )
+    nope_cache = jnp.zeros((4, 16, lkv_dim), jnp.bfloat16)
+    rope_cache = jnp.zeros((4, 16, 16), jnp.bfloat16)
+    # 1 partial-tail request (live < num_tokens) so trailing mask also exercises!
+    live_tokens = 380
+    flat_topk = jnp.zeros((num_tokens, 4), jnp.int32)
+    seq_lens = jnp.array([live_tokens], jnp.int32)
+    block_tables = jnp.arange(4, dtype=jnp.int32)
+    qsl = jnp.array([0, live_tokens], jnp.int32)
+    dist = jnp.array([0, 0, 1], jnp.int32)
+    lead_part = jnp.asarray(
+        (rng.standard_normal((split_rows, heads, lkv_dim)) * 0.2).astype(np.float32),
+        jnp.bfloat16,
+    )
+    lead_lse = jnp.asarray(
+        rng.uniform(-2.0, 2.0, size=(split_rows, heads)).astype(np.float32)
+    )
+    w_uv = jnp.asarray(
+        (rng.standard_normal((heads, lkv_dim, head_dim)) * 0.2).astype(np.float32),
+        jnp.bfloat16,
+    )
+    w_o = jnp.asarray(
+        (rng.standard_normal((dcp * (heads * head_dim // 2), hidden)) * 0.1).astype(
+            np.float32
+        ),
+        jnp.float8_e4m3fn,
+    )
+    # Use shard_map rank layout: each rank gets its pair-half [H/2*V, hidden].
+    half_cols = (heads // 2) * head_dim
+    w_o_base = (rng.standard_normal((2, half_cols, hidden)) * 0.1).astype(np.float32)
+    w_o_rep = jnp.asarray(
+        np.concatenate([w_o_base[r & 1] for r in range(dcp)], axis=0),
+        jnp.float8_e4m3fn,
+    )
+    del w_o
+    s_o = jnp.asarray(rng.uniform(0.1, 0.5, size=(hidden,)).astype(np.float32))
+    s_o_shd = jax.device_put(
+        jnp.tile(s_o, (dcp,)), jax.sharding.NamedSharding(mesh, P(AXIS))
+    )
+    rank_ids = jnp.arange(dcp, dtype=jnp.int32)
+
+    q_shd = jax.device_put(q, jax.sharding.NamedSharding(mesh, P(AXIS)))
+    nope_shd = jax.device_put(
+        jnp.tile(nope_cache, (dcp, 1, 1)), jax.sharding.NamedSharding(mesh, P(AXIS))
+    )
+    rope_shd = jax.device_put(
+        jnp.tile(rope_cache, (dcp, 1, 1)), jax.sharding.NamedSharding(mesh, P(AXIS))
+    )
+    topk_shd = jax.device_put(flat_topk, jax.sharding.NamedSharding(mesh, P(AXIS)))
+    lp_shd = jax.device_put(
+        jnp.tile(lead_part, (dcp, 1, 1)), jax.sharding.NamedSharding(mesh, P(AXIS))
+    )
+    ll_shd = jax.device_put(
+        jnp.tile(lead_lse, (dcp, 1)), jax.sharding.NamedSharding(mesh, P(AXIS))
+    )
+    w_o_shd = jax.device_put(w_o_rep, jax.sharding.NamedSharding(mesh, P(AXIS)))
+    rk_shd = jax.device_put(rank_ids, jax.sharding.NamedSharding(mesh, P(AXIS)))
+    s_o_rep = s_o_shd
+
+    def _attend_ref(q_t, gn, gr, topk, n_rows):
+        del gn, gr, topk
+        mask = jnp.arange(q_t.shape[0], dtype=jnp.int32)[:, None, None] < n_rows
+        return jnp.where(
+            mask,
+            (q_t * jnp.bfloat16(0.5)).astype(jnp.bfloat16),
+            jnp.zeros((), jnp.bfloat16),
+        )
+
+    def _attend_fused(q_t, gn, gr, topk, n_rows):
+        return _attend_ref(q_t, gn, gr, topk, n_rows)
+
+    def _attend_hm(q_t, gn, gr, topk, n_rows):
+        del gn, gr, topk
+        # Poison rows >= n_rows with NaN to ensure fused kernel masks un-visited rows.
+        mask = jnp.arange(q_t.shape[0], dtype=jnp.int32)[:, None, None] < n_rows
+        rhl = jnp.where(
+            mask,
+            (q_t * jnp.bfloat16(0.5)).astype(jnp.bfloat16),
+            jnp.full(q_t.shape, jnp.nan, jnp.bfloat16),
+        )
+        hrl = jnp.swapaxes(rhl, 0, 1)
+        return tuple(
+            hrl[:, c * chunk_rows : (c + 1) * chunk_rows, :]
+            for c in range(rows_per_rank // chunk_rows)
+        )
+
+    _attend_fused.head_major_chunks = _attend_hm  # type: ignore[attr-defined]
+    _attend_fused.head_major_chunk_rows = chunk_rows  # type: ignore[attr-defined]
+
+    orig_sq_local = sq3d.shift_quant_split_3d_fp8_local
+    orig_wuv_local = sq3d.wuv_quant_split_3d_fp8_local
+    interp = pltpu.InterpretParams(detect_races=True)
+
+    def _sq_interp(*args, **kwargs):
+        return orig_sq_local(*args, **kwargs, interpret=interp)
+
+    def _wuv_interp(*args, **kwargs):
+        return orig_wuv_local(*args, **kwargs, interpret=interp)
+
+    with (
+        patch.object(sq3d, "shift_quant_split_3d_fp8_local", _sq_interp),
+        patch.object(sq3d, "wuv_quant_split_3d_fp8_local", _wuv_interp),
+    ):
+        _, _, ref_y = tp.sparse_mla_attention_with_lead_oproj(
+            layout,
+            mesh,
+            AXIS,
+            nope_shd,
+            rope_shd,
+            q_shd,
+            None,
+            None,
+            topk_shd,
+            seq_lens,
+            block_tables,
+            qsl,
+            dist,
+            lead_partial=lp_shd,
+            lead_lse=ll_shd,
+            write_kv=None,
+            attend=_attend_ref,
+            w_uv=w_uv,
+            w_o=w_o_shd,
+            w_o_scale=s_o_rep,
+            rank_ids=rk_shd,
+            q_own_rows=True,
+            w_uv_replicated=True,
+            num_tokens=num_tokens,
+            flat_topk_cap_strided=True,
+            epilogue_3d=True,
+        )
+        _, _, got_y = tp.sparse_mla_attention_with_lead_oproj(
+            layout,
+            mesh,
+            AXIS,
+            nope_shd,
+            rope_shd,
+            q_shd,
+            None,
+            None,
+            topk_shd,
+            seq_lens,
+            block_tables,
+            qsl,
+            dist,
+            lead_partial=lp_shd,
+            lead_lse=ll_shd,
+            write_kv=None,
+            attend=_attend_fused,
+            w_uv=w_uv,
+            w_o=w_o_shd,
+            w_o_scale=s_o_rep,
+            rank_ids=rk_shd,
+            q_own_rows=True,
+            w_uv_replicated=True,
+            num_tokens=num_tokens,
+            flat_topk_cap_strided=True,
+            epilogue_3d=True,
+        )
+    assert np.all(np.isfinite(np.asarray(got_y, np.float32)))
+    np.testing.assert_array_equal(
+        np.asarray(got_y).view(np.uint16), np.asarray(ref_y).view(np.uint16)
+    )
+
+
+def test_should_expose_head_major_chunks_hook_when_make_attend_enabled(monkeypatch):
+    from vllm_torchtpu import envs as _envs  # noqa: PLC0415 -- test-only helper
+    from vllm_torchtpu.kernels.mla.sparse import (  # noqa: PLC0415 -- test-only helper
+        kernel as sparse_mla_kernel,
+    )
+    from vllm_torchtpu.layers.adapter import (  # noqa: PLC0415 -- test-only helper
+        dcp_token_parallel_op,
+    )
+
+    monkeypatch.setattr(_envs, "TPU_DCP_TP_FUSED_WUV_EPILOGUE", True)
+    captured: dict[str, object] = {}
+
+    def _fake_kernel(q, *args, **kwargs):
+        captured.update(kwargs)
+        c = kwargs["gather_and_attention_chunk_size"]
+        return tuple(
+            jnp.zeros((q.shape[1], c, 576), jnp.bfloat16)
+            for _ in range(q.shape[0] // c)
+        )
+
+    monkeypatch.setattr(
+        sparse_mla_kernel, "sparse_ragged_paged_attention", _fake_kernel
+    )
+    attend = dcp_token_parallel_op.make_attend(
+        sm_scale=0.1,
+        k_scale=1.0,
+        cache_layout="sparsecore",
+        packed_rope=False,
+        lkv_dim=512,
+    )
+    assert getattr(attend, "head_major_chunk_rows") == 256  # noqa: B009 -- optional hook
+    q = jnp.zeros((512, 4, 512), jnp.bfloat16)
+    chunks = getattr(attend, "head_major_chunks")(  # noqa: B009 -- optional hook
+        q, None, None, None, jnp.int32(512)
+    )
+    assert captured["head_major_out_chunks"] is True
+    assert len(chunks) == 2 and all(c.shape == (4, 256, 512) for c in chunks)
+
+
+def test_should_reject_head_major_out_chunks_with_return_lse():
+    from vllm_torchtpu.kernels.mla.sparse import (  # noqa: PLC0415 -- test-only helper
+        kernel as sparse_mla_kernel,
+    )
+
+    q = jnp.zeros((64, 4, 512), jnp.bfloat16)
+    cache_nope = jnp.zeros((2, 16, 128), jnp.uint32)
+    cache_rope = jnp.zeros((2, 4, 128), jnp.uint32)
+    topk = jnp.zeros((64, 8), jnp.int32)
+    cu_q_lens = jnp.array([0, 64], jnp.int32)
+    dist = jnp.array([0, 0, 1], jnp.int32)
+    with pytest.raises(ValueError, match="head_major_out_chunks"):
+        sparse_mla_kernel.sparse_ragged_paged_attention(
+            q,
+            cache_nope,
+            cache_rope,
+            topk,
+            None,
+            cu_q_lens,
+            dist,
+            cache_layout=sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT,
+            gather_and_attention_chunk_size=64,
+            attention_kernel_batch_size=16,
+            return_lse=True,
+            head_major_out_chunks=True,
         )

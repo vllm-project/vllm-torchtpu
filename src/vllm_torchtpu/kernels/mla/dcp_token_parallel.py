@@ -924,6 +924,74 @@ def _project_w_uv_hrv(out: jax.Array, w_uv_all: jax.Array) -> jax.Array:
     ).astype(out.dtype)
 
 
+def _can_use_fused_wuv_epilogue(
+    layout: TokenParallelLayout,
+    attend_fn: Callable[..., Any],
+    w_uv_all: jax.Array,
+    num_rows: int,
+    dtype: jnp.dtype,
+) -> bool:
+    if layout.effective_zigzag_bands(num_rows * layout.dcp_size) <= 1:
+        return False
+    hm_fn = getattr(attend_fn, "head_major_chunks", None)
+    chunk_rows = getattr(attend_fn, "head_major_chunk_rows", None)
+    if hm_fn is None or chunk_rows is None:
+        return False
+    num_heads, lkv_dim, head_dim = (
+        int(w_uv_all.shape[0]),
+        int(w_uv_all.shape[1]),
+        int(w_uv_all.shape[2]),
+    )
+    return shift_quant_split_3d.supports_wuv_quant_split_3d_local(
+        num_heads,
+        num_rows,
+        int(chunk_rows),
+        layout.split_rows,
+        lkv_dim,
+        head_dim,
+        dtype,
+    )
+
+
+def _project_wuv_hm_pair_halves_local(
+    layout: TokenParallelLayout,
+    own_chunks: tuple[jax.Array, ...],
+    lead_hrl: jax.Array,
+    w_uv_all: jax.Array,
+    rank_vec: jax.Array,
+    w_local: jax.Array,
+    s_local: jax.Array,
+    axis_name: str,
+    *,
+    num_valid_own_rows: jax.Array,
+    use_pallas: bool = True,
+) -> jax.Array:
+    pairs = [(i, i ^ 1) for i in range(layout.dcp_size)]
+    w_peer = lax.ppermute(w_local, axis_name, pairs)
+    w_uv_cast = w_uv_all.astype(lead_hrl.dtype)
+    if use_pallas:
+        mine, peer, x_scale = shift_quant_split_3d.wuv_quant_split_3d_fp8_local(
+            lead_hrl,
+            own_chunks,
+            w_uv_cast,
+            rank_vec,
+            num_valid_own_rows=num_valid_own_rows,
+        )
+    else:
+        mine, peer, x_scale = shift_quant_split_3d.wuv_quant_split_3d_local_ref(
+            lead_hrl,
+            own_chunks,
+            w_uv_cast,
+            rank_vec,
+            num_valid_own_rows=num_valid_own_rows,
+        )
+    dims = (((1,), (0,)), ((), ()))
+    y = lax.dot_general(
+        mine, w_local, dims, preferred_element_type=jnp.float32
+    ) + lax.dot_general(peer, w_peer, dims, preferred_element_type=jnp.float32)
+    return (y * x_scale * s_local.astype(jnp.float32)[None, :]).astype(lead_hrl.dtype)
+
+
 def _can_use_3d_fp8_epilogue(
     layout: TokenParallelLayout,
     num_heads: int,
@@ -1252,6 +1320,7 @@ def _sparse_mla_attention_core(
             )
         )
         use_3d_epilogue = False
+        use_fused_wuv = False
         if has_oproj and epilogue_3d:
             assert (
                 w_uv_all is not None and w_o_local is not None and s_o_local is not None
@@ -1265,6 +1334,10 @@ def _sparse_mla_attention_core(
                 w_o_local,
                 s_o_local,
             )
+            if use_3d_epilogue and has_lead:
+                use_fused_wuv = _can_use_fused_wuv_epilogue(
+                    layout, attend, w_uv_all, q_tok.shape[0], q_tok.dtype
+                )
 
         # Gather and attend at the step's page count: the kernel reads a
         # buffer of `cap` pages per rank, with no padding copy to max_pages.
@@ -1295,7 +1368,11 @@ def _sparse_mla_attention_core(
                     g_nope, g_rope, lp_t, ll_t = lax.optimization_barrier(
                         (g_nope, g_rope, lead_part_local, lead_lse_local)
                     )
-                    if use_3d_epilogue:
+                    if use_fused_wuv:
+                        lead_v = jnp.swapaxes(
+                            _merge_lead_partial_latent(lp_t, ll_t, axis_name), 0, 1
+                        )
+                    elif use_3d_epilogue:
                         lead_v = _merge_lead_partial_to_v_hrv(
                             lp_t, ll_t, w_uv_arr, axis_name, q_tok.dtype
                         )
@@ -1303,6 +1380,16 @@ def _sparse_mla_attention_core(
                         lead_v = _merge_lead_partial_to_v(
                             lp_t, ll_t, w_uv_arr, axis_name, q_tok.dtype
                         )
+                if use_fused_wuv:
+                    attend_hm = getattr(attend, "head_major_chunks")  # noqa: B009 -- optional kernel hook
+                    if q_pe_tok is not None:
+                        out = attend_hm(
+                            q_tok, g_nope, g_rope, flat, rr.num_rows, q_pe_tok
+                        )
+                    else:
+                        out = attend_hm(q_tok, g_nope, g_rope, flat, rr.num_rows)
+                    assert lead_v is not None
+                    return out, lead_v
                 if q_pe_tok is not None:
                     out = attend(q_tok, g_nope, g_rope, flat, rr.num_rows, q_pe_tok)
                 else:
@@ -1326,7 +1413,24 @@ def _sparse_mla_attention_core(
             assert w_o_local is not None and s_o_local is not None
             w_o_arr, s_o_arr = w_o_local, s_o_local
             out, lead_v = switched
-            if use_3d_epilogue:
+            if use_fused_wuv:
+                assert w_uv_all is not None
+                rank_vec = jnp.asarray(
+                    rank_arg[0] if rank_arg else jnp.reshape(rank, (1,)),
+                    dtype=jnp.int32,
+                )
+                projected = _project_wuv_hm_pair_halves_local(
+                    layout,
+                    out,
+                    lead_v,
+                    w_uv_all,
+                    rank_vec,
+                    w_o_arr,
+                    s_o_arr,
+                    axis_name,
+                    num_valid_own_rows=rr.num_rows,
+                )
+            elif use_3d_epilogue:
                 rank_vec = jnp.asarray(
                     rank_arg[0] if rank_arg else jnp.reshape(rank, (1,)),
                     dtype=jnp.int32,
@@ -1791,6 +1895,7 @@ def _unified_indexer_mla_core(
             else lax.all_gather(w_uv_local, axis_name, axis=0, tiled=True)
         )
         use_3d_epilogue = False
+        use_fused_wuv = False
         if has_oproj and epilogue_3d:
             assert w_o_local is not None and s_o_local is not None
             use_3d_epilogue = _can_use_3d_fp8_epilogue(
@@ -1802,9 +1907,13 @@ def _unified_indexer_mla_core(
                 w_o_local,
                 s_o_local,
             )
+            if use_3d_epilogue:
+                use_fused_wuv = _can_use_fused_wuv_epilogue(
+                    layout, attend, w_uv_all, rows, q_tok.dtype
+                )
 
-        def branch(cap: int) -> Callable[[], tuple[jax.Array, jax.Array, jax.Array]]:
-            def run() -> tuple[jax.Array, jax.Array, jax.Array]:
+        def branch(cap: int) -> Callable[[], tuple[Any, jax.Array, jax.Array]]:
+            def run() -> tuple[Any, jax.Array, jax.Array]:
                 nat = _gather_index_k_pages(
                     idx_cache, idx_page_ids, cap, dcp, il, ps, axis_name
                 )
@@ -1838,6 +1947,13 @@ def _unified_indexer_mla_core(
                 g_nope, g_rope, lp_t, ll_t = lax.optimization_barrier(
                     (g_nope, g_rope, lead_part_local, lead_lse_local)
                 )
+                if use_fused_wuv:
+                    lead_v = jnp.swapaxes(
+                        _merge_lead_partial_latent(lp_t, ll_t, axis_name), 0, 1
+                    )
+                    attend_hm = getattr(attend, "head_major_chunks")  # noqa: B009 -- optional kernel hook
+                    out = attend_hm(q_tok, g_nope, g_rope, flat, rr.num_rows, q_pe_tok)
+                    return out, lead_v, flat
                 if use_3d_epilogue:
                     lead_v = _merge_lead_partial_to_v_hrv(
                         lp_t, ll_t, w_uv_all, axis_name, q_tok.dtype
@@ -1860,7 +1976,23 @@ def _unified_indexer_mla_core(
         if has_oproj:
             assert w_o_local is not None and s_o_local is not None
             w_o_arr, s_o_arr = w_o_local, s_o_local
-            if use_3d_epilogue:
+            if use_fused_wuv:
+                rank_vec = jnp.asarray(
+                    rank_arg[0] if rank_arg else jnp.reshape(rank, (1,)),
+                    dtype=jnp.int32,
+                )
+                projected = _project_wuv_hm_pair_halves_local(
+                    layout,
+                    out,
+                    lead_v,
+                    w_uv_all,
+                    rank_vec,
+                    w_o_arr,
+                    s_o_arr,
+                    axis_name,
+                    num_valid_own_rows=rr.num_rows,
+                )
+            elif use_3d_epilogue:
                 rank_vec = jnp.asarray(
                     rank_arg[0] if rank_arg else jnp.reshape(rank, (1,)),
                     dtype=jnp.int32,
@@ -2131,6 +2263,7 @@ def _sparse_mla_in_branch_qb_core(
             else lax.all_gather(w_uv_local, axis_name, axis=0, tiled=True)
         )
         use_3d_epilogue = False
+        use_fused_wuv = False
         if has_oproj and epilogue_3d:
             assert w_o_local is not None and s_o_local is not None
             use_3d_epilogue = _can_use_3d_fp8_epilogue(
@@ -2142,6 +2275,10 @@ def _sparse_mla_in_branch_qb_core(
                 w_o_local,
                 s_o_local,
             )
+            if use_3d_epilogue:
+                use_fused_wuv = _can_use_fused_wuv_epilogue(
+                    layout, tail_attend, w_uv_all, rows, qc_r.dtype
+                )
 
         def branch(cap: int) -> Callable[[], tuple[jax.Array, jax.Array]]:
             def run() -> tuple[jax.Array, jax.Array]:
@@ -2168,6 +2305,17 @@ def _sparse_mla_in_branch_qb_core(
                 lead_partial, lead_lse = lead_attend(
                     ql_head, qpe_head, nope, rope, h_topk_r, bt, sl, qsl, dist
                 )
+                if use_fused_wuv:
+                    lead_v = jnp.swapaxes(
+                        _merge_lead_partial_latent(lead_partial, lead_lse, axis_name),
+                        0,
+                        1,
+                    )
+                    attend_hm = getattr(tail_attend, "head_major_chunks")  # noqa: B009 -- optional kernel hook
+                    out = attend_hm(
+                        ql_tail, g_nope, g_rope, flat, rr.num_rows, qpe_tail
+                    )
+                    return out, lead_v
                 if use_3d_epilogue:
                     lead_v = _merge_lead_partial_to_v_hrv(
                         lead_partial, lead_lse, w_uv_all, axis_name, ql_tail.dtype
@@ -2190,6 +2338,22 @@ def _sparse_mla_in_branch_qb_core(
         if has_oproj:
             assert w_o_local is not None and s_o_local is not None
             w_o_arr, s_o_arr = w_o_local, s_o_local
+            if use_fused_wuv:
+                rank_vec = jnp.asarray(
+                    rank_arg[0] if rank_arg else jnp.reshape(rank, (1,)),
+                    dtype=jnp.int32,
+                )
+                return _project_wuv_hm_pair_halves_local(
+                    layout,
+                    out,
+                    lead_v,
+                    w_uv_all,
+                    rank_vec,
+                    w_o_arr,
+                    s_o_arr,
+                    axis_name,
+                    num_valid_own_rows=rr.num_rows,
+                )
             if use_3d_epilogue:
                 rank_vec = jnp.asarray(
                     rank_arg[0] if rank_arg else jnp.reshape(rank, (1,)),
@@ -2474,6 +2638,7 @@ def _unified_indexer_in_branch_qb_core(
             else lax.all_gather(w_uv_local, axis_name, axis=0, tiled=True)
         )
         use_3d_epilogue = False
+        use_fused_wuv = False
         if has_oproj and epilogue_3d:
             assert w_o_local is not None and s_o_local is not None
             use_3d_epilogue = _can_use_3d_fp8_epilogue(
@@ -2485,6 +2650,10 @@ def _unified_indexer_in_branch_qb_core(
                 w_o_local,
                 s_o_local,
             )
+            if use_3d_epilogue:
+                use_fused_wuv = _can_use_fused_wuv_epilogue(
+                    layout, tail_attend, w_uv_all, rows, qc_r.dtype
+                )
 
         def branch(cap: int) -> Callable[[], tuple[jax.Array, jax.Array, jax.Array]]:
             def run() -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -2524,6 +2693,17 @@ def _unified_indexer_in_branch_qb_core(
                 lead_partial, lead_lse = lead_attend(
                     ql_head, qpe_head, nope, rope, h_topk_r, mla_bt, sl, qsl, dist
                 )
+                if use_fused_wuv:
+                    lead_v = jnp.swapaxes(
+                        _merge_lead_partial_latent(lead_partial, lead_lse, axis_name),
+                        0,
+                        1,
+                    )
+                    attend_hm = getattr(tail_attend, "head_major_chunks")  # noqa: B009 -- optional kernel hook
+                    out = attend_hm(
+                        ql_tail, g_nope, g_rope, flat, rr.num_rows, qpe_tail
+                    )
+                    return out, lead_v, flat
                 if use_3d_epilogue:
                     lead_v = _merge_lead_partial_to_v_hrv(
                         lead_partial, lead_lse, w_uv_all, axis_name, ql_tail.dtype
@@ -2546,7 +2726,23 @@ def _unified_indexer_in_branch_qb_core(
         if has_oproj:
             assert w_o_local is not None and s_o_local is not None
             w_o_arr, s_o_arr = w_o_local, s_o_local
-            if use_3d_epilogue:
+            if use_fused_wuv:
+                rank_vec = jnp.asarray(
+                    rank_arg[0] if rank_arg else jnp.reshape(rank, (1,)),
+                    dtype=jnp.int32,
+                )
+                projected = _project_wuv_hm_pair_halves_local(
+                    layout,
+                    out,
+                    lead_v,
+                    w_uv_all,
+                    rank_vec,
+                    w_o_arr,
+                    s_o_arr,
+                    axis_name,
+                    num_valid_own_rows=rr.num_rows,
+                )
+            elif use_3d_epilogue:
                 rank_vec = jnp.asarray(
                     rank_arg[0] if rank_arg else jnp.reshape(rank, (1,)),
                     dtype=jnp.int32,
