@@ -50,7 +50,7 @@ def _tpu7x(monkeypatch):
 
 
 def test_qwen3_5_takes_the_reciprocal_scale_and_streamed_slabs():
-    assert hooks.apply_kernel_numerics(_model(QWEN35)) is None
+    assert hooks.apply_kernel_numerics(_model(QWEN35)) is True
     assert util.RECIPROCAL_SCALE is True
     assert gmm_v2.RHS_STREAM is True
     assert gmm_v2.TUNED_FP8_MOE is True

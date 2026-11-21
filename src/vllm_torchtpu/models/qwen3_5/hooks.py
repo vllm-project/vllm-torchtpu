@@ -256,7 +256,7 @@ def is_measured_target(model_config) -> bool:
     return False
 
 
-def apply_kernel_numerics(model_config) -> bool | None:
+def apply_kernel_numerics(model_config) -> bool:
     """Qwen3.5's kernel numerics and code paths where they were measured
     (``is_measured_target``), in every process that loads the model.
 
@@ -269,7 +269,7 @@ def apply_kernel_numerics(model_config) -> bool | None:
     and code. Returns False without a model config and for any model other
     than the measured target: the patch registry marks a patch done by its
     target, not by model, so a later load of the measured target in the same
-    process still turns them on.
+    process still turns them on. Returns True once they are on.
     """
     if not is_measured_target(model_config):
         return False
@@ -279,7 +279,7 @@ def apply_kernel_numerics(model_config) -> bool | None:
     util.set_reciprocal_scale(True)
     gmm_v2.set_rhs_stream(True)
     gmm_v2.set_tuned_fp8_moe(True)
-    return None
+    return True
 
 
 def apply_serving_defaults(vllm_config: VllmConfig) -> None:
