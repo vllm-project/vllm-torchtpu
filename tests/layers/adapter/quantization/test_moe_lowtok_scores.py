@@ -345,3 +345,124 @@ def test_copies_placement_registers_non_persistent_buffers_and_arms_copies_op(
         assert seen_gmm == [4]
     finally:
         expert_placement.clear_cache()
+
+
+def test_arm_copies_tables_drive_non_zero_rank_in_kernel_scores(tmp_path, monkeypatch):
+    import functools
+    import json
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.kernels.experimental.moe_lowtok import kernel as lowtok_kernel
+    from vllm_torchtpu.kernels.experimental.moe_lowtok import (
+        moe_lowtok_scores as kernel_scores,
+    )
+    from vllm_torchtpu.layers.adapter import expert_placement
+
+    monkeypatch.setattr(
+        lowtok_kernel.pl,
+        "pallas_call",
+        functools.partial(lowtok_kernel.pl.pallas_call, interpret=True),
+    )
+    monkeypatch.setattr(
+        lowtok_kernel.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(vmem_capacity_bytes=64 * 1024**2),
+    )
+    kernel_scores.clear_cache()
+    table = {
+        "experts": 8,
+        "shards": 2,
+        "owned_per_core": 4,
+        "slots_per_core": 5,
+        "copies": True,
+        "layers": {
+            "0": {
+                "cores": [[0, 1, 2, 3, 4], [4, 5, 6, 7, 0]],
+                "copies": {"4": 0, "0": 1},
+            }
+        },
+    }
+    path = tmp_path / "copies.json"
+    path.write_text(json.dumps(table))
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
+    expert_placement.clear_cache()
+    try:
+        placement = expert_placement.current()
+        assert placement is not None
+        rng = np.random.default_rng(7)
+        hidden, inter, tokens, topk = 512, 512, 4, 4
+        x_f32 = rng.standard_normal((tokens, hidden)).astype(np.float32)
+        w13_all = np.clip(rng.standard_normal((8, hidden, 2 * inter)), -4, 4).astype(
+            np.float32
+        )
+        w2_all = np.clip(rng.standard_normal((8, inter, hidden)), -4, 4).astype(
+            np.float32
+        )
+        # Keep scale=1 so fp8 cast roundtrips cleanly without quant helpers.
+        w13_fp8 = jnp.asarray(w13_all, jnp.float8_e4m3fn)
+        w2_fp8 = jnp.asarray(w2_all, jnp.float8_e4m3fn)
+        s13_f32 = jnp.ones((8, 1, 1, 2 * inter), jnp.float32)
+        s2_f32 = jnp.ones((8, 1, 1, hidden), jnp.float32)
+        scores_f32 = jnp.pad(
+            jax.nn.softmax(
+                jnp.asarray(rng.standard_normal((tokens, 8)) * 3.0, jnp.float32),
+                axis=-1,
+            ),
+            ((0, 0), (0, 120)),
+        )
+        x_jnp = jnp.asarray(x_f32, jnp.bfloat16)
+
+        total = np.zeros((tokens, hidden), np.float64)
+        for r, slots in enumerate(placement.layers[0]):
+            proto = make_layer(experts=5)
+
+            class _Layer(torch.nn.Module):
+                def __init__(self, src, ep_rank):
+                    super().__init__()
+                    for k, v in vars(src).items():
+                        setattr(self, k, v)
+                    self.w13_weight = torch.empty(
+                        (5, hidden, 2 * inter), dtype=torch.bfloat16
+                    )
+                    self.w2_weight = torch.empty(
+                        (5, inter, hidden), dtype=torch.bfloat16
+                    )
+                    self.w13_weight_scale_inv = torch.empty(
+                        (5, 1, 1, 2 * inter), dtype=torch.float32
+                    )
+                    self.w2_weight_scale_inv = torch.empty(
+                        (5, 1, 1, hidden), dtype=torch.float32
+                    )
+                    self.layer_name = "model.layers.0.mlp.experts"
+                    self.expert_map_manager = SimpleNamespace(ep_rank=ep_rank)
+
+            layer = _Layer(proto, r)
+            scores._arm_copies(layer, placement, 0)
+            assert int(layer._lowtok_tables[0].item()) == r * placement.owned
+            idx = jnp.asarray(slots, jnp.int32)
+            part = kernel_scores(
+                x_jnp,
+                scores_f32,
+                0,
+                None,
+                jnp.asarray(layer._lowtok_prim.numpy()),
+                jnp.asarray(layer._lowtok_copy.numpy()),
+                w13_fp8[idx],
+                s13_f32[idx],
+                w2_fp8[idx],
+                s2_f32[idx],
+                topk=topk,
+                ranks=2,
+                owned=placement.owned,
+                has_copies=True,
+                tables=jnp.asarray(layer._lowtok_tables.numpy()),
+            )
+            total += np.asarray(part, np.float64)
+
+        assert np.isfinite(total).all() and np.linalg.norm(total) > 0
+        assert total.shape == (tokens, hidden)
+    finally:
+        expert_placement.clear_cache()

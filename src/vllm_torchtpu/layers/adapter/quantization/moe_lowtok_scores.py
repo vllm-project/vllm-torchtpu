@@ -255,7 +255,7 @@ def _arm_copies(
     )
     slot = slot_table(gid, placement.slots, lanes=lanes)
     tables_np = pack_tables(
-        rank,
+        rank * placement.owned,
         gid,
         np.asarray(hot, np.int32),
         np.asarray(hprim, np.int32),
