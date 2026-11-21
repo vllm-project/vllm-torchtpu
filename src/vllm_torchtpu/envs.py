@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS: int | None = None
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
@@ -916,6 +917,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel.
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
+    ),
+    # Local tokens at or above which fused EP MoE v2 enqueues the activation
+    # all-gather ahead of the slab scatters, standing in for
+    # layer.AGQ_MIN_LOCAL_TOKENS. Read at trace time. Unset leaves the
+    # measured default.
+    "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS": lambda: (
+        int(v) if (v := os.getenv("MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS")) else None
     ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and

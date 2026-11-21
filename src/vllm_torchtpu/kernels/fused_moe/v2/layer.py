@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -249,7 +250,8 @@ def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
 # of the slab scatters. Measured, not chosen: +2.80% at t_local 2048 and
 # -0.01 / -7.81 / -1.92 / -1.94% at 1024 / 256 / 64 / 32, because the scatters
 # lose ~90 us of cover to buy a ~129 us hoist and only the largest shape's
-# plan is long enough to pay for it.
+# plan is long enough to pay for it. Overridable per process by
+# MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS, read at trace time.
 AGQ_MIN_LOCAL_TOKENS = 1024
 
 # Per-config cache of the shard_map'd MoE callable; a fresh shard_map
@@ -735,7 +737,10 @@ def fused_ep_moe_v2(
         # the scatters share no queue with the collective, the barrier holds
         # them until the gathered activations arrive, and that trade has not
         # been measured.
-        if t_local >= AGQ_MIN_LOCAL_TOKENS:
+        agq_min_local_tokens = envs.MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS
+        if agq_min_local_tokens is None:
+            agq_min_local_tokens = AGQ_MIN_LOCAL_TOKENS
+        if t_local >= agq_min_local_tokens:
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
         token_gather = shard_token_gather(
             routing,
