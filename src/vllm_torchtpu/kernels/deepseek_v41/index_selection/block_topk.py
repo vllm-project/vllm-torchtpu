@@ -56,7 +56,8 @@ def _vmem_words(rows, width, block_width, k, blocks, block_size, buffers, reside
         + buffers * block_width
         + RADIX_BUCKETS
         + blocks
-        + blocks * block_size
+        # Key bits and IDs, each with a padding vector.
+        + 2 * (blocks * block_size + plsc.get_sparse_core_info().num_lanes)
         + k
         + _length_words(rows)
     )
@@ -139,8 +140,9 @@ def block_topk(
             the newest visible block forced first; ascending, -1 padded, and
             ties keep the lowest IDs.
         maxima: Optional FP32 [rows, cdiv(width, maxima_block) or more] maxima
-            of each row's `maxima_block`-key blocks, as `scores` holds them;
-            blocks past a row's length are never read. Given, the kernel
+            of each row's `maxima_block`-key blocks, as `scores` holds them
+            (so -inf from a row's length to the end of its last `block_size`
+            block); later blocks are never read. Given, the kernel
             reads them instead of reducing the scores, and fetches only the
             chosen blocks' keys.
         maxima_block: Keys per given maximum, a power-of-two divisor of
@@ -217,7 +219,8 @@ def block_topk(
             histogram=pltpu.VMEM((RADIX_BUCKETS,), jnp.int32),
             block_ids=pltpu.VMEM((blocks,), jnp.int32),
             # Ordered key bits; first holds the published block IDs.
-            keys=pltpu.VMEM((max(candidates, publish),), jnp.int32),
+            keys=pltpu.VMEM((max(candidates, publish) + lanes,), jnp.int32),
+            key_ids=pltpu.VMEM((candidates + lanes,), jnp.int32),
             output=pltpu.VMEM((k,), jnp.int32),
             limits=pltpu.VMEM((_length_words(rows),), jnp.int32),
             # Streamed rows: the chosen blocks' keys, fetched from HBM.
@@ -241,6 +244,7 @@ def block_topk(
         histogram,
         block_ids,
         keys,
+        key_ids,
         output,
         limits,
         fetched,
@@ -433,22 +437,24 @@ def block_topk(
             radix.emit(maxima, block_chunks, blocks, chosen, block_ids)
 
             # Stage 2: the chosen blocks' keys, from the resident row or HBM.
-            def owners(i):
-                candidate = radix.positions(i)
-                owner = plsc.load_gather(block_ids, [candidate // block_size])
-                return owner, owner * block_size + candidate % block_size
-
             if publish_copy is not None:
                 publish_copy.wait()
-            chosen_blocks = jnp.minimum(chosen[0], blocks)
+            total, _, gate, _, _ = chosen
+            chosen_blocks = jnp.minimum(total, blocks)
             key_chunks = pl.cdiv(chosen_blocks * block_size, lanes)
             if not resident:
                 fetch_blocks(row_id, chosen_blocks)
             radix.clear()
 
-            @plsc.parallel_loop(0, key_chunks, unroll=4)
-            def gather_keys(i):
-                owner, ids = owners(i)
+            # Each chosen block holds a key at or above the blocks' gate, so the
+            # k-th largest key does too: keep only such keys, in order.
+            @plsc.parallel_loop(
+                0, key_chunks, carry=jnp.zeros(lanes, jnp.int32), unroll=4
+            )
+            def gather_keys(i, kept):
+                candidate = radix.positions(i)
+                owner = plsc.load_gather(block_ids, [candidate // block_size])
+                ids = owner * block_size + candidate % block_size
                 valid = (owner >= 0) & (ids < tokens)
                 if resident:
                     index = base + jnp.where(valid, ids, 0)
@@ -456,9 +462,18 @@ def block_topk(
                 else:
                     values = fetched[pl.ds(i * lanes, lanes)]
                 bits = _ordered_bits(jnp.where(valid, values, -jnp.inf))
-                keys[pl.ds(i * lanes, lanes)] = bits.view(jnp.int32)
-                radix.add(bits)
+                selected = bits >= gate
+                slots = kept + plsc.cumsum(selected.astype(jnp.int32)) - 1
+                plsc.store_scatter(keys, [slots], bits.view(jnp.int32), mask=selected)
+                plsc.store_scatter(key_ids, [slots], ids, mask=selected)
+                radix.add(jnp.where(selected, bits, jnp.uint32(0)))
+                return kept + plsc.all_reduce_population_count(selected)
 
+            # Zero bits pad the last vector below every selected key.
+            plsc.store_scatter(
+                keys, [gather_keys + radix.lane_ids], jnp.zeros(lanes, jnp.int32)
+            )
+            key_chunks = pl.cdiv(gather_keys[0], lanes)
             selection = radix.threshold(keys, key_chunks, k)
 
             @pl.when(row_id > first)
@@ -467,7 +482,14 @@ def block_topk(
                     output, out_ref.at[row_id - stride], output_sem
                 ).wait()
 
-            radix.emit(keys, key_chunks, k, selection, output, lambda i: owners(i)[1])
+            radix.emit(
+                keys,
+                key_chunks,
+                k,
+                selection,
+                output,
+                lambda i: key_ids[pl.ds(i * lanes, lanes)],
+            )
             pltpu.async_copy(output, out_ref.at[row_id], output_sem)
             if buffers == 1:
                 pl.when(row_id + stride < rows)(lambda: start_row(row_id + stride, 0))

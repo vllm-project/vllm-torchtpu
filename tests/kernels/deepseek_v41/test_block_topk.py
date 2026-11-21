@@ -9,6 +9,7 @@ import pytest
 
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.block_topk import (
     block_topk,
+    default_blocks,
     is_supported,
 )
 
@@ -130,3 +131,82 @@ def test_given_maxima_match_reduced(
     given = run(maxima=jnp.asarray(maxima), maxima_block=maxima_block)
     for a, b in zip(jax.tree.leaves(reduced), jax.tree.leaves(given)):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+def _ordered(values):
+    """FP32 radix order as unsigned bits: +0 above -0, -inf lowest."""
+    bits = values.astype(np.float32).view(np.uint32)
+    sign = (bits.view(np.int32) >> 31).view(np.uint32)
+    return (bits ^ (sign | np.uint32(1 << 31))).astype(np.int64)
+
+
+def _top(bits, count):
+    """Positions of the `count` largest finite bits, ties in position order."""
+    finite = bits > _ordered(np.float32(-np.inf))
+    order = np.lexsort((np.arange(bits.size), -bits))
+    return np.sort(order[finite[order]][:count])
+
+
+def _expected_selection(scores, maxima, length, block, publish):
+    """The kernel's exact output: the top blocks by maximum, then the top keys
+    among theirs, ties to the lowest IDs, ascending and -1 padded."""
+    live = -(-length // block)
+    bits = _ordered(maxima[:live])
+    if publish and live:
+        bits[live - 1] = _ordered(np.float32(np.inf))
+    chosen = _top(bits, default_blocks(K, 16, forced=bool(publish)))
+    ids = (chosen[:, None] * block + np.arange(block)).ravel()
+    ids = ids[ids < length]
+    selected = ids[_top(_ordered(scores[ids]), K)]
+    expected = np.full(K, -1, np.int32)
+    expected[: selected.size] = selected
+    return expected
+
+
+# Served decode tiles: 16 rows, one request's 6 verify rows live. Ratio-2
+# layers (block 8 maxima) and 1M-token ratio-1 layers (block 16 folded from
+# 8), at contexts of about 110k-370k tokens.
+SERVED = [(524288, 8, length) for length in (55000, 112000, 185000)]
+SERVED += [(1048576, 16, length) for length in (110000, 370000)]
+
+
+@pytest.mark.parametrize("distribution", ["random", "relu", "masked", "narrow"])
+@pytest.mark.parametrize("publish", [0, PUBLISH])
+@pytest.mark.parametrize("width,block,length", SERVED)
+def test_served_decode_matches_reference(width, block, length, publish, distribution):
+    if jax.default_backend() != "tpu":
+        pytest.skip("SparseCore top-k requires TPU")
+    maxima_block = BLOCK
+    if publish and block != maxima_block:
+        pytest.skip("Folded selection does not publish")
+    if block != maxima_block and distribution == "relu":
+        pytest.skip("Folding signed-zero maxima may keep either zero")
+    rows, live = 16, 6
+    rng = np.random.default_rng(length + publish)
+    scores = np.full((rows, width), -np.inf, np.float32)
+    lengths = np.zeros(rows, np.int32)
+    lengths[:live] = length + np.arange(live)
+    for row in range(live):
+        n = lengths[row]
+        if distribution == "narrow":
+            # One top radix byte: every block survives its first pivot.
+            scores[row, :n] = 1 + rng.random(n, dtype=np.float32)
+        else:
+            scores[row, :n] = _scores(distribution, 1, n, rng)[0]
+    maxima = _block_maxima(scores, maxima_block)
+    result = block_topk(
+        jnp.asarray(scores),
+        jnp.asarray(lengths),
+        k=K,
+        block_size=block,
+        publish=publish,
+        maxima=jnp.asarray(maxima),
+        maxima_block=None if block == maxima_block else maxima_block,
+    )
+    selected = np.asarray(result[0] if publish else result)
+    folded = maxima.reshape(rows, -1, block // maxima_block).max(-1)
+    for row in range(rows):
+        expected = _expected_selection(
+            scores[row], folded[row], lengths[row], block, publish
+        )
+        np.testing.assert_array_equal(selected[row], expected)
