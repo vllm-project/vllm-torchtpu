@@ -45,6 +45,8 @@ def _runner(device, req_ids, step_trimmed):
     )
     manager.step_trimmed = step_trimmed
     runner._adaptive_verification = manager
+    # __init__ sets it; these steps' drafts come from no drafter.
+    runner.drafter = None
     runner._unfenced_h2d_sources = []
     runner._free_h2d_sources = {}
     runner._registered_h2d_sources = set()
