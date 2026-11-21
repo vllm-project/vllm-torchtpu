@@ -226,12 +226,6 @@ _TOL = dict(atol=1.5e-2, rtol=2e-2)
 @pytest.mark.parametrize("seqs", [_SHORT, _LONG], ids=["short", "160k"])
 @pytest.mark.parametrize("kv_dtype", [jnp.float8_e4m3fn, jnp.bfloat16])
 def test_bq1024_prefill_matches_reference(monkeypatch, kv_dtype, seqs):
-    if kv_dtype == jnp.bfloat16 and seqs is _LONG:
-        # Independent of the diet: when this skip was added, the DECODE block
-        # picker chose bkv=1792 for bf16 SEQ_ALONG_LANE at this page-table size
-        # and the RPAd compile overshot TPU7x VMEM by ~28 KB. The served KV
-        # cache at these shapes is fp8, which this case covers at 160k.
-        pytest.skip("RPAd bf16 HND VMEM estimate (pre-existing); fp8 covers 160k")
     inputs, logical, page_table = _setup(kv_dtype, seqs)
     total = int(inputs["cu_q_lens"][-1])
     ref, _, _ = _reference(inputs, logical, seqs)
