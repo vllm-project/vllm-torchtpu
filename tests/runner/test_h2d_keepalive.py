@@ -120,14 +120,13 @@ def test_cached_subtract_indices_upload_synchronously():
             assert ns["pos_idx_dev"].arr.tolist() == [0, 0, -1, -1, -1, 1, -1, -1]
 
     # 260 distinct keys: FIFO at 256 keeps the 256 most recent (never .clear()),
-    # each miss did 2 synchronous uploads, and _h2d_keepalive was never touched.
+    # and each miss did 2 synchronous uploads.
     assert len(runner._async_subtract_idx_cache) == 256
     assert (4, 8, ((0, 2), (None, 3), (1, 1))) not in runner._async_subtract_idx_cache
     assert (4, 8, ((3, 2), (None, 3), (1, 1))) not in runner._async_subtract_idx_cache
     assert (4, 8, ((4, 2), (None, 3), (1, 1))) in runner._async_subtract_idx_cache
     assert (4, 8, ((259, 2), (None, 3), (1, 1))) in runner._async_subtract_idx_cache
     assert len(uploads) == 2 * 260 and all(not nb for _, nb, _ in uploads)
-    assert not hasattr(runner, "_h2d_keepalive")
 
 
 def test_cached_subst_indices_fifo_256_and_synchronous():

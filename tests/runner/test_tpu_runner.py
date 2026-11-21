@@ -2748,6 +2748,9 @@ class TestReorderBatchForRpa:
         runner._reorder_batch_for_rpa = TPUModelRunner._reorder_batch_for_rpa.__get__(
             runner
         )
+        runner._order_prefills_and_publish_swaps = (
+            TPUModelRunner._order_prefills_and_publish_swaps.__get__(runner)
+        )
         return runner
 
     def _batch(self, runner, req_ids, computed=None):
@@ -3385,15 +3388,16 @@ class TestReadOffsetsClearedOnReallocation:
         self._set_batch(runner, ["a", "b"], [5, 6])
         runner._reset_read_offsets_for_new_requests(0, 2)
         assert len(calls) == 1
+        stacked = runner._attn_metadata_builder_ctx._stacked_mamba_groups
+        assert isinstance(stacked, torch.Tensor)
 
         # Second step with the same requests: no new requests and not in
-        # lockstep, so _reset_read_offsets is skipped completely while
-        # ctx._stacked_mamba_groups is still populated for post-verify reuse.
+        # lockstep, so it returns before _reset_read_offsets and before it
+        # touches ctx; the groups the first step stacked stay there for
+        # post-verify reuse.
         runner._reset_read_offsets_for_new_requests(0, 2)
         assert len(calls) == 1
-        assert isinstance(
-            runner._attn_metadata_builder_ctx._stacked_mamba_groups, torch.Tensor
-        )
+        assert runner._attn_metadata_builder_ctx._stacked_mamba_groups is stacked
 
     def test_reuses_pre_stacked_mamba_groups_from_ctx(self, monkeypatch):
         import vllm_torchtpu.runner.tpu_runner as tr_mod

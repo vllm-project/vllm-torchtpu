@@ -946,7 +946,8 @@ def test_async_state_seed_reads_the_previous_batch_row_not_the_source_position()
     fake.scheduler_config = SimpleNamespace(async_scheduling=True)
     fake.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     # In the previous step's batch "a" sits at row 1, the first row of a
-    # second chunk behind a chunk padded to 8 rows.
+    # second chunk behind a chunk padded to 8 rows: its source position is 8,
+    # the first chunk's padded length, while its batch row is 1.
     fake._pre_async_results = SimpleNamespace(
         request_seq_lens=[(0, None, 0, "b"), (1, None, 0, "a")],
         req_id_to_index_copy={"b": 0, "a": 8},

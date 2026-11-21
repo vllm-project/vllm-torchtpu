@@ -416,10 +416,10 @@ def test_async_substitution_uploads_one_index_tensor(fast):
     assert len(runner._unfenced_h2d_sources) == (0 if fast else 2)
 
 
-def test_async_substitution_cache_hits_each_layout_and_evicts_the_oldest():
+def test_async_substitution_cache_hits_each_layout_and_evicts_in_insertion_order():
     """The device copy of each index layout is uploaded once and served again
     from the cache, also after another layout ran in between; at 256 layouts
-    the oldest goes first."""
+    the first inserted goes first, since a hit does not refresh an entry."""
     runner = _substitution_runner(fast=True)
     one = np.zeros(1, dtype=np.int32)
 
@@ -438,7 +438,7 @@ def test_async_substitution_cache_hits_each_layout_and_evicts_the_oldest():
         indices(num_tokens)
     assert len(runner._async_subst_dev_cache) == 256
     assert indices(3) is second
-    indices(4 + 254)  # a 257th layout evicts the oldest, the 2-token one
+    indices(4 + 254)  # a 257th layout evicts the first inserted, the 2-token one
     assert len(runner._async_subst_dev_cache) == 256
     assert indices(3) is second
     assert indices(2) is not first

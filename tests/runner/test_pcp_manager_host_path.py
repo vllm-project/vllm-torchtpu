@@ -69,6 +69,7 @@ def _runner(tokens, most_model_len, manager):
         num_reqs_max_model_len=MAX_MODEL_LEN_REQS,
         num_reqs_most_model_len=MOST_MODEL_LEN_REQS,
         reorder_batch_threshold=1,
+        _uniform_sched_arr_cache={},
         _wait_input_staging_fence=lambda: None,
         get_pcp_planner=lambda: SimpleNamespace(reserve_host_token_capacity=reserve),
     )
