@@ -217,11 +217,17 @@ def iter_leaf_kv_cache_specs(kv_cache_spec):
 def has_multi_shapes_kv_caches(vllm_config: VllmConfig) -> bool:
     """Whether this model's KV cache consists of multiple tensors
     of different shapes.
+
+    Model packages declare such architectures through
+    `multi_shapes_kv.register_multi_shapes_kv_architectures`.
     """
-    return vllm_config.model_config.architecture in (
+    from vllm_torchtpu.offload.multi_shapes_kv import is_multi_shapes_kv_architecture
+
+    architecture = vllm_config.model_config.architecture
+    return architecture in (
         "DeepseekV4ForCausalLM",
         "GlmMoeDsaForCausalLM",
-    )
+    ) or is_multi_shapes_kv_architecture(architecture)
 
 
 class RaidenLoadStoreSpec(LoadStoreSpec):
