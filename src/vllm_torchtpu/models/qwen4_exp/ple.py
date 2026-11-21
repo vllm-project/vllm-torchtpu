@@ -28,6 +28,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -174,6 +175,33 @@ def ngram_ids(
     return torch.cat(blocks, dim=-1)
 
 
+def ragged_tail(
+    rows: torch.Tensor,
+    history: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ends: torch.Tensor,
+) -> torch.Tensor:
+    """Each request's last ``history.shape[1]`` rows of its history followed
+    by the first ``ends[r]`` rows of its chunk.
+
+    ``rows`` is [num_tokens, ...] and ``history`` [num_reqs, length, ...],
+    oldest first. With ``ends`` the query lengths this is the history the
+    next chunk starts from.
+    """
+    num_tokens = rows.shape[0]
+    num_reqs, length = history.shape[:2]
+    starts = query_start_loc[:-1].to(torch.int32)
+    steps = torch.arange(length, dtype=torch.int32, device=rows.device)
+    source = ends.to(torch.int32).unsqueeze(1) - length + steps
+    from_step = rows[(starts.unsqueeze(1) + source).clamp(0, num_tokens - 1)]
+    from_history = history[
+        torch.arange(num_reqs, dtype=torch.int32, device=rows.device).unsqueeze(1),
+        (length + source).clamp(0, length - 1),
+    ]
+    valid = (source >= 0).view(*source.shape, *([1] * (rows.dim() - 1)))
+    return torch.where(valid, from_step.to(history.dtype), from_history)
+
+
 def dilated_short_conv(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -214,18 +242,8 @@ def dilated_short_conv(
         rows = torch.where((source >= 0).unsqueeze(-1), from_step, from_window)
         out = out + rows.float() * weight[:, tap].float()
 
-    # The new window is each request's last `history` inputs.
-    starts = query_start_loc[:-1]
-    query_lens = query_start_loc[1:] - starts
-    steps = torch.arange(history, dtype=torch.int32, device=x.device)
-    source = query_lens.unsqueeze(1) - history + steps
-    from_step = x[(starts.unsqueeze(1) + source).clamp(0, num_tokens - 1)]
-    from_window = windows[
-        torch.arange(num_reqs, dtype=torch.int32, device=x.device).unsqueeze(1),
-        (history + source).clamp(0, history - 1),
-    ]
-    new_windows = torch.where((source >= 0).unsqueeze(-1), from_step, from_window)
-    return out.to(x.dtype), new_windows
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    return out.to(x.dtype), ragged_tail(x, windows, query_start_loc, query_lens)
 
 
 @dataclass(frozen=True)
@@ -242,6 +260,17 @@ class PLEInputs:
     input_ids: torch.Tensor
     query_start_loc: torch.Tensor
     ngram_context: torch.Tensor
+
+
+class PLEOutput(NamedTuple):
+    output: torch.Tensor
+    conv_window: torch.Tensor
+    conv_input: torch.Tensor
+
+
+# TPU gather overflows 32-bit element offsets when a single table exceeds ~2B
+# elements (e.g. 40M x 160 = 6.4B in FP8), returning out-of-bounds memory.
+_MAX_GATHER_ELEMENTS = 1 << 30
 
 
 class Qwen4ExpPLETable(PLEVocabParallelEmbedding):
@@ -269,6 +298,21 @@ class Qwen4ExpPLETable(PLEVocabParallelEmbedding):
         )
         self.embedding_method = embedding_method
         self.output_dtype = torch.get_default_dtype()
+        self._weight_chunks: nn.ParameterList | None = None
+
+    def finalize_weights(self, max_elements: int = _MAX_GATHER_ELEMENTS) -> None:
+        """Splits tables over ``max_elements``: TPU gather offsets are 32-bit."""
+        weight = self._parameters.get("weight")
+        if weight is None or weight.numel() <= max_elements:
+            return
+        chunk_rows = max(1, max_elements // self.embedding_dim)
+        chunks = [
+            nn.Parameter(chunk.clone(), requires_grad=False)
+            for chunk in weight.split(chunk_rows, dim=0)
+        ]
+        self._weight_chunks = nn.ParameterList(chunks)
+        # Drop the monolithic 6.4 GB parameter so only the chunks stay in HBM.
+        self.register_parameter("weight", None)
 
     def allocate_embedding_weight(
         self, num_embeddings: int, embedding_dim: int, dtype: torch.dtype
@@ -293,11 +337,32 @@ class Qwen4ExpPLETable(PLEVocabParallelEmbedding):
             )
             owned = (flat >= start) & (flat < end)
             flat = torch.where(owned, flat - start, 0)
-        rows = self.embedding_method.embedding(self, flat)
-        rows = self.embedding_method.dequantize(self, rows, self.output_dtype)
+        rows = self._gather_rows(flat)
         if owned is not None:
             rows = rows.masked_fill(~owned.unsqueeze(-1), 0)
         return rows.reshape(*ids.shape, self.embedding_dim)
+
+    def _gather_rows(self, flat: torch.Tensor) -> torch.Tensor:
+        """Look up and dequantize local rows, using chunked gather for large tables."""
+        if self._weight_chunks is None:
+            rows = self.embedding_method.embedding(self, flat)
+            return self.embedding_method.dequantize(self, rows, self.output_dtype)
+        rows = torch.zeros(
+            (flat.shape[0], self.embedding_dim),
+            dtype=self.output_dtype,
+            device=flat.device,
+        )
+        offset = 0
+        for chunk in self._weight_chunks:
+            end_chunk = offset + chunk.shape[0]
+            in_chunk = (flat >= offset) & (flat < end_chunk)
+            chunk_rows = F.embedding(torch.where(in_chunk, flat - offset, 0), chunk)
+            chunk_rows = self.embedding_method.dequantize(
+                self, chunk_rows, self.output_dtype
+            )
+            rows = rows + chunk_rows.masked_fill(~in_chunk.unsqueeze(-1), 0)
+            offset = end_chunk
+        return rows
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         rows = self.local_rows(input_)
@@ -528,9 +593,8 @@ class Qwen4ExpPLELayer(nn.Module):
         hidden_states: torch.Tensor,
         inputs: PLEInputs,
         conv_windows: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns the term to add to the hc_count * hidden_size residual, and
-        each request's new conv window (see dilated_short_conv)."""
+    ) -> PLEOutput:
+        """Returns (PLE delta, new conv windows, conv inputs for checkpointing)."""
         num_tokens = hidden_states.shape[0]
         if inputs.input_ids.shape[0] != num_tokens:
             raise ValueError(
@@ -552,8 +616,9 @@ class Qwen4ExpPLELayer(nn.Module):
         gate = dot / math.sqrt(self.hidden_size)
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
         gated_value = (torch.sigmoid(gate) * value.unsqueeze(-2)).flatten(-2)
+        conv_input = self.norm_conv(gated_value)
         conv_output, new_windows = dilated_short_conv(
-            self.norm_conv(gated_value),
+            conv_input,
             self.conv1d.weight[:, 0, :],
             self.conv_dilation,
             conv_windows,
@@ -561,4 +626,4 @@ class Qwen4ExpPLELayer(nn.Module):
             request,
             chunk_pos,
         )
-        return gated_value + F.silu(conv_output), new_windows
+        return PLEOutput(gated_value + F.silu(conv_output), new_windows, conv_input)
