@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """``repetition_penalty`` on the TPU sampler: request tracking, packed bitmask
-scaling math, sync decode integration, and TPU compilation."""
+scaling math, decode integration, and TPU compilation."""
 
 from __future__ import annotations
 
@@ -22,7 +22,11 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
-from runner_output_test_utils import plain_step_runner, run_sample_tokens
+from runner_output_test_utils import (
+    _host_copy_state,
+    plain_step_runner,
+    run_sample_tokens,
+)
 from vllm import SamplingParams
 from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import LogprobsTensors
@@ -33,6 +37,7 @@ from vllm_torchtpu.layers.adapter.sample import repetition_penalty as penalty_op
 from vllm_torchtpu.runner import greedy_top_tokens, min_tokens
 from vllm_torchtpu.runner import repetition_penalty as rep_pen
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner_async_output import AsyncPreResults
 
 NEG_INF = float("-inf")
 
@@ -71,18 +76,9 @@ def _batch(rows: dict[str, tuple[float, list[int]]], order: list[str]):
     )
 
 
-def _tracker_in_mode(vocab_size: int, async_scheduling: bool, spec):
-    return rep_pen.RepetitionPenaltyTracker(
-        vocab_size,
-        8,
-        async_scheduling=async_scheduling,
-        speculative_decoding=spec is not None,
-    )
-
-
 def _tracker(vocab_size: int, max_num_reqs: int = 8):
     return rep_pen.RepetitionPenaltyTracker(
-        vocab_size, max_num_reqs, async_scheduling=False, speculative_decoding=False
+        vocab_size, max_num_reqs, speculative_decoding=False
     )
 
 
@@ -422,7 +418,6 @@ class TestRunnerIntegration:
         runner._repetition_penalty = rep_pen.RepetitionPenaltyTracker(
             vocab_size=16,
             max_num_reqs=4,
-            async_scheduling=False,
             speculative_decoding=False,
         )
 
@@ -437,44 +432,66 @@ class TestRunnerIntegration:
         assert out[1, 5].item() == pytest.approx(1.0)
         assert out[1, 0].item() == pytest.approx(2.0)
 
-    @pytest.mark.parametrize(
-        ("async_scheduling", "spec"), [(True, None), (False, object())]
-    )
-    def test_unsupported_modes_skip_penalty_with_warning(self, async_scheduling, spec):
-        """An unsupported mode logs warning_once, applies nothing and keeps the
-        greedy top-tokens fast path open."""
+    def test_async_step_reads_the_previous_token_not_its_placeholder(self):
+        """Async scheduling: when this step samples, the last output id of
+        `r0` is still the placeholder (0) of the previous step, whose token (5)
+        is in `_pre_async_results`. The runner puts that token in first, so
+        token 5 (3.0) is seen and drops to 2.0, and token 0 (2.8) is not seen
+        and wins. Reading the placeholder would scale token 0 and pick 5."""
+        logits = torch.zeros(1, 8)
+        logits[0, 5], logits[0, 0], logits[0, 2] = 3.0, 2.8, 2.5
+        runner = _penalized_runner(logits)
+        runner.scheduler_config.async_scheduling = True
+        runner._modify_prev_results = TPUModelRunner._modify_prev_results.__get__(
+            runner
+        )
+        request = runner.requests["r0"]
+        request.output_token_ids.append(0)
+        runner._pre_async_results = AsyncPreResults(
+            req_ids=["r0"],
+            next_tokens_tpu=torch.tensor([5]),
+            request_seq_lens=[(0, request, 1, "r0")],
+            discard_sampled_tokens_req_indices=[],
+            req_id_to_index_copy={"r0": 0},
+            copy_state=_host_copy_state([torch.tensor([[5]])], [1]),
+        )
+        out = run_sample_tokens(runner).get_output()
+        assert out.sampled_token_ids == [[0]]
+        # The previous step's token, then this step's placeholder.
+        assert request.output_token_ids == [5, 0]
+
+    def test_speculative_decoding_skips_penalty_with_warning(self):
+        """Speculative decoding logs warning_once, applies nothing and keeps
+        the greedy top-tokens fast path open."""
         runner = _penalized_runner(torch.zeros(1, 8))
-        runner._repetition_penalty = _tracker_in_mode(8, async_scheduling, spec)
+        runner._repetition_penalty = rep_pen.RepetitionPenaltyTracker(
+            8, 8, speculative_decoding=True
+        )
         with patch.object(rep_pen, "logger") as log:
             assert not runner._repetition_penalty.begin_step(runner.input_batch)
         log.warning_once.assert_called_once()
-        assert "async_scheduling=False" in log.warning_once.call_args.args[0]
+        assert "speculative_config" in log.warning_once.call_args.args[0]
         runner.input_batch.all_greedy = True
         runner._greedy_head_owner = object()
         with patch.object(greedy_top_tokens, "step_eligible", return_value=True):
             assert TPUModelRunner._greedy_top_tokens_this_step(runner)
 
     @pytest.mark.parametrize(
-        ("async_scheduling", "spec", "expected"),
+        ("spec", "expected"),
         [
             (
-                False,
                 None,
                 [(8, 12, torch.bfloat16, (8, 1)), (16, 12, torch.bfloat16, (16, 1))],
             ),
-            (True, None, []),
-            (False, object(), []),
+            (object(), []),
         ],
     )
-    def test_precompile_covers_supported_buckets_only(
-        self, async_scheduling, spec, expected
-    ):
+    def test_precompile_covers_supported_buckets_only(self, spec, expected):
         runner = object.__new__(TPUModelRunner)
         runner.num_reqs_paddings = [8, 16]
         runner._repetition_penalty = rep_pen.RepetitionPenaltyTracker(
             vocab_size=12,
             max_num_reqs=16,
-            async_scheduling=async_scheduling,
             speculative_decoding=spec is not None,
         )
         runner.device = torch.device("cpu")
