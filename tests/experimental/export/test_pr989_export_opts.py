@@ -706,3 +706,9 @@ def test_experimental_use_rust_env_default_is_false():
     from vllm_torchtpu import envs
 
     assert envs.VLLM_TPU_EXPERIMENTAL_USE_RUST is False
+    assert envs.VLLM_TPU_STATIC_POOLER is True
+    assert envs.VLLM_TPU_POOLING_KV_CACHE_TOKENS == -1
+    assert envs.VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS == 8
+    assert envs.VLLM_TPU_SRPT_ATTN_WORK_CAP == 0
+    assert envs.VLLM_TPU_SRPT_ATTN_TILE_TOKENS == 32
+    assert envs.VLLM_TPU_MEGAKERNEL == ""

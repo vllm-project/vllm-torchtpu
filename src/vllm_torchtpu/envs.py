@@ -1354,6 +1354,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
+    # Pooling KV cache and static pooler settings.
+    "VLLM_TPU_STATIC_POOLER": env_bool("VLLM_TPU_STATIC_POOLER", default=True),
+    "VLLM_TPU_POOLING_KV_CACHE_TOKENS": env_int("VLLM_TPU_POOLING_KV_CACHE_TOKENS", -1),
+    # SRPT prefill scheduler settings.
+    "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_int(
+        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
+    ),
+    "VLLM_TPU_SRPT_ATTN_WORK_CAP": env_nonnegative_int(
+        "VLLM_TPU_SRPT_ATTN_WORK_CAP", 0
+    ),
+    "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # Megakernel plugin selector.
+    "VLLM_TPU_MEGAKERNEL": env_str("VLLM_TPU_MEGAKERNEL", default=""),
     # Route `vllm serve` through the experimental Rust runtime when true.
     "VLLM_TPU_EXPERIMENTAL_USE_RUST": env_bool("VLLM_TPU_EXPERIMENTAL_USE_RUST"),
     # The rvllm binary; takes the same values as the launcher's --rvllm-binary.
