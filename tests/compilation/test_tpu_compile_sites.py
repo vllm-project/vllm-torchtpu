@@ -202,7 +202,10 @@ def test_the_source_checks_recognize_each_spelling():
 # such a call, so it turns direct dispatch off and every call goes through
 # Dynamo. A change that adds such a site lists it here, so that losing direct
 # dispatch is a decision rather than an accident.
-THROUGH_DYNAMO: list[tuple[str, str]] = []
+THROUGH_DYNAMO: list[tuple[str, str]] = [
+    ("runner.tpu_runner", "_stack_mamba_groups_compiled"),
+    ("spec_decode.eagle3", "Eagle3Proposer._draft_stack_tokens"),
+]
 
 DISABLED = "direct dispatch disabled"
 
