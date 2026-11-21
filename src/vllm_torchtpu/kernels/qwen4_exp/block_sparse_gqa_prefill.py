@@ -43,6 +43,9 @@ VPU_FEATURES = ("mask", "qk16", "pv16", "qkfirst")
 VPU_DEFAULT = ("mask", "qk16", "pv16")
 # Comma-free spellings (recipes pass server env as a comma-separated list).
 VPU_PRESETS = {"1": VPU_DEFAULT, "2": VPU_DEFAULT + ("qkfirst",)}
+# Query rows per group of the VPU path's unit row order (one BF16 sublane tile
+# of queries; two FP32 score vregs per KV segment).
+VPU_ROW_GROUP = 16
 
 
 def vpu_features():
@@ -675,6 +678,26 @@ def _kernel(
 
     # Larger query blocks reuse one resident KV tile across query subtiles.
     num_query_tiles = query_block // query_tile
+    # VPU path: a unit's rows are ordered (token group, query head, token)
+    # instead of (query head, token), so the selection mask of a group's tokens
+    # is one set of vregs that every query head of the group reuses. A row's
+    # arithmetic does not depend on its position: bit-identical. Not with
+    # return_lse: Mosaic cannot regroup the [rows] lse vector that way.
+    grouped = vpu and not return_lse and query_tile % VPU_ROW_GROUP == 0
+    row_group = VPU_ROW_GROUP if grouped else query_tile
+    groups_per_tile = query_tile // row_group
+
+    def to_unit_rows(x):
+        """[q_heads_per_kv, query_tile, ...] -> [unit rows, ...]."""
+        rest = x.shape[2:]
+        x = x.reshape(q_heads_per_kv, groups_per_tile, row_group, *rest)
+        return jnp.swapaxes(x, 0, 1).reshape(q_heads_per_kv * query_tile, *rest)
+
+    def from_unit_rows(x):
+        """[unit rows, ...] -> [query_tile, q_heads_per_kv, ...]."""
+        rest = x.shape[1:]
+        x = x.reshape(groups_per_tile, q_heads_per_kv, row_group, *rest)
+        return jnp.swapaxes(x, 1, 2).reshape(query_tile, q_heads_per_kv, *rest)
 
     def init_state():
         # Preserve -inf initialization and all-masked-row guards exactly.
@@ -949,6 +972,17 @@ def _kernel(
                     acc * alpha[:, None] + weighted
                 )
 
+    if vpu:
+        # Each unit's query rows in unit order, built once per query block.
+        source = q16_vpu if "qk16" in vpu else q
+        unit_queries = [
+            [
+                to_unit_rows(source[head, :, start : start + query_tile])
+                for head in range(kv_heads)
+            ]
+            for start in range(0, query_block, query_tile)
+        ]
+
     def compute_tile_vpu(tile, kv_ref, boundary):
         """compute_tile with less vector work per score (VLLM_TPU_QSA_PREFILL_VPU).
 
@@ -1002,15 +1036,10 @@ def _kernel(
                 value = value.astype(jnp.bfloat16)
             key_values.append((key, value))
         rows = query_tile * q_heads_per_kv
-        source = q16_vpu if "qk16" in vpu else q
 
         def qk(query_tile_index, head, key):
-            start = query_tile_index * query_tile
-            query = source[head, :, start : start + query_tile].reshape(
-                rows, head_dim
-            )
             return lax.dot(
-                query,
+                unit_queries[query_tile_index][head],
                 key,
                 dimension_numbers=(([1], [1]), ([], [])),
                 preferred_element_type=jnp.float32,
@@ -1047,8 +1076,8 @@ def _kernel(
             if "qk16" in vpu and not scale_folded:
                 score = score * score_scale
             row_visible = jnp.broadcast_to(
-                tile_visible[None, :, :],
-                (q_heads_per_kv, query_tile, kv_tile),
+                tile_visible.reshape(groups_per_tile, 1, row_group, kv_tile),
+                (groups_per_tile, q_heads_per_kv, row_group, kv_tile),
             ).reshape(rows, kv_tile)
             score = jnp.where(row_visible, score, -jnp.inf)
             next_m = jnp.maximum(m, jnp.max(score, axis=1))
@@ -1134,11 +1163,14 @@ def _kernel(
             for head in range(kv_heads):
                 mass = state(query_tile_index, head, "mass")
                 acc = accumulator_ref[query_tile_index, head, :, :]
+                # The value scale is applied once here, not per KV tile.
+                scaled = acc * (v_scale / jnp.where(mass == 0, 1, mass))[:, None]
                 heads.append(
-                    # The value scale is applied once here, not per KV tile.
-                    (acc * (v_scale / jnp.where(mass == 0, 1, mass))[:, None])
-                    .reshape(q_heads_per_kv, query_tile, head_dim)
-                    .transpose(1, 0, 2)
+                    from_unit_rows(scaled)
+                    if grouped
+                    else scaled.reshape(q_heads_per_kv, query_tile, head_dim).transpose(
+                        1, 0, 2
+                    )
                 )
             output_tiles.append(jnp.concatenate(heads, axis=1))
         output_ref[...] = jnp.concatenate(output_tiles, axis=0).astype(
