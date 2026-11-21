@@ -117,8 +117,7 @@ def test_the_float_decode_is_exact_below_max_pairs(divisor):
     """The scatter floors pair // divisor as (pair + FLOOR_NUDGE) times the
     float32 inverse, truncated. That is exact for every pair number below
     MAX_PAIRS, at the divisors the layer uses (pair words and message tokens
-    per shard) and at awkward ones; with divisor 1000 it first goes wrong
-    at 5,386,999, about 1.28 x 2**22, so the bound cannot be twice as high."""
+    per shard) and at awkward ones."""
     pair = np.arange(row_tables_kernel.MAX_PAIRS, dtype=np.int64)
     inverse = np.float32(1.0 / divisor)
     nudged = pair.astype(np.float32) + np.float32(row_tables_kernel.FLOOR_NUDGE)
