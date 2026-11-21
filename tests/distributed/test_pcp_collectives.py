@@ -257,10 +257,8 @@ def _pcp_mesh_environment(monkeypatch, layout_holder, world_size=2):
             )
         ),
     )
-    from torch_tpu._internal import pallas as pallas_module
-
     get_pallas_mesh = Mock(side_effect=lambda **kwargs: object())
-    monkeypatch.setattr(pallas_module, "get_pallas_mesh", get_pallas_mesh)
+    monkeypatch.setattr(torch.tpu.pallas, "get_pallas_mesh", get_pallas_mesh)
     return get_pallas_mesh
 
 
@@ -306,7 +304,6 @@ def _stage_mesh_environment(monkeypatch, holder, mesh_device_ids):
         world_size=2, rank_in_group=0, ranks=[2, 3], device_group=object()
     )
     monkeypatch.setattr(parallel_state, "get_pcp_group", lambda: group)
-    from torch_tpu._internal import pallas as pallas_module
 
     mesh = SimpleNamespace(
         devices=SimpleNamespace(
@@ -314,7 +311,7 @@ def _stage_mesh_environment(monkeypatch, holder, mesh_device_ids):
         )
     )
     get_pallas_mesh = Mock(return_value=mesh)
-    monkeypatch.setattr(pallas_module, "get_pallas_mesh", get_pallas_mesh)
+    monkeypatch.setattr(torch.tpu.pallas, "get_pallas_mesh", get_pallas_mesh)
     return group, mesh, get_pallas_mesh
 
 
