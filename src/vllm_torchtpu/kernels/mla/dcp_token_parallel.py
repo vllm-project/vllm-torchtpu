@@ -533,6 +533,13 @@ def restride_flat_rows(
     return jnp.where(flat >= 0, owner * (cap * layout.page_size) + rest, -1)
 
 
+# Avoid axis=0 all-gather below the 8 MiB SparseCore offload floor (TC
+# all-gather on axis=3, tiled=True drops the post-AG transpose for cap<=12),
+# and avoid axis=3 above 8 MiB (SparseCore all-gather on axis=0 avoids
+# inner-axis scatter overhead for cap>=16).
+_PACKED_INDEX_K_AXIS0_AG_MIN_BYTES = 8 << 20
+
+
 def _gather_index_k_pages(
     cache: jax.Array,
     page_ids: jax.Array,
@@ -541,9 +548,32 @@ def _gather_index_k_pages(
     il: int,
     ps: int,
     axis_name: str,
+    *,
+    packed_u32: bool = False,
+    axis0_ag_min_bytes: int = _PACKED_INDEX_K_AXIS0_AG_MIN_BYTES,
 ) -> jax.Array:
     local = cache[page_ids[:cap]]
     rows = local.shape[1]
+    if packed_u32:
+        u32_local = lax.bitcast_convert_type(jnp.swapaxes(local, 2, 3), jnp.uint32)
+        if ps % (dcp * il) == 0:
+            blocks = ps // (dcp * il)
+            u32_blk = u32_local.reshape(cap, rows, dcp, blocks, il)
+            if cap * dcp * rows * ps * 4 >= axis0_ag_min_bytes:
+                packed = jnp.transpose(u32_blk, (0, 2, 1, 3, 4)).reshape(
+                    cap * dcp, rows, blocks, il
+                )
+                g = lax.all_gather(packed, axis_name, axis=0, tiled=False)
+                return jnp.transpose(g, (1, 2, 3, 0, 4)).reshape(cap * dcp, rows, ps)
+            packed = jnp.transpose(u32_blk, (0, 2, 1, 3, 4)).reshape(
+                cap * dcp, rows, blocks, 1, il
+            )
+            g = lax.all_gather(packed, axis_name, axis=3, tiled=True)
+            return g.reshape(cap * dcp, rows, ps)
+        g = lax.all_gather(
+            u32_local.reshape(cap, rows, ps // il, il), axis_name, axis=3
+        )
+        return g.reshape(cap, rows, dcp, ps).swapaxes(1, 2).reshape(cap * dcp, rows, ps)
     if il == 4 and ps % (dcp * il) == 0:
         # Avoid gathering along inner axis=3 on u32[cap, rows, ps // il, il]:
         # XLA emits two full-buffer post-AG layout copies plus an unpack fusion
@@ -1732,6 +1762,7 @@ def indexer_topk(
     rank_ids: jax.Array | None = None,
     q_own_rows: bool = False,
     flat_topk_cap_strided: bool = False,
+    index_k_packed_u32: bool = False,
 ) -> jax.Array:
     """Token-parallel indexer top-k for one layer (global view).
 
@@ -1766,7 +1797,14 @@ def indexer_topk(
         def branch(cap: int) -> Callable[[], jax.Array]:
             def run() -> jax.Array:
                 nat = _gather_index_k_pages(
-                    cache, page_ids, cap, dcp, il, ps, axis_name
+                    cache,
+                    page_ids,
+                    cap,
+                    dcp,
+                    il,
+                    ps,
+                    axis_name,
+                    packed_u32=index_k_packed_u32,
                 )
                 # Avoid hoisting natural_page_table above branch(cap): full
                 # vpages_per_seq width inflates score buffers to max_pages * dcp
@@ -1841,6 +1879,7 @@ def _unified_indexer_mla_core(
     w_o: jax.Array | None = None,
     w_o_scale: jax.Array | None = None,
     epilogue_3d: bool = True,
+    index_k_packed_u32: bool = False,
 ) -> tuple[jax.Array, ...]:
     if (w_o is None) != (w_o_scale is None):
         raise ValueError("w_o and w_o_scale must be passed together")
@@ -1915,7 +1954,14 @@ def _unified_indexer_mla_core(
         def branch(cap: int) -> Callable[[], tuple[Any, jax.Array, jax.Array]]:
             def run() -> tuple[Any, jax.Array, jax.Array]:
                 nat = _gather_index_k_pages(
-                    idx_cache, idx_page_ids, cap, dcp, il, ps, axis_name
+                    idx_cache,
+                    idx_page_ids,
+                    cap,
+                    dcp,
+                    il,
+                    ps,
+                    axis_name,
+                    packed_u32=index_k_packed_u32,
                 )
                 table = natural_page_table(
                     layout, rr, offsets, idx_vpages_per_seq, cap=cap
@@ -2083,6 +2129,7 @@ def unified_indexer_mla_with_lead(
     read_pages: tuple[ReadPagesFn, ReadPagesFn] = (take_pages, take_pages),
     w_uv_replicated: bool = False,
     tie_after_idx_max_cap: int = 0,
+    index_k_packed_u32: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Run token-parallel indexer top-k, latent gather, lead merge, and MLA together.
 
@@ -2116,6 +2163,7 @@ def unified_indexer_mla_with_lead(
         read_pages=read_pages,
         w_uv_replicated=w_uv_replicated,
         tie_after_idx_max_cap=tie_after_idx_max_cap,
+        index_k_packed_u32=index_k_packed_u32,
     )
     return own_v, lead_v, flat
 
@@ -2150,6 +2198,7 @@ def unified_indexer_mla_with_lead_oproj(
     w_uv_replicated: bool = False,
     tie_after_idx_max_cap: int = 0,
     epilogue_3d: bool = True,
+    index_k_packed_u32: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Run unified indexer + sparse MLA + sequence-row o_proj in one shard_map."""
     projected, flat = _unified_indexer_mla_core(
@@ -2181,6 +2230,7 @@ def unified_indexer_mla_with_lead_oproj(
         w_o=w_o,
         w_o_scale=w_o_scale,
         epilogue_3d=epilogue_3d,
+        index_k_packed_u32=index_k_packed_u32,
     )
     return projected, flat
 
@@ -2581,6 +2631,7 @@ def _unified_indexer_in_branch_qb_core(
     w_o: jax.Array | None = None,
     w_o_scale: jax.Array | None = None,
     epilogue_3d: bool = True,
+    index_k_packed_u32: bool = False,
 ) -> tuple[jax.Array, ...]:
     if (w_o is None) != (w_o_scale is None):
         raise ValueError("w_o and w_o_scale must be passed together")
@@ -2658,7 +2709,14 @@ def _unified_indexer_in_branch_qb_core(
         def branch(cap: int) -> Callable[[], tuple[jax.Array, jax.Array, jax.Array]]:
             def run() -> tuple[jax.Array, jax.Array, jax.Array]:
                 nat = _gather_index_k_pages(
-                    idx_cache, idx_page_ids, cap, dcp, il, ps, axis_name
+                    idx_cache,
+                    idx_page_ids,
+                    cap,
+                    dcp,
+                    il,
+                    ps,
+                    axis_name,
+                    packed_u32=index_k_packed_u32,
                 )
                 table = natural_page_table(
                     layout, rr, offsets, idx_vpages_per_seq, cap=cap
@@ -2842,6 +2900,7 @@ def unified_indexer_in_branch_qb_mla(
     w_uv_replicated: bool = False,
     tie_after_idx_max_cap: int = 12,
     tie_lead_min_cap: int = 0,
+    index_k_packed_u32: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Run indexer top-k, in-branch `q_b`, lead MLA, and tail MLA in one cap switch.
 
@@ -2878,6 +2937,7 @@ def unified_indexer_in_branch_qb_mla(
         w_uv_replicated=w_uv_replicated,
         tie_after_idx_max_cap=tie_after_idx_max_cap,
         tie_lead_min_cap=tie_lead_min_cap,
+        index_k_packed_u32=index_k_packed_u32,
     )
     return own_v, lead_v, flat
 
@@ -2917,6 +2977,7 @@ def unified_indexer_in_branch_qb_mla_oproj(
     tie_after_idx_max_cap: int = 12,
     tie_lead_min_cap: int = 0,
     epilogue_3d: bool = True,
+    index_k_packed_u32: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Run indexer top-k, in-branch `q_b`, MLA, and `o_proj` in one `shard_map`."""
     attn_out, flat = _unified_indexer_in_branch_qb_core(
@@ -2953,5 +3014,6 @@ def unified_indexer_in_branch_qb_mla_oproj(
         w_o=w_o,
         w_o_scale=w_o_scale,
         epilogue_3d=epilogue_3d,
+        index_k_packed_u32=index_k_packed_u32,
     )
     return attn_out, flat

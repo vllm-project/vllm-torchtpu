@@ -485,6 +485,7 @@ def build_unified_indexer_attention_op(
             w_uv_replicated=True,
             tie_after_idx_max_cap=tie_after_idx_max_cap,
             epilogue_3d=envs.TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT,
+            index_k_packed_u32=True,
         )
         full_topk = jax.shard_map(
             lambda h, t: jnp.concatenate([h, t], axis=0),

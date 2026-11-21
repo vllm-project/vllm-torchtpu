@@ -14,6 +14,7 @@
 """Tests for Deepseek V4 StreamIndex Top-K kernel."""
 
 import functools
+import importlib
 from typing import NamedTuple
 
 import jax
@@ -1850,3 +1851,65 @@ def test_should_compute_exact_effective_row_lengths_for_mixed_and_padded_batches
             )
             expected[tok] = min(vis, num_positions)
     np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize("decode_page_major", [True, False])
+def test_should_trace_packed_u32_seq_along_lane_kernels_and_reject_bad_shape(
+    monkeypatch: pytest.MonkeyPatch, decode_page_major: bool
+) -> None:
+    from jax._src.pallas.mosaic import (
+        tpu_info as ti,  # noqa: PLC0415 -- CPU-only trace helper needs target TPU info
+    )
+    from jax.experimental.pallas import (
+        tpu as pltpu,  # noqa: PLC0415 -- CPU-only trace helper needs target TPU info
+    )
+
+    st_mod = importlib.import_module(
+        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+    )
+
+    info = ti.get_tpu_info_for_chip(ti.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    monkeypatch.setattr(ti, "get_tpu_info", lambda: info)
+    monkeypatch.setattr(
+        st_mod,
+        "sparsecore_topk",
+        lambda scores, k, *a, **kw: jnp.zeros((scores.shape[0], k), jnp.int32),
+    )
+
+    def _run(q, w, kv, sl, pt, qsl, dist):
+        return streamindex_topk(
+            q,
+            w,
+            kv,
+            sl,
+            pt,
+            qsl,
+            dist,
+            k=2048,
+            compression_ratio=1,
+            kv_layout=KVLayout.SEQ_ALONG_LANE,
+            num_queries_per_block=128,
+            num_kv_pages_per_block=8,
+            chunk_tokens=128,
+            decode_as_mixed=True,
+            enable_early_exit=False,
+            decode_page_major=decode_page_major,
+        )
+
+    args = (
+        jax.ShapeDtypeStruct((1024, 32, 128), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((1024, 32), jnp.bfloat16),
+        jax.ShapeDtypeStruct((64, 33, 256), jnp.uint32),
+        jax.ShapeDtypeStruct((64,), jnp.int32),
+        jax.ShapeDtypeStruct((64 * 16,), jnp.int32),
+        jax.ShapeDtypeStruct((65,), jnp.int32),
+        jax.ShapeDtypeStruct((3,), jnp.int32),
+    )
+    traced = jax.jit(_run).trace(*args)
+    jaxpr_txt = str(traced.jaxpr)
+    assert ("-pm" in jaxpr_txt) is decode_page_major
+
+    bad_args = (*args[:2], jax.ShapeDtypeStruct((64, 32, 256), jnp.uint32), *args[3:])
+    with pytest.raises(ValueError, match="SEQ_ALONG_LANE packed u32 expects"):
+        jax.jit(_run).trace(*bad_args)

@@ -1315,11 +1315,11 @@ def test_should_select_lead_streamidx_decode_as_mixed_when_split_rows_aligned(
 
 
 @pytest.mark.parametrize(
-    ("nat_shape", "topk", "want_early_exit"),
+    ("nat_shape", "topk", "want_early_exit", "want_page_major"),
     [
-        ((16, 33, 4, 256), 2048, True),
-        ((32, 33, 4, 256), 2048, False),
-        ((128, 33, 256), 2048, False),
+        ((16, 33, 4, 256), 2048, True, None),
+        ((32, 33, 4, 256), 2048, False, None),
+        ((128, 33, 256), 2048, False, True),
     ],
 )
 def test_should_disable_streamidx_early_exit_on_multi_page_cap_branches(
@@ -1327,12 +1327,15 @@ def test_should_disable_streamidx_early_exit_on_multi_page_cap_branches(
     nat_shape: tuple[int, ...],
     topk: int,
     want_early_exit: bool,
+    want_page_major: bool | None,
 ) -> None:
-    seen: list[bool] = []
+    seen: list[tuple[bool, bool | None]] = []
 
     def _fake_streamindex_topk(*args, **kwargs):
         del args
-        seen.append(bool(kwargs["enable_early_exit"]))
+        seen.append(
+            (bool(kwargs["enable_early_exit"]), kwargs.get("decode_page_major"))
+        )
         return jnp.zeros((16, topk), dtype=jnp.int32)
 
     monkeypatch.setattr(tp_op_mod, "streamindex_topk", _fake_streamindex_topk)
@@ -1360,7 +1363,7 @@ def test_should_disable_streamidx_early_exit_on_multi_page_cap_branches(
         rr,
         jnp.zeros((4, 16), dtype=jnp.int32),
     )
-    assert seen == [want_early_exit]
+    assert seen == [(want_early_exit, want_page_major)]
 
 
 @pytest.mark.parametrize(
@@ -1413,10 +1416,10 @@ def test_should_forward_lead_decode_as_mixed_in_unified_idx_qb_op(
         lambda n, r, *a, **kw: (n, r),
     )
 
-    class _StopAfterLead(Exception):
-        pass
-
+    shd = NamedSharding(mesh, P(AXIS))
+    rep = NamedSharding(mesh, P())
     seen: list[tuple[tuple[int, int, int], tuple[int, int, int], bool]] = []
+    seen_u32: list[bool] = []
 
     def _capture_lead(*args, **kwargs):
         del args
@@ -1427,14 +1430,27 @@ def test_should_forward_lead_decode_as_mixed_in_unified_idx_qb_op(
                 kwargs["decode_as_mixed"],
             )
         )
-        raise _StopAfterLead()
+        return jax.device_put(jnp.zeros((4 * split_rows, TOPK), jnp.int32), shd)
+
+    def _capture_unified(*args, **kwargs):
+        del args
+        seen_u32.append(bool(kwargs.get("index_k_packed_u32", False)))
+        return (
+            jax.device_put(jnp.zeros((64, 32), jnp.bfloat16), shd),
+            jax.device_put(jnp.zeros((64, TOPK), jnp.int32), shd),
+        )
 
     monkeypatch.setattr(unified_qb_mod, "streamindex_topk_dcp", _capture_lead)
+    monkeypatch.setattr(tp, "unified_indexer_in_branch_qb_mla_oproj", _capture_unified)
     spec_n = types.SimpleNamespace(
-        page_size=32, layout=types.SimpleNamespace(value="xla")
+        page_size=32, num_pages=4, layout=types.SimpleNamespace(value="xla")
     )
     spec_r = types.SimpleNamespace(
-        page_size=32, layout=spec_n.layout, packed_rope=False
+        page_size=32,
+        num_pages=4,
+        token_bytes=16,
+        layout=spec_n.layout,
+        packed_rope=False,
     )
 
     class _FakeLayer:
@@ -1461,32 +1477,30 @@ def test_should_forward_lead_decode_as_mixed_in_unified_idx_qb_op(
         layer, impl, indexer_op, layout, q_replicated=True, callbacks=cb
     )
     assert built is not None
-    shd = NamedSharding(mesh, P(AXIS))
-    rep = NamedSharding(mesh, P())
-    with pytest.raises(_StopAfterLead):
-        captured_fn[0](
-            jax.device_put(jnp.zeros((16, 3, 4, 32), jnp.uint8), shd),
-            jax.device_put(jnp.zeros((16, 32, 8), jnp.bfloat16), shd),
-            jax.device_put(jnp.zeros((16, 8, 16), jnp.bfloat16), shd),
-            jax.device_put(jnp.zeros((4 * (16 + split_rows), 2, 12), jnp.uint8), shd),
-            jax.device_put(jnp.ones((4 * (16 + split_rows), 2), jnp.bfloat16), shd),
-            jax.device_put(jnp.zeros((64, 13), jnp.uint8), rep),
-            jax.device_put(jnp.zeros((4 * (16 + split_rows), 12), jnp.bfloat16), shd),
-            jax.device_put(jnp.zeros((12, 48), jnp.float8_e4m3fn), rep),
-            jax.device_put(jnp.ones((48,), jnp.float32), rep),
-            jax.device_put(jnp.ones((4, 8, 8), jnp.bfloat16), rep),
-            jax.device_put(jnp.zeros((4 * (16 + split_rows), 4), jnp.bfloat16), shd),
-            jax.device_put(jnp.zeros((64, 8), jnp.bfloat16), rep),
-            jax.device_put(jnp.zeros((64, 4), jnp.bfloat16), rep),
-            jax.device_put(jnp.zeros((8,), jnp.int32), rep),
-            jax.device_put(jnp.zeros((16,), jnp.int32), rep),
-            jax.device_put(jnp.zeros((16,), jnp.int32), rep),
-            jax.device_put(jnp.zeros((9,), jnp.int32), rep),
-            jax.device_put(jnp.array([0, 0, 1], jnp.int32), rep),
-            jax.device_put(jnp.array([0, 0, 1], jnp.int32), rep),
-            jax.device_put(jnp.arange(4, dtype=jnp.int32), shd),
-            jax.device_put(jnp.ones((4, 8, 6), jnp.bfloat16), rep),
-            jax.device_put(jnp.zeros((24, 32), jnp.float8_e4m3fn), shd),
-            jax.device_put(jnp.ones((32,), jnp.float32), shd),
-        )
+    captured_fn[0](
+        jax.device_put(jnp.zeros((16, 3, 4, 32), jnp.uint8), shd),
+        jax.device_put(jnp.zeros((16, 32, 8), jnp.bfloat16), shd),
+        jax.device_put(jnp.zeros((16, 8, 16), jnp.bfloat16), shd),
+        jax.device_put(jnp.zeros((4 * (16 + split_rows), 2, 12), jnp.uint8), shd),
+        jax.device_put(jnp.ones((4 * (16 + split_rows), 2), jnp.bfloat16), shd),
+        jax.device_put(jnp.zeros((64, 13), jnp.uint8), rep),
+        jax.device_put(jnp.zeros((4 * (16 + split_rows), 12), jnp.bfloat16), shd),
+        jax.device_put(jnp.zeros((12, 48), jnp.float8_e4m3fn), rep),
+        jax.device_put(jnp.ones((48,), jnp.float32), rep),
+        jax.device_put(jnp.ones((4, 8, 8), jnp.bfloat16), rep),
+        jax.device_put(jnp.zeros((4 * (16 + split_rows), 4), jnp.bfloat16), shd),
+        jax.device_put(jnp.zeros((64, 8), jnp.bfloat16), rep),
+        jax.device_put(jnp.zeros((64, 4), jnp.bfloat16), rep),
+        jax.device_put(jnp.zeros((8,), jnp.int32), rep),
+        jax.device_put(jnp.zeros((16,), jnp.int32), rep),
+        jax.device_put(jnp.zeros((16,), jnp.int32), rep),
+        jax.device_put(jnp.zeros((9,), jnp.int32), rep),
+        jax.device_put(jnp.array([0, 0, 1], jnp.int32), rep),
+        jax.device_put(jnp.array([0, 0, 1], jnp.int32), rep),
+        jax.device_put(jnp.arange(4, dtype=jnp.int32), shd),
+        jax.device_put(jnp.ones((4, 8, 6), jnp.bfloat16), rep),
+        jax.device_put(jnp.zeros((24, 32), jnp.float8_e4m3fn), shd),
+        jax.device_put(jnp.ones((32,), jnp.float32), shd),
+    )
     assert seen == [((2, 2, 32), want_bq, want_dam)]
+    assert seen_u32 == [True]

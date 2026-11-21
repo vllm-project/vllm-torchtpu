@@ -533,6 +533,7 @@ def build_unified_indexer_in_branch_qb_op(
             tie_after_idx_max_cap=tie_after_idx_max_cap,
             tie_lead_min_cap=0,
             epilogue_3d=epilogue_3d,
+            index_k_packed_u32=True,
         )
         full_topk = jax.shard_map(
             lambda h, t: jnp.concatenate([h, t], axis=0),

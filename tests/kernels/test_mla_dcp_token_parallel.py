@@ -31,7 +31,7 @@ import jax.extend.core
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.mla import dcp_token_parallel as tp
@@ -817,3 +817,95 @@ def test_should_match_divmod_reference_for_flat_rows_power_of_two_and_fallback(
                 page = owner * stride_pages + ro + (p // vps)
                 want[r, c] = page * ps + slot
     np.testing.assert_array_equal(got, want)
+
+
+@pytest.mark.parametrize("axis0_ag_min_bytes", [0, 1 << 30])
+@pytest.mark.parametrize(("dcp", "il", "ps"), [(4, 4, 32), (4, 4, 12)])
+def test_should_gather_packed_u32_index_k_bit_exact_across_ag_modes(
+    axis0_ag_min_bytes: int, dcp: int, il: int, ps: int
+) -> None:
+    mesh = _mesh(dcp)
+    cap, rows, num_pages = 2, 5, 6
+    rng = np.random.default_rng(1170 + dcp * 31 + ps * 7)
+    cache_np = rng.integers(0, 256, size=(dcp * num_pages, rows, 4, ps), dtype=np.uint8)
+    page_ids_np = np.array([3, 1, 5, 0], dtype=np.int32)
+    shd = NamedSharding(mesh, P(AXIS))
+    rep = NamedSharding(mesh, P())
+    cache = jax.device_put(jnp.asarray(cache_np), shd)
+    page_ids = jax.device_put(jnp.asarray(page_ids_np), rep)
+
+    def _run(c, pids):
+        ref_u8 = tp._gather_index_k_pages(  # noqa: SLF001 -- direct unit parity check between u8 and packed u32 index-K gather modes
+            c, pids, cap, dcp, il, ps, AXIS, packed_u32=False
+        )
+        got_u32 = tp._gather_index_k_pages(  # noqa: SLF001 -- direct unit parity check between u8 and packed u32 index-K gather modes
+            c,
+            pids,
+            cap,
+            dcp,
+            il,
+            ps,
+            AXIS,
+            packed_u32=True,
+            axis0_ag_min_bytes=axis0_ag_min_bytes,
+        )
+        want_u32 = jax.lax.bitcast_convert_type(jnp.swapaxes(ref_u8, 2, 3), jnp.uint32)
+        return got_u32, want_u32
+
+    got, want = jax.jit(
+        jax.shard_map(
+            _run,
+            mesh=mesh,
+            in_specs=(P(AXIS), P()),
+            out_specs=(P(), P()),
+            check_vma=False,
+        )
+    )(cache, page_ids)
+    assert got.shape == (cap * dcp, rows, ps)
+    assert got.dtype == jnp.uint32
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def test_should_match_u8_indexer_topk_when_index_k_packed_u32_enabled() -> None:
+    dcp = 4
+    mesh = _mesh(dcp)
+    case = CASES[dcp]
+    lay, num_tokens = case["layout"], case["num_tokens"]
+    st = Step(lay, num_tokens, case["reqs"], seed=117)
+    rng = np.random.default_rng(118)
+    q = jnp.asarray(
+        rng.standard_normal((num_tokens, 1, IDX_ROWS * IDX_SUB)).astype(np.float32)
+    )
+    weights = jnp.ones((num_tokens, 1), jnp.float32)
+    ref_select = _select_topk_ref(lay)
+
+    def _select_from_u32(q_r, w_r, natural, rr, table):
+        assert natural.ndim == 3 and natural.dtype == jnp.uint32
+        u8 = jnp.swapaxes(jax.lax.bitcast_convert_type(natural, jnp.uint8), 2, 3)
+        return ref_select(q_r, w_r, u8, rr, table)
+
+    args = (
+        jax.device_put(jnp.asarray(st.idx_cache), NamedSharding(mesh, P(AXIS))),
+        q,
+        weights,
+        *st.args(),
+    )
+    want = tp.indexer_topk(
+        lay,
+        mesh,
+        AXIS,
+        *args,
+        select_topk=ref_select,
+        flat_topk_cap_strided=True,
+        index_k_packed_u32=False,
+    )
+    got = tp.indexer_topk(
+        lay,
+        mesh,
+        AXIS,
+        *args,
+        select_topk=_select_from_u32,
+        flat_topk_cap_strided=True,
+        index_k_packed_u32=True,
+    )
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))

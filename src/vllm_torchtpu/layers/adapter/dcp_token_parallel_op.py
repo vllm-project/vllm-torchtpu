@@ -418,6 +418,11 @@ def make_select_topk(
         # length, and dropping the cond wrapper frees XLA to overlap the last
         # chunk's SparseCore top-k wait with downstream ops.
         enable_early_exit = mla_op.STREAMIDX_ENABLE_EARLY_EXIT and kv_tokens <= 2 * topk
+        u32_sal = (
+            kv_layout == KVLayout.SEQ_ALONG_LANE
+            and natural.ndim == 3
+            and natural.dtype == jnp.uint32
+        )
         zero = jnp.int32(0)
         # Avoid decode_as_mixed=False on [0, 0, rr.num_seqs]: builds two dead
         # decode schedules and compiles an unreachable distribution[1] > 0 cond.
@@ -439,6 +444,7 @@ def make_select_topk(
             kv_layout=kv_layout,
             chunk_tokens=tp_chunk_tokens,
             decode_pack=decode_pack,
+            decode_page_major=True if u32_sal else None,
             shared_meta=shared_meta,
             decode_as_mixed=True,
         )
@@ -1918,6 +1924,7 @@ def build_indexer_op(
                 rank_ids=rank_ids,
                 q_own_rows=q_own_rows,
                 flat_topk_cap_strided=True,
+                index_k_packed_u32=(kv_layout == KVLayout.SEQ_ALONG_LANE),
             )
             return cache_kv, flat
 
@@ -2008,6 +2015,7 @@ def build_indexer_op(
             rank_ids=rank_ids,
             q_own_rows=q_own_rows,
             flat_topk_cap_strided=True,
+            index_k_packed_u32=(kv_layout == KVLayout.SEQ_ALONG_LANE),
         )
         full = jax.shard_map(
             lambda h, t: jnp.concatenate([h, t], axis=0),

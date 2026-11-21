@@ -230,11 +230,20 @@ def kernel(
 
     _, num_q_heads, head_dim = q_hbm_ref.shape
 
+    u32_sal = (
+        seq_along_lane
+        and cache_kv_hbm_ref.ndim == 3
+        and cache_kv_hbm_ref.dtype == jnp.uint32
+    )
     if seq_along_lane:
-        # [total_num_pages, kv_sublane_groups, kv_packing, page_size] where the
-        # leading `head_dim` sublane rows hold the FP8 key bytes and the next row
-        # holds the per-token UE8M0 scale.
-        (_, kv_sublane_groups, kv_packing, page_size) = cache_kv_hbm_ref.shape
+        if u32_sal:
+            (_, kv_sublane_groups, page_size) = cache_kv_hbm_ref.shape
+            kv_packing = 4
+        else:
+            # [total_num_pages, kv_sublane_groups, kv_packing, page_size] where the
+            # leading `head_dim` sublane rows hold the FP8 key bytes and the next row
+            # holds the per-token UE8M0 scale.
+            (_, kv_sublane_groups, kv_packing, page_size) = cache_kv_hbm_ref.shape
         kv_head_dim_groups = head_dim // kv_packing
         page_size_per_kv_packing = page_size // kv_packing
     else:
@@ -313,7 +322,7 @@ def kernel(
     page_major = (
         decode_page_major
         and seq_along_lane
-        and not prefill_cfg.enabled
+        and (u32_sal or not prefill_cfg.enabled)
         and seq_batch_size == 1
         and page_size % 128 == 0
     )
@@ -328,7 +337,33 @@ def kernel(
         lambda p_id: (seq_tile(p_id), bq_block(p_id), 0),
         pipeline_mode=pl.Buffered(buffer_count=buffer_cnt, use_lookahead=True),
     )
-    if seq_along_lane and page_major:
+    if u32_sal and page_major:
+        assert kv_sublane_groups is not None
+        # Avoid 3D flat u32 [1, 33, bkv_sz] or u8 bitcast+reshape on prefill:
+        # 4D u32 [1, bkv_p, 33, page_size] copies each page contiguously and
+        # slices u32[32, 128] with stride=1 without memref_reshape errors.
+        kv_spec = pl.BlockSpec(
+            (
+                pl.BoundedSlice(seq_batch_size),
+                bkv_p,
+                kv_sublane_groups,
+                page_size,
+            ),
+            lambda p_id: (seq_tile(p_id), bkv_block(p_id), 0, 0),
+            pipeline_mode=pl.Buffered(buffer_count=buffer_cnt, use_lookahead=True),
+        )
+    elif u32_sal:
+        assert kv_sublane_groups is not None
+        kv_spec = pl.BlockSpec(
+            (
+                pl.BoundedSlice(seq_batch_size),
+                kv_sublane_groups,
+                bkv_sz,
+            ),
+            lambda p_id: (seq_tile(p_id), 0, bkv_block(p_id)),
+            pipeline_mode=pl.Buffered(buffer_count=buffer_cnt, use_lookahead=True),
+        )
+    elif seq_along_lane and page_major:
         assert kv_sublane_groups is not None
         kv_spec = pl.BlockSpec(
             (
@@ -440,6 +475,8 @@ def kernel(
     num_lane_tiles_bkv = bkv_sz // 128
 
     def seq_along_lane_block_rows(bkv_vmem):
+        if u32_sal:
+            return bkv_vmem
         return bkv_vmem.bitcast(jnp.uint32).reshape(
             seq_batch_size, kv_sublane_groups * num_lane_tiles_bkv, 128
         )
@@ -457,6 +494,22 @@ def kernel(
 
     def seq_along_lane_key_tile(rows, batch_idx, lane_tile_idx):
         """[head_dim, 128] FP8 keys of lane tile `lane_tile_idx`."""
+        if u32_sal:
+            if page_major:
+                p, j = divmod(lane_tile_idx, tiles_per_page)
+                words = rows[
+                    batch_idx,
+                    p,
+                    pl.ds(0, kv_head_dim_groups),
+                    pl.ds(j * 128, 128),
+                ]
+            else:
+                words = rows[
+                    batch_idx,
+                    pl.ds(0, kv_head_dim_groups),
+                    pl.ds(lane_tile_idx * 128, 128),
+                ]
+            return pltpu.bitcast(words, jnp.float8_e4m3fn)
         row0, stride = _tile_row0(lane_tile_idx)
         words = rows[
             batch_idx,
@@ -467,6 +520,22 @@ def kernel(
 
     def seq_along_lane_scale_tile(rows, batch_idx, lane_tile_idx):
         """[1, 128] f32 dequantization scales of lane tile `lane_tile_idx`."""
+        if u32_sal:
+            if page_major:
+                p, j = divmod(lane_tile_idx, tiles_per_page)
+                words = rows[
+                    batch_idx,
+                    p,
+                    pl.ds(kv_head_dim_groups, 1),
+                    pl.ds(j * 128, 128),
+                ]
+            else:
+                words = rows[
+                    batch_idx,
+                    pl.ds(kv_head_dim_groups, 1),
+                    pl.ds(lane_tile_idx * 128, 128),
+                ]
+            return pltpu.bitcast((words & 0xFF) << 23, jnp.float32)
         row0, stride = _tile_row0(lane_tile_idx)
         row = row0 + kv_head_dim_groups * stride
         words = rows[batch_idx, pl.ds(row, 1), :]
@@ -1609,16 +1678,34 @@ def streamindex_topk(
     q = prepare_q_inputs(q)
     head_dim = q.shape[-1]
 
+    u32_sal_in = (
+        kv_layout == KVLayout.SEQ_ALONG_LANE
+        and cache_kv.ndim == 3
+        and cache_kv.dtype == jnp.uint32
+    )
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
-        total_num_pages, kv_sublane_groups, kv_packing, page_size = cache_kv.shape
-        expected_shape = get_kv_cache_shape(
-            total_num_pages, page_size, actual_head_dim, kv_layout
-        )
-        if cache_kv.shape != expected_shape:
-            raise ValueError(
-                "SEQ_ALONG_LANE expects cache_kv of shape"
-                f" {expected_shape}, got {cache_kv.shape}."
+        if u32_sal_in:
+            total_num_pages, kv_sublane_groups, page_size = cache_kv.shape
+            kv_packing = 4
+            expected_u8 = get_kv_cache_shape(
+                total_num_pages, page_size, actual_head_dim, kv_layout
             )
+            expected_u32 = (expected_u8[0], expected_u8[1], expected_u8[3])
+            if cache_kv.shape != expected_u32:
+                raise ValueError(
+                    "SEQ_ALONG_LANE packed u32 expects cache_kv of shape"
+                    f" {expected_u32}, got {cache_kv.shape}."
+                )
+        else:
+            total_num_pages, kv_sublane_groups, kv_packing, page_size = cache_kv.shape
+            expected_shape = get_kv_cache_shape(
+                total_num_pages, page_size, actual_head_dim, kv_layout
+            )
+            if cache_kv.shape != expected_shape:
+                raise ValueError(
+                    "SEQ_ALONG_LANE expects cache_kv of shape"
+                    f" {expected_shape}, got {cache_kv.shape}."
+                )
         if kv_sublane_groups * kv_packing != head_dim + kv_packing:
             raise ValueError(
                 f"Inconsistent SEQ_ALONG_LANE cache: {kv_sublane_groups=},"
@@ -1664,7 +1751,10 @@ def streamindex_topk(
             and case == MlaCase.MIXED
             and kv_layout == KVLayout.SEQ_ALONG_LANE
             and seq_batch_size == 1
-            and bq_sz == get_dtype_packing(q.dtype)
+            and (
+                (u32_sal_in and page_size % 128 == 0)
+                or bq_sz == get_dtype_packing(q.dtype)
+            )
         )
         return pack, page_major
 

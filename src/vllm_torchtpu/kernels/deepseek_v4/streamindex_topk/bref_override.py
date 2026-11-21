@@ -332,7 +332,19 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
                 # [i * page_size, (i + 1) * page_size) of the block. The offset is a
                 # compile-time constant and page_size is a multiple of the lane count,
                 # so the destination slice is always tile aligned.
-                if self.page_major_groups:
+                if cache_kv_hbm.ndim == 3:
+                    if self.page_major_groups:
+                        dst = vmem_dst.at[  # pytype: disable=attribute-error
+                            batch_idx, i, :, :
+                        ]
+                    else:
+                        dst_lane_start = i * self.page_size
+                        dst = vmem_dst.at[  # pytype: disable=attribute-error
+                            batch_idx,
+                            :,
+                            pl.ds(dst_lane_start, self.page_size),
+                        ]
+                elif self.page_major_groups:
                     g = self.page_major_groups
                     dst = vmem_dst.at[  # pytype: disable=attribute-error
                         batch_idx, pl.ds(i * g, g), :, :
