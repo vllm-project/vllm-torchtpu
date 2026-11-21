@@ -2933,6 +2933,7 @@ class TestInputStagingFence:
             _fenced_h2d_sources=[],
             _free_h2d_sources={},
             _registered_h2d_sources=set(),
+            _staged_block_tables_reuse={},
             _token_padding_state=None,
             sequence_layout_planner=SimpleNamespace(
                 prepare_dummy=lambda **kw: SimpleNamespace(
@@ -2975,6 +2976,8 @@ class TestInputStagingFence:
         runner.attn_groups = [[group]]
 
         for dp_lockstep in (False, True, False):
+            # Equal tables would reuse the last upload; force one to fence.
+            runner._staged_block_tables_reuse.clear()
             TPUModelRunner._dummy_run(
                 runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=dp_lockstep
             )
@@ -2984,6 +2987,9 @@ class TestInputStagingFence:
             assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
         assert len(_FakeTpuEvent.instances) == 3
         assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])
+        # A repeat of the same tables uploads nothing and holds no source.
+        TPUModelRunner._dummy_run(runner, num_tokens=16, num_reqs=4, num_blocks=4)
+        assert runner._fenced_h2d_sources == []
 
         # With through_handoff=True, the fence must be recorded before
         # _pp_wave.start_forward so the next wait never blocks on the receive.

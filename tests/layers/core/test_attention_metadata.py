@@ -48,6 +48,7 @@ class TestAttentionMetadataBuilderPlumbing:
         runner._unfenced_h2d_sources = []
         runner._free_h2d_sources = {}
         runner._registered_h2d_sources = set()
+        runner._staged_block_tables_reuse = {}
         runner.attn_groups = []
         runner._unified_kv_layout = False
 
@@ -502,6 +503,43 @@ class TestAttentionMetadataBuilderPlumbing:
         assert set(ctx.staged_block_tables) == {0}
         assert ctx.staged_mamba_products is None
         assert ctx.staged_block_tables[0].numel() == 4 * 4
+
+    @pytest.mark.parametrize("num_groups", [1, 3])
+    def test_repeated_tables_reuse_the_staged_upload(self, num_groups):
+        """A walk whose packed tables repeat reuses its previous upload and
+        returns its unused host buffer; a changed table or another group set
+        uploads again."""
+        runner = self._make_runner_mock(num_groups=num_groups)
+        self._make_attn_groups(
+            runner, [self._make_builder(runner, gid) for gid in range(num_groups)]
+        )
+
+        def walk(gids=None):
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=2,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones(4, dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            )
+            stage_block_table_uploads(runner, ctx, 4, gids=gids)
+            return ctx.staged_block_tables
+
+        first = walk()
+        assert len(runner._unfenced_h2d_sources) == 1
+        assert [t.tolist() for t in walk().values()] == [
+            t.tolist() for t in first.values()
+        ]
+        assert len(runner._unfenced_h2d_sources) == 1
+        numel = runner._unfenced_h2d_sources[0][0].numel()
+        assert len(runner._free_h2d_sources[(numel, torch.int32)]) == 1
+
+        walk(gids={0})
+        assert len(runner._unfenced_h2d_sources) == 2 - (num_groups == 1)
+        runner.input_batch.block_table[0].get_cpu_tensor.return_value[0, 0] = 77
+        assert walk()[0][0].item() == 77
+        assert len(runner._unfenced_h2d_sources) == 3 - (num_groups == 1)
 
     @pytest.mark.parametrize("num_groups", [1, 3])
     def test_each_staged_walk_owns_its_host_buffer(self, num_groups):

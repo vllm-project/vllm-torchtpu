@@ -278,20 +278,41 @@ def stage_h2d_upload(runner: Any, host: torch.Tensor) -> torch.Tensor:
     tensors use a no-op callback and are dropped after synchronization.
     """
     assert host.is_contiguous()
-    recycle = id(host) in runner._registered_h2d_sources
-    if recycle:
-        key = (host.numel(), host.dtype)
+    if id(host) in runner._registered_h2d_sources:
 
         def release_cb() -> None:
-            free = runner._free_h2d_sources.pop(key, None)
-            if free is None:
-                free = []
-            free.append(host)
-            runner._free_h2d_sources[key] = free
+            _recycle_h2d_source(runner, host)
     else:
         release_cb = _noop_release
     runner._unfenced_h2d_sources.append((host, release_cb))
     return host.to(runner.device, non_blocking=True)
+
+
+def _recycle_h2d_source(runner: Any, host: torch.Tensor) -> None:
+    """Return a `zeros_h2d_source` buffer no transfer reads to the free list."""
+    key = (host.numel(), host.dtype)
+    free = runner._free_h2d_sources.pop(key, None)
+    if free is None:
+        free = []
+    free.append(host)
+    runner._free_h2d_sources[key] = free
+
+
+def _stage_unless_unchanged(
+    runner: Any, walk: tuple, host: torch.Tensor
+) -> torch.Tensor:
+    """`stage_h2d_upload(runner, host)`, reusing ``walk``'s previous upload
+    while its packed block tables repeat: they change only when a request
+    gains or loses a block. The device tables are only read downstream."""
+    key = (host.dtype, host.numpy().tobytes())
+    prev = runner._staged_block_tables_reuse.get(walk)
+    if prev is not None and prev[0] == key:
+        if id(host) in runner._registered_h2d_sources:
+            _recycle_h2d_source(runner, host)
+        return prev[1]
+    dev = stage_h2d_upload(runner, host)
+    runner._staged_block_tables_reuse[walk] = (key, dev)
+    return dev
 
 
 def zeros_h2d_source(
@@ -615,7 +636,7 @@ def stage_block_table_uploads(
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed buffer: same staged layout, null blocks.
 
-    staged_dev = stage_h2d_upload(runner, flat)
+    staged_dev = _stage_unless_unchanged(runner, tuple(e[0] for e in entries), flat)
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices
