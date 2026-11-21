@@ -60,7 +60,8 @@ def _case(seed, query_heads, kv_tile, k_scale, contexts=(700, 50)):
     ratio, dim = 4, 256
     page_size, pages = (512, 4) if kv_tile == 1024 else (128, 12)
     tokens = 1024
-    # Two requests: a 600-token prefill on a 700-token context and a short one.
+    # Two requests: a 600-token prefill and a 100-token one, on `contexts`
+    # tokens of cached context (by default 700 and 50).
     starts = np.array([0, 600, 700], np.int32)
     contexts = np.array(contexts, np.int32)
     pages = max(pages, -(-(int(contexts.max()) + tokens) // page_size))
