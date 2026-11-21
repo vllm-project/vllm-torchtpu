@@ -28,6 +28,7 @@ from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.frontend_options import SECTION as FRONTEND_OPTIONS_SECTION
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.worker.worker_options import SECTION as WORKER_OPTIONS_SECTION
 
 logger = init_logger(__name__)
 
@@ -60,6 +61,7 @@ HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
         PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
         FRONTEND_OPTIONS_SECTION,
+        WORKER_OPTIONS_SECTION,
     }
 )
 

@@ -55,6 +55,8 @@ from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker import worker_options
+from vllm_torchtpu.worker.numa_bind import bind_to_chip_numa_node
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -92,6 +94,25 @@ def _release_free_host_heap() -> None:
     elif hasattr(process, "malloc_trim"):
         process.malloc_trim(0)
         logger.info("Released free host heap via glibc malloc_trim.")
+
+
+def _device_remap(local_rank_offset: int) -> str | None:
+    """The setting that runs this engine's ranks on other TPU devices than
+    their host-local rank names, or None. TPU_LOCAL_RANK_OFFSET and
+    DEBUG_TPU_LOCAL_RANK_OFFSET shift every rank; VLLM_TPU_DEVICE_ORDER maps
+    each rank to a listed device at worker spawn; under
+    TPU_MULTIHOST_BACKEND=ray each worker runs on the chip Ray assigned it,
+    and with vLLM's nnodes left at 1 the parallel config counts every worker
+    of a multi-host engine as this host's."""
+    if local_rank_offset:
+        return f"TPU_LOCAL_RANK_OFFSET={local_rank_offset}"
+    if envs.DEBUG_TPU_LOCAL_RANK_OFFSET:
+        return f"DEBUG_TPU_LOCAL_RANK_OFFSET={envs.DEBUG_TPU_LOCAL_RANK_OFFSET}"
+    if envs.VLLM_TPU_DEVICE_ORDER:
+        return f"VLLM_TPU_DEVICE_ORDER={envs.VLLM_TPU_DEVICE_ORDER}"
+    if envs.TPU_MULTIHOST_BACKEND == "ray":
+        return "TPU_MULTIHOST_BACKEND=ray"
+    return None
 
 
 class TPUWorker(WorkerBase):
@@ -199,6 +220,26 @@ class TPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    def _maybe_bind_numa(
+        self, native_local_rank: int, dp_size: int, local_rank_offset: int = 0
+    ) -> None:
+        """Bind this worker to its chip's NUMA node when
+        ``tpu_worker.numa_bind`` is on. The host's workers are this engine's
+        local ranks times its host-local DP engines.
+
+        The bind assumes rank r runs on the host's r-th TPU device. A setting
+        that moves ranks to other devices (``_device_remap``) would make it
+        pick the wrong node, so then placement is left unchanged."""
+        if not worker_options.get(self.vllm_config).numa_bind:
+            return
+        remap = _device_remap(local_rank_offset)
+        if remap is not None:
+            logger.info("NUMA bind: %s; placement unchanged", remap)
+            return
+        pc = self.parallel_config
+        dp_size_local = (pc.data_parallel_size_local or dp_size) if dp_size > 1 else 1
+        bind_to_chip_numa_node(native_local_rank, pc.local_world_size * dp_size_local)
+
     def init_device(self):
         # vLLM's MultiprocExecutor passes per-engine rank/local_rank as
         # constructor args. Native vLLM DP keeps those values local to the DP
@@ -228,6 +269,10 @@ class TPUWorker(WorkerBase):
         # takes these at construction time.
         self.profile_rank = binding.rank
         self.profile_world_size = binding.world_size
+        # Before the runtime starts, so its threads and buffers follow.
+        self._maybe_bind_numa(
+            binding.native_local_rank, dp_size, binding.local_rank_offset
+        )
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
