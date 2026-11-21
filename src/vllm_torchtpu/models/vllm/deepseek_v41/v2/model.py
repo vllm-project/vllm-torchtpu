@@ -244,6 +244,16 @@ def place_decoder_rows(placement, *tensors):
     return fn(placement, *tensors)
 
 
+def _stream_view(streams: torch.Tensor, hidden_size: int) -> torch.Tensor:
+    """``[T, hc, D]`` view of HC streams handed between CED stage programs.
+
+    The streams cross a program boundary as ``[T, hc * D]``, the shape the mHC
+    kernels write and read: as a ``[T, hc, D]`` program output XLA lays them
+    out by stream instead, which relays out every hand-off.
+    """
+    return streams.unflatten(1, (-1, hidden_size))
+
+
 def _mean_hc_streams(hidden_states: torch.Tensor) -> torch.Tensor:
     # Unroll the small static HC stream axis (hc_mult=4) instead of emitting a
     # second HLO reduce over dim=1 alongside collapse(hidden_states, pre_mix).
@@ -1355,7 +1365,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             start_layer, end_layer = split, self._ced_boundary
         stage_sp = self._stage_uses_sequence_parallel(stage)
         carry_stage = stage in ("encoder_middle", "encoder_tail")
-        if stage == "decoder" or carry_stage:
+        if stage == "decoder":
+            hidden_states = _stream_view(inputs_embeds, self.config.hidden_size)
+        elif carry_stage:
             hidden_states = inputs_embeds
         elif upstream.get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -1413,6 +1425,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             input_ids = upstream.sp_shard(input_ids)
 
         residual, post_mix, res_mix = encoder_carry or (None, None, None)
+        if residual is not None:
+            residual = _stream_view(residual, self.config.hidden_size)
         pre_mix: torch.Tensor | None = encoder_pre_mix
         if stage_sp and pre_mix is not None and not carry_stage:
             # CED decoder replay: encoder rows arrive unsharded.
@@ -1467,7 +1481,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # this post fused with the Engram injection.
                 assert not aux_hidden_by_layer
                 assert isinstance(hidden_states, torch.Tensor)
-                return hidden_states, residual, post_mix, res_mix, pre_mix
+                assert residual is not None
+                # Streams flat across the program boundary (`_stream_view`).
+                return hidden_states, residual.flatten(1), post_mix, res_mix, pre_mix
             if layer is not None:
                 # The last layer has no successor to fold its post into.
                 hidden_states = post(hidden_states, residual, post_mix, res_mix)
@@ -1494,6 +1510,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     for layer_id in self.aux_hidden_state_layers
                     if layer_id in aux_hidden_by_layer
                 ]
+                # Streams flat across the program boundary (`_stream_view`).
+                hidden_states = hidden_states.flatten(1)
                 if encoder_aux:
                     return hidden_states, pre_mix, encoder_aux
                 return hidden_states, pre_mix

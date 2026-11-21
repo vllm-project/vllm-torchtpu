@@ -632,6 +632,7 @@ def test_forward_stage_decoder_and_encoder_paths(monkeypatch: pytest.MonkeyPatch
             return hidden, None, None, None, out_pre, None
 
     model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=16),
         _ced_boundary=2,
         start_layer=0,
         end_layer=4,
@@ -654,7 +655,8 @@ def test_forward_stage_decoder_and_encoder_paths(monkeypatch: pytest.MonkeyPatch
         lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
     monkeypatch.setattr(v2_model, "post", lambda h, *a: h)
-    monkeypatch.setattr(v2_model, "flat_collapse", lambda h, pm: h)
+    # The decoder views the flat encoder output as [T, 1, 16] streams.
+    monkeypatch.setattr(v2_model, "flat_collapse", lambda h, pm: h.flatten(1))
 
     out_dec = v2_model.DeepseekV41Model._forward_stage(
         model,
@@ -1335,6 +1337,7 @@ def test_early_split_preserves_delayed_carry(monkeypatch, rows):
     )
     model = object.__new__(v2_model.DeepseekV41Model)
     torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=4)
     model.start_layer, model.end_layer, model._ced_boundary = 0, 4, 3
     model._engram_split_layer = 2
     model.use_sequence_parallel = False

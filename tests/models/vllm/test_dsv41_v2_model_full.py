@@ -1136,6 +1136,7 @@ class TestModelForwardStage:
         mtp: bool = False,
     ) -> DeepseekV41Model:
         model = DeepseekV41Model.__new__(DeepseekV41Model)
+        model.config = SimpleNamespace(hidden_size=64)
         model.start_layer = 0
         model.end_layer = 2
         model._ced_boundary = 1
