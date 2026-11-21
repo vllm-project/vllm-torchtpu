@@ -1551,6 +1551,8 @@ def patched_mtp_forward(
     hidden_states, _ = self.norm(hidden_states, residual)
     if sp:
         hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+    # Restore the step-0 gather's row count after the 4- or 8-row slice on
+    # small buckets (_step0_effective_gather_indices): callers get max_loop_p rows.
     if (
         _step0_gather_indices is not None
         and hidden_states.shape[0] < _step0_gather_indices.shape[0]

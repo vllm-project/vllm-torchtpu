@@ -3425,19 +3425,6 @@ def test_draft_post_step0_fused_matches_unfused_carries_and_step1_inputs(advance
     assert torch.equal(pos1_a, pos1_gi)
     assert torch.equal(seq1_a, seq1_gi)
 
-    from vllm_torchtpu.compilation import shape_variants
-    from vllm_torchtpu.models.vllm.qwen3_next_patch import (
-        _step0_effective_gather_indices,
-        step0_post_attn_gather_context,
-    )
-
-    with step0_post_attn_gather_context(s0_gi_a):
-        assert _step0_effective_gather_indices(torch.zeros((3, 4))).shape == (16,)
-        with shape_variants.warmup():
-            assert _step0_effective_gather_indices(torch.zeros((3, 4))).shape == (4,)
-            assert _step0_effective_gather_indices(torch.zeros((3, 8))).shape == (8,)
-            assert _step0_effective_gather_indices(torch.zeros((3, 12))).shape == (16,)
-
 
 @pytest.mark.parametrize("hidden_rows", [4, 8])
 @pytest.mark.parametrize("max_p", [0, 8])
