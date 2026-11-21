@@ -1468,12 +1468,13 @@ def _walk_kernel(
         )
     output_ref[...] = jnp.concatenate(heads, axis=1).astype(output_ref.dtype)
     if lse_ref is not None:
-        lses = []
+        # [1, kv_heads, q_heads_per_kv * query_block] in the state's own layout (row = q-head * query_block + row): Mosaic
+        # cannot reshape a 1-D state row to [q_heads_per_kv, query_block] (CEN2 j-3f53f369: 'unsupported shape cast');
+        # the wrapper moves it to [rows, query heads] (lse_rows).
         for head in range(kv_heads):
             mass = mass_ref[0, head, :]
-            lse = jnp.where(mass == 0, -jnp.inf, max_ref[0, head, :] + jnp.log(jnp.where(mass == 0, 1.0, mass)))
-            lses.append(lse.reshape(q_heads_per_kv, query_block).T)
-        lse_ref[...] = jnp.concatenate(lses, axis=1)
+            lse_ref[0, head, :] = jnp.where(mass == 0, -jnp.inf,
+                                            max_ref[0, head, :] + jnp.log(jnp.where(mass == 0, 1.0, mass)))
 
 
 def _walk_kernel_per_group(
@@ -2024,7 +2025,7 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
             ] + ([pl.BlockSpec(memory_space=pltpu.HBM)] * 2 if gathered is not None else []) + ids_extra
             + ([pl.BlockSpec(memory_space=pltpu.HBM)] if listed_lines is not None else []),
             out_specs=(pl.BlockSpec((group, query_heads, head_dim), lambda b, *_: (b, 0, 0)),
-                       pl.BlockSpec((group, query_heads), lambda b, *_: (b, 0))) if emit_lse
+                       pl.BlockSpec((1, kv_heads, group * q_heads_per_kv), lambda b, *_: (b, 0, 0))) if emit_lse
             else pl.BlockSpec((group, query_heads, head_dim), lambda b, *_: (b, 0, 0)),
             scratch_shapes=[
                 pltpu.SMEM((words_padded,), jnp.int32),
@@ -2055,7 +2056,8 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
         ),
         out_shape=(jax.ShapeDtypeStruct((ngroups * group, query_heads, head_dim) if in_place else query.shape,
                                         jnp.bfloat16),
-                   jax.ShapeDtypeStruct(((ngroups * group) if in_place else query.shape[0], query_heads), jnp.float32))
+                   jax.ShapeDtypeStruct((ngroups if in_place else query.shape[0] // group, kv_heads,
+                                         group * q_heads_per_kv), jnp.float32))
         if emit_lse else jax.ShapeDtypeStruct((ngroups * group, query_heads, head_dim) if in_place else query.shape,
                                               jnp.bfloat16),
         name=f"qsa_union_walk_g{group}_kv{kv_tile}" + ("_lean" if lean else "")
@@ -2806,6 +2808,14 @@ def gather_chunk_bounds(ngroups, chunks, growth=1.0):
     return list(zip(cuts[:-1], cuts[1:]))
 
 
+def lse_rows(lse, group):
+    """The walk kernel's lse output [groups, kv_heads, q_heads_per_kv * group] as [groups * group, query heads] (the output's
+    head order: kv head * q_heads_per_kv + q head)."""
+    ngroups, kv_heads, width = lse.shape
+    qh = width // group
+    return lse.reshape(ngroups, kv_heads, qh, group).transpose(0, 3, 1, 2).reshape(ngroups * group, kv_heads * qh)
+
+
 def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows, ids, *, gathered, chunks, group,
                      union_cap, kv_tile, ratio, k_scale, v_scale, lean, qk16, growth=1.0, gather_pool=None,
                      in_place=False, lean_gathered=False, mask_view=False, vguard_lean=False, walk_pipe=False,
@@ -2868,7 +2878,7 @@ def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows
             ))
             outs.append(res[0] if emit else res)
             lses.append(res[1] if emit else None)
-        return jnp.concatenate(outs, axis=0), (jnp.concatenate(lses, axis=0) if emit else None)
+        return jnp.concatenate(outs, axis=0), (lse_rows(jnp.concatenate(lses, axis=0), group) if emit else None)
 
     if qa1.get("fos") == 2:
         # WALK-FOS V2 guard (port of MM HUNT-ATTN L-A V2's, credited): a static offset of 0 is exact while every live row's
