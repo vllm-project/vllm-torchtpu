@@ -27,6 +27,9 @@ Every table the kernel emits is also checked against ``routing_tables``'
 reference passes (dense jnp ops over the same pairs).
 """
 
+import contextlib
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -36,8 +39,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.fused_moe.v3 import routing_tables as tables
 from vllm_torchtpu.kernels.fused_moe.v3 import routing_tables_kernel as kernel
+from vllm_torchtpu.kernels.fused_moe.v3.layout import LANES
 
-LANES = 128
 ROW_BLOCK = 8
 
 
@@ -45,8 +48,8 @@ def _tpu7x():
     return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
 
 
-@pytest.fixture
-def interpret(monkeypatch):
+@contextlib.contextmanager
+def _interpret_mode(monkeypatch):
     """TPU interpret mode with a TPU7x chip record, on the CPU device."""
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
     monkeypatch.setattr(tpu_info, "get_tpu_info", _tpu7x)
@@ -54,6 +57,13 @@ def interpret(monkeypatch):
         jax.default_device(jax.devices("cpu")[0]),
         pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()),
     ):
+        yield
+
+
+@pytest.fixture
+def interpret(monkeypatch):
+    """The kernel in TPU interpret mode on CPU."""
+    with _interpret_mode(monkeypatch):
         yield
 
 
@@ -69,12 +79,7 @@ def interpret_or_chip(request, monkeypatch):
     if request.param == "tpu":
         yield False
         return
-    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
-    monkeypatch.setattr(tpu_info, "get_tpu_info", _tpu7x)
-    with (
-        jax.default_device(jax.devices("cpu")[0]),
-        pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()),
-    ):
+    with _interpret_mode(monkeypatch):
         yield True
 
 
@@ -287,9 +292,19 @@ def test_shard_tables_match_the_reference(interpret, unrouted):
 
 
 # The shard-tables call also zeroes the scatter's token and scale tables, a
-# block per grid step. This world's call has 5 steps (2 groups of 8 blocks of
-# 128 pairs, twice, and one more).
+# block per grid step. The cases below are sized for this world's 5 steps,
+# which the test reads off the traced program.
 ZERO_WORDS_PER_STEP = 1024
+ZERO_STEPS = 5
+
+
+def _grid_steps(call):
+    """The grid steps of the one Pallas program `call` traces."""
+    jaxpr = jax.make_jaxpr(call)()
+    programs = [e for e in jaxpr.eqns if e.primitive.name == "pallas_call"]
+    assert len(programs) == 1
+    (steps,) = programs[0].params["grid_mapping"].grid
+    return steps
 
 
 @pytest.mark.parametrize(
@@ -304,7 +319,8 @@ def test_the_tables_to_zero_come_back_zero(interpret_or_chip, zero_tables):
     grid's 5 steps, so it is zeroed in 3072-word blocks, the last ragged."""
     messages, _ = _messages()
     routed_rows = tables.routed_rows_bound(SHARDS * TOKENS, TOP_K, EXPERTS, TILE)
-    outs = _shard_tables(
+    call = functools.partial(
+        _shard_tables,
         messages,
         0,
         routed_rows,
@@ -312,7 +328,8 @@ def test_the_tables_to_zero_come_back_zero(interpret_or_chip, zero_tables):
         zero_tables=zero_tables,
         zero_words_per_step=ZERO_WORDS_PER_STEP,
     )
-    zeroed = outs[8:]
+    assert _grid_steps(call) == ZERO_STEPS
+    zeroed = call()[8:]
     assert [tuple(z.shape) for z in zeroed] == [(n,) for n in zero_tables]
     for z in zeroed:
         np.testing.assert_array_equal(np.asarray(z), 0)
@@ -325,3 +342,22 @@ def test_more_than_two_tables_to_zero_are_refused():
     routed_rows = tables.routed_rows_bound(SHARDS * TOKENS, TOP_K, EXPERTS, TILE)
     with pytest.raises(ValueError, match="3 tables to zero"):
         _shard_tables(messages, 0, routed_rows, zero_tables=(1024, 1024, 1024))
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("words", [0, 1000, 1536])
+def test_a_zero_block_of_part_tiles_is_refused(interpret, words):
+    """A table is zeroed in 1-D blocks of whole (SUBLANES, LANES) tiles, so
+    zero_words_per_step must be a positive multiple of 1024 words."""
+    messages, _ = _messages()
+    routed_rows = tables.routed_rows_bound(SHARDS * TOKENS, TOP_K, EXPERTS, TILE)
+    with pytest.raises(ValueError, match=f"zero_words_per_step {words}:"):
+        jax.eval_shape(
+            lambda: _shard_tables(
+                messages,
+                0,
+                routed_rows,
+                zero_tables=(896,),
+                zero_words_per_step=words,
+            )
+        )

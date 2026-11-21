@@ -129,8 +129,8 @@ SHARD_TABLE_SCRATCH = (
 
 def _pair_block(message_ref, i, block):
     """Pair block i of a grid step's routing message rows, as one [block]
-    vector: the
-    block's lane rows laid end to end (a lane concat of whole rows)."""
+    vector: the block's lane rows laid end to end (a lane concat of whole
+    rows)."""
     rows_per_block = block // LANES
     rows = message_ref[i * rows_per_block : (i + 1) * rows_per_block, :]
     return jnp.concatenate([rows[j : j + 1, :] for j in range(rows_per_block)], axis=1)[
@@ -650,9 +650,9 @@ def shard_tables_kernel(
     side_effects=True,
 ):
     """The pallas mode's front end, from the gathered routing messages
-    (`routing_messages` [num_shards, rows, LANES] int32: shard s's pair indices
-    flat in
-    its first pairs_per_shard // LANES rows, a pair's number its word).
+    (`routing_messages` [num_shards, rows, LANES] int32: shard s's pair
+    indices flat in its first pairs_per_shard // LANES rows, a pair's number
+    its word).
 
     Returns (run_rows [E, num_shards], arrival rows [pairs_per_shard // LANES,
     LANES] of this shard's own pairs in pair order, routed_row [n], the FFN
@@ -662,6 +662,11 @@ def shard_tables_kernel(
     receive sems) from the start call. The gathered rows come back aliased
     with the middle rounds issued), then one zeroed table per length in
     `zero_tables`. Every output is placed in HBM.
+
+    Each table in `zero_tables` (two at most) is zeroed in equal 1-D blocks,
+    one a grid step: `zero_words_per_step` words, a whole number of
+    (SUBLANES, LANES) tiles as the block's layout needs, or a larger
+    multiple of it when the table is longer than the steps would cover.
 
     `pairs_per_expert` is the most pairs one shard sends one expert (its
     tokens when each token selects distinct experts); None takes
@@ -723,9 +728,12 @@ def shard_tables_kernel(
         raise ValueError(
             f"{len(zero_tables)} tables to zero. The scatter behind this call fills two"
         )
-    # Each table is zeroed in equal blocks over the grid's steps: at least
-    # zero_words_per_step words a step, more when the table is longer than
-    # the steps would otherwise cover.
+    if zero_words_per_step <= 0 or zero_words_per_step % (SUBLANES * LANES):
+        raise ValueError(
+            f"zero_words_per_step {zero_words_per_step}: pass a positive "
+            f"multiple of {SUBLANES * LANES}. The tables are zeroed in 1-D "
+            f"blocks of whole ({SUBLANES}, {LANES}) tiles"
+        )
     steps = 2 * n_groups + 1
     zero_words = tuple(
         max(
