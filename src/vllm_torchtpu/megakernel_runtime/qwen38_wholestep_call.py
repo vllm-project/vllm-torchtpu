@@ -151,7 +151,7 @@ _LOGGED_MK_OPTIONS: set[tuple[str, int]] = set()
 _MK_BLOCK_FIELDS = (
     ("key_slots", "key_slots"),  # wholekeyslots (auto resolved per bucket)
     ("keymp", "mp"),  # wholekeymp
-    ("key_lanes", "ck_lanes"),  # wholekeylanes (= ck_width when unset)
+    ("key_lanes", "key_lanes"),  # wholekeylanes (= ck_width when unset)
     ("thr_fast", "thr_fast_mode"),  # "" off, "ter2", "te", ...
     ("req_async", "req_async"),
     ("req_async_ids", "req_async_ids"),

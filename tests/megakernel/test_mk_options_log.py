@@ -43,6 +43,22 @@ def test_line_reads_block_and_tiles():
     assert "uattn_lite" not in kv
 
 
+def test_key_lanes_logged_and_auto_slots_doubled(monkeypatch):
+    """wholekeylanes=128: the block's `key_lanes` shows in the line; auto key-ring slots
+    double (same VMEM: half-width slots)."""
+    off = wc.mk_options_line(8, _spec(carrier="fp8"), Tiles())
+    assert "key_lanes=256" in off
+    monkeypatch.setattr(wc, "KEY_LANES", 128)
+    monkeypatch.setattr(wc, "KEY_SLOTS", wc.KEY_SLOTS_AUTO)
+    assert wc.indexed_options(16)["ck_lanes"] == 128
+    assert (wc.key_slots_for(16), wc.key_slots_for(48), wc.key_slots_for(64)) == (8, 8, 6)
+    on = wc.mk_options_line(8, _spec(carrier="fp8", ck_lanes=128), Tiles())
+    assert "key_lanes=128" in on
+    monkeypatch.setattr(wc, "KEY_LANES", 0)
+    assert (wc.key_slots_for(16), wc.key_slots_for(64)) == (4, 3)
+    assert "ck_lanes" not in wc.indexed_options(16)
+
+
 def test_thr_fast_one_resolves_to_ter2_and_defaults_off():
     on = wc.mk_options_line(8, _spec(thr_fast="1"), Tiles())
     assert "thr_fast='ter2'" in on
