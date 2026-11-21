@@ -211,3 +211,50 @@ def test_mask_router_logits_for_padding():
     finally:
         token_padding.set_padding_state(None)
     assert token_padding.mask_router_logits_for_padding(logits) is logits
+
+
+def test_update_skips_unchanged_rows():
+    state = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
+    state.update(3, 6)
+    mask = state.local_padding_mask
+    state.local_padding_mask = mask.clone().fill_(True)  # detects a rewrite
+    state.update(3, 6)
+    assert state.local_padding_mask.all()
+    state.update(2, 6)
+    assert (
+        state.get_local_padding_mask(8).tolist()
+        == [False] * 2 + [True] * 4 + [False] * 2
+    )
+
+
+def test_draft_and_target_keep_their_own_masks():
+    target = TokenPaddingState.create(8, torch.device("cpu"))
+    draft = TokenPaddingState.create(8, torch.device("cpu"))
+    token_padding.set_padding_state(target, draft)
+    try:
+        token_padding.mark_target_padding(target, 3, 4)
+        assert token_padding._padding_state is target
+        token_padding.mark_draft_padding(2, 8)
+        assert token_padding._padding_state is draft
+        assert draft.get_local_padding_mask(8).sum().item() == 6
+        assert (
+            target.get_local_padding_mask(8).tolist()
+            == [False] * 3 + [True] + [False] * 4
+        )
+        token_padding.mark_target_padding(target, 3, 4)
+        assert token_padding._padding_state is target
+    finally:
+        token_padding.set_padding_state(None)
+
+
+def test_draft_padding_without_draft_state_shares_the_mask():
+    state = TokenPaddingState.create(8, torch.device("cpu"))
+    token_padding.set_padding_state(state)
+    try:
+        token_padding.mark_draft_padding(1, 4)
+        assert token_padding._padding_state is state
+        assert state.get_local_padding_mask(4).tolist() == [False] + [True] * 3
+    finally:
+        token_padding.set_padding_state(None)
+    token_padding.mark_draft_padding(1, 4)
+    assert token_padding._padding_state is None

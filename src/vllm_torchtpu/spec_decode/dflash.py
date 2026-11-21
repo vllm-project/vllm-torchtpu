@@ -776,9 +776,9 @@ class DFlashProposer:
             draft_attn_metadata = self._build_draft_attn_metadata(
                 chunk, padded_len, seq_lens
             )
-            # The padding mask still describes the target's last chunk; a
-            # MoE draft layer would skip real draft rows past its valid count.
-            token_padding.mark_padding(chunk.num_reqs * block_size, padded_len)
+            # The drafter's mask must describe this forward's rows, or a MoE
+            # draft layer would skip real draft rows past a stale valid count.
+            token_padding.mark_draft_padding(chunk.num_reqs * block_size, padded_len)
 
             with (
                 # Precomputed so set_forward_context does not run its
@@ -1003,7 +1003,7 @@ class DFlashProposer:
         )
         # Every row of a dummy draft forward is padding, as in the runner's
         # warmup steps.
-        token_padding.mark_padding(0, num_tokens)
+        token_padding.mark_draft_padding(0, num_tokens)
 
         with (
             # Same contract as propose(): precomputed DP metadata, no

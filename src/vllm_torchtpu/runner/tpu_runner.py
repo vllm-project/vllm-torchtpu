@@ -5895,6 +5895,7 @@ class TPUModelRunner(GPUModelRunner):
         )
         if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe:
             max_padded_tokens = self.max_num_tokens
+            draft_padding_state = None
             if isinstance(self.drafter, DFlashProposer):
                 # A DFlash draft forward can outgrow the largest target
                 # bucket (DFlashProposer._draft_token_paddings); it never
@@ -5902,10 +5903,15 @@ class TPUModelRunner(GPUModelRunner):
                 max_padded_tokens = max(
                     max_padded_tokens, self.max_num_reqs * self.drafter.block_size
                 )
+                draft_padding_state = token_padding.TokenPaddingState.create(
+                    max_padded_tokens, self.device
+                )
             self._token_padding_state = token_padding.TokenPaddingState.create(
                 max_padded_tokens, self.device
             )
-            token_padding.set_padding_state(self._token_padding_state)
+            token_padding.set_padding_state(
+                self._token_padding_state, draft_padding_state
+            )
 
         # Last: arming needs the drafter's MTP layer and the padding mask.
         if envs.USE_MOE_TP_DECODE_KERNEL:
@@ -6275,7 +6281,9 @@ class TPUModelRunner(GPUModelRunner):
         if padding_state is not None:
             # Every row of a warmup step is padding; every row of a profile
             # step is a real token.
-            padding_state.update(num_tokens if profiling else 0, num_tokens)
+            token_padding.mark_target_padding(
+                padding_state, num_tokens if profiling else 0, num_tokens
+            )
         self._record_input_staging_fence()
         intermediate_tensors = None
         if through_handoff:
@@ -8602,7 +8610,9 @@ class TPUModelRunner(GPUModelRunner):
         else:
             # Padding-mask support is currently limited to the ALL layout.
             num_valid_tokens = num_tokens_padded
-        padding_state.update(num_valid_tokens, num_tokens_padded)
+        token_padding.mark_target_padding(
+            padding_state, num_valid_tokens, num_tokens_padded
+        )
 
     def forward_model(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None

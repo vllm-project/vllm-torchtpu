@@ -14,11 +14,14 @@
 
 import contextlib
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
 _padding_state: "TokenPaddingState | _RowSubsetPadding | None" = None
+# The drafter's own mask, so the target's and the drafter's rows each keep
+# their device mask across steps instead of overwriting one shared mask.
+_draft_padding_state: "TokenPaddingState | None" = None
 
 
 @dataclass
@@ -26,6 +29,8 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
+    # (valid, padded) the mask holds; None until the first update.
+    _written: tuple[int, int] | None = field(default=None, compare=False)
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
@@ -36,18 +41,26 @@ class TokenPaddingState:
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
+        if self._written == (local_valid_tokens, local_padded_tokens):
+            return
         host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)
+        self._written = (local_valid_tokens, local_padded_tokens)
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]
 
 
-def set_padding_state(state: "TokenPaddingState | None") -> None:
-    global _padding_state
+def set_padding_state(
+    state: "TokenPaddingState | None", draft: "TokenPaddingState | None" = None
+) -> None:
+    """Make ``state`` the mask forwards read; ``draft``, when given, is the
+    mask `mark_draft_padding` switches to for a drafter forward."""
+    global _padding_state, _draft_padding_state
     _padding_state = state
+    _draft_padding_state = draft
 
 
 class _RowSubsetPadding:
@@ -87,11 +100,31 @@ def mark_padding(num_valid_tokens: int, num_padded_tokens: int) -> None:
     """Describe the rows of the next forward: [num_valid_tokens,
     num_padded_tokens) are padding. A no-op when no padding state is set.
 
-    The mask is shared by every forward on this rank, so a forward whose rows
-    differ from the target step's (a drafter) must call this before it runs.
+    The current mask is read by every forward on this rank until the next
+    call; a drafter uses `mark_draft_padding` before each of its forwards.
     """
     if _padding_state is not None:
         _padding_state.update(num_valid_tokens, num_padded_tokens)
+
+
+def mark_draft_padding(num_valid_tokens: int, num_padded_tokens: int) -> None:
+    """`mark_padding` for a drafter forward: switches to the drafter's own
+    mask when one is set. The runner switches back (`mark_target_padding`)
+    before its next target forward."""
+    global _padding_state
+    if _draft_padding_state is not None and _padding_state is not None:
+        _padding_state = _draft_padding_state
+    mark_padding(num_valid_tokens, num_padded_tokens)
+
+
+def mark_target_padding(
+    state: TokenPaddingState, num_valid_tokens: int, num_padded_tokens: int
+) -> None:
+    """Make the runner's ``state`` current again and describe its rows."""
+    global _padding_state
+    if _draft_padding_state is not None and _padding_state is _draft_padding_state:
+        _padding_state = state
+    state.update(num_valid_tokens, num_padded_tokens)
 
 
 def zero_routing_weights_for_padding(
