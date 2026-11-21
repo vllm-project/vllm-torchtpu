@@ -125,6 +125,14 @@ def test_should_clamp_decode_topk_cap_for_dcp16():
     assert ai.resolve_decode_topk_cap(0, 16, 2048, decode_bucket=True) == 0
 
 
+def test_should_filter_default_mixed_live_widths_below_topk_cap():
+    assert ai.filter_mixed_live_widths(None, "256,384", 256) == ()
+    assert ai.filter_mixed_live_widths(None, "128,256,384", 256) == (128,)
+    assert ai.filter_mixed_live_widths(None, "256,384", 512) == (256, 384)
+    assert ai.filter_mixed_live_widths((128, 256), "384", 256) == (128,)
+    assert ai.filter_mixed_live_widths(None, "256,384", 0) == (256, 384)
+
+
 def test_gate_compares_tokens_once():
     # The bucket size is symbolic under torch.compile: one `T <= cap`
     # comparison and nothing else (no modulo, no lower bound), or the

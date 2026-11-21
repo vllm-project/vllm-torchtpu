@@ -1059,6 +1059,17 @@ def resolve_decode_topk_cap(
     return topk_cap
 
 
+def filter_mixed_live_widths(
+    override: tuple[int, ...] | None, env_value: str, topk_cap: int | None
+) -> tuple[int, ...]:
+    raw = (
+        override
+        if override is not None
+        else tuple(int(w) for w in env_value.split(",") if w)
+    )
+    return tuple(w for w in raw if not topk_cap or w < topk_cap)
+
+
 def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
     """TPU_DCP_MLA_MIXED_BODY -> the live body's lever tuple ("1" = default set),
     plus the stage-A levers with TPU_DCP_MLA_MIXED_KERNEL_V2."""
@@ -1552,12 +1563,8 @@ def sparse_mla_attention_dcp(
                 **chunk_kwargs,
                 "attention_kernel_batch_size": attention_kernel_batch_size,
             }
-        live_widths = (
-            tuple(w for w in mixed_live_widths_override if not topk_cap or w < topk_cap)
-            if mixed_live_widths_override is not None
-            else tuple(
-                int(w) for w in envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS.split(",") if w
-            )
+        live_widths = filter_mixed_live_widths(
+            mixed_live_widths_override, envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS, topk_cap
         )
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
