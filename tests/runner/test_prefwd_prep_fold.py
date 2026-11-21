@@ -208,11 +208,16 @@ def test_prep_fold_shapes_cover_steady_keys():
         for rows in (n, _get_padded_num_reqs_with_upper_limit(n, MAX_REQS)):
             assert ((rows, tokens) in shapes) == exact, (n, rows)
     assert {(1, 4), (2, 8), (4, 16), (16, 64)} <= shapes
-    # Same coverage as the subtract warmup for the folded subset.
-    sub = tpu_runner._subtract_rejected_shapes(
-        MAX_REQS, width, paddings, {MAX_REQS}, False
-    )
-    assert {(r, t, MAX_REQS) for r, t in shapes} <= sub
+    # The rejected counts carry the previous step's request count: served c16
+    # logged rows n+1 and n+2 (requests finished in between) as unwarmed keys.
+    assert {(2, 4), (3, 4), (3, 8), (4, 8), (5, 16), (7, 16)} <= shapes
+    for rows, tokens in shapes:
+        n = tokens // width
+        assert n <= rows <= min(
+            max(n + tpu_runner.PREP_FOLD_PREV_ROWS,
+                _get_padded_num_reqs_with_upper_limit(n, MAX_REQS)),
+            MAX_REQS,
+        ), (rows, tokens)
 
 
 def test_env_parse(monkeypatch):
