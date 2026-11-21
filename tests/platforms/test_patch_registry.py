@@ -280,6 +280,12 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_install_fused_norm_kernels",
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
+    # The copy-slot hook wraps the _calculate_expert_maps installed when it
+    # runs; the host-lookup patch replaces it without calling the original.
+    worker_init = stages["worker_init"]
+    assert worker_init.index("_patch_expert_map_host_lookup") < worker_init.index(
+        "patch_copy_slot_hook"
+    )
     assert "patch_logits_processor_heads" in stages["worker_init"]
 
 
