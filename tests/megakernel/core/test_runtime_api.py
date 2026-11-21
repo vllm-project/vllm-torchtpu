@@ -31,7 +31,13 @@ import pytest
 import vllm_torchtpu.megakernel.core as mk
 from tests.megakernel.core.megakernel_synth import TINY_TILES, synth_hybrid_spec
 from vllm_torchtpu.megakernel.core import cache as mk_cache
-from vllm_torchtpu.megakernel.core import model_def, planner, profile
+from vllm_torchtpu.megakernel.core import (
+    cache_flat,
+    fused_io_hook,
+    model_def,
+    planner,
+    profile,
+)
 from vllm_torchtpu.megakernel.core import runtime as mk_rt
 from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.core.geometry import ModelGeometry
@@ -46,7 +52,7 @@ from vllm_torchtpu.megakernel.core.model_def import (
     register_model,
 )
 from vllm_torchtpu.megakernel.core.modules import GDN, GQA, Embedding, MoE, Norm
-from vllm_torchtpu.megakernel.core.pool.config import CacheExec, with_cache
+from vllm_torchtpu.megakernel.core.pool.config import CacheExec, cache_exec, with_cache
 from vllm_torchtpu.megakernel.core.profile import DEFAULT_PROFILE, Profile
 from vllm_torchtpu.megakernel.core.runtime import (
     Bucket,
@@ -73,6 +79,10 @@ from vllm_torchtpu.megakernel.core.runtime import (
     verify_ir_coverage,
     verify_pooled_step_hlo,
     verify_sentinel_step,
+)
+from vllm_torchtpu.megakernel.core.weights.spec_inputs import (
+    pack_spec_inputs,
+    random_spec_inputs,
 )
 
 
@@ -934,6 +944,93 @@ def test_verify_compiled_step_ir_forms(ir_text, hlo_text, want):
         assert (ok, msg) == (True, "ok")
     else:
         assert not ok and want in msg, msg
+
+
+@pytest.mark.parametrize(
+    ("bucket_b", "paged", "want_fused"),
+    [(4, True, True), (4, False, True), (8, True, False)],
+    ids=["auto_fused", "auto_fused_unpaged", "split"],
+)
+def test_verify_pooled_step_hlo_uses_the_flat_steps_fused_decision(
+    monkeypatch: pytest.MonkeyPatch, bucket_b: int, paged: bool, want_fused: bool
+):
+    """`verify_pooled_step_hlo` lowers the flat step from `build_global_avals`
+    and checks its HLO with the fused-I/O decision `make_flat_pooled_step` made,
+    for a bucket `"auto"` fuses (`B <= 4`) and one it splits. The flat step pages
+    an unpaged `ex` itself, so a fused unpaged `ex` is still a fused step."""
+    R, T = 2, 1
+    spec = synth_hybrid_spec(L=2, att_every=2, R=R, VH=4)  # fused GDN: 2*kh <= vh
+    base_ex = ExecSpec(
+        B=bucket_b,
+        T=T,
+        R=R,
+        ctx=256,
+        stack_e=True,
+        tiles=TINY_TILES.with_modules({"gqa": {"kv_blk": 128, "nkv": 2}}),
+        interpret=True,
+        cache=CacheExec(paged_kv=paged, num_pages=128),
+    )
+    prof = resolve_driver_profile(DEFAULT_PROFILE, model_name=spec.name)
+    ex, use_fused, _ = bucket_exec_spec(
+        spec,
+        base_ex,
+        prof,
+        bucket_t=bucket_b,
+        tokens_per_seq=T,
+        fused_pool_io="auto",
+        fused_pool_io_max_b=4,
+        fused_pool_io_min_b_hi=56,
+    )
+    # "auto" fuses only with a registered fused pool I/O implementation.
+    assert use_fused is (want_fused and fused_io_hook.fused_io_available())
+
+    flat_fused: list[bool] = []
+    real_build = cache_flat.build_pooled
+
+    def spy_build(*a: Any, **kw: Any) -> Any:
+        b = real_build(*a, **kw)
+        flat_fused.append(cache_exec(b.ex_paged).fused_pool_io)
+        return b
+
+    checked_fused: list[bool] = []
+    real_check = mk_cache.check_pooled_step_hlo
+
+    def spy_check(*a: Any, **kw: Any) -> Any:
+        checked_fused.append(kw["fused_pool_io"])
+        return real_check(*a, **kw)
+
+    monkeypatch.setattr(cache_flat, "build_pooled", spy_build)
+    monkeypatch.setattr(mk_cache, "check_pooled_step_hlo", spy_check)
+
+    # Per-rank weight and pool descriptors (build_global_avals reads shapes).
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices("cpu")[:R]), ("tp",))
+    pos, hid, w_log, st_log = random_spec_inputs(jax.random.PRNGKey(3), spec, ex)
+    _, _, w_mk, _ = pack_spec_inputs(pos, hid, w_log, st_log, spec, ex, mesh=mesh)
+    pt, ckpt, roff, _ = mk_cache.default_pool_layout(spec, ex)
+    raw = mk_cache.states_to_pool(spec, ex, st_log, pt, ckpt, read_offsets=roff)
+
+    def rank_sds(a: Any) -> jax.ShapeDtypeStruct:
+        return jax.ShapeDtypeStruct((a.shape[0] // R, *a.shape[1:]), a.dtype)
+
+    w_flat = [
+        rank_sds(t)
+        for k in planner.plan(spec, ex).w_names
+        for t in (w_mk[k] if isinstance(w_mk[k], tuple) else (w_mk[k],))
+    ]
+    pools = [rank_sds(p) for p in raw]
+    avals = mk_rt.build_global_avals(
+        mesh, spec, ex, w_flat, pools, max_pages_per_seq=pt.shape[1]
+    )
+    assert [a.shape for a in avals[2 : 2 + len(w_flat)]] == [
+        (R * w.shape[0], *w.shape[1:]) for w in w_flat
+    ]
+    assert avals[-3].shape == (ex.NS, pt.shape[1])
+
+    ok, msg = verify_pooled_step_hlo(
+        mesh, spec, ex, w_flat, pools, max_pages_per_seq=pt.shape[1]
+    )
+    assert ok, msg
+    assert flat_fused == checked_fused == [use_fused]
 
 
 def test_verify_sentinel_step_pass_and_failures():
