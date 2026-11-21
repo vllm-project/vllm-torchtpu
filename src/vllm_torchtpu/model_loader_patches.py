@@ -654,7 +654,19 @@ def _start_ep_range_prefetch(
     ``num_threads`` threads, so the lazy safetensors iterator that follows
     finds its pages cached. Dense tensors are kept by every rank; ranks on
     one host share those pages.
+
+    The thread can outlive the load it serves: a draft model that keeps a
+    few tensors still prefetches every local range of the checkpoint.
+    ``_stop_ep_range_prefetch`` stops it, and the page cache eviction calls
+    that first so the thread cannot read evicted pages back in.
     """
+    stop = threading.Event()
+
+    def read(job: tuple[int, int, int]) -> int:
+        if stop.is_set():
+            return 0
+        fd, off, size = job
+        return len(os.pread(fd, size, off))
 
     def run() -> None:
         start = time.perf_counter()
@@ -670,18 +682,25 @@ def _start_ep_range_prefetch(
                         for off in range(lo, hi, block_size)
                     )
             with ThreadPoolExecutor(max_workers=num_threads) as executor:
-                total = sum(
-                    executor.map(lambda j: len(os.pread(j[0], j[2], j[1])), jobs)
-                )
+                total = sum(executor.map(read, jobs))
             elapsed = time.perf_counter() - start
-            logger.info(
-                "[ep-prefetch] read %.1f GiB of local tensors from %d files in "
-                "%.1f s (%.2f GiB/s)",
-                total / 2**30,
-                len(sorted_files),
-                elapsed,
-                total / 2**30 / max(elapsed, 1e-9),
-            )
+            if stop.is_set():
+                logger.info(
+                    "[ep-prefetch] stopped after %.1f GiB of local tensors from "
+                    "%d files in %.1f s",
+                    total / 2**30,
+                    len(sorted_files),
+                    elapsed,
+                )
+            else:
+                logger.info(
+                    "[ep-prefetch] read %.1f GiB of local tensors from %d files in "
+                    "%.1f s (%.2f GiB/s)",
+                    total / 2**30,
+                    len(sorted_files),
+                    elapsed,
+                    total / 2**30 / max(elapsed, 1e-9),
+                )
         except Exception:
             logger.warning("[ep-prefetch] prefetch failed", exc_info=True)
         finally:
@@ -696,7 +715,29 @@ def _start_ep_range_prefetch(
         num_threads,
         block_size,
     )
-    threading.Thread(target=run, name="ep-range-prefetch", daemon=True).start()
+    thread = threading.Thread(target=run, name="ep-range-prefetch", daemon=True)
+    with _prefetch_lock:
+        _prefetches.append((thread, stop))
+    thread.start()
+
+
+# Prefetch threads started by _start_ep_range_prefetch and not yet stopped.
+_prefetches: list[tuple[threading.Thread, threading.Event]] = []
+_prefetch_lock = threading.Lock()
+
+
+def _stop_ep_range_prefetch() -> None:
+    """Stop this process's prefetch threads and wait for them to exit.
+
+    Reads already issued finish; queued ones are skipped.
+    """
+    with _prefetch_lock:
+        prefetches = list(_prefetches)
+        _prefetches.clear()
+    for _, stop in prefetches:
+        stop.set()
+    for thread, _ in prefetches:
+        thread.join()
 
 
 def _evict_one_checkpoint_file(fpath: str) -> float | None:
@@ -793,15 +834,18 @@ def evict_loaded_weights_page_cache() -> None:
     """Evict host page cache for every weight file loaded so far.
 
     Called by the runner after the target and any draft model are loaded.
+
+    Every rank first stops its own prefetch threads, which may still be
+    reading this checkpoint (see ``_start_ep_range_prefetch``), then evicts.
+    The page cache is shared across a host's ranks, but each rank evicts
+    after its own stop, so the last eviction on a host comes after every
+    rank there has stopped reading. A second eviction of a file is cheap.
     """
     if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE or not _loaded_weight_files:
         return
+    _stop_ep_range_prefetch()
     files = list(_loaded_weight_files)
     _loaded_weight_files.clear()
-    # Host page cache is shared across ranks; only local rank 0 issues the eviction
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-    if local_rank != 0:
-        return
     try:
         _evict_checkpoint_page_cache(files)
     except Exception as e:

@@ -14,8 +14,10 @@
 """Unit tests for the deferred weight page cache eviction.
 
 Eviction must wait until every model is loaded: an MTP draft re-reads the
-target checkpoint, and evicting between the two loads makes local rank 0
-re-read it from cold disk while every other rank waits. No TPU, no network.
+target checkpoint, and evicting between the two loads makes a rank re-read it
+from cold disk while every other rank waits. It must also stop the EP range
+prefetch first, or the prefetch reads the evicted pages back in. No TPU, no
+network.
 """
 
 import os
@@ -33,7 +35,7 @@ def evicted(monkeypatch):
     monkeypatch.setattr(envs, "TPU_EVICT_WEIGHTS_PAGE_CACHE", True, raising=False)
     monkeypatch.setattr(mlp, "_evict_checkpoint_page_cache", calls.append)
     monkeypatch.setattr(mlp, "_loaded_weight_files", {})
-    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(mlp, "_prefetches", [])
     return calls
 
 
@@ -70,12 +72,72 @@ def test_files_evicted_concurrently(tmp_path, monkeypatch):
     assert len(fadvise_fds) == 4
 
 
-def test_only_local_rank_zero_evicts(evicted, monkeypatch):
-    monkeypatch.setenv("LOCAL_RANK", "3")
+@pytest.mark.parametrize("local_rank", ["0", "3"])
+def test_every_rank_evicts(evicted, monkeypatch, local_rank):
+    # Each rank evicts after stopping its own prefetch, so the last eviction
+    # on a host follows every rank's stop.
+    monkeypatch.setenv("LOCAL_RANK", local_rank)
     mlp._loaded_weight_files.update(dict.fromkeys(["a"]))
     mlp.evict_loaded_weights_page_cache()
-    assert evicted == []
+    assert evicted == [["a"]]
     assert not mlp._loaded_weight_files
+
+
+def test_eviction_stops_prefetch_before_evicting(tmp_path, monkeypatch):
+    """A prefetch still reading when eviction starts reads nothing after it.
+
+    The draft model's prefetch outlives the draft load: it reads every local
+    range of the checkpoint while the load needs a few tensors.
+    """
+    path = tmp_path / "shard-0.safetensors"
+    path.write_bytes(b"\0" * (64 * 4))
+    monkeypatch.setattr(envs, "TPU_EVICT_WEIGHTS_PAGE_CACHE", True, raising=False)
+    monkeypatch.setattr(mlp, "_loaded_weight_files", {str(path): None})
+    monkeypatch.setattr(mlp, "_prefetches", [])
+    monkeypatch.setattr(mlp, "_local_tensor_ranges", lambda p, ids: [(0, 64 * 4)])
+
+    events: list[str] = []
+    lock = threading.Lock()
+    first_read = threading.Event()
+    real_pread = os.pread
+
+    def pread_until_stopped(fd: int, size: int, off: int) -> bytes:
+        # The first read holds until the eviction sets the prefetch's stop
+        # event, so the reads still queued must be the ones it skips.
+        with lock:
+            events.append("read")
+            first = not first_read.is_set()
+        if first:
+            # Registered before the thread starts, and only cleared by the stop.
+            _, stop = mlp._prefetches[0]
+            first_read.set()
+            assert stop.wait(timeout=5.0)
+        data = real_pread(fd, size, off)
+        with lock:
+            events.append("read-done")
+        return data
+
+    def fake_evict(files: list[str]) -> None:
+        with lock:
+            events.append("evict")
+
+    monkeypatch.setattr(os, "pread", pread_until_stopped)
+    monkeypatch.setattr(mlp, "_evict_checkpoint_page_cache", fake_evict)
+
+    # One reader thread and a 64-byte block: four reads, one at a time.
+    mlp._start_ep_range_prefetch([str(path)], set(), num_threads=1, block_size=64)
+    assert first_read.wait(timeout=5.0)
+    mlp.evict_loaded_weights_page_cache()
+
+    # The eviction waits for the read in flight (the join) and skips the rest.
+    assert events == ["read", "read-done", "evict"]
+    assert not mlp._prefetches
+
+
+def test_stop_without_prefetch_is_a_no_op(monkeypatch):
+    monkeypatch.setattr(mlp, "_prefetches", [])
+    mlp._stop_ep_range_prefetch()
+    assert not mlp._prefetches
 
 
 def test_disabled_leaves_files_untouched(evicted, monkeypatch):
