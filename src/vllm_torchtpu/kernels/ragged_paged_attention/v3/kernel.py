@@ -20,6 +20,7 @@ during inference.
 """
 
 import functools
+import math
 from enum import Enum
 from typing import Any, cast
 
@@ -37,6 +38,9 @@ from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import (
     get_tpu_version,
     next_power_of_2,
 )
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class RpaCase(Enum):
@@ -1503,28 +1507,9 @@ def static_validate_inputs(
     if chunk_prefill_size is not None and chunk_prefill_size <= 0:
         raise ValueError(f"{chunk_prefill_size=} must be positive.")
 
-    def _validate_block_sizes(block_sizes, prefix):
-        if block_sizes is None:
-            return
-        bq_sz, bkv_sz, bq_csz, bkv_csz = block_sizes
-        if not (bq_csz > 0 and bq_sz % bq_csz == 0):
-            raise ValueError(
-                f"{prefix} {bq_csz=} and {bq_sz=} must satisfy (0 < bq_csz and bq_sz"
-                " % bq_csz == 0)."
-            )
-        if not (bkv_csz > 0 and bkv_sz % bkv_csz == 0):
-            raise ValueError(
-                f"{prefix} {bkv_csz=} and {bkv_sz=} must satisfy (0 < bkv_csz and"
-                " bkv_sz % bkv_csz == 0)."
-            )
-        if bkv_sz % page_size != 0:
-            raise ValueError(f"{prefix} {bkv_sz=} must be divisible by {page_size=}.")
-        if bkv_csz % page_size != 0:
-            raise ValueError(f"{prefix} {bkv_csz=} must be divisible by {page_size=}.")
-
-    _validate_block_sizes(d_block_sizes, "decode")
-    _validate_block_sizes(p_block_sizes, "prefill")
-    _validate_block_sizes(m_block_sizes, "mixed")
+    _validate_block_sizes_tuple(d_block_sizes, page_size, "decode")
+    _validate_block_sizes_tuple(p_block_sizes, page_size, "prefill")
+    _validate_block_sizes_tuple(m_block_sizes, page_size, "mixed")
 
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
@@ -1536,6 +1521,88 @@ def static_validate_inputs(
     del q_scale
     del k_scale
     del v_scale
+
+
+def _validate_block_sizes_tuple(block_sizes, page_size: int, prefix: str) -> None:
+    if block_sizes is None:
+        return
+    bq_sz, bkv_sz, bq_csz, bkv_csz = block_sizes
+    if not (bq_csz > 0 and bq_sz % bq_csz == 0):
+        raise ValueError(
+            f"{prefix} {bq_csz=} and {bq_sz=} must satisfy (0 < bq_csz and bq_sz"
+            " % bq_csz == 0)."
+        )
+    if not (bkv_csz > 0 and bkv_sz % bkv_csz == 0):
+        raise ValueError(
+            f"{prefix} {bkv_csz=} and {bkv_sz=} must satisfy (0 < bkv_csz and"
+            " bkv_sz % bkv_csz == 0)."
+        )
+    if bkv_sz % page_size != 0:
+        raise ValueError(f"{prefix} {bkv_sz=} must be divisible by {page_size=}.")
+    if bkv_csz % page_size != 0:
+        raise ValueError(f"{prefix} {bkv_csz=} must be divisible by {page_size=}.")
+
+
+def fit_block_sizes_to_vmem(
+    bq_sz,
+    bkv_sz,
+    bq_csz,
+    bkv_csz,
+    *,
+    q_dtype,
+    kv_dtype,
+    actual_num_q_heads,
+    actual_num_kv_heads,
+    head_dim,
+    vmem_limit_bytes,
+):
+    """Shrinks (bq_sz, bkv_sz, bq_csz, bkv_csz) until the scratch fits in VMEM.
+
+    The KV fetch block is halved first, down to `bkv_csz`: that leaves the
+    compute tiles, and so the register spills, unchanged. Then the query block
+    is halved. Block sizes whose `get_vmem_estimate_bytes` already fits are
+    returned unchanged once aligned to their compute sub-tiles (`bkv_csz` and
+    `bq_csz`). A page-aligned `bkv_csz` keeps `bkv_sz` page aligned.
+    """
+    bkv_sz = align_to(bkv_sz, bkv_csz)
+    bq_csz = math.gcd(bq_sz, min(bq_csz, bq_sz))
+
+    def fits(bq, bkv):
+        return (
+            get_vmem_estimate_bytes(
+                actual_num_kv_heads,
+                max(1, actual_num_q_heads // actual_num_kv_heads),
+                head_dim,
+                bq,
+                bkv,
+                q_dtype,
+                kv_dtype,
+            )
+            <= vmem_limit_bytes
+        )
+
+    while not fits(bq_sz, bkv_sz) and bkv_sz > bkv_csz:
+        bkv_sz = max(bkv_csz, align_to(bkv_sz // 2, bkv_csz))
+    while not fits(bq_sz, bkv_sz) and bq_sz > 1:
+        bq_sz = max(1, bq_sz // 2)
+        bq_csz = math.gcd(bq_sz, min(bq_csz, bq_sz))
+    if not fits(bq_sz, bkv_sz):
+        # Nothing smaller is valid. Return the minimum blocks rather than
+        # raising here, so Mosaic reports the actual VMEM allocation failure
+        # (the estimate can be conservative), but say why it may fail.
+        logger.warning(
+            "RPA v3: even the minimum block sizes (bq=%d, bkv=%d) exceed the "
+            "VMEM limit (%d bytes) for %d q heads / %d kv heads at head_dim "
+            "%d; compilation may fail. Pass smaller explicit block sizes or "
+            "a larger vmem_limit_bytes.",
+            bq_sz,
+            bkv_sz,
+            vmem_limit_bytes,
+            actual_num_q_heads,
+            actual_num_kv_heads,
+            head_dim,
+        )
+    return bq_sz, bkv_sz, bq_csz, bkv_csz
 
 
 def get_default_block_sizes(
@@ -1550,10 +1617,12 @@ def get_default_block_sizes(
     pages_per_seq,
     *,
     case: RpaCase = RpaCase.MIXED,
+    vmem_limit_bytes: int | None = None,
 ):
     """Get (bq, bkv_sz, bq_csz, bkv_csz) by some heuristic formulas.
 
-    Note the default block sizes are not necessarily optimal.
+    Note the default block sizes are not necessarily optimal. They are shrunk
+    to fit `vmem_limit_bytes` (default: the chip's VMEM capacity).
     """
     tpu_version = get_tpu_version()
 
@@ -1598,11 +1667,45 @@ def get_default_block_sizes(
     # The query compute block should never exceed the query fetch block.
     bq_csz = min(bq_csz, bq_sz)
 
+    # `attention_loop` steps `bkv_x2_ref` in fixed `bkv_csz` tiles (`idx * bkv_csz`
+    # for `cdiv(effective_bkv_sz, bkv_csz)` iterations), so `bkv_sz` must be an
+    # exact multiple of `bkv_csz` even when `page_size` is not a power of two
+    # (e.g. `page_size=144` on unified-pool hybrid models, where `align_to(2048,
+    # 144)=2160` is not divisible by `align_to(512, 144)=576`).
+    bkv_csz_aligned = align_to(max(1, bkv_csz), page_size)
+    bkv_sz_aligned = align_to(max(1, bkv_sz), bkv_csz_aligned)
+
+    # The formulas above ignore the head count and head_dim: e.g. 8 local KV
+    # heads at head_dim 256 need ~71 MiB of VMEM in the mixed case on TPU7x.
+    # Only apply automatic VMEM fitting at head_dim >= 256 (or when an explicit
+    # `vmem_limit_bytes` is passed) so standard head_dim <= 128 models keep
+    # their existing heuristic tiles unchanged.
+    if vmem_limit_bytes is not None or head_dim >= 256:
+        if vmem_limit_bytes is None:
+            vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+        bq_sz, bkv_sz, bq_csz, bkv_csz = fit_block_sizes_to_vmem(
+            max(1, bq_sz),
+            bkv_sz_aligned,
+            max(1, bq_csz),
+            bkv_csz_aligned,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            actual_num_q_heads=actual_num_q_heads,
+            actual_num_kv_heads=actual_num_kv_heads,
+            head_dim=head_dim,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+    else:
+        bq_sz = max(1, bq_sz)
+        bkv_sz = bkv_sz_aligned
+        bq_csz = max(1, bq_csz)
+        bkv_csz = bkv_csz_aligned
+
     return {
-        "bq_sz": max(1, bq_sz),
-        "bkv_sz": align_to(bkv_sz, page_size),
-        "bq_csz": max(1, bq_csz),
-        "bkv_csz": align_to(bkv_csz, page_size),
+        "bq_sz": bq_sz,
+        "bkv_sz": bkv_sz,
+        "bq_csz": bq_csz,
+        "bkv_csz": bkv_csz,
     }
 
 
@@ -1928,7 +2031,7 @@ def ragged_paged_attention(
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
-            return get_default_block_sizes(
+            resolved = get_default_block_sizes(
                 q.dtype,
                 kv_cache.dtype,
                 actual_num_q_heads,
@@ -1939,7 +2042,19 @@ def ragged_paged_attention(
                 max_num_seqs,
                 pages_per_seq,
                 case=case,
+                vmem_limit_bytes=vmem_limit_bytes,
             )
+            _validate_block_sizes_tuple(
+                (
+                    resolved["bq_sz"],
+                    resolved["bkv_sz"],
+                    resolved["bq_csz"],
+                    resolved["bkv_csz"],
+                ),
+                page_size,
+                case.name.lower(),
+            )
+            return resolved
         return {
             "bq_sz": block_sizes[0],
             "bkv_sz": block_sizes[1],
