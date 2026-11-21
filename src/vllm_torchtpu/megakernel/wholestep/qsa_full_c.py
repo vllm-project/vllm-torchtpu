@@ -389,6 +389,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         (scalar), in score-position order: under `compressed_dcp` rank 0's half's visible
         prefix, then rank 1's."""
         S, span = self.max_groups // 128, CH * 128
+        nv = jnp.clip(nv, 0, self.max_groups)  # hardening: out-of-range n_vis cannot widen m
         if not self.compressed_dcp:
             return jnp.minimum((nv + span - 1) // span, S // CH), lambda i: i * CH
         Sh = S // self.dcp
