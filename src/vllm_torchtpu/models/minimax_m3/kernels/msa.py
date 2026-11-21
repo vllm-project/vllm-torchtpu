@@ -522,45 +522,6 @@ def write_index_shard(
     )
 
 
-def fold_index_heads(
-    index_q: jax.Array, seq_lens: jax.Array, cu_q_lens: jax.Array
-) -> tuple[jax.Array, jax.Array]:
-    """``index_q [T, H, D]`` folded into query rows ``[H * T, D]`` (request
-    ``s`` owns rows ``[H * cu[s], H * cu[s + 1])`` in (head, token) order),
-    and each head's and token's row ``[H, T]``."""
-    num_tokens, num_heads, head_dim = index_q.shape
-    seq_id, _, valid = token_positions(num_tokens, seq_lens, cu_q_lens)
-    tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
-    head = jnp.arange(num_heads, dtype=jnp.int32)[:, None]
-    num_real = cu_q_lens[-1]
-    rows = jnp.where(
-        valid[None],
-        num_heads * cu_q_lens[seq_id][None]
-        + head * q_len[None]
-        + (tok - cu_q_lens[seq_id])[None],
-        # Padding tokens after the last request, one unique row each.
-        num_heads * num_real + head * (num_tokens - num_real) + (tok - num_real)[None],
-    )
-    # The folded rows by a gather from each row's (token, head): the inverse
-    # of `rows`. As a scatter of `index_q` into `rows` this cost ~75 us per
-    # layer at c64's 8K-token steps (twin j-40c5ed08).
-    r = jnp.arange(num_heads * num_tokens, dtype=jnp.int32)
-    starts = num_heads * cu_q_lens
-    seq = jnp.searchsorted(starts[1:], r, side="right", method="compare_all")
-    seq = jnp.minimum(seq, seq_lens.shape[0] - 1).astype(jnp.int32)
-    real = r < num_heads * num_real
-    first = jnp.where(real, msa_indexer.lookup(cu_q_lens, seq), num_real)
-    length = jnp.where(
-        real, msa_indexer.lookup(cu_q_lens, seq + 1) - first, num_tokens - num_real
-    )
-    off = r - num_heads * first
-    length = jnp.maximum(length, 1)
-    src = (first + off % length) * num_heads + off // length
-    folded = index_q.reshape(num_tokens * num_heads, head_dim)[src]
-    return folded, rows
-
-
 def partial_block_scores(
     index_q: jax.Array,
     index_cache: jax.Array,
@@ -583,9 +544,9 @@ def partial_block_scores(
     rows ``[H * cu[s], H * cu[s + 1])``), so one `block_scores` call reads
     the shard's pages once per query tile. Row ``t * H + h`` is head ``h`` of
     token ``t``, ``index_q`` as laid out: `block_scores` is blind to the row
-    order within a request (it masks no key by position), and the
-    (head, token) order of `fold_index_heads` took a scatter (~5 us per
-    layer in the c64 decode twin, j-9a9fccc2).
+    order within a request (it masks no key by position), and a (head,
+    token) order took a scatter (~5 us per layer in the c64 decode twin,
+    j-9a9fccc2).
     """
     num_tokens, num_heads, head_dim = index_q.shape
     folded = index_q.reshape(num_tokens * num_heads, head_dim)

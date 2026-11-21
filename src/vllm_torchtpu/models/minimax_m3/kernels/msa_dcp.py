@@ -770,16 +770,15 @@ def _class_candidates(
     moved 32x the bytes, which the transposing pick kernel then turned back.
 
     ``index_q [T, G, D]``: ``G > 1`` heads are folded into each request's
-    query rows in (head, token) order (`msa.fold_index_heads`), which the
-    column positions below assume.
+    query rows in (token, head) order, as laid out: the block scores are
+    blind to the row order within a request, and a (head, token) order took
+    a row gather of the queries (~45 us per layer at c64's 8K-token mixed
+    steps, twin j-a202588d).
     """
-    num_tokens, num_heads, _ = index_q.shape
-    if num_heads == 1:
-        folded = index_q
-        rows = jnp.arange(num_tokens, dtype=jnp.int32)[None]
-    else:
-        folded, rows = msa.fold_index_heads(index_q, local_lens, cu_q_lens)
-        folded = folded[:, None]
+    num_tokens, num_heads, head_dim = index_q.shape
+    rows = jnp.arange(num_tokens * num_heads, dtype=jnp.int32)
+    rows = rows.reshape(num_tokens, num_heads).T  # [G, T]: head h of token t
+    folded = index_q.reshape(num_tokens * num_heads, 1, head_dim)
     folded_cu = num_heads * cu_q_lens
     plan = msa_indexer.class_plan(
         folded,
@@ -802,12 +801,15 @@ def _class_candidates(
         (plan.large(), plan.large_block_q, True),
     ):
         # A column's query row sits at offset o of its request's folded rows,
-        # token o mod q_len of it: position = len - q_len + o mod q_len.
+        # token o // G of it: position = len - q_len + o // G. Rows of a tile
+        # past its request (never gathered back) stay inside its positions,
+        # which bound the candidate scan's width.
         per_tile = functools.partial(msa_indexer.lookup, index=scored.tile_seq)
         row = scored.tile_row0[:, None] + jnp.arange(block_q, dtype=jnp.int32)[None, :]
         offset = row - per_tile(folded_cu[:-1])[:, None]
         q_len = jnp.maximum(per_tile(q_lens), 1)[:, None]
-        col_pos = (per_tile(seq_lens)[:, None] - q_len + offset % q_len).reshape(-1)
+        token = jnp.clip(offset // num_heads, 0, q_len - 1)
+        col_pos = (per_tile(seq_lens)[:, None] - q_len + token).reshape(-1)
         # A class's scores are padded to its worst-case tile count (the large
         # class: 66 tiles of 512 at 8K tokens for ~14 real ones); pick in
         # its live tiles only.
