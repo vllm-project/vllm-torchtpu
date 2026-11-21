@@ -1576,7 +1576,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # combined and mixed rows written back block by block, f32 intermediates
     # bounded to 128-row chunks). 1 keeps hc_decode.py's math and order
     # (bitwise target); 2 takes hc_decode_cmp.py's math (injection logits on
-    # the MXU, tanh sigmoid; ulp-level). 0 (default) keeps hc_decode.py.
+    # the MXU, tanh sigmoid; ulp-level). 3 (q38 HC-HIGHROWS-2, W3) keeps mode
+    # 1's math on a row-block software pipeline (bitwise target). 0 (default)
+    # keeps hc_decode.py.
     # Exclusive with TPU_QWEN4_HC_DECODE_COMPARE.
     "TPU_QWEN4_HC_DECODE_WIDE": env_int("TPU_QWEN4_HC_DECODE_WIDE", 0),
     # qwen4_exp prefill: let the fused HC mix (hc_full) and the gated_residual

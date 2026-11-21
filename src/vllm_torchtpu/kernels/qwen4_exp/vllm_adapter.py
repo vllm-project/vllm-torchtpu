@@ -144,7 +144,7 @@ def _decode_mix_choice():
     if wide:
         if wide not in WIDE_MODES:
             raise ValueError(
-                f"TPU_QWEN4_HC_DECODE_WIDE={wide}: expected 0 (off), 1 or 2"
+                f"TPU_QWEN4_HC_DECODE_WIDE={wide}: expected 0 (off), 1, 2 or 3"
             )
         cmp_set = envs.TPU_QWEN4_HC_DECODE_COMPARE
         if cmp_set or envs.TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID:

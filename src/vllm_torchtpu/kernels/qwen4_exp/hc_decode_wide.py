@@ -38,6 +38,16 @@ Modes (static):
   ``(1 + tanh(u / 2)) / 2`` with the half folded into the gate. It differs from
   ``hc_decode.py`` at the ulp level and can move a bf16 rounding.
 
+* 3, W3 (q38 HC-HIGHROWS-2): mode 1's math and rounding, every expression
+  of ``hc_decode.py`` unchanged, on a row-block software pipeline. The down
+  rows are copied right after the first row block (budget ``W3_LOOKAHEAD_MIB``),
+  and block i-1's full-K down projection and gate are emitted, unrolled, in one
+  region with block i's combine / norm / injection pieces, so the scheduler can
+  run the matrix pass beside the vector work. A row split keeps the served
+  order (``TPU_QWEN4_HC_DECODE_TILE_ROWS=256`` is bit-identical to 512 on
+  device at 288-496 rows); bit identity with ``hc_decode.py`` is decided on
+  device.
+
 ``timing`` (bench only): ``"dma"`` runs the copies and no compute,
 ``"compute"`` the compute and no copies.
 """
@@ -60,9 +70,11 @@ SERVED_PIECE = 32  # hc_decode.py's _ROW_CHUNK
 CMP_PIECE = 16  # hc_decode_cmp.py's PIECE
 CHUNK = 256
 LANES = 128
-MODES = (1, 2)
+MODES = (1, 2, 3)
 TIMINGS = ("full", "dma", "compute")
 LOOKAHEAD_MIB = 8
+# Mode 3: block 0's rows, the down rows and block 1's rows in flight at once.
+W3_LOOKAHEAD_MIB = 12
 VMEM_LIMIT = 56 << 20
 
 
@@ -134,7 +146,7 @@ def _kernel(
     h_hbm = refs.pop(0) if prologue else None
     res_vm, w_vm, dn_vm, up_vm, xn_vm, gate_vm, mixed_vm = refs[:7]
     refs = refs[7:]
-    injw_vm = refs.pop(0) if inject and mode == 1 else None
+    injw_vm = refs.pop(0) if inject and mode in (1, 3) else None
     w1_vm = refs.pop(0) if mode == 2 else None
     y_vm = refs.pop(0) if mode == 2 else None
     if prologue:
@@ -163,7 +175,7 @@ def _kernel(
     w_in = copy(w_hbm, w_vm)
     if inject:
         # Mode 2: the inject rows go below the down rows ([down; inject; unused]).
-        inj_dst = injw_vm if mode == 1 else dn_vm.at[pl.ds(lowrank, branches), :]
+        inj_dst = injw_vm if mode in (1, 3) else dn_vm.at[pl.ds(lowrank, branches), :]
         inj_in = copy(injw_hbm, inj_dst)
     pinj_in = copy(pinj_hbm, pinj_vm) if prologue else None
     rows_in, blk_in = [], []
@@ -186,10 +198,15 @@ def _kernel(
         queue.append((rows_in[i], rb * width * 2))
         if prologue:
             queue.append((blk_in[i], rb * hidden * 2))
-    queue.append((dn_in, lowrank * width * 2))
+        if mode == 3 and i == 0:
+            # W3: the down rows right after the first block; its full-K dot
+            # runs beside block 1's vector work.
+            queue.append((dn_in, lowrank * width * 2))
+    if mode != 3:
+        queue.append((dn_in, lowrank * width * 2))
     queue.append((up_in, width * 3 * LANES * 2))
-    budget = lookahead << 20
-    state = dict(started=0, waited=-1)
+    budget = (W3_LOOKAHEAD_MIB if mode == 3 else lookahead) << 20
+    state = dict(started=0, waited=-1, done=set())
 
     def pump():
         while state["started"] < len(queue):
@@ -201,7 +218,12 @@ def _kernel(
             state["started"] += 1
 
     def need(c):
+        # A copy is waited once (mode 3 needs the down rows at block 1 and
+        # again before the last block's down projection).
         i = next(j for j, (q, _) in enumerate(queue) if q is c)
+        if i in state["done"]:
+            return
+        state["done"].add(i)
         while state["started"] <= i:
             queue[state["started"]][0].start()
             state["started"] += 1
@@ -211,7 +233,7 @@ def _kernel(
 
     pump()
     need(w_in)
-    if inject and mode == 1:
+    if inject and mode in (1, 3):
         need(inj_in)
     if prologue:
         need(pinj_in)
@@ -294,12 +316,38 @@ def _kernel(
             v = res_vm[prs, cols].astype(jnp.float32)
             xn_vm[prs, cols] = (v * rb * w1_vm[:, cols]).astype(jnp.bfloat16)
 
+    def down_block(i):
+        """W3: hc_decode.py's down projection and gate, unchanged, on block
+        ``i``'s rows (full K; a row split keeps the served order)."""
+        rows = pl.ds(*blocks[i])
+        down_acc = jax.lax.dot_general(
+            xn_vm[rows, :],
+            dn_vm[...],
+            dimension_numbers=nt,
+            preferred_element_type=jnp.float32,
+        )
+        gate = (down_acc.astype(jnp.bfloat16) / branches).astype(jnp.bfloat16)
+        gate_vm[rows, :] = jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16)
+
     h_out = []
     for i, (r0, rb) in enumerate(blocks):
         need(rows_in[i])
         if prologue:
             need(blk_in[i])
-        if compute and mode == 1:
+        if mode == 3:
+            # Block i-1's matrix pass, then block i's served pieces, unrolled
+            # in one region (hc_decode_cmp.py's overlap, on row blocks).
+            if i >= 1:
+                need(dn_in)
+                if compute:
+                    down_block(i - 1)
+            if compute:
+                pieces, tail = divmod(rb, SERVED_PIECE)
+                for p in range(pieces):
+                    served_rows(r0 + p * SERVED_PIECE, SERVED_PIECE)
+                if tail:
+                    served_rows(r0 + pieces * SERVED_PIECE, tail)
+        elif compute and mode == 1:
             pieces, tail = divmod(rb, SERVED_PIECE)
             assert pieces >= 2 and tail in (0, 16), (rb, pieces, tail)
 
@@ -329,7 +377,9 @@ def _kernel(
     if inject and mode == 2:
         need(inj_in)
     need(dn_in)
-    if compute and mode == 1:
+    if compute and mode == 3:
+        down_block(len(blocks) - 1)
+    elif compute and mode == 1:
         # hc_decode.py's down projection and gate, unchanged (one dot).
         down_acc = jax.lax.dot_general(
             xn_vm[...],
@@ -383,7 +433,7 @@ def _kernel(
     mixed_out = []
     for c0, rc in blocks:
         rows = pl.ds(c0, rc)
-        if compute and mode == 1:
+        if compute and mode in (1, 3):
             # hc_decode.py's up projection and branch mean, unchanged, on rc rows.
             mixed = None
             for b in range(branches):
@@ -549,7 +599,7 @@ def _hc_decode_mix_wide(
     ):
         raise ValueError(
             "HC decode mix (wide) requires BF16 rows that are a multiple of 16 "
-            f"in [{MIN_TOKENS}, {MAX_TOKENS}] and mode 1 or 2"
+            f"in [{MIN_TOKENS}, {MAX_TOKENS}] and mode 1, 2 or 3"
         )
 
     any_space = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
@@ -559,7 +609,7 @@ def _hc_decode_mix_wide(
         out_shape.append(jax.ShapeDtypeStruct((tokens, branches), jnp.float32))
     if prologue:
         out_shape.append(jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16))
-    if mode == 1:
+    if mode in (1, 3):
         down_rows = lowrank
     else:
         # [down; inject; unused], a whole number of 128-row tiles.
@@ -573,7 +623,7 @@ def _hc_decode_mix_wide(
         pltpu.VMEM((tokens, lowrank), jnp.bfloat16),  # gate_vm
         pltpu.VMEM((tokens, hidden), jnp.bfloat16),  # mixed_vm
     ]
-    if inject and mode == 1:
+    if inject and mode in (1, 3):
         scratch.append(pltpu.VMEM((branches, width), jnp.bfloat16))  # injw_vm
     if mode == 2:
         scratch.append(pltpu.VMEM((CMP_PIECE, width), jnp.float32))  # w1_vm

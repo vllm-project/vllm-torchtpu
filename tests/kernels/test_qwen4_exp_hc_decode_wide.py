@@ -72,7 +72,7 @@ def _specs(tokens, inject=True, prologue=True):
     return args, extra
 
 
-@pytest.mark.parametrize("tokens,mode", [(144, 1), (512, 1), (168, 2), (448, 3)])
+@pytest.mark.parametrize("tokens,mode", [(144, 1), (512, 1), (168, 2), (448, 4)])
 def test_wide_rejects_unsupported_rows_and_modes(tokens, mode):
     args, extra = _specs(tokens)
 
@@ -94,7 +94,7 @@ def test_auto_keeps_served_kernel_outside_wide_rows(tokens, monkeypatch):
 
 
 @pytest.mark.parametrize("tokens", [160, 240, 448, 496])
-@pytest.mark.parametrize("mode", [1, 2])
+@pytest.mark.parametrize("mode", [1, 2, 3])
 def test_auto_takes_wide_kernel_at_wide_rows(tokens, mode, monkeypatch):
     calls = []
     monkeypatch.setattr(hc_decode_wide, "hc_decode_mix", lambda *a, **k: calls.append(("served", k["max_tile"])))
@@ -130,13 +130,13 @@ def test_op_names_follow_the_flag(monkeypatch):
     base = _names(monkeypatch)
     assert len(base) == 4 and all(n.endswith("_t512_v1") for n in base), base
     assert _names(monkeypatch, 0) == base
-    for mode in (1, 2):
+    for mode in (1, 2, 3):
         names = _names(monkeypatch, mode)
         assert all(n.endswith(f"_t512_w{mode}_v1") for n in names), names
         assert [n.replace(f"_w{mode}_v1", "_v1") for n in names] == base
 
 
-@pytest.mark.parametrize("wide,compare,match", [(1, True, "exclusive"), (2, True, "exclusive"), (3, False, "expected 0")])
+@pytest.mark.parametrize("wide,compare,match", [(1, True, "exclusive"), (2, True, "exclusive"), (4, False, "expected 0")])
 def test_op_build_refuses_bad_settings(monkeypatch, wide, compare, match):
     with pytest.raises(ValueError, match=match):
         _names(monkeypatch, wide, compare)
@@ -151,7 +151,7 @@ def test_compile_factors_key_the_flag(monkeypatch):
     monkeypatch.setenv("TPU_QWEN4_HC_DECODE_WIDE", "0")
     zero = tpu_compiler._tpu_compile_env_factors()
     assert unset == zero and unset["TPU_QWEN4_HC_DECODE_WIDE"] == 0
-    for mode in (1, 2):
+    for mode in (1, 2, 3):
         monkeypatch.setenv("TPU_QWEN4_HC_DECODE_WIDE", str(mode))
         on = tpu_compiler._tpu_compile_env_factors()
         assert on["TPU_QWEN4_HC_DECODE_WIDE"] == mode
@@ -173,7 +173,7 @@ from torch_tpu._internal import pallas
 from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter as va
 assert va.pallas is pallas and pallas.jax_op.__module__.startswith("torch_tpu"), pallas.jax_op.__module__
 built = 0
-for mode in ("1", "2"):
+for mode in ("1", "2", "3"):
     os.environ["TPU_QWEN4_HC_DECODE_WIDE"] = mode
     os.environ["TPU_QWEN4_HC_DECODE_TILE_ROWS"] = "512"
     for build in (va.build_decode_mix_op, va.build_decode_combine_mix_op):
@@ -198,4 +198,4 @@ def test_real_torch_tpu_wrapper_accepts_the_wide_ops():
     src = str(Path(hc_decode_wide.__file__).resolve().parents[3])
     env = dict(os.environ, PYTHONPATH=src + os.pathsep + os.environ.get("PYTHONPATH", ""))
     proc = subprocess.run([sys.executable, "-c", _REAL_WRAPPER], env=env, capture_output=True, text=True, timeout=600)
-    assert proc.returncode == 0 and "REAL WRAPPER OK built 8" in proc.stdout, proc.stdout[-2000:] + proc.stderr[-3000:]
+    assert proc.returncode == 0 and "REAL WRAPPER OK built 12" in proc.stdout, proc.stdout[-2000:] + proc.stderr[-3000:]
