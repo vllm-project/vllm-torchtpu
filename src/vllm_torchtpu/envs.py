@@ -215,6 +215,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN: int = 2
     VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE: int = 65536
     VLLM_TPU_PACKED_PROMPT_IDS: bool = False
+    VLLM_TPU_ENGINE_ARRAY_PROMPT: bool = False
 
 
 def env_with_choices(
@@ -1371,6 +1372,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of a msgpack list of ints (core/packed_prompt_ids.py). Same ids. A rollout
     # switch: remove it and keep the packed path once serving runs confirm it.
     "VLLM_TPU_PACKED_PROMPT_IDS": env_bool("VLLM_TPU_PACKED_PROMPT_IDS"),
+    # With VLLM_TPU_PACKED_PROMPT_IDS: the engine core's Request keeps the received
+    # int32 array as its prompt instead of a list (core/packed_prompt_ids.py).
+    # Same ids. A rollout switch like the one above.
+    "VLLM_TPU_ENGINE_ARRAY_PROMPT": env_bool("VLLM_TPU_ENGINE_ARRAY_PROMPT"),
 }
 
 

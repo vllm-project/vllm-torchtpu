@@ -24,7 +24,7 @@ from array import array
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from vllm_torchtpu.core.packed_prompt_ids import ENGINE_PACKED
+from vllm_torchtpu.core.packed_prompt_ids import ENGINE_PACKED, PromptIds
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -84,11 +84,12 @@ def get_request_block_hasher(
         start_token_idx = len(request.block_hashes) * hash_block_size
         # The prompt's array as the engine received it (packed_prompt_ids.py):
         # the same 4-byte ids, so the same block hashes, without a second pack.
-        received = (
-            ENGINE_PACKED.take(request.prompt_token_ids)
-            if start_token_idx == 0
-            else None
-        )
+        received = None
+        if start_token_idx == 0:
+            prompt = request.prompt_token_ids
+            received = (
+                prompt if type(prompt) is PromptIds else ENGINE_PACKED.take(prompt)
+            )
         num_tokens = request.num_tokens
         if start_token_idx + hash_block_size > num_tokens:
             return []
@@ -106,8 +107,11 @@ def get_request_block_hasher(
                 )
 
         all_token_ids = request._all_token_ids
-        if start_token_idx == 0:
+        if start_token_idx == 0 and isinstance(all_token_ids, list):
             token_ids = all_token_ids
+        elif received is not None and len(received) >= end_token_idx:
+            # Read without making the whole prompt a list (PromptIds).
+            token_ids = received
         else:
             token_ids = all_token_ids[start_token_idx:end_token_idx]
         if received is not None and len(received) >= end_token_idx:
