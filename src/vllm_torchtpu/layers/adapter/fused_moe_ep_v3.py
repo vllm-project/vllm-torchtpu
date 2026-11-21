@@ -778,8 +778,15 @@ def _unsupported_kernel_reason(
     keeps the grouped-matmul path.
     """
     device = mesh.devices.flat[0]
-    # `supported_on` reads the chip record only for a TPU device.
-    if not supported_on(device):
+    # `supported_on` reads this process's chip record for a TPU device. JAX
+    # raises when the record cannot be read (a device kind it does not know,
+    # or no backend); the kernel's checks cannot run then, and neither could
+    # the kernel, so the layer is refused rather than the load failing.
+    try:
+        supported = supported_on(device)
+    except (ValueError, RuntimeError) as error:
+        return f"the TPU chip record could not be read at weight load: {error}"
+    if not supported:
         return (
             f"the kernel is built and tested on TPU generations "
             f"{SUPPORTED_GENERATIONS} only, and the mesh's devices are "
