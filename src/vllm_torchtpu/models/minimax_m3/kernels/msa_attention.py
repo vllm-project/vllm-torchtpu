@@ -56,14 +56,13 @@ SMALL_BATCH_TOKENS = 1024
 PREFILL_BLOCK_Q = 32
 SMALL_BATCH_BLOCK_Q = 8
 DEFAULT_PAGES_PER_STEP = 16
-# Prefill / mixed-step tiles of the DCP LSE calls over 4-bit caches: 8-token
-# tiles and 32-page groups. A kernel step costs ~0.7 us besides its score work
-# (unpack, selection compares, loop and scratch traffic: timing-only removal
-# arms, j-aec3278d), so fewer, wider groups win, and an 8-token tile's union is
-# small enough to fit one. Standalone call, 8192 tokens with served-c48-like
-# dispersion (5.0 us per 16-token tile as served, j-da859161): 2.60 -> 2.00 ms
-# (j-ac9898cc).
-PREFILL_BLOCK_Q_4BIT = 8
+# Prefill / mixed-step tiles of the DCP LSE calls over 4-bit caches: 64-token
+# tiles (`attend_t`, K / V scales folded into bf16 rows) and 32-page groups. A
+# tile's pages are unpacked once for 64 tokens instead of 8; it pays while a
+# step's tokens select much the same pages. Standalone 8192-token call, c48
+# shape: 0.98 -> 0.50 ms (selections .999-local), 1.04 -> 0.65 (.995), even at
+# .98 and +8 % at .97 (r12 j-50d34835, j-9c5505d9).
+PREFILL_BLOCK_Q_4BIT = 64
 PREFILL_PAGES_PER_STEP_4BIT = 32
 # 8/16-bit prefill / mixed-step groups: 32 pages, with the 24-page step width
 # (`msa_attention_lse._STEP_WIDTHS`). Standalone fp8 32-token tiles: 1.62-1.66
