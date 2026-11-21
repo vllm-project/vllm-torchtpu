@@ -853,4 +853,9 @@ def attend_and_merge(
         return out.at[dest].set(dcp_out, mode="drop")
 
     prefix = jnp.all((p >= num_decode) | (src_row == p))
-    return jax.lax.cond(prefix, decode_prefix, scatter, hp_out)
+    # The barrier keeps the consumer's ops out of the branches: XLA sank the
+    # output projection's f32 convert of the whole output into them (a 32 MB
+    # f32 copy, ~20 us per layer at c64's 8K-token steps, twin j-a202588d).
+    return jax.lax.optimization_barrier(
+        jax.lax.cond(prefix, decode_prefix, scatter, hp_out)
+    )
