@@ -310,7 +310,10 @@ def test_pair_first_reduce_scatter_matches_psum_scatter():
 
     def body(fn):
         return jax.shard_map(
-            fn, mesh=mesh, in_specs=(P("dcp"), P("dcp")), out_specs=P("dcp"),
+            fn,
+            mesh=mesh,
+            in_specs=(P("dcp"), P("dcp")),
+            out_specs=P("dcp"),
             check_vma=False,
         )(x, ranks)
 

@@ -225,6 +225,9 @@ _PAGES_PER_CHUNK = 128
 # fp8 5 x 450 pages 25.5 -> 24.1, j-0a884760; of 256-page ones 4 -> 8: 87.7
 # -> 77.9 and 22.7 -> 21.5, j-83e37332). An earlier sweep found all chunks
 # slower (j-2e0b290e), before the copies took one scalar address each.
+# Measured with 32-page chunks; with `_PAGES_PER_CHUNK` 128 a 128-page group
+# is one chunk and a 256-page group two, which then carry all of it (the
+# 128-page dots measured faster with this spreading collapsed, j-3fb5ff45).
 _DMA_ISSUE_CHUNKS = 8
 # Page groups in `_kernel_v3`'s DMA ring.
 _RING_SLOTS = 3

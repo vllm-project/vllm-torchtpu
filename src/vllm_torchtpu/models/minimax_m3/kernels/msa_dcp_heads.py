@@ -116,11 +116,11 @@ def merge_partials(
         interpret=interpret,
     )
     if dcp == 4:
+        # Pays when ranks r and r ^ 1 are one chip's cores (the DCP mesh's
+        # contiguous ranks); correct for any device order.
         merged = _pair_first_reduce_scatter(weighted, axis, rank)
     else:
-        merged = jax.lax.psum_scatter(
-            weighted, axis, scatter_dimension=0, tiled=True
-        )
+        merged = jax.lax.psum_scatter(weighted, axis, scatter_dimension=0, tiled=True)
     return msa_fp4.unrotate_output(merged.astype(out.dtype)).transpose(1, 0, 2)
 
 
@@ -131,7 +131,9 @@ def _pair_first_reduce_scatter(x: jax.Array, axis: str, rank: jax.Array):
     ranks ``r`` and ``r ^ 2`` swap the block the other keeps and sum. Only
     one block per rank crosses between the chips, where the reduce-scatter
     sent three (c64 decode twin: 30 us per layer for 3.1 MB, j-09d6a5c6).
-    Sums in f32."""
+    Sums in f32; the pair's sum crosses the chips rounded to ``x.dtype``
+    (bf16 with `TPU_DCP_RS_OUT_PRECISION`), as the reduce-scatter's partial
+    sums travel, in another order."""
     heads = x.shape[0] // 4
     blocks = x.reshape(4, heads, *x.shape[1:])
     even, odd = blocks[0::2], blocks[1::2]  # blocks {0, 2}, {1, 3}
