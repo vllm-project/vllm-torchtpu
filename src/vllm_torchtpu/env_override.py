@@ -90,8 +90,8 @@ if (
 # threshold below). Values mirror JAX's pallas chip table at
 # jax/_src/pallas/mosaic/tpu_info.py. We resolve from the chip family string
 # because we run before libtpu is loadable and cannot query pltpu directly.
-# Unknown families fall through to libtpu's default (no flag set); add new
-# entries here when a new chip family ships.
+# Unknown families fall through to a safe 64 MiB default (safe for v7x/v5p);
+# add new entries here when a new chip family ships.
 _TPU_VMEM_BYTES_PER_TENSOR_CORE = {
     # TPU v5p: 64 MiB per tensor core.
     "v5p": 67108864,
@@ -134,16 +134,30 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
     if override is not None:
         return override if override > 0 else None
 
-    tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
+    tpu_type = (os.getenv("TPU_ACCELERATOR_TYPE") or os.getenv("TPU_TYPE")
+                or os.getenv("ACCELERATOR_TYPE"))
     if not tpu_type:
         tpu_type = _fetch_tpu_type_from_metadata()
     if not tpu_type:
-        return None
+        import sys
+        print(
+            "vllm_torchtpu.env_override: WARNING - TPU accelerator type not found in env or metadata. "
+            "Falling back to safe 64 MiB SparseCore offload threshold.",
+            file=sys.stderr,
+        )
+        # Default to 64 MiB (safe for v7x/v5p) if GCE metadata is unavailable
+        return 67108864
     tpu_type = tpu_type.strip().lower()
     for prefix, size in _TPU_VMEM_BYTES_PER_TENSOR_CORE.items():
         if tpu_type.startswith(prefix):
             return size
-    return None
+    import sys
+    print(
+        f"vllm_torchtpu.env_override: WARNING - Unrecognized TPU accelerator type {tpu_type!r}. "
+        "Falling back to safe 64 MiB SparseCore offload threshold.",
+        file=sys.stderr,
+    )
+    return 67108864
 
 
 _existing_libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
@@ -195,6 +209,11 @@ _libtpu_extra_args: list[str] = []
 # small on --attention-backend CUSTOM).
 if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
     _libtpu_extra_args.append("--xla_tpu_use_dynamic_smem_negotiation=true")
+
+# --xla_tpu_enable_diagnostic_coordinator: disable background telemetry harvester
+# in multi-process/DP serving environments to prevent out-of-range core index traps.
+if not _user_has_flag("--xla_tpu_enable_diagnostic_coordinator"):
+    _libtpu_extra_args.append("--xla_tpu_enable_diagnostic_coordinator=false")
 
 # --xla_tpu_sparse_core_{all_reduce,all_gather}_offload_min_size_in_bytes:
 # raise the SC-offload threshold to the per-tensor-core VMEM capacity so
