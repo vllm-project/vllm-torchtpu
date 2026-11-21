@@ -248,8 +248,9 @@ def calculate_block_sizes(
     - decode VMEM counts the compute tiles once rather than per lane, plus the
       K/V tiles and sub-chunk scores Mosaic spills when q is split, against a
       cap of 85% of VMEM with an fp8 KV cache and 75% otherwise;
-    - an fp8 KV cache (without LSE) takes the fp8 compute threshold, and the
-      fp8/bf16 throughput ratio is rounded rather than floored;
+    - an fp8 KV cache (without LSE) takes the fp8 compute threshold on a chip
+      with fp8 compute, and the fp8/bf16 throughput ratio is rounded rather
+      than floored;
     - prefill bq is clamped to the token count aligned to the MXU width.
     Off (the default), the tiles are the ones these rules replace, so other
     models keep their tiles.
@@ -302,7 +303,7 @@ def calculate_block_sizes(
         batch_size: int,
         bq_sz: int,
         bkv_sz: int,
-        is_decode: bool = False,
+        tuned_decode: bool = False,
     ) -> int:
         """Given tile size, calculate VMEM usage of the kernel."""
 
@@ -373,7 +374,7 @@ def calculate_block_sizes(
         )
 
         # Step 3: Sum up all memory usage.
-        if is_decode:
+        if tuned_decode:
             # Pipeline buffers are allocated per batch item, whereas active
             # compute tiles are live for one batch item at a time.
             total_bytes = buffer_bytes * batch_size + compute_bytes
@@ -424,9 +425,14 @@ def calculate_block_sizes(
         jnp.dtype(jnp.float8_e5m2),
     )
 
-    # Threshold value based on hardware generation and precision.
+    # Threshold value based on hardware generation and precision. A chip
+    # without fp8 compute (fp8_ops_per_second == 0) keeps the bf16 threshold
+    # for an fp8 KV cache: its ratio would round to 0 and zero the threshold.
     is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1 or (
-        tuned_tiles and is_fp8_kv and not serve_cfgs.return_lse
+        tuned_tiles
+        and is_fp8_kv
+        and not serve_cfgs.return_lse
+        and tpu_info.fp8_ops_per_second > 0
     )
 
     match tpu_info.generation:
