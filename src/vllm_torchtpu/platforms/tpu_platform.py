@@ -447,6 +447,7 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE",
         "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER",
         "MOE_FUSED_EP_PUSH_ONEHOT_SCALE_SLAB",
+        "MOE_FUSED_EP_PUSH_PAIR_KERNEL",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

@@ -273,6 +273,7 @@ def _build_op(
             split_exchange=split_exchange and envs.MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE,
             early_scale_scatter=envs.MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER,
             onehot_scale_slab=envs.MOE_FUSED_EP_PUSH_ONEHOT_SCALE_SLAB,
+            pair_kernel=envs.MOE_FUSED_EP_PUSH_PAIR_KERNEL,
         )
         if dspark_draft and envs.TPU_DSPARK_DRAFT_MOE_TUNING:
             impl_kw.update(sc_prepush=1, height_rungs_override=2)

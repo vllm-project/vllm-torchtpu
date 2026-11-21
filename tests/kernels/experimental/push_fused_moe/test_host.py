@@ -521,6 +521,78 @@ def test_plan_from_kernel_tables_matches_the_sharded_plan(skew):
         np.testing.assert_array_equal(np.asarray(slab_row), np.asarray(want_slab))
 
 
+@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+@pytest.mark.parametrize("t_local,topk", [(16, 6), (16, 8), (8, 6)])
+def test_pair_tables_kernel_matches_the_xla_plan(t_local, topk, skew):
+    """plan_kernel.build_pair_tables (interpret mode), fed the exchanged
+    payload and the table kernel's plan tables, gives routing_pairs_from_tables'
+    pos and mirror_pos and the drop-mode scale-slab scatter exactly, at the
+    served decode geometry (ep 8, 48 slots), rows routed nowhere included."""
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.layer import (
+        _exchange_layout,
+        _pack_routing_exchange,
+    )
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
+        build_pair_tables,
+        build_push_tables,
+        pair_tables_apply,
+    )
+
+    ep, g_local = 8, 48
+    idx, kw = _routing(ep, t_local, g_local, topk, skew=skew, seed=17 + topk)
+    e_total = kw["e_total"]
+    layout = _exchange_layout(t_local, topk, e_total, True)
+    scale_rows = host.act_scale_slab_rows(kw["shard_stride"])
+    assert pair_tables_apply(t_local, topk, layout[0], scale_rows)
+    rng = np.random.default_rng(t_local + topk)
+    bits = rng.integers(-(2**31), 2**31, (ep, t_local), dtype=np.int64)
+    bits = jnp.asarray(bits.astype(np.int32))
+    blocks = idx.reshape(ep, t_local * topk // kw["block"], kw["block"])
+    counts = _counts(idx, ep, t_local, e_total)
+    payload = jnp.stack(
+        [
+            _pack_routing_exchange(
+                jnp.asarray(blocks[s].reshape(-1)), bits[s], counts[s], layout
+            )
+            for s in range(ep)
+        ]
+    )
+    rows = -(-layout[2] // 128)
+    out = jnp.pad(payload, ((0, 0), (0, rows * 128 - layout[2]))).reshape(ep, rows, 128)
+    for me in (0, 5, ep - 1):
+        gathered = _gathered(idx, me, kw)
+        seg_start = jnp.asarray(np.cumsum(counts[me]) - counts[me])
+        tables = build_push_tables(
+            gathered.rows_by_dest, seg_start, jnp.int32(me), ep=ep, n_pre=2,
+            tile_m=kw["tile_m"], interpret=True,
+        )[8]  # fmt: skip
+        want_pos, want_mir, slab_row = push_host.routing_pairs_from_tables(
+            jnp.int32(me),
+            gathered,
+            *tables,
+            e_total=e_total,
+            ep=ep,
+            t_local=t_local,
+            block=kw["block"],
+            shard_stride=kw["shard_stride"],
+        )
+        want_slab = (
+            jnp.zeros((scale_rows * 128,), jnp.int32)
+            .at[slab_row]
+            .add(jnp.repeat(bits.reshape(-1), topk), mode="drop")
+        )
+        pos, mir, slab = build_pair_tables(
+            out, *tables, jnp.int32(me), ep=ep, t_local=t_local, topk=topk,
+            block=kw["block"], e_total=e_total, scale_rows=scale_rows,
+            interpret=True,
+        )  # fmt: skip
+        np.testing.assert_array_equal(np.asarray(pos), np.asarray(want_pos))
+        np.testing.assert_array_equal(np.asarray(mir), np.asarray(want_mir))
+        np.testing.assert_array_equal(
+            np.asarray(slab).view(np.int32).reshape(-1), np.asarray(want_slab)
+        )
+
+
 @pytest.mark.parametrize("count_at", [2176, 2000, 300])
 def test_relane_counts_matches_the_reshape(count_at):
     """The exchange-tables kernel's re-laning of the exchanged count words

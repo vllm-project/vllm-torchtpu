@@ -59,7 +59,9 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
 from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
     build_exchange_rows_tables,
     build_exchange_rows_tables_split,
+    build_pair_tables,
     build_push_tables,
+    pair_tables_apply,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.routing import prepare_routing
 from vllm_torchtpu.kernels.experimental.push_fused_moe.sc_dispatch import (
@@ -339,6 +341,7 @@ def fused_ep_moe_push(
     early_scale_scatter=0,
     split_exchange=False,
     onehot_scale_slab=False,
+    pair_kernel=False,
     expert_slot=None,
     expert_load=None,
     shared_expert=None,
@@ -387,7 +390,10 @@ def fused_ep_moe_push(
     rows are in flight (plan_kernel.build_exchange_rows_tables_split), and
     `onehot_scale_slab` builds the activation scale slab of a step with at
     most ONEHOT_SCALE_SLAB_MAX_PAIRS routed pairs on the TensorCore
-    (`_scale_slab_onehot`) instead of a SparseCore scatter. The
+    (`_scale_slab_onehot`) instead of a SparseCore scatter, and with
+    `exchange_tables` and `kernel_plan_tables` `pair_kernel` builds such a
+    step's per-pair tables and scale slab in one kernel from the exchanged
+    payload (plan_kernel.build_pair_tables). The
     caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
@@ -740,6 +746,7 @@ def fused_ep_moe_push(
         pre_tables=None,
         x_l=None,
         shared_fn=None,
+        exchange_slab=None,
     ):
         """Dispatch tables, SparseCore pre-push, plan, kernel and combine.
 
@@ -889,7 +896,31 @@ def fused_ep_moe_push(
         pair_tables = None
         routing_inputs = None
         routing = None
-        if kernel_plan_tables:
+        pair_slab = None
+        scale_rows = act_scale_slab_rows(ragged_stride)
+        if (
+            kernel_plan_tables
+            and pair_kernel
+            and exchange_slab is not None
+            and form.quantized_activations
+            and pair_tables_apply(t_local, topk, layout[0], scale_rows)
+        ):
+            # The per-pair lookups and the scale slab, from the payload.
+            assert shard_tables is not None
+            pos_k, mirror_k, pair_slab = build_pair_tables(
+                exchange_slab,
+                *shard_tables[4],
+                me,
+                ep=ep,
+                t_local=t_local,
+                topk=topk,
+                block=block,
+                e_total=e_total,
+                scale_rows=scale_rows,
+            )
+            pair_tables = (pos_k, mirror_k)
+            slab_row = None
+        elif kernel_plan_tables:
             # The table kernel built the plan's small tables; only the
             # per-pair lookups are left.
             assert shard_tables is not None
@@ -922,29 +953,33 @@ def fused_ep_moe_push(
         # Keep the scale-slab scatter (a SparseCore offload) behind the
         # pre-push on the SparseCore queue. The shared expert joins here, so
         # the expert kernel, which reads the slab, cannot start before it.
+        # The pair kernel's finished slab takes the slab rows' place.
+        slab_in = slab_row if pair_slab is None else pair_slab
         if early_scale_scatter == 2:
             # Nor behind the pre-push: the scatter may take the SparseCore
             # first; the light pre-push still lands under the shared expert.
-            slab_row, scale_bits_g = lax.optimization_barrier((slab_row, scale_bits_g))
+            slab_in, scale_bits_g = lax.optimization_barrier((slab_in, scale_bits_g))
         elif early_scale_scatter:
             # The shared expert joins after the scatter instead (below), so
             # the scatter's SparseCore work can run under it.
-            slab_row, scale_bits_g, slab = lax.optimization_barrier(
-                (slab_row, scale_bits_g, slab)
+            slab_in, scale_bits_g, slab = lax.optimization_barrier(
+                (slab_in, scale_bits_g, slab)
             )
         else:
-            slab_row, scale_bits_g, slab, *shared_out = lax.optimization_barrier(
-                (slab_row, scale_bits_g, slab) + shared_out
+            slab_in, scale_bits_g, slab, *shared_out = lax.optimization_barrier(
+                (slab_in, scale_bits_g, slab) + shared_out
             )
         # The activation row scale, scattered onto the slab row each routed
         # pair computes on (v2's scale slab; see there).
-        if form.quantized_activations:
+        if form.quantized_activations and pair_slab is not None:
+            scale_slab = slab_in
+        elif form.quantized_activations:
+            slab_row = slab_in
             scale_bits = (
                 _repeat_bits(cast(jax.Array, scale_bits_g), topk)
                 if matmul_scale_repeat
                 else jnp.repeat(cast(jax.Array, scale_bits_g), topk)
             )
-            scale_rows = act_scale_slab_rows(ragged_stride)
             if onehot_scale_slab and slab_row.size <= ONEHOT_SCALE_SLAB_MAX_PAIRS:
                 scale_slab = _scale_slab_onehot(slab_row, scale_bits, scale_rows)
             else:
@@ -1051,6 +1086,7 @@ def fused_ep_moe_push(
             gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
         )
         pre_tables = None
+        exchange_slab = None
         my_counts = block_hist.sum(axis=0)
         shared_in, shared_fn = x_l, None
         # On its unfused path the shared expert splits around the exchange.
@@ -1101,11 +1137,15 @@ def fused_ep_moe_push(
                         shared_in, w13, s13, limit=shared_limit
                     )
                 shared_in, handle = lax.optimization_barrier((shared_in, handle))
-                exchange, q_sorted, *pre_tables = done(handle, q_l, seg_start)
+                exchange, q_sorted, *pre_tables, exchange_slab = done(
+                    handle, q_l, seg_start
+                )
             elif exchange_tables:
-                exchange, q_sorted, *pre_tables = build_exchange_rows_tables(
-                    **table_kw
-                )(packed, rank_l[0, 0], q_l, tok, seg_start)
+                exchange, q_sorted, *pre_tables, exchange_slab = (
+                    build_exchange_rows_tables(**table_kw)(
+                        packed, rank_l[0, 0], q_l, tok, seg_start
+                    )
+                )
             else:
                 exchange, q_sorted = build_tc_exchange_all_gather_rows(
                     ep=ep,
@@ -1152,6 +1192,7 @@ def fused_ep_moe_push(
             pre_tables,
             shared_in,
             shared_fn,
+            exchange_slab,
         )
 
     bias_args = tuple(b for b in (w1_bias, w2_bias) if b is not None)
@@ -1242,6 +1283,7 @@ def fused_ep_moe_push(
         int(early_scale_scatter),
         bool(split_exchange),
         bool(onehot_scale_slab),
+        bool(pair_kernel),
     )
     out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
     out_specs = out_specs if len(out_specs) > 1 else out_specs[0]
