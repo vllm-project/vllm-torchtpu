@@ -55,38 +55,13 @@ RUN_DIR="${RUN_DIR:-${RUN_ROOT}/run}"
 BIND_HOST="${BIND_HOST:-127.0.0.1}"
 job_tag="${BUILDKITE_JOB_ID:-${BUILDKITE_BUILD_NUMBER:-0}}"
 PORT_SHIFT="${PORT_SHIFT:-$(($(printf '%s' "${job_tag}" | cksum | cut -d' ' -f1) % 47))}"
-EPHEMERAL_FLOOR="$(cut -f1 /proc/sys/net/ipv4/ip_local_port_range \
-  2>/dev/null || echo 32768)"
-
-# First free port at or above $1, probed the way the servers bind it: an
-# IPv6 wildcard socket, which on Linux covers the IPv4 wildcard too. The
-# probe closes the socket before the server opens it, so this narrows the
-# race to milliseconds instead of leaving the port unchecked for the run.
-# The scan span stays well inside the 500-port gap between bases.
-pick_port() {
-  python3 - "$1" "${EPHEMERAL_FLOOR}" <<'PY'
-import socket
-import sys
-
-base, floor = int(sys.argv[1]), int(sys.argv[2])
-end = min(base + 100, floor)
-# gRPC binds a dualstack wildcard where it can and falls back to IPv4
-# where it cannot; probe with whichever this host actually supports.
-dualstack = socket.has_dualstack_ipv6()
-family = socket.AF_INET6 if dualstack else socket.AF_INET
-for port in range(base, end):
-    try:
-        probe = socket.create_server(("", port), family=family,
-                                     dualstack_ipv6=dualstack)
-    except OSError:
-        continue
-    probe.close()
-    print(port)
-    break
-else:
-    raise SystemExit(f"no port free in [{base}, {end})")
-PY
-}
+GPC_LOG_DIR="${RUN_DIR}/logs"
+REGISTRY_PID=""
+NODE_PID=""
+SERVER_PID=""
+# pick_port, stop_gpc_processes, check_control_plane, wait_port.
+# shellcheck source=scripts/vllm/integration/gpc_control_plane.sh
+source "${script_dir}/gpc_control_plane.sh"
 
 server_base=$((8100 + PORT_SHIFT))
 registry_base=$((21500 + PORT_SHIFT))
@@ -176,55 +151,7 @@ export GLOG_alsologtostderr=1
 global_registry_server --port="${REGISTRY_PORT}" \
   >"${RUN_DIR}/logs/registry.log" 2>&1 &
 REGISTRY_PID=$!
-
-SERVER_PID=""
-NODE_PID=""
-cleanup() {
-  local pid
-  for pid in "${SERVER_PID}" "${NODE_PID}" "${REGISTRY_PID}"; do
-    if [[ -n "${pid}" ]]; then kill -TERM "${pid}" 2>/dev/null || true; fi
-  done
-  sleep 2
-  for pid in "${SERVER_PID}" "${NODE_PID}" "${REGISTRY_PID}"; do
-    if [[ -n "${pid}" ]]; then kill -KILL "${pid}" 2>/dev/null || true; fi
-  done
-}
-trap cleanup EXIT
-
-check_control_plane() {
-  kill -0 "${REGISTRY_PID}" 2>/dev/null || {
-    tail -50 "${RUN_DIR}/logs/registry.log" || true
-    # A lost port race is the one failure the registry cannot report itself
-    # on older wheels: it announces the address it never bound and then
-    # crashes, so name the cause here rather than leaving "exited".
-    if grep -qE "Failed to (add port|listen)" \
-        "${RUN_DIR}/logs/registry.log" 2>/dev/null; then
-      fail "global_registry_server could not bind port ${REGISTRY_PORT}:\
- something else on this agent holds it"
-    fi
-    fail "global_registry_server exited"
-  }
-  if [[ -n "${NODE_PID}" ]]; then
-    kill -0 "${NODE_PID}" 2>/dev/null || {
-      tail -50 "${RUN_DIR}/logs/store_node.log" || true
-      fail "kv_cache_host_store_node_main exited"
-    }
-  fi
-}
-
-wait_port() {
-  local port="$1" what="$2" timeout="${3:-60}" waited=0
-  until (exec 3<>"/dev/tcp/${BIND_HOST}/${port}") 2>/dev/null; do
-    exec 3>&- 2>/dev/null || true
-    check_control_plane
-    [[ "${waited}" -lt "${timeout}" ]] \
-      || fail "${what} (${BIND_HOST}:${port}) not reachable after ${waited}s"
-    sleep 1
-    waited=$((waited + 1))
-  done
-  exec 3>&- 2>/dev/null || true
-  echo "${what} port ${port} reachable"
-}
+trap stop_gpc_processes EXIT
 
 wait_port "${REGISTRY_PORT}" "global registry"
 
