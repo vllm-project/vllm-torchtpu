@@ -32,10 +32,24 @@ from vllm_torchtpu.megakernel.advisor import (
     jax_bridge,
     models,
     specs,
+    support,
 )
 from vllm_torchtpu.megakernel.core import errors
 
 SOURCE_PREFIXES = ("FACT:", "DERIVED:", "ASSUMED:", "CHOSEN:")
+EXPECTED_VECTOR_REGISTERS_PER_CORE = 64
+EXPECTED_VECTOR_REGISTER_BYTES = 4096
+EXPECTED_VECTOR_LOADS_PER_CYCLE = 3
+EXPECTED_VECTOR_STORES_PER_CYCLE = 2
+EXPECTED_VECTOR_PORT_OPS_PER_CYCLE = 4
+EXPECTED_CLOCK_HZ = 2.2e9
+PUBLIC_SCALING_BOOK_TPU_CHAPTER_URL = "jax-ml.github.io/scaling-book/tpus"
+CHIP_WITHOUT_VECTOR_REGISTER_FIGURES = "v6e"
+UNSET_SOURCE_PREFIX = "CHOSEN: 0 (unset)"
+EXPECTED_VECTOR_LOAD_CAP_TEXT = (
+    "Vector register load cap: 3 x 4,096 B x 2.2e9 Hz = 27.03 TB/s per core. "
+    "It is above the HBM rate, so it does not bind while weights stream from HBM."
+)
 
 
 SHIPPED_PRESET_COUNT = 13
@@ -783,6 +797,52 @@ def test_quantization_peak_flops_and_hf_subchannel_parsing() -> None:
     assert p_subchannel.weight_dtype == "fp8"
 
 
+def test_vector_register_constants_are_public_values() -> None:
+    """Verify TPU 7x vector register fields, provenance, and derived load cap."""
+    chip_spec = chips.resolve_chip_spec("tpu7x")
+    assert chip_spec.vector_registers_per_core == EXPECTED_VECTOR_REGISTERS_PER_CORE
+    assert chip_spec.vector_register_bytes == EXPECTED_VECTOR_REGISTER_BYTES
+    assert chip_spec.vector_loads_per_cycle == EXPECTED_VECTOR_LOADS_PER_CYCLE
+    assert chip_spec.vector_stores_per_cycle == EXPECTED_VECTOR_STORES_PER_CYCLE
+    assert chip_spec.vector_port_ops_per_cycle == EXPECTED_VECTOR_PORT_OPS_PER_CYCLE
+    assert chip_spec.clock_hz == EXPECTED_CLOCK_HZ
+
+    new_field_names = (
+        "vector_registers_per_core",
+        "vector_register_bytes",
+        "vector_loads_per_cycle",
+        "vector_stores_per_cycle",
+        "vector_port_ops_per_cycle",
+        "clock_hz",
+    )
+    assert chip_spec.sources is not None
+    for field_name in new_field_names:
+        assert field_name in chip_spec.sources
+        field_source_text = chip_spec.sources[field_name]
+        assert PUBLIC_SCALING_BOOK_TPU_CHAPTER_URL in field_source_text
+
+    calculated_cap = (
+        chip_spec.vector_loads_per_cycle
+        * chip_spec.vector_register_bytes
+        * chip_spec.clock_hz
+    )
+    assert chip_spec.vector_load_cap_bytes_per_s == calculated_cap
+    assert chip_spec.vector_load_cap_bytes_per_s > chip_spec.hbm_bw_bytes_per_s
+
+    sweep = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    table_text = advisor.format_regime_table(sweep)
+    html_text = advisor.render_advisor_html(sweep)
+    assert EXPECTED_VECTOR_LOAD_CAP_TEXT in table_text
+    assert EXPECTED_VECTOR_LOAD_CAP_TEXT in html_text
+
+    unset_chip_spec = chips.resolve_chip_spec(CHIP_WITHOUT_VECTOR_REGISTER_FIGURES)
+    assert not unset_chip_spec.vector_load_cap_bytes_per_s
+    assert not advisor.report.vector_register_load_cap_line(unset_chip_spec)
+    assert unset_chip_spec.sources is not None
+    for field_name in new_field_names:
+        assert unset_chip_spec.sources[field_name].startswith(UNSET_SOURCE_PREFIX)
+
+
 def test_kimi_k3_declares_eight_expert_owner_groups() -> None:
     """Verify Kimi-K3 decode and saturation presets declare 8 expert owner groups."""
     kimi_preset = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
@@ -1467,3 +1527,54 @@ def test_preset_loaders_reject_malformed_fields(
         match="dtype_basis must be one of",
     ):
         models.load_preset_dtype_basis()
+
+
+def test_config_notice_reports_preset_match(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify `--config` stderr notice covers matched, custom-named, and unmatched."""
+    snapshots = _load_config_snapshots()
+    base_cfg = snapshots["kimi-k3"]["config"]
+    assert isinstance(base_cfg, dict)
+
+    matched_dir = tmp_path / "neutral-checkpoint"
+    matched_dir.mkdir(parents=True, exist_ok=True)
+    matched_cfg = matched_dir / "config.json"
+    matched_cfg.write_text(json.dumps(base_cfg), encoding="utf-8")
+    assert advisor.main(["--config", str(matched_cfg), "--chip", "tpu7x"]) == 0
+    matched_err = capsys.readouterr().err
+    assert (
+        "Config matched shipped preset kimi-k3: "
+        "its layouts and megakernel declarations apply."
+    ) in matched_err
+
+    altered_cfg = copy.deepcopy(base_cfg)
+    text_cfg = altered_cfg["text_config"]
+    assert isinstance(text_cfg, dict)
+    text_cfg["num_hidden_layers"] = int(str(text_cfg["num_hidden_layers"])) + 1
+
+    preset_named_dir = tmp_path / "kimi_k3"
+    preset_named_dir.mkdir(parents=True, exist_ok=True)
+    preset_named_cfg = preset_named_dir / "config.json"
+    preset_named_cfg.write_text(json.dumps(altered_cfg), encoding="utf-8")
+    renamed_profile = advisor.resolve_model_profile(str(preset_named_cfg))
+    assert renamed_profile.name == "kimi_k3-custom"
+    renamed_tier, _ = support.classify_model_support_tier(renamed_profile)
+    assert renamed_tier != "declared"
+    assert advisor.main(["--config", str(preset_named_cfg), "--chip", "tpu7x"]) == 0
+    renamed_err = capsys.readouterr().err
+    assert "kimi-k3" in renamed_err
+    assert "kimi_k3-custom" in renamed_err
+    assert "no megakernel declaration" in renamed_err
+
+    unmatched_dir = tmp_path / "custom-arch"
+    unmatched_dir.mkdir(parents=True, exist_ok=True)
+    unmatched_cfg = unmatched_dir / "config.json"
+    unmatched_cfg.write_text(json.dumps(altered_cfg), encoding="utf-8")
+    unmatched_profile = advisor.resolve_model_profile(str(unmatched_cfg))
+    assert unmatched_profile.name == "custom-arch"
+    assert advisor.main(["--config", str(unmatched_cfg), "--chip", "tpu7x"]) == 0
+    unmatched_err = capsys.readouterr().err
+    assert (
+        "Config matched no shipped preset: no megakernel declaration applies."
+    ) in unmatched_err
