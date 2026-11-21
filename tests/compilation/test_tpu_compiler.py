@@ -366,6 +366,23 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
         } <= hashed
 
+    def test_runtime_hash_covers_the_batched_rpa_argument_modules(self):
+        """The batched RPA and DCP kernel entries, behind jax_op, pick the
+        kernel's decode lanes and reduced-precision modes from these modules,
+        which do not call jax_op themselves; an edit to either changes the
+        built kernel, so it must change the cache key."""
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        source_root = Path(tpu_compiler.__file__).resolve().parents[2]
+        hashed = {
+            path.relative_to(source_root).as_posix()
+            for path in tpu_compiler._iter_runtime_cache_key_files(source_root)
+        }
+        assert {
+            "vllm_torchtpu/layers/adapter/batched_rpa_decode.py",
+            "vllm_torchtpu/layers/adapter/native_fp8_scope.py",
+        } <= hashed
+
     def test_runtime_hash_excluded_kernels_stay_omni_only(self):
         """Excluded diffusion kernels must have no caller in hashed code.
 

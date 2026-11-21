@@ -487,10 +487,16 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
                 )
 
                 layers = vllm_config.compilation_config.static_forward_context
+                draft_impls = _draft_attention_impls(draft) | _draft_attention_impls(
+                    separate_draft
+                )
                 for attn_layer in layers.values():
                     if isinstance(attn_layer, AttentionLayerBase):
                         impl = getattr(attn_layer, "impl", None)
                         if isinstance(impl, PallasAttentionBackendImpl):
+                            # As in serving, the draft's attention runs with
+                            # every reduced-precision mode off.
+                            impl.is_attention_draft = id(impl) in draft_impls
                             impl.initialize_kernel(attn_layer)  # type: ignore[arg-type]
 
             model._export_tpu_mesh = mesh  # type: ignore[attr-defined]
@@ -505,6 +511,22 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
 
 # The attribute of a loaded target model holding its MTP draft, if it has one.
 MTP_DRAFT_ATTR = "_export_mtp_draft"
+
+
+def _draft_attention_impls(draft: nn.Module | None) -> set[int]:
+    """The ids of the attention impls inside a draft model: the MTP draft or
+    a separate DFlash/DSpark draft. Their attention layers share the target's
+    static forward context, so the export loop tells them apart by the module
+    tree they belong to."""
+    if draft is None:
+        return set()
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+
+    return {
+        id(m.impl)
+        for m in draft.modules()
+        if isinstance(m, AttentionLayerBase) and getattr(m, "impl", None) is not None
+    }
 
 
 def _load_mtp_draft(vllm_config: Any, target: nn.Module) -> nn.Module | None:
