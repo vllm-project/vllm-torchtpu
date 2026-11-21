@@ -18,8 +18,9 @@ import jax
 
 def rpa_kernel_names(fn, *args) -> list[str]:
     """The names of the RPA kernels (not the schedule kernels) `fn(*args)`
-    traces, in trace order; a name ends in the kernel's batch, bq and bkv
-    tiles ("-b<batch>-q<bq>-k<bkv>")."""
+    traces, in trace order. A name carries the kernel's batch, bq and bkv
+    tiles as "-b<batch>-q<bq>-k<bkv>", its last field unless the kernel has a
+    sliding window ("-sw<window>" follows)."""
     names = []
 
     def walk(jaxpr):
