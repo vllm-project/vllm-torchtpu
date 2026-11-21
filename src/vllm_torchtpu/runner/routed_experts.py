@@ -46,9 +46,12 @@ from vllm_torchtpu.layers.adapter.routed_experts_capturer import (
     HostSnapshot,
     TPURoutedExpertsCapturer,
 )
+from vllm_torchtpu.utils import dp_engines_in_lockstep
 
 
-def hbm_reserve_bytes(vllm_config: VllmConfig, token_paddings: list[int]) -> int:
+def hbm_reserve_bytes(
+    vllm_config: VllmConfig, token_paddings: list[int], max_forwards_per_step: int
+) -> int:
     """HBM the capture takes after the memory profile; 0 without capture.
 
     The larger of two: vLLM's int32 table of `max_num_batched_tokens` rows,
@@ -57,9 +60,12 @@ def hbm_reserve_bytes(vllm_config: VllmConfig, token_paddings: list[int]) -> int
     to `max_concurrent_batches` steps. Each forward runs at least one request,
     and its table holds its bucket's rows: the smallest bucket, or less than
     R times its tokens, where R is the largest ratio between neighboring
-    buckets. The tables are counted at uint16, the widest output dtype, and
-    on every rank: only the first TP rank keeps them, but vLLM sizes every
-    rank's KV cache by the smallest budget.
+    buckets. When EP couples the DP engines, every forward of a step is
+    instead padded to the bucket of the engine with the most tokens that
+    step, so each of the step's forwards, at most `max_forwards_per_step`, is
+    counted at the largest bucket. The tables are counted at uint16, the
+    widest output dtype, and on every rank: only the first TP rank keeps them,
+    but vLLM sizes every rank's KV cache by the smallest budget.
     """
     if not vllm_config.aux_output_config.enabled:
         return 0
@@ -71,16 +77,19 @@ def hbm_reserve_bytes(vllm_config: VllmConfig, token_paddings: list[int]) -> int
     scheduler_config = vllm_config.scheduler_config
     max_num_batched_tokens = scheduler_config.max_num_batched_tokens
     vllm_table_bytes = torch.int32.itemsize * max_num_batched_tokens * row_size
-    # R times the step's tokens, rounded up. With one bucket, every forward
-    # pads to it, which the second term already counts.
-    padded_tokens = max(
-        (
-            -(-larger * max_num_batched_tokens // smaller)
-            for smaller, larger in zip(token_paddings, token_paddings[1:])
-        ),
-        default=0,
-    )
-    step_rows = padded_tokens + scheduler_config.max_num_seqs * token_paddings[0]
+    if dp_engines_in_lockstep(vllm_config.parallel_config):
+        step_rows = max_forwards_per_step * token_paddings[-1]
+    else:
+        # R times the step's tokens, rounded up. With one bucket, every
+        # forward pads to it, which the second term already counts.
+        padded_tokens = max(
+            (
+                -(-larger * max_num_batched_tokens // smaller)
+                for smaller, larger in zip(token_paddings, token_paddings[1:])
+            ),
+            default=0,
+        )
+        step_rows = padded_tokens + scheduler_config.max_num_seqs * token_paddings[0]
     tables_bytes = (
         torch.uint16.itemsize
         * row_size
@@ -135,6 +144,39 @@ def _moe_layer_ids(model: torch.nn.Module) -> list[int]:
     return sorted(layer_ids)
 
 
+def _gathered_dp_rows(model: torch.nn.Module) -> tuple[int, int]:
+    """How many DP ranks' rows each MoE layer's capture hook receives, and
+    which of them are this rank's.
+
+    With DP and EP, vLLM gathers every DP rank's rows before it calls the MoE
+    method, unless the method gathers them itself after `route()`. The
+    capturer keeps one count for all layers, so a model whose layers differ is
+    rejected: under TPU_MOE_FP8_ALL_GATHER the FP8 method gathers the rows
+    itself, but the unquantized method of an FP8 checkpoint's ignored MoE
+    layers does not. The gather follows the DP group, so this rank's rows sit
+    at its position in the group, the `dp_rank` vLLM gives every MoE layer
+    from that group.
+    """
+    runners = [module for module in model.modules() if isinstance(module, MoERunner)]
+    gathered_by_vllm = [
+        runner.layer_id for runner in runners if runner.do_naive_dispatch_combine
+    ]
+    if gathered_by_vllm and len(gathered_by_vllm) < len(runners):
+        raise NotImplementedError(
+            "--enable-return-routed-experts cannot capture a model whose MoE "
+            "layers differ in who gathers the DP ranks' rows: vLLM gathers "
+            f"them before MoE layers {gathered_by_vllm}, and the other "
+            "layers' MoE methods gather them after picking the experts. Unset "
+            "TPU_MOE_FP8_ALL_GATHER."
+        )
+    if not gathered_by_vllm:
+        return 1, 0
+    # Every MoE layer's moe_config comes from the engine's one parallel
+    # config, so the first layer's DP size and rank are every layer's.
+    moe_config = runners[0].moe_config
+    return moe_config.dp_size, moe_config.dp_rank
+
+
 @dataclass
 class _StepInputBatch:
     """Stands in for vLLM's `InputBatch` in `prepare_output`: the fields it
@@ -181,12 +223,17 @@ class RoutedExpertsCapture:
     ) -> None:
         _reject_uncapturable_layers(model)
         moe_layer_ids = _moe_layer_ids(model)
+        num_gathered_dp_ranks, gathered_rows_index = _gathered_dp_rows(model)
         self._connector = get_aux_output_connector(model, vllm_config, kv_cache_config)
         # Every rank runs the same compiled forward, but vLLM's connector takes
         # the step's rows only from the first TP rank, so only that rank copies
         # them to the host.
         self._capturer = TPURoutedExpertsCapturer(
-            vllm_config, moe_layer_ids, copies_to_host=get_tp_group().is_first_rank
+            vllm_config,
+            moe_layer_ids,
+            copies_to_host=get_tp_group().is_first_rank,
+            num_gathered_dp_ranks=num_gathered_dp_ranks,
+            gathered_rows_index=gathered_rows_index,
         )
         use_capturer(self._connector, model, self._capturer)
         self._step_has_metadata = False

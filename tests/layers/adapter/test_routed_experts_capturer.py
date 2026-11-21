@@ -123,6 +123,34 @@ def test_one_trace_returns_a_table_for_each_forward(on_host, is_warmup):
     assert tables[0].data_ptr() != tables[1].data_ptr()
 
 
+@pytest.mark.parametrize(
+    "num_gathered_dp_ranks,gathered_rows_index", [(3, 0), (3, 1), (3, 2), (1, 0)]
+)
+def test_one_trace_keeps_this_dp_ranks_rows(
+    on_host, num_gathered_dp_ranks, gathered_rows_index
+):
+    """With DP and EP, vLLM hands each MoE layer the rows of every DP rank, in
+    DP rank order and each padded to the same bucket. The table holds this
+    rank's bucket of them, picked by its position in the DP group, not by
+    the engine's DP index (0 here), and one trace still serves every bucket. A
+    layer that gathers the rows itself hands over only this rank's rows."""
+    capturer = make_capturer(
+        num_gathered_dp_ranks=num_gathered_dp_ranks,
+        gathered_rows_index=gathered_rows_index,
+    )
+    graphs = []
+    forward = _compile_like_vllm(_bound_model(capturer), graphs)
+
+    for bucket in (16, 32):
+        ids = expert_ids(num_gathered_dp_ranks * bucket)
+        _run(forward, ids, context_num_tokens=bucket)
+        table = capturer.check_forward(bucket)
+        start = gathered_rows_index * bucket
+        assert torch.equal(table.to(torch.int32), ids[start : start + bucket])
+
+    assert len(graphs) == 1
+
+
 def test_layers_without_experts_return_zeros(on_host):
     """Nothing writes the column of a layer without experts, and vLLM returns
     0 for it."""

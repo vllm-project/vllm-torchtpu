@@ -56,13 +56,13 @@ def on_host(monkeypatch):
     return capture_utils.use_host_events(monkeypatch)
 
 
-def _capture(monkeypatch, model, is_first_rank=True):
+def _capture(monkeypatch, model, is_first_rank=True, data_parallel_rank=0):
     tp_group = SimpleNamespace(is_first_rank=is_first_rank)
     monkeypatch.setattr(aux_output_worker, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(routed_experts, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(routed_experts, "MoERunner", capture_utils.MoELayer)
     return routed_experts.RoutedExpertsCapture(
-        capture_utils.make_vllm_config(),
+        capture_utils.make_vllm_config(data_parallel_rank=data_parallel_rank),
         model,
         SimpleNamespace(num_blocks=1024, kv_cache_groups=[]),
     )
@@ -82,9 +82,9 @@ def build_capture(monkeypatch, on_host):
     after the test."""
     captures = []
 
-    def build(layer_ids=None, is_first_rank=True):
-        model = capture_utils.make_moe_model(layer_ids)
-        captures.append(_capture(monkeypatch, model, is_first_rank))
+    def build(layer_ids=None, is_first_rank=True, data_parallel_rank=0, **layer_kwargs):
+        model = capture_utils.make_moe_model(layer_ids, **layer_kwargs)
+        captures.append(_capture(monkeypatch, model, is_first_rank, data_parallel_rank))
         return captures[-1], model
 
     yield build
@@ -153,6 +153,54 @@ def test_every_forward_of_a_step_reaches_its_requests(capture, on_host):
     expected = torch.cat([a_rows, a_rest]).numpy()
     assert np.array_equal(outputs["a"].rows, expected)
     assert all(event.synchronized for event in on_host)
+
+
+@pytest.mark.parametrize("data_parallel_rank", [1, 0])
+@pytest.mark.parametrize("vllm_gathers_dp_rows", [True, False])
+def test_a_dp_rank_returns_its_own_rows(
+    build_capture, vllm_gathers_dp_rows, data_parallel_rank
+):
+    """With DP and EP, vLLM gathers the rows of every DP rank before a MoE
+    layer's hook, in the order of the DP group and each rank padded to the
+    same bucket, unless the MoE method gathers them itself after picking the
+    experts. Either way a request on the rank at position 1 of the DP group
+    gets back that rank's rows, also when the engine's DP index is 0, as when
+    RayDistributedExecutorV2 places the engine with DP index 1 on the first
+    chips."""
+    capture, model = build_capture(
+        data_parallel_rank=data_parallel_rank,
+        dp_size=2,
+        dp_rank=1,
+        vllm_gathers_dp_rows=vllm_gathers_dp_rows,
+    )
+    _begin(capture, ["a"])
+    rows = capture_utils.expert_ids(16, num_experts=PADDING, seed=1)
+    rows[5:] = PADDING
+    if vllm_gathers_dp_rows:
+        other_rank_rows = capture_utils.expert_ids(16, num_experts=PADDING, seed=0)
+        hook_rows = torch.cat([other_rank_rows, rows])
+    else:
+        hook_rows = rows
+    capture_utils.model_forward(model, hook_rows)
+    capture.take_forward(16, 5)
+
+    pending = capture.prepare_output(["a"], {"a": 5}, {}, np.zeros(1, dtype=np.int32))
+    outputs = pending.process_output([[7]])
+
+    assert np.array_equal(outputs["a"].rows, rows[:5].numpy())
+
+
+def test_layers_that_differ_in_who_gathers_are_rejected(monkeypatch, on_host):
+    """The capturer keeps one count of gathered DP ranks for every layer, so a
+    model where vLLM gathers the rows for some MoE layers and the MoE method
+    for the others cannot be captured."""
+    model = capture_utils.make_moe_model(dp_size=2, vllm_gathers_dp_rows=True)
+    model[1].do_naive_dispatch_combine = False
+
+    with pytest.raises(
+        NotImplementedError, match=r"vLLM gathers them before MoE layers \[0, 2\]"
+    ):
+        _capture(monkeypatch, model)
 
 
 def test_a_rank_that_does_not_publish_copies_nothing(build_capture, on_host):
@@ -313,12 +361,33 @@ def test_hbm_reserve_covers_the_forward_tables_in_flight(monkeypatch):
     paddings = capture_utils.TOKEN_PADDINGS
 
     vllm_config.aux_output_config = AuxOutputConfig(enable_return_routed_experts=True)
-    reserve = routed_experts.hbm_reserve_bytes(vllm_config, paddings)
+    reserve = routed_experts.hbm_reserve_bytes(vllm_config, paddings, 3)
 
     assert reserve == 2 * (2 * 64 + 8 * 16) * 12 * 2
     assert reserve > 64 * 12 * 4
     vllm_config.aux_output_config = AuxOutputConfig()
-    assert routed_experts.hbm_reserve_bytes(vllm_config, paddings) == 0
+    assert routed_experts.hbm_reserve_bytes(vllm_config, paddings, 3) == 0
+
+
+@pytest.mark.parametrize("enable_expert_parallel", [True, False])
+def test_hbm_reserve_under_dp(monkeypatch, enable_expert_parallel):
+    """With EP, every forward of a step is padded to the bucket of the DP
+    engine with the most tokens, so each of a step's 3 forwards can hold the
+    largest bucket's 64 rows. Without EP the engines run on their own, and
+    the single-engine bound holds."""
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
+    vllm_config = capture_utils.make_vllm_config()
+    vllm_config.aux_output_config = AuxOutputConfig(enable_return_routed_experts=True)
+    vllm_config.parallel_config.data_parallel_size = 2
+    vllm_config.parallel_config.enable_expert_parallel = enable_expert_parallel
+
+    reserve = routed_experts.hbm_reserve_bytes(
+        vllm_config, capture_utils.TOKEN_PADDINGS, 3
+    )
+
+    step_rows = 3 * 64 if enable_expert_parallel else 2 * 64 + 8 * 16
+    assert reserve == 2 * step_rows * 12 * 2
 
 
 def test_hbm_reserve_covers_buckets_that_jump_more_than_double(monkeypatch):
@@ -333,7 +402,7 @@ def test_hbm_reserve_covers_buckets_that_jump_more_than_double(monkeypatch):
     scheduler_config = vllm_config.scheduler_config
     num_tokens = scheduler_config.max_num_batched_tokens
 
-    reserve = routed_experts.hbm_reserve_bytes(vllm_config, paddings)
+    reserve = routed_experts.hbm_reserve_bytes(vllm_config, paddings, 3)
 
     step_rows = reserve // (12 * 2 * vllm_config.max_concurrent_batches)
     assert step_rows == 8 * 64 + 8 * 8
