@@ -129,6 +129,119 @@ def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
     }
 
 
+def _spec_warmup_runner(spec, config, captured, *, async_scheduling):
+    runner = SimpleNamespace(
+        max_model_len=40960,
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=async_scheduling, max_num_seqs=8
+        ),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=config,
+        execute_model=lambda so: captured.append(so),
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
+    )
+    return runner
+
+
+@pytest.mark.parametrize("async_scheduling,stride", [(True, 4), (False, 1)])
+def test_spec_warmup_nct_stride_follows_the_scheduler(async_scheduling, stride):
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=async_scheduling, max_num_seqs=8
+        ),
+    )
+    assert TPUModelRunner._spec_warmup_nct_stride(runner) == stride
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_spec_warmup_one_token_prompt_never_steps_before_the_prompt(
+    async_scheduling,
+):
+    spec = FullAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+    )
+    captured = []
+    runner = _spec_warmup_runner(
+        spec, config, captured, async_scheduling=async_scheduling
+    )
+
+    P = 1
+    assert TPUModelRunner._warmup_one_spec_request(runner, P, idx=0)
+
+    ncts = [so.scheduled_cached_reqs.num_computed_tokens[0] for so in captured[1:]]
+    K = runner.speculative_config.num_speculative_tokens
+    if async_scheduling:
+        # The worker subtracts the previous step's rejected drafts (at most
+        # K) from these optimistic counts; the first decode step has none.
+        assert ncts == [1 + t * (1 + K) for t in range(len(ncts))]
+        assert min(n - K for n in ncts[1:]) >= 1
+    else:
+        assert ncts == [1 + t for t in range(len(ncts))]
+
+
+def test_spec_warmup_batch_steps_and_blocks_follow_the_scheduler():
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+    )
+    captured = []
+    runner = _spec_warmup_runner(spec, config, captured, async_scheduling=True)
+    runner.max_num_reqs = 8
+    runner.max_num_tokens = 64
+    P, R = 4, 2
+
+    TPUModelRunner._warmup_spec_batch(runner, R, P, mixed=True)
+
+    K = runner.speculative_config.num_speculative_tokens
+    cached = [so for so in captured if so.scheduled_cached_reqs.req_ids]
+    assert cached, "no decode steps ran"
+    ncts = [so.scheduled_cached_reqs.num_computed_tokens[0] for so in cached]
+    assert ncts == [P + t * (1 + K) for t in range(len(ncts))]
+    # Each synthetic request's blocks cover the last position its steps write.
+    (block_ids,) = captured[0].scheduled_new_reqs[0].block_ids
+    assert len(block_ids) * spec.block_size >= ncts[-1] + 1 + K
+
+
+def test_spec_warmup_batch_mixed_steps_stay_within_max_model_len():
+    """With little room past the prompt, the decode run leaves room for the
+    two mixed verify+prefill steps after it: no step writes a position at or
+    past max_model_len."""
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+    )
+    captured = []
+    runner = _spec_warmup_runner(spec, config, captured, async_scheduling=True)
+    runner.max_model_len = 28
+    runner.max_num_reqs = 8
+    runner.max_num_tokens = 64
+    P, R = 4, 2
+
+    TPUModelRunner._warmup_spec_batch(runner, R, P, mixed=True)
+
+    K = runner.speculative_config.num_speculative_tokens
+    cached = [so for so in captured if so.scheduled_cached_reqs.req_ids]
+    assert sum(1 for so in cached if so.scheduled_new_reqs) == 2
+    last = max(
+        nct + K for so in cached for nct in so.scheduled_cached_reqs.num_computed_tokens
+    )
+    assert last < runner.max_model_len
+
+
 @pytest.mark.parametrize("dcp_size,expected_blocks", [(1, 65), (8, 9)])
 def test_spec_warmup_request_counts_blocks_in_block_table_units(
     dcp_size, expected_blocks
@@ -140,19 +253,7 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
         parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_size)
     )
     captured = []
-    runner = SimpleNamespace(
-        max_model_len=40960,
-        speculative_config=SimpleNamespace(num_speculative_tokens=3),
-        kv_cache_config=SimpleNamespace(
-            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
-        ),
-        vllm_config=config,
-        execute_model=lambda so: captured.append(so),
-        sample_tokens=lambda _: None,
-        take_draft_token_ids=lambda: None,
-        _warmup_spec_decode_cleanup=lambda rids: True,
-        requests=_warmup_requests(),
-    )
+    runner = _spec_warmup_runner(spec, config, captured, async_scheduling=False)
 
     assert TPUModelRunner._warmup_one_spec_request(runner, 8192, idx=0)
 
@@ -187,6 +288,7 @@ def test_spec_warmup_request_verifies_k_drafts_under_dynamic_schedule():
             parallel_config=SimpleNamespace(decode_context_parallel_size=1)
         ),
         input_batch=SimpleNamespace(num_reqs=1, req_ids=["__spec_warmup_0__"]),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
         _is_async_drafter=True,
         _async_drafter=drafter,
         execute_model=lambda so: captured.append(so),
@@ -720,7 +822,7 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
         max_model_len=256,
         max_num_tokens=256,
         max_num_reqs=tpu_runner.MIN_NUM_SEQS,
-        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        scheduler_config=SimpleNamespace(max_num_seqs=4, async_scheduling=False),
         speculative_config=SimpleNamespace(num_speculative_tokens=7),
         kv_cache_config=SimpleNamespace(
             num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
@@ -756,6 +858,7 @@ def test_spec_warmup_keeps_optimistic_output_placeholders():
     runner = SimpleNamespace(
         max_model_len=256,
         speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
         kv_cache_config=SimpleNamespace(
             num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
         ),

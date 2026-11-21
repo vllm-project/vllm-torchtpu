@@ -129,7 +129,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         _update_num_xla_graphs=lambda *_args: None,
         _modify_prev_results=lambda: None,
         _sync_replicated_drafts_across_tp=lambda drafts: drafts,
-        _assemble_async_spec_substitution=lambda *_args: async_source,
+        _assemble_async_spec_substitution=lambda *_args, **_kwargs: async_source,
         _assemble_async_prefill_bootstrap=lambda *_args: async_source,
         _update_placeholder=lambda *_args: {"r0": 0},
         _stage_timing=MagicMock(),
@@ -142,6 +142,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
         "_build_kv_connector_output",
+        "_skips_multi_chunk_draft_cat",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     return runner

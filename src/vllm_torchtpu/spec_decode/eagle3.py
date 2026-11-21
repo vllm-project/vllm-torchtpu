@@ -262,6 +262,15 @@ class Eagle3Proposer:
         # Zero [kernel_num_reqs] rejected counts per (knr, device), for the
         # post-step-0 bridge on an all-accept sync step.
         self._zero_rej_dev_cache: dict[tuple, torch.Tensor] = {}
+        # The last device-returning propose's per-chunk padded [p, K] drafts
+        # and the tensor it returned; tpu_runner's async substitution reads them
+        # to skip a re-pad when `drafts is _last_propose_device_out`.
+        self._last_padded_drafts_per_chunk: list[torch.Tensor] | None = None
+        self._last_propose_device_out: torch.Tensor | None = None
+        # Set by tpu_runner for one propose: return chunk 0's whole padded
+        # [p, K] block instead of concatenating chunks (the runner takes each
+        # chunk's drafts from _last_padded_drafts_per_chunk).
+        self._skip_next_multi_chunk_draft_cat: bool = False
         # Base copies of RPA's request_distribution for draft step 0, keyed on
         # the id of the runner's packed slice (_with_base_request_distribution).
         self._base_request_distribution_cache: dict[
@@ -1727,7 +1736,9 @@ class Eagle3Proposer:
                 device tensor instead of host nested lists. The async path uses
                 this to pack drafts into the next-step substitution source
                 without a D2H on the critical path; the sync path keeps the
-                list return.
+                list return. When the runner set
+                ``_skip_next_multi_chunk_draft_cat``, the tensor is chunk 0's
+                whole padded ``[p, K]`` block instead.
             next_tokens_per_chunk: spec verify step (sync and async) —
                 per-chunk on-device rejection-sampler output, passed to each
                 chunk's ``_prepare_draft_inputs`` so the draft seed is read
@@ -1736,7 +1747,9 @@ class Eagle3Proposer:
                 ``[total_reqs]`` device tensor of the just-sampled tokens.
 
         Returns (sync) a list of length num_reqs, each inner list holding K
-        draft tokens; or (return_device) the ``[num_reqs, K]`` device tensor.
+        draft tokens; or (return_device) the ``[num_reqs, K]`` device tensor,
+        or chunk 0's whole padded ``[p, K]`` block when the runner set
+        ``_skip_next_multi_chunk_draft_cat``.
         """
         runner = self.runner
         self._draft_md_cache.clear()
@@ -2200,7 +2213,8 @@ class Eagle3Proposer:
                         run_draft_step(ci, step)
                     pad_dp_draft_step(step)
 
-        # Assemble [total_num_reqs, K]. Each chunk's tokens are padded to p; slice
+        # Assemble [total_num_reqs, K] (or, under skip_cat, return chunk 0's
+        # padded [p, K] block). Each chunk's tokens are padded to p; slice
         # to the real num_reqs at the end. Sync slices on the host (the [p, K] D2H
         # is constant-shape, so no recompile); async keeps the device slice
         # (matches prior behaviour for the substitution source).
@@ -2214,13 +2228,19 @@ class Eagle3Proposer:
             )
             for toks in draft_tokens_per_chunk
         ]
+        skip_cat = self._skip_next_multi_chunk_draft_cat
+        self._skip_next_multi_chunk_draft_cat = False
         if return_device:
-            if len(per_chunk_stacked) == 1:
+            if skip_cat:
+                out = per_chunk_stacked[0]
+            elif len(per_chunk_stacked) == 1:
                 out = per_chunk_stacked[0][: chunks[0].num_reqs]
             else:
                 out = torch.cat(
                     [s[: c.num_reqs] for s, c in zip(per_chunk_stacked, chunks)], dim=0
                 )
+            self._last_padded_drafts_per_chunk = per_chunk_stacked
+            self._last_propose_device_out = out
             return out
         result = []
         for s, c in zip(per_chunk_stacked, chunks):

@@ -87,6 +87,8 @@ def make_runner(device, monkeypatch, k):
     runner._read_offset_scratch = {}
     runner._last_sequence_layout_plan = None
     runner.pcp_manager = None
+    # __init__ sets it; these steps' drafts come from no drafter.
+    runner.drafter = None
     runner._fast_token_substitution = False
     # Real upstream batch operations and CPU token buffers. The kernels being
     # checked (offset reset / source assembly / substitution / D2H) use TPU.
@@ -349,6 +351,12 @@ def substitution_runner(device, k):
     runner._async_subst_dev_cache = {}
     runner._cached_subst_key = None
     runner._cached_substitution_indices = None
+    # __init__ sets these: the drafts here come from no drafter, and the
+    # substitution indices upload through stage_h2d_upload's registry.
+    runner.drafter = None
+    runner._unfenced_h2d_sources = []
+    runner._registered_h2d_sources = set()
+    runner._free_h2d_sources = {}
     return runner
 
 
