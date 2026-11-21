@@ -534,6 +534,18 @@ def _expert_block_permutation(ep: int, device) -> torch.Tensor | None:
     return torch.tensor(order, dtype=torch.int32, device=device)
 
 
+def sequence_parallel_rows_per_rank(tp: int) -> int:
+    """The fewest rows per rank a sequence-parallel step has under tensor
+    parallelism: a step is sliced from the layout's row threshold
+    (``sequence_parallel.min_rows``) up, over ``tp`` ranks. The FP8 method's
+    step gate, the load-time warning below and ``check_kernel_threshold`` all
+    read it, so they agree on whether every sequence-parallel step reaches
+    the fused kernel's per-rank gate."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+
+    return _sp.min_rows() // tp
+
+
 def check_kernel_threshold(ep: int, tp: int, lowtok_cap: int = 0) -> None:
     """Refuse thresholds that leave a gap between the few-token kernel and the
     fused EP kernel. Without tensor parallelism the two meet at one row
@@ -559,14 +571,11 @@ def check_kernel_threshold(ep: int, tp: int, lowtok_cap: int = 0) -> None:
         # Under tensor parallelism the fused kernel takes only the
         # sequence-parallel steps. A step below `start` rows keeps its rows
         # replicated and is served by the few-token kernel up to `cap` rows and
-        # by the routed grouped-matmul path between `cap` and `start`. The
-        # first sliced step is the first token bucket of at least `start` rows
-        # (buckets double, so the next power of two), split over `tp` ranks;
-        # the kernels meet when that share reaches the fused kernel's per-rank
-        # gate. With `start` at 0 every step is sliced, the first bucket is one
-        # row, and no few-token cap meets the gate.
-        first_sp_bucket = 1 << (max(start, 1) - 1).bit_length()
-        meets = gate <= -(-first_sp_bucket // tp)
+        # by the routed grouped-matmul path between `cap` and `start`. A sliced
+        # step has at least `start` rows, split over `tp` ranks; the kernels
+        # meet when that share reaches the fused kernel's per-rank gate. With
+        # `start` at 0 every step is sliced and no few-token cap meets the gate.
+        meets = gate <= sequence_parallel_rows_per_rank(tp)
         if cap * 2 >= start:
             rule = (
                 f"the few-token kernel up to {cap} rows, sequence parallelism "
@@ -686,17 +695,18 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
             tp,
             gate,
         )
-        if _sp.min_rows() // tp < gate:
+        rows_per_rank = sequence_parallel_rows_per_rank(tp)
+        if rows_per_rank < gate:
             logger.warning_once(
                 "Fused EP MoE: the sequence-parallel row threshold of %d rows "
-                "gives %d rows per rank at the first sequence-parallel step, "
+                "guarantees %d rows per rank on a sequence-parallel step, "
                 "below this layout's step gate of %d (STEP_MIN_TOKENS_BY_LAYOUT), "
                 "so a traced row-count guard decides which sequence-parallel "
                 "steps take the kernel, and a compile size of exactly %d tokens "
                 "may fail to trace. Give this layout a row threshold of at least "
                 "%d rows in sequence_parallel's row table.",
                 _sp.min_rows(),
-                _sp.min_rows() // tp,
+                rows_per_rank,
                 gate,
                 gate * tp,
                 gate * tp,
