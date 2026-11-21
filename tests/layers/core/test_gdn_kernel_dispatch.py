@@ -28,6 +28,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import torch
 from jax.sharding import Mesh
 
 from vllm_torchtpu.gdn_pool_layout import (
@@ -307,3 +308,70 @@ def test_the_copy_serves_only_the_qwen3_5_moe_architectures():
     assert others
     for architecture in others:
         assert gdn_attention.gdn_kernel_wrapper(architecture) is main_gdn_wrapper
+
+
+def _layer(architecture):
+    return SimpleNamespace(model_config=SimpleNamespace(architecture=architecture))
+
+
+@pytest.mark.parametrize(
+    ("architecture", "views"),
+    [(QWEN, True), ("Qwen3NextForCausalLM", False), (KIMI, False), (None, False)],
+)
+def test_ba_halves_are_views_only_for_the_qwen3_5_moe_architectures(
+    architecture, views
+):
+    """The Qwen3.5 MoE architectures hand the b and a halves to the GDN op as
+    chunk views; every other architecture gets contiguous copies."""
+    ba = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+    b, a = gdn_attention_op._split_ba(_layer(architecture), ba)
+    assert torch.equal(b, ba[:, :4]) and torch.equal(a, ba[:, 4:])
+    assert (b.data_ptr() == ba.data_ptr()) is views
+    assert (not b.is_contiguous()) is views
+
+
+def test_ba_split_follows_the_layer_not_the_engine():
+    """The layer's own model config decides, as it does for the kernel."""
+    ba = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+    with set_vllm_model_wrapper_context(mesh=None, vllm_config=_vllm_config(KIMI)):
+        b, _ = gdn_attention_op._split_ba(_layer(QWEN), ba)
+    assert b.data_ptr() == ba.data_ptr()
+    with set_vllm_model_wrapper_context(mesh=None, vllm_config=_vllm_config(QWEN)):
+        b, _ = gdn_attention_op._split_ba(_layer(KIMI), ba)
+    assert b.is_contiguous() and b.data_ptr() != ba.data_ptr()
+
+
+def test_the_pooled_pcp_op_keeps_contiguous_ba_halves(monkeypatch):
+    """The pooled PCP op runs gdn_pcp_fused rather than the kernel the dispatch
+    selects, so even the Qwen3.5 MoE architectures hand it contiguous
+    b and a halves."""
+    attn = _attn(QWEN)
+    ba = torch.arange(NUM_TOKENS * 2 * N_V, dtype=torch.float32).reshape(
+        NUM_TOKENS, 2 * N_V
+    )
+    seen = {}
+
+    def pooled_pcp_op(hidden_states, _weight, _scale, b, a, *_rest):
+        seen["b"], seen["a"] = b, a
+        return torch.zeros(hidden_states.shape[0], N_V * D_V), None
+
+    attn.gdn_pooled_pcp_op = pooled_pcp_op
+    attn.in_proj_ba = lambda hidden_states: (ba, None)
+    attn._require_pcp_projection_parameters = lambda: (None, None)
+    attn._bm_state_ids = lambda state_ids: state_ids
+    attn._prefill_ckpt_operands = lambda attn_metadata: (None, None)
+    attn._apply_output_projection = lambda core_attn_out, z, num_tokens: core_attn_out
+    attn.conv1d = SimpleNamespace(weight=None, bias=None)
+    attn.A_log = attn.dt_bias = None
+    monkeypatch.setattr(
+        gdn_attention_op, "is_pcp_streaming_attention_metadata", lambda _md: True
+    )
+    attn_metadata = SimpleNamespace(
+        mamba_state_indices=torch.zeros(NUM_SEQS, dtype=torch.int64),
+        query_start_loc=None,
+        request_distribution=None,
+        seq_lens=None,
+    )
+    attn._forward_fused_pooled_pcp(torch.zeros(NUM_TOKENS, 4), None, attn_metadata)
+    assert torch.equal(seen["b"], ba[:, :N_V]) and torch.equal(seen["a"], ba[:, N_V:])
+    assert seen["b"].is_contiguous() and seen["a"].is_contiguous()
