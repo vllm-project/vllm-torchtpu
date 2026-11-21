@@ -1057,3 +1057,9 @@ def test_hf_loader_heterogeneous_groups_block_scale_and_kv_guards() -> None:
                     },
                 }
             )
+
+
+def test_count_hosts_rounds_up_partial_hosts() -> None:
+    """Round positive chip counts up to physical hosts using ceiling division."""
+    for num_chips, expected_hosts in ((0, 1), (4, 1), (5, 2), (8, 2), (9, 3)):
+        assert rf.chips.count_hosts(num_chips) == expected_hosts
