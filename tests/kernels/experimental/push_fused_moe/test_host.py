@@ -309,6 +309,33 @@ def test_repeat_bits_equals_jnp_repeat(n, repeats):
     np.testing.assert_array_equal(got, np.repeat(bits, repeats))
 
 
+@pytest.mark.parametrize("n,scale_rows", [(768, 11), (3072, 11), (4096, 21)])
+def test_scale_slab_onehot_equals_the_scatter(n, scale_rows):
+    """The one-hot scale slab is the drop-mode scatter-add bit for bit when
+    every routed pair has a slab row of its own: any bit pattern, rows left
+    unwritten, and off-slab sentinels dropped."""
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.layer import (
+        _scale_slab_onehot,
+    )
+
+    rng = np.random.default_rng(n)
+    cells = scale_rows * 128
+    rows = rng.permutation(cells)[: min(n, cells - 7)]
+    slab_row = np.full(n, cells + 5, np.int32)  # off-slab: dropped
+    slab_row[rng.permutation(n)[: rows.size]] = rows
+    bits = rng.integers(-(2**31), 2**31, n, dtype=np.int64).astype(np.int32)
+    bits[:4] = np.array([np.nan, np.inf, -np.inf, -0.0], np.float32).view(np.int32)
+    want = (
+        jnp.zeros((cells,), jnp.int32)
+        .at[jnp.asarray(slab_row)]
+        .add(jnp.asarray(bits), mode="drop")
+    )
+    got = _scale_slab_onehot(jnp.asarray(slab_row), jnp.asarray(bits), scale_rows)
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.int32).reshape(-1), np.asarray(want)
+    )
+
+
 @pytest.mark.parametrize("n_pre", [1, 2, 3, 25])
 @pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
 def test_dispatch_tables_match_the_decoded_segments(n_pre, skew):

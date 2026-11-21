@@ -132,14 +132,22 @@ G_LOCAL = SMALL["e_total"] // EP  # 4, the same for FP4_SHAPE
 CONTRIB_SLAB_STRIDE = EP * G_LOCAL * CAPACITY + CAPACITY
 
 
-def _check_parity(weights, common, *, sc_prepush, tc_exchange, ragged_stride):
+def _check_parity(
+    weights, common, *, sc_prepush, tc_exchange, ragged_stride, **push_kw
+):
     mesh = common["mesh"]
     hidden = weights[0].shape[1]
     x, gating = _inputs(mesh, 7, hidden=hidden, e_logical=weights[0].shape[0])
     kw = dict(common, ragged_stride=ragged_stride)
     want = fused_ep_moe_v2(x, *weights, gating, **kw)
     got = fused_ep_moe_push(
-        x, *weights, gating, sc_prepush=sc_prepush, tc_exchange=tc_exchange, **kw
+        x,
+        *weights,
+        gating,
+        sc_prepush=sc_prepush,
+        tc_exchange=tc_exchange,
+        **push_kw,
+        **kw,
     )
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     wrong = fused_ep_moe_v2(x, *_roll(weights), gating, **kw)
@@ -207,6 +215,44 @@ def test_fp4_push_matches_v2(sc_prepush, tc_exchange, ragged_stride):
         sc_prepush=sc_prepush,
         tc_exchange=tc_exchange,
         ragged_stride=ragged_stride,
+    )
+
+
+@pytest.mark.parametrize(
+    "ragged_stride", [None, CONTRIB_SLAB_STRIDE], ids=["vmem", "slab"]
+)
+def test_onehot_scale_slab_matches_v2(ragged_stride):
+    """A decode-sized step (32 tokens a shard here) with the TensorCore scale
+    slab gives v2's output bit for bit, on the served FP4 form with the
+    TensorCore exchange."""
+    mesh = _mesh()
+    weights = _fp4_weights(mesh, 23, rhs_qb=512, **FP4_SHAPE)
+    bias = jax.device_put(
+        np.random.default_rng(6)
+        .normal(0, 0.1, FP4_SHAPE["e_total"])
+        .astype(np.float32),
+        NamedSharding(mesh, P()),
+    )
+    common = dict(
+        topk=TOPK,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        score_bias=bias,
+        routed_scaling_factor=2.5,
+        act_fn="silu_and_mul_with_clamp",
+    )
+    _check_parity(
+        weights,
+        common,
+        sc_prepush=2,
+        tc_exchange=True,
+        ragged_stride=ragged_stride,
+        onehot_scale_slab=True,
     )
 
 

@@ -132,6 +132,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_SINGLE_BARRIER: bool = True
     MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE: bool = True
     MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER: int = 2
+    MOE_FUSED_EP_PUSH_ONEHOT_SCALE_SLAB: bool = True
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -1076,6 +1077,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # run while the TensorCore computes the shared expert.
     "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER": env_int(
         "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER", 2
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: a decode-sized step builds the activation
+    # scale slab with a one-hot matmul on the TensorCore instead of a
+    # SparseCore scatter, which the pre-push otherwise queues behind.
+    "MOE_FUSED_EP_PUSH_ONEHOT_SCALE_SLAB": env_bool(
+        "MOE_FUSED_EP_PUSH_ONEHOT_SCALE_SLAB", default=True
     ),
     # MOE_FUSED_EP_KERNEL_IMPL=push: run the layer's FP8 shared expert as one
     # kernel (kernels/quantized_matmul/shared_expert.py) inside the MoE op,

@@ -251,6 +251,41 @@ def _repeat_bits(bits, repeats):
     return word.reshape(n * repeats)[: n_in * repeats]
 
 
+# Up to this many routed pairs (decode-sized steps) the scale slab is built on
+# the TensorCore (_scale_slab_onehot); above it the SparseCore scatter stays.
+ONEHOT_SCALE_SLAB_MAX_PAIRS = 4096
+
+
+def _scale_slab_onehot(slab_row, scale_bits, scale_rows):
+    """``zeros([scale_rows * 128]).at[slab_row].add(scale_bits, mode="drop")``
+    as one one-hot matmul, returned as the f32 [scale_rows, 128] slab.
+
+    Exact for any bit pattern because every routed pair lands on a slab row of
+    its own: row r = 128 * hi + lo, an [4 * scale_rows, n] operand holds each
+    pair's four bit-pattern bytes on its hi row and an [n, 128] one-hot picks
+    its lo lane, so every output is one byte (< 256, exact in bf16) times 1.0
+    summed with zeros in f32. Rows past the slab (the off-shard sentinel)
+    match no hi row and drop. On the SparseCore the scatter delays the
+    pre-push queued behind it; here it is one small matmul in VMEM.
+    """
+    lanes = HIDDEN_LANE_BLOCK
+    (n,) = slab_row.shape
+    hi = slab_row // lanes
+    lo = slab_row % lanes
+    shifts = 8 * jnp.arange(4, dtype=jnp.int32)
+    planes = jnp.right_shift(scale_bits[None, :], shifts[:, None]) & 255  # [4, n]
+    on_row = hi[None, :] == jnp.arange(scale_rows, dtype=jnp.int32)[:, None]
+    a = jnp.where(on_row[None], planes[:, None, :], 0)
+    a = a.astype(jnp.bfloat16).reshape(4 * scale_rows, n)
+    b = (lo[:, None] == jnp.arange(lanes, dtype=jnp.int32)[None, :]).astype(
+        jnp.bfloat16
+    )
+    out = jnp.dot(a, b, preferred_element_type=jnp.float32).astype(jnp.int32)
+    out = out.reshape(4, scale_rows, lanes)
+    word = out[0] | (out[1] << 8) | (out[2] << 16) | (out[3] << 24)
+    return lax.bitcast_convert_type(word, jnp.float32)
+
+
 _LAYER_SM_CACHE = {}
 _LAYER_SM_CACHE_LOCK = threading.Lock()
 
@@ -303,6 +338,7 @@ def fused_ep_moe_push(
     single_barrier=False,
     early_scale_scatter=0,
     split_exchange=False,
+    onehot_scale_slab=False,
     expert_slot=None,
     expert_load=None,
     shared_expert=None,
@@ -348,7 +384,10 @@ def fused_ep_moe_push(
     held behind it; 2: nor behind the SparseCore pre-push); `split_exchange`
     (with `exchange_tables` and the in-op shared expert on its unfused path)
     runs the shared expert's gate_up projection while the routing exchange's
-    rows are in flight (plan_kernel.build_exchange_rows_tables_split). The
+    rows are in flight (plan_kernel.build_exchange_rows_tables_split), and
+    `onehot_scale_slab` builds the activation scale slab of a step with at
+    most ONEHOT_SCALE_SLAB_MAX_PAIRS routed pairs on the TensorCore
+    (`_scale_slab_onehot`) instead of a SparseCore scatter. The
     caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
@@ -906,12 +945,15 @@ def fused_ep_moe_push(
                 else jnp.repeat(cast(jax.Array, scale_bits_g), topk)
             )
             scale_rows = act_scale_slab_rows(ragged_stride)
-            scale_slab = lax.bitcast_convert_type(
-                jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
-                .at[slab_row]
-                .add(scale_bits, mode="drop"),
-                jnp.float32,
-            ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
+            if onehot_scale_slab and slab_row.size <= ONEHOT_SCALE_SLAB_MAX_PAIRS:
+                scale_slab = _scale_slab_onehot(slab_row, scale_bits, scale_rows)
+            else:
+                scale_slab = lax.bitcast_convert_type(
+                    jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
+                    .at[slab_row]
+                    .add(scale_bits, mode="drop"),
+                    jnp.float32,
+                ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
             scale_slab = None
         if early_scale_scatter and shared_out and scale_slab is not None:
@@ -1199,6 +1241,7 @@ def fused_ep_moe_push(
         bool(single_barrier),
         int(early_scale_scatter),
         bool(split_exchange),
+        bool(onehot_scale_slab),
     )
     out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
     out_specs = out_specs if len(out_specs) > 1 else out_specs[0]
