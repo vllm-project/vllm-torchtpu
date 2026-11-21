@@ -47,10 +47,14 @@ BF16, F32 = jnp.bfloat16, jnp.float32
 MAX_ROWS = 32
 # bf16 MXU operands pack 16 sublanes.
 _ROW_ALIGN = 16
-# Bytes per weight DMA, and how many are in flight: ~1.5 MiB chunks keep the
-# compute behind the last one short; 6 in flight cover the DMA latency.
-_CHUNK_BYTES = 3 << 19
+# Bytes per weight DMA, and how many are in flight (6: 4.5 MiB, enough to
+# cover the DMA latency). The weights stream through rings of one more slot
+# than that: the kernel's VMEM stays small, which leaves XLA the room it uses
+# to prefetch the neighbouring ops' weights (all of VMEM to this call cost
+# the drafter's other matmuls ~5 us each, c4 twin j-319ca531).
+_CHUNK_BYTES = 3 << 18
 _IN_FLIGHT = 6
+_SLOTS = _IN_FLIGHT + 1
 _VMEM_HEADROOM = 4 << 20
 
 
@@ -77,12 +81,12 @@ def _kernel(
     x_ref,  # VMEM [m, h] bf16
     sgu_ref,  # VMEM [1, 2i] f32
     sd_ref,  # VMEM [1, h] f32
-    wgu_v,  # VMEM [h, 2i] e4m3
-    wd_v,  # VMEM [i, h] e4m3
+    wgu_v,  # VMEM [slots, gate_up chunk rows, 2i] e4m3
+    wd_v,  # VMEM [slots, down chunk rows, h] e4m3
     gu_acc,  # VMEM [mp, 2i] f32
     act_ref,  # VMEM [mp, i] bf16
     out_acc,  # VMEM [mp, h] f32
-    sem,  # DMA [3 + chunks]: x, scales, weight chunks
+    sem,  # DMA [3 + 2 slots]: x, scales, the two rings' slots
     *ar_scratch,  # with an all-reduce: VMEM [mp, h] bf16, then ar.scratch_shapes
     gu_chunks,
     d_chunks,
@@ -101,13 +105,16 @@ def _kernel(
     ]
     for copy in small:
         copy.start()
+    # Chunk n of a weight goes to slot n % _SLOTS of its ring; it starts once
+    # chunk n - _SLOTS (that slot's last tenant) has been contracted.
     copies = [
-        pltpu.make_async_copy(src.at[pl.ds(k, c)], dst.at[pl.ds(k, c)], sem.at[j])
-        for j, (src, dst, k, c) in enumerate(
-            [(wgu_hbm, wgu_v, k, c) for k, c in gu_chunks]
-            + [(wd_hbm, wd_v, k, c) for k, c in d_chunks],
-            start=len(small),
+        pltpu.make_async_copy(
+            src.at[pl.ds(k, c)],
+            ring.at[n % _SLOTS, pl.ds(0, c)],
+            sem.at[len(small) + n % _SLOTS + (_SLOTS if ring is wd_v else 0)],
         )
+        for src, ring, chunks in ((wgu_hbm, wgu_v, gu_chunks), (wd_hbm, wd_v, d_chunks))
+        for n, (k, c) in enumerate(chunks)
     ]
     for copy in copies[:_IN_FLIGHT]:
         copy.start()
@@ -126,17 +133,17 @@ def _kernel(
     for j, (k, c) in enumerate(gu_chunks):
         landed(j)
         gu_acc[...] += jnp.dot(
-            x[:, k : k + c], wgu_v[k : k + c, :], preferred_element_type=F32
+            x[:, k : k + c], wgu_v[j % _SLOTS, :c, :], preferred_element_type=F32
         )
     small[1].wait()
     gate = _project(gu_acc[:, :i], sgu_ref[:, :i])
     up = _project(gu_acc[:, i:], sgu_ref[:, i:])
     act_ref[...] = shared_activation(gate, up).astype(BF16)
     out_acc[...] = jnp.zeros_like(out_acc)
-    for j, (k, c) in enumerate(d_chunks, start=len(gu_chunks)):
-        landed(j)
+    for n, (k, c) in enumerate(d_chunks):
+        landed(len(gu_chunks) + n)
         out_acc[...] += jnp.dot(
-            act_ref[:, k : k + c], wd_v[k : k + c, :], preferred_element_type=F32
+            act_ref[:, k : k + c], wd_v[n % _SLOTS, :c, :], preferred_element_type=F32
         )
     small[2].wait()
     if spec is None:
@@ -151,8 +158,8 @@ def _kernel(
 def _vmem_bytes(mp: int, h: int, i: int, spec, info) -> int:
     t = functools.partial(ar.tiled_bytes, info=info)
     total = (
-        t((h, 2 * i), jnp.float8_e4m3fn)
-        + t((i, h), jnp.float8_e4m3fn)
+        t((_SLOTS, _chunks(h, 2 * i)[0][1], 2 * i), jnp.float8_e4m3fn)
+        + t((_SLOTS, _chunks(i, h)[0][1], h), jnp.float8_e4m3fn)
         + 2 * t((mp, h), BF16)  # x, out
         + t((1, 2 * i), F32)
         + t((1, h), F32)
@@ -223,9 +230,7 @@ def fused_mlp(
     d_chunks = _chunks(i, h * w_d.dtype.itemsize)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    # All of VMEM: room left over lets XLA prefetch the weights into VMEM
-    # ahead of the call, serialized before it.
-    params = dict(vmem_limit_bytes=info.vmem_capacity_bytes)
+    params = dict(vmem_limit_bytes=_vmem_bytes(mp, h, i, spec, info) + _VMEM_HEADROOM)
     if spec is not None:
         params["collective_id"] = ar.COLLECTIVE_ID
     return pl.pallas_call(
@@ -239,12 +244,12 @@ def fused_mlp(
                 pltpu.VMEM(x.shape, x.dtype),
                 pltpu.VMEM(s_gu.shape, s_gu.dtype),
                 pltpu.VMEM(s_d.shape, s_d.dtype),
-                pltpu.VMEM((h, 2 * i), w_gu.dtype),
-                pltpu.VMEM((i, h), w_d.dtype),
+                pltpu.VMEM((_SLOTS, gu_chunks[0][1], 2 * i), w_gu.dtype),
+                pltpu.VMEM((_SLOTS, d_chunks[0][1], h), w_d.dtype),
                 pltpu.VMEM((mp, 2 * i), F32),
                 pltpu.VMEM((mp, i), BF16),
                 pltpu.VMEM((mp, h), F32),
-                pltpu.SemaphoreType.DMA((3 + len(gu_chunks) + len(d_chunks),)),
+                pltpu.SemaphoreType.DMA((3 + 2 * _SLOTS,)),
                 *(
                     [pltpu.VMEM((mp, h), BF16), *ar.scratch_shapes(spec)]
                     if spec is not None

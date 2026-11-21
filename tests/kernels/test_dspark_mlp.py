@@ -71,6 +71,16 @@ def test_matches_reference(m: int, h: int, i: int) -> None:
     assert _err(got, want) < 2e-2
 
 
+def test_rings_wrap(monkeypatch) -> None:
+    """128-row chunks: 16 gate_up and 8 down chunks through 7-slot rings."""
+    monkeypatch.setattr(kernel, "_CHUNK_BYTES", 1 << 16)
+    ops = _operands(16, 2048, 1024, seed=5)
+    assert len(kernel._chunks(2048, 2048)) > kernel._SLOTS
+    assert len(kernel._chunks(1024, 2048)) > kernel._SLOTS
+    got = kernel.fused_mlp(*ops, interpret=True)
+    assert _err(got, kernel.reference(*ops)) < 2e-2
+
+
 def test_faults_are_caught() -> None:
     """The bar above rejects a dropped K chunk and swapped gate / up."""
     m, h, i = 16, 2048, 1024
