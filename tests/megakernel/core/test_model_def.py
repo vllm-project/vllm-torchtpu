@@ -108,7 +108,11 @@ def assert_modules_equal(ba: Module, bb: Module) -> None:
         )
     elif isinstance(ba, GDNModule):
         assert isinstance(bb, GDNModule)
-        assert ba.prefix == bb.prefix
+        assert (ba.pool_layout, ba.gate, ba._explicit_gate) == (
+            bb.pool_layout,
+            bb.gate,
+            bb._explicit_gate,
+        )
     elif isinstance(ba, MoEModule):
         assert isinstance(bb, MoEModule)
         assert (
@@ -322,6 +326,17 @@ def test_core_model_def_modules_have_no_qwen_literals_and_fit_line_budget():
     rec_decl = GDNModule(geometry=mg).cache_decl(mg)
     assert kv_decl is not None and rec_decl is not None
     play = pool.derive_pool_layout(([rec_decl] * 3 + [kv_decl]) * 2, R=8)
+    assert_modules_equal(
+        GDNModule(pool_layout=play, gate="sigmoid"),
+        GDNModule(pool_layout=play, gate="sigmoid"),
+    )
+    with pytest.raises(AssertionError):
+        assert_modules_equal(GDNModule(pool_layout=play), GDNModule())
+    with pytest.raises(AssertionError):
+        assert_modules_equal(
+            GDNModule(pool_layout=play, gate="silu"),
+            GDNModule(pool_layout=play, gate="sigmoid"),
+        )
     pb1 = pool.make_pool_backend(play, check=mg.check, rec_chunk=GDNModule.chunk_rows)
     pb2 = pool.make_pool_backend(play, check=mg.check, rec_chunk=GDNModule.chunk_rows)
     pb3 = pool.make_pool_backend(

@@ -346,8 +346,7 @@ def hf_config_for_geometry(
             elif k == "gdn_gate":
                 updates[hf_k] = str(g.gdn_gate)
             elif k == "vocab" and max_vocab is not None:
-                v_sz = int(getattr(g, "V", out.get(hf_k, max_vocab)))
-                updates[hf_k] = min(v_sz, int(max_vocab))
+                updates[hf_k] = min(int(out.get(hf_k, max_vocab)), int(max_vocab))
     sched = cls.resolve_schedule(g)
     gqa_m = {"heads": int(g.NH), "kv_heads": int(g.NKV), "head_dim": int(g.HD)}
     gdn_m: dict[str, Any] = {"k_heads": int(g.KH), "v_heads": int(g.VH)}
