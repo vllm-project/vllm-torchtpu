@@ -63,7 +63,8 @@ def _make_jax_inputs(
 
 
 def test_should_select_largest_supported_tail_chunk():
-    assert select_tail_chunk(1024) == 512
+    assert select_tail_chunk(2048) == 512
+    assert select_tail_chunk(1024) == 1024
     assert select_tail_chunk(512) == 512
     assert select_tail_chunk(256) == 256
     assert select_tail_chunk(128) == 128

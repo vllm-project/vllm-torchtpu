@@ -23,6 +23,10 @@ def select_tail_chunk(tail_rows: int) -> int | None:
     """Return the largest supported tail token chunk dividing `tail_rows`, or None."""
     if tail_rows <= 0:
         return None
+    # Avoid looping two 512-row passes on 1024-row prefill chunks; cap >1024
+    # tails at 512 so larger buckets keep VMEM headroom.
+    if tail_rows == 1024:
+        return 1024
     for candidate in TAIL_CHUNK_CANDIDATES:
         if tail_rows % candidate == 0:
             return candidate
