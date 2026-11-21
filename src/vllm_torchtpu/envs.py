@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS: int | None = None
+    MOE_FUSED_EP_V2_ROUTE_KERNEL: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
@@ -925,6 +926,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS": lambda: (
         int(v) if (v := os.getenv("MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS")) else None
     ),
+    # Run fused EP MoE v2's routing exchange and routing plan -- the payload
+    # all-gather, the sharded plan, the transport/count/visit tables and both
+    # slab tables -- as one TensorCore Pallas kernel (v2/route_plan.py) where
+    # its shape conditions hold, in place of the XLA collective, the plan's
+    # small XLA ops and the SparseCore slab scatters. Same tables, bit for bit.
+    # Read at trace time; requires MOE_FUSED_EP_V2_SHARDED_PLAN.
+    "MOE_FUSED_EP_V2_ROUTE_KERNEL": env_bool("MOE_FUSED_EP_V2_ROUTE_KERNEL"),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device

@@ -65,6 +65,10 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     rowquant_fp8,
     scale_slab_fits,
 )
+from vllm_torchtpu.kernels.fused_moe.v2.route_plan import (
+    build_route_plan,
+    route_plan_supported,
+)
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
     TokenReplicaLayout,
@@ -540,6 +544,33 @@ def fused_ep_moe_v2(
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
     wire_width = _exchange_layout(t_wire, topk, e_total, form.quantized_activations)[-1]
+    # The routing exchange and plan as one TensorCore kernel (route_plan.py):
+    # the same tables, for the fused stage's sharded plan, where the kernel's
+    # shape conditions hold. Everything else keeps the XLA form below.
+    route_kernel = bool(
+        envs.MOE_FUSED_EP_V2_ROUTE_KERNEL
+        and sharded_plan
+        and stage == "fused"
+        and route_plan_supported(
+            ep=ep,
+            e_total=e_total,
+            t_local=t_local,
+            topk=topk,
+            block=block,
+            tile_m=capacity,
+            shard_stride=ragged_stride,
+        )
+    )
+    if envs.MOE_FUSED_EP_V2_ROUTE_KERNEL:
+        logger.info_once(
+            "fused_ep_moe_v2: routing exchange and plan by the TensorCore "
+            "route-plan kernel: %s (ep=%d experts=%d t_local=%d topk=%d)",
+            route_kernel,
+            ep,
+            e_total,
+            t_local,
+            topk,
+        )
 
     def unpack_operands(scales_gating_biases):
         """(w1 scale, w2 scale, gate, hash ids, score bias, bias iterator)."""
@@ -672,6 +703,55 @@ def fused_ep_moe_v2(
         )
         return topk_weights, packed, local_blocks, block_hist, row_routes
 
+    def kernel_and_combine(
+        q_g,
+        planned,
+        topk_weights,
+        row_routes,
+        rank_l,
+        w1_l,
+        w2_l,
+        w1s_l,
+        w2s_l,
+        bias_it,
+        out_dtype,
+    ):
+        """The kernel and combine over the route-plan kernel's tables.
+
+        The same calls compute_local makes below, on the same operands.
+        """
+        recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
+        w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
+        w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
+        arrivals, arrival_scales = kfn(
+            planned.kernel_tables,
+            planned.token_gather,
+            planned.expert_rows,
+            planned.slab_base,
+            q_g,
+            planned.scale_slab,
+            w1_l,
+            w2_l,
+            w1s_l,
+            w2s_l,
+            w1b_k,
+            w2b_k,
+            recv_rows=recv_rows,
+            visit=planned.visit,
+            counts=planned.counts,
+            rank=rank_l,
+        )
+        combined = _combine_arrivals(
+            arrivals,
+            arrival_scales,
+            planned.pos,
+            planned.mirror_pos,
+            topk_weights,
+            out_dtype,
+        )
+        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        return token_layout.restore(combined, ax)
+
     def compute_local(
         q_g,
         exchange,
@@ -686,8 +766,27 @@ def fused_ep_moe_v2(
         w2s_l,
         bias_it,
         out_dtype,
+        planned=None,
     ):
-        """Plan, kernel and combine over the gathered rows and payload."""
+        """Plan, kernel and combine over the gathered rows and payload.
+
+        `planned` is the route-plan kernel's RoutePlan, which stands in for
+        the exchange and everything the plan builds from it.
+        """
+        if planned is not None:
+            return kernel_and_combine(
+                q_g,
+                planned,
+                topk_weights,
+                row_routes,
+                rank_l,
+                w1_l,
+                w2_l,
+                w1s_l,
+                w2s_l,
+                bias_it,
+                out_dtype,
+            )
         me = rank_l[0, 0]
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
@@ -901,6 +1000,34 @@ def fused_ep_moe_v2(
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
             gate_l, hash_l, score_bias_l, row_scale_l
         )
+        if route_kernel:
+            planned = build_route_plan(
+                ep=ep,
+                e_total=e_total,
+                t_local=t_local,
+                topk=topk,
+                block=block,
+                tile_m=capacity,
+                shard_stride=ragged_stride,
+                layout=layout,
+                quantized=form.quantized_activations,
+            )(packed, rank_l)
+            return compute_local(
+                q_g,
+                None,
+                None,
+                None,
+                topk_weights,
+                row_routes,
+                rank_l,
+                w1_l,
+                w2_l,
+                w1s_l,
+                w2s_l,
+                bias_it,
+                x_l.dtype,
+                planned=planned,
+            )
         exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
             ep, layout[-1]
         )
@@ -1048,6 +1175,7 @@ def fused_ep_moe_v2(
         bool(w2_scales_expert_second_minor),
         slab_by_set,
         scale_by_lookup,
+        route_kernel,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),
