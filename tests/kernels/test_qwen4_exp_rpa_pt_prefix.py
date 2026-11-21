@@ -64,6 +64,10 @@ def _kv_lens(case):
     lens[6] = 0  # a live request owning no group here (its rows stay; no KV tile is scheduled)
     if case == 1:
         lens[0] = 0  # sequence 0 empty: idle lanes index its first tile
+    # Tiles pack four to a step in task order; make the last step hold one
+    # tile, so three idle lanes (page index 0, no tokens) are scheduled.
+    while sum(-(-int(x) // BKV) for x in lens) % LANES != 1:
+        lens[7] += BKV
     return lens
 
 
@@ -133,6 +137,8 @@ def test_every_fetched_page_index_is_copied(monkeypatch, case, skip):
     lens = _kv_lens(case)
     cfgs, steps, ent = _schedule(lens, monkeypatch)
     assert steps > 0 and cfgs.bkv_p == BKV_P
+    idle = sum(1 for step in ent for p0, _, tokens in step if p0 == 0 and tokens == 0)
+    assert idle >= LANES - 1, idle  # the last step's idle lanes are in the schedule
     reads = _reads(ent, skip)
     copied = _copied(lens)
     missing = sorted(reads - copied)
