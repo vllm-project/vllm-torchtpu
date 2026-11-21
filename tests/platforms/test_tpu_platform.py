@@ -1345,11 +1345,15 @@ def test_qwen_wrappers_are_installed_once_across_model_loads(
     originals = [getattr(target, name) for target, name in targets]
     for (target, name), original in zip(targets, originals):
         monkeypatch.setattr(target, name, original)
+    # Model patches read the config's architectures, which a ModelConfig
+    # always has.
     other_model = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="llama"), model="llama"
+        hf_config=SimpleNamespace(model_type="llama"), model="llama", architectures=None
     )
     qwen_model = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="qwen3_vl"), model="Qwen/Qwen3-VL-4B"
+        hf_config=SimpleNamespace(model_type="qwen3_vl"),
+        model="Qwen/Qwen3-VL-4B",
+        architectures=None,
     )
     reg.apply("platform_activation", model_config=other_model)
     assert [getattr(target, name) for target, name in targets] == originals

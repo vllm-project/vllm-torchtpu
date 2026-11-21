@@ -1,0 +1,604 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Load-time selection and forward wiring of the small-batch MoE scores entry."""
+
+import re
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+import torch
+
+from vllm_torchtpu.layers.adapter import fused_moe_ep
+from vllm_torchtpu.layers.adapter.quantization import fp8
+from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores as scores
+
+pytestmark = pytest.mark.cpu_test
+
+
+def make_layer(experts=64, hidden=512, inter=256, use_ep=True):
+    def meta(*shape, dtype=torch.float8_e4m3fn):
+        return torch.empty(shape, dtype=dtype, device="meta")
+
+    return SimpleNamespace(
+        layer_name="model.layers.0.mlp.experts",
+        hidden_size=hidden,
+        global_num_experts=512,
+        renormalize=True,
+        custom_routing_function=None,
+        scoring_func="softmax",
+        e_score_correction_bias=None,
+        use_grouped_topk=False,
+        num_expert_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        apply_router_weight_on_input=False,
+        moe_config=SimpleNamespace(
+            experts_per_token=10,
+            ep_size=8,
+            in_dtype=torch.bfloat16,
+            moe_parallel_config=SimpleNamespace(use_ep=use_ep),
+        ),
+        w13_weight=meta(experts, hidden, 2 * inter),
+        w2_weight=meta(experts, inter, hidden),
+        w13_weight_scale_inv=meta(experts, 1, 1, 2 * inter, dtype=torch.float32),
+        w2_weight_scale_inv=meta(experts, 1, 1, hidden, dtype=torch.float32),
+        _experts_start=torch.tensor(192, dtype=torch.int32),
+        _lowtok_has_copies=False,
+    )
+
+
+def method(owner=None):
+    return SimpleNamespace(_use_adaptive_fused_moe=owner == "adaptive", owner=owner)
+
+
+@pytest.fixture(autouse=True)
+def _no_engine_config(monkeypatch):
+    """prebuild reads the engine config only through `enabled`, which the tests
+    set; the armed row cap starts unset."""
+    import vllm.config
+
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", SimpleNamespace)
+    monkeypatch.setattr(scores, "_ARMED_MAX_TOKENS", 0)
+    monkeypatch.setattr(scores, "set_lowtok_max_tokens", Mock())
+
+
+@pytest.fixture
+def enabled(monkeypatch):
+    monkeypatch.setattr(scores, "enabled", lambda vllm_config: True)
+    monkeypatch.setattr(
+        scores, "enable_pipelined_collective_and_compute", lambda: False
+    )
+    monkeypatch.setattr(scores, "_LAYERS", [])
+    monkeypatch.setattr(
+        fused_moe_ep, "fused_moe_ep_supported", lambda m: m.owner == "v2"
+    )
+    op = Mock(name="op")
+    monkeypatch.setattr(scores, "_build_op", Mock(return_value=op))
+    return op
+
+
+def _logs(monkeypatch):
+    logs = SimpleNamespace(warning=Mock(), info=Mock())
+    monkeypatch.setattr(scores.logger, "warning", logs.warning)
+    monkeypatch.setattr(scores.logger, "info", logs.info)
+    return logs
+
+
+def test_disabled_builds_and_logs_nothing(monkeypatch):
+    monkeypatch.setattr(scores, "enabled", lambda vllm_config: False)
+    monkeypatch.setattr(scores, "_LAYERS", [])
+    logs = _logs(monkeypatch)
+    assert scores.prebuild(method(), make_layer(use_ep=False), "gelu") is None
+    scores.log_summary()
+    assert scores._LAYERS == []
+    logs.warning.assert_not_called()
+    logs.info.assert_not_called()
+
+
+def test_prebuild_gives_every_layer_the_copy_flag(monkeypatch):
+    """The FP8 forward reads the flag directly on every layer it loads, one
+    the rule leaves on the default MoE path included."""
+    monkeypatch.setattr(scores, "enabled", lambda vllm_config: False)
+    layer = make_layer()
+    del layer._lowtok_has_copies
+    assert scores.prebuild(method(), layer, "silu") is None
+    assert layer._lowtok_has_copies is False
+
+
+def test_plain_softmax_router_moves_into_the_kernel(enabled):
+    """Without a placement table every local slot is a primary, so the op's
+    grouped fallback gets no bound (expert_placement.primary_experts)."""
+    assert scores.prebuild(method(), make_layer(), "silu") is enabled
+    scores._build_op.assert_called_once_with(10, None)
+
+
+@pytest.mark.parametrize(
+    "layer, activation, match",
+    [
+        (make_layer(use_ep=False), "silu", "expert parallelism"),
+        (make_layer(experts=129), "silu", "envelope"),
+        (make_layer(inter=128), "silu", "envelope"),
+        (make_layer(), "gelu", "envelope"),
+    ],
+)
+def test_layer_the_kernel_cannot_serve_is_reported_at_the_summary(
+    enabled, monkeypatch, layer, activation, match
+):
+    """The kernel is on by rule, so a layer it cannot serve keeps the default
+    MoE path and is named in a warning."""
+    warning = Mock()
+    monkeypatch.setattr(scores.logger, "warning", warning)
+    assert scores.prebuild(method(), layer, activation) is None
+    scores.log_summary()
+    (message, *args), _ = warning.call_args
+    assert re.search(f"cannot serve.*{match}", message % tuple(args))
+
+
+@pytest.mark.parametrize(
+    "owner, reason",
+    [
+        ("adaptive", "adaptive fused MoE owns the layer"),
+        ("v2", "the fused EP kernel owns the layer"),
+    ],
+)
+def test_layer_a_fused_path_owns_is_declined_not_refused(
+    enabled, monkeypatch, owner, reason
+):
+    """A layer the kernel cannot serve but a fused path owns is counted as
+    declined in the summary line, not warned about as unservable."""
+    logs = _logs(monkeypatch)
+    scores.prebuild(method(owner), make_layer(use_ep=False), "silu")
+    scores.log_summary()
+    logs.warning.assert_not_called()
+    (message, *args), _ = logs.info.call_args
+    line = message % tuple(args)
+    assert "0/1 MoE layers armed" in line and f"1 x {reason}" in line
+
+
+@pytest.mark.parametrize(
+    "use_ep, line",
+    [
+        (True, "moe_lowtok: 1/1 MoE layers armed (scores 1, ids 0)"),
+        (False, "moe_lowtok: 0/1 MoE layers armed (scores 0, ids 0); 1 x the "),
+    ],
+    ids=["entry-armed", "no-entry"],
+)
+def test_fused_ep_v3_owns_only_a_layer_without_an_entry(
+    enabled, monkeypatch, use_ep, line
+):
+    """Fused EP v3 takes the steps at or above its row gate and the armed
+    entry serves the steps below it, so the summary counts such a layer as
+    armed; a v3 layer without an entry is the fused kernel's."""
+    from vllm_torchtpu.layers.adapter import fused_moe_ep_v3
+
+    monkeypatch.setattr(
+        fused_moe_ep_v3, "fused_moe_ep_supported", lambda m: m.owner == "v3"
+    )
+    logs = _logs(monkeypatch)
+    scores.prebuild(method("v3"), make_layer(use_ep=use_ep), "silu")
+    scores.log_summary()
+    logs.warning.assert_not_called()
+    (message, *args), _ = logs.info.call_args
+    assert (message % tuple(args)).startswith(line)
+
+
+@pytest.mark.parametrize(
+    "option, value",
+    [
+        ("custom_routing_function", lambda **kw: None),
+        ("scoring_func", "sigmoid"),
+        ("renormalize", False),
+        ("e_score_correction_bias", torch.zeros(512)),
+        ("use_grouped_topk", True),
+        ("hash_indices_table", torch.zeros(8, 10)),
+        ("routed_scaling_factor", 2.5),
+        ("apply_router_weight_on_input", True),
+    ],
+)
+def test_routing_the_kernel_does_not_reproduce_keeps_the_ids_entry(
+    enabled, option, value
+):
+    layer = make_layer()
+    setattr(layer, option, value)
+    if option == "use_grouped_topk":
+        layer.num_expert_group, layer.topk_group = 8, 4
+    assert scores.prebuild(method(), layer, "silu") is None
+
+
+@pytest.mark.parametrize("option", ["chunk_pipelining", "fp8_all_gather"])
+def test_rank_local_router_input_keeps_the_ids_entry(enabled, monkeypatch, option):
+    """With either option the FP8 method owns the DP exchange, so vLLM leaves
+    the router input rank-local and only the grouped path gathers it: the
+    scores entry is declined and the routed-ids entry (inside the grouped
+    path, after its gather) stays armed."""
+    if option == "chunk_pipelining":
+        monkeypatch.setattr(
+            scores, "enable_pipelined_collective_and_compute", lambda: True
+        )
+    else:
+        monkeypatch.setattr(scores.envs, "TPU_MOE_FP8_ALL_GATHER", True)
+    info = Mock()
+    monkeypatch.setattr(scores.logger, "info", info)
+    assert scores.prebuild(method(), make_layer(), "silu") is None
+    scores.log_summary()
+    line = info.call_args.args[0] % info.call_args.args[1:]
+    assert line.startswith("moe_lowtok: 1/1 MoE layers armed (scores 0, ids 1)")
+    assert "keeps the router input rank-local" in line
+
+
+def test_fp8_all_gather_forward_gathers_before_the_grouped_kernel(enabled, monkeypatch):
+    """At DP > 1 with TPU_MOE_FP8_ALL_GATHER, vLLM skips its dispatch and
+    combine. The layer must reach pipelined_fused_moe_gmm, which gathers the
+    rows across DP ranks and reduce-scatters the output, not the scores op,
+    which would compute this rank's rows against its own experts only."""
+    monkeypatch.setattr(scores.envs, "TPU_MOE_FP8_ALL_GATHER", True)
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
+    monkeypatch.setattr(fp8, "enable_pipelined_collective_and_compute", lambda: False)
+    monkeypatch.setattr(scores, "apply", Mock(return_value="lowtok"))
+    monkeypatch.setattr(fp8.moe_routing, "route", Mock(return_value=(None, None)))
+    monkeypatch.setattr(fp8, "pipelined_fused_moe_gmm", Mock(return_value="gathered"))
+    monkeypatch.setattr(fp8, "fused_moe_gmm", Mock(return_value="local"))
+    layer = make_layer()
+    layer.w13_bias = layer.w2_bias = None
+    op = scores.prebuild(method(), layer, "silu")
+    fp8_method = SimpleNamespace(
+        owner=None,
+        _tpu_activation_str="silu",
+        _use_adaptive_fused_moe=False,
+        _moe_lowtok_scores_op=op,
+        _gmm_primary_experts=None,
+    )
+    x = torch.empty(16, 512)
+    out = fp8.VllmFp8MoEMethodTPU.apply_monolithic(
+        fp8_method, layer, x, torch.empty(16, 512)
+    )
+    assert out == "gathered"
+    scores.apply.assert_not_called()
+
+
+def test_a_layer_outside_the_backbone_graph_arms_the_scores_entry(enabled, monkeypatch):
+    """The row cap runs inside the JAX op per compiled shape, so layers outside
+    the "backbone" tag (such as the MTP draft under "eagle_head") also arm the
+    scores entry without forking the torch trace."""
+    from vllm.compilation import backends
+
+    info = Mock()
+    monkeypatch.setattr(scores.logger, "info", info)
+    with backends.set_model_tag("eagle_head"):
+        assert scores.prebuild(method(), make_layer(), "silu") is enabled
+    assert scores.prebuild(method(), make_layer(), "silu") is enabled
+    scores.log_summary()
+    line = info.call_args.args[0] % info.call_args.args[1:]
+    assert line.startswith("moe_lowtok: 2/2 MoE layers armed (scores 2, ids 0)")
+
+
+def test_summary_counts_entries_and_declines(enabled, monkeypatch):
+    info = Mock()
+    monkeypatch.setattr(scores.logger, "info", info)
+    for _ in range(3):
+        scores.prebuild(method(), make_layer(), "silu")
+    biased = make_layer()
+    biased.e_score_correction_bias = torch.zeros(512)
+    scores.prebuild(method(), biased, "silu")
+    scores.prebuild(method("v2"), make_layer(), "silu")
+    scores.log_summary()
+    line = info.call_args.args[0] % info.call_args.args[1:]
+    assert line.startswith("moe_lowtok: 4/5 MoE layers armed (scores 3, ids 1)")
+    assert "1 x the fused EP kernel owns the layer" in line
+    assert "1 x scores declined, ids armed: e_score_correction_bias" in line
+    assert scores._LAYERS == []
+
+
+@pytest.mark.parametrize("num_primary_experts", [None, 4])
+@pytest.mark.parametrize("rows, lowtok", [(64, True), (65, False)])
+def test_in_op_row_cap_dispatches_lowtok_or_fused_moe_func(
+    monkeypatch, rows, lowtok, num_primary_experts
+):
+    """The row-count fork lives inside the JAX op so torch tracing stays
+    uniform; above the cap the grouped fallback gets the op's primary count."""
+    monkeypatch.setattr(scores, "_ARMED_MAX_TOKENS", 64)
+    monkeypatch.setenv("TPU_MOE_ROUTER_TOPK", "sort")
+    monkeypatch.setattr(scores, "moe_lowtok", Mock(return_value="lowtok"))
+    monkeypatch.setattr(scores, "fused_moe_func", Mock(return_value="gmm"))
+    x = jnp.zeros((rows, 8), dtype=jnp.bfloat16)
+    s = jnp.ones((rows, 16), dtype=jnp.float32) / 16.0
+    w13 = jnp.zeros((4, 8, 16), dtype=jnp.float8_e4m3fn)
+    w2 = jnp.zeros((4, 8, 8), dtype=jnp.float8_e4m3fn)
+    s13 = jnp.ones((4, 1, 1, 16), dtype=jnp.float32)
+    s2 = jnp.ones((4, 1, 1, 8), dtype=jnp.float32)
+    start = jnp.int32(0)
+    out = scores._moe_scores_fn(
+        x,
+        s,
+        w13,
+        w2,
+        s13,
+        s2,
+        start,
+        topk=2,
+        num_primary_experts=num_primary_experts,
+    )
+    assert out == ("lowtok" if lowtok else "gmm")
+    if lowtok:
+        scores.moe_lowtok.assert_called_once()
+        scores.fused_moe_func.assert_not_called()
+    else:
+        scores.moe_lowtok.assert_not_called()
+        scores.fused_moe_func.assert_called_once()
+        assert (
+            scores.fused_moe_func.call_args.kwargs["num_primary_experts"]
+            == num_primary_experts
+        )
+
+
+def test_grouped_fallback_leaves_the_weight_dtype_to_fused_moe_func(monkeypatch):
+    """Above the cap the routing weights reach fused_moe_func in float32, as
+    the softmax computes them, so fused_moe_func's own cast decides their dtype
+    (TPU_MOE_TOPK_WEIGHTS_FLOAT32, tested in tests/layers/core/
+    test_fused_moe_gmm.py), as for the grouped path; a cast to the
+    activations' bf16 in the op would discard the option."""
+    monkeypatch.setenv("TPU_MOE_ROUTER_TOPK", "sort")
+    monkeypatch.setattr(scores, "_ARMED_MAX_TOKENS", 0)
+    monkeypatch.setattr(scores, "fused_moe_func", Mock(return_value="gmm"))
+    rows = 3
+    x = jnp.zeros((rows, 8), dtype=jnp.bfloat16)
+    # Logits whose top-2 softmax weights bf16 cannot hold exactly.
+    logits = jnp.array(
+        [[0.1, 1.3, 0.0, 0.7], [2.0, -1.0, 0.3, 0.2], [0.0, 0.0, 0.5, 0.45]],
+        dtype=jnp.float32,
+    )
+    w13 = jnp.zeros((4, 8, 16), dtype=jnp.float8_e4m3fn)
+    w2 = jnp.zeros((4, 8, 8), dtype=jnp.float8_e4m3fn)
+    s13 = jnp.ones((4, 1, 1, 16), dtype=jnp.float32)
+    s2 = jnp.ones((4, 1, 1, 8), dtype=jnp.float32)
+    scores._moe_scores_fn(x, logits, w13, w2, s13, s2, jnp.int32(0), topk=2)
+    weights = scores.fused_moe_func.call_args.args[7]
+    top2 = jax.lax.top_k(logits, 2)[0]
+    assert weights.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(weights), jax.nn.softmax(top2, axis=-1))
+
+
+@pytest.mark.parametrize("skip_padded", [False, True])
+def test_apply_passes_softmax_scores_and_the_grouped_operand_order(
+    monkeypatch, skip_padded
+):
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1" if skip_padded else "0")
+    padded = torch.tensor([False, True, False])
+    monkeypatch.setattr(
+        scores.token_padding,
+        "padding_mask_for",
+        lambda rows, is_local_tensor=False: padded,
+    )
+    layer = make_layer()
+    op = Mock(return_value="out")
+    x = torch.randn(3, 512, dtype=torch.bfloat16)
+    logits = torch.randn(3, 512, dtype=torch.bfloat16)
+    assert scores.apply(op, layer, x, logits) == "out"
+    args = op.call_args.args
+    want = logits.clone()
+    if skip_padded:
+        want[1] = float("-inf")
+    assert args[0] is x
+    torch.testing.assert_close(args[1], want)
+    assert args[2:] == (
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale_inv,
+        layer.w2_weight_scale_inv,
+        layer._experts_start,
+    )
+
+
+@pytest.mark.parametrize("armed", [True, False])
+def test_fp8_forward_takes_the_scores_entry_when_armed(monkeypatch, armed):
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
+    monkeypatch.setattr(fp8, "enable_pipelined_collective_and_compute", lambda: False)
+    monkeypatch.setattr(scores, "apply", Mock(return_value="lowtok"))
+    monkeypatch.setattr(fp8.moe_routing, "route", Mock(return_value=(None, None)))
+    monkeypatch.setattr(fp8, "fused_moe_gmm", Mock(return_value="gmm"))
+    method = SimpleNamespace(
+        _tpu_activation_str="silu",
+        _use_adaptive_fused_moe=False,
+        _moe_lowtok_scores_op=Mock() if armed else None,
+        _gmm_primary_experts=None,
+    )
+    layer = make_layer()
+    layer.w13_bias = layer.w2_bias = None
+    x = torch.empty(129, 512)
+    out = fp8.VllmFp8MoEMethodTPU.apply_monolithic(
+        method, layer, x, torch.empty(129, 512)
+    )
+    assert out == ("lowtok" if armed else "gmm")
+
+
+def test_op_is_built_once_per_topk_and_fakes_the_row_shape():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    op = scores._build_op(10, None)
+    assert scores._build_op(10, None) is op
+    layer = make_layer()
+    with FakeTensorMode():
+        x = torch.empty(4, 512, dtype=torch.bfloat16)
+        w = [
+            torch.empty(t.shape, dtype=t.dtype)
+            for t in (
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+            )
+        ]
+        out = op(x, torch.empty(4, 512), *w, torch.empty((), dtype=torch.int32))
+    assert tuple(out.shape) == (4, 512) and out.dtype == torch.bfloat16
+
+
+def test_copy_enabled_placement_arms_60_backbone_plus_1_mtp_draft_layer(
+    enabled, monkeypatch, tmp_path
+):
+    """With a copy-enabled placement table (e.g. 68 slots = 64 owned + 4 copies),
+    the 60 placed backbone layers arm the copy-aware scores op while the unplaced
+    61st MTP draft layer (mtp.layers.0.mlp.experts, 64 slots) arms the 0-copy
+    scores op, giving 61/61 scores armed."""
+    import json
+
+    # Rank r holds its 64 primaries, then copies of rank r + 1's first four.
+    table = {
+        "experts": 512,
+        "shards": 8,
+        "copies_per_rank": 4,
+        "layers": {
+            str(lidx): [
+                list(range(r * 64, (r + 1) * 64))
+                + [((r + 1) % 8) * 64 + j for j in range(4)]
+                for r in range(8)
+            ]
+            for lidx in range(60)
+        },
+    }
+    pfile = tmp_path / "opt_copies32.json"
+    pfile.write_text(json.dumps(table))
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(pfile))
+    # A 60-layer target: the drafter's MoE layer is table layer 60, unlisted.
+    monkeypatch.setattr(scores.expert_placement, "_target_layers", lambda: 60)
+
+    copies_op = Mock(name="copies_op")
+    monkeypatch.setattr(scores, "_build_copies_op", Mock(return_value=copies_op))
+    info = Mock()
+    monkeypatch.setattr(scores.logger, "info", info)
+
+    for lidx in range(60):
+        layer = make_layer(experts=68)
+        layer.layer_name = f"language_model.model.layers.{lidx}.mlp.experts"
+        layer.moe_config.ep_rank = 3
+        assert scores.prebuild(method(), layer, "silu") is copies_op
+        assert layer._lowtok_has_copies is True
+        assert layer._lowtok_owned == 64
+        assert layer._lowtok_prim.shape == (512,)
+        assert layer._lowtok_copy.shape == (512,)
+        assert layer._lowtok_hot1h.shape == (512, 128)
+        assert layer._lowtok_tables[0].item() == 3 * 64
+
+    mtp_layer = make_layer(experts=64)
+    mtp_layer.layer_name = "mtp.layers.0.mlp.experts"
+    assert scores.prebuild(method(), mtp_layer, "silu") is enabled
+    assert mtp_layer._lowtok_has_copies is False
+    # Its grouped fallback bound: every one of its 64 slots is a primary
+    # (expert_placement.primary_experts for an unplaced layer).
+    scores._build_op.assert_called_once_with(10, 64)
+
+    scores.log_summary()
+    line = info.call_args.args[0] % info.call_args.args[1:]
+    assert line.startswith("moe_lowtok: 61/61 MoE layers armed (scores 61, ids 0)")
+
+
+def test_only_a_512_expert_layer_gets_the_copy_tables(enabled, monkeypatch):
+    """The copy-aware op's slot, holder and hot tables are 512 lanes wide
+    (kernel.slot_table, pack_tables, hot_onehot), so only a placed layer of
+    exactly 512 experts gets it. A copies layer of 768 experts (96 primaries
+    and 4 copies per rank at EP8) keeps the routed-ids entry instead."""
+    monkeypatch.setattr(scores.expert_placement, "has_copies", lambda: True)
+    monkeypatch.setattr(scores.expert_placement, "placed", lambda name: True)
+    monkeypatch.setattr(scores.expert_placement, "slots", lambda: 100)
+    monkeypatch.setattr(scores.expert_placement, "global_count", lambda: 768)
+    monkeypatch.setattr(scores.expert_placement, "shards", lambda: 8)
+    monkeypatch.setattr(scores, "_build_copies_op", Mock(name="copies_op"))
+    layer = make_layer(experts=100)
+    layer.global_num_experts = 768
+    assert scores.prebuild(method(), layer, "silu") is None
+    scores._build_copies_op.assert_not_called()
+
+
+@pytest.mark.parametrize("rows, lowtok", [(64, True), (65, False)])
+def test_in_op_row_cap_dispatches_copy_aware_lowtok_or_fused_moe_func(
+    monkeypatch, rows, lowtok
+):
+    monkeypatch.setattr(scores, "_ARMED_MAX_TOKENS", 64)
+    monkeypatch.setenv("TPU_MOE_ROUTER_TOPK", "sort")
+    monkeypatch.setattr(scores, "moe_lowtok", Mock(return_value="lowtok_copies"))
+    monkeypatch.setattr(scores, "fused_moe_func", Mock(return_value="gmm_copies"))
+    x = jnp.zeros((rows, 8), dtype=jnp.bfloat16)
+    s = jnp.ones((rows, 512), dtype=jnp.float32) / 512.0
+    w13 = jnp.zeros((68, 8, 16), dtype=jnp.float8_e4m3fn)
+    w2 = jnp.zeros((68, 8, 8), dtype=jnp.float8_e4m3fn)
+    s13 = jnp.ones((68, 1, 1, 16), dtype=jnp.float32)
+    s2 = jnp.ones((68, 1, 1, 8), dtype=jnp.float32)
+    start = jnp.int32(0)
+    tables = jnp.zeros((1024,), dtype=jnp.int32)
+    prim = jnp.zeros((512,), dtype=jnp.int32)
+    copy = jnp.full((512,), -1, dtype=jnp.int32)
+    hot1h = jnp.zeros((512, 128), dtype=jnp.bfloat16)
+    out = scores._moe_scores_fn(
+        x,
+        s,
+        w13,
+        w2,
+        s13,
+        s2,
+        start,
+        tables,
+        prim,
+        copy,
+        hot1h,
+        topk=10,
+        ranks=8,
+        owned=64,
+        has_copies=True,
+    )
+    assert out == ("lowtok_copies" if lowtok else "gmm_copies")
+    if lowtok:
+        scores.moe_lowtok.assert_called_once()
+        assert scores.moe_lowtok.call_args.kwargs == {
+            "topk": 10,
+            "ranks": 8,
+            "owned": 64,
+            "has_copies": True,
+            "from_logits": True,
+        }
+        scores.fused_moe_func.assert_not_called()
+    else:
+        scores.moe_lowtok.assert_not_called()
+        scores.fused_moe_func.assert_called_once()
+        assert scores.fused_moe_func.call_args.kwargs["num_primary_experts"] == 64
+
+
+def test_apply_passes_holder_tables_when_layer_has_copies(monkeypatch):
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
+    layer = make_layer(experts=68)
+    layer._lowtok_has_copies = True
+    layer._lowtok_tables = torch.zeros(1024, dtype=torch.int32)
+    layer._lowtok_prim = torch.zeros(512, dtype=torch.int32)
+    layer._lowtok_copy = torch.full((512,), -1, dtype=torch.int32)
+    layer._lowtok_hot1h = torch.zeros((512, 128), dtype=torch.bfloat16)
+    op = Mock(return_value="out_copies")
+    x = torch.randn(3, 512, dtype=torch.bfloat16)
+    logits = torch.randn(3, 512, dtype=torch.bfloat16)
+    assert scores.apply(op, layer, x, logits) == "out_copies"
+    args = op.call_args.args
+    assert args[0] is x
+    torch.testing.assert_close(args[1], logits)
+    assert args[2:] == (
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale_inv,
+        layer.w2_weight_scale_inv,
+        layer._experts_start,
+        layer._lowtok_tables,
+        layer._lowtok_prim,
+        layer._lowtok_copy,
+        layer._lowtok_hot1h,
+    )

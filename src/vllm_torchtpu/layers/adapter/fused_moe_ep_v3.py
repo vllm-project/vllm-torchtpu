@@ -436,6 +436,18 @@ def _expert_block_permutation(ep: int, device) -> torch.Tensor | None:
     return torch.tensor(order, dtype=torch.int32, device=device)
 
 
+def sequence_parallel_rows_per_rank(tp: int) -> int:
+    """The fewest rows per rank a sequence-parallel step has under tensor
+    parallelism: a step is sliced from the layout's row threshold
+    (``sequence_parallel.min_rows``) up, over ``tp`` ranks. The FP8 method's
+    step gate, the load-time warning below and ``check_kernel_threshold`` all
+    read it, so they agree on whether every sequence-parallel step reaches
+    the fused kernel's per-rank gate."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+
+    return _sp.min_rows() // tp
+
+
 def check_kernel_threshold(ep: int, tp: int, lowtok_cap: int = 0) -> None:
     """Refuse thresholds that leave a gap between the few-token kernel and the
     fused EP kernel. Without tensor parallelism the two meet at one row
@@ -461,14 +473,11 @@ def check_kernel_threshold(ep: int, tp: int, lowtok_cap: int = 0) -> None:
         # Under tensor parallelism the fused kernel takes only the
         # sequence-parallel steps. A step below `start` rows keeps its rows
         # replicated and is served by the few-token kernel up to `cap` rows and
-        # by the routed grouped-matmul path between `cap` and `start`. The
-        # first sliced step is the first token bucket of at least `start` rows
-        # (buckets double, so the next power of two), split over `tp` ranks;
-        # the kernels meet when that share reaches the fused kernel's per-rank
-        # gate. With `start` at 0 every step is sliced, the first bucket is one
-        # row, and no few-token cap meets the gate.
-        first_sp_bucket = 1 << (max(start, 1) - 1).bit_length()
-        meets = gate <= -(-first_sp_bucket // tp)
+        # by the routed grouped-matmul path between `cap` and `start`. A sliced
+        # step has at least `start` rows, split over `tp` ranks; the kernels
+        # meet when that share reaches the fused kernel's per-rank gate. With
+        # `start` at 0 every step is sliced and no few-token cap meets the gate.
+        meets = gate <= sequence_parallel_rows_per_rank(tp)
         if cap * 2 >= start:
             rule = (
                 f"the few-token kernel up to {cap} rows, sequence parallelism "
@@ -496,6 +505,28 @@ def check_kernel_threshold(ep: int, tp: int, lowtok_cap: int = 0) -> None:
             "must meet."
         )
     logger.info_once("MoE kernels: %s.", rule)
+
+
+def sequence_parallel_threshold_unset(layer) -> bool:
+    """Whether this kernel would take ``layer``'s sequence-parallel steps under
+    tensor parallelism while the layout's sequence-parallel row threshold
+    (``sequence_parallel.min_rows``) is still 0.
+
+    The first sequence-parallel bucket is then one row, below every layout's
+    step gate, so the few-token kernel cannot meet this one there
+    (``check_kernel_threshold``) and must stay off; the threshold is 0 until
+    the model follows each step's form. The checks are the ones
+    ``prebuild_fused_moe_ep`` makes before it calls ``check_kernel_threshold``.
+    """
+    if not (envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_KERNEL_IMPL == "v3"):
+        return False
+    if _pcp_size(layer) > 1 or _tensor_parallel_size() <= 1:
+        return False
+    from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+
+    return (
+        _sp.enabled() and layer.moe_config.is_sequence_parallel and _sp.min_rows() == 0
+    )
 
 
 def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) -> None:
@@ -554,13 +585,30 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
         return
     if tp > 1:
         # With sequence parallelism each rank passes its own rows to the kernel.
+        gate = _step_min_tokens()
         logger.info_once(
             "Fused EP MoE under tensor parallelism (tp_size=%d) with sequence "
             "parallelism: each rank's own rows, steps of at least %d rows "
             "per rank.",
             tp,
-            _step_min_tokens(),
+            gate,
         )
+        rows_per_rank = sequence_parallel_rows_per_rank(tp)
+        if rows_per_rank < gate:
+            logger.warning_once(
+                "Fused EP MoE: the sequence-parallel row threshold of %d rows "
+                "guarantees %d rows per rank on a sequence-parallel step, "
+                "below this layout's step gate of %d (STEP_MIN_TOKENS_BY_LAYOUT), "
+                "so a traced row-count guard decides which sequence-parallel "
+                "steps take the kernel, and a compile size of exactly %d tokens "
+                "may fail to trace. Give this layout a row threshold of at least "
+                "%d rows in sequence_parallel's row table.",
+                _sp.min_rows(),
+                rows_per_rank,
+                gate,
+                gate * tp,
+                gate * tp,
+            )
 
     mesh = build_ep_mesh()
     if mesh is None:
@@ -571,14 +619,18 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
         return
     ep = mesh.shape[EP_AXIS_NAME]
     _EP_SIZE = ep
-    check_kernel_threshold(ep, tp)
+    from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
+
+    # The FP8 method arms the few-token kernel before this, so its cap is known.
+    check_kernel_threshold(ep, tp, lowtok_cap=moe_lowtok_scores.armed_max_tokens())
 
     w1, w2 = layer.w13_weight, layer.w2_weight
     w1_scale = layer.w13_weight_scale_inv
     w2_scale = layer.w2_weight_scale_inv
-    # under a copies placement the rank's tensors carry copy slots after its
-    # primaries; the prompt path routes to primaries only and streams them alone
-    # (the forward passes the same views)
+    # Under a copies placement the rank's tensors carry copy slots after its
+    # primaries. The op is built for the primaries alone (experts_per_shard),
+    # and routing selects primaries only; the FP8 method's forward passes the
+    # layer's full tensors, the copy slots included.
     from vllm_torchtpu.layers.adapter import expert_placement as _placement
 
     n_prim = getattr(layer, _placement.PRIMARY_EXPERTS_ATTR, None)

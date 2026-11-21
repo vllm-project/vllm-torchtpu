@@ -31,7 +31,11 @@ Each leg (`prefill`, `decode`) lists:
   `$MODEL` and `$SERVED_MODEL` are the model path and served name.
 - `env`: the environment the leg set, limited to variables this package
   declares in `envs.py`. `$EXPERT_PLACEMENT_TABLE` is the path of the
-  decode leg's expert placement table, which `not_yet_supported` describes.
+  decode leg's expert placement table in this directory:
+  `expert_placement_dp8_ep8.json` for the DP4 x TP2 point, a permutation of
+  the 512 experts over its 8 expert-parallel ranks (64 per rank, no copies),
+  and `expert_placement_tp8_ep8_agentx_corr_c32.json` for the TP8 points,
+  68 slots per rank (64 experts and 4 copies).
   Per-pod wiring (ports, hosts, engine ids, cache directories) is
   deployment-specific and not recorded.
 - `additional_config`: the `--additional-config` JSON for the leg. The
@@ -49,16 +53,9 @@ rules or `additional_config` options change by change, and each change that
 turns one that the points use into a setting or section updates the entries.
 A value that this tree cannot run yet is kept as the record run used it and
 listed under `not_yet_supported`, per leg, with what it needs: a capability
-this tree lacks, or a file it does not ship (p01's permutation table); the
-change that adds the capability removes it from that list. The entry tests
-check that this tree's `envs.py` accepts every other environment value. A leg
-run here without the listed values uses fused EP MoE v2 and main's
-permutation placement, so the `record` numbers are not expected to
-reproduce on this tree. The record run's TP8 + DCP4 decode legs also took
-their KV cache size from a budget the record tree's config hook calibrated
-with fused EP MoE v3 (their `serve_args` pass no `--kv-cache-memory-bytes`);
-the change that adds v3 adds that budget, and until then those legs size
-their KV cache by `--gpu-memory-utilization`.
+this tree lacks or a file it does not ship; the change that adds the
+capability removes it from that list. The entry tests
+check that this tree's `envs.py` accepts every other environment value.
 
 ## Reading a gate entry
 

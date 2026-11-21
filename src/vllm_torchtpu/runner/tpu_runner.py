@@ -133,7 +133,10 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_rows,
     copy_pool_blocks,
 )
-from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
+from vllm_torchtpu.layers.adapter.quantization import (
+    get_tpu_quantization_config,
+    moe_lowtok_scores,
+)
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
@@ -6270,6 +6273,8 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=torch.float32,
                         device=self.device,
                     )
+
+        moe_lowtok_scores.log_summary()
 
         # After the drafter: every placed MoE layer, the drafter's too, must
         # have had its router renumbered with its experts.

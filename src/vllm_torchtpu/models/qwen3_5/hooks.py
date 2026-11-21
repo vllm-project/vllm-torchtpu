@@ -27,6 +27,14 @@ command-line value always wins, and only on the engines it was measured on:
 Qwen3.5-397B-A17B on TPU7x, in the roles and layouts of the validation
 entries (``validation/``). Every other engine keeps main's behaviour.
 
+- ``kv_cache_memory_bytes``: a calibrated budget on a decode
+  (``kv_consumer``) leg at TP8 + DCP4 with expert parallelism, no pipeline
+  or prefill context parallelism, and the fused EP MoE v3 kernel
+  (``MOE_FUSED_EP_KERNEL_IMPL=v3``): the entries' TP8 decode legs. Every
+  other engine stays on ``gpu_memory_utilization``, among them a leg with
+  fused EP v2 or the grouped-matmul MoE (their activations were never
+  measured beside this budget), the DP4 x TP2 decode layout (its entry passes
+  ``--kv-cache-memory-bytes``) and main's nightly TP1 x DP8 configs.
 - ``prefix_match_unit``: 128 tokens on a prefill (``kv_producer``) leg
   without prefill or decode context parallelism (the entries' PP8 prefill
   legs). Every other engine keeps the unit unset, so a PCP prefill leg
@@ -40,7 +48,7 @@ from typing import TYPE_CHECKING
 from jax.experimental.pallas import tpu as pltpu
 from vllm.model_executor.models.config import Qwen3_5ForConditionalGenerationConfig
 
-from vllm_torchtpu import additional_config_sections, tpu_info
+from vllm_torchtpu import additional_config_sections, envs, tpu_info
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.qwen3_5 import settings
 
@@ -54,6 +62,19 @@ logger = init_logger(__name__)
 # text config) on TPU7x devices.
 _CALIBRATED_SHAPE = {"num_experts": 512, "hidden_size": 4096, "num_hidden_layers": 60}
 _CALIBRATED_CHIP = pltpu.ChipVersion.TPU_7X.value
+# The decode layouts (tensor, data, decode context parallel size) whose legs
+# ran on the KV budget, with expert parallelism over their 8 ranks: the
+# validation entries' TP8 + DCP4 decode legs.
+_CALIBRATED_DECODE_LAYOUTS = frozenset({(8, 1, 4)})
+# The MoE kernel those legs ran (MOE_FUSED_EP_KERNEL_IMPL): its scratch is
+# part of the HBM the budget leaves for activations.
+_CALIBRATED_MOE_KERNEL = "v3"
+# The expert slots per rank (64 primary + 16 replicated) the budget was
+# measured with; _expert_slot_kv_credit adjusts it for every slot fewer or more.
+_CALIBRATED_EXPERT_SLOTS = 80
+# The budget at those slots, reserving about 2.5 GiB of HBM for runtime
+# activations and program-load scratch buffers.
+_CALIBRATED_KV_BYTES = 33_500_000_000
 
 
 def _chip_family() -> str | None:
@@ -73,6 +94,41 @@ def _is_calibrated(model_config) -> bool:
         if getattr(text, key, None) != value:
             return False
     return _chip_family() == _CALIBRATED_CHIP
+
+
+def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, int]:
+    """(credit, slots): HBM bytes per device freed (positive) or taken
+    (negative) by the expert placement holding fewer (more) slots per rank
+    than the placement the Qwen3.5 safe_kv budgets were measured with, one FP8
+    expert (gate|up and down, 3 x hidden x moe_intermediate bytes) per slot
+    per MoE layer of the target; and a placed layer's slot count (for
+    logging).
+
+    Every target layer holds num_experts / EP slots per rank, or the slots
+    per rank of a placement table (TPU_EXPERT_PLACEMENT) that places it, its
+    primaries and copy slots; table entries past the target's layers (a
+    drafter's) are not target layers. A table with copy slots also budgets
+    the drafter's MoE layer for its copy slots, whether or not the table
+    places it: the measured budgets did (every TP8 decode leg of the measured
+    runs logged that budget), and it leaves copies x 3 x hidden x
+    moe_intermediate bytes (48 MiB for 4 copies at Qwen3.5-397B-A17B's shape)
+    unspent where the drafter's layer is not placed."""
+    # Imported here, not at the module top: every vLLM process imports this
+    # module through the general plugin (register_models), and only the
+    # measured decode layout's budget reads the placement.
+    from vllm_torchtpu.layers.adapter import expert_placement
+
+    text = model_config.hf_text_config
+    ep = parallel_config.tensor_parallel_size * parallel_config.data_parallel_size
+    unplaced = text.num_experts // ep
+    placement = expert_placement.current()
+    placed = unplaced if placement is None else placement.slots_per_rank
+    slot_layers = 0 if placement is None else -placement.copies_per_rank
+    for layer in range(text.num_hidden_layers):
+        is_placed = placement is not None and layer in placement.layers
+        slot_layers += _CALIBRATED_EXPERT_SLOTS - (placed if is_placed else unplaced)
+    slot_bytes = 3 * text.hidden_size * text.moe_intermediate_size
+    return slot_layers * slot_bytes, placed
 
 
 def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
@@ -106,10 +162,131 @@ def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
     cache_config.prefix_match_unit = 128
 
 
+def _moe_kernel() -> str | None:
+    """The fused EP MoE implementation this process runs (``v2`` when the
+    switch is on without an implementation), or None without fused EP."""
+    if not envs.USE_MOE_FUSED_EP_KERNEL:
+        return None
+    return envs.MOE_FUSED_EP_KERNEL_IMPL or "v2"
+
+
+def _is_measured_kv_layout(vllm_config: VllmConfig) -> bool:
+    """Whether the engine's role, layout and MoE kernel are those the KV
+    budget was measured on: a decode (kv_consumer) leg at TP8 + DCP4 with
+    expert parallelism, no pipeline or prefill context parallelism, and fused
+    EP MoE v3. There the expert-slot credit counts each rank's slots and
+    layers exactly; PP splits the layers across stages and vLLM folds PCP into
+    the EP size."""
+    kv_cfg = vllm_config.kv_transfer_config
+    parallel_config = vllm_config.parallel_config
+    layout = (
+        parallel_config.tensor_parallel_size,
+        parallel_config.data_parallel_size,
+        parallel_config.decode_context_parallel_size,
+    )
+    return (
+        kv_cfg is not None
+        and kv_cfg.kv_role == "kv_consumer"
+        and layout in _CALIBRATED_DECODE_LAYOUTS
+        and parallel_config.enable_expert_parallel
+        and parallel_config.pipeline_parallel_size == 1
+        and parallel_config.prefill_context_parallel_size == 1
+        and _moe_kernel() == _CALIBRATED_MOE_KERNEL
+    )
+
+
+def _apply_kv_budget(vllm_config: VllmConfig, calibrated: bool) -> None:
+    cache_config = vllm_config.cache_config
+    if cache_config.kv_cache_memory_bytes is not None:
+        return
+    parallel_config = vllm_config.parallel_config
+    if not calibrated or not _is_measured_kv_layout(vllm_config):
+        kv_cfg = vllm_config.kv_transfer_config
+        logger.info(
+            "Qwen3.5 kv_cache_memory_bytes left to gpu_memory_utilization: the "
+            "calibrated budget was measured for Qwen3.5-397B-A17B decode "
+            "(kv_consumer) legs on TPU7x at TP8 + DCP4 with expert "
+            "parallelism, no PP or PCP and fused EP MoE v3 (this engine: "
+            "calibrated checkpoint and device=%s, kv_role=%s, tp=%d, dp=%d, "
+            "dcp=%d, expert_parallel=%s, pp=%d, pcp=%d, fused_ep=%s).",
+            calibrated,
+            None if kv_cfg is None else kv_cfg.kv_role,
+            parallel_config.tensor_parallel_size,
+            parallel_config.data_parallel_size,
+            parallel_config.decode_context_parallel_size,
+            parallel_config.enable_expert_parallel,
+            parallel_config.pipeline_parallel_size,
+            parallel_config.prefill_context_parallel_size,
+            _moe_kernel(),
+        )
+        return
+    credit, slots = _expert_slot_kv_credit(vllm_config.model_config, parallel_config)
+    safe_kv = _CALIBRATED_KV_BYTES + credit
+    logger.info(
+        "Qwen3.5-397B kv_cache_memory_bytes set to auto: %d (slots=%d, dcp=%d, "
+        "seqs=%d).",
+        safe_kv,
+        slots,
+        parallel_config.decode_context_parallel_size,
+        vllm_config.scheduler_config.max_num_seqs,
+    )
+    cache_config.kv_cache_memory_bytes = safe_kv
+
+
+def is_measured_target(model_config) -> bool:
+    """Whether this engine serves the checkpoint and device the Qwen3.5 PD
+    stack's kernel levers were measured on: a Qwen3.5 architecture
+    (``settings.is_qwen3_5``) with the calibrated checkpoint shape on TPU7x
+    (``_is_calibrated``, Qwen3.5-397B-A17B). The kernel numerics below and the
+    few-token MoE kernel (``moe_lowtok_scores.enabled``) apply only there.
+
+    Any other Qwen3.5 checkpoint (main's CI model, Qwen3.5-35B-A3B, among
+    them) or device keeps main's arithmetic and code: those levers change the
+    last bits of the forward pass, which is not a free choice where they were
+    not measured."""
+    if not settings.is_qwen3_5(model_config):
+        return False
+    if _is_calibrated(model_config):
+        return True
+    logger.info_once(
+        "Qwen3.5 kernel levers (reciprocal-scale quantize, tuned and streamed "
+        "FP8 MoE grouped matmul, few-token MoE kernel) left at main's "
+        "arithmetic: they were measured for Qwen3.5-397B-A17B on TPU7x only."
+    )
+    return False
+
+
+def apply_kernel_numerics(model_config) -> bool:
+    """Qwen3.5's kernel numerics and code paths where they were measured
+    (``is_measured_target``), in every process that loads the model.
+
+    The Qwen3.5 PD stack was tuned and evaluated with the quantize helpers'
+    reciprocal scale (kernels/quantized_matmul/util.RECIPROCAL_SCALE), the
+    grouped matmul's hand-streamed whole-expert slabs
+    (kernels/megablox/gmm_v2.RHS_STREAM), and its tuned FP8 MoE tiling and
+    rhs-scale hoist (gmm_v2.TUNED_FP8_MOE), all off by default; turn them on
+    before the model's kernels are traced. Other models keep main's arithmetic
+    and code. Returns False without a model config and for any model other
+    than the measured target: the patch registry marks a patch done by its
+    target, not by model, so a later load of the measured target in the same
+    process still turns them on. Returns True once they are on.
+    """
+    if not is_measured_target(model_config):
+        return False
+    from vllm_torchtpu.kernels.megablox import gmm_v2
+    from vllm_torchtpu.kernels.quantized_matmul import util
+
+    util.set_reciprocal_scale(True)
+    gmm_v2.set_rhs_stream(True)
+    gmm_v2.set_tuned_fp8_moe(True)
+    return True
+
+
 def apply_serving_defaults(vllm_config: VllmConfig) -> None:
     """Fill the Qwen3.5 TPU serving defaults the user did not set."""
     calibrated = _is_calibrated(vllm_config.model_config)
     _apply_prefix_match_unit(vllm_config, calibrated)
+    _apply_kv_budget(vllm_config, calibrated)
 
 
 class TPUQwen35MoeConfig(Qwen3_5ForConditionalGenerationConfig):

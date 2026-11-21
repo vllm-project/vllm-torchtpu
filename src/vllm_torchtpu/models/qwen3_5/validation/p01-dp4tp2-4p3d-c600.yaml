@@ -24,11 +24,6 @@ record:
 decode_layout: "DP4 x TP2, multi-port external LB"
 concurrency: 600
 chips: 28
-# Values the record run used that this tree cannot run yet (README.md).
-not_yet_supported:
-  decode:
-    MOE_FUSED_EP_KERNEL_IMPL: "the fused EP MoE v3 kernel (this tree accepts v2 and adaptive)"
-    TPU_EXPERT_PLACEMENT: "an expert placement table that permutes the 512 experts over 8 ranks, which this tree does not ship"
 legs:
   prefill:
     replicas: 4
@@ -241,4 +236,5 @@ legs:
       USE_MOE_SPARSE_CORE: "1"
       VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: "1"
       VLLM_XLA_CHECK_RECOMPILATION: "0"
-    additional_config: {}
+    additional_config:
+      tpu_collectives: {small_all_reduce: true}

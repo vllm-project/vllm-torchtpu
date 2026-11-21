@@ -26,6 +26,7 @@ import torch
 from vllm.model_executor.layers.activation import SiluAndMul
 
 import vllm_torchtpu.envs as envs
+from tests.layers.adapter.quantization.test_fp8_fused_ep_v3_forward import _setenv
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME
 from vllm_torchtpu.layers.adapter import fused_moe_decode as bridge
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
@@ -157,6 +158,40 @@ def test_admission_declines_a_layer_with_copy_slots(monkeypatch, tmp_path):
     setattr(placed.routed_experts, expert_placement.PRIMARY_EXPERTS_ATTR, 4)
     assert bridge._admit(placed, 2) is None
     assert bridge._admit(_glm_runner(DeepseekV2MLP(256, 128)), 2) is not None
+
+
+@pytest.mark.parametrize(
+    "path", ["scores", "v3", "adaptive", "v2", "collectives", "none"]
+)
+def test_admission_declines_a_layer_another_path_serves(monkeypatch, path):
+    """One MoE decision per layer: apply_monolithic serves these layers by
+    another path before it reaches the fused decode kernel, so arming one
+    would make the runner drop its shared expert and all-reduce while that
+    path returns only this rank's routed partial."""
+    import vllm.distributed
+
+    from vllm_torchtpu.layers.adapter import fused_moe_ep_v3
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import FUSED_MOE_EP_OP_ATTR
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    runner = _glm_runner(DeepseekV2MLP(256, 128))
+    qm = runner._quant_method
+    if path == "scores":
+        qm._moe_lowtok_scores_op = object()
+    elif path == "v3":
+        _setenv(monkeypatch, "USE_MOE_FUSED_EP_KERNEL", "1")
+        monkeypatch.setattr(fused_moe_ep_v3, "_OP", object())
+        qm._tpu_fused_ep_eligible = True
+    elif path == "adaptive":
+        qm._use_adaptive_fused_moe = True
+    elif path == "v2":
+        setattr(qm, FUSED_MOE_EP_OP_ATTR, object())
+    elif path == "collectives":
+        _setenv(monkeypatch, "TPU_MOE_FP8_ALL_GATHER", "1")
+    admitted = bridge._admit(runner, 2)
+    assert (admitted is None) is (path != "none")
 
 
 def test_admission_declines_attention_narrower_than_mesh(monkeypatch):

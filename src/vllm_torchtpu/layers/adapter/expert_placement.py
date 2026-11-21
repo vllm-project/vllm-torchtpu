@@ -397,12 +397,51 @@ def has_applied_layers() -> bool:
     return bool(_APPLIED_LAYERS)
 
 
-# The table's facts by the names the MoE methods ask for them; neither needs a
-# table.
+def _require() -> Placement:
+    placement = current()
+    if placement is None:
+        raise RuntimeError("no expert placement: TPU_EXPERT_PLACEMENT is unset")
+    return placement
+
+
+# The table's facts by the names the few-token MoE kernel and the MoE methods
+# ask for them. The accessors that call _require need a table; has_copies,
+# placed, primary_experts and fetch_filter_ids answer without one.
 def has_copies() -> bool:
     """Whether the table gives the ranks copy slots after their primaries."""
     placement = current()
     return placement is not None and placement.copies_per_rank > 0
+
+
+def placed(name: str) -> bool:
+    """Whether the table places the layer a prefix or tensor name belongs to."""
+    return placed_ranks(name) is not None
+
+
+def shards() -> int:
+    """The expert-parallel ranks the table places experts over."""
+    return _require().shards
+
+
+def global_count() -> int:
+    """The model's routed experts, every rank's primaries together."""
+    return _require().experts
+
+
+def owned() -> int:
+    """Primary slots per rank, the slots the router and the other kernels see."""
+    return _require().per_rank
+
+
+def slots() -> int:
+    """Every slot a rank holds, primaries then copies."""
+    return _require().slots_per_rank
+
+
+def holder_tables(layer: int, rank: int) -> tuple[list[int], list[int], list[int]]:
+    """Placement.holder_tables: `rank`'s slot ids and each expert's primary
+    and copy ranks, in primary (router) ids."""
+    return _require().holder_tables(layer, rank)
 
 
 def primary_experts(layer) -> int | None:
@@ -415,6 +454,11 @@ def primary_experts(layer) -> int | None:
         return None
     primaries = getattr(layer, PRIMARY_EXPERTS_ATTR, None)
     return int(layer.w13_weight.shape[0]) if primaries is None else int(primaries)
+
+
+def hot_order(layer: int) -> list[int]:
+    """The layer's copied experts hottest first, in primary (router) ids."""
+    return _require().hot_order(layer)
 
 
 def fetch_filter_ids(name: str) -> frozenset[int] | None:

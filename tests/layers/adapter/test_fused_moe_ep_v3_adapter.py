@@ -28,6 +28,7 @@ from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal.pallas._mock_device import _PallasDevice
 from vllm.distributed import parallel_state
 
+from tests.layers.adapter.quantization.test_fp8_fused_ep_v3_forward import _setenv
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v3 import ffn_kernel
 from vllm_torchtpu.kernels.fused_moe.v3 import layer as kernel_layer
@@ -39,6 +40,8 @@ from vllm_torchtpu.layers.adapter import (
     token_padding,
 )
 from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as v3
+from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
+from vllm_torchtpu.models.qwen3_5 import hooks
 
 pytestmark = pytest.mark.cpu_test
 
@@ -125,6 +128,18 @@ def test_tensor_parallel_gate_refuses_a_first_sliced_bucket_below_it(
     groups(1, 8)
     with pytest.raises(ValueError, match="leave steps between the two kernels"):
         v3.check_kernel_threshold(ep=8, tp=8, lowtok_cap=448)
+
+
+def test_tensor_parallel_gate_is_checked_on_the_threshold_itself(groups, monkeypatch):
+    """DP4 x TP2 (gate 32) at a 48-row sequence-parallel threshold: a sliced
+    step can have as few as 24 rows per rank, below the gate (the FP8
+    method's gate reads the same 24 rows), even though a 64-row step would
+    reach it. The few-token cap is refused."""
+    monkeypatch.setattr(sequence_parallel, "DEFAULT_MIN_ROWS", 48)
+    groups(4, 2)
+    assert v3.sequence_parallel_rows_per_rank(2) == 24
+    with pytest.raises(ValueError, match="leave steps between the two kernels"):
+        v3.check_kernel_threshold(ep=8, tp=2, lowtok_cap=448)
 
 
 def test_tensor_parallel_gate_is_checked_at_the_first_sliced_bucket(
@@ -739,3 +754,82 @@ def test_the_graph_reads_the_buffers_and_keeps_the_output(
     assert torch.equal(compiled(out), out)
     # The output, the rank buffer, the expert order, and the valid count.
     assert graph_inputs == [4 if skip_padded_tokens else 3]
+
+
+@pytest.fixture
+def qwen3_5_397b_v3_sp(armed, groups, monkeypatch):
+    """A Qwen3.5-397B-A17B engine on TPU7x with expert parallelism, fused EP
+    v3 and sequence-parallel MoE; returns a function that sets the (dp, tp)
+    layout and gives one MoE layer stand-in on an 8-wide EP mesh."""
+    import vllm.config
+
+    _setenv(monkeypatch, "MOE_FUSED_EP_KERNEL_IMPL", "v3")
+    _setenv(monkeypatch, "TPU_MOE_SEQUENCE_PARALLEL", "1")
+    monkeypatch.setattr(hooks, "_chip_family", lambda: "7x")
+    monkeypatch.setattr(moe_lowtok_scores, "_ARMED_MAX_TOKENS", 0)
+    monkeypatch.setattr(moe_lowtok_scores, "_LAYERS", [])
+    monkeypatch.setattr(moe_lowtok_scores, "set_lowtok_max_tokens", lambda cap: None)
+    # The few-token kernel's own layer checks are not what this is about: the
+    # cap is armed before them.
+    monkeypatch.setattr(
+        moe_lowtok_scores, "_unsupported_reason", lambda layer, act: "a stand-in"
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architectures=["Qwen3_5MoeForConditionalGeneration"],
+            hf_text_config=SimpleNamespace(**hooks._CALIBRATED_SHAPE),
+        ),
+        parallel_config=SimpleNamespace(enable_expert_parallel=True),
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
+
+    def engine(dp, tp):
+        groups(dp, tp)
+        monkeypatch.setattr(v3, "_tensor_parallel_size", lambda: tp)
+        monkeypatch.setattr(v3, "build_ep_mesh", lambda: _mesh(8))
+        layer = _layer(slots=4)
+        layer.layer_name = "model.layers.0.mlp.experts"
+        layer.global_num_experts = 4 * 8
+        layer.moe_config.ep_size = 8
+        layer.moe_config.is_sequence_parallel = True
+        return layer
+
+    return engine
+
+
+def _load(layer):
+    """One MoE layer's load sequence in the FP8 method: the few-token
+    kernel's prebuild, then fused EP v3's."""
+    moe_lowtok_scores.prebuild(SimpleNamespace(), layer, "silu")
+    return _prebuild(layer)
+
+
+@pytest.mark.parametrize("layout", [(4, 2), (1, 8)], ids=["dp4tp2", "tp8"])
+def test_the_engine_loads_while_the_sequence_parallel_threshold_is_unset(
+    qwen3_5_397b_v3_sp, layout
+):
+    """Until the model follows each step's form the sequence-parallel row
+    threshold is 0, so the first sliced bucket is one row, below both layouts'
+    step gates: the few-token kernel stays off, and fused EP v3's threshold
+    check passes instead of stopping the engine at load."""
+    layer = qwen3_5_397b_v3_sp(*layout)
+    assert sequence_parallel.min_rows() == 0
+    assert _load(layer)
+    assert moe_lowtok_scores.armed_max_tokens() == 0
+
+
+@pytest.mark.parametrize(
+    "layout,threshold", [((4, 2), 64), ((1, 8), 512)], ids=["dp4tp2", "tp8"]
+)
+def test_the_few_token_kernel_arms_once_the_threshold_is_set(
+    qwen3_5_397b_v3_sp, monkeypatch, layout, threshold
+):
+    """The control: at the thresholds of a model that follows each step's form
+    (64 rows at DP4 x TP2, 512 at TP8) the few-token kernel arms at its EP8
+    cap and the two kernels meet."""
+    layer = qwen3_5_397b_v3_sp(*layout)
+    monkeypatch.setattr(
+        sequence_parallel, "min_rows", lambda parallel_config=None: threshold
+    )
+    assert _load(layer)
+    assert moe_lowtok_scores.armed_max_tokens() == 448

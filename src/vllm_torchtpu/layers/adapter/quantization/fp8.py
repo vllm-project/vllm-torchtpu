@@ -94,6 +94,7 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
+from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     VllmQuantLinearConfig,
@@ -760,7 +761,9 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                 )
 
                 return VllmUnquantizedLinearMethod()
-            return VllmFp8LinearMethodTPU(self, self.get_linear_config(layer))
+            return VllmFp8LinearMethodTPU(
+                self, self.get_linear_config(layer), prefix=prefix
+            )
 
         if isinstance(layer, Attention):
             return None
@@ -786,6 +789,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     _gmm_primary_experts: int | None = None
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
+    _moe_lowtok_scores_op: torch.library.CustomOpDef | None = None
 
     def __init__(
         self,
@@ -827,19 +831,26 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
           is only ours to do if we are the one issuing it;
         - the fused EP kernel does the exchange inside its own program.
 
-        The fused half asks `fused_moe_ep_supported` about this method, not
-        `envs.USE_MOE_FUSED_EP_KERNEL`: the env var only says the operator
-        asked for the kernel, while `prebuild_fused_moe_ep` is what decides
-        whether this layer was actually armed. Claiming ownership on the
-        request would strip vLLM's collectives in every configuration prebuild
-        refuses -- TP, over the SMEM bound, under the token threshold, or
-        a weight or routing layout the kernel cannot serve.
+        The fused half needs both the request (`envs.USE_MOE_FUSED_EP_KERNEL`)
+        and the arming: `fused_moe_ep_supported` (v2 or v3) asks this method
+        whether `prebuild_fused_moe_ep` armed this layer. Claiming ownership on
+        the request alone would strip vLLM's collectives in every
+        configuration prebuild refuses -- over the SMEM bound, under the token
+        threshold, or a weight or routing layout the kernel cannot serve.
         """
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            fused_moe_ep_supported as fused_moe_ep_v2_supported,
+        )
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_moe_ep_supported as fused_moe_ep_v3_supported,
+        )
 
         return (
             enable_pipelined_collective_and_compute()
-            or fused_moe_ep_supported(self)
+            or (
+                envs.USE_MOE_FUSED_EP_KERNEL
+                and (fused_moe_ep_v3_supported(self) or fused_moe_ep_v2_supported(self))
+            )
             or adaptive_moe.adaptive_fused_moe_supported(self)
             or envs.TPU_MOE_FP8_ALL_GATHER
         )
@@ -1072,7 +1083,20 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
+            from vllm.config import get_current_vllm_config_or_none
+
+            from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+            # Under the loader's config context; a no-op unless the
+            # tpu_collectives.small_all_reduce option is on. Without a config
+            # context (weights processed directly) there is nothing to build.
+            vllm_config = get_current_vllm_config_or_none()
+            if vllm_config is not None:
+                small_all_reduce_op.prebuild(vllm_config)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        self._moe_lowtok_scores_op = moe_lowtok_scores.prebuild(
+            self, layer, activation_str
+        )
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
                 layer,
@@ -1092,26 +1116,47 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             prebuild_fused_moe_ep,
             register_score_bias_buffer,
         )
-
-        _ep_op = prebuild_fused_moe_ep(
-            layer,
-            topk=layer.moe_config.experts_per_token,
-            renormalize=layer.renormalize,
-            activation=activation_str,
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            prebuild_fused_moe_ep as prebuild_fused_moe_ep_v3,
         )
-        setattr(self, FUSED_MOE_EP_OP_ATTR, _ep_op)
-        if _ep_op is not None:
-            # Stage the bias, exactly as the nvfp4 and mxfp4 methods do. This
-            # is the other half of the arity contract: `_routing_config`
-            # decides the op's operand count from
-            # `layer.e_score_correction_bias`, while the call site reads the
-            # STAGED buffer via `score_bias_operand`. Register nothing and the
-            # two disagree -- the op is built with eight operands and
-            # `fused_moe_ep` takes its `score_bias is None` branch and passes
-            # seven, which Dynamo rejects with `missing value for argument
-            # 'score_bias'`. Passing the operand at the call site is not
-            # sufficient on its own; it has to exist.
-            register_score_bias_buffer(layer)
+
+        if envs.MOE_FUSED_EP_KERNEL_IMPL == "v3":
+            if (
+                envs.USE_MOE_FUSED_EP_KERNEL
+                and enable_pipelined_collective_and_compute()
+            ):
+                raise ValueError(
+                    "USE_MOE_FUSED_EP_KERNEL and MoE chunk pipelining both claim "
+                    "the expert-parallel exchange; enable one of them."
+                )
+            prebuild_fused_moe_ep_v3(
+                layer,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                activation=activation_str,
+            )
+            self._tpu_fused_ep_eligible = layer._tpu_fused_ep_eligible
+            setattr(self, FUSED_MOE_EP_OP_ATTR, None)
+        else:
+            _ep_op = prebuild_fused_moe_ep(
+                layer,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                activation=activation_str,
+            )
+            setattr(self, FUSED_MOE_EP_OP_ATTR, _ep_op)
+            if _ep_op is not None:
+                # Stage the bias, exactly as the nvfp4 and mxfp4 methods do. This
+                # is the other half of the arity contract: `_routing_config`
+                # decides the op's operand count from
+                # `layer.e_score_correction_bias`, while the call site reads the
+                # STAGED buffer via `score_bias_operand`. Register nothing and the
+                # two disagree -- the op is built with eight operands and
+                # `fused_moe_ep` takes its `score_bias is None` branch and passes
+                # seven, which Dynamo rejects with `missing value for argument
+                # 'score_bias'`. Passing the operand at the call site is not
+                # sufficient on its own; it has to exist.
+                register_score_bias_buffer(layer)
 
     def _prebuild_grouped_path(
         self, layer: TpuRoutedExperts, activation_str: str
@@ -1126,6 +1171,37 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
             num_primary_experts=self._gmm_primary_experts,
         )
+
+    def served_before_fused_decode(self, layer: RoutedExperts) -> str | None:
+        """The path `apply_monolithic` serves this layer by before it reaches
+        the fused MoE decode kernel's check, or None.
+
+        In `apply_monolithic`'s order: adaptive fused MoE, fused EP v2, the TP
+        decode MoE kernel, fused EP v3, the few-token scores entry, and the
+        grouped path that issues its own collectives. `fused_moe_decode`
+        arms only a layer this returns None for: arming makes the runner skip
+        the shared expert and the all-reduce, which the other paths' outputs
+        still need.
+        """
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_moe_ep_supported as fused_moe_ep_v3_supported,
+        )
+        from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
+
+        if self._use_adaptive_fused_moe:
+            return "adaptive fused MoE"
+        if fused_moe_ep_supported(self):
+            return "fused EP v2"
+        if moe_tp_decode_supported(self):
+            return "the TP decode MoE kernel"
+        if envs.USE_MOE_FUSED_EP_KERNEL and fused_moe_ep_v3_supported(self):
+            return "fused EP v3"
+        if self._moe_lowtok_scores_op is not None:
+            return "the few-token scores entry"
+        if enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER:
+            return "the grouped path with its own collectives"
+        return None
 
     def apply_monolithic(
         self,
@@ -1171,6 +1247,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             fused_moe_ep_supported,
             score_bias_operand,
         )
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_moe_ep_supported as fused_moe_ep_v3_supported,
+        )
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import step_min_tokens
 
         if fused_moe_ep_supported(self):
             return fused_moe_ep(
@@ -1192,6 +1272,18 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # Armed layer: the runner no longer runs the shared expert or the
             # all-reduce, so this returns the reduced shared + routed sum.
             return moe_tp_decode_forward(self, layer, x, router_logits)
+        # The method holds the layer's eligibility (copied by prebuild).
+        if envs.USE_MOE_FUSED_EP_KERNEL and fused_moe_ep_v3_supported(self):
+            return self._apply_owning_dispatch_v3(
+                layer,
+                x,
+                router_logits,
+                use_fused_kernel=_fused_kernel_takes(x.shape[0], step_min_tokens()),
+            )
+        if self._moe_lowtok_scores_op is not None:
+            return moe_lowtok_scores.apply(
+                self._moe_lowtok_scores_op, layer, x, router_logits
+            )
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -1240,9 +1332,102 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if fused_moe_decode_supported(self):
             # Armed layer: the runner no longer runs the shared expert or the
             # all-reduce, so this returns the reduced shared + routed sum.
+            # Arming refuses a layer an earlier branch serves
+            # (served_before_fused_decode).
             return fused_moe_decode(self, layer, x, topk_weights, topk_ids)
 
         return fused_moe_gmm(**kwargs)
+
+    def _apply_owning_dispatch_v3(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        use_fused_kernel: bool = True,
+    ) -> torch.Tensor:
+        layer = cast("TpuRoutedExperts", layer)
+        from vllm.distributed.parallel_state import get_ep_group
+
+        from vllm_torchtpu.layers.adapter import small_all_reduce_op
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_moe_ep,
+            fused_moe_ep_supported,
+            retain_fused_ep_graph_inputs,
+        )
+
+        if use_fused_kernel and fused_moe_ep_supported(self):
+            w13, w2, s13, s2 = (
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+            )
+            router_logits = _retain_copy_tables(layer, router_logits)
+            out = fused_moe_ep(x, w13, w2, s13, s2, router_logits)
+            experts_start = layer._experts_start
+            if experts_start is not None:
+                value = experts_start.to(out.dtype)
+                out = out + (value - value)
+            out = small_all_reduce_op.retain(out)
+            return token_padding.retain_padding_graph_input(out)
+
+        ep = get_ep_group()
+        sequence_parallel_flag = layer.moe_config.is_sequence_parallel
+        dispatched = ep.dispatch_router_logits(x, router_logits, sequence_parallel_flag)
+        assert len(dispatched) == 2
+        gathered_x, gathered_logits = dispatched
+        out = self.apply_monolithic_external_dispatch(
+            layer, gathered_x, gathered_logits
+        )
+        return retain_fused_ep_graph_inputs(ep.combine(out, sequence_parallel_flag))
+
+    def apply_monolithic_external_dispatch(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del input_ids
+        layer = cast("TpuRoutedExperts", layer)
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            retain_fused_ep_graph_inputs,
+        )
+
+        if self._moe_lowtok_scores_op is not None:
+            out = moe_lowtok_scores.apply(
+                self._moe_lowtok_scores_op, layer, x, router_logits
+            )
+            return retain_fused_ep_graph_inputs(out)
+        # A layer with copy tables always has the scores op, which returned
+        # above, so this path never needs to keep them as graph inputs.
+        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids, topk_weights
+            )
+        activation_str = self._tpu_activation_str
+        assert activation_str is not None, (
+            "[moe] process_weights_after_loading did not run for this layer"
+        )
+        kwargs = {
+            "hidden_states": x,
+            "w1": layer.w13_weight,
+            "w2": layer.w2_weight,
+            "w1_scale": layer.w13_weight_scale_inv,
+            "w2_scale": layer.w2_weight_scale_inv,
+            "w1_bias": getattr(layer, "w13_bias", None),
+            "w2_bias": getattr(layer, "w2_bias", None),
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "experts_start": layer._experts_start,
+            "num_primary_experts": self._gmm_primary_experts,
+            "topk": layer.moe_config.experts_per_token,
+            "activation": activation_str,
+        }
+        out = fused_moe_gmm(**kwargs)
+        return retain_fused_ep_graph_inputs(out)
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):
@@ -1756,3 +1941,50 @@ def resolve_online_fp8(
     method.online_fp8_policy = policy
     policy.selected[prefix] = aliases
     return method
+
+
+def _retain_copy_tables(layer: TpuRoutedExperts, tensor: torch.Tensor) -> torch.Tensor:
+    """`tensor` plus a zero read from the layer's few-token copy tables, when
+    it has them.
+
+    Other compiled shapes of the same forward take the few-token scores op,
+    which reads those tables, so the fused kernel's shapes keep them as graph
+    inputs too, as `fused_moe_ep_v3.retain_fused_ep_graph_inputs` does for the
+    fused EP buffers: the shape-specific graphs keep one set of inputs.
+    """
+    if layer._lowtok_has_copies:
+        zero = (
+            layer._lowtok_tables[:1]
+            + layer._lowtok_prim[:1]
+            + layer._lowtok_copy[:1]
+            + layer._lowtok_hot1h[0, :1].to(torch.int32)
+        ) * 0
+        tensor = tensor + zero.to(tensor.dtype)
+    return tensor
+
+
+def _fused_kernel_takes(rows: int, gate: int) -> bool:
+    """Whether this step's MoE runs through the fused EP kernel.
+
+    Under tensor parallelism only a sequence-parallel step qualifies, and when
+    the SP threshold already puts every SP step's rows per rank at or above
+    the gate, that settles it without reading ``rows``. Comparing the traced
+    row count against the gate would put a lower bound on the token symbol;
+    a trace whose only bucket sits on that bound (the small all-reduce fork
+    bounds the same symbol from above at 128 rows) then specializes the
+    symbol, which vLLM's dynamic-shape trace rejects.
+    """
+    from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+        sequence_parallel_rows_per_rank,
+        tensor_parallel_size,
+    )
+
+    tp = tensor_parallel_size()
+    if tp > 1:
+        from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+
+        if not _sp.is_active():
+            return False
+        if sequence_parallel_rows_per_rank(tp) >= gate:
+            return True
+    return rows >= gate
