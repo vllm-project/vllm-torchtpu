@@ -129,7 +129,22 @@ def indexed_options(B: int | None = None) -> dict:
         select_nvis=envs.VLLM_TPU_MK_QSA_SELECT_NVIS,
         manager_pages=KEY_MP,
         key_slots=key_slots_for(B),
+        **thr_fast_options(B),
     )
+
+
+def thr_fast_options(B: int | None) -> dict:
+    """VLLM_TPU_MK_QSA_THR_FAST_BUCKETS="16:te,32:te" (default unset; exact): the `B`-row
+    kernel's VLLM_TPU_MK_QSA_THR_FAST value (`QSAFullIndexedBlock.thr_fast`); other buckets
+    keep VLLM_TPU_MK_QSA_THR_FAST. c32 (main-KV DCP-2) b16/b32: "1" (ter2)'s compaction tier
+    copies slow every rank's select by 60-69 us; "te" has no tiers. Empty when unset or `B`
+    is not listed, so the spec is unchanged."""
+    raw = os.environ.get("VLLM_TPU_MK_QSA_THR_FAST_BUCKETS", "")
+    if not raw or B is None:
+        return {}
+    table = dict(kv.split(":", 1) for kv in raw.split(",") if kv)
+    v = table.get(str(B))
+    return {} if v is None else {"thr_fast": v}
 
 
 def main_call_options() -> dict:
