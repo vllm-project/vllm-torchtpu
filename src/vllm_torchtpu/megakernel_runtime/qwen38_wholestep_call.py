@@ -135,6 +135,100 @@ def indexed_options(B: int | None = None) -> dict:
     )
 
 
+_LOGGED_MK_OPTIONS: set[int] = set()
+
+# (label, attribute) read from the built QSA indexed block, in log order. Attributes a
+# block does not have (older or newer kernels) are skipped, so the line never fails.
+_MK_BLOCK_FIELDS = (
+    ("key_slots", "key_slots"),  # wholekeyslots (auto resolved per bucket)
+    ("keymp", "mp"),  # wholekeymp
+    ("key_lanes", "ck_lanes"),  # wholekeylanes (= ck_width when unset)
+    ("thr_fast", "thr_fast_mode"),  # "" off, "ter2", "te", ...
+    ("req_async", "req_async"),
+    ("req_async_ids", "req_async_ids"),
+    ("req_async_bank", "req_async_bank"),
+    ("xmerge", "xmerge"),
+    ("skip_idle", "skip_idle"),
+    ("xreq_prefetch", "xreq_prefetch"),
+    ("xreq_loads", "xreq_loads"),
+    ("async_dma", "async_dma"),
+    ("select_nvis", "select_nvis"),
+    ("nvis_union", "select_nvis_union"),
+    ("nvis_digit", "nvis_digit"),
+    ("nvis_balance", "nvis_balance"),
+    ("uattn_lite", "uattn_lite"),
+    ("dcp", "dcp"),
+    ("compressed_dcp", "compressed_dcp"),
+)
+_MK_TILE_FIELDS = ("hier", "rel_fetch", "nbe", "nbd", "vmem_mib")
+
+
+def _fmt(v: Any) -> str:
+    if isinstance(v, bool):
+        return str(int(v))
+    return repr(v) if isinstance(v, str) else str(v)
+
+
+def _find_qsa_block(spec: Any) -> Any:
+    """The QSA indexed block of a whole-step spec: blocks sit inside sublayer wrappers
+    (`.inner`) and switch slots (`.branches`)."""
+    todo = list(spec.all_blocks()) + list(spec.layer_type.slots)
+    seen: set[int] = set()
+    while todo:
+        b = todo.pop(0)
+        if id(b) in seen:
+            continue
+        seen.add(id(b))
+        if hasattr(b, "key_slots"):
+            return b
+        inner = getattr(b, "inner", None)
+        if inner is not None:
+            todo.append(inner)
+        branches = getattr(b, "branches", None)
+        if isinstance(branches, dict):
+            todo.extend(branches.values())
+        elif isinstance(branches, (list, tuple)):
+            todo.extend(branches)
+    return None
+
+
+def mk_options_line(B: int, spec: Any, tiles: Any) -> str:
+    """One line with the options the `B`-row whole-step kernel was actually built with: read
+    from the built QSA block and the bucket's tiles (never re-parsed from the env)."""
+    blk = _find_qsa_block(spec)
+    parts = []
+    if blk is not None:
+        parts += [f"{k}={_fmt(getattr(blk, a))}" for k, a in _MK_BLOCK_FIELDS if hasattr(blk, a)]
+    parts += [f"{k}={_fmt(getattr(tiles, k))}" for k in _MK_TILE_FIELDS if hasattr(tiles, k)]
+    return f"qwen38 MK options b{B}: " + " ".join(parts)
+
+
+def _is_rank0() -> bool:
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank() == 0
+    except Exception:  # no TP group (CPU tests, tools): log
+        return True
+
+
+def log_mk_options(B: int, spec: Any, tiles: Any) -> None:
+    """Startup self-check (rank 0, once per row bucket): proves from the server log which MK
+    options each bucket's kernel really got. Logging only; the spec is not touched."""
+    if B in _LOGGED_MK_OPTIONS:
+        return
+    _LOGGED_MK_OPTIONS.add(B)
+    if not _is_rank0():
+        return
+    try:
+        line = mk_options_line(B, spec, tiles)
+    except Exception as e:  # never let the log break a build
+        line = f"qwen38 MK options b{B}: unavailable ({type(e).__name__}: {e})"
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info(line)
+
+
 def nvis_balance_options(B: int | None) -> dict:
     """VLLM_TPU_MK_QSA_NVIS_BALANCE_BUCKETS="48,64" (default unset; exact): the `B`-row
     kernel's sharded selection balances whole requests over the runs by visible groups
@@ -397,6 +491,7 @@ def build_wholestep_call(
         )
 
     spec = spec_for(L, n_att)
+    log_mk_options(B, spec, ex.tiles)
     stats = union_stats_on()
     fn, k_specs, _, n_w = make_flat_segment_step(
         mesh,

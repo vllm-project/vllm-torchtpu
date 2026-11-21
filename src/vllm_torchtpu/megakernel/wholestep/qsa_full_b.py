@@ -292,6 +292,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         # VLLM_TPU_MK_QSA_THR_FAST_BUCKETS, `qwen38_wholestep_call.thr_fast_options`).
         fast = thr_fast if thr_fast is not None else os.environ.get("VLLM_TPU_MK_QSA_THR_FAST", "0")
         fast = "ter2" if fast == "1" else "" if fast == "0" else fast
+        self.thr_fast_mode = fast  # resolved value, read by the startup option log
         ex_bit, ex_every = (int(x) for x in
                             os.environ.get("VLLM_TPU_MK_QSA_THR_EXIT", "19,2").split(","))
         self.thr_kw = dict(tie_skip="t" in fast,
