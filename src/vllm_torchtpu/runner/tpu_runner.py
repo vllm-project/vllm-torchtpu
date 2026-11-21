@@ -648,6 +648,12 @@ _steady_verify_tail_compiled = torch.compile(
 )
 
 
+def _steady_verify_tail_program(*args: Any) -> tuple[torch.Tensor, ...]:
+    """`_steady_verify_tail_impl`, compiled on TPU."""
+    on_tpu = args[0].device.type == "tpu"
+    return (_steady_verify_tail_compiled if on_tpu else _steady_verify_tail_impl)(*args)
+
+
 logger = init_logger(__name__)
 
 
@@ -6101,11 +6107,7 @@ class TPUModelRunner(GPUModelRunner):
         assert carry is not None and md.draft_token_ids is not None
         k = carry.tokens_per_req - 1
         hist, meta, width, blocks, key = fused
-        out = (
-            _steady_verify_tail_compiled
-            if tokens.device.type == "tpu"
-            else _steady_verify_tail_impl
-        )(
+        out = _steady_verify_tail_program(
             tokens,
             md.draft_token_ids,
             md.draft_lengths,
@@ -8092,7 +8094,8 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_advance_decode_inputs(self) -> None:
         """Compile `_advance_decode_inputs` at every steady decode (or, under
         n-gram speculative decoding, verify) shape: the token and request
-        buckets of each batch size, per seq_lens width."""
+        buckets of each batch size, per seq_lens width; and a greedy verify
+        step's steady tail, which advances the inputs in its own program."""
         spec = self.speculative_config
         if not self.scheduler_config.async_scheduling or (
             spec is not None
@@ -8117,29 +8120,99 @@ class TPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_per_req=np.full(n, T, dtype=np.int32),
                 ),
                 _get_padded_num_reqs_with_upper_limit(n, self.max_num_reqs),
+                # The verify step's logits rows (`get_spec_decode_metadata`).
+                _get_padded_token_len(self.num_tokens_paddings, n * T),
             )
             for n in range(1, self.max_num_reqs + 1)
         }
+        tail = (
+            T > 1
+            and self._greedy_head_owner is not None
+            and self.rejection_sampler is not None
+            and not self.rejection_sampler.synthetic_mode
+        )
         i32 = dict(dtype=torch.int32, device=self.device)
         i64 = dict(dtype=torch.int64, device=self.device)
         with self._precompile_timed("advance_decode_inputs"):
-            for num_tokens, num_reqs in sorted(buckets):
+            for num_tokens, num_reqs, logits_len in sorted(buckets):
                 pos_shape = (3, num_tokens) if self.uses_mrope else (num_tokens,)
                 # A verify step's source is padded to max_num_reqs * T
                 # (`sample_tokens`), its rejected counts are per padded row.
                 rejected = torch.zeros(num_reqs, **i32) if T > 1 else None
                 src = num_reqs if T == 1 else self.max_num_reqs * T
                 for width in sorted(widths):
+                    query_start_loc = torch.zeros(width + 1, **i32)
                     out = _advance_decode_inputs(
                         torch.zeros(src, **i64),
                         torch.zeros(num_tokens, **i32),
                         torch.zeros(pos_shape, **i32),
                         torch.zeros(width, **i32),
-                        torch.zeros(width + 1, **i32),
+                        query_start_loc,
                         rejected,
                         T,
                     )
                     synchronize_tensors(out)
+                    if tail:
+                        self._precompile_steady_verify_tail(
+                            logits_len, num_reqs, (*out, query_start_loc)
+                        )
+
+    def _precompile_steady_verify_tail(
+        self,
+        logits_len: int,
+        num_reqs: int,
+        carry_inputs: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Compile `_steady_verify_tail_impl` for one steady verify shape at
+        every n-gram match width, as the first tail of a run (its draft
+        counts are the metadata's) and as a later one (on the previous tail's
+        outputs). A served request whose length needed a width the spec
+        warm-up batch had not reached re-traced the tail.
+
+        `carry_inputs` are the step's ids, positions, seq_lens and
+        query_start_loc. Each tensor argument is a separate tensor, except the
+        first tail's draft lengths, which serve as its draft counts: dynamo
+        guards on which arguments alias."""
+        drafter = self.drafter
+        assert isinstance(drafter, DeviceNgramProposer)
+        assert self.speculative_config is not None
+        k = self.speculative_config.num_speculative_tokens
+        i32 = dict(dtype=torch.int32, device=self.device)
+        i64 = dict(dtype=torch.int64, device=self.device)
+        draft_lengths = torch.zeros(num_reqs, **i32)
+        md = (
+            torch.zeros(num_reqs, **i32),  # bonus_logits_indices
+            torch.zeros(logits_len, **i32),  # target_logits_indices
+            torch.zeros(logits_len, **i32),  # final_logits_indices
+            torch.zeros(logits_len, **i64),  # segment_ids
+            torch.zeros(logits_len, **i32),  # group_indices
+        )
+        *advanced, query_start_loc = carry_inputs
+        for hist, meta, width, blocks in drafter.warmup_fused_inputs(num_reqs):
+            draft_token_ids = torch.zeros(logits_len, **i32)
+            num_drafts = draft_lengths
+            for _ in range(2):
+                out = _steady_verify_tail_program(
+                    torch.zeros((logits_len, 1), **i64),
+                    draft_token_ids,
+                    draft_lengths,
+                    num_drafts,
+                    *md,
+                    hist,
+                    meta,
+                    *advanced,
+                    query_start_loc,
+                    k,
+                    drafter.min_n,
+                    drafter.max_n,
+                    width,
+                    blocks,
+                    self.max_num_reqs * (1 + k),
+                )
+                synchronize_tensors(list(out))
+                meta, advanced = out[2], list(out[5:8])
+                draft_token_ids, num_drafts = out[8], out[9]
+            advanced = list(carry_inputs[:3])
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.

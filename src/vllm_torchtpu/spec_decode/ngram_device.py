@@ -24,6 +24,7 @@ earliest occurrence, and the up to K tokens that follow it.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -309,6 +310,18 @@ class DeviceNgramProposer:
         assert self._hist is not None
         _, width = self._chunk_meta(start, num_reqs, rows, 2 * steps, meta)
         return self._hist, meta, width, self._blocks, key
+
+    def warmup_fused_inputs(
+        self, rows: int
+    ) -> Iterator[tuple[torch.Tensor, torch.Tensor, int, int]]:
+        """`fused_inputs`' history, meta, match width and blocks at every match
+        width, for `rows` rows that all write the dump row."""
+        assert self._hist is not None
+        meta = torch.zeros(2 * rows, dtype=torch.int32)
+        meta[:rows] = self._dump_row
+        meta = meta.to(self.runner.device)
+        for width in self._match_widths:
+            yield self._hist, meta, width, self._blocks
 
     def commit_fused(self, key: tuple[int, int, int], next_meta: torch.Tensor) -> None:
         """Keep the lengths a folded `propose_step` left (see `fused_inputs`)."""
