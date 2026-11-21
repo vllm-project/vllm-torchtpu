@@ -450,8 +450,6 @@ def _eagle3_drafter_stand_in(**fields):
 def test_compiled_async_spec_helpers_match_eager(device):
     if device.type != "tpu":
         pytest.skip("TPU compiled helpers require TPU device")
-    from types import SimpleNamespace
-
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
     # 1. _compiled_assemble_spec_and_rejected
@@ -648,8 +646,8 @@ def test_subtract_and_substitute_draft_token_ids_and_two_chunk_mamba_offsets():
             subtract_and_substitute_draft_token_ids,
         ),
         (
-            _compiled_subtract_and_substitute_placeholder_token.__wrapped__._torchdynamo_orig_callable,
-            _compiled_subtract_and_substitute_draft_token_ids.__wrapped__._torchdynamo_orig_callable,
+            _eager(_compiled_subtract_and_substitute_placeholder_token),
+            _eager(_compiled_subtract_and_substitute_draft_token_ids),
         ),
     ):
         sl_a, pos_a, ids_a = fn_pl(
@@ -702,10 +700,8 @@ def test_subtract_and_substitute_draft_token_ids_and_two_chunk_mamba_offsets():
     read_offsets = torch.zeros((8,), dtype=torch.int32)
     mamba_idx = torch.tensor([[2, 5, 0, 0]], dtype=torch.int32)
 
-    flat2, rej2 = (
-        _compiled_assemble_two_chunks_spec_rejected_and_read_offsets.__wrapped__._torchdynamo_orig_callable(
-            nt0, d0, dl0, nt1, d1, dl1, read_offsets, mamba_idx, 32, 8
-        )
+    flat2, rej2 = _eager(_compiled_assemble_two_chunks_spec_rejected_and_read_offsets)(
+        nt0, d0, dl0, nt1, d1, dl1, read_offsets, mamba_idx, 32, 8
     )
     assert flat2[:4].tolist() == [51, 501, 502, 503]
     assert flat2[4:8].tolist() == [60, 601, 602, 603]

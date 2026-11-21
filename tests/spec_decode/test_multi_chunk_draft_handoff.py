@@ -300,6 +300,8 @@ def test_without_the_skip_propose_concatenates_the_chunks(monkeypatch):
     ],
 )
 def test_the_concat_stays_where_nothing_takes_each_chunks_drafts(monkeypatch, case):
+    """Each case changes only the condition it names, which alone keeps the
+    concat."""
     num_reqs = [3, 2]
     drafter = _proposer(monkeypatch, num_reqs)
     runner = _runner(

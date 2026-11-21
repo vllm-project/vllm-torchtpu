@@ -615,7 +615,8 @@ def _compiled_assemble_spec_and_rejected(
     """Fused bucketed on-device substitution source assembly + num_rejected.
 
     Operates on bucketed ``next_tokens`` ``[B, K+1]``, ``drafts`` ``[D, K]``
-    (with ``D >= B``), and ``draft_lengths`` ``[B]`` (padded tail rows are 0),
+    (padded or cut to ``B`` rows), and ``draft_lengths`` ``[B]`` (padded tail
+    rows are 0),
     returning ``(src_padded [bound], num_rejected_padded [max_num_reqs])`` in a
     single compiled graph.
     """
@@ -697,8 +698,8 @@ def _compiled_assemble_prefill_bootstrap(
 ) -> torch.Tensor:
     """Bucketed on-device substitution source assembly for async prefill bootstrap.
 
-    Packs ``selected_tokens`` ``[B, 1]`` and ``padded_drafts`` ``[D, K]`` (with
-    ``D >= B``) into ``src_padded [bound]`` in a single compiled graph.
+    Packs ``selected_tokens`` ``[B, 1]`` and ``padded_drafts`` ``[D, K]`` (padded
+    or cut to ``B`` rows) into ``src_padded [bound]`` in a single compiled graph.
     """
     B = selected_tokens.shape[0]
     drafts_b = (
