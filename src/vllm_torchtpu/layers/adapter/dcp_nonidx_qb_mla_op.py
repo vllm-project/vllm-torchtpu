@@ -196,6 +196,7 @@ def build_in_branch_qb_attention_op(
                     rope_spec=rope_spec,
                     dcp_size=dcp,
                     interleave_size=il,
+                    zigzag_bands=layout.effective_zigzag_bands(kv_c.shape[0] * dcp),
                 )
             return update_sparse_mla_kv_cache_dcp(
                 nope,

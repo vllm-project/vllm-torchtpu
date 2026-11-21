@@ -390,9 +390,14 @@ class _OProjReduceScatter:
     """The MLA op's `prefill_group` for an input of all rows: o_proj's partial
     sums, reduce-scattered to each rank's rows instead of all-reduced."""
 
-    @staticmethod
-    def project_reduce_scatter(x: torch.Tensor, o_proj: Any) -> torch.Tensor:
+    def __init__(self, zigzag_bands: int = 1) -> None:
+        self.zigzag_bands = zigzag_bands
+
+    def project_reduce_scatter(self, x: torch.Tensor, o_proj: Any) -> torch.Tensor:
         partial = o_proj.quant_method.apply(o_proj, x)
+        if self.zigzag_bands > 1:
+            tp = get_tensor_model_parallel_world_size()
+            partial = _to_zigzag_rank_major(partial, tp, self.zigzag_bands)
         return tensor_model_parallel_reduce_scatter(partial, 0)
 
 
@@ -409,6 +414,7 @@ class _GatherProjections(_OProjReduceScatter):
         num_tokens: int,
         *,
         positions_local: torch.Tensor | None = None,
+        zigzag_bands: int = 1,
     ) -> tuple[
         torch.Tensor
         | tuple[torch.Tensor, torch.Tensor]
@@ -499,24 +505,45 @@ class _GatherProjections(_OProjReduceScatter):
                 kv_lora = kv_lora_local
                 if use_sharded_kv:
                     all_heads = gathered[:, :cols_qc].reshape(tp, s, q_lora)
-                    kw = gathered[:, cols_qc:] if indexer is not None else None
+                    kw = (
+                        _from_zigzag_rank_major(
+                            gathered[:, cols_qc:], num_tokens, tp, zigzag_bands
+                        )
+                        if indexer is not None
+                        else None
+                    )
                 else:
-                    kv_lora = gathered[:, :kv_dim]
+                    kv_lora = _from_zigzag_rank_major(
+                        gathered[:, :kv_dim], num_tokens, tp, zigzag_bands
+                    )
                     all_heads = gathered[:, kv_dim : kv_dim + cols_qc].reshape(
                         tp, s, q_lora
                     )
                     kw = (
-                        gathered[:, kv_dim + cols_qc :] if indexer is not None else None
+                        _from_zigzag_rank_major(
+                            gathered[:, kv_dim + cols_qc :],
+                            num_tokens,
+                            tp,
+                            zigzag_bands,
+                        )
+                        if indexer is not None
+                        else None
                     )
                 rank = tp_op.rank.view(1)
-                next_rank = torch.clamp(rank + 1, max=tp - 1)
-                from_next = all_heads.index_select(0, next_rank).squeeze(0)
-                tail_s = torch.where(
-                    rank.view(1, 1) < tp - 1,
-                    from_next,
-                    q_c_local[-1:].expand(s, -1),
-                )
-                q_c_qrows = torch.cat([all_heads[0], q_c_local[s:], tail_s], dim=0)
+                if zigzag_bands > 1:
+                    pad = q_c_local[-1:].expand(s, -1)
+                    r0_tail = torch.cat([q_c_local[s:], pad], dim=0)
+                    tail = torch.where(rank.view(1, 1) == 0, r0_tail, q_c_local)
+                    q_c_qrows = torch.cat([all_heads[0], tail], dim=0)
+                else:
+                    next_rank = torch.clamp(rank + 1, max=tp - 1)
+                    from_next = all_heads.index_select(0, next_rank).squeeze(0)
+                    tail_s = torch.where(
+                        rank.view(1, 1) < tp - 1,
+                        from_next,
+                        q_c_local[-1:].expand(s, -1),
+                    )
+                    q_c_qrows = torch.cat([all_heads[0], q_c_local[s:], tail_s], dim=0)
                 if use_sharded_kv:
                     assert positions_local is not None
                     return (q_c_qrows, kv_lora_local, positions_local), kw
@@ -526,22 +553,57 @@ class _GatherProjections(_OProjReduceScatter):
         if indexer is not None:
             parts.append(indexer.wk_weights_proj(x)[0])
         rows = _all_rows(torch.cat(parts, dim=-1), num_tokens)
+        if zigzag_bands > 1:
+            rows = _from_zigzag_rank_major(
+                rows, num_tokens, get_tensor_model_parallel_world_size(), zigzag_bands
+            )
         if indexer is None:
             return rows, None
         width = parts[0].shape[-1]
         return rows[:, :width], rows[:, width:]
 
 
+class _ZigzagGatherProjections(_OProjReduceScatter):
+    """Bound `_GatherProjections` carrying a non-unit `zigzag_bands` count."""
+
+    def project_gather(
+        self,
+        mla: Any,
+        x: torch.Tensor,
+        num_tokens: int,
+        *,
+        positions_local: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor
+        | tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ]:
+        return _GatherProjections.project_gather(
+            mla,
+            x,
+            num_tokens,
+            positions_local=positions_local,
+            zigzag_bands=self.zigzag_bands,
+        )
+
+
 class _ShardedKVGatherProjections(_OProjReduceScatter):
     """Per-step projection gatherer that slices local positions lazily."""
 
-    def __init__(self, positions: torch.Tensor, tp: int) -> None:
+    def __init__(
+        self, positions: torch.Tensor, tp: int, *, zigzag_bands: int = 1
+    ) -> None:
+        super().__init__(zigzag_bands=zigzag_bands)
         self._positions = positions
         self._tp = tp
         self._positions_local: torch.Tensor | None = None
 
     def project_gather(
-        self, mla: Any, x: torch.Tensor, num_tokens: int
+        self,
+        mla: Any,
+        x: torch.Tensor,
+        num_tokens: int,
     ) -> tuple[
         torch.Tensor
         | tuple[torch.Tensor, torch.Tensor]
@@ -553,11 +615,19 @@ class _ShardedKVGatherProjections(_OProjReduceScatter):
         # binds the rank tensor to the module global instead of
         # layers[0]._tpu_sp_keep, causing ShapeSpecializationError on bucket handover.
         if self._positions_local is None:
-            self._positions_local = own_rows(
-                self._positions, fused_moe_ep.rank_operand(), self._tp
+            rank = fused_moe_ep.rank_operand()
+            self._positions_local = (
+                own_rows_zigzag(self._positions, rank, self._tp, self.zigzag_bands)
+                if self.zigzag_bands > 1
+                else own_rows(self._positions, rank, self._tp)
             )
+        extra_kw = {"zigzag_bands": self.zigzag_bands} if self.zigzag_bands > 1 else {}
         return _GatherProjections.project_gather(
-            mla, x, num_tokens, positions_local=self._positions_local
+            mla,
+            x,
+            num_tokens,
+            positions_local=self._positions_local,
+            **extra_kw,
         )
 
 
@@ -571,11 +641,77 @@ def _check_divides(num_tokens: int) -> int:
     return tp
 
 
+def _to_zigzag_rank_major(x: torch.Tensor, tp: int, num_bands: int) -> torch.Tensor:
+    if num_bands <= 1:
+        return x
+    num_tokens = x.shape[0]
+    band = num_tokens // (tp * num_bands)
+    x_bands = x.view(num_bands, tp, band, *x.shape[1:])
+    slices = [
+        x_bands[k].flip(0) if k % 2 == 1 else x_bands[k] for k in range(num_bands)
+    ]
+    return torch.stack(slices, dim=1).reshape(num_tokens, *x.shape[1:])
+
+
+def _from_zigzag_rank_major(
+    gathered: torch.Tensor, num_tokens: int, tp: int, num_bands: int
+) -> torch.Tensor:
+    if num_bands <= 1:
+        return gathered
+    band = num_tokens // (tp * num_bands)
+    g = gathered.view(tp, num_bands, band, *gathered.shape[1:])
+    parts = [g[:, k].flip(0) if k % 2 == 1 else g[:, k] for k in range(num_bands)]
+    return torch.cat(parts, dim=0).reshape(num_tokens, *gathered.shape[1:])
+
+
+def _step_zigzag_bands(active_layers: list[Any], num_tokens: int, tp: int) -> int:
+    if not dcp_token_parallel_op.applies(num_tokens):
+        return 1
+    found: int | None = None
+    for layer in active_layers:
+        if getattr(layer, KEEP_ATTR, None) is None:
+            continue
+        mla = getattr(getattr(layer, "self_attn", None), "mla_attn", None)
+        tp_op = getattr(getattr(mla, "mla_attn", None), "sparse_mla_tp_op", None)
+        if tp_op is None:
+            return 1
+        layout = getattr(tp_op, "layout", None)
+        if layout is None or layout.dcp_size != tp:
+            return 1
+        nb = int(layout.effective_zigzag_bands(num_tokens))
+        if nb <= 1:
+            return 1
+        if found is None:
+            found = nb
+        elif found != nb:
+            raise ValueError(
+                f"inconsistent zigzag_bands across armed layers: {found} vs {nb}"
+            )
+    return found or 1
+
+
+def own_rows_zigzag(
+    x: torch.Tensor, rank: torch.Tensor, tp: int, num_bands: int
+) -> torch.Tensor:
+    """Rank `rank`'s `num_bands` alternating forward/reverse zigzag bands."""
+    if num_bands <= 1:
+        return own_rows(x, rank, tp)
+    rows_per_rank = x.shape[0] // tp
+    band = rows_per_rank // num_bands
+    r = rank.reshape(())
+    blocks = x.view(num_bands * tp, band, *x.shape[1:])
+    idx = torch.stack(
+        [k * tp + r if k % 2 == 0 else (k + 1) * tp - 1 - r for k in range(num_bands)]
+    )
+    return blocks.index_select(0, idx).reshape(rows_per_rank, *x.shape[1:])
+
+
 def own_rows(x: torch.Tensor, rank: torch.Tensor, tp: int) -> torch.Tensor:
     """Rank `rank`'s contiguous `1/tp` of the rows of `x`. The rank is data
     (int32 `[1, 1]`), so every rank traces the same program."""
-    rows = x.view(tp, x.shape[0] // tp, *x.shape[1:])
-    return rows.index_select(0, rank.view(1)).view(x.shape[0] // tp, *x.shape[1:])
+    rows_per_rank = x.shape[0] // tp
+    rows = x.view(tp, rows_per_rank, *x.shape[1:])
+    return rows.index_select(0, rank.view(1)).view(rows_per_rank, *x.shape[1:])
 
 
 def _all_rows(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -593,17 +729,22 @@ def _zero_rank_dependency(tensor: torch.Tensor, rank: torch.Tensor) -> torch.Ten
     return rank + (bits_f32 - bits_f32).reshape(rank.shape).to(rank.dtype)
 
 
-def _moe(mlp: Any, x: torch.Tensor, num_tokens: int, tp: int) -> torch.Tensor:
+def _moe(
+    mlp: Any, x: torch.Tensor, num_tokens: int, tp: int, *, num_bands: int = 1
+) -> torch.Tensor:
     """The MoE block on this rank's rows: routed (fused EP, own tokens) times
     the routed scale, plus the shared expert -- the runner's order."""
     experts = mlp.experts.routed_experts
     router_logits, _ = mlp.gate(x)
     rank = fused_moe_ep.rank_operand()
     if envs.TPU_MOE_SKIP_PADDED_TOKENS and token_padding._padding_state is not None:
-        pad_mask = own_rows(
-            token_padding._padding_state.local_padding_mask.narrow(0, 0, num_tokens),
-            rank,
-            tp,
+        raw_mask = token_padding._padding_state.local_padding_mask.narrow(
+            0, 0, num_tokens
+        )
+        pad_mask = (
+            own_rows_zigzag(raw_mask, rank, tp, num_bands)
+            if num_bands > 1
+            else own_rows(raw_mask, rank, tp)
         )
         router_logits = torch.where(pad_mask[:, None], float("nan"), router_logits)
     shared = _shared_expert(mlp, x)
@@ -641,16 +782,32 @@ def _sequence_parallel_layer_forward(
         hidden_states = layer.input_layernorm(hidden_states)
     else:
         hidden_states, residual = layer.input_layernorm(hidden_states, residual)
-    group = gather_group if sharded_in else _O_PROJ_RS
+    zigzag_bands = int(getattr(gather_group, "zigzag_bands", 1))
+    group = (
+        gather_group
+        if sharded_in
+        else (
+            _O_PROJ_RS
+            if zigzag_bands <= 1
+            else _OProjReduceScatter(zigzag_bands=zigzag_bands)
+        )
+    )
     hidden_states = layer.self_attn.mla_attn(
         positions, hidden_states, llama_4_scaling, prefill_group=group
     )
     if not sharded_in:
-        residual = own_rows(residual, fused_moe_ep.rank_operand(), tp)
+        rk = fused_moe_ep.rank_operand()
+        residual = (
+            own_rows_zigzag(residual, rk, tp, zigzag_bands)
+            if zigzag_bands > 1
+            else own_rows(residual, rk, tp)
+        )
     hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
     if hasattr(layer.mlp, DENSE_OP):
         return _dense_mlp(layer.mlp, hidden_states), residual
-    return _moe(layer.mlp, hidden_states, num_tokens, tp), residual
+    return _moe(
+        layer.mlp, hidden_states, num_tokens, tp, num_bands=zigzag_bands
+    ), residual
 
 
 def _can_fuse_decode_post_attn_norm(
@@ -746,6 +903,9 @@ def patched_model_forward(
     # lifted token symbol to a concrete tensor dim, leaving `_embed_reduce_scatter`'s
     # `aten.empty([floordiv, H])` symbolic and failing static lowering.
     positions = positions.view(num_tokens, *positions.shape[1:])
+    active_layers = list(islice(self.layers, self.start_layer, self.end_layer))
+    tp = _check_divides(num_tokens)
+    zigzag_bands = _step_zigzag_bands(active_layers, num_tokens, tp)
     if inputs_embeds is not None:
         hidden_states = inputs_embeds
     elif (
@@ -753,11 +913,15 @@ def patched_model_forward(
         and input_ids is not None
         and input_ids.ndim == 1
     ):
-        tp = _check_divides(num_tokens)
         input_ids = input_ids.view(num_tokens)
         full_table = replicated_embedding.full_weight(self.embed_tokens)
         if full_table is None:
-            hidden_states = _embed_reduce_scatter(self.embed_tokens, input_ids)
+            embed_ids = (
+                _to_zigzag_rank_major(input_ids, tp, zigzag_bands)
+                if zigzag_bands > 1
+                else input_ids
+            )
+            hidden_states = _embed_reduce_scatter(self.embed_tokens, embed_ids)
         else:
             # Avoid calling fused_moe_ep.rank_operand() before layer 0's
             # _retain_buffers(*keep): it binds the rank tensor to the module
@@ -765,7 +929,12 @@ def patched_model_forward(
             # then names it differently (ShapeSpecializationError on handover).
             first_keep = getattr(self.layers[self.start_layer], KEEP_ATTR)
             input_ids = _retain_buffers(input_ids, *first_keep)
-            own_ids = own_rows(input_ids, fused_moe_ep.rank_operand(), tp)
+            rk = fused_moe_ep.rank_operand()
+            own_ids = (
+                own_rows_zigzag(input_ids, rk, tp, zigzag_bands)
+                if zigzag_bands > 1
+                else own_rows(input_ids, rk, tp)
+            )
             hidden_states = replicated_embedding.lookup(full_table, own_ids)
             # The decode buckets keep the vocab-parallel lookup: lift what it
             # reads so both traces hand buckets over with the same inputs.
@@ -778,13 +947,17 @@ def patched_model_forward(
     # embed_tokens and all leading dense layers take SP collectives, no
     # all-reduce runs on the prefill branch to lift small_all_reduce_op._RANK.
     hidden_states = small_all_reduce_op.retain(hidden_states)
-    active_layers = list(islice(self.layers, self.start_layer, self.end_layer))
-    gather_group: Any = _GATHER_PROJECTIONS
+    gather_group: Any = (
+        _GATHER_PROJECTIONS
+        if zigzag_bands <= 1
+        else _ZigzagGatherProjections(zigzag_bands=zigzag_bands)
+    )
     if envs.TPU_DCP_TP_SHARDED_KV_WRITE and any(
         getattr(layer, KEEP_ATTR, None) is not None for layer in active_layers
     ):
-        tp = _check_divides(num_tokens)
-        gather_group = _ShardedKVGatherProjections(positions, tp)
+        gather_group = _ShardedKVGatherProjections(
+            positions, tp, zigzag_bands=zigzag_bands
+        )
     residual = None
     for layer in active_layers:
         if getattr(layer, KEEP_ATTR, None) is not None:
@@ -796,6 +969,10 @@ def patched_model_forward(
     hidden_states, _ = self.norm(hidden_states, residual)
     if hidden_states.shape[0] != num_tokens:
         hidden_states = _all_rows(hidden_states, num_tokens)
+        if zigzag_bands > 1:
+            hidden_states = _from_zigzag_rank_major(
+                hidden_states, num_tokens, tp, zigzag_bands
+            )
     return hidden_states
 
 

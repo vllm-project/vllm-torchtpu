@@ -126,6 +126,18 @@ def layout_for(vllm_config: Any) -> dcp_token_parallel.TokenParallelLayout:
     max_model_len = int(vllm_config.model_config.max_model_len)
     max_pages = -(-max_model_len // vps) + EXTRA_PAGES
     base_caps = GATHER_CAPS
+    req_zigzag = int(envs.TPU_DCP_TP_ZIGZAG_BANDS)
+    tp = int(getattr(parallel, "tensor_parallel_size", dcp))
+    zigzag_bands = (
+        req_zigzag
+        if (
+            envs.TPU_MOE_PREFILL_SEQUENCE_PARALLEL
+            and req_zigzag > 1
+            and dcp == tp
+            and dcp >= 2
+        )
+        else 1
+    )
     return dcp_token_parallel.TokenParallelLayout(
         dcp_size=dcp,
         interleave_size=int(parallel.cp_kv_cache_interleave_size),
@@ -133,6 +145,7 @@ def layout_for(vllm_config: Any) -> dcp_token_parallel.TokenParallelLayout:
         split_rows=-(-max_num_seqs // SPLIT_ROWS_ALIGN) * SPLIT_ROWS_ALIGN,
         max_pages=max_pages,
         gather_caps=tuple(c for c in base_caps if c < max_pages) + (max_pages,),
+        zigzag_bands=zigzag_bands,
     )
 
 
@@ -587,6 +600,7 @@ def build_attention_op(
                     rope_spec=rope_spec,
                     dcp_size=dcp,
                     interleave_size=il,
+                    zigzag_bands=layout.effective_zigzag_bands(kv_c.shape[0] * dcp),
                 )
             return write_kv(nope, rope, kv_c, k_pe_in, sl, bt, qsl, rank)
 
@@ -1399,6 +1413,7 @@ def build_attention_op(
         split_rows = layout.split_rows
 
         def _qc_head_shift(q_c_local: jax.Array, rk: jax.Array) -> jax.Array:
+            zigzag_local = layout.effective_zigzag_bands(q_c_local.shape[0] * dcp) > 1
             return jax.shard_map(
                 lambda qc, r: dcp_token_parallel.gather_qc_head_rows(
                     qc,
@@ -1406,6 +1421,7 @@ def build_attention_op(
                     dcp_size=dcp,
                     split_rows=split_rows,
                     axis_name=DCP_AXIS_NAME,
+                    zigzag_local=zigzag_local,
                 ),
                 mesh=mesh,
                 in_specs=(sharded, sharded),
@@ -1435,7 +1451,7 @@ def build_attention_op(
 
         qc_head_shift_op, _ = get_shared_jax_op(
             "dcp_qc_head_shift",
-            (id(mesh), dcp, split_rows),
+            (id(mesh), dcp, split_rows, layout.zigzag_bands),
             _build_qc_head_shift_op,
         )
 
@@ -1538,6 +1554,23 @@ def q_rows(tp_op: Any, num_tokens: int) -> torch.Tensor:
     layout = tp_op.layout
     rows = layout.rows_per_rank(num_tokens)
     rank = tp_op.rank
+    nb = layout.effective_zigzag_bands(num_tokens)
+    if nb > 1:
+        r = rank.reshape(())
+        s = layout.split_rows
+        dcp = layout.dcp_size
+        band = rows // nb
+        offs = torch.arange(band, dtype=rank.dtype, device=rank.device)
+        bands = [
+            ((k * dcp + r if k % 2 == 0 else (k + 1) * dcp - 1 - r) * band + offs)
+            for k in range(nb)
+        ]
+        own = torch.cat(bands, dim=0)
+        pad = own[-1:].expand(s)
+        r0_tail = torch.cat([own[s:], pad], dim=0)
+        tail = torch.where(r == 0, r0_tail, own)
+        head = torch.arange(s, dtype=rank.dtype, device=rank.device)
+        return torch.cat([head, tail], dim=0)
     ar = torch.arange(layout.split_rows + rows, dtype=rank.dtype, device=rank.device)
     own = ar + torch.where(ar >= layout.split_rows, rank * rows, 0)
     return torch.clamp(own, max=num_tokens - 1)
@@ -1772,6 +1805,11 @@ def build_indexer_op(
                 f"index-K page {cache_kv.shape[-1]} != block size "
                 f"{layout.page_size} the token-parallel layout was built for"
             )
+        idx_zigzag_kw = (
+            {"zigzag_bands": layout.effective_zigzag_bands(k_packed.shape[0])}
+            if k_sharded and layout.effective_zigzag_bands(k_packed.shape[0]) > 1
+            else {}
+        )
         cache_kv = mla_op._cp_scatter_indexer_k(
             cache_kv,
             k_packed,
@@ -1787,6 +1825,7 @@ def build_indexer_op(
             rank_ids=rank_ids,
             compact=k_write_compact,
             k_sharded=k_sharded,
+            **idx_zigzag_kw,
         )
         q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
 

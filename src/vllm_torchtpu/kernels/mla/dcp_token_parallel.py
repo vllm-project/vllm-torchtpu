@@ -89,6 +89,10 @@ class TokenParallelLayout:
     # max_pages): it moves the smallest that holds the step's pages, so the
     # collective scales with the context rather than the buffer.
     gather_caps: tuple[int, ...] = ()
+    # Alternating forward/reverse bands per rank across a step (1 = contiguous;
+    # even >= 2 enables zero-ppermute dual-zigzag load balancing when band size
+    # holds `split_rows`).
+    zigzag_bands: int = 1
 
     def __post_init__(self):
         if self.dcp_size < 2:
@@ -100,6 +104,12 @@ class TokenParallelLayout:
             )
         if self.split_rows < 0 or self.max_pages < 1:
             raise ValueError(f"bad split_rows / max_pages: {self}")
+        if self.zigzag_bands < 1 or (
+            self.zigzag_bands > 1 and self.zigzag_bands % 2 != 0
+        ):
+            raise ValueError(
+                f"zigzag_bands must be 1 or a positive even int, got {self}"
+            )
         caps = self.gather_caps or (self.max_pages,)
         if list(caps) != sorted(set(caps)) or caps[-1] != self.max_pages or caps[0] < 1:
             raise ValueError(f"gather_caps must ascend to max_pages: {self}")
@@ -116,6 +126,49 @@ class TokenParallelLayout:
                 f"split_rows={self.split_rows} and divide by dcp={self.dcp_size}"
             )
         return num_tokens // self.dcp_size
+
+    def effective_zigzag_bands(self, num_tokens: int) -> int:
+        nb = self.zigzag_bands
+        if (
+            nb > 1
+            and self.split_rows > 0
+            and num_tokens % (self.dcp_size * nb) == 0
+            and (num_tokens // (self.dcp_size * nb)) >= self.split_rows
+        ):
+            return nb
+        return 1
+
+
+def zigzag_band_block_starts(
+    rank: jax.Array | int, dcp_size: int, rows_local: int, num_bands: int
+) -> jax.Array:
+    """Return `i32[num_bands]` starting global token index for each zigzag band."""
+    if num_bands < 1 or (num_bands > 1 and num_bands % 2 != 0):
+        raise ValueError(f"num_bands must be 1 or even >= 2, got {num_bands}")
+    if rows_local % num_bands:
+        raise ValueError(
+            f"rows_local={rows_local} must divide evenly by num_bands={num_bands}"
+        )
+    r = jnp.asarray(rank, dtype=jnp.int32).reshape(())
+    band_size = rows_local // num_bands
+    ks = jnp.arange(num_bands, dtype=jnp.int32)
+    even = (ks & 1) == 0
+    blk = jnp.where(even, ks * dcp_size + r, (ks + 1) * dcp_size - 1 - r)
+    return (blk * band_size).astype(jnp.int32)
+
+
+def zigzag_rank_global_tokens(
+    rank: jax.Array | int, rows_local: int, dcp_size: int, num_bands: int
+) -> jax.Array:
+    """Return `i32[rows_local]` global step token indices owned by `rank`."""
+    r = jnp.asarray(rank, dtype=jnp.int32).reshape(())
+    if num_bands <= 1:
+        return r * jnp.int32(rows_local) + jnp.arange(rows_local, dtype=jnp.int32)
+    starts = zigzag_band_block_starts(r, dcp_size, rows_local, num_bands)
+    band_size = rows_local // num_bands
+    return (starts[:, None] + jnp.arange(band_size, dtype=jnp.int32)[None, :]).reshape(
+        rows_local
+    )
 
 
 def rank_as_data(axis_name: str, axis_size: int) -> jax.Array:
@@ -230,13 +283,72 @@ def flat_rows(
 
 class RankRows(NamedTuple):
     """This rank's rows as a ragged batch of its own. Local request `k` is
-    global request `first_req + k`; requests past `num_seqs` are empty."""
+    global request `first_req + k` (or `req_ids[k]` under dual-zigzag);
+    requests past `num_seqs` are empty."""
 
     seq_lens: jax.Array  # i32[R], truncated after this rank's last row
     cu_q_lens: jax.Array  # i32[R + 1], local rows
     num_seqs: jax.Array  # i32
     first_req: jax.Array  # i32
     num_rows: jax.Array  # i32, real rows; the rest of the R rows are padding
+    req_ids: jax.Array | None = None  # i32[R], exact global req per span (zigzag)
+
+
+def _rank_rows_dual_zigzag(
+    layout: TokenParallelLayout,
+    rank: jax.Array,
+    num_tokens: int,
+    num_bands: int,
+    seq_lens: jax.Array,
+    query_start_loc: jax.Array,
+    num_seqs: jax.Array,
+) -> RankRows:
+    max_reqs = seq_lens.shape[0]
+    rows = layout.rows_per_rank(num_tokens)
+    band_size = rows // num_bands
+    starts = zigzag_band_block_starts(rank, layout.dcp_size, rows, num_bands)
+    total_valid = query_start_loc[num_seqs]
+    q_start, q_end = query_start_loc[:-1], query_start_loc[1:]
+    req_idx = jnp.arange(max_reqs, dtype=jnp.int32)
+    active = req_idx < num_seqs
+
+    r = rank.reshape(())
+    is_r0 = r == 0
+    band_lo = jnp.where(
+        (jnp.arange(num_bands, dtype=jnp.int32) == 0) & is_r0,
+        jnp.int32(layout.split_rows),
+        starts,
+    )
+    band_hi = starts + band_size
+    lo = band_lo[:, None]
+    hi = jnp.clip(total_valid, lo, band_hi[:, None])
+    a = jnp.clip(q_start[None, :], lo, hi)
+    b = jnp.clip(q_end[None, :], lo, hi)
+    q_len = jnp.where(active[None, :] & (b > a), b - a, 0)
+
+    # Proof: at most one request crosses each band gap (last_j <= first_{j+1}),
+    # so the total non-empty (band, req) spans <= max_reqs + num_bands - 1.
+    out_cap = max_reqs + num_bands
+    flat_qlen = q_len.reshape(-1)
+    flat_valid = flat_qlen > 0
+    flat_req = jnp.broadcast_to(req_idx[None, :], (num_bands, max_reqs)).reshape(-1)
+    flat_seq = (seq_lens[None, :] - (q_end[None, :] - b)).reshape(-1)
+
+    pos = jnp.cumsum(flat_valid.astype(jnp.int32)) - 1
+    dst = jnp.where(flat_valid, pos, out_cap)
+    out_qlen = jnp.zeros((out_cap,), jnp.int32).at[dst].set(flat_qlen, mode="drop")
+    out_seq = jnp.zeros((out_cap,), jnp.int32).at[dst].set(flat_seq, mode="drop")
+    out_req = jnp.zeros((out_cap,), jnp.int32).at[dst].set(flat_req, mode="drop")
+    n_local = jnp.sum(flat_valid.astype(jnp.int32))
+    cu = jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(out_qlen)])
+    return RankRows(
+        out_seq.astype(jnp.int32),
+        cu.astype(jnp.int32),
+        n_local,
+        out_req[0],
+        cu[n_local].astype(jnp.int32),
+        out_req.astype(jnp.int32),
+    )
 
 
 def rank_rows(
@@ -247,12 +359,18 @@ def rank_rows(
     query_start_loc: jax.Array,
     num_seqs: jax.Array,
 ) -> RankRows:
-    """Per-rank sequence metadata for rows `split_rows + rank * R + [0, R)`.
+    """Per-rank sequence metadata for rows `split_rows + rank * R + [0, R)`
+    (or `num_bands` alternating zigzag bands when configured).
 
     Each row keeps its global position and causal bound: a request's
     `seq_len` is cut by the rows that follow this rank's range, so the last
     local row of the request sits at `seq_len' - 1`.
     """
+    nb = layout.effective_zigzag_bands(num_tokens)
+    if nb > 1:
+        return _rank_rows_dual_zigzag(
+            layout, rank, num_tokens, nb, seq_lens, query_start_loc, num_seqs
+        )
     num_reqs = seq_lens.shape[0]
     rows = layout.rows_per_rank(num_tokens)
     total = query_start_loc[num_seqs]
@@ -284,6 +402,8 @@ def row_requests(rr: RankRows, num_rows: int) -> jax.Array:
     i = jnp.arange(num_rows, dtype=jnp.int32)
     local = _search(rr.cu_q_lens[1:], i, "right").astype(jnp.int32)
     local = jnp.minimum(local, jnp.maximum(rr.num_seqs - 1, 0))
+    if rr.req_ids is not None:
+        return rr.req_ids[local]
     return jnp.minimum(rr.first_req + local, rr.seq_lens.shape[0] - 1)
 
 
@@ -301,9 +421,12 @@ def natural_page_table(
     """
     bound_pages = layout.max_pages if cap is None else cap
     eff_vpages_per_seq = min(vpages_per_seq, bound_pages)
-    num_reqs = rr.seq_lens.shape[0]
-    k = jnp.arange(num_reqs, dtype=jnp.int32)
-    req = jnp.minimum(rr.first_req + k, num_reqs - 1)
+    if rr.req_ids is not None:
+        req = rr.req_ids
+    else:
+        num_reqs = rr.seq_lens.shape[0]
+        k = jnp.arange(num_reqs, dtype=jnp.int32)
+        req = jnp.minimum(rr.first_req + k, num_reqs - 1)
     width = eff_vpages_per_seq * layout.dcp_size
     pages = offsets[req][:, None] * layout.dcp_size + jnp.arange(width)[None, :]
     pages = jnp.minimum(pages, bound_pages * layout.dcp_size - 1)
@@ -487,8 +610,45 @@ def own_rows(layout: TokenParallelLayout, x: jax.Array, rank: jax.Array) -> jax.
     padding."""
     num_tokens = x.shape[0]
     rows = layout.rows_per_rank(num_tokens)
+    nb = layout.effective_zigzag_bands(num_tokens)
+    if nb > 1:
+        r = rank.reshape(())
+        s = layout.split_rows
+        own_idx = zigzag_rank_global_tokens(r, rows, layout.dcp_size, nb)
+        r0_idx = jnp.concatenate(
+            [own_idx[s:], jnp.full((s,), num_tokens - 1, dtype=jnp.int32)]
+        )
+        idx = jnp.where(r == 0, r0_idx, own_idx)
+        return jnp.take(x, idx, axis=0)
     idx = layout.split_rows + rank * rows + jnp.arange(rows, dtype=jnp.int32)
     return jnp.take(x, jnp.minimum(idx, num_tokens - 1), axis=0)
+
+
+def _zigzag_tail_rank_order_indices(
+    dcp_size: int, num_tokens: int, split_rows: int, num_bands: int
+) -> tuple[list[int], list[int]]:
+    """Return static forward (rank-major -> global) & inverse (tail -> rank-major)
+    index maps."""
+    rows = num_tokens // dcp_size
+    band_size = rows // num_bands
+    fwd: list[int] = []
+    inv = [rows - 1] * num_tokens
+    for r in range(dcp_size):
+        tokens_r: list[int] = []
+        for k in range(num_bands):
+            blk = k * dcp_size + r if (k & 1) == 0 else (k + 1) * dcp_size - 1 - r
+            start = blk * band_size
+            tokens_r.extend(range(start, start + band_size))
+        if r == 0:
+            shifted = tokens_r[split_rows:] + [num_tokens - 1] * split_rows
+            for loc, g in enumerate(tokens_r[split_rows:]):
+                inv[g - split_rows] = r * rows + loc
+            fwd.extend(shifted)
+        else:
+            for loc, g in enumerate(tokens_r):
+                inv[g - split_rows] = r * rows + loc
+            fwd.extend(tokens_r)
+    return fwd, inv
 
 
 def heads_to_tokens(
@@ -496,15 +656,38 @@ def heads_to_tokens(
 ) -> jax.Array:
     """`[T, h, d]` this rank's heads of every row -> `[R, h * dcp, d]` every
     head of this rank's token-parallel rows (heads in rank order)."""
+    num_tokens = x.shape[0]
     s = layout.split_rows
+    nb = layout.effective_zigzag_bands(num_tokens)
+    if nb > 1:
+        fwd, _ = _zigzag_tail_rank_order_indices(layout.dcp_size, num_tokens, s, nb)
+        x_pad = jnp.take(x, jnp.asarray(fwd, dtype=jnp.int32), axis=0)
+        rows = layout.rows_per_rank(num_tokens)
+        zero_tail = jnp.zeros((s, *x.shape[1:]), x.dtype)
+        x_pad = x_pad.at[rows - s : rows].set(zero_tail)
+        return lax.all_to_all(x_pad, axis_name, 0, 1, tiled=True)
     x = jnp.concatenate([x[s:], jnp.zeros((s, *x.shape[1:]), x.dtype)])
     return lax.all_to_all(x, axis_name, 0, 1, tiled=True)
 
 
-def tokens_to_heads(y: jax.Array, axis_name: str) -> jax.Array:
+def tokens_to_heads(
+    y: jax.Array,
+    axis_name: str,
+    *,
+    layout: TokenParallelLayout | None = None,
+) -> jax.Array:
     """Inverse of `heads_to_tokens`: `[R, H, d]` -> `[T, H / dcp, d]`, row `i`
     being step row `split_rows + i` (the last `split_rows` rows are padding)."""
-    return lax.all_to_all(y, axis_name, 1, 0, tiled=True)
+    gathered = lax.all_to_all(y, axis_name, 1, 0, tiled=True)
+    if layout is not None:
+        num_tokens = gathered.shape[0]
+        nb = layout.effective_zigzag_bands(num_tokens)
+        if nb > 1:
+            s = layout.split_rows
+            _, inv = _zigzag_tail_rank_order_indices(layout.dcp_size, num_tokens, s, nb)
+            unperm = jnp.take(gathered, jnp.asarray(inv, dtype=jnp.int32), axis=0)
+            return unperm.at[num_tokens - s :].set(0)
+    return gathered
 
 
 def dequantize_row_shards(
@@ -527,18 +710,26 @@ def gather_qc_head_rows(
     dcp_size: int,
     split_rows: int,
     axis_name: str,
+    zigzag_local: bool = False,
 ) -> jax.Array:
-    """Assemble `[split_rows + R, Q_LORA]` via `ppermute` and rank-0 broadcast."""
+    """Assemble `[split_rows + R, Q_LORA]` head0 broadcast plus per-rank tail rows."""
     r = rank.reshape(())
     head_local = q_c_local[:split_rows]
-    perm = [(i, (i - 1) % dcp_size) for i in range(dcp_size)]
-    from_next = lax.ppermute(head_local, axis_name, perm)
     # Avoid an all-gather of every rank's head slice: only rank 0's head is
     # broadcast, and a bf16 psum with (dcp_size - 1) exact zeros is bit-exact
     # for finite values while sending 256 KB instead of 4.19 MB at dcp=16.
     head0 = lax.psum(
         jnp.where(r == 0, head_local, jnp.zeros_like(head_local)), axis_name
     )
+    if zigzag_local:
+        # Dual-zigzag band 0 contains all of [0, split_rows) on rank 0, so
+        # nonzero ranks attend all R own rows directly with zero ppermute.
+        pad = jnp.broadcast_to(q_c_local[-1:], (split_rows, q_c_local.shape[-1]))
+        r0_tail = jnp.concatenate([q_c_local[split_rows:], pad], axis=0)
+        tail = jnp.where(r == 0, r0_tail, q_c_local)
+        return jnp.concatenate([head0, tail], axis=0)
+    perm = [(i, (i - 1) % dcp_size) for i in range(dcp_size)]
+    from_next = lax.ppermute(head_local, axis_name, perm)
     tail_s = jnp.where(
         r < dcp_size - 1,
         from_next,
@@ -556,12 +747,10 @@ def token_rows_to_sequence_rows(
 ) -> jax.Array:
     """Token-parallel rows `[R, N]` -> this rank's sequence-parallel rows `[R, N]`.
 
-    Per rank, inside a `shard_map` over `axis_name`: `own_rows` are step rows
-    `split_rows + rank * R + i`, `lead_rows` `[split_rows, N]` step rows
-    `[0, split_rows)` (same on every rank); the result is step rows
-    `rank * R + i`. Each rank hands its last `split_rows` rows to the next
-    rank; rank 0 takes `lead_rows` instead. Rows past `T` (the last rank's
-    tail) are dropped."""
+    Per rank, inside a `shard_map` over `axis_name`: for contiguous layout,
+    `own_rows` are step rows `split_rows + rank * R + i`, handed to rank+1 via
+    `ppermute`; for dual-zigzag (`zigzag_bands > 1`), only rank 0 swaps in
+    `lead_rows` at `[0, split_rows)` with zero cross-rank transfer."""
     s = layout.split_rows
     rows = own_rows.shape[0]
     if lead_rows.shape[0] != s or s > rows:
@@ -570,6 +759,11 @@ def token_rows_to_sequence_rows(
         )
     if s == 0:
         return own_rows
+    if layout.effective_zigzag_bands(rows * layout.dcp_size) > 1:
+        r0_rows = jnp.concatenate(
+            [lead_rows.astype(own_rows.dtype), own_rows[: rows - s]], axis=0
+        )
+        return jnp.where(rank == 0, r0_rows, own_rows)
     perm = [(i, i + 1) for i in range(layout.dcp_size - 1)]
     carried = lax.ppermute(own_rows[rows - s :], axis_name, perm)
     lead = jnp.where(rank == 0, lead_rows.astype(own_rows.dtype), carried)
@@ -765,7 +959,16 @@ def _project_hrv_pair_halves_local(
     split_rows = layout.split_rows
     pairs = [(i, i ^ 1) for i in range(layout.dcp_size)]
     w_peer = lax.ppermute(w_local, axis_name, pairs)
-    if use_pallas and shift_quant_split_3d.supports_shift_quant_split_3d_remote(
+    if layout.effective_zigzag_bands(num_rows * layout.dcp_size) > 1:
+        if use_pallas:
+            mine, peer, x_scale = shift_quant_split_3d.shift_quant_split_3d_fp8_local(
+                lead_hrv, own_hrv, rank_vec
+            )
+        else:
+            mine, peer, x_scale = shift_quant_split_3d.shift_quant_split_3d_local_ref(
+                lead_hrv, own_hrv, rank_vec
+            )
+    elif use_pallas and shift_quant_split_3d.supports_shift_quant_split_3d_remote(
         own_hrv.shape[0],
         num_rows,
         split_rows,
@@ -1154,7 +1357,7 @@ def _sparse_mla_attention_core(
         out = switched
         if token_rows:
             return nope, rope, out
-        return nope, rope, tokens_to_heads(out, axis_name)
+        return nope, rope, tokens_to_heads(out, axis_name, layout=layout)
 
     extra: tuple[jax.Array, ...] = ()
     extra_specs: tuple[P, ...] = ()

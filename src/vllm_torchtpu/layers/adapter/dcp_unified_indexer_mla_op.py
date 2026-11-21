@@ -245,6 +245,11 @@ def build_unified_indexer_attention_op(
                 f"{layout.page_size} the token-parallel layout was built for"
             )
 
+        idx_zigzag_kw = (
+            {"zigzag_bands": layout.effective_zigzag_bands(k_packed.shape[0])}
+            if k_sharded and layout.effective_zigzag_bands(k_packed.shape[0]) > 1
+            else {}
+        )
         index_cache = callbacks.scatter_indexer_k(
             index_cache,
             k_packed,
@@ -260,6 +265,7 @@ def build_unified_indexer_attention_op(
             rank_ids=rank_ids,
             compact=k_write_compact,
             k_sharded=k_sharded,
+            **idx_zigzag_kw,
         )
 
         def _write_kv_once(nope, rope, kv_c, k_pe_in, sl, bt, qsl, rk):
@@ -279,6 +285,7 @@ def build_unified_indexer_attention_op(
                     rope_spec=rope_spec,
                     dcp_size=dcp,
                     interleave_size=il,
+                    zigzag_bands=layout.effective_zigzag_bands(kv_c.shape[0] * dcp),
                 )
             return update_sparse_mla_kv_cache_dcp(
                 nope,

@@ -987,6 +987,34 @@ def _unpack_u32_band_to_u8(packed: jax.Array, orig_width: int) -> jax.Array:
     return out[:, :orig_width] if out.shape[-1] != orig_width else out
 
 
+def sort_recv_by_dst_row(
+    recv_u32: jax.Array,
+    recv_dst: jax.Array,
+    *,
+    num_rows: int,
+    max_valid_rows: int,
+) -> tuple[jax.Array, jax.Array]:
+    # Avoid passing unsorted `zigzag_bands > 1` rows to `scatter_rows`:
+    # alternating bands split one 128-lane granule across separate ranks, so
+    # concurrent `_write_runs` waves would read-modify-write stale tiles.
+    sentinel = jnp.int32(jnp.iinfo(jnp.int32).max)
+    valid = (recv_dst >= 0) & (recv_dst < num_rows)
+    sort_key = jnp.where(valid, recv_dst, sentinel)
+    sorted_key, perm = lax.sort_key_val(
+        sort_key,
+        jnp.arange(recv_dst.shape[0], dtype=jnp.int32),
+        is_stable=False,
+    )
+    keep = min(int(recv_dst.shape[0]), max_valid_rows)
+    sorted_k = sorted_key[:keep]
+    sorted_dst = jnp.where(
+        sorted_k < num_rows,
+        sorted_k,
+        jnp.int32(kv_cache_utils.SKIP_ROW),
+    )
+    return recv_u32[perm[:keep]], sorted_dst
+
+
 def sharded_kv_append_dcp(
     cache_kv: jax.Array,
     k_packed_local: jax.Array,
@@ -1001,6 +1029,7 @@ def sharded_kv_append_dcp(
     kv_layout: KVLayout | str | None = KVLayout.SEQ_ALONG_LANE,
     interpret: bool = False,
     use_pallas_scatter: bool = True,
+    zigzag_bands: int = 1,
 ) -> jax.Array:
     """Route sequence-sharded u8 K records via owner all_to_all into DCP cache."""
     page_size = cache_page_size(cache_kv, kv_layout)
@@ -1038,6 +1067,7 @@ def sharded_kv_append_dcp(
         num_seqs=int(seq_lens.shape[0]),
         dcp_size=dcp_size,
         interleave_size=interleave_size,
+        zigzag_bands=zigzag_bands,
     )
     send_idx, recv_dst_all = kv_cache_utils.build_sharded_dcp_a2a_plan(
         rows_local,
@@ -1051,17 +1081,33 @@ def sharded_kv_append_dcp(
         interleave_size=interleave_size,
         cap=cap_full,
         axis_name=axis_name,
+        zigzag_bands=zigzag_bands,
     )
     k_u32, orig_width = _pack_u8_to_u32_band(k_packed_local)
     band_words = int(k_u32.shape[-1])
+    num_seqs = int(seq_lens.shape[0])
+    num_cache_rows = int(cache_kv.shape[0]) * page_size
 
-    def _scatter_tier(cap: int) -> jax.Array:
+    def _scatter_tier(cap: int, seq_bound: int) -> jax.Array:
         sent = k_u32[send_idx[:, :cap]]
         recv = jax.lax.all_to_all(
             sent, axis_name, split_axis=0, concat_axis=0, tiled=False
         ).reshape(-1, band_words)
-        recv_u8 = _unpack_u32_band_to_u8(recv, orig_width)
         recv_dst = recv_dst_all[:, :cap].reshape(-1)
+        if zigzag_bands > 1:
+            max_valid = owned_rows_bound(
+                rows_local * dcp_size,
+                num_seqs=seq_bound,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+            )
+            recv, recv_dst = sort_recv_by_dst_row(
+                recv,
+                recv_dst,
+                num_rows=num_cache_rows,
+                max_valid_rows=max_valid,
+            )
+        recv_u8 = _unpack_u32_band_to_u8(recv, orig_width)
         if use_pallas_scatter:
             return scatter_rows(
                 cache_kv, recv_u8, recv_dst, kv_layout, interpret=interpret
@@ -1069,18 +1115,22 @@ def sharded_kv_append_dcp(
         return scatter_rows_reference(cache_kv, recv_u8, recv_dst, kv_layout)
 
     max_fast_seqs = kv_cache_utils.sharded_a2a_fast_seq_limit(
-        rows_local, dcp_size=dcp_size, interleave_size=interleave_size
+        rows_local,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+        zigzag_bands=zigzag_bands,
     )
     if cap_full > kv_cache_utils.SHARDED_A2A_FAST_CAP and max_fast_seqs >= 1:
         # Avoid lax.pmax across ranks: cu_q_lens is replicated, so live_seqs
         # gives a zero-collective sufficient condition for max_cnt <= fast cap.
         live_seqs = jnp.sum((cu_q_lens[1:] > cu_q_lens[:-1]).astype(jnp.int32))
+        fast_seq_bound = min(num_seqs, max_fast_seqs)
         return jax.lax.cond(
             live_seqs <= jnp.int32(max_fast_seqs),
-            lambda: _scatter_tier(kv_cache_utils.SHARDED_A2A_FAST_CAP),
-            lambda: _scatter_tier(cap_full),
+            lambda: _scatter_tier(kv_cache_utils.SHARDED_A2A_FAST_CAP, fast_seq_bound),
+            lambda: _scatter_tier(cap_full, num_seqs),
         )
-    return _scatter_tier(cap_full)
+    return _scatter_tier(cap_full, num_seqs)
 
 
 def owned_rows_bound(

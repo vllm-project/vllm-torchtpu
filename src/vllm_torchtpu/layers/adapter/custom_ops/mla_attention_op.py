@@ -497,6 +497,7 @@ def _cp_scatter_indexer_k(
     rank_ids: jax.Array | None = None,
     compact: bool = False,
     k_sharded: bool = False,
+    zigzag_bands: int = 1,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
 
@@ -540,6 +541,7 @@ def _cp_scatter_indexer_k(
                 interleave_size=interleave_size,
                 axis_name=axis_name,
                 kv_layout=kv_layout,
+                zigzag_bands=zigzag_bands,
             )
         if writer == "pallas":
             return coalesced_kv_append_dcp(

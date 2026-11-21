@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     TPU_DCP_TP_UNIFIED_INDEXER_IN_BRANCH_QB: bool = True
     TPU_DCP_TP_UNIFIED_INDEXER_MLA: bool = True
     TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP: int = 12
+    TPU_DCP_TP_ZIGZAG_BANDS: int = 4
     TPU_MLA_DECODE_LOCAL_Q_AG: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = True
@@ -891,6 +892,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_TP_SHARDED_KV_WRITE": env_bool(
         "TPU_DCP_TP_SHARDED_KV_WRITE", default=True
     ),
+    # Number of alternating forward/reverse sequence-parallel bands per rank for
+    # token-parallel DCP prefill (1 = contiguous sharding; even >= 2, e.g. 4,
+    # interleaves band blocks in dual-zigzag order across all layers so every
+    # rank shares identical causal load without per-layer ppermute collectives).
+    "TPU_DCP_TP_ZIGZAG_BANDS": env_int("TPU_DCP_TP_ZIGZAG_BANDS", 4),
     # Maximum gather cap inside the in-branch q_b + sparse MLA op at which
     # fused_qb runs without a post-gather_latent barrier so it overlaps
     # Chunk-0 SparseCore KV gather; caps above this hold lead_mla behind the

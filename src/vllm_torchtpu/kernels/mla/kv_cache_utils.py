@@ -764,24 +764,38 @@ _SHARDED_COMPACT_BLOCK = 64
 
 
 def _sharded_a2a_cap(
-    rows_local: int, *, num_seqs: int, dcp_size: int, interleave_size: int
+    rows_local: int,
+    *,
+    num_seqs: int,
+    dcp_size: int,
+    interleave_size: int,
+    zigzag_bands: int = 1,
 ) -> int:
-    # Exact supremum over `rows_local` contiguous rows with `<= num_seqs`
-    # sequences: each sequence contributes <= L_i / dcp + il * (dcp - 1) / dcp
-    # tokens to any single DCP owner rank.
-    raw = (rows_local + num_seqs * (dcp_size - 1) * interleave_size) // dcp_size
+    # Exact supremum over `rows_local` rows split across `zigzag_bands`
+    # contiguous bands with `<= num_seqs` sequences: at most `zigzag_bands - 1`
+    # extra sequence cuts across band gaps, yielding `<= num_seqs + zigzag_bands - 1`
+    # spans, each contributing `<= L_s / dcp + il * (dcp - 1) / dcp` to any owner.
+    eff_spans = num_seqs + max(zigzag_bands - 1, 0)
+    raw = (rows_local + eff_spans * (dcp_size - 1) * interleave_size) // dcp_size
     return min(rows_local, ((raw + 15) // 16) * 16)
 
 
 def _sharded_a2a_fast_seq_limit(
-    rows_local: int, *, dcp_size: int, interleave_size: int
+    rows_local: int,
+    *,
+    dcp_size: int,
+    interleave_size: int,
+    zigzag_bands: int = 1,
 ) -> int:
     if dcp_size <= 1:
         return 0
     headroom = _SHARDED_A2A_FAST_CAP * dcp_size - rows_local + (dcp_size - 1)
     if headroom <= 0:
         return 0
-    return headroom // ((dcp_size - 1) * interleave_size)
+    return max(
+        0,
+        headroom // ((dcp_size - 1) * interleave_size) - max(zigzag_bands - 1, 0),
+    )
 
 
 def _build_sharded_dcp_a2a_plan(
@@ -797,6 +811,7 @@ def _build_sharded_dcp_a2a_plan(
     cap: int,
     axis_name: str,
     pack_dst_rows: bool,
+    zigzag_bands: int = 1,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     page_size = nope_spec.page_size
     if interleave_size % WORD_BYTES:
@@ -809,7 +824,21 @@ def _build_sharded_dcp_a2a_plan(
             f"interleave_size={interleave_size} must divide page_size={page_size}."
         )
 
-    tok = dcp_rank * jnp.int32(rows_local) + jnp.arange(rows_local, dtype=jnp.int32)
+    if zigzag_bands > 1:
+        if zigzag_bands % 2 != 0 or rows_local % zigzag_bands:
+            raise ValueError(
+                f"zigzag_bands={zigzag_bands} must be even and divide "
+                f"rows_local={rows_local}."
+            )
+        band = rows_local // zigzag_bands
+        ks = jnp.arange(zigzag_bands, dtype=jnp.int32)
+        r = jnp.asarray(dcp_rank, dtype=jnp.int32).reshape(())
+        blk = jnp.where((ks & 1) == 0, ks * dcp_size + r, (ks + 1) * dcp_size - 1 - r)
+        tok = (
+            blk[:, None] * jnp.int32(band) + jnp.arange(band, dtype=jnp.int32)[None, :]
+        ).reshape(rows_local)
+    else:
+        tok = dcp_rank * jnp.int32(rows_local) + jnp.arange(rows_local, dtype=jnp.int32)
     seq_id, pos, in_batch = _local_row_positions(tok, seq_lens, query_start_loc)
 
     virtual_page_size = jnp.int32(page_size * dcp_size)
@@ -883,6 +912,7 @@ def _update_sparse_mla_kv_cache_dcp_sharded_impl(
     dcp_size: int,
     interleave_size: int,
     use_pallas_scatter: bool,
+    zigzag_bands: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
     if dcp_size == 1:
@@ -912,6 +942,7 @@ def _update_sparse_mla_kv_cache_dcp_sharded_impl(
         num_seqs=seq_lens.shape[0],
         dcp_size=dcp_size,
         interleave_size=interleave_size,
+        zigzag_bands=zigzag_bands,
     )
     use_packed_sc = (
         use_pallas_scatter
@@ -930,6 +961,7 @@ def _update_sparse_mla_kv_cache_dcp_sharded_impl(
         cap=cap_full,
         axis_name=axis_name,
         pack_dst_rows=use_packed_sc,
+        zigzag_bands=zigzag_bands,
     )
 
     if use_packed_sc:
@@ -1005,7 +1037,10 @@ def _update_sparse_mla_kv_cache_dcp_sharded_impl(
             )
 
     max_fast_seqs = _sharded_a2a_fast_seq_limit(
-        rows_local, dcp_size=dcp_size, interleave_size=interleave_size
+        rows_local,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+        zigzag_bands=zigzag_bands,
     )
     if cap_full > _SHARDED_A2A_FAST_CAP and max_fast_seqs >= 1:
         # Avoid lax.pmax across ranks: query_start_loc is replicated, so the
@@ -1037,6 +1072,7 @@ def update_sparse_mla_kv_cache_dcp_sharded(
     rope_spec: SparseMLAKVCacheSpec,
     dcp_size: int,
     interleave_size: int,
+    zigzag_bands: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Route sequence-sharded FP8 latents via owner all_to_all into DCP caches.
 
@@ -1057,6 +1093,7 @@ def update_sparse_mla_kv_cache_dcp_sharded(
         dcp_size=dcp_size,
         interleave_size=interleave_size,
         use_pallas_scatter=True,
+        zigzag_bands=zigzag_bands,
     )
 
 
@@ -1075,6 +1112,7 @@ def update_sparse_mla_kv_cache_dcp_sharded_jax(
     rope_spec: SparseMLAKVCacheSpec,
     dcp_size: int,
     interleave_size: int,
+    zigzag_bands: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Pure-XLA twin of `update_sparse_mla_kv_cache_dcp_sharded` for CPU tests."""
     return _update_sparse_mla_kv_cache_dcp_sharded_impl(
@@ -1092,4 +1130,5 @@ def update_sparse_mla_kv_cache_dcp_sharded_jax(
         dcp_size=dcp_size,
         interleave_size=interleave_size,
         use_pallas_scatter=False,
+        zigzag_bands=zigzag_bands,
     )

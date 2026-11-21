@@ -240,23 +240,37 @@ def get_dst_rows(page: jax.Array, slot: jax.Array, page_size: int) -> jax.Array:
 
 
 def sharded_a2a_cap(
-    rows_local: int, *, num_seqs: int, dcp_size: int, interleave_size: int
+    rows_local: int,
+    *,
+    num_seqs: int,
+    dcp_size: int,
+    interleave_size: int,
+    zigzag_bands: int = 1,
 ) -> int:
-    # Exact supremum over rows_local contiguous rows with <= num_seqs sequences:
-    # each sequence contributes <= (L_i + (dcp - 1) * il) // dcp rows to any rank.
-    raw = (rows_local + num_seqs * (dcp_size - 1) * interleave_size) // dcp_size
+    # Exact supremum over `rows_local` rows split across `zigzag_bands`
+    # contiguous bands with `<= num_seqs` sequences: at most `zigzag_bands - 1`
+    # extra cuts across band gaps.
+    eff_spans = num_seqs + max(zigzag_bands - 1, 0)
+    raw = (rows_local + eff_spans * (dcp_size - 1) * interleave_size) // dcp_size
     return min(rows_local, ((raw + 15) // 16) * 16)
 
 
 def sharded_a2a_fast_seq_limit(
-    rows_local: int, *, dcp_size: int, interleave_size: int
+    rows_local: int,
+    *,
+    dcp_size: int,
+    interleave_size: int,
+    zigzag_bands: int = 1,
 ) -> int:
     if dcp_size <= 1:
         return 0
     headroom = SHARDED_A2A_FAST_CAP * dcp_size - rows_local + (dcp_size - 1)
     if headroom <= 0:
         return 0
-    return headroom // ((dcp_size - 1) * interleave_size)
+    return max(
+        0,
+        headroom // ((dcp_size - 1) * interleave_size) - max(zigzag_bands - 1, 0),
+    )
 
 
 def build_sharded_dcp_a2a_plan(
@@ -272,6 +286,7 @@ def build_sharded_dcp_a2a_plan(
     interleave_size: int,
     cap: int,
     axis_name: str,
+    zigzag_bands: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Map rank-sharded local rows to per-owner send indices and received dst_rows."""
     if dcp_size < 1 or interleave_size < 1:
@@ -282,9 +297,23 @@ def build_sharded_dcp_a2a_plan(
         raise ValueError(
             f"interleave_size={interleave_size} must divide page_size={page_size}."
         )
-    tok = jnp.asarray(dcp_rank, dtype=jnp.int32) * jnp.int32(rows_local) + jnp.arange(
-        rows_local, dtype=jnp.int32
-    )
+    if zigzag_bands > 1:
+        if zigzag_bands % 2 != 0 or rows_local % zigzag_bands:
+            raise ValueError(
+                f"zigzag_bands={zigzag_bands} must be even and divide "
+                f"rows_local={rows_local}."
+            )
+        band = rows_local // zigzag_bands
+        ks = jnp.arange(zigzag_bands, dtype=jnp.int32)
+        r = jnp.asarray(dcp_rank, dtype=jnp.int32).reshape(())
+        blk = jnp.where((ks & 1) == 0, ks * dcp_size + r, (ks + 1) * dcp_size - 1 - r)
+        tok = (
+            blk[:, None] * jnp.int32(band) + jnp.arange(band, dtype=jnp.int32)[None, :]
+        ).reshape(rows_local)
+    else:
+        tok = jnp.asarray(dcp_rank, dtype=jnp.int32) * jnp.int32(
+            rows_local
+        ) + jnp.arange(rows_local, dtype=jnp.int32)
     seq_id, pos, in_batch = _row_positions_for_tokens(tok, seq_lens, query_start_loc)
     safe_pos = jnp.maximum(pos, 0)
     virtual_page_size = page_size * dcp_size
