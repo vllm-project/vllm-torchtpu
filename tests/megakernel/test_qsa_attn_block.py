@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import pytest
 from jax.experimental import pallas as pl
@@ -32,6 +33,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.megakernel.blocks.qsa_attn.block import (
     MICRO,
     TILE,
+    _unpack_kv,
     attend_row,
     reference_rows,
 )
@@ -277,3 +279,74 @@ def test_recent_tokens_merge_like_pool_tokens(fold):
     assert float(np.abs(got[0]).mean()) > 1e-2  # recent only: attended
     np.testing.assert_allclose(got, want, atol=2e-2, rtol=2e-2)
     assert float(np.abs(got - want).mean()) < 2e-3
+
+
+def _slot_with_all_pairs(off: int, rows: int = TILE) -> np.ndarray:
+    """Raw `[rows, 1, 4, DIM]` bytes: pair `off`'s K / V take every byte pair."""
+    raw = np.random.default_rng(31 + off).integers(0, 256, (rows, 1, 4, DIM), np.uint8)
+    pairs = np.arange(rows * DIM) % 65536
+    raw[:, 0, 2 * off] = (pairs & 0xFF).reshape(rows, DIM)
+    raw[:, 0, 2 * off + 1] = (pairs >> 8).reshape(rows, DIM)
+    return raw
+
+
+def _unpack_kv_bytewise(slot_ref, off):
+    """The previous per-byte unpack (`(words >> 8c) & 0xFF`, two casts)."""
+    raw = slot_ref[...]
+    words = pltpu.bitcast(raw.reshape(-1, raw.shape[-1]), jnp.uint32)
+
+    def byte(c):
+        b = (
+            ((words >> (8 * c).astype(jnp.uint32)) & 0xFF)
+            .astype(jnp.uint16)
+            .astype(jnp.uint8)
+        )
+        return pltpu.bitcast(b, jnp.float8_e4m3fn)
+
+    return byte(2 * off), byte(2 * off + 1)
+
+
+def _unpacked(
+    raw: np.ndarray, off: int, unpack, interpret: bool = True
+) -> tuple[np.ndarray, np.ndarray]:
+    def kernel(off_ref, slot_ref, k_ref, v_ref):
+        k8, v8 = unpack(slot_ref, off_ref[0])
+        k_ref[...] = k8.astype(jnp.float32)
+        v_ref[...] = v8.astype(jnp.float32)
+
+    out = jax.ShapeDtypeStruct((raw.shape[0], DIM), jnp.float32)
+    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    k, v = pl.pallas_call(
+        kernel,
+        out_shape=(out, out),
+        in_specs=[smem, vmem],
+        out_specs=(vmem, vmem),
+        interpret=interpret,
+    )(jnp.asarray([off], jnp.int32), jnp.asarray(raw).view(jnp.float8_e4m3fn))
+    return np.asarray(k), np.asarray(v)
+
+
+@pytest.mark.parametrize("off", [0, 1])
+def test_unpack_kv_bit_identical_over_all_byte_pairs(off):
+    """Every (K, V) FP8 byte pair, NaN included: bit-identical to the bytewise unpack
+    and equal to the FP8 values (a traced `off`, as the kernels pass it)."""
+    raw = _slot_with_all_pairs(off)
+    got = _unpacked(raw, off, lambda ref, o: _unpack_kv(ref, o, True))
+    old = _unpacked(raw, off, _unpack_kv_bytewise)
+    for c, g, o in zip((2 * off, 2 * off + 1), got, old):
+        np.testing.assert_array_equal(g.view(np.uint32), o.view(np.uint32))
+        want = raw[:, 0, c].view(ml_dtypes.float8_e4m3fn).astype(np.float32)
+        np.testing.assert_array_equal(g, want)  # NaN == NaN here
+
+
+@pytest.mark.parametrize("off,rows", [(0, TILE), (1, TILE), (1, MICRO)])
+def test_unpack_kv_tpu_path_matches_interpret(off, rows):
+    """On device, the strided-row read gives the interpret path's bits."""
+    if jax.devices()[0].platform != "tpu":
+        pytest.skip("needs a TPU")
+    raw = _slot_with_all_pairs(off, rows)
+    got = _unpacked(raw, off, lambda ref, o: _unpack_kv(ref, o, False), False)
+    want = _unpacked(raw, off, lambda ref, o: _unpack_kv(ref, o, True))
+    for g, w in zip(got, want):
+        np.testing.assert_array_equal(g.view(np.uint32), w.view(np.uint32))

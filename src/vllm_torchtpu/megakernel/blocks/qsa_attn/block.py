@@ -58,18 +58,24 @@ def _unpack_kv(slot_ref: Any, off: Any, interpret: bool) -> tuple[jax.Array, jax
     Four pack rows form one 32-bit word per lane, row `c` in byte `c`; K and V of
     pair `off` are bytes `2 * off` and `2 * off + 1`.
     """
+    n, lanes = slot_ref.shape[0], slot_ref.shape[-1]
     if interpret:
         raw = slot_ref[...]
-        words = pltpu.bitcast(raw.reshape(-1, raw.shape[-1]), jnp.uint32)
+        words = pltpu.bitcast(raw.reshape(-1, lanes), jnp.uint32)
     else:
-        words = slot_ref.bitcast(jnp.uint32).reshape(-1, slot_ref.shape[-1])[...]
-
-    def byte(c: Any) -> jax.Array:
-        sh = (8 * c).astype(jnp.uint32) if hasattr(c, "astype") else 8 * c
-        b = ((words >> sh) & 0xFF).astype(jnp.uint16).astype(jnp.uint8)
-        return pltpu.bitcast(b, jnp.float8_e4m3fn)
-
-    return byte(2 * off), byte(2 * off + 1)
+        # The slot is row-major `[n * halves, 128]` words (token `i`'s 128-lane half `h`
+        # at row `i * halves + h`): stride-`halves` reads fill whole vregs, where a
+        # `[n, lanes]` read loads one sublane per vreg and relayouts.
+        halves = lanes // 128
+        rows = slot_ref.bitcast(jnp.uint32).reshape(n * halves, 128)
+        words = jnp.concatenate(
+            [rows[pl.ds(h, n, stride=halves), :] for h in range(halves)], axis=1
+        )
+    sh = (16 * off).astype(jnp.uint32) if hasattr(off, "astype") else 16 * off
+    pair = (words >> sh).astype(jnp.uint16)  # K | V << 8; the casts truncate
+    k8 = pltpu.bitcast(pair.astype(jnp.uint8), jnp.float8_e4m3fn)
+    v8 = pltpu.bitcast((pair >> 8).astype(jnp.uint8), jnp.float8_e4m3fn)
+    return k8, v8
 
 
 def attend_row(
