@@ -141,13 +141,16 @@ def indexed_options(B: int | None = None) -> dict:
 
 def main_call_options() -> dict:
     """Main whole-step call only (the draft passes its own `skip_idle`): VLLM_TPU_MK_QSA_XMERGE
-    (one exchange per QSA layer) and VLLM_TPU_MK_WHOLE_SKIP_IDLE (request loops stop after
-    the last live request). Empty when both are off, so the spec is unchanged."""
+    (one exchange per QSA layer), VLLM_TPU_MK_WHOLE_SKIP_IDLE (request loops stop after
+    the last live request) and VLLM_TPU_MK_QSA_UNION_SPLIT (union tiles split over the ranks
+    sharing a KV head). Empty when all are off, so the spec is unchanged."""
     out: dict = {}
     if envs.VLLM_TPU_MK_QSA_XMERGE:
         out["xmerge"] = True
     if envs.VLLM_TPU_MK_WHOLE_SKIP_IDLE and LOOP_REQUESTS:
         out["skip_idle"] = True
+    if envs.VLLM_TPU_MK_QSA_UNION_SPLIT > 1 and UNION_ATTN and main_kv_dcp() == 1:
+        out["union_split"] = envs.VLLM_TPU_MK_QSA_UNION_SPLIT
     return out
 
 

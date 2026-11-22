@@ -190,21 +190,27 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qx_sem", pltpu.SemaphoreType.DMA((6,))),
         ] if self.xreq_loads else []) + (self._shard_scratch(ex) if self.shard_index else []) + (
             self._union_scratch(ex) if self.union_attn else []
-        ) + (self._dcp_scratch(g, ex) if self.dcp > 1 else [])
+        ) + (self._dcp_scratch(g, ex) if self.split > 1 else [])
 
     def _dcp_scratch(self, g: Any, ex: ExecSpec) -> list[ScratchReq]:
-        """Main-KV DCP: the pair rank's q (`qd_q`), this rank's partial over its own heads
-        (`qd_o` / `qd_l`) and the partial over the pair rank's heads sent to it (`qd_os` /
-        `qd_ls`, received into `qd_or` / `qd_lr`); lse rows lane-broadcast `[nh, 128]`."""
-        nh = self.nh(g, ex)
+        """Main-KV DCP / union split over a group of `S = self.split` ranks (`me ^ j`, j < S):
+        peer `me ^ j`'s q (`qd_q[j - 1]`), this rank's partial over its own heads (`qd_o` /
+        `qd_l`), the partial over peer `me ^ j`'s heads sent to it (`qd_os[j - 1]` /
+        `qd_ls[j - 1]`) and the one peer `me ^ j` computed for this rank's heads (`qd_or[j - 1]`
+        / `qd_lr[j - 1]`); lse rows lane-broadcast `[nh, 128]`."""
+        # The union split's group must share one KV head: rank r holds head r // (R / NKV).
+        assert not self.union_split or (ex.R // g.NKV) % self.union_split == 0, (
+            ex.R, g.NKV, self.union_split)
+        nh, P = self.nh(g, ex), self.split - 1
         o, lse = pltpu.VMEM((ex.MB, nh, g.HD), F32), pltpu.VMEM((ex.MB, nh, 128), F32)
+        po, plse = pltpu.VMEM((P, ex.MB, nh, g.HD), F32), pltpu.VMEM((P, ex.MB, nh, 128), F32)
         return [
-            ScratchReq("qd_q", pltpu.VMEM((ex.MB, nh, g.HD), F32)),
+            ScratchReq("qd_q", po),
             ScratchReq("qd_o", o), ScratchReq("qd_l", lse),
-            ScratchReq("qd_os", o), ScratchReq("qd_ls", lse),
-            ScratchReq("qd_or", o), ScratchReq("qd_lr", lse),
+            ScratchReq("qd_os", po), ScratchReq("qd_ls", plse),
+            ScratchReq("qd_or", po), ScratchReq("qd_lr", plse),
         ] + [
-            ScratchReq(f"qd_{k}sem{i}", pltpu.SemaphoreType.DMA((1,)))
+            ScratchReq(f"qd_{k}sem{i}", pltpu.SemaphoreType.DMA((P,)))
             for i in range(3) for k in "sr"
         ]
 
@@ -1330,6 +1336,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         part = (grp == n_r) & (tail > 0)
         full = (grp == ga) & (ga < n_r) & (scr["qc_sga"][r] > 0)
         ok = (r < ex.B) & (pos <= p_r) & (part | full)
+        if self.union_split:  # the last group rank attends the recent tile (it has the fewest tiles)
+            return ok & (jax.lax.rem(ctx.me, self.split) == self.split - 1)
         return ok & self._dcp_owned(ctx, pos) if self.dcp > 1 else ok
 
     def _attend_unions(
@@ -1393,7 +1401,12 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                         )
                         return carry
 
-                    jax.lax.fori_loop(0, (n_u + 127) // 128, chunk, 0)
+                    c_lo, c_hi = 0, (n_u + 127) // 128
+                    if self.union_split:  # only the 128-id chunks of this rank's tiles
+                        t0, nt = ua.split_tiles(n_u, jax.lax.rem(ctx.me, self.split), self.split)
+                        c_lo, c_hi = t0 * ua.GROUPS_PER_TILE // 128, jnp.minimum(
+                            ((t0 + nt) * ua.GROUPS_PER_TILE + 127) // 128, c_hi)
+                    jax.lax.fori_loop(c_lo, c_hi, chunk, 0)
                     src = scr["qu_pv"]
                 cs = [
                     pltpu.make_async_copy(
@@ -1436,13 +1449,19 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ok_any = self._recent_ok(ctx, rs[0], scol)
             for r in rs[1:]:
                 ok_any = ok_any | self._recent_ok(ctx, r, scol)
-            if self.dcp > 1:  # both pair ranks' heads, this rank's first
-                qs = [jnp.concatenate([scr["qf_q"][r], scr["qd_q"][r]], axis=0) for r in rs]
+            if self.split > 1:  # every group rank's heads, this rank's first
+                qs = [
+                    jnp.concatenate(
+                        [scr["qf_q"][r]] + [scr["qd_q"][j, r] for j in range(self.split - 1)],
+                        axis=0,
+                    )
+                    for r in rs
+                ]
             else:
                 qs = [scr["qf_q"][r] for r in rs]
             with sc("qsa_u_attend", 2):
                 res = ua.attend_request(
-                    T=T, nh=nh * self.dcp, pool=ctx.extra[POOL], ring=scr["qf_ring"],
+                    T=T, nh=nh * self.split, pool=ctx.extra[POOL], ring=scr["qf_ring"],
                     sems=scr["qf_ring_sem"],
                     ids=scr["qu_row"], codes=scr["qu_cd"].at[q, :, pl.ds(uoff, KU)],
                         n_union=n_u,
@@ -1454,13 +1473,17 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     scale_v=ctx.extra[SCALES][1], sm_scale=g.HD**-0.5, interpret=ex.interpret,
                     recent=(scr["qc_rk"][q], scr["qc_rv"][q], ok, ok_any), phys=self.union_phys,
                     dcp=self.dcp, sc=ctx.stream.sc,
+                    split=(jax.lax.rem(ctx.me, self.split), self.split) if self.union_split
+                    else None,
                     **(dict(ids_row=bank, stream=stream) if xreq else {}),
                 )
-            if self.dcp > 1:
+            if self.split > 1:
                 for r, (att, lse) in zip(rs, res):
-                    lse = jnp.broadcast_to(lse, (2 * nh, 128))
-                    scr["qd_o"][r], scr["qd_os"][r] = att[:nh], att[nh:]
-                    scr["qd_l"][r], scr["qd_ls"][r] = lse[:nh], lse[nh:]
+                    lse = jnp.broadcast_to(lse, (self.split * nh, 128))
+                    scr["qd_o"][r], scr["qd_l"][r] = att[:nh], lse[:nh]
+                    for j in range(1, self.split):
+                        scr["qd_os"][j - 1, r] = att[j * nh : (j + 1) * nh]
+                        scr["qd_ls"][j - 1, r] = lse[j * nh : (j + 1) * nh]
                 return (outs, nxt_base(sbase, n_u)) if xreq else outs
             if self.union_stats:
                 assert nreq <= UNION_STATS_REQS, (nreq, UNION_STATS_REQS)
@@ -1488,7 +1511,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             return (tuple(outs), nxt_base(sbase, n_u)) if xreq else tuple(outs)
 
         def nxt_base(sbase: Any, n_u: Any) -> Any:
-            return sbase + (n_u * ua.MICRO + ua.TILE - 1) // ua.TILE
+            if self.union_split:
+                return sbase + ua.split_tiles(
+                    n_u, jax.lax.rem(ctx.me, self.split), self.split)[1]
+            return sbase + ua.union_tiles(n_u)
 
         n_loop = self._n_live(ctx) if self.skip_idle else nreq
         if self.union_phys:  # the table rows of the requests the loop visits, waited there
@@ -1503,40 +1529,55 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         outs, _ = jax.lax.fori_loop(0, n_loop, req, (zeros, jnp.int32(0)))
         return list(outs)
 
-    def _dcp_pair(self, ctx: Any, src: Any, dst: Any, i: int) -> None:
-        """`src` -> the pair rank's `dst` (and its `src` -> ours), waited on both sides."""
-        scr = ctx.scr
-        ctx.comm.exchange(ctx.comm.group_copies(
-            lambda off: src, dst, scr[f"qd_ssem{i}"], scr[f"qd_rsem{i}"], 2,
-        ))
+    def _dcp_group(self, ctx: Any, src: Any, dst: Any, i: int) -> list:
+        """Copies `src(j)` -> `dst[j - 1]` of group peer `me ^ j` (j = 1 .. S - 1): every
+        rank's slot `j - 1` receives from its peer `me ^ j`."""
+        scr, me = ctx.scr, ctx.me
+        return [
+            pltpu.make_async_remote_copy(
+                src_ref=src(j), dst_ref=dst.at[j - 1],
+                send_sem=scr[f"qd_ssem{i}"].at[j - 1], recv_sem=scr[f"qd_rsem{i}"].at[j - 1],
+                device_id=(me ^ j,), device_id_type=pl.DeviceIdType.MESH,
+            )
+            for j in range(1, self.split)
+        ]
 
-    def _dcp_attend(self, ctx: Any, l: Any, zeros: tuple) -> None:
-        """Pair q exchange, then the union attention over this rank's groups for both ranks'
-        heads (partials into `qd_o` / `qd_l` and, for the pair rank, `qd_os` / `qd_ls`)."""
+    def _dcp_attend(self, ctx: Any, l: Any, zeros: tuple, qx: list) -> None:
+        """The group's q (`qx`, started after the projection) landed, then the union attention
+        over this rank's groups / tiles for every group rank's heads (partials into `qd_o` /
+        `qd_l` and, for the peers, `qd_os` / `qd_ls`), then one partial exchange."""
         scr, sc = ctx.scr, ctx.stream.sc
         with sc("qsa_dcp_qx", 2):
-            self._dcp_pair(ctx, scr["qf_q"], scr["qd_q"], 0)
+            for d in qx:
+                d.wait_recv()
+            for d in qx:
+                d.wait_send()
         self._attend_unions(ctx, l, zeros)
         with sc("qsa_dcp_px", 2):
-            self._dcp_pair(ctx, scr["qd_os"], scr["qd_or"], 1)
-            self._dcp_pair(ctx, scr["qd_ls"], scr["qd_lr"], 2)
+            ctx.comm.exchange(
+                self._dcp_group(ctx, lambda j: scr["qd_os"].at[j - 1], scr["qd_or"], 1)
+                + self._dcp_group(ctx, lambda j: scr["qd_ls"].at[j - 1], scr["qd_lr"], 2)
+            )
 
     def _dcp_combine(self, ctx: Any) -> list[jax.Array]:
-        """This rank's heads: the pair's partials merged by LSE, then gated (`dcp_combine`'s
-        math and rounding; rows no rank owns a token of stay 0). `nh` `[MB, HD]` F32."""
+        """This rank's heads: the group's partials merged by LSE, then gated (`dcp_combine`'s
+        math and rounding, extended left to right past two partials; rows no rank owns a token
+        of stay 0). `nh` `[MB, HD]` F32."""
         ex, scr, g = ctx.ex, ctx.scr, ctx.g
         nh = self.nh(g, ex)
         rows = jax.lax.broadcasted_iota(I32, (ex.MB, 1), 0)
 
         def row(r: Any, outs: Any) -> Any:
-            l0, l1 = scr["qd_l"][r][:, 0:1], scr["qd_lr"][r][:, 0:1]
-            top = jnp.maximum(l0, l1)
+            ls = [scr["qd_l"][r][:, 0:1]] + [
+                scr["qd_lr"][j, r][:, 0:1] for j in range(self.split - 1)]
+            os_ = [scr["qd_o"][r]] + [scr["qd_or"][j, r] for j in range(self.split - 1)]
+            top = functools.reduce(jnp.maximum, ls)
             fin = top > -jnp.inf
             safe = jnp.where(fin, top, 0.0)
-            w0 = jnp.where(fin, jnp.exp(l0 - safe), 0.0)
-            w1 = jnp.where(fin, jnp.exp(l1 - safe), 0.0)
-            tot = w0 + w1
-            o = (w0 * scr["qd_o"][r] + w1 * scr["qd_or"][r]) / jnp.where(tot > 0, tot, 1.0)
+            ws = [jnp.where(fin, jnp.exp(x - safe), 0.0) for x in ls]
+            tot = functools.reduce(jnp.add, ws)
+            num = functools.reduce(jnp.add, [w * x for w, x in zip(ws, os_)])
+            o = num / jnp.where(tot > 0, tot, 1.0)
             gated = (
                 o.astype(BF16).astype(F32)
                 * jax.nn.sigmoid(scr["qf_g"][r].astype(F32)).astype(BF16).astype(F32)
@@ -1545,7 +1586,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             return tuple(jnp.where(rows == r, res[h : h + 1], o_) for h, o_ in enumerate(outs))
 
         zeros = tuple(jnp.zeros((ex.MB, g.HD), F32) for _ in range(nh))
-        return list(jax.lax.fori_loop(0, ex.MB, row, zeros))
+        # Union split under `skip_idle`: idle requests' partials are never written; their rows
+        # stay 0 as in the unsplit union attention.
+        n_rows = self._n_live(ctx) * ex.T if self.union_split and self.skip_idle else ex.MB
+        return list(jax.lax.fori_loop(0, n_rows, row, zeros))
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ex, scr, g = ctx.ex, ctx.scr, ctx.g
@@ -1553,6 +1597,11 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         sc = ctx.stream.sc
         with sc("qsa_proj"):
             kv = self._project(ctx, l, slot)
+        qx = []
+        if self.split > 1:  # the group's q, in flight under the selection
+            qx = self._dcp_group(ctx, lambda j: scr["qf_q"], scr["qd_q"], 0)
+            for d in qx:
+                d.start()
         with sc("qsa_select"):
             self._select(ctx, l, slot)
         rows = jax.lax.broadcasted_iota(I32, (ex.MB, 1), 0)
@@ -1605,8 +1654,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
         zeros = tuple(jnp.zeros((ex.MB, g.HD), F32) for _ in range(nh))
         with sc("qsa_attend"):
-            if self.dcp > 1:
-                self._dcp_attend(ctx, l, zeros)
+            if self.split > 1:
+                self._dcp_attend(ctx, l, zeros, qx)
                 with sc("qsa_dcp_combine", 2):
                     outs = self._dcp_combine(ctx)
             elif self.union_attn:

@@ -227,6 +227,21 @@ def table_chunks(n_vis: Any, per_page: int, dcp: int, width: int) -> Any:
     return jnp.minimum(last_col // 128 + 1, width // 128)
 
 
+def union_tiles(n_union: Any) -> Any:
+    """Ring tiles of a union of `n_union` groups."""
+    return (n_union * MICRO + TILE - 1) // TILE
+
+
+def split_tiles(n_union: Any, rank: Any, ways: int) -> tuple[Any, Any]:
+    """`(first tile, tiles)` of group rank `rank`'s share of a union's tiles (`union_split`):
+    consecutive runs of ceil(ntiles / ways) tiles rounded up to even (each run's first id
+    starts a 128-lane chunk), the last ranks' runs shorter or empty."""
+    ntiles = union_tiles(n_union)
+    run = ((ntiles + ways - 1) // ways + 1) // 2 * 2
+    t0 = rank * run
+    return t0, jnp.clip(ntiles - t0, 0, run)
+
+
 def attend_request(
     *,
     T: int,
@@ -253,6 +268,7 @@ def attend_request(
     sc: Any = None,
     ids_row: Any = 0,
     stream: Any = None,
+    split: Any = None,
 ) -> list[Any]:
     """Gated sparse attention of one request's `T` rows over their union: `T` `[nh, 256]` F32.
 
@@ -277,6 +293,10 @@ def attend_request(
     (else its first `min(ntiles, nslots - 1)` were). `nxt = (live, ids_row, table_row, n_union)`
     of the next request (its ids already staged in `ids[ids_row]`). Every issued tile is waited
     by its own request; the caller carries `base + ntiles` to the next request.
+    `split = (rank, ways)` (`union_split`; `rank` traced): only this group rank's share of the
+    union's tiles (`split_tiles`) is streamed and scored (`ntiles` and stream positions count
+    those), and, as under `dcp` = 2, each row returns its ungated partial `(attn, lse)` for the
+    group's LSE combine; the caller masks the recent tile to one group rank.
     """
     sc = sc or (lambda *_: contextlib.nullcontext())
     per_page = pool.shape[1] // MICRO
@@ -286,7 +306,7 @@ def attend_request(
     shift = per_page.bit_length() - 1
     cshift = shift + dcp.bit_length() - 1
     length = n_union * MICRO
-    ntiles = (length + TILE - 1) // TILE
+    t0, ntiles = split_tiles(n_union, *split) if split is not None else (0, union_tiles(n_union))
     # `phys` on TPU: the pool as rows of micro-pages, so a copy's source address is one id
     # times the row stride (CPU interpret cannot index a reshaped ref: per-page indexing there).
     micro_pages = (
@@ -340,29 +360,32 @@ def attend_request(
 
             @pl.when(k < ntiles)
             def _(k=k):
-                start(k, k)
+                start(t0 + k, k)
 
         slot = lambda t: jax.lax.rem(t, nslots)  # noqa: E731
 
         def issue(p: Any) -> None:
             @pl.when(p < ntiles)
             def _():
-                start(p, slot(p))
+                start(t0 + p, slot(p))
 
     else:
         sbase, first, (nlive, nrow, ntrow, n_next) = stream
-        nt_next = jnp.where(nlive, (n_next * MICRO + TILE - 1) // TILE, 0)
+        t0_next, nt_next = (
+            split_tiles(n_next, *split) if split is not None else (0, union_tiles(n_next))
+        )
+        nt_next = jnp.where(nlive, nt_next, 0)
         slot = lambda p: jax.lax.rem(sbase + p, nslots)  # noqa: E731
 
         def issue(p: Any, own_ok: Any = True) -> None:
             # Position p: this request's tile p, or the next request's tile p - ntiles.
             @pl.when((p < ntiles) & own_ok)
             def _():
-                start(p, slot(p))
+                start(t0 + p, slot(p))
 
             @pl.when((p >= ntiles) & (p - ntiles < nt_next))
             def _():
-                for cp in copies(p - ntiles, slot(p), nrow, ntrow):
+                for cp in copies(t0_next + p - ntiles, slot(p), nrow, ntrow):
                     cp.start()
 
         for k in range(nslots - 1):
@@ -389,9 +412,9 @@ def attend_request(
     def tile(t: Any, carry: Any) -> Any:
         s = slot(t)
         with sc("u_wait", 3):
-            wait(t, s)
+            wait(t0 + t, s)
         issue(t + nslots - 1)
-        return _tile_body(t, s, carry)
+        return _tile_body(t0 + t, s, carry)
 
     def _tile_body(t: Any, s: Any, carry: Any) -> Any:
       with sc("u_unpack", 3):
@@ -476,7 +499,8 @@ def attend_request(
     rk, rv, ok_rows, ok_any = recent
     rkey = rk * scale_k
     rval = jnp.where(ok_any, rv * scale_v, 0.0)
-    if dcp > 1:
+    partials = dcp > 1 or split is not None
+    if partials:
         partial = []
     out = []
     for r in range(T):
@@ -493,7 +517,7 @@ def attend_request(
         l_sum = l_sum * alpha + jnp.sum(p, axis=-1, keepdims=True)
         acc = acc * alpha + jnp.dot(p, rval, preferred_element_type=F32)
         attn = acc / jnp.where(l_sum > 0, l_sum, 1.0)
-        if dcp > 1:
+        if partials:
             lse = jnp.where(l_sum > 0, m_new + jnp.log(jnp.where(l_sum > 0, l_sum, 1.0)), -jnp.inf)
             partial.append((jnp.where(l_sum > 0, attn, 0.0), lse))
             continue
@@ -507,4 +531,4 @@ def attend_request(
         )
         row_has = has[r] | (jnp.max(jnp.where(ok, 1, 0)) > 0)
         out.append(jnp.where(row_has, gated, 0.0))
-    return partial if dcp > 1 else out
+    return partial if partials else out

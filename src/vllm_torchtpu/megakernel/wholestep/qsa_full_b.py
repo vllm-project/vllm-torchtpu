@@ -100,6 +100,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         select_nvis: int = 0,
         nvis_rows: tuple = (32, 64),
         xmerge: bool = False,
+        union_split: int = 1,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -171,7 +172,12 @@ class QSAFullIndexedBlock(QSAFullBlock):
         groups per pool block; `qsa_cktab` lists a rank's own pages in local order). Both ranks
         of a pair score the same request, each over its own groups, swap their halves of the
         scores (in-kernel remote DMA, F32 bits: exact) and select over the whole set; with
-        `shard_index` the requests are sharded over pairs."""
+        `shard_index` the requests are sharded over pairs. `union_split` = S in (2, 4)
+        (VLLM_TPU_MK_QSA_UNION_SPLIT, needs `union_attn`, no main-KV DCP): the S ranks of an
+        aligned group (`me ^ j`, j < S; they share one KV head and each holds all of it) split
+        every request's union tiles into S runs (`union_attn.split_tiles`); each attends every
+        group rank's heads over its run and the group combines the partials by LSE, as `dcp` = 2
+        does over its token halves."""
         super().__init__(**kw)
         assert max_groups % 1024 == 0, max_groups  # whole (8, 128) score tiles per row
         self.max_groups, self.pps, self.debug = max_groups, pages_per_seq, debug
@@ -215,6 +221,13 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.dcp = max(int(dcp), 1)
         assert self.dcp in (1, 2), dcp
         assert self.dcp == 1 or union_attn, "main-KV DCP is implemented on the union path"
+        self.union_split = int(union_split) if int(union_split) > 1 else 0
+        assert self.union_split in (0, 2, 4), union_split
+        assert not self.union_split or (union_attn and self.dcp == 1), (
+            "union split: union attention over an unsplit main KV"
+        )
+        # Ranks whose partial attentions are LSE-combined: the main-KV DCP pair or the split group.
+        self.split = self.union_split or self.dcp
         self.compressed_dcp = compressed_dcp
         assert not compressed_dcp or (
             self.dcp == 2 and carrier and per_request_scores and bounded_chunks

@@ -190,6 +190,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_AR_HIER_SMALL: bool = False
     VLLM_TPU_MK_QSA_XMERGE: bool = False
     VLLM_TPU_MK_WHOLE_SKIP_IDLE: bool = False
+    VLLM_TPU_MK_QSA_UNION_SPLIT: int = 0
     VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_MK_WHOLE_L45: bool = False
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
@@ -1352,6 +1353,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # after the last live request (`skip_idle`, as the MK draft already does), so the idle
     # request slots of a bucket's tile do no work. Live rows are byte-identical.
     "VLLM_TPU_MK_WHOLE_SKIP_IDLE": env_bool("VLLM_TPU_MK_WHOLE_SKIP_IDLE"),
+    # Whole-step megakernel QSA union attention without main-KV DCP: 2 or 4 ranks sharing a
+    # KV head split each request's union tiles and combine their partials by LSE
+    # (`QSAFullIndexedBlock.union_split`; the main-KV DCP combine's math). 0 = off. Not
+    # bit-exact: f32 rounding of the combine.
+    "VLLM_TPU_MK_QSA_UNION_SPLIT": env_int("VLLM_TPU_MK_QSA_UNION_SPLIT", 0),
     # Whole-step megakernel: also run the last QSA layer (model layer 47) in the whole-step
     # call, as a one-layer kernel after layers 3..46, its step tokens written with theirs;
     # the stock L47 attention core and last segment kernel are skipped.

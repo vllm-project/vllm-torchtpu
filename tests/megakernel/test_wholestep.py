@@ -292,7 +292,8 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
            max_groups: int | None = None, phys: bool = False, dcp: int = 1, dcp_pool: bool = True,
            shared_kv: bool = False, cdcp: bool = False, cdcp_keys: bool = True, ck_fn=None,
            async_dma: bool = False, B: int | None = None, xreq: int = 0,
-           skip_idle: bool = False, xmerge: bool = False, key_mp: int = 0, key_slots: int = 2):
+           skip_idle: bool = False, xmerge: bool = False, key_mp: int = 0, key_slots: int = 2,
+           union_split: int = 0, R: int = 2, geom=None):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -301,29 +302,29 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
         RING_NEW,
     )
 
+    g_ = G if geom is None else geom  # geometry (`geom`: e.g. more heads for R = 4)
     CTX = CTX_C if ctx is None else ctx
     MG = MAX_GROUPS if max_groups is None else max_groups
-    R = 2
     ex = ExecSpec(R=R, B=2 * T if B is None else B, T=T, ctx=128, interpret=True, tiles=_TILES)
     d = wi.random_wholestep_inputs(
-        key, G, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True
+        key, g_, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True
     )
-    d = wi.add_indexer_inputs(key, G, ex, d, L, max_groups=MG, ctx=CTX)
+    d = wi.add_indexer_inputs(key, g_, ex, d, L, max_groups=MG, ctx=CTX)
     if ck_fn is not None:  # test-chosen compressed keys (e.g. tie-heavy scores)
         d["ck"] = ck_fn(d["ck"])
-    d = wi.add_step_inputs(key, G, ex, d, L, ctx=CTX)
+    d = wi.add_step_inputs(key, g_, ex, d, L, ctx=CTX)
     if (
         long
     ):  # served long-context mode: HBM page tables, one request's scores at a time
         d = wi.add_carrier(key, d, mp=key_mp)
         d["hbm_tables"] = True
     if shared_kv:  # the ranks share one KV head (a DCP pair): same K/V columns, same pool
-        kv = 2 * G.HD  # `[q0|g0|..|k|v]`: K and V are the last two 256-wide column blocks
+        kv = 2 * g_.HD  # `[q0|g0|..|k|v]`: K and V are the last two 256-wide column blocks
         d["qkvg"] = d["qkvg"].at[1:, ..., -kv:].set(
             jnp.broadcast_to(d["qkvg"][:1, ..., -kv:], d["qkvg"][1:, ..., -kv:].shape)
         )
         d["pool"] = jnp.broadcast_to(d["pool"][:1], d["pool"].shape)
-    ref, _ = wi.wholestep_reference(G, ex, d, L)
+    ref, _ = wi.wholestep_reference(g_, ex, d, L)
     steps = d.pop("_step_out")
     pps = d["mtab"].shape[1]
     if dcp > 1 and dcp_pool:
@@ -335,9 +336,10 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
                    union_stats=stats, union_phys=phys, loop_requests=loop, dcp=dcp,
                    compressed_dcp=cdcp, xreq_prefetch=xreq, skip_idle=skip_idle,
                    manager_pages=key_mp, key_slots=key_slots,
-                   **(dict(xmerge=True) if xmerge else {}))
+                   **(dict(xmerge=True) if xmerge else {}),
+                   **(dict(union_split=union_split) if union_split else {}))
     spec = wholestep_spec(
-        G,
+        g_,
         R,
         L=L,
         qsa=dict(budget=BUDGET),
@@ -347,7 +349,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
             **(long_kw if long else {})
         ),
     )
-    w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
+    w_mk, states = wi.pack_wholestep(spec, g_, ex, d, L)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
         mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states
@@ -358,7 +360,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
     assert [x.name for x in kernel.extra_inputs(spec, ex)] == names
     step, _ = kernel.make_step(mesh, spec, ex)
     _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras_c(d, mesh, R))
-    B, n_att, nreq = ex.B, L // G.att_every, ex.M // T
+    B, n_att, nreq = ex.B, L // g_.att_every, ex.M // T
     res = np.asarray(outs[RESIDUAL_OUT].reshape(R, ex.M, -1)[:, :B], np.float32)
     ck = np.asarray(outs[CK_NEW], np.float32).reshape(R, n_att, nreq, -1)[0]
     ring = np.asarray(outs[RING_NEW], np.float32).reshape(R, n_att, nreq, 8, -1)[0]
@@ -1457,6 +1459,41 @@ def test_main_skip_idle_and_xmerge_bit_identical(monkeypatch, B):
     both = _main_run(monkeypatch, B, skip_idle=True, xmerge=True)
     _assert_live_identical(base, skip, nlive)
     _assert_live_identical(base, both, nlive)
+
+
+def _assert_split_close(base: tuple, run: tuple) -> None:
+    """The union-split kernel against the unsplit one: residual to f32 combine rounding (the
+    main-KV DCP test's bound), same selection."""
+    dd = np.abs(run[0] - base[0])
+    assert np.isfinite(run[0]).all()
+    assert dd.max() < 1e-2 * float(np.abs(base[1]).mean()), dd.max()
+    np.testing.assert_array_equal(run[7], base[7])
+
+
+@pytest.mark.parametrize("ways,kw", [
+    (2, dict()),
+    # The served main-call form: request loop, both prefetches, physical ids, merged exchange,
+    # idle request slots skipped; ragged unions (empty, one tile, full).
+    (2, dict(loop=True, B=32, ctx=[3001, 100, 3, 2000, 0, 0, 0, 0], async_dma=True, xreq=3,
+             phys=True, xmerge=True, skip_idle=True)),
+    (4, dict(loop=True, B=32, ctx=[3001, 100, 3, 2000, 0, 0, 0, 0], async_dma=True, xreq=3,
+             phys=True, xmerge=True, skip_idle=True)),
+])
+def test_union_split_attention_matches_unsplit(ways, kw):
+    """VLLM_TPU_MK_QSA_UNION_SPLIT (R = `ways` ranks sharing one KV head, unsplit pool): each
+    rank attends every rank's heads over its run of every request's union tiles and the
+    group combines by LSE. Matches the unsplit union kernel to f32 combine rounding; grouping
+    ranks that do not share a KV head (each attends the others' heads with its own K / V) is
+    caught."""
+    # One KV head shared by all `ways` ranks, as served (R = 4 needs heads divisible by 4)
+    geom = dataclasses.replace(G, NH=8 if ways == 4 else G.NH, NKV=1)
+    base_kw = dict(long=True, rank_ids=True, union=True, shard=True, shared_kv=True, R=ways,
+                   geom=geom, **kw)
+    base = _run_c(**base_kw)
+    _assert_split_close(base, _run_c(**base_kw, union_split=ways))
+    base_kw["shared_kv"] = False
+    with pytest.raises(AssertionError):
+        _assert_split_close(_run_c(**base_kw), _run_c(**base_kw, union_split=ways))
 
 
 def test_qsa_xmerge_lost_union_is_caught(monkeypatch):
