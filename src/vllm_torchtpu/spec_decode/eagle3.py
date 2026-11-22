@@ -1155,7 +1155,13 @@ class Eagle3Proposer:
             num_tokens_padded=input_ids.shape[0],
         )
         rows = last_token_indices.shape[0]
-        draft_rows = self._padded_draft_rows(last_token_indices, self._draft_rows_len(chunk))
+        # VLLM_TPU_DRAFT_SEED_EXTRAS: the fused seed program already emitted them.
+        extras = self._seed_extras.get(id(chunk))
+        draft_rows = (
+            extras[0]
+            if extras is not None
+            else self._padded_draft_rows(last_token_indices, self._draft_rows_len(chunk))
+        )
         num_tokens = input_ids.shape[0]
         with (
             set_model_tag("eagle_head"),
