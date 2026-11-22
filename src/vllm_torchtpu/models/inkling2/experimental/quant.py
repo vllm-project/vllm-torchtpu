@@ -33,24 +33,6 @@ import torch
 INKLING2_QUANT_METHOD = "inkling2"
 _UE8M0_EXPONENT_BIAS = 127
 _SUPPORTED_COMPUTE_DTYPES = frozenset({"float32", "bfloat16", "mxfp8", "nvfp4"})
-_FP4_E2M1_LUT = (
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-)
 
 ExpertQuantFormat = Literal["nvfp4", "mxfp8"]
 
@@ -156,15 +138,23 @@ def dequantize_mxfp8(
 
 
 def unpack_uint8_to_fp4(packed: torch.Tensor) -> torch.Tensor:
-    """Unpack uint8 E2M1 nibbles (low nibble first) ``[..., K//2]`` -> fp32."""
+    """Unpack uint8 E2M1 nibbles (low nibble first) ``[..., K//2]`` -> fp32.
+
+    Uses branchless bitwise arithmetic rather than LUT gather indexing so the
+    decoding vectorizes cleanly on TPU VPU lanes under ``torch.compile``.
+    """
     if packed.dtype != torch.uint8:
         raise ValueError(f"Expected uint8 packed FP4 tensor, got {packed.dtype}")
-    lut = torch.tensor(_FP4_E2M1_LUT, dtype=torch.float32, device=packed.device)
-    low = (packed & 0x0F).to(torch.int64)
-    high = ((packed >> 4) & 0x0F).to(torch.int64)
-    return torch.stack((lut[low], lut[high]), dim=-1).reshape(
-        *packed.shape[:-1], packed.shape[-1] * 2
+    nibbles = torch.stack((packed & 0x0F, (packed >> 4) & 0x0F), dim=-1)
+    sign_bit = (nibbles >> 3) & 0x01
+    exp = (nibbles >> 1) & 0x03
+    mant = (nibbles & 0x01).to(torch.float32)
+    normal_mag = (1.0 + 0.5 * mant) * torch.exp2(
+        (exp.to(torch.float32) - 1.0).clamp_min(0.0)
     )
+    mag = torch.where(exp != 0, normal_mag, 0.5 * mant)
+    vals = torch.where(sign_bit != 0, -mag, mag)
+    return vals.reshape(*packed.shape[:-1], packed.shape[-1] * 2)
 
 
 def dequantize_nvfp4(

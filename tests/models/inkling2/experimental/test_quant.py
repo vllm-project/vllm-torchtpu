@@ -117,3 +117,35 @@ def test_dequantize_nvfp4_block16_and_global_scale() -> None:
     expected_e1 = torch.tensor([4.0, -8.0] * 8 + [1.0, -2.0] * 8)
     torch.testing.assert_close(out[0, 0], expected_e0)
     torch.testing.assert_close(out[1, 0], expected_e1)
+
+
+def test_unpack_uint8_to_fp4_exhaustive_256_bytes() -> None:
+    lut = torch.tensor(
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
+        dtype=torch.float32,
+    )
+    all_bytes = torch.arange(256, dtype=torch.uint8)
+    unpacked = unpack_uint8_to_fp4(all_bytes)
+    expected = torch.stack(
+        (lut[(all_bytes & 0x0F).long()], lut[((all_bytes >> 4) & 0x0F).long()]),
+        dim=-1,
+    ).reshape(512)
+    assert unpacked.shape == (512,)
+    assert torch.equal(unpacked.view(torch.int32), expected.view(torch.int32))
