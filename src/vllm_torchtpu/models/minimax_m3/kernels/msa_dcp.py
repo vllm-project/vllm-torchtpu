@@ -60,13 +60,6 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 
 _NEG_INF = float("-inf")
 _LANES = 128
-# The narrowest column count `local_candidates` scans (a vreg's lanes), and
-# the fewest rows for which it picks a width per row block: below it a pick
-# is latency-bound whatever its width (c4 b1 3.4 us at 1,024 columns), above
-# it per-column work (c48 b36 decode: 288 rows x 1,024 columns, 12 us per
-# layer, of which ~370 columns are visible).
-_MIN_CANDIDATE_WIDTH = 128
-_MIN_CANDIDATE_TOKENS = 128
 # Decode-sized batches (up to this many rows) pick in row blocks of a vreg's
 # lanes, transposed, where that pads less than `msa_select.DEFAULT_BLOCK_ROWS`
 # (c48 b36: 288 rows in 3 x 128, not 2 x 256: candidates 12.0 -> 3.4 us per
@@ -145,7 +138,6 @@ def local_seq_lens(
 
 def _candidates_kernel(
     rank_ref,
-    widths_ref,
     scores_ref,
     pos_ref,
     score_out_ref,
@@ -156,65 +148,46 @@ def _candidates_kernel(
     init_blocks,
     local_blocks,
     dcp,
-    widths,
     col_bits,
 ):
     """`msa_select._kernel` over this rank's columns (column ``c`` is block
-    ``c * dcp + rank``), also returning the picked scores. The rank is read
-    from SMEM so that every rank runs the same program.
-
-    Row block ``i`` scans only its first ``widths_ref[i]`` columns (one of
-    the static `widths`, covering every block its rows see): the scores span
-    the whole max-model-len width, mostly past every row's context (c4
-    prefill twin, j-3c651507: ~240 of 1,024 columns visible). `local_candidates`
-    now passes this row-major kernel one full width (its blocks are not
-    transposed); the per-block widths remain for the transposed kernel's
-    callers and the tests."""
+    ``c * dcp + rank``), also returning the picked scores, over the whole
+    width. The rank is read from SMEM so that every rank runs the same
+    program."""
     rank = rank_ref[0]
-    width_now = widths_ref[pl.program_id(0)]
-    rows = scores_ref.shape[0]
+    rows, width = scores_ref.shape
     num_visible = pos_ref[...] // block_size + 1
 
-    def select(width):
-        s = scores_ref[:, :width]
-        cols = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
-        blocks = cols * dcp + rank
-        visible = blocks < num_visible
-        s = jnp.where(visible, s, _NEG_INF)
-        s = jnp.where(
-            visible & (blocks >= num_visible - local_blocks),
-            msa_select._FORCED_LOCAL_SCORE,
-            s,
+    s = scores_ref[...]
+    cols = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
+    blocks = cols * dcp + rank
+    visible = blocks < num_visible
+    s = jnp.where(visible, s, _NEG_INF)
+    s = jnp.where(
+        visible & (blocks >= num_visible - local_blocks),
+        msa_select._FORCED_LOCAL_SCORE,
+        s,
+    )
+    s = jnp.where(visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s)
+    # The scores the transposed kernel's keys keep, so both order alike.
+    s = _key_scores(_score_keys(s, cols, col_bits), col_bits)[0]
+    picked_scores, picked_blocks = [], []
+    for _ in range(topk):
+        best_score = jnp.max(s, axis=1, keepdims=True)
+        best = jnp.min(jnp.where(s == best_score, cols, width), axis=1, keepdims=True)
+        picked_scores.append(best_score)
+        picked_blocks.append(jnp.where(best_score > _NEG_INF, best * dcp + rank, -1))
+        s = jnp.where(cols == best, _NEG_INF, s)
+    odd = (rank & 1) == 1  # picks in reverse (`local_candidates`)
+    for out_ref, picked in (
+        (score_out_ref, picked_scores),
+        (block_out_ref, picked_blocks),
+    ):
+        out_ref[...] = jnp.where(
+            odd,
+            jnp.concatenate(picked[::-1], axis=1),
+            jnp.concatenate(picked, axis=1),
         )
-        s = jnp.where(
-            visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
-        )
-        # The scores the transposed kernel's keys keep, so both order alike.
-        s = _key_scores(_score_keys(s, cols, col_bits), col_bits)[0]
-        picked_scores, picked_blocks = [], []
-        for _ in range(topk):
-            best_score = jnp.max(s, axis=1, keepdims=True)
-            best = jnp.min(
-                jnp.where(s == best_score, cols, width), axis=1, keepdims=True
-            )
-            picked_scores.append(best_score)
-            picked_blocks.append(
-                jnp.where(best_score > _NEG_INF, best * dcp + rank, -1)
-            )
-            s = jnp.where(cols == best, _NEG_INF, s)
-        odd = (rank & 1) == 1  # picks in reverse (`local_candidates`)
-        for out_ref, picked in (
-            (score_out_ref, picked_scores),
-            (block_out_ref, picked_blocks),
-        ):
-            out_ref[...] = jnp.where(
-                odd,
-                jnp.concatenate(picked[::-1], axis=1),
-                jnp.concatenate(picked, axis=1),
-            )
-
-    for width in widths:
-        pl.when(width_now == width)(functools.partial(select, width))
 
 
 # `_candidates_kernel_t` picks on int32 keys that order the selection in one
@@ -224,19 +197,24 @@ def _candidates_kernel(
 # equal kept scores, the lower column. Keys are distinct, so a pick is the
 # largest key below the previous pick: ``max(key - (prev ^ INT_MIN))``, two
 # VALU ops per vreg and no store (the f32 picks took five, a store and a
-# second load: 56 bundles per 32 vregs, AOT). The scores keep 12+ mantissa
+# second load: 56 bundles per 32 vregs, AOT). The scores keep 11 mantissa
 # bits (they come from fp8 / 4-bit keys and bf16 or e4m3 queries); every
 # rank keys with the same bits, so a DCP group's lists merge exactly
 # (`merge_pair_candidates`) on the scores the picks return.
 _KEY_TOP = 1 << 30
 _INT_MIN = -(1 << 31)
-# Accumulators (8-sublane groups) of a pick pass, and its loop's unroll.
+# Accumulators (8-sublane groups) of a pick pass.
 _PICK_ACCUMULATORS = 4
-_PICK_UNROLL = 4
+
+
+# Column bits of every key up to 2,048 columns (262,144 tokens of 128-token
+# blocks on one rank), whatever the scores' padded width, so that the tile
+# classes of a step and the token-order path keep the same scores.
+_MIN_KEY_BITS = 11
 
 
 def _key_bits(num_cols: int) -> int:
-    return max(1, (num_cols - 1).bit_length())
+    return max(_MIN_KEY_BITS, (num_cols - 1).bit_length())
 
 
 def _score_keys(s: jax.Array, cols: jax.Array, col_bits: int) -> jax.Array:
@@ -261,51 +239,14 @@ def _key_scores(keys: jax.Array, col_bits: int) -> tuple[jax.Array, jax.Array]:
     return score, low - (keys & low)
 
 
-def _picks_packed(
-    keys, width, rank, topk, dcp, col_bits, score_out_ref, block_out_ref, key_ref
-):
-    """`topk` picks of a block's keys ``[width, rows]`` (`_score_keys`) in
-    `key_ref`'s first rows, padded to whole accumulator groups with the
-    lowest key."""
-    rows = keys.shape[1]
-    sub = 8 * _PICK_ACCUMULATORS
-    padded = -(-width // sub) * sub
-    key_ref[:width, :] = keys
-    if padded > width:
-        key_ref[width:padded, :] = jnp.full(
-            (padded - width, rows), -_KEY_TOP, jnp.int32
-        )
-    trips = padded // sub
-
-    def pick(k, prev):
-        off = prev ^ _INT_MIN  # [8, rows]
-
-        def body(v, acc):
-            at = pl.ds(pl.multiple_of(v * sub, sub), sub)
-            x = key_ref[at, :]
-            return tuple(
-                jnp.maximum(a, x[8 * i : 8 * (i + 1)] - off) for i, a in enumerate(acc)
-            )
-
-        init = (jnp.full((8, rows), _INT_MIN, jnp.int32),) * _PICK_ACCUMULATORS
-        acc = jax.lax.fori_loop(0, trips, body, init, unroll=min(trips, _PICK_UNROLL))
-        while len(acc) > 1:
-            acc = tuple(jnp.maximum(acc[i], acc[i + 1]) for i in range(0, len(acc), 2))
-        best = jnp.max(acc[0], axis=0, keepdims=True) + off[:1]  # [1, rows]
-        score, col = _key_scores(best, col_bits)
-        slot = jnp.where((rank & 1) == 1, topk - 1 - k, k)
-        score_out_ref[pl.ds(slot, 1), :] = score
-        block_out_ref[pl.ds(slot, 1), :] = jnp.where(
-            score > _NEG_INF, col * dcp + rank, -1
-        )
-        return jnp.broadcast_to(best, (8, rows))
-
-    jax.lax.fori_loop(0, topk, pick, jnp.full((8, keys.shape[1]), _KEY_TOP, jnp.int32))
+# `_candidates_kernel_t` builds keys `_KEY_CHUNK[pretransposed]` columns at a
+# time and scans them in groups of `_PICK_ROWS` (accumulator groups unrolled).
+_KEY_CHUNK = {True: 32, False: _LANES}
+_PICK_ROWS = 128
 
 
 def _candidates_kernel_t(
     rank_ref,
-    widths_ref,
     scores_ref,
     pos_ref,
     score_out_ref,
@@ -317,8 +258,8 @@ def _candidates_kernel_t(
     init_blocks,
     local_blocks,
     dcp,
-    widths,
     col_bits,
+    real_cols,
     pretransposed=False,
 ):
     """`_candidates_kernel` with the row block transposed in VMEM: columns
@@ -327,17 +268,31 @@ def _candidates_kernel_t(
     instead of across lanes on the XLU, which bound the row-major picks
     (~310 bundles per pick of a 256 x 128 block in the LLO), over packed keys
     (`_score_keys`). `pretransposed` scores already come as ``[columns,
-    rows]``."""
-    rank = rank_ref[0]
-    width_now = widths_ref[pl.program_id(0)]
-    rows = pos_ref.shape[1]
-    num_visible = pos_ref[...] // block_size + 1  # [1, rows]
+    rows]``.
 
-    def select(width):
-        s = scores_ref[:width, :] if pretransposed else scores_ref[:, :width].T
-        cols = jax.lax.broadcasted_iota(jnp.int32, (width, rows), 0)
+    The block keys and scans only the columns its rows can see (the scores
+    span max-model-len, mostly past every row's context): a loop bound read
+    from its positions, one body for every width."""
+    rank = rank_ref[0]
+    num_cols = scores_ref.shape[0 if pretransposed else 1]
+    rows = pos_ref.shape[1]
+    chunk = _KEY_CHUNK[pretransposed]
+    sub = 8 * _PICK_ACCUMULATORS
+    num_visible = pos_ref[...] // block_size + 1  # [1, rows]
+    # A rank's blocks below n are among its first ceil(n / dcp) columns.
+    needed = (jnp.max(num_visible) + dcp - 1) // dcp
+    chunks = jnp.clip((needed + chunk - 1) // chunk, 1, num_cols // chunk)
+    lowest = jnp.full((_PICK_ROWS, rows), -_KEY_TOP, jnp.int32)
+
+    def build(c, carry):
+        start = pl.multiple_of(c * chunk, chunk)
+        if pretransposed:
+            s = scores_ref[pl.ds(start, chunk), :]
+        else:
+            s = scores_ref[:, pl.ds(start, chunk)].T
+        cols = start + jax.lax.broadcasted_iota(jnp.int32, (chunk, rows), 0)
         blocks = cols * dcp + rank
-        visible = blocks < num_visible
+        visible = (blocks < num_visible) & (cols < real_cols)
         s = jnp.where(visible, s, _NEG_INF)
         s = jnp.where(
             visible & (blocks >= num_visible - local_blocks),
@@ -347,55 +302,47 @@ def _candidates_kernel_t(
         s = jnp.where(
             visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
         )
-        _picks_packed(
-            _score_keys(s, cols, col_bits),
-            width,
-            rank,
-            topk,
-            dcp,
-            col_bits,
-            score_out_ref,
-            block_out_ref,
-            key_ref,
+        key_ref[pl.ds(start, chunk), :] = _score_keys(s, cols, col_bits)
+        return carry
+
+    jax.lax.fori_loop(0, chunks, build, 0)
+    # The last scan group's rows past the keys: never picked before them.
+    key_ref[pl.ds(pl.multiple_of(chunks * chunk, chunk), _PICK_ROWS), :] = lowest
+    groups = (chunks * chunk + _PICK_ROWS - 1) // _PICK_ROWS
+
+    def pick(k, prev):
+        off = prev ^ _INT_MIN  # [8, rows]
+
+        def scan(g, acc):
+            for u in range(_PICK_ROWS // sub):
+                at = pl.ds(pl.multiple_of(g * _PICK_ROWS + u * sub, sub), sub)
+                x = key_ref[at, :]
+                acc = tuple(
+                    jnp.maximum(a, x[8 * i : 8 * (i + 1)] - off)
+                    for i, a in enumerate(acc)
+                )
+            return acc
+
+        init = (jnp.full((8, rows), _INT_MIN, jnp.int32),) * _PICK_ACCUMULATORS
+        acc = jax.lax.fori_loop(0, groups, scan, init)
+        while len(acc) > 1:
+            acc = tuple(jnp.maximum(acc[i], acc[i + 1]) for i in range(0, len(acc), 2))
+        best = jnp.max(acc[0], axis=0, keepdims=True) + off[:1]  # [1, rows]
+        score, col = _key_scores(best, col_bits)
+        slot = jnp.where((rank & 1) == 1, topk - 1 - k, k)
+        score_out_ref[pl.ds(slot, 1), :] = score
+        block_out_ref[pl.ds(slot, 1), :] = jnp.where(
+            score > _NEG_INF, col * dcp + rank, -1
         )
+        return jnp.broadcast_to(best, (8, rows))
 
-    for width in widths:
-        pl.when(width_now == width)(functools.partial(select, width))
+    jax.lax.fori_loop(0, topk, pick, jnp.full((8, rows), _KEY_TOP, jnp.int32))
 
-
-# Scan widths step by this many pretransposed columns up to
-# `_FINE_WIDTH_LIMIT`, then by 128.
-_FINE_WIDTH_STEP = 32
-_FINE_WIDTH_LIMIT = 256
-# Past this width the scan widths step by half of it (bounding the
-# kernel's bodies: 20 at 4,096 columns).
-_COARSE_WIDTH_FROM = 1024
 
 # Row blocks of a multiple of this many rows (a vreg's lanes) pick
 # transposed (`_candidates_kernel_t`, `_merge_kernel_t`); smaller decode
 # blocks would fill few lanes of each vreg.
 _TRANSPOSED_ROWS = 128
-
-
-def _scan_widths(num_cols: int, pretransposed: bool) -> list[int]:
-    """`local_candidates`' scan widths up to `num_cols`. A pick costs per
-    scanned column, so widths step finely: by `_FINE_WIDTH_STEP` columns
-    (sublanes of the pretransposed scores) up to `_FINE_WIDTH_LIMIT`, then by
-    a vreg's 128 lanes (powers of two cost ~25% more scan on average: c64's
-    146-column blocks scanned 256)."""
-    step = _FINE_WIDTH_STEP if pretransposed else _MIN_CANDIDATE_WIDTH
-    widths = list(range(step, min(num_cols, _FINE_WIDTH_LIMIT) + 1, step))
-    # Then steps of 128 up to _COARSE_WIDTH_FROM, and of half of that
-    # past it: one kernel body per width.
-    for lo, hi, step in (
-        (_MIN_CANDIDATE_WIDTH, _COARSE_WIDTH_FROM, _MIN_CANDIDATE_WIDTH),
-        (_COARSE_WIDTH_FROM, num_cols, _COARSE_WIDTH_FROM // 2),
-    ):
-        first = (widths[-1] if widths else 0) + step
-        widths += range(max(first, lo), min(hi, num_cols) + 1, step)
-    if not widths or widths[-1] != num_cols:
-        widths.append(num_cols)
-    return widths
 
 
 @functools.partial(
@@ -482,35 +429,31 @@ def local_candidates(
     # reads past them only when the live rows reach it. Padding rows pick from
     # garbage and are dropped, as the kernels reduce within a row only.
     p = jnp.pad(pos, (0, pad))[:, None]
-    # Static scan widths (`_scan_widths`, one kernel body each); each row
-    # block takes the narrowest one holding every block its rows see (a
-    # rank's blocks below n are among its first ceil(n / dcp) columns). Only
-    # transposed blocks: row-major ones scan the full width (c48 b23's one
-    # block of 184 rows took 4.6 us per layer at 1,024 columns, 18 us with
-    # widths, twins j-9662bca6, j-7cf6dd33).
+    # Every rank keys with the bits of the unpadded width (`_MIN_KEY_BITS`).
+    col_bits = _key_bits(num_cols)
     transposed = block_rows % _TRANSPOSED_ROWS == 0
-    widths = (
-        _scan_widths(num_cols, pretransposed)
-        if transposed and num_tokens >= _MIN_CANDIDATE_TOKENS
-        else [num_cols]
-    )
     num_blocks = (num_tokens + pad) // block_rows
-    if len(widths) == 1:
-        row_widths = jnp.full((num_blocks,), num_cols, jnp.int32)
-    else:
-        last_pos = jnp.max(p.reshape(num_blocks, block_rows), axis=1)
-        needed = -(-(last_pos // block_size + 1) // dcp)
-        w = jnp.asarray(widths, jnp.int32)
-        row_widths = jnp.min(jnp.where(w >= needed[:, None], w, num_cols), axis=1)
     scratch = []
     if transposed:
-        kernel = functools.partial(_candidates_kernel_t, pretransposed=pretransposed)
+        # Whole key chunks (`_candidates_kernel_t`); the kernel masks the
+        # padded columns.
+        chunk = _KEY_CHUNK[pretransposed]
+        kernel = functools.partial(
+            _candidates_kernel_t, real_cols=num_cols, pretransposed=pretransposed
+        )
+        if num_cols % chunk:
+            col_pad = -num_cols % chunk
+            s = jnp.pad(
+                s,
+                ((0, col_pad), (0, 0)) if pretransposed else ((0, 0), (0, col_pad)),
+                constant_values=_NEG_INF,
+            )
+            num_cols += col_pad
         pos_spec = pl.BlockSpec((1, block_rows), lambda i: (0, i))
         p = p.T
         out_spec = pl.BlockSpec((topk, block_rows), lambda i: (0, i))
         out_dims = (topk, num_tokens + pad)
-        sub = 8 * _PICK_ACCUMULATORS
-        scratch = [pltpu.VMEM((-(-max(widths) // sub) * sub, block_rows), jnp.int32)]
+        scratch = [pltpu.VMEM((num_cols + _PICK_ROWS, block_rows), jnp.int32)]
     else:
         kernel = _candidates_kernel
         pos_spec = pl.BlockSpec((block_rows, 1), lambda i: (i, 0))
@@ -524,8 +467,7 @@ def local_candidates(
             init_blocks=init_blocks,
             local_blocks=local_blocks,
             dcp=dcp,
-            widths=tuple(widths),
-            col_bits=_key_bits(num_cols),
+            col_bits=col_bits,
         ),
         grid=(
             num_blocks
@@ -533,7 +475,6 @@ def local_candidates(
             else jnp.clip(-(-live_rows // block_rows), 1, num_blocks),
         ),
         in_specs=[
-            pl.BlockSpec(memory_space=pltpu.SMEM),
             pl.BlockSpec(memory_space=pltpu.SMEM),
             (
                 pl.BlockSpec((num_cols, block_rows), lambda i: (0, i))
@@ -554,7 +495,7 @@ def local_candidates(
         ),
         interpret=interpret,
         name="minimax_m3_msa_dcp_candidates",
-    )(rank_array(rank), row_widths, s, p)
+    )(rank_array(rank), s, p)
     if transposed:
         picked_scores, picked_blocks = picked_scores.T, picked_blocks.T
     return picked_scores[:num_tokens], picked_blocks[:num_tokens]

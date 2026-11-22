@@ -51,7 +51,6 @@ def _reference(scores, pos, rank, dcp, init_blocks, local_blocks):
 
 
 @pytest.mark.parametrize("pretransposed", [False, True])
-@pytest.mark.parametrize("pick_widths", [True, False])
 @pytest.mark.parametrize(
     "num_tokens,num_cols,dcp,rank,max_pos,init_blocks,local_blocks",
     [
@@ -59,11 +58,11 @@ def _reference(scores, pos, rank, dcp, init_blocks, local_blocks):
         (300, 512, 2, 0, 130_000, 1, 1),  # every chunk visible in some block
         (5, 256, 8, 3, 9_000, 0, 1),  # decode-sized: one padded 128-row block
         (40, 96, 4, 2, 20_000, 1, 2),  # one padded 128-row block, < 128 columns
-        (300, 384, 2, 0, 60_000, 0, 1),  # widths 128, 256 and the full 384
-        (128, 512, 2, 1, 50_000, 0, 1),  # the fewest rows that pick widths
+        (300, 384, 2, 0, 60_000, 0, 1),  # 1, 2 or 3 column chunks per block
+        (128, 512, 2, 1, 50_000, 0, 1),
         (129, 512, 2, 0, 50_000, 0, 1),  # one block of all its rows
         (1032, 256, 2, 1, 30_000, 0, 1),  # past decode-sized: 256-row blocks
-        (300, 1040, 2, 1, 270_000, 0, 1),  # running picks, then a looped 1,040
+        (300, 1040, 2, 1, 270_000, 0, 1),  # a width of whole chunks plus a part
     ],
 )
 def test_candidates_match_reference(
@@ -74,12 +73,8 @@ def test_candidates_match_reference(
     max_pos,
     init_blocks,
     local_blocks,
-    pick_widths,
     pretransposed,
-    monkeypatch,
 ):
-    if pick_widths:  # per-row-block widths (transposed blocks only)
-        monkeypatch.setattr(msa_dcp, "_MIN_CANDIDATE_TOKENS", 0)
     rng = np.random.default_rng(num_tokens + num_cols)
     # Few distinct values so ties are common.
     scores = rng.integers(0, 6, (num_tokens, num_cols)).astype(np.float32)
@@ -105,8 +100,8 @@ def test_candidates_match_reference(
 
 def _kept_scores(scores, num_cols):
     """The scores `msa_dcp`'s packed keys keep: the order-preserving int32
-    code shifted right one bit, its low ceil(log2(num_cols)) bits cleared."""
-    low = (1 << max(1, (num_cols - 1).bit_length())) - 1
+    code shifted right one bit, its low `msa_dcp._key_bits` bits cleared."""
+    low = (1 << msa_dcp._key_bits(num_cols)) - 1
     code = scores.astype(np.float32).view(np.int32)
     code = np.where(code < 0, code ^ 0x7FFFFFFF, code)
     code = ((code >> 1) & ~low) << 1
@@ -164,8 +159,8 @@ def test_row_blocks_stay_inside_the_scores(num_tokens):
         )
     )(scores, pos)
     (call,) = _pallas_calls(jaxpr.jaxpr)
-    rows = call.invars[2].aval.shape[0]
-    block_rows = call.params["grid_mapping"].block_mappings[2].block_aval.shape[0]
+    rows = call.invars[1].aval.shape[0]
+    block_rows = call.params["grid_mapping"].block_mappings[1].block_aval.shape[0]
     assert rows % block_rows == 0, (rows, block_rows)
     assert call.params["grid_mapping"].grid[0] * block_rows == rows
 
