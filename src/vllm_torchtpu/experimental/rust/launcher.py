@@ -67,9 +67,17 @@ PROG = "python -m vllm_torchtpu.experimental.rust"
 
 # vLLM options that `rvllm serve` takes under the same name. host and port are
 # frontend options; the others are engine arguments that set runtime behavior,
-# not the artifact.
+# not the artifact. kv_transfer_config selects the disaggregated-serving role,
+# so it stays out of the export and prefill and decode servers share one.
 RVLLM_VLLM_DESTS = frozenset(
-    {"host", "port", "served_model_name", "async_scheduling", "load_format"}
+    {
+        "host",
+        "port",
+        "served_model_name",
+        "async_scheduling",
+        "load_format",
+        "kv_transfer_config",
+    }
 )
 # Of those, the ones the exporter reads too: it exports dummy weights for
 # `--load-format dummy`.
@@ -225,12 +233,6 @@ def split_args(
             )
         elif dest in INTERNAL_EXPORT_DESTS:
             raise LauncherError(f"{name} is internal to the exporter")
-        elif dest == "kv_transfer_config":
-            raise LauncherError(
-                "--kv-transfer-config is not supported: rvllm disaggregates with "
-                "its own flags (--role prefill|decode, --kv-port, --kv-advertise, "
-                "--kv-producers)"
-            )
         elif dest in RVLLM_VLLM_DESTS:
             if dest == "served_model_name" and count > 1:
                 raise LauncherError("rvllm serves one --served-model-name")

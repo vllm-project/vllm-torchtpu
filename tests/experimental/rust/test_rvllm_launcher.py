@@ -99,6 +99,18 @@ def test_engine_arguments_go_to_the_exporter_and_deployment_flags_to_rvllm():
     assert s.warnings == []
 
 
+def test_kv_transfer_config_goes_to_rvllm_only():
+    config = '{"kv_connector":"TPUConnector","kv_role":"kv_consumer"}'
+    s = split("m", "--max-model-len", "8", "--kv-transfer-config", config)
+    assert s.export_args == ["--max-model-len", "8"]
+    assert s.serve_args == ["--kv-transfer-config", config]
+    # Prefill and decode servers of one model share the cached export.
+    producer = config.replace("consumer", "producer")
+    prefill = split("m", "--kv-transfer-config", producer)
+    decode = split("m", "--kv-transfer-config", config)
+    assert prefill.export_args == decode.export_args == []
+
+
 def test_the_model_can_be_given_with_model():
     assert split("--model=m", "--max-model-len", "8").model == "m"
     assert split("--model", "m").model == "m"
@@ -110,7 +122,6 @@ def test_the_model_can_be_given_with_model():
         (["m", "--api-key", "k"], "--api-key is a `vllm serve` frontend option"),
         (["m", "--chat-template", "t.jinja"], "--chat-template is a `vllm serve`"),
         (["m", "--enable-auto-tool-choice"], "frontend option that rvllm does not"),
-        (["m", "--kv-transfer-config", "{}"], "--role prefill|decode"),
         (["m", "--no-such-option"], "neither a `vllm serve` option nor"),
         (["m", "--output-dir", "/tmp/x"], "chosen by the launcher"),
         (["m", "--served-model-name", "a", "b"], "one --served-model-name"),
