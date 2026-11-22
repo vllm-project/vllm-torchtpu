@@ -48,12 +48,12 @@ BF16, F32 = jnp.bfloat16, jnp.float32
 MAX_ROWS = 32
 # bf16 MXU operands pack 16 sublanes.
 _ROW_ALIGN = 16
-# Bytes per weight DMA, and how many are in flight (6: 4.5 MiB, enough to
-# cover the DMA latency). The weights stream through rings of one more slot
-# than that: the kernel's VMEM stays small, which leaves XLA the room it uses
-# to prefetch the neighbouring ops' weights (all of VMEM to this call cost
-# the drafter's other matmuls ~5 us each, c4 twin j-319ca531).
-_CHUNK_BYTES = 3 << 18
+# Bytes per weight DMA and how many are in flight: 1.5 MiB x 6 (9 MiB) kept
+# the call at 10.2-10.5 us (j-319ca531, 8 / 24 rows); 768 KiB x 6 took 13.0
+# (j-617cb005). The weights stream through rings of one more slot than that
+# (~21 MiB): all of VMEM to this call cost the drafter's other matmuls ~5 us
+# each by starving XLA's prefetch of their weights (j-319ca531).
+_CHUNK_BYTES = 3 << 19
 _IN_FLIGHT = 6
 _SLOTS = _IN_FLIGHT + 1
 _VMEM_HEADROOM = 4 << 20
