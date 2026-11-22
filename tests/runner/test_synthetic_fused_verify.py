@@ -25,7 +25,10 @@ import vllm.distributed
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.runner import tpu_runner
-from vllm_torchtpu.runner.speculative_decoding_manager import SpecDecodeMetadata
+from vllm_torchtpu.runner.speculative_decoding_manager import (
+    SpecDecodeMetadata,
+    SpeculativeDecodingManager,
+)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 K, VOCAB, HIDDEN = 3, 160, 16
@@ -47,6 +50,7 @@ def _runner(gen, top_p):
     runner._synthetic_row_rank = None
     runner._synthetic_shard = None
     runner._synthetic_fused_warm = set()
+    runner._synthetic_fused_shapes = set()
     runner._sampling_params_reuse = None
     runner.input_batch = SimpleNamespace(
         temperature_cpu_tensor=torch.tensor([1.0, 0.7, 1.3]),
@@ -116,6 +120,7 @@ def test_fused_verify_matches_three_programs(monkeypatch, warm, top_p, seed):
     gen.set_state(md_gen_state)
     md = _metadata(gen)
     if warm:
+        runner._synthetic_fused_shapes.add((16, 16, 4))
         runner._synthetic_fused_warm.add("warmed")
         monkeypatch.setattr(tpu_runner, "program_key", lambda _args: "warmed")
     fused_calls = []
@@ -131,4 +136,98 @@ def test_fused_verify_matches_three_programs(monkeypatch, warm, top_p, seed):
     assert md.synthetic_hidden_states is None
     assert torch.equal(tokens, expected)
     # The same draws from the sampling stream.
+    assert torch.equal(state, expected_state)
+
+
+def _served_metadata(num_tokens_paddings, scheduled):
+    """`get_spec_decode_metadata` of a step scheduling ``scheduled`` tokens
+    per request, K drafts for each verifying request (K + 1 tokens) and none
+    for a prefill chunk, padded to 4 requests."""
+    num_draft = np.array([K if n == K + 1 else 0 for n in scheduled], np.int32)
+    manager = SimpleNamespace(
+        _meta_cache_key=None,
+        runner=SimpleNamespace(
+            input_ids_cpu=torch.zeros(64, dtype=torch.int32),
+            arange_np=np.arange(64),
+            num_tokens_paddings=num_tokens_paddings,
+            device=torch.device("cpu"),
+        ),
+    )
+    return SpeculativeDecodingManager.get_spec_decode_metadata(
+        manager,  # type: ignore[arg-type]
+        num_draft,
+        np.cumsum(scheduled).astype(np.int32),
+        padded_num_reqs=4,
+    )
+
+
+@pytest.mark.parametrize(
+    "scheduled, fused",
+    [
+        # Three verifying requests: 12 tokens, verify and token bucket 16.
+        ([K + 1] * 3, True),
+        # A 2-token prefill chunk beside them still lands in bucket 16.
+        ([K + 1] * 3 + [2], True),
+        # A 9-token one moves the token bucket to 32: three programs, with
+        # the LM head in execute_model as before.
+        ([K + 1] * 3 + [9], False),
+    ],
+)
+def test_served_step_meets_the_warmup_keys(monkeypatch, scheduled, fused):
+    """The warmup's keys (`_precompile_synthetic_fused_verify`) against a
+    step built as serving builds it: a step in a warmed (token bucket, verify
+    rows, requests) runs the one program; another keeps its LM head in
+    execute_model (no deferral, no warm-miss warning); same tokens and
+    stream either way."""
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda out: None)
+    gen = torch.Generator().manual_seed(0)
+    runner = _runner(gen, [0.9, 1.0, 0.6])
+    runner.model_config = SimpleNamespace(get_hidden_size=lambda: HIDDEN)
+    runner._hidden_states_dtype = torch.float32
+    runner.device = torch.device("cpu")
+    with torch.compiler.set_stance("force_eager"):
+        runner._precompile_synthetic_fused_verify(16, 4)
+    assert runner._synthetic_fused_shapes == {(16, 16, 4)}
+
+    paddings = [8, 16, 32]
+    bucket = tpu_runner._get_padded_token_len(paddings, sum(scheduled))
+    hidden = torch.randn(bucket, HIDDEN, generator=gen)
+    md_state = gen.get_state()
+    monkeypatch.setattr(envs, "TPU_SPEC_SYNTHETIC_FUSED_VERIFY", False)
+    expected, expected_state = _step(
+        runner, hidden, _served_metadata(paddings, scheduled), 0
+    )
+
+    monkeypatch.setattr(envs, "TPU_SPEC_SYNTHETIC_FUSED_VERIFY", True)
+    gen.set_state(md_state)
+    md = _served_metadata(paddings, scheduled)
+    calls = []
+    fused_program = TPUModelRunner.synthetic_verify_and_sample
+    monkeypatch.setattr(
+        TPUModelRunner,
+        "synthetic_verify_and_sample",
+        lambda *a, **kw: calls.append(1) or fused_program(*a, **kw),
+    )
+    warnings = []
+    monkeypatch.setattr(
+        tpu_runner.logger, "warning_once", lambda *a, **kw: warnings.append(a)
+    )
+    deferred = []
+    verify_logits = runner._synthetic_verify_logits
+
+    def record(hidden_states, md):
+        out = verify_logits(hidden_states, md)
+        deferred.append(md.synthetic_hidden_states is not None)
+        return out
+
+    runner._synthetic_verify_logits = record
+    tokens, state = _step(runner, hidden, md, 0)
+
+    assert calls == ([1] if fused else [])
+    assert deferred == [fused]
+    assert warnings == []
+    assert torch.equal(tokens, expected)
     assert torch.equal(state, expected_state)

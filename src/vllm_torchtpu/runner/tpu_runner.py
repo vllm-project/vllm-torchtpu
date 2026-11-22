@@ -1240,8 +1240,10 @@ class TPUModelRunner(GPUModelRunner):
         # `_substitute_and_extract_drafts` at.
         self._substitute_drafts_warm: set[tuple] = set()
         # `program_key`s of the arguments the warmup compiled
-        # `synthetic_verify_and_sample` at (`TPU_SPEC_SYNTHETIC_FUSED_VERIFY`).
+        # `synthetic_verify_and_sample` at (`TPU_SPEC_SYNTHETIC_FUSED_VERIFY`),
+        # and their `_synthetic_fused_shape`s.
         self._synthetic_fused_warm: set[tuple] = set()
+        self._synthetic_fused_shapes: set[tuple[int, int, int]] = set()
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank, has_kv_transfer_group)
@@ -5014,19 +5016,37 @@ class TPUModelRunner(GPUModelRunner):
         those rows when they split over the TP ranks
         (`compute_selected_logit_rows`, marked on ``md``).
 
-        With `TPU_SPEC_SYNTHETIC_FUSED_VERIFY` and the accepts in the one
-        draw, only draw the uniforms (the same draw at the same point of the
-        stream) and return ``hidden_states``: the plan and the LM head run in
-        the sampler's program (`_sample_synthetic_verify_fused`)."""
+        With `TPU_SPEC_SYNTHETIC_FUSED_VERIFY`, a step of a warmed shape and
+        the accepts in the one draw, only draw the uniforms (the same draw at
+        the same point of the stream) and return ``hidden_states``: the plan
+        and the LM head run in the sampler's program
+        (`_sample_synthetic_verify_fused`)."""
+        assert md.draft_token_ids is not None
         num_reqs = md.draft_lengths.shape[0]
         split = self._synthetic_rows_split(num_reqs)
         md.synthetic_row_rank = self._synthetic_row_rank if split else None
-        if envs.TPU_SPEC_SYNTHETIC_FUSED_VERIFY and self._draw_synthetic_uniforms(md):
+        if (
+            envs.TPU_SPEC_SYNTHETIC_FUSED_VERIFY
+            and self._synthetic_fused_shape(hidden_states, md.draft_token_ids, num_reqs)
+            in self._synthetic_fused_shapes
+            and self._draw_synthetic_uniforms(md)
+        ):
             md.synthetic_hidden_states = hidden_states
             return hidden_states
         return self._synthetic_logits(
             hidden_states, self._plan_synthetic_verify(md), md
         )
+
+    @staticmethod
+    def _synthetic_fused_shape(
+        hidden_states: torch.Tensor, draft_token_ids: torch.Tensor, num_reqs: int
+    ) -> tuple[int, int, int]:
+        """(hidden rows, verify rows, padded requests). The warmup compiles
+        `synthetic_verify_and_sample` with hidden rows == verify rows, the
+        shape of a decode-only step; a step whose token bucket differs (a
+        prefill chunk beside the verify) keeps the three programs and its LM
+        head in execute_model."""
+        return (hidden_states.shape[0], draft_token_ids.shape[0], num_reqs)
 
     def _synthetic_logits(
         self, hidden_states: torch.Tensor, rows: torch.Tensor, md: SpecDecodeMetadata
@@ -7673,6 +7693,9 @@ class TPUModelRunner(GPUModelRunner):
                 out = self.synthetic_verify_and_sample(*args, **full)
             synchronize_tensors(out)
             self._synthetic_fused_warm.add(program_key((args, full)))
+        self._synthetic_fused_shapes.add(
+            self._synthetic_fused_shape(hidden, draft_token_ids, num_reqs)
+        )
 
     def _precompile_top_token_verify(
         self,
