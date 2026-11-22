@@ -119,13 +119,44 @@ class _World:
                 self.violations.append(f"D4 pass {t}: parked block {p.block_id} is still in the prefix cache")
             if p.ref_cnt != 0:
                 self.violations.append(f"D4 pass {t}: parked block {p.block_id} has ref_cnt {p.ref_cnt}")
-        ids = [x.block_id for x in queued] + [x.block_id for x in parked] + [x.block_id for x in held_blocks] + [0]
+        held_ids = sorted({x.block_id for x in held_blocks})
+        ids = [x.block_id for x in queued] + [x.block_id for x in parked] + held_ids + [0]
         if len(queued) != pool.free_block_queue.num_free_blocks:
             self.violations.append(f"D4 pass {t}: free queue walks {len(queued)} blocks, counts {pool.free_block_queue.num_free_blocks}")
         if sorted(ids) != list(range(pool.num_gpu_blocks)):
             self.violations.append(f"D4 pass {t}: blocks not each in exactly one place ({len(ids)} vs {pool.num_gpu_blocks})")
         if vasync is not None and sum(vasync.count.values()) != len(parked):
             self.violations.append(f"D4 pass {t}: parked count {sum(vasync.count.values())} vs {len(parked)} parked blocks")
+
+
+def _check_pins(world, t) -> None:
+    """D5: every save in flight still holds its admission's pin (FakeKVCacheStore.save needs one, and so does a retry)."""
+    for s in world.stores:
+        for h in s._saving:
+            if s.entries[h].pin_count < 1:
+                world.violations.append(f"D5 pass {t}: an in-flight save lost its admission pin (block {s.entries[h].device_block_id})")
+
+
+def _check_targets(world, sched, blocks, t, what) -> bool:
+    """D6: no arrival-touch target (pinned on arrival or adopted when scheduled) is a parked block."""
+    vasync = sched.__dict__.get("_vasync")
+    parked = {b.block_id for rec in vasync.parked.values() for b in rec.blocks} if vasync is not None else set()
+    bad = [b.block_id for b in blocks if b.block_id in parked]
+    if bad:
+        world.violations.append(f"D6 pass {t}: {what} targets parked blocks {bad}")
+    return not bad
+
+
+def _check_host_hits(world, keys, t) -> None:
+    """D7: a key the host tier counts as resident is on the host, not a save in flight."""
+    from tests.offload.test_raiden_store_offload import FakeBlockStatus
+
+    host = (FakeBlockStatus.HOST, FakeBlockStatus.HOST_AND_HBM)
+    for key in keys:
+        h = world.ns + bytes(key) + (0).to_bytes(4, "big")
+        homes = [s for s in world.stores if h in s.entries]
+        if not any(s.entries[h].status in host and h not in s._saving for s in homes):
+            world.violations.append(f"D7 pass {t}: key {bytes(key)[:6].hex()} counted as a host hit while not on the host")
 
 
 class _Store(FakeKVCacheStore):
@@ -773,3 +804,234 @@ def test_backlog_scheduler_thread_saving(monkeypatch):
     assert off_world.violations == [] and on_world.violations == [], (off_world.violations + on_world.violations)[:5]
     assert off["sync_jobs"] > 0 and on["async_jobs"] > 0
     assert on["sched_ms"] <= 0.25 * off["sched_ms"], (on, off)
+
+
+# -- the served combination: VLLM_TPU_OFFLOAD_VICTIM_ASYNC with VLLM_TPU_ARRIVAL_TOUCH=1 ------------------------------
+#
+# The Car D / E / F / G forms set VLLM_TPU_ARRIVAL_TOUCH=1 (sub-keys at their defaults; no TIER_X2 / READ_ROOM) in the
+# same scheduler. Arrival touch reaches HBM blocks only through prefix-cache lookups (core/arrival_touch.py
+# arrival_blocks -> find_longest_cache_hit, then BlockPool.touch) and the host tier only through
+# host_resident_prefix + touch_run (TPURaidenOffloadingConnector.arrival_touch).
+
+
+def _kvm(pool):
+    from types import SimpleNamespace as NS
+
+    return NS(coordinator=NS(single_type_managers=[NS(block_pool=pool, req_to_blocks={}) for _ in range(6)]))
+
+
+def _arrival_pins(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.core.arrival_touch import ArrivalPins
+
+    monkeypatch.setenv("VLLM_TPU_ARRIVAL_TOUCH", "1")
+    for k in ("VLLM_TPU_ARRIVAL_TOUCH_HBM_FRAC", "VLLM_TPU_ARRIVAL_TOUCH_MIN_FREE_FRAC", "VLLM_TPU_ARRIVAL_TOUCH_TTL_S",
+              "VLLM_TPU_ARRIVAL_TOUCH_TIER"):
+        monkeypatch.delenv(k, raising=False)
+    return ArrivalPins(hbm_frac=float(envs.VLLM_TPU_ARRIVAL_TOUCH_HBM_FRAC),
+                       min_free_frac=float(envs.VLLM_TPU_ARRIVAL_TOUCH_MIN_FREE_FRAC),
+                       ttl_s=float(envs.VLLM_TPU_ARRIVAL_TOUCH_TTL_S), tier=bool(envs.VLLM_TPU_ARRIVAL_TOUCH_TIER))
+
+
+def _hits(pool, req, group, n_tokens):
+    """The run a prefix lookup adopts for one full-attention group: get_cached_block per block until the first miss,
+    over at most (num_tokens - 1) tokens (find_longest_cache_hit's max length)."""
+    out = []
+    for i in range((n_tokens - 1) // BS):
+        got = pool.get_cached_block(req.block_hashes[i], [group])
+        if not got:
+            break
+        out.append(got[0])
+    return out
+
+
+class _ArrivalRun(_Run):
+    """_Run with arrival touch: a new request (40 % of them return an earlier prompt) arrives in the waiting queue,
+    where the tree's ArrivalPins pins the blocks its prefix lookup finds and the host tier refreshes the keys past its
+    local hit; it waits 0-15 passes (a pass is 10 s of the arrival clock against the 120 s TTL); before each pass
+    ArrivalPins.before_schedule releases expired and pressure pins; when scheduled it adopts its current hit
+    (BlockPool.touch, as allocate_slots does), allocates the rest and its pin is released (rel_sched). Checks D1-D7."""
+
+    def __init__(self, sched, pool, world, seed, pins, **kw):
+        super().__init__(sched, pool, world, seed, **kw)
+        self.pins, self.kvm = pins, _kvm(pool)
+        self.waiting: list[dict] = []
+        self.refreshed = 0
+        self.adopted = 0
+        self.prompts: list[tuple[int, int]] = []
+
+    def pinned(self):
+        return [b for pin in self.pins.pins.values() for keep in pin.groups for b in keep]
+
+    def step(self, admit=True):
+        from vllm.v1.core.sched.output import SchedulerOutput
+        from vllm.v1.kv_offload.base import make_offload_key
+
+        t, rng, pool, world, pins = self.t, self.rng, self.pool, self.world, self.pins
+        now = 10.0 * t
+        manager = self.sched._raiden_manager
+        keep = []
+        for r in self.running:
+            if r[0] <= t:
+                pool.free_blocks(list(reversed(r[1])))
+            else:
+                keep.append(r)
+        self.running = keep
+        draws = [
+            (rng.randint(*self.sizes), rng.random() < self.partial_p, rng.random(), rng.randint(*self.life),
+             rng.randint(0, 15), rng.random())
+            for _ in range(rng.randint(*self.admit) if admit else 0)
+        ]
+        for n_full, partial, dup, life, wait, pick in draws:
+            self.seq += 1
+            if dup < 0.4 and self.prompts:
+                seed, group = self.prompts[int(pick * len(self.prompts))]
+                n_full = max(n_full, 2)
+            else:
+                seed, group = self.seq, self.groups[self.seq % len(self.groups)]
+                self.prompts.append((seed, group))
+            req = _request(f"r{seed}", n_full * BS + int(partial), seed)
+            rid = f"q{self.seq}"
+            hits = _hits(pool, req, group, req.num_tokens)
+            if _check_targets(world, self.sched, hits, t, "an arrival pin") and hits and pins.hbm_frac > 0:
+                groups = [[] for _ in range(6)]
+                groups[group] = hits
+                pins.pin(self.kvm, rid, groups, now)
+            keys = [make_offload_key(req.block_hashes[i], group) for i in range(len(hits), n_full)]
+            run = manager.host_resident_prefix(keys)
+            _check_host_hits(world, keys[:run], t)
+            if run:
+                self.refreshed += manager.touch_run(keys[:run])
+            _check_pins(world, t)
+            self.waiting.append(dict(rid=rid, req=req, group=group, n_full=n_full, partial=int(partial), life=life,
+                                     ready=t + wait))
+        pins.before_schedule(self.kvm, now)
+        new = []
+        t0 = time.perf_counter()
+        for w in list(self.waiting):
+            if w["ready"] > t:
+                continue
+            if len(self.running) + len(new) >= self.max_running:
+                break
+            hits = _hits(pool, w["req"], w["group"], w["req"].num_tokens)
+            if not _check_targets(world, self.sched, hits, t, "an adoption"):
+                hits = []
+            need = w["n_full"] - len(hits) + w["partial"]
+            free = pool.get_num_free_blocks()
+            self.free_seq.append(free)
+            if need + sum(1 for b in hits if b.ref_cnt == 0) > free:
+                self.starved += 1
+                continue
+            pool.touch(hits)
+            blocks = hits + (pool.get_new_blocks(need) if need else [])
+            pins.release(self.kvm, w["rid"], "rel_sched")
+            self.adopted += len(hits)
+            self.waiting.remove(w)
+            new.append([t + w["life"], blocks, w])
+        meta = self.sched.build_connector_meta(SchedulerOutput.make_empty())
+        self.sched_s += time.perf_counter() - t0
+        _echo(self.sched, meta)
+        held = self.held() + [b for r in new for b in r[1]] + self.pinned()
+        world.check_ship(held, t)
+        world.check_places(self.sched, pool, held, t)
+        _check_pins(world, t)
+        for fin, blocks, w in new:
+            req, group, n_full = w["req"], w["group"], w["n_full"]
+            h = sum(1 for b in blocks[:n_full] if b.block_hash is not None)
+            for i, b in enumerate(blocks[h:n_full], start=h):
+                world.hbm[b.block_id] = world.key_bytes(make_offload_key(req.block_hashes[i], group))
+            for b in blocks[n_full:]:
+                world.hbm[b.block_id] = ("partial", t, b.block_id)
+            pool.cache_full_blocks(req, blocks, h, n_full, BS, group)
+            self.running.append((fin, blocks))
+        self.t += 1
+        return meta
+
+    def settle(self, limit=200):
+        self.pins.release_all(self.kvm, "rel_finish")
+        self.waiting = []
+        return super().settle(limit)
+
+
+@pytest.mark.parametrize("seed,pool_blocks,min_age", [(21, 96, 3), (22, 384, 3), (23, 384, 10)])
+def test_integrity_sim_with_arrival_touch(monkeypatch, seed, pool_blocks, min_age):
+    """The served combination: VLLM_TPU_OFFLOAD_VICTIM_ASYNC=256 with VLLM_TPU_ARRIVAL_TOUCH=1 on the tier-class
+    scheduler (out-of-order landings, failed saves retried, returners). No D1-D7 violation; arrival pins, adoptions and
+    host refreshes all happen while victim stores are parked."""
+    world = _World(random.Random(2000 + seed), latency=(1, 6), fail_p=0.05)
+    sched = _sched(monkeypatch, world, 256)
+    sched._victim_min_age = min_age
+    pool = _pool(world, pool_blocks)
+    pins = _arrival_pins(monkeypatch)
+    run = _ArrivalRun(sched, pool, world, seed, pins, sizes=(2, 6), admit=(0, 4), max_running=8, life=(1, 3))
+    for _ in range(160):
+        run.step()
+    assert run.settle(), "parked jobs never drained"
+    st = pins.stats
+    _mark("SIM_ARRIVAL", seed=seed, pool=pool_blocks, reserve=256, min_age=min_age,
+          async_jobs=_tel(sched, "victim_async_stores"), released=_tel(sched, "victim_async_released_blocks"),
+          sync_jobs=_tel(sched, "victim_stores"), fallbacks=_tel(sched, "victim_async_fallbacks"),
+          pinned=st["pinned"], pinned_blocks=st["pinned_blocks"], denied=st["denied_budget"] + st["denied_floor"],
+          rel_ttl=st["rel_ttl"], rel_pressure=st["rel_pressure"], rel_sched=st["rel_sched"], adopted=run.adopted,
+          refreshed=run.refreshed, landed=world.landed, violations=len(world.violations))
+    assert world.violations == [], world.violations[:5]
+    assert _tel(sched, "victim_async_stores") > 0 and _tel(sched, "victim_async_released_blocks") > 0
+    assert st["pinned"] > 0 and run.adopted > 0 and run.refreshed > 0
+
+
+def test_arrival_touch_never_reaches_a_parked_block(monkeypatch):
+    """A returner whose prefix is parked finds no HBM hit (nothing to pin), the host tier counts none of its in-flight
+    keys as resident, and the refresh leaves the saves' pins as they were; once the stores land the keys are host hits
+    and the refresh moves them. A pinned cached block is never parked (it is not in the free queue); released, it is
+    young; aged, it is parked and invisible to the next arrival."""
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.kv_offload.base import make_offload_key
+
+    world, sched, pool, reqs, rest = _parked_setup(monkeypatch)
+    pins, kvm = _arrival_pins(monkeypatch), _kvm(pool)
+    vasync, manager, store = sched._vasync, sched._raiden_manager, world.stores[0]
+    sched.build_connector_meta(SchedulerOutput.make_empty())
+    parked = {b.block_id for rec in vasync.parked.values() for b in rec.blocks}
+    assert len(parked) == 4
+    req1 = _request("r1", 2 * BS + 1, 1)
+    hits = _hits(pool, req1, MAIN, req1.num_tokens)
+    _check_targets(world, sched, hits, 0, "an arrival pin")
+    assert hits == []
+    keys = [make_offload_key(req1.block_hashes[i], MAIN) for i in range(2)]
+    pins_before = {h: store.entries[h].pin_count for h in store._saving}
+    assert manager.host_resident_prefix(keys) == 0
+    manager.touch_run(keys)
+    assert {h: store.entries[h].pin_count for h in store._saving} == pins_before and all(pins_before.values())
+    store.land_now(list(store._saving))
+    _echo(sched, sched.build_connector_meta(SchedulerOutput.make_empty()))
+    assert not vasync.parked
+    assert manager.host_resident_prefix(keys) == 2 and manager.touch_run(keys) == 2
+    assert all(store.entries[world.ns + bytes(k) + (0).to_bytes(4, "big")].pin_count == 0 for k in keys)
+    # A cached block pinned on arrival stays out of the free queue, so evict-ahead cannot take it.
+    blocks = pool.get_new_blocks(2)
+    req3 = _request("r3", 2 * BS + 1, 3)
+    for i, b in enumerate(blocks):
+        world.hbm[b.block_id] = world.key_bytes(make_offload_key(req3.block_hashes[i], MAIN))
+    pool.cache_full_blocks(req3, blocks, 0, 2, BS, MAIN)
+    _free_aged(sched, pool, blocks)
+    hits = _hits(pool, req3, MAIN, req3.num_tokens)
+    assert [b.block_id for b in hits] == [b.block_id for b in blocks]
+    groups = [[] for _ in range(6)]
+    groups[MAIN] = hits
+    assert pins.pin(kvm, "q3", groups, 0.0)
+    sched.build_connector_meta(SchedulerOutput.make_empty())
+    assert not vasync.parked and all(b.ref_cnt == 1 for b in blocks)
+    pins.release(kvm, "q3", "rel_finish")
+    sched.build_connector_meta(SchedulerOutput.make_empty())
+    assert not vasync.parked  # just freed: young
+    sched._victim_tap.step += sched._victim_min_age
+    sched.build_connector_meta(SchedulerOutput.make_empty())
+    assert {b.block_id for rec in vasync.parked.values() for b in rec.blocks} == {b.block_id for b in blocks}
+    late = _hits(pool, req3, MAIN, req3.num_tokens)
+    _check_targets(world, sched, late, 1, "an arrival pin")
+    assert late == []
+    held = rest + [b for rec in vasync.parked.values() for b in rec.blocks]
+    world.check_places(sched, pool, rest, 1)
+    _check_pins(world, 1)
+    _mark("ARRIVAL_PARKED", parked=len(held) - len(rest), violations=len(world.violations))
+    assert world.violations == [], world.violations[:5]
