@@ -74,7 +74,7 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
-from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -559,6 +559,14 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         # passes `layer` uniformly, which fixes that -- flagging separately as
         # it's a behavior change, not just a refactor.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            # Bucket padding rows would otherwise route like tokens and
+            # stream experts whose output is dropped.
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids,
+                topk_weights,
+                is_local_tensor=enable_pipelined_collective_and_compute(),
+            )
         kwargs = {
             "hidden_states": x,
             "w1": layer.w13_weight,

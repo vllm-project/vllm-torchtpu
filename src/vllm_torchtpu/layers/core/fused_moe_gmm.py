@@ -918,6 +918,10 @@ def fused_moe_func(
     if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
+        if skip_padded_tokens:
+            # A padded row's zero weights alone would still make the dense
+            # kernels stream its experts.
+            valid &= topk_weights != 0
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
