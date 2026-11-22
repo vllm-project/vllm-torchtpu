@@ -37,6 +37,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -214,8 +215,9 @@ class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """DFlashQwen3DecoderLayer.forward, with the post-attention norm run by
-        the MLP's op when `arm_fused_mlp` handed it over."""
+        """DFlashQwen3DecoderLayer.forward, with the post-attention norm (and
+        with pre_all_reduce the attention-exit all-reduce) run by the MLP's op
+        when `arm_fused_mlp` handed them over."""
         if residual is not None:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         else:
@@ -225,6 +227,10 @@ class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
         fused = self.mlp.forward_with_norm(hidden_states, residual)
         if fused is not None:
             return fused
+        if not self.self_attn.o_proj.reduce_results:
+            # The MLP took over this all-reduce (`arm_fused_mlp` pre_all_reduce)
+            # but not at this shape.
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         return self.mlp(hidden_states), residual
 

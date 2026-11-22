@@ -76,9 +76,10 @@ def _norm_fake(x, residual, *operands):
     return _fake(x), _fake(x)
 
 
-def _mlp_body(eps: float | None, n: int = 1, reduce=None):
+def _mlp_body(eps: float | None, n: int = 1, reduce=None, pre_ar: bool = False):
     """Per-device body of (x, [residual, norm_w,] *operands[, rank]): the
-    kernel at its rows, else XLA (plus `reduce` when n > 1)."""
+    kernel at its rows, else XLA (plus `reduce` when n > 1: of the output, or
+    with pre_ar of the input x)."""
 
     def body(x, *args):
         if eps is not None:
@@ -89,11 +90,15 @@ def _mlp_body(eps: float | None, n: int = 1, reduce=None):
         operands, rank = (args[:4], args[4]) if n > 1 else (args, None)
         m, h = x.shape
         if kernel.supported(m, h, operands[2].shape[0], n):
-            return kernel.fused_mlp(x, *operands, rank=rank, n=n, norm=norm)
+            return kernel.fused_mlp(
+                x, *operands, rank=rank, n=n, norm=norm, pre_ar=pre_ar
+            )
+        if pre_ar:
+            x = reduce(x, rank)
         out = kernel.reference(x, *operands, norm=norm)
         if norm is not None:
             out, new_residual = out
-        if n > 1:
+        if n > 1 and not pre_ar:
             out = reduce(out, rank)
         return (out, new_residual) if norm is not None else out
 
@@ -138,14 +143,15 @@ def _make_norm_op(eps: float):
     return op
 
 
-def _make_reducing_op(armed, eps: float | None = None):
+def _make_reducing_op(armed, eps: float | None = None, pre_ar: bool = False):
     """The MLP (with eps: and its norm prologue) plus the TP all-reduce over
-    the armed all-reduce's mesh, as a torch op of (x, [residual, norm_w,]
-    *operands, rank)."""
+    the armed all-reduce's mesh, of its output or (pre_ar, with eps) of its
+    input x, as a torch op of (x, [residual, norm_w,] *operands, rank)."""
     mesh = armed.mesh
     axis = mesh.axis_names[0]
     n = int(mesh.size)
-    body = _mlp_body(eps, n, pallas_all_reduce.reduce_body(n, armed.max_bytes, axis))
+    reduce = pallas_all_reduce.reduce_body(n, armed.max_bytes, axis)
+    body = _mlp_body(eps, n, reduce, pre_ar)
     nargs = 6 if eps is None else 8
     specs = (P(axis),) * nargs
     out_specs = P(axis) if eps is None else (P(axis), P(axis))
@@ -160,7 +166,9 @@ def _make_reducing_op(armed, eps: float | None = None):
 
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
-        "pallas::dspark_fused_mlp_all_reduce" + ("" if eps is None else "_norm"),
+        "pallas::dspark_fused_mlp_"
+        + ("pre_all_reduce" if pre_ar else "all_reduce")
+        + ("" if eps is None else "_norm"),
         (_reducing_signature if eps is None else _reducing_norm_signature)(put),
         mesh=mesh,
         input_partition_specs=specs,
@@ -176,12 +184,16 @@ class MiniMaxM3DSparkMLP(MiniMaxM3MLP):
     Armed with its layer's post-attention norm (buffer `_fused_norm_w`, and
     `_norm_op` set), `forward_with_norm` also does that norm's residual add.
     With the all-reduce folded in, `_reducing_op` / `_reducing_norm_op` take
-    a buffer `_mesh_rank` (this rank's mesh index) last.
+    a buffer `_mesh_rank` (this rank's mesh index) last. With
+    `_pre_reducing_norm_op`, `forward_with_norm` takes the attention output
+    before its TP all-reduce (o_proj's partial) and reduces it in the kernel,
+    under the weight stream.
     """
 
     _norm_op = None
     _reducing_op = None
     _reducing_norm_op = None
+    _pre_reducing_norm_op = None
 
     def _armed_for(self, x) -> bool:
         return (
@@ -221,6 +233,9 @@ class MiniMaxM3DSparkMLP(MiniMaxM3MLP):
         ):
             return None
         args = (x, residual, self._fused_norm_w, *self._operands())
+        if self._pre_reducing_norm_op is not None:
+            out, residual = self._pre_reducing_norm_op(*args, self._mesh_rank)
+            return self._reduce(out), residual
         if self._reducing_norm_op is not None:
             return self._reducing_norm_op(*args, self._mesh_rank)
         out, residual = self._norm_op(*args)
@@ -328,7 +343,7 @@ def _arm_norm(layers: list, mlps: list[MiniMaxM3DSparkMLP]) -> float | None:
     a GemmaRMSNorm or the eps differ."""
     norms = [layer.post_attention_layernorm for layer in layers]
     weights = [_norm_weight(norm) for norm in norms]
-    eps = {norm.variance_epsilon for norm in norms}
+    eps = {getattr(norm, "variance_epsilon", None) for norm in norms}
     if any(w is None for w in weights) or len(eps) != 1:
         return None
     (eps,) = eps
@@ -339,10 +354,74 @@ def _arm_norm(layers: list, mlps: list[MiniMaxM3DSparkMLP]) -> float | None:
     return eps
 
 
-def arm_fused_mlp(model: torch.nn.Module | None, fold_all_reduce: bool = False) -> int:
+def _pre_selftest(mlp: MiniMaxM3DSparkMLP, op, rank: torch.Tensor) -> bool:
+    """Whether the pre-reducing op gives this rank the bits of the armed
+    all-reduce followed by the local norm op. Collective, with a timeout."""
+    operands = mlp._operands()
+    hidden = operands[0].shape[0]
+    device = operands[0].device
+    mine = torch.Generator().manual_seed(1 + get_tp_group().rank_in_group)
+    shared = torch.Generator().manual_seed(0)  # the residual is replicated
+    ok = True
+    faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
+    try:
+        for n in _SELFTEST_ROWS:
+            x = torch.randn(n, hidden, generator=mine).to(torch.bfloat16).to(device)
+            res = torch.randn(n, hidden, generator=shared).to(torch.bfloat16)
+            args = (res.to(device), mlp._fused_norm_w, *operands)
+            want, want_res = mlp._norm_op(tensor_model_parallel_all_reduce(x), *args)
+            got, got_res = op(x, *args, rank)
+            ok &= bool(torch.equal(got.cpu(), want.cpu()))
+            ok &= bool(torch.equal(got_res.cpu(), want_res.cpu()))
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+    return ok
+
+
+def _arm_pre_all_reduce(layers: list, eps: float | None) -> bool:
+    """Hand each layer's attention-exit TP all-reduce to its MLP's op (o_proj
+    stops reducing; the op reduces under the weight stream); collective."""
+    tp = get_tp_group()
+    armed = pallas_all_reduce.armed_for(tp.ranks)
+    o_projs = [layer.self_attn.o_proj for layer in layers]
+    refusal = None
+    if eps is None:
+        refusal = "the MLPs do not carry their post-attention norm"
+    elif armed is None or armed.mesh is None or tp.world_size == 1:
+        refusal = "the Pallas all-reduce is not armed for the TP group"
+    elif not all(getattr(o, "reduce_results", False) for o in o_projs):
+        refusal = "an o_proj does not reduce its results"
+    if refusal:
+        logger.warning("DSpark draft: the attention all-reduce stays: %s.", refusal)
+        return False
+    op = _make_reducing_op(armed, eps, pre_ar=True)
+    mlps = [layer.mlp for layer in layers]
+    seen = [None] * tp.world_size
+    torch.distributed.all_gather_object(
+        seen, _pre_selftest(mlps[0], op, armed.rank), group=tp.cpu_group
+    )
+    if not all(seen):
+        logger.warning(
+            "DSpark draft: the attention all-reduce stays: self-test failed %s.",
+            seen,
+        )
+        return False
+    for mlp, o_proj in zip(mlps, o_projs):
+        mlp._pre_reducing_norm_op = op
+        mlp.register_buffer("_mesh_rank", armed.rank, persistent=False)
+        o_proj.reduce_results = False
+    return True
+
+
+def arm_fused_mlp(
+    model: torch.nn.Module | None,
+    fold_all_reduce: bool = False,
+    pre_all_reduce: bool = False,
+) -> int:
     """Arm every eligible draft MLP of `model` (with its decoder layer's
     post-attention norm when it is a GemmaRMSNorm); returns how many were
-    armed. With fold_all_reduce, collective over the TP group."""
+    armed. With fold_all_reduce (the MLP's own all-reduce) or pre_all_reduce
+    (the attention-exit one), collective over the TP group."""
     if model is None:
         return 0
     mlps = [m for m in model.modules() if isinstance(m, MiniMaxM3DSparkMLP)]
@@ -370,19 +449,21 @@ def arm_fused_mlp(model: torch.nn.Module | None, fold_all_reduce: bool = False) 
     if armed and len(armed_layers) == len(armed):
         eps = _arm_norm(armed_layers, [layer.mlp for layer in armed_layers])
     folded = bool(armed) and fold_all_reduce and _arm_all_reduce(armed, eps)
+    pre = bool(armed) and pre_all_reduce and _arm_pre_all_reduce(armed_layers, eps)
     # [i, h]: K-major.
     fits = bool(armed) and kernel.supported(
         kernel.MAX_ROWS,
         *armed[0].down_proj.weight.shape[::-1],
-        n=get_tp_group().world_size if folded else 1,
+        n=get_tp_group().world_size if folded or pre else 1,
     )
     logger.info(
-        "DSpark draft: %d of %d MLPs run as one op%s%s; its kernel serves up to "
+        "DSpark draft: %d of %d MLPs run as one op%s%s%s; its kernel serves up to "
         "%d rows (%s at this shape); %d norms read a cached (1 + w).",
         len(armed),
         len(mlps),
         " with the post-attention norm" if eps is not None else "",
         " with the TP all-reduce" if folded else "",
+        " with the attention all-reduce in front" if pre else "",
         kernel.MAX_ROWS,
         "supported" if fits else "NOT supported",
         len(cached),

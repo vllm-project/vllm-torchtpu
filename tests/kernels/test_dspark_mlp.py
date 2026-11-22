@@ -212,6 +212,48 @@ def _ar_worker():
         ),
         races=bool(interpret_pallas_call.races.races_found),
     )
+    # pre_ar: x is a partial summed in the kernel ahead of the norm and MLP;
+    # every rank gets the same reduced x and residual, its own weights.
+    for rows in (8, 21, 24):
+        partials = [ops[0][:rows] for ops in per_rank]
+        residual, nw, eps = _norm(rows, AR_H, seed=60 + rows)
+        x_sum = np.zeros((rows, AR_H), np.float32)
+        for p in partials:
+            x_sum = x_sum + np.asarray(p, np.float32)
+        x_red = jnp.asarray(x_sum, jnp.bfloat16)
+        local = [
+            kernel.fused_mlp(x_red, *ops[1:], interpret=True, norm=(residual, nw, eps))
+            for ops in per_rank
+        ]
+        run_pre = jax.jit(
+            jax.shard_map(
+                lambda x, res, w, *a: kernel.fused_mlp(
+                    x, *a[:4], rank=a[4], n=N_RANKS, norm=(res, w, 1e-6), pre_ar=True
+                ),
+                mesh=mesh,
+                in_specs=(P("d"),) * 8,
+                out_specs=(P("d"), P("d")),
+                check_vma=False,
+            )
+        )
+        pltpu.reset_tpu_interpret_mode_state()
+        out, res = run_pre(
+            jnp.concatenate(partials),
+            jnp.concatenate([residual] * N_RANKS),
+            jnp.concatenate([nw] * N_RANKS),
+            *weights,
+            ranks,
+        )
+        out = np.asarray(out, np.float32).reshape(N_RANKS, rows, AR_H)
+        res = np.asarray(res, np.float32).reshape(N_RANKS, rows, AR_H)
+        result[f"pre{rows}"] = dict(
+            exact=all(
+                np.array_equal(out[r], np.asarray(local[r][0], np.float32))
+                and np.array_equal(res[r], np.asarray(local[r][1], np.float32))
+                for r in range(N_RANKS)
+            ),
+            races=bool(interpret_pallas_call.races.races_found),
+        )
     print("RESULT " + json.dumps(result))
 
 
@@ -231,7 +273,7 @@ def on_8_devices():
     return json.loads(lines[-1][len("RESULT ") :])
 
 
-@pytest.mark.parametrize("rows", [*AR_ROWS, "norm"])
+@pytest.mark.parametrize("rows", [*AR_ROWS, "norm", "pre8", "pre21", "pre24"])
 def test_all_reduce_epilogue_on_8_devices(on_8_devices, rows):
     case = on_8_devices[str(rows)]
     assert case["exact"] and not case["races"], case

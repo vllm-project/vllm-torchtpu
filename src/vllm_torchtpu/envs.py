@@ -1202,8 +1202,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # call at decode rows (kernels/dspark_mlp.py; XLA above its row cap).
     # "ar" also folds the TP all-reduce after it into that call (needs the
     # Pallas all-reduce armed, TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES > 0).
+    # "pre_ar" instead hands the attention-exit TP all-reduce to the kernel,
+    # ahead of its norm prologue and under its weight stream.
     "TPU_DSPARK_FUSED_MLP": env_with_choices(
-        "TPU_DSPARK_FUSED_MLP", "0", ["0", "1", "ar"]
+        "TPU_DSPARK_FUSED_MLP", "0", ["0", "1", "ar", "pre_ar"]
     ),
     # A DCP-sharded draft attention layer whose KV head spans two ranks
     # merges the two partials in one Pallas exchange

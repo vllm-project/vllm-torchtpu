@@ -79,7 +79,7 @@ def _project(acc, scale):
     return y.astype(BF16).astype(F32)
 
 
-def _kernel(meta_ref, *refs, gu_chunks, d_chunks, spec, eps):
+def _kernel(meta_ref, *refs, gu_chunks, d_chunks, spec, eps, pre_ar):
     """meta_ref: SMEM int32 [1, 1], this device's mesh index (all-reduce).
 
     refs, with ``eps`` (the residual add + RMSNorm prologue) the bracketed:
@@ -92,6 +92,10 @@ def _kernel(meta_ref, *refs, gu_chunks, d_chunks, spec, eps):
                      act [mp, i] bf16, out_acc [mp, h] f32; DMA semaphores;
                      [residual, norm weight copies]; with an all-reduce
                      [mp, h] bf16 then ar.scratch_shapes.
+
+    With ``pre_ar`` the all-reduce is of the input x (before the norm
+    prologue) instead of the output, and both weight rings are filled ahead
+    of it, so the weight stream runs under the all-reduce rounds.
     """
     norm = eps is not None
     k = 7 if norm else 5
@@ -132,16 +136,40 @@ def _kernel(meta_ref, *refs, gu_chunks, d_chunks, spec, eps):
         for src, ring, chunks in ((wgu_hbm, wgu_v, gu_chunks), (wd_hbm, wd_v, d_chunks))
         for n, (k, c) in enumerate(chunks)
     ]
-    for copy in copies[:_IN_FLIGHT]:
-        copy.start()
+    # Which copy starts once copy j has landed: its slot's last tenant (one
+    # window back, so contracted in the previous step) is done. One window
+    # over both weights, or (pre_ar) one per ring, both filled up front.
+    g = len(gu_chunks)
+    if pre_ar:
+        first = [
+            *range(min(_IN_FLIGHT, g)),
+            *range(g, g + min(_IN_FLIGHT, len(d_chunks))),
+        ]
+        follow = {
+            j: j + _IN_FLIGHT
+            for lo, hi in ((0, g), (g, len(copies)))
+            for j in range(lo, hi)
+            if j + _IN_FLIGHT < hi
+        }
+    else:
+        first = range(min(_IN_FLIGHT, len(copies)))
+        follow = {j: j + _IN_FLIGHT for j in range(len(copies) - _IN_FLIGHT)}
+    for j in first:
+        copies[j].start()
 
     def landed(j):
         copies[j].wait()
-        if j + _IN_FLIGHT < len(copies):
-            copies[j + _IN_FLIGHT].start()
+        if j in follow:
+            copies[follow[j]].start()
 
     x_copy.wait()
     x = x_ref[...].astype(F32)
+    if pre_ar:
+        reduced, *scr = ar_scratch
+        if mp != m:
+            x = jnp.concatenate([x, jnp.zeros((mp - m, h), F32)], 0)
+        ar.epilogue(spec, meta_ref[0, 0], m, x, reduced, scr)
+        x = reduced[:m, :].astype(F32)
     if norm:
         # fused_add_rms_norm (layers/adapter/ir_ops.py): the bf16 sum is the
         # new residual and what is normalized, in f32, times (1 + w).
@@ -172,7 +200,7 @@ def _kernel(meta_ref, *refs, gu_chunks, d_chunks, spec, eps):
             act_ref[:, k : k + c], wd_v[n % _SLOTS, :c, :], preferred_element_type=F32
         )
     sd_copy.wait()
-    if spec is None:
+    if spec is None or pre_ar:
         o_ref[...] = _project(out_acc[:m, :], sd_ref[...]).astype(o_ref.dtype)
     else:
         reduced, *scr = ar_scratch
@@ -231,6 +259,7 @@ def fused_mlp(
     n: int = 1,
     interpret: bool = False,
     norm: tuple[jax.Array, jax.Array, float] | None = None,
+    pre_ar: bool = False,
 ):
     """``down(swiglu_oai(x @ w_gu * s_gu)) * s_d`` of bf16 ``x [m, h]`` (at
     most MAX_ROWS rows) on e4m3 ``w_gu [h, 2i]`` ([gate | up])
@@ -243,7 +272,13 @@ def fused_mlp(
     With ``norm = (residual [m, h] bf16, weight [1, h] f32, eps)`` the MLP's
     input is GemmaRMSNorm's fused add: ``r = bf16(x + residual)``, normalized
     with ``weight`` (1 + w); returns ``(out, r)``.
+
+    With ``pre_ar`` (and n > 1 and norm) the n ranks' x are summed first (x
+    is a partial, e.g. o_proj's before its all-reduce) and the output is not
+    reduced: the input all-reduce runs under the weight stream.
     """
+    if pre_ar and (n < 2 or norm is None):
+        raise ValueError("fused_mlp: pre_ar needs n > 1 and norm")
     m, h = x.shape
     i = w_d.shape[0]
     if not supported(m, h, i, n):
@@ -256,7 +291,7 @@ def fused_mlp(
 
         if norm is not None:
             norm = (pad(norm[0]), *norm[1:])
-        out = fused_mlp(pad(x), w_gu, s_gu, w_d, s_d, rank, n, interpret, norm)
+        out = fused_mlp(pad(x), w_gu, s_gu, w_d, s_d, rank, n, interpret, norm, pre_ar)
         return tuple(o[:m] for o in out) if norm is not None else out[:m]
     info = pltpu.get_tpu_info()
     mp = m + (-m % _ROW_ALIGN)
@@ -281,7 +316,12 @@ def fused_mlp(
         params["collective_id"] = ar.COLLECTIVE_ID
     return pl.pallas_call(
         functools.partial(
-            _kernel, gu_chunks=gu_chunks, d_chunks=d_chunks, spec=spec, eps=eps
+            _kernel,
+            gu_chunks=gu_chunks,
+            d_chunks=d_chunks,
+            spec=spec,
+            eps=eps,
+            pre_ar=pre_ar,
         ),
         out_shape=(out_shape, out_shape) if norm is not None else out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -309,7 +349,7 @@ def fused_mlp(
         compiler_params=pltpu.CompilerParams(**params),
         name=f"dspark_mlp-m_{mp}-h_{h}-i_{i}"
         + ("-norm" if norm is not None else "")
-        + (f"-ar_{n}" if n > 1 else ""),
+        + (f"-{'pre_' if pre_ar else ''}ar_{n}" if n > 1 else ""),
         interpret=interpret,
     )(rank.reshape(1, 1).astype(jnp.int32), *operands)
 

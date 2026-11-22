@@ -6258,6 +6258,7 @@ class TPUModelRunner(GPUModelRunner):
             arm_fused_mlp(
                 self._async_drafter.draft_model,
                 fold_all_reduce=envs.TPU_DSPARK_FUSED_MLP == "ar",
+                pre_all_reduce=envs.TPU_DSPARK_FUSED_MLP == "pre_ar",
             )
 
     def load_lora_model(

@@ -258,3 +258,60 @@ def test_cached_norm_matches_the_uncached_one():
     got, got_res = norm.forward_native(x, r)
     assert torch.equal(got, want) and torch.equal(got_res, want_res)
     assert torch.equal(norm.forward_native(x), want_plain)
+
+
+def test_pre_all_reduce_hands_the_attention_reduction_to_the_op(monkeypatch):
+    monkeypatch.setattr(
+        bridge,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            ranks=list(range(8)), world_size=8, cpu_group=None, rank_in_group=0
+        ),
+    )
+    armed = SimpleNamespace(rank=torch.tensor([[3]], dtype=torch.int32), mesh=object())
+    monkeypatch.setattr(bridge.pallas_all_reduce, "armed_for", lambda ranks: armed)
+    monkeypatch.setattr(bridge, "_make_norm_op", lambda eps: "local")
+    made = []
+
+    def make(a, eps=None, pre_ar=False):
+        made.append((eps, pre_ar))
+        return lambda x, residual, norm_w, *o: (x + 1, x + residual)
+
+    monkeypatch.setattr(bridge, "_make_reducing_op", make)
+    monkeypatch.setattr(bridge, "_pre_selftest", lambda mlp, op, rank: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda seen, obj, group: seen.__setitem__(slice(None), [obj] * len(seen)),
+    )
+    reduced = []
+    monkeypatch.setattr(bridge, "get_tensor_model_parallel_world_size", lambda: 8)
+    monkeypatch.setattr(
+        bridge, "tensor_model_parallel_all_reduce", lambda t: reduced.append(t) or t
+    )
+    mlp = _mlp()
+    layer = _layer(mlp, _gemma_norm(1e-6))
+    layer.self_attn = nn.Module()
+    layer.self_attn.o_proj = SimpleNamespace(reduce_results=True)
+    assert bridge.arm_fused_mlp(nn.ModuleList([layer]), pre_all_reduce=True) == 1
+    assert made == [(1e-6, True)]
+    assert layer.self_attn.o_proj.reduce_results is False
+    x = torch.ones(8, H, dtype=torch.bfloat16)
+    out, residual = mlp.forward_with_norm(x, x)
+    assert torch.equal(out, x + 1) and torch.equal(residual, x * 2)
+    assert len(reduced) == 1  # only the MLP's own output all-reduce
+
+
+def test_pre_all_reduce_needs_the_norm(monkeypatch):
+    monkeypatch.setattr(
+        bridge,
+        "get_tp_group",
+        lambda: SimpleNamespace(ranks=list(range(8)), world_size=8, cpu_group=None),
+    )
+    mlp = _mlp()
+    layer = _layer(mlp, nn.LayerNorm(H))  # not a GemmaRMSNorm: no norm prologue
+    layer.self_attn = nn.Module()
+    layer.self_attn.o_proj = SimpleNamespace(reduce_results=True)
+    assert bridge.arm_fused_mlp(nn.ModuleList([layer]), pre_all_reduce=True) == 1
+    assert layer.self_attn.o_proj.reduce_results is True
+    assert mlp._pre_reducing_norm_op is None
