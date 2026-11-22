@@ -674,14 +674,19 @@ def test_num_reqs_padding_matches_the_stock_padding(monkeypatch):
         )
 
 
-def test_write_programs_trace_as_one_graph(monkeypatch):
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+def test_write_programs_trace_as_one_graph(monkeypatch, backend):
     """No graph break in the write programs (backend-independent), and the
-    traced programs write what the eager ones do."""
+    traced programs write what the eager ones do. Under aot_eager, AOT
+    autograd functionalizes their in-place `index_put_` updates, as it does
+    the head's; the slots still end as the eager programs leave them."""
     runner, _, slots, _ = _decoding(monkeypatch)
     a, null = slots.slot_of("a"), slots.config.null_slot
+    # Each backend traces the programs afresh.
+    torch._dynamo.reset()
 
     def compiled(fn):
-        return torch.compile(fn, backend="eager", fullgraph=True, dynamic=False)
+        return torch.compile(fn, backend=backend, fullgraph=True, dynamic=False)
 
     scalar_rows = np.tile(slots._scalars[null], (8, 1))
     scalar_rows[0] = slots._scalars[a]
