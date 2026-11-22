@@ -77,6 +77,7 @@ def _kernel(
     tiles_per_step: int = 1,
     groups_per_tile: int = 1,
     transposed: bool = False,
+    packed_table: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -177,7 +178,12 @@ def _kernel(
             base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
 
             def start(g, queue=0):
-                page = page_table_ref[work_page_ref[base + g]]
+                key = work_page_ref[base + g]
+                page = (
+                    msa_attention.table16_entry(page_table_ref, key)
+                    if packed_table
+                    else page_table_ref[key]
+                )
                 for copy in page_copies(half, g, page):
                     copy.start(priority=queue)
 
@@ -560,6 +566,12 @@ def _attention_call(
 
     aliased = out is not None
     in_place = (pl.BlockSpec(memory_space=pl.ANY),) * 2 if aliased else ()
+    # Decode-sized calls take the page table as 16-bit ids (`pack_table16`).
+    packed_table = None
+    if block_q == msa_attention.SMALL_BATCH_BLOCK_Q:
+        packed_table = msa_attention.pack_table16(page_table, kv_cache.shape[0])
+    if packed_table is not None:
+        page_table = packed_table
     fp4 = scale_rows is not None
     transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
     scale_inputs = (scale_cache,) if fp4 else ()
@@ -637,6 +649,7 @@ def _attention_call(
             tiles_per_step=tiles_per_step,
             groups_per_tile=groups_per_tile,
             transposed=transposed,
+            packed_table=packed_table is not None,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,

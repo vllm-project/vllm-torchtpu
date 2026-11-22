@@ -38,7 +38,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4, msa_write
+from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4, msa_write
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
     check_page_dtype,
     unpack_page,
@@ -364,6 +364,7 @@ def _kernel_v3(
     store=None,
     prologue=None,
     on_pages=None,
+    packed_table=False,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -386,7 +387,7 @@ def _kernel_v3(
     `prologue()` runs at the first step once its page copies are issued, and
     `on_pages(slot, base)` once a step's pages are in ring slot `slot`
     (``base``: the block-table entry of its first page), before they are
-    scored.
+    scored. A `packed_table` block table is `msa_attention.pack_table16`'s.
     """
     slots, pages_per_step, rows, head_dim = buf.shape
     ahead = slots - 1
@@ -395,6 +396,10 @@ def _kernel_v3(
     page_size = _page_tokens(rows, cache_ref.dtype)
     chunk = _v3_chunk(pages_per_step, block_q, page_size)
     pages_per_seq = block_tables_ref.shape[0] // seq_pages_ref.shape[0]
+    table_entry = block_tables_ref.__getitem__
+    if packed_table:
+        pages_per_seq *= 2
+        table_entry = functools.partial(msa_attention.table16_entry, block_tables_ref)
     step, num_steps = pl.program_id(0), pl.num_programs(0)
     # The pages as 32-bit words: a dense VMEM layout, so each key vreg is one
     # load (a packed [S / p, p, D] page tiles VMEM in (p, D) tiles).
@@ -413,11 +418,15 @@ def _kernel_v3(
             # Keep the last group's block-table reads in its request's row.
             first = base % pages_per_seq
             col = jnp.minimum(first + g, pages_per_seq - 1) - first
-        return pltpu.make_async_copy(
-            words.at[block_tables_ref[base + col]],
-            buf.at[slot, g],
-            sems.at[slot],
-        )
+            page = table_entry(base + col)
+        elif packed_table and pages_per_step % 2 == 0:
+            # `base` is even: entry g's 16-bit half is static, and pages g and
+            # g + 1 read one word (a dynamic half cost ~4 scalar ops per page).
+            word = block_tables_ref[(base >> 1) + g // 2]
+            page = (word >> 16) & 0xFFFF if g % 2 else word & 0xFFFF
+        else:
+            page = table_entry(base + col)
+        return pltpu.make_async_copy(words.at[page], buf.at[slot, g], sems.at[slot])
 
     def wait_pages(live, slot):
         """Wait for the slot's `live` page copies: the slot's semaphore counts
@@ -645,6 +654,7 @@ def _kernel_v3_select(
     *refs,
     select: RowSelect,
     writes: msa_write.RunWrites | None = None,
+    packed_table: bool = False,
 ):
     """`_kernel_v3` with token-major scores kept in VMEM, by page group and
     token row, then reduced by `select` at the last step: a separate kernel
@@ -740,6 +750,7 @@ def _kernel_v3_select(
         store=store,
         prologue=prologue,
         on_pages=on_pages,
+        packed_table=packed_table,
     )
 
     def pick(width):
@@ -1075,6 +1086,10 @@ def _select_call(
     pos, arg = select_inputs
     num_tokens = pos.shape[0]
     select_meta = _select_meta(cu_q_lens, arg, live_pages, writes)
+    work, tile_info, block_tables, seq_pages = prefetch
+    packed = msa_attention.pack_table16(block_tables, index_cache.shape[0])
+    if packed is not None:
+        prefetch = (work, tile_info, packed, seq_pages)
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
     scratch = [
         pltpu.VMEM(ring, jnp.uint32),
@@ -1102,6 +1117,7 @@ def _select_call(
             _kernel_v3_select,
             select=select,
             writes=None if writes is None else writes.layout_only(),
+            packed_table=packed is not None,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(prefetch) + 1,

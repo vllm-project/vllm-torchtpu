@@ -84,6 +84,25 @@ _MASK_VALUE = -1e30
 _NO_PAGE = jnp.iinfo(jnp.int32).max
 
 
+def pack_table16(table: jax.Array, num_pages: int) -> jax.Array | None:
+    """A page table of ids below `num_pages` as two 16-bit ids per int32 word
+    (`table16_entry`), or None if an id needs more bits. A kernel copies its
+    scalar-prefetch operands into SMEM before it starts, ~17 ns per KiB: the
+    served 16 x 1,024-entry table cost ~1.1 us per call (bench j-51de9fb9:
+    -0.55 us per call at half the entries)."""
+    if num_pages > 1 << 16:
+        return None
+    table = table.astype(jnp.int32)
+    if table.shape[0] % 2:
+        table = jnp.pad(table, (0, 1))
+    return (table[0::2] & 0xFFFF) | (table[1::2] << 16)
+
+
+def table16_entry(ref, i):
+    """Entry `i` of a `pack_table16` table in SMEM."""
+    return (ref[i >> 1] >> ((i & 1) * 16)) & 0xFFFF
+
+
 def _groups_per_tile(block_q: int, topk: int, pages_per_step: int) -> int:
     """Union rows of `pages_per_step` pages per tile: a power of two, so a
     meta word's row gives its tile by a shift (`_meta_tile`). Other shapes
