@@ -742,6 +742,36 @@ def test_fused_kv_update_and_inputs(monkeypatch):
     assert proposer._update_kv_and_build_inputs([chunk], [next_tokens]) is None
 
 
+@pytest.mark.parametrize("builder", ["next_tokens", "seed"])
+def test_warming_compiles_input_builders_at_every_token_bucket(monkeypatch, builder):
+    """The input builders are keyed on the step's token bucket: leaving
+    `warming` replays each argument set they met at every larger bucket, so
+    a mixed step at a prefill bucket finds its program compiled."""
+    monkeypatch.setattr(dflash_module.envs, "TPU_DFLASH_FUSED_KV_INPUTS", False)
+    monkeypatch.setattr(dflash_module.envs, "TPU_DFLASH_WARM_INPUT_BUCKETS", True)
+    proposer, chunk, next_tokens = _fused_kv_inputs_proposer()
+    calls = []
+    setattr(
+        proposer,
+        f"_tpu_build_dflash_inputs_{builder}",
+        lambda *args: calls.append(args),
+    )
+    if builder == "seed":
+        inputs = {"device_seed": next_tokens[:, 0].contiguous()}
+    else:
+        inputs = {"next_tokens_device": next_tokens}
+    with proposer.warming():
+        proposer._prepare_dflash_inputs(chunk, **inputs)
+        proposer._prepare_dflash_inputs(chunk, **inputs)
+    assert [c[2].shape[0] for c in calls] == [8, 8, 16, 32]
+    warmed = {spec_decode_utils.program_key(c) for c in calls}
+    for num_tokens in (16, 32):
+        chunk.position_ids = torch.arange(num_tokens, dtype=torch.int32)
+        calls.clear()
+        proposer._prepare_dflash_inputs(chunk, **inputs)
+        assert spec_decode_utils.program_key(calls[0]) in warmed
+
+
 def test_missing_target_layer_ids():
     with pytest.raises(ValueError, match="target layer ids"):
         _make_proposer(target_layer_ids=[])

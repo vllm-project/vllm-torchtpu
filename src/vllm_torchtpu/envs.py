@@ -162,6 +162,7 @@ if TYPE_CHECKING:
     TPU_SPEC_SYNTHETIC_ROW_SPLIT: bool = True
     TPU_SPEC_SYNTHETIC_ROW_SPLIT_MIN_ROWS: int = 1
     TPU_DFLASH_FUSED_KV_INPUTS: bool = False
+    TPU_DFLASH_WARM_INPUT_BUCKETS: bool = False
     TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS: bool = False
     TPU_SPEC_SYNTHETIC_FUSED_VERIFY: bool = False
     TPU_SPEC_SYNTHETIC_KEYED_UNIFORMS: bool = False
@@ -1222,6 +1223,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # two, at the inputs the real spec-decode warmup compiled it for. Same
     # cache writes and draft inputs.
     "TPU_DFLASH_FUSED_KV_INPUTS": env_bool("TPU_DFLASH_FUSED_KV_INPUTS", default=False),
+    # DFlash/DSpark: after the spec-decode warmup, compile the draft input
+    # builders at every token bucket for each argument set the warmup met, so a
+    # verify + prefill step at a prefill bucket does not compile mid-serving.
+    # One small program per (argument set, bucket) at startup.
+    "TPU_DFLASH_WARM_INPUT_BUCKETS": env_bool(
+        "TPU_DFLASH_WARM_INPUT_BUCKETS", default=False
+    ),
     # Async spec decode: run the async token substitution and the extraction
     # of the drafts to verify as one compiled program
     # (`_substitute_and_extract_drafts`) instead of two, at the arguments the

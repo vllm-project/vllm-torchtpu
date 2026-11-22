@@ -188,6 +188,9 @@ class DFlashProposer:
         # while `_warming` (the runner's real spec-decode warmup).
         self._fused_kv_inputs_keys: set[tuple] = set()
         self._warming_fused_kv_inputs = False
+        # `program_key` -> (builder, arguments) of each compiled input-builder
+        # call met while warming; `warming` replays them at every token bucket.
+        self._input_builder_warm_args: dict[tuple, tuple] = {}
 
     @property
     def block_size(self) -> int:
@@ -544,8 +547,9 @@ class DFlashProposer:
         The base token is the last verified token from the target model.
         """
         if next_tokens_device is not None:
-            return self._tpu_build_dflash_inputs_next_tokens(
-                *self._next_tokens_input_args(chunk, next_tokens_device)
+            return self._run_input_builder(
+                "_tpu_build_dflash_inputs_next_tokens",
+                self._next_tokens_input_args(chunk, next_tokens_device),
             )
         if device_seed is None:
             raise RuntimeError(
@@ -555,14 +559,17 @@ class DFlashProposer:
         padded_len, query_start_loc_device, position_ids_device = (
             self._draft_input_layout(chunk)
         )
-        return self._tpu_build_dflash_inputs_seed(
-            device_seed,
-            query_start_loc_device,
-            position_ids_device,
-            self._chunk_num_reqs_device(chunk),
-            self.block_size,
-            padded_len,
-            self.mask_token_id,
+        return self._run_input_builder(
+            "_tpu_build_dflash_inputs_seed",
+            (
+                device_seed,
+                query_start_loc_device,
+                position_ids_device,
+                self._chunk_num_reqs_device(chunk),
+                self.block_size,
+                padded_len,
+                self.mask_token_id,
+            ),
         )
 
     def _next_tokens_input_args(
@@ -736,7 +743,7 @@ class DFlashProposer:
             self._fused_kv_inputs_keys.add(key)
             # Also compile the unfused builder, which a shape the warmup
             # did not meet falls back to (the KV update has its precompile).
-            self._tpu_build_dflash_inputs_next_tokens(*input_args)
+            self._run_input_builder("_tpu_build_dflash_inputs_next_tokens", input_args)
         fused = key in self._fused_kv_inputs_keys
         if not fused:
             logger.info_once(
@@ -753,7 +760,48 @@ class DFlashProposer:
             if fused:
                 return self._tpu_update_kv_and_build_inputs(kv_args, input_args)
             self._tpu_precompute_and_update_kv_cache(*kv_args)
-        return self._tpu_build_dflash_inputs_next_tokens(*input_args)
+        return self._run_input_builder(
+            "_tpu_build_dflash_inputs_next_tokens", input_args
+        )
+
+    def _run_input_builder(
+        self, name: str, args: tuple
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The compiled input builder `name` on `args` (its `position_ids`
+        third), recording the call while warming (see
+        `_warm_input_builder_token_buckets`)."""
+        if self._warming_fused_kv_inputs:
+            self._input_builder_warm_args.setdefault(
+                (name, program_key(args)), (name, args)
+            )
+        return getattr(self, name)(*args)
+
+    def _warm_input_builder_token_buckets(self) -> None:
+        """Compile the input builders at every target token bucket for each
+        argument set the warmup met.
+
+        The builders are keyed on the step's token bucket through
+        `position_ids`, but the warmup reaches the prefill buckets only with
+        one request; a verify + prefill step, or several prompts, at a larger
+        bucket would otherwise compile one mid-serving."""
+        seen = set(self._input_builder_warm_args)
+        compiled = 0
+        for name, args in list(self._input_builder_warm_args.values()):
+            positions = args[2]
+            for num_tokens in self.runner.num_tokens_paddings:
+                if num_tokens <= positions.shape[0]:
+                    continue
+                padded = (args[0], args[1], positions.new_zeros(num_tokens), *args[3:])
+                key = (name, program_key(padded))
+                if key in seen:
+                    continue
+                seen.add(key)
+                getattr(self, name)(*padded)
+                compiled += 1
+        logger.info(
+            "Warmed the DFlash input builders at %d more token-bucket argument sets",
+            compiled,
+        )
 
     @contextlib.contextmanager
     def warming(self):
@@ -765,6 +813,8 @@ class DFlashProposer:
             yield
         finally:
             self._warming_fused_kv_inputs = False
+        if envs.TPU_DFLASH_WARM_INPUT_BUCKETS:
+            self._warm_input_builder_token_buckets()
 
     def _update_context_kv(self, chunks: list[DraftChunkInputs]) -> int:
         """Update all context chunks before any draft forward (DP lockstep)."""
