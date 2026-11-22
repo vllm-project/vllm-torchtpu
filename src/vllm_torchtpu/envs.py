@@ -220,7 +220,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DP_PROMPT_BACKLOG_MARGIN: float = 1.0
     VLLM_TPU_DP_PREFIX_AFFINITY: bool = False
     VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS: int = 4096
-    VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN: int = 2
+    VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN: int = 8
     VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE: int = 65536
 
 
@@ -1396,7 +1396,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Data-parallel front end: send a request to the least loaded engine that
     # took its longest remembered prompt prefix (core/dp_prefix_affinity.py),
     # so that engine's prefix cache serves it, unless that engine is more than
-    # LOAD_MARGIN requests busier than the least loaded one.
+    # LOAD_MARGIN requests busier than the least loaded one. Leaving the holder
+    # recomputes the whole conversation on another engine, while a few more
+    # requests in flight cost the holder little, so the default (8) tolerates
+    # several requests of imbalance before it gives up the prefix cache.
     "VLLM_TPU_DP_PREFIX_AFFINITY": env_bool(
         "VLLM_TPU_DP_PREFIX_AFFINITY", default=False
     ),
@@ -1404,7 +1407,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS", 4096
     ),
     "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN": env_int(
-        "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN", 2
+        "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN", 8
     ),
     "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE": env_int(
         "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE", 65536
