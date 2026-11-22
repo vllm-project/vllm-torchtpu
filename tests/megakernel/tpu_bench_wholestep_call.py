@@ -112,6 +112,11 @@ def main():
     ap.add_argument("--rand-pool", action="store_true",
                     help="random FP8 in the whole pool (made before the weights, so its program "
                     "loads into unfragmented HBM): distinct keys and KV, as a prefilled server")
+    ap.add_argument("--same-ranks", action="store_true",
+                    help="every rank gets the same weight shard and (with --rand-pool) the same "
+                         "pool, so ranks sharing a KV head hold identical K / V (numerics arms)")
+    ap.add_argument("--save-res", default="",
+                    help="directory: save the first call's residual output per bucket (b<B>.npy)")
     ap.add_argument("--fill-keys", action="store_true",
                     help="random FP8 in the requests' compressed-key and main-KV blocks (else "
                     "zeros: equal scores, attention of zeros), so a hash sees the selection")
@@ -199,7 +204,8 @@ def main():
         if a.rand_pool and not (a.trace_only or a.aot):
 
             def rand_pool(nb=NB, per=per, kb=kb):
-                k = jax.random.fold_in(jax.random.PRNGKey(5), jax.lax.axis_index("tp"))
+                rank = 0 if a.same_ranks else jax.lax.axis_index("tp")
+                k = jax.random.fold_in(jax.random.PRNGKey(5), rank)
                 v = jax.random.normal(k, (nb * per, kb, 1, 4, 256), jnp.bfloat16) * 0.5
                 return v.astype(jnp.float8_e4m3fn)
 
@@ -260,6 +266,12 @@ def main():
                 return jax.ShapeDtypeStruct(shape, dtype, sharding=tp)
             key, k = jax.random.split(key)
             if jnp.issubdtype(dtype, jnp.floating):
+                if a.same_ranks:  # one rank's shard, repeated on every rank
+                    one = jax.random.normal(k, (shape[0] // R,) + tuple(shape[1:]), jnp.float32)
+                    return jax.device_put(
+                        jnp.tile((one * a.wstd).astype(dtype), (R,) + (1,) * (len(shape) - 1)),
+                        tp,
+                    )
                 return jax.device_put(
                     (jax.random.normal(k, shape, jnp.float32) * a.wstd).astype(dtype),
                     tp,
@@ -400,6 +412,11 @@ def main():
         t0 = time.time()
         res, pool = f(*args)
         jax.block_until_ready(res)
+        if a.save_res:
+            import os
+
+            os.makedirs(a.save_res, exist_ok=True)
+            np.save(f"{a.save_res}/b{B}.npy", np.asarray(res.astype(jnp.float32)))
         if a.hash:
             import hashlib
 
