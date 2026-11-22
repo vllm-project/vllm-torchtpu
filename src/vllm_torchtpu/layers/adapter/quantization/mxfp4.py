@@ -504,6 +504,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             # below then hands the kernel one bias row per token.
             row_score_bias=getattr(layer, "bias_vl", None) is not None,
             shared_limit=self._shared_limit(layer),
+            shared_output_scale=self._shared_output_scale(layer),
         )
         if self.fused_ep and op is None:
             raise ValueError(
@@ -529,6 +530,19 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         if limit is None:
             raise ValueError("MOE_FUSED_EP_PUSH_SHARED_EXPERT needs a swiglu limit")
         return float(limit)
+
+    @classmethod
+    def _shared_output_scale(cls, layer) -> float | None:
+        """The routed scale the layer's MoE runner applies before adding the
+        shared expert, when the op does both (MOE_FUSED_EP_PUSH_SHARED_ADD):
+        the runner records it on the layer (FUSED_MOE_EP_RUNNER_SCALE_ATTR)."""
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            FUSED_MOE_EP_RUNNER_SCALE_ATTR,
+        )
+
+        if cls._shared_limit(layer) is None or not envs.MOE_FUSED_EP_PUSH_SHARED_ADD:
+            return None
+        return getattr(layer, FUSED_MOE_EP_RUNNER_SCALE_ATTR, None)
 
     def _resolve_tpu_activation(self, layer) -> str:
         # This variant runs the clamped kernel, so the string is not
@@ -716,6 +730,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             FUSED_MOE_EP_OP_ATTR,
             FUSED_MOE_EP_SHARED_LIMIT_ATTR,
+            FUSED_MOE_EP_SHARED_SCALE_ATTR,
             fused_moe_ep_unsupported_reason,
             register_score_bias_buffer,
         )
@@ -792,6 +807,11 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             self,
             FUSED_MOE_EP_SHARED_LIMIT_ATTR,
             None if op is None else self._shared_limit(layer),
+        )
+        setattr(
+            self,
+            FUSED_MOE_EP_SHARED_SCALE_ATTR,
+            None if op is None else self._shared_output_scale(layer),
         )
         expert_placement.check_layer_served(layer, fused_armed=op is not None)
         if op is not None:
@@ -899,6 +919,16 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
         return getattr(self, FUSED_MOE_EP_SHARED_LIMIT_ATTR, None)
 
+    @property
+    def shared_expert_output_scale(self) -> float | None:
+        """The routed scale this layer's op applies before adding the shared
+        expert -- the op then returns that sum alone -- or None."""
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            FUSED_MOE_EP_SHARED_SCALE_ATTR,
+        )
+
+        return getattr(self, FUSED_MOE_EP_SHARED_SCALE_ATTR, None)
+
     def forward_monolithic_with_shared_expert(
         self,
         layer: RoutedExperts,
@@ -906,9 +936,10 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None,
         shared_expert: tuple[torch.Tensor, ...],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
         """(routed, shared) from the one op: `_forward_monolithic_tpu`'s
-        routed experts, plus the shared expert (w13, s13, w2, s2) on `x`."""
+        routed experts, plus the shared expert (w13, s13, w2, s2) on `x`; or,
+        with `shared_expert_output_scale`, shared + routed * that scale."""
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
             hash_topk_ids_operand,

@@ -1559,6 +1559,56 @@ def test_runner_refuses_a_shared_expert_the_op_was_not_built_for():
         )
 
 
+def test_runner_skips_the_scale_and_add_the_fused_op_did():
+    runner, _ = _runner_with_shared(10.0)
+    runner.routed_experts.quant_method.shared_expert_output_scale = 1.5
+    runner.routed_experts.quant_method.forward_monolithic_with_shared_expert = (
+        lambda *a: "sum"
+    )
+    runner.routed_scaling_factor = 1.5
+    runner.routed_output_transform = None
+    hidden = torch.zeros(2, 4, dtype=torch.bfloat16)
+    out = VllmMoERunner._apply_quant_method(runner, hidden, torch.zeros(2, 3), hidden)
+    assert out == (None, "sum")
+    fused = torch.ones(2, 4)
+    shared, scaled = VllmMoERunner._maybe_apply_routed_scale_to_output(
+        runner, None, fused
+    )
+    assert shared is None and scaled is fused and torch.equal(fused, torch.ones(2, 4))
+    assert VllmMoERunner._maybe_combine(runner, None, "sum") == "sum"
+    runner.routed_scaling_factor = 2.5
+    with pytest.raises(ValueError, match="scaling by 1.5"):
+        VllmMoERunner._apply_quant_method(runner, hidden, torch.zeros(2, 3), hidden)
+    runner.routed_scaling_factor = 1.5
+    fp32 = torch.zeros(2, 4)
+    with pytest.raises(ValueError, match="in torch.float32"):
+        VllmMoERunner._apply_quant_method(runner, fp32, torch.zeros(2, 3), fp32)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mxfp4_prebuild_folds_the_runner_scale_with_the_shared_expert(
+    monkeypatch, enabled
+):
+    """The op takes the routed scale its runner recorded on the layer, only
+    with the shared expert inside and MOE_FUSED_EP_PUSH_SHARED_ADD."""
+    from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
+        VllmDeepseekV4Mxfp4MoEMethod,
+    )
+
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_KERNEL_IMPL", "push")
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SHARED_EXPERT", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SHARED_ADD", enabled)
+    method = object.__new__(VllmDeepseekV4Mxfp4MoEMethod)
+    method.fused_ep = True
+    layer = _layer(renormalize=True, swiglu_limit=10.0)
+    setattr(layer, bridge.FUSED_MOE_EP_RUNNER_SCALE_ATTR, 1.5)
+    w13 = torch.empty((4, 512, 1024), device="meta")
+    w2 = torch.empty((4, 512, 512), device="meta")
+    with patch.object(bridge, "prebuild_fused_moe_ep", return_value="op") as build:
+        method._prebuild_w4a8(layer, "silu", w13, w2, 512)
+    assert build.call_args.kwargs["shared_output_scale"] == (1.5 if enabled else None)
+
+
 def test_op_sees_padded_rows_routed_nowhere_and_real_rows_unchanged():
     from vllm_torchtpu.layers.adapter import token_padding
 

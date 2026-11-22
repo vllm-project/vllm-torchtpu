@@ -131,6 +131,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_EXCHANGE_TABLES: bool = True
     MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES: bool = True
     MOE_FUSED_EP_PUSH_SHARED_EXPERT: bool = True
+    MOE_FUSED_EP_PUSH_SHARED_ADD: bool = True
     MOE_FUSED_EP_PUSH_LIGHT_PREPUSH: int = 2
     MOE_FUSED_EP_PUSH_SINGLE_BARRIER: bool = True
     MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE: bool = True
@@ -1131,6 +1132,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the TensorCore computes it while the pre-push is in flight.
     "MOE_FUSED_EP_PUSH_SHARED_EXPERT": env_bool(
         "MOE_FUSED_EP_PUSH_SHARED_EXPERT", default=True
+    ),
+    # With MOE_FUSED_EP_PUSH_SHARED_EXPERT: the op also applies the MoE
+    # runner's routed scale and adds the shared expert's output inside the
+    # combine kernel, so it returns the layer's one output and the runner's
+    # separate scale-and-add pass over it is gone.
+    "MOE_FUSED_EP_PUSH_SHARED_ADD": env_bool(
+        "MOE_FUSED_EP_PUSH_SHARED_ADD", default=True
     ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and

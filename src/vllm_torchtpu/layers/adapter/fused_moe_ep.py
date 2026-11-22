@@ -127,6 +127,13 @@ FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
 # Set beside the op when it was built with the layer's shared expert inside
 # (MOE_FUSED_EP_PUSH_SHARED_EXPERT): the swiglu limit it closed over.
 FUSED_MOE_EP_SHARED_LIMIT_ATTR = "_fused_moe_ep_shared_limit"
+# Set beside it when the op also scales the routed output and adds the shared
+# expert's (MOE_FUSED_EP_PUSH_SHARED_ADD): the scale it applies. The op then
+# returns that one sum, and the MoE runner neither scales nor adds.
+FUSED_MOE_EP_SHARED_SCALE_ATTR = "_fused_moe_ep_shared_scale"
+# Set on a layer's routed experts by the TPU MoE runner that owns them: the
+# routed scale that runner applies to the routed output before the shared add.
+FUSED_MOE_EP_RUNNER_SCALE_ATTR = "_fused_moe_ep_runner_scale"
 
 # Set on a DSpark draft layer's routed experts (the object prebuild receives)
 # by `mark_dspark_draft_moe`, so that prebuild can build that layer's op with
@@ -220,6 +227,7 @@ def _build_op(
     dspark_draft=False,
     split_exchange=False,
     shared_limit: float | None = None,
+    shared_output_scale: float | None = None,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -238,7 +246,9 @@ def _build_op(
     every placed layer of a model shares this one op and one exported program
     per shape. A `shared_limit` adds the layer's FP8 shared expert (w13, s13,
     w2, s2; replicated) as four trailing operands, computed inside the op
-    (push only), and the op returns (routed, shared).
+    (push only), and the op returns (routed, shared); with
+    `shared_output_scale` as well it returns the one output shared + routed *
+    shared_output_scale, the MoE runner's combine of the two.
     """
     from vllm_torchtpu.compilation.moe_preprocessing import prepare_moe_preprocessing
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -304,6 +314,7 @@ def _build_op(
         tuple(sorted(impl_kw.items())),
         has_expert_slot,
         shared_limit,
+        shared_output_scale,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -320,11 +331,15 @@ def _build_op(
 
     if shared_limit is not None and envs.MOE_FUSED_EP_KERNEL_IMPL != "push":
         raise ValueError("MOE_FUSED_EP_PUSH_SHARED_EXPERT needs the push kernel")
+    if shared_output_scale is not None and shared_limit is None:
+        raise ValueError("shared_output_scale needs the shared expert in the op")
+    returns_shared = shared_limit is not None and shared_output_scale is None
 
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
         if shared_limit is not None:
             bias_kw["shared_expert"] = tuple(bias_kw.pop(n) for n in _SHARED_OPERANDS)
             bias_kw["shared_limit"] = shared_limit
+            bias_kw["shared_output_scale"] = shared_output_scale
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
@@ -588,7 +603,7 @@ def _build_op(
             + ("expert_slot",) * has_expert_slot
             + ("expert_load",) * has_expert_load
             + (_SHARED_OPERANDS if shared_limit is not None else ()),
-            outputs=1 + has_expert_load + (shared_limit is not None),
+            outputs=1 + has_expert_load + returns_shared,
         )
     elif has_score_bias:
         fn = moe_with_score_bias
@@ -601,7 +616,7 @@ def _build_op(
     out_specs = (
         (spec,)
         + ((PartitionSpec(),) if has_expert_load else ())
-        + ((spec,) if shared_limit is not None else ())
+        + ((spec,) if returns_shared else ())
     )
     op = jax_op(
         name,
@@ -623,7 +638,7 @@ def _build_op(
         outs = (torch.empty_like(x),)
         if has_expert_load:
             outs += (torch.empty_like(args[load_argnum - 1]),)
-        if shared_limit is not None:
+        if returns_shared:
             outs += (torch.empty_like(x),)
         return outs if len(outs) > 1 else outs[0]
 
@@ -723,7 +738,8 @@ def fused_moe_ep(
     prebuild saw the corresponding thing on the layer -- prebuild built the
     op's signature around that. Getting it wrong is a torch arity error at the
     first call, not a wrong answer. `shared_expert` (w13, s13, w2, s2) goes
-    with an op built with a shared limit, which then returns (routed, shared).
+    with an op built with a shared limit, which then returns (routed, shared),
+    or their combine alone when it was built with a shared output scale.
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
     router_logits = _route_padded_rows_nowhere(router_logits)
@@ -856,6 +872,7 @@ def prebuild_fused_moe_ep(
     policy: FusedEPPolicy = FusedEPPolicy.LEGACY,
     row_score_bias: bool = False,
     shared_limit: float | None = None,
+    shared_output_scale: float | None = None,
 ) -> Any | None:
     """Resolve the mesh and build the fused-EP op for one layer.
 
@@ -886,6 +903,8 @@ def prebuild_fused_moe_ep(
     experts], one row per token, instead of the staged [experts] vector.
     `shared_limit` builds the op with the layer's shared expert inside (see
     `_build_op`); the caller then passes it on every forward.
+    `shared_output_scale` (with it) has the op return the runner's combine of
+    the two outputs instead.
     """
     if policy == FusedEPPolicy.LEGACY:
         if not envs.USE_MOE_FUSED_EP_KERNEL:
@@ -1068,6 +1087,7 @@ def prebuild_fused_moe_ep(
         dspark_draft=bool(getattr(layer, DSPARK_DRAFT_MOE_ATTR, False)),
         split_exchange=bool(getattr(layer, SPLIT_EXCHANGE_MOE_ATTR, False)),
         shared_limit=shared_limit,
+        shared_output_scale=shared_output_scale,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

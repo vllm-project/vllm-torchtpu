@@ -16,6 +16,7 @@
 import inspect
 from collections.abc import Callable
 
+import torch
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
@@ -25,7 +26,17 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
 from vllm_torchtpu.layers.adapter import moe_routing
-from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+    FUSED_MOE_EP_RUNNER_SCALE_ATTR,
+    fused_moe_ep_supported,
+)
+
+
+def _shared_output_scale(quant_method) -> float | None:
+    """The routed scale a layer's fused EP op applies before adding the shared
+    expert (it then returns that sum alone), or None."""
+    return getattr(quant_method, "shared_expert_output_scale", None)
+
 
 # Taken once at import, outside any trace: the MoE forward is traced by
 # torch.compile, and reading the upstream property from inside the trace does
@@ -56,6 +67,22 @@ class VllmMoERunner(MoERunner):
         object.__setattr__(
             self, "_tpu_shared_mlp", bound.arguments.get("shared_experts")
         )
+        # The scale this runner gives the routed output before adding the
+        # shared expert's, for a fused EP op that does both
+        # (MOE_FUSED_EP_PUSH_SHARED_ADD); read when the op is built. The op
+        # scales in bf16, so only a scale bf16 holds exactly is handed over.
+        scale = float(self.routed_scaling_factor)
+        exact = torch.tensor(scale, dtype=torch.bfloat16).item() == scale
+        if (
+            self._tpu_shared_mlp is not None
+            and exact
+            and self.routed_output_transform is None
+        ):
+            setattr(
+                self.routed_experts,
+                FUSED_MOE_EP_RUNNER_SCALE_ATTR,
+                scale,
+            )
 
     def _apply_quant_method(
         self,
@@ -93,16 +120,33 @@ class VllmMoERunner(MoERunner):
                 f"the fused EP op was built for swiglu limit {limit}, the shared "
                 f"expert has {shared_limit}"
             )
-        routed, shared_out = (
-            self.routed_experts.quant_method.forward_monolithic_with_shared_expert(
-                self.routed_experts,
-                hidden_states,
-                router_logits,
-                input_ids,
-                tuple(shared),
-            )
+        result = self.routed_experts.quant_method.forward_monolithic_with_shared_expert(
+            self.routed_experts,
+            hidden_states,
+            router_logits,
+            input_ids,
+            tuple(shared),
         )
-        return shared_out, routed
+        scale = _shared_output_scale(self.routed_experts.quant_method)
+        if scale is None:
+            routed, shared_out = result
+            return shared_out, routed
+        # The op scales in bf16 (upstream divides the shared output instead
+        # for fp16) by the scale this runner recorded at init.
+        if scale != self.routed_scaling_factor or hidden_states.dtype != torch.bfloat16:
+            raise ValueError(
+                f"the fused EP op adds the shared expert after scaling by {scale} "
+                f"in bfloat16; this runner scales by {self.routed_scaling_factor} "
+                f"in {hidden_states.dtype}"
+            )
+        # The op returned the shared + scaled routed sum: no shared output
+        # for the runner to add, and no scale left to apply.
+        return None, result
+
+    def _maybe_apply_routed_scale_to_output(self, shared_output, fused_output):
+        if _shared_output_scale(self._quant_method) is not None:
+            return shared_output, fused_output
+        return super()._maybe_apply_routed_scale_to_output(shared_output, fused_output)
 
     def _take_over_moe_quant_config_init(self) -> None:
         routed_experts = self.routed_experts
@@ -208,6 +252,10 @@ class VllmMoERunner(MoERunner):
         return super()._maybe_dispatch(hidden_states, router_logits)
 
     def _maybe_combine(self, shared_output, hidden_states):
+        if _shared_output_scale(self._quant_method) is not None:
+            # The fused op combined the routed rows onto their own rank and
+            # added the shared expert: its one output is the layer's.
+            return hidden_states
         if self._fused_ep_owns_pcp_collectives():
             # The fused program has already pushed and summed routed rows
             # back onto their token-owning PCP rank. Preserve upstream's

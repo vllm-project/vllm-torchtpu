@@ -55,6 +55,7 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
     build_combine_fs_kernel,
     build_push_moe_kernel,
     decode_combine_applies,
+    fold_scaled_add,
     fs_combine_chunk,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
@@ -156,12 +157,23 @@ def _pack_routing_exchange(pairs, scale_bits, counts, layout):
 
 
 def _combine_arrivals_fs(
-    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype, decode=True
+    arrivals,
+    arrival_scales,
+    pos,
+    mirror_pos,
+    topk_weights,
+    out_dtype,
+    decode=True,
+    fold=None,
 ):
     """v2's `_combine_arrivals`, with the arrival-scale lookup done inside the
     combine kernel (see kernel._build_combine_fs_kernel) where that kernel
     applies, the one-pass decode combine (kernel._build_combine_decode_kernel)
-    at decode sizes where `decode`, and v2's XLA epilogue everywhere else."""
+    at decode sizes where `decode`, and v2's XLA epilogue everywhere else.
+
+    `fold` = (keep [t_local] bool, addend [t_local, hidden], scale) returns
+    kernel.fold_scaled_add(combined zeroed where not keep, addend, scale)
+    instead, inside the fs kernel where it applies."""
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
@@ -178,22 +190,32 @@ def _combine_arrivals_fs(
             wire_dtype=arrivals.dtype,
             out_dtype=out_dtype,
         )
-        return combine(arrivals, arrival_scales, scl, topk_weights, rows)
+        combined = combine(arrivals, arrival_scales, scl, topk_weights, rows)
+        return combined if fold is None else _fold(combined, *fold)
     # v2's step rule keeps its COMBINE_MIN_TOKENS floor; the fs kernel tiles
     # by its own chunk.
-    if not (combine_step_tokens(t_local) and fs_combine_chunk(t_local, topk)):
-        return _combine_arrivals(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+    if combine_step_tokens(t_local) and fs_combine_chunk(t_local, topk):
+        combine = build_combine_fs_kernel(
+            t_local=t_local,
+            topk=topk,
+            hidden=lane_blocks * lanes,
+            lane_blocks=lane_blocks,
+            wire_dtype=arrivals.dtype,
+            out_dtype=out_dtype,
+            out_scale=None if fold is None else fold[2],
         )
-    combine = build_combine_fs_kernel(
-        t_local=t_local,
-        topk=topk,
-        hidden=lane_blocks * lanes,
-        lane_blocks=lane_blocks,
-        wire_dtype=arrivals.dtype,
-        out_dtype=out_dtype,
+        operands = (arrivals, arrival_scales, scl, topk_weights, rows)
+        return combine(*operands, *(() if fold is None else fold[:2]))
+    combined = _combine_arrivals(
+        arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
     )
-    return combine(arrivals, arrival_scales, scl, topk_weights, rows)
+    return combined if fold is None else _fold(combined, *fold)
+
+
+def _fold(combined, keep, addend, scale):
+    """`_combine_arrivals_fs`'s `fold` on a combined output."""
+    combined = jnp.where(keep[:, None], combined, jnp.zeros_like(combined))
+    return fold_scaled_add(combined, addend, scale)
 
 
 def _to_slots(topk_idx, expert_slot, row_base, *, onehot=False):
@@ -361,6 +383,7 @@ def fused_ep_moe_push(
     expert_load=None,
     shared_expert=None,
     shared_limit=None,
+    shared_output_scale=None,
 ):
     """Run one MoE layer through the push-dispatch fused EP kernel.
 
@@ -435,6 +458,10 @@ def fused_ep_moe_push(
     with `shared_limit`). It is computed on this shard's rows after the
     SparseCore pre-push is issued and before the expert kernel, so it runs
     while the pre-push is in flight; the layer then also returns it, last.
+    With `shared_output_scale` it returns instead the one output
+    `shared + routed * shared_output_scale` (in the output dtype, each op
+    rounded, as the MoE runner combines the two), the add done inside the
+    combine (see kernel.fold_scaled_add).
     """
     del preprocess_topology
     form = weight_form(weight_format)
@@ -462,6 +489,10 @@ def fused_ep_moe_push(
     has_shared = shared_expert is not None
     if has_shared and (len(shared_expert) != 4 or shared_limit is None):
         raise ValueError("shared_expert is (w13, s13, w2, s2) with a shared_limit")
+    if shared_output_scale is not None and not has_shared:
+        raise ValueError(
+            "shared_output_scale scales the routed output for a shared add"
+        )
     # Global experts the router scores; without a layout, one slot each.
     e_logical = gating.shape[1] if has_expert_slot else e_total
     if has_expert_slot and (
@@ -1109,6 +1140,21 @@ def fused_ep_moe_push(
                 (me * t_local, 0),
                 (t_local, topk),
             )
+        # A row that routed nowhere read arrival rows nobody wrote; its weight is
+        # zero, but zero times an unwritten NaN is not: such rows are zeroed.
+        fold = None
+        if shared_output_scale is not None:
+            if shared_out[0].dtype != out_dtype:
+                raise ValueError(
+                    f"the shared output is {shared_out[0].dtype}, the routed "
+                    f"{jnp.dtype(out_dtype).name}: the folded add takes one dtype"
+                )
+            # The shared expert ran on the shard's own rows, the combine's
+            # only when no replica group splits them.
+            if len(token_layout.groups[0]) != 1:
+                raise ValueError("the folded shared add needs unsplit token rows")
+            fold = (row_routes.reshape(-1), shared_out[0], shared_output_scale)
+            shared_out = ()
         combined = _combine_arrivals_fs(
             arrivals,
             arrival_scales,
@@ -1117,10 +1163,10 @@ def fused_ep_moe_push(
             topk_weights,
             out_dtype,
             decode=decode_combine,
+            fold=fold,
         )
-        # A row that routed nowhere read arrival rows nobody wrote; its weight is
-        # zero, but zero times an unwritten NaN is not.
-        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        if fold is None:
+            combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         out = token_layout.restore(combined, ax)
         outs = (out,) + (() if updated_load is None else (updated_load,))
         outs += tuple(shared_out)
@@ -1343,6 +1389,7 @@ def fused_ep_moe_push(
         bool(kernel_plan_tables),
         has_shared and tuple((a.shape, a.dtype) for a in shared_args),
         float(shared_limit) if has_shared and shared_limit is not None else False,
+        None if shared_output_scale is None else float(shared_output_scale),
         int(light_prepush),
         bool(single_barrier),
         int(early_scale_scatter),
@@ -1352,7 +1399,10 @@ def fused_ep_moe_push(
         bool(wide_pair_kernel),
         bool(decode_combine),
     )
-    out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
+    returns_shared = has_shared and shared_output_scale is None
+    out_specs = (
+        (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * returns_shared)
+    )
     out_specs = out_specs if len(out_specs) > 1 else out_specs[0]
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

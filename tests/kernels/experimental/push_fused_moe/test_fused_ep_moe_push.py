@@ -477,22 +477,26 @@ def test_decode_combine_matches_xla_epilogue(t_local, topk):
     )
 
 
+@pytest.mark.parametrize("fold", [False, True], ids=["plain", "fold"])
 @pytest.mark.parametrize(
     "t_local,lane_blocks,topk",
     [(256, 40, 6), (320, 40, 6), (384, 40, 6), (256, 20, 6), (256, 4, 6), (320, 40, 3)],
 )
-def test_fs_combine_matches_xla_epilogue(t_local, lane_blocks, topk):
+def test_fs_combine_matches_xla_epilogue(t_local, lane_blocks, topk, fold):
     """At mixed-step sizes the combine is the pipelined fs kernel (an even
     and an odd block count, both chunk widths, hidden sizes that are not
     whole registers of lane blocks, a block's table slice that is not whole
     tiles at the drafter's top-3); it gives v2's XLA epilogue bit for bit,
-    unwritten (NaN) mirror entries and repeated arrival rows included."""
+    unwritten (NaN) mirror entries and repeated arrival rows included. With
+    `fold` it also masks rows, scales and adds an addend exactly as those
+    ops do compiled after it."""
     from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
         decode_combine_applies,
         fs_combine_chunk,
     )
     from vllm_torchtpu.kernels.experimental.push_fused_moe.layer import (
         _combine_arrivals_fs,
+        _fold,
     )
     from vllm_torchtpu.kernels.fused_moe.v2.layer import _combine_arrivals
 
@@ -511,12 +515,78 @@ def test_fs_combine_matches_xla_epilogue(t_local, lane_blocks, topk):
     mirror_pos = np.where(finite, mirror_pos, mirror_pos[finite][0])
     weights = jnp.asarray(rng.uniform(0, 1, (t_local, topk)), jnp.float32)
     args = (arrivals, jnp.asarray(scales), jnp.asarray(pos), jnp.asarray(mirror_pos))
-    got = jax.jit(_combine_arrivals_fs, static_argnums=5)(*args, weights, jnp.bfloat16)
-    want = jax.jit(_combine_arrivals, static_argnums=5)(*args, weights, jnp.bfloat16)
+    extra = ()
+    if fold:
+        keep = jnp.asarray(rng.random(t_local) > 0.1)
+        addend = rng.normal(0, 1, (t_local, lane_blocks * 128))
+        addend *= rng.choice([1e-39, 1e-3, 1.0, 40.0], addend.shape)
+        extra = (keep, jnp.asarray(addend, jnp.bfloat16), 1.5)
+
+    def fs(*a):
+        return _combine_arrivals_fs(*a, jnp.bfloat16, fold=extra or None)
+
+    def xla(*a):
+        out = _combine_arrivals(*a, jnp.bfloat16)
+        return _fold(out, *extra) if fold else out
+
+    got = jax.jit(fs, compiler_options=_AS_SERVED)(*args, weights)
+    want = jax.jit(xla, compiler_options=_AS_SERVED)(*args, weights)
     assert np.isfinite(np.asarray(got, np.float32)).all()
     np.testing.assert_array_equal(
         np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
     )
+
+
+@pytest.mark.parametrize("rows", [256, 16], ids=["fs", "decode"])
+def test_shared_add_inside_is_bit_exact(rows):
+    """With `shared_output_scale` the layer returns shared + routed * scale
+    (each op rounded, as the MoE runner computes it from the two outputs the
+    layer returns without it), bit for bit: through the fs combine kernel at
+    256 rows a shard and after the decode combine at 16."""
+    from vllm_torchtpu.kernels.quantized_matmul.shared_expert import _FP8_MAX
+
+    mesh = _mesh()
+    weights = _fp4_weights(mesh, 41, rhs_qb=512, **FP4_SHAPE)
+    hidden, n = FP4_SHAPE["hidden"], 256
+    rng = np.random.default_rng(43)
+    repl = NamedSharding(mesh, P())
+
+    def w(shape):
+        raw = np.clip(rng.normal(0, 64, shape), -_FP8_MAX, _FP8_MAX)
+        return jax.device_put(jnp.asarray(raw, jnp.float32).astype(FP8), repl)
+
+    def scl(size):
+        return jax.device_put(
+            rng.uniform(0.5, 1.5, size).astype(np.float32) * 1e-3, repl
+        )
+
+    shared = (w((hidden, 2 * n)), scl(2 * n), w((n, hidden)), scl(hidden))
+    x, gating = _inputs(
+        mesh, 47, hidden=hidden, e_logical=FP4_SHAPE["e_total"], tokens=EP * rows
+    )
+    # A row that routes nowhere is masked out of the routed output.
+    gating = gating.at[::5].set(-jnp.inf)
+    common = dict(
+        topk=TOPK, renormalize=True, mesh=mesh, capacity=CAPACITY,
+        weight_format=WeightFormat.FP4, rhs_qb=512, sharded_plan=True,
+        scoring_fn="sqrtsoftplus", act_fn="silu_and_mul_with_clamp", sc_prepush=2,
+        tc_exchange=True, shared_expert=shared, shared_limit=10.0,
+    )  # fmt: skip
+
+    def layer(x, gating, scale):
+        return fused_ep_moe_push(
+            x, *weights, gating, shared_output_scale=scale, **common
+        )
+
+    def runner(routed, shared_out):
+        return shared_out + routed * jnp.asarray(1.5, routed.dtype)
+
+    as_served = dict(static_argnums=2, compiler_options=_AS_SERVED)
+    routed, shared_out = jax.jit(layer, **as_served)(x, gating, None)
+    want = np.asarray(jax.jit(runner, compiler_options=_AS_SERVED)(routed, shared_out))
+    got = np.asarray(jax.jit(layer, **as_served)(x, gating, 1.5))
+    assert np.isfinite(got.astype(np.float32)).all()
+    np.testing.assert_array_equal(got.view(np.uint16), want.view(np.uint16))
 
 
 def test_tc_exchange_row_gather_equals_take():

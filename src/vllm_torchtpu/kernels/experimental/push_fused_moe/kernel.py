@@ -1898,8 +1898,15 @@ def fs_combine_chunk(t_local, topk):
     return 0
 
 
+def fold_scaled_add(routed, addend, scale):
+    """addend + routed * scale in the routed output's dtype: the scale and the
+    shared-expert add as the MoE layer's caller applies them to its outputs
+    (two ops in that dtype, each result rounded)."""
+    return addend + routed * jnp.asarray(scale, routed.dtype)
+
+
 def _build_combine_fs_kernel(
-    *, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype
+    *, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype, out_scale=None
 ):
     """out[i] = sum_k scales[scl[i, k]] * w[i, k] * arrivals[pos[i, k]].
 
@@ -1926,6 +1933,12 @@ def _build_combine_fs_kernel(
       token's hidden axis along sublanes) and stored in f32; the output tile
       group is read back with a sublane-strided load, one lane block of 16
       tokens at a time, and rounded to bf16 there.
+
+    With `out_scale`, the call also takes the token mask and an addend of the
+    output's shape and returns what the layer's caller would make of them:
+    the combine, zero on masked rows, rounded, times out_scale, rounded, plus
+    the addend, rounded (see `fold_scaled_add`). The addend's rows are fetched
+    beside the chunk's arrival rows.
     """
     ch = fs_combine_chunk(t_local, topk)
     assert ch, (t_local, topk)
@@ -1955,25 +1968,26 @@ def _build_combine_fs_kernel(
     # The loop covers pairs of blocks; the last two or three are unrolled
     # after it, the last one starting no rows past the end.
     tail = 2 + n_blocks % 2
+    fold = out_scale is not None
 
-    def kernel(
-        pos_sm,
-        scales_sm,
-        pos_hbm,
-        scl_hbm,
-        tw_hbm,
-        arr_hbm,
-        out_hbm,
-        pos_st,
-        scl_st,
-        tw_st,
-        rows_vm,
-        acc_vm,
-        out_vm,
-        row_sems,
-        out_sems,
-        tab_sems,
-    ):
+    def kernel(*refs):
+        if fold:
+            pos_sm, scales_sm, keep_sm, pos_hbm, scl_hbm, tw_hbm, arr_hbm, add_hbm = (
+                refs[:8]
+            )
+            refs = refs[8:]
+        else:
+            pos_sm, scales_sm, pos_hbm, scl_hbm, tw_hbm, arr_hbm = refs[:6]
+            refs = refs[6:]
+        out_hbm, pos_st, scl_st, tw_st, rows_vm, acc_vm, out_vm = refs[:7]
+        row_sems, out_sems, tab_sems, *add_scratch = refs[7:]
+
+        def add_copy(c, slot):
+            add_vm, add_sems = add_scratch
+            return pltpu.make_async_copy(
+                add_hbm.at[pl.ds(c * ch, ch)], add_vm.at[slot], add_sems.at[slot]
+            )
+
         def stage_copies(b, buf):
             # b - buf is even, so (b - buf) * n_tab is whole tiles.
             pair = (b - buf) * n_tab
@@ -2010,6 +2024,11 @@ def _build_combine_fs_kernel(
             pltpu.make_async_copy(
                 rows_vm.at[slot], rows_vm.at[slot], row_sems.at[slot]
             ).wait()
+            starts = not (last and r + lead >= ring)
+            if fold:
+                add_copy(0, slot).wait()
+                if starts:
+                    add_copy(b * ring + r + lead, nslot).start()
 
             @pl.when(b > 0)
             def _():
@@ -2019,7 +2038,7 @@ def _build_combine_fs_kernel(
 
             for u in range(ch):
                 e0 = (r * ch + u) * topk
-                if not (last and r + lead >= ring):
+                if starts:
                     for k in range(topk):
                         start_row(pos_st[pos_at + e0 + k], nslot, u, k)
                 acc = None
@@ -2028,14 +2047,18 @@ def _build_combine_fs_kernel(
                         buf, e0 + k
                     )
                     acc = term if acc is None else acc + term
+                if fold:
+                    keep = keep_sm[b * blk + r * ch + u] != 0
+                    acc = jnp.where(keep, acc, jnp.zeros_like(acc))
                 g, gu = divmod(u, gt)
                 acc_vm[g, pl.ds(gu * acc_rows, lane_blocks)] = acc
             for g in range(ch // gt):
                 for lb in range(lane_blocks):
-                    v = acc_vm[g, pl.ds(lb, gt, stride=acc_rows)]
-                    out_vm[slot, pl.ds(g * gt, gt), pl.ds(lb * lanes, lanes)] = (
-                        v.astype(out_dtype)
-                    )
+                    tile = (slot, pl.ds(g * gt, gt), pl.ds(lb * lanes, lanes))
+                    v = acc_vm[g, pl.ds(lb, gt, stride=acc_rows)].astype(out_dtype)
+                    if fold:
+                        v = fold_scaled_add(v, add_scratch[0][tile], out_scale)
+                    out_vm[tile] = v
             pltpu.make_async_copy(
                 out_vm.at[slot],
                 out_hbm.at[pl.ds(b * blk + r * ch, ch)],
@@ -2062,6 +2085,8 @@ def _build_combine_fs_kernel(
             for u in range(ch):
                 for k in range(topk):
                     start_row(pos_sm[(c * ch + u) * topk + k], c, u, k)
+            if fold:
+                add_copy(c, c).start()
         lax.fori_loop(0, (n_blocks - tail) // 2, block_pair, jnp.int32(0))
         for i in range(tail):
             one_block(
@@ -2073,11 +2098,19 @@ def _build_combine_fs_kernel(
             pltpu.make_async_copy(out_vm.at[s], out_vm.at[s], out_sems.at[s]).wait()
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    add_scratch = (
+        (
+            pltpu.VMEM((ring, ch, hidden), out_dtype),
+            pltpu.SemaphoreType.DMA((ring,)),
+        )
+        if fold
+        else ()
+    )
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            in_specs=[hbm] * 4,
+            num_scalar_prefetch=2 + fold,
+            in_specs=[hbm] * (4 + fold),
             out_specs=hbm,
             scratch_shapes=(
                 pltpu.SMEM((2 * window,), jnp.int32),
@@ -2089,6 +2122,7 @@ def _build_combine_fs_kernel(
                 pltpu.SemaphoreType.DMA((ring,)),
                 pltpu.SemaphoreType.DMA((ring,)),
                 pltpu.SemaphoreType.DMA((3, 2)),
+                *add_scratch,
             ),
             grid=(),
         ),
@@ -2096,10 +2130,11 @@ def _build_combine_fs_kernel(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=host.vmem_limit(), disable_bounds_checks=True
         ),
-        name=f"moe_v2_combine_t{t_local}_k{topk}_c{ch}_r{ring}_l{lead}_fs",
+        name=f"moe_v2_combine_t{t_local}_k{topk}_c{ch}_r{ring}_l{lead}_fs"
+        + ("_add" if fold else ""),
     )
 
-    def fn(arrivals, arrival_scales, scl, topk_weights, pos):
+    def fn(arrivals, arrival_scales, scl, topk_weights, pos, keep=None, addend=None):
         # Every table flattens TOKEN-major, like v2's combine, padded to
         # table_len (the pad lands in the flattening copy). pos rides scalar
         # prefetch for the first lead chunks' rows and HBM for the rest.
@@ -2108,14 +2143,16 @@ def _build_combine_fs_kernel(
             return jnp.pad(table, (0, table_len - table.size))
 
         pos = flat(pos, jnp.int32)
-        return call(
-            pos,
-            arrival_scales.astype(jnp.float32).reshape(-1),
+        scales = arrival_scales.astype(jnp.float32).reshape(-1)
+        tables = (
             pos,
             flat(scl, jnp.int32),
             flat(topk_weights, jnp.float32),
             arrivals,
         )
+        if not fold:
+            return call(pos, scales, *tables)
+        return call(pos, scales, keep.astype(jnp.int32).reshape(-1), *tables, addend)
 
     return fn
 
