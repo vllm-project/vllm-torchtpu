@@ -234,7 +234,13 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         ]
         if self.union_phys:
             out += [
-                ScratchReq("qu_tab", pltpu.VMEM((1, self.pps), I32)),
+                # Every request's main-table row, copied at the start of the union attention;
+                # one padded [8, pps] tile each (with wholekeyslots=auto, b16 fits only with
+                # wholekeylanes=128)
+                # (one [1, pps] tile row per request: a dynamic single-row load of a
+                # [nreq, pps] buffer does not lower).
+                ScratchReq("qu_tab", pltpu.VMEM((nreq, 1, self.pps), I32)),
+                ScratchReq("qu_tab_sem", pltpu.SemaphoreType.DMA((nreq,))),
                 ScratchReq("qu_pv", pltpu.VMEM((1, KU), I32)),
             ]
         if self.shard_index and not self.xmerge:
@@ -1346,6 +1352,12 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
         xreq = self.xreq_prefetch
 
+        def tab_copy(q: Any) -> Any:
+            o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
+            return pltpu.make_async_copy(
+                ctx.extra[MTAB].at[o, pl.ds(q, 1)], scr["qu_tab"].at[q], scr["qu_tab_sem"].at[q]
+            )
+
         def stage_ids(q: Any, bank: Any) -> None:
             """Request `q`'s union ids (physical with `union_phys`) into `qu_row[bank]`."""
             # This rank's union: under DCP only the groups it owns (the pair rank's rows are
@@ -1354,21 +1366,30 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             n_u = scr["qu_n"][q, rk]
             with sc("qsa_u_ids", 2):
                 if self.union_phys:
-                    # The request's main-table row, then its union ids -> physical micro-page ids for
-                    # every slot a tile reads (< ceil(n / 64) * 64 <= ceil(n / 128) * 128).
-                    o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
-                    cp = pltpu.make_async_copy(
-                        ctx.extra[MTAB].at[o, pl.ds(q, 1)], scr["qu_tab"], scr["qu_sem"].at[2]
-                    )
-                    cp.start()
-                    cp.wait()
+                    # The request's main-table row (`tab_copy`, in flight since the loop
+                    # began), then its union ids -> physical micro-page ids for every slot a
+                    # tile reads (< ceil(n / 64) * 64 <= ceil(n / 128) * 128).
+                    tab_copy(q).wait()
                     per_page = ctx.extra[POOL].shape[1] // ua.MICRO
-                    tab = scr["qu_tab"][...]
+                    # Table entries are pool block ids: this many bytes hold them.
+                    blocks = ctx.extra[POOL].shape[0]
+                    table_bytes = max(1, -(-(blocks - 1).bit_length() // 8))
+                    # Union ids are below the last row's visible groups: only the table
+                    # columns those reach are scanned (whole 128-lane chunks of the row).
+                    row = scr["qu_tab"].at[q]
+                    if self.pps % 128 == 0:
+                        tab = row
+                        n_tab = ua.table_chunks(
+                            ctx.extra[NVIS][q * T + T - 1], per_page, self.dcp, self.pps
+                        )
+                    else:
+                        tab, n_tab = row[...], None
 
                     def chunk(c: Any, carry: Any) -> Any:
                         lo = pl.multiple_of(c * 128, 128)
                         scr["qu_pv"][:, pl.ds(lo, 128)] = ua.physical_ids(
-                            src[:, pl.ds(lo, 128)], tab, per_page, self.dcp
+                            src[:, pl.ds(lo, 128)], tab, per_page, self.dcp, n_tab,
+                            table_bytes=table_bytes,
                         )
                         return carry
 
@@ -1470,6 +1491,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             return sbase + (n_u * ua.MICRO + ua.TILE - 1) // ua.TILE
 
         n_loop = self._n_live(ctx) if self.skip_idle else nreq
+        if self.union_phys:  # the table rows of the requests the loop visits, waited there
+            for q in range(nreq):
+                pl.when(q < n_loop)(lambda q=q: tab_copy(q).start())
         if not xreq:
             return list(jax.lax.fori_loop(0, n_loop, req, zeros))
         @pl.when(n_loop > 0)

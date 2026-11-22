@@ -642,6 +642,42 @@ def test_physical_ids_match_the_copy_address_math():
         assert not np.array_equal(bad, want[:128])
 
 
+def test_physical_ids_scan_only_the_visible_table_chunks():
+    """`physical_ids` with `n_tab = table_chunks(n_vis, ...)` scans only the table chunks that
+    hold the columns of groups `< n_vis` and equals the full scan; one chunk too few misses
+    the ids of the last chunk (the bound is what makes it equal)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+
+    rng = np.random.default_rng(1)
+    for per_page, pps, dcp in ((128, 512, 1), (128, 512, 2), (4, 256, 1)):
+        tab = rng.integers(0, 200_000, (1, pps)).astype(np.int32)
+        cs = per_page.bit_length() - 1 + dcp.bit_length() - 1
+        for n_vis in (1, 5 << cs, (128 << cs) + 3, (pps << cs) - 1):
+            ids = rng.integers(0, n_vis, (1, 128)).astype(np.int32)
+            ids[0, :4] = (0, n_vis - 1, 0, n_vis - 1)
+            want = np.asarray(ua.physical_ids(jnp.asarray(ids), jnp.asarray(tab), per_page, dcp))
+
+            def run(n_tab, ids=ids, tab=tab, per_page=per_page, dcp=dcp):
+                def kern(ids_ref, tab_ref, out_ref):
+                    out_ref[...] = ua.physical_ids(
+                        ids_ref[...], tab_ref, per_page, dcp, n_tab, table_bytes=3
+                    )
+
+                return np.asarray(pl.pallas_call(
+                    kern, out_shape=jax.ShapeDtypeStruct((1, 128), jnp.int32),
+                    in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 2,
+                    out_specs=pl.BlockSpec(memory_space=pltpu.VMEM), interpret=True,
+                )(jnp.asarray(ids), jnp.asarray(tab)))
+
+            n_tab = int(ua.table_chunks(jnp.int32(n_vis), per_page, dcp, pps))
+            np.testing.assert_array_equal(run(n_tab), want, err_msg=f"{per_page} {dcp} {n_vis}")
+            if n_tab > 1:
+                assert not np.array_equal(run(n_tab - 1), want)
+
+
 def test_union_physical_ids_bit_identical():
     """`union_phys`: the copies read the same addresses, so the step is bit-identical to
     the
