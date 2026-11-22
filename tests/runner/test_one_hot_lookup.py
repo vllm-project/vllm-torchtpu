@@ -47,3 +47,16 @@ def test_subtract_leaves_unmapped_slots():
     )
     assert new_seq.tolist() == [97, 100, 98, 99, 100, 100]
     assert new_pos.tolist() == [7, 8, 12, 11, 12, 13, 15, 17, 18, 19]
+
+
+@pytest.mark.parametrize("traced", [False, True])
+def test_in_range_lookup_matches_indexing(traced):
+    gen = torch.Generator().manual_seed(5)
+    table = torch.randint(0, 200_000, (512,), generator=gen, dtype=torch.int32)
+    index = torch.randint(0, 512, (96,), generator=gen, dtype=torch.int32)
+
+    def fn(t, i):
+        return small_lookup(t, i, in_range=True)
+
+    run = torch.compile(fn, backend="eager") if traced else fn
+    assert torch.equal(run(table, index), table[index])
