@@ -655,6 +655,7 @@ def test_directory_with_nothing_to_upload_is_not_an_error(
 
 
 _AGENTX_MODEL = "moonshotai/Kimi-K3"
+_AGENTX_EXPORT = "conc_8/aiperf_artifacts/profile_export_aiperf.json"
 _AGENTX_METRICS = {
     "request_throughput_avg": 0.25,
     "request_count_avg": 300.0,
@@ -752,7 +753,7 @@ def _agentx_results_dir(tmp_path: pathlib.Path, edit) -> pathlib.Path:
     """A results directory holding the fixture point, its export changed by
     `edit`."""
     results_dir = _results_dir(tmp_path, "conc_8")
-    export_path = results_dir / "conc_8/aiperf_artifacts/profile_export_aiperf.json"
+    export_path = results_dir / _AGENTX_EXPORT
     export = json.loads(export_path.read_text())
     edit(export)
     export_path.write_text(json.dumps(export))
@@ -811,17 +812,83 @@ def test_unreadable_agentx_export_fails_the_upload_but_keeps_the_other_points(
     assert _rows(out) == [_AGENTX_ROW]
 
 
-def test_agentx_export_outside_conc_layout_is_ignored(tmp_path, monkeypatch, capsys):
+def _agentx_row(record: int, concurrency: int) -> dict:
+    """The fixture point's row, as the `record`th of a run and at another
+    concurrency."""
+    config = _AGENTX_ROW["config"]
+    workload = {**config["workload"], "max_concurrency": concurrency}
+    return {
+        **_AGENTX_ROW,
+        "record_id": _record_id(record),
+        "config": {**config, "workload": workload},
+    }
+
+
+def test_agentx_ladder_writes_one_row_per_conc_directory_by_concurrency(
+    tmp_path, monkeypatch, capsys
+):
     results_dir = _results_dir(tmp_path, "conc_8")
-    stray = results_dir / "wrong_location"
-    stray.mkdir()
-    shutil.copy(
-        results_dir / "conc_8/aiperf_artifacts/profile_export_aiperf.json", stray
+    # The same export under each: the concurrency is the directory's, and a
+    # point may sit deeper than the top of the results directory.
+    for point in ("conc_2", "agentx/conc_16"):
+        shutil.copytree(results_dir / "conc_8", results_dir / point)
+
+    returncode, rows = _upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 0
+    assert rows == [_agentx_row(1, 2), _agentx_row(2, 8), _agentx_row(3, 16)]
+
+
+@pytest.mark.parametrize(
+    "not_a_point",
+    [
+        "profile_export_aiperf.json",
+        "wrong_location/profile_export_aiperf.json",
+        "conc_abc/profile_export_aiperf.json",
+        "conc_/profile_export_aiperf.json",
+        "conc_16_old/deep/profile_export_aiperf.json",
+        "conc_0/aiperf_artifacts/profile_export_aiperf.json",
+        "conc_016/aiperf_artifacts/profile_export_aiperf.json",
+    ],
+)
+def test_aiperf_export_under_no_conc_n_directory_is_named_and_skipped(
+    tmp_path, monkeypatch, capsys, not_a_point
+):
+    results_dir = _results_dir(tmp_path, "conc_8")
+    stray = results_dir / not_a_point
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(results_dir / _AGENTX_EXPORT, stray)
+
+    returncode, out, err = _run_upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 0
+    assert _rows(out) == [_AGENTX_ROW]
+    assert err == (
+        f"Skipping {stray}: not under a conc_<N>/ directory, so not an AgentX point.\n"
     )
 
-    _, rows = _upload(monkeypatch, capsys, results_dir)
 
-    assert rows == [_AGENTX_ROW]
+def test_two_exports_under_one_agentx_point_stop_the_upload_before_any_row(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(
+        tmp_path, "config.json", "isl1024_osl1024_c64.json", "conc_8"
+    )
+    first = results_dir / _AGENTX_EXPORT
+    second = results_dir / "conc_8/retry/profile_export_aiperf.json"
+    second.parent.mkdir()
+    shutil.copy(first, second)
+
+    returncode, out, err = _run_upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 1
+    assert err == (
+        f"Error: two AgentX exports under one concurrency point "
+        f"{results_dir / 'conc_8'}: {first} and {second}. One point is one row; "
+        "remove the export that is not the point's result.\n"
+    )
+    # Not the speed-grid cell either: the rerun would write it a second time.
+    assert out == ""
 
 
 def test_created_time_converts_an_offset_to_utc():

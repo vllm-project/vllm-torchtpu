@@ -218,10 +218,19 @@ statements without running them.
 | In the directory | Row |
 |------------------|-----|
 | `isl<N>_osl<N>_c<N>.json` | One per cell: the `vllm_bench` metrics, with the run's accuracy scores as `lm_eval`. Also written to Spanner unless `--skip-spanner` is set |
-| `conc_<N>/` with aiperf's `profile_export_aiperf.json` below it | One per AgentX replay point, as `agentx_client.sh` writes them: the `agentx` metrics, and the interactivity at the median, P90 and P99 inter-token latency as `derived` |
+| `conc_<N>/` with one aiperf `profile_export_aiperf.json` below it | One per AgentX replay point, at concurrency N: the `agentx` metrics, and the interactivity at the median, P90 and P99 inter-token latency as `derived` |
 | `results_*.json` and no cell | One for the run: the accuracy scores as `lm_eval`. `config.json` must name the `model` |
 
 A directory with none of these uploads nothing, which is not an error.
+
+An AgentX point is a directory named `conc_<N>`, as `agentx_client.sh` creates
+one per concurrency: N is a positive integer with no leading zero. The
+directory may sit anywhere under `<DIR>`, and the export anywhere below it.
+
+- An export under no such directory, such as `conc_abc/` or `conc_16_old/`, is
+  not a point. It is named on stderr and skipped.
+- Two exports under one `conc_<N>/` stop the upload with an error that names
+  both, before any row is written. One point is one row.
 
 ## Environment Variables
 

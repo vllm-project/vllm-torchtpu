@@ -18,14 +18,19 @@
 Each measured point becomes one BigQuery row (see bq_utils for the row
 shape):
 
-  isl*_osl*_c*.json           one `vllm bench serve` cell per row, with the
-                              run's accuracy scores on every row. Also the
-                              only rows written to Spanner.
-  profile_export_aiperf.json  one AgentX replay point per row, found at any
-                              depth (agentx_client.sh writes one per
-                              conc_<N>/).
-  results_*.json              one accuracy row for the run, when the run has
-                              no speed-grid row to carry the scores.
+  isl*_osl*_c*.json  one `vllm bench serve` cell per row, with the run's
+                     accuracy scores on every row. Also the only rows written
+                     to Spanner.
+  conc_<N>/          one AgentX replay point per row. agentx_client.sh writes
+                     each point into a directory named after its concurrency
+                     N, a positive integer with no leading zero. The directory
+                     may sit anywhere under the results directory, with
+                     aiperf's profile_export_aiperf.json anywhere below it.
+                     Such an export under no conc_<N>/ is not a point and is
+                     skipped; two under one conc_<N>/ stop the upload before
+                     any row is written.
+  results_*.json     one accuracy row for the run, when the run has no
+                     speed-grid row to carry the scores.
 """
 
 import argparse
@@ -49,6 +54,8 @@ DEFAULT_DATABASE_ID = "vllm-bm-bk-runs"
 
 RESULT_FILENAME_RE = re.compile(r"^isl(\d+)_osl(\d+)_c(\d+)\.json$")
 AGENTX_EXPORT_FILENAME = "profile_export_aiperf.json"
+# N as agentx_client.sh accepts a concurrency: positive, no leading zero.
+AGENTX_POINT_DIR_RE = re.compile(r"conc_([1-9][0-9]*)")
 ACC_KEYS = (
     "exact_match,strict_match",
     "exact_match,custom-extract",
@@ -117,20 +124,53 @@ def engine_flags(config: dict) -> dict:
     }
 
 
-def agentx_workload(export: dict) -> dict:
-    """What one aiperf export says its AgentX replay point ran."""
-    input_config = export["input_config"]
-    dataset = input_config["datasets"][0]
+def find_agentx_points(results_dir: Path) -> list[tuple[int, Path]]:
+    """(concurrency, aiperf export) of each AgentX replay point under
+    RESULTS_DIR, by concurrency.
+
+    A point is the outermost conc_<N>/ directory on an export's path, and N
+    is its concurrency. An export with no such directory above it is not a
+    point; it is named on stderr and skipped.
+
+    Raises:
+        ValueError: A point holds two exports. One point is one row, so
+            neither is picked for it.
+    """
+    points = {}
+    for export in sorted(results_dir.rglob(AGENTX_EXPORT_FILENAME)):
+        directories = export.relative_to(results_dir).parts[:-1]
+        for depth, name in enumerate(directories, 1):
+            match = AGENTX_POINT_DIR_RE.fullmatch(name)
+            if match:
+                break
+        else:
+            print(
+                f"Skipping {export}: not under a conc_<N>/ directory, so not "
+                "an AgentX point.",
+                file=sys.stderr,
+            )
+            continue
+        point = results_dir.joinpath(*directories[:depth])
+        if point in points:
+            raise ValueError(
+                f"two AgentX exports under one concurrency point {point}: "
+                f"{points[point][1]} and {export}. One point is one row; "
+                "remove the export that is not the point's result."
+            )
+        points[point] = (int(match.group(1)), export)
+    return sorted(points.values())
+
+
+def agentx_workload(export: dict, concurrency: int) -> dict:
+    """What one AgentX replay point ran: the replay its aiperf export
+    describes, at the concurrency its conc_<N>/ directory names."""
+    dataset = export["input_config"]["datasets"][0]
     return {
         "scenario": export.get("metadata", {}).get("scenario"),
         "dataset": dataset.get("dataset"),
         # Set only when the client capped the traces it replays.
         "max_context_length": dataset.get("max_context_length"),
-        "max_concurrency": next(
-            phase["concurrency"]
-            for phase in input_config["phases"]
-            if phase["kind"] == "profiling"
-        ),
+        "max_concurrency": concurrency,
     }
 
 
@@ -197,11 +237,12 @@ def main():
 
     # Locate all result json files matching the pattern
     result_files = sorted(args.results_dir.glob("isl*_osl*_c*.json"))
-    # agentx_client.sh writes one conc_<N>/ directory per point.
-    agentx_files = sorted(
-        args.results_dir.glob(f"**/conc_*/**/{AGENTX_EXPORT_FILENAME}")
-    )
-    if not (result_files or agentx_files or accuracy_metrics):
+    try:
+        agentx_points = find_agentx_points(args.results_dir)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    if not (result_files or agentx_points or accuracy_metrics):
         print(
             f"Nothing to upload from {args.results_dir}: no speed-grid cell, "
             "AgentX point or accuracy result."
@@ -438,7 +479,7 @@ def main():
 
     # AgentX points and the accuracy row go to BigQuery only: Spanner's
     # RunRecord is keyed on a speed-grid cell.
-    for export_path in agentx_files:
+    for concurrency, export_path in agentx_points:
         try:
             export = json.loads(export_path.read_text())
         except (OSError, json.JSONDecodeError) as e:
@@ -462,7 +503,7 @@ def main():
             config={
                 **run_config,
                 "engine_flags": engine_flags(config),
-                "workload": agentx_workload(export),
+                "workload": agentx_workload(export, concurrency),
             },
             bq_table=args.bq_table,
         )

@@ -50,12 +50,6 @@
         "dataset": "semianalysis_cc_traces_weka_062126",
         "max_context_length": 131072
       }
-    ],
-    "phases": [
-      {
-        "kind": "profiling",
-        "concurrency": 8
-      }
     ]
   },
   "was_cancelled": false,
