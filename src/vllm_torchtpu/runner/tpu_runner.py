@@ -1248,6 +1248,9 @@ class TPUModelRunner(GPUModelRunner):
         # dtype is the drafter's), the template the grid warmup of
         # `_substitute_and_extract_drafts` builds its sources from.
         self._substitute_source_seen: torch.Tensor | None = None
+        # The rejected-count correction's arguments the real spec-decode
+        # warmup met: the template `_precompile_subtract_num_rejected` grids.
+        self._subtract_args_seen: tuple | None = None
         self._warming_substitute_drafts = False
         # `program_key`s of the arguments the warmup compiled
         # `synthetic_verify_and_sample` at (`TPU_SPEC_SYNTHETIC_FUSED_VERIFY`),
@@ -3533,7 +3536,7 @@ class TPUModelRunner(GPUModelRunner):
                     seq_idx_np[i] = pos
                     pos_idx_np[acc : acc + n_sched] = pos
                 acc += n_sched
-            seq_lens, self.position_ids = subtract_num_rejected_tokens_compiled(
+            subtract_args = (
                 seq_lens,
                 self.position_ids,
                 self._pre_async_results.spec_decode_num_rejected_tokens,
@@ -3543,6 +3546,11 @@ class TPUModelRunner(GPUModelRunner):
                 self._upload_unless_unchanged(
                     "rejected_pos_idx", torch.from_numpy(pos_idx_np)
                 ),
+            )
+            if self._warming_substitute_drafts:
+                self._subtract_args_seen = subtract_args
+            seq_lens, self.position_ids = subtract_num_rejected_tokens_compiled(
+                *subtract_args
             )
 
         # For decode-only case, cache constant device tensors to skip H2D.
@@ -7471,6 +7479,37 @@ class TPUModelRunner(GPUModelRunner):
         )
         self._substitute_source_seen = None
 
+    def _precompile_subtract_num_rejected(self) -> None:
+        """`subtract_num_rejected_tokens_compiled` at every token bucket and
+        substitution row count a step can bring, on arguments like the ones
+        the real spec-decode warmup met (`_subtract_args_seen`); steps with a
+        prefill chunk otherwise compile it on the serving path."""
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            subtract_num_rejected_tokens_compiled,
+        )
+
+        template, self._subtract_args_seen = self._subtract_args_seen, None
+        if template is None:
+            return
+        seq_lens, positions, num_rejected, seq_idx, pos_idx = template
+        row_counts = {num_rejected.shape[0]} | {
+            _get_padded_num_reqs_with_upper_limit(n, self.max_num_reqs)
+            for n in range(1, self.max_num_reqs + 1)
+        }
+        with self._precompile_timed("subtract_num_rejected_tokens"):
+            for num_tokens in self.num_tokens_paddings:
+                tokens = positions.new_zeros((*positions.shape[:-1], num_tokens))
+                slots = pos_idx.new_full((num_tokens,), -1)
+                for rows in sorted(row_counts):
+                    out = subtract_num_rejected_tokens_compiled(
+                        seq_lens.clone(),
+                        tokens,
+                        num_rejected.new_zeros(rows),
+                        seq_idx,
+                        slots,
+                    )
+                    synchronize_tensors(out)
+
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
 
@@ -8141,6 +8180,7 @@ class TPUModelRunner(GPUModelRunner):
                     with self._warming_substitute_drafts_ctx():
                         self._warmup_spec_decode()
                     self._precompile_substitute_and_extract_drafts()
+                    self._precompile_subtract_num_rejected()
                 else:
                     self._warmup_spec_decode()
 
