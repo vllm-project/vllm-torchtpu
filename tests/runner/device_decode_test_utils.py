@@ -42,6 +42,7 @@ from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.device_decode import controller as controller_mod
 from vllm_torchtpu.runner.min_tokens import MinTokensTracker
+from vllm_torchtpu.runner.repetition_penalty import RepetitionPenaltyTracker
 from vllm_torchtpu.runner.tpu_runner import (
     MIN_NUM_SEQS,
     TPUModelRunner,
@@ -221,6 +222,12 @@ def make_runner(
     r.num_prompt_logprobs = {}
     r._prompt_logprobs_unsupported = "the CPU test runner"
     r._min_tokens = MinTokensTracker()
+    r._repetition_penalty = RepetitionPenaltyTracker(
+        VOCAB,
+        MAX_NUM_REQS,
+        async_scheduling=async_scheduling,
+        speculative_decoding=False,
+    )
     r.late_interaction_runner = SimpleNamespace(
         on_requests_finished=lambda _ids: None,
         register_request=lambda _req_id, _params: None,
