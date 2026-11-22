@@ -32,6 +32,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
     VllmGatedDeltaNetAttention,
     gdn_attention_core_tpu_pcp_prefill,
 )
+from vllm_torchtpu.layers.adapter.linear_common import PrequantLinearMethod
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -1938,3 +1939,193 @@ def test_flipped_qkvz_fp8_block_weight_is_the_kept_one_transposed(
     assert kept_weight.shape == weight.shape
     torch.testing.assert_close(flipped_weight, kept_weight.T, rtol=0, atol=0)
     torch.testing.assert_close(flipped_scale, kept_scale, rtol=0, atol=0)
+
+
+class _Proj:
+    """An input projection stand-in (a layer built without __init__ takes no
+    modules): records its forward inputs and returns a fixed output."""
+
+    def __init__(self, out, quant_method, bias=None, skip_bias_add=False):
+        self.out = out
+        self.quant_method = quant_method
+        self.bias = bias
+        self.skip_bias_add = skip_bias_add
+        self.forward_inputs = []
+
+    def __call__(self, x):
+        self.forward_inputs.append(x)
+        return self.out, None
+
+
+class _PrequantMethod(PrequantLinearMethod):
+    """A linear method that takes pre-quantized rows; records each call."""
+
+    def __init__(self, out):
+        self.out = out
+        self.calls = []
+
+    def apply_prequant(self, layer, x_q, x_s, bias=None):
+        self.calls.append((layer, x_q, x_s, bias))
+        return self.out
+
+
+def _prequant_rows(num_tokens, hidden, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(num_tokens, hidden, generator=g)
+    scale = x.abs().amax(dim=1, keepdim=True) / 448.0
+    return (x / scale).to(torch.float8_e4m3fn), scale.to(torch.float32)
+
+
+def _bare_gdn_attn():
+    """The forward's projection stage on a layer built without __init__: 4
+    value heads and 2 key heads of 16, one TP rank, mocked core op, norm and
+    out_proj (the harness of the forward tests above)."""
+    attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+    attn.num_spec = 0
+    attn.head_v_dim = 16
+    attn.num_v_heads = 4
+    attn.tp_size = 1
+    attn.prefix = "test_layer"
+    attn.gqa_interleaved_layout = False
+    attn.key_dim = 32
+    attn.num_k_heads = 2
+    attn.head_k_dim = 16
+    attn.value_dim = 64
+    attn.conv1d = MagicMock()
+    attn.conv1d.weight = torch.randn(1)
+    attn.conv1d.bias = torch.randn(1)
+    attn.A_log = torch.randn(1)
+    attn.dt_bias = torch.randn(1)
+    attn.kv_cache = (torch.ones(1), torch.ones(1))
+    attn.gdn_op = MagicMock(return_value=torch.randn(2, 4, 16))
+    attn.norm = MagicMock(return_value=torch.randn(2, 4, 16))
+    attn.out_proj = MagicMock(return_value=(torch.ones(2, 64), None))
+    metadata = MagicMock()
+    metadata.seq_lens = torch.ones(2)
+    metadata.block_tables = torch.tensor([5, 6, 7, 8])
+    metadata.mamba_state_indices = None
+    metadata.query_start_loc = torch.zeros(2)
+    metadata.request_distribution = torch.zeros(3)
+    metadata.mamba_request_distribution = None
+    metadata.mamba_slot_read_offsets = None
+    metadata.mamba_prefill_ckpt_offsets = None
+    forward_context = MagicMock()
+    forward_context.attn_metadata = {"test_layer": metadata}
+    return attn, forward_context
+
+
+@pytest.mark.parametrize("split_qkv_z", [False, True], ids=["qkvz", "qkv_z"])
+@patch("vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context")
+def test_forward_hands_prequant_rows_to_the_methods_that_take_them(
+    mock_get_forward_context, split_qkv_z
+):
+    """With `prequant`, each input projection whose method is a
+    PrequantLinearMethod applies it to the FP8 rows and scales (with the
+    layer's bias unless the layer skips adding it); the layer's own forward
+    does not run, and the core op sees the method outputs."""
+    attn, forward_context = _bare_gdn_attn()
+    mock_get_forward_context.return_value = forward_context
+    mixed_qkv = torch.randn(2, 128)
+    z = torch.randn(2, 64)
+    ba = torch.randn(2, 8)
+    bias = torch.randn(1)
+    if split_qkv_z:
+        projs = {
+            "in_proj_qkv": _Proj(None, _PrequantMethod(mixed_qkv), bias=bias),
+            "in_proj_z": _Proj(None, _PrequantMethod(z)),
+        }
+    else:
+        projs = {
+            "in_proj_qkvz": _Proj(
+                None, _PrequantMethod(torch.cat((mixed_qkv, z), -1)), bias=bias
+            )
+        }
+    projs["in_proj_ba"] = _Proj(
+        None, _PrequantMethod(ba), bias=torch.randn(1), skip_bias_add=True
+    )
+    for name, proj in projs.items():
+        setattr(attn, name, proj)
+    x_q, x_s = _prequant_rows(2, 64)
+
+    attn.forward(x_q, prequant=(x_q, x_s))
+
+    # The fused q|k|v projection adds its bias; in_proj_z has none and
+    # in_proj_ba skips adding its own.
+    expected_bias = {"in_proj_qkv": bias, "in_proj_qkvz": bias}
+    for name, proj in projs.items():
+        assert proj.forward_inputs == []
+        ((layer, got_q, got_s, got_bias),) = proj.quant_method.calls
+        assert layer is proj and got_q is x_q and got_s is x_s
+        assert got_bias is expected_bias.get(name)
+    core_args = attn.gdn_op.call_args[0]
+    torch.testing.assert_close(core_args[0], mixed_qkv)
+    torch.testing.assert_close(core_args[1], ba[:, :4])
+    torch.testing.assert_close(core_args[2], ba[:, 4:])
+    torch.testing.assert_close(attn.norm.call_args[0][1], z.reshape(2, 4, 16))
+
+
+@patch("vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context")
+def test_forward_runs_other_methods_on_the_dequantized_prequant_rows(
+    mock_get_forward_context,
+):
+    """A projection whose method is not a PrequantLinearMethod runs its own
+    forward on the dequantized rows. An `apply_prequant` attribute alone does
+    not make a method take pre-quantized rows."""
+    attn, forward_context = _bare_gdn_attn()
+    mock_get_forward_context.return_value = forward_context
+    stand_in = SimpleNamespace(apply_prequant=MagicMock())
+    attn.in_proj_qkvz = _Proj(torch.randn(2, 192), stand_in)
+    attn.in_proj_ba = _Proj(None, _PrequantMethod(torch.randn(2, 8)))
+    x_q, x_s = _prequant_rows(2, 64, seed=1)
+
+    attn.forward(x_q, prequant=(x_q, x_s))
+
+    stand_in.apply_prequant.assert_not_called()
+    (rows,) = attn.in_proj_qkvz.forward_inputs
+    assert rows.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        rows, (x_q.to(torch.float32) * x_s).to(torch.bfloat16), rtol=0, atol=0
+    )
+    assert len(attn.in_proj_ba.quant_method.calls) == 1
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
+def test_the_397b_fp8_input_projection_takes_prequantized_rows(
+    make_gdn_attention, tp_size
+):
+    """The Qwen3.5-397B FP8 checkpoint's GDN layer (16 key and 64 value heads
+    of 128, hidden 4096, 128 x 128 block scales, in_proj_b and in_proj_a left
+    bf16) requantizes in_proj_qkvz per channel at load, so the model patch's
+    FP8 row gather and fused input norm admit it at every decode and prefill
+    TP size; the bf16 in_proj_ba is not admitted."""
+    from vllm_torchtpu.models.vllm import qwen3_next_patch
+
+    attention, _ = make_gdn_attention(
+        tp_size,
+        0,
+        "fp8_block",
+        num_key_heads=16,
+        num_value_heads=64,
+        hidden_size=4096,
+    )
+    for proj in (attention.in_proj_qkvz, attention.in_proj_ba):
+        proj.quant_method.process_weights_after_loading(proj)
+    qkvz = attention.in_proj_qkvz
+    assert qkvz.weight.dtype == torch.float8_e4m3fn
+    assert qwen3_next_patch._takes_prequant_rows(qkvz)
+    assert attention.in_proj_ba.weight.dtype == torch.bfloat16
+    assert not qwen3_next_patch._takes_prequant_rows(attention.in_proj_ba)
+
+
+def test_the_pooled_pcp_forward_refuses_pre_quantized_rows():
+    """The pooled PCP forward reads hidden_states, which would hold the FP8 rows
+    without their scales, so it refuses pre-quantized rows instead of dropping
+    them."""
+    layer = SimpleNamespace(
+        kv_cache=[torch.zeros(4)], _has_active_pooled_pcp_state=lambda _kv: True
+    )
+    rows = torch.zeros(2, 8, dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="takes no pre-quantized rows"):
+        VllmGatedDeltaNetAttention.forward(
+            layer, rows, prequant=(rows, torch.ones(2, 1))
+        )

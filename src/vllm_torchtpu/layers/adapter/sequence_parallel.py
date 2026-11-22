@@ -31,18 +31,33 @@ _ACTIVE = True
 
 # Smallest step, in rows, that runs sequence-parallel. Below it the step keeps
 # its rows replicated over TP: slicing a few rows saves less in the MoE than the
-# extra all-gather and reduce-scatter cost. A layout measured to cross over at a
-# different row count gets an entry in _MIN_ROWS_BY_LAYOUT, keyed on
-# (data_parallel_size, tensor_parallel_size).
+# extra all-gather and reduce-scatter cost.
 #
-# 0: every sequence-parallel step stays sliced and every compile size follows
-# the TP alignment rule of _configure_sequence_parallel_moe. The model slices
-# every step it runs, so the threshold may rise only once the model follows
-# each step's form (is_active).
-# TODO: raise it, per layout, with the change that makes the Qwen3.5 model
-# follow each step's form.
+# Only a model whose forward follows each step's form (it slices a step's rows
+# exactly when the runner marks the step sequence-parallel) can run a step
+# replicated, so the threshold applies once such a model calls
+# follow_step_form(). Until then it is DEFAULT_MIN_ROWS, 0: every
+# sequence-parallel step stays sliced and every compile size follows main's
+# alignment rule, as on main.
 DEFAULT_MIN_ROWS = 0
-_MIN_ROWS_BY_LAYOUT: dict[tuple[int, int], int] = {}
+# The threshold for a model that follows the step's form: STEP_FORM_MIN_ROWS,
+# or the entry of a layout measured to cross over at a different row count,
+# keyed on (data_parallel_size, tensor_parallel_size). The values are the
+# Qwen3.5-397B decode crossovers: 64 rows at DP4 x TP2 and 512 at TP8.
+STEP_FORM_MIN_ROWS = 512
+_MIN_ROWS_BY_LAYOUT: dict[tuple[int, int], int] = {(4, 2): 64, (1, 8): 512}
+_FOLLOWS_STEP_FORM = False
+
+# A speculative drafter is compiled apart from the model, so its forward and
+# MoE read whatever step form was recorded last. Only an MTP proposer that
+# records each draft forward's own form with set_active before running it
+# lets a draft run replicated rows; with any other, a draft would run on the
+# form of the target step before it. So for an engine with a drafter the row
+# threshold stays DEFAULT_MIN_ROWS (every sequence-parallel step sliced, the
+# draft included, as on main) until the proposer records the draft's form.
+# The proposer change that records it sets this to True.
+DRAFT_RECORDS_STEP_FORM = False
+_HAS_DRAFTER = False
 
 
 def parallel_layout(
@@ -64,13 +79,49 @@ def parallel_layout(
     )
 
 
+def follow_step_form() -> None:
+    """Record that the model's forward follows each step's form.
+
+    Called by a model patch that slices a step's rows only when the runner
+    marks the step sequence-parallel (``set_active``); from then on a step
+    below ``min_rows()`` runs replicated, and the runner writes the per-rank
+    padding mask only for a sliced step (``step_rows_are_sliced``).
+    """
+    global _FOLLOWS_STEP_FORM
+    _FOLLOWS_STEP_FORM = True
+
+
+def follows_step_form() -> bool:
+    return _FOLLOWS_STEP_FORM
+
+
+def set_has_drafter(has_drafter: bool) -> None:
+    """Record whether the engine runs a speculative drafter. The platform's
+    sequence-parallel check records it in the engine process, and the runner
+    in each worker, before any compile size or step is sized."""
+    global _HAS_DRAFTER
+    _HAS_DRAFTER = bool(has_drafter)
+
+
+def gates_rows() -> bool:
+    """Whether steps below the layout's threshold run replicated: the model
+    follows each step's form, and the engine has no drafter or one whose
+    proposer records each draft forward's form (DRAFT_RECORDS_STEP_FORM)."""
+    return _FOLLOWS_STEP_FORM and (DRAFT_RECORDS_STEP_FORM or not _HAS_DRAFTER)
+
+
 def min_rows(parallel_config: ParallelConfig | None = None) -> int:
     """The row threshold for the layout of ``parallel_config``, or of this
-    process's model-parallel groups when it is None."""
+    process's model-parallel groups when it is None: DEFAULT_MIN_ROWS until a
+    model follows each step's form (and, with a drafter, until its proposer
+    records each draft forward's form; see gates_rows), then the layout's
+    entry or STEP_FORM_MIN_ROWS."""
+    if not gates_rows():
+        return DEFAULT_MIN_ROWS
     layout = parallel_layout(parallel_config)
     if layout is None:
-        return DEFAULT_MIN_ROWS
-    return _MIN_ROWS_BY_LAYOUT.get(layout, DEFAULT_MIN_ROWS)
+        return STEP_FORM_MIN_ROWS
+    return _MIN_ROWS_BY_LAYOUT.get(layout, STEP_FORM_MIN_ROWS)
 
 
 def enabled() -> bool:
@@ -95,6 +146,19 @@ def fp8_gather() -> bool:
 
 def step_is_sequence_parallel(full_num_tokens: int) -> bool:
     return enabled() and int(full_num_tokens) >= min_rows()
+
+
+def step_rows_are_sliced(parallel_config: ParallelConfig, full_num_tokens: int) -> bool:
+    """Whether the forward about to run slices this step's rows over TP: the
+    model follows each step's form, sequence-parallel MoE is admitted
+    (``use_sequence_parallel_moe``, which vLLM's Qwen3.5 decoder layers set
+    ``use_attn_reduce_scatter_for_moe`` from), and the step is
+    sequence-parallel. Otherwise the MoE layers get every row of the step."""
+    return (
+        _FOLLOWS_STEP_FORM
+        and parallel_config.use_sequence_parallel_moe
+        and step_is_sequence_parallel(full_num_tokens)
+    )
 
 
 def set_active(active: bool) -> None:

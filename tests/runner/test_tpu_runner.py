@@ -30,6 +30,7 @@ from runner_output_test_utils import (
 )
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -1411,6 +1412,9 @@ class TestStartStopPhasedProfiling:
 @pytest.mark.tpu_test
 class TestTPURunner:
     def setup_method(self):
+        self._setup_runner()
+
+    def _setup_runner(self, device_config: DeviceConfig | None = None):
         self.mock_device = torch.device("cpu")
 
         model_config = ModelConfig(
@@ -1440,6 +1444,7 @@ class TestTPURunner:
             parallel_config=parallel_config,
             observability_config={},
             additional_config={},
+            **({} if device_config is None else {"device_config": device_config}),
         )
 
         self.runner = MagicMock(spec=TPUModelRunner)
@@ -1539,6 +1544,70 @@ class TestTPURunner:
             self.runner.max_num_tokens + 1,
         )
         assert self.runner.mrope_positions.np.dtype == np.int32
+
+
+class _StopInit(Exception):
+    """Raised by a stand-in to end TPUModelRunner.__init__ at the call a test
+    checks."""
+
+
+class TestTPURunnerInitOnHost:
+    """TPUModelRunner.__init__ steps that need no chip, on the CPU lane: the
+    engine config names the CPU device and the TPU-only helpers are patched
+    out."""
+
+    def setup_method(self):
+        TestTPURunner._setup_runner(self, device_config=DeviceConfig(device="cpu"))
+
+    def teardown_method(self):
+        self._find_non_ssm_backend_patcher.stop()
+
+    @pytest.mark.parametrize("has_drafter", [False, True])
+    def test_init_records_whether_a_drafter_runs(self, has_drafter):
+        """The worker records whether a drafter runs before the model loads:
+        the sequence-parallel row threshold depends on it. __init__ stops right
+        after that call, so nothing later in it needs a chip."""
+        self.runner.dtype = torch.bfloat16
+        self.runner.parallel_config = self.runner.vllm_config.parallel_config
+        self.runner.uses_mrope = False
+        self.runner.supports_mm_inputs = False
+        self.runner.vllm_config.compilation_config.compile_sizes = [16, 2048]
+        self.runner._make_buffer = GPUModelRunner._make_buffer.__get__(self.runner)
+        self.runner.input_batch = SimpleNamespace(thinking_budget_state_holder=None)
+        if has_drafter:
+            self.runner.vllm_config.speculative_config = SimpleNamespace(
+                method="mtp", num_speculative_tokens=3
+            )
+        recorded = []
+
+        def record_and_stop(has_drafter):
+            recorded.append(has_drafter)
+            raise _StopInit
+
+        with (
+            patch.object(GPUModelRunner, "__init__", return_value=None),
+            patch(
+                "vllm_torchtpu.runner.tpu_runner._torch_tpu_wrapper",
+                side_effect=lambda: contextlib.nullcontext(),
+            ),
+            patch("vllm_torchtpu.runner.tpu_runner._validate_libtpu_version"),
+            patch.object(
+                TPUModelRunner, "_create_mesh_for_parallelism", return_value=MagicMock()
+            ),
+            patch.object(
+                tpu_runner.sequence_parallel, "set_has_drafter", record_and_stop
+            ),
+            pytest.raises(_StopInit),
+        ):
+            TPUModelRunner.__init__(
+                self.runner,
+                self.runner.vllm_config,
+                self.mock_device,
+                profiler_rank=0,
+                profiler_world_size=1,
+            )
+
+        assert recorded == [has_drafter]
 
 
 class TestAttentionMetadataBuilder:

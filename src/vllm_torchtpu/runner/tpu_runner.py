@@ -1202,6 +1202,9 @@ class TPUModelRunner(GPUModelRunner):
 
         self.speculative_config = self.vllm_config.speculative_config
         speculative_config = self.speculative_config
+        # Before the model loads: the sequence-parallel row threshold depends
+        # on whether a drafter runs (sequence_parallel.gates_rows).
+        sequence_parallel.set_has_drafter(speculative_config is not None)
         # The producer populates draft context KV without generating proposals.
         self._is_dspark_pd_producer = bool(
             transfer_config is not None
@@ -9127,17 +9130,23 @@ class TPUModelRunner(GPUModelRunner):
         self,
         num_tokens_padded: int,
         num_valid_tokens: int | None = None,
-        rows_sliced: bool = False,
+        rows_sliced: bool | None = None,
     ) -> None:
         """Record which of this step's token rows are padding.
 
         `num_valid_tokens` is the step's real token count; None takes it from
         the sequence layout plan (the ALL layout only, else no row is
-        padding). `rows_sliced` writes this rank's slice of the mask instead
-        of all `num_tokens_padded` rows.
-
-        TODO: pass rows_sliced=True from the change that makes the model
-        follow each step's form; until then every caller writes the full mask.
+        padding). `rows_sliced` says whether the forward about to run slices
+        its rows over TP (each rank owns `num_tokens_padded // tp` rows): the
+        mask is then this rank's slice. Otherwise it covers all
+        `num_tokens_padded` rows, which every rank holds. None takes the
+        decision the target forward makes, `sequence_parallel.step_rows_are_sliced`:
+        sliced only when sequence-parallel MoE is admitted, the step is
+        sequence-parallel and the model follows each step's form. Any other
+        forward gets the full mask, because its MoE paths read the mask over
+        all of a step's rows: written for a forward that reads every row, the
+        per-rank slice marks other ranks' real rows as padding and the MoE
+        drops their experts.
         """
         padding_state = getattr(self, "_token_padding_state", None)
         if padding_state is None:
@@ -9152,6 +9161,10 @@ class TPUModelRunner(GPUModelRunner):
                 # Padding-mask support is currently limited to the ALL layout.
                 valid_tokens = num_tokens_padded
         tp_size = self.parallel_config.tensor_parallel_size
+        if rows_sliced is None:
+            rows_sliced = sequence_parallel.step_rows_are_sliced(
+                self.parallel_config, num_tokens_padded
+            )
         if rows_sliced and tp_size > 1:
             chunk = num_tokens_padded // tp_size
             tp_rank = get_tensor_model_parallel_rank()

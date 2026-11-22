@@ -42,6 +42,15 @@ def configure_sp_moe():
         yield _configure_sequence_parallel_moe
 
 
+@pytest.fixture(autouse=True)
+def _restore_the_drafter_record(monkeypatch):
+    """_configure_sequence_parallel_moe records whether a drafter runs; keep
+    that record from leaking into later tests."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    monkeypatch.setattr(sequence_parallel, "_HAS_DRAFTER", False)
+
+
 @pytest.fixture
 def all_buckets_sequence_parallel(monkeypatch):
     """A threshold of 1 row: no bucket runs replicated, so every one must split."""
@@ -142,6 +151,7 @@ def test_sequence_parallel_buckets_follow_the_engines_layout(
     before any model-parallel group exists, so it must pass its config."""
     from vllm_torchtpu.layers.adapter import sequence_parallel
 
+    monkeypatch.setattr(sequence_parallel, "_FOLLOWS_STEP_FORM", True)
     monkeypatch.setitem(sequence_parallel._MIN_ROWS_BY_LAYOUT, (4, 2), 64)
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,
@@ -241,6 +251,37 @@ def test_sequence_parallel_admits_mtp(configure_sp_moe):
     )
     configure_sp_moe(vllm_config)
     assert vllm_config.compilation_config.compile_sizes == [16, 32, 64]
+
+
+def test_with_an_mtp_drafter_buckets_keep_mains_rule_until_the_draft_form_is_recorded(
+    configure_sp_moe, monkeypatch
+):
+    """With an MTP drafter and no record of each draft forward's form, every
+    bucket must split as on main (threshold 0); with the record the layout's
+    threshold keeps the small replicated buckets."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    monkeypatch.setattr(sequence_parallel, "_FOLLOWS_STEP_FORM", True)
+    monkeypatch.setitem(sequence_parallel._MIN_ROWS_BY_LAYOUT, (4, 2), 64)
+
+    def configure(records):
+        monkeypatch.setattr(sequence_parallel, "DRAFT_RECORDS_STEP_FORM", records)
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                use_sequence_parallel_moe=True,
+                data_parallel_size=4,
+                tensor_parallel_size=2,
+                pipeline_parallel_size=1,
+            ),
+            model_config=SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"]),
+            compilation_config=SimpleNamespace(compile_sizes=[8, 24, 48, 72, 96, 1024]),
+            speculative_config=SimpleNamespace(method="mtp"),
+        )
+        configure_sp_moe(vllm_config)
+        return vllm_config.compilation_config.compile_sizes
+
+    assert configure(records=False) == [8, 48, 96, 1024]
+    assert configure(records=True) == [8, 24, 48, 96, 1024]
 
 
 @pytest.mark.parametrize("method", ["eagle", "ngram"])

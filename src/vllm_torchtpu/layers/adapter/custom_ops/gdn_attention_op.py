@@ -26,7 +26,7 @@ from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.model_executor.layers.linear import LinearBase, MergedColumnParallelLinear
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
@@ -56,7 +56,10 @@ from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
 )
-from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    PrequantLinearMethod,
+)
 from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention,
     run_jax_gdn_attention_pcp_tp_prefill,
@@ -368,6 +371,27 @@ def _get_shared_gdn_op(kind: str, key: tuple, build: Callable[[str], Any]) -> An
         op = build(f"pallas::{kind}_{next(_shared_gdn_op_ids)}")
         _shared_gdn_ops[(kind, key)] = op
     return op
+
+
+def _project_prequant(
+    layer: LinearBase, prequant: tuple[torch.Tensor, torch.Tensor]
+) -> torch.Tensor:
+    """One input projection of rows already quantized per row to FP8
+    (values, scales), which the Qwen3.5 model patch hands the layer from its
+    sequence-parallel FP8 all-gather or fused input norm when the layer's main
+    projection serves them. They are the only rows the layer has, so every
+    projection gets them, whether or not its method serves them as its
+    `apply` would (`serves_prequant_rows`): a
+    `linear_common.PrequantLinearMethod` (the TPU FP8 and unquantized linear
+    methods) applies the layer to them with `apply_prequant`; any other method
+    runs the layer's own forward on the dequantized rows."""
+    x_q, x_s = prequant
+    method = layer.quant_method
+    if isinstance(method, PrequantLinearMethod):
+        bias = None if layer.skip_bias_add else cast("torch.Tensor | None", layer.bias)
+        return method.apply_prequant(layer, x_q, x_s, bias)
+    out, _ = layer((x_q.to(torch.float32) * x_s).to(torch.bfloat16))
+    return out
 
 
 @QwenGatedDeltaNetAttention.register_oot
@@ -1207,9 +1231,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         kv_cache = self.kv_cache
         if self._has_active_pooled_pcp_state(kv_cache):
+            if prequant is not None:
+                # hidden_states would then be the FP8 rows, without scales.
+                raise ValueError(
+                    "The pooled PCP GDN forward reads hidden_states and takes no "
+                    "pre-quantized rows; a PCP-streaming layer is never marked "
+                    "for them (_mark_pre_attn_norm_quant)."
+                )
             assert kv_cache is not None
             attn_metadata = cast(
                 "dict[str, _GdnAttentionMetadata]", get_forward_context().attn_metadata
@@ -1220,25 +1252,42 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 attn_metadata,
             )
 
-        mixed_qkv, z, b, a = self._project_inputs(hidden_states)
+        mixed_qkv, z, b, a = self._project_inputs(hidden_states, prequant)
         return self.forward_projected(mixed_qkv, z, b, a)
 
     def _project_inputs(
-        self, hidden_states: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Part 1, the input projection: (mixed_qkv, z, b, a)."""
         if hasattr(self, "in_proj_qkv"):
-            mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
-            z, _ = self.in_proj_z(hidden_states)
+            if prequant is None:
+                mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+                ba, _ = self.in_proj_ba(hidden_states)
+                z, _ = self.in_proj_z(hidden_states)
+            else:
+                # Cast like every projection here: the type checker can see a
+                # submodule as `Module | Tensor`.
+                mixed_qkv = _project_prequant(
+                    cast(LinearBase, self.in_proj_qkv), prequant
+                )
+                ba = _project_prequant(cast(LinearBase, self.in_proj_ba), prequant)
+                z = _project_prequant(cast(LinearBase, self.in_proj_z), prequant)
             if self.fused_output_projection is None:
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
             a = a.contiguous()
         else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+            if prequant is None:
+                mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+                ba, _ = self.in_proj_ba(hidden_states)
+            else:
+                mixed_qkvz = _project_prequant(
+                    cast(LinearBase, self.in_proj_qkvz), prequant
+                )
+                ba = _project_prequant(cast(LinearBase, self.in_proj_ba), prequant)
 
             # Every checkpoint loader produces [q, k, v, z] and [b, a].
             qkv_size = self.tp_head_geometry.local_conv_dim(

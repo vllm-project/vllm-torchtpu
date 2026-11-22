@@ -29,9 +29,17 @@ def _parallel(dp, tp):
     return SimpleNamespace(data_parallel_size=dp, tensor_parallel_size=tp)
 
 
+# A layout where sequence-parallel MoE is admitted (ParallelConfig's
+# use_sequence_parallel_moe), and one where it is not.
+_ADMITTED = SimpleNamespace(use_sequence_parallel_moe=True)
+_NOT_ADMITTED = SimpleNamespace(use_sequence_parallel_moe=False)
+
+
 @pytest.fixture
 def groups(monkeypatch):
-    """Initialized model-parallel groups of a chosen (dp, tp) layout."""
+    """Initialized model-parallel groups of a chosen (dp, tp) layout, in an
+    engine without a drafter unless a test says otherwise."""
+    monkeypatch.setattr(sp, "_HAS_DRAFTER", False)
 
     def set_layout(dp, tp):
         monkeypatch.setattr(
@@ -71,20 +79,91 @@ def test_a_small_step_stays_sliced_until_a_model_follows_the_form(groups, monkey
 
 
 @pytest.mark.parametrize("layout", [(1, 8), (4, 2), (2, 4)])
-def test_unlisted_layouts_use_the_default(groups, layout):
+def test_every_layout_uses_the_default_until_a_model_follows_the_form(groups, layout):
     groups(*layout)
     assert sp.min_rows() == sp.DEFAULT_MIN_ROWS
     assert sp.min_rows(_parallel(*layout)) == sp.DEFAULT_MIN_ROWS
 
 
 def test_a_layout_entry_applies_to_that_layout_only(groups, monkeypatch):
-    monkeypatch.setitem(sp._MIN_ROWS_BY_LAYOUT, (4, 2), 64)
-    groups(4, 2)
-    assert sp.min_rows() == 64
-    groups(1, 8)
-    assert sp.min_rows() == sp.DEFAULT_MIN_ROWS
+    monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", True)
+    monkeypatch.setitem(sp._MIN_ROWS_BY_LAYOUT, (2, 4), 96)
+    groups(2, 4)
+    assert sp.min_rows() == 96
+    groups(2, 2)
+    assert sp.min_rows() == sp.STEP_FORM_MIN_ROWS
     # An explicit parallel config wins over the process's groups.
-    assert sp.min_rows(_parallel(4, 2)) == 64
+    assert sp.min_rows(_parallel(2, 4)) == 96
+
+
+@pytest.mark.parametrize(
+    "layout,threshold", [((4, 2), 64), ((1, 8), 512), ((2, 4), 512), ((1, 2), 512)]
+)
+def test_a_model_that_follows_the_form_raises_the_threshold(
+    groups, monkeypatch, layout, threshold
+):
+    """The Qwen3.5 decode crossovers: 64 rows at DP4 x TP2, 512 at TP8 and on
+    unlisted layouts. Before a model follows the form, every layout keeps 0."""
+    groups(*layout)
+    monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", False)
+    assert sp.min_rows() == 0
+    sp.follow_step_form()
+    assert sp.follows_step_form()
+    assert sp.min_rows() == threshold
+    assert sp.min_rows(_parallel(*layout)) == threshold
+
+
+@pytest.mark.parametrize("layout,threshold", [((4, 2), 64), ((1, 8), 512)])
+def test_with_a_drafter_the_threshold_waits_for_the_draft_form_record(
+    groups, monkeypatch, layout, threshold
+):
+    """A drafter's forward and MoE read the last recorded step form. Until its
+    proposer records each draft forward's form (DRAFT_RECORDS_STEP_FORM), an
+    engine with a drafter keeps every sequence-parallel step sliced, as on
+    main; with the record the layout's threshold applies, and without a
+    drafter it applies as before."""
+    groups(*layout)
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", True)
+    monkeypatch.setattr(sp, "DRAFT_RECORDS_STEP_FORM", False)
+    sp.set_has_drafter(True)
+    assert not sp.gates_rows()
+    assert sp.min_rows() == sp.min_rows(_parallel(*layout)) == 0
+    # A small step stays sliced, and its mask is each rank's slice.
+    assert sp.step_is_sequence_parallel(4)
+    assert sp.step_rows_are_sliced(_ADMITTED, 4)
+    monkeypatch.setattr(sp, "DRAFT_RECORDS_STEP_FORM", True)
+    assert sp.gates_rows()
+    assert sp.min_rows() == sp.min_rows(_parallel(*layout)) == threshold
+    assert not sp.step_is_sequence_parallel(threshold - 1)
+    monkeypatch.setattr(sp, "DRAFT_RECORDS_STEP_FORM", False)
+    sp.set_has_drafter(False)
+    assert sp.min_rows() == threshold
+
+
+def test_a_step_is_sliced_only_for_a_model_that_follows_the_form(groups, monkeypatch):
+    groups(1, 8)
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", False)
+    assert sp.step_is_sequence_parallel(512) is True
+    assert sp.step_rows_are_sliced(_ADMITTED, 512) is False
+    monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", True)
+    assert sp.step_rows_are_sliced(_ADMITTED, 512) is True
+    assert sp.step_rows_are_sliced(_ADMITTED, 511) is False
+
+
+def test_a_step_is_sliced_only_where_sequence_parallel_moe_is_admitted(
+    groups, monkeypatch
+):
+    """TPU_MOE_SEQUENCE_PARALLEL=1 alone makes a model follow each step's
+    form, but vLLM's decoder layers slice rows only where sequence-parallel
+    MoE is admitted (not without expert parallelism, for example)."""
+    groups(1, 8)
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    monkeypatch.setattr(sp, "_FOLLOWS_STEP_FORM", True)
+    assert sp.step_is_sequence_parallel(512) is True
+    assert sp.step_rows_are_sliced(_NOT_ADMITTED, 512) is False
+    assert sp.step_rows_are_sliced(_ADMITTED, 512) is True
 
 
 @pytest.mark.parametrize(
