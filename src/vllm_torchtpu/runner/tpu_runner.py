@@ -761,11 +761,27 @@ def _candidate_verify_fused_program(vocab_size: int, synthetic: bool):
     `hidden[indices]` that `compute_selected_local_logits` runs, in place of
     the `local_logits` argument; with `read_offsets`
     (VLLM_TPU_CANDIDATE_VERIFY_RO) the post-verify `_update_read_offsets_impl`
-    scatter, a function of the verify output only."""
+    scatter; with `seed_input_ids` (VLLM_TPU_CANDIDATE_VERIFY_SEED) the
+    drafter's fused async seed (`_async_seed_inputs_impl`) on the verify
+    output, returned after it. The last two read the verify output only."""
+    from vllm_torchtpu.spec_decode.eagle3 import _async_seed_inputs_impl
+
     verify = _candidate_verify_fn(vocab_size, synthetic)
 
     def candidate_verify_fused(
-        read_offsets, groups, ro_num_reqs, head, hidden, indices, *args
+        read_offsets,
+        groups,
+        ro_num_reqs,
+        head,
+        hidden,
+        indices,
+        seed_query_start_loc,
+        seed_num_reqs,
+        seed_input_ids,
+        seed_p,
+        seed_num_rows,
+        seed_override,
+        *args,
     ):
         if head is not None:
             selected = torch.index_select(hidden, 0, indices)
@@ -774,7 +790,19 @@ def _candidate_verify_fused_program(vocab_size: int, synthetic: bool):
         out = verify(*args)
         if read_offsets is not None:
             _update_read_offsets_impl(read_offsets, groups, out, ro_num_reqs)
-        return out
+        if seed_input_ids is None:
+            return out
+        seed = _async_seed_inputs_impl(
+            out,
+            args[5],  # the draft lengths the verify reads
+            seed_query_start_loc,
+            seed_num_reqs,
+            seed_input_ids,
+            seed_p,
+            seed_num_rows,
+            seed_override,
+        )
+        return out, *seed
 
     return _static_shape_args(_tpu_compile(candidate_verify_fused))
 
@@ -2104,6 +2132,8 @@ class TPUModelRunner(GPUModelRunner):
         self._num_reqs_device: dict[int, torch.Tensor] = {}
         self._fused_read_offsets: tuple = (None, 0)
         self._fused_read_offsets_applied = False
+        self._verify_seed_chunk: DraftChunkInputs | None = None
+        self._partial_requests: tuple | None = None
         # Drafting and verification happen where sampling happens, on the
         # last pipeline stage; the other stages keep the config for the KV
         # cache spec and the scheduler, and nothing else.
@@ -6202,6 +6232,12 @@ class TPUModelRunner(GPUModelRunner):
         assert md.draft_token_ids is not None, "deferred draft_token_ids never filled"
         if isinstance(logits, VocabShardLogits):
             read_offsets = self._candidate_read_offsets()
+            hidden_rows = (
+                None if logits.local is not None else (logits.hidden, logits.indices)
+            )
+            seed_args = None
+            if hidden_rows is not None:
+                seed_args = self._candidate_seed_args(md, scheduler_output)
             out = self._sample_spec_verify_candidates(
                 logits.local,
                 md,
@@ -6209,9 +6245,15 @@ class TPUModelRunner(GPUModelRunner):
                 cur_end_idx,
                 sampling_generator,
                 read_offsets,
-                None if logits.local is not None else (logits.hidden, logits.indices),
+                hidden_rows,
+                seed_args,
             )
             self._fused_read_offsets_applied = read_offsets is not None
+            if seed_args is not None:
+                out, *seed_out = out
+                self._async_drafter.stash_verify_seed(
+                    self._verify_seed_chunk, out, tuple(seed_out)
+                )
             return out
         if top_tokens:
             assert self.rejection_sampler is not None
@@ -6701,18 +6743,25 @@ class TPUModelRunner(GPUModelRunner):
         elif is_spec_step:
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, md, mamba_indices, boundary_plan in zip(
+            draft_chunks = (
+                state.draft_chunks
+                if len(state.draft_chunks) == len(state.logits_list)
+                else [None] * len(state.logits_list)
+            )
+            for logits, num_reqs, md, mamba_indices, boundary_plan, chunk in zip(
                 state.logits_list,
                 state.num_reqs_list,
                 state.spec_decode_metadata_list,
                 mamba_idx_list,
                 boundary_plans,
+                draft_chunks,
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
                     host_phases.mark("sample_setup")
                     self._fused_read_offsets = (mamba_indices, num_reqs)
                     self._fused_read_offsets_applied = False
+                    self._verify_seed_chunk = chunk
 
                     with self._stage_timing.stage("sample"):
                         next_tokens = self._sample_spec_verify_chunk(
@@ -6726,6 +6775,7 @@ class TPUModelRunner(GPUModelRunner):
                             sampling_generator,
                             state.top_tokens,
                         )
+                    self._verify_seed_chunk = None
                     host_phases.mark("vfy_rejection")
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
@@ -6935,6 +6985,7 @@ class TPUModelRunner(GPUModelRunner):
             )
             # Ignore the sampled token from the partial request.
             # Rewind the generator state as if the token was not sampled.
+            # (_partial_request_indices applies the same rule.)
             if seq_len < req_state.num_tokens:
                 generator = self.input_batch.generators.get(i)
                 if generator is not None:
@@ -8637,18 +8688,34 @@ class TPUModelRunner(GPUModelRunner):
                     for sh in shapes
                 ]
                 read_offsets.append((scratch, groups, 1))
+        # The folded async seed rides on the folded projection only, at the
+        # seed keys a verify chunk of this bucket reaches.
+        seeds: list = [None]
+        if (
+            envs.VLLM_TPU_CANDIDATE_VERIFY_SEED
+            and envs.VLLM_TPU_CANDIDATE_VERIFY_LOGITS
+            and hasattr(getattr(self, "_async_drafter", None), "async_seed_warm_args")
+        ):
+            seeds += [
+                (warm_md.draft_lengths, *args[1:])
+                for args in self._async_drafter.async_seed_warm_args(
+                    num_tokens, bonus_logits_indices.shape[0]
+                )
+            ]
         for hidden_rows in projections:
             for ro in read_offsets:
-                out = self._sample_spec_verify_candidates(
-                    warm_local if hidden_rows is None else None,
-                    warm_md,
-                    0,
-                    0,
-                    self._get_sampling_generator(),
-                    ro,
-                    hidden_rows,
-                )
-                synchronize_tensors(out)
+                for seed in seeds if hidden_rows is not None else [None]:
+                    out = self._sample_spec_verify_candidates(
+                        warm_local if hidden_rows is None else None,
+                        warm_md,
+                        0,
+                        0,
+                        self._get_sampling_generator(),
+                        ro,
+                        hidden_rows,
+                        seed,
+                    )
+                    synchronize_tensors(out)
 
     def _precompile_verify_fused(
         self,
@@ -10672,7 +10739,8 @@ class TPUModelRunner(GPUModelRunner):
         sampling_generator: torch.Generator | None,
         read_offsets: tuple | None = None,
         hidden_rows: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
+        seed_args: tuple | None = None,
+    ) -> torch.Tensor | tuple:
         """`_sample_spec_verify_chunk` for a non-greedy step from this rank's
         logits shard: the same distributions, drawn over per-shard top-64
         candidates (layers/core/candidate_sampling.py); the draws differ
@@ -10680,7 +10748,9 @@ class TPUModelRunner(GPUModelRunner):
         `_candidate_read_offsets`) the program also scatters the chunk's
         mamba read offsets; with `hidden_rows` = (hidden states, logits
         indices) in place of `local_logits` it also projects the logits
-        (VLLM_TPU_CANDIDATE_VERIFY_LOGITS)."""
+        (VLLM_TPU_CANDIDATE_VERIFY_LOGITS); with `seed_args` (the drafter's
+        `verify_seed_args`) it returns (tokens, *the fused async seed's
+        outputs) (VLLM_TPU_CANDIDATE_VERIFY_SEED)."""
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
         assert self._candidate_bounds is not None
@@ -10735,7 +10805,7 @@ class TPUModelRunner(GPUModelRunner):
             width,
             self.speculative_config.num_speculative_tokens,
         )
-        if read_offsets is None and hidden_rows is None:
+        if read_offsets is None and hidden_rows is None and seed_args is None:
             return _candidate_verify_program(head.org_vocab_size, synthetic)(*args)
         ro_args: tuple = (None, None, None)
         if read_offsets is not None:
@@ -10754,9 +10824,60 @@ class TPUModelRunner(GPUModelRunner):
                 "CANDIDATE_VERIFY_LOGITS: the LM head projection in the "
                 "candidate verify program"
             )
+        if seed_args is not None:
+            logger.info_once(
+                "CANDIDATE_VERIFY_SEED: the drafter's async seed in the "
+                "candidate verify program"
+            )
+            # The seed's draft counts are the verify's (one tensor, so the
+            # program does not see it twice).
+            assert seed_args[0] is md.draft_lengths
         return _candidate_verify_fused_program(head.org_vocab_size, synthetic)(
-            *ro_args, *logits_args, *args
+            *ro_args, *logits_args, *(seed_args or (None,) * 7)[1:], *args
         )
+
+    def _candidate_seed_args(
+        self, md: SpecDecodeMetadata, scheduler_output: "SchedulerOutput"
+    ) -> tuple | None:
+        """VLLM_TPU_CANDIDATE_VERIFY_SEED: the drafter's fused async seed
+        arguments for this verify chunk (`self._verify_seed_chunk`, set by
+        sample_tokens), or None to leave the seed to the drafter. Folded only
+        with the in-program LM head projection, so the verify warmup's keys
+        cover it."""
+        chunk = self._verify_seed_chunk
+        if not envs.VLLM_TPU_CANDIDATE_VERIFY_SEED or chunk is None:
+            return None
+        drafter = getattr(self, "_async_drafter", None)
+        if drafter is None or not hasattr(drafter, "verify_seed_args"):
+            return None
+        return drafter.verify_seed_args(
+            chunk,
+            md.bonus_logits_indices.shape[0],
+            self._partial_request_indices(scheduler_output),
+            scheduler_output,
+        )
+
+    def _partial_request_indices(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> list[int]:
+        """Batch rows of the requests this step leaves short of their tokens
+        (a partial prefill chunk), whose sampled token sample_tokens
+        discards. Computed once per step."""
+        cached = self._partial_requests
+        if cached is not None and cached[0] is scheduler_output:
+            return cached[1]
+        out = []
+        req_ids = self.input_batch.req_ids[: self.input_batch.num_reqs]
+        for i, req_id in enumerate(req_ids):
+            req_state = self.requests[req_id]
+            seq_len = (
+                req_state.num_computed_tokens
+                + scheduler_output.num_scheduled_tokens[req_id]
+            )
+            if seq_len < req_state.num_tokens:
+                out.append(i)
+        self._partial_requests = (scheduler_output, out)
+        return out
 
     @staticmethod
     def _verify_projects_logits(

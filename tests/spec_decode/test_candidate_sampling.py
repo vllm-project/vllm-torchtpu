@@ -443,17 +443,36 @@ def test_candidate_verify_fused_program_folds_neighbours(monkeypatch):
         num_reqs = torch.tensor(2)
         args = (None,) * 13 + (2, 3)
         program = tr._candidate_verify_fused_program(100, False)
-        out = program(got, groups, num_reqs, head, hidden, indices, *args)
+        no_seed = (None,) * 6
+        out = program(got, groups, num_reqs, head, hidden, indices, *no_seed, *args)
         assert out is next_tokens
         assert torch.equal(seen[-1], hidden[indices.long()] @ weight.T)
         tr._update_read_offsets_impl(want, groups, next_tokens, num_reqs)
         assert torch.equal(got, want)
         assert got.tolist() == [0, 0, 0, 1, 9, 9, 1, 9]
         local = torch.ones(3, 3)
-        assert program(None, None, None, None, None, None, local, *args[1:]) is (
-            next_tokens
-        )
+        none3 = (None,) * 3
+        assert program(*none3, *none3, *no_seed, local, *args[1:]) is next_tokens
         assert seen[-1] is local
+        # VLLM_TPU_CANDIDATE_VERIFY_SEED: the drafter's fused seed on the
+        # verify output, reading the verify's draft lengths.
+        from vllm_torchtpu.spec_decode.eagle3 import _async_seed_inputs_impl
+
+        draft_lengths = torch.tensor([3, 3, 3], dtype=torch.int32)
+        seed = (
+            torch.tensor([0, 4, 8, 12], dtype=torch.int32),
+            torch.tensor(2),
+            torch.arange(12, dtype=torch.int32),
+            4,
+            0,
+            None,
+        )
+        verify_args = (local, *args[1:5], draft_lengths, *args[6:])
+        out = program(*none3, *none3, *seed, *verify_args)
+        want_seed = _async_seed_inputs_impl(next_tokens, draft_lengths, *seed)
+        assert out[0] is next_tokens and len(out) == 1 + len(want_seed)
+        for a, b in zip(out[1:], want_seed):
+            assert torch.equal(a, b)
     finally:
         tr._candidate_verify_fn.cache_clear()
         tr._candidate_verify_fused_program.cache_clear()
@@ -510,7 +529,9 @@ def test_candidate_chunk_hands_hidden_rows_when_logits_deferred():
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
     passed = []
-    runner = types.SimpleNamespace(_candidate_read_offsets=lambda: None)
+    runner = types.SimpleNamespace(
+        _candidate_read_offsets=lambda: None, _candidate_seed_args=lambda *a: None
+    )
     runner._sample_spec_verify_candidates = lambda *a: passed.append(a) or "tokens"
     md = types.SimpleNamespace(draft_token_ids=object())
     hidden, indices = object(), object()
@@ -518,11 +539,11 @@ def test_candidate_chunk_hands_hidden_rows_when_logits_deferred():
     TPUModelRunner._sample_spec_verify_chunk(
         runner, deferred, md, None, None, 0, 2, False, None
     )
-    assert passed[-1][0] is None and passed[-1][-1] == (hidden, indices)
+    assert passed[-1][0] is None and passed[-1][6] == (hidden, indices)
     TPUModelRunner._sample_spec_verify_chunk(
         runner, VocabShardLogits("L"), md, None, None, 0, 2, False, None
     )
-    assert passed[-1][0] == "L" and passed[-1][-1] is None
+    assert passed[-1][0] == "L" and passed[-1][6] is None
 
 
 @pytest.mark.parametrize(
@@ -603,3 +624,91 @@ def test_tpu_projection_in_verify_program_is_bitwise(rows):
     )
     for a, b in zip(separate, fused):
         assert a.dtype == b.dtype and torch.equal(a.cpu(), b.cpu())
+
+
+def test_candidate_chunk_stashes_the_folded_seed_for_the_drafter(monkeypatch):
+    """With seed arguments the verify returns (tokens, *seed outputs); the
+    chunk returns the tokens and hands the seed to the drafter for the chunk
+    whose draft inputs sample_tokens named."""
+    from vllm_torchtpu.layers.adapter.sample.candidate_sampling import (
+        VocabShardLogits,
+    )
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    stashed = []
+    chunk = object()
+    runner = types.SimpleNamespace(
+        _candidate_read_offsets=lambda: None,
+        _candidate_seed_args=lambda md, so: ("seed args",),
+        _verify_seed_chunk=chunk,
+        _async_drafter=types.SimpleNamespace(
+            stash_verify_seed=lambda *a: stashed.append(a)
+        ),
+    )
+    runner._sample_spec_verify_candidates = lambda *a: ("tokens", "ids", "gather")
+    md = types.SimpleNamespace(draft_token_ids=object())
+    out = TPUModelRunner._sample_spec_verify_chunk(
+        runner,
+        VocabShardLogits(None, "H", "I"),
+        md,
+        None,
+        None,
+        0,
+        2,
+        False,
+        None,
+    )
+    assert out == "tokens"
+    assert stashed == [(chunk, "tokens", ("ids", "gather"))]
+
+
+@pytest.mark.parametrize(
+    "fused, partial_flag, discard, expected",
+    [
+        (False, False, [], None),
+        (True, False, [], ("args", "lengths", None)),
+        (True, False, [1], None),
+        (True, False, [5], ("args", "lengths", None)),
+        (True, True, [1], ("args", "lengths", ("override", (0,)))),
+    ],
+)
+def test_verify_seed_args_follow_the_drafter_seed_rules(
+    monkeypatch, fused, partial_flag, discard, expected
+):
+    """The drafter hands the verify the fused seed arguments only where
+    `_prepare_draft_inputs` takes the fused seed: both seed flags on, and no
+    partial-prefill row in the chunk unless VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL
+    supplies the override."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    monkeypatch.setattr(envs, "VLLM_TPU_FUSED_ASYNC_DRAFT_SEED", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_DRAFT_SEED_FUSED", fused, raising=False)
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL", partial_flag, raising=False
+    )
+    proposer = types.SimpleNamespace(
+        runner=types.SimpleNamespace(
+            input_batch=types.SimpleNamespace(req_ids=["a", "b", "c", "d"])
+        ),
+        _fused_seed_args=lambda chunk, num_draft, override: (
+            "args",
+            num_draft,
+            override,
+        ),
+        _seed_override=lambda ov_i, req_ids, so, width: ("override", tuple(ov_i)),
+    )
+    chunk = types.SimpleNamespace(draft_lengths="lengths", num_reqs=2, start_index=1)
+    got = Eagle3Proposer.verify_seed_args(proposer, chunk, 2, discard, None)
+    assert got == expected
+
+
+def test_verify_seed_stash_keeps_only_this_steps_chunks():
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    old, cur = object(), object()
+    proposer = types.SimpleNamespace(
+        _verify_seeds={id(old): (old, "nt0", ())}, draft_chunks=[cur]
+    )
+    Eagle3Proposer.stash_verify_seed(proposer, cur, "nt1", ("seed",))
+    assert proposer._verify_seeds == {id(cur): (cur, "nt1", ("seed",))}

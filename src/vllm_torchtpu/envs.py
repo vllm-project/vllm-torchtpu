@@ -411,6 +411,7 @@ if TYPE_CHECKING:
     VLLM_TPU_VERIFY_RO_INGRAPH: bool = False
     VLLM_TPU_CANDIDATE_VERIFY_RO: bool = False
     VLLM_TPU_CANDIDATE_VERIFY_LOGITS: bool = False
+    VLLM_TPU_CANDIDATE_VERIFY_SEED: bool = False
     VLLM_TPU_DRAFT_SEED_EXTRAS: bool = False
     VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
@@ -2623,6 +2624,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # logits row) the candidate verify program projects this rank's logits
     # shard itself instead of a separate LM head program. Same ops.
     "VLLM_TPU_CANDIDATE_VERIFY_LOGITS": env_bool("VLLM_TPU_CANDIDATE_VERIFY_LOGITS"),
+    # With VLLM_TPU_CANDIDATE_VERIFY_LOGITS: the drafter's fused async seed
+    # (draft input shift/scatter and gather pad from the verify output) runs
+    # inside the candidate verify program instead of as its own program in
+    # propose. Same ops.
+    "VLLM_TPU_CANDIDATE_VERIFY_SEED": env_bool("VLLM_TPU_CANDIDATE_VERIFY_SEED"),
     # With VLLM_TPU_VERIFY_FUSED: compute the mamba read offsets inside the
     # fused verify program and apply them with one eager scatter.
     "VLLM_TPU_VERIFY_FUSED_READ_OFFSETS": env_bool("VLLM_TPU_VERIFY_FUSED_READ_OFFSETS"),

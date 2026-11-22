@@ -412,6 +412,9 @@ class Eagle3Proposer:
         self._draft_md_cache: dict[int, tuple[dict, torch.Tensor, int]] = {}
         self._seed_checks_done = 0
         self._seed_extras: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # VLLM_TPU_CANDIDATE_VERIFY_SEED: id(chunk) -> (chunk, verify output,
+        # seed outputs) the verify program computed this step.
+        self._verify_seeds: dict[int, tuple] = {}
         self._carry_checks_done = 0
         self._draft_rows_fresh_logged = False
         self._carry_mismatches: torch.Tensor | None = None
@@ -2567,25 +2570,18 @@ class Eagle3Proposer:
                 and _fused_seed_device(nt)
             ):
                 # Seed, input shift/scatter and gather pad in one program.
-                extras = (
-                    self._draft_rows
-                    and envs.VLLM_TPU_DRAFT_SEED_EXTRAS
-                    and chunk.sequence_layout_plan.descriptor
-                    == DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
-                )
-                seed_out = _async_seed_inputs(
-                    nt,
-                    num_draft_full,
-                    chunk.attn_ctx.query_start_loc,
-                    self._device_constant(
-                        ("num_reqs", num_reqs),
-                        lambda: torch.tensor(num_reqs, dtype=torch.int64),
-                    ),
-                    chunk.input_ids,
-                    self._loop_bucket(num_reqs),
-                    self._draft_rows_len(chunk) if extras else 0,
-                    seed_override,
-                )
+                extras = self._seed_extras_on(chunk)
+                verified = self._verify_seeds.get(id(chunk))
+                if verified is not None and verified[0] is chunk and verified[1] is nt:
+                    # VLLM_TPU_CANDIDATE_VERIFY_SEED: the verify program ran
+                    # this program on `nt` with the same arguments.
+                    del self._verify_seeds[id(chunk)]
+                    seed_out = verified[2]
+                else:
+                    seed_args = self._fused_seed_args(
+                        chunk, num_draft_full, seed_override
+                    )
+                    seed_out = _async_seed_inputs(nt, *seed_args)
                 draft_input_ids, gather_indices, num_rejected_out = seed_out[:3]
                 if extras:
                     self._seed_extras[id(chunk)] = (seed_out[3], seed_out[4])
@@ -2802,6 +2798,131 @@ class Eagle3Proposer:
         )
 
         return (draft_input_ids, chunk.position_ids, gather_indices, num_rejected_out)
+
+    def _seed_extras_on(self, chunk: DraftChunkInputs) -> bool:
+        """Whether the fused async seed also returns step 0's extras
+        (`draft_rows`, padded rejected counts) for `chunk`."""
+        return bool(
+            self._draft_rows
+            and envs.VLLM_TPU_DRAFT_SEED_EXTRAS
+            and chunk.sequence_layout_plan.descriptor
+            == DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+        )
+
+    def _fused_seed_args(
+        self,
+        chunk: DraftChunkInputs,
+        num_draft: torch.Tensor,
+        seed_override: torch.Tensor | None,
+    ) -> tuple:
+        """The fused async seed program's arguments after `next_tokens`."""
+        num_reqs = chunk.num_reqs
+        extras = self._seed_extras_on(chunk)
+        return (
+            num_draft,
+            chunk.attn_ctx.query_start_loc,
+            self._device_constant(
+                ("num_reqs", num_reqs),
+                lambda: torch.tensor(num_reqs, dtype=torch.int64),
+            ),
+            chunk.input_ids,
+            self._loop_bucket(num_reqs),
+            self._draft_rows_len(chunk) if extras else 0,
+            seed_override,
+        )
+
+    def verify_seed_args(
+        self,
+        chunk: DraftChunkInputs,
+        width: int,
+        discard_sampled_tokens_req_indices: list[int],
+        scheduler_output,
+    ) -> tuple | None:
+        """VLLM_TPU_CANDIDATE_VERIFY_SEED: the fused async seed program's
+        arguments after `next_tokens` (a `[width, K+1]` verify output) for
+        this chunk, the ones `_prepare_draft_inputs` would pass, or None when
+        the chunk takes another seed path. The verify program runs the seed
+        on its output and hands the result over with `stash_verify_seed`."""
+        if (
+            chunk.draft_lengths is None
+            or not envs.VLLM_TPU_FUSED_ASYNC_DRAFT_SEED
+            or not envs.VLLM_TPU_DRAFT_SEED_FUSED
+        ):
+            return None
+        num_reqs, start = chunk.num_reqs, chunk.start_index
+        discard_set = set(discard_sampled_tokens_req_indices)
+        ov_i = [i for i in range(num_reqs) if start + i in discard_set]
+        seed_override = None
+        if envs.VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL:
+            req_ids = self.runner.input_batch.req_ids[start : start + num_reqs]
+            seed_override = self._seed_override(
+                ov_i, req_ids, scheduler_output, width
+            )
+        elif ov_i:
+            return None
+        return self._fused_seed_args(chunk, chunk.draft_lengths, seed_override)
+
+    def stash_verify_seed(
+        self, chunk: DraftChunkInputs, next_tokens: torch.Tensor, seed_out: tuple
+    ) -> None:
+        """Hand `_prepare_draft_inputs` the seed the verify program computed
+        for `chunk` from `next_tokens` (VLLM_TPU_CANDIDATE_VERIFY_SEED).
+        Entries of earlier steps' chunks are dropped here."""
+        current = self.draft_chunks or ()
+        self._verify_seeds = {
+            key: entry
+            for key, entry in self._verify_seeds.items()
+            if any(entry[0] is c for c in current)
+        }
+        self._verify_seeds[id(chunk)] = (chunk, next_tokens, seed_out)
+
+    def async_seed_warm_args(self, num_tokens: int, width: int) -> list[tuple]:
+        """The seed arguments `verify_seed_args` can produce for a verify
+        chunk of `num_tokens` tokens at request bucket `width`, for the
+        verify warmup (the keys `_precompile_async_seed_inputs` warms)."""
+        runner = self.runner
+        out = []
+        for p, q in self._async_seed_warm_keys(num_tokens, width):
+            num_rows = (
+                q - 1 if self._draft_rows and envs.VLLM_TPU_DRAFT_SEED_EXTRAS else 0
+            )
+            out.append(
+                (
+                    torch.zeros(width, dtype=torch.int32).to(runner.device),
+                    torch.zeros(q, dtype=torch.int32).to(runner.device),
+                    torch.tensor(1, dtype=torch.int64).to(runner.device),
+                    torch.zeros(num_tokens, dtype=torch.int32).to(runner.device),
+                    p,
+                    num_rows,
+                    torch.full((width,), -1, dtype=torch.int32).to(runner.device)
+                    if envs.VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL
+                    else None,
+                )
+            )
+        return out
+
+    def _async_seed_warm_keys(self, T: int, width: int) -> list[tuple[int, int]]:
+        """(loop bucket p, query-start width) pairs the fused async seed
+        reaches at token bucket `T` and request bucket `width`."""
+        import bisect
+
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+
+        runner = self.runner
+        reqs = sorted(runner.num_reqs_paddings)
+        qsl_widths = {
+            w + 1
+            for w in (runner.num_reqs_max_model_len, runner.num_reqs_most_model_len)
+            if w
+        }
+        prev = reqs[bisect.bisect_left(reqs, width) - 1] if width != reqs[0] else 0
+        ps = {
+            _get_padded_token_len(runner.num_tokens_paddings, n)
+            for n in range(prev + 1, width + 1)
+        }
+        return [
+            (p, q) for p in sorted(x for x in ps if x <= T) for q in sorted(qsl_widths)
+        ]
 
     def _seed_override(
         self, ov_i: list[int], req_ids, scheduler_output, width: int
@@ -3644,53 +3765,19 @@ class Eagle3Proposer:
     def _precompile_async_seed_inputs(self) -> None:
         """`_async_seed_inputs_compiled` at every reachable (token bucket T,
         sampler request bucket width, loop bucket p, query-start width)."""
-        import bisect
-
-        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
-
         runner = self.runner
         k = self.speculative_config.num_speculative_tokens
         reqs = sorted(runner.num_reqs_paddings)
-        qsl_widths = {
-            w + 1
-            for w in (runner.num_reqs_max_model_len, runner.num_reqs_most_model_len)
-            if w
-        }
         with runner._precompile_timed("drafter fused async seed"):
             for T in runner.num_tokens_paddings:
                 for width in reqs:
                     # Mixed chunks carry prefill tokens too, so T is not
                     # bounded by the verify width: warm every token bucket.
-                    prev = reqs[bisect.bisect_left(reqs, width) - 1] if width != reqs[0] else 0
-                    ps = {
-                        _get_padded_token_len(runner.num_tokens_paddings, n)
-                        for n in range(prev + 1, width + 1)
-                    }
-                    for p in sorted(x for x in ps if x <= T):
-                        for q in sorted(qsl_widths):
-                            nt = torch.zeros((width, k + 1), dtype=torch.int32).to(
-                                runner.device
-                            )
-                            nd = torch.zeros(width, dtype=torch.int32).to(runner.device)
-                            qsl = torch.zeros(q, dtype=torch.int32).to(runner.device)
-                            n_dev = torch.tensor(1, dtype=torch.int64).to(runner.device)
-                            ids = torch.zeros(T, dtype=torch.int32).to(runner.device)
-                            num_rows = (
-                                q - 1
-                                if self._draft_rows and envs.VLLM_TPU_DRAFT_SEED_EXTRAS
-                                else 0
-                            )
-                            ov = (
-                                torch.full((width,), -1, dtype=torch.int32).to(
-                                    runner.device
-                                )
-                                if envs.VLLM_TPU_FUSED_DRAFT_SEED_PARTIAL
-                                else None
-                            )
-                            out = _async_seed_inputs_compiled(
-                                nt, nd, qsl, n_dev, ids, p, num_rows, ov
-                            )
-                            synchronize_tensors(out)
+                    nt = torch.zeros((width, k + 1), dtype=torch.int32).to(
+                        runner.device
+                    )
+                    for args in self.async_seed_warm_args(T, width):
+                        synchronize_tensors(_async_seed_inputs_compiled(nt, *args))
 
     def _precompile_draft_rows_carry_and_token(self) -> None:
         """`_draft_rows_carry_and_token` at every (token bucket T, loop bucket
