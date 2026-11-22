@@ -345,11 +345,11 @@ def _kernel(
     shared_scratch = extra_scratch[:4] if i_s else ()
     extra_scratch = extra_scratch[len(shared_scratch) :]
     if sparse:
-        # SMEM [E] routes per local expert, [E + 1] their offsets, [m * k] the
-        # routes' tokens grouped by expert; VMEM [mp, h] bf16 the gathered
-        # rows, [mp, lanes] f32 the current expert's coefficient per token.
-        counts_ref, offs_ref, sorted_ref, xs_ref, coeff_rows_ref = extra_scratch[:5]
-        extra_scratch = extra_scratch[5:]
+        # SMEM [E] tokens per local expert, [E, mp] their tokens; VMEM [mp, h]
+        # bf16 the gathered rows, [mp, lanes] f32 the current expert's
+        # coefficient per token.
+        counts_ref, tokens_ref, xs_ref, coeff_rows_ref = extra_scratch[:4]
+        extra_scratch = extra_scratch[4:]
     if groups:
         # VMEM and SMEM [8, S] the copy choice (_choose_replicas) and its
         # DMA's semaphore; SMEM [m * k] each route's local expert (`mark`).
@@ -405,32 +405,24 @@ def _kernel(
         copy_slot = choice_smem[3, jnp.maximum(e - block, 0)]
         return jnp.where(e < block, block_smem[0] * block + e, copy_slot)
 
-    def first_route(r, e):
-        """No earlier route of r's token names e (each token adds an expert's
-        output once, weighted by its summed coefficient)."""
-        first = True
-        for back in range(1, topk):
-            earlier = jnp.maximum(r - back, 0)
-            first &= (back > r % topk) | (route_ids[earlier] != e)
-        return first
-
-    def mark(r, carry):
+    def mark(t, carry):
+        # A token's routes at once: their loads are independent.
+        named = [ids_smem[t * topk + j] for j in range(topk)]
         if groups:
-            s = ids_smem[r]
-            e = jnp.where(s >= 0, choice_smem[0, jnp.maximum(s, 0)], -1)
-            lids_ref[r] = e
-        else:
-            e = ids_smem[r]
+            named = [
+                jnp.where(s >= 0, choice_smem[0, jnp.maximum(s, 0)], -1) for s in named
+            ]
+            for j, e in enumerate(named):
+                lids_ref[t * topk + j] = e
+        for e in named:
 
-        @pl.when((e >= 0) & (e < experts))
-        def local():
-            active_ref[e] = 1
-            if sparse:
-                counts_ref[e] += first_route(r, e).astype(jnp.int32)
+            @pl.when((e >= 0) & (e < experts))
+            def local(*, e=e):
+                active_ref[e] = 1
 
         return carry
 
-    lax.fori_loop(0, ids_smem.shape[0], mark, 0)
+    lax.fori_loop(0, routes // topk, mark, 0)
 
     def compact(e, count):
         @pl.when(active_ref[e] != 0)
@@ -479,28 +471,24 @@ def _kernel(
                 copy.start()
 
     if sparse:
-        # Group the routes' tokens by local expert (a counting sort) while the
-        # first weight copies fly; counts_ref becomes each expert's cursor.
-        offs_ref[0] = 0
+        # List each local expert's tokens while the first weight copies fly; a
+        # token naming an expert twice is listed once (its coefficient sums
+        # both routes).
+        def place(t, carry):
+            named = [route_ids[t * topk + j] for j in range(topk)]
+            for j, e in enumerate(named):
+                fresh = (e >= 0) & (e < experts)
+                for earlier in named[:j]:
+                    fresh &= earlier != e
 
-        def offsets(e, carry):
-            offs_ref[e + 1] = offs_ref[e] + counts_ref[e]
-            counts_ref[e] = offs_ref[e]
-            return carry
-
-        lax.fori_loop(0, experts, offsets, 0)
-
-        def place(r, carry):
-            e = route_ids[r]
-
-            @pl.when((e >= 0) & (e < experts) & first_route(r, e))
-            def local():
-                sorted_ref[counts_ref[e]] = r // topk
-                counts_ref[e] += 1
+                @pl.when(fresh)
+                def local(*, e=e):
+                    tokens_ref[e, counts_ref[e]] = t
+                    counts_ref[e] += 1
 
             return carry
 
-        lax.fori_loop(0, routes, place, 0)
+        lax.fori_loop(0, routes // topk, place, 0)
 
     # Token-side setup overlaps the first weight copies.
     def pad_rows(v):
@@ -591,13 +579,13 @@ def _kernel(
     tile = _ROW_ALIGN
     tile_rows = lax.broadcasted_iota(jnp.int32, (tile, 1), 0)
 
-    def tile_tokens(begin, end):
-        """The tokens of routes [begin, begin + tile) as a [tile, 1] column,
-        -1 at or past ``end``."""
+    def tile_tokens(e, begin, end):
+        """Expert e's listed tokens [begin, begin + tile) as a [tile, 1]
+        column, -1 at or past ``end``."""
         col = jnp.full((tile, 1), -1, jnp.int32)
         for j in range(tile):
-            r = begin + j
-            tok = jnp.where(r < end, sorted_ref[jnp.minimum(r, routes - 1)], -1)
+            k = begin + j
+            tok = jnp.where(k < end, tokens_ref[e, jnp.minimum(k, mp - 1)], -1)
             col = jnp.where(tile_rows == j, tok, col)
         return col
 
@@ -605,8 +593,8 @@ def _kernel(
         slot = unit % _NUM_BUFFERS
         c = unit % num_chunks
         e = active_ids_ref[unit // num_chunks]
-        begin, end = offs_ref[e], offs_ref[e + 1]
-        tiles = (end - begin + tile - 1) // tile
+        end = counts_ref[e]
+        tiles = (end + tile - 1) // tile
 
         def rows_at(t):
             return pl.ds(pl.multiple_of(t * tile, tile), tile)
@@ -615,7 +603,7 @@ def _kernel(
         def gather():
             # One-hot products: exact copies of the expert's token rows.
             def body(t, carry):
-                col = tile_tokens(begin + t * tile, end)
+                col = tile_tokens(e, t * tile, end)
                 lanes = lax.broadcasted_iota(jnp.int32, (tile, mp), 1)
                 onehot = (col == lanes).astype(jnp.bfloat16)
                 xs_ref[rows_at(t), :] = jnp.dot(
@@ -654,12 +642,12 @@ def _kernel(
             # coefficient, to that token's row alone: the dense kernel's
             # arithmetic, and no product spans other tokens.
             def body(t, carry):
-                rows = jnp.minimum(end - begin - t * tile, tile)
+                rows = jnp.minimum(end - t * tile, tile)
                 for j in range(tile):
 
                     @pl.when(j < rows)
                     def add(*, j=j):
-                        tok = pl.ds(sorted_ref[begin + t * tile + j], 1)
+                        tok = pl.ds(tokens_ref[e, t * tile + j], 1)
                         w = jnp.broadcast_to(coeff_rows_ref[tok, 0:1], (1, h))
                         out_e = expert_acc_ref[pl.ds(t * tile + j, 1), :]
                         out_e = out_e.astype(out_ref.dtype).astype(f32)
@@ -797,8 +785,7 @@ def dense_expert_moe_fp4(
     if sparse_rows:
         sparse_scratch = [
             pltpu.SMEM((experts,), jnp.int32),
-            pltpu.SMEM((experts + 1,), jnp.int32),
-            pltpu.SMEM((local_ids.size,), jnp.int32),
+            pltpu.SMEM((experts, mp), jnp.int32),
             pltpu.VMEM((mp, h), jnp.bfloat16),
             pltpu.VMEM((mp, lanes), jnp.float32),
         ]
