@@ -225,3 +225,20 @@ def test_other_norms_keep_the_unfused_path(monkeypatch):
     assert bridge.arm_fused_mlp(model) == 2
     x = torch.ones(8, H, dtype=torch.bfloat16)
     assert all(m.forward_with_norm(x, x) is None for m in mlps)
+
+
+def test_op_signatures_are_valid_jax_ops():
+    """torch_tpu's jax_op refuses a signature without valid annotations at arm
+    time, which silently drops the drafter back to the unfused MLP."""
+    import inspect
+
+    from torch_tpu._internal.pallas import pallas
+
+    from vllm_torchtpu.models.minimax_m3 import dspark_mlp
+
+    for make in (
+        dspark_mlp._norm_signature,
+        dspark_mlp._reducing_signature,
+        dspark_mlp._reducing_norm_signature,
+    ):
+        pallas._verify_signature(inspect.signature(make(None)))

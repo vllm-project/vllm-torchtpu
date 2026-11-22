@@ -104,21 +104,25 @@ A = jax.Array
 
 
 def _norm_signature(body):
-    def fn(x: A, residual: A, norm_w: A, w_gu: A, s_gu: A, w_d: A, s_d: A):
+    def fn(
+        x: A, residual: A, norm_w: A, w_gu: A, s_gu: A, w_d: A, s_d: A
+    ) -> tuple[A, A]:
         return body(x, residual, norm_w, w_gu, s_gu, w_d, s_d)
 
     return fn
 
 
 def _reducing_signature(body):
-    def fn(x: A, w_gu: A, s_gu: A, w_d: A, s_d: A, rank: A):
+    def fn(x: A, w_gu: A, s_gu: A, w_d: A, s_d: A, rank: A) -> A:
         return body(x, w_gu, s_gu, w_d, s_d, rank)
 
     return fn
 
 
 def _reducing_norm_signature(body):
-    def fn(x: A, residual: A, norm_w: A, w_gu: A, s_gu: A, w_d: A, s_d: A, rank: A):
+    def fn(
+        x: A, residual: A, norm_w: A, w_gu: A, s_gu: A, w_d: A, s_d: A, rank: A
+    ) -> tuple[A, A]:
         return body(x, residual, norm_w, w_gu, s_gu, w_d, s_d, rank)
 
     return fn
