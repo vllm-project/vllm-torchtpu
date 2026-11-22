@@ -60,7 +60,9 @@ _VMEM_HEADROOM = 1 << 20
 # per token element, and a margin. tpu7x AOT compiles (libtpu 0.0.50) of the
 # MiniMax-M3 EP8 call (h 6144, i 3072, shared 384) need 50.3 MiB at 16 rows
 # and 52.7 MiB at 32; XLA keeps the call's neighbours in VMEM only with
-# limits up to ~53.7 MiB.
+# limits up to ~53.7 MiB. The sparse-row mode stays within the same bound at
+# every size it serves (EP4xTP2 call, i 1536: 54.6 / 56.8 / 46.1 / 50.7 MiB at
+# 48 / 64 / 96 / 128 rows, chunk 768 / 768 / 512 / 512).
 _CALIBRATED_ROWS = 32
 _CALIBRATED_TOKEN_BYTES = 24
 _CALIBRATED_MARGIN = 256 << 10
@@ -93,10 +95,13 @@ def shared_activation(gate: jax.Array, up: jax.Array) -> jax.Array:
     return bf16(bf16(gate * sig) * bf16(up + 1.0))
 
 
-def _chunk(m: int, h: int, i: int, i_s: int, vmem_capacity: int) -> int:
+def _chunk(
+    m: int, h: int, i: int, i_s: int, vmem_capacity: int, sparse: bool = False
+) -> int:
     """The widest unit of intermediate columns whose buffers fit in VMEM, or 0."""
+    budget = vmem_capacity - _VMEM_HEADROOM
     for c in (1024, 768, 512, 384, 256, 128):
-        if i % c == 0 and _vmem_bytes(m, h, c, i_s) <= vmem_capacity - _VMEM_HEADROOM:
+        if i % c == 0 and _vmem_bytes(m, h, c, i_s, sparse) <= budget:
             return c
     return 0
 
@@ -122,7 +127,15 @@ def _shared_ok(shared: SharedExpert | None, h: int, activation: str) -> bool:
 
 
 def can_use_dense_expert_fp4(
-    hidden, w1, w2, s1, s2, *, activation, shared: SharedExpert | None = None
+    hidden,
+    w1,
+    w2,
+    s1,
+    s2,
+    *,
+    activation,
+    shared: SharedExpert | None = None,
+    sparse_rows: bool = False,
 ) -> bool:
     """Layout and arithmetic support; the token threshold is the caller's."""
     if activation not in _ACTIVATIONS or hidden.ndim != 2:
@@ -158,19 +171,21 @@ def can_use_dense_expert_fp4(
         return False
     i_s = 0 if shared is None else shared.w2.shape[0]
     return info.is_matmul_supported(jnp.bfloat16, jnp.float8_e4m3fn) and bool(
-        _chunk(m, h, i, i_s, info.vmem_capacity_bytes)
+        _chunk(m, h, i, i_s, info.vmem_capacity_bytes, sparse_rows)
     )
 
 
-def _vmem_limit_bytes(m: int, h: int, chunk: int, i_s: int, vmem_capacity: int) -> int:
+def _vmem_limit_bytes(
+    m: int, h: int, chunk: int, i_s: int, vmem_capacity: int, sparse: bool = False
+) -> int:
     """The call's VMEM limit. VMEM it reserves cannot hold the activations live
     across it (the residual stream, its operands and output): XLA spills them
     to HBM, and each op that reads or writes one pays an HBM round trip. At up
-    to _CALIBRATED_ROWS rows the limit is the measured need (the token
-    temporaries at _CALIBRATED_TOKEN_BYTES, not `_vmem_bytes`'s budget);
-    larger calls keep the whole of VMEM."""
+    to _CALIBRATED_ROWS rows, and in the sparse-row mode, the limit is the
+    measured need (the token temporaries at _CALIBRATED_TOKEN_BYTES, not
+    `_vmem_bytes`'s budget); larger dense calls keep the whole of VMEM."""
     mp = m + (-m % _ROW_ALIGN)
-    if mp > _CALIBRATED_ROWS:
+    if not sparse and mp > _CALIBRATED_ROWS:
         return vmem_capacity
     need = _weight_vmem_bytes(h, chunk, i_s) + mp * h * _CALIBRATED_TOKEN_BYTES
     return min(vmem_capacity, need + _CALIBRATED_MARGIN)
@@ -184,13 +199,16 @@ def _weight_vmem_bytes(h: int, chunk: int, i_s: int) -> int:
     return _NUM_BUFFERS * (weights + scales) + 3 * h * i_s
 
 
-def _vmem_bytes(m: int, h: int, chunk: int, i_s: int) -> int:
+def _vmem_bytes(m: int, h: int, chunk: int, i_s: int, sparse: bool = False) -> int:
     """VMEM of one call: `_weight_vmem_bytes`, the token-sized scratch and the
-    compiler's token-sized temporaries (~16 bytes per element, measured with
-    tpu7x AOT compiles at 16 and 64 rows)."""
+    compiler's temporaries (tpu7x AOT compiles: ~16 bytes per token element
+    when a unit evaluates every token, measured at 16 and 64 rows; with
+    ``sparse``, ~8 for the gather/scatter products plus 16 per element of one
+    16-row tile, fitted at 64-256 rows)."""
     mp = m + (-m % _ROW_ALIGN)
-    tokens = mp * h * (2 + 4 + 4 + 2 + (2 if i_s else 0) + 16)
-    return _weight_vmem_bytes(h, chunk, i_s) + tokens
+    scratch = 2 + 4 + 4 + 2 + (2 if i_s else 0) + (2 if sparse else 0)
+    temporaries = (8 * mp + 16 * _ROW_ALIGN) if sparse else 16 * mp
+    return _weight_vmem_bytes(h, chunk, i_s) + (mp * scratch + temporaries) * h
 
 
 def _kernel(
@@ -209,6 +227,7 @@ def _kernel(
     experts,
     activation,
     i_s,
+    sparse,
 ):
     if i_s:
         sw1_hbm, ss1_ref, sw2_hbm, ss2_ref, *refs = refs
@@ -227,8 +246,13 @@ def _kernel(
         active_ref,  # SMEM [E]: nonzero for an expert some token routes to
         active_ids_ref,  # SMEM [E]
         sem_ref,
-        *shared_scratch,
+        *extra_scratch,
     ) = refs
+    shared_scratch = extra_scratch[:5] if i_s else ()
+    if sparse:
+        # SMEM [E] routes per local expert, [E + 1] their offsets, [m * k] the
+        # routes' tokens grouped by expert; VMEM [mp, h] bf16 the gathered rows.
+        counts_ref, offs_ref, sorted_ref, xs_ref = extra_scratch[len(shared_scratch) :]
     fp8 = jnp.float8_e4m3fn
     f32 = jnp.float32
     m = x_ref.shape[0]
@@ -251,9 +275,22 @@ def _kernel(
 
     def clear(e, carry):
         active_ref[e] = 0
+        if sparse:
+            counts_ref[e] = 0
         return carry
 
     lax.fori_loop(0, experts, clear, 0)
+    topk = ids_ref.shape[1]
+    routes = ids_smem.shape[0]
+
+    def first_route(r, e):
+        """No earlier route of r's token names e (each token adds an expert's
+        output once, weighted by its summed coefficient)."""
+        first = True
+        for back in range(1, topk):
+            earlier = jnp.maximum(r - back, 0)
+            first &= (back > r % topk) | (ids_smem[earlier] != e)
+        return first
 
     def mark(r, carry):
         e = ids_smem[r]
@@ -261,6 +298,8 @@ def _kernel(
         @pl.when((e >= 0) & (e < experts))
         def local():
             active_ref[e] = 1
+            if sparse:
+                counts_ref[e] += first_route(r, e).astype(jnp.int32)
 
         return carry
 
@@ -312,6 +351,30 @@ def _kernel(
             for copy in transfers(jnp.int32(initial)):
                 copy.start()
 
+    if sparse:
+        # Group the routes' tokens by local expert (a counting sort) while the
+        # first weight copies fly; counts_ref becomes each expert's cursor.
+        offs_ref[0] = 0
+
+        def offsets(e, carry):
+            offs_ref[e + 1] = offs_ref[e] + counts_ref[e]
+            counts_ref[e] = offs_ref[e]
+            return carry
+
+        lax.fori_loop(0, experts, offsets, 0)
+
+        def place(r, carry):
+            e = ids_smem[r]
+
+            @pl.when((e >= 0) & (e < experts) & first_route(r, e))
+            def local():
+                sorted_ref[counts_ref[e]] = r // topk
+                counts_ref[e] += 1
+
+            return carry
+
+        lax.fori_loop(0, routes, place, 0)
+
     # Token-side setup overlaps the first weight copies.
     def pad_rows(v):
         if mp == m:
@@ -360,10 +423,8 @@ def _kernel(
         shared_out_ref[...] = projection(act, swd_ref, ss2_ref[...])
     x_pad_ref[...] = jnp.where(jnp.isfinite(x), x, 0).astype(jnp.bfloat16)
 
-    def compute(unit):
-        slot = unit % _NUM_BUFFERS
-        c = unit % num_chunks
-        x = x_pad_ref[...]
+    def expert_mlp(x, slot):
+        """The unit's gate, up and down columns on rows ``x``: f32 [rows, h]."""
         gate = jnp.zeros((x.shape[0], chunk), f32)
         up = jnp.zeros((x.shape[0], chunk), f32)
         for k in range(0, h, _QUANT_BLOCK):
@@ -398,6 +459,99 @@ def _kernel(
                 )
                 * sd_ref[slot, b]
             )
+        return down
+
+    tile = _ROW_ALIGN
+    tile_rows = lax.broadcasted_iota(jnp.int32, (tile, 1), 0)
+    tile_lanes = lax.broadcasted_iota(jnp.int32, (1, tile), 1)
+
+    def tile_tokens(begin, end):
+        """The tokens of routes [begin, begin + tile) (-1 at or past ``end``),
+        as a [tile, 1] column and a [1, tile] row."""
+        col = jnp.full((tile, 1), -1, jnp.int32)
+        row = jnp.full((1, tile), -1, jnp.int32)
+        for j in range(tile):
+            r = begin + j
+            tok = jnp.where(r < end, sorted_ref[jnp.minimum(r, routes - 1)], -1)
+            col = jnp.where(tile_rows == j, tok, col)
+            row = jnp.where(tile_lanes == j, tok, row)
+        return col, row
+
+    def compute_sparse(unit):
+        slot = unit % _NUM_BUFFERS
+        c = unit % num_chunks
+        e = active_ids_ref[unit // num_chunks]
+        begin, end = offs_ref[e], offs_ref[e + 1]
+        tiles = (end - begin + tile - 1) // tile
+
+        def rows_at(t):
+            return pl.ds(pl.multiple_of(t * tile, tile), tile)
+
+        @pl.when(c == 0)
+        def gather():
+            # One-hot products: exact copies of the expert's token rows.
+            def body(t, carry):
+                col, _ = tile_tokens(begin + t * tile, end)
+                lanes = lax.broadcasted_iota(jnp.int32, (tile, mp), 1)
+                onehot = (col == lanes).astype(jnp.bfloat16)
+                xs_ref[rows_at(t), :] = jnp.dot(
+                    onehot, x_pad_ref[...], preferred_element_type=f32
+                ).astype(jnp.bfloat16)
+                return carry
+
+            lax.fori_loop(0, tiles, body, 0)
+
+        def run(t, carry):
+            down = expert_mlp(xs_ref[rows_at(t), :], slot)
+
+            @pl.when(c == 0)
+            def first():
+                expert_acc_ref[rows_at(t), :] = down
+
+            @pl.when(c > 0)
+            def rest():
+                expert_acc_ref[rows_at(t), :] += down
+
+            return carry
+
+        lax.fori_loop(0, tiles, run, 0)
+
+        @pl.when(c == num_chunks - 1)
+        def finish():
+            columns = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
+            coeff = jnp.sum(
+                jnp.where(columns == e, coeff_ref[...], 0), axis=1, keepdims=True
+            )
+            token_rows = lax.broadcasted_iota(jnp.int32, (mp, tile), 0)
+
+            def body(t, carry):
+                _, row = tile_tokens(begin + t * tile, end)
+                weights = jnp.where(token_rows == row, coeff, 0)  # [mp, tile]
+                # The product spans every token: keep a non-finite bf16 expert
+                # output from turning other tokens' rows into NaN (0 * inf).
+                # (isfinite takes f32 in Mosaic: test the bf16 round trip.)
+                out_e = expert_acc_ref[rows_at(t), :]
+                out_e = out_e.astype(jnp.bfloat16).astype(f32)
+                out_e = jnp.where(jnp.isfinite(out_e), out_e, 0).astype(jnp.bfloat16)
+                # One route per (token, row), so each output element is one
+                # product: two bf16 passes carry a bf16 routing weight exactly
+                # (an f32 one to 16 bits).
+                hi = weights.astype(jnp.bfloat16)
+                lo = (weights - hi.astype(f32)).astype(jnp.bfloat16)
+                acc_ref[...] += jnp.dot(
+                    hi, out_e, preferred_element_type=f32
+                ) + jnp.dot(lo, out_e, preferred_element_type=f32)
+                return carry
+
+            lax.fori_loop(0, tiles, body, 0)
+
+    def compute(unit):
+        if sparse:
+            compute_sparse(unit)
+            return
+        slot = unit % _NUM_BUFFERS
+        c = unit % num_chunks
+        down = expert_mlp(x_pad_ref[...], slot)
 
         @pl.when(c == 0)
         def first():
@@ -439,7 +593,7 @@ def _kernel(
     out_ref[...] = out.astype(out_ref.dtype)
 
 
-@functools.partial(jax.jit, static_argnames=("activation",))
+@functools.partial(jax.jit, static_argnames=("activation", "sparse_rows"))
 def dense_expert_moe_fp4(
     hidden,
     w1,
@@ -451,6 +605,7 @@ def dense_expert_moe_fp4(
     *,
     activation="swigluoai",
     shared: SharedExpert | None = None,
+    sparse_rows: bool = False,
 ):
     """Local routed contribution of fp4 experts, [tokens, hidden] bf16, as
     fused_moe_func's GMM path returns it, plus the shared expert's output
@@ -462,7 +617,7 @@ def dense_expert_moe_fp4(
     experts, i, _ = w2.shape
     i_s = 0 if shared is None else shared.w2.shape[0]
     info = pltpu.get_tpu_info()
-    chunk = _chunk(m, h, i, i_s, info.vmem_capacity_bytes)
+    chunk = _chunk(m, h, i, i_s, info.vmem_capacity_bytes, sparse_rows)
     # Whole f32 sublane tiles of tokens; the kernel pads to _ROW_ALIGN itself.
     pad = -m % 8
     if pad:
@@ -486,6 +641,14 @@ def dense_expert_moe_fp4(
             pltpu.VMEM((mp, h), jnp.bfloat16),
             pltpu.SemaphoreType.DMA((3,)),
         ]
+    sparse_scratch = []
+    if sparse_rows:
+        sparse_scratch = [
+            pltpu.SMEM((experts,), jnp.int32),
+            pltpu.SMEM((experts + 1,), jnp.int32),
+            pltpu.SMEM((local_ids.size,), jnp.int32),
+            pltpu.VMEM((mp, h), jnp.bfloat16),
+        ]
     out = pl.pallas_call(
         functools.partial(
             _kernel,
@@ -495,6 +658,7 @@ def dense_expert_moe_fp4(
             experts=experts,
             activation=activation,
             i_s=i_s,
+            sparse=sparse_rows,
         ),
         out_shape=jax.ShapeDtypeStruct((mk, h), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -516,15 +680,17 @@ def dense_expert_moe_fp4(
                 pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SemaphoreType.DMA((_NUM_BUFFERS, 6)),
                 *shared_scratch,
+                *sparse_scratch,
             ],
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=_vmem_limit_bytes(
-                mk, h, chunk, i_s, info.vmem_capacity_bytes
+                mk, h, chunk, i_s, info.vmem_capacity_bytes, sparse_rows
             )
         ),
         name=f"dense_expert_moe_fp4-e_{experts}-m_{mp}-h_{h}-i_{i}-c_{chunk}"
-        + (f"-s_{i_s}" if i_s else ""),
+        + (f"-s_{i_s}" if i_s else "")
+        + ("-sparse" if sparse_rows else ""),
     )(
         local_ids.reshape(-1),
         hidden,

@@ -90,6 +90,7 @@ _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 _DENSE_FP4_MAX_TOKENS = envs.TPU_MOE_DENSE_FP4_MAX_TOKENS
+_DENSE_FP4_SPARSE_MAX_TOKENS = envs.TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS
 # Fixed at import: one-hot permute/combine over the valid prefix only.
 _BOUNDED_ONEHOT = envs.TPU_MOE_BOUNDED_ONEHOT
 # Fixed at import: build the MoE permutation from one packed sort.
@@ -849,9 +850,12 @@ def fused_moe_func(
 
     num_tokens, hidden_size = hidden_states.shape
 
+    # Above the dense cap and up to the sparse one, the kernel evaluates each
+    # expert on its own routes' rows only (16-row tiles).
+    sparse_rows = num_tokens > _DENSE_FP4_MAX_TOKENS
     dense_fp4 = (
         use_ep
-        and 0 < num_tokens <= _DENSE_FP4_MAX_TOKENS
+        and 0 < num_tokens <= max(_DENSE_FP4_MAX_TOKENS, _DENSE_FP4_SPARSE_MAX_TOKENS)
         and rhs_quant_dtype is None
         and w1_bias is None
         and w2_bias is None
@@ -863,6 +867,7 @@ def fused_moe_func(
             w2_scale,
             activation=activation,
             shared=shared,
+            sparse_rows=sparse_rows,
         )
     )
     if shared is not None and activation != "swigluoai":
@@ -961,6 +966,7 @@ def fused_moe_func(
             topk_ids,
             activation=activation,
             shared=shared,
+            sparse_rows=sparse_rows,
         )
 
     (

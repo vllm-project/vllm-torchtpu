@@ -115,6 +115,30 @@ def test_dense_fp4_shared_matches_gmm_plus_xla_shared(monkeypatch, m):
     np.testing.assert_allclose(out, ref, rtol=0, atol=1e-2 * np.abs(ref).max())
 
 
+@pytest.mark.parametrize("m,with_shared", [(40, False), (48, True), (64, True)])
+def test_sparse_rows_match_dense(m, with_shared):
+    """Each expert on its own routes' rows (16-row tiles, experts above 16
+    rows included) is bit-identical to evaluating every row."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    h, i, e, topk = 512, 1024, 4, 4
+    x, w1, w2, s1, s2, weights, ids = _inputs(m, h, i, e, topk, seed=m)
+    local = np.where(np.asarray(ids) >= e, np.asarray(ids) - e, -1)
+    heavy = ~(local == 1).any(axis=1) & (np.arange(m) % 2 == 0)
+    local[heavy, 0] = 1  # expert 1 takes more than one 16-row tile
+    ids = jnp.asarray(local, jnp.int32)
+    shared = _shared(h, 256, seed=m) if with_shared else None
+    args = (x, w1, w2, s1, s2, weights, ids)
+    assert kernel.can_use_dense_expert_fp4(
+        *args[:5], activation="swigluoai", shared=shared, sparse_rows=True
+    )
+    dense = kernel.dense_expert_moe_fp4(*args, shared=shared)
+    sparse = kernel.dense_expert_moe_fp4(*args, shared=shared, sparse_rows=True)
+    np.testing.assert_array_equal(
+        np.asarray(sparse, np.float32), np.asarray(dense, np.float32)
+    )
+
+
 def test_dense_fp4_shared_without_local_route_is_the_shared_expert():
     if jax.default_backend() != "tpu":
         pytest.skip("requires TPU")
