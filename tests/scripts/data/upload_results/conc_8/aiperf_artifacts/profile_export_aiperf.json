@@ -1,0 +1,83 @@
+{
+  "aiperf_version": "0.12.0",
+  "request_throughput": {
+    "unit": "requests/sec",
+    "avg": 0.25
+  },
+  "request_latency": {
+    "unit": "ms",
+    "avg": 9000.0,
+    "p50": 4000.0,
+    "p90": 22000.0,
+    "p99": 58000.0
+  },
+  "request_count": {
+    "unit": "requests",
+    "avg": 300.0
+  },
+  "time_to_first_token": {
+    "unit": "ms",
+    "avg": 1800.0,
+    "p50": 900.0,
+    "p90": 3800.0,
+    "p99": 25000.0
+  },
+  "inter_token_latency": {
+    "unit": "ms",
+    "avg": 20.0,
+    "p50": 12.5,
+    "p90": 25.0,
+    "p99": 80.0
+  },
+  "output_token_throughput": {
+    "unit": "tokens/sec",
+    "avg": 640.0
+  },
+  "benchmark_duration": {
+    "unit": "sec",
+    "avg": 1200.0
+  },
+  "input_config": {
+    "models": {
+      "items": [
+        {
+          "name": "moonshotai/Kimi-K3"
+        }
+      ]
+    },
+    "datasets": [
+      {
+        "dataset": "semianalysis_cc_traces_weka_062126",
+        "max_context_length": 131072
+      }
+    ],
+    "phases": [
+      {
+        "kind": "profiling",
+        "concurrency": 8
+      }
+    ]
+  },
+  "was_cancelled": false,
+  "end_time": "2026-10-28T08:35:19.586894",
+  "input_token_throughput": {
+    "unit": "tokens/sec",
+    "avg": 12160.0
+  },
+  "total_token_throughput": {
+    "unit": "tokens/sec",
+    "avg": 12800.0
+  },
+  "effective_concurrency": {
+    "unit": "requests",
+    "avg": 7.25
+  },
+  "theoretical_prefix_cache_hit": {
+    "unit": "%",
+    "avg": 91.5
+  },
+  "metadata": {
+    "scenario": "agentx",
+    "submission_valid": true
+  }
+}

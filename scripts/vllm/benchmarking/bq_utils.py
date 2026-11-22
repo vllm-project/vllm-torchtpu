@@ -20,6 +20,8 @@ metrics element's type names the tool that produced its payload (e.g.
 'vllm_bench', 'lm_eval'); values keeps that tool's flat leaf keys
 verbatim, so generic names (completed, failed, duration) can't clash with
 other harnesses writing to the shared table and provenance stays explicit.
+'agentx' is one aiperf replay point; aiperf nests its statistics per metric,
+so that element holds them flattened (extract_agentx_metrics).
 
 Numbers computed from a tool's payload (bench_metrics.derived_metrics) go in
 an element of their own, 'derived', so the tool's payload stays verbatim.
@@ -29,7 +31,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 
 DEFAULT_BQ_PROJECT_ID = "cloud-ullm-inference-ci-cd"
 DEFAULT_BQ_TABLE = "cloud-ullm-inference-ci-cd.llm_benchmark_analytics.benchmark_runs"
@@ -70,6 +72,27 @@ BENCH_METRIC_FIELDS = (
     "spec_decode_accepted_tokens",
 )
 
+# aiperf's profile_export_aiperf.json holds one {"unit", "avg", "p50", ...}
+# block per metric. The statistics listed here are kept, as "<metric>_<stat>",
+# in aiperf's units: latencies in milliseconds, throughputs per second.
+_AGENTX_LATENCY_STATS = ("avg", "p50", "p90", "p99")
+AGENTX_METRIC_FIELDS = (
+    ("request_throughput", ("avg",)),
+    ("request_count", ("avg",)),
+    ("error_request_count", ("avg",)),
+    ("output_token_throughput", ("avg",)),
+    ("input_token_throughput", ("avg",)),
+    ("total_token_throughput", ("avg",)),
+    ("time_to_first_token", _AGENTX_LATENCY_STATS),
+    ("inter_token_latency", _AGENTX_LATENCY_STATS),
+    ("request_latency", _AGENTX_LATENCY_STATS),
+    ("effective_concurrency", ("avg",)),
+    ("benchmark_duration", ("avg",)),
+    # The hit rate an unbounded cache would reach on the replayed trace, in
+    # percent: a property of the workload, not a measurement of the server.
+    ("theoretical_prefix_cache_hit", ("avg",)),
+)
+
 
 def sql_escape(val: str) -> str:
     return val.replace("'", "''")
@@ -81,12 +104,42 @@ def extract_bench_metrics(data: dict) -> dict:
     return {k: data[k] for k in BENCH_METRIC_FIELDS if data.get(k) is not None}
 
 
+def extract_agentx_metrics(export: dict) -> dict:
+    """The `agentx` element from one aiperf profile_export_aiperf.json, with
+    absent metrics omitted. The scenario and aiperf's verdict on the run sit
+    in the export's `metadata`, and only when a scenario was named."""
+    out = {}
+    for metric, stats in AGENTX_METRIC_FIELDS:
+        block = export.get(metric, {})
+        for stat in stats:
+            if block.get(stat) is not None:
+                out[f"{metric}_{stat}"] = block[stat]
+    metadata = export.get("metadata", {})
+    for key, source in (
+        ("aiperf_version", export),
+        ("was_cancelled", export),
+        ("scenario", metadata),
+        ("submission_valid", metadata),
+    ):
+        if source.get(key) is not None:
+            out[key] = source[key]
+    return out
+
+
 def created_time_sql(date_str) -> str:
-    """TIMESTAMP literal from a `vllm bench serve` `date` stamp (measurement
-    time), falling back to insert time."""
+    """TIMESTAMP literal from a measurement time, falling back to insert
+    time. Accepts a `vllm bench serve` `date` stamp (20261020-104845) or the
+    ISO 8601 `end_time` of an aiperf export. Both tools write the client's
+    clock without an offset, which is taken as UTC; a time that carries an
+    offset is converted."""
     if date_str:
         try:
-            dt = datetime.strptime(date_str, "%Y%m%d-%H%M%S")
+            try:
+                dt = datetime.strptime(date_str, "%Y%m%d-%H%M%S")
+            except ValueError:
+                dt = datetime.fromisoformat(date_str)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(UTC)
             return f"TIMESTAMP '{dt.strftime('%Y-%m-%dT%H:%M:%SZ')}'"
         except ValueError:
             print(

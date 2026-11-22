@@ -30,6 +30,16 @@ a P50 repeats the median, and a speed-grid cell has a null label and the
 model as its tokenizer. The keys the writer also saves but the rows do not
 hold (latencies, queue_times, max_concurrent_requests and the *_e2el_ms
 statistics) are left out; no uploader reads them.
+
+results_mmmu_pro.json is the file run_eval_flow.sh writes for an evalscope
+score of 0.61.
+
+The AgentX point (conc_8/) is not a measurement. Its shape follows the public
+source of the writer agentx_client.sh pins (aiperf 0.12.0: JsonExportData,
+JsonMetricResult and the config it dumps as input_config). Its values are
+invented, and it was not checked against a real export. It holds only the
+keys and statistics the uploader reads, and the unit every metric block must
+carry.
 """
 
 import importlib.util
@@ -150,7 +160,8 @@ def _results_dir(tmp_path: pathlib.Path, *names: str) -> pathlib.Path:
     return results_dir
 
 
-def _upload(monkeypatch, capsys, results_dir, *args) -> tuple[int, list[dict]]:
+def _run_upload(monkeypatch, capsys, results_dir, *args) -> tuple[int, str, str]:
+    """The uploader's dry run over a directory: exit status, stdout, stderr."""
     monkeypatch.setattr(
         sys,
         "argv",
@@ -158,7 +169,13 @@ def _upload(monkeypatch, capsys, results_dir, *args) -> tuple[int, list[dict]]:
         + [str(a) for a in args],
     )
     returncode = upload_results.main()
-    return returncode, _rows(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    return returncode, captured.out, captured.err
+
+
+def _upload(monkeypatch, capsys, results_dir, *args) -> tuple[int, list[dict]]:
+    returncode, out, _ = _run_upload(monkeypatch, capsys, results_dir, *args)
+    return returncode, _rows(out)
 
 
 _BASE_CONFIG = {
@@ -575,3 +592,240 @@ def test_speculative_decoding_acceptance_is_kept_when_the_bench_reports_it(
         "spec_decode_draft_tokens": 2000,
         "spec_decode_accepted_tokens": 1250,
     }
+
+
+_ACCURACY_ROW = {
+    "table": _TABLE,
+    "record_id": _record_id(1),
+    # The suites' result files share no measurement time.
+    "created_time": "CURRENT_TIMESTAMP()",
+    "repository": "vllm-torchtpu",
+    "run_type": "DAILY",
+    "model_id": _GRID_MODEL,
+    "metrics": {"lm_eval": {"gsm8k": 0.98}},
+    "config": {**_BASE_CONFIG, "engine_flags": _ENGINE_FLAGS},
+}
+
+
+@pytest.mark.parametrize(
+    ("results", "scores"),
+    [
+        (["lm_eval"], {"gsm8k": 0.98}),
+        (["results_mmmu_pro.json"], {"mmmu_pro": 0.61}),
+        (["lm_eval", "results_mmmu_pro.json"], {"gsm8k": 0.98, "mmmu_pro": 0.61}),
+    ],
+)
+def test_run_without_a_speed_grid_writes_its_scores_as_one_accuracy_row(
+    tmp_path, monkeypatch, capsys, results, scores
+):
+    results_dir = _results_dir(tmp_path, "config.json", *results)
+
+    returncode, rows = _upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 0
+    assert rows == [{**_ACCURACY_ROW, "metrics": {"lm_eval": scores}}]
+
+
+def test_accuracy_row_needs_the_model_that_config_json_names(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "lm_eval")
+
+    returncode, out, err = _run_upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 1
+    assert "Error: Missing required config parameter 'model' in config.json" in err
+    assert _rows(out) == []
+
+
+def test_directory_with_nothing_to_upload_is_not_an_error(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "config.json")
+    # An empty directory is reported before the commit is asked for.
+    monkeypatch.delenv("BUILDKITE_COMMIT")
+
+    returncode, out, _ = _run_upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 0
+    assert out == (
+        f"Nothing to upload from {results_dir}: no speed-grid cell, AgentX point "
+        "or accuracy result.\n"
+    )
+
+
+_AGENTX_MODEL = "moonshotai/Kimi-K3"
+_AGENTX_METRICS = {
+    "request_throughput_avg": 0.25,
+    "request_count_avg": 300.0,
+    "output_token_throughput_avg": 640.0,
+    "input_token_throughput_avg": 12160.0,
+    "total_token_throughput_avg": 12800.0,
+    "time_to_first_token_avg": 1800.0,
+    "time_to_first_token_p50": 900.0,
+    "time_to_first_token_p90": 3800.0,
+    "time_to_first_token_p99": 25000.0,
+    "inter_token_latency_avg": 20.0,
+    "inter_token_latency_p50": 12.5,
+    "inter_token_latency_p90": 25.0,
+    "inter_token_latency_p99": 80.0,
+    "request_latency_avg": 9000.0,
+    "request_latency_p50": 4000.0,
+    "request_latency_p90": 22000.0,
+    "request_latency_p99": 58000.0,
+    "effective_concurrency_avg": 7.25,
+    "benchmark_duration_avg": 1200.0,
+    "theoretical_prefix_cache_hit_avg": 91.5,
+    "aiperf_version": "0.12.0",
+    "was_cancelled": False,
+    "scenario": "agentx",
+    "submission_valid": True,
+}
+_AGENTX_ROW = {
+    "table": _TABLE,
+    "record_id": _record_id(1),
+    # The export's end_time, 2026-10-28T08:35:19.586894, which has no offset.
+    "created_time": "TIMESTAMP '2026-10-28T08:35:19Z'",
+    "repository": "vllm-torchtpu",
+    "run_type": "DAILY",
+    "model_id": _AGENTX_MODEL,
+    "metrics": {
+        "agentx": _AGENTX_METRICS,
+        # 1000 / the P50, P90 and P99 inter_token_latency of 12.5, 25 and 80 ms.
+        "derived": {"median_intvty": 80.0, "p90_intvty": 40.0, "p99_intvty": 12.5},
+    },
+    "config": {
+        **_BASE_CONFIG,
+        # The directory has no config.json to state them.
+        "engine_flags": {
+            "max_num_seqs": None,
+            "max_num_batched_tokens": None,
+            "tensor_parallel_size": None,
+            "data_parallel_size": 1,
+            "max_model_len": None,
+            "enable_ep": False,
+            "quantization": None,
+            "multihost_backend": None,
+        },
+        "workload": {
+            "scenario": "agentx",
+            "dataset": "semianalysis_cc_traces_weka_062126",
+            "max_context_length": 131072,
+            "max_concurrency": 8,
+        },
+    },
+}
+
+
+def test_agentx_point_row_carries_the_replay_and_its_interactivity(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "conc_8")
+
+    returncode, rows = _upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 0
+    assert rows == [_AGENTX_ROW]
+
+
+def test_agentx_run_with_config_json_and_scores_writes_a_point_and_an_accuracy_row(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "config.json", "conc_8", "lm_eval")
+
+    returncode, rows = _upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 0
+    assert rows == [
+        {
+            **_AGENTX_ROW,
+            # config.json names the run's model, as on its speed-grid rows; the
+            # export's own name is the fallback.
+            "model_id": _GRID_MODEL,
+            "config": {**_AGENTX_ROW["config"], "engine_flags": _ENGINE_FLAGS},
+        },
+        {**_ACCURACY_ROW, "record_id": _record_id(2)},
+    ]
+
+
+def _agentx_results_dir(tmp_path: pathlib.Path, edit) -> pathlib.Path:
+    """A results directory holding the fixture point, its export changed by
+    `edit`."""
+    results_dir = _results_dir(tmp_path, "conc_8")
+    export_path = results_dir / "conc_8/aiperf_artifacts/profile_export_aiperf.json"
+    export = json.loads(export_path.read_text())
+    edit(export)
+    export_path.write_text(json.dumps(export))
+    return results_dir
+
+
+def test_agentx_point_without_token_latency_has_no_derived_element(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _agentx_results_dir(
+        tmp_path, lambda export: export.pop("inter_token_latency")
+    )
+
+    _, (row,) = _upload(monkeypatch, capsys, results_dir)
+
+    assert row["metrics"] == {
+        "agentx": {
+            name: value
+            for name, value in _AGENTX_METRICS.items()
+            if not name.startswith("inter_token_latency_")
+        }
+    }
+
+
+def test_agentx_point_with_failed_requests_carries_their_count(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _agentx_results_dir(
+        tmp_path,
+        lambda export: export.update(
+            error_request_count={"unit": "requests", "avg": 3.0}
+        ),
+    )
+
+    _, (row,) = _upload(monkeypatch, capsys, results_dir)
+
+    assert row["metrics"]["agentx"] == {
+        **_AGENTX_METRICS,
+        "error_request_count_avg": 3.0,
+    }
+
+
+def test_unreadable_agentx_export_fails_the_upload_but_keeps_the_other_points(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "conc_8")
+    broken = results_dir / "conc_16/aiperf_artifacts/profile_export_aiperf.json"
+    broken.parent.mkdir(parents=True)
+    # A client killed while it wrote.
+    broken.write_text('{"request_count": {"av')
+
+    returncode, out, err = _run_upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 1
+    assert f"Error loading {broken}: " in err
+    assert _rows(out) == [_AGENTX_ROW]
+
+
+def test_agentx_export_outside_conc_layout_is_ignored(tmp_path, monkeypatch, capsys):
+    results_dir = _results_dir(tmp_path, "conc_8")
+    stray = results_dir / "wrong_location"
+    stray.mkdir()
+    shutil.copy(
+        results_dir / "conc_8/aiperf_artifacts/profile_export_aiperf.json", stray
+    )
+
+    _, rows = _upload(monkeypatch, capsys, results_dir)
+
+    assert rows == [_AGENTX_ROW]
+
+
+def test_created_time_converts_an_offset_to_utc():
+    assert (
+        upload_results.bq_utils.created_time_sql("2026-11-02T09:18:05+08:00")
+        == "TIMESTAMP '2026-11-02T01:18:05Z'"
+    )

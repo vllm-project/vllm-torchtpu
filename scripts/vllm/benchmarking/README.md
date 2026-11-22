@@ -211,6 +211,18 @@ A perf step opts in with `UPLOAD_TO_VLLM_CI: "1"` in its `env`;
 upload, and skips it on PRs and non-main branches like that upload. `--dry-run`
 prints the rows without posting them.
 
+`upload_results.py --results-dir <DIR>` writes one BigQuery row for each
+measured point in a results directory. `--skip-db-upload` prints the
+statements without running them.
+
+| In the directory | Row |
+|------------------|-----|
+| `isl<N>_osl<N>_c<N>.json` | One per cell: the `vllm_bench` metrics, with the run's accuracy scores as `lm_eval`. Also written to Spanner unless `--skip-spanner` is set |
+| `conc_<N>/` with aiperf's `profile_export_aiperf.json` below it | One per AgentX replay point, as `agentx_client.sh` writes them: the `agentx` metrics, and the interactivity at the median, P90 and P99 inter-token latency as `derived` |
+| `results_*.json` and no cell | One for the run: the accuracy scores as `lm_eval`. `config.json` must name the `model` |
+
+A directory with none of these uploads nothing, which is not an error.
+
 ## Environment Variables
 
 | Variable | Default | Description |
