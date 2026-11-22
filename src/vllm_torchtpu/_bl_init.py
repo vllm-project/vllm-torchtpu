@@ -727,6 +727,11 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     patch_executor_for_pp_handoff(kwargs.get("vllm_config"))
     patch_engine_core_for_pp_chunks(kwargs.get("vllm_config"))
     patch_engine_core_for_lazy_push(kwargs.get("vllm_config"))
+    # q38 SV-KNOB GIL-SW (core/host_knobs.py): wraps scheduler.schedule once the engine
+    # core is built; a no-op unless VLLM_TPU_HOST_SWITCH_US / VLLM_TPU_HOST_AB_PERIOD_MS is set.
+    from vllm_torchtpu.core.host_knobs import patch_engine_core_for_host_knobs
+
+    patch_engine_core_for_host_knobs()
 
     from vllm.v1.engine.core import EngineCoreProc
 

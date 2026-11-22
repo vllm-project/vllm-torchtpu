@@ -157,6 +157,7 @@ from vllm_torchtpu.runner import pp_last_async_output
 from vllm_torchtpu.runner import pp_last_async_drafter as _pparf  # q38 PPARF (VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER, default off)
 from vllm_torchtpu.runner import host_admit_probe
 from vllm_torchtpu.runner import step_buckets
+from vllm_torchtpu.core import host_knobs as _host_knobs  # q38 SV-KNOB GIL-SW (default off)
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
     StaticPoolerSpec,
@@ -4301,6 +4302,8 @@ class TPUModelRunner(GPUModelRunner):
                 "after execute_model() returns None."
             )
         host_phases.begin_step()
+        if _host_knobs.ENABLED:
+            _host_knobs.on_step("worker")
         if host_admit_probe.ENABLED:
             host_admit_probe.runner_step(self, scheduler_output)
         if self._mtp_prefill_only:

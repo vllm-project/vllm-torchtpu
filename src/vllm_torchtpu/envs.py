@@ -435,6 +435,8 @@ if TYPE_CHECKING:
     VLLM_TPU_WEIGHT_DIGEST_RANKS: str = ""
     VLLM_TPU_HOST_COPY_CHECK: bool = False
     VLLM_TPU_HOST_PHASES: int = 0
+    VLLM_TPU_HOST_SWITCH_US: int = 0
+    VLLM_TPU_HOST_AB_PERIOD_MS: int = 0
     VLLM_TPU_HOSTADMIT_PROBE: str = ""
     VLLM_TPU_HOSTADMIT_PYSPY: str = ""
     VLLM_TPU_HOSTADMIT_PYSPY_RANKS: str = "0"
@@ -2895,6 +2897,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log each rank's per-step host time by runner phase every N steps
     # (0 = off); runner/host_phases.py.
     "VLLM_TPU_HOST_PHASES": env_nonnegative_int("VLLM_TPU_HOST_PHASES", 0),
+    # q38 SV-KNOB GIL-SW (core/host_knobs.py): the interpreter's thread switch
+    # interval in microseconds for the engine core and the workers (0 = off;
+    # 1..100000), and its in-process A/B windows in ms (0 = off; must divide
+    # 86,400,000 with an even quotient). Host thread scheduling only.
+    "VLLM_TPU_HOST_SWITCH_US": env_nonnegative_int("VLLM_TPU_HOST_SWITCH_US", 0),
+    "VLLM_TPU_HOST_AB_PERIOD_MS": env_nonnegative_int("VLLM_TPU_HOST_AB_PERIOD_MS", 0),
     # Host timeline of the admission path in profile windows, as
     # "<start_s>:<duration_s>[+...]" after the first Stage-3 load each process
     # sees ("" = off); runner/host_admit_probe.py.

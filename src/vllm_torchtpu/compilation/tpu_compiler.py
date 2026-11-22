@@ -306,6 +306,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     "QWEN4_EXP_PD_EARLY_POLL",
     # Per-step host phase logging (runner/host_phases.py).
     "VLLM_TPU_HOST_PHASES",
+    # q38 SV-KNOB GIL-SW: the interpreter's thread switch interval and its A/B
+    # windows, set per process at its first step (core/host_knobs.py).
+    "VLLM_TPU_HOST_SWITCH_US",
+    "VLLM_TPU_HOST_AB_PERIOD_MS",
     # Last pipeline stage replies from the output thread (host only;
     # runner/pp_last_async_output.py).
     "VLLM_TPU_PP_LAST_ASYNC_OUTPUT",
