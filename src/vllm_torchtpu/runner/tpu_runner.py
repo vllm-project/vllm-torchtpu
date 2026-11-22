@@ -8713,9 +8713,9 @@ class TPUModelRunner(GPUModelRunner):
         ).to(self.device)
         # Each program variant serving can run at this bucket: the folded
         # LM head projection (one hidden row per logits row) and the folded
-        # read-offset scatter at the slot-group shapes the backbone warmup
-        # walks recorded for this width (into a scratch copy, so warmup
-        # leaves the live offsets untouched).
+        # read-offset scatter at every slot-group shape set a verify chunk
+        # can hand it (into a scratch copy, so warmup leaves the live
+        # offsets untouched).
         projections: list = [None]
         if envs.VLLM_TPU_CANDIDATE_VERIFY_LOGITS:
             projections.append(
@@ -8727,19 +8727,35 @@ class TPUModelRunner(GPUModelRunner):
                     torch.zeros(num_tokens, dtype=torch.int32).to(self.device),
                 )
             )
+        # With slot groups the fold always runs (see _candidate_read_offsets),
+        # so the projection is warmed with the folded scatter only; the plain
+        # program stays warmed as without the folds.
         read_offsets: list = [None]
         if (
             envs.VLLM_TPU_CANDIDATE_VERIFY_RO
+            and envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
             and self.mamba_slot_read_offsets is not None
+            and self.mamba_slot_read_offsets.device.type == "tpu"
         ):
             scratch = self.mamba_slot_read_offsets.clone()
-            width = bonus_logits_indices.shape[0]
-            for shapes in self.__dict__.get("_ro_group_shapes", {}).get(width, ()):
-                groups = [
-                    torch.zeros(sh, dtype=torch.int32, device=self.device)
-                    for sh in shapes
-                ]
-                read_offsets.append((scratch, groups, 1))
+            warm_shapes = sorted(self._ro_slot_group_shapes())
+            if not self.__dict__.get("_ro_warm_logged"):
+                self._ro_warm_logged = True
+                logger.info(
+                    "CANDIDATE_VERIFY_RO warmup slot groups: %s",
+                    [(len(s), sorted(set(s))) for s in warm_shapes],
+                )
+            read_offsets = [
+                (
+                    scratch,
+                    [
+                        torch.zeros(sh, dtype=torch.int32, device=self.device)
+                        for sh in shapes
+                    ],
+                    1,
+                )
+                for shapes in warm_shapes
+            ] or [None]
         # The folded async seed rides on the folded projection only, at the
         # seed keys a verify chunk of this bucket reaches.
         seeds: list = [None]
@@ -8756,7 +8772,8 @@ class TPUModelRunner(GPUModelRunner):
                 )
             ]
         for hidden_rows in projections:
-            for ro in read_offsets:
+            plain = hidden_rows is None and read_offsets[0] is not None
+            for ro in [None, *read_offsets] if plain else read_offsets:
                 for seed in seeds if hidden_rows is not None else [None]:
                     out = self._sample_spec_verify_candidates(
                         warm_local if hidden_rows is None else None,
@@ -10950,6 +10967,29 @@ class TPUModelRunner(GPUModelRunner):
             and hidden_states.device.type == "tpu"
         )
 
+    def _ro_slot_group_shapes(self) -> set[tuple]:
+        """The read-offset slot-group shape sets a verify chunk can hand the
+        candidate verify program: on the unified pool, one [request
+        capacity] tensor per mamba KV group (the staged walk's per-group
+        state ids are as wide as the chunk's capacity, not its verify
+        bucket), plus every set the walks recorded (keyed by that capacity,
+        so each fits every verify bucket). Warmup's dummy walks take the
+        compact path and record none."""
+        recorded = self.__dict__.get("_ro_group_shapes", {})
+        shapes = set().union(*recorded.values())
+        if self._unified_kv_layout and not envs.VLLM_TPU_STAGED_WALK_STACKED:
+            mamba_groups = {
+                group.metadata_builders[0].kv_cache_group_id
+                for group_list in self.attn_groups
+                for group in group_list
+                if group.metadata_builders[0].is_mamba_group
+            }
+            capacities = (self.num_reqs_max_model_len, self.num_reqs_most_model_len)
+            for capacity in capacities:
+                if capacity and mamba_groups:
+                    shapes.add(((capacity,),) * len(mamba_groups))
+        return shapes
+
     def _candidate_read_offsets(self) -> tuple | None:
         """VLLM_TPU_CANDIDATE_VERIFY_RO: (read-offset buffer, slot groups,
         rows) for this verify chunk's in-program scatter, or None to scatter
@@ -10963,6 +11003,13 @@ class TPUModelRunner(GPUModelRunner):
             or not groups
         ):
             return None
+        if not self.__dict__.get("_ro_shapes_logged"):
+            self._ro_shapes_logged = True
+            logger.info(
+                "CANDIDATE_VERIFY_RO serving slot groups: %d x %s",
+                len(groups),
+                sorted({tuple(g.shape) for g in groups}),
+            )
         return self.mamba_slot_read_offsets, groups, rows
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)

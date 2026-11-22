@@ -492,11 +492,12 @@ def test_candidate_chunk_folds_read_offsets_only_when_switched_on(monkeypatch):
     cpu_buffer = types.SimpleNamespace(device=types.SimpleNamespace(type="cpu"))
     passed = []
     md = types.SimpleNamespace(draft_token_ids=object())
+    groups_ = [torch.zeros(4, dtype=torch.int32)]
     cases = [
-        (False, tpu_buffer, ["g"], None),
-        (True, cpu_buffer, ["g"], None),
+        (False, tpu_buffer, groups_, None),
+        (True, cpu_buffer, groups_, None),
         (True, tpu_buffer, None, None),
-        (True, tpu_buffer, ["g"], (tpu_buffer, ["g"], 2)),
+        (True, tpu_buffer, groups_, (tpu_buffer, groups_, 2)),
     ]
     monkeypatch.setattr(envs, "VLLM_TPU_FUSED_READ_OFFSET_UPDATE", True, raising=False)
     for flag, buffer, groups, expected in cases:
@@ -712,3 +713,38 @@ def test_verify_seed_stash_keeps_only_this_steps_chunks():
     )
     Eagle3Proposer.stash_verify_seed(proposer, cur, "nt1", ("seed",))
     assert proposer._verify_seeds == {id(cur): (cur, "nt1", ("seed",))}
+
+
+@pytest.mark.parametrize("stacked", [False, True])
+def test_ro_slot_group_shapes_cover_each_capacity(monkeypatch, stacked):
+    """The read-offset fold is warmed at one [capacity] slot group per mamba
+    KV group (deduplicated), for both request capacities, plus any recorded
+    set; the stacked walk hands stacks instead, so only recorded sets."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    monkeypatch.setattr(envs, "VLLM_TPU_STAGED_WALK_STACKED", stacked, raising=False)
+
+    def group(gid, mamba):
+        builder = types.SimpleNamespace(kv_cache_group_id=gid, is_mamba_group=mamba)
+        return types.SimpleNamespace(metadata_builders=[builder])
+
+    runner = types.SimpleNamespace(
+        _unified_kv_layout=True,
+        attn_groups=[
+            [group(0, False)],
+            [group(1, True), group(1, True)],
+            [group(2, True)],
+        ],
+        num_reqs_max_model_len=16,
+        num_reqs_most_model_len=8,
+        _ro_group_shapes={16: {((16,), (16,), (16,))}},
+    )
+    shapes = TPUModelRunner._ro_slot_group_shapes(runner)
+    expected = {((16,), (16,), (16,))}
+    if not stacked:
+        expected |= {((16,), (16,)), ((8,), (8,))}
+    assert shapes == expected
+    runner.attn_groups = [[group(0, False)]]
+    runner._ro_group_shapes = {}
+    assert TPUModelRunner._ro_slot_group_shapes(runner) == set()
