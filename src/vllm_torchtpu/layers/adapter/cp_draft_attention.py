@@ -1669,7 +1669,7 @@ def _pair_merge_block_op(
 
     name = (
         f"pallas::dcp_draft_pair_merge_block_q{max_query_len}_s{sm_scale:.8f}"
-        f"_c{int(causal)}"
+        f"_c{int(causal)}_k{k_scale}_v{v_scale}_{cache_dtype}"
     ).replace(".", "p")
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
