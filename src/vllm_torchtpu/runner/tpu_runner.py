@@ -196,6 +196,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
     SpecLogprobsChunk,
+    extract_draft_token_ids,
     valid_token_ids,
 )
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
@@ -434,8 +435,6 @@ def _substitute_and_extract_drafts(
     (`_substitute_placeholder_token`, or with no indices the in-order slice of
     ``next_tokens`` its fast path takes) and `extract_draft_token_ids` of the
     result, as one program."""
-    from vllm_torchtpu.runner.tpu_runner_async_output import extract_draft_token_ids
-
     if token_in_tpu_cur_input_indices is None:
         input_ids = next_tokens.flatten()[: input_ids.shape[0]].to(input_ids.dtype)
     else:
@@ -2586,10 +2585,6 @@ class TPUModelRunner(GPUModelRunner):
         its result: one program (`_substitute_and_extract_drafts`, under
         `TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS`) at the arguments the warmup
         compiled it at, else as before."""
-        from vllm_torchtpu.runner.tpu_runner_async_output import (
-            extract_draft_token_ids,
-        )
-
         inputs = self._async_substitution_inputs(
             input_ids,
             token_in_tpu_cur_input_indices,
