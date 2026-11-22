@@ -45,7 +45,12 @@ from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
 
 DEFAULT_BLOCK_Q = 128
 DEFAULT_LARGE_BLOCK_Q = 512
-DEFAULT_PAGES_PER_STEP = 32
+# Pages per grid step of the large (prefill) tiles: a step's fixed cost
+# against its 16-page dots (bench, us per call, 32 / 64 / 128 pages: c64
+# mixed 372 / 357 / 345, c48 281 / 266 / 262, c4 123 / 105 / 95, c16 161 /
+# 142 / 135; bit-identical). 128 grows the kernel 6x (AOT c48: 6.6k, 18.6k,
+# 41.8k bundles; one straight-line body per ring slot and chunk count).
+DEFAULT_PAGES_PER_STEP = 64
 # The block_q class (decode, MTP verify) runs the v3 DMA ring; 128 pages per
 # step keep more bytes in flight (j-dba77583: 32 req x 8 tokens at 128K,
 # 1.95 -> 1.66 ms). The large prefill class keeps 32.
