@@ -91,6 +91,17 @@ def main():
                     help="shard / union / loop indexer modes (the served whole-step's)")
     ap.add_argument("--profile", default="", help="trace dir: device time per call + top ops")
     ap.add_argument("--skip-idle", type=int, default=1, help="skip idle request slots (served loop)")
+    ap.add_argument("--key-slots", type=int, default=2,
+                    help="draft key-ring slots (draftkeyslots; -1 = auto)")
+    ap.add_argument("--key-lanes", type=int, default=0, choices=(0, 128),
+                    help="wholekeylanes (the draft inherits the target's key lanes)")
+    ap.add_argument("--fill-keys", action="store_true",
+                    help="random FP8 in the requests' compressed-key and main-KV blocks, so a "
+                    "hash sees the selection")
+    ap.add_argument("--dhash", action="store_true",
+                    help="digest of the first call's residual, tokens and pool (bitwise checks)")
+    ap.add_argument("--ctx-min", type=int, default=0,
+                    help="mixed contexts: request q gets ctx - q * (ctx - ctx_min) // (nreq - 1)")
     ap.add_argument("--trace-only", action="store_true")
     ap.add_argument("--interpret", action="store_true")
     a = ap.parse_args()
@@ -101,6 +112,11 @@ def main():
     import vllm_torchtpu.megakernel_runtime.qwen38_draft as qd
 
     qd.SKIP_IDLE = bool(a.skip_idle)
+    qd.KEY_SLOTS = a.key_slots
+    if a.key_lanes:
+        from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_call as wsc2
+
+        wsc2.KEY_LANES = a.key_lanes
     if a.interpret or a.trace_only:
         from jax.experimental import pallas as pl
         from jax.experimental.pallas import tpu as pltpu
@@ -126,7 +142,12 @@ def main():
             B = -(-(nreq * T) // 4) * 4
             NRQ = B // T  # requests the kernel sees (padding requests idle)
             NR = max(16, NRQ)
-            n_used = -(-(a.ctx + 4 + nreq) // 128)
+            if a.ctx_min:
+                ctx_q = [a.ctx - q * (a.ctx - a.ctx_min) // max(nreq - 1, 1)
+                         for q in range(nreq)]
+            else:
+                ctx_q = [a.ctx + q for q in range(nreq)]
+            n_used = -(-(max(ctx_q) + 4) // 128)
             NB = 1 + nreq * (1 + 2 * n_used) + 8
             layout = Qwen38GdnPoolLayout(
                 pool_shape=(NB * 4, 128, 1, 4, 256), pool_dtype="float8_e4m3fn"
@@ -138,7 +159,7 @@ def main():
             )
             ex = ExecSpec(R=R, B=B, T=T, ctx=128, tiles=wholestep_tiles(B, a.max_groups))
             spec = draft_spec(g, R, budget=a.budget, max_groups=a.max_groups,
-                              vocab_shard=a.vocab_shard)
+                              vocab_shard=a.vocab_shard, B=B)
             _, info = kernel.make_step(mesh, spec, ex)
             p, wsh = info["plan"], info["wshape"]
             key = jax.random.PRNGKey(0)
@@ -163,21 +184,22 @@ def main():
                     ws.append(rnd((R * s[0][0],) + tuple(s[0][1:]), s[1]))
             rng = np.random.default_rng(0)
             free = iter(rng.permutation(np.arange(4, 4 * NB)))
-            ctx = np.array([a.ctx + q for q in range(nreq)] + [0] * (NR - nreq), np.int32)
+            ctx = np.array(ctx_q + [0] * (NR - nreq), np.int32)
             qsl = np.array([min(q, nreq) * T for q in range(NR + 1)], np.int32)
             main = np.zeros((NR, pps), np.int32)
             comp = np.zeros((NR, pps), np.int32)
             ring = np.zeros((NR, 8), np.int32)
             for q in range(nreq):
-                main[q, :n_used] = [next(free) for _ in range(n_used)]
-                comp[q, :n_used] = [next(free) for _ in range(n_used)]
+                nq = -(-(ctx_q[q] + 4) // 128)
+                main[q, :nq] = [next(free) for _ in range(nq)]
+                comp[q, :nq] = [next(free) for _ in range(nq)]
                 ring[q, 0] = next(free)
             positions = np.zeros(B, np.int32)
             positions[: nreq * T] = np.concatenate(
                 [ctx[q] + np.arange(T) for q in range(nreq)]
             )
             inv = 1.0 / (1e7 ** (np.arange(0, 64, 2) / 64))
-            ang = np.arange(a.ctx + 4096)[:, None] * inv[None]
+            ang = np.arange(max(ctx_q) + 4096)[:, None] * inv[None]
             trig = jnp.asarray(
                 np.concatenate([np.cos(ang), np.sin(ang), np.zeros((len(ang), 64))], 1),
                 jnp.bfloat16,
@@ -188,6 +210,18 @@ def main():
                 out_shardings=tp,
             )() if not a.trace_only else rnd((R * NB * 4, 128, 1, 4, 256),
                                              jnp.float8_e4m3fn)
+            if a.fill_keys and not a.trace_only:
+                ids = jnp.asarray(np.concatenate([comp[:nreq].ravel(), main[:nreq].ravel()]))
+                ids = ids[ids > 0]
+
+                def fill(p, ids):
+                    k = jax.random.fold_in(jax.random.PRNGKey(5), jax.lax.axis_index("tp"))
+                    v = jax.random.normal(k, (ids.shape[0],) + p.shape[1:], jnp.float32) * 0.5
+                    return p.at[ids].set(v.astype(p.dtype))
+
+                pool = jax.jit(jax.shard_map(fill, mesh=mesh, in_specs=(P("tp"), P()),
+                                             out_specs=P("tp"), check_vma=False),
+                               donate_argnums=0)(pool, ids)
             put = lambda x: jax.device_put(jnp.asarray(x), rep)  # noqa: E731
             args = [hidden, *ws, pool, put(ring.reshape(-1)), put(main.reshape(-1)),
                     put(comp.reshape(-1)), put(positions), put(qsl), put(ctx), put(trig),
@@ -200,6 +234,24 @@ def main():
             t0 = time.time()
             res, tok, pool = f(*args)
             jax.block_until_ready(res)
+            if a.dhash:
+                import hashlib
+
+                def digest(p):
+                    u = jax.lax.bitcast_convert_type(p.reshape(p.shape[0], -1, 4), jnp.uint32)
+                    w = jax.lax.broadcasted_iota(jnp.uint32, u.shape, 1) * jnp.uint32(
+                        2654435761) + 1
+                    return (jnp.sum(u, axis=1),
+                            jax.lax.reduce(u, jnp.uint32(0), jax.lax.bitwise_xor, (1,)),
+                            jnp.sum(u * w, axis=1))
+
+                hsh = hashlib.sha256(np.asarray(res).tobytes())
+                hsh.update(np.asarray(tok).tobytes())
+                for x in jax.jit(digest)(pool):
+                    hsh.update(np.asarray(x).tobytes())
+                print(f"T={T} reqs={nreq} B={B} DHASH {hsh.hexdigest()[:16]} tokens-sha "
+                      f"{hashlib.sha256(np.asarray(tok).tobytes()).hexdigest()[:12]}",
+                      flush=True)
             print(f"T={T} reqs={nreq} B={B} first call {time.time() - t0:.1f} s finite "
                   f"{float(jnp.isfinite(res.astype(jnp.float32)).mean()):.4f} tokens "
                   f"{np.asarray(tok)[:nreq * T].tolist()[:8]}", flush=True)
