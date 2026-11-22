@@ -2978,6 +2978,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             ):
                 indexer_qrows = q_rows
 
+        q: torch.Tensor | None = None
         fused_qb_out: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         in_branch_qb_inputs: dcp_nonidx_qb_mla_op.InBranchQbInputs | None = None
         if self.kimi_preprocess is not None:
