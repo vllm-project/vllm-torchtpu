@@ -716,8 +716,8 @@ class DFlashProposer:
         """A lone chunk's context-KV update and its draft inputs from the
         verified tokens as one program (`_tpu_update_kv_and_build_inputs`),
         where `TPU_DFLASH_FUSED_KV_INPUTS` allows it and the runner's warmup
-        compiled it at these inputs; None leaves both to their own programs
-        (`_update_context_kv`, `_prepare_dflash_inputs`)."""
+        compiled it at these inputs (else the two programs apart); None leaves
+        both to `_update_context_kv` and `_prepare_dflash_inputs`."""
         if not (
             envs.TPU_DFLASH_FUSED_KV_INPUTS
             and len(chunks) == 1
@@ -737,12 +737,23 @@ class DFlashProposer:
             # Also compile the unfused builder, which a shape the warmup
             # did not meet falls back to (the KV update has its precompile).
             self._tpu_build_dflash_inputs_next_tokens(*input_args)
-        elif key not in self._fused_kv_inputs_keys:
-            return None
+        fused = key in self._fused_kv_inputs_keys
+        if not fused:
+            logger.info_once(
+                "DFlash fused KV update + draft inputs not precompiled for %d "
+                "tokens, %d requests; running them apart.",
+                chunk.aux_hidden_states[0].shape[0],
+                chunk.num_reqs,
+            )
+        # A miss runs the two programs `_update_context_kv` and
+        # `_prepare_dflash_inputs` would, on the arguments built above.
         with set_vllm_model_wrapper_context(
             mesh=self.runner.mesh, vllm_config=self.vllm_config
         ):
-            return self._tpu_update_kv_and_build_inputs(kv_args, input_args)
+            if fused:
+                return self._tpu_update_kv_and_build_inputs(kv_args, input_args)
+            self._tpu_precompute_and_update_kv_cache(*kv_args)
+        return self._tpu_build_dflash_inputs_next_tokens(*input_args)
 
     @contextlib.contextmanager
     def warming(self):

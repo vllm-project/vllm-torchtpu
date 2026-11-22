@@ -157,6 +157,7 @@ if TYPE_CHECKING:
     TPU_SPEC_SYNTHETIC_ROW_SPLIT: bool = True
     TPU_SPEC_SYNTHETIC_ROW_SPLIT_MIN_ROWS: int = 1
     TPU_DFLASH_FUSED_KV_INPUTS: bool = False
+    TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS: bool = False
     TPU_DSPARK_MARKOV_KERNEL: bool = True
     TPU_DSPARK_FUSED_MLP: str = "0"
     TPU_SAMPLER_TOP_P_KERNEL: bool = True
@@ -1175,6 +1176,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # two, at the inputs the real spec-decode warmup compiled it for. Same
     # cache writes and draft inputs.
     "TPU_DFLASH_FUSED_KV_INPUTS": env_bool("TPU_DFLASH_FUSED_KV_INPUTS", default=False),
+    # Async spec decode: run the async token substitution and the extraction
+    # of the drafts to verify as one compiled program
+    # (`_substitute_and_extract_drafts`) instead of two, at the arguments the
+    # warmup compiled it at. Same input ids and drafts.
+    "TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS": env_bool(
+        "TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS", default=False
+    ),
     # The DSpark greedy Markov chain over a vocab-parallel LM head runs its K
     # steps as one kernel with remote-DMA exchanges
     # (kernels/collectives/markov_argmax.py) instead of a per-step XLA loop

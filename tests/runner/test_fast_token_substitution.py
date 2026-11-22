@@ -118,13 +118,19 @@ def test_substitute_placeholder_token_rejects_mismatched_lengths():
         )
 
 
+@pytest.mark.parametrize("flag", [True, False])
 @pytest.mark.parametrize("fast", [True, False])
 @pytest.mark.parametrize("in_order", [True, False])
-def test_substitute_and_extract_drafts_matches_two_steps(fast, in_order):
-    """`_substitute_async_tokens_and_drafts` at a warmed shape (one program)
-    returns the substitution and the extracted drafts of the unwarmed path."""
+def test_substitute_and_extract_drafts_matches_two_steps(
+    monkeypatch, flag, fast, in_order
+):
+    """`_substitute_async_tokens_and_drafts` at a warmed shape (one program,
+    `TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS` on) returns the substitution and the
+    extracted drafts of the unwarmed path, which builds its substitution inputs
+    (uploads, cached slots) once."""
     from vllm_torchtpu.runner.tpu_runner_async_output import extract_draft_token_ids
 
+    monkeypatch.setattr(envs, "TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS", flag)
     num_tokens, k = 8, 3
     next_tokens = torch.arange(100, 100 + 4 * (1 + k), dtype=torch.int64)
     cur = np.arange(num_tokens if in_order else 6, dtype=np.int32)
@@ -135,12 +141,20 @@ def test_substitute_and_extract_drafts_matches_two_steps(fast, in_order):
     )
 
     def runner():
-        return _runner(
+        r = _runner(
             _fast_token_substitution=fast,
             device=torch.device("cpu"),
             _pre_async_results=SimpleNamespace(next_tokens_tpu=next_tokens),
             _substitute_drafts_warm=set(),
         )
+        r.input_builds = 0
+
+        def build(*args):
+            r.input_builds += 1
+            return TPUModelRunner._async_substitution_inputs(r, *args)
+
+        r._async_substitution_inputs = build
+        return r
 
     def inputs():
         return torch.arange(-num_tokens, 0, dtype=torch.int32)
@@ -157,6 +171,7 @@ def test_substitute_and_extract_drafts_matches_two_steps(fast, in_order):
         )
         cold = runner()
         unwarmed = cold._substitute_async_tokens_and_drafts(inputs(), cur, pre, md)
+        assert cold.input_builds == 1
         warm = runner()
         warm._substitute_drafts_warm.add("warmed")
         with (
@@ -170,7 +185,8 @@ def test_substitute_and_extract_drafts_matches_two_steps(fast, in_order):
             ) as fused,
         ):
             warmed = warm._substitute_async_tokens_and_drafts(inputs(), cur, pre, md)
-            assert fused.called
+            assert fused.called == flag
+        assert warm.input_builds == 1
     for got in (unwarmed, warmed):
         assert torch.equal(got[0], expected[0])
         assert torch.equal(got[1], expected[1])

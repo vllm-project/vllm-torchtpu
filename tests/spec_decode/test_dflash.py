@@ -692,25 +692,33 @@ def _fused_kv_inputs_proposer():
 
 def test_fused_kv_update_and_inputs(monkeypatch):
     """`TPU_DFLASH_FUSED_KV_INPUTS`: one program for the KV update and the
-    draft inputs, at the inputs the warmup met; elsewhere the two programs."""
+    draft inputs at the inputs the warmup met; a lone chunk elsewhere runs the
+    two programs on the same arguments; several chunks are left to propose."""
     monkeypatch.setattr(dflash_module.envs, "TPU_DFLASH_FUSED_KV_INPUTS", True)
     proposer, chunk, next_tokens = _fused_kv_inputs_proposer()
+    fused_calls = []
+    fused = proposer._tpu_update_kv_and_build_inputs
+
+    def spy(*args):
+        fused_calls.append(args)
+        return fused(*args)
+
+    proposer._tpu_update_kv_and_build_inputs = spy
+    other_tokens = torch.full((3, 4), -1, dtype=torch.int32)
     with torch.compiler.set_stance("force_eager"):
         expected = proposer._prepare_dflash_inputs(chunk, next_tokens)
-        # Not yet met by the warmup: no fusion, nothing run.
-        assert proposer._update_kv_and_build_inputs([chunk], [next_tokens]) is None
-        proposer._precompute_and_update_kv_cache.assert_not_called()
+        expected_other = proposer._prepare_dflash_inputs(chunk, other_tokens)
+        # Not yet met by the warmup: the two programs apart.
+        cold = proposer._update_kv_and_build_inputs([chunk], [next_tokens])
+        assert not fused_calls
 
         with proposer.warming():
             warmed = proposer._update_kv_and_build_inputs([chunk], [next_tokens])
         served = proposer._update_kv_and_build_inputs([chunk], [next_tokens])
-        # Another shape (3 requests' rows) falls back.
-        assert (
-            proposer._update_kv_and_build_inputs(
-                [chunk], [torch.full((3, 4), -1, dtype=torch.int32)]
-            )
-            is None
-        )
+        assert len(fused_calls) == 2
+        # Another shape (3 requests' rows): apart again.
+        other = proposer._update_kv_and_build_inputs([chunk], [other_tokens])
+        assert len(fused_calls) == 2
         # Two chunks keep the hoisted per-chunk updates.
         assert (
             proposer._update_kv_and_build_inputs(
@@ -719,11 +727,12 @@ def test_fused_kv_update_and_inputs(monkeypatch):
             is None
         )
 
-    for got in (warmed, served):
+    for got in (cold, warmed, served):
         assert all(torch.equal(a, b) for a, b in zip(got, expected, strict=True))
+    assert all(torch.equal(a, b) for a, b in zip(other, expected_other, strict=True))
     kv_args = proposer._kv_update_args(chunk)
     calls = proposer._precompute_and_update_kv_cache.call_args_list
-    assert len(calls) == 2
+    assert len(calls) == 4
     for call in calls:
         hidden, positions, md = call.args
         assert hidden is kv_args[0] and torch.equal(positions, kv_args[1])

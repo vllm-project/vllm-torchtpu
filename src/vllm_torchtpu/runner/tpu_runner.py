@@ -2558,7 +2558,16 @@ class TPUModelRunner(GPUModelRunner):
         )
         if inputs is None:
             return input_ids
-        cur_input_indices, pre_next_tokens_indices, next_tokens = inputs
+        return self._substitute_async_tokens(input_ids, *inputs)
+
+    @staticmethod
+    def _substitute_async_tokens(
+        input_ids: torch.Tensor,
+        cur_input_indices: torch.Tensor | None,
+        pre_next_tokens_indices: torch.Tensor | None,
+        next_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """The async substitution on `_async_substitution_inputs`."""
         if cur_input_indices is None:
             return next_tokens.flatten().to(input_ids.dtype)[: len(input_ids)]
         assert pre_next_tokens_indices is not None
@@ -2574,8 +2583,9 @@ class TPUModelRunner(GPUModelRunner):
         md: SpecDecodeMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`_apply_async_token_substitution` and `extract_draft_token_ids` of
-        its result: one program (`_substitute_and_extract_drafts`) at the
-        shapes the warmup compiled it for, else as before."""
+        its result: one program (`_substitute_and_extract_drafts`, under
+        `TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS`) at the arguments the warmup
+        compiled it at, else as before."""
         from vllm_torchtpu.runner.tpu_runner_async_output import (
             extract_draft_token_ids,
         )
@@ -2595,13 +2605,18 @@ class TPUModelRunner(GPUModelRunner):
                 cur_input_indices,
                 pre_next_tokens_indices,
             )
-            if program_key(args) in self._substitute_drafts_warm:
-                return _substitute_and_extract_drafts(*args)
-            input_ids = self._apply_async_token_substitution(
-                input_ids,
-                token_in_tpu_cur_input_indices,
-                token_in_tpu_pre_next_tokens_indices,
-            )
+            if envs.TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS:
+                if program_key(args) in self._substitute_drafts_warm:
+                    return _substitute_and_extract_drafts(*args)
+                logger.info_once(
+                    "Fused async substitution + draft extraction not precompiled "
+                    "for %d tokens, %d next tokens, %d logits rows; running "
+                    "them apart.",
+                    input_ids.shape[0],
+                    next_tokens.shape[0],
+                    md.final_logits_indices.shape[0],
+                )
+            input_ids = self._substitute_async_tokens(input_ids, *inputs)
         drafts = extract_draft_token_ids(
             input_ids, md.final_logits_indices, md.target_logits_indices
         )
@@ -2640,9 +2655,9 @@ class TPUModelRunner(GPUModelRunner):
                     token_in_tpu_pre_next_tokens_indices,
                     np.arange(len(input_ids), dtype=np.int32),
                 )
+                and next_tokens.numel() >= len(input_ids)
             ):
-                if next_tokens.numel() >= len(input_ids):
-                    return None, None, next_tokens
+                return None, None, next_tokens
 
             # Fast path 2: Cache persistent device indices to eliminate per-step
             # H2D uploads
@@ -7021,7 +7036,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     synchronize_tensors(out)
                     logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
-                if self._is_async_drafter:
+                if self._is_async_drafter and envs.TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS:
                     self._precompile_substitute_and_extract_drafts(
                         input_ids,
                         cur_input_indices,
