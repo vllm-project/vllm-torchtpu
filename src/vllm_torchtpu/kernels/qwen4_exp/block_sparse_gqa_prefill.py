@@ -90,13 +90,20 @@ def lazy_softmax_features():
 #   37888 owned keys x 448 stay far below FP32 max) and a row keeps full
 #   precision while its true max is within 87 - 15 + SHIFT nats of the bound.
 #   Rows outside that range are detected from lse and the call is re-run with
-#   the online softmax (``block_sparse_gqa_attention``).
+#   the online softmax (``block_sparse_gqa_attention``). On the VPU path a
+#   block whose bounds are all small runs with a zero stabilizer instead
+#   (BOUND_STAB_ZERO_LIMIT), so its rows round differently.
 # The bound is set from the loaded weights (``note_key_norm_bound``); None = off.
 _KEY_NORM_BOUND = None
 BOUND_STAB_MARGIN = 1.1
 BOUND_STAB_SHIFT = 60.0
 BOUND_STAB_GUARD = -55.0  # rerun when lse - stabilizer < this (log mass)
 BOUND_STAB_GUARD_HIGH = 65.0  # rerun when lse - stabilizer > this (bound violated)
+# VPU path: a query block whose score bounds are all at most this walks with a
+# zero stabilizer (no per-score subtraction): probabilities stay in
+# [e^-64, e^64], normal in FP32 and BF16, and 2^20 keys x 448 x e^64 < e^85
+# stays below FP32 max.
+BOUND_STAB_ZERO_LIMIT = 64.0
 # VPU path with the bound stabilizer, one KV head: a query block whose unit
 # (tokens x query heads, by KV tile) holds at most this many scores runs as
 # one unit per KV tile (TP8: 512 x 3 x 1024, 6 MiB of FP32 scores).
@@ -737,6 +744,7 @@ def _kernel(
         # q already carries sm * k_scale; cached keys are k / k_scale.
         bound = lax.bitcast_convert_type(bound_ref[0], jnp.float32)
         scale, shift = bound * (BOUND_STAB_MARGIN / k_scale), BOUND_STAB_SHIFT
+        shifted = jnp.int32(0)
         for query_tile_index in range(num_query_tiles):
             start = query_tile_index * query_tile
             for head in range(kv_heads):
@@ -746,9 +754,21 @@ def _kernel(
                     if grouped
                     else rows_q.reshape(query_tile * q_heads_per_kv, head_dim)
                 )
-                max_ref[query_tile_index, head, :] = (
-                    jnp.sqrt(jnp.sum(rows_q * rows_q, axis=1)) * scale - shift
-                )
+                score_bound = jnp.sqrt(jnp.sum(rows_q * rows_q, axis=1)) * scale
+                max_ref[query_tile_index, head, :] = score_bound - shift
+                if vpu:
+                    shifted = jnp.maximum(
+                        shifted,
+                        jnp.max(
+                            (score_bound > BOUND_STAB_ZERO_LIMIT).astype(jnp.int32)
+                        ),
+                    )
+        if vpu:
+            # See BOUND_STAB_ZERO_LIMIT; the interior KV tiles then skip the
+            # per-score subtraction (``unshifted``).
+            @pl.when(shifted == 0)
+            def zero_stabilizer():
+                max_ref[...] = jnp.zeros(max_ref.shape, jnp.float32)
 
     def lazy_update(query_tile_index, head, score, value, tile_visible):
         """Online softmax step with a block-scalar stabilizer.
@@ -1006,7 +1026,7 @@ def _kernel(
             for start in range(0, query_block, query_tile)
         ]
 
-    def attend(query_tile_index, head, score, tile_visible, value):
+    def attend(query_tile_index, head, score, tile_visible, value, unshifted=False):
         """One unit's online-softmax step over this KV tile."""
         m = max_ref[query_tile_index, head, :]
         mass = mass_ref[query_tile_index, head, :]
@@ -1021,7 +1041,7 @@ def _kernel(
         if bound_stab:
             # The row's stabilizer was set before the walk (max_ref): no row
             # max, no rescale.
-            prob = jnp.exp(score - m[:, None])
+            prob = jnp.exp(score if unshifted else score - m[:, None])
             prob_sum = jnp.sum(prob, axis=1)
             if "pv16" in vpu:
                 prob = prob.astype(jnp.bfloat16)
@@ -1056,7 +1076,7 @@ def _kernel(
             acc * alpha[:, None] + weighted
         )
 
-    def compute_tile_vpu(tile, kv_ref, boundary, parity):
+    def compute_tile_vpu(tile, kv_ref, boundary, parity, unshifted):
         """compute_tile with less vector work per score (VLLM_TPU_QSA_PREFILL_VPU).
 
         Each 128-key segment of a KV tile is covered by one selection word, so
@@ -1137,6 +1157,7 @@ def _kernel(
                 carry_score_ref[1 - parity],
                 carry_bits_ref[1 - parity] < 0,
                 carry_value_ref[1 - parity],
+                unshifted,
             )
             for index, (query_tile_index, head) in enumerate(units[:-1]):
                 ahead = units[index + 1]
@@ -1147,6 +1168,7 @@ def _kernel(
                     scores.pop(index),
                     unit_bits(query_tile_index) < 0,
                     key_values[head][1],
+                    unshifted,
                 )
             carry_score_ref[parity] = scores.pop(len(units) - 1)
             carry_bits_ref[parity] = unit_bits(units[-1][0])
@@ -1178,6 +1200,7 @@ def _kernel(
                 score,
                 unit_bits(query_tile_index) < 0,
                 key_values[head][1],
+                unshifted,
             )
 
     if vpu:
@@ -1192,11 +1215,21 @@ def _kernel(
 
             @pl.when(end <= min_length)
             def interior():
-                compute_tile_vpu(tile, kv_ref, False, parity)
+                if not bound_stab:
+                    compute_tile_vpu(tile, kv_ref, False, parity, False)
+                    return
+                # Boundary tiles and the drained carry subtract the (zero)
+                # stabilizer: only the interior tiles get a second body.
+                for unshifted in (False, True):
+                    pl.when((shifted == 0) == unshifted)(
+                        functools.partial(
+                            compute_tile_vpu, tile, kv_ref, False, parity, unshifted
+                        )
+                    )
 
             @pl.when(end > min_length)
             def boundary():
-                compute_tile_vpu(tile, kv_ref, True, parity)
+                compute_tile_vpu(tile, kv_ref, True, parity, False)
 
     def run_tiles(tile_fn):
         # Tile slot i always lands in kv{i % 2}: the VPU path's carry keys its
@@ -2350,7 +2383,13 @@ def block_sparse_gqa_attention(
         else:
             visible = blocks >= 0
         has_key = live_rows & jnp.any(visible, axis=1)[:, None]
-        low = live_rows & jnp.isfinite(lse) & (lse - stab < BOUND_STAB_GUARD)
+        # A row runs with stabilizer stab or 0 (BOUND_STAB_ZERO_LIMIT): the
+        # low guard takes the larger.
+        low = (
+            live_rows
+            & jnp.isfinite(lse)
+            & (lse - jnp.maximum(stab, 0) < BOUND_STAB_GUARD)
+        )
         lost = has_key & jnp.isneginf(lse)
         # A layer whose keys exceed the bound (not one that noted it) can only
         # push probabilities up: e^65 x 448 x 37888 < FP32 max, so rows under

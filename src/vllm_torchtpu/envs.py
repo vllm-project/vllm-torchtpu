@@ -1108,8 +1108,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_LANE_SUM": env_str("VLLM_TPU_QSA_PREFILL_LANE_SUM", ""),
     # qwen4_exp QSA sparse prefill (LANE_SUM or VPU path): per-row stabilizer from
     # the k_norm key-length bound instead of the online row max (no rescale in
-    # the KV loop; online re-run when a row leaves the precise range). "1" on,
-    # "0" off, unset: additional-config qwen4_exp.qsa_prefill_bound_stab
+    # the KV loop; online re-run when a row leaves the precise range; on the
+    # VPU path a query block whose score bounds are all <= 64 runs with a zero
+    # stabilizer). "1" on, "0" off, unset: additional-config
+    # qwen4_exp.qsa_prefill_bound_stab
     # (default off). The env takes precedence.
     "VLLM_TPU_QSA_PREFILL_BOUND_STAB": env_str("VLLM_TPU_QSA_PREFILL_BOUND_STAB", ""),
     # qwen4_exp QSA sparse prefill: fetch each KV tile with one DMA per

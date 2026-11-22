@@ -399,6 +399,33 @@ def test_vpu_path_uses_the_bound(interpret, monkeypatch, vpu):
     )
 
 
+@pytest.mark.parametrize("query_scale,unshifted", [(1.0, True), (1.5, False)])
+def test_vpu_unshifted_and_shifted_blocks(
+    interpret, monkeypatch, query_scale, unshifted
+):
+    """A block whose score bounds are within BOUND_STAB_ZERO_LIMIT walks with
+    a zero stabilizer (no per-score subtraction), a block above it with the
+    bound stabilizer: both match the online softmax within the
+    BF16-probability tolerance."""
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_VPU", "2")
+    case = make_case(np.random.default_rng(14), CASES["two"], 24)
+    case = (case[0] * query_scale,) + case[1:]
+    stab = np.asarray(bsp.bound_stabilizer(case[0], k_scale=K_SCALE, bound=case[-1]))
+    score_bound = stab.max() + bsp.BOUND_STAB_SHIFT
+    assert (score_bound <= bsp.BOUND_STAB_ZERO_LIMIT) == unshifted
+    want = attend(case, 0, 1)
+    bsp.note_key_norm_bound(case[-1])
+    got = attend(case, 0, 1)
+    out_w, lse_w = (np.asarray(x) for x in want)
+    out_g, lse_g = (np.asarray(x) for x in got)
+    assert not np.array_equal(out_w, out_g)  # a different rounding, so it ran
+    np.testing.assert_array_equal(np.isfinite(lse_g), np.isfinite(lse_w))
+    fin = np.isfinite(lse_w)
+    np.testing.assert_allclose(lse_g[fin], lse_w[fin], atol=4e-3)
+    scale = np.maximum(np.abs(out_w).max(-1, keepdims=True), 1e-30)
+    assert float((np.abs(out_g - out_w) / scale).max()) < 8e-3
+
+
 @pytest.mark.parametrize("vpu", ["1", "2"])
 def test_vpu_bound_block_unit_bitwise(interpret, monkeypatch, vpu):
     """With the bound, a 512-token block of 3 query heads runs as one unit
