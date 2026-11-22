@@ -27,8 +27,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 DEFAULT_BLOCK_ROWS = 256
 _NEG_INF = float("-inf")
-_FORCED_LOCAL_SCORE = 1e29
-_FORCED_INIT_SCORE = 1e30
+# Powers of two, far above any block score: exact in `msa_dcp`'s packed keys.
+_FORCED_LOCAL_SCORE = 2.0**96
+_FORCED_INIT_SCORE = 2.0**99
 _VMEM_LIMIT_BYTES = 48 * 1024 * 1024
 
 

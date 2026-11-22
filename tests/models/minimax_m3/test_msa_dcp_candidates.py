@@ -103,6 +103,46 @@ def test_candidates_match_reference(
     np.testing.assert_array_equal(np.asarray(got_s), want_s)
 
 
+def _kept_scores(scores, num_cols):
+    """The scores `msa_dcp`'s packed keys keep: the order-preserving int32
+    code shifted right one bit, its low ceil(log2(num_cols)) bits cleared."""
+    low = (1 << max(1, (num_cols - 1).bit_length())) - 1
+    code = scores.astype(np.float32).view(np.int32)
+    code = np.where(code < 0, code ^ 0x7FFFFFFF, code)
+    code = ((code >> 1) & ~low) << 1
+    return np.where(code < 0, code ^ 0x7FFFFFFF, code).astype(np.int32).view(np.float32)
+
+
+@pytest.mark.parametrize("pretransposed", [False, True])
+@pytest.mark.parametrize("num_tokens,num_cols,rank", [(8, 1024, 0), (300, 520, 1)])
+def test_candidates_order_kept_scores(num_tokens, num_cols, rank, pretransposed):
+    """Real-valued scores with near-ties below the kept precision: the picks
+    are the reference's on the kept scores (ties to the lower block), and
+    return those scores."""
+    rng = np.random.default_rng(num_cols)
+    base = rng.normal(0, 4, (num_tokens, num_cols)).astype(np.float32)
+    # Neighbours that differ only in bits the keys drop.
+    base[:, 1::2] = np.nextafter(base[:, ::2][:, : num_cols // 2], np.inf)
+    pos = np.full((num_tokens,), 2 * 128 * num_cols - 1, np.int32)
+    got_s, got_b = local_candidates(
+        jnp.asarray(base).T if pretransposed else jnp.asarray(base)[:, None, :],
+        jnp.asarray(pos),
+        block_size=BLOCK,
+        topk=TOPK,
+        init_blocks=0,
+        local_blocks=1,
+        rank=rank,
+        dcp=2,
+        interpret=True,
+    )
+    kept = _kept_scores(base, num_cols)
+    want_s, want_b = _reference(kept, pos, rank, 2, 0, 1)
+    if rank % 2:
+        want_s, want_b = want_s[:, ::-1], want_b[:, ::-1]
+    np.testing.assert_array_equal(np.asarray(got_b), want_b)
+    np.testing.assert_array_equal(np.asarray(got_s), want_s)
+
+
 @pytest.mark.parametrize("num_tokens", [256, 384, 300, 129])
 def test_row_blocks_stay_inside_the_scores(num_tokens):
     """Without `live_rows` every row block runs: the scores the kernel reads
