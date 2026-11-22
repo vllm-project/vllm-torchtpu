@@ -17,6 +17,7 @@
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Changes to kernels/gdn/v3 are not picked up automatically.
 # Changes from the source:
+# - GDNConfig.qkv_2d and the act_scratch_ref scratch for 2D bf16 qkv rows.
 # - SHARED_KKT_SHAPES and GDNConfig.shared_kkt, read by
 #   compute_gdn.chunked_gdn_per_seq.
 
@@ -97,6 +98,9 @@ class GDNConfig:
     window_size: int = 1
     # Indicate the use of unified pool.
     is_shared: bool = False
+    # qkv streams as 2D bf16 rows [tokens, dim_size] in 16-row aligned DMA
+    # windows (fused_conv1d_gdn bf16_qkv_mode=2) rather than f32 rows.
+    qkv_2d: bool = False
 
     @property
     def conv_hbm_offset(self) -> int:
@@ -281,7 +285,17 @@ class GDNConfig:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
+        # The f32 rows a 2D bf16 qkv tile unpacks into (wrapper.inner_kernel):
+        # one 16-row aligned chunk per sequence.
+        act_scratch = None
+        if self.qkv_2d:
+            aligned_chunk = pl.cdiv(self.chunk_size, 16) * 16
+            act_scratch = pltpu.VMEM(
+                (self.seq_tile_size, aligned_chunk, 1, self.dim_size), jnp.float32
+            )
+
         return dict(
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
+            act_scratch_ref=act_scratch,
         )

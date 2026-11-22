@@ -17,9 +17,19 @@
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Changes to kernels/gdn/v3 are not picked up automatically.
 # Changes from the source:
-# - Own-line pyrefly ignores where jax's stubs are narrower than the runtime,
-#   and one where pyrefly cannot tell that out_act is set before the final
-#   reshape (main lists the source's errors in its pyrefly baselines).
+# - fused_conv1d_gdn's bf16_qkv_mode (default 2): a bf16 qkv streams as 2D
+#   rows that inner_kernel unpacks to f32; mode 0 casts it first, as the
+#   source does.
+# - inner_kernel takes a PER_SEQ chunked tile's conv state lazily
+#   (_lazy_conv_state): the static tail on a full tile, the rows ending at
+#   its last real token on a partial one.
+# - A lax.cond skips the PER_SEQ call on decode-only steps of the pooled
+#   (unified block pool) path.
+# - The chunk is clipped to the batch before the 2D qkv check reads it;
+#   main clips it only in its static-tiling branch.
+# - Own-line pyrefly ignores where jax's stubs are narrower than the runtime
+#   (main lists the source's errors in .pyrefly-baseline-full.json).
+# - A comment typo.
 # No change targets AttentionMode.KDA, which this copy's callers never pass;
 # see compute_kda.py.
 
@@ -48,7 +58,7 @@ logger = init_logger(__name__)
 
 def inner_kernel(
     # Inputs.
-    qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]
+    qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size] or 2D bf16 rows
     b_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
     a_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
     conv_state_in_slot_ref: jax.Ref,  # [seq, 1, prev_kernel_size, 1, dim_size]
@@ -62,6 +72,7 @@ def inner_kernel(
     weights_ref: memory_ref.WeightRefs,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
+    act_scratch_ref: jax.Ref | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -88,6 +99,8 @@ def inner_kernel(
             convolution carry.
         carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
             recurrent state carry.
+        act_scratch_ref: Optional VMEM scratch reference for the f32 unpack
+            of 2D bf16 qkv rows (cfg.qkv_2d); None otherwise.
         cfg: GDN configuration object.
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
@@ -96,6 +109,34 @@ def inner_kernel(
 
     if p_id is None:
         p_id = pl.program_id(0)
+
+    # 2D bf16 qkv: shift each sequence's rows out of their 16-row aligned DMA
+    # window into the f32 scratch. This runs before load_and_select_states so
+    # the unpack's bf16 load and f32 cast are dead before the selected states
+    # become live. Ordered after it, the unpack temporaries add to the VMEM
+    # peak: 4.0 MiB more for the per_seq b1 c64 kernel at dim 12288 on TPU7x.
+    qkv_work_ref = qkv_slot_ref
+    if qkv_slot_ref.ndim == 3:
+        assert act_scratch_ref is not None
+        aligned_chunk = pl.cdiv(cfg.chunk_size, 16) * 16
+        for idx in range(cfg.seq_tile_size):
+            r_base = metadata_ref.p_id_to_r_base[p_id, idx]
+            r_prefix = jax.lax.rem(r_base, 16)
+            for prefix in range(16):
+
+                @pl.when(r_prefix == prefix)
+                def _unpack(idx=idx, prefix=prefix):
+                    load_rows = pl.cdiv(prefix + aligned_chunk, 16) * 16
+                    dense_qkv = qkv_slot_ref[idx, :load_rows, :]
+                    act_scratch_ref[idx, :aligned_chunk, 0, :] = dense_qkv[
+                        prefix : prefix + aligned_chunk, :
+                    ].astype(jnp.float32)
+
+        qkv_work_ref = (
+            act_scratch_ref
+            if aligned_chunk == cfg.chunk_size
+            else act_scratch_ref.at[:, : cfg.chunk_size]
+        )
 
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
@@ -114,7 +155,10 @@ def inner_kernel(
     # single register which necessitate costly shuffling for every sliding.
     # Therefore, it is extremely important to leverage compact layout that
     # ensures 1 register only stores data from 1 row.
-    qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
+    if qkv_slot_ref.ndim == 3:
+        qkv_in_compact = qkv_work_ref[...]
+    else:
+        qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
     qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
 
     # Prepare conv1d weights.
@@ -123,19 +167,41 @@ def inner_kernel(
     if weights_ref.conv.bias is not None:
         conv_bias = weights_ref.conv.bias[...].astype(jnp.float32)
 
-    qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
-        real_sizes=real_sizes,
-        lhs=qkv_in_compact,
-        conv_weight=conv_weight,
-        conv_bias=conv_bias,
-        cfg=cfg,
+    lazy_state = (
+        cfg.mode == config.GDNMode.PER_SEQ
+        and not cfg.use_recurrent
+        and carry_conv_scratch_ref is not None
+        and cfg.window_size == 1
+        and cfg.seq_tile_size == 1
     )
+    if lazy_state:
+        assert carry_conv_scratch_ref is not None
+        qkv_out_compact = compute_conv1d.causal_conv1d_out(
+            qkv_in_compact, conv_weight, conv_bias, cfg
+        )
+        _lazy_conv_state(
+            lhs=qkv_in_compact[0],
+            real_sizes=real_sizes,
+            conv_state_out_slot_ref=conv_state_out_slot_ref,
+            carry_conv_scratch_ref=carry_conv_scratch_ref,
+            cfg=cfg,
+        )
+    else:
+        qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
+            real_sizes=real_sizes,
+            lhs=qkv_in_compact,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            cfg=cfg,
+        )
 
-    conv_state_out_slot_ref[...] = new_conv_state.astype(conv_state_out_slot_ref.dtype)
-    if carry_conv_scratch_ref is not None:
-        # The next tile resumes from the state after this tile's last token,
-        # which is the final checkpoint.
-        carry_conv_scratch_ref[...] = new_conv_state[:, -1]
+        conv_state_out_slot_ref[...] = new_conv_state.astype(
+            conv_state_out_slot_ref.dtype
+        )
+        if carry_conv_scratch_ref is not None:
+            # The next tile resumes from the state after this tile's last
+            # token, which is the final checkpoint.
+            carry_conv_scratch_ref[...] = new_conv_state[:, -1]
 
     # Apply activation function.
     qkv_out_compact = jax.nn.silu(qkv_out_compact)
@@ -163,7 +229,7 @@ def inner_kernel(
         q_compact, k_compact, v_compact, b_compact, a_compact = (
             vmem_ldst.load_activation_as_compact(
                 qkv_vreg=qkv_out_compact,
-                qkv_vmem_ref=qkv_slot_ref,
+                qkv_vmem_ref=qkv_work_ref,
                 b_vmem_ref=b_slot_ref,
                 a_vmem_ref=a_slot_ref,
                 cfgs=cfg,
@@ -188,7 +254,7 @@ def inner_kernel(
         q_large, k_large, v_large, b_large, a_large = (
             vmem_ldst.load_activation_as_large(
                 qkv_vreg=qkv_out_compact,
-                qkv_vmem_ref=qkv_slot_ref,
+                qkv_vmem_ref=qkv_work_ref,
                 b_vmem_ref=b_slot_ref,
                 a_vmem_ref=a_slot_ref,
                 cfgs=cfg,
@@ -219,6 +285,59 @@ def inner_kernel(
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
 
 
+def _store_conv_state_tile(conv_state_out_slot_ref: jax.Ref, state3: jax.Array) -> None:
+    """Stores one PER_SEQ tile's conv state ([prev_kernel_size, 1, dim]) into
+    window position 0 of slot 0."""
+    conv_state_out_slot_ref[0, 0] = state3.astype(conv_state_out_slot_ref.dtype)
+
+
+def _lazy_conv_state(
+    *,
+    lhs: jax.Array,  # [prev_kernel_size + chunk, 1, dim] f32
+    real_sizes: jax.Array,  # [1]
+    conv_state_out_slot_ref: jax.Ref,
+    carry_conv_scratch_ref: jax.Ref,
+    cfg: config.GDNConfig,
+) -> None:
+    """Conv state of a PER_SEQ chunked tile from its compact rows: the static
+    tail on a full tile, the per-row masked select on a partial tile.
+
+    A partial tile is not always its sequence's last. An internal prefill
+    checkpoint ends a tile at its checkpoint row, and PCP splits tiles at
+    rank-slot boundaries, so a tile can be partial with more of its sequence
+    still to come. The next tile takes its conv lookback from
+    `carry_conv_scratch_ref`, so a partial tile carries the rows that end at
+    its last real token (`lazy_conv_carry_rows`), never the static tail past
+    it. Every tile leaves its final conv state in window position 0, as the
+    eager path does: the output ref also copies that position to a prefill
+    checkpoint block when the tile ends at one.
+    """
+    chunk, kprev = cfg.chunk_size, cfg.prev_kernel_size
+    rs = real_sizes[0]
+    tail = lhs[chunk : chunk + kprev]
+    carry_conv_scratch_ref[0] = tail
+
+    @pl.when(rs == chunk)
+    def _full():
+        _store_conv_state_tile(conv_state_out_slot_ref, tail)
+
+    @pl.when(rs < chunk)
+    def _partial():
+        rows = lazy_conv_carry_rows(lhs, rs, cfg)
+        carry_conv_scratch_ref[0] = rows
+        _store_conv_state_tile(conv_state_out_slot_ref, rows)
+
+
+def lazy_conv_carry_rows(
+    lhs: jax.Array, real_size: jax.Array, cfg: config.GDNConfig
+) -> jax.Array:
+    """Conv rows a lazily converted tile hands to the next tile of its
+    sequence: rows [real_size, real_size + prev_kernel_size) of `lhs`, the
+    inputs ending at the tile's last real token. Equals the static tail on a
+    full tile."""
+    return compute_conv1d.conv_state_rows(lhs, real_size, cfg)
+
+
 def outer_kernel(
     # Inputs.
     metadata_ref: memory_ref.MetadataRef,
@@ -234,6 +353,7 @@ def outer_kernel(
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    act_scratch_ref: jax.Array | None = None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -277,6 +397,7 @@ def outer_kernel(
         weights_ref,
         carry_conv_scratch_ref,
         carry_recurrent_scratch_ref,
+        act_scratch_ref,
     )
     state_allocs = (conv_in_alloc, recurrent_in_alloc)
     out_allocs = (out_alloc, conv_out_alloc, recurrent_out_alloc)
@@ -340,6 +461,7 @@ def outer_kernel(
         "gate_lower_bound",
         "kernel_act_dtype",
         "kernel_conv_weight_dtype",
+        "bf16_qkv_mode",
     ),
 )
 def fused_conv1d_gdn(
@@ -379,6 +501,7 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    bf16_qkv_mode: int = 2,
 ) -> tuple[jax.Array | tuple[jax.Array, jax.Array], jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -455,6 +578,11 @@ def fused_conv1d_gdn(
             Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
             sequences. Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
+        bf16_qkv_mode: How a bf16 qkv reaches the kernel: 0 casts it to
+            `kernel_act_dtype` rows, 2 streams the 2D [T, dim] bf16 rows in
+            16-row aligned DMAs. Mode 2 needs dim a multiple of 2 * num_lanes,
+            at least 16 tokens and a multiple-of-8 mixed chunk, and falls back
+            to 0 otherwise.
 
     Returns:
         new_states: The updated state cache, aliased in place, with the same
@@ -491,7 +619,8 @@ def fused_conv1d_gdn(
             f"state; got conv={conv_dtype} recurrent={recurrent_dtype}."
         )
 
-    qkv = qkv.astype(kernel_act_dtype)
+    if bf16_qkv_mode not in (0, 2):
+        raise ValueError(f"bf16_qkv_mode must be 0 or 2; got {bf16_qkv_mode}.")
     b = b.astype(kernel_act_dtype)
     a = a.astype(kernel_act_dtype)
 
@@ -535,7 +664,7 @@ def fused_conv1d_gdn(
         # the pool block only ever has to hold a single state.
         assert ckpt_indices.shape == (num_seqs, num_spec_tokens + 1)
     else:
-        # Iniitalize the ckpt_indices to default value.
+        # Initialize the ckpt_indices to default value.
         spec_offset = jnp.arange(num_spec_tokens + 1).reshape(1, -1)
         ckpt_indices = state_indices.reshape(-1, 1) + spec_offset
     assert (prefill_ckpt_offsets is None) == (prefill_ckpt_indices is None), (
@@ -548,13 +677,26 @@ def fused_conv1d_gdn(
         prefill_ckpt_offsets = prefill_ckpt_offsets.astype(jnp.int32)
         prefill_ckpt_indices = prefill_ckpt_indices.astype(jnp.int32)
 
-    act_in_dtype = qkv.dtype
-    assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
-
     num_lanes = pltpu.get_tpu_info().num_lanes
-    packing = 4 // act_in_dtype.itemsize
-    padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
+    mixed_tile_size = min(mixed_tile_size, batch_size)
+    if (
+        bf16_qkv_mode == 2
+        and qkv.dtype == jnp.bfloat16
+        and dim % (2 * num_lanes) == 0
+        and batch_size >= 16
+        and mixed_tile_size % 8 == 0
+    ):
+        qkv_2d = True
+    else:
+        bf16_qkv_mode = 0
+        qkv_2d = False
+        qkv = qkv.astype(kernel_act_dtype)
+    act_in_dtype = qkv.dtype
+    assert a.dtype == b.dtype == jnp.dtype(kernel_act_dtype)
+
+    packing = 16 if qkv_2d else (4 // act_in_dtype.itemsize)
+    padded_batch_size = pl.cdiv(batch_size, packing) * packing
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
     window_size = num_spec_tokens + 1
     decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
@@ -577,7 +719,16 @@ def fused_conv1d_gdn(
             decode_vmem_limit_bytes=decode_vmem_limit_bytes,
             mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
             window_size=window_size,
+            qkv_2d=qkv_2d,
         )
+        if qkv_2d and mixed_tile_size % 8:
+            # The bf16 qkv layout runs only on multiple-of-8 chunks, and the
+            # VMEM fit can cap the chunk below the one checked above.
+            # padded_batch_size stays a multiple of 16, which f32 rows accept.
+            bf16_qkv_mode = 0
+            qkv_2d = False
+            qkv = qkv.astype(kernel_act_dtype)
+            act_in_dtype = qkv.dtype
         logger.info_once(
             "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
             num_seqs,
@@ -629,7 +780,8 @@ def fused_conv1d_gdn(
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
-    qkv = qkv.reshape(padded_batch_size, 1, -1)
+    if not qkv_2d:
+        qkv = qkv.reshape(padded_batch_size, 1, -1)
     b = b.reshape(padded_batch_size, 1, -1)
     a = a.reshape(padded_batch_size, 1, -1)
 
@@ -696,6 +848,7 @@ def fused_conv1d_gdn(
                 conv_state=conv_dtype,
             ),
             is_shared=is_shared,
+            qkv_2d=qkv_2d,
         )
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
@@ -791,11 +944,24 @@ def fused_conv1d_gdn(
     if not prefill_only:
         out_act, out_states = call_kernel(states, None, config.GDNMode.BATCHED)
     if not batched_only:
-        out_act, out_states = call_kernel(out_states, out_act, config.GDNMode.PER_SEQ)
+        if out_act is not None and is_shared:
+            # Over the unified block pool, skip the PER_SEQ call when the batch
+            # has no prefill or mixed sequence (decode-only steps). The dense
+            # path calls it on every step, as main does.
+            out_act, out_states = jax.lax.cond(
+                distribution[0] < distribution[2],
+                lambda act_states: call_kernel(
+                    act_states[1], act_states[0], config.GDNMode.PER_SEQ
+                ),
+                lambda act_states: act_states,
+                (out_act, out_states),
+            )
+        else:
+            out_act, out_states = call_kernel(
+                out_states, out_act, config.GDNMode.PER_SEQ
+            )
 
-    # One of the two calls above always runs (batched_only and prefill_only are
-    # exclusive), which pyrefly cannot tell.
-    # pyrefly: ignore[missing-attribute]
+    assert out_act is not None
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.
     if conv_state_shape is not None:
