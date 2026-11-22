@@ -239,7 +239,7 @@ def test_dual_layout_matches_ep(monkeypatch, m, with_shared):
 
 
 # TP-sliced (every expert local) and EP ranks owning experts [e, 2e) of 2e;
-# the 40-row step falls back to routing first (sparse rows); top-8 too.
+# the 40-row step routes in the kernel's sparse-row mode; top-8 too.
 @pytest.mark.parametrize(
     "m,i,use_ep,topk",
     [
@@ -291,8 +291,8 @@ def test_fused_routing_matches_routing_first(monkeypatch, m, i, use_ep, topk):
     )
     got, want = np.asarray(got, np.float32), np.asarray(want, np.float32)
     if m > 32:
-        # Sparse rows route first inside fused_moe_func's jit, where XLA may
-        # fuse the weights' sum differently from route_from_scores alone.
+        # The reference routes first inside fused_moe_func's jit, where XLA
+        # may fuse the weights' sum differently from route_from_scores alone.
         np.testing.assert_allclose(got, want, rtol=0, atol=1e-2 * np.abs(want).max())
     else:
         np.testing.assert_array_equal(got, want)

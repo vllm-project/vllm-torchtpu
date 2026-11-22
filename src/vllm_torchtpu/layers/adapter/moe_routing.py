@@ -344,12 +344,17 @@ def select_experts(
 # Routing results the dense fp4 kernel can produce itself, by dtype name.
 _ROUTE_WEIGHT_DTYPES = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
 _FUSED_DENSE_ROUTING = envs.TPU_MOE_DENSE_FP4_FUSED_ROUTING
-# Sparse-row steps keep routing outside the kernel: in the kernel it delays
-# their counting sort (c16 twin: +6.5 us per layer at 40 tokens).
-_DENSE_FP4_TOKEN_CAP = envs.TPU_MOE_DENSE_FP4_MAX_TOKENS
 # The kernel lays route j's ids out as row j of one [8, 128] vreg tile.
 _ROUTE_MAX_TOPK = 8
 _ROUTE_MAX_TOKENS = 128
+# Steps the dense fp4 kernel routes itself: all-row steps, and sparse-row
+# steps up to _ROUTE_MAX_TOKENS when they route in the kernel too.
+_DENSE_FP4_TOKEN_CAP = max(
+    envs.TPU_MOE_DENSE_FP4_MAX_TOKENS,
+    min(envs.TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS, _ROUTE_MAX_TOKENS)
+    if envs.TPU_MOE_DENSE_FP4_SPARSE_FUSED_ROUTING
+    else 0,
+)
 
 
 def dense_route_spec(layer, hidden_dtype: torch.dtype) -> Route | None:

@@ -1013,9 +1013,8 @@ def fused_moe_func(
 
     With ``route``, ``topk_weights`` and ``topk_ids`` are instead the [tokens,
     E] f32 sigmoid routing scores and the scores plus correction bias: the
-    dense fp4 kernel's all-row steps route in the same call, every other
-    path (sparse rows included) routes first
-    (`route_from_scores`).
+    dense fp4 kernel's steps (all rows or sparse rows) route in the same
+    call, every other path routes first (`route_from_scores`).
 
     ``tp_experts`` is the dual layout of EP weights: this rank's TP slice of
     every routed expert. Steps of up to TPU_MOE_DUAL_LAYOUT_MAX_TOKENS tokens
@@ -1086,7 +1085,7 @@ def fused_moe_func(
             sparse_rows=sparse_rows,
         )
     )
-    if route is not None and (sparse_rows or not dense_fp4):
+    if route is not None and not dense_fp4:
         topk_weights, topk_ids = route_from_scores(topk_weights, topk_ids, route)
         route = None
     if shared is not None and activation != "swigluoai":

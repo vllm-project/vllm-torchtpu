@@ -370,7 +370,7 @@ def _kernel(
         group_vmem, sorted_ref, group_sem, rows_ref = extra_scratch[
             len(shared_scratch) : len(shared_scratch) + 4
         ]
-    if route is not None:
+    if route is not None and not sparse:
         # VMEM [8, 128] int32 and its SMEM copy: route j's local ids, row j.
         ids_vmem, ids_route_smem, route_sem = extra_scratch[-3:]
     fp8 = jnp.float8_e4m3fn
@@ -425,15 +425,18 @@ def _kernel(
             rows_real,
             route,
         )
-        tokens = lax.broadcasted_iota(jnp.int32, (m, ids_vmem.shape[1]), 0)
-        lanes = lax.broadcasted_iota(jnp.int32, (m, ids_vmem.shape[1]), 1)
-        for j, col in enumerate(id_cols):
-            ids_vmem[j : j + 1, :] = jnp.sum(
-                jnp.where(tokens == lanes, col, 0), axis=0, keepdims=True
+        if not sparse:  # sparse rows group the id columns themselves
+            tokens = lax.broadcasted_iota(jnp.int32, (m, ids_vmem.shape[1]), 0)
+            lanes = lax.broadcasted_iota(jnp.int32, (m, ids_vmem.shape[1]), 1)
+            for j, col in enumerate(id_cols):
+                ids_vmem[j : j + 1, :] = jnp.sum(
+                    jnp.where(tokens == lanes, col, 0), axis=0, keepdims=True
+                )
+            route_copy = pltpu.make_async_copy(
+                ids_vmem, ids_route_smem, route_sem.at[0]
             )
-        route_copy = pltpu.make_async_copy(ids_vmem, ids_route_smem, route_sem.at[0])
-        route_copy.start()
-        route_copy.wait()
+            route_copy.start()
+            route_copy.wait()
 
         def route_id(r):
             return ids_route_smem[r % topk, r // topk]
@@ -872,7 +875,7 @@ def dense_expert_moe_fp4(
             pltpu.VMEM((_ROW_ALIGN, h), jnp.float32),
         ]
     route_scratch = []
-    if route is not None:
+    if route is not None and not sparse_rows:
         route_scratch = [
             pltpu.VMEM((8, lanes), jnp.int32),
             pltpu.SMEM((8, lanes), jnp.int32),

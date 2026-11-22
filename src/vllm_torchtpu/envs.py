@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS: int = 0
     TPU_MOE_DENSE_FP4_SHARED: bool = False
     TPU_MOE_DENSE_FP4_FUSED_ROUTING: bool = True
+    TPU_MOE_DENSE_FP4_SPARSE_FUSED_ROUTING: bool = True
     TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS: int = 0
     TPU_MOE_DUAL_LAYOUT_MAX_TOKENS: int = 0
     TPU_GMM_FP8_W8A8: bool = False
@@ -884,6 +885,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of in a top-k kernel and XLA glue ahead of it.
     "TPU_MOE_DENSE_FP4_FUSED_ROUTING": env_bool(
         "TPU_MOE_DENSE_FP4_FUSED_ROUTING", default=True
+    ),
+    # Sparse-row steps of the dense fp4 kernel route in the kernel as well
+    # (with TPU_MOE_DENSE_FP4_FUSED_ROUTING): their row grouping reads the
+    # routed id columns from VMEM, so routing outside only adds XLA ops.
+    "TPU_MOE_DENSE_FP4_SPARSE_FUSED_ROUTING": env_bool(
+        "TPU_MOE_DENSE_FP4_SPARSE_FUSED_ROUTING", default=True
     ),
     # Steps of at least this many tokens whose MoE reduction the model owns
     # (MiniMax-M3 SP steps) leave a shared expert armed by
