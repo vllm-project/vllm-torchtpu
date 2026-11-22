@@ -17,13 +17,12 @@ from __future__ import annotations
 
 from collections.abc import Hashable, Iterable
 from typing import cast
-from unittest.mock import patch
 
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
+from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -39,7 +38,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models import vision as vision_utils
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
@@ -529,15 +527,6 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return loaded_experts | ordinary_loaded
 
 
-def _tpu_tp_all_gather(input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """Gather a materialized encoder output without leaving the TPU."""
-    materialized = fresh_buffer(input_)
-    synchronize_tensors(materialized)
-    gathered = tensor_model_parallel_all_gather(materialized, dim=dim)
-    synchronize_tensors(gathered)
-    return gathered
-
-
 @MULTIMODAL_REGISTRY.register_processor(
     KimiK3MultiModalProcessor,
     info=KimiK3ProcessingInfo,
@@ -673,27 +662,12 @@ class KimiK3ForConditionalGeneration(
         media_input = self._parse_and_validate_media_input(**kwargs)
         if media_input is None:
             return None
-        if self.use_data_parallel:
-            # Keep upstream's DP sharding/reassembly, but isolate its TPU
-            # collective from the rank-local lazy encoder graphs.
-            with patch.object(
-                vision_utils,
-                "tensor_model_parallel_all_gather",
-                _tpu_tp_all_gather,
-            ):
-                return vision_tower_forward(
-                    self.vision_tower,
-                    media_input["pixel_values"],
-                    media_input["grid_thws"],
-                    mm_projector=self.mm_projector,
-                    use_data_parallel=True,
-                )
         return vision_tower_forward(
             self.vision_tower,
             media_input["pixel_values"],
             media_input["grid_thws"],
             mm_projector=self.mm_projector,
-            use_data_parallel=False,
+            use_data_parallel=self.use_data_parallel,
         )
 
     # -- SupportsEncoderCudaGraph protocol methods --
