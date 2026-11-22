@@ -35,6 +35,9 @@ _PRECISION = {
     "highest": jax.lax.Precision.HIGHEST,
 }
 
+# Row alignment of the slice starts (see qproj_fill_jax).
+_ALIGN = 16
+
 # (rows, slices, group base, precision) already logged by this process.
 _LOGGED: set = set()
 
@@ -97,10 +100,15 @@ def qproj_fill_jax(
     precision: str,
 ) -> jax.Array:
     """``hidden @ weight.T`` as ``slices`` row slices, slice g in scheduling
-    group ``group_base + g``; the slices are concatenated in row order."""
+    group ``group_base + g``; the slices are concatenated in row order.
+
+    Slice starts are rounded down to 16 rows (one bf16 (8, 128)(2, 1) tile of
+    the [rows, N] result), so XLA assembles the slices in place (each dot fused
+    with a dynamic-update-slice into the result) instead of a concatenate copy;
+    6,400 rows / 8 slices are 800-row slices either way."""
     rows = hidden.shape[0]
     prec = _PRECISION[precision]
-    bounds = [rows * g // slices for g in range(slices + 1)]
+    bounds = [(rows * g // slices) // _ALIGN * _ALIGN for g in range(slices)] + [rows]
     parts = []
     for g in range(slices):
         part = jax.lax.dot_general(
