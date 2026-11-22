@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES: bool = True
     TPU_DCP_TP_SHARDED_KV_WRITE: bool = True
     TPU_DCP_TP_SHARDED_INDEXER_K: bool = False
+    TPU_DCP_TP_UNIFIED_IN_BRANCH_LEAD_INDEXER: bool = True
     TPU_DCP_TP_UNIFIED_INDEXER_IN_BRANCH_QB: bool = True
     TPU_DCP_TP_UNIFIED_INDEXER_MLA: bool = True
     TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP: int = 0
@@ -944,6 +945,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # token-parallel cap switch so pure-TC q_b overlaps gather_latent/Chunk-0.
     "TPU_DCP_TP_IN_BRANCH_QB_MLA": env_bool(
         "TPU_DCP_TP_IN_BRANCH_QB_MLA", default=True
+    ),
+    # With TPU_DCP_TP_UNIFIED_INDEXER_IN_BRANCH_QB and histogram-merge DCP
+    # lead top-k: defer the leading split_rows indexer pass inside the unified
+    # cap-switch branch so its SparseCore top-k overlaps the index-K all-gather
+    # and StreamIdxTC tail chunks.
+    "TPU_DCP_TP_UNIFIED_IN_BRANCH_LEAD_INDEXER": env_bool(
+        "TPU_DCP_TP_UNIFIED_IN_BRANCH_LEAD_INDEXER", default=True
     ),
     # With TPU_DCP_TP_UNIFIED_INDEXER_MLA and query replication on indexer
     # layers: defer fused q_b_proj + RoPE + absorb_q and lead MLA inside the

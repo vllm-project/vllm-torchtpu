@@ -40,6 +40,7 @@ from vllm_torchtpu.distributed.dcp import (
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     KVLayout,
+    streamindex_topk,
     streamindex_topk_dcp,
 )
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
@@ -126,6 +127,7 @@ def build_unified_indexer_in_branch_qb_op(
     mla_chunk_tokens = envs.TPU_SPARSE_MLA_CHUNK_TOKENS
     tie_after_idx_max_cap = envs.TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP
     epilogue_3d = envs.TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT
+    in_branch_lead = envs.TPU_DCP_TP_UNIFIED_IN_BRANCH_LEAD_INDEXER
 
     topk = int(indexer_op.topk_tokens)
     idx_chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
@@ -332,35 +334,97 @@ def build_unified_indexer_in_branch_qb_op(
             dcp_token_parallel_op.lead_streamidx_block_sizes(s, bkvp_dcp, bq_dcp)
         )
         large = callbacks.dcp_indexer_a2a_for_bucket(s, True, a2a_min_tokens)
-        head_topk = streamindex_topk_dcp(
-            q_idx_dcp,
-            w_idx_dcp,
-            index_cache,
-            seq_s,
-            idx_block_tables,
-            qsl_s,
-            idx_dist_s,
-            mesh=mesh,
-            k=topk,
-            compression_ratio=1,
-            dcp_size=dcp,
-            interleave_size=il,
-            num_kv_pages_per_block=bkvp_dcp,
-            num_queries_per_block=bq_dcp,
-            kv_layout=kv_layout,
-            skip_empty_decode=skip_empty_decode,
-            skip_empty_decode_chunked=skip_empty_decode_chunked,
-            chunk_tokens=idx_chunk_tokens,
-            a2a_merge=large and a2a_merge and not hist_merge,
-            hist_merge=large and hist_merge,
-            global_scheduling_group_id=global_group,
-            dcp_rank_ids=rank_ids,
-            dcp_lane_ids=lane_ids,
-            small_all_gather=small_ag,
-            decode_pack=decode_pack,
-            shared_meta=shared_meta,
-            decode_as_mixed=lead_decode_as_mixed,
-        )
+        defer_lead_indexer = bool(in_branch_lead and large and hist_merge and dcp >= 2)
+        if defer_lead_indexer:
+            head_topk = None
+            rank_ids_unified = (
+                jax.shard_map(
+                    lambda rk, ln: rk + jnp.int32(0) * ln,
+                    mesh=mesh,
+                    in_specs=(shd, shd),
+                    out_specs=shd,
+                    check_vma=False,
+                )(rank_ids, lane_ids)
+                if rank_ids is not None and lane_ids is not None
+                else rank_ids
+            )
+
+            def _select_lead_topk(
+                ql_r: jax.Array,
+                wl_r: jax.Array,
+                cache_r: jax.Array,
+                sl_r: jax.Array,
+                bt_r: jax.Array,
+                qsl_r: jax.Array,
+                dist_r: jax.Array,
+                cp_rank_r: jax.Array,
+            ) -> jax.Array:
+                local_bt = jnp.mod(bt_r, jnp.int32(cache_r.shape[0]))
+                out_tk = streamindex_topk(
+                    ql_r,
+                    wl_r,
+                    cache_r,
+                    sl_r,
+                    local_bt,
+                    qsl_r,
+                    dist_r,
+                    k=topk,
+                    compression_ratio=1,
+                    num_kv_pages_per_block=bkvp_dcp,
+                    num_queries_per_block=bq_dcp,
+                    enable_early_exit=False,
+                    kv_layout=kv_layout,
+                    chunk_tokens=idx_chunk_tokens,
+                    cp_size=dcp,
+                    cp_rank=cp_rank_r,
+                    interleave_size=il,
+                    return_scores=False,
+                    skip_empty_decode=skip_empty_decode,
+                    skip_empty_decode_chunked=skip_empty_decode_chunked,
+                    decode_pack=decode_pack,
+                    shared_meta=shared_meta,
+                    dcp_axis_name=DCP_AXIS_NAME,
+                    decode_as_mixed=lead_decode_as_mixed,
+                )
+                assert isinstance(out_tk, jax.Array)
+                return out_tk
+
+            lead_kw: dict[str, Any] = {
+                "select_lead_topk": _select_lead_topk,
+                "lead_topk_inputs": (q_idx_dcp, w_idx_dcp, seq_s, qsl_s, idx_dist_s),
+            }
+        else:
+            rank_ids_unified = rank_ids
+            lead_kw = {}
+            head_topk = streamindex_topk_dcp(
+                q_idx_dcp,
+                w_idx_dcp,
+                index_cache,
+                seq_s,
+                idx_block_tables,
+                qsl_s,
+                idx_dist_s,
+                mesh=mesh,
+                k=topk,
+                compression_ratio=1,
+                dcp_size=dcp,
+                interleave_size=il,
+                num_kv_pages_per_block=bkvp_dcp,
+                num_queries_per_block=bq_dcp,
+                kv_layout=kv_layout,
+                skip_empty_decode=skip_empty_decode,
+                skip_empty_decode_chunked=skip_empty_decode_chunked,
+                chunk_tokens=idx_chunk_tokens,
+                a2a_merge=large and a2a_merge and not hist_merge,
+                hist_merge=large and hist_merge,
+                global_scheduling_group_id=global_group,
+                dcp_rank_ids=rank_ids,
+                dcp_lane_ids=lane_ids,
+                small_all_gather=small_ag,
+                decode_pack=decode_pack,
+                shared_meta=shared_meta,
+                decode_as_mixed=lead_decode_as_mixed,
+            )
 
         cache_layout = nope_spec.layout.value
         lkv_dim = kv_c_normed.shape[-1]
@@ -369,7 +433,7 @@ def build_unified_indexer_in_branch_qb_op(
         if not (
             topk_cap
             and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
-            and head_topk.shape[-1] > topk_cap
+            and topk > topk_cap
         ):
             topk_cap = None
         lead_chunk_kwargs: dict[str, Any] = (
@@ -527,21 +591,26 @@ def build_unified_indexer_in_branch_qb_op(
             w_o=w_o,
             w_o_scale=s_o,
             num_tokens=num_tokens,
-            rank_ids=rank_ids,
+            rank_ids=rank_ids_unified,
             read_pages=read_pages,
             w_uv_replicated=True,
             tie_after_idx_max_cap=tie_after_idx_max_cap,
             tie_lead_min_cap=0,
             epilogue_3d=epilogue_3d,
             index_k_packed_u32=True,
+            **lead_kw,
         )
-        full_topk = jax.shard_map(
-            lambda h, t: jnp.concatenate([h, t], axis=0),
-            mesh=mesh,
-            in_specs=(shd, shd),
-            out_specs=shd,
-            check_vma=False,
-        )(head_topk, tail_flat)
+        if defer_lead_indexer:
+            full_topk = tail_flat
+        else:
+            assert head_topk is not None
+            full_topk = jax.shard_map(
+                lambda h, t: jnp.concatenate([h, t], axis=0),
+                mesh=mesh,
+                in_specs=(shd, shd),
+                out_specs=shd,
+                check_vma=False,
+            )(head_topk, tail_flat)
         return index_cache, kv_cache_nope, kv_cache_rope, full_topk, attn_out
 
     split_w_uk = (
@@ -905,6 +974,7 @@ def build_unified_indexer_in_branch_qb_op(
         small_ag,
         has_lane,
         split_w_uk,
+        bool(in_branch_lead),
     )
 
     def _build_plain(op_name: str):

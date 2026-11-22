@@ -2726,7 +2726,7 @@ def _unified_indexer_in_branch_qb_core(
     s_qb: jax.Array,
     w_uk_t: jax.Array | tuple[jax.Array, jax.Array],
     cos_sin: jax.Array,
-    head_topk: jax.Array,
+    head_topk: jax.Array | None,
     mla_block_tables: jax.Array,
     seq_lens: jax.Array,
     query_start_loc: jax.Array,
@@ -2747,9 +2747,34 @@ def _unified_indexer_in_branch_qb_core(
     w_o_scale: jax.Array | None = None,
     epilogue_3d: bool = True,
     index_k_packed_u32: bool = False,
+    select_lead_topk: Callable[
+        [
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+        ],
+        jax.Array,
+    ]
+    | None = None,
+    lead_topk_inputs: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
+    | None = None,
 ) -> tuple[jax.Array, ...]:
     if (w_o is None) != (w_o_scale is None):
         raise ValueError("w_o and w_o_scale must be passed together")
+    if (select_lead_topk is None) != (lead_topk_inputs is None):
+        raise ValueError(
+            "select_lead_topk and lead_topk_inputs must be passed together"
+        )
+    has_lead_select = select_lead_topk is not None
+    if has_lead_select and head_topk is not None:
+        raise ValueError("pass either head_topk or select_lead_topk, not both")
+    if not has_lead_select and head_topk is None:
+        raise ValueError("head_topk is required when select_lead_topk is None")
     has_oproj = w_o is not None
     dcp = layout.dcp_size
     s = layout.split_rows
@@ -2768,7 +2793,6 @@ def _unified_indexer_in_branch_qb_core(
         sqb_r,
         wuk_r,
         cs_r,
-        h_topk_r,
         mla_bt,
         sl,
         qsl,
@@ -2777,6 +2801,16 @@ def _unified_indexer_in_branch_qb_core(
         *extra_args,
     ):
         idx = 0
+        h_topk_in = None
+        lead_q_r = lead_w_r = lead_sl_r = lead_qsl_r = lead_dist_r = None
+        if has_lead_select:
+            lead_q_r, lead_w_r, lead_sl_r, lead_qsl_r, lead_dist_r = extra_args[
+                idx : idx + 5
+            ]
+            idx += 5
+        else:
+            h_topk_in = extra_args[idx]
+            idx += 1
         n_rank = 1 if rank_ids is not None else 0
         rank_arg = extra_args[idx : idx + n_rank]
         idx += n_rank
@@ -2825,8 +2859,33 @@ def _unified_indexer_in_branch_qb_core(
             layout, num_tokens, rank, q_idx_r, w_idx_r, rr
         )
 
-        def branch(cap: int) -> Callable[[], tuple[jax.Array, jax.Array, jax.Array]]:
-            def run() -> tuple[jax.Array, jax.Array, jax.Array]:
+        def branch(cap: int) -> Callable[[], tuple[jax.Array, ...]]:
+            def run() -> tuple[jax.Array, ...]:
+                if has_lead_select:
+                    assert select_lead_topk is not None
+                    assert (
+                        lead_q_r is not None
+                        and lead_w_r is not None
+                        and lead_sl_r is not None
+                        and lead_qsl_r is not None
+                        and lead_dist_r is not None
+                    )
+                    # Avoid stalling TensorCore on the leading split_rows
+                    # SparseCore top-k before the switch: launch it at branch
+                    # entry so it overlaps the index-K gather and tail pass.
+                    h_topk_r = select_lead_topk(
+                        lead_q_r,
+                        lead_w_r,
+                        idx_cache,
+                        lead_sl_r,
+                        idx_bt,
+                        lead_qsl_r,
+                        lead_dist_r,
+                        rank.reshape(()),
+                    )
+                else:
+                    assert h_topk_in is not None
+                    h_topk_r = h_topk_in
                 nat = _gather_index_k_pages(
                     idx_cache,
                     idx_page_ids,
@@ -2888,6 +2947,8 @@ def _unified_indexer_in_branch_qb_core(
                     out = attend_hm(
                         ql_tail, g_nope, g_rope, flat, rr.num_rows, qpe_tail
                     )
+                    if has_lead_select:
+                        return out, lead_v, flat, h_topk_r
                     return out, lead_v, flat
                 if use_3d_epilogue:
                     lead_v = _merge_lead_partial_to_v_hrv(
@@ -2903,11 +2964,19 @@ def _unified_indexer_in_branch_qb_core(
                     if use_3d_epilogue
                     else _project_w_uv(out, w_uv_all)
                 )
+                if has_lead_select:
+                    return out, lead_v, flat, h_topk_r
                 return out, lead_v, flat
 
             return run
 
-        out, lead_v, flat = _switch_on_cap(layout, jnp.sum(pages), branch)
+        switched = _switch_on_cap(layout, jnp.sum(pages), branch)
+        if has_lead_select:
+            out, lead_v, flat, h_topk_out = switched
+            topk_out = jnp.concatenate([h_topk_out, flat], axis=0)
+        else:
+            out, lead_v, flat = switched
+            topk_out = flat
         if has_oproj:
             assert w_o_local is not None and s_o_local is not None
             w_o_arr, s_o_arr = w_o_local, s_o_local
@@ -2939,13 +3008,26 @@ def _unified_indexer_in_branch_qb_core(
                 projected = _shift_and_project_local(
                     layout, out, lead_v, rank, w_o_arr, s_o_arr, axis_name
                 )
-            return projected, flat
-        return out, lead_v, flat
+            return projected, topk_out
+        return out, lead_v, topk_out
 
-    extra: tuple[jax.Array, ...] = () if rank_ids is None else (rank_ids,)
+    extra: list[jax.Array] = []
+    extra_specs: list[P] = []
+    if has_lead_select:
+        assert lead_topk_inputs is not None
+        extra.extend(lead_topk_inputs)
+        extra_specs.extend([rep] * 5)
+    else:
+        assert head_topk is not None
+        extra.append(head_topk)
+        extra_specs.append(sharded)
+    if rank_ids is not None:
+        extra.append(rank_ids)
+        extra_specs.append(sharded)
     if has_oproj:
         assert w_o is not None and w_o_scale is not None
-        extra = (*extra, w_o, w_o_scale)
+        extra.extend((w_o, w_o_scale))
+        extra_specs.extend((sharded, sharded))
     w_uv_spec = rep if w_uv_replicated else sharded
     w_uk_spec = (rep, rep) if isinstance(w_uk_t, tuple) else rep
     out_specs = (sharded, sharded) if has_oproj else (sharded, rep, sharded)
@@ -2964,14 +3046,13 @@ def _unified_indexer_in_branch_qb_core(
             rep,
             w_uk_spec,
             sharded,
-            sharded,
             rep,
             rep,
             rep,
             rep,
             w_uv_spec,
-        )
-        + (sharded,) * len(extra),
+            *extra_specs,
+        ),
         out_specs=out_specs,
         check_vma=False,
     )(
@@ -2986,7 +3067,6 @@ def _unified_indexer_in_branch_qb_core(
         s_qb,
         w_uk_t,
         cos_sin,
-        head_topk,
         mla_block_tables,
         seq_lens,
         query_start_loc,
@@ -3011,7 +3091,7 @@ def unified_indexer_in_branch_qb_mla(
     s_qb: jax.Array,
     w_uk_t: jax.Array | tuple[jax.Array, jax.Array],
     cos_sin: jax.Array,
-    head_topk: jax.Array,
+    head_topk: jax.Array | None,
     mla_block_tables: jax.Array,
     seq_lens: jax.Array,
     query_start_loc: jax.Array,
@@ -3029,10 +3109,27 @@ def unified_indexer_in_branch_qb_mla(
     tie_after_idx_max_cap: int = 0,
     tie_lead_min_cap: int = 0,
     index_k_packed_u32: bool = False,
+    select_lead_topk: Callable[
+        [
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+        ],
+        jax.Array,
+    ]
+    | None = None,
+    lead_topk_inputs: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
+    | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Run indexer top-k, in-branch `q_b`, lead MLA, and tail MLA in one cap switch.
 
-    Returns `(own_v [dcp*R, H, V], lead_v [S, H, V], tail_flat_topk [dcp*R, K])`.
+    Returns `(own_v [dcp*R, H, V], lead_v [S, H, V], tail_flat_topk [dcp*R, K])`,
+    or `[dcp*(S+R), K]` concatenated top-k when `select_lead_topk` is supplied.
     """
     own_v, lead_v, flat = _unified_indexer_in_branch_qb_core(
         layout,
@@ -3066,6 +3163,8 @@ def unified_indexer_in_branch_qb_mla(
         tie_after_idx_max_cap=tie_after_idx_max_cap,
         tie_lead_min_cap=tie_lead_min_cap,
         index_k_packed_u32=index_k_packed_u32,
+        select_lead_topk=select_lead_topk,
+        lead_topk_inputs=lead_topk_inputs,
     )
     return own_v, lead_v, flat
 
@@ -3085,7 +3184,7 @@ def unified_indexer_in_branch_qb_mla_oproj(
     s_qb: jax.Array,
     w_uk_t: jax.Array | tuple[jax.Array, jax.Array],
     cos_sin: jax.Array,
-    head_topk: jax.Array,
+    head_topk: jax.Array | None,
     mla_block_tables: jax.Array,
     seq_lens: jax.Array,
     query_start_loc: jax.Array,
@@ -3106,6 +3205,22 @@ def unified_indexer_in_branch_qb_mla_oproj(
     tie_lead_min_cap: int = 0,
     epilogue_3d: bool = True,
     index_k_packed_u32: bool = False,
+    select_lead_topk: Callable[
+        [
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+        ],
+        jax.Array,
+    ]
+    | None = None,
+    lead_topk_inputs: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
+    | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Run indexer top-k, in-branch `q_b`, MLA, and `o_proj` in one `shard_map`."""
     attn_out, flat = _unified_indexer_in_branch_qb_core(
@@ -3143,5 +3258,7 @@ def unified_indexer_in_branch_qb_mla_oproj(
         w_o_scale=w_o_scale,
         epilogue_3d=epilogue_3d,
         index_k_packed_u32=index_k_packed_u32,
+        select_lead_topk=select_lead_topk,
+        lead_topk_inputs=lead_topk_inputs,
     )
     return attn_out, flat
