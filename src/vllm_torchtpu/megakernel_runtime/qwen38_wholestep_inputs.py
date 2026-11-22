@@ -213,3 +213,45 @@ def qsa_step_inputs(
         "qsa_ring": ring,
         "qsa_rope_ck": trig32(jnp.maximum(j0, 0))[:, None, :],
     }
+
+
+def selection_groups(
+    ids: Any, context: Any, starts: Any, *, T: int, K: int
+) -> tuple[Any, Any]:
+    """`(groups [M, K] int32, lens [M])`: each verify row's full selection of one QSA layer
+    from the whole-step kernel's exported pool-path ids (`QSAFullIndexedBlock.export_ids`),
+    in the stock selection's terms (`qsa_rpa.selected_tokens` blocks, -1 = none).
+
+    `ids [M, 1, K]` (or `[M, K]`): per row the selected groups below `g_a = context // 4`,
+    ascending, slots past the count 0. A row that sees at most K complete groups selects
+    every one of them (the stock indexer's rule), whatever its ids. A row that sees more
+    selects exactly K; the kernel moves `g_a` (the group holding the step's first tokens)
+    out of the pool path when selected, so its count is then K - 1 and slot K - 1 holds
+    0 (with K >= 2 the K-th ascending id of K is never 0): `g_a` goes there. `lens` are
+    the rows' lengths (`qsa_step_inputs`: context + t + 1, 0 for idle requests)."""
+    M = ids.shape[0]
+    raw = ids.reshape(M, K).astype(jnp.int32)
+    nreq = M // T
+    ctx = _fit(context.astype(jnp.int32), nreq)
+    q_len = _fit((starts[1:] - starts[:-1]).astype(jnp.int32), nreq)
+    t = jnp.arange(T, dtype=jnp.int32)
+    lens = jnp.where((q_len > 0)[:, None], ctx[:, None] + t[None] + 1, 0).reshape(M)
+    nv = lens // GROUP
+    ga = jnp.repeat(ctx // GROUP, T)
+    j = jnp.arange(K, dtype=jnp.int32)[None]
+    visible = jnp.where(j < nv[:, None], j, -1)
+    sga = raw[:, K - 1 :] == 0
+    over = jnp.where(j < K - sga.astype(jnp.int32), raw, jnp.where(sga, ga[:, None], -1))
+    return jnp.where((nv > K)[:, None], over, visible), lens
+
+
+def export_selection(
+    ids: Any, context: Any, starts: Any, *, T: int, K: int, rows: int
+) -> Any:
+    """The draft's shared-selection sink rows `[rows, 4 K + 3]` int32 (stock
+    `pooled_qsa`'s `selected`: `selected_tokens` of the groups, plus each row's partial
+    group's tokens) of the kernel's exported ids (`selection_groups`)."""
+    from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import selected_tokens
+
+    groups, lens = selection_groups(ids, context, starts, T=T, K=K)
+    return selected_tokens(groups[:rows], lens[:rows], GROUP * K, GROUP)

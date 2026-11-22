@@ -87,9 +87,13 @@ class _WholeKind:
         tag: str,
         tail: bool = False,
         L: int = L_WHOLE,
+        export_width: int = 0,
     ) -> None:
         self.mesh, self.g, self.layout, self.qsa = mesh, g, layout, qsa
         self.tail, self.L = tail, L
+        # > 0 (VLLM_TPU_MK_WHOLE_EXPORT_SELECTION): the call's last output is this rank's
+        # `[rows, export_width]` shared selection of layer 47.
+        self.export_width = export_width
         self.kw = dict(
             budget=budget,
             max_groups=max_groups,
@@ -97,6 +101,7 @@ class _WholeKind:
             rotary_dim=rotary_dim,
             write=write,
             stacked_meta=stacked_mamba_operands(),
+            export=export_width > 0,
         )
         self._calls: dict[int, Any] = {}
         self.tag = tag
@@ -115,6 +120,8 @@ class _WholeKind:
                 # copy, [11, 16, 1, 128] -> [88, 16, 1, 128]); bucket-independent.
                 shape = (len(qsa) - int(tail), UNION_STATS_REQS, 1, 128)
                 out.append(hidden.new_empty(shape, dtype=torch.int32))
+            if export_width:  # one row per token, like the stock layer's `selected`
+                out.append(hidden.new_empty((hidden.shape[0], export_width), dtype=torch.int32))
             return out
 
         self.op = op
@@ -296,6 +303,8 @@ class Qwen38WholeStep(nn.Module):
             if union_stats_on()
             else None
         )
+        # Not a submodule: the model owns layer 47 (a plain attribute, like `layers`).
+        object.__setattr__(self, "export_attn", self._export_target())
         self.kind = _WholeKind(
             self.mesh,
             self.g,
@@ -309,8 +318,29 @@ class Qwen38WholeStep(nn.Module):
             tag=self.tag,
             tail=self.tail and not self.fused,
             L=self.L,
+            export_width=(
+                0 if self.export_attn is None else int(self.export_attn._selection_sink.shape[1])
+            ),
         )
         self.kind.pool_index = self.n_w
+
+    def _export_target(self) -> Any:
+        """VLLM_TPU_MK_WHOLE_EXPORT_SELECTION: layer 47's attention, whose shared-selection
+        sink (`Qwen4ExpMTP.bind_shared_selection`) this call writes, when the call runs
+        layer 47 (L47 / L45), writes the caches (not the `wholecheck` shadow) and a draft
+        is bound; else None (no export)."""
+        if not (envs.VLLM_TPU_MK_WHOLE_EXPORT_SELECTION and self.tail and self.write):
+            return None
+        attn = self.layers[LAST_LAYER].self_attn
+        sink = getattr(attn, "_selection_sink", None)
+        if sink is None:
+            logger.warning(
+                "Qwen3.8 whole-step: VLLM_TPU_MK_WHOLE_EXPORT_SELECTION without a bound "
+                "shared-selection sink (VLLM_TPU_QSA_DRAFT_SHARED_SELECTION); no export"
+            )
+            return None
+        assert sink.shape[1] == 4 * self.budget + 3, (tuple(sink.shape), self.budget)
+        return attn
 
     def forward(
         self,
@@ -377,6 +407,10 @@ class Qwen38WholeStep(nn.Module):
             # program (w06g j-b1a76c09: ShapeSpecializationError at bucket 32); only
             # copy.
             self.union_stats.copy_(outs[2])
+        if self.export_attn is not None:
+            # This step's layer-47 selection, for draft step 0 (stock: the sink gather;
+            # MK: `Qwen4ExpMTP.carry_shared_selection`) and the loop steps after it.
+            self.export_attn.write_selection_sink(outs[-1])
         return res
 
     def log_union_stats(self, calls: int) -> None:
@@ -409,3 +443,42 @@ class Qwen38WholeStep(nn.Module):
             float(torch.quantile(u / m, 0.5)),
             float(u.mean()),
         )
+
+    def check_export_selection(
+        self, runner: Any, call: int, whole_calls: int, n_req: int, rows: int
+    ) -> None:
+        """VLLM_TPU_MK_EXPORT_SELECTION_CHECK=N (debug; called by the driver after a
+        whole-step forward, outside the compiled programs). Every N-th whole call snapshots
+        the shared-selection sink; if the next forward is a whole step too, logs whether
+        the sink changed (stale without VLLM_TPU_MK_WHOLE_EXPORT_SELECTION: never) and how
+        many of the draft's carried rows (step 0 of the snapshot's step) are one of their
+        request's snapshot rows. One host read per check."""
+        every = int(envs.VLLM_TPU_MK_EXPORT_SELECTION_CHECK)
+        sink = getattr(self.layers[LAST_LAYER].self_attn, "_selection_sink", None)
+        if every <= 0 or sink is None:
+            return
+        prev = getattr(self, "_sel_check", None)
+        self._sel_check = None
+        if prev is not None and prev[0] == call - 1:
+            _, snap, n_prev = prev
+            changed = not torch.equal(sink[: snap.shape[0]].to("cpu"), snap)
+            draft = getattr(getattr(runner, "drafter", None), "draft_model", None)
+            layers = getattr(getattr(draft, "model", None), "layers", None) or []
+            carried = getattr(layers[0].self_attn, "_selection_rows", None) if layers else None
+            matched = -1
+            if carried is not None:
+                c = carried[:n_prev].to("cpu")
+                s = snap[: n_prev * T_VERIFY].reshape(n_prev, T_VERIFY, -1)
+                matched = int((c[:, None, :] == s).all(-1).any(-1).sum())
+            tot = getattr(self, "_sel_check_tot", [0, 0, 0, 0])
+            tot = [tot[0] + 1, tot[1] + int(changed), tot[2] + max(matched, 0), tot[3] + n_prev]
+            self._sel_check_tot = tot
+            logger.info(
+                "Qwen3.8 whole-step export check (call %d, export %s): sink changed %s; "
+                "carried rows = this request's exported rows %d/%d; totals: changed %d/%d "
+                "checks, carried %d/%d",
+                call, int(self.export_attn is not None), changed, matched, n_prev,
+                tot[1], tot[0], tot[2], tot[3],
+            )
+        if whole_calls % every == 0:
+            self._sel_check = (call, sink[:rows].to("cpu"), n_req)

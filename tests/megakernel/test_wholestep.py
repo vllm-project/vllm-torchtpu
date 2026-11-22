@@ -294,7 +294,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
            async_dma: bool = False, B: int | None = None, xreq: int = 0,
            skip_idle: bool = False, xmerge: bool = False, key_mp: int = 0, key_slots: int = 2,
            req_async: int = 0, nvis_balance: bool = False, uattn_lite: bool = False,
-           key_lanes: int = 0):
+           key_lanes: int = 0, export: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -349,7 +349,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
         step=True,
         indexed=dict(
             max_groups=MG, pages_per_seq=pps, debug=True, async_dma=async_dma,
-            **(long_kw if long else {})
+            **(long_kw if long else {}), **(dict(export_ids=True) if export else {})
         ),
     )
     w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
@@ -377,6 +377,10 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
     d["_ir_new"] = np.asarray(outs[IR_NEW], np.float32).reshape(R, n_att, ex.M, -1)[
         :, :, :B
     ]
+    if export:
+        from vllm_torchtpu.megakernel.wholestep.qsa_full_b import SEL_IDS
+
+        d["_sel_ids"] = np.asarray(outs[SEL_IDS]).reshape(R, ex.M, -1)[:, :B]
     if stats:
         from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
             UNION_STATS,
@@ -532,6 +536,58 @@ def test_step_selection_exact_on_its_own_queries(long):
             want = {i for i in topk_reference(st, n, BUDGET) if i < c0 // 4}
             got = set(ids[o, r, : len(want)].tolist())
             assert got == want, (o, r, len(got ^ want))
+
+
+@pytest.mark.parametrize("kw", [
+    dict(long=True),
+    dict(long=True, union=True, shard=True, xmerge=True, req_async=2, loop=True, xreq=3,
+         skip_idle=True, async_dma=True),
+], ids=["long", "served"])
+def test_export_ids_restore_the_full_stock_selection(kw):
+    """VLLM_TPU_MK_WHOLE_EXPORT_SELECTION: the exported ids are the last QSA layer's
+    pool-path ids on every rank, and `selection_groups` turns them into the stock
+    selection of every row, g_a included (the kernel keeps g_a off the pool path), and
+    `export_selection` into the stock `selected` rows of the draft's sink."""
+    from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import selected_tokens
+    from vllm_torchtpu.megakernel.wholestep.indexer import score_rows, topk_reference
+    from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_inputs import (
+        export_selection,
+        selection_groups,
+    )
+
+    *_, ck, _, _, iq, ids, d = _run_c(rank_ids=True, export=True, **kw)
+    sel = d["_sel_ids"]  # [R, B, K]
+    o, T, (R, B, K) = iq.shape[0] - 1, 4, sel.shape
+    for r in range(R):
+        np.testing.assert_array_equal(sel[r], ids[r, o])
+    ctx = jnp.asarray(d["ctxq"], jnp.int32)
+    starts = jnp.arange(len(d["ctxq"]) + 1, dtype=jnp.int32) * T
+    groups, lens = selection_groups(jnp.asarray(sel[0]), ctx, starts, T=T, K=K)
+    groups, lens = np.asarray(groups), np.asarray(lens)
+    want_blocks = np.full((B, K), -1, np.int32)
+    n_ga = 0
+    for row in range(B):
+        q = row // T
+        c0 = int(d["ctxq"][q])
+        p3 = c0 + (3 - c0 % 4) % 4
+        qr = jnp.asarray(iq[o, row].reshape(4, -1), BF16)
+        st = np.array(score_rows(qr, d["ck"][q]))[0]
+        st[p3 // 4] = np.asarray(
+            score_rows(qr, jnp.broadcast_to(jnp.asarray(ck[o, q], BF16), (8, ck.shape[-1])))
+        )[0, 0]
+        n = int(d["nvis"][row])
+        want = sorted(topk_reference(st, n, K))
+        n_ga += int(c0 // 4 in want and n > K)
+        assert sorted(groups[row][groups[row] >= 0].tolist()) == want, row
+        assert lens[row] == c0 + row % T + 1
+        want_blocks[row, : len(want)] = want
+    got = np.asarray(export_selection(jnp.asarray(sel[0]), ctx, starts, T=T, K=K, rows=B))
+    sorted_groups = np.sort(np.where(groups < 0, np.iinfo(np.int32).max, groups), axis=1)
+    sorted_groups = np.where(sorted_groups == np.iinfo(np.int32).max, -1, sorted_groups)
+    np.testing.assert_array_equal(sorted_groups, want_blocks)
+    ref = np.asarray(selected_tokens(jnp.asarray(want_blocks), jnp.asarray(lens), 4 * K, 4))
+    np.testing.assert_array_equal(got, ref)
+    print(f"export: rows with g_a selected past the budget: {n_ga}")
 
 
 def test_sharded_indexer_matches_unsharded():
@@ -1222,8 +1278,9 @@ def test_last_layer_step_with_per_layer_metadata_matches_reference(T):
         assert dd.mean() < 3e-2 * k * scale, (r, dd.mean() / scale)
 
 
-def _partial_last_cycle_run(tiles):
-    """`L = 5`, `first="qsa"` whole-step call; returns (kernel residual, reference)."""
+def _partial_last_cycle_run(tiles, export: bool = False):
+    """`L = 5`, `first="qsa"` whole-step call; returns (kernel residual, reference).
+    `export`: also `(SEL_IDS, last QSA layer's DBG_IDS)` (the served L45 export)."""
     R, T, Lt = 2, 4, 5
     ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=tiles)
     d = wi.random_wholestep_inputs(
@@ -1241,6 +1298,7 @@ def _partial_last_cycle_run(tiles):
         carrier="bf16",
         chunk_pages=32,
         n_layers=2,
+        **(dict(export_ids=True, debug=True) if export else {}),
     )
     spec = wholestep_spec(
         G, R, L=Lt, qsa=dict(budget=BUDGET), step=True, indexed=idx, first="qsa"
@@ -1255,7 +1313,24 @@ def _partial_last_cycle_run(tiles):
     res = np.asarray(outs[RESIDUAL_OUT].reshape(R, ex.M, -1)[:, : ex.B], np.float32)
     refn = np.asarray(ref, np.float32)
     assert float(np.std(refn - np.asarray(d["inp"].x[: ex.B], np.float32))) > 0.01
+    if export:
+        from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, SEL_IDS
+
+        sel = np.asarray(outs[SEL_IDS]).reshape(R, ex.M, -1)[:, : ex.B]
+        dbg = np.asarray(outs[DBG_IDS]).reshape(R, 2, ex.M, -1)[:, -1, : ex.B]
+        return res, refn, sel, dbg
     return res, refn
+
+
+def test_export_ids_last_layer_of_a_per_layer_call():
+    """`export_ids` with per-layer metadata (`n_layers = 2`, the served L45 kernel): the
+    export is the last QSA layer's ids (its debug copy), on every rank, and the residual
+    is bit-identical to the call without the export."""
+    res, _ = _partial_last_cycle_run(_TILES)
+    res_x, _, sel, dbg = _partial_last_cycle_run(_TILES, export=True)
+    np.testing.assert_array_equal(res_x, res)
+    np.testing.assert_array_equal(sel, dbg)
+    assert (sel > 0).any()
 
 
 def test_partial_last_cycle_ends_on_qsa_matches_reference():

@@ -193,6 +193,8 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_WHOLE_SKIP_IDLE: bool = False
     VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_MK_WHOLE_L45: bool = False
+    VLLM_TPU_MK_WHOLE_EXPORT_SELECTION: bool = False
+    VLLM_TPU_MK_EXPORT_SELECTION_CHECK: int = 0
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
     VLLM_TPU_HC_PREFILL_COMBINE_MIX: bool = False
     VLLM_TPU_HC_PREFILL_WIDE_TILE: int = 0
@@ -1357,6 +1359,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # its QSA layer) instead of VLLM_TPU_MK_WHOLE_L47's second one-layer kernel; implies
     # the L47 plumbing (cache writes, stock L47 skipped).
     "VLLM_TPU_MK_WHOLE_L45": env_bool("VLLM_TPU_MK_WHOLE_L45"),
+    # With VLLM_TPU_MK_WHOLE_L47 / _L45 and VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: the
+    # whole-step kernel exports layer 47's selected groups and the call writes them to the
+    # draft's shared-selection sink (stock layer 47 is skipped, so the sink was stale);
+    # MK draft step 0 (VLLM_TPU_MK_DRAFT) then carries this step's rows to the loop steps.
+    # Target outputs are unchanged; only what the draft attends changes.
+    "VLLM_TPU_MK_WHOLE_EXPORT_SELECTION": env_bool("VLLM_TPU_MK_WHOLE_EXPORT_SELECTION"),
+    # Debug (served smoke; one host read per check): every N-th whole-step call, snapshot
+    # the shared-selection sink; on the next forward (if it is a whole step too) log whether
+    # the sink changed and whether the draft's carried rows are the snapshot's rows.
+    "VLLM_TPU_MK_EXPORT_SELECTION_CHECK": env_int("VLLM_TPU_MK_EXPORT_SELECTION_CHECK", 0),
     # Prefill HC full mix: take the up projection as its [low rank, width]
     # transpose. The checkpoint weight is held column-major, so the transpose
     # is a bitcast and the per-call relayout copy before the kernel goes away

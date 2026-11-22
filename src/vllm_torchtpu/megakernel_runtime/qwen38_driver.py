@@ -2463,6 +2463,10 @@ class Qwen38SegmentDriver:
                     and self.whole_calls % wsc.UNION_STATS_EVERY == 0
                 ):
                     self.whole_module.log_union_stats(self.whole_calls)
+                if envs.VLLM_TPU_MK_EXPORT_SELECTION_CHECK > 0:
+                    self.whole_module.check_export_selection(
+                        runner, self.calls_total, self.whole_calls, n_req, rows
+                    )
             else:
                 with self._serve_contexts(runner):
                     out = self.program(input_ids=input_ids, positions=positions, **kw)

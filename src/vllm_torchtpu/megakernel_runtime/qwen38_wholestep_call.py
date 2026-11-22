@@ -42,6 +42,7 @@ from vllm_torchtpu.megakernel.exec_spec import DebugOptions, ExecSpec, Tiles
 from vllm_torchtpu.megakernel.ops import F32, REC
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
 from vllm_torchtpu.megakernel.wholestep.qsa_full import KV_NEW
+from vllm_torchtpu.megakernel.wholestep.qsa_full_b import SEL_IDS
 from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW, UNION_STATS
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
 
@@ -50,7 +51,7 @@ from .qwen38_segment_call import GDN_META, T_VERIFY, gdn_blocks, ring_depths, se
 from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
 
 from .qwen38_wholestep_cache import QSALayerCache, wholestep_qsa_writes
-from .qwen38_wholestep_inputs import qsa_step_inputs
+from .qwen38_wholestep_inputs import export_selection, qsa_step_inputs
 
 QSA_TABLES = 3  # per QSA layer: ring ids, main table, compressed table
 # Served indexer options: page tables in HBM with per-layer SMEM windows, one request's
@@ -168,6 +169,7 @@ _MK_BLOCK_FIELDS = (
     ("uattn_lite", "uattn_lite"),
     ("dcp", "dcp"),
     ("compressed_dcp", "compressed_dcp"),
+    ("export_ids", "export_ids"),  # VLLM_TPU_MK_WHOLE_EXPORT_SELECTION
 )
 _MK_TILE_FIELDS = ("hier", "rel_fetch", "nbe", "nbd", "vmem_mib")
 
@@ -457,12 +459,19 @@ def build_wholestep_call(
     tiles: Tiles | None = None,
     tail: bool = False,
     stacked_meta: bool = False,
+    export: bool = False,
 ) -> tuple[Any, tuple, tuple, tuple]:
     """`tail` (VLLM_TPU_MK_WHOLE_L47): the last QSA layer (model layer 47) runs as a
     second, one-layer kernel (`wholestep_spec(L=1)`) right after the `L`-layer one, in
     this function; `qsa_layers`, the tables and the norms then carry it last, and its
     step tokens go through the same cache writer as the other QSA layers. Weights:
-    the `L`-layer kernel's, then the tail kernel's."""
+    the `L`-layer kernel's, then the tail kernel's.
+
+    `export` (VLLM_TPU_MK_WHOLE_EXPORT_SELECTION): the kernel running the last QSA layer
+    (the tail kernel, or the `L`-layer one when it ends on that layer) exports its
+    selection (`export_ids`), and the call returns one more output, this rank's
+    `[B, 4 budget + 3]` int32 rows in the stock `selected` layout (`export_selection`),
+    for the MTP draft's shared-selection sink."""
     R = mesh.size
     T = T_VERIFY
     # VLLM_TPU_MK_SCOPES=N: per-phase named scopes in the kernel (profiling only).
@@ -481,7 +490,7 @@ def build_wholestep_call(
     assert len(qsa_layers) == n_qsa, (len(qsa_layers), n_qsa)
     pps = max_groups * 4 // 128
 
-    def spec_for(layers: int, n_layers: int):
+    def spec_for(layers: int, n_layers: int, export_ids: bool = False):
         return wholestep_spec(
             g,
             R,
@@ -497,18 +506,21 @@ def build_wholestep_call(
                 n_layers=n_layers,
                 **indexed_options(B),
                 **main_call_options(),
+                **({"export_ids": True} if export_ids else {}),
             ),
             hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
         )
 
-    spec = spec_for(L, n_att)
+    export_main = export and not tail
+    spec = spec_for(L, n_att, export_main)
     log_mk_options(B, spec, ex.tiles)
     stats = union_stats_on()
     fn, k_specs, _, n_w = make_flat_segment_step(
         mesh,
         spec,
         ex,
-        extra_outs=(KV_NEW, KR_NEW, IR_NEW) + ((UNION_STATS,) if stats else ()),
+        extra_outs=(KV_NEW, KR_NEW, IR_NEW) + ((UNION_STATS,) if stats else ())
+        + ((SEL_IDS,) if export_main else ()),
     )
     M, NS = ex.M, B // T
     tp, rep = P("tp"), P()
@@ -535,9 +547,10 @@ def build_wholestep_call(
     hbm = {x for x, s in zip(fn.extra_names, x_specs) if s == tp}
     if tail:  # model layer 47: QSA + MoE, no GDN layer
         fn_t, k_specs_t, _, n_w_t = make_flat_segment_step(
-            mesh, spec_for(1, 1), ex, extra_outs=(KV_NEW, KR_NEW, IR_NEW)
+            mesh, spec_for(1, 1, export), ex,
+            extra_outs=(KV_NEW, KR_NEW, IR_NEW) + ((SEL_IDS,) if export else ()),
         )
-        targets_t = weight_targets(spec_for(1, 1))
+        targets_t = weight_targets(spec_for(1, 1, export))
         x_specs_t = k_specs_t[2 : 2 + len(fn_t.extra_names)]
         hbm |= {x for x, s in zip(fn_t.extra_names, x_specs_t) if s == tp}
     else:
@@ -621,6 +634,24 @@ def build_wholestep_call(
     )
 
     dcp_size = main_kv_dcp()
+    if export and _is_rank0():
+        from vllm_torchtpu.logger import init_logger
+
+        # Build time (once per bucket): the line proves the served program exports.
+        init_logger(__name__).info(
+            "Qwen3.8 whole-step b%d: VLLM_TPU_MK_WHOLE_EXPORT_SELECTION: the %s kernel exports "
+            "layer 47's selection to the MTP draft's shared-selection sink",
+            B, "tail" if tail else "main",
+        )
+    export_rows = jax.shard_map(
+        lambda ids, context, starts: export_selection(
+            ids, context, starts, T=T, K=budget, rows=B
+        ),
+        mesh=mesh,
+        in_specs=(tp, rep, rep),
+        out_specs=tp,
+        check_vma=False,
+    )
 
     def per_rank_writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables_flat, positions, starts,
                         context, trig, norms_flat, *rest):
@@ -688,17 +719,22 @@ def build_wholestep_call(
         xs.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32))
         outs = fn(pos0, x, *(xs[k] for k in fn.extra_names), *w)
         res, conv_ck, rec_ck, kv, kr, ir = outs[:6]
+        sel_ids = outs[6 + int(stats)] if export_main else None
         extra: tuple = ()
         if tail:  # the pool is read-only in both kernels; every write follows them
             xt = dict(zip(names, inputs_t(pool, tables, positions, starts, context, trig)))
             outs_t = fn_t(pos0, res, *(xt[k] for k in fn_t.extra_names), *w_t)
             res, extra = outs_t[0], tuple(outs_t[1:4])
+            if export:  # no GDN checkpoints in the tail kernel: (res, kv, kr, ir, ids)
+                sel_ids = outs_t[4]
         pool = writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables, positions, starts, context,
                       trig, norms, *extra, *rank)
-        return (unpad(res), pool, outs[6]) if stats else (unpad(res), pool)
+        ret = (unpad(res), pool) + ((outs[6],) if stats else ())
+        return ret + ((export_rows(sel_ids, context, starts),) if export else ())
 
     in_specs = (
         (tp,) + (tp,) * (n_w + n_w_t) + (tp,) + (rep,) * n_meta + (rep,) * n_tab + (rep,) * 4
         + (rep,) * (2 * n_qsa) + ((tp,) if dcp_size > 1 else ())
     )
-    return call, in_specs, (tp, tp, tp) if stats else (tp, tp), (1 + n_w + n_w_t,)
+    out_specs = (tp, tp) + ((tp,) if stats else ()) + ((tp,) if export else ())
+    return call, in_specs, out_specs, (1 + n_w + n_w_t,)
