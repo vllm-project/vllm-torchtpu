@@ -25,6 +25,28 @@ def _torch_tpu_builds_stage_meshes() -> bool:
 
 _FULL_ATTENTION_LAYER_TYPES = ["full_attention", "deepseek_sparse_attention"]
 
+# KV transfer connectors that register each stage's own layers: the
+# disaggregation connector with the stage's peer, the offloading connector
+# with the offload controller.
+_RAIDEN_CONNECTORS = ("TPURaidenConnector", "TPURaidenOffloadingConnector")
+
+
+def _kv_connector_names(kv_transfer_config: Any) -> list[str]:
+    """The connector a config names, or the children of a TPUMultiConnector."""
+    name = kv_transfer_config.kv_connector
+    if name != "TPUMultiConnector":
+        return [name]
+    extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    return [child["kv_connector"] for child in extra.get("connectors", [])]
+
+
+def _non_raiden_connectors(kv_transfer_config: Any) -> list[str]:
+    return [
+        name
+        for name in _kv_connector_names(kv_transfer_config)
+        if name not in _RAIDEN_CONNECTORS
+    ]
+
 
 def _stage_without_full_attention(vllm_config: Any) -> str | None:
     """Describe the first stage holding no full-attention layer, or None.
@@ -50,6 +72,34 @@ def _stage_without_full_attention(vllm_config: Any) -> str | None:
     return None
 
 
+def _skips_topk(hf_config: Any, layer: int) -> bool:
+    """Whether `layer` reuses an earlier layer's top-k (IndexCache), by the
+    rule vLLM v0.29.0's DeepseekV2 attention builds its layers with."""
+    pattern = getattr(hf_config, "index_topk_pattern", None)
+    if pattern is not None:
+        return 0 <= layer < len(pattern) and pattern[layer] == "S"
+    freq = getattr(hf_config, "index_topk_freq", 1)
+    offset = getattr(hf_config, "index_skip_topk_offset", 2)
+    return max(layer - offset + 1, 0) % freq != 0
+
+
+def _stage_starting_on_shared_topk(vllm_config: Any) -> str | None:
+    """Describe the first stage whose first layer reuses the top-k of a layer
+    on the stage before it, or None."""
+    from vllm.distributed.utils import get_pp_indices
+
+    hf_config = vllm_config.model_config.hf_text_config
+    if not hasattr(hf_config, "index_topk"):
+        return None
+    num_layers = hf_config.num_hidden_layers
+    stages = vllm_config.parallel_config.pipeline_parallel_size
+    for stage in range(1, stages):
+        start, _ = get_pp_indices(num_layers, stage, stages)
+        if _skips_topk(hf_config, start):
+            return f"stage {stage} starts at layer {start}"
+    return None
+
+
 def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     """Reject configurations the TPU pipeline-parallel path does not serve.
 
@@ -61,12 +111,19 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
 
     unsupported = None
     remedy = ""
-    if parallel_config.tensor_parallel_size > 1:
-        # On torch_tpu (dev20260813) a stage's TP collectives stall on the
-        # first serving step, when the other stages are not launching the
-        # same collectives; warmup, where every stage runs them, passes.
-        unsupported = "tensor parallelism inside a stage"
-        remedy = " Use --tensor-parallel-size 1."
+    if (
+        parallel_config.tensor_parallel_size > 1
+        and not _torch_tpu_builds_stage_meshes()
+    ):
+        # On torch_tpu builds with world-size meshes only (dev20260813), a
+        # stage's TP collectives stall on the first serving step, when the
+        # other stages are not launching the same collectives. A torch_tpu that
+        # builds meshes over a stage's group (0.3.0) runs them.
+        unsupported = "tensor parallelism inside a stage with this torch_tpu"
+        remedy = (
+            " Use --tensor-parallel-size 1, or a torch_tpu that builds Pallas"
+            " meshes over a stage's process group."
+        )
     elif (
         parallel_config.prefill_context_parallel_size > 1
         or (
@@ -90,11 +147,11 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     elif (
         parallel_config.prefill_context_parallel_size > 1
         and vllm_config.kv_transfer_config is not None
-        and vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"
+        and _non_raiden_connectors(vllm_config.kv_transfer_config)
     ):
         # These connectors pair a stage with its peer through one pool per
         # device; a context-parallel stage spreads a request over several.
-        # The raiden connector lowers each PCP worker's chunks of the
+        # The raiden connectors lower each PCP worker's chunks of the
         # stage's layers.
         unsupported = "KV transfer connectors with context-parallel stages"
     elif vllm_config.scheduler_config.async_scheduling:
@@ -104,25 +161,36 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         remedy = " Pass --no-async-scheduling."
     elif vllm_config.speculative_config is not None:
         unsupported = "speculative decoding"
-    elif (
-        vllm_config.kv_transfer_config is not None
-        and vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"
+    elif vllm_config.kv_transfer_config is not None and (
+        others := _non_raiden_connectors(vllm_config.kv_transfer_config)
     ):
-        # The raiden connector transfers each stage's own layers; the
+        # The raiden connectors transfer each stage's own layers; the
         # other connectors assume every worker holds every layer.
-        unsupported = "KV transfer connectors other than TPURaidenConnector"
+        unsupported = (
+            "KV transfer connectors other than TPURaidenConnector and "
+            f"TPURaidenOffloadingConnector ({', '.join(others)})"
+        )
     elif vllm_config.kv_transfer_config is not None and (
         stage := _stage_without_full_attention(vllm_config)
     ):
-        # The raiden connector pairs a stage with its peer through the
+        # The raiden connectors register a stage's pools through the
         # measured layout of a full-attention KV pool, so a stage made of
         # linear-attention layers alone has nothing to register.
         unsupported = (
-            f"TPURaidenConnector with a stage holding no full-attention layer ({stage})"
+            f"a raiden connector with a stage holding no full-attention layer ({stage})"
         )
         remedy = (
             " Choose a pipeline size or VLLM_PP_LAYER_PARTITION that "
             "gives every stage a full-attention layer."
+        )
+    elif stage := _stage_starting_on_shared_topk(vllm_config):
+        # A layer that skips its indexer reads the top-k buffer an earlier
+        # layer of the same stage wrote this step; on a stage's first layer
+        # that buffer is stale.
+        unsupported = f"a stage starting on a layer that reuses the top-k ({stage})"
+        remedy = (
+            " Choose a VLLM_PP_LAYER_PARTITION that starts every stage on a layer"
+            " with its own indexer."
         )
     elif _legacy_ray_executor():
         # The pipeline's hand-off pushes go through the executor hook that

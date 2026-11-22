@@ -43,11 +43,13 @@ from typing import cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import (
     FCFSRequestQueue,
     RequestQueue,
     SchedulingPolicy,
 )
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_offload.base import make_offload_key
 from vllm.v1.request import Request
 
@@ -100,6 +102,27 @@ class PrefixAwareScheduler(AsyncScheduler):
             self._tier_warmth,
             self.TIER_PROBE_MAX_CHUNKS,
             self.MAX_WAIT_S,
+        )
+
+    # Without async scheduling, keep the synchronous Scheduler's bookkeeping.
+    # AsyncScheduler's output placeholders let a request be scheduled again
+    # before its sampled token returns; under pipeline parallelism the first
+    # stage then gets no token for it (IndexError in `_update_states`).
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        if self.scheduler_config.async_scheduling:
+            super()._update_after_schedule(scheduler_output)
+        else:
+            Scheduler._update_after_schedule(self, scheduler_output)
+
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int], is_stale: bool = False
+    ) -> tuple[list[int], bool]:
+        if self.scheduler_config.async_scheduling:
+            return super()._update_request_with_output(
+                request, new_token_ids, is_stale=is_stale
+            )
+        return Scheduler._update_request_with_output(
+            self, request, new_token_ids, is_stale=is_stale
         )
 
     def _init_aging(self, max_wait_s: float) -> None:

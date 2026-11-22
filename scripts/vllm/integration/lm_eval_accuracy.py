@@ -94,6 +94,11 @@ def evaluate_with_vllm(
     """Evaluate with lm-eval and shut down its vLLM EngineCore on every exit."""
     import lm_eval
 
+    # lm-eval's torch seed calls torch.manual_seed, which also seeds every
+    # registered device backend. torch_tpu's manual_seed_all opens the TPU
+    # devices in this process, and the EngineCore workers already hold them.
+    # The engine seeds its own sampling, so leave torch unseeded here.
+    evaluation_args.setdefault("torch_random_seed", None)
     model = _create_vllm_model(model_args, batch_size, max_batch_size, device)
     try:
         return lm_eval.simple_evaluate(

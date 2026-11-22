@@ -18,6 +18,7 @@ def _config(
     pcp=1,
     dp=1,
     ep=False,
+    hf_config=None,
 ):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -31,12 +32,30 @@ def _config(
         speculative_config=speculative,
         kv_transfer_config=kv_transfer,
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(layer_types=layer_types)
+            hf_text_config=hf_config or SimpleNamespace(layer_types=layer_types)
         ),
     )
 
 
-RAIDEN = SimpleNamespace(kv_connector="TPURaidenConnector")
+RAIDEN = SimpleNamespace(kv_connector="TPURaidenConnector", is_kv_producer=True)
+RAIDEN_CONSUMER = SimpleNamespace(
+    kv_connector="TPURaidenConnector", is_kv_producer=False
+)
+OFFLOAD = SimpleNamespace(
+    kv_connector="TPURaidenOffloadingConnector", is_kv_producer=True
+)
+
+
+def _multi(*children):
+    return SimpleNamespace(
+        kv_connector="TPUMultiConnector",
+        is_kv_producer=True,
+        kv_connector_extra_config={
+            "connectors": [{"kv_connector": name} for name in children]
+        },
+    )
+
+
 # Qwen3.5-0.8B: 24 layers, full attention on every fourth.
 HYBRID_24 = ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(24)]
 
@@ -73,6 +92,36 @@ def test_accepts_the_raiden_connector():
     validate_pipeline_parallel_config(_config(pp=2, kv_transfer=RAIDEN))
 
 
+def test_accepts_the_raiden_offloading_connector():
+    validate_pipeline_parallel_config(_config(pp=2, kv_transfer=OFFLOAD))
+
+
+def test_accepts_a_multi_connector_of_raiden_connectors():
+    validate_pipeline_parallel_config(
+        _config(
+            pp=2,
+            kv_transfer=_multi("TPURaidenConnector", "TPURaidenOffloadingConnector"),
+        )
+    )
+
+
+def test_rejects_a_multi_connector_with_another_child():
+    with pytest.raises(NotImplementedError, match="TPUConnectorHMA"):
+        validate_pipeline_parallel_config(
+            _config(pp=2, kv_transfer=_multi("TPURaidenConnector", "TPUConnectorHMA"))
+        )
+
+
+def test_offloading_rejects_a_stage_of_linear_attention_layers_only(monkeypatch):
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    with pytest.raises(
+        NotImplementedError, match=r"stage 0 holds layers 0-2, linear_attention only"
+    ):
+        validate_pipeline_parallel_config(
+            _config(pp=8, kv_transfer=OFFLOAD, layer_types=HYBRID_24)
+        )
+
+
 def test_raiden_rejects_a_stage_of_linear_attention_layers_only(monkeypatch):
     monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
     with pytest.raises(
@@ -103,7 +152,8 @@ def test_linear_attention_stages_are_fine_without_kv_transfer():
     validate_pipeline_parallel_config(_config(pp=8, layer_types=HYBRID_24))
 
 
-def test_rejects_tensor_parallel_stages():
+def test_rejects_tensor_parallel_stages_on_world_size_meshes(monkeypatch):
+    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: False)
     with pytest.raises(NotImplementedError, match="tensor-parallel-size 1"):
         validate_pipeline_parallel_config(_config(pp=2, tp=4))
 
@@ -112,6 +162,10 @@ def test_rejects_tensor_parallel_stages():
 def stage_meshes(monkeypatch):
     """A torch_tpu that builds meshes over a stage's process group."""
     monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: True)
+
+
+def test_accepts_tensor_parallel_stages(stage_meshes):
+    validate_pipeline_parallel_config(_config(pp=2, tp=4))
 
 
 def test_accepts_context_parallel_stages(stage_meshes):
@@ -150,6 +204,10 @@ def test_raiden_accepts_context_parallel_stages(stage_meshes):
     validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=RAIDEN))
 
 
+def test_offloading_accepts_context_parallel_stages(stage_meshes):
+    validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=OFFLOAD))
+
+
 def test_rejects_the_legacy_ray_executor(monkeypatch):
     monkeypatch.setenv("TPU_MULTIHOST_BACKEND", "ray")
     monkeypatch.setenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", "0")
@@ -171,3 +229,53 @@ def test_raiden_accepts_stages_of_sparse_attention_layers(monkeypatch):
     validate_pipeline_parallel_config(
         _config(pp=8, kv_transfer=RAIDEN, layer_types=["deepseek_sparse_attention"] * 8)
     )
+
+
+def _glm52(**overrides):
+    # GLM-5.2: 78 layers; layers 0-2 and every fourth from 6 run their indexer.
+    fields = dict(
+        layer_types=None,
+        num_hidden_layers=78,
+        index_topk=2048,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        index_topk_pattern=None,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_rejects_a_stage_starting_on_a_shared_topk_layer(monkeypatch):
+    # The default 39/39 split starts stage 1 at layer 39, which reuses layer
+    # 38's top-k.
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    with pytest.raises(
+        NotImplementedError,
+        match=r"reuses the top-k \(stage 1 starts at layer 39\)"
+        r".*VLLM_PP_LAYER_PARTITION",
+    ):
+        validate_pipeline_parallel_config(_config(pp=2, hf_config=_glm52()))
+
+
+@pytest.mark.parametrize("partition", ["42,36", "38,40"])
+def test_accepts_stages_starting_on_an_indexer_layer(monkeypatch, partition):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+    validate_pipeline_parallel_config(_config(pp=2, hf_config=_glm52()))
+
+
+def test_topk_pattern_overrides_the_frequency(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "2,2")
+    pattern = ["F", "S", "S", "F"]
+    with pytest.raises(NotImplementedError, match="starts at layer 2"):
+        validate_pipeline_parallel_config(
+            _config(
+                pp=2,
+                hf_config=_glm52(num_hidden_layers=4, index_topk_pattern=pattern),
+            )
+        )
+
+
+def test_models_without_an_indexer_skip_the_topk_check(monkeypatch):
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    plain = SimpleNamespace(layer_types=None, num_hidden_layers=78)
+    validate_pipeline_parallel_config(_config(pp=2, hf_config=plain))

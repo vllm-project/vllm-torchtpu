@@ -62,8 +62,6 @@ def validate_pcp_manager_config(vllm_config: Any) -> None:
             "tensor_parallel_size * prefill_context_parallel_size, got "
             f"dcp={dcp_size}, tp={tp_size}, pcp={pcp_size}."
         )
-    if int(parallel_config.pipeline_parallel_size) != 1:
-        raise NotImplementedError("PCP x DCP does not support pipeline parallelism.")
     if int(parallel_config.data_parallel_size) != 1:
         raise NotImplementedError("PCP x DCP does not support data parallelism.")
     if vllm_config.speculative_config is not None:

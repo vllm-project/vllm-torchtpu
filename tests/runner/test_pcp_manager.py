@@ -110,7 +110,7 @@ def test_mla_kv_page_size_requires_one_size(specs):
         mla_kv_page_size(_config(*specs))
 
 
-def _pcp_manager_config(max_model_len=8192, pcp_size=2, tp_size=4):
+def _pcp_manager_config(max_model_len=8192, pcp_size=2, tp_size=4, pp_size=1):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             use_mla=True,
@@ -122,7 +122,7 @@ def _pcp_manager_config(max_model_len=8192, pcp_size=2, tp_size=4):
             prefill_context_parallel_size=pcp_size,
             decode_context_parallel_size=8,
             tensor_parallel_size=tp_size,
-            pipeline_parallel_size=1,
+            pipeline_parallel_size=pp_size,
             data_parallel_size=1,
             is_moe_model=False,
             enable_expert_parallel=False,
@@ -188,3 +188,8 @@ def test_pcp_manager_config_packed_rope_opt_in(monkeypatch):
     monkeypatch.setattr(envs, "TPU_SPARSE_MLA_PACKED_ROPE", True)
     monkeypatch.setattr(envs, "TPU_PCP_PACKED_ROPE", True)
     validate_pcp_manager_config(_pcp_manager_config())
+
+
+def test_pcp_manager_config_accepts_pipeline_stages():
+    """PCP x DCP inside each pipeline stage: PCP=8, DCP=8, PP=2."""
+    validate_pcp_manager_config(_pcp_manager_config(pcp_size=8, tp_size=1, pp_size=2))
