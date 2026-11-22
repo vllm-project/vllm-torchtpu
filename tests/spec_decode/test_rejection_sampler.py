@@ -541,7 +541,13 @@ def test_synthetic_sample_split_over_ranks_matches_one_rank(monkeypatch, seed):
         synthetic_sample_rows_and_assemble(
             logits[rank * per_rank : (rank + 1) * per_rank],
             torch.tensor([rank], dtype=torch.int32),
-            recover_draft, accepted, temps, top_k, top_p, recover_u, *tables,
+            recover_draft,
+            accepted,
+            temps,
+            top_k,
+            top_p,
+            recover_u,
+            *tables,
             **layout,
         )
     gathered = torch.cat(blocks)
@@ -551,7 +557,13 @@ def test_synthetic_sample_split_over_ranks_matches_one_rank(monkeypatch, seed):
     output = synthetic_sample_rows_and_assemble(
         logits[:per_rank],
         torch.tensor([0], dtype=torch.int32),
-        recover_draft, accepted, temps, top_k, top_p, recover_u, *tables,
+        recover_draft,
+        accepted,
+        temps,
+        top_k,
+        top_p,
+        recover_u,
+        *tables,
         **layout,
     )
     assert torch.equal(output, expected)
@@ -1408,3 +1420,82 @@ def test_synthetic_keyed_uniforms_match_their_draw(monkeypatch):
         logits, rank, *args, keys, *tables, **layout
     )
     assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_synthetic_plan_matches_a_loop_reference(seed):
+    """`_synthetic_verify_rows` and `_assemble_synthetic` (int32 plan) against a
+    per-request loop on random padded plans with placeholder drafts (the
+    uncompiled bodies, so it runs on the host)."""
+    from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+        PLACEHOLDER_TOKEN_ID,
+        _assemble_synthetic,
+        _synthetic_verify_rows,
+    )
+
+    gen = torch.Generator().manual_seed(seed)
+    k, padded_reqs = 7, 16
+    for _ in range(25):
+        nreq = int(torch.randint(1, padded_reqs + 1, (1,), generator=gen))
+        lengths = torch.randint(0, k + 1, (nreq,), generator=gen).tolist()
+        target, segment, group, bonus, row = [], [], [], [], 0
+        for r, n in enumerate(lengths):
+            target += [row + j for j in range(n)]
+            segment += [r] * n
+            group += list(range(n))
+            bonus.append(row + n)
+            row += n + 1
+        rows = max(8, -(-len(target) // 8) * 8)
+        pad = rows - len(target)
+        target += [0] * pad
+        segment += [padded_reqs] * pad
+        group += [0] * pad
+        bonus += [0] * (padded_reqs - nreq)
+        draft = torch.randint(-1, 500, (rows,), generator=gen, dtype=torch.int32)
+        num_draft = torch.tensor(
+            lengths + [0] * (padded_reqs - nreq), dtype=torch.int32
+        )
+        accept_u = torch.rand(rows, generator=gen)
+        rates = torch.rand(k, generator=gen)
+        final = torch.randperm(row + 1, generator=gen).to(torch.int32)
+        accepted, sample_rows, recover = _synthetic_verify_rows(
+            draft,
+            num_draft,
+            torch.tensor(segment),
+            torch.tensor(group, dtype=torch.int32),
+            torch.tensor(target, dtype=torch.int32),
+            torch.tensor(bonus, dtype=torch.int32),
+            final,
+            accept_u,
+            rates,
+        )
+        sampled = torch.randint(0, 500, (padded_reqs,), generator=gen)
+        tokens = _assemble_synthetic(
+            sampled,
+            accepted,
+            draft,
+            num_draft,
+            torch.tensor(segment),
+            torch.tensor(group, dtype=torch.int32),
+            k,
+        )
+        start = 0
+        for r in range(padded_reqs):
+            n = lengths[r] if r < nreq else 0
+            slots = range(start, start + n)
+            rejected = [
+                s
+                for s in slots
+                if not (accept_u[s] < rates[group[s]] and draft[s] >= 0)
+            ]
+            want_accepted = group[rejected[0]] if rejected else n
+            want_row = final[target[rejected[0]] if rejected else bonus[r]]
+            want_recover = int(draft[rejected[0]]) if rejected else -1
+            assert int(accepted[r]) == want_accepted
+            assert int(sample_rows[r]) == int(want_row)
+            assert int(recover[r]) == want_recover
+            want_tokens = [int(draft[start + j]) for j in range(want_accepted)]
+            want_tokens += [int(sampled[r])]
+            want_tokens += [PLACEHOLDER_TOKEN_ID] * (k - want_accepted)
+            assert tokens[r].tolist() == want_tokens
+            start += n
