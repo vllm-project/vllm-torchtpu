@@ -588,6 +588,9 @@ class Selected(NamedTuple):
     caches: tuple = ()
 
 
+# VMEM the block-select kernel asks for beyond its scratch (pipeline blocks,
+# spills).
+_SELECT_VMEM_MARGIN_BYTES = 4 << 20
 # Token rows a `RowSelect` pick takes at once (a decode bucket's).
 _SELECT_ROWS = 128
 
@@ -1120,8 +1123,10 @@ def _select_call(
             *cache_shapes,
         ],
         input_output_aliases=aliases,
+        # What the kernel holds and a margin: XLA keeps a call's whole limit
+        # out of the VMEM it prefetches the next ops' weights into.
         compiler_params=dataclasses.replace(
-            params, vmem_limit_bytes=max(32 << 20, vmem_bytes + (16 << 20))
+            params, vmem_limit_bytes=vmem_bytes + _SELECT_VMEM_MARGIN_BYTES
         ),
         interpret=interpret,
         name="minimax_m3_msa_block_select",

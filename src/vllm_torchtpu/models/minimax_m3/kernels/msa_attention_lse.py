@@ -45,6 +45,10 @@ TILES_PER_STEP = 4
 _FP4_PREFETCH = 2
 # Page copies a group's start loop issues per iteration (`_kernel`).
 _START_UNROLL = 4
+# 8-token tiles (decode-sized DCP batches) hold a few MiB of pages and
+# blocks; XLA keeps a call's whole limit out of the VMEM it prefetches the
+# next ops' weights into (the output projection's 6 MiB fp8 weight).
+_SMALL_BATCH_VMEM_LIMIT_BYTES = 16 * 1024 * 1024
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -651,7 +655,11 @@ def _attention_call(
         input_output_aliases=({num_inputs: 0, num_inputs + 1: 1} if aliased else {}),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=msa_attention._VMEM_LIMIT_BYTES,
+            vmem_limit_bytes=(
+                _SMALL_BATCH_VMEM_LIMIT_BYTES
+                if block_q == msa_attention.SMALL_BATCH_BLOCK_Q
+                else msa_attention._VMEM_LIMIT_BYTES
+            ),
             # Every copy's page comes from the page table, so the checks only
             # add scalar work to each step (as the ragged paged attention).
             disable_bounds_checks=True,
