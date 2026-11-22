@@ -1124,7 +1124,10 @@ class Eagle3Proposer:
         num_rejected_np: np.ndarray | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """`(hidden carry, token 0, positions carry)` of draft step 0 from one MK call
-        (`mtp_fused_loop.build_mk_draft_step0`), trimmed to the chunk's p rows."""
+        (`mtp_fused_loop.build_mk_draft_step0`), at the chunk's request capacity
+        (`draft_rows`, >= p rows): the loop runs at that width. Trimming them to p
+        here would make the host launch an execute_as_strided program per step to
+        re-materialize the three views before the fused loop."""
         if self._mk_draft_step0 is None:
             from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mk_draft_step0
 
@@ -1184,8 +1187,21 @@ class Eagle3Proposer:
             carry, token, pos = self._mk_draft_step0(
                 input_ids, positions, target_hidden_states, draft_rows
             )
-        # draft_rows is the chunk's request capacity, >= p: plain row slices.
+        if self._loop_takes_width(draft_rows.shape[0], rows):
+            return carry, token, pos
         return self._fit_draft_rows_output(carry, rows), token[:rows], pos[..., :rows]
+
+    def _loop_takes_width(self, width: int, rows: int) -> bool:
+        """Whether the loop can run at `width` (>= the p carry rows) on a warmed
+        program: a loop bucket of its own, and the same loop program kind (MK or
+        stock) the step would pick at p."""
+        if width < rows or self._loop_bucket(width) != width:
+            return False
+        if not envs.VLLM_TPU_MK_DRAFT_LOOP:
+            return True
+        return (self._mk_fused_loop_for(rows) is None) == (
+            self._mk_fused_loop_for(width) is None
+        )
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
@@ -2118,10 +2134,14 @@ class Eagle3Proposer:
 
         if K > 1:
             # Loop steps: uniform decode shape, one query per request. The
-            # carries are already padded to the chunk's bucket p, so the loop
-            # draft forward hits a precompiled trace with no per-num_reqs
-            # recompile.
-            padded_nr_per_chunk = [self._loop_bucket(c.num_reqs) for c in chunks]
+            # carries are padded to the chunk's bucket p, or wider (MK draft
+            # step 0 may return the request capacity, _run_mk_draft_step0), so
+            # the loop draft forward hits a precompiled trace with no
+            # per-num_reqs recompile.
+            padded_nr_per_chunk = [
+                max(self._loop_bucket(c.num_reqs), h.shape[0])
+                for c, h in zip(chunks, hidden_carry_per_chunk)
+            ]
             loop_hidden = [
                 _maybe_pad_dim0(h, p)
                 for h, p in zip(hidden_carry_per_chunk, padded_nr_per_chunk)
