@@ -137,6 +137,7 @@ def fused_step_inputs(
     eos_token_id: int,
     ngram_size: int,
     functional: bool = False,
+    substitution: tuple | None = None,
 ):
     """``Qwen4ExpAdapter.prepare_inputs``'s device work as one function, so it
     compiles to one program (VLLM_TPU_QWEN4_FUSED_PREP) instead of ~20 eager
@@ -150,7 +151,21 @@ def fused_step_inputs(
     (VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL) ``current`` is left alone and its
     updated record is returned as a fifth item instead: input mutations cost a
     per-tensor eager copy-back after the program.
+
+    ``substitution`` (VLLM_TPU_SUBST_IN_STEP_INPUTS) = (source, logits
+    indices, target logits indices): ``ids`` only gives the step's token
+    count and dtype, and the program first runs the runner's steady-decode
+    substitution (``_subst_prefix_extract_impl``: the ids are the source's
+    first tokens, the verified drafts their gather), then appends the ids
+    and the drafts to its outputs.
     """
+    if substitution is not None:
+        from vllm_torchtpu.runner.tpu_runner import _subst_prefix_extract_impl
+
+        source, logits_indices, target_indices = substitution
+        ids, drafts = _subst_prefix_extract_impl(
+            source, ids.shape[0], ids.dtype, logits_indices, target_indices
+        )
     rows = starts.shape[0] - 1
     row_start = scalars[0]
     num_requests = scalars[1]
@@ -198,9 +213,12 @@ def fused_step_inputs(
             recent_context.index_copy_(0, target, context)
             recent_lengths.index_copy_(0, target, new_lengths)
     valid_tokens = torch.arange(ids.shape[0], device=ids.device) < starts[-1]
+    out = (context, history, slots, valid_tokens)
     if functional:
-        return context, history, slots, valid_tokens, (record if spec_window else None)
-    return context, history, slots, valid_tokens
+        out += (record if spec_window else None,)
+    if substitution is not None:
+        out += (ids, drafts)
+    return out
 
 
 def dummy_query_lengths(num_tokens, num_reqs, max_active):
@@ -385,7 +403,22 @@ class Qwen4ExpAdapter:
             and envs.VLLM_TPU_QWEN4_NGRAM_WINDOW != "check"
         ):
             return self._prepare_inputs_fused(snapshot)
+        assert snapshot.substitution is None
         return self._prepare_inputs_eager(snapshot)
+
+    def accepts_substitution(self) -> bool:
+        """VLLM_TPU_SUBST_IN_STEP_INPUTS: `prepare_inputs` can run the
+        runner's steady-decode substitution in its input program (the fused
+        path without its eager cross-check). It then returns the substituted
+        ids and the verified drafts under `substituted_input_ids` /
+        `verified_draft_token_ids`, for the runner to take out of the model
+        kwargs."""
+        return bool(
+            envs.VLLM_TPU_SUBST_IN_STEP_INPUTS
+            and envs.VLLM_TPU_QWEN4_FUSED_PREP
+            and envs.VLLM_TPU_QWEN4_NGRAM_WINDOW != "check"
+            and not envs.VLLM_TPU_QWEN4_FUSED_PREP_CHECK
+        )
 
     def _prepare_inputs_eager(self, snapshot, current_override=None):
         runner = self.runner
@@ -543,10 +576,12 @@ class Qwen4ExpAdapter:
             eos_token_id=self.config.eos_token_id,
             ngram_size=self.config.ngram_size,
             functional=functional,
+            substitution=snapshot.substitution,
         )
         context, history, slots, valid_tokens = out[:4]
         if functional and current is not None:
             current = self._recent[1] = out[4]
+        substituted = out[-2:] if snapshot.substitution is not None else None
         if reference is not None:
             self._check_fused(
                 snapshot.num_requests,
@@ -558,7 +593,7 @@ class Qwen4ExpAdapter:
                 valid_tokens,
             )
         tables = self._block_tables(snapshot, rows)
-        return dict(
+        kwargs = dict(
             query_start_loc=starts,
             ngram_context=history,
             state_slots=slots,
@@ -567,6 +602,11 @@ class Qwen4ExpAdapter:
             main_block_table=tables[0],
             compressed_block_table=tables[1],
         )
+        if substituted is not None:
+            kwargs["substituted_input_ids"], kwargs["verified_draft_token_ids"] = (
+                substituted
+            )
+        return kwargs
 
     def _check_fused(
         self, n, reference, current, context, history, slots, valid_tokens
@@ -614,9 +654,14 @@ class Qwen4ExpAdapter:
             )
         return fn
 
-    def precompile_fused_inputs(self, num_tokens_paddings, rows_options):
+    def precompile_fused_inputs(
+        self, num_tokens_paddings, rows_options, substitution_sources=()
+    ):
         """Compile ``fused_step_inputs`` for every (rows, num_tokens) bucket a
-        step can reach, under no_grad like execute_model, before serving."""
+        step can reach, under no_grad like execute_model, before serving; with
+        ``substitution_sources`` ((length, dtype) of the runner's steady-decode
+        substitution sources) also the substitution variant at every bucket a
+        source covers (VLLM_TPU_SUBST_IN_STEP_INPUTS)."""
         if not envs.VLLM_TPU_QWEN4_FUSED_PREP:
             return
         runner = self.runner
@@ -649,23 +694,33 @@ class Qwen4ExpAdapter:
                     previous = current = None
                 for num_tokens in num_tokens_paddings:
                     ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
-                    out = self._fused_fn()(
-                        starts,
-                        seq_lens,
-                        starts if self.pooled else state,
-                        store,
-                        scalars,
-                        previous,
-                        current,
-                        ids,
-                        window=window,
-                        pooled=self.pooled,
-                        spec_window=self.spec_window,
-                        eos_token_id=self.config.eos_token_id,
-                        ngram_size=self.config.ngram_size,
-                        functional=envs.VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL,
-                    )
-                    synchronize_tensors(out[:4])
+                    # Steady verify: both index vectors are the padded logits
+                    # length, = num_tokens (as the runner's substitution warmup).
+                    idx = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+                    substitutions = [None] + [
+                        (torch.zeros(n, dtype=dtype, device=device), idx, idx)
+                        for n, dtype in substitution_sources
+                        if n >= num_tokens and self.accepts_substitution()
+                    ]
+                    for substitution in substitutions:
+                        out = self._fused_fn()(
+                            starts,
+                            seq_lens,
+                            starts if self.pooled else state,
+                            store,
+                            scalars,
+                            previous,
+                            current,
+                            ids,
+                            window=window,
+                            pooled=self.pooled,
+                            spec_window=self.spec_window,
+                            eos_token_id=self.config.eos_token_id,
+                            ngram_size=self.config.ngram_size,
+                            functional=envs.VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL,
+                            substitution=substitution,
+                        )
+                        synchronize_tensors(out[:4])
         logger.info(
             "Compiled fused qwen4 step inputs for rows %s x %d token buckets",
             sorted({r for r in rows_options if r}),

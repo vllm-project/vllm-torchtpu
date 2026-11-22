@@ -2133,6 +2133,9 @@ class TPUModelRunner(GPUModelRunner):
         self._fused_read_offsets: tuple = (None, 0)
         self._fused_read_offsets_applied = False
         self._verify_seed_chunk: DraftChunkInputs | None = None
+        # VLLM_TPU_SUBST_IN_STEP_INPUTS: this chunk's substitution, handed to
+        # the model adapter's input program.
+        self._pending_substitution: tuple | None = None
         self._partial_requests: tuple | None = None
         # Drafting and verification happen where sampling happens, on the
         # last pipeline stage; the other stages keep the config for the KV
@@ -3562,6 +3565,15 @@ class TPUModelRunner(GPUModelRunner):
                             and req[0].shape[0] == len(input_ids)
                             and req[1].shape[0] == len(input_ids)
                         ):
+                            if self._substitution_in_step_inputs():
+                                # The adapter's input program substitutes;
+                                # `input_ids` only sizes the step until then.
+                                self._pending_substitution = (next_src, *req)
+                                logger.info_once(
+                                    "SUBST_IN_STEP_INPUTS: input ids and verified "
+                                    "drafts from the model adapter's input program"
+                                )
+                                return input_ids
                             ids, drafts = _subst_prefix_extract_compiled(
                                 next_src, len(input_ids), input_ids.dtype, *req
                             )
@@ -3658,6 +3670,32 @@ class TPUModelRunner(GPUModelRunner):
             if envs.VLLM_TPU_WARMED_SUBSTITUTE_SOURCE
             else self._pre_async_results.next_tokens_tpu,
         )
+
+    def _substitution_in_step_inputs(self) -> bool:
+        """VLLM_TPU_SUBST_IN_STEP_INPUTS: the steady-decode substitution runs
+        inside the model adapter's input program (text-only first stage)."""
+        accepts = getattr(self.model_adapter, "accepts_substitution", None)
+        return bool(
+            accepts is not None
+            and accepts()
+            and not self.supports_mm_inputs
+            and self._pp_is_first
+        )
+
+    def _step_substitution_sources(self) -> list[tuple[int, torch.dtype]]:
+        """(length, dtype) of the steady-decode substitution sources the
+        adapter's input program is warmed for: the bounded async-spec source
+        (int32, see sample_tokens)."""
+        if not (
+            self._substitution_in_step_inputs()
+            and envs.VLLM_TPU_SUBST_FRESH_IDS
+            and envs.VLLM_TPU_SUBST_EXTRACT_FUSED
+            and self._is_async_drafter
+        ):
+            return []
+        assert self.speculative_config is not None
+        k = self.speculative_config.num_speculative_tokens
+        return [(self.max_num_reqs * (1 + k), torch.int32)]
 
     def _substitute_next_lens(self) -> list[int]:
         """next_tokens lengths `_precompile_substitute_placeholder_token` warms."""
@@ -5529,6 +5567,7 @@ class TPUModelRunner(GPUModelRunner):
                 and len(cur_input_indices) > 0
             )
             self._subst_extract_out = None
+            self._pending_substitution = None
             if fuse_extract:
                 assert spec_decode_metadata is not None
                 self._subst_extract_req = (
@@ -5558,6 +5597,10 @@ class TPUModelRunner(GPUModelRunner):
                     # substitution program itself.
                     spec_decode_metadata.draft_token_ids = self._subst_extract_out
                     self._subst_extract_out = None
+                elif self._pending_substitution is not None:
+                    # VLLM_TPU_SUBST_IN_STEP_INPUTS: set from the adapter's
+                    # input program below.
+                    pass
                 else:
                     extract = (
                         _extract_drafts_compiled
@@ -5679,8 +5722,17 @@ class TPUModelRunner(GPUModelRunner):
                         num_tokens_padded,
                         attn_metadata,
                         input_ids,
+                        self._pending_substitution,
                     )
                 )
+                if self._pending_substitution is not None:
+                    assert spec_decode_metadata is not None
+                    input_ids = model_kwargs.pop("substituted_input_ids")
+                    spec_decode_metadata.draft_token_ids = model_kwargs.pop(
+                        "verified_draft_token_ids"
+                    )
+                    draft_input_ids_src = input_ids
+                    self._pending_substitution = None
 
             host_phases.mark("adapter_prepare_inputs")
             if seed_late:
@@ -9013,6 +9065,7 @@ class TPUModelRunner(GPUModelRunner):
                     precompile_inputs(
                         self.num_tokens_paddings,
                         (self.num_reqs_max_model_len, self.num_reqs_most_model_len),
+                        self._step_substitution_sources(),
                     )
 
             # Precompile multimodal vision encoder graphs

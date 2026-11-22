@@ -412,6 +412,7 @@ if TYPE_CHECKING:
     VLLM_TPU_CANDIDATE_VERIFY_RO: bool = False
     VLLM_TPU_CANDIDATE_VERIFY_LOGITS: bool = False
     VLLM_TPU_CANDIDATE_VERIFY_SEED: bool = False
+    VLLM_TPU_SUBST_IN_STEP_INPUTS: bool = False
     VLLM_TPU_DRAFT_SEED_EXTRAS: bool = False
     VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
@@ -2629,6 +2630,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # inside the candidate verify program instead of as its own program in
     # propose. Same ops.
     "VLLM_TPU_CANDIDATE_VERIFY_SEED": env_bool("VLLM_TPU_CANDIDATE_VERIFY_SEED"),
+    # With VLLM_TPU_SUBST_FRESH_IDS + VLLM_TPU_SUBST_EXTRACT_FUSED and a model
+    # adapter whose input program accepts it (qwen4_exp's fused prep): the
+    # steady-decode substitution (input ids and verified drafts) runs inside
+    # that program instead of as its own. Same ops.
+    "VLLM_TPU_SUBST_IN_STEP_INPUTS": env_bool("VLLM_TPU_SUBST_IN_STEP_INPUTS"),
     # With VLLM_TPU_VERIFY_FUSED: compute the mamba read offsets inside the
     # fused verify program and apply them with one eager scatter.
     "VLLM_TPU_VERIFY_FUSED_READ_OFFSETS": env_bool("VLLM_TPU_VERIFY_FUSED_READ_OFFSETS"),

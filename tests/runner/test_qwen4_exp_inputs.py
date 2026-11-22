@@ -453,3 +453,95 @@ def test_fused_prepare_inputs_matches_eager(
         # check: the live comparison agrees; fault (context - 1): it catches it.
         bad = int(a_fused._fused_check_bad)
         assert (bad == 0) if check == "check" else (bad > 0), bad
+
+
+@pytest.mark.parametrize("window", ["", "1"])
+@pytest.mark.parametrize("pooled", [False, True])
+def test_fused_prepare_inputs_runs_the_steady_substitution(monkeypatch, pooled, window):
+    """VLLM_TPU_SUBST_IN_STEP_INPUTS: given the runner's substitution, the
+    fused input program returns the kwargs and records it returns for the
+    substituted ids, plus those ids and the verified drafts exactly as
+    `_subst_prefix_extract_impl` builds them."""
+    import numpy as np
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.models.vllm.qwen4_exp import inputs as inputs_mod
+    from vllm_torchtpu.runner.tpu_runner import _subst_prefix_extract_impl
+
+    rows, max_reqs, max_len, num_tokens, spec = 4, 6, 64, 16, 3
+    rng = np.random.default_rng(7 + pooled)
+
+    def make():
+        runner = NS(device="cpu", max_num_reqs=max_reqs, **_h2d_staging())
+        runner.model_config = NS(hf_text_config=q4exp_text_config())
+        runner.cache_config = NS(block_size=128)
+        runner.input_batch = NS(
+            token_ids_cpu_tensor=torch.from_numpy(
+                rng.integers(100, 999, (max_reqs, max_len)).astype(np.int32)
+            ),
+            num_computed_tokens_cpu=np.zeros(max_reqs, dtype=np.int64),
+            req_ids=[],
+        )
+        adapter = Qwen4ExpAdapter(runner)
+        adapter.pooled = pooled
+        adapter.spec_window = spec + 1
+        monkeypatch.setattr(adapter, "_fused_fn", lambda: inputs_mod.fused_step_inputs)
+        return runner, adapter
+
+    (r_ref, a_ref), (r_sub, a_sub) = make(), make()
+    r_sub.input_batch.token_ids_cpu_tensor.copy_(r_ref.input_batch.token_ids_cpu_tensor)
+    monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_FUSED_PREP", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_FUSED_PREP_CHECK", "", raising=False)
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL", True, raising=False
+    )
+    monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_NGRAM_WINDOW", window, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_SUBST_IN_STEP_INPUTS", True, raising=False)
+    assert a_sub.accepts_substitution()
+    attention = f"{a_ref.attention_prefix}.self_attn"
+    tables = {
+        a_ref._main_owner(attention): NS(block_tables=torch.zeros(rows, 3)),
+        a_ref._compressed_owner(attention): NS(block_tables=torch.zeros(rows, 2)),
+    }
+    for step, req_ids in enumerate([["a", "b", "c", "d"], ["b", "a", "d", "c"]]):
+        n = len(req_ids)
+        ctx_lens = rng.integers(5, max_len - 8, n)
+        starts = torch.arange(rows + 1, dtype=torch.int32) * (spec + 1)
+        seq_lens = torch.tensor(ctx_lens + spec + 1, dtype=torch.int32)
+        source = torch.from_numpy(rng.integers(100, 999, 64).astype(np.int32))
+        logits_idx = torch.arange(num_tokens, dtype=torch.int32)
+        target_idx = torch.from_numpy(
+            rng.integers(0, num_tokens - 1, num_tokens).astype(np.int32)
+        )
+        ids, drafts = _subst_prefix_extract_impl(
+            source, num_tokens, torch.int32, logits_idx, target_idx
+        )
+        placeholder = torch.full((num_tokens,), -7, dtype=torch.int32)
+        outs = []
+        for runner, adapter, snapshot_ids, substitution in (
+            (r_ref, a_ref, ids, None),
+            (r_sub, a_sub, placeholder, (source, logits_idx, target_idx)),
+        ):
+            runner.input_batch.req_ids = req_ids
+            runner.input_batch.num_computed_tokens_cpu[:n] = ctx_lens
+            runner._attn_metadata_builder_ctx = NS(
+                query_start_loc=starts,
+                seq_lens=seq_lens,
+                mamba_state_indices=torch.tensor([5, 3, 1, 0], dtype=torch.int32),
+            )
+            store = adapter.begin_step()
+            outs.append(
+                adapter.prepare_inputs(
+                    ModelInputSnapshot(
+                        store, 0, n, num_tokens, tables, snapshot_ids, substitution
+                    )
+                )
+            )
+        ref, sub = outs
+        assert torch.equal(sub.pop("substituted_input_ids"), ids)
+        assert torch.equal(sub.pop("verified_draft_token_ids"), drafts)
+        assert ref.keys() == sub.keys()
+        for key in ref:
+            assert torch.equal(ref[key], sub[key]), (step, key)
+        for got, want in zip(a_sub._recent[1], a_ref._recent[1]):
+            assert torch.equal(got, want), step

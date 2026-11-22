@@ -22,6 +22,10 @@ class ModelInputSnapshot:
     num_tokens: int
     attention_metadata: dict[str, Any]
     input_ids: torch.Tensor
+    # VLLM_TPU_SUBST_IN_STEP_INPUTS: (source, logits indices, target logits
+    # indices) of a steady-decode substitution the adapter's input program
+    # runs; `input_ids` then gives only the shape and dtype.
+    substitution: tuple | None = None
 
 
 class ModelAdapter(Protocol):
