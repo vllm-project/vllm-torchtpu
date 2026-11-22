@@ -43,7 +43,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..blocks.qsa_attn.block import MICRO, TILE, _unpack_kv
 from ..ops import BF16, F32, I32
-from .indexer import exclusive_prefix
+from .indexer import sum_rows, exclusive_prefix
 
 GROUPS_PER_TILE = TILE // MICRO  # one group = one micro-page of 4 tokens
 
@@ -61,11 +61,12 @@ def union_consts(S: int, KU: int) -> tuple:
     li = jax.lax.broadcasted_iota(I32, (128, 128), 0)
     lj = jax.lax.broadcasted_iota(I32, (128, 128), 1)
     return (
-        (li <= lj).astype(BF16),
+        (li >= lj).astype(BF16),
         (li < lj).astype(BF16),  # `indexer.exclusive_prefix`'s 128-lane strict triangle
-        jax.lax.broadcasted_iota(I32, (W, 1), 0),
-        jax.lax.broadcasted_iota(I32, (1, S), 1),
-        jax.lax.broadcasted_iota(I32, (W, 128), 1),
+        (li == lj).astype(BF16),
+        jax.lax.broadcasted_iota(I32, (1, W), 1),
+        jax.lax.broadcasted_iota(I32, (S, 1), 0),
+        jax.lax.broadcasted_iota(I32, (128, 1), 0),
     )
 
 
@@ -93,46 +94,43 @@ def compact_union(
     codes (slots past the count: 0) and the count `[1, 1]`.
 
     `code [S, 128]` int32 (lane = group id, value = row bits < 2^T). The compaction of
-    `indexer.compact_row` with every coded lane selected, `UNION_CHUNK` output slots per
-    pass
-    (the `[slots, S]` one-hot temporaries overflow VMEM: all 2048 slots at once 62.8 of
-    62.1 MiB at
-    16 rows, j-c89e9978; 512 per pass still 62.4, j-bfd3a7f8); each slot's code is
-    gathered from its group's sublane row by the
-    same one-hot matmul (codes <= 15 are exact in BF16).
+    `indexer.compact_row` (lane-major over the slots) with every coded lane selected,
+    `UNION_CHUNK` output slots per pass (the `[S, slots]` one-hot temporaries overflow VMEM:
+    all 2048 slots at once 62.8 of 62.1 MiB at 16 rows, j-c89e9978; 512 per pass still 62.4,
+    j-bfd3a7f8); each slot's code is gathered from its group's sublane row by the same
+    one-hot matmul as its in-row ranks (codes <= 15 are exact in BF16).
     """
-    U, Us, jcol0, srow, lane = consts
-    S, W = code.shape[0], jcol0.shape[0]
-    sel = code > 0
-    P = jnp.dot(sel.astype(F32).astype(BF16), U, preferred_element_type=F32)
-    c_row = jnp.transpose(jnp.broadcast_to(P[:, 127:128], (S, 128)))[0:1, :]
+    Ut, Us, eye, jcol0, scol, lcol = consts
+    S, W = code.shape[0], jcol0.shape[1]
+    dn = (((1,), (1,)), ((), ()))
+    PT = jax.lax.dot_general(  # PT[l, r]: coded lanes <= l of row r
+        Ut, (code > 0).astype(F32).astype(BF16), dn, preferred_element_type=F32
+    )
+    CT = jax.lax.dot_general(eye, code.astype(F32).astype(BF16), dn, preferred_element_type=F32)
+    c_row = PT[127:128, :]
     O_row = exclusive_prefix(c_row, Us)
-    E_row = O_row + c_row
-    Pb, codeb = P.astype(BF16), code.astype(F32).astype(BF16)
-    n = jnp.sum(sel.astype(I32), axis=(0, 1), keepdims=True)
+    E_col = jnp.transpose(jnp.broadcast_to(O_row + c_row, (128, S)))  # [S, 128]: E[r]
+    E = jnp.concatenate([E_col] * -(-W // 128), axis=1)[:, :W]
+    O_hi = jnp.floor(O_row * (1.0 / 256.0))
+    lhs = jnp.concatenate(
+        [PT, CT, O_hi, O_row - 256.0 * O_hi, jnp.zeros((14, S), F32)], axis=0
+    ).astype(BF16)  # [272, S]
+    n = jnp.sum(c_row, axis=1, keepdims=True)
     ids_out, codes_out = [], []
     for j0 in range(0, KU, W):
         jcol = jcol0 + j0
         jf = jcol.astype(F32)
-        r_j = jnp.sum((E_row <= jf).astype(I32), axis=1, keepdims=True)
-        hit = srow == r_j
-        oh = hit.astype(F32).astype(BF16)
-        Pg = jnp.dot(oh, Pb, preferred_element_type=F32)
-        O_rj = jnp.sum(jnp.where(hit, O_row, 0.0), axis=1, keepdims=True)
-        lane_j = jnp.sum((Pg <= jf - O_rj).astype(I32), axis=1, keepdims=True)
-        Cg = jnp.dot(oh, codeb, preferred_element_type=F32)
-        code_j = jnp.sum(jnp.where(lane == lane_j, Cg, 0.0), axis=1, keepdims=True)
-        live = jcol < n
-        ids = jnp.where(live, r_j * 128 + lane_j, 0).astype(F32)
-        codes = jnp.where(live, code_j, 0.0)
-        ids_out.append(
-            jnp.transpose(jnp.broadcast_to(ids, (W, 128)))[0:1, :].astype(I32)
-        )
-        codes_out.append(
-            jnp.transpose(jnp.broadcast_to(codes, (W, 128)))[0:1, :].astype(I32)
-        )
+        r_j = sum_rows((E <= jf).astype(I32))
+        oh = (scol == r_j).astype(F32).astype(BF16)  # [S, W]
+        g = jnp.dot(lhs, oh, preferred_element_type=F32)  # [272, W]
+        O_rj = 256.0 * g[256:257] + g[257:258]
+        lane_j = sum_rows((g[:128] <= jf - O_rj).astype(I32))
+        code_j = sum_rows(jnp.where(lcol == lane_j, g[128:256], 0.0))
+        live = jf < n
+        ids_out.append(jnp.where(live, r_j * 128 + lane_j, 0))
+        codes_out.append(jnp.where(live, code_j, 0.0).astype(I32))
     cat = lambda xs: xs[0] if len(xs) == 1 else jnp.concatenate(xs, axis=1)  # noqa: E731
-    return cat(ids_out), cat(codes_out), n
+    return cat(ids_out), cat(codes_out), n.astype(I32)
 
 
 def compact_union_chunk(code: jax.Array, tot: jax.Array, row_of, KU: int, consts: tuple,

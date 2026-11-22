@@ -633,9 +633,16 @@ class QSAFullIndexedBlock(QSAFullBlock):
         if SCORE_ARM == "dma":
             scr["qi_s"][rows, col] = jnp.zeros((T, CG // 128, 128), F32)
             return
-        # Stock BF16KeyReader read: ref bitcast FP8 -> BF16 when carrier == "fp8".
-        keys = ring.at[s].bitcast(BF16)[...] if self.carrier == "fp8" else ring[s]
-        keys = keys.reshape(CG, W)[:, : ix.IDX_DIM]
+        if self.carrier == "fp8":
+            # The slot is row-major words `[CH * 16 * W / 128, 128]`, two BF16 keys per word
+            # (key 2i in the low half, as the ref bitcast FP8 -> BF16 reads it): whole-vreg
+            # reads of the first 128 lanes, then an in-register bitcast with the same row
+            # order. A `[CH, 16, 2, W]` BF16 read loads two rows per vreg and relayouts.
+            wrows = ring.at[s].bitcast(I32).reshape(CG // 2 * (W // 128), 128)
+            words = wrows[pl.ds(0, CG // 2, stride=W // 128)] if W > 128 else wrows[...]
+            keys = pltpu.bitcast(words, BF16)
+        else:
+            keys = ring[s].reshape(CG, W)[:, : ix.IDX_DIM]
         st = ix.score_rows(qr, keys)  # [T, CG]
         scr["qi_s"][rows, col] = st.reshape(T, CG // 128, 128)
 

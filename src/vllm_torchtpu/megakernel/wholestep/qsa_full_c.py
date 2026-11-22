@@ -923,24 +923,18 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 # Recent groups (>= g_a) leave the pool path; remember whether g_a was
                 # selected.
                 scr["qc_sga"][r] = jnp.sum((sel & (lid == ga)).astype(I32))
-                bp = jnp.where(lid < ga, b, -1)
-                # Selection of the pool path: the same set restricted to ids < g_a. With
-                # `n_vis`
-                # clamped to g_a the compaction sees exactly those ids (select-all of
-                # the kept).
-                kept = jnp.sum((sel & (lid < ga)).astype(I32))
-                b2 = jnp.where(sel & (lid < ga), bp, -1)
+                # Selection of the pool path: the same set restricted to ids < g_a, compacted
+                # whole (at most K groups).
+                keep = sel & (lid < ga)
+                kept = jnp.sum(keep.astype(I32))
                 if (
                     self.union_attn
                 ):  # row bit r - lo of every pool-path group it selects
                     rows = pl.ds(0, Sx)
                     scr["qu_code"][rows] = scr["qu_code"][rows] | jnp.where(
-                        sel & (lid < ga), jnp.left_shift(1, r - lo), 0
+                        keep, jnp.left_shift(1, r - lo), 0
                     )
-                pos = ix.compact_row(
-                    b2, jnp.zeros((1, 1), I32), jnp.zeros((1, 1), I32) + G,
-                    jnp.zeros((1, 1), I32) + kept, K, consts,
-                )
+                pos = ix.compact_sel(keep, jnp.zeros((1, 1), I32) + kept, K, consts)
                 return pos, kept
 
             def tail(r: Any, pos: Any, kept: Any, carry: Any) -> Any:

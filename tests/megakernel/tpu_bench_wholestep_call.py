@@ -503,6 +503,7 @@ def _apply_removals(spec: str) -> None:
             ix.compact_row = lambda b, th, tm, nv, K, consts: jnp.zeros(
                 (1, K), jnp.int32
             )
+            ix.compact_sel = lambda sel, nv, K, consts: jnp.zeros((1, K), jnp.int32)
         else:
             raise ValueError(arm)
     if arms:
