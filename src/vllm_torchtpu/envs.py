@@ -2770,11 +2770,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DRAFT_CARRY_SHARD_ARGMAX": env_bool(
         "VLLM_TPU_DRAFT_CARRY_SHARD_ARGMAX", default=False
     ),
-    # With VLLM_TPU_DRAFT_SHARD_ARGMAX: the draft's greedy token reads an FP8
-    # copy of its vocab shard of the lm_head (per-row scales, built once after
-    # load) instead of the BF16 weight, halving the bytes each draft step
-    # streams. Changes draft tokens near ties only, so acceptance, never the
-    # verified output.
+    # With VLLM_TPU_DRAFT_SHARD_ARGMAX: the draft's greedy token multiplies an
+    # FP8 copy of its vocab shard of the lm_head (per-row scales, built once
+    # after load) with the hidden state quantized to FP8 per token, instead of
+    # the BF16 weight and hidden, halving the bytes each draft step streams.
+    # Changes draft tokens near ties only, so acceptance, never the verified
+    # output.
     "VLLM_TPU_DRAFT_LM_HEAD_FP8": env_bool("VLLM_TPU_DRAFT_LM_HEAD_FP8", default=False),
     # MTP draft step 0 on a draft declaring `supports_draft_rows` (Qwen4Exp):
     # write the draft layer's caches for every token of the target's step but

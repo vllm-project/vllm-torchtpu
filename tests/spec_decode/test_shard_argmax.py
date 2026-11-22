@@ -2,6 +2,7 @@
 """VLLM_TPU_DRAFT_SHARD_ARGMAX: the per-shard argmax + candidate all-gather picks
 exactly the token the full-logits argmax picks (CPU)."""
 
+import sys
 import types
 
 import pytest
@@ -153,15 +154,25 @@ def test_fp8_head_attach_and_logits(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_TPU_DRAFT_SHARD_ARGMAX", True)
     assert shard_argmax.attach_fp8_head(model)
     assert model.draft_head_fp8.dtype == torch.float8_e4m3fn
-    assert model.draft_head_fp8.shape == weight.shape
+    assert model.draft_head_fp8.shape == weight.t().shape
     assert model.draft_head_scale.dtype == torch.float32
+    w8 = model.draft_head_fp8.float() * model.draft_head_scale
+    torch.testing.assert_close(w8.t(), weight.float(), rtol=0.07, atol=1e-6)
+    assert (w8[:, 7] == 0).all()
+
+    def fake_quantized_matmul(x, w_q, w_s):  # the dense FP8 linear's (k, n) contract
+        assert w_q.dtype == torch.float8_e4m3fn and w_q.shape == (x.shape[-1], shard)
+        assert w_s.shape == (shard,)
+        return (x.float() @ (w_q.float() * w_s)).to(x.dtype)
+
+    fake = types.ModuleType("vllm_torchtpu.layers.adapter.linear_common")
+    fake.quantized_matmul = fake_quantized_matmul
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
     h = torch.randn(5, hidden, generator=g).to(torch.bfloat16)
-    want = (h.float() @ weight.float().t())
-    got = shard_argmax._local_logits(model, h)
-    assert torch.isfinite(got).all() and (got[:, 7] == 0).all()
-    # e4m3 keeps 3 mantissa bits: each weight within 1/16 relative of its row's value.
-    err = (got - want).abs().max() / want.abs().max()
-    assert err < 0.1, err
+    got = shard_argmax._local_logits(model, h).float()
+    want = h.float() @ weight.float().t()
+    assert (got[:, 7] == 0).all()
+    assert (got - want).abs().max() / want.abs().max() < 0.1
 
 
 def test_fp8_head_refuses_quantized_weights(monkeypatch):

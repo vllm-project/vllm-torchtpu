@@ -73,9 +73,11 @@ def _usable(model: Any) -> bool:
 
 def attach_fp8_head(model: Any) -> bool:
     """VLLM_TPU_DRAFT_LM_HEAD_FP8: register an FP8 copy of this rank's lm_head
-    shard on ``model`` (``draft_head_fp8`` [shard, hidden] float8_e4m3fn and
-    ``draft_head_scale`` [shard] float32, one scale per vocab row), read by
-    ``greedy_draft_token`` instead of the BF16 weight. Returns whether it did:
+    shard on ``model`` (``draft_head_fp8`` [hidden, shard] float8_e4m3fn, the
+    (k, n) layout ``quantized_matmul`` takes, and ``draft_head_scale`` [shard]
+    float32, one scale per vocab row), read by ``greedy_draft_token`` instead of
+    the BF16 weight; the hidden state is then quantized to FP8 per token too
+    (``_local_logits``). Returns whether it did:
     the shard-argmax path must be usable, since the copy feeds the local
     candidates only, and the head must hold plain float weights (a quantized
     head's codes are not its values) and no bias."""
@@ -90,19 +92,22 @@ def attach_fp8_head(model: Any) -> bool:
 
     fp8, scale = quantize_tensor(weight.float(), torch.float8_e4m3fn, axis=-1)
     scale = scale.reshape(-1)
-    model.register_buffer("draft_head_fp8", fp8, persistent=False)
+    model.register_buffer("draft_head_fp8", fp8.t().contiguous(), persistent=False)
     model.register_buffer("draft_head_scale", scale, persistent=False)
     return True
 
 
 def _local_logits(model: Any, hidden: torch.Tensor) -> torch.Tensor:
-    """This rank's vocab-shard logits, from the FP8 copy when one is attached."""
+    """This rank's vocab-shard logits, from the FP8 copy when one is attached:
+    the FP8 dense-linear matmul (per-token FP8 activations, FP8 x FP8 on the
+    MXU), so the weight streams as FP8 with no per-element convert."""
     lp, head = model.logits_processor, model.lm_head
     fp8 = getattr(model, "draft_head_fp8", None)
     if fp8 is None:
         return lp._get_logits(hidden, head, None, skip_gather=True)
-    logits = torch.matmul(hidden, fp8.to(hidden.dtype).t()).float()
-    return logits * model.draft_head_scale
+    from vllm_torchtpu.layers.adapter.linear_common import quantized_matmul
+
+    return quantized_matmul(hidden, fp8, model.draft_head_scale)
 
 
 def greedy_draft_token(model: Any, hidden: torch.Tensor) -> torch.Tensor:
