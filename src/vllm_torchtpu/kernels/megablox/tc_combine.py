@@ -40,7 +40,10 @@ TILE_ROWS = 16
 # Rows per MXU contraction chunk.
 _CHUNK_ROWS = 256
 _TILES_PER_CHUNK = _CHUNK_ROWS // TILE_ROWS
-TOKEN_BLOCK = 256
+# Tokens per grid step, widest first: a block's buffer holds its routed rows
+# plus up to two partial tiles per local expert, so many local experts (a
+# hierarchical EP split) fit only a narrower block.
+TOKEN_BLOCKS = (256, 128)
 _VMEM_LIMIT_BYTES = 60 * 1024 * 1024
 
 
@@ -51,16 +54,27 @@ def max_tiles(token_block: int, topk: int, num_experts: int) -> int:
     return -(-tiles // _TILES_PER_CHUNK) * _TILES_PER_CHUNK
 
 
+def pick_token_block(num_tokens: int, hidden: int, topk: int, num_experts: int) -> int:
+    """The widest of TOKEN_BLOCKS that divides the tokens and whose buffers
+    fit in VMEM, or 0."""
+    for block in TOKEN_BLOCKS:
+        if num_tokens % block:
+            continue
+        tiles = max_tiles(block, topk, num_experts)
+        vmem = (
+            2 * tiles * TILE_ROWS * hidden * 2  # double-buffered tiles
+            + block * hidden * 4  # f32 accumulator
+            + 2 * block * hidden * 2  # output blocks
+        )
+        if vmem <= _VMEM_LIMIT_BYTES - 8 * 1024 * 1024:
+            return block
+    return 0
+
+
 def supported(num_tokens: int, hidden: int, topk: int, num_experts: int, dtype) -> bool:
-    if dtype != jnp.bfloat16 or hidden % 128 or num_tokens % TOKEN_BLOCK:
+    if dtype != jnp.bfloat16 or hidden % 128:
         return False
-    tiles = max_tiles(TOKEN_BLOCK, topk, num_experts)
-    vmem = (
-        2 * tiles * TILE_ROWS * hidden * 2  # double-buffered tiles
-        + TOKEN_BLOCK * hidden * 4  # f32 accumulator
-        + 2 * TOKEN_BLOCK * hidden * 2  # output blocks
-    )
-    return vmem <= _VMEM_LIMIT_BYTES - 8 * 1024 * 1024
+    return pick_token_block(num_tokens, hidden, topk, num_experts) > 0
 
 
 def _plan(pos, valid, group_sizes, num_tokens: int, topk: int, token_block: int):
@@ -250,11 +264,11 @@ def tc_combine(
     num_tokens = pos.shape[0] // topk
     hidden = x.shape[1]
     num_experts = group_sizes.shape[0]
-    token_block = TOKEN_BLOCK
-    nb = num_tokens // token_block
-    maxt = max_tiles(token_block, topk, num_experts)
+    block = pick_token_block(num_tokens, hidden, topk, num_experts)
+    nb = num_tokens // block
+    maxt = max_tiles(block, topk, num_experts)
     tiles, counts, rows = _plan(
-        pos.astype(jnp.int32), valid, group_sizes, num_tokens, topk, token_block
+        pos.astype(jnp.int32), valid, group_sizes, num_tokens, topk, block
     )
     if x.shape[0] % TILE_ROWS:
         x = jnp.pad(x, ((0, TILE_ROWS - x.shape[0] % TILE_ROWS), (0, 0)))
@@ -266,14 +280,14 @@ def tc_combine(
         num_scalar_prefetch=3,
         grid=(nb,),
         in_specs=[
-            pl.BlockSpec((token_block, topk), lambda b, *_: (b, 0)),
-            pl.BlockSpec((token_block, topk), lambda b, *_: (b, 0)),
+            pl.BlockSpec((block, topk), lambda b, *_: (b, 0)),
+            pl.BlockSpec((block, topk), lambda b, *_: (b, 0)),
             pl.BlockSpec(memory_space=pl.ANY),
         ],
-        out_specs=pl.BlockSpec((token_block, hidden), lambda b, *_: (b, 0)),
+        out_specs=pl.BlockSpec((block, hidden), lambda b, *_: (b, 0)),
         scratch_shapes=[
             pltpu.VMEM((2, maxt * TILE_ROWS, hidden), x.dtype),
-            pltpu.VMEM((token_block, hidden), jnp.float32),
+            pltpu.VMEM((block, hidden), jnp.float32),
             pltpu.SemaphoreType.DMA((2,)),
         ],
     )
