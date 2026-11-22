@@ -21,6 +21,7 @@ from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 from vllm_torchtpu.layers.adapter.sample import top_p_sample
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import small_lookup
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
@@ -991,16 +992,7 @@ def _synthetic_verify_rows(
     group_indices = group_indices.to(i32)
     num_draft_tokens = num_draft_tokens.to(i32)
 
-    # Lookups by index (a table at [R] or [T] positions) run as one-hot masked
-    # reductions, which fuse: on TPU each gather of a few elements is a
-    # program step of its own (~1.2 us, serial here).
-    def lookup(table: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-        slots = torch.arange(table.shape[0], dtype=i32, device=device)
-        one_hot = index.unsqueeze(1) == slots.unsqueeze(0)
-        picked = torch.where(one_hot, table.unsqueeze(0), 0)
-        return picked.sum(dim=1, dtype=table.dtype)
-
-    rates = lookup(synthetic_conditional_rates, group_indices)
+    rates = small_lookup(synthetic_conditional_rates, group_indices)
     accepted = (accept_u < rates) & (draft_token_ids >= 0)
     match_mask = segment_ids.to(i32).unsqueeze(0) == torch.arange(
         batch_size, dtype=i32, device=device
@@ -1018,16 +1010,16 @@ def _synthetic_verify_rows(
     ).values
     any_rejected = first_rejected_pos < total_tokens
     accepted_count = torch.where(
-        any_rejected, lookup(group_indices, first_rejected_pos), num_draft_tokens
+        any_rejected, small_lookup(group_indices, first_rejected_pos), num_draft_tokens
     )
     logits_row = torch.where(
         any_rejected,
-        lookup(target_logits_indices.to(i32), first_rejected_pos),
+        small_lookup(target_logits_indices.to(i32), first_rejected_pos),
         bonus_logits_indices.to(i32),
     )
-    rows = lookup(final_logits_indices.to(i32), logits_row)
+    rows = small_lookup(final_logits_indices.to(i32), logits_row)
     recover_draft = torch.where(
-        any_rejected, lookup(draft_token_ids, first_rejected_pos), -1
+        any_rejected, small_lookup(draft_token_ids, first_rejected_pos), -1
     )
     return accepted_count, rows, recover_draft
 

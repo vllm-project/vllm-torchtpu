@@ -40,6 +40,7 @@ def test_matches_concatenation_in_rank_order(monkeypatch, dtype, dim):
         return torch.cat([b.contiguous().view(words.dtype) for b in blocks])
 
     monkeypatch.setattr(pallas_all_reduce, "all_gather_small", fake_gather)
+    monkeypatch.setattr(pallas_all_reduce, "_ARMED", object())
     monkeypatch.setattr(
         vllm.distributed, "get_tp_group", lambda: SimpleNamespace(ranks=range(N))
     )

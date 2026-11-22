@@ -11,21 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The async-spec glue's one-hot lookups equal the gathers they replace."""
+"""`small_lookup` (traced: a one-hot sum; eager or large: a gather) equals
+indexing, out-of-range indices giving 0, and the async-spec glue built on it."""
 
 import pytest
 import torch
 
 from vllm_torchtpu.runner import tpu_runner_async_output as ao
+from vllm_torchtpu.utils import small_lookup
 
 
 @pytest.mark.parametrize("table_len, index_len", [(8, 96), (512, 8192), (64, 7)])
-def test_lookup_matches_indexing(table_len, index_len):
+@pytest.mark.parametrize("traced", [False, True])
+def test_lookup_matches_indexing(table_len, index_len, traced):
     gen = torch.Generator().manual_seed(table_len + index_len)
     table = torch.randint(-5, 200_000, (table_len,), generator=gen, dtype=torch.int32)
-    index = torch.randint(0, table_len, (index_len,), generator=gen, dtype=torch.int32)
-    got = ao.lookup(table, index)
-    assert got.dtype == table.dtype and torch.equal(got, table[index])
+    index = torch.randint(-1, table_len + 1, (index_len,), generator=gen)
+    index = index.to(torch.int32)
+    fn = torch.compile(small_lookup, backend="eager") if traced else small_lookup
+    got = fn(table, index)
+    in_range = (index >= 0) & (index < table_len)
+    want = torch.where(in_range, table[index.clamp(0, table_len - 1)], 0)
+    assert got.dtype == table.dtype and torch.equal(got, want)
 
 
 def test_subtract_leaves_unmapped_slots():

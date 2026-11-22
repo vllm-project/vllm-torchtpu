@@ -23,6 +23,8 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
+from vllm_torchtpu.utils import small_lookup
+
 INVALID_TOKEN_ID = -1
 
 
@@ -266,28 +268,6 @@ def assemble_spec_next_tokens(
     return src.reshape(-1)  # [num_reqs * (1 + K)]
 
 
-# The largest [len(index), len(table)] one-hot `lookup` builds; past it a
-# gather is cheaper.
-_ONE_HOT_MAX_ELEMENTS = 1 << 20
-
-
-def _one_hot_lookup(table: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-    """``table[index]`` where ``0 <= index < len(table)``, else 0, as a one-hot
-    masked sum ([len(index), len(table)]), which fuses: on TPU a gather of a
-    few elements is a ~1 us program step of its own."""
-    slots = torch.arange(table.shape[0], dtype=index.dtype, device=index.device)
-    picked = torch.where(index.unsqueeze(1) == slots, table.unsqueeze(0), 0)
-    return picked.sum(dim=1, dtype=table.dtype)
-
-
-def lookup(table: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-    """``table[index]`` for in-range indices of a 1-D table: the one-hot sum
-    when it is small (static shapes decide), else a gather."""
-    if index.numel() * table.shape[0] <= _ONE_HOT_MAX_ELEMENTS:
-        return _one_hot_lookup(table, index)
-    return table[index]
-
-
 def subtract_num_rejected_tokens(
     seq_lens: torch.Tensor,
     positions: torch.Tensor,
@@ -312,10 +292,10 @@ def subtract_num_rejected_tokens(
         positions_subtract_indices: ``[total_tokens]`` index into ``num_rejected``
             for each position slot, ``-1`` to leave it unchanged.
     """
-    seq_subtract = _one_hot_lookup(num_rejected, seq_lens_subtract_indices)
+    seq_subtract = small_lookup(num_rejected, seq_lens_subtract_indices)
     seq_lens = seq_lens - seq_subtract
 
-    pos_subtract = _one_hot_lookup(num_rejected, positions_subtract_indices)
+    pos_subtract = small_lookup(num_rejected, positions_subtract_indices)
     if positions.ndim == 2:  # mrope (out of text-MVP scope; kept for parity)
         pos_subtract = pos_subtract.unsqueeze(0)
     positions = positions - pos_subtract
@@ -330,7 +310,9 @@ def extract_draft_token_ids(
     """Gather the draft tokens the target just verified, from the (post-async-
     substitution) device ``input_ids``.
     """
-    return lookup(input_ids, lookup(logits_indices, target_logits_indices + 1))
+    return small_lookup(
+        input_ids, small_lookup(logits_indices, target_logits_indices + 1)
+    )
 
 
 def compute_num_rejected(

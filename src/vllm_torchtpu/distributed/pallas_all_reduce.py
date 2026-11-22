@@ -375,7 +375,7 @@ def tp_all_gather(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
     words = x
     if x.element_size() == 2 and x.shape[-1] % 2 == 0:
         words = x.contiguous().view(torch.int32)
-    if words.element_size() == 4:
+    if _ARMED is not None and words.element_size() == 4:
         gathered = all_gather_small(get_tp_group().ranks, words)
     if gathered is None:
         return tensor_model_parallel_all_gather(x, dim)
