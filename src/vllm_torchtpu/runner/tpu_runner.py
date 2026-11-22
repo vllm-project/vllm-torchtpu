@@ -9617,8 +9617,6 @@ class TPUModelRunner(GPUModelRunner):
         from torch.distributed import _functional_collectives as funcol
         from vllm.distributed import get_tp_group
 
-        from vllm_torchtpu.distributed import pallas_all_reduce
-
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         shard = self.model.compute_logits_shard(selected)  # [rows, vocab / tp]
         tp_group = get_tp_group()
@@ -9631,11 +9629,9 @@ class TPUModelRunner(GPUModelRunner):
         # One row per rank stays 2-D: [tp, width] is dense, while a [tp, 1,
         # width] buffer pads each rank's row to a tile of its own.
         send = shard if per_rank == 1 else shard.reshape(tp, per_rank, width)
-        recv = pallas_all_reduce.tp_all_to_all(send)
-        if recv is None:
-            recv = funcol.all_to_all_single(
-                send.contiguous(), None, None, tp_group.device_group
-            )
+        recv = funcol.all_to_all_single(
+            send.contiguous(), None, None, tp_group.device_group
+        )
         if isinstance(recv, funcol.AsyncCollectiveTensor):
             recv = funcol.wait_tensor(recv)
         return _synthetic_logit_rows(recv, per_rank)

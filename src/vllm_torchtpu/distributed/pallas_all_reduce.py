@@ -64,7 +64,6 @@ class _Armed:
     rank_ordered: bool = False
     mesh: Any = None
     max_bytes: int = 0
-    a2a_op: Any = None
 
 
 _ARMED: _Armed | None = None
@@ -145,36 +144,6 @@ def _make_gather_op(mesh):
     return op
 
 
-def _make_a2a_op(mesh):
-    axis = mesh.axis_names[0]
-    n = int(mesh.size)
-    specs = (P(axis), P(axis))
-    sharded = jax.shard_map(
-        lambda x, rank: kernel.all_to_all_small(x, rank, n),
-        mesh=mesh,
-        in_specs=specs,
-        out_specs=P(axis),
-        check_vma=False,
-    )
-
-    def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
-        args = (x, rank)
-        return sharded(
-            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
-        )
-
-    # pyrefly: ignore[no-matching-overload]
-    op = pallas.jax_op(
-        "pallas::tp_all_to_all_small",
-        fn,
-        mesh=mesh,
-        input_partition_specs=specs,
-        output_partition_specs=P(axis),
-    )
-    op.register_fake(lambda x, rank: torch.empty_like(x))
-    return op
-
-
 def _refusal() -> str | None:
     tp = parallel_state.get_tp_group()
     ep = get_ep_group()
@@ -228,20 +197,6 @@ def _gather_selftest(op, rank: torch.Tensor, mesh_index: int, n: int, device) ->
     return bool(np.array_equal(got, want))
 
 
-def _a2a_selftest(op, rank: torch.Tensor, mesh_index: int, n: int, device) -> bool:
-    """Whether the all-to-all hands rank d every rank's block d, in rank order."""
-    width = 640
-    blocks = np.arange(n * n * width, dtype=np.float32).reshape(n, n, width)
-    faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
-    try:
-        mine = torch.from_numpy(blocks[mesh_index]).to(torch.bfloat16)
-        got = op(mine.to(device), rank).float().cpu().numpy()
-    finally:
-        faulthandler.cancel_dump_traceback_later()
-    want = torch.from_numpy(blocks[:, mesh_index]).to(torch.bfloat16).float().numpy()
-    return bool(np.array_equal(got, want))
-
-
 def _gather(obj) -> list:
     tp = parallel_state.get_tp_group()
     seen = [None] * tp.world_size
@@ -279,16 +234,10 @@ def arm(hidden: int, device: torch.device) -> bool:
         gather_op = _make_gather_op(mesh)
         if not all(_gather(_gather_selftest(gather_op, rank, mesh_index, n, device))):
             raise RuntimeError("tp_all_gather_small: self-test failed")
-    a2a_op = None
-    if envs.TPU_TP_PALLAS_SMALL_ALL_TO_ALL:
-        a2a_op = _make_a2a_op(mesh)
-        if not all(_gather(_a2a_selftest(a2a_op, rank, mesh_index, n, device))):
-            raise RuntimeError("tp_all_to_all_small: self-test failed")
     _ARMED = _Armed(
         ranks=tuple(int(r) for r in tp.ranks),
         op=op,
         gather_op=gather_op,
-        a2a_op=a2a_op,
         rank=rank,
         mesh=mesh,
         max_bytes=max_bytes,
@@ -382,23 +331,3 @@ def tp_all_gather(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
     blocks = gathered.view(x.dtype).view(-1, *x.shape)  # [n, *x.shape]
     dim = dim % x.dim()
     return torch.cat(blocks.unbind(0), dim=dim) if dim else blocks.flatten(0, 1)
-
-
-def tp_all_to_all(x: torch.Tensor) -> torch.Tensor | None:
-    """The armed Pallas all-to-all (`TPU_TP_PALLAS_SMALL_ALL_TO_ALL`) of x
-    ``[tp, ...]`` over the TP group, rank order (block d to rank d, block s
-    of the result from rank s), or None when it is not armed (the caller
-    takes its usual all-to-all)."""
-    from vllm.distributed import get_tp_group
-
-    armed = _ARMED
-    tp = get_tp_group()
-    if (
-        armed is None
-        or armed.a2a_op is None
-        or tuple(tp.ranks) != armed.ranks
-        or not armed.rank_ordered
-        or x.shape[0] != tp.world_size
-    ):
-        return None
-    return armed.a2a_op(x.contiguous(), armed.rank)
