@@ -447,6 +447,7 @@ def add_indexer_inputs(
         "nvis": jnp.asarray(lens // 4),
         "tail": jnp.asarray(lens % 4),
         "max_groups": max_groups,
+        "T": T,  # verify rows per request (`extras_b` splits the per-row tables by it)
     }
 
 
@@ -549,7 +550,7 @@ def extras_b(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
     if d.get(
         "hbm_tables"
     ):  # [layers, requests, cols] per-rank HBM extras (`hbm_tables=True`)
-        nreq = d["nvis"].shape[0] // 4
+        nreq = d["nvis"].shape[0] // d.get("T", 4)  # request slots = rows / T
 
         def lay(t):
             t = jnp.asarray(t)
