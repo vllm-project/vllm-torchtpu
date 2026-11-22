@@ -613,6 +613,8 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 hbm_operands=statics.hbm_operands,
                 l1=True,
                 l1_tail=True,
+                ag_pairs=statics.ag_pairs,
+                exchange_pieces=statics.exchange_pieces,
             )
         if (
             not statics.incumbent_max_rows or n <= statics.incumbent_max_rows

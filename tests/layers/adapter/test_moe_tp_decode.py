@@ -658,3 +658,59 @@ def test_op_body_pads_a_call_between_kernel_sizes(
         assert calls == [want]
         expected = jnp.where(rows < n_valid, 2.0, 0.0).astype(x.dtype)
     assert bool(jnp.all(out == expected[None]))
+
+
+@pytest.mark.parametrize(("ag_pairs", "pieces"), [(0, 0), (96, 96), (16, 0)])
+def test_op_body_passes_the_all_reduce_options_to_the_row_gathered_kernel(
+    monkeypatch, ag_pairs, pieces
+):
+    import jax
+    import jax.numpy as jnp
+
+    calls = []
+
+    def fake_rg(x, *args, **kwargs):
+        calls.append(
+            (x.shape[0], kwargs["ag_pairs"], kwargs["exchange_pieces"], kwargs["l1"])
+        )
+        return jnp.ones_like(x)
+
+    monkeypatch.setattr(
+        moe_tp_decode.kernel_rg, "can_use_moe_tp_decode_rg", lambda *a, **k: True
+    )
+    monkeypatch.setattr(moe_tp_decode.kernel_rg, "moe_tp_decode_rg", fake_rg)
+    statics = moe_tp_decode._OpStatics(
+        topk=TOPK,
+        routed_scale=ROUTED_SCALE,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        fast=True,
+        rg_min_rows=96,
+        ag_pairs=ag_pairs,
+        exchange_pieces=pieces,
+    )
+    body = moe_tp_decode._op_body(statics, n_ranks=2, axis="d")
+    f32, f8 = jnp.float32, jnp.float8_e4m3fn
+    tokens = 96
+    operands = (
+        jnp.zeros((tokens, H), jnp.bfloat16),
+        jnp.zeros((tokens, E), f32),
+        jnp.zeros((E,), f32),
+        jnp.zeros((tokens,), jnp.bool_),
+        jnp.zeros((E, H, 2 * INTER), f8),
+        jnp.zeros((E, INTER, H), f8),
+        jnp.zeros((E, 1, 1, 2 * INTER), f32),
+        jnp.zeros((E, 1, 1, H), f32),
+        jnp.zeros((H, 2 * FS), f8),
+        jnp.zeros((2 * FS,), f32),
+        jnp.zeros((FS, H), f8),
+        jnp.zeros((H,), f32),
+        jnp.zeros((1, 1), jnp.int32),
+        jnp.zeros((1, 1), jnp.int32),
+    )
+    stacked = [jnp.stack([a, a]) for a in operands]
+    out = jax.vmap(body, axis_name="d")(*stacked)
+    # The kernel's output is already all-reduced: no psum on top.
+    assert bool(jnp.all(out == 1))
+    assert calls == [(tokens, ag_pairs, pieces, True)]

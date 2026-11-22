@@ -30,6 +30,9 @@ Static options (WHITEBOARD v3 levers; defaults reproduce the first build):
       a fraction of the code).
   pad: probe-only cold code: "before" places one copy of the dense path, "after<k>" k copies (default 1), in loops
       whose trip count is a runtime 0, before or after the ring (the ring body unchanged).
+  ag_pairs, exchange_pieces: the in-kernel all-reduce's chip-pair all-gather and lane-group pieces, as
+      kernel.moe_tp_decode takes them (all_reduce.make_spec's pair_rows and piece_rows; same output bits). The kernel
+      name gains -pairs_<rows> and -pieces_<rows>.
 """
 
 import functools
@@ -111,7 +114,7 @@ def can_use_moe_tp_decode_rg(*args, topk: int, n_ranks: int, r_slab: int = R_SLA
     return vmem_plan(m, h, K._i_chunk(i), scores.shape[1], shared_w2.shape[0], info, spec, r_slab, l2) is not None
 
 
-def kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts, r, fault):
+def kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts, r, fault, pair_rows=0, piece_rows=0):
     name = (
         f"moe_tp_decode-rg{r}-e_{experts}-m_{m}-h_{h}-i_{i}-fs_{shared_inter}"
         f"-nb_{K._NUM_BUFFERS}-n_{n_ranks}"
@@ -122,6 +125,10 @@ def kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts, r, fault):
         name += f"-ne_{num_experts}"
     if fault:
         name += f"-fault_{fault}"
+    if pair_rows:
+        name += f"-pairs_{pair_rows}"
+    if piece_rows:
+        name += f"-pieces_{piece_rows}"
     return name
 
 
@@ -590,7 +597,7 @@ def _kernel(
     jax.jit,
     static_argnames=(
         "routed_scale", "topk", "n_ranks", "fast", "hbm_operands", "r_slab", "fault", "l1", "l2", "dense_loops", "pad",
-        "l1_tail",
+        "l1_tail", "ag_pairs", "exchange_pieces",
     ),
 )
 def moe_tp_decode_rg(
@@ -621,6 +628,8 @@ def moe_tp_decode_rg(
     dense_loops: bool = False,
     pad: str | None = None,
     l1_tail: bool = False,
+    ag_pairs: int = 0,
+    exchange_pieces: int = 0,
 ):
     """kernel.moe_tp_decode's contract (fast schedule's bits) with row-gathered expert compute."""
     if not fast:
@@ -632,7 +641,7 @@ def moe_tp_decode_rg(
     num_experts = scores.shape[1]
     shared_inter = shared_w2.shape[0]
     info = pltpu.get_tpu_info()
-    ar_spec = all_reduce.make_spec(n_ranks, m, h)
+    ar_spec = all_reduce.make_spec(n_ranks, m, h, ag_pairs, exchange_pieces)
     ic = K._i_chunk(i)
     plan = vmem_plan(m, h, ic, num_experts, shared_inter, info, ar_spec, r_slab, l2)
     if plan is None:
@@ -728,7 +737,9 @@ def moe_tp_decode_rg(
             ],
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=limit, collective_id=all_reduce.COLLECTIVE_ID),
-        name=kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts, r_slab, fault)
+        name=kernel_name(
+            experts, m, h, i, shared_inter, n_ranks, num_experts, r_slab, fault, ar_spec.pair_rows, ar_spec.piece_rows
+        )
         + ("-l1" if l1 else "")
         + ("-l2" if l2 else "")
         + ("-dl" if dense_loops else "")

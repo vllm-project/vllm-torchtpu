@@ -233,6 +233,39 @@ def test_chip_pair_spec_and_pairing_check(monkeypatch):
         all_reduce.check_chip_pairs([((), None)] * 8)
 
 
+@pytest.mark.parametrize(
+    ("ag_pairs", "pieces", "suffix"),
+    [(0, 0, ""), (96, 96, "-pairs_160-pieces_160"), (16, 0, "-pairs_16")],
+)
+def test_row_gathered_kernel_takes_chip_pairs_and_pieces(
+    monkeypatch, ag_pairs, pieces, suffix
+):
+    from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel_rg
+
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    monkeypatch.setattr(kernel_impl, "_vmem_fraction", lambda: 1.0)
+    m, h = 160, GLM52_TP16["h"]
+    shapes = _shapes(m, h, 16, 2048, 128, score_experts=256)
+    x, scores, bias, *weights = (jnp.zeros(s.shape, s.dtype) for s in shapes)
+    run = jax.jit(
+        lambda *a: kernel_rg.moe_tp_decode_rg(
+            *a,
+            routed_scale=ROUTED_SCALE,
+            topk=8,
+            n_ranks=N_RANKS,
+            l1=True,
+            l1_tail=True,
+            ag_pairs=ag_pairs,
+            exchange_pieces=pieces,
+        )
+    )
+    text = str(jax.make_jaxpr(run)(x, scores, bias, m, 3, *weights, 48))
+    served = kernel_rg.kernel_name(16, m, h, 2048, 128, N_RANKS, 256, 32, None)
+    assert f"{served}{suffix}-l1-tail" in text
+    assert ("-pairs_" in text) == bool(ag_pairs)
+    assert ("-pieces_" in text) == bool(pieces)
+
+
 def test_selftest_inputs_have_exact_sums_that_expose_a_wrong_chunk(monkeypatch):
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
     spec = all_reduce.make_spec(N_RANKS, 16, GLM52_TP16["h"])
