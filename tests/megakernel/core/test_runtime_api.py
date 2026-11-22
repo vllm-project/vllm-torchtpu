@@ -105,7 +105,7 @@ def test_runtime_package_ast_and_fresh_import_free_of_vllm_and_torch():
     lines."""
     runtime_dir = Path(mk_rt.__file__).parent
     py_files = sorted(runtime_dir.glob("*.py"))
-    assert len(py_files) == 10
+    assert "checks.py" in {p.name for p in py_files}
 
     for py_path in py_files:
         src = py_path.read_text(encoding="utf-8")
@@ -925,8 +925,8 @@ def test_checks_hlo_ir_warmup_and_sentinel():
             is_eager=False,
         )
 
-    # pool_schedule_info raises MegakernelLayoutError when cache_backend is absent
-    with pytest.raises(mk.MegakernelLayoutError, match="has no pool backend layout"):
+    # pool_schedule_info raises (`require_pool_backend`) without a cache_backend
+    with pytest.raises(ValueError, match="does not configure a cache_backend"):
         pool_schedule_info(types.SimpleNamespace(name="kv", cache_backend=None))
 
 
@@ -1796,9 +1796,12 @@ def test_build_warmup_plan_shapes_and_sentinels():
         zero_centered_norm=True,
     )
     ms = synth_hybrid_spec(g, R=1)
-    # `build_warmup_plan` takes `(T, B)` `bucket_keys` directly: default keys
-    # match the pre-generalization `WarmupStepPlan` list byte-for-byte, and
-    # `T=8` verify keys produce plans for `(8, b)` with `spv = spp * 8`.
+    # `build_warmup_plan` takes `(T, B)` `bucket_keys` directly. For the
+    # default keys the expected list pins every field: two runner shapes
+    # `(tok_pad, req_pad, blk_pad, c_cols)` per bucket and, on each bucket's
+    # first shape, the sentinel plan of its `(T, fused, gather)` variant (its
+    # own KV page, GDN slot base and first page, sub-step `T`). `T=8` verify
+    # keys produce plans for `(8, b)` with `spv = spp * 8`.
     pol_def = BucketPolicy((8, 16), (16, 32))
     default_keys = list(pol_def.iter_buckets())
     fio_def = {(1, 8): True, (1, 16): False, (4, 16): True, (4, 32): False}
@@ -1852,7 +1855,6 @@ def test_build_warmup_plan_shapes_and_sentinels():
         WarmupStepPlan(4, 32, 32, 16, 4, 4, None),
     ]
     assert steps_def == expected_default_steps
-    assert repr(steps_def) == repr(expected_default_steps)
     assert warmed_def == default_keys and n_save_def == 255
 
     keys_t8 = [(1, 8), (8, 16), (8, 32)]

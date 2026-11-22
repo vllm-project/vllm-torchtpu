@@ -27,7 +27,7 @@ from jax.sharding import NamedSharding
 
 from .. import cache
 from ..cache_common import require_pool_backend
-from ..errors import MegakernelConfigError, MegakernelLayoutError
+from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec
 from ..spec import ModelSpec
 from .constants import MTP_VERIFY_TOKENS
@@ -49,11 +49,7 @@ class PoolScheduleInfo:
 
 def pool_schedule_info(spec: ModelSpec) -> PoolScheduleInfo:
     """Extract `PoolScheduleInfo` from `spec.cache_backend`."""
-    pb = spec.cache_backend
-    if pb is None:
-        raise MegakernelLayoutError(
-            f"MegakernelDriver: ModelSpec {spec.name!r} has no pool backend layout"
-        )
+    pb = require_pool_backend(spec)
     lay = pb.layout
     rec, npools = pb.recurrent_slots_per_pool, pb.num_pools
     pps, spp = lay.pages_per_slot, lay.slots_per_pool
@@ -62,12 +58,12 @@ def pool_schedule_info(spec: ModelSpec) -> PoolScheduleInfo:
     return PoolScheduleInfo(npools, rec, spp + 1, pps, spp, lay.rec_pages_per_slot)
 
 
-def check_compile_hlo_mesh(mesh: Any, compile_hlo_check: bool) -> None:
+def check_compile_hlo_mesh(mesh: jax.sharding.Mesh, compile_hlo_check: bool) -> None:
     """Fail at config time if `compile_hlo_check=1` cannot work on `mesh`."""
     if not compile_hlo_check:
         return
-    devs = getattr(mesh, "devices", None)
-    first = devs.flat[0] if devs is not None and devs.size > 0 else None
+    devs = mesh.devices
+    first = devs.flat[0] if devs.size > 0 else None
     if not isinstance(first, jax.Device):
         raise MegakernelConfigError(
             "MegakernelDriver: compile_hlo_check=1 requires a mesh of real "
@@ -98,7 +94,7 @@ def build_global_avals(
     """Construct global `jax.ShapeDtypeStruct` descriptors for HLO lowering/export."""
     r_cnt, g = mesh.devices.size, spec.config
     k_ckpt = ckpt_cols if ckpt_cols is not None else ex.T
-    g_per_att = max(1, pool_schedule_info(spec).recurrent_slots_per_pool)
+    g_per_att = pool_schedule_info(spec).recurrent_slots_per_pool
     sds = [
         _Sds((r_cnt * int(t.shape[0]), *t.shape[1:]), _any_dtype_to_jax(t.dtype))
         for t in (*w_flat, *raw_pools)
