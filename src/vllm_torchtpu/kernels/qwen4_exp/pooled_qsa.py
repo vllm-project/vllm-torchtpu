@@ -2070,6 +2070,8 @@ def shared_blocks(shared, lengths, compress_ratio, token_topk):
     the other layer did not cover falls back to group 0.
     """
     block_topk = token_topk // compress_ratio
+    # Only the block-start columns are read: the whole-step export (VLLM_TPU_MK_WHOLE_
+    # EXPORT_SELECTION) writes no partial-group tokens (`export_selection`).
     groups = shared[:, :token_topk:compress_ratio]
     groups = jnp.where(groups >= 0, groups // compress_ratio, 0).astype(jnp.int32)
     visible = visible_blocks(lengths, compress_ratio, block_topk)

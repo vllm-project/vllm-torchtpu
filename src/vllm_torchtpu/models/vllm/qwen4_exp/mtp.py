@@ -365,6 +365,12 @@ class Qwen4ExpMTP(nn.Module):
         # bucket can pin that bucket's trace (compilation/shape_variants.py).
         if vllm_torchtpu_envs.VLLM_TPU_MTP_DRAFT_DECODE_ROWS:
             max_tokens += 1
+        # Invariant: the sink's (and `_selection_rows`') only reader is the shared ops'
+        # `pooled_qsa.shared_blocks`, which reads the group of block j from column
+        # `j * ratio` alone. The whole-step export (VLLM_TPU_MK_WHOLE_EXPORT_SELECTION,
+        # `qwen38_wholestep_inputs.export_selection`) relies on it and leaves the
+        # partial group's token columns -1; a new reader of the token columns must take
+        # `export_selection(..., tails=True)` instead.
         sink = torch.full(
             (max_tokens, width), -1, dtype=torch.int32, device=target.rope_cache.device
         )

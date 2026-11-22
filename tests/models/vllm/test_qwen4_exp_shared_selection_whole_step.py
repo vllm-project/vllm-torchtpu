@@ -190,3 +190,17 @@ def test_stock_layer_47_with_mk_step0(bound, monkeypatch, flag):
     _mk_whole_step(sink_layer, draft, 2, export=False)  # MK draft step 0
     want = _selection(2 if flag else 1)[_last_rows()]
     torch.testing.assert_close(attention._selection_rows[:REQS], want, rtol=0, atol=0)
+
+
+def test_sink_reader_is_shared_blocks_only():
+    """The whole-step export leaves the partial group's token columns -1, which is safe
+    only while `shared_blocks` (block-start columns) is the one reader of `shared`."""
+    import re
+
+    from vllm_torchtpu.kernels.qwen4_exp import pooled_qsa
+
+    src = inspect.getsource(pooled_qsa)
+    reads = [m.group(0) for m in re.finditer(r"[^\n]*\bshared\[[^\n]*", src)]
+    assert reads == ["    groups = shared[:, :token_topk:compress_ratio]"], reads
+    uses = re.findall(r"\w+\(shared\b", src)
+    assert set(uses) <= {"shared_blocks(shared"}, uses
