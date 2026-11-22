@@ -632,7 +632,8 @@ def _tiles(cu_q_lens: jax.Array, seq_in_class: jax.Array, block_q: int, max_tile
 class ClassScores(NamedTuple):
     """One tile class's scores (`_class_scores`) and where its rows sit."""
 
-    scores: jax.Array  # [P, tiles * Bq], or [tiles * Bq, P] if token-major
+    # [P, tiles * Bq]; [tiles * Bq, P] if token-major; [tiles, P, Bq] if tile-major
+    scores: jax.Array
     col: jax.Array  # [T] each query row's column
     tile_seq: jax.Array  # [tiles] request of each tile
     tile_row0: jax.Array  # [tiles] query row of each tile's first column
@@ -655,13 +656,16 @@ def _class_scores(
     kernel,
     interpret,
     token_major=False,
+    tile_major=False,
     scale_cache=None,
     scale_row=None,
     q_pad=None,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token (`ClassScores`); `token_major` (kernel v3) returns
-    them as ``[tiles * block_q, P]`` instead, so a token's scores are one row.
+    them as ``[tiles * block_q, P]`` instead, so a token's scores are one row,
+    and `tile_major` (kernel v3) as ``[tiles, P, block_q]``, so a tile's
+    scores are contiguous.
     The query rows are padded by ``q_pad >= block_q`` rows (default
     `block_q`): classes sharing it share one padded copy."""
     num_tokens, _, head_dim = index_q.shape
@@ -768,6 +772,16 @@ def _class_scores(
         out_specs = pl.BlockSpec(
             (block_q, pages_per_step),
             lambda w, work, *_: (work[w] >> _TILE_SHIFT, work[w] & _GROUP_MASK),
+        )
+    elif tile_major:
+        if kernel != "v3":
+            raise NotImplementedError(f"tile-major scores need kernel v3, got {kernel}")
+        out_shape = jax.ShapeDtypeStruct(
+            (max_tiles, padded_pages, block_q), jnp.float32
+        )
+        out_specs = pl.BlockSpec(
+            (None, pages_per_step, block_q),
+            lambda w, work, *_: (work[w] >> _TILE_SHIFT, work[w] & _GROUP_MASK, 0),
         )
     params = pltpu.CompilerParams(
         dimension_semantics=("arbitrary",), disable_bounds_checks=kernel == "v3"
@@ -974,6 +988,10 @@ def class_plan(
         + 1,
         pages_per_step=pages_per_step,
         kernel=large_kernel,
+        # A tile's scores contiguous: its picks read one run, where the
+        # transposed [P, tiles * block_q] layout's block was P runs of one
+        # tile row (2 KB each), DMA-bound (c64 mixed candidates bench).
+        tile_major=large_kernel == "v3",
     )
     pages_per_seq = block_tables.shape[0] // max_num_seqs
     return _ClassPlan(
@@ -1106,6 +1124,8 @@ def block_scores(
     def with_large():
         large_scored = plan.large()
         large = large_scored.scores
+        if large.ndim == 3:  # tile-major
+            large = large.transpose(1, 0, 2).reshape(large.shape[1], -1)
         large_col = columns(large_scored, plan.large_block_q, large.shape[1])
         small_t = small.T if token_major else small
         seq = jnp.minimum(

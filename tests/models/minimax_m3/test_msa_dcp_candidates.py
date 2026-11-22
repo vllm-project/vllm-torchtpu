@@ -50,7 +50,7 @@ def _reference(scores, pos, rank, dcp, init_blocks, local_blocks):
     return out_s, out_b
 
 
-@pytest.mark.parametrize("pretransposed", [False, True])
+@pytest.mark.parametrize("layout", ["token", "transposed", "tile"])
 @pytest.mark.parametrize(
     "num_tokens,num_cols,dcp,rank,max_pos,init_blocks,local_blocks",
     [
@@ -73,15 +73,37 @@ def test_candidates_match_reference(
     max_pos,
     init_blocks,
     local_blocks,
-    pretransposed,
+    layout,
 ):
     rng = np.random.default_rng(num_tokens + num_cols)
     # Few distinct values so ties are common.
     scores = rng.integers(0, 6, (num_tokens, num_cols)).astype(np.float32)
     pos = np.sort(rng.integers(0, max_pos, num_tokens)).astype(np.int32)
+    got_s, got_b = _pick(scores, pos, layout, rank, dcp, init_blocks, local_blocks)
+    want_s, want_b = _reference(scores, pos, rank, dcp, init_blocks, local_blocks)
+    if rank % 2:  # odd ranks list their picks in reverse
+        want_s, want_b = want_s[:, ::-1], want_b[:, ::-1]
+    np.testing.assert_array_equal(np.asarray(got_b), want_b)
+    np.testing.assert_array_equal(np.asarray(got_s), want_s)
+
+
+def _pick(scores, pos, layout, rank, dcp, init_blocks, local_blocks):
+    """`local_candidates` of ``scores [T, P]`` given as ``[T, 1, P]``, as the
+    large tile class's transposed ``[P, T]`` or as its tile-major ``[tiles,
+    P, 128]``."""
+    num_tokens = scores.shape[0]
+    tile_major = layout == "tile"
+    if layout == "token":
+        s = jnp.asarray(scores)[:, None, :]
+    elif layout == "transposed":
+        s = jnp.asarray(scores).T
+    else:
+        pad = -num_tokens % 128
+        padded = np.pad(scores, ((0, pad), (0, 0)))
+        s = jnp.asarray(padded.reshape(-1, 128, scores.shape[1]).transpose(0, 2, 1))
+        pos = np.pad(pos, (0, pad), mode="edge")
     got_s, got_b = local_candidates(
-        # [P, T] as the large tile class scores, or [T, 1, P]
-        jnp.asarray(scores).T if pretransposed else jnp.asarray(scores)[:, None, :],
+        s,
         jnp.asarray(pos),
         block_size=BLOCK,
         topk=TOPK,
@@ -89,13 +111,10 @@ def test_candidates_match_reference(
         local_blocks=local_blocks,
         rank=rank,
         dcp=dcp,
+        tile_major=tile_major,
         interpret=True,
     )
-    want_s, want_b = _reference(scores, pos, rank, dcp, init_blocks, local_blocks)
-    if rank % 2:  # odd ranks list their picks in reverse
-        want_s, want_b = want_s[:, ::-1], want_b[:, ::-1]
-    np.testing.assert_array_equal(np.asarray(got_b), want_b)
-    np.testing.assert_array_equal(np.asarray(got_s), want_s)
+    return got_s[:num_tokens], got_b[:num_tokens]
 
 
 def _kept_scores(scores, num_cols):
@@ -108,9 +127,9 @@ def _kept_scores(scores, num_cols):
     return np.where(code < 0, code ^ 0x7FFFFFFF, code).astype(np.int32).view(np.float32)
 
 
-@pytest.mark.parametrize("pretransposed", [False, True])
+@pytest.mark.parametrize("layout", ["token", "transposed", "tile"])
 @pytest.mark.parametrize("num_tokens,num_cols,rank", [(8, 1024, 0), (300, 520, 1)])
-def test_candidates_order_kept_scores(num_tokens, num_cols, rank, pretransposed):
+def test_candidates_order_kept_scores(num_tokens, num_cols, rank, layout):
     """Real-valued scores with near-ties below the kept precision: the picks
     are the reference's on the kept scores (ties to the lower block), and
     return those scores."""
@@ -119,17 +138,7 @@ def test_candidates_order_kept_scores(num_tokens, num_cols, rank, pretransposed)
     # Neighbours that differ only in bits the keys drop.
     base[:, 1::2] = np.nextafter(base[:, ::2][:, : num_cols // 2], np.inf)
     pos = np.full((num_tokens,), 2 * 128 * num_cols - 1, np.int32)
-    got_s, got_b = local_candidates(
-        jnp.asarray(base).T if pretransposed else jnp.asarray(base)[:, None, :],
-        jnp.asarray(pos),
-        block_size=BLOCK,
-        topk=TOPK,
-        init_blocks=0,
-        local_blocks=1,
-        rank=rank,
-        dcp=2,
-        interpret=True,
-    )
+    got_s, got_b = _pick(base, pos, layout, rank, 2, 0, 1)
     kept = _kept_scores(base, num_cols)
     want_s, want_b = _reference(kept, pos, rank, 2, 0, 1)
     if rank % 2:

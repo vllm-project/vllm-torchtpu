@@ -364,6 +364,7 @@ _TRANSPOSED_ROWS = 128
         "local_blocks",
         "dcp",
         "block_rows",
+        "tile_major",
         "interpret",
     ),
 )
@@ -379,6 +380,7 @@ def local_candidates(
     dcp: int,
     block_rows: int = msa_select.DEFAULT_BLOCK_ROWS,
     live_rows: jax.Array | None = None,
+    tile_major: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """This rank's top-k ``(scores [T, topk] f32, blocks [T, topk] i32)``,
@@ -390,12 +392,16 @@ def local_candidates(
     ``[0, live_rows)`` are picked; the other rows' results are unset.
 
     ``scores [T, 1, P]`` are this rank's block scores (column ``c`` is global
-    block ``c * dcp + rank``), or ``[P, T]`` transposed (the large tiles'
-    layout in `msa_indexer`); forced blocks carry `msa_select`'s forced
+    block ``c * dcp + rank``), ``[P, T]`` transposed, or with `tile_major`
+    ``[tiles, P, rows]`` (the large tiles' layout in `msa_indexer`, a row
+    block per tile); forced blocks carry `msa_select`'s forced
     scores and missing picks are ``(-inf, -1)``.
     """
-    pretransposed = scores.ndim == 2
-    if pretransposed:
+    pretransposed = tile_major or scores.ndim == 2
+    if tile_major:
+        num_tiles, num_cols, block_rows = scores.shape
+        num_tokens = num_tiles * block_rows
+    elif pretransposed:
         num_cols, num_tokens = scores.shape
     else:
         num_tokens, num_heads, num_cols = scores.shape
@@ -406,7 +412,8 @@ def local_candidates(
     # A decode batch fills one block of its own (sublane-rounded) size, not
     # `block_rows` rows mostly of padding: the kernel's topk passes scan every
     # row of the block.
-    block_rows = min(block_rows, max(8, -(-num_tokens // 8) * 8))
+    if not tile_major:
+        block_rows = min(block_rows, max(8, -(-num_tokens // 8) * 8))
     # 128-row transposed blocks (rows on the lanes) where they pad less, and for
     # a batch of at most 128 rows (decode; 2 x 128 for 184 rows was slower in
     # the c48 twin, `_DECODE_CANDIDATE_TOKENS`): they pick with
@@ -417,7 +424,8 @@ def local_candidates(
     # the size it was planned for (below).
     rows_128 = -(-num_tokens // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS
     if (
-        live_rows is None
+        not tile_major
+        and live_rows is None
         and num_tokens <= _DECODE_CANDIDATE_TOKENS
         and (
             num_tokens <= _TRANSPOSED_ROWS
@@ -453,11 +461,8 @@ def local_candidates(
         )
         if num_cols % chunk:
             col_pad = -num_cols % chunk
-            s = jnp.pad(
-                s,
-                ((0, col_pad), (0, 0)) if pretransposed else ((0, 0), (0, col_pad)),
-                constant_values=_NEG_INF,
-            )
+            widths = [(0, col_pad), (0, 0)] if pretransposed else [(0, 0), (0, col_pad)]
+            s = jnp.pad(s, [(0, 0)] * (s.ndim - 2) + widths, constant_values=_NEG_INF)
             num_cols += col_pad
         pos_spec = pl.BlockSpec((1, block_rows), lambda i: (0, i))
         p = p.T
@@ -487,7 +492,9 @@ def local_candidates(
         in_specs=[
             pl.BlockSpec(memory_space=pltpu.SMEM),
             (
-                pl.BlockSpec((num_cols, block_rows), lambda i: (0, i))
+                pl.BlockSpec((None, num_cols, block_rows), lambda i: (i, 0, 0))
+                if tile_major
+                else pl.BlockSpec((num_cols, block_rows), lambda i: (0, i))
                 if pretransposed
                 else pl.BlockSpec((block_rows, num_cols), lambda i: (i, 0))
             ),
@@ -733,6 +740,7 @@ def _class_candidates(
             scored.scores if transposed else scored.scores[:, None, :],
             col_pos,
             live_rows=scored.num_tiles * block_q,
+            tile_major=scored.scores.ndim == 3,
         )
         picks.append(pack_candidates(s, b))
         # Each head's and token's column in this class (`_class_scores`).
