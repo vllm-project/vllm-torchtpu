@@ -46,7 +46,7 @@ from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.quantization.fp8_lm_head import Fp8LMHeadMethod
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.minimax_m3 import sp_o_proj
+from vllm_torchtpu.models.minimax_m3 import residual_ar, sp_o_proj
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse, sp_norm
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
@@ -133,6 +133,30 @@ class MiniMaxM3DecoderLayer(nn.Module):
             return ffn(hidden_states), residual
         with self._layer_owned_reductions():
             return self._attn_rs(positions, hidden_states, residual)
+
+    def forward_residual_ar(
+        self,
+        positions: torch.Tensor,
+        partial: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The layer once `residual_ar.arm` armed it: ``partial`` is the
+        previous layer's FFN output before its TP all-reduce (the embedding,
+        with ``residual`` None, for the first layer). Returns this layer's FFN
+        partial, the residual, and the reduced residual-stream entry
+        (``x + residual`` of the layer's input)."""
+        op_a, op_b = self._residual_ar_ops
+        w_qkv, s_qkv, nw_in, w_o, s_o, nw_post = residual_ar.residual_ar_operands(self)
+        attn = self.self_attn
+        if residual is None:
+            entry = partial
+            qkv, _ = attn.qkv_proj(self.input_layernorm(partial))
+        else:
+            qkv, entry = op_a(partial, residual, nw_in, w_qkv, s_qkv, self._mesh_rank)
+        heads = attn(positions, None, project=False, qkv=qkv)
+        normed, residual = op_b(heads, w_o, s_o, entry, nw_post, self._mesh_rank)
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        return ffn(normed), residual, entry
 
     def _attn_rs(
         self,
@@ -411,6 +435,8 @@ class MiniMaxM3Model(nn.Module):
         # residual added, before the next norm) are also returned; set by
         # the DSpark drafter before the first trace.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+        # Set by residual_ar.arm: layers fuse their TP all-reduces.
+        self.residual_ar_armed = False
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -445,6 +471,18 @@ class MiniMaxM3Model(nn.Module):
             if len(self.layers) in self.aux_hidden_state_layers:
                 aux_hidden_states.append(tensor_model_parallel_all_gather(shard, 0))
             hidden_states = tensor_model_parallel_all_gather(self.norm(shard), 0)
+        elif self.residual_ar_armed and not sp_step:
+            partial, residual = inputs_embeds, None
+            for idx, layer in enumerate(self.layers):
+                partial, residual, entry = layer.forward_residual_ar(
+                    positions, partial, residual
+                )
+                if idx > 0 and idx in self.aux_hidden_state_layers:
+                    aux_hidden_states.append(entry)
+            hidden_states = tensor_model_parallel_all_reduce(partial)
+            if len(self.layers) in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states + residual)
+            hidden_states, _ = self.norm(hidden_states, residual)
         else:
             hidden_states, residual = inputs_embeds, None
             for idx, layer in enumerate(self.layers):

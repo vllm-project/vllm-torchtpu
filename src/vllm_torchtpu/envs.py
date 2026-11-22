@@ -79,6 +79,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_FP8_GATHER: bool = False
     TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER: bool = False
     TPU_MINIMAX_M3_SP_FUSED_NORM: bool = False
+    TPU_MINIMAX_M3_FUSED_RESIDUAL_AR: int = 0
+    TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_E4M3: bool = False
     TPU_MINIMAX_M3_SP_E4M3_QKV: bool = False
     TPU_MINIMAX_M3_SP_A2A_OPROJ: str = "off"
     TPU_MINIMAX_M3_SP_A2A_E4M3: bool = False
@@ -782,6 +784,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (models/minimax_m3/kernels/sp_norm.py) instead of three XLA fusions.
     "TPU_MINIMAX_M3_SP_FUSED_NORM": env_bool(
         "TPU_MINIMAX_M3_SP_FUSED_NORM", default=False
+    ),
+    # Decode-sized steps (up to this many rows; 0 off) run each decoder
+    # layer's two TP all-reduces fused with their neighbours, one Pallas call
+    # each (models/minimax_m3/residual_ar.py): o_proj + all-reduce + residual
+    # add + norm, and FFN all-reduce + the next layer's add + norm.
+    # Needs the Pallas all-reduce armed (TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES);
+    # refused when a decode MoE kernel that reduces its own output is armed
+    # (USE_MOE_TP_DECODE_KERNEL, FUSED_MOE_DECODE_KERNEL on fp8 experts).
+    # Sequence-parallel steps keep their own path.
+    "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR": env_int(
+        "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR", 0
+    ),
+    # With it, qkv_proj (and o_proj above the fused calls' rows) contract e4m3
+    # rows (per-row amax / 448 scales) against the e4m3 weights (e4m3 x e4m3)
+    # instead of converting the weight to bf16 inside the dot's fusion.
+    "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_E4M3": env_bool(
+        "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_E4M3", default=False
     ),
     # "full" SP with the e4m3 gathers: qkv_proj, a dense layer's MLP gate_up
     # and a model-side shared expert (TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS)

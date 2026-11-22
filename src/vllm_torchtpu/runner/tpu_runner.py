@@ -6246,6 +6246,10 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.distributed import pallas_all_reduce
 
             pallas_all_reduce.arm(self.model_config.get_hidden_size(), self.device)
+        if envs.TPU_MINIMAX_M3_FUSED_RESIDUAL_AR > 0:
+            from vllm_torchtpu.models.minimax_m3 import residual_ar
+
+            residual_ar.arm(self.model, envs.TPU_MINIMAX_M3_FUSED_RESIDUAL_AR)
         if envs.TPU_DRAFT_DCP_PAIR_MERGE and self._is_async_drafter:
             from vllm_torchtpu.layers.adapter.cp_draft_attention import (
                 arm_pair_merge,

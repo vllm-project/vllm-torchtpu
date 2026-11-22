@@ -442,17 +442,19 @@ class MiniMaxM3SparseAttention(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list | None,
         project: bool = True,
+        qkv: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``hidden_states`` may come as e4m3 rows with per-row f32 scales
         (an SP step's e4m3 all-gather), which qkv_proj contracts as e4m3, or
         as a list of such all-gathered row pieces (model.py `_ffn_pieces`).
-        ``project=False`` returns this rank's heads before o_proj."""
-        if isinstance(hidden_states, list):
+        ``project=False`` returns this rank's heads before o_proj. ``qkv``
+        (with hidden_states None) is qkv_proj's output, already computed."""
+        if qkv is None and isinstance(hidden_states, list):
             # An SP step's gathered row pieces: project each as it lands.
             qkv = _step_rows([self._qkv(p) for p in hidden_states])
-        else:
+        elif qkv is None:
             qkv = self._qkv(hidden_states)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
