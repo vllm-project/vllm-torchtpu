@@ -1075,7 +1075,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # probabilities into the PV dot; bit-identical on v7x, where Mosaic
     # already runs the FP32 dot as one BF16 pass); "2" = "1" + qkfirst (the
     # next query subtile's QK issued before this one's softmax and PV;
-    # bit-identical; -5% kernel on TP8 512-row blocks, no-op on 256-row).
+    # bit-identical; -5% kernel on TP8 512-row blocks, no-op on 256-row, and
+    # on blocks the bound stabilizer runs as one unit).
     # Precedence: VLLM_TPU_QSA_PREFILL_UNION_WALK replaces the block-sparse
     # kernel where it applies; this flag acts on every remaining call (DCP,
     # kv_head_offset layers, short contexts, small steps, the union walk's

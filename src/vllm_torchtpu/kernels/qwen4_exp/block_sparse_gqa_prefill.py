@@ -97,6 +97,10 @@ BOUND_STAB_MARGIN = 1.1
 BOUND_STAB_SHIFT = 60.0
 BOUND_STAB_GUARD = -55.0  # rerun when lse - stabilizer < this (log mass)
 BOUND_STAB_GUARD_HIGH = 65.0  # rerun when lse - stabilizer > this (bound violated)
+# VPU path with the bound stabilizer, one KV head: a query block whose unit
+# (tokens x query heads, by KV tile) holds at most this many scores runs as
+# one unit per KV tile (TP8: 512 x 3 x 1024, 6 MiB of FP32 scores).
+BOUND_UNIT_SCORES = 1536 * 1024
 
 
 def bound_stab_enabled(env_value: str, config_value) -> bool:
@@ -1604,7 +1608,9 @@ def _block_sparse_gqa_prefill(
     ``kv_head_offset`` skips that many KV heads of each cache row: a paired
     main KV page stores a second layer's head after the first layer's.
     ``query_tile`` is the query subtile that shares one decoded KV tile; it
-    defaults to ``default_query_tile``.
+    defaults to ``default_query_tile``. The VPU path with the bound
+    stabilizer replaces it with the whole query block when the unit fits
+    BOUND_UNIT_SCORES.
     """
     tokens, query_heads, head_dim = query.shape
     pages, physical_page_size, head_axis, packing, cache_dim = cache.shape
@@ -1807,13 +1813,27 @@ def _block_sparse_gqa_prefill(
     # VLLM_TPU_QSA_PREFILL_VPU: the per-segment bits need one 128-key
     # selection word per lane row (ratio 4); BF16 operands need BF16 queries.
     vpu = vpu_features() if ratio * 32 == 128 and bf16_io else ()
+    if (
+        bound_stab
+        and key_norm_bound is not None
+        and vpu
+        and kv_heads == 1
+        and query_block * query_heads * kv_tile <= BOUND_UNIT_SCORES
+    ):
+        # The bound stabilizer leaves no row max or rescale between KV tiles,
+        # so the whole query block is one unit per tile: one QK, softmax and
+        # PV whose rows the scheduler streams through the MXU and VPU
+        # together. Each row's arithmetic is unchanged up to the FP32
+        # summation order Mosaic picks for the taller PV dot.
+        query_tile = query_block
     if query_tile % 16:
         vpu = tuple(name for name in vpu if name == "mask")
     if vpu:
         logger.info_once(
-            "QSA sparse prefill VPU path on: features=%s "
+            "QSA sparse prefill VPU path on: features=%s, query subtile %d "
             "(VLLM_TPU_QSA_PREFILL_VPU=%s)",
             ",".join(vpu),
+            query_tile,
             envs.VLLM_TPU_QSA_PREFILL_VPU,
         )
         live_lengths = jnp.where(lengths > 0, lengths, jnp.iinfo(jnp.int32).max)

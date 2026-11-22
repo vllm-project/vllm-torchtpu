@@ -399,6 +399,35 @@ def test_vpu_path_uses_the_bound(interpret, monkeypatch, vpu):
     )
 
 
+@pytest.mark.parametrize("vpu", ["1", "2"])
+def test_vpu_bound_block_unit_bitwise(interpret, monkeypatch, vpu):
+    """With the bound, a 512-token block of 3 query heads runs as one unit
+    per KV tile (BOUND_UNIT_SCORES): the same per-row arithmetic as two
+    256-token subtiles, bit for bit here (on TPU the taller PV dot may sum
+    its FP32 partials in another order)."""
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_VPU", vpu)
+    query, blocks, lengths, table, cache, starts, bound = make_case(
+        np.random.default_rng(15), [(700, 600), (2047, 424)], 24
+    )
+    bsp.note_key_norm_bound(bound)
+
+    def run():
+        jax.clear_caches()
+        return jax.jit(
+            lambda q, c: bsp.block_sparse_gqa_attention(
+                q, jnp.zeros_like(q), blocks, lengths, table, c, starts, kv_heads=1,
+                ratio=RATIO, k_scale=K_SCALE, v_scale=V_SCALE, query_block=512,
+                kv_tile=PAGE, query_tile=256, return_lse=True,
+            )[:2]
+        )(query, cache)
+
+    whole = run()
+    monkeypatch.setattr(bsp, "BOUND_UNIT_SCORES", 768 * PAGE)
+    split = run()
+    for a, b in zip(whole, split):
+        np.testing.assert_array_equal(bits(a), bits(b))
+
+
 def test_bound_route_on_when_eligible(interpret, monkeypatch):
     monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_VPU", "")
     assert bsp.bound_kernel_eligible(
