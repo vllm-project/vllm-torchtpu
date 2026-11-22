@@ -192,9 +192,8 @@ def derive_moe_params(
         and not ecopy  # `dedup_local` path (no redundant-expert placement)
         and not moe_tp  # EP: ER local experts fit the 128 lanes
         and not dbg.row_mask
-        and 0 < er <= 128
+        and 0 < er <= 128  # (MR = rup(B, 8): the first 8 `hitv` rows always exist)
         and g.TOPK <= 128
-        and ex.MR >= 8  # elist / count rows ride the first 8 `hitv` rows
         and ex.B * g.TOPK < DEDUP_BIG
     )
     rb_lanes = 128
