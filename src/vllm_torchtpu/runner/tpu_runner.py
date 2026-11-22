@@ -895,7 +895,8 @@ class TPUModelRunner(GPUModelRunner):
         # allocated when a request first appears and retained until its KV
         # ownership ends. Keying on req_id (rather than persistent-batch
         # position) makes the mapping immune to condense/swap reordering in
-        # upstream vLLM's InputBatch, which we do not subclass.
+        # the V1 InputBatch (in-tree copy in runner/vllm_v1), which we do not
+        # subclass.
         self._mamba_slot_by_req_id: dict[str, int] = {}
         self._free_mamba_slots: list[int] = []
         # State checkpoints per request under speculative decoding: one per

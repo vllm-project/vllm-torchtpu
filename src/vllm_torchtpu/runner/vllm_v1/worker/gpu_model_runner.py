@@ -22,7 +22,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -83,7 +83,6 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import (
     PIN_MEMORY,
@@ -91,7 +90,6 @@ from vllm.utils.torch_utils import (
     kv_cache_dtype_str_to_dtype,
 )
 from vllm.v1.attention.backend import (
-    AttentionMetadata,
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import (
@@ -105,12 +103,8 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 from vllm.v1.outputs import (
-    AsyncModelRunnerOutput,
     ECConnectorOutput,
     KVConnectorOutput,
-    LogprobsTensors,
-    ModelRunnerOutput,
-    PoolerOutput,
 )
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.sample.logits_processor import build_logitsprocs
@@ -163,101 +157,6 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
-
-
-AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]  # noqa: UP040
-
-
-# list when ubatching is enabled
-PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict  # noqa: UP040
-
-
-def _copy_pooler_output_to_cpu(
-    raw_pooler_output: PoolerOutput, finished_mask: list[bool]
-) -> list[torch.Tensor | None]:
-    num_reqs = len(finished_mask)
-
-    if isinstance(raw_pooler_output, torch.Tensor):
-        if raw_pooler_output.shape[0] != num_reqs:
-            raise ValueError(
-                "Pooler output batch size does not match finished mask size: "
-                f"{raw_pooler_output.shape[0]} != {num_reqs}."
-            )
-
-        num_finished = sum(finished_mask)
-        if num_finished == 0:
-            return [None] * num_reqs
-        if num_finished == num_reqs:
-            return list(raw_pooler_output.to("cpu", non_blocking=True))
-
-        # partial finished
-        finished_indices = [i for i, include in enumerate(finished_mask) if include]
-        index_tensor = torch.tensor(
-            finished_indices, device=raw_pooler_output.device, dtype=torch.long
-        )
-        finished_outputs = raw_pooler_output.index_select(0, index_tensor).to(
-            "cpu", non_blocking=True
-        )
-        partial_pooler_output: list[torch.Tensor | None] = [None] * num_reqs
-        for i, out in zip(finished_indices, finished_outputs):
-            partial_pooler_output[i] = out
-        return partial_pooler_output
-
-    assert isinstance(raw_pooler_output, list)
-    if len(raw_pooler_output) != num_reqs:
-        raise ValueError(
-            "Pooler output batch size does not match finished mask size: "
-            f"{len(raw_pooler_output)} != {num_reqs}."
-        )
-
-    pooler_output: list[torch.Tensor | None] = [None] * num_reqs
-    for i, (out, include) in enumerate(zip(raw_pooler_output, finished_mask)):
-        if include and out is not None:
-            pooler_output[i] = out.to("cpu", non_blocking=True)
-    return pooler_output
-
-
-class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
-    def __init__(
-        self,
-        model_runner_output: ModelRunnerOutput,
-        raw_pooler_output: PoolerOutput,
-        finished_mask: list[bool],
-        async_output_copy_stream: torch.cuda.Stream,
-    ):
-        self._model_runner_output = model_runner_output
-
-        # Event on the copy stream so we can synchronize the non-blocking copy.
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.async_copy_ready_event = torch.cuda.Event(blocking=True)
-
-        # Keep a reference to the device tensors to avoid them being
-        # deallocated until we finish copying it to the host.
-        self._raw_pooler_output = raw_pooler_output
-
-        # Initiate the copy on a separate stream, but do not synchronize it.
-        default_stream = torch.cuda.current_stream()
-        with torch.cuda.stream(async_output_copy_stream):
-            async_output_copy_stream.wait_stream(default_stream)
-            self._model_runner_output.pooler_output = _copy_pooler_output_to_cpu(
-                raw_pooler_output=self._raw_pooler_output,
-                finished_mask=finished_mask,
-            )
-            self.async_copy_ready_event.record()
-
-    def get_output(self) -> ModelRunnerOutput:
-        """Copy the device tensors to the host and return a ModelRunnerOutput.
-        This function blocks until the copy is finished.
-        """
-        self.async_copy_ready_event.synchronize()
-
-        # Release the device tensors once the copy has completed.
-        del self._raw_pooler_output
-        return self._model_runner_output
-
-    def get_kv_connector_output(self) -> KVConnectorOutput | None:
-        """Get the KV connector output for this async output."""
-        return self._model_runner_output.kv_connector_output
 
 
 class ExecuteModelState(NamedTuple):
@@ -813,13 +712,6 @@ class GPUModelRunner(
         """Zero the KV cache memory for the given block IDs."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
-
-    def _get_or_create_async_output_copy_stream(self) -> torch.cuda.Stream:
-        stream = self.async_output_copy_stream
-        if stream is None:
-            stream = torch.cuda.Stream()
-            self.async_output_copy_stream = stream
-        return stream
 
     def _on_request_state_removed(
         self,
@@ -1758,102 +1650,6 @@ class GPUModelRunner(
 
         return tuple(tasks)
 
-    def _pool(
-        self,
-        hidden_states: torch.Tensor,
-        num_scheduled_tokens: int,
-        num_scheduled_tokens_np: np.ndarray,
-        kv_connector_output: KVConnectorOutput | None,
-    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        num_reqs = self.input_batch.num_reqs
-        assert num_reqs == len(self.input_batch.pooling_params), (
-            "Either all or none of the requests in a batch must be pooling request"
-        )
-
-        hidden_states = hidden_states[:num_scheduled_tokens]
-        seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs]
-
-        pooling_metadata = self.input_batch.get_pooling_metadata()
-        pooling_metadata.build_pooling_cursor(
-            num_scheduled_tokens_np,
-            seq_lens_cpu,
-            device=hidden_states.device,
-            query_start_loc_gpu=self.query_start_loc.gpu[: num_reqs + 1],
-        )
-
-        model = cast(VllmModelForPooling, self.model)
-        raw_pooler_output: PoolerOutput = model.pooler(
-            hidden_states=hidden_states, pooling_metadata=pooling_metadata
-        )
-
-        finished_mask = pooling_metadata.get_pooling_cursor().get_finished_mask()
-        raw_pooler_output = self.late_interaction_runner.postprocess_pooler_output(
-            raw_pooler_output=raw_pooler_output,
-            pooling_params=pooling_metadata.pooling_params,
-            req_ids=self.input_batch.req_ids,
-            finished_mask=finished_mask,
-        )
-
-        model_runner_output = ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids.copy(),
-            req_id_to_index=self.input_batch.req_id_to_index.copy(),
-            kv_connector_output=kv_connector_output,
-        )
-
-        if raw_pooler_output is None or not any(finished_mask):
-            self._sync_device()
-            model_runner_output.pooler_output = [None] * num_reqs
-            return model_runner_output
-
-        if not current_platform.is_cuda_alike():
-            # cpu/xpu runners cannot use the CUDA stream/event-based wrapper.
-            model_runner_output.pooler_output = _copy_pooler_output_to_cpu(
-                raw_pooler_output=raw_pooler_output,
-                finished_mask=finished_mask,
-            )
-            self._sync_device()
-            return model_runner_output
-
-        return AsyncGPUPoolingModelRunnerOutput(
-            model_runner_output=model_runner_output,
-            raw_pooler_output=raw_pooler_output,
-            finished_mask=finished_mask,
-            async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
-        )
-
-    def _model_forward(
-        self,
-        input_ids: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        **model_kwargs: dict[str, Any],
-    ) -> Any:
-        """Helper method to call the model forward pass.
-
-        This method can be overridden by subclasses for model execution.
-        Motivation: We can inspect only this method versus
-        the whole execute_model, which has additional logic.
-
-        Args:
-            input_ids: Input token IDs
-            positions: Token positions
-            intermediate_tensors: Tensors from previous pipeline stages
-            inputs_embeds: Input embeddings (alternative to input_ids)
-            **model_kwargs: Additional model arguments
-
-        Returns:
-            Model output tensor
-
-        """
-        return self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-        )
-
     def _get_valid_sampled_token_count(self) -> list[int]:
         # Wait until valid_sampled_tokens_count is copied to cpu,
         prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
@@ -1865,117 +1661,6 @@ class GPUModelRunner(
         assert counts_cpu is not None
         sampled_count_event.synchronize()
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
-
-    def _get_prompt_logprobs_dict(
-        self,
-        hidden_states: torch.Tensor,
-        num_scheduled_tokens: dict[str, int],
-    ) -> dict[str, LogprobsTensors | None]:
-        num_prompt_logprobs_dict = self.num_prompt_logprobs
-        if not num_prompt_logprobs_dict:
-            return {}
-
-        prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
-
-        # Since prompt logprobs are a rare feature, prioritize simple,
-        # maintainable loop over optimal performance.
-        completed_prefill_reqs = []
-        for req_id, num_prompt_logprobs in num_prompt_logprobs_dict.items():
-            num_tokens = num_scheduled_tokens.get(req_id)
-            if num_tokens is None:
-                # This can happen if the request was preempted in prefill stage.
-                continue
-
-            # Get metadata for this request.
-            request = self.requests[req_id]
-            if request.prompt_token_ids is None:
-                # Prompt logprobs is incompatible with prompt embeddings
-                continue
-
-            num_prompt_tokens = len(request.prompt_token_ids)
-            prompt_token_ids = async_tensor_h2d(
-                request.prompt_token_ids, device=self.device
-            )
-
-            # Set up target LogprobsTensors object.
-            logprobs_tensors = request.in_progress_prompt_logprobs_cpu
-            if logprobs_tensors is None:
-                # Create empty logprobs CPU tensors for the entire prompt.
-                # If chunked, we'll copy in slice by slice.
-                logprobs_tensors = LogprobsTensors.empty_cpu(
-                    num_prompt_tokens - 1, num_prompt_logprobs + 1
-                )
-                request.in_progress_prompt_logprobs_cpu = logprobs_tensors
-
-            # Determine number of logits to retrieve.
-            start_idx = request.num_computed_tokens
-            start_tok = start_idx + 1
-            num_remaining_tokens = num_prompt_tokens - start_tok
-            if num_tokens <= num_remaining_tokens:
-                # This is a chunk, more tokens remain.
-                # In the == case, there are no more prompt logprobs to produce
-                # but we want to defer returning them to the next step where we
-                # have new generated tokens to return.
-                num_logits = num_tokens
-            else:
-                # This is the last chunk of prompt tokens to return.
-                num_logits = num_remaining_tokens
-                completed_prefill_reqs.append(req_id)
-                prompt_logprobs_dict[req_id] = logprobs_tensors
-
-            if num_logits <= 0:
-                # This can happen for the final chunk if we prefilled exactly
-                # (num_prompt_tokens - 1) tokens for this request in the prior
-                # step. There are no more prompt logprobs to produce.
-                continue
-
-            # Get the logits corresponding to this req's prompt tokens.
-            # If this is a partial request (i.e. chunked prefill),
-            # then there is prompt logprob generated for each index.
-            req_idx = self.input_batch.req_id_to_index[req_id]
-            offset = self.query_start_loc.np[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
-
-            # Get the "target" tokens for each index. For prompt at index i,
-            # the token at prompt index i+1 is the "sampled" token we want
-            # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
-
-            # Compute prompt scores respecting logprobs_mode.
-            # NOTE: prompt tokens skip sampling processors, so
-            # processed_* and raw_* yield the same scores here.
-            if self.model_config.logprobs_mode in ("raw_logits", "processed_logits"):
-                scores = logits.to(torch.float32)
-            else:
-                scores = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks, *_ = self.sampler.gather_logprobs(
-                scores, num_prompt_logprobs, tgt_token_ids
-            )
-
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
-
-        # Remove requests that have completed prefill from the batch
-        # num_prompt_logprobs_dict.
-        for req_id in completed_prefill_reqs:
-            del num_prompt_logprobs_dict[req_id]
-            self.requests[req_id].in_progress_prompt_logprobs_cpu = None
-
-        # Must synchronize the non-blocking GPU->CPU transfers.
-        if prompt_logprobs_dict:
-            self._sync_device()
-
-        return prompt_logprobs_dict
-
-    _freeze_gc = staticmethod(freeze_gc_for_cudagraph_capture)
 
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that

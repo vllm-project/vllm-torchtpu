@@ -243,10 +243,11 @@ plugins.md007.enabled = false
 
 [tool.pyrefly]
 project-includes = ["src"]
-# Verbatim copies of vLLM v0.33.0 code (see its __init__.py). Upstream owns
-# their typing, and editing them to satisfy pyrefly would break the diff
-# against their source. Code that imports them is still checked. pyrefly
-# keeps its default excludes on top of this list.
+# Copies of vLLM v0.33.0 code (imports adjusted, unused methods trimmed;
+# see vllm_torchtpu.runner.vllm_v1). Upstream owns their typing, and editing
+# them to satisfy pyrefly would break the diff against their source. Code
+# that imports them is still checked. pyrefly keeps its default excludes on
+# top of this list.
 project-excludes = ["src/vllm_torchtpu/runner/vllm_v1/**"]
 
 # Errors listed in the baseline file do not fail the check; any error not
