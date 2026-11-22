@@ -430,14 +430,17 @@ def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
 _ONE_HOT_MAX_ELEMENTS = 1 << 20
 
 
-def small_lookup(table: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-    """``table[index]`` of a 1-D ``table``, 0 where an index is out of range.
+def small_lookup(
+    table: torch.Tensor, index: torch.Tensor, *, in_range: bool = False
+) -> torch.Tensor:
+    """``table[index]`` of a 1-D ``table``, 0 where an index is out of range
+    (``in_range``: the caller guarantees none is, so an eager lookup is the
+    plain gather).
 
     In a compiled program, and while the [len(index), len(table)] one-hot
     stays small (static shapes decide), as a one-hot masked sum, which XLA
     fuses with its neighbours: on TPU a gather of a few elements is a ~1 us
     program step of its own. Eagerly, or for larger shapes, a gather."""
-    in_range = (index >= 0) & (index < table.shape[0])
     if (
         torch.compiler.is_compiling()
         and index.numel() * table.shape[0] <= _ONE_HOT_MAX_ELEMENTS
@@ -445,5 +448,8 @@ def small_lookup(table: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
         slots = torch.arange(table.shape[0], dtype=index.dtype, device=index.device)
         picked = torch.where(index.unsqueeze(1) == slots, table.unsqueeze(0), 0)
         return picked.sum(dim=1, dtype=table.dtype)
+    if in_range:
+        return table[index]
+    valid = (index >= 0) & (index < table.shape[0])
     gathered = table[index.clamp(0, table.shape[0] - 1)]
-    return torch.where(in_range, gathered, torch.zeros_like(gathered))
+    return torch.where(valid, gathered, torch.zeros_like(gathered))

@@ -310,9 +310,8 @@ def extract_draft_token_ids(
     """Gather the draft tokens the target just verified, from the (post-async-
     substitution) device ``input_ids``.
     """
-    return small_lookup(
-        input_ids, small_lookup(logits_indices, target_logits_indices + 1)
-    )
+    rows = small_lookup(logits_indices, target_logits_indices + 1, in_range=True)
+    return small_lookup(input_ids, rows, in_range=True)
 
 
 def compute_num_rejected(
