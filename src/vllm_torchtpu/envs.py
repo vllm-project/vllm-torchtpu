@@ -169,6 +169,7 @@ if TYPE_CHECKING:
     TPU_DSPARK_MARKOV_KERNEL: bool = True
     TPU_DSPARK_FUSED_MLP: str = "0"
     TPU_DRAFT_DCP_PAIR_MERGE: bool = False
+    TPU_DRAFT_DCP_PAIR_MERGE_BLOCK: bool = False
     TPU_SAMPLER_TOP_P_KERNEL: bool = True
     TPU_FP8_LM_HEAD: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
@@ -1270,6 +1271,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (kernels/collectives/pair_lse_merge.py) instead of cp_lse_ag_out_rs's
     # all-gather + reduce-scatter. Needs the Pallas all-reduce armed.
     "TPU_DRAFT_DCP_PAIR_MERGE": env_bool("TPU_DRAFT_DCP_PAIR_MERGE", default=False),
+    # With the pair merge armed: the draft block's own attention and the final
+    # merge run in the pair exchange kernel
+    # (kernels/collectives/pair_lse_merge.py `exchange_block`) instead of the
+    # XLA block op after it.
+    "TPU_DRAFT_DCP_PAIR_MERGE_BLOCK": env_bool(
+        "TPU_DRAFT_DCP_PAIR_MERGE_BLOCK", default=False
+    ),
     # Token recovery without top-k or draft probabilities (the synthetic
     # verify's sampler) runs on a Pallas kernel holding each row as a dense
     # [vocab / 128, 128] slab (kernels/top_p_sample.py). 0 keeps the XLA path.

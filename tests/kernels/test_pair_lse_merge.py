@@ -27,6 +27,9 @@ import pytest
 N_RANKS = 8
 # (tokens, 2 * heads): the c4 draft decode buckets; 7 rows (not a tile).
 CASES = ((8, 16), (24, 16), (7, 16))
+# exchange_block (rows, 2 * heads): the c4 b1 and b4 draft blocks (8 and 32
+# rows, 1 and 4 requests of 7 rows plus padding).
+BLOCK_CASES = ((8, 16), (32, 16))
 D = 128
 
 
@@ -102,6 +105,77 @@ def _worker():
                 finite=bool(np.isfinite(o).all()),
                 races=bool(getattr(interpret_pallas_call.races, "races_found", False)),
             )
+    # The block's own attention and the final merge folded in
+    # (`exchange_block`) vs the pair merge, cp_draft_attention.attend_block
+    # (uniform blocks of 7) and merge; one request short of the rows.
+    from vllm_torchtpu.layers.adapter.cp_draft_attention import attend_block, merge
+
+    for t, two_h in BLOCK_CASES:
+        heads, q_block = two_h // 2, 7
+        reqs = t // q_block
+        rng = np.random.default_rng(100 + t)
+        out, lse = _inputs(t, two_h, t)
+        out_b = jnp.asarray(out, jnp.bfloat16)
+        q = jnp.asarray(rng.standard_normal((N_RANKS, t, heads, D)), jnp.bfloat16)
+        kv = jnp.asarray(rng.standard_normal((2, N_RANKS, t, 1, D)), jnp.bfloat16)
+        seq_lens = jnp.zeros((N_RANKS, reqs), jnp.int32)
+        for causal in (True, False):
+            block = jax.jit(
+                jax.shard_map(
+                    lambda o,
+                    s,
+                    m,
+                    q_,
+                    kk,
+                    vv,
+                    sl,
+                    c=causal,
+                    qb=q_block: k.exchange_block(
+                        o[0],
+                        s[0],
+                        m[0],
+                        q_[0],
+                        kk[0],
+                        vv[0],
+                        q_block=qb,
+                        valid_rows=sl.shape[1] * qb,
+                        sm_scale=0.125,
+                        causal=c,
+                    )[None],
+                    mesh=mesh,
+                    in_specs=(spec,) * 7,
+                    out_specs=spec,
+                    check_vma=False,
+                )
+            )
+            pltpu.reset_tpu_interpret_mode_state()
+            got = block(out_b, jnp.asarray(lse), meta, q, kv[0], kv[1], seq_lens)
+            got = np.asarray(got, np.float32).reshape(N_RANKS, t, heads, D)
+            rel = 0.0
+            for r in range(N_RANKS):
+                ctx, ctx_lse = k.reference(
+                    [out_b[r & ~1], out_b[r | 1]], [lse[r & ~1], lse[r | 1]], r % 2
+                )
+                ob, lb = attend_block(
+                    q[r],
+                    kv[0, r],
+                    kv[1, r],
+                    seq_lens[r],
+                    None,
+                    max_query_len=q_block,
+                    sm_scale=0.125,
+                    causal=causal,
+                    uniform_blocks=True,
+                )
+                want = np.asarray(merge(ctx.astype(ob.dtype), ctx_lse, ob, lb)[0])
+                want = want.astype(np.float32)
+                err = np.abs(got[r] - want) / np.maximum(np.abs(want), 1e-2)
+                rel = max(rel, float(np.nanmax(err)))
+            result[f"block-{t}-{int(causal)}"] = dict(
+                rel=rel,
+                finite=bool(np.isfinite(got).all()),
+                races=bool(getattr(interpret_pallas_call.races, "races_found", False)),
+            )
     # Fault control: the other block's heads must miss the bar.
     t, two_h = CASES[1]
     out, lse = _inputs(t, two_h, t)
@@ -128,6 +202,15 @@ def on_8_devices():
     lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
     assert proc.returncode == 0 and lines, proc.stdout[-3000:] + proc.stderr[-3000:]
     return json.loads(lines[-1][len("RESULT ") :])
+
+
+@pytest.mark.parametrize("causal", [1, 0])
+@pytest.mark.parametrize("t", [t for t, _ in BLOCK_CASES])
+def test_merge_block_on_8_devices(on_8_devices, t, causal):
+    case = on_8_devices[f"block-{t}-{causal}"]
+    # Within two bf16 roundings of the unfused ops.
+    assert case["rel"] <= 2**-6 and case["finite"], case
+    assert not case["races"], case
 
 
 @pytest.mark.parametrize("name", ["kernel", "xla"])
