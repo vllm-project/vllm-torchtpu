@@ -163,6 +163,7 @@ if TYPE_CHECKING:
     TPU_DFLASH_FUSED_KV_INPUTS: bool = False
     TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS: bool = False
     TPU_SPEC_SYNTHETIC_FUSED_VERIFY: bool = False
+    TPU_SPEC_SYNTHETIC_KEYED_UNIFORMS: bool = False
     TPU_DSPARK_MARKOV_KERNEL: bool = True
     TPU_DSPARK_FUSED_MLP: str = "0"
     TPU_DRAFT_DCP_PAIR_MERGE: bool = False
@@ -1225,6 +1226,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sample_tokens, so each chunk's hidden states stay referenced until then.
     "TPU_SPEC_SYNTHETIC_FUSED_VERIFY": env_bool(
         "TPU_SPEC_SYNTHETIC_FUSED_VERIFY", default=False
+    ),
+    # With the fused verify on row-split rows, make the step's uniforms
+    # from counter-keyed hashes where they are used (the top-p kernel makes
+    # its rows' own) instead of drawing them into HBM in a separate RNG
+    # program (`rejection_sampler.stream_keys`). Other uniforms, same
+    # distribution.
+    "TPU_SPEC_SYNTHETIC_KEYED_UNIFORMS": env_bool(
+        "TPU_SPEC_SYNTHETIC_KEYED_UNIFORMS", default=False
     ),
     # The DSpark greedy Markov chain over a vocab-parallel LM head runs its K
     # steps as one kernel with remote-DMA exchanges

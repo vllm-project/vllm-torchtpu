@@ -21,6 +21,9 @@ from torch_tpu._internal import pallas
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels import top_p_sample as kernel
 
+HASH_MULTS = kernel.HASH_MULTS
+ID_MULT = kernel.ID_MULT
+
 
 def _fake(logits, recover_u, params, draft):
     return torch.empty((kernel.ROWS, 128), dtype=torch.int32, device=logits.device)
@@ -77,7 +80,8 @@ def recover_shards(
     vocab: int,
 ) -> torch.Tensor:
     """`recover` of ``logits [rows, tp, padded shard]`` (vocab id ``s *
-    row_width + w`` at ``[s, w]``) with uniforms of the same layout."""
+    row_width + w`` at ``[s, w]``) with uniforms of the same layout, or
+    int32 ``[rows]`` stream keys the kernel makes them from."""
     rows = logits.shape[0]
     temperatures = temperatures.float().view(rows)
     top_p = torch.ones_like(temperatures) if top_p is None else top_p.float().view(rows)

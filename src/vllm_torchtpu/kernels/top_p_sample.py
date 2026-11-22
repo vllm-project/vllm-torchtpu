@@ -43,6 +43,28 @@ _BIG = 2**31 - 1
 _THRESHOLD_BITS = 30
 
 
+# Counter-based uniforms (`uniform_from_key`): a row's stream key mixed with
+# each vocab id by the lowbias32 integer hash; `rejection_sampler.stream_keys`
+# makes the keys and the same uniforms in torch.
+ID_MULT = -2048144789  # 0x85ebca6b as int32
+HASH_MULTS = (0x7FEB352D, -2073254261)  # 0x846ca68b as int32
+
+
+def hash32(x: jax.Array) -> jax.Array:
+    """lowbias32 on int32 (wrapping multiplies, logical shifts)."""
+    x = x ^ lax.shift_right_logical(x, 16)
+    x = x * jnp.int32(HASH_MULTS[0])
+    x = x ^ lax.shift_right_logical(x, 15)
+    x = x * jnp.int32(HASH_MULTS[1])
+    return x ^ lax.shift_right_logical(x, 16)
+
+
+def uniform_from_key(ids: jax.Array, key) -> jax.Array:
+    """f32 uniforms in [0, 1) on 24-bit steps, one per id of a row's stream."""
+    bits = hash32(ids * jnp.int32(ID_MULT) + key)
+    return lax.shift_right_logical(bits, 8).astype(jnp.float32) * (1.0 / (1 << 24))
+
+
 def _full(x: jax.Array, op) -> jax.Array:
     """Reduce a ``[G, W]`` slab to ``[1, 1]``, the long axis first: it spans
     vregs, which combine elementwise; the short one then reduces one vreg's
@@ -52,8 +74,20 @@ def _full(x: jax.Array, op) -> jax.Array:
 
 
 def _kernel(
-    params_ref, draft_ref, logits_ref, u_ref, out_ref, *, rows, shape, width, vocab
+    params_ref,
+    draft_ref,
+    logits_ref,
+    u_ref,
+    out_ref,
+    *,
+    rows,
+    shape,
+    width,
+    vocab,
+    keyed,
 ):
+    """``u_ref``: the uniforms ``[rows, G, W]`` in VMEM, or with ``keyed``
+    each row's stream key in SMEM (`uniform_from_key` of the vocab ids)."""
     sub = lax.broadcasted_iota(jnp.int32, shape, 0)
     col = lax.broadcasted_iota(jnp.int32, shape, 1)
     ids = sub * width + col
@@ -87,7 +121,8 @@ def _kernel(
         )
         kept = jnp.where(p >= threshold, e, 0.0)
         q = jnp.where(ids == draft, 0.0, kept / _full(kept, jnp.sum))
-        u = jnp.clip(u_ref[r], _TINY, 1.0 - _EPS)
+        u = uniform_from_key(ids, u_ref[r]) if keyed else u_ref[r]
+        u = jnp.clip(u, _TINY, 1.0 - _EPS)
         score = q / (-jnp.log(u) + _TINY)
         if valid is not None:
             score = jnp.where(valid, score, 0.0)  # whatever the padding's u
@@ -112,7 +147,9 @@ def top_p_rows(
     vocab: int | None = None,
 ) -> jax.Array:
     """Token per row of ``logits`` ``[rows, G, W]`` (rows <= 8, W a multiple
-    of 128), sampling with uniforms ``recover_u`` f32 ``[rows, G, W]``. Vocab
+    of 128), sampling with uniforms ``recover_u`` f32 ``[rows, G, W]``, or
+    int32 ``[rows]`` stream keys whose uniforms the kernel makes
+    (`uniform_from_key`; no draw read from HBM). Vocab
     id ``g * row_width + w`` sits at ``[g, w]``: ``row_width`` W (default) for
     a dense ``[vocab / 128, 128]`` slab, or a vocab-parallel shard's width
     for the shards side by side, columns past it padding; ids at or past
@@ -124,6 +161,7 @@ def top_p_rows(
     if lanes % 128 or not supports(rows, groups * lanes):
         raise ValueError(f"top_p_rows does not take logits {logits.shape}")
     width = lanes if row_width is None else row_width
+    keyed = recover_u.ndim == 1
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     return pl.pallas_call(
@@ -133,8 +171,9 @@ def top_p_rows(
             shape=(groups, lanes),
             width=width,
             vocab=groups * width if vocab is None else vocab,
+            keyed=keyed,
         ),
-        in_specs=[smem, smem, vmem, vmem],
+        in_specs=[smem, smem, vmem, smem if keyed else vmem],
         out_specs=vmem,
         out_shape=jax.ShapeDtypeStruct((ROWS, 128), jnp.int32),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=48 << 20),

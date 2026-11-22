@@ -541,7 +541,13 @@ def test_synthetic_sample_split_over_ranks_matches_one_rank(monkeypatch, seed):
         synthetic_sample_rows_and_assemble(
             logits[rank * per_rank : (rank + 1) * per_rank],
             torch.tensor([rank], dtype=torch.int32),
-            recover_draft, accepted, temps, top_k, top_p, recover_u, *tables,
+            recover_draft,
+            accepted,
+            temps,
+            top_k,
+            top_p,
+            recover_u,
+            *tables,
             **layout,
         )
     gathered = torch.cat(blocks)
@@ -551,7 +557,13 @@ def test_synthetic_sample_split_over_ranks_matches_one_rank(monkeypatch, seed):
     output = synthetic_sample_rows_and_assemble(
         logits[:per_rank],
         torch.tensor([0], dtype=torch.int32),
-        recover_draft, accepted, temps, top_k, top_p, recover_u, *tables,
+        recover_draft,
+        accepted,
+        temps,
+        top_k,
+        top_p,
+        recover_u,
+        *tables,
         **layout,
     )
     assert torch.equal(output, expected)
@@ -1356,3 +1368,55 @@ def test_rejection_sampler_greedy_path_ignores_draft_probs(device):
     assert torch.equal(output, expected)
     log.warning_once.assert_called_once()
     assert "ignored" in log.warning_once.call_args.args[0]
+
+
+def test_synthetic_keyed_uniforms_match_their_draw(monkeypatch):
+    """Stream keys in place of the draw (`TPU_SPEC_SYNTHETIC_KEYED_UNIFORMS`)
+    sample and accept exactly as the draw holding the same keyed uniforms:
+    the recovery rows in the row split's layout, the accepts in its last row
+    (the uncompiled bodies, so it runs on the host)."""
+    import vllm.distributed
+
+    from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+        _accept_uniforms,
+        keyed_uniforms,
+        stream_keys,
+        synthetic_sample_rows_and_assemble_body,
+    )
+
+    monkeypatch.setattr(
+        vllm.distributed, "tensor_model_parallel_all_gather", lambda x, dim=0: x
+    )
+    gen = torch.Generator().manual_seed(0)
+    reqs, vocab, k = 4, 200, 3
+    width = synthetic_shard_width(vocab)
+    tokens = reqs * k
+    keys = stream_keys(torch.tensor([5], dtype=torch.int32), reqs + 1, seed=7)
+    ids = torch.arange(width, dtype=torch.int32)
+    drawn = keyed_uniforms(keys[:, None, None], ids[None, None])  # [reqs + 1, 1, W]
+    assert torch.equal(_accept_uniforms(keys, tokens), _accept_uniforms(drawn, tokens))
+    logits = torch.full((reqs, 1, width), float("nan"))
+    logits[:, 0, :vocab] = 3 * torch.randn(reqs, vocab, generator=gen)
+    args = (
+        torch.randint(-1, vocab, (reqs,), generator=gen),
+        torch.randint(0, k + 1, (reqs,), generator=gen),
+        torch.ones(reqs, 1),
+        torch.zeros(reqs, 1, dtype=torch.int32),
+        torch.full((reqs, 1), 0.9),
+    )
+    tables = (
+        torch.randint(0, vocab, (tokens,), generator=gen, dtype=torch.int32),
+        torch.full((reqs,), k, dtype=torch.int32),
+        torch.arange(tokens) // k,
+        (torch.arange(tokens) % k).to(torch.int32),
+        k,
+    )
+    rank = torch.tensor([0], dtype=torch.int32)
+    layout = {"row_width": vocab, "vocab": vocab}
+    want = synthetic_sample_rows_and_assemble_body(
+        logits, rank, *args, drawn, *tables, **layout
+    )
+    got = synthetic_sample_rows_and_assemble_body(
+        logits, rank, *args, keys, *tables, **layout
+    )
+    assert torch.equal(got, want)

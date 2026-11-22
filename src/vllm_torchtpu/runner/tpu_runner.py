@@ -131,6 +131,7 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online
 from vllm_torchtpu.layers.adapter.sample import top_p_sample
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     RejectionSampler,
+    stream_keys,
     synthetic_sample_and_assemble,
     synthetic_sample_and_assemble_body,
     synthetic_sample_rows_and_assemble,
@@ -169,6 +170,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabl
 from vllm_torchtpu.runner import greedy_top_tokens
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.bucket_stats import BucketStats
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -180,7 +182,6 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
 )
-from vllm_torchtpu.runner.bucket_stats import BucketStats
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
@@ -1249,6 +1250,9 @@ class TPUModelRunner(GPUModelRunner):
         # and their `_synthetic_fused_shape`s.
         self._synthetic_fused_warm: set[tuple] = set()
         self._synthetic_fused_shapes: set[tuple[int, int, int]] = set()
+        # Counter state of the keyed uniforms (`TPU_SPEC_SYNTHETIC_KEYED_UNIFORMS`),
+        # advanced by `synthetic_verify_and_sample_keyed` on device.
+        self._synthetic_rng_state: torch.Tensor | None = None
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank, has_kv_transfer_group)
@@ -3450,7 +3454,8 @@ class TPUModelRunner(GPUModelRunner):
         local_padded_total_num_scheduled_tokens = layout_plan.local_padded_num_tokens
         if (bucket_stats := getattr(self, "_bucket_stats", None)) is not None:
             bucket_stats.record(
-                local_padded_total_num_scheduled_tokens, local_total_num_scheduled_tokens
+                local_padded_total_num_scheduled_tokens,
+                local_total_num_scheduled_tokens,
             )
         local_token_slice = layout_plan.token_slice
         if layout_plan.kind is SequenceLayoutKind.ALL:
@@ -5065,13 +5070,38 @@ class TPUModelRunner(GPUModelRunner):
             envs.TPU_SPEC_SYNTHETIC_FUSED_VERIFY
             and self._synthetic_fused_shape(hidden_states, md.draft_token_ids, num_reqs)
             in self._synthetic_fused_shapes
-            and self._draw_synthetic_uniforms(md)
         ):
-            md.synthetic_hidden_states = hidden_states
-            return hidden_states
+            if self._synthetic_keyed(md, num_reqs):
+                # No draw: the fused program makes the uniforms (or the
+                # fallback draws them at sample time).
+                md.synthetic_uniforms = None
+                md.synthetic_hidden_states = hidden_states
+                return hidden_states
+            if self._draw_synthetic_uniforms(md):
+                md.synthetic_hidden_states = hidden_states
+                return hidden_states
         return self._synthetic_logits(
             hidden_states, self._plan_synthetic_verify(md), md
         )
+
+    def _synthetic_keyed(self, md: SpecDecodeMetadata, num_reqs: int) -> bool:
+        """Whether this fused verify takes keyed uniforms
+        (`TPU_SPEC_SYNTHETIC_KEYED_UNIFORMS`): row-split rows, and accepts that
+        would fit the one draw a fallback makes."""
+        assert md.draft_token_ids is not None
+        return (
+            envs.TPU_SPEC_SYNTHETIC_KEYED_UNIFORMS
+            and md.synthetic_row_rank is not None
+            and synthetic_uniforms_fit(md.draft_token_ids.shape[0], num_reqs)
+        )
+
+    def _synthetic_rng(self) -> torch.Tensor:
+        """The keyed uniforms' counter state, int32 ``[1]`` on device."""
+        if self._synthetic_rng_state is None:
+            self._synthetic_rng_state = torch.zeros(1, dtype=torch.int32).to(
+                self.device
+            )
+        return self._synthetic_rng_state
 
     @staticmethod
     def _synthetic_fused_shape(
@@ -5186,6 +5216,7 @@ class TPUModelRunner(GPUModelRunner):
         temperatures, top_k, top_p = self._padded_sampling_params(
             cur_start_idx, cur_end_idx, num_reqs, torch.float32, hidden_states.device
         )
+        keyed = md.synthetic_uniforms is None
         args = (
             hidden_states,
             md.draft_token_ids,
@@ -5195,7 +5226,7 @@ class TPUModelRunner(GPUModelRunner):
             md.target_logits_indices,
             md.bonus_logits_indices,
             md.final_logits_indices,
-            md.synthetic_uniforms,
+            self._synthetic_rng() if keyed else md.synthetic_uniforms,
             self.rejection_sampler.synthetic_conditional_rates,
             temperatures,
             top_k,
@@ -5204,6 +5235,16 @@ class TPUModelRunner(GPUModelRunner):
             self.speculative_config.num_speculative_tokens,
         )
         key = program_key((args, variant))
+        if keyed and key in self._synthetic_fused_warm:
+            tokens, self._synthetic_rng_state = self.synthetic_verify_and_sample_keyed(
+                *args, **variant
+            )
+            return tokens
+        if keyed:
+            drawn = self._draw_synthetic_uniforms(md)
+            assert drawn, "keyed verify admits only accepts that fit one draw"
+            args = args[:8] + (md.synthetic_uniforms,) + args[9:]
+            key = program_key((args, variant))
         if key not in self._synthetic_fused_warm:
             logger.warning_once(
                 "Synthetic fused verify not precompiled for %d hidden rows, "
@@ -5221,6 +5262,58 @@ class TPUModelRunner(GPUModelRunner):
                 logits, md, cur_start_idx, cur_end_idx, None
             )
         return self.synthetic_verify_and_sample(*args, **variant)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def synthetic_verify_and_sample_keyed(
+        self,
+        hidden_states: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        final_logits_indices: torch.Tensor,
+        rng_state: torch.Tensor,
+        synthetic_conditional_rates: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        rank: torch.Tensor | None,
+        max_draft_tokens: int,
+        topk_candidates: int = 0,
+        apply_topk_topp: bool = True,
+        apply_top_k: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`synthetic_verify_and_sample` on the stream keys of counter
+        ``rng_state`` (`rejection_sampler.stream_keys`) instead of a drawn
+        ``uniforms``; returns the tokens and the advanced state."""
+        keys = stream_keys(
+            rng_state,
+            num_draft_tokens.shape[0] + 1,
+            int(self.model_config.seed or 0),
+        )
+        tokens = self._synthetic_verify_and_sample_body(
+            hidden_states,
+            draft_token_ids,
+            num_draft_tokens,
+            segment_ids,
+            group_indices,
+            target_logits_indices,
+            bonus_logits_indices,
+            final_logits_indices,
+            keys,
+            synthetic_conditional_rates,
+            temperatures,
+            top_k,
+            top_p,
+            rank,
+            max_draft_tokens,
+            topk_candidates,
+            apply_topk_topp,
+            apply_top_k,
+        )
+        return tokens, rng_state + 1
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def synthetic_verify_and_sample(
@@ -5248,6 +5341,50 @@ class TPUModelRunner(GPUModelRunner):
         picks (`compute_selected_logits`, or `compute_selected_logit_rows`
         with ``rank``) and `synthetic_sample_and_assemble` (or its row split)
         as one program."""
+        return self._synthetic_verify_and_sample_body(
+            hidden_states,
+            draft_token_ids,
+            num_draft_tokens,
+            segment_ids,
+            group_indices,
+            target_logits_indices,
+            bonus_logits_indices,
+            final_logits_indices,
+            uniforms,
+            synthetic_conditional_rates,
+            temperatures,
+            top_k,
+            top_p,
+            rank,
+            max_draft_tokens,
+            topk_candidates,
+            apply_topk_topp,
+            apply_top_k,
+        )
+
+    def _synthetic_verify_and_sample_body(
+        self,
+        hidden_states: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        final_logits_indices: torch.Tensor,
+        uniforms: torch.Tensor,
+        synthetic_conditional_rates: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        rank: torch.Tensor | None,
+        max_draft_tokens: int,
+        topk_candidates: int,
+        apply_topk_topp: bool,
+        apply_top_k: bool,
+    ) -> torch.Tensor:
+        """The traced body of `synthetic_verify_and_sample` (``uniforms`` the
+        draw, or stream keys on row-split rows)."""
         accepted_count, rows, recover_draft = synthetic_verify_rows_from_uniforms_body(
             draft_token_ids,
             num_draft_tokens,
@@ -7760,6 +7897,14 @@ class TPUModelRunner(GPUModelRunner):
                 out = self.synthetic_verify_and_sample(*args, **full)
             synchronize_tensors(out)
             self._synthetic_fused_warm.add(program_key((args, full)))
+            if envs.TPU_SPEC_SYNTHETIC_KEYED_UNIFORMS and rank is not None:
+                keyed = args[:8] + (self._synthetic_rng(),) + args[9:]
+                with torch.no_grad():
+                    out, self._synthetic_rng_state = (
+                        self.synthetic_verify_and_sample_keyed(*keyed, **full)
+                    )
+                synchronize_tensors(out)
+                self._synthetic_fused_warm.add(program_key((keyed, full)))
         self._synthetic_fused_shapes.add(
             self._synthetic_fused_shape(hidden, draft_token_ids, num_reqs)
         )

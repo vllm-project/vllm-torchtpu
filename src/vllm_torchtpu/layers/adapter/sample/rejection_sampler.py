@@ -862,7 +862,46 @@ def synthetic_uniforms_shape(
     return (num_reqs, vocab + SYNTHETIC_ACCEPT_LANES)
 
 
+# Keyed uniforms (`TPU_SPEC_SYNTHETIC_KEYED_UNIFORMS`): instead of one draw
+# in HBM, a step's uniforms are lowbias32 hashes of (row stream key, index),
+# made where they are used (the top-p kernel makes its rows' own,
+# kernels/top_p_sample.py `uniform_from_key`). The keys come from a counter
+# state the fused verify advances on device, the same on every TP rank.
+_GOLDEN = -1640531527  # 0x9e3779b9 as int32
+_ROW_MULT = 0x632BE5AB
+
+
+def _hash32(x: torch.Tensor) -> torch.Tensor:
+    """`top_p_sample.hash32` in torch int32 ops (wrapping multiplies; the
+    masks make the arithmetic shifts logical)."""
+    m0, m1 = top_p_sample.HASH_MULTS
+    x = x ^ ((x >> 16) & 0xFFFF)
+    x = x * m0
+    x = x ^ ((x >> 15) & 0x1FFFF)
+    x = x * m1
+    return x ^ ((x >> 16) & 0xFFFF)
+
+
+def stream_keys(state: torch.Tensor, num_rows: int, seed: int) -> torch.Tensor:
+    """int32 ``[num_rows]`` stream keys of the step at counter ``state``
+    (int32 ``[1]``): row ``r`` of the draw's layout (the requests' rows,
+    then the accepts' row, `synthetic_uniforms_shape`)."""
+    step = _hash32(state.to(torch.int32) * _GOLDEN + (seed & 0x7FFFFFFF))
+    rows = torch.arange(1, num_rows + 1, dtype=torch.int32, device=state.device)
+    return _hash32(step + rows * _ROW_MULT)
+
+
+def keyed_uniforms(keys: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """`top_p_sample.uniform_from_key`: f32 uniforms of ids ``ids`` in the
+    streams ``keys`` (broadcast)."""
+    bits = _hash32(ids.to(torch.int32) * top_p_sample.ID_MULT + keys.to(torch.int32))
+    return ((bits >> 8) & 0xFFFFFF).to(torch.float32) * (1.0 / (1 << 24))
+
+
 def _accept_uniforms(uniforms: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    if uniforms.dim() == 1:  # stream keys: the accepts' row is the last
+        ids = torch.arange(num_tokens, dtype=torch.int32, device=uniforms.device)
+        return keyed_uniforms(uniforms[-1:], ids)
     if uniforms.dim() == 3:
         # Gather the accept row first: indexing the draw itself lowers to an
         # as_strided copy of all of it (31 us at c48 b37, twin j-3d92658b).
@@ -1078,11 +1117,21 @@ def synthetic_sample_rows_and_assemble_body(
         return x.index_select(0, block)
 
     u_rows = rows(recover_u)
-    if (
+    kernel = (
         topk_candidates == 0
         and not (apply_topk_topp and apply_top_k)
         and top_p_sample.applies_shards(logit_rows, row_width, vocab)
-    ):
+    )
+    if recover_u.dim() == 1 and not kernel:
+        # Stream keys (`stream_keys`) where the kernel cannot make the
+        # uniforms: the rows' uniforms in the draw's layout.
+        ids = torch.arange(tp, dtype=torch.int32, device=u_rows.device)[
+            :, None
+        ] * row_width + torch.arange(
+            logit_rows.shape[-1], dtype=torch.int32, device=u_rows.device
+        )
+        u_rows = keyed_uniforms(u_rows[:, None, None], ids[None])
+    if kernel:
         # The shards as they came: no relayout of the rows into one vocab.
         sampled_rows = top_p_sample.recover_shards(
             logit_rows,

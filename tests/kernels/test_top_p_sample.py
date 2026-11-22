@@ -118,3 +118,64 @@ def test_shards_side_by_side_match_the_dense_slab() -> None:
         vocab=VOCAB,
     )
     np.testing.assert_array_equal(np.asarray(got)[:, 0], np.asarray(want)[:, 0])
+
+
+def test_keyed_uniforms_match_the_torch_hash() -> None:
+    """The kernel's keyed uniforms are bit-for-bit the torch ones the runner
+    makes from the same stream keys (`rejection_sampler.keyed_uniforms`)."""
+    from vllm_torchtpu.kernels.top_p_sample import uniform_from_key
+    from vllm_torchtpu.layers.adapter.sample.rejection_sampler import keyed_uniforms
+
+    rng = np.random.default_rng(0)
+    ids = rng.integers(0, 200_064, size=4096, dtype=np.int32)
+    for key in (0, 1, -7, 2**31 - 1, -(2**31)):
+        want = keyed_uniforms(
+            torch.tensor([key], dtype=torch.int32), torch.from_numpy(ids)
+        )
+        got = uniform_from_key(jnp.asarray(ids), jnp.int32(key))
+        np.testing.assert_array_equal(np.asarray(got), want.numpy())
+        assert want.min() >= 0.0 and want.max() < 1.0
+
+
+def test_stream_keys_give_uniform_independent_rows() -> None:
+    """Each step's rows get distinct streams; their uniforms look uniform."""
+    from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+        keyed_uniforms,
+        stream_keys,
+    )
+
+    k0 = stream_keys(torch.tensor([0], dtype=torch.int32), 9, seed=0)
+    k1 = stream_keys(torch.tensor([1], dtype=torch.int32), 9, seed=0)
+    assert len(set(k0.tolist()) | set(k1.tolist())) == 18
+    u = keyed_uniforms(k0[:, None], torch.arange(200_000, dtype=torch.int32)[None])
+    assert abs(float(u.mean()) - 0.5) < 2e-3
+    hist = torch.histc(u, bins=16, min=0.0, max=1.0) / u.numel()
+    assert float((hist - 1 / 16).abs().max()) < 2e-3
+    assert abs(float(torch.corrcoef(torch.stack([u[0], u[1]]))[0, 1])) < 1e-2
+
+
+def test_keyed_kernel_matches_the_drawn_layout() -> None:
+    """Stream keys in SMEM sample what the same uniforms in the row split's
+    layout do (shard padding and ids past the vocabulary included)."""
+    from vllm_torchtpu.layers.adapter.sample.rejection_sampler import keyed_uniforms
+
+    rows, shards, width, padded = 8, 4, 1500, 1536
+    logits, _, temp, top_p, draft = _case(rows, 4.0, 5)
+    keys = torch.tensor([3, -11, 7, 2**30, -5, 0, 99, 12345], dtype=torch.int32)
+    ids = torch.arange(shards, dtype=torch.int32)[:, None] * width + torch.arange(
+        padded, dtype=torch.int32
+    )
+    u = keyed_uniforms(keys[:, None, None], ids[None])  # [rows, shards, padded]
+    lg = np.full((rows, shards * width), np.nan, np.float32)
+    lg[:, :VOCAB] = logits.float().numpy()
+    side = np.full((rows, shards, padded), np.nan, np.float32)
+    side[:, :, :width] = lg.reshape(rows, shards, width)
+    args = (
+        jnp.asarray(torch.stack([temp, top_p]).numpy()),
+        jnp.asarray(draft.numpy().astype(np.int32)),
+    )
+    common = dict(interpret=True, row_width=width, vocab=VOCAB)
+    side = jnp.asarray(side, jnp.bfloat16)
+    want = top_p_rows(side, jnp.asarray(u.numpy()), *args, **common)
+    got = top_p_rows(side, jnp.asarray(keys.numpy()), *args, **common)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
