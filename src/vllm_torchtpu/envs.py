@@ -200,6 +200,7 @@ if TYPE_CHECKING:
     TPU_GC_POLICY: str = "freeze"
     TPU_GC_COLLECT_EVERY: int = 500
     TPU_GC_TRACE: bool = False
+    VLLM_TPU_PREFIX_KEEP_SWA_TAIL: bool = False
 
 
 def env_with_choices(
@@ -1261,6 +1262,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # engine core (generation, duration, wall-clock ns), to line stalls up
     # with collections in the step records. Independent of TPU_GC_POLICY.
     "TPU_GC_TRACE": env_bool("TPU_GC_TRACE", default=False),
+    # Engine core, SWA bounded replay: keep the sliding-window pages before each
+    # prompt's last block boundary, so the next turn's prefix hit there adopts
+    # them and skips the replay (core/prefix_swa_tail.py).
+    "VLLM_TPU_PREFIX_KEEP_SWA_TAIL": env_bool("VLLM_TPU_PREFIX_KEEP_SWA_TAIL"),
 }
 
 
