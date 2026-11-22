@@ -726,9 +726,7 @@ def _resolved_reshard_controller_address(dp_rank: int) -> str:
 
 
 def _use_raiden_glm_admission() -> bool:
-    return _cached_env_predicate(
-        "glm", lambda: bool(tpu_envs.use_raiden_glm_admission())
-    )
+    return _cached_env_predicate("glm", tpu_envs.use_raiden_glm_admission)
 
 
 def _use_raiden_dsv4_admission() -> bool:
