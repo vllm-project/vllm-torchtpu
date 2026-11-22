@@ -22,6 +22,26 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import utils
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
+
+def get_tpu_info() -> pltpu.TpuInfo:
+    """The local chip's TPU info; TPU7x's when JAX runs without a TPU backend
+    (CPU tests and tracing), so the configs can still be computed. A TPU that
+    JAX does not recognize raises rather than take TPU7x's SMEM and VMEM."""
+    try:
+        return pltpu.get_tpu_info()
+    except ValueError:
+        if jax.default_backend() == "tpu":
+            raise
+        logger.warning_once(
+            "Batched RPA: no TPU backend (JAX backend %s); sizing tiles and "
+            "schedules for TPU7x.",
+            jax.default_backend(),
+        )
+        return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,20 +164,35 @@ class Fp8Operand(enum.StrEnum):
     - ROW: one dynamic scale per row of the operand.
     - SPLIT: ROW, with the rounding residual quantized as a second fp8 half
       stacked under the first along the matmul rows: about bf16 accuracy for
-      twice the LHS rows.
+      twice the LHS rows. DECODE only.
+    - STATIC: a fixed scale: q is cast as is (after q_norm and RoPE it sits
+      well inside the e4m3 range), the softmax weights are cast times
+      `flash_attention.P_SCALE`, which the division by l removes.
+
+    An e5m2 KV cache takes only the DECODE kernel's ROW operands.
     """
 
     OFF = enum.auto()
     ROW = enum.auto()
     SPLIT = enum.auto()
+    STATIC = enum.auto()
+
+
+_FP8_OPERAND_SUFFIX = {
+    Fp8Operand.ROW: "",
+    Fp8Operand.SPLIT: "2",
+    Fp8Operand.STATIC: "s",
+}
 
 
 @dataclasses.dataclass(frozen=True)
 class NativeFp8:
-    """Which DECODE matmuls run natively in the fp8 KV dtype.
+    """Which matmuls of a kernel run natively in the fp8 KV dtype.
 
-    `qk` quantizes q per (token, head) row; `pv` quantizes the softmax weights
-    per row. Every operand OFF (the default) is the dequantizing kernel.
+    `qk` casts q and `pv` the softmax weights to the KV dtype, each as its
+    `Fp8Operand` says: with one scale per row (q per (token, head) row, the
+    weights per row) for ROW and SPLIT, or with a fixed scale for STATIC.
+    Every operand OFF (the default) is the dequantizing kernel.
     """
 
     qk: Fp8Operand = Fp8Operand.OFF
@@ -166,8 +201,19 @@ class NativeFp8:
     def any(self) -> bool:
         return self.qk is not Fp8Operand.OFF or self.pv is not Fp8Operand.OFF
 
+    def __str__(self) -> str:
+        """Short form for logs: "qk" / "pv" with "2" for SPLIT and "s" for
+        STATIC (e.g. "pvs", "qk2pv2"), "off" when no operand is on."""
+        parts = [
+            name + _FP8_OPERAND_SUFFIX[op]
+            for name, op in (("qk", self.qk), ("pv", self.pv))
+            if op is not Fp8Operand.OFF
+        ]
+        return "".join(parts) or "off"
+
 
 NATIVE_FP8_OFF = NativeFp8()
+
 
 # Inputs need three slots. The fetch for a tile is issued throughout the
 # preceding tile rather than all at once at its start, so it cannot be waited
@@ -206,7 +252,20 @@ class ServingConfigs:
     return_lse: bool = False
     skip_kv_update: bool = False
     mask_invalid_v: bool | None = None
+    # Native fp8 matmuls of the DECODE kernel, and of the PREFILL and MIXED
+    # kernels (no SPLIT operands there).
     native_fp8: NativeFp8 = NATIVE_FP8_OFF
+    native_fp8_prefill: NativeFp8 = NATIVE_FP8_OFF
+    # Run the DECODE softmax in base 2: log2(e) is folded into the score
+    # scale and the exponentials are exp2. Equal in exact arithmetic, but
+    # where the scale is folded into q (`flash_attention.q_folded_scale`) it
+    # is cast to q's dtype: for a bf16 q at head_dim 256, log2(e) / 16 =
+    # 0.09016844 rounds to 0.09033203, so the scores are scaled 0.18% more
+    # than on the base-e path, and q * scale takes one more bf16 rounding.
+    # Not applied when the kernel returns the LSE (return_lse, as the DCP
+    # passes do), since callers merge LSEs in natural log, nor with soft_cap,
+    # which caps the base-e scores. The wrapper logs either once.
+    decode_exp2: bool = False
 
     def __post_init__(self):
         if Fp8Operand.SPLIT in (self.native_fp8.qk, self.native_fp8.pv) and (
@@ -223,19 +282,43 @@ class ServingConfigs:
                 "mask_invalid_v",
                 self.kv_layout == KVLayout.SEQ_ALONG_LANE,
             )
-        if self.native_fp8.any() and jnp.dtype(self.dtype_kv) not in (
+        for name in ("native_fp8", "native_fp8_prefill"):
+            self._check_native_fp8(name, getattr(self, name))
+
+    def _check_native_fp8(self, name: str, modes: NativeFp8) -> None:
+        if not modes.any():
+            return
+        if jnp.dtype(self.dtype_kv) not in (
             jnp.dtype(jnp.float8_e4m3fn),
             jnp.dtype(jnp.float8_e5m2),
         ):
             raise ValueError(
-                f"native_fp8={self.native_fp8} runs matmuls in the fp8 KV dtype, "
-                f"but the KV cache is {jnp.dtype(self.dtype_kv)}; use an fp8 KV "
-                "cache or leave native_fp8 off."
+                f"{name}={modes} runs matmuls in the fp8 KV dtype, but the KV "
+                f"cache is {jnp.dtype(self.dtype_kv)}; use an fp8 KV cache or "
+                f"leave {name} off."
             )
-        if self.native_fp8.qk is not Fp8Operand.OFF and self.scale_q is not None:
+        if jnp.dtype(self.dtype_kv) == jnp.dtype(jnp.float8_e5m2) and (
+            name == "native_fp8_prefill" or Fp8Operand.STATIC in (modes.qk, modes.pv)
+        ):
             raise ValueError(
-                "native_fp8.qk with a static q scale: the q-scale path already "
+                f"{name}={modes} with an fp8_e5m2 KV cache: only the DECODE "
+                "kernel's ROW operands are tested on e5m2; use an fp8_e4m3 KV "
+                "cache."
+            )
+        if modes.qk is not Fp8Operand.OFF and self.scale_q is not None:
+            raise ValueError(
+                f"{name}.qk with a static q scale: the q-scale path already "
                 "casts q to the KV dtype; pass one or the other."
+            )
+        if name == "native_fp8_prefill" and Fp8Operand.SPLIT in (modes.qk, modes.pv):
+            raise ValueError(
+                f"{name}={modes}: SPLIT operands are DECODE only; use ROW or STATIC."
+            )
+        if modes.pv is Fp8Operand.STATIC and self.per_token_scale:
+            raise ValueError(
+                f"{name}.pv STATIC with per-token V scales: the scales multiply "
+                "the softmax weights before the cast and can leave the fp8 "
+                "range; use ROW."
             )
 
     @property
@@ -365,8 +448,9 @@ class RpaConfigs:
         word_size_bytes = 4
         fixed_bytes *= word_size_bytes
 
+        tpu_info = get_tpu_info()
         smem_limit_bytes = (
-            pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024
+            tpu_info.smem_capacity_bytes - 32 * 1024
         ) * self.serve.smem_fraction_limit_for_schedule_generation
         available_bytes = smem_limit_bytes - fixed_bytes
 
@@ -386,7 +470,7 @@ class RpaConfigs:
 
         max_steps_ub = available_bytes // bytes_per_step
 
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = tpu_info.num_lanes
         max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
         return int(max_steps_ub)
 
@@ -407,7 +491,7 @@ class RpaConfigs:
     def page_window_slot_len(self) -> int:
         """SMEM entries per window slot: lane-aligned, plus a lane group of slack
         when the window itself is not."""
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = get_tpu_info().num_lanes
         entries = self.page_window_entries
         return utils.align_to(entries, num_lanes) + (
             num_lanes if entries % num_lanes else 0
@@ -441,14 +525,15 @@ class RpaConfigs:
 
     @property
     def aligned_q_head_dim(self) -> int:
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = get_tpu_info().num_lanes
         return utils.align_to(self.model.head_dim, num_lanes)
 
     # Actual head dimension used for compute, does not include scale factors.
     @property
     def compute_kv_head_dim(self) -> int:
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        tpu_info = get_tpu_info()
+        num_lanes = tpu_info.num_lanes
+        num_sublanes = tpu_info.num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return utils.align_to(self.model.head_dim, num_sublanes * kv_packing)
@@ -458,8 +543,9 @@ class RpaConfigs:
     # per_token_scale is enabled.
     @property
     def aligned_kv_head_dim(self) -> int:
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        tpu_info = get_tpu_info()
+        num_lanes = tpu_info.num_lanes
+        num_sublanes = tpu_info.num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
@@ -555,7 +641,7 @@ class RpaConfigs:
         the sublane dim, where single tokens are addressable.
         """
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            return pltpu.get_tpu_info().num_lanes
+            return get_tpu_info().num_lanes
         return 1
 
     @property
@@ -600,7 +686,7 @@ class RpaConfigs:
 
     @property
     def lm_scratch_shape(self):
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = get_tpu_info().num_lanes
         return (
             self.model.num_kv_heads,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
@@ -609,7 +695,7 @@ class RpaConfigs:
 
     @property
     def lse_vmem_shape(self):
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = get_tpu_info().num_lanes
         q_per_kv_packing = self.aligned_num_q_heads_per_kv_head // self.serve.packing_q
         return (
             self.block.batch_size,

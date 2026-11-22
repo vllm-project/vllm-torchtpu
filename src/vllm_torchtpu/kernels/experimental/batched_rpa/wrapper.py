@@ -17,6 +17,8 @@ Validates tensor shapes, selects tuned block sizes, builds DMA schedule tables,
 and invokes the Pallas Batched RPA kernel.
 """
 
+import math
+from collections.abc import Callable
 from typing import cast
 
 import jax
@@ -34,6 +36,11 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+# Share of the VMEM limit the heuristic's tiles may fill (decode with the tuned
+# tiles has its own caps), and the tuned prefill table's tiles too: headroom
+# against VMEM OOM at the cost of some tile size.
+_VMEM_FRACTION = 0.8
 
 
 def prepare_inputs(
@@ -55,8 +62,9 @@ def prepare_inputs(
     kv_packing = utils.get_dtype_packing(kv_dtype)
 
     aligned_num_q_heads_per_kv_head = utils.align_to(num_q_heads_per_kv_head, q_packing)
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    num_sublanes = pltpu.get_tpu_info().num_sublanes
+    tpu_info = configs.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
+    num_sublanes = tpu_info.num_sublanes
     aligned_q_head_dim = utils.align_to(actual_q_head_dim, num_lanes)
 
     # Compute aligned kv head dimension, accounting for per-token scale if
@@ -131,7 +139,6 @@ def prepare_inputs(
         actual_kv_head_dim += num_scale_channels
 
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        num_lanes = pltpu.get_tpu_info().num_lanes
         align_tokens = max(num_lanes, page_size)
         padded_total_tokens = utils.align_to(total_q_tokens, align_tokens)
         new_kv_hbm = (
@@ -251,12 +258,14 @@ def calculate_block_sizes(
     - an fp8 KV cache (without LSE) takes the fp8 compute threshold on a chip
       with fp8 compute, and the fp8/bf16 throughput ratio is rounded rather
       than floored;
-    - prefill bq is clamped to the token count aligned to the MXU width.
+    - prefill bq is clamped to the token count aligned to the MXU width;
+    - prefill/mixed tiles come from `_TUNED_PREFILL_TILES` for the layer
+      shapes it lists.
     Off (the default), the tiles are the ones these rules replace, so other
     models keep their tiles.
     """
 
-    tpu_info = pltpu.get_tpu_info()
+    tpu_info = configs.get_tpu_info()
     num_lanes = tpu_info.num_lanes
     mxu_column_size = tpu_info.mxu_column_size
 
@@ -493,7 +502,7 @@ def calculate_block_sizes(
         )
         decode_vmem_frac = 0.85 if is_fp8_kv else 0.75
         capped_vmem_limit_bytes = vmem_limit_bytes * (
-            decode_vmem_frac if tuned_decode else 0.8
+            decode_vmem_frac if tuned_decode else _VMEM_FRACTION
         )
 
         # To maximize MXU, we want bkv_sz to be at least MXU size.
@@ -557,11 +566,9 @@ def calculate_block_sizes(
         if tuned_tiles and fixed_bq_sz is None:
             # Clamp prefill/mixed bq_sz to the aligned total_q_tokens bucket so
             # small token buckets do not allocate 1024-token Q/O VMEM buffers.
-            max_useful_bq_sz = max(
-                mxu_column_size,
-                utils.align_to(serve_cfgs.total_q_tokens, mxu_column_size),
+            bq_sz = min(
+                bq_sz, max_useful_bq_sz(serve_cfgs.total_q_tokens, mxu_column_size)
             )
-            bq_sz = min(bq_sz, max_useful_bq_sz)
 
         # Step 3: Given current tile size, calculate compute tile size.
         return configs.BlockSizes(
@@ -575,8 +582,135 @@ def calculate_block_sizes(
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size)
+    if tuned_tiles:
+        # The table's tiles get the VMEM check and cap the heuristic's prefill
+        # tiles get in find_best_block_sizes.
+        prefill_block_sizes = tuned_prefill_block_sizes(
+            prefill_block_sizes,
+            model_cfgs,
+            serve_cfgs,
+            tpu_info,
+            fits=lambda b: calculate_vmem_usage(b.batch_size, b.bq_sz, b.bkv_sz)
+            < vmem_limit_bytes * _VMEM_FRACTION,
+        )
 
     return decode_block_sizes, prefill_block_sizes
+
+
+def max_useful_bq_sz(total_q_tokens: int, mxu_column_size: int) -> int:
+    """The largest prefill/mixed bq a call can fill: its token count aligned
+    to the MXU width, and at least one MXU width."""
+    return max(mxu_column_size, utils.align_to(total_q_tokens, mxu_column_size))
+
+
+# Prefill/mixed tiles (bq, bq_c, bkv, batch) tuned for one layer shape on one
+# chip: (chip, q heads, KV heads, head_dim, fp8 KV) per device. The heuristic
+# grows bq and bkv together, so with many q heads per KV head (32 q / 2 KV
+# heads on a PP=8 stage of Qwen3.5-397B) VMEM stops both at 256 and every
+# 256-key block pays a full accumulator rescale. A 1024-key block with a small
+# q sub-chunk fits: 256,32,1024,1 ran the prefill kernel ~20% faster at 87K
+# context (standalone kernel benchmark, TPU7x), and 256,16,1024,1 cut the PP8
+# prefill engine step a further 4.8% (137.5 -> 130.9 ms) with GSM8K at 97.80%.
+# TpuInfo types its chip_version as jax's ChipVersion base class, hence object.
+_TUNED_PREFILL_TILES: dict[
+    tuple[object, int, int, int, bool], tuple[int, int, int, int]
+] = {
+    (pltpu.ChipVersion.TPU_7X, 32, 2, 256, True): (256, 16, 1024, 1),
+}
+# Layer shapes that keep the heuristic's prefill/mixed tiles, listed so that
+# the miss log names only shapes nobody has looked at: the decode legs of
+# Qwen3.5-397B on TPU7x (16 q / 1 KV head with DP4 x TP2, 4 q / 1 KV head with
+# TP8 and DCP4) were measured with the heuristic's tiles.
+_HEURISTIC_PREFILL_SHAPES = frozenset(
+    {
+        (pltpu.ChipVersion.TPU_7X, 16, 1, 256, True),
+        (pltpu.ChipVersion.TPU_7X, 4, 1, 256, True),
+    }
+)
+# Tiles that produced wrong outputs at the tuned shape: 128,16,1024,1 scored
+# 78.01% on GSM8K (gate 97%). No table entry, and no table entry after the bq
+# clamp, may use them.
+_UNSAFE_PREFILL_TILES = frozenset({(128, 16, 1024, 1)})
+
+
+def tuned_prefill_block_sizes(
+    default: configs.BlockSizes,
+    model_cfgs: configs.ModelConfigs,
+    serve_cfgs: configs.ServingConfigs,
+    tpu_info: pltpu.TpuInfo,
+    *,
+    fits: Callable[[configs.BlockSizes], bool],
+) -> configs.BlockSizes:
+    """The prefill tiles from `_TUNED_PREFILL_TILES` for this chip and layer
+    shape, or `default` (the heuristic's). Applied with ``tuned_tiles`` only.
+
+    bq is clamped to the aligned token count as the heuristic does, and bq_c
+    to a divisor of bq. A shape the table does not list takes `default` and
+    logs its key once, unless `_HEURISTIC_PREFILL_SHAPES` lists it. A page
+    size that does not divide the table's bkv, a clamp that lands on
+    `_UNSAFE_PREFILL_TILES`, and tiles that do not pass `fits` (the VMEM
+    check) each take `default` and log it once.
+    """
+    is_fp8_kv = jnp.dtype(serve_cfgs.dtype_kv) in (
+        jnp.dtype(jnp.float8_e4m3fn),
+        jnp.dtype(jnp.float8_e5m2),
+    )
+    key = (
+        tpu_info.chip_version,
+        model_cfgs.num_q_heads,
+        model_cfgs.num_kv_heads,
+        model_cfgs.head_dim,
+        is_fp8_kv,
+    )
+    tiles = _TUNED_PREFILL_TILES.get(key)
+    if tiles is None:
+        if key not in _HEURISTIC_PREFILL_SHAPES:
+            # Once per shape: the heuristic's tiles vary with the token count.
+            logger.warning_once(
+                "Batched RPA: no tuned prefill tiles for (chip, q heads, KV "
+                "heads, head_dim, fp8 KV) = %s; using the heuristic's tiles.",
+                key,
+            )
+        return default
+    if tiles in _UNSAFE_PREFILL_TILES:
+        raise ValueError(f"prefill tiles {tiles} for {key} are known to be wrong")
+    bq, bq_c, bkv, batch = tiles
+    if bkv % serve_cfgs.page_size:
+        logger.warning_once(
+            "Batched RPA: the tuned prefill tiles %s for %s need a page size "
+            "that divides bkv %d, not %d; using the heuristic's %s.",
+            tiles,
+            key,
+            bkv,
+            serve_cfgs.page_size,
+            default,
+        )
+        return default
+    bq = min(bq, max_useful_bq_sz(serve_cfgs.total_q_tokens, tpu_info.mxu_column_size))
+    bq_c = math.gcd(bq, min(bq_c, bq))
+    clamped = configs.BlockSizes(bq_sz=bq, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=batch)
+    if (bq, bq_c, bkv, batch) in _UNSAFE_PREFILL_TILES:
+        logger.warning_once(
+            "Batched RPA: clamping the tuned prefill tiles %s for %s to %d "
+            "tokens gives %s, which are known to be wrong; using the "
+            "heuristic's %s.",
+            tiles,
+            key,
+            serve_cfgs.total_q_tokens,
+            clamped,
+            default,
+        )
+        return default
+    if not fits(clamped):
+        logger.warning_once(
+            "Batched RPA: the tuned prefill tiles %s for %s do not fit the "
+            "VMEM limit; using the heuristic's %s.",
+            clamped,
+            key,
+            default,
+        )
+        return default
+    return clamped
 
 
 @jax.jit(
@@ -610,6 +744,8 @@ def calculate_block_sizes(
         "mask_invalid_v",
         "return_raw_output",
         "native_fp8",
+        "native_fp8_prefill",
+        "decode_exp2",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -659,6 +795,8 @@ def ragged_paged_attention(
     prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
     return_raw_output: bool = False,
     native_fp8: configs.NativeFp8 = configs.NATIVE_FP8_OFF,
+    native_fp8_prefill: configs.NativeFp8 = configs.NATIVE_FP8_OFF,
+    decode_exp2: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -740,6 +878,11 @@ def ragged_paged_attention(
         native_fp8: Which DECODE matmuls run natively in the fp8 KV dtype, and
             how each operand is scaled (`configs.NativeFp8`). Needs an fp8 KV
             cache. Defaults to every operand off.
+        native_fp8_prefill: The same for the PREFILL and MIXED kernels (ROW
+            or STATIC operands). Defaults to every operand off.
+        decode_exp2: Run the DECODE softmax in base 2; see
+            `configs.ServingConfigs.decode_exp2`. Not applied with
+            return_lse or soft_cap. Defaults to False.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -779,7 +922,7 @@ def ragged_paged_attention(
     if mask_value is None:
         mask_value = cast(float, jnp.finfo(out_dtype).min)
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = cast(int, pltpu.get_tpu_info().vmem_capacity_bytes)
+        vmem_limit_bytes = cast(int, configs.get_tpu_info().vmem_capacity_bytes)
     max_num_seqs = kv_lens.shape[0]
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         page_size = kv_cache.shape[4]
@@ -817,8 +960,21 @@ def ragged_paged_attention(
     k_scale_tensor = dynamic_k_scale
     v_scale_tensor = dynamic_v_scale
 
+    if decode_exp2 and return_lse:
+        logger.warning_once(
+            "Batched RPA: decode_exp2 is not applied to calls that return the "
+            "LSE (such as the DCP passes), whose callers merge LSEs in natural "
+            "log; those calls keep the base-e decode softmax."
+        )
+    if decode_exp2 and soft_cap is not None:
+        logger.warning_once(
+            "Batched RPA: decode_exp2 is not applied with soft_cap, which caps "
+            "the base-e scores; those calls keep the base-e decode softmax."
+        )
     serve_cfgs = configs.ServingConfigs(
         native_fp8=native_fp8,
+        native_fp8_prefill=native_fp8_prefill,
+        decode_exp2=decode_exp2,
         num_seqs=max_num_seqs,
         num_page_indices=num_page_indices,
         total_q_tokens=queries.shape[0],
@@ -839,13 +995,14 @@ def ragged_paged_attention(
         skip_kv_update=skip_kv_update,
         mask_invalid_v=mask_invalid_v,
     )
-    tpu_info = pltpu.get_tpu_info()
-    if serve_cfgs.native_fp8.any() and not tpu_info.fp8_ops_per_second:
-        raise ValueError(
-            f"native_fp8={serve_cfgs.native_fp8} runs matmuls in fp8 on the MXU, "
-            f"which this chip ({tpu_info.chip_version}) does not have; leave "
-            "native_fp8 off."
-        )
+    tpu_info = configs.get_tpu_info()
+    for name in ("native_fp8", "native_fp8_prefill"):
+        modes = getattr(serve_cfgs, name)
+        if modes.any() and not tpu_info.fp8_ops_per_second:
+            raise ValueError(
+                f"{name}={modes} runs matmuls in fp8 on the MXU, which this chip "
+                f"({tpu_info.chip_version}) does not have; leave {name} off."
+            )
 
     if prepared_inputs is None:
         q_hbm, new_kv_hbm = prepare_inputs(
@@ -906,7 +1063,7 @@ def ragged_paged_attention(
     # Pre-allocate LSE buffer.
     lse_hbm_init: jax.Array | None = None
     if return_lse:
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = configs.get_tpu_info().num_lanes
         q_packing = utils.get_dtype_packing(queries.dtype)
         num_q_heads_per_kv_head = num_q_heads // num_kv_heads
         aligned_num_q_heads_per_kv_head = utils.align_to(

@@ -14,8 +14,10 @@
 """Tests for batched RPA config and block size calculations across TPU generations."""
 
 import functools
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
@@ -43,6 +45,10 @@ def _create_mock_tpu_info(
     mock.fp8_ops_per_second = fp8_ops_per_second
     mock.bf16_ops_per_second = bf16_ops_per_second
     return mock
+
+
+def _unknown_chip(*args, **kwargs):
+    raise ValueError("Unsupported TPU device kind")
 
 
 @pytest.mark.parametrize(
@@ -237,3 +243,59 @@ def test_the_jitted_wrapper_passes_the_decode_batch_size_to_its_decode_kernel(
     assert len([n for n in names if n.startswith(decode)]) == 1, names
     assert len([n for n in names if n.startswith(mixed)]) == 1, names
     assert all("-b2-" in n for n in names if n.startswith(mixed)), names
+
+
+@pytest.mark.parametrize(("backend", "falls_back"), [("cpu", True), ("tpu", False)])
+def test_tpu_info_falls_back_to_tpu7x_only_without_a_tpu(
+    monkeypatch, backend, falls_back
+):
+    """An unrecognized chip on a TPU backend raises instead of silently taking
+    TPU7x's SMEM and VMEM sizes; off TPU the configs use TPU7x's, and say so
+    once."""
+    warnings = []
+    monkeypatch.setattr(
+        configs,
+        "logger",
+        SimpleNamespace(warning_once=lambda msg, *args: warnings.append(msg % args)),
+    )
+    monkeypatch.setattr(pltpu, "get_tpu_info", _unknown_chip)
+    monkeypatch.setattr(jax, "default_backend", lambda: backend)
+    if falls_back:
+        info = configs.get_tpu_info()
+        assert info == pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+        assert len(warnings) == 1 and "TPU7x" in warnings[0], warnings
+    else:
+        with pytest.raises(ValueError, match="Unsupported TPU device kind"):
+            configs.get_tpu_info()
+
+
+def test_schedule_sizes_need_no_tpu_backend(monkeypatch):
+    """Without a TPU backend, every RpaConfigs size the schedule needs comes
+    from the TPU7x fallback, page_window_slot_len included."""
+    monkeypatch.setattr(
+        configs, "logger", SimpleNamespace(warning_once=lambda *args: None)
+    )
+    monkeypatch.setattr(pltpu, "get_tpu_info", _unknown_chip)
+    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
+    serve = configs.ServingConfigs(
+        num_seqs=8,
+        page_size=128,
+        total_q_tokens=64,
+        num_page_indices=8 * 64,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.float8_e4m3fn,
+        dtype_out=jnp.bfloat16,
+        kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+    )
+    cfgs = configs.RpaConfigs(
+        block=configs.BlockSizes(bq_sz=256, bq_c_sz=64, bkv_sz=256, batch_size=1),
+        model=configs.ModelConfigs(
+            num_q_heads=8, num_kv_heads=1, head_dim=256, mask_value=-1e30
+        ),
+        serve=serve,
+        mode=configs.RpaCase.MIXED,
+        vmem_limit_bytes=64 << 20,
+    )
+    assert cfgs.page_window_slot_len % 128 == 0
+    assert cfgs.max_steps_ub > 0
+    assert configs.worst_case_schedule_chunks(cfgs) >= 1
