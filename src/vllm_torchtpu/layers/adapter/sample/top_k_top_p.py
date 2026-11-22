@@ -424,19 +424,82 @@ def topk_cutoff_mask(
     return torch.where(logits >= cutoff, logits, torch.full_like(logits, replace_val))
 
 
+def topp_mask_narrow(
+    logits: torch.Tensor,
+    p: torch.Tensor,
+    top_idx: torch.Tensor,
+    replace_val: float = MASKED_LOGIT_VALUE,
+) -> torch.Tensor:
+    """`topp_mask` for top-k-masked rows (VLLM_TPU_SAMPLER_TOPP_NARROW).
+
+    `logits` must already be top-k masked with 1 <= k <= kmax and `top_idx`
+    [batch, kmax] be the indices of its kmax largest entries, largest first.
+    The bisection's threshold is the largest t with mass(t) >= p, where
+    mass(t) = sum(where(probs >= t, probs, 0)) only changes at probability
+    values and grows (rounding is monotone) as t falls: so it is the largest
+    probability p_j with mass(p_j) >= p, or -inf-like "keep all" when even the
+    whole kept mass is < p. Every positive probability is among the kmax
+    largest (count(x > v_k) < k <= kmax; ties equal v_k), so a binary search
+    over those kmax values, evaluating the same mass sum, finds the same
+    threshold in log2(kmax) + 1 steps.
+    """
+    p = p.squeeze(-1)
+    probs = torch.softmax(logits, dim=-1)
+    zero_val = torch.zeros_like(probs)
+    replace_tensor = torch.full_like(logits, replace_val)
+    kmax = top_idx.shape[-1]
+    cand = probs.gather(-1, top_idx).to(torch.float32)
+    pos = torch.zeros(p.shape, dtype=torch.int64, device=logits.device)
+    step = 1 << (kmax.bit_length() - 1)
+    if step < kmax:
+        step <<= 1
+    while step:
+        nxt = pos + step
+        in_range = nxt <= kmax
+        threshold = cand.gather(-1, (nxt.clamp(max=kmax) - 1).unsqueeze(-1))
+        probability_mass = torch.sum(
+            torch.where(probs >= threshold, probs, zero_val),
+            dim=-1,
+        )
+        pos = torch.where(in_range & (probability_mass < p), nxt, pos)
+        step >>= 1
+    found = cand.gather(-1, pos.clamp(max=kmax - 1).unsqueeze(-1))
+    keep_all = torch.full_like(found, float("-inf"))
+    threshold = torch.where((pos < kmax).unsqueeze(-1), found, keep_all)
+    return torch.where(probs >= threshold, logits, replace_tensor)
+
+
 def apply_top_k_top_p_kmax(
-    logits: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor, kmax: int
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    kmax: int,
+    topp_narrow: bool = False,
 ) -> torch.Tensor:
     """`apply_top_k_top_p` (no candidates) with `topk_cutoff_mask` when
-    kmax > 0, else exactly `apply_top_k_top_p`."""
+    kmax > 0 (and `topp_mask_narrow` with topp_narrow), else exactly
+    `apply_top_k_top_p`. Active rows need 1 <= top_k <= kmax."""
     if kmax <= 0:
         return apply_top_k_top_p(logits, top_k, top_p)
     should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
-    topk_masked = topk_cutoff_mask(logits, top_k, kmax, MASKED_LOGIT_VALUE)
+    if topp_narrow:
+        top = torch.topk(logits, kmax, dim=-1)
+        kk = (top_k.clamp(min=1, max=kmax) - 1).to(torch.int64)
+        cutoff = top.values.gather(-1, kk)
+        topk_masked = torch.where(
+            logits >= cutoff, logits, torch.full_like(logits, MASKED_LOGIT_VALUE)
+        )
+    else:
+        topk_masked = topk_cutoff_mask(logits, top_k, kmax, MASKED_LOGIT_VALUE)
     masked_logits = torch.where(should_apply_topk, topk_masked, logits)
 
     should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
-    topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE)
+    if topp_narrow:
+        topp_masked = topp_mask_narrow(
+            masked_logits, top_p, top.indices, MASKED_LOGIT_VALUE
+        )
+    else:
+        topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE)
     return torch.where(should_apply_topp, topp_masked, masked_logits)
 
 
@@ -468,13 +531,16 @@ def apply_top_k_top_p_candidates_pre(
     block_max: torch.Tensor,
     candidates_of: Callable[[torch.Tensor], torch.Tensor],
     kmax: int = 0,
+    topp_narrow: bool = False,
 ) -> torch.Tensor:
     """`apply_top_k_top_p_candidates(logits, ...)` given `block_max` (equal
     to the block maxima of `logits`) and `candidates_of(block_ids)` (equal to
     the gathered blocks of `logits`)."""
     block_ids = torch.topk(block_max, num_blocks, dim=-1, sorted=False).indices
     candidates = candidates_of(block_ids)
-    kept = apply_top_k_top_p_kmax(candidates, top_k, top_p, kmax) > MASKED_LOGIT_VALUE
+    kept = apply_top_k_top_p_kmax(
+        candidates, top_k, top_p, kmax, topp_narrow
+    ) > MASKED_LOGIT_VALUE
     inf = torch.full_like(candidates, float("inf"))
     cutoff = torch.where(kept, candidates, inf).amin(dim=-1, keepdim=True)
     masked = torch.where(
@@ -501,6 +567,7 @@ def top_k_top_p_candidate_logits_pre(
     top_p: torch.Tensor,
     num_blocks: int,
     kmax: int = 0,
+    topp_narrow: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """`top_k_top_p_candidate_logits` given the unscaled block maxima and
     `raw_candidates_of(block_ids)` (the unscaled gathered blocks)."""
@@ -508,7 +575,9 @@ def top_k_top_p_candidate_logits_pre(
     block_max = scale(raw_block_max)
     block_ids = torch.topk(block_max, num_blocks, dim=-1, sorted=False).indices
     candidates = scale(raw_candidates_of(block_ids))
-    kept = apply_top_k_top_p_kmax(candidates, top_k, top_p, kmax) > MASKED_LOGIT_VALUE
+    kept = apply_top_k_top_p_kmax(
+        candidates, top_k, top_p, kmax, topp_narrow
+    ) > MASKED_LOGIT_VALUE
     inf = torch.full_like(candidates, float("inf"))
     cutoff = torch.where(kept, candidates, inf).amin(dim=-1, keepdim=True)
     masked_value = torch.full_like(candidates, MASKED_LOGIT_VALUE)

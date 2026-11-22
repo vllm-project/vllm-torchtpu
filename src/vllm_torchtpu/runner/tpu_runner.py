@@ -461,6 +461,7 @@ def _sample_from_logits_pre(
     raw_block_max: torch.Tensor,
     raw_candidates_of,
     kmax: int = 0,
+    topp_narrow: bool = False,
 ) -> torch.Tensor:
     """`_sample_from_logits_impl(..., topk_candidates)` given the unscaled
     block maxima and blocks of `logits` (VLLM_TPU_SAMPLER_LOGITS_BLOCKS). The
@@ -476,6 +477,7 @@ def _sample_from_logits_pre(
         _apply_temperature_impl(raw_block_max, temperatures),
         lambda ids: _apply_temperature_impl(raw_candidates_of(ids), temperatures),
         kmax,
+        topp_narrow,
     )
     u_clamped = torch.clamp(
         u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
@@ -510,6 +512,7 @@ def _verify_logits_blocks(
     blocks_flat = logits.reshape(num_rows * blocks_per_row, CANDIDATE_BLOCK)
     block_max = logits.reshape(num_rows, blocks_per_row, CANDIDATE_BLOCK).amax(dim=-1)
     kmax = topk_candidates // 2 if mode >= 2 else 0
+    topp_narrow = mode >= 3
 
     def blocks_of(rows):
         return lambda ids: row_block_gather(blocks_flat, blocks_per_row, rows, ids)
@@ -525,6 +528,7 @@ def _verify_logits_blocks(
         torch.index_select(block_max, 0, bonus_logits_indices),
         blocks_of(bonus_logits_indices),
         kmax,
+        topp_narrow,
     ).view(-1)
     target_rows = target_logits_indices
     if recover_flat_u is not None:
@@ -555,6 +559,7 @@ def _verify_logits_blocks(
             recover_at,
             topk_candidates,
             kmax,
+            topp_narrow,
         )
 
     return bonus_token_ids, target_dist_fn
@@ -752,6 +757,24 @@ def _verify_one_draw_ro_impl(
 
 _verify_one_draw_ro_compiled = _static_shape_args(
     _tpu_compile(_verify_one_draw_ro_impl)
+)
+
+
+def _verify_one_draw_ro_lb_impl(
+    read_offsets: torch.Tensor,
+    groups: list[torch.Tensor],
+    ro_num_reqs: torch.Tensor,
+    logits_blocks: int,
+    *args,
+):
+    """`_verify_one_draw_ro_impl` with VLLM_TPU_SAMPLER_LOGITS_BLOCKS."""
+    out = _verify_fused_one_draw_impl(*args, None, logits_blocks)
+    _update_read_offsets_impl(read_offsets, groups, out, ro_num_reqs)
+    return out
+
+
+_verify_one_draw_ro_lb_compiled = _static_shape_args(
+    _tpu_compile(_verify_one_draw_ro_lb_impl)
 )
 
 
@@ -6848,9 +6871,9 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates,
             self._sampler_candidates_only(topk_candidates),
         )
+        logits_blocks = self._sampler_logits_blocks() if flat_u is not None else 0
         if flat_u is not None:
             call_args = (*args[:6], flat_u, *args[9:])
-            logits_blocks = envs.VLLM_TPU_SAMPLER_LOGITS_BLOCKS
 
             def verify(*extra):
                 if logits_blocks:
@@ -6882,7 +6905,16 @@ class TPUModelRunner(GPUModelRunner):
             and envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
             and self.mamba_slot_read_offsets.device.type == "tpu"
         )
-        if ingraph_ro:
+        if ingraph_ro and logits_blocks:
+            out = _verify_one_draw_ro_lb_compiled(
+                self.mamba_slot_read_offsets,
+                list(ro_groups),
+                self._num_reqs_tensor(ro_num_reqs),
+                logits_blocks,
+                *call_args,
+            )
+            self._fused_read_offsets_applied = True
+        elif ingraph_ro:
             out = _verify_one_draw_ro_compiled(
                 self.mamba_slot_read_offsets,
                 list(ro_groups),
@@ -10998,6 +11030,15 @@ class TPUModelRunner(GPUModelRunner):
             CANDIDATE_BLOCK,
         )
         return num_blocks
+
+    @staticmethod
+    def _sampler_logits_blocks() -> int:
+        """VLLM_TPU_SAMPLER_LOGITS_BLOCKS mode for the fused one-draw verify;
+        VLLM_TPU_SAMPLER_TOPP_NARROW (needs mode 2) selects mode 3."""
+        mode = min(envs.VLLM_TPU_SAMPLER_LOGITS_BLOCKS, 2)
+        if mode == 2 and envs.VLLM_TPU_SAMPLER_TOPP_NARROW:
+            return 3
+        return mode
 
     @staticmethod
     def _sampler_candidates_only(topk_candidates: int) -> bool:

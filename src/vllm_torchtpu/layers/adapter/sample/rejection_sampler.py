@@ -743,6 +743,7 @@ def candidate_target_dist_pre(
     recover_at,
     topk_candidates: int,
     kmax: int = 0,
+    topp_narrow: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """`_candidate_target_dist` (VLLM_TPU_SAMPLER_LOGITS_BLOCKS) from the
     target rows' unscaled block maxima, `raw_candidates_of(block_ids)` /
@@ -762,6 +763,7 @@ def candidate_target_dist_pre(
         top_p,
         topk_candidates,
         kmax,
+        topp_narrow,
     )
     target_probs = torch.softmax(masked_logits, dim=-1)
     zero = torch.zeros_like(target_probs)
