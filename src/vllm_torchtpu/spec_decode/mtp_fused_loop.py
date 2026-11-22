@@ -66,8 +66,9 @@ class _MtpFusedLoop(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
-        """`positions` and `seq_lens` are step 1's. Returns the K-1 draft
-        tokens, one [p] int32 tensor per step."""
+        """`positions` are step 0's (each step advances them, step 1 too, so
+        the caller launches no eager add) and `seq_lens` step 1's. Returns the
+        K-1 draft tokens, one [p] int32 tensor per step."""
         tokens = []
         # VLLM_TPU_MK_DRAFT: each step is one kernel call returning the carry and the
         # greedy token (attached before the first trace, so a static choice here).
@@ -78,8 +79,8 @@ class _MtpFusedLoop(nn.Module):
         # (`mk_draft_compile_config`); the caller picks it per step in Python.
         mk_step = getattr(self.mtp, "mk_draft_step", None) if self.use_mk else None
         for i in range(self.num_steps):
+            positions = positions + 1
             if i > 0:
-                positions = positions + 1
                 seq_lens.add_(1)
             if mk_step is not None:
                 hidden_states, input_ids = mk_step(input_ids, positions, hidden_states, 1)

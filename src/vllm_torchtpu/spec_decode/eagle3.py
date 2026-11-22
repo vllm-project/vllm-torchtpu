@@ -986,9 +986,10 @@ class Eagle3Proposer:
     ) -> tuple[torch.Tensor, ...] | None:
         """Draft steps 1..K-1 of one chunk in one dispatch.
 
-        `input_ids` is step 0's token and `positions` step 1's. Returns the
-        K-1 tokens, or None when this chunk's metadata doesn't fit the
-        program (the caller then runs the per-step loop).
+        `input_ids` is step 0's token and `positions` step 0's (the program
+        advances them). Returns the K-1 tokens, or None when this chunk's
+        metadata doesn't fit the program (the caller then runs the per-step
+        loop).
         """
         attn_metadata = self._build_draft_attn_metadata(
             chunk=chunk,
@@ -2224,7 +2225,7 @@ class Eagle3Proposer:
                     fused = self._run_mtp_fused_loop(
                         chunk=chunk,
                         input_ids=draft_tokens_per_chunk[ci][-1],
-                        positions=loop_positions[ci] + 1,
+                        positions=loop_positions[ci],
                         hidden_states=loop_hidden[ci],
                         num_rejected_np=rejected_np_per_chunk[ci],
                         num_rejected_dev=rejected_dev_per_chunk[ci],

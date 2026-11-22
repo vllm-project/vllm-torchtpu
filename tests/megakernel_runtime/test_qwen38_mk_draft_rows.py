@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_torchtpu.spec_decode import mtp_fused_loop as fl
@@ -116,3 +117,30 @@ def test_stock_loop_has_no_token_count_guard():
     fn(*copy.deepcopy(a8192))
     assert counter.frame_count == 1, counter.frame_count
     assert loop.mtp.mk_calls == 0
+
+
+@pytest.mark.parametrize("use_mk", [False, True])
+def test_loop_advances_step0_positions(use_mk, monkeypatch):
+    """The caller passes step 0's positions; step i of the loop sees them + i + 1,
+    and seq_lens (step 1's) advances only between steps."""
+    loop = _loop(use_mk)
+    seen = []
+    mk_step, fwd = loop.mtp.mk_draft_step, type(loop.mtp).forward
+
+    def record_mk(input_ids, positions, hidden, rows_per_request):
+        seen.append(positions.clone())
+        return mk_step(input_ids, positions, hidden, rows_per_request)
+
+    def record_fwd(self, input_ids, positions, *rest, **kw):
+        seen.append(positions.clone())
+        return fwd(self, input_ids, positions, *rest, **kw)
+
+    monkeypatch.setattr(loop.mtp, "mk_draft_step", record_mk)
+    monkeypatch.setattr(type(loop.mtp), "forward", record_fwd)
+    monkeypatch.setattr(fl, "greedy_draft_token", lambda model, h: h[:, 0].to(torch.int32))
+    ids, pos, hidden, seq_lens = _args(4)
+    pos = torch.arange(4) * 10
+    seq_lens = torch.full((4,), 7)
+    loop.forward(ids, pos, hidden, seq_lens)
+    assert [p.tolist() for p in seen] == [(pos + 1).tolist(), (pos + 2).tolist()]
+    assert seq_lens.tolist() == [8] * 4
