@@ -138,6 +138,7 @@ def arm_dense_fp4_shared(model: torch.nn.Module, what: str = "model") -> int:
             activation=runner._quant_method._tpu_activation_str,
             use_ep=True,
             with_shared=True,
+            replica_groups=getattr(layer, "expert_replica_groups", 0),
         )
         for name, tensor in zip(_SHARED_BUFFERS, shared):
             layer.register_buffer(name, tensor, persistent=False)

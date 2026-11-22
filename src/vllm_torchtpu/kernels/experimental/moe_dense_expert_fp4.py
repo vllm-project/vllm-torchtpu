@@ -213,15 +213,86 @@ def _vmem_bytes(m: int, h: int, chunk: int, i_s: int, sparse: bool = False) -> i
     return _weight_vmem_bytes(h, chunk, i_s) + (mp * scratch + temporaries) * h
 
 
+def _choose_replicas(
+    ids_ref,
+    table_ref,
+    block_index,
+    choice_vmem,
+    choice_smem,
+    sem,
+    *,
+    block,
+    groups,
+):
+    """Which copy of each replicated expert serves this step, the same choice
+    on every block (each sees all routes): a block's load is the slots it must
+    stream, first its unreplicated touched slots, then each touched replicated
+    slot in table order goes to the copy's block if that block's load is lower
+    than its home block's (home on a tie).
+
+    Fills choice_smem's rows: 0 each slot's local expert on this block (-1:
+    another block's), 3 at [r] the slot of local expert block + r (a copy);
+    rows 1 and 2 hold the touched slots and the blocks' loads."""
+    m, topk = ids_ref.shape
+    num_slots = choice_vmem.shape[1]
+    replicas = table_ref.shape[0] // 4
+    lanes = lax.broadcasted_iota(jnp.int32, (1, num_slots), 1)
+    # Touched and replicated slots, and the blocks' unreplicated loads, as
+    # vectors; one DMA hands them to the scalar decisions.
+    ids = ids_ref[...]
+    routed = lax.broadcasted_iota(jnp.int32, (m, num_slots), 1)
+    hits = jnp.zeros((m, num_slots), jnp.int32)
+    for route in range(topk):
+        hits = jnp.maximum(
+            hits, (ids[:, route : route + 1] == routed).astype(jnp.int32)
+        )
+    touched = jnp.max(hits, axis=0, keepdims=True)
+    replicated = jnp.zeros_like(touched)
+    for d in range(replicas):
+        replicated = jnp.where(lanes == table_ref[4 * d], 1, replicated)
+    unreplicated = touched * (1 - replicated)
+    home = lanes // block
+    loads = jnp.zeros_like(touched)
+    for g in range(groups):
+        loads = jnp.where(
+            lanes == g, jnp.sum(jnp.where(home == g, unreplicated, 0)), loads
+        )
+    own = (unreplicated != 0) & (home == block_index)
+    rows = [jnp.where(own, lanes - home * block, -1), touched, loads]
+    rows += [jnp.zeros_like(touched)] * (choice_vmem.shape[0] - len(rows))
+    choice_vmem[...] = jnp.concatenate(rows, axis=0)
+    copy = pltpu.make_async_copy(choice_vmem, choice_smem, sem)
+    copy.start()
+    copy.wait()
+
+    def decide(d, carry):
+        s = table_ref[4 * d]
+        home, block_copy, copy_local = (table_ref[4 * d + k] for k in (1, 2, 3))
+
+        @pl.when((s >= 0) & (choice_smem[1, jnp.maximum(s, 0)] != 0))
+        def touched():
+            to_copy = choice_smem[2, block_copy] < choice_smem[2, home]
+            pick = jnp.where(to_copy, block_copy, home)
+            choice_smem[2, pick] += 1
+
+            @pl.when(pick == block_index)
+            def here():
+                @pl.when(to_copy)
+                def on_copy():
+                    choice_smem[0, s] = copy_local
+                    choice_smem[3, copy_local - block] = s
+
+                @pl.when(~to_copy)
+                def at_home():
+                    choice_smem[0, s] = s - home * block
+
+        return carry
+
+    lax.fori_loop(0, replicas, decide, 0)
+
+
 def _kernel(
     ids_smem,  # SMEM [m * topk] local expert ids, -1 off this rank (prefetch)
-    x_ref,  # VMEM [m, h] bf16
-    ids_ref,  # VMEM [m, topk] int32: ids_smem as rows
-    tw_ref,  # VMEM [m, topk] f32 routing weights
-    w1_hbm,  # [E, h, 2i] fp4
-    w2_hbm,  # [E, i, h] fp4
-    s1_hbm,  # [E, h / 128, 1, 2i] f32
-    s2_hbm,  # [E, i / 128, 1, h] f32
     *refs,
     h,
     i,
@@ -230,7 +301,24 @@ def _kernel(
     activation,
     i_s,
     sparse,
+    groups,
 ):
+    # With expert replicas (``groups`` blocks of experts, each with replica
+    # slots after its own), ids_smem holds slots instead: [D * 4] the replica
+    # table (expert_placement.ExpertPlacement.replica_table) and [1] this
+    # block's index come next.
+    if groups:
+        table_smem, block_smem, *refs = refs
+    (
+        x_ref,  # VMEM [m, h] bf16
+        ids_ref,  # VMEM [m, topk] int32: ids_smem as rows
+        tw_ref,  # VMEM [m, topk] f32 routing weights
+        w1_hbm,  # [E, h, 2i] fp4
+        w2_hbm,  # [E, i, h] fp4
+        s1_hbm,  # [E, h / 128, 1, 2i] f32
+        s2_hbm,  # [E, i / 128, 1, h] f32
+        *refs,
+    ) = refs
     if i_s:
         sw1_hbm, ss1_ref, sw2_hbm, ss2_ref, *refs = refs
     (
@@ -242,7 +330,7 @@ def _kernel(
         su_ref,
         sd_ref,
         x_pad_ref,  # VMEM [mp, h] bf16: the tokens, padded with zero rows
-        coeff_ref,  # VMEM [mp, E_pad] f32: each token's weight per local expert
+        coeff_ref,  # VMEM [mp, E_pad] f32: each token's weight per expert column
         expert_acc_ref,  # VMEM [mp, h] f32: the current expert's down projection
         acc_ref,  # VMEM [mp, h] f32: the routing-weighted sum
         active_ref,  # SMEM [E]: nonzero for an expert some token routes to
@@ -251,13 +339,17 @@ def _kernel(
         *extra_scratch,
     ) = refs
     shared_scratch = extra_scratch[:4] if i_s else ()
+    extra_scratch = extra_scratch[len(shared_scratch) :]
     if sparse:
         # SMEM [E] routes per local expert, [E + 1] their offsets, [m * k] the
         # routes' tokens grouped by expert; VMEM [mp, h] bf16 the gathered
         # rows, [mp, lanes] f32 the current expert's coefficient per token.
-        counts_ref, offs_ref, sorted_ref, xs_ref, coeff_rows_ref = extra_scratch[
-            len(shared_scratch) :
-        ]
+        counts_ref, offs_ref, sorted_ref, xs_ref, coeff_rows_ref = extra_scratch[:5]
+        extra_scratch = extra_scratch[5:]
+    if groups:
+        # VMEM and SMEM [8, S] the copy choice (_choose_replicas) and its
+        # DMA's semaphore; SMEM [m * k] each route's local expert (`mark`).
+        choice_vmem, choice_smem, choice_sem, lids_ref = extra_scratch
     fp8 = jnp.float8_e4m3fn
     f32 = jnp.float32
     m = x_ref.shape[0]
@@ -287,6 +379,27 @@ def _kernel(
     lax.fori_loop(0, experts, clear, 0)
     topk = ids_ref.shape[1]
     routes = ids_smem.shape[0]
+    route_ids = ids_smem
+    if groups:
+        block = experts - table_smem.shape[0] // 4 // groups
+        _choose_replicas(
+            ids_ref,
+            table_smem,
+            block_smem[0],
+            choice_vmem,
+            choice_smem,
+            choice_sem,
+            block=block,
+            groups=groups,
+        )
+        route_ids = lids_ref
+
+    def column(e):
+        """Local expert e's column of coeff_ref: its slot with replicas."""
+        if not groups:
+            return e
+        copy_slot = choice_smem[3, jnp.maximum(e - block, 0)]
+        return jnp.where(e < block, block_smem[0] * block + e, copy_slot)
 
     def first_route(r, e):
         """No earlier route of r's token names e (each token adds an expert's
@@ -294,11 +407,16 @@ def _kernel(
         first = True
         for back in range(1, topk):
             earlier = jnp.maximum(r - back, 0)
-            first &= (back > r % topk) | (ids_smem[earlier] != e)
+            first &= (back > r % topk) | (route_ids[earlier] != e)
         return first
 
     def mark(r, carry):
-        e = ids_smem[r]
+        if groups:
+            s = ids_smem[r]
+            e = jnp.where(s >= 0, choice_smem[0, jnp.maximum(s, 0)], -1)
+            lids_ref[r] = e
+        else:
+            e = ids_smem[r]
 
         @pl.when((e >= 0) & (e < experts))
         def local():
@@ -369,7 +487,7 @@ def _kernel(
         lax.fori_loop(0, experts, offsets, 0)
 
         def place(r, carry):
-            e = ids_smem[r]
+            e = route_ids[r]
 
             @pl.when((e >= 0) & (e < experts) & first_route(r, e))
             def local():
@@ -522,7 +640,9 @@ def _kernel(
         def finish():
             columns = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
             coeff = jnp.sum(
-                jnp.where(columns == e, coeff_ref[...], 0), axis=1, keepdims=True
+                jnp.where(columns == column(e), coeff_ref[...], 0),
+                axis=1,
+                keepdims=True,
             )
             coeff_rows_ref[...] = jnp.broadcast_to(coeff, coeff_rows_ref.shape)
 
@@ -566,7 +686,9 @@ def _kernel(
             e = active_ids_ref[unit // num_chunks]
             columns = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
             coeff = jnp.sum(
-                jnp.where(columns == e, coeff_ref[...], 0), axis=1, keepdims=True
+                jnp.where(columns == column(e), coeff_ref[...], 0),
+                axis=1,
+                keepdims=True,
             )
             out_e = expert_acc_ref[...].astype(out_ref.dtype).astype(f32)
             # Zero routing must suppress even a non-finite unused output.
@@ -593,7 +715,9 @@ def _kernel(
     out_ref[...] = out.astype(out_ref.dtype)
 
 
-@functools.partial(jax.jit, static_argnames=("activation", "sparse_rows"))
+@functools.partial(
+    jax.jit, static_argnames=("activation", "sparse_rows", "replica_groups")
+)
 def dense_expert_moe_fp4(
     hidden,
     w1,
@@ -606,13 +730,20 @@ def dense_expert_moe_fp4(
     activation="swigluoai",
     shared: SharedExpert | None = None,
     sparse_rows: bool = False,
+    replicas=None,
+    block_index=None,
+    replica_groups: int = 0,
 ):
     """Local routed contribution of fp4 experts, [tokens, hidden] bf16, as
     fused_moe_func's GMM path returns it, plus the shared expert's output
-    when `shared` is given. IDs outside this rank must
-    be -1. Callers check can_use_dense_expert_fp4 first. Non-finite hidden
-    states and weights are zeroed for the routed experts, as the GMM path's
-    one-hot permute (which serves these token counts) does."""
+    when `shared` is given. IDs outside this rank must be -1. With
+    `replica_groups` blocks of experts whose local experts end in replica
+    slots, `local_ids` are slots instead (-1 for none), `replicas` is the
+    layer's replica table (expert_placement.ExpertPlacement.replica_table,
+    int32) and `block_index` this rank's block: the kernel picks which copy of
+    each replicated expert runs. Callers check can_use_dense_expert_fp4 first.
+    Non-finite hidden states and weights are zeroed for the routed experts, as
+    the GMM path's one-hot permute (which serves these token counts) does."""
     m, h = hidden.shape
     experts, i, _ = w2.shape
     i_s = 0 if shared is None else shared.w2.shape[0]
@@ -640,6 +771,21 @@ def dense_expert_moe_fp4(
             pltpu.VMEM((i_s, h), shared.w2.dtype),
             pltpu.SemaphoreType.DMA((3,)),
         ]
+    columns = experts
+    prefetch, replica_scratch = (local_ids.reshape(-1),), []
+    if replica_groups:
+        replica_count = replicas.shape[0] // 4
+        columns = replica_groups * (experts - replica_count // replica_groups)
+        prefetch += (
+            replicas.astype(jnp.int32),
+            block_index.reshape(1).astype(jnp.int32),
+        )
+        replica_scratch = [
+            pltpu.VMEM((8, columns), jnp.int32),
+            pltpu.SMEM((8, columns), jnp.int32),
+            pltpu.SemaphoreType.DMA(()),
+            pltpu.SMEM((local_ids.size,), jnp.int32),
+        ]
     sparse_scratch = []
     if sparse_rows:
         sparse_scratch = [
@@ -659,10 +805,11 @@ def dense_expert_moe_fp4(
             activation=activation,
             i_s=i_s,
             sparse=sparse_rows,
+            groups=replica_groups,
         ),
         out_shape=jax.ShapeDtypeStruct((mk, h), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=len(prefetch),
             in_specs=[vmem, vmem, vmem, *[hbm] * 4, *shared_specs],
             out_specs=vmem,
             scratch_shapes=[
@@ -673,7 +820,7 @@ def dense_expert_moe_fp4(
                 pltpu.VMEM((_NUM_BUFFERS, h // _QUANT_BLOCK, 1, chunk), jnp.float32),
                 pltpu.VMEM((_NUM_BUFFERS, chunk // _QUANT_BLOCK, 1, h), jnp.float32),
                 pltpu.VMEM((mp, h), jnp.bfloat16),
-                pltpu.VMEM((mp, experts + (-experts) % lanes), jnp.float32),
+                pltpu.VMEM((mp, columns + (-columns) % lanes), jnp.float32),
                 pltpu.VMEM((mp, h), jnp.float32),
                 pltpu.VMEM((mp, h), jnp.float32),
                 pltpu.SMEM((experts,), jnp.int32),
@@ -681,6 +828,7 @@ def dense_expert_moe_fp4(
                 pltpu.SemaphoreType.DMA((_NUM_BUFFERS, 6)),
                 *shared_scratch,
                 *sparse_scratch,
+                *replica_scratch,
             ],
         ),
         compiler_params=pltpu.CompilerParams(
@@ -692,7 +840,7 @@ def dense_expert_moe_fp4(
         + (f"-s_{i_s}" if i_s else "")
         + ("-sparse" if sparse_rows else ""),
     )(
-        local_ids.reshape(-1),
+        *prefetch,
         hidden,
         local_ids,
         topk_weights.astype(jnp.float32),

@@ -28,6 +28,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm_torchtpu.layers.adapter.moe_hierarchical import (
     hierarchical_moe_parallel_config,
 )
+from vllm_torchtpu.models.minimax_m3.expert_placement import ExpertPlacement
 
 # The checkpoint config may omit swiglu_beta; SwiGLU-OAI's up-bias is 1.
 _DEFAULT_SWIGLU_BETA = 1.0
@@ -119,9 +120,11 @@ class MiniMaxM3MoE(nn.Module):
         # the experts each: the same bytes per core, but a decode step's
         # touched experts spread over pairs of cores, so the core that sets
         # the post-MoE all-reduce streams fewer of them.
+        placement = ExpertPlacement(num_experts)
         with hierarchical_moe_parallel_config():
             self.experts = FusedMoEFactory(
-                num_experts=num_experts,
+                # Replica slots (expert_placement.py) are extra physical experts.
+                num_experts=placement.num_physical_experts,
                 top_k=config.num_experts_per_tok,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -139,6 +142,38 @@ class MiniMaxM3MoE(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.experts",
             )
+        table = placement.replica_table(prefix)
+        if table is not None:
+            self._arm_replicas(placement, table, prefix)
+
+    def _arm_replicas(
+        self, placement: ExpertPlacement, table: list[int], prefix: str
+    ) -> None:
+        """Hand the layer's replica table to the routed experts' op: the dense
+        fp4 decode kernel picks the copies, other steps run the home copies."""
+        from vllm_torchtpu.models.minimax_m3.quant import MiniMaxM3Nvfp4MoEMethod
+
+        routed = self.experts.routed_experts
+        if not isinstance(routed.quant_method, MiniMaxM3Nvfp4MoEMethod):
+            raise ValueError(
+                f"Expert replicas need NVFP4 experts; {prefix} runs "
+                f"{type(routed.quant_method).__name__}."
+            )
+        if routed.moe_config.ep_size != placement.groups:
+            raise ValueError(
+                f"The expert placement's replicas need {placement.groups} EP ranks "
+                f"(TPU_MOE_HIERARCHICAL_EP); {prefix} has "
+                f"{routed.moe_config.ep_size}."
+            )
+        # Every layer's table has the same length: unused rows name slot -1.
+        rows = placement.groups * placement.replicas_per_group
+        table = table + [-1, 0, 0, 0] * (rows - len(table) // 4)
+        routed.register_buffer(
+            "_expert_replicas",
+            torch.tensor(table, dtype=torch.int32),
+            persistent=False,
+        )
+        routed.expert_replica_groups = placement.groups
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits, _ = self.gate(hidden_states)

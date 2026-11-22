@@ -160,6 +160,94 @@ def test_sparse_rows_match_dense_with_f32_weights_and_repeated_ids():
     )
 
 
+def _replica_choice(slots, table, groups, block):
+    """Python model of the kernel's copy choice: slot -> (block, local)."""
+    touched = sorted({int(s) for s in slots.ravel() if s >= 0})
+    listed = {table[d][0] for d in range(len(table))}
+    load = [0] * groups
+    owner = {}
+    for s in touched:
+        if s not in listed:
+            load[s // block] += 1
+            owner[s] = (s // block, s % block)
+    for s, home, copy, copy_local in table:
+        if s in touched:
+            to_copy = load[copy] < load[home]
+            load[copy if to_copy else home] += 1
+            owner[s] = (copy, copy_local) if to_copy else (home, s % block)
+    return owner
+
+
+@pytest.mark.parametrize("m,sparse_rows", [(8, False), (24, False), (48, True)])
+def test_replicas_match_dense_on_the_chosen_copies(m, sparse_rows):
+    """Each block computes exactly the routes the copy choice gives it, as
+    the dense kernel does on those routes' local ids."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    groups, block, h, i, topk = 4, 8, 512, 512, 4
+    rng = np.random.default_rng(m)
+    # Two replicas per block: copies of its slots 0 and 3 on the next blocks.
+    pairs = [(q * block, (q + 1) % groups) for q in range(groups)]
+    pairs += [(q * block + 3, (q + 2) % groups) for q in range(groups)]
+    used, table = [0] * groups, []
+    for s, b in pairs:
+        table.append((s, s // block, b, block + used[b]))
+        used[b] += 1
+    num_slots = groups * block
+    hot = np.r_[np.full(block, 4.0), np.ones(num_slots - block)]
+    slots = np.stack(
+        [
+            rng.choice(num_slots, topk, replace=False, p=hot / hot.sum())
+            for _ in range(m)
+        ]
+    )
+    slots[-2:] = -1
+    x = jnp.asarray(rng.normal(size=(m, h)), jnp.bfloat16)
+    weights = jnp.asarray(rng.uniform(0.1, 1.0, size=(m, topk)), jnp.bfloat16)
+    w1 = rng.normal(size=(num_slots, h, 2 * i))
+    w2 = rng.normal(size=(num_slots, i, h))
+    s1 = rng.uniform(0.01, 0.05, size=(num_slots, h // 128, 1, 2 * i))
+    s2 = rng.uniform(0.01, 0.05, size=(num_slots, i // 128, 1, h))
+    owner = _replica_choice(slots, table, groups, block)
+    served = np.zeros(slots.shape, int)
+    for q in range(groups):
+        own = list(range(q * block, (q + 1) * block))
+        copies = [s for s, _, b, _ in table if b == q]
+        idx = own + copies
+
+        def local(a, dtype, idx=idx):
+            return jnp.asarray(a[idx], dtype)
+
+        weights_q = (
+            local(w1, jnp.float4_e2m1fn),
+            local(w2, jnp.float4_e2m1fn),
+            local(s1, jnp.float32),
+            local(s2, jnp.float32),
+        )
+        lids = np.full(slots.shape, -1)
+        for (t, j), s in np.ndenumerate(slots):
+            if s >= 0 and owner[s][0] == q:
+                lids[t, j] = owner[s][1]
+                served[t, j] += 1
+        dense = kernel.dense_expert_moe_fp4(
+            x, *weights_q, weights, jnp.asarray(lids, jnp.int32)
+        )
+        chosen = kernel.dense_expert_moe_fp4(
+            x,
+            *weights_q,
+            weights,
+            jnp.asarray(slots, jnp.int32),
+            sparse_rows=sparse_rows,
+            replicas=jnp.asarray(np.ravel(table), jnp.int32),
+            block_index=jnp.asarray(q, jnp.int32),
+            replica_groups=groups,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(chosen, np.float32), np.asarray(dense, np.float32)
+        )
+    assert (served[slots >= 0] == 1).all()
+
+
 def test_dense_fp4_shared_without_local_route_is_the_shared_expert():
     if jax.default_backend() != "tpu":
         pytest.skip("requires TPU")

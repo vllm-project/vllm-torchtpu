@@ -794,6 +794,7 @@ def shared_expert_mlp(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "replica_groups",
     ),
 )
 def fused_moe_func(
@@ -815,6 +816,8 @@ def fused_moe_func(
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
     shared: SharedExpert | None = None,
+    replicas: jax.Array | None = None,
+    replica_groups: int = 0,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -834,6 +837,13 @@ def fused_moe_func(
     safe to bind as a compile-time constant); ``use_sparse_core`` is a static
     flag selecting the #193 SparseCore ragged gather/gather-reduce (vs the
     pre-#193 plain-JAX path).
+
+    With ``replica_groups`` (EP over that many blocks of experts, each
+    block's local experts its own slots followed by replica slots holding
+    copies of other blocks' experts, models/minimax_m3/expert_placement.py),
+    ``topk_ids`` are slots and ``replicas`` the layer's replica table: the
+    dense fp4 decode kernel picks which copy of each replicated expert runs,
+    every other path runs the home copies.
 
     For packed weights, `rhs_quant_dtype` is used to specify the logical dtype of the
     weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
@@ -891,6 +901,8 @@ def fused_moe_func(
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            replicas=replicas,
+            replica_groups=replica_groups,
         )
         return shared_expert_mlp(hidden_states, shared, routed)
 
@@ -919,6 +931,33 @@ def fused_moe_func(
         # so the damage stays with that token (the permute zeroes the hidden
         # states, see prepare_routed_gmm_inputs).
         topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
+
+    if replica_groups:
+        if not use_ep or experts_start is None:
+            raise ValueError("Expert replicas need EP routing.")
+        per_group = replicas.shape[0] // 4 // replica_groups
+        if dense_fp4:
+            if skip_padded_tokens:
+                topk_ids = jnp.where(topk_weights != 0, topk_ids, -1)
+            logger.info_once("Selected dense-expert fp4 decode MoE with replicas")
+            return dense_expert_moe_fp4(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                activation=activation,
+                shared=shared,
+                sparse_rows=sparse_rows,
+                replicas=replicas,
+                block_index=experts_start // w1.shape[0],
+                replica_groups=replica_groups,
+            )
+        # Home copies: slot s is local expert s % block of block s // block.
+        block = w1.shape[0] - per_group
+        topk_ids = topk_ids + topk_ids // block * per_group
 
     if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start

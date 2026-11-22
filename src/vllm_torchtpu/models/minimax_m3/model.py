@@ -254,8 +254,10 @@ class MiniMaxM3Model(nn.Module):
         placement = ExpertPlacement(
             vllm_config.model_config.hf_text_config.num_local_experts
         )
-        # The EP weight filter keeps the checkpoint experts of this rank's slots.
-        model_loader_patches.set_expert_slot_map(placement.slot if placement else None)
+        # The EP weight filter keeps the checkpoint experts of this rank's blocks.
+        model_loader_patches.set_expert_slot_map(
+            placement.owner_slots if placement else None
+        )
         config = vllm_config.model_config.hf_text_config
         self.config = config
         # Keys this model's compile-artifact cache directory.
@@ -352,13 +354,14 @@ class MiniMaxM3Model(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
                     param = params_dict[name]
-                    param.weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=placement.slot(name, expert_id),
-                    )
+                    for physical in placement.physical_experts(name, expert_id):
+                        param.weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                            expert_id=physical,
+                        )
                     break
                 else:
                     raise ValueError(f"Unexpected expert weight {name}")

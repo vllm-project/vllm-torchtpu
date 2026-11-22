@@ -487,11 +487,16 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        replicas = getattr(layer, "_expert_replicas", None)
+        if replicas is not None:
+            # Built with the model; the op reads it beside the weights.
+            layer._expert_replicas = replicas.to(layer.w13_weight.device)
         if not self._use_adaptive_fused_moe:
             prebuild_fused_moe_kernel(
                 topk=layer.moe_config.experts_per_token,
                 activation=activation_str,
                 use_ep=layer.moe_config.moe_parallel_config.use_ep,
+                replica_groups=getattr(layer, "expert_replica_groups", 0),
             )
 
         if self._use_adaptive_fused_moe:
@@ -519,6 +524,14 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"
         )
+        # Routed slots of a model with expert replicas
+        # (models/minimax_m3/expert_placement.py) are not physical experts;
+        # only fused_moe_gmm maps them.
+        replicas = getattr(layer, "_expert_replicas", None)
+        if replicas is not None and (
+            self._use_adaptive_fused_moe or enable_pipelined_collective_and_compute()
+        ):
+            raise NotImplementedError("Expert replicas run on fused_moe_gmm only.")
         if self._use_adaptive_fused_moe:
             return adaptive_moe.run_adaptive_fused_moe(
                 self,
@@ -536,6 +549,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         )
 
         if fused_moe_ep_supported(self):
+            if replicas is not None:
+                raise NotImplementedError("Expert replicas run on fused_moe_gmm only.")
             return fused_moe_ep(
                 self,
                 x,
@@ -586,6 +601,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
 
         from vllm_torchtpu.layers.adapter.dense_fp4_shared import shared_operands
 
+        if replicas is not None:
+            kwargs["replicas"] = replicas
+            kwargs["replica_groups"] = layer.expert_replica_groups
         return fused_moe_gmm(**kwargs, shared=shared_operands(layer))
 
 
