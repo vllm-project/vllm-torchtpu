@@ -188,7 +188,9 @@ def _pick(s, num_visible, rank, *, topk, init_blocks, local_blocks, dcp):
         picked_scores.append(best_score)
         picked_blocks.append(jnp.where(best_score > _NEG_INF, best * dcp + rank, -1))
         s = jnp.where(cols == best, _NEG_INF, s)
-    return jnp.concatenate(picked_scores, axis=1), jnp.concatenate(picked_blocks, axis=1)
+    return jnp.concatenate(picked_scores, axis=1), jnp.concatenate(
+        picked_blocks, axis=1
+    )
 
 
 def _pick_t(st, num_visible, rank, *, topk, init_blocks, local_blocks, dcp):
@@ -222,7 +224,9 @@ def _pick_t(st, num_visible, rank, *, topk, init_blocks, local_blocks, dcp):
             jnp.where(best_score > _NEG_INF, best.astype(jnp.int32) * dcp + rank, -1)
         )
         st = jnp.where(ids == best, _NEG_INF, st)
-    return jnp.concatenate(picked_scores, axis=0), jnp.concatenate(picked_blocks, axis=0)
+    return jnp.concatenate(picked_scores, axis=0), jnp.concatenate(
+        picked_blocks, axis=0
+    )
 
 
 class _PackedPick(NamedTuple):
@@ -858,7 +862,10 @@ def msa_write_and_candidates_dcp(
             **msa.block_score_options(),
             interpret=interpret,
         )
-        if plan.selects:
+        # A request's tokens (at most a tile class's block_q when it
+        # selects) then span at most one block per rank: one written page each
+        # (`_written_pages`).
+        if plan.selects and block_size >= msa_indexer.DEFAULT_BLOCK_Q:
             # A decode step: one kernel writes, scores and picks.
             kv_rows = jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1)
             writes = msa.run_writes(
@@ -942,6 +949,7 @@ def msa_write_and_candidates_dcp(
             interpret,
             scale_cache,
             scale_row,
+            token_rows=True,
         )
     else:
         # All heads in one pass over this rank's index pages: [G, T, P],
@@ -958,7 +966,10 @@ def msa_write_and_candidates_dcp(
             scale_cache=scale_cache,
             scale_row=scale_row,
         ).reshape(num_heads * num_tokens, 1, -1)
-    cand_scores, cand_blocks = candidates(scores, jnp.tile(pos, num_heads))
+    if isinstance(scores, msa_indexer.TokenRows):
+        cand_scores, cand_blocks = candidates(scores.scores, pos, rows=scores.rows)
+    else:
+        cand_scores, cand_blocks = candidates(scores, jnp.tile(pos, num_heads))
     packed = pack_candidates(cand_scores, cand_blocks)  # [G * T, 2 * topk]
     packed = packed.reshape(num_heads, num_tokens, -1).transpose(1, 0, 2)
     if fp4:

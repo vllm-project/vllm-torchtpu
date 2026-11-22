@@ -14,9 +14,12 @@
 """MSA attention work list: the single-tile path equals the general one, and
 `_live_groups` marks exactly the first ``num_groups`` groups."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention as msa
 
@@ -66,3 +69,25 @@ def test_live_groups_are_the_first_num_groups(tiles: int) -> None:
             )
             want = np.arange(meta.shape[0]) < int(num_groups)
             np.testing.assert_array_equal(msa._live_groups(meta, count), want)
+
+
+# An odd length (the last word's high half is padding), ids past the sign bit.
+@pytest.mark.parametrize("length", [10, 11])
+def test_table16_entries_read_back(length: int) -> None:
+    rng = np.random.default_rng(length)
+    table = jnp.asarray(rng.integers(0, 1 << 16, length), jnp.int32)
+    packed = msa.pack_table16(table, 1 << 16)
+    assert msa.pack_table16(table, (1 << 16) + 1) is None
+
+    def kernel(packed_ref, o_ref):
+        for i in range(length):
+            o_ref[i] = msa.table16_entry(packed_ref, i)
+
+    got = pl.pallas_call(
+        kernel,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)],
+        out_specs=pl.BlockSpec(memory_space=pltpu.SMEM),
+        out_shape=jax.ShapeDtypeStruct((length,), jnp.int32),
+        interpret=True,
+    )(packed)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(table))

@@ -376,7 +376,12 @@ class RunWrites(NamedTuple):
         num_rows = self.layout.num_rows
         lanes = input_refs[num_rows] if self.layout.has_lanes else None
         return _pipe(
-            self.layout, run_refs, input_refs[:num_rows], lanes, cache_refs, scratch_refs
+            self.layout,
+            run_refs,
+            input_refs[:num_rows],
+            lanes,
+            cache_refs,
+            scratch_refs,
         )
 
 

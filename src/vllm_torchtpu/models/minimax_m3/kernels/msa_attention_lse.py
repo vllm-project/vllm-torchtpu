@@ -47,7 +47,8 @@ _FP4_PREFETCH = 2
 _START_UNROLL = 4
 # 8-token tiles (decode-sized DCP batches) hold a few MiB of pages and
 # blocks; XLA keeps a call's whole limit out of the VMEM it prefetches the
-# next ops' weights into (the output projection's 6 MiB fp8 weight).
+# next ops' weights into (the output projection's 6 MiB fp8 weight). Their
+# calls ask for this, or what they hold and a margin if more.
 _SMALL_BATCH_VMEM_LIMIT_BYTES = 16 * 1024 * 1024
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
@@ -641,6 +642,13 @@ def _attention_call(
         ],
     )
     num_inputs = 4 + 5 + len(scale_inputs)
+    # VMEM the call holds: its page (and scale) ring, double-buffered blocks.
+    rows = tiles_per_step * block_q
+    held = ring * pages_per_step * rows_per_page * packing * row_width
+    held *= jnp.dtype(kv_cache.dtype).itemsize
+    if fp4:
+        held += ring * pages_per_step * math.prod(scale_cache.shape[1:]) * 4
+    held += 2 * (2 * num_heads * rows * head_dim * q.dtype.itemsize + rows * topk * 4)
     return pl.pallas_call(
         functools.partial(
             kernel,
@@ -669,7 +677,7 @@ def _attention_call(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=(
-                _SMALL_BATCH_VMEM_LIMIT_BYTES
+                max(_SMALL_BATCH_VMEM_LIMIT_BYTES, held + (4 << 20))
                 if block_q == msa_attention.SMALL_BATCH_BLOCK_Q
                 else msa_attention._VMEM_LIMIT_BYTES
             ),

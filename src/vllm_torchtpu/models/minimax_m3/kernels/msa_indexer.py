@@ -364,7 +364,7 @@ def _kernel_v3(
     store=None,
     prologue=None,
     on_pages=None,
-    packed_table=False,
+    table_width=None,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -385,9 +385,9 @@ def _kernel_v3(
     `store(first, m)`, if given, takes each scored chunk's maxima ``m [Bq,
     chunk]`` (pages ``first ..`` of the step's group) instead of `o_ref`;
     `prologue()` runs at the first step once its page copies are issued, and
-    `on_pages(slot, base)` once a step's pages are in ring slot `slot`
-    (``base``: the block-table entry of its first page), before they are
-    scored. A `packed_table` block table is `msa_attention.pack_table16`'s.
+    `on_pages(slot)` once a step's pages are in ring slot `slot`, before they
+    are scored. With `table_width` (its rows' entries), the block table is
+    `msa_attention.pack_table16`'s.
     """
     slots, pages_per_step, rows, head_dim = buf.shape
     ahead = slots - 1
@@ -397,8 +397,10 @@ def _kernel_v3(
     chunk = _v3_chunk(pages_per_step, block_q, page_size)
     pages_per_seq = block_tables_ref.shape[0] // seq_pages_ref.shape[0]
     table_entry = block_tables_ref.__getitem__
-    if packed_table:
-        pages_per_seq *= 2
+    if table_width is not None:
+        # Packed rows run on into the next word: an odd width is not the
+        # packed length's share.
+        pages_per_seq = table_width
         table_entry = functools.partial(msa_attention.table16_entry, block_tables_ref)
     step, num_steps = pl.program_id(0), pl.num_programs(0)
     # The pages as 32-bit words: a dense VMEM layout, so each key vreg is one
@@ -419,7 +421,7 @@ def _kernel_v3(
             first = base % pages_per_seq
             col = jnp.minimum(first + g, pages_per_seq - 1) - first
             page = table_entry(base + col)
-        elif packed_table and pages_per_step % 2 == 0:
+        elif table_width is not None and (pages_per_seq | pages_per_step) % 2 == 0:
             # `base` is even: entry g's 16-bit half is static, and pages g and
             # g + 1 read one word (a dynamic half cost ~4 scalar ops per page).
             word = block_tables_ref[(base >> 1) + g // 2]
@@ -549,7 +551,7 @@ def _kernel_v3(
         their share of the ahead group's descriptors."""
         wait_pages(live, slot)
         if on_pages is not None:
-            on_pages(slot, base)
+            on_pages(slot)
         for c in range(num_chunks):
             pages = range(
                 min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
@@ -598,7 +600,8 @@ class Selected(NamedTuple):
 
 
 # VMEM the block-select kernel asks for beyond its scratch (pipeline blocks,
-# spills).
+# spills), at least: a wide pick's arrays (scores, ids, blocks, masks) may need
+# more.
 _SELECT_VMEM_MARGIN_BYTES = 4 << 20
 # Token rows a `RowSelect` pick takes at once (a decode bucket's).
 _SELECT_ROWS = 128
@@ -619,8 +622,9 @@ class _SelectMeta(NamedTuple):
 
 
 def _select_meta(cu_q_lens, arg, live_pages, writes=None):
-    """`_SelectMeta`'s int32 operand; `writes` = (`msa_write.RunWrites`, the
-    per-request written pages then runs ``[2 * max_num_seqs]``)."""
+    """`_SelectMeta`'s int32 operand (`_select_meta_views` reads it back);
+    `writes` = (`msa_write.RunWrites`, the per-request written pages then
+    runs ``[2 * max_num_seqs]``)."""
     parts = [cu_q_lens, jnp.reshape(arg, (1,)), jnp.reshape(live_pages, (1,))]
     if writes is not None:
         parts += [*writes[0].scalars, writes[1]]
@@ -628,20 +632,20 @@ def _select_meta(cu_q_lens, arg, live_pages, writes=None):
 
 
 def _select_meta_views(ref, max_num_seqs, writes):
-    def take(start, size):
-        return ref.at[pl.ds(start, size)]
-
-    seqs = max_num_seqs
+    """`_SelectMeta` of `_select_meta`'s operand in SMEM, in its order."""
+    sizes = [max_num_seqs + 1, 1, 1]
+    if writes is not None:
+        sizes += [s.shape[0] for s in writes.scalars] + [max_num_seqs] * 2
+    views, start = [], 0
+    for size in sizes:
+        views.append(ref.at[pl.ds(start, size)])
+        start += size
+    cu_q_lens, arg, live_pages, *rest = views
     num_runs, runs, page, run = None, (), None, None
     if writes is not None:
-        num_runs = ref[seqs + 3]
-        max_runs = writes.scalars[1].shape[0]
-        runs = tuple(take(seqs + 4 + i * max_runs, max_runs) for i in range(4))
-        written = seqs + 4 + 4 * max_runs
-        page, run = take(written, seqs), take(written + seqs, seqs)
-    return _SelectMeta(
-        take(0, seqs + 1), ref[seqs + 1], ref[seqs + 2], num_runs, runs, page, run
-    )
+        num_runs, *runs, page, run = rest
+        num_runs, runs = num_runs[0], tuple(runs)
+    return _SelectMeta(cu_q_lens, arg[0], live_pages[0], num_runs, runs, page, run)
 
 
 def _kernel_v3_select(
@@ -654,7 +658,7 @@ def _kernel_v3_select(
     *refs,
     select: RowSelect,
     writes: msa_write.RunWrites | None = None,
-    packed_table: bool = False,
+    table_width: int | None = None,
 ):
     """`_kernel_v3` with token-major scores kept in VMEM, by page group and
     token row, then reduced by `select` at the last step: a separate kernel
@@ -728,8 +732,7 @@ def _kernel_v3_select(
 
         merged_keys = pipe.out_bufs[-1].bitcast(jnp.uint32)
 
-        def on_pages(slot, base):
-            del base
+        def on_pages(slot):
             g = meta.written_page[seq] - (entry & _GROUP_MASK) * pages_per_step
 
             @pl.when((g >= 0) & (g < pages_per_step))
@@ -750,7 +753,7 @@ def _kernel_v3_select(
         store=store,
         prologue=prologue,
         on_pages=on_pages,
-        packed_table=packed_table,
+        table_width=table_width,
     )
 
     def pick(width):
@@ -766,7 +769,9 @@ def _kernel_v3_select(
     def _select():
         # The narrowest width holding every request's pages.
         most = meta.live_pages
-        widths = list(range(select.width_step, groups * pages_per_step, select.width_step))
+        widths = list(
+            range(select.width_step, groups * pages_per_step, select.width_step)
+        )
         widths.append(groups * pages_per_step)
         # Every count takes one width, none too: a step whose requests hold
         # no page on this rank still writes its rows.
@@ -1088,8 +1093,10 @@ def _select_call(
     select_meta = _select_meta(cu_q_lens, arg, live_pages, writes)
     work, tile_info, block_tables, seq_pages = prefetch
     packed = msa_attention.pack_table16(block_tables, index_cache.shape[0])
+    table_width = None
     if packed is not None:
         prefetch = (work, tile_info, packed, seq_pages)
+        table_width = block_tables.shape[0] // seq_pages.shape[0]
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
     scratch = [
         pltpu.VMEM(ring, jnp.uint32),
@@ -1099,6 +1106,8 @@ def _select_call(
     write_inputs, aliases, cache_shapes = (), {}, []
     vmem_bytes = 4 * (ring[0] * ring[1] * ring[2] * ring[3])
     vmem_bytes += 4 * groups * (num_tokens + block_q) * ring[1]
+    # Four f32 / int32 [rows, width] arrays of the widest pick.
+    pick = 4 * 4 * min(num_tokens, _SELECT_ROWS) * groups * ring[1]
     if writes is not None:
         writes = writes[0]
         if writes.caches[-1] is not index_cache:
@@ -1117,7 +1126,7 @@ def _select_call(
             _kernel_v3_select,
             select=select,
             writes=None if writes is None else writes.layout_only(),
-            packed_table=packed is not None,
+            table_width=table_width,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(prefetch) + 1,
@@ -1142,7 +1151,7 @@ def _select_call(
         # What the kernel holds and a margin: XLA keeps a call's whole limit
         # out of the VMEM it prefetches the next ops' weights into.
         compiler_params=dataclasses.replace(
-            params, vmem_limit_bytes=vmem_bytes + _SELECT_VMEM_MARGIN_BYTES
+            params, vmem_limit_bytes=vmem_bytes + max(_SELECT_VMEM_MARGIN_BYTES, pick)
         ),
         interpret=interpret,
         name="minimax_m3_msa_block_select",

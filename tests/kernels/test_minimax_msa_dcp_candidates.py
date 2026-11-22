@@ -101,8 +101,9 @@ def test_packed_pick_matches_local_candidates(width: int, rank: int) -> None:
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
-# One page group, and two (the second partly live).
-@pytest.mark.parametrize("pages_per_seq", [8, 160])
+# One page group, two (the second partly live), a whole one (pages read in
+# 16-bit pairs), and an odd block-table width (packed rows straddle words).
+@pytest.mark.parametrize("pages_per_seq", [8, 160, 128, 9])
 @pytest.mark.parametrize("rank", [0, 1])
 def test_decode_write_and_candidates_match_separate_calls(pages_per_seq, rank):
     """A decode step writes, scores and picks in one kernel: the same caches
@@ -118,13 +119,20 @@ def test_decode_write_and_candidates_match_separate_calls(pages_per_seq, rank):
     full = dcp * _BLOCK * pages_per_seq
     # Slot 3 is past the batch, with an earlier request's length (as served).
     seq_lens = jnp.asarray(
-        [_BLOCK * (full // _BLOCK // 3) + 3, 300, _BLOCK * (full // _BLOCK - 2) + 3, full],
+        [
+            _BLOCK * (full // _BLOCK // 3) + 3,
+            300,
+            _BLOCK * (full // _BLOCK - 2) + 3,
+            full,
+        ],
         jnp.int32,
     )
     block_tables = jnp.asarray(
         rng.permutation(pages)[: seqs * pages_per_seq], jnp.int32
     )
-    bf16 = functools.partial(lambda *s: jnp.asarray(rng.standard_normal(s), jnp.bfloat16))
+    bf16 = functools.partial(
+        lambda *s: jnp.asarray(rng.standard_normal(s), jnp.bfloat16)
+    )
     k, v, index_q = bf16(tokens, 1, dim), bf16(tokens, 1, dim), bf16(tokens, 1, dim)
     index_k = bf16(tokens, dim)
     fp8 = jnp.float8_e4m3fn
@@ -134,24 +142,50 @@ def test_decode_write_and_candidates_match_separate_calls(pages_per_seq, rank):
     index_cache = jnp.asarray(rng.integers(-2, 3, (pages, 32, 4, dim)) * 64, fp8)
     meta = (seq_lens, block_tables, cu, jnp.asarray([3, 3, 3], jnp.int32))
     got = msa_dcp.msa_write_and_candidates_dcp(
-        k, v, index_q, index_k, kv_cache, index_cache, *meta, topk=_TOPK,
-        init_blocks=0, local_blocks=1, rank=rank, dcp=dcp, interpret=True,
+        k,
+        v,
+        index_q,
+        index_k,
+        kv_cache,
+        index_cache,
+        *meta,
+        topk=_TOPK,
+        init_blocks=0,
+        local_blocks=1,
+        rank=rank,
+        dcp=dcp,
+        interpret=True,
     )
 
     seq_id, pos, valid = msa.token_positions(tokens, seq_lens, cu)
     page = msa_dcp.owner_pages(
-        block_tables.reshape(seqs, -1), seq_id, pos, valid,
-        block_size=_BLOCK, rank=rank, dcp=dcp,
+        block_tables.reshape(seqs, -1),
+        seq_id,
+        pos,
+        valid,
+        block_size=_BLOCK,
+        rank=rank,
+        dcp=dcp,
     )
     kv_rows = jnp.concatenate([k, v], axis=-1).reshape(tokens, -1)
     want_kv, want_index = msa.write_caches(
         [msa_write.Rows(kv_cache, kv_rows), msa_write.Rows(index_cache, index_k)],
-        page, pos, max_num_seqs=seqs, interpret=True,
+        page,
+        pos,
+        max_num_seqs=seqs,
+        interpret=True,
     )
     local_lens = msa_dcp.local_seq_lens(seq_lens, block_size=_BLOCK, rank=rank, dcp=dcp)
     rows = msa_indexer.block_scores(
-        index_q, want_index, local_lens, block_tables, cu, meta[3][2],
-        token_rows=True, **msa.block_score_options(), interpret=True,
+        index_q,
+        want_index,
+        local_lens,
+        block_tables,
+        cu,
+        meta[3][2],
+        token_rows=True,
+        **msa.block_score_options(),
+        interpret=True,
     )
     assert isinstance(rows, msa_indexer.TokenRows)
     # As served (`sparse_local_block` 1): the straddled block's score counts.
@@ -173,16 +207,27 @@ def test_decode_step_with_no_page_on_rank() -> None:
     seqs, dim, tokens = 16, 128, 16
     q_lens = np.ones(seqs, np.int64)
     cu = jnp.asarray(np.concatenate([[0], np.cumsum(q_lens)]), jnp.int32)
-    bf16 = functools.partial(lambda *s: jnp.asarray(rng.standard_normal(s), jnp.bfloat16))
+    bf16 = functools.partial(
+        lambda *s: jnp.asarray(rng.standard_normal(s), jnp.bfloat16)
+    )
     fp8 = jnp.float8_e4m3fn
     got = msa_dcp.msa_write_and_candidates_dcp(
-        bf16(tokens, 1, dim), bf16(tokens, 1, dim), bf16(tokens, 1, dim),
+        bf16(tokens, 1, dim),
+        bf16(tokens, 1, dim),
+        bf16(tokens, 1, dim),
         bf16(tokens, dim),
         jnp.asarray(rng.integers(-2, 3, (16, 32, 4, 2 * dim)), fp8),
         jnp.asarray(rng.integers(-2, 3, (16, 32, 4, dim)), fp8),
-        jnp.ones((seqs,), jnp.int32), jnp.zeros((seqs * 8,), jnp.int32), cu,
-        jnp.asarray([tokens] * 3, jnp.int32), topk=_TOPK, init_blocks=0,
-        local_blocks=1, rank=1, dcp=2, interpret=True,
+        jnp.ones((seqs,), jnp.int32),
+        jnp.zeros((seqs * 8,), jnp.int32),
+        cu,
+        jnp.asarray([tokens] * 3, jnp.int32),
+        topk=_TOPK,
+        init_blocks=0,
+        local_blocks=1,
+        rank=1,
+        dcp=2,
+        interpret=True,
     )[2]
     np.testing.assert_array_equal(np.asarray(got[:, :_TOPK]), -np.inf)
     np.testing.assert_array_equal(np.asarray(got[:, _TOPK:]), -1)
