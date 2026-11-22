@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_DECODE_FUSION: str = "auto"
     TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = 8
+    TPU_DEEPSEEK_V41_OPROJ_VMEM_FIT: bool = False
     TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS: bool = True
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
     TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = True
@@ -540,6 +541,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH": env_positive_int_or_none(
         "TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH", default=8
     ),
+    # Fused output projection: reserve its scratch buffers' tile-padded size
+    # plus a margin as its VMEM limit instead of all 64 MiB, so XLA keeps small
+    # live buffers resident across the call. Same kernel (bit-exact). A rollout
+    # switch: remove it once serving runs confirm it.
+    "TPU_DEEPSEEK_V41_OPROJ_VMEM_FIT": env_bool("TPU_DEEPSEEK_V41_OPROJ_VMEM_FIT"),
     # CED decode: reuse the per-request SWA window-starts device tensor while
     # the replay starts are unchanged, instead of building and uploading it in
     # every step's host path ahead of the encoder. Same values (bit-exact).
