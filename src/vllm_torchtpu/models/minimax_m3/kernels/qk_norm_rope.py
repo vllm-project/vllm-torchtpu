@@ -24,7 +24,11 @@ The kernel's outputs have fixed layouts, so XLA cannot re-lay out the norm
 and rope for the consumers of q: as XLA fusions they emitted q tokens-minor
 and every consumer paid a relayout copy (the DCP query all-gather, ~49 us
 per layer at 8K tokens on the c4 twin, j-db4e365d). With ``q_head_major``
-q comes out ``[nq, T, D]``, the layout the DCP attention reads.
+q comes out ``[nq, T, D]``, the layout the DCP attention reads. With
+``rotate`` q and index_q come out rotated for a 4-bit cache
+(`msa_fp4.rotate_queries`): as an XLA dot on the kernel's output the
+rotation re-laid q out (c64 8K-token step: ~0.3 ms per layer of rotation
+fusions and copies, twin j-6bf91132).
 """
 
 import functools
@@ -34,6 +38,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 
 DEFAULT_BLOCK_TOKENS = 256
 
@@ -66,6 +72,7 @@ def _kernel(
     iq_ref,
     ik_ref,
     *,
+    hadamard_ref=None,
     num_heads,
     num_kv_heads,
     head_dim,
@@ -89,18 +96,26 @@ def _kernel(
         n = n.astype(jnp.float32)
         return jnp.where(lane < rotary_dim, n * cos + partner * sin, n).astype(dtype)
 
+    def rotated(x):
+        # msa_fp4.rotate_queries: one bf16 pass, f32 accumulation, then 1 / D.
+        if hadamard_ref is None:
+            return x
+        return (dot(x, hadamard_ref[...]) * (1.0 / head_dim)).astype(dtype)
+
     nq, nkv, d = num_heads, num_kv_heads, head_dim
     for h in range(nq):
         if q_head_major:
-            q_ref[h] = norm_rope(h, h)
+            q_ref[h] = rotated(norm_rope(h, h))
         else:
-            q_ref[:, h * d : (h + 1) * d] = norm_rope(h, h)
+            q_ref[:, h * d : (h + 1) * d] = rotated(norm_rope(h, h))
     for h in range(nkv):
         k_ref[:, h * d : (h + 1) * d] = norm_rope(nq + h, nq + h)
         v_ref[:, h * d : (h + 1) * d] = qkv_ref[
             :, (nq + nkv + h) * d : (nq + nkv + h + 1) * d
         ]
-        iq_ref[:, h * d : (h + 1) * d] = norm_rope(nq + 2 * nkv + h, nq + nkv + h)
+        iq_ref[:, h * d : (h + 1) * d] = rotated(
+            norm_rope(nq + 2 * nkv + h, nq + nkv + h)
+        )
     ik_ref[...] = norm_rope(nq + 3 * nkv, nq + 2 * nkv)
 
 
@@ -112,6 +127,7 @@ def _kernel(
         "head_dim",
         "eps",
         "q_head_major",
+        "rotate",
         "block_tokens",
         "interpret",
     ),
@@ -126,6 +142,7 @@ def qk_norm_rope(
     head_dim: int,
     eps: float,
     q_head_major: bool = False,
+    rotate: bool = False,
     block_tokens: int = DEFAULT_BLOCK_TOKENS,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -135,7 +152,8 @@ def qk_norm_rope(
     cache rows of its position, in the activation dtype); ``weight [nq + 2 *
     nkv + 1, D]`` f32 the ``1 + w`` rows of the q, k, index_q and index_k
     heads. q is ``[nq, T, D]`` with `q_head_major`, else ``[T, nq * D]``;
-    k, v and index_q ``[T, nkv * D]``, index_k ``[T, D]``.
+    k, v and index_q ``[T, nkv * D]``, index_k ``[T, D]``. `rotate`: q and
+    index_q times ``H / D`` (`msa_fp4.rotate_queries`).
     """
     num_tokens = qkv.shape[0]
     nq, nkv, d = num_heads, num_kv_heads, head_dim
@@ -160,9 +178,24 @@ def qk_norm_rope(
         q_spec = pl.BlockSpec((block_t, nq * d), rows)
         q_shape = jax.ShapeDtypeStruct((num_tokens, nq * d), qkv.dtype)
     kv_spec = pl.BlockSpec((block_t, nkv * d), rows)
+    mats = [jnp.asarray(m, jnp.bfloat16) for m in _rope_matrices(d, rotary_dim)]
+    mat_specs = [
+        pl.BlockSpec((d, d), lambda i: (0, 0)),
+        pl.BlockSpec((2, rotary_dim, d), lambda i: (0, 0, 0)),
+    ]
+    kernel = _kernel
+    if rotate:
+        mats.append(jnp.asarray(msa_fp4.hadamard(d), jnp.bfloat16))
+        mat_specs.append(pl.BlockSpec((d, d), lambda i: (0, 0)))
+
+        def kernel(qkv, cs, w, partner, factors, hadamard, *outs, **kw):
+            return _kernel(
+                qkv, cs, w, partner, factors, *outs, hadamard_ref=hadamard, **kw
+            )
+
     return pl.pallas_call(
         functools.partial(
-            _kernel,
+            kernel,
             num_heads=nq,
             num_kv_heads=nkv,
             head_dim=d,
@@ -175,8 +208,7 @@ def qk_norm_rope(
             pl.BlockSpec((block_t, qkv.shape[1]), rows),
             pl.BlockSpec((block_t, rotary_dim), rows),
             pl.BlockSpec(weight.shape, lambda i: (0, 0)),
-            pl.BlockSpec((d, d), lambda i: (0, 0)),
-            pl.BlockSpec((2, rotary_dim, d), lambda i: (0, 0, 0)),
+            *mat_specs,
         ],
         out_specs=[
             q_spec,
@@ -195,9 +227,4 @@ def qk_norm_rope(
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         interpret=interpret,
         name="minimax_m3_qk_norm_rope",
-    )(
-        qkv,
-        cos_sin,
-        weight.astype(jnp.float32),
-        *(jnp.asarray(m, jnp.bfloat16) for m in _rope_matrices(d, rotary_dim)),
-    )
+    )(qkv, cos_sin, weight.astype(jnp.float32), *mats)

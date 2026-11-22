@@ -42,6 +42,7 @@ from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
 from vllm_torchtpu.models.minimax_m3 import sp_o_proj
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
+    fp4_dcp_rotates_queries,
     get_msa_dcp_op,
     get_msa_op,
     get_msa_sharded_op,
@@ -395,7 +396,7 @@ class MiniMaxM3SparseAttention(nn.Module):
                 _dcp_rank_tensor(get_dcp_rank(), str(torch.get_default_device())),
                 persistent=False,
             )
-            if self.fp4:  # each rank rotates its own query heads (get_msa_dcp_op)
+            if self.fp4:  # each rank (un)rotates its own query heads (get_msa_dcp_op)
                 self.register_buffer(
                     "hadamard",
                     _hadamard_tensor(self.head_dim, str(torch.get_default_device())),
@@ -415,6 +416,9 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.head_dim,
             eps,
             self.q_head_major,
+            rotate=self.fp4
+            and self.dcp_size > 1
+            and fp4_dcp_rotates_queries(self.dcp_size, self.kv_head_replicas),
         )
 
     def score_bound(self) -> float:

@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
-from vllm_torchtpu.models.minimax_m3.kernels import qk_norm_rope
+from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4, qk_norm_rope
 
 D, ROT, EPS = 128, 64, 1e-6
 
@@ -45,12 +45,13 @@ def _reference(qkv, cos_sin, weight, nq, nkv):
     return q, k, v, iq, ik
 
 
+@pytest.mark.parametrize("rotate", [False, True])
 @pytest.mark.parametrize("q_head_major", [False, True])
 @pytest.mark.parametrize(
     "num_tokens,nq,nkv,block_tokens",
     [(8, 8, 1, 256), (24, 8, 1, 256), (512, 8, 1, 256), (300, 4, 2, 128)],
 )
-def test_matches_reference(num_tokens, nq, nkv, block_tokens, q_head_major):
+def test_matches_reference(num_tokens, nq, nkv, block_tokens, q_head_major, rotate):
     rng = np.random.default_rng(num_tokens + nq)
     qkv = jnp.asarray(
         rng.normal(0, 2, (num_tokens, (nq + 3 * nkv + 1) * D)), jnp.bfloat16
@@ -67,10 +68,15 @@ def test_matches_reference(num_tokens, nq, nkv, block_tokens, q_head_major):
         head_dim=D,
         eps=EPS,
         q_head_major=q_head_major,
+        rotate=rotate,
         block_tokens=block_tokens,
         interpret=True,
     )
     want = _reference(qkv, cos_sin, weight, nq, nkv)
+    if rotate:  # the 4-bit DCP op's rotation of q and index_q, as XLA did it
+        want = tuple(
+            msa_fp4.rotate_queries(x) if i in (0, 3) else x for i, x in enumerate(want)
+        )
     want_q = (
         want[0].transpose(1, 0, 2) if q_head_major else want[0].reshape(num_tokens, -1)
     )
@@ -81,9 +87,10 @@ def test_matches_reference(num_tokens, nq, nkv, block_tokens, q_head_major):
         )
 
 
+@pytest.mark.parametrize("rotate", [False, True])
 @pytest.mark.parametrize("q_head_major", [False, True])
 @pytest.mark.parametrize("num_tokens", [8, 300, 8192])
-def test_lowers_for_tpu(num_tokens, q_head_major):
+def test_lowers_for_tpu(num_tokens, q_head_major, rotate):
     nq, nkv = 8, 1
     args = (
         jax.ShapeDtypeStruct((num_tokens, (nq + 3 * nkv + 1) * D), jnp.bfloat16),
@@ -97,6 +104,7 @@ def test_lowers_for_tpu(num_tokens, q_head_major):
         head_dim=D,
         eps=EPS,
         q_head_major=q_head_major,
+        rotate=rotate,
     )
     tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
     with use_abstract_mesh(tpu7x):

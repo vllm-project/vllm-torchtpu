@@ -25,7 +25,12 @@ from vllm_torchtpu.models.minimax_m3.kernels import qk_norm_rope
 
 @functools.cache
 def get_qk_norm_rope_op(
-    num_heads: int, num_kv_heads: int, head_dim: int, eps: float, q_head_major: bool
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    eps: float,
+    q_head_major: bool,
+    rotate: bool = False,
 ) -> Callable[..., tuple[torch.Tensor, ...]]:
     """`qk_norm_rope.qk_norm_rope` as a torch op, built once per config from
     module ``__init__`` (as `ops.msa.get_msa_op`)."""
@@ -42,11 +47,14 @@ def get_qk_norm_rope_op(
             head_dim=head_dim,
             eps=eps,
             q_head_major=q_head_major,
+            rotate=rotate,
         )
 
     op = pallas.jax_op(
         f"pallas::minimax_m3_qk_norm_rope_q{num_heads}_kv{num_kv_heads}_d{head_dim}"
-        f"_e{eps!r}_hm{int(q_head_major)}".replace(".", "p").replace("-", "m"),
+        f"_e{eps!r}_hm{int(q_head_major)}{'_rot' if rotate else ''}".replace(
+            ".", "p"
+        ).replace("-", "m"),
         _norm_rope_jax,
     )
 

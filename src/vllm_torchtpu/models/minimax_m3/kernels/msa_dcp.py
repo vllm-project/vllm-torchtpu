@@ -859,13 +859,15 @@ def msa_write_and_candidates_dcp(
     rank: int | jax.Array,
     dcp: int,
     scale_cache: jax.Array | None = None,
+    index_q_rotated: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, ...]:
     """First half of the DCP forward: write this rank's tokens, score its
     blocks and pick its candidates.
 
     With 4-bit caches (`msa_fp4`, one KV head per rank) pass `scale_cache`;
-    it is returned updated after `index_cache`.
+    it is returned updated after `index_cache`. `index_q` is then rotated
+    here (`msa_fp4.rotate_queries`) unless `index_q_rotated`.
 
     Shapes as `msa.msa_forward`, except that a rank may hold ``G >= 1`` KV
     heads (DCP wider than a KV head's replicas): ``k``/``v``/``index_q
@@ -905,7 +907,8 @@ def msa_write_and_candidates_dcp(
             max_num_seqs=max_num_seqs,
             interpret=interpret,
         )
-        index_q = msa_fp4.rotate_queries(index_q)
+        if not index_q_rotated:
+            index_q = msa_fp4.rotate_queries(index_q)
     else:
         kv_rows = jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1)
         kv_cache, index_cache = msa.write_caches(

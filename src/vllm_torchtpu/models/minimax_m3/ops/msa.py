@@ -702,6 +702,15 @@ def get_msa_dcp_op(
     return op
 
 
+def fp4_dcp_rotates_queries(dcp: int, kv_head_replicas: int) -> bool:
+    """Whether the 4-bit DCP op takes q and index_q already rotated
+    (`msa_fp4.rotate_queries`) by the norm + rope kernel (`qk_norm_rope`'s
+    ``rotate``): a group over one KV head. A group of several KV heads
+    rotates them inside the op: kernel-rotated q and index_q cost relayout
+    copies around the group gathers (c64 twin j-afe31cf0)."""
+    return max(1, dcp // kv_head_replicas) == 1
+
+
 def _get_msa_dcp_fp4_op(
     sm_scale: float,
     topk: int,
@@ -713,9 +722,10 @@ def _get_msa_dcp_fp4_op(
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_dcp_op` for 4-bit caches."""
     kv_heads = max(1, dcp // kv_head_replicas)
+    q_rotated = fp4_dcp_rotates_queries(dcp, kv_head_replicas)
     from vllm_torchtpu.distributed.dcp import get_dcp_group
 
-    def _score_jax(
+    def _write_and_score(
         k: jax.Array,
         v: jax.Array,
         index_q: jax.Array,
@@ -728,13 +738,8 @@ def _get_msa_dcp_fp4_op(
         query_start_loc: jax.Array,
         request_distribution: jax.Array,
         dcp_rank: jax.Array,
-        q: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-        # This rank's queries are rotated here, a 1 / DCP share of the
-        # group's heads: inside a JAX op the rotation leaves the rope
-        # fusions that produce q alone (a torch matmul on q re-laid them
-        # out, +0.3 ms per layer at 8K tokens, j-c5c4bdfc).
-        return *msa_dcp.msa_write_and_candidates_dcp(
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        return msa_dcp.msa_write_and_candidates_dcp(
             k,
             v,
             index_q,
@@ -751,13 +756,50 @@ def _get_msa_dcp_fp4_op(
             rank=dcp_rank,
             dcp=dcp,
             scale_cache=scale_cache,
+            index_q_rotated=q_rotated,
+        )
+
+    def _score_and_rotate(
+        k: jax.Array,
+        v: jax.Array,
+        index_q: jax.Array,
+        index_k: jax.Array,
+        kv_cache: jax.Array,
+        index_cache: jax.Array,
+        scale_cache: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+        dcp_rank: jax.Array,
+        q: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+        # This rank's queries, a 1 / DCP share of the group's heads: inside a
+        # JAX op the rotation leaves the ops that produce q alone (a torch
+        # matmul on q re-laid them out, +0.3 ms per layer at 8K tokens,
+        # j-c5c4bdfc).
+        return *_write_and_score(
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            scale_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            dcp_rank,
         ), msa_fp4.rotate_queries(q)
+
+    _score_jax = _write_and_score if q_rotated else _score_and_rotate
 
     suffix = (
         f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_dcp{dcp}_g{kv_heads}"
     ).replace(".", "p")
     score_op = pallas.jax_op(
-        f"pallas::minimax_m3_msa_dcp_fp4_score_{suffix}",
+        f"pallas::minimax_m3_msa_dcp_fp4_score_{'rot_' if q_rotated else ''}{suffix}",
         _score_jax,
         donate_argnums=(
             _SHARD_KV_CACHE_ARG,
@@ -776,7 +818,7 @@ def _get_msa_dcp_fp4_op(
                 dtype=torch.float32,
                 device=k.device,
             ),
-            torch.empty_like(args[-1]),
+            *(() if q_rotated else (torch.empty_like(args[-1]),)),
         )
 
     score_op.register_fake(_score_fake)
@@ -813,7 +855,7 @@ def _get_msa_dcp_fp4_op(
             k, v, index_q = gather_group_kv(
                 k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
             )
-        new_kv_cache, new_index_cache, new_scale_cache, candidates, q = score_op(
+        new_kv_cache, new_index_cache, new_scale_cache, candidates, *rotated = score_op(
             k,
             v,
             index_q,
@@ -826,8 +868,10 @@ def _get_msa_dcp_fp4_op(
             metadata.query_start_loc,
             metadata.request_distribution,
             dcp_rank,
-            q.contiguous(),
+            *(() if q_rotated else (q.contiguous(),)),
         )
+        if rotated:
+            (q,) = rotated
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
         scale_cache.copy_(new_scale_cache)
