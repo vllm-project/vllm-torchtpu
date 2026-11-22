@@ -78,24 +78,32 @@ def _check_lookup():
     ).astype(np.int32)
     hashes[3, 1, 5] = -1  # a dead n-gram reads as zeros
 
-    mesh = Mesh(np.array(jax.devices()[:WORLD]), (engram_hbm._AXIS,))
-    lookup = engram_hbm.make_lookup(mesh, COLS, PART_COLS, rows, DIM, BLOCK, NODE, meta)
-    out = lookup(
-        jnp.asarray(hashes.reshape(WORLD * TOKENS, COLS)),
-        jnp.asarray(table),
-        jnp.asarray(scales),
-        jnp.arange(WORLD, dtype=jnp.int32).reshape(WORLD, 1),
-    )
-    out = np.asarray(out).reshape(WORLD, TOKENS, COLS, DIM)
-
-    expected = np.zeros_like(out)
+    expected = np.zeros((WORLD, TOKENS, COLS, DIM), ml_dtypes.bfloat16)
     for r in range(WORLD):
         for t in range(TOKENS):
             for c in range(COLS):
                 g = hashes[r, t, c]
                 if g >= 0:
                     expected[r, t, c] = _reference(full_raw[g], full_scale[g])
-    np.testing.assert_array_equal(out.view(np.uint16), expected.view(np.uint16))
+
+    mesh = Mesh(np.array(jax.devices()[:WORLD]), (engram_hbm._AXIS,))
+    merged_max = engram_hbm.MERGED_EXCHANGE_MAX_TOKENS
+    assert merged_max >= TOKENS
+    # Rows and scales in one exchange (decode buckets), then in two.
+    for threshold in (merged_max, 0):
+        engram_hbm.MERGED_EXCHANGE_MAX_TOKENS = threshold
+        lookup = engram_hbm.make_lookup(
+            mesh, COLS, PART_COLS, rows, DIM, BLOCK, NODE, meta
+        )
+        out = lookup(
+            jnp.asarray(hashes.reshape(WORLD * TOKENS, COLS)),
+            jnp.asarray(table),
+            jnp.asarray(scales),
+            jnp.arange(WORLD, dtype=jnp.int32).reshape(WORLD, 1),
+        )
+        engram_hbm.MERGED_EXCHANGE_MAX_TOKENS = merged_max
+        out = np.asarray(out).reshape(WORLD, TOKENS, COLS, DIM)
+        np.testing.assert_array_equal(out.view(np.uint16), expected.view(np.uint16))
 
 
 def test_dequant_matches_reference():

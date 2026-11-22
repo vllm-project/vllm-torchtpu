@@ -45,6 +45,8 @@ _ENV = "TPU_DEEPSEEK_V41_ENGRAM_HBM"
 # ``auto`` enables ``first`` from this EP size: measured faster at EP16; at EP8
 # the 11.8 GiB table costs ~37% of the KV pool.
 AUTO_MIN_EP_SIZE = 16
+# Token buckets up to this size exchange rows and scales in one all-to-all.
+MERGED_EXCHANGE_MAX_TOKENS = 64
 
 
 def _tp_size() -> int:
@@ -224,14 +226,22 @@ def make_lookup(
             node_size, num_tokens, part_cols, blocks
         )
         scale = jnp.where(valid[..., None], scale, jnp.uint8(_INVALID_SCALE))
-        raw = jax.lax.all_to_all(raw, _AXIS, 0, 0, tiled=True, axis_index_groups=groups)
-        scale = jax.lax.all_to_all(
-            scale, _AXIS, 0, 0, tiled=True, axis_index_groups=groups
-        )
-        # [source rank, T, heads, ...] -> [T, source rank * heads, ...]: the
-        # head shard order of the host exchange.
-        raw = jnp.transpose(raw, (1, 0, 2, 3)).reshape(num_tokens, cols, dim)
-        scale = jnp.transpose(scale, (1, 0, 2, 3)).reshape(num_tokens, cols, blocks)
+
+        def exchange(x):
+            # [source rank, T, heads, ...] -> [T, source rank * heads, ...]:
+            # the head shard order of the host exchange.
+            x = jax.lax.all_to_all(x, _AXIS, 0, 0, tiled=True, axis_index_groups=groups)
+            return jnp.transpose(x, (1, 0, 2, 3)).reshape(num_tokens, cols, -1)
+
+        if num_tokens <= MERGED_EXCHANGE_MAX_TOKENS:
+            # Latency-bound: one all-to-all of rows with their scales appended
+            # instead of two.
+            rows_with_scales = exchange(jnp.concatenate([raw, scale], axis=-1))
+            raw, scale = rows_with_scales[..., :dim], rows_with_scales[..., dim:]
+        else:
+            # Bandwidth-bound: appending the dim // block_size scale bytes pads
+            # every dim-byte row to the next 128-byte tile, so they go alone.
+            raw, scale = exchange(raw), exchange(scale)
         return dequant(raw, scale, block_size)
 
     def lookup(h: jax.Array, w: jax.Array, s: jax.Array, rank: jax.Array) -> jax.Array:
