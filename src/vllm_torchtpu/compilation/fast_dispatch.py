@@ -27,13 +27,13 @@ per-call frame evaluation; every guard Dynamo built is kept.
 * The guard memo (``runner.host_trims`` turns it on under the batch-1 rule;
   it only acts with ``fast_compiled_call``): on top of the direct dispatch,
   remember which cache entry the guard check selected for an argument
-  *signature* (per tensor: shape, stride, dtype, device, requires_grad, and
-  which earlier tensor argument it is, if any; per Python scalar / None /
-  str: its type and value; any other object: its id; lists and tuples
-  element-wise) and dispatch later calls with the same signature to that
-  entry without re-running ``guard_manager.check``. An entry keeps a weak
-  reference to each object it keys by id (a strong one if the object takes
-  no weak reference) and is used only while each is still that object, so a
+  *signature* (per tensor: shape, stride, dtype, device, requires_grad, its
+  Python type, and which earlier tensor argument it is, if any; per Python
+  scalar / None / str: its type and value; any other object: its id; lists and
+  tuples element-wise) and dispatch later calls with the same signature to
+  that entry without re-running ``guard_manager.check``. An entry keeps a weak
+  reference to each object it keys by id (a strong one if the object takes no
+  weak reference) and is used only while each is still that object, so a
   recycled id never matches. The memo is dropped whenever the code object's
   cache entries change (recompile or eviction). A guard on something the
   signature does not cover (a global, or an attribute of an argument object)
@@ -100,8 +100,18 @@ def _signature(args: tuple | list, tensor_ids: dict, objs: list | None) -> tuple
     for a in args:
         if isinstance(a, torch.Tensor):
             alias = tensor_ids.setdefault(id(a), len(tensor_ids))
+            # Dynamo's tensor guard checks the exact type too (a subclass or
+            # an nn.Parameter gets its own cache entry).
             parts.append(
-                (a.shape, a.stride(), a.dtype, a.device, a.requires_grad, alias)
+                (
+                    a.shape,
+                    a.stride(),
+                    a.dtype,
+                    a.device,
+                    a.requires_grad,
+                    type(a),
+                    alias,
+                )
             )
         elif a is None or type(a) in _SCALARS:
             parts.append((type(a), a))

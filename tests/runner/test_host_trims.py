@@ -81,6 +81,32 @@ def test_memo_key_covers_metadata_scalars_and_identity():
     assert fd._memo_key(([0] * (fd._MEMO_MAX_SEQ + 1),)) is None
 
 
+class _SubTensor(torch.Tensor):
+    pass
+
+
+def _fn_type(x):
+    return x * 2 + (100 if type(x) is _SubTensor else 0)
+
+
+def test_memo_key_tells_tensor_types_apart():
+    # Dynamo's tensor guard checks the exact type: a subclass and an
+    # nn.Parameter each get their own cache entry, so they need their own key.
+    t = torch.zeros(4)
+    assert fd._memo_key((t,)) != fd._memo_key((t.as_subclass(_SubTensor),))
+    param = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+    assert fd._memo_key((t,)) != fd._memo_key((param,))
+
+
+def test_memo_never_hits_across_tensor_types(memo_on):
+    w = _wrapped(_fn_type)
+    for _ in range(3):
+        x, sub = torch.zeros(4), torch.zeros(4).as_subclass(_SubTensor)
+        torch.testing.assert_close(w(x), x * 2)
+        torch.testing.assert_close(w(sub).as_subclass(torch.Tensor), x * 2 + 100)
+    assert fd._MEMO_STATS["hit"] >= 2
+
+
 def test_memo_key_tells_aliased_tensor_arguments_apart():
     # Dynamo guards whether two tensor inputs are the same tensor, so the
     # same tensor twice and two equal-metadata tensors need different keys.
