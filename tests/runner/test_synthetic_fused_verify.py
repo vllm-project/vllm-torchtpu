@@ -24,6 +24,7 @@ import vllm.distributed
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
+from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.speculative_decoding_manager import SpecDecodeMetadata
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -115,10 +116,8 @@ def test_fused_verify_matches_three_programs(monkeypatch, warm, top_p, seed):
     gen.set_state(md_gen_state)
     md = _metadata(gen)
     if warm:
-        variant = runner._synthetic_sampler_variant(0, 3)
-        runner._synthetic_fused_warm.add(
-            runner._synthetic_fused_key(16, 16, 4, variant)
-        )
+        runner._synthetic_fused_warm.add("warmed")
+        monkeypatch.setattr(tpu_runner, "program_key", lambda _args: "warmed")
     fused_calls = []
     fused = TPUModelRunner.synthetic_verify_and_sample
     monkeypatch.setattr(

@@ -1187,7 +1187,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Under the synthetic one-row verify, run the accept plan, the LM head and
     # the sampler as one compiled program (`synthetic_verify_and_sample`)
     # instead of three, at the shapes the warmup compiled it for. Same
-    # uniforms and tokens.
+    # uniforms and tokens; the LM head moves from execute_model to
+    # sample_tokens, so each chunk's hidden states stay referenced until then.
     "TPU_SPEC_SYNTHETIC_FUSED_VERIFY": env_bool(
         "TPU_SPEC_SYNTHETIC_FUSED_VERIFY", default=False
     ),

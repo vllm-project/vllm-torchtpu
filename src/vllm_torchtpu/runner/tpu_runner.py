@@ -1239,8 +1239,8 @@ class TPUModelRunner(GPUModelRunner):
         # `program_key`s of the arguments the warmup compiled
         # `_substitute_and_extract_drafts` at.
         self._substitute_drafts_warm: set[tuple] = set()
-        # `_synthetic_fused_key`s the warmup compiled `synthetic_verify_and_sample`
-        # for (`TPU_SPEC_SYNTHETIC_FUSED_VERIFY`).
+        # `program_key`s of the arguments the warmup compiled
+        # `synthetic_verify_and_sample` at (`TPU_SPEC_SYNTHETIC_FUSED_VERIFY`).
         self._synthetic_fused_warm: set[tuple] = set()
 
         self._init_phased_profiling()
@@ -5112,14 +5112,6 @@ class TPUModelRunner(GPUModelRunner):
             "apply_top_k": self._sampler_applies_top_k(),
         }
 
-    def _synthetic_fused_key(
-        self, hidden_rows: int, num_tokens: int, num_reqs: int, variant: dict
-    ) -> tuple:
-        """What `synthetic_verify_and_sample` compiles per: the hidden-state
-        rows, the verify length, the padded requests and the variant (the row
-        split and the draw's layout follow from the requests)."""
-        return (hidden_rows, num_tokens, num_reqs, *sorted(variant.items()))
-
     def _sample_synthetic_verify_fused(
         self, md: SpecDecodeMetadata, cur_start_idx: int, cur_end_idx: int
     ) -> torch.Tensor:
@@ -5133,28 +5125,12 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         num_reqs = md.draft_lengths.shape[0]
         variant = self._synthetic_sampler_variant(cur_start_idx, cur_end_idx)
-        key = self._synthetic_fused_key(
-            hidden_states.shape[0], md.draft_token_ids.shape[0], num_reqs, variant
-        )
-        if key not in self._synthetic_fused_warm:
-            logger.warning_once(
-                "Synthetic fused verify not precompiled for %s; "
-                "running its three programs.",
-                key,
-            )
-            rows = self._decide_synthetic_verify(
-                md, synthetic_verify_rows_from_uniforms, md.synthetic_uniforms
-            )
-            logits = self._synthetic_logits(hidden_states, rows, md)
-            return self._sample_synthetic_verify(
-                logits, md, cur_start_idx, cur_end_idx, None
-            )
         # float32: the program casts them to the logits' dtype, the rounding
         # the upload at that dtype does.
         temperatures, top_k, top_p = self._padded_sampling_params(
             cur_start_idx, cur_end_idx, num_reqs, torch.float32, hidden_states.device
         )
-        return self.synthetic_verify_and_sample(
+        args = (
             hidden_states,
             md.draft_token_ids,
             md.draft_lengths,
@@ -5170,8 +5146,25 @@ class TPUModelRunner(GPUModelRunner):
             top_p,
             md.synthetic_row_rank,
             self.speculative_config.num_speculative_tokens,
-            **variant,
         )
+        key = program_key((args, variant))
+        if key not in self._synthetic_fused_warm:
+            logger.warning_once(
+                "Synthetic fused verify not precompiled for %d hidden rows, "
+                "%d verify rows, %d requests, %s; running its three programs.",
+                hidden_states.shape[0],
+                md.draft_token_ids.shape[0],
+                num_reqs,
+                tuple(sorted(variant.items())),
+            )
+            rows = self._decide_synthetic_verify(
+                md, synthetic_verify_rows_from_uniforms, md.synthetic_uniforms
+            )
+            logits = self._synthetic_logits(hidden_states, rows, md)
+            return self._sample_synthetic_verify(
+                logits, md, cur_start_idx, cur_end_idx, None
+            )
+        return self.synthetic_verify_and_sample(*args, **variant)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def synthetic_verify_and_sample(
@@ -7603,6 +7596,24 @@ class TPUModelRunner(GPUModelRunner):
         rank = (
             self._synthetic_row_rank if self._synthetic_rows_split(num_reqs) else None
         )
+        args = (
+            hidden,
+            draft_token_ids,
+            draft_lengths,
+            segment_ids,
+            group_indices,
+            target_logits_indices,
+            bonus_logits_indices,
+            # Its own tensor, as in serving: dynamo guards on aliasing.
+            torch.zeros_like(target_logits_indices),
+            uniforms,
+            self.rejection_sampler.synthetic_conditional_rates,
+            temps,
+            top_k,
+            top_p,
+            rank,
+            self.speculative_config.num_speculative_tokens,
+        )
         for variant in variants:
             full = {
                 "topk_candidates": 0,
@@ -7611,29 +7622,9 @@ class TPUModelRunner(GPUModelRunner):
                 **variant,
             }
             with torch.no_grad():
-                out = self.synthetic_verify_and_sample(
-                    hidden,
-                    draft_token_ids,
-                    draft_lengths,
-                    segment_ids,
-                    group_indices,
-                    target_logits_indices,
-                    bonus_logits_indices,
-                    # Its own tensor, as in serving: dynamo guards on aliasing.
-                    torch.zeros_like(target_logits_indices),
-                    uniforms,
-                    self.rejection_sampler.synthetic_conditional_rates,
-                    temps,
-                    top_k,
-                    top_p,
-                    rank,
-                    self.speculative_config.num_speculative_tokens,
-                    **full,
-                )
+                out = self.synthetic_verify_and_sample(*args, **full)
             synchronize_tensors(out)
-            self._synthetic_fused_warm.add(
-                self._synthetic_fused_key(num_tokens, num_tokens, num_reqs, full)
-            )
+            self._synthetic_fused_warm.add(program_key((args, full)))
 
     def _precompile_top_token_verify(
         self,
