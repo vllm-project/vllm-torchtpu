@@ -543,7 +543,7 @@ def _recover_tokens(
         )
     is_greedy = temperatures.squeeze(-1) == 0
     valid_draft_token_ids = draft_token_ids >= 0
-    safe_draft_token_ids = draft_token_ids.clamp(min=0)
+    safe_draft_token_ids = draft_token_ids.clamp(min=0).long()
     # On rejection, resample from the residual max(0, p - q). Placeholder
     # drafts have no q mass to subtract, so their recovery distribution
     # remains the full target distribution.
@@ -984,44 +984,42 @@ def _synthetic_verify_rows(
     total_tokens = draft_token_ids.shape[0]
     batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device
-    draft_token_ids = draft_token_ids.to(torch.int64)
-    group_indices = group_indices.to(torch.int64)
+    # int32 throughout: the ids and positions fit, and 64-bit integers split
+    # every gather and compare into two on TPU.
+    i32 = torch.int32
+    draft_token_ids = draft_token_ids.to(i32)
+    group_indices = group_indices.to(i32)
+    num_draft_tokens = num_draft_tokens.to(i32)
 
     accepted = (accept_u < synthetic_conditional_rates[group_indices]) & (
         draft_token_ids >= 0
     )
-    match_mask = segment_ids.unsqueeze(0) == torch.arange(
-        batch_size, device=device
+    match_mask = segment_ids.to(i32).unsqueeze(0) == torch.arange(
+        batch_size, dtype=i32, device=device
     ).unsqueeze(1)
     valid_slot_mask = torch.any(
-        match_mask
-        & (group_indices.unsqueeze(0) < num_draft_tokens.to(torch.int64).unsqueeze(1)),
+        match_mask & (group_indices.unsqueeze(0) < num_draft_tokens.unsqueeze(1)),
         dim=0,
     )
     rejected_slot = match_mask & (valid_slot_mask & ~accepted).unsqueeze(0)
-    large_value = torch.tensor(total_tokens, dtype=torch.int64, device=device)
     # Slots of a request are consecutive with increasing group index, so its
     # first rejected slot is the smallest position.
-    positions = torch.arange(total_tokens, dtype=torch.int64, device=device)
+    positions = torch.arange(total_tokens, dtype=i32, device=device)
     first_rejected_pos = torch.min(
-        torch.where(rejected_slot, positions.unsqueeze(0), large_value), dim=1
+        torch.where(rejected_slot, positions.unsqueeze(0), total_tokens), dim=1
     ).values
     any_rejected = first_rejected_pos < total_tokens
     safe_pos = torch.clamp(first_rejected_pos, max=total_tokens - 1)
     accepted_count = torch.where(
-        any_rejected, group_indices[safe_pos], num_draft_tokens.to(torch.int64)
+        any_rejected, group_indices[safe_pos], num_draft_tokens
     )
     logits_row = torch.where(
         any_rejected,
-        target_logits_indices.to(torch.int64)[safe_pos],
-        bonus_logits_indices.to(torch.int64),
+        target_logits_indices.to(i32)[safe_pos],
+        bonus_logits_indices.to(i32),
     )
-    rows = final_logits_indices[logits_row].to(torch.int32)
-    recover_draft = torch.where(
-        any_rejected,
-        draft_token_ids[safe_pos],
-        torch.full_like(accepted_count, -1),
-    )
+    rows = final_logits_indices[logits_row].to(i32)
+    recover_draft = torch.where(any_rejected, draft_token_ids[safe_pos], -1)
     return accepted_count, rows, recover_draft
 
 
@@ -1232,13 +1230,14 @@ def _assemble_synthetic(
     # select chains on TPU (~200 us at 64 requests); masked reductions over
     # [requests, slots] do the same work vectorized. The [R, 1 + K, T] mask is
     # R * (1 + K) * T elements: 64 x 8 x 512 = 256K at max_num_seqs 64.
-    match = segment_ids.unsqueeze(0) == torch.arange(
-        batch_size, device=device
+    i32 = torch.int32
+    match = segment_ids.to(i32).unsqueeze(0) == torch.arange(
+        batch_size, dtype=i32, device=device
     ).unsqueeze(1)
-    limit = torch.minimum(num_draft_tokens.to(torch.int64), accepted_count)
-    group_indices = group_indices.to(torch.int64)
+    limit = torch.minimum(num_draft_tokens.to(i32), accepted_count.to(i32))
+    group_indices = group_indices.to(i32)
     kept = match & (group_indices.unsqueeze(0) < limit.unsqueeze(1))  # [R, T]
-    column = torch.arange(max_draft_tokens + 1, device=device)
+    column = torch.arange(max_draft_tokens + 1, dtype=i32, device=device)
     at_column = kept.unsqueeze(1) & (
         group_indices.view(1, 1, -1) == column.view(1, -1, 1)
     )  # [R, 1 + K, T]
@@ -1248,7 +1247,7 @@ def _assemble_synthetic(
         torch.tensor(PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device),
     ).amax(dim=-1)
     selected_tokens = torch.where(
-        column.unsqueeze(0) == accepted_count.unsqueeze(1),
+        column.unsqueeze(0) == accepted_count.to(i32).unsqueeze(1),
         sampled.to(torch.int32).unsqueeze(1),
         drafts,
     )
