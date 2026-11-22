@@ -798,6 +798,9 @@ def _build_fused_ep_moe_kernel(
     ):
         layout_rows = None
     input_slots = 3 if interleave_inputs else OUT_PARITIES
+    # Rows past a tile's live rows are never committed, so the three-slot
+    # stream need not fetch them; each row DMA holds the weight stream ~35 ns.
+    live_rows_only = envs.MOE_FUSED_EP_V2_LIVE_ROWS_ONLY
     # The prefetch schedule this build can afford: the deepest runway whose
     # nbuf copies of one expert still leave the rest of the buffers inside
     # the budget, walked down from the ceiling one slot at a time. Every
@@ -1408,7 +1411,9 @@ def _build_fused_ep_moe_kernel(
 
                 lax.fori_loop(
                     0,
-                    tile_blocks if interleave_inputs else live_blocks,
+                    tile_blocks
+                    if interleave_inputs and not live_rows_only
+                    else live_blocks,
                     issue_block,
                     jnp.int32(0),
                 )
@@ -1436,11 +1441,30 @@ def _build_fused_ep_moe_kernel(
             """Wait the token rows and the scale window of one tile."""
             # Sems count bytes, so the split wait is exact under any landing
             # order.
-            pltpu.make_async_copy(
-                lhs_vm.at[slot, pl.ds(0, live_rows)],
-                lhs_vm.at[slot, pl.ds(0, live_rows)],
-                lhs_sems.at[slot],
-            ).wait()
+            if live_rows_only and interleave_inputs:
+                # A DMA ref's slice size must be static: a full tile keeps one
+                # wait, a partial tile waits its live rows one row at a time.
+                @pl.when(live_rows == tile_m)
+                def _():
+                    pltpu.make_async_copy(
+                        lhs_vm.at[slot], lhs_vm.at[slot], lhs_sems.at[slot]
+                    ).wait()
+
+                @pl.when(live_rows < tile_m)
+                def _():
+                    def wait_row(r, unused):
+                        pltpu.make_async_copy(
+                            lhs_vm.at[slot, 0], lhs_vm.at[slot, 0], lhs_sems.at[slot]
+                        ).wait()
+                        return unused
+
+                    lax.fori_loop(0, live_rows, wait_row, jnp.int32(0))
+            else:
+                pltpu.make_async_copy(
+                    lhs_vm.at[slot, pl.ds(0, live_rows)],
+                    lhs_vm.at[slot, pl.ds(0, live_rows)],
+                    lhs_sems.at[slot],
+                ).wait()
             if has_act_scale:
                 assert ls_vm is not None
                 pltpu.make_async_copy(
@@ -1766,7 +1790,10 @@ def _build_fused_ep_moe_kernel(
 
                 # Consume the current input. The three-slot stream issues i+2
                 # during down; the legacy path below issues i+1 at tile head.
-                lhs_ready_tile(tile_m if interleave_inputs else live_rows, input_slot)
+                lhs_ready_tile(
+                    tile_m if interleave_inputs and not live_rows_only else live_rows,
+                    input_slot,
+                )
                 other_parity = jnp.int32(1) - parity
 
                 if interleave_inputs:
@@ -1831,7 +1858,34 @@ def _build_fused_ep_moe_kernel(
                     # Static slices, no runtime branch/fori_loop in the DMA path.
                     # Source groups occupy the first tile_m // 16 columns. Final LLO
                     # must confirm their issue positions and available runway.
-                    if column < tile_m // 16:
+                    def issue_row(dst_row):
+                        token = token_gather_sm[
+                            copy_slot * gather_window_rows + copy_offset + dst_row
+                        ]
+                        pltpu.make_async_copy(
+                            lhs_hbm.at[token],
+                            lhs_vm.at[copy_input_slot, dst_row],
+                            lhs_sems.at[copy_input_slot],
+                        ).start()
+
+                    if column < tile_m // 16 and live_rows_only:
+                        lo = column * 16
+
+                        # Full columns keep the static starts; only the column
+                        # holding the tile's last live row loops over its rows.
+                        @pl.when(copy_rows >= lo + 16)
+                        def _():
+                            for r in range(16):
+                                issue_row(jnp.int32(lo + r))
+
+                        @pl.when(jnp.logical_and(copy_rows > lo, copy_rows < lo + 16))
+                        def _():
+                            def start_row(dst_row, unused):
+                                issue_row(dst_row)
+                                return unused
+
+                            lax.fori_loop(lo, copy_rows, start_row, jnp.int32(0))
+                    elif column < tile_m // 16:
                         for r in range(16):
                             dst_row = column * 16 + r
                             src_row = jnp.minimum(jnp.int32(dst_row), copy_rows - 1)
@@ -1843,17 +1897,17 @@ def _build_fused_ep_moe_kernel(
                                 lhs_vm.at[copy_input_slot, dst_row],
                                 lhs_sems.at[copy_input_slot],
                             ).start()
-                        if column == 0 and has_act_scale:
-                            assert ls_hbm is not None and ls_vm is not None
-                            pltpu.make_async_copy(
-                                ls_hbm.at[
-                                    pl.ds(
-                                        copy_base // HIDDEN_LANE_BLOCK, ls_window_rows
-                                    )
-                                ],
-                                ls_vm.at[copy_input_slot],
-                                lhs_sems.at[copy_input_slot],
-                            ).start()
+                    # Both row paths owe the tile's scale window: lhs_ready_tile
+                    # waits its bytes on the same sem, so skipping it hangs.
+                    if column == 0 and tile_m >= 16 and has_act_scale:
+                        assert ls_hbm is not None and ls_vm is not None
+                        pltpu.make_async_copy(
+                            ls_hbm.at[
+                                pl.ds(copy_base // HIDDEN_LANE_BLOCK, ls_window_rows)
+                            ],
+                            ls_vm.at[copy_input_slot],
+                            lhs_sems.at[copy_input_slot],
+                        ).start()
 
                 # The alternate activation slot has retired its previous tile.
                 # Fill the next expert's first tile before this final FFN so
@@ -2297,7 +2351,13 @@ def _build_fused_ep_moe_kernel(
             @pl.when(n_visit > 0)
             def drain_last_input():
                 for j in range(2):
-                    lhs_ready_tile(tile_m, tile_plan_sm[(total_tiles + j) * 3 + 2])
+                    # The spare tiles repeat the last tile, live rows included.
+                    lhs_ready_tile(
+                        tile_plan_sm[(total_tiles + j) * 3 + 1]
+                        if live_rows_only
+                        else tile_m,
+                        tile_plan_sm[(total_tiles + j) * 3 + 2],
+                    )
                 wait_gather_window(
                     tile_plan_sm[(total_tiles + 2) * 3 + 0],
                     lax.rem(carry_end[0], jnp.int32(2)),

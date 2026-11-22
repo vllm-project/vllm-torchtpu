@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_COMBINE_ONE_CALL: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     MOE_FUSED_EP_V2_WEIGHT_DMA_PRIORITY: int = 1
+    MOE_FUSED_EP_V2_LIVE_ROWS_ONLY: bool = False
     TPU_MOE_EPLB_DYNAMIC: bool = False
     TPU_MOE_EPLB_MODE: str = "decode_only"
     TPU_MOE_EPLB_WINDOW_STEPS: int = 16
@@ -979,6 +980,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run fused EP MoE v2's small-t combine (decode) as one Pallas call
     # (fused_moe/v2/combine_small.py) instead of the XLA epilogue.
     "MOE_FUSED_EP_V2_COMBINE_ONE_CALL": env_bool("MOE_FUSED_EP_V2_COMBINE_ONE_CALL"),
+    # Fused EP MoE v2 three-slot input stream: fetch and wait only each
+    # tile's live token rows instead of all tile_m rows.
+    "MOE_FUSED_EP_V2_LIVE_ROWS_ONLY": env_bool("MOE_FUSED_EP_V2_LIVE_ROWS_ONLY"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the
