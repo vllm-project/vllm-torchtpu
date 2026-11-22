@@ -52,6 +52,7 @@ from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
 
 from .qwen38_wholestep_cache import QSALayerCache, wholestep_qsa_writes
 from .qwen38_wholestep_call import (
+    KEY_SLOTS_AUTO,
     LONG_CONTEXT,
     QSA_TABLES,
     compressed_dcp,
@@ -66,6 +67,12 @@ logger = init_logger(__name__)
 STEP0_T, LOOP_T = 4, 1  # query rows per request: draft step 0 (verify rows), loop steps
 # Skip idle request slots in the served request loop (`QSAFullIndexedBlock.skip_idle`).
 SKIP_IDLE = True
+# `VLLM_TPU_MEGAKERNEL=...,draftkeyslots=N|auto`: slots of the draft indexer's key-stream ring
+# (`QSAFullIndexedBlock.key_slots`), as `wholekeyslots` for the target. `auto` resolves per row
+# bucket with the target's rule (`key_slots_for`: 4 up to 48 rows, 3 above, doubled under
+# wholekeylanes=128). Same keys, same scores, same draft tokens. 2 (default): the draft's
+# original 2-slot ring. A deeper ring needs whole compressed keys (no compressed-key DCP).
+KEY_SLOTS: int = 2
 
 
 def draft_kv_dcp() -> int:
@@ -78,16 +85,30 @@ def draft_kv_dcp() -> int:
     return main_kv_dcp() if envs.VLLM_TPU_QSA_MTP_KV_DCP else 1
 
 
-def draft_spec(g: Any, R: int, *, budget: int, max_groups: int, vocab_shard: int) -> Any:
+def draft_key_slots(B: int | None) -> int:
+    """Key-ring slots of the `B`-row draft kernel (`draftkeyslots`; 2 without a bucket)."""
+    if KEY_SLOTS != KEY_SLOTS_AUTO:
+        return KEY_SLOTS
+    if B is None:
+        return 2
+    from . import qwen38_wholestep_call as wsc
+
+    return (4 if B <= 48 else 3) * (2 if wsc.KEY_LANES == 128 else 1)
+
+
+def draft_spec(g: Any, R: int, *, budget: int, max_groups: int, vocab_shard: int,
+               B: int | None = None) -> Any:
     """The one-layer draft-step kernel spec (BF16 HC: the draft keeps its precision).
     With the served request loop, idle request slots are skipped (`skip_idle`: at one
-    row per request a 16-row tile holds 16 request slots)."""
+    row per request a 16-row tile holds 16 request slots). `B`: the row bucket, for
+    the key-ring slots (`draftkeyslots`); None (operand packing) keeps 2."""
     opts = indexed_options()
     dcp = draft_kv_dcp()
     opts.update(dcp=dcp, compressed_dcp=bool(opts.get("compressed_dcp")) and dcp > 1)
-    # The draft builds its own per-page key table (`qsa_step_inputs` without manager pages)
-    # and keeps the 2-slot key ring.
-    opts.update(manager_pages=0, key_slots=2)
+    # The draft builds its own per-page key table (`qsa_step_inputs` without manager pages);
+    # its key ring keeps 2 slots unless `draftkeyslots` is set.
+    slots = 2 if opts["compressed_dcp"] else draft_key_slots(B)
+    opts.update(manager_pages=0, key_slots=slots)
     return wholestep_spec(
         g,
         R,
@@ -155,7 +176,7 @@ def build_draft_call(
         # VLLM_TPU_MK_SCOPES=N: per-phase named scopes in the kernel (profiling only).
         debug=DebugOptions(scopes=int(os.environ.get("VLLM_TPU_MK_SCOPES", "0") or 0)),
     )
-    spec = draft_spec(g, R, budget=budget, max_groups=max_groups, vocab_shard=vocab_shard)
+    spec = draft_spec(g, R, budget=budget, max_groups=max_groups, vocab_shard=vocab_shard, B=B)
     log_mk_options(B, spec, ex.tiles, label="MK draft")
     fn, k_specs, _, n_w = make_flat_segment_step(
         mesh, spec, ex, extra_outs=(KV_NEW, KR_NEW, IR_NEW, TOP)

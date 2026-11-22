@@ -111,6 +111,19 @@ def _parse_int(raw: str, key: str) -> int | None:
     return None
 
 
+def _apply_draft_key_slots(raw: str) -> None:
+    """`draftkeyslots=N|auto` -> `qwen38_draft.KEY_SLOTS` (the draft kernel's key ring)."""
+    auto = "draftkeyslots=auto" in raw.split(",")
+    slots = None if auto else _parse_int(raw, "draftkeyslots")
+    if not (auto or slots):
+        return
+    from . import qwen38_draft, qwen38_wholestep_call
+
+    assert auto or slots >= 2, slots
+    qwen38_draft.KEY_SLOTS = qwen38_wholestep_call.KEY_SLOTS_AUTO if auto else slots
+    logger.info("Qwen3.8 MK draft key stream: %s ring slots", "auto" if auto else slots)
+
+
 def _real_traffic(kw: dict, runner: Any = None, n_req: int | None = None) -> bool:
     """A served step rather than a warmup dummy: some request has more than 64 tokens of context.
 
@@ -873,6 +886,7 @@ class Qwen38SegmentDriver:
             )
             logger.info("Qwen3.8 whole-step key stream: %d pages per DMA, %s ring slots",
                         keymp or 1, "auto" if auto_slots else keyslots or 2)
+        _apply_draft_key_slots(raw)
         keylanes = _parse_int(raw, "wholekeylanes")
         if keylanes:
             from . import qwen38_wholestep_call
