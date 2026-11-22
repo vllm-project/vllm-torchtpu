@@ -60,7 +60,7 @@ def _err(got, want) -> float:
 
 # Rows padded to a sublane tile (7, 21), a half bf16 tile, a tile, the cap; a
 # multi-chunk K (h = 2048 rows at 2i = 2048: 3 gate_up and 2 down chunks).
-@pytest.mark.parametrize("m", [7, 8, 16, 21, 32])
+@pytest.mark.parametrize("m", [7, 8, 16, 21, 32, 48])
 @pytest.mark.parametrize("h,i", [(256, 128), (2048, 1024)])
 def test_matches_reference(m: int, h: int, i: int) -> None:
     ops = _operands(m, h, i, seed=m + h)
@@ -116,7 +116,8 @@ def test_faults_are_caught() -> None:
 
 def test_supported_rows() -> None:
     assert kernel.supported(32, 6144, 1536)
-    assert not kernel.supported(40, 6144, 1536)
+    assert kernel.supported(48, 6144, 1536)
+    assert not kernel.supported(56, 6144, 1536)
     assert kernel.supported(7, 6144, 1536)
     assert not kernel.supported(32, 6144, 1000)
 

@@ -45,7 +45,8 @@ from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce as ar
 
 BF16, F32 = jnp.bfloat16, jnp.float32
 # Above this many rows the weights stop being the whole cost; XLA keeps them.
-MAX_ROWS = 32
+# 48: the c16 b5 draft bucket (5 requests x 7 rows, padded).
+MAX_ROWS = 48
 # bf16 MXU operands pack 16 sublanes.
 _ROW_ALIGN = 16
 # Bytes per weight DMA and how many are in flight: 1.5 MiB x 6 (9 MiB) kept
