@@ -449,6 +449,7 @@ if TYPE_CHECKING:
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     VLLM_TPU_SAMPLER_CANDIDATES_ONLY: bool = False
     VLLM_TPU_SAMPLER_LOGITS_BLOCKS: int = 0
+    VLLM_TPU_SAMPLER_TOPP_NARROW: bool = False
     VLLM_TPU_GDN_MIXED_TILE_POW2: bool = False
     VLLM_TPU_SPEC_BOUNDARY_STATE_COPY: bool = False
     VLLM_TPU_GDN_V3_WINDOW_VERIFY: bool = False
@@ -2838,6 +2839,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SAMPLER_LOGITS_BLOCKS": env_nonnegative_int(
         "VLLM_TPU_SAMPLER_LOGITS_BLOCKS", 0
     ),
+    # With VLLM_TPU_SAMPLER_LOGITS_BLOCKS=2: find the top-p threshold by a
+    # 6-step search over the (at most top_k) kept candidates' probabilities
+    # instead of the 32-step float bisection; each step evaluates the same
+    # mass sum, so the threshold and the kept set are the same.
+    "VLLM_TPU_SAMPLER_TOPP_NARROW": env_bool("VLLM_TPU_SAMPLER_TOPP_NARROW"),
     # GDN v3 static tiling: round the mixed tile down to a power of two so a
     # 24/40-row bucket stays divisible by the triangular solve's block, and
     # assert that divisibility (PR #2821 ece3d83b5). Dynamic tiling

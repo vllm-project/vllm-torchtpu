@@ -8,6 +8,8 @@ import torch
 
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
+    apply_top_k_top_p,
+    apply_top_k_top_p_kmax,
     topk_cutoff_mask,
     topk_mask,
 )
@@ -92,7 +94,7 @@ def _case(seed, num_reqs, pad_reqs, blocks, family, num_cand):
 
 
 @pytest.mark.parametrize("family", ["normal", "grid", "peaked", "zeros"])
-@pytest.mark.parametrize("mode", [1, 2])
+@pytest.mark.parametrize("mode", [1, 2, 3])
 def test_logits_blocks_bitwise(family, mode):
     for seed in range(12):
         num_reqs = 1 + seed % 3
@@ -108,7 +110,7 @@ def test_logits_blocks_b8_shape():
     for seed in range(4):
         args = _case(100 + seed, 6, 8, 80, "normal", 32)
         ref = _verify_fused_one_draw_impl(*args)
-        for mode in (1, 2):
+        for mode in (1, 2, 3):
             out = _verify_fused_one_draw_impl(*args, mode)
             assert all(torch.equal(a, b) for a, b in zip(ref, out))
 
@@ -147,3 +149,68 @@ def test_mutation_is_caught(monkeypatch):
         for s, ref in enumerate(refs)
     )
     assert diffs > 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_topp_narrow_matches_bisection(dtype):
+    """mode 3's top-p search returns the bisection's mask, including p close
+    to 1 (the whole kept mass below p) and tie-heavy rows."""
+    g = torch.Generator().manual_seed(1)
+    ps = [1e-6, 0.3, 0.5, 0.8, 0.95, 0.999, 0.9999999, 1.0]
+    for trial in range(40):
+        rows = 8
+        if trial % 3 == 0:
+            x = torch.randint(-6, 7, (rows, 1024), generator=g).float() * 0.5
+        elif trial % 3 == 1:
+            x = torch.randn(rows, 1024, generator=g) * (1 + trial % 5)
+        else:
+            x = torch.randn(rows, 1024, generator=g)
+            x[:, :3] = 20.0
+        x = x.to(dtype)
+        k = torch.randint(1, 33, (rows, 1), generator=g)
+        p = torch.tensor([[ps[int(i)]] for i in torch.randint(0, len(ps), (rows,), generator=g)])
+        ref = apply_top_k_top_p(x, k, p)
+        out = apply_top_k_top_p_kmax(x, k, p, 32, topp_narrow=True)
+        assert torch.equal(ref, out), trial
+
+
+def test_topp_narrow_keep_all_rows():
+    # bf16 probabilities whose kept mass rounds below p: the bisection keeps
+    # every top-k entry; the narrowed search must too.
+    g = torch.Generator().manual_seed(3)
+    for _ in range(50):
+        x = (torch.randn(8, 1024, generator=g) * 2).to(torch.bfloat16)
+        k = torch.full((8, 1), 32)
+        p = torch.full((8, 1), 0.9999999)
+        assert torch.equal(
+            apply_top_k_top_p(x, k, p), apply_top_k_top_p_kmax(x, k, p, 32, True)
+        )
+
+
+@pytest.mark.parametrize(
+    "lb,narrow,want", [(0, False, 0), (0, True, 0), (1, True, 1), (2, False, 2), (2, True, 3)]
+)
+def test_runner_mode(monkeypatch, lb, narrow, want):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    monkeypatch.setattr(envs, "VLLM_TPU_SAMPLER_LOGITS_BLOCKS", lb, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_SAMPLER_TOPP_NARROW", narrow, raising=False)
+    assert TPUModelRunner._sampler_logits_blocks() == want
+
+
+def test_ro_lb_impl_matches_ro_impl():
+    from vllm_torchtpu.runner.tpu_runner import (
+        _verify_one_draw_ro_impl,
+        _verify_one_draw_ro_lb_impl,
+    )
+
+    args = _case(7, 3, 4, 40, "peaked", 16)[:-1]
+    slots = torch.arange(4, dtype=torch.int32)
+    for mode in (1, 2, 3):
+        ro_a = torch.zeros(8, dtype=torch.int32)
+        ro_b = torch.zeros(8, dtype=torch.int32)
+        n = torch.tensor(3)
+        out_a = _verify_one_draw_ro_impl(ro_a, [slots], n, *args)
+        out_b = _verify_one_draw_ro_lb_impl(ro_b, [slots], n, mode, *args)
+        assert torch.equal(out_a, out_b) and torch.equal(ro_a, ro_b)
