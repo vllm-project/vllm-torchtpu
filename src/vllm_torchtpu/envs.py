@@ -164,6 +164,7 @@ if TYPE_CHECKING:
     TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS: bool = False
     TPU_SPEC_SYNTHETIC_FUSED_VERIFY: bool = False
     TPU_SPEC_SYNTHETIC_KEYED_UNIFORMS: bool = False
+    TPU_DSPARK_REPLICATED_EMBED: bool = False
     TPU_DSPARK_MARKOV_KERNEL: bool = True
     TPU_DSPARK_FUSED_MLP: str = "0"
     TPU_DRAFT_DCP_PAIR_MERGE: bool = False
@@ -1234,6 +1235,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # distribution.
     "TPU_SPEC_SYNTHETIC_KEYED_UNIFORMS": env_bool(
         "TPU_SPEC_SYNTHETIC_KEYED_UNIFORMS", default=False
+    ),
+    # The DSpark draft looks its anchors up in a full replicated copy of its
+    # embedding (vocab x hidden per rank, 2.5 GB at MiniMax-M3's 200k x 6144
+    # bf16) instead of the vocab-parallel one, whose lookup ends in a TP
+    # all-reduce on every draft step. Same rows.
+    "TPU_DSPARK_REPLICATED_EMBED": env_bool(
+        "TPU_DSPARK_REPLICATED_EMBED", default=False
     ),
     # The DSpark greedy Markov chain over a vocab-parallel LM head runs its K
     # steps as one kernel with remote-DMA exchanges

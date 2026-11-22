@@ -37,10 +37,15 @@ from typing import NamedTuple
 
 import torch
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
-from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
+from vllm_torchtpu.spec_decode.utils import (
+    DraftChunkInputs,
+    populate_draft_embed_from_target,
+)
 
 logger = init_logger(__name__)
 
@@ -148,6 +153,8 @@ class DSparkProposer(DFlashProposer):
         # (max, id) pair per rank and row). Greedy ids are identical to the
         # argmax of the gathered logits. Drafts without the method keep the
         # gathered path.
+        if envs.TPU_DSPARK_REPLICATED_EMBED:
+            self._replicate_draft_embed()
         enable = getattr(self.draft_model, "enable_vocab_parallel_markov_argmax", None)
         self._vocab_parallel_markov = (
             callable(enable) and not self._draft_replicated and bool(enable())
@@ -157,6 +164,22 @@ class DSparkProposer(DFlashProposer):
                 "DSpark: greedy Markov drafting argmaxes the vocab-parallel "
                 "logits per rank; full-vocab logits are not gathered."
             )
+
+    def _replicate_draft_embed(self) -> None:
+        """`TPU_DSPARK_REPLICATED_EMBED`: the draft's vocab-parallel
+        embed_tokens (its own or the target's, shared) becomes a full
+        nn.Embedding on every rank, so the anchor lookup needs no all-reduce.
+        A target that shares the module keeps its own reference to it."""
+        assert self.draft_model is not None
+        embed = self.draft_model.model.embed_tokens
+        if not isinstance(embed, VocabParallelEmbedding) or embed.tp_size == 1:
+            logger.warning(
+                "TPU_DSPARK_REPLICATED_EMBED: the draft embedding is %s, not a "
+                "TP-sharded VocabParallelEmbedding; left as it is.",
+                type(embed).__name__,
+            )
+            return
+        populate_draft_embed_from_target(self.draft_model, embed)
 
     def _observe_draft_aux(
         self, aux: torch.Tensor, chunk_index: int, chunk: DraftChunkInputs
