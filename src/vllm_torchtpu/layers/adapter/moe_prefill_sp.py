@@ -40,7 +40,9 @@ through every tensor either branch reads (`_retain_buffers`, no data read):
 the first access names each buffer the same way in both traces.
 """
 
+import functools
 import inspect
+from collections.abc import Callable
 from itertools import islice
 from typing import Any
 
@@ -53,18 +55,17 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.model_executor.layers import vocab_parallel_embedding as vpe
 from vllm.model_executor.models import deepseek_v2
-from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_mesh_index
-from vllm_torchtpu.layers.adapter.linear_common import (
-    KEEP_VLLM_LAYOUT_ATTR,
-    WEIGHT_FLIPPED_ATTR,
-)
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import fresh_buffer
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_mesh_index
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.kv_cache_append import (
+    owned_rows_bound_from_local,
+)
 from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import (
     grouped_shared_expert_sharded,
 )
@@ -72,9 +73,18 @@ from vllm_torchtpu.layers.adapter import (
     dcp_token_parallel_op,
     fused_moe_decode,
     fused_moe_ep,
+    replicated_embedding,
+    rmsnorm,
+    small_all_reduce_op,
     token_padding,
 )
 from vllm_torchtpu.layers.adapter.attention import _retain_buffers
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+)
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import fresh_buffer
 
 logger = init_logger(__name__)
 
@@ -96,10 +106,21 @@ SHARED_STACK = (
     "_tpu_sp_shared_w2",
     "_tpu_sp_shared_s2",
 )
+DENSE_STACK = (
+    "_tpu_sp_dense_w13",
+    "_tpu_sp_dense_s13",
+    "_tpu_sp_dense_w2",
+    "_tpu_sp_dense_s2",
+)
 # On an armed decoder layer's mlp: the stacked tensors, its row in them, the op.
 SHARED_ATTR = "_tpu_sp_shared"
 SHARED_INDEX = "_tpu_sp_shared_index"
 SHARED_OP = "_tpu_sp_shared_op"
+DENSE_ATTR = "_tpu_sp_dense"
+DENSE_INDEX = "_tpu_sp_dense_index"
+DENSE_OP = "_tpu_sp_dense_op"
+EMBED_RS_ATTR = "_tpu_sp_embed_rs"
+DEFER_FINAL_AG_ATTR = "_tpu_sp_defer_final_ag"
 OP_ATTR = "_tpu_sp_moe_op"
 SCALE_ATTR = "_tpu_sp_routed_scale"
 
@@ -174,33 +195,39 @@ def _gather(t: torch.Tensor, dim: int) -> torch.Tensor:
     return get_tp_group().all_gather(t, dim)
 
 
+def _is_per_channel_fp8(linear: Any) -> bool:
+    w = getattr(linear, "weight", None)
+    s = getattr(linear, "weight_scale", None)
+    return (
+        w is not None
+        and w.dtype == torch.float8_e4m3fn
+        and s is not None
+        and s.dim() == 1
+        and bool(getattr(linear, WEIGHT_FLIPPED_ATTR, False))
+        and not bool(getattr(linear, KEEP_VLLM_LAYOUT_ATTR, False))
+        and getattr(linear, "bias", None) is None
+    )
+
+
 def _per_channel_fp8(linear: Any) -> tuple[torch.Tensor, torch.Tensor]:
     w, s = linear.weight, getattr(linear, "weight_scale", None)
-    if (
-        w.dtype != torch.float8_e4m3fn
-        or s is None
-        or s.dim() != 1
-        or not getattr(linear, WEIGHT_FLIPPED_ATTR, False)
-        or getattr(linear, KEEP_VLLM_LAYOUT_ATTR, False)
-        or getattr(linear, "bias", None) is not None
-    ):
+    if not _is_per_channel_fp8(linear):
         raise NotImplementedError(
             "TPU_MOE_PREFILL_SEQUENCE_PARALLEL re-shards a shared expert held as "
             "per-channel fp8 (k, n) linears without bias; got "
             f"{w.dtype} weight {tuple(w.shape)}, scale "
             f"{None if s is None else tuple(s.shape)}"
         )
+    assert s is not None
     return w.data, s.data
 
 
-def _group_shared_expert(
-    mlp: Any, tp: int, rank: int, group: int
+def _group_mlp_block(
+    mlp_block: Any, tp: int, rank: int, group: int
 ) -> tuple[torch.Tensor, ...]:
-    """This rank's member slice of the layer's shared expert (w13, s13, w2,
-    s2); the fp8 weights still as the bf16 they were gathered in (exact)."""
-    shared = mlp.shared_experts
-    w13, s13 = _per_channel_fp8(shared.gate_up_proj)
-    w2, s2 = _per_channel_fp8(shared.down_proj)
+    """This rank's member slice of a `DeepseekV2MLP` block (`w13, s13, w2, s2`)."""
+    w13, s13 = _per_channel_fp8(mlp_block.gate_up_proj)
+    w2, s2 = _per_channel_fp8(mlp_block.down_proj)
     return member_slice(
         _gather(w13, 1),
         _gather(s13, 0),
@@ -212,12 +239,25 @@ def _group_shared_expert(
     )
 
 
-def _stack_shared_experts(
-    backbone: Any, mlps: list[Any], parts: list[tuple[torch.Tensor, ...]]
+def _group_shared_expert(
+    mlp: Any, tp: int, rank: int, group: int
+) -> tuple[torch.Tensor, ...]:
+    """Return this rank's member slice of the layer's shared expert."""
+    return _group_mlp_block(mlp.shared_experts, tp, rank, group)
+
+
+def _stack_mlp_parts(
+    backbone: Any,
+    mlps: list[Any],
+    parts: list[tuple[torch.Tensor, ...]],
+    *,
+    stack_names: tuple[str, str, str, str],
+    attr: str,
+    index_attr: str,
 ) -> None:
     stacked = []
     dtypes = (torch.float8_e4m3fn, torch.float32, torch.float8_e4m3fn, torch.float32)
-    for name, column, dtype in zip(SHARED_STACK, zip(*parts), dtypes):
+    for name, column, dtype in zip(stack_names, zip(*parts), dtypes):
         # A fresh buffer, not a view: torch_tpu hands the executable the buffer
         # behind a tensor, and peer-replayed programs then disagree with this
         # rank's argument shapes. Stacked before the fp8 cast (exact).
@@ -225,8 +265,21 @@ def _stack_shared_experts(
         backbone.register_buffer(name, t, persistent=False)
         stacked.append(t)
     for i, mlp in enumerate(mlps):
-        setattr(mlp, SHARED_ATTR, tuple(stacked))
-        setattr(mlp, SHARED_INDEX, i)
+        setattr(mlp, attr, tuple(stacked))
+        setattr(mlp, index_attr, i)
+
+
+def _stack_shared_experts(
+    backbone: Any, mlps: list[Any], parts: list[tuple[torch.Tensor, ...]]
+) -> None:
+    _stack_mlp_parts(
+        backbone,
+        mlps,
+        parts,
+        stack_names=SHARED_STACK,
+        attr=SHARED_ATTR,
+        index_attr=SHARED_INDEX,
+    )
 
 
 _SHARED_OPS: dict[tuple, Any] = {}
@@ -265,6 +318,51 @@ def _shared_expert(mlp: Any, x: torch.Tensor) -> torch.Tensor:
     return getattr(mlp, SHARED_OP)(x, *(t[i] for t in getattr(mlp, SHARED_ATTR)))
 
 
+def _dense_mlp(mlp: Any, x: torch.Tensor) -> torch.Tensor:
+    i = getattr(mlp, DENSE_INDEX)
+    return getattr(mlp, DENSE_OP)(x, *(t[i] for t in getattr(mlp, DENSE_ATTR)))
+
+
+def _embed_reduce_scatter(embed: Any, input_ids: torch.Tensor) -> torch.Tensor:
+    """Vocab-parallel embedding reduced onto sequence-parallel rows `[T / tp, H]`.
+
+    Reads the same shard-bound buffers and weight in the same order as
+    `VocabParallelEmbedding.forward` so decode and prefill buckets lift
+    identical arguments for bucket hand-over.
+    """
+    masked_input, input_mask = vpe.get_masked_input_and_mask(
+        input_ids,
+        getattr(
+            embed,
+            "org_vocab_start_index",
+            embed.shard_indices.org_vocab_start_index,
+        ),
+        getattr(
+            embed,
+            "org_vocab_end_index",
+            embed.shard_indices.org_vocab_end_index,
+        ),
+        getattr(
+            embed,
+            "num_org_vocab_padding",
+            embed.shard_indices.num_org_vocab_padding,
+        ),
+        getattr(
+            embed,
+            "added_vocab_start_index",
+            embed.shard_indices.added_vocab_start_index,
+        ),
+        getattr(
+            embed,
+            "added_vocab_end_index",
+            embed.shard_indices.added_vocab_end_index,
+        ),
+    )
+    output_parallel = embed.quant_method.embedding(embed, masked_input.long())
+    output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+    return tensor_model_parallel_reduce_scatter(output_parallel, 0)
+
+
 # ---------------------------------------------------------------------------
 # Forwards
 # ---------------------------------------------------------------------------
@@ -274,9 +372,14 @@ class _OProjReduceScatter:
     """The MLA op's `prefill_group` for an input of all rows: o_proj's partial
     sums, reduce-scattered to each rank's rows instead of all-reduced."""
 
-    @staticmethod
-    def project_reduce_scatter(x: torch.Tensor, o_proj: Any) -> torch.Tensor:
+    def __init__(self, zigzag_bands: int = 1) -> None:
+        self.zigzag_bands = zigzag_bands
+
+    def project_reduce_scatter(self, x: torch.Tensor, o_proj: Any) -> torch.Tensor:
         partial = o_proj.quant_method.apply(o_proj, x)
+        if self.zigzag_bands > 1:
+            tp = get_tensor_model_parallel_world_size()
+            partial = _to_zigzag_rank_major(partial, tp, self.zigzag_bands)
         return tensor_model_parallel_reduce_scatter(partial, 0)
 
 
@@ -288,8 +391,22 @@ class _GatherProjections(_OProjReduceScatter):
 
     @staticmethod
     def project_gather(
-        mla: Any, x: torch.Tensor, num_tokens: int
-    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor | None]:
+        mla: Any,
+        x: torch.Tensor,
+        num_tokens: int,
+        *,
+        positions_local: torch.Tensor | None = None,
+        zigzag_bands: int = 1,
+        owned_k_resolver: Callable[
+            [Any, torch.Tensor, int], tuple[torch.Tensor, torch.Tensor] | None
+        ]
+        | None = None,
+    ) -> tuple[
+        torch.Tensor
+        | tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ]:
         qkv = mla.fused_qkv_a_proj(x)[0]
         indexer = mla.indexer if not mla.skip_topk else None
         tp_op = getattr(getattr(mla, "mla_attn", None), "sparse_mla_tp_op", None)
@@ -321,34 +438,278 @@ class _GatherProjections(_OProjReduceScatter):
                 kv_dim = qkv.shape[-1] - q_lora
                 q_c_local, kv_lora_local = qkv.split([q_lora, kv_dim], dim=-1)
                 cols_qc = (s * q_lora) // rows_local
-                parts = [kv_lora_local, q_c_local[:s].reshape(rows_local, cols_qc)]
+                use_sharded_kv = (
+                    envs.TPU_DCP_TP_SHARDED_KV_WRITE
+                    and envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ
+                    and positions_local is not None
+                    and getattr(mla, "is_sparse", False)
+                    and getattr(mla, "g_proj", None) is None
+                    and getattr(tp_op, "serves_sharded_kv", False)
+                    and getattr(mla, "o_proj", None) is not None
+                    and dcp_token_parallel_op.serves_sequence_row_oproj(mla.o_proj)
+                )
+                qc_head_shift_op = getattr(tp_op, "qc_head_shift_op", None)
+                if use_sharded_kv and qc_head_shift_op is not None:
+                    assert positions_local is not None
+                    if indexer is None:
+                        q_c_qrows = qc_head_shift_op(q_c_local, tp_op.rank)
+                        return (q_c_qrows, kv_lora_local, positions_local), None
+                    if envs.TPU_DCP_TP_SHARDED_INDEXER_K and getattr(
+                        getattr(
+                            getattr(indexer, "indexer_op", None), "topk_op_tp", None
+                        ),
+                        "serves_sharded_k",
+                        False,
+                    ):
+                        kw_local = indexer.wk_weights_proj(x)[0]
+                        k_dim = int(indexer.head_dim)
+                        k_local, w_local = kw_local.split(
+                            [k_dim, kw_local.shape[-1] - k_dim], dim=-1
+                        )
+                        qcw_qrows = qc_head_shift_op(
+                            torch.cat([q_c_local, w_local], dim=-1), tp_op.rank
+                        )
+                        q_c_qrows, w_qrows = qcw_qrows.split(
+                            [q_lora, w_local.shape[-1]], dim=-1
+                        )
+                        return (
+                            (q_c_qrows, kv_lora_local, positions_local),
+                            (k_local, w_qrows, positions_local),
+                        )
+                    gather_owned_k_op = getattr(tp_op, "gather_owned_k_op", None)
+                    if (
+                        not envs.TPU_DCP_TP_SHARDED_INDEXER_K
+                        and envs.TPU_INDEXER_K_WRITE_COMPACT
+                        and gather_owned_k_op is not None
+                        and owned_k_resolver is not None
+                    ):
+                        kw_local = indexer.wk_weights_proj(x)[0]
+                        k_dim = int(indexer.head_dim)
+                        k_local, w_local = kw_local.split(
+                            [k_dim, kw_local.shape[-1] - k_dim], dim=-1
+                        )
+                        owned_plan = owned_k_resolver(mla, k_local, num_tokens)
+                        if owned_plan is not None:
+                            raw_own, pos_own = owned_plan
+                            qcw_qrows = qc_head_shift_op(
+                                torch.cat([q_c_local, w_local], dim=-1), tp_op.rank
+                            )
+                            q_c_qrows, w_qrows = qcw_qrows.split(
+                                [q_lora, w_local.shape[-1]], dim=-1
+                            )
+                            k_own = gather_owned_k_op(k_local, raw_own)
+                            return (
+                                (q_c_qrows, kv_lora_local, positions_local),
+                                (k_own, w_qrows, pos_own),
+                            )
+                qc_head_packed = q_c_local[:s].reshape(rows_local, cols_qc)
+                parts = (
+                    [qc_head_packed]
+                    if use_sharded_kv
+                    else [kv_lora_local, qc_head_packed]
+                )
                 if indexer is not None:
                     parts.append(indexer.wk_weights_proj(x)[0])
-                gathered = _all_rows(torch.cat(parts, dim=-1), num_tokens)
-                kv_lora = gathered[:, :kv_dim]
-                all_heads = gathered[:, kv_dim : kv_dim + cols_qc].reshape(
-                    tp, s, q_lora
+                gathered = _all_rows(
+                    parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1),
+                    num_tokens,
                 )
-                kw = gathered[:, kv_dim + cols_qc :] if indexer is not None else None
+                kv_lora = kv_lora_local
+                if use_sharded_kv:
+                    all_heads = gathered[:, :cols_qc].reshape(tp, s, q_lora)
+                    kw = (
+                        _from_zigzag_rank_major(
+                            gathered[:, cols_qc:], num_tokens, tp, zigzag_bands
+                        )
+                        if indexer is not None
+                        else None
+                    )
+                else:
+                    kv_lora = _from_zigzag_rank_major(
+                        gathered[:, :kv_dim], num_tokens, tp, zigzag_bands
+                    )
+                    all_heads = gathered[:, kv_dim : kv_dim + cols_qc].reshape(
+                        tp, s, q_lora
+                    )
+                    kw = (
+                        _from_zigzag_rank_major(
+                            gathered[:, kv_dim + cols_qc :],
+                            num_tokens,
+                            tp,
+                            zigzag_bands,
+                        )
+                        if indexer is not None
+                        else None
+                    )
                 rank = tp_op.rank.view(1)
-                next_rank = torch.clamp(rank + 1, max=tp - 1)
-                from_next = all_heads.index_select(0, next_rank).squeeze(0)
-                tail_s = torch.where(
-                    rank.view(1, 1) < tp - 1,
-                    from_next,
-                    q_c_local[-1:].expand(s, -1),
-                )
-                q_c_qrows = torch.cat([all_heads[0], q_c_local[s:], tail_s], dim=0)
+                if zigzag_bands > 1:
+                    pad = q_c_local[-1:].expand(s, -1)
+                    r0_tail = torch.cat([q_c_local[s:], pad], dim=0)
+                    tail = torch.where(rank.view(1, 1) == 0, r0_tail, q_c_local)
+                    q_c_qrows = torch.cat([all_heads[0], tail], dim=0)
+                else:
+                    next_rank = torch.clamp(rank + 1, max=tp - 1)
+                    from_next = all_heads.index_select(0, next_rank).squeeze(0)
+                    tail_s = torch.where(
+                        rank.view(1, 1) < tp - 1,
+                        from_next,
+                        q_c_local[-1:].expand(s, -1),
+                    )
+                    q_c_qrows = torch.cat([all_heads[0], q_c_local[s:], tail_s], dim=0)
+                if use_sharded_kv:
+                    assert positions_local is not None
+                    return (q_c_qrows, kv_lora_local, positions_local), kw
                 return (q_c_qrows, kv_lora), kw
 
         parts = [qkv]
         if indexer is not None:
             parts.append(indexer.wk_weights_proj(x)[0])
         rows = _all_rows(torch.cat(parts, dim=-1), num_tokens)
+        if zigzag_bands > 1:
+            rows = _from_zigzag_rank_major(
+                rows, num_tokens, get_tensor_model_parallel_world_size(), zigzag_bands
+            )
         if indexer is None:
             return rows, None
         width = parts[0].shape[-1]
         return rows[:, :width], rows[:, width:]
+
+
+class _ZigzagGatherProjections(_OProjReduceScatter):
+    """Bound `_GatherProjections` carrying a non-unit `zigzag_bands` count."""
+
+    def project_gather(
+        self,
+        mla: Any,
+        x: torch.Tensor,
+        num_tokens: int,
+        *,
+        positions_local: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor
+        | tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ]:
+        return _GatherProjections.project_gather(
+            mla,
+            x,
+            num_tokens,
+            positions_local=positions_local,
+            zigzag_bands=self.zigzag_bands,
+        )
+
+
+class _ShardedKVGatherProjections(_OProjReduceScatter):
+    """Per-step projection gatherer that slices local positions lazily."""
+
+    def __init__(
+        self, positions: torch.Tensor, tp: int, *, zigzag_bands: int = 1
+    ) -> None:
+        super().__init__(zigzag_bands=zigzag_bands)
+        self._positions = positions
+        self._tp = tp
+        self._positions_local: torch.Tensor | None = None
+        self._owned_k_plans: dict[
+            tuple[int, int, int],
+            tuple[torch.Tensor, torch.Tensor],
+        ] = {}
+
+    def _resolve_owned_k_plan(
+        self, mla: Any, k_local: torch.Tensor, num_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        mla_attn = getattr(mla, "mla_attn", None)
+        tp_op = getattr(mla_attn, "sparse_mla_tp_op", None)
+        if tp_op is None:
+            return None
+        owned_rows_op = getattr(tp_op, "indexer_owned_rows_op", None)
+        if owned_rows_op is None or getattr(tp_op, "rank", None) is None:
+            return None
+        indexer_op = getattr(getattr(mla, "indexer", None), "indexer_op", None)
+        topk_op_tp = getattr(indexer_op, "topk_op_tp", None)
+        if not getattr(topk_op_tp, "serves_sharded_k", False):
+            return None
+        unified_qb_op = getattr(mla_attn, "sparse_mla_unified_idx_qb_op", None)
+        if unified_qb_op is not None and not getattr(
+            unified_qb_op, "serves_sharded_k", False
+        ):
+            return None
+        unified_tp_op = getattr(mla_attn, "sparse_mla_unified_tp_op", None)
+        if unified_tp_op is not None and not getattr(
+            unified_tp_op, "serves_sharded_k", False
+        ):
+            return None
+        step_meta_fn = getattr(indexer_op, "live_cache_step_metadata", None)
+        if not callable(step_meta_fn):
+            return None
+        step_meta = step_meta_fn()
+        if step_meta is None:
+            return None
+        seq_lens, block_tables, query_start_loc = step_meta
+        bound = owned_rows_bound_from_local(
+            k_local.shape[0],
+            num_seqs=seq_lens.shape[0],
+            interleave_size=int(tp_op.layout.interleave_size),
+        )
+        if bound >= num_tokens:
+            return None
+        # Avoid int(num_tokens) in plan_key: num_tokens is symbolic under AOT
+        # dynamic tracing, and each _ShardedKVGatherProjections instance serves
+        # one step token count.
+        plan_key = (
+            id(seq_lens),
+            id(block_tables),
+            id(query_start_loc),
+        )
+        cached = self._owned_k_plans.get(plan_key)
+        if cached is not None:
+            return cached
+        own_idx, raw_own = owned_rows_op(
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            k_local[:, :1],
+            tp_op.rank,
+        )
+        pos_own = self._positions.index_select(0, own_idx)
+        plan = (raw_own, pos_own)
+        self._owned_k_plans[plan_key] = plan
+        return plan
+
+    def project_gather(
+        self,
+        mla: Any,
+        x: torch.Tensor,
+        num_tokens: int,
+    ) -> tuple[
+        torch.Tensor
+        | tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ]:
+        # Avoid eager slicing in patched_model_forward: calling
+        # fused_moe_ep.rank_operand() before layer 0's _retain_buffers(*keep)
+        # binds the rank tensor to the module global instead of
+        # layers[0]._tpu_sp_keep, causing ShapeSpecializationError on bucket handover.
+        if self._positions_local is None:
+            rank = fused_moe_ep.rank_operand()
+            self._positions_local = (
+                own_rows_zigzag(self._positions, rank, self._tp, self.zigzag_bands)
+                if self.zigzag_bands > 1
+                else own_rows(self._positions, rank, self._tp)
+            )
+        extra_kw: dict[str, Any] = {
+            "owned_k_resolver": self._resolve_owned_k_plan,
+        }
+        if self.zigzag_bands > 1:
+            extra_kw["zigzag_bands"] = self.zigzag_bands
+        return _GatherProjections.project_gather(
+            mla,
+            x,
+            num_tokens,
+            positions_local=self._positions_local,
+            **extra_kw,
+        )
 
 
 _O_PROJ_RS = _OProjReduceScatter()
@@ -361,11 +722,181 @@ def _check_divides(num_tokens: int) -> int:
     return tp
 
 
+def _to_zigzag_rank_major(x: torch.Tensor, tp: int, num_bands: int) -> torch.Tensor:
+    if num_bands <= 1:
+        return x
+    num_tokens = x.shape[0]
+    band = num_tokens // (tp * num_bands)
+    x_bands = x.view(num_bands, tp, band, *x.shape[1:])
+    slices = [
+        x_bands[k].flip(0) if k % 2 == 1 else x_bands[k] for k in range(num_bands)
+    ]
+    return torch.stack(slices, dim=1).reshape(num_tokens, *x.shape[1:])
+
+
+def _from_zigzag_rank_major(
+    gathered: torch.Tensor, num_tokens: int, tp: int, num_bands: int
+) -> torch.Tensor:
+    if num_bands <= 1:
+        return gathered
+    band = num_tokens // (tp * num_bands)
+    g = gathered.view(tp, num_bands, band, *gathered.shape[1:])
+    parts = [g[:, k].flip(0) if k % 2 == 1 else g[:, k] for k in range(num_bands)]
+    return torch.cat(parts, dim=0).reshape(num_tokens, *gathered.shape[1:])
+
+
+def zigzag_global_to_owner_and_local(
+    indices: torch.Tensor, num_tokens: int, tp: int, num_bands: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map global indices `[M]` to `(owner_rank, local_row)`."""
+    safe_idx = indices.to(torch.int32).clamp(0, num_tokens - 1)
+    rows_per_rank = num_tokens // tp
+    if num_bands <= 1:
+        owner_rank = torch.div(safe_idx, rows_per_rank, rounding_mode="floor")
+        local_row = torch.remainder(safe_idx, rows_per_rank)
+        return owner_rank.to(torch.int32), local_row.to(torch.int32)
+    band = rows_per_rank // num_bands
+    blk = torch.div(safe_idx, band, rounding_mode="floor")
+    off = torch.remainder(safe_idx, band)
+    band_idx = torch.div(blk, tp, rounding_mode="floor")
+    slot = torch.remainder(blk, tp)
+    odd_band = (band_idx % 2) == 1
+    owner_rank = torch.where(odd_band, tp - 1 - slot, slot)
+    local_row = band_idx * band + off
+    return owner_rank.to(torch.int32), local_row.to(torch.int32)
+
+
+def select_sp_hidden_states(
+    local_hidden: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    num_tokens: int,
+    tp: int,
+    zigzag_bands: int,
+    rank_tensor: torch.Tensor | None = None,
+    all_reduce_fn: Any = None,
+) -> torch.Tensor:
+    """Gather `[M, H]` rows from rank-local SP `local_hidden` `[T/tp, H]`.
+
+    Falls back to a full all-gather + un-zigzag when `M >= T/tp` (e.g.
+    prompt_logprobs over a whole prompt chunk). For typical sampling indices
+    (`M <= max_num_reqs`), gathers local rows and runs a masked all-reduce so
+    non-owning ranks contribute +0 and the single owner contributes x.
+    """
+    local_rows = local_hidden.shape[0]
+    if indices.shape[0] >= local_rows:
+        full = _all_rows(local_hidden, num_tokens)
+        if zigzag_bands > 1:
+            full = _from_zigzag_rank_major(full, num_tokens, tp, zigzag_bands)
+        return torch.index_select(full, 0, indices)
+    owner_rank, local_row = zigzag_global_to_owner_and_local(
+        indices, num_tokens, tp, zigzag_bands
+    )
+    picked = torch.index_select(local_hidden, 0, local_row)
+    rk = (
+        (fused_moe_ep.rank_operand() if rank_tensor is None else rank_tensor)
+        .reshape(())
+        .to(owner_rank.dtype)
+    )
+    mask = (owner_rank == rk).unsqueeze(-1)
+    masked = torch.where(mask, picked, torch.zeros_like(picked))
+    reduce_fn = (
+        tensor_model_parallel_all_reduce if all_reduce_fn is None else all_reduce_fn
+    )
+    return reduce_fn(masked)
+
+
+def step_zigzag_bands_for_model(model: torch.nn.Module, num_tokens: int) -> int:
+    backbone = getattr(model, "model", None)
+    if backbone is None or not getattr(backbone, KEEP_ATTR, False):
+        return 1
+    tp = get_tensor_model_parallel_world_size()
+    if num_tokens % tp != 0:
+        return 1
+    active_layers = list(
+        islice(backbone.layers, backbone.start_layer, backbone.end_layer)
+    )
+    return _step_zigzag_bands(active_layers, num_tokens, tp, check_model_tag=False)
+
+
+def is_final_ag_deferred_for_bucket(model: torch.nn.Module, num_tokens: int) -> bool:
+    # Avoid calling applies(): callers run outside model_tag == "backbone"
+    # during precompile and post-forward logits selection.
+    if not (
+        envs.TPU_MOE_PREFILL_SEQUENCE_PARALLEL
+        and num_tokens > envs.bucket_gate_edge(MIN_TOKENS)
+    ):
+        return False
+    backbone = getattr(model, "model", None)
+    if backbone is None:
+        return False
+    return bool(
+        getattr(backbone, KEEP_ATTR, False)
+        and getattr(backbone, DEFER_FINAL_AG_ATTR, False)
+        and get_tensor_model_parallel_world_size() > 1
+    )
+
+
+def _step_zigzag_bands(
+    active_layers: list[Any],
+    num_tokens: int,
+    tp: int,
+    *,
+    check_model_tag: bool = True,
+) -> int:
+    if check_model_tag:
+        if not dcp_token_parallel_op.applies(num_tokens):
+            return 1
+    elif not (
+        envs.TPU_DCP_PREFILL_TOKEN_PARALLEL
+        and num_tokens > envs.bucket_gate_edge(dcp_token_parallel_op.MIN_TOKENS)
+    ):
+        return 1
+    found: int | None = None
+    for layer in active_layers:
+        if getattr(layer, KEEP_ATTR, None) is None:
+            continue
+        mla = getattr(getattr(layer, "self_attn", None), "mla_attn", None)
+        tp_op = getattr(getattr(mla, "mla_attn", None), "sparse_mla_tp_op", None)
+        if tp_op is None:
+            return 1
+        layout = getattr(tp_op, "layout", None)
+        if layout is None or layout.dcp_size != tp:
+            return 1
+        nb = int(layout.effective_zigzag_bands(num_tokens))
+        if nb <= 1:
+            return 1
+        if found is None:
+            found = nb
+        elif found != nb:
+            raise ValueError(
+                f"inconsistent zigzag_bands across armed layers: {found} vs {nb}"
+            )
+    return found or 1
+
+
+def own_rows_zigzag(
+    x: torch.Tensor, rank: torch.Tensor, tp: int, num_bands: int
+) -> torch.Tensor:
+    """Rank `rank`'s `num_bands` alternating forward/reverse zigzag bands."""
+    if num_bands <= 1:
+        return own_rows(x, rank, tp)
+    rows_per_rank = x.shape[0] // tp
+    band = rows_per_rank // num_bands
+    r = rank.reshape(())
+    blocks = x.view(num_bands * tp, band, *x.shape[1:])
+    idx = torch.stack(
+        [k * tp + r if k % 2 == 0 else (k + 1) * tp - 1 - r for k in range(num_bands)]
+    )
+    return blocks.index_select(0, idx).reshape(rows_per_rank, *x.shape[1:])
+
+
 def own_rows(x: torch.Tensor, rank: torch.Tensor, tp: int) -> torch.Tensor:
     """Rank `rank`'s contiguous `1/tp` of the rows of `x`. The rank is data
     (int32 `[1, 1]`), so every rank traces the same program."""
-    rows = x.view(tp, x.shape[0] // tp, *x.shape[1:])
-    return rows.index_select(0, rank.view(1)).view(x.shape[0] // tp, *x.shape[1:])
+    rows_per_rank = x.shape[0] // tp
+    rows = x.view(tp, rows_per_rank, *x.shape[1:])
+    return rows.index_select(0, rank.view(1)).view(rows_per_rank, *x.shape[1:])
 
 
 def _all_rows(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -373,19 +904,35 @@ def _all_rows(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
     return tensor_model_parallel_all_gather(x, 0).narrow(0, 0, num_tokens)
 
 
-def _moe(mlp: Any, x: torch.Tensor, num_tokens: int, tp: int) -> torch.Tensor:
+def _zero_rank_dependency(tensor: torch.Tensor, rank: torch.Tensor) -> torch.Tensor:
+    # Avoid omitting this zero-delta dependency: without tying rank to the
+    # shared-expert output, XLA schedules shared_expert_blocked_down after
+    # fused_ep_moe_v2 instead of overlapping it inside MoE's async FP8
+    # all-gather. Reinterpreting low bits as int16->float32 keeps f - f == 0
+    # for all bit patterns (including NaN/Inf) while surviving simplification.
+    bits_f32 = tensor[:1, :1].reshape(1).view(torch.int16)[:1].to(torch.float32)
+    return rank + (bits_f32 - bits_f32).reshape(rank.shape).to(rank.dtype)
+
+
+def _moe(
+    mlp: Any, x: torch.Tensor, num_tokens: int, tp: int, *, num_bands: int = 1
+) -> torch.Tensor:
     """The MoE block on this rank's rows: routed (fused EP, own tokens) times
     the routed scale, plus the shared expert -- the runner's order."""
     experts = mlp.experts.routed_experts
     router_logits, _ = mlp.gate(x)
     rank = fused_moe_ep.rank_operand()
-    if envs.TPU_MOE_SKIP_PADDED_TOKENS and token_padding._padding_state is not None:
-        pad_mask = own_rows(
-            token_padding._padding_state.local_padding_mask.narrow(0, 0, num_tokens),
-            rank,
-            tp,
+    padding = token_padding._padding_state  # noqa: SLF001 -- runner singleton
+    if envs.TPU_MOE_SKIP_PADDED_TOKENS and padding is not None:
+        raw_mask = padding.local_padding_mask.narrow(0, 0, num_tokens)
+        pad_mask = (
+            own_rows_zigzag(raw_mask, rank, tp, num_bands)
+            if num_bands > 1
+            else own_rows(raw_mask, rank, tp)
         )
         router_logits = torch.where(pad_mask[:, None], float("nan"), router_logits)
+    shared = _shared_expert(mlp, x)
+    routed_rank = _zero_rank_dependency(shared, rank)
     routed = fused_moe_ep.run_sequence_parallel_op(
         getattr(mlp, OP_ATTR),
         x,
@@ -394,13 +941,13 @@ def _moe(mlp: Any, x: torch.Tensor, num_tokens: int, tp: int) -> torch.Tensor:
         experts.w13_weight_scale_inv,
         experts.w2_weight_scale_inv,
         router_logits,
-        rank,
+        routed_rank,
         experts.e_score_correction_bias,
     )
     scale = getattr(mlp, SCALE_ATTR)
     if scale != 1.0:
         routed = routed * scale
-    return _shared_expert(mlp, x) + routed
+    return shared + routed
 
 
 def _sequence_parallel_layer_forward(
@@ -409,6 +956,7 @@ def _sequence_parallel_layer_forward(
     hidden_states: torch.Tensor,
     residual: torch.Tensor | None,
     llama_4_scaling: torch.Tensor | None,
+    gather_group: Any = _GATHER_PROJECTIONS,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens = positions.shape[0]
     tp = _check_divides(num_tokens)
@@ -418,14 +966,80 @@ def _sequence_parallel_layer_forward(
         hidden_states = layer.input_layernorm(hidden_states)
     else:
         hidden_states, residual = layer.input_layernorm(hidden_states, residual)
-    group = _GATHER_PROJECTIONS if sharded_in else _O_PROJ_RS
+    zigzag_bands = int(getattr(gather_group, "zigzag_bands", 1))
+    group = (
+        gather_group
+        if sharded_in
+        else (
+            _O_PROJ_RS
+            if zigzag_bands <= 1
+            else _OProjReduceScatter(zigzag_bands=zigzag_bands)
+        )
+    )
     hidden_states = layer.self_attn.mla_attn(
         positions, hidden_states, llama_4_scaling, prefill_group=group
     )
     if not sharded_in:
-        residual = own_rows(residual, fused_moe_ep.rank_operand(), tp)
+        rk = fused_moe_ep.rank_operand()
+        residual = (
+            own_rows_zigzag(residual, rk, tp, zigzag_bands)
+            if zigzag_bands > 1
+            else own_rows(residual, rk, tp)
+        )
     hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
-    return _moe(layer.mlp, hidden_states, num_tokens, tp), residual
+    if hasattr(layer.mlp, DENSE_OP):
+        return _dense_mlp(layer.mlp, hidden_states), residual
+    return _moe(
+        layer.mlp, hidden_states, num_tokens, tp, num_bands=zigzag_bands
+    ), residual
+
+
+def _can_fuse_decode_post_attn_norm(
+    layer: Any,
+    hidden_states: torch.Tensor,
+) -> bool:
+    if (
+        not envs.TPU_FUSED_OPROJ_AR
+        or getattr(layer, "use_sequence_parallel_moe", False)
+        or getattr(layer, "use_mha", False)
+        or hidden_states.dim() != 2
+        or hidden_states.dtype != torch.bfloat16
+    ):
+        return False
+    mla = getattr(getattr(layer, "self_attn", None), "mla_attn", None)
+    if (
+        mla is None
+        or getattr(getattr(mla, "mla_attn", None), "W_O_dcp_qrep", None) is not None
+    ):
+        return False
+    return small_all_reduce_op.can_fuse_rmsnorm(
+        hidden_states.shape[0],
+        getattr(mla, "o_proj", None),
+        getattr(layer, "post_attention_layernorm", None),
+    )
+
+
+def _decode_fused_post_attn_layer_forward(
+    layer: Any,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    llama_4_scaling: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if residual is None:
+        residual = hidden_states
+        hidden_states = layer.input_layernorm(hidden_states)
+    else:
+        hidden_states, residual = layer.input_layernorm(hidden_states, residual)
+    norm = layer.post_attention_layernorm
+    hidden_states, residual = layer.self_attn.mla_attn(
+        positions,
+        hidden_states,
+        llama_4_scaling,
+        post_attn_norm=(residual, norm.weight, float(norm.variance_epsilon)),
+    )
+    hidden_states = layer.mlp(hidden_states)
+    return hidden_states, residual
 
 
 def patched_decoder_layer_forward(
@@ -434,6 +1048,8 @@ def patched_decoder_layer_forward(
     hidden_states: torch.Tensor,
     residual: torch.Tensor | None,
     llama_4_scaling: torch.Tensor | None = None,
+    *,
+    gather_group: Any = _GATHER_PROJECTIONS,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     keep = getattr(self, KEEP_ATTR, None)
     if keep is None:
@@ -442,11 +1058,15 @@ def patched_decoder_layer_forward(
         )
     hidden_states = _retain_buffers(hidden_states, *keep)
     if not applies(positions.shape[0]):
+        if _can_fuse_decode_post_attn_norm(self, hidden_states):
+            return _decode_fused_post_attn_layer_forward(
+                self, positions, hidden_states, residual, llama_4_scaling
+            )
         return UPSTREAM_DECODER_LAYER_FORWARD(
             self, positions, hidden_states, residual, llama_4_scaling
         )
     return _sequence_parallel_layer_forward(
-        self, positions, hidden_states, residual, llama_4_scaling
+        self, positions, hidden_states, residual, llama_4_scaling, gather_group
     )
 
 
@@ -462,15 +1082,83 @@ def patched_model_forward(
         return UPSTREAM_MODEL_FORWARD(
             self, input_ids, positions, intermediate_tensors, inputs_embeds
         )
-    hidden_states = (
-        inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
+    # Avoid leaving the lifted `num_tokens` SymInt symbolic inside AOT export:
+    # when all layers take sharded KV/indexer paths, no later op equates the
+    # lifted token symbol to a concrete tensor dim, leaving `_embed_reduce_scatter`'s
+    # `aten.empty([floordiv, H])` symbolic and failing static lowering.
+    positions = positions.view(num_tokens, *positions.shape[1:])
+    active_layers = list(islice(self.layers, self.start_layer, self.end_layer))
+    tp = _check_divides(num_tokens)
+    zigzag_bands = _step_zigzag_bands(active_layers, num_tokens, tp)
+    if inputs_embeds is not None:
+        hidden_states = inputs_embeds
+    elif (
+        getattr(self, EMBED_RS_ATTR, False)
+        and input_ids is not None
+        and input_ids.ndim == 1
+    ):
+        input_ids = input_ids.view(num_tokens)
+        full_table = replicated_embedding.full_weight(self.embed_tokens)
+        if full_table is None:
+            embed_ids = (
+                _to_zigzag_rank_major(input_ids, tp, zigzag_bands)
+                if zigzag_bands > 1
+                else input_ids
+            )
+            hidden_states = _embed_reduce_scatter(self.embed_tokens, embed_ids)
+        else:
+            # Avoid calling fused_moe_ep.rank_operand() before layer 0's
+            # _retain_buffers(*keep): it binds the rank tensor to the module
+            # global instead of layers[0]._tpu_sp_keep, and the decode trace
+            # then names it differently (ShapeSpecializationError on handover).
+            first_keep = getattr(self.layers[self.start_layer], KEEP_ATTR)
+            input_ids = _retain_buffers(input_ids, *first_keep)
+            rk = fused_moe_ep.rank_operand()
+            own_ids = (
+                own_rows_zigzag(input_ids, rk, tp, zigzag_bands)
+                if zigzag_bands > 1
+                else own_rows(input_ids, rk, tp)
+            )
+            hidden_states = replicated_embedding.lookup(full_table, own_ids)
+            # The decode buckets keep the vocab-parallel lookup: lift what it
+            # reads so both traces hand buckets over with the same inputs.
+            hidden_states = _retain_buffers(
+                hidden_states, *replicated_embedding.shard_operands(self.embed_tokens)
+            )
+    else:
+        hidden_states = self.embed_input_ids(input_ids)
+    # Avoid ShapeSpecializationError on warmup bucket handover: when
+    # embed_tokens and all leading dense layers take SP collectives, no
+    # all-reduce runs on the prefill branch to lift small_all_reduce_op._RANK.
+    hidden_states = small_all_reduce_op.retain(hidden_states)
+    gather_group: Any = (
+        _GATHER_PROJECTIONS
+        if zigzag_bands <= 1
+        else _ZigzagGatherProjections(zigzag_bands=zigzag_bands)
     )
+    if envs.TPU_DCP_TP_SHARDED_KV_WRITE and any(
+        getattr(layer, KEEP_ATTR, None) is not None for layer in active_layers
+    ):
+        gather_group = _ShardedKVGatherProjections(
+            positions, tp, zigzag_bands=zigzag_bands
+        )
     residual = None
-    for layer in islice(self.layers, self.start_layer, self.end_layer):
-        hidden_states, residual = layer(positions, hidden_states, residual, None)
+    for layer in active_layers:
+        if getattr(layer, KEEP_ATTR, None) is not None:
+            hidden_states, residual = layer(
+                positions, hidden_states, residual, None, gather_group=gather_group
+            )
+        else:
+            hidden_states, residual = layer(positions, hidden_states, residual, None)
     hidden_states, _ = self.norm(hidden_states, residual)
-    if hidden_states.shape[0] != num_tokens:
+    if hidden_states.shape[0] != num_tokens and not getattr(
+        self, DEFER_FINAL_AG_ATTR, False
+    ):
         hidden_states = _all_rows(hidden_states, num_tokens)
+        if zigzag_bands > 1:
+            hidden_states = _from_zigzag_rank_major(
+                hidden_states, num_tokens, tp, zigzag_bands
+            )
     return hidden_states
 
 
@@ -550,10 +1238,66 @@ def _keep_list(mlp: torch.nn.Module) -> list[torch.Tensor]:
     return list(seen.values())
 
 
-def arm(model: torch.nn.Module, vllm_config: Any) -> int:
-    """Prepare every MoE layer of the backbone; returns how many. Collective
-    over the TP group (weight gathers, the EP mesh). Raises for anything the
-    split cannot serve."""
+def _keep_list_dense(mlp: torch.nn.Module) -> list[torch.Tensor]:
+    """Buffers lifted by either branch of an armed dense decoder layer."""
+    seen: dict[int, torch.Tensor] = {}
+    extra = (fused_moe_ep.rank_operand(),)
+    for t in (*mlp.parameters(), *mlp.buffers(), *getattr(mlp, DENSE_ATTR), *extra):
+        if t is not None:
+            seen.setdefault(id(t), t)
+    return list(seen.values())
+
+
+def _dense_group_size(tp: int, shared_group: int) -> int:
+    # Avoid group=4 for the few dense layers: group=2 keeps dense MLP
+    # communication intra-chip (zero inter-chip traffic) at ~340 MB/TC total.
+    return 2 if (shared_group >= 2 and tp % 2 == 0) else 1
+
+
+def _can_arm_dense_layer(layer: Any) -> bool:
+    if not isinstance(layer.mlp, deepseek_v2.DeepseekV2MLP):
+        return False
+    mla = getattr(getattr(layer, "self_attn", None), "mla_attn", None)
+    if (
+        mla is None
+        or "prefill_group" not in inspect.signature(type(mla).forward).parameters
+        or mla.kimi_preprocess is not None
+        or mla.q_lora_rank is None
+        or mla.g_proj is not None
+    ):
+        return False
+    return _is_per_channel_fp8(layer.mlp.gate_up_proj) and _is_per_channel_fp8(
+        layer.mlp.down_proj
+    )
+
+
+def _can_embed_reduce_scatter(backbone: Any, tp: int) -> bool:
+    embed = getattr(backbone, "embed_tokens", None)
+    return (
+        tp > 1
+        and isinstance(embed, vpe.VocabParallelEmbedding)
+        and getattr(embed, "tp_size", 1) == tp
+        and bool(
+            getattr(
+                vpe.VocabParallelEmbedding, "_tpu_vocab_parallel_embedding_patch", False
+            )
+        )
+        and not bool(getattr(embed, "use_fused_embedding", False))
+        and hasattr(embed, "quant_method")
+    )
+
+
+def arm(
+    model: torch.nn.Module,
+    vllm_config: Any,
+    *,
+    defer_final_ag: bool = False,
+) -> int:
+    """Arm MoE and eligible leading dense layers for sequence-parallel prefill.
+
+    Collective over the TP group (weight gathers, the EP mesh). Returns how many
+    MoE layers were armed; raises for anything the split cannot serve.
+    """
     check_config(vllm_config)
     backbone = _backbone(model)
     tp = get_tensor_model_parallel_world_size()
@@ -571,6 +1315,7 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
         raise NotImplementedError(
             "the split needs every layer after the first MoE layer to be MoE"
         )
+    tp_rank = get_tp_group().rank_in_group
     shared_parts = []
     for layer in layers[first:]:
         mla = getattr(layer.self_attn, "mla_attn", None)
@@ -602,16 +1347,14 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             renormalize=experts.renormalize,
             activation=experts.quant_method._tpu_activation_str,
         )
-        if ep_mesh_index() != get_tp_group().rank_in_group:
+        if ep_mesh_index() != tp_rank:
             raise NotImplementedError(
                 "the EP mesh index must be the TP rank (a rank-ordered EP mesh, "
                 "as under DCP): the rank operand also picks the residual rows"
             )
         setattr(mlp, OP_ATTR, op)
         setattr(mlp, SCALE_ATTR, float(mlp.routed_scaling_factor))
-        shared_parts.append(
-            _group_shared_expert(mlp, tp, get_tp_group().rank_in_group, group)
-        )
+        shared_parts.append(_group_shared_expert(mlp, tp, tp_rank, group))
         setattr(mlp, SHARED_OP, _build_shared_op(group))
     _stack_shared_experts(
         backbone, [layer.mlp for layer in layers[first:]], shared_parts
@@ -619,14 +1362,71 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
     del shared_parts
     for layer in layers[first:]:
         setattr(layer, KEEP_ATTR, _keep_list(layer.mlp))
+        if getattr(layer, "post_attention_layernorm", None) is not None:
+            small_all_reduce_op.prepare_rmsnorm_op(
+                float(layer.post_attention_layernorm.variance_epsilon)
+            )
+
+    dense_armed = 0
+    dense_group = _dense_group_size(tp, group)
+    dense_layers = layers[:first]
+    if dense_layers and all(_can_arm_dense_layer(layer) for layer in dense_layers):
+        dense_parts = [
+            _group_mlp_block(layer.mlp, tp, tp_rank, dense_group)
+            for layer in dense_layers
+        ]
+        _stack_mlp_parts(
+            backbone,
+            [layer.mlp for layer in dense_layers],
+            dense_parts,
+            stack_names=DENSE_STACK,
+            attr=DENSE_ATTR,
+            index_attr=DENSE_INDEX,
+        )
+        del dense_parts
+        dense_op = _build_shared_op(dense_group)
+        for layer in dense_layers:
+            # Avoid leaving post_attention_layernorm paired with gate_up_proj:
+            # _dense_mlp bypasses gate_up_proj, leaving PrequantSlot.value set
+            # on SP traces and emitting extra Dynamo outputs (submod_0[1:]).
+            rmsnorm.disarm_post_attention_prequant(layer)
+            setattr(layer.mlp, DENSE_OP, dense_op)
+            setattr(layer, KEEP_ATTR, _keep_list_dense(layer.mlp))
+            if getattr(layer, "post_attention_layernorm", None) is not None:
+                small_all_reduce_op.prepare_rmsnorm_op(
+                    float(layer.post_attention_layernorm.variance_epsilon)
+                )
+        dense_armed = len(dense_layers)
+
+    embed_rs = (first == 0 or dense_armed == first) and _can_embed_reduce_scatter(
+        backbone, tp
+    )
+    setattr(backbone, EMBED_RS_ATTR, embed_rs)
+    embed_replicated = (
+        embed_rs
+        and envs.TPU_EMBED_REPLICATED
+        and replicated_embedding.arm_if_eligible(
+            backbone.embed_tokens,
+            tp,
+            functools.partial(_gather, dim=0),
+            decode=envs.TPU_EMBED_REPLICATED_DECODE,
+        )
+    )
+    setattr(backbone, DEFER_FINAL_AG_ATTR, bool(defer_final_ag))
     setattr(backbone, KEEP_ATTR, True)
     n = len(layers) - first
     logger.info(
-        "TPU_MOE_PREFILL_SEQUENCE_PARALLEL: %d MoE layers armed (layers %d..%d), "
-        "buckets > %d tokens, tp=%d",
+        "TPU_MOE_PREFILL_SEQUENCE_PARALLEL: %d MoE layers (layers %d..%d) and "
+        "%d dense layers (dense_group=%d, embed_rs=%s, embed_replicated=%s, "
+        "defer_final_ag=%s) armed, buckets > %d tokens, tp=%d",
         n,
         backbone.start_layer + first,
         backbone.end_layer - 1,
+        dense_armed,
+        dense_group,
+        embed_rs,
+        embed_replicated,
+        bool(defer_final_ag),
         envs.bucket_gate_edge(MIN_TOKENS),
         tp,
     )

@@ -23,13 +23,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import (
     blocked_down,
     grouped_shared_expert_sharded,
     silu_and_mul,
 )
+from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 AX = "d"
 FP8 = jnp.float8_e4m3fn
@@ -75,3 +75,88 @@ def test_each_rank_gets_the_whole_expert_on_its_rows(group):
     # being summed in bf16 (group > 1).
     tol = 1e-3 if group == 1 else 1e-2
     assert np.linalg.norm(got - want) / np.linalg.norm(want) < tol
+
+
+def _reference_blocked_down_f32(
+    act: jax.Array, w2: jax.Array, s2: jax.Array
+) -> np.ndarray:
+    blocks, n = s2.shape
+    kb = w2.shape[0] // blocks
+    out = jnp.zeros((act.shape[0], n), jnp.float32)
+    for b in range(blocks):
+        rows = slice(b * kb, (b + 1) * kb)
+        out = out + xla_quantized_matmul(act[:, rows], w2[rows], s2[b]).astype(
+            jnp.float32
+        )
+    return np.asarray(out.astype(act.dtype), dtype=np.float32)
+
+
+@pytest.mark.parametrize(
+    "m,blocks,n",
+    [
+        (64, 8, 128),
+        (64, 16, 256),
+        (128, 24, 256),
+    ],
+    ids=["single_step_b8", "single_step_b16", "multi_step_b24"],
+)
+def test_should_match_reference_blocked_down_when_pallas_kernel_runs(m, blocks, n):
+    kb = 128
+    k = blocks * kb
+    ks = jax.random.split(jax.random.key(blocks + m), 3)
+    # Anti-cancellation: non-uniform per-block scale magnitudes and zero rows
+    # catch wrong block indexing, dropped scales, or 0/0 NaNs.
+    block_gain = jnp.geomspace(0.02, 5.0, blocks, dtype=jnp.float32)
+    act = (
+        jax.random.normal(ks[0], (m, k), jnp.float32)
+        * jnp.repeat(block_gain, kb)[None, :]
+    ).astype(jnp.bfloat16)
+    act = act.at[0].set(jnp.bfloat16(0.0))
+    act = act.at[-1, :kb].set(jnp.bfloat16(0.0))
+    w2 = (jax.random.normal(ks[1], (k, n), jnp.float32) * 16.0).astype(FP8)
+    s2 = (
+        jax.random.uniform(ks[2], (blocks, n), jnp.float32, 0.2, 2.0)
+        / block_gain[:, None]
+    )
+
+    want = _reference_blocked_down_f32(act, w2, s2)
+    got_arr = jax.jit(
+        lambda a, w, s: blocked_down(a, w, s, interpret=jax.default_backend() != "tpu")
+    )(act, w2, s2)
+    got = np.asarray(got_arr, dtype=np.float32)
+
+    assert got_arr.dtype == act.dtype
+    assert np.isfinite(got).all()
+    assert np.all(got[0] == 0.0)
+    rel_l2 = np.linalg.norm(got - want) / (np.linalg.norm(want) + 1e-8)
+    assert rel_l2 < 5e-3
+
+
+def test_should_fall_back_cleanly_when_shapes_or_dtype_unaligned():
+    ks = jax.random.split(jax.random.key(99), 3)
+    act = jax.random.normal(ks[0], (32, 256), jnp.float32).astype(jnp.bfloat16)
+    w2_bf16 = jax.random.normal(ks[1], (256, 128), jnp.float32).astype(jnp.bfloat16)
+    s2 = jax.random.uniform(ks[2], (4, 128), jnp.float32, 0.5, 1.5)
+
+    want = _reference_blocked_down_f32(act, w2_bf16, s2)
+    got = np.asarray(
+        blocked_down(act, w2_bf16, s2, interpret=jax.default_backend() != "tpu"),
+        dtype=np.float32,
+    )
+    assert np.allclose(got, want, atol=1e-3, rtol=1e-3)
+
+
+def test_should_fall_back_to_xla_when_wide_dense_tile_exceeds_vmem_cap(monkeypatch):
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    moe_jaxpr = jax.make_jaxpr(blocked_down)(
+        jax.ShapeDtypeStruct((1024, 2048), jnp.bfloat16),
+        jax.ShapeDtypeStruct((2048, 6144), FP8),
+        jax.ShapeDtypeStruct((16, 6144), jnp.float32),
+    )
+    dense_jaxpr = jax.make_jaxpr(blocked_down)(
+        jax.ShapeDtypeStruct((1024, 12288), jnp.bfloat16),
+        jax.ShapeDtypeStruct((12288, 6144), FP8),
+        jax.ShapeDtypeStruct((16, 6144), jnp.float32),
+    )
+    assert "pallas_call" in str(moe_jaxpr)
+    assert "pallas_call" not in str(dense_jaxpr)
