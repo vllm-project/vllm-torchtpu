@@ -2445,10 +2445,9 @@ def _sparse_mla_in_branch_qb_core(
                 )
                 if cap > free_nobar_max_cap:
                     # Avoid SparseCore contention between lead_mla and SC-offloaded
-                    # gather_latent on caps >= 12: hold lead_mla behind a barrier
-                    # until gather_latent completes while pure-TC fused_qb overlaps
-                    # gather_latent; smaller caps leave fused_qb free to overlap
-                    # Chunk-0 SparseCore KV gather.
+                    # gather_latent: with fused 3-D gather_latent even cap=4 (9.0 MiB)
+                    # offloads to SparseCore, so hold lead_mla behind a barrier while
+                    # pure-TC fused_qb overlaps gather_latent.
                     g_nope, g_rope, ql_head, qpe_head = lax.optimization_barrier(
                         (g_nope, g_rope, ql_head, qpe_head)
                     )

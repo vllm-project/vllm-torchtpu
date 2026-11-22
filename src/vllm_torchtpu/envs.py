@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     TPU_DCP_PREFILL_TOKEN_PARALLEL: bool = True
     TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT: bool = True
     TPU_DCP_TP_FUSED_WUV_EPILOGUE: bool = True
-    TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP: int = 4
+    TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP: int = 0
     TPU_DCP_TP_IN_BRANCH_QB_LAYERNORM: bool = True
     TPU_DCP_TP_IN_BRANCH_QB_MLA: bool = True
     TPU_DCP_TP_PREFILL_LOCAL_OPROJ: bool = True
@@ -928,11 +928,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rank shares identical causal load without per-layer ppermute collectives).
     "TPU_DCP_TP_ZIGZAG_BANDS": env_int("TPU_DCP_TP_ZIGZAG_BANDS", 4),
     # Maximum gather cap inside the in-branch q_b + sparse MLA op at which
-    # fused_qb runs without a post-gather_latent barrier so it overlaps
-    # Chunk-0 SparseCore KV gather; caps above this hold lead_mla behind the
-    # barrier so pure-TC fused_qb overlaps SparseCore-offloaded gather_latent.
+    # fused_qb runs without a post-gather_latent barrier. Default 0 keeps the
+    # barrier enabled on all caps >= 4: with fused 3-D gather_latent folding
+    # rope into nope, even cap=4 (9.0 MiB) offloads to SparseCore, so dropping
+    # the barrier adds SparseCore contention behind lead_mla.
     "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP": env_int(
-        "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP", 4
+        "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP", 0
     ),
     # With TPU_DCP_TP_IN_BRANCH_QB_MLA on non-indexer layers: move q_a_layernorm
     # inside the token-parallel cap switch right before fused q_b so the latent
