@@ -269,10 +269,57 @@ def _norm_weight(norm) -> torch.Tensor | None:
     return fresh_buffer((norm.weight.float() + 1.0).reshape(1, -1))
 
 
+# Bar for a self-test row whose reference reduces with XLA's psum (rows past
+# the armed all-reduce's byte cap): a different summation order than the
+# kernel's rank-ordered f32 sum, so the outputs differ by roundings. A wrong
+# rank, slot or protocol misses by O(1).
+_SELFTEST_REL_TOL = 2**-6
+
+
+def _same_sum(rows: int, hidden: int) -> bool:
+    """Whether the armed all-reduce sums a [rows, hidden] tensor the way the
+    kernel's epilogue does (its Pallas kernel, not psum): bit-equal then."""
+    from vllm_torchtpu.kernels.collectives import tp_all_reduce
+
+    armed = pallas_all_reduce.armed_for(get_tp_group().ranks)
+    n = get_tp_group().world_size
+    return 0 < tp_all_reduce.view_bytes(rows, hidden, n) <= armed.max_bytes
+
+
+def _check(name: str, rows: int, got: torch.Tensor, want: torch.Tensor, exact: bool):
+    """(passed, a one-line report) of one self-test comparison."""
+    got, want = got.float().cpu(), want.float().cpu()
+    finite = bool(torch.isfinite(got).all())
+    diff = (got - want).abs()
+    max_abs = float(diff.max()) if diff.numel() else 0.0
+    scale = float(want.abs().max()) or 1.0
+    # bf16 ulps of each reference element (8 mantissa bits).
+    ulp = torch.exp2(torch.floor(torch.log2(want.abs().clamp_min(1e-30))) - 7)
+    max_ulp = float((diff / ulp).max()) if diff.numel() else 0.0
+    if exact:
+        passed = finite and bool(torch.equal(got, want))
+    else:
+        passed = finite and max_abs <= _SELFTEST_REL_TOL * scale
+    report = (
+        f"{name}@{rows}: {'ok' if passed else 'FAIL'} "
+        f"({'exact' if exact else 'tol'}) max_abs={max_abs:.3g} "
+        f"scale={scale:.3g} max_ulp={max_ulp:.3g} finite={finite}"
+    )
+    return passed, report
+
+
+def _report(what: str, results: list) -> bool:
+    ok = all(passed for passed, _ in results)
+    log = logger.info if ok else logger.warning
+    log("DSpark draft %s self-test: %s", what, "; ".join(r for _, r in results))
+    return ok
+
+
 def _selftest(mlp: MiniMaxM3DSparkMLP, ops, rank: torch.Tensor) -> bool:
-    """Whether the reducing ops give this rank the bits of the local ops plus
-    the armed all-reduce. Collective over the TP group; a wrong rank or mesh
-    hangs the kernel, so a timeout dumps every stack and exits."""
+    """Whether the reducing ops give this rank the local ops plus the armed
+    all-reduce (bit-equal where both sum alike, else to `_SELFTEST_REL_TOL`).
+    Collective over the TP group; a wrong rank or mesh hangs the kernel, so a
+    timeout dumps every stack and exits."""
     operands = mlp._operands()
     gen = torch.Generator().manual_seed(1 + get_tp_group().rank_in_group)
     hidden = operands[0].shape[0]
@@ -281,24 +328,25 @@ def _selftest(mlp: MiniMaxM3DSparkMLP, ops, rank: torch.Tensor) -> bool:
     def rows(n):
         return torch.randn(n, hidden, generator=gen).to(torch.bfloat16).to(device)
 
-    ok = True
+    results = []
     faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
     try:
         for n in _SELFTEST_ROWS:
+            exact = _same_sum(n, hidden)
             x = rows(n)
             want = tensor_model_parallel_all_reduce(_op(x, *operands))
             got = ops["mlp"](x, *operands, rank)
-            ok &= bool(torch.equal(got.cpu(), want.cpu()))
+            results.append(_check("mlp", n, got, want, exact))
             if "norm" in ops:
                 args = (x, rows(n), mlp._fused_norm_w, *operands)
                 out, res = mlp._norm_op(*args)
                 got, got_res = ops["norm"](*args, rank)
                 want = tensor_model_parallel_all_reduce(out)
-                ok &= bool(torch.equal(got.cpu(), want.cpu()))
-                ok &= bool(torch.equal(got_res.cpu(), res.cpu()))
+                results.append(_check("norm.out", n, got, want, exact))
+                results.append(_check("norm.residual", n, got_res, res, True))
     finally:
         faulthandler.cancel_dump_traceback_later()
-    return ok
+    return _report("all-reduce epilogue", results)
 
 
 def _arm_all_reduce(mlps: list[MiniMaxM3DSparkMLP], eps: float | None) -> bool:
@@ -356,27 +404,29 @@ def _arm_norm(layers: list, mlps: list[MiniMaxM3DSparkMLP]) -> float | None:
 
 
 def _pre_selftest(mlp: MiniMaxM3DSparkMLP, op, rank: torch.Tensor) -> bool:
-    """Whether the pre-reducing op gives this rank the bits of the armed
-    all-reduce followed by the local norm op. Collective, with a timeout."""
+    """Whether the pre-reducing op gives this rank the armed all-reduce
+    followed by the local norm op (bit-equal where both sum alike, else to
+    `_SELFTEST_REL_TOL`). Collective, with a timeout."""
     operands = mlp._operands()
     hidden = operands[0].shape[0]
     device = operands[0].device
     mine = torch.Generator().manual_seed(1 + get_tp_group().rank_in_group)
     shared = torch.Generator().manual_seed(0)  # the residual is replicated
-    ok = True
+    results = []
     faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
     try:
         for n in _SELFTEST_ROWS:
+            exact = _same_sum(n, hidden)
             x = torch.randn(n, hidden, generator=mine).to(torch.bfloat16).to(device)
             res = torch.randn(n, hidden, generator=shared).to(torch.bfloat16)
             args = (res.to(device), mlp._fused_norm_w, *operands)
             want, want_res = mlp._norm_op(tensor_model_parallel_all_reduce(x), *args)
             got, got_res = op(x, *args, rank)
-            ok &= bool(torch.equal(got.cpu(), want.cpu()))
-            ok &= bool(torch.equal(got_res.cpu(), want_res.cpu()))
+            results.append(_check("out", n, got, want, exact))
+            results.append(_check("residual", n, got_res, want_res, exact))
     finally:
         faulthandler.cancel_dump_traceback_later()
-    return ok
+    return _report("attention all-reduce prologue", results)
 
 
 def _arm_pre_all_reduce(layers: list, eps: float | None) -> bool:

@@ -315,3 +315,33 @@ def test_pre_all_reduce_needs_the_norm(monkeypatch):
     assert bridge.arm_fused_mlp(nn.ModuleList([layer]), pre_all_reduce=True) == 1
     assert layer.self_attn.o_proj.reduce_results is True
     assert mlp._pre_reducing_norm_op is None
+
+
+def test_selftest_check_is_exact_or_within_roundings():
+    want = torch.tensor([[1.0, -2.0, 4.0]], dtype=torch.bfloat16)
+    one_ulp = torch.tensor([[1.0078125, -2.0, 4.0]], dtype=torch.bfloat16)
+    assert bridge._check("x", 8, want, want, exact=True)[0]
+    passed, report = bridge._check("x", 8, one_ulp, want, exact=True)
+    assert not passed and "max_ulp=1" in report
+    assert bridge._check("x", 48, one_ulp, want, exact=False)[0]
+    wrong = torch.tensor([[1.0, 2.0, 4.0]], dtype=torch.bfloat16)
+    assert not bridge._check("x", 48, wrong, want, exact=False)[0]
+    nan = torch.tensor([[float("nan"), -2.0, 4.0]], dtype=torch.bfloat16)
+    passed, report = bridge._check("x", 48, nan, want, exact=False)
+    assert not passed and "finite=False" in report
+
+
+def test_selftest_sums_alike_only_on_the_pallas_all_reduce(monkeypatch):
+    monkeypatch.setattr(
+        bridge,
+        "get_tp_group",
+        lambda: SimpleNamespace(ranks=list(range(8)), world_size=8),
+    )
+    monkeypatch.setattr(
+        bridge.pallas_all_reduce,
+        "armed_for",
+        lambda ranks: SimpleNamespace(max_bytes=524288),
+    )
+    # The c4 served cap: 24 rows on the kernel, the 48-row bucket on psum.
+    assert bridge._same_sum(24, 6144)
+    assert not bridge._same_sum(48, 6144)
