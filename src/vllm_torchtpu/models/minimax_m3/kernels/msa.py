@@ -299,6 +299,8 @@ def _select_and_attend(
 
 # Query rows of a decode request per index head: 1 + 7 speculative tokens.
 _DECODE_ROWS = 8
+# Pages per large-tile step in `_block_scores` (the token-order path).
+_CONDITIONAL_PAGES_PER_STEP = 32
 
 
 def block_score_options(index_heads: int = 1, wide: bool = False) -> dict[str, int]:
@@ -357,6 +359,14 @@ def _block_scores(
 ):
     """`index_q` must already be rotated for a 4-bit cache; its rows fold
     `index_heads` heads per token (`block_score_options`)."""
+    options = block_score_options(
+        index_heads,
+        _wide_decode_scores(index_q, index_cache, seq_lens, block_tables, index_heads),
+    )
+    # Decode steps take the large class in a conditional, whose cost grows
+    # with the code it holds (c48 b22 conditional 1.3 -> 7.1 us per 5-layer
+    # twin step with 64-page steps, 34 with 128): its tiles keep 32 pages.
+    options["pages_per_step"] = _CONDITIONAL_PAGES_PER_STEP
     return msa_indexer.block_scores(
         index_q,
         index_cache,
@@ -364,12 +374,7 @@ def _block_scores(
         block_tables,
         cu_q_lens,
         num_seqs,
-        **block_score_options(
-            index_heads,
-            _wide_decode_scores(
-                index_q, index_cache, seq_lens, block_tables, index_heads
-            ),
-        ),
+        **options,
         scale_cache=scale_cache,
         scale_row=scale_row,
         row_index=row_index,
