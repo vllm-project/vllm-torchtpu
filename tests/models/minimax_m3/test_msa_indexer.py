@@ -263,6 +263,61 @@ def test_fp4_folded_matches_reference(
                 )
 
 
+@pytest.mark.parametrize("pages_per_step", [4, 32])
+def test_fp4_folded_prefill_tiles_close_to_reference(pages_per_step):
+    """Prefill-sized tiles (> `DEFAULT_BLOCK_Q` rows) score e4m3 queries
+    against e4m3 keys times their scales (`FP8_MXU_QUERIES`): within a few
+    percent of the exact block maxima (e4m3 queries alone, exact keys: max
+    3.9 %, mean 0.84 % of the mean score; with e4m3 keys 9.1 %, 1.6 %)."""
+    rng = np.random.default_rng(pages_per_step)
+    q_lens, ctx_lens = [1, 300], [700, 200]
+    num_seqs, num_real = len(q_lens), sum(q_lens)
+    num_tokens = num_real + 5
+    seq_lens = np.zeros(MAX_SEQS, np.int32)
+    seq_lens[:num_seqs] = np.array(ctx_lens) + np.array(q_lens)
+    cu_q = np.full(MAX_SEQS + 1, num_real, np.int32)
+    cu_q[: num_seqs + 1] = np.concatenate([[0], np.cumsum(q_lens)])
+    tables = np.zeros((MAX_SEQS, PAGES_PER_SEQ), np.int32)
+    tables[:num_seqs] = rng.permutation(np.arange(1, NUM_PAGES))[
+        : num_seqs * PAGES_PER_SEQ
+    ].reshape(num_seqs, PAGES_PER_SEQ)
+    nib, scale = msa_fp4.quantize(
+        jnp.asarray(rng.standard_normal((NUM_PAGES, PAGE, HEAD_DIM)), jnp.float32)
+    )
+    keys = np.asarray(msa_fp4.dequantize(nib, scale))
+    index_q = jnp.asarray(rng.standard_normal((num_tokens, 1, HEAD_DIM))).astype(
+        jnp.bfloat16
+    )
+    scores = block_scores(
+        index_q,
+        msa_fp4.pack_rows(nib, scale),
+        jnp.asarray(seq_lens),
+        jnp.asarray(tables.reshape(-1)),
+        jnp.asarray(cu_q),
+        jnp.int32(num_seqs),
+        block_q=128,
+        large_block_q=256,
+        pages_per_step=pages_per_step,
+        small_pages_per_step=128,
+        kernel="v3",
+        large_kernel="v3",
+        interpret=True,
+    )
+    queries = np.asarray(index_q.astype(jnp.float32))[:, 0]
+    scores = np.asarray(scores)[:, 0]
+    r = 1  # the large request
+    num_pages = -(-seq_lens[r] // PAGE)
+    got = scores[cu_q[r] : cu_q[r + 1], :num_pages]
+    want = np.stack(
+        [
+            (keys[tables[r, :num_pages]] @ queries[t]).max(axis=1)
+            for t in range(cu_q[r], cu_q[r + 1])
+        ]
+    )
+    err = np.abs(got - want) / np.abs(want).mean()
+    assert err.max() < 0.12 and err.mean() < 0.025, (err.max(), err.mean())
+
+
 @pytest.mark.parametrize("tokens", [8, 256])
 def test_fp4_folded_lowers_for_tpu(tokens):
     max_seqs, pages_per_seq = 16, 2048
