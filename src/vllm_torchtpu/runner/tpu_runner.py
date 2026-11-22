@@ -201,6 +201,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUModelRunnerOutput,
     SpecLogprobsChunk,
     extract_draft_token_ids,
+    lookup,
     valid_token_ids,
 )
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
@@ -414,8 +415,8 @@ def _substitute_placeholder_token_body(
     # clamp_min(0) gives a safe in-range gather index for the -1 sentinel
     # slots; their gathered values are discarded by `mask` in `where`.
     safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
-    new_token_values = next_tokens[safe_idx].to(input_ids.dtype)
-    original_values = input_ids[token_in_tpu_cur_input_indices]
+    new_token_values = lookup(next_tokens.flatten(), safe_idx).to(input_ids.dtype)
+    original_values = lookup(input_ids, token_in_tpu_cur_input_indices)
     update_values = torch.where(mask, new_token_values, original_values)
     input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
     return input_ids
