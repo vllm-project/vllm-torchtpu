@@ -58,9 +58,11 @@ def _serve(dtype_kv, native_fp8=configs.NATIVE_FP8_OFF, **kwargs):
 def test_native_fp8_needs_an_fp8_kv_cache(native_fp8):
     with pytest.raises(ValueError, match="fp8 KV"):
         _serve(jnp.bfloat16, native_fp8)
-    # SPLIT has no room in e5m2 (test_batched_rpa_native_fp8_admission.py).
-    split = configs.Fp8Operand.SPLIT in (native_fp8.qk, native_fp8.pv)
-    for dtype_kv in (jnp.float8_e4m3fn,) + (() if split else (jnp.float8_e5m2,)):
+    # e5m2 takes only ROW operands (test_batched_rpa_native_fp8_admission.py).
+    row = all(
+        op in (configs.Fp8Operand.OFF, _ROW) for op in (native_fp8.qk, native_fp8.pv)
+    )
+    for dtype_kv in (jnp.float8_e4m3fn,) + ((jnp.float8_e5m2,) if row else ()):
         assert _serve(dtype_kv, native_fp8).native_fp8 == native_fp8
 
 

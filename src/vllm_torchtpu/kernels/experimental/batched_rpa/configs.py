@@ -168,6 +168,8 @@ class Fp8Operand(enum.StrEnum):
     - STATIC: a fixed scale: q is cast as is (after q_norm and RoPE it sits
       well inside the e4m3 range), the softmax weights are cast times
       `flash_attention.P_SCALE`, which the division by l removes.
+
+    An e5m2 KV cache takes only the DECODE kernel's ROW operands.
     """
 
     OFF = enum.auto()
@@ -294,6 +296,14 @@ class ServingConfigs:
                 f"{name}={modes} runs matmuls in the fp8 KV dtype, but the KV "
                 f"cache is {jnp.dtype(self.dtype_kv)}; use an fp8 KV cache or "
                 f"leave {name} off."
+            )
+        if jnp.dtype(self.dtype_kv) == jnp.dtype(jnp.float8_e5m2) and (
+            name == "native_fp8_prefill" or Fp8Operand.STATIC in (modes.qk, modes.pv)
+        ):
+            raise ValueError(
+                f"{name}={modes} with an fp8_e5m2 KV cache: only the DECODE "
+                "kernel's ROW operands are tested on e5m2; use an fp8_e4m3 KV "
+                "cache."
             )
         if modes.qk is not Fp8Operand.OFF and self.scale_q is not None:
             raise ValueError(
