@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
     TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = True
     TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = True
+    TPU_DEEPSEEK_V41_MHC_ENTRY_GATE_KERNEL: bool = False
     TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS: bool = True
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
@@ -571,6 +572,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # only the drafter's rounding.
     "TPU_DEEPSEEK_V41_MHC_SHIFTED_T16": env_bool(
         "TPU_DEEPSEEK_V41_MHC_SHIFTED_T16", default=True
+    ),
+    # mHC gates outside the fused kernel (each program's first layer, the
+    # drafter): compute sigmoid/softmax/Sinkhorn with the Pallas gate kernel
+    # the fused layers use, instead of ~95 small XLA ops. Changes only rounding.
+    # Remove the switch, keeping the kernel path, once accuracy holds in serving.
+    "TPU_DEEPSEEK_V41_MHC_ENTRY_GATE_KERNEL": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_ENTRY_GATE_KERNEL"
     ),
     # DSpark decode sampler: compute the drafter's BF16 base logits with the
     # Pallas full-K head (kernels/logits_head.py) instead of the XLA dot.

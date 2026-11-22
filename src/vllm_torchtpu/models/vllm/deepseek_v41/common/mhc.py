@@ -12,6 +12,7 @@ import torch
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.kernels.mhc.torch import mhc_post_torch, mhc_pre_delayed_torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
     get_shifted_post_pre_rms_op,
 )
@@ -64,6 +65,47 @@ def _pre_gates(
     return pre_mix, post_mix, comb_mix
 
 
+def _xla_or_kernel_gates(
+    mixes: jax.Array,
+    sqrsum: jax.Array,
+    hc_mult: int,
+    hidden_size: int,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    *constants,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`_pre_gates`, or the Pallas gate kernel on the same [T, M*(M+2)] logits.
+
+    The kernel takes tokens on lanes, so T is padded to a multiple of 128.
+    """
+    if not envs.TPU_DEEPSEEK_V41_MHC_ENTRY_GATE_KERNEL:
+        return _pre_gates(
+            mixes, sqrsum, hc_mult, hidden_size, hc_scale, hc_base, *constants
+        )
+    from vllm_torchtpu.kernels.deepseek_v41.mhc.shifted_post_pre_rms import (
+        _pre_gates as gate_kernel,
+    )
+
+    rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats = constants
+    tokens = mixes.shape[0]
+    pad = -tokens % 128
+    new_pre, post, comb = gate_kernel(
+        jnp.pad(mixes.astype(jnp.float32).T, ((0, 0), (0, pad))),
+        jnp.pad(sqrsum.reshape(1, tokens).astype(jnp.float32), ((0, 0), (0, pad))),
+        hc_scale.astype(jnp.float32),
+        hc_base.astype(jnp.float32),
+        hidden_size=hidden_size,
+        rms_eps=rms_eps,
+        hc_pre_eps=pre_eps,
+        hc_sinkhorn_eps=sinkhorn_eps,
+        hc_post_mult_value=post_multiplier,
+        sinkhorn_repeat=repeats,
+        # Single-block grids write only the real token columns.
+        tokens=tokens if pad > 0 and tokens + pad <= 1024 else None,
+    )
+    return new_pre[:tokens], post[:tokens], comb[:tokens]
+
+
 _pre_op = None
 
 
@@ -92,7 +134,7 @@ def delayed_pre_jax(
     # Upstream's first-layer broadcast optimization folds x/fn to hidden_size.
     # Gate normalization must still use the actual projection input width.
     squares = jnp.mean(jnp.square(x), -1, keepdims=True) * (mult * dim)
-    new_pre, post, comb = _pre_gates(
+    new_pre, post, comb = _xla_or_kernel_gates(
         mixes,
         squares,
         mult,
@@ -345,7 +387,9 @@ def delayed_pre_flat_jax(
     tile = tokens if tokens <= 128 else (128 if tokens == 256 else 64)
     weight = fn if fn.dtype == jnp.bfloat16 else _pack_mix_weight(fn)
     mixes, square, value = _flat_pre_sums(flat, weight, previous_pre, mixes, tile)
-    new_pre, post, comb = _pre_gates(mixes, square, mult, dim, scale, base, *constants)
+    new_pre, post, comb = _xla_or_kernel_gates(
+        mixes, square, mult, dim, scale, base, *constants
+    )
     return post[..., None], comb, value, new_pre
 
 
@@ -550,7 +594,7 @@ def delayed_post_pre_flat_jax(
         mixes,
         tile,
     )
-    new_pre, post, comb = _pre_gates(
+    new_pre, post, comb = _xla_or_kernel_gates(
         mixes_out, square, mult, dim, scale, base, *constants
     )
     return flat_new, post[..., None], comb, value, new_pre
