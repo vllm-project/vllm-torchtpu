@@ -61,8 +61,12 @@ def _stitch_decode_lane(
             pl.ds(src_tok_idx // num_lanes, outer_dim, lanes_per_col)
         ]
         rolled = pltpu.roll(src_vreg, dst_rel - src_tok_idx % num_lanes, axis=1)
+        # A block without the new token (CACHE_ONLY, or a lane with no
+        # sequence) leaves `dst_rel` zero like the lanes after it: the source
+        # lane is unfetched VMEM there.
+        new_tok = jnp.logical_and(lane_idx == dst_rel, bkv_sz_new > 0)
         merged_dst_vreg = lax.select(
-            lane_idx == dst_rel, rolled, jnp.where(lane_idx < dst_rel, dst_vreg, 0)
+            new_tok, rolled, jnp.where(lane_idx < dst_rel, dst_vreg, 0)
         )
         return [dst_chunk_idx], outer_dim, lanes_per_col, [merged_dst_vreg]
 
@@ -100,11 +104,24 @@ def _stitch_prefill_lane(
     bkv_sz_cache: jax.Array,
     cache_end: jax.Array,
     new_tok_offset: jax.Array,
+    bkv_sz_new: jax.Array,
     v_len: int,
     *,
     cfgs: configs.RpaConfigs,
 ):
-    """O(N) Prefill Path: Roll the entire new tokens buffer into place."""
+    """O(N) Prefill Path: Roll the entire new tokens buffer into place.
+
+    Every lane past the last valid token (``bkv_sz_cache + bkv_sz_new``) is
+    zeroed. Otherwise the roll fills those lanes from the rest of the window:
+    the rows fetched next to the new tokens, which can be undefined (rows that
+    pad the bucket), or lanes nothing was fetched into (all of them on a
+    CACHE_ONLY pass). The writeback copies whole 128-lane columns, so the
+    lanes past the last valid token in its column reach the KV cache, with or
+    without `mask_invalid_v`; and when V is not masked on load, score masking
+    does not neutralize such lanes, because 0 * NaN = NaN in the P @ V matmul.
+    (`_stitch_decode_lane` writes only the columns that hold the stitch
+    boundary.)
+    """
     total_head_words = (
         cfgs.model.num_kv_heads * 2 * cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
     )
@@ -118,10 +135,12 @@ def _stitch_prefill_lane(
     lane_idx = jax.lax.broadcasted_iota(
         jnp.int32, rolled_u32[..., : cfgs.bkv_sz].shape, 2
     )
+    valid_end = bkv_sz_cache + bkv_sz_new
+    cached_valid_end = jnp.minimum(bkv_sz_cache, valid_end)
     merged_cache_u32 = jax.lax.select(
-        lane_idx >= bkv_sz_cache,
-        rolled_u32[..., : cfgs.bkv_sz],
+        lane_idx < cached_valid_end,
         vmem_u32_reshaped[..., : cfgs.bkv_sz],
+        jnp.where(lane_idx < valid_end, rolled_u32[..., : cfgs.bkv_sz], 0),
     )
 
     return merged_cache_u32
@@ -200,6 +219,7 @@ def stitch_new_kv_lane(
             bkv_sz_cache,
             cache_end,
             new_tok_offset,
+            bkv_sz_frm_new.astype(jnp.int32),
             cfgs.kv_vmem_lanes,
             cfgs=cfgs,
         )
