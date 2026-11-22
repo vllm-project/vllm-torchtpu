@@ -40,8 +40,9 @@ PERF_SUITES_CLI_SET=0
 SERVED_MODEL_NAME_CLI=""
 SERVED_MODEL_NAME_CLI_SET=0
 
+# A value never starts with "--", so "--config --dry-run" is a missing value.
 require_arg() {
-    if [ "$2" -lt 2 ]; then
+    if [ "$#" -lt 2 ] || [[ "$2" == --* ]]; then
         echo "ERROR: $1 requires a value"
         exit 1
     fi
@@ -51,29 +52,29 @@ require_arg() {
 while [[ $# -gt 0 ]]; do
     case $1 in
         --config)
-            require_arg "$1" "$#"
+            require_arg "$@"
             CONFIG_NAME="$2"
             shift 2
             ;;
         --results-dir)
-            require_arg "$1" "$#"
+            require_arg "$@"
             RESULTS_DIR="$2"
             shift 2
             ;;
         --base-url)
-            require_arg "$1" "$#"
+            require_arg "$@"
             BASE_URL_CLI="$2"
             BASE_URL_CLI_SET=1
             shift 2
             ;;
         --eval-suites)
-            require_arg "$1" "$#"
+            require_arg "$@"
             EVAL_SUITES_CLI="$2"
             EVAL_SUITES_CLI_SET=1
             shift 2
             ;;
         --perf-suites)
-            require_arg "$1" "$#"
+            require_arg "$@"
             PERF_SUITES_CLI="$2"
             PERF_SUITES_CLI_SET=1
             shift 2
@@ -81,7 +82,7 @@ while [[ $# -gt 0 ]]; do
         # The name the endpoint serves the model under, when a router or
         # gateway does not serve it under the config's MODEL.
         --served-model-name)
-            require_arg "$1" "$#"
+            require_arg "$@"
             SERVED_MODEL_NAME_CLI="$2"
             SERVED_MODEL_NAME_CLI_SET=1
             shift 2
@@ -99,14 +100,14 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --host)
-            require_arg "$1" "$#"
+            require_arg "$@"
             HOST="$2"
             HOST_PORT_CLI=1
             START_SERVER=0
             shift 2
             ;;
         --port)
-            require_arg "$1" "$#"
+            require_arg "$@"
             PORT="$2"
             HOST_PORT_CLI=1
             shift 2
@@ -130,7 +131,7 @@ while [[ $# -gt 0 ]]; do
         # Gates against another config's baselines, for a config that serves
         # that one's model another way and must answer the same.
         --baseline-config)
-            require_arg "$1" "$#"
+            require_arg "$@"
             BASELINE_CONFIG="$2"
             shift 2
             ;;
@@ -584,7 +585,8 @@ fi
 # --base-url a router may serve the model under another name, so there the
 # explicit flag wins, then the endpoint's own answer when it lists one model.
 # The endpoint is asked once, with no wait: the caller starts this script when
-# the endpoint is ready.
+# the endpoint is ready. A lookup that fails stops the run here (set -e), since
+# falling back to MODEL could send every request to a model that is not there.
 SERVED_MODEL="$SERVED_MODEL_NAME_CLI"
 if [ -z "$SERVED_MODEL" ] && [ "$BASE_URL_CLI_SET" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
     SERVED_MODEL=$(python3 "$SCRIPT_DIR/endpoint_url.py" discover-model "$BASE_URL")
@@ -612,19 +614,20 @@ if [ "$BOOT_SERVER" = "1" ]; then
   if [ "$RUN_BENCH_SERVE" = "0" ]; then
     BENCH_ARGS+=(--skip-bench-cells)
   fi
+elif [ "$RUN_BENCH_SERVE" = "0" ]; then
+  # A dry run still writes the config.json the evals below read. It sends no
+  # request, so it is not given the endpoint or the served model name:
+  # spec_bench configs reject an external endpoint even in a dry run.
+  BENCH_ARGS+=(--dry-run)
 else
   if [ "$BASE_URL_CLI_SET" = "1" ]; then
     BENCH_ARGS+=(--base-url "$BASE_URL")
   else
     BENCH_ARGS+=(--host "$HOST" --port "$PORT")
   fi
-  if [ "$RUN_BENCH_SERVE" = "0" ]; then
-    # A dry run still writes the config.json the evals below read.
-    BENCH_ARGS+=(--dry-run)
+  if [ -n "$SERVED_MODEL" ]; then
+    BENCH_ARGS+=(--served-model-name "$SERVED_MODEL")
   fi
-fi
-if [ -n "$SERVED_MODEL" ]; then
-  BENCH_ARGS+=(--served-model-name "$SERVED_MODEL")
 fi
 
 ./scripts/vllm/benchmarking/run_benchmarks.sh "${BENCH_ARGS[@]}"
@@ -682,7 +685,7 @@ for suite in "${SELECTED_EVAL_SUITES[@]}"; do
 done
 
 # ========================================================
-# 7. Upload results to BigQuery (and Spanner, if asked)
+# 5. Upload results to BigQuery (and Spanner, if asked)
 # ========================================================
 echo "=== Uploading results ==="
 UPLOAD_ARGS=("--results-dir" "$RESULTS_DIR")

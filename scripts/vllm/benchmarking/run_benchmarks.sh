@@ -23,7 +23,8 @@
 #   --serve-only       start the config's server and wait on it, running no benchmark
 #   --skip-bench-cells start the server (if local) and write config.json without running bench cells
 #   --base-url URL     API root of a running server (cannot be combined with --host or --port)
-#   --served-model-name NAME  model name sent in requests to a running server
+#   --served-model-name NAME
+#                      model name sent in requests to a running server
 #
 # Examples:
 #   ./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3-0.6b-smoke
@@ -81,8 +82,9 @@ SERVED_MODEL_NAME_CLI=""
 SERVED_MODEL_NAME_CLI_SET=0
 START_SERVER=1
 
+# A value never starts with "--", so "--config --dry-run" is a missing value.
 require_arg() {
-    if [ "$2" -lt 2 ]; then
+    if [ "$#" -lt 2 ] || [[ "$2" == --* ]]; then
         echo "ERROR: $1 requires a value"
         exit 1
     fi
@@ -91,12 +93,12 @@ require_arg() {
 while [[ $# -gt 0 ]]; do
     case $1 in
         --config)
-            require_arg "$1" "$#"
+            require_arg "$@"
             CONFIG_NAME="$2"
             shift 2
             ;;
         --results-dir)
-            require_arg "$1" "$#"
+            require_arg "$@"
             RESULTS_DIR_OVERRIDE="$2"
             shift 2
             ;;
@@ -118,21 +120,21 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --host)
-            require_arg "$1" "$#"
+            require_arg "$@"
             HOST="$2"
             HOST_PORT_CLI=1
             START_SERVER=0
             shift 2
             ;;
         --mode)
-            require_arg "$1" "$#"
+            require_arg "$@"
             BENCHMARK_MODE_CLI="$2"
             shift 2
             ;;
         # A running server by its API root (the URL without /v1), for one
         # that --host and --port cannot name: https, or a path prefix.
         --base-url)
-            require_arg "$1" "$#"
+            require_arg "$@"
             BASE_URL_CLI="$2"
             BASE_URL_CLI_SET=1
             shift 2
@@ -140,13 +142,13 @@ while [[ $# -gt 0 ]]; do
         # The name the server serves the model under, when it is not MODEL.
         # MODEL still names the tokenizer.
         --served-model-name)
-            require_arg "$1" "$#"
+            require_arg "$@"
             SERVED_MODEL_NAME_CLI="$2"
             SERVED_MODEL_NAME_CLI_SET=1
             shift 2
             ;;
         --port)
-            require_arg "$1" "$#"
+            require_arg "$@"
             PORT="$2"
             HOST_PORT_CLI=1
             shift 2
@@ -329,6 +331,10 @@ if [ "$BENCHMARK_MODE" != "spec_bench" ]; then
 else
     if [ "$START_SERVER" != "1" ]; then
         echo "ERROR: --host and --base-url are not supported in spec_bench mode because each (BS, K) cell restarts vllm serve."
+        exit 1
+    fi
+    if [ "$SKIP_BENCH_CELLS" = "1" ]; then
+        echo "ERROR: --skip-bench-cells is not supported in spec_bench mode because the (BS, K) sweep starts and stops its own servers."
         exit 1
     fi
     if [ -z "${SPEC_K_LIST// /}" ]; then

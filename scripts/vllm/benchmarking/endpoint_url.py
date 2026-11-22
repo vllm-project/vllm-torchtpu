@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
@@ -63,9 +65,16 @@ def normalize_base_url(raw: str) -> str:
         )
 
     netloc = url.netloc
+    # "host:" has no port to keep, and "http:/host" parses as the host "http".
+    if netloc.endswith(":"):
+        raise ValueError(f"Invalid --base-url: {raw}")
     if bare and port is None:
         netloc = f"{netloc}:8000"
     return f"{url.scheme}://{netloc}{path}"
+
+
+class ModelLookupError(RuntimeError):
+    """``/v1/models`` could not be read, so the served model is unknown."""
 
 
 def discover_served_model(
@@ -73,8 +82,12 @@ def discover_served_model(
 ) -> str | None:
     """Return the single model id advertised at ``<base_url>/v1/models``.
 
-    Returns ``None`` if the endpoint is unreachable, fails authentication, or
-    advertises zero or multiple models.
+    Returns ``None`` if the endpoint answers with zero or multiple models.
+
+    Raises:
+        ModelLookupError: The endpoint is unreachable, answers with an HTTP
+            error (failed authentication included), or does not answer with
+            a JSON model list.
     """
     models_url = f"{base_url}/v1/models"
     headers: dict[str, str] = {}
@@ -84,21 +97,29 @@ def discover_served_model(
     try:
         with urllib.request.urlopen(request, timeout=timeout) as resp:
             payload = json.load(resp)
-        data = payload.get("data")
-        if not isinstance(data, list):
-            return None
-        ids = [
-            entry["id"] for entry in data if isinstance(entry, dict) and "id" in entry
-        ]
-    except Exception as err:
-        print(
-            f"Could not list the served models at {models_url}: {err}",
-            file=sys.stderr,
+    # URLError covers HTTP errors, OSError timeouts and resets, HTTPException
+    # a broken HTTP reply, and ValueError a body that is not JSON.
+    except (
+        urllib.error.URLError,
+        OSError,
+        http.client.HTTPException,
+        ValueError,
+    ) as err:
+        raise ModelLookupError(
+            f"Could not list the served models at {models_url}: {err}"
+        ) from err
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        raise ModelLookupError(
+            f"Could not list the served models at {models_url}: "
+            "the response is not a JSON model list"
         )
-        return None
-    if len(ids) == 1 and isinstance(ids[0], str):
-        return ids[0]
-    return None
+    ids = [
+        entry["id"]
+        for entry in data
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+    ]
+    return ids[0] if len(ids) == 1 else None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -117,9 +138,17 @@ def main(argv: list[str] | None = None) -> int:
             print(str(err), file=sys.stderr)
             return 1
         return 0
-    model_id = discover_served_model(
-        value, api_key=os.environ.get("OPENAI_API_KEY") or None
-    )
+    try:
+        model_id = discover_served_model(
+            value, api_key=os.environ.get("OPENAI_API_KEY") or None
+        )
+    except ModelLookupError as err:
+        print(
+            f"ERROR: {err}. Pass --served-model-name to name the model "
+            "without this lookup.",
+            file=sys.stderr,
+        )
+        return 1
     if model_id:
         print(model_id)
     return 0
