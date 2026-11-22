@@ -31,6 +31,7 @@ import pytest
 import torch
 
 from vllm_torchtpu import utils as vu
+from vllm_torchtpu.compilation import decorators
 from vllm_torchtpu.compilation import fast_dispatch as fd
 from vllm_torchtpu.distributed.kv_transfer import tpu_connector as tc
 from vllm_torchtpu.runner import fast_forward_context as ffc
@@ -231,6 +232,126 @@ def test_memo_cleared_when_cache_entries_change(memo_on):
     assert st["count"] != count_before
     assert st["memo"] == {}
     torch.testing.assert_close(w(x, 2), _fn_scale(x, 2))
+
+
+# --- draft forwards that read the forward context stay out of the memo -------
+
+_DRAFT_LAYER = "draft.model.layers.0.self_attn.attn"
+_VOCAB, _HIDDEN, _BLOCK = 32, 8, 4
+
+
+class _ContextAttention(torch.nn.Module):
+    """Reads its block table from vLLM's forward context, as vLLM's attention
+    layer does. Its output depends on the table's static length, as that of a
+    paged-attention program built for the length does."""
+
+    def forward(self, h):
+        from vllm.forward_context import get_forward_context
+
+        table = get_forward_context().attn_metadata[_DRAFT_LAYER].block_tables
+        return h + table.shape[0] + 0 * table[:1].to(h.dtype)
+
+
+class _ContextBackbone(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = torch.nn.Embedding(_VOCAB, _HIDDEN)
+        self.attn = _ContextAttention()
+
+    def forward(self, input_ids, positions):
+        return self.attn(self.embed(input_ids))
+
+
+class _ContextDraft(torch.nn.Module):
+    """What the DFlash and DSpark draft forwards call on their draft model."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = _ContextBackbone()
+        self.lm_head = torch.nn.Linear(_HIDDEN, _VOCAB, bias=False)
+
+    def compute_logits(self, hidden):
+        return self.lm_head(hidden)
+
+    def compute_draft_logits(self, hidden):
+        return self.lm_head(hidden)
+
+    def markov_embed(self, token_ids):
+        return self.model.embed(token_ids)
+
+    def markov_bias(self, markov_embed):
+        return 0.1 * self.lm_head(markov_embed)
+
+    def map_draft_to_target(self, draft_ids):
+        return draft_ids
+
+
+def _forward_context_config():
+    return types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_rank=0,
+            use_sequence_parallel_moe=False,
+            is_moe_model=False,
+        ),
+        compilation_config=types.SimpleNamespace(
+            static_forward_context={},
+            fast_moe_cold_start=False,
+            static_all_moe_layers=None,
+        ),
+    )
+
+
+@pytest.mark.parametrize("which", ["dflash", "dspark"])
+def test_draft_forward_runs_the_program_for_the_current_block_table(
+    memo_on, monkeypatch, which
+):
+    # max_model_len 4096 with VLLM_TPU_MOST_MODEL_LEN 1024 and 64-token
+    # blocks: a one-request draft step's block table has 64 blocks when the
+    # step uses max_model_len and 16 when it does not, and the draft forward's
+    # arguments are the same either way. Precompile compiles both programs,
+    # serving then switches between them; a memo hit would run the program
+    # compiled for the other length.
+    from vllm.forward_context import set_forward_context
+
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+    from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+    from vllm_torchtpu.spec_decode.dspark import DSparkProposer
+
+    cls = DFlashProposer if which == "dflash" else DSparkProposer
+    decorated = cls._dflash_forward_and_sample
+    real_compile = torch.compile
+
+    def eager_backend(model=None, **kwargs):
+        return real_compile(model, **{**kwargs, "backend": "eager"})
+
+    monkeypatch.setattr(torch, "compile", eager_backend)
+    # The class's own tpu_compile setting, on the eager backend. The entries
+    # it compiles share the method's code object, so they are dropped after.
+    torch._dynamo.reset()
+    forward = decorators.tpu_compile(
+        guard_memo=decorated._fast_dispatch_state["guard_memo"]
+    )(decorated.__wrapped__)
+    proposer = cls.__new__(cls)
+    proposer.draft_model = _ContextDraft()
+    proposer.use_confidence_head = False
+    proposer.sample_from_anchor = True
+    positions = torch.arange(_BLOCK, dtype=torch.int32)
+    try:
+        for blocks in (64, 16, 16, 16, 64, 64, 16):
+            md = AttentionMetadata(
+                input_positions=positions,
+                block_tables=torch.zeros(blocks, dtype=torch.int32),
+            )
+            input_ids = torch.tensor([blocks % _VOCAB, 1, 2, 3])
+            with set_forward_context({_DRAFT_LAYER: md}, _forward_context_config()):
+                got = forward(proposer, input_ids, positions, _BLOCK)
+                want = decorated.__wrapped__(proposer, input_ids, positions, _BLOCK)
+            torch.testing.assert_close(got, want)
+        assert fd._MEMO_STATS["hit"] == 0
+        assert forward._fast_dispatch_state["memo"] == {}
+    finally:
+        torch._dynamo.reset()
 
 
 class _DS:

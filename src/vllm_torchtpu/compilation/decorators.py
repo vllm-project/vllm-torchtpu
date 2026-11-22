@@ -22,25 +22,38 @@ New compile sites of a plain function use it rather than that
 ``tests/compilation/test_tpu_compile_sites.py`` checks the package's sites.
 """
 
+import functools
 import types
 from collections.abc import Callable
-from typing import Any
+from typing import Any, overload
 
 import torch
 
 from vllm_torchtpu.compilation import fast_dispatch
 
 
-def tpu_compile[F: Callable[..., Any]](fn: F) -> F:
+@overload
+def tpu_compile[F: Callable[..., Any]](fn: F, /) -> F: ...
+
+
+@overload
+def tpu_compile[F: Callable[..., Any]](*, guard_memo: bool) -> Callable[[F], F]: ...
+
+
+def tpu_compile(fn: Any = None, /, *, guard_memo: bool = True) -> Any:
     """Compile ``fn`` for TPU with ``torch.compile(fn, backend="tpu",
     fullgraph=True, dynamic=False)`` and wrap the result for fast dispatch.
-    Use it as a decorator, or call it on a function.
+    Use it as a decorator, or call it on a function;
+    ``@tpu_compile(guard_memo=False)`` keeps the function out of the guard
+    memo (``compilation.fast_dispatch``).
 
     The compile call is main's, so the compiled programs and their guards
     are those of the plain ``torch.compile`` call. Disarmed (the default) the
     wrapper calls the compiled function and nothing else. The option is read
     on every call, never at decoration.
     """
+    if fn is None:
+        return functools.partial(tpu_compile, guard_memo=guard_memo)
     if not isinstance(fn, types.FunctionType):
         raise TypeError(
             f"tpu_compile takes a plain function, got {type(fn).__name__}; "
@@ -51,4 +64,4 @@ def tpu_compile[F: Callable[..., Any]](fn: F) -> F:
         # Dynamo is disabled (TORCHDYNAMO_DISABLE=1): torch.compile hands back
         # the function itself, which has no cache entries to dispatch.
         return fn
-    return fast_dispatch.wrap(compiled, fn)
+    return fast_dispatch.wrap(compiled, fn, guard_memo)

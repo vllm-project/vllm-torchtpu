@@ -1102,7 +1102,10 @@ class DFlashProposer:
 
         return hidden_states
 
-    @tpu_compile
+    # The draft model reads its attention metadata from vLLM's forward
+    # context, not from an argument, so a guard-memo hit could run the program
+    # compiled for another block-table width (max_model_len vs most_model_len).
+    @tpu_compile(guard_memo=False)
     def _dflash_forward_and_sample(
         self,
         input_ids: torch.Tensor,

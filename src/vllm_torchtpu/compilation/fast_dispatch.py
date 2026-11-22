@@ -37,7 +37,11 @@ per-call frame evaluation; every guard Dynamo built is kept.
   recycled id never matches. The memo is dropped whenever the code object's
   cache entries change (recompile or eviction). A guard on something the
   signature does not cover (a global, or an attribute of an argument object)
-  is not re-checked on a memo hit.
+  is not re-checked on a memo hit, so a function whose compiled program
+  depends on such state, and the state can change between calls with the same
+  arguments, opts out with ``tpu_compile(guard_memo=False)``: every call of it
+  runs the guard check. The DFlash and DSpark draft forwards do: their draft
+  model reads its attention metadata from vLLM's forward context.
 
 TODO: Remove this module once PyTorch has a public guarded call path for
 ``fullgraph`` compiled functions (https://github.com/pytorch/pytorch/issues/206560);
@@ -171,9 +175,10 @@ def _entry_count(code: types.CodeType) -> int:
     return _c_eval_frame._get_total_cache_entry_count(code)
 
 
-def wrap(compiled: Any, fn: types.FunctionType) -> Any:
+def wrap(compiled: Any, fn: types.FunctionType, guard_memo: bool = True) -> Any:
     """The fast-dispatch wrapper of ``compiled``, ``torch.compile``'s result
-    for the plain function ``fn``."""
+    for the plain function ``fn``; ``guard_memo=False`` keeps it out of the
+    guard memo."""
     code = fn.__code__
     region = compiled._isolate_recompiles_id
     flags = code.co_flags
@@ -193,6 +198,7 @@ def wrap(compiled: Any, fn: types.FunctionType) -> Any:
         "logged": False,
         "memo": {},  # signature -> (direct fn, refs to its id-keyed objects)
         "memo_count": -1,
+        "guard_memo": guard_memo,  # False: this function never uses the memo
     }
 
     def _f_locals(args: tuple, kwargs: dict) -> dict | None:
@@ -339,7 +345,13 @@ def wrap(compiled: Any, fn: types.FunctionType) -> Any:
                 and _c_eval_frame.get_eval_frame_callback() is None
                 and stance_mod._stance.stance == "default"
             ):
-                if _MEMO["on"] and not kwargs and len(args) == nargs:
+                use_memo = (
+                    _MEMO["on"]
+                    and state["guard_memo"]
+                    and not kwargs
+                    and len(args) == nargs
+                )
+                if use_memo:
                     count = _entry_count(code)
                     if count == state["count"]:
                         hit = _memo_dispatch(args, count)
@@ -357,7 +369,7 @@ def wrap(compiled: Any, fn: types.FunctionType) -> Any:
                         if gm.cache_entry is None:
                             continue
                         if gm.check(f_locals):
-                            if _MEMO["on"] and not kwargs and len(args) == nargs:
+                            if use_memo:
                                 _memo_store(args, direct, state["count"])
                             if idx > 0:
                                 entries.insert(0, entries.pop(idx))
