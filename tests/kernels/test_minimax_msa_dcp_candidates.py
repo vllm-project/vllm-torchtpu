@@ -261,3 +261,88 @@ def test_merge_ignores_rank_order(tokens: int) -> None:
     for candidates in (ordered, ordered[::-1]):
         got = msa_dcp.merge_head_candidates(jnp.asarray(candidates), _TOPK)
         np.testing.assert_array_equal(np.asarray(got)[:, 0], want)
+
+
+def _rank_candidates(rng, tokens, pages_per_seq, rank, dcp, shared):
+    """Packed candidates of one rank: distinct blocks of the rank, scores with
+    ties (few values), some rows short of topk (-inf, -1). `shared`: every
+    row picks the same blocks but for a few, as a request's rows do served."""
+    first = rng.permutation(pages_per_seq)
+    blocks = []
+    for row in range(tokens):
+        mine = rng.permutation(pages_per_seq) if not shared or row % 3 == 2 else first
+        blocks.append(mine[:_TOPK])
+    blocks = np.stack(blocks) * dcp + rank
+    scores = rng.integers(-3, 4, (tokens, _TOPK)).astype(np.float32)
+    short = rng.random((tokens, _TOPK)) < 0.15
+    scores[short] = -np.inf
+    blocks[short] = -1
+    return msa_dcp.pack_candidates(jnp.asarray(scores), jnp.asarray(blocks))
+
+
+def _attend_case(tokens, rank, shared, seed):
+    rng = np.random.default_rng(seed)
+    seqs, dim, dcp, heads, pages_per_seq = 8, 128, 2, 16, 40
+    if tokens == 48:  # a request of 5 rows, a padding tile
+        q_lens = np.array([8, 8, 5, 8, 8, 0, 0, 0])
+    else:
+        q_lens = np.array([8] * (tokens // 8) + [0] * (seqs - tokens // 8))
+    cu = jnp.asarray(np.concatenate([[0], np.cumsum(q_lens)]), jnp.int32)
+    full = dcp * _BLOCK * pages_per_seq
+    seq_lens = jnp.asarray(
+        np.where(q_lens > 0, rng.integers(2000, full, seqs), 0), jnp.int32
+    )
+    pages = seqs * pages_per_seq + 8
+    block_tables = jnp.asarray(
+        rng.permutation(pages)[: seqs * pages_per_seq], jnp.int32
+    )
+    candidates = jnp.stack(
+        [
+            _rank_candidates(rng, tokens, pages_per_seq, r, dcp, shared)
+            for r in (rank, 1 - rank)
+        ]
+    )
+    kv_cache = jnp.asarray(
+        rng.integers(-2, 3, (pages, 32, 4, 2 * dim)), jnp.float8_e4m3fn
+    )
+    q = jnp.asarray(rng.standard_normal((heads, tokens, dim)), jnp.bfloat16)
+    common = dict(
+        sm_scale=dim**-0.5,
+        topk=_TOPK,
+        rank=rank,
+        dcp=dcp,
+        q_head_major=True,
+        interpret=True,
+    )
+    return (q, kv_cache, candidates, seq_lens, block_tables, cu), common
+
+
+# Tokens 8 (one tile), 24 (three tiles, one per step), 48 (a request of 5 rows
+# and a padding tile: tiles of several requests and of none).
+@pytest.mark.parametrize("tokens", [8, 24, 48])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("shared", [False, True])
+def test_attention_of_kept_own_candidates(tokens, rank, shared):
+    """A decode step attends the pages of this rank's kept candidates
+    (`own_first`): the same outputs, bit for bit, as over its merged
+    selection."""
+    args, common = _attend_case(
+        tokens, rank, shared, seed=tokens * 4 + rank * 2 + shared
+    )
+    want = msa_dcp.msa_attend_dcp(*args, **common)
+    got = msa_dcp.msa_attend_dcp(*args, own_first=True, **common)
+    for w, g in zip(want, got):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+
+
+def test_kept_own_candidates_comparison_catches_a_changed_selection():
+    """Positive control for the test above: one candidate that loses its
+    place in the global top-k changes the outputs it compares."""
+    args, common = _attend_case(16, 0, True, seed=3)
+    q, kv_cache, candidates, *meta = args
+    want = msa_dcp.msa_attend_dcp(*args, own_first=True, **common)
+    # Row 0's best own candidate drops below every real one.
+    best = int(jnp.argmax(candidates[0, 0, :_TOPK]))
+    fault = candidates.at[0, 0, best].set(-1e9)
+    got = msa_dcp.msa_attend_dcp(q, kv_cache, fault, *meta, own_first=True, **common)
+    assert not np.array_equal(np.asarray(got[0]), np.asarray(want[0]))

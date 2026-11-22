@@ -657,6 +657,26 @@ _KERNEL_MERGE_MIN_CANDIDATES = 64
 _MERGE_BLOCK_TOKENS = 256
 
 
+def kept_own_candidates(
+    candidates: jax.Array, topk: int
+) -> tuple[jax.Array, jax.Array]:
+    """This rank's blocks ``[T, topk]`` of one KV head's packed candidates
+    ``[ranks, T, 2 * topk]`` (this rank's first) and which of them the global
+    top-k keeps: those that fewer than topk real candidates of all ranks
+    rank ahead of (score descending, ties to the lower block), as
+    `merge_candidates` orders them. The same pages as its selection's
+    blocks of this rank, in candidate order: an attention that only tests
+    a page's membership needs neither the other ranks' blocks nor the
+    order."""
+    s = jnp.concatenate([c[:, :topk] for c in candidates], axis=1)
+    b = jnp.concatenate([c[:, topk:] for c in candidates], axis=1).astype(jnp.int32)
+    s_i, b_i = s[:, :topk, None], b[:, :topk, None]
+    s_j, b_j = s[:, None, :], b[:, None, :]
+    ahead = (s_j > _NEG_INF) & ((s_j > s_i) | ((s_j == s_i) & (b_j < b_i)))
+    place = jnp.sum(ahead, axis=2, dtype=jnp.int32)
+    return b[:, :topk], (s[:, :topk] > _NEG_INF) & (place < topk)
+
+
 def merge_head_candidates(
     candidates: jax.Array, topk: int, interpret: bool = False
 ) -> jax.Array:
@@ -991,6 +1011,7 @@ def msa_attend_dcp(
     dcp: int,
     scale_cache: jax.Array | None = None,
     q_head_major: bool = False,
+    own_first: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Second half of the DCP forward: attend over the selected blocks this
@@ -1008,7 +1029,9 @@ def msa_attend_dcp(
     the partial head-major, as the kernel writes it, ``(out [G * Hg, T, D],
     lse [G * Hg, T] f32)``: the LSE merge reduce-scatters heads along the
     leading axis (`ops.msa.merge_head_partials`), or the merge's all-to-all
-    sends each rank its block (`attend_and_merge`).
+    sends each rank its block (`attend_and_merge`). With `own_first`
+    (``candidates[0]`` is this rank's) and one KV head, the page keys come
+    from this rank's kept candidates (`kept_own_candidates`).
     """
     num_tokens = q.shape[1 if q_head_major else 0]
     rank = rank_array(rank)[0]
@@ -1017,8 +1040,7 @@ def msa_attend_dcp(
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
     pages_per_seq = block_tables_2d.shape[1]
     seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
-    selected = merge_head_candidates(candidates, topk, interpret)  # [T, G, topk]
-    num_heads = selected.shape[1]
+    num_heads = candidates.shape[2] // (2 * topk)
     own_block = pos // block_size
     local_key = jnp.where(
         valid & (own_block % dcp == rank),
@@ -1027,7 +1049,12 @@ def msa_attend_dcp(
     )
     # Page keys (seq * pages_per_seq + logical block) of the selected blocks
     # this rank holds, as `msa.sparse_attention`; [T, G, topk].
-    mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
+    if own_first and num_heads == 1:
+        blocks, kept = kept_own_candidates(candidates, topk)
+        mine, selected = (kept & valid[:, None])[:, None], blocks[:, None]
+    else:
+        selected = merge_head_candidates(candidates, topk, interpret)
+        mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
     keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
     small = num_tokens <= DCP_SMALL_BATCH_TOKENS
     if small:
@@ -1260,8 +1287,9 @@ def attend_and_merge(
     if small:
         # A pair's candidates by one permute: an XLA all-gather blocks the
         # TensorCore for its latency (3.2 us per layer at c4 b3, j-c71e5160).
-        # The merge does not depend on the ranks' order (`merge_head_candidates`),
-        # so no zeros, rank-indexed updates or relayouts build a rank-ordered copy.
+        # No rank-ordered copy (zeros, rank-indexed updates, relayouts): the
+        # selection does not depend on the ranks' order, and this rank's own
+        # candidates come first (`msa_attend_dcp`'s `own_first`).
         assert dcp == 2, "the swap below pairs two ranks"
         received = jax.lax.ppermute(candidates, axis, [(0, 1), (1, 0)])
         cand_all = jnp.stack([candidates, received])
@@ -1280,6 +1308,7 @@ def attend_and_merge(
         dcp=dcp,
         scale_cache=scale_cache,
         q_head_major=True,
+        own_first=small,
         interpret=interpret,
     )
     # Block r of each result came from rank r: its partial of this rank's heads.
