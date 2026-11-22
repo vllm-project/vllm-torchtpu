@@ -264,7 +264,7 @@ def test_f32_conv_pooled_step_matches_reference_and_keeps_conv_exact(T: int, B: 
         "t4_wide_f32",
     ],
 )
-def test_f32_conv_fused_matches_split_bitwise(T: int, wide_qkv: bool, conv_dtype: Any):
+def test_conv_fused_matches_split(T: int, wide_qkv: bool, conv_dtype: Any):
     """Fused pool I/O (`T in (1, 4)`, `conv_stage in (False, True)`) matches
     head-major split pool I/O: bitwise on `f32`-conv hidden outputs (at `T=1`
     and `t=0` of `T=4`) and on KV/conv pool bytes, within 8 `bf16` ULPs on CPU
@@ -378,12 +378,12 @@ def test_f32_conv_fused_matches_split_bitwise(T: int, wide_qkv: bool, conv_dtype
         else:
             # On Intel XLA:CPU, batched `(B, QKV)`/`[CB, KD, VD]` split vs
             # per-sequence `(1, QKV)`/`[1, KD, VD]` fused GDN recurrence can
-            # differ by 1 `bf16` ULP in layer 0. Later layers inherit it: up to
-            # 4 `bf16` ULPs on `hid`, `2**-10` on later-layer conv, `2**-11` on
-            # `rec`, and 1 fp8 ULP on the KV entry written at `pos`. Layer-0
-            # conv (written before the recurrence), padded rows and every KV
-            # entry other than the one written stay bitwise. TPU bitwise
-            # coverage is in `test_fused_pool_io_tpu.py`.
+            # differ by 1 `bf16` ULP in layer 0. Later layers inherit it: bound
+            # `hid` at 8 `bf16` ULPs (`<= 4` observed), later-layer conv at
+            # `2**-4`, `rec` at `2**-7`, and the KV entry written at `pos` at
+            # 1 fp8 ULP. Layer-0 conv (written before the recurrence), padded
+            # rows and every KV entry other than the one written stay bitwise.
+            # TPU bitwise coverage is in `test_fused_pool_io_tpu.py`.
             np.testing.assert_array_equal(
                 np.asarray(mk.unfold(hid_fused, 2)[:, B:]).view(np.uint8),
                 np.asarray(mk.unfold(hid_split, 2)[:, B:]).view(np.uint8),

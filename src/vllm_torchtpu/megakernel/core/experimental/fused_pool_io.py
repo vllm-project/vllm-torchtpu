@@ -149,7 +149,7 @@ def _gqa_seq_active(ctx: Any, s: Any) -> Any:
     if cache_exec(ex).act_mode == "all":
         return jnp.bool_(True)
     if cache_exec(ex).act_mode == "ref":
-        return (ST["active_seqs"][s] != 0) if "active_seqs" in ST else jnp.bool_(True)
+        return ST["active_seqs"][s] != 0
     if "ckpt_indices" not in ST:
         return jnp.bool_(True)
     ck_ref = ST["ckpt_indices"]
@@ -743,11 +743,6 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
         def colsk(x):
             return jnp.swapaxes(jnp.broadcast_to(x[:, None, :], (kh, VD, KD)), 1, 2)
 
-        if 2 * kh > vh:
-            raise MegakernelConfigError(
-                f"GDN fused_pool_io requires 2 * kh <= vh for per-rank sbuf staging, "
-                f"got kh={kh}, vh={vh} (R={ex.R})"
-            )
         NCB = 2 if 4 * kh <= vh else 1
         hrow = lax.broadcasted_iota(I32, (vh, VD), 0)
         HR2 = KD // 2

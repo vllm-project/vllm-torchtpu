@@ -511,6 +511,8 @@ def test_cache_experimental_wrappers_build_fused_steps():
     mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
     step = cache_experimental.make_fused_pooled_step(mesh, spec, ex)
     assert step.info["use_fused"] is True
+    with pytest.raises(MegakernelConfigError, match="donate_pools=True"):
+        cache_experimental.make_fused_pooled_step(mesh, spec, ex, donate_pools=False)
     _, _, _, donated = cache_experimental.make_flat_fused_pooled_step(mesh, spec, ex)
     assert donated
     with pytest.raises(MegakernelConfigError, match="donate_pools=True"):

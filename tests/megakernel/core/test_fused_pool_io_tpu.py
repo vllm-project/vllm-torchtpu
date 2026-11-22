@@ -25,36 +25,13 @@ import pytest
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from tests.megakernel.conftest import host_device, tpu_mesh
 from tests.megakernel.core.megakernel_synth import TINY_TILES, synth_hybrid_spec
 from vllm_torchtpu.megakernel import core as mk
 from vllm_torchtpu.megakernel.core import pool
 from vllm_torchtpu.megakernel.core.cache_hlo import check_pooled_step_hlo
 from vllm_torchtpu.megakernel.core.ops import BF16, F32, I32
 from vllm_torchtpu.megakernel.core.reference import spec_reference_step
-
-
-def _tpu_mesh(R: int) -> Mesh:
-    """Return an `R`-device TPU mesh, skipping cleanly when TPU is absent or busy."""
-    try:
-        devs = list(jax.devices("tpu"))
-    except RuntimeError as exc:
-        pytest.skip(f"TPU backend unavailable or busy: {exc}")
-    if len(devs) < R:
-        pytest.skip(f"Requires >= {R} TPU devices, found {len(devs)}")
-    try:
-        jax.device_put(jnp.zeros((1,), dtype=I32), devs[0]).block_until_ready()
-    except RuntimeError as exc:
-        pytest.skip(f"TPU device busy or unusable: {exc}")
-    return Mesh(np.asarray(devs[:R]), ("tp",))
-
-
-def _host_device(fallback: jax.Device) -> jax.Device:
-    """Prefer CPU for reference input construction when available, else `fallback`."""
-    try:
-        cpu_devs = jax.devices("cpu")
-    except RuntimeError:
-        cpu_devs = []
-    return cpu_devs[0] if cpu_devs else fallback
 
 
 def _hybrid_geom(
@@ -113,8 +90,9 @@ def _run_split_and_fused_on_tpu(
 ) -> dict[str, Any]:
     """Run split (`fused_pool_io=False`) and fused (`fused_pool_io=True`) steps on
     identical inputs on TPU (`interpret=False`) and return unpacked results."""
-    # Fused GDN recurrence always runs head-major; match it on split.
-    tiles = replace(TINY_TILES, bank=512 << 10).with_modules(
+    # Fused GDN recurrence always runs head-major; `wide_rows=0` activates
+    # `GCH=True` (`gdn_rec_chunked`) on split so `gdn_head_major=True` takes effect.
+    tiles = replace(TINY_TILES, bank=512 << 10, wide_rows=0).with_modules(
         {
             "gqa": {"kv_blk": 128, "nkv": 2},
             "gdn": {"conv_stage": conv_stage, "gdn_head_major": True},
@@ -141,7 +119,7 @@ def _run_split_and_fused_on_tpu(
     spec_dt, lay = _with_conv_dtype(spec_base, conv_dtype)
     lay.validate(ex_split)
 
-    host_dev = _host_device(mesh.devices.flat[0])
+    host_dev = host_device(mesh.devices.flat[0])
     with jax.default_device(host_dev):
         pos, hid_l, w_l, st_l = mk.random_spec_inputs(
             jax.random.key(seed), spec_dt, ex_ref
@@ -157,13 +135,22 @@ def _run_split_and_fused_on_tpu(
             np.asarray(conv_full, dtype=np.float32),
             np.asarray(conv_full.astype(BF16), dtype=np.float32),
         )
-        if jnp.dtype(conv_dtype) == jnp.dtype(F32):
+        is_f32_conv = jnp.dtype(conv_dtype) == jnp.dtype(F32)
+        if is_f32_conv:
             st_l = dict(st_l, conv=conv_full)
         else:
             st_l = dict(st_l, conv=conv_full.astype(BF16).astype(F32))
 
         ref_hid, ref_st = spec_reference_step(
-            spec_dt, g, ex_ref, pos, hid_l, w_l, st_l, paged_kv=True, pool_io=True
+            spec_dt,
+            g,
+            ex_ref,
+            pos,
+            hid_l,
+            w_l,
+            st_l,
+            paged_kv=True,
+            pool_io=not is_f32_conv,
         )
         pos_mk, hid_mk, w_mk, _ = mk.pack_spec_inputs(
             pos, hid_l, w_l, st_l, spec_dt, ex_ref
@@ -194,6 +181,7 @@ def _run_split_and_fused_on_tpu(
         mesh, spec_dt, ex_split, donate=False, fused_pool_io=False
     )
     assert not info_split["use_fused"] and not info_split["use_gpr"]
+    assert info_split["plan"].module_params["gdn"].GCH
     hid_split, raw_split = step_split(
         pos_tpu, hid_tpu, w_tpu, raw_split_in, pt_tpu, ckpt_tpu, roff_tpu
     )
@@ -204,33 +192,32 @@ def _run_split_and_fused_on_tpu(
         mesh, spec_dt, ex_fused, donate=True, fused_pool_io=True
     )
     assert info_fused["use_fused"]
-    compiled_hlo = (
-        step_fused.lower(
-            pos_tpu, hid_tpu, w_tpu, raw_fused_in, pt_tpu, ckpt_tpu, roff_tpu
-        )
-        .compile()
-        .as_text()
-    )
+    compiled_fused = step_fused.lower(
+        pos_tpu, hid_tpu, w_tpu, raw_fused_in, pt_tpu, ckpt_tpu, roff_tpu
+    ).compile()
+    compiled_hlo = compiled_fused.as_text()
     assert compiled_hlo is not None
     ok_hlo, msg_hlo = check_pooled_step_hlo(
         compiled_hlo, layout=lay, fused_pool_io=True
     )
     assert ok_hlo, msg_hlo
 
-    hid_fused, raw_fused = step_fused(
+    hid_fused, raw_fused = compiled_fused(
         pos_tpu, hid_tpu, w_tpu, raw_fused_in, pt_tpu, ckpt_tpu, roff_tpu
     )
     jax.block_until_ready((hid_fused, raw_fused))
 
+    raw_split_np = [np.asarray(r).copy() for r in raw_split]
+    raw_fused_np = [np.asarray(r).copy() for r in raw_fused]
     with jax.default_device(host_dev):
         st_init = pool.pool_to_states(
             lay, ex_ref, [jnp.asarray(r) for r in raw_host], pt, ckpt
         )
         st_split = pool.pool_to_states(
-            lay, ex_ref, [jnp.asarray(np.asarray(r)) for r in raw_split], pt, ckpt
+            lay, ex_ref, [jnp.asarray(r) for r in raw_split_np], pt, ckpt
         )
         st_fused = pool.pool_to_states(
-            lay, ex_ref, [jnp.asarray(np.asarray(r)) for r in raw_fused], pt, ckpt
+            lay, ex_ref, [jnp.asarray(r) for r in raw_fused_np], pt, ckpt
         )
 
     return {
@@ -242,6 +229,8 @@ def _run_split_and_fused_on_tpu(
         "hid_fused": np.asarray(
             mk.unfold(hid_fused, ex_fused.R)[:, :B], dtype=np.float32
         ),
+        "raw_split": raw_split_np,
+        "raw_fused": raw_fused_np,
         "ref_hid": np.asarray(ref_hid, dtype=np.float32),
         "ref_st": ref_st,
         "st_init": st_init,
@@ -256,6 +245,16 @@ def _assert_fused_matches_split(res: dict[str, Any], *, conv_dtype: Any) -> None
     np.testing.assert_allclose(
         res["hid_fused"][0], res["ref_hid"], rtol=3e-2, atol=3e-2
     )
+
+    # Full raw pool byte equality across every pool (including unreferenced pages,
+    # null pages, and conv rows past `conv_rows`).
+    assert len(res["raw_fused"]) == len(res["raw_split"])
+    for pool_idx, (rf, rs) in enumerate(zip(res["raw_fused"], res["raw_split"])):
+        np.testing.assert_array_equal(
+            np.asarray(rf).view(np.uint8),
+            np.asarray(rs).view(np.uint8),
+            err_msg=f"fused vs split raw pool[{pool_idx}] bytes mismatch",
+        )
 
     # Pooled KV (`kc`, `vc`) and GDN (`conv`, `rec`) states match split bit-for-bit.
     for key in ("kc", "vc", "conv", "rec"):
@@ -286,7 +285,7 @@ def test_fused_vs_split_pool_io_bf16_and_f32_conv_on_tpu(
 ) -> None:
     """`fused_pool_io=True` matches split pool I/O on TPU (`interpret=False`)
     across `bf16` and `f32` conv (`conv_stage` off and on) at `T=1` and `T=4`."""
-    mesh = _tpu_mesh(R=2)
+    mesh = tpu_mesh(R=2)
     g = _hybrid_geom(L=4, att_every=4, R=2, KH=2, VH=4)
     spec = synth_hybrid_spec(g, R=2)
     B = 2 * T
@@ -312,7 +311,7 @@ def test_fused_vs_split_page_crossing_verify_on_tpu(conv_dtype: Any) -> None:
     """`T=4` verify step where sequence 0 crosses a `128`-token KV page boundary
     (`pos = [126, 127, 128, 129]`, exercising slow per-token KV RMW `kv_mode == 2`
     alongside sequence 1 on fast KV RMW `kv_mode == 1`) matches split on TPU."""
-    mesh = _tpu_mesh(R=2)
+    mesh = tpu_mesh(R=2)
     g = _hybrid_geom(L=4, att_every=4, R=2, KH=2, VH=4)
     spec = synth_hybrid_spec(g, R=2)
     assert spec.cache_backend is not None
@@ -360,7 +359,7 @@ def test_fused_vs_split_multi_pool_natt_gt_1_on_tpu(
 ) -> None:
     """`fused_pool_io=True` matches split on multi-pool `synth_hybrid_spec`
     geometries with `NATT = 2 > 1` (`num_pools = 2`, `slots_per_pool` in `{1, 3}`)."""
-    mesh = _tpu_mesh(R=2)
+    mesh = tpu_mesh(R=2)
     g = _hybrid_geom(L=L, att_every=att_every, R=2, KH=2, VH=4)
     assert g.NATT == 2 and g.NGDN == L - 2
     spec = synth_hybrid_spec(g, R=2)
