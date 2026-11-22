@@ -278,3 +278,18 @@ def dedup_local(m: MoEEmit, stamp: Any) -> Any:
                     0, TOPK, functools.partial(pick, b), n_hit, unroll=True
                 )
     return n_hit
+
+
+def dedup_local_vec(m: MoEEmit) -> Any:
+    """`dedup_local` from the `dedup_rows_vec` rows: copy the hit list to `elist`.
+
+    `hits` row 0 holds the first-appearance hit list, row 1 lane 0 the count.
+    Only `elist[0:n_hit]` is ever read (every consumer is under `n_hit > 0`).
+    """
+    scr, sc = m.scr, m.sc
+    n_copy = min(m.mp.ER, m.ex.B * m.mp.TOPK)
+    with sc("route_dedup", 2):
+        n_hit = scr["hits"][1, 0]
+        for i in range(n_copy):
+            scr["elist"][i] = scr["hits"][0, i]
+    return n_hit
