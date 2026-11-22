@@ -146,6 +146,7 @@ def test_substitute_and_extract_drafts_matches_two_steps(
             device=torch.device("cpu"),
             _pre_async_results=SimpleNamespace(next_tokens_tpu=next_tokens),
             _substitute_drafts_warm=set(),
+            _warming_substitute_drafts=False,
         )
         r.input_builds = 0
 
@@ -190,3 +191,108 @@ def test_substitute_and_extract_drafts_matches_two_steps(
     for got in (unwarmed, warmed):
         assert torch.equal(got[0], expected[0])
         assert torch.equal(got[1], expected[1])
+
+
+@pytest.mark.parametrize("source_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("num_reqs", [1, 2, 3, 4])
+def test_served_decode_step_meets_the_warmup_keys(monkeypatch, source_dtype, num_reqs):
+    """The served step's `_substitute_and_extract_drafts` arguments, built
+    as execute_model builds them (substitution indices, spec metadata, the
+    drafter's substitution source), against the warmup's: the real
+    spec-decode warmup's source sets the grid's template, so every decode-only
+    request count runs the one program, in order (a full bucket) or indexed."""
+    from contextlib import nullcontext
+
+    from vllm_torchtpu.runner import tpu_runner
+    from vllm_torchtpu.runner.speculative_decoding_manager import (
+        SpeculativeDecodingManager,
+    )
+    from vllm_torchtpu.runner.tpu_runner_async_output import (
+        assemble_spec_next_tokens,
+        extract_draft_token_ids,
+    )
+
+    k, max_reqs, paddings = 3, 4, [8, 16, 32]
+    monkeypatch.setattr(envs, "TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS", True)
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda out: None)
+    req_ids = [f"r{i}" for i in range(num_reqs)]
+    rows = torch.arange(max_reqs * (k + 1), dtype=source_dtype).view(max_reqs, k + 1)
+    drafts = 100 + torch.arange(max_reqs * k, dtype=source_dtype).view(max_reqs, k)
+    # sample_tokens' source: [bonus, drafts] per padded request, bound length.
+    source = assemble_spec_next_tokens(rows, drafts)
+    runner = _runner(
+        _fast_token_substitution=True,
+        device=torch.device("cpu"),
+        speculative_config=SimpleNamespace(num_speculative_tokens=k),
+        num_tokens_paddings=paddings,
+        max_num_reqs=max_reqs,
+        input_batch=SimpleNamespace(req_ids=req_ids),
+        _last_sequence_layout_plan=None,
+        _pre_async_results=SimpleNamespace(
+            next_tokens_tpu=source,
+            req_id_to_index_copy={r: i for i, r in enumerate(req_ids)},
+            spec_decode_num_rejected_tokens=torch.zeros(max_reqs, dtype=torch.int32),
+        ),
+        _substitute_drafts_warm=set(),
+        _substitute_source_seen=None,
+        _warming_substitute_drafts=False,
+        _precompile_timed=lambda name: nullcontext(),
+    )
+    scheduled = np.full(num_reqs, k + 1, dtype=np.int32)
+    bucket = tpu_runner._get_padded_token_len(paddings, int(scheduled.sum()))
+    manager = SimpleNamespace(
+        _meta_cache_key=None,
+        runner=SimpleNamespace(
+            input_ids_cpu=torch.zeros(64, dtype=torch.int32),
+            arange_np=np.arange(64),
+            num_tokens_paddings=paddings,
+            device=torch.device("cpu"),
+        ),
+    )
+
+    def step():
+        cur, pre = runner._prepare_async_token_substitution_indices(
+            0, num_reqs, scheduled
+        )
+        md = SpeculativeDecodingManager.get_spec_decode_metadata(
+            manager,  # type: ignore[arg-type]
+            np.full(num_reqs, k, dtype=np.int32),
+            np.cumsum(scheduled).astype(np.int32),
+            padded_num_reqs=max_reqs,
+            defer_draft_token_ids=True,
+        )
+        input_ids = torch.zeros(bucket, dtype=torch.int32)
+        return runner._substitute_async_tokens_and_drafts(input_ids, cur, pre, md), md
+
+    with (
+        torch.compiler.set_stance("force_eager"),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner._substitute_and_extract_drafts",
+            wraps=_substitute_and_extract_drafts,
+        ) as fused,
+    ):
+        # The real warmup's step (another request count) shows the source.
+        with runner._warming_substitute_drafts_ctx():
+            step()
+        assert runner._substitute_source_seen is source
+        runner._substitute_drafts_warm.clear()
+        TPUModelRunner._precompile_substitute_and_extract_drafts(runner)
+        fused.reset_mock()
+        (input_ids, got_drafts), md = step()
+        assert fused.call_count == 1
+        expected = runner._substitute_async_tokens(
+            torch.zeros(bucket, dtype=torch.int32),
+            *runner._async_substitution_inputs(
+                torch.zeros(bucket, dtype=torch.int32),
+                *runner._prepare_async_token_substitution_indices(
+                    0, num_reqs, scheduled
+                ),
+            ),
+        )
+    assert torch.equal(input_ids, expected)
+    assert torch.equal(
+        got_drafts,
+        extract_draft_token_ids(
+            expected, md.final_logits_indices, md.target_logits_indices
+        ),
+    )

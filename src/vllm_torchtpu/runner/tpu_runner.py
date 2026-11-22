@@ -1239,6 +1239,11 @@ class TPUModelRunner(GPUModelRunner):
         # `program_key`s of the arguments the warmup compiled
         # `_substitute_and_extract_drafts` at.
         self._substitute_drafts_warm: set[tuple] = set()
+        # The spec substitution source the real spec-decode warmup met (its
+        # dtype is the drafter's), the template the grid warmup of
+        # `_substitute_and_extract_drafts` builds its sources from.
+        self._substitute_source_seen: torch.Tensor | None = None
+        self._warming_substitute_drafts = False
         # `program_key`s of the arguments the warmup compiled
         # `synthetic_verify_and_sample` at (`TPU_SPEC_SYNTHETIC_FUSED_VERIFY`),
         # and their `_synthetic_fused_shape`s.
@@ -2599,24 +2604,23 @@ class TPUModelRunner(GPUModelRunner):
             token_in_tpu_pre_next_tokens_indices,
         )
         if inputs is not None:
-            cur_input_indices, pre_next_tokens_indices, next_tokens = inputs
-            args = (
-                input_ids,
-                next_tokens,
-                md.final_logits_indices,
-                md.target_logits_indices,
-                cur_input_indices,
-                pre_next_tokens_indices,
+            args = self._substitute_drafts_args(
+                input_ids, *inputs, md.final_logits_indices, md.target_logits_indices
             )
             if envs.TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS:
-                if program_key(args) in self._substitute_drafts_warm:
+                key = program_key(args)
+                if self._warming_substitute_drafts:
+                    self._substitute_source_seen = inputs[2]
+                    self._substitute_drafts_warm.add(key)
+                if key in self._substitute_drafts_warm:
                     return _substitute_and_extract_drafts(*args)
                 logger.info_once(
                     "Fused async substitution + draft extraction not precompiled "
-                    "for %d tokens, %d next tokens, %d logits rows; running "
+                    "for %d tokens, %d next tokens (%s), %d logits rows; running "
                     "them apart.",
                     input_ids.shape[0],
-                    next_tokens.shape[0],
+                    inputs[2].shape[0],
+                    inputs[2].dtype,
                     md.final_logits_indices.shape[0],
                 )
             input_ids = self._substitute_async_tokens(input_ids, *inputs)
@@ -2624,6 +2628,38 @@ class TPUModelRunner(GPUModelRunner):
             input_ids, md.final_logits_indices, md.target_logits_indices
         )
         return input_ids, drafts
+
+    @staticmethod
+    def _substitute_drafts_args(
+        input_ids: torch.Tensor,
+        cur_input_indices: torch.Tensor | None,
+        pre_next_tokens_indices: torch.Tensor | None,
+        next_tokens: torch.Tensor,
+        final_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+    ) -> tuple:
+        """`_substitute_and_extract_drafts`'s arguments, from
+        `_async_substitution_inputs` and the step's logits indices; serving
+        and the warmup both key on `program_key` of this."""
+        return (
+            input_ids,
+            next_tokens,
+            final_logits_indices,
+            target_logits_indices,
+            cur_input_indices,
+            pre_next_tokens_indices,
+        )
+
+    @contextlib.contextmanager
+    def _warming_substitute_drafts_ctx(self) -> Iterator[None]:
+        """Within the real spec-decode warmup: compile
+        `_substitute_and_extract_drafts` at the arguments its steps build and
+        keep their substitution source as the grid warmup's template."""
+        self._warming_substitute_drafts = True
+        try:
+            yield
+        finally:
+            self._warming_substitute_drafts = False
 
     def _async_substitution_inputs(
         self,
@@ -7218,44 +7254,55 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     synchronize_tensors(out)
                     logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
-                if self._is_async_drafter and envs.TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS:
-                    self._precompile_substitute_and_extract_drafts(
-                        input_ids,
-                        cur_input_indices,
-                        pre_next_tokens_indices,
-                        next_lens[-1],
-                    )
 
-    def _precompile_substitute_and_extract_drafts(
-        self,
-        input_ids: torch.Tensor,
-        cur_input_indices: torch.Tensor,
-        pre_next_tokens_indices: torch.Tensor,
-        next_len: int,
-    ) -> None:
-        """`_substitute_and_extract_drafts` on the spec source at one token
-        bucket of a decode-only verify (as many logits rows as tokens), in
-        order and indexed; other shapes run its two parts
-        (`_substitute_async_tokens_and_drafts`)."""
-        num_tokens = input_ids.shape[0]
-        next_tokens = torch.zeros(next_len, dtype=torch.int64).to(self.device)
-        logits_indices = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
-        target_logits_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
-            self.device
-        )
-        for indexed in (False, True):
-            if not indexed and next_len < num_tokens:
-                continue  # the in-order slice needs next_len >= num_tokens
-            args = (
-                input_ids,
-                next_tokens,
-                logits_indices,
-                target_logits_indices,
-                cur_input_indices if indexed else None,
-                pre_next_tokens_indices if indexed else None,
+    def _precompile_substitute_and_extract_drafts(self) -> None:
+        """`_substitute_and_extract_drafts` at every token bucket a decode-only
+        verify reaches (as many logits rows as tokens), in order and indexed,
+        on a substitution source like the one the real spec-decode warmup met
+        (`_substitute_source_seen`: the drafter's dtype, the bounded length);
+        other steps run its two parts (`_substitute_async_tokens_and_drafts`)."""
+        source = self._substitute_source_seen
+        if source is None:
+            logger.warning(
+                "The spec-decode warmup met no async substitution source; "
+                "_substitute_and_extract_drafts is not warmed for other shapes."
             )
-            synchronize_tensors(_substitute_and_extract_drafts(*args))
-            self._substitute_drafts_warm.add(program_key(args))
+            return
+        assert self.speculative_config is not None
+        max_len = _get_padded_token_len(
+            self.num_tokens_paddings,
+            min(
+                self.max_num_reqs
+                * (1 + self.speculative_config.num_speculative_tokens),
+                self.num_tokens_paddings[-1],
+            ),
+        )
+        next_tokens = torch.zeros_like(source)
+
+        def zeros(n: int) -> torch.Tensor:
+            return torch.zeros(n, dtype=torch.int32).to(self.device)
+
+        with self._precompile_timed("substitute_and_extract_drafts"):
+            for num_tokens in self.num_tokens_paddings:
+                if num_tokens > max_len:
+                    break
+                # As `_async_substitution_inputs` builds them: no slot tensors
+                # for the in-order slice, int32 slots padded to the bucket.
+                slots = [(zeros(num_tokens), zeros(num_tokens))]
+                if next_tokens.numel() >= num_tokens:
+                    slots.append((None, None))
+                for cur, pre in slots:
+                    args = self._substitute_drafts_args(
+                        zeros(num_tokens),
+                        cur,
+                        pre,
+                        next_tokens,
+                        zeros(num_tokens),
+                        zeros(num_tokens),
+                    )
+                    synchronize_tensors(_substitute_and_extract_drafts(*args))
+                    self._substitute_drafts_warm.add(program_key(args))
+        self._substitute_source_seen = None
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
@@ -7915,7 +7962,12 @@ class TPUModelRunner(GPUModelRunner):
                 # dispatch fuses them differently, so the first real
                 # request would otherwise compile new graphs. Warm those
                 # through the real two-phase spec-decode path.
-                self._warmup_spec_decode()
+                if envs.TPU_ASYNC_FUSED_SUBSTITUTE_DRAFTS:
+                    with self._warming_substitute_drafts_ctx():
+                        self._warmup_spec_decode()
+                    self._precompile_substitute_and_extract_drafts()
+                else:
+                    self._warmup_spec_decode()
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.
