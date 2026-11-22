@@ -758,23 +758,25 @@ def test_scale_slab_lookup_and_scatter_are_bit_exact(
     np.testing.assert_array_equal(outs[True], outs[False])
 
 
+@pytest.mark.parametrize("t_local", [16, 48, kernel.COMBINE_MIN_TOKENS])
 @pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
 def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
-    wire_dtype,
+    wire_dtype, t_local
 ):
-    """Pallas `_build_combine_kernel` keeps NaN arrival rows on padded rows.
+    """The Pallas combine kernels keep NaN arrival rows on padded rows.
 
     In `fused_ep_moe_v2`, a freshly allocated `arrivals` buffer may contain
     zeroes on TPU rather than `NaN`. This single-chip test calls
-    `layer._combine_arrivals` directly at `t_local = COMBINE_MIN_TOKENS` (256),
-    where `kernel.combine_step_tokens(t_local) > 0` dispatches to the Pallas
-    DMA/reduce combine kernel (`_build_combine_kernel`), with `arrivals` and
+    `layer._combine_arrivals` directly at a `t_local` that dispatches to a
+    Pallas combine kernel -- the small one-group-a-step kernel under
+    `COMBINE_MIN_TOKENS`, the pipelined one at it -- with `arrivals` and
     `arrival_scales` explicitly poisoned with `NaN` at all sentinel positions,
     followed by the layer's `jnp.where(row_routes, combined, jnp.zeros_like(combined))`.
     """
-    t_local = kernel.COMBINE_MIN_TOKENS
-    assert kernel.combine_step_tokens(t_local) > 0
     topk, lane_blocks, lanes, tile_m = 4, 2, 128, 128
+    assert kernel.combine_step_tokens(t_local) or kernel.combine_small_tokens(
+        t_local, topk, tile_m
+    )
     hidden = lane_blocks * lanes
     block = host.routing_block(t_local, topk)
     recv_rows = block + 64
@@ -820,6 +822,60 @@ def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
         out[active:].astype(np.float32),
         np.zeros((padded, hidden), dtype=np.float32),
     )
+
+
+@pytest.mark.parametrize(
+    "t_local,topk,lane_blocks",
+    [(16, 10, 64), (48, 4, 2), (240, 8, 4)],
+    ids=["decode", "odd_groups", "max_groups"],
+)
+@pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
+def test_small_combine_kernel_matches_xla_epilogue(
+    monkeypatch, wire_dtype, t_local, topk, lane_blocks
+):
+    """The small combine kernel computes the XLA epilogue's bits.
+
+    Same coefficient, same terms in the same order, so the two agree exactly,
+    including on positions past either buffer, which both clamp to its end.
+    """
+    tile_m, mirror_sublanes = 128, 9
+    recv_rows = t_local * topk + 64
+    assert kernel.combine_small_tokens(t_local, topk, tile_m)
+    rng = np.random.default_rng(t_local)
+    with jax.default_device(jax.devices()[0]):
+        arrivals = jnp.asarray(
+            rng.uniform(-4, 4, (recv_rows, lane_blocks, 128)).astype(np.float32)
+        ).astype(wire_dtype)
+        arrival_scales = jnp.asarray(
+            rng.uniform(0.01, 2, (mirror_sublanes, tile_m)).astype(np.float32)
+        )
+        pos = rng.integers(0, recv_rows + 8, (t_local, topk), dtype=np.int32)
+        mirror_pos = rng.integers(
+            0, mirror_sublanes * tile_m + 8, (t_local, topk), dtype=np.int32
+        )
+        topk_weights = rng.uniform(0, 1, (t_local, topk)).astype(np.float32)
+        args = (
+            arrivals,
+            arrival_scales,
+            jnp.asarray(pos),
+            jnp.asarray(mirror_pos),
+            jnp.asarray(topk_weights),
+        )
+
+        def combine():
+            # A fresh function per call, so the second trace sees the patch.
+            # The result leaves the jit as bf16: a bf16 -> f32 convert inside
+            # it lets XLA fold the rounding away under excess precision.
+            return jax.jit(lambda *a: layer._combine_arrivals(*a, jnp.bfloat16))
+
+        small = combine()
+        assert "moe_v2_combine_small" in small.lower(*args).as_text()
+        got = np.asarray(small(*args)).astype(np.float32)
+        monkeypatch.setattr(layer, "combine_small_tokens", lambda *_: False)
+        xla = combine()
+        assert "moe_v2_combine_small" not in xla.lower(*args).as_text()
+        want = np.asarray(xla(*args)).astype(np.float32)
+    np.testing.assert_array_equal(got, want)
 
 
 @pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])

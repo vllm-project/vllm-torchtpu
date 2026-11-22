@@ -60,7 +60,9 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     SCALE_SLAB_WINDOW,
     build_act_scale_slab,
     build_combine_kernel,
+    build_combine_small_kernel,
     build_fused_ep_moe_kernel,
+    combine_small_tokens,
     combine_step_tokens,
     rowquant_fp8,
     scale_slab_fits,
@@ -125,11 +127,12 @@ def _combine_arrivals(
     Where the kernel path applies (kernel.combine_step_tokens) the row gather
     and the weighted sum are one Mosaic call: XLA answers `arrivals[rows]`
     with a SparseCore gather whose output is in HBM at any size, so the rows
-    are written out and read straight back before the sum sees them.
-    Everywhere else the gather is not offloaded and there is no round trip to
-    remove, so the fused XLA epilogue below stays.
+    are written out and read straight back before the sum sees them. Under
+    it (kernel.combine_small_tokens) XLA keeps both gathers on the TensorCore
+    at tens of ns per index, so a smaller kernel takes the scale lookup, the
+    row gather and the sum at once. Any other shape keeps the XLA epilogue.
 
-    Both paths fold the arrival row's scale and the router weight into one
+    Every path folds the arrival row's scale and the router weight into one
     coefficient over K * t_local values, so each of the K * t_local * hidden
     elements is multiplied once rather than twice.
     """
@@ -137,6 +140,18 @@ def _combine_arrivals(
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
     hidden = lane_blocks * lanes
+    if combine_small_tokens(t_local, topk, tile_m):
+        combine = build_combine_small_kernel(
+            t_local=t_local,
+            topk=topk,
+            lane_blocks=lane_blocks,
+            recv_rows=recv_rows,
+            mirror_sublanes=mirror_sublanes,
+            tile_m=tile_m,
+            wire_dtype=arrivals.dtype,
+            out_dtype=out_dtype,
+        )
+        return combine(arrivals, arrival_scales, pos, mirror_pos, topk_weights)
     # A gather clamps an out-of-range index to the last one; a DMA does not,
     # and a sublane index clamped on its own would pair the last sublane with
     # the wrong lane. Neither position is ever negative.

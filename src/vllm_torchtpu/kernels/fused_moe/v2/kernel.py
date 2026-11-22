@@ -2370,9 +2370,10 @@ COMBINE_GROUP = 16
 # live at once. Unrolled straight-line over a whole step, the list scheduler
 # hoists every arrival load and spills.
 COMBINE_CHUNK = 16
-# Below this many local tokens XLA does not offload the gather at all (b64 and
-# b32 emit no OFFLOAD_GATHER), so there is no round trip to remove and a second
-# Mosaic call's fixed cost would be the whole effect.
+# Local tokens from which the pipelined step loop below applies. Under it the
+# combine is the one-group-at-a-time kernel further down: XLA keeps the gathers
+# on the TensorCore there, and that costs ~33 ns per scalar index and ~67 ns per
+# arrival row -- 16.5 us a layer at t_local=16, topk=10, hidden 8192.
 COMBINE_MIN_TOKENS = 256
 COMBINE_PARITIES = 4
 # Steps of row lead. A step's rows are waited at its head, so at one step of
@@ -2561,6 +2562,193 @@ def build_combine_kernel(**kwargs):
             fn = _COMBINE_CACHE.get(key)
             if fn is None:
                 fn = _build_combine_kernel(**kwargs)
+                _COMBINE_CACHE[key] = fn
+    return fn
+
+
+# SMEM the small combine's double-buffered scale sublanes may take: a quarter
+# of the 1 MiB SMEM of every current chip. Each pair copies one whole mirror
+# sublane, since a DMA addresses the mirror no finer than that.
+COMBINE_SCALE_SMEM_BYTES = 256 * 1024
+
+
+def combine_small_tokens(t_local, topk, tile_m):
+    """Whether the small-batch combine kernel takes this shape.
+
+    It covers whole COMBINE_GROUP token groups under COMBINE_MIN_TOKENS whose
+    scale sublanes fit COMBINE_SCALE_SMEM_BYTES; anything else under the
+    pipelined path's minimum keeps the XLA epilogue.
+    """
+    return (
+        0 < t_local < COMBINE_MIN_TOKENS
+        and not t_local % COMBINE_GROUP
+        and 2 * COMBINE_GROUP * topk * tile_m * 4 <= COMBINE_SCALE_SMEM_BYTES
+    )
+
+
+def _build_combine_small_kernel(
+    *,
+    t_local,
+    topk,
+    lane_blocks,
+    recv_rows,
+    mirror_sublanes,
+    tile_m,
+    wire_dtype,
+    out_dtype,
+):
+    """The combine under COMBINE_MIN_TOKENS, one COMBINE_GROUP of tokens a step.
+
+    out[i] = sum_k (scale[mirror_pos[i, k]] * w[i, k]) * arrivals[pos[i, k]],
+    with both positions clamped into their buffers here, as XLA's gather would.
+    The arrival row's scale is looked up in the kernel too: each pair copies
+    its mirror sublane into SMEM beside its row, so the coefficient is one
+    scalar multiply rather than a separate XLA gather of t_local * topk
+    scalars. The terms and their order are the XLA epilogue's, so the result
+    is the same bits.
+
+    A group's rows and sublanes are started while the group before it reduces,
+    double-buffered; at decode batch sizes there is a single group and the
+    kernel is one round of copies, one reduction and one store.
+    """
+    gt = COMBINE_GROUP
+    groups = t_local // gt
+    pairs = gt * topk
+    lanes = HIDDEN_LANE_BLOCK
+    hidden = lane_blocks * lanes
+    scl_shift = host.pow2_shift(tile_m, "the mirror's lane count")
+    max_scl = mirror_sublanes * tile_m - 1
+
+    def kernel(
+        pos_sm,
+        mpos_sm,
+        w_sm,
+        arr_hbm,
+        scl_hbm,
+        out_hbm,
+        rows_vm,
+        scl_sm,
+        tile_vm,
+        out_vm,
+        row_sems,
+        scl_sems,
+        out_sem,
+    ):
+        def mirror_index(j):
+            return jnp.minimum(mpos_sm[j], max_scl)
+
+        def start_group(g, parity):
+            # Token-major, so the first token's rows lead the queues; slots
+            # alternate queues as in the pipelined kernel, and a pair's sublane
+            # rides the queue its row does not.
+            for u in range(gt):
+                for k in range(topk):
+                    j = (g * gt + u) * topk + k
+                    slot = k * gt + u
+                    pltpu.make_async_copy(
+                        scl_hbm.at[
+                            pl.ds(jnp.right_shift(mirror_index(j), scl_shift), 1)
+                        ],
+                        scl_sm.at[pl.ds(parity * pairs + slot, 1)],
+                        scl_sems.at[parity],
+                    ).start(priority=(k + 1) % 2)
+                    pltpu.make_async_copy(
+                        arr_hbm.at[jnp.minimum(pos_sm[j], recv_rows - 1)],
+                        rows_vm.at[parity, slot],
+                        row_sems.at[parity],
+                    ).start(priority=k % 2)
+
+        def one_group(g, carry):
+            parity = g % 2
+            if groups > 1:
+
+                @pl.when(g + 1 < groups)
+                def _():
+                    start_group(g + 1, 1 - parity)
+
+            pltpu.make_async_copy(
+                rows_vm.at[parity], rows_vm.at[parity], row_sems.at[parity]
+            ).wait()
+            own = scl_sm.at[pl.ds(parity * pairs, pairs)]
+            pltpu.make_async_copy(own, own, scl_sems.at[parity]).wait()
+            for u in range(gt):
+                acc = None
+                for k in range(topk):
+                    j = (g * gt + u) * topk + k
+                    slot = k * gt + u
+                    lane = mirror_index(j) & (tile_m - 1)
+                    coef = scl_sm[parity * pairs + slot, lane] * w_sm[j]
+                    term = rows_vm[parity, slot].astype(jnp.float32) * coef
+                    acc = term if acc is None else acc + term
+                tile_vm[u] = cast(jax.Array, acc).astype(out_dtype)
+            out_vm[g] = tile_vm[...].reshape(gt, hidden)
+            pltpu.make_async_copy(
+                out_vm.at[g], out_hbm.at[pl.ds(g * gt, gt)], out_sem
+            ).start()
+            return carry
+
+        start_group(0, 0)
+        lax.fori_loop(0, groups, one_group, jnp.int32(0))
+        pltpu.make_async_copy(out_vm, out_vm, out_sem).wait()
+
+    hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    call = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            in_specs=[hbm, hbm],
+            out_specs=hbm,
+            scratch_shapes=(
+                pltpu.VMEM((2, pairs, lane_blocks, lanes), wire_dtype),
+                pltpu.SMEM((2 * pairs, tile_m), jnp.float32),
+                pltpu.VMEM((gt, lane_blocks, lanes), out_dtype),
+                pltpu.VMEM((groups, gt, hidden), out_dtype),
+                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SemaphoreType.DMA,
+            ),
+            grid=(),
+        ),
+        out_shape=jax.ShapeDtypeStruct((t_local, hidden), out_dtype),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=host.vmem_limit(), disable_bounds_checks=True
+        ),
+        name=f"moe_v2_combine_small_t{t_local}_k{topk}",
+    )
+
+    def fn(arrivals, arrival_scales, pos, mirror_pos, topk_weights):
+        # Bounds checks are off, so the shapes the clamps and the SMEM tables
+        # were sized for are checked here. Tables flatten token-major.
+        expect = (
+            ("arrivals", arrivals, (recv_rows, lane_blocks, lanes)),
+            ("arrival_scales", arrival_scales, (mirror_sublanes, tile_m)),
+            ("pos", pos, (t_local, topk)),
+            ("mirror_pos", mirror_pos, (t_local, topk)),
+            ("topk_weights", topk_weights, (t_local, topk)),
+        )
+        for name, arr, shape in expect:
+            if tuple(arr.shape) != shape:
+                raise ValueError(f"{name} must be {list(shape)}, got {list(arr.shape)}")
+        return call(
+            pos.astype(jnp.int32).reshape(-1),
+            mirror_pos.astype(jnp.int32).reshape(-1),
+            topk_weights.astype(jnp.float32).reshape(-1),
+            arrivals,
+            arrival_scales.astype(jnp.float32),
+        )
+
+    return fn
+
+
+def build_combine_small_kernel(**kwargs):
+    """Memoizing front door; see build_fused_ep_moe_kernel for why."""
+    key = (("kind", "small"),) + tuple(sorted((k, str(v)) for k, v in kwargs.items()))
+    fn = _COMBINE_CACHE.get(key)
+    if fn is None:
+        with _COMBINE_CACHE_LOCK:
+            fn = _COMBINE_CACHE.get(key)
+            if fn is None:
+                fn = _build_combine_small_kernel(**kwargs)
                 _COMBINE_CACHE[key] = fn
     return fn
 
