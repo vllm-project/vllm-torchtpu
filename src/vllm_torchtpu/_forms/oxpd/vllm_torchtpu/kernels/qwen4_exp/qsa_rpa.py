@@ -925,6 +925,9 @@ def _prefill_attention(
             **({"walk_pipe": envs.VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE} if envs.VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE else {}),
             **({"dot16": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_DOT16 else {}),
             **({"vguard_none": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_VGUARD_NONE else {}),
+            **({"bf16_softmax": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_BF16_SOFTMAX else {}),
+            **({"fos": int(envs.VLLM_TPU_QSA_PREFILL_UNION_FOS)} if envs.VLLM_TPU_QSA_PREFILL_UNION_FOS else {}),
+            **({"lean_tile": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_LEAN_TILE else {}),
         )
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
         block_sparse_gqa_attention,

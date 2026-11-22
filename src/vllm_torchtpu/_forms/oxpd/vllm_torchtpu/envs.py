@@ -208,6 +208,9 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_DOT16: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_VGUARD_NONE: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_BF16_SOFTMAX: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_FOS: int = 0
+    VLLM_TPU_QSA_PREFILL_UNION_LEAN_TILE: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_GATHERED: str = ""
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS: int = 4
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
@@ -1332,6 +1335,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # q38 UNION-BUILD (default off; gathered walk only): VGUARD_NONE: no value guard (QA-1's VGUARD_LEAN keeps `written`, which is
     # true on every rank whose probability can be non-zero). Bitwise on finite read rows (QA-1's precondition). Kernel name _vn.
     "VLLM_TPU_QSA_PREFILL_UNION_VGUARD_NONE": env_bool("VLLM_TPU_QSA_PREFILL_UNION_VGUARD_NONE"),
+    # q38 PSTEP-QSA WALK-FOS (default off; NOT bitwise, accuracy-gated): the gathered union walk's softmax in packed BF16
+    # (MM P17 R-B port), FOS 1 (lag-1 offset) / 2 (static offset 0 with the exact re-walk guard) on it (MM L-A port) and
+    # the lean FP8 tile (MM L-B port). FOS and LEAN_TILE need BF16_SOFTMAX.
+    "VLLM_TPU_QSA_PREFILL_UNION_BF16_SOFTMAX": env_bool("VLLM_TPU_QSA_PREFILL_UNION_BF16_SOFTMAX", default=False),
+    "VLLM_TPU_QSA_PREFILL_UNION_FOS": env_int("VLLM_TPU_QSA_PREFILL_UNION_FOS", 0),
+    "VLLM_TPU_QSA_PREFILL_UNION_LEAN_TILE": env_bool("VLLM_TPU_QSA_PREFILL_UNION_LEAN_TILE", default=False),
     # GATHERED ("", "reference", "sparsecore"; with LISTED): the walk-free kernel on chunked gathered tiles.
     "VLLM_TPU_QSA_PREFILL_UNION_GATHERED": env_str("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", ""),
     "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS": env_int("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", 4),
