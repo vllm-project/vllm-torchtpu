@@ -13,9 +13,8 @@
 # limitations under the License.
 """The TPU runner's sampler and logprobs math as plain functions.
 
-`TPUModelRunner._apply_temperature`, `sample_from_logits` and
-`gather_logprobs` delegate here, so another compiled program can trace the
-same math without a runner.
+`TPUModelRunner.sample_from_logits` and `gather_logprobs` delegate here, so
+another compiled program can trace the same math without a runner.
 """
 
 import torch

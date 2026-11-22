@@ -14,7 +14,7 @@
 """Token sampling from logits, as the TPU runner samples.
 
 The exporter lowers the TPU runner's sampler (`TPUModelRunner.sample_from_logits`
-and `_apply_temperature`) into every artifact, so that an artifact samples as
+and `sampler_math`) into every artifact, so that an artifact samples as
 vLLM does. This module is a copy of it, kept inside the experimental exporter;
 `tests/experimental/export/test_sampler_parity.py` checks that the two agree.
 

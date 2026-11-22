@@ -57,6 +57,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.sample.sampler_math import apply_temperature
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     apply_top_k_top_p,
     random_sampler_variants,
@@ -3644,7 +3645,6 @@ def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
     """Uniform noise `u` in float32 preserves the upper Gumbel tail above the
     bfloat16 ceiling (-log(-log(1 - 2^-7)) ~= 4.85) when logits are bfloat16."""
     runner = SimpleNamespace()
-    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
     sample_fn = TPUModelRunner.sample_from_logits.__wrapped__
 
     logits = torch.tensor([[6.0, 0.0]], dtype=torch.bfloat16)
@@ -3799,7 +3799,6 @@ def test_skipping_topk_topp_is_exact_at_the_default_sampling_params(dtype):
     path; with top-k set, skipping would change them (negative control)."""
     gen = torch.Generator().manual_seed(0)
     runner = SimpleNamespace()
-    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
     sample_fn = TPUModelRunner.sample_from_logits.__wrapped__
     num_reqs, vocab = 16, 4096
     logits = (torch.randn(num_reqs, vocab, generator=gen) * 4).to(dtype)
@@ -3811,7 +3810,7 @@ def test_skipping_topk_topp_is_exact_at_the_default_sampling_params(dtype):
     top_k = torch.zeros((num_reqs, 1), dtype=torch.int32)
     top_p = torch.ones((num_reqs, 1), dtype=torch.float32)
 
-    scaled = runner._apply_temperature(logits, temperatures)
+    scaled = apply_temperature(logits, temperatures)
     assert torch.equal(apply_top_k_top_p(scaled, top_k, top_p, 0), scaled)
     for _ in range(4):
         u = torch.rand((num_reqs, vocab), dtype=torch.float32, generator=gen)
@@ -3892,7 +3891,6 @@ def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
         runner.input_batch.all_greedy = False
         # A partial prefill: its token is discarded.
         runner.requests["r1"].num_tokens = 2
-        runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
         runner.sample_from_logits_func = (
             TPUModelRunner.sample_from_logits.__wrapped__.__get__(runner)
         )

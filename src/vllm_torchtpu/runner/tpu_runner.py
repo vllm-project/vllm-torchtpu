@@ -556,7 +556,6 @@ def _make_kv_connector_output(
 
 # Smallest output size
 MIN_NUM_SEQS = 8
-SAMPLING_EPS = sampler_math.SAMPLING_EPS
 
 
 def _compute_num_reqs_in_chunk(
@@ -9548,11 +9547,6 @@ class TPUModelRunner(GPUModelRunner):
         bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_logits, target_logits
-
-    def _apply_temperature(
-        self, logits: torch.Tensor, temperatures: torch.Tensor
-    ) -> torch.Tensor:
-        return sampler_math.apply_temperature(logits, temperatures)
 
     # TODO: Under SPMD mode, sample_from_logits has correctness issue.
     #       Re-enable the torch.compile once the issue is fixed in torchxla.

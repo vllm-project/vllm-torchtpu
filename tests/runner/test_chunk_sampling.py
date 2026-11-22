@@ -70,7 +70,6 @@ def _runner(*, all_greedy: bool = True, spec_k: int | None = None) -> SimpleName
         TPUModelRunner._sample_plain_chunk,
         TPUModelRunner._sample_spec_verify_chunk,
         TPUModelRunner._mask_min_tokens,
-        TPUModelRunner._apply_temperature,
         TPUModelRunner._sampler_applies_topk_topp,
         TPUModelRunner.spec_bonus_and_target_logits,
         TPUModelRunner.spec_bonus_and_target_tokens,

@@ -19,13 +19,12 @@ import pytest
 import torch
 
 from vllm_torchtpu.experimental.export import random_sample
-from vllm_torchtpu.runner import tpu_runner
+from vllm_torchtpu.layers.adapter.sample import sampler_math
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
 def _runner_sample(*args, **kwargs):
     runner = SimpleNamespace()
-    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
     return TPUModelRunner.sample_from_logits.__wrapped__(runner, *args, **kwargs)
 
 
@@ -51,4 +50,4 @@ def test_exporter_sampler_matches_the_tpu_runner(all_greedy, apply_topk_topp):
 
 
 def test_exporter_greedy_threshold_matches_the_tpu_runner():
-    assert random_sample.SAMPLING_EPS == tpu_runner.SAMPLING_EPS
+    assert random_sample.SAMPLING_EPS == sampler_math.SAMPLING_EPS

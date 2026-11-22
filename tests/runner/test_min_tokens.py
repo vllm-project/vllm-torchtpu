@@ -628,7 +628,6 @@ def test_plain_step_masks_random_sampling_below_min_tokens(num_output, expected)
         TPUModelRunner._sampler_applies_topk_topp.__get__(runner)
     )
     runner._get_sampling_generator = lambda: torch.Generator().manual_seed(0)
-    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
     runner.sample_from_logits_func = TPUModelRunner.sample_from_logits.__get__(runner)
     assert run_sample_tokens(runner).sampled_token_ids == [[expected]]
 

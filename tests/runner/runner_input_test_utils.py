@@ -406,7 +406,6 @@ def _make_sample_runner(
         TPUModelRunner._settle_draft_placeholders_for_min_tokens,
         TPUModelRunner._num_output_tokens,
         TPUModelRunner._greedy_top_tokens_this_step,
-        TPUModelRunner._apply_temperature,
         TPUModelRunner._sampler_applies_topk_topp,
         TPUModelRunner._modify_prev_results,
         TPUModelRunner._update_placeholder,

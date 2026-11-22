@@ -203,9 +203,6 @@ def test_rotated_sweeps_hold_no_collective():
     vocab, n = 2 * CANDIDATE_BLOCK, 8
     logits = torch.randn(n, vocab)
     runner = SimpleNamespace(model_config=SimpleNamespace(max_logprobs=5))
-    runner._apply_temperature = lambda lg, t: TPUModelRunner._apply_temperature(
-        runner, lg, t
-    )
     graphs = []
     for all_greedy, topk_candidates, apply_topk_topp in [
         (False, 0, True),
