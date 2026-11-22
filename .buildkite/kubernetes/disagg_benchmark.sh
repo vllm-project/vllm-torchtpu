@@ -19,8 +19,23 @@
 # Run as the `benchmark` role of manifests/workloads/qwen3.5-397b-1p1d.yaml,
 # which passes WORKLOAD_NAME. The engines are reached by JobSet's per-pod DNS,
 # built from that name.
+#
+# Usage: disagg_benchmark.sh [--prefill-chips=N --decode-chips=N]
+# The physical chips of each engine, which the manifest states beside the
+# engines it sizes; each published row divides its throughput by their sum.
 
 set -e
+
+# Checked before the hours of startup; the values are parse_gke_results.py's
+# to validate.
+chip_args=()
+for arg in "$@"; do
+  case "$arg" in
+    --prefill-chips=*|--decode-chips=*) chip_args+=("$arg") ;;
+    *) echo "ERROR: unknown argument: $arg"; exit 1 ;;
+  esac
+done
+
 # The image ships libtpu, which makes vLLM's platform
 # detection pick TPU on this CPU-only pod and fail.
 pip uninstall -y libtpu libtpu-nightly >/dev/null 2>&1 || true
@@ -108,7 +123,7 @@ publish_result() {
   # the step goes red at the end so a silent gap in the
   # table cannot pass.
   python3 /workspace/vllm-torchtpu/.buildkite/scripts/parse_gke_results.py \
-    "$path" "${record_base}-${name%.json}" \
+    "$path" "${record_base}-${name%.json}" "${chip_args[@]}" \
     || { echo "WARNING: BigQuery insert failed for $name"; publish_failed=1; }
 }
 

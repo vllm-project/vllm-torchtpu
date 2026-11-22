@@ -35,7 +35,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-import bq_utils
+import bench_metrics
 
 DEFAULT_ENDPOINT = "https://vllm-perf-data-ingest-224810116257.us-central1.run.app/"
 TOKEN_ENV = "INGEST_BEARER_TOKEN"
@@ -55,12 +55,19 @@ def to_row(
 ) -> dict:
     tp = int(config["tensor_parallelism"])
     dp = int(config.get("data_parallelism") or 1)
-    # Shared per-chip throughput formula from bq_utils.
-    per_chip = bq_utils.derived_metrics(
+    if bench_metrics.physical_chips(chips) is None:
+        raise ValueError("chips must be a positive integer, got None")
+    per_chip = bench_metrics.derived_metrics(
         chips=chips,
         output_tput=float(raw["output_throughput"]),
         total_tput=float(raw["total_token_throughput"]),
     )
+    if "input_tput_per_chip" not in per_chip:
+        raise ValueError(
+            "cannot compute throughput per chip from output_throughput="
+            f"{raw['output_throughput']!r} and total_token_throughput="
+            f"{raw['total_token_throughput']!r}"
+        )
     row = {
         "date": datetime.datetime.strptime(raw["date"], "%Y%m%d-%H%M%S").strftime(
             "%Y-%m-%d %H:%M:%S"
@@ -93,7 +100,8 @@ def to_row(
         name = key.removesuffix("_ms")
         row[name] = value / 1000.0
         if "tpot" in name:
-            row[name.replace("tpot", "intvty")] = bq_utils.interactivity(value) or 0.0
+            intvty = bench_metrics.interactivity(value)
+            row[name.replace("tpot", "intvty")] = intvty or 0.0
     return row
 
 

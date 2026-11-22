@@ -27,7 +27,7 @@ _SCRIPT = (
     / "benchmarking"
     / "publish_perf_dashboard.py"
 )
-# The script is run as a script, so it imports its sibling bq_utils.
+# The script is run as a script, so it imports its sibling bench_metrics.
 # Scope sys.path mutation to module load so later test files are unaffected.
 _BENCHMARKING_STR = str(_SCRIPT.parent)
 _added_path = _BENCHMARKING_STR not in sys.path
@@ -77,3 +77,51 @@ def test_rows_match_the_dashboard_schema(tmp_path):
     assert row["input_tput_per_gpu"] == pytest.approx(770.0 / 4)
     assert row["mean_ttft"] == pytest.approx(1.434)
     assert row["p99_intvty"] == pytest.approx(25.0)
+
+
+@pytest.mark.parametrize("chips", [0, -4, True, None])
+def test_a_row_needs_a_positive_chip_count(chips):
+    with pytest.raises(ValueError, match="chips must be a positive integer"):
+        publish_perf_dashboard.to_row(
+            _RAW,
+            _CONFIG,
+            isl=1024,
+            osl=8192,
+            conc=256,
+            device="tpu7x",
+            chips=chips,
+            image="img:tag",
+        )
+
+
+def test_a_row_needs_a_finite_throughput():
+    raw = {**_RAW, "output_throughput": float("nan")}
+
+    with pytest.raises(ValueError, match="cannot compute throughput per chip"):
+        publish_perf_dashboard.to_row(
+            raw,
+            _CONFIG,
+            isl=1024,
+            osl=8192,
+            conc=256,
+            device="tpu7x",
+            chips=4,
+            image="img:tag",
+        )
+
+
+def test_zero_tpot_publishes_zero_interactivity():
+    raw = {**_RAW, "p99_tpot_ms": 0.0}
+
+    row = publish_perf_dashboard.to_row(
+        raw,
+        _CONFIG,
+        isl=1024,
+        osl=8192,
+        conc=256,
+        device="tpu7x",
+        chips=4,
+        image="img:tag",
+    )
+
+    assert (row["p99_tpot"], row["p99_intvty"]) == (0.0, 0.0)

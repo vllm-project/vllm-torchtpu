@@ -15,10 +15,11 @@
 BigQuery. Exits nonzero if any insert fails; --dry-run prints the SQL
 without executing it.
 
-The launcher may state the fleet's physical chips in PREFILL_CHIPS and
-DECODE_CHIPS (or NUM_CHIPS), which per-chip throughput divides by, and may
-leave a routing_metrics.json beside the result file; see bq_utils."""
+--prefill-chips and --decode-chips state the physical chips of the two
+engine pools. With them the row carries throughput per chip, over their sum,
+and both counts in its config."""
 
+import argparse
 import json
 import os
 import re
@@ -26,15 +27,22 @@ import sys
 import uuid
 from pathlib import Path
 
-# The shared BigQuery helpers live with the benchmarking scripts (which also
-# ship in the CI image); this script runs on the Buildkite agent host.
+# The shared BigQuery and metric helpers live with the benchmarking scripts
+# (which also ship in the CI image); this script runs on the Buildkite agent
+# host.
 sys.path.insert(
     0, str(Path(__file__).resolve().parents[2] / "scripts" / "vllm" / "benchmarking")
 )
+import bench_metrics
 import bq_utils
 
 
-def parse_and_upload(file_path, record_id, dry_run=False) -> bool:
+def parse_and_upload(
+    file_path, record_id, dry_run=False, prefill_chips=None, decode_chips=None
+) -> bool:
+    chips = bench_metrics.physical_chips(
+        prefill_chips=prefill_chips, decode_chips=decode_chips
+    )
     if not os.path.exists(file_path):
         print(f"File not found: {file_path}", file=sys.stderr)
         return False
@@ -55,13 +63,6 @@ def parse_and_upload(file_path, record_id, dry_run=False) -> bool:
             "Using None.",
             file=sys.stderr,
         )
-
-    try:
-        chips = bq_utils.chips_from_env()
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return False
-    routing_metrics = bq_utils.load_routing_metrics(Path(file_path).parent)
 
     success = True
     with open(file_path) as f:
@@ -111,11 +112,16 @@ def parse_and_upload(file_path, record_id, dry_run=False) -> bool:
                 },
             }
 
-            metrics = bq_utils.with_shared_elements(
-                [("vllm_bench", bq_utils.extract_bench_metrics(data))],
-                bq_utils.bench_derived_metrics(data, chips),
-                routing_metrics,
-            )
+            if chips is not None:
+                # Both pools, since their sum alone cannot tell a 4 + 4 fleet
+                # from a 6 + 2 one.
+                config_dict["prefill_chips"] = prefill_chips
+                config_dict["decode_chips"] = decode_chips
+
+            metrics = [("vllm_bench", bq_utils.extract_bench_metrics(data))]
+            derived = bench_metrics.bench_derived_metrics(data, chips)
+            if derived:
+                metrics.append(("derived", derived))
 
             sql = bq_utils.build_insert_sql(
                 record_id=unique_record_id,
@@ -133,14 +139,44 @@ def parse_and_upload(file_path, record_id, dry_run=False) -> bool:
     return success
 
 
-if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if a != "--dry-run"]
-    if len(args) < 2:
-        print(
-            "Usage: python parse_gke_results.py <file_path> <record_id> [--dry-run]",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    sys.exit(
-        0 if parse_and_upload(args[0], args[1], dry_run="--dry-run" in sys.argv) else 1
+def _chip_count(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError:
+        count = 0
+    if count <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    return count
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("file_path", help="Result file of one benchmark cell")
+    parser.add_argument("record_id", help="Prefix of each row's record_id")
+    parser.add_argument(
+        "--prefill-chips", type=_chip_count, help="Chips serving the prefill pool"
     )
+    parser.add_argument(
+        "--decode-chips", type=_chip_count, help="Chips serving the decode pool"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print the SQL without executing it"
+    )
+    args = parser.parse_args(argv)
+    if (args.prefill_chips is None) != (args.decode_chips is None):
+        parser.error(
+            "--prefill-chips and --decode-chips go together: a disaggregated "
+            "run is served by both pools"
+        )
+    ok = parse_and_upload(
+        args.file_path,
+        args.record_id,
+        dry_run=args.dry_run,
+        prefill_chips=args.prefill_chips,
+        decode_chips=args.decode_chips,
+    )
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

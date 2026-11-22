@@ -8,7 +8,7 @@
   "isl_osl_configs": "1024:8192",
   "dataset_name": "random",
   "concurrency_options": "256",
-  "num_prompts": 2560,
+  "num_prompts": 16,
   "max_model_len": 16384,
   "max_num_batched_tokens": 16384,
   "max_num_seqs": 16,
