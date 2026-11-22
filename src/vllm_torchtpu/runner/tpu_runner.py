@@ -7261,11 +7261,14 @@ class TPUModelRunner(GPUModelRunner):
                     logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
 
     def _precompile_substitute_and_extract_drafts(self) -> None:
-        """`_substitute_and_extract_drafts` at every token bucket a decode-only
-        verify reaches (as many logits rows as tokens), in order and indexed,
-        on a substitution source like the one the real spec-decode warmup met
-        (`_substitute_source_seen`: the drafter's dtype, the bounded length);
-        other steps run its two parts (`_substitute_async_tokens_and_drafts`)."""
+        """`_substitute_and_extract_drafts` at every (token bucket, logits
+        rows) pair a verify reaches: decode-only steps (as many logits rows as
+        tokens) in order and indexed, steps with a prefill chunk beside the
+        verify (more tokens than logits rows) indexed, on a substitution
+        source like the one the real spec-decode warmup met
+        (`_substitute_source_seen`: the drafter's dtype, the bounded length).
+        A pair left out runs its two parts (`_substitute_async_tokens_and_drafts`),
+        which compile online on the serving path."""
         source = self._substitute_source_seen
         if source is None:
             logger.warning(
@@ -7287,26 +7290,32 @@ class TPUModelRunner(GPUModelRunner):
         def zeros(n: int) -> torch.Tensor:
             return torch.zeros(n, dtype=torch.int32).to(self.device)
 
+        logits_lens = [n for n in self.num_tokens_paddings if n <= max_len]
         with self._precompile_timed("substitute_and_extract_drafts"):
             for num_tokens in self.num_tokens_paddings:
-                if num_tokens > max_len:
-                    break
-                # As `_async_substitution_inputs` builds them: no slot tensors
-                # for the in-order slice, int32 slots padded to the bucket.
-                slots = [(zeros(num_tokens), zeros(num_tokens))]
-                if next_tokens.numel() >= num_tokens:
-                    slots.append((None, None))
-                for cur, pre in slots:
-                    args = self._substitute_drafts_args(
-                        zeros(num_tokens),
-                        cur,
-                        pre,
-                        next_tokens,
-                        zeros(num_tokens),
-                        zeros(num_tokens),
-                    )
-                    synchronize_tensors(_substitute_and_extract_drafts(*args))
-                    self._substitute_drafts_warm.add(program_key(args))
+                for num_logits in logits_lens:
+                    if num_logits > num_tokens:
+                        break
+                    # As `_async_substitution_inputs` builds them: int32 slots
+                    # padded to the bucket; no slot tensors for the in-order
+                    # slice, which only a decode-only step takes.
+                    slots = [(zeros(num_tokens), zeros(num_tokens))]
+                    if num_logits == num_tokens and next_tokens.numel() >= num_tokens:
+                        slots.append((None, None))
+                    for cur, pre in slots:
+                        args = self._substitute_drafts_args(
+                            zeros(num_tokens),
+                            cur,
+                            pre,
+                            next_tokens,
+                            zeros(num_logits),
+                            zeros(num_logits),
+                        )
+                        key = program_key(args)
+                        if key in self._substitute_drafts_warm:
+                            continue
+                        synchronize_tensors(_substitute_and_extract_drafts(*args))
+                        self._substitute_drafts_warm.add(key)
         self._substitute_source_seen = None
 
     def _precompile_rejection_sampler(self) -> None:
