@@ -74,7 +74,9 @@ def test_memo_key_covers_metadata_scalars_and_identity():
     assert k1 != fd._memo_key((torch.zeros(4, 9), 3, None, "s", obj, [b, 2]))
     assert k1 != fd._memo_key((torch.zeros(8, 4).t(), 3, None, "s", obj, [b, 2]))
     assert k1 != fd._memo_key((a.to(torch.bfloat16), 3, None, "s", obj, [b, 2]))
-    assert k1 != fd._memo_key((a.requires_grad_(False), 4, None, "s", obj, [b, 2]))
+    assert k1 != fd._memo_key(
+        (torch.zeros(4, 8, requires_grad=True), 3, None, "s", obj, [b, 2])
+    )
     assert k1 != fd._memo_key((a, 3, None, "s", object(), [b, 2]))
     assert k1 != fd._memo_key((a, 3, None, "s", obj, [b, 3]))
     assert k1 != fd._memo_key((a, True, None, "s", obj, [b, 2]))  # bool vs int
@@ -543,9 +545,7 @@ def test_switch_interval_applied_from_the_first_step(monkeypatch):
 
 
 def test_gc_freeze_after_n_steps(monkeypatch):
-    import gc as gc_mod
-
-    orig = gc_mod.get_threshold()
+    orig = gc.get_threshold()
     monkeypatch.setattr(host_trims, "SWITCH_US", 0)
     monkeypatch.setattr(host_trims, "GC_FREEZE", True)
     monkeypatch.setattr(host_trims, "GC_FREEZE_AFTER_STEPS", 3)
@@ -556,13 +556,13 @@ def test_gc_freeze_after_n_steps(monkeypatch):
     try:
         host_trims.on_step()
         host_trims.on_step()
-        assert gc_mod.get_threshold()[0] == orig[0] and not host_trims._hook["frozen"]
+        assert gc.get_threshold()[0] == orig[0] and not host_trims._hook["frozen"]
         host_trims.on_step()
-        assert host_trims._hook["frozen"] and gc_mod.get_threshold()[0] == 12345
-        assert gc_mod.get_freeze_count() > 0
+        assert host_trims._hook["frozen"] and gc.get_threshold()[0] == 12345
+        assert gc.get_freeze_count() > 0
     finally:
-        gc_mod.unfreeze()
-        gc_mod.set_threshold(*orig)
+        gc.unfreeze()
+        gc.set_threshold(*orig)
 
 
 def test_dp_size_cache(monkeypatch):
