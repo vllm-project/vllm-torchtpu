@@ -167,6 +167,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_INDEXER_BQ: int = 128
     VLLM_TPU_QSA_PREFILL_INDEXER_BKV: int = 256
     VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND: bool = False
+    VLLM_TPU_QSA_PREFILL_QPROJ_FILL: bool = False
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
     VLLM_TPU_QSA_RING_SELECT: bool = False
@@ -859,6 +860,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Sharded / DCP indexers keep their own path. Default off.
     "VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND": env_bool(
         "VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND", default=False
+    ),
+    # q38 PSTEP-IDXFILL: with the no-cond prefill indexer (the key above), the
+    # walk q_proj of a ragged prefill step with >= 3 indexer chunks runs as
+    # chunks - 2 row slices, slice g tagged with the layer's indexer scheduling
+    # group base + g, so it runs inside SparseCore top-k window g (the
+    # TensorCore waits there) instead of after it. Same dot per row. Default off.
+    "VLLM_TPU_QSA_PREFILL_QPROJ_FILL": env_bool(
+        "VLLM_TPU_QSA_PREFILL_QPROJ_FILL", default=False
     ),
     # Compressed keys per KV block of the shared-stream pass above (a multiple
     # of 128). Only read when VLLM_TPU_QSA_DECODE_QUERY_BLOCK > 0.

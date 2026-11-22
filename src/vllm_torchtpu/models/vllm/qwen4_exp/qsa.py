@@ -615,13 +615,25 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 build_pooled_qsa_nocond_op,
             )
 
+            self._indexer_group_base = streamindex_config.layer_scheduling_group_base(
+                self.prefix
+            )
             self._op = partial(
                 build_pooled_qsa_nocond_op(),
-                indexer_group_base=streamindex_config.layer_scheduling_group_base(
-                    self.prefix
-                ),
+                indexer_group_base=self._indexer_group_base,
                 **keywords,
             )
+            if vllm_torchtpu_envs.VLLM_TPU_QSA_PREFILL_QPROJ_FILL:
+                # q38 PSTEP-IDXFILL: the walk q_proj as row slices inside this
+                # layer's indexer windows (built here, not in the traced forward).
+                from vllm_torchtpu.layers.adapter.custom_ops import qsa_qproj_fill_op
+
+                self._qproj_fill = partial(
+                    qsa_qproj_fill_op.qproj_fill,
+                    group_base=self._indexer_group_base,
+                    chunk_override=vllm_torchtpu_envs.VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK,
+                    precision=qsa_qproj_fill_op.matmul_precision(),
+                )
         else:
             self._op = partial(build_pooled_qsa_op(), **keywords)
         from . import compare_core_stats
@@ -1170,11 +1182,31 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         group_qgate = group_qgate and not qgate_check
         if project_shares and not dcp_merge:
             raise NotImplementedError("VLLM_TPU_QSA_DCP_MERGE=proj on a path without the DCP merge")
+        # q38 PSTEP-IDXFILL (VLLM_TPU_QSA_PREFILL_QPROJ_FILL): on the plain no-cond
+        # op's ragged prefill steps with >= 3 indexer chunks, q_proj as tagged row
+        # slices (None otherwise: q_proj as before).
+        qgate = None
+        qproj_fill = getattr(self, "_qproj_fill", None)
+        if (
+            qproj_fill is not None
+            and op is self._op
+            and not group_qgate
+            and not use_shared
+            and not self.single_graph
+        ):
+            qgate = qproj_fill(
+                hidden,
+                self.q_proj.weight,
+                int(metadata.context_lens.shape[0]),
+                self.max_query_len,
+            )
         output, selected = op(
             (
                 torch.nn.functional.linear(hidden, self.q_proj_group_weight)
                 if group_qgate
                 else self.q_proj(hidden)
+                if qgate is None
+                else qgate
             ),
             self.k_proj(hidden),
             self.v_proj(hidden),
