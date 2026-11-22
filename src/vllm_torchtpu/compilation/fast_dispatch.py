@@ -42,7 +42,11 @@ decorated at import, before the options are known, is covered:
   recycled id never matches. The memo is dropped whenever the code object's
   cache entries change (recompile or eviction). A guard on something the
   signature does not cover (a global, or an attribute of an argument object)
-  is not re-checked on a memo hit.
+  is not re-checked on a memo hit, so a function whose compiled program
+  depends on such state, and the state can change between calls with the same
+  arguments, opts out with ``tpu_compile(guard_memo=False)``: every call of it
+  runs the guard check. The DFlash and DSpark draft forwards do: their draft
+  model reads its attention metadata from vLLM's forward context.
 
 TODO: Remove this module once PyTorch has a public guarded call path for
 ``fullgraph`` compiled functions (an upstream issue is to be filed). Until
@@ -61,7 +65,7 @@ import inspect
 import types
 import weakref
 from collections.abc import Callable
-from typing import Any
+from typing import Any, overload
 
 import torch
 from torch._C._dynamo import eval_frame as _c_eval_frame
@@ -179,7 +183,7 @@ def _entry_count(code: types.CodeType) -> int:
     return _c_eval_frame._get_total_cache_entry_count(code)
 
 
-def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
+def _wrap(compiled: Any, fn: types.FunctionType, guard_memo: bool = True) -> Any:
     code = fn.__code__
     region = compiled._isolate_recompiles_id
     flags = code.co_flags
@@ -199,6 +203,7 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
         "logged": False,
         "memo": {},  # signature -> (direct fn, refs to its id-keyed objects)
         "memo_count": -1,
+        "guard_memo": guard_memo,  # False: this function never uses the memo
     }
 
     def _f_locals(args: tuple, kwargs: dict) -> dict | None:
@@ -340,7 +345,13 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
                 and _c_eval_frame.get_eval_frame_callback() is None
                 and stance_mod._stance.stance == "default"
             ):
-                if _MEMO["on"] and not kwargs and len(args) == nargs:
+                use_memo = (
+                    _MEMO["on"]
+                    and state["guard_memo"]
+                    and not kwargs
+                    and len(args) == nargs
+                )
+                if use_memo:
                     count = _entry_count(code)
                     if count == state["count"]:
                         hit = _memo_dispatch(args, count)
@@ -351,7 +362,7 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
                 if f_locals is not None and _entry_count(code) == state["count"]:
                     for idx, (gm, direct) in enumerate(entries):
                         if gm.check(f_locals):
-                            if _MEMO["on"] and not kwargs and len(args) == nargs:
+                            if use_memo:
                                 _memo_store(args, direct, state["count"])
                             if idx > 0:
                                 entries.insert(0, entries.pop(idx))
@@ -386,10 +397,20 @@ def _drop_global_state(entries: Any) -> list[bool]:
     return [keep_all or e.guard_type != "GLOBAL_STATE" for e in entries]
 
 
-def tpu_compile[F: Callable[..., Any]](fn: F) -> F:
+@overload
+def tpu_compile[F: Callable[..., Any]](fn: F, /) -> F: ...
+
+
+@overload
+def tpu_compile[F: Callable[..., Any]](*, guard_memo: bool) -> Callable[[F], F]: ...
+
+
+def tpu_compile(fn: Any = None, /, *, guard_memo: bool = True) -> Any:
     """Compile ``fn`` for TPU: ``torch.compile(fn, backend="tpu",
     fullgraph=True, dynamic=False)`` with this module's guard filter, wrapped
-    for fast dispatch. Use it as a decorator, or call it on a function.
+    for fast dispatch. Use it as a decorator, or call it on a function;
+    ``@tpu_compile(guard_memo=False)`` keeps the function out of the guard
+    memo (module docstring).
 
     Disarmed (the default) the wrapper calls the compiled function and the
     filter keeps every guard, so the compiled programs and their guards are
@@ -407,6 +428,8 @@ def tpu_compile[F: Callable[..., Any]](fn: F) -> F:
     TPU, so neither grad mode nor the CPU intra-op thread count changes what
     they compute.
     """
+    if fn is None:
+        return functools.partial(tpu_compile, guard_memo=guard_memo)
     if not isinstance(fn, types.FunctionType):
         raise TypeError(
             f"tpu_compile takes a plain function, got {type(fn).__name__}; "
@@ -426,4 +449,4 @@ def tpu_compile[F: Callable[..., Any]](fn: F) -> F:
         # Dynamo is disabled (TORCHDYNAMO_DISABLE=1): torch.compile hands back
         # the function itself, which has no cache entries to dispatch.
         return fn
-    return _wrap(compiled, fn)
+    return _wrap(compiled, fn, guard_memo)
