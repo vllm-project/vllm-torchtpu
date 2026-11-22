@@ -7481,9 +7481,10 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_subtract_num_rejected(self) -> None:
         """`subtract_num_rejected_tokens_compiled` at every token bucket and
-        substitution row count a step can bring, on arguments like the ones
-        the real spec-decode warmup met (`_subtract_args_seen`); steps with a
-        prefill chunk otherwise compile it on the serving path."""
+        padded request count of a single verify chunk, on arguments like the
+        ones the real spec-decode warmup met (`_subtract_args_seen`); steps
+        with a prefill chunk otherwise compile it on the serving path. Steps
+        of several verify chunks (sums of padded counts) are not covered."""
         from vllm_torchtpu.runner.tpu_runner_async_output import (
             subtract_num_rejected_tokens_compiled,
         )
@@ -7509,6 +7510,11 @@ class TPUModelRunner(GPUModelRunner):
                         slots,
                     )
                     synchronize_tensors(out)
+        logger.info(
+            "Warmed subtract_num_rejected_tokens at %d token buckets x %d row counts",
+            len(self.num_tokens_paddings),
+            len(row_counts),
+        )
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
