@@ -355,7 +355,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
         out = super().outputs(g, ex)
         if self.export_ids:
-            out.append(StateDecl(SEL_IDS, (ex.M, 1, self.budget), I32, "w", per_layer=False))
+            out.append(StateDecl(SEL_IDS, (ex.M, 1, self.budget), I32, "w", per_layer=False,
+                                 memory_space="hbm"))  # never VMEM: 128 KiB per 64 rows
         if self.debug:
             out += [
                 StateDecl(DBG_IQ, (ex.M, 4 * ix.IDX_DIM), F32, "w"),

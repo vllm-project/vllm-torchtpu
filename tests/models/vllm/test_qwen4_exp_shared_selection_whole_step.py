@@ -173,3 +173,20 @@ def test_loop_after_mk_step0_reads_this_steps_selection(bound, monkeypatch):
     torch.testing.assert_close(
         attention._selection_rows[:REQS], _selection(4)[_last_rows()], rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_stock_layer_47_with_mk_step0(bound, monkeypatch, flag):
+    """Layer 47 outside the kernel (VLLM_TPU_MK_WHOLE_L47 / _L45 off): its stock `attend`
+    writes the sink, but MK draft step 0 carries the rows only with
+    VLLM_TPU_MK_WHOLE_EXPORT_SELECTION (the carry does not need the kernel's export)."""
+    monkeypatch.setattr(
+        mtp_module.vllm_torchtpu_envs, "VLLM_TPU_MK_WHOLE_EXPORT_SELECTION", flag
+    )
+    sink_layer, draft = bound
+    attention = draft.model.layers[0].self_attn
+    _stock_step(sink_layer, attention, 1)
+    Qwen4ExpQSA.write_selection_sink(sink_layer, _selection(2))  # stock layer 47
+    _mk_whole_step(sink_layer, draft, 2, export=False)  # MK draft step 0
+    want = _selection(2 if flag else 1)[_last_rows()]
+    torch.testing.assert_close(attention._selection_rows[:REQS], want, rtol=0, atol=0)
