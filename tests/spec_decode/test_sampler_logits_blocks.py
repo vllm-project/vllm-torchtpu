@@ -214,3 +214,48 @@ def test_ro_lb_impl_matches_ro_impl():
         out_a = _verify_one_draw_ro_impl(ro_a, [slots], n, *args)
         out_b = _verify_one_draw_ro_lb_impl(ro_b, [slots], n, mode, *args)
         assert torch.equal(out_a, out_b) and torch.equal(ro_a, ro_b)
+
+
+@pytest.mark.parametrize("fold_ro", [True, False])
+def test_warmup_compiles_the_served_variant(monkeypatch, fold_ro):
+    """Warmup must call the one-draw verify with the same trailing static
+    args the step passes (num_reqs or None, then the mode); otherwise the
+    flag-on variant compiles mid-serve."""
+    import types
+
+    import vllm_torchtpu.runner.tpu_runner as runner
+    from vllm_torchtpu import envs
+
+    calls = []
+    monkeypatch.setattr(
+        runner, "_verify_fused_one_draw_compiled", lambda *a: calls.append(a[16:]) or a[0]
+    )
+    monkeypatch.setattr(runner, "synchronize_tensors", lambda *a, **k: None)
+    monkeypatch.setattr(envs, "VLLM_TPU_SAMPLER_LOGITS_BLOCKS", 2, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_SAMPLER_TOPP_NARROW", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_VERIFY_ONE_DRAW", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_VERIFY_FUSED_READ_OFFSETS", fold_ro, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_VERIFY_RO_INGRAPH", False, raising=False)
+    fake = types.SimpleNamespace(
+        rejection_sampler=types.SimpleNamespace(
+            synthetic_conditional_rates=None, synthetic_mode=False
+        ),
+        speculative_config=types.SimpleNamespace(num_speculative_tokens=3),
+        vocab_size=CANDIDATE_BLOCK * 4,
+        device="cpu",
+        mamba_slot_read_offsets=torch.zeros(4, dtype=torch.int32),
+        _topk_candidate_blocks=lambda: 2,
+        _num_reqs_tensor=lambda n: torch.tensor(n),
+        _sampler_candidates_only=staticmethod(lambda c: c > 0),
+        _sampler_logits_blocks=runner.TPUModelRunner._sampler_logits_blocks,
+        _verify_one_draw_stream_checked=True,
+    )
+    i32 = lambda n: torch.zeros(n, dtype=torch.int32)  # noqa: E731
+    runner.TPUModelRunner._precompile_verify_fused(
+        fake,
+        torch.zeros(4, CANDIDATE_BLOCK * 4, dtype=torch.bfloat16),
+        i32(2), i32(4), i32(4), i32(2), torch.zeros(4, dtype=torch.int64), i32(4),
+        None, None,
+    )
+    assert calls and all(c[-1] == 3 for c in calls), calls
+    assert all((c[0] is None) != fold_ro for c in calls)
