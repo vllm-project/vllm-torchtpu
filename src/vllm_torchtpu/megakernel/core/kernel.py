@@ -386,10 +386,11 @@ def build(
         for a_i in range(n_raw):
             aliases[2 + n_w_leaves + raw_s_offset + a_i] = raw_o_offset + a_i
     elif tiles.inplace:
-        assert ex.R == 1, (
-            "tiles.inplace cannot alias rw states inside a communicating "
-            "R > 1 pallas_call"
-        )
+        if ex.R > 1:
+            raise MegakernelConfigError(
+                "tiles.inplace cannot alias rw states inside a communicating "
+                f"R > 1 pallas_call (got R={ex.R})"
+            )
         s_leaf_offset = 0
         for k in st_names:
             st = p.state_decls[k]
