@@ -1041,14 +1041,19 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None):
     before any of this; the clip is written so that it would hold on its own.
     """
     T, K = routing.pair_grid
-    # The token number of each routed pair is a counted repeat, not a
-    # division: pair i belongs to token i // K, which is the token index
-    # broadcast K times. K is the selection width and need not be a power
-    # of two, so this is the spelling that removes the division rather
-    # than the one that shifts it.
-    token_of_pair = jnp.broadcast_to(
-        jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)
-    ).reshape(-1)
+    # The token number of each routed pair: pair i belongs to token i // K.
+    # A power-of-two K is a shift of the flat pair index. Avoid the
+    # [T, K]-broadcast spelling there: the K-wide minor axis pads to full
+    # lane tiles and XLA relayouts it to flat (~8 us per MoE layer on TPU).
+    # Any other K keeps the counted repeat, which removes the division.
+    if K & (K - 1) == 0:
+        token_of_pair = jnp.right_shift(
+            jnp.arange(T * K, dtype=jnp.int32), jnp.int32(K.bit_length() - 1)
+        )
+    else:
+        token_of_pair = jnp.broadcast_to(
+            jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)
+        ).reshape(-1)
     row = (
         local_slab_rows(routing, me, shard_stride=shard_stride)
         if rows is None
@@ -1138,15 +1143,12 @@ def shard_transport_tables_in_blocks(routing, me, *, e_total, ep):
     recv_base = routing.recv_base  # [d, s, g]
 
     not_me = jnp.arange(ep) != me
-    # contrib includes the own-dest region, which hops to recvbuf later.
-    out_total = my_region_rows.sum(axis=0)  # [d] incl. me
-    contrib_base = jnp.cumsum(out_total) - out_total  # [d]
-    grp_off = jnp.cumsum(my_region_rows, axis=0) - my_region_rows  # [g, d]
-
-    # One expert per push, so an expert's contrib offset is its region's.
-    contrib_off = contrib_base[None, :] + grp_off  # [G, d]
-
-    push_src = contrib_base[None, :] + grp_off  # [g, d]
+    # Avoid destination-major contrib packing: interleaving experts forces
+    # commit_tile to emit ep predicated DMAs per tile instead of <= 3 spans.
+    my_expert_rows = my_region_rows.sum(axis=1)
+    my_expert_base = jnp.cumsum(my_expert_rows) - my_expert_rows
+    contrib_off = my_expert_base[:, None] + run_start
+    push_src = contrib_off
     push_len = my_region_rows
     # recv_base[d (receiver), me (src), g] for every d: [d, g] -> [g, d].
     my_recv_base = lax.dynamic_slice(recv_base, (0, me, 0), (ep, 1, g_local))[:, 0]
@@ -1589,6 +1591,40 @@ def vmem_estimate_bytes(
     return sum(array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)
 
 
+TP_DOWN_CHUNK = 2048
+
+
+def resolve_tp_down_chunk(
+    hidden: int,
+    *,
+    ep_tp_size: int = 2,
+    weight_format: WeightFormat = WeightFormat.FP8,
+    has_w1_bias: bool = False,
+    has_w2_bias: bool = False,
+    wire_dtype=None,
+) -> int | None:
+    form = weight_form(weight_format, wire_dtype)
+    if (
+        ep_tp_size != 2
+        or weight_format != WeightFormat.FP8
+        or form.wire_dtype is not FP8
+        or has_w1_bias
+        or has_w2_bias
+    ):
+        return None
+    for chunk in (TP_DOWN_CHUNK, 1024):
+        if hidden > chunk and hidden % chunk == 0:
+            return chunk
+    half = hidden // 2
+    if (
+        hidden >= 2 * HIDDEN_LANE_BLOCK
+        and hidden % 2 == 0
+        and half % HIDDEN_LANE_BLOCK == 0
+    ):
+        return half
+    return None
+
+
 def tp_pair_vmem_bytes(
     g_local,
     capacity,
@@ -1597,6 +1633,7 @@ def tp_pair_vmem_bytes(
     *,
     tp_w1_slots=2,
     tp_w1p_slots=2,
+    tp_w2p_slots=1,
     tp_scl_slots=2,
     ep_tp_size=2,
     weight_format=WeightFormat.FP8,
@@ -1605,13 +1642,12 @@ def tp_pair_vmem_bytes(
     has_w2_bias=False,
     info=None,
     wire_dtype=None,
+    down_chunk: int | None = None,
 ):
     """VMEM bytes occupied by the TP-pair schedule (`ep_tp_size == 2`).
 
-    Replaces `w1_vm` with `(tp_w1_slots, hidden, 2 * inter_slice)`, `w1s_vm`
-    with `(tp_scl_slots, 2 * inter)`, `w2s_vm` with `(tp_scl_slots, ...)` plus
-    the pair's `tp_w2s_vm` and `tp_w1p_vm` scratch buffers, aligned to the
-    chip's lane and sublane tiling.
+    Models persistent scratch plus peak sequential tile-body liveness across
+    gate/up requantization, chunked or full down-projection, and wire cast.
     """
     if info is None:
         info = pltpu.get_tpu_info()
@@ -1633,22 +1669,54 @@ def tp_pair_vmem_bytes(
     for name, shape, dtype in scratch:
         if name == "w1_vm":
             shape = (tp_w1_slots, hidden, 2 * inter_slice)
+        elif name == "w2_vm":
+            shape = (1, inter_slice, hidden)
         elif name == "w1s_vm":
             shape = (tp_scl_slots, *shape[1:])
         arrays.append((name, shape, dtype))
     arrays += [
         ("tp_w2s_vm", (tp_scl_slots, ep_tp_size * hidden), jnp.float32),
         ("tp_w1p_vm", (tp_w1p_slots, hidden, 2 * inter_slice), form.weight_dtype),
+        ("tp_w2p_vm", (tp_w2p_slots, inter_slice, hidden), form.weight_dtype),
     ]
-    arrays += vmem_tile_body_arrays(
-        capacity,
-        hidden,
-        inter,
-        weight_format=weight_format,
-        rhs_qb=rhs_qb,
-        wire_dtype=wire_dtype,
+    scratch_bytes = sum(
+        array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays
     )
-    return sum(array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)
+
+    tile_m = capacity
+    mid_dtype = FP8 if form.quantized_activations else jnp.bfloat16
+    mid_bytes = array_vmem_bytes((tile_m, inter), mid_dtype, info)
+    phase1_bytes = (
+        array_vmem_bytes((tile_m, 2 * inter), jnp.float32, info)
+        + array_vmem_bytes((tile_m, inter), jnp.bfloat16, info)
+        + mid_bytes
+    )
+    dc = hidden if (down_chunk is None or down_chunk >= hidden) else down_chunk
+    down_bf16_bytes = array_vmem_bytes((tile_m, hidden), jnp.bfloat16, info)
+    phase2_dot_bytes = (
+        mid_bytes
+        + ep_tp_size * array_vmem_bytes((tile_m, dc), jnp.float32, info)
+        + down_bf16_bytes
+    )
+    wire_bytes = (
+        array_vmem_bytes((tile_m, hidden), FP8, info) if form.wire_dtype is FP8 else 0
+    )
+    phase2_quant_bytes = down_bf16_bytes + wire_bytes
+
+    widen_bytes = 0
+    if weight_format == WeightFormat.FP4:
+        widen_bytes = array_vmem_bytes(
+            (WIDENED_BLOCK_BUFFERS, rhs_qb, max(2 * inter, hidden)), FP8, info
+        )
+    elif weight_format == WeightFormat.INT8:
+        widen_bytes = array_vmem_bytes(
+            (WIDENED_BLOCK_BUFFERS, WIDEN_KCHUNK, max(2 * inter, hidden)), BF16, info
+        )
+    return (
+        scratch_bytes
+        + widen_bytes
+        + max(phase1_bytes, phase2_dot_bytes, phase2_quant_bytes)
+    )
 
 
 class WeightSlots(NamedTuple):
