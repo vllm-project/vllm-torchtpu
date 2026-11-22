@@ -116,3 +116,38 @@ def test_draft_label_logged_separately(caplog, monkeypatch):
     ]
     # The draft keeps the 2-slot key ring and no manager pages.
     assert "key_slots=2" in lines[1] and "keymp=0" in lines[1]
+
+
+def test_draft_key_slots_option(monkeypatch):
+    """draftkeyslots=N|auto: the draft kernel's key ring (default 2); auto takes the
+    target's per-bucket rule, doubled under wholekeylanes=128; operand packing (no
+    bucket) keeps 2."""
+    from vllm_torchtpu.megakernel_runtime import qwen38_draft as qd
+
+    def slots(B):
+        spec = qd.draft_spec(G, 2, budget=64, max_groups=2048, vocab_shard=1024, B=B)
+        return wc._find_qsa_block(spec).key_slots
+
+    assert qd.KEY_SLOTS == 2 and slots(16) == 2
+    monkeypatch.setattr(qd, "KEY_SLOTS", 4)
+    assert slots(16) == 4 and slots(None) == 4
+    monkeypatch.setattr(qd, "KEY_SLOTS", wc.KEY_SLOTS_AUTO)
+    assert (slots(16), slots(64), slots(None)) == (4, 3, 2)
+    monkeypatch.setattr(wc, "KEY_LANES", 128)
+    assert (slots(16), slots(48), slots(64)) == (8, 8, 6)
+    # The target's own slots do not move the draft's.
+    monkeypatch.setattr(wc, "KEY_SLOTS", 3)
+    assert slots(16) == 8
+
+
+def test_driver_parses_draft_key_slots(monkeypatch):
+    from vllm_torchtpu.megakernel_runtime import qwen38_draft as qd
+    from vllm_torchtpu.megakernel_runtime.qwen38_driver import _apply_draft_key_slots
+
+    monkeypatch.setattr(qd, "KEY_SLOTS", 2)
+    _apply_draft_key_slots("whole=1,wholekeyslots=auto")
+    assert qd.KEY_SLOTS == 2
+    _apply_draft_key_slots("whole=1,draftkeyslots=4")
+    assert qd.KEY_SLOTS == 4
+    _apply_draft_key_slots("whole=1,wholekeyslots=auto,draftkeyslots=auto")
+    assert qd.KEY_SLOTS == wc.KEY_SLOTS_AUTO
