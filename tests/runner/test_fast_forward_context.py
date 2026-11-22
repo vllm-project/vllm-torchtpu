@@ -29,8 +29,10 @@ from vllm_torchtpu.runner import fast_forward_context as ffc
 
 @pytest.fixture(autouse=True)
 def _enabled(monkeypatch):
-    # Off by default; these tests cover the enabled path.
+    # Off by default; these tests cover the enabled path, each with an empty
+    # cache of its own.
     monkeypatch.setattr(ffc, "_ENABLED", True)
+    monkeypatch.setattr(ffc, "_CACHE", {})
 
 
 @pytest.fixture(autouse=True)
@@ -73,7 +75,6 @@ def _fields(ctx):
 
 
 def test_cached_context_matches_stock_and_swaps_metadata():
-    ffc._CACHE.clear()
     cfg = _cfg()
     md1, md2 = {"a": 1}, {"a": 2}
     t = torch.tensor([4], dtype=torch.int32)
@@ -105,7 +106,6 @@ def test_cached_context_matches_stock_and_swaps_metadata():
 
 
 def test_restores_previous_context_and_keys_by_num_tokens():
-    ffc._CACHE.clear()
     cfg = _cfg()
     before = fc._forward_context
     with ffc.fast_set_forward_context(
@@ -121,7 +121,6 @@ def test_restores_previous_context_and_keys_by_num_tokens():
 
 
 def test_extra_kwargs_take_stock_path():
-    ffc._CACHE.clear()
     cfg = _cfg()
     with ffc.fast_set_forward_context(
         {},
@@ -138,7 +137,6 @@ def test_a_dp_count_that_is_not_a_tensor_takes_the_stock_path(monkeypatch):
     # Serving passes a CPU tensor or None. Anything else, such as a NumPy
     # array (which has .tolist and a .device string but no .numel), gets no
     # key and takes the stock path instead of raising.
-    ffc._CACHE.clear()
     cfg = _cfg()
     stock = []
     monkeypatch.setattr(
@@ -158,7 +156,6 @@ def test_a_dp_count_that_is_not_a_tensor_takes_the_stock_path(monkeypatch):
 def test_batch_size_tracking_takes_the_stock_path(monkeypatch):
     # VLLM_LOG_BATCHSIZE_INTERVAL >= 0 sets vLLM's module-level
     # track_batchsize; the stock path then times each forward.
-    ffc._CACHE.clear()
     monkeypatch.setattr(fc, "track_batchsize", True)
     with ffc.fast_set_forward_context(
         None,
@@ -174,7 +171,6 @@ def test_num_tokens_is_part_of_the_key():
     # Same (absent) DP tensor, different num_tokens: the stock path derives
     # the DP token count from num_tokens, so a cached context for 4 tokens
     # must not be reused for 8.
-    ffc._CACHE.clear()
     cfg = _cfg()
     with ffc.fast_set_forward_context({}, cfg, num_tokens=4, num_tokens_across_dp=None):
         pass
@@ -196,7 +192,6 @@ def test_each_cached_context_starts_its_own_moe_layer_counter():
     `all_moe_layers[moe_layer_index]` and advancing the index on the current
     context (`moe_runner.get_layer_from_name`). Every fast call must start at
     0 and share only the read-only layer list with the cached context."""
-    ffc._CACHE.clear()
     cfg = _cfg()
     cfg.compilation_config.fast_moe_cold_start = True
     cfg.compilation_config.static_all_moe_layers = ["moe.0", "moe.1"]
