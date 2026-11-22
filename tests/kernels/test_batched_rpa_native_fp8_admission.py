@@ -21,6 +21,9 @@ doubles the decode matmul's LHS rows and score tile, which the decode VMEM
 model counts. Each operand an admitted mode turns on enters its decode matmul
 in the KV dtype, e4m3 or e5m2, and each operand a prefill mode turns on enters
 its MIXED kernel matmul in the KV dtype.
+
+The STATIC operands and the prefill modes are tested on e4m3 only, so they
+refuse an e5m2 KV cache; e5m2 runs only the DECODE kernel's ROW operands.
 """
 
 from types import SimpleNamespace
@@ -70,6 +73,33 @@ def test_split_refuses_an_e5m2_kv_cache(native_fp8):
 def test_row_operands_run_on_an_e5m2_kv_cache():
     modes = configs.NativeFp8(qk=_ROW, pv=_ROW)
     assert _serve(jnp.float8_e5m2, modes).native_fp8 == modes
+
+
+@pytest.mark.parametrize(
+    ("name", "modes"),
+    [
+        ("native_fp8", configs.NativeFp8(pv=_STATIC)),
+        ("native_fp8", configs.NativeFp8(qk=_STATIC)),
+        ("native_fp8", configs.NativeFp8(qk=_STATIC, pv=_ROW)),
+        ("native_fp8", configs.NativeFp8(qk=_STATIC, pv=_STATIC)),
+        ("native_fp8_prefill", configs.NativeFp8(pv=_ROW)),
+        ("native_fp8_prefill", configs.NativeFp8(qk=_ROW)),
+        ("native_fp8_prefill", configs.NativeFp8(qk=_ROW, pv=_ROW)),
+        ("native_fp8_prefill", configs.NativeFp8(pv=_STATIC)),
+        ("native_fp8_prefill", configs.NativeFp8(qk=_STATIC)),
+        ("native_fp8_prefill", configs.NativeFp8(qk=_STATIC, pv=_STATIC)),
+    ],
+    ids=str,
+)
+def test_static_and_prefill_operands_refuse_an_e5m2_kv_cache(name, modes):
+    def serve(dtype_kv):
+        if name == "native_fp8":
+            return _serve(dtype_kv, modes)
+        return _serve(dtype_kv, configs.NATIVE_FP8_OFF, native_fp8_prefill=modes)
+
+    with pytest.raises(ValueError, match=f"{name}={modes} with an fp8_e5m2"):
+        serve(jnp.float8_e5m2)
+    assert getattr(serve(jnp.float8_e4m3fn), name) == modes
 
 
 @pytest.mark.parametrize("name", ["native_fp8", "native_fp8_prefill"])
