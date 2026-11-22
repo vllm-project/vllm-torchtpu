@@ -542,7 +542,11 @@ def test_step_selection_exact_on_its_own_queries(long):
     dict(long=True),
     dict(long=True, union=True, shard=True, xmerge=True, req_async=2, loop=True, xreq=3,
          skip_idle=True, async_dma=True),
-], ids=["long", "served"])
+    # skip_idle with two idle request slots in a 16-row bucket: their rows are neither
+    # selected nor exchanged, so their exported ids are a previous layer's (masked by starts).
+    dict(long=True, union=True, shard=True, xmerge=True, req_async=2, loop=True, xreq=3,
+         skip_idle=True, async_dma=True, B=16, ctx=[3001, 100, 0, 0]),
+], ids=["long", "served", "served_idle"])
 def test_export_ids_restore_the_full_stock_selection(kw):
     """VLLM_TPU_MK_WHOLE_EXPORT_SELECTION: the exported ids are the last QSA layer's
     pool-path ids on every rank, and `selection_groups` turns them into the stock
@@ -561,7 +565,8 @@ def test_export_ids_restore_the_full_stock_selection(kw):
     for r in range(R):
         np.testing.assert_array_equal(sel[r], ids[r, o])
     ctx = jnp.asarray(d["ctxq"], jnp.int32)
-    starts = jnp.arange(len(d["ctxq"]) + 1, dtype=jnp.int32) * T
+    live = np.asarray(d["ctxq"]) > 0  # served: an idle slot has no query tokens
+    starts = jnp.asarray(np.concatenate([[0], np.cumsum(np.where(live, T, 0))]), jnp.int32)
     groups, lens = selection_groups(jnp.asarray(sel[0]), ctx, starts, T=T, K=K)
     groups, lens = np.asarray(groups), np.asarray(lens)
     want_blocks = np.full((B, K), -1, np.int32)
@@ -569,6 +574,9 @@ def test_export_ids_restore_the_full_stock_selection(kw):
     for row in range(B):
         q = row // T
         c0 = int(d["ctxq"][q])
+        if not live[q]:
+            assert lens[row] == 0 and (groups[row] == -1).all(), row
+            continue
         p3 = c0 + (3 - c0 % 4) % 4
         qr = jnp.asarray(iq[o, row].reshape(4, -1), BF16)
         st = np.array(score_rows(qr, d["ck"][q]))[0]
