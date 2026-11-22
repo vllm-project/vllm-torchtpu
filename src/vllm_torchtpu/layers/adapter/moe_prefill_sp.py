@@ -54,6 +54,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.layers import vocab_parallel_embedding as vpe
@@ -115,6 +116,7 @@ DENSE_ATTR = "_tpu_sp_dense"
 DENSE_INDEX = "_tpu_sp_dense_index"
 DENSE_OP = "_tpu_sp_dense_op"
 EMBED_RS_ATTR = "_tpu_sp_embed_rs"
+DEFER_FINAL_AG_ATTR = "_tpu_sp_defer_final_ag"
 OP_ATTR = "_tpu_sp_moe_op"
 SCALE_ATTR = "_tpu_sp_routed_scale"
 
@@ -640,8 +642,112 @@ def _from_zigzag_rank_major(
     return torch.cat(parts, dim=0).reshape(num_tokens, *gathered.shape[1:])
 
 
-def _step_zigzag_bands(active_layers: list[Any], num_tokens: int, tp: int) -> int:
-    if not dcp_token_parallel_op.applies(num_tokens):
+def zigzag_global_to_owner_and_local(
+    indices: torch.Tensor, num_tokens: int, tp: int, num_bands: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map global indices `[M]` to `(owner_rank, local_row)`."""
+    safe_idx = indices.to(torch.int32).clamp(0, num_tokens - 1)
+    rows_per_rank = num_tokens // tp
+    if num_bands <= 1:
+        owner_rank = torch.div(safe_idx, rows_per_rank, rounding_mode="floor")
+        local_row = torch.remainder(safe_idx, rows_per_rank)
+        return owner_rank.to(torch.int32), local_row.to(torch.int32)
+    band = rows_per_rank // num_bands
+    blk = torch.div(safe_idx, band, rounding_mode="floor")
+    off = torch.remainder(safe_idx, band)
+    band_idx = torch.div(blk, tp, rounding_mode="floor")
+    slot = torch.remainder(blk, tp)
+    odd_band = (band_idx % 2) == 1
+    owner_rank = torch.where(odd_band, tp - 1 - slot, slot)
+    local_row = band_idx * band + off
+    return owner_rank.to(torch.int32), local_row.to(torch.int32)
+
+
+def select_sp_hidden_states(
+    local_hidden: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    num_tokens: int,
+    tp: int,
+    zigzag_bands: int,
+    rank_tensor: torch.Tensor | None = None,
+    all_reduce_fn: Any = None,
+) -> torch.Tensor:
+    """Gather `[M, H]` rows from rank-local SP `local_hidden` `[T/tp, H]`.
+
+    Falls back to a full all-gather + un-zigzag when `M >= T/tp` (e.g.
+    prompt_logprobs over a whole prompt chunk). For typical sampling indices
+    (`M <= max_num_reqs`), gathers local rows and runs a masked all-reduce so
+    non-owning ranks contribute +0 and the single owner contributes x.
+    """
+    local_rows = local_hidden.shape[0]
+    if indices.shape[0] >= local_rows:
+        full = _all_rows(local_hidden, num_tokens)
+        if zigzag_bands > 1:
+            full = _from_zigzag_rank_major(full, num_tokens, tp, zigzag_bands)
+        return torch.index_select(full, 0, indices)
+    owner_rank, local_row = zigzag_global_to_owner_and_local(
+        indices, num_tokens, tp, zigzag_bands
+    )
+    picked = torch.index_select(local_hidden, 0, local_row)
+    rk = (
+        (fused_moe_ep.rank_operand() if rank_tensor is None else rank_tensor)
+        .reshape(())
+        .to(owner_rank.dtype)
+    )
+    mask = (owner_rank == rk).unsqueeze(-1)
+    masked = torch.where(mask, picked, torch.zeros_like(picked))
+    reduce_fn = (
+        tensor_model_parallel_all_reduce if all_reduce_fn is None else all_reduce_fn
+    )
+    return reduce_fn(masked)
+
+
+def step_zigzag_bands_for_model(model: torch.nn.Module, num_tokens: int) -> int:
+    backbone = getattr(model, "model", None)
+    if backbone is None or not getattr(backbone, KEEP_ATTR, False):
+        return 1
+    tp = get_tensor_model_parallel_world_size()
+    if num_tokens % tp != 0:
+        return 1
+    active_layers = list(
+        islice(backbone.layers, backbone.start_layer, backbone.end_layer)
+    )
+    return _step_zigzag_bands(active_layers, num_tokens, tp, check_model_tag=False)
+
+
+def is_final_ag_deferred_for_bucket(model: torch.nn.Module, num_tokens: int) -> bool:
+    # Avoid calling applies(): callers run outside model_tag == "backbone"
+    # during precompile and post-forward logits selection.
+    if not (
+        envs.TPU_MOE_PREFILL_SEQUENCE_PARALLEL
+        and num_tokens > envs.bucket_gate_edge(MIN_TOKENS)
+    ):
+        return False
+    backbone = getattr(model, "model", None)
+    if backbone is None:
+        return False
+    return bool(
+        getattr(backbone, KEEP_ATTR, False)
+        and getattr(backbone, DEFER_FINAL_AG_ATTR, False)
+        and get_tensor_model_parallel_world_size() > 1
+    )
+
+
+def _step_zigzag_bands(
+    active_layers: list[Any],
+    num_tokens: int,
+    tp: int,
+    *,
+    check_model_tag: bool = True,
+) -> int:
+    if check_model_tag:
+        if not dcp_token_parallel_op.applies(num_tokens):
+            return 1
+    elif not (
+        envs.TPU_DCP_PREFILL_TOKEN_PARALLEL
+        and num_tokens > envs.bucket_gate_edge(dcp_token_parallel_op.MIN_TOKENS)
+    ):
         return 1
     found: int | None = None
     for layer in active_layers:
@@ -942,7 +1048,9 @@ def patched_model_forward(
         else:
             hidden_states, residual = layer(positions, hidden_states, residual, None)
     hidden_states, _ = self.norm(hidden_states, residual)
-    if hidden_states.shape[0] != num_tokens:
+    if hidden_states.shape[0] != num_tokens and not getattr(
+        self, DEFER_FINAL_AG_ATTR, False
+    ):
         hidden_states = _all_rows(hidden_states, num_tokens)
         if zigzag_bands > 1:
             hidden_states = _from_zigzag_rank_major(
@@ -1076,7 +1184,12 @@ def _can_embed_reduce_scatter(backbone: Any, tp: int) -> bool:
     )
 
 
-def arm(model: torch.nn.Module, vllm_config: Any) -> int:
+def arm(
+    model: torch.nn.Module,
+    vllm_config: Any,
+    *,
+    defer_final_ag: bool = False,
+) -> int:
     """Arm MoE and eligible leading dense layers for sequence-parallel prefill.
 
     Collective over the TP group (weight gathers, the EP mesh). Returns how many
@@ -1196,12 +1309,13 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             decode=envs.TPU_EMBED_REPLICATED_DECODE,
         )
     )
+    setattr(backbone, DEFER_FINAL_AG_ATTR, bool(defer_final_ag))
     setattr(backbone, KEEP_ATTR, True)
     n = len(layers) - first
     logger.info(
         "TPU_MOE_PREFILL_SEQUENCE_PARALLEL: %d MoE layers (layers %d..%d) and "
-        "%d dense layers (dense_group=%d, embed_rs=%s, embed_replicated=%s) "
-        "armed, buckets > %d tokens, tp=%d",
+        "%d dense layers (dense_group=%d, embed_rs=%s, embed_replicated=%s, "
+        "defer_final_ag=%s) armed, buckets > %d tokens, tp=%d",
         n,
         backbone.start_layer + first,
         backbone.end_layer - 1,
@@ -1209,6 +1323,7 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
         dense_group,
         embed_rs,
         embed_replicated,
+        bool(defer_final_ag),
         envs.bucket_gate_edge(MIN_TOKENS),
         tp,
     )

@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_PREFILL_SEQUENCE_PARALLEL: bool = True
+    TPU_MOE_PREFILL_SP_DEFER_FINAL_AG: bool = True
     TPU_MOE_PREFILL_SP_SHARED_GROUP: int = 1
     TPU_MOE_PREFILL_SP_FP8_WIRE: bool = True
     TPU_EMBED_REPLICATED: bool = True
@@ -1262,6 +1263,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MLA + MoE models (`layers/adapter/moe_prefill_sp.py`).
     "TPU_MOE_PREFILL_SEQUENCE_PARALLEL": env_bool(
         "TPU_MOE_PREFILL_SEQUENCE_PARALLEL", default=True
+    ),
+    # Under TPU_MOE_PREFILL_SEQUENCE_PARALLEL: return the rank-local final
+    # hidden states from the backbone instead of all-gathering the full step
+    # tensor, and gather only the selected logits rows (<= max_num_reqs) via
+    # masked all-reduce inside compute_selected_logits / top_tokens.
+    "TPU_MOE_PREFILL_SP_DEFER_FINAL_AG": env_bool(
+        "TPU_MOE_PREFILL_SP_DEFER_FINAL_AG", default=True
     ),
     # Tensor-parallel subgroup size for the shared expert under
     # TPU_MOE_PREFILL_SEQUENCE_PARALLEL (1 replicates per rank).
