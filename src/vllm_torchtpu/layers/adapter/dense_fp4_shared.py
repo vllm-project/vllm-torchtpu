@@ -42,10 +42,29 @@ _SHARED_BUFFERS = ("_dfs_w1", "_dfs_s1", "_dfs_w2", "_dfs_s2")
 
 
 def shared_operands(layer: Any) -> tuple[torch.Tensor, ...] | None:
-    """The armed shared expert's tensors of a routed layer, else None."""
+    """The armed shared expert's tensors of a routed layer, else None (an
+    armed layer also carries a step's e4m3 rows, SHARED_ROWS_ATTR)."""
     if getattr(layer, _SHARED_BUFFERS[0], None) is None:
         return None
     return tuple(getattr(layer, name) for name in _SHARED_BUFFERS)
+
+
+# Attribute of a routed layer holding a step's gathered e4m3 row pieces for
+# the shared expert: MiniMaxM3MoE sets it around the routed call within one
+# traced forward (dynamo tracks the mutation; it ends as None, so it adds no
+# graph output) and the routed op reads it. One piece count is supported, the
+# prebuilt op's (TPU_MINIMAX_M3_SP_FFN_PIECES).
+SHARED_ROWS_ATTR = "_dfs_step_shared_rows"
+SHARED_ROWS_PIECES = 2
+
+
+def shared_rows_enabled() -> bool:
+    """Whether SP steps hand their gathered e4m3 pieces to the routed op's
+    shared expert (TPU_MINIMAX_M3_SP_E4M3_SHARED with SHARED_ROWS_PIECES)."""
+    return (
+        envs.TPU_MINIMAX_M3_SP_E4M3_SHARED
+        and envs.TPU_MINIMAX_M3_SP_FFN_PIECES == SHARED_ROWS_PIECES
+    )
 
 
 def model_side_shared(layer: Any, num_tokens: int) -> bool:
@@ -114,14 +133,19 @@ def arm_dense_fp4_shared(model: torch.nn.Module, what: str = "model") -> int:
         layer = runner.routed_experts
         # A traced forward cannot build the op. TP-sliced experts (no EP) hold
         # every expert's slice; the op then runs its non-EP routing.
-        prebuild_fused_moe_kernel(
-            topk=runner.moe_config.experts_per_token,
-            activation=runner._quant_method._tpu_activation_str,
-            use_ep=getattr(layer, "_experts_start", None) is not None,
-            with_shared=True,
-        )
+        use_ep = getattr(layer, "_experts_start", None) is not None
+        rows_variants = (0, SHARED_ROWS_PIECES) if shared_rows_enabled() else (0,)
+        for with_shared_rows in rows_variants:
+            prebuild_fused_moe_kernel(
+                topk=runner.moe_config.experts_per_token,
+                activation=runner._quant_method._tpu_activation_str,
+                use_ep=use_ep,
+                with_shared=True,
+                with_shared_rows=with_shared_rows,
+            )
         for name, tensor in zip(_SHARED_BUFFERS, shared):
             layer.register_buffer(name, tensor, persistent=False)
+        setattr(layer, SHARED_ROWS_ATTR, None)
         runner._shared_experts = None
         runner._forward_entry = runner._select_forward()
         armed += 1

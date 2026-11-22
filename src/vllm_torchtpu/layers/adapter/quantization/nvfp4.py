@@ -609,6 +609,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             return pipelined_fused_moe_gmm(**kwargs)
 
         from vllm_torchtpu.layers.adapter.dense_fp4_shared import (
+            SHARED_ROWS_ATTR,
             model_side_shared,
             shared_operands,
         )
@@ -616,8 +617,21 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         shared = shared_operands(layer)
         if model_side_shared(layer, x.shape[0]):
             shared = None
+        tp_experts = dual_operands(layer)
+        # The model's e4m3 pieces for the shared expert (see SHARED_ROWS_ATTR);
+        # the dual layout's op variant does not take them, and steps the dense
+        # fp4 kernel routes itself do not use them.
+        shared_rows = (
+            getattr(layer, SHARED_ROWS_ATTR, None)
+            if shared is not None and tp_experts is None and route is None
+            else None
+        )
         return fused_moe_gmm(
-            **kwargs, shared=shared, tp_experts=dual_operands(layer), route=route
+            **kwargs,
+            shared=shared,
+            tp_experts=tp_experts,
+            route=route,
+            shared_rows=shared_rows,
         )
 
 

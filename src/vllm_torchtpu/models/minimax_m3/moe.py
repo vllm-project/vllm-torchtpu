@@ -25,9 +25,13 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+from vllm_torchtpu.layers.adapter.dense_fp4_dual import dual_operands
 from vllm_torchtpu.layers.adapter.dense_fp4_shared import (
+    SHARED_ROWS_ATTR,
+    SHARED_ROWS_PIECES,
     model_side_shared,
     shared_operands,
+    shared_rows_enabled,
 )
 from vllm_torchtpu.models.minimax_m3.ops.rows_join import join_rows_op
 from vllm_torchtpu.models.minimax_m3.quant import (
@@ -214,6 +218,22 @@ class MiniMaxM3MoE(nn.Module):
             return join(*(t for p in pieces for t in p))
         return torch.cat([_dequant(p) for p in pieces])
 
+    @staticmethod
+    def _shared_rows(
+        routed_layer: nn.Module, pieces: list[Rows]
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...] | None:
+        """Gathered e4m3 pieces for the routed op's shared expert to contract
+        as e4m3 (fused_moe_gmm.shared_activation_e4m3), else None."""
+        if (
+            not shared_rows_enabled()
+            or shared_operands(routed_layer) is None
+            or dual_operands(routed_layer) is not None
+            or len(pieces) != SHARED_ROWS_PIECES
+            or not all(isinstance(p, tuple) for p in pieces)
+        ):
+            return None
+        return tuple(pieces)
+
     def forward(
         self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     ) -> torch.Tensor:
@@ -221,24 +241,29 @@ class MiniMaxM3MoE(nn.Module):
         SP step's e4m3 all-gather), or as a list of such gathered pieces: the
         router and routed experts take them dequantized, a model-side shared
         expert contracts them as e4m3."""
-        if isinstance(hidden_states, list):
+        pieces = hidden_states if isinstance(hidden_states, list) else None
+        if pieces is not None:
             # Gathered pieces: dequantize and route each as it lands.
-            router_logits = torch.cat(
-                [self.gate(_dequant(p))[0] for p in hidden_states]
-            )
-            x = self._join_pieces(hidden_states)
-            hidden_states = cat_rows(hidden_states)
+            router_logits = torch.cat([self.gate(_dequant(p))[0] for p in pieces])
+            x = self._join_pieces(pieces)
+            hidden_states = cat_rows(pieces)
         else:
             x = _dequant(hidden_states)
             router_logits = None
         e4m3 = isinstance(hidden_states, tuple)
         routed_layer = getattr(self.experts, "routed_experts", None)
-        shared = None
+        shared = shared_rows = None
         if routed_layer is not None and model_side_shared(routed_layer, x.shape[0]):
             shared = shared_operands(routed_layer)
+        elif routed_layer is not None and pieces is not None:
+            shared_rows = self._shared_rows(routed_layer, pieces)
         if router_logits is None:
             router_logits, _ = self.gate(x)
+        if shared_rows is not None:
+            setattr(routed_layer, SHARED_ROWS_ATTR, shared_rows)
         out = self.experts(hidden_states=x, router_logits=router_logits)
+        if shared_rows is not None:
+            setattr(routed_layer, SHARED_ROWS_ATTR, None)
         if shared is None:
             return out
         act_fn = self.shared_experts.act_fn

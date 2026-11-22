@@ -1556,3 +1556,26 @@ def test_tp_slices_of_ep_weights_round_trip():
             np.testing.assert_array_equal(
                 np.asarray(a.astype(jnp.float32)), np.asarray(b.astype(jnp.float32))
             )
+
+
+def test_shared_activation_e4m3_matches_dequantized_rows():
+    """The shared gate_up on e4m3 rows equals it on their bf16 dequantization
+    up to that dequantization's rounding."""
+    from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import SharedExpert
+
+    rng = np.random.default_rng(0)
+    rows, hidden, inter = 64, 512, 128
+    x = rng.normal(0, 2, (rows, hidden)).astype(np.float32)
+    scale = np.abs(x).max(axis=1, keepdims=True) / 448
+    q = jnp.asarray(x / scale, jnp.float8_e4m3fn)
+    scale = jnp.asarray(scale, jnp.float32)
+    w1 = jnp.asarray(rng.normal(0, 64, (hidden, 2 * inter)), jnp.float8_e4m3fn)
+    s1 = jnp.exp2(jnp.asarray(rng.integers(-14, -11, (1, 2 * inter)), jnp.float32))
+    w2 = jnp.zeros((inter, hidden), jnp.float8_e4m3fn)
+    shared = SharedExpert(w1, s1, w2, jnp.ones((1, hidden), jnp.float32))
+    dequantized = (q.astype(jnp.float32) * scale).astype(jnp.bfloat16)
+    want = np.asarray(fused_moe_gmm.shared_expert_down(dequantized, shared)[0])
+    got = np.asarray(fused_moe_gmm.shared_activation_e4m3(q, scale, w1, s1))
+    assert got.shape == want.shape == (rows, inter)
+    want, got = want.astype(np.float32), got.astype(np.float32)
+    assert np.linalg.norm(got - want) <= 1e-2 * np.linalg.norm(want)

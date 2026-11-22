@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_FP4_SHARED: bool = False
     TPU_MOE_DENSE_FP4_FUSED_ROUTING: bool = True
     TPU_MOE_DENSE_FP4_SPARSE_FUSED_ROUTING: bool = True
+    TPU_MINIMAX_M3_SP_E4M3_SHARED: bool = True
     TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS: int = 0
     TPU_MOE_DUAL_LAYOUT_MAX_TOKENS: int = 0
     TPU_GMM_FP8_W8A8: bool = False
@@ -891,6 +892,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # routed id columns from VMEM, so routing outside only adds XLA ops.
     "TPU_MOE_DENSE_FP4_SPARSE_FUSED_ROUTING": env_bool(
         "TPU_MOE_DENSE_FP4_SPARSE_FUSED_ROUTING", default=True
+    ),
+    # MiniMax-M3 SP steps evaluate an armed shared expert's gate_up on the
+    # gathered e4m3 rows (fp8 x fp8) as each piece lands; the routed op adds
+    # its down projection (TPU_MOE_DENSE_FP4_SHARED).
+    "TPU_MINIMAX_M3_SP_E4M3_SHARED": env_bool(
+        "TPU_MINIMAX_M3_SP_E4M3_SHARED", default=True
     ),
     # Steps of at least this many tokens whose MoE reduction the model owns
     # (MiniMax-M3 SP steps) leave a shared expert armed by

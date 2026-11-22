@@ -945,6 +945,36 @@ def shared_expert_down(x: jax.Array, shared: SharedExpert) -> SharedDown:
     return act.astype(jnp.bfloat16), shared.w2, shared.s2
 
 
+def shared_activation_e4m3(
+    q: jax.Array, row_scale: jax.Array, w1: jax.Array, s1: jax.Array
+) -> jax.Array:
+    """`shared_expert_down`'s activation on e4m3 rows ``q`` with f32 row
+    scales (an SP step's gathered rows): gate_up contracts e4m3 x e4m3 on the
+    MXU's fp8 rate, rounded where `_shared_projection` rounds, from the rows
+    before their bf16 dequantization."""
+    acc = jax.lax.dot(q, w1, preferred_element_type=jnp.float32)
+    y = (acc * row_scale).astype(jnp.bfloat16).astype(jnp.float32) * s1
+    gate, up = jnp.split(y.astype(jnp.bfloat16), 2, axis=-1)
+    return shared_activation(gate.astype(jnp.float32), up.astype(jnp.float32)).astype(
+        jnp.bfloat16
+    )
+
+
+def _shared_down(
+    x: jax.Array,
+    shared: SharedExpert,
+    rows: tuple[tuple[jax.Array, jax.Array], ...] | None,
+) -> SharedDown:
+    """`shared_expert_down` on the bf16 tokens ``x``, or on their gathered e4m3
+    row pieces ``rows`` when given (`shared_activation_e4m3`)."""
+    if rows is None:
+        return shared_expert_down(x, shared)
+    act = jnp.concatenate(
+        [shared_activation_e4m3(q, scale, shared.w1, shared.s1) for q, scale in rows]
+    )
+    return act, shared.w2, shared.s2
+
+
 def _add_shared_down(routed: jax.Array, shared_down: SharedDown | None) -> jax.Array:
     if shared_down is None:
         return routed
@@ -1008,6 +1038,7 @@ def fused_moe_func(
     tp_experts: TpSlicedExperts | None = None,
     shared_down: SharedDown | None = None,
     route: Route | None = None,
+    shared_rows: tuple[tuple[jax.Array, jax.Array], ...] | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -1025,7 +1056,10 @@ def fused_moe_func(
     With ``shared``, an always-on expert's output (rounded to bf16) is added to
     the routed output, as vLLM's MoERunner adds a separately computed shared
     expert; the dense fp4 kernel evaluates it in the same call where it serves
-    the step.
+    the step. ``shared_rows`` are the e4m3 rows (with f32 row scales) the
+    tokens were gathered as, in pieces: on steps the dense fp4 kernel does not
+    serve, the shared expert's gate_up then contracts them as e4m3
+    (`shared_activation_e4m3`).
 
     For linear EP placement, ``experts_start`` is the first global expert id
     owned by this shard, passed as a 0-d int32 array (real traced data, not a
@@ -1111,7 +1145,7 @@ def fused_moe_func(
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
-            shared_down=shared_expert_down(hidden_states, shared),
+            shared_down=_shared_down(hidden_states, shared, shared_rows),
         )
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
