@@ -42,6 +42,7 @@ queries of the group's heads along with the query heads.
 """
 
 import functools
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -148,39 +149,112 @@ def _candidates_kernel(
     prefill twin, j-3c651507: ~240 of 1,024 columns visible)."""
     rank = rank_ref[0]
     width_now = widths_ref[pl.program_id(0)]
-    rows = scores_ref.shape[0]
     num_visible = pos_ref[...] // block_size + 1
 
     def select(width):
-        s = scores_ref[:, :width]
-        cols = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
-        blocks = cols * dcp + rank
-        visible = blocks < num_visible
-        s = jnp.where(visible, s, _NEG_INF)
-        s = jnp.where(
-            visible & (blocks >= num_visible - local_blocks),
-            msa_select._FORCED_LOCAL_SCORE,
-            s,
+        score_out_ref[...], block_out_ref[...] = _pick(
+            scores_ref[:, :width],
+            num_visible,
+            rank,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            dcp=dcp,
         )
-        s = jnp.where(
-            visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
-        )
-        picked_scores, picked_blocks = [], []
-        for _ in range(topk):
-            best_score = jnp.max(s, axis=1, keepdims=True)
-            best = jnp.min(
-                jnp.where(s == best_score, cols, width), axis=1, keepdims=True
-            )
-            picked_scores.append(best_score)
-            picked_blocks.append(
-                jnp.where(best_score > _NEG_INF, best * dcp + rank, -1)
-            )
-            s = jnp.where(cols == best, _NEG_INF, s)
-        score_out_ref[...] = jnp.concatenate(picked_scores, axis=1)
-        block_out_ref[...] = jnp.concatenate(picked_blocks, axis=1)
 
     for width in widths:
         pl.when(width_now == width)(functools.partial(select, width))
+
+
+def _pick(s, num_visible, rank, *, topk, init_blocks, local_blocks, dcp):
+    """The top-k ``(scores, blocks)`` ``[rows, topk]`` of row-major scores
+    ``s [rows, width]`` of this rank's columns (column ``c`` is block ``c *
+    dcp + rank``), each row seeing its first ``num_visible [rows, 1]`` blocks."""
+    rows, width = s.shape
+    cols = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
+    blocks = cols * dcp + rank
+    visible = blocks < num_visible
+    s = jnp.where(visible, s, _NEG_INF)
+    s = jnp.where(
+        visible & (blocks >= num_visible - local_blocks),
+        msa_select._FORCED_LOCAL_SCORE,
+        s,
+    )
+    s = jnp.where(visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s)
+    picked_scores, picked_blocks = [], []
+    for _ in range(topk):
+        best_score = jnp.max(s, axis=1, keepdims=True)
+        best = jnp.min(jnp.where(s == best_score, cols, width), axis=1, keepdims=True)
+        picked_scores.append(best_score)
+        picked_blocks.append(jnp.where(best_score > _NEG_INF, best * dcp + rank, -1))
+        s = jnp.where(cols == best, _NEG_INF, s)
+    return jnp.concatenate(picked_scores, axis=1), jnp.concatenate(picked_blocks, axis=1)
+
+
+def _pick_t(st, num_visible, rank, *, topk, init_blocks, local_blocks, dcp):
+    """`_pick` of transposed scores ``st [width, rows]`` (``num_visible [1,
+    rows]``), returning ``[topk, rows]`` each: every max and first index
+    reduces across vregs and sublanes on the VPU. Row-major, they reduce
+    across lanes on the XLU, whose latency bounds the dependent picks
+    (decode, 8 to 48 rows x 512 columns: ~7,500 cycles at any row count vs
+    ~4,100 here, AOT)."""
+    width, rows = st.shape
+    cols = jax.lax.broadcasted_iota(jnp.int32, (width, rows), 0)
+    blocks = cols * dcp + rank
+    visible = blocks < num_visible
+    st = jnp.where(visible, st, _NEG_INF)
+    st = jnp.where(
+        visible & (blocks >= num_visible - local_blocks),
+        msa_select._FORCED_LOCAL_SCORE,
+        st,
+    )
+    st = jnp.where(visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, st)
+    # Column ids as f32 (exact below 2**24): a pick's first tie is one f32 min.
+    ids = cols.astype(jnp.float32)
+    picked_scores, picked_blocks = [], []
+    for _ in range(topk):
+        best_score = jnp.max(st, axis=0, keepdims=True)
+        best = jnp.min(
+            jnp.where(st == best_score, ids, float(width)), axis=0, keepdims=True
+        )
+        picked_scores.append(best_score)
+        picked_blocks.append(
+            jnp.where(best_score > _NEG_INF, best.astype(jnp.int32) * dcp + rank, -1)
+        )
+        st = jnp.where(ids == best, _NEG_INF, st)
+    return jnp.concatenate(picked_scores, axis=0), jnp.concatenate(picked_blocks, axis=0)
+
+
+class _PackedPick(NamedTuple):
+    """The top-k of token rows at their positions, packed (`pack_candidates`):
+    the `msa_indexer.RowSelect` of a decode step's local candidates."""
+
+    block_size: int
+    topk: int
+    init_blocks: int
+    local_blocks: int
+    dcp: int
+
+    def __call__(self, s, pos, rank):
+        options = dict(
+            topk=self.topk,
+            init_blocks=self.init_blocks,
+            local_blocks=self.local_blocks,
+            dcp=self.dcp,
+        )
+        num_visible = pos // self.block_size + 1
+        if s.shape[1] > _TRANSPOSED_PICK_WIDTH:
+            return pack_candidates(*_pick(s, num_visible, rank, **options))
+        scores, blocks = _pick_t(s.T, num_visible.T, rank, **options)
+        return pack_candidates(scores.T, blocks.T)
+
+
+# A decode pick scans this many columns at most transposed (`_pick_t`, whose
+# cost grows with the width: ~7,800 cycles at 1,024 against the row-major
+# picks' ~7,600 at any width, AOT); its widths step by `_PICK_WIDTH_STEP`,
+# one unrolled body each.
+_TRANSPOSED_PICK_WIDTH = 768
+_PICK_WIDTH_STEP = 256
 
 
 def _candidates_kernel_t(
@@ -803,6 +877,7 @@ def msa_write_and_candidates_dcp(
             return kv_cache, index_cache, scale_cache, packed
         return kv_cache, index_cache, packed
     if num_heads == 1:
+        pick = _PackedPick(block_size, topk, init_blocks, local_blocks, dcp)
         scores = msa._block_scores(
             index_q,
             index_cache,
@@ -813,7 +888,8 @@ def msa_write_and_candidates_dcp(
             interpret,
             scale_cache,
             scale_row,
-            token_rows=True,
+            select=msa_indexer.RowSelect(pick, 2 * topk, _PICK_WIDTH_STEP),
+            select_inputs=(pos, rank),
         )
     else:
         # All heads in one pass over this rank's index pages: [G, T, P],
@@ -830,10 +906,11 @@ def msa_write_and_candidates_dcp(
             scale_cache=scale_cache,
             scale_row=scale_row,
         ).reshape(num_heads * num_tokens, 1, -1)
-    if isinstance(scores, msa_indexer.TokenRows):
-        cand_scores, cand_blocks = candidates(scores.scores, pos, rows=scores.rows)
-    else:
-        cand_scores, cand_blocks = candidates(scores, jnp.tile(pos, num_heads))
+    if isinstance(scores, msa_indexer.Selected):  # one head: [T, 2 * topk]
+        if fp4:
+            return kv_cache, index_cache, scale_cache, scores.rows
+        return kv_cache, index_cache, scores.rows
+    cand_scores, cand_blocks = candidates(scores, jnp.tile(pos, num_heads))
     packed = pack_candidates(cand_scores, cand_blocks)  # [G * T, 2 * topk]
     packed = packed.reshape(num_heads, num_tokens, -1).transpose(1, 0, 2)
     if fp4:

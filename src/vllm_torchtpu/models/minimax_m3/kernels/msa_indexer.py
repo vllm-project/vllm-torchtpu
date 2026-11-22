@@ -360,6 +360,7 @@ def _kernel_v3(
     sems,  # DMA semaphores [R], one per ring slot
     *,
     transposed=False,
+    store=None,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -376,6 +377,9 @@ def _kernel_v3(
 
     A folded 4-bit page (`msa_fp4.scales_in_page`) is ``S / 8`` word rows of
     int4 keys and one row of f32 slot scales (`_chunk_maxima_t`).
+
+    `store(first, m)`, if given, takes each scored chunk's maxima ``m [Bq,
+    chunk]`` (pages ``first ..`` of the step's group) instead of `o_ref`.
     """
     slots, pages_per_step, rows, head_dim = buf.shape
     ahead = slots - 1
@@ -476,7 +480,9 @@ def _kernel_v3(
                 dtype=cache_ref.dtype,
                 folded=folded,
             )  # [Bq, chunk]
-            if transposed:
+            if store is not None:
+                store(first, m)
+            elif transposed:
                 o_ref[:, pl.ds(first, chunk)] = m
             else:
                 o_ref[pl.ds(first, chunk), :] = m.T
@@ -510,7 +516,9 @@ def _kernel_v3(
             return pltpu.bitcast(w, cache_ref.dtype).astype(jnp.bfloat16)
 
         m = _chunk_maxima(q_pair, page_keys, chunk)
-        if transposed:
+        if store is not None:
+            store(first, m.T)
+        elif transposed:
             o_ref[:, pl.ds(first, chunk)] = m.T
         else:
             o_ref[pl.ds(first, chunk), :] = m
@@ -541,6 +549,117 @@ def _kernel_v3(
             pl.when((step % slots == slot) & (live_chunks > lo) & (live_chunks <= n))(
                 functools.partial(body, slot, n)
             )
+
+
+class RowSelect(NamedTuple):
+    """A per-token reduction of a decode step's block scores that
+    `block_scores` runs in its kernel, on the scores in VMEM, instead of
+    returning them (`block_scores`' `select`).
+
+    ``pick(s [R, W] f32, pos [R, 1] i32, arg) -> [R, width] f32`` takes R
+    tokens' scores over the first ``W`` pages (a multiple of 128 holding every
+    request's pages; columns past a token's own request's pages are stale),
+    their absolute positions and the int32 scalar ``arg``; ``W`` steps by
+    `width_step` columns (a multiple of the 128-page groups: one kernel body
+    per width). A jit static: `pick` must hash by value.
+    """
+
+    pick: Callable
+    width: int
+    width_step: int = 128
+
+
+class Selected(NamedTuple):
+    """`block_scores` reduced by a `RowSelect`: ``rows [T, width]``."""
+
+    rows: jax.Array
+
+
+# Token rows a `RowSelect` pick takes at once (a decode bucket's).
+_SELECT_ROWS = 128
+
+
+def _kernel_v3_select(
+    # Scalar prefetch
+    work_ref,
+    tile_seq_ref,
+    block_tables_ref,
+    seq_pages_ref,
+    select_ref,  # [max_num_seqs + 2] cu_q_lens, then the pick's scalar
+    # In
+    q_ref,  # [Bq, D]
+    cache_ref,  # left in HBM
+    pos_ref,  # [T, 1] absolute positions
+    # Out
+    o_ref,  # [T, width]
+    # Scratch
+    buf,
+    sems,
+    scores_ref,  # [page groups, T + Bq, pages_per_step] f32, token rows
+    *,
+    select: RowSelect,
+):
+    """`_kernel_v3` with token-major scores kept in VMEM, by page group and
+    token row, then reduced by `select` at the last step: a separate kernel
+    reading them back cost a call and its row copies (~4 us per layer at
+    decode, flat in the batch: candidates of 8 to 48 tokens, twin
+    j-5928c8f0)."""
+    groups, _, pages_per_step = scores_ref.shape
+    block_q = q_ref.shape[0]
+    num_tokens = o_ref.shape[0]
+    max_num_seqs = seq_pages_ref.shape[0]
+    step = pl.program_id(0)
+    entry = work_ref[step]
+    info = tile_seq_ref[entry >> _TILE_SHIFT]
+    seq = info & _SEQ_MASK
+    row0 = pl.multiple_of(info >> _ROW_SHIFT, _ROW_ALIGN)
+    rows = row0 + jax.lax.broadcasted_iota(jnp.int32, (block_q, 1), 0)
+    # A tile's aligned start may hold the previous request's last rows, which
+    # that request's own tile wrote: keep only this request's rows.
+    own = (rows >= select_ref[seq]) & (rows < select_ref[seq + 1])
+    tile = scores_ref.at[entry & _GROUP_MASK, pl.ds(row0, block_q)]
+
+    def store(first, m):
+        cols = pl.ds(first, m.shape[1])
+        tile[:, cols] = jnp.where(own, m, tile[:, cols])
+
+    _kernel_v3(
+        work_ref,
+        tile_seq_ref,
+        block_tables_ref,
+        seq_pages_ref,
+        q_ref,
+        cache_ref,
+        None,
+        buf,
+        sems,
+        store=store,
+    )
+
+    def pick(width):
+        for r0 in range(0, num_tokens, _SELECT_ROWS):
+            n = min(_SELECT_ROWS, num_tokens - r0)
+            s = jnp.concatenate(
+                [scores_ref[g, pl.ds(r0, n)] for g in range(width // pages_per_step)],
+                axis=1,
+            )
+            o_ref[pl.ds(r0, n)] = select.pick(
+                s, pos_ref[pl.ds(r0, n)], select_ref[max_num_seqs + 1]
+            )
+
+    @pl.when(step == pl.num_programs(0) - 1)
+    def _select():
+        # The narrowest width holding every request's pages.
+        most = jax.lax.fori_loop(
+            0, max_num_seqs, lambda i, m: jnp.maximum(m, seq_pages_ref[i]), 1
+        )
+        widths = list(range(select.width_step, groups * pages_per_step, select.width_step))
+        widths.append(groups * pages_per_step)
+        for i, width in enumerate(widths):
+            fits = most > (widths[i - 1] if i else 0)
+            if width < widths[-1]:
+                fits = fits & (most <= width)
+            pl.when(fits)(functools.partial(pick, width))
 
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
@@ -614,12 +733,16 @@ def _class_scores(
     scale_cache=None,
     scale_row=None,
     q_pad=None,
+    select=None,
+    select_inputs=None,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token (`ClassScores`); `token_major` (kernel v3) returns
     them as ``[tiles * block_q, P]`` instead, so a token's scores are one row.
     The query rows are padded by ``q_pad >= block_q`` rows (default
-    `block_q`): classes sharing it share one padded copy."""
+    `block_q`): classes sharing it share one padded copy. With a token-major
+    `select` (`RowSelect`) and its ``(pos [T], arg)`` `select_inputs`, returns
+    `Selected` instead."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
     page_size = _page_tokens(rows_per_page, index_cache.dtype)
@@ -739,6 +862,56 @@ def _class_scores(
                 f"kernel v3 pairs pages in chunks of up to {_PAGES_PER_CHUNK}: "
                 f"pages_per_step must be an even divisor or a multiple of it, "
                 f"got {pages_per_step}"
+            )
+        if select is not None:
+            if not token_major:
+                raise NotImplementedError("a RowSelect needs token-major scores")
+            pos, arg = select_inputs
+            select_meta = jnp.concatenate(
+                [cu_q_lens.astype(jnp.int32), jnp.reshape(arg, (1,)).astype(jnp.int32)]
+            )
+            rows = pltpu.VMEM(
+                (num_groups_per_seq, num_tokens + block_q, pages_per_step), jnp.float32
+            )
+            return Selected(
+                pl.pallas_call(
+                    functools.partial(_kernel_v3_select, select=select),
+                    grid_spec=pltpu.PrefetchScalarGridSpec(
+                        num_scalar_prefetch=5,
+                        grid=grid_spec.grid,
+                        in_specs=[
+                            grid_spec.in_specs[0],
+                            pl.BlockSpec(memory_space=pl.ANY),
+                            pl.BlockSpec((num_tokens, 1), lambda *_: (0, 0)),
+                        ],
+                        out_specs=pl.BlockSpec(
+                            (num_tokens, select.width), lambda *_: (0, 0)
+                        ),
+                        scratch_shapes=[
+                            pltpu.VMEM(
+                                (_RING_SLOTS, pages_per_step, rows_per_page, head_dim),
+                                jnp.uint32,
+                            ),
+                            pltpu.SemaphoreType.DMA((_RING_SLOTS,)),
+                            rows,
+                        ],
+                    ),
+                    out_shape=jax.ShapeDtypeStruct(
+                        (num_tokens, select.width), jnp.float32
+                    ),
+                    compiler_params=params,
+                    interpret=interpret,
+                    name="minimax_m3_msa_block_select",
+                )(
+                    work,
+                    tile_info,
+                    block_tables,
+                    seq_pages,
+                    select_meta,
+                    q_rows,
+                    index_cache,
+                    pos.astype(jnp.int32)[:, None],
+                )
             )
         scores_t = pl.pallas_call(
             functools.partial(_kernel_v3, transposed=token_major),
@@ -957,6 +1130,7 @@ def class_plan(
         "scale_row",
         "transposed_tile_q",
         "token_rows",
+        "select",
         "interpret",
     ),
 )
@@ -978,8 +1152,10 @@ def block_scores(
     scale_row: int | None = None,
     transposed_tile_q: int = _SMALL_TILE_Q_TRANSPOSED,
     token_rows: bool = False,
+    select: RowSelect | None = None,
+    select_inputs: tuple[jax.Array, jax.Array] | None = None,
     interpret: bool = False,
-) -> jax.Array | TokenRows:
+) -> jax.Array | TokenRows | Selected:
     """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
 
     Requests of at most `block_q` query tokens (decode, short chunks) are
@@ -1008,6 +1184,10 @@ def block_scores(
         the scores in the kernel's rows and each token's row, for a consumer
         that reads its rows itself (`msa_dcp.local_candidates`). Other steps
         return the gathered scores as without it.
+      select, select_inputs: on the steps `token_rows` applies to, reduce
+        each token's scores in the kernel instead (`RowSelect`, with ``(pos
+        [T] absolute positions, its scalar)``) and return `Selected`. Other
+        steps return the gathered scores.
     Pages past a token's own page hold scores of keys it must not see, and
     pages past its request's last page are not written; callers mask both.
     """
@@ -1032,6 +1212,8 @@ def block_scores(
     num_tokens = index_q.shape[0]
     max_num_seqs = seq_lens.shape[0]
     max_large, is_large, token_major = plan.max_large, plan.is_large, plan.token_major
+    if select is not None and max_large == 0 and token_major:
+        return plan.small(select=select, select_inputs=select_inputs)
     small, small_col, *_ = plan.small()
     # The classes may pad pages to different group multiples; pad to the wider.
     pages = max(small.shape[1 if token_major else 0], plan.large_pages)

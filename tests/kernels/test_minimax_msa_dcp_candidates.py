@@ -84,6 +84,60 @@ def test_decode_step_returns_token_rows() -> None:
     )
 
 
+# Transposed picks (up to 768 columns) and row-major ones.
+@pytest.mark.parametrize("width", [256, 1024])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_packed_pick_matches_local_candidates(width: int, rank: int) -> None:
+    rng = np.random.default_rng(width + rank)
+    tokens = 24
+    # Few distinct values, so most picks break ties.
+    scores = jnp.asarray(rng.integers(-3, 4, (tokens, width)), jnp.float32)
+    pos = jnp.asarray(rng.integers(0, 2 * _BLOCK * width, tokens), jnp.int32)
+    want = msa_dcp.pack_candidates(*_pick(scores[:, None, :], pos, rank))
+    pick = msa_dcp._PackedPick(_BLOCK, _TOPK, 1, 2, 2)
+    got = pick(scores, pos[:, None], jnp.asarray(rank, jnp.int32))
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+# One page group, and two (the second partly live).
+@pytest.mark.parametrize("pages_per_seq", [8, 160])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_decode_select_matches_token_row_candidates(pages_per_seq, rank) -> None:
+    rng = np.random.default_rng(pages_per_seq + rank)
+    seqs, dim = 4, 128
+    pages = seqs * pages_per_seq + 8
+    # Request 2 starts mid-tile: its tile's first rows are request 1's.
+    q_lens = np.array([8, 5, 8, 0])
+    cu = jnp.asarray(np.concatenate([[0], np.cumsum(q_lens)]), jnp.int32)
+    full = 2 * _BLOCK * pages_per_seq
+    seq_lens = jnp.asarray(
+        np.where(q_lens > 0, [full // 3, 300, full - 5, 0], 0), jnp.int32
+    )
+    local_lens = msa_dcp.local_seq_lens(seq_lens, block_size=_BLOCK, rank=rank, dcp=2)
+    _, pos, _ = msa.token_positions(24, seq_lens, cu)
+    args = (
+        jnp.asarray(rng.standard_normal((24, 1, dim)), jnp.bfloat16),
+        jnp.asarray(rng.integers(-2, 3, (pages, 32, 4, dim)), jnp.float8_e4m3fn),
+        local_lens,
+        jnp.asarray(rng.permutation(pages)[: seqs * pages_per_seq], jnp.int32),
+        cu,
+        jnp.asarray(3, jnp.int32),
+    )
+    options = dict(**msa.block_score_options(), interpret=True)
+    rows = msa_indexer.block_scores(*args, token_rows=True, **options)
+    want = msa_dcp.pack_candidates(*_pick(rows.scores, pos, rank, rows=rows.rows))
+    pick = msa_dcp._PackedPick(_BLOCK, _TOPK, 1, 2, 2)
+    got = msa_indexer.block_scores(
+        *args,
+        select=msa_indexer.RowSelect(pick, 2 * _TOPK),
+        select_inputs=(pos, jnp.asarray(rank, jnp.int32)),
+        **options,
+    )
+    assert isinstance(got, msa_indexer.Selected)
+    live = int(cu[-1])
+    np.testing.assert_array_equal(np.asarray(got.rows)[:live], np.asarray(want)[:live])
+
+
 def _reference_merge(candidates: np.ndarray) -> np.ndarray:
     """Per token: the real candidates by score descending, then block."""
     out = -np.ones(candidates.shape[1:2] + (_TOPK,), np.int32)
