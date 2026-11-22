@@ -3112,6 +3112,12 @@ class TPUModelRunner(GPUModelRunner):
             off += n
         return out
 
+    def _spec_source_bound(self) -> int:
+        """The length an async-spec substitution source is padded to: the
+        max stride-(1+K) span, one shape for next step's substitution."""
+        assert self.speculative_config is not None
+        return self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
+
     def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk, state):
         """Async-spec substitution assembler.
 
@@ -3154,8 +3160,13 @@ class TPUModelRunner(GPUModelRunner):
         ):
             chunk_padded_num_reqs = nt_chunk.shape[0] if bucketed else num_reqs
             if bucketed and md is not None:
+                # A lone chunk's source comes out at the bound sample_tokens
+                # pads it to (no separate pad program).
                 src, num_rejected = spec_chunk_sources(
-                    nt_chunk, drafts_chunk, md.draft_lengths
+                    nt_chunk,
+                    drafts_chunk,
+                    md.draft_lengths,
+                    self._spec_source_bound() if len(drafts_per_chunk) == 1 else 0,
                 )
             else:
                 drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
@@ -6152,10 +6163,7 @@ class TPUModelRunner(GPUModelRunner):
                 # positions are unchanged. Spec only (stride 1+K); pure-non-spec
                 # async keeps its stride-1 source + existing precompile.
                 if spec_num_rejected is not None:
-                    assert self.speculative_config is not None
-                    bound = self.max_num_reqs * (
-                        1 + self.speculative_config.num_speculative_tokens
-                    )
+                    bound = self._spec_source_bound()
                     if next_tokens_tpu.shape[0] < bound:
                         next_tokens_tpu = torch.nn.functional.pad(
                             next_tokens_tpu, (0, bound - next_tokens_tpu.shape[0])

@@ -78,7 +78,10 @@ class MarkovChainOp:
         anchors = anchors.to(torch.int32).clamp(0, self.words.shape[0] - 1)
         scalars = torch.cat([self.header, anchors])
         out = self.op(scalars, logits, self.words, self.w2_even, self.w2_odd)
-        return out[:, :steps]
+        # A copy, not a view of the kernel's [rows, 128] output: a compiled
+        # program returning the view makes its consumer run a separate
+        # as_strided program to materialize it.
+        return out[:, :steps].contiguous()
 
 
 def _refusal() -> str | None:

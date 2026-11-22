@@ -337,16 +337,22 @@ def compute_num_rejected(
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def spec_chunk_sources(
-    next_tokens: torch.Tensor, drafts: torch.Tensor, draft_lengths: torch.Tensor
+    next_tokens: torch.Tensor,
+    drafts: torch.Tensor,
+    draft_lengths: torch.Tensor,
+    length: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """A bucketed verify chunk's substitution source
-    (`assemble_spec_next_tokens`) and rejected counts (`compute_num_rejected`),
-    the drafts and draft lengths fitted to its ``next_tokens`` rows, as one
-    program: run eagerly, each op was a program of its own."""
+    (`assemble_spec_next_tokens`, appended with zeros to ``length`` when that
+    is longer) and rejected counts (`compute_num_rejected`), the drafts and
+    draft lengths fitted to its ``next_tokens`` rows, as one program: run
+    eagerly, each op was a program of its own."""
     from vllm_torchtpu.spec_decode.utils import fit_rows
 
     rows = next_tokens.shape[0]
     source = assemble_spec_next_tokens(next_tokens, fit_rows(drafts, rows))
+    if length > source.shape[0]:
+        source = torch.nn.functional.pad(source, (0, length - source.shape[0]))
     return source, compute_num_rejected(next_tokens, fit_rows(draft_lengths, rows))
 
 
