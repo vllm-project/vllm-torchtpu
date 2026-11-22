@@ -134,6 +134,9 @@ PATCHES = (
     Patch(
         "vllm_torchtpu.core.preproc_in_wait:patch_preproc_in_wait", ("engine_core",)
     ),
+    # Finished requests freed in the engine core's waits (inert unless
+    # VLLM_TPU_DEFER_FIN): outermost Scheduler free / update / schedule wrappers.
+    Patch("vllm_torchtpu.core.defer_fin:patch_defer_fin", ("engine_core",)),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),

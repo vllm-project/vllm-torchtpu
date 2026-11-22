@@ -406,6 +406,8 @@ if TYPE_CHECKING:
     VLLM_TPU_GC_CENSUS: str = ""
     VLLM_TPU_PREPROC_IN_WAIT: int = 0
     VLLM_TPU_PREPROC_IN_WAIT_AB_MS: int = 0
+    VLLM_TPU_DEFER_FIN: bool = False
+    VLLM_TPU_DEFER_FIN_AB_MS: int = 0
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -2810,6 +2812,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_PREPROC_IN_WAIT_AB_MS": env_nonnegative_int(
         "VLLM_TPU_PREPROC_IN_WAIT_AB_MS", 0
     ),
+    # Engine core: a finished request's KV blocks are freed, and the request
+    # dropped, while the main thread waits on the workers' tokens or an empty
+    # input queue, or at most 2 schedules later (core/defer_fin.py). Host-only.
+    "VLLM_TPU_DEFER_FIN": env_bool("VLLM_TPU_DEFER_FIN", default=False),
+    # Engine core: in-process A/B of VLLM_TPU_DEFER_FIN in wall-clock windows
+    # of this many ms (on in even windows); 0 is off. Host-only.
+    "VLLM_TPU_DEFER_FIN_AB_MS": env_nonnegative_int("VLLM_TPU_DEFER_FIN_AB_MS", 0),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
     "VLLM_TORCHTPU_IPC_KEY": lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),

@@ -345,6 +345,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # New requests built in the engine core's waits (core/preproc_in_wait.py).
     "VLLM_TPU_PREPROC_IN_WAIT",
     "VLLM_TPU_PREPROC_IN_WAIT_AB_MS",
+    # Finished requests freed in the engine core's waits (core/defer_fin.py).
+    "VLLM_TPU_DEFER_FIN",
+    "VLLM_TPU_DEFER_FIN_AB_MS",
     # Host timeline and py-spy windows (runner/host_admit_probe.py).
     "VLLM_TPU_HOSTADMIT_PROBE",
     "VLLM_TPU_HOSTADMIT_PYSPY",
