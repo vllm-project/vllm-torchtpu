@@ -363,6 +363,9 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     TPU_SAMPLER_VERIFY_TRIM: bool = False
     TPU_SAMPLER_VERIFY_TRIM_ROWS: list[int] = []
+    TPU_SAMPLER_VOCAB_PARALLEL_TARGET: bool = False
+    TPU_SAMPLER_VP_RADIX_BITS: int = 3
+    TPU_SAMPLER_VP_UNIFORM_SLICE: bool = False
 
 
 def _positive_int_list(env_name: str) -> list[int]:
@@ -2473,6 +2476,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SAMPLER_VERIFY_TRIM_ROWS": lambda: _positive_int_list(
         "TPU_SAMPLER_VERIFY_TRIM_ROWS"
     ),
+    # Non-greedy speculative verify steps without logprobs, grammar, top_k,
+    # min_p, penalties or logit bias: each rank keeps its own vocabulary shard
+    # of the target logits instead of all-gathering them, and runs the softmax,
+    # the top-p threshold search and the draws on that shard. Only per-row
+    # values cross ranks: the softmax statistics, one all-reduce per radix
+    # round of the threshold search (TPU_SAMPLER_VP_RADIX_BITS), the draft's
+    # probability under real acceptance, and the (value, id) pair of each draw.
+    # Uniforms are the full-vocabulary draws of the default path, sliced to the
+    # shard. Same output distribution; the top-p boundary can move for a token
+    # whose cumulative mass is within rounding of top_p, and bonus tokens are
+    # drawn by the f32 exponential race (bf16 Gumbel-max on the default path).
+    # Read per step: a running engine can turn it off; the precompile warms the
+    # path only when the env var is set at load. Every other step takes the
+    # default path.
+    "TPU_SAMPLER_VOCAB_PARALLEL_TARGET": env_bool("TPU_SAMPLER_VOCAB_PARALLEL_TARGET"),
+    # With TPU_SAMPLER_VOCAB_PARALLEL_TARGET: bits of the top-p threshold
+    # resolved per round, each round one TP all-reduce of f32[2**bits - 1,
+    # rows]. The 30 searched bits take ceil(30 / bits) rounds. 3 (10 rounds)
+    # measured cheapest on tpu7x at 176 rows: a round costs about 12.8 us of
+    # all-reduce plus 1.85 us per candidate threshold.
+    "TPU_SAMPLER_VP_RADIX_BITS": env_positive_int_or_none(
+        "TPU_SAMPLER_VP_RADIX_BITS", 3
+    ),
+    # With TPU_SAMPLER_VOCAB_PARALLEL_TARGET: take each rank's columns of the
+    # full-vocabulary uniforms with a dynamic slice of the last dimension
+    # (torch.ops.tpu.dynamic_slice at the shard's first global id) instead of
+    # viewing the draw as [rows, tp, V/tp]. When V/tp is not a multiple of 128
+    # that view relayouts the whole draw; the slice keeps the [rows, V] layout,
+    # and the in-graph draw's bits-to-f32 convert fuses into it, so it runs on
+    # the shard's columns only. Same uniforms, same output. Read at load.
+    "TPU_SAMPLER_VP_UNIFORM_SLICE": env_bool("TPU_SAMPLER_VP_UNIFORM_SLICE"),
     # With TPU_SAMPLER_FUSED_CHAIN: the fused verify chain draws its three
     # uniforms (bonus_u, accept_u, recover_u) inside the compiled program
     # instead of as six eager programs before it. Dynamo cannot take a

@@ -36,6 +36,7 @@ def _int32_bsearch(
     device: torch.device,
     radix_bits: int = 1,
     skip_bits: int = 0,
+    top_clear_bits: int = 0,
 ) -> torch.Tensor:
     """Batched binary search over int32 values.
 
@@ -59,6 +60,9 @@ def _int32_bsearch(
         (each round is one pass over the predicate's input).
       skip_bits: mask of bits 30..0 the caller has proven the 1-bit search
         never sets (radix_bits == 1 only); their rounds are not run.
+      top_clear_bits: number of top bits (bit 31, then 30, ...) the caller has
+        proven the search leaves clear; the sign evaluation and those bits'
+        rounds are not run, so the search covers bits 31 - top_clear_bits..0.
 
     Returns:
       For each element of the batch, the largest int32 for which the predicate
@@ -66,17 +70,21 @@ def _int32_bsearch(
     """
     current_bits = torch.zeros(batch_shape, dtype=torch.int32, device=device)
     zero = torch.zeros_like(current_bits)
-    sign_bit = torch.full_like(current_bits, -(1 << 31))
 
-    # bit 31 is special, because it compares in the opposite order of all other
-    # bits.
-    current_bits = current_bits | torch.where(predicate(current_bits), sign_bit, zero)
+    if top_clear_bits == 0:
+        sign_bit = torch.full_like(current_bits, -(1 << 31))
+        # bit 31 is special, because it compares in the opposite order of all
+        # other bits.
+        current_bits = current_bits | torch.where(
+            predicate(current_bits), sign_bit, zero
+        )
+    # Bits hi-1..0 remain to be searched.
+    hi = 31 if top_clear_bits == 0 else 32 - top_clear_bits
 
     if radix_bits > 1:
-        # Bits 30..0 in digits of up to radix_bits bits, high digit first.
+        # Bits hi-1..0 in digits of up to radix_bits bits, high digit first.
         # Within a fixed sign bit, int32 order is the order of the low 31 bits,
         # so candidate j of a digit at `shift` is current | (j << shift).
-        hi = 31
         while hi > 0:
             width = min(radix_bits, hi)
             shift = hi - width
@@ -95,7 +103,7 @@ def _int32_bsearch(
 
     for i in range(31):
         bit = 1 << (30 - i)
-        if skip_bits & bit:
+        if skip_bits & bit or bit >= 1 << hi:
             continue
         bit_t = torch.full_like(current_bits, bit)
         midpoint = current_bits | bit
@@ -155,6 +163,7 @@ def _float32_bsearch(
     device: torch.device,
     radix_bits: int = 1,
     skip_bits: int = 0,
+    top_clear_bits: int = 0,
 ) -> torch.Tensor:
     """Binary search on finite float32 numbers.
 
@@ -193,7 +202,9 @@ def _float32_bsearch(
 
     # We search over bit patterns, which requires bit shifting and ordering of
     # bit patterns. This is natively supported on int32 but not on float32.
-    result = _int32_bsearch(batch_shape, int32_predicate, device, radix_bits, skip_bits)
+    result = _int32_bsearch(
+        batch_shape, int32_predicate, device, radix_bits, skip_bits, top_clear_bits
+    )
     return _monotonic_int32_to_float32(result)
 
 
@@ -286,6 +297,40 @@ def _topp_bisect_threshold(
             )
         return result
     return _float32_bsearch(probs.shape[:-1], predicate, probs.device, radix_bits)
+
+
+def vocab_parallel_topp_threshold(
+    probs: torch.Tensor, top_p: torch.Tensor, radix_bits: int
+) -> torch.Tensor:
+    """The top-p threshold of each row from this rank's vocabulary shard.
+
+    ``probs`` is f32 [rows, shard] of softmax probabilities normalised over the
+    full vocabulary, ``top_p`` f32 [rows]. Returns f32 [rows]: the largest t
+    with mass(probs >= t) >= top_p over the whole row, the threshold of
+    `_topp_bisect_threshold`. Each radix round sums the candidate masses over
+    the shard and all-reduces f32[2**radix_bits - 1, rows] across TP.
+
+    Bits 31 and 30 are not searched. Bit 30: the predicate is True at 2.0
+    (mass 0 < top_p, as in `_topp_bisect_threshold`). Bit 31: the predicate
+    at +0.0 is mass(probs >= 0) < top_p, the whole row's mass. When rounding
+    makes that True the full search goes negative, where every threshold
+    keeps every column; here the positive search ends at +0.0, which keeps
+    every column as well (probs >= 0). So the kept set {probs >= t} is the
+    full search's in both cases. Needs top_p > 0.
+    """
+    from vllm.distributed import tensor_model_parallel_all_reduce
+
+    zero_val = torch.zeros_like(probs)
+
+    def predicate(threshold: torch.Tensor) -> torch.Tensor:
+        local_mass = torch.sum(
+            torch.where(probs >= threshold.unsqueeze(-1), probs, zero_val), dim=-1
+        )
+        return tensor_model_parallel_all_reduce(local_mass) < top_p
+
+    return _float32_bsearch(
+        probs.shape[:-1], predicate, probs.device, radix_bits, top_clear_bits=2
+    )
 
 
 def topp_mask(

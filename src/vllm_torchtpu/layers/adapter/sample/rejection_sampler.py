@@ -487,8 +487,6 @@ def _random_rejection_sample_with_segment_impl(
         top_p = top_p[:verify_rows]
         accept_u = accept_u[:verify_rows]
         recover_u = recover_u[:verify_rows]
-    total_tokens = draft_token_ids.shape[0]
-    batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device
     vocab_size = target_logits.shape[-1]
 
@@ -523,17 +521,16 @@ def _random_rejection_sample_with_segment_impl(
     target_token_probs = target_probs.gather(
         -1, safe_draft_token_ids.unsqueeze(-1)
     ).squeeze(-1)
-    if synthetic_mode:
-        assert synthetic_conditional_rates is not None
-        conditional_rates = synthetic_conditional_rates[group_indices.to(torch.int64)]
-        accepted = accept_u < conditional_rates
-    else:
-        accepted = torch.where(
-            is_greedy,
-            draft_token_ids == target_logits_argmax,
-            accept_u < target_token_probs,
-        )
-    accepted = accepted & valid_draft_token_ids
+    accepted = accepted_drafts(
+        draft_token_ids,
+        is_greedy,
+        target_logits_argmax,
+        target_token_probs,
+        accept_u,
+        group_indices,
+        synthetic_conditional_rates,
+        synthetic_mode,
+    )
 
     # On rejection, resample from the residual max(0, p - q). With q a delta at
     # x, subtracting q only touches entry x, so the residual is just p with the
@@ -569,6 +566,69 @@ def _random_rejection_sample_with_segment_impl(
         target_logits_argmax,
         recovered_token_ids,
     )
+    return assemble_rejection_output(
+        draft_token_ids,
+        accepted,
+        recovered_token_ids,
+        num_draft_tokens,
+        bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+    )
+
+
+def accepted_drafts(
+    draft_token_ids: torch.Tensor,
+    is_greedy: torch.Tensor,
+    target_logits_argmax: torch.Tensor,
+    target_token_probs: torch.Tensor | None,
+    accept_u: torch.Tensor,
+    group_indices: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
+) -> torch.Tensor:
+    """The non-greedy accept decision of each draft slot.
+
+    Synthetic acceptance reads only ``accept_u`` and the slot's conditional
+    rate. Otherwise a greedy row accepts the target's argmax and a random row
+    accepts with probability ``target_token_probs`` (the target probability of
+    the draft, after top-k/top-p). A placeholder draft (id < 0) never accepts.
+    """
+    if synthetic_mode:
+        assert synthetic_conditional_rates is not None
+        conditional_rates = synthetic_conditional_rates[group_indices.to(torch.int64)]
+        accepted = accept_u < conditional_rates
+    else:
+        assert target_token_probs is not None
+        accepted = torch.where(
+            is_greedy,
+            draft_token_ids == target_logits_argmax,
+            accept_u < target_token_probs,
+        )
+    return accepted & (draft_token_ids >= 0)
+
+
+def assemble_rejection_output(
+    draft_token_ids: torch.Tensor,
+    accepted: torch.Tensor,
+    recovered_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    """The [batch_size, max_draft_tokens + 1] output of a non-greedy verify.
+
+    Each request keeps its drafts before its first rejected slot, then that
+    slot's recovered token; a request with every draft accepted, or with no
+    drafts, gets its bonus token after them. Padded with
+    PLACEHOLDER_TOKEN_ID.
+    """
+    total_tokens = draft_token_ids.shape[0]
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
 
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     match_mask = segment_ids.unsqueeze(0) == batch_indices

@@ -474,20 +474,8 @@ def vocab_parallel_argmax(
     local argmax is the first maximum within the shard, and the cross-rank
     argmax is the first maximal rank, i.e. the lowest global id.
     """
-    from vllm.distributed import tensor_model_parallel_all_gather
-
-    rows, width = local_logits.shape
-    if info.num_org_local < width:
-        pos = torch.arange(width, device=local_logits.device)
-        local_logits = torch.where(
-            pos < info.num_org_local,
-            local_logits,
-            torch.tensor(
-                float("-inf"), dtype=local_logits.dtype, device=local_logits.device
-            ),
-        )
-    local_idx = torch.argmax(local_logits, dim=-1, keepdim=True)
-    local_max = torch.gather(local_logits, -1, local_idx)
+    rows = local_logits.shape[0]
+    local_max, local_idx = _local_max(local_logits, info)
     if info.slot is not None and local_logits.dtype == torch.bfloat16:
         # bf16 holds every bf16 logit and every integer up to 256, so the id
         # rides as three base-256 digits (vocab < 2**24).
@@ -513,13 +501,52 @@ def vocab_parallel_argmax(
             .to(torch.int32)
         )
         return d[:, 0] * 65536 + d[:, 1] * 256 + d[:, 2]
+    return _exchange_max_pairs(local_max, local_idx, info)[1]
+
+
+def vocab_parallel_max_argmax(
+    local_values: torch.Tensor, info: VocabParallelArgmax
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The full-vocab max (f32 [rows]) and its id (int32 [rows]) from this
+    rank's [rows, V/tp] f32 shard, by the f32 pair exchange of
+    `vocab_parallel_argmax`: ties go to the lowest global id."""
+    local_max, local_idx = _local_max(local_values, info)
+    return _exchange_max_pairs(local_max, local_idx, info)
+
+
+def _local_max(
+    local: torch.Tensor, info: VocabParallelArgmax
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The first maximum of each row of a shard and its local index ([rows,
+    1] each); padding columns never win."""
+    width = local.shape[-1]
+    if info.num_org_local < width:
+        pos = torch.arange(width, device=local.device)
+        local = torch.where(
+            pos < info.num_org_local,
+            local,
+            torch.tensor(float("-inf"), dtype=local.dtype, device=local.device),
+        )
+    local_idx = torch.argmax(local, dim=-1, keepdim=True)
+    return torch.gather(local, -1, local_idx), local_idx
+
+
+def _exchange_max_pairs(
+    local_max: torch.Tensor, local_idx: torch.Tensor, info: VocabParallelArgmax
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-gathers each rank's (max, global id) of every row ([rows, 1] each)
+    and keeps the first maximal rank, which owns the lowest ids."""
+    from vllm.distributed import tensor_model_parallel_all_gather
+
+    rows = local_max.shape[0]
     # f32 holds every vocab id exactly (< 2**24) and every bf16 logit.
     pair = torch.cat(
         [local_max.float(), (local_idx + info.org_vocab_start).float()], dim=-1
     )
     gathered = tensor_model_parallel_all_gather(pair, dim=0).view(info.tp_size, rows, 2)
     best_rank = torch.argmax(gathered[..., 0], dim=0, keepdim=True)
-    return torch.gather(gathered[..., 1], 0, best_rank).view(rows).to(torch.int32)
+    best = torch.gather(gathered, 0, best_rank.unsqueeze(-1).expand(1, rows, 2))
+    return best[0, :, 0], best[0, :, 1].to(torch.int32)
 
 
 class ColumnParallelEhProj(torch.nn.Module):
