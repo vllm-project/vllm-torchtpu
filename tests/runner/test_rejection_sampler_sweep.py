@@ -296,12 +296,12 @@ def test_check_flags_an_op_outside_aten():
 
 
 @pytest.mark.parametrize("rank", [0, 3])
-def test_fused_verify_warms_outside_the_rotated_sweep(monkeypatch, rank):
-    """`synthetic_verify_and_sample` holds the LM head's and the sampler's
-    collectives, so it must not warm inside the rotated sweep (on TPU that
-    paired one rank's all-to-all with another shape's on its peers and halted
-    the SparseCore, c16 j-6314aa0e): every rank warms it after the sweep, in
-    bucket order."""
+def test_collective_warmups_run_outside_the_rotated_sweep(monkeypatch, rank):
+    """The row-split sampler (an all-gather) and `synthetic_verify_and_sample`
+    (the LM head's and the sampler's collectives) must not warm inside the
+    rotated sweep: on TPU that paired one rank's collective with another
+    shape's on its peers and halted the SparseCore (c16, j-6314aa0e). Every
+    rank warms them after the sweep, in bucket order."""
     monkeypatch.setattr(tpu_runner.envs, "TPU_SPEC_SYNTHETIC_FUSED_VERIFY", True)
     monkeypatch.setattr(tpu_runner.envs, "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY", True)
     monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda out: None)
@@ -309,10 +309,17 @@ def test_fused_verify_warms_outside_the_rotated_sweep(monkeypatch, rank):
     monkeypatch.setenv(FLAG, "1")
     runner, _ = _runner()
     runner.rejection_sampler.synthetic_mode = True
-    order = []
-    runner._precompile_synthetic_verify = lambda draft, *a: order.append(
-        ("sweep", draft.shape[0], a[3].shape[0])
+    runner._synthetic_rows_split = lambda num_reqs: num_reqs >= 64
+    runner._synthetic_warm_inputs = functools.partial(
+        TPUModelRunner._synthetic_warm_inputs, runner
     )
+    order = []
+
+    def verify(draft, *args, in_rotated_sweep=True):
+        where = "sweep" if in_rotated_sweep else "split"
+        order.append((where, draft.shape[0], args[3].shape[0]))
+
+    runner._precompile_synthetic_verify = verify
     runner._precompile_synthetic_fused_verify = lambda t, r: order.append(
         ("fused", t, r)
     )
@@ -321,5 +328,10 @@ def test_fused_verify_warms_outside_the_rotated_sweep(monkeypatch, rank):
     swept = [o[1:] for o in order if o[0] == "sweep"]
     start = rank * len(PAIRS) // 8
     assert swept == PAIRS[start:] + PAIRS[:start]
-    fits = [p for p in PAIRS if rs.synthetic_uniforms_fit(*p)]
-    assert order[len(swept) :] == [("fused", *p) for p in fits]
+    after = []
+    for num_tokens, num_reqs in PAIRS:
+        if num_reqs >= 64:
+            after.append(("split", num_tokens, num_reqs))
+        if rs.synthetic_uniforms_fit(num_tokens, num_reqs):
+            after.append(("fused", num_tokens, num_reqs))
+    assert order[len(swept) :] == after

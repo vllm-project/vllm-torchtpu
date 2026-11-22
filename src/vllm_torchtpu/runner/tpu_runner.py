@@ -7450,17 +7450,45 @@ class TPUModelRunner(GPUModelRunner):
                     num_reqs,
                 )
         if (
-            envs.TPU_SPEC_SYNTHETIC_FUSED_VERIFY
-            and envs.TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY
+            envs.TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY
             and self.rejection_sampler.synthetic_mode
         ):
-            # Its LM head and sampler hold collectives, so every rank walks the
-            # shapes in one order: the rotated sweep above would pair one rank's
-            # collective with another shape's on its peers.
-            with self._precompile_timed("synthetic fused verify"):
+            # The row-split sampler and the fused verify hold collectives, so
+            # every rank walks their shapes in one order: the rotated sweep
+            # above would pair one rank's collective with another shape's on
+            # its peers (a SparseCore halt at c16, twin j-6314aa0e).
+            with self._precompile_timed("synthetic verify collectives"):
                 for num_tokens, num_reqs in bucket_order:
-                    if synthetic_uniforms_fit(num_tokens, num_reqs):
+                    if self._synthetic_rows_split(num_reqs):
+                        self._precompile_synthetic_verify(
+                            *self._synthetic_warm_inputs(num_tokens, num_reqs),
+                            in_rotated_sweep=False,
+                        )
+                    if envs.TPU_SPEC_SYNTHETIC_FUSED_VERIFY and (
+                        synthetic_uniforms_fit(num_tokens, num_reqs)
+                    ):
                         self._precompile_synthetic_fused_verify(num_tokens, num_reqs)
+
+    def _synthetic_warm_inputs(
+        self, num_tokens: int, num_reqs: int
+    ) -> tuple[torch.Tensor, ...]:
+        """`_precompile_synthetic_verify`'s token inputs at one
+        (padded_logits_length, padded_num_reqs) pair, in
+        get_spec_decode_metadata's dtypes: draft ids, target rows, segment
+        ids, group indices, draft lengths, bonus rows, accept uniforms."""
+
+        def zeros(n: int, dtype: torch.dtype) -> torch.Tensor:
+            return torch.zeros(n, dtype=dtype).to(self.device)
+
+        return (
+            zeros(num_tokens, torch.int32),
+            zeros(num_tokens, torch.int32),
+            zeros(num_tokens, torch.int64),
+            zeros(num_tokens, torch.int32),
+            zeros(num_reqs, torch.int32),
+            zeros(num_reqs, torch.int32),
+            zeros(num_tokens, torch.float32),
+        )
 
     def _synthetic_sampler_variants(self) -> list[dict]:
         """The synthetic sampler's static-argument variants a step can pick
@@ -7483,12 +7511,15 @@ class TPUModelRunner(GPUModelRunner):
         draft_lengths: torch.Tensor,
         bonus_logits_indices: torch.Tensor,
         warm_accept_u: torch.Tensor,
+        in_rotated_sweep: bool = True,
     ) -> None:
         """The synthetic one-row verify (`_plan_synthetic_verify`,
         `_sample_synthetic_verify`) at one (padded_logits_length,
         padded_num_reqs) pair, in every sampler variant the step can pick.
         Its logits come from compute_selected_logits at padded_num_reqs rows,
-        which `_precompile_compute_selected_logits` warms."""
+        which `_precompile_compute_selected_logits` warms. In the rotated
+        sweep the row-split sampler (an all-gather) is left to the pass after
+        it (`_precompile_rejection_sampler`)."""
         assert self.rejection_sampler is not None
         assert self.rejection_sampler.synthetic_conditional_rates is not None
         assert self.speculative_config is not None
@@ -7526,7 +7557,10 @@ class TPUModelRunner(GPUModelRunner):
         top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
         variants = self._synthetic_sampler_variants()
         # The step samples on one path per shape, with this shape's draw.
-        if self._synthetic_rows_split(num_reqs):
+        split = self._synthetic_rows_split(num_reqs)
+        if split and in_rotated_sweep:
+            return
+        if split:
             from vllm.distributed import get_tensor_model_parallel_world_size
 
             assert self._synthetic_shard is not None
@@ -7586,15 +7620,15 @@ class TPUModelRunner(GPUModelRunner):
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
 
-        def zeros(n: int, dtype: torch.dtype) -> torch.Tensor:
-            return torch.zeros(n, dtype=dtype).to(self.device)
-
-        draft_token_ids = zeros(num_tokens, torch.int32)
-        target_logits_indices = zeros(num_tokens, torch.int32)
-        segment_ids = zeros(num_tokens, torch.int64)
-        group_indices = zeros(num_tokens, torch.int32)
-        draft_lengths = zeros(num_reqs, torch.int32)
-        bonus_logits_indices = zeros(num_reqs, torch.int32)
+        (
+            draft_token_ids,
+            target_logits_indices,
+            segment_ids,
+            group_indices,
+            draft_lengths,
+            bonus_logits_indices,
+            _,
+        ) = self._synthetic_warm_inputs(num_tokens, num_reqs)
         uniforms = torch.zeros(
             self._synthetic_uniforms_shape(num_reqs), dtype=torch.float32
         ).to(self.device)
