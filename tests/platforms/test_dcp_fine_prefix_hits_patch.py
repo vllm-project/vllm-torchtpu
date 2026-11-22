@@ -65,11 +65,19 @@ def patched(monkeypatch):
         cls, "find_longest_cache_hit", inspect.unwrap(cls.find_longest_cache_hit)
     )
     monkeypatch.setattr(cls, "_tpu_dcp_fine_prefix_patch", False, raising=False)
-    monkeypatch.setattr(
-        kv_cache_utils,
-        "resolve_kv_cache_block_sizes",
-        inspect.unwrap(kv_cache_utils.resolve_kv_cache_block_sizes),
-    )
+    resolve = inspect.unwrap(kv_cache_utils.resolve_kv_cache_block_sizes)
+    monkeypatch.setattr(kv_cache_utils, "resolve_kv_cache_block_sizes", resolve)
+    # The scheduler tests build a VllmConfig, which activates the TPU platform
+    # and so applies the hybrid PCP patch on top of this resolver. Restore that
+    # patch's marker and saved resolver too, or a later test finds it marked
+    # applied while upstream's resolver is back in place.
+    for name, default in (
+        ("_tpu_hybrid_pcp_block_sizes_patch", False),
+        ("_tpu_original_resolve_kv_cache_block_sizes", resolve),
+    ):
+        monkeypatch.setattr(
+            kv_cache_utils, name, getattr(kv_cache_utils, name, default), raising=False
+        )
     _patch_vllm_dcp_fine_prefix_hits()
 
 
