@@ -22,6 +22,21 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_DCP_PREFILL_TOKEN_PARALLEL: bool = True
+    TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT: bool = True
+    TPU_DCP_TP_FUSED_WUV_EPILOGUE: bool = True
+    TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP: int = 0
+    TPU_DCP_TP_IN_BRANCH_QB_LAYERNORM: bool = True
+    TPU_DCP_TP_IN_BRANCH_QB_MLA: bool = True
+    TPU_DCP_TP_PREFILL_LOCAL_OPROJ: bool = True
+    TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES: bool = True
+    TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES: bool = True
+    TPU_DCP_TP_SHARDED_KV_WRITE: bool = True
+    TPU_DCP_TP_SHARDED_INDEXER_K: bool = False
+    TPU_DCP_TP_UNIFIED_IN_BRANCH_LEAD_INDEXER: bool = True
+    TPU_DCP_TP_UNIFIED_INDEXER_IN_BRANCH_QB: bool = True
+    TPU_DCP_TP_UNIFIED_INDEXER_MLA: bool = True
+    TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP: int = 0
+    TPU_DCP_TP_ZIGZAG_BANDS: int = 4
     TPU_MLA_DECODE_LOCAL_Q_AG: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = True
@@ -51,6 +66,10 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SEND_GROUP_ROWS: int = 8
     TPU_DCP_MLA_SEND_SMALL_A2A: bool = True
     TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS: int = 8
+    TPU_MLA_FUSED_QB_ROPE_ABSORB: bool = True
+    TPU_MLA_SPLIT_QKV_A_PROJ: bool = True
+    TPU_MLA_SPLIT_QKV_A_CHUNK: int = 1024
+    TPU_MLA_SPLIT_W_UK_T: bool = True
     TPU_MLA_FUSED_SMALL_A2A: bool = True
     TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB: int = 16
     TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS: int = 8
@@ -109,8 +128,11 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_PREFILL_SEQUENCE_PARALLEL: bool = True
+    TPU_MOE_PREFILL_SP_DEFER_FINAL_AG: bool = True
     TPU_MOE_PREFILL_SP_SHARED_GROUP: int = 1
     TPU_MOE_PREFILL_SP_FP8_WIRE: bool = True
+    TPU_EMBED_REPLICATED: bool = True
+    TPU_EMBED_REPLICATED_DECODE: bool = True
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -265,6 +287,8 @@ if TYPE_CHECKING:
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
     VLLM_TPU_DEBUG_PCP_LAYOUT: bool = False
     TPU_LOCAL_RANK_OFFSET: int = 0
+    TPU_ASCENDING_DEVICE_ORDER: str = "auto"
+    TPU_PHYSICAL_LOCAL_RANK: int | None = None
     VLLM_TPU_DEVICE_ORDER: str = ""
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
     TORCH_TPU_BASE_PORT: int = 8070
@@ -675,6 +699,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS": env_int(
         "TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS", 1
     ),
+    # Fuse token-parallel prefill FP8 q_b_proj + NeoX q_pe RoPE + W_UK_T
+    # absorb_q_split in a single VMEM Pallas kernel (no HBM [T, H*(d_nope+d_pe)]
+    # intermediate). Bit-exact vs the unfused chain; 0 extra HBM.
+    "TPU_MLA_FUSED_QB_ROPE_ABSORB": env_bool(
+        "TPU_MLA_FUSED_QB_ROPE_ABSORB", default=True
+    ),
+    # Split each MLA fused_qkv_a_proj FP8 weight column-wise into independent
+    # contiguous device buffers (q_a chunks of TPU_MLA_SPLIT_QKV_A_CHUNK plus
+    # kv_a) and drop the monolithic buffer after load (0 extra HBM). Lets the
+    # compiler prefetch smaller tiles independently without displacing other
+    # per-layer decode weights from VMEM.
+    "TPU_MLA_SPLIT_QKV_A_PROJ": env_bool("TPU_MLA_SPLIT_QKV_A_PROJ", default=True),
+    "TPU_MLA_SPLIT_QKV_A_CHUNK": env_int("TPU_MLA_SPLIT_QKV_A_CHUNK", 1024),
+    # Split gathered W_UK_T_dcp_qrep [H, d_nope, L] into two equal head-axis
+    # device buffers [H/2, d_nope, L] after load (0 extra HBM) so decode
+    # absorb_q prefetches two smaller tensors independently alongside qkv_a.
+    "TPU_MLA_SPLIT_W_UK_T": env_bool("TPU_MLA_SPLIT_W_UK_T", default=True),
     # With TPU_MLA_FUSED_SMALL_A2A: peers push into a VMEM receive scratch and
     # the kernel also runs the DCP merge (the unpack + `_merge_received`, term
     # by term), so the op returns the merged [T, L, V] -- no receive buffer, no
@@ -830,6 +871,106 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gathered KV and index-K pages (`kernels/mla/dcp_token_parallel.py`).
     "TPU_DCP_PREFILL_TOKEN_PARALLEL": env_bool(
         "TPU_DCP_PREFILL_TOKEN_PARALLEL", default=True
+    ),
+    # With TPU_DCP_PREFILL_TOKEN_PARALLEL and TPU_MOE_PREFILL_SEQUENCE_PARALLEL:
+    # each rank's token-parallel rows already hold every head, so run the whole
+    # o_proj on them and land on the sequence-parallel rows directly, skipping
+    # the all-to-all back to heads and o_proj's reduce-scatter
+    # (`dcp_token_parallel.project_sequence_rows`): the op all-gathers o_proj's
+    # FP8 row shards per layer (weights only, so XLA can issue it early).
+    "TPU_DCP_TP_PREFILL_LOCAL_OPROJ": env_bool(
+        "TPU_DCP_TP_PREFILL_LOCAL_OPROJ", default=True
+    ),
+    # With TPU_DCP_TP_PREFILL_LOCAL_OPROJ: each rank keeps half of o_proj's FP8
+    # row shards (the half its chip partner does not), so a step swaps halves
+    # between the two cores of a chip with one ppermute instead of
+    # all-gathering every shard over ICI. Costs half an o_proj per layer of
+    # HBM.
+    "TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES": env_bool(
+        "TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES", default=True
+    ),
+    # With TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES: keep the halves from o_proj
+    # quantized once per output channel over the whole K (the FP8 loader's
+    # DCP-gathered rows) so both halves share one scale and contract FP8 x FP8
+    # against the per-row FP8 activation, as the other per-channel FP8
+    # linears do, instead of bf16 against per-shard dequantized weights.
+    "TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES": env_bool(
+        "TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES", default=True
+    ),
+    # With TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES: keep W_UV outputs in head-major
+    # [H, R, V] layout across the cap switch and run a single-pass Pallas VMEM
+    # shift+FP8-quant+pair-split kernel inside the attention shard_map, avoiding
+    # the [H, R, V] -> [R, H*V] HBM transpose and inter-shard_map barrier.
+    "TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT": env_bool(
+        "TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT", default=True
+    ),
+    # With TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT and zigzag_bands > 1: emit
+    # chunked head-major [H, chunk, L] MLA latent outputs directly into a fused
+    # Pallas W_UV + FP8 row-quant + pair-half split kernel (zero concat/transpose).
+    "TPU_DCP_TP_FUSED_WUV_EPILOGUE": env_bool(
+        "TPU_DCP_TP_FUSED_WUV_EPILOGUE", default=True
+    ),
+    # With TPU_DCP_TP_PREFILL_LOCAL_OPROJ and TPU_MOE_PREFILL_SEQUENCE_PARALLEL:
+    # keep kv_lora sequence-sharded across kv_a_layernorm, k_pe RoPE, and FP8
+    # quantization, then route packed KV bytes directly to their DCP owner via
+    # all_to_all instead of all-gathering bf16 kv_lora to every rank.
+    "TPU_DCP_TP_SHARDED_KV_WRITE": env_bool(
+        "TPU_DCP_TP_SHARDED_KV_WRITE", default=True
+    ),
+    # Gate sequence-sharded indexer wk_weights_proj + all-to-all K cache write
+    # (off by default to keep large-bucket compilation time bounded).
+    "TPU_DCP_TP_SHARDED_INDEXER_K": env_bool(
+        "TPU_DCP_TP_SHARDED_INDEXER_K", default=False
+    ),
+    # Number of alternating forward/reverse sequence-parallel bands per rank for
+    # token-parallel DCP prefill (1 = contiguous sharding; even >= 2, e.g. 4,
+    # interleaves band blocks in dual-zigzag order across all layers so every
+    # rank shares identical causal load without per-layer ppermute collectives).
+    "TPU_DCP_TP_ZIGZAG_BANDS": env_int("TPU_DCP_TP_ZIGZAG_BANDS", 4),
+    # Maximum gather cap inside the in-branch q_b + sparse MLA op at which
+    # fused_qb runs without a post-gather_latent barrier. Default 0 keeps the
+    # barrier enabled on all caps >= 4: with fused 3-D gather_latent folding
+    # rope into nope, even cap=4 (9.0 MiB) offloads to SparseCore, so dropping
+    # the barrier adds SparseCore contention behind lead_mla.
+    "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP": env_int(
+        "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP", 0
+    ),
+    # With TPU_DCP_TP_IN_BRANCH_QB_MLA on non-indexer layers: move q_a_layernorm
+    # inside the token-parallel cap switch right before fused q_b so the latent
+    # page gather all-gather starts without waiting on RMSNorm.
+    "TPU_DCP_TP_IN_BRANCH_QB_LAYERNORM": env_bool(
+        "TPU_DCP_TP_IN_BRANCH_QB_LAYERNORM", default=True
+    ),
+    # With TPU_DCP_TP_PREFILL_LOCAL_OPROJ and query replication on non-indexer
+    # layers: defer fused q_b_proj + RoPE + absorb_q and lead MLA inside the
+    # token-parallel cap switch so pure-TC q_b overlaps gather_latent/Chunk-0.
+    "TPU_DCP_TP_IN_BRANCH_QB_MLA": env_bool(
+        "TPU_DCP_TP_IN_BRANCH_QB_MLA", default=True
+    ),
+    # With TPU_DCP_TP_UNIFIED_INDEXER_IN_BRANCH_QB and histogram-merge DCP
+    # lead top-k: defer the leading split_rows indexer pass inside the unified
+    # cap-switch branch so its SparseCore top-k overlaps the index-K all-gather
+    # and StreamIdxTC tail chunks.
+    "TPU_DCP_TP_UNIFIED_IN_BRANCH_LEAD_INDEXER": env_bool(
+        "TPU_DCP_TP_UNIFIED_IN_BRANCH_LEAD_INDEXER", default=True
+    ),
+    # With TPU_DCP_TP_UNIFIED_INDEXER_MLA and query replication on indexer
+    # layers: defer fused q_b_proj + RoPE + absorb_q and lead MLA inside the
+    # unified cap-switch branch so pure-TC q_b overlaps SC top-k and gathers.
+    "TPU_DCP_TP_UNIFIED_INDEXER_IN_BRANCH_QB": env_bool(
+        "TPU_DCP_TP_UNIFIED_INDEXER_IN_BRANCH_QB", default=True
+    ),
+    # With TPU_DCP_TP_PREFILL_LOCAL_OPROJ and query replication on indexer
+    # layers: run token-parallel indexer top-k and sparse MLA inside one shared
+    # cap-switch branch so context KV page gathers overlap StreamIdxTC.
+    "TPU_DCP_TP_UNIFIED_INDEXER_MLA": env_bool(
+        "TPU_DCP_TP_UNIFIED_INDEXER_MLA", default=True
+    ),
+    # Maximum gather cap inside the unified indexer+MLA branch at which
+    # gather_latent is ordered after StreamIdxTC to avoid small-cap SC/TC
+    # contention; 0 keeps gather_latent free on all caps.
+    "TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP": env_int(
+        "TPU_DCP_TP_UNIFIED_TIE_AFTER_IDX_MAX_CAP", 0
     ),
     # Decode local-Q projection under query-replicated DCP: compute each rank's
     # local head-slice columns via the fused FP8 column-window matmul + 1-round
@@ -1139,6 +1280,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_PREFILL_SEQUENCE_PARALLEL": env_bool(
         "TPU_MOE_PREFILL_SEQUENCE_PARALLEL", default=True
     ),
+    # Under TPU_MOE_PREFILL_SEQUENCE_PARALLEL: return the rank-local final
+    # hidden states from the backbone instead of all-gathering the full step
+    # tensor, and gather only the selected logits rows (<= max_num_reqs) via
+    # masked all-reduce inside compute_selected_logits / top_tokens.
+    "TPU_MOE_PREFILL_SP_DEFER_FINAL_AG": env_bool(
+        "TPU_MOE_PREFILL_SP_DEFER_FINAL_AG", default=True
+    ),
     # Tensor-parallel subgroup size for the shared expert under
     # TPU_MOE_PREFILL_SEQUENCE_PARALLEL (1 replicates per rank).
     "TPU_MOE_PREFILL_SP_SHARED_GROUP": env_int("TPU_MOE_PREFILL_SP_SHARED_GROUP", 1),
@@ -1146,6 +1294,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_MOE_PREFILL_SEQUENCE_PARALLEL.
     "TPU_MOE_PREFILL_SP_FP8_WIRE": env_bool(
         "TPU_MOE_PREFILL_SP_FP8_WIRE", default=True
+    ),
+    # Under TPU_MOE_PREFILL_SEQUENCE_PARALLEL: all-gather the vocab-parallel
+    # embedding table at load and look tokens up locally, instead of the
+    # reduce-scatter (prefill) / all-reduce (decode) of shard partials
+    # (`layers/adapter/replicated_embedding.py`; + the table per rank).
+    "TPU_EMBED_REPLICATED": env_bool("TPU_EMBED_REPLICATED", default=True),
+    # With TPU_EMBED_REPLICATED armed: decode buckets also read the replica
+    # (rows zeroed outside the vocabulary, as the masked shard lookup gives)
+    # instead of the masked shard lookup + all-reduce.
+    "TPU_EMBED_REPLICATED_DECODE": env_bool(
+        "TPU_EMBED_REPLICATED_DECODE", default=True
     ),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
@@ -1858,6 +2017,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Added to every worker's local rank when it binds to a physical chip.
     # worker/tpu_rank_binding.py reads it from the env mapping it is given.
     "TPU_LOCAL_RANK_OFFSET": env_int("TPU_LOCAL_RANK_OFFSET", 0),
+    # Align global ranks 0..N-1 to physical TPU global device IDs 0..N-1.
+    # "auto" enables when DCP > 1 (and PCP == DP == PP == 1); "1"/"0" force on/off.
+    "TPU_ASCENDING_DEVICE_ORDER": lambda: os.getenv(
+        "TPU_ASCENDING_DEVICE_ORDER", "auto"
+    ),
+    # Per-worker physical LOCAL_RANK override assigned by RayDistributedExecutorV2
+    # when ascending device ordering is active; unset uses engine local_rank.
+    "TPU_PHYSICAL_LOCAL_RANK": env_optional_int("TPU_PHYSICAL_LOCAL_RANK"),
     # Physical device index per local rank ("0,2,1,3,4,6,5,7"); empty = native.
     "VLLM_TPU_DEVICE_ORDER": lambda: os.getenv("VLLM_TPU_DEVICE_ORDER", ""),
     # Same offset for the legacy worker init path; debug only.
