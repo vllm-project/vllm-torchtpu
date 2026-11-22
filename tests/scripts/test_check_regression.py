@@ -631,6 +631,16 @@ _TASK_FILTER_HINT = (
 )
 
 
+def _assert_usage_error(monkeypatch, capsys, argv, error):
+    """The command line exits 2 with `error` as its only message."""
+    with pytest.raises(SystemExit) as exc_info:
+        _run_cli(monkeypatch, *argv)
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.endswith(f"check_regression.py: error: {error}\n")
+
+
 def test_calibrate_eval_rejects_bad_runs(tmp_path, monkeypatch, capsys):
     good = _write_eval_run(tmp_path / "good", {"mmlu_pro": {"acc,none": 0.5}})
     other = _write_eval_run(tmp_path / "other", {"mbpp": {"acc,none": 0.5}})
@@ -868,6 +878,50 @@ def test_cli_update_mode(tmp_path, monkeypatch, capsys):
     new_file.write_text(json.dumps({**_RAISED, "_policy": {"state": "frozen"}}))
     assert _run_cli(monkeypatch, *argv, "--previous-baseline", str(old_file)) == 2
     assert "ERROR: _policy.owner must be a non-empty string" in capsys.readouterr().err
+
+
+# What each mode needs after the flags that select it; BASELINE and RESULTS
+# stand for real paths.
+_UPDATE = "--mode update"
+_MODE_ARGS = {
+    _UPDATE: ["--baseline", "BASELINE"],
+    "--mode perf": ["--results-dir", "RESULTS", "--baseline", "BASELINE"],
+    "--mode eval": ["--results-dir", "RESULTS", "--baseline", "BASELINE"],
+    "--mode perf --calibrate": ["--results-dir", "RESULTS"],
+    "--mode eval --calibrate": ["--results-dir", "RESULTS"],
+}
+_RESULT_MODES = [mode for mode in _MODE_ARGS if mode != _UPDATE]
+# (mode, flags it does not take, the flags the error names)
+_NOT_VALID_CASES = [
+    (_UPDATE, ["--calibrate"], "--calibrate"),
+    (_UPDATE, ["--tolerance", "0.1"], "--tolerance"),
+    (_UPDATE, ["--results-dir", "RESULTS"], "--results-dir"),
+    (_UPDATE, ["--task-filter", "mmlu_pro"], "--task-filter"),
+    # 0 is a real value of this flag, not "flag not given".
+    (_UPDATE, ["--gate-ttft-max-concurrency", "0"], "--gate-ttft-max-concurrency"),
+    (_UPDATE, ["--tolerance", "0.1", "--calibrate"], "--calibrate, --tolerance"),
+    *[
+        (mode, ["--previous-baseline", "BASELINE"], "--previous-baseline")
+        for mode in _RESULT_MODES
+    ],
+]
+
+
+@pytest.mark.parametrize(
+    ("mode", "flags", "named"),
+    _NOT_VALID_CASES,
+    ids=[f"{mode} {' '.join(flags)}" for mode, flags, _ in _NOT_VALID_CASES],
+)
+def test_cli_rejects_flags_the_mode_does_not_take(
+    tmp_path, monkeypatch, capsys, mode, flags, named
+):
+    """A flag given to a mode that does not take it is a usage error."""
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(_TASK))
+    results = _write_eval_run(tmp_path / "results", _TASK)
+    paths = {"BASELINE": str(baseline), "RESULTS": str(results)}
+    argv = [paths.get(arg, arg) for arg in mode.split() + _MODE_ARGS[mode] + flags]
+    _assert_usage_error(monkeypatch, capsys, argv, f"{named}: not valid with {mode}")
 
 
 @pytest.mark.parametrize("content", [None, "[]", "{not json"])

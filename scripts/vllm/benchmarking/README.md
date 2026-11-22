@@ -174,6 +174,10 @@ block. A file without the block is in `development`.
 `1` when a frozen baseline changed without approval and `2` when the `_policy`
 block is malformed.
 
+Update mode takes only `--baseline` and `--previous-baseline`, and `perf` and
+`eval` modes do not take `--previous-baseline`. A flag given to a mode that
+does not take it is a usage error (exit `2`).
+
 ```bash
 git show origin/main:<baseline path> > /tmp/previous.baseline.json
 python3 scripts/vllm/benchmarking/check_regression.py \

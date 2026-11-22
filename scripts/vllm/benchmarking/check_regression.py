@@ -594,6 +594,23 @@ def calibrate_eval(
     return baseline
 
 
+# The argparse destinations each mode takes; perf and eval modes share theirs.
+# A flag given to a mode that does not take it is a usage error, not a setting
+# that is silently ignored.
+UPDATE_MODE_ARGS = frozenset({"mode", "baseline", "previous_baseline"})
+RESULT_MODE_ARGS = frozenset(
+    {
+        "mode",
+        "results_dir",
+        "baseline",
+        "tolerance",
+        "calibrate",
+        "task_filter",
+        "gate_ttft_max_concurrency",
+    }
+)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -643,6 +660,20 @@ def main() -> int:
         "0 ungates TTFT for every cell.",
     )
     args = parser.parse_args()
+
+    accepted = UPDATE_MODE_ARGS if args.mode == "update" else RESULT_MODE_ARGS
+    # A flag whose value equals its default counts as not given.
+    rejected = sorted(
+        dest
+        for dest, value in vars(args).items()
+        if dest not in accepted and value != parser.get_default(dest)
+    )
+    if rejected:
+        flags = ", ".join("--" + dest.replace("_", "-") for dest in rejected)
+        selected = f"--mode {args.mode}"
+        if args.calibrate and args.mode != "update":
+            selected += " --calibrate"
+        parser.error(f"{flags}: not valid with {selected}")
 
     if args.mode == "update":
         if args.baseline is None:
