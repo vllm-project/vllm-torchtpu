@@ -32,9 +32,13 @@ def test_matches_xla_gate_within_one_rounding(tokens, masked):
     ref = eg.engram_gate_reference(hidden, kv, q, k, mask, eps=EPS, clamp=CLAMP)
     assert got.shape == ref.shape and got.dtype == ref.dtype
     got32, ref32 = np.asarray(got, np.float32), np.asarray(ref, np.float32)
-    # Only the sums over D are reassociated: at most one BF16 step apart, rarely.
-    step = np.abs(ref32) * 2.0**-7 + 1e-30
-    assert np.all(np.abs(got32 - ref32) <= step)
+    # Reassociated sums and Mosaic transcendentals move the FP32 gate by a few
+    # ulps: the output is at most one BF16 step off, plus that FP32 slack where
+    # stream and gated value cancel.
+    value = np.asarray(kv[:, M * D :], np.float32)
+    operands = np.abs(np.asarray(hidden, np.float32)) + np.tile(np.abs(value), M)
+    bound = np.abs(ref32) * 2.0**-7 + operands * 1e-5
+    assert np.all(np.abs(got32 - ref32) <= bound)
     assert np.mean(got32 != ref32) < 1e-3
     if masked:
         closed = ~np.asarray(mask)

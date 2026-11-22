@@ -5,8 +5,9 @@ One pass over the flat ``[T, M*D]`` residual. For each stream ``m`` it
 computes the normalized dot of the stream against its key, the signed-sqrt
 sigmoid gate, and ``stream + gate * value``. This is the arithmetic of
 ``Engram.forward`` (and of upstream's fused CUDA kernel): FP32 math on BF16
-inputs, one BF16 rounding of the output. Only the order of the three
-per-stream sums over ``D`` differs from the XLA reductions.
+inputs, one BF16 rounding of the output. The order of the three per-stream
+sums over ``D`` and Mosaic's lowering of rsqrt, sqrt and sigmoid differ from
+XLA's, so an output can differ by one BF16 rounding step.
 """
 
 import functools
@@ -56,8 +57,8 @@ def _gate_kernel(
         for c in range(0, dim, columns):
             hidden = hidden_ref[:, pl.ds(m * dim + c, columns)].astype(jnp.float32)
             key = kv_ref[:, pl.ds(m * dim + c, columns)].astype(jnp.float32)
-            q = q_ref[pl.ds(m, 1), pl.ds(c, columns)]
-            k = k_ref[pl.ds(m, 1), pl.ds(c, columns)]
+            q = q_ref[:, pl.ds(c, columns)].astype(jnp.float32)[m : m + 1]
+            k = k_ref[:, pl.ds(c, columns)].astype(jnp.float32)[m : m + 1]
             dot = dot + lane_sum(hidden * q * k * key)
             hidden_squares = hidden_squares + lane_sum(hidden * hidden)
             key_squares = key_squares + lane_sum(key * key)
@@ -104,6 +105,8 @@ def engram_gate(
         [T, M*D] in ``hidden.dtype``.
     """
     tokens, width = hidden.shape
+    if tokens == 0:
+        return hidden
     mult, dim = q_weight.shape
     assert width == mult * dim and kv.shape == (tokens, (mult + 1) * dim)
     assert k_weight.shape == (mult, dim) and dim % LANES == 0
@@ -115,7 +118,12 @@ def engram_gate(
         inputs.append(token_mask.astype(jnp.float32).reshape(tokens, 1))
     if padded != tokens:
         inputs = [jnp.pad(a, ((0, padded - tokens), (0, 0))) for a in inputs]
-    hidden, kv, *mask = inputs
+    # Without the constraint XLA may stage small activations into VMEM ahead
+    # of the call with copies whose waits are exposed in decode steps.
+    hidden, kv, q_weight, k_weight, *mask = [
+        pltpu.with_memory_space_constraint(a, pltpu.HBM)
+        for a in (inputs[0], inputs[1], q_weight, k_weight, *inputs[2:])
+    ]
 
     def rows(width):
         return pl.BlockSpec((tile, width), lambda i: (i, 0))
@@ -134,7 +142,7 @@ def engram_gate(
             dimension_semantics=("parallel",), vmem_limit_bytes=VMEM_LIMIT_BYTES
         ),
         interpret=interpret,
-    )(hidden, kv, q_weight.astype(jnp.float32), k_weight.astype(jnp.float32), *mask)
+    )(hidden, kv, q_weight, k_weight, *mask)
     return out[:tokens] if padded != tokens else out
 
 

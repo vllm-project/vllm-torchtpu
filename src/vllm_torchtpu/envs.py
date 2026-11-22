@@ -492,7 +492,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Gate the Engram value into the hc streams with one Pallas pass
     # (kernels/deepseek_v41/engram_gate.py) instead of XLA's FP32 [T, M, D]
-    # passes. Only the order of the sums over D differs.
+    # passes; outputs can differ by one BF16 rounding step.
     "TPU_DEEPSEEK_V41_ENGRAM_PALLAS_GATE": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_PALLAS_GATE", default=True
     ),
