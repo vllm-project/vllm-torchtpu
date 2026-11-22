@@ -25,6 +25,10 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+from vllm_torchtpu.layers.adapter.moe_hierarchical import (
+    hierarchical_moe_parallel_config,
+)
+
 # The checkpoint config may omit swiglu_beta; SwiGLU-OAI's up-bias is 1.
 _DEFAULT_SWIGLU_BETA = 1.0
 
@@ -110,25 +114,31 @@ class MiniMaxM3MoE(nn.Module):
             reduce_results=False,
         )
         limit, alpha, beta = swiglu_params(config)
-        self.experts = FusedMoEFactory(
-            num_experts=num_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            scoring_func=config.scoring_func,
-            e_score_correction_bias=self.e_score_correction_bias,
-            renormalize=True,
-            # w13 is [all gates; all ups], not gpt-oss's interleaved layout.
-            activation="swigluoai_uninterleave",
-            swiglu_limit=limit,
-            swiglu_alpha=alpha,
-            swiglu_beta=beta,
-            routed_scaling_factor=config.routed_scaling_factor,
-            router_logits_dtype=torch.float32,
-            shared_experts=self.shared_experts,
-            quant_config=quant_config,
-            prefix=f"{prefix}.experts",
-        )
+        # Under TPU_MOE_HIERARCHICAL_EP each chip's two cores split the
+        # intermediate columns of the chip's experts instead of owning half
+        # the experts each: the same bytes per core, but a decode step's
+        # touched experts spread over pairs of cores, so the core that sets
+        # the post-MoE all-reduce streams fewer of them.
+        with hierarchical_moe_parallel_config():
+            self.experts = FusedMoEFactory(
+                num_experts=num_experts,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                scoring_func=config.scoring_func,
+                e_score_correction_bias=self.e_score_correction_bias,
+                renormalize=True,
+                # w13 is [all gates; all ups], not gpt-oss's interleaved layout.
+                activation="swigluoai_uninterleave",
+                swiglu_limit=limit,
+                swiglu_alpha=alpha,
+                swiglu_beta=beta,
+                routed_scaling_factor=config.routed_scaling_factor,
+                router_logits_dtype=torch.float32,
+                shared_experts=self.shared_experts,
+                quant_config=quant_config,
+                prefix=f"{prefix}.experts",
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits, _ = self.gate(hidden_states)
