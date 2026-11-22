@@ -214,6 +214,14 @@ if envs.TPU_SORT_ON_SPARSECORE and not _user_has_flag(
 ):
     _libtpu_extra_args.append("--xla_tpu_enable_offloading_sort_to_sparsecore=true")
 
+# --xla_tpu_enable_async_all_to_all: XLA all-to-alls become start/done pairs
+# that TensorCore work can run between (the DeepSeek-V4.1 HBM Engram lookup's
+# exchanges).
+if envs.TPU_ASYNC_ALL_TO_ALL and not _user_has_flag(
+    "--xla_tpu_enable_async_all_to_all"
+):
+    _libtpu_extra_args.append("--xla_tpu_enable_async_all_to_all=true")
+
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)
     if _existing_libtpu_args:

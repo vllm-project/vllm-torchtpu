@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     TPU_ONEHOT_TABLE_LOOKUP: bool = True
     TPU_INLINE_DEDUPLICATED_CALLS: bool = True
     TPU_SORT_ON_SPARSECORE: bool = True
+    TPU_ASYNC_ALL_TO_ALL: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
     TPU_ROPE_PAIRED_ROWS: bool = True
     TPU_BLOCK_TABLE_DELTA_BUCKETS: bool = True
@@ -627,6 +628,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TensorCore's critical path. Measured on DeepSeek-V4.1 (tpu7x) only; set
     # 0 if another model's sorts contend for SparseCore.
     "TPU_SORT_ON_SPARSECORE": env_bool("TPU_SORT_ON_SPARSECORE", default=True),
+    # Issue XLA all-to-alls asynchronously, so TensorCore work overlaps them
+    # (--xla_tpu_enable_async_all_to_all; env_override.py). Same results; the
+    # DeepSeek-V4.1 HBM Engram lookup's exchanges leave the critical path.
+    # Measured on DeepSeek-V4.1 (tpu7x) only; buffers stay live across the
+    # overlapped work, so set 0 if another model's peak memory or step regresses.
+    "TPU_ASYNC_ALL_TO_ALL": env_bool("TPU_ASYNC_ALL_TO_ALL", default=True),
     # Debug: on every incremental step, rebuild the full packed table on the
     # host and check it against the device-resident copy (raises on mismatch).
     "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE": env_bool(
