@@ -18,7 +18,8 @@ Qwen3.5 changes keep its interface. Each test class of
 tests/kernels/test_gdn_attention_v3.py is collected here a second time with
 every import of the kernel package (top-level and inside test methods)
 swapped for the copy's, so the copy is held to the same checks (the TPU-only
-classes run in TPU CI, the rest on CPU).
+classes run in TPU CI, the rest on CPU). The tile selection class is left
+out: it pins main's tiler picks, and the copy runs the Qwen3.5 tiler.
 """
 
 import pathlib
@@ -46,7 +47,15 @@ def _load_against_copy() -> types.ModuleType:
 _suite = _load_against_copy()
 assert _suite.wrapper.__name__.startswith("vllm_torchtpu.models.qwen3_5.")
 
+# Classes whose expectations are main's tuning, not kernel behaviour: the copy
+# runs the Qwen3.5 tiler, whose picks test_qwen3_5_gdn_tiling.py checks.
+_NOT_APPLICABLE = {"GDNAttentionTileSelectionTest"}
+
 for _name, _obj in vars(_suite).items():
-    if isinstance(_obj, type) and _name.startswith("GDN"):
+    if (
+        isinstance(_obj, type)
+        and _name.startswith("GDN")
+        and _name not in _NOT_APPLICABLE
+    ):
         globals()[f"Copy{_name}"] = type(f"Copy{_name}", (_obj,), {})
 del _name, _obj

@@ -20,6 +20,10 @@
 # - GDNConfig.qkv_2d and the act_scratch_ref scratch for 2D bf16 qkv rows.
 # - SHARED_KKT_SHAPES and GDNConfig.shared_kkt, read by
 #   compute_gdn.chunked_gdn_per_seq.
+# - TILER_SHAPES and GDNConfig.step_trims (the tiler and per-step trims), and
+#   FUSED_1DOT_SHAPES and GDNConfig.fused_1dot (the fused 1-dot recurrence).
+# - gdn_triangular_block_size: GDNConfig.triangular_block_size's GDN rule, which
+#   wrapper.py also reads.
 
 import dataclasses
 import enum
@@ -41,6 +45,33 @@ SHARED_KKT_SHAPES: frozenset[tuple[int, int, int, int]] = frozenset(
     {(16, 64, 128, 128)}
 )
 
+# Shapes (as above) at which the copy runs the GDN v3 tiler and per-step trims
+# (`wrapper.fused_conv1d_gdn`, `GDNConfig.step_trims`). The tiler sizes the
+# prefill/mixed chunk (128 tokens by default, rounded down to a multiple of 16
+# above 16 and capped at the largest chunk whose VMEM estimate fits) and the
+# decode tile. The chunk sets where the chunked prefill splits a sequence, so a
+# different chunk rounds differently; the decode tile and the trims change the
+# kernel program, which can round differently too. These are the Qwen3.5-397B
+# shapes of the served legs: the PP8 x TP1 prefill (16 kq and 64 value heads of
+# 128), the DP4 x TP2 decode (8 and 32) and the TP8 decode (2 and 8). Every
+# other shape takes main's tiles (the caller's, 64-token chunks and 4-sequence
+# decode tiles by default, or main's picks under TPU_ENABLE_GDN_DYNAMIC_TILING)
+# and main's per-step code.
+TILER_SHAPES: frozenset[tuple[int, int, int, int]] = frozenset(
+    {(16, 64, 128, 128), (8, 32, 128, 128), (2, 8, 128, 128)}
+)
+
+# Shapes (as above) at which a speculative verify window runs the fused 1-dot
+# token recurrence (`GDNConfig.fused_1dot`): one dot gives k S and q S against
+# the undecayed state, and the decay is applied to the products. It
+# reassociates the decay, so its results differ from the two-dot form in the
+# last bits. These are the Qwen3.5-397B DP4 x TP2 decode shape, where it was
+# measured, and its TP1 shape. Every other shape, including the 397B at TP8,
+# keeps the two-dot form, which is main's.
+FUSED_1DOT_SHAPES: frozenset[tuple[int, int, int, int]] = frozenset(
+    {(16, 64, 128, 128), (8, 32, 128, 128)}
+)
+
 
 class AttentionMode(enum.StrEnum):
     # Gated Delta Net: one scalar gate per value head.
@@ -56,6 +87,19 @@ class GDNMode(enum.StrEnum):
     # verify window. See `GDNConfig.window_size`.
     BATCHED = enum.auto()
     PER_SEQ = enum.auto()
+
+
+def gdn_triangular_block_size(num_v_heads: int) -> int:
+    """Sub-block size of the chunked GDN intra-chunk solve
+    (`GDNConfig.triangular_block_size`): between-block updates scale as 1 / B,
+    so B scales inversely with the head groups of 8 value heads
+    (head_groups * B <= 16), as the largest power of two within that budget so
+    that it divides every chunk."""
+    head_groups = pl.cdiv(num_v_heads, 8)
+    for b in (16, 8, 4):
+        if head_groups * b <= 16:
+            return b
+    return 2
 
 
 @jax.tree_util.register_dataclass
@@ -101,6 +145,13 @@ class GDNConfig:
     # qkv streams as 2D bf16 rows [tokens, dim_size] in 16-row aligned DMA
     # windows (fused_conv1d_gdn bf16_qkv_mode=2) rather than f32 rows.
     qkv_2d: bool = False
+    # Token-recurrent GDN computes k S and q S with one dot against the
+    # undecayed state and decays the products (fused_conv1d_gdn fused_1dot).
+    fused_1dot: bool = False
+    # The GDN v3 per-step trims (TILER_SHAPES): the conv taps start from the
+    # first product instead of a zero, and lane-aligned heads are sliced out
+    # of the conv output in registers instead of a VMEM store and reload.
+    step_trims: bool = False
 
     @property
     def conv_hbm_offset(self) -> int:
@@ -176,17 +227,13 @@ class GDNConfig:
         # B = 16 // 3 = 5, which does not divide a 128-row chunk).
         # Chunk sizes are powers of two, so pick the largest power of two
         # that satisfies the budget instead of the exact quotient.
-        head_groups = pl.cdiv(self.num_v_heads, 8)
         if self.is_kda:
+            head_groups = pl.cdiv(self.num_v_heads, 8)
             for b in (16, 8, 4):
                 if head_groups * b * b <= 256:
                     return b
             return 2
-        # GDN: between-block updates scale as 1 / B.
-        for b in (16, 8, 4):
-            if head_groups * b <= 16:
-                return b
-        return 2
+        return gdn_triangular_block_size(self.num_v_heads)
 
     @property
     def shared_kkt(self) -> bool:

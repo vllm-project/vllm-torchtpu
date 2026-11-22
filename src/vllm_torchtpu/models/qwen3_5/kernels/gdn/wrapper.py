@@ -30,8 +30,26 @@
 # - Own-line pyrefly ignores where jax's stubs are narrower than the runtime
 #   (main lists the source's errors in .pyrefly-baseline-full.json).
 # - A comment typo.
-# No change targets AttentionMode.KDA, which this copy's callers never pass;
-# see compute_kda.py.
+# - fused_conv1d_gdn pads b and a for a GDN call in one HBM pad of the two
+#   stacked, at every shape (KDA keeps the source's two pads).
+# - At config.TILER_SHAPES only: the tiler's prefill chunk (128 by default, a
+#   multiple of 16 above 16 tokens, whole triangular blocks below, capped at
+#   its VMEM fit) and decode tile, the per-step trims (a_log and dt_bias
+#   padded once) and, for verify windows at config.FUSED_1DOT_SHAPES, the
+#   fused 1-dot recurrence (use_fused_1dot). Every other shape keeps main's
+#   tiles (MAIN_MIXED_TILE_SIZE) and per-step code.
+# - decode_tile_override: a positive value replaces the decode tile the call
+#   would pick, capped at the batch, the sequence count and the VMEM ceilings
+#   (KDA verify windows keep one sequence).
+# - The verify-window tile cap (tiling.spec_window_tile_cap) counts the output
+#   at its dtype's width, where the source counts 2 bytes, so an f32
+#   activation's static decode tile can be one sequence smaller than the
+#   source's; a bf16 activation gets the same cap.
+# - Verify read offsets into a caller's checkpoint table (ckpt_indices) are
+#   clipped to the window.
+# Only the config.TILER_SHAPES change is limited to those shapes; every other
+# change above also runs off them. No change targets AttentionMode.KDA, which
+# this copy's callers never pass; see compute_kda.py.
 
 import functools
 
@@ -54,6 +72,19 @@ from vllm_torchtpu.models.qwen3_5.kernels.gdn import (
 )
 
 logger = init_logger(__name__)
+
+# main's default prefill/mixed chunk, which every shape outside
+# config.TILER_SHAPES keeps.
+MAIN_MIXED_TILE_SIZE = 64
+
+
+def use_fused_1dot(window_size: int, n_kq: int, n_v: int, d_k: int, d_v: int) -> bool:
+    """Whether a tile with this window and per-rank shape runs the fused 1-dot
+    recurrence (compute_gdn: one 8-row dot for k S and q S, decay applied to
+    the products): a verify window at a shape in config.FUSED_1DOT_SHAPES. It
+    reassociates the decay, so its results can differ from the two-dot form in
+    the last bits."""
+    return window_size > 1 and (n_kq, n_v, d_k, d_v) in config.FUSED_1DOT_SHAPES
 
 
 def inner_kernel(
@@ -208,10 +239,11 @@ def inner_kernel(
 
     # Step 2: GDN.
 
-    # Prepare gdn weights.
-    if cfg.is_kda:
-        # KDA reshapes these per (head, channel) rather than padding out to
-        # a lane multiple over heads.
+    # Prepare gdn weights: pre-padded to aligned_num_v_heads outside the
+    # pallas_call for GDN (the pad is kept for direct inner_kernel tests).
+    # KDA reshapes these per (head, channel) rather than padding out to a lane
+    # multiple over heads.
+    if cfg.is_kda or weights_ref.gdn.a_log.shape[0] == cfg.aligned_num_v_heads:
         a_log = weights_ref.gdn.a_log[...]
         dt_bias = weights_ref.gdn.dt_bias[...]
     else:
@@ -462,6 +494,7 @@ def outer_kernel(
         "kernel_act_dtype",
         "kernel_conv_weight_dtype",
         "bf16_qkv_mode",
+        "decode_tile_override",
     ),
 )
 def fused_conv1d_gdn(
@@ -500,8 +533,9 @@ def fused_conv1d_gdn(
     kernel_conv_weight_dtype: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
-    mixed_tile_size: int = 64,
+    mixed_tile_size: int | None = None,
     bf16_qkv_mode: int = 2,
+    decode_tile_override: int = 0,
 ) -> tuple[jax.Array | tuple[jax.Array, jax.Array], jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -574,15 +608,31 @@ def fused_conv1d_gdn(
         kernel_act_dtype: Dtype qkv, b and a are cast to before the kernel.
         kernel_conv_weight_dtype: Dtype conv_weight and conv_bias are cast to
             before the kernel.
-        decode_tile_size: Tile size along sequence dimension for decode sequences.
-            Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
+        decode_tile_size: Tile size along sequence dimension for decode sequences,
+            capped so its 1 + window state tiles fit the decode VMEM budget.
+            Replaced by the dynamic tiler's pick when
+            TPU_ENABLE_GDN_DYNAMIC_TILING is set (GDN only). At a GDN shape in
+            config.TILER_SHAPES the GDN v3 tiler picks it
+            (tiling.select_decode_tile_size); at every other shape main's
+            rule does (tiling.main_decode_tile_size under the flag).
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
-            sequences. Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
+            sequences, capped at the batch. At a GDN shape in
+            config.TILER_SHAPES it defaults to 128, is rounded down to a
+            multiple of 16 above 16 and is capped to the largest chunk whose
+            VMEM estimate fits. At every other shape it is main's: 64 by
+            default, replaced by the VMEM fit from the batch when
+            TPU_ENABLE_GDN_DYNAMIC_TILING is set (GDN only).
         bf16_qkv_mode: How a bf16 qkv reaches the kernel: 0 casts it to
             `kernel_act_dtype` rows, 2 streams the 2D [T, dim] bf16 rows in
             16-row aligned DMAs. Mode 2 needs dim a multiple of 2 * num_lanes,
             at least 16 tokens and a multiple-of-8 mixed chunk, and falls back
             to 0 otherwise.
+        decode_tile_override: When positive, the decode tile T, in place of
+            the dynamic or static pick (capped at the batch and the sequence
+            count). Callers set it for a layout whose measured best tile the
+            tiler does not pick. It is also capped at the decode VMEM
+            ceilings (tiling.select_decode_tile_size), so it can choose a
+            smaller tile but not one that overflows VMEM.
 
     Returns:
         new_states: The updated state cache, aliased in place, with the same
@@ -663,6 +713,10 @@ def fused_conv1d_gdn(
         # checkpoint t of sequence s lives at block ckpt_indices[s, t], so
         # the pool block only ever has to hold a single state.
         assert ckpt_indices.shape == (num_seqs, num_spec_tokens + 1)
+        if num_spec_tokens > 0:
+            # A read offset indexes the checkpoint table; keep it inside the
+            # window, since the kernel's SMEM reads are not bounds-checked.
+            read_offsets = jnp.clip(read_offsets, 0, num_spec_tokens)
     else:
         # Initialize the ckpt_indices to default value.
         spec_offset = jnp.arange(num_spec_tokens + 1).reshape(1, -1)
@@ -679,7 +733,18 @@ def fused_conv1d_gdn(
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     decode_tile_size = min(decode_tile_size, batch_size)
+    # The GDN v3 tiler and per-step trims change the kernel program (the chunk
+    # also sets where the chunked prefill splits a sequence), so they run only
+    # at the shapes they were measured at (config.TILER_SHAPES). Every other
+    # shape keeps main's tiles and per-step code.
+    tiler_shape = not is_kda and (n_kq, n_v, d_k, d_v) in config.TILER_SHAPES
+    if mixed_tile_size is None:
+        mixed_tile_size = (
+            tiling.MIXED_TILE_SIZES[0] if tiler_shape else MAIN_MIXED_TILE_SIZE
+        )
     mixed_tile_size = min(mixed_tile_size, batch_size)
+    if tiler_shape and mixed_tile_size > 16:
+        mixed_tile_size = (mixed_tile_size // 16) * 16
     if (
         bf16_qkv_mode == 2
         and qkv.dtype == jnp.bfloat16
@@ -701,9 +766,16 @@ def fused_conv1d_gdn(
     window_size = num_spec_tokens + 1
     decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
 
-    # KDA stays on static tiles until the VMEM estimate models its gate.
-    if envs.TPU_ENABLE_GDN_DYNAMIC_TILING and not is_kda:
-        decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
+    dynamic_tiling = envs.TPU_ENABLE_GDN_DYNAMIC_TILING and not is_kda
+    dyn_decode_tile: int | None = None
+    decode_vmem_fit: int | None = None
+    if not is_kda:
+        # At config.TILER_SHAPES the prefill/mixed chunk is capped at its VMEM
+        # fit in both modes; elsewhere the flag replaces it with the VMEM fit
+        # from the batch, as in main. The flag also selects the decode tile:
+        # the tiler's pick, or decode_tile_size under spec_tile_cap below.
+        # KDA stays on static tiles until the VMEM estimate models its gate.
+        fit_decode_tile, fit_mixed_tile = tiling.get_tile_sizes(
             batch_size=batch_size,
             num_seqs=num_seqs,
             padded_batch_size=padded_batch_size,
@@ -712,14 +784,43 @@ def fused_conv1d_gdn(
             d_k=d_k,
             d_v=d_v,
             kernel_size=kernel_size,
-            conv_state_dim_size=dim if is_shared else states[0].shape[-1],
+            conv_state_dim_size=dim,
             act_out_dtype=act_out_dtype,
             recurrent_state_dtype=recurrent_dtype,
             num_lanes=num_lanes,
             decode_vmem_limit_bytes=decode_vmem_limit_bytes,
             mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
             window_size=window_size,
+            mixed_tile_size=mixed_tile_size if tiler_shape else None,
             qkv_2d=qkv_2d,
+        )
+        if tiler_shape or dynamic_tiling:
+            mixed_tile_size = fit_mixed_tile
+        if tiler_shape:
+            # The chunked solve inverts each chunk in triangular blocks, so a
+            # chunk longer than one block must hold whole blocks. Chunks above
+            # 16 tokens are multiples of 16 already; a smaller batch (say 10
+            # tokens at 32 value heads, blocks of 4) is rounded down here.
+            block = config.gdn_triangular_block_size(n_v)
+            if mixed_tile_size > block:
+                mixed_tile_size -= mixed_tile_size % block
+        if dynamic_tiling:
+            dyn_decode_tile = fit_decode_tile
+        # The decode tile's VMEM ceiling in both modes (the dynamic pick is
+        # already under it); select_decode_tile_size caps an override at it.
+        decode_vmem_fit = tiling.calculate_decode_tile_size(
+            batch_size=max(1, min(padded_batch_size, num_seqs)),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            conv_state_dim_size=dim,
+            act_out_dtype=act_out_dtype,
+            recurrent_state_dtype=recurrent_dtype,
+            num_lanes=num_lanes,
+            vmem_capacity_limit_bytes=decode_vmem_limit_bytes,
+            kernel_size=kernel_size,
+            window_size=window_size,
         )
         if qkv_2d and mixed_tile_size % 8:
             # The bf16 qkv layout runs only on multiple-of-8 chunks, and the
@@ -729,6 +830,61 @@ def fused_conv1d_gdn(
             qkv_2d = False
             qkv = qkv.astype(kernel_act_dtype)
             act_in_dtype = qkv.dtype
+
+    spec_tile_cap = tiling.spec_window_tile_cap(
+        window=window_size,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        dim=dim,
+        aligned_num_v_heads=aligned_num_v_heads,
+        num_buffers=config.GDNConfig.__dataclass_fields__["num_buffers"].default,
+        vmem_budget=decode_vmem_limit_bytes,
+        rec_state_bytes=jnp.dtype(recurrent_dtype).itemsize,
+        act_out_bytes=jnp.dtype(act_out_dtype).itemsize,
+    )
+    if not tiler_shape:
+        # main's decode tile: its dynamic pick, or the caller's tile under the
+        # window cap; KDA verify windows keep one sequence per tile.
+        if dynamic_tiling:
+            decode_tile_size = tiling.main_decode_tile_size(
+                num_seqs=num_seqs,
+                padded_batch_size=padded_batch_size,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                conv_state_dim_size=dim,
+                act_out_dtype=act_out_dtype,
+                recurrent_state_dtype=recurrent_dtype,
+                num_lanes=num_lanes,
+                decode_vmem_limit_bytes=decode_vmem_limit_bytes,
+                window_size=window_size,
+            )
+        else:
+            # main's static chunk: rounded down to a power of two, so
+            # a small non-power-of-two token bucket stays divisible by
+            # triangular_block_size.
+            mixed_tile_size = tiling.clip_mixed_tile_size(mixed_tile_size, batch_size)
+            decode_tile_size = max(1, min(decode_tile_size, spec_tile_cap))
+        if num_spec_tokens > 0 and is_kda:
+            decode_tile_size = 1
+    if tiler_shape or decode_tile_override > 0:
+        # An explicit override takes the same caps at every shape.
+        decode_tile_size = tiling.select_decode_tile_size(
+            default_tile=decode_tile_size,
+            dyn_tile=dyn_decode_tile if tiler_shape else decode_tile_size,
+            batch_size=batch_size,
+            num_spec_tokens=num_spec_tokens,
+            spec_tile_cap=spec_tile_cap,
+            vmem_tile_cap=decode_vmem_fit,
+            is_kda=is_kda,
+            override=decode_tile_override,
+            num_seqs=num_seqs,
+        )
+    if dynamic_tiling:
         logger.info_once(
             "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
             num_seqs,
@@ -737,38 +893,6 @@ def fused_conv1d_gdn(
             decode_tile_size,
             mixed_tile_size,
         )
-    else:
-        # Round the static clip down to a power of two so a small
-        # non-power-of-two token bucket (e.g. TPU_TOKEN_BUCKET_EXTRA or tiny
-        # max_num_batched_tokens) stays divisible by triangular_block_size.
-        mixed_tile_size = tiling.clip_mixed_tile_size(mixed_tile_size, batch_size)
-        # Each sequence holds 1 input state slot plus `window` output
-        # checkpoint slots per buffer in VMEM, at every window size. Shrink
-        # the tile so the double-buffered windows fit in roughly half the
-        # scoped-VMEM budget.
-        window = num_spec_tokens + 1
-        num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
-        state_positions = 1 + window
-        recurrent_bytes_per_seq = (
-            state_positions * n_v * d_k * d_v * jnp.dtype(recurrent_dtype).itemsize
-        )
-        bytes_per_seq = (
-            # Recurrent checkpoints — the dominant term.
-            recurrent_bytes_per_seq
-            # Conv checkpoints (fp32).
-            + state_positions * (kernel_size - 1) * dim * 4
-            # qkv (fp32), b/a (fp32), out (act_out).
-            + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
-        )
-        spec_tile_budget = (decode_vmem_limit_bytes // 2) // num_buffers
-        decode_tile_size = max(
-            1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
-        )
-
-    if num_spec_tokens > 0 and is_kda:
-        # KDA verify keeps one sequence per tile until multi-sequence KDA
-        # verify tiles are sized by a KDA-aware VMEM estimate.
-        decode_tile_size = 1
 
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
@@ -777,13 +901,27 @@ def fused_conv1d_gdn(
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
     qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
-    b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
-    a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
-
     if not qkv_2d:
         qkv = qkv.reshape(padded_batch_size, 1, -1)
-    b = b.reshape(padded_batch_size, 1, -1)
-    a = a.reshape(padded_batch_size, 1, -1)
+    if not is_kda:
+        # Fuse b and a [N, n_v] -> [2, N_pad, 128] into a single HBM pad where
+        # both leading-index slices remain 100% contiguous [N_pad, 1, 128].
+        ba_padded = jnp.pad(
+            jnp.stack((b, a), axis=0),
+            ((0, 0), (0, batch_padding_size), (0, num_v_padding_size)),
+        )
+        b = ba_padded[0].reshape(padded_batch_size, 1, -1)
+        a = ba_padded[1].reshape(padded_batch_size, 1, -1)
+        if tiler_shape:
+            # Pad a_log and dt_bias to the lane-aligned head count once here
+            # rather than in every tile (one of the per-step trims).
+            a_log = jnp.pad(a_log, ((0, num_v_padding_size)))
+            dt_bias = jnp.pad(dt_bias, ((0, num_v_padding_size)))
+    else:
+        b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
+        a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
+        b = b.reshape(padded_batch_size, 1, -1)
+        a = a.reshape(padded_batch_size, 1, -1)
 
     # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.
     conv_state_shape = None
@@ -849,6 +987,8 @@ def fused_conv1d_gdn(
             ),
             is_shared=is_shared,
             qkv_2d=qkv_2d,
+            fused_1dot=use_fused_1dot(window_size, n_kq, n_v, d_k, d_v),
+            step_trims=tiler_shape,
         )
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
