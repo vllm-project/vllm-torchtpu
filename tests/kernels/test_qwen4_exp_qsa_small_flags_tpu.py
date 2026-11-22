@@ -8,6 +8,8 @@ skipped elsewhere).
   512-group selection, contexts 2k-200k) under main-KV DCP 2 with the LSE
   (every rank, both paired slots) and replicated: out and LSE bytes equal to
   both flags off.
+- VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE with LEAN_FETCH off: the lean and fast
+  fetches' bits, and the plain per-page schedule's values.
 - VLLM_TPU_QSA_INDEXER_DENSE_STEP / VLLM_TPU_QSA_INDEXER_TAIL_SKIP: the served
   replicated decode indexer (mixed pass, per-token scores, 4 query rows a
   block, 3,328-key blocks on the pool-page table with one DMA per pool page,
@@ -144,6 +146,48 @@ def test_rpa_flags_same_bits(monkeypatch, requests, rows, ctx):
     print("rpa", requests, rows, ctx, report)
     assert all(not v for v in report.values()), report
     assert any(np.frombuffer(v[0], np.float32).any() for v in outs.values())
+
+
+@pytest.mark.parametrize("requests,rows,ctx", RPA_CASES[:3])
+@pytest.mark.parametrize("slot_read", ["0", "1"])
+def test_compact_schedule_fetch_paths(monkeypatch, requests, rows, ctx, slot_read):
+    """The compact schedule (one entry per lane-tile) with LEAN_FETCH off, as in
+    the c1/c4/c8 serve envs: the same bits as with the lean and fast fetches,
+    and the values of the plain per-page schedule and fetch (other KV tiles,
+    so another summation order)."""
+    for k, v in {**RPA_ENV, "VLLM_TPU_QSA_DECODE_SLOT_READ": slot_read}.items():
+        monkeypatch.setenv(k, v)
+    rng = np.random.default_rng(requests * 11 + rows)
+    cache = _rpa_cache(2)
+    blocks, lengths, table = _rpa_inputs(rng, requests=requests, rows=rows, ctx=ctx)
+    q = jnp.asarray(rng.standard_normal((rows, Q_HEADS, D)), jnp.bfloat16)
+    g = jnp.asarray(rng.standard_normal((rows, Q_HEADS, D)), jnp.bfloat16)
+    # (compact, lean, fast, skip)
+    arms = {
+        "plain": ("0", "0", "0", "0"),
+        "fast": ("1", "1", "1", "0"),
+        "lean": ("1", "1", "0", "0"),
+        "per_page": ("1", "0", "0", "0"),
+        "per_page_skip": ("1", "0", "0", "16"),
+    }
+    outs = {}
+    for name, (compact, lean, fast, skip) in arms.items():
+        monkeypatch.setenv("VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE", compact)
+        monkeypatch.setenv("VLLM_TPU_QSA_DECODE_LEAN_FETCH", lean)
+        monkeypatch.setenv("VLLM_TPU_QSA_DECODE_FAST_FETCH", fast)
+        monkeypatch.setenv("VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY", skip)
+        jax.clear_caches()
+        res = jax.jit(functools.partial(_attend, offset=1, rank=None))(
+            q, g, blocks, lengths, table, cache
+        )
+        outs[name] = np.asarray(res[0], np.float32)
+    fast = outs["fast"].tobytes()
+    diff = [n for n in arms if n != "plain" and outs[n].tobytes() != fast]
+    print("compact fetch paths", requests, rows, ctx, slot_read, diff)
+    assert not diff, diff
+    assert outs["fast"].any()
+    # BF16-level agreement: another KV tile order rounds differently (~1 BF16 ulp).
+    np.testing.assert_allclose(outs["per_page"], outs["plain"], rtol=2e-2, atol=4e-3)
 
 
 # --- decode indexer ------------------------------------------------------------
