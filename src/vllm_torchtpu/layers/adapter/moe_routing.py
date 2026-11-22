@@ -241,6 +241,22 @@ def _hash_moe_select(
     return topk_weights, topk_ids
 
 
+# Up to this many tokens the routing weights are selected with a one-hot
+# compare instead of an XLA gather (c48 192-token decode: a 4 us gather per
+# layer); larger steps keep the gather, which they offload to SparseCore.
+_SELECT_SCORES_MAX_TOKENS = 512
+
+
+def _take_scores(scores: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """``scores.gather(-1, ids)`` for [tokens, E] scores and [tokens, k] ids."""
+    if scores.shape[0] > _SELECT_SCORES_MAX_TOKENS:
+        return scores.gather(-1, ids.long())
+    experts = torch.arange(scores.shape[-1], device=scores.device, dtype=ids.dtype)
+    hit = ids.unsqueeze(-1) == experts
+    # One selected value per row and zeros elsewhere: the sum is that value.
+    return torch.where(hit, scores.unsqueeze(-2), 0.0).sum(dim=-1)
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -324,7 +340,7 @@ def select_experts(
         bias = e_score_correction_bias.float().view(bias_shape)
         scores_for_choice = scores + bias
         _, topk_ids = _topk(scores_for_choice, topk)
-        topk_weights = scores.gather(-1, topk_ids.long())
+        topk_weights = _take_scores(scores, topk_ids)
     else:
         topk_weights, topk_ids = _topk(scores, topk)
 
