@@ -50,8 +50,9 @@ logger = init_logger(__name__)
 
 # Non-persistent buffers of an armed MLP, in kernel.fused_mlp's order.
 _BUFFERS = ("_fused_w_gu", "_fused_s_gu", "_fused_w_d", "_fused_s_d")
-# Rows of the all-reduce self-test: the epilogue's fold, trim and full paths.
-_SELFTEST_ROWS = (2, 8, 24)
+# Rows of the all-reduce self-tests: the epilogue's fold, trim and full
+# paths, the kernel's cap, and one XLA-fallback count above it.
+_SELFTEST_ROWS = (2, 8, 24, kernel.MAX_ROWS, kernel.MAX_ROWS + 8)
 SELFTEST_TIMEOUT_S = 300
 
 
