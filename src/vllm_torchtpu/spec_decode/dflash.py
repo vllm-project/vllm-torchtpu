@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import dataclasses
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -48,6 +47,7 @@ from vllm_torchtpu.spec_decode.utils import (
     maybe_share_embeddings,
     maybe_share_lm_head,
     normalize_draft_config,
+    program_key,
 )
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -109,33 +109,6 @@ def _draft_has_moe_layers(draft_model: torch.nn.Module) -> bool:
     if is_mixture_of_experts(draft_model):
         return True
     return any(isinstance(m, MoERunner) for m in draft_model.modules())
-
-
-def _program_key(args: object) -> tuple:
-    """What a ``dynamic=False`` compiled program is specialized on in
-    ``args``: each tensor's shape, dtype and strides and which earlier tensor
-    it is (aliasing), and every scalar's value, through tuples, lists, dicts
-    and dataclasses (other leaves, such as host copies, by type only)."""
-    seen: dict[int, int] = {}
-
-    def key(x: object) -> object:
-        if isinstance(x, torch.Tensor):
-            first = seen.setdefault(id(x), len(seen))
-            return ("T", tuple(x.shape), x.dtype, x.stride(), first)
-        if isinstance(x, (tuple, list)):
-            return (type(x).__name__, *(key(v) for v in x))
-        if isinstance(x, dict):
-            return ("dict", *((k, key(v)) for k, v in x.items()))
-        if dataclasses.is_dataclass(x) and not isinstance(x, type):
-            return (
-                type(x).__name__,
-                *(key(getattr(x, f.name, None)) for f in dataclasses.fields(x)),
-            )
-        if x is None or isinstance(x, (bool, int, float, str, torch.dtype)):
-            return x
-        return type(x).__name__
-
-    return cast(tuple, key(args))
 
 
 class DFlashProposer:
@@ -211,7 +184,7 @@ class DFlashProposer:
         # Keyed by the chunk's padded request count; the all-zero
         # `draft_lengths` a chunk without spec metadata routes on.
         self._zero_draft_lengths_cache: dict[int, torch.Tensor] = {}
-        # `_program_key`s of `_tpu_update_kv_and_build_inputs` calls compiled
+        # `program_key`s of `_tpu_update_kv_and_build_inputs` calls compiled
         # while `_warming` (the runner's real spec-decode warmup).
         self._fused_kv_inputs_keys: set[tuple] = set()
         self._warming_fused_kv_inputs = False
@@ -758,7 +731,7 @@ class DFlashProposer:
         chunk = chunks[0]
         kv_args = self._kv_update_args(chunk)
         input_args = self._next_tokens_input_args(chunk, next_tokens_per_chunk[0])
-        key = _program_key((kv_args, input_args))
+        key = program_key((kv_args, input_args))
         if self._warming_fused_kv_inputs:
             self._fused_kv_inputs_keys.add(key)
             # Also compile the unfused builder, which a shape the warmup

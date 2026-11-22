@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -48,6 +49,33 @@ _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = AllSequenceLayoutPlanner().prepare_dummy(
     num_reqs=0,
     kv_cache_initialized=False,
 )
+
+
+def program_key(args: object) -> tuple:
+    """What a ``dynamic=False`` compiled program is specialized on in
+    ``args``: each tensor's shape, dtype and strides and which earlier tensor
+    it is (aliasing), and every scalar's value, through tuples, lists, dicts
+    and dataclasses (other leaves, such as host copies, by type only)."""
+    seen: dict[int, int] = {}
+
+    def key(x: object) -> object:
+        if isinstance(x, torch.Tensor):
+            first = seen.setdefault(id(x), len(seen))
+            return ("T", tuple(x.shape), x.dtype, x.stride(), first)
+        if isinstance(x, (tuple, list)):
+            return (type(x).__name__, *(key(v) for v in x))
+        if isinstance(x, dict):
+            return ("dict", *((k, key(v)) for k, v in x.items()))
+        if dataclasses.is_dataclass(x) and not isinstance(x, type):
+            return (
+                type(x).__name__,
+                *(key(getattr(x, f.name, None)) for f in dataclasses.fields(x)),
+            )
+        if x is None or isinstance(x, (bool, int, float, str, torch.dtype)):
+            return x
+        return type(x).__name__
+
+    return cast(tuple, key(args))
 
 
 def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:

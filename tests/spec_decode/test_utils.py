@@ -201,3 +201,28 @@ def test_fit_rows_returns_slices_or_pads_the_leading_dim():
     out = utils.fit_rows(t, 6, value=-1)
     assert out.dtype == torch.int32 and out.shape == (6, 2)
     assert torch.equal(out[:4], t) and out[4:].eq(-1).all()
+
+
+def test_program_key_tells_apart_what_a_static_program_is_keyed_on():
+    from dataclasses import dataclass
+
+    @dataclass
+    class Meta:
+        lens: torch.Tensor
+        host: object = None
+        kind: str = "all"
+
+    a, b = torch.zeros(4, dtype=torch.int32), torch.zeros(4, dtype=torch.int32)
+    key = utils.program_key
+    base = key((a, b, Meta(a, host=object()), 3, None))
+    # Same shapes, aliasing and scalars; host leaves count by type only.
+    c, d = torch.ones(4, dtype=torch.int32), torch.ones(4, dtype=torch.int32)
+    assert key((c, d, Meta(c, host=object()), 3, None)) == base
+    assert key((a, a, Meta(a), 3, None)) != base  # aliasing
+    assert key((a, b, Meta(b), 3, None)) != base  # aliasing inside a dataclass
+    assert key((a, b.long(), Meta(a), 3, None)) != base  # dtype
+    assert key((a, torch.zeros(5, dtype=torch.int32), Meta(a), 3, None)) != base
+    assert key((a, torch.zeros(8, dtype=torch.int32)[::2], Meta(a), 3, None)) != base
+    assert key((a, b, Meta(a, kind="x"), 3, None)) != base  # scalar field
+    assert key((a, b, Meta(a), 4, None)) != base  # scalar
+    assert key((a, b, Meta(a), 3, a)) != base  # None vs tensor

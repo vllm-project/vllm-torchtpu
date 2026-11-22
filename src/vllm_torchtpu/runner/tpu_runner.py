@@ -206,6 +206,7 @@ from vllm_torchtpu.spec_decode.utils import (
     fit_rows,
     handoff_seed_tokens,
     normalize_draft_config,
+    program_key,
 )
 from vllm_torchtpu.structured_decoding import StructuredDecodingManager
 from vllm_torchtpu.tpu_info import get_libtpu_version, get_tpu_library_path
@@ -1233,9 +1234,9 @@ class TPUModelRunner(GPUModelRunner):
         # (LM head shard width, vocab) of the row split's logits layout
         # (`compute_selected_logit_rows`), set with `_synthetic_row_rank`.
         self._synthetic_shard: tuple[int, int] | None = None
-        # `_substitute_drafts_key`s the warmup compiled
-        # `_substitute_and_extract_drafts` for.
-        self._substitute_drafts_warm: set[tuple[int, int, int, bool]] = set()
+        # `program_key`s of the arguments the warmup compiled
+        # `_substitute_and_extract_drafts` at.
+        self._substitute_drafts_warm: set[tuple] = set()
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank, has_kv_transfer_group)
@@ -2586,21 +2587,16 @@ class TPUModelRunner(GPUModelRunner):
         )
         if inputs is not None:
             cur_input_indices, pre_next_tokens_indices, next_tokens = inputs
-            key = self._substitute_drafts_key(
-                input_ids.shape[0],
-                next_tokens.shape[0],
-                md.final_logits_indices.shape[0],
-                indexed=cur_input_indices is not None,
+            args = (
+                input_ids,
+                next_tokens,
+                md.final_logits_indices,
+                md.target_logits_indices,
+                cur_input_indices,
+                pre_next_tokens_indices,
             )
-            if key in self._substitute_drafts_warm:
-                return _substitute_and_extract_drafts(
-                    input_ids,
-                    next_tokens,
-                    md.final_logits_indices,
-                    md.target_logits_indices,
-                    cur_input_indices,
-                    pre_next_tokens_indices,
-                )
+            if program_key(args) in self._substitute_drafts_warm:
+                return _substitute_and_extract_drafts(*args)
             input_ids = self._apply_async_token_substitution(
                 input_ids,
                 token_in_tpu_cur_input_indices,
@@ -2610,13 +2606,6 @@ class TPUModelRunner(GPUModelRunner):
             input_ids, md.final_logits_indices, md.target_logits_indices
         )
         return input_ids, drafts
-
-    @staticmethod
-    def _substitute_drafts_key(
-        num_tokens: int, next_len: int, logits_len: int, indexed: bool
-    ) -> tuple[int, int, int, bool]:
-        """What `_substitute_and_extract_drafts` compiles per."""
-        return (num_tokens, next_len, logits_len, indexed)
 
     def _async_substitution_inputs(
         self,
@@ -7060,7 +7049,7 @@ class TPUModelRunner(GPUModelRunner):
         for indexed in (False, True):
             if not indexed and next_len < num_tokens:
                 continue  # the in-order slice needs next_len >= num_tokens
-            out = _substitute_and_extract_drafts(
+            args = (
                 input_ids,
                 next_tokens,
                 logits_indices,
@@ -7068,10 +7057,8 @@ class TPUModelRunner(GPUModelRunner):
                 cur_input_indices if indexed else None,
                 pre_next_tokens_indices if indexed else None,
             )
-            synchronize_tensors(out)
-            self._substitute_drafts_warm.add(
-                self._substitute_drafts_key(num_tokens, next_len, num_tokens, indexed)
-            )
+            synchronize_tensors(_substitute_and_extract_drafts(*args))
+            self._substitute_drafts_warm.add(program_key(args))
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.

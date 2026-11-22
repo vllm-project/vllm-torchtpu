@@ -158,14 +158,17 @@ def test_substitute_and_extract_drafts_matches_two_steps(fast, in_order):
         cold = runner()
         unwarmed = cold._substitute_async_tokens_and_drafts(inputs(), cur, pre, md)
         warm = runner()
-        indexed = not (fast and in_order)
-        warm._substitute_drafts_warm.add(
-            warm._substitute_drafts_key(num_tokens, next_tokens.numel(), 8, indexed)
-        )
-        with patch(
-            "vllm_torchtpu.runner.tpu_runner._substitute_and_extract_drafts",
-            wraps=_substitute_and_extract_drafts,
-        ) as fused:
+        warm._substitute_drafts_warm.add("warmed")
+        with (
+            patch(
+                "vllm_torchtpu.runner.tpu_runner.program_key",
+                lambda _args: "warmed",
+            ),
+            patch(
+                "vllm_torchtpu.runner.tpu_runner._substitute_and_extract_drafts",
+                wraps=_substitute_and_extract_drafts,
+            ) as fused,
+        ):
             warmed = warm._substitute_async_tokens_and_drafts(inputs(), cur, pre, md)
             assert fused.called
     for got in (unwarmed, warmed):
