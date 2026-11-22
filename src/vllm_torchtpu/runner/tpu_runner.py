@@ -755,18 +755,28 @@ def _candidate_verify_program(vocab_size: int, synthetic: bool):
 
 
 @functools.cache
-def _candidate_verify_ro_program(vocab_size: int, synthetic: bool):
-    """VLLM_TPU_CANDIDATE_VERIFY_RO: `_candidate_verify_fn` plus the
-    post-verify `_update_read_offsets_impl` scatter in one program (the
-    offsets are a function of the verify output only). Same ops."""
+def _candidate_verify_fused_program(vocab_size: int, synthetic: bool):
+    """`_candidate_verify_fn` with its neighbours in one program (same ops):
+    with `head` (VLLM_TPU_CANDIDATE_VERIFY_LOGITS) the LM head projection of
+    `hidden[indices]` that `compute_selected_local_logits` runs, in place of
+    the `local_logits` argument; with `read_offsets`
+    (VLLM_TPU_CANDIDATE_VERIFY_RO) the post-verify `_update_read_offsets_impl`
+    scatter, a function of the verify output only."""
     verify = _candidate_verify_fn(vocab_size, synthetic)
 
-    def candidate_verify_ro(read_offsets, groups, ro_num_reqs, *args):
+    def candidate_verify_fused(
+        read_offsets, groups, ro_num_reqs, head, hidden, indices, *args
+    ):
+        if head is not None:
+            selected = torch.index_select(hidden, 0, indices)
+            local = head.quant_method.apply(head, selected, bias=None)
+            args = (local, *args[1:])
         out = verify(*args)
-        _update_read_offsets_impl(read_offsets, groups, out, ro_num_reqs)
+        if read_offsets is not None:
+            _update_read_offsets_impl(read_offsets, groups, out, ro_num_reqs)
         return out
 
-    return _static_shape_args(_tpu_compile(candidate_verify_ro))
+    return _static_shape_args(_tpu_compile(candidate_verify_fused))
 
 
 def _reset_read_offsets(
@@ -5746,11 +5756,16 @@ class TPUModelRunner(GPUModelRunner):
                         # This rank's vocab shard only; the verify program
                         # exchanges per-shard candidates instead of the
                         # full logits (VLLM_TPU_CANDIDATE_SAMPLING).
-                        logits = VocabShardLogits(
-                            self.compute_selected_local_logits(
-                                hidden_states, logits_indices
+                        if self._verify_projects_logits(hidden_states, logits_indices):
+                            logits = VocabShardLogits(
+                                None, hidden_states, logits_indices
                             )
-                        )
+                        else:
+                            logits = VocabShardLogits(
+                                self.compute_selected_local_logits(
+                                    hidden_states, logits_indices
+                                )
+                            )
                     else:
                         logits = self.compute_selected_logits(
                             hidden_states, logits_indices
@@ -6194,6 +6209,7 @@ class TPUModelRunner(GPUModelRunner):
                 cur_end_idx,
                 sampling_generator,
                 read_offsets,
+                None if logits.local is not None else (logits.hidden, logits.indices),
             )
             self._fused_read_offsets_applied = read_offsets is not None
             return out
@@ -8592,17 +8608,27 @@ class TPUModelRunner(GPUModelRunner):
             (num_tokens, head.num_embeddings_per_partition),
             dtype=self._hidden_states_dtype,
         ).to(self.device)
-        out = self._sample_spec_verify_candidates(
-            warm_local, warm_md, 0, 0, self._get_sampling_generator()
-        )
-        synchronize_tensors(out)
+        # Each program variant serving can run at this bucket: the folded
+        # LM head projection (one hidden row per logits row) and the folded
+        # read-offset scatter at the slot-group shapes the backbone warmup
+        # walks recorded for this width (into a scratch copy, so warmup
+        # leaves the live offsets untouched).
+        projections: list = [None]
+        if envs.VLLM_TPU_CANDIDATE_VERIFY_LOGITS:
+            projections.append(
+                (
+                    torch.zeros(
+                        (num_tokens, self.model_config.get_hidden_size()),
+                        dtype=self._hidden_states_dtype,
+                    ).to(self.device),
+                    torch.zeros(num_tokens, dtype=torch.int32).to(self.device),
+                )
+            )
+        read_offsets: list = [None]
         if (
             envs.VLLM_TPU_CANDIDATE_VERIFY_RO
             and self.mamba_slot_read_offsets is not None
         ):
-            # The slot-group shapes the staged walk produced at this width
-            # (recorded by the backbone warmup walks); scatter into a scratch
-            # copy so warmup leaves the live offsets untouched.
             scratch = self.mamba_slot_read_offsets.clone()
             width = bonus_logits_indices.shape[0]
             for shapes in self.__dict__.get("_ro_group_shapes", {}).get(width, ()):
@@ -8610,13 +8636,17 @@ class TPUModelRunner(GPUModelRunner):
                     torch.zeros(sh, dtype=torch.int32, device=self.device)
                     for sh in shapes
                 ]
+                read_offsets.append((scratch, groups, 1))
+        for hidden_rows in projections:
+            for ro in read_offsets:
                 out = self._sample_spec_verify_candidates(
-                    warm_local,
+                    warm_local if hidden_rows is None else None,
                     warm_md,
                     0,
                     0,
                     self._get_sampling_generator(),
-                    (scratch, groups, 1),
+                    ro,
+                    hidden_rows,
                 )
                 synchronize_tensors(out)
 
@@ -10635,19 +10665,22 @@ class TPUModelRunner(GPUModelRunner):
 
     def _sample_spec_verify_candidates(
         self,
-        local_logits: torch.Tensor,
+        local_logits: torch.Tensor | None,
         md: SpecDecodeMetadata,
         cur_start_idx: int,
         cur_end_idx: int,
         sampling_generator: torch.Generator | None,
         read_offsets: tuple | None = None,
+        hidden_rows: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """`_sample_spec_verify_chunk` for a non-greedy step from this rank's
         logits shard: the same distributions, drawn over per-shard top-64
         candidates (layers/core/candidate_sampling.py); the draws differ
         from the gathered-logits path. With `read_offsets` (see
         `_candidate_read_offsets`) the program also scatters the chunk's
-        mamba read offsets."""
+        mamba read offsets; with `hidden_rows` = (hidden states, logits
+        indices) in place of `local_logits` it also projects the logits
+        (VLLM_TPU_CANDIDATE_VERIFY_LOGITS)."""
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
         assert self._candidate_bounds is not None
@@ -10656,13 +10689,15 @@ class TPUModelRunner(GPUModelRunner):
         assert md.draft_token_ids is not None
         num_bonus = md.bonus_logits_indices.shape[0]
         num_targets = md.target_logits_indices.shape[0]
-        device = local_logits.device
+        # The LM head keeps the hidden states' dtype.
+        dtype_source = local_logits if hidden_rows is None else hidden_rows[0]
+        device = dtype_source.device
         # Padding rows keep top_k = 1, so every row has a top-k cutoff.
         temps, top_k, top_p = self._padded_sampling_params(
             cur_start_idx,
             cur_end_idx,
             num_bonus,
-            local_logits.dtype,
+            dtype_source.dtype,
             device,
             pad_top_k=1,
         )
@@ -10700,18 +10735,43 @@ class TPUModelRunner(GPUModelRunner):
             width,
             self.speculative_config.num_speculative_tokens,
         )
+        if read_offsets is None and hidden_rows is None:
+            return _candidate_verify_program(head.org_vocab_size, synthetic)(*args)
+        ro_args: tuple = (None, None, None)
         if read_offsets is not None:
-            # VLLM_TPU_CANDIDATE_VERIFY_RO: the read-offset scatter in the
-            # verify program; `read_offsets` is (buffer, slot groups, rows).
+            # VLLM_TPU_CANDIDATE_VERIFY_RO: `read_offsets` is (buffer, slot
+            # groups, rows).
             buffer, groups, rows = read_offsets
+            ro_args = (buffer, list(groups), self._num_reqs_tensor(rows))
             logger.info_once(
                 "CANDIDATE_VERIFY_RO: candidate verify and the read-offset "
                 "scatter in one program"
             )
-            return _candidate_verify_ro_program(head.org_vocab_size, synthetic)(
-                buffer, list(groups), self._num_reqs_tensor(rows), *args
+        logits_args: tuple = (None, None, None)
+        if hidden_rows is not None:
+            logits_args = (head, *hidden_rows)
+            logger.info_once(
+                "CANDIDATE_VERIFY_LOGITS: the LM head projection in the "
+                "candidate verify program"
             )
-        return _candidate_verify_program(head.org_vocab_size, synthetic)(*args)
+        return _candidate_verify_fused_program(head.org_vocab_size, synthetic)(
+            *ro_args, *logits_args, *args
+        )
+
+    @staticmethod
+    def _verify_projects_logits(
+        hidden_states: torch.Tensor, logits_indices: torch.Tensor
+    ) -> bool:
+        """VLLM_TPU_CANDIDATE_VERIFY_LOGITS: the candidate verify program
+        projects this chunk's logits itself. Only for chunks with one hidden
+        row per logits row (verify / decode steps), the shapes the verify
+        warmup compiles; a mixed step's prefill-sized hidden states keep the
+        separate projection."""
+        return bool(
+            envs.VLLM_TPU_CANDIDATE_VERIFY_LOGITS
+            and hidden_states.shape[0] == logits_indices.shape[0]
+            and hidden_states.device.type == "tpu"
+        )
 
     def _candidate_read_offsets(self) -> tuple | None:
         """VLLM_TPU_CANDIDATE_VERIFY_RO: (read-offset buffer, slot groups,

@@ -403,21 +403,37 @@ def test_runner_operands_and_output_match_separate_ops(synthetic):
     assert torch.equal(out, ref)
 
 
-def test_candidate_verify_ro_program_scatters_after_verify(monkeypatch):
-    """VLLM_TPU_CANDIDATE_VERIFY_RO: the fused program returns the verify
-    output and leaves the read offsets as `_update_read_offsets_impl` does."""
+def test_candidate_verify_fused_program_folds_neighbours(monkeypatch):
+    """The fused program runs the verify on the LM head projection of
+    `hidden[indices]` (VLLM_TPU_CANDIDATE_VERIFY_LOGITS) and leaves the read
+    offsets as `_update_read_offsets_impl` does (VLLM_TPU_CANDIDATE_VERIFY_RO)."""
     from vllm_torchtpu.runner import tpu_runner as tr
 
     next_tokens = torch.tensor(
         [[5, 6, -1, -1], [7, -1, -1, -1], [1, 2, 3, 4]], dtype=torch.int32
     )
+    seen = []
+
+    def tokens(outs, *rest):
+        return next_tokens
+
     monkeypatch.setattr(tr, "_tpu_compile", lambda fn: fn)
     monkeypatch.setattr(tr, "candidate_verify_op", lambda *a: lambda *ops: ops)
-    monkeypatch.setattr(tr, "_candidate_verify_operands", lambda *a: ())
-    monkeypatch.setattr(tr, "_candidate_verify_tokens", lambda *a: next_tokens)
+    monkeypatch.setattr(
+        tr, "_candidate_verify_operands", lambda logits, *a: seen.append(logits) or ()
+    )
+    monkeypatch.setattr(tr, "_candidate_verify_tokens", tokens)
     tr._candidate_verify_fn.cache_clear()
-    tr._candidate_verify_ro_program.cache_clear()
+    tr._candidate_verify_fused_program.cache_clear()
     try:
+        weight = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        head = types.SimpleNamespace(
+            quant_method=types.SimpleNamespace(
+                apply=lambda layer, x, bias=None: x @ weight.T
+            )
+        )
+        hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        indices = torch.tensor([4, 0, 2], dtype=torch.int32)
         groups = [
             torch.tensor([3, 1, 0, 0], dtype=torch.int32),
             torch.tensor([6, 2, 0, 0], dtype=torch.int32),
@@ -426,14 +442,21 @@ def test_candidate_verify_ro_program_scatters_after_verify(monkeypatch):
         want = got.clone()
         num_reqs = torch.tensor(2)
         args = (None,) * 13 + (2, 3)
-        out = tr._candidate_verify_ro_program(100, False)(got, groups, num_reqs, *args)
+        program = tr._candidate_verify_fused_program(100, False)
+        out = program(got, groups, num_reqs, head, hidden, indices, *args)
         assert out is next_tokens
+        assert torch.equal(seen[-1], hidden[indices.long()] @ weight.T)
         tr._update_read_offsets_impl(want, groups, next_tokens, num_reqs)
         assert torch.equal(got, want)
         assert got.tolist() == [0, 0, 0, 1, 9, 9, 1, 9]
+        local = torch.ones(3, 3)
+        assert program(None, None, None, None, None, None, local, *args[1:]) is (
+            next_tokens
+        )
+        assert seen[-1] is local
     finally:
         tr._candidate_verify_fn.cache_clear()
-        tr._candidate_verify_ro_program.cache_clear()
+        tr._candidate_verify_fused_program.cache_clear()
 
 
 def test_candidate_chunk_folds_read_offsets_only_when_switched_on(monkeypatch):
@@ -468,7 +491,7 @@ def test_candidate_chunk_folds_read_offsets_only_when_switched_on(monkeypatch):
             TPUModelRunner._candidate_read_offsets, runner
         )
         runner._sample_spec_verify_candidates = (
-            lambda *a: passed.append(a[-1]) or "tokens"
+            lambda *a: passed.append(a[5]) or "tokens"
         )
         out = TPUModelRunner._sample_spec_verify_chunk(
             runner, VocabShardLogits(local="L"), md, None, None, 0, 2, False, None
@@ -476,3 +499,107 @@ def test_candidate_chunk_folds_read_offsets_only_when_switched_on(monkeypatch):
         assert out == "tokens"
         assert passed[-1] == expected
         assert runner._fused_read_offsets_applied is (expected is not None)
+
+
+def test_candidate_chunk_hands_hidden_rows_when_logits_deferred():
+    """A VocabShardLogits without `local` reaches the verify as
+    (hidden, indices) for the in-program projection."""
+    from vllm_torchtpu.layers.adapter.sample.candidate_sampling import (
+        VocabShardLogits,
+    )
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    passed = []
+    runner = types.SimpleNamespace(_candidate_read_offsets=lambda: None)
+    runner._sample_spec_verify_candidates = lambda *a: passed.append(a) or "tokens"
+    md = types.SimpleNamespace(draft_token_ids=object())
+    hidden, indices = object(), object()
+    deferred = VocabShardLogits(None, hidden, indices)
+    TPUModelRunner._sample_spec_verify_chunk(
+        runner, deferred, md, None, None, 0, 2, False, None
+    )
+    assert passed[-1][0] is None and passed[-1][-1] == (hidden, indices)
+    TPUModelRunner._sample_spec_verify_chunk(
+        runner, VocabShardLogits("L"), md, None, None, 0, 2, False, None
+    )
+    assert passed[-1][0] == "L" and passed[-1][-1] is None
+
+
+@pytest.mark.parametrize(
+    "flag, rows, device, expected",
+    [
+        (False, 8, "tpu", False),
+        (True, 8, "tpu", True),
+        (True, 8192, "tpu", False),
+        (True, 8, "cpu", False),
+    ],
+)
+def test_verify_projects_logits_only_on_verify_shaped_chunks(
+    monkeypatch, flag, rows, device, expected
+):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    monkeypatch.setattr(envs, "VLLM_TPU_CANDIDATE_VERIFY_LOGITS", flag, raising=False)
+    hidden = types.SimpleNamespace(
+        shape=(rows, 2560), device=types.SimpleNamespace(type=device)
+    )
+    indices = types.SimpleNamespace(shape=(8,))
+    assert TPUModelRunner._verify_projects_logits(hidden, indices) is expected
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+def test_tpu_projection_in_verify_program_is_bitwise(rows):
+    """VLLM_TPU_CANDIDATE_VERIFY_LOGITS: the LM head projection compiled into
+    the program that builds the candidate operands gives the operands the
+    separate projection program gives, bit for bit (served shard shapes:
+    2560 hidden, 248320 / 8 vocab rows, bf16)."""
+    import torch_tpu  # noqa: F401
+
+    from vllm_torchtpu.runner import tpu_runner as tr
+
+    dev = torch.device("tpu")
+    g = torch.Generator().manual_seed(rows)
+    k, width = 3, tr.candidate_width(8)
+    num_reqs = rows // (k + 1)
+    hidden = (torch.randn(rows, 2560, generator=g) * 0.5).to(torch.bfloat16).to(dev)
+    weight = (torch.randn(31040, 2560, generator=g) * 0.02).to(torch.bfloat16).to(dev)
+    indices = torch.randperm(rows, generator=g).to(torch.int32).to(dev)
+    bonus_idx = (torch.arange(num_reqs) * (k + 1) + k).to(torch.int32).to(dev)
+    target_idx = (
+        (torch.arange(num_reqs)[:, None] * (k + 1) + torch.arange(k))
+        .flatten()
+        .to(torch.int32)
+        .to(dev)
+    )
+    draft = torch.randint(0, 62080, (num_reqs * k,), generator=g, dtype=torch.int32)
+    segment = torch.arange(num_reqs).repeat_interleave(k)
+    group = torch.arange(k, dtype=torch.int32).repeat(num_reqs)
+    temps = torch.rand(num_reqs, 1, generator=g).to(torch.bfloat16)
+    top_k = torch.randint(1, 48, (num_reqs, 1), generator=g, dtype=torch.int32)
+    top_p = torch.rand(num_reqs, 1, generator=g)
+    bounds = torch.tensor([31040, 62080], dtype=torch.int32)
+    n = tr._candidate_uniforms_count(num_reqs, draft.numel(), target_idx.numel(), width)
+    u = torch.rand(n, generator=g)
+    rest = [t.to(dev) for t in (bounds, draft, temps, top_k, top_p, segment, group)]
+    u = u.to(dev)
+
+    def operands(local):
+        return tr._candidate_verify_operands(
+            local, bonus_idx, target_idx, *rest, None, u, width
+        )
+
+    def project(hidden, indices, weight):
+        selected = torch.index_select(hidden, 0, indices)
+        return torch.nn.functional.linear(selected, weight)
+
+    compile_ = functools.partial(
+        torch.compile, backend="tpu", fullgraph=True, dynamic=False
+    )
+    separate = compile_(operands)(compile_(project)(hidden, indices, weight))
+    fused = compile_(lambda h, i, w: operands(project(h, i, w)))(
+        hidden, indices, weight
+    )
+    for a, b in zip(separate, fused):
+        assert a.dtype == b.dtype and torch.equal(a.cpu(), b.cpu())

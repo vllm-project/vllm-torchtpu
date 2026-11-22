@@ -44,9 +44,13 @@ NUM_OPERANDS = 15
 
 
 class VocabShardLogits(NamedTuple):
-    """This rank's [rows, vocab shard] logits, standing in for full logits."""
+    """This rank's [rows, vocab shard] logits, standing in for full logits.
+    With VLLM_TPU_CANDIDATE_VERIFY_LOGITS `local` is None and the verify
+    program projects `hidden[indices]` itself."""
 
-    local: torch.Tensor
+    local: torch.Tensor | None
+    hidden: torch.Tensor | None = None
+    indices: torch.Tensor | None = None
 
 
 @functools.cache
