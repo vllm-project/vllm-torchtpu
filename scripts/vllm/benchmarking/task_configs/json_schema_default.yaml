@@ -1,0 +1,80 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+cases:
+  - name: flat_json
+    schema_path: ../structured_schemas/flat_json.json
+    max_tokens: 1024
+    prompts:
+      - "Generate a JSON object with 10 fictional users for an enterprise directory, including varied roles and ages."
+      - "Create a JSON roster of 10 software project members with realistic names, ages, emails, active flags, and roles."
+      - "Return a JSON list of 10 customer support accounts under the users key matching the schema."
+      - "Produce a JSON payload containing 10 university lab accounts with admin, user, and guest roles."
+
+  - name: complex_ast
+    schema_path: ../structured_schemas/complex_ast.json
+    max_tokens: 1536
+    prompts:
+      - "Generate 10 arithmetic and comparison AST expressions with short descriptions."
+      - "Return 10 nested expression trees combining variables x, y, z and constants with +, -, *, /, ==, <, >."
+      - "Build 10 expression AST entries representing physics and algebra formulas."
+      - "Emit 10 valid nested binary expression trees with human-readable descriptions."
+
+  - name: character_schema
+    schema_path: ../structured_schemas/character_schema.json
+    dataset_path: ../datasets/character_benchmark.json
+    limit: 16
+    max_tokens: 512
+
+  - name: tool_call_arguments
+    max_tokens: 512
+    schema:
+      type: object
+      properties:
+        tool_name:
+          type: string
+          enum:
+            - query_logs
+            - scale_deployment
+            - run_sql_check
+        arguments:
+          type: object
+          properties:
+            service:
+              type: string
+              pattern: "^[a-z0-9-]+$"
+            limit:
+              type: integer
+              minimum: 1
+              maximum: 1000
+            severity:
+              type: string
+              enum:
+                - INFO
+                - WARN
+                - ERROR
+          required:
+            - service
+            - limit
+            - severity
+          additionalProperties: false
+      required:
+        - tool_name
+        - arguments
+      additionalProperties: false
+    prompts:
+      - "Call query_logs for service gateway-router to fetch the latest 50 ERROR entries."
+      - "Invoke scale_deployment on prefill-pool with limit 16 and severity INFO."
+      - "Run run_sql_check for billing-api with limit 100 and severity WARN."
+      - "Fetch the last 25 ERROR records from decode-worker using query_logs."
