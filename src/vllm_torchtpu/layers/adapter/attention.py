@@ -78,7 +78,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec,
 )
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
-from vllm_torchtpu.layers.adapter import batched_rpa_decode
+from vllm_torchtpu.layers.adapter import batched_rpa_decode, native_fp8_scope
 from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
 from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
@@ -559,11 +559,13 @@ def _pallas_rpa_kernel_batched(
     decode_lanes: int | None = None,
     tuned_tiles: bool = False,
     skip_empty_mixed: bool = False,
+    attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF,
     block_major: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
     kernel_kwargs = batched_rpa_decode.kernel_kwargs(decode_lanes)
+    kernel_kwargs.update(native_fp8_scope.kernel_kwargs(attention_modes))
     if decode_query_size > 1:
         kernel_kwargs["decode_query_size"] = decode_query_size
     if tuned_tiles:
@@ -875,6 +877,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
     # Skip an empty MIXED call (the batched RPA wrapper's skip_empty_mixed);
     # off by default, a model opts its layers in.
     skip_empty_mixed: bool = False
+    # Reduced-precision modes of this layer's batched RPA kernels; off unless
+    # the model turns them on (native_fp8_scope).
+    attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF
+    # Set on a speculative draft's attention layers before their kernels are
+    # built (by the TPU runner, the DFlash proposer and the export path):
+    # those layers keep full precision.
+    is_attention_draft: bool = False
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -1008,6 +1017,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if use_pcp_streaming
             else batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
         )
+        modes = native_fp8_scope.effective(
+            self.attention_modes, self.is_attention_draft
+        )
         config_key = (
             self._kernel_op_prefix,
             self.sliding_window,
@@ -1022,11 +1034,32 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_lanes,
             self.tuned_tiles,
             self.skip_empty_mixed,
+            modes,
             block_major,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
             return existing
+        if modes.any() and (
+            use_pcp_streaming
+            or self.head_size == 64
+            or "attention_modes" not in inspect.signature(self._kernel_entry).parameters
+        ):
+            # Only the batched RPA entry runs reduced-precision modes; the PCP
+            # streaming kernel, the head_dim 64 kernel that
+            # sharded_ragged_paged_attention switches to, and the other entries
+            # would drop them. Checked on a cache miss only: the modes are part
+            # of the key, so a cached kernel has passed this check.
+            if use_pcp_streaming:
+                kernel = "the PCP streaming RPA kernel"
+            elif self.head_size == 64:
+                kernel = "ragged_paged_attention_hd64, which runs head_size 64,"
+            else:
+                kernel = self._kernel_entry.__name__
+            raise NotImplementedError(
+                f"{kernel} has no reduced-precision attention modes, but this "
+                f"layer asks for {modes}; leave attention_modes off for it."
+            )
 
         # Reuse an existing custom op if one with the same config already exists.
         # `_kernel_op_prefix` is included so subclasses (e.g. the batched RPA
@@ -1067,6 +1100,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_lanes,
             self.tuned_tiles,
             self.skip_empty_mixed,
+            modes,
             block_major,
         )
         existing = self._kernel_registry.get(registry_key)
@@ -1114,6 +1148,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 entry_kwargs["tuned_tiles"] = self.tuned_tiles
             if "skip_empty_mixed" in entry_params:
                 entry_kwargs["skip_empty_mixed"] = self.skip_empty_mixed
+            # Entries without the argument run kernels that have no
+            # reduced-precision modes. Bind it whenever the entry takes it,
+            # even with every mode off (the entry's default, so nothing
+            # changes): torch_tpu's jax_op accepts a parameter that is not a
+            # jax.Array or POD type, like AttentionModes, only when bound.
+            if "attention_modes" in entry_params:
+                entry_kwargs["attention_modes"] = modes
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
@@ -1246,6 +1287,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             dcp_rank=self.dcp_rank,
             kv_layout=self.kv_layout,
             decode_query_size=self.decode_query_size,
+            attention_modes=native_fp8_scope.effective(
+                self.attention_modes, self.is_attention_draft
+            ),
             tuned_tiles=self.tuned_tiles,
             skip_empty_mixed=self.skip_empty_mixed,
         )
@@ -1308,6 +1352,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 f"{type(self).__name__} overrides the layer-major RPA "
                 "kernel but has no bundled variant; refusing to fall "
                 "back to the default bundled kernel."
+            )
+        modes = native_fp8_scope.effective(
+            self.attention_modes, self.is_attention_draft
+        )
+        if modes.any():
+            raise NotImplementedError(
+                "VLLM_TPU_BLOCK_MAJOR_KV=1: the bundled RPA kernel has no "
+                f"reduced-precision attention modes, but this layer asks for "
+                f"{modes}; leave attention_modes off with the block-major pool."
             )
         ctx = get_vllm_model_wrapper_context()
         mesh = ctx.mesh
@@ -1470,6 +1523,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     cp_rank=self.dcp_rank,
                     kv_layout=self.kv_layout,
                     decode_query_size=self.decode_query_size,
+                    attention_modes=native_fp8_scope.effective(
+                        self.attention_modes, self.is_attention_draft
+                    ),
                     tuned_tiles=self.tuned_tiles,
                     skip_empty_mixed=self.skip_empty_mixed,
                 )

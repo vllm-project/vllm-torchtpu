@@ -35,6 +35,7 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     wrapper as _batched_rpa_wrapper,
 )
+from vllm_torchtpu.layers.adapter import native_fp8_scope
 from vllm_torchtpu.utils import synchronize_tensors
 
 # ---------------------------------------------------------------------------
@@ -100,6 +101,7 @@ def _pallas_rpa_kernel_dcp(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF,
     tuned_tiles: bool = False,
     skip_empty_mixed: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -138,6 +140,7 @@ def _pallas_rpa_kernel_dcp(
         kv_layout=kv_layout,
         tuned_tiles=tuned_tiles,
         skip_empty_mixed=skip_empty_mixed,
+        **native_fp8_scope.kernel_kwargs(attention_modes),
     )
     return new_kv_cache, output, lse
 
@@ -203,6 +206,7 @@ def build_dcp_kernels(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF,
     tuned_tiles: bool = False,
     skip_empty_mixed: bool = False,
 ) -> tuple:
@@ -228,6 +232,7 @@ def build_dcp_kernels(
         cp_rank,
         kv_layout,
         decode_query_size,
+        attention_modes,
         tuned_tiles,
         skip_empty_mixed,
     )
@@ -250,6 +255,7 @@ def build_dcp_kernels(
             attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
+            attention_modes=attention_modes,
             tuned_tiles=tuned_tiles,
             skip_empty_mixed=skip_empty_mixed,
         )
@@ -268,6 +274,7 @@ def build_dcp_kernels(
             attention_scope=_batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY,
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
+            attention_modes=attention_modes,
             tuned_tiles=tuned_tiles,
             skip_empty_mixed=skip_empty_mixed,
         )
@@ -301,6 +308,7 @@ def forward_with_dcp(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF,
     tuned_tiles: bool = False,
     skip_empty_mixed: bool = False,
 ) -> torch.Tensor:
@@ -311,9 +319,10 @@ def forward_with_dcp(
         full local K/V for this step), so this rank's own heads attend
             directly; no gather/combine needed.
 
-    `tuned_tiles` and `skip_empty_mixed` must be the layer's, as given to
-    `build_dcp_kernels` when its kernels were prebuilt: the lookup below then
-    finds those ops instead of building new ones while torch.compile traces.
+    `attention_modes`, `tuned_tiles` and `skip_empty_mixed` must be the
+    layer's, as given to `build_dcp_kernels` when its kernels were prebuilt:
+    the lookup below then finds those ops instead of building new ones while
+    torch.compile traces.
     """
     dcp_group = get_dcp_group()
     if dcp_group is None:
@@ -334,6 +343,7 @@ def forward_with_dcp(
         cp_rank=dcp_rank,
         kv_layout=kv_layout,
         decode_query_size=decode_query_size,
+        attention_modes=attention_modes,
         tuned_tiles=tuned_tiles,
         skip_empty_mixed=skip_empty_mixed,
     )
