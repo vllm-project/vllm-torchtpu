@@ -133,6 +133,10 @@ def main():
                     "and print OK or the compile error (e.g. the scoped VMEM OOM)")
     ap.add_argument("--tail", action="store_true",
                     help="VLLM_TPU_MK_WHOLE_L47: + the last QSA layer as a one-layer kernel")
+    ap.add_argument("--export", action="store_true",
+                    help="VLLM_TPU_MK_WHOLE_EXPORT_SELECTION: the call also returns layer 47's "
+                    "selection in the sink layout; DHASH stays over the target outputs only, and "
+                    "SELCHK checks the rows against the stock selection's invariants")
     ap.add_argument("--ledger", action="store_true",
                     help="print each kernel's planned VMEM scratch (name, shape, dtype, MiB, phase)")
     a = ap.parse_args()
@@ -211,11 +215,12 @@ def main():
             norm_eps=1e-6,
             rotary_dim=64,
             tail=a.tail,
+            export=a.export,
         )
         if a.stacked_meta_check:
             call_s, _, _, _ = build_wholestep_call(
                 mesh, g, B, layout, layers, L=L, budget=a.budget, max_groups=a.max_groups,
-                norm_eps=1e-6, rotary_dim=64, tail=a.tail, stacked_meta=True,
+                norm_eps=1e-6, rotary_dim=64, tail=a.tail, stacked_meta=True, export=a.export,
             )
         spec = wholestep_spec(
             g,
@@ -379,9 +384,9 @@ def main():
             zero_pool = jax.jit(lambda p: jnp.zeros_like(p), out_shardings=tp)
             fs = jax.jit(call_s, donate_argnums=donate)
             args[1 + len(ws)] = zero_pool(pool)
-            r0, p0 = f(*args)
+            r0, p0, *_ = f(*args)
             args_s[1 + len(ws)] = zero_pool(pool)
-            r1, p1 = fs(*args_s)
+            r1, p1, *_ = fs(*args_s)
             same = bool(jnp.array_equal(r0, r1)) and bool(
                 jnp.array_equal(jax.lax.bitcast_convert_type(p0, jnp.uint8),
                                 jax.lax.bitcast_convert_type(p1, jnp.uint8)))
@@ -389,8 +394,10 @@ def main():
             pool = p0
             args[1 + len(ws)] = pool
         t0 = time.time()
-        res, pool = f(*args)
+        res, pool, *sel = f(*args)
         jax.block_until_ready(res)
+        if sel:
+            _check_selection(np.asarray(sel[0]), R, B, a.budget, ctx_q)
         if a.hash:
             import hashlib
 
@@ -421,14 +428,14 @@ def main():
         for _ in range(a.iters):
             args[1 + len(ws)] = pool
             t0 = time.perf_counter()
-            res, pool = f(*args)
+            res, pool, *_ = f(*args)
             jax.block_until_ready((res, pool))
             ts.append(time.perf_counter() - t0)
         if a.profile:
             with jax.profiler.trace(f"{a.profile}/b{B}"):
                 for _ in range(a.profile_iters):
                     args[1 + len(ws)] = pool
-                    res, pool = f(*args)
+                    res, pool, *_ = f(*args)
                 jax.block_until_ready((res, pool))
         r32 = res.astype(jnp.float32)
         fin_rows = np.asarray(jnp.isfinite(r32).all(axis=1)).reshape(R, B)
@@ -447,6 +454,41 @@ def main():
             f"{float(jnp.nanmean(jnp.abs(r32))):.4g} (input {in_mean:.4g})",
             flush=True,
         )
+
+
+def _check_selection(sel: np.ndarray, R: int, B: int, K: int, ctx_q: list) -> None:
+    """`--export`: every rank returns the same rows, and each live row is a stock-layout
+    selection (`qsa_rpa.selected_tokens`): min(n_vis, K) distinct ascending groups below
+    n_vis (each as its 4 tokens), then the row's partial group's tokens, then -1."""
+    import hashlib
+
+    W = 4 * K + 3
+    sel = sel.reshape(R, B, W)
+    same = all(np.array_equal(sel[0], sel[r]) for r in range(R))
+    bad, n_full, n_ga = [], 0, 0
+    for row in range(B):
+        q, t = divmod(row, 4)
+        s = sel[0, row]
+        if q >= len(ctx_q):
+            continue
+        n = ctx_q[q] + t + 1
+        nv, ga = n // 4, ctx_q[q] // 4
+        cnt = min(nv, K)
+        g = s[: 4 * K : 4]
+        ok = (g[:cnt] >= 0).all() and (g[cnt:] == -1).all() and (g[:cnt] < nv).all()
+        ok &= bool((np.diff(g[:cnt]) > 0).all())
+        blk = np.where(g[:, None] >= 0, g[:, None] * 4 + np.arange(4), -1).reshape(-1)[: 4 * cnt]
+        ok &= bool(np.array_equal(s[: 4 * cnt], blk))
+        tail = [p for p in range(nv * 4, n)]
+        ok &= bool(np.array_equal(s[4 * cnt : 4 * cnt + len(tail)], tail))
+        ok &= bool((s[4 * cnt + len(tail) :] == -1).all())
+        n_full += int(nv > K)
+        n_ga += int(nv > K and cnt and g[cnt - 1] == ga)
+        if not ok:
+            bad.append(row)
+    print(f"B={B} SELCHK ranks_equal={same} rows_bad={len(bad)} {bad[:8]} over_budget_rows={n_full} "
+          f"g_a_selected={n_ga} digest {hashlib.sha256(sel[0].tobytes()).hexdigest()[:16]}",
+          flush=True)
 
 
 def _apply_removals(spec: str) -> None:

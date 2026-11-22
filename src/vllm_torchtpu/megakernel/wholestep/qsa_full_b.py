@@ -59,6 +59,10 @@ DBG_IQ = (
     "qsa_dbg_iq"  # debug outputs: the kernel's index queries and selected ids per layer
 )
 DBG_IDS = "qsa_dbg_ids"
+# `export_ids`: the last QSA layer's pool-path ids `[M, 1, K]` (`qi_id`: ascending, slots past
+# the row's count 0, g_a's flag in slot K-1 as `selection_groups` reads it) for the MTP
+# draft's shared selection (VLLM_TPU_MK_WHOLE_EXPORT_SELECTION). Not per layer: one buffer.
+SEL_IDS = "qsa_sel_ids"
 UNION_SLOTS = 3  # attention ring slots with `union_attn`
 NVIS_DIGIT = int(os.environ.get("VLLM_TPU_MK_QSA_NVIS_DIGIT", "3"))  # bits per bisection pass
 # Timing-only attribution arm of the key stream (tests/megakernel/tpu_bench_wholestep_call.py
@@ -104,6 +108,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         req_async: int = 0,
         nvis_balance: bool = False,
         uattn_lite: bool = False,
+        export_ids: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -188,6 +193,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
             "a deeper key ring: carrier keys, bounded per-request chunks, no compressed DCP"
         )
         self.n_layers = n_layers
+        # `export_ids`: copy the last QSA layer's `qi_id` to the `SEL_IDS` output (stage C;
+        # with `n_layers` the layer ordinal `n_layers - 1`, else every layer, the last wins).
+        self.export_ids = bool(export_ids)
         self.hbm_tables, self.per_request_scores = hbm_tables, per_request_scores
         self.bounded_chunks = bounded_chunks
         self.shard_index = shard_index
@@ -346,6 +354,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
 
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
         out = super().outputs(g, ex)
+        if self.export_ids:
+            out.append(StateDecl(SEL_IDS, (ex.M, 1, self.budget), I32, "w", per_layer=False))
         if self.debug:
             out += [
                 StateDecl(DBG_IQ, (ex.M, 4 * ix.IDX_DIM), F32, "w"),
@@ -355,6 +365,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
 
     def host_update_states(self, g, ex, pos, states, raw_outputs):  # noqa: ANN001
         out = super().host_update_states(g, ex, pos, states, raw_outputs)
+        if self.export_ids:
+            out[SEL_IDS] = raw_outputs[SEL_IDS]
         if self.debug:
             out.update({k: raw_outputs[k] for k in (DBG_IQ, DBG_IDS)})
         return out
@@ -519,6 +531,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 else []
             ),
             ScratchReq("qi_sem", pltpu.SemaphoreType.DMA((3,))),
+            *([ScratchReq("qe_sem", pltpu.SemaphoreType.DMA((1,)))] if self.export_ids else []),
             *(
                 [
                     ScratchReq("qx_ssem", pltpu.SemaphoreType.DMA((2,))),
