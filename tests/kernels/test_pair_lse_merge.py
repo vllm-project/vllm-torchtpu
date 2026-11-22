@@ -139,12 +139,12 @@ def test_merge_on_8_devices(on_8_devices, name, t):
     assert not case["races"], case
 
 
+def test_fault_is_caught(on_8_devices):
+    assert on_8_devices["fault_caught"]
+
+
 if __name__ == "__main__":
     from jax.experimental.pallas import tpu as pltpu
 
     with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams(detect_races=True)):
         _worker()
-
-
-def test_fault_is_caught(on_8_devices):
-    assert on_8_devices["fault_caught"]

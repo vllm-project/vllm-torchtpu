@@ -1430,27 +1430,35 @@ def _pair_merge_op(mesh: Any, perm: tuple[tuple[int, int], ...]):
     return op
 
 
-def _pair_selftest(op, meta: torch.Tensor, head_group: Any, shape, device) -> bool:
+def _pair_selftest(
+    op, meta: torch.Tensor, head_group: Any, shape, shape_rows, device
+) -> bool:
     """Whether the pair merge gives this rank cp_lse_ag_out_rs's result to a
-    bf16 rounding. Collective; a wrong peer hangs, so a timeout dumps every
-    stack and exits."""
+    bf16 rounding, at each of ``shape_rows`` rows of ``[2H, D]``. Collective;
+    a wrong peer hangs, so a timeout dumps every stack and exits."""
     import faulthandler
 
     from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 
     gen = torch.Generator().manual_seed(7 + int(head_group.rank_in_group))
-    out = torch.randn(shape, generator=gen).to(torch.bfloat16).to(device)
-    lse = (torch.randn(shape[:2], generator=gen) * 3).to(device)
+    ok = True
     faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
     try:
-        want, want_lse = cp_lse_ag_out_rs(out, lse, head_group, return_lse=True)
-        got, got_lse = op(out, lse, meta)
-        return bool(
-            torch.allclose(got.float().cpu(), want.float().cpu(), rtol=2**-7, atol=1e-3)
-            and torch.allclose(got_lse.cpu(), want_lse.float().cpu(), atol=1e-5)
-        )
+        for rows in shape_rows:
+            dims = (rows, *shape)
+            out = torch.randn(dims, generator=gen).to(torch.bfloat16).to(device)
+            lse = (torch.randn(dims[:2], generator=gen) * 3).to(device)
+            want, want_lse = cp_lse_ag_out_rs(out, lse, head_group, return_lse=True)
+            got, got_lse = op(out, lse, meta)
+            ok &= bool(
+                torch.allclose(
+                    got.float().cpu(), want.float().cpu(), rtol=2**-7, atol=1e-3
+                )
+                and torch.allclose(got_lse.cpu(), want_lse.float().cpu(), atol=1e-5)
+            )
     finally:
         faulthandler.cancel_dump_traceback_later()
+    return ok
 
 
 def arm_pair_merge(model: torch.nn.Module) -> int:
@@ -1496,12 +1504,15 @@ def arm_pair_merge(model: torch.nn.Module) -> int:
     meta = torch.tensor([[peer, int(head_group.rank_in_group)]], dtype=torch.int32)
     meta = meta.to(device)
     op = _pair_merge_op(armed.mesh, perm)
+    from vllm_torchtpu.kernels.collectives import pair_lse_merge
+
     impl = layers[0].impl
-    shape = (24, impl.num_heads * 2, impl.head_size)
+    shape = (impl.num_heads * 2, impl.head_size)
+    # A decode block on the kernel, and one past its cap on the permute.
+    over = pair_lse_merge.MAX_BYTES // (shape[0] * shape[1] * 2) + 8
+    selftest = _pair_selftest(op, meta, head_group, shape, (24, over), device)
     ok = [None] * tp.world_size
-    torch.distributed.all_gather_object(
-        ok, _pair_selftest(op, meta, head_group, shape, device), group=tp.cpu_group
-    )
+    torch.distributed.all_gather_object(ok, selftest, group=tp.cpu_group)
     if not all(ok):
         logger.warning("DCP draft pair merge not armed: self-test failed %s", ok)
         return 0

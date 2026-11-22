@@ -37,8 +37,10 @@ from jax.experimental.pallas import tpu as pltpu
 F32 = jnp.float32
 COLLECTIVE_ID = 0
 _MESH = pl.DeviceIdType.MESH
-# Partial bytes the kernel takes (the rest of VMEM holds ~6x this).
-MAX_BYTES = 2 << 20
+# Partial bytes the kernel takes: draft decode blocks (64 rows at 16 heads of
+# 128). VMEM holds ~24x this: the partials, the f32 LSEs whose 1-wide lane
+# dim pads to 128 (twice a bf16 partial each) and the f32 temporaries.
+MAX_BYTES = 256 << 10
 
 
 def _merge(out_me, lse_me, out_peer, lse_peer, block, heads):
@@ -127,7 +129,7 @@ def _call(shape: tuple[int, int, int], dtype):
         ),
         compiler_params=pltpu.CompilerParams(
             collective_id=COLLECTIVE_ID,
-            vmem_limit_bytes=8 * MAX_BYTES + (4 << 20),
+            vmem_limit_bytes=32 * MAX_BYTES + (4 << 20),
         ),
         name=f"pair_lse_merge-t_{t}-h_{two_h}-d_{d}",
     )

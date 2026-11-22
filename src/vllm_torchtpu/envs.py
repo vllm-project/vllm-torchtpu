@@ -1202,14 +1202,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # call at decode rows (kernels/dspark_mlp.py; XLA above its row cap).
     # "ar" also folds the TP all-reduce after it into that call (needs the
     # Pallas all-reduce armed, TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES > 0).
+    "TPU_DSPARK_FUSED_MLP": env_with_choices(
+        "TPU_DSPARK_FUSED_MLP", "0", ["0", "1", "ar"]
+    ),
     # A DCP-sharded draft attention layer whose KV head spans two ranks
     # merges the two partials in one Pallas exchange
     # (kernels/collectives/pair_lse_merge.py) instead of cp_lse_ag_out_rs's
     # all-gather + reduce-scatter. Needs the Pallas all-reduce armed.
     "TPU_DRAFT_DCP_PAIR_MERGE": env_bool("TPU_DRAFT_DCP_PAIR_MERGE", default=False),
-    "TPU_DSPARK_FUSED_MLP": env_with_choices(
-        "TPU_DSPARK_FUSED_MLP", "0", ["0", "1", "ar"]
-    ),
     # Token recovery without top-k or draft probabilities (the synthetic
     # verify's sampler) runs on a Pallas kernel holding each row as a dense
     # [vocab / 128, 128] slab (kernels/top_p_sample.py). 0 keeps the XLA path.
