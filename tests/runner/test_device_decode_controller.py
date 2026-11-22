@@ -34,11 +34,12 @@ from vllm_torchtpu.runner.device_decode import controller as controller_mod
 from vllm_torchtpu.runner.device_decode.controller import (
     DeviceDecodeController,
     DeviceDecodeState,
+    stock_uniform,
     stock_uniform_key,
 )
 from vllm_torchtpu.runner.device_decode.head import SamplerVariant, head_key
 from vllm_torchtpu.runner.device_decode.inputs import DecodeShape
-from vllm_torchtpu.runner.device_decode.rng import counter_uniform
+from vllm_torchtpu.runner.device_decode.rng import counter_uniform_impl
 from vllm_torchtpu.runner.device_decode.slots import (
     MIRROR_MISMATCH,
     NO_SLOT,
@@ -75,6 +76,17 @@ def test_bad_flag_values_raise(monkeypatch, name, value):
 
 def test_every_rank_gets_the_flags():
     assert {FLAG, VERIFY_FLAG} <= set(TpuPlatform.additional_env_vars)
+
+
+def test_the_flags_stay_out_of_the_compile_cache_key(monkeypatch):
+    """Neither flag changes a program the compile cache holds, so neither is
+    one of the key's env factors."""
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    for name, value in ((FLAG, "1"), (VERIFY_FLAG, "4")):
+        assert name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+        monkeypatch.setenv(name, value)
+        assert name not in tpu_compiler._tpu_compile_env_factors()
 
 
 EXCLUDED = {
@@ -185,7 +197,7 @@ def test_stock_noise_is_the_head_noise(monkeypatch):
     for row, req_id in enumerate(runner.input_batch.req_ids[:2]):
         slot = slots.slot_of(req_id)
         position = int(runner.input_batch.num_computed_tokens_cpu[row])
-        want = counter_uniform(
+        want = counter_uniform_impl(
             slots.seed_lo[slot : slot + 1],
             slots.seed_hi[slot : slot + 1],
             torch.tensor([position], dtype=torch.int32),
@@ -219,6 +231,31 @@ def test_the_stock_noise_program_slices_the_plan_itself(monkeypatch):
     plan = plans[0]
     assert plan.is_contiguous() and plan.shape[1] == 4
     assert (tuple(plan.shape), plan.stride(), plan.dtype) in precompiled
+
+
+@pytest.mark.tpu_test
+def test_the_stock_noise_program_draws_the_host_bits_on_tpu(device):
+    """The compiled stock-path noise program, the one serving runs, draws on
+    TPU the bits the host draws for each plan row's slot and position, over
+    a whole padded vocabulary."""
+    vocab_size = 248320
+    gen = torch.Generator().manual_seed(0)
+    seed_lo = torch.randint(-(2**31), 2**31, (9,), dtype=torch.int32, generator=gen)
+    seed_hi = torch.randint(-(2**31), 2**31, (9,), dtype=torch.int32, generator=gen)
+    # A [P, 4] plan as a stock chunk uploads it, each row's slot and position
+    # in its first two columns.
+    plan = torch.zeros((8, 4), dtype=torch.int32)
+    plan[:, 0] = torch.tensor([8, 0, 3, 3, 7, 1, 5, 2])
+    plan[:, 1] = torch.tensor([0, 1, 543, 544, 10239, 2**24 + 1, 2**31 - 1, 7])
+    got = stock_uniform(
+        seed_lo.to(device), seed_hi.to(device), plan.to(device), vocab_size
+    )
+    rows = plan[:, 0].long()
+    want = counter_uniform_impl(
+        seed_lo[rows], seed_hi[rows], plan[:, 1].contiguous(), vocab_size
+    )
+    mismatches = int((got.cpu().view(torch.int32) != want.view(torch.int32)).sum())
+    assert mismatches == 0, f"{mismatches} of {want.numel()} uniforms differ"
 
 
 @pytest.mark.parametrize(

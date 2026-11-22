@@ -723,6 +723,7 @@ class TPUModelRunner(GPUModelRunner):
     _dp_step_other_decode: bool = False
     _adaptive_verification: AdaptiveVerificationManager | None = None
     _thinking_budget: thinking_budget_tracker.ThinkingBudgetTracker | None = None
+    _device_decode: DeviceDecodeController | None = None
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
     # pin's mask, whose dtype follows the draft tokens.
     _tp_rank0_confidence_mask: torch.Tensor | None = None
@@ -4380,7 +4381,7 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
         # Update cached state
         self._update_states(scheduler_output)
-        device_decode = getattr(self, "_device_decode", None)
+        device_decode = self._device_decode
         if device_decode is not None:
             # Also on zero-token steps, which can free slots.
             device_decode.on_states_updated(scheduler_output)
@@ -5692,7 +5693,7 @@ class TPUModelRunner(GPUModelRunner):
         scheduler_output = state.scheduler_output
         self.execute_model_state = None
         rep_pen = self._repetition_penalty.begin_step(self.input_batch)
-        device_decode = getattr(self, "_device_decode", None)
+        device_decode = self._device_decode
         if isinstance(state, DeviceDecodeState):
             assert device_decode is not None
             return device_decode.sample_tokens(state, grammar_output)
@@ -7765,7 +7766,7 @@ class TPUModelRunner(GPUModelRunner):
         self._precompile_repetition_penalty()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
-        device_decode = getattr(self, "_device_decode", None)
+        device_decode = self._device_decode
         if device_decode is not None:
             device_decode.precompile_heads()
 
@@ -9664,7 +9665,7 @@ class TPUModelRunner(GPUModelRunner):
 def _initialize_device_decode(runner: TPUModelRunner) -> None:
     """Sets up the opt-in device decode path at the end of `capture_model`,
     or has it log why it stays off."""
-    device_decode = getattr(runner, "_device_decode", None)
+    device_decode = runner._device_decode
     if device_decode is not None:
         device_decode.initialize_and_precompile()
 

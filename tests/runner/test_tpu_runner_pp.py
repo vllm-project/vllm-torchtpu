@@ -41,6 +41,7 @@ def _runner(**attrs):
     runner._pp_intermediate_template = None
     runner._pp_topk_buffer = None
     runner._pp_pending_kv_save_nan_check = None
+    runner._device_decode = None
     for name in (
         "forward_model",
         "_pp_intermediate_tensors",
@@ -291,6 +292,7 @@ class TestHandOffConstruction:
             vllm_config=None,
             device=torch.device("cpu"),
             enforce_eager=True,
+            _device_decode=None,
         )
 
         def intermediate_tensors(num_tokens, zeros):
@@ -414,6 +416,7 @@ class TestBufferedStepPosting:
             _dp_local_prompt_logprob_rows=lambda _so: 0,
             _dp_coordinated_step=lambda *_a, **_kw: (None, 2),
             _adaptive_verification=None,
+            _device_decode=None,
             _readmit_trimmed_drafts=lambda *_a: None,
             _pp_handoff=handoff,
             _pp_is_first=first,

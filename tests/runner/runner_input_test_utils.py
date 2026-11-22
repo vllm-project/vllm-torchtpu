@@ -86,6 +86,7 @@ def _make_runner(
     runner._pp_is_last = True
     runner._pp_handoff = None
     runner._adaptive_verification = None
+    runner._device_decode = None
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,
@@ -383,6 +384,7 @@ def _make_sample_runner(
         _is_async_drafter=is_eagle3,
         _async_drafter=SimpleNamespace(draft_chunks=None, bucketed_drafts=False),
         _adaptive_verification=None,
+        _device_decode=None,
         _mtp_prefill_only=False,
         _tp_rank0_mask=None,
         _fence_spec_kv_under_token_copy=False,

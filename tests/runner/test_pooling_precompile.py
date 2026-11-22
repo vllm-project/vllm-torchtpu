@@ -778,6 +778,7 @@ def test_runner_sampling_precompile_bypassed_for_pooling(is_pooling):
     runner = SimpleNamespace(
         is_pooling_model=is_pooling,
         _pp_is_last=True,
+        _device_decode=None,
         get_pcp_planner=lambda: SimpleNamespace(
             uses_selected_logits_hidden_states=True
         ),
