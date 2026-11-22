@@ -218,6 +218,40 @@ def test_pipeline_stages_keep_stock_reads(monkeypatch):
     assert all(len(mq.reads) == 1 for mq in ex.response_mqs)
 
 
+def test_runtime_stats_line_every_log_every_late_calls(monkeypatch):
+    rpc = _on(monkeypatch)
+    monkeypatch.setattr(fl, "LOG_EVERY", 3)
+    for k in list(fl.stats):
+        fl.stats[k] = 0
+    lines = []
+    monkeypatch.setattr(fl.logger, "info", lambda fmt, *a: lines.append(fmt % a))
+    ex, agg = Exec(), KVOutputAggregator(8)
+    for i in range(7):
+        step(ex, "s%d" % i)
+        call(rpc, ex, agg)
+    rt = [ln for ln in lines if ln.startswith("FANIN_LATE late=")]
+    assert len(rt) == 2, lines
+    assert rt[0].startswith("FANIN_LATE late=3 full=0 drained=14 carried=14 dropped=0 drain_ms_mean=")
+    assert rt[1].startswith("FANIN_LATE late=6 full=0 drained=35 carried=35 dropped=0 drain_ms_mean=")
+    assert float(rt[1].rsplit("=", 1)[1]) >= 0.0
+
+
+def test_no_runtime_line_when_off_or_full(monkeypatch):
+    monkeypatch.setattr(fl, "LOG_EVERY", 1)
+    lines = []
+    monkeypatch.setattr(fl.logger, "info", lambda fmt, *a: lines.append(fmt % a))
+    ex, agg = Exec(), KVOutputAggregator(8)
+    for i in range(3):
+        step(ex, "s%d" % i)
+        MultiprocExecutor.collective_rpc(ex, "sample_tokens", args=(None,), unique_reply_rank=0, kv_output_aggregator=agg)
+    rpc2 = _on(monkeypatch, ab=20000)
+    fl._now_ns = lambda: (20_414 * DAY_NS) + 20 * 10**9   # an odd window: full reads only
+    for i in range(3):
+        step(ex, "t%d" % i)
+        call(rpc2, ex, agg)
+    assert not any(ln.startswith("FANIN_LATE late=") for ln in lines), lines
+
+
 # ---- A/B windows
 
 

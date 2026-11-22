@@ -48,13 +48,15 @@ DAY_MS = 86_400_000
 LATE_METHODS = ("execute_model", "sample_tokens")
 # sha256 of vLLM 0.31's MultiprocExecutor.collective_rpc source, blank lines dropped and lines right-stripped.
 SOURCE_SHA256 = "e24890821c673f3e62b74979f59e267acc4c71a1ea057f010c2a034d0441c4ab"
+# The runtime stats line (engine core main thread, the thread that does the late fan-in) every LOG_EVERY late step RPCs:
+# two step RPCs a decode step, so about every 2500 steps (about once a minute at B1 decode rows).
 LOG_EVERY = 5000
 _PATCH_FLAG = "_tpu_fanin_late_patch"
 
 ENABLED = False
 AB_MS = 0
 _state = {"ab_window": None}
-stats = {"late": 0, "full": 0, "drained": 0, "carried": 0, "dropped": 0}
+stats = {"late": 0, "full": 0, "drained": 0, "carried": 0, "dropped": 0, "drain_ns": 0, "drains": 0}
 
 
 def _load() -> None:
@@ -169,7 +171,11 @@ def make_collective_rpc():
                         stats["dropped"] += 1
 
         def get_response():
-            drain()
+            if st["pending"]:
+                t0 = time.perf_counter_ns()
+                drain()
+                stats["drain_ns"] += time.perf_counter_ns() - t0
+                stats["drains"] += 1
             if output_rank is not None:
                 return read(output_rank)
             if late_ok and ab_on():
@@ -177,9 +183,12 @@ def make_collective_rpc():
                 st["pending"].append(([r for r in range(len(mqs)) if r != rank], bool(result)))
                 stats["late"] += 1
                 if stats["late"] % LOG_EVERY == 0:
+                    # The runtime stats line: late = step RPCs answered from the output rank alone; drained = late replies
+                    # read at the start of the next call; drain_ms_mean = mean time to read them (near 0 = they were ready).
                     logger.info(
-                        "FANIN_LATE late=%d full=%d drained=%d carried=%d dropped=%d",
+                        "FANIN_LATE late=%d full=%d drained=%d carried=%d dropped=%d drain_ms_mean=%.3f",
                         stats["late"], stats["full"], stats["drained"], stats["carried"], stats["dropped"],
+                        stats["drain_ns"] / 1e6 / max(1, stats["drains"]),
                     )
                 return [result]
             if late_ok:
