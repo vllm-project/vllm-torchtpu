@@ -45,6 +45,9 @@ from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 from vllm_torchtpu.kernels.lse_rescale import lse_rescale_quantize
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 if envs.TPU_DCP_MERGE_VSPACE_FUSED:
     # Registers the fused V-space operand ops at import, never in a trace.
@@ -173,17 +176,37 @@ def merge_lse_partials_scatter_heads(
     # drafter never compares it.
     # A W_UV-projected f32 partial still crosses in the attention dtype.
     narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
+    combine_dtype = (wire_dtype or output.dtype) if narrow else output.dtype
+    if online_lse_combine_applies(
+        output.shape[0],
+        is_backbone,
+        num_heads=output.shape[1],
+        vdim=output.shape[2],
+        combine_dtype=combine_dtype,
+    ):
+        part_bf16 = (
+            output if output.dtype == torch.bfloat16 else output.to(torch.bfloat16)
+        )
+        merged = _retain_rank(
+            merge_lse_partials_online_combine(
+                part_bf16, lse, group, query_start_loc=query_start_loc
+            )
+        )
+        return merged.to(output.dtype)
+
     if (
         envs.TPU_DCP_LSE_MERGE_A2A
         and is_backbone
         and output.shape[0] <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
     ):
-        return merge_lse_partials_all_to_all(
-            output,
-            lse,
-            group,
-            send_dtype=wire_dtype if narrow else None,
-            query_start_loc=query_start_loc,
+        return _retain_rank(
+            merge_lse_partials_all_to_all(
+                output,
+                lse,
+                group,
+                send_dtype=wire_dtype if narrow else None,
+                query_start_loc=query_start_loc,
+            )
         )
 
     # The drafter cannot compare the token count in torch, but JAX exports
@@ -207,7 +230,14 @@ def merge_lse_partials_scatter_heads(
     return _retain_rank(cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype))
 
 
-def vspace_fused_applies(num_tokens: int, is_backbone: bool) -> bool:
+def vspace_fused_applies(
+    num_tokens: int,
+    is_backbone: bool,
+    *,
+    num_heads: int | None = None,
+    vdim: int = 128,
+    combine_dtype: torch.dtype | None = None,
+) -> bool:
     """TPU_DCP_MERGE_VSPACE_FUSED: whether this step's merge is
     the chunked reduce-scatter merge with the heads-major weighted operand,
     so the operand can be built in V space by `dcp_vspace` (#1935 trial 6's
@@ -220,6 +250,23 @@ def vspace_fused_applies(num_tokens: int, is_backbone: bool) -> bool:
         return False
     group = get_dcp_group()
     if group is None or int(group.world_size) == 1:
+        return False
+    eff_dtype = (
+        combine_dtype
+        if combine_dtype is not None
+        else (
+            torch.bfloat16
+            if (envs.TPU_DCP_RS_OUT_PRECISION and is_backbone)
+            else torch.float32
+        )
+    )
+    if online_lse_combine_applies(
+        num_tokens,
+        is_backbone,
+        num_heads=num_heads,
+        vdim=vdim,
+        combine_dtype=eff_dtype,
+    ):
         return False
     if (
         envs.TPU_DCP_LSE_MERGE_A2A
@@ -696,6 +743,14 @@ def send_layout_applies(
     group = get_dcp_group()
     if group is None or int(group.world_size) == 1:
         return False
+    if online_lse_combine_applies(
+        num_tokens,
+        is_backbone,
+        num_heads=num_heads,
+        vdim=vdim,
+        combine_dtype=dtype,
+    ):
+        return False
     if not (
         envs.TPU_DCP_MLA_SEND_LAYOUT
         and envs.TPU_DCP_LSE_MERGE_A2A
@@ -812,9 +867,11 @@ def merge_send_layout(
 
 
 _RAGGED_A2A_OPS: dict = {}
-# This rank's DCP index as an int32 [1] device tensor: the exchange takes it
-# as data (XLA's SPMD export refuses `axis_index`'s partition-id).
+# This rank's DCP index (and optional lane index on multi-lane meshes) as
+# int32 [1] device tensors: exchanges take them as data because XLA's SPMD
+# export refuses `axis_index`'s partition-id.
 _DCP_RANK: torch.Tensor | None = None
+_DCP_LANE: torch.Tensor | None = None
 
 
 def _ragged_all_to_all(
@@ -853,9 +910,9 @@ def prebuild_ragged_all_to_all(world: int, skip: int = 0) -> None:
 
 
 def _retain_rank(out: torch.Tensor) -> torch.Tensor:
-    """`out` plus a zero read from the rank buffer, on the merge branch that
-    does not run the ragged exchange: the backbone warmup hands a bucket over
-    only between traces that lift the same buffers (as
+    """`out` plus a zero read from the rank (and optional lane) buffer, on
+    merge branches that do not lift them directly: the backbone warmup hands a
+    bucket over only between traces that lift the same buffers (as
     `small_all_reduce_op.retain`). A dead read would be eliminated, so the
     zero rides on `out`."""
     from vllm_torchtpu.compilation import shape_variants
@@ -863,7 +920,11 @@ def _retain_rank(out: torch.Tensor) -> torch.Tensor:
     if _DCP_RANK is None or not shape_variants.in_warmup():
         return out
     value = _DCP_RANK[0].to(out.dtype)
-    return out + (value - value)
+    zero = value - value
+    if _DCP_LANE is not None:
+        lane_val = _DCP_LANE[0].to(out.dtype)
+        zero = zero + (lane_val - lane_val)
+    return out + zero
 
 
 def _build_ragged_all_to_all(world: int, skip: int = 0):
@@ -1745,3 +1806,341 @@ def prebuild_sized_merge(world: int) -> None:
         return op(output, lse, rank_t, lane_t)
 
     _SIZED_MERGE_OPS[world] = merge
+
+
+_ONLINE_COMBINE_OPS: dict[tuple[int, str, bool, bool], Any] = {}
+_DCP_CHIP_PAIRS_CACHE: dict[tuple, bool] = {}
+
+
+def online_lse_combine_mode_requested() -> str:
+    """Normalized ``TPU_DCP_ONLINE_LSE_COMBINE`` mode, or ``""`` when off."""
+    raw = (envs.TPU_DCP_ONLINE_LSE_COMBINE or "").strip().lower()
+    if raw in ("", "0"):
+        return ""
+    if raw in ("1", "auto"):
+        return "auto"
+    if raw in ("pairs", "flat"):
+        return raw
+    raise ValueError(
+        f"Unsupported TPU_DCP_ONLINE_LSE_COMBINE={envs.TPU_DCP_ONLINE_LSE_COMBINE!r}; "
+        "expected '', '0', '1', 'auto', 'pairs', or 'flat'."
+    )
+
+
+def online_lse_combine_applies(
+    num_tokens: int,
+    is_backbone: bool,
+    *,
+    num_heads: int | None = None,
+    vdim: int = 512,
+    combine_dtype: torch.dtype = torch.bfloat16,
+) -> bool:
+    """Whether backbone ``merge_lse_partials_scatter_heads`` routes ``num_tokens``
+    through ``dcp_online_lse_combine`` at trace time.
+
+    ``num_tokens`` is symbolic under the dynamic-shape compile, so it is only
+    compared at bucket edges (see ``envs.bucket_gate_edge``) and tested for
+    16-row alignment; the geometry check takes no token count. A lower bound
+    such as ``T >= 16`` next to another gate's ``T <= 16`` would pin the traced
+    token count and fail the compile.
+    """
+    from vllm_torchtpu.kernels.experimental.small_collectives.dcp_lse_combine import (
+        MAX_COMBINE_TOKENS,
+        TILE_ROWS,
+        online_lse_combine_geometry_supported,
+    )
+
+    req = online_lse_combine_mode_requested()
+    if not is_backbone or not req or combine_dtype != torch.bfloat16:
+        return False
+    group = get_dcp_group()
+    if group is None:
+        return False
+    world = int(group.world_size)
+    if world <= 1:
+        return False
+    # Exclude the smallest decode bucket (<= 8 tokens) so tiny single-request
+    # buckets keep the existing send_layout / small-A2A path.
+    if num_tokens <= envs.bucket_gate_edge(16):
+        return False
+    if num_tokens > MAX_COMBINE_TOKENS or num_tokens % TILE_ROWS != 0:
+        return False
+    heads = int(num_heads) if num_heads is not None else 4 * world
+    check_mode = "pairs" if req == "pairs" else "flat"
+    return online_lse_combine_geometry_supported(heads, world, vdim, mode=check_mode)
+
+
+def _dcp_chip_pairs_ok(mesh: Any, group: Any | None = None) -> bool:
+    """Whether adjacent DCP ranks ``(2c, 2c + 1)`` share one physical TPU chip."""
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME
+    from vllm_torchtpu.kernels.experimental.moe_tp_decode.all_reduce import (
+        check_chip_pairs,
+    )
+    from vllm_torchtpu.kernels.experimental.small_collectives.dcp_lse_combine import (
+        mesh_has_chip_pairs,
+    )
+
+    ranks_key = tuple(int(r) for r in group.ranks) if group is not None else ()
+    cache_key = (id(mesh), ranks_key)
+    cached = _DCP_CHIP_PAIRS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    ok = mesh_has_chip_pairs(mesh, DCP_AXIS_NAME)
+    if (
+        not ok
+        and group is not None
+        and torch.distributed.is_initialized()
+        and group.cpu_group is not None
+    ):
+        local_devs = jax.local_devices()
+        local_dev = local_devs[0] if local_devs else None
+        coords = (
+            tuple(int(c) for c in local_dev.coords)
+            if local_dev is not None and local_dev.platform == "tpu"
+            else None
+        )
+        core = (
+            int(local_dev.core_on_chip)
+            if local_dev is not None and local_dev.platform == "tpu"
+            else -1
+        )
+        entry = (int(group.rank_in_group), coords, core)
+        gathered: list[Any] = [None] * int(group.world_size)
+        torch.distributed.all_gather_object(gathered, entry, group=group.cpu_group)
+        if all(item is not None and item[1] is not None for item in gathered):
+            ordered = sorted(gathered, key=lambda item: item[0])
+            places = [(c_xyz, c_id) for _, c_xyz, c_id in ordered]
+            try:
+                check_chip_pairs(places)
+                ok = True
+            except ValueError:
+                ok = False
+        if torch.distributed.get_world_size() > int(group.world_size):
+            all_lanes: list[Any] = [False] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(all_lanes, ok)
+            ok = all(bool(v) for v in all_lanes)
+
+    _DCP_CHIP_PAIRS_CACHE[cache_key] = ok
+    return ok
+
+
+def _resolve_online_combine_mode(mesh: Any, group: Any | None = None) -> str:
+    """Resolve ``'auto'`` / ``'pairs'`` / ``'flat'`` against the DCP mesh."""
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME
+
+    req = online_lse_combine_mode_requested()
+    world = int(mesh.shape[DCP_AXIS_NAME])
+    pairs_ok = world >= 4 and world % 2 == 0 and _dcp_chip_pairs_ok(mesh, group)
+    if req == "auto":
+        return "pairs" if pairs_ok else "flat"
+    if req == "pairs":
+        if not pairs_ok:
+            raise ValueError(
+                f"TPU_DCP_ONLINE_LSE_COMBINE='pairs' requires even DCP world >= 4 "
+                f"with adjacent ranks sharing each TPU chip (world={world}); "
+                "use 'auto' or 'flat' on non-paired topologies."
+            )
+        return "pairs"
+    return "flat"
+
+
+def _ensure_online_lse_combine_op(
+    world: int,
+    *,
+    use_live: bool,
+    out_vmem: bool = True,
+    group: Any | None = None,
+):
+    global _DCP_RANK, _DCP_LANE
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.distributed.dcp import (
+        DCP_AXIS_NAME,
+        DCP_LANE_AXIS_NAME,
+        dcp_lane_operand,
+        dcp_rank_operand,
+        get_or_create_dcp_mesh,
+    )
+    from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+    from vllm_torchtpu.kernels.experimental.small_collectives.dcp_lse_combine import (
+        dcp_online_lse_combine,
+        online_lse_combine_supported,
+    )
+
+    if group is None:
+        group = get_dcp_group()
+    mesh = get_or_create_dcp_mesh()
+    assert mesh.shape[DCP_AXIS_NAME] == world, (mesh.shape, world)
+    mode = _resolve_online_combine_mode(mesh, group)
+
+    lane_axes = tuple(a for a in mesh.axis_names if a != DCP_AXIS_NAME)
+    assert len(lane_axes) <= 1, mesh.axis_names
+    lane_axis = lane_axes[0] if lane_axes else DCP_LANE_AXIS_NAME
+    multi_lane = lane_axis in mesh.axis_names and int(mesh.shape[lane_axis]) > 1
+
+    if _DCP_RANK is None:
+        _DCP_RANK = dcp_rank_operand(torch.device("tpu"))
+    if multi_lane and _DCP_LANE is None:
+        _DCP_LANE = dcp_lane_operand(torch.device("tpu"))
+
+    key = (world, mode, use_live, out_vmem)
+    cached = _ONLINE_COMBINE_OPS.get(key)
+    if cached is not None:
+        return cached
+
+    spec = P(DCP_AXIS_NAME)
+
+    def _run_combine(o, lse_in, rank, lane=None, live=None):
+        tokens, heads, vdim = o.shape
+        lse_f32 = lse_in.astype(jnp.float32)
+        if not online_lse_combine_supported(tokens, heads, world, vdim, mode=mode):
+            logger.warning_once(
+                "dcp_online_lse_combine unsupported at trace shape "
+                "(tokens=%d, heads=%d, world=%d, vdim=%d, mode=%s); "
+                "falling back to XLA all-gather + reduce-scatter.",
+                tokens,
+                heads,
+                world,
+                vdim,
+                mode,
+            )
+            lses = jax.lax.all_gather(lse_f32, DCP_AXIS_NAME, axis=0)
+            weighted = _rs_weighted(o, lse_f32, lses)
+            merged = jax.lax.psum_scatter(
+                weighted, DCP_AXIS_NAME, scatter_dimension=1, tiled=True
+            )
+            return merged.astype(o.dtype)
+        return dcp_online_lse_combine(
+            o,
+            lse_f32,
+            num_cores=world,
+            axis=DCP_AXIS_NAME,
+            mode=mode,
+            rank=jnp.reshape(rank, (1,)),
+            lane_axis=lane_axis if lane_axis in mesh.axis_names else None,
+            lane=None if lane is None else jnp.reshape(lane, (1,)),
+            live_tokens=None if live is None else jnp.reshape(live, (1,)),
+            out_vmem=out_vmem,
+        )
+
+    def fake(output: torch.Tensor, lse: torch.Tensor, *_) -> torch.Tensor:
+        tokens, heads, vdim = output.shape
+        return output.new_empty((tokens, heads // world, vdim))
+
+    op_tag = (
+        f"pallas::dcp_online_lse_combine_{mode}_{world}"
+        + ("_live" if use_live else "")
+        + ("_ov" if out_vmem else "")
+    )
+    if multi_lane and use_live:
+        in_specs = (spec, spec, P(), spec, spec)
+
+        def fn(
+            o: jax.Array,
+            lse_in: jax.Array,
+            live: jax.Array,
+            rank: jax.Array,
+            lane: jax.Array,
+        ) -> jax.Array:
+            return jax.shard_map(
+                lambda a, b, lv, rk, ln: _run_combine(a, b, rk, lane=ln, live=lv),
+                mesh=mesh,
+                in_specs=in_specs,
+                out_specs=spec,
+                check_vma=False,
+            )(o, lse_in, live, rank, lane)
+
+    elif multi_lane:
+        in_specs = (spec, spec, spec, spec)
+
+        def fn(
+            o: jax.Array,
+            lse_in: jax.Array,
+            rank: jax.Array,
+            lane: jax.Array,
+        ) -> jax.Array:
+            return jax.shard_map(
+                lambda a, b, rk, ln: _run_combine(a, b, rk, lane=ln),
+                mesh=mesh,
+                in_specs=in_specs,
+                out_specs=spec,
+                check_vma=False,
+            )(o, lse_in, rank, lane)
+
+    elif use_live:
+        in_specs = (spec, spec, P(), spec)
+
+        def fn(
+            o: jax.Array,
+            lse_in: jax.Array,
+            live: jax.Array,
+            rank: jax.Array,
+        ) -> jax.Array:
+            return jax.shard_map(
+                lambda a, b, lv, rk: _run_combine(a, b, rk, live=lv),
+                mesh=mesh,
+                in_specs=in_specs,
+                out_specs=spec,
+                check_vma=False,
+            )(o, lse_in, live, rank)
+
+    else:
+        in_specs = (spec, spec, spec)
+
+        def fn(o: jax.Array, lse_in: jax.Array, rank: jax.Array) -> jax.Array:
+            return jax.shard_map(
+                lambda a, b, rk: _run_combine(a, b, rk),
+                mesh=mesh,
+                in_specs=in_specs,
+                out_specs=spec,
+                check_vma=False,
+            )(o, lse_in, rank)
+
+    op = sharded_jax_op(
+        op_tag,
+        fn,
+        mesh=mesh,
+        input_partition_specs=in_specs,
+        output_partition_specs=spec,
+        fake=fake,
+    )
+    entry = (op, multi_lane)
+    _ONLINE_COMBINE_OPS[key] = entry
+    return entry
+
+
+def prebuild_online_lse_combine(world: int) -> None:
+    """Register the online-LSE combine op for a DCP group of ``world`` ranks at
+    model build, outside any Dynamo trace."""
+    if world <= 1 or not online_lse_combine_mode_requested():
+        return
+    _ensure_online_lse_combine_op(world, use_live=True)
+
+
+def merge_lse_partials_online_combine(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any,
+    *,
+    query_start_loc: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Merge ``output`` ``[T, H, D]`` bf16 and ``lse`` ``[T, H]`` f32 across
+    ``group`` into ``[T, H // world, D]`` bf16 via ``dcp_online_lse_combine``."""
+    world = int(group.world_size)
+    use_live = query_start_loc is not None
+    op, multi_lane = _ensure_online_lse_combine_op(
+        world, use_live=use_live, group=group
+    )
+    part = output.contiguous()
+    lse_f32 = (
+        lse if lse.dtype == torch.float32 else lse.to(torch.float32)
+    ).contiguous()
+    args: list[Any] = [part, lse_f32]
+    if use_live:
+        assert query_start_loc is not None
+        args.append(query_start_loc[-1:].to(torch.int32))
+    args.append(_DCP_RANK)
+    if multi_lane:
+        args.append(_DCP_LANE)
+    return op(*args)

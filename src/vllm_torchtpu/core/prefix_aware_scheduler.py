@@ -74,9 +74,6 @@ class PrefixAwareScheduler(AsyncScheduler):
     #: Requests whose HBM-uncached part is shorter than this many tier chunks
     #: are not probed: they already rank as warm.
     TIER_PROBE_MIN_CHUNKS = 2
-    #: Maximum tier chunks probed per request (~256K tokens at 4096 tokens/chunk),
-    #: bounding per-step store lookups on very long prompts.
-    TIER_PROBE_MAX_CHUNKS = 64
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -87,13 +84,18 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._init_tier_warmth(envs.TPU_PREFIX_AWARE_TIER_WARMTH)
 
         logger.info(
-            "PrefixAwareScheduler ACTIVE (window=%d, tier_warmth=%s)",
+            "PrefixAwareScheduler ACTIVE (window=%d, tier_warmth=%s, "
+            "tier_probe_max_chunks=%d)",
             self.WINDOW,
             self._tier_warmth,
+            self._tier_probe_max_chunks,
         )
 
     def _init_tier_warmth(self, enabled: bool) -> None:
         self._tier_warmth = bool(enabled)
+        # Most tier chunks probed per request, bounding the store lookup on
+        # very long prompts.
+        self._tier_probe_max_chunks = envs.TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS
         self._tier_resolved = False
         self._tier_scheduler: TPURaidenOffloadingScheduler | None = None
         self._tier_probe_broken = False
@@ -162,7 +164,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         ):
             return cached[2]
 
-        stop_chunk = min(max_chunks, first_chunk + self.TIER_PROBE_MAX_CHUNKS)
+        stop_chunk = min(max_chunks, first_chunk + self._tier_probe_max_chunks)
         try:
             block_hashes = request.block_hashes
             keys = []

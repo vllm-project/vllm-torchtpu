@@ -89,7 +89,7 @@ def _judge(y, x, w, tag=""):
     return ok, info
 
 
-@pytest.mark.parametrize("m", [1, 3, 4, 8, 12, 16, 32, 64])
+@pytest.mark.parametrize("m", [1, 3, 4, 8, 12, 16, 32, 64, 80, 96])
 def test_matches_xla_and_f64(m):
     x, w = _x(m, seed=m), _w(N)
     y = lh.lm_head_hbm(x, w)
@@ -149,7 +149,9 @@ def test_dispatch():
             np.asarray(lh.lm_head_hbm(x, w), np.float32),
         )
     assert lh.supports(64, _x(64), w)
-    assert not lh.supports(65, _x(65), w)
+    assert lh.supports(80, _x(80), w)
+    assert lh.supports(lh.MAX_M, _x(lh.MAX_M), w)
+    assert not lh.supports(lh.MAX_M + 1, _x(lh.MAX_M + 1), w)
     assert not lh.supports(4, _x(4).astype(jnp.float32), w)
     assert not lh.supports(4, _x(4), w[:100])  # 100 rows: not a bf16 tile multiple
     assert not lh.supports(4, _x(4), w.astype(jnp.float32))
