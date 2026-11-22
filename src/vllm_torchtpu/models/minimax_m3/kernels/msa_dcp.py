@@ -203,7 +203,6 @@ def _candidates_kernel(
 # (`merge_pair_candidates`) on the scores the picks return.
 _KEY_TOP = 1 << 30
 _INT_MIN = -(1 << 31)
-# Accumulators (8-sublane groups) of a pick pass.
 _PICK_ACCUMULATORS = 4
 
 
@@ -240,9 +239,12 @@ def _key_scores(keys: jax.Array, col_bits: int) -> tuple[jax.Array, jax.Array]:
 
 
 # `_candidates_kernel_t` builds keys `_KEY_CHUNK[pretransposed]` columns at a
-# time and scans them in groups of `_PICK_ROWS` (accumulator groups unrolled).
+# time; a pick scans them with `_PICK_ACCUMULATORS` running maxima (one per
+# 8-sublane group), its loop unrolled `_PICK_UNROLL` times (AOT: 26 bundles
+# per 32 vregs; 2 picks per scan in sorted pairs or 4 took 1.0-1.1 bundles
+# per vreg and pick, as the insertions chain).
 _KEY_CHUNK = {True: 32, False: _LANES}
-_PICK_ROWS = 128
+_PICK_UNROLL = 4
 
 
 def _candidates_kernel_t(
@@ -277,12 +279,10 @@ def _candidates_kernel_t(
     num_cols = scores_ref.shape[0 if pretransposed else 1]
     rows = pos_ref.shape[1]
     chunk = _KEY_CHUNK[pretransposed]
-    sub = 8 * _PICK_ACCUMULATORS
     num_visible = pos_ref[...] // block_size + 1  # [1, rows]
     # A rank's blocks below n are among its first ceil(n / dcp) columns.
     needed = (jnp.max(num_visible) + dcp - 1) // dcp
     chunks = jnp.clip((needed + chunk - 1) // chunk, 1, num_cols // chunk)
-    lowest = jnp.full((_PICK_ROWS, rows), -_KEY_TOP, jnp.int32)
 
     def build(c, carry):
         start = pl.multiple_of(c * chunk, chunk)
@@ -299,44 +299,54 @@ def _candidates_kernel_t(
             msa_select._FORCED_LOCAL_SCORE,
             s,
         )
-        s = jnp.where(
-            visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
-        )
+        if init_blocks:
+            s = jnp.where(
+                visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
+            )
         key_ref[pl.ds(start, chunk), :] = _score_keys(s, cols, col_bits)
         return carry
 
     jax.lax.fori_loop(0, chunks, build, 0)
-    # The last scan group's rows past the keys: never picked before them.
-    key_ref[pl.ds(pl.multiple_of(chunks * chunk, chunk), _PICK_ROWS), :] = lowest
-    groups = (chunks * chunk + _PICK_ROWS - 1) // _PICK_ROWS
+    sub = 8 * _PICK_ACCUMULATORS
+    trips = chunks * chunk // sub
 
-    def pick(k, prev):
-        off = prev ^ _INT_MIN  # [8, rows]
+    def scan(off, acc, v):
+        x = key_ref[pl.ds(pl.multiple_of(v * sub, sub), sub), :]
+        return tuple(
+            jnp.maximum(a, x[8 * i : 8 * (i + 1)] - off) for i, a in enumerate(acc)
+        )
 
-        def scan(g, acc):
-            for u in range(_PICK_ROWS // sub):
-                at = pl.ds(pl.multiple_of(g * _PICK_ROWS + u * sub, sub), sub)
-                x = key_ref[at, :]
-                acc = tuple(
-                    jnp.maximum(a, x[8 * i : 8 * (i + 1)] - off)
-                    for i, a in enumerate(acc)
-                )
+    picks, prev = [], jnp.full((8, rows), _KEY_TOP, jnp.int32)
+    for _ in range(topk):
+        # The largest key below the last pick: ``key - off`` wraps the keys
+        # at or above it below every other.
+        off = prev ^ _INT_MIN
+
+        def unrolled(i, acc, off=off):
+            for u in range(_PICK_UNROLL):
+                acc = scan(off, acc, i * _PICK_UNROLL + u)
             return acc
 
-        init = (jnp.full((8, rows), _INT_MIN, jnp.int32),) * _PICK_ACCUMULATORS
-        acc = jax.lax.fori_loop(0, groups, scan, init)
-        while len(acc) > 1:
-            acc = tuple(jnp.maximum(acc[i], acc[i + 1]) for i in range(0, len(acc), 2))
-        best = jnp.max(acc[0], axis=0, keepdims=True) + off[:1]  # [1, rows]
-        score, col = _key_scores(best, col_bits)
-        slot = jnp.where((rank & 1) == 1, topk - 1 - k, k)
-        score_out_ref[pl.ds(slot, 1), :] = score
-        block_out_ref[pl.ds(slot, 1), :] = jnp.where(
-            score > _NEG_INF, col * dcp + rank, -1
+        acc = (jnp.full((8, rows), _INT_MIN, jnp.int32),) * _PICK_ACCUMULATORS
+        acc = jax.lax.fori_loop(0, trips // _PICK_UNROLL, unrolled, acc)
+        acc = jax.lax.fori_loop(
+            trips // _PICK_UNROLL * _PICK_UNROLL,
+            trips,
+            lambda v, acc, off=off: scan(off, acc, v),
+            acc,
         )
-        return jnp.broadcast_to(best, (8, rows))
-
-    jax.lax.fori_loop(0, topk, pick, jnp.full((8, rows), _KEY_TOP, jnp.int32))
+        best = functools.reduce(jnp.maximum, acc)
+        for shift in (4, 2, 1):  # across sublanes: every sublane gets the max
+            best = jnp.maximum(best, pltpu.roll(best, shift, 0))
+        prev = best + off
+        picks.append(prev[:1])
+    # Odd ranks list their picks in reverse (`local_candidates`).
+    keys = jnp.where(
+        (rank & 1) == 1, jnp.concatenate(picks[::-1]), jnp.concatenate(picks)
+    )
+    score, col = _key_scores(keys, col_bits)
+    score_out_ref[...] = score
+    block_out_ref[...] = jnp.where(score > _NEG_INF, col * dcp + rank, -1)
 
 
 # Row blocks of a multiple of this many rows (a vreg's lanes) pick
@@ -453,7 +463,7 @@ def local_candidates(
         p = p.T
         out_spec = pl.BlockSpec((topk, block_rows), lambda i: (0, i))
         out_dims = (topk, num_tokens + pad)
-        scratch = [pltpu.VMEM((num_cols + _PICK_ROWS, block_rows), jnp.int32)]
+        scratch = [pltpu.VMEM((num_cols, block_rows), jnp.int32)]
     else:
         kernel = _candidates_kernel
         pos_spec = pl.BlockSpec((block_rows, 1), lambda i: (i, 0))
