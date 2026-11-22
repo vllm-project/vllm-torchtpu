@@ -57,12 +57,15 @@ from __future__ import annotations
 import gc
 import os
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm_torchtpu import utils
 from vllm_torchtpu.compilation import fast_dispatch
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner import fast_forward_context, runner_options
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
 
@@ -138,24 +141,12 @@ def on_scheduler_step(vllm_config: Any) -> None:
 _done: set[int] = set()
 
 
-def _evaluate_guards(module: Any) -> bool:
-    """vLLM's evaluate_guards for this module (True when unknown: keep guards)."""
-    cfg = getattr(module, "compilation_config", None)
-    if cfg is None:
-        vcfg = getattr(module, "vllm_config", None)
-        cfg = getattr(vcfg, "compilation_config", None)
-    ds = getattr(cfg, "dynamic_shapes_config", None)
-    if ds is None:
-        return True
-    return bool(getattr(ds, "evaluate_guards", True))
-
-
-def maybe_skip_aot_guards(module: Any) -> bool:
+def maybe_skip_aot_guards(module: Any, vllm_config: VllmConfig) -> bool:
     """After a successful call of ``module`` (the MTP draft step and fused-loop
-    programs): once its freshly AOT-compiled function has run, skip that
-    function's per-call Dynamo guard evaluation, exactly as vLLM already does
-    for an AOT function it loads from cache when
-    ``dynamic_shapes_config.evaluate_guards`` is False
+    programs, built from ``vllm_config``): once its freshly AOT-compiled
+    function has run, skip that function's per-call Dynamo guard evaluation,
+    exactly as vLLM already does for an AOT function it loads from cache when
+    ``compilation_config.dynamic_shapes_config.evaluate_guards`` is False
     (``vllm/compilation/decorators.py``). The compiled callable that runs is
     the same object either way. Returns True when this call disabled it.
     Cheap after the first call per module."""
@@ -164,22 +155,21 @@ def maybe_skip_aot_guards(module: Any) -> bool:
     key = id(module)
     if key in _done:
         return False
+    # vLLM sets aot_compiled_fn once the module has compiled; its own
+    # __call__ reads it the same way.
     fn = getattr(module, "aot_compiled_fn", None)
     if fn is None:
         return False
     _done.add(key)
-    if not getattr(fn, "_guard_check_enabled", False):
+    if not fn._guard_check_enabled:
         return False
-    if _evaluate_guards(module):
+    if vllm_config.compilation_config.dynamic_shapes_config.evaluate_guards:
         logger.info(
             "Batch-1 host trims: %s keeps its AOT guards (evaluate_guards=True)",
             type(module).__name__,
         )
         return False
-    disable = getattr(fn, "disable_guard_check", None)
-    if disable is None:
-        return False
-    disable()
+    fn.disable_guard_check()
     logger.info(
         "Batch-1 host trims: per-call guard check off for %s "
         "(as vLLM's AOT cache-load path does with evaluate_guards=False)",

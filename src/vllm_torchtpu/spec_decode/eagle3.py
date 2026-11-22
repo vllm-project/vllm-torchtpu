@@ -638,7 +638,9 @@ class Eagle3Proposer:
                 self._mtp_fused_loop_warm = True
             out = self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
         if host_trims.AOT_SKIP_GUARDS:
-            host_trims.maybe_skip_aot_guards(self._mtp_fused_loop)
+            host_trims.maybe_skip_aot_guards(
+                self._mtp_fused_loop, self.draft_vllm_config
+            )
         return out
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
@@ -2099,7 +2101,7 @@ class Eagle3Proposer:
                 self._mtp_loop_model_warm = True
             out = model(**kwargs)
         if host_trims.AOT_SKIP_GUARDS:
-            host_trims.maybe_skip_aot_guards(model)
+            host_trims.maybe_skip_aot_guards(model, self.draft_vllm_config)
 
         return self._unwrap_model_out(out)
 

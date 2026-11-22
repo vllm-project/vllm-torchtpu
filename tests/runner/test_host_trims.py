@@ -380,11 +380,6 @@ def test_draft_forward_runs_the_program_for_the_current_block_table(
         torch._dynamo.reset()
 
 
-class _DS:
-    def __init__(self, evaluate):
-        self.evaluate_guards = evaluate
-
-
 class _AOTFn:
     def __init__(self):
         self._guard_check_enabled = True
@@ -393,45 +388,63 @@ class _AOTFn:
         self._guard_check_enabled = False
 
 
-def _module(evaluate):
-    m = types.SimpleNamespace()
-    m.compilation_config = types.SimpleNamespace(dynamic_shapes_config=_DS(evaluate))
-    m.aot_compiled_fn = _AOTFn()
-    return m
+def _draft_config(evaluate_guards):
+    # vLLM's own compilation config, so a renamed field fails here.
+    from vllm.config import CompilationConfig
+
+    cc = CompilationConfig()
+    cc.dynamic_shapes_config.evaluate_guards = evaluate_guards
+    return types.SimpleNamespace(compilation_config=cc)
+
+
+def _compiled_module():
+    return types.SimpleNamespace(aot_compiled_fn=_AOTFn())
 
 
 def test_aot_skip_guards_matches_vllm_load_policy(monkeypatch):
     host_trims._reset_for_tests()
     monkeypatch.setattr(host_trims, "AOT_SKIP_GUARDS", True)
-    m = _module(evaluate=False)
-    assert host_trims.maybe_skip_aot_guards(m) is True
+    m = _compiled_module()
+    assert host_trims.maybe_skip_aot_guards(m, _draft_config(False)) is True
     assert m.aot_compiled_fn._guard_check_enabled is False
-    assert host_trims.maybe_skip_aot_guards(m) is False  # once per module
-    keep = _module(evaluate=True)
-    assert host_trims.maybe_skip_aot_guards(keep) is False
+    # Once per module.
+    assert host_trims.maybe_skip_aot_guards(m, _draft_config(False)) is False
+    keep = _compiled_module()
+    assert host_trims.maybe_skip_aot_guards(keep, _draft_config(True)) is False
     assert keep.aot_compiled_fn._guard_check_enabled is True
-    unknown = types.SimpleNamespace(aot_compiled_fn=_AOTFn())
-    assert host_trims.maybe_skip_aot_guards(unknown) is False
-    assert unknown.aot_compiled_fn._guard_check_enabled is True
+
+
+def test_aot_skip_guards_fails_on_a_config_without_evaluate_guards(monkeypatch):
+    # A renamed evaluate_guards must fail, not read as "keep the guards".
+    host_trims._reset_for_tests()
+    monkeypatch.setattr(host_trims, "AOT_SKIP_GUARDS", True)
+    renamed = types.SimpleNamespace(
+        compilation_config=types.SimpleNamespace(
+            dynamic_shapes_config=types.SimpleNamespace()
+        )
+    )
+    m = _compiled_module()
+    with pytest.raises(AttributeError, match="evaluate_guards"):
+        host_trims.maybe_skip_aot_guards(m, renamed)
+    assert m.aot_compiled_fn._guard_check_enabled is True
 
 
 def test_aot_skip_guards_off_by_default(monkeypatch):
     host_trims._reset_for_tests()
     monkeypatch.setattr(host_trims, "AOT_SKIP_GUARDS", False)
-    m = _module(evaluate=False)
-    assert host_trims.maybe_skip_aot_guards(m) is False
+    m = _compiled_module()
+    assert host_trims.maybe_skip_aot_guards(m, _draft_config(False)) is False
     assert m.aot_compiled_fn._guard_check_enabled is True
 
 
 def test_aot_skip_guards_waits_for_compiled_fn(monkeypatch):
     host_trims._reset_for_tests()
     monkeypatch.setattr(host_trims, "AOT_SKIP_GUARDS", True)
-    m = types.SimpleNamespace(
-        compilation_config=types.SimpleNamespace(dynamic_shapes_config=_DS(False))
-    )
-    assert host_trims.maybe_skip_aot_guards(m) is False  # not compiled yet
+    m = types.SimpleNamespace()
+    cfg = _draft_config(False)
+    assert host_trims.maybe_skip_aot_guards(m, cfg) is False  # not compiled yet
     m.aot_compiled_fn = _AOTFn()
-    assert host_trims.maybe_skip_aot_guards(m) is True
+    assert host_trims.maybe_skip_aot_guards(m, cfg) is True
 
 
 def test_connector_env_cache(monkeypatch):
@@ -772,7 +785,9 @@ def _drafter_calls(monkeypatch, rule_on, fused):
     monkeypatch.setattr(
         host_trims,
         "maybe_skip_aot_guards",
-        lambda module: events.append(("skip_guards", module.name)),
+        lambda module, vllm_config: events.append(
+            ("skip_guards", module.name, vllm_config)
+        ),
     )
     monkeypatch.setattr(
         eagle3, "set_vllm_model_wrapper_context", lambda **_: contextlib.nullcontext()
@@ -834,7 +849,7 @@ def test_the_drafter_takes_the_cached_context_and_skips_guards_after_the_run(
         ("cached", draft_config, 3, ("across_dp", 3)),
         ("run", name),
         ("run", name),
-        ("skip_guards", name),
+        ("skip_guards", name, draft_config),
     ]
 
 
