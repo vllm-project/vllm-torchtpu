@@ -32,11 +32,13 @@ import torch
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
+from vllm import ir
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 
 from vllm_torchtpu.distributed import pallas_all_reduce
 from vllm_torchtpu.kernels import dspark_mlp as kernel
@@ -225,10 +227,27 @@ class MiniMaxM3DSparkMLP(MiniMaxM3MLP):
         return self._reduce(out), residual
 
 
+class CachedGemmaRMSNorm(GemmaRMSNorm):
+    """GemmaRMSNorm that, once `arm_fused_mlp` cached it, reads (1 + w) in f32
+    from a buffer instead of computing it on every call: the same values,
+    without a convert op per norm per step (1.1 / 1.3 us per q/k and hidden
+    norm at 24 rows, c4 twin j-617cb005)."""
+
+    def cache_weight(self) -> None:
+        w = fresh_buffer(self.weight.float() + 1.0)
+        self.register_buffer("_weight_plus_one", w, persistent=False)
+
+    def forward_native(self, x, residual=None):
+        w = getattr(self, "_weight_plus_one", None)
+        if w is None:
+            return super().forward_native(x, residual)
+        if residual is None:
+            return ir.ops.rms_norm(x, w, self.variance_epsilon)
+        return ir.ops.fused_add_rms_norm(x, residual, w, self.variance_epsilon)
+
+
 def _norm_weight(norm) -> torch.Tensor | None:
     """GemmaRMSNorm's f32 [1, h] (1 + w), or None for another norm."""
-    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-
     if not isinstance(norm, GemmaRMSNorm) or norm.weight.dim() != 1:
         return None
     return fresh_buffer((norm.weight.float() + 1.0).reshape(1, -1))
@@ -343,6 +362,9 @@ def arm_fused_mlp(model: torch.nn.Module | None, fold_all_reduce: bool = False) 
         armed.append(mlp)
     if not mlps:
         return 0
+    cached = [m for m in model.modules() if isinstance(m, CachedGemmaRMSNorm)]
+    for norm in cached:
+        norm.cache_weight()
     eps = None
     armed_layers = [layer for layer in layers if layer.mlp in armed]
     if armed and len(armed_layers) == len(armed):
@@ -356,12 +378,13 @@ def arm_fused_mlp(model: torch.nn.Module | None, fold_all_reduce: bool = False) 
     )
     logger.info(
         "DSpark draft: %d of %d MLPs run as one op%s%s; its kernel serves up to "
-        "%d rows (%s at this shape).",
+        "%d rows (%s at this shape); %d norms read a cached (1 + w).",
         len(armed),
         len(mlps),
         " with the post-attention norm" if eps is not None else "",
         " with the TP all-reduce" if folded else "",
         kernel.MAX_ROWS,
         "supported" if fits else "NOT supported",
+        len(cached),
     )
     return len(armed)

@@ -242,3 +242,19 @@ def test_op_signatures_are_valid_jax_ops():
         dspark_mlp._reducing_norm_signature,
     ):
         pallas._verify_signature(inspect.signature(make(None)))
+
+
+def test_cached_norm_matches_the_uncached_one():
+    norm = bridge.CachedGemmaRMSNorm.__new__(bridge.CachedGemmaRMSNorm)
+    nn.Module.__init__(norm)
+    norm.weight = nn.Parameter(torch.randn(H).to(torch.bfloat16))
+    norm.variance_epsilon = 1e-6
+    x = torch.randn(8, H).to(torch.bfloat16)
+    r = torch.randn(8, H).to(torch.bfloat16)
+    want, want_res = norm.forward_native(x, r)
+    want_plain = norm.forward_native(x)
+    assert bridge.arm_fused_mlp(nn.ModuleList([norm, _mlp()])) == 1
+    assert norm._weight_plus_one.dtype == torch.float32
+    got, got_res = norm.forward_native(x, r)
+    assert torch.equal(got, want) and torch.equal(got_res, want_res)
+    assert torch.equal(norm.forward_native(x), want_plain)

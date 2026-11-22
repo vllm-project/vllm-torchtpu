@@ -38,7 +38,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
-from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -63,7 +62,10 @@ from vllm_torchtpu.layers.adapter.cp_draft_attention import (
 )
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.minimax_m3.dspark_mlp import MiniMaxM3DSparkMLP
+from vllm_torchtpu.models.minimax_m3.dspark_mlp import (
+    CachedGemmaRMSNorm,
+    MiniMaxM3DSparkMLP,
+)
 from vllm_torchtpu.models.minimax_m3.quant import QUANT_METHOD
 from vllm_torchtpu.spec_decode.vocab_parallel_argmax import (
     MAX_VOCAB_FOR_FLOAT_IDS,
@@ -168,8 +170,8 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
             quant_config=quant_config,
             prefix=prefix,
         )
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = CachedGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = CachedGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
 
 class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
@@ -203,8 +205,8 @@ class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
             prefix=f"{prefix}.mlp",
         )
         hidden_size, eps = config.hidden_size, config.rms_norm_eps
-        self.input_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
-        self.post_attention_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
+        self.input_layernorm = CachedGemmaRMSNorm(hidden_size, eps=eps)
+        self.post_attention_layernorm = CachedGemmaRMSNorm(hidden_size, eps=eps)
 
     def forward(
         self,
@@ -283,8 +285,8 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
             vllm_config=vllm_config, start_layer_id=start_layer_id, prefix=prefix
         )
         hidden_size, eps = self.config.hidden_size, self.config.rms_norm_eps
-        self.hidden_norm = GemmaRMSNorm(hidden_size, eps=eps)
-        self.norm = GemmaRMSNorm(hidden_size, eps=eps)
+        self.hidden_norm = CachedGemmaRMSNorm(hidden_size, eps=eps)
+        self.norm = CachedGemmaRMSNorm(hidden_size, eps=eps)
         # One write op for every layer's DCP-sharded context K/V, set by
         # `prepare_draft_kv_write` once the layers' attention is set up.
         self._sharded_kv_write_op = None
