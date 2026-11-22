@@ -346,7 +346,9 @@ def main():
         from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
 
         if main_kv_dcp() > 1:  # the QSA layers' dcp_rank buffer: tp rank % 2, one per rank
-            args.append(jax.device_put(jnp.arange(R, dtype=jnp.int32) % main_kv_dcp(), tp))
+            rank = jnp.arange(R, dtype=jnp.int32) % main_kv_dcp()
+            args.append(jax.ShapeDtypeStruct(rank.shape, rank.dtype, sharding=tp) if a.aot
+                        else jax.device_put(rank, tp))
         f = jax.jit(call, donate_argnums=donate)
         if a.aot:
             t0 = time.time()
@@ -481,8 +483,9 @@ def _check_selection(sel: np.ndarray, R: int, B: int, K: int, ctx_q: list) -> No
         blk = np.where(g[:, None] >= 0, g[:, None] * 4 + np.arange(4), -1).reshape(-1)[: 4 * cnt]
         ok &= bool(np.array_equal(s[: 4 * cnt], blk))
         tail = [p for p in range(nv * 4, n)]
-        ok &= bool(np.array_equal(s[4 * cnt : 4 * cnt + len(tail)], tail))
-        ok &= bool((s[4 * cnt + len(tail) :] == -1).all())
+        # The served rows leave the partial group's tokens -1 (`export_selection`).
+        ok &= bool(np.array_equal(s[4 * cnt : 4 * cnt + len(tail)], tail)
+                   and (s[4 * cnt + len(tail) :] == -1).all()) or bool((s[4 * cnt :] == -1).all())
         n_full += int(nv > K)
         n_ga += int(nv > K and cnt and g[cnt - 1] == ga)
         if not ok:

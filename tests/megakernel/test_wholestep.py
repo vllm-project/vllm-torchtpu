@@ -589,7 +589,7 @@ def test_export_ids_restore_the_full_stock_selection(kw):
         assert sorted(groups[row][groups[row] >= 0].tolist()) == want, row
         assert lens[row] == c0 + row % T + 1
         want_blocks[row, : len(want)] = want
-    got = np.asarray(export_selection(jnp.asarray(sel[0]), ctx, starts, T=T, K=K, rows=B))
+    got = np.asarray(export_selection(jnp.asarray(sel[0]), ctx, starts, T=T, K=K, rows=B, tails=True))
     sorted_groups = np.sort(np.where(groups < 0, np.iinfo(np.int32).max, groups), axis=1)
     sorted_groups = np.where(sorted_groups == np.iinfo(np.int32).max, -1, sorted_groups)
     np.testing.assert_array_equal(sorted_groups, want_blocks)
