@@ -77,6 +77,19 @@ _EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale
 _unused_weight_predicate: Callable[[str], bool] | None = None
 
 
+# Set by a model that places checkpoint experts in other expert slots
+# (models/minimax_m3/expert_placement.py): (tensor name, checkpoint expert id)
+# -> the slot the EP ownership map is about. Only MiniMaxM3Model sets it, at
+# construction, and it lasts for the process: its load_weights may run more
+# than once per load.
+_expert_slot: Callable[[str, int], int] | None = None
+
+
+def set_expert_slot_map(slot_of: Callable[[str, int], int] | None) -> None:
+    global _expert_slot
+    _expert_slot = slot_of
+
+
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
 
@@ -85,6 +98,8 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
         return False
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
         return False
+    if _expert_slot is not None:
+        expert_id = _expert_slot(name, expert_id)
     return expert_id not in local_expert_ids
 
 

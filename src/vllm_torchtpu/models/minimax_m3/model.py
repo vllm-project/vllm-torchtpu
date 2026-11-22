@@ -41,13 +41,17 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, model_loader_patches
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.layers.adapter.quantization.fp8_lm_head import Fp8LMHeadMethod
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
+from vllm_torchtpu.models.minimax_m3.expert_placement import ExpertPlacement
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
 from vllm_torchtpu.utils import fresh_buffer
+
+# Per-routed-expert rows outside the experts: they follow the expert placement.
+_PER_EXPERT_ROWS = (".block_sparse_moe.gate.weight", ".e_score_correction_bias")
 
 
 class FoldedGemmaRMSNorm(GemmaRMSNorm):
@@ -247,6 +251,11 @@ def _all_gather_rows(x: torch.Tensor, fp8: bool) -> torch.Tensor:
 class MiniMaxM3Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        placement = ExpertPlacement(
+            vllm_config.model_config.hf_text_config.num_local_experts
+        )
+        # The EP weight filter keeps the checkpoint experts of this rank's slots.
+        model_loader_patches.set_expert_slot_map(placement.slot if placement else None)
         config = vllm_config.model_config.hf_text_config
         self.config = config
         # Keys this model's compile-artifact cache directory.
@@ -325,8 +334,11 @@ class MiniMaxM3Model(nn.Module):
         )
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        placement = ExpertPlacement(self.config.num_local_experts)
         for name, loaded_weight in weights:
             name = name.replace(".weight_scale_inv", ".weight_scale")
+            if name.endswith(_PER_EXPERT_ROWS):
+                loaded_weight = placement.to_slots(name, loaded_weight)
             if ".experts." in name:
                 for ct_suffix, modelopt_suffix in CT_TO_MODELOPT_EXPERT_SUFFIX.items():
                     name = name.replace(ct_suffix, modelopt_suffix)
@@ -345,7 +357,7 @@ class MiniMaxM3Model(nn.Module):
                         loaded_weight,
                         name,
                         shard_id=shard_id,
-                        expert_id=expert_id,
+                        expert_id=placement.slot(name, expert_id),
                     )
                     break
                 else:
