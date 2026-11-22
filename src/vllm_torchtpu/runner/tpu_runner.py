@@ -170,7 +170,6 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabl
 from vllm_torchtpu.runner import greedy_top_tokens
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
-from vllm_torchtpu.runner.bucket_stats import BucketStats
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -182,6 +181,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
 )
+from vllm_torchtpu.runner.bucket_stats import BucketStats
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
@@ -3454,8 +3454,7 @@ class TPUModelRunner(GPUModelRunner):
         local_padded_total_num_scheduled_tokens = layout_plan.local_padded_num_tokens
         if (bucket_stats := getattr(self, "_bucket_stats", None)) is not None:
             bucket_stats.record(
-                local_padded_total_num_scheduled_tokens,
-                local_total_num_scheduled_tokens,
+                local_padded_total_num_scheduled_tokens, local_total_num_scheduled_tokens
             )
         local_token_slice = layout_plan.token_slice
         if layout_plan.kind is SequenceLayoutKind.ALL:
@@ -5075,6 +5074,7 @@ class TPUModelRunner(GPUModelRunner):
                 # No draw: the fused program makes the uniforms (or the
                 # fallback draws them at sample time).
                 md.synthetic_uniforms = None
+                md.synthetic_keyed = True
                 md.synthetic_hidden_states = hidden_states
                 return hidden_states
             if self._draw_synthetic_uniforms(md):
@@ -5216,7 +5216,7 @@ class TPUModelRunner(GPUModelRunner):
         temperatures, top_k, top_p = self._padded_sampling_params(
             cur_start_idx, cur_end_idx, num_reqs, torch.float32, hidden_states.device
         )
-        keyed = md.synthetic_uniforms is None
+        keyed, md.synthetic_keyed = md.synthetic_keyed, False
         args = (
             hidden_states,
             md.draft_token_ids,
@@ -7453,6 +7453,10 @@ class TPUModelRunner(GPUModelRunner):
                             continue
                         synchronize_tensors(_substitute_and_extract_drafts(*args))
                         self._substitute_drafts_warm.add(key)
+        logger.info(
+            "Warmed _substitute_and_extract_drafts at %d argument sets",
+            len(self._substitute_drafts_warm),
+        )
         self._substitute_source_seen = None
 
     def _precompile_rejection_sampler(self) -> None:

@@ -74,6 +74,9 @@ class SpecDecodeMetadata:
     # wait for the sampler's program (`TPU_SPEC_SYNTHETIC_FUSED_VERIFY`); the
     # step's logits entry then holds these too.
     synthetic_hidden_states: torch.Tensor | None = None
+    # The fused verify makes its uniforms from stream keys instead of
+    # ``synthetic_uniforms`` (`TPU_SPEC_SYNTHETIC_KEYED_UNIFORMS`).
+    synthetic_keyed: bool = False
 
     def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
         assert self.deferred_draft_token_ids_cpu is not None

@@ -541,13 +541,7 @@ def test_synthetic_sample_split_over_ranks_matches_one_rank(monkeypatch, seed):
         synthetic_sample_rows_and_assemble(
             logits[rank * per_rank : (rank + 1) * per_rank],
             torch.tensor([rank], dtype=torch.int32),
-            recover_draft,
-            accepted,
-            temps,
-            top_k,
-            top_p,
-            recover_u,
-            *tables,
+            recover_draft, accepted, temps, top_k, top_p, recover_u, *tables,
             **layout,
         )
     gathered = torch.cat(blocks)
@@ -557,13 +551,7 @@ def test_synthetic_sample_split_over_ranks_matches_one_rank(monkeypatch, seed):
     output = synthetic_sample_rows_and_assemble(
         logits[:per_rank],
         torch.tensor([0], dtype=torch.int32),
-        recover_draft,
-        accepted,
-        temps,
-        top_k,
-        top_p,
-        recover_u,
-        *tables,
+        recover_draft, accepted, temps, top_k, top_p, recover_u, *tables,
         **layout,
     )
     assert torch.equal(output, expected)
