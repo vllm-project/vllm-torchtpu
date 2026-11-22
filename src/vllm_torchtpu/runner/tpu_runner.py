@@ -446,8 +446,9 @@ def _substitute_and_extract_drafts(
     if token_in_tpu_cur_input_indices is None:
         # A copy: the program returning a view of its input made the forward
         # run a separate as_strided program to materialize it.
-        input_ids = next_tokens.flatten()[: input_ids.shape[0]].to(input_ids.dtype)
-        input_ids = input_ids.clone()
+        input_ids = next_tokens.flatten()[: input_ids.shape[0]].to(
+            input_ids.dtype, copy=True
+        )
     else:
         assert token_in_tpu_pre_next_tokens_indices is not None
         input_ids = _substitute_placeholder_token_body(

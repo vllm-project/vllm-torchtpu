@@ -1662,31 +1662,21 @@ def _arm_pair_merge_block(layers, mesh, perm, pair_op, meta, shape, tp) -> dict:
         return {}
     keys = {_block_key(m.impl.sharded_draft_dcp["ops"]["block_args"]) for m in layers}
     keys.discard(None)
+    import faulthandler
+
     device = meta.device
     gen = torch.Generator().manual_seed(11 + int(tp.rank_in_group))
     built, ok = {}, True
-    for key in sorted(keys):
-        max_query_len, sm_scale, causal = key
-        block_op = _pair_merge_block_op(mesh, perm, max_query_len, sm_scale, causal)
-        rows, (two_h, d) = 2 * max_query_len + 2, shape
-        heads = two_h // 2
-
-        def t(*dims, dtype=torch.bfloat16, scale=1.0):
-            return (torch.randn(dims, generator=gen) * scale).to(dtype).to(device)
-
-        out, lse = t(rows, two_h, d), t(rows, two_h, dtype=torch.float32, scale=3)
-        q, key_, value = t(rows, heads, d), t(rows, 1, d), t(rows, 1, d)
-        seq_lens = torch.zeros(2, dtype=torch.int32, device=device)
-        starts = torch.arange(3, dtype=torch.int32, device=device) * max_query_len
-        got = block_op(out, lse, meta, q, key_, value, seq_lens)
-        ctx, ctx_lse = pair_op(out, lse, meta)
-        want = _block_op(max_query_len, sm_scale, causal, True)(
-            q, key_, value, seq_lens, starts, ctx, ctx_lse
-        )
-        ok &= bool(
-            torch.allclose(got.float().cpu(), want.float().cpu(), rtol=2**-6, atol=1e-2)
-        )
-        built[key] = block_op
+    # A wrong peer or semaphore hangs the exchange instead of failing.
+    faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
+    try:
+        for key in sorted(keys):
+            built[key], passed = _selftest_block_op(
+                key, mesh, perm, pair_op, meta, shape, gen, device
+            )
+            ok &= passed
+    finally:
+        faulthandler.cancel_dump_traceback_later()
     seen = [None] * tp.world_size
     torch.distributed.all_gather_object(seen, ok, group=tp.cpu_group)
     if not all(seen):
@@ -1694,6 +1684,33 @@ def _arm_pair_merge_block(layers, mesh, perm, pair_op, meta, shape, tp) -> dict:
         return {}
     logger.info("DCP draft pair merge folds the block op (%s).", sorted(built))
     return built
+
+
+def _selftest_block_op(key, mesh, perm, pair_op, meta, shape, gen, device):
+    """The folded op of block configuration ``key`` and whether it matches the
+    unfused pair merge + block op on a decode block (two requests and two
+    padding rows)."""
+    max_query_len, sm_scale, causal = key
+    block_op = _pair_merge_block_op(mesh, perm, max_query_len, sm_scale, causal)
+    rows, (two_h, d) = 2 * max_query_len + 2, shape
+    heads = two_h // 2
+
+    def t(*dims, dtype=torch.bfloat16, scale=1.0):
+        return (torch.randn(dims, generator=gen) * scale).to(dtype).to(device)
+
+    out, lse = t(rows, two_h, d), t(rows, two_h, dtype=torch.float32, scale=3)
+    q, key_, value = t(rows, heads, d), t(rows, 1, d), t(rows, 1, d)
+    seq_lens = torch.zeros(2, dtype=torch.int32, device=device)
+    starts = torch.arange(3, dtype=torch.int32, device=device) * max_query_len
+    got = block_op(out, lse, meta, q, key_, value, seq_lens)
+    ctx, ctx_lse = pair_op(out, lse, meta)
+    want = _block_op(max_query_len, sm_scale, causal, True)(
+        q, key_, value, seq_lens, starts, ctx, ctx_lse
+    )
+    passed = torch.allclose(
+        got.float().cpu(), want.float().cpu(), rtol=2**-6, atol=1e-2
+    )
+    return block_op, bool(passed)
 
 
 def arm_pair_merge(model: torch.nn.Module) -> int:
