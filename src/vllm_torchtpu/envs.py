@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = True
     TPU_DEEPSEEK_V41_MHC_ENTRY_GATE_KERNEL: bool = False
     TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS: bool = True
+    TPU_DEEPSEEK_V41_DRAFT_VP_PICKS: bool = False
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
     TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
@@ -585,6 +586,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Changes only the draft logits' rounding (FP32 accumulation order).
     "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS": env_bool(
         "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS", default=True
+    ),
+    # With the vocab-parallel head, pick the DSpark drafter's greedy tokens on
+    # each rank's vocab slice and exchange one (value, index) pair per request
+    # per pick, instead of returning [T, V] logits and reading the whole Markov
+    # table (vocab_parallel_head.make_picks). Changes only rounding order.
+    # Remove the switch, keeping the slice picks, once accuracy holds in serving.
+    "TPU_DEEPSEEK_V41_DRAFT_VP_PICKS": env_bool(
+        "TPU_DEEPSEEK_V41_DRAFT_VP_PICKS", default=False
     ),
     # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
     # 256-row gathers when a step has 257..1024 rows

@@ -235,3 +235,147 @@ def is_vocab_parallel(lm_head: torch.nn.Module | None) -> bool:
 def logits(lm_head: torch.nn.Module, hidden: torch.Tensor) -> torch.Tensor:
     """[T, D] rows of this rank -> [T, V] BF16 logits over the whole vocab."""
     return lm_head.vocab_parallel_op(hidden.to(torch.bfloat16), lm_head.weight)
+
+
+def _bf16(values):
+    # An explicit BF16 rounding that XLA keeps inside fusions, where a plain
+    # cast pair may be dropped and leave an FP32 intermediate.
+    return jax.lax.reduce_precision(values, exponent_bits=8, mantissa_bits=7)
+
+
+def make_picks(mesh, world: int, vocab: int, block: int):
+    """Greedy DSpark draft picks on the vocab-parallel head, without the [T, V]
+    logits: (rows [W*T, D] bf16, head [V, D] bf16, markov_w1 W copies
+    [W*V, r] bf16, markov_w2 [V, r] bf16, anchors [W*R] i32, ranks [W] i32),
+    all sharded on axis 0, T = R * block -> tokens [W*R, block] i32.
+
+    Each rank scores every rank's rows on its vocab slice. A pick adds
+    bf16(markov_w1[prev] @ markov_w2_slice^T) to the slice's logits, rounds the
+    sum to BF16, takes the slice's (max, first index), and the ranks exchange
+    one (value, index) pair per request. Slices are in rank order, so the
+    lowest rank winning a tie gives the first-index argmax over the whole
+    vocab, as the full-vocab pick does.
+    """
+    shard = vocab // world
+
+    def local(x, w, w1, w2, anchors, ranks):
+        rows, width = x.shape
+        requests = rows // block
+        # Slot-major rows [block, R]: pick i reads one contiguous [W*R, V/W]
+        # block of the logits instead of a strided row every block rows.
+        x = x.reshape(requests, block, width).transpose(1, 0, 2).reshape(rows, width)
+        copies = jnp.broadcast_to(x[None], (world, rows, width))
+        every = jax.lax.all_to_all(
+            copies.reshape(world * rows, width), EP_AXIS_NAME, 0, 0, tiled=True
+        )
+        part = (
+            _bf16(
+                jax.lax.dot_general(
+                    every,
+                    w,
+                    (((1,), (1,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+            )
+            .astype(jnp.bfloat16)
+            .reshape(world, block, requests, shard)
+        )
+        # The rank arrives as a per-device input: axis_index lowers to
+        # partition-id, which the torch_tpu export path refuses.
+        rank = ranks[0]
+        prev = jax.lax.all_to_all(
+            jnp.broadcast_to(anchors[None], (world, requests)),
+            EP_AXIS_NAME,
+            0,
+            0,
+            tiled=True,
+        ).reshape(world * requests)
+        tokens = []
+        for i in range(block):
+            bias = _bf16(
+                jax.lax.dot_general(
+                    w1[prev],
+                    w2,
+                    (((1,), (1,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+            )
+            logits = part[:, i].reshape(world * requests, shard)
+            scores = _bf16(logits.astype(jnp.float32) + bias)
+            first = jnp.argmax(scores, axis=-1).astype(jnp.int32)
+            value = jnp.take_along_axis(scores, first[:, None], axis=1)[:, 0]
+            # [2, W*R] i32 per rank -> [W, 2, W*R]: every rank's slice winner.
+            packed = jnp.stack(
+                [jax.lax.bitcast_convert_type(value, jnp.int32), first + rank * shard]
+            )
+            got = jax.lax.all_to_all(
+                jnp.broadcast_to(packed[None], (world,) + packed.shape),
+                EP_AXIS_NAME,
+                0,
+                0,
+                tiled=True,
+            )
+            winner = jnp.argmax(
+                jax.lax.bitcast_convert_type(got[:, 0], jnp.float32), axis=0
+            )
+            prev = jnp.take_along_axis(got[:, 1], winner[None], axis=0)[0]
+            tokens.append(prev)
+        every_tokens = jnp.stack(tokens, axis=1)
+        return jax.lax.dynamic_slice_in_dim(
+            every_tokens, rank * requests, requests, axis=0
+        )
+
+    def picks(
+        x: jax.Array,
+        w: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        anchors: jax.Array,
+        ranks: jax.Array,
+    ) -> jax.Array:
+        rows = P(EP_AXIS_NAME, None)
+        return jax.shard_map(
+            local,
+            mesh=mesh,
+            in_specs=(rows, rows, rows, rows, P(EP_AXIS_NAME), P(EP_AXIS_NAME)),
+            out_specs=rows,
+            check_vma=False,
+        )(x, w, w1, w2, anchors, ranks)
+
+    return picks
+
+
+@cache
+def build_picks_op(world: int, vocab: int, width: int, block: int):
+    """Torch op for ``make_picks`` over the EP mesh; built at load time, like
+    ``build_head_op``."""
+    from torch_tpu._internal.pallas import jax_op
+
+    from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
+
+    mesh = build_ep_mesh()
+    if mesh is None:
+        raise RuntimeError(
+            "The vocab-parallel draft picks need an expert-parallel mesh"
+        )
+    rows = P(EP_AXIS_NAME, None)
+    op = jax_op(
+        f"pallas::dsv41_vocab_parallel_picks_v{vocab}_d{width}_k{block}",
+        make_picks(mesh, world, vocab, block),
+        mesh=mesh,
+        input_partition_specs=(
+            rows,
+            rows,
+            rows,
+            rows,
+            P(EP_AXIS_NAME),
+            P(EP_AXIS_NAME),
+        ),
+        output_partition_specs=rows,
+    )
+
+    def fake(x, w, w1, w2, anchors, ranks):
+        return anchors.new_empty((anchors.shape[0], block), dtype=torch.int32)
+
+    op.register_fake(fake)
+    return op

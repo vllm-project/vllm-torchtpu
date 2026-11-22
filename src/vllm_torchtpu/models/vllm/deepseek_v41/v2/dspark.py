@@ -400,6 +400,8 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             return None
         assert self.lm_head is not None
         if vocab_parallel_head.is_vocab_parallel(self.lm_head):
+            if envs.TPU_DEEPSEEK_V41_DRAFT_VP_PICKS:
+                return self._prepare_vocab_parallel_picks(block_size)
             # The shared head holds only this rank's vocab rows: the fused
             # sampler's full-vocab Pallas head cannot read it. Draft logits go
             # through compute_logits, which runs the vocab-parallel head.
@@ -425,6 +427,54 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         if envs.TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS:
             self._decode_logits = initialize_logits_head()
         return self._sample_decode
+
+    def _prepare_vocab_parallel_picks(self, block_size: int):
+        """Greedy picks on this rank's vocab slice; no full-vocab logits."""
+        from vllm_torchtpu.distributed.ep_mesh import ep_device_ids, ep_mesh_index
+
+        assert self.lm_head is not None
+        markov = self.model.markov_head
+        ids = ep_device_ids()
+        # The vocab-parallel head exists only with EP over 2 or more ranks.
+        assert ids is not None
+        world = len(ids)
+        vocab = self.lm_head.vocab_parallel_vocab
+        shard = vocab // world
+        rank = ep_mesh_index()
+        # This rank's rows of markov_w2, the slice its picks score.
+        self._vp_markov_w2 = markov.markov_w2.weight.data[
+            rank * shard : (rank + 1) * shard
+        ].clone()
+        # The rank as a per-device input of the op, which cannot use axis_index.
+        self._vp_rank = torch.full(
+            (1,), rank, dtype=torch.int32, device=self._vp_markov_w2.device
+        )
+        self._vp_picks = vocab_parallel_head.build_picks_op(
+            world, vocab, self.lm_head.weight.shape[1], block_size
+        )
+        logger.info(
+            "DSpark draft picks: on the vocab slice, rank %d of %d, markov_w2 rows %s",
+            rank,
+            world,
+            tuple(self._vp_markov_w2.shape),
+        )
+        return self._sample_vocab_parallel
+
+    def _sample_vocab_parallel(
+        self, hidden: torch.Tensor, input_ids: torch.Tensor, block_size: int
+    ) -> torch.Tensor | None:
+        rows = hidden.shape[0]
+        assert self.lm_head is not None
+        anchors = input_ids[:rows].view(rows // block_size, block_size)[:, 0]
+        tokens = self._vp_picks(
+            self.model.norm(hidden).to(torch.bfloat16),
+            self.lm_head.weight,
+            self.model.markov_head.markov_w1.weight,
+            self._vp_markov_w2,
+            anchors.to(torch.int32),
+            self._vp_rank,
+        )
+        return tokens.to(torch.int64)
 
     def _sample_decode(
         self, hidden: torch.Tensor, input_ids: torch.Tensor, block_size: int
