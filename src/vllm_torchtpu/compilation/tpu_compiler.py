@@ -33,10 +33,10 @@ from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
-from vllm_torchtpu.logger import init_logger
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -272,6 +272,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TORCH_TPU_BASE_PORT",
     "TORCH_TPU_MP_RENDEZVOUS_PORT",
     "TPU_LOCAL_RANK_OFFSET",
+    "TPU_PHYSICAL_LOCAL_RANK",
     "TPU_SHARDED_LOAD_SYNC_EVERY",
     "VLLM_TORCHTPU_IPC_KEY",
     "VLLM_TPU_DEBUG_PCP_LAYOUT",

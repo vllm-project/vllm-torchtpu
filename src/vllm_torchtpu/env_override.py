@@ -204,14 +204,27 @@ _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
 # given: keep it at or below the kernel's smallest all-reduce (3 MiB for
 # GLM-5.2 at its 256-token minimum).
 _PREFILL_KERNEL_ALL_REDUCE_BYTES = 1 << 20
+_TOKEN_PARALLEL_ALL_GATHER_BYTES = 6 << 20
 SC_ALL_REDUCE_FLAG = "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
+SC_ALL_GATHER_FLAG = "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"
 _PREFILL_KERNEL_LOWERS_FLOOR = envs.FUSED_MOE_PREFILL_KERNEL and envs.is_set(
     "FUSED_MOE_PREFILL_KERNEL"
+)
+# Avoid keeping an >= 8 MiB all-gather floor under token-parallel DCP:
+# fused 3-D page gathers eliminate the standalone 6 MiB rope all-gather,
+# so 6 MiB offloads the 6.19 MiB cap=12 indexer-K gather to SparseCore
+# (where lowering to 4 MiB adds SparseCore contention on 4.12 MiB cap=8).
+# Trigger when either TPU_DCP_PREFILL_TOKEN_PARALLEL or a positive
+# TPU_DCP_MLA_TOPK_CAP is set and token-parallel prefill remains enabled
+# (so non-DCP models keep 64 MiB).
+_TOKEN_PARALLEL_LOWERS_AG_FLOOR = envs.TPU_DCP_PREFILL_TOKEN_PARALLEL and (
+    envs.is_set("TPU_DCP_PREFILL_TOKEN_PARALLEL")
+    or (envs.TPU_DCP_MLA_TOPK_CAP > 0 and envs.is_set("TPU_DCP_MLA_TOPK_CAP"))
 )
 if _sc_offload_bytes is not None:
     for _flag_name in (
         SC_ALL_REDUCE_FLAG,
-        "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
+        SC_ALL_GATHER_FLAG,
     ):
         _bytes = _sc_offload_bytes
         if (
@@ -220,6 +233,12 @@ if _sc_offload_bytes is not None:
             and envs.SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES is None
         ):
             _bytes = min(_bytes, _PREFILL_KERNEL_ALL_REDUCE_BYTES)
+        if (
+            _flag_name == SC_ALL_GATHER_FLAG
+            and _TOKEN_PARALLEL_LOWERS_AG_FLOOR
+            and envs.SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES is None
+        ):
+            _bytes = min(_bytes, _TOKEN_PARALLEL_ALL_GATHER_BYTES)
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_bytes}")
 

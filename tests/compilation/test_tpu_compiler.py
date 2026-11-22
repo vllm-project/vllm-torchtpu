@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
+from vllm_torchtpu import env_override
 from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
 
 
@@ -383,6 +384,66 @@ class TestTpuCompilerCache:
                 "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes="
                 f"{64 << 20}",
                 "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=4096",
+            ]
+
+    @pytest.mark.parametrize(
+        "token_parallel,extra_env,all_reduce,all_gather",
+        [
+            ("1", {}, 64 << 20, 6 << 20),
+            (None, {}, 64 << 20, 64 << 20),
+            ("0", {}, 64 << 20, 64 << 20),
+            (None, {"TPU_DCP_MLA_TOPK_CAP": "512"}, 64 << 20, 6 << 20),
+            ("0", {"TPU_DCP_MLA_TOPK_CAP": "512"}, 64 << 20, 64 << 20),
+            (None, {"TPU_DCP_MLA_TOPK_CAP": "0"}, 64 << 20, 64 << 20),
+            ("1", {"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": "12345"}, 12345, 12345),
+            (
+                "1",
+                {"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": str(64 << 20)},
+                64 << 20,
+                64 << 20,
+            ),
+            ("1", {"TPU_ACCELERATOR_TYPE": "unknown-8"}, None, None),
+        ],
+    )
+    def test_should_lower_all_gather_floor_when_token_parallel_dcp_active(
+        self, token_parallel, extra_env, all_reduce, all_gather
+    ):
+        env_mock = {
+            **(
+                {}
+                if token_parallel is None
+                else {"TPU_DCP_PREFILL_TOKEN_PARALLEL": token_parallel}
+            ),
+            "TPU_ACCELERATOR_TYPE": "tpu7x-16",
+            **extra_env,
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            importlib.reload(env_override)
+
+            expected = [
+                f"--xla_tpu_sparse_core_{op}_offload_min_size_in_bytes={n}"
+                for op, n in (("all_reduce", all_reduce), ("all_gather", all_gather))
+                if n is not None
+            ]
+            assert self._sc_offload_flags() == expected
+
+    def test_should_keep_user_all_gather_flag_when_token_parallel_explicitly_set(self):
+        env_mock = {
+            "TPU_DCP_PREFILL_TOKEN_PARALLEL": "1",
+            "TPU_ACCELERATOR_TYPE": "tpu7x-16",
+            "LIBTPU_INIT_ARGS": (
+                "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=33554432"
+            ),
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            importlib.reload(env_override)
+
+            assert self._sc_offload_flags() == [
+                (
+                    "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes="
+                    f"{64 << 20}"
+                ),
+                "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=33554432",
             ]
 
     @pytest.mark.parametrize(
