@@ -110,7 +110,6 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         StepMetaOps,
         check_ckpt_write_cols_distinct,
         pack_step_meta,
-        resolve_step_positions,
     )
 
 # Public names resolve on first access (PEP 562): importing a submodule
@@ -196,7 +195,6 @@ _LAZY: dict[str, str] = {
     "StepMetaOps": ".step_meta",
     "check_ckpt_write_cols_distinct": ".step_meta",
     "pack_step_meta": ".step_meta",
-    "resolve_step_positions": ".step_meta",
 }
 
 __all__ = [
@@ -265,7 +263,6 @@ __all__ = [
     "policy",
     "pool_schedule_info",
     "resolve_driver_profile",
-    "resolve_step_positions",
     "select_bucket",
     "stats",
     "step_meta",

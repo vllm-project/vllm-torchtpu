@@ -64,11 +64,8 @@ class TorchStepMetaOps:
     def zeros_like_i32(self, x: torch.Tensor) -> torch.Tensor:
         return torch.zeros_like(x)
 
-    def arange_i32(self, start: int, stop: int, *, like: torch.Tensor) -> torch.Tensor:
-        return torch.arange(start, stop, dtype=torch.int32, device=like.device)
-
-    def clip(self, x: torch.Tensor, lo: int, hi: int | None = None) -> torch.Tensor:
-        return x.clamp(min=lo) if hi is None else x.to(torch.long).clamp(min=lo, max=hi)
+    def clip(self, x: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
+        return x.to(torch.long).clamp(min=lo, max=hi)
 
     def take_1d(self, table_1d: torch.Tensor, idx_1d: torch.Tensor) -> torch.Tensor:
         return table_1d[idx_1d].to(torch.int32)

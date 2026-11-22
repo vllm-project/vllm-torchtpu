@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Framework-free step metadata packing and position resolution."""
+"""Framework-free step metadata packing."""
 
 from __future__ import annotations
 
@@ -51,8 +51,7 @@ class StepMetaOps(Protocol):
     def slice_or_pad_2d(self, x: Any, target_rows: int, target_cols: int) -> Any: ...
     def zeros_i32(self, shape: tuple[int, ...], *, like: Any) -> Any: ...
     def zeros_like_i32(self, x: Any) -> Any: ...
-    def arange_i32(self, start: int, stop: int, *, like: Any) -> Any: ...
-    def clip(self, x: Any, lo: int, hi: int | None = None) -> Any: ...
+    def clip(self, x: Any, lo: int, hi: int) -> Any: ...
     def take_1d(self, table_1d: Any, idx_1d: Any) -> Any: ...
     def take_col_2d(self, table_2d: Any, col_idx_1d: Any) -> Any: ...
     def expand_1d_to_2d(self, x_1d: Any, cols: int) -> Any: ...
@@ -106,13 +105,8 @@ class JaxStepMetaOps:
     def zeros_like_i32(self, x: Any) -> Any:
         return jnp.zeros_like(jnp.asarray(x, dtype=jnp.int32))
 
-    def arange_i32(self, start: int, stop: int, *, like: Any) -> Any:
-        del like
-        return jnp.arange(start, stop, dtype=jnp.int32)
-
-    def clip(self, x: Any, lo: int, hi: int | None = None) -> Any:
-        arr = jnp.asarray(x, dtype=jnp.int32)
-        return jnp.maximum(arr, lo) if hi is None else jnp.clip(arr, lo, hi)
+    def clip(self, x: Any, lo: int, hi: int) -> Any:
+        return jnp.clip(jnp.asarray(x, dtype=jnp.int32), lo, hi)
 
     def take_1d(self, table_1d: Any, idx_1d: Any) -> Any:
         t_arr = jnp.asarray(table_1d, dtype=jnp.int32).reshape(-1)
@@ -159,45 +153,6 @@ class JaxStepMetaOps:
 
 
 _JAX_STEP_META_OPS = JaxStepMetaOps()
-
-
-def resolve_step_positions(
-    positions: Any | None,
-    seq_lens: Any | None,
-    *,
-    num_reqs: int,
-    tokens_per_seq: int,
-    like: Any,
-    ops: StepMetaOps | None = None,
-) -> Any:
-    """Resolve flat per-token step positions from `positions` or `seq_lens`.
-
-    `seq_lens` follows the runner's convention (`num_computed_tokens + T`, the
-    length after this step), so the `T` tokens of a sequence sit at positions
-    `seq_len - T .. seq_len - 1`.
-    """
-    eff_ops = _JAX_STEP_META_OPS if ops is None else ops
-    T = tokens_per_seq
-    active_rows = num_reqs * T
-    fb_1d = (
-        eff_ops.zeros_i32((max(1, num_reqs),), like=like)
-        if seq_lens is None
-        else seq_lens
-    )
-    if positions is not None:
-        pos_flat = (
-            positions[0]
-            if eff_ops.ndim(positions) == 2
-            else eff_ops.reshape(positions, (-1,))
-        )
-        if eff_ops.numel(pos_flat) >= active_rows:
-            return pos_flat[:active_rows]
-    seq_l = eff_ops.slice_or_pad_1d(fb_1d, num_reqs)
-    offsets = eff_ops.reshape(eff_ops.arange_i32(-T, 0, like=like), (1, T))
-    return eff_ops.reshape(
-        eff_ops.clip(eff_ops.reshape(seq_l, (-1, 1)) + offsets, 0),
-        (-1,),
-    )
 
 
 def check_ckpt_write_cols_distinct(ckpt_2d: Any, tokens_per_seq: int) -> None:

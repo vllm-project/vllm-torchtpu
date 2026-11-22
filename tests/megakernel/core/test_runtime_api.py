@@ -53,7 +53,11 @@ from vllm_torchtpu.megakernel.core.model_def import (
 )
 from vllm_torchtpu.megakernel.core.modules import GDN, GQA, Embedding, MoE, Norm
 from vllm_torchtpu.megakernel.core.pool.config import CacheExec, cache_exec, with_cache
-from vllm_torchtpu.megakernel.core.profile import DEFAULT_PROFILE, Profile
+from vllm_torchtpu.megakernel.core.profile import (
+    DEFAULT_PROFILE,
+    Profile,
+    register_profile,
+)
 from vllm_torchtpu.megakernel.core.runtime import (
     Bucket,
     BucketPolicy,
@@ -74,7 +78,6 @@ from vllm_torchtpu.megakernel.core.runtime import (
     parse_runtime_options,
     pool_schedule_info,
     resolve_driver_profile,
-    resolve_step_positions,
     verify_compiled_step_ir,
     verify_ir_coverage,
     verify_pooled_step_hlo,
@@ -257,66 +260,165 @@ def test_runtime_config_and_gpr_bucket_exec_spec():
     assert (use_fused_t4, use_gpr_t4) == (False, True)
     planner.plan(ms, ex_t4)
 
-    # Explicit base_exec pool_gather="split" is preserved when profile pool_gather=None
+    # An explicit base_exec `pool_gather="split"` wins over a profile that
+    # gathers on that bucket without it: `gpr_prof` (True) at `(T=4, B=4)` and
+    # an auto (`None`) profile at a WIDE `(T=4, B=24)` bucket.
     base_split = with_cache(base_ex, pool_gather="split")
-    ex_split_t4, _, use_gpr_split = bucket_exec_spec(
-        ms,
-        base_split,
-        DEFAULT_PROFILE,
-        bucket_t=4,
-        tokens_per_seq=4,
-        fused_pool_io=False,
-        fused_pool_io_max_b=DEFAULT_PROFILE.fused_pool_io_max_b,
-        fused_pool_io_min_b_hi=DEFAULT_PROFILE.fused_pool_io_min_b_hi,
+    auto_prof = Profile(name="test-gpr-auto", pool_gather=None)
+    for prof_g, b_t in ((gpr_prof, 4), (auto_prof, 24)):
+        kw: dict[str, Any] = dict(
+            bucket_t=b_t,
+            tokens_per_seq=4,
+            fused_pool_io=False,
+            fused_pool_io_max_b=prof_g.fused_pool_io_max_b,
+            fused_pool_io_min_b_hi=prof_g.fused_pool_io_min_b_hi,
+        )
+        assert bucket_exec_spec(ms, base_ex, prof_g, **kw)[2], prof_g.name
+        ex_split, _, use_gpr_split = bucket_exec_spec(ms, base_split, prof_g, **kw)
+        assert ex_split.cache.pool_gather is False, prof_g.name
+        assert not use_gpr_split, prof_g.name
+
+
+def test_parse_runtime_options_profile_defaults_and_value_errors(
+    isolated_model_registry,
+):
+    """A named profile fills the profile-owned keys left unset (its
+    `pool_gather=None` as `"auto"`), explicit values win, and each value
+    parser rejects bad input with a `Megakernel:` error."""
+    register_profile(
+        Profile(
+            name="test-rt-opts",
+            numerics="approx",
+            buckets=(8, 24),
+            verify_buckets=(8, 16),
+            fused_pool_io="auto",
+            fused_pool_io_max_b=12,
+            fused_pool_io_min_b_hi=40,
+            pool_gather=None,
+        )
     )
-    assert ex_split_t4.cache.pool_gather is False
-    assert not use_gpr_split
+    cfg = parse_runtime_options({"profile": " test-rt-opts "})
+    assert cfg["profile"] == "test-rt-opts"
+    assert (cfg["buckets"], cfg["verify_buckets"]) == ((8, 24), (8, 16))
+    assert not cfg["buckets_explicit"] and not cfg["verify_buckets_explicit"]
+    assert cfg["fused_pool_io"] == "auto"
+    assert (cfg["fused_pool_io_max_b"], cfg["fused_pool_io_min_b_hi"]) == (12, 40)
+    assert cfg["pool_gather"] == "auto" and cfg["explicit"] == frozenset()
+    assert explicit_profile_settings(cfg) == dict.fromkeys(
+        ("buckets", "verify_buckets", "fused_pool_io", "fused_pool_io_max_b")
+        + ("fused_pool_io_min_b_hi", "pool_gather")
+    )
+    over = {
+        "profile": "test-rt-opts",
+        "buckets": "16",
+        "verify_buckets": [4],
+        "fused_pool_io": "0",
+        "fused_pool_io_max_b": "4",
+        "pool_gather": "1",
+    }
+    cfg_ov = parse_runtime_options(over)
+    assert (cfg_ov["buckets"], cfg_ov["verify_buckets"]) == ((16,), (4,))
+    assert cfg_ov["fused_pool_io"] is False and cfg_ov["pool_gather"] is True
+    assert (cfg_ov["fused_pool_io_max_b"], cfg_ov["fused_pool_io_min_b_hi"]) == (4, 40)
+    assert cfg_ov["explicit"] == {"fused_pool_io", "fused_pool_io_max_b", "pool_gather"}
+    with pytest.raises(ValueError, match="Megakernel: unknown megakernel profile"):
+        parse_runtime_options({"profile": "test-rt-missing"})
+
+    for mode, want in (("AUTO", ""), (" tp ", "tp"), ("ep", "ep"), ("", "")):
+        assert parse_runtime_options({"mode": mode})["mode"] == want
+    for key, val, want in (
+        ("compile_hlo_check", "yes", True),
+        ("compile_hlo_check", "off", False),
+        ("compile_hlo_check", 1, True),
+        ("fused_pool_io", "fused", True),
+        ("fused_pool_io", "split", False),
+        ("fused_pool_io", " Auto ", "auto"),
+        ("pool_gather", "gpr", True),
+        ("pool_gather", "3stage", False),
+        ("pool_gather", "auto", "auto"),
+        ("fused_pool_io_min_b_hi", " 48 ", 48),
+    ):
+        assert parse_runtime_options({key: val})[key] == want, (key, val)
+    for key, val, msg in (
+        ("mode", "dp", "invalid mode='dp'"),
+        ("compile_hlo_check", "maybe", "invalid boolean value 'maybe'"),
+        ("fused_pool_io", "sometimes", "invalid fused_pool_io='sometimes'"),
+        ("pool_gather", "gather", "invalid pool_gather='gather'"),
+        ("fused_pool_io_max_b", "abc", "invalid fused_pool_io_max_b='abc'"),
+        ("fused_pool_io_min_b_hi", "4.5", "invalid fused_pool_io_min_b_hi='4.5'"),
+    ):
+        with pytest.raises(ValueError, match=f"^Megakernel: {msg}"):
+            parse_runtime_options({key: val})
 
 
-def test_pack_step_meta_and_resolve_step_positions_jax():
-    """Test `pack_step_meta` and `resolve_step_positions` over `JaxStepMetaOps`."""
+def test_resolve_driver_profile_defaults_overrides_and_errors(
+    isolated_model_registry,
+):
+    """`profile=None` runs the model's default profile (else `default`);
+    unknown names and a profile for another model raise; `pool_gather="auto"`
+    maps to the profile's auto (`None`)."""
+    mdl_default = register_profile(
+        Profile(name="test-rt-mdl", model="test-rt-model", model_default=True)
+    )
+    assert resolve_driver_profile(None, model_name="test-rt-model") is mdl_default
+    assert resolve_driver_profile(None, model_name="no-such-model") is DEFAULT_PROFILE
+    assert resolve_driver_profile("", model_name="test-rt-model") is mdl_default
+    with pytest.raises(ValueError, match="Megakernel: unknown megakernel profile"):
+        resolve_driver_profile("test-rt-missing", model_name="test-rt-model")
+    with pytest.raises(ValueError, match="targets model 'test-rt-model', not 'other'"):
+        resolve_driver_profile("test-rt-mdl", model_name="other")
+    for val, want in (("auto", None), ("0", False), ("gpr", True), (None, False)):
+        prof = resolve_driver_profile(DEFAULT_PROFILE, pool_gather=val)
+        assert prof.pool_gather is want, val
+    prof = resolve_driver_profile(
+        "test-rt-mdl",
+        model_name="test-rt-model",
+        fused_pool_io="auto",
+        fused_pool_io_max_b=6,
+        fused_pool_io_min_b_hi=50,
+    )
+    assert prof.fused_pool_io == "auto"
+    assert (prof.fused_pool_io_max_b, prof.fused_pool_io_min_b_hi) == (6, 50)
+
+
+def test_parse_runtime_options_keeps_verify_buckets_of_any_width(
+    isolated_model_registry,
+):
+    """`verify_buckets` (set, or from the profile) are only range-checked here:
+    `BucketPolicy.resolve` checks them against the program's verify widths,
+    so a program verifying `T=6` can take `6, 12` buckets."""
+    register_profile(
+        Profile(name="test-rt-verify6", numerics="approx", verify_buckets=(6, 12))
+    )
+    for opts in ({"verify_buckets": "6:12"}, {"profile": "test-rt-verify6"}):
+        cfg = parse_runtime_options(opts)
+        assert cfg["verify_buckets"] == (6, 12), opts
+        prof = resolve_driver_profile(cfg["profile"])
+        owned = explicit_profile_settings(cfg)
+        kw: dict[str, Any] = dict(
+            speculative_tokens=5,
+            buckets_explicit=cfg["buckets_explicit"],
+            verify_buckets_explicit=cfg["verify_buckets_explicit"],
+        )
+        pol = BucketPolicy.resolve(
+            prof, owned["buckets"], owned["verify_buckets"], verify_tokens=(6,), **kw
+        )
+        assert pol.verify_buckets == (6, 12), opts
+    with pytest.raises(ValueError, match="invalid verify_buckets"):
+        parse_runtime_options({"verify_buckets": "0:8"})
+    # Set buckets the program's widths don't divide still fail, in `resolve`.
+    with pytest.raises(ValueError, match=r"verify_buckets \[6\] not divisible"):
+        BucketPolicy.resolve(
+            DEFAULT_PROFILE, None, (6, 8), verify_buckets_explicit=True
+        )
+
+
+def test_pack_step_meta_jax():
+    """Test `pack_step_meta` over `JaxStepMetaOps` (2-D M-RoPE positions use
+    row 0)."""
     ops = JaxStepMetaOps()
-    seq_lens = jnp.asarray([5, 10], dtype=jnp.int32)
-    pos_t1 = resolve_step_positions(
-        None, seq_lens, num_reqs=2, tokens_per_seq=1, like=seq_lens, ops=ops
-    )
-    np.testing.assert_array_equal(np.asarray(pos_t1), np.array([4, 9], dtype=np.int32))
-
-    # `seq_lens` is the length after this step (`num_computed_tokens + T`), so a
-    # sequence's `T` tokens sit at `seq_len - T .. seq_len - 1`.
-    pos_t4 = resolve_step_positions(
-        None, seq_lens, num_reqs=2, tokens_per_seq=4, like=seq_lens, ops=ops
-    )
-    np.testing.assert_array_equal(
-        np.asarray(pos_t4), np.array([1, 2, 3, 4, 6, 7, 8, 9], dtype=np.int32)
-    )
-    pos_t2_short = resolve_step_positions(
-        None,
-        jnp.asarray([1, 3], dtype=jnp.int32),
-        num_reqs=2,
-        tokens_per_seq=2,
-        like=seq_lens,
-        ops=ops,
-    )
-    np.testing.assert_array_equal(
-        np.asarray(pos_t2_short), np.array([0, 0, 1, 2], dtype=np.int32)
-    )
-
-    # Short positions triggers fallback to seq_lens; M-RoPE 2D positions are preserved
-    pos_short = jnp.asarray([4], dtype=jnp.int32)
-    pos_from_short = resolve_step_positions(
-        pos_short, seq_lens, num_reqs=2, tokens_per_seq=1, like=seq_lens, ops=ops
-    )
-    np.testing.assert_array_equal(
-        np.asarray(pos_from_short), np.array([4, 9], dtype=np.int32)
-    )
-    pos_mrope = jnp.stack([pos_t4, pos_t4, pos_t4], axis=0)
-    pos_from_mrope = resolve_step_positions(
-        pos_mrope, seq_lens, num_reqs=2, tokens_per_seq=4, like=seq_lens, ops=ops
-    )
-    assert pos_from_mrope.shape == (8,)
-    np.testing.assert_array_equal(np.asarray(pos_from_mrope), np.asarray(pos_t4))
-
+    pos_t4 = jnp.asarray([1, 2, 3, 4, 6, 7, 8, 9], dtype=jnp.int32)
+    pos_mrope = jnp.stack([pos_t4, pos_t4 + 100, pos_t4 + 200], axis=0)
     ids = jnp.asarray([11, 12, 13, 14, 21, 22, 23, 24], dtype=jnp.int32)
     bt_1d = jnp.asarray([100, 101, 200, 201], dtype=jnp.int32)
     s0 = jnp.asarray([1, 0], dtype=jnp.int32)  # seq 1 inactive (slot 0)
@@ -336,6 +438,7 @@ def test_pack_step_meta_and_resolve_step_positions_jax():
     )
     assert meta.ids_b.shape == (8,)
     assert meta.pos_b.shape == (8,)
+    np.testing.assert_array_equal(np.asarray(meta.pos_b), [1, 2, 3, 4, 0, 0, 0, 0])
     assert meta.pt_b.shape == (2, 2)
     assert meta.ckpt_b.shape == (3, 2, 4)
     assert meta.roff_b.shape == (3, 2)
@@ -426,6 +529,10 @@ def test_pack_step_meta_validate_rejects_duplicate_write_slots():
     )
     traced = jax.jit(lambda c: pack(c, validate=True).ckpt_b)(c_dup)
     np.testing.assert_array_equal(np.asarray(traced[0]), [[3, 3], [4, 5]])
+
+
+def test_jax_step_meta_ops_implements_the_protocol():
+    """`JaxStepMetaOps` provides every `StepMetaOps` method."""
     assert isinstance(JaxStepMetaOps(), mk_rt.StepMetaOps)
 
 
@@ -1471,10 +1578,7 @@ def test_second_framework_plain_jax_adapter_on_synthetic_model_def(
     pools_step = tuple(raw_pools)
 
     step_ids = jnp.asarray([7, 13], dtype=jnp.int32)
-    step_seq_lens = jnp.asarray([1, 1], dtype=jnp.int32)
-    step_pos = resolve_step_positions(
-        None, step_seq_lens, num_reqs=2, tokens_per_seq=1, like=step_seq_lens, ops=ops
-    )
+    step_pos = jnp.zeros((2,), dtype=jnp.int32)  # each sequence's first token
     s_live = jnp.asarray([1, 5], dtype=jnp.int32)
     c_live = jnp.asarray([[1, 2], [5, 6]], dtype=jnp.int32)
     r_live = jnp.zeros((16,), dtype=jnp.int32)
@@ -1531,15 +1635,7 @@ def test_second_framework_plain_jax_adapter_on_synthetic_model_def(
         ),
     }
     step_ids_2 = jnp.asarray([19, 23], dtype=jnp.int32)
-    step_seq_lens_2 = jnp.asarray([2, 2], dtype=jnp.int32)
-    step_pos_2 = resolve_step_positions(
-        None,
-        step_seq_lens_2,
-        num_reqs=2,
-        tokens_per_seq=1,
-        like=step_seq_lens_2,
-        ops=ops,
-    )
+    step_pos_2 = jnp.ones((2,), dtype=jnp.int32)  # each sequence's second token
     meta_live_2 = pack_step_meta(
         step_ids_2,
         step_pos_2,

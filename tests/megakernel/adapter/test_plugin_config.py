@@ -18,6 +18,7 @@ template settings reach the library's `parse_runtime_options` through
 from __future__ import annotations
 
 import json
+import logging
 from types import SimpleNamespace
 from typing import Any
 
@@ -26,6 +27,16 @@ import pytest
 import vllm_torchtpu.megakernel.adapter.driver as driver_mod
 from vllm_torchtpu.megakernel.adapter import config as cfg_mod
 from vllm_torchtpu.megakernel.adapter import plugin as plugin_mod
+from vllm_torchtpu.megakernel.adapter import testing
+from vllm_torchtpu.megakernel.core import Profile
+from vllm_torchtpu.megakernel.core import profile as profile_mod
+from vllm_torchtpu.megakernel.core.runtime import (
+    DEFAULT_BUCKETS,
+    DEFAULT_FUSED_POOL_IO_MAX_B,
+    DEFAULT_FUSED_POOL_IO_MIN_B_HI,
+    DEFAULT_VERIFY_BUCKETS,
+    parse_runtime_options,
+)
 
 # A built-in shorthand and a checkpoint arch it claims: conftest's
 # `mk_fake_template` (its top-level options are the library runtime config's
@@ -76,24 +87,58 @@ _LEGACY_ADD = (
 )
 
 
+# Stand-ins for the Qwen3.5 template's profiles that the legacy inputs name
+# (the adapter's tests import no model folder), each with its own non-default
+# profile-owned values so the filled-in defaults are checked per profile.
+_STAND_INS = {
+    p.name: p
+    for p in (
+        Profile(
+            name="qwen35-baseline",
+            numerics="approx",
+            fused_pool_io="auto",
+            fused_pool_io_max_b=12,
+            pool_gather=None,
+        ),
+        Profile(
+            name="qwen35-candidate30",
+            numerics="approx",
+            fused_pool_io=True,
+            fused_pool_io_min_b_hi=40,
+            buckets=(16, 32),
+            verify_buckets=(8, 16),
+        ),
+        Profile(
+            name="qwen35-candidate30-fused",
+            numerics="approx",
+            fused_pool_io="auto",
+            fused_pool_io_max_b=24,
+            fused_pool_io_min_b_hi=56,
+            pool_gather=True,
+        ),
+    )
+}
+
+
 @pytest.fixture
 def _template_profile_names(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The legacy inputs name the Qwen3.5 template's profiles; register
-    stand-ins under those names (the adapter's tests import no model folder)."""
-    from vllm_torchtpu.megakernel.core import Profile, register_profile
-    from vllm_torchtpu.megakernel.core import profile as profile_mod
+    """Register the stand-ins under the template's profile names."""
+    monkeypatch.setattr(
+        profile_mod, "_REGISTRY", {**profile_mod._REGISTRY, **_STAND_INS}
+    )
 
-    monkeypatch.setattr(profile_mod, "_REGISTRY", dict(profile_mod._REGISTRY))
-    for name in ("qwen35-baseline", "qwen35-candidate30", "qwen35-candidate30-fused"):
-        if name not in profile_mod._REGISTRY:
-            register_profile(
-                Profile(name=name, numerics="approx", fused_pool_io="auto")
-            )
+
+def _word_bool(val: Any) -> bool:
+    """A legacy on / off value (a bool, or one of the words the inputs use)."""
+    if isinstance(val, bool):
+        return val
+    return {"0": False, "false": False, "1": True, "true": True}[str(val).lower()]
 
 
 def _enabled_by_rule(*sources: Any) -> bool:
-    """`enabled` by the config's documented rule, independently of it: the
-    last explicit on / off, else on when any source configures anything."""
+    """`enabled` by the config's documented rule, computed here without the
+    config module: the last explicit on / off, else on when any source
+    configures anything."""
     explicit: bool | None = None
     configured = False
     for src in sources:
@@ -118,7 +163,7 @@ def _enabled_by_rule(*sources: Any) -> bool:
                 src = dict(kv.split("=", 1) for kv in low.split(","))
         configured = configured or any(v is not None for v in src.values())
         if src.get("enabled") is not None:
-            explicit = cfg_mod.parse_bool(src["enabled"])
+            explicit = _word_bool(src["enabled"])
         elif src.get("plugin") is not None:
             explicit = True
     return configured if explicit is None else explicit
@@ -149,20 +194,72 @@ def _keys_by_rule(*sources: Any) -> dict[str, Any]:
     return merged
 
 
+def _typed_by_rule(opts: dict[str, Any]) -> dict[str, Any]:
+    """`parse_runtime_options(opts)` by its documented rule, computed from the
+    inputs and the stand-in profile: set keys typed, unset profile-owned keys
+    from the named profile (`pool_gather=None` as `"auto"`), else the library
+    defaults."""
+    prof = _STAND_INS[opts["profile"]] if "profile" in opts else None
+
+    def rows(val: Any) -> tuple[int, ...]:
+        if isinstance(val, str):
+            return tuple(int(x) for x in val.replace(":", ",").split(","))
+        return tuple(val)
+
+    def owned(key: str, parse: Any, default: Any) -> Any:
+        if key in opts:
+            return parse(opts[key])
+        return default if prof is None else getattr(prof, key)
+
+    flag = {"auto": "auto", "0": False, "1": True}.__getitem__
+    pool_gather = owned("pool_gather", flag, False)
+    prof_buckets = None if prof is None else prof.buckets
+    prof_verify = None if prof is None else prof.verify_buckets
+    return {
+        "mode": {"auto": ""}.get(opts.get("mode", ""), opts.get("mode", "")),
+        "profile": None if prof is None else prof.name,
+        "buckets": rows(opts["buckets"])
+        if "buckets" in opts
+        else prof_buckets or DEFAULT_BUCKETS,
+        "verify_buckets": rows(opts["verify_buckets"])
+        if "verify_buckets" in opts
+        else prof_verify or DEFAULT_VERIFY_BUCKETS,
+        "buckets_explicit": "buckets" in opts,
+        "verify_buckets_explicit": "verify_buckets" in opts,
+        "fused_pool_io": owned("fused_pool_io", flag, False),
+        "fused_pool_io_max_b": owned(
+            "fused_pool_io_max_b", int, DEFAULT_FUSED_POOL_IO_MAX_B
+        ),
+        "fused_pool_io_min_b_hi": owned(
+            "fused_pool_io_min_b_hi", int, DEFAULT_FUSED_POOL_IO_MIN_B_HI
+        ),
+        "pool_gather": "auto" if pool_gather is None else pool_gather,
+        "compile_hlo_check": flag(opts.get("compile_hlo_check", "0")),
+        "explicit": frozenset(
+            opts.keys()
+            & {
+                "fused_pool_io",
+                "fused_pool_io_max_b",
+                "fused_pool_io_min_b_hi",
+                "pool_gather",
+            }
+        ),
+    }
+
+
 @pytest.mark.usefixtures("_template_profile_names")
 @pytest.mark.parametrize("env", _LEGACY_ENV)
 @pytest.mark.parametrize("add", _LEGACY_ADD)
 def test_legacy_inputs_follow_the_per_key_rule(env: Any, add: Any) -> None:
     """Legacy syntaxes resolve per key, the later source winning: the runtime
     keys directly, the template settings into `options` (which the library's
-    `parse_runtime_options` then types). `enabled` follows its own rule: an
-    earlier explicit off holds over a later source's settings."""
-    from vllm_torchtpu.megakernel.core.runtime import parse_runtime_options
-
+    `parse_runtime_options` then types, checked against `_typed_by_rule`).
+    `enabled` follows its own rule: an earlier explicit off holds over a later
+    source's settings."""
     new = cfg_mod.parse_config(env, add, raw_env=env)
     assert new.enabled == _enabled_by_rule(env, add)
     want = _keys_by_rule(env, add)
-    assert new.ab == cfg_mod.parse_bool(want.get("ab", False), key="ab")
+    assert new.ab == _word_bool(want.get("ab", False))
     want_period = float(want.get("stats_period_s", cfg_mod.DEFAULT_STATS_PERIOD_S))
     assert new.stats_period_s == want_period
     resolved = cfg_mod.resolve_plugin_ref(new, _HF)
@@ -171,7 +268,11 @@ def test_legacy_inputs_follow_the_per_key_rule(env: Any, add: Any) -> None:
     assert ref.shorthand == _SHORTHAND
     want_opts = {k: v for k, v in want.items() if k not in cfg_mod.RUNTIME_KEYS}
     assert dict(options) == want_opts
-    assert parse_runtime_options(options) == parse_runtime_options(want_opts)
+    got, typed = parse_runtime_options(options), _typed_by_rule(want_opts)
+    assert got == typed
+    assert {k: type(v) for k, v in got.items()} == {
+        k: type(v) for k, v in typed.items()
+    }
 
 
 def test_missing_shorthand_template_leaves_the_megakernel_off(
@@ -179,10 +280,6 @@ def test_missing_shorthand_template_leaves_the_megakernel_off(
 ) -> None:
     """Without the shorthand's model folder installed, the driver logs it and
     stays off: no error, no collective."""
-    import logging
-
-    from vllm_torchtpu.megakernel.adapter import testing
-
     gone = plugin_mod.SHORTHANDS[_SHORTHAND]._replace(
         module="no_such_mk_folder.megakernel"
     )

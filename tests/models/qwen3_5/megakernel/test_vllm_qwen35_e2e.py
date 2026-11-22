@@ -63,7 +63,6 @@ from vllm_torchtpu.megakernel.core.runtime import (
     pack_step_meta,
     parse_runtime_options,
     resolve_driver_profile,
-    resolve_step_positions,
     select_bucket,
 )
 from vllm_torchtpu.megakernel.core.runtime.contract import (  # noqa: E402
@@ -178,7 +177,7 @@ def _extract_group_mamba_tensors(
 def prepare_step_metadata(
     attn_md: Any,
     mamba_mds: Any,
-    positions: torch.Tensor | None,
+    positions: torch.Tensor,
     num_reqs: int,
     bucket_t: int,
     max_pages_per_seq: int,
@@ -198,14 +197,6 @@ def prepare_step_metadata(
     fb_1d = getattr(attn_md, "seq_lens", None)
     if fb_1d is None:
         fb_1d = torch.zeros((max(1, num_reqs),), dtype=torch.int32, device=dev)
-    pos_in = resolve_step_positions(
-        positions,
-        fb_1d,
-        num_reqs=num_reqs,
-        tokens_per_seq=T,
-        like=bt,
-        ops=TorchStepMetaOps(),
-    )
     s0, c0, r0, hr0, uc0 = _extract_group_mamba_tensors(mamba_mds[0], fb_1d)
     s1, c1, r1, hr1, uc1 = _extract_group_mamba_tensors(mamba_mds[1], fb_1d)
     s2, c2, r2, hr2, uc2 = _extract_group_mamba_tensors(mamba_mds[2], fb_1d)
@@ -223,7 +214,7 @@ def prepare_step_metadata(
     dummy_ids = torch.ones((active_rows,), dtype=torch.int32, device=dev)
     _, pos_b, pt_b, ckpt_b, roff_b = prepare_step_inputs_eager(
         dummy_ids,
-        pos_in,
+        positions,
         bt[:num_reqs],
         s0[:num_reqs],
         c0[:num_reqs],
@@ -753,47 +744,12 @@ def test_prepare_step_metadata_decode_and_verify() -> None:
     assert ckpt_small[0].tolist() == [[1, 2, 3, 4], [5, 6, 7, 8]]
     assert roff_small[0].tolist() == [2, 1]
 
-    # 4. `positions=None` (T=1 and T=4), short `positions` (`numel() < num_reqs * T`),
-    #    and 2-D M-RoPE `positions` (`(3, 8)`) synthesize / slice positions properly.
-    pos_none_t1, _, _, _ = prepare_step_metadata(
-        attn_md=attn_md,
-        mamba_mds=mamba_mds,
-        positions=None,
-        num_reqs=2,
-        bucket_t=4,
-        max_pages_per_seq=2,
-        tokens_per_seq=1,
-    )
-    assert pos_none_t1.tolist() == [9, 24, 0, 0]
-
-    pos_none_t4, _, _, _ = prepare_step_metadata(
-        attn_md=attn_md,
-        mamba_mds=mamba_mds,
-        positions=None,
-        num_reqs=2,
-        bucket_t=8,
-        max_pages_per_seq=2,
-        tokens_per_seq=4,
-    )
-    # `seq_lens` is the length after the step: positions `seq_len - 4 .. seq_len - 1`.
-    assert pos_none_t4.tolist() == [6, 7, 8, 9, 21, 22, 23, 24]
-
-    pos_short_t4, _, _, _ = prepare_step_metadata(
-        attn_md=attn_md,
-        mamba_mds=mamba_mds,
-        positions=torch.tensor([1, 2], dtype=torch.int32),
-        num_reqs=2,
-        bucket_t=8,
-        max_pages_per_seq=2,
-        tokens_per_seq=4,
-    )
-    assert pos_short_t4.tolist() == [6, 7, 8, 9, 21, 22, 23, 24]
-
+    # 4. 2-D M-RoPE `positions` (`(3, 8)`): the step uses row 0.
     mrope_row = torch.tensor([9, 10, 11, 12, 24, 25, 26, 27], dtype=torch.int32)
     pos_mrope_t4, _, _, _ = prepare_step_metadata(
         attn_md=attn_md,
         mamba_mds=mamba_mds,
-        positions=torch.stack([mrope_row, mrope_row, mrope_row], dim=0),
+        positions=torch.stack([mrope_row, mrope_row + 100, mrope_row + 200], dim=0),
         num_reqs=2,
         bucket_t=8,
         max_pages_per_seq=2,

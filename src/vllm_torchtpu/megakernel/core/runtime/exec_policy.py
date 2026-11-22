@@ -23,13 +23,20 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..cache import should_fuse_pool_io, should_use_pool_gather
+from ..cache_common import require_pool_backend
 from ..exec_spec import ExecSpec
 from ..modules.gqa import GQAModule, GQATunables
 from ..pool.config import FUSED_POOL_IO_MAX_B, FUSED_POOL_IO_MIN_B_HI, with_cache
 from ..profile import Profile, get_profile, model_default_profile
 from ..spec import ModelSpec
-from .constants import DEFAULT_BUCKETS, DEFAULT_VERIFY_BUCKETS, FALSE_STRS
-from .policy import parse_mk_buckets, parse_mk_verify_buckets
+from .constants import (
+    DEFAULT_BUCKETS,
+    DEFAULT_VERIFY_BUCKETS,
+    FALSE_STRS,
+    MAX_BUCKET_ROWS,
+    _parse_bucket_list,
+)
+from .policy import parse_mk_buckets
 
 _TRUE_STRS = ("1", "true", "yes", "on")
 DEFAULT_FUSED_POOL_IO_MAX_B: int = FUSED_POOL_IO_MAX_B
@@ -65,6 +72,23 @@ def _parse_tri_flag(val: Any, *, true_extra: str, name: str) -> bool | str:
     )
 
 
+def _parse_int(val: Any, name: str) -> int:
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Megakernel: invalid {name}={val!r}; expected an integer"
+        ) from None
+
+
+def _parse_verify_rows(val: Any) -> tuple[int, ...]:
+    """Verify bucket rows, range-checked only: `BucketPolicy.resolve` checks
+    them against the program's verify widths (`verify_tokens`)."""
+    return _parse_bucket_list(
+        val, valid_fn=lambda b: 1 <= b <= MAX_BUCKET_ROWS, label="verify_buckets"
+    )
+
+
 def _parse_fused_pool_io(val: Any) -> bool | str:
     """Parse `fused_pool_io` to `True`, `False`, or `'auto'`."""
     return _parse_tri_flag(val, true_extra="fused", name="fused_pool_io")
@@ -72,8 +96,6 @@ def _parse_fused_pool_io(val: Any) -> bool | str:
 
 def _parse_pool_gather(val: Any) -> bool | str:
     """Parse `pool_gather` to `True`, `False`, or `'auto'` (empty string: off)."""
-    if val is None:
-        return "auto"
     return _parse_tri_flag(val, true_extra="gpr", name="pool_gather")
 
 
@@ -94,7 +116,7 @@ def _apply_profile_defaults(cfg: dict[str, Any], explicit: set[str]) -> None:
     if not cfg["buckets_explicit"] and prof.buckets is not None:
         cfg["buckets"] = parse_mk_buckets(prof.buckets)
     if not cfg["verify_buckets_explicit"] and prof.verify_buckets is not None:
-        cfg["verify_buckets"] = parse_mk_verify_buckets(prof.verify_buckets)
+        cfg["verify_buckets"] = _parse_verify_rows(prof.verify_buckets)
 
 
 RUNTIME_OPTION_KEYS = frozenset(
@@ -151,13 +173,13 @@ def parse_runtime_options(options: Mapping[str, Any]) -> dict[str, Any]:
         cfg["buckets"] = parse_mk_buckets(d["buckets"])
         cfg["buckets_explicit"] = True
     if "verify_buckets" in d:
-        cfg["verify_buckets"] = parse_mk_verify_buckets(d["verify_buckets"])
+        cfg["verify_buckets"] = _parse_verify_rows(d["verify_buckets"])
         cfg["verify_buckets_explicit"] = True
     for k, fn in (
         ("fused_pool_io", _parse_fused_pool_io),
         ("pool_gather", _parse_pool_gather),
-        ("fused_pool_io_max_b", int),
-        ("fused_pool_io_min_b_hi", int),
+        ("fused_pool_io_max_b", lambda v: _parse_int(v, "fused_pool_io_max_b")),
+        ("fused_pool_io_min_b_hi", lambda v: _parse_int(v, "fused_pool_io_min_b_hi")),
     ):
         if k in d:
             cfg[k] = fn(d[k])
@@ -261,10 +283,7 @@ def bucket_exec_spec(
         spec, ex_cand, fused_pool_io=eff_fused, max_b_low=max_b, min_b_hi=min_b
     )
     ex_cand2 = with_cache(ex_cand, fused_pool_io=use_fused)
-    pb = spec.cache_backend
-    use_gpr = (
-        False
-        if (use_fused or pb is None)
-        else should_use_pool_gather(spec, pb, ex_cand2, use_fused=use_fused)
+    use_gpr = not use_fused and should_use_pool_gather(
+        spec, require_pool_backend(spec), ex_cand2, use_fused=False
     )
     return with_cache(ex_cand2, pool_gather=use_gpr), use_fused, use_gpr
