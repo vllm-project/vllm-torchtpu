@@ -18,7 +18,12 @@ import pytest
 from vllm.config import CacheConfig
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
-from vllm_torchtpu.executors.tpu_multiproc_executor import TpuMultiprocExecutor
+from vllm_torchtpu.executors.tpu_multiproc_executor import (
+    TpuMultiprocExecutor,
+    _may_pack_prompts,
+)
+
+_EXECUTOR_MODULE = "vllm_torchtpu.executors.tpu_multiproc_executor"
 
 # Sentinel returned by the parent get_kv_cache_specs; the override plumbing must
 # pass this through unchanged.
@@ -220,3 +225,83 @@ def test_ray_executor_raises_on_real_disagreement():
         pytest.raises(ValueError, match="workers disagree"),
     ):
         executor.get_kv_cache_specs()
+
+
+_PROMPT = [7, 129279, 0, 42] * 1000
+
+
+def _new_request(prompt_token_ids):
+    from vllm.v1.core.sched.output import NewRequestData
+
+    return NewRequestData(
+        req_id="r0",
+        prompt_token_ids=prompt_token_ids,
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=([1, 2],),
+        num_computed_tokens=0,
+        lora_request=None,
+    )
+
+
+@patch.object(MultiprocExecutor, "execute_model", return_value="out")
+def test_execute_model_sends_new_prompts_as_int_arrays(mock_super):
+    """New requests' prompts go to the workers as array('i') with the same
+    tokens; the worker copies and reads them as before."""
+    import pickle
+    from array import array
+
+    import numpy as np
+    import torch
+
+    new_req = _new_request(list(_PROMPT))
+    no_ids = _new_request(None)
+    scheduler_output = MagicMock(scheduled_new_reqs=[new_req, no_ids])
+    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    executor._pack_prompts = True
+
+    assert executor.execute_model(scheduler_output, non_block=True) == "out"
+
+    mock_super.assert_called_once_with(scheduler_output, True)
+    assert no_ids.prompt_token_ids is None
+    sent = new_req.prompt_token_ids
+    assert isinstance(sent, array) and sent.typecode == "i"
+    received = pickle.loads(pickle.dumps(new_req, protocol=pickle.HIGHEST_PROTOCOL))
+    prompt = received.prompt_token_ids
+    assert received.prompt_len == len(_PROMPT)
+    assert type(prompt[1]) is int and list(prompt) == _PROMPT
+    token_ids_cpu = np.zeros((1, len(_PROMPT) + 8), dtype=np.int32)
+    token_ids_cpu[0, : len(_PROMPT)] = prompt
+    np.testing.assert_array_equal(token_ids_cpu[0, : len(_PROMPT)], _PROMPT)
+    assert torch.tensor(prompt).tolist() == _PROMPT
+
+
+@pytest.mark.parametrize("consumer", [None, "reasoning", "configured", "plugin"])
+def test_prompts_stay_lists_for_list_consumers(consumer):
+    """A reasoning config (thinking-budget state) or any custom logits
+    processor, configured or installed as a plugin, may use list semantics
+    on the prompt: then the prompt is sent as a list."""
+    vllm_config = MagicMock(reasoning_config=None)
+    vllm_config.model_config.logits_processors = None
+    plugins = []
+    if consumer == "reasoning":
+        vllm_config.reasoning_config = MagicMock()
+    elif consumer == "configured":
+        vllm_config.model_config.logits_processors = ["pkg.Processor"]
+    elif consumer == "plugin":
+        plugins = [MagicMock()]
+    with patch(f"{_EXECUTOR_MODULE}.entry_points", return_value=plugins):
+        assert _may_pack_prompts(vllm_config) is (consumer is None)
+
+
+@patch.object(MultiprocExecutor, "execute_model", return_value="out")
+def test_execute_model_keeps_lists_when_not_packing(mock_super):
+    new_req = _new_request(list(_PROMPT))
+    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    executor._pack_prompts = False
+
+    executor.execute_model(MagicMock(scheduled_new_reqs=[new_req]))
+
+    assert type(new_req.prompt_token_ids) is list
+    assert new_req.prompt_token_ids == _PROMPT
