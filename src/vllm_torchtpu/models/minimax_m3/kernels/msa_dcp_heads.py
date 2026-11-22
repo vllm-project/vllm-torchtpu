@@ -254,8 +254,7 @@ def merge_partials_all_to_all(
             f"{out.dtype} {out.shape} over {dcp} ranks"
         )
     lse = lse.astype(jnp.float32).T.reshape(num_tokens, dcp, heads).transpose(1, 0, 2)
-    bits = jax.lax.bitcast_convert_type(lse, jnp.uint16)  # [dcp, T, Hl, 2]
-    bits = bits.reshape(dcp, 1, num_tokens, width)
+    bits = msa_dcp.words_to_u16_planes(lse)[:, None]  # [dcp, 1, T, 2 Hl]
     bits = jnp.pad(bits, ((0, 0), (0, 0), (0, 0), (0, head_dim - width)))
     send = jnp.concatenate(
         [
@@ -268,9 +267,7 @@ def merge_partials_all_to_all(
     )  # [dcp, Hl + 1, T, D]: block r goes to rank r
     got = jax.lax.all_to_all(send, axis, 0, 0, tiled=True)
     parts = jax.lax.bitcast_convert_type(got[:, :heads], out.dtype)
-    lses = jax.lax.bitcast_convert_type(
-        got[:, heads, :, :width].reshape(dcp, num_tokens, heads, 2), jnp.float32
-    )
+    lses = msa_dcp.u16_planes_to_words(got[:, heads], heads, jnp.float32)
     hadamard = jnp.asarray(msa_fp4.hadamard(head_dim), out.dtype)
     merged = msa_dcp.merge_partials(parts, lses, hadamard, interpret=interpret)
     return merged.reshape(num_tokens, heads, head_dim)

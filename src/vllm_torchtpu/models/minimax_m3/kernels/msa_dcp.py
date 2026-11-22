@@ -1491,27 +1491,44 @@ def _attend_pair_decode(
     )
 
 
+def words_to_u16_planes(x: jax.Array) -> jax.Array:
+    """32-bit ``x [..., n]`` as uint16 ``[..., 2n]``: the low halves in lanes
+    ``[0, n)``, the high ones in ``[n, 2n)``. A bitcast to ``[..., n, 2]``
+    interleaves them, and reading them back took two strided lane slices
+    (~0.8 us each for a ``[192, 32]`` row in the c48 decode twin,
+    j-1d070da1); planes come back by contiguous slices that fuse."""
+    words = jax.lax.bitcast_convert_type(x, jnp.uint32)
+    halves = [words & 0xFFFF, words >> 16]
+    return jnp.concatenate([h.astype(jnp.uint16) for h in halves], axis=-1)
+
+
+def u16_planes_to_words(planes: jax.Array, n: int, dtype) -> jax.Array:
+    """Inverse of `words_to_u16_planes` for the first ``2n`` lanes of
+    ``planes``: ``[..., n]`` of 32-bit `dtype`."""
+    lo, hi = (planes[..., i * n : (i + 1) * n].astype(jnp.uint32) for i in (0, 1))
+    return jax.lax.bitcast_convert_type(lo | (hi << 16), dtype)
+
+
 def _swap_with_row(x: jax.Array, extra: jax.Array, axis: str):
     """A DCP pair's ``x [H, T, D]`` (16-bit) and ``extra [T, n]`` (32-bit)
     swapped by one collective permute: the bits of `extra` ride as one more
-    uint16 head row (every permute start costs ~1 us on the TensorCore at
-    decode, c4 twin j-6bbe97e2). As 16-bit integers: float copies may
-    canonicalize NaN or flush subnormal bit patterns."""
+    uint16 head row (`words_to_u16_planes`; every permute start costs ~1 us
+    on the TensorCore at decode, c4 twin j-6bbe97e2). As 16-bit integers:
+    float copies may canonicalize NaN or flush subnormal bit patterns."""
     _, num_tokens, head_dim = x.shape
-    width = 2 * extra.shape[1]
-    if x.dtype.itemsize != 2 or extra.dtype.itemsize != 4 or width > head_dim:
+    n = extra.shape[1]
+    if x.dtype.itemsize != 2 or extra.dtype.itemsize != 4 or 2 * n > head_dim:
         raise ValueError(
             f"16-bit x and 32-bit extra of at most {head_dim // 2} columns, got "
             f"{x.dtype} {x.shape}, {extra.dtype} {extra.shape}"
         )
-    bits = jax.lax.bitcast_convert_type(extra, jnp.uint16).reshape(1, num_tokens, width)
-    bits = jnp.pad(bits, ((0, 0), (0, 0), (0, head_dim - width)))
+    bits = words_to_u16_planes(extra)[None]
+    bits = jnp.pad(bits, ((0, 0), (0, 0), (0, head_dim - 2 * n)))
     send = jnp.concatenate([jax.lax.bitcast_convert_type(x, jnp.uint16), bits])
     got = jax.lax.ppermute(send, axis, [(0, 1), (1, 0)])
-    peer_extra = got[-1, :, :width].reshape(num_tokens, width // 2, 2)
     return (
         jax.lax.bitcast_convert_type(got[:-1], x.dtype),
-        jax.lax.bitcast_convert_type(peer_extra, extra.dtype),
+        u16_planes_to_words(got[-1], n, extra.dtype),
     )
 
 
