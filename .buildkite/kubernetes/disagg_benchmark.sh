@@ -20,21 +20,44 @@
 # which passes WORKLOAD_NAME. The engines are reached by JobSet's per-pod DNS,
 # built from that name.
 #
-# Usage: disagg_benchmark.sh [--prefill-chips=N --decode-chips=N]
+# Usage: disagg_benchmark.sh [--prefill-chips=N --decode-chips=N] [--check-args]
 # The physical chips of each engine, which the manifest states beside the
 # engines it sizes; each published row divides its throughput by their sum.
+# --check-args stops after the argument checks, which is how
+# tests/scripts/test_disagg_benchmark.py runs them.
 
 set -e
 
-# Checked before the hours of startup; the values are parse_gke_results.py's
-# to validate.
-chip_args=()
+# Checked here, before the hours of startup: parse_gke_results.py would
+# reject the same values, but only after the first cell has run.
+unset prefill_chips decode_chips
+check_args=0
 for arg in "$@"; do
   case "$arg" in
-    --prefill-chips=*|--decode-chips=*) chip_args+=("$arg") ;;
+    --prefill-chips=*) prefill_chips=${arg#*=} ;;
+    --decode-chips=*) decode_chips=${arg#*=} ;;
+    --check-args) check_args=1 ;;
     *) echo "ERROR: unknown argument: $arg"; exit 1 ;;
   esac
 done
+if [ "${prefill_chips+set}" != "${decode_chips+set}" ]; then
+  echo "ERROR: --prefill-chips and --decode-chips go together: both engines serve the run."
+  exit 1
+fi
+chip_args=()
+if [ -n "${prefill_chips+set}" ]; then
+  for flag in "--prefill-chips=$prefill_chips" "--decode-chips=$decode_chips"; do
+    if ! [[ "${flag#*=}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "ERROR: ${flag%%=*} must be a positive integer, got '${flag#*=}'"
+      exit 1
+    fi
+    chip_args+=("$flag")
+  done
+fi
+if [ "$check_args" -eq 1 ]; then
+  echo "Arguments are valid; parse_gke_results.py gets: ${chip_args[*]}"
+  exit 0
+fi
 
 # The image ships libtpu, which makes vLLM's platform
 # detection pick TPU on this CPU-only pod and fail.

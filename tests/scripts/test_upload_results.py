@@ -382,32 +382,107 @@ def test_gke_upload_rejects_a_chip_count_it_cannot_trust(tmp_path, capsys, args,
     assert _rows(captured.out) == []
 
 
-def test_gke_manifest_states_the_chips_its_engines_request():
+def test_gke_manifest_states_the_chips_its_engines_hold():
     manifest = yaml.safe_load(
         (
             _REPO / ".buildkite/kubernetes/manifests/workloads/qwen3.5-397b-1p1d.yaml"
         ).read_text()
     )
-    containers = {
-        job["name"]: job["template"]["spec"]["template"]["spec"]["containers"][0]
-        for job in manifest["spec"]["replicatedJobs"]
-    }
+    jobs = {job["name"]: job for job in manifest["spec"]["replicatedJobs"]}
 
-    assert containers["benchmark"]["command"][2:] == [
-        "--prefill-chips=4",
-        "--decode-chips=4",
+    def chips(role: str) -> int:
+        """Chips the role's pods hold at once: Jobs x pods per Job x chips per
+        pod. `completions` counts pods over the Job's life, not at once."""
+        job_spec = jobs[role]["template"]["spec"]
+        per_pod = sum(
+            int(container["resources"]["requests"]["google.com/tpu"])
+            for container in job_spec["template"]["spec"]["containers"]
+        )
+        return jobs[role]["replicas"] * job_spec["parallelism"] * per_pod
+
+    pod_spec = jobs["benchmark"]["template"]["spec"]["template"]["spec"]
+    assert pod_spec["containers"][0]["command"][2:] == [
+        f"--prefill-chips={chips('prefill')}",
+        f"--decode-chips={chips('decode')}",
     ]
-    assert containers["prefill"]["resources"]["requests"] == {"google.com/tpu": "4"}
-    assert containers["decode"]["resources"]["requests"] == {"google.com/tpu": "4"}
+    assert (chips("prefill"), chips("decode")) == (4, 4)
+
+
+_GKE_TTFT_CELL = "pd_disagg_ttft_c1_i65536_o1"
+# --percentile-metrics=ttft,e2el: the cell has no TPOT or ITL keys.
+_GKE_TTFT_BENCH = {
+    "request_throughput": 0.4628023936055456,
+    "output_throughput": 0.4628023936055456,
+    "total_token_throughput": 30330.68046972664,
+    "max_output_tokens_per_s": 1.0,
+    "rtfx": 0.0,
+    "mean_ttft_ms": 2160.1349558124953,
+    "median_ttft_ms": 2165.3985120000243,
+    "std_ttft_ms": 40.305854461149764,
+    "p90_ttft_ms": 2205.0965189998806,
+    "p99_ttft_ms": 2213.0933955001296,
+    "completed": 16,
+    "failed": 0,
+    "total_input_tokens": 1048576,
+    "total_output_tokens": 16,
+    "duration": 34.57199059699997,
+}
+_GKE_TTFT_ROW = {
+    **_GKE_ROW,
+    "record_id": f"kube-run-1_inf_c1_{'0' * 6}",
+    "created_time": "TIMESTAMP '2026-11-21T14:48:38Z'",
+    "metrics": {"vllm_bench": _GKE_TTFT_BENCH},
+    "config": {
+        **_GKE_ROW["config"],
+        "workload": {
+            "input_len": 65536,
+            "output_len": 1,
+            "num_prompts": 16,
+            "request_rate": "inf",
+            "burstiness": 1.0,
+            "max_concurrency": 1,
+        },
+        "engine_flags": {"tokenizer_id": _GKE_MODEL, "label": _GKE_TTFT_CELL},
+    },
+}
 
 
 def test_gke_ttft_cell_without_tpot_has_no_derived_element(tmp_path, capsys):
-    returncode, (row,) = _parse_gke(
-        capsys, tmp_path, cell="pd_disagg_ttft_c1_i65536_o1"
+    returncode, rows = _parse_gke(capsys, tmp_path, cell=_GKE_TTFT_CELL)
+
+    assert returncode == 0
+    assert rows == [_GKE_TTFT_ROW]
+
+
+def test_gke_ttft_cell_with_the_manifest_chips_derives_only_per_chip_throughput(
+    tmp_path, capsys
+):
+    returncode, rows = _parse_gke(
+        capsys, tmp_path, "--prefill-chips=4", "--decode-chips=4", cell=_GKE_TTFT_CELL
     )
 
     assert returncode == 0
-    assert list(row["metrics"]) == ["vllm_bench"]
+    assert rows == [
+        {
+            **_GKE_TTFT_ROW,
+            "metrics": {
+                "vllm_bench": _GKE_TTFT_BENCH,
+                # The output and total tok/s above on 4 + 4 chips; input is
+                # their difference. No *_intvty: the cell has no TPOT.
+                "derived": {
+                    "num_chips": 8,
+                    "output_tput_per_chip": 0.0578502992006932,
+                    "total_tput_per_chip": 3791.33505871583,
+                    "input_tput_per_chip": 3791.2772084166295,
+                },
+            },
+            "config": {
+                **_GKE_TTFT_ROW["config"],
+                "prefill_chips": 4,
+                "decode_chips": 4,
+            },
+        }
+    ]
 
 
 def test_gke_cell_with_zero_tpot_has_no_derived_element(tmp_path, capsys):
