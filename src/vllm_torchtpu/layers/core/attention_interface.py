@@ -5,10 +5,6 @@ from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
-import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
-import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
-import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
-import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from jax.experimental import shard_map
 from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
 from jax.experimental.pallas.ops.tpu.splash_attention import (
@@ -19,18 +15,18 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
+
+import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
+import vllm_torchtpu.kernels.mla.sparse.kernel as sparse_mla_kernel
+import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
+import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
+import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
-from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
-from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import get_megacore
-
-import vllm_torchtpu.kernels.mla.sparse.kernel as sparse_mla_kernel
-from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
@@ -39,6 +35,10 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     update_sparse_mla_kv_cache_dcp,
 )
 from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
+from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import get_megacore
 
 logger = init_logger(__name__)
 
@@ -1048,6 +1048,28 @@ def dcp_mla_topk_cap(dcp_size: int) -> int:
     return topk_cap
 
 
+def resolve_decode_topk_cap(
+    topk_cap: int, dcp_size: int, topk: int, *, decode_bucket: bool
+) -> int:
+    # Avoid VMEM spill at m=16,32 fused decode exchange under DCP>=16: per-rank
+    # count is ~topk/dcp_size (128 at topk=2048, dcp=16), so cap=256 halves
+    # gather/VMEM scratch while the exact overflow pass handles >256 rows.
+    if decode_bucket and dcp_size >= 16 and topk_cap > 256 and topk > 256:
+        return 256
+    return topk_cap
+
+
+def filter_mixed_live_widths(
+    override: tuple[int, ...] | None, env_value: str, topk_cap: int | None
+) -> tuple[int, ...]:
+    raw = (
+        override
+        if override is not None
+        else tuple(int(w) for w in env_value.split(",") if w)
+    )
+    return tuple(w for w in raw if not topk_cap or w < topk_cap)
+
+
 def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
     """TPU_DCP_MLA_MIXED_BODY -> the live body's lever tuple ("1" = default set),
     plus the stage-A levers with TPU_DCP_MLA_MIXED_KERNEL_V2."""
@@ -1165,6 +1187,18 @@ def fused_small_a2a_bucket_config(num_tokens: int) -> tuple[bool | tuple, int]:
     return bool(pin), int(vmem_mib)
 
 
+def build_fused_exchange_peer(
+    dcp_rank: jax.Array, dcp_lane: jax.Array, query_start_loc: jax.Array
+) -> jax.Array:
+    return jnp.stack(
+        [
+            dcp_rank.astype(jnp.int32),
+            dcp_lane.astype(jnp.int32),
+            query_start_loc[-1].astype(jnp.int32),
+        ]
+    )
+
+
 def sparse_mla_attention_dcp(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -1196,6 +1230,8 @@ def sparse_mla_attention_dcp(
     fused_merge: bool = False,
     merge_pieces: bool = True,
     skip_kv_write: bool = False,
+    mixed_live_widths_override: tuple[int, ...] | None = None,
+    attention_kernel_batch_size: int | None = None,
 ) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1495,16 +1531,19 @@ def sparse_mla_attention_dcp(
                         bool(merge_here),
                     )
                     assert dcp_lane is not None  # lifted when fused_exchange
-                    peer = [dcp_rank.astype(jnp.int32), dcp_lane.astype(jnp.int32)]
-                    if merge_here:
-                        # The real-token count: the kernel's unpack mask.
-                        peer.append(query_start_loc_[-1].astype(jnp.int32))
-                    split_kwargs["send_peer"] = jnp.stack(peer)
+                    split_kwargs["send_peer"] = build_fused_exchange_peer(
+                        dcp_rank, dcp_lane, query_start_loc_
+                    )
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes
         # it: SparseCore caches and a top-k wider than the cap.
-        topk_cap = dcp_mla_topk_cap(dcp_size)
+        topk_cap = resolve_decode_topk_cap(
+            dcp_mla_topk_cap(dcp_size),
+            dcp_size,
+            topk_idx.shape[-1],
+            decode_bucket=decode_bucket,
+        )
         if not (
             topk_cap
             and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
@@ -1518,6 +1557,14 @@ def sparse_mla_attention_dcp(
             }
             if topk_cap
             else sparse_mla_chunk_kwargs()
+        )
+        if attention_kernel_batch_size is not None:
+            chunk_kwargs = {
+                **chunk_kwargs,
+                "attention_kernel_batch_size": attention_kernel_batch_size,
+            }
+        live_widths = filter_mixed_live_widths(
+            mixed_live_widths_override, envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS, topk_cap
         )
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
@@ -1574,12 +1621,13 @@ def sparse_mla_attention_dcp(
             # Largest chunk (tokens) that takes the small-chunk path (16 =
             # kernel default).
             small_chunk_tokens=small_chunk_tokens,
+            # Avoid 1-atom SC gather underutilization at m>=16 decode buckets;
+            # keep 1 atom for m<=8 where narrow rows saturate fewer subcores.
+            small_chunk_gather_atoms=4 if q.shape[0] >= 16 else 1,
             lse_mask_empty=mask_in_kernel,
             fused_window_prep=fused_prep,
             mixed_live_gather=envs.TPU_DCP_MLA_MIXED_LIVE,
-            mixed_live_widths=tuple(
-                int(w) for w in envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS.split(",") if w
-            ),
+            mixed_live_widths=live_widths,
             mixed_body_levers=_mixed_body_levers(
                 envs.TPU_DCP_MLA_MIXED_BODY, envs.TPU_DCP_MLA_MIXED_KERNEL_V2
             ),
@@ -1587,7 +1635,13 @@ def sparse_mla_attention_dcp(
             kv_write_fault=None if kv_write_fault == "wrong_owner" else kv_write_fault,
             mixed_fused_prep=envs.TPU_DCP_MLA_MIXED_FUSED_PREP,
             decode_row_widths=(
-                tuple(int(w) for w in envs.TPU_MLA_DECODE_ROW_WIDTHS.split(",") if w)
+                tuple(
+                    w
+                    for w in (
+                        int(x) for x in envs.TPU_MLA_DECODE_ROW_WIDTHS.split(",") if x
+                    )
+                    if w < topk_cap
+                )
                 if topk_cap
                 else ()
             ),

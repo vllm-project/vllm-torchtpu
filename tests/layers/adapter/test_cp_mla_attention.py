@@ -16,8 +16,10 @@ position-ownership rule the indexer's return leg and the KV write agree on, and
 the kernel `return_lse` flag the merge is built on."""
 
 import concurrent.futures
+import inspect
 import math
 import threading
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -25,8 +27,9 @@ import numpy as np
 import pytest
 import torch
 from absl.testing import parameterized
-from vllm_torchtpu.distributed import dcp_comm
 
+from vllm_torchtpu.distributed import dcp, dcp_comm
+from vllm_torchtpu.distributed import sharded_jax_op as sjo
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     cp_global_to_local,
     cp_owner_rank,
@@ -38,6 +41,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 )
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.layers.adapter import cp_mla_attention as cp_mla
+from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mao
 from vllm_torchtpu.layers.core import attention_interface
 
 
@@ -1865,3 +1869,77 @@ def test_local_q_all_gather_op_hands_jax_op_an_annotated_function(monkeypatch):
     monkeypatch.setattr(cp_mla, "_LOCAL_Q_ALL_GATHER_OPS", {})
     cp_mla.local_q_all_gather_op()
     assert built == ["pallas::fp8_window_all_gather_16"]
+
+
+def test_should_register_and_cache_local_q_norm_all_gather_op(monkeypatch):
+    class _Mesh:
+        shape = {dcp.DCP_AXIS_NAME: 16}
+        axis_names = (dcp.DCP_AXIS_NAME,)
+
+    built = []
+
+    def checked_op(name, fn, **_):
+        signature = inspect.signature(inspect.unwrap(fn), eval_str=True)
+        sjo.pallas_impl._verify_signature(signature)  # noqa: SLF001 -- torch_tpu check
+        assert sjo.pallas_impl._infer_static_argnums(signature) == ()  # noqa: SLF001 -- torch_tpu check
+        built.append(name)
+        return object()
+
+    monkeypatch.setattr(dcp, "get_or_create_dcp_mesh", lambda: _Mesh())
+    monkeypatch.setattr(sjo, "sharded_jax_op", checked_op)
+    monkeypatch.setattr(cp_mla, "_LOCAL_Q_NORM_ALL_GATHER_OPS", {})
+    op_a = cp_mla.local_q_norm_all_gather_op(1e-6)
+    op_b = cp_mla.local_q_norm_all_gather_op(1e-6)
+    op_c = cp_mla.local_q_norm_all_gather_op(1e-5)
+    assert op_a is op_b
+    assert op_a is not op_c
+    assert built == [
+        "pallas::fp8_window_all_gather_rn_16_1em06",
+        "pallas::fp8_window_all_gather_rn_16_1em05",
+    ]
+
+
+def test_should_gate_q_norm_fusion_to_tiny_nonindexer_layers(monkeypatch):
+    operands = (
+        torch.zeros((2048, 16384), dtype=torch.float8_e4m3fn),
+        torch.ones((16384,), dtype=torch.float32),
+    )
+    monkeypatch.setattr(mao, "_qb_overlap_operands", lambda _proj: operands)
+    gate = (
+        mao.VllmTPUMultiHeadLatentAttentionWrapper._local_q_norm_serves  # noqa: SLF001 -- verify gate contract
+    )
+
+    def make_stub(**kw):
+        return SimpleNamespace(
+            local_q_norm_fused_op=kw.get("op", object()),
+            indexer=kw.get("indexer"),
+            skip_topk=kw.get("skip_topk", False),
+            dcp_group_size=16,
+            q_a_layernorm=kw.get(
+                "norm",
+                SimpleNamespace(
+                    has_weight=True,
+                    variance_size_override=None,
+                    weight=torch.ones(2048, dtype=torch.bfloat16),
+                ),
+            ),
+            q_b_proj=kw.get("qb", object()),
+        )
+
+    q4 = torch.zeros((4, 2048), dtype=torch.bfloat16)
+    q8 = torch.zeros((8, 2048), dtype=torch.bfloat16)
+    assert gate(make_stub(), q4)
+    assert gate(make_stub(indexer=object(), skip_topk=True), q4)
+    assert not gate(make_stub(op=None), q4)
+    assert not gate(make_stub(indexer=object(), skip_topk=False), q4)
+    assert not gate(make_stub(), q8)
+    assert not gate(
+        make_stub(
+            norm=SimpleNamespace(
+                has_weight=True,
+                variance_size_override=1024,
+                weight=torch.ones(2048, dtype=torch.bfloat16),
+            )
+        ),
+        q4,
+    )

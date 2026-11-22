@@ -93,10 +93,15 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_SCALE,
     FP8_PALLAS_SCHED_GROUP_ATTR,
     FP8_PALLAS_WEIGHT,
+    FP8_SPLIT_SCALES_ATTR,
+    FP8_SPLIT_WEIGHTS_ATTR,
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     get_fp8_linear_pallas_op,
+    get_prequantized_matmul_op,
+    get_quantize_fp8_row_op,
     prequantized_matmul,
+    quantize_fp8_row,
     quantized_matmul,
     quantized_matmul_pallas,
 )
@@ -1775,6 +1780,33 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
         layer = cast("TpuLinear", layer)
+        split_w = getattr(layer, FP8_SPLIT_WEIGHTS_ATTR, None)
+        if split_w is not None:
+            split_s = getattr(layer, FP8_SPLIT_SCALES_ATTR)
+            slot = getattr(layer, _PREQUANT_ATTR, None)
+            prequant = None if slot is None else slot.value
+            if prequant is not None:
+                assert slot is not None
+                slot.value = None
+                x_q, x_scale = prequant
+            else:
+                x_q, x_scale = quantize_fp8_row(x.reshape(-1, x.shape[-1]))
+            parts = [
+                prequantized_matmul(
+                    x_q,
+                    x_scale,
+                    getattr(layer, w_name),
+                    getattr(layer, s_name),
+                )
+                for w_name, s_name in zip(split_w, split_s, strict=True)
+            ]
+            out = torch.cat(parts, dim=-1)
+            out = out.reshape(*x.shape[:-1], out.shape[-1])
+            if out.dtype != x.dtype:
+                out = out.to(x.dtype)
+            if bias is not None:
+                out = out + bias
+            return out
         weight = layer.weight
         if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
@@ -1812,6 +1844,81 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if bias is not None:
             out = out + bias
         return out
+
+
+def split_fp8_linear_columns(layer: torch.nn.Module, widths: tuple[int, ...]) -> bool:
+    """Split a canonical `(k, n)` per-channel FP8 linear into disjoint columns.
+
+    Allocates fresh contiguous parameter buffers for each width and detaches the
+    monolithic `weight` and `weight_scale` so runtime HBM footprint stays flat.
+    """
+    if len(widths) < 2 or any(width <= 0 for width in widths):
+        return False
+    if getattr(layer, FP8_SPLIT_WEIGHTS_ATTR, None) is not None:
+        return False
+    if not isinstance(getattr(layer, "quant_method", None), VllmFp8LinearMethodTPU):
+        return False
+    if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+        return False
+    if getattr(layer, FP8_PALLAS_N_ATTR, None) is not None:
+        return False
+    if getattr(layer, "bias", None) is not None:
+        return False
+    weight_obj = getattr(layer, "weight", None)
+    scale_obj = getattr(layer, "weight_scale", None)
+    if not isinstance(weight_obj, torch.Tensor) or not isinstance(
+        scale_obj, torch.Tensor
+    ):
+        return False
+    weight = cast(torch.Tensor, weight_obj)
+    scale = cast(torch.Tensor, scale_obj)
+    if (
+        weight.dtype != torch.float8_e4m3fn
+        or weight.ndim != 2
+        or scale.ndim != 1
+        or scale.shape[0] != weight.shape[1]
+        or sum(widths) != weight.shape[1]
+    ):
+        return False
+
+    # Build the JAX custom ops outside Dynamo before registering split buffers.
+    get_prequantized_matmul_op()
+    get_quantize_fp8_row_op()
+
+    weight_data = weight.data
+    scale_data = scale.data
+    is_tpu = weight_data.device.type == "tpu"
+    w_names: list[str] = []
+    s_names: list[str] = []
+    sync_list: list[torch.Tensor] = []
+    col = 0
+    for idx, width in enumerate(widths):
+        # Avoid dynamic slices of a single device buffer: XLA tracks prefetch
+        # size per parameter, so independent fresh_buffer slabs let the compiler
+        # allocate smaller tiles without pinning the original monolith in VMEM.
+        w_part = fresh_buffer(weight_data[:, col : col + width])
+        s_part = fresh_buffer(scale_data[col : col + width])
+        col += width
+        w_name = f"weight_split_{idx}"
+        s_name = f"weight_scale_split_{idx}"
+        layer.register_parameter(
+            w_name, torch.nn.Parameter(w_part, requires_grad=False)
+        )
+        layer.register_parameter(
+            s_name, torch.nn.Parameter(s_part, requires_grad=False)
+        )
+        w_names.append(w_name)
+        s_names.append(s_name)
+        sync_list.extend((w_part, s_part))
+
+    layer.register_parameter("weight", None)
+    layer.register_parameter("weight_scale", None)
+    del weight, scale, weight_data, scale_data
+    setattr(layer, FP8_SPLIT_WEIGHTS_ATTR, tuple(w_names))
+    setattr(layer, FP8_SPLIT_SCALES_ATTR, tuple(s_names))
+    if is_tpu:
+        synchronize_tensors(sync_list)
+    return True
 
 
 def resolve_online_fp8(

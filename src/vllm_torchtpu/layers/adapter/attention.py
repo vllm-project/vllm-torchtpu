@@ -11,7 +11,6 @@ from typing import Any, ClassVar, cast
 
 import jax
 import torch
-import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.compilation import backends as vllm_compilation_backends
@@ -33,6 +32,9 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
+
+import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
+from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     flat_kernel_ids,
@@ -45,6 +47,13 @@ from vllm_torchtpu.distributed.dcp import (
     get_or_create_dcp_mesh,
 )
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    DCP_AXIS_NAME,
+    indexer_kv_layout,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    get_kv_cache_shape as _get_indexer_kv_cache_shape,
+)
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
@@ -56,42 +65,32 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     make_pcp_streaming_rpa_kernel,
     pcp_streaming_jax_op,
 )
-from vllm_torchtpu.kernels.mla.absorb_q import absorb_q
+from vllm_torchtpu.kernels.mla import kv_cache_utils
+from vllm_torchtpu.kernels.mla.absorb_q import (
+    absorb_q,
+    absorb_q_halves,
+    absorb_q_split,
+    absorb_q_split_halves,
+)
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+    KVCacheLayout,
+    KVCacheType,
+    SparseMLAKVCacheSpec,
+)
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
+from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
+from vllm_torchtpu.layers.adapter import (
+    dcp_nonidx_qb_mla_op,
+    dcp_token_parallel_op,
+    dcp_unified_idx_qb_mla_op,
+    dcp_unified_indexer_mla_op,
+)
 from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
 )
 from vllm_torchtpu.layers.adapter.cp_attention import (
     forward_with_dcp as _forward_with_dcp,
 )
-from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.core.quantization import quantize_kv
-from vllm_torchtpu.layers.core.sequence_layout import (
-    is_pcp_streaming_attention_metadata,
-)
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_vllm_model_wrapper_context,
-)
-from vllm_torchtpu.tpu_info import get_chip_version
-from vllm_torchtpu.utils import get_shared_jax_op, synchronize_tensors
-
-from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME,
-    indexer_kv_layout,
-)
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    get_kv_cache_shape as _get_indexer_kv_cache_shape,
-)
-from vllm_torchtpu.kernels.mla import kv_cache_utils
-from vllm_torchtpu.kernels.mla.kv_cache_utils import (
-    KVCacheLayout,
-    KVCacheType,
-    SparseMLAKVCacheSpec,
-)
-from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
-from vllm_torchtpu.layers.adapter import dcp_token_parallel_op
 from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_heads,
     all_gather_q_nope_pe_heads,
@@ -106,6 +105,17 @@ from vllm_torchtpu.layers.core.attention_interface import (
     ragged_paged_attention,
     ragged_paged_attention_batched,
 )
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.quantization import quantize_kv
+from vllm_torchtpu.layers.core.sequence_layout import (
+    is_pcp_streaming_attention_metadata,
+)
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_vllm_model_wrapper_context,
+)
+from vllm_torchtpu.tpu_info import get_chip_version
+from vllm_torchtpu.utils import get_shared_jax_op, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -114,9 +124,50 @@ def _fake_absorb_q(q_nope: torch.Tensor, w_uk_t: torch.Tensor) -> torch.Tensor:
     return q_nope.new_empty((*q_nope.shape[:2], w_uk_t.shape[2]))
 
 
+def _fake_absorb_q_split(
+    q_nope: torch.Tensor, w_uk_t: torch.Tensor, split_rows: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rank = w_uk_t.shape[2]
+    return (
+        q_nope.new_empty((split_rows, q_nope.shape[1], rank)),
+        q_nope.new_empty((q_nope.shape[0] - split_rows, q_nope.shape[1], rank)),
+    )
+
+
 # Registered at import: Dynamo cannot trace a lock-guarded registration.
 _absorb_q = pallas.jax_op("pallas::mla_absorb_q", absorb_q)
 _absorb_q.register_fake(_fake_absorb_q)
+_absorb_q_split = pallas.jax_op("pallas::mla_absorb_q_split", absorb_q_split)
+_absorb_q_split.register_fake(_fake_absorb_q_split)
+
+
+def _fake_absorb_q_halves(
+    q_nope: torch.Tensor, w_uk_t_lo: torch.Tensor, w_uk_t_hi: torch.Tensor
+) -> torch.Tensor:
+    del w_uk_t_hi
+    return q_nope.new_empty((*q_nope.shape[:2], w_uk_t_lo.shape[2]))
+
+
+def _fake_absorb_q_split_halves(
+    q_nope: torch.Tensor,
+    w_uk_t_lo: torch.Tensor,
+    w_uk_t_hi: torch.Tensor,
+    split_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del w_uk_t_hi
+    rank = w_uk_t_lo.shape[2]
+    return (
+        q_nope.new_empty((split_rows, q_nope.shape[1], rank)),
+        q_nope.new_empty((q_nope.shape[0] - split_rows, q_nope.shape[1], rank)),
+    )
+
+
+_absorb_q_halves = pallas.jax_op("pallas::mla_absorb_q_halves", absorb_q_halves)
+_absorb_q_halves.register_fake(_fake_absorb_q_halves)
+_absorb_q_split_halves = pallas.jax_op(
+    "pallas::mla_absorb_q_split_halves", absorb_q_split_halves
+)
+_absorb_q_split_halves.register_fake(_fake_absorb_q_split_halves)
 
 
 def _uv_before_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
@@ -2829,17 +2880,31 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         """Executes complete TPU multi-head latent attention evaluation.
 
         A large qrep step under TPU_DCP_MLA_OPROJ_ALL_REDUCE returns the
-        unmerged, quantized `weight_lse_partials` instead of the output."""
+        unmerged, quantized `weight_lse_partials` instead of the output. With
+        `sp_o_proj` (TPU_DCP_TP_PREFILL_LOCAL_OPROJ, a token-parallel bucket
+        only) it returns o_proj's output on this rank's sequence-parallel
+        rows, `[T / dcp, hidden]`."""
         assert isinstance(q, tuple) and len(q) == 2, (
             "q must be a tuple of (q_nope, q_pe)"
         )
         q_nope, q_pe = q
         input_dtype = q_nope.dtype
+        sp_o_proj = kwargs.get("sp_o_proj")
 
+        kv_sharded = bool(kwargs.get("kv_sharded", False))
         # For determine_available_memory when cache memory buffer is empty right during
         # probe (before binding, `layer.kv_cache` is the layer's default empty tensor;
         # after binding, sparse layers hold a (nope, rope) pair).
         if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
+            if sp_o_proj is not None:
+                rows = (
+                    kv_c_normed.shape[0]
+                    if kv_sharded
+                    else kv_c_normed.shape[0] // self.dcp_size
+                )
+                return torch.ones_like(
+                    kv_c_normed.flatten(1)[:rows, :1].expand(-1, sp_o_proj[0].shape[1])
+                )
             if output is None:
                 # Preserve symbolic token dimensions during the memory probe.
                 # kv_c_normed has every row; q may hold only some
@@ -2851,26 +2916,55 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             output.fill_(1)
             return output
 
+        num_kv_tokens = kv_c_normed.view(-1, layer.kv_lora_rank).shape[0] * (
+            self.dcp_size if kv_sharded else 1
+        )
         topk_indices = kwargs.get("topk_indices")
+        unified_indexer_inputs = kwargs.get("unified_indexer_inputs")
+        in_branch_qb_inputs = kwargs.get("in_branch_qb_inputs")
+        has_topk = topk_indices is not None or unified_indexer_inputs is not None
+        if sp_o_proj is not None and not (
+            has_topk
+            and getattr(layer, "sparse_mla_tp_op", None) is not None
+            and dcp_token_parallel_op.applies(num_kv_tokens)
+        ):
+            raise ValueError("sp_o_proj is only served on a token-parallel bucket")
+        if kv_sharded and sp_o_proj is None:
+            raise ValueError("kv_sharded requires sp_o_proj on a token-parallel bucket")
+        if in_branch_qb_inputs is not None and not (
+            has_topk
+            and sp_o_proj is not None
+            and dcp_token_parallel_op.applies(num_kv_tokens)
+        ):
+            raise ValueError(
+                "in_branch_qb_inputs requires topk_indices or unified_indexer_inputs "
+                "and sp_o_proj on a token-parallel bucket"
+            )
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
         # Query replication hands us the whole DCP group's heads already, so
         # the sparse DCP path below can skip its per-step q all-gather. It is
         # the only consumer, hence the `topk_indices` term.
-        use_qrep = (
-            q_dcp_replicated is not None
-            and self.dcp_size > 1
-            and topk_indices is not None
-        )
+        use_qrep = q_dcp_replicated is not None and self.dcp_size > 1 and has_topk
         q_rope_table: list[torch.Tensor] = []
+        w_uk_t_halves: tuple[torch.Tensor, torch.Tensor] | None = None
         if use_qrep:
-            assert layer.W_UK_T_dcp_qrep is not None, (
+            w_uk_lo = getattr(layer, "W_UK_T_dcp_qrep_lo", None)
+            w_uk_hi = getattr(layer, "W_UK_T_dcp_qrep_hi", None)
+            has_halves = w_uk_lo is not None and w_uk_hi is not None
+            assert has_halves or layer.W_UK_T_dcp_qrep is not None, (
                 "q_dcp_replicated was passed but W_UK_T_dcp_qrep was never "
                 "built; `process_weights_after_loading` must run first."
             )
             # TPU_MLA_DECODE_PROLOGUE hands a third element: the per-token
             # rope table, with q_pe then the raw (un-roped) q head view.
             q_nope, q_pe, *q_rope_table = q_dcp_replicated
-            w_uk_t_src = layer.W_UK_T_dcp_qrep
+            if w_uk_lo is not None and w_uk_hi is not None:
+                lo_t = cast(torch.Tensor, w_uk_lo)
+                hi_t = cast(torch.Tensor, w_uk_hi)
+                w_uk_t_halves = (lo_t, hi_t)
+                w_uk_t_src = lo_t
+            else:
+                w_uk_t_src = cast(torch.Tensor, layer.W_UK_T_dcp_qrep)
             w_uk_t_scale = layer.W_UK_T_dcp_qrep_scale
         else:
             w_uk_t_src = layer.W_UK_T
@@ -2880,6 +2974,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Not in the MTP drafter under TPU_MTP_DCP_MERGE_SIZED: the drafter's
         # projected partial stays f32, and the sized merge only takes a 2-byte
         # partial, so it would silently fall back to the f32 reduce-scatter.
+        q_tokens = (
+            q_nope[0].shape[0] + q_nope[1].shape[0]
+            if isinstance(q_nope, tuple)
+            else q_nope.shape[0]
+        )
         uv_first = (
             use_qrep
             and getattr(layer, "W_UV_dcp_qrep", None) is not None
@@ -2888,7 +2987,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 or vllm_compilation_backends.model_tag == "backbone"
             )
             and _uv_before_merge_applies(
-                q_nope.shape[0], vllm_compilation_backends.model_tag == "backbone"
+                q_tokens, vllm_compilation_backends.model_tag == "backbone"
             )
         )
         pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
@@ -2896,14 +2995,70 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
-        if q_nope.device.type == "tpu" and w_uk_t_scale is None:
-            ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
+        tp_op = getattr(layer, "sparse_mla_tp_op", None)
+        ql_nope_split: tuple[torch.Tensor, torch.Tensor] | None = None
+        if isinstance(q_nope, tuple):
+            # Already absorbed and split by TPU_MLA_FUSED_QB_ROPE_ABSORB.
+            ql_head, ql_tail = q_nope
+            ql_nope_split = (
+                ql_head.to(input_dtype).view(-1, attn_heads, layer.kv_lora_rank),
+                ql_tail.to(input_dtype).view(-1, attn_heads, layer.kv_lora_rank),
+            )
+            ql_nope = ql_nope_split[0]
+        elif in_branch_qb_inputs is not None:
+            # Deferred into dcp_nonidx_qb_mla_op.in_branch_qb_attention; skip
+            # eager W_UK_T absorption on the dead q_nope placeholder.
+            ql_nope = q_nope
         else:
-            q_nope_t = q_nope.transpose(0, 1)
-            ql_nope = torch.bmm(q_nope_t, w_uk_t_src.to(q_nope_t.dtype))
-            if w_uk_t_scale is not None:
-                ql_nope = ql_nope * w_uk_t_scale
-            ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
+            use_tp_split_absorb = (
+                has_topk
+                and tp_op is not None
+                and use_qrep
+                and dcp_token_parallel_op.applies(num_kv_tokens)
+                and getattr(tp_op, "split_q_inputs", False)
+                and q_nope.device.type == "tpu"
+                and w_uk_t_scale is None
+            )
+            if use_tp_split_absorb:
+                assert tp_op is not None
+                if w_uk_t_halves is not None:
+                    ql_head, ql_tail = _absorb_q_split_halves(
+                        q_nope,
+                        w_uk_t_halves[0].to(q_nope.dtype),
+                        w_uk_t_halves[1].to(q_nope.dtype),
+                        tp_op.layout.split_rows,
+                    )
+                else:
+                    ql_head, ql_tail = _absorb_q_split(
+                        q_nope, w_uk_t_src.to(q_nope.dtype), tp_op.layout.split_rows
+                    )
+                ql_nope_split = (
+                    ql_head.to(input_dtype).view(-1, attn_heads, layer.kv_lora_rank),
+                    ql_tail.to(input_dtype).view(-1, attn_heads, layer.kv_lora_rank),
+                )
+                ql_nope = ql_nope_split[0]
+            elif q_nope.device.type == "tpu" and w_uk_t_scale is None:
+                if w_uk_t_halves is not None:
+                    ql_nope = _absorb_q_halves(
+                        q_nope,
+                        w_uk_t_halves[0].to(q_nope.dtype),
+                        w_uk_t_halves[1].to(q_nope.dtype),
+                    ).to(input_dtype)
+                else:
+                    ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(
+                        input_dtype
+                    )
+            else:
+                q_nope_t = q_nope.transpose(0, 1)
+                w_uk_bmm = (
+                    torch.cat(w_uk_t_halves, dim=0)
+                    if w_uk_t_halves is not None
+                    else w_uk_t_src
+                )
+                ql_nope = torch.bmm(q_nope_t, w_uk_bmm.to(q_nope_t.dtype))
+                if w_uk_t_scale is not None:
+                    ql_nope = ql_nope * w_uk_t_scale
+                ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
@@ -2916,32 +3071,83 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 layer.kv_cache_quantized_dtype, k_pe, value=None, k_scale=k_scale
             )
 
-        ql_nope_flat = ql_nope.view(-1, attn_heads, layer.kv_lora_rank)
-        q_pe_flat = q_pe.reshape(-1, attn_heads, pe_dim)
         kv_c_normed_flat = kv_c_normed.view(-1, layer.kv_lora_rank)
         k_pe_flat = k_pe.view(-1, layer.qk_rope_head_dim)
-
-        if topk_indices is not None:
+        if in_branch_qb_inputs is not None:
             assert isinstance(kv_cache, (tuple, list)) and len(kv_cache) == 2, (
                 "sparse MLA layers use a native (nope, rope) split "
                 f"cache; got {type(kv_cache)}"
             )
-            if getattr(
-                layer, "sparse_mla_tp_op", None
-            ) is not None and dcp_token_parallel_op.applies(kv_c_normed_flat.shape[0]):
+            assert sp_o_proj is not None
+            if unified_indexer_inputs is not None:
+                return dcp_unified_idx_qb_mla_op.unified_indexer_in_branch_qb_attention(
+                    layer,
+                    (kv_cache[0], kv_cache[1]),
+                    in_branch_qb_inputs,
+                    kv_c_normed_flat,
+                    k_pe_flat,
+                    unified_indexer_inputs,
+                    attn_metadata,
+                    w_o=sp_o_proj,
+                    kv_sharded=kv_sharded,
+                )
+            assert topk_indices is not None
+            return dcp_nonidx_qb_mla_op.in_branch_qb_attention(
+                layer,
+                (kv_cache[0], kv_cache[1]),
+                in_branch_qb_inputs,
+                kv_c_normed_flat,
+                k_pe_flat,
+                topk_indices,
+                attn_metadata,
+                w_o=sp_o_proj,
+                kv_sharded=kv_sharded,
+            )
+
+        ql_nope_flat = ql_nope.view(-1, attn_heads, layer.kv_lora_rank)
+        q_pe_flat = q_pe.reshape(-1, attn_heads, pe_dim)
+
+        if has_topk:
+            assert isinstance(kv_cache, (tuple, list)) and len(kv_cache) == 2, (
+                "sparse MLA layers use a native (nope, rope) split "
+                f"cache; got {type(kv_cache)}"
+            )
+            if (
+                unified_indexer_inputs is not None
+                and sp_o_proj is not None
+                and dcp_token_parallel_op.applies(num_kv_tokens)
+            ):
+                return dcp_unified_indexer_mla_op.unified_indexer_attention(
+                    layer,
+                    (kv_cache[0], kv_cache[1]),
+                    ql_nope_split if ql_nope_split is not None else ql_nope_flat,
+                    q_pe_flat,
+                    kv_c_normed_flat,
+                    k_pe_flat,
+                    unified_indexer_inputs,
+                    attn_metadata,
+                    w_o=sp_o_proj,
+                    kv_sharded=kv_sharded,
+                )
+            assert topk_indices is not None
+            if tp_op is not None and dcp_token_parallel_op.applies(num_kv_tokens):
                 # TPU_DCP_PREFILL_TOKEN_PARALLEL: the DCP path on the leading
                 # rows, the token-parallel split on the rest; merged outputs.
                 outputs = dcp_token_parallel_op.attention(
                     layer,
                     (kv_cache[0], kv_cache[1]),
-                    ql_nope_flat,
+                    ql_nope_split if ql_nope_split is not None else ql_nope_flat,
                     q_pe_flat,
                     kv_c_normed_flat,
                     k_pe_flat,
                     topk_indices,
                     attn_metadata,
                     q_replicated=use_qrep,
+                    w_o=sp_o_proj,
+                    kv_sharded=kv_sharded,
                 )
+                if sp_o_proj is not None:
+                    return outputs
             elif self.dcp_size > 1:
                 assert getattr(layer, "sparse_mla_dcp_op", None) is not None, (
                     "DCP sparse MLA op was never built; "

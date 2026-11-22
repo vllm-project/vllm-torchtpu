@@ -29,7 +29,9 @@ buffer coordinates from the same metadata, so IndexShare layers read them
 unchanged.
 
 The choice is static per compiled bucket; a step the gather buffer cannot
-hold raises in the runner (`check_step_capacity`) instead of running.
+hold raises in the runner (`check_step_capacity`) instead of running. Under
+prefix caching the scheduler keeps every step inside the buffer
+(`core/token_parallel_page_budget.py`).
 """
 
 import functools
@@ -44,20 +46,28 @@ import torch
 from jax import lax
 from jax.sharding import PartitionSpec as P
 from vllm.compilation import backends as vllm_compilation_backends
+
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    KVLayout,
+    kv_cache_append,
+    streamindex_topk,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    kv_cache_utils as idx_kv_cache_utils,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
-from vllm_torchtpu.utils import get_shared_jax_op
-
-from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    KVLayout,
-    streamindex_topk,
-)
 from vllm_torchtpu.kernels.mla import dcp_token_parallel, page_gather
-from vllm_torchtpu.kernels.mla.kv_cache_utils import update_sparse_mla_kv_cache_dcp
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+    update_sparse_mla_kv_cache_dcp,
+    update_sparse_mla_kv_cache_dcp_sharded,
+)
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
+from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.utils import get_shared_jax_op
 
 # Smallest bucket that takes the split (a power of two: `bucket_gate_edge`).
 MIN_TOKENS = 1024
@@ -68,6 +78,18 @@ EXTRA_PAGES = 4
 SPLIT_ROWS_ALIGN = 16
 # Gather sizes (virtual pages) below the buffer's capacity a step may take.
 GATHER_CAPS = (4, 8, 12, 16, 20, 24, 32, 44)
+# Query rows per sparse MLA gather + attention chunk on the split's own rows
+# when TPU_SPARSE_MLA_CHUNK_TOKENS is unset.
+# Avoid smaller 64/128-row chunks here: 256-row chunks halve SparseCore/TensorCore
+# chunk boundaries over a split's 1024 rows while keeping default 16-row batches.
+ATTEND_CHUNK_TOKENS = 256
+
+
+def attend_chunk_kwargs(env_chunk_kwargs: dict[str, int]) -> dict[str, int]:
+    """The split attend's chunk kwargs: the env override, else 256 rows."""
+    if env_chunk_kwargs:
+        return env_chunk_kwargs
+    return {"gather_and_attention_chunk_size": ATTEND_CHUNK_TOKENS}
 
 
 def applies(num_tokens: int) -> bool:
@@ -77,6 +99,24 @@ def applies(num_tokens: int) -> bool:
         envs.TPU_DCP_PREFILL_TOKEN_PARALLEL
         and vllm_compilation_backends.model_tag == "backbone"
         and num_tokens > envs.bucket_gate_edge(MIN_TOKENS)
+    )
+
+
+def serves_sequence_row_oproj(o_proj: Any) -> bool:
+    """Whether the op can run `o_proj` itself (TPU_DCP_TP_PREFILL_LOCAL_OPROJ).
+
+    Its row shard must be FP8 in the canonical (k, n) layout with one scale per
+    output channel, as `dcp_token_parallel.project_sequence_rows` takes it."""
+    weight = getattr(o_proj, "weight", None)
+    scale = getattr(o_proj, "weight_scale", None)
+    return (
+        weight is not None
+        and scale is not None
+        and getattr(o_proj, "bias", None) is None
+        and bool(getattr(o_proj, WEIGHT_FLIPPED_ATTR, False))
+        and weight.dtype == torch.float8_e4m3fn
+        and scale.dim() == 1
+        and scale.shape[0] == weight.shape[1]
     )
 
 
@@ -90,6 +130,18 @@ def layout_for(vllm_config: Any) -> dcp_token_parallel.TokenParallelLayout:
     max_model_len = int(vllm_config.model_config.max_model_len)
     max_pages = -(-max_model_len // vps) + EXTRA_PAGES
     base_caps = GATHER_CAPS
+    req_zigzag = int(envs.TPU_DCP_TP_ZIGZAG_BANDS)
+    tp = int(getattr(parallel, "tensor_parallel_size", dcp))
+    zigzag_bands = (
+        req_zigzag
+        if (
+            envs.TPU_MOE_PREFILL_SEQUENCE_PARALLEL
+            and req_zigzag > 1
+            and dcp == tp
+            and dcp >= 2
+        )
+        else 1
+    )
     return dcp_token_parallel.TokenParallelLayout(
         dcp_size=dcp,
         interleave_size=int(parallel.cp_kv_cache_interleave_size),
@@ -97,6 +149,7 @@ def layout_for(vllm_config: Any) -> dcp_token_parallel.TokenParallelLayout:
         split_rows=-(-max_num_seqs // SPLIT_ROWS_ALIGN) * SPLIT_ROWS_ALIGN,
         max_pages=max_pages,
         gather_caps=tuple(c for c in base_caps if c < max_pages) + (max_pages,),
+        zigzag_bands=zigzag_bands,
     )
 
 
@@ -111,11 +164,6 @@ def check_config(vllm_config: Any, *, q_replicate: bool) -> None:
         raise NotImplementedError(
             "TPU_DCP_PREFILL_TOKEN_PARALLEL returns merged latent outputs; it "
             "does not take TPU_DCP_MLA_UV_BEFORE_MERGE / _OPROJ_ALL_REDUCE."
-        )
-    if vllm_config.cache_config.enable_prefix_caching:
-        raise NotImplementedError(
-            "TPU_DCP_PREFILL_TOKEN_PARALLEL does not take prefix caching: the "
-            "gather buffer is sized for the scheduled rows (check_step_capacity)."
         )
     if vllm_config.scheduler_config.max_num_seqs > MIN_TOKENS // 2:
         raise NotImplementedError(
@@ -234,13 +282,109 @@ def make_attend(
             k_scale=k_scale,
             cache_layout=cache_layout,
             mixed_body_levers=mixed_body_levers,
-            **sparse_mla_chunk_kwargs(),
+            **attend_chunk_kwargs(sparse_mla_chunk_kwargs()),
             **packed,
             **split_kw,
         )
         return out if out.shape[-1] == lkv_dim else out[..., :lkv_dim]
 
+    if envs.TPU_DCP_TP_FUSED_WUV_EPILOGUE:
+        chunk_kw = attend_chunk_kwargs(sparse_mla_chunk_kwargs())
+        chunk_rows = int(
+            chunk_kw.get(
+                "gather_and_attention_chunk_size",
+                sparse_mla_kernel.DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
+            )
+        )
+
+        def attend_hm(q, g_nope, g_rope, topk, num_rows, q_pe=None):
+            split_kw = {"q_pe": q_pe} if split_q and q_pe is not None else {}
+            chunks = sparse_mla_kernel.sparse_ragged_paged_attention(
+                q,
+                g_nope,
+                g_rope,
+                topk,
+                None,
+                jnp.stack([jnp.int32(0), num_rows.astype(jnp.int32)]),
+                jnp.array([0, 0, 1], jnp.int32),
+                sm_scale=sm_scale,
+                k_scale=k_scale,
+                cache_layout=cache_layout,
+                mixed_body_levers=mixed_body_levers,
+                head_major_out_chunks=True,
+                **attend_chunk_kwargs(sparse_mla_chunk_kwargs()),
+                **packed,
+                **split_kw,
+            )
+            assert isinstance(chunks, tuple)
+            return tuple(
+                c if c.shape[-1] == lkv_dim else c[..., :lkv_dim] for c in chunks
+            )
+
+        attend.head_major_chunks = attend_hm  # type: ignore[attr-defined]
+        attend.head_major_chunk_rows = chunk_rows  # type: ignore[attr-defined]
+
     return attend
+
+
+_TP_STREAMIDX_MIN_BKVP = 8
+_TP_STREAMIDX_WIDE_BKVP = 16
+_TP_STREAMIDX_WIDE_BKVP_KV_TOKENS = 49152
+_TP_STREAMIDX_WIDE_KV_TOKENS = 16384
+_TP_STREAMIDX_WIDE_CHUNK_TOKENS = 128
+
+
+def _token_parallel_streamidx_knobs(
+    num_rows: int,
+    natural_shape: tuple[int, ...],
+    kv_layout: KVLayout,
+    mixed_bkvp: int | None,
+    chunk_tokens: int | None,
+) -> tuple[int | None, int | None]:
+    num_pages = natural_shape[0]
+    page_tokens = (
+        natural_shape[-1]
+        if kv_layout == KVLayout.SEQ_ALONG_LANE
+        else natural_shape[1] * natural_shape[2]
+    )
+    kv_tokens = num_pages * page_tokens
+    if mixed_bkvp is None:
+        tp_mixed_bkvp = None
+    elif (
+        kv_tokens >= _TP_STREAMIDX_WIDE_BKVP_KV_TOKENS
+        and num_pages >= _TP_STREAMIDX_WIDE_BKVP
+        and num_pages % _TP_STREAMIDX_WIDE_BKVP == 0
+    ):
+        tp_mixed_bkvp = max(mixed_bkvp, _TP_STREAMIDX_WIDE_BKVP)
+    elif num_pages >= _TP_STREAMIDX_MIN_BKVP:
+        tp_mixed_bkvp = max(mixed_bkvp, _TP_STREAMIDX_MIN_BKVP)
+    else:
+        tp_mixed_bkvp = mixed_bkvp
+    tp_chunk_tokens = (
+        _TP_STREAMIDX_WIDE_CHUNK_TOKENS
+        if (
+            chunk_tokens == 256
+            and kv_tokens > _TP_STREAMIDX_WIDE_KV_TOKENS
+            and num_rows >= 256
+            and num_rows % _TP_STREAMIDX_WIDE_CHUNK_TOKENS == 0
+        )
+        else chunk_tokens
+    )
+    return tp_mixed_bkvp, tp_chunk_tokens
+
+
+def lead_streamidx_block_sizes(
+    split_rows: int,
+    bkvp: tuple[int, int, int],
+    bq: tuple[int, int, int],
+) -> tuple[tuple[int, int, int], tuple[int, int, int], bool]:
+    # Avoid 3-pass decode+batched-decode+mixed compilation on lead_indexer
+    # (s=64): single-pass decode_as_mixed with mixed bq=16 (dividing s) keeps
+    # bkvp=32 intact (bkvp=16 causes set_diff>0) and eliminates dead decode
+    # kernels with set_diff=0.
+    if split_rows >= 16 and split_rows % 16 == 0 and bq[2] < 16:
+        return bkvp, (bq[0], bq[1], 16), True
+    return bkvp, bq, False
 
 
 def make_select_topk(
@@ -261,10 +405,31 @@ def make_select_topk(
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
 
     def select(q_r, w_r, natural, rr, table):
+        tp_mixed_bkvp, tp_chunk_tokens = _token_parallel_streamidx_knobs(
+            q_r.shape[0], natural.shape, kv_layout, mixed_bkvp, chunk_tokens
+        )
         bkvp, bq = mla_op._streamidx_block_sizes(
-            q_r.shape[0], *small_bucket, mixed_bkvp, decode_pack
+            q_r.shape[0], *small_bucket, tp_mixed_bkvp, decode_pack
+        )
+        page_tokens = (
+            natural.shape[-1]
+            if kv_layout == KVLayout.SEQ_ALONG_LANE
+            else natural.shape[1] * natural.shape[2]
+        )
+        kv_tokens = natural.shape[0] * page_tokens
+        # Avoid compiling unreachable _fast_path conditionals on multi-page cap
+        # branches (kv_tokens > 2 * topk): _common_path is exact for every
+        # length, and dropping the cond wrapper frees XLA to overlap the last
+        # chunk's SparseCore top-k wait with downstream ops.
+        enable_early_exit = mla_op.STREAMIDX_ENABLE_EARLY_EXIT and kv_tokens <= 2 * topk
+        u32_sal = (
+            kv_layout == KVLayout.SEQ_ALONG_LANE
+            and natural.ndim == 3
+            and natural.dtype == jnp.uint32
         )
         zero = jnp.int32(0)
+        # Avoid decode_as_mixed=False on [0, 0, rr.num_seqs]: builds two dead
+        # decode schedules and compiles an unreachable distribution[1] > 0 cond.
         return streamindex_topk(
             q_r,
             w_r,
@@ -279,11 +444,13 @@ def make_select_topk(
             num_queries_per_block=bq,
             skip_empty_decode=skip_empty_decode,
             skip_empty_decode_chunked=skip_empty_decode_chunked,
-            enable_early_exit=mla_op.STREAMIDX_ENABLE_EARLY_EXIT,
+            enable_early_exit=enable_early_exit,
             kv_layout=kv_layout,
-            chunk_tokens=chunk_tokens,
+            chunk_tokens=tp_chunk_tokens,
             decode_pack=decode_pack,
+            decode_page_major=True if u32_sal else None,
             shared_meta=shared_meta,
+            decode_as_mixed=True,
         )
 
     return select
@@ -295,6 +462,31 @@ def _after_reads(*caches: jax.Array, after: jax.Array) -> tuple[jax.Array, ...]:
     in-place cache write first and then has to copy the whole cache to keep
     the value the sub-batch reads."""
     return lax.optimization_barrier((*caches, after))[:-1]
+
+
+def _tie_rank_to_partial(
+    partial: jax.Array, rank_ids: jax.Array, mesh: Any, sharded_spec: Any
+) -> jax.Array:
+    # Avoid scheduling the leading-row attention and its LSE/psum collectives
+    # serially after the main token-parallel attention: tying `rank_ids` with a
+    # NaN-safe zero-delta barrier from `partial` orders leading attention first
+    # so its collectives overlap the main attention kernel.
+    def _tie_local(part_local: jax.Array, rank_local: jax.Array) -> jax.Array:
+        bits = jax.lax.bitcast_convert_type(
+            part_local[0, 0, 0].astype(jnp.bfloat16), jnp.uint16
+        ).astype(jnp.int32)
+        zero = (jax.lax.optimization_barrier(bits) == jnp.int32(-1)).astype(
+            rank_local.dtype
+        )
+        return rank_local + zero
+
+    return jax.shard_map(
+        _tie_local,
+        mesh=mesh,
+        in_specs=(sharded_spec, sharded_spec),
+        out_specs=sharded_spec,
+        check_vma=False,
+    )(partial, rank_ids)
 
 
 def build_attention_op(
@@ -364,6 +556,10 @@ def build_attention_op(
         after: jax.Array | None,
         rank_ids: jax.Array | None,
         w_uv: jax.Array | None = None,
+        w_o: jax.Array | None = None,
+        s_o: jax.Array | None = None,
+        q_tail: jax.Array | None = None,
+        kv_sharded: bool = False,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         if after is not None:
             kv_cache_nope, kv_cache_rope = _after_reads(
@@ -445,6 +641,7 @@ def build_attention_op(
                 read_pages=read_pages,
                 w_uv=w_uv,
                 q_pe=q_pe,
+                flat_topk_cap_strided=True,
             )
 
         assert q_pe is not None
@@ -459,13 +656,31 @@ def build_attention_op(
                 if r_arg
                 else dcp_token_parallel.rank_as_data(DCP_AXIS_NAME, dcp)
             )
+            if kv_sharded:
+                return update_sparse_mla_kv_cache_dcp_sharded(
+                    nope,
+                    rope,
+                    kv_c,
+                    k_pe_in,
+                    sl,
+                    bt,
+                    qsl,
+                    rank,
+                    axis_name=DCP_AXIS_NAME,
+                    nope_spec=nope_spec,
+                    rope_spec=rope_spec,
+                    dcp_size=dcp,
+                    interleave_size=il,
+                    zigzag_bands=layout.effective_zigzag_bands(kv_c.shape[0] * dcp),
+                )
             return write_kv(nope, rope, kv_c, k_pe_in, sl, bt, qsl, rank)
 
         r_extra = () if rank_ids is None else (rank_ids,)
+        kv_spec = shd if kv_sharded else rp
         kv_cache_nope, kv_cache_rope = jax.shard_map(
             _write_once,
             mesh=mesh,
-            in_specs=(shd, shd, rp, rp, rp, rp, rp) + (shd,) * len(r_extra),
+            in_specs=(shd, shd, kv_spec, kv_spec, rp, rp, rp) + (shd,) * len(r_extra),
             out_specs=(shd, shd),
             check_vma=False,
         )(
@@ -483,15 +698,29 @@ def build_attention_op(
             seq_lens, query_start_loc, request_distribution, s
         )
         if q_replicated:
-            q_dcp = jax.shard_map(
-                lambda x: x[:s], mesh=mesh, in_specs=shd, out_specs=rp, check_vma=False
-            )(q)
+            if q_tail is not None:
+                q_dcp = jax.shard_map(
+                    lambda x: x, mesh=mesh, in_specs=shd, out_specs=rp, check_vma=False
+                )(q)
+                q_tp = q_tail
+            else:
+                q_dcp = jax.shard_map(
+                    lambda x: x[:s],
+                    mesh=mesh,
+                    in_specs=shd,
+                    out_specs=rp,
+                    check_vma=False,
+                )(q)
+                q_tp = jax.shard_map(
+                    lambda x: x[s:],
+                    mesh=mesh,
+                    in_specs=shd,
+                    out_specs=shd,
+                    check_vma=False,
+                )(q)
             pe_dcp = jax.shard_map(
                 lambda x: x[:s], mesh=mesh, in_specs=shd, out_specs=rp, check_vma=False
             )(q_pe)
-            q_tp = jax.shard_map(
-                lambda x: x[s:], mesh=mesh, in_specs=shd, out_specs=shd, check_vma=False
-            )(q)
             pe_tp = jax.shard_map(
                 lambda x: x[s:], mesh=mesh, in_specs=shd, out_specs=shd, check_vma=False
             )(q_pe)
@@ -523,11 +752,26 @@ def build_attention_op(
             check_vma=False,
         )(topk_in)
 
+        # Avoid slicing sharded kv_c_normed/k_pe under skip_kv_write=True:
+        # sparse_mla_attention_dcp declares them replicated and would trigger an
+        # all-gather for dead operands that are never read.
+        kv_c_lead = (
+            jnp.zeros((s, kv_c_normed.shape[-1]), kv_c_normed.dtype)
+            if kv_sharded
+            else kv_c_normed[:s]
+        )
+        k_pe_lead = (
+            jnp.zeros((s, k_pe.shape[-1]), k_pe.dtype) if kv_sharded else k_pe[:s]
+        )
+        lead_live_widths = (
+            (128, 256, 384) if envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS == "256,384" else None
+        )
+        lead_batch_size = 8 if s <= 64 and s % 8 == 0 else None
         _, _, partial, lse = sparse_mla_attention_dcp(
             q_dcp,
             pe_dcp,
-            kv_c_normed[:s],
-            k_pe[:s],
+            kv_c_lead,
+            k_pe_lead,
             kv_cache_nope,
             kv_cache_rope,
             head_topk,
@@ -545,7 +789,43 @@ def build_attention_op(
             dcp_rank_ids=rank_ids,
             merge_pieces=False,
             skip_kv_write=True,
+            mixed_live_widths_override=lead_live_widths,
+            attention_kernel_batch_size=lead_batch_size,
         )
+        if w_o is not None:
+            assert s_o is not None and w_uv is not None and rank_ids is not None
+            _, _, projected = dcp_token_parallel.sparse_mla_attention_with_lead_oproj(
+                layout,
+                mesh,
+                DCP_AXIS_NAME,
+                kv_cache_nope,
+                kv_cache_rope,
+                q_tp,
+                None,
+                None,
+                tail_topk,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                lead_partial=partial,
+                lead_lse=lse,
+                write_kv=None,
+                attend=attend,
+                w_uv=w_uv,
+                w_o=w_o,
+                w_o_scale=s_o,
+                rank_ids=rank_ids,
+                q_own_rows=q_replicated,
+                read_pages=read_pages,
+                q_pe=pe_tp,
+                w_uv_replicated=True,
+                num_tokens=num_tokens,
+                flat_topk_cap_strided=True,
+                epilogue_3d=envs.TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT,
+            )
+            return kv_cache_nope, kv_cache_rope, projected
+
         _, _, tail_out = dcp_token_parallel.sparse_mla_attention(
             layout,
             mesh,
@@ -553,8 +833,8 @@ def build_attention_op(
             kv_cache_nope,
             kv_cache_rope,
             q_tp,
-            kv_c_normed,
-            k_pe,
+            None,
+            None,
             tail_topk,
             seq_lens,
             block_tables,
@@ -567,6 +847,10 @@ def build_attention_op(
             read_pages=read_pages,
             w_uv=w_uv,
             q_pe=pe_tp,
+            token_rows=False,
+            w_uv_replicated=False,
+            num_tokens=num_tokens,
+            flat_topk_cap_strided=True,
         )
 
         def _merge_and_join(part, lse_part, tail_local, *w_uv_arg):
@@ -604,6 +888,7 @@ def build_attention_op(
         return kv_cache_nope, kv_cache_rope, full_out
 
     use_split_op = split_q or fused_subbatch
+    split_q_inputs = bool(fused_subbatch and q_replicated)
     sharded, rep = P(DCP_AXIS_NAME), P()
 
     def _build_wrapper(has_rank: bool, has_uv: bool):
@@ -622,6 +907,7 @@ def build_attention_op(
                 query_start_loc: jax.Array,
                 request_distribution: jax.Array,
                 *extra: jax.Array,
+                q_tail: jax.Array | None = None,
             ) -> tuple[jax.Array, jax.Array, jax.Array]:
                 r_id = extra[0] if has_rank else None
                 uv_w = extra[-1] if has_uv else None
@@ -640,7 +926,97 @@ def build_attention_op(
                     None,
                     r_id,
                     uv_w,
+                    q_tail=q_tail,
                 )
+
+            if split_q_inputs:
+                if (has_rank, has_uv) == (False, False):
+
+                    def ws0(
+                        n: jax.Array,
+                        r: jax.Array,
+                        qh: jax.Array,
+                        qt: jax.Array,
+                        qp: jax.Array,
+                        kc: jax.Array,
+                        kp: jax.Array,
+                        tk: jax.Array,
+                        sl: jax.Array,
+                        bt: jax.Array,
+                        qsl: jax.Array,
+                        rd: jax.Array,
+                    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                        return _fn_fused(
+                            n, r, qh, qp, kc, kp, tk, sl, bt, qsl, rd, q_tail=qt
+                        )
+
+                    return ws0
+                if (has_rank, has_uv) == (False, True):
+
+                    def ws1(
+                        n: jax.Array,
+                        r: jax.Array,
+                        qh: jax.Array,
+                        qt: jax.Array,
+                        qp: jax.Array,
+                        kc: jax.Array,
+                        kp: jax.Array,
+                        tk: jax.Array,
+                        sl: jax.Array,
+                        bt: jax.Array,
+                        qsl: jax.Array,
+                        rd: jax.Array,
+                        uv: jax.Array,
+                    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                        return _fn_fused(
+                            n, r, qh, qp, kc, kp, tk, sl, bt, qsl, rd, uv, q_tail=qt
+                        )
+
+                    return ws1
+                if (has_rank, has_uv) == (True, False):
+
+                    def ws2(
+                        n: jax.Array,
+                        r: jax.Array,
+                        qh: jax.Array,
+                        qt: jax.Array,
+                        qp: jax.Array,
+                        kc: jax.Array,
+                        kp: jax.Array,
+                        tk: jax.Array,
+                        sl: jax.Array,
+                        bt: jax.Array,
+                        qsl: jax.Array,
+                        rd: jax.Array,
+                        rk: jax.Array,
+                    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                        return _fn_fused(
+                            n, r, qh, qp, kc, kp, tk, sl, bt, qsl, rd, rk, q_tail=qt
+                        )
+
+                    return ws2
+
+                def ws3(
+                    n: jax.Array,
+                    r: jax.Array,
+                    qh: jax.Array,
+                    qt: jax.Array,
+                    qp: jax.Array,
+                    kc: jax.Array,
+                    kp: jax.Array,
+                    tk: jax.Array,
+                    sl: jax.Array,
+                    bt: jax.Array,
+                    qsl: jax.Array,
+                    rd: jax.Array,
+                    rk: jax.Array,
+                    uv: jax.Array,
+                ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                    return _fn_fused(
+                        n, r, qh, qp, kc, kp, tk, sl, bt, qsl, rd, rk, uv, q_tail=qt
+                    )
+
+                return ws3
 
             if (has_rank, has_uv) == (False, False):
 
@@ -878,6 +1254,8 @@ def build_attention_op(
         return c3
 
     in_specs = (sharded, sharded, sharded)
+    if split_q_inputs:
+        in_specs += (sharded,)
     if use_split_op:
         in_specs += (sharded,)
     in_specs += (rep, rep, sharded, rep, rep, rep, rep)
@@ -889,9 +1267,11 @@ def build_attention_op(
         in_specs += (sharded,)
     fn = _build_wrapper(has_rank, uv_in_tp)
 
+    kv_c_rest_idx = 2 if split_q_inputs else (1 if use_split_op else 0)
+
     def _fake(kv_cache_nope, kv_cache_rope, q, *rest, **kwargs):
         del kwargs
-        kv_c_normed = rest[1] if use_split_op else rest[0]
+        kv_c_normed = rest[kv_c_rest_idx]
         return (
             torch.empty_like(kv_cache_nope),
             torch.empty_like(kv_cache_rope),
@@ -934,9 +1314,368 @@ def build_attention_op(
     ):
         sharers.append(weakref.ref(target_layer))
 
+    oproj_op = None
+    oproj_sharded_kv_op = None
+    # TPU_DCP_TP_PREFILL_LOCAL_OPROJ needs the fused sub-batch op with the DCP
+    # rank operand and W_UV in the op; other layers keep o_proj outside.
+    if envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ and fused_subbatch and has_rank and uv_in_tp:
+
+        def _make_oproj_wrapper(kv_sharded: bool):
+            if split_q_inputs:
+
+                def _w_oproj_split(
+                    n: jax.Array,
+                    r: jax.Array,
+                    qh: jax.Array,
+                    qt: jax.Array,
+                    qp: jax.Array,
+                    kc: jax.Array,
+                    kp: jax.Array,
+                    tk: jax.Array,
+                    sl: jax.Array,
+                    bt: jax.Array,
+                    qsl: jax.Array,
+                    rd: jax.Array,
+                    rk: jax.Array,
+                    uv: jax.Array,
+                    wo: jax.Array,
+                    so: jax.Array,
+                ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                    return _run(
+                        n,
+                        r,
+                        qh,
+                        qp,
+                        kc,
+                        kp,
+                        tk,
+                        sl,
+                        bt,
+                        qsl,
+                        rd,
+                        None,
+                        rk,
+                        uv,
+                        wo,
+                        so,
+                        qt,
+                        kv_sharded=kv_sharded,
+                    )
+
+                return _w_oproj_split
+
+            def _w_oproj_plain(
+                n: jax.Array,
+                r: jax.Array,
+                qn: jax.Array,
+                qp: jax.Array,
+                kc: jax.Array,
+                kp: jax.Array,
+                tk: jax.Array,
+                sl: jax.Array,
+                bt: jax.Array,
+                qsl: jax.Array,
+                rd: jax.Array,
+                rk: jax.Array,
+                uv: jax.Array,
+                wo: jax.Array,
+                so: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                return _run(
+                    n,
+                    r,
+                    qn,
+                    qp,
+                    kc,
+                    kp,
+                    tk,
+                    sl,
+                    bt,
+                    qsl,
+                    rd,
+                    None,
+                    rk,
+                    uv,
+                    wo,
+                    so,
+                    kv_sharded=kv_sharded,
+                )
+
+            return _w_oproj_plain
+
+        def _fake_oproj(kv_cache_nope, kv_cache_rope, q, *rest, **kwargs):
+            del kwargs
+            kv_c_normed, w_o = rest[kv_c_rest_idx], rest[-2]
+            return (
+                torch.empty_like(kv_cache_nope),
+                torch.empty_like(kv_cache_rope),
+                q.new_empty((kv_c_normed.shape[0] // layout.dcp_size, w_o.shape[1])),
+            )
+
+        def _fake_oproj_sharded_kv(kv_cache_nope, kv_cache_rope, q, *rest, **kwargs):
+            del kwargs
+            kv_c_normed, w_o = rest[kv_c_rest_idx], rest[-2]
+            return (
+                torch.empty_like(kv_cache_nope),
+                torch.empty_like(kv_cache_rope),
+                q.new_empty((kv_c_normed.shape[0], w_o.shape[1])),
+            )
+
+        oproj_in_specs = in_specs[:-1] + (rep, sharded, sharded)
+
+        def _build_oproj_op(op_name: str):
+            built = pcp_streaming_jax_op(
+                op_name,
+                _make_oproj_wrapper(kv_sharded=False),
+                donate_argnums=(0, 1),
+                mesh=mesh,
+                # W_UV every head, replicated; o_proj's row shard + its scale.
+                input_partition_specs=oproj_in_specs,
+                output_partition_specs=(sharded, sharded, sharded),
+            )
+            built.register_fake(_fake_oproj)
+            return built, layers
+
+        oproj_key = (
+            id(mesh),
+            layout,
+            bool(q_replicated),
+            sm_scale,
+            dequant,
+            mixed_levers,
+            chunk_tokens,
+            num_heads,
+            out_dim,
+        )
+        oproj_op, _ = get_shared_jax_op(
+            "sparse_mla_tp_oproj",
+            oproj_key,
+            _build_oproj_op,
+        )
+
+        if envs.TPU_DCP_TP_SHARDED_KV_WRITE:
+            kv_c_spec_idx = 3 + kv_c_rest_idx
+            sharded_kv_in_specs = (
+                oproj_in_specs[:kv_c_spec_idx]
+                + (sharded, sharded)
+                + oproj_in_specs[kv_c_spec_idx + 2 :]
+            )
+
+            def _build_oproj_sharded_kv_op(op_name: str):
+                built = pcp_streaming_jax_op(
+                    op_name,
+                    _make_oproj_wrapper(kv_sharded=True),
+                    donate_argnums=(0, 1),
+                    mesh=mesh,
+                    input_partition_specs=sharded_kv_in_specs,
+                    output_partition_specs=(sharded, sharded, sharded),
+                )
+                built.register_fake(_fake_oproj_sharded_kv)
+                return built, layers
+
+            oproj_sharded_kv_op, _ = get_shared_jax_op(
+                "sparse_mla_tp_oproj_sharded_kv",
+                oproj_key,
+                _build_oproj_sharded_kv_op,
+            )
+
+    qc_head_shift_op = None
+    gather_owned_k_op = None
+    indexer_owned_rows_op = None
+    if q_replicated and oproj_sharded_kv_op is not None and rank_tensor is not None:
+        split_rows = layout.split_rows
+
+        def _qc_head_shift(q_c_local: jax.Array, rk: jax.Array) -> jax.Array:
+            zigzag_local = layout.effective_zigzag_bands(q_c_local.shape[0] * dcp) > 1
+            return jax.shard_map(
+                lambda qc, r: dcp_token_parallel.gather_qc_head_rows(
+                    qc,
+                    r,
+                    dcp_size=dcp,
+                    split_rows=split_rows,
+                    axis_name=DCP_AXIS_NAME,
+                    zigzag_local=zigzag_local,
+                ),
+                mesh=mesh,
+                in_specs=(sharded, sharded),
+                out_specs=sharded,
+                check_vma=False,
+            )(q_c_local, rk)
+
+        def _fake_qc_head_shift(
+            q_c_local: torch.Tensor, rk: torch.Tensor
+        ) -> torch.Tensor:
+            del rk
+            return q_c_local.new_empty(
+                (q_c_local.shape[0] + split_rows, q_c_local.shape[1])
+            )
+
+        def _build_qc_head_shift_op(op_name: str):
+            built = pcp_streaming_jax_op(
+                op_name,
+                _qc_head_shift,
+                donate_argnums=(),
+                mesh=mesh,
+                input_partition_specs=(sharded, sharded),
+                output_partition_specs=sharded,
+            )
+            built.register_fake(_fake_qc_head_shift)
+            return built, layers
+
+        qc_head_shift_op, _ = get_shared_jax_op(
+            "dcp_qc_head_shift",
+            (id(mesh), dcp, split_rows, layout.zigzag_bands),
+            _build_qc_head_shift_op,
+        )
+
+        def _gather_owned_k(k_local: jax.Array, raw_own: jax.Array) -> jax.Array:
+            return jax.shard_map(
+                lambda kl, ro: jnp.take(
+                    lax.all_gather(kl, DCP_AXIS_NAME, axis=0, tiled=True),
+                    ro,
+                    axis=0,
+                ),
+                mesh=mesh,
+                in_specs=(sharded, sharded),
+                out_specs=sharded,
+                check_vma=False,
+            )(k_local, raw_own)
+
+        def _fake_gather_owned_k(
+            k_local: torch.Tensor, raw_own: torch.Tensor
+        ) -> torch.Tensor:
+            return k_local.new_empty((raw_own.shape[0], k_local.shape[1]))
+
+        def _build_gather_owned_k_op(op_name: str):
+            built = pcp_streaming_jax_op(
+                op_name,
+                _gather_owned_k,
+                donate_argnums=(),
+                mesh=mesh,
+                input_partition_specs=(sharded, sharded),
+                output_partition_specs=sharded,
+            )
+            built.register_fake(_fake_gather_owned_k)
+            return built, layers
+
+        gather_owned_k_op, _ = get_shared_jax_op(
+            "dcp_gather_owned_k",
+            (id(mesh), dcp),
+            _build_gather_owned_k_op,
+        )
+
+        def _indexer_owned_rows(
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            tok_probe: jax.Array,
+            rk: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            num_tokens = int(tok_probe.shape[0])
+            zb = layout.effective_zigzag_bands(num_tokens)
+            live_pages = next(
+                (
+                    int(kc.kv_cache.shape[0])
+                    for ref in layers
+                    if (ly := ref()) is not None
+                    and (kc := getattr(ly, "indexer_k_cache", None)) is not None
+                    and kc.kv_cache.numel() > 0
+                ),
+                0,
+            )
+            eff_pages = live_pages if live_pages > 0 else (2**29 // max(dcp, 1))
+
+            def _per_rank(
+                sl: jax.Array,
+                pi: jax.Array,
+                cql: jax.Array,
+                probe: jax.Array,
+                r_arr: jax.Array,
+            ) -> tuple[jax.Array, jax.Array]:
+                # Avoid del probe: jax.export prunes unused inputs from @main,
+                # causing fx_to_mlir func.call arity mismatch (expected 4, got 5).
+                r_live, _ = lax.optimization_barrier((r_arr, probe))
+                page, slot = idx_kv_cache_utils.get_dcp_page_and_slot(
+                    num_tokens,
+                    sl,
+                    pi,
+                    cql,
+                    r_live[0],
+                    page_size=layout.page_size,
+                    num_pages=eff_pages,
+                    dcp_size=dcp,
+                    interleave_size=layout.interleave_size,
+                )
+                dst_rows = idx_kv_cache_utils.get_dst_rows(page, slot, layout.page_size)
+                own_idx, _ = kv_cache_append.compact_owned_row_indices(
+                    dst_rows,
+                    num_seqs=sl.shape[0],
+                    dcp_size=dcp,
+                    interleave_size=layout.interleave_size,
+                )
+                raw_own = kv_cache_append.zigzag_to_rank_major_idx(
+                    own_idx,
+                    num_tokens=num_tokens,
+                    dcp_size=dcp,
+                    zigzag_bands=zb,
+                )
+                return own_idx, raw_own
+
+            return jax.shard_map(
+                _per_rank,
+                mesh=mesh,
+                in_specs=(rep, rep, rep, sharded, sharded),
+                out_specs=(sharded, sharded),
+                check_vma=False,
+            )(seq_lens, page_indices, cu_q_lens, tok_probe, rk)
+
+        def _fake_indexer_owned_rows(
+            seq_lens: torch.Tensor,
+            page_indices: torch.Tensor,
+            cu_q_lens: torch.Tensor,
+            tok_probe: torch.Tensor,
+            rk: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del page_indices, cu_q_lens, rk
+            # Avoid int(tok_probe.shape[0]): tok_probe.shape[0] is symbolic under
+            # AOT dynamic tracing and casting to int specializes input_ids/positions.
+            cap = kv_cache_append.owned_rows_bound_from_local(
+                tok_probe.shape[0],
+                num_seqs=seq_lens.shape[0],
+                interleave_size=layout.interleave_size,
+            )
+            return (
+                seq_lens.new_empty((cap,), dtype=torch.int32),
+                seq_lens.new_empty((cap,), dtype=torch.int32),
+            )
+
+        def _build_indexer_owned_rows_op(op_name: str):
+            built = pcp_streaming_jax_op(
+                op_name,
+                _indexer_owned_rows,
+                donate_argnums=(),
+                mesh=mesh,
+                input_partition_specs=(rep, rep, rep, sharded, sharded),
+                output_partition_specs=(sharded, sharded),
+            )
+            built.register_fake(_fake_indexer_owned_rows)
+            return built, layers
+
+        indexer_owned_rows_op, _ = get_shared_jax_op(
+            "dcp_indexer_owned_rows",
+            (
+                id(mesh),
+                dcp,
+                layout.page_size,
+                layout.interleave_size,
+                layout.zigzag_bands,
+            ),
+            _build_indexer_owned_rows_op,
+        )
+
     def run(
         kv_cache: tuple[torch.Tensor, torch.Tensor],
-        q: torch.Tensor,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         q_pe: torch.Tensor | None,
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
@@ -947,10 +1686,49 @@ def build_attention_op(
         request_distribution: torch.Tensor,
         after: torch.Tensor | None,
         w_uv: torch.Tensor | None = None,
+        w_o: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_sharded: bool = False,
     ) -> torch.Tensor:
         nope_cache, rope_cache = kv_cache
-        q_args = (q, q_pe) if use_split_op else (q,)
+        if split_q_inputs:
+            if isinstance(q, tuple):
+                q_head, q_tail = q
+            else:
+                q_head, q_tail = q[: layout.split_rows], q[layout.split_rows :]
+            q_args: tuple[Any, ...] = (q_head, q_tail, q_pe)
+        elif use_split_op:
+            q_args = (q, q_pe)
+        else:
+            q_args = (q,)
         after_args = () if fused_subbatch else (after,)
+        if w_o is not None:
+            selected_oproj_op = oproj_sharded_kv_op if kv_sharded else oproj_op
+            if selected_oproj_op is None or w_uv is None or rank_tensor is None:
+                raise RuntimeError(
+                    "sequence-row o_proj requested but its op was not built "
+                    "(TPU_DCP_TP_PREFILL_LOCAL_OPROJ / "
+                    "TPU_DCP_TP_SHARDED_KV_WRITE off at load?)"
+                )
+            new_nope, new_rope, out = selected_oproj_op(
+                nope_cache,
+                rope_cache,
+                *q_args,
+                kv_c_normed,
+                k_pe,
+                topk_in,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                rank_tensor,
+                w_uv,
+                *w_o,
+            )
+            nope_cache.copy_(new_nope)
+            rope_cache.copy_(new_rope)
+            return out
+        if kv_sharded:
+            raise ValueError("kv_sharded requires sequence-row o_proj (w_o)")
         new_nope, new_rope, out = op(
             nope_cache,
             rope_cache,
@@ -974,7 +1752,13 @@ def build_attention_op(
     run.q_replicated = q_replicated  # type: ignore[attr-defined]
     run.uv_in_tp = uv_in_tp  # type: ignore[attr-defined]
     run.split_q = use_split_op  # type: ignore[attr-defined]
+    run.split_q_inputs = split_q_inputs  # type: ignore[attr-defined]
     run.fused_subbatch = fused_subbatch  # type: ignore[attr-defined]
+    run.serves_oproj = oproj_op is not None  # type: ignore[attr-defined]
+    run.serves_sharded_kv = oproj_sharded_kv_op is not None  # type: ignore[attr-defined]
+    run.qc_head_shift_op = qc_head_shift_op  # type: ignore[attr-defined]
+    run.gather_owned_k_op = gather_owned_k_op  # type: ignore[attr-defined]
+    run.indexer_owned_rows_op = indexer_owned_rows_op  # type: ignore[attr-defined]
     # This rank's DCP index as data, for `q_rows` (built here, outside Dynamo).
     from vllm_torchtpu.distributed.dcp import dcp_rank_operand
 
@@ -990,6 +1774,23 @@ def q_rows(tp_op: Any, num_tokens: int) -> torch.Tensor:
     layout = tp_op.layout
     rows = layout.rows_per_rank(num_tokens)
     rank = tp_op.rank
+    nb = layout.effective_zigzag_bands(num_tokens)
+    if nb > 1:
+        r = rank.reshape(())
+        s = layout.split_rows
+        dcp = layout.dcp_size
+        band = rows // nb
+        offs = torch.arange(band, dtype=rank.dtype, device=rank.device)
+        bands = [
+            ((k * dcp + r if k % 2 == 0 else (k + 1) * dcp - 1 - r) * band + offs)
+            for k in range(nb)
+        ]
+        own = torch.cat(bands, dim=0)
+        pad = own[-1:].expand(s)
+        r0_tail = torch.cat([own[s:], pad], dim=0)
+        tail = torch.where(r == 0, r0_tail, own)
+        head = torch.arange(s, dtype=rank.dtype, device=rank.device)
+        return torch.cat([head, tail], dim=0)
     ar = torch.arange(layout.split_rows + rows, dtype=rank.dtype, device=rank.device)
     own = ar + torch.where(ar >= layout.split_rows, rank * rows, 0)
     return torch.clamp(own, max=num_tokens - 1)
@@ -998,18 +1799,24 @@ def q_rows(tp_op: Any, num_tokens: int) -> torch.Tensor:
 def attention(
     layer: Any,
     kv_cache: tuple[torch.Tensor, torch.Tensor],
-    ql_nope: torch.Tensor,
+    ql_nope: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     q_pe: torch.Tensor,
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
     topk_rows: torch.Tensor,
     attn_metadata: Any,
     q_replicated: bool,
+    w_o: tuple[torch.Tensor, torch.Tensor] | None = None,
+    kv_sharded: bool = False,
 ) -> torch.Tensor:
     """Sparse MLA of a split bucket: `[T, heads, kv_lora_rank]`, this rank's
     heads, merged; what the DCP path returns for the same step. `ql_nope` /
     `q_pe` hold this rank's heads of every row, or, under query replication,
-    every head of the `q_rows` rows."""
+    every head of the `q_rows` rows (either contiguous or split `(head, tail)`).
+
+    With `w_o` (this rank's FP8 o_proj row shard, canonical (k, n), and its
+    per-channel scale): o_proj's output on this rank's sequence-parallel rows
+    instead, `[T / dcp, hidden]` (`dcp_token_parallel.project_sequence_rows`)."""
     from vllm_torchtpu.layers.adapter.cp_mla_attention import (
         _retain_rank,
         all_gather_q_nope_pe_heads,
@@ -1024,19 +1831,35 @@ def attention(
         )
     layout = tp_op.layout
     s = layout.split_rows
-    num_tokens = kv_c_normed.shape[0]
+    num_tokens = (
+        kv_c_normed.shape[0] * layout.dcp_size if kv_sharded else kv_c_normed.shape[0]
+    )
     rows = layout.rows_per_rank(num_tokens)
-    if q_replicated and ql_nope.shape[0] != s + rows:
-        raise ValueError(f"q has {ql_nope.shape[0]} rows, not the {s + rows} q_rows")
+    if isinstance(ql_nope, tuple):
+        q_head, q_tail = ql_nope
+        if q_replicated and (q_head.shape[0] != s or q_tail.shape[0] != rows):
+            raise ValueError(
+                f"split q has ({q_head.shape[0]}, {q_tail.shape[0]}) rows, "
+                f"not ({s}, {rows})"
+            )
+        q_dtype = q_head.dtype
+    else:
+        if q_replicated and ql_nope.shape[0] != s + rows:
+            raise ValueError(
+                f"q has {ql_nope.shape[0]} rows, not the {s + rows} q_rows"
+            )
+        q_dtype = ql_nope.dtype
     md = attn_metadata
+    if w_o is not None and not getattr(tp_op, "fused_subbatch", False):
+        raise NotImplementedError("sequence-row o_proj needs the fused sub-batch op")
+    if kv_sharded and w_o is None:
+        raise ValueError("kv_sharded requires sequence-row o_proj (w_o)")
     if getattr(tp_op, "fused_subbatch", False):
         w_uv_arg = None
         if getattr(tp_op, "uv_in_tp", False):
-            w_uv_arg = (
-                layer.W_UV.to(ql_nope.dtype)
-                if layer.W_UV.dtype != ql_nope.dtype
-                else layer.W_UV
-            )
+            # The sequence-row o_proj takes every head's W_UV (replicated).
+            w_uv_src = layer.W_UV if w_o is None else layer.W_UV_tp_all
+            w_uv_arg = w_uv_src.to(q_dtype) if w_uv_src.dtype != q_dtype else w_uv_src
         out = tp_op(
             kv_cache,
             ql_nope,
@@ -1050,8 +1873,12 @@ def attention(
             md.request_distribution,
             None,
             w_uv_arg,
+            w_o,
+            kv_sharded=kv_sharded,
         )
         return _retain_rank(out)
+
+    assert isinstance(ql_nope, torch.Tensor)
 
     seq_s, qsl_s, dist_s = dcp_rows_metadata(
         md.seq_lens, md.query_start_loc, md.request_distribution, s
@@ -1121,7 +1948,6 @@ def build_indexer_op(
     [T / dcp, topk]` this rank's rows as flat gather-buffer rows. Writes every
     row's K into the cache first, as the DCP op does."""
     from vllm_torchtpu.distributed.dcp import dcp_lane_operand
-
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk_dcp
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
 
@@ -1181,11 +2007,14 @@ def build_indexer_op(
         after: jax.Array | None,
         rank_ids: jax.Array | None,
         lane_ids: jax.Array | None = None,
+        *,
+        k_sharded: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
         if after is not None:
             (cache_kv,) = _after_reads(cache_kv, after=after)
+        k_for_mode = k_packed[: k_packed.shape[0] // dcp] if k_sharded else k_packed
         writer, kv_layout = mla_op._resolve_indexer_kv_cache_mode(
-            cache_kv, k_packed, mode=kv_cache_mode
+            cache_kv, k_for_mode, mode=kv_cache_mode
         )
         if kv_layout != KVLayout.SEQ_ALONG_LANE:
             raise NotImplementedError(
@@ -1197,6 +2026,16 @@ def build_indexer_op(
                 f"index-K page {cache_kv.shape[-1]} != block size "
                 f"{layout.page_size} the token-parallel layout was built for"
             )
+        idx_scatter_kw: dict[str, Any] = {}
+        if k_sharded:
+            step_tok = (
+                int(q_bytes.shape[0] - dcp * layout.split_rows)
+                if q_own_rows
+                else int(k_packed.shape[0])
+            )
+            idx_scatter_kw["step_tokens"] = step_tok
+            if layout.effective_zigzag_bands(step_tok) > 1:
+                idx_scatter_kw["zigzag_bands"] = layout.effective_zigzag_bands(step_tok)
         cache_kv = mla_op._cp_scatter_indexer_k(
             cache_kv,
             k_packed,
@@ -1211,6 +2050,8 @@ def build_indexer_op(
             kv_layout=kv_layout,
             rank_ids=rank_ids,
             compact=k_write_compact,
+            k_sharded=k_sharded,
+            **idx_scatter_kw,
         )
         q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
 
@@ -1241,6 +2082,8 @@ def build_indexer_op(
                 select_topk=select,
                 rank_ids=rank_ids,
                 q_own_rows=q_own_rows,
+                flat_topk_cap_strided=True,
+                index_k_packed_u32=(kv_layout == KVLayout.SEQ_ALONG_LANE),
             )
             return cache_kv, flat
 
@@ -1283,6 +2126,9 @@ def build_indexer_op(
         bkvp_dcp, bq_dcp = mla_op._streamidx_block_sizes(
             s, *small_bucket, mixed_bkvp, decode_pack
         )
+        bkvp_dcp, bq_dcp, lead_decode_as_mixed = lead_streamidx_block_sizes(
+            s, bkvp_dcp, bq_dcp
+        )
         large = mla_op._dcp_indexer_a2a_for_bucket(s, True, a2a_min_tokens)
         head = streamindex_topk_dcp(
             q_dcp,
@@ -1311,6 +2157,7 @@ def build_indexer_op(
             small_all_gather=small_ag,
             decode_pack=decode_pack,
             shared_meta=shared_meta,
+            decode_as_mixed=lead_decode_as_mixed,
         )
         tail = dcp_token_parallel.indexer_topk(
             layout,
@@ -1326,6 +2173,8 @@ def build_indexer_op(
             select_topk=select,
             rank_ids=rank_ids,
             q_own_rows=q_own_rows,
+            flat_topk_cap_strided=True,
+            index_k_packed_u32=(kv_layout == KVLayout.SEQ_ALONG_LANE),
         )
         full = jax.shard_map(
             lambda h, t: jnp.concatenate([h, t], axis=0),
@@ -1336,7 +2185,7 @@ def build_indexer_op(
         )(head, tail)
         return cache_kv, full
 
-    def _build_idx_wrapper():
+    def _build_idx_wrapper(k_sharded: bool = False):
         if fused_subbatch:
             if not has_rank:
 
@@ -1350,7 +2199,20 @@ def build_indexer_op(
                     cql: jax.Array,
                     dist: jax.Array,
                 ) -> tuple[jax.Array, jax.Array]:
-                    return _run(qb, w, kv, kp, sl, pi, cql, dist, None, None, None)
+                    return _run(
+                        qb,
+                        w,
+                        kv,
+                        kp,
+                        sl,
+                        pi,
+                        cql,
+                        dist,
+                        None,
+                        None,
+                        None,
+                        k_sharded=k_sharded,
+                    )
 
                 return f0
             if not has_lane:
@@ -1366,7 +2228,20 @@ def build_indexer_op(
                     dist: jax.Array,
                     rk: jax.Array,
                 ) -> tuple[jax.Array, jax.Array]:
-                    return _run(qb, w, kv, kp, sl, pi, cql, dist, None, rk, None)
+                    return _run(
+                        qb,
+                        w,
+                        kv,
+                        kp,
+                        sl,
+                        pi,
+                        cql,
+                        dist,
+                        None,
+                        rk,
+                        None,
+                        k_sharded=k_sharded,
+                    )
 
                 return f1
 
@@ -1382,7 +2257,20 @@ def build_indexer_op(
                 rk: jax.Array,
                 ln: jax.Array,
             ) -> tuple[jax.Array, jax.Array]:
-                return _run(qb, w, kv, kp, sl, pi, cql, dist, None, rk, ln)
+                return _run(
+                    qb,
+                    w,
+                    kv,
+                    kp,
+                    sl,
+                    pi,
+                    cql,
+                    dist,
+                    None,
+                    rk,
+                    ln,
+                    k_sharded=k_sharded,
+                )
 
             return f2
 
@@ -1399,7 +2287,20 @@ def build_indexer_op(
                 dist: jax.Array,
                 af: jax.Array,
             ) -> tuple[jax.Array, jax.Array]:
-                return _run(qb, w, kv, kp, sl, pi, cql, dist, af, None, None)
+                return _run(
+                    qb,
+                    w,
+                    kv,
+                    kp,
+                    sl,
+                    pi,
+                    cql,
+                    dist,
+                    af,
+                    None,
+                    None,
+                    k_sharded=k_sharded,
+                )
 
             return u0
 
@@ -1415,7 +2316,20 @@ def build_indexer_op(
             af: jax.Array,
             rk: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
-            return _run(qb, w, kv, kp, sl, pi, cql, dist, af, rk, None)
+            return _run(
+                qb,
+                w,
+                kv,
+                kp,
+                sl,
+                pi,
+                cql,
+                dist,
+                af,
+                rk,
+                None,
+                k_sharded=k_sharded,
+            )
 
         return u1
 
@@ -1446,7 +2360,7 @@ def build_indexer_op(
     def _build_idx_op(op_name: str):
         built = pcp_streaming_jax_op(
             op_name,
-            _build_idx_wrapper(),
+            _build_idx_wrapper(k_sharded=False),
             donate_argnums=(2,),
             mesh=mesh,
             input_partition_specs=in_specs,
@@ -1455,47 +2369,70 @@ def build_indexer_op(
         built.register_fake(_fake)
         return built
 
-    op = get_shared_jax_op(
-        "streamidx_topk_tp",
-        (
-            id(mesh),
-            layout,
-            bool(q_own_rows),
-            int(topk),
-            chunk_tokens,
-            bool(hist_merge),
-            bool(a2a_merge),
-            int(a2a_min_tokens),
-            small_bucket,
-            kv_cache_mode,
-            bool(skip_empty_decode),
-            bool(skip_empty_decode_chunked),
-            mixed_bkvp,
-            bool(decode_pack),
-            shared_meta,
-            bool(k_write_compact),
-            bool(fused_subbatch),
-            global_group,
-            has_rank,
-            small_ag,
-            has_lane,
-        ),
-        _build_idx_op,
+    op_key = (
+        id(mesh),
+        layout,
+        bool(q_own_rows),
+        int(topk),
+        chunk_tokens,
+        bool(hist_merge),
+        bool(a2a_merge),
+        int(a2a_min_tokens),
+        small_bucket,
+        kv_cache_mode,
+        bool(skip_empty_decode),
+        bool(skip_empty_decode_chunked),
+        mixed_bkvp,
+        bool(decode_pack),
+        shared_meta,
+        bool(k_write_compact),
+        bool(fused_subbatch),
+        global_group,
+        has_rank,
+        small_ag,
+        has_lane,
     )
+    op = get_shared_jax_op("streamidx_topk_tp", op_key, _build_idx_op)
 
-    def run(*args: torch.Tensor) -> torch.Tensor:
+    sharded_k_op = None
+    if q_own_rows and fused_subbatch and has_rank:
+        sharded_k_in_specs = in_specs[:3] + (sharded,) + in_specs[4:]
+
+        def _build_sharded_k_op(op_name: str):
+            built = pcp_streaming_jax_op(
+                op_name,
+                _build_idx_wrapper(k_sharded=True),
+                donate_argnums=(2,),
+                mesh=mesh,
+                input_partition_specs=sharded_k_in_specs,
+                output_partition_specs=(sharded, sharded),
+            )
+            built.register_fake(_fake)
+            return built
+
+        sharded_k_op = get_shared_jax_op(
+            "streamidx_topk_tp_sharded_k", op_key, _build_sharded_k_op
+        )
+
+    def run(*args: torch.Tensor, k_sharded: bool = False) -> torch.Tensor:
         extra = ()
         if rank_tensor is not None:
             extra = (*extra, rank_tensor)
         if lane_tensor is not None:
             extra = (*extra, lane_tensor)
-        new_cache, flat = op(*args, *extra)
+        selected_op = sharded_k_op if k_sharded else op
+        if selected_op is None:
+            raise ValueError(
+                "k_sharded requires q_own_rows, fused_subbatch, and rank_ids"
+            )
+        new_cache, flat = selected_op(*args, *extra)
         args[2].copy_(new_cache)
         return flat
 
     run.layout = layout  # type: ignore[attr-defined]
     run.q_own_rows = q_own_rows  # type: ignore[attr-defined]
     run.fused_subbatch = fused_subbatch  # type: ignore[attr-defined]
+    run.serves_sharded_k = sharded_k_op is not None  # type: ignore[attr-defined]
     return run
 
 
@@ -1509,10 +2446,13 @@ def indexer_rows(
     page_indices: torch.Tensor,
     cu_q_lens: torch.Tensor,
     distribution: torch.Tensor,
+    *,
+    k_sharded: bool = False,
 ) -> torch.Tensor:
     """`[split_rows + T / dcp, topk]`: the DCP sub-batch's rank-local top-k,
     then this rank's token-parallel rows (see the module docstring)."""
     if getattr(indexer.topk_op_tp, "fused_subbatch", False):
+        extra = {"k_sharded": True} if k_sharded else {}
         return indexer.topk_op_tp(
             q_bytes,
             weights,
@@ -1522,7 +2462,10 @@ def indexer_rows(
             page_indices,
             cu_q_lens,
             distribution,
+            **extra,
         )
+    if k_sharded:
+        raise ValueError("k_sharded requires fused_subbatch")
     s = indexer.topk_op_tp.layout.split_rows
     q_own = getattr(indexer.topk_op_tp, "q_own_rows", False)
     seq_s, qsl_s, dist_s = dcp_rows_metadata(seq_lens, cu_q_lens, distribution, s)
