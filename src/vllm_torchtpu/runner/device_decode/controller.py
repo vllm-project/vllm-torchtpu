@@ -88,6 +88,9 @@ PROMPT_LOGPROBS = "prompt_logprobs"
 UNSUPPORTED_SAMPLING = "unsupported_sampling"
 ENCODER_OR_KV = "encoder_or_kv"
 UNREGISTERED_SHAPE = "unregistered_shape"
+# Last, on a verified step: its inputs built on the device disagree with the
+# stock ones, so it runs on the stock path and device steps turn off.
+VERIFY_INPUT_MISMATCH = "verify_input_mismatch"
 # The other counters.
 DEVICE_STEPS = "device_steps"
 VERIFY_STEPS = "verify_steps"
@@ -339,6 +342,7 @@ class DeviceDecodeController:
             mismatch = self._input_mismatch(inputs, shape)
             if mismatch is not None:
                 self._counters[VERIFY_MISMATCHES] += 1
+                self._count_stock_step(VERIFY_INPUT_MISMATCH)
                 self._disable(f"verified inputs: {mismatch}")
                 return False
         attn_metadata = build_decode_attention_metadata(r, inputs, shape, offsets)
@@ -433,7 +437,8 @@ class DeviceDecodeController:
 
     def counters(self) -> dict[str, int]:
         """Device steps, stock steps by reason, verified steps and verify
-        mismatches."""
+        mismatches. Only steps planned while device steps are on count: once
+        a check turns them off, later steps are not counted."""
         return dict(self._counters)
 
     def _plan_step(

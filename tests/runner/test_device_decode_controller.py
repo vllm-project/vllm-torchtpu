@@ -606,7 +606,8 @@ def test_verify_mode_catches_a_corrupt_slot_before_the_forward(monkeypatch):
     assert engine.logprobs == reference.logprobs
     assert not engine.controller.enabled
     assert "input token" in engine.controller.disabled_reason
-    assert engine.controller.counters()["verify_mismatches"] == 1
+    counters = engine.controller.counters()
+    assert counters["verify_mismatches"] == counters["verify_input_mismatch"] == 1
 
 
 def test_verify_mode_returns_the_stock_tokens_after_a_wrong_sample(monkeypatch):
