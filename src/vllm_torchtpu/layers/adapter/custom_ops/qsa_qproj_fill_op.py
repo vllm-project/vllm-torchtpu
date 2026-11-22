@@ -16,6 +16,17 @@ to in torch_tpu (stablehlo.dot_general, contracting the last dims of input and
 weight, the global float32 matmul precision; csrc/ops/linear/
 linear_aten_kernels.cc BuildLinearShlo), so every output row is the same dot.
 
+Every decision on the step's token count is made inside the JAX op, from the
+row count JAX traces it at, never in the torch forward: a Python decision on
+the token count there leaves Dynamo guards that split the backbone into several
+traces, and the trace that takes the fill first touches the token-count SymInt
+ahead of the layer's weights, so a bucket cannot be handed between the traces
+(compilation/shape_variants.py; T62v j-d94605d9, Worker_PP7). The torch graph
+therefore holds one fill op per layer at every bucket, with the same inputs as
+the ``q_proj`` it replaces; a step below 3 indexer chunks gets the op's single
+plain dot. The slots (``context_lens``' static length) and ``max_query_len``
+are static per graph.
+
 It lives under layers/adapter/custom_ops so the compile-cache key hashes it.
 The op is built at import: Dynamo cannot trace its construction from inside a
 compiled forward.
@@ -103,26 +114,33 @@ def qproj_fill_jax(
     weight: jax.Array,
     *,
     group_base: int,
-    slices: int,
+    slots: int,
+    max_query_len: int,
+    chunk_override: int,
     precision: str,
 ) -> jax.Array:
-    """``hidden @ weight.T`` as ``slices`` row slices, slice g in scheduling
-    group ``group_base + g``; the slices are concatenated in row order.
+    """``hidden @ weight.T``, as row slices when the step takes the chunked
+    prefill indexer with at least 3 chunks.
 
-    Slice starts are rounded down to 16 rows (one bf16 (8, 128)(2, 1) tile of
-    the [rows, N] result), so XLA assembles the slices in place (each dot fused
-    with a dynamic-update-slice into the result) instead of a concatenate copy;
-    6,400 rows / 8 slices are 800-row slices either way."""
+    The slice count comes from the concrete row count this is traced at
+    (``hidden.shape[0]``). 0 slices: one plain dot, no group. Otherwise slice g
+    is in scheduling group ``group_base + g`` and the slices are concatenated
+    in row order. Slice starts are rounded down to 16 rows (one bf16
+    (8, 128)(2, 1) tile of the [rows, N] result), so XLA assembles the slices
+    in place (each dot fused with a dynamic-update-slice into the result)
+    instead of a concatenate copy; 6,400 rows / 8 slices are 800-row slices
+    either way."""
     rows = hidden.shape[0]
+    slices = fill_slices(rows, slots, max_query_len, chunk_override)
     prec = _PRECISION[precision]
+    dims = (((hidden.ndim - 1,), (weight.ndim - 1,)), ((), ()))
+    if slices < 1:
+        return jax.lax.dot_general(hidden, weight, dims, precision=(prec, prec))
     bounds = [(rows * g // slices) // _ALIGN * _ALIGN for g in range(slices)] + [rows]
     parts = []
     for g in range(slices):
         part = jax.lax.dot_general(
-            hidden[bounds[g] : bounds[g + 1]],
-            weight,
-            (((hidden.ndim - 1,), (weight.ndim - 1,)), ((), ())),
-            precision=(prec, prec),
+            hidden[bounds[g] : bounds[g + 1]], weight, dims, precision=(prec, prec)
         )
         parts.append(
             xla_metadata.set_xla_metadata(part, _scheduling_group_id=group_base + g)
@@ -135,8 +153,10 @@ QPROJ_FILL_OP = pallas.jax_op("qwen4_exp::qsa_qproj_fill", qproj_fill_jax)
 
 
 @QPROJ_FILL_OP.register_fake
-def _fake_qproj_fill(hidden, weight, *, group_base, slices, precision):
-    del group_base, slices, precision
+def _fake_qproj_fill(
+    hidden, weight, *, group_base, slots, max_query_len, chunk_override, precision
+):
+    del group_base, slots, max_query_len, chunk_override, precision
     return hidden.new_empty((hidden.shape[0], weight.shape[0]))
 
 
@@ -149,14 +169,17 @@ def qproj_fill(
     group_base: int,
     chunk_override: int,
     precision: str,
-) -> torch.Tensor | None:
-    """The filled ``q_proj`` of a step, or None when the step does not take the
-    chunked prefill indexer with at least 3 chunks (the caller keeps
-    ``q_proj``). Static per graph: the row count, slots and the layer's base.
-    No imports, env reads or logging here (inside the Dynamo capture)."""
-    slices = fill_slices(int(hidden.shape[0]), slots, max_query_len, chunk_override)
-    if slices < 1:
-        return None
+) -> torch.Tensor:
+    """The layer's ``q_proj`` through the fill op. Only static arguments here
+    (the slots are ``context_lens``' static length): no access to the token
+    count (the op decides the slices from its concrete row count), no imports,
+    env reads or logging (inside the Dynamo capture)."""
     return QPROJ_FILL_OP(
-        hidden, weight, group_base=group_base, slices=slices, precision=precision
+        hidden,
+        weight,
+        group_base=group_base,
+        slots=slots,
+        max_query_len=max_query_len,
+        chunk_override=chunk_override,
+        precision=precision,
     )
