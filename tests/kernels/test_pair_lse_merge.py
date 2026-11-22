@@ -30,6 +30,17 @@ CASES = ((8, 16), (24, 16), (7, 16))
 # exchange_block (rows, 2 * heads): the c4 b1 and b4 draft blocks (8 and 32
 # rows, 1 and 4 requests of 7 rows plus padding).
 BLOCK_CASES = ((8, 16), (32, 16))
+KV_SCALE = 0.5  # the draft fp8 cache's K/V scale in exchange_block's test
+
+
+def _stored(x):
+    """x as the fp8 draft cache holds it, back in bf16."""
+    import jax.numpy as jnp
+
+    x = (x.astype(jnp.float32) / KV_SCALE).astype(jnp.float8_e4m3fn)
+    return (x.astype(jnp.float32) * KV_SCALE).astype(jnp.bfloat16)
+
+
 D = 128
 
 
@@ -106,31 +117,34 @@ def _worker():
                 races=bool(getattr(interpret_pallas_call.races, "races_found", False)),
             )
     # The block's own attention and the final merge folded in
-    # (`exchange_block`) vs the pair merge, cp_draft_attention.attend_block
-    # (uniform blocks of 7) and merge; one request short of the rows.
+    # (`exchange_block`, on the attention kernel's own LSE layout and the
+    # block's K/V before the fp8 cache round trip) vs the unfused path:
+    # token-order LSEs, the pair merge, the round trip,
+    # cp_draft_attention.attend_block (uniform blocks of 7) and merge.
     from vllm_torchtpu.layers.adapter.cp_draft_attention import attend_block, merge
 
     for t, two_h in BLOCK_CASES:
         heads, q_block = two_h // 2, 7
         reqs = t // q_block
+        valid = reqs * q_block
         rng = np.random.default_rng(100 + t)
-        out, lse = _inputs(t, two_h, t)
+        out, _ = _inputs(t, two_h, t)
+        out[:, valid:] = np.nan  # rows no request owns: undefined
         out_b = jnp.asarray(out, jnp.bfloat16)
+        lse_native = (
+            rng.standard_normal((N_RANKS, reqs, 1, q_block * two_h)) * 3
+        ).astype(np.float32)
+        lse_native[0, 0, 0, :two_h] = -np.inf  # a token with no context
+        lse_t = np.full((N_RANKS, t, two_h), -np.inf, np.float32)
+        lse_t[:, :valid] = lse_native.reshape(N_RANKS, valid, two_h)
+        out_t = jnp.where(jnp.arange(t)[None, :, None, None] < valid, out_b, 0)
         q = jnp.asarray(rng.standard_normal((N_RANKS, t, heads, D)), jnp.bfloat16)
         kv = jnp.asarray(rng.standard_normal((2, N_RANKS, t, 1, D)), jnp.bfloat16)
-        seq_lens = jnp.zeros((N_RANKS, reqs), jnp.int32)
+
         for causal in (True, False):
             block = jax.jit(
                 jax.shard_map(
-                    lambda o,
-                    s,
-                    m,
-                    q_,
-                    kk,
-                    vv,
-                    sl,
-                    c=causal,
-                    qb=q_block: k.exchange_block(
+                    lambda o, s, m, q_, kk, vv, c=causal, qb=q_block: k.exchange_block(
                         o[0],
                         s[0],
                         m[0],
@@ -138,29 +152,33 @@ def _worker():
                         kk[0],
                         vv[0],
                         q_block=qb,
-                        valid_rows=sl.shape[1] * qb,
                         sm_scale=0.125,
                         causal=c,
+                        k_scale=KV_SCALE,
+                        v_scale=KV_SCALE,
+                        cache_dtype=jnp.float8_e4m3fn,
                     )[None],
                     mesh=mesh,
-                    in_specs=(spec,) * 7,
+                    in_specs=(spec,) * 6,
                     out_specs=spec,
                     check_vma=False,
                 )
             )
             pltpu.reset_tpu_interpret_mode_state()
-            got = block(out_b, jnp.asarray(lse), meta, q, kv[0], kv[1], seq_lens)
+            got = block(out_b, jnp.asarray(lse_native), meta, q, kv[0], kv[1])
             got = np.asarray(got, np.float32).reshape(N_RANKS, t, heads, D)
             rel = 0.0
+            seq_lens = jnp.zeros((reqs,), jnp.int32)
             for r in range(N_RANKS):
+                lo, hi = r & ~1, r | 1
                 ctx, ctx_lse = k.reference(
-                    [out_b[r & ~1], out_b[r | 1]], [lse[r & ~1], lse[r | 1]], r % 2
+                    [out_t[lo], out_t[hi]], [lse_t[lo], lse_t[hi]], r % 2
                 )
                 ob, lb = attend_block(
                     q[r],
-                    kv[0, r],
-                    kv[1, r],
-                    seq_lens[r],
+                    _stored(kv[0, r]),
+                    _stored(kv[1, r]),
+                    seq_lens,
                     None,
                     max_query_len=q_block,
                     sm_scale=0.125,
