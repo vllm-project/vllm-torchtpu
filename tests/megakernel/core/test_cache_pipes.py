@@ -278,18 +278,68 @@ def _recording_backend(spec: Any, seen: list[Any]) -> Any:
 
 
 @pytest.mark.parametrize(("T", "gpr"), [(1, False), (4, "eligible")])
-def test_flat_pooled_step_uses_cache_exec_act_mode(T: int, gpr: Any):
-    """`CacheExec.act_mode` reaches the pool kernels; `"ref"` fails closed."""
+def test_pooled_steps_use_cache_exec_act_mode(T: int, gpr: Any):
+    """`CacheExec.act_mode` reaches the pool kernels of the flat step and of a
+    pooled step called without `active_seqs`; `"ref"` without a mask fails
+    closed."""
     seen: list[Any] = []
     spec = _recording_backend(synth_hybrid_spec(L=2, att_every=2, R=R), seen)
     ex = _make_paged_ex(B=4, T=T, gpr=gpr, act_mode="all")
     c = _Case(spec, ex, seed=5)
     flat_fn, *_ = cache.make_flat_pooled_step(c.mesh, spec, ex, donate_pools=False)
     flat_fn.lower(*c.flat_args(c.pools(), *c.meta()))
-    assert seen == ["all"]
+    step = cache.make_pooled_step(c.mesh, spec, ex)
+    step.lower(c.pos_mk, c.hid_mk, c.w_mk, c.pools(), *c.meta())
+    assert seen == ["all", "all"]
     ex_ref = _make_paged_ex(B=4, T=T, gpr=gpr, act_mode="ref")
     with pytest.raises(MegakernelConfigError, match="act_mode='ref'"):
         cache.make_flat_pooled_step(c.mesh, spec, ex_ref)
+    step_ref = cache.make_pooled_step(c.mesh, spec, ex_ref)
+    with pytest.raises(MegakernelConfigError, match="act_mode='ref'"):
+        step_ref.lower(c.pos_mk, c.hid_mk, c.w_mk, c.pools(), *c.meta())
+
+
+def test_pooled_step_states_dict_and_mode_strings():
+    """The `states`-dict form and string `active_seqs` (`ModeTag` through
+    `jax.jit` + `shard_map`) run the requested mode; other strings raise."""
+    seen: list[Any] = []
+    spec = _recording_backend(synth_hybrid_spec(L=2, att_every=2, R=R), seen)
+    c = _Case(spec, _make_paged_ex(B=4, T=1), seed=8)
+    step = cache.make_pooled_step(c.mesh, spec, c.ex)
+    args = (c.pos_mk, c.hid_mk, c.w_mk)
+    hid_ref, raw_ref = step(*args, c.pools(), *c.meta())  # default "from_ckpt"
+    pt, ckpt, roff = c.meta()
+    pb = spec.cache_backend
+    for mode in ("from_ckpt", "all"):  # every sequence is active: same outputs
+        states = {
+            pool.POOL_STATE_NAME: c.pools(),
+            pb.page_table_state_name: pt,
+            "ckpt_indices": ckpt,
+            "read_offsets": roff,
+            "active_seqs": mode,
+            "untouched": "kept",
+        }
+        hid, new_states = step(*args, states)
+        assert new_states.keys() == states.keys()
+        assert new_states["untouched"] == "kept"
+        hid_p, raw_p = step(*args, c.pools(), pt, ckpt, roff, mode)
+        for got_hid, got_raw in (
+            (hid, new_states[pool.POOL_STATE_NAME]),
+            (hid_p, raw_p),
+        ):
+            np.testing.assert_array_equal(got_hid, hid_ref)
+            for got, want in zip(got_raw, raw_ref, strict=True):
+                np.testing.assert_array_equal(
+                    np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8)
+                )
+    # One trace per mode (the dict and positional forms share it).
+    assert seen == ["from_ckpt", "all"]
+    for states_form in (False, True):
+        with pytest.raises(ValueError, match="Unsupported active_seqs mode"):
+            if states_form:
+                step(*args, {**states, "active_seqs": "ref"})
+            else:
+                step(*args, c.pools(), pt, ckpt, roff, "ref")
 
 
 def test_flat_pooled_step_rejects_ref_before_building(monkeypatch):
@@ -400,6 +450,17 @@ def test_pooled_step_checks_rank_folded_metadata_per_rank():
         step(c.pos_mk, c.hid_mk, c.w_mk, c.pools(), c.pt, bad, roff_1d)
 
 
+@pytest.fixture
+def fused_io_registered(monkeypatch):
+    """Mark a fused pool I/O implementation as registered, without loading one.
+
+    For tests that only resolve the pool I/O mode and never run a fused kernel.
+    """
+    monkeypatch.setattr(_builtins, "_LOADED", set(_builtins.BUILTINS))
+    monkeypatch.setattr(fused_io_hook, "_IMPL", object())
+
+
+@pytest.mark.usefixtures("fused_io_registered")
 def test_pooled_steps_validate_only_the_resolved_exec_spec(monkeypatch):
     """A valid `fused_pool_io=False` override is not rejected for the fused mode."""
     # f32 conv, 2048 conv channels per rank: the T=6 fused conv window (256 rows)
@@ -431,6 +492,7 @@ def test_pooled_steps_validate_only_the_resolved_exec_spec(monkeypatch):
     assert [cache_exec(e).fused_pool_io for e in built] == [False, False]
 
 
+@pytest.mark.usefixtures("fused_io_registered")
 def test_should_fuse_pool_io_requires_the_fused_conv_window_to_fit():
     """`"auto"` falls back to split when the fused conv window misses one page."""
     spec = _f32_conv(synth_hybrid_spec(L=2, att_every=2, R=R, KH=8, VH=16))

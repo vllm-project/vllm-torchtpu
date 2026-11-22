@@ -23,7 +23,7 @@ from typing import Any
 import jax
 from jax.sharding import PartitionSpec as P
 
-from .cache_common import PooledBuild, validate_page_table_shape
+from .cache_common import PooledBuild, default_act_mode, validate_page_table_shape
 from .cache_flat import local_meta, run_local
 from .pool import check_ckpt_bounds
 from .pool.backend import resolve_active_seqs
@@ -124,7 +124,7 @@ def check_ckpt_bounds_per_rank(
             _rank("active_seqs", r),
         )
         act_mode, mask = resolve_active_seqs(
-            act_r, default_mode="from_ckpt", ns=ex.NS, has_recurrent=b.has_rec
+            act_r, default_mode=default_act_mode(b), ns=ex.NS, has_recurrent=b.has_rec
         )
         check_ckpt_bounds(
             ckpt_r,

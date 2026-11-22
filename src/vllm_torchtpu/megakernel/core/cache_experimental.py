@@ -34,12 +34,10 @@ HBM copy before the kernel. To avoid that 2.30 GiB/pool copy in 1-launch mode
    - **Important**: Because `pallas_call` does not declare a write or alias on
      `ST[POOL_STATE_NAME]` on TPU, correctness relies entirely on outer buffer
      donation being honored with zero intermediate full-pool copies. Keep this
-     path **opt-in** (`fused_pool_io=False` by default everywhere) and verify
-     both `check_fused_pooled_step_hlo` and outer `torch_tpu` donation IR on
-     every compiled bucket when enabled. `make_pooled_step` /
-     `make_flat_pooled_step` raise `MegakernelConfigError` (a `RuntimeError`)
-     for a fused build with `donate_pools=False`, and the vLLM driver IR-checks
-     every fused bucket during warmup (eager mode included).
+     path **opt-in** (`fused_pool_io=False` by default everywhere) and check
+     each compiled fused step with `check_fused_pooled_step_hlo`.
+     `make_pooled_step` / `make_flat_pooled_step` raise `MegakernelConfigError`
+     (a `RuntimeError`) for a fused build with `donate_pools=False`.
 
 2. **On CPU (`ex.interpret != False`)**:
    - `GQAModule.outputs` declares `O[POOL_STATE_NAME]` (`access="w"`), and

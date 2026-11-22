@@ -19,8 +19,14 @@ from typing import Any
 
 import jax
 
-from .cache_common import PooledBuild, build_pooled
-from .cache_pooled_local import check_ckpt_bounds_per_rank, raw_step, wrap_active_seqs
+from .cache_common import PooledBuild, build_pooled, default_act_mode
+from .cache_pooled_local import (
+    ModeTag,
+    check_ckpt_bounds_per_rank,
+    raw_step,
+    wrap_active_seqs,
+)
+from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .pool.config import FUSED_POOL_IO_MAX_B, FUSED_POOL_IO_MIN_B_HI, cache_exec
 
@@ -68,8 +74,10 @@ def make_pooled_step(
       3. Attention-only (`not cache_backend.has_recurrent_pool`) positional:
          `hid, raw_pools = step(pos, hidden, weights, raw_pools, page_table,
                                 [*extra_inputs], [active_seqs])`
-    The per-rank body is `cache_flat.run_local`, shared with
-    `make_flat_pooled_step`.
+    `active_seqs` is a mask array or a mode (`"from_ckpt"` / `"all"`); without
+    one the step runs `CacheExec.act_mode`, and `"ref"` raises
+    `MegakernelConfigError`. The per-rank body is `cache_flat.run_local`,
+    shared with `make_flat_pooled_step`.
     """
     b = build_pooled(
         mesh,
@@ -147,6 +155,17 @@ def make_pooled_step(
     return PooledStepFn(_call, _lower, b.info)
 
 
+def _default_active_seqs(b: PooledBuild) -> ModeTag:
+    """`active_seqs` of a call that passes none: `CacheExec.act_mode`."""
+    mode = default_act_mode(b)
+    if mode == "ref":
+        raise MegakernelConfigError(
+            "pooled step: CacheExec.act_mode='ref' needs an active_seqs mask; "
+            "pass one, or build with act_mode 'from_ckpt' or 'all'"
+        )
+    return ModeTag(mode)
+
+
 def parse_call_args(
     b: PooledBuild, states_or_raw: Any, rest: tuple[Any, ...]
 ) -> tuple[
@@ -159,7 +178,11 @@ def parse_call_args(
     Any,
     tuple[Any, ...],
 ]:
-    """Split the `states`-dict or positional call forms into step arguments."""
+    """Split the `states`-dict or positional call forms into step arguments.
+
+    Without `active_seqs`, the step runs `CacheExec.act_mode` (see
+    `default_act_mode`); `"ref"` then raises `MegakernelConfigError`.
+    """
     n_extra, has_rec, pool_key, pt_key = b.n_extra, b.has_rec, b.pool_key, b.pt_key
     if isinstance(states_or_raw, dict):
         states = states_or_raw
@@ -167,7 +190,7 @@ def parse_call_args(
         page_table = states[pt_key]
         ckpt_indices = states.get("ckpt_indices")
         read_offsets = states.get("read_offsets")
-        active_seqs = wrap_active_seqs(states.get("active_seqs"))
+        active_seqs = states.get("active_seqs")
         if len(rest) > n_extra:
             raise TypeError(
                 f"pooled step (states dict form) takes {n_extra} extra inputs "
@@ -181,7 +204,9 @@ def parse_call_args(
             page_table,
             ckpt_indices,
             read_offsets,
-            active_seqs,
+            _default_active_seqs(b)
+            if active_seqs is None
+            else wrap_active_seqs(active_seqs),
             extra_tuple,
         )
 
@@ -202,7 +227,11 @@ def parse_call_args(
             f"active_seqs after the pool metadata, got {len(tail)} arguments"
         )
     extra_tuple = tuple(tail[:n_extra])
-    active_seqs = wrap_active_seqs(tail[n_extra] if len(tail) > n_extra else None)
+    active_seqs = (
+        wrap_active_seqs(tail[n_extra])
+        if len(tail) > n_extra and tail[n_extra] is not None
+        else _default_active_seqs(b)
+    )
 
     return (
         False,
