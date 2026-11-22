@@ -196,6 +196,8 @@ def test_dedup_vec_env_flag(monkeypatch):
     monkeypatch.setenv("VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC", "1")
     assert envs.VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC is True
     assert wsc.wholestep_tiles(16).block("moe").dedup_vec is True
+    assert wsc.wholestep_tiles(8).block("moe").dedup_vec is True
+    assert wsc.wholestep_tiles(4).block("moe").dedup_vec is False  # b4: scalar is cheaper
 
 
 def _compare(B: int, hot: bool) -> None:
