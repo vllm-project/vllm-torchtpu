@@ -448,6 +448,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MTP_DRAFT_PADDING_MASK: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     VLLM_TPU_SAMPLER_CANDIDATES_ONLY: bool = False
+    VLLM_TPU_SAMPLER_LOGITS_BLOCKS: int = 0
     VLLM_TPU_GDN_MIXED_TILE_POW2: bool = False
     VLLM_TPU_SPEC_BOUNDARY_STATE_COPY: bool = False
     VLLM_TPU_GDN_V3_WINDOW_VERIFY: bool = False
@@ -2828,6 +2829,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and arg-maxing full-vocab rows. Same uniforms; probabilities can differ
     # in the last bit (softmax normalizer summed in another order).
     "VLLM_TPU_SAMPLER_CANDIDATES_ONLY": env_bool("VLLM_TPU_SAMPLER_CANDIDATES_ONLY"),
+    # With VLLM_TPU_SAMPLER_CANDIDATES_ONLY in the fused verify: 1 = take the
+    # 128-logit block maxima once from the shared logits rows (no full-row
+    # copy of the target rows), gather candidate blocks as whole rows, and read
+    # the recovery uniforms straight from the flat draw; 2 = also find the
+    # top-k cutoff with one torch.topk instead of a 32-step bisection. Same
+    # values, same tokens; 0 = off.
+    "VLLM_TPU_SAMPLER_LOGITS_BLOCKS": env_nonnegative_int(
+        "VLLM_TPU_SAMPLER_LOGITS_BLOCKS", 0
+    ),
     # GDN v3 static tiling: round the mixed tile down to a power of two so a
     # 24/40-row bucket stays divisible by the triangular solve's block, and
     # assert that divisibility (PR #2821 ece3d83b5). Dynamic tiling

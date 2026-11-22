@@ -21,8 +21,10 @@ from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     apply_top_k_top_p,
     blocked_argmax,
+    blocked_argmax_pre,
     first_argmax_ids,
     top_k_top_p_candidate_logits,
+    top_k_top_p_candidate_logits_pre,
 )
 
 if TYPE_CHECKING:
@@ -449,8 +451,13 @@ def _random_rejection_sample_impl(
     synthetic_mode: bool,
     topk_candidates: int = 0,
     candidates_only: bool = False,
+    target_dist_fn=None,
 ) -> torch.Tensor:
-    """Vectorized non-greedy speculative decoding validation in Torch."""
+    """Vectorized non-greedy speculative decoding validation in Torch.
+
+    target_dist_fn: optional (draft_token_ids, temperatures, top_k, top_p) ->
+    the four target-side quantities, replacing the target-logits path
+    (VLLM_TPU_SAMPLER_LOGITS_BLOCKS; `target_logits` is then unused)."""
     total_tokens = draft_token_ids.shape[0]
     batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device
@@ -462,20 +469,28 @@ def _random_rejection_sample_impl(
         target_dist = _candidate_target_dist
     else:
         target_dist = _full_vocab_target_dist
-    (
-        target_logits_argmax,
-        target_token_probs,
-        recovered_token_ids,
-        has_recovery_mass,
-    ) = target_dist(
-        draft_token_ids,
-        target_logits,
-        temperatures,
-        top_k,
-        top_p,
-        recover_u,
-        topk_candidates,
-    )
+    if target_dist_fn is not None:
+        (
+            target_logits_argmax,
+            target_token_probs,
+            recovered_token_ids,
+            has_recovery_mass,
+        ) = target_dist_fn(draft_token_ids, temperatures, top_k, top_p)
+    else:
+        (
+            target_logits_argmax,
+            target_token_probs,
+            recovered_token_ids,
+            has_recovery_mass,
+        ) = target_dist(
+            draft_token_ids,
+            target_logits,
+            temperatures,
+            top_k,
+            top_p,
+            recover_u,
+            topk_candidates,
+        )
     if synthetic_mode:
         assert synthetic_conditional_rates is not None
         conditional_rates = synthetic_conditional_rates[group_indices.to(torch.int64)]
@@ -701,6 +716,62 @@ def _candidate_target_dist(
     )
     recover_u = torch.clamp(
         torch.gather(recover_u, 1, ids),
+        min=torch.finfo(target_probs.dtype).tiny,
+        max=1.0 - torch.finfo(target_probs.dtype).eps,
+    )
+    exp_noise = -torch.log(recover_u)
+    recovered_token_ids = first_argmax_ids(
+        recovered_dist / (exp_noise + torch.finfo(target_probs.dtype).tiny), ids
+    ).to(torch.int32)
+    has_recovery_mass = torch.any(recovered_dist > 0, dim=-1)
+    return (
+        target_logits_argmax,
+        target_token_probs,
+        recovered_token_ids,
+        has_recovery_mass,
+    )
+
+
+def candidate_target_dist_pre(
+    draft_token_ids: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    raw_block_max: torch.Tensor,
+    raw_candidates_of,
+    raw_block_of,
+    recover_at,
+    topk_candidates: int,
+    kmax: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`_candidate_target_dist` (VLLM_TPU_SAMPLER_LOGITS_BLOCKS) from the
+    target rows' unscaled block maxima, `raw_candidates_of(block_ids)` /
+    `raw_block_of(block_id)` (their unscaled blocks) and `recover_at(ids)`
+    (the recovery uniforms at candidate ids): the same values and ops."""
+    valid_draft_token_ids = draft_token_ids >= 0
+    safe_draft_token_ids = draft_token_ids.clamp(min=0)
+    target_logits_argmax = blocked_argmax_pre(raw_block_max, raw_block_of).to(
+        torch.int32
+    )
+    denominators = temperatures.to(torch.float32) + TEMPERATURE_EPS
+    ids, masked_logits = top_k_top_p_candidate_logits_pre(
+        raw_block_max,
+        raw_candidates_of,
+        lambda x: x.to(torch.float32) / denominators,
+        top_k,
+        top_p,
+        topk_candidates,
+        kmax,
+    )
+    target_probs = torch.softmax(masked_logits, dim=-1)
+    zero = torch.zeros_like(target_probs)
+    is_draft = ids == safe_draft_token_ids.unsqueeze(-1)
+    target_token_probs = torch.where(is_draft, target_probs, zero).sum(dim=-1)
+    recovered_dist = torch.where(
+        is_draft & valid_draft_token_ids.unsqueeze(-1), zero, target_probs
+    )
+    recover_u = torch.clamp(
+        recover_at(ids),
         min=torch.finfo(target_probs.dtype).tiny,
         max=1.0 - torch.finfo(target_probs.dtype).eps,
     )

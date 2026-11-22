@@ -123,10 +123,13 @@ from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     RejectionSampler,
     _random_rejection_sample_impl,
     candidate_rejection_output,
+    candidate_target_dist_pre,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
     apply_top_k_top_p,
+    apply_top_k_top_p_candidates_pre,
+    row_block_gather,
 )
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
@@ -448,6 +451,115 @@ def _sample_from_logits_impl(
     return torch.argmax(final_logits, dim=-1, keepdim=True)
 
 
+def _sample_from_logits_pre(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    u: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    topk_candidates: int,
+    raw_block_max: torch.Tensor,
+    raw_candidates_of,
+    kmax: int = 0,
+) -> torch.Tensor:
+    """`_sample_from_logits_impl(..., topk_candidates)` given the unscaled
+    block maxima and blocks of `logits` (VLLM_TPU_SAMPLER_LOGITS_BLOCKS). The
+    temperature division is monotone non-decreasing, so the block maxima of
+    the scaled row are the scaled block maxima bit for bit."""
+    is_greedy = temperatures <= SAMPLING_EPS
+    scaled_logits = _apply_temperature_impl(logits, temperatures)
+    masked_logits = apply_top_k_top_p_candidates_pre(
+        scaled_logits,
+        top_k,
+        top_p,
+        topk_candidates,
+        _apply_temperature_impl(raw_block_max, temperatures),
+        lambda ids: _apply_temperature_impl(raw_candidates_of(ids), temperatures),
+        kmax,
+    )
+    u_clamped = torch.clamp(
+        u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
+    )
+    gumbel_noise = -torch.log(-torch.log(u_clamped))
+    noisy_logits = masked_logits + gumbel_noise
+    final_logits = torch.where(is_greedy, logits, noisy_logits)
+    return torch.argmax(final_logits, dim=-1, keepdim=True)
+
+
+def _verify_logits_blocks(
+    logits: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    bonus_u: torch.Tensor,
+    recover_u: torch.Tensor,
+    topk_candidates: int,
+    mode: int,
+    recover_flat_u: torch.Tensor | None,
+    recover_offset: int,
+):
+    """VLLM_TPU_SAMPLER_LOGITS_BLOCKS: the bonus token ids and the target
+    dist callable of `_verify_fused_impl`'s candidates-only path, with one
+    block-max reduction over the shared logits rows, row gathers of whole
+    candidate blocks, and (with the flat draw) the recovery uniforms read at
+    their flat offsets."""
+    num_rows, vocab = logits.shape
+    blocks_per_row = vocab // CANDIDATE_BLOCK
+    blocks_flat = logits.reshape(num_rows * blocks_per_row, CANDIDATE_BLOCK)
+    block_max = logits.reshape(num_rows, blocks_per_row, CANDIDATE_BLOCK).amax(dim=-1)
+    kmax = topk_candidates // 2 if mode >= 2 else 0
+
+    def blocks_of(rows):
+        return lambda ids: row_block_gather(blocks_flat, blocks_per_row, rows, ids)
+
+    bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+    bonus_token_ids = _sample_from_logits_pre(
+        bonus_logits,
+        temperatures,
+        bonus_u,
+        top_k,
+        top_p,
+        topk_candidates,
+        torch.index_select(block_max, 0, bonus_logits_indices),
+        blocks_of(bonus_logits_indices),
+        kmax,
+    ).view(-1)
+    target_rows = target_logits_indices
+    if recover_flat_u is not None:
+        row_base = (
+            torch.arange(target_rows.shape[0], device=logits.device, dtype=torch.int64)
+            * vocab
+            + recover_offset
+        ).unsqueeze(-1)
+
+        def recover_at(ids):
+            flat = (row_base + ids).reshape(-1)
+            return torch.index_select(recover_flat_u, 0, flat).reshape(ids.shape)
+
+    else:
+
+        def recover_at(ids):
+            return torch.gather(recover_u, 1, ids)
+
+    def target_dist_fn(draft_token_ids, temps, tk, tp):
+        return candidate_target_dist_pre(
+            draft_token_ids,
+            temps,
+            tk,
+            tp,
+            torch.index_select(block_max, 0, target_rows),
+            blocks_of(target_rows),
+            lambda b: blocks_of(target_rows)(b.unsqueeze(-1)),
+            recover_at,
+            topk_candidates,
+            kmax,
+        )
+
+    return bonus_token_ids, target_dist_fn
+
+
 def _verify_fused_impl(
     logits: torch.Tensor,
     bonus_logits_indices: torch.Tensor,
@@ -468,18 +580,43 @@ def _verify_fused_impl(
     topk_candidates: int,
     candidates_only: bool = False,
     num_reqs: torch.Tensor | None = None,
+    logits_blocks: int = 0,
+    recover_flat_u: torch.Tensor | None = None,
+    recover_offset: int = 0,
 ):
     """Non-greedy spec verify of one chunk as one program
     (VLLM_TPU_VERIFY_FUSED): the bonus/target logit gathers, the bonus-token
     sample, the per-position sampling-parameter gathers and the rejection
     sampler, op for op the same as `_sample_spec_verify_chunk`'s separate
     programs. The uniforms come from the caller's eager draws, in the same
-    order and shapes, so the random stream is unchanged."""
-    bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
-    target_logits = torch.index_select(logits, 0, target_logits_indices)
-    bonus_token_ids = _sample_from_logits_impl(
-        bonus_logits, temperatures, bonus_u, top_k, top_p, topk_candidates
-    ).view(-1)
+    order and shapes, so the random stream is unchanged.
+
+    logits_blocks > 0 (VLLM_TPU_SAMPLER_LOGITS_BLOCKS, candidates-only
+    chunks): `_verify_logits_blocks` computes the same values without the
+    full target-row copy."""
+    target_dist_fn = None
+    if logits_blocks and candidates_only and topk_candidates > 0:
+        target_logits = None
+        bonus_token_ids, target_dist_fn = _verify_logits_blocks(
+            logits,
+            bonus_logits_indices,
+            target_logits_indices,
+            temperatures,
+            top_k,
+            top_p,
+            bonus_u,
+            recover_u,
+            topk_candidates,
+            logits_blocks,
+            recover_flat_u,
+            recover_offset,
+        )
+    else:
+        bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+        target_logits = torch.index_select(logits, 0, target_logits_indices)
+        bonus_token_ids = _sample_from_logits_impl(
+            bonus_logits, temperatures, bonus_u, top_k, top_p, topk_candidates
+        ).view(-1)
     next_tokens = _random_rejection_sample_impl(
         draft_token_ids,
         target_logits,
@@ -497,6 +634,7 @@ def _verify_fused_impl(
         synthetic_mode,
         topk_candidates,
         candidates_only,
+        target_dist_fn,
     )
     if num_reqs is None:
         return next_tokens
@@ -553,6 +691,7 @@ def _verify_fused_one_draw_impl(
     topk_candidates: int,
     candidates_only: bool = False,
     num_reqs: torch.Tensor | None = None,
+    logits_blocks: int = 0,
 ):
     """`_verify_fused_impl` fed by one flat uniform draw
     (VLLM_TPU_VERIFY_ONE_DRAW), split inside the program: the step issues one
@@ -585,6 +724,10 @@ def _verify_fused_one_draw_impl(
         topk_candidates,
         candidates_only,
         num_reqs,
+        logits_blocks,
+        u if logits_blocks else None,
+        bonus_logits_indices.shape[0] * logits.shape[-1]
+        + math.prod(draft_token_ids.shape),
     )
 
 
@@ -6707,8 +6850,14 @@ class TPUModelRunner(GPUModelRunner):
         )
         if flat_u is not None:
             call_args = (*args[:6], flat_u, *args[9:])
+            logits_blocks = envs.VLLM_TPU_SAMPLER_LOGITS_BLOCKS
 
             def verify(*extra):
+                if logits_blocks:
+                    num_reqs_arg = extra[0] if extra else None
+                    return _verify_fused_one_draw_compiled(
+                        *call_args, num_reqs_arg, logits_blocks
+                    )
                 return _verify_fused_one_draw_compiled(*call_args, *extra)
 
         else:
