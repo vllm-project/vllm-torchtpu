@@ -770,7 +770,7 @@ class DFlashProposer:
         """The compiled input builder `name` on `args` (its `position_ids`
         third), recording the call while warming (see
         `_warm_input_builder_token_buckets`)."""
-        if self._warming_fused_kv_inputs:
+        if self._warming_fused_kv_inputs and envs.TPU_DFLASH_WARM_INPUT_BUCKETS:
             self._input_builder_warm_args.setdefault(
                 (name, program_key(args)), (name, args)
             )
@@ -783,7 +783,8 @@ class DFlashProposer:
         The builders are keyed on the step's token bucket through
         `position_ids`, but the warmup reaches the prefill buckets only with
         one request; a verify + prefill step, or several prompts, at a larger
-        bucket would otherwise compile one mid-serving."""
+        bucket would otherwise compile one mid-serving. Covers the warmup's
+        argument sets crossed with the buckets, not every request count."""
         seen = set(self._input_builder_warm_args)
         compiled = 0
         for name, args in list(self._input_builder_warm_args.values()):
@@ -802,6 +803,7 @@ class DFlashProposer:
             "Warmed the DFlash input builders at %d more token-bucket argument sets",
             compiled,
         )
+        self._input_builder_warm_args.clear()
 
     @contextlib.contextmanager
     def warming(self):
