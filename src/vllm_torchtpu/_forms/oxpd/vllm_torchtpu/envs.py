@@ -202,6 +202,12 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_MASK_VIEW: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_VGUARD_LEAN: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_ALIGN_GATHER: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE: int = 0
+    VLLM_TPU_QSA_PREFILL_UNION_DOT16: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_VGUARD_NONE: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_GATHERED: str = ""
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS: int = 4
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
@@ -1302,6 +1308,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GATHERED_LEAN (with IN_PLACE; ignored without it): the in-place gathered walk takes no union words and no page
     # rows, which it never reads (no per-chunk union-word slices / padding / staging, no per-word pool bases). Bitwise.
     "VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN"),
+    # q38 QA-1 (PREFILL-10 / QA1BUILD; all default off; bitwise on finite pools; gathered walk only):
+    # MASK_VIEW: the walk tile applies its [rows, keys] visibility on a [q heads per KV head, rows, keys] view of the
+    # scores instead of materializing the per-head broadcast (the same select, so the same scores).
+    "VLLM_TPU_QSA_PREFILL_UNION_MASK_VIEW": env_bool("VLLM_TPU_QSA_PREFILL_UNION_MASK_VIEW"),
+    # VGUARD_LEAN: the walk tile's value guard keeps only its `written` term (no isfinite test). Every row the
+    # gathered walk reads is a written pool row (union ranks, or the padding row = word 0 of the group's page
+    # row), so on a finite pool the isfinite term is always true and the select is the same.
+    "VLLM_TPU_QSA_PREFILL_UNION_VGUARD_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_UNION_VGUARD_LEAN"),
+    # ALIGN_GATHER (PA-0): union_walk_prefill builds its group-aligned row layout by an inverse row gather (each
+    # aligned slot computes its source row) instead of a fill + scatter. Pure data movement: bit-identical.
+    "VLLM_TPU_QSA_PREFILL_UNION_ALIGN_GATHER": env_bool("VLLM_TPU_QSA_PREFILL_UNION_ALIGN_GATHER"),
+    # q38 UNION-BUILD (default off; gathered walk only): WALK_PIPE: the gathered walk's tile loop software-pipelined (stage A
+    # = mask / decode / guard / masked QK of tile t + 1 beside stage B = softmax / PV / state of tile t, in one block, the
+    # staged scores and values in VMEM). The served per-tile ops on the same operands, the state in tile order: bitwise
+    # the served walk (a TPU measurement). 2 = the two stages interleaved per KV head in program order. Kernel name gains
+    # _pipe / _pipe2; one engagement line per trace. 0 / unset = off.
+    "VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE": env_int("VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE", 0),
+    # q38 UNION-BUILD (default off; gathered walk only): DOT16: both walk dots take BF16 operands (queries once per block, keys and
+    # values decoded to BF16, probabilities cast at the PV dot). Mosaic's f32 dot there is one BF16 pass with round-to-nearest
+    # operands (M, T83m precision probe), so the dots' results are the served ones; bitwise checked on TPU. Kernel name _d16.
+    "VLLM_TPU_QSA_PREFILL_UNION_DOT16": env_bool("VLLM_TPU_QSA_PREFILL_UNION_DOT16"),
+    # q38 UNION-BUILD (default off; gathered walk only): VGUARD_NONE: no value guard (QA-1's VGUARD_LEAN keeps `written`, which is
+    # true on every rank whose probability can be non-zero). Bitwise on finite read rows (QA-1's precondition). Kernel name _vn.
+    "VLLM_TPU_QSA_PREFILL_UNION_VGUARD_NONE": env_bool("VLLM_TPU_QSA_PREFILL_UNION_VGUARD_NONE"),
     # GATHERED ("", "reference", "sparsecore"; with LISTED): the walk-free kernel on chunked gathered tiles.
     "VLLM_TPU_QSA_PREFILL_UNION_GATHERED": env_str("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", ""),
     "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS": env_int("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", 4),
