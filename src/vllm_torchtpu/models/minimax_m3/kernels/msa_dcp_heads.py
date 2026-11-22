@@ -183,7 +183,7 @@ def _pair_first_merge(
 
 
 def _pair_first_merge_by_head(
-    attend, axis: str, rank: jax.Array, rs_out_precision: bool
+    attend, axis: str, rank: jax.Array, rs_out_precision: bool, interpret: bool = False
 ) -> jax.Array:
     """`_pair_first_merge` of a DCP group of 4 over 2 KV heads (KV head ``h``
     owns head blocks ``2h`` and ``2h + 1``; ranks ``r`` and ``r ^ 1`` one
@@ -194,7 +194,8 @@ def _pair_first_merge_by_head(
     the chips while this chip's own KV head is attended: the cross-chip
     permute (one link carries both cores' blocks) waited behind the whole
     attention (c64 decode twin j-6bf91132: ~18 us per layer at b47). Same
-    exchanges and bytes as `_pair_first_merge`."""
+    exchanges and bytes as `_pair_first_merge`. Returns this rank's heads
+    unrotated, token-major ``[T, Hl * D]``."""
     own, parity = rank // 2, rank % 2
     far = 1 - own
     far_call, own_call = attend(jnp.stack([far, own]))
@@ -225,8 +226,95 @@ def _pair_first_merge_by_head(
     cross = [(r, r ^ 2) for r in range(4)]
     other_o = jax.lax.ppermute(o_far, axis, cross)
     other_l = jax.lax.ppermute(l_far, axis, cross)
-    o_own, l_own = pair_combine(*own_call(after=(o_far, l_far)), own)
-    return _combine(o_own, l_own, other_o, other_l)[0][0]
+    out_own, lse_own = own_call(after=(o_far, l_far))
+    if out_own.dtype != jnp.bfloat16 or other_o.dtype != jnp.bfloat16:
+        o_own, l_own = pair_combine(out_own, lse_own, own)
+        merged = _combine(o_own, l_own, other_o, other_l)[0][0]
+        merged = msa_fp4.unrotate_output(merged.astype(out_own.dtype))
+        return merged.transpose(1, 0, 2).reshape(merged.shape[1], -1)
+    # This chip's head: the pair's combine, the cross-chip combine and the
+    # unrotation in one kernel (as XLA ops, the f32 combines of [Hl, T, D]
+    # and the unrotate cost more than the merge's collectives, twin
+    # j-8a3254c0). The weights are XLA's: [Hl, T] f32 ops.
+    lse = lse_own.astype(jnp.float32).reshape(4, -1, lse_own.shape[-1])
+    keep, send = 2 * own + parity, 2 * own + 1 - parity
+    blocks = out_own.reshape(4, -1, *out_own.shape[1:])
+    got_o, got_l = (jax.lax.ppermute(pick(x, send), axis, pair) for x in (blocks, lse))
+    return _merge_unrotate(
+        out_own,
+        keep,
+        got_o[0],
+        other_o[0],
+        pick(lse, keep)[0],
+        got_l[0],
+        other_l[0],
+        interpret=interpret,
+    )
+
+
+def _weights(l1, l2):
+    """`_combine`'s weights of two partials' LSEs: ``(w1, w2, total, lse)``."""
+    peak = jnp.maximum(l1, l2)
+    peak = jnp.where(jnp.isinf(peak), 0.0, peak)
+    w1, w2 = jnp.exp(l1 - peak), jnp.exp(l2 - peak)
+    total = w1 + w2
+    return w1, w2, total, peak + jnp.log(total)
+
+
+def _merge_unrotate(out, keep, o2, o3, l1, l2, l3, *, interpret=False):
+    """``_combine(_combine(out[keep block], l1, o2, l2), o3, l3)`` (bf16
+    partials ``[Hl, T, D]``, f32 LSEs ``[Hl, T]``), cast to bf16 and
+    unrotated (`msa_fp4.unrotate_output`), written token-major ``[T, Hl *
+    D]``: op for op the XLA merge, in one kernel that reads block `keep`
+    (traced) of the head-major ``out [4 Hl, T, D]`` in place."""
+    heads, num_tokens, head_dim = o2.shape
+    w1, w2, t1, l12 = _weights(l1, l2)
+    v1, v2, t2, _ = _weights(l12, l3)
+    weights = jnp.stack([w1, w2, t1, v1, v2, t2]).transpose(0, 2, 1)  # [6, T, Hl]
+
+    def kernel(keep_ref, o1_ref, o2_ref, o3_ref, w_ref, h_ref, out_ref):
+        del keep_ref
+        for h in range(heads):
+            w = [w_ref[k, :, h : h + 1] for k in range(6)]
+            o = jnp.where(w[0] > 0, o1_ref[h].astype(jnp.float32) * w[0], 0.0)
+            o = o + jnp.where(w[1] > 0, o2_ref[h].astype(jnp.float32) * w[1], 0.0)
+            o = jnp.where(w[2] > 0, o / w[2], 0.0)
+            o = jnp.where(w[3] > 0, o * w[3], 0.0)
+            o = o + jnp.where(w[4] > 0, o3_ref[h].astype(jnp.float32) * w[4], 0.0)
+            o = jnp.where(w[5] > 0, o / w[5], 0.0)
+            y = jnp.dot(
+                o.astype(jnp.bfloat16), h_ref[...], preferred_element_type=jnp.float32
+            )
+            out_ref[:, h * head_dim : (h + 1) * head_dim] = (
+                y * (1.0 / head_dim)
+            ).astype(out_ref.dtype)
+
+    full = lambda shape: pl.BlockSpec(shape, lambda i, k: (0,) * len(shape))  # noqa: E731
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1,),
+            in_specs=[
+                pl.BlockSpec((heads, num_tokens, head_dim), lambda i, k: (k[0], 0, 0)),
+                full(o2.shape),
+                full(o3.shape),
+                full(weights.shape),
+                full((head_dim, head_dim)),
+            ],
+            out_specs=full((num_tokens, heads * head_dim)),
+        ),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, heads * head_dim), jnp.bfloat16),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_merge_unrotate",
+    )(
+        jnp.reshape(keep, (1,)).astype(jnp.int32),
+        out,
+        o2,
+        o3,
+        weights,
+        jnp.asarray(msa_fp4.hadamard(head_dim).T, jnp.bfloat16),
+    )
 
 
 def merge_partials_all_to_all(
@@ -361,11 +449,14 @@ def _dcp_attend(
         and not all_to_all
         and q.shape[0] <= msa_dcp.DCP_SMALL_BATCH_TOKENS
     ):
-        merged = _pair_first_merge_by_head(
-            lambda order: attend(head_order=order), axis, rank, rs_out_precision
+        # [T, Hl * D], unrotated
+        return _pair_first_merge_by_head(
+            lambda order: attend(head_order=order),
+            axis,
+            rank,
+            rs_out_precision,
+            interpret,
         )
-        merged = msa_fp4.unrotate_output(merged.astype(q.dtype))
-        return merged.transpose(1, 0, 2)
     out, lse = attend()
     if all_to_all:
         return merge_partials_all_to_all(out, lse, axis, dcp=dcp, interpret=interpret)
