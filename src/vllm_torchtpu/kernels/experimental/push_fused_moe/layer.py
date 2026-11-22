@@ -55,6 +55,7 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
     build_combine_fs_kernel,
     build_push_moe_kernel,
     decode_combine_applies,
+    fs_combine_chunk,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
     build_exchange_rows_tables,
@@ -175,7 +176,9 @@ def _combine_arrivals_fs(
             out_dtype=out_dtype,
         )
         return combine(arrivals, arrival_scales, scl, topk_weights, rows)
-    if not combine_step_tokens(t_local):
+    # v2's step rule keeps its COMBINE_MIN_TOKENS floor; the fs kernel tiles
+    # by its own chunk.
+    if not (combine_step_tokens(t_local) and fs_combine_chunk(t_local, topk)):
         return _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
         )
