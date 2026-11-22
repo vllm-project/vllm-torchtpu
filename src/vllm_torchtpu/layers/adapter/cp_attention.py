@@ -100,6 +100,8 @@ def _pallas_rpa_kernel_dcp(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    tuned_tiles: bool = False,
+    skip_empty_mixed: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One DCP pass (CACHE_ONLY or NEW_TOKENS_ONLY). Returns (new_kv_cache,
     output, lse). decode_query_size widens the DECODE bucket so speculative
@@ -134,6 +136,8 @@ def _pallas_rpa_kernel_dcp(
         decode_query_size=decode_query_size,
         return_lse=True,
         kv_layout=kv_layout,
+        tuned_tiles=tuned_tiles,
+        skip_empty_mixed=skip_empty_mixed,
     )
     return new_kv_cache, output, lse
 
@@ -199,6 +203,8 @@ def build_dcp_kernels(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    tuned_tiles: bool = False,
+    skip_empty_mixed: bool = False,
 ) -> tuple:
     """Build and cache the CACHE_ONLY and NEW_TOKENS_ONLY jax_ops.
 
@@ -222,6 +228,8 @@ def build_dcp_kernels(
         cp_rank,
         kv_layout,
         decode_query_size,
+        tuned_tiles,
+        skip_empty_mixed,
     )
     cache_key = ("dcp_cache", *base_key)
     new_key = ("dcp_new", *base_key)
@@ -242,6 +250,8 @@ def build_dcp_kernels(
             attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
+            tuned_tiles=tuned_tiles,
+            skip_empty_mixed=skip_empty_mixed,
         )
         cached_cache = _DCP_KERNEL_REGISTRY[cache_key] = _build_dcp_kernel_op(
             f"pallas::rpa_dcp_cache_{_alloc_instance_id()}", fn
@@ -258,6 +268,8 @@ def build_dcp_kernels(
             attention_scope=_batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY,
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
+            tuned_tiles=tuned_tiles,
+            skip_empty_mixed=skip_empty_mixed,
         )
         cached_new = _DCP_KERNEL_REGISTRY[new_key] = _build_dcp_kernel_op(
             f"pallas::rpa_dcp_new_{_alloc_instance_id()}", fn
@@ -289,6 +301,8 @@ def forward_with_dcp(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    tuned_tiles: bool = False,
+    skip_empty_mixed: bool = False,
 ) -> torch.Tensor:
     """Two-pass DCP attention forward.
     1. CACHE_ONLY: query is all-gathered by heads to attend every rank's KV
@@ -297,6 +311,9 @@ def forward_with_dcp(
         full local K/V for this step), so this rank's own heads attend
             directly; no gather/combine needed.
 
+    `tuned_tiles` and `skip_empty_mixed` must be the layer's, as given to
+    `build_dcp_kernels` when its kernels were prebuilt: the lookup below then
+    finds those ops instead of building new ones while torch.compile traces.
     """
     dcp_group = get_dcp_group()
     if dcp_group is None:
@@ -317,6 +334,8 @@ def forward_with_dcp(
         cp_rank=dcp_rank,
         kv_layout=kv_layout,
         decode_query_size=decode_query_size,
+        tuned_tiles=tuned_tiles,
+        skip_empty_mixed=skip_empty_mixed,
     )
 
     query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)

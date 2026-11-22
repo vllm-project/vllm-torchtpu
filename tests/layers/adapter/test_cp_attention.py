@@ -20,6 +20,7 @@ the registry can be checked together, including reuse across layers/layouts.
 
 from types import SimpleNamespace
 
+import jax.experimental.pallas.tpu as pltpu
 import pytest
 import torch
 from vllm.config import (
@@ -62,6 +63,24 @@ def _impl(cls=attention.PallasBatchedRPAAttentionBackendImpl, head_size=256):
     )
 
 
+def _opted_in_impl(monkeypatch, tiles):
+    """A layer built the way a model that opts its layers in builds it: the
+    flags are set before __init__ looks up the decode lanes (TPU7x, a
+    262,144-token context), and stay on the layer."""
+    cls = attention.PallasBatchedRPAAttentionBackendImpl
+    serving = SimpleNamespace(
+        speculative_config=None, model_config=SimpleNamespace(max_model_len=262144)
+    )
+    with monkeypatch.context() as m:
+        m.setattr(cls, "tuned_tiles", tiles)
+        m.setattr(cls, "skip_empty_mixed", tiles)
+        m.setattr(attention, "get_chip_version", lambda: pltpu.ChipVersion.TPU_7X)
+        m.setattr(attention, "get_current_vllm_config_or_none", lambda: serving)
+        impl = _impl()
+    impl.tuned_tiles = impl.skip_empty_mixed = tiles
+    return impl
+
+
 def _config():
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -74,9 +93,17 @@ def _config():
 
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("tiles", [False, True])
 def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
-    monkeypatch, rank, compiled, cpu_vllm_config_context
+    monkeypatch, rank, compiled, tiles, cpu_vllm_config_context
 ):
+    """With `tiles`, the layers carry tuned_tiles and skip_empty_mixed, set as a
+    model opting its layers in sets them, so the forward must look the ops up
+    with those values too. Such a layer has 4 decode lanes, which the DCP
+    passes do not take: they keep the wrapper's 8."""
+    # Every case compiles the forward of three layers; start from a clean
+    # dynamo cache so the cases do not add up to its recompile limit.
+    torch._dynamo.reset()
     built, calls = [], []
 
     def build_op(_name, fn):
@@ -106,12 +133,18 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
     # The third layer must reuse NHD's ops after HND has populated the registry.
     for layout in ("LBNHC", "LBHNC", "LBNHC"):
         get_current_vllm_config().cache_config.kv_cache_layout = layout
-        impl = _impl()
+        impl = _opted_in_impl(monkeypatch, tiles)
+        assert impl.decode_lanes == (4 if tiles else None)
         with set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()):
             impl.initialize_kernel(layer)
         implementations.append(impl)
 
     assert len(built) == 4  # Two layouts, two scopes; shared by matching layers.
+    assert all(fn.keywords["tuned_tiles"] is tiles for fn in built)
+    assert all(fn.keywords["skip_empty_mixed"] is tiles for fn in built)
+    assert not any(
+        {"decode_lanes", "decode_batch_size"} & set(fn.keywords) for fn in built
+    )
     assert (
         implementations[0].rpa_dcp_cache_kernel
         is implementations[2].rpa_dcp_cache_kernel

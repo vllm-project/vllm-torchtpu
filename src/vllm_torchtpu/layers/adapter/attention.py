@@ -78,6 +78,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec,
 )
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
+from vllm_torchtpu.layers.adapter import batched_rpa_decode
 from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
 from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
@@ -555,10 +556,20 @@ def _pallas_rpa_kernel_batched(
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout,
     decode_query_size: int = 1,
+    decode_lanes: int | None = None,
+    tuned_tiles: bool = False,
+    skip_empty_mixed: bool = False,
     block_major: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
+    kernel_kwargs = batched_rpa_decode.kernel_kwargs(decode_lanes)
+    if decode_query_size > 1:
+        kernel_kwargs["decode_query_size"] = decode_query_size
+    if tuned_tiles:
+        kernel_kwargs["tuned_tiles"] = True
+    if skip_empty_mixed:
+        kernel_kwargs["skip_empty_mixed"] = True
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -576,10 +587,8 @@ def _pallas_rpa_kernel_batched(
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
         rpa_func=(
-            functools.partial(
-                ragged_paged_attention_batched, decode_query_size=decode_query_size
-            )
-            if decode_query_size > 1
+            functools.partial(ragged_paged_attention_batched, **kernel_kwargs)
+            if kernel_kwargs
             else ragged_paged_attention_batched
         ),
         sm_scale=sm_scale,
@@ -857,6 +866,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
     )
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
     decode_query_size: int = 1
+    # Decode lanes from the layer-shape table (batched_rpa_decode). They reach
+    # the batched kernel entry only; the DCP passes keep the wrapper's 8.
+    decode_lanes: int | None = None
+    # The tuned batched RPA tiles and decode lanes (wrapper.calculate_block_sizes,
+    # batched_rpa_decode); off by default, a model opts its layers in.
+    tuned_tiles: bool = False
+    # Skip an empty MIXED call (the batched RPA wrapper's skip_empty_mixed);
+    # off by default, a model opts its layers in.
+    skip_empty_mixed: bool = False
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -1001,6 +1019,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             max_model_len,
             pcp_kv_layout,
             self.decode_query_size,
+            self.decode_lanes,
+            self.tuned_tiles,
+            self.skip_empty_mixed,
             block_major,
         )
         existing = self._kernel_config_cache.get(config_key)
@@ -1043,6 +1064,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.use_causal_mask,
             pcp_kv_layout,
             self.decode_query_size,
+            self.decode_lanes,
+            self.tuned_tiles,
+            self.skip_empty_mixed,
             block_major,
         )
         existing = self._kernel_registry.get(registry_key)
@@ -1084,6 +1108,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 )
             if "decode_query_size" in entry_params:
                 entry_kwargs["decode_query_size"] = self.decode_query_size
+            if "decode_lanes" in entry_params:
+                entry_kwargs["decode_lanes"] = self.decode_lanes
+            if "tuned_tiles" in entry_params:
+                entry_kwargs["tuned_tiles"] = self.tuned_tiles
+            if "skip_empty_mixed" in entry_params:
+                entry_kwargs["skip_empty_mixed"] = self.skip_empty_mixed
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
@@ -1216,6 +1246,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             dcp_rank=self.dcp_rank,
             kv_layout=self.kv_layout,
             decode_query_size=self.decode_query_size,
+            tuned_tiles=self.tuned_tiles,
+            skip_empty_mixed=self.skip_empty_mixed,
         )
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
@@ -1438,6 +1470,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     cp_rank=self.dcp_rank,
                     kv_layout=self.kv_layout,
                     decode_query_size=self.decode_query_size,
+                    tuned_tiles=self.tuned_tiles,
+                    skip_empty_mixed=self.skip_empty_mixed,
                 )
             return
 
@@ -1712,6 +1746,15 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         # head_dim 64 is rerouted to the hd64 kernel.
         if spec is not None and self.head_size != 64:
             self.decode_query_size = spec.num_speculative_tokens + 1
+        model_config = vllm_config.model_config if vllm_config is not None else None
+        if self.tuned_tiles and model_config is not None and self.head_size != 64:
+            self.decode_lanes = batched_rpa_decode.decode_lanes(
+                chip_version=get_chip_version(),
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_size,
+                kv_cache_dtype=self.kv_cache_quantized_dtype,
+                max_model_len=model_config.max_model_len,
+            )
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
