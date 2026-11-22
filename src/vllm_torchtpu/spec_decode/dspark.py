@@ -145,6 +145,8 @@ class DSparkProposer(DFlashProposer):
                     f"DSpark draft model lacks {attr}(); expected a "
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
+        if envs.TPU_DSPARK_REPLICATED_EMBED:
+            self._replicate_draft_embed()
         # Opt-in interface for drafts whose LM head is vocab-parallel: the
         # draft's enable_vocab_parallel_markov_argmax() prepares its shard of
         # the Markov head and returns whether the shard path applies; then the
@@ -153,8 +155,6 @@ class DSparkProposer(DFlashProposer):
         # (max, id) pair per rank and row). Greedy ids are identical to the
         # argmax of the gathered logits. Drafts without the method keep the
         # gathered path.
-        if envs.TPU_DSPARK_REPLICATED_EMBED:
-            self._replicate_draft_embed()
         enable = getattr(self.draft_model, "enable_vocab_parallel_markov_argmax", None)
         self._vocab_parallel_markov = (
             callable(enable) and not self._draft_replicated and bool(enable())
@@ -172,10 +172,14 @@ class DSparkProposer(DFlashProposer):
         A target that shares the module keeps its own reference to it."""
         assert self.draft_model is not None
         embed = self.draft_model.model.embed_tokens
-        if not isinstance(embed, VocabParallelEmbedding) or embed.tp_size == 1:
+        if (
+            not isinstance(embed, VocabParallelEmbedding)
+            or embed.tp_size == 1
+            or hasattr(embed, "weight_scale")
+        ):
             logger.warning(
-                "TPU_DSPARK_REPLICATED_EMBED: the draft embedding is %s, not a "
-                "TP-sharded VocabParallelEmbedding; left as it is.",
+                "TPU_DSPARK_REPLICATED_EMBED: the draft embedding is %s, not an "
+                "unquantized TP-sharded VocabParallelEmbedding; left as it is.",
                 type(embed).__name__,
             )
             return
