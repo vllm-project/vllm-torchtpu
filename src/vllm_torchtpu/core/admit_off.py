@@ -39,7 +39,8 @@ changes.
 (0 = off): in-process A/B in wall-clock windows (on in even ``time_ns // P ms`` windows; in odd windows nothing is done
 in the wait). Both keys are host-only and excluded from the compile key. Engine-core process of a KV consumer only;
 the engine core logs one ``ADMIT_OFF engaged:`` line once its engine is built (or ``ADMIT_OFF not engaged:`` with the
-reason).
+reason), and the main thread logs ``ADMIT_AHEAD ahead=<n> ... admit_ms_mean=<ms>`` at its first admission done in the
+wait and every ``LOG_EVERY`` admissions after (the runtime line).
 """
 
 import ast
@@ -83,7 +84,7 @@ HELD = []
 _state = {"engine": None, "limit": 0, "seq": 0, "window_n": 0, "charge_due": 0, "stalled_seq": -1,
           "in_sched": False, "busy": False, "ab_window": None}
 stats = {"pulled": 0, "admitted": 0, "backout": 0, "ineligible": 0, "held": 0, "reissued": 0, "charged": 0,
-         "ab_off": 0}
+         "ab_off": 0, "admit_ns": 0}
 
 
 def enabled() -> bool:
@@ -303,17 +304,21 @@ def step_window() -> None:
             stats["ineligible"] += 1
             _state["stalled_seq"] = _state["seq"]
             return
+        t0 = time.perf_counter_ns()
         if not admit_one(sched, request):
             _state["stalled_seq"] = _state["seq"]
             return
+        stats["admit_ns"] += time.perf_counter_ns() - t0
         PENDING[request.request_id] = _state["seq"]
         _state["window_n"] += 1
         stats["admitted"] += 1
-        if stats["admitted"] % LOG_EVERY == 0:
+        if stats["admitted"] == 1 or stats["admitted"] % LOG_EVERY == 0:
+            # The runtime line (Car H's gating row): logged by the thread that admits, at the first admission done in the
+            # wait and every LOG_EVERY after.
             logger.info(
-                "ADMIT_OFF admitted=%d pulled=%d backout=%d ineligible=%d held=%d reissued=%d charged=%d",
+                "ADMIT_AHEAD ahead=%d pulled=%d backout=%d ineligible=%d held=%d reissued=%d charged=%d admit_ms_mean=%.3f",
                 stats["admitted"], stats["pulled"], stats["backout"], stats["ineligible"], stats["held"],
-                stats["reissued"], stats["charged"],
+                stats["reissued"], stats["charged"], stats["admit_ns"] / stats["admitted"] / 1e6,
             )
     finally:
         _state["busy"] = False

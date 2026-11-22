@@ -142,9 +142,8 @@ def _install(mp, limit=4, cap=0):
     ao.patch_admit_off()
 
 
-def _scheduler(mp, *, max_num_seqs=16, num_blocks=NUM_BLOCKS, cls=Scheduler, role="kv_consumer"):
-    mp.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
-    vllm_config = VllmConfig(
+def _vllm_config(max_num_seqs=16):
+    return VllmConfig(
         scheduler_config=SchedulerConfig(max_num_seqs=max_num_seqs, max_num_batched_tokens=2048, max_model_len=2048,
                                          enable_chunked_prefill=True, is_encoder_decoder=False),
         model_config=ModelConfig(model="facebook/opt-125m", dtype="float16", seed=42, max_model_len=2048),
@@ -153,6 +152,19 @@ def _scheduler(mp, *, max_num_seqs=16, num_blocks=NUM_BLOCKS, cls=Scheduler, rol
         parallel_config=ParallelConfig(),
         device_config=DeviceConfig(device="cpu"),
     )
+
+
+# Building a VllmConfig runs the TPU platform's check_and_update_config, which applies the platform_activation patches
+# (the same-step prefix-hit patch among them: it wraps Scheduler.schedule). Do it once at import, so every fixture's
+# snapshot of Scheduler.schedule already includes them; a fixture that restored the pre-activation attribute would
+# leave the same-step patch half installed (its BlockPool wrappers without the per-pass reset).
+os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+_vllm_config()
+
+
+def _scheduler(mp, *, max_num_seqs=16, num_blocks=NUM_BLOCKS, cls=Scheduler, role="kv_consumer"):
+    mp.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    vllm_config = _vllm_config(max_num_seqs)
     vllm_config.kv_transfer_config = KVTransferConfig(kv_connector="AdmitTestConnector",
                                                       kv_connector_module_path=__name__, kv_role=role)
     kv_cache_config = KVCacheConfig(num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=[
@@ -215,7 +227,9 @@ def _land(s, ids):
     s._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving=set(ids)))
 
 
-# Arrivals, landings and finishes between passes. The prompts of r09 / r10 repeat r01 / r02's (local prefix hits).
+# Arrivals, landings (of the requests still loading) and finishes between passes. The prompts of r09 / r10 repeat
+# r01 / r02's (local prefix hits on blocks hashed at least two passes before: an in-wait lookup treats the blocks the
+# immediately preceding pass hashed as unwritten, see test_in_wait_lookup_treats_blocks_hashed_in_the_previous_pass_...).
 SCRIPT = (
     ("arrive", (0, 1, 2)), ("pass",),
     ("arrive", (3,)), ("pass",),
@@ -223,6 +237,7 @@ SCRIPT = (
     ("arrive", (4, 5, 6, 7, 8)), ("pass",),
     ("pass",),
     ("land", (2, 3, 4)), ("finish", (0,)), ("pass",),
+    ("pass",),
     ("arrive", (9, 10, 11)), ("pass",),
     ("land", (5, 6, 7, 8, 9, 10, 11)), ("pass",),
     ("finish", (1, 2)), ("arrive", (12,)), ("pass",),
@@ -245,7 +260,8 @@ def _drive(mp, lever, cls, cap):
             if not lever:
                 _drain(e)
         elif op[0] == "land":
-            _land(s, ["r%02d" % i for i in op[1]])
+            ids = ["r%02d" % i for i in op[1]]
+            _land(s, [x for x in ids if x in s.requests and s.requests[x].status == RequestStatus.WAITING_FOR_REMOTE_KVS])
         elif op[0] == "finish":
             s.finish_requests(["r%02d" % i for i in op[1]], RequestStatus.FINISHED_STOPPED)
         else:
@@ -378,11 +394,37 @@ def test_backout_when_not_async_leaves_no_trace(fresh):
     e.input_queue.put_nowait((ADD, (r, 0)))
     _window()
     after = _snapshot(s)
-    assert ao.stats["backout"] == 1 and "r02" not in ao.PENDING
+    assert ao.stats["backout"] == 1 and "r02" not in ao.PENDING, (ao.stats, r.status, s.connector.log[log0:])
     assert after["waiting"] == ["r02"] and after["holding"] == before["holding"]
     assert after["free"] == before["free"] and after["cached"] == before["cached"]
     assert r.status == RequestStatus.WAITING and r.num_computed_tokens == 0 and r not in s._inflight_prefills
     assert not [x for x in s.connector.log[log0:] if x[0] == "alloc"]
+
+
+def test_in_wait_lookup_treats_blocks_hashed_in_the_previous_pass_as_unwritten(fresh):
+    """Documented schedule-only difference: the same-step patch resets its unwritten set at the start of each pass, so a
+    lookup in the wait right after a pass misses the blocks that pass hashed (the remote load covers them); one pass
+    later they hit, as they would in schedule()."""
+    from vllm.v1.core.block_pool import BlockPool
+
+    assert getattr(BlockPool.get_cached_block, "_tpu_same_step_prefix_hit_patch", False)
+    _install(fresh)
+    s = _scheduler(fresh)
+    e = _engine(s)
+    ao.attach(e)
+    e.input_queue.put_nowait((ADD, (_req(1), 0)))
+    _window()
+    s.schedule()
+    _land(s, ["r01"])
+    s.schedule()  # r01 lands and is scheduled: its prompt's full blocks are hashed in this pass
+    e.input_queue.put_nowait((ADD, (_req(2, prompt_of=1), 0)))
+    _window()
+    s.schedule()
+    e.input_queue.put_nowait((ADD, (_req(3, prompt_of=1), 0)))
+    _window()
+    allocs = {x[1]: x[2] for x in s.connector.log if x[0] == "alloc"}
+    assert allocs == {"r01": PROMPT_LEN, "r02": PROMPT_LEN, "r03": PROMPT_LEN - 2 * BLOCK_SIZE}, allocs
+    assert s.requests["r02"].status == s.requests["r03"].status == RequestStatus.WAITING_FOR_REMOTE_KVS
 
 
 def test_backout_when_blocks_do_not_fit_leaves_no_trace(fresh):
@@ -579,6 +621,30 @@ def test_engine_core_logs_the_engagement_line(fresh, monkeypatch):
     assert lines == ["ADMIT_OFF engaged: remote-KV admissions run in the engine core's token wait "
                      "(up to 4 between schedules, after 2.0 ms of a wait; KV load pacing cap 0; AB 0 ms)"], lines
     assert ao._state["engine"] is eng
+
+
+def test_runtime_line_at_the_first_admission_and_every_log_every(fresh, monkeypatch):
+    lines = []
+    monkeypatch.setattr(ao.logger, "info", lambda fmt, *a: lines.append(fmt % a))
+    monkeypatch.setattr(ao, "LOG_EVERY", 3)
+    _install(fresh, limit=4)
+    s = _scheduler(fresh)
+    e = _engine(s)
+    ao.attach(e)
+    e.input_queue.put_nowait((ADD, (_req(90, unknown=True), 0)))  # backs out: no line
+    _window()
+    s.schedule()
+    _drain(e)
+    s.finish_requests(["r90"], RequestStatus.FINISHED_ABORTED)
+    for i in range(7):
+        e.input_queue.put_nowait((ADD, (_req(i), 0)))
+    for _ in range(3):
+        _window()
+        s.schedule()
+    runtime = [l for l in lines if l.startswith("ADMIT_AHEAD ")]
+    assert [l.split()[1] for l in runtime] == ["ahead=1", "ahead=3", "ahead=6"], runtime
+    assert all(" backout=1 " in l and " admit_ms_mean=" in l for l in runtime), runtime
+    assert ao.stats["admitted"] == 7
 
 
 def test_keys_are_registered_and_out_of_the_compile_key():
