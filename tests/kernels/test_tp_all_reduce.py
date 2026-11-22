@@ -29,6 +29,9 @@ N_RANKS = 8
 # (rows, hidden): MiniMax-M3.1 decode buckets (4 and 8 share a view, 24 is
 # the b3 decode), and a hidden size whose rows need padding to a lane multiple.
 CASES = ((4, 6144), (8, 6144), (24, 6144), (3, 1024))
+# all_gather_small rows per rank: SP row scales of 2 and 4 pieces at 8k, and a
+# count that needs padding.
+GATHER_ROWS = (512, 256, 100)
 
 
 @pytest.mark.parametrize(
@@ -82,6 +85,23 @@ def _worker():
             exact=all(np.array_equal(out[r], x.sum(0)) for r in range(N_RANKS)),
             races=bool(interpret_pallas_call.races.races_found),
         )
+    gather = jax.jit(
+        jax.shard_map(
+            lambda x, r: tp_all_reduce.all_gather_small(x, r, N_RANKS),
+            mesh=mesh,
+            in_specs=(P("d"), P("d")),
+            out_specs=P("d"),
+            check_vma=False,
+        )
+    )
+    for rows in GATHER_ROWS:
+        x = np.arange(N_RANKS * rows, dtype=np.float32).reshape(N_RANKS * rows, 1)
+        pltpu.reset_tpu_interpret_mode_state()
+        out = np.asarray(gather(jnp.asarray(x), ranks)).reshape(N_RANKS, -1, 1)
+        result[f"gather{rows}"] = dict(
+            exact=all(np.array_equal(out[r], x) for r in range(N_RANKS)),
+            races=bool(interpret_pallas_call.races.races_found),
+        )
     print("RESULT " + json.dumps(result))
 
 
@@ -104,6 +124,12 @@ def on_8_devices():
 @pytest.mark.parametrize("rows, hidden", CASES)
 def test_kernel_on_8_devices(on_8_devices, rows, hidden):
     case = on_8_devices[f"{rows}x{hidden}"]
+    assert case["exact"] and not case["races"], case
+
+
+@pytest.mark.parametrize("rows", GATHER_ROWS)
+def test_gather_on_8_devices(on_8_devices, rows):
+    case = on_8_devices[f"gather{rows}"]
     assert case["exact"] and not case["races"], case
 
 

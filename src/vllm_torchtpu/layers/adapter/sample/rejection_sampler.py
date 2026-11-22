@@ -1206,11 +1206,11 @@ def _gather_and_assemble(
     max_draft_tokens: int,
 ) -> torch.Tensor:
     """`_assemble_synthetic` of every rank's sampled rows."""
-    from vllm.distributed import tensor_model_parallel_all_gather
+    from vllm_torchtpu.distributed.pallas_all_reduce import tp_all_gather
 
     # Exchanged as float32, which holds every id below 2**24 exactly, as the
     # vocab-parallel argmax exchanges its ids.
-    sampled = tensor_model_parallel_all_gather(sampled_rows.float(), dim=0)
+    sampled = tp_all_gather(sampled_rows.float(), dim=0)
     return _assemble_synthetic(
         sampled.to(torch.int32),
         accepted_count,

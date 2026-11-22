@@ -57,6 +57,7 @@ from vllm.model_executor.models.qwen3_dspark import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
 
+from vllm_torchtpu.distributed import pallas_all_reduce
 from vllm_torchtpu.layers.adapter.cp_draft_attention import (
     write_layers_op,
     write_layers_with_dcp,
@@ -150,7 +151,10 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> None:
-        if cache_config is not None and cache_config.cache_dtype == "int4_per_token_head":
+        if (
+            cache_config is not None
+            and cache_config.cache_dtype == "int4_per_token_head"
+        ):
             # Only the target's MSA caches are 4-bit; the draft's KV stays fp8.
             cache_config = copy.copy(cache_config)
             cache_config.cache_dtype = "fp8"
@@ -261,7 +265,7 @@ def _column_parallel(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
     cols = weight.shape[1] // tp
     start = get_tensor_model_parallel_rank() * cols
     part = torch.matmul(x, weight[:, start : start + cols])
-    return tensor_model_parallel_all_gather(part, dim=-1)
+    return pallas_all_reduce.tp_all_gather(part, dim=-1)
 
 
 def _context_kv(attn: nn.Module, context: torch.Tensor):

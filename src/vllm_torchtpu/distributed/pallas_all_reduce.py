@@ -57,6 +57,7 @@ _SELFTEST_ROWS = (8, 24)
 class _Armed:
     ranks: tuple[int, ...]
     op: Any
+    gather_op: Any
     rank: torch.Tensor  # this rank's mesh index, int32 [1, 1]
     # Every rank's mesh index equals its group rank (decided once, from all
     # ranks' indices, so the answer is the same on every rank).
@@ -113,6 +114,36 @@ def _make_op(mesh, max_bytes: int):
     return op
 
 
+def _make_gather_op(mesh):
+    axis = mesh.axis_names[0]
+    n = int(mesh.size)
+    specs = (P(axis), P(axis))
+    sharded = jax.shard_map(
+        lambda x, rank: kernel.all_gather_small(x, rank, n),
+        mesh=mesh,
+        in_specs=specs,
+        out_specs=P(axis),
+        check_vma=False,
+    )
+
+    def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
+        args = (x, rank)
+        return sharded(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        "pallas::tp_all_gather_small",
+        fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=P(axis),
+    )
+    op.register_fake(lambda x, rank: x.new_empty((n * x.shape[0], *x.shape[1:])))
+    return op
+
+
 def _refusal() -> str | None:
     tp = parallel_state.get_tp_group()
     ep = get_ep_group()
@@ -153,6 +184,19 @@ def _selftest(
     return failures
 
 
+def _gather_selftest(op, rank: torch.Tensor, mesh_index: int, n: int, device) -> bool:
+    """Whether the gather op returns every rank's distinct rows in rank order."""
+    rows = 512
+    want = np.arange(n * rows, dtype=np.float32).reshape(n * rows, 1)
+    faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
+    try:
+        mine = torch.from_numpy(want[mesh_index * rows : (mesh_index + 1) * rows])
+        got = op(mine.to(device), rank).cpu().numpy()
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+    return bool(np.array_equal(got, want))
+
+
 def _gather(obj) -> list:
     tp = parallel_state.get_tp_group()
     seen = [None] * tp.world_size
@@ -185,9 +229,15 @@ def arm(hidden: int, device: torch.device) -> bool:
         raise RuntimeError(
             f"tp_all_reduce: self-test failed (rows per rank): {failures}"
         )
+    gather_op = None
+    if envs.TPU_TP_PALLAS_SMALL_ALL_GATHER:
+        gather_op = _make_gather_op(mesh)
+        if not all(_gather(_gather_selftest(gather_op, rank, mesh_index, n, device))):
+            raise RuntimeError("tp_all_gather_small: self-test failed")
     _ARMED = _Armed(
         ranks=tuple(int(r) for r in tp.ranks),
         op=op,
+        gather_op=gather_op,
         rank=rank,
         mesh=mesh,
         max_bytes=max_bytes,
@@ -234,3 +284,49 @@ def armed_for(ranks) -> _Armed | None:
     if armed is None or tuple(ranks) != armed.ranks:
         return None
     return armed
+
+
+def all_gather_small(ranks, x: torch.Tensor) -> torch.Tensor | None:
+    """The armed Pallas all-gather (rows, rank order) of a small 32-bit x
+    over the group of `ranks`, or None when it is not armed for this group or
+    tensor (the caller takes its usual all-gather)."""
+    armed = _ARMED
+    if armed is None or armed.gather_op is None or tuple(ranks) != armed.ranks:
+        return None
+    # Blocks land at their mesh index; callers pair them with group-rank-ordered
+    # gathers.
+    if not armed.rank_ordered:
+        return None
+    # A static per-tensor test (dtype, not size): a size cutoff would give the
+    # bucket traces different graphs (see `all_reduce`). The kernel holds the
+    # gathered tensor in VMEM: row scales of any bucket are <= 8 x 4 B x 8192.
+    if kernel.gather_view(x.numel(), x.element_size()) is None:
+        return None
+    return armed.gather_op(x.contiguous(), armed.rank)
+
+
+# Bytes one rank sends through `tp_all_gather`'s Pallas call: the gathered
+# tensor sits in VMEM (n x this).
+_SMALL_GATHER_MAX_BYTES = 256 << 10
+
+
+def tp_all_gather(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
+    """`tensor_model_parallel_all_gather(x, dim)`, by the armed Pallas
+    all-gather (`all_gather_small`, `TPU_TP_PALLAS_SMALL_ALL_GATHER`) when x
+    is a small 32- or 16-bit tensor (16-bit pairs of the last dim as words),
+    else vLLM's. The same concatenation in rank order."""
+    from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
+
+    gathered = None
+    words = x
+    if x.element_size() == 2 and x.shape[-1] % 2 == 0:
+        words = x.contiguous().view(torch.int32)
+    if words.element_size() == 4 and x.numel() * x.element_size() <= (
+        _SMALL_GATHER_MAX_BYTES
+    ):
+        gathered = all_gather_small(get_tp_group().ranks, words)
+    if gathered is None:
+        return tensor_model_parallel_all_gather(x, dim)
+    blocks = gathered.view(x.dtype).view(-1, *x.shape)  # [n, *x.shape]
+    dim = dim % x.dim()
+    return torch.cat(blocks.unbind(0), dim=dim) if dim else blocks.flatten(0, 1)

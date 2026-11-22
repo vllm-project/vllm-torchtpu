@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     TPU_MOE_TC_COMBINE_PIECES: int = 1
     TPU_MINIMAX_M3_SP_ATTN_PIECES: bool = False
     TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES: bool = True
+    TPU_TP_PALLAS_SMALL_ALL_GATHER: bool = False
     TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS: int = 4096
     TPU_MINIMAX_M3_MSA_WIDE_TILES: str = "off"
     TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = True
@@ -855,6 +856,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (off: only the attention side, qkv_proj and o_proj, runs per piece).
     "TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES": env_bool(
         "TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES", default=True
+    ),
+    # With the Pallas TP all-reduce armed: all-gather small tensors (the
+    # DSpark draft's context fc columns, the synthetic sampler's tokens) with
+    # one Pallas call (kernels/collectives/tp_all_reduce.py `all_gather_small`)
+    # instead of XLA's TensorCore all-gather.
+    "TPU_TP_PALLAS_SMALL_ALL_GATHER": env_bool(
+        "TPU_TP_PALLAS_SMALL_ALL_GATHER", default=False
     ),
     # MSA prefill-size sparse-attention calls on 64-token tiles
     # (models/minimax_m3/kernels/msa_attention_lse.py `_adaptive_call`):
