@@ -83,8 +83,8 @@ Only keys present in the baseline are gated.
 
 Each task is compared on the accuracy metric of its baseline entry, the first
 in the script's `ACC_KEYS` order when the entry has several. A task whose
-results lack that metric fails as `(no result)`, also for a single run. No
-other accuracy metric of the task stands in for it.
+results lack that metric fails as `(no result)`. No other accuracy metric of
+the task stands in for it.
 
 Where the baseline carries a standard error (`exact_match_stderr`), the allowed
 drop becomes a one-sided 95% significance test:
@@ -114,27 +114,9 @@ python3 scripts/vllm/benchmarking/check_regression.py \
   --baseline scripts/vllm/benchmarking/baselines/eval/<config>.<task>.baseline.json
 ```
 
-### Accuracy uses the mean of several runs
-
-Pass `--results-dir` once per run, both to calibrate a baseline and to check
-against one. The accuracy value is the mean over the runs. The standard error
-is the mean of the standard errors the runs reported, kept only when every run
-reported one.
-
-Only the value is averaged. The standard error stays that of a single run, so
-the gate is as wide as for a single run, whatever the number of runs. The
-allowed drop is the same formula as above.
-
-A metric that any of the runs lacks is dropped with a warning, so a run that
-lost a task fails the check as a missing result. `--calibrate` exits `2`
-instead of writing a baseline when a run is empty or lacks a metric that
-another run has.
-
-```bash
-python3 scripts/vllm/benchmarking/check_regression.py \
-  --mode eval --calibrate --task-filter <task> \
-  --results-dir <RUN1> --results-dir <RUN2> --results-dir <RUN3>
-```
+`--calibrate` writes a baseline as the median of the runs, one `--results-dir`
+per run. It exits `2` instead of writing a baseline when a run has no selected
+task or lacks an accuracy metric that another run has.
 
 ## Accuracy Evaluation (`lm_eval`)
 

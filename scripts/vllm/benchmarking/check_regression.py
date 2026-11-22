@@ -17,8 +17,6 @@
 Usage:
     check_regression.py --mode <perf|eval> --results-dir <dir> --baseline <baseline.json> [--tolerance 0.05]
     check_regression.py --mode <perf|eval> --calibrate --results-dir <dir> [<dir2> ...]
-
-Eval mode accepts --results-dir several times and compares the mean of the runs.
 """  # noqa: E501
 
 from __future__ import annotations
@@ -266,50 +264,6 @@ def load_eval_results(results_dir: Path) -> dict[str, dict]:
     return out
 
 
-class AggregatedRuns(NamedTuple):
-    """The per-task mean of several runs, and what could not be averaged."""
-
-    entries: dict[str, dict]
-    # (task, metric) pairs that some run lacks, in task then ACC_KEYS order.
-    dropped: list[tuple[str, str]]
-
-
-def aggregate_eval_runs(runs: Sequence[dict[str, dict]]) -> AggregatedRuns:
-    """Collapse the results of N runs into one entry per task.
-
-    Each accuracy value becomes the mean over the runs. Its stderr is the mean
-    of the stderrs the runs reported, present only when every run reported
-    one. Only the value is averaged: the stderr stays that of a single run, so
-    the gate is as wide as for a single run.
-
-    A metric that any run lacks is left out of the entries and returned in
-    ``dropped``, so a run that lost a task shows up as a missing result
-    instead of a mean over fewer runs.
-    """
-    if not runs:
-        return AggregatedRuns({}, [])
-    n = len(runs)
-    out: dict[str, dict] = {}
-    dropped: list[tuple[str, str]] = []
-    for task in sorted(set().union(*runs)):
-        entries = [run.get(task, {}) for run in runs]
-        entry: dict[str, float] = {}
-        for k in ACC_KEYS:
-            values = [e[k] for e in entries if k in e]
-            if not values:
-                continue
-            if len(values) < n:
-                dropped.append((task, k))
-                continue
-            entry[k] = statistics.fmean(values)
-            reported = [e[stderr_key(k)] for e in entries if stderr_key(k) in e]
-            if len(reported) == n:
-                entry[stderr_key(k)] = statistics.fmean(reported)
-        if entry:
-            out[task] = entry
-    return AggregatedRuns(out, dropped)
-
-
 class PrimaryMetric(NamedTuple):
     name: str
     value: float
@@ -478,25 +432,37 @@ def check_eval(
 def calibrate_eval(
     results_dirs: list[Path], task_filter: set[str] | None
 ) -> dict[str, dict]:
-    """Build an eval baseline as the mean of the runs in `results_dirs`.
+    """Build an eval baseline as the median of the runs in `results_dirs`.
 
-    Raises ValueError when a run has no selected task or lacks a metric that
-    another run has, so a broken run cannot shrink or empty the baseline.
+    Raises ValueError when a run has no selected task or lacks an accuracy
+    metric that another run has, so a broken run cannot shrink the baseline or
+    shift its median.
     """
-    runs = []
+    collected: dict[str, dict[str, list[float]]] = {}
     for d in results_dirs:
-        run = {
-            task: metrics
-            for task, metrics in load_eval_results(d).items()
-            if task_filter is None or task in task_filter
-        }
-        if not run:
+        selected = False
+        for task, metrics in load_eval_results(d).items():
+            if task_filter is not None and task not in task_filter:
+                continue
+            selected = True
+            slot = collected.setdefault(task, {})
+            for k, v in metrics.items():
+                slot.setdefault(k, []).append(float(v))
+        if not selected:
             raise ValueError(f"no selected eval results under {d}")
-        runs.append(run)
-    baseline, dropped = aggregate_eval_runs(runs)
-    if dropped:
-        lost = "; ".join(f"{task} {k}" for task, k in dropped)
-        raise ValueError(f"not in every run: {lost}")
+
+    missing = sorted(
+        f"{task} {k}"
+        for task, metrics in collected.items()
+        for k, vs in metrics.items()
+        if k in ACC_KEYS and len(vs) < len(results_dirs)
+    )
+    if missing:
+        raise ValueError(f"not in every run: {'; '.join(missing)}")
+
+    baseline = {}
+    for task, metrics in collected.items():
+        baseline[task] = {k: statistics.median(vs) for k, vs in metrics.items()}
     return baseline
 
 
@@ -513,8 +479,7 @@ def main() -> int:
         type=Path,
         action="append",
         required=True,
-        help="Directory containing result files. Repeat for calibrate, or in "
-        "eval mode to compare the mean of several runs.",
+        help="Directory containing result files. Repeat for calibrate.",
     )
     parser.add_argument(
         "--baseline", type=Path, help="Baseline JSON to compare against."
@@ -580,8 +545,8 @@ def main() -> int:
 
     if args.baseline is None:
         parser.error("--baseline is required unless --calibrate is set")
-    if args.mode == "perf" and len(args.results_dir) != 1:
-        parser.error("--results-dir may only be given once in perf check mode")
+    if len(args.results_dir) != 1:
+        parser.error("--results-dir may only be given once in check mode")
 
     if args.mode == "perf":
         results = load_perf_results(args.results_dir[0])
@@ -592,24 +557,13 @@ def main() -> int:
             )
             return 2
     else:
-        runs = [load_eval_results(d) for d in args.results_dir]
-        for results_dir, run in zip(args.results_dir, runs):
-            if not run:
-                print(
-                    f"ERROR: no results_*.json found under {results_dir}",
-                    file=sys.stderr,
-                )
-                return 2
-        # One run passes through untouched; several are gated on their mean.
-        if len(runs) == 1:
-            results = runs[0]
-        else:
-            results, dropped = aggregate_eval_runs(runs)
-            for task, k in dropped:
-                print(
-                    f"Warning: {task} {k} is not in every run; dropped.",
-                    file=sys.stderr,
-                )
+        results = load_eval_results(args.results_dir[0])
+        if not results:
+            print(
+                f"ERROR: no results_*.json found under {args.results_dir[0]}",
+                file=sys.stderr,
+            )
+            return 2
 
     with args.baseline.open() as fh:
         baseline = json.load(fh)
