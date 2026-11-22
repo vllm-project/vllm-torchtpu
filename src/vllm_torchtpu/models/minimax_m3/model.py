@@ -50,7 +50,10 @@ from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.quantization.fp8_lm_head import Fp8LMHeadMethod
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3 import residual_ar, sp_o_proj
-from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
+from vllm_torchtpu.models.minimax_m3.attention import (
+    MiniMaxM3SparseAttention,
+    StepHalves,
+)
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse, sp_norm
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.ops.sp_norm import get_add_norm_quant_op
@@ -62,7 +65,8 @@ logger = init_logger(__name__)
 class _GemmaRMSNorm(GemmaRMSNorm):
     """GemmaRMSNorm whose f32 ``1 + weight`` is computed once after loading
     (`shift_weight`): forward_native recomputes it per call, one XLA op per
-    norm per step."""
+    norm per step. forward_native mirrors upstream GemmaRMSNorm.forward_native
+    with that weight."""
 
     def shift_weight(self) -> None:
         self.register_buffer(
@@ -142,6 +146,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         attn_rs: bool = False,
+        step: StepHalves | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Residual-deferred layer; ``attn_rs`` (large steps) reduce-scatters
         the attention output instead of all-reducing it."""
@@ -150,15 +155,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        whole = None if step is None else (step, None)
         if not attn_rs:
-            hidden_states = self.self_attn(positions, hidden_states)
+            hidden_states = self.self_attn(positions, hidden_states, half=whole)
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
             ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
             return ffn(hidden_states), residual
         with self._layer_owned_reductions():
-            return self._attn_rs(positions, hidden_states, residual)
+            return self._attn_rs(positions, hidden_states, residual, whole)
 
     def forward_residual_ar(
         self,
@@ -189,13 +195,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
+        whole: tuple[StepHalves, None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Each rank gets the new residual stream of its token shard,
         normalizes it and all-gathers it as the FFN input; the attention
         partial rides the FFN all-reduce. The returned residual is the
         pre-attention one, so the next fused add + norm sees
         ``ffn + attn + residual``."""
-        attn = self.self_attn(positions, hidden_states)
+        attn = self.self_attn(positions, hidden_states, half=whole)
         shard = tensor_model_parallel_reduce_scatter(attn + residual / self.tp_size, 0)
         normed = _all_gather_rows(
             self.post_attention_layernorm(shard), envs.TPU_MINIMAX_M3_SP_FP8_GATHER
@@ -210,6 +217,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         shard: torch.Tensor | None,
         update: torch.Tensor | None = None,
+        halves: StepHalves | None = None,
+        step: StepHalves | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
         """Sequence-parallel layer: the residual stream stays a token shard.
 
@@ -220,14 +229,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
         all-gathers feed attention and the FFN, and their partial outputs are
         reduce-scattered back onto the shard. Returns the residual shard
         entering this layer (None for the first), the shard after attention
-        and this layer's FFN update.
+        and this layer's FFN update. With ``halves`` the shard holds this
+        rank's block of each token half (`_halves_rows`) and attention runs
+        per half (`_attention_halves`).
         """
         with self._layer_owned_reductions():
-            return self._forward_sp(positions, hidden_states, shard, update)
+            return self._forward_sp(
+                positions, hidden_states, shard, update, halves, step
+            )
 
     def _norm_gather(
         self,
-        norm: "_GemmaRMSNorm",
+        norm: _GemmaRMSNorm,
         shard: torch.Tensor,
         update: torch.Tensor | None,
         fp8: bool,
@@ -257,17 +270,25 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         shard: torch.Tensor | None,
         update: torch.Tensor | None,
+        halves: StepHalves | None = None,
+        step: StepHalves | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
         layer_input = None
         o_proj = self.self_attn.o_proj
+        whole = None if step is None else (step, None)
         if shard is None:
             normed = self.input_layernorm(hidden_states)
-            if sp_o_proj.applies(o_proj):
-                attn = self.self_attn(positions, normed, project=False)
+            if halves is not None:
+                rows = [halves.take(normed, i) for i in range(2)]
+                update = self._attention_halves(positions, rows, halves)
+                shard = update + _halves_rows(hidden_states, self.tp_size)
+                update = None
+            elif sp_o_proj.applies(o_proj):
+                attn = self.self_attn(positions, normed, project=False, half=whole)
                 rows = sp_o_proj.local_rows(hidden_states)
                 shard = sp_o_proj.sp_o_proj(o_proj, attn) + rows
             else:
-                attn = self.self_attn(positions, normed)
+                attn = self.self_attn(positions, normed, half=whole)
                 shard = tensor_model_parallel_reduce_scatter(
                     attn + hidden_states / self.tp_size, 0
                 )
@@ -285,8 +306,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 envs.TPU_MINIMAX_M3_SP_E4M3_QKV,
             )
             layer_input = shard
-            if sp_o_proj.applies(o_proj):
-                attn = self.self_attn(positions, normed, project=False)
+            if halves is not None:
+                update = self._attention_halves(positions, normed, halves)
+            elif sp_o_proj.applies(o_proj):
+                attn = self.self_attn(positions, normed, project=False, half=whole)
                 pieces = (
                     _ffn_pieces(shard.shape[0], self.tp_size)
                     if envs.TPU_MINIMAX_M3_SP_ATTN_PIECES
@@ -294,13 +317,30 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 )
                 update = sp_o_proj.sp_o_proj(o_proj, attn, pieces)
             else:
-                attn = self.self_attn(positions, normed)
+                attn = self.self_attn(positions, normed, half=whole)
                 update = tensor_model_parallel_reduce_scatter(attn, 0)
-        shard, update = self._ffn_sp(shard, update)
+        shard, update = self._ffn_sp(shard, update, halves is not None)
         return layer_input, shard, update
 
+    def _attention_halves(
+        self, positions: torch.Tensor, rows: list, halves: StepHalves
+    ) -> torch.Tensor:
+        """o_proj(attention) summed over TP for this rank's block of each
+        token half (the halves layout): the first half attends (and writes its
+        keys) before the second, and each half's all-to-all + o_proj starts
+        when its attention is done, under the other half's attention."""
+        o_proj = self.self_attn.o_proj
+        out, attn = [], None
+        for i, x in enumerate(rows):
+            # The second half's cache writes follow the first half's reads.
+            attn = self.self_attn(
+                positions, x, project=False, half=(halves, i), after=attn
+            )
+            out.append(sp_o_proj.sp_o_proj(o_proj, attn))
+        return torch.cat(out)
+
     def _ffn_sp(
-        self, shard: torch.Tensor, update: torch.Tensor | None
+        self, shard: torch.Tensor, update: torch.Tensor | None, halves: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """(shard + update, reduce-scattered FFN(all-gathered norm of it)).
         With row pieces (_ffn_pieces) each piece of the shard is normed and
@@ -326,8 +366,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
         )
         if n == 1:
             return shard, tensor_model_parallel_reduce_scatter(ffn(gathered), 0)
-        # The MoE's padding mask is indexed by row: give it piece-major rows.
-        rows = functools.partial(_piece_major_rows, shard.shape[0] * tp, tp, n)
+        # The MoE's padding mask is indexed by row: give it piece-major rows
+        # (the halves layout gathers the step's rows in order).
+        rows = (
+            _identity_rows
+            if halves
+            else functools.partial(_piece_major_rows, shard.shape[0] * tp, tp, n)
+        )
         if envs.TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE and not self.is_moe_layer:
             per = shard.shape[0] * tp // n
             out_updates = []
@@ -337,14 +382,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
                     out = ffn(piece)
                 out_updates.append(tensor_model_parallel_reduce_scatter(out, 0))
             return shard, torch.cat(out_updates)
-        with token_padding.padding_of_rows(rows):
+        with (
+            contextlib.nullcontext() if halves else token_padding.padding_of_rows(rows)
+        ):
             out = ffn(gathered)
         out_updates = [tensor_model_parallel_reduce_scatter(o, 0) for o in out.chunk(n)]
         return shard, torch.cat(out_updates)
 
     def _norm_gather_pieces(
         self,
-        norm: "_GemmaRMSNorm",
+        norm: _GemmaRMSNorm,
         shard: torch.Tensor,
         update: torch.Tensor | None,
         fp8: bool,
@@ -391,6 +438,31 @@ def _piece_major_rows(
     pieces' order: piece i holds every rank's i-th row block of its shard."""
     x = x[:tokens].view(tp_size, pieces, -1, *x.shape[1:])
     return x.transpose(0, 1).flatten(0, 2)
+
+
+def _identity_rows(x: torch.Tensor) -> torch.Tensor:
+    return x
+
+
+def _halves_rows(x: torch.Tensor, tp_size: int) -> torch.Tensor:
+    """This rank's shard of step rows ``x`` in the halves layout: its block
+    of the first token half, then its block of the second."""
+    x = x.view(2, tp_size, x.shape[0] // (2 * tp_size), *x.shape[1:])
+    rank = pallas_all_reduce.armed_rank(get_tp_group().ranks)
+    if rank is None:
+        raise RuntimeError("the SP halves layout needs the armed, rank-ordered mesh")
+    return torch.index_select(x, 1, rank.view(1)).flatten(0, 2)
+
+
+def _gather_shards(x: torch.Tensor, halves: bool) -> torch.Tensor:
+    """The step rows of a residual shard (all-gathered; the halves layout
+    gathered per half, so the rows come back in step order)."""
+    rows = tensor_model_parallel_all_gather(x, 0)
+    if not halves:
+        return rows
+    # [rank][half][block] -> [half][rank][block]
+    rows = rows.view(-1, 2, x.shape[0] // 2, *x.shape[1:]).transpose(0, 1)
+    return rows.flatten(0, 2)
 
 
 def _rows_slice(
@@ -474,6 +546,22 @@ class MiniMaxM3Model(nn.Module):
         self.norm = _GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.sp_mode = _sp_mode() if self.tp_size > 1 else "off"
+        # Per-half attention (StepHalves) is checked on 8-bit caches with one
+        # KV head per rank (head-major queries). On 4-bit caches the second
+        # half's attention reads NaN once its cache writes are ordered after
+        # the first half's reads (and XLA copies the caches when they are
+        # not); a DCP group over several KV heads (c64's DCP4) halted the TPU.
+        attn = self.layers[0].self_attn
+        self.step_halves = bool(
+            envs.TPU_MINIMAX_M3_SP_HALVES
+            and attn.q_head_major
+            and attn.scale_cache is None
+        )
+        if envs.TPU_MINIMAX_M3_SP_HALVES and not self.step_halves:
+            logger.warning(
+                "TPU_MINIMAX_M3_SP_HALVES needs 8-bit KV caches and DCP over one "
+                "KV head per rank: off"
+            )
         # Residual-stream entries of these layers (k = output of layer k-1,
         # residual added, before the next norm) are also returned; set by
         # the DSpark drafter before the first trace.
@@ -484,12 +572,30 @@ class MiniMaxM3Model(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _halves_step(self, num_tokens: int) -> bool:
+        """Whether this SP step runs attention per token half
+        (TPU_MINIMAX_M3_SP_HALVES): on steps whose shard splits into the two
+        row pieces of `_ffn_pieces`, gathered per piece on both sides, with
+        o_proj's all-to-all path (whose rank order `_halves_rows` reads)."""
+        return bool(
+            self.step_halves
+            and envs.TPU_MINIMAX_M3_SP_ATTN_PIECES
+            and envs.TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES
+            and _ffn_pieces(num_tokens // self.tp_size, self.tp_size) == 2
+            and sp_o_proj.applies(self.layers[0].self_attn.o_proj)
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        step = None
+        if self.step_halves:
+            # First thing in every trace (StepHalves).
+            tokens = input_ids if inputs_embeds is None else inputs_embeds
+            step = StepHalves(positions, tokens.shape[0])
         if inputs_embeds is None:
             assert input_ids is not None
             inputs_embeds = self.embed_input_ids(input_ids)
@@ -501,19 +607,21 @@ class MiniMaxM3Model(nn.Module):
         )
         if sp_step and self.sp_mode == "full":
             shard, update = None, None
+            num_tokens = inputs_embeds.shape[0]
+            halves = step if step and self._halves_step(num_tokens) else None
             for idx, layer in enumerate(self.layers):
                 # Layer idx materializes its input residual (entry idx).
                 layer_input, shard, update = layer.forward_sp(
-                    positions, inputs_embeds, shard, update
+                    positions, inputs_embeds, shard, update, halves, step
                 )
                 if idx > 0 and idx in self.aux_hidden_state_layers:
                     aux_hidden_states.append(
-                        tensor_model_parallel_all_gather(layer_input, 0)
+                        _gather_shards(layer_input, halves is not None)
                     )
             shard = shard + update
             if len(self.layers) in self.aux_hidden_state_layers:
-                aux_hidden_states.append(tensor_model_parallel_all_gather(shard, 0))
-            hidden_states = tensor_model_parallel_all_gather(self.norm(shard), 0)
+                aux_hidden_states.append(_gather_shards(shard, halves is not None))
+            hidden_states = _gather_shards(self.norm(shard), halves is not None)
         elif self.residual_ar_armed and not sp_step:
             partial, residual = inputs_embeds, None
             for idx, layer in enumerate(self.layers):
@@ -530,7 +638,7 @@ class MiniMaxM3Model(nn.Module):
             hidden_states, residual = inputs_embeds, None
             for idx, layer in enumerate(self.layers):
                 hidden_states, residual = layer(
-                    positions, hidden_states, residual, sp_step
+                    positions, hidden_states, residual, sp_step, step
                 )
                 if idx + 1 in self.aux_hidden_state_layers:
                     aux_hidden_states.append(hidden_states + residual)

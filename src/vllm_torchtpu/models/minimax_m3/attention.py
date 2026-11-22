@@ -48,6 +48,7 @@ from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_sharded_op,
 )
 from vllm_torchtpu.models.minimax_m3.ops.qk_norm_rope import get_qk_norm_rope_op
+from vllm_torchtpu.models.minimax_m3.step_halves import split_metadata
 
 
 class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
@@ -243,6 +244,53 @@ def norm_rope_heads(
     cos_sin = rotary_emb._match_cos_sin_cache_dtype(qkv)
     cos_sin = cos_sin.index_select(0, positions.flatten())
     return op(qkv, cos_sin, weight)
+
+
+class StepHalves:
+    """The two token halves of a step (TPU_MINIMAX_M3_SP_HALVES): their
+    positions and the attention metadata of their queries, derived from the
+    step's once per forward (half None: the step's own).
+
+    Every trace of the model derives them first thing, so the traces of all
+    token buckets read their inputs in one order, as
+    compilation/shape_variants needs to hand a bucket between traces. The
+    second half attends after the first (whose keys it reads from the cache).
+    """
+
+    def __init__(self, positions: torch.Tensor, num_tokens: int) -> None:
+        # positions' length is its own symbol: tie it to the token count the
+        # halves split, or narrowing it specializes the trace.
+        torch._check(positions.shape[0] == num_tokens)
+        self.split = num_tokens // 2
+        self.num_tokens = num_tokens
+        self.positions = (self.take(positions, 0), self.take(positions, 1))
+        self.whole_positions = positions
+        self._metadata: dict[int, tuple[AttentionMetadata, ...]] = {}
+        metadata = get_forward_context().attn_metadata
+        if isinstance(metadata, dict):
+            for md in metadata.values():
+                if isinstance(md, AttentionMetadata) and id(md) not in self._metadata:
+                    self._metadata[id(md)] = split_metadata(md, self.split)
+
+    def take(self, x: torch.Tensor, half: int) -> torch.Tensor:
+        """Half ``half``'s rows of step rows ``x`` (narrow: a symbolic slice
+        would specialize the token count)."""
+        if half == 0:
+            return x.narrow(0, 0, self.split)
+        return x.narrow(0, self.split, self.num_tokens - self.split)
+
+    def positions_of(self, half: int | None) -> torch.Tensor:
+        return self.whole_positions if half is None else self.positions[half]
+
+    def metadata(self, md: AttentionMetadata, half: int | None) -> AttentionMetadata:
+        """Half ``half``'s metadata (None: the whole step's)."""
+        return self._metadata[id(md)][2 if half is None else half]
+
+
+def _zero_of(dep: torch.Tensor) -> torch.Tensor:
+    """An exact f32 zero [1, 1] computed from ``dep`` (a data dependence)."""
+    x = dep[:1, :1].float()
+    return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0) * 0
 
 
 def _step_rows(pieces: list[torch.Tensor]) -> torch.Tensor:
@@ -449,17 +497,28 @@ class MiniMaxM3SparseAttention(nn.Module):
         hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list | None,
         project: bool = True,
         qkv: torch.Tensor | None = None,
+        half: tuple[StepHalves, int | None] | None = None,
+        after: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``hidden_states`` may come as e4m3 rows with per-row f32 scales
         (an SP step's e4m3 all-gather), which qkv_proj contracts as e4m3, or
         as a list of such all-gathered row pieces (model.py `_ffn_pieces`).
         ``project=False`` returns this rank's heads before o_proj. ``qkv``
-        (with hidden_states None) is qkv_proj's output, already computed."""
+        (with hidden_states None) is qkv_proj's output, already computed.
+        ``half`` (step, i): the rows are token half i of the step (i None: all
+        of them), attended with the step's derived metadata (StepHalves)."""
+        if half is not None:
+            positions = half[0].positions_of(half[1])
         if qkv is None and isinstance(hidden_states, list):
             # An SP step's gathered row pieces: project each as it lands.
             qkv = _step_rows([self._qkv(p) for p in hidden_states])
         elif qkv is None:
             qkv = self._qkv(hidden_states)
+        if after is not None:
+            # The caches are written in place: this call's writes must follow
+            # the reads of the call that produced `after` (else XLA copies
+            # the caches).
+            qkv = qkv + _zero_of(after).to(qkv.dtype)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
             positions,
@@ -492,6 +551,8 @@ class MiniMaxM3SparseAttention(nn.Module):
                 extra["scale_cache"] = self.scale_cache.kv_cache
                 if self.dcp_size > 1:
                     extra["hadamard"] = self.hadamard
+            if half is not None:
+                layer_metadata = half[0].metadata(layer_metadata, half[1])
             attn_output = self.msa_op(
                 q,
                 k.view(num_tokens, self.num_kv_heads, self.head_dim),

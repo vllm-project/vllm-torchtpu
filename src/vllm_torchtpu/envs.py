@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES: bool = True
     TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE: bool = False
     TPU_TP_PALLAS_SMALL_ALL_GATHER: bool = False
+    TPU_MINIMAX_M3_SP_HALVES: bool = False
     TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS: int = 4096
     TPU_MINIMAX_M3_MSA_WIDE_TILES: str = "off"
     TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = True
@@ -867,6 +868,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE": env_bool(
         "TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE", default=False
     ),
+    # With TPU_MINIMAX_M3_SP_FFN_PIECES=2 and TPU_MINIMAX_M3_SP_ATTN_PIECES:
+    # the row pieces are the step's two token halves and attention runs per
+    # half (first half first), so one half's residual collectives overlap the
+    # other half's attention (models/minimax_m3/attention.py StepHalves).
+    "TPU_MINIMAX_M3_SP_HALVES": env_bool("TPU_MINIMAX_M3_SP_HALVES", default=False),
     # With the Pallas TP all-reduce armed: all-gather small tensors (an SP
     # step's e4m3 row scales, the DSpark draft's context fc columns, the
     # synthetic sampler's tokens) with one Pallas call
