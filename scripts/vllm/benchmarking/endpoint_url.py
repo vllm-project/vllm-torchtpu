@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import argparse
 import http.client
 import json
 import os
@@ -23,6 +24,13 @@ import sys
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
+
+
+def _invalid_base_url(raw: str, hint: str = "") -> ValueError:
+    # A value that may hold credentials (user:password@host) is not echoed:
+    # the message goes to logs.
+    shown = "<not shown: it contains '@'>" if "@" in raw else raw
+    return ValueError(f"Invalid --base-url: {shown}{hint}")
 
 
 def normalize_base_url(raw: str) -> str:
@@ -36,53 +44,55 @@ def normalize_base_url(raw: str) -> str:
     """
     text = raw.strip()
     if not text or any(ch.isspace() for ch in text):
-        raise ValueError(f"Invalid --base-url: {raw}")
+        raise _invalid_base_url(raw)
 
     bare = "://" not in text
     try:
         url = urlparse("http://" + text if bare else text)
         port = url.port
     except ValueError as err:
-        raise ValueError(f"Invalid --base-url: {raw}") from err
+        raise _invalid_base_url(raw) from err
 
     # Credentials in the URL would be echoed into logs with every command.
+    if url.username is not None or url.password is not None:
+        raise _invalid_base_url(
+            raw, " (credentials in the URL are not supported; set OPENAI_API_KEY)"
+        )
     if (
         url.scheme not in ("http", "https")
         or not url.hostname
-        or url.username is not None
-        or url.password is not None
         or url.query
         or url.fragment
     ):
-        raise ValueError(f"Invalid --base-url: {raw}")
+        raise _invalid_base_url(raw)
 
     path = url.path.rstrip("/")
     if path == "/v1" or path.endswith("/v1"):
         path = path[: -len("/v1")].rstrip("/")
     if "/v1/" in f"{path}/":
-        raise ValueError(
-            f"Invalid --base-url: {raw} (pass the API root, not a /v1/... route)"
-        )
+        raise _invalid_base_url(raw, " (pass the API root, not a /v1/... route)")
 
     netloc = url.netloc
     # "host:" has no port to keep, and "http:/host" parses as the host "http".
     if netloc.endswith(":"):
-        raise ValueError(f"Invalid --base-url: {raw}")
+        raise _invalid_base_url(raw)
     if bare and port is None:
         netloc = f"{netloc}:8000"
     return f"{url.scheme}://{netloc}{path}"
 
 
 class ModelLookupError(RuntimeError):
-    """``/v1/models`` could not be read, so the served model is unknown."""
+    """``/v1/models`` could not be read, so the served models are unknown."""
 
 
-def discover_served_model(
+class ModelNotServedError(RuntimeError):
+    """The model name a run would send is not one the endpoint lists."""
+
+
+def list_served_models(
     base_url: str, *, api_key: str | None = None, timeout: float = 30.0
-) -> str | None:
-    """Return the single model id advertised at ``<base_url>/v1/models``.
-
-    Returns ``None`` if the endpoint answers with zero or multiple models.
+) -> list[str]:
+    """Return the model ids advertised at ``<base_url>/v1/models``.
 
     Raises:
         ModelLookupError: The endpoint is unreachable, answers with an HTTP
@@ -114,43 +124,97 @@ def discover_served_model(
             f"Could not list the served models at {models_url}: "
             "the response is not a JSON model list"
         )
-    ids = [
+    return [
         entry["id"]
         for entry in data
         if isinstance(entry, dict) and isinstance(entry.get("id"), str)
     ]
-    return ids[0] if len(ids) == 1 else None
+
+
+def choose_served_model(
+    listed: list[str],
+    *,
+    config_model: str,
+    served_model_name: str | None = None,
+    adopt_single_listed: bool = False,
+) -> str:
+    """Return the model name to send to an endpoint that lists ``listed``.
+
+    The name is ``served_model_name`` when given. Otherwise it is the single
+    listed id when ``adopt_single_listed`` is set and the endpoint lists
+    exactly one, and ``config_model`` in every other case.
+
+    Raises:
+        ModelNotServedError: The chosen name is not in ``listed``. Every
+            request for it would fail, and ``vllm bench serve`` would still
+            exit 0 with a result file of zeros.
+    """
+    if served_model_name:
+        name, source = served_model_name, "--served-model-name"
+    elif adopt_single_listed and len(listed) == 1:
+        return listed[0]
+    else:
+        name, source = config_model, "the config's MODEL"
+    if name not in listed:
+        served = ", ".join(listed) if listed else "no models"
+        raise ModelNotServedError(
+            f"{source} '{name}' is not a model the endpoint serves (it lists: {served})"
+        )
+    return name
+
+
+def _resolve_model(args: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="endpoint_url.py resolve-model")
+    parser.add_argument("base_url")
+    parser.add_argument("--config-model", required=True)
+    parser.add_argument("--served-model-name")
+    parser.add_argument("--adopt-single-listed", action="store_true")
+    parsed = parser.parse_args(args)
+    try:
+        listed = list_served_models(
+            parsed.base_url, api_key=os.environ.get("OPENAI_API_KEY") or None
+        )
+        name = choose_served_model(
+            listed,
+            config_model=parsed.config_model,
+            served_model_name=parsed.served_model_name,
+            adopt_single_listed=parsed.adopt_single_listed,
+        )
+    except ModelLookupError as err:
+        print(
+            f"ERROR: {err}. The run sends no request before it has checked "
+            "the model name against this list.",
+            file=sys.stderr,
+        )
+        return 1
+    except ModelNotServedError as err:
+        print(
+            f"ERROR: {parsed.base_url}/v1/models: {err}. Pass "
+            "--served-model-name with a name the endpoint serves.",
+            file=sys.stderr,
+        )
+        return 1
+    print(name)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
-    if len(args) != 2 or args[0] not in ("normalize", "discover-model"):
+    if args[:1] == ["resolve-model"]:
+        return _resolve_model(args[1:])
+    if len(args) != 2 or args[0] != "normalize":
         print(
-            "Usage: endpoint_url.py <normalize|discover-model> <url>",
+            "Usage: endpoint_url.py normalize <url>\n"
+            "       endpoint_url.py resolve-model <url> --config-model MODEL "
+            "[--served-model-name NAME] [--adopt-single-listed]",
             file=sys.stderr,
         )
         return 2
-    command, value = args
-    if command == "normalize":
-        try:
-            print(normalize_base_url(value))
-        except ValueError as err:
-            print(str(err), file=sys.stderr)
-            return 1
-        return 0
     try:
-        model_id = discover_served_model(
-            value, api_key=os.environ.get("OPENAI_API_KEY") or None
-        )
-    except ModelLookupError as err:
-        print(
-            f"ERROR: {err}. Pass --served-model-name to name the model "
-            "without this lookup.",
-            file=sys.stderr,
-        )
+        print(normalize_base_url(args[1]))
+    except ValueError as err:
+        print(str(err), file=sys.stderr)
         return 1
-    if model_id:
-        print(model_id)
     return 0
 
 

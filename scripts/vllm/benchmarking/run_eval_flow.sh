@@ -426,11 +426,13 @@ print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + '
 
 # Single source of truth for named --eval-suites entries:
 #   "<suite>:<runner>:<scope>"
-# Scope is "text" (always included in `all`) or "multimodal" (included in `all`
-# only for *multimodal* configs, matching run_eval_configs.sh).
+# Scope says when `all` includes the suite: "text" always, "config_lm_eval"
+# only when the config's LM_EVAL_TASKS lists it (a config narrows that list to
+# rule a task out for its model, and --run-lm-eval follows it too), and
+# "multimodal" only for *multimodal* configs, matching run_eval_configs.sh.
 EVAL_SUITE_TABLE=(
-    "mmlu_llama:lm_eval:text"
-    "mmlu_pro:lm_eval:text"
+    "mmlu_llama:lm_eval:config_lm_eval"
+    "mmlu_pro:lm_eval:config_lm_eval"
     "gsm8k:lm_eval:text"
     "humaneval_plus_tpu:lm_eval:text"
     "mbpp_plus_tpu:lm_eval:text"
@@ -453,9 +455,16 @@ append_all_eval_suites() {
     local entry suite _ scope
     for entry in "${EVAL_SUITE_TABLE[@]}"; do
         IFS=':' read -r suite _ scope <<< "$entry"
-        if [ "$scope" = "text" ] || [[ "$CONFIG_NAME" == *multimodal* ]]; then
-            SELECTED_EVAL_SUITES+=("$suite")
-        fi
+        case "$scope" in
+            config_lm_eval)
+                # Padded with spaces so a name only matches a whole word.
+                [[ " ${LM_EVAL_TASKS//[$'\t\n']/ } " == *" $suite "* ]] || continue
+                ;;
+            multimodal)
+                [[ "$CONFIG_NAME" == *multimodal* ]] || continue
+                ;;
+        esac
+        SELECTED_EVAL_SUITES+=("$suite")
     done
 }
 
@@ -467,17 +476,23 @@ fi
 
 # Read config-declared suite defaults in an isolated subshell before launching.
 # Suite variables start empty so only the config file sets them, and config
-# stdout is discarded so echoed notes are never eval'd.
+# stdout is discarded so echoed notes are never eval'd. MODEL and
+# BENCHMARK_MODE start as run_benchmarks.sh starts them, and come back under
+# CONFIG_ names so this shell's own MODEL and environment stay as they were.
 _config_vars=$(
     SCRIPT_DIR="$SCRIPT_DIR" bash -c '
         set -euo pipefail
         LM_EVAL_TASKS="mmlu_llama mmlu_pro"
         EVAL_SUITES=""
         PERF_SUITES=""
+        MODEL=""
+        BENCHMARK_MODE="${BENCHMARK_MODE:-serving}"
         source "$1" >/dev/null
         for var in LM_EVAL_TASKS EVAL_SUITES PERF_SUITES; do
             printf "%s=%q\n" "$var" "${!var}"
         done
+        printf "CONFIG_MODEL=%q\n" "$MODEL"
+        printf "CONFIG_BENCHMARK_MODE=%q\n" "$BENCHMARK_MODE"
     ' _ "$CONFIG_FILE"
 ) || {
     echo "ERROR: Failed to read config defaults from $CONFIG_FILE" >&2
@@ -580,16 +595,36 @@ if [ "$START_SERVER" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
     fi
 fi
 
+# A spec_bench config has no server outside its own (BS, K) sweep, which starts
+# and stops one per cell, so there is none to keep for the evals. Checked here,
+# before the cleanup below kills whatever is serving.
+if [ "$BOOT_SERVER" = "1" ] && [ "$RUN_BENCH_SERVE" = "0" ] && [ "$CONFIG_BENCHMARK_MODE" = "spec_bench" ]; then
+    echo "ERROR: $CONFIG_NAME is a spec_bench config and cannot run eval suites on a server this script starts. Point the evals at a running server with --host and --port or --base-url, or pass --skip-benchmark to use the one already on localhost:$PORT."
+    exit 1
+fi
+
 # The name clients put in their requests. Empty means the config's MODEL, which
-# is what a server this script starts, or one reached by --host, serves. Behind
-# --base-url a router may serve the model under another name, so there the
-# explicit flag wins, then the endpoint's own answer when it lists one model.
-# The endpoint is asked once, with no wait: the caller starts this script when
-# the endpoint is ready. A lookup that fails stops the run here (set -e), since
-# falling back to MODEL could send every request to a model that is not there.
+# is what a server this script starts serves. A server this run does not start
+# is asked for its /v1/models list first, once and with no wait (the caller
+# starts this script when the endpoint is ready), and the run stops here
+# (set -e) unless the name it would send is on that list: every request for
+# another name fails, and vllm bench serve still exits 0 with zeros. The name
+# is --served-model-name when given, else MODEL. Behind --base-url a router may
+# serve the model under another name, so there an endpoint that lists exactly
+# one model is sent that one.
 SERVED_MODEL="$SERVED_MODEL_NAME_CLI"
-if [ -z "$SERVED_MODEL" ] && [ "$BASE_URL_CLI_SET" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
-    SERVED_MODEL=$(python3 "$SCRIPT_DIR/endpoint_url.py" discover-model "$BASE_URL")
+if [ "$BOOT_SERVER" = "0" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
+    RESOLVE_ARGS=(--config-model "$CONFIG_MODEL")
+    if [ -n "$SERVED_MODEL_NAME_CLI" ]; then
+        RESOLVE_ARGS+=(--served-model-name "$SERVED_MODEL_NAME_CLI")
+    fi
+    if [ "$BASE_URL_CLI_SET" = "1" ]; then
+        RESOLVE_ARGS+=(--adopt-single-listed)
+    fi
+    SERVED_MODEL=$(python3 "$SCRIPT_DIR/endpoint_url.py" resolve-model "$BASE_URL" "${RESOLVE_ARGS[@]}")
+    if [ "$SERVED_MODEL" = "$CONFIG_MODEL" ]; then
+        SERVED_MODEL=""
+    fi
 fi
 
 # ========================================================
@@ -639,8 +674,8 @@ if [ -n "$SERVED_MODEL" ]; then
         echo "Sending requests for served model $SERVED_MODEL (config model: $MODEL)"
     fi
     MODEL="$SERVED_MODEL"
-elif [ "$BASE_URL_CLI_SET" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
-    echo "No single served model at $BASE_URL/v1/models and no --served-model-name; using the config's model $MODEL"
+elif [ "$BOOT_SERVER" = "0" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
+    echo "Sending requests for the config's model $MODEL, which $BASE_URL/v1/models lists"
 fi
 MMLU_PRO_DISABLE_MULTITURN_ARGS=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("mmlu_pro_disable_multiturn_args", False)).lower())' "$RESULTS_DIR/config.json")
 EXTRA_LM_EVAL_MODEL_ARGS=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("extra_lm_eval_model_args", ""))' "$RESULTS_DIR/config.json")
