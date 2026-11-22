@@ -362,13 +362,28 @@ def test_f32_conv_fused_matches_split_bitwise(T: int, wide_qkv: bool, conv_dtype
                 np.asarray(hid_fused).view(np.uint8),
                 np.asarray(hid_split).view(np.uint8),
             )
+            for k in ("kc", "vc", "conv"):
+                np.testing.assert_array_equal(
+                    np.asarray(st_fused[k]).view(np.uint8),
+                    np.asarray(st_split[k]).view(np.uint8),
+                    err_msg=f"mismatch on {k}",
+                )
+            np.testing.assert_allclose(
+                np.asarray(st_fused["rec"], np.float32),
+                np.asarray(st_split["rec"], np.float32),
+                rtol=2**-7,
+                atol=1e-4,
+            )
+            _non_rec_pool_bytes_equal(raw_fused, raw_split, lay, ex_split.R, ckpt)
         else:
             # On Intel XLA:CPU, batched `(B, QKV)`/`[CB, KD, VD]` split vs
-            # per-sequence `(1, QKV)`/`[1, KD, VD]` fused GDN conv+recurrence
-            # can differ by 1 `bf16` ULP, propagating to <= 4 `bf16` ULPs
-            # (`4 * 2**-7`) across `L=4`; allow `8 * 2**-7` (`2**-4`) on `hid`
-            # while keeping padded rows, KV, conv, and non-`rec` pool bytes
-            # bitwise (TPU bitwise coverage is in `test_fused_pool_io_tpu.py`).
+            # per-sequence `(1, QKV)`/`[1, KD, VD]` fused GDN recurrence can
+            # differ by 1 `bf16` ULP in layer 0. Later layers inherit it: up to
+            # 4 `bf16` ULPs on `hid`, `2**-10` on later-layer conv, `2**-11` on
+            # `rec`, and 1 fp8 ULP on the KV entry written at `pos`. Layer-0
+            # conv (written before the recurrence), padded rows and every KV
+            # entry other than the one written stay bitwise. TPU bitwise
+            # coverage is in `test_fused_pool_io_tpu.py`.
             np.testing.assert_array_equal(
                 np.asarray(mk.unfold(hid_fused, 2)[:, B:]).view(np.uint8),
                 np.asarray(mk.unfold(hid_split, 2)[:, B:]).view(np.uint8),
@@ -379,19 +394,40 @@ def test_f32_conv_fused_matches_split_bitwise(T: int, wide_qkv: bool, conv_dtype
                 rtol=8 * 2**-7,
                 atol=1e-3,
             )
-        for k in ("kc", "vc", "conv"):
             np.testing.assert_array_equal(
-                np.asarray(st_fused[k]).view(np.uint8),
-                np.asarray(st_split[k]).view(np.uint8),
-                err_msg=f"mismatch on {k}",
+                np.asarray(st_fused["conv"][:, 0]).view(np.uint8),
+                np.asarray(st_split["conv"][:, 0]).view(np.uint8),
             )
-        np.testing.assert_allclose(
-            np.asarray(st_fused["rec"], np.float32),
-            np.asarray(st_split["rec"], np.float32),
-            rtol=2**-7,
-            atol=1e-4,
-        )
-        _non_rec_pool_bytes_equal(raw_fused, raw_split, lay, ex_split.R, ckpt)
+            np.testing.assert_allclose(
+                np.asarray(st_fused["conv"], np.float32),
+                np.asarray(st_split["conv"], np.float32),
+                rtol=2**-4,
+                atol=2e-3,
+            )
+            np.testing.assert_allclose(
+                np.asarray(st_fused["rec"], np.float32),
+                np.asarray(st_split["rec"], np.float32),
+                rtol=2**-7,
+                atol=1e-3,
+            )
+            pos_np = np.asarray(pos, dtype=np.int32)
+            for k in ("kc", "vc"):
+                f_u8 = np.asarray(st_fused[k]).view(np.uint8)
+                s_u8 = np.asarray(st_split[k]).view(np.uint8)
+                for s_i in range(B):
+                    p0 = int(pos_np[s_i])
+                    np.testing.assert_array_equal(
+                        f_u8[:, :, s_i, :p0], s_u8[:, :, s_i, :p0]
+                    )
+                    np.testing.assert_array_equal(
+                        f_u8[:, :, s_i, p0 + 1 :], s_u8[:, :, s_i, p0 + 1 :]
+                    )
+                np.testing.assert_allclose(
+                    np.asarray(st_fused[k].astype(F32)),
+                    np.asarray(st_split[k].astype(F32)),
+                    rtol=0.15,
+                    atol=2.5e-2,
+                )
     else:
         # Causal `t == 0` (`f32` conv) outputs and layer-0 conv across all `T`
         # checkpoints are bit-exact on XLA:CPU; `t >= 1` tokens can inherit 1
