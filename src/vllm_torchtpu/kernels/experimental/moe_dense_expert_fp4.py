@@ -779,6 +779,9 @@ def dense_expert_moe_fp4(
     prefetch, replica_scratch = (local_ids.reshape(-1),), []
     if replica_groups:
         replica_count = replicas.shape[0] // 4
+        # The kernel derives the block size from a table of exactly
+        # replica_groups * R rows (unused rows name slot -1).
+        assert replica_count % replica_groups == 0, replicas.shape
         columns = replica_groups * (experts - replica_count // replica_groups)
         prefetch += (
             replicas.astype(jnp.int32),
