@@ -106,6 +106,25 @@ def write_caches(
     receive rows are rewritten. A request's tokens must be consecutive with
     consecutive positions. `max_num_seqs` bounds the requests in the batch
     (default: one per token)."""
+    targets, slots, max_runs = _write_args(targets, pages, pos, max_num_seqs)
+    return msa_write.write_runs(
+        targets, pages, slots, max_runs=max_runs, interpret=interpret
+    )
+
+
+def run_writes(
+    targets: Sequence[msa_write.Rows | msa_write.SlotValues],
+    pages: jax.Array,
+    pos: jax.Array,
+    *,
+    max_num_seqs: int | None = None,
+) -> msa_write.RunWrites:
+    """`write_caches`' writes, for a kernel that makes them itself."""
+    targets, slots, max_runs = _write_args(targets, pages, pos, max_num_seqs)
+    return msa_write.run_writes(targets, pages, slots, max_runs=max_runs)
+
+
+def _write_args(targets, pages, pos, max_num_seqs):
     num_tokens = pages.shape[0]
     block_size = page_size(targets[0].cache)
     max_runs = msa_write.max_write_runs(
@@ -119,9 +138,7 @@ def write_caches(
         else t._replace(rows=_cache_rows(t.cache, t.rows))
         for t in targets
     ]
-    return msa_write.write_runs(
-        targets, pages, pos % block_size, max_runs=max_runs, interpret=interpret
-    )
+    return targets, pos % block_size, max_runs
 
 
 def write_rows(
@@ -320,12 +337,10 @@ def _block_scores(
     scale_row=None,
     index_heads=1,
     token_rows=False,
-    select=None,
-    select_inputs=None,
 ):
     """`index_q` must already be rotated for a 4-bit cache; its rows fold
     `index_heads` heads per token (`block_score_options`); see
-    `msa_indexer.block_scores` for `token_rows` and `select`."""
+    `msa_indexer.block_scores` for `token_rows`."""
     return msa_indexer.block_scores(
         index_q,
         index_cache,
@@ -337,8 +352,6 @@ def _block_scores(
         scale_cache=scale_cache,
         scale_row=scale_row,
         token_rows=token_rows,
-        select=select,
-        select_inputs=select_inputs,
         interpret=interpret,
     )
 

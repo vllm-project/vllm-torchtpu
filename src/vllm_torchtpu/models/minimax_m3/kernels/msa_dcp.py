@@ -773,6 +773,27 @@ def _class_candidates(
     )
 
 
+def _written_pages(writes, seq_id, pos, max_num_seqs, block_size, dcp):
+    """Per request, the page its run writes, as the indexer reads its pages
+    (index ``j`` of its block-table row holds this rank's block ``j * dcp +
+    rank``, `owner_pages`), or -1; then the run's index (0 if none):
+    ``[2 * max_num_seqs]``. A decode request (at most a block of tokens)
+    writes at most one page per rank."""
+    num_runs, _, _, _, tok0 = writes.scalars
+    max_runs, num_tokens = tok0.shape[0], seq_id.shape[0]
+    tok0 = jnp.minimum(tok0, num_tokens - 1)
+    run = jnp.arange(max_runs, dtype=jnp.int32)
+    seq = jnp.where(run < num_runs[0], msa_indexer.lookup(seq_id, tok0), -1)
+    page = msa_indexer.lookup(pos, tok0) // block_size // dcp
+    mine = seq[None, :] == jnp.arange(max_num_seqs, dtype=jnp.int32)[:, None]
+    return jnp.concatenate(
+        [
+            jnp.max(jnp.where(mine, page[None, :], -1), axis=1),
+            jnp.max(jnp.where(mine, run[None, :], 0), axis=1),
+        ]
+    )
+
+
 def msa_write_and_candidates_dcp(
     k: jax.Array,
     v: jax.Array,
@@ -824,6 +845,41 @@ def msa_write_and_candidates_dcp(
     )
     fp4 = scale_cache is not None
     scale_row = msa_fp4.index_scale_row(num_heads) if fp4 else None
+    local_lens = local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp)
+    decode = not msa_indexer.is_prefill_step(num_heads * num_tokens, max_num_seqs)
+    if num_heads == 1 and not fp4 and decode:
+        plan = msa_indexer.class_plan(
+            index_q,
+            index_cache,
+            local_lens,
+            block_tables,
+            cu_q_lens,
+            distribution[2],
+            **msa.block_score_options(),
+            interpret=interpret,
+        )
+        if plan.selects:
+            # A decode step: one kernel writes, scores and picks.
+            kv_rows = jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1)
+            writes = msa.run_writes(
+                [
+                    msa_write.Rows(kv_cache, kv_rows),
+                    msa_write.Rows(index_cache, index_k),
+                ],
+                pages,
+                pos,
+                max_num_seqs=max_num_seqs,
+            )
+            pick = _PackedPick(block_size, topk, init_blocks, local_blocks, dcp)
+            selected = plan.small(
+                select=msa_indexer.RowSelect(pick, 2 * topk, _PICK_WIDTH_STEP),
+                select_inputs=(pos, rank),
+                writes=(
+                    writes,
+                    _written_pages(writes, seq_id, pos, max_num_seqs, block_size, dcp),
+                ),
+            )
+            return (*selected.caches, selected.rows)
     if fp4:
         kv_cache, index_cache, scale_cache = msa.write_fp4(
             kv_cache,
@@ -847,7 +903,6 @@ def msa_write_and_candidates_dcp(
             max_num_seqs=max_num_seqs,
             interpret=interpret,
         )
-    local_lens = local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp)
     candidates = functools.partial(
         local_candidates,
         block_size=block_size,
@@ -877,7 +932,6 @@ def msa_write_and_candidates_dcp(
             return kv_cache, index_cache, scale_cache, packed
         return kv_cache, index_cache, packed
     if num_heads == 1:
-        pick = _PackedPick(block_size, topk, init_blocks, local_blocks, dcp)
         scores = msa._block_scores(
             index_q,
             index_cache,
@@ -888,8 +942,6 @@ def msa_write_and_candidates_dcp(
             interpret,
             scale_cache,
             scale_row,
-            select=msa_indexer.RowSelect(pick, 2 * topk, _PICK_WIDTH_STEP),
-            select_inputs=(pos, rank),
         )
     else:
         # All heads in one pass over this rank's index pages: [G, T, P],
@@ -906,10 +958,6 @@ def msa_write_and_candidates_dcp(
             scale_cache=scale_cache,
             scale_row=scale_row,
         ).reshape(num_heads * num_tokens, 1, -1)
-    if isinstance(scores, msa_indexer.Selected):  # one head: [T, 2 * topk]
-        if fp4:
-            return kv_cache, index_cache, scale_cache, scores.rows
-        return kv_cache, index_cache, scores.rows
     cand_scores, cand_blocks = candidates(scores, jnp.tile(pos, num_heads))
     packed = pack_candidates(cand_scores, cand_blocks)  # [G * T, 2 * topk]
     packed = packed.reshape(num_heads, num_tokens, -1).transpose(1, 0, 2)

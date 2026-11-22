@@ -25,7 +25,8 @@ flight.
 """
 
 import functools
-from collections.abc import Sequence
+import math
+from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
 import jax
@@ -81,22 +82,34 @@ class _ValuesSpec(NamedTuple):
     num_values: int  # lanes [0, num_values) of the lane values
 
 
-def _kernel(
-    # Scalar prefetch
-    num_runs_ref,  # [1]
-    run_page_ref,  # [R] page of each run
-    run_lo_ref,  # [R] first slot of each run within its page
-    run_hi_ref,  # [R] one past the last slot
-    run_tok0_ref,  # [R] first token of each run
-    *refs,
-    specs: tuple,
-    page_size: int,
-    num_tokens: int,
-    has_lanes: bool,
-):
-    """In (HBM): each `Rows` target's rows ``[T, W]`` as unsigned ints of its
-    slot width (8 bits for 4-bit slots), the lane values ``[T, 128]`` (if
-    any), then the caches; out: the caches, aliased.
+class _Layout(NamedTuple):
+    """The statics of a `write_runs` call: its targets' specs, slots per page,
+    padded batch rows and whether it carries lane values."""
+
+    specs: tuple
+    page_size: int
+    num_tokens: int
+    has_lanes: bool
+
+    @property
+    def num_rows(self) -> int:
+        return sum(isinstance(s, _RowsSpec) for s in self.specs)
+
+
+class _Pipe(NamedTuple):
+    """A run's copies and merge (`_pipe`): ``in_copies(r, slot)`` bring its
+    rows window and pages into buffer `slot`, ``merge(r, slot)`` writes its
+    rows into the pages there and ``out_copies(r, slot)`` send them back."""
+
+    in_copies: Callable
+    out_copies: Callable
+    merge: Callable
+    out_bufs: list  # each target's merged pages, [depth, ...] per buffer slot
+
+
+def _pipe(layout: _Layout, run_refs, words_hbm, lanes_hbm, caches, scratch) -> _Pipe:
+    """`_Pipe` over the run tables ``run_refs = (page, lo, hi, tok0)`` (SMEM),
+    the rows (and lane values) in HBM, the caches and `RunWrites.scratch`.
 
     A run's tokens ``tok0 + i`` take slots ``lo + i`` of its page: slot ``s``
     reads batch row ``tok0 - lo + s``. Each run copies in a window of
@@ -105,15 +118,11 @@ def _kernel(
     ``S`` of a ``[W / 128, 2S + window + 8, 128]`` staging buffer (Mosaic's
     strided loads need 32-bit 128-lane rows), so slot 0's row there is
     ``S + tok0 - lo - start`` >= 1."""
-    num_rows = sum(isinstance(s, _RowsSpec) for s in specs)
-    it = iter(refs)
-    words_hbm = [next(it) for _ in range(num_rows)]
-    lanes_hbm = next(it) if has_lanes else None
-    for _ in specs:  # the aliased inputs: `caches` below are the same buffers
-        next(it)
-    caches = [next(it) for _ in specs]
-    windows = [next(it) for _ in range(num_rows)]
-    staging = [next(it) for _ in range(num_rows)]
+    specs, page_size, num_tokens, has_lanes = layout
+    run_page_ref, run_lo_ref, run_hi_ref, run_tok0_ref = run_refs
+    it = iter(scratch)
+    windows = [next(it) for _ in range(layout.num_rows)]
+    staging = [next(it) for _ in range(layout.num_rows)]
     lane_window = next(it) if has_lanes else None
     in_bufs = [next(it) for _ in specs]
     out_bufs = [next(it) for _ in specs]
@@ -211,6 +220,37 @@ def _kernel(
                 words = jnp.where(take, bits[:, :width], words)
             out_buf.bitcast(jnp.uint32)[slot, :, 0, :] = words
 
+    return _Pipe(in_copies, out_copies, merge, out_bufs)
+
+
+def _kernel(
+    # Scalar prefetch
+    num_runs_ref,  # [1]
+    run_page_ref,  # [R] page of each run
+    run_lo_ref,  # [R] first slot of each run within its page
+    run_hi_ref,  # [R] one past the last slot
+    run_tok0_ref,  # [R] first token of each run
+    *refs,
+    layout: _Layout,
+):
+    """In (HBM): each `Rows` target's rows ``[T, W]`` as unsigned ints of its
+    slot width (8 bits for 4-bit slots), the lane values ``[T, 128]`` (if
+    any), then the caches; out: the caches, aliased; then `_pipe`'s scratch.
+    Runs flow through `_DEPTH` buffers."""
+    it = iter(refs)
+    words_hbm = [next(it) for _ in range(layout.num_rows)]
+    lanes_hbm = next(it) if layout.has_lanes else None
+    for _ in layout.specs:  # the aliased inputs: `caches` below are the same buffers
+        next(it)
+    caches = [next(it) for _ in layout.specs]
+    in_copies, out_copies, merge, _ = _pipe(
+        layout,
+        (run_page_ref, run_lo_ref, run_hi_ref, run_tok0_ref),
+        words_hbm,
+        lanes_hbm,
+        caches,
+        list(it),
+    )
     num_runs = num_runs_ref[0]
 
     def start(r, slot):
@@ -281,33 +321,78 @@ def _slot_words(target: Rows) -> tuple[jax.Array, _RowsSpec, int]:
     return words, spec, data_rows * 32 // bits
 
 
-def write_runs(
+class RunWrites(NamedTuple):
+    """`write_runs`' operands, for a kernel that writes the runs itself:
+    `scalars` (scalar prefetch: run count ``[1]``, each run's page, first and
+    end slot and first token), `inputs` (HBM: the rows as unsigned words, and
+    lane values), the `caches` (aliased in and out) and `layout`. In the
+    kernel, `scratch` shapes `pipe`'s buffers for `depth` runs at once."""
+
+    scalars: tuple
+    inputs: tuple
+    caches: tuple
+    layout: _Layout
+
+    def layout_only(self) -> "RunWrites":
+        """This with its arrays as shapes: what a kernel may close over."""
+        shapes = functools.partial(
+            jax.tree.map, lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype)
+        )
+        return RunWrites(
+            shapes(self.scalars), shapes(self.inputs), shapes(self.caches), self.layout
+        )
+
+    def scratch(self, depth: int) -> list:
+        page_size, num_rows = self.layout.page_size, self.layout.num_rows
+        words = self.inputs[:num_rows]
+        window = _window(page_size)
+        buffer_rows = 2 * page_size + window + 8
+        scratch = [pltpu.VMEM((depth, window) + w.shape[1:], w.dtype) for w in words]
+        scratch += [
+            pltpu.VMEM((w.shape[1] // _LANES, buffer_rows, _LANES), jnp.uint32)
+            for w in words
+        ]
+        if self.layout.has_lanes:
+            scratch.append(pltpu.VMEM((depth, buffer_rows, _LANES), jnp.uint32))
+        pages = [pltpu.VMEM((depth,) + c.shape[1:], c.dtype) for c in self.caches]
+        return scratch + pages + pages + [pltpu.SemaphoreType.DMA((depth,))] * 2
+
+    def scratch_bytes(self, depth: int) -> int:
+        page_size, num_rows = self.layout.page_size, self.layout.num_rows
+        window = _window(page_size)
+        buffer_rows = 2 * page_size + window + 8
+        total = sum(
+            (depth * window * w.dtype.itemsize + buffer_rows * 4) * w.shape[1]
+            for w in self.inputs[:num_rows]
+        )
+        total += depth * buffer_rows * _LANES * 4 * self.layout.has_lanes
+        return total + 2 * sum(
+            depth * math.prod(c.shape[1:]) * c.dtype.itemsize for c in self.caches
+        )
+
+    def pipe(self, run_refs, input_refs, cache_refs, scratch_refs) -> _Pipe:
+        """The kernel's `_Pipe`: ``run_refs`` = the scalars' run tables
+        (page, lo, hi, tok0), and the refs of `inputs`, `caches`, `scratch`."""
+        num_rows = self.layout.num_rows
+        lanes = input_refs[num_rows] if self.layout.has_lanes else None
+        return _pipe(
+            self.layout, run_refs, input_refs[:num_rows], lanes, cache_refs, scratch_refs
+        )
+
+
+def run_writes(
     targets: Sequence[Rows | SlotValues],
     pages: jax.Array,
     slots: jax.Array,
     *,
     max_runs: int,
-    interpret: bool = False,
-) -> list[jax.Array]:
-    """Write token ``t``'s rows / values of every target at ``(pages[t],
-    slots[t])`` of its cache; returns the caches in `targets` order.
-
-    The caches share the page geometry (same pages, slots per page). Tokens
-    with a page outside the caches are dropped. Consecutive tokens of a run
-    must take consecutive slots of one page, as a request's new tokens do;
-    a run boundary is wherever that breaks, and no two runs may share a page
-    (the kernel copies a run's page in while earlier runs' pages are still
-    being written back; tokens map to pages by whole blocks, so a request's
-    tokens in one page are one run).
-    `max_runs` bounds the number of runs (see `max_write_runs`).
-    """
+) -> RunWrites:
+    """`write_runs`' `RunWrites` (arguments as `write_runs`)."""
     num_tokens = pages.shape[0]
     num_pages = targets[0].cache.shape[0]
     if any(t.cache.shape[0] != num_pages for t in targets):
         raise ValueError("write_runs targets must share their pages")
-    num_runs, run_page, run_lo, run_hi, run_tok0 = token_runs(
-        pages, slots, num_pages, max_runs
-    )
+    runs = token_runs(pages, slots, num_pages, max_runs)
     words, specs, scale_lanes = [], [], []
     lane_values = None
     page_size = None
@@ -351,40 +436,48 @@ def write_runs(
         for i, bits in scale_lanes:
             lanes = jnp.where(lane == i, bits[:, None], lanes)
         inputs.append(jnp.pad(lanes, pad))
-    caches = [t.cache for t in targets]
-    buffer_rows = 2 * page_size + window + 8
-    scratch = [pltpu.VMEM((_DEPTH, window) + w.shape[1:], w.dtype) for w in words]
-    scratch += [
-        pltpu.VMEM((w.shape[1] // _LANES, buffer_rows, _LANES), jnp.uint32)
-        for w in words
-    ]
-    if has_lanes:
-        scratch.append(pltpu.VMEM((_DEPTH, buffer_rows, _LANES), jnp.uint32))
-    pages_scratch = [pltpu.VMEM((_DEPTH,) + c.shape[1:], c.dtype) for c in caches]
-    scratch += pages_scratch + pages_scratch
-    scratch += [pltpu.SemaphoreType.DMA((_DEPTH,))] * 2
-    vmem_bytes = sum(
-        (_DEPTH * window * w.dtype.itemsize + buffer_rows * 4) * w.shape[1]
-        for w in words
+    num_runs, *tables = runs
+    return RunWrites(
+        (num_runs[None], *tables),
+        tuple(inputs),
+        tuple(t.cache for t in targets),
+        _Layout(tuple(specs), page_size, padded, has_lanes),
     )
-    vmem_bytes += _DEPTH * buffer_rows * _LANES * 4 * has_lanes
-    vmem_bytes += 2 * sum(_DEPTH * c[0].size * c.dtype.itemsize for c in caches)
+
+
+def write_runs(
+    targets: Sequence[Rows | SlotValues],
+    pages: jax.Array,
+    slots: jax.Array,
+    *,
+    max_runs: int,
+    interpret: bool = False,
+) -> list[jax.Array]:
+    """Write token ``t``'s rows / values of every target at ``(pages[t],
+    slots[t])`` of its cache; returns the caches in `targets` order.
+
+    The caches share the page geometry (same pages, slots per page). Tokens
+    with a page outside the caches are dropped. Consecutive tokens of a run
+    must take consecutive slots of one page, as a request's new tokens do;
+    a run boundary is wherever that breaks, and no two runs may share a page
+    (the kernel copies a run's page in while earlier runs' pages are still
+    being written back; tokens map to pages by whole blocks, so a request's
+    tokens in one page are one run).
+    `max_runs` bounds the number of runs (see `max_write_runs`).
+    """
+    writes = run_writes(targets, pages, slots, max_runs=max_runs)
+    caches = writes.caches
+    vmem_bytes = writes.scratch_bytes(_DEPTH)
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
-    first_cache = 5 + len(inputs)
+    first_cache = 5 + len(writes.inputs)
     return pl.pallas_call(
-        functools.partial(
-            _kernel,
-            specs=tuple(specs),
-            page_size=page_size,
-            num_tokens=padded,
-            has_lanes=has_lanes,
-        ),
+        functools.partial(_kernel, layout=writes.layout),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
             grid=(1,),
-            in_specs=[any_spec] * (len(inputs) + len(caches)),
+            in_specs=[any_spec] * (len(writes.inputs) + len(caches)),
             out_specs=[any_spec] * len(caches),
-            scratch_shapes=scratch,
+            scratch_shapes=writes.scratch(_DEPTH),
         ),
         out_shape=[jax.ShapeDtypeStruct(c.shape, c.dtype) for c in caches],
         input_output_aliases={first_cache + i: i for i in range(len(caches))},
@@ -394,7 +487,7 @@ def write_runs(
         ),
         interpret=interpret,
         name="minimax_m3_msa_write_runs",
-    )(num_runs[None], run_page, run_lo, run_hi, run_tok0, *inputs, *caches)
+    )(*writes.scalars, *writes.inputs, *caches)
 
 
 def token_runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int):

@@ -28,6 +28,7 @@ gathered back to ``[tokens, pages]``; the short (decode) requests' 128-page
 groups are lane-aligned either way and come out token-major.
 """
 
+import dataclasses
 import functools
 from collections.abc import Callable
 from typing import NamedTuple
@@ -37,7 +38,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4, msa_write
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
     check_page_dtype,
     unpack_page,
@@ -361,6 +362,8 @@ def _kernel_v3(
     *,
     transposed=False,
     store=None,
+    prologue=None,
+    on_pages=None,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -379,7 +382,11 @@ def _kernel_v3(
     int4 keys and one row of f32 slot scales (`_chunk_maxima_t`).
 
     `store(first, m)`, if given, takes each scored chunk's maxima ``m [Bq,
-    chunk]`` (pages ``first ..`` of the step's group) instead of `o_ref`.
+    chunk]`` (pages ``first ..`` of the step's group) instead of `o_ref`;
+    `prologue()` runs at the first step once its page copies are issued, and
+    `on_pages(slot, base)` once a step's pages are in ring slot `slot`
+    (``base``: the block-table entry of its first page), before they are
+    scored.
     """
     slots, pages_per_step, rows, head_dim = buf.shape
     ahead = slots - 1
@@ -446,6 +453,8 @@ def _kernel_v3(
         for k in range(ahead):
             start(*ahead_group(k), range(pages_per_step), k)
 
+    if prologue is not None:
+        pl.when(step == 0)(prologue)
     base, live = group(step)
     next_base, next_live = ahead_group(step + ahead)
     q_pair = _paired_query(q_ref[...].astype(jnp.bfloat16))
@@ -530,6 +539,8 @@ def _kernel_v3(
         request's last page (their scores are never read) and only issue
         their share of the ahead group's descriptors."""
         wait_pages(live, slot)
+        if on_pages is not None:
+            on_pages(slot, base)
         for c in range(num_chunks):
             pages = range(
                 min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
@@ -570,13 +581,55 @@ class RowSelect(NamedTuple):
 
 
 class Selected(NamedTuple):
-    """`block_scores` reduced by a `RowSelect`: ``rows [T, width]``."""
+    """`block_scores` reduced by a `RowSelect`: ``rows [T, width]``, and the
+    caches it wrote (its `writes`, in their order)."""
 
     rows: jax.Array
+    caches: tuple = ()
 
 
 # Token rows a `RowSelect` pick takes at once (a decode bucket's).
 _SELECT_ROWS = 128
+
+
+class _SelectMeta(NamedTuple):
+    """`_kernel_v3_select`'s scalars, views of its one SMEM operand
+    (`_select_meta`): each scalar-prefetch operand is its own copy before
+    the kernel starts."""
+
+    cu_q_lens: object  # [max_num_seqs + 1]
+    arg: object  # the pick's scalar
+    live_pages: object  # the most pages of a request in the class
+    num_runs: object  # `writes`' run count, its run tables (page, lo, hi, tok0)
+    runs: tuple
+    written_page: object  # per request: its written page's index in its row, or -1
+    written_run: object  # per request: the run writing it
+
+
+def _select_meta(cu_q_lens, arg, live_pages, writes=None):
+    """`_SelectMeta`'s int32 operand; `writes` = (`msa_write.RunWrites`, the
+    per-request written pages then runs ``[2 * max_num_seqs]``)."""
+    parts = [cu_q_lens, jnp.reshape(arg, (1,)), jnp.reshape(live_pages, (1,))]
+    if writes is not None:
+        parts += [*writes[0].scalars, writes[1]]
+    return jnp.concatenate([p.astype(jnp.int32) for p in parts])
+
+
+def _select_meta_views(ref, max_num_seqs, writes):
+    def take(start, size):
+        return ref.at[pl.ds(start, size)]
+
+    seqs = max_num_seqs
+    num_runs, runs, page, run = None, (), None, None
+    if writes is not None:
+        num_runs = ref[seqs + 3]
+        max_runs = writes.scalars[1].shape[0]
+        runs = tuple(take(seqs + 4 + i * max_runs, max_runs) for i in range(4))
+        written = seqs + 4 + 4 * max_runs
+        page, run = take(written, seqs), take(written + seqs, seqs)
+    return _SelectMeta(
+        take(0, seqs + 1), ref[seqs + 1], ref[seqs + 2], num_runs, runs, page, run
+    )
 
 
 def _kernel_v3_select(
@@ -585,29 +638,42 @@ def _kernel_v3_select(
     tile_seq_ref,
     block_tables_ref,
     seq_pages_ref,
-    select_ref,  # [max_num_seqs + 2] cu_q_lens, then the pick's scalar
-    # In
-    q_ref,  # [Bq, D]
-    cache_ref,  # left in HBM
-    pos_ref,  # [T, 1] absolute positions
-    # Out
-    o_ref,  # [T, width]
-    # Scratch
-    buf,
-    sems,
-    scores_ref,  # [page groups, T + Bq, pages_per_step] f32, token rows
-    *,
+    select_ref,  # `_select_meta`
+    *refs,
     select: RowSelect,
+    writes: msa_write.RunWrites | None = None,
 ):
     """`_kernel_v3` with token-major scores kept in VMEM, by page group and
     token row, then reduced by `select` at the last step: a separate kernel
-    reading them back cost a call and its row copies (~4 us per layer at
-    decode, flat in the batch: candidates of 8 to 48 tokens, twin
-    j-5928c8f0)."""
+    reading them back cost a call and its row copies.
+
+    With `writes` (its index-key cache the one scored), the kernel also
+    writes the step's tokens (`msa_write.write_runs`): their pages are read
+    and merged at the first step, beside the first page copies, and written
+    back while later steps score; a page that a step scores before its write
+    lands takes the merged copy. A separate write call waited out its page
+    copies' latency on its own (~2.3 us per layer at decode, twin
+    j-71e410b5).
+
+    Refs after the scalar prefetch: q ``[Bq, D]``, the index cache (HBM),
+    positions ``[T, 1]``, [`writes`' other caches' inputs and its inputs],
+    out ``[T, width]``, [`writes`' caches out], the page ring and its
+    semaphores, the scores ``[page groups, T + Bq, pages_per_step]`` f32,
+    [`writes`' scratch]."""
+    max_num_seqs = seq_pages_ref.shape[0]
+    meta = _select_meta_views(select_ref, max_num_seqs, writes)
+    it = iter(refs)
+    q_ref, cache_ref, pos_ref = next(it), next(it), next(it)
+    if writes is not None:
+        for _ in writes.caches[:-1]:  # aliased: written through the outputs
+            next(it)
+        input_refs = [next(it) for _ in writes.inputs]
+    o_ref = next(it)
+    cache_out_refs = [next(it) for _ in writes.caches] if writes is not None else []
+    buf, sems, scores_ref = next(it), next(it), next(it)
     groups, _, pages_per_step = scores_ref.shape
     block_q = q_ref.shape[0]
     num_tokens = o_ref.shape[0]
-    max_num_seqs = seq_pages_ref.shape[0]
     step = pl.program_id(0)
     entry = work_ref[step]
     info = tile_seq_ref[entry >> _TILE_SHIFT]
@@ -616,12 +682,47 @@ def _kernel_v3_select(
     rows = row0 + jax.lax.broadcasted_iota(jnp.int32, (block_q, 1), 0)
     # A tile's aligned start may hold the previous request's last rows, which
     # that request's own tile wrote: keep only this request's rows.
-    own = (rows >= select_ref[seq]) & (rows < select_ref[seq + 1])
+    own = (rows >= meta.cu_q_lens[seq]) & (rows < meta.cu_q_lens[seq + 1])
     tile = scores_ref.at[entry & _GROUP_MASK, pl.ds(row0, block_q)]
 
     def store(first, m):
         cols = pl.ds(first, m.shape[1])
         tile[:, cols] = jnp.where(own, m, tile[:, cols])
+
+    prologue = on_pages = None
+    if writes is not None:
+        # One buffer slot per run: every merged index page stays for `on_pages`.
+        pipe = writes.pipe(meta.runs, input_refs, cache_out_refs, list(it))
+        num_runs = meta.num_runs
+
+        def each_run(fn):
+            jax.lax.fori_loop(0, num_runs, lambda r, c: (fn(r), c)[1], 0)
+
+        def copies(kind, method):
+            return lambda r: [getattr(c, method)() for c in kind(r, r)]
+
+        pl.when(step == 0)(lambda: each_run(copies(pipe.in_copies, "start")))
+
+        def prologue():
+            def write(r):
+                for c in pipe.in_copies(r, r):
+                    c.wait()
+                pipe.merge(r, r)
+                for c in pipe.out_copies(r, r):
+                    c.start()
+
+            each_run(write)
+
+        merged_keys = pipe.out_bufs[-1].bitcast(jnp.uint32)
+
+        def on_pages(slot, base):
+            del base
+            g = meta.written_page[seq] - (entry & _GROUP_MASK) * pages_per_step
+
+            @pl.when((g >= 0) & (g < pages_per_step))
+            def _():
+                run = meta.written_run[seq]
+                buf[slot, pl.ds(g, 1)] = merged_keys[pl.ds(run, 1), :, 0, :]
 
     _kernel_v3(
         work_ref,
@@ -634,6 +735,8 @@ def _kernel_v3_select(
         buf,
         sems,
         store=store,
+        prologue=prologue,
+        on_pages=on_pages,
     )
 
     def pick(width):
@@ -643,23 +746,28 @@ def _kernel_v3_select(
                 [scores_ref[g, pl.ds(r0, n)] for g in range(width // pages_per_step)],
                 axis=1,
             )
-            o_ref[pl.ds(r0, n)] = select.pick(
-                s, pos_ref[pl.ds(r0, n)], select_ref[max_num_seqs + 1]
-            )
+            o_ref[pl.ds(r0, n)] = select.pick(s, pos_ref[pl.ds(r0, n)], meta.arg)
 
     @pl.when(step == pl.num_programs(0) - 1)
     def _select():
         # The narrowest width holding every request's pages.
-        most = jax.lax.fori_loop(
-            0, max_num_seqs, lambda i, m: jnp.maximum(m, seq_pages_ref[i]), 1
-        )
+        most = meta.live_pages
         widths = list(range(select.width_step, groups * pages_per_step, select.width_step))
         widths.append(groups * pages_per_step)
+        # Every count takes one width, none too: a step whose requests hold
+        # no page on this rank still writes its rows.
         for i, width in enumerate(widths):
-            fits = most > (widths[i - 1] if i else 0)
-            if width < widths[-1]:
-                fits = fits & (most <= width)
-            pl.when(fits)(functools.partial(pick, width))
+            bounds = ([most > widths[i - 1]] if i else []) + (
+                [most <= width] if width < widths[-1] else []
+            )
+            if not bounds:
+                pick(width)
+                continue
+            pl.when(functools.reduce(jnp.logical_and, bounds))(
+                functools.partial(pick, width)
+            )
+        if writes is not None:
+            each_run(copies(pipe.out_copies, "wait"))
 
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
@@ -735,6 +843,7 @@ def _class_scores(
     q_pad=None,
     select=None,
     select_inputs=None,
+    writes=None,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token (`ClassScores`); `token_major` (kernel v3) returns
@@ -742,7 +851,7 @@ def _class_scores(
     The query rows are padded by ``q_pad >= block_q`` rows (default
     `block_q`): classes sharing it share one padded copy. With a token-major
     `select` (`RowSelect`) and its ``(pos [T], arg)`` `select_inputs`, returns
-    `Selected` instead."""
+    `Selected` instead, having also written `writes` (`_kernel_v3_select`)."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
     page_size = _page_tokens(rows_per_page, index_cache.dtype)
@@ -866,52 +975,24 @@ def _class_scores(
         if select is not None:
             if not token_major:
                 raise NotImplementedError("a RowSelect needs token-major scores")
-            pos, arg = select_inputs
-            select_meta = jnp.concatenate(
-                [cu_q_lens.astype(jnp.int32), jnp.reshape(arg, (1,)).astype(jnp.int32)]
-            )
-            rows = pltpu.VMEM(
-                (num_groups_per_seq, num_tokens + block_q, pages_per_step), jnp.float32
-            )
-            return Selected(
-                pl.pallas_call(
-                    functools.partial(_kernel_v3_select, select=select),
-                    grid_spec=pltpu.PrefetchScalarGridSpec(
-                        num_scalar_prefetch=5,
-                        grid=grid_spec.grid,
-                        in_specs=[
-                            grid_spec.in_specs[0],
-                            pl.BlockSpec(memory_space=pl.ANY),
-                            pl.BlockSpec((num_tokens, 1), lambda *_: (0, 0)),
-                        ],
-                        out_specs=pl.BlockSpec(
-                            (num_tokens, select.width), lambda *_: (0, 0)
-                        ),
-                        scratch_shapes=[
-                            pltpu.VMEM(
-                                (_RING_SLOTS, pages_per_step, rows_per_page, head_dim),
-                                jnp.uint32,
-                            ),
-                            pltpu.SemaphoreType.DMA((_RING_SLOTS,)),
-                            rows,
-                        ],
-                    ),
-                    out_shape=jax.ShapeDtypeStruct(
-                        (num_tokens, select.width), jnp.float32
-                    ),
-                    compiler_params=params,
-                    interpret=interpret,
-                    name="minimax_m3_msa_block_select",
-                )(
-                    work,
-                    tile_info,
-                    block_tables,
-                    seq_pages,
-                    select_meta,
-                    q_rows,
-                    index_cache,
-                    pos.astype(jnp.int32)[:, None],
-                )
+            return _select_call(
+                select,
+                select_inputs,
+                writes,
+                (work, tile_info, block_tables, seq_pages),
+                q_rows,
+                index_cache,
+                cu_q_lens,
+                # The class's requests' most pages: slots past the batch keep
+                # earlier requests' lengths.
+                jnp.max(jnp.where(seq_in_class, seq_pages, 1)),
+                grid=grid_spec.grid,
+                q_spec=grid_spec.in_specs[0],
+                ring=(_RING_SLOTS, pages_per_step, rows_per_page, head_dim),
+                groups=num_groups_per_seq,
+                block_q=block_q,
+                params=params,
+                interpret=interpret,
             )
         scores_t = pl.pallas_call(
             functools.partial(_kernel_v3, transposed=token_major),
@@ -969,6 +1050,92 @@ def _class_scores(
     )
 
 
+def _select_call(
+    select,
+    select_inputs,
+    writes,
+    prefetch,
+    q_rows,
+    index_cache,
+    cu_q_lens,
+    live_pages,
+    *,
+    grid,
+    q_spec,
+    ring,
+    groups,
+    block_q,
+    params,
+    interpret,
+):
+    """The `_kernel_v3_select` call of `_class_scores` (`Selected`)."""
+    pos, arg = select_inputs
+    num_tokens = pos.shape[0]
+    select_meta = _select_meta(cu_q_lens, arg, live_pages, writes)
+    any_spec = pl.BlockSpec(memory_space=pl.ANY)
+    scratch = [
+        pltpu.VMEM(ring, jnp.uint32),
+        pltpu.SemaphoreType.DMA((ring[0],)),
+        pltpu.VMEM((groups, num_tokens + block_q, ring[1]), jnp.float32),
+    ]
+    write_inputs, aliases, cache_shapes = (), {}, []
+    vmem_bytes = 4 * (ring[0] * ring[1] * ring[2] * ring[3])
+    vmem_bytes += 4 * groups * (num_tokens + block_q) * ring[1]
+    if writes is not None:
+        writes = writes[0]
+        if writes.caches[-1] is not index_cache:
+            raise ValueError("the written caches must end with the scored one")
+        depth = writes.scalars[1].shape[0]  # one buffer slot per run
+        write_inputs = (*writes.caches[:-1], *writes.inputs)
+        scratch += writes.scratch(depth)
+        vmem_bytes += writes.scratch_bytes(depth)
+        cache_shapes = [jax.ShapeDtypeStruct(c.shape, c.dtype) for c in writes.caches]
+        # Operands: the prefetch, then q, the scored cache, pos, write_inputs.
+        q_at = len(prefetch) + 1
+        aliases = {q_at + 3 + i: 1 + i for i in range(len(writes.caches) - 1)}
+        aliases[q_at + 1] = len(writes.caches)
+    out = pl.pallas_call(
+        functools.partial(
+            _kernel_v3_select,
+            select=select,
+            writes=None if writes is None else writes.layout_only(),
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=len(prefetch) + 1,
+            grid=grid,
+            in_specs=[
+                q_spec,
+                any_spec,
+                pl.BlockSpec((num_tokens, 1), lambda *_: (0, 0)),
+                *[any_spec] * len(write_inputs),
+            ],
+            out_specs=[
+                pl.BlockSpec((num_tokens, select.width), lambda *_: (0, 0)),
+                *[any_spec] * len(cache_shapes),
+            ],
+            scratch_shapes=scratch,
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct((num_tokens, select.width), jnp.float32),
+            *cache_shapes,
+        ],
+        input_output_aliases=aliases,
+        compiler_params=dataclasses.replace(
+            params, vmem_limit_bytes=max(32 << 20, vmem_bytes + (16 << 20))
+        ),
+        interpret=interpret,
+        name="minimax_m3_msa_block_select",
+    )(
+        *prefetch,
+        select_meta,
+        q_rows,
+        index_cache,
+        pos.astype(jnp.int32)[:, None],
+        *write_inputs,
+    )
+    return Selected(out[0], tuple(out[1:]))
+
+
 class TokenRows(NamedTuple):
     """`block_scores` of a decode step left in the kernel's token-major
     rows: token ``t``'s scores are ``scores[rows[t]]``."""
@@ -989,6 +1156,12 @@ class _ClassPlan(NamedTuple):
     max_large: int
     is_large: jax.Array
     token_major: bool
+
+    @property
+    def selects(self) -> bool:
+        """Whether `small` takes a `RowSelect` (`_class_scores`): a step of
+        token-major small tiles only (a decode step)."""
+        return self.max_large == 0 and self.token_major
 
 
 def is_prefill_step(num_tokens: int, max_num_seqs: int) -> bool:
@@ -1130,7 +1303,6 @@ def class_plan(
         "scale_row",
         "transposed_tile_q",
         "token_rows",
-        "select",
         "interpret",
     ),
 )
@@ -1152,10 +1324,8 @@ def block_scores(
     scale_row: int | None = None,
     transposed_tile_q: int = _SMALL_TILE_Q_TRANSPOSED,
     token_rows: bool = False,
-    select: RowSelect | None = None,
-    select_inputs: tuple[jax.Array, jax.Array] | None = None,
     interpret: bool = False,
-) -> jax.Array | TokenRows | Selected:
+) -> jax.Array | TokenRows:
     """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
 
     Requests of at most `block_q` query tokens (decode, short chunks) are
@@ -1184,10 +1354,6 @@ def block_scores(
         the scores in the kernel's rows and each token's row, for a consumer
         that reads its rows itself (`msa_dcp.local_candidates`). Other steps
         return the gathered scores as without it.
-      select, select_inputs: on the steps `token_rows` applies to, reduce
-        each token's scores in the kernel instead (`RowSelect`, with ``(pos
-        [T] absolute positions, its scalar)``) and return `Selected`. Other
-        steps return the gathered scores.
     Pages past a token's own page hold scores of keys it must not see, and
     pages past its request's last page are not written; callers mask both.
     """
@@ -1212,8 +1378,6 @@ def block_scores(
     num_tokens = index_q.shape[0]
     max_num_seqs = seq_lens.shape[0]
     max_large, is_large, token_major = plan.max_large, plan.is_large, plan.token_major
-    if select is not None and max_large == 0 and token_major:
-        return plan.small(select=select, select_inputs=select_inputs)
     small, small_col, *_ = plan.small()
     # The classes may pad pages to different group multiples; pad to the wider.
     pages = max(small.shape[1 if token_major else 0], plan.large_pages)
