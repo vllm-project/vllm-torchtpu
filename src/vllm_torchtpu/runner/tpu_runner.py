@@ -9127,10 +9127,23 @@ class TPUModelRunner(GPUModelRunner):
                 topk_candidates,
                 self._sampler_candidates_only(topk_candidates),
             )
+            # VLLM_TPU_SAMPLER_LOGITS_BLOCKS: the step passes the mode as a
+            # static arg on every one-draw call, so warm that variant.
+            logits_blocks = (
+                self._sampler_logits_blocks() if envs.VLLM_TPU_VERIFY_ONE_DRAW else 0
+            )
             if fold_ro:
-                synchronize_tensors(fn(*args, self._num_reqs_tensor(1)))
+                if logits_blocks:
+                    synchronize_tensors(
+                        fn(*args, self._num_reqs_tensor(1), logits_blocks)
+                    )
+                else:
+                    synchronize_tensors(fn(*args, self._num_reqs_tensor(1)))
                 continue
-            synchronize_tensors(fn(*args))
+            if logits_blocks:
+                synchronize_tensors(fn(*args, None, logits_blocks))
+            else:
+                synchronize_tensors(fn(*args))
             if (
                 envs.VLLM_TPU_VERIFY_RO_INGRAPH
                 and envs.VLLM_TPU_VERIFY_ONE_DRAW
@@ -9147,11 +9160,19 @@ class TPUModelRunner(GPUModelRunner):
                         torch.zeros(sh, dtype=torch.int32, device=self.device)
                         for sh in shapes
                     ]
-                    synchronize_tensors(
-                        _verify_one_draw_ro_compiled(
+                    if logits_blocks:
+                        out = _verify_one_draw_ro_lb_compiled(
+                            scratch,
+                            groups,
+                            self._num_reqs_tensor(1),
+                            logits_blocks,
+                            *args,
+                        )
+                    else:
+                        out = _verify_one_draw_ro_compiled(
                             scratch, groups, self._num_reqs_tensor(1), *args
                         )
-                    )
+                    synchronize_tensors(out)
         if envs.VLLM_TPU_VERIFY_ONE_DRAW and not getattr(
             self, "_verify_one_draw_stream_checked", False
         ):
