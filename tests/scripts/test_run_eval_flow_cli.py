@@ -1957,20 +1957,32 @@ def test_json_schema_suite_fails_and_reports_each_invalid_response(
     assert "::error::Eval regression check failed for json_schema!" in proc.stdout
 
 
-def test_json_schema_suite_has_no_result_when_the_endpoint_answers_5xx(
-    flow, make_gateway
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    [
+        pytest.param(
+            (503, {"error": "overloaded"}),
+            "ERROR: HTTP 503 for case 'flat_json' sample '0': "
+            '{"error": "overloaded"}',
+            id="http_503",
+        ),
+        pytest.param(
+            (200, {"object": "error"}),
+            "ERROR: Request for case 'flat_json' sample '0' failed: "
+            "KeyError('choices')",
+            id="not_a_chat_completion",
+        ),
+    ],
+)
+def test_json_schema_suite_has_no_result_when_the_endpoint_cannot_be_evaluated(
+    flow, make_gateway, reply, error
 ):
-    gateway = make_gateway(
-        "", [_CONFIG_MODEL], chat_reply=lambda payload: (503, {"error": "overloaded"})
-    )
+    gateway = make_gateway("", [_CONFIG_MODEL], chat_reply=lambda payload: reply)
 
     proc = _run_json_schema(flow, gateway)
 
     assert proc.returncode == 1
-    assert (
-        "ERROR: HTTP 503 for case 'flat_json' sample '0': "
-        '{"error": "overloaded"}' in proc.stderr
-    )
+    assert error in proc.stderr
     assert "::error::eval_json_schema.py could not evaluate json_schema." in proc.stdout
     assert not (flow.results_dir / "results_json_schema.json").exists()
     assert not (flow.results_dir / "eval_check_json_schema.md").exists()
@@ -2054,11 +2066,14 @@ def test_missing_json_schema_task_config_fails_before_cleanup(flow):
     assert flow.argv("lm_eval") == []
 
 
-def test_eval_suites_all_includes_json_schema(flow):
-    flow.run(*flow.host_args, "--eval-suites", "all", "--perf-suites", "none")
+def test_eval_suites_all_runs_json_schema_after_the_other_suites(flow):
+    proc = flow.run(*flow.host_args, "--eval-suites", "all", "--perf-suites", "none")
 
     assert _json_schema_results(flow)["meta"]["total_trials"] == 28
     assert len(flow.server.chat_requests) == 28
+    assert proc.stdout.index("Running lm_eval for task: mbpp_plus_tpu") < (
+        proc.stdout.index("Running eval_json_schema.py for task: json_schema")
+    )
 
 
 def test_shipped_flat_json_config_gates_its_own_task_config(flow, make_gateway):

@@ -14,7 +14,8 @@
 """Tests for the schema validator and task config parser of eval_json_schema.py.
 
 The requests the client sends, the results file it writes and its gate are
-tested through ``run_eval_flow.sh`` in ``test_run_eval_flow_cli.py``.
+tested through ``run_eval_flow.sh`` in ``test_run_eval_flow_cli.py``, against
+an endpoint that answers. The last test here covers one that does not.
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
+import socket
+import subprocess
 import sys
 from typing import Any
 
@@ -355,3 +358,33 @@ def test_load_cases_rejects_a_malformed_task_config(tmp_path, config, message):
         eval_json_schema.load_cases(path)
 
     assert message in str(excinfo.value)
+
+
+def test_cli_exits_1_without_a_results_file_when_nothing_is_listening(tmp_path):
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    output = tmp_path / "results_json_schema.json"
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPT),
+            "--base-url",
+            f"http://127.0.0.1:{port}",
+            "--model",
+            "any-model",
+            "--task-config",
+            str(_write_task_config(tmp_path, {"cases": [_CASE]})),
+            "--output-json",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 1
+    (error_line,) = proc.stderr.splitlines()
+    assert error_line.startswith("ERROR: Request for case 'case' sample '0' failed: ")
+    assert "Connection refused" in error_line
+    assert not output.exists()
