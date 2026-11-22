@@ -362,8 +362,11 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     # bitwise vs the dense loop, tests/megakernel/test_moe_rowbucket.py). No-op up to 16 rows.
     if envs.VLLM_TPU_MK_ROW_BUCKET:
         t = t.with_blocks({"moe": {"row_bucket": True}})
-    # VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC: vectorized routed-expert dedup (exact; envs.py).
-    if envs.VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC:
+    # VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC: vectorized routed-expert dedup (exact; envs.py), from
+    # 8 rows up. exos j-ae327ec3 (C groups, ctx 100K, hash identical): MK -35/-85/-135/-188 us
+    # per call at c32 b16/b32/b48/b64, -5/-33 at c16 b8/b16; b4 +8 (the ~20 us fixed vector
+    # cost over 45 layers exceeds the 11 us scalar loop), so b4 keeps the scalar loop.
+    if envs.VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC and B >= 8:
         t = t.with_blocks({"moe": {"dedup_vec": True}})
     # VLLM_TPU_MK_BUCKET_TUNE: per-bucket core / block knobs (BUCKET_TUNE, by row bucket).
     if envs.VLLM_TPU_MK_BUCKET_TUNE:
