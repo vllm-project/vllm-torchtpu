@@ -16,7 +16,9 @@
 # It serves the Qwen3.5 MoE architectures only (gdn_kernel_wrapper in
 # layers/core/gdn_attention.py picks it); every other model keeps kernels/gdn/v3.
 # Changes to kernels/gdn/v3 are not picked up automatically.
-# Changes from the source: none.
+# Changes from the source:
+# - chunked_gdn_per_seq computes (beta k) k^T as diag(beta) (k k^T), one dot
+#   per kq head, at config.SHARED_KKT_SHAPES only.
 
 import jax
 import jax.numpy as jnp
@@ -170,12 +172,26 @@ def chunked_gdn_per_seq(
     k_beta_repeat = k_repeat * beta_large
 
     # [num_v_heads, chunk, chunk]
-    beta_k_k_t = jax.lax.dot(
-        k_beta_repeat,
-        k_repeat,
-        dimension_numbers=(((2,), (2,)), ((0,), (0,))),
-        preferred_element_type=jnp.float32,
-    ).astype(cfg.dtypes.compute)
+    if cfg.shared_kkt:
+        # (beta k) k^T = diag(beta) (k k^T): one dot per kq head, the rows
+        # scaled per value head.
+        kk_t = jax.lax.dot(
+            k_large,
+            k_large,
+            dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+            preferred_element_type=jnp.float32,
+        )
+        beta_k_k_t = jnp.repeat(
+            kk_t.astype(cfg.dtypes.compute), cfg.v_per_kq_head, axis=0
+        )
+        beta_k_k_t = (beta_k_k_t * beta_large).astype(cfg.dtypes.compute)
+    else:
+        beta_k_k_t = jax.lax.dot(
+            k_beta_repeat,
+            k_repeat,
+            dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+            preferred_element_type=jnp.float32,
+        ).astype(cfg.dtypes.compute)
     gating_beta_k_k_t = gating_map_masked * beta_k_k_t
     t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
 
