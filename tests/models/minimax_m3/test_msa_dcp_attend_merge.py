@@ -247,7 +247,13 @@ def test_decode_plan_matches_xla(rank, q_lens, ctx_lens, num_tokens, pages_per_s
     )
     mine = (selected >= 0) & (selected % DCP == rank) & valid[:, None]
     keys = jnp.where(mine, seq_id[:, None] * pages_per_seq + selected // DCP, -1)
-    work, _ = msa_attention_lse._packed_work(keys[None], 8, pages_per_step)
+    work, _ = msa_attention_lse._packed_work(
+        keys[None],
+        8,
+        pages_per_step,
+        align=msa_attention_lse._merged_store_rows(8, 2 * HL, jnp.bfloat16),
+        most=msa_attention_lse._decode_tiles_per_step(8, False, 2 * HL, False),
+    )
     want = (keys, local_key[:, None], (pos % PAGE + 1)[:, None])
     for g, w in zip(got[:3], want, strict=True):
         np.testing.assert_array_equal(np.asarray(g), np.asarray(w))

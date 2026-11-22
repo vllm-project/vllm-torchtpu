@@ -1457,6 +1457,29 @@ def _attend_pair_decode(
     num_q_heads, num_tokens, _ = q_all.shape
     block_q = msa_attention.SMALL_BATCH_BLOCK_Q
     pages_per_step = _SMALL_BATCH_PAGES_PER_STEP
+    # Padding tokens (past the query starts: no keys) fill a grid step's
+    # output windows (`msa_attention_lse.token_multiple`).
+    pad = -num_tokens % msa_attention_lse.token_multiple(
+        num_tokens, block_q, num_q_heads, q_all.dtype, scale_cache is not None, False
+    )
+    if pad:
+        q_all = jnp.pad(q_all, ((0, 0), (0, pad), (0, 0)))
+        own, peer = (jnp.pad(x, ((0, pad), (0, 0))) for x in (own, peer))
+        out, lse = _attend_pair_decode(
+            q_all,
+            kv_cache,
+            own,
+            peer,
+            seq_lens,
+            block_tables,
+            cu_q_lens,
+            rank,
+            sm_scale=sm_scale,
+            topk=topk,
+            scale_cache=scale_cache,
+            interpret=interpret,
+        )
+        return out[:, :num_tokens], lse[:, :num_tokens]
     sections, _, tiles_per_step, groups_per_tile = msa_attention_lse.call_work_spec(
         num_tokens, num_q_heads, q_all.dtype, topk, block_q, pages_per_step
     )

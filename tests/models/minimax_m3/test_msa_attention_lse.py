@@ -14,6 +14,7 @@
 """MSA sparse attention with log-sum-exp (interpret mode) against a dense
 reference."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -425,6 +426,71 @@ def test_fp4_lse_wide_groups(
         0,
     )
     _check(got, want)
+
+
+@pytest.mark.parametrize("dtype", [*CACHE_DTYPES, "int4"])
+@pytest.mark.parametrize(
+    "num_tokens,num_real,pages_per_step,most_tiles",
+    [
+        (40, 30, 16, 64),  # one step of 5 tiles (padded to 6): a unit and singles
+        (56, 56, 16, 2),  # 2-tile steps: units shorter than DECODE_UNIT_GROUPS
+        (88, 61, 32, 4),  # padding tiles (no pages) beside wide groups
+        (8, 5, 16, 64),  # one tile, unpadded: the plain group loop
+        (64, 37, 16, 64),  # trailing padding tiles of a bucketed batch, alone
+        (32, 24, 32, 64),  # 3 tiles + 1 padding tile: a unit of the remainder
+    ],
+)
+def test_decode_units_match_reference(
+    num_tokens, num_real, pages_per_step, most_tiles, dtype, monkeypatch
+):
+    """8-token tiles of calls over several KV heads run in units of
+    `DECODE_UNIT_GROUPS` groups: group counts per step that are not
+    multiples of it, steps shorter than a unit and its remainder, units
+    holding padding tiles and tiles of several groups, and page copies
+    issued across steps and calls (`run_unit`'s count)."""
+    monkeypatch.setitem(globals(), "PAGES", 96)
+    monkeypatch.setitem(globals(), "TOPK", 16)
+    monkeypatch.setattr(msa_attention_lse, "UNIT_TILES_PER_STEP", most_tiles)
+    jax.clear_caches()
+    num_kv_heads = 2
+    rng = np.random.default_rng(num_tokens + pages_per_step)
+    fp4 = dtype == "int4"
+    q, kv_rows, kv, table, keys, local_key, local_limit = _inputs(
+        rng, num_tokens, num_real, num_kv_heads, jnp.bfloat16 if fp4 else dtype
+    )
+    extra = {}
+    if fp4:
+        kv, scales, kv_rows = _fp4_cache(rng, num_kv_heads)
+        extra = dict(scale_cache=jnp.asarray(scales))
+    got = msa_sparse_attention_lse_heads(
+        q,
+        kv,
+        jnp.asarray(keys),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        jnp.asarray(table),
+        sm_scale=SCALE,
+        block_q=8,
+        pages_per_step=pages_per_step,
+        interpret=True,
+        **extra,
+    )
+    jax.clear_caches()
+    q32 = np.asarray(q.astype(jnp.float32))
+    outs, lses = [], []
+    for h in range(num_kv_heads):
+        o, lse_h = _reference(
+            q32[:, h * Q_PER_KV : (h + 1) * Q_PER_KV],
+            kv_rows,
+            keys[:, h],
+            local_key,
+            local_limit,
+            table,
+            h,
+        )
+        outs.append(o)
+        lses.append(lse_h)
+    _check(got, (np.concatenate(outs, axis=1), np.concatenate(lses, axis=1)))
 
 
 @pytest.mark.parametrize("pages_per_step", [16, 32])
