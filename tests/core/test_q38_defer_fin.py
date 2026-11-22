@@ -266,6 +266,22 @@ def test_spin_condition_wrappers_note_first(fresh, monkeypatch):
     assert seen == ["note_wait", ("wait", 5), "note_read", "read"]
 
 
+def test_engine_core_logs_the_engagement_line_once_built(fresh, monkeypatch):
+    lines = []
+    monkeypatch.setattr(df.logger, "info", lambda fmt, *a: lines.append(fmt % a))
+    for owner, name in ((Scheduler, "_free_request_blocks"), (Scheduler, "update_from_output"), (Scheduler, "schedule"),
+                        (SpinCondition, "wait"), (SpinCondition, "record_read")):
+        monkeypatch.setattr(owner, name, owner.__dict__[name])
+    monkeypatch.setattr(EngineCoreProc, "__init__", lambda self, *a, **k: setattr(self, "input_queue", queue.Queue()))
+    df.patch_defer_fin()
+    lines.clear()
+    eng = object.__new__(EngineCoreProc)
+    EngineCoreProc.__init__(eng)
+    assert lines == ["DEFER_FIN engaged: finished requests freed in the engine core's waits "
+                     "(after 2.0 ms of a wait, at idle, or within 2 schedules; AB 0 ms)"]
+    assert getattr(eng.input_queue.get, df._PATCH_FLAG, False)
+
+
 def test_keys_are_registered_and_out_of_the_compile_key():
     assert all(k in envs.environment_variables for k in KEYS)
     src = pathlib.Path(df.__file__).parents[1] / "compilation" / "tpu_compiler.py"

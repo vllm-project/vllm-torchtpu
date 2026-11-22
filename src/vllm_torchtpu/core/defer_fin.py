@@ -225,6 +225,13 @@ def patch_defer_fin() -> None:
     def __init__(self, *args, **kwargs):
         init(self, *args, **kwargs)
         wrap_input_queue(self.input_queue)
+        # The engagement line: logged by the engine core process once its engine is built (patch-time lines are logged
+        # before its logging reaches the served log).
+        logger.info(
+            "DEFER_FIN engaged: finished requests freed in the engine core's waits "
+            "(after %.1f ms of a wait, at idle, or within %d schedules; AB %d ms)",
+            OPEN_AFTER_NS / 1e6, MAX_LAG, AB_MS,
+        )
 
     setattr(__init__, _PATCH_FLAG, True)
     __init__.__wrapped__ = init
