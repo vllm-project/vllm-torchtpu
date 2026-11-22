@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
     VLLM_TPU_QSA_PREFILL_QUERY_TILE: int = 0
+    VLLM_TPU_QSA_PREFILL_QPREP_FUSED: bool = False
     VLLM_TPU_QSA_PREFILL_Q128_FALLBACK: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_WALK: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT: int = 32768
@@ -1101,6 +1102,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_QUERY_TILE": env_nonnegative_int(
         "VLLM_TPU_QSA_PREFILL_QUERY_TILE", 0
     ),
+    # q38 PSTEP-QSAGLUE QPREP-FUSED (default off; NOT bitwise: the gemma_norm sum order): the prefill walk query (gemma_norm +
+    # main_rope) and the gate in one Pallas pass over qgate (qsa_qprep_fused.py), on steps of >= 1024 rows only; smaller
+    # steps (decode, verify) keep the XLA form byte for byte.
+    "VLLM_TPU_QSA_PREFILL_QPREP_FUSED": env_bool("VLLM_TPU_QSA_PREFILL_QPREP_FUSED", default=False),
     # Qwen4-exp QSA prefill on a TP1 stage's 3200-token pages: run token counts
     # that are a multiple of 128 but not of 256 (the 3200-token bucket) on the
     # paired Q128/KV512 kernel instead of the unpaired Q256/KV128 fallback.
