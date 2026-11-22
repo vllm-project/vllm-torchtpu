@@ -697,10 +697,9 @@ def _candidate_verify_tokens(
 
 
 @functools.cache
-def _candidate_verify_program(vocab_size: int, synthetic: bool):
-    """A non-greedy verify chunk sampled from per-shard candidates as one
-    program: the draw split, the operand gathers, the candidate op and the
-    rejection output."""
+def _candidate_verify_fn(vocab_size: int, synthetic: bool):
+    """A non-greedy verify chunk sampled from per-shard candidates: the draw
+    split, the operand gathers, the candidate op and the rejection output."""
     op = candidate_verify_op(vocab_size, synthetic)
 
     def candidate_verify(
@@ -746,7 +745,28 @@ def _candidate_verify_program(vocab_size: int, synthetic: bool):
             max_draft_tokens,
         )
 
-    return _static_shape_args(_tpu_compile(candidate_verify))
+    return candidate_verify
+
+
+@functools.cache
+def _candidate_verify_program(vocab_size: int, synthetic: bool):
+    """`_candidate_verify_fn` as one program."""
+    return _static_shape_args(_tpu_compile(_candidate_verify_fn(vocab_size, synthetic)))
+
+
+@functools.cache
+def _candidate_verify_ro_program(vocab_size: int, synthetic: bool):
+    """VLLM_TPU_CANDIDATE_VERIFY_RO: `_candidate_verify_fn` plus the
+    post-verify `_update_read_offsets_impl` scatter in one program (the
+    offsets are a function of the verify output only). Same ops."""
+    verify = _candidate_verify_fn(vocab_size, synthetic)
+
+    def candidate_verify_ro(read_offsets, groups, ro_num_reqs, *args):
+        out = verify(*args)
+        _update_read_offsets_impl(read_offsets, groups, out, ro_num_reqs)
+        return out
+
+    return _static_shape_args(_tpu_compile(candidate_verify_ro))
 
 
 def _reset_read_offsets(
@@ -6166,9 +6186,17 @@ class TPUModelRunner(GPUModelRunner):
         """
         assert md.draft_token_ids is not None, "deferred draft_token_ids never filled"
         if isinstance(logits, VocabShardLogits):
-            return self._sample_spec_verify_candidates(
-                logits.local, md, cur_start_idx, cur_end_idx, sampling_generator
+            read_offsets = self._candidate_read_offsets()
+            out = self._sample_spec_verify_candidates(
+                logits.local,
+                md,
+                cur_start_idx,
+                cur_end_idx,
+                sampling_generator,
+                read_offsets,
             )
+            self._fused_read_offsets_applied = read_offsets is not None
+            return out
         if top_tokens:
             assert self.rejection_sampler is not None
             assert self.speculative_config is not None
@@ -8568,6 +8596,29 @@ class TPUModelRunner(GPUModelRunner):
             warm_local, warm_md, 0, 0, self._get_sampling_generator()
         )
         synchronize_tensors(out)
+        if (
+            envs.VLLM_TPU_CANDIDATE_VERIFY_RO
+            and self.mamba_slot_read_offsets is not None
+        ):
+            # The slot-group shapes the staged walk produced at this width
+            # (recorded by the backbone warmup walks); scatter into a scratch
+            # copy so warmup leaves the live offsets untouched.
+            scratch = self.mamba_slot_read_offsets.clone()
+            width = bonus_logits_indices.shape[0]
+            for shapes in self.__dict__.get("_ro_group_shapes", {}).get(width, ()):
+                groups = [
+                    torch.zeros(sh, dtype=torch.int32, device=self.device)
+                    for sh in shapes
+                ]
+                out = self._sample_spec_verify_candidates(
+                    warm_local,
+                    warm_md,
+                    0,
+                    0,
+                    self._get_sampling_generator(),
+                    (scratch, groups, 1),
+                )
+                synchronize_tensors(out)
 
     def _precompile_verify_fused(
         self,
@@ -10589,11 +10640,14 @@ class TPUModelRunner(GPUModelRunner):
         cur_start_idx: int,
         cur_end_idx: int,
         sampling_generator: torch.Generator | None,
+        read_offsets: tuple | None = None,
     ) -> torch.Tensor:
         """`_sample_spec_verify_chunk` for a non-greedy step from this rank's
         logits shard: the same distributions, drawn over per-shard top-64
         candidates (layers/core/candidate_sampling.py); the draws differ
-        from the gathered-logits path."""
+        from the gathered-logits path. With `read_offsets` (see
+        `_candidate_read_offsets`) the program also scatters the chunk's
+        mamba read offsets."""
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
         assert self._candidate_bounds is not None
@@ -10629,7 +10683,7 @@ class TPUModelRunner(GPUModelRunner):
         )
         host_phases.mark("vfy_rand")
         synthetic = self.rejection_sampler.synthetic_mode
-        return _candidate_verify_program(head.org_vocab_size, synthetic)(
+        args = (
             local_logits,
             md.bonus_logits_indices,
             md.target_logits_indices,
@@ -10646,6 +10700,33 @@ class TPUModelRunner(GPUModelRunner):
             width,
             self.speculative_config.num_speculative_tokens,
         )
+        if read_offsets is not None:
+            # VLLM_TPU_CANDIDATE_VERIFY_RO: the read-offset scatter in the
+            # verify program; `read_offsets` is (buffer, slot groups, rows).
+            buffer, groups, rows = read_offsets
+            logger.info_once(
+                "CANDIDATE_VERIFY_RO: candidate verify and the read-offset "
+                "scatter in one program"
+            )
+            return _candidate_verify_ro_program(head.org_vocab_size, synthetic)(
+                buffer, list(groups), self._num_reqs_tensor(rows), *args
+            )
+        return _candidate_verify_program(head.org_vocab_size, synthetic)(*args)
+
+    def _candidate_read_offsets(self) -> tuple | None:
+        """VLLM_TPU_CANDIDATE_VERIFY_RO: (read-offset buffer, slot groups,
+        rows) for this verify chunk's in-program scatter, or None to scatter
+        after it (`_update_mamba_slot_read_offsets`)."""
+        groups, rows = self._fused_read_offsets
+        if (
+            not envs.VLLM_TPU_CANDIDATE_VERIFY_RO
+            or not envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
+            or self.mamba_slot_read_offsets is None
+            or self.mamba_slot_read_offsets.device.type != "tpu"
+            or not groups
+        ):
+            return None
+        return self.mamba_slot_read_offsets, groups, rows
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_top_tokens(

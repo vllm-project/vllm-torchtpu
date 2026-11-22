@@ -401,3 +401,78 @@ def test_runner_operands_and_output_match_separate_ops(synthetic):
         accepted[0], recovered[0], draft, num_draft, bonus[0], segment, group, k
     )
     assert torch.equal(out, ref)
+
+
+def test_candidate_verify_ro_program_scatters_after_verify(monkeypatch):
+    """VLLM_TPU_CANDIDATE_VERIFY_RO: the fused program returns the verify
+    output and leaves the read offsets as `_update_read_offsets_impl` does."""
+    from vllm_torchtpu.runner import tpu_runner as tr
+
+    next_tokens = torch.tensor(
+        [[5, 6, -1, -1], [7, -1, -1, -1], [1, 2, 3, 4]], dtype=torch.int32
+    )
+    monkeypatch.setattr(tr, "_tpu_compile", lambda fn: fn)
+    monkeypatch.setattr(tr, "candidate_verify_op", lambda *a: lambda *ops: ops)
+    monkeypatch.setattr(tr, "_candidate_verify_operands", lambda *a: ())
+    monkeypatch.setattr(tr, "_candidate_verify_tokens", lambda *a: next_tokens)
+    tr._candidate_verify_fn.cache_clear()
+    tr._candidate_verify_ro_program.cache_clear()
+    try:
+        groups = [
+            torch.tensor([3, 1, 0, 0], dtype=torch.int32),
+            torch.tensor([6, 2, 0, 0], dtype=torch.int32),
+        ]
+        got = torch.full((8,), 9, dtype=torch.int32)
+        want = got.clone()
+        num_reqs = torch.tensor(2)
+        args = (None,) * 13 + (2, 3)
+        out = tr._candidate_verify_ro_program(100, False)(got, groups, num_reqs, *args)
+        assert out is next_tokens
+        tr._update_read_offsets_impl(want, groups, next_tokens, num_reqs)
+        assert torch.equal(got, want)
+        assert got.tolist() == [0, 0, 0, 1, 9, 9, 1, 9]
+    finally:
+        tr._candidate_verify_fn.cache_clear()
+        tr._candidate_verify_ro_program.cache_clear()
+
+
+def test_candidate_chunk_folds_read_offsets_only_when_switched_on(monkeypatch):
+    """The verify chunk hands the read offsets to the candidate program (and
+    marks them applied) only with VLLM_TPU_CANDIDATE_VERIFY_RO, a device
+    offset buffer and slot groups; otherwise the separate scatter runs."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter.sample.candidate_sampling import (
+        VocabShardLogits,
+    )
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    tpu_buffer = types.SimpleNamespace(device=types.SimpleNamespace(type="tpu"))
+    cpu_buffer = types.SimpleNamespace(device=types.SimpleNamespace(type="cpu"))
+    passed = []
+    md = types.SimpleNamespace(draft_token_ids=object())
+    cases = [
+        (False, tpu_buffer, ["g"], None),
+        (True, cpu_buffer, ["g"], None),
+        (True, tpu_buffer, None, None),
+        (True, tpu_buffer, ["g"], (tpu_buffer, ["g"], 2)),
+    ]
+    monkeypatch.setattr(envs, "VLLM_TPU_FUSED_READ_OFFSET_UPDATE", True, raising=False)
+    for flag, buffer, groups, expected in cases:
+        monkeypatch.setattr(envs, "VLLM_TPU_CANDIDATE_VERIFY_RO", flag, raising=False)
+        runner = types.SimpleNamespace(
+            mamba_slot_read_offsets=buffer,
+            _fused_read_offsets=(groups, 2),
+            _fused_read_offsets_applied=False,
+        )
+        runner._candidate_read_offsets = functools.partial(
+            TPUModelRunner._candidate_read_offsets, runner
+        )
+        runner._sample_spec_verify_candidates = (
+            lambda *a: passed.append(a[-1]) or "tokens"
+        )
+        out = TPUModelRunner._sample_spec_verify_chunk(
+            runner, VocabShardLogits(local="L"), md, None, None, 0, 2, False, None
+        )
+        assert out == "tokens"
+        assert passed[-1] == expected
+        assert runner._fused_read_offsets_applied is (expected is not None)
