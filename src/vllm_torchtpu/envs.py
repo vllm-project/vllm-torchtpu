@@ -161,6 +161,7 @@ if TYPE_CHECKING:
     TPU_SPEC_SYNTHETIC_FUSED_VERIFY: bool = False
     TPU_DSPARK_MARKOV_KERNEL: bool = True
     TPU_DSPARK_FUSED_MLP: str = "0"
+    TPU_DRAFT_DCP_PAIR_MERGE: bool = False
     TPU_SAMPLER_TOP_P_KERNEL: bool = True
     TPU_FP8_LM_HEAD: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
@@ -1201,6 +1202,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # call at decode rows (kernels/dspark_mlp.py; XLA above its row cap).
     # "ar" also folds the TP all-reduce after it into that call (needs the
     # Pallas all-reduce armed, TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES > 0).
+    # A DCP-sharded draft attention layer whose KV head spans two ranks
+    # merges the two partials in one Pallas exchange
+    # (kernels/collectives/pair_lse_merge.py) instead of cp_lse_ag_out_rs's
+    # all-gather + reduce-scatter. Needs the Pallas all-reduce armed.
+    "TPU_DRAFT_DCP_PAIR_MERGE": env_bool("TPU_DRAFT_DCP_PAIR_MERGE", default=False),
     "TPU_DSPARK_FUSED_MLP": env_with_choices(
         "TPU_DSPARK_FUSED_MLP", "0", ["0", "1", "ar"]
     ),

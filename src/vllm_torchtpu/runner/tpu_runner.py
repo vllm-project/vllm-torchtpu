@@ -6210,6 +6210,12 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.distributed import pallas_all_reduce
 
             pallas_all_reduce.arm(self.model_config.get_hidden_size(), self.device)
+        if envs.TPU_DRAFT_DCP_PAIR_MERGE and self._is_async_drafter:
+            from vllm_torchtpu.layers.adapter.cp_draft_attention import (
+                arm_pair_merge,
+            )
+
+            arm_pair_merge(self._async_drafter.draft_model)
         if envs.TPU_DSPARK_FUSED_MLP != "0" and self._is_async_drafter:
             from vllm_torchtpu.models.minimax_m3.dspark_mlp import arm_fused_mlp
 
