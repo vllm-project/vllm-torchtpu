@@ -22,6 +22,7 @@ lowering.
 
 import functools
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -346,3 +347,58 @@ def test_kept_own_candidates_comparison_catches_a_changed_selection():
     fault = candidates.at[0, 0, best].set(-1e9)
     got = msa_dcp.msa_attend_dcp(q, kv_cache, fault, *meta, own_first=True, **common)
     assert not np.array_equal(np.asarray(got[0]), np.asarray(want[0]))
+
+
+# Heads per rank 8 as served, 4 (an LSE block of fewer than 8 rows).
+@pytest.mark.parametrize("tokens, heads", [(8, 8), (48, 8), (384, 8), (24, 4)])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("rotated", [False, True])
+def test_merge_pair_matches_merge_partials(tokens, heads, rank, rotated):
+    """A pair's merge from this rank's partial and the other rank's packed
+    block equals `merge_partials` of both ranks' blocks in rank order, bit for
+    bit, rows no rank attended included."""
+    rng = np.random.default_rng(tokens + rank + 2 * rotated)
+    dim = 128
+    outs, lses = [], []
+    for _ in range(2):
+        lse = rng.standard_normal((2 * heads, tokens)).astype(np.float32) * 4
+        lse[:, ::7] = -np.inf  # this rank attended nothing for these tokens
+        out = rng.standard_normal((2 * heads, tokens, dim)).astype(np.float32)
+        out[:, ::7] = 0
+        outs.append(jnp.asarray(out, jnp.bfloat16))
+        lses.append(jnp.asarray(lse))
+    lses[1] = lses[1].at[:, ::14].set(-np.inf)  # neither rank: the output is 0
+    hadamard = (
+        jnp.asarray(rng.choice([-1.0, 1.0], (dim, dim)), jnp.bfloat16)
+        if rotated
+        else None
+    )
+    block = slice(rank * heads, (rank + 1) * heads)
+    parts = jnp.stack([o[block] for o in outs])
+    stacked = jnp.stack([x[block].T for x in lses])
+    want = msa_dcp.merge_partials(parts, stacked, hadamard, interpret=True)
+    bits = [jax.lax.bitcast_convert_type(x, jnp.uint32) for x in lses]
+    peer = msa_dcp._pack_partial(outs[1 - rank], bits[1 - rank], jnp.int32(rank))
+    got = msa_dcp.merge_pair(
+        outs[rank],
+        bits[rank],
+        peer,
+        jnp.asarray([rank], jnp.int32),
+        hadamard,
+        interpret=True,
+    )
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+@pytest.mark.parametrize("tokens", [8, 24])
+def test_attention_lse_bits_are_the_lse(tokens):
+    """`lse_bits` returns the LSEs' uint32 bits and the same partial."""
+    args, common = _attend_case(tokens, 1, False, seed=tokens)
+    want = msa_dcp.msa_attend_dcp(*args, own_first=True, **common)
+    got = msa_dcp.msa_attend_dcp(*args, own_first=True, lse_bits=True, **common)
+    np.testing.assert_array_equal(np.asarray(got[0]), np.asarray(want[0]))
+    assert got[1].dtype == jnp.uint32
+    np.testing.assert_array_equal(
+        np.asarray(got[1]),
+        np.asarray(jax.lax.bitcast_convert_type(want[1], jnp.uint32)),
+    )

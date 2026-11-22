@@ -1012,6 +1012,7 @@ def msa_attend_dcp(
     scale_cache: jax.Array | None = None,
     q_head_major: bool = False,
     own_first: bool = False,
+    lse_bits: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Second half of the DCP forward: attend over the selected blocks this
@@ -1031,7 +1032,9 @@ def msa_attend_dcp(
     leading axis (`ops.msa.merge_head_partials`), or the merge's all-to-all
     sends each rank its block (`attend_and_merge`). With `own_first`
     (``candidates[0]`` is this rank's) and one KV head, the page keys come
-    from this rank's kept candidates (`kept_own_candidates`).
+    from this rank's kept candidates (`kept_own_candidates`); with
+    `lse_bits` and one KV head, the lse comes as its uint32 bits
+    (`msa_attention_lse.msa_sparse_attention_lse`).
     """
     num_tokens = q.shape[1 if q_head_major else 0]
     rank = rank_array(rank)[0]
@@ -1087,6 +1090,7 @@ def msa_attend_dcp(
                 *args,
                 head=0,
                 head_major=True,
+                lse_bits=lse_bits,
                 **common,
                 **msa._fp4_attention_kwargs(scale_cache),
             )
@@ -1096,7 +1100,14 @@ def msa_attend_dcp(
         )
     if num_heads == 1:
         return msa_attention_lse.msa_sparse_attention_lse(
-            q, kv_cache, keys[:, 0], *args, head=0, head_major=True, **common
+            q,
+            kv_cache,
+            keys[:, 0],
+            *args,
+            head=0,
+            head_major=True,
+            lse_bits=lse_bits,
+            **common,
         )
     # One kernel for all the group's KV heads (the head is a kernel input).
     return msa_attention_lse.msa_sparse_attention_lse_heads(
@@ -1111,9 +1122,22 @@ def _merge_partials_kernel(lse_ref, parts_ref, *rest, rotated):
     """One token block of `merge_partials`: ``lse_ref [dcp, Bt, Hl]``,
     ``parts_ref [dcp, Hl, Bt, D]``, (``hadamard [D, D]``), ``o_ref [Bt,
     Hl * D]``."""
-    o_ref = rest[-1]
-    dcp, num_heads, _, head_dim = parts_ref.shape
-    lse = lse_ref[...]
+    dcp = parts_ref.shape[0]
+    _merge_rows(
+        lse_ref[...],
+        lambda r, h: parts_ref[r, h],
+        dcp,
+        rest[-1],
+        rest[0] if rotated else None,
+    )
+
+
+def _merge_rows(lse, part, dcp, o_ref, hadamard_ref):
+    """The LSE merge of ``dcp`` partials: ``lse [dcp, Bt, Hl]`` f32, ``part(r,
+    h)`` rank ``r``'s ``[Bt, D]`` partial of head ``h`` -> ``o_ref [Bt, Hl *
+    D]`` (unrotated by `hadamard_ref` if given)."""
+    num_heads = lse.shape[2]
+    head_dim = o_ref.shape[1] // num_heads
     # torch.logsumexp over the ranks; a token no rank attended (every lse
     # -inf) gets NaN weights, which the where below turns into zeros.
     peak = jnp.max(lse, axis=0)
@@ -1124,18 +1148,124 @@ def _merge_partials_kernel(lse_ref, parts_ref, *rest, rotated):
     for h in range(num_heads):
         merged = None
         for r in range(dcp):
-            w = jnp.broadcast_to(weight[r, :, h : h + 1], parts_ref.shape[2:])
+            p = part(r, h)
+            w = jnp.broadcast_to(weight[r, :, h : h + 1], p.shape)
             # A plain product: a rank that attended nothing for a token has
             # a zero partial (`msa_sparse_attention_lse`), never NaN, so no
             # select guards it (a compare and a select per element, ~20% of
             # the kernel's bundles).
-            term = parts_ref[r, h].astype(jnp.float32) * w
+            term = p.astype(jnp.float32) * w
             merged = term if merged is None else merged + term
         merged = merged.astype(o_ref.dtype)
-        if rotated:
-            merged = jnp.dot(merged, rest[0][...], preferred_element_type=jnp.float32)
+        if hadamard_ref is not None:
+            merged = jnp.dot(
+                merged, hadamard_ref[...], preferred_element_type=jnp.float32
+            )
             merged = (merged * (1.0 / head_dim)).astype(o_ref.dtype)
         o_ref[:, h * head_dim : (h + 1) * head_dim] = merged
+
+
+def _merge_pair_kernel(rank_ref, own_ref, lse_ref, peer_ref, *rest, rotated):
+    """One token block of `merge_pair`: this rank's partial of its heads
+    ``own_ref [Hl, Bt, D]``, the LSEs of both ranks' heads ``lse_ref [2 * Hl,
+    Bt]`` (its own are block ``rank``), the other rank's `_pack_partial`
+    ``peer_ref [Hl + 1, Bt, D]`` uint16, (``hadamard [D, D]``), ``o_ref [Bt,
+    Hl * D]``. The terms add in rank order, as `merge_partials` adds them."""
+    num_heads = own_ref.shape[0]
+    first = rank_ref[0] == 0  # this rank's terms come first
+    bits = peer_ref[num_heads].astype(jnp.int32)  # [Bt, D]
+    peer_lse = pltpu.bitcast(
+        (bits[:, :num_heads] << 16) | bits[:, num_heads : 2 * num_heads], jnp.float32
+    )  # [Bt, Hl]
+    lses = pltpu.bitcast(lse_ref[...], jnp.float32)
+    own_lse = jnp.where(first, lses[:num_heads], lses[num_heads:]).T
+    lse = jnp.stack(
+        [jnp.where(first, own_lse, peer_lse), jnp.where(first, peer_lse, own_lse)]
+    )
+
+    def part(r, h):
+        own, peer = own_ref[h], pltpu.bitcast(peer_ref[h], own_ref.dtype)
+        return jnp.where(first == (r == 0), own, peer)
+
+    _merge_rows(lse, part, 2, rest[-1], rest[0] if rotated else None)
+
+
+def _pack_partial(out: jax.Array, lse: jax.Array, block: jax.Array) -> jax.Array:
+    """Head block `block` of a head-major partial (``out [2 * Hl, T, D]``
+    16-bit, ``lse [2 * Hl, T]`` f32 as uint32 bits) as one ``[Hl + 1, T, D]``
+    uint16 buffer for one collective permute: its ``Hl`` heads' bits, then a
+    row of each token's ``Hl`` LSEs, high halves then low halves
+    (`_merge_pair_kernel`). As 16-bit integers: float copies may canonicalize
+    NaN or flush subnormal bit patterns (the LSE halves are arbitrary bits)."""
+    num_heads = out.shape[0] // 2
+    head_dim = out.shape[2]
+    if out.dtype.itemsize != 2 or 2 * num_heads > head_dim:
+        raise ValueError(
+            f"16-bit partials with 2 * heads <= head_dim, got {out.dtype} {out.shape}"
+        )
+    heads = jax.lax.dynamic_slice_in_dim(out, block * num_heads, num_heads)
+    words = jax.lax.bitcast_convert_type(heads, jnp.uint16)
+    lses = jax.lax.dynamic_slice_in_dim(lse, block * num_heads, num_heads).T
+    bits = jnp.concatenate([lses >> 16, lses & 0xFFFF], axis=1).astype(jnp.uint16)
+    bits = jnp.pad(bits, ((0, 0), (0, head_dim - 2 * num_heads)))
+    return jnp.concatenate([words, bits[None]])
+
+
+@functools.partial(jax.jit, static_argnames=("block_tokens", "interpret"))
+def merge_pair(
+    out: jax.Array,
+    lse: jax.Array,
+    peer: jax.Array,
+    rank: jax.Array,
+    hadamard: jax.Array | None = None,
+    *,
+    block_tokens: int = _PARTIALS_BLOCK_TOKENS,
+    interpret: bool = False,
+) -> jax.Array:
+    """`merge_partials` of a DCP pair, token-major ``[T, Hl * D]``: this
+    rank's head-major partial of both ranks' heads (``out [2 * Hl, T, D]``,
+    ``lse [2 * Hl, T]`` f32 as uint32 bits; its own heads are block
+    ``rank``) and the other
+    rank's `_pack_partial` of this rank's heads, ``peer [Hl + 1, T, D]``.
+    The kernel reads each operand as the permute and the attention left it:
+    no XLA op stacks the pair or unpacks the LSEs."""
+    two_heads, num_tokens, head_dim = out.shape
+    num_heads = two_heads // 2
+    block_t = max(1, min(num_tokens, block_tokens))
+    rotated = hadamard is not None
+    return pl.pallas_call(
+        functools.partial(_merge_pair_kernel, rotated=rotated),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(pl.cdiv(num_tokens, block_t),),
+            in_specs=[
+                pl.BlockSpec((num_heads, block_t, head_dim), lambda i, r: (r[0], i, 0)),
+                # Both ranks' heads: a block of Hl rows would need Hl % 8 == 0.
+                pl.BlockSpec((two_heads, block_t), lambda i, r: (0, i)),
+                pl.BlockSpec(
+                    (num_heads + 1, block_t, head_dim), lambda i, r: (0, i, 0)
+                ),
+                *(
+                    [pl.BlockSpec((head_dim, head_dim), lambda i, r: (0, 0))]
+                    if rotated
+                    else []
+                ),
+            ],
+            out_specs=pl.BlockSpec(
+                (block_t, num_heads * head_dim), lambda i, r: (i, 0)
+            ),
+        ),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, num_heads * head_dim), out.dtype),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_merge_pair",
+    )(
+        rank_array(rank),
+        out,
+        lse,
+        peer,
+        *([hadamard] if rotated else []),
+    )
 
 
 @functools.partial(jax.jit, static_argnames=("block_tokens", "interpret"))
@@ -1182,59 +1312,6 @@ def merge_partials(
     )(lse.astype(jnp.float32), parts, *([hadamard] if rotated else []))
 
 
-def all_to_all_by_permute(
-    x: jax.Array, rank: jax.Array, axis: str, dcp: int
-) -> jax.Array:
-    """`jax.lax.all_to_all` of ``x [dcp, ...]`` along its leading axis (block
-    ``d`` goes to rank ``d``; block ``s`` of the result came from rank
-    ``s``), by ``dcp - 1`` collective permutes (rank ``r`` gets rank ``r +
-    s``'s block from shift ``s``). For decode-sized blocks: each XLA
-    all-to-all costs its latency on the TensorCore (~1.3 us per layer at c4
-    decode, j-c71e5160)."""
-    out = jnp.zeros_like(x)
-    own = jax.lax.dynamic_index_in_dim(x, rank, 0, False)
-    out = jax.lax.dynamic_update_index_in_dim(out, own, rank, 0)
-    for shift in range(1, dcp):
-        perm = [(src, (src - shift) % dcp) for src in range(dcp)]
-        send = jax.lax.dynamic_index_in_dim(x, (rank - shift) % dcp, 0, False)
-        received = jax.lax.ppermute(send, axis, perm)
-        out = jax.lax.dynamic_update_index_in_dim(
-            out, received, (rank + shift) % dcp, 0
-        )
-    return out
-
-
-def _exchange_partials(
-    parts: jax.Array, lses: jax.Array, rank: jax.Array, axis: str, dcp: int
-) -> tuple[jax.Array, jax.Array]:
-    """`all_to_all_by_permute` of ``parts [dcp, Hl, T, D]`` and ``lses [dcp,
-    T, Hl]`` f32 in one set of permutes: the LSEs' bits ride as one more uint16
-    head row (a permute copies bytes; every permute start costs ~1 us on the
-    TensorCore at decode, c4 twin j-6bbe97e2)."""
-    num_ranks, num_heads, num_tokens, head_dim = parts.shape
-    if parts.dtype.itemsize != 2 or 2 * num_heads > head_dim:
-        raise ValueError(
-            f"16-bit partials with 2 * heads <= head_dim, got {parts.dtype} "
-            f"{parts.shape}"
-        )
-    # As 16-bit integers: float copies may canonicalize NaN or flush
-    # subnormal bit patterns (the LSE halves are arbitrary bits).
-    words = jax.lax.bitcast_convert_type(parts, jnp.uint16)
-    bits = jax.lax.bitcast_convert_type(lses, jnp.uint16)  # [dcp, T, Hl, 2]
-    bits = bits.reshape(num_ranks, 1, num_tokens, 2 * num_heads)
-    bits = jnp.pad(bits, ((0, 0), (0, 0), (0, 0), (0, head_dim - 2 * num_heads)))
-    both = all_to_all_by_permute(
-        jnp.concatenate([words, bits], axis=1), rank, axis, dcp
-    )
-    bits = both[:, num_heads, :, : 2 * num_heads].reshape(
-        num_ranks, num_tokens, num_heads, 2
-    )
-    return (
-        jax.lax.bitcast_convert_type(both[:, :num_heads], parts.dtype),
-        jax.lax.bitcast_convert_type(bits, lses.dtype),
-    )
-
-
 def _gather_heads(q: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Array:
     """The group's head-major query heads ``[dcp * Hl, T, D]`` from this
     rank's ``q [Hl, T, D]``. A pair swaps its halves by one collective
@@ -1274,10 +1351,11 @@ def attend_and_merge(
 
     The query heads and candidates are all-gathered, `msa_attend_dcp` runs
     over the group's heads, and each rank's head block of the partial and
-    its LSEs go to their owner by all-to-all for `merge_partials`. As XLA
-    collectives in one program they move the head-major buffers as laid out;
-    torch's all-to-all of them cost ~890 us per layer at 8K tokens (c4 twin,
-    j-c60806bf)."""
+    its LSEs go to their owner by all-to-all for `merge_partials`; a
+    decode-sized pair's by one permute of the other rank's block for
+    `merge_pair`. As XLA collectives in one program they move the head-major
+    buffers as laid out; torch's all-to-all of them cost ~890 us per layer at
+    8K tokens (c4 twin, j-c60806bf)."""
     num_heads, num_tokens, head_dim = q.shape
     rank = rank_array(rank)[0]
     q_all = _gather_heads(q, rank, axis, dcp)
@@ -1309,14 +1387,19 @@ def attend_and_merge(
         scale_cache=scale_cache,
         q_head_major=True,
         own_first=small,
+        lse_bits=small,
         interpret=interpret,
     )
+    if small:
+        # The other rank's heads go to it in one permute; ours stay where the
+        # attention wrote them.
+        peer = jax.lax.ppermute(
+            _pack_partial(out, lse, 1 - rank), axis, [(0, 1), (1, 0)]
+        )
+        return merge_pair(out, lse, peer, rank, hadamard, interpret=interpret)
     # Block r of each result came from rank r: its partial of this rank's heads.
     parts = out.reshape(dcp, num_heads, num_tokens, head_dim)
     lses = lse.reshape(dcp, num_heads, num_tokens).transpose(0, 2, 1)
-    if small:
-        parts, lses = _exchange_partials(parts, lses, rank, axis, dcp)
-    else:
-        parts = jax.lax.all_to_all(parts, axis, 0, 0, tiled=True)
-        lses = jax.lax.all_to_all(lses, axis, 0, 0, tiled=True)
+    parts = jax.lax.all_to_all(parts, axis, 0, 0, tiled=True)
+    lses = jax.lax.all_to_all(lses, axis, 0, 0, tiled=True)
     return merge_partials(parts, lses, hadamard, interpret=interpret)

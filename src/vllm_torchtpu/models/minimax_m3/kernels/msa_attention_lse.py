@@ -823,6 +823,7 @@ def _chunked_call(
     scale_rows=None,
     head_major=False,
     q_head_major=False,
+    lse_bits=False,
 ):
     """`_attention_call` per KV head and chunk of at most
     `MAX_TOKENS_PER_CALL` tokens (the work list lives in SMEM).
@@ -908,6 +909,9 @@ def _chunked_call(
     out, lse = out
     # lse [head blocks, tiles, 1, Hg * Bq] -> [T, G * Hg] (or head-major)
     num_blocks, num_tiles = lse.shape[:2]
+    if lse_bits:
+        # Before the relayout: XLA fuses its unit-dim drop into the bitcast.
+        lse = jax.lax.bitcast_convert_type(lse, jnp.uint32)
     if head_major:
         lse = lse.reshape(num_blocks, num_tiles, -1, block_q).transpose(0, 2, 1, 3)
         lse = lse.reshape(num_q_heads, num_tiles * block_q)
@@ -955,6 +959,7 @@ def _check_rows(kv_cache, head_dim, head=None):
         "interpret",
         "head_major",
         "q_head_major",
+        "lse_bits",
     ),
 )
 def msa_sparse_attention_lse(
@@ -975,6 +980,7 @@ def msa_sparse_attention_lse(
     interpret: bool = False,
     head_major: bool = False,
     q_head_major: bool = False,
+    lse_bits: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_attention.msa_sparse_attention` (kernel v2, page keys translated
     by `page_table`) returning ``(out [T, H, D], lse [T, H] f32)``.
@@ -986,6 +992,9 @@ def msa_sparse_attention_lse(
     A 4-bit cache takes its `scale_cache` (`msa_attention.msa_sparse_attention`).
     With `head_major`, the results come back head-major: ``out [H, T, D]``,
     ``lse [H, T]``; with `q_head_major`, q comes head-major, ``[H, T, D]``.
+    With `lse_bits`, the lse comes as its uint32 bits, for a consumer that
+    moves bits (a one-tile call's f32 relayout was a ~0.65 us reduce of its
+    own, bitcast first it fuses).
     """
     num_tokens, head_dim = selected.shape[0], q.shape[2]
     msa_attention.check_cache(kv_cache, scale_cache)
@@ -1009,6 +1018,7 @@ def msa_sparse_attention_lse(
         scale_rows=None if scale_cache is None else (k_scale_row, v_scale_row),
         head_major=head_major,
         q_head_major=q_head_major,
+        lse_bits=lse_bits,
     )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]
