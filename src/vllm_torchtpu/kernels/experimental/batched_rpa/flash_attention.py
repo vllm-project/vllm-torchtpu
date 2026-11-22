@@ -12,12 +12,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from typing import cast
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
 from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
+
+
+def vpu_diet_enabled() -> bool:
+    """Whether to take the score-tile VPU savings (scale folding, mask skip).
+
+    Always on; a function so tests can compare it with the plain path. Both
+    paths give the same bits: the mask skip is exact, and the scale is folded
+    into q only when `q_folded_scale` finds sm_scale and k_scale each a power
+    of two (sm_scale=1/16, k_scale=1 for head_dim 256). Any other scale takes
+    the plain path's multiplies, one factor at a time.
+    """
+    return True
+
+
+def _is_power_of_two(x: float) -> bool:
+    return x > 0.0 and math.isfinite(x) and math.frexp(x)[0] == 0.5
+
+
+def q_folded_scale(cfgs: configs.RpaConfigs) -> float | None:
+    """Returns the static qk scale if it can be folded into q exactly.
+
+    Scaling a bf16/f32 q by a power of two only changes its exponent, so
+    dot(q * s, k) is bit-identical to dot(q, k) * s while touching a
+    [TQ, head_dim] tile instead of the [TQ, bkv] f32 score tile. The plain
+    path multiplies the score tile by sm_scale and then by k_scale, rounding
+    after each, so the fold equals it only when each factor is a power of two
+    (a power-of-two product of two other factors does not round the same).
+    """
+    serve = cfgs.serve
+    if serve.scale_q is not None or serve.per_token_scale:
+        return None
+    if jnp.dtype(serve.dtype_q) not in (
+        jnp.dtype(jnp.bfloat16),
+        jnp.dtype(jnp.float32),
+    ):
+        return None
+    factors = [float(cfgs.model.sm_scale)]
+    if serve.scale_k is not None:
+        factors.append(float(serve.scale_k))
+    if not all(_is_power_of_two(f) for f in factors):
+        return None
+    return math.prod(factors)
 
 
 def flash_attention_qk_softmax(
@@ -28,13 +73,23 @@ def flash_attention_qk_softmax(
     l_prev: jax.Array,  # [KV, TQ, 128]
     is_last_k: SmemWrapper,  # [steps, B]
     *,
-    custom_mask: jax.Array,
+    custom_mask: jax.Array | None,
     cfgs: configs.RpaConfigs,
     bq_start: int,
     k_scale: jax.Array | float | None = None,  # [B, KV, S]
 ):
-    """Flash attention kernel."""
+    """Flash attention kernel.
+
+    `custom_mask=None` means every score in the tile is visible (the caller
+    proved the KV block lies entirely below the causal diagonal), so the
+    mask select is skipped.
+    """
     b, k_heads, tq, h_size = q.shape
+
+    diet = vpu_diet_enabled()
+    folded_scale = q_folded_scale(cfgs) if diet else None
+    if folded_scale is not None and folded_scale != 1.0:
+        q = q * jnp.asarray(folded_scale, dtype=q.dtype)
 
     if cfgs.serve.scale_q is not None:
         q = q / cfgs.serve.scale_q
@@ -63,11 +118,12 @@ def flash_attention_qk_softmax(
         )
     qk = qk.reshape(b, k_heads, tq, s)
 
-    qk *= cfgs.model.sm_scale
-    if cfgs.serve.scale_q is not None:
-        qk *= cfgs.serve.scale_q
-    if k_scale is not None:
-        qk *= k_scale
+    if folded_scale is None:
+        qk *= cfgs.model.sm_scale
+        if cfgs.serve.scale_q is not None:
+            qk *= cfgs.serve.scale_q
+        if k_scale is not None:
+            qk *= k_scale
 
     # We convert to the output dtype after scaling, because especially for very
     # low precision, we want to have 32-bit scale factors and do scaling in fp32.
@@ -76,11 +132,12 @@ def flash_attention_qk_softmax(
     if cfgs.model.soft_cap is not None:
         qk = cfgs.model.soft_cap * jnp.tanh(qk / cfgs.model.soft_cap)
 
-    qk_masked = []
-    for b_idx in range(cfgs.block.batch_size):
-        mask_b = custom_mask[b_idx]
-        qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
-    qk = jnp.stack(qk_masked, axis=0)
+    if custom_mask is not None:
+        qk_masked = []
+        for b_idx in range(cfgs.block.batch_size):
+            mask_b = custom_mask[b_idx]
+            qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
+        qk = jnp.stack(qk_masked, axis=0)
 
     m_curr = jnp.max(qk, axis=-1, keepdims=True)
 
@@ -129,7 +186,7 @@ def flash_attention_pv(
     step: jax.Array,
     is_last_k: SmemWrapper,  # [steps, B]
     cfgs: configs.RpaConfigs,
-    v_scale: jax.Array | None = None,  # [B, KV, S]
+    v_scale: jax.Array | float | None = None,  # [B, KV, S]
 ):
     """Flash attention kernel."""
     b, k_heads, tq, s = p.shape
@@ -139,7 +196,7 @@ def flash_attention_pv(
     # here for per-token and per-tensor scaling, unlike the qk matmul.
     if cfgs.serve.per_token_scale:
         assert v_scale is not None
-        v_sc = v_scale[:, :, jnp.newaxis, :]
+        v_sc = cast("jax.Array", v_scale)[:, :, jnp.newaxis, :]
         # We can scale p or v, and because p will be smaller especially for decode
         # workflows, we scale p to save some time.
         p = p.astype(v_sc.dtype) * v_sc
