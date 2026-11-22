@@ -991,9 +991,17 @@ def _synthetic_verify_rows(
     group_indices = group_indices.to(i32)
     num_draft_tokens = num_draft_tokens.to(i32)
 
-    accepted = (accept_u < synthetic_conditional_rates[group_indices]) & (
-        draft_token_ids >= 0
-    )
+    # Lookups by index (a table at [R] or [T] positions) run as one-hot masked
+    # reductions, which fuse: on TPU each gather of a few elements is a
+    # program step of its own (~1.2 us, serial here).
+    def lookup(table: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        slots = torch.arange(table.shape[0], dtype=i32, device=device)
+        one_hot = index.unsqueeze(1) == slots.unsqueeze(0)
+        picked = torch.where(one_hot, table.unsqueeze(0), 0)
+        return picked.sum(dim=1, dtype=table.dtype)
+
+    rates = lookup(synthetic_conditional_rates, group_indices)
+    accepted = (accept_u < rates) & (draft_token_ids >= 0)
     match_mask = segment_ids.to(i32).unsqueeze(0) == torch.arange(
         batch_size, dtype=i32, device=device
     ).unsqueeze(1)
@@ -1009,17 +1017,18 @@ def _synthetic_verify_rows(
         torch.where(rejected_slot, positions.unsqueeze(0), total_tokens), dim=1
     ).values
     any_rejected = first_rejected_pos < total_tokens
-    safe_pos = torch.clamp(first_rejected_pos, max=total_tokens - 1)
     accepted_count = torch.where(
-        any_rejected, group_indices[safe_pos], num_draft_tokens
+        any_rejected, lookup(group_indices, first_rejected_pos), num_draft_tokens
     )
     logits_row = torch.where(
         any_rejected,
-        target_logits_indices.to(i32)[safe_pos],
+        lookup(target_logits_indices.to(i32), first_rejected_pos),
         bonus_logits_indices.to(i32),
     )
-    rows = final_logits_indices[logits_row].to(i32)
-    recover_draft = torch.where(any_rejected, draft_token_ids[safe_pos], -1)
+    rows = lookup(final_logits_indices.to(i32), logits_row)
+    recover_draft = torch.where(
+        any_rejected, lookup(draft_token_ids, first_rejected_pos), -1
+    )
     return accepted_count, rows, recover_draft
 
 
