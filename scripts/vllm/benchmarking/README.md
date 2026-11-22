@@ -145,6 +145,43 @@ selected task or lacks an accuracy metric that another run has. A run may lack
 a standard error. The baseline then takes the median of the standard errors
 that the other runs reported.
 
+### Baseline freeze policy (`--mode update`)
+
+A baseline file is in one of two states, recorded in a top-level `_policy`
+block. A file without the block is in `development`.
+
+- `development`: the setup is still below its target. Anyone may update the
+  baseline.
+- `frozen`: the setup met its target. The gated values, the state, and the owner
+  change only when the same change adds a new `approval` record whose
+  `approver` is the `owner` named in the file before the change.
+
+```json
+{
+  "_policy": {
+    "state": "frozen",
+    "owner": "<GitHub handle>",
+    "approval": {
+      "approver": "<GitHub handle>",
+      "reference": "<URL of the PR or issue where the owner approved>"
+    }
+  },
+  "mmlu_pro": {"exact_match,custom-extract": 0.7664}
+}
+```
+
+`--mode update` checks a change to a baseline file against this rule. It exits
+`1` when a frozen baseline changed without approval and `2` when the `_policy`
+block is malformed.
+
+```bash
+git show origin/main:<baseline path> > /tmp/previous.baseline.json
+python3 scripts/vllm/benchmarking/check_regression.py \
+  --mode update \
+  --previous-baseline /tmp/previous.baseline.json \
+  --baseline <baseline path>
+```
+
 ## Accuracy Evaluation (`lm_eval`)
 
 ### Tasks

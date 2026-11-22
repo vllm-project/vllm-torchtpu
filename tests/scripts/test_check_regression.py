@@ -728,3 +728,170 @@ def test_cli_calibrate_eval_writes_median_of_selected_tasks(
     captured = capsys.readouterr()
     assert json.loads(captured.out) == expected_baseline
     assert captured.err == ""
+
+
+# --- Freeze policy: a frozen baseline changes only with owner approval ---
+
+_TASK = {"mmlu_pro": {"acc,none": 0.90}}
+_RAISED = {"mmlu_pro": {"acc,none": 0.93}}
+_FROZEN = {"state": "frozen", "owner": "alice"}
+_APPROVAL_1 = {"approver": "alice", "reference": "https://example.invalid/pull/1"}
+_APPROVAL_2 = {"approver": "alice", "reference": "https://example.invalid/pull/2"}
+_NO_APPROVAL = (
+    "frozen baseline changed without a new _policy.approval record from owner 'alice'"
+)
+_WRONG_APPROVER = (
+    "frozen baseline changed with approval from 'bob', but its owner is 'alice'"
+)
+
+
+def test_parse_policy_defaults_to_development():
+    assert check_regression.parse_policy(_TASK) == check_regression.BaselinePolicy(
+        state="development", owner=None, approval=None
+    )
+
+
+def test_parse_policy_frozen_with_approval():
+    policy = check_regression.parse_policy(
+        {"_policy": {**_FROZEN, "approval": _APPROVAL_1}}
+    )
+    assert policy == check_regression.BaselinePolicy(
+        state="frozen",
+        owner="alice",
+        approval=("alice", "https://example.invalid/pull/1"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("policy", "message"),
+    [
+        ("frozen", "_policy must be an object"),
+        ({"state": "golden"}, "_policy.state must be 'development' or 'frozen'"),
+        ({"state": "frozen"}, "_policy.owner must be a non-empty string"),
+        ({"state": "frozen", "owner": " "}, "_policy.owner must be a non-empty"),
+        ({"approval": "alice"}, "_policy.approval must be an object"),
+        (
+            {"approval": {"approver": "alice"}},
+            "_policy.approval.reference must be a non-empty string",
+        ),
+    ],
+)
+def test_parse_policy_rejects_malformed_block(policy, message):
+    with pytest.raises(ValueError, match=message):
+        check_regression.parse_policy({"_policy": policy})
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        # New file, and development baselines, change freely.
+        (None, _RAISED, None),
+        (_TASK, _RAISED, None),
+        ({**_TASK, "_policy": {"state": "development"}}, _RAISED, None),
+        # Freezing a development baseline needs no approval.
+        (_TASK, {**_RAISED, "_policy": _FROZEN}, None),
+        # A frozen baseline may change metadata, but not gated values.
+        (
+            {**_TASK, "_policy": _FROZEN},
+            {
+                **_TASK,
+                "_policy": _FROZEN,
+                "_source": {"url": "https://example.invalid"},
+            },
+            None,
+        ),
+        ({**_TASK, "_policy": _FROZEN}, {**_RAISED, "_policy": _FROZEN}, _NO_APPROVAL),
+        # Dropping the policy block or the task does not unfreeze it.
+        ({**_TASK, "_policy": _FROZEN}, _RAISED, _NO_APPROVAL),
+        ({**_TASK, "_policy": _FROZEN}, {"_policy": _FROZEN}, _NO_APPROVAL),
+        (
+            {**_TASK, "_policy": _FROZEN},
+            {**_TASK, "_policy": {"state": "development"}},
+            _NO_APPROVAL,
+        ),
+        # Handing the file to another owner is a change too.
+        (
+            {**_TASK, "_policy": _FROZEN},
+            {**_TASK, "_policy": {"state": "frozen", "owner": "bob"}},
+            _NO_APPROVAL,
+        ),
+        # An approval that was already in the old file does not count again.
+        (
+            {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            {**_RAISED, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            _NO_APPROVAL,
+        ),
+        (
+            {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            {**_RAISED, "_policy": {**_FROZEN, "approval": _APPROVAL_2}},
+            None,
+        ),
+        (
+            {**_TASK, "_policy": _FROZEN},
+            {
+                **_RAISED,
+                "_policy": {
+                    "state": "frozen",
+                    "owner": "bob",
+                    "approval": {
+                        "approver": "bob",
+                        "reference": "https://example.invalid/3",
+                    },
+                },
+            },
+            _WRONG_APPROVER,
+        ),
+    ],
+)
+def test_check_baseline_update(old, new, expected):
+    assert check_regression.check_baseline_update(old, new) == expected
+
+
+def test_cli_update_mode(tmp_path, monkeypatch, capsys):
+    old_file = tmp_path / "old.json"
+    new_file = tmp_path / "new.json"
+    old_file.write_text(json.dumps({**_TASK, "_policy": _FROZEN}))
+    new_file.write_text(json.dumps({**_RAISED, "_policy": _FROZEN}))
+    argv = ["--mode", "update", "--baseline", str(new_file)]
+
+    assert _run_cli(monkeypatch, *argv, "--previous-baseline", str(old_file)) == 1
+    assert f"FAILED: {new_file}: {_NO_APPROVAL}" in capsys.readouterr().err
+
+    # Without a previous file the same content is a new baseline.
+    assert _run_cli(monkeypatch, *argv) == 0
+
+    new_file.write_text(
+        json.dumps({**_RAISED, "_policy": {**_FROZEN, "approval": _APPROVAL_1}})
+    )
+    assert _run_cli(monkeypatch, *argv, "--previous-baseline", str(old_file)) == 0
+
+    new_file.write_text(json.dumps({**_RAISED, "_policy": {"state": "frozen"}}))
+    assert _run_cli(monkeypatch, *argv, "--previous-baseline", str(old_file)) == 2
+    assert "ERROR: _policy.owner must be a non-empty string" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("content", [None, "[]", "{not json"])
+def test_cli_update_mode_unreadable_file_exits_2(
+    tmp_path, monkeypatch, capsys, content
+):
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps(_TASK))
+    bad = tmp_path / "bad.json"
+    if content is not None:
+        bad.write_text(content)
+    for baseline, previous in ((bad, good), (good, bad)):
+        ret = _run_cli(
+            monkeypatch,
+            "--mode", "update", "--baseline", str(baseline),
+            "--previous-baseline", str(previous),
+        )  # fmt: skip
+        assert ret == 2
+        assert "ERROR: " in capsys.readouterr().err
+
+
+def test_shipped_baselines_have_valid_policy():
+    """Every checked-in perf and eval baseline parses under the policy schema."""
+    files = sorted(_BASELINE_DIR.parent.rglob("*.baseline.json"))
+    assert len(files) > 40
+    for path in files:
+        check_regression.parse_policy(json.loads(path.read_text()))

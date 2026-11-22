@@ -17,6 +17,7 @@
 Usage:
     check_regression.py --mode <perf|eval> --results-dir <dir> --baseline <baseline.json> [--tolerance 0.05]
     check_regression.py --mode <perf|eval> --calibrate --results-dir <dir> [<dir2> ...]
+    check_regression.py --mode update --baseline <new.json> [--previous-baseline <old.json>]
 """  # noqa: E501
 
 from __future__ import annotations
@@ -237,6 +238,115 @@ def calibrate_perf(
                 entry.pop("median_ttft_ms", None)
         baseline[key] = entry
     return baseline
+
+
+# Baseline files keep metadata under top-level keys that start with "_"; the
+# gates ignore them. The update policy lives under this one:
+#   "_policy": {
+#     "state": "development" | "frozen",   (absent block means development)
+#     "owner": "<handle>",                 (required when frozen)
+#     "approval": {"approver": "<handle>", "reference": "<PR or issue URL>"}
+#   }
+POLICY_KEY = "_policy"
+DEVELOPMENT = "development"
+FROZEN = "frozen"
+
+
+class Approval(NamedTuple):
+    approver: str
+    reference: str
+
+
+@dataclasses.dataclass(frozen=True)
+class BaselinePolicy:
+    """Who may change a baseline file, and whether it is frozen."""
+
+    state: str = DEVELOPMENT
+    owner: str | None = None
+    approval: Approval | None = None
+
+
+def _policy_str(block: dict, field: str, where: str) -> str:
+    value = block.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{where}.{field} must be a non-empty string")
+    return value
+
+
+def parse_policy(baseline: dict) -> BaselinePolicy:
+    """Read the `_policy` block; raise ValueError when it is malformed."""
+    raw = baseline.get(POLICY_KEY)
+    if raw is None:
+        return BaselinePolicy()
+    if not isinstance(raw, dict):
+        raise ValueError(f"{POLICY_KEY} must be an object")
+    state = raw.get("state", DEVELOPMENT)
+    if state not in (DEVELOPMENT, FROZEN):
+        raise ValueError(
+            f"{POLICY_KEY}.state must be {DEVELOPMENT!r} or {FROZEN!r}, got {state!r}"
+        )
+    owner = None
+    if state == FROZEN or "owner" in raw:
+        owner = _policy_str(raw, "owner", POLICY_KEY)
+    approval = None
+    if "approval" in raw:
+        block = raw["approval"]
+        where = f"{POLICY_KEY}.approval"
+        if not isinstance(block, dict):
+            raise ValueError(f"{where} must be an object")
+        approval = Approval(
+            _policy_str(block, "approver", where),
+            _policy_str(block, "reference", where),
+        )
+    return BaselinePolicy(state, owner, approval)
+
+
+def load_baseline_file(path: Path) -> dict:
+    """Read a baseline JSON file; raise ValueError when it is not an object."""
+    try:
+        baseline = json.loads(path.read_text())
+    except OSError as e:
+        raise ValueError(f"cannot read {path}: {e}") from e
+    if not isinstance(baseline, dict):
+        raise ValueError(f"{path} must hold a JSON object")
+    return baseline
+
+
+def gated_entries(baseline: dict) -> dict:
+    return {k: v for k, v in baseline.items() if not k.startswith("_")}
+
+
+def check_baseline_update(old: dict | None, new: dict) -> str | None:
+    """Return why replacing baseline `old` with `new` is not allowed, or None.
+
+    A development baseline (or a new file, `old` None) changes freely. A frozen
+    baseline changes its gated values, state, or owner only when `new` carries
+    an approval record that the old file did not have and whose approver is the
+    owner named in the old file.
+    """
+    new_policy = parse_policy(new)
+    if old is None:
+        return None
+    old_policy = parse_policy(old)
+    if old_policy.state != FROZEN:
+        return None
+    if gated_entries(old) == gated_entries(new) and (
+        new_policy.state,
+        new_policy.owner,
+    ) == (old_policy.state, old_policy.owner):
+        return None
+    approval = new_policy.approval
+    if approval is None or approval == old_policy.approval:
+        return (
+            "frozen baseline changed without a new "
+            f"{POLICY_KEY}.approval record from owner {old_policy.owner!r}"
+        )
+    if approval.approver != old_policy.owner:
+        return (
+            f"frozen baseline changed with approval from {approval.approver!r}, "
+            f"but its owner is {old_policy.owner!r}"
+        )
+    return None
 
 
 def find_eval_results_jsons(results_dir: Path) -> list[Path]:
@@ -488,19 +598,26 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=["perf", "eval"],
+        choices=["perf", "eval", "update"],
         required=True,
-        help="Mode of operation: perf or eval.",
+        help="perf or eval gate results against a baseline; update checks "
+        "that a baseline file change follows its freeze policy.",
     )
     parser.add_argument(
         "--results-dir",
         type=Path,
         action="append",
-        required=True,
+        default=[],
         help="Directory containing result files. Repeat for calibrate.",
     )
     parser.add_argument(
         "--baseline", type=Path, help="Baseline JSON to compare against."
+    )
+    parser.add_argument(
+        "--previous-baseline",
+        type=Path,
+        help="Update mode: the baseline file before the change. Omit for a "
+        "new baseline file.",
     )
     parser.add_argument(
         "--tolerance",
@@ -526,6 +643,25 @@ def main() -> int:
         "0 ungates TTFT for every cell.",
     )
     args = parser.parse_args()
+
+    if args.mode == "update":
+        if args.baseline is None:
+            parser.error("--baseline is required in update mode")
+        try:
+            old = None
+            if args.previous_baseline is not None:
+                old = load_baseline_file(args.previous_baseline)
+            violation = check_baseline_update(old, load_baseline_file(args.baseline))
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+        if violation:
+            print(f"FAILED: {args.baseline}: {violation}", file=sys.stderr)
+            return 1
+        print("PASS: baseline update follows its freeze policy.")
+        return 0
+    if not args.results_dir:
+        parser.error("--results-dir is required in perf and eval modes")
 
     tolerance = args.tolerance
     if tolerance is None:
@@ -576,7 +712,7 @@ def main() -> int:
 
     with args.baseline.open() as fh:
         baseline = json.load(fh)
-    baseline = {k: v for k, v in baseline.items() if not k.startswith("_")}
+    baseline = gated_entries(baseline)
 
     if args.mode == "perf":
         failed = check_perf(results, baseline, tolerance)
