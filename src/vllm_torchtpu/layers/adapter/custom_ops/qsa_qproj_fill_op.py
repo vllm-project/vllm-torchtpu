@@ -71,8 +71,15 @@ def fill_slices(rows: int, slots: int, max_query_len: int, chunk_override: int) 
 
 
 def matmul_precision() -> str:
-    """torch_tpu's global float32 matmul precision name (read at layer build)."""
-    return str(torch.get_float32_matmul_precision())
+    """The precision torch_tpu gives F.linear's dot_general (read at layer build):
+    precision_impl._get_precision (= PyUnsafeGetPrecision, which
+    GetAndAddPrecisionTo reads: thread-local context, then NoTF32Guard, then the
+    global setting; DEFAULT unless set), as torch's name."""
+    from torch_tpu._internal.precision import precision_impl
+
+    get = getattr(precision_impl, "_get_precision", None) or precision_impl._get_global_precision
+    name = get().name
+    return {"DEFAULT": "medium", "HIGH": "high", "HIGHEST": "highest"}[name]
 
 
 def _log_engaged(rows: int, slices: int, group_base: int, precision: str) -> None:
