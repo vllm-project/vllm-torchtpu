@@ -351,6 +351,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Non-output ranks' step replies read one call late (core/fanin_late.py).
     "VLLM_TPU_FANIN_LATE",
     "VLLM_TPU_FANIN_LATE_AB_MS",
+    # Remote-KV admissions run in the engine core's waits (core/admit_off.py).
+    "VLLM_TPU_ADMIT_OFF",
+    "VLLM_TPU_ADMIT_OFF_AB_MS",
     # Host timeline and py-spy windows (runner/host_admit_probe.py).
     "VLLM_TPU_HOSTADMIT_PROBE",
     "VLLM_TPU_HOSTADMIT_PYSPY",

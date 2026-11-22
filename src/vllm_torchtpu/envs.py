@@ -410,6 +410,8 @@ if TYPE_CHECKING:
     VLLM_TPU_DEFER_FIN_AB_MS: int = 0
     VLLM_TPU_FANIN_LATE: bool = False
     VLLM_TPU_FANIN_LATE_AB_MS: int = 0
+    VLLM_TPU_ADMIT_OFF: int = 0
+    VLLM_TPU_ADMIT_OFF_AB_MS: int = 0
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -2829,6 +2831,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # In-process A/B of VLLM_TPU_FANIN_LATE in wall-clock windows of this many
     # ms (late reads in even windows); 0 is off. Host-only.
     "VLLM_TPU_FANIN_LATE_AB_MS": env_nonnegative_int("VLLM_TPU_FANIN_LATE_AB_MS", 0),
+    # Engine core (KV consumer): a new request's async remote-KV admission
+    # (prefix lookup, connector match, block allocation, load registration)
+    # runs while the main thread waits on the workers' tokens, at most this
+    # many between two schedule passes (core/admit_off.py); 0 is off.
+    # Host-only.
+    "VLLM_TPU_ADMIT_OFF": env_nonnegative_int("VLLM_TPU_ADMIT_OFF", 0),
+    # Engine core: in-process A/B of VLLM_TPU_ADMIT_OFF in wall-clock windows
+    # of this many ms (on in even windows); 0 is off. Host-only.
+    "VLLM_TPU_ADMIT_OFF_AB_MS": env_nonnegative_int("VLLM_TPU_ADMIT_OFF_AB_MS", 0),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
     "VLLM_TORCHTPU_IPC_KEY": lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),

@@ -140,6 +140,9 @@ PATCHES = (
     # Non-output ranks' step replies read one call late (inert unless
     # VLLM_TPU_FANIN_LATE): replaces MultiprocExecutor.collective_rpc.
     Patch("vllm_torchtpu.core.fanin_late:patch_fanin_late", ("engine_core",)),
+    # Remote-KV admissions in the engine core's waits (inert unless
+    # VLLM_TPU_ADMIT_OFF): outermost Scheduler schedule / finish / scan wrappers.
+    Patch("vllm_torchtpu.core.admit_off:patch_admit_off", ("engine_core",)),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
