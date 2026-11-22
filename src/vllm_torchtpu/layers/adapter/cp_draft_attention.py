@@ -1645,6 +1645,57 @@ def _pair_selftest(
     return ok
 
 
+def _block_key(block_args: dict) -> tuple | None:
+    """(max_query_len, sm_scale, causal) of a layer whose block op the pair
+    merge can fold in (uniform blocks), else None."""
+    if not block_args["uniform_blocks"]:
+        return None
+    return (block_args["max_query_len"], block_args["sm_scale"], block_args["causal"])
+
+
+def _arm_pair_merge_block(layers, mesh, perm, pair_op, meta, shape, tp) -> dict:
+    """`TPU_DRAFT_DCP_PAIR_MERGE_BLOCK`: the folded block op per distinct
+    block configuration of ``layers``, each self-tested against the unfused
+    pair merge + block op on a decode block; {} when off or a test fails on
+    any rank. Collective over the TP group."""
+    if not envs.TPU_DRAFT_DCP_PAIR_MERGE_BLOCK:
+        return {}
+    keys = {_block_key(m.impl.sharded_draft_dcp["ops"]["block_args"]) for m in layers}
+    keys.discard(None)
+    device = meta.device
+    gen = torch.Generator().manual_seed(11 + int(tp.rank_in_group))
+    built, ok = {}, True
+    for key in sorted(keys):
+        max_query_len, sm_scale, causal = key
+        block_op = _pair_merge_block_op(mesh, perm, max_query_len, sm_scale, causal)
+        rows, (two_h, d) = 2 * max_query_len + 2, shape
+        heads = two_h // 2
+
+        def t(*dims, dtype=torch.bfloat16, scale=1.0):
+            return (torch.randn(dims, generator=gen) * scale).to(dtype).to(device)
+
+        out, lse = t(rows, two_h, d), t(rows, two_h, dtype=torch.float32, scale=3)
+        q, key_, value = t(rows, heads, d), t(rows, 1, d), t(rows, 1, d)
+        seq_lens = torch.zeros(2, dtype=torch.int32, device=device)
+        starts = torch.arange(3, dtype=torch.int32, device=device) * max_query_len
+        got = block_op(out, lse, meta, q, key_, value, seq_lens)
+        ctx, ctx_lse = pair_op(out, lse, meta)
+        want = _block_op(max_query_len, sm_scale, causal, True)(
+            q, key_, value, seq_lens, starts, ctx, ctx_lse
+        )
+        ok &= bool(
+            torch.allclose(got.float().cpu(), want.float().cpu(), rtol=2**-6, atol=1e-2)
+        )
+        built[key] = block_op
+    seen = [None] * tp.world_size
+    torch.distributed.all_gather_object(seen, ok, group=tp.cpu_group)
+    if not all(seen):
+        logger.warning("DCP draft pair merge + block not armed: self-test %s", seen)
+        return {}
+    logger.info("DCP draft pair merge folds the block op (%s).", sorted(built))
+    return built
+
+
 def arm_pair_merge(model: torch.nn.Module) -> int:
     """Route every DCP-sharded draft attention layer of `model` whose head
     group has two ranks through the pair merge; returns how many. Collective
@@ -1700,17 +1751,12 @@ def arm_pair_merge(model: torch.nn.Module) -> int:
     if not all(ok):
         logger.warning("DCP draft pair merge not armed: self-test failed %s", ok)
         return 0
+    block_ops = _arm_pair_merge_block(layers, armed.mesh, perm, op, meta, shape, tp)
     for layer in layers:
         ops = dict(layer.impl.sharded_draft_dcp["ops"], pair_merge=op)
-        block_args = ops["block_args"]
-        if envs.TPU_DRAFT_DCP_PAIR_MERGE_BLOCK and block_args["uniform_blocks"]:
-            ops["pair_merge_block"] = _pair_merge_block_op(
-                armed.mesh,
-                perm,
-                block_args["max_query_len"],
-                block_args["sm_scale"],
-                block_args["causal"],
-            )
+        key = _block_key(ops["block_args"])
+        if key in block_ops:
+            ops["pair_merge_block"] = block_ops[key]
         layer.impl.sharded_draft_dcp["ops"] = ops
         layer.register_buffer("draft_pair_meta", meta, persistent=False)
     logger.info(
