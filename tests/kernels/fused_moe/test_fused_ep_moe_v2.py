@@ -42,6 +42,7 @@ from jax import lax
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2 import (
     AXIS,
     WeightFormat,
@@ -876,6 +877,55 @@ def test_small_combine_kernel_matches_xla_epilogue(
         assert "moe_v2_combine_small" not in xla.lower(*args).as_text()
         want = np.asarray(xla(*args)).astype(np.float32)
     np.testing.assert_array_equal(got, want)
+
+
+@pytest.mark.parametrize(
+    "sharded_plan,route_kernel",
+    [(False, False), (True, False), (True, True)],
+    ids=["replicated", "sharded", "route_kernel"],
+)
+def test_order_after_orders_without_changing_either_value(
+    monkeypatch, sharded_plan, route_kernel
+):
+    """`order_after` comes back unchanged and leaves the output's bits alone.
+
+    The serving layer passes the all-reduced shared-expert output through it
+    so the routing exchange waits on that all-reduce. The barrier has to be
+    in the program, and has to order rather than change either value.
+    """
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_V2_ROUTE_KERNEL", route_kernel)
+    mesh = _mesh()
+    # Eight experts a rank: the route-plan kernel takes no fewer.
+    e_total = 8 * mesh.size
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        26,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=e_total,
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh, 27, tokens=mesh.size * 16, hidden=SMALL["hidden"], e_total=e_total
+    )
+    after = jax.jit(lambda a: a * 3)(x)
+    common = dict(
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+        sharded_plan=sharded_plan,
+    )
+    args = (x, w1, w2, w1_scale, w2_scale, gating)
+    plain = jax.jit(lambda *a: fused_ep_moe_v2(*a, **common))
+    ordered = jax.jit(lambda *a: fused_ep_moe_v2(*a[:6], order_after=a[6], **common))
+    program = ordered.lower(*args, after).as_text()
+    assert "optimization_barrier" in program
+    assert ("route_plan" in program) == route_kernel
+    out, back = ordered(*args, after)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(plain(*args)))
+    np.testing.assert_array_equal(np.asarray(back), np.asarray(after))
 
 
 @pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])

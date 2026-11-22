@@ -311,6 +311,7 @@ def fused_ep_moe_v2(
     gather_positions=None,
     w1_scales_expert_second_minor=False,
     w2_scales_expert_second_minor=False,
+    order_after=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -372,6 +373,15 @@ def fused_ep_moe_v2(
     shard's q concatenated on axis 0, and returns what "fused" returns.
     gather_positions[i] is the block of q_g holding mesh index i's rows;
     None means mesh order.
+
+    order_after, on the fused stage only, is any array sharded like x that
+    must exist before the routing exchange starts. The layer then returns
+    (out, order_after), the second passed through the same barrier, and the
+    caller has to use that copy so the barrier is not pruned. The serving
+    layer hands in the all-reduced shared-expert output: nothing else orders
+    the two, and XLA otherwise runs the shared expert and its all-reduce
+    after the combine, where the TensorCore waits on them, rather than in
+    its idle wait on the token all-gather.
 
     w1_ / w2_scales_expert_second_minor say that scale table's device layout
     is {2,0,1}. The kernel then reads it as [blocks, E, N]. A wrong flag
@@ -459,6 +469,9 @@ def fused_ep_moe_v2(
         raise ValueError(f"stage must be fused, route or compute; got {stage!r}")
     if (routed is not None) != (stage == "compute"):
         raise ValueError('routed is passed exactly when stage == "compute"')
+    has_order_after = order_after is not None
+    if has_order_after and stage != "fused":
+        raise ValueError("order_after applies to the fused stage only")
     if gather_positions is not None:
         gather_positions = tuple(int(i) for i in gather_positions)
         if stage != "compute" or tuple(sorted(gather_positions)) != tuple(range(ep)):
@@ -1007,6 +1020,9 @@ def fused_ep_moe_v2(
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
+        after_l = None
+        if has_order_after:
+            *scales_gating_biases, after_l = scales_gating_biases
         w1s_l, w2s_l, gate_l, hash_l, score_bias_l, bias_it = unpack_operands(
             scales_gating_biases
         )
@@ -1015,6 +1031,10 @@ def fused_ep_moe_v2(
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
             gate_l, hash_l, score_bias_l, row_scale_l
         )
+        if after_l is not None:
+            # After the all-gather has started and before the exchange: the
+            # TensorCore otherwise idles here waiting on that gather.
+            packed, after_l = lax.optimization_barrier((packed, after_l))
         if route_kernel:
             planned = build_route_plan(
                 ep=ep,
@@ -1027,7 +1047,7 @@ def fused_ep_moe_v2(
                 layout=layout,
                 quantized=form.quantized_activations,
             )(packed, rank_l)
-            return compute_local(
+            out = compute_local(
                 q_g,
                 None,
                 None,
@@ -1043,24 +1063,26 @@ def fused_ep_moe_v2(
                 x_l.dtype,
                 planned=planned,
             )
-        exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
-            ep, layout[-1]
-        )
-        return compute_local(
-            q_g,
-            exchange,
-            local_blocks,
-            block_hist,
-            topk_weights,
-            row_routes,
-            rank_l,
-            w1_l,
-            w2_l,
-            w1s_l,
-            w2s_l,
-            bias_it,
-            x_l.dtype,
-        )
+        else:
+            exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
+                ep, layout[-1]
+            )
+            out = compute_local(
+                q_g,
+                exchange,
+                local_blocks,
+                block_hist,
+                topk_weights,
+                row_routes,
+                rank_l,
+                w1_l,
+                w2_l,
+                w1s_l,
+                w2s_l,
+                bias_it,
+                x_l.dtype,
+            )
+        return out if after_l is None else (out, after_l)
 
     def route_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """stage="route": the wire rows, router weights and payload."""
@@ -1152,6 +1174,9 @@ def fused_ep_moe_v2(
     if routed is not None:
         args += tuple(routed)
         in_specs += (P(ax),) * len(routed)
+    if has_order_after:
+        args += (order_after,)
+        in_specs += (P(ax),)
     NS = jax.sharding.NamedSharding
     args = tuple(jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
     # local_fn closes over config-static values only -- the per-call data
@@ -1191,9 +1216,10 @@ def fused_ep_moe_v2(
         slab_by_set,
         scale_by_lookup,
         route_kernel,
+        has_order_after,
     )
     body, out_specs = {
-        "fused": (local_fn, P(ax)),
+        "fused": (local_fn, (P(ax), P(ax)) if has_order_after else P(ax)),
         "route": (route_fn, (P(ax),) * 3),
         "compute": (compute_fn, P(ax)),
     }[stage]

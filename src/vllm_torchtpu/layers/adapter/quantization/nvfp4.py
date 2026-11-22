@@ -412,6 +412,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
 
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             FUSED_MOE_EP_OP_ATTR,
+            FUSED_MOE_EP_ORDERED_OP_ATTR,
+            fused_moe_ep_ordered_op,
             fused_moe_ep_unsupported_reason,
             register_fused_scale_buffers,
             register_score_bias_buffer,
@@ -499,6 +501,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             self._adaptive_fused_moe_op = op
         else:
             setattr(self, FUSED_MOE_EP_OP_ATTR, op)
+            setattr(self, FUSED_MOE_EP_ORDERED_OP_ATTR, fused_moe_ep_ordered_op(op))
         if op is not None:
             register_score_bias_buffer(layer)
             register_fused_scale_buffers(layer)
@@ -514,12 +517,16 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        order_after: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # order_after is the MoE runner's: see fused_moe_ep. It returns a pair.
         layer = cast("TpuRoutedExperts", layer)
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"
         )
+        if order_after is not None and self._use_adaptive_fused_moe:
+            raise ValueError("order_after needs the fused EP op, not adaptive")
         if self._use_adaptive_fused_moe:
             return adaptive_moe.run_adaptive_fused_moe(
                 self,
@@ -546,6 +553,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 layer._tpu_fused_w2_scale,
                 router_logits,
                 score_bias_operand(layer),
+                order_after=order_after,
             )
 
         # Quantization-independent routing decision (simulation override ->

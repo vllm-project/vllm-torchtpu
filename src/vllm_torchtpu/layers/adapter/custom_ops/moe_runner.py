@@ -16,18 +16,25 @@
 from collections.abc import Callable
 
 import torch
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import (
     RoutingSimulatorRouter,
 )
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    SharedExpertsOrder,
+)
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
 from vllm_torchtpu.layers.adapter import expert_placement
-from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+    FUSED_MOE_EP_ORDERED_OP_ATTR,
+    fused_moe_ep_supported,
+)
 from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
 
 # Taken once at import, outside any trace: the MoE forward is traced by
@@ -149,6 +156,70 @@ class VllmMoERunner(MoERunner):
             fused_moe_ep_supported(owner)
             or adaptive_fused_moe_supported(owner)
             or _upstream_fused_output_is_reduced(self)
+        )
+
+    def _orders_shared_before_routed(self) -> bool:
+        """Whether this layer all-reduces its shared expert before routing.
+
+        Only where prebuild built the fused op's order_after variant
+        (MOE_FUSED_EP_V2_SHARED_BEFORE_ROUTED) and upstream would have
+        reduced the shared output on its own, after the routed call. Static
+        per layer, so _apply_quant_method and the skipped reduction below
+        always agree.
+        """
+        return (
+            self.shared_experts is not None
+            and getattr(self._quant_method, FUSED_MOE_EP_ORDERED_OP_ATTR, None)
+            is not None
+            and not self.moe_config.is_sequence_parallel
+            and self._fused_output_is_reduced
+        )
+
+    def _apply_quant_method(
+        self,
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids=None,
+        shared_experts_overlapping=False,
+    ):
+        if not self._orders_shared_before_routed():
+            return super()._apply_quant_method(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids=input_ids,
+                shared_experts_overlapping=shared_experts_overlapping,
+            )
+        # Upstream's order, with the all-reduce moved up from forward() and
+        # handed to the fused op, which makes its routing exchange wait for
+        # it: in the data nothing orders the two, and XLA otherwise runs the
+        # shared expert and its all-reduce after the routed combine.
+        assert not shared_experts_overlapping, "no aux stream on TPU"
+        shared_experts = self.shared_experts
+        assert shared_experts is not None
+        self._maybe_apply_shared_experts(
+            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+        )
+        shared_output = tensor_model_parallel_all_reduce(shared_experts.output)
+        routed_experts = self.routed_experts
+        fused_out, shared_output = routed_experts.quant_method.apply_monolithic(
+            layer=routed_experts,
+            x=hidden_states,
+            router_logits=self.router.prepare_monolithic_logits(router_logits),
+            input_ids=input_ids,
+            order_after=shared_output,
+        )
+        return shared_output, fused_out
+
+    def _maybe_reduce_shared_expert_output(
+        self, shared_output, fused_output_is_reduced=None
+    ):
+        # Already reduced in _apply_quant_method.
+        if self._orders_shared_before_routed():
+            return shared_output
+        return super()._maybe_reduce_shared_expert_output(
+            shared_output, fused_output_is_reduced
         )
 
     def _fused_ep_owns_pcp_collectives(self) -> bool:

@@ -118,6 +118,11 @@ _RANK_BUFFER: Any = None
 # (`Fp8Config.get_quant_method`), so this is per-layer state without a registry
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
+# Beside it, the op's order_after variant (see fused_ep_moe_v2), built only
+# under MOE_FUSED_EP_V2_SHARED_BEFORE_ROUTED and recorded the same way.
+FUSED_MOE_EP_ORDERED_OP_ATTR = "_fused_moe_ep_ordered_op"
+# id(op) -> its order_after variant, for the caller recording both.
+_ORDERED_OPS: dict[int, Any] = {}
 
 
 def _squeeze_channel_scale(
@@ -183,11 +188,14 @@ def _build_op(
     sorted_gather=None,
     w1_scales_expert_second_minor=False,
     w2_scales_expert_second_minor=False,
+    has_order_after=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
     `sorted_gather` is `ep_sorted_gather_group()`'s (group, positions), or
     None for the single fused program. With it the op is a `_SortedGatherOp`.
+    `has_order_after` builds the variant taking one more operand, sharded
+    like x, and returning (out, that operand); see fused_ep_moe_v2.
     """
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
@@ -207,6 +215,7 @@ def _build_op(
         None if sorted_gather is None else sorted_gather[1],
         w1_scales_expert_second_minor,
         w2_scales_expert_second_minor,
+        has_order_after,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -309,7 +318,24 @@ def _build_op(
             hash_topk_ids=hash_ids.astype(jnp.int32),
         )
 
+    def moe_ordered(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        order_after: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return call(
+            x, w1, w2, w1_scale, w2_scale, gating, rank, order_after=order_after
+        )
+
     assert not (has_score_bias and has_hash_ids)
+    assert not (
+        has_order_after and (has_score_bias or has_hash_ids or sorted_gather)
+    ), "order_after is built for the plain single-program op only"
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
     # every shard for its own tokens, so it is replicated where the other
@@ -330,7 +356,10 @@ def _build_op(
     # JaxCallable with that one line replaced, was the way around it. Torchtpu
     # takes output_partition_specs itself now, which is the same information
     # without a copy of anyone's source.
-    if has_score_bias:
+    if has_order_after:
+        fn = moe_ordered
+        input_specs += (spec,)
+    elif has_score_bias:
         fn = moe_with_score_bias
     elif has_hash_ids:
         fn = moe_with_hash_ids
@@ -343,7 +372,7 @@ def _build_op(
         # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
         # -- and the single output is sharded on axis 0 like x.
         input_partition_specs=input_specs,
-        output_partition_specs=spec,
+        output_partition_specs=(spec, spec) if has_order_after else spec,
     )
 
     # Replaces the fake jax_op installs, which resolves the output aval by
@@ -352,7 +381,10 @@ def _build_op(
     def _fake(x, *_args, **_kwargs):
         return torch.empty_like(x)
 
-    op.register_fake(_fake)
+    def _fake_ordered(x, *args, **_kwargs):
+        return torch.empty_like(x), torch.empty_like(args[-1])
+
+    op.register_fake(_fake_ordered if has_order_after else _fake)
     if sorted_gather is not None:
         op = _build_split_ops(
             name,
@@ -567,7 +599,8 @@ def fused_moe_ep(
     router_logits: torch.Tensor,
     score_bias: torch.Tensor | None = None,
     hash_ids: torch.Tensor | None = None,
-) -> torch.Tensor:
+    order_after: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run one MoE layer through the fused EP kernel.
 
     Takes this rank's own tokens and returns this rank's own tokens: the
@@ -582,6 +615,11 @@ def fused_moe_ep(
     thing on the layer -- prebuild built the op's signature around that.
     Getting it wrong is a torch arity error at the first call, not a wrong
     answer.
+
+    `order_after`, shaped like `hidden_states`, must exist before the layer's
+    routing exchange; the result is then (routed output, order_after's copy
+    from behind the barrier), and the caller must use that copy. Only on a
+    layer `fused_moe_ep_ordered_op` built a variant for.
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
     if w1.dtype == torch.float4_e2m1fn_x2:
@@ -601,7 +639,19 @@ def fused_moe_ep(
     if envs.TPU_MOE_SKIP_PADDED_TOKENS:
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
     extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
+    if order_after is not None:
+        if extra:
+            raise ValueError("order_after takes no score bias or hash ids")
+        ordered = getattr(owner, FUSED_MOE_EP_ORDERED_OP_ATTR)
+        return ordered(
+            hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, order_after
+        )
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
+
+
+def fused_moe_ep_ordered_op(op: Any) -> Any:
+    """prebuild's order_after variant of `op`, or None where none was built."""
+    return None if op is None else _ORDERED_OPS.get(id(op))
 
 
 def _simulated_routing_operands(
@@ -1017,6 +1067,31 @@ def prebuild_fused_moe_ep(
         w2_scales_expert_second_minor=weight_format == "fp4"
         and _scales_expert_second_minor(w2_scale),
     )
+    if (
+        envs.MOE_FUSED_EP_V2_SHARED_BEFORE_ROUTED
+        and sorted_gather is None
+        and not (has_score_bias or has_hash_ids)
+    ):
+        _ORDERED_OPS[id(op)] = _build_op(
+            mesh,
+            topk,
+            renormalize,
+            activation,
+            mesh_expert_order,
+            sharded_plan,
+            weight_format,
+            rhs_qb,
+            scoring_fn,
+            has_score_bias,
+            routed_scale,
+            has_hash_ids,
+            token_replica_groups=token_replica_groups,
+            w1_scales_expert_second_minor=weight_format == "fp4"
+            and _scales_expert_second_minor(w1_scale),
+            w2_scales_expert_second_minor=weight_format == "fp4"
+            and _scales_expert_second_minor(w2_scale),
+            has_order_after=True,
+        )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "

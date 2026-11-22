@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS: int | None = None
     MOE_FUSED_EP_V2_ROUTE_KERNEL: bool = False
+    MOE_FUSED_EP_V2_SHARED_BEFORE_ROUTED: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
@@ -933,6 +934,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # small XLA ops and the SparseCore slab scatters. Same tables, bit for bit.
     # Read at trace time; requires MOE_FUSED_EP_V2_SHARDED_PLAN.
     "MOE_FUSED_EP_V2_ROUTE_KERNEL": env_bool("MOE_FUSED_EP_V2_ROUTE_KERNEL"),
+    # On a fused EP MoE v2 layer with a TP-partial shared expert, all-reduce
+    # the shared expert's output BEFORE the routed layer's routing exchange
+    # rather than after its combine. Nothing in the data orders the two, and
+    # XLA otherwise leaves the shared expert and its all-reduce after the
+    # combine, on the critical path, while the TensorCore idles earlier
+    # waiting on the token all-gather. Same values; read at load time.
+    "MOE_FUSED_EP_V2_SHARED_BEFORE_ROUTED": env_bool(
+        "MOE_FUSED_EP_V2_SHARED_BEFORE_ROUTED"
+    ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
