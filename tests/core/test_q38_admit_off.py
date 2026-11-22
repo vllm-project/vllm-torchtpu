@@ -427,6 +427,34 @@ def test_in_wait_lookup_treats_blocks_hashed_in_the_previous_pass_as_unwritten(f
     assert s.requests["r02"].status == s.requests["r03"].status == RequestStatus.WAITING_FOR_REMOTE_KVS
 
 
+def test_unwritten_miss_counter_counts_a_real_miss_and_not_an_older_cached_block(fresh, monkeypatch):
+    lines = []
+    monkeypatch.setattr(ao.logger, "info", lambda fmt, *a: lines.append(fmt % a))
+    monkeypatch.setattr(ao, "LOG_EVERY", 1)
+    _install(fresh)
+    s = _scheduler(fresh)
+    e = _engine(s)
+    ao.attach(e)
+    e.input_queue.put_nowait((ADD, (_req(1), 0)))
+    _window()
+    s.schedule()
+    _land(s, ["r01"])
+    s.schedule()  # pass k: A (r01) lands and is scheduled; its fresh prompt blocks are hashed in this pass
+    e.input_queue.put_nowait((ADD, (_req(2, prompt_of=1), 0)))
+    _window()  # B (r02), same fresh prefix, in the next wait: its hit stops at A's still-unwritten first block
+    assert (ao.stats["unwritten_miss"], ao.stats["miss_tok"]) == (1, 2 * BLOCK_SIZE), ao.stats
+    s.schedule()
+    _land(s, ["r02"])
+    s.schedule()  # B lands: its blocks re-insert the same hashes; the map keeps A's older block first
+    e.input_queue.put_nowait((ADD, (_req(3, prompt_of=1), 0)))
+    _window()  # control: the lookup gets A's older, written block, a hit, so no miss
+    allocs = {x[1]: x[2] for x in s.connector.log if x[0] == "alloc"}
+    assert allocs == {"r01": PROMPT_LEN, "r02": PROMPT_LEN, "r03": PROMPT_LEN - 2 * BLOCK_SIZE}, allocs
+    assert (ao.stats["unwritten_miss"], ao.stats["miss_tok"], ao.stats["wait_tok"]) == (1, 2 * BLOCK_SIZE, 3 * PROMPT_LEN)
+    runtime = [l for l in lines if l.startswith("ADMIT_AHEAD ")]
+    assert len(runtime) == 3 and runtime[-1].endswith(" unwritten_miss=1 miss_tok=32 wait_tok=120"), runtime
+
+
 def test_backout_when_blocks_do_not_fit_leaves_no_trace(fresh):
     _install(fresh)
     s = _scheduler(fresh, num_blocks=20)

@@ -39,8 +39,15 @@ changes.
 (0 = off): in-process A/B in wall-clock windows (on in even ``time_ns // P ms`` windows; in odd windows nothing is done
 in the wait). Both keys are host-only and excluded from the compile key. Engine-core process of a KV consumer only;
 the engine core logs one ``ADMIT_OFF engaged:`` line once its engine is built (or ``ADMIT_OFF not engaged:`` with the
-reason), and the main thread logs ``ADMIT_AHEAD ahead=<n> ... admit_ms_mean=<ms>`` at its first admission done in the
-wait and every ``LOG_EVERY`` admissions after (the runtime line).
+reason), and the main thread logs ``ADMIT_AHEAD ahead=<n> ... admit_ms_mean=<ms> unwritten_miss=<n> miss_tok=<t>
+wait_tok=<T>`` at its first admission done in the wait and every ``LOG_EVERY`` admissions after (the runtime line).
+
+``unwritten_miss`` / ``miss_tok`` / ``wait_tok`` size the one cache effect of the move (committed in-wait admissions
+only, so ON windows only under AB): ``unwritten_miss`` counts admissions whose local hit stopped at a block that the
+same-step patch still counts as unwritten (hashed in the pass just before the wait; ``schedule()`` would have hit it),
+``miss_tok`` estimates the tokens such hits lost (walking forward while the hashes stay cached), and ``wait_tok`` sums
+the prompt tokens of all committed in-wait admissions. Indicator, not an exact token count: the check reads the hashes of
+the first full-attention KV cache group only (``unwritten_miss_tokens``), not every group's convergent hit.
 """
 
 import ast
@@ -84,7 +91,7 @@ HELD = []
 _state = {"engine": None, "limit": 0, "seq": 0, "window_n": 0, "charge_due": 0, "stalled_seq": -1,
           "in_sched": False, "busy": False, "ab_window": None}
 stats = {"pulled": 0, "admitted": 0, "backout": 0, "ineligible": 0, "held": 0, "reissued": 0, "charged": 0,
-         "ab_off": 0, "admit_ns": 0}
+         "ab_off": 0, "admit_ns": 0, "unwritten_miss": 0, "miss_tok": 0, "wait_tok": 0}
 
 
 def enabled() -> bool:
@@ -173,6 +180,52 @@ def ineligible(sched, request) -> str | None:
     return None
 
 
+def _attention_group(sched) -> tuple:
+    """(group id, block size) of the first full-attention KV cache group, cached per scheduler; (None, 0) if none."""
+    g = sched.__dict__.get("_tpu_admit_off_attn_group")
+    if g is None:
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+        g = (None, 0)
+        for i, m in enumerate(sched.kv_cache_manager.coordinator.single_type_managers):
+            if isinstance(m, FullAttentionManager):
+                g = (i, m.block_size)
+                break
+        sched.__dict__["_tpu_admit_off_attn_group"] = g
+    return g
+
+
+def unwritten_miss_tokens(sched, request, num_hit_tokens: int) -> int | None:
+    """None unless the attention group's next block after the local hit is cached but still in the same-step patch's
+    unwritten set; else the tokens a hit would have covered, walking forward while that group's hashes stay cached
+    (capped at the scan's num_tokens - 1). Read-only; one map lookup unless it fires. Indicator: one group's hashes."""
+    from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+
+    pool = sched.kv_cache_manager.block_pool
+    unwritten = pool.__dict__.get("_tpu_unwritten_block_ids")
+    if not unwritten:
+        return None
+    gid, bsize = _attention_group(sched)
+    if gid is None or bsize % pool.hash_block_size:
+        return None
+    scale = bsize // pool.hash_block_size
+    hashes = request.block_hashes
+    get = pool.cached_block_hash_to_block.get_one_block
+
+    def cached(i):
+        j = (i + 1) * scale - 1
+        return get(make_block_hash_with_group_id(hashes[j], gid)) if j < len(hashes) else None
+
+    i = num_hit_tokens // bsize
+    first = cached(i)
+    if first is None or first.block_id not in unwritten:
+        return None
+    n = 1
+    while cached(i + n) is not None:
+        n += 1
+    return min(n * bsize, max(0, request.num_tokens - 1 - num_hit_tokens))
+
+
 def _back_out(request, boundary_before, why: str) -> bool:
     request.shared_prefix_boundary = boundary_before
     stats["backout"] += 1
@@ -201,6 +254,8 @@ def admit_one(sched, request) -> bool:
         request.shared_prefix_boundary,
         hit_diverged,
     ) = sched._get_local_prefix_cache_hit(request)
+    # Indicator only (read-only; before the allocation can evict anything): did the hit stop at an unwritten block?
+    miss = unwritten_miss_tokens(sched, request, num_new_local_computed_tokens)
     # Get externally-cached tokens (block-aligned local hit presented to the connector).
     partial_tail = num_new_local_computed_tokens % sched.block_size
     block_aligned_local = num_new_local_computed_tokens - partial_tail
@@ -274,6 +329,10 @@ def admit_one(sched, request) -> bool:
     assert popped is request
     sched.deferred_waiting.add(request)
     sched.kv_holding_waiting.add_request(request)
+    stats["wait_tok"] += request.num_prompt_tokens
+    if miss is not None:
+        stats["unwritten_miss"] += 1
+        stats["miss_tok"] += miss
     return True
 
 
@@ -316,9 +375,11 @@ def step_window() -> None:
             # The runtime line (Car H's gating row): logged by the thread that admits, at the first admission done in the
             # wait and every LOG_EVERY after.
             logger.info(
-                "ADMIT_AHEAD ahead=%d pulled=%d backout=%d ineligible=%d held=%d reissued=%d charged=%d admit_ms_mean=%.3f",
+                "ADMIT_AHEAD ahead=%d pulled=%d backout=%d ineligible=%d held=%d reissued=%d charged=%d admit_ms_mean=%.3f "
+                "unwritten_miss=%d miss_tok=%d wait_tok=%d",
                 stats["admitted"], stats["pulled"], stats["backout"], stats["ineligible"], stats["held"],
                 stats["reissued"], stats["charged"], stats["admit_ns"] / stats["admitted"] / 1e6,
+                stats["unwritten_miss"], stats["miss_tok"], stats["wait_tok"],
             )
     finally:
         _state["busy"] = False
