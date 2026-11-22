@@ -264,10 +264,18 @@ def test_the_stock_noise_program_draws_the_host_bits_on_tpu(device):
         ({"min_p": 0.1}, "unsupported_sampling"),
         ({"logit_bias": {3: 2.0}}, "unsupported_sampling"),
         ({"presence_penalty": 0.5}, "unsupported_sampling"),
+        ({"repetition_penalty": 1.2}, "unsupported_sampling"),
         ({"prompt_logprobs": 1}, "prompt_logprobs"),
         ({"min_tokens": 3, "stop_token_ids": [5]}, "min_tokens"),
     ],
-    ids=["min_p", "logit_bias", "penalty", "prompt_logprobs", "min_tokens"],
+    ids=[
+        "min_p",
+        "logit_bias",
+        "penalty",
+        "repetition_penalty",
+        "prompt_logprobs",
+        "min_tokens",
+    ],
 )
 def test_sampling_the_head_cannot_apply_runs_on_the_stock_path(
     monkeypatch, params, reason

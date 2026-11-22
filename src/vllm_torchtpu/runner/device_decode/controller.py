@@ -489,8 +489,8 @@ class DeviceDecodeController:
         return shape, variant
 
     def _unsupported_sampling(self, input_batch: Any, req_ids: list[str]) -> bool:
-        """Sampling neither the head nor the stock TPU sampler applies; it
-        stays on the stock path, which keeps one behaviour for it."""
+        """Sampling the head does not apply. It stays on the stock path, so it
+        behaves as it does with the flag off."""
         max_num_logprobs = input_batch.max_num_logprobs
         return bool(
             not input_batch.no_penalties
