@@ -297,6 +297,9 @@ def test_core_model_def_modules_have_no_qwen_literals_and_fit_line_budget():
         low = text.lower()
         assert "qwen" not in low, f"{path.name} must not mention Qwen"
 
+
+def test_module_and_pool_backend_equality_helpers_and_geometry_check():
+    """Equality helpers, `make_pool_backend`, and `ModelGeometry.check` contracts."""
     b1 = MoEModule(prefix="mlp")
     b2 = MoEModule(prefix="mlp")
     b3 = MoEModule(prefix="other")
@@ -843,11 +846,58 @@ def test_synthetic_model_def_every2_spec_reference_and_override_errors(
             jax.random.PRNGKey(1), g_tiny, ex, g_tiny.NGDN
         ),
     }
+    keys = jax.random.split(jax.random.PRNGKey(17), len(w_zero) + len(st_zero) + 1)
+    hid_l = (jax.random.normal(keys[0], (ex.B, g_tiny.H), dtype=F32) * 0.2).astype(BF16)
+    w_rand: dict[str, Any] = {
+        k: v
+        + (jax.random.normal(keys[1 + i], v.shape, dtype=F32) * 0.05).astype(v.dtype)
+        for i, (k, v) in enumerate(w_zero.items())
+    }
+    st_rand: dict[str, Any] = {
+        k: (
+            jax.random.normal(keys[1 + len(w_zero) + i], v.shape, dtype=F32) * 0.05
+        ).astype(v.dtype)
+        for i, (k, v) in enumerate(st_zero.items())
+    }
+    w_spec = {
+        **w_rand,
+        "in_norm": w_rand["attn_norm"],
+        "post_norm": w_rand["ffn_norm"],
+        "final_norm": w_rand["final_ln"],
+    }
     ref_out, ref_st = SynthHybrid.reference_step(
-        g_tiny, ex, pos, hid_l, w_zero, st_zero
+        g_tiny, ex, pos, hid_l, w_rand, st_rand
     )
-    assert ref_out.shape == (ex.B, g_tiny.H) and jnp.all(jnp.isfinite(ref_out))
-    assert set(ref_st) == {"kc", "vc", "conv", "rec"}
+    spec_out, spec_st = reference.spec_reference_step(
+        ms, g_tiny, ex, pos, hid_l, w_spec, st_rand
+    )
+    assert ref_out.shape == (ex.B, g_tiny.H) and bool(jnp.all(jnp.isfinite(ref_out)))
+    assert not bool(jnp.allclose(ref_out, 0.0))
+    assert not bool(jnp.allclose(ref_out, hid_l))
+    assert bool(jnp.array_equal(ref_out, spec_out))
+    assert set(ref_st) == {"kc", "vc", "conv", "rec"} == set(spec_st)
+    for k in spec_st:
+        assert bool(jnp.array_equal(ref_st[k], spec_st[k])), k
+
+    # Rank-replicated `(R, L, H)` layer norms and `(R, 1, H)` final norms match.
+    w_rank_norms = {
+        **w_rand,
+        "attn_norm": jnp.broadcast_to(
+            w_rand["attn_norm"][None], (ex.R, g_tiny.L, g_tiny.H)
+        ),
+        "ffn_norm": jnp.broadcast_to(
+            w_rand["ffn_norm"][None], (ex.R, g_tiny.L, g_tiny.H)
+        ),
+        "final_ln": jnp.broadcast_to(
+            w_rand["final_ln"][None, None], (ex.R, 1, g_tiny.H)
+        ),
+    }
+    rank_out, rank_st = SynthHybrid.reference_step(
+        g_tiny, ex, pos, hid_l, w_rank_norms, st_rand
+    )
+    assert bool(jnp.array_equal(rank_out, ref_out))
+    for k in ref_st:
+        assert bool(jnp.array_equal(rank_st[k], ref_st[k])), k
 
     dense_mlp = _DenseMLPModule.bind(
         prefix="mlp",
@@ -1114,7 +1164,7 @@ def test_model_def_random_reference_step_matches_independent_loop_and_norm_renam
 def test_derive_regressions_sigmoid_moe_overrides_shrink_rope_and_experts(
     isolated_model_registry,
 ):
-    """Cover #3609 review regressions across `derive.py` and `model_def.py`."""
+    """Cover sigmoid gate, MoE overrides, `text_config` shrink, RoPE, and `experts`."""
     base_cfg = {
         "vocab_size": 64000,
         "hidden_size": 1024,

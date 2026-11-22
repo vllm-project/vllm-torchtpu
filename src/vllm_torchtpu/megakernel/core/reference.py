@@ -72,6 +72,14 @@ def _norm_weight(
     return logical_weights[key if key in logical_weights else fallback]
 
 
+def _layer_norm_w(w: Any, lyr: int) -> Any:
+    return w[0, lyr] if w.ndim == 3 else (w[lyr] if w.ndim == 2 else w)
+
+
+def _final_norm_w(w: Any) -> Any:
+    return w[0, 0] if w.ndim == 3 else (w[0] if w.ndim == 2 else w)
+
+
 def prepare_reference_step_state(
     logical_states: Mapping[str, Any],
     g: Any,
@@ -184,7 +192,7 @@ def composed_reference_step(
                 f"layer {lyr} slot 'pre_norm' is None (kernel requires pre_norm)"
             )
         pre_w = _norm_weight(sched.pre_norm[lyr], pre_mod, logical_weights, "in_norm")
-        x_mix = pre_mod.reference(pre_w[lyr], res, g=g)[0]
+        x_mix = pre_mod.reference(_layer_norm_w(pre_w, lyr), res, g=g)[0]
         mix_mod = _make_ref_module(sched.mixer[lyr], g)
         if mix_mod is None:
             raise MegakernelConfigError(f"Layer {lyr} has no mixer module")
@@ -212,7 +220,7 @@ def composed_reference_step(
         post_w = _norm_weight(
             sched.post_norm[lyr], post_mod, logical_weights, "post_norm"
         )
-        x_ffn = post_mod.reference(post_w[lyr], res, g=g)[0]
+        x_ffn = post_mod.reference(_layer_norm_w(post_w, lyr), res, g=g)[0]
         ffn_mod = _make_ref_module(sched.ffn[lyr], g)
         if ffn_mod is None:
             raise MegakernelConfigError(f"Layer {lyr} has no ffn module")
@@ -225,7 +233,7 @@ def composed_reference_step(
     if fn_mod is None or final_norm is None:
         raise MegakernelConfigError("final_norm is None (kernel requires final_norm)")
     fn_w = _norm_weight(final_norm, fn_mod, logical_weights, "final_norm")
-    out_b = fn_mod.reference(fn_w, res, g=g, out_dtype=BF16)[0]
+    out_b = fn_mod.reference(_final_norm_w(fn_w), res, g=g, out_dtype=BF16)[0]
     out_states = finalize_reference_step_state(
         step_state, conv_in, rec_in, ngdn, vh, KD, VD, ex, pool_io=pool_io
     )
@@ -262,12 +270,7 @@ def spec_reference_step(
                 else (slot, lyr)
             )
             if mod.input_norm is not None:
-                in_w = logical_weights[mod.input_norm]
-                in_w_l = (
-                    in_w[0, lyr]
-                    if in_w.ndim == 3
-                    else (in_w[lyr] if in_w.ndim == 2 else in_w)
-                )
+                in_w_l = _layer_norm_w(logical_weights[mod.input_norm], lyr)
                 x_in: Any = rmsnorm(
                     res,
                     in_w_l,
@@ -292,8 +295,7 @@ def spec_reference_step(
             )
             sub_arr = jnp.asarray(sub_out).astype(F32)
             res = round_bf16(res + sub_arr) if mod.reduction == "allreduce" else sub_arr
-    fn_w = logical_weights["final_norm"]
-    fn_w_0 = fn_w[0] if fn_w.ndim >= 2 else fn_w
+    fn_w_0 = _final_norm_w(logical_weights["final_norm"])
     out_b = rmsnorm(
         res,
         fn_w_0,

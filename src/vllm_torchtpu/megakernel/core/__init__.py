@@ -87,14 +87,10 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         unfold,
     )
     from .model_def import (
-        Every,
         FromHF,
-        FromHFLayerTypes,
         LMHead,
         ModelDef,
         ModelGeometry,
-        ResolvedSchedule,
-        Schedule,
         find_model,
         get_model,
         list_models,
@@ -147,6 +143,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         model_default_profile,
         register_profile,
     )
+    from .schedule import Every, FromHFLayerTypes, ResolvedSchedule, Schedule
     from .spec import (
         REQUIRED,
         CompareMode,
@@ -264,14 +261,14 @@ _LAZY: dict[str, str] = {
     "fold": ".kernel",
     "make_step": ".kernel",
     "unfold": ".kernel",
-    "Every": ".model_def",
+    "Every": ".schedule",
     "FromHF": ".model_def",
-    "FromHFLayerTypes": ".model_def",
+    "FromHFLayerTypes": ".schedule",
     "LMHead": ".model_def",
     "ModelDef": ".model_def",
     "ModelGeometry": ".model_def",
-    "ResolvedSchedule": ".model_def",
-    "Schedule": ".model_def",
+    "ResolvedSchedule": ".schedule",
+    "Schedule": ".schedule",
     "find_model": ".model_def",
     "get_model": ".model_def",
     "list_models": ".model_def",
