@@ -80,11 +80,24 @@ def test_selection_groups_restore_the_stock_selection(contexts, K, live, tie):
         n_ga += int(sum((ids[r, 0, K - 1] == 0) and lens[r] // 4 > K
                         for r in range(len(lens))))
         rows = len(lens) - 2  # the call's rows (B) may be fewer than the kernel's (M)
+        ref = selected_tokens(jnp.asarray(want[:rows]), jnp.asarray(lens[:rows]), 4 * K, 4)
+        full = export_selection(jnp.asarray(ids), jnp.asarray(ctx), jnp.asarray(starts),
+                                T=T, K=K, rows=rows, tails=True)
+        np.testing.assert_array_equal(np.asarray(full), np.asarray(ref))
         got = export_selection(jnp.asarray(ids), jnp.asarray(ctx), jnp.asarray(starts),
                                T=T, K=K, rows=rows)
-        ref = selected_tokens(jnp.asarray(want[:rows]), jnp.asarray(lens[:rows]), 4 * K, 4)
         assert got.shape == (rows, 4 * K + 3) and got.dtype == jnp.int32
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+        # Served form: the stock row without the partial group's tokens; what the draft
+        # reads from it (`shared_blocks`) is identical.
+        no_tail = selected_tokens(jnp.asarray(want[:rows]), jnp.zeros(rows, jnp.int32) + 4 * K * 4,
+                                  4 * K, 4)  # lengths past every group: no partial group
+        np.testing.assert_array_equal(np.asarray(got)[:, : 4 * K], np.asarray(no_tail)[:, : 4 * K])
+        assert (np.asarray(got)[:, 4 * K :] == -1).all()
+        from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import shared_blocks
+
+        lj = jnp.asarray(lens[:rows])
+        np.testing.assert_array_equal(np.asarray(shared_blocks(got, lj, 4, 4 * K)),
+                                      np.asarray(shared_blocks(ref, lj, 4, 4 * K)))
     if K == 64 and contexts[0] == 3001:
         assert n_ga > 0  # the g_a-in-slot-K-1 case is exercised
 
