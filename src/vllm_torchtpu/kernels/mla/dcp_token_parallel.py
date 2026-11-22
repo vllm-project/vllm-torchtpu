@@ -53,6 +53,7 @@ the indexer (its own cache group) and every attention layer agree on it.
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -542,22 +543,36 @@ def gather_latent(
 
     local_nope = read_pages[0](nope_cache, page_ids)
     local_rope = read_pages[1](rope_cache, page_ids)
+    n_pages = int(page_ids.shape[0])
+    cols = int(nope_cache.shape[-1]) if nope_cache.ndim >= 2 else 0
     if (
         local_nope.dtype == local_rope.dtype
-        and local_nope.ndim == 3
-        and local_rope.ndim == 3
-        and local_nope.shape[0] == local_rope.shape[0]
-        and local_nope.shape[2] == local_rope.shape[2]
-        and local_nope.shape[1] % 8 == 0
-        and local_rope.shape[1] % 8 == 0
+        and n_pages > 0
+        and cols > 0
+        and local_nope.size == n_pages * math.prod(nope_cache.shape[1:])
+        and local_rope.size == n_pages * math.prod(rope_cache.shape[1:])
+        and local_nope.size % (n_pages * cols) == 0
+        and local_rope.size % (n_pages * cols) == 0
     ):
-        n_rows = local_nope.shape[1]
-        both = jnp.concatenate([local_nope, local_rope], axis=1)
-        g_both = lax.all_gather(both, axis_name, axis=0, tiled=True)
-        return (
-            g_both[:, :n_rows, :].reshape(-1, *nope_cache.shape[1:]),
-            g_both[:, n_rows:, :].reshape(-1, *rope_cache.shape[1:]),
-        )
+        n_rows = local_nope.size // (n_pages * cols)
+        r_rows = local_rope.size // (n_pages * cols)
+        if n_rows % 8 == 0 and r_rows % 8 == 0:
+            # Avoid separate un-fused rope all-gather when page_gather returns
+            # 2-D linear outputs or packed-rope width (16) differs from nope
+            # width (128): fold per-page bytes to [cap, rows, cols] so one
+            # tiled all-gather moves both caches together on the fast path.
+            both = jnp.concatenate(
+                [
+                    local_nope.reshape(n_pages, n_rows, cols),
+                    local_rope.reshape(n_pages, r_rows, cols),
+                ],
+                axis=1,
+            )
+            g_both = lax.all_gather(both, axis_name, axis=0, tiled=True)
+            return (
+                g_both[:, :n_rows, :].reshape(-1, *nope_cache.shape[1:]),
+                g_both[:, n_rows:, :].reshape(-1, *rope_cache.shape[1:]),
+            )
 
     def gather(local: jax.Array, tail_shape: tuple[int, ...]) -> jax.Array:
         return lax.all_gather(local.reshape(-1), axis_name, tiled=True).reshape(
