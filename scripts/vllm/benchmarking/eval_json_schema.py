@@ -26,7 +26,8 @@ Usage:
         --task-config <yaml> --output-json <path>
 
 ``--base-url`` is the API root without ``/v1`` and ``--model`` the name the
-endpoint serves, both as ``run_eval_flow.sh`` resolved them.
+endpoint serves, both as ``run_eval_flow.sh`` resolved them. ``OPENAI_API_KEY``,
+when set, is sent as a bearer token.
 
 A task config is a YAML mapping with one key, ``cases``, a list. Each case has:
 
@@ -51,6 +52,7 @@ import concurrent.futures
 import dataclasses
 import http.client
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -327,11 +329,17 @@ def _request_body(model: str, case: SchemaCase, prompt: str) -> dict[str, Any]:
     }
 
 
-def _run_trial(chat_url: str, model: str, case: SchemaCase, sample: Sample) -> Trial:
+def _run_trial(
+    chat_url: str,
+    headers: dict[str, str],
+    model: str,
+    case: SchemaCase,
+    sample: Sample,
+) -> Trial:
     request = urllib.request.Request(
         chat_url,
         data=json.dumps(_request_body(model, case, sample.prompt)).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
     where = f"case '{case.name}' sample '{sample.sample_id}'"
     try:
@@ -366,17 +374,28 @@ def _run_trial(chat_url: str, model: str, case: SchemaCase, sample: Sample) -> T
     return Trial(case.name, sample.sample_id, finish_reason, error)
 
 
-def evaluate(base_url: str, model: str, cases: Sequence[SchemaCase]) -> list[Trial]:
+def evaluate(
+    base_url: str,
+    model: str,
+    cases: Sequence[SchemaCase],
+    *,
+    api_key: str | None,
+) -> list[Trial]:
     """Send every prompt of ``cases`` and return one verdict per response.
+
+    ``api_key``, when set, is sent as a bearer token.
 
     Raises:
         RuntimeError: The endpoint is unreachable, answers with a 5xx, or does
             not answer with a chat completion.
     """
     chat_url = f"{base_url}/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     with concurrent.futures.ThreadPoolExecutor(max_workers=_CONCURRENCY) as pool:
         futures = [
-            pool.submit(_run_trial, chat_url, model, case, sample)
+            pool.submit(_run_trial, chat_url, headers, model, case, sample)
             for case in cases
             for sample in case.samples
         ]
@@ -428,7 +447,8 @@ def main() -> int:
     args = parser.parse_args()
     try:
         cases = load_cases(args.task_config)
-        trials = evaluate(args.base_url, args.model, cases)
+        api_key = os.environ.get("OPENAI_API_KEY") or None
+        trials = evaluate(args.base_url, args.model, cases, api_key=api_key)
     except (RuntimeError, ValueError) as err:
         # No results file is written: the caller fails the suite on the exit
         # status.

@@ -1976,6 +1976,16 @@ def test_json_schema_suite_has_no_result_when_the_endpoint_answers_5xx(
     assert not (flow.results_dir / "eval_check_json_schema.md").exists()
 
 
+def test_openai_api_key_reaches_the_json_schema_client(flow, make_gateway):
+    gateway = make_gateway("", [_CONFIG_MODEL], required_api_key="gw-key-123")
+
+    proc = _run_json_schema(flow, gateway, env={"OPENAI_API_KEY": "gw-key-123"})
+
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    meta = _json_schema_results(flow)["meta"]
+    assert (meta["total_trials"], meta["successful_trials"]) == (28, 28)
+
+
 def test_config_names_the_json_schema_task_config(flow, make_gateway, tmp_path):
     task_config = _write_answer_task_config(tmp_path, ["What is 6 times 7?"])
     config = flow.write_config(
