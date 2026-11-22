@@ -86,7 +86,7 @@ printf '%s\\n' "$@" >> "$STUB_LOG_DIR/vllm.args"
 if [ "${1:-}" = "serve" ]; then
     echo "$$" > "$STUB_LOG_DIR/vllm_serve.pid"
     touch "$STUB_LOG_DIR/server.ready"
-    sleep 30
+    exec sleep 30
 fi
 """
 
