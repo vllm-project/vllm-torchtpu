@@ -990,7 +990,10 @@ class DFlashProposer:
         for _ in range(num_chunks):
             self._dp_dummy_forward()
 
-    @tpu_compile
+    # The draft layers' attention metadata arrives as arguments, which the
+    # guard memo keys by identity, and the program depends on the block tables
+    # inside them, so every call runs the guard check.
+    @tpu_compile(guard_memo=False)
     def _tpu_precompute_and_update_kv_cache(
         self,
         hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor,

@@ -40,8 +40,10 @@ per-call frame evaluation; every guard Dynamo built is kept.
   is not re-checked on a memo hit, so a function whose compiled program
   depends on such state, and the state can change between calls with the same
   arguments, opts out with ``tpu_compile(guard_memo=False)``: every call of it
-  runs the guard check. The DFlash and DSpark draft forwards do: their draft
-  model reads its attention metadata from vLLM's forward context.
+  runs the guard check. The DFlash and DSpark draft forwards do (their draft
+  model reads its attention metadata from vLLM's forward context), and so does
+  DFlash's context-KV update (its program depends on the block tables inside
+  the metadata objects it takes as arguments).
 
 TODO: Remove this module once PyTorch has a public guarded call path for
 ``fullgraph`` compiled functions (https://github.com/pytorch/pytorch/issues/206560);

@@ -382,6 +382,97 @@ def test_draft_forward_runs_the_program_for_the_current_block_table(
         torch._dynamo.reset()
 
 
+# --- DFlash's context-KV update keeps its metadata arguments out of the memo -
+
+
+class _KVImpl:
+    """Writes the static length of the block table its program was traced
+    with, as a paged-attention program built for that length writes its
+    pages."""
+
+    def forward(self, layer, query, key, value, kv_cache, attn_metadata):
+        table = attn_metadata.block_tables
+        kv_cache.copy_(torch.full_like(kv_cache, float(table.shape[0])) + 0 * key.sum())
+        return query
+
+
+class _KVRotary(torch.nn.Module):
+    def forward(self, positions, query, key):
+        return query, key
+
+
+class _KVSelfAttn(torch.nn.Module):
+    head_dim, num_kv_heads, num_heads = 4, 1, 2
+
+    def __init__(self):
+        super().__init__()
+        self.rotary_emb = _KVRotary()
+        self.attn = torch.nn.Module()
+        self.attn.kv_cache = torch.zeros(4)
+        self.attn.impl = _KVImpl()
+
+
+class _KVLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = _KVSelfAttn()
+
+
+class _KVDraft(torch.nn.Module):
+    """What DFlash's context-KV update reads from a draft model that has no
+    context-KV hook of its own."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.layers = torch.nn.ModuleList([_KVLayer()])
+        self.model._fused_kv_weight = torch.nn.Parameter(
+            torch.ones(2 * 4, _HIDDEN), requires_grad=False
+        )
+        self.model._fused_kv_bias = None
+
+
+def test_context_kv_update_runs_the_program_for_the_current_metadata(
+    memo_on, monkeypatch
+):
+    # The update takes its attention metadata as arguments, which the memo
+    # keys by identity, and its program depends on the block-table width
+    # inside them. With the method out of the memo, swapping block_tables on
+    # one metadata object between calls still runs the program for the new
+    # width; a memo hit would run the 64-block program for the 16-block calls.
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+    from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+
+    decorated = DFlashProposer._tpu_precompute_and_update_kv_cache
+    real_compile = torch.compile
+
+    def eager_backend(model=None, **kwargs):
+        return real_compile(model, **{**kwargs, "backend": "eager"})
+
+    monkeypatch.setattr(torch, "compile", eager_backend)
+    # The class's own tpu_compile setting, on the eager backend; its entries
+    # share the method's code object, so they are dropped after.
+    torch._dynamo.reset()
+    update = decorators.tpu_compile(
+        guard_memo=decorated._fast_dispatch_state["guard_memo"]
+    )(decorated.__wrapped__)
+    proposer = DFlashProposer.__new__(DFlashProposer)
+    proposer.draft_model = _KVDraft()
+    kv_cache = proposer.draft_model.model.layers[0].self_attn.attn.kv_cache
+    hidden = torch.ones(_BLOCK, _HIDDEN)
+    positions = torch.arange(_BLOCK, dtype=torch.int32)
+    md = AttentionMetadata(input_positions=positions)
+    try:
+        for blocks in (64, 64, 16, 16, 64):
+            md.block_tables = torch.zeros(blocks, dtype=torch.int32)
+            update(proposer, hidden, positions, (md,))
+            assert kv_cache[0].item() == blocks
+        assert fd._MEMO_STATS["hit"] == 0
+        assert update._fast_dispatch_state["memo"] == {}
+    finally:
+        torch._dynamo.reset()
+
+
 class _AOTFn:
     def __init__(self):
         self._guard_check_enabled = True
