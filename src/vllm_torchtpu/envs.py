@@ -427,6 +427,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DEFER_PREV_RESULTS_WAIT: bool = False
     VLLM_TPU_PP_LAST_ASYNC_OUTPUT: bool = False
     VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER: bool = False
+    VLLM_TPU_STAGE3_PARK_SEND_REGISTRATION: bool = False
     VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = False
     VLLM_TPU_CPU_PIN: str = "off"
     VLLM_TPU_WEIGHT_DIGEST_RANKS: str = ""
@@ -2952,6 +2953,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (runner/pp_last_async_drafter.py). Host only.
     "VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER": env_bool(
         "VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER", default=False
+    ),
+    # q38 PSTEP-L2: on a pipeline Stage-3 producer, the finishing-step KV
+    # sync in process_send_load enqueues without waiting, records a device
+    # event behind it and parks the step's send registration; the next
+    # process_send_load (every execute_model, forward or not) registers it
+    # once the event completed, waiting on it if it has not
+    # (distributed/kv_transfer/stage3_send_park.py). Host only; default off.
+    "VLLM_TPU_STAGE3_PARK_SEND_REGISTRATION": env_bool(
+        "VLLM_TPU_STAGE3_PARK_SEND_REGISTRATION", default=False
     ),
     # Async spec decode: derive the draft seed (token, position, rejected
     # count) from the rejection-sampler output in one compiled program per

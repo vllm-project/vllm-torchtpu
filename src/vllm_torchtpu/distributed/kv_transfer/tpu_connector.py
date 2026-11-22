@@ -74,6 +74,7 @@ if TYPE_CHECKING:
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.kv_transfer import kv_scatter
+from vllm_torchtpu.distributed.kv_transfer import stage3_send_park
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     LoadMeta,
     ReqId,
@@ -660,6 +661,15 @@ def _engine_is_pipeline(vllm_config: VllmConfig) -> bool:
     """A pipeline-parallel engine: each stage transfers its own layers, so
     the transfer ranks are the pipeline stages (or their PCP ranks)."""
     return _pipeline_parallel_size(vllm_config) > 1
+
+
+def _stage3_park_fence_event() -> Any:
+    """q38 PSTEP-L2: a device event recorded behind every program enqueued so
+    far (torch_tpu's record snapshots the stream after materializing it),
+    queried without blocking by the next send drain."""
+    event = torch.tpu.Event()
+    event.record()
+    return event
 
 
 def _token_pcp_size(vllm_config: VllmConfig) -> int:
@@ -4308,6 +4318,10 @@ class TPURaidenConnectorWorker:
     ) -> None:
         engine = self._ensure_raiden_transfer_engine()
         if self.is_producer:
+            park = self._stage3_send_parking()
+            if park is not None:
+                self._process_send_load_parked(park, metadata)
+                return
             if self.vllm_config.speculative_config is not None and any(
                 getattr(req_meta, "registered_ahead", False) is not True
                 for req_meta in metadata.reqs_to_send.values()
@@ -4415,6 +4429,73 @@ class TPURaidenConnectorWorker:
             self._wait_for_recving(submitted_loads)
             if not report_completion:
                 self._suppress_done_recving.update(submitted_loads)
+
+    def _stage3_send_parking(self) -> stage3_send_park.Stage3SendParking | None:
+        """q38 PSTEP-L2 (VLLM_TPU_STAGE3_PARK_SEND_REGISTRATION): this producer
+        worker's send parking, decided once; None keeps today's path."""
+        if self.__dict__.get("_stage3_send_park_decided"):
+            return self.__dict__.get("_stage3_send_park")
+        park = None
+        if stage3_send_park.enabled():
+            why = []
+            if not self._raiden_stage3_enabled():
+                why.append("not the Raiden Stage-3 transport")
+            elif not self._uses_stage3_grouped_pages():
+                why.append("not the grouped Stage-3 page path")
+            if not _engine_is_pipeline(self.vllm_config):
+                why.append("not a pipeline producer")
+            if why:
+                logger.warning(
+                    "q38 PSTEP-L2 stage-3 send park NOT ENGAGED: %s (%s)",
+                    "; ".join(why),
+                    stage3_send_park.ENV,
+                )
+            else:
+                park = stage3_send_park.Stage3SendParking(
+                    self._local_raiden_transfer_rank()
+                )
+        self._stage3_send_park = park
+        self._stage3_send_park_decided = True
+        return park
+
+    def _process_send_load_parked(
+        self,
+        park: stage3_send_park.Stage3SendParking,
+        metadata: TPUConnectorMetadata,
+    ) -> None:
+        """q38 PSTEP-L2: the producer send path with parked registration
+        (distributed/kv_transfer/stage3_send_park.py)."""
+        # Every step parked by an earlier call registers first, oldest first,
+        # each once its event completed (the drain waits on it otherwise).
+        park.drain(
+            self._register_stage3_request_blocks_grouped,
+            self._stage3_arm_parked_finish,
+        )
+        if self.vllm_config.speculative_config is not None and any(
+            getattr(req_meta, "registered_ahead", False) is not True
+            for req_meta in metadata.reqs_to_send.values()
+        ):
+            # The blocking path's materialization set, enqueued without
+            # waiting; the event behind it covers every write enqueued so far.
+            synchronize_tensors(self._flattened_kv_cache_tensors(), wait=False)
+            parked = TPUConnectorMetadata()
+            parked.reqs_to_send = dict(metadata.reqs_to_send)
+            parked.reqs_to_release = dict(metadata.reqs_to_release)
+            park.park(parked, _stage3_park_fence_event())
+            return
+        self._register_stage3_request_blocks_grouped(metadata)
+
+    def _stage3_arm_parked_finish(self, req_id: str) -> None:
+        """get_finished's finish transition for a registration that was
+        parked when finished_req_ids named its request."""
+        registration = self._stage3_registered_sends.get(req_id)
+        if registration is not None and registration.finish_pending:
+            self._stage3_registered_sends[req_id] = dataclasses.replace(
+                registration,
+                finish_pending=False,
+                expiration_time=time.time()
+                + float(dist_utils.get_p2p_wait_pull_timeout()),
+            )
 
     def _require_stage3_controller(self) -> tuple[Any, str]:
         facade = self._raiden_controller_facade
@@ -7088,6 +7169,11 @@ class TPURaidenConnectorWorker:
                         expiration_time=now
                         + float(dist_utils.get_p2p_wait_pull_timeout()),
                     )
+            park = self.__dict__.get("_stage3_send_park")
+            if park is not None and finished_req_ids:
+                # q38 PSTEP-L2: a finish of a still-parked send is applied
+                # right after its registration (Stage3SendParking.drain).
+                park.note_finished(finished_req_ids)
         self._poll_finished(engine)
         done_sending = self._done_sending
         if self.is_producer and self._raiden_stage3_enabled():
