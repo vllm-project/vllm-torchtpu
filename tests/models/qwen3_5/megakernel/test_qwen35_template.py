@@ -33,6 +33,7 @@ import torch
 import vllm_torchtpu.megakernel.adapter.agreement as agreement_mod
 import vllm_torchtpu.megakernel.adapter.driver as driver_mod
 import vllm_torchtpu.megakernel.adapter.stepping as stepping_mod
+from tests.megakernel.adapter.vllm_kv_cache_layout import kv_cache_layout
 from tests.models.qwen3_5.megakernel.test_vllm_qwen35_e2e import (
     _allocate_aliased_pools,
     _cpu_mesh,
@@ -287,10 +288,10 @@ def test_framework_slot_facts_read_the_runner_view(
     )
     pool = torch.empty((96, 2, 64, 4, 128), dtype=torch.float8_e4m3fn, device="meta")
 
+    kv_layout = kv_cache_layout(monkeypatch)
+
     def view(layout: str, pcp: int) -> Any:
-        cache = SimpleNamespace(
-            get_resolved_kv_cache_layout=lambda: SimpleNamespace(name=layout)
-        )
+        cache = SimpleNamespace(get_resolved_kv_cache_layout=lambda: kv_layout[layout])
         return SimpleNamespace(
             cache_block_size=640,
             vllm_config=SimpleNamespace(

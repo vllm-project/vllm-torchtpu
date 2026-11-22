@@ -100,7 +100,6 @@ class PoolLayoutFacts:
 def facts_from_pool_layout(layout: PoolLayout, R: int) -> PoolLayoutFacts:
     """The slot facts the megakernel's pool I/O assumes on each of `R` ranks."""
     rec_isz = jnp.dtype(layout.rec_dtype).itemsize
-    conv_isz = jnp.dtype(layout.conv_dtype).itemsize
     qkv = layout.qkv_per_rank(R)
     return PoolLayoutFacts(
         page_dtype=dtype_name(jnp.dtype(layout.page_dtype)),
@@ -112,7 +111,7 @@ def facts_from_pool_layout(layout: PoolLayout, R: int) -> PoolLayoutFacts:
         ssm_bytes=layout.vh_per_rank(R) * layout.KD * layout.VD * rec_isz,
         ssm_offset_bytes=0,
         conv_dtype=dtype_name(jnp.dtype(layout.conv_dtype)),
-        conv_bytes=layout.conv_taps * qkv * conv_isz,
+        conv_bytes=layout.conv_bytes(R),
         conv_offset_bytes=layout.conv_page * layout.page_bytes,
         conv_order=CONV_ORDER_TAPS_QKV,
         local_kh=layout.kh_per_rank(R),

@@ -42,14 +42,23 @@ from vllm_torchtpu.megakernel.core.runtime.layout_facts import (
 # Conv element order with Q/K head pairs interleaved (`TPU_GDN_CONV_QK_PAIR_LAYOUT`).
 CONV_ORDER_QK_PAIR = "qk_pair"
 
-# The page axis that holds a pool page's tokens, by the name of vLLM's
-# resolved `KVCacheLayout` (`cache_config.get_resolved_kv_cache_layout()`).
-# HND (`LBHNC`, SEQ_ALONG_LANE, the megakernel's) pages are
-# `(2 * kvh, hd / pack, pack, page_size)`; NHD (`LBNHC`, HEAD_ALONG_SUBLANE,
-# `PallasAttentionBackend.get_kv_cache_shape`) pages are
-# `(page_size, 2 * kvh / pack, pack, hd)`. Any other layout is declined.
-_PAGE_TOKEN_AXIS = {"LBHNC": -1, "LBNHC": 0}
 _PAGE_RANK = 4
+
+
+def _page_token_axis(kv_layout: Any) -> int | None:
+    """The page axis that holds a pool page's tokens under vLLM's resolved
+    `KVCacheLayout` (`cache_config.get_resolved_kv_cache_layout()`), or None.
+
+    HND (`LBHNC`, SEQ_ALONG_LANE, the megakernel's) pages are
+    `(2 * kvh, hd / pack, pack, page_size)`; NHD (`LBNHC`, HEAD_ALONG_SUBLANE,
+    `PallasAttentionBackend.get_kv_cache_shape`) pages are
+    `(page_size, 2 * kvh / pack, pack, hd)`. Any other layout is declined.
+    """
+    # Imported here, as the adapter's other vLLM imports are, so that the
+    # module imports without vLLM.
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    return {KVCacheLayout.LBHNC: -1, KVCacheLayout.LBNHC: 0}.get(kv_layout)
 
 
 def _mismatch(detail: str) -> LayoutDecline:
@@ -96,7 +105,7 @@ def framework_pool_layout_facts(
             f"prefill context parallel size {pcp_size} shards the TP-local GDN "
             "heads again per PCP rank, which these facts don't describe"
         )
-    axis = _PAGE_TOKEN_AXIS.get(kv_layout.name)
+    axis = _page_token_axis(kv_layout)
     if axis is None:
         raise _unknown(f"KV cache layout {kv_layout.name} isn't one of HND or NHD")
     page_shape = tuple(int(d) for d in pool.shape[1:])

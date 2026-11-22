@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 import torch
 
+from tests.megakernel.adapter.vllm_kv_cache_layout import kv_cache_layout
 from vllm_torchtpu import gdn_pool_layout as gpl
 from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 from vllm_torchtpu.megakernel.adapter.pool_facts import framework_pool_layout_facts
@@ -88,7 +89,7 @@ def test_qwen35_framework_slot_matches_its_pool_layout(
         pool=pool,
         linear_attn=_qwen35_gdn_layer(),
         block_size=640,
-        kv_layout=SimpleNamespace(name="LBHNC"),
+        kv_layout=kv_cache_layout(monkeypatch).LBHNC,
         pcp_size=1,
         conv_qk_pair=False,
     )

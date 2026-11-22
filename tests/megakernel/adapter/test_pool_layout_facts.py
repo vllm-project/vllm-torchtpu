@@ -18,7 +18,7 @@ the same slot (`megakernel.adapter.pool_facts`)."""
 from __future__ import annotations
 
 import dataclasses
-import enum
+import importlib
 from types import SimpleNamespace
 from typing import Any
 
@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 import torch
 
+from tests.megakernel.adapter.vllm_kv_cache_layout import kv_cache_layout
 from vllm_torchtpu import gdn_pool_layout as gpl
 from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 from vllm_torchtpu.megakernel.adapter.pool_facts import (
@@ -70,12 +71,14 @@ _FACTS = PoolLayoutFacts(
 )
 
 
-class _KVLayout(enum.Enum):
-    """Stand-in for vLLM's `KVCacheLayout` (the facts read only `.name`)."""
+@pytest.fixture(autouse=True)
+def _kv_cache_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    kv_cache_layout(monkeypatch)
 
-    LBHNC = "HND"
-    LBNHC = "NHD"
-    BLNHC = "block-major NHD"
+
+def _kv_layout(name: str) -> Any:
+    """vLLM's `KVCacheLayout` member `name` (or its stand-in without vLLM)."""
+    return importlib.import_module("vllm.v1.kv_cache_layout").KVCacheLayout[name]
 
 
 def _mk_facts(layout: PoolLayout = _LAYOUT) -> PoolLayoutFacts:
@@ -98,6 +101,10 @@ def _pool() -> torch.Tensor:
     return torch.empty((96, 2, 64, 4, 128), dtype=torch.float8_e4m3fn, device="meta")
 
 
+def _fp8_pool(*page_shape: int) -> torch.Tensor:
+    return torch.empty((8, *page_shape), dtype=torch.float8_e4m3fn, device="meta")
+
+
 @pytest.fixture
 def bf16_conv_pool(monkeypatch: pytest.MonkeyPatch) -> None:
     """A framework whose pooled conv state is bf16 (`gdn_pool_layout`'s
@@ -105,12 +112,12 @@ def bf16_conv_pool(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpl, "DEFAULT_POOLED_GDN_CONV_STATE_DTYPE", "torch.bfloat16")
 
 
-def _fw_facts(**kw: Any) -> PoolLayoutFacts:
+def _fw_facts(kv_layout: str = "LBHNC", **kw: Any) -> PoolLayoutFacts:
     args: dict[str, Any] = dict(
         pool=_pool(),
         linear_attn=_gdn_layer(),
         block_size=640,
-        kv_layout=_KVLayout.LBHNC,
+        kv_layout=_kv_layout(kv_layout),
         pcp_size=1,
         conv_qk_pair=False,
     )
@@ -169,7 +176,7 @@ def test_framework_fp32_ssm_slot_is_declined(bf16_conv_pool: None) -> None:
         (dict(block_size=1280), "slot_tokens"),
         (dict(conv_qk_pair=True), "conv_order"),
         (
-            dict(pool=torch.empty((8, 2, 64, 4, 256), dtype=torch.float8_e4m3fn)),
+            dict(pool=_fp8_pool(2, 64, 4, 256)),
             "page_shape",
         ),
     ],
@@ -191,10 +198,6 @@ def test_layout_differences_are_declined(bf16_conv_pool: None) -> None:
     assert "slot_tokens: megakernel=512 framework=640" in res.message
 
 
-def _fp8_pool(*page_shape: int) -> torch.Tensor:
-    return torch.empty((8, *page_shape), dtype=torch.float8_e4m3fn, device="meta")
-
-
 def test_framework_nhd_pool_reads_tokens_from_the_first_page_axis(
     bf16_conv_pool: None,
 ) -> None:
@@ -202,13 +205,13 @@ def test_framework_nhd_pool_reads_tokens_from_the_first_page_axis(
     take the page size from axis 0, so the layout comparison names it. Even a
     page whose dims happen to equal the megakernel's HND page doesn't match."""
     # `PallasAttentionBackend.get_kv_cache_shape(n, 128, 1, 256, fp8)`.
-    fw = _fw_facts(pool=_fp8_pool(128, 1, 4, 256), kv_layout=_KVLayout.LBNHC)
+    fw = _fw_facts(pool=_fp8_pool(128, 1, 4, 256), kv_layout="LBNHC")
     assert (fw.page_size, fw.token_bytes) == (128, 1024)
     res = compare_layout_facts(_mk_facts(), fw)
     assert not res.eligible and res.code == "pool_layout_mismatch"
     assert "page_size:" not in res.message and "token_bytes:" in res.message
 
-    fw = _fw_facts(kv_layout=_KVLayout.LBNHC)
+    fw = _fw_facts(kv_layout="LBNHC")
     assert fw.page_shape == _mk_facts().page_shape
     assert (fw.page_size, fw.token_bytes) == (2, 32768)
     res = compare_layout_facts(_mk_facts(), fw)
@@ -222,7 +225,7 @@ def test_framework_nhd_pool_reads_tokens_from_the_first_page_axis(
         # HND, 1 KV head of 128 dims in fp8: 256-byte token rows.
         (dict(pool=_fp8_pool(2, 32, 4, 128)), "pool_layout_mismatch", "granules"),
         (dict(pool=_fp8_pool(2, 64, 512)), "pool_layout_mismatch", "4-D page"),
-        (dict(kv_layout=_KVLayout.BLNHC), "pool_layout_unknown", "BLNHC"),
+        (dict(kv_layout="BLNHC"), "pool_layout_unknown", "BLNHC"),
         (dict(pcp_size=2), "pool_layout_unknown", "prefill context parallel"),
     ],
 )
