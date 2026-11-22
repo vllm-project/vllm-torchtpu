@@ -111,16 +111,16 @@ def _stitch_prefill_lane(
 ):
     """O(N) Prefill Path: Roll the entire new tokens buffer into place.
 
-    When V is not masked on load (`mask_invalid_v` off), every lane past the
-    last valid token (``bkv_sz_cache + bkv_sz_new``) is zeroed. Otherwise the
-    roll fills those lanes from the rest of the window: the rows fetched next
-    to the new tokens, which can be undefined (rows that pad the bucket), or
-    lanes nothing was fetched into (all of them on a CACHE_ONLY pass), and
-    score masking does not neutralize them, because 0 * NaN = NaN in the
-    P @ V matmul. With `mask_invalid_v` on, V is zeroed past the valid tokens
-    as it loads and the scores there are masked, so those lanes keep what the
-    roll brings in. (`_stitch_decode_lane` writes only the columns that hold
-    the stitch boundary.)
+    Every lane past the last valid token (``bkv_sz_cache + bkv_sz_new``) is
+    zeroed. Otherwise the roll fills those lanes from the rest of the window:
+    the rows fetched next to the new tokens, which can be undefined (rows that
+    pad the bucket), or lanes nothing was fetched into (all of them on a
+    CACHE_ONLY pass). The writeback copies whole 128-lane columns, so the
+    lanes past the last valid token in its column reach the KV cache, with or
+    without `mask_invalid_v`; and when V is not masked on load, score masking
+    does not neutralize such lanes, because 0 * NaN = NaN in the P @ V matmul.
+    (`_stitch_decode_lane` writes only the columns that hold the stitch
+    boundary.)
     """
     total_head_words = (
         cfgs.model.num_kv_heads * 2 * cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
@@ -135,12 +135,6 @@ def _stitch_prefill_lane(
     lane_idx = jax.lax.broadcasted_iota(
         jnp.int32, rolled_u32[..., : cfgs.bkv_sz].shape, 2
     )
-    if cfgs.serve.mask_invalid_v:
-        return jax.lax.select(
-            lane_idx >= bkv_sz_cache,
-            rolled_u32[..., : cfgs.bkv_sz],
-            vmem_u32_reshaped[..., : cfgs.bkv_sz],
-        )
     valid_end = bkv_sz_cache + bkv_sz_new
     cached_valid_end = jnp.minimum(bkv_sz_cache, valid_end)
     merged_cache_u32 = jax.lax.select(
