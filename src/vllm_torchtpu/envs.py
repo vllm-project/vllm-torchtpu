@@ -408,6 +408,8 @@ if TYPE_CHECKING:
     VLLM_TPU_PREPROC_IN_WAIT_AB_MS: int = 0
     VLLM_TPU_DEFER_FIN: bool = False
     VLLM_TPU_DEFER_FIN_AB_MS: int = 0
+    VLLM_TPU_FANIN_LATE: bool = False
+    VLLM_TPU_FANIN_LATE_AB_MS: int = 0
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -2819,6 +2821,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Engine core: in-process A/B of VLLM_TPU_DEFER_FIN in wall-clock windows
     # of this many ms (on in even windows); 0 is off. Host-only.
     "VLLM_TPU_DEFER_FIN_AB_MS": env_nonnegative_int("VLLM_TPU_DEFER_FIN_AB_MS", 0),
+    # q38 SV-KNOB FANIN-L (core/fanin_late.py): the engine core reads the
+    # non-output ranks' execute_model / sample_tokens replies one call late
+    # (their KV-transfer reports reach the aggregator one step RPC later).
+    # Host-only.
+    "VLLM_TPU_FANIN_LATE": env_bool("VLLM_TPU_FANIN_LATE", default=False),
+    # In-process A/B of VLLM_TPU_FANIN_LATE in wall-clock windows of this many
+    # ms (late reads in even windows); 0 is off. Host-only.
+    "VLLM_TPU_FANIN_LATE_AB_MS": env_nonnegative_int("VLLM_TPU_FANIN_LATE_AB_MS", 0),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
     "VLLM_TORCHTPU_IPC_KEY": lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),

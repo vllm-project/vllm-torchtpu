@@ -348,6 +348,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Finished requests freed in the engine core's waits (core/defer_fin.py).
     "VLLM_TPU_DEFER_FIN",
     "VLLM_TPU_DEFER_FIN_AB_MS",
+    # Non-output ranks' step replies read one call late (core/fanin_late.py).
+    "VLLM_TPU_FANIN_LATE",
+    "VLLM_TPU_FANIN_LATE_AB_MS",
     # Host timeline and py-spy windows (runner/host_admit_probe.py).
     "VLLM_TPU_HOSTADMIT_PROBE",
     "VLLM_TPU_HOSTADMIT_PYSPY",

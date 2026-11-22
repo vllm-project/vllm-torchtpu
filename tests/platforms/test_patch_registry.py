@@ -237,6 +237,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "patch_engine_core_gc",
         "patch_preproc_in_wait",
         "patch_defer_fin",
+        "patch_fanin_late",
         "_patch_vllm_merge_multimodal_embeddings",
         "patch_engine_core_cpu_pin",
     ]
