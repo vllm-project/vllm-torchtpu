@@ -7281,6 +7281,7 @@ class TPUModelRunner(GPUModelRunner):
                 pairs.append((num_tokens, num_reqs))
                 if num_reqs >= min(num_tokens, self.max_num_reqs):
                     break
+        bucket_order = list(pairs)
         pairs = _rotate_precompile_sweep(pairs, "rejection_sampler")
         with self._precompile_timed("rejection_sampler"):
             # padded_logits_length-shaped inputs, rebuilt when the length
@@ -7448,6 +7449,30 @@ class TPUModelRunner(GPUModelRunner):
                     num_tokens,
                     num_reqs,
                 )
+        if (
+            envs.TPU_SPEC_SYNTHETIC_FUSED_VERIFY
+            and envs.TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY
+            and self.rejection_sampler.synthetic_mode
+        ):
+            # Its LM head and sampler hold collectives, so every rank walks the
+            # shapes in one order: the rotated sweep above would pair one rank's
+            # collective with another shape's on its peers.
+            with self._precompile_timed("synthetic fused verify"):
+                for num_tokens, num_reqs in bucket_order:
+                    if synthetic_uniforms_fit(num_tokens, num_reqs):
+                        self._precompile_synthetic_fused_verify(num_tokens, num_reqs)
+
+    def _synthetic_sampler_variants(self) -> list[dict]:
+        """The synthetic sampler's static-argument variants a step can pick
+        (`_synthetic_sampler_variant`), as overrides of the defaults."""
+        variants: list[dict] = [
+            {},
+            {"apply_topk_topp": False},
+            {"apply_top_k": False},
+        ]
+        if blocks := self._topk_candidate_blocks():
+            variants.append({"topk_candidates": blocks})
+        return variants
 
     def _precompile_synthetic_verify(
         self,
@@ -7499,13 +7524,7 @@ class TPUModelRunner(GPUModelRunner):
         )
         top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(self.device)
         top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
-        variants: list[dict] = [
-            {},
-            {"apply_topk_topp": False},
-            {"apply_top_k": False},
-        ]
-        if blocks := self._topk_candidate_blocks():
-            variants.append({"topk_candidates": blocks})
+        variants = self._synthetic_sampler_variants()
         # The step samples on one path per shape, with this shape's draw.
         if self._synthetic_rows_split(num_reqs):
             from vllm.distributed import get_tensor_model_parallel_world_size
@@ -7554,37 +7573,32 @@ class TPUModelRunner(GPUModelRunner):
                 **variant,
             )
             synchronize_tensors(out)
-        if envs.TPU_SPEC_SYNTHETIC_FUSED_VERIFY and one_draw:
-            self._precompile_synthetic_fused_verify(
-                draft_token_ids,
-                target_logits_indices,
-                segment_ids,
-                group_indices,
-                draft_lengths,
-                bonus_logits_indices,
-                recover_u,
-                variants,
-            )
 
     def _precompile_synthetic_fused_verify(
-        self,
-        draft_token_ids: torch.Tensor,
-        target_logits_indices: torch.Tensor,
-        segment_ids: torch.Tensor,
-        group_indices: torch.Tensor,
-        draft_lengths: torch.Tensor,
-        bonus_logits_indices: torch.Tensor,
-        uniforms: torch.Tensor,
-        variants: list[dict],
+        self, num_tokens: int, num_reqs: int
     ) -> None:
         """`synthetic_verify_and_sample` at one (padded_logits_length,
         padded_num_reqs) pair, on hidden states of a decode-only step (one
         row per verified position) and in every sampler variant; other
-        shapes take its three programs (`_sample_synthetic_verify_fused`)."""
+        shapes take its three programs (`_sample_synthetic_verify_fused`).
+        The inputs mirror get_spec_decode_metadata's dtypes and the one draw
+        `_draw_synthetic_uniforms` makes."""
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
-        num_tokens = draft_token_ids.shape[0]
-        num_reqs = draft_lengths.shape[0]
+
+        def zeros(n: int, dtype: torch.dtype) -> torch.Tensor:
+            return torch.zeros(n, dtype=dtype).to(self.device)
+
+        draft_token_ids = zeros(num_tokens, torch.int32)
+        target_logits_indices = zeros(num_tokens, torch.int32)
+        segment_ids = zeros(num_tokens, torch.int64)
+        group_indices = zeros(num_tokens, torch.int32)
+        draft_lengths = zeros(num_reqs, torch.int32)
+        bonus_logits_indices = zeros(num_reqs, torch.int32)
+        uniforms = torch.zeros(
+            self._synthetic_uniforms_shape(num_reqs), dtype=torch.float32
+        ).to(self.device)
+        variants = self._synthetic_sampler_variants()
         hidden = torch.zeros(
             (num_tokens, self.model_config.get_hidden_size()),
             dtype=self._hidden_states_dtype,
