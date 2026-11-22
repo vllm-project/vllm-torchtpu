@@ -305,7 +305,7 @@ def load_baseline_file(path: Path) -> dict:
     """Read a baseline JSON file; raise ValueError when it is not an object."""
     try:
         baseline = json.loads(path.read_text())
-    except OSError as e:
+    except (OSError, json.JSONDecodeError) as e:
         raise ValueError(f"cannot read {path}: {e}") from e
     if not isinstance(baseline, dict):
         raise ValueError(f"{path} must hold a JSON object")

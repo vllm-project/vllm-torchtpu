@@ -148,7 +148,8 @@ that the other runs reported.
 ### Baseline freeze policy (`--mode update`)
 
 A baseline file is in one of two states, recorded in a top-level `_policy`
-block. A file without the block is in `development`.
+block. A file without the block, or with a block that has no `state`, is in
+`development`.
 
 - `development`: the setup is still below its target. Anyone may update the
   baseline.
@@ -170,9 +171,25 @@ block. A file without the block is in `development`.
 }
 ```
 
-`--mode update` checks a change to a baseline file against this rule. It exits
-`1` when a frozen baseline changed without approval and `2` when the `_policy`
-block is malformed.
+The rule in detail:
+
+- The gated values are all top-level keys that do not start with `_`. Other
+  `_` keys, such as `_source`, change freely.
+- A `frozen` block must name an `owner`. `approval` is optional and needs both
+  `approver` and `reference`. Each of the three is a non-empty string.
+- An `approval` record counts once. A record that the file already carried
+  before the change does not approve the change.
+- A new baseline file and a `development` baseline need no approval, also to
+  become `frozen`.
+
+`--mode update` checks a change to a baseline file against this rule. Pass the
+file before the change as `--previous-baseline`, and omit that flag for a new
+baseline file. The check compares the two files and does not open `reference`,
+so a reviewer confirms the approval there. No CI step runs the check yet.
+
+It exits `0` when the change follows the policy and `1` when a frozen baseline
+changed without a new approval from its owner. It exits `2` when a file cannot
+be read, is not a JSON object, or has a malformed `_policy` block.
 
 Update mode takes only `--baseline` and `--previous-baseline`, and `perf` and
 `eval` modes do not take `--previous-baseline`. A flag given to a mode that
@@ -242,8 +259,8 @@ A generation cap goes in `LM_EVAL_GEN_KWARGS` as `max_gen_toks`: the
 
 `run_benchmarks.sh` supports two runner modes via `--mode serving|spec_bench`
 (or `BENCHMARK_MODE=serving|spec_bench`; distinct from `check_regression.py
---mode perf|eval` above). In `spec_bench` mode, the runner sweeps batch size
-(`SPEC_BS_LIST`) × speculative draft tokens (`SPEC_K_LIST`) on the
+--mode perf|eval|update` above). In `spec_bench` mode, the runner sweeps batch
+size (`SPEC_BS_LIST`) × speculative draft tokens (`SPEC_K_LIST`) on the
 [Spec-Bench](https://github.com/hemingkx/Spec-Bench) dataset:
 
 1. Restarts `vllm serve` per `(BS, K)` cell with `--max-num-seqs <BS>` and

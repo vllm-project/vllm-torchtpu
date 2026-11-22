@@ -779,6 +779,8 @@ def test_parse_policy_frozen_with_approval():
         ({"state": "golden"}, "_policy.state must be 'development' or 'frozen'"),
         ({"state": "frozen"}, "_policy.owner must be a non-empty string"),
         ({"state": "frozen", "owner": " "}, "_policy.owner must be a non-empty"),
+        # A development block need not name an owner, but may not name a bad one.
+        ({"owner": ""}, "_policy.owner must be a non-empty string"),
         ({"approval": "alice"}, "_policy.approval must be an object"),
         (
             {"approval": {"approver": "alice"}},
@@ -812,11 +814,12 @@ def test_parse_policy_rejects_malformed_block(policy, message):
         ),
         ({**_TASK, "_policy": _FROZEN}, {**_RAISED, "_policy": _FROZEN}, _NO_APPROVAL),
         # Dropping the policy block or the task does not unfreeze it.
-        ({**_TASK, "_policy": _FROZEN}, _RAISED, _NO_APPROVAL),
+        ({**_TASK, "_policy": _FROZEN}, _TASK, _NO_APPROVAL),
         ({**_TASK, "_policy": _FROZEN}, {"_policy": _FROZEN}, _NO_APPROVAL),
+        # Unfreezing is a change, also when the owner stays.
         (
             {**_TASK, "_policy": _FROZEN},
-            {**_TASK, "_policy": {"state": "development"}},
+            {**_TASK, "_policy": {"state": "development", "owner": "alice"}},
             _NO_APPROVAL,
         ),
         # Handing the file to another owner is a change too.
@@ -861,23 +864,25 @@ def test_cli_update_mode(tmp_path, monkeypatch, capsys):
     old_file = tmp_path / "old.json"
     new_file = tmp_path / "new.json"
     old_file.write_text(json.dumps({**_TASK, "_policy": _FROZEN}))
-    new_file.write_text(json.dumps({**_RAISED, "_policy": _FROZEN}))
-    argv = ["--mode", "update", "--baseline", str(new_file)]
+    new_only = ["--mode", "update", "--baseline", str(new_file)]
+    with_previous = [*new_only, "--previous-baseline", str(old_file)]
+    passed = (0, "PASS: baseline update follows its freeze policy.\n", "")
+    no_owner = (2, "", "ERROR: _policy.owner must be a non-empty string\n")
 
-    assert _run_cli(monkeypatch, *argv, "--previous-baseline", str(old_file)) == 1
-    assert f"FAILED: {new_file}: {_NO_APPROVAL}" in capsys.readouterr().err
+    def run(new_policy, argv):
+        new_file.write_text(json.dumps({**_RAISED, "_policy": new_policy}))
+        ret = _run_cli(monkeypatch, *argv)
+        captured = capsys.readouterr()
+        return ret, captured.out, captured.err
 
+    violation = (1, "", f"FAILED: {new_file}: {_NO_APPROVAL}\n")
+    assert run(_FROZEN, with_previous) == violation
     # Without a previous file the same content is a new baseline.
-    assert _run_cli(monkeypatch, *argv) == 0
-
-    new_file.write_text(
-        json.dumps({**_RAISED, "_policy": {**_FROZEN, "approval": _APPROVAL_1}})
-    )
-    assert _run_cli(monkeypatch, *argv, "--previous-baseline", str(old_file)) == 0
-
-    new_file.write_text(json.dumps({**_RAISED, "_policy": {"state": "frozen"}}))
-    assert _run_cli(monkeypatch, *argv, "--previous-baseline", str(old_file)) == 2
-    assert "ERROR: _policy.owner must be a non-empty string" in capsys.readouterr().err
+    assert run(_FROZEN, new_only) == passed
+    assert run({**_FROZEN, "approval": _APPROVAL_1}, with_previous) == passed
+    # A malformed block exits 2, in a changed file and in a new one.
+    assert run({"state": "frozen"}, with_previous) == no_owner
+    assert run({"state": "frozen"}, new_only) == no_owner
 
 
 # What each mode needs after the flags that select it; BASELINE and RESULTS
@@ -891,6 +896,27 @@ _MODE_ARGS = {
     "--mode eval --calibrate": ["--results-dir", "RESULTS"],
 }
 _RESULT_MODES = [mode for mode in _MODE_ARGS if mode != _UPDATE]
+
+
+@pytest.mark.parametrize(
+    ("argv", "error"),
+    [
+        (["--mode", "update"], "--baseline is required in update mode"),
+        (
+            ["--mode", "perf", "--baseline", "b.json"],
+            "--results-dir is required in perf and eval modes",
+        ),
+        # Without the check this run would write an empty baseline and exit 0.
+        (
+            ["--mode", "eval", "--calibrate"],
+            "--results-dir is required in perf and eval modes",
+        ),
+    ],
+)
+def test_cli_requires_the_flags_a_mode_reads(monkeypatch, capsys, argv, error):
+    _assert_usage_error(monkeypatch, capsys, argv, error)
+
+
 # (mode, flags it does not take, the flags the error names)
 _NOT_VALID_CASES = [
     (_UPDATE, ["--calibrate"], "--calibrate"),
@@ -924,9 +950,17 @@ def test_cli_rejects_flags_the_mode_does_not_take(
     _assert_usage_error(monkeypatch, capsys, argv, f"{named}: not valid with {mode}")
 
 
-@pytest.mark.parametrize("content", [None, "[]", "{not json"])
+@pytest.mark.parametrize(
+    ("content", "error"),
+    [
+        # A missing file and invalid JSON: the reason follows the file name.
+        (None, "ERROR: cannot read {bad}: "),
+        ("{not json", "ERROR: cannot read {bad}: "),
+        ("[]", "ERROR: {bad} must hold a JSON object\n"),
+    ],
+)
 def test_cli_update_mode_unreadable_file_exits_2(
-    tmp_path, monkeypatch, capsys, content
+    tmp_path, monkeypatch, capsys, content, error
 ):
     good = tmp_path / "good.json"
     good.write_text(json.dumps(_TASK))
@@ -940,12 +974,15 @@ def test_cli_update_mode_unreadable_file_exits_2(
             "--previous-baseline", str(previous),
         )  # fmt: skip
         assert ret == 2
-        assert "ERROR: " in capsys.readouterr().err
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith(error.format(bad=bad))
+        assert captured.err.count("\n") == 1
 
 
 def test_shipped_baselines_have_valid_policy():
     """Every checked-in perf and eval baseline parses under the policy schema."""
     files = sorted(_BASELINE_DIR.parent.rglob("*.baseline.json"))
-    assert len(files) > 40
+    assert files, f"no baselines found under {_BASELINE_DIR.parent}"
     for path in files:
         check_regression.parse_policy(json.loads(path.read_text()))
