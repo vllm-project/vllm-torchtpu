@@ -599,83 +599,48 @@ def test_check_regression_cli_output(tmp_path, monkeypatch, capsys):
 def test_aggregate_eval_runs_single_run_keeps_reported_stderr():
     runs = [{"mmlu_pro": {"acc,none": 0.8, "acc_stderr,none": 0.02}}]
     assert check_regression.aggregate_eval_runs(runs).entries == {
-        "mmlu_pro": {"acc,none": 0.8, "acc_stderr,none": 0.02, "num_runs": 1}
+        "mmlu_pro": {"acc,none": 0.8, "acc_stderr,none": 0.02}
     }
 
 
 def test_aggregate_eval_runs_single_run_without_stderr():
     runs = [{"mmlu_pro": {"acc,none": 0.8}}]
     assert check_regression.aggregate_eval_runs(runs).entries == {
-        "mmlu_pro": {"acc,none": 0.8, "num_runs": 1}
+        "mmlu_pro": {"acc,none": 0.8}
     }
 
 
-def test_aggregate_eval_runs_below_min_runs_keeps_reported_stderr():
-    # Three runs are fewer than MIN_RUNS_FOR_EMPIRICAL_STDERR (5): both the
-    # value and the reported stderr use the mean (asymmetric inputs separate
-    # mean from median: values 0.80/0.80/0.86 have mean 0.82 vs. median 0.80;
-    # stderrs 0.03/0.04/0.08 have mean 0.05 vs. median 0.04).
+@pytest.mark.parametrize(
+    "runs_data",
+    [
+        ((0.80, 0.03), (0.80, 0.04), (0.86, 0.08)),
+        # Any number of runs: five keep the reported stderr like three do.
+        ((0.80, 0.03), (0.80, 0.03), (0.80, 0.04), (0.80, 0.07), (0.90, 0.08)),
+    ],
+)
+def test_aggregate_eval_runs_averages_value_and_reported_stderr(runs_data):
+    # Both the value and the reported stderr use the mean. Asymmetric inputs
+    # separate mean from median: the values have mean 0.82 and median 0.80,
+    # the stderrs mean 0.05 and median 0.04.
     runs = [
         {"mmlu_pro": {"acc,none": value, "acc_stderr,none": stderr}}
-        for value, stderr in ((0.80, 0.03), (0.80, 0.04), (0.86, 0.08))
+        for value, stderr in runs_data
     ]
-    assert check_regression.MIN_RUNS_FOR_EMPIRICAL_STDERR == 5
     assert check_regression.aggregate_eval_runs(runs).entries == {
         "mmlu_pro": {
             "acc,none": pytest.approx(0.82, abs=1e-12),
             "acc_stderr,none": pytest.approx(0.05, abs=1e-12),
-            "num_runs": 3,
         }
     }
 
 
-def test_aggregate_eval_runs_below_min_runs_needs_stderr_from_every_run():
+def test_aggregate_eval_runs_needs_stderr_from_every_run():
     runs = [
         {"mmlu_pro": {"acc,none": 0.80, "acc_stderr,none": 0.05}},
         {"mmlu_pro": {"acc,none": 0.90}},
     ]
     assert check_regression.aggregate_eval_runs(runs).entries == {
-        "mmlu_pro": {"acc,none": pytest.approx(0.85, abs=1e-12), "num_runs": 2}
-    }
-
-
-def test_aggregate_eval_runs_empirical_stderr_from_five_runs():
-    # Asymmetric inputs: mean is 0.82 (median is 0.80), sample variance is
-    # 0.008 / 4 = 0.002, and stdev / sqrt(5) = sqrt(0.0004) = 0.02.
-    # It replaces the per-run reported 0.05.
-    runs = [
-        {"mmlu_pro": {"acc,none": value, "acc_stderr,none": 0.05}}
-        for value in (0.80, 0.80, 0.80, 0.80, 0.90)
-    ]
-    assert check_regression.aggregate_eval_runs(runs).entries == {
-        "mmlu_pro": {
-            "acc,none": pytest.approx(0.82, abs=1e-12),
-            "acc_stderr,none": pytest.approx(0.02, abs=1e-12),
-            "num_runs": 5,
-        }
-    }
-
-
-def test_aggregate_eval_runs_five_identical_runs_have_zero_stderr():
-    runs = [{"mmlu_pro": {"acc,none": 0.5, "acc_stderr,none": 0.03}}] * 5
-    assert check_regression.aggregate_eval_runs(runs).entries == {
-        "mmlu_pro": {"acc,none": 0.5, "acc_stderr,none": 0.0, "num_runs": 5}
-    }
-
-
-def test_aggregate_eval_runs_caps_measured_stderr_at_reported():
-    # One collapsed run: stdev / sqrt(5) is 0.16, far above the 0.011 that
-    # every run reported, so the reported stderr caps it.
-    runs = [
-        {"mmlu_pro": {"acc,none": value, "acc_stderr,none": 0.011}}
-        for value in (0.80, 0.80, 0.80, 0.80, 0.00)
-    ]
-    assert check_regression.aggregate_eval_runs(runs).entries == {
-        "mmlu_pro": {
-            "acc,none": pytest.approx(0.64, abs=1e-12),
-            "acc_stderr,none": pytest.approx(0.011, abs=1e-12),
-            "num_runs": 5,
-        }
+        "mmlu_pro": {"acc,none": pytest.approx(0.85, abs=1e-12)}
     }
 
 
@@ -685,9 +650,7 @@ def test_aggregate_eval_runs_returns_metric_missing_from_a_run(capsys):
         {"mmlu_pro": {"acc,none": 0.9}},
     ]
     entries, dropped = check_regression.aggregate_eval_runs(runs)
-    assert entries == {
-        "mmlu_pro": {"acc,none": pytest.approx(0.85, abs=1e-12), "num_runs": 2}
-    }
+    assert entries == {"mmlu_pro": {"acc,none": pytest.approx(0.85, abs=1e-12)}}
     assert dropped == [("mbpp", "pass_at_1,none")]
     captured = capsys.readouterr()
     assert (captured.out, captured.err) == ("", "")
@@ -717,10 +680,10 @@ def test_calibrate_eval_uses_mean_for_any_listed_task(tmp_path):
         for i, value in enumerate((0.40, 0.40, 0.70))
     ]
     assert check_regression.calibrate_eval(dirs, None) == {
-        "gpqa_diamond": {"acc,none": pytest.approx(0.50, abs=1e-12), "num_runs": 3}
+        "gpqa_diamond": {"acc,none": pytest.approx(0.50, abs=1e-12)}
     }
     assert check_regression.calibrate_eval(dirs, {"gpqa_diamond", "mmlu_pro"}) == {
-        "gpqa_diamond": {"acc,none": pytest.approx(0.50, abs=1e-12), "num_runs": 3}
+        "gpqa_diamond": {"acc,none": pytest.approx(0.50, abs=1e-12)}
     }
 
 
@@ -783,7 +746,7 @@ def test_cli_calibrate_eval_writes_mean_of_selected_tasks(
     )  # fmt: skip
     assert ret == 0
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {"mmlu_pro": {"acc,none": 0.625, "num_runs": 2}}
+    assert json.loads(captured.out) == {"mmlu_pro": {"acc,none": 0.625}}
     assert captured.err == ""
 
 
@@ -792,12 +755,11 @@ def test_cli_calibrate_eval_writes_mean_of_selected_tasks(
     [
         # One run: 1.645 * hypot(0.02, 0.02) = 0.0465, drop 0.04 passes.
         ({"acc,none": 0.86, "acc_stderr,none": 0.02}, 1, 0.0465276262, "PASS"),
-        # Two runs gate exactly as wide as one, with or without a run stderr.
+        # Several runs gate exactly as wide as one, with or without a run
+        # stderr, also when the runs agree exactly.
         ({"acc,none": 0.86, "acc_stderr,none": 0.02}, 2, 0.0465276262, "PASS"),
         ({"acc,none": 0.86}, 2, 0.0465276262, "PASS"),
-        # Five identical runs have stderr 0.0, so only the baseline's 0.02
-        # counts: 1.645 * hypot(0.02, 0.0) = 0.0329, and the same drop fails.
-        ({"acc,none": 0.86, "acc_stderr,none": 0.02}, 5, 0.0329, "FAIL"),
+        ({"acc,none": 0.86, "acc_stderr,none": 0.02}, 5, 0.0465276262, "PASS"),
     ],
 )
 def test_check_eval_gate_width_by_number_of_runs(
@@ -812,65 +774,20 @@ def test_check_eval_gate_width_by_number_of_runs(
     assert row.status == expected_status
 
 
-def _runs(values, stderr=None):
-    extra = {} if stderr is None else {"acc_stderr,none": stderr}
-    return [{"mmlu_pro": {"acc,none": value, **extra}} for value in values]
-
-
 def test_check_eval_one_collapsed_run_of_five_fails():
-    # The mean is 0.64. The reported 0.011 caps the measured stderr of 0.16,
-    # so the allowed drop is 2.132 * hypot(0.011, 0.011) = 0.0332, not 0.342.
+    # The mean is 0.64. The spread of the runs does not widen the gate: the
+    # allowed drop is 1.645 * hypot(0.011, 0.011) = 0.0256, as for one run.
     baseline = {"mmlu_pro": {"acc,none": 0.80, "acc_stderr,none": 0.011}}
     results = check_regression.aggregate_eval_runs(
-        _runs((0.80, 0.80, 0.80, 0.80, 0.00), stderr=0.011)
+        [
+            {"mmlu_pro": {"acc,none": value, "acc_stderr,none": 0.011}}
+            for value in (0.80, 0.80, 0.80, 0.80, 0.00)
+        ]
     ).entries
     row = check_regression.check_eval(results, baseline, 0.015).rows[0]
     assert row.actual == pytest.approx(0.64, abs=1e-12)
-    assert row.allowed_drop == pytest.approx(0.0331661365, abs=1e-9)
+    assert row.allowed_drop == pytest.approx(0.0255901935, abs=1e-9)
     assert row.status == "FAIL"
-
-
-def test_check_eval_measured_stderr_uses_student_t():
-    # Five runs: stdev 0.0316, stderr of the mean 0.014142. Its 4 degrees of
-    # freedom take the t value 2.132, not 1.645: 2.132 * 0.014142 = 0.03015.
-    baseline = {"mmlu_pro": {"acc,none": 0.90}}
-    results = check_regression.aggregate_eval_runs(
-        _runs((0.84, 0.86, 0.88, 0.90, 0.92))
-    ).entries
-    row = check_regression.check_eval(results, baseline, 0.015).rows[0]
-    assert row.stderr == pytest.approx(0.0141421356, abs=1e-9)
-    assert row.allowed_drop == pytest.approx(0.0301510332, abs=1e-9)
-
-
-@pytest.mark.parametrize("swap", [False, True])
-def test_check_eval_two_measured_sides_use_smaller_degrees_of_freedom(swap):
-    # Five runs give stderr 0.01 (4 df), six give 0.015275 (5 df). Either way
-    # round the t value is the one for 4 df: 2.132 * hypot(0.01, 0.015275).
-    five = check_regression.aggregate_eval_runs(
-        _runs((0.72, 0.74, 0.75, 0.76, 0.78))
-    ).entries
-    six = check_regression.aggregate_eval_runs(
-        _runs((0.70, 0.72, 0.74, 0.76, 0.78, 0.80))
-    ).entries
-    baseline, results = (six, five) if swap else (five, six)
-    row = check_regression.check_eval(results, baseline, 0.015).rows[0]
-    assert row.stderr == pytest.approx(0.0182574186, abs=1e-9)
-    assert row.allowed_drop == pytest.approx(0.0389248164, abs=1e-9)
-
-
-def test_check_eval_run_without_stderr_against_five_run_baseline():
-    # The baseline stores the stderr of the mean of 5 runs, 0.01. One run
-    # without a stderr is sqrt(5) times as noisy, so the difference has
-    # 0.01 * sqrt(6) = 0.024495 and the allowed drop is 2.132 times that.
-    baseline = check_regression.aggregate_eval_runs(
-        _runs((0.72, 0.74, 0.75, 0.76, 0.78))
-    ).entries
-    assert baseline["mmlu_pro"]["acc_stderr,none"] == pytest.approx(0.01, abs=1e-12)
-    results = {"mmlu_pro": {"acc,none": 0.72}}
-    row = check_regression.check_eval(results, baseline, 0.015).rows[0]
-    assert row.stderr == pytest.approx(0.0244948974, abs=1e-9)
-    assert row.allowed_drop == pytest.approx(0.0522231213, abs=1e-9)
-    assert row.status == "PASS"
 
 
 def test_check_eval_missing_primary_metric_fails_as_no_result():
@@ -883,24 +800,9 @@ def test_check_eval_missing_primary_metric_fails_as_no_result():
             {"mmlu_llama": {"acc,none": 0.95}},
         ]
     ).entries
-    assert results == {"mmlu_llama": {"acc,none": 0.95, "num_runs": 2}}
+    assert results == {"mmlu_llama": {"acc,none": 0.95}}
     row = check_regression.check_eval(results, baseline, 0.015).rows[0]
     assert (row.metric, row.status) == ("(no result)", "FAIL")
-
-
-def test_check_eval_baseline_from_five_identical_runs():
-    # A baseline with stderr 0.0 is exact: the run's own 0.02 sets the width,
-    # 1.645 * 0.02 = 0.0329, and a run without a stderr gets the flat 0.015.
-    baseline = check_regression.aggregate_eval_runs(
-        [{"mmlu_pro": {"acc,none": 0.9}}] * 5
-    ).entries
-    with_stderr = {"mmlu_pro": {"acc,none": 0.88, "acc_stderr,none": 0.02}}
-    row = check_regression.check_eval(with_stderr, baseline, 0.015).rows[0]
-    assert (row.allowed_drop, row.status) == (pytest.approx(0.0329, abs=1e-12), "PASS")
-    row = check_regression.check_eval(
-        {"mmlu_pro": {"acc,none": 0.88}}, baseline, 0.015
-    ).rows[0]
-    assert (row.allowed_drop, row.status) == (0.015, "FAIL")
 
 
 @pytest.mark.parametrize(
@@ -911,9 +813,9 @@ def test_check_eval_baseline_from_five_identical_runs():
         # mean 0.88, drop 0.02 beyond the flat 0.015 tolerance
         ((0.87, 0.89), 1),
         ((0.89,), 0),
-        # Five runs, mean 0.88, stdev 0.0316, stderr 0.01414: allowed drop is
-        # 2.132 * 0.01414 = 0.03015, so the same 0.02 drop passes.
-        ((0.84, 0.86, 0.88, 0.90, 0.92), 0),
+        # Five runs gate like two: mean 0.88, and their spread does not widen
+        # the flat 0.015 tolerance.
+        ((0.84, 0.86, 0.88, 0.90, 0.92), 1),
     ],
 )
 def test_cli_eval_gates_on_mean_of_runs(

@@ -88,24 +88,8 @@ def stderr_key(metric: str) -> str:
 # 1.41x a single run's stderr, not 1x. Gating at one raw stderr would still
 # fail ~24% of clean reruns on a small benchmark like humaneval_plus (N=164,
 # stderr ~2.3pp); scaling the difference's stderr by the one-sided 95%
-# critical value puts that at 5% by construction. The normal value holds while
-# both stderrs are the ones the runs reported.
+# critical value puts that at 5% by construction.
 Z_ONE_SIDED_95 = 1.645
-
-# One-sided 95% Student-t critical values by degrees of freedom. A stderr
-# measured from the spread of N runs has only N - 1 degrees of freedom, and
-# scaling it by the normal value would fail 8.8% of clean 5-run checks, not 5%.
-# Between two rows the lower one applies, which is the wider gate.
-# fmt: off
-T_ONE_SIDED_95 = {
-    1: 6.314, 2: 2.920, 3: 2.353, 4: 2.132, 5: 2.015, 6: 1.943, 7: 1.895,
-    8: 1.860, 9: 1.833, 10: 1.812, 11: 1.796, 12: 1.782, 13: 1.771, 14: 1.761,
-    15: 1.753, 16: 1.746, 17: 1.740, 18: 1.734, 19: 1.729, 20: 1.725,
-    21: 1.721, 22: 1.717, 23: 1.714, 24: 1.711, 25: 1.708, 26: 1.706,
-    27: 1.703, 28: 1.701, 29: 1.699, 30: 1.697, 40: 1.684, 60: 1.671,
-    120: 1.658,
-}
-# fmt: on
 
 # Guards the exactly-at-threshold comparison against binary floating-point
 # error (e.g. 0.88 - 0.90 == -0.020000000000000018, not -0.02).
@@ -282,13 +266,6 @@ def load_eval_results(results_dir: Path) -> dict[str, dict]:
     return out
 
 
-# Fewest runs whose spread replaces the per-run reported stderr. The spread of
-# N runs has N - 1 degrees of freedom; below 5 runs it is too rough an estimate
-# to narrow a gate with, so fewer runs keep the single-run stderr and only the
-# value is averaged.
-MIN_RUNS_FOR_EMPIRICAL_STDERR = 5
-
-
 class AggregatedRuns(NamedTuple):
     """The per-task mean of several runs, and what could not be averaged."""
 
@@ -300,17 +277,10 @@ class AggregatedRuns(NamedTuple):
 def aggregate_eval_runs(runs: Sequence[dict[str, dict]]) -> AggregatedRuns:
     """Collapse the results of N runs into one entry per task.
 
-    Each accuracy value becomes the mean over the runs. Its stderr depends on
-    N:
-
-    - N < MIN_RUNS_FOR_EMPIRICAL_STDERR: the mean of the stderrs the runs
-      reported, present only when every run reported one. The gate is then as
-      wide as for a single run.
-    - N >= MIN_RUNS_FOR_EMPIRICAL_STDERR: the empirical standard error of the
-      mean, ``stdev(values) / sqrt(N)``. Runs that agree exactly give 0.0, so
-      a deterministic task falls back to the flat tolerance on its side. When
-      every run reported a stderr, their mean caps the measured one, so a
-      broken run cannot widen the gate that judges it.
+    Each accuracy value becomes the mean over the runs. Its stderr is the mean
+    of the stderrs the runs reported, present only when every run reported
+    one. Only the value is averaged: the stderr stays that of a single run, so
+    the gate is as wide as for a single run.
 
     A metric that any run lacks is left out of the entries and returned in
     ``dropped``, so a run that lost a task shows up as a missing result
@@ -333,15 +303,10 @@ def aggregate_eval_runs(runs: Sequence[dict[str, dict]]) -> AggregatedRuns:
                 continue
             entry[k] = statistics.fmean(values)
             reported = [e[stderr_key(k)] for e in entries if stderr_key(k) in e]
-            if n >= MIN_RUNS_FOR_EMPIRICAL_STDERR:
-                measured = statistics.stdev(values) / math.sqrt(n)
-                if len(reported) == n:
-                    measured = min(measured, statistics.fmean(reported))
-                entry[stderr_key(k)] = measured
-            elif len(reported) == n:
+            if len(reported) == n:
                 entry[stderr_key(k)] = statistics.fmean(reported)
         if entry:
-            out[task] = {**entry, "num_runs": n}
+            out[task] = entry
     return AggregatedRuns(out, dropped)
 
 
@@ -380,11 +345,8 @@ def delta_stderr(
     sets the scale for both sides, the run's stderr for its own side only.
 
     - Both report: ``hypot(se_baseline, se_run)``.
-    - Run reports none: assume it is as noisy as one run of the baseline. A
-      baseline of fewer than MIN_RUNS_FOR_EMPIRICAL_STDERR runs stores a
-      single run's stderr, recovering the ``sqrt(2) * se_baseline`` form. From
-      that many runs on it stores the stderr of the mean of ``num_runs`` runs,
-      so the run gets ``se_baseline * sqrt(num_runs)``.
+    - Run reports none: assume it is as noisy as the baseline, recovering the
+      ``sqrt(2) * se_baseline`` form.
     - Baseline reports none: the baseline is treated as exact, giving
       ``hypot(0.0, se_run) == se_run``. The gate still widens off the run's
       measured stderr rather than dropping back to the flat tolerance, but by
@@ -397,32 +359,7 @@ def delta_stderr(
     se_results = primary_stderr(results_entry or {}, metric_name)
     if se_results is None:
         se_results = se_baseline
-        num_runs = baseline_entry.get("num_runs", 1)
-        if num_runs >= MIN_RUNS_FOR_EMPIRICAL_STDERR:
-            se_results *= math.sqrt(num_runs)
     return math.hypot(se_baseline, se_results)
-
-
-def critical_value(
-    baseline_entry: dict, results_entry: dict | None, metric_name: str
-) -> float:
-    """One-sided 95% critical value that scales ``delta_stderr()``.
-
-    A side whose non-zero stderr was measured from the spread of its runs
-    (``num_runs >= MIN_RUNS_FOR_EMPIRICAL_STDERR``) calls for the Student-t
-    value at ``num_runs - 1`` degrees of freedom, the smaller of the two when
-    both sides are measured. Otherwise the normal value applies.
-    """
-    measured_dfs = [
-        entry["num_runs"] - 1
-        for entry in (baseline_entry, results_entry or {})
-        if entry.get("num_runs", 1) >= MIN_RUNS_FOR_EMPIRICAL_STDERR
-        and primary_stderr(entry, metric_name)
-    ]
-    if not measured_dfs:
-        return Z_ONE_SIDED_95
-    df = min(measured_dfs)
-    return T_ONE_SIDED_95[max(k for k in T_ONE_SIDED_95 if k <= df)]
 
 
 class EvalRow(NamedTuple):
@@ -485,12 +422,7 @@ def check_eval(
         se_delta = (
             delta_stderr(baseline[task], results.get(task), metric_name) if b else 0.0
         )
-        critical = (
-            critical_value(baseline[task], results.get(task), metric_name)
-            if b
-            else Z_ONE_SIDED_95
-        )
-        allowed_drop = max(tolerance, critical * se_delta)
+        allowed_drop = max(tolerance, Z_ONE_SIDED_95 * se_delta)
         defaults = {
             "allowed_drop": allowed_drop,
             "stderr": se_delta,

@@ -81,6 +81,11 @@ Compares `lm_eval` accuracy to `baselines/eval/<config>.<task>.baseline.json`.
 The default tolerance is 1.5pp; a config can override it with `EVAL_TOLERANCE`.
 Only keys present in the baseline are gated.
 
+Each task is compared on the accuracy metric of its baseline entry, the first
+in the script's `ACC_KEYS` order when the entry has several. A task whose
+results lack that metric fails as `(no result)`, also for a single run. No
+other accuracy metric of the task stands in for it.
+
 Where the baseline carries a standard error (`exact_match_stderr`), the allowed
 drop becomes a one-sided 95% significance test:
 
@@ -91,8 +96,6 @@ max(tolerance, 1.645 * hypot(stderr_baseline, stderr_run))
 When only one side records a standard error, the two cases differ:
 
 - **Baseline only**: it sets the scale for both sides, `sqrt(2) * stderr_baseline`.
-  A baseline calibrated from 5 or more runs stores the standard error of their
-  mean, so the single run gets `stderr_baseline * sqrt(num_runs)`.
 - **Run only**: it covers only its own side, and the baseline is treated as
   exact, `stderr_run`.
 
@@ -115,29 +118,17 @@ python3 scripts/vllm/benchmarking/check_regression.py \
 
 Pass `--results-dir` once per run, both to calibrate a baseline and to check
 against one. The accuracy value is the mean over the runs. The standard error
-depends on the number of runs N:
+is the mean of the standard errors the runs reported, kept only when every run
+reported one.
 
-- Fewer than 5 runs: the mean of the standard errors the runs reported, kept
-  only when every run reported one. The gate is as wide as for a single run.
-- 5 or more runs: the measured spread, `stdev(values) / sqrt(N)`, in place of
-  the per-run `lm_eval` estimate. Runs that agree exactly give 0, so a
-  deterministic task falls back to the flat tolerance on its side. When every
-  run reported a standard error, their mean caps the measured spread, so one
-  broken run cannot widen the gate that judges it. Runs that report none have
-  no such cap.
+Only the value is averaged. The standard error stays that of a single run, so
+the gate is as wide as for a single run, whatever the number of runs. The
+allowed drop is the same formula as above.
 
-The spread of fewer than 5 runs is too rough an estimate to narrow a gate with.
-
-The allowed drop is the same formula as above, except for the factor 1.645. A
-non-zero standard error measured from N runs has N - 1 degrees of freedom, so
-the one-sided 95% Student-t value takes its place (2.132 at 5 runs). When both
-sides are measured, the smaller N applies. This gate is tighter than the
-single-run gate when the runs agree closely, and wider when they do not.
-
-A metric that any of the runs lacks is dropped, so a run that lost a task fails
-the check as a missing result. `--calibrate` exits `2` instead of writing a
-baseline when a run is empty or lacks a metric that another run has. Calibrated
-entries record `num_runs`, also for a single run.
+A metric that any of the runs lacks is dropped with a warning, so a run that
+lost a task fails the check as a missing result. `--calibrate` exits `2`
+instead of writing a baseline when a run is empty or lacks a metric that
+another run has.
 
 ```bash
 python3 scripts/vllm/benchmarking/check_regression.py \
