@@ -153,21 +153,22 @@ def test_expert_range_kernel_name(monkeypatch):
 @pytest.mark.parametrize(
     "i_chunk, expected",
     [
-        ("256", {16: (256, 6), 32: (256, 6), 64: (256, 5)}),
-        ("512", {16: (512, 3), 32: (512, 3), 64: (256, 5)}),
+        (256, {16: (256, 6), 32: (256, 6), 64: (256, 5)}),
+        (512, {16: (512, 3), 32: (512, 3), 64: (256, 5)}),
     ],
 )
 def test_wider_i_chunk_steps_ring_depth_on_large_buckets(
     monkeypatch, i_chunk, expected
 ):
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
-    monkeypatch.setenv("TPU_MOE_TP_DECODE_I_CHUNK", i_chunk)
     info = _tpu7x()
     for rows, (exp_ic, exp_nb) in expected.items():
         shapes = _shapes(rows, 6144, 32, 1024, 128, score_experts=256)
         assert kernel.can_use_moe_tp_decode(*shapes, topk=8, n_ranks=N_RANKS)
         spec = all_reduce.make_spec(N_RANKS, rows, 6144)
-        plan = kernel_impl._plan_ring(rows, 6144, 1024, 256, 128, info, spec)
+        plan = kernel_impl._plan_ring(  # noqa: SLF001 -- no public (ic, nb) seam
+            rows, 6144, 1024, 256, 128, info, spec, max_i_chunk=i_chunk
+        )
         assert plan is not None
         assert plan[:2] == (exp_ic, exp_nb)
 
