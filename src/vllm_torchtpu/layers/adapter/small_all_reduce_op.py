@@ -52,9 +52,14 @@ count from the token-padding mask and exchanges a lone valid row in one round
 (its one-row build); every trace then reads the mask (``retain``).
 """
 
+from typing import Any
+
 import jax
 import torch
 from jax.sharding import PartitionSpec
+
+from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
@@ -67,6 +72,8 @@ from vllm_torchtpu.kernels.experimental.small_collectives import (
     reduce_scatter,
 )
 from vllm_torchtpu.kernels.experimental.small_collectives.common import LANES
+from vllm_torchtpu.kernels.quantized_matmul import fp8_oproj_all_reduce
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_N_ATTR,
     FP8_PALLAS_WEIGHT,
@@ -74,11 +81,6 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     PREQUANT_ATTR,
 )
 from vllm_torchtpu.logger import init_logger
-
-from vllm_torchtpu import envs
-from vllm_torchtpu.compilation import shape_variants
-from vllm_torchtpu.kernels.quantized_matmul import fp8_oproj_all_reduce
-from vllm_torchtpu.layers.adapter import token_padding
 
 logger = init_logger(__name__)
 
@@ -88,6 +90,11 @@ MAX_ROWS = 96
 # Largest DP combine, in rows per engine, the reduce-scatter takes: it beats
 # XLA through 24 rows, ties at 32 and loses at 64 (j-de6349e8).
 COMBINE_MAX_ROWS = 24
+# Smallest decode bucket where fusing post_attention_layernorm into o_proj AR
+# beats XLA's router-norm fusion (m <= 4 keeps the unfused path).
+# Avoid RMSNORM_MIN_M = 8: intersects small-A2A s0 <= 8 guard into constant
+# s0 == 8 under mark_dynamic; 5 matches the existing m <= 4 / m >= 5 split.
+RMSNORM_MIN_M = 5
 
 
 def max_rows() -> int:
@@ -108,6 +115,7 @@ _VALID_TILE_ROWS = 0
 # data (see small_collectives/common.py).
 _RANK = None
 _CORES = 0
+_MESH = None
 _MESH_RANKS: tuple[int, ...] = ()
 # Whether the DP group is the mesh, so its combine may take the kernel.
 _DP_COMBINE = False
@@ -117,6 +125,9 @@ _MM_AR_OP = None
 # Whether _MM_AR_OP is the one-row build (TPU_ONE_ROW_ALL_REDUCE), which
 # takes the valid-row count.
 _MM_AR_ONE_ROW = False
+# Fused o_proj + all-reduce + residual_add + RMSNorm ops keyed by eps.
+_MM_AR_RN_OPS: dict[float, Any] = {}
+_PENDING_RMSNORM_EPS: set[float] = set()
 
 
 def _build_all_reduce(mesh, psum_above: int | None = None):
@@ -254,6 +265,112 @@ def _build_matmul_all_reduce_one_row(mesh, waves: bool):
     )
 
 
+def _build_matmul_all_reduce_rmsnorm(mesh, waves: bool, eps: float, one_row: bool):
+    """Fused o_proj + all-reduce + residual_add + RMSNorm over ``mesh``."""
+    n = mesh.shape[EP_AXIS_NAME]
+    spec = PartitionSpec(EP_AXIS_NAME)
+    tag = f"{float(eps):.3e}".replace(".", "p").replace("-", "m").replace("+", "")
+    eps_f = float(eps)
+
+    if one_row:
+
+        def body_one(x, w, w_s, n_valid, rank, residual, norm_w):
+            return fp8_oproj_all_reduce.fp8_matmul_all_reduce(
+                x,
+                w,
+                w_s,
+                rank,
+                num_cores=n,
+                axis=EP_AXIS_NAME,
+                waves=waves,
+                n_valid=n_valid,
+                residual=residual,
+                norm_w=norm_w,
+                eps=eps_f,
+            )
+
+        def fn_one(
+            x: jax.Array,
+            w: jax.Array,
+            w_s: jax.Array,
+            n_valid: jax.Array,
+            rank: jax.Array,
+            residual: jax.Array,
+            norm_w: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return jax.shard_map(
+                body_one,
+                mesh=mesh,
+                in_specs=(spec,) * 7,
+                out_specs=(spec, spec),
+                check_vma=False,
+            )(x, w, w_s, n_valid, rank, residual, norm_w)
+
+        def fake_one(x, w, w_s, n_valid, rank, residual, norm_w):
+            return x.new_empty((x.shape[0], w.shape[1])), torch.empty_like(residual)
+
+        return sharded_jax_op(
+            f"pallas::fp8_matmul_all_reduce_one_row_rmsnorm_{tag}",
+            fn_one,
+            mesh=mesh,
+            input_partition_specs=(spec,) * 7,
+            output_partition_specs=(spec, spec),
+            fake=fake_one,
+        )
+
+    def body(x, w, w_s, rank, residual, norm_w):
+        return fp8_oproj_all_reduce.fp8_matmul_all_reduce(
+            x,
+            w,
+            w_s,
+            rank,
+            num_cores=n,
+            axis=EP_AXIS_NAME,
+            waves=waves,
+            residual=residual,
+            norm_w=norm_w,
+            eps=eps_f,
+        )
+
+    def fn(
+        x: jax.Array,
+        w: jax.Array,
+        w_s: jax.Array,
+        rank: jax.Array,
+        residual: jax.Array,
+        norm_w: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(spec,) * 6,
+            out_specs=(spec, spec),
+            check_vma=False,
+        )(x, w, w_s, rank, residual, norm_w)
+
+    def fake(x, w, w_s, rank, residual, norm_w):
+        return x.new_empty((x.shape[0], w.shape[1])), torch.empty_like(residual)
+
+    return sharded_jax_op(
+        f"pallas::fp8_matmul_all_reduce_rmsnorm_{tag}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec,) * 6,
+        output_partition_specs=(spec, spec),
+        fake=fake,
+    )
+
+
+def prepare_rmsnorm_op(eps: float) -> None:
+    """Register (and build if prebuilt) the fused o_proj AR + RMSNorm op for ``eps``."""
+    eps_f = float(eps)
+    _PENDING_RMSNORM_EPS.add(eps_f)
+    if _MM_AR_OP is not None and _MESH is not None and eps_f not in _MM_AR_RN_OPS:
+        _MM_AR_RN_OPS[eps_f] = _build_matmul_all_reduce_rmsnorm(
+            _MESH, envs.TPU_FUSED_OPROJ_AR_WAVES, eps_f, _MM_AR_ONE_ROW
+        )
+
+
 def _build_reduce_scatter(mesh):
     n = mesh.shape[EP_AXIS_NAME]
     spec = PartitionSpec(EP_AXIS_NAME)
@@ -284,7 +401,7 @@ def _build_reduce_scatter(mesh):
 def prebuild() -> None:
     """Build the ops and this core's rank tensor, outside any traced region:
     the mesh comes from a collective. A no-op unless TPU_SMALL_ALL_REDUCE."""
-    global _AR_OP, _AR_SIZED_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
+    global _AR_OP, _AR_SIZED_OP, _RS_OP, _RANK, _CORES, _MESH, _MESH_RANKS, _DP_COMBINE
     global _AR_VALID_OP, _VALID_TILE_ROWS, _MM_AR_OP, _MM_AR_ONE_ROW
     if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
         return
@@ -301,6 +418,7 @@ def prebuild() -> None:
         )
     from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 
+    _MESH = mesh
     _CORES = mesh.shape[EP_AXIS_NAME]
     ep_group = get_ep_group()
     assert ep_group is not None  # build_ep_mesh() returned a mesh over it
@@ -333,11 +451,16 @@ def prebuild() -> None:
             else _build_matmul_all_reduce
         )
         _MM_AR_OP = build(mesh, envs.TPU_FUSED_OPROJ_AR_WAVES)
+        for eps_f in sorted(_PENDING_RMSNORM_EPS):
+            if eps_f not in _MM_AR_RN_OPS:
+                _MM_AR_RN_OPS[eps_f] = _build_matmul_all_reduce_rmsnorm(
+                    mesh, envs.TPU_FUSED_OPROJ_AR_WAVES, eps_f, _MM_AR_ONE_ROW
+                )
     logger.info(
         "Small collectives armed | cores=%d | max_rows=%d | "
         "combine_max_rows=%d | one_shot_max_bytes=%d | tp_all_reduce=%s | "
         "dp_combine=%s | outside_warmup=%s | valid_rows=%s | fused_oproj_ar=%s"
-        " | fused_oproj_ar_one_row=%s",
+        " | fused_oproj_ar_one_row=%s | fused_oproj_ar_rmsnorm_eps=%s",
         _CORES,
         max_rows(),
         COMBINE_MAX_ROWS,
@@ -352,6 +475,7 @@ def prebuild() -> None:
         else "off",
         _MM_AR_OP is not None,
         _MM_AR_ONE_ROW,
+        tuple(sorted(_MM_AR_RN_OPS)),
     )
 
 
@@ -497,3 +621,65 @@ def row_parallel_or(x: torch.Tensor, layer) -> torch.Tensor:
                     return _MM_AR_OP(retain(x), w, w_s, n_valid, _RANK)
                 return _MM_AR_OP(retain(x), w, w_s, _RANK)
     return layer(x)[0]
+
+
+def can_fuse_rmsnorm(rows: int, layer, norm) -> bool:
+    """Whether ``rows`` in [RMSNORM_MIN_M, MAX_M] can fuse ``layer`` + ``norm``."""
+    if (
+        _MM_AR_OP is None
+        or not torch.compiler.is_compiling()
+        or not shape_variants.in_warmup()
+        or rows < RMSNORM_MIN_M
+        or rows > fp8_oproj_all_reduce.MAX_M
+        or norm is None
+        or not getattr(norm, "has_weight", True)
+        or getattr(norm, "variance_size_override", None) is not None
+        or getattr(norm, "_prequant_slot", None) is not None
+    ):
+        return False
+    norm_w = getattr(norm, "weight", None)
+    if norm_w is None or norm_w.dim() != 1:
+        return False
+    eps_f = float(getattr(norm, "variance_epsilon", 0.0))
+    if eps_f not in _MM_AR_RN_OPS:
+        return False
+    weights = _fused_layer_weights(layer)
+    if weights is None:
+        return False
+    w, _ = weights
+    return norm_w.shape[0] == w.shape[1] and fp8_oproj_all_reduce.supports(
+        rows, w.shape[0], w.shape[1], _CORES
+    )
+
+
+def row_parallel_or_rmsnorm(
+    x: torch.Tensor,
+    layer,
+    residual: torch.Tensor,
+    norm_w: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused ``o_proj + all-reduce + residual_add + RMSNorm`` for 8 <= m <= 64."""
+    rn_op = _MM_AR_RN_OPS.get(float(eps))
+    weights = _fused_layer_weights(layer) if _fits(x, LANES) else None
+    if rn_op is not None and weights is not None:
+        w, w_s = weights
+        rows, k = x.shape
+        if (
+            RMSNORM_MIN_M <= rows <= fp8_oproj_all_reduce.MAX_M
+            and k == w.shape[0]
+            and fp8_oproj_all_reduce.supports(rows, k, w.shape[1], _CORES)
+            and residual.shape == (rows, w.shape[1])
+            and residual.dtype == x.dtype
+            and norm_w.shape == (w.shape[1],)
+        ):
+            # Avoid reordering args: keeping _RANK before (residual, norm_w) matches
+            # unfused m<=4 FX placeholder lift order for bucket handover.
+            if _MM_AR_ONE_ROW:
+                n_valid = _valid_rows(rows, _one_row_mask())
+                return rn_op(retain(x), w, w_s, n_valid, _RANK, residual, norm_w)
+            return rn_op(retain(x), w, w_s, _RANK, residual, norm_w)
+    raise RuntimeError(
+        f"row_parallel_or_rmsnorm called for ineligible shape "
+        f"{tuple(x.shape)} / eps={eps}"
+    )

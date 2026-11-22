@@ -54,18 +54,29 @@ ROW_TILE = 16
 # (small_collectives.all_reduce.COLLECTIVE_ID).
 COLLECTIVE_ID = 5
 LANES = 128
-MAX_M = 16
+MAX_M = 64
+D2D_MIN_M = 32
 # (k, n) -> (tile, nbuf): fp8_skinny's measured o_proj ring ("n", 2048, 3).
 TUNED = {(1024, 6144): (2048, 3)}
 
 
 def supports(m: int, k: int, n: int, num_cores: int) -> bool:
     """Whether a [m, k] x [k, n] row-parallel block over num_cores ranks takes the
-    kernel: a measured (k, n), m <= 16, and owner chunks of whole lane groups."""
+    kernel: a measured (k, n), m <= 64, and owner chunks of whole lane groups."""
     return (
         m <= MAX_M
         and (k, n) in TUNED
         and num_cores >= 2
+        and n % num_cores == 0
+        and (n // num_cores) % LANES == 0
+    )
+
+
+def d2d_first_supported(m: int, n: int, num_cores: int) -> bool:
+    return (
+        m >= D2D_MIN_M
+        and num_cores >= 4
+        and num_cores % 2 == 0
         and n % num_cores == 0
         and (n // num_cores) % LANES == 0
     )
@@ -99,18 +110,17 @@ def _one_row_exchange(o_ref, one, me, rs_send, rs_recv, *, n, axis):
         part = jnp.broadcast_to(row0[:, j * w : (j + 1) * w], (ROW_TILE, w))
         q1 = jnp.where(rows == j, part, q1)
     one.at[me][...] = q1.astype(one.dtype)
-    for j in range(n):
-
-        @pl.when(jnp.int32(j) != me)
-        def _(j=j):
-            pltpu.make_async_remote_copy(
-                src_ref=one.at[me],
-                dst_ref=one.at[me],
-                send_sem=rs_send,
-                recv_sem=rs_recv,
-                device_id={axis: jnp.int32(j)},
-                device_id_type=MESH,
-            ).start()
+    # Avoid fixed rank-0..n-1 loop: rotating peer order eliminates link incast.
+    for step in range(1, n):
+        dst = jax.lax.rem(me + step, jnp.int32(n))
+        pltpu.make_async_remote_copy(
+            src_ref=one.at[me],
+            dst_ref=one.at[me],
+            send_sem=rs_send,
+            recv_sem=rs_recv,
+            device_id={axis: dst},
+            device_id_type=MESH,
+        ).start()
 
     peers = one.at[pl.ds(0, n - 1)]  # the byte count of n - 1 slots
     pltpu.make_async_copy(peers, peers, rs_recv).wait()
@@ -125,6 +135,150 @@ def _one_row_exchange(o_ref, one, me, rs_send, rs_recv, *, n, axis):
     pltpu.make_async_copy(peers, peers, rs_send).wait()
 
 
+def _d2d_first_exchange(
+    o_ref,
+    d2d_recv,
+    rs_recv,
+    red_buf,
+    sems,
+    me,
+    *,
+    n,
+    axis,
+    single=None,
+):
+    """1-barrier pair-first reduce-scatter + half-world RS/AG + pair all-gather."""
+    (
+        d2d_send,
+        d2d_recv_sem,
+        d2d_ag_send,
+        d2d_ag_recv,
+        rs_send,
+        rs_recv_sem,
+        ag_send,
+        ag_recv_sem,
+        loc,
+    ) = sems
+    m, n_out = o_ref.shape
+    half_n = n_out // 2
+    n_pairs = n // 2
+    chunk_w = half_n // n_pairs
+
+    bit = jax.lax.bitwise_and(me, jnp.int32(1))
+    pair = jax.lax.shift_right_logical(me, jnp.int32(1))
+    partner = jax.lax.bitwise_xor(me, jnp.int32(1))
+    my_off = bit * half_n
+    peer_off = (1 - bit) * half_n
+    my_slice = o_ref.at[:, pl.ds(pl.multiple_of(my_off, half_n), half_n)]
+    peer_slice = o_ref.at[:, pl.ds(pl.multiple_of(peer_off, half_n), half_n)]
+
+    pair_rs = pltpu.make_async_remote_copy(
+        src_ref=peer_slice,
+        dst_ref=d2d_recv,
+        send_sem=d2d_send.at[0],
+        recv_sem=d2d_recv_sem.at[0],
+        device_id={axis: partner},
+        device_id_type=MESH,
+    )
+    pair_rs.start()
+    pltpu.make_async_copy(d2d_recv, d2d_recv, d2d_recv_sem.at[0]).wait_recv()
+    my_slice[...] = (
+        my_slice[...].astype(jnp.float32) + d2d_recv[...].astype(jnp.float32)
+    ).astype(o_ref.dtype)
+
+    def chunk_half(p_idx):
+        return o_ref.at[
+            :, pl.ds(pl.multiple_of(my_off + p_idx * chunk_w, chunk_w), chunk_w)
+        ]
+
+    def slot_half(p_idx):
+        return rs_recv.at[p_idx, pl.ds(0, m), pl.ds(0, chunk_w)]
+
+    own_c = pltpu.make_async_copy(chunk_half(pair), slot_half(pair), loc.at[0])
+    own_c.start()
+    rs_copies = []
+    for idx, step in enumerate(range(1, n_pairs)):
+        dst_p = jax.lax.rem(pair + step, jnp.int32(n_pairs))
+        dst_r = dst_p * 2 + bit
+        cp = pltpu.make_async_remote_copy(
+            src_ref=chunk_half(dst_p),
+            dst_ref=slot_half(pair),
+            send_sem=rs_send.at[idx],
+            recv_sem=rs_recv_sem.at[pair],
+            device_id={axis: dst_r},
+            device_id_type=MESH,
+        )
+        cp.start()
+        rs_copies.append(cp)
+    own_c.wait()
+    for step in range(1, n_pairs):
+        src_p = jax.lax.rem(pair + (n_pairs - step), jnp.int32(n_pairs))
+        pltpu.make_async_copy(
+            slot_half(src_p), slot_half(src_p), rs_recv_sem.at[src_p]
+        ).wait_recv()
+    acc = rs_recv[0].astype(jnp.float32)
+    for q in range(1, n_pairs):
+        acc = acc + rs_recv[q].astype(jnp.float32)
+    red_buf[...] = acc.astype(red_buf.dtype)
+
+    own_a = pltpu.make_async_copy(red_buf, chunk_half(pair), loc.at[1])
+    own_a.start()
+    ag_copies = []
+    for idx, step in enumerate(range(1, n_pairs)):
+        dst_p = jax.lax.rem(pair + step, jnp.int32(n_pairs))
+        dst_r = dst_p * 2 + bit
+        cp = pltpu.make_async_remote_copy(
+            src_ref=red_buf,
+            dst_ref=chunk_half(pair),
+            send_sem=ag_send.at[idx],
+            recv_sem=ag_recv_sem.at[pair],
+            device_id={axis: dst_r},
+            device_id_type=MESH,
+        )
+        cp.start()
+        ag_copies.append(cp)
+    own_a.wait()
+    for step in range(1, n_pairs):
+        src_p = jax.lax.rem(pair + (n_pairs - step), jnp.int32(n_pairs))
+        pltpu.make_async_copy(
+            chunk_half(src_p), chunk_half(src_p), ag_recv_sem.at[src_p]
+        ).wait_recv()
+
+    pair_rs.wait_send()
+    pair_ag = pltpu.make_async_remote_copy(
+        src_ref=my_slice,
+        dst_ref=my_slice,
+        send_sem=d2d_ag_send.at[0],
+        recv_sem=d2d_ag_recv.at[0],
+        device_id={axis: partner},
+        device_id_type=MESH,
+    )
+    pair_ag.start()
+    pltpu.make_async_copy(peer_slice, peer_slice, d2d_ag_recv.at[0]).wait_recv()
+    pair_ag.wait_send()
+    for cp in (*rs_copies, *ag_copies):
+        cp.wait_send()
+    if single is not None:
+
+        @pl.when(single)
+        def _zero_pad():
+            row_idx = jax.lax.broadcasted_iota(jnp.int32, (m, n_out), 0)
+            o_ref[...] = jnp.where(
+                row_idx == 0, o_ref[...].astype(jnp.float32), 0.0
+            ).astype(o_ref.dtype)
+
+
+def _apply_add_rmsnorm(o_ref, res_ref, nw_ref, norm_ref, eps: float):
+    s = o_ref[...].astype(jnp.float32) + res_ref[...].astype(jnp.float32)
+    o_ref[...] = s.astype(o_ref.dtype)
+    inv = jax.lax.rsqrt(jnp.mean(s * s, axis=-1, keepdims=True) + jnp.float32(eps))
+    # Avoid intermediate bf16 cast on `s * inv`: XLA TPU keeps f32 excess precision
+    # across the weight multiply, while Mosaic Pallas materializes explicit bf16
+    # rounding (~25.9% 1-ULP precision loss per layer vs unfused RMSNorm).
+    y = (s * inv) * nw_ref[...].astype(jnp.float32)
+    norm_ref[...] = y.astype(norm_ref.dtype)
+
+
 def _kernel(
     idx_ref,
     rank_ref,
@@ -137,28 +291,43 @@ def _kernel(
     q_dtype,
     waves,
     one_row,
+    d2d_first,
+    has_rmsnorm,
+    eps,
 ):
     nv_ref, *refs = refs if one_row else (None, *refs)
-    (
-        x_ref,
-        ws_hbm,
-        w_hbm,
-        o_ref,
-        xq_ref,
-        xs_ref,
-        wbuf,
-        wsem,
-        ws_vmem,
-        ws_sem,
-        recv,
-        red,
-        rs_send,
-        rs_recv,
-        ag_send,
-        ag_recv,
-        loc,
-        *one,
-    ) = refs
+    if has_rmsnorm:
+        (
+            x_ref,
+            ws_hbm,
+            w_hbm,
+            res_ref,
+            nw_ref,
+            norm_ref,
+            o_ref,
+            xq_ref,
+            xs_ref,
+            wbuf,
+            wsem,
+            ws_vmem,
+            ws_sem,
+            *ar_refs,
+        ) = refs
+    else:
+        res_ref = nw_ref = norm_ref = None
+        (
+            x_ref,
+            ws_hbm,
+            w_hbm,
+            o_ref,
+            xq_ref,
+            xs_ref,
+            wbuf,
+            wsem,
+            ws_vmem,
+            ws_sem,
+            *ar_refs,
+        ) = refs
     s = idx_ref[0]
     me = rank_ref[0]
     own = o_ref.shape[1] // n
@@ -194,31 +363,85 @@ def _kernel(
     xq_ref[...] = x_q.astype(xq_ref.dtype)
     xs_ref[...] = scale
 
+    dn = (((1,), (0,)), ((), ()))
+    if d2d_first:
+        (
+            d2d_recv,
+            rs_recv_buf,
+            red_buf,
+            d2d_send,
+            d2d_recv_sem,
+            d2d_ag_send,
+            d2d_ag_recv,
+            rs_send,
+            rs_recv,
+            ag_send,
+            ag_recv,
+            loc,
+        ) = ar_refs
+        for j in range(n_tiles):
+            copy(j).wait()
+            y = jax.lax.dot_general(
+                xq_ref[...], wbuf[j % nbuf], dn, preferred_element_type=jnp.float32
+            )
+            if j == 0:
+                ws_copy.wait()
+            cols = slice(j * t, (j + 1) * t)
+            o_ref[:, cols] = (y * xs_ref[...] * ws_vmem[:, cols]).astype(o_ref.dtype)
+            if j + nbuf < n_tiles:
+                copy(j + nbuf).start()
+        pl.semaphore_wait(bsem, n)
+        _d2d_first_exchange(
+            o_ref,
+            d2d_recv,
+            rs_recv_buf,
+            red_buf,
+            (
+                d2d_send,
+                d2d_recv_sem,
+                d2d_ag_send,
+                d2d_ag_recv,
+                rs_send,
+                rs_recv,
+                ag_send,
+                ag_recv,
+                loc,
+            ),
+            me,
+            n=n,
+            axis=axis,
+            single=single,
+        )
+        if has_rmsnorm:
+            _apply_add_rmsnorm(o_ref, res_ref, nw_ref, norm_ref, eps)
+        return
+
+    recv, red, rs_send, rs_recv, ag_send, ag_recv, loc, *one = ar_refs
+
     def chunk(j):
-        return o_ref.at[:, pl.ds(j * own, own)]
+        return o_ref.at[:, pl.ds(pl.multiple_of(j * own, LANES), own)]
 
     def two_shot(cond):
         """cond, and not the one-row path's step."""
         return jnp.logical_and(jnp.logical_not(single), cond) if one_row else cond
 
-    def push_owner(j):
-        @pl.when(two_shot(jnp.int32(j) != me))
+    def push_owner(dst):
+        @pl.when(two_shot(dst != me))
         def _():
             pltpu.make_async_remote_copy(
-                src_ref=chunk(j),
+                src_ref=chunk(dst),
                 dst_ref=recv.at[me],
                 send_sem=rs_send,
                 recv_sem=rs_recv,
-                device_id={axis: jnp.int32(j)},
+                device_id={axis: dst},
                 device_id_type=MESH,
             ).start()
 
-        @pl.when(two_shot(jnp.int32(j) == me))
+        @pl.when(two_shot(dst == me))
         def _():
-            pltpu.make_async_copy(chunk(j), recv.at[j], loc.at[0]).start()
+            pltpu.make_async_copy(chunk(dst), recv.at[dst], loc.at[0]).start()
 
     wave_of = owner_waves(n, o_ref.shape[1], t) if waves else None
-    dn = (((1,), (0,)), ((), ()))
     for j in range(n_tiles):
         copy(j).wait()
         y = jax.lax.dot_general(
@@ -233,12 +456,17 @@ def _kernel(
         if wave_of is not None:
             if j == 0:
                 pl.semaphore_wait(bsem, n)
-            for o in wave_of[j]:
-                push_owner(o)
+            wlist = wave_of[j]
+            nw_len = len(wlist)
+            for idx_w in range(nw_len):
+                # Avoid fixed owner-order pushes: rotating inside each contiguous wave
+                # spreads remote copies across peers without changing rank summation.
+                dst = jnp.int32(wlist[0]) + jax.lax.rem(me + idx_w, jnp.int32(nw_len))
+                push_owner(dst)
     if wave_of is None:
         pl.semaphore_wait(bsem, n)
-        for o in range(n):
-            push_owner(o)
+        for step in range(n):
+            push_owner(jax.lax.rem(me + step, jnp.int32(n)))
 
     tail = functools.partial(
         _two_shot_tail,
@@ -252,11 +480,15 @@ def _kernel(
     )
     if not one_row:
         tail()
-        return
-    pl.when(single)(
-        lambda: _one_row_exchange(o_ref, one[0], me, rs_send, rs_recv, n=n, axis=axis)
-    )
-    pl.when(jnp.logical_not(single))(tail)
+    else:
+        pl.when(single)(
+            lambda: _one_row_exchange(
+                o_ref, one[0], me, rs_send, rs_recv, n=n, axis=axis
+            )
+        )
+        pl.when(jnp.logical_not(single))(tail)
+    if has_rmsnorm:
+        _apply_add_rmsnorm(o_ref, res_ref, nw_ref, norm_ref, eps)
 
 
 def _two_shot_tail(o_ref, recv, red, sems, me, *, n, axis):
@@ -272,18 +504,16 @@ def _two_shot_tail(o_ref, recv, red, sems, me, *, n, axis):
     red[...] = acc.astype(red.dtype)
 
     dst_me = o_ref.at[:, pl.ds(pl.multiple_of(me * own, LANES), own)]
-    for j in range(n):
-
-        @pl.when(jnp.int32(j) != me)
-        def _(j=j):
-            pltpu.make_async_remote_copy(
-                src_ref=red,
-                dst_ref=dst_me,
-                send_sem=ag_send,
-                recv_sem=ag_recv,
-                device_id={axis: jnp.int32(j)},
-                device_id_type=MESH,
-            ).start()
+    for step in range(1, n):
+        dst = jax.lax.rem(me + step, jnp.int32(n))
+        pltpu.make_async_remote_copy(
+            src_ref=red,
+            dst_ref=dst_me,
+            send_sem=ag_send,
+            recv_sem=ag_recv,
+            device_id={axis: dst},
+            device_id_type=MESH,
+        ).start()
 
     own_ag = pltpu.make_async_copy(red, dst_me, loc.at[1])
     own_ag.start()
@@ -294,29 +524,67 @@ def _two_shot_tail(o_ref, recv, red, sems, me, *, n, axis):
 
 
 @functools.cache
-def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves, one_row):
+def _build(
+    m,
+    k,
+    n_out,
+    n_stack,
+    w_dtype,
+    x_dtype,
+    num_cores,
+    axis,
+    waves,
+    one_row,
+    nw_dtype=None,
+    eps=1e-6,
+):
     t, nbuf = TUNED[(k, n_out)]
     n_tiles = n_out // t
     nbuf = max(1, min(nbuf, n_tiles))
     own = n_out // num_cores
-    scratch = [
+    d2d_first = d2d_first_supported(m, n_out, num_cores)
+    has_rmsnorm = nw_dtype is not None
+    base_scratch = [
         pltpu.VMEM((m, k), jnp.bfloat16),  # x_q (fp8 values held as bf16)
         pltpu.VMEM((m, 1), jnp.float32),  # x scale
         pltpu.VMEM((nbuf, k, t), w_dtype),  # weight ring
         pltpu.SemaphoreType.DMA((nbuf,)),
         pltpu.VMEM((1, n_out), jnp.float32),  # weight scale
         pltpu.SemaphoreType.DMA,
-        pltpu.VMEM((num_cores, m, own), x_dtype),  # receive slots, by sender rank
-        pltpu.VMEM((m, own), x_dtype),  # my summed chunk
-        pltpu.SemaphoreType.DMA,  # reduce-scatter send
-        pltpu.SemaphoreType.DMA,  # reduce-scatter receive
-        pltpu.SemaphoreType.DMA,  # all-gather send
-        pltpu.SemaphoreType.DMA,  # all-gather receive
-        pltpu.SemaphoreType.DMA((2,)),  # local copies
     ]
-    if one_row:
-        # The one-row path's slots, by sender rank: row 0 folded into ROW_TILE rows.
-        scratch.append(pltpu.VMEM((num_cores, ROW_TILE, n_out // ROW_TILE), x_dtype))
+    if d2d_first:
+        n_pairs = num_cores // 2
+        scratch = [
+            *base_scratch,
+            pltpu.VMEM((m, n_out // 2), x_dtype),  # intra-pair receive
+            pltpu.VMEM((n_pairs, m, own), x_dtype),  # half-world RS slots
+            pltpu.VMEM((m, own), x_dtype),  # reduced chunk
+            pltpu.SemaphoreType.DMA((1,)),
+            pltpu.SemaphoreType.DMA((1,)),
+            pltpu.SemaphoreType.DMA((1,)),
+            pltpu.SemaphoreType.DMA((1,)),
+            pltpu.SemaphoreType.DMA((n_pairs,)),
+            pltpu.SemaphoreType.DMA((n_pairs,)),
+            pltpu.SemaphoreType.DMA((n_pairs,)),
+            pltpu.SemaphoreType.DMA((n_pairs,)),
+            pltpu.SemaphoreType.DMA((2,)),
+        ]
+    else:
+        scratch = [
+            *base_scratch,
+            pltpu.VMEM((num_cores, m, own), x_dtype),  # receive slots, by sender rank
+            pltpu.VMEM((m, own), x_dtype),  # my summed chunk
+            pltpu.SemaphoreType.DMA,  # reduce-scatter send
+            pltpu.SemaphoreType.DMA,  # reduce-scatter receive
+            pltpu.SemaphoreType.DMA,  # all-gather send
+            pltpu.SemaphoreType.DMA,  # all-gather receive
+            pltpu.SemaphoreType.DMA((2,)),  # local copies
+        ]
+        if one_row:
+            # The one-row path's slots, by sender rank: row 0 folded into ROW_TILE rows.
+            scratch.append(
+                pltpu.VMEM((num_cores, ROW_TILE, n_out // ROW_TILE), x_dtype)
+            )
     kern = functools.partial(
         _kernel,
         n=num_cores,
@@ -327,26 +595,37 @@ def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves, one_r
         q_dtype=w_dtype,
         waves=waves,
         one_row=one_row,
+        d2d_first=d2d_first,
+        has_rmsnorm=has_rmsnorm,
+        eps=float(eps),
     )
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    in_specs = [vmem, hbm, hbm, vmem, vmem] if has_rmsnorm else [vmem, hbm, hbm]
+    out_specs = [vmem, vmem] if has_rmsnorm else vmem
+    out_shape = (
+        (
+            jax.ShapeDtypeStruct((m, n_out), x_dtype),
+            jax.ShapeDtypeStruct((m, n_out), x_dtype),
+        )
+        if has_rmsnorm
+        else jax.ShapeDtypeStruct((m, n_out), x_dtype)
+    )
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=3 if one_row else 2,
-        in_specs=[
-            vmem,
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-        ],
-        out_specs=vmem,
+        in_specs=in_specs,
+        out_specs=out_specs,
         scratch_shapes=scratch,
     )
     return pl.pallas_call(
         kern,
-        out_shape=jax.ShapeDtypeStruct((m, n_out), x_dtype),
+        out_shape=out_shape,
         grid_spec=grid_spec,
         compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
         name=(
-            f"fp8_oproj_all_reduce{'_w' if waves else ''}{'_1r' if one_row else ''}"
-            f"_m{m}_k{k}_n{n_out}"
+            f"fp8_oproj_all_reduce{'_d2d' if d2d_first else ''}"
+            f"{'_w' if waves and not d2d_first else ''}{'_1r' if one_row else ''}"
+            f"{'_rn' if has_rmsnorm else ''}_m{m}_k{k}_n{n_out}"
         ),
     )
 
@@ -362,16 +641,41 @@ def _call_constrained(call, scalars, x, w_s2, w_stack):
     )
 
 
+@functools.partial(jax.jit, static_argnums=(0,))
+def _call_constrained_rmsnorm(call, scalars, x, w_s2, w_stack, residual, norm_w2):
+    return call(
+        *scalars,
+        x,
+        pltpu.with_memory_space_constraint(w_s2, pltpu.HBM),
+        pltpu.with_memory_space_constraint(w_stack, pltpu.HBM),
+        residual,
+        norm_w2,
+    )
+
+
 def fp8_matmul_all_reduce_stacked(
-    x, w_stack, idx, w_s, rank, *, num_cores, axis, waves=False, n_valid=None
+    x,
+    w_stack,
+    idx,
+    w_s,
+    rank,
+    *,
+    num_cores,
+    axis,
+    waves=False,
+    n_valid=None,
+    residual=None,
+    norm_w=None,
+    eps: float = 1e-6,
 ):
     """sum over the num_cores ranks of mesh axis `axis` of
     fp8_skinny(x, w_stack[idx[0]], w_s), inside a shard_map over that axis.
 
-    x bf16 [m <= 16, k]; w_stack fp8_e4m3fn [L, k, n] (K-major); idx, rank int32 [1]
-    (rank = this core's index on the axis, as data); w_s f32 [n] -> bf16 [m, n].
+    x bf16 [m <= 64, k]; w_stack fp8_e4m3fn [L, k, n] (K-major); idx, rank int32 [1]
+    (rank = this core's index on the axis, as data); w_s f32 [n] -> bf16 [m, n], or
+    (normed [m, n], new_residual [m, n]) when residual and norm_w are provided.
     n_valid int32 [1] (the same on every rank) builds the one-row kernel: rows
-    >= n_valid are padding, and with n_valid == 1 they come out +0.
+    >= n_valid are padding, and with n_valid == 1 they come out +0 before add+norm.
     """
     m, k = x.shape
     n_stack, _, n_out = w_stack.shape
@@ -379,21 +683,57 @@ def fp8_matmul_all_reduce_stacked(
         raise ValueError(
             f"[{m}, {k}] x [{k}, {n_out}] over {num_cores} ranks: unsupported"
         )
+    if (residual is None) != (norm_w is None):
+        raise ValueError("residual and norm_w must both be provided or both None")
+    if residual is not None and norm_w is not None:
+        if residual.shape != (m, n_out) or residual.dtype != x.dtype:
+            raise ValueError(
+                f"residual {residual.shape}/{residual.dtype} != "
+                f"({m}, {n_out})/{x.dtype}"
+            )
+        if norm_w.shape != (n_out,):
+            raise ValueError(f"norm_w {norm_w.shape} != ({n_out},)")
     one_row = n_valid is not None
     if one_row and not one_row_supported(n_out):
         raise ValueError(f"the one-row build needs n = {n_out} to fill {ROW_TILE} rows")
     call = _build(
-        m, k, n_out, n_stack, w_stack.dtype, x.dtype, num_cores, axis, waves, one_row
+        m,
+        k,
+        n_out,
+        n_stack,
+        w_stack.dtype,
+        x.dtype,
+        num_cores,
+        axis,
+        waves,
+        one_row,
+        nw_dtype=norm_w.dtype if norm_w is not None else None,
+        eps=float(eps),
     )
     w_s2 = w_s.reshape(1, n_out).astype(jnp.float32)
     scalars = (idx.astype(jnp.int32), rank.astype(jnp.int32))
-    if one_row:
+    if n_valid is not None:
         scalars += (n_valid.astype(jnp.int32),)
+    if residual is not None and norm_w is not None:
+        return _call_constrained_rmsnorm(
+            call, scalars, x, w_s2, w_stack, residual, norm_w.reshape(1, n_out)
+        )
     return _call_constrained(call, scalars, x, w_s2, w_stack)
 
 
 def fp8_matmul_all_reduce(
-    x, w_q, w_s, rank, *, num_cores, axis, waves=False, n_valid=None
+    x,
+    w_q,
+    w_s,
+    rank,
+    *,
+    num_cores,
+    axis,
+    waves=False,
+    n_valid=None,
+    residual=None,
+    norm_w=None,
+    eps: float = 1e-6,
 ):
     """`fp8_matmul_all_reduce_stacked` on one [k, n] weight."""
     return fp8_matmul_all_reduce_stacked(
@@ -406,4 +746,7 @@ def fp8_matmul_all_reduce(
         axis=axis,
         waves=waves,
         n_valid=n_valid,
+        residual=residual,
+        norm_w=norm_w,
+        eps=eps,
     )

@@ -25,12 +25,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel as kernel_impl
 from vllm_torchtpu.kernels.experimental.moe_tp_decode.kernel import _quantize_blocks
+from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 F8, BF16, F32 = jnp.float8_e4m3fn, jnp.bfloat16, jnp.float32
 FP8_MAX = float(jnp.finfo(F8).max)
@@ -153,21 +153,22 @@ def test_expert_range_kernel_name(monkeypatch):
 @pytest.mark.parametrize(
     "i_chunk, expected",
     [
-        ("256", {16: (256, 6), 32: (256, 6), 64: (256, 5)}),
-        ("512", {16: (512, 3), 32: (512, 3), 64: (256, 5)}),
+        (256, {16: (256, 6), 32: (256, 6), 64: (256, 5)}),
+        (512, {16: (512, 3), 32: (512, 3), 64: (256, 5)}),
     ],
 )
 def test_wider_i_chunk_steps_ring_depth_on_large_buckets(
     monkeypatch, i_chunk, expected
 ):
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
-    monkeypatch.setenv("TPU_MOE_TP_DECODE_I_CHUNK", i_chunk)
     info = _tpu7x()
     for rows, (exp_ic, exp_nb) in expected.items():
         shapes = _shapes(rows, 6144, 32, 1024, 128, score_experts=256)
         assert kernel.can_use_moe_tp_decode(*shapes, topk=8, n_ranks=N_RANKS)
         spec = all_reduce.make_spec(N_RANKS, rows, 6144)
-        plan = kernel_impl._plan_ring(rows, 6144, 1024, 256, 128, info, spec)
+        plan = kernel_impl._plan_ring(  # noqa: SLF001 -- no public (ic, nb) seam
+            rows, 6144, 1024, 256, 128, info, spec, max_i_chunk=i_chunk
+        )
         assert plan is not None
         assert plan[:2] == (exp_ic, exp_nb)
 
@@ -544,7 +545,9 @@ def _gmm_v2_quantize(x, width=Q_BLOCK):
     return blocks
 
 
-def _expected(x, scores, bias, n_valid, ranks, c, *, x_block=Q_BLOCK):
+def _expected(
+    x, scores, bias, n_valid, ranks, c, *, x_block=Q_BLOCK, pair_first: bool = False
+):
     """The kernel's arithmetic in plain JAX ops run one at a time (so bf16 is
     rounded after every op), each part as the path it replaces computes it:
     routing as select_experts (top-k of scores + bias; the picked unbiased
@@ -566,7 +569,7 @@ def _expected(x, scores, bias, n_valid, ranks, c, *, x_block=Q_BLOCK):
     w = (picked / jnp.maximum(wsum, 1e-20)).astype(BF16).astype(F32)
     coef = jnp.sum(jax.nn.one_hot(ids, c["e"], dtype=F32) * w[..., None], axis=1)
     blocks = _gmm_v2_quantize(x, x_block)
-    total = None
+    partials = []
     for w13, w2, s13, s2, sw13, ss13, sw2, ss2 in ranks:
         routed = jnp.zeros(x.shape, F32)
         for e in range(c["e"]):
@@ -587,8 +590,20 @@ def _expected(x, scores, bias, n_valid, ranks, c, *, x_block=Q_BLOCK):
         gate_up = xla_quantized_matmul(x, sw13, ss13)
         act = jax.nn.silu(gate_up[:, :fs].astype(F32)).astype(BF16)
         shared = xla_quantized_matmul(act * gate_up[:, fs:], sw2, ss2)
-        partial = (shared + routed.astype(BF16) * ROUTED_SCALE).astype(F32)
-        total = partial if total is None else total + partial
+        partials.append((shared + routed.astype(BF16) * ROUTED_SCALE).astype(F32))
+    # Full m>=32 buckets use pair-first reduction: bf16(r[2p] + r[2p+1]) then f32 sum.
+    if pair_first and len(partials) >= 4 and len(partials) % 2 == 0:
+        paired = [
+            (partials[p] + partials[p + 1]).astype(BF16).astype(F32)
+            for p in range(0, len(partials), 2)
+        ]
+        total = paired[0]
+        for p_sum in paired[1:]:
+            total = total + p_sum
+    else:
+        total = partials[0]
+        for p_sum in partials[1:]:
+            total = total + p_sum
     return np.asarray(total.astype(BF16)[:n_valid]).astype(np.float32)
 
 
@@ -692,15 +707,16 @@ def _worker(part):
 
     cache = {}
 
-    def references(key, x, scores, rows, weights):
-        # Every row of these inputs: a valid row's result is independent of
-        # n_valid, so cases with the same inputs share them.
-        if key not in cache:
-            cache[key] = (
+    def references(key, x, scores, rows, n_valid, weights):
+        # Full m>=32 paths use pair-first bf16 reduction; fold/trim sum ranks linearly.
+        pair_first = rows >= 32 and n_valid > 16
+        cache_key = (key, pair_first)
+        if cache_key not in cache:
+            cache[cache_key] = (
                 _reference(x, scores, bias, rows, weights, c),
-                _expected(x, scores, bias, rows, weights, c),
+                _expected(x, scores, bias, rows, weights, c, pair_first=pair_first),
             )
-        return cache[key]
+        return cache[cache_key]
 
     def checks(out, x, scores, rows, n_valid, races, start, key, weights=ranks):
         out = out.reshape(N_RANKS, rows, c["h"]).astype(np.float32)
@@ -715,7 +731,7 @@ def _worker(part):
         )
         if n_valid:
             got = out[0, :n_valid]
-            want, exp = references(key, x, scores, rows, weights)
+            want, exp = references(key, x, scores, rows, n_valid, weights)
             want, exp = want[:n_valid].astype(np.float64), exp[:n_valid]
             case.update(
                 rel_l2=rel_l2(got, want),
