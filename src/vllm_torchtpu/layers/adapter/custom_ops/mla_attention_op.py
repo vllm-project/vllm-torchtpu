@@ -2535,6 +2535,16 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # o_proj's finished shard (a tuple, so it is not a second submodule).
         self.mla_attn.sp_o_proj_source = (self.o_proj,)
         if (
+            envs.TPU_DCP_TP_IN_BRANCH_QB_LAYERNORM
+            and self.q_a_layernorm is not None
+            and (self.indexer is None or self.skip_topk)
+            and getattr(self.q_a_layernorm, "has_weight", True)
+            and getattr(self.q_a_layernorm, "variance_size_override", None) is None
+        ):
+            self.mla_attn.in_branch_q_ln_eps = float(
+                getattr(self.q_a_layernorm, "variance_epsilon", 1e-6)
+            )
+        if (
             envs.TPU_DCP_TP_PREFILL_LOCAL_OPROJ
             and envs.TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES
             and envs.TPU_DCP_TP_PREFILL_OPROJ_FP8_HALVES
@@ -3044,10 +3054,6 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 )
                 if fuse_local_q_norm:
                     q = self._project_local_q_norm(q_c)
-                else:
-                    q_c = self.q_a_layernorm(q_c)
-                if fuse_local_q_norm:
-                    pass
                 elif (
                     getattr(self, "qb_overlap", False)
                     and self.kimi_preprocess is None
@@ -3056,6 +3062,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     and pre_qc_qrows is None
                     and not dcp_token_parallel_op.applies(num_tokens)
                 ):
+                    q_c = self.q_a_layernorm(q_c)
                     # The indexer runs on q_c anyway; it returns q too.
                     assert self.indexer is not None
                     early_topk, q = self.indexer(
@@ -3076,15 +3083,16 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     and vllm_compilation_backends.model_tag == "backbone"
                     and self._local_q_serves(q_c.shape[0])
                 ):
+                    q_c = self.q_a_layernorm(q_c)
                     q = self._project_local_q(q_c)
                 else:
-                    q_c_for_q = (
+                    q_c_raw_for_q = (
                         q_c
                         if (q_rows is None or q_c.shape[0] == q_rows.shape[0])
                         else q_c.index_select(0, q_rows)
                     )
                     fused_ops = self._fused_qb_rope_absorb_operands(
-                        q_c_for_q,
+                        q_c_raw_for_q,
                         q_rows=q_rows,
                         llama_4_scaling=llama_4_scaling,
                         num_kv_tokens=positions.shape[0],
@@ -3131,6 +3139,45 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                             and sp_o_proj_ready
                             and self.indexer.indexer_op.has_live_unified_cache()
                         )
+                        q_ln_w: Any = getattr(self.q_a_layernorm, "weight", None)
+                        q_ln_eps_val = getattr(
+                            self.q_a_layernorm, "variance_epsilon", None
+                        )
+                        has_q_ln_fn = getattr(in_branch_qb_op, "has_q_ln", None)
+                        defer_nonidx_q_ln = (
+                            can_defer_nonidx_qb
+                            and envs.TPU_DCP_TP_IN_BRANCH_QB_LAYERNORM
+                            and isinstance(q_ln_w, torch.Tensor)
+                            and q_ln_w.ndim == 1
+                            and q_ln_w.shape[0] == q_c_raw_for_q.shape[-1]
+                            and getattr(self.q_a_layernorm, "has_weight", True)
+                            and getattr(
+                                self.q_a_layernorm, "variance_size_override", None
+                            )
+                            is None
+                            and not (
+                                hasattr(self.q_a_layernorm, "is_prequant_armed")
+                                and self.q_a_layernorm.is_prequant_armed()
+                            )
+                            and q_ln_eps_val is not None
+                            and callable(has_q_ln_fn)
+                            and bool(has_q_ln_fn(float(q_ln_eps_val), kv_sharded))
+                        )
+                        if defer_nonidx_q_ln:
+                            assert isinstance(q_ln_w, torch.Tensor)
+                            assert q_ln_eps_val is not None
+                            q_c_for_q = q_c_raw_for_q
+                            q_ln_weight_arg: torch.Tensor | None = q_ln_w
+                            q_ln_eps_arg: float | None = float(q_ln_eps_val)
+                        else:
+                            q_c = self.q_a_layernorm(q_c)
+                            q_c_for_q = (
+                                q_c
+                                if (q_rows is None or q_c.shape[0] == q_rows.shape[0])
+                                else q_c.index_select(0, q_rows)
+                            )
+                            q_ln_weight_arg = None
+                            q_ln_eps_arg = None
                         if can_defer_nonidx_qb or can_defer_idx_qb:
                             if isinstance(w_uk_t, tuple):
                                 w_uk_lo, w_uk_hi = w_uk_t
@@ -3142,6 +3189,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                                         w_uk_t=w_uk_lo.to(q_c_for_q.dtype),
                                         cos_sin=cos_sin,
                                         w_uk_t_hi=w_uk_hi.to(q_c_for_q.dtype),
+                                        q_ln_weight=q_ln_weight_arg,
+                                        q_ln_eps=q_ln_eps_arg,
                                     )
                                 )
                             else:
@@ -3152,6 +3201,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                                         s_qb=s_qb,
                                         w_uk_t=w_uk_t.to(q_c_for_q.dtype),
                                         cos_sin=cos_sin,
+                                        q_ln_weight=q_ln_weight_arg,
+                                        q_ln_eps=q_ln_eps_arg,
                                     )
                                 )
                         elif isinstance(w_uk_t, tuple):
@@ -3176,6 +3227,12 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                             )
                         q = None
                     else:
+                        q_c = self.q_a_layernorm(q_c)
+                        q_c_for_q = (
+                            q_c
+                            if (q_rows is None or q_c.shape[0] == q_rows.shape[0])
+                            else q_c.index_select(0, q_rows)
+                        )
                         q = self.q_b_proj(q_c_for_q)[0]
             else:
                 assert q_rows is None, "token-parallel rows need the q_lora path"

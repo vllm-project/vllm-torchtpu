@@ -71,6 +71,8 @@ class InBranchQbInputs:
     w_uk_t: torch.Tensor
     cos_sin: torch.Tensor
     w_uk_t_hi: torch.Tensor | None = None
+    q_ln_weight: torch.Tensor | None = None
+    q_ln_eps: float | None = None
 
 
 def _dcp_rows_metadata_jax(
@@ -158,6 +160,8 @@ def build_in_branch_qb_attention_op(
         s_o: jax.Array,
         *,
         kv_sharded: bool,
+        q_ln_w: jax.Array | None = None,
+        q_ln_eps: float = 1e-6,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         live = [
             sharer
@@ -402,6 +406,8 @@ def build_in_branch_qb_attention_op(
             flat_topk_cap_strided=True,
             free_nobar_max_cap=free_nobar_max_cap,
             epilogue_3d=envs.TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT,
+            q_ln_w=q_ln_w,
+            q_ln_eps=q_ln_eps,
         )
         return kv_cache_nope, kv_cache_rope, attn_out
 
@@ -410,7 +416,106 @@ def build_in_branch_qb_attention_op(
         and getattr(target_layer, "W_UK_T_dcp_qrep_hi", None) is not None
     )
 
-    def _make_wrapper(kv_sharded: bool):
+    def _make_wrapper(kv_sharded: bool, q_ln_eps: float | None = None):
+        if q_ln_eps is not None and split_w_uk:
+
+            def _w_split_qln(
+                nope: jax.Array,
+                rope: jax.Array,
+                qc: jax.Array,
+                wqb: jax.Array,
+                sqb: jax.Array,
+                wuk_lo: jax.Array,
+                cs: jax.Array,
+                kc: jax.Array,
+                kp: jax.Array,
+                tk: jax.Array,
+                sl: jax.Array,
+                bt: jax.Array,
+                qsl: jax.Array,
+                dist: jax.Array,
+                rk: jax.Array,
+                uv: jax.Array,
+                wo: jax.Array,
+                so: jax.Array,
+                wuk_hi: jax.Array,
+                qln_w: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                return _run(
+                    nope,
+                    rope,
+                    qc,
+                    wqb,
+                    sqb,
+                    (wuk_lo, wuk_hi),
+                    cs,
+                    kc,
+                    kp,
+                    tk,
+                    sl,
+                    bt,
+                    qsl,
+                    dist,
+                    rk,
+                    uv,
+                    wo,
+                    so,
+                    kv_sharded=kv_sharded,
+                    q_ln_w=qln_w,
+                    q_ln_eps=q_ln_eps,
+                )
+
+            return _w_split_qln
+
+        if q_ln_eps is not None:
+
+            def _w_qln(
+                nope: jax.Array,
+                rope: jax.Array,
+                qc: jax.Array,
+                wqb: jax.Array,
+                sqb: jax.Array,
+                wuk: jax.Array,
+                cs: jax.Array,
+                kc: jax.Array,
+                kp: jax.Array,
+                tk: jax.Array,
+                sl: jax.Array,
+                bt: jax.Array,
+                qsl: jax.Array,
+                dist: jax.Array,
+                rk: jax.Array,
+                uv: jax.Array,
+                wo: jax.Array,
+                so: jax.Array,
+                qln_w: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                return _run(
+                    nope,
+                    rope,
+                    qc,
+                    wqb,
+                    sqb,
+                    wuk,
+                    cs,
+                    kc,
+                    kp,
+                    tk,
+                    sl,
+                    bt,
+                    qsl,
+                    dist,
+                    rk,
+                    uv,
+                    wo,
+                    so,
+                    kv_sharded=kv_sharded,
+                    q_ln_w=qln_w,
+                    q_ln_eps=q_ln_eps,
+                )
+
+            return _w_qln
+
         if split_w_uk:
 
             def _w_split(
@@ -553,7 +658,7 @@ def build_in_branch_qb_attention_op(
 
         return _fake
 
-    def _in_specs(kv_sharded: bool) -> tuple[P, ...]:
+    def _in_specs(kv_sharded: bool, *, with_q_ln: bool = False) -> tuple[P, ...]:
         kv_spec = shd if kv_sharded else rep
         base = (
             shd,  # kv_cache_nope
@@ -575,7 +680,11 @@ def build_in_branch_qb_attention_op(
             shd,  # w_o
             shd,  # s_o
         )
-        return base + ((rep,) if split_w_uk else ())
+        if split_w_uk:
+            base = (*base, rep)
+        if with_q_ln:
+            base = (*base, rep)
+        return base
 
     out_specs = (shd, shd, shd)
     cache_key = (
@@ -635,6 +744,47 @@ def build_in_branch_qb_attention_op(
         ):
             sharded_sharers.append(weakref.ref(target_layer))
 
+    qln_op_cache: dict[tuple[bool, float], Any] = {}
+
+    def _prepare_qln_op(eps: float) -> None:
+        eps_f = float(eps)
+        for kv_sharded in (False, True) if sharded_kv_op is not None else (False,):
+            key = (kv_sharded, eps_f)
+            if key in qln_op_cache:
+                continue
+            prefix = (
+                "sparse_mla_in_branch_qb_qln_oproj_sharded_kv"
+                if kv_sharded
+                else "sparse_mla_in_branch_qb_qln_oproj"
+            )
+
+            def _build_qln(
+                op_name: str, _kv_sharded: bool = kv_sharded, _eps: float = eps_f
+            ):
+                built = pcp_streaming_jax_op(
+                    op_name,
+                    _make_wrapper(kv_sharded=_kv_sharded, q_ln_eps=_eps),
+                    donate_argnums=(0, 1),
+                    mesh=mesh,
+                    input_partition_specs=_in_specs(
+                        kv_sharded=_kv_sharded, with_q_ln=True
+                    ),
+                    output_partition_specs=out_specs,
+                )
+                built.register_fake(_make_fake(kv_sharded=_kv_sharded))
+                return built, layers
+
+            op, op_sharers = get_shared_jax_op(prefix, (*cache_key, eps_f), _build_qln)
+            if getattr(target_layer, "use_sparse", True) and not any(
+                ref() is target_layer for ref in op_sharers
+            ):
+                op_sharers.append(weakref.ref(target_layer))
+            qln_op_cache[key] = op
+
+    eager_q_ln_eps = getattr(target_layer, "in_branch_q_ln_eps", None)
+    if eager_q_ln_eps is not None and envs.TPU_DCP_TP_IN_BRANCH_QB_LAYERNORM:
+        _prepare_qln_op(float(eager_q_ln_eps))
+
     def run(
         kv_cache: tuple[torch.Tensor, torch.Tensor],
         qb_inputs: InBranchQbInputs,
@@ -651,13 +801,29 @@ def build_in_branch_qb_attention_op(
         kv_sharded: bool = False,
     ) -> torch.Tensor:
         nope_cache, rope_cache = kv_cache
-        selected = sharded_kv_op if kv_sharded else plain_op
-        if selected is None:
-            raise RuntimeError("in-branch q_b sharded KV op requested but not built")
-        wuk_extra = ()
+        use_q_ln = qb_inputs.q_ln_weight is not None and qb_inputs.q_ln_eps is not None
+        if use_q_ln:
+            assert qb_inputs.q_ln_eps is not None
+            key = (kv_sharded, float(qb_inputs.q_ln_eps))
+            selected = qln_op_cache.get(key)
+            if selected is None:
+                raise RuntimeError(
+                    "in-branch q_b q_ln op was not registered for "
+                    f"kv_sharded={kv_sharded}, eps={qb_inputs.q_ln_eps}"
+                )
+        else:
+            selected = sharded_kv_op if kv_sharded else plain_op
+            if selected is None:
+                raise RuntimeError(
+                    "in-branch q_b sharded KV op requested but not built"
+                )
+        extra_args: list[torch.Tensor] = []
         if split_w_uk:
             assert qb_inputs.w_uk_t_hi is not None
-            wuk_extra = (qb_inputs.w_uk_t_hi,)
+            extra_args.append(qb_inputs.w_uk_t_hi)
+        if use_q_ln:
+            assert qb_inputs.q_ln_weight is not None
+            extra_args.append(qb_inputs.q_ln_weight)
         new_nope, new_rope, attn_out = selected(
             nope_cache,
             rope_cache,
@@ -677,14 +843,19 @@ def build_in_branch_qb_attention_op(
             w_uv,
             w_o[0],
             w_o[1],
-            *wuk_extra,
+            *extra_args,
         )
         nope_cache.copy_(new_nope)
         rope_cache.copy_(new_rope)
         return attn_out
 
+    def _has_q_ln(eps: float, kv_sharded: bool = False) -> bool:
+        return (kv_sharded, float(eps)) in qln_op_cache
+
     run.layout = layout  # type: ignore[attr-defined]
     run.serves_sharded_kv = sharded_kv_op is not None  # type: ignore[attr-defined]
+    run.prepare_q_ln = _prepare_qln_op  # type: ignore[attr-defined]
+    run.has_q_ln = _has_q_ln  # type: ignore[attr-defined]
     return run
 
 

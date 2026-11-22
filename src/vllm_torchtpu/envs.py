@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT: bool = True
     TPU_DCP_TP_FUSED_WUV_EPILOGUE: bool = True
     TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP: int = 4
+    TPU_DCP_TP_IN_BRANCH_QB_LAYERNORM: bool = True
     TPU_DCP_TP_IN_BRANCH_QB_MLA: bool = True
     TPU_DCP_TP_PREFILL_LOCAL_OPROJ: bool = True
     TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES: bool = True
@@ -931,6 +932,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # barrier so pure-TC fused_qb overlaps SparseCore-offloaded gather_latent.
     "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP": env_int(
         "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP", 4
+    ),
+    # With TPU_DCP_TP_IN_BRANCH_QB_MLA on non-indexer layers: move q_a_layernorm
+    # inside the token-parallel cap switch right before fused q_b so the latent
+    # page gather all-gather starts without waiting on RMSNorm.
+    "TPU_DCP_TP_IN_BRANCH_QB_LAYERNORM": env_bool(
+        "TPU_DCP_TP_IN_BRANCH_QB_LAYERNORM", default=True
     ),
     # With TPU_DCP_TP_PREFILL_LOCAL_OPROJ and query replication on non-indexer
     # layers: defer fused q_b_proj + RoPE + absorb_q and lead MLA inside the

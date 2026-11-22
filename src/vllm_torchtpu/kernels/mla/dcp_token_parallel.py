@@ -2317,6 +2317,14 @@ def unified_indexer_mla_with_lead_oproj(
     return projected, flat
 
 
+def _apply_q_a_rmsnorm(x: jax.Array, weight: jax.Array, eps: float) -> jax.Array:
+    x_f32 = x.astype(jnp.float32)
+    variance = jnp.mean(x_f32 * x_f32, axis=-1, keepdims=True)
+    # Match vLLM RMSNorm: cast normalized f32 values to weight dtype before scale.
+    normed = (x_f32 * lax.rsqrt(variance + jnp.float32(eps))).astype(weight.dtype)
+    return (normed * weight).astype(x.dtype)
+
+
 def _sparse_mla_in_branch_qb_core(
     layout: TokenParallelLayout,
     mesh: Mesh,
@@ -2348,10 +2356,13 @@ def _sparse_mla_in_branch_qb_core(
     w_o: jax.Array | None = None,
     w_o_scale: jax.Array | None = None,
     epilogue_3d: bool = True,
+    q_ln_w: jax.Array | None = None,
+    q_ln_eps: float = 1e-6,
 ) -> Any:
     if (w_o is None) != (w_o_scale is None):
         raise ValueError("w_o and w_o_scale must be passed together")
     has_oproj = w_o is not None
+    has_q_ln = q_ln_w is not None
     dcp = layout.dcp_size
     s = layout.split_rows
     sharded = P(axis_name)
@@ -2381,6 +2392,8 @@ def _sparse_mla_in_branch_qb_core(
         w_o_local = s_o_local = None
         if has_oproj:
             w_o_local, s_o_local = extra_args[idx], extra_args[idx + 1]
+            idx += 2
+        q_ln_local = extra_args[idx] if has_q_ln else None
         rank = _rank(rank_arg, axis_name, dcp)
         # Avoid propagating the SparseCore writer's 32-word view across the cap
         # switch: keep latent cache arrays in their [pages, rows, 128] layout.
@@ -2422,8 +2435,13 @@ def _sparse_mla_in_branch_qb_core(
                     if flat_topk_cap_strided
                     else restride_flat_rows(layout, f_topk_r, cap)
                 )
+                qc_in = (
+                    _apply_q_a_rmsnorm(qc_r, q_ln_local, q_ln_eps)
+                    if q_ln_local is not None
+                    else qc_r
+                )
                 ql_head, ql_tail, qpe_head, qpe_tail = fused_qb(
-                    qc_r, wqb_r, sqb_r, wuk_r, cs_r, s
+                    qc_in, wqb_r, sqb_r, wuk_r, cs_r, s
                 )
                 if cap > free_nobar_max_cap:
                     # Avoid SparseCore contention between lead_mla and SC-offloaded
@@ -2500,9 +2518,15 @@ def _sparse_mla_in_branch_qb_core(
         return out, lead_v
 
     extra: tuple[jax.Array, ...] = () if rank_ids is None else (rank_ids,)
+    extra_specs: tuple[P, ...] = () if rank_ids is None else (sharded,)
     if has_oproj:
         assert w_o is not None and w_o_scale is not None
         extra = (*extra, w_o, w_o_scale)
+        extra_specs = (*extra_specs, sharded, sharded)
+    if has_q_ln:
+        assert q_ln_w is not None
+        extra = (*extra, q_ln_w)
+        extra_specs = (*extra_specs, rep)
     w_uv_spec = rep if w_uv_replicated else sharded
     w_uk_spec = (rep, rep) if isinstance(w_uk_t, tuple) else rep
     out_specs = sharded if has_oproj else (sharded, rep)
@@ -2525,7 +2549,7 @@ def _sparse_mla_in_branch_qb_core(
             rep,
             w_uv_spec,
         )
-        + (sharded,) * len(extra),
+        + extra_specs,
         out_specs=out_specs,
         check_vma=False,
     )(
@@ -2575,6 +2599,8 @@ def sparse_mla_attention_with_in_branch_qb(
     w_uv_replicated: bool = False,
     flat_topk_cap_strided: bool = False,
     free_nobar_max_cap: int = 0,
+    q_ln_w: jax.Array | None = None,
+    q_ln_eps: float = 1e-6,
 ) -> tuple[jax.Array, jax.Array]:
     """Run fused `q_b`, lead MLA, and token-parallel MLA in one cap switch.
 
@@ -2610,6 +2636,8 @@ def sparse_mla_attention_with_in_branch_qb(
         w_uv_replicated=w_uv_replicated,
         flat_topk_cap_strided=flat_topk_cap_strided,
         free_nobar_max_cap=free_nobar_max_cap,
+        q_ln_w=q_ln_w,
+        q_ln_eps=q_ln_eps,
     )
 
 
@@ -2644,6 +2672,8 @@ def sparse_mla_attention_with_in_branch_qb_oproj(
     flat_topk_cap_strided: bool = False,
     free_nobar_max_cap: int = 0,
     epilogue_3d: bool = True,
+    q_ln_w: jax.Array | None = None,
+    q_ln_eps: float = 1e-6,
 ) -> jax.Array:
     """Run in-branch `q_b`, lead MLA, sparse MLA, and o_proj in one shard_map."""
     return _sparse_mla_in_branch_qb_core(
@@ -2676,6 +2706,8 @@ def sparse_mla_attention_with_in_branch_qb_oproj(
         w_o=w_o,
         w_o_scale=w_o_scale,
         epilogue_3d=epilogue_3d,
+        q_ln_w=q_ln_w,
+        q_ln_eps=q_ln_eps,
     )
 
 
