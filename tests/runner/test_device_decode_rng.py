@@ -112,7 +112,7 @@ def _seed_words(seeds) -> tuple[torch.Tensor, torch.Tensor]:
 
 def _uniform(seeds, positions, vocab: int) -> torch.Tensor:
     lo, hi = _seed_words(seeds)
-    return rng.counter_uniform(
+    return rng.counter_uniform_impl(
         lo, hi, torch.tensor(positions, dtype=torch.int32), vocab
     )
 
@@ -165,7 +165,7 @@ def test_hash_is_murmur3_x86_32_of_the_16_byte_key():
                 assert int(mrv2_hash32(seed, pos, token)) == _murmur3_x86_32(key, 0)
 
 
-def test_counter_uniform_matches_mrv2_over_the_whole_vocabulary():
+def test_uniforms_match_mrv2_over_the_whole_vocabulary():
     # One position per seed over the full vocabulary, every (seed, position)
     # pair over its first 1024 tokens.
     positions = [POSITIONS[i % len(POSITIONS)] for i in range(len(SEEDS))]
@@ -219,14 +219,14 @@ def test_a_draw_depends_only_on_its_key():
         assert (other != base).float().mean() > 0.99, (seed, pos)
 
 
-def test_counter_uniform_for_rows_reads_seeds_by_slot():
+def test_rows_read_their_seeds_by_slot():
     lo, hi = _seed_words([11, -5, 2**40 + 3, 0])
     # Rows as columns of a [rows, 4] plan, as the stock path stages them.
     plan = torch.tensor(
         [[2, 9, 1, 10], [0, 0, 1, 1], [2, 4, 0, 5], [3, 0, 0, 0]], dtype=torch.int32
     )
-    got = rng.counter_uniform_for_rows(lo, hi, plan[:, 0], plan[:, 1], 512)
-    want = rng.counter_uniform(lo[[2, 0, 2, 3]], hi[[2, 0, 2, 3]], plan[:, 1], 512)
+    got = rng.counter_uniform_for_rows_impl(lo, hi, plan[:, 0], plan[:, 1], 512)
+    want = rng.counter_uniform_impl(lo[[2, 0, 2, 3]], hi[[2, 0, 2, 3]], plan[:, 1], 512)
     assert torch.equal(got, want)
 
 
@@ -234,31 +234,39 @@ def test_wider_integers_are_rejected():
     seeds = torch.zeros(2, dtype=torch.int64)
     pos = torch.zeros(2, dtype=torch.int32)
     with pytest.raises(TypeError, match="seed_lo must be int32"):
-        rng.counter_uniform(seeds, seeds.int(), pos, 8)
+        rng.counter_uniform_impl(seeds, seeds.int(), pos, 8)
 
 
 @pytest.mark.tpu_test
-def test_counter_uniform_bits_on_tpu(device):
-    """The compiled TPU programs draw MRV2's bits over the whole vocabulary."""
+def test_uniforms_compiled_for_tpu_match_mrv2_bits(device):
+    """The keyed RNG compiled for TPU draws MRV2's bits over the whole
+    vocabulary, for rows given directly and for rows read by slot."""
     positions = [POSITIONS[i % len(POSITIONS)] for i in range(len(SEEDS))]
     lo, hi = _seed_words(SEEDS)
     pos = torch.tensor(positions, dtype=torch.int32)
     seeds = np.array(SEEDS, dtype=np.int64)[:, None]
     tokens = np.arange(VOCAB)[None, :]
 
-    got = rng.counter_uniform(lo.to(device), hi.to(device), pos.to(device), VOCAB)
+    # Callers compile these plain functions into their own programs; compile
+    # them here the same way.
+    compiled = torch.compile(
+        rng.counter_uniform_impl, backend="tpu", fullgraph=True, dynamic=False
+    )
+    with torch.no_grad():
+        got = compiled(lo.to(device), hi.to(device), pos.to(device), VOCAB)
     want = mrv2_uniform32(seeds, np.array(positions)[:, None], tokens)
     mismatches = int((_bits(got.cpu().numpy()) != _bits(want)).sum())
     assert mismatches == 0, f"{mismatches} of {want.size} uniforms differ"
 
-    # The stock-path entry, with rows as columns of a [rows, 4] plan.
-    order = torch.arange(len(SEEDS)).flip(0)
-    plan = torch.zeros((len(SEEDS), 4), dtype=torch.int32)
-    plan[:, 0], plan[:, 1] = order, pos
-    plan = plan.to(device)
-    got = rng.counter_uniform_for_rows(
-        lo.to(device), hi.to(device), plan[:, 0], plan[:, 1], VOCAB
+    # Each row reads its seed from the slot tensors, here in reverse order.
+    order = torch.arange(len(SEEDS), dtype=torch.int32).flip(0)
+    compiled = torch.compile(
+        rng.counter_uniform_for_rows_impl, backend="tpu", fullgraph=True, dynamic=False
     )
+    with torch.no_grad():
+        got = compiled(
+            lo.to(device), hi.to(device), order.to(device), pos.to(device), VOCAB
+        )
     want = mrv2_uniform32(seeds[order.numpy()], np.array(positions)[:, None], tokens)
     mismatches = int((_bits(got.cpu().numpy()) != _bits(want)).sum())
     assert mismatches == 0, f"{mismatches} of {want.size} uniforms differ"

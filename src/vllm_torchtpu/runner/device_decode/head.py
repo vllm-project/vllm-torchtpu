@@ -19,8 +19,8 @@ step's single device-to-host copy, and advances each request's slot in place,
 as `post_update` does in vLLM's Model Runner V2
 (vllm/v1/worker/gpu/input_batch.py). Sampling and logprobs are the stock TPU
 sampler's math (`sampler_math`). Only the uniforms differ: they come from
-`rng.counter_uniform`, keyed by (seed, position, token id), so given the same
-uniforms the head and the stock sampler pick the same token.
+`rng.counter_uniform_impl`, keyed by (seed, position, token id), so given the
+same uniforms the head and the stock sampler pick the same token.
 """
 
 from collections.abc import Iterable

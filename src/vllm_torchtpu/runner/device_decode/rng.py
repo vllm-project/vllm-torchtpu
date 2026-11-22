@@ -69,11 +69,20 @@ def _uniform_from_bits(bits: torch.Tensor) -> torch.Tensor:
 def counter_uniform_impl(
     seed_lo: torch.Tensor, seed_hi: torch.Tensor, pos: torch.Tensor, vocab_size: int
 ) -> torch.Tensor:
-    """The plain body of `counter_uniform`."""
+    """Float32 uniforms [rows, vocab_size] in (0, 1], one per (row, token id).
+
+    `seed_lo` and `seed_hi` [rows] are the int32 bit patterns of the low and
+    high words of each row's 64-bit seed; `pos` [rows] int32 is the position
+    the row samples at. Equal to vLLM's `murmur3_uniform32(seed, pos, token)`.
+    Plain torch ops, which the decode head and the stock path's noise program
+    compile into their own programs.
+    """
     for name, words in (("seed_lo", seed_lo), ("seed_hi", seed_hi), ("pos", pos)):
         if words.dtype != torch.int32:
             # Wider integers would not wrap at 32 bits.
-            raise TypeError(f"counter_uniform: {name} must be int32, not {words.dtype}")
+            raise TypeError(
+                f"counter_uniform_impl: {name} must be int32, not {words.dtype}"
+            )
     h = _mix(torch.zeros_like(seed_lo), _scramble(seed_lo))
     h = _mix(h, _scramble(seed_hi))
     h = _mix(h, _scramble(pos))
@@ -89,52 +98,14 @@ def counter_uniform_for_rows_impl(
     rows_pos: torch.Tensor,
     vocab_size: int,
 ) -> torch.Tensor:
-    """The plain body of `counter_uniform_for_rows`."""
+    """`counter_uniform_impl` for rows whose seed words sit in slot tensors.
+
+    `seed_lo_slots` / `seed_hi_slots` are [num_slots] int32; `rows_slot` and
+    `rows_pos` [rows] int32 give each row's slot and position.
+    """
     return counter_uniform_impl(
         torch.index_select(seed_lo_slots, 0, rows_slot),
         torch.index_select(seed_hi_slots, 0, rows_slot),
         rows_pos,
         vocab_size,
     )
-
-
-_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-_counter_uniform_compiled = _tpu_compile(counter_uniform_impl)
-_counter_uniform_for_rows_compiled = _tpu_compile(counter_uniform_for_rows_impl)
-
-
-def counter_uniform(
-    seed_lo: torch.Tensor, seed_hi: torch.Tensor, pos: torch.Tensor, vocab_size: int
-) -> torch.Tensor:
-    """Float32 uniforms [rows, vocab_size] in (0, 1], one per (row, token id).
-
-    `seed_lo` and `seed_hi` [rows] are the int32 bit patterns of the low and
-    high words of each row's 64-bit seed; `pos` [rows] int32 is the position
-    the row samples at. Equal to vLLM's `murmur3_uniform32(seed, pos, token)`.
-    """
-    fn = _counter_uniform_compiled if pos.device.type == "tpu" else counter_uniform_impl
-    with torch.no_grad():
-        return fn(seed_lo, seed_hi, pos, vocab_size)
-
-
-def counter_uniform_for_rows(
-    seed_lo_slots: torch.Tensor,
-    seed_hi_slots: torch.Tensor,
-    rows_slot: torch.Tensor,
-    rows_pos: torch.Tensor,
-    vocab_size: int,
-) -> torch.Tensor:
-    """`counter_uniform` for rows whose seed words sit in slot tensors.
-
-    `seed_lo_slots` / `seed_hi_slots` are [num_slots] int32; `rows_slot` and
-    `rows_pos` [rows] int32 give each row's slot and position. One compiled
-    program per input shape and stride, so a precompile must pass row tensors
-    laid out as the runtime call's.
-    """
-    fn = (
-        _counter_uniform_for_rows_compiled
-        if rows_pos.device.type == "tpu"
-        else counter_uniform_for_rows_impl
-    )
-    with torch.no_grad():
-        return fn(seed_lo_slots, seed_hi_slots, rows_slot, rows_pos, vocab_size)

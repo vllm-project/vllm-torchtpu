@@ -39,7 +39,7 @@ from vllm_torchtpu.runner.device_decode.head import (
     head_key,
     precompile_head,
 )
-from vllm_torchtpu.runner.device_decode.rng import counter_uniform
+from vllm_torchtpu.runner.device_decode.rng import counter_uniform_impl
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 MAX_NUM_REQS = 16
@@ -208,12 +208,13 @@ def _check_head_matches_stock(
     before, idx_mapping = _slots(runner, num_reqs, gen)
     slots = {field: t.clone().to(device) for field, t in before.items()}
     rows = idx_mapping[:num_rows].long()
-    u = counter_uniform(
-        before["seed_lo"][rows].to(device),
-        before["seed_hi"][rows].to(device),
-        before["num_computed"][rows].to(device),
+    # Each row's keyed noise, drawn on the host; the head draws its own.
+    u = counter_uniform_impl(
+        before["seed_lo"][rows],
+        before["seed_hi"][rows],
+        before["num_computed"][rows],
         VOCAB,
-    )
+    ).to(device)
     fed = {}
     if check_sampler_inputs:
         sample = head.sample_from_logits_impl
@@ -323,19 +324,37 @@ def test_head_matches_the_stock_sampler(
 def test_head_matches_the_stock_sampler_on_tpu(device, num_reqs, num_rows, monkeypatch):
     """Every head variant against the stock compiled sampler and logprobs
     programs on TPU: tokens, ranks and logprob bits equal."""
-    for scenario in SCENARIOS:
-        for max_num_logprobs in LOGPROBS:
-            runner = _runner(
-                scenario, num_reqs, max_num_logprobs, max_num_reqs=256, device=device
-            )
-            _check_head_matches_stock(
-                runner,
-                num_reqs,
-                num_rows,
-                monkeypatch,
-                seed=num_rows + len(scenario),
-                check_sampler_inputs=False,
-            )
+    # Each (rows, variant) is its own dynamic=False head program: 12 per case,
+    # past Dynamo's default limit of 8 per function, which fullgraph=True
+    # turns into FailOnRecompileLimitHit. The runner raises the limits in
+    # TPUModelRunner.__init__, which this stand-in skips. config.patch, not
+    # monkeypatch.setattr: under pytest 9.2 monkeypatch's undo deletes torch
+    # config entries for the rest of the session (pytest-dev/pytest#15287).
+    try:
+        with torch._dynamo.config.patch(
+            cache_size_limit=1024, accumulated_recompile_limit=1024
+        ):
+            for scenario in SCENARIOS:
+                for max_num_logprobs in LOGPROBS:
+                    runner = _runner(
+                        scenario,
+                        num_reqs,
+                        max_num_logprobs,
+                        max_num_reqs=256,
+                        device=device,
+                    )
+                    _check_head_matches_stock(
+                        runner,
+                        num_reqs,
+                        num_rows,
+                        monkeypatch,
+                        seed=num_rows + len(scenario),
+                        check_sampler_inputs=False,
+                    )
+    finally:
+        # Drop the entries compiled past the default limit, so a later test
+        # that compiles the head or the stock sampler starts afresh.
+        torch._dynamo.reset()
 
 
 def test_variant_follows_the_stock_decisions():
