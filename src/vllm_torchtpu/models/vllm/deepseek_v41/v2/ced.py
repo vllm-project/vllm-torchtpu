@@ -5,6 +5,8 @@ from dataclasses import dataclass, replace
 import torch
 from vllm.distributed import get_dp_group
 
+from vllm_torchtpu.distributed.shm_allreduce import dp_all_reduce_max
+
 
 def prefix_replay_enabled(vllm_config) -> bool:
     """Whether prefix caching runs through SWA bounded replay.
@@ -43,9 +45,7 @@ def coordinate_decoder_replay(
         dtype=torch.int64,
         device="cpu",
     )
-    torch.distributed.all_reduce(
-        count, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
-    )
+    dp_all_reduce_max(count, group, "decoder_replay")
     return replace(plan, padded_num_tokens=int(count.item())) if plan else None
 
 
