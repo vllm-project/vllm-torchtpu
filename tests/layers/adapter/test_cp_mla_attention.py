@@ -16,8 +16,10 @@ position-ownership rule the indexer's return leg and the KV write agree on, and
 the kernel `return_lse` flag the merge is built on."""
 
 import concurrent.futures
+import inspect
 import math
 import threading
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -26,7 +28,8 @@ import pytest
 import torch
 from absl.testing import parameterized
 
-from vllm_torchtpu.distributed import dcp_comm
+from vllm_torchtpu.distributed import dcp, dcp_comm
+from vllm_torchtpu.distributed import sharded_jax_op as sjo
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     cp_global_to_local,
     cp_owner_rank,
@@ -38,6 +41,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 )
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.layers.adapter import cp_mla_attention as cp_mla
+from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mao
 from vllm_torchtpu.layers.core import attention_interface
 
 
@@ -1868,13 +1872,6 @@ def test_local_q_all_gather_op_hands_jax_op_an_annotated_function(monkeypatch):
 
 
 def test_should_register_and_cache_local_q_norm_all_gather_op(monkeypatch):
-    import inspect  # noqa: PLC0415 -- match sibling lazy import style
-
-    from vllm_torchtpu.distributed import dcp  # noqa: PLC0415 -- lazy dist import
-    from vllm_torchtpu.distributed import (
-        sharded_jax_op as sjo,  # noqa: PLC0415 -- lazy dist import
-    )
-
     class _Mesh:
         shape = {dcp.DCP_AXIS_NAME: 16}
         axis_names = (dcp.DCP_AXIS_NAME,)
@@ -1903,12 +1900,6 @@ def test_should_register_and_cache_local_q_norm_all_gather_op(monkeypatch):
 
 
 def test_should_gate_q_norm_fusion_to_tiny_nonindexer_layers(monkeypatch):
-    from types import SimpleNamespace  # noqa: PLC0415 -- test-local utility
-
-    from vllm_torchtpu.layers.adapter.custom_ops import (
-        mla_attention_op as mao,  # noqa: PLC0415 -- lazy heavy import
-    )
-
     operands = (
         torch.zeros((2048, 16384), dtype=torch.float8_e4m3fn),
         torch.ones((16384,), dtype=torch.float32),
