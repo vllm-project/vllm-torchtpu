@@ -18,7 +18,9 @@
 chunk and so for every later one, on every lane. This checks the two against
 each other on the boundary of each term: the causal offset (the block's last
 key against the first query row), the lane's valid keys, and the DCP scopes'
-`local_k_start` (NEW_TOKENS_ONLY) and `local_k_end` (CACHE_ONLY).
+`local_k_start` (NEW_TOKENS_ONLY) and `local_k_end` (CACHE_ONLY). It also
+checks that each static guard alone (a sliding window, DECODE,
+`vpu_diet_enabled()` false) turns the skip off for a block every term passes.
 """
 
 import itertools
@@ -27,7 +29,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs, kernel
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs,
+    flash_attention,
+    kernel,
+)
 
 _BQ, _BKV, _NQ = 16, 256, 4
 _FULL = configs.AttentionScope.FULL
@@ -42,7 +48,7 @@ _LOCAL_K_END = (_BKV - 1, _BKV, _BKV + 1)
 _VISIBLE = (-_BKV, _BKV, 0, _BKV)
 
 
-def _cfgs(scope, batch_size):
+def _cfgs(scope, batch_size, mode=configs.RpaCase.MIXED, sliding_window=None):
     serve = configs.ServingConfigs(
         num_seqs=8,
         page_size=128,
@@ -55,7 +61,11 @@ def _cfgs(scope, batch_size):
         attention_scope=scope,
     )
     model = configs.ModelConfigs(
-        num_q_heads=_NQ, num_kv_heads=1, head_dim=256, mask_value=-1e9
+        num_q_heads=_NQ,
+        num_kv_heads=1,
+        head_dim=256,
+        mask_value=-1e9,
+        sliding_window=sliding_window,
     )
     block = configs.BlockSizes(
         bq_sz=_BQ, bq_c_sz=_BQ, bkv_sz=_BKV, batch_size=batch_size
@@ -64,7 +74,7 @@ def _cfgs(scope, batch_size):
         block=block,
         model=model,
         serve=serve,
-        mode=configs.RpaCase.MIXED,
+        mode=mode,
         vmem_limit_bytes=1 << 26,
     )
 
@@ -112,3 +122,24 @@ def test_block_fully_visible_iff_the_mask_keeps_every_score(scope, batch_size):
             assert bool(got) == want, lanes
             outcomes.add(want)
     assert outcomes == {True, False}
+
+
+@pytest.mark.parametrize("guard", ["sliding_window", "decode", "diet_off"])
+def test_each_static_guard_keeps_the_mask(guard, monkeypatch):
+    stitch, step = _metadata(_FULL, [_VISIBLE])
+    # Without the guard, this block skips the mask.
+    assert bool(kernel.block_fully_visible(stitch, step, _cfgs(_FULL, 1)))
+    mode = configs.RpaCase.DECODE if guard == "decode" else configs.RpaCase.MIXED
+    window = _BKV // 2 if guard == "sliding_window" else None
+    cfgs = _cfgs(_FULL, 1, mode=mode, sliding_window=window)
+    if guard == "diet_off":
+        monkeypatch.setattr(flash_attention, "vpu_diet_enabled", lambda: False)
+    if guard == "sliding_window":
+        # The window masks scores in this block, so skipping the mask would
+        # attend past it.
+        shape = (1, 1, _BQ * cfgs.aligned_num_q_heads_per_kv_head, _BKV)
+        (mask,) = kernel.generate_mask(
+            shape, bq_start=0, stitch_meta=stitch, step_meta=step, cfgs=cfgs
+        )
+        assert not np.all(np.asarray(mask))
+    assert kernel.block_fully_visible(stitch, step, cfgs) is None
