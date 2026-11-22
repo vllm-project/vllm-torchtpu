@@ -19,6 +19,8 @@ import pytest
 
 from vllm_torchtpu.layers.adapter.cp_draft_attention import (
     _token_layout,
+    write_kv,
+    write_kv_layers,
     write_pairs,
     write_runs,
     write_runs_batched,
@@ -122,3 +124,49 @@ def test_token_layout_matches_search():
     want_pos = seq_lens[s] - q_lens[s] + tok[real] - cu[s]
     np.testing.assert_array_equal(np.asarray(pos)[real], want_pos)
     np.testing.assert_array_equal(np.asarray(pos)[~real], 0)
+
+
+@pytest.mark.parametrize("dcp, head_ranks", [(2, 2), (8, 2), (8, 1)])
+def test_write_kv_layers_matches_each_layer(dcp, head_ranks):
+    """Every layer's draft-block write from one call (one kernel for a
+    decode batch's runs) equals `write_kv` layer by layer, on every rank."""
+    rng = np.random.default_rng(3)
+    layers, num_pages, head_dim = 3, 40, 128
+    kv_heads = dcp // head_ranks
+    words = -(-2 * kv_heads // 4)
+    ctx_lens = [1501, 300, 1033, 127]  # page crossings, a block edge
+    num_reqs, block = len(ctx_lens), 7
+    tables = jnp.asarray(
+        rng.permutation(np.arange(1, num_pages))[: num_reqs * 8].reshape(num_reqs, 8),
+        jnp.int32,
+    )
+    num_tokens = 32  # a padded decode bucket
+    seq_lens = jnp.asarray(ctx_lens, jnp.int32) + block
+    cu = jnp.asarray(np.arange(num_reqs + 1) * block, jnp.int32)
+    keys = jnp.asarray(
+        rng.standard_normal((layers, num_tokens, 1, head_dim)), jnp.bfloat16
+    )
+    values = jnp.asarray(
+        rng.standard_normal((layers, num_tokens, 1, head_dim)), jnp.bfloat16
+    )
+    for rank in range(dcp):
+        caches = tuple(
+            jnp.asarray(
+                rng.standard_normal((num_pages, 128, words, 4, head_dim)), jnp.float32
+            ).astype(jnp.float8_e4m3fn)
+            for _ in range(layers)
+        )
+        common = dict(dcp=dcp, head_ranks=head_ranks, rank=jnp.int32(rank))
+        want = [
+            write_kv(
+                c, keys[i], values[i], seq_lens, tables, cu, interpret=True, **common
+            )
+            for i, c in enumerate(caches)
+        ]
+        got = write_kv_layers(
+            caches, keys, values, seq_lens, tables, cu, interpret=True, **common
+        )
+        for w, g in zip(want, got, strict=True):
+            np.testing.assert_array_equal(
+                np.asarray(g.astype(jnp.float32)), np.asarray(w.astype(jnp.float32))
+            )

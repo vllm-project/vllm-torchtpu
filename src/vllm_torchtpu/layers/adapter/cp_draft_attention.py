@@ -189,6 +189,81 @@ def write_kv(
     return written.reshape(kv_cache.shape)
 
 
+def write_kv_layers(
+    kv_caches: tuple[jax.Array, ...],
+    keys: jax.Array,
+    values: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    dcp: int,
+    head_ranks: int,
+    rank: jax.Array,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    interpret: bool = False,
+) -> tuple[jax.Array, ...]:
+    """`write_kv` of every layer's ``keys[i]`` / ``values[i]`` into
+    ``kv_caches[i]`` (one page shape): a decode batch's runs are issued for
+    all layers from one kernel (`write_runs_batched`), other writes per layer."""
+    from vllm_torchtpu.models.minimax_m3.kernels.msa_write import max_write_runs
+
+    kv_cache = kv_caches[0]
+    num_tokens = keys.shape[1]
+    num_pages, page_size = kv_cache.shape[:2]
+    halves = _halves(kv_cache.shape[1:], dcp // head_ranks)
+    if halves == 2 or num_tokens >= _RUN_WRITE_MIN_TOKENS:
+        return tuple(
+            write_kv(
+                cache,
+                keys[i],
+                values[i],
+                seq_lens,
+                block_tables,
+                cu_q_lens,
+                dcp=dcp,
+                head_ranks=head_ranks,
+                rank=rank,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                interpret=interpret,
+            )
+            for i, cache in enumerate(kv_caches)
+        )
+    _, _, words, packing, width = kv_cache.shape
+    max_seqs = seq_lens.shape[0]
+    tables = block_tables.reshape(max_seqs, -1)
+    seq, pos, valid = _token_layout(seq_lens, cu_q_lens, num_tokens)
+    holder, slot = _page_slot(pos, page_size=page_size, dcp=dcp, head_ranks=head_ranks)
+    mine = valid & (holder == rank % head_ranks)
+    page = jnp.where(mine, tables[seq, pos // page_size // dcp], num_pages)
+    rows = jnp.stack(
+        [
+            token_head_rows(
+                _quantize(keys[i], kv_cache.dtype, k_scale),
+                _quantize(values[i], kv_cache.dtype, v_scale),
+                halves,
+                kv_cache.shape[1:],
+            ).reshape(num_tokens, 1, packing, width)
+            for i in range(len(kv_caches))
+        ]
+    )
+    word_rows = [
+        cache.reshape(num_pages, page_size * words, 1, packing, width)
+        for cache in kv_caches
+    ]
+    written = write_runs_batched(
+        word_rows,
+        rows,
+        page,
+        slot,
+        max_runs=max_write_runs(num_tokens, max_seqs, page_size),
+        interpret=interpret,
+    )
+    return tuple(w.reshape(kv_cache.shape) for w in written)
+
+
 # Prefill-sized writes take one grid step per run (`write_runs`); a decode
 # batch's many short runs are all issued from one step (`write_runs_batched`),
 # where an XLA scatter cost ~0.12 us per token (65 us per draft layer at 512
@@ -197,42 +272,50 @@ _RUN_WRITE_MIN_TOKENS = 1024
 
 
 def write_runs_batched(
-    kv_cache: jax.Array,
+    kv_cache: jax.Array | list[jax.Array],
     rows: jax.Array,
     pages: jax.Array,
     slots: jax.Array,
     *,
     max_runs: int,
     interpret: bool = False,
-) -> jax.Array:
+) -> jax.Array | list[jax.Array]:
     """`write_runs` from a single grid step: every run's power-of-two DMA
-    pieces are started back to back, then all are waited for."""
+    pieces are started back to back, then all are waited for. With a list of
+    caches (one page shape) ``rows`` holds each one's rows (``[L, T, ...]``)
+    and every cache takes the same runs."""
     from vllm_torchtpu.models.minimax_m3.kernels.msa_write import token_runs
 
+    single = not isinstance(kv_cache, list)
+    caches = [kv_cache] if single else kv_cache
+    layers = len(caches)
+    if single:
+        rows = rows[None]
+    kv_cache = caches[0]
     num_pages, page_size = kv_cache.shape[:2]
     # A run fits a page and the rows.
-    longest = min(page_size, rows.shape[0])
+    longest = min(page_size, rows.shape[1])
     pieces = [1 << b for b in reversed(range(longest.bit_length()))]
     num_runs, run_page, run_lo, run_hi, run_tok0 = token_runs(
         pages.astype(jnp.int32), slots.astype(jnp.int32), num_pages, max_runs
     )
 
-    def kernel(
-        n_ref, page_ref, lo_ref, hi_ref, tok0_ref, rows_hbm, cache_in, cache_out, sem
-    ):
-        del cache_in
+    def kernel(n_ref, page_ref, lo_ref, hi_ref, tok0_ref, rows_hbm, *refs):
+        # refs: the caches in (aliased), the caches out, the semaphore.
+        cache_outs, sem = refs[layers : 2 * layers], refs[2 * layers]
 
         def run_copies(r):
             count = hi_ref[r] - lo_ref[r]
             copies = []
             for size in pieces:
                 off = count & ~(2 * size - 1)  # after the larger pieces
-                copy = pltpu.make_async_copy(
-                    rows_hbm.at[pl.ds(tok0_ref[r] + off, size)],
-                    cache_out.at[page_ref[r], pl.ds(lo_ref[r] + off, size)],
-                    sem.at[0],
-                )
-                copies.append(((count & size) != 0, copy))
+                for layer, cache_out in enumerate(cache_outs):
+                    copy = pltpu.make_async_copy(
+                        rows_hbm.at[layer, pl.ds(tok0_ref[r] + off, size)],
+                        cache_out.at[page_ref[r], pl.ds(lo_ref[r] + off, size)],
+                        sem.at[0],
+                    )
+                    copies.append(((count & size) != 0, copy))
             return copies
 
         def start(r, carry):
@@ -249,21 +332,22 @@ def write_runs_batched(
         jax.lax.fori_loop(0, n_ref[0], wait, 0)
 
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    return pl.pallas_call(
+    written = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
             grid=(1,),
-            in_specs=[hbm, hbm],
-            out_specs=hbm,
+            in_specs=[hbm] * (1 + layers),
+            out_specs=[hbm] * layers,
             scratch_shapes=[pltpu.SemaphoreType.DMA((1,))],
         ),
-        out_shape=jax.ShapeDtypeStruct(kv_cache.shape, kv_cache.dtype),
-        # Operand 6 = the cache (after 5 scalar-prefetch operands and the rows).
-        input_output_aliases={6: 0},
+        out_shape=[jax.ShapeDtypeStruct(c.shape, c.dtype) for c in caches],
+        # Operands 6.. = the caches (after 5 scalar-prefetch operands and the rows).
+        input_output_aliases={6 + i: i for i in range(layers)},
         interpret=interpret,
         name="dcp_draft_write_runs_batched",
-    )(num_runs[None], run_page, run_lo, run_hi, run_tok0, rows, kv_cache)
+    )(num_runs[None], run_page, run_lo, run_hi, run_tok0, rows, *caches)
+    return written[0] if single else list(written)
 
 
 def write_runs(
@@ -504,10 +588,13 @@ def _window_pages(
     holder = rank % head_ranks
     first_page = (first + (holder - first) % head_ranks) // dcp
     logical = first_page[:, None] + jnp.arange(num_pages)[None, :]
-    pages = tables[
-        jnp.arange(max_seqs)[:, None], jnp.minimum(logical, tables.shape[1] - 1)
-    ]
-    return q_lens, cache_lens, logical * dcp + holder, pages
+    # Each row's window of its table as a one-hot masked sum, which fuses: a
+    # gather of the [R, L] pages ran 0.7 us at 8 requests and 5.9 us at 50,
+    # once per draft layer.
+    cols = jnp.minimum(logical, tables.shape[1] - 1)
+    one_hot = cols[:, :, None] == jnp.arange(tables.shape[1])[None, None, :]
+    pages = jnp.sum(jnp.where(one_hot, tables[:, None, :], 0), axis=-1)
+    return q_lens, cache_lens, logical * dcp + holder, pages.astype(tables.dtype)
 
 
 def attend_cached(
@@ -1218,21 +1305,18 @@ def write_layers_op(
         keys, values, seq_lens, block_tables, query_start_loc, dcp_rank = args[
             num_layers:
         ]
-        return tuple(
-            write_kv(
-                cache,
-                keys[i],
-                values[i],
-                seq_lens,
-                block_tables,
-                query_start_loc,
-                dcp=dcp,
-                head_ranks=head_ranks,
-                rank=dcp_rank[0],
-                k_scale=k_scale,
-                v_scale=v_scale,
-            )
-            for i, cache in enumerate(caches)
+        return write_kv_layers(
+            caches,
+            keys,
+            values,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            dcp=dcp,
+            head_ranks=head_ranks,
+            rank=dcp_rank[0],
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
     names = [f"kv_cache_{i}" for i in range(num_layers)] + [
