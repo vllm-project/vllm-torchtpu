@@ -27,6 +27,7 @@ time per bucket. Usage (8 cores, one process):
 from __future__ import annotations
 
 import argparse
+import os
 import time
 
 import jax
@@ -474,8 +475,8 @@ def _check_selection(sel: np.ndarray, R: int, B: int, K: int, ctx_q: list) -> No
         n = ctx_q[q] + t + 1
         nv, ga = n // 4, ctx_q[q] // 4
         cnt = min(nv, K)
-        g = s[: 4 * K : 4]
-        ok = (g[:cnt] >= 0).all() and (g[cnt:] == -1).all() and (g[:cnt] < nv).all()
+        g = np.where(s[: 4 * K : 4] >= 0, s[: 4 * K : 4] // 4, -1)  # block j: tokens 4 g + 0..3
+        ok = (g[:cnt] >= 0).all() and (g[cnt + 1 :] == -1).all() and (g[:cnt] < nv).all()  # slot cnt: tail
         ok &= bool((np.diff(g[:cnt]) > 0).all())
         blk = np.where(g[:, None] >= 0, g[:, None] * 4 + np.arange(4), -1).reshape(-1)[: 4 * cnt]
         ok &= bool(np.array_equal(s[: 4 * cnt], blk))
@@ -486,6 +487,9 @@ def _check_selection(sel: np.ndarray, R: int, B: int, K: int, ctx_q: list) -> No
         n_ga += int(nv > K and cnt and g[cnt - 1] == ga)
         if not ok:
             bad.append(row)
+    out = os.environ.get("CDK_OUTPUT_DIR", "")
+    if out:  # for an offline comparison (draft rows vs the target's selection)
+        np.save(f"{out}/sel_b{B}_ctx{ctx_q[0]}.npy", sel[0])
     print(f"B={B} SELCHK ranks_equal={same} rows_bad={len(bad)} {bad[:8]} over_budget_rows={n_full} "
           f"g_a_selected={n_ga} digest {hashlib.sha256(sel[0].tobytes()).hexdigest()[:16]}",
           flush=True)

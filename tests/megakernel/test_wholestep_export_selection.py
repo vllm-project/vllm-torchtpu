@@ -89,6 +89,29 @@ def test_selection_groups_restore_the_stock_selection(contexts, K, live, tie):
         assert n_ga > 0  # the g_a-in-slot-K-1 case is exercised
 
 
+def test_selection_groups_take_unordered_ids():
+    """`compressed_dcp` exports `_cdcp_gid` of ascending score positions: the true group
+    ids, not ascending, with pads still 0 (gid(0) = 0, and a nonzero position maps to a
+    nonzero id). The mapping's slot-K-1 rule then still holds and the selection is the
+    same set (the draft's `shared_blocks` reads it as a set)."""
+    K, contexts = 64, [3001, 4096, 100]
+    rng = np.random.default_rng(3)
+    for seed in range(4):
+        ids, want, lens, ctx, starts = _case(contexts, K, seed)
+        perm = ids.copy()
+        for r in range(len(lens)):
+            if lens[r] // 4 <= K:
+                continue  # ids not read
+            kept = K - int(ctx[r // T] // 4 in want[r])
+            perm[r, 0, :kept] = rng.permutation(ids[r, 0, :kept])
+            if kept == K and perm[r, 0, K - 1] == 0:  # the largest position is never group 0
+                perm[r, 0, [0, K - 1]] = perm[r, 0, [K - 1, 0]]
+        groups, _ = selection_groups(jnp.asarray(perm), jnp.asarray(ctx), jnp.asarray(starts),
+                                     T=T, K=K)
+        got = np.sort(np.where(np.asarray(groups) < 0, 1 << 30, np.asarray(groups)), axis=1)
+        np.testing.assert_array_equal(np.where(got == 1 << 30, -1, got), want)
+
+
 def test_selection_groups_catch_a_dropped_g_a():
     """Positive control: an export that loses g_a's slot rule fails the comparison."""
     K, contexts = 64, [3001, 4096]
