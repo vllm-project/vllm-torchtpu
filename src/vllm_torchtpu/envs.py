@@ -144,6 +144,8 @@ if TYPE_CHECKING:
     TPU_GREEDY_TOP_TOKENS: bool = False
     DP_SCHED_ENABLED: bool = False
     TPU_SHORT_PREFILL_FIRST_TOKENS: int = 0
+    TPU_PREFILL_MAX_LONG_RUNNING: int = 0
+    TPU_PREFILL_LONG_TOKENS: int = 16384
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -1528,6 +1530,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SHORT_PREFILL_FIRST_TOKENS": env_nonnegative_int(
         "TPU_SHORT_PREFILL_FIRST_TOKENS", 0
     ),
+    # PrefixAwareShortFirstScheduler admits no further request with more than
+    # TPU_PREFILL_LONG_TOKENS uncached tokens while this many such prefills
+    # run (core/prefix_aware_short_first_scheduler.py); 0 is off.
+    "TPU_PREFILL_MAX_LONG_RUNNING": env_nonnegative_int(
+        "TPU_PREFILL_MAX_LONG_RUNNING", 0
+    ),
+    "TPU_PREFILL_LONG_TOKENS": env_nonnegative_int("TPU_PREFILL_LONG_TOKENS", 16384),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
