@@ -32,6 +32,30 @@ die() {
     exit 1
 }
 
+# The full SHA of the commit the checkout at <repo_root> holds, which is what
+# its images are built from. BUILDKITE_COMMIT is the fallback for a checkout
+# without git metadata, and is not trusted first because it can read "HEAD"
+# when a build is created without a commit. git is asked only when the
+# checkout has its own .git: otherwise it would climb into an enclosing
+# repository and report that one's HEAD.
+image_revision() {
+    local repo_root="$1" revision=""
+    if [[ -e "${repo_root}/.git" ]]; then
+        revision="$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || true)"
+    fi
+    if [[ ! "${revision}" =~ ^[0-9a-f]{40}$ ]]; then
+        revision="${BUILDKITE_COMMIT:-}"
+    fi
+    [[ "${revision}" =~ ^[0-9a-f]{40}$ ]] \
+        || die "cannot tell which commit the images are built from: no git HEAD in ${repo_root} and BUILDKITE_COMMIT='${BUILDKITE_COMMIT:-}' is not a full commit SHA."
+    echo "${revision}"
+}
+
+# The `docker build --label` value that records <revision> on an image.
+image_revision_label() {
+    echo "org.opencontainers.image.revision=$1"
+}
+
 is_valid_release_version() {
     [[ "$1" =~ ${PEP440_PUBLIC_REGEX} ]]
 }
