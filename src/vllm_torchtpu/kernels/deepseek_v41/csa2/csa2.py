@@ -413,9 +413,12 @@ def _csa2_kernel_impl(
             )
         for i in range(bq):
             output = pv_raw[i]
+            # PV accumulated unnormalized weights. SWA-only inverses are
+            # already replicated across lanes (see swa_pv_sum).
             if has_main:
-                # PV accumulated unnormalized weights.
                 output = output * inverses[bank, i]
+            else:
+                output = output * jnp.concatenate((inverses[bank, i],) * 4, axis=1)
             tail = output[:, 384:]
             partner = jnp.take_along_axis(
                 tail,
@@ -662,6 +665,35 @@ def _csa2_kernel_impl(
                     if r == bq - 1:
                         preload_next(mxu)
 
+        def swa_pv_sum(indices):
+            # SWA-only PV with unnormalized weights. Before its PV, mxu1 sums
+            # each row's weights against ones into the row's QK accumulator,
+            # free once the scores are popped: the denominator arrives
+            # replicated across lanes, with no cross-lane sum or broadcast.
+            pltpu.matmul_push_rhs(swa_ref[:, pl.ds(0, 256)], 0, 0)
+            pltpu.matmul_push_rhs(jnp.ones((256, 256), jnp.bfloat16), 0, 1)
+            for r, i in enumerate(indices):
+                lhs = jnp.pad(swa_p_ref[i], ((0, mxu_heads - heads), (0, 0)))
+                pltpu.matmul_acc_lhs(
+                    accumulators[0][bq + r], lhs, load_staged_rhs=0 if r == 0 else None
+                )
+                pltpu.matmul_acc_lhs(
+                    accumulators[1][r], lhs, load_staged_rhs=0 if r == 0 else None
+                )
+                if r == 0:
+                    pltpu.matmul_push_rhs(swa_ref[:, pl.ds(256, 256)], 0, 1)
+            preload_next(0)
+            for r, i in enumerate(indices):
+                lhs = jnp.pad(swa_p_ref[i], ((0, mxu_heads - heads), (0, 0)))
+                pltpu.matmul_acc_lhs(
+                    accumulators[1][bq + r], lhs, load_staged_rhs=0 if r == 0 else None
+                )
+            preload_next(1)
+            for r, i in enumerate(indices):
+                total = pltpu.matmul_pop(accumulators[1][r])[:heads, :128]
+                # inverses holds the sink term until the sum arrives.
+                inverses[bank, i] = 1.0 / (inverses[bank, i] + total)
+
         indices = tuple(range(bq))
         if not has_main:
             # SWA-only layers: the window is the whole key set.
@@ -670,19 +702,23 @@ def _csa2_kernel_impl(
             if not first_tile:
                 finish(tile - 1, 1 - bank)
             swa_qk_pop(0, bq)
-            sink = sink_ref[...] * log2_e
+            sink = jnp.broadcast_to(sink_ref[...] * log2_e, (heads, 128))
             for r in indices:
                 swa_logits = swa_score_ref[r]
-                maximum = jnp.maximum(sink, jnp.max(swa_logits, axis=1, keepdims=True))
-                exponentials = jnp.exp2(swa_logits - maximum)
-                denominator = jnp.exp2(sink - maximum) + jnp.sum(
-                    exponentials, axis=1, keepdims=True
+                # One lane broadcast of the maximum serves both halves and
+                # the sink term.
+                maximum = jnp.maximum(
+                    sink,
+                    jnp.broadcast_to(
+                        jnp.max(swa_logits, axis=1, keepdims=True), (heads, 128)
+                    ),
                 )
-                # One reciprocal per row: a per-element divide costs 9 us/call
-                # here (62 vs 71 us); the full form keeps its divide (measured
-                # slower with the reciprocal).
-                swa_p_ref[r] = (exponentials * (1.0 / denominator)).astype(jnp.bfloat16)
-            swa_pv(indices)
+                exponentials = jnp.exp2(
+                    swa_logits - jnp.concatenate((maximum, maximum), axis=1)
+                )
+                inverses[bank, r] = jnp.exp2(sink - maximum)
+                swa_p_ref[r] = exponentials.astype(jnp.bfloat16)
+            swa_pv_sum(indices)
             if not first_tile:
                 output_copy(tile - 1, 1 - bank).start()
             return
@@ -1125,7 +1161,7 @@ def csa2(
                 pltpu.VMEM((bq, heads, 256), jnp.float32),
                 pltpu.VMEM((bq, heads, 512), jnp.bfloat16) if has_main else None,
                 pltpu.VMEM((bq, heads, 256), jnp.bfloat16),
-                pltpu.VMEM((2, bq, heads, 1), jnp.float32),
+                pltpu.VMEM((2, bq, heads, 1 if has_main else 128), jnp.float32),
                 pltpu.VMEM((bq, heads, 512), jnp.float32),
                 pltpu.SemaphoreType.DMA((4, 2 if resident_metadata else 4)),
                 pltpu.SemaphoreType.DMA((4, num_pages)),
