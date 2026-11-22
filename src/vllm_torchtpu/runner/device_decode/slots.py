@@ -552,7 +552,18 @@ class DecodeSlots:
 
     def _stage_grown_block_rows(self, input_batch: Any) -> None:
         """Stages every batch row whose block count left its slot's mirror.
-        Worker block tables only append, so the count tracks the contents."""
+
+        The count tracks the contents because, with vLLM 0.33, a request's
+        blocks only grow while it keeps its slot. `_update_states` appends a
+        running request's new blocks (`append_row`), and condensing or
+        reordering the batch moves whole rows (`move_row`, `swap_row`). A
+        request that rejoins the batch gets its old blocks back plus any new
+        ones (`add_row`). Only a resumed request's blocks are replaced, and
+        `sync_from_runner` frees and allocates its slot again, which stages
+        the whole row. Kernel block tables only append, and each KV cache
+        group has its own table and mirror count. A change that rewrote a
+        row in place without changing its count would get past this check.
+        """
         num_reqs = input_batch.num_reqs
         if not num_reqs:
             return
