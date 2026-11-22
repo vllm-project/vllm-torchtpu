@@ -14,12 +14,15 @@
 """Tests for Deepseek V4 StreamIndex Top-K kernel."""
 
 import functools
+import importlib
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax._src.pallas.mosaic import tpu_info as ti
+from jax.experimental.pallas import tpu as pltpu
 
 # `convert_cache_to_seq_along_lane` is not re-exported by the package's
 # `__init__`, and the package attribute `streamindex_topk` is the jitted
@@ -28,7 +31,11 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     KVLayout,
     streamindex_topk,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.metadata import (
+    cp_local_length,
+)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+    _effective_row_lengths,
     convert_cache_to_seq_along_lane,
 )
 
@@ -1753,3 +1760,151 @@ if __name__ == "__main__":
     from absl import app
 
     app.run(main)
+
+
+@pytest.mark.tpu_test
+def test_should_match_causal_fast_path_indices_with_compare_all_searchsorted():
+    num_tokens, k = 13, 16
+    q = jnp.zeros((num_tokens, 4, 128), dtype=jnp.float8_e4m3fn)
+    weights = jnp.zeros((num_tokens, 4), dtype=jnp.bfloat16)
+    k_cache = jnp.zeros((2, 16, 4, 256), dtype=jnp.uint8)
+    seq_lens = jnp.array([8, 4, 0, 0], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 5, 9, 9, 9], dtype=jnp.int32)
+    page_indices = jnp.zeros((8,), dtype=jnp.int32)
+    distribution = jnp.array([0, 0, 2], dtype=jnp.int32)
+
+    got = np.asarray(
+        streamindex_topk(
+            q,
+            weights,
+            k_cache,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            k=k,
+            compression_ratio=1,
+            num_kv_pages_per_block=2,
+            num_queries_per_block=4,
+            enable_early_exit=True,
+        )
+    )
+
+    expected = np.full((num_tokens, k), -1, dtype=np.int32)
+    for t in range(5):
+        max_pos = 3 + t
+        expected[t, : max_pos + 1] = np.arange(max_pos + 1, dtype=np.int32)
+    for t in range(4):
+        expected[5 + t, : t + 1] = np.arange(t + 1, dtype=np.int32)
+    np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,compression_ratio,cp_size,cp_rank,interleave_c",
+    [
+        pytest.param(16, 1, 1, 0, 1, id="fast-cr1-cp1"),
+        pytest.param(16, 2, 1, 0, 1, id="general-cr2-cp1"),
+        pytest.param(16, 1, 4, 1, 4, id="fast-cr1-cp4-il4"),
+        pytest.param(4, 1, 4, 1, 4, id="small-b4-cr1-cp4-il4"),
+    ],
+)
+def test_should_compute_exact_effective_row_lengths_for_mixed_and_padded_batches(
+    num_tokens, compression_ratio, cp_size, cp_rank, interleave_c
+):
+    # Anti-cancellation batch: 2 decode rows, a zero-length gap sequence, a
+    # mid-sequence chunked prefill, an over-cap sequence, plus inactive slots
+    # with non-zero garbage seq_lens/cu_q_lens past num_seqs.
+    num_positions = 40
+    if num_tokens <= 4:
+        seq_lens = np.array([15, 7, 999, 888], dtype=np.int32)
+        cu_q_lens = np.array([0, 1, 2, 0, 0], dtype=np.int32)
+        distribution = np.array([2, 2, 2], dtype=np.int32)
+    else:
+        seq_lens = np.array([15, 7, 100, 30, 60, 999, 888, 777], dtype=np.int32)
+        cu_q_lens = np.array([0, 1, 2, 2, 6, 11, 0, 0, 0], dtype=np.int32)
+        distribution = np.array([2, 2, 5], dtype=np.int32)
+
+    got = np.asarray(
+        _effective_row_lengths(
+            jnp.asarray(seq_lens),
+            jnp.asarray(cu_q_lens),
+            jnp.asarray(distribution),
+            num_tokens,
+            num_positions,
+            compression_ratio,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            interleave_c=interleave_c,
+        )
+    )
+
+    expected = np.zeros((num_tokens,), dtype=np.int32)
+    for s in range(int(distribution[2])):
+        q0, q1 = int(cu_q_lens[s]), int(cu_q_lens[s + 1])
+        q_len = q1 - q0
+        sl = int(seq_lens[s])
+        for tok in range(q0, q1):
+            token_pos = sl - q_len + (tok - q0)
+            vis = min(sl // compression_ratio, token_pos // compression_ratio + 1)
+            vis = int(
+                np.asarray(
+                    cp_local_length(jnp.int32(vis), cp_rank, cp_size, interleave_c)
+                )
+            )
+            expected[tok] = min(vis, num_positions)
+    np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize("decode_page_major", [True, False])
+def test_should_trace_packed_u32_seq_along_lane_kernels_and_reject_bad_shape(
+    monkeypatch: pytest.MonkeyPatch, decode_page_major: bool
+) -> None:
+    st_mod = importlib.import_module(
+        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+    )
+
+    info = ti.get_tpu_info_for_chip(ti.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    monkeypatch.setattr(ti, "get_tpu_info", lambda: info)
+    monkeypatch.setattr(
+        st_mod,
+        "sparsecore_topk",
+        lambda scores, k, *a, **kw: jnp.zeros((scores.shape[0], k), jnp.int32),
+    )
+
+    def _run(q, w, kv, sl, pt, qsl, dist):
+        return streamindex_topk(
+            q,
+            w,
+            kv,
+            sl,
+            pt,
+            qsl,
+            dist,
+            k=2048,
+            compression_ratio=1,
+            kv_layout=KVLayout.SEQ_ALONG_LANE,
+            num_queries_per_block=128,
+            num_kv_pages_per_block=8,
+            chunk_tokens=128,
+            decode_as_mixed=True,
+            enable_early_exit=False,
+            decode_page_major=decode_page_major,
+        )
+
+    args = (
+        jax.ShapeDtypeStruct((1024, 32, 128), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((1024, 32), jnp.bfloat16),
+        jax.ShapeDtypeStruct((64, 33, 256), jnp.uint32),
+        jax.ShapeDtypeStruct((64,), jnp.int32),
+        jax.ShapeDtypeStruct((64 * 16,), jnp.int32),
+        jax.ShapeDtypeStruct((65,), jnp.int32),
+        jax.ShapeDtypeStruct((3,), jnp.int32),
+    )
+    traced = jax.jit(_run).trace(*args)
+    jaxpr_txt = str(traced.jaxpr)
+    assert ("-pm" in jaxpr_txt) is decode_page_major
+
+    bad_args = (*args[:2], jax.ShapeDtypeStruct((64, 32, 256), jnp.uint32), *args[3:])
+    with pytest.raises(ValueError, match="SEQ_ALONG_LANE packed u32 expects"):
+        jax.jit(_run).trace(*bad_args)

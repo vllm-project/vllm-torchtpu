@@ -217,9 +217,17 @@ def test_coop_v2_engages_through_the_a2a_dispatcher(monkeypatch):
     exactly on the allow-listed shapes."""
     _require_sparsecore()
     monkeypatch.setattr(envs, "TPU_SC_TOPK_COOP_V2", True)
-    for b, engaged in ((8, True), (16, True), (32, False), (4, False)):
-        scores = jnp.zeros((b, N_A2A), jnp.float32)
-        lens = jnp.full((b,), N_A2A, jnp.int32)
+    for b, n, engaged in (
+        (4, N_A2A, True),
+        (8, N_A2A, True),
+        (16, N_A2A, True),
+        (32, N_A2A, False),
+        (2, N_A2A, False),
+        (16, 12288, True),
+        (4, 32768, True),
+    ):
+        scores = jnp.zeros((b, n), jnp.float32)
+        lens = jnp.full((b,), n, jnp.int32)
         txt = (
             jax.jit(
                 lambda s, ln: sc_topk.sparsecore_topk.__wrapped__(
@@ -231,7 +239,7 @@ def test_coop_v2_engages_through_the_a2a_dispatcher(monkeypatch):
         )
         assert (
             bool(re.search(r"sc_topk_direct_b\d+_n\d+_k\d+_p\d+_v2", txt)) is engaged
-        ), b
+        ), (b, n)
 
 
 def _merge_case(b, dcp, k, seed, kind):

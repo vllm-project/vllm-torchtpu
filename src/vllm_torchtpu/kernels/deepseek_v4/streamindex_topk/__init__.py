@@ -32,6 +32,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.kv_cache_append import (
     coalesced_kv_append_dcp,
     scatter_rows,
     scatter_rows_reference,
+    sharded_kv_append_dcp,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.kv_cache_utils import (
     get_dcp_page_and_slot,
@@ -81,6 +82,7 @@ __all__ = [
     "indexer_kv_layout",
     "scatter_rows",
     "scatter_rows_reference",
+    "sharded_kv_append_dcp",
     "streamindex_topk",
     "streamindex_topk_dcp",
 ]

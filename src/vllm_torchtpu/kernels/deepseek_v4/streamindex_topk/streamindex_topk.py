@@ -26,6 +26,7 @@ from jax.experimental import pallas as pl
 from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
+
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
     rank_major_merge_fits,
@@ -33,15 +34,14 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     sparsecore_topk_dcp_merge,
 )
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk_dcp import sparsecore_topk_dcp
-from vllm_torchtpu.kernels.experimental.small_collectives import (
-    all_gather as small_collectives_all_gather,
-)
-
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     bref_override,
     config,
     dcp_sc_compact,
     metadata,
+)
+from vllm_torchtpu.kernels.experimental.small_collectives import (
+    all_gather as small_collectives_all_gather,
 )
 
 try:
@@ -144,15 +144,12 @@ class _BlockedPrefillConfig:
         # stores when every token owns whole (8, 128) tiles of it.
         num_sublanes_bkv = bkv_sz // 128
         strided_score_store = num_sublanes_bkv % 8 == 0
-        # Rows between consecutive tokens of the VMEM score block. The sublanes of
-        # one store must fall in distinct VMEM banks (row mod 32), so with a pitch
-        # of nsub rows, a multiple of 16 for the usual block sizes, every strided
-        # store splits into 2-row pieces (1-row at nsub = 32), and a bundle holding
-        # two stores cannot also pop the MXU. A pitch of 8 mod 16 rows lets each
-        # store cover 4 rows; the padding rows are never copied out.
+        # Avoid multiple-of-8 pitch on strided score stores: padding by +1 gives
+        # an odd row stride so full vector-width stores avoid splitting, cutting
+        # padding from 8 rows down to 1 row per token.
         score_pitch = num_sublanes_bkv
-        if enabled and strided_score_store and score_pitch % 16 == 0:
-            score_pitch += 8
+        if enabled and strided_score_store and score_pitch % 8 == 0:
+            score_pitch += 1
 
         # Reduced-precision head reduction (used for FP8 queries):
         # relu(q @ k) is rounded to bf16 and the weights are held in bf16, so each
@@ -230,11 +227,20 @@ def kernel(
 
     _, num_q_heads, head_dim = q_hbm_ref.shape
 
+    u32_sal = (
+        seq_along_lane
+        and cache_kv_hbm_ref.ndim == 3
+        and cache_kv_hbm_ref.dtype == jnp.uint32
+    )
     if seq_along_lane:
-        # [total_num_pages, kv_sublane_groups, kv_packing, page_size] where the
-        # leading `head_dim` sublane rows hold the FP8 key bytes and the next row
-        # holds the per-token UE8M0 scale.
-        (_, kv_sublane_groups, kv_packing, page_size) = cache_kv_hbm_ref.shape
+        if u32_sal:
+            (_, kv_sublane_groups, page_size) = cache_kv_hbm_ref.shape
+            kv_packing = 4
+        else:
+            # [total_num_pages, kv_sublane_groups, kv_packing, page_size] where the
+            # leading `head_dim` sublane rows hold the FP8 key bytes and the next row
+            # holds the per-token UE8M0 scale.
+            (_, kv_sublane_groups, kv_packing, page_size) = cache_kv_hbm_ref.shape
         kv_head_dim_groups = head_dim // kv_packing
         page_size_per_kv_packing = page_size // kv_packing
     else:
@@ -313,7 +319,7 @@ def kernel(
     page_major = (
         decode_page_major
         and seq_along_lane
-        and not prefill_cfg.enabled
+        and (u32_sal or not prefill_cfg.enabled)
         and seq_batch_size == 1
         and page_size % 128 == 0
     )
@@ -328,7 +334,33 @@ def kernel(
         lambda p_id: (seq_tile(p_id), bq_block(p_id), 0),
         pipeline_mode=pl.Buffered(buffer_count=buffer_cnt, use_lookahead=True),
     )
-    if seq_along_lane and page_major:
+    if u32_sal and page_major:
+        assert kv_sublane_groups is not None
+        # Avoid 3D flat u32 [1, 33, bkv_sz] or u8 bitcast+reshape on prefill:
+        # 4D u32 [1, bkv_p, 33, page_size] copies each page contiguously and
+        # slices u32[32, 128] with stride=1 without memref_reshape errors.
+        kv_spec = pl.BlockSpec(
+            (
+                pl.BoundedSlice(seq_batch_size),
+                bkv_p,
+                kv_sublane_groups,
+                page_size,
+            ),
+            lambda p_id: (seq_tile(p_id), bkv_block(p_id), 0, 0),
+            pipeline_mode=pl.Buffered(buffer_count=buffer_cnt, use_lookahead=True),
+        )
+    elif u32_sal:
+        assert kv_sublane_groups is not None
+        kv_spec = pl.BlockSpec(
+            (
+                pl.BoundedSlice(seq_batch_size),
+                kv_sublane_groups,
+                bkv_sz,
+            ),
+            lambda p_id: (seq_tile(p_id), 0, bkv_block(p_id)),
+            pipeline_mode=pl.Buffered(buffer_count=buffer_cnt, use_lookahead=True),
+        )
+    elif seq_along_lane and page_major:
         assert kv_sublane_groups is not None
         kv_spec = pl.BlockSpec(
             (
@@ -440,6 +472,8 @@ def kernel(
     num_lane_tiles_bkv = bkv_sz // 128
 
     def seq_along_lane_block_rows(bkv_vmem):
+        if u32_sal:
+            return bkv_vmem
         return bkv_vmem.bitcast(jnp.uint32).reshape(
             seq_batch_size, kv_sublane_groups * num_lane_tiles_bkv, 128
         )
@@ -457,6 +491,22 @@ def kernel(
 
     def seq_along_lane_key_tile(rows, batch_idx, lane_tile_idx):
         """[head_dim, 128] FP8 keys of lane tile `lane_tile_idx`."""
+        if u32_sal:
+            if page_major:
+                p, j = divmod(lane_tile_idx, tiles_per_page)
+                words = rows[
+                    batch_idx,
+                    p,
+                    pl.ds(0, kv_head_dim_groups),
+                    pl.ds(j * 128, 128),
+                ]
+            else:
+                words = rows[
+                    batch_idx,
+                    pl.ds(0, kv_head_dim_groups),
+                    pl.ds(lane_tile_idx * 128, 128),
+                ]
+            return pltpu.bitcast(words, jnp.float8_e4m3fn)
         row0, stride = _tile_row0(lane_tile_idx)
         words = rows[
             batch_idx,
@@ -467,6 +517,22 @@ def kernel(
 
     def seq_along_lane_scale_tile(rows, batch_idx, lane_tile_idx):
         """[1, 128] f32 dequantization scales of lane tile `lane_tile_idx`."""
+        if u32_sal:
+            if page_major:
+                p, j = divmod(lane_tile_idx, tiles_per_page)
+                words = rows[
+                    batch_idx,
+                    p,
+                    pl.ds(kv_head_dim_groups, 1),
+                    pl.ds(j * 128, 128),
+                ]
+            else:
+                words = rows[
+                    batch_idx,
+                    pl.ds(kv_head_dim_groups, 1),
+                    pl.ds(lane_tile_idx * 128, 128),
+                ]
+            return pltpu.bitcast((words & 0xFF) << 23, jnp.float32)
         row0, stride = _tile_row0(lane_tile_idx)
         row = row0 + kv_head_dim_groups * stride
         words = rows[batch_idx, pl.ds(row, 1), :]
@@ -1239,6 +1305,82 @@ def convert_cache_to_seq_along_lane(
     )
 
 
+_SMALL_EFFECTIVE_ROW_GATHER_MAX_TOKENS = 4
+
+
+def _effective_global_visible(
+    seq_lens: jax.Array,  # i32[max_num_seqs]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+    num_tokens: int,
+    compression_ratio: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Return global `(visible, valid)` per token before CP sharding/clamp."""
+    max_num_seqs = seq_lens.shape[0]
+    num_seqs = distribution[2]
+    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
+    # Avoid replacing dynamic gathers on tiny decode buckets (num_tokens <= 4):
+    # on 16-TC DCP decode the [4, max_num_seqs] reduction regresses c=1 ITL by
+    # +48..+195 us/step, whereas b >= 8 and prefill gain from gather-free VPU math.
+    if num_tokens <= _SMALL_EFFECTIVE_ROW_GATHER_MAX_TOKENS:
+        seq_mask = token_ids[:, None] >= cu_q_lens[None, 1 : max_num_seqs + 1]
+        seq_mask = jnp.where(
+            jnp.arange(max_num_seqs)[None, :] < num_seqs, seq_mask, False
+        )
+        seq_ids = jnp.sum(seq_mask, axis=1)
+        q_start = cu_q_lens[seq_ids]
+        q_len = cu_q_lens[seq_ids + 1] - q_start
+        seq_len = seq_lens[seq_ids]
+        token_pos = seq_len - q_len + (token_ids - q_start)
+        kv_len = seq_len // compression_ratio
+        visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+        valid = (token_ids >= cu_q_lens[0]) & (token_ids < cu_q_lens[num_seqs])
+        return visible, valid
+
+    seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
+    q_starts = cu_q_lens[:max_num_seqs]
+    q_ends = cu_q_lens[1 : max_num_seqs + 1]
+    # Avoid dynamic 1D gathers on cu_q_lens/seq_lens for b >= 8 and prefill:
+    # XLA lowers those as sequential gather fusions, whereas a masked int32
+    # reduction over [num_tokens, max_num_seqs] stays on the VPU (~6x faster).
+    in_seq = (
+        (seq_idx[None, :] < num_seqs)
+        & (token_ids[:, None] >= q_starts[None, :])
+        & (token_ids[:, None] < q_ends[None, :])
+    )
+    if compression_ratio == 1:
+        pos_off = (seq_lens - q_ends + jnp.int32(1))[None, :]
+        cand = jnp.minimum(seq_lens[None, :], token_ids[:, None] + pos_off)
+        visible = jnp.sum(jnp.where(in_seq, cand, jnp.int32(0)), axis=1)
+        return visible, visible > jnp.int32(0)
+    pos_off = seq_lens - q_ends
+    off = jnp.sum(jnp.where(in_seq, pos_off[None, :], jnp.int32(0)), axis=1)
+    seq_len = jnp.sum(jnp.where(in_seq, seq_lens[None, :], jnp.int32(0)), axis=1)
+    token_pos = token_ids + off
+    kv_len = seq_len // compression_ratio
+    visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+    valid = jnp.any(in_seq, axis=1)
+    return visible, valid
+
+
+def _clamp_local_visible(
+    visible: jax.Array,
+    valid: jax.Array,
+    *,
+    num_positions: int,
+    compression_ratio: int,
+    num_tokens: int,
+    cp_rank: jax.Array | int,
+    cp_size: int,
+    interleave_c: int,
+) -> jax.Array:
+    local = cp_local_length(visible, cp_rank, cp_size, interleave_c)
+    clamped = jnp.minimum(local, jnp.int32(num_positions))
+    if compression_ratio == 1 and num_tokens > _SMALL_EFFECTIVE_ROW_GATHER_MAX_TOKENS:
+        return clamped
+    return jnp.where(valid, clamped, jnp.int32(0))
+
+
 def _effective_row_lengths(
     seq_lens: jax.Array,  # i32[max_num_seqs]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -1255,22 +1397,19 @@ def _effective_row_lengths(
     Under context parallelism the score matrix is rank-local, so the row length
     is the number of globally-visible positions that *this* rank owns.
     """
-    max_num_seqs = seq_lens.shape[0]
-    num_seqs = distribution[2]
-    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_mask = token_ids[:, None] >= cu_q_lens[None, 1 : max_num_seqs + 1]
-    seq_mask = jnp.where(jnp.arange(max_num_seqs)[None, :] < num_seqs, seq_mask, False)
-    seq_ids = jnp.sum(seq_mask, axis=1)
-
-    q_start = cu_q_lens[seq_ids]
-    q_len = cu_q_lens[seq_ids + 1] - q_start
-    seq_len = seq_lens[seq_ids]
-    token_pos = seq_len - q_len + (token_ids - q_start)
-    kv_len = seq_len // compression_ratio
-    visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
-    visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
-    valid = token_ids < cu_q_lens[num_seqs]
-    return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
+    visible, valid = _effective_global_visible(
+        seq_lens, cu_q_lens, distribution, num_tokens, compression_ratio
+    )
+    return _clamp_local_visible(
+        visible,
+        valid,
+        num_positions=num_positions,
+        compression_ratio=compression_ratio,
+        num_tokens=num_tokens,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        interleave_c=interleave_c,
+    )
 
 
 @functools.partial(
@@ -1536,16 +1675,34 @@ def streamindex_topk(
     q = prepare_q_inputs(q)
     head_dim = q.shape[-1]
 
+    u32_sal_in = (
+        kv_layout == KVLayout.SEQ_ALONG_LANE
+        and cache_kv.ndim == 3
+        and cache_kv.dtype == jnp.uint32
+    )
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
-        total_num_pages, kv_sublane_groups, kv_packing, page_size = cache_kv.shape
-        expected_shape = get_kv_cache_shape(
-            total_num_pages, page_size, actual_head_dim, kv_layout
-        )
-        if cache_kv.shape != expected_shape:
-            raise ValueError(
-                "SEQ_ALONG_LANE expects cache_kv of shape"
-                f" {expected_shape}, got {cache_kv.shape}."
+        if u32_sal_in:
+            total_num_pages, kv_sublane_groups, page_size = cache_kv.shape
+            kv_packing = 4
+            expected_u8 = get_kv_cache_shape(
+                total_num_pages, page_size, actual_head_dim, kv_layout
             )
+            expected_u32 = (expected_u8[0], expected_u8[1], expected_u8[3])
+            if cache_kv.shape != expected_u32:
+                raise ValueError(
+                    "SEQ_ALONG_LANE packed u32 expects cache_kv of shape"
+                    f" {expected_u32}, got {cache_kv.shape}."
+                )
+        else:
+            total_num_pages, kv_sublane_groups, kv_packing, page_size = cache_kv.shape
+            expected_shape = get_kv_cache_shape(
+                total_num_pages, page_size, actual_head_dim, kv_layout
+            )
+            if cache_kv.shape != expected_shape:
+                raise ValueError(
+                    "SEQ_ALONG_LANE expects cache_kv of shape"
+                    f" {expected_shape}, got {cache_kv.shape}."
+                )
         if kv_sublane_groups * kv_packing != head_dim + kv_packing:
             raise ValueError(
                 f"Inconsistent SEQ_ALONG_LANE cache: {kv_sublane_groups=},"
@@ -1591,7 +1748,10 @@ def streamindex_topk(
             and case == MlaCase.MIXED
             and kv_layout == KVLayout.SEQ_ALONG_LANE
             and seq_batch_size == 1
-            and bq_sz == get_dtype_packing(q.dtype)
+            and (
+                (u32_sal_in and page_size % 128 == 0)
+                or bq_sz == get_dtype_packing(q.dtype)
+            )
         )
         return pack, page_major
 
@@ -1859,31 +2019,56 @@ def streamindex_topk(
         )
 
         num_positions = max(num_sublanes_total * 128, k)
-        eff_row_lengths = _effective_row_lengths(
-            seq_lens=seq_lens,
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-            num_tokens=max_num_tokens,
-            num_positions=num_positions,
-            compression_ratio=compression_ratio,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            interleave_c=interleave_c,
-        )
-        # Rank 0 owns the first interleave block of every row, so its row
-        # lengths bound every rank's, and every rank computes the same (only
-        # `dcp_axis_name` reads them).
-        row_bounds = _effective_row_lengths(
-            seq_lens=seq_lens,
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-            num_tokens=max_num_tokens,
-            num_positions=num_positions,
-            compression_ratio=compression_ratio,
-            cp_rank=0,
-            cp_size=cp_size,
-            interleave_c=interleave_c,
-        )
+        if max_num_tokens > _SMALL_EFFECTIVE_ROW_GATHER_MAX_TOKENS:
+            global_visible, global_valid = _effective_global_visible(
+                seq_lens, cu_q_lens, distribution, max_num_tokens, compression_ratio
+            )
+            eff_row_lengths = _clamp_local_visible(
+                global_visible,
+                global_valid,
+                num_positions=num_positions,
+                compression_ratio=compression_ratio,
+                num_tokens=max_num_tokens,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                interleave_c=interleave_c,
+            )
+            # Rank 0 owns the first interleave block of every row, so its row
+            # lengths bound every rank's, and every rank computes the same (only
+            # `dcp_axis_name` reads them).
+            row_bounds = _clamp_local_visible(
+                global_visible,
+                global_valid,
+                num_positions=num_positions,
+                compression_ratio=compression_ratio,
+                num_tokens=max_num_tokens,
+                cp_rank=0,
+                cp_size=cp_size,
+                interleave_c=interleave_c,
+            )
+        else:
+            eff_row_lengths = _effective_row_lengths(
+                seq_lens=seq_lens,
+                cu_q_lens=cu_q_lens,
+                distribution=distribution,
+                num_tokens=max_num_tokens,
+                num_positions=num_positions,
+                compression_ratio=compression_ratio,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                interleave_c=interleave_c,
+            )
+            row_bounds = _effective_row_lengths(
+                seq_lens=seq_lens,
+                cu_q_lens=cu_q_lens,
+                distribution=distribution,
+                num_tokens=max_num_tokens,
+                num_positions=num_positions,
+                compression_ratio=compression_ratio,
+                cp_rank=0,
+                cp_size=cp_size,
+                interleave_c=interleave_c,
+            )
 
         if chunk_tokens is None or max_num_tokens % chunk_tokens:
             num_chunks, chunk_len = 1, max_num_tokens
@@ -2042,8 +2227,12 @@ def streamindex_topk(
 
     def _fast_path(_):
         token_idx = jnp.arange(q.shape[0])
+        # Avoid default binary-search searchsorted: lowers to a gather
+        # while-loop on TPU (~640 us vs ~10 us at 1024 tokens).
         seq_idx = jnp.minimum(
-            jnp.searchsorted(cu_q_lens[1:], token_idx, side="right"),
+            jnp.searchsorted(
+                cu_q_lens[1:], token_idx, side="right", method="compare_all"
+            ),
             seq_lens.shape[0] - 1,
         )
         seq_len = seq_lens[seq_idx]
@@ -2054,7 +2243,8 @@ def streamindex_topk(
             seq_len // compression_ratio - 1,
             q_abs_pos // compression_ratio,
         )
-        max_valid_idx = jnp.where(token_idx < cu_q_lens[-1], max_valid_idx, -1)
+        valid_tok = (token_idx >= cu_q_lens[0]) & (token_idx < cu_q_lens[-1])
+        max_valid_idx = jnp.where(valid_tok, max_valid_idx, -1)
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
         return jnp.where(s_idx <= max_valid_idx[:, None], s_idx, -1)
 
