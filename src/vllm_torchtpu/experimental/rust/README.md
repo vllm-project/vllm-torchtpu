@@ -58,6 +58,11 @@ values are exactly vLLM's:
 - **Some options go to rvllm.** `--host`, `--port`, `--served-model-name` and
   `--[no-]async-scheduling` set the server and its runtime behavior.
   `--load-format` goes to both rvllm and the exporter.
+  `--kv-transfer-config` goes to rvllm only, so the prefill and decode servers
+  of a disaggregated deployment share one cached export: rvllm takes the
+  `TPUConnector` and `TPURaidenConnector` configs of the `vllm serve` command
+  line (`kv_role` `kv_producer` or `kv_consumer`) and listens for KV pulls on
+  `TPU_KV_TRANSFER_PORT`, as vLLM does.
 - **rvllm's own deployment flags go to rvllm.** `vllm serve` has no such flags:
   `--role`, `--kv-port`, `--kv-listen`, `--kv-advertise`, `--kv-producers`,
   `--max-queued-requests`, `--shutdown-timeout` and
@@ -69,8 +74,6 @@ values are exactly vLLM's:
   - Every other option rvllm does not implement fails before anything runs,
     for example `--api-key`, `--chat-template`, `--enable-auto-tool-choice`
     and `--ssl-*`. So does an option `vllm serve` does not know.
-  - Disaggregated serving uses rvllm's flags: `--kv-transfer-config` fails
-    and says which flags to use.
 
 The launcher prints the export command and the `rvllm serve` command before it
 runs them.
