@@ -123,6 +123,7 @@ def _kernel(
     inline_issue: bool = False,
     limited: bool = False,
     kernel_limits: bool = False,
+    packed_stores: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -184,7 +185,7 @@ def _kernel(
             start = tile % tiles_per_step * bq
             rows = pl.ds(pl.multiple_of(start, bq), bq)
             q_refs = tuple(r.at[:, rows, :] for r in q_refs)
-            packed = _merged_store_rows(bq, o_ref.shape[0], o_ref.dtype)
+            packed = _merged_store_rows(bq, o_ref.shape[0], o_ref.dtype, packed_stores)
             if packed > 1:
                 store_out = functools.partial(
                     _store_unaligned_rows, o_ref, start, bq, packed
@@ -679,13 +680,15 @@ def _denom_floor() -> float:
     return float(jnp.finfo(jnp.float32).tiny) if MAX_FREE else 1.0
 
 
-def _merged_store_rows(block_q: int, num_heads: int, dtype) -> int:
+def _merged_store_rows(block_q: int, num_heads: int, dtype, packed=False) -> int:
     """The packed output window (`_store_unaligned_rows`) a tile's output is
     merged into, or 1 for a plain store: a window is the output dtype's
     sublane tile (16 rows for bf16). Blocks of 16 heads lower their 8-row
-    stores (decode tiles); 8 heads did not (c64 head-parallel, j-d318070b)."""
+    stores (decode tiles) when XLA gives the output 8-row tiles; 8 heads did
+    not (c64 head-parallel, j-d318070b). `packed` merges whatever the heads
+    (an output whose consumers XLA lays out in 16-row tiles)."""
     rows = 8 * 4 // jnp.dtype(dtype).itemsize
-    return rows if block_q % rows and num_heads % rows else 1
+    return rows if block_q % rows and (packed or num_heads % rows) else 1
 
 
 def _store_unaligned_rows(o_ref, start, rows, packed, out):
@@ -726,6 +729,7 @@ def _attention_call(
     scale_rows=None,
     calls=1,
     inline_issue=False,
+    packed_stores=False,
 ):
     """One kernel call over the tiles ``tile_offset + [0, tiles)`` of the
     head-major ``q [G * Hg, T, D]``, ``selected [G, T, K]``, ``local_page``
@@ -869,6 +873,7 @@ def _attention_call(
             inline_issue=inline_issue,
             limited=limited,
             kernel_limits=kernel_limits,
+            packed_stores=packed_stores,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -1415,7 +1420,9 @@ def _chunked_call(
     return out.transpose(1, 0, 2)[:num_tokens], lse[:num_tokens]
 
 
-def _chunk_work(selected, num_q_heads, dtype, block_q, pages_per_step, fp4=False):
+def _chunk_work(
+    selected, num_q_heads, dtype, block_q, pages_per_step, fp4=False, packed=False
+):
     """`_chunked_call`'s calls over ``selected [T, G, K]``: ``(step,
     chunks, pad, selected [G, chunks * step, K], (packed, tiles_per_step))``
     with every call's work list built in one batched pass ahead of the loop
@@ -1433,7 +1440,7 @@ def _chunk_work(selected, num_q_heads, dtype, block_q, pages_per_step, fp4=False
         selected.reshape(num_heads * num_chunks, step, topk),
         block_q,
         pages_per_step,
-        align=_merged_store_rows(block_q, num_q_heads // num_heads, dtype),
+        align=_merged_store_rows(block_q, num_q_heads // num_heads, dtype, packed),
         most=PREFILL_TILES_PER_STEP_4BIT
         if fp4
         and block_q < msa_attention.DEFAULT_BLOCK_Q
@@ -1760,3 +1767,85 @@ def msa_sparse_attention_lse_heads(
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]
     return out[:num_tokens], lse[:num_tokens]
+
+
+def msa_sparse_attention_lse_head_calls(
+    q: jax.Array,
+    kv_cache: jax.Array,
+    selected: jax.Array,
+    local_page: jax.Array,
+    local_limit: jax.Array,
+    page_table: jax.Array,
+    head_order: jax.Array,
+    *,
+    sm_scale: float,
+    block_q: int,
+    pages_per_step: int,
+    scale_cache: jax.Array,
+    interpret: bool = False,
+) -> list:
+    """`msa_sparse_attention_lse_heads` of a 4-bit cache as one kernel call
+    per KV head, in the traced order ``head_order`` (``int32[G]``), so a
+    consumer of an earlier head's partial (a collective) can overlap the
+    later calls. Returns one thunk per call: ``call(after=None)`` runs it
+    after the arrays `after` exist (an optimization barrier) and returns
+    ``(out [G * Hg, T, D], lse [G * Hg, T])`` head-major, of which only that
+    head's query heads are set. One chunk (decode-sized steps) only."""
+    num_tokens, num_heads = selected.shape[:2]
+    num_q_heads, head_dim = q.shape[1], q.shape[2]
+    msa_attention.check_cache(kv_cache, scale_cache)
+    if _check_rows(kv_cache, head_dim) < num_heads or num_q_heads % num_heads:
+        raise ValueError(
+            f"{num_heads} KV heads of {num_q_heads} query heads do not fit cache "
+            f"rows {kv_cache.shape}."
+        )
+    # Packed stores (below) need whole output windows per grid step: an even
+    # tile count.
+    store_rows = _merged_store_rows(block_q, 1, q.dtype, True)
+    q, selected, local_page, local_limit = _pad_tokens(
+        q, selected, local_page, local_limit, max(block_q, store_rows)
+    )
+    q = q.transpose(1, 0, 2)
+    step, num_chunks, pad, selected, (packed, tiles_per_step) = _chunk_work(
+        selected, num_q_heads, q.dtype, block_q, pages_per_step, True, packed=True
+    )
+    if num_chunks != 1:
+        raise ValueError(f"one chunk per head, got {num_chunks} of {step} tokens")
+    q = jnp.pad(q, ((0, 0), (0, pad), (0, 0)))
+    local_page = jnp.pad(local_page, (0, pad), constant_values=-1)[:, None]
+    local_limit = jnp.pad(local_limit, (0, pad))[:, None]
+
+    def call(h, after=None):
+        head = head_order[h]
+        q_h = q if after is None else jax.lax.optimization_barrier((q, after))[0]
+        out, lse = _attention_call(
+            q_h,
+            kv_cache,
+            selected,
+            local_page,
+            local_limit,
+            page_table,
+            jnp.stack([head, head]).astype(jnp.int32),
+            jnp.zeros((1,), jnp.int32),
+            None,
+            (
+                jax.lax.dynamic_index_in_dim(packed, head, 0, False),
+                step // block_q,
+                tiles_per_step,
+            ),
+            q_per_head=num_q_heads // num_heads,
+            sm_scale=sm_scale,
+            block_q=block_q,
+            pages_per_step=pages_per_step,
+            interpret=interpret,
+            scale_cache=scale_cache,
+            scale_rows="head",
+            # The caller's selects lay the output out in 16-row tiles.
+            packed_stores=True,
+        )
+        num_blocks, num_tiles = lse.shape[:2]
+        lse = lse.reshape(num_blocks, num_tiles, -1, block_q).transpose(0, 2, 1, 3)
+        lse = lse.reshape(num_q_heads, num_tiles * block_q)
+        return out[:, :num_tokens], lse[:, :num_tokens]
+
+    return [functools.partial(call, h) for h in range(num_heads)]

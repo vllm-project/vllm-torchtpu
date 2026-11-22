@@ -330,3 +330,26 @@ def test_pair_first_merge_matches_lse_merge():
     np.testing.assert_allclose(
         np.asarray(got).reshape(4, heads, tokens, 128), want, rtol=1e-5, atol=1e-5
     )
+
+
+@pytest.mark.parametrize("head_calls", [True, False])
+def test_dcp4_decode_merge_matches_dcp_reference(head_calls, monkeypatch):
+    """c64's layout (DCP 4 over 2 KV heads), decode rows only: the pair-first
+    merge, with one kernel call per KV head (`_pair_first_merge_by_head`) or
+    one call for both."""
+    mod = globals()
+    for name, value in {"DCP": 4, "HEADS": 2, "REPLICAS": 2, "HL": 8}.items():
+        monkeypatch.setitem(mod, name, value)
+    if len(jax.devices()) < DCP:
+        pytest.skip(
+            "needs 4 devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)"
+        )
+    monkeypatch.setattr(msa_dcp_heads, "PAIR_FIRST_HEAD_CALLS", head_calls)
+    rng = np.random.default_rng(1)
+    *args, num_real = _step(rng, [8, 8, 8], [3000, 5000, 8800], 12, 32)
+    want = _reference(*args)
+    got = _spmd(*args, decode_rows=8)
+    for r in range(DCP):
+        np.testing.assert_allclose(
+            got[r][:num_real], np.asarray(want[r])[:num_real], rtol=2e-2, atol=2e-2
+        )

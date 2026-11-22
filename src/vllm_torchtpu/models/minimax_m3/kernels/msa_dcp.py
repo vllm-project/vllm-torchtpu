@@ -993,8 +993,9 @@ def msa_attend_dcp(
     dcp: int,
     scale_cache: jax.Array | None = None,
     q_head_major: bool = False,
+    head_order: jax.Array | None = None,
     interpret: bool = False,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array] | list:
     """Second half of the DCP forward: attend over the selected blocks this
     rank holds.
 
@@ -1012,6 +1013,9 @@ def msa_attend_dcp(
     leading axis (`ops.msa.merge_head_partials`), or `attend_and_merge`
     sends each rank its block (a pair: a permute of the peer's heads).
     ``q`` may be a pair of head-major arrays holding the heads in order.
+    With `head_order` (``int32[G]``; 4-bit, several KV heads, decode-sized
+    steps) one kernel call per KV head in that order instead, as thunks
+    (`msa_attention_lse.msa_sparse_attention_lse_head_calls`).
     """
     num_tokens = jax.tree.leaves(q)[0].shape[1 if q_head_major else 0]
     rank = rank_array(rank)[0]
@@ -1058,6 +1062,21 @@ def msa_attend_dcp(
         interpret=interpret,
     )
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
+    if head_order is not None:
+        if scale_cache is None or num_heads == 1 or q_head_major:
+            raise ValueError("per-head calls serve token-major 4-bit groups")
+        return msa_attention_lse.msa_sparse_attention_lse_head_calls(
+            q,
+            kv_cache,
+            keys,
+            *args,
+            head_order,
+            sm_scale=sm_scale,
+            block_q=block_q,
+            pages_per_step=pages_per_step,
+            scale_cache=scale_cache,
+            interpret=interpret,
+        )
     if scale_cache is not None:
         if num_heads == 1:
             return msa_attention_lse.msa_sparse_attention_lse(

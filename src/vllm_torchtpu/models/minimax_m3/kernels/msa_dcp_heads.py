@@ -72,6 +72,9 @@ _SPLIT_PAGES_PER_STEP = 32
 # replica with less waits at the next exchange (c64 DCP 4 twin, per-core
 # kernel time up to 2.2x, j-867fc577). A block is a whole 64-token tile.
 _INTERLEAVE_TOKENS = 64
+# Decode steps of a DCP group of 4 over 2 KV heads attend each KV head in its
+# own call so the cross-chip merge overlaps the second (`_pair_first_merge_by_head`).
+PAIR_FIRST_HEAD_CALLS = True
 
 
 def _interleave(x: jax.Array, axis: int = 0) -> jax.Array:
@@ -177,6 +180,53 @@ def _pair_first_merge(
     )
     other_l = jax.lax.ppermute(jnp.where(half, lg[1], lg[0]), axis, cross)
     return _combine(keep_o, keep_l, other_o, other_l)[0]
+
+
+def _pair_first_merge_by_head(
+    attend, axis: str, rank: jax.Array, rs_out_precision: bool
+) -> jax.Array:
+    """`_pair_first_merge` of a DCP group of 4 over 2 KV heads (KV head ``h``
+    owns head blocks ``2h`` and ``2h + 1``; ranks ``r`` and ``r ^ 1`` one
+    chip's cores, both keeping blocks of KV head ``r // 2``), from
+    ``attend(order)``, one kernel call per KV head in ``order``
+    (`msa_attention_lse.msa_sparse_attention_lse_head_calls`). The other
+    chip's KV head is attended first and its pair-combined block crosses
+    the chips while this chip's own KV head is attended: the cross-chip
+    permute (one link carries both cores' blocks) waited behind the whole
+    attention (c64 decode twin j-6bf91132: ~18 us per layer at b47). Same
+    exchanges and bytes as `_pair_first_merge`."""
+    own, parity = rank // 2, rank % 2
+    far = 1 - own
+    far_call, own_call = attend(jnp.stack([far, own]))
+    pair = [(r, r ^ 1) for r in range(4)]
+
+    def pick(blocks, index):
+        # Block ``index`` as ``[1, Hl, T, D]``, by selects of static blocks: a
+        # 3D consumer (a dynamic slice, or selects of 3D blocks) gave the
+        # kernel's output the 16-row bf16 tiling, where its 8-row tile stores
+        # do not lower (Mosaic E2003). Selects, not arithmetic: the other KV
+        # head's blocks of a call's output are never written.
+        picked = blocks[3:]
+        for b in (2, 1, 0):
+            picked = jnp.where(index == b, blocks[b : b + 1], picked)
+        return picked
+
+    def pair_combine(out, lse, head):
+        """Head ``head``'s block of this rank's parity combined over the chip."""
+        out = out.reshape(4, -1, *out.shape[1:])
+        lse = lse.astype(jnp.float32).reshape(4, -1, lse.shape[-1])
+        keep, send = 2 * head + parity, 2 * head + 1 - parity
+        got_o, got_l = (jax.lax.ppermute(pick(x, send), axis, pair) for x in (out, lse))
+        return _combine(pick(out, keep), pick(lse, keep), got_o, got_l)
+
+    out_far, lse_far = far_call()
+    o_far, l_far = pair_combine(out_far, lse_far, far)
+    o_far = o_far.astype(out_far.dtype if rs_out_precision else jnp.float32)
+    cross = [(r, r ^ 2) for r in range(4)]
+    other_o = jax.lax.ppermute(o_far, axis, cross)
+    other_l = jax.lax.ppermute(l_far, axis, cross)
+    o_own, l_own = pair_combine(*own_call(after=(o_far, l_far)), own)
+    return _combine(o_own, l_own, other_o, other_l)[0][0]
 
 
 def merge_partials_all_to_all(
@@ -291,7 +341,8 @@ def _dcp_attend(
     by `merge_partials` or, with `all_to_all`, `merge_partials_all_to_all`."""
     q_all = jax.lax.all_gather(q, axis, axis=1, tiled=True)
     cand_all = jax.lax.all_gather(candidates, axis, axis=0)
-    out, lse = msa_dcp.msa_attend_dcp(
+    attend = functools.partial(
+        msa_dcp.msa_attend_dcp,
         q_all,
         kv_cache,
         cand_all,
@@ -305,6 +356,20 @@ def _dcp_attend(
         scale_cache=scale_cache,
         interpret=interpret,
     )
+    kv_heads = candidates.shape[1] // (2 * topk)
+    if (
+        PAIR_FIRST_HEAD_CALLS
+        and dcp == 4
+        and kv_heads == 2
+        and not all_to_all
+        and q.shape[0] <= msa_dcp.DCP_SMALL_BATCH_TOKENS
+    ):
+        merged = _pair_first_merge_by_head(
+            lambda order: attend(head_order=order), axis, rank, rs_out_precision
+        )
+        merged = msa_fp4.unrotate_output(merged.astype(q.dtype))
+        return merged.transpose(1, 0, 2)
+    out, lse = attend()
     if all_to_all:
         return merge_partials_all_to_all(out, lse, axis, dcp=dcp, interpret=interpret)
     return merge_partials(
