@@ -54,7 +54,7 @@ from .model import (
     moe_weights_mapper,
     verify_moe_checkpoint,
 )
-from .qsa import QSAMetadata
+from .qsa import QSAMetadata, shared_step0_rows
 
 _CHECKPOINT_LAYER = re.compile(r"^mtp\.layers\.(\d+)\.")
 
@@ -376,6 +376,21 @@ class Qwen4ExpMTP(nn.Module):
                 "_selection_rows", torch.full_like(sink, -1), persistent=False
             )
         return True
+
+    def carry_shared_selection(self, rows: torch.Tensor, num_tokens: int) -> None:
+        """What stock draft step 0 does to the shared selection, for a step 0 that does
+        not run the stock attention (VLLM_TPU_MK_DRAFT with
+        VLLM_TPU_MK_WHOLE_EXPORT_SELECTION): copy each request's last verified row of the
+        target's sink (``rows``, -1 for none) into the rows the loop steps attend."""
+        from . import qsa  # the layer's own row update (`attend_with_indices`)
+
+        for layer in self.model.layers:
+            attention = cast(Qwen4ExpDecoderLayer, layer).self_attn
+            source = getattr(attention, "_selection_source", None)
+            if source is not None:
+                qsa.update_rows_(
+                    attention._selection_rows, shared_step0_rows(source, rows, num_tokens)
+                )
 
     def mk_draft_step(self, input_ids, positions, hidden_states, rows_per_request: int):
         """VLLM_TPU_MK_DRAFT: `(next hidden carry, greedy tokens int32)` of one draft

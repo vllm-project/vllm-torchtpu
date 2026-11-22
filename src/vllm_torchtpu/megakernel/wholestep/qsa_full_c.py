@@ -1696,6 +1696,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             kv = self._project(ctx, l, slot)
         with sc("qsa_select"):
             self._select(ctx, l, slot)
+        self._export_ids(ctx, l, start=True)
         rows = jax.lax.broadcasted_iota(I32, (ex.MB, 1), 0)
         srow = jax.lax.broadcasted_iota(I32, (1, 8), 1)
         scol = jax.lax.broadcasted_iota(I32, (8, 1), 0)
@@ -1762,5 +1763,30 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             kv.wait()
             if self.req_async:
                 self._drain_new_group_stores(ctx, l)
+            self._export_ids(ctx, l, start=False)
         with ctx.stream.segment(lazy=False):
             return ctx.stream.dmatmul("o_proj", scr["xb2"], g.H)
+
+    def _export_ids(self, ctx: Any, l: Any, *, start: bool) -> None:  # noqa: E741
+        """`export_ids`: start (after the selection) or wait (after the attention, which
+        does not write `qi_id`) the copy of the last QSA layer's pool-path ids to `SEL_IDS`.
+        Per row: ascending ids below g_a, slots past the count 0; g_a, when selected, is in
+        no slot (`selection_groups` restores it). No VMEM: `qi_id` is the selection's own."""
+        if not self.export_ids:
+            return
+        from .qsa_full_b import SEL_IDS
+
+        MB = ctx.ex.MB
+        cp = pltpu.make_async_copy(
+            ctx.scr["qi_id"], ctx.O[SEL_IDS].at[pl.ds(0, MB)], ctx.scr["qe_sem"].at[0]
+        )
+        go = cp.start if start else cp.wait
+        if not self.n_layers:
+            go()
+            return
+        last = ctx.stream.sp.block_ord(l, self.name) == self.n_layers - 1
+        if isinstance(last, bool):  # a static layer index
+            if last:
+                go()
+            return
+        pl.when(last)(go)

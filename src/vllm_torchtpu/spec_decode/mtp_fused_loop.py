@@ -195,6 +195,13 @@ class _MkDraftStep0(nn.Module):
         carry, tokens = self.mtp.mk_draft_step(  # type: ignore[attr-defined]
             input_ids, positions, hidden_states, self.rows_per_request
         )
+        if envs.VLLM_TPU_MK_WHOLE_EXPORT_SELECTION:
+            # The whole-step call wrote this step's layer-47 selection to the sink; carry
+            # the requests' rows to the loop steps as stock step 0 does (else they attend
+            # the rows of the last stock step 0).
+            self.mtp.carry_shared_selection(  # type: ignore[attr-defined]
+                draft_rows, input_ids.shape[0]
+            )
         rows = draft_rows.clamp_min(0)
         return (
             torch.index_select(carry, 0, rows),
