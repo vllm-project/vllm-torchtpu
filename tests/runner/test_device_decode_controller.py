@@ -235,9 +235,9 @@ def test_the_stock_noise_program_slices_the_plan_itself(monkeypatch):
 
 @pytest.mark.tpu_test
 def test_the_stock_noise_program_draws_the_host_bits_on_tpu(device):
-    """The compiled stock-path noise program, the one serving runs, draws on
-    TPU the bits the host draws for each plan row's slot and position, over
-    a whole padded vocabulary."""
+    """The compiled stock_uniform program, which draws a random stock chunk's
+    noise when VLLM_TPU_DEVICE_DECODE is on, gives on TPU the bits the host
+    draws for each plan row's slot and position, over a whole padded vocabulary."""
     vocab_size = 248320
     gen = torch.Generator().manual_seed(0)
     seed_lo = torch.randint(-(2**31), 2**31, (9,), dtype=torch.int32, generator=gen)
