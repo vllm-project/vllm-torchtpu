@@ -27,10 +27,12 @@ Needs `dcp` devices; CPU virtual devices are enough
 import dataclasses
 
 import jax
+import jax.extend.core
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.mla import dcp_token_parallel as tp
 
@@ -440,3 +442,470 @@ def test_layout_rejects_unservable_buckets():
         tp.TokenParallelLayout(16, 4, 32, split_rows=16, max_pages=4)
     with pytest.raises(ValueError):
         tp.TokenParallelLayout(4, 4, 32, split_rows=16, max_pages=8, gather_caps=(4,))
+
+
+def test_should_bound_natural_page_table_to_gather_cap_when_cap_below_max_pages():
+    dcp = 4
+    mesh = _mesh(dcp)
+    lay = tp.TokenParallelLayout(
+        dcp, 4, 32, split_rows=16, max_pages=8, gather_caps=(2, 4, 8)
+    )
+    st = Step(lay, 256, [Req(50, 150)], max_reqs=4, seed=11)
+    seq_lens, qsl = jnp.asarray(st.seq_lens), jnp.asarray(st.qsl)
+    _, offsets = tp.step_pages(lay, seq_lens, qsl, st.num_seqs)
+    rr = tp.rank_rows(lay, jnp.int32(0), 256, seq_lens, qsl, st.num_seqs)
+
+    capped_tbl = np.asarray(
+        tp.natural_page_table(lay, rr, offsets, vpages_per_seq=8, cap=2)
+    )
+    uncapped_tbl = np.asarray(tp.natural_page_table(lay, rr, offsets, vpages_per_seq=8))
+    assert capped_tbl.shape == (4 * 2 * dcp,)
+    assert uncapped_tbl.shape == (4 * 8 * dcp,)
+    assert int(capped_tbl.max()) <= 2 * dcp - 1
+
+    vpages_per_seq = st.block_tables.shape[1]
+    seen_table_widths: list[int] = []
+    ref_select = _select_topk_ref(lay)
+
+    def strict_select(q, weights, natural, rr_arg, table):
+        num_reqs = rr_arg.seq_lens.shape[0]
+        cap = natural.shape[0] // dcp
+        seen_table_widths.append(table.shape[0] // num_reqs)
+        assert table.shape == (num_reqs * min(vpages_per_seq, cap) * dcp,)
+        in_bounds = (table >= 0) & (table < natural.shape[0])
+        out = ref_select(q, weights, natural, rr_arg, table)
+        return jnp.where(jnp.all(in_bounds), out, jnp.full_like(out, -999))
+
+    rng = np.random.default_rng(13)
+    q = rng.standard_normal((256, 1, IDX_ROWS * IDX_SUB)).astype(np.float32)
+    weights = np.ones((256, 1), np.float32)
+    flat = np.asarray(
+        jax.jit(
+            lambda *a: tp.indexer_topk(
+                lay, mesh, AXIS, *a, select_topk=strict_select, q_own_rows=False
+            )
+        )(jnp.asarray(st.idx_cache), jnp.asarray(q), jnp.asarray(weights), *st.args())
+    )
+    assert seen_table_widths == [min(vpages_per_seq, c) * dcp for c in lay.gather_caps]
+    assert (flat != -999).all()
+
+
+@pytest.mark.parametrize("q_own_rows", [False, True])
+def test_should_match_restrided_attention_when_indexer_emits_cap_strided_flat_topk(
+    q_own_rows,
+):
+    dcp = 4
+    mesh = _mesh(dcp)
+    # cap=2 < max_pages=8 forces anti-cancellation divergence if max_pages
+    # stride leaks into cap-strided flat_topk on any owner > 0.
+    lay = tp.TokenParallelLayout(
+        dcp, 4, 32, split_rows=16, max_pages=8, gather_caps=(2, 4, 8)
+    )
+    num_tokens = 256
+    st = Step(lay, num_tokens, [Req(12, 130), Req(18, 95)], max_reqs=4, seed=23)
+    rng = np.random.default_rng(29)
+    per = lay.rows_per_rank(num_tokens)
+
+    q_idx = rng.standard_normal((num_tokens, 1, IDX_ROWS * IDX_SUB)).astype(np.float32)
+    w_idx = np.ones((num_tokens, 1), np.float32)
+    if q_own_rows:
+        q_idx_in = np.concatenate(
+            [
+                q_idx[
+                    np.minimum(
+                        lay.split_rows + r * per + np.arange(per), num_tokens - 1
+                    )
+                ]
+                for r in range(dcp)
+            ]
+        )
+        w_idx_in = np.concatenate(
+            [
+                w_idx[
+                    np.minimum(
+                        lay.split_rows + r * per + np.arange(per), num_tokens - 1
+                    )
+                ]
+                for r in range(dcp)
+            ]
+        )
+    else:
+        q_idx_in, w_idx_in = q_idx, w_idx
+
+    idx_args = (
+        jnp.asarray(st.idx_cache),
+        jnp.asarray(q_idx_in),
+        jnp.asarray(w_idx_in),
+        *st.args(),
+    )
+    flat_max = np.asarray(
+        jax.jit(
+            lambda *a: tp.indexer_topk(
+                lay,
+                mesh,
+                AXIS,
+                *a,
+                select_topk=_select_topk_ref(lay),
+                q_own_rows=q_own_rows,
+                flat_topk_cap_strided=False,
+            )
+        )(*idx_args)
+    )
+    flat_cap = np.asarray(
+        jax.jit(
+            lambda *a: tp.indexer_topk(
+                lay,
+                mesh,
+                AXIS,
+                *a,
+                select_topk=_select_topk_ref(lay),
+                q_own_rows=q_own_rows,
+                flat_topk_cap_strided=True,
+            )
+        )(*idx_args)
+    )
+
+    pages, _ = tp.step_pages(
+        lay, jnp.asarray(st.seq_lens), jnp.asarray(st.qsl), st.num_seqs
+    )
+    active_cap = next(c for c in lay.gather_caps if int(pages.sum()) <= c)
+    assert active_cap < lay.max_pages
+    expected_cap = np.asarray(
+        tp.restride_flat_rows(lay, jnp.asarray(flat_max), active_cap)
+    )
+    np.testing.assert_array_equal(flat_cap, expected_cap)
+    assert np.any(flat_cap != flat_max)
+
+    heads = 2 * dcp
+    q_full = rng.standard_normal((num_tokens, heads, DN + DR)).astype(np.float32)
+    q_sharded = q_full.reshape(num_tokens, dcp, 2, -1).transpose(1, 0, 2, 3)
+    q_rows = np.concatenate([q_full, np.zeros_like(q_full[: lay.split_rows])])
+    q_own = q_rows[lay.split_rows :].reshape(dcp * per, heads, -1)
+    q_in = q_own if q_own_rows else q_sharded.reshape(dcp * num_tokens, 2, -1)
+
+    _, _, out_max = jax.jit(
+        lambda *a: tp.sparse_mla_attention(
+            lay,
+            mesh,
+            AXIS,
+            *a,
+            write_kv=_write_kv_ref(lay, st.num_pages),
+            attend=_attend_ref,
+            q_own_rows=q_own_rows,
+            flat_topk_cap_strided=False,
+        )
+    )(
+        jnp.asarray(st.nope_cache),
+        jnp.asarray(st.rope_cache),
+        jnp.asarray(q_in),
+        jnp.asarray(st.kv_c),
+        jnp.asarray(st.k_pe),
+        jnp.asarray(flat_max),
+        *st.args(),
+    )
+    _, _, out_cap = jax.jit(
+        lambda *a: tp.sparse_mla_attention(
+            lay,
+            mesh,
+            AXIS,
+            *a,
+            write_kv=_write_kv_ref(lay, st.num_pages),
+            attend=_attend_ref,
+            q_own_rows=q_own_rows,
+            flat_topk_cap_strided=True,
+        )
+    )(
+        jnp.asarray(st.nope_cache),
+        jnp.asarray(st.rope_cache),
+        jnp.asarray(q_in),
+        jnp.asarray(st.kv_c),
+        jnp.asarray(st.k_pe),
+        jnp.asarray(flat_cap),
+        *st.args(),
+    )
+    np.testing.assert_array_equal(np.asarray(out_cap), np.asarray(out_max))
+
+
+@pytest.mark.parametrize("il", [1, 4])
+def test_should_preserve_all_index_k_bytes_across_interleave_gather_paths(il):
+    dcp = 4
+    mesh = _mesh(dcp)
+    lay = tp.TokenParallelLayout(
+        dcp, il, 32, split_rows=16, max_pages=4, gather_caps=(2, 4)
+    )
+    st = Step(lay, 256, [Req(20, 140), Req(10, 80)], max_reqs=4, seed=31)
+    pages, offsets = tp.step_pages(
+        lay, jnp.asarray(st.seq_lens), jnp.asarray(st.qsl), st.num_seqs
+    )
+    page_ids = tp.gather_page_ids(
+        lay,
+        jnp.asarray(st.block_tables.reshape(-1)),
+        pages,
+        offsets,
+        st.num_pages,
+    )
+    gathered = np.asarray(
+        jax.jit(
+            jax.shard_map(
+                lambda c, pids, tot: tp.gather_index_k(lay, c, pids, tot, AXIS),
+                mesh=mesh,
+                in_specs=(P(AXIS), P(), P()),
+                out_specs=P(),
+                check_vma=False,
+            )
+        )(jnp.asarray(st.idx_cache), page_ids, jnp.sum(pages))
+    )
+    # Reference natural byte layout for each active virtual page v and global slot t.
+    n_active = int(pages.sum())
+    cache_by_rank = st.idx_cache.reshape(dcp, st.num_pages, IDX_ROWS, IDX_SUB, 32)
+    pids_np = np.asarray(page_ids)
+    for v in range(n_active):
+        p = int(pids_np[v])
+        for q in range(dcp):
+            nat_page = gathered[v * dcp + q]
+            for s in range(32):
+                pos = q * 32 + s
+                owner = (pos // il) % dcp
+                local_slot = (pos // (dcp * il)) * il + (pos % il)
+                np.testing.assert_array_equal(
+                    nat_page[:, :, s],
+                    cache_by_rank[owner, p, :, :, local_slot],
+                )
+
+
+def test_should_accumulate_lead_partial_psum_in_float32_without_bf16_cancellation():
+    dcp = 4
+    mesh = _mesh(dcp)
+    split_rows = 4
+    num_heads = 2
+    lay = tp.TokenParallelLayout(
+        dcp, 4, 32, split_rows=split_rows, max_pages=4, gather_caps=(2, 4)
+    )
+    st = Step(lay, 64, [Req(32, 32)], max_reqs=4, seed=71)
+    rows_per_rank = lay.rows_per_rank(64)
+
+    # Anti-cancellation inputs across ranks: asymmetric LSE weights multiply
+    # opposing large partials so bf16 pre-cast before psum incurs >0.1 error,
+    # whereas float32 psum matches the float64 reference to bf16 rounding.
+    lp = np.zeros((dcp, split_rows, num_heads, DN), dtype=np.float32)
+    ll = np.full((dcp, split_rows, num_heads), -np.inf, dtype=np.float32)
+    # Row 0: opposing large partials with slightly different LSEs (0.0 vs 0.01).
+    ll[:, 0, :] = np.array([0.0, -4.0, 0.01, -4.0], dtype=np.float32)[:, None]
+    for r, val in enumerate((100.0, 0.5, -99.0, 0.5)):
+        lp[r, 0, :, :] = val
+    # Row 1: asymmetric LSE + opposing large/small terms.
+    ll[:, 1, :] = np.array([0.0, 0.25, 0.02, 0.25], dtype=np.float32)[:, None]
+    for r, val in enumerate((256.0, 0.5, -252.0, 0.5)):
+        lp[r, 1, :, :] = val
+    # Row 2: all -inf LSE -> must produce exact finite 0.0 (no NaN).
+    lp[:, 2, :, :] = 7.0
+    # Row 3: single finite rank -> exact passthrough of rank 1's partial.
+    ll[1, 3, :] = 2.5
+    lp[:, 3, :, :] = np.arange(1, dcp + 1, dtype=np.float32)[:, None, None]
+
+    lp_bf16 = jnp.asarray(lp.reshape(dcp * split_rows, num_heads, DN), jnp.bfloat16)
+    ll_f32 = jnp.asarray(ll.reshape(dcp * split_rows, num_heads), jnp.float32)
+    w_uv = jnp.broadcast_to(jnp.eye(DN, dtype=jnp.bfloat16)[None], (num_heads, DN, DN))
+    q_tail = jnp.zeros((dcp * rows_per_rank, num_heads, DN), jnp.bfloat16)
+    flat_topk = jnp.full((dcp * rows_per_rank, TOPK), -1, jnp.int32)
+
+    def _zero_attend(q_tok, g_n, g_r, flat, num_rows):
+        del g_n, g_r, flat, num_rows
+        return jnp.zeros_like(q_tok)
+
+    def _run_lead_merge(lp_in, ll_in):
+        return tp.sparse_mla_attention_with_lead(
+            lay,
+            mesh,
+            AXIS,
+            jnp.asarray(st.nope_cache),
+            jnp.asarray(st.rope_cache),
+            q_tail,
+            None,
+            None,
+            flat_topk,
+            jnp.asarray(st.seq_lens),
+            jnp.asarray(st.block_tables.reshape(-1)),
+            jnp.asarray(st.qsl),
+            jnp.asarray([0, 0, st.num_seqs], jnp.int32),
+            lead_partial=lp_in,
+            lead_lse=ll_in,
+            write_kv=None,
+            attend=_zero_attend,
+            w_uv=w_uv,
+            q_own_rows=True,
+            w_uv_replicated=True,
+            num_tokens=64,
+        )[3]
+
+    lead_v = _run_lead_merge(lp_bf16, ll_f32)
+    got = np.asarray(lead_v, dtype=np.float32)
+
+    # Structural check: cross-rank lead psum must execute in float32 (not bf16)
+    # so TPU all-reduce lowering does not accumulate bf16 rounding drift.
+    psum_dtypes: list[jnp.dtype] = []
+
+    def _collect_psum(jpr):
+        for eqn in jpr.eqns:
+            if eqn.primitive.name == "psum":
+                psum_dtypes.extend(v.aval.dtype for v in eqn.invars)
+            for sub in jax.extend.core.jaxprs_in_params(eqn.params):
+                _collect_psum(sub)
+
+    _collect_psum(jax.make_jaxpr(_run_lead_merge)(lp_bf16, ll_f32).jaxpr)
+    assert psum_dtypes and all(dt == jnp.float32 for dt in psum_dtypes)
+
+    # Independent float64 reference using quantized bf16 inputs.
+    lp_q = np.asarray(lp_bf16, dtype=np.float64).reshape(dcp, split_rows, num_heads, DN)
+    ll_64 = ll.astype(np.float64)
+    finite = np.isfinite(ll_64)
+    any_finite = np.any(finite, axis=0)
+    safe_ll = np.where(finite, ll_64, 0.0)
+    max_ll = np.max(np.where(finite, ll_64, -np.inf), axis=0)
+    safe_max = np.where(any_finite, max_ll, 0.0)
+    exp_shifted = np.where(finite, np.exp(safe_ll - safe_max[None]), 0.0)
+    sum_exp = np.sum(exp_shifted, axis=0)
+    m = np.where(any_finite, np.log(np.where(any_finite, sum_exp, 1.0)) + safe_max, 0.0)
+    w_64 = np.where(finite, np.exp(safe_ll - m[None]), 0.0)
+    expected = np.sum(lp_q * w_64[..., None], axis=0)
+    expected_bf16 = np.asarray(jnp.asarray(expected, jnp.bfloat16), dtype=np.float32)
+
+    assert np.all(np.isfinite(got))
+    np.testing.assert_allclose(got, expected_bf16, rtol=0.0, atol=1e-2)
+    np.testing.assert_array_equal(got[2], 0.0)
+    np.testing.assert_array_equal(got[3], 2.0)
+
+
+@pytest.mark.parametrize("stride_pages", [4, 12, 16, 24, 44])
+@pytest.mark.parametrize(
+    ("dcp", "il", "ps"),
+    [(16, 4, 256), (4, 4, 16), (3, 4, 24)],
+)
+def test_should_match_divmod_reference_for_flat_rows_power_of_two_and_fallback(
+    stride_pages: int, dcp: int, il: int, ps: int
+):
+    lay = tp.TokenParallelLayout(
+        dcp_size=dcp,
+        interleave_size=il,
+        page_size=ps,
+        split_rows=4,
+        max_pages=44,
+    )
+    rng = np.random.default_rng(1111 + stride_pages + dcp * 17)
+    raw = rng.integers(-4, dcp * ps * 10, size=(32, 64), dtype=np.int32)
+    pos = np.where(raw < 0, -1, raw).astype(np.int32)
+    # Include exact boundary positions around virtual pages and negative sentinels.
+    pos[0, :6] = np.array([-1, 0, il - 1, il, dcp * il, dcp * ps - 1], dtype=np.int32)
+    row_offsets = rng.integers(0, 4, size=(32,), dtype=np.int32)
+
+    got = np.asarray(
+        tp.flat_rows(
+            lay, jnp.asarray(pos), jnp.asarray(row_offsets), stride_pages=stride_pages
+        )
+    )
+    # Independent scalar reference oracle.
+    want = np.full_like(pos, -1)
+    vps = dcp * ps
+    for r in range(pos.shape[0]):
+        ro = int(row_offsets[r])
+        for c in range(pos.shape[1]):
+            p = int(pos[r, c])
+            if p >= 0:
+                owner = (p // il) % dcp
+                in_vp = p % vps
+                slot = (in_vp // (dcp * il)) * il + (in_vp % il)
+                page = owner * stride_pages + ro + (p // vps)
+                want[r, c] = page * ps + slot
+    np.testing.assert_array_equal(got, want)
+
+
+@pytest.mark.parametrize("axis0_ag_min_bytes", [0, 1 << 30])
+@pytest.mark.parametrize(("dcp", "il", "ps"), [(4, 4, 32), (4, 4, 12)])
+def test_should_gather_packed_u32_index_k_bit_exact_across_ag_modes(
+    axis0_ag_min_bytes: int, dcp: int, il: int, ps: int
+) -> None:
+    mesh = _mesh(dcp)
+    cap, rows, num_pages = 2, 5, 6
+    rng = np.random.default_rng(1170 + dcp * 31 + ps * 7)
+    cache_np = rng.integers(0, 256, size=(dcp * num_pages, rows, 4, ps), dtype=np.uint8)
+    page_ids_np = np.array([3, 1, 5, 0], dtype=np.int32)
+    shd = NamedSharding(mesh, P(AXIS))
+    rep = NamedSharding(mesh, P())
+    cache = jax.device_put(jnp.asarray(cache_np), shd)
+    page_ids = jax.device_put(jnp.asarray(page_ids_np), rep)
+
+    def _run(c, pids):
+        ref_u8 = tp._gather_index_k_pages(  # noqa: SLF001 -- direct unit parity check between u8 and packed u32 index-K gather modes
+            c, pids, cap, dcp, il, ps, AXIS, packed_u32=False
+        )
+        got_u32 = tp._gather_index_k_pages(  # noqa: SLF001 -- direct unit parity check between u8 and packed u32 index-K gather modes
+            c,
+            pids,
+            cap,
+            dcp,
+            il,
+            ps,
+            AXIS,
+            packed_u32=True,
+            axis0_ag_min_bytes=axis0_ag_min_bytes,
+        )
+        want_u32 = jax.lax.bitcast_convert_type(jnp.swapaxes(ref_u8, 2, 3), jnp.uint32)
+        return got_u32, want_u32
+
+    got, want = jax.jit(
+        jax.shard_map(
+            _run,
+            mesh=mesh,
+            in_specs=(P(AXIS), P()),
+            out_specs=(P(), P()),
+            check_vma=False,
+        )
+    )(cache, page_ids)
+    assert got.shape == (cap * dcp, rows, ps)
+    assert got.dtype == jnp.uint32
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def test_should_match_u8_indexer_topk_when_index_k_packed_u32_enabled() -> None:
+    dcp = 4
+    mesh = _mesh(dcp)
+    case = CASES[dcp]
+    lay, num_tokens = case["layout"], case["num_tokens"]
+    st = Step(lay, num_tokens, case["reqs"], seed=117)
+    rng = np.random.default_rng(118)
+    q = jnp.asarray(
+        rng.standard_normal((num_tokens, 1, IDX_ROWS * IDX_SUB)).astype(np.float32)
+    )
+    weights = jnp.ones((num_tokens, 1), jnp.float32)
+    ref_select = _select_topk_ref(lay)
+
+    def _select_from_u32(q_r, w_r, natural, rr, table):
+        assert natural.ndim == 3 and natural.dtype == jnp.uint32
+        u8 = jnp.swapaxes(jax.lax.bitcast_convert_type(natural, jnp.uint8), 2, 3)
+        return ref_select(q_r, w_r, u8, rr, table)
+
+    args = (
+        jax.device_put(jnp.asarray(st.idx_cache), NamedSharding(mesh, P(AXIS))),
+        q,
+        weights,
+        *st.args(),
+    )
+    want = tp.indexer_topk(
+        lay,
+        mesh,
+        AXIS,
+        *args,
+        select_topk=ref_select,
+        flat_topk_cap_strided=True,
+        index_k_packed_u32=False,
+    )
+    got = tp.indexer_topk(
+        lay,
+        mesh,
+        AXIS,
+        *args,
+        select_topk=_select_from_u32,
+        flat_topk_cap_strided=True,
+        index_k_packed_u32=True,
+    )
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))

@@ -130,7 +130,12 @@ def _kernel_send(p, world, fault=None):
 
 
 GEOMETRIES = ((16, 64), (8, 64), (8, 32))  # (ranks, heads): mirror, twin, test
-DECODE_CELLS = tuple(c for c in prologue.CELLS if c[0] <= 32)
+DECODE_CELLS = (
+    (4, (1, 1)),
+    (4, (4,)),
+    (8, (1, 4, 1)),
+    (8, (4, 4)),
+) + tuple(c for c in prologue.CELLS if c[0] <= 32)
 
 
 def _problem(query_tokens, seq_q, heads, zero=False):
@@ -169,14 +174,15 @@ def test_kernel_send_rows_bit_identical(world, heads, cell):
 
 @pytest.mark.parametrize("fault", ["send_dest_rotate", "send_lse_lo_skip"])
 @pytest.mark.parametrize("world,heads", ((16, 64), (8, 64)))
-def test_kernel_send_positive_control_fails(fault, world, heads):
+@pytest.mark.parametrize("cell", ((4, (4,)), (8, (4, 4)), (16, (4, 4, 4, 1))), ids=str)
+def test_kernel_send_positive_control_fails(fault, world, heads, cell):
     prologue._require_tpu()
-    query_tokens, seq_q = 16, (4, 4, 4, 1)
+    query_tokens, seq_q = cell
     p = _problem(query_tokens, seq_q, heads)
     out, lse = prologue._kernel(p, candidate=True)
     send = _kernel_send(p, world, fault=fault)
     nw, no = _diffs(send, prologue._bits16(out), np.asarray(lse), world, sum(seq_q))
-    print(f"fault {fault}: lse-word diffs {nw}, partial diffs {no}")
+    print(f"fault {fault} cell={cell}: lse-word diffs {nw}, partial diffs {no}")
     assert nw or no, f"fault {fault} not caught"
 
 

@@ -19,6 +19,7 @@ NOTE: Currently designed for 8-bit / FP8 KV caches (1 byte per element). We use
 
 import dataclasses
 import enum
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -250,6 +251,23 @@ def pack_tokens(values: jax.Array, token_bytes: int) -> jax.Array:
     return words
 
 
+def _local_row_positions(
+    tok: jax.Array,
+    seq_lens: jax.Array,
+    query_start_loc: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Per-row `(sequence, global KV position, valid)` for arbitrary token IDs."""
+    num_seqs = seq_lens.shape[0]
+    seq_id = jnp.searchsorted(
+        query_start_loc[1:], tok, side="right", method="compare_all"
+    ).astype(jnp.int32)
+    valid = tok < query_start_loc[-1]
+
+    seq_id = jnp.minimum(seq_id, num_seqs - 1)
+    pos = tok + (seq_lens - query_start_loc[1:])[seq_id]
+    return seq_id, pos, valid
+
+
 def _row_positions(
     num_tokens: int,
     seq_lens: jax.Array,
@@ -266,15 +284,8 @@ def _row_positions(
     masks them out the same way. Shared by the sharded and unsharded writers so
     they cannot drift into two different notions of where a row belongs.
     """
-    num_seqs = seq_lens.shape[0]
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_id = jnp.searchsorted(
-        query_start_loc[1:], tok, side="right", method="compare_all"
-    ).astype(jnp.int32)
-    valid = tok < query_start_loc[-1]
-
-    seq_id = jnp.minimum(seq_id, num_seqs - 1)
-    pos = tok + (seq_lens - query_start_loc[1:])[seq_id]
+    seq_id, pos, valid = _local_row_positions(tok, seq_lens, query_start_loc)
     return tok, seq_id, pos, valid
 
 
@@ -747,3 +758,425 @@ def _get_dcp_page_and_slot(
         valid, local_block_tables[seq_id, virtual_page], jnp.int32(OOB_PAGE)
     )
     return page, slot
+
+
+_SHARDED_A2A_FAST_CAP = 128
+_SHARDED_COMPACT_BLOCK = 64
+
+
+def _sharded_a2a_cap(
+    rows_local: int,
+    *,
+    num_seqs: int,
+    dcp_size: int,
+    interleave_size: int,
+    zigzag_bands: int = 1,
+) -> int:
+    # Exact supremum over `rows_local` rows split across `zigzag_bands`
+    # contiguous bands with `<= num_seqs` sequences: at most `zigzag_bands - 1`
+    # extra sequence cuts across band gaps, yielding `<= num_seqs + zigzag_bands - 1`
+    # spans, each contributing `<= L_s / dcp + il * (dcp - 1) / dcp` to any owner.
+    eff_spans = num_seqs + max(zigzag_bands - 1, 0)
+    raw = (rows_local + eff_spans * (dcp_size - 1) * interleave_size) // dcp_size
+    return min(rows_local, ((raw + 15) // 16) * 16)
+
+
+def _sharded_a2a_max_send_bound(
+    query_start_loc: jax.Array,
+    *,
+    rows_local: int,
+    dcp_size: int,
+    interleave_size: int,
+    zigzag_bands: int = 1,
+) -> jax.Array:
+    """Return replicated sound int32 upper bound on `max_{rank, owner} send_count`.
+
+    Every contiguous span of length ``L`` inside a block hits any single DCP
+    owner at most ``(L // cycle) * interleave_size + min(L % cycle, interleave_size)``
+    times regardless of starting KV position. Summing across active sequences
+    and each rank's zigzag bands avoids cross-rank collectives while strictly
+    bounding the true worst-case per-owner slot count.
+    """
+    nb = zigzag_bands if zigzag_bands > 1 else 1
+    band = rows_local // nb
+    num_blocks = dcp_size * nb
+    total_tokens = dcp_size * rows_local
+    cycle = jnp.int32(dcp_size * interleave_size)
+    il = jnp.int32(interleave_size)
+    blk_lo = jnp.arange(num_blocks, dtype=jnp.int32)[:, None] * jnp.int32(band)
+    blk_hi = blk_lo + jnp.int32(band)
+    q_s = jnp.clip(query_start_loc[:-1], 0, total_tokens)[None, :]
+    q_s = q_s.at[:, 0].set(jnp.int32(0))
+    q_e = jnp.clip(query_start_loc[1:], 0, total_tokens)[None, :]
+    span = jnp.maximum(
+        jnp.int32(0), jnp.minimum(q_e, blk_hi) - jnp.maximum(q_s, blk_lo)
+    )
+    blk_ub = jnp.sum((span // cycle) * il + jnp.minimum(span % cycle, il), axis=1)
+    if nb == 1:
+        return jnp.max(blk_ub).astype(jnp.int32)
+    r_idx = jnp.arange(dcp_size, dtype=jnp.int32)[:, None]
+    k_idx = jnp.arange(nb, dtype=jnp.int32)[None, :]
+    blk_id = jnp.where(
+        (k_idx & 1) == 0,
+        k_idx * dcp_size + r_idx,
+        (k_idx + 1) * dcp_size - 1 - r_idx,
+    )
+    return jnp.max(jnp.sum(blk_ub[blk_id], axis=1)).astype(jnp.int32)
+
+
+def _sharded_a2a_cap_tiers(
+    rows_local: int,
+    *,
+    cap_full: int,
+    dcp_size: int,
+) -> tuple[int, ...]:
+    """Return sorted distinct all_to_all cap tiers ending at `cap_full`."""
+    if dcp_size <= 1 or cap_full <= 16:
+        return (cap_full,)
+    # Avoid non-power-of-2 intermediate tiers (e.g. 72/80/96): irregular row
+    # counts split vector tiling in all_to_all/gather/scatter and compile extra
+    # conditional branches slower than the 128-row tier.
+    base = max(16, ((rows_local + dcp_size - 1) // dcp_size + 15) // 16 * 16)
+    candidates = (base, _SHARDED_A2A_FAST_CAP)
+    tiers = sorted({c for c in candidates if c < cap_full})
+    tiers.append(cap_full)
+    return tuple(tiers)
+
+
+def _build_sharded_dcp_a2a_plan(
+    rows_local: int,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array,
+    *,
+    nope_spec: SparseMLAKVCacheSpec,
+    dcp_size: int,
+    interleave_size: int,
+    cap: int,
+    axis_name: str,
+    pack_dst_rows: bool,
+    zigzag_bands: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+    page_size = nope_spec.page_size
+    if interleave_size % WORD_BYTES:
+        raise ValueError(
+            f"interleave_size={interleave_size} must be a multiple of "
+            f"WORD_BYTES={WORD_BYTES}."
+        )
+    if page_size % interleave_size:
+        raise ValueError(
+            f"interleave_size={interleave_size} must divide page_size={page_size}."
+        )
+
+    if zigzag_bands > 1:
+        if zigzag_bands % 2 != 0 or rows_local % zigzag_bands:
+            raise ValueError(
+                f"zigzag_bands={zigzag_bands} must be even and divide "
+                f"rows_local={rows_local}."
+            )
+        band = rows_local // zigzag_bands
+        ks = jnp.arange(zigzag_bands, dtype=jnp.int32)
+        r = jnp.asarray(dcp_rank, dtype=jnp.int32).reshape(())
+        blk = jnp.where((ks & 1) == 0, ks * dcp_size + r, (ks + 1) * dcp_size - 1 - r)
+        tok = (
+            blk[:, None] * jnp.int32(band) + jnp.arange(band, dtype=jnp.int32)[None, :]
+        ).reshape(rows_local)
+    else:
+        tok = dcp_rank * jnp.int32(rows_local) + jnp.arange(rows_local, dtype=jnp.int32)
+    seq_id, pos, in_batch = _local_row_positions(tok, seq_lens, query_start_loc)
+
+    virtual_page_size = jnp.int32(page_size * dcp_size)
+    cycle = jnp.int32(dcp_size * interleave_size)
+    interleave = jnp.int32(interleave_size)
+    offset = pos % virtual_page_size
+    owner = jnp.where(in_batch, (offset % cycle) // interleave, jnp.int32(-1))
+    slot = (offset // cycle) * interleave + (offset % interleave)
+
+    local_bt = jnp.mod(block_tables, jnp.int32(nope_spec.num_pages)).reshape(
+        seq_lens.shape[0], -1
+    )
+    virtual_page = jnp.clip(pos // virtual_page_size, 0, local_bt.shape[1] - 1)
+    dst_page = jnp.where(in_batch, local_bt[seq_id, virtual_page], jnp.int32(OOB_PAGE))
+
+    owners = jnp.arange(dcp_size, dtype=jnp.int32)[:, None]
+    csum = jnp.cumsum((owner[None, :] == owners).astype(jnp.int32), axis=1)
+    counts = csum[:, -1]
+    j = jnp.arange(cap, dtype=jnp.int32)[None, :, None]
+    if (
+        rows_local >= 2 * _SHARDED_COMPACT_BLOCK
+        and rows_local % _SHARDED_COMPACT_BLOCK == 0
+    ):
+        num_blocks = rows_local // _SHARDED_COMPACT_BLOCK
+        csum_b = csum.reshape(dcp_size, num_blocks, _SHARDED_COMPACT_BLOCK)
+        blk = jnp.sum(
+            (csum_b[:, :, _SHARDED_COMPACT_BLOCK - 1][:, None, :] <= j).astype(
+                jnp.int32
+            ),
+            axis=2,
+        )
+        blk_c = jnp.minimum(blk, num_blocks - 1)
+        d_idx = jnp.arange(dcp_size, dtype=jnp.int32)[:, None]
+        in_blk = jnp.sum((csum_b[d_idx, blk_c] <= j).astype(jnp.int32), axis=2)
+        send_idx = jnp.minimum(blk * _SHARDED_COMPACT_BLOCK + in_blk, rows_local - 1)
+    else:
+        send_idx = jnp.sum((csum[:, None, :] <= j).astype(jnp.int32), axis=2)
+        send_idx = jnp.minimum(send_idx, rows_local - 1)
+
+    keep = jnp.arange(cap, dtype=jnp.int32)[None, :] < counts[:, None]
+    send_page = jnp.where(keep, dst_page[send_idx], jnp.int32(OOB_PAGE))
+    send_slot = jnp.where(keep, slot[send_idx], jnp.int32(0))
+    if pack_dst_rows:
+        send_dst = _dst_rows(send_page, send_slot, page_size)
+        recv_dst = jax.lax.all_to_all(
+            send_dst, axis_name, split_axis=0, concat_axis=0, tiled=False
+        )
+        return send_idx, recv_dst, None
+    recv_page = jax.lax.all_to_all(
+        send_page, axis_name, split_axis=0, concat_axis=0, tiled=False
+    )
+    recv_slot = jax.lax.all_to_all(
+        send_slot, axis_name, split_axis=0, concat_axis=0, tiled=False
+    )
+    return send_idx, recv_page, recv_slot
+
+
+def _update_sparse_mla_kv_cache_dcp_sharded_impl(
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array,
+    *,
+    axis_name: str,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    dcp_size: int,
+    interleave_size: int,
+    use_pallas_scatter: bool,
+    zigzag_bands: int = 1,
+) -> tuple[jax.Array, jax.Array]:
+    _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
+    if dcp_size == 1:
+        writer = (
+            update_sparse_mla_kv_cache_dcp
+            if use_pallas_scatter
+            else update_sparse_mla_kv_cache_dcp_jax
+        )
+        return writer(
+            kv_cache_nope,
+            kv_cache_rope,
+            kv_c_normed,
+            k_pe,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            dcp_rank,
+            nope_spec=nope_spec,
+            rope_spec=rope_spec,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+
+    rows_local = kv_c_normed.shape[0]
+    cap_full = _sharded_a2a_cap(
+        rows_local,
+        num_seqs=seq_lens.shape[0],
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+        zigzag_bands=zigzag_bands,
+    )
+    use_packed_sc = (
+        use_pallas_scatter
+        and nope_spec.layout is KVCacheLayout.SPARSECORE
+        and rope_spec.layout is KVCacheLayout.SPARSECORE
+    )
+    send_idx, recv_primary, recv_slot = _build_sharded_dcp_a2a_plan(
+        rows_local,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        dcp_rank,
+        nope_spec=nope_spec,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+        cap=cap_full,
+        axis_name=axis_name,
+        pack_dst_rows=use_packed_sc,
+        zigzag_bands=zigzag_bands,
+    )
+
+    if use_packed_sc:
+        from vllm_torchtpu.kernels.mla import (  # noqa: PLC0415 -- circular import with scatter_utils
+            scatter_utils,
+        )
+
+        packed_nope = pack_tokens(kv_c_normed, nope_spec.token_bytes)
+        packed_rope = pack_tokens(k_pe, rope_spec.token_bytes)
+        nope_words = packed_nope.shape[-1]
+        packed_both = jnp.concatenate([packed_nope, packed_rope], axis=-1)
+        total_words = packed_both.shape[-1]
+        recv_dst_all = recv_primary
+
+        def _scatter_tier(cap: int) -> tuple[jax.Array, jax.Array]:
+            sent = packed_both[send_idx[:, :cap]]
+            recv = jax.lax.all_to_all(
+                sent, axis_name, split_axis=0, concat_axis=0, tiled=False
+            ).reshape(-1, total_words)
+            recv_dst = recv_dst_all[:, :cap].reshape(-1)
+            nope_out = scatter_utils.scatter_rows(
+                kv_cache_nope,
+                recv[:, :nope_words],
+                recv_dst,
+                name=f"scatter_{nope_spec.cache_type.value}_{nope_spec.layout.value}_cache",
+            )
+            rope_out = scatter_utils.scatter_rows(
+                kv_cache_rope,
+                recv[:, nope_words:],
+                recv_dst,
+                name=f"scatter_{rope_spec.cache_type.value}_{rope_spec.layout.value}_cache",
+            )
+            return nope_out, rope_out
+
+    else:
+        assert recv_slot is not None
+        recv_page = recv_primary
+        kv_nope_dim = kv_c_normed.shape[-1]
+        kv_u8 = jnp.concatenate(
+            [
+                jax.lax.bitcast_convert_type(kv_c_normed, jnp.uint8),
+                jax.lax.bitcast_convert_type(k_pe, jnp.uint8),
+            ],
+            axis=-1,
+        )
+        total_cols = kv_u8.shape[-1]
+
+        def _scatter_tier(cap: int) -> tuple[jax.Array, jax.Array]:
+            sent = kv_u8[send_idx[:, :cap]]
+            recv = jax.lax.all_to_all(
+                sent, axis_name, split_axis=0, concat_axis=0, tiled=False
+            ).reshape(-1, total_cols)
+            recv_nope = jax.lax.bitcast_convert_type(
+                recv[:, :kv_nope_dim], kv_c_normed.dtype
+            )
+            recv_rope = jax.lax.bitcast_convert_type(recv[:, kv_nope_dim:], k_pe.dtype)
+            page_c = recv_page[:, :cap].reshape(-1)
+            slot_c = recv_slot[:, :cap].reshape(-1)
+            if use_pallas_scatter:
+                return _scatter_caches(
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    recv_nope,
+                    recv_rope,
+                    page_c,
+                    slot_c,
+                    nope_spec,
+                    rope_spec,
+                )
+            return (
+                _scatter_rows(kv_cache_nope, nope_spec, recv_nope, page_c, slot_c),
+                _scatter_rows(kv_cache_rope, rope_spec, recv_rope, page_c, slot_c),
+            )
+
+    tiers = _sharded_a2a_cap_tiers(rows_local, cap_full=cap_full, dcp_size=dcp_size)
+    if len(tiers) > 1 and rows_local % max(zigzag_bands, 1) == 0:
+        # Avoid lax.pmax across ranks and conservative (dcp-1)*il per-seq
+        # padding: query_start_loc is replicated so all ranks pick the exact
+        # same smallest tier cap >= true worst-case per-owner slot count.
+        send_ub = _sharded_a2a_max_send_bound(
+            query_start_loc,
+            rows_local=rows_local,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+            zigzag_bands=zigzag_bands,
+        )
+        tier_arr = jnp.asarray(tiers, dtype=jnp.int32)
+        branch_idx = jnp.minimum(
+            jnp.searchsorted(tier_arr, send_ub, side="left", method="compare_all"),
+            jnp.int32(len(tiers) - 1),
+        )
+        return jax.lax.switch(
+            branch_idx,
+            tuple(functools.partial(_scatter_tier, c) for c in tiers),
+        )
+    return _scatter_tier(cap_full)
+
+
+def update_sparse_mla_kv_cache_dcp_sharded(
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array,
+    *,
+    axis_name: str,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    dcp_size: int,
+    interleave_size: int,
+    zigzag_bands: int = 1,
+) -> tuple[jax.Array, jax.Array]:
+    """Route sequence-sharded FP8 latents via owner all_to_all into DCP caches.
+
+    Shapes: `kv_c_normed` `[T/dcp, L]` and `k_pe` `[T/dcp, R]` -> updated DCP shards.
+    """
+    return _update_sparse_mla_kv_cache_dcp_sharded_impl(
+        kv_cache_nope,
+        kv_cache_rope,
+        kv_c_normed,
+        k_pe,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        dcp_rank,
+        axis_name=axis_name,
+        nope_spec=nope_spec,
+        rope_spec=rope_spec,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+        use_pallas_scatter=True,
+        zigzag_bands=zigzag_bands,
+    )
+
+
+def update_sparse_mla_kv_cache_dcp_sharded_jax(
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array,
+    *,
+    axis_name: str,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    dcp_size: int,
+    interleave_size: int,
+    zigzag_bands: int = 1,
+) -> tuple[jax.Array, jax.Array]:
+    """Pure-XLA twin of `update_sparse_mla_kv_cache_dcp_sharded` for CPU tests."""
+    return _update_sparse_mla_kv_cache_dcp_sharded_impl(
+        kv_cache_nope,
+        kv_cache_rope,
+        kv_c_normed,
+        k_pe,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        dcp_rank,
+        axis_name=axis_name,
+        nope_spec=nope_spec,
+        rope_spec=rope_spec,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+        use_pallas_scatter=False,
+        zigzag_bands=zigzag_bands,
+    )
