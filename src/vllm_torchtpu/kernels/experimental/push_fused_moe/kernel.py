@@ -1953,11 +1953,9 @@ def _build_combine_fs_kernel(
     # Block b reads its own tokens' scl and w and starts the rows of the
     # tokens lead chunks past its own, so its pos slice is `shift` entries
     # later. Each slice is staged as the tile-aligned window around it; its
-    # offset in the window is static per buffer (fs_combine_chunk). The
-    # tables are padded so that every window lies inside them.
+    # offset in the window is static per buffer (fs_combine_chunk).
     shift = topk * lead * ch
     window = align_up(n_tab, _TABLE_TILE) + _TABLE_TILE
-    table_len = align_up((n_blocks - 1) * n_tab + shift + window, _TABLE_TILE)
 
     def at(buf, base):
         """(window start, slice offset in it) of block b's slice that starts
@@ -1968,6 +1966,15 @@ def _build_combine_fs_kernel(
     # The loop covers pairs of blocks; the last two or three are unrolled
     # after it, the last one starting no rows past the end.
     tail = 2 + n_blocks % 2
+    # A window the loop stages (blocks up to the first unrolled one) is whole
+    # and must lie in the table; the unrolled blocks' windows stop at its end
+    # instead. The tables are padded only to whole tiles and as far as the
+    # loop's windows need.
+    first_tail = n_blocks - tail
+    table_len = max(
+        align_up(t_local * topk, _TABLE_TILE),
+        first_tail * n_tab + at(0, shift)[0] + window,
+    )
     fold = out_scale is not None
 
     def kernel(*refs):
@@ -1991,15 +1998,20 @@ def _build_combine_fs_kernel(
         def stage_copies(b, buf):
             # b - buf is even, so (b - buf) * n_tab is whole tiles.
             pair = (b - buf) * n_tab
-            dst = pl.ds(buf * window, window)
             copies = []
             for i, (src, st, base) in enumerate(
                 ((pos_hbm, pos_st, shift), (scl_hbm, scl_st, 0), (tw_hbm, tw_st, 0))
             ):
-                start = pl.multiple_of(pair + at(buf, base)[0], _TABLE_TILE)
+                start = pair + at(buf, base)[0]
+                if isinstance(b, int) and b > first_tail:
+                    size = min(window, table_len - start)
+                else:
+                    start, size = pl.multiple_of(start, _TABLE_TILE), window
                 copies.append(
                     pltpu.make_async_copy(
-                        src.at[pl.ds(start, window)], st.at[dst], tab_sems.at[i, buf]
+                        src.at[pl.ds(start, size)],
+                        st.at[pl.ds(buf * window, size)],
+                        tab_sems.at[i, buf],
                     )
                 )
             return copies
@@ -2136,10 +2148,12 @@ def _build_combine_fs_kernel(
 
     def fn(arrivals, arrival_scales, scl, topk_weights, pos, keep=None, addend=None):
         # Every table flattens TOKEN-major, like v2's combine, padded to
-        # table_len (the pad lands in the flattening copy). pos rides scalar
-        # prefetch for the first lead chunks' rows and HBM for the rest.
+        # table_len. pos rides scalar prefetch for the first lead chunks'
+        # rows and HBM for the rest.
         def flat(table, dtype):
             table = table.astype(dtype).reshape(-1)
+            if table.size == table_len:  # no zero-width pad op in the program
+                return table
             return jnp.pad(table, (0, table_len - table.size))
 
         pos = flat(pos, jnp.int32)
