@@ -10,8 +10,15 @@ from jax.experimental.pallas import tpu as pltpu
 # 435 us against 530 us for the XLA dot (the HBM floor is 448 us). The 80-
 # and 160-row slot-major draft buckets (16 and 32 requests per slot) reuse the
 # tile: the weight stream is the same and their VMEM footprint is smaller.
+# The target model's sampled rows (8-128), device time against the XLA dot:
+# 405/469 us at 8 and 16 rows, 424/497 at 32, 435/518 at 64, 455/527 at 128.
 TUNED_TILES = {
+    (8, 5120, 129280): 1280,
+    (16, 5120, 129280): 1280,
+    (32, 5120, 129280): 1280,
+    (64, 5120, 129280): 1280,
     (80, 5120, 129280): 1280,
+    (128, 5120, 129280): 1280,
     (160, 5120, 129280): 1280,
     (240, 5120, 129280): 1280,
 }

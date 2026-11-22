@@ -19,6 +19,9 @@ from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental import decode_preparation
+from vllm_torchtpu.kernels.logits_head import (
+    is_supported_shape as is_supported_logits_head_shape,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
     initialize_shifted_mhc,
 )
@@ -56,6 +59,7 @@ from .ced import (
     prefix_replay_enabled,
     start_decoder_replay_coordination,
 )
+from .dspark_sampling import initialize_logits_head
 from .engram import Engram, NgramHashState, engram_cache_slots
 from .host_engram import (
     HOST_ENGRAM_KEY,
@@ -1749,6 +1753,26 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             engram.upload_hbm_table()
         return loaded
 
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        weight = self.lm_head.weight
+        processor = self.logits_processor
+        # What the processor would compute: the plain BF16 head, no scale, cap,
+        # or vocab padding. A TP-sharded weight is not a tuned shape.
+        if (
+            self._logits_head is not None
+            and hidden_states.dtype == weight.dtype == torch.bfloat16
+            and processor.head_dtype in (None, torch.bfloat16)
+            and not processor.logits_as_input
+            and processor.scale == 1.0
+            and processor.soft_cap is None
+            and processor.org_vocab_size == weight.shape[0]
+            and is_supported_logits_head_shape(
+                hidden_states.shape[0], tuple(weight.shape)
+            )
+        ):
+            return self._logits_head(hidden_states, weight)
+        return super().compute_logits(hidden_states)
+
     def forward(self, *args, **kwargs):
         # Materialize upstream's persistent history outside the compiled model.
         # Its lazy first-use zeros allocation must not become an operation that
@@ -1806,6 +1830,10 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         # NVIDIA MXFP8 adapter selected by upstream uses weight_scale instead.
         self.hf_to_vllm_mapper = upstream._make_deepseek_v4_weights_mapper(
             getattr(self.config, "expert_dtype", "fp4"), "weight_scale_inv"
+        )
+        # Registered here: compute_logits runs inside compiled programs.
+        self._logits_head = (
+            initialize_logits_head() if envs.TPU_DEEPSEEK_V41_PALLAS_LOGITS else None
         )
 
 

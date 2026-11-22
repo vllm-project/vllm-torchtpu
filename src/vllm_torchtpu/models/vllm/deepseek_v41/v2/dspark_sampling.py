@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fixed-envelope slot-major DSpark sampling and final mHC collapse."""
 
+import functools
 from typing import Any, cast
 
 import jax
@@ -43,9 +44,11 @@ def initialize_samples():
     return op
 
 
+@functools.cache
 def initialize_logits_head():
+    # Cached: the target model's compute_logits and the drafter share one op.
     op = pallas.jax_op(
-        "pallas::dspark_logits_head",
+        "pallas::logits_head",
         logits_head,
         mesh=None,
         input_partition_specs=cast(Any, (P(),) * 2),

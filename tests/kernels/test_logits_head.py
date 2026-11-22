@@ -9,15 +9,17 @@ from vllm_torchtpu.kernels import logits_head as kernel
 
 def test_supported_shapes():
     assert kernel.is_supported_shape(240, (129280, 5120))
+    assert kernel.is_supported_shape(16, (129280, 5120))
     assert not kernel.is_supported_shape(288, (129280, 5120))
     assert not kernel.is_supported_shape(240, (129280, 4096))
 
 
 @pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="Pallas TPU kernel")
 @pytest.mark.parametrize("seed", [0, 1])
-def test_logits_head_matches_xla_dot_within_one_bf16_ulp(seed):
+@pytest.mark.parametrize("rows", [16, 240])
+def test_logits_head_matches_xla_dot_within_one_bf16_ulp(seed, rows):
     keys = jax.random.split(jax.random.PRNGKey(seed))
-    hidden = jax.random.normal(keys[0], (240, 5120)).astype(jnp.bfloat16)
+    hidden = jax.random.normal(keys[0], (rows, 5120)).astype(jnp.bfloat16)
     weight = (jax.random.normal(keys[1], (129280, 5120)) * 0.02).astype(jnp.bfloat16)
     want = jax.jit(
         lambda h, w: jnp.dot(h, w.T, preferred_element_type=jnp.float32).astype(

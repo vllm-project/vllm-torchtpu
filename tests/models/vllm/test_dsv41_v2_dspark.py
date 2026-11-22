@@ -771,6 +771,39 @@ def test_dspark_load_weights(monkeypatch: pytest.MonkeyPatch):
     assert draft_lm2.model.confidence_head is not None
 
 
+@pytest.mark.parametrize(
+    "rows, enabled, pallas",
+    [(16, True, True), (8, True, True), (16, False, False), (512, True, False)],
+)
+def test_target_logits_use_pallas_head_at_tuned_rows(
+    monkeypatch, rows, enabled, pallas
+):
+    model = v2_model.DeepseekV41ForCausalLM.__new__(v2_model.DeepseekV41ForCausalLM)
+    nn.Module.__init__(model)
+    weight = torch.empty((129280, 5120), dtype=torch.bfloat16, device="meta")
+    model.lm_head = SimpleNamespace(weight=weight)
+    model.logits_processor = SimpleNamespace(
+        head_dtype=None,
+        logits_as_input=False,
+        scale=1.0,
+        soft_cap=None,
+        org_vocab_size=129280,
+    )
+    hidden = torch.empty((rows, 5120), dtype=torch.bfloat16, device="meta")
+    logits = torch.empty((rows, 129280), dtype=torch.bfloat16, device="meta")
+    head = MagicMock(return_value=logits)
+    model._logits_head = head if enabled else None
+    xla = MagicMock(return_value=logits)
+    monkeypatch.setattr(
+        v2_model.upstream.DeepseekV41LLMForCausalLM, "compute_logits", xla
+    )
+
+    assert model.compute_logits(hidden) is logits
+    assert head.called == pallas and xla.called != pallas
+    if pallas:
+        assert head.call_args.args == (hidden, weight)
+
+
 def test_decode_sampler_uses_pallas_logits_head_when_enabled(monkeypatch):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import dspark_sampling
 

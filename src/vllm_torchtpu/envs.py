@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_MHC_FUSED_GATES: bool = True
     TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = True
     TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS: bool = True
+    TPU_DEEPSEEK_V41_PALLAS_LOGITS: bool = True
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
     TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
@@ -569,6 +570,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Changes only the draft logits' rounding (FP32 accumulation order).
     "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS": env_bool(
         "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS", default=True
+    ),
+    # Target model logits: compute the LM head with the same Pallas full-K head
+    # at the row counts in its TUNED_TILES instead of the XLA dot. Changes only
+    # the logits' rounding (FP32 accumulation order).
+    "TPU_DEEPSEEK_V41_PALLAS_LOGITS": env_bool(
+        "TPU_DEEPSEEK_V41_PALLAS_LOGITS", default=True
     ),
     # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
     # 256-row gathers when a step has 257..1024 rows
