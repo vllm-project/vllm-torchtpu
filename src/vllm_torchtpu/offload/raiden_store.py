@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import itertools
 import math
 import os
 import socket
@@ -109,6 +110,7 @@ from vllm.v1.kv_offload.base import (
     get_offload_group_idx,
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
+from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import unified_block_major_enabled
@@ -117,6 +119,7 @@ from vllm_torchtpu.offload.block_major_layout import (
     BlockMajorContract,
     resolve_block_major_contract,
 )
+from vllm_torchtpu.offload.metrics import SubBlockSourceCounts
 
 if TYPE_CHECKING:
     import torch
@@ -233,11 +236,20 @@ class RaidenLoadStoreSpec(LoadStoreSpec):
     `pinned` is set to False if `prepare_load` lost the race against eviction
     before acquiring pins. The load job then fails cleanly at submit time,
     allowing vLLM to recompute the blocks.
+
+    `key_sources` has, for each key of a pinned load, the tier that the load
+    reads each of its sub-blocks from.
     """
 
-    def __init__(self, keys: list[OffloadKey], pinned: bool = True):
+    def __init__(
+        self,
+        keys: list[OffloadKey],
+        pinned: bool = True,
+        key_sources: Mapping[OffloadKey, SubBlockSourceCounts] | None = None,
+    ):
         self.keys = keys
         self.pinned = pinned
+        self.key_sources = key_sources or {}
 
     def __repr__(self) -> str:
         return (
@@ -799,7 +811,41 @@ class RaidenOffloadingManager(OffloadingManager):
                 return RaidenLoadStoreSpec(keys, pinned=False)
             idx = resolved_to
         self._pending_remote_slices.update(remote_slices)
-        return RaidenLoadStoreSpec(keys)
+        return RaidenLoadStoreSpec(
+            keys, key_sources=self._key_sources(keys, sub_hashes, remote_slices)
+        )
+
+    def _key_sources(
+        self,
+        keys: list[OffloadKey],
+        sub_hashes: list[bytes],
+        remote_slices: Mapping[bytes, Any],
+    ) -> dict[OffloadKey, SubBlockSourceCounts]:
+        """The tier that `submit_load_job` reads each sub-block of each key from.
+
+        `remote_slices` has Raiden's location record of each sub-block that is not
+        read from the host pool: a peer's block (`REMOTE`) or a storage block.
+        """
+        factor = self._device_block_size_factor
+        if not remote_slices:
+            # The common load, all in the host pool: one tuple for every key.
+            all_host: SubBlockSourceCounts = ((CacheHitSource.HOST, factor),)
+            return dict.fromkeys(keys, all_host)
+        key_sources: dict[OffloadKey, SubBlockSourceCounts] = {}
+        for key_idx, key in enumerate(keys):
+            sources = []
+            for sub_hash in sub_hashes[key_idx * factor : (key_idx + 1) * factor]:
+                block = remote_slices.get(sub_hash)
+                if block is None:
+                    sources.append(CacheHitSource.HOST)
+                elif block.status == self._block_status.REMOTE:
+                    sources.append(CacheHitSource.P2P)
+                else:  # SHARED_STORAGE
+                    sources.append(CacheHitSource.DISK)
+            key_sources[key] = tuple(
+                (source, len(list(run))) for source, run in itertools.groupby(sources)
+            )
+        return key_sources
 
     def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
         # The Raiden directory is the sole authority on what is stored: probe
