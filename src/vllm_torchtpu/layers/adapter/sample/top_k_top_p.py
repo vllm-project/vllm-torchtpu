@@ -395,3 +395,127 @@ def top_k_top_p_candidate_logits(
     lane = torch.arange(CANDIDATE_BLOCK, device=logits.device, dtype=block_ids.dtype)
     ids = (block_ids.unsqueeze(-1) * CANDIDATE_BLOCK + lane).reshape(rows, -1)
     return ids, masked
+
+
+# VLLM_TPU_SAMPLER_LOGITS_BLOCKS: the candidate helpers below take the block
+# maxima and the candidate blocks from the caller, so the fused verify can
+# reduce the shared logits rows once and gather whole 128-logit blocks by row
+# instead of copying full target rows first. Each mirrors the function named
+# in its docstring op for op on the same values.
+
+
+def topk_cutoff_mask(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    kmax: int,
+    replace_val: float = MASKED_LOGIT_VALUE,
+) -> torch.Tensor:
+    """`topk_mask` for rows with 1 <= k <= kmax, from one torch.topk.
+
+    The bisection in `topk_mask` returns the k-th largest value as its cutoff
+    (the largest t with count(logits > -t) < k is t = -v_k), so the kept set
+    `logits >= v_k` is the same, ties included. Rows with k outside
+    [1, kmax] get an arbitrary cutoff; callers discard them (top_k <= 0) or
+    never pass them (the candidate gate keeps top_k <= blocks // 2).
+    """
+    vals = torch.topk(logits, kmax, dim=-1).values
+    kk = (k.clamp(min=1, max=kmax) - 1).to(torch.int64)
+    cutoff = vals.gather(-1, kk)
+    return torch.where(logits >= cutoff, logits, torch.full_like(logits, replace_val))
+
+
+def apply_top_k_top_p_kmax(
+    logits: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor, kmax: int
+) -> torch.Tensor:
+    """`apply_top_k_top_p` (no candidates) with `topk_cutoff_mask` when
+    kmax > 0, else exactly `apply_top_k_top_p`."""
+    if kmax <= 0:
+        return apply_top_k_top_p(logits, top_k, top_p)
+    should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
+    topk_masked = topk_cutoff_mask(logits, top_k, kmax, MASKED_LOGIT_VALUE)
+    masked_logits = torch.where(should_apply_topk, topk_masked, logits)
+
+    should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
+    topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE)
+    return torch.where(should_apply_topp, topp_masked, masked_logits)
+
+
+def row_block_gather(
+    blocks_flat: torch.Tensor,
+    blocks_per_row: int,
+    rows: torch.Tensor,
+    block_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Blocks `block_ids[r, j]` of source row `rows[r]`, as one row gather.
+
+    blocks_flat: [N * blocks_per_row, CANDIDATE_BLOCK] (a reshape of [N, V]).
+    rows: [R] source rows. block_ids: [R, n]. Returns [R, n * CANDIDATE_BLOCK],
+    the values `torch.gather` of those blocks returns (a pure copy).
+    """
+    idx = rows.to(torch.int64).unsqueeze(-1) * blocks_per_row + block_ids.to(
+        torch.int64
+    )
+    return torch.index_select(blocks_flat, 0, idx.reshape(-1)).reshape(
+        block_ids.shape[0], -1
+    )
+
+
+def apply_top_k_top_p_candidates_pre(
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    num_blocks: int,
+    block_max: torch.Tensor,
+    candidates_of: Callable[[torch.Tensor], torch.Tensor],
+    kmax: int = 0,
+) -> torch.Tensor:
+    """`apply_top_k_top_p_candidates(logits, ...)` given `block_max` (equal
+    to the block maxima of `logits`) and `candidates_of(block_ids)` (equal to
+    the gathered blocks of `logits`)."""
+    block_ids = torch.topk(block_max, num_blocks, dim=-1, sorted=False).indices
+    candidates = candidates_of(block_ids)
+    kept = apply_top_k_top_p_kmax(candidates, top_k, top_p, kmax) > MASKED_LOGIT_VALUE
+    inf = torch.full_like(candidates, float("inf"))
+    cutoff = torch.where(kept, candidates, inf).amin(dim=-1, keepdim=True)
+    masked = torch.where(
+        logits >= cutoff, logits, torch.full_like(logits, MASKED_LOGIT_VALUE)
+    )
+    return torch.where(top_k > 0, masked, logits)
+
+
+def blocked_argmax_pre(
+    block_max: torch.Tensor, block_of: Callable[[torch.Tensor], torch.Tensor]
+) -> torch.Tensor:
+    """`blocked_argmax(logits)` given the block maxima of `logits` and
+    `block_of(block_ids)` -> the [rows, CANDIDATE_BLOCK] block of each row."""
+    block_ids = torch.argmax(block_max, dim=-1)
+    block = block_of(block_ids)
+    return block_ids * CANDIDATE_BLOCK + torch.argmax(block, dim=-1)
+
+
+def top_k_top_p_candidate_logits_pre(
+    raw_block_max: torch.Tensor,
+    raw_candidates_of: Callable[[torch.Tensor], torch.Tensor],
+    scale: Callable[[torch.Tensor], torch.Tensor],
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    num_blocks: int,
+    kmax: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`top_k_top_p_candidate_logits` given the unscaled block maxima and
+    `raw_candidates_of(block_ids)` (the unscaled gathered blocks)."""
+    rows = raw_block_max.shape[0]
+    block_max = scale(raw_block_max)
+    block_ids = torch.topk(block_max, num_blocks, dim=-1, sorted=False).indices
+    candidates = scale(raw_candidates_of(block_ids))
+    kept = apply_top_k_top_p_kmax(candidates, top_k, top_p, kmax) > MASKED_LOGIT_VALUE
+    inf = torch.full_like(candidates, float("inf"))
+    cutoff = torch.where(kept, candidates, inf).amin(dim=-1, keepdim=True)
+    masked_value = torch.full_like(candidates, MASKED_LOGIT_VALUE)
+    masked = torch.where(candidates >= cutoff, candidates, masked_value)
+    masked = torch.where(top_k > 0, masked, candidates)
+    lane = torch.arange(
+        CANDIDATE_BLOCK, device=raw_block_max.device, dtype=block_ids.dtype
+    )
+    ids = (block_ids.unsqueeze(-1) * CANDIDATE_BLOCK + lane).reshape(rows, -1)
+    return ids, masked
