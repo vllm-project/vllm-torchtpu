@@ -17,10 +17,19 @@ Covers scripts/vllm/benchmarking/upload_results.py, bq_utils.py and
 bench_metrics.py, and .buildkite/scripts/parse_gke_results.py. Uploader tests
 run in dry-run mode over fixture files (tests/scripts/data/upload_results) and
 read the rows back out of the INSERT statements they print; helper unit tests
-call bench_metrics directly. The fixtures have the keys and value types that
-the pinned `vllm bench serve` (v0.33.0) saves for each lane's flags; their
-values are synthetic. Nothing reaches BigQuery or Spanner: subprocess.run, the
-only way either CLI is invoked, raises.
+call bench_metrics directly. Nothing reaches BigQuery or Spanner:
+subprocess.run, the only way either CLI is invoked, raises.
+
+The fixture cells come from rows that two nightly builds wrote to the
+benchmark_runs table: the speed-grid cell from build 10629 and the two GKE
+cells from build 10602. Every field an uploader reads carries the row's
+value, and `date` is the row's created_time. The rest of each file follows
+what the pinned `vllm bench serve` (v0.33.0) saves for the lane's flags:
+request_goodput is null without --goodput, endpoint_type repeats the backend,
+a P50 repeats the median, and a speed-grid cell has a null label and the
+model as its tokenizer. The keys the writer also saves but the rows do not
+hold (latencies, queue_times, max_concurrent_requests and the *_e2el_ms
+statistics) are left out; no uploader reads them.
 """
 
 import importlib.util
@@ -38,7 +47,8 @@ import yaml
 _REPO = pathlib.Path(__file__).resolve().parents[2]
 _BENCHMARKING = _REPO / "scripts" / "vllm" / "benchmarking"
 _DATA = pathlib.Path(__file__).resolve().parent / "data" / "upload_results"
-_MODEL = "Qwen/Qwen3.5-397B-A17B-FP8"
+_GRID_MODEL = "deepseek-ai/DeepSeek-V2"
+_GKE_MODEL = "Qwen/Qwen3.5-397B-A17B-FP8"
 _TABLE = "cloud-ullm-inference-ci-cd.llm_benchmark_analytics.benchmark_runs"
 
 
@@ -160,48 +170,48 @@ _BASE_CONFIG = {
     "profile_gcs_dir": None,
 }
 _ENGINE_FLAGS = {
-    "max_num_seqs": 16,
-    "max_num_batched_tokens": 16384,
-    "tensor_parallel_size": 2,
-    "data_parallel_size": 4,
+    "max_num_seqs": 128,
+    "max_num_batched_tokens": 8192,
+    "tensor_parallel_size": 8,
+    "data_parallel_size": 1,
     "max_model_len": 16384,
     "enable_ep": True,
-    "quantization": "fp8",
+    "quantization": "none",
     "multihost_backend": None,
 }
 # No p90_* keys: run_benchmarks.sh leaves --metric-percentiles at its default
 # of 99.
 _BENCH_METRICS = {
-    "request_throughput": 0.03125,
-    "output_throughput": 256.0,
-    "total_token_throughput": 288.0,
-    "max_output_tokens_per_s": 352.0,
+    "request_throughput": 1.7395167641836704,
+    "output_throughput": 1784.700712133341,
+    "total_token_throughput": 3562.5955649268135,
+    "max_output_tokens_per_s": 2432.0,
     "rtfx": 0.0,
-    "mean_ttft_ms": 1434.0,
-    "median_ttft_ms": 1200.0,
-    "std_ttft_ms": 300.0,
-    "p99_ttft_ms": 2500.0,
-    "mean_tpot_ms": 36.0,
-    "median_tpot_ms": 32.0,
-    "std_tpot_ms": 4.0,
-    "p99_tpot_ms": 50.0,
-    "mean_itl_ms": 36.0,
-    "median_itl_ms": 32.0,
-    "std_itl_ms": 4.0,
-    "p99_itl_ms": 50.0,
-    "completed": 16,
+    "mean_ttft_ms": 699.213593406273,
+    "median_ttft_ms": 205.83673850023843,
+    "std_ttft_ms": 1183.3377321032601,
+    "p99_ttft_ms": 4537.59701739953,
+    "mean_tpot_ms": 32.10634284340862,
+    "median_tpot_ms": 32.83010131278941,
+    "std_tpot_ms": 2.5744545163437387,
+    "p99_tpot_ms": 36.14999171315232,
+    "mean_itl_ms": 31.92212706080333,
+    "median_itl_ms": 27.675446999637643,
+    "std_itl_ms": 25.53811036050862,
+    "p99_itl_ms": 158.76247312935448,
+    "completed": 320,
     "failed": 0,
-    "total_input_tokens": 16384,
-    "total_output_tokens": 131072,
-    "duration": 512.0,
+    "total_input_tokens": 327060,
+    "total_output_tokens": 328312,
+    "duration": 183.95913542699964,
 }
 _SPEED_GRID_ROW = {
     "table": _TABLE,
     "record_id": _record_id(1),
-    "created_time": "TIMESTAMP '2026-10-20T10:48:45Z'",
+    "created_time": "TIMESTAMP '2026-11-21T22:45:57Z'",
     "repository": "vllm-torchtpu",
     "run_type": "DAILY",
-    "model_id": _MODEL,
+    "model_id": _GRID_MODEL,
     "metrics": {"vllm_bench": _BENCH_METRICS, "lm_eval": {"gsm8k": 0.98}},
     "config": {
         **_BASE_CONFIG,
@@ -209,12 +219,12 @@ _SPEED_GRID_ROW = {
         "engine_flags": _ENGINE_FLAGS,
         "workload": {
             "input_len": 1024,
-            "output_len": 8192,
-            "num_prompts": 16,
+            "output_len": 1024,
+            "num_prompts": 320,
             # What the bench saves for an unlimited rate: a string, not null.
             "request_rate": "inf",
             "burstiness": 1.0,
-            "max_concurrency": 256,
+            "max_concurrency": 64,
         },
     },
 }
@@ -224,7 +234,7 @@ def test_speed_grid_row_carries_the_cell_and_the_run_accuracy(
     tmp_path, monkeypatch, capsys
 ):
     results_dir = _results_dir(
-        tmp_path, "config.json", "isl1024_osl8192_c256.json", "lm_eval"
+        tmp_path, "config.json", "isl1024_osl1024_c64.json", "lm_eval"
     )
 
     returncode, rows = _upload(monkeypatch, capsys, results_dir)
@@ -233,46 +243,50 @@ def test_speed_grid_row_carries_the_cell_and_the_run_accuracy(
     assert rows == [_SPEED_GRID_ROW]
 
 
-_GKE_DECODE_CELL = "pd_disagg_decode_round1_c8_i8192_o1024"
+_GKE_DECODE_CELL = "pd_disagg_decode_daily_round3_c256_i65536_o1024"
 _GKE_ROW = {
     "table": _TABLE,
-    "record_id": f"kube-run-1_inf_c8_{'0' * 6}",
-    "created_time": "TIMESTAMP '2026-10-20T10:48:45Z'",
+    "record_id": f"kube-run-1_inf_c256_{'0' * 6}",
+    "created_time": "TIMESTAMP '2026-11-21T15:25:05Z'",
     "repository": "vllm-torchtpu",
     "run_type": "GKE_DISAGG",
-    "model_id": _MODEL,
+    "model_id": _GKE_MODEL,
     "metrics": {
-        # disagg_benchmark.sh asks for percentiles 50, 90 and 99; the P50 and
-        # end-to-end latency keys are not BENCH_METRIC_FIELDS.
+        # disagg_benchmark.sh asks for percentiles 50, 90 and 99; the P50
+        # keys are not BENCH_METRIC_FIELDS.
         "vllm_bench": {
-            "request_throughput": 0.5,
-            "output_throughput": 512.0,
-            "total_token_throughput": 4608.0,
-            "max_output_tokens_per_s": 640.0,
+            "request_throughput": 0.5976054708154231,
+            "output_throughput": 611.9480021149933,
+            "total_token_throughput": 39776.62013747456,
+            "max_output_tokens_per_s": 704.0,
             "rtfx": 0.0,
-            "mean_ttft_ms": 500.0,
-            "median_ttft_ms": 450.0,
-            "std_ttft_ms": 120.0,
-            "p90_ttft_ms": 700.0,
-            "p99_ttft_ms": 900.0,
-            "mean_tpot_ms": 9.0,
-            "median_tpot_ms": 8.0,
-            "std_tpot_ms": 1.5,
-            "p90_tpot_ms": 10.0,
-            "p99_tpot_ms": 12.5,
-            "mean_itl_ms": 9.0,
-            "median_itl_ms": 8.0,
-            "std_itl_ms": 1.5,
-            "p90_itl_ms": 10.0,
-            "p99_itl_ms": 12.5,
-            "completed": 8,
+            "mean_ttft_ms": 203565.2416025781,
+            "median_ttft_ms": 203331.61300500022,
+            "std_ttft_ms": 116100.16813890262,
+            "p90_ttft_ms": 363772.5042280001,
+            "p99_ttft_ms": 399683.54623475013,
+            "mean_tpot_ms": 24.291133922172836,
+            "median_tpot_ms": 24.38053086070386,
+            "std_tpot_ms": 0.573331313217146,
+            "p90_tpot_ms": 24.70020041642207,
+            "p99_tpot_ms": 24.997773420381314,
+            "mean_itl_ms": 24.445805767222204,
+            "median_itl_ms": 24.102490000132093,
+            "std_itl_ms": 18.614944635309854,
+            "p90_itl_ms": 25.8508530000654,
+            "p99_itl_ms": 31.339102500123776,
+            "completed": 256,
             "failed": 0,
-            "total_input_tokens": 65536,
-            "total_output_tokens": 8192,
-            "duration": 16.0,
+            "total_input_tokens": 16777216,
+            "total_output_tokens": 262144,
+            "duration": 428.37626578399977,
         },
-        # 1000 / the median, P90 and P99 TPOT of 8, 10 and 12.5 ms.
-        "derived": {"median_intvty": 125.0, "p90_intvty": 100.0, "p99_intvty": 80.0},
+        # 1000 / the median, P90 and P99 TPOT above.
+        "derived": {
+            "median_intvty": 41.01633412797354,
+            "p90_intvty": 40.4855014591357,
+            "p99_intvty": 40.00356284470819,
+        },
     },
     "config": {
         "code_hash": "0123abcd",
@@ -283,14 +297,14 @@ _GKE_ROW = {
         "backend": "openai",
         "endpoint_type": "openai",
         "workload": {
-            "input_len": 8192,
+            "input_len": 65536,
             "output_len": 1024,
-            "num_prompts": 8,
+            "num_prompts": 256,
             "request_rate": "inf",
             "burstiness": 1.0,
-            "max_concurrency": 8,
+            "max_concurrency": 256,
         },
-        "engine_flags": {"tokenizer_id": _MODEL, "label": _GKE_DECODE_CELL},
+        "engine_flags": {"tokenizer_id": _GKE_MODEL, "label": _GKE_DECODE_CELL},
     },
 }
 
@@ -322,14 +336,13 @@ def test_gke_row_counts_both_pools_of_the_disaggregated_fleet(tmp_path, capsys):
             "metrics": {
                 "vllm_bench": _GKE_ROW["metrics"]["vllm_bench"],
                 "derived": {
-                    # 512 output and 4608 total tok/s on 6 + 2 chips.
+                    # The output and total tok/s above on 6 + 2 chips; input
+                    # is their difference.
                     "num_chips": 8,
-                    "output_tput_per_chip": 64.0,
-                    "total_tput_per_chip": 576.0,
-                    "input_tput_per_chip": 512.0,
-                    "median_intvty": 125.0,
-                    "p90_intvty": 100.0,
-                    "p99_intvty": 80.0,
+                    "output_tput_per_chip": 76.49350026437416,
+                    "total_tput_per_chip": 4972.07751718432,
+                    "input_tput_per_chip": 4895.5840169199455,
+                    **_GKE_ROW["metrics"]["derived"],
                 },
             },
             "config": {**_GKE_ROW["config"], "prefill_chips": 6, "decode_chips": 2},
@@ -389,7 +402,9 @@ def test_gke_manifest_states_the_chips_its_engines_request():
 
 
 def test_gke_ttft_cell_without_tpot_has_no_derived_element(tmp_path, capsys):
-    returncode, (row,) = _parse_gke(capsys, tmp_path, cell="pd_disagg_ttft_c1_i8192_o1")
+    returncode, (row,) = _parse_gke(
+        capsys, tmp_path, cell="pd_disagg_ttft_c1_i65536_o1"
+    )
 
     assert returncode == 0
     assert list(row["metrics"]) == ["vllm_bench"]
@@ -441,8 +456,8 @@ def test_derived_metrics_ignores_non_finite_values_and_invalid_chips():
 def test_speculative_decoding_acceptance_is_kept_when_the_bench_reports_it(
     tmp_path, monkeypatch, capsys
 ):
-    results_dir = _results_dir(tmp_path, "config.json", "isl1024_osl8192_c256.json")
-    cell_path = results_dir / "isl1024_osl8192_c256.json"
+    results_dir = _results_dir(tmp_path, "config.json", "isl1024_osl1024_c64.json")
+    cell_path = results_dir / "isl1024_osl1024_c64.json"
     cell = json.loads(cell_path.read_text())
     cell.update(
         spec_decode_acceptance_rate=62.5,
