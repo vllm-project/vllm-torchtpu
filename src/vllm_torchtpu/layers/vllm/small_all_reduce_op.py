@@ -30,7 +30,7 @@ from jax.sharding import PartitionSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
-                                               ep_mesh_index, ep_rank_order)
+                                               ep_mesh_index)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.collectives import small_all_reduce as sar
 from vllm_torchtpu.kernels.collectives import small_gather_scatter as sgs
@@ -49,10 +49,12 @@ _CORES = 0
 # Whether the tensor-parallel group is the mesh (the same ranks as the
 # expert-parallel group): only then may the TP reductions take the kernel.
 _TP_IS_MESH = False
-# the data-parallel combine's reduce-scatter: the op and its per-rank operands (this rank and the rank-to-core table)
-_RS_OP = None
-_MY_RANK = None
-_CORE_OF_RANK = None
+# the data-parallel combine's reduce-scatter: legacy op/buffers retained for
+# standalone unit tests (TpuDeviceCommunicator.combine delegates to
+# layers.adapter.small_all_reduce_op).
+_RS_OP: Any = None
+_MY_RANK: Any = None
+_CORE_OF_RANK: Any = None
 # whether the data-parallel combine takes the kernel on this deployment (the
 # data-parallel group is the mesh); decided at prebuild, read by the traced
 # forward, so both sides of the token-count fork see the same answer
@@ -154,36 +156,19 @@ def prebuild() -> bool:
     form = envs.TPU_SMALL_ALL_REDUCE_FORM or None
     _OP = _build(mesh, form)
     _CORES = n
-    from vllm.distributed.parallel_state import (get_dp_group, get_ep_group,
-                                                 get_tp_group)
+    from vllm.distributed.parallel_state import get_ep_group, get_tp_group
     _TP_IS_MESH = tuple(get_tp_group().ranks) == tuple(get_ep_group().ranks)
-    # the data-parallel combine's reduce-scatter: this rank and the mesh
-    # core of every rank (ep_rank_order gives the rank at each mesh index)
-    global _RS_OP, _MY_RANK, _CORE_OF_RANK, _DP_COMBINE
-    order = ep_rank_order()
-    rank_of_core = list(order) if order is not None else list(range(n))
-    core_of_rank = [rank_of_core.index(r) for r in range(n)]
-    _MY_RANK = torch.tensor([int(get_dp_group().rank_in_group)],
-                            dtype=torch.int32,
-                            device=torch.device("tpu"))
-    _CORE_OF_RANK = torch.tensor(core_of_rank,
-                                 dtype=torch.int32,
-                                 device=torch.device("tpu"))
-    _RS_OP = _build_reduce_scatter(mesh)
-    from vllm.distributed.parallel_state import get_ep_group
-    _DP_COMBINE = (int(get_dp_group().world_size) == n and tuple(
-        get_dp_group().ranks) == tuple(get_ep_group().ranks))
+    # TpuDeviceCommunicator.combine() routes through
+    # layers/adapter/small_all_reduce_op.dp_combine_or(), so leave legacy
+    # _RS_OP/_DP_COMBINE unarmed here; otherwise retain_dp_combine_inputs()
+    # would lift _RANK/_MY_RANK/_CORE_OF_RANK in fused-EP traces while traces
+    # below TPU_MOE_FUSED_EP_STEP_MIN_TOKENS only lift adapter's _RANK.
     logger.info(
         "small all-reduce armed (cap %d rows, %d cores, mesh index %d, "
         "tensor-parallel group is the mesh: %s): form %s", cap, n,
         int(_RANK[0]), _TP_IS_MESH, form
         or "by block size (one-shot up to %d bytes per core, two-shot above)" %
         sar.ONE_SHOT_MAX_BYTES)
-    logger.info(
-        "data-parallel combine reduce-scatter %s (this rank %d, "
-        "mesh core of each rank %s)",
-        "armed" if _DP_COMBINE else "built, not this deployment's combine",
-        int(_MY_RANK[0]), core_of_rank)
     return True
 
 
