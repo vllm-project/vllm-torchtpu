@@ -391,11 +391,14 @@ class _AOTFn:
 
 
 def _draft_config(evaluate_guards):
-    # vLLM's own compilation config, so a renamed field fails here.
-    from vllm.config import CompilationConfig
+    # Built through vLLM's own constructors, so a renamed field fails here:
+    # they refuse an unknown keyword, while assigning an unknown attribute to
+    # an instance would just add it.
+    from vllm.config.compilation import CompilationConfig, DynamicShapesConfig
 
-    cc = CompilationConfig()
-    cc.dynamic_shapes_config.evaluate_guards = evaluate_guards
+    cc = CompilationConfig(
+        dynamic_shapes_config=DynamicShapesConfig(evaluate_guards=evaluate_guards)
+    )
     return types.SimpleNamespace(compilation_config=cc)
 
 
