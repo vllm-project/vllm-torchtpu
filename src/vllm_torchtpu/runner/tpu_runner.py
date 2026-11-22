@@ -152,6 +152,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
 )
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner import host_phases
+from vllm_torchtpu.runner import pam_incr
 from vllm_torchtpu.runner import l6_seedspec as _l6_seedspec
 from vllm_torchtpu.runner import pp_last_async_output
 from vllm_torchtpu.runner import pp_last_async_drafter as _pparf  # q38 PPARF (VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER, default off)
@@ -1286,6 +1287,9 @@ class TPUModelRunner(GPUModelRunner):
         )
         self.seq_lens_np = self.seq_lens_cpu.numpy()
         self._block_table_stage_cpu: torch.Tensor | None = None
+        # q38 SV-PAM PAM-INCR (runner/pam_incr.py): a no-op unless VLLM_TPU_PAM_INCR
+        # is set (nothing is patched).
+        pam_incr.patch_pam_incr()
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(
                 self.max_num_tokens,

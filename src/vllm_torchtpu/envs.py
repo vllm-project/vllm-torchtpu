@@ -435,6 +435,8 @@ if TYPE_CHECKING:
     VLLM_TPU_PLE_HOST_OVERLAP_CHECK: int = 0
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
     VLLM_TPU_DEFER_PREV_RESULTS_WAIT: bool = False
+    VLLM_TPU_PAM_INCR: bool = False
+    VLLM_TPU_PAM_INCR_AB_MS: int = 0
     VLLM_TPU_PP_LAST_ASYNC_OUTPUT: bool = False
     VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER: bool = False
     VLLM_TPU_STAGE3_PARK_SEND_REGISTRATION: bool = False
@@ -2945,6 +2947,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 86,400,000 with an even quotient). Host thread scheduling only.
     "VLLM_TPU_HOST_SWITCH_US": env_nonnegative_int("VLLM_TPU_HOST_SWITCH_US", 0),
     "VLLM_TPU_HOST_AB_PERIOD_MS": env_nonnegative_int("VLLM_TPU_HOST_AB_PERIOD_MS", 0),
+    # q38 SV-PAM PAM-INCR (runner/pam_incr.py): the target walk's block-table pack
+    # writes only the rows that changed since its buffer was last packed, into
+    # two dedicated host buffers used in turn (full pack on any geometry change
+    # and on dummy runs); the staged bytes equal the stock pack's. Host-only.
+    "VLLM_TPU_PAM_INCR": env_bool("VLLM_TPU_PAM_INCR", default=False),
+    # In-process A/B of VLLM_TPU_PAM_INCR in wall-clock windows of this many ms
+    # (incremental pack in even windows); 0 is off. Host-only.
+    "VLLM_TPU_PAM_INCR_AB_MS": env_nonnegative_int("VLLM_TPU_PAM_INCR_AB_MS", 0),
     # Host timeline of the admission path in profile windows, as
     # "<start_s>:<duration_s>[+...]" after the first Stage-3 load each process
     # sees ("" = off); runner/host_admit_probe.py.

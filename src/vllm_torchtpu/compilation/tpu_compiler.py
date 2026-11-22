@@ -310,6 +310,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     # windows, set per process at its first step (core/host_knobs.py).
     "VLLM_TPU_HOST_SWITCH_US",
     "VLLM_TPU_HOST_AB_PERIOD_MS",
+    # Row-incremental target-walk block-table pack (q38 SV-PAM PAM-INCR): host
+    # only, the staged bytes are the stock pack's (runner/pam_incr.py).
+    "VLLM_TPU_PAM_INCR",
+    "VLLM_TPU_PAM_INCR_AB_MS",
     # Last pipeline stage replies from the output thread (host only;
     # runner/pp_last_async_output.py).
     "VLLM_TPU_PP_LAST_ASYNC_OUTPUT",
