@@ -478,12 +478,14 @@ def test_decode_combine_matches_xla_epilogue(t_local, topk):
 
 
 @pytest.mark.parametrize(
-    "t_local,lane_blocks", [(256, 40), (320, 40), (384, 40), (256, 20), (256, 4)]
+    "t_local,lane_blocks,topk",
+    [(256, 40, 6), (320, 40, 6), (384, 40, 6), (256, 20, 6), (256, 4, 6), (320, 40, 3)],
 )
-def test_fs_combine_matches_xla_epilogue(t_local, lane_blocks):
+def test_fs_combine_matches_xla_epilogue(t_local, lane_blocks, topk):
     """At mixed-step sizes the combine is the pipelined fs kernel (an even
     and an odd block count, both chunk widths, hidden sizes that are not
-    whole registers of lane blocks); it gives v2's XLA epilogue bit for bit,
+    whole registers of lane blocks, a block's table slice that is not whole
+    tiles at the drafter's top-3); it gives v2's XLA epilogue bit for bit,
     unwritten (NaN) mirror entries and repeated arrival rows included."""
     from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
         decode_combine_applies,
@@ -494,7 +496,7 @@ def test_fs_combine_matches_xla_epilogue(t_local, lane_blocks):
     )
     from vllm_torchtpu.kernels.fused_moe.v2.layer import _combine_arrivals
 
-    topk, sublanes, tile_m = 6, 97, 128
+    sublanes, tile_m = 97, 128
     recv_rows = t_local * topk + 512
     assert fs_combine_chunk(t_local, topk) and not decode_combine_applies(t_local)
     rng = np.random.default_rng(t_local + lane_blocks)

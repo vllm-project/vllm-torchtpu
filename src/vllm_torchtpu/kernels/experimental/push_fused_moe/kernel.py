@@ -1878,17 +1878,22 @@ FS_COMBINE_CHUNK = 32
 FS_COMBINE_RING = 4
 FS_COMBINE_LEAD = 3
 # SMEM and HBM tables are tiled by this many entries; a staged table slice
-# must start on a tile.
+# starts and ends on a tile.
 _TABLE_TILE = 128
 
 
 def fs_combine_chunk(t_local, topk):
     """Tokens per chunk of the fs combine at this shape, or 0 where it does
-    not apply: at least two blocks of FS_COMBINE_RING chunks, and a block's
-    table slice (topk entries a token) whole tiles."""
+    not apply: at least two blocks of FS_COMBINE_RING chunks, and two blocks'
+    table entries (topk a token) whole tiles, so that where a block's slice
+    sits in its staged window depends only on the block's parity."""
     for ch in (FS_COMBINE_CHUNK, COMBINE_GROUP):
         blk = FS_COMBINE_RING * ch
-        if not t_local % blk and t_local >= 2 * blk and not topk * blk % _TABLE_TILE:
+        if (
+            not t_local % blk
+            and t_local >= 2 * blk
+            and not 2 * topk * blk % _TABLE_TILE
+        ):
             return ch
     return 0
 
@@ -1932,11 +1937,21 @@ def _build_combine_fs_kernel(
     n_tab = topk * blk
     # A token's f32 sum, padded to whole registers in the accumulator.
     acc_rows = align_up(lane_blocks, 8)
-    # Block b starts the rows of the tokens lead chunks past its own: its pos
-    # slice starts `shift` entries into the next block, rounded down to a
-    # tile, and runs one tile longer. The last block's is the table's tail.
+    # Block b reads its own tokens' scl and w and starts the rows of the
+    # tokens lead chunks past its own, so its pos slice is `shift` entries
+    # later. Each slice is staged as the tile-aligned window around it; its
+    # offset in the window is static per buffer (fs_combine_chunk). The
+    # tables are padded so that every window lies inside them.
     shift = topk * lead * ch
-    n_pos = n_tab + _TABLE_TILE
+    window = align_up(n_tab, _TABLE_TILE) + _TABLE_TILE
+    table_len = align_up((n_blocks - 1) * n_tab + shift + window, _TABLE_TILE)
+
+    def at(buf, base):
+        """(window start, slice offset in it) of block b's slice that starts
+        `base` entries into the block, for b of parity buf."""
+        off = (buf * n_tab + base) % _TABLE_TILE
+        return buf * n_tab + base - off, off
+
     # The loop covers pairs of blocks; the last two or three are unrolled
     # after it, the last one starting no rows past the end.
     tail = 2 + n_blocks % 2
@@ -1959,30 +1974,21 @@ def _build_combine_fs_kernel(
         out_sems,
         tab_sems,
     ):
-        def stage_copies(b, buf, last):
-            p0 = (
-                t_local * topk - n_pos
-                if last
-                else b * n_tab + shift // _TABLE_TILE * _TABLE_TILE
-            )
-            tab = pl.ds(buf * n_tab, n_tab)
-            return (
-                pltpu.make_async_copy(
-                    pos_hbm.at[pl.ds(p0, n_pos)],
-                    pos_st.at[pl.ds(buf * n_pos, n_pos)],
-                    tab_sems.at[0, buf],
-                ),
-                pltpu.make_async_copy(
-                    scl_hbm.at[pl.ds(b * n_tab, n_tab)],
-                    scl_st.at[tab],
-                    tab_sems.at[1, buf],
-                ),
-                pltpu.make_async_copy(
-                    tw_hbm.at[pl.ds(b * n_tab, n_tab)],
-                    tw_st.at[tab],
-                    tab_sems.at[2, buf],
-                ),
-            )
+        def stage_copies(b, buf):
+            # b - buf is even, so (b - buf) * n_tab is whole tiles.
+            pair = (b - buf) * n_tab
+            dst = pl.ds(buf * window, window)
+            copies = []
+            for i, (src, st, base) in enumerate(
+                ((pos_hbm, pos_st, shift), (scl_hbm, scl_st, 0), (tw_hbm, tw_st, 0))
+            ):
+                start = pl.multiple_of(pair + at(buf, base)[0], _TABLE_TILE)
+                copies.append(
+                    pltpu.make_async_copy(
+                        src.at[pl.ds(start, window)], st.at[dst], tab_sems.at[i, buf]
+                    )
+                )
+            return copies
 
         def start_row(p, slot, u, k):
             # Alternate queues by slot: an in-order queue retires a small
@@ -1993,15 +1999,14 @@ def _build_combine_fs_kernel(
             ).start(priority=k % 2)
 
         def coef(buf, e):
-            c = jnp.full((8, lanes), scales_sm[scl_st[buf * n_tab + e]], jnp.float32)
-            c = c * jnp.full((8, lanes), tw_st[buf * n_tab + e], jnp.float32)
+            e += buf * window + at(buf, 0)[1]
+            c = jnp.full((8, lanes), scales_sm[scl_st[e]], jnp.float32)
+            c = c * jnp.full((8, lanes), tw_st[e], jnp.float32)
             return jnp.tile(c, (pl.cdiv(lane_blocks, 8), 1))[:lane_blocks]
 
         def one_chunk(b, buf, r, last):
             slot, nslot = r, (r + lead) % ring
-            pos_at = buf * n_pos + (
-                n_pos - n_tab + shift if last else shift % _TABLE_TILE
-            )
+            pos_at = buf * window + at(buf, shift)[1]
             pltpu.make_async_copy(
                 rows_vm.at[slot], rows_vm.at[slot], row_sems.at[slot]
             ).wait()
@@ -2037,11 +2042,11 @@ def _build_combine_fs_kernel(
                 out_sems.at[slot],
             ).start()
 
-        def one_block(b, buf, last=False, stage_last=False):
-            for cp in stage_copies(b, buf, last):
+        def one_block(b, buf, last=False):
+            for cp in stage_copies(b, buf):
                 cp.wait()
             if not last:
-                for cp in stage_copies(b + 1, 1 - buf, stage_last):
+                for cp in stage_copies(b + 1, 1 - buf):
                     cp.start()
             for r in range(ring):
                 one_chunk(b, buf, r, last)
@@ -2051,7 +2056,7 @@ def _build_combine_fs_kernel(
                 one_block(2 * j + buf, buf)
             return carry
 
-        for cp in stage_copies(0, 0, False):
+        for cp in stage_copies(0, 0):
             cp.start()
         for c in range(lead):
             for u in range(ch):
@@ -2063,7 +2068,6 @@ def _build_combine_fs_kernel(
                 n_blocks - tail + i,
                 i % 2,
                 last=i == tail - 1,
-                stage_last=i == tail - 2,
             )
         for s in range(ring):
             pltpu.make_async_copy(out_vm.at[s], out_vm.at[s], out_sems.at[s]).wait()
@@ -2076,9 +2080,9 @@ def _build_combine_fs_kernel(
             in_specs=[hbm] * 4,
             out_specs=hbm,
             scratch_shapes=(
-                pltpu.SMEM((2 * n_pos,), jnp.int32),
-                pltpu.SMEM((2 * n_tab,), jnp.int32),
-                pltpu.SMEM((2 * n_tab,), jnp.float32),
+                pltpu.SMEM((2 * window,), jnp.int32),
+                pltpu.SMEM((2 * window,), jnp.int32),
+                pltpu.SMEM((2 * window,), jnp.float32),
                 pltpu.VMEM((ring, topk * ch, lane_blocks, lanes), wire_dtype),
                 pltpu.VMEM((ch // gt, gt * acc_rows, lanes), jnp.float32),
                 pltpu.VMEM((ring, ch, hidden), out_dtype),
@@ -2096,15 +2100,20 @@ def _build_combine_fs_kernel(
     )
 
     def fn(arrivals, arrival_scales, scl, topk_weights, pos):
-        # Every table flattens TOKEN-major, like v2's combine. pos rides
-        # scalar prefetch for the first lead chunks' rows and HBM for the rest.
-        pos = pos.astype(jnp.int32).reshape(-1)
+        # Every table flattens TOKEN-major, like v2's combine, padded to
+        # table_len (the pad lands in the flattening copy). pos rides scalar
+        # prefetch for the first lead chunks' rows and HBM for the rest.
+        def flat(table, dtype):
+            table = table.astype(dtype).reshape(-1)
+            return jnp.pad(table, (0, table_len - table.size))
+
+        pos = flat(pos, jnp.int32)
         return call(
             pos,
             arrival_scales.astype(jnp.float32).reshape(-1),
             pos,
-            scl.astype(jnp.int32).reshape(-1),
-            topk_weights.astype(jnp.float32).reshape(-1),
+            flat(scl, jnp.int32),
+            flat(topk_weights, jnp.float32),
             arrivals,
         )
 
