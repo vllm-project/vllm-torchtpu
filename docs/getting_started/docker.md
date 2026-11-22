@@ -46,7 +46,7 @@ Nightly images are built automatically every night from the `main` branch (`--ta
   docker pull vllm/vllm-torchtpu:nightly-20261029-1689a6b-v0.32.0
   ```
 
-The moving `:nightly` tag names no commit. Each image records the commit it was built from in its `org.opencontainers.image.revision` label, which you can read without pulling the image:
+The moving `:nightly` tag names no commit. Each image records the commit it was built from in its `org.opencontainers.image.revision` label, which you can read without pulling the image. An image built before the label was added, which includes tags published earlier and releases from branches cut earlier, prints nothing:
 
 ```bash
 docker buildx imagetools inspect vllm/vllm-torchtpu:nightly \

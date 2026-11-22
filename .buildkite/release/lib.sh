@@ -51,6 +51,28 @@ image_revision() {
     echo "${revision}"
 }
 
+# The commit every step of a release agrees on: the one preflight.sh gated on
+# CI and stored in meta-data. A step whose checkout at <repo_root> holds another
+# commit fails here, before it builds anything. Running a step standalone, with
+# nothing stored, uses the checkout's commit.
+release_revision() {
+    local repo_root="$1" checkout gated rc=0
+    # errexit is off inside the caller's $(...), so a failure is passed on by hand.
+    checkout="$(image_revision "${repo_root}")" || exit 1
+    buildkite-agent meta-data exists release-revision || rc=$?
+    case "${rc}" in
+        0)
+            gated="$(buildkite-agent meta-data get release-revision)" \
+                || die "could not read meta-data release-revision."
+            [[ "${checkout}" == "${gated}" ]] \
+                || die "this step's checkout is at ${checkout}, but preflight gated the release on ${gated}."
+            ;;
+        100) ;;
+        *) die "could not read meta-data release-revision (exit ${rc})." ;;
+    esac
+    echo "${checkout}"
+}
+
 # The `docker build --label` value that records <revision> on an image.
 image_revision_label() {
     echo "org.opencontainers.image.revision=$1"

@@ -72,8 +72,10 @@ the new pipeline's schedule takes over.
 
 Each nightly and release image carries the commit it was built from in the
 `org.opencontainers.image.revision` label, which maps a tag that names no
-commit, such as a GAR `nightly-YYYYMMDD`, to one. Read it without pulling the
-image:
+commit, such as a GAR `nightly-YYYYMMDD`, to one. An image built before the
+label was added has none: that covers tags pushed earlier, and releases from
+branches cut earlier, since a release branch runs the tooling it was cut with.
+Read the label without pulling the image (an image without it prints nothing):
 
 ```bash
 docker buildx imagetools inspect <image>:<tag> \

@@ -14,12 +14,12 @@
 """What the image scripts build and push, and the commit label they set.
 
 Covers .buildkite/scripts/publish_nightly_images.sh,
-.buildkite/release/build_images.sh and the `--label` option of
-docker/build_image.sh. Each script runs for real, in a throwaway git
-repository holding copies of the scripts it calls, with `docker`,
-`buildkite-agent` and `date` replaced on PATH by stubs. The docker stub records
-every invocation, so the tests read the build and push commands the pipeline
-would have run.
+.buildkite/release/build_images.sh, the commit .buildkite/release/preflight.sh
+gates a release on, and the `--label` option of docker/build_image.sh. Each
+script runs for real, in a throwaway git repository holding copies of the
+scripts it calls, with `docker`, `buildkite-agent`, `curl` and `date` replaced
+on PATH by stubs. The docker stub records every invocation, so the tests read
+the build and push commands the pipeline would have run.
 """
 
 import os
@@ -36,11 +36,14 @@ _COPIED = (
     ".buildkite/scripts/cleanup_docker.sh",
     ".buildkite/release/build_images.sh",
     ".buildkite/release/lib.sh",
+    ".buildkite/release/preflight.sh",
     "docker/build_image.sh",
     "pyproject.toml",
 )
 _NIGHTLY_SCRIPT = ".buildkite/scripts/publish_nightly_images.sh"
 _RELEASE_SCRIPT = ".buildkite/release/build_images.sh"
+_PREFLIGHT_SCRIPT = ".buildkite/release/preflight.sh"
+_CI_GATE = ".buildkite/release/ci_gate.py"
 _BUILD_IMAGE_SCRIPT = "docker/build_image.sh"
 _REGISTRY = "us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu"
 _REVISION_LABEL = "org.opencontainers.image.revision"
@@ -62,15 +65,34 @@ case "$*" in
     *) exec /bin/date "$@" ;;
 esac
 """
-# No release approval and no stored release version: `meta-data exists` says
-# "not found" (1 for the approval lookup of the nightly script, 100 for the
-# version lookup of the release library), and every write succeeds.
+# Build meta-data is one file per key under $META_DIR, empty unless a test or
+# a script under test sets a key. For a missing key `meta-data exists` says
+# "not found": 100 for the release-* keys of the release library, 1 for the
+# approval lookup of the nightly script. Every other call succeeds.
 _BUILDKITE_AGENT_STUB = """#!/bin/bash
-if [ "$1 $2" = "meta-data exists" ]; then
-    if [ "$3" = "release-version" ]; then exit 100; fi
-    exit 1
+if [ "$1" = "meta-data" ]; then
+    case "$2" in
+        set) printf '%s' "$4" > "$META_DIR/$3" ;;
+        get) cat "$META_DIR/$3" ;;
+        exists)
+            [ -e "$META_DIR/$3" ] && exit 0
+            case "$3" in release-*) exit 100 ;; esac
+            exit 1
+            ;;
+    esac
 fi
 exit 0
+"""
+# PyPI answers "no such version" to the preflight's check.
+_CURL_STUB = """#!/bin/bash
+printf 404
+"""
+# Stands in for ci_gate.py, which asks GitHub: records the commit it is asked
+# about and vouches for it.
+_CI_GATE_STUB = """import os, sys
+with open(os.environ["CI_GATE_LOG"], "a") as log:
+    log.write(sys.argv[1] + "\\n")
+print("https://buildkite.example/builds/1")
 """
 
 
@@ -126,11 +148,33 @@ class _Checkout:
             ("docker", _DOCKER_STUB),
             ("date", _DATE_STUB),
             ("buildkite-agent", _BUILDKITE_AGENT_STUB),
+            ("curl", _CURL_STUB),
         ):
             stub = self._bin_dir / name
             stub.write_text(body)
             stub.chmod(0o755)
         self._docker_log = tmp_path / "docker.log"
+        self._ci_gate_log = tmp_path / "ci_gate.log"
+        self._meta_dir = tmp_path / "meta"
+        self._meta_dir.mkdir()
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Stores build meta-data, as an earlier step of the build would."""
+        (self._meta_dir / key).write_text(value)
+
+    def meta(self) -> dict[str, str]:
+        """The build meta-data stored so far."""
+        return {path.name: path.read_text() for path in self._meta_dir.iterdir()}
+
+    def commits_asked_of_the_ci_gate(self) -> list[str]:
+        return self._ci_gate_log.read_text().splitlines()
+
+    def commit_again(self) -> str:
+        """Moves the checkout to a new commit; returns it."""
+        (self.repo / "later.txt").write_text("later\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "later")
+        return _git(self.repo, "rev-parse", "HEAD")
 
     def drop_git_metadata_inside_another_repository(self) -> str:
         """Removes the checkout's .git and makes its parent directory a
@@ -144,6 +188,7 @@ class _Checkout:
         """Runs `script` from the checkout root; returns the completed
         process and the docker invocations as argv lists."""
         self._docker_log.write_text("")
+        self._ci_gate_log.write_text("")
         process_env = {
             key: value
             for key, value in _without_git_variables(dict(os.environ)).items()
@@ -153,6 +198,8 @@ class _Checkout:
         process_env.update(
             PATH=f"{self._bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
             DOCKER_LOG=str(self._docker_log),
+            CI_GATE_LOG=str(self._ci_gate_log),
+            META_DIR=str(self._meta_dir),
             BUILDKITE_BRANCH=self.branch,
             **env,
         )
@@ -309,6 +356,47 @@ def test_no_release_image_is_built_when_the_commit_is_unknown(release):
     assert completed.returncode == 1
     assert "cannot tell which commit the images are built from" in completed.stderr
     assert _builds(calls) == []
+
+
+def test_preflight_gates_and_stores_the_checked_out_commit(release):
+    (release.repo / _CI_GATE).write_text(_CI_GATE_STUB)
+
+    # "HEAD" is what Buildkite reports for a build created without a commit;
+    # GitHub would read it as the default branch.
+    completed, _ = release.run(_PREFLIGHT_SCRIPT, BUILDKITE_COMMIT="HEAD")
+
+    assert completed.returncode == 0, completed.stderr
+    assert release.commits_asked_of_the_ci_gate() == [release.head]
+    assert release.meta() == {
+        "release-version": "0.29.0",
+        "release-revision": release.head,
+        "release-prerelease": "no",
+    }
+
+
+def test_release_images_are_built_from_the_commit_preflight_gated(release):
+    release.set_meta("release-revision", release.head)
+
+    completed, calls = release.run(_RELEASE_SCRIPT, BUILDKITE_COMMIT="HEAD")
+
+    assert completed.returncode == 0, completed.stderr
+    assert {tuple(_labels(build)) for build in _builds(calls)} == {
+        (f"{_REVISION_LABEL}={release.head}",)
+    }
+
+
+def test_no_release_image_is_built_from_a_commit_preflight_did_not_gate(release):
+    release.set_meta("release-revision", release.head)
+    later = release.commit_again()
+
+    completed, calls = release.run(_RELEASE_SCRIPT, BUILDKITE_COMMIT=release.head)
+
+    assert completed.returncode == 1
+    assert (
+        f"this step's checkout is at {later}, but preflight gated the release on"
+        f" {release.head}." in completed.stderr
+    )
+    assert calls == []
 
 
 def test_build_image_passes_every_label_to_docker_build(nightly):
