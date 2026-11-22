@@ -389,10 +389,10 @@ class TestTpuCompilerCache:
     @pytest.mark.parametrize(
         "token_parallel,extra_env,all_reduce,all_gather",
         [
-            ("1", {}, 64 << 20, 8 << 20),
+            ("1", {}, 64 << 20, 6 << 20),
             (None, {}, 64 << 20, 64 << 20),
             ("0", {}, 64 << 20, 64 << 20),
-            (None, {"TPU_DCP_MLA_TOPK_CAP": "512"}, 64 << 20, 8 << 20),
+            (None, {"TPU_DCP_MLA_TOPK_CAP": "512"}, 64 << 20, 6 << 20),
             ("0", {"TPU_DCP_MLA_TOPK_CAP": "512"}, 64 << 20, 64 << 20),
             (None, {"TPU_DCP_MLA_TOPK_CAP": "0"}, 64 << 20, 64 << 20),
             ("1", {"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": "12345"}, 12345, 12345),
