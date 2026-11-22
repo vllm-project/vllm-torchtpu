@@ -2429,6 +2429,9 @@ class Eagle3Proposer:
                         run_draft_step(ci, step)
                     pad_dp_draft_step(step)
 
+        # VLLM_TPU_CANDIDATE_VERIFY_SEED: a seed the step's propose did not
+        # take must not pin its chunk's buffers past the step.
+        self._verify_seeds.clear()
         host_phases.mark("dp_loop")
         # Assemble [total_num_reqs, K]. Each chunk's tokens are padded to p; slice
         # to the real num_reqs at the end. Sync slices on the host (the [p, K] D2H

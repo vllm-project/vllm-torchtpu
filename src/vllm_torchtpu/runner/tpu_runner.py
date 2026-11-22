@@ -8694,7 +8694,8 @@ class TPUModelRunner(GPUModelRunner):
         if (
             envs.VLLM_TPU_CANDIDATE_VERIFY_SEED
             and envs.VLLM_TPU_CANDIDATE_VERIFY_LOGITS
-            and hasattr(getattr(self, "_async_drafter", None), "async_seed_warm_args")
+            and self._is_async_drafter
+            and hasattr(self._async_drafter, "async_seed_warm_args")
         ):
             seeds += [
                 (warm_md.draft_lengths, *args[1:])
@@ -10847,8 +10848,10 @@ class TPUModelRunner(GPUModelRunner):
         chunk = self._verify_seed_chunk
         if not envs.VLLM_TPU_CANDIDATE_VERIFY_SEED or chunk is None:
             return None
-        drafter = getattr(self, "_async_drafter", None)
-        if drafter is None or not hasattr(drafter, "verify_seed_args"):
+        if not self._is_async_drafter:
+            return None
+        drafter = self._async_drafter
+        if not hasattr(drafter, "verify_seed_args"):
             return None
         return drafter.verify_seed_args(
             chunk,
