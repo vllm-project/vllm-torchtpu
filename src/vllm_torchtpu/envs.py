@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_ATTN_PIECES: bool = False
     TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES: bool = True
     TPU_TP_PALLAS_SMALL_ALL_GATHER: bool = False
+    TPU_TP_PALLAS_SMALL_ALL_TO_ALL: bool = False
     TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS: int = 4096
     TPU_MINIMAX_M3_MSA_WIDE_TILES: str = "off"
     TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = True
@@ -863,6 +864,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of XLA's TensorCore all-gather.
     "TPU_TP_PALLAS_SMALL_ALL_GATHER": env_bool(
         "TPU_TP_PALLAS_SMALL_ALL_GATHER", default=False
+    ),
+    # With the Pallas TP all-reduce armed: the synthetic verify's LM head rows
+    # go to their sampling rank by one Pallas all-to-all (a barrier and a
+    # direct HBM copy to every peer; kernels/collectives/tp_all_reduce.py
+    # `all_to_all_small`) instead of XLA's TensorCore all-to-all.
+    "TPU_TP_PALLAS_SMALL_ALL_TO_ALL": env_bool(
+        "TPU_TP_PALLAS_SMALL_ALL_TO_ALL", default=False
     ),
     # MSA prefill-size sparse-attention calls on 64-token tiles
     # (models/minimax_m3/kernels/msa_attention_lse.py `_adaptive_call`):

@@ -216,3 +216,70 @@ def all_reduce(x: jax.Array, rank: jax.Array, n: int) -> jax.Array:
     # consumer (the residual add + RMSNorm), which then runs on the [16, w] view
     # at 0.78 us instead of 0.15 us.
     return lax.optimization_barrier(out.reshape(padded, hidden)[:rows])
+
+
+@functools.cache
+def _all_to_all_call(n: int, m: int, w: int, dtype):
+    def kernel(rank_ref, x_hbm, out_hbm, send_sem, recv_sem, local_sem):
+        me = rank_ref[0]
+        barrier = pltpu.get_barrier_semaphore()
+        for d in range(n):
+            pl.semaphore_signal(barrier, inc=1, device_id=(d,), device_id_type=_MESH)
+        pl.semaphore_wait(barrier, n)
+        sends = []
+        for step in range(1, n):
+            target = lax.rem(me + step, n)
+            copy = pltpu.make_async_remote_copy(
+                x_hbm.at[target],
+                out_hbm.at[me],
+                send_sem.at[step],
+                recv_sem.at[me],
+                device_id=(target,),
+                device_id_type=_MESH,
+            )
+            copy.start()
+            sends.append(copy)
+        own = pltpu.make_async_copy(x_hbm.at[me], out_hbm.at[me], local_sem.at[0])
+        own.start()
+        own.wait()
+        for step in range(1, n):
+            t = lax.rem(me + n - step, n)
+            pltpu.make_async_copy(
+                out_hbm.at[t], out_hbm.at[t], recv_sem.at[t]
+            ).wait_recv()
+        for copy in sends:
+            copy.wait_send()
+
+    hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((n, m, w), dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[hbm],
+            out_specs=hbm,
+            scratch_shapes=[
+                pltpu.SemaphoreType.DMA((n,)),
+                pltpu.SemaphoreType.DMA((n,)),
+                pltpu.SemaphoreType.DMA((1,)),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
+        name=f"tp_all_to_all_small-m_{m}-w_{w}-n_{n}",
+    )
+
+
+def all_to_all_small(x: jax.Array, rank: jax.Array, n: int) -> jax.Array:
+    """All-to-all of x ``[n, ...]`` over the n ranks: block d goes to rank d,
+    block s of the result came from rank s. A barrier and one direct HBM copy
+    to every peer, for the latency-bound exchanges where XLA's TensorCore
+    all-to-all takes ~11 us (the synthetic sampler's LM head rows). Call under
+    shard_map."""
+    assert x.shape[0] == n, (x.shape, n)
+    shape = x.shape
+    w = shape[-1]
+    m = x.size // (n * w)
+    out = _all_to_all_call(n, m, w, x.dtype)(
+        rank.reshape(1).astype(jnp.int32), x.reshape(n, m, w)
+    )
+    return out.reshape(shape)

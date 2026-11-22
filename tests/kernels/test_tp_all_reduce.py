@@ -32,6 +32,9 @@ CASES = ((4, 6144), (8, 6144), (24, 6144), (3, 1024))
 # all_gather_small rows per rank: SP row scales of 2 and 4 pieces at 8k, and a
 # count that needs padding.
 GATHER_ROWS = (512, 256, 100)
+# all_to_all_small blocks per destination (rows, width): the synthetic
+# sampler's LM head rows at 1 and 8 rows per rank (a padded shard width).
+A2A_SHAPES = ((1, 25088), (8, 640))
 
 
 @pytest.mark.parametrize(
@@ -102,6 +105,32 @@ def _worker():
             exact=all(np.array_equal(out[r], x) for r in range(N_RANKS)),
             races=bool(interpret_pallas_call.races.races_found),
         )
+    a2a = jax.jit(
+        jax.shard_map(
+            lambda x, r: tp_all_reduce.all_to_all_small(x[0], r, N_RANKS)[None],
+            mesh=mesh,
+            in_specs=(P("d"), P("d")),
+            out_specs=P("d"),
+            check_vma=False,
+        )
+    )
+    for rows, width in A2A_SHAPES:
+        # Rank r's block d holds (r, d) everywhere.
+        x = np.zeros((N_RANKS, N_RANKS, rows, width), np.float32)
+        for r in range(N_RANKS):
+            for d in range(N_RANKS):
+                x[r, d] = r * 100 + d + np.arange(rows * width).reshape(rows, width)
+        pltpu.reset_tpu_interpret_mode_state()
+        out = np.asarray(a2a(jnp.asarray(x, jnp.bfloat16), ranks).astype(jnp.float32))
+        want = np.asarray(jnp.asarray(x, jnp.bfloat16).astype(jnp.float32))
+        result[f"a2a{rows}x{width}"] = dict(
+            exact=all(
+                np.array_equal(out[d, s], want[s, d])
+                for d in range(N_RANKS)
+                for s in range(N_RANKS)
+            ),
+            races=bool(interpret_pallas_call.races.races_found),
+        )
     print("RESULT " + json.dumps(result))
 
 
@@ -130,6 +159,12 @@ def test_kernel_on_8_devices(on_8_devices, rows, hidden):
 @pytest.mark.parametrize("rows", GATHER_ROWS)
 def test_gather_on_8_devices(on_8_devices, rows):
     case = on_8_devices[f"gather{rows}"]
+    assert case["exact"] and not case["races"], case
+
+
+@pytest.mark.parametrize("rows, width", A2A_SHAPES)
+def test_all_to_all_on_8_devices(on_8_devices, rows, width):
+    case = on_8_devices[f"a2a{rows}x{width}"]
     assert case["exact"] and not case["races"], case
 
 
