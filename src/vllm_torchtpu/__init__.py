@@ -1981,6 +1981,9 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     original_init = vpe.VocabParallelEmbedding.__init__
 
     from vllm_torchtpu import envs as _envs
+    from vllm_torchtpu.layers.adapter import (  # noqa: PLC0415 -- lazy like this hook's other imports
+        replicated_embedding,
+    )
 
     # TPU_VOCAB_EMBED_I32_BOUNDS: int32 bounds (no X64SplitLow per program
     # input); same values, every bound is < 2**31.
@@ -2024,6 +2027,9 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             )
 
     def patched_forward(self, input_):
+        replica_rows = replicated_embedding.decode_lookup(self, input_)
+        if replica_rows is not None:
+            return replica_rows
         input_mask = None
         if self.tp_size > 1:
             masked_input, input_mask = vpe.get_masked_input_and_mask(
@@ -2060,7 +2066,12 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
             from vllm.distributed import tensor_model_parallel_all_reduce
 
-            return tensor_model_parallel_all_reduce(output_parallel)
+            output = tensor_model_parallel_all_reduce(output_parallel)
+            # Avoid an unmasked lookup in the replicated table here: short
+            # prompts prefilled in decode buckets came back with wrong tokens
+            # through it (decode_lookup above masks out-of-vocabulary ids).
+            # Keep the table lifted for bucket hand-over.
+            return replicated_embedding.retain_table(self, output)
         return output_parallel
 
     def patched_get_masked_input_and_mask(
