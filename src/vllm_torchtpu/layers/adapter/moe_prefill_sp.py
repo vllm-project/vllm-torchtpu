@@ -42,6 +42,7 @@ the first access names each buffer the same way in both traces.
 
 import functools
 import inspect
+from collections.abc import Callable
 from itertools import islice
 from typing import Any
 
@@ -62,6 +63,9 @@ from vllm.model_executor.models import deepseek_v2
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_mesh_index
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.kv_cache_append import (
+    owned_rows_bound_from_local,
+)
 from vllm_torchtpu.kernels.fused_moe.grouped_shared_expert import (
     grouped_shared_expert_sharded,
 )
@@ -393,6 +397,10 @@ class _GatherProjections(_OProjReduceScatter):
         *,
         positions_local: torch.Tensor | None = None,
         zigzag_bands: int = 1,
+        owned_k_resolver: Callable[
+            [Any, torch.Tensor, int], tuple[torch.Tensor, torch.Tensor] | None
+        ]
+        | None = None,
     ) -> tuple[
         torch.Tensor
         | tuple[torch.Tensor, torch.Tensor]
@@ -468,6 +476,32 @@ class _GatherProjections(_OProjReduceScatter):
                             (q_c_qrows, kv_lora_local, positions_local),
                             (k_local, w_qrows, positions_local),
                         )
+                    gather_owned_k_op = getattr(tp_op, "gather_owned_k_op", None)
+                    if (
+                        not envs.TPU_DCP_TP_SHARDED_INDEXER_K
+                        and envs.TPU_INDEXER_K_WRITE_COMPACT
+                        and gather_owned_k_op is not None
+                        and owned_k_resolver is not None
+                    ):
+                        kw_local = indexer.wk_weights_proj(x)[0]
+                        k_dim = int(indexer.head_dim)
+                        k_local, w_local = kw_local.split(
+                            [k_dim, kw_local.shape[-1] - k_dim], dim=-1
+                        )
+                        owned_plan = owned_k_resolver(mla, k_local, num_tokens)
+                        if owned_plan is not None:
+                            raw_own, pos_own = owned_plan
+                            qcw_qrows = qc_head_shift_op(
+                                torch.cat([q_c_local, w_local], dim=-1), tp_op.rank
+                            )
+                            q_c_qrows, w_qrows = qcw_qrows.split(
+                                [q_lora, w_local.shape[-1]], dim=-1
+                            )
+                            k_own = gather_owned_k_op(k_local, raw_own)
+                            return (
+                                (q_c_qrows, kv_lora_local, positions_local),
+                                (k_own, w_qrows, pos_own),
+                            )
                 qc_head_packed = q_c_local[:s].reshape(rows_local, cols_qc)
                 parts = (
                     [qc_head_packed]
@@ -576,6 +610,71 @@ class _ShardedKVGatherProjections(_OProjReduceScatter):
         self._positions = positions
         self._tp = tp
         self._positions_local: torch.Tensor | None = None
+        self._owned_k_plans: dict[
+            tuple[int, int, int],
+            tuple[torch.Tensor, torch.Tensor],
+        ] = {}
+
+    def _resolve_owned_k_plan(
+        self, mla: Any, k_local: torch.Tensor, num_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        mla_attn = getattr(mla, "mla_attn", None)
+        tp_op = getattr(mla_attn, "sparse_mla_tp_op", None)
+        if tp_op is None:
+            return None
+        owned_rows_op = getattr(tp_op, "indexer_owned_rows_op", None)
+        if owned_rows_op is None or getattr(tp_op, "rank", None) is None:
+            return None
+        indexer_op = getattr(getattr(mla, "indexer", None), "indexer_op", None)
+        topk_op_tp = getattr(indexer_op, "topk_op_tp", None)
+        if not getattr(topk_op_tp, "serves_sharded_k", False):
+            return None
+        unified_qb_op = getattr(mla_attn, "sparse_mla_unified_idx_qb_op", None)
+        if unified_qb_op is not None and not getattr(
+            unified_qb_op, "serves_sharded_k", False
+        ):
+            return None
+        unified_tp_op = getattr(mla_attn, "sparse_mla_unified_tp_op", None)
+        if unified_tp_op is not None and not getattr(
+            unified_tp_op, "serves_sharded_k", False
+        ):
+            return None
+        step_meta_fn = getattr(indexer_op, "live_cache_step_metadata", None)
+        if not callable(step_meta_fn):
+            return None
+        step_meta = step_meta_fn()
+        if step_meta is None:
+            return None
+        seq_lens, block_tables, query_start_loc = step_meta
+        bound = owned_rows_bound_from_local(
+            k_local.shape[0],
+            num_seqs=seq_lens.shape[0],
+            interleave_size=int(tp_op.layout.interleave_size),
+        )
+        if bound >= num_tokens:
+            return None
+        # Avoid int(num_tokens) in plan_key: num_tokens is symbolic under AOT
+        # dynamic tracing, and each _ShardedKVGatherProjections instance serves
+        # one step token count.
+        plan_key = (
+            id(seq_lens),
+            id(block_tables),
+            id(query_start_loc),
+        )
+        cached = self._owned_k_plans.get(plan_key)
+        if cached is not None:
+            return cached
+        own_idx, raw_own = owned_rows_op(
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            k_local[:, :1],
+            tp_op.rank,
+        )
+        pos_own = self._positions.index_select(0, own_idx)
+        plan = (raw_own, pos_own)
+        self._owned_k_plans[plan_key] = plan
+        return plan
 
     def project_gather(
         self,
@@ -599,7 +698,11 @@ class _ShardedKVGatherProjections(_OProjReduceScatter):
                 if self.zigzag_bands > 1
                 else own_rows(self._positions, rank, self._tp)
             )
-        extra_kw = {"zigzag_bands": self.zigzag_bands} if self.zigzag_bands > 1 else {}
+        extra_kw: dict[str, Any] = {
+            "owned_k_resolver": self._resolve_owned_k_plan,
+        }
+        if self.zigzag_bands > 1:
+            extra_kw["zigzag_bands"] = self.zigzag_bands
         return _GatherProjections.project_gather(
             mla,
             x,

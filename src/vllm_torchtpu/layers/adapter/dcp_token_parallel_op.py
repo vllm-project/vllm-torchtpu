@@ -51,7 +51,11 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     KVLayout,
+    kv_cache_append,
     streamindex_topk,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    kv_cache_utils as idx_kv_cache_utils,
 )
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
@@ -1476,6 +1480,8 @@ def build_attention_op(
             )
 
     qc_head_shift_op = None
+    gather_owned_k_op = None
+    indexer_owned_rows_op = None
     if q_replicated and oproj_sharded_kv_op is not None and rank_tensor is not None:
         split_rows = layout.split_rows
 
@@ -1520,6 +1526,151 @@ def build_attention_op(
             "dcp_qc_head_shift",
             (id(mesh), dcp, split_rows, layout.zigzag_bands),
             _build_qc_head_shift_op,
+        )
+
+        def _gather_owned_k(k_local: jax.Array, raw_own: jax.Array) -> jax.Array:
+            return jax.shard_map(
+                lambda kl, ro: jnp.take(
+                    lax.all_gather(kl, DCP_AXIS_NAME, axis=0, tiled=True),
+                    ro,
+                    axis=0,
+                ),
+                mesh=mesh,
+                in_specs=(sharded, sharded),
+                out_specs=sharded,
+                check_vma=False,
+            )(k_local, raw_own)
+
+        def _fake_gather_owned_k(
+            k_local: torch.Tensor, raw_own: torch.Tensor
+        ) -> torch.Tensor:
+            return k_local.new_empty((raw_own.shape[0], k_local.shape[1]))
+
+        def _build_gather_owned_k_op(op_name: str):
+            built = pcp_streaming_jax_op(
+                op_name,
+                _gather_owned_k,
+                donate_argnums=(),
+                mesh=mesh,
+                input_partition_specs=(sharded, sharded),
+                output_partition_specs=sharded,
+            )
+            built.register_fake(_fake_gather_owned_k)
+            return built, layers
+
+        gather_owned_k_op, _ = get_shared_jax_op(
+            "dcp_gather_owned_k",
+            (id(mesh), dcp),
+            _build_gather_owned_k_op,
+        )
+
+        def _indexer_owned_rows(
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            tok_probe: jax.Array,
+            rk: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            num_tokens = int(tok_probe.shape[0])
+            zb = layout.effective_zigzag_bands(num_tokens)
+            live_pages = next(
+                (
+                    int(kc.kv_cache.shape[0])
+                    for ref in layers
+                    if (ly := ref()) is not None
+                    and (kc := getattr(ly, "indexer_k_cache", None)) is not None
+                    and kc.kv_cache.numel() > 0
+                ),
+                0,
+            )
+            eff_pages = live_pages if live_pages > 0 else (2**29 // max(dcp, 1))
+
+            def _per_rank(
+                sl: jax.Array,
+                pi: jax.Array,
+                cql: jax.Array,
+                probe: jax.Array,
+                r_arr: jax.Array,
+            ) -> tuple[jax.Array, jax.Array]:
+                # Avoid del probe: jax.export prunes unused inputs from @main,
+                # causing fx_to_mlir func.call arity mismatch (expected 4, got 5).
+                r_live, _ = lax.optimization_barrier((r_arr, probe))
+                page, slot = idx_kv_cache_utils.get_dcp_page_and_slot(
+                    num_tokens,
+                    sl,
+                    pi,
+                    cql,
+                    r_live[0],
+                    page_size=layout.page_size,
+                    num_pages=eff_pages,
+                    dcp_size=dcp,
+                    interleave_size=layout.interleave_size,
+                )
+                dst_rows = idx_kv_cache_utils.get_dst_rows(page, slot, layout.page_size)
+                own_idx, _ = kv_cache_append.compact_owned_row_indices(
+                    dst_rows,
+                    num_seqs=sl.shape[0],
+                    dcp_size=dcp,
+                    interleave_size=layout.interleave_size,
+                )
+                raw_own = kv_cache_append.zigzag_to_rank_major_idx(
+                    own_idx,
+                    num_tokens=num_tokens,
+                    dcp_size=dcp,
+                    zigzag_bands=zb,
+                )
+                return own_idx, raw_own
+
+            return jax.shard_map(
+                _per_rank,
+                mesh=mesh,
+                in_specs=(rep, rep, rep, sharded, sharded),
+                out_specs=(sharded, sharded),
+                check_vma=False,
+            )(seq_lens, page_indices, cu_q_lens, tok_probe, rk)
+
+        def _fake_indexer_owned_rows(
+            seq_lens: torch.Tensor,
+            page_indices: torch.Tensor,
+            cu_q_lens: torch.Tensor,
+            tok_probe: torch.Tensor,
+            rk: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del page_indices, cu_q_lens, rk
+            # Avoid int(tok_probe.shape[0]): tok_probe.shape[0] is symbolic under
+            # AOT dynamic tracing and casting to int specializes input_ids/positions.
+            cap = kv_cache_append.owned_rows_bound_from_local(
+                tok_probe.shape[0],
+                num_seqs=seq_lens.shape[0],
+                interleave_size=layout.interleave_size,
+            )
+            return (
+                seq_lens.new_empty((cap,), dtype=torch.int32),
+                seq_lens.new_empty((cap,), dtype=torch.int32),
+            )
+
+        def _build_indexer_owned_rows_op(op_name: str):
+            built = pcp_streaming_jax_op(
+                op_name,
+                _indexer_owned_rows,
+                donate_argnums=(),
+                mesh=mesh,
+                input_partition_specs=(rep, rep, rep, sharded, sharded),
+                output_partition_specs=(sharded, sharded),
+            )
+            built.register_fake(_fake_indexer_owned_rows)
+            return built, layers
+
+        indexer_owned_rows_op, _ = get_shared_jax_op(
+            "dcp_indexer_owned_rows",
+            (
+                id(mesh),
+                dcp,
+                layout.page_size,
+                layout.interleave_size,
+                layout.zigzag_bands,
+            ),
+            _build_indexer_owned_rows_op,
         )
 
     def run(
@@ -1606,6 +1757,8 @@ def build_attention_op(
     run.serves_oproj = oproj_op is not None  # type: ignore[attr-defined]
     run.serves_sharded_kv = oproj_sharded_kv_op is not None  # type: ignore[attr-defined]
     run.qc_head_shift_op = qc_head_shift_op  # type: ignore[attr-defined]
+    run.gather_owned_k_op = gather_owned_k_op  # type: ignore[attr-defined]
+    run.indexer_owned_rows_op = indexer_owned_rows_op  # type: ignore[attr-defined]
     # This rank's DCP index as data, for `q_rows` (built here, outside Dynamo).
     from vllm_torchtpu.distributed.dcp import dcp_rank_operand
 
@@ -1859,8 +2012,9 @@ def build_indexer_op(
     ) -> tuple[jax.Array, jax.Array]:
         if after is not None:
             (cache_kv,) = _after_reads(cache_kv, after=after)
+        k_for_mode = k_packed[: k_packed.shape[0] // dcp] if k_sharded else k_packed
         writer, kv_layout = mla_op._resolve_indexer_kv_cache_mode(
-            cache_kv, k_packed, mode=kv_cache_mode
+            cache_kv, k_for_mode, mode=kv_cache_mode
         )
         if kv_layout != KVLayout.SEQ_ALONG_LANE:
             raise NotImplementedError(
@@ -1872,11 +2026,16 @@ def build_indexer_op(
                 f"index-K page {cache_kv.shape[-1]} != block size "
                 f"{layout.page_size} the token-parallel layout was built for"
             )
-        idx_zigzag_kw = (
-            {"zigzag_bands": layout.effective_zigzag_bands(k_packed.shape[0])}
-            if k_sharded and layout.effective_zigzag_bands(k_packed.shape[0]) > 1
-            else {}
-        )
+        idx_scatter_kw: dict[str, Any] = {}
+        if k_sharded:
+            step_tok = (
+                int(q_bytes.shape[0] - dcp * layout.split_rows)
+                if q_own_rows
+                else int(k_packed.shape[0])
+            )
+            idx_scatter_kw["step_tokens"] = step_tok
+            if layout.effective_zigzag_bands(step_tok) > 1:
+                idx_scatter_kw["zigzag_bands"] = layout.effective_zigzag_bands(step_tok)
         cache_kv = mla_op._cp_scatter_indexer_k(
             cache_kv,
             k_packed,
@@ -1892,7 +2051,7 @@ def build_indexer_op(
             rank_ids=rank_ids,
             compact=k_write_compact,
             k_sharded=k_sharded,
-            **idx_zigzag_kw,
+            **idx_scatter_kw,
         )
         q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
 

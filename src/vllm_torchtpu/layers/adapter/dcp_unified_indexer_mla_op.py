@@ -231,8 +231,9 @@ def build_unified_indexer_attention_op(
         if nope_spec.layout is not rope_spec.layout:
             raise ValueError("sparse MLA needs matching NoPE and RoPE layouts")
 
+        k_for_mode = k_packed[: k_packed.shape[0] // dcp] if k_sharded else k_packed
         writer, kv_layout = callbacks.resolve_kv_cache_mode(
-            index_cache, k_packed, mode=kv_cache_mode
+            index_cache, k_for_mode, mode=kv_cache_mode
         )
         if kv_layout != KVLayout.SEQ_ALONG_LANE:
             raise NotImplementedError(
@@ -245,11 +246,12 @@ def build_unified_indexer_attention_op(
                 f"{layout.page_size} the token-parallel layout was built for"
             )
 
-        idx_zigzag_kw = (
-            {"zigzag_bands": layout.effective_zigzag_bands(k_packed.shape[0])}
-            if k_sharded and layout.effective_zigzag_bands(k_packed.shape[0]) > 1
-            else {}
-        )
+        step_tok = int(kv_c_normed.shape[0])
+        idx_scatter_kw: dict[str, Any] = {}
+        if k_sharded:
+            idx_scatter_kw["step_tokens"] = step_tok
+            if layout.effective_zigzag_bands(step_tok) > 1:
+                idx_scatter_kw["zigzag_bands"] = layout.effective_zigzag_bands(step_tok)
         index_cache = callbacks.scatter_indexer_k(
             index_cache,
             k_packed,
@@ -265,7 +267,7 @@ def build_unified_indexer_attention_op(
             rank_ids=rank_ids,
             compact=k_write_compact,
             k_sharded=k_sharded,
-            **idx_zigzag_kw,
+            **idx_scatter_kw,
         )
 
         def _write_kv_once(nope, rope, kv_c, k_pe_in, sl, bt, qsl, rk):

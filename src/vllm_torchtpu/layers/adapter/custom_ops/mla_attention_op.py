@@ -535,6 +535,7 @@ def _cp_scatter_indexer_k(
     rank_ids: jax.Array | None = None,
     compact: bool = False,
     k_sharded: bool = False,
+    step_tokens: int | None = None,
     zigzag_bands: int = 1,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
@@ -562,12 +563,30 @@ def _cp_scatter_indexer_k(
         raise ValueError(
             f"writer='xla' only supports HEAD_ALONG_SUBLANE, got {kv_layout}."
         )
-    if k_sharded and writer != "pallas":
+    if (
+        k_sharded
+        and writer != "pallas"
+        and (step_tokens is None or k_packed.shape[0] == step_tokens)
+    ):
         raise ValueError(f"k_sharded requires writer='pallas', got {writer!r}.")
 
     def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens, *rank_arg):
         rank = rank_arg[0][0] if rank_arg else cp_rank_as_data(axis_name, cp_size)
         if k_sharded:
+            if step_tokens is not None and k_packed.shape[0] * cp_size != step_tokens:
+                return kv_cache_append.coalesced_owned_kv_append_dcp(
+                    cache_kv,
+                    k_packed,
+                    seq_lens,
+                    page_indices,
+                    cu_q_lens,
+                    rank,
+                    num_tokens=step_tokens,
+                    dcp_size=cp_size,
+                    interleave_size=interleave_size,
+                    kv_layout=kv_layout,
+                    writer=writer,
+                )
             return kv_cache_append.sharded_kv_append_dcp(
                 cache_kv,
                 k_packed,
@@ -1348,7 +1367,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         num_rows = hidden_states.shape[0]
         topk_op_tp = getattr(self, "topk_op_tp", None)
         step_tokens = (
-            k.shape[0] * topk_op_tp.layout.dcp_size
+            hidden_states.shape[0] * topk_op_tp.layout.dcp_size
             if (k_sharded and topk_op_tp is not None)
             else hidden_states.shape[0]
         )
@@ -1432,6 +1451,20 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             isinstance(metadata, AttentionMetadata)
             and self.k_cache.kv_cache.numel() > 0
         )
+
+    def live_cache_step_metadata(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return None
+        metadata = attn_metadata.get(self.k_cache.prefix)
+        if (
+            not isinstance(metadata, AttentionMetadata)
+            or self.k_cache.kv_cache.numel() == 0
+        ):
+            return None
+        return metadata.seq_lens, metadata.block_tables, metadata.query_start_loc
 
     def prepare_unified_inputs(
         self,
@@ -2278,6 +2311,7 @@ class VllmTPUMLAAttention(MLAAttention):
                     and indexer_op is not None
                     and getattr(indexer_op, "topk_op_tp", None) is not None
                 ):
+                    self.indexer_k_cache = indexer_op.k_cache
                     indexer_op.topk_op_tp = dcp_token_parallel_op.build_indexer_op(
                         indexer_op,
                         self.token_parallel_layout,
@@ -3135,6 +3169,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                             and (
                                 not kv_sharded
                                 or getattr(unified_qb_op, "serves_sharded_kv", False)
+                            )
+                            and (
+                                not isinstance(pre_kw, tuple)
+                                or getattr(unified_qb_op, "serves_sharded_k", False)
                             )
                             and sp_o_proj_ready
                             and self.indexer.indexer_op.has_live_unified_cache()
