@@ -917,6 +917,57 @@ class TpuPlatform(Platform):
             and "DeepseekV4ForCausalLM" in vllm_config.model_config.architectures
         ):
             supported = ["BLHNC"]
+        # Per-token FP4 (--kv-cache-dtype nvfp4) only supports the batched RPA kernel's
+        # SEQ_ALONG_LANE layout (vLLM's HND / LBHNC) implements. Pin the layout here so
+        # users do not also have to set VLLM_KV_CACHE_LAYOUT=HND, and fail early for
+        # unsupported setups.
+        if vllm_config.cache_config.cache_dtype == "nvfp4":
+            if backend is not PallasBatchedRPAAttentionBackend:
+                raise NotImplementedError(
+                    "--kv-cache-dtype nvfp4 (per-token FP4 KV cache) is only "
+                    "implemented by the batched RPA kernel. Add "
+                    "--attention-backend CUSTOM."
+                )
+            if (
+                vllm_config.model_config is not None
+                and vllm_config.model_config.get_head_size() == 64
+            ):
+                raise NotImplementedError(
+                    "--kv-cache-dtype nvfp4 needs the batched RPA kernel, which "
+                    "has no head_dim==64 variant. Use --kv-cache-dtype fp8 or "
+                    "auto for this model."
+                )
+            # Spec decode is not currently supported because the draft model's attention
+            # layers can have the same KV pool but with a different head_dim. However,
+            # because the head_dim of the existing model KV entries is not the exact
+            # head_dim, but rather, a packed and padded version, and so it's impossible
+            # to retrieve the original head_dim to know how much to pad the draft
+            # output. So, we fail closed until the pool's logical head width is passed
+            # down explicitly.
+            # TODO: support speculative decoding with nvfp4.
+            if vllm_config.speculative_config is not None:
+                raise NotImplementedError(
+                    "--kv-cache-dtype nvfp4 does not support speculative "
+                    "decoding yet. Remove --speculative-config or use "
+                    "--kv-cache-dtype fp8 or auto."
+                )
+            # The unified KV pool stores hybrid models' GDN
+            # state in rows exactly one attention token wide and needs that
+            # width in whole 512-byte granules (gdn_pool_layout.GRANULE_BYTES).
+            # A per-token FP4 row is head_dim / 2 plus the scale bytes, padded
+            # (320 bytes for Qwen3.5 at TP=8), so it does not fit. The
+            # compact-mamba layout keeps GDN state out of the attention pages.
+            if (
+                vllm_config.model_config is not None
+                and vllm_config.model_config.is_hybrid
+                and unified_kv_layout_enabled(vllm_config)
+            ):
+                raise NotImplementedError(
+                    "--kv-cache-dtype nvfp4 does not fit the unified KV pool of "
+                    "hybrid models. Set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0 and "
+                    "pass --no-enable-prefix-caching --block-size 256."
+                )
+            supported = [VllmKVCacheLayout.LBHNC.name]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
         # The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND.
         if (
@@ -1444,7 +1495,9 @@ class TpuPlatform(Platform):
     def is_kv_cache_dtype_supported(
         cls, kv_cache_dtype: str, _model_config: ModelConfig
     ) -> bool:
-        supported = {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
+        # "nvfp4" is the per-token FP4 KV cache of the batched
+        # RPA (CUSTOM) backend; check_and_update_config rejects other backends.
+        supported = {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2", "nvfp4"}
         return kv_cache_dtype in supported
 
     @classmethod
