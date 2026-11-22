@@ -151,10 +151,7 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> None:
-        if (
-            cache_config is not None
-            and cache_config.cache_dtype == "int4_per_token_head"
-        ):
+        if cache_config is not None and cache_config.cache_dtype == "int4_per_token_head":
             # Only the target's MSA caches are 4-bit; the draft's KV stays fp8.
             cache_config = copy.copy(cache_config)
             cache_config.cache_dtype = "fp8"

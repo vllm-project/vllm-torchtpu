@@ -286,6 +286,11 @@ def armed_for(ranks) -> _Armed | None:
     return armed
 
 
+# Bytes one rank sends through `all_gather_small`: the gathered tensor sits in
+# VMEM (n x this).
+_SMALL_GATHER_MAX_BYTES = 256 << 10
+
+
 def all_gather_small(ranks, x: torch.Tensor) -> torch.Tensor | None:
     """The armed Pallas all-gather (rows, rank order) of a small 32-bit x
     over the group of `ranks`, or None when it is not armed for this group or
@@ -297,33 +302,29 @@ def all_gather_small(ranks, x: torch.Tensor) -> torch.Tensor | None:
     # gathers.
     if not armed.rank_ordered:
         return None
-    # A static per-tensor test (dtype, not size): a size cutoff would give the
-    # bucket traces different graphs (see `all_reduce`). The kernel holds the
-    # gathered tensor in VMEM: row scales of any bucket are <= 8 x 4 B x 8192.
-    if kernel.gather_view(x.numel(), x.element_size()) is None:
+    # The kernel holds the gathered tensor (n x x) in VMEM.
+    if (
+        kernel.gather_view(x.numel(), x.element_size()) is None
+        or x.numel() * x.element_size() > _SMALL_GATHER_MAX_BYTES
+    ):
         return None
     return armed.gather_op(x.contiguous(), armed.rank)
-
-
-# Bytes one rank sends through `tp_all_gather`'s Pallas call: the gathered
-# tensor sits in VMEM (n x this).
-_SMALL_GATHER_MAX_BYTES = 256 << 10
 
 
 def tp_all_gather(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
     """`tensor_model_parallel_all_gather(x, dim)`, by the armed Pallas
     all-gather (`all_gather_small`, `TPU_TP_PALLAS_SMALL_ALL_GATHER`) when x
     is a small 32- or 16-bit tensor (16-bit pairs of the last dim as words),
-    else vLLM's. The same concatenation in rank order."""
+    else vLLM's. The same concatenation in rank order. The size test picks
+    the path per traced shape: call it from programs compiled per bucket
+    (dynamic=False), not from the backbone's shared trace (shape_variants)."""
     from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
 
     gathered = None
     words = x
     if x.element_size() == 2 and x.shape[-1] % 2 == 0:
         words = x.contiguous().view(torch.int32)
-    if words.element_size() == 4 and x.numel() * x.element_size() <= (
-        _SMALL_GATHER_MAX_BYTES
-    ):
+    if words.element_size() == 4:
         gathered = all_gather_small(get_tp_group().ranks, words)
     if gathered is None:
         return tensor_model_parallel_all_gather(x, dim)
