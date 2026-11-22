@@ -137,6 +137,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER: int = 2
     MOE_FUSED_EP_PUSH_ONEHOT_SCALE_SLAB: bool = True
     MOE_FUSED_EP_PUSH_PAIR_KERNEL: bool = True
+    MOE_FUSED_EP_PUSH_WIDE_PAIR_KERNEL: bool = True
     MOE_FUSED_EP_PUSH_DECODE_COMBINE: bool = True
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
@@ -1112,6 +1113,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # from one kernel over the exchanged payload instead of ~30 XLA ops.
     "MOE_FUSED_EP_PUSH_PAIR_KERNEL": env_bool(
         "MOE_FUSED_EP_PUSH_PAIR_KERNEL", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with EXCHANGE_TABLES and KERNEL_PLAN_TABLES:
+    # a prefill-sized step's per-pair plan tables and local expert sort come
+    # from two kernels instead of ~60 XLA ops and an argsort.
+    "MOE_FUSED_EP_PUSH_WIDE_PAIR_KERNEL": env_bool(
+        "MOE_FUSED_EP_PUSH_WIDE_PAIR_KERNEL", default=True
     ),
     # MOE_FUSED_EP_KERNEL_IMPL=push: a step of at most 64 tokens a shard combines
     # its arrivals with the one-pass decode kernel instead of XLA's epilogue.

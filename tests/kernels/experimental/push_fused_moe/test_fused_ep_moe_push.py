@@ -840,3 +840,68 @@ def test_served_dims_split_exchange_is_bit_exact(shape):
     for want, got in zip(*outs):
         assert np.isfinite(got.astype(np.float32)).all()
         np.testing.assert_array_equal(got.view(np.uint16), want.view(np.uint16))
+
+
+def test_served_dims_wide_pair_kernel_is_bit_exact():
+    """The mixed step's per-pair tables and local sort from the two wide pair
+    kernels change no arithmetic: at the served 48-slot layer with 1024 rows a
+    shard, a few hot experts and padded rows routed nowhere, routed and
+    shared outputs match the XLA tables' bit for bit."""
+    g_local, rows, topk = 48, 1024, 6
+    mesh = _mesh()
+    e_total = EP * g_local
+    weights = _served_fp4_weights(mesh, 101, e_total=e_total)
+    x, gating = _inputs(
+        mesh, 102, hidden=SERVED_HIDDEN, e_logical=e_total, tokens=EP * rows
+    )
+    rng = np.random.default_rng(103)
+    pad = np.zeros((EP * rows, 1), bool)
+    pad[rng.random(EP * rows) < 0.05] = True
+    gating = jnp.where(jnp.asarray(pad), -jnp.inf, gating)
+    bias = np.zeros(e_total, np.float32)
+    bias[rng.choice(e_total, EP, replace=False)] = 3.0
+    shared = _shared_expert_weights(mesh, 104)
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        score_bias=jax.device_put(bias, NamedSharding(mesh, P())),
+        routed_scaling_factor=1.5,
+        act_fn="silu_and_mul_with_clamp",
+        logical_intermediate_size=SERVED_LOGICAL_INTER,
+        sc_prepush=2,
+        tc_exchange=True,
+        exchange_row_gather=True,
+        table_kernel=True,
+        exchange_tables=True,
+        kernel_plan_tables=True,
+        light_prepush=2,
+        single_barrier=True,
+        split_exchange=True,
+        early_scale_scatter=2,
+        pair_kernel=True,
+        shared_expert=shared,
+        shared_limit=10.0,
+    )
+
+    # The weights are operands, not constants captured by the trace.
+    def layer(x, gating, weights, wide):
+        return fused_ep_moe_push(x, *weights, gating, wide_pair_kernel=wide, **common)
+
+    outs = [
+        [
+            np.asarray(o)
+            for o in jax.jit(layer, static_argnums=3, compiler_options=_AS_SERVED)(
+                x, gating, weights, wide
+            )
+        ]
+        for wide in (False, True)
+    ]
+    for want, got in zip(*outs):
+        assert np.isfinite(got.astype(np.float32)).all()
+        np.testing.assert_array_equal(got.view(np.uint16), want.view(np.uint16))

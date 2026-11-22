@@ -623,3 +623,147 @@ def test_relane_counts_matches_the_reshape(count_at):
     want = words[:, count_at : count_at + ep * g].reshape(ep, ep, g)
     np.testing.assert_array_equal(np.asarray(got)[:, :, :g], want)
     np.testing.assert_array_equal(np.asarray(got)[:, :, g:], 0)
+
+
+# Prefill-sized steps: the served mixed step (t_local 1024), a step whose
+# routing block is one 128-pair chunk, and an unaligned expert count.
+WIDE_GEOMETRIES = [
+    pytest.param(8, 1024, 48, 6, 256, id="ep8_t1024_g48"),
+    pytest.param(8, 512, 48, 4, 128, id="ep8_t512_g48_topk4_block128"),
+    pytest.param(4, 128, 50, 8, 256, id="ep4_t128_g50_topk8"),
+]
+WIDE_MODES = ["uniform", "skewed", "one_expert", "mostly_nowhere"]
+
+
+def _wide_routing(ep, t_local, g_local, topk, block, mode, seed):
+    """_routing's ids and kwargs (with routing block `block`), plus
+    degenerate routings: every pair on one expert, or most rows routed
+    nowhere."""
+    idx, kw = _routing(ep, t_local, g_local, topk, skew=mode == "skewed", seed=seed)
+    kw["block"] = block
+    rng = np.random.default_rng(seed + 1)
+    if mode == "one_expert":
+        idx[:] = rng.integers(0, kw["e_total"])
+        idx[rng.random(idx.shape[0]) < 0.05] = kw["e_total"]
+    elif mode == "mostly_nowhere":
+        idx[rng.random(idx.shape[0]) < 0.8] = kw["e_total"]
+    return idx, kw
+
+
+@pytest.mark.parametrize("ep,t_local,g_local,topk,block", WIDE_GEOMETRIES)
+@pytest.mark.parametrize("mode", WIDE_MODES)
+def test_local_ranks_kernel_matches_the_local_sort(
+    ep, t_local, g_local, topk, block, mode
+):
+    """plan_kernel.build_local_ranks (interpret mode): its counts are
+    pair_block_hist's, its segment starts and row map give exactly
+    local_sort_tokens' (tok, seg_start), rows routed nowhere included, and
+    the argsort path's tokens when every pair is on one expert."""
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
+        build_local_ranks,
+        wide_pair_tables_apply,
+    )
+
+    idx, kw = _wide_routing(
+        ep, t_local, g_local, topk, block, mode, seed=t_local + topk
+    )
+    e_total = kw["e_total"]
+    assert wide_pair_tables_apply(t_local, topk, block)
+    n = t_local * topk
+    for me in (0, ep - 1):
+        local = jnp.asarray(idx[me * t_local : (me + 1) * t_local].reshape(-1))
+        want_counts = host.pair_block_hist(local.reshape(-1, block), e_total).sum(0)
+        want_tok, want_seg = push_host.local_sort_tokens(
+            local, want_counts, e_total=e_total, topk=topk
+        )
+        if mode == "one_expert":
+            # A token selecting one expert topk times breaks the count path's
+            # premise (top-k ids are distinct); the argsort path takes it.
+            want_tok = push_host._sorted_tokens_by_argsort(
+                local, jnp.cumsum(want_counts), t_local=t_local, topk=topk
+            )
+        counts, seg, row_map, words = build_local_ranks(
+            local, e_total=e_total, topk=topk, block=block, interpret=True
+        )
+        np.testing.assert_array_equal(np.asarray(counts), np.asarray(want_counts))
+        np.testing.assert_array_equal(np.asarray(seg), np.asarray(want_seg))
+        np.testing.assert_array_equal(np.asarray(words) & 0xFFFF, np.asarray(local))
+        row_map = np.asarray(row_map)
+        dest, src = row_map & 0xFFFF, row_map >> 16
+        np.testing.assert_array_equal(np.sort(dest), np.arange(n))
+        tok = np.empty(n, np.int32)
+        tok[dest] = src
+        np.testing.assert_array_equal(tok, np.asarray(want_tok))
+
+
+@pytest.mark.parametrize("ep,t_local,g_local,topk,block", WIDE_GEOMETRIES)
+@pytest.mark.parametrize("mode", WIDE_MODES)
+def test_pair_rows_kernel_matches_the_xla_plan(ep, t_local, g_local, topk, block, mode):
+    """plan_kernel.build_pair_rows (interpret mode), fed a payload carrying
+    every source's build_local_ranks words and the table kernel's plan
+    tables, gives routing_pairs_from_tables' pos, mirror_pos and slab_row
+    exactly, rows routed nowhere included."""
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.layer import (
+        _exchange_layout,
+        _pack_routing_exchange,
+    )
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
+        build_local_ranks,
+        build_pair_rows,
+        build_push_tables,
+    )
+
+    idx, kw = _wide_routing(ep, t_local, g_local, topk, block, mode, seed=3 * t_local)
+    e_total = kw["e_total"]
+    layout = _exchange_layout(t_local, topk, e_total, True)
+    blocks = idx.reshape(ep, -1)
+    bits = jnp.zeros((t_local,), jnp.int32)
+    payload = []
+    for s in range(ep):
+        counts, _, _, words = build_local_ranks(
+            jnp.asarray(blocks[s]), e_total=e_total, topk=topk, block=block,
+            interpret=True,
+        )  # fmt: skip
+        payload.append(_pack_routing_exchange(words, bits, counts, layout))
+    rows = -(-layout[2] // 1024) * 8
+    out = jnp.pad(jnp.stack(payload), ((0, 0), (0, rows * 128 - layout[2])))
+    out = out.reshape(ep, rows, 128)
+    counts = _counts(idx, ep, t_local, e_total)
+    for me in (0, ep - 1):
+        gathered = _gathered(idx, me, kw)
+        seg_start = jnp.asarray(np.cumsum(counts[me]) - counts[me])
+        tables = build_push_tables(
+            gathered.rows_by_dest, seg_start, jnp.int32(me), ep=ep, n_pre=2,
+            tile_m=kw["tile_m"], interpret=True,
+        )[8]  # fmt: skip
+        want = push_host.routing_pairs_from_tables(
+            jnp.int32(me),
+            gathered,
+            *tables,
+            e_total=e_total,
+            ep=ep,
+            t_local=t_local,
+            block=block,
+            shard_stride=kw["shard_stride"],
+        )
+        got = build_pair_rows(
+            out, *tables, jnp.int32(me), ep=ep, t_local=t_local, topk=topk,
+            e_total=e_total, shard_stride=kw["shard_stride"], interpret=True,
+        )  # fmt: skip
+        for g_arr, w_arr in zip(got, want):
+            np.testing.assert_array_equal(np.asarray(g_arr), np.asarray(w_arr))
+
+
+def test_wide_pair_tables_admit_only_their_sizes():
+    """The wide kernels take prefill-sized steps whose sorted rows, ranks and
+    source tokens fit their 16-bit word fields; others keep the XLA path."""
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
+        WIDE_PAIRS_MAX,
+        wide_pair_tables_apply,
+    )
+
+    assert wide_pair_tables_apply(1024, 6, 256)
+    assert not wide_pair_tables_apply(16, 6, 32)  # decode: build_pair_tables
+    assert not wide_pair_tables_apply(288, 6, 64)  # not whole [8, 128] tiles
+    assert not wide_pair_tables_apply(16384, 6, 256)  # rows overflow 16 bits
+    assert WIDE_PAIRS_MAX < 1 << 15

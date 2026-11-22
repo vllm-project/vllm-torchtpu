@@ -60,9 +60,12 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
 from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
     build_exchange_rows_tables,
     build_exchange_rows_tables_split,
+    build_local_ranks,
+    build_pair_rows,
     build_pair_tables,
     build_push_tables,
     pair_tables_apply,
+    wide_pair_tables_apply,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.routing import prepare_routing
 from vllm_torchtpu.kernels.experimental.push_fused_moe.sc_dispatch import (
@@ -352,6 +355,7 @@ def fused_ep_moe_push(
     split_exchange=False,
     onehot_scale_slab=False,
     pair_kernel=False,
+    wide_pair_kernel=False,
     decode_combine=True,
     expert_slot=None,
     expert_load=None,
@@ -404,12 +408,15 @@ def fused_ep_moe_push(
     (`_scale_slab_onehot`) instead of a SparseCore scatter, and with
     `exchange_tables` and `kernel_plan_tables` `pair_kernel` builds such a
     step's per-pair tables and scale slab in one kernel from the exchanged
-    payload (plan_kernel.build_pair_tables), and `decode_combine` combines a
-    step of at most kernel.COMBINE_TOKENS tokens a shard with the one-pass
-    decode kernel instead of v2's XLA epilogue (on by default here, unlike
-    the other two: it was the only combine at those sizes before the knob
-    existed). The
-    caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
+    payload (plan_kernel.build_pair_tables), and `wide_pair_kernel` builds a
+    larger step's per-pair tables (plan_kernel.build_pair_rows) and its local
+    sort (plan_kernel.build_local_ranks, the exchange kernel copying rows by
+    its row map) in two kernels instead of ~60 XLA ops and an argsort, and
+    `decode_combine` combines a step of at most kernel.COMBINE_TOKENS tokens a
+    shard with the one-pass decode kernel instead of v2's XLA epilogue (on by
+    default here, unlike the others: it was the only combine at those
+    sizes before the knob existed). The caller
+    (layers/adapter/fused_moe_ep.py) reads all of them from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -531,6 +538,12 @@ def fused_ep_moe_push(
         ragged_stride = stride_bound
     if block is None:
         block = routing_block(t_local, topk)
+    wide_pairs = bool(
+        wide_pair_kernel
+        and exchange_tables
+        and kernel_plan_tables
+        and wide_pair_tables_apply(t_local, topk, block)
+    )
     if ragged_stride % capacity != 0 or ragged_stride < stride_bound:
         raise ValueError(
             f"ragged_stride {ragged_stride} must be a multiple of capacity "
@@ -727,7 +740,18 @@ def fused_ep_moe_push(
         local_blocks = topk_idx.astype(jnp.int32).reshape(
             t_local * topk // block, block
         )
-        block_hist = pair_block_hist(local_blocks, e_total)
+        pairs = local_blocks.reshape(-1)
+        if wide_pairs:
+            # (counts, seg_start, row map, payload words); the payload carries
+            # each pair's rank with its expert, for build_pair_rows.
+            local_ranks = build_local_ranks(
+                pairs, e_total=e_total, topk=topk, block=block
+            )
+            block_hist, counts, pairs = None, local_ranks[0], local_ranks[3]
+        else:
+            local_ranks = None
+            block_hist = pair_block_hist(local_blocks, e_total)
+            counts = block_hist.sum(axis=0)
         scale_bits_l = (
             None
             if row_scale_l is None
@@ -737,10 +761,8 @@ def fused_ep_moe_push(
                 )
             )
         )
-        packed = _pack_routing_exchange(
-            local_blocks.reshape(-1), scale_bits_l, block_hist.sum(axis=0), layout
-        )
-        return topk_weights, packed, local_blocks, block_hist, row_routes
+        packed = _pack_routing_exchange(pairs, scale_bits_l, counts, layout)
+        return topk_weights, packed, local_blocks, block_hist, row_routes, local_ranks
 
     def compute_local(
         q_sorted,
@@ -899,7 +921,8 @@ def fused_ep_moe_push(
             shard_stride=ragged_stride,
         )
         gathered = None
-        if sharded_plan:
+        # The wide path's payload carries ranked words, not expert ids.
+        if sharded_plan and not wide_pairs:
             gathered = GatheredPairs(
                 expert_blocks=pairs_g.reshape(T * topk // block, block),
                 local_blocks=local_blocks,
@@ -913,7 +936,21 @@ def fused_ep_moe_push(
         routing = None
         pair_slab = None
         scale_rows = act_scale_slab_rows(ragged_stride)
-        if (
+        if wide_pairs:
+            # The per-pair lookups, from the payload's ranked pairs.
+            assert shard_tables is not None
+            pos_k, mirror_k, slab_row = build_pair_rows(
+                exchange_slab,
+                *shard_tables[4],
+                me,
+                ep=ep,
+                t_local=t_local,
+                topk=topk,
+                e_total=e_total,
+                shard_stride=ragged_stride,
+            )
+            pair_tables = (pos_k, mirror_k)
+        elif (
             kernel_plan_tables
             and pair_kernel
             and exchange_slab is not None
@@ -1103,12 +1140,13 @@ def fused_ep_moe_push(
             bias_it,
         ) = unpack_operands(scales_gating_biases)
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
-        topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
-            gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
+        topk_weights, packed, local_blocks, block_hist, row_routes, local_ranks = (
+            select_local(
+                gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
+            )
         )
         pre_tables = None
         exchange_slab = None
-        my_counts = block_hist.sum(axis=0)
         shared_in, shared_fn = x_l, None
         # On its unfused path the shared expert splits around the exchange.
         split_shared = (
@@ -1129,14 +1167,18 @@ def fused_ep_moe_push(
                 )
         if exchange_row_gather:
             # The sorted rows are copied by the exchange kernel itself.
-            with jax.named_scope("moe_early_qsort"):
-                tok, seg_start = local_sort_tokens(
-                    local_blocks.reshape(-1),
-                    my_counts,
-                    e_total=e_total,
-                    topk=topk,
-                    bf16_counts=bf16_sort_counts,
-                )
+            if wide_pairs:
+                # The row map: build_local_ranks' scatter form of `tok`.
+                _, seg_start, tok, _ = local_ranks
+            else:
+                with jax.named_scope("moe_early_qsort"):
+                    tok, seg_start = local_sort_tokens(
+                        local_blocks.reshape(-1),
+                        block_hist.sum(axis=0),
+                        e_total=e_total,
+                        topk=topk,
+                        bf16_counts=bf16_sort_counts,
+                    )
             table_kw = dict(
                 ep=ep,
                 width=layout[-1],
@@ -1147,6 +1189,7 @@ def fused_ep_moe_push(
                 tile_m=capacity,
                 light_prepush=light_prepush,
                 single_barrier=bool(single_barrier),
+                scatter_rows=wide_pairs,
             )
             if split_shared:
                 start, done = build_exchange_rows_tables_split(**table_kw)
@@ -1178,6 +1221,7 @@ def fused_ep_moe_push(
         else:
             # Issue the routing exchange before the local sort, so the sort
             # runs on the TensorCore while the exchange is in flight.
+            my_counts = block_hist.sum(axis=0)
             packed, q_l, local_blocks, my_counts = lax.optimization_barrier(
                 (packed, q_l, local_blocks, my_counts)
             )
@@ -1305,6 +1349,7 @@ def fused_ep_moe_push(
         bool(split_exchange),
         bool(onehot_scale_slab),
         bool(pair_kernel),
+        bool(wide_pair_kernel),
         bool(decode_combine),
     )
     out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
