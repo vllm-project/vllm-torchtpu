@@ -144,15 +144,12 @@ class _BlockedPrefillConfig:
         # stores when every token owns whole (8, 128) tiles of it.
         num_sublanes_bkv = bkv_sz // 128
         strided_score_store = num_sublanes_bkv % 8 == 0
-        # Rows between consecutive tokens of the VMEM score block. The sublanes of
-        # one store must fall in distinct VMEM banks (row mod 32), so with a pitch
-        # of nsub rows, a multiple of 16 for the usual block sizes, every strided
-        # store splits into 2-row pieces (1-row at nsub = 32), and a bundle holding
-        # two stores cannot also pop the MXU. A pitch of 8 mod 16 rows lets each
-        # store cover 4 rows; the padding rows are never copied out.
+        # Avoid multiple-of-8 pitch on strided score stores: padding by +1 gives
+        # an odd row stride so full vector-width stores avoid splitting, cutting
+        # padding from 8 rows down to 1 row per token.
         score_pitch = num_sublanes_bkv
-        if enabled and strided_score_store and score_pitch % 16 == 0:
-            score_pitch += 8
+        if enabled and strided_score_store and score_pitch % 8 == 0:
+            score_pitch += 1
 
         # Reduced-precision head reduction (used for FP8 queries):
         # relu(q @ k) is rounded to bf16 and the weights are held in bf16, so each
