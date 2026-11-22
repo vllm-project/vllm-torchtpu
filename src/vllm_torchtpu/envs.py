@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_QSA_XMERGE: bool = False
     VLLM_TPU_MK_UATTN_LITE: bool = False
     VLLM_TPU_MK_WHOLE_SKIP_IDLE: bool = False
+    VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS: str = ""
     VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_MK_WHOLE_L45: bool = False
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
@@ -1349,6 +1350,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # after the last live request (`skip_idle`, as the MK draft already does), so the idle
     # request slots of a bucket's tile do no work. Live rows are byte-identical.
     "VLLM_TPU_MK_WHOLE_SKIP_IDLE": env_bool("VLLM_TPU_MK_WHOLE_SKIP_IDLE"),
+    # Per row bucket "16,32" or "16;32" (default unset): when set, `skip_idle` only in the
+    # listed buckets (overrides VLLM_TPU_MK_WHOLE_SKIP_IDLE), so NVIS_BALANCE (which needs
+    # skip_idle off) keeps working in the others (exos c32: idle-mix b16 -22, b32 -84 us).
+    "VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS": env_str("VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS", ""),
     # Whole-step megakernel: also run the last QSA layer (model layer 47) in the whole-step
     # call, as a one-layer kernel after layers 3..46, its step tokens written with theirs;
     # the stock L47 attention core and last segment kernel are skipped.

@@ -239,6 +239,12 @@ def log_mk_options(B: int, spec: Any, tiles: Any, label: str = "MK") -> None:
     init_logger(__name__).info(line)
 
 
+def bucket_entries(raw: str | None) -> list[str]:
+    """The non-empty entries of a per-bucket env value ("16,32", "16;32", "16:te;32:te"):
+    ";" also separates entries, since the served recipe's EXTRA_SERVER_ENV splits on ","."""
+    return [x for x in (raw or "").replace(";", ",").split(",") if x]
+
+
 def nvis_balance_options(B: int | None) -> dict:
     """VLLM_TPU_MK_QSA_NVIS_BALANCE_BUCKETS="48,64" or "48;64" (default unset; exact): the `B`-row
     kernel's sharded selection balances whole requests over the runs by visible groups
@@ -247,8 +253,7 @@ def nvis_balance_options(B: int | None) -> dict:
     raw = os.environ.get("VLLM_TPU_MK_QSA_NVIS_BALANCE_BUCKETS", "")
     if not raw or B is None:
         return {}
-    # ";" also separates entries: the served recipe's EXTRA_SERVER_ENV splits on ",".
-    return {"nvis_balance": True} if str(B) in raw.replace(";", ",").split(",") else {}
+    return {"nvis_balance": True} if str(B) in bucket_entries(raw) else {}
 
 
 def thr_fast_options(B: int | None) -> dict:
@@ -260,20 +265,30 @@ def thr_fast_options(B: int | None) -> dict:
     raw = os.environ.get("VLLM_TPU_MK_QSA_THR_FAST_BUCKETS", "")
     if not raw or B is None:
         return {}
-    # ";" also separates entries: the served recipe's EXTRA_SERVER_ENV splits on ",".
-    table = dict(kv.split(":", 1) for kv in raw.replace(";", ",").split(",") if kv)
+    table = dict(kv.split(":", 1) for kv in bucket_entries(raw))
     v = table.get(str(B))
     return {} if v is None else {"thr_fast": v}
 
 
-def main_call_options() -> dict:
+def skip_idle_on(B: int | None) -> bool:
+    """`skip_idle` of the `B`-row main kernel: VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS="16,32" (or
+    "16;32") when set (only the listed buckets; none without a bucket), else
+    VLLM_TPU_MK_WHOLE_SKIP_IDLE."""
+    raw = envs.VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS
+    if not raw:
+        return bool(envs.VLLM_TPU_MK_WHOLE_SKIP_IDLE)
+    return B is not None and str(B) in bucket_entries(raw)
+
+
+def main_call_options(B: int | None = None) -> dict:
     """Main whole-step call only (the draft passes its own `skip_idle`): VLLM_TPU_MK_QSA_XMERGE
-    (one exchange per QSA layer) and VLLM_TPU_MK_WHOLE_SKIP_IDLE (request loops stop after
-    the last live request). Empty when both are off, so the spec is unchanged."""
+    (one exchange per QSA layer) and `skip_idle` (request loops stop after the last live
+    request; VLLM_TPU_MK_WHOLE_SKIP_IDLE or, per bucket, VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS).
+    Empty when both are off, so the spec is unchanged."""
     out: dict = {}
     if envs.VLLM_TPU_MK_QSA_XMERGE:
         out["xmerge"] = True
-    if envs.VLLM_TPU_MK_WHOLE_SKIP_IDLE and LOOP_REQUESTS:
+    if skip_idle_on(B) and LOOP_REQUESTS:
         out["skip_idle"] = True
     return out
 
@@ -496,7 +511,7 @@ def build_wholestep_call(
                 carrier="fp8",
                 n_layers=n_layers,
                 **indexed_options(B),
-                **main_call_options(),
+                **main_call_options(B),
             ),
             hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
         )

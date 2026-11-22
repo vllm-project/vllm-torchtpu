@@ -1594,3 +1594,76 @@ def test_nvis_balance_buckets_env(monkeypatch):
     assert wc.nvis_balance_options(64) == {"nvis_balance": True}
     assert wc.nvis_balance_options(16) == {}
     assert wc.nvis_balance_options(None) == {}
+
+
+def test_bucket_entries_helper(monkeypatch):
+    """`bucket_entries`: "," and ";" separate entries, empties dropped; the three per-bucket
+    envs parse through it unchanged (THR_FAST_BUCKETS values keep their ":")."""
+    from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_call as wc
+
+    assert wc.bucket_entries("16,32") == ["16", "32"]
+    assert wc.bucket_entries("16;32") == ["16", "32"]
+    assert wc.bucket_entries("16:te;32:te,48:t") == ["16:te", "32:te", "48:t"]
+    assert wc.bucket_entries(";16,,32;") == ["16", "32"]
+    assert wc.bucket_entries("") == [] and wc.bucket_entries(None) == []
+    monkeypatch.setenv("VLLM_TPU_MK_QSA_THR_FAST_BUCKETS", "16:te;32:ter2")
+    assert wc.thr_fast_options(16) == {"thr_fast": "te"}
+    assert wc.thr_fast_options(32) == {"thr_fast": "ter2"}
+    assert wc.thr_fast_options(48) == {}
+    monkeypatch.setenv("VLLM_TPU_MK_QSA_NVIS_BALANCE_BUCKETS", "48;64")
+    assert wc.nvis_balance_options(64) == {"nvis_balance": True}
+    assert wc.nvis_balance_options(32) == {}
+
+
+def test_skip_idle_buckets_env(monkeypatch):
+    """VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS: unset -> VLLM_TPU_MK_WHOLE_SKIP_IDLE (global);
+    set -> only the listed buckets ("," or ";"), overriding the global flag."""
+    from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_call as wc
+
+    if not wc.LOOP_REQUESTS:
+        monkeypatch.setattr(wc, "LOOP_REQUESTS", True)
+    monkeypatch.delenv("VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS", raising=False)
+    monkeypatch.delenv("VLLM_TPU_MK_WHOLE_SKIP_IDLE", raising=False)
+    assert not wc.skip_idle_on(16) and "skip_idle" not in wc.main_call_options(16)
+    monkeypatch.setenv("VLLM_TPU_MK_WHOLE_SKIP_IDLE", "1")
+    assert all(wc.skip_idle_on(b) for b in (16, 48, None))
+    assert wc.main_call_options(48)["skip_idle"] is True
+    for raw in ("16,32", "16;32"):
+        monkeypatch.setenv("VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS", raw)
+        assert wc.skip_idle_on(16) and wc.skip_idle_on(32)
+        assert not wc.skip_idle_on(48) and not wc.skip_idle_on(64) and not wc.skip_idle_on(None)
+        assert "skip_idle" not in wc.main_call_options(48)
+        assert wc.main_call_options(32)["skip_idle"] is True
+    monkeypatch.delenv("VLLM_TPU_MK_WHOLE_SKIP_IDLE")
+    assert wc.skip_idle_on(16) and not wc.skip_idle_on(48)
+
+
+def test_skip_idle_buckets_keeps_nvis_balance_bit_identical(monkeypatch):
+    """c32 served form: SKIP_IDLE_BUCKETS="16;32" + NVIS_BALANCE_BUCKETS="48;64" at b48 gives
+    no skip_idle and nvis_balance on, so the kernel (main-call geometry, 4 request slots, R = 2,
+    two requests per run) is byte-identical to skip_idle off + nvis_balance on, and the
+    balanced path is really taken (the block keeps nvis_balance)."""
+    from vllm_torchtpu.megakernel.wholestep import qsa_full_c as qc
+    from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_call as wc
+
+    monkeypatch.setattr(wc, "LOOP_REQUESTS", True)
+    monkeypatch.setenv("VLLM_TPU_MK_WHOLE_SKIP_IDLE", "1")
+    monkeypatch.setenv("VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS", "16;32")
+    monkeypatch.setenv("VLLM_TPU_MK_QSA_NVIS_BALANCE_BUCKETS", "48;64")
+    opts = {**wc.main_call_options(48), **wc.nvis_balance_options(48)}
+    assert opts.get("nvis_balance") and not opts.get("skip_idle"), opts
+    seen = []
+    orig = qc.QSAFullStepBlock._balance_tables
+
+    def spy(self, ctx):  # noqa: ANN001
+        seen.append(self.skip_idle)
+        return orig(self, ctx)
+
+    monkeypatch.setattr(qc.QSAFullStepBlock, "_balance_tables", spy)
+    kw = dict(ctx=[3001, 2000, 777, 0], xmerge=True, req_async=1)
+    run = _main_run(monkeypatch, 16, skip_idle=bool(opts.get("skip_idle")),
+                    nvis_balance=bool(opts.get("nvis_balance")), **kw)
+    assert seen and not any(seen), seen
+    base = _main_run(monkeypatch, 16, skip_idle=False, nvis_balance=True, **kw)
+    assert np.isfinite(base[0]).all()
+    _assert_xreq_identical(base, run)
