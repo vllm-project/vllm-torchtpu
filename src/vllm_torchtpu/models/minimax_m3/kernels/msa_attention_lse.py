@@ -77,10 +77,12 @@ _MASK_BIAS = 1e30
 # each, cost ~12 % of a 4-bit 8-token call (r9 kernel bench j-ecb17102).
 LIMIT_TABLE = True
 _LIMIT_TABLE_MIN_TOKENS = msa_attention.SMALL_BATCH_TOKENS
-# 4-bit calls without the table (decode) compute the same [Bq, W] limits in
-# the kernel, once per group: one compare per selection column against the
+# Calls without the table (decode) compute the same [Bq, W] limits in the
+# kernel, once per group: one compare per selection column against the
 # group's pages instead of a compare and a lane reduction per page (13 % of
 # a c64 decode call, kernel bench j-0a524278), then the same spread matmul.
+# The per-page lane reductions were the critical path of 8-bit decode groups
+# too (AOT pre-delay schedule, 32 pages: 2,649 -> 1,990 cycles).
 KERNEL_LIMITS = True
 # 4-bit tiles of 16+ tokens run `attend_t` with the K / V scales folded into
 # their bf16 rows, as the 8/16-bit caches do.
@@ -563,8 +565,14 @@ def _kernel(
                     (((1,), (0,)), ((), ())),
                     preferred_element_type=jnp.float32,
                 )  # [Bq, W * S]
-                spot = jax.lax.broadcasted_iota(jnp.int32, (1, width * page_size), 1)
-                masks.append((spot % page_size).astype(jnp.float32) < limit)
+                if fp4:
+                    spot = jax.lax.broadcasted_iota(
+                        jnp.int32, (1, width * page_size), 1
+                    )
+                    spot = spot % page_size
+                else:  # each key's slot in the bitcast's row order
+                    spot = jnp.tile(slots, (1, width))
+                masks.append(spot.astype(jnp.float32) < limit)
             for g, kv_ref in enumerate(kv_refs[:width]):
                 if not spreads:
                     page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
@@ -816,11 +824,9 @@ def _attention_call(
         for x in limits
     ]
     page_size = msa_attention.page_tokens(kv_cache)
-    kernel_limits = KERNEL_LIMITS and fp4 and not limited and not transposed
+    kernel_limits = _kernel_limits(kv_cache) and not limited and not transposed
     spread = (
-        [pltpu.VMEM((pages_per_step, pages_per_step * page_size), jnp.bfloat16)]
-        if limited or kernel_limits
-        else []
+        _spread_scratch(pages_per_step, page_size) if limited or kernel_limits else []
     )
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=4,
@@ -914,6 +920,22 @@ def _attention_call(
         *limits,
         *(out if aliased else ()),
     )
+
+
+def _kernel_limits(kv_cache) -> bool:
+    """`KERNEL_LIMITS` for a cache whose `attend` needs no per-page ``seen``
+    (4- and 8-bit; 16-bit pages zero their unseen slots by it) and whose page
+    limits the bf16 spread matmul carries exactly (at most 256 slots)."""
+    return (
+        KERNEL_LIMITS
+        and jnp.dtype(kv_cache.dtype).itemsize == 1
+        and msa_attention.page_tokens(kv_cache) <= 256
+    )
+
+
+def _spread_scratch(pages_per_step, page_size):
+    """`_kernel`'s one-hot that spreads a group's page limits over its slots."""
+    return [pltpu.VMEM((pages_per_step, pages_per_step * page_size), jnp.bfloat16)]
 
 
 def _kernel_scratch(rows, head_dim, pages_per_step, kv_cache, scale_cache, transposed):
@@ -1036,6 +1058,11 @@ def planned_attention(
             scale_cache if fp4 else None,
             transposed=False,
         )
+        + (
+            _spread_scratch(pages_per_step, msa_attention.page_tokens(kv_cache))
+            if _kernel_limits(kv_cache)
+            else []
+        )
         + [
             pltpu.VMEM((num_tokens, topk), jnp.int32),
             pltpu.VMEM((num_tokens, 1), jnp.int32),
@@ -1051,6 +1078,7 @@ def planned_attention(
             sm_scale=sm_scale,
             tiles_per_step=tiles_per_step,
             groups_per_tile=groups_per_tile,
+            kernel_limits=_kernel_limits(kv_cache),
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
