@@ -14,6 +14,8 @@
 """MSA attention work list: the single-tile path equals the general one, and
 `_live_groups` marks exactly the first ``num_groups`` groups."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -22,6 +24,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention as msa
+from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse as lse
 
 
 def _selections(rng, tokens: int, topk: int) -> list[np.ndarray]:
@@ -91,3 +94,46 @@ def test_table16_entries_read_back(length: int) -> None:
         interpret=True,
     )(packed)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(table))
+
+
+# One tile, a step's worth (4), steps of 3 and of 1, and a long call.
+@pytest.mark.parametrize("tiles", [1, 4, 6, 3, 17])
+def test_kernel_group_words_match_xla(tiles: int) -> None:
+    """The kernel's scalar group words (`_tile_group_words`) equal
+    `_packed_work`'s: meta words and counts of the groups in use, and every
+    step start."""
+    block_q, topk, pages_per_step = 8, 16, 16
+    rng = np.random.default_rng(tiles)
+    groups_per_tile = msa._groups_per_tile(block_q, topk, pages_per_step)
+    max_groups = tiles * groups_per_tile
+    for sel in _selections(rng, tiles * block_q, topk):
+        sel = jnp.asarray(sel, jnp.int32)[None]
+        want, tiles_per_step = lse._packed_work(sel, block_q, pages_per_step)
+        row, steps = lse._packed_work(sel, block_q, pages_per_step, in_kernel=True)
+        assert steps == tiles_per_step
+        union_len = max_groups * pages_per_step
+        np.testing.assert_array_equal(row[0, :union_len], want[0, :union_len])
+        num_steps = tiles // tiles_per_step
+
+        kernel = functools.partial(
+            lse._tile_group_words,
+            groups_per_tile=groups_per_tile,
+            pages_per_step=pages_per_step,
+            tiles_per_step=tiles_per_step,
+        )
+        got = pl.pallas_call(
+            kernel,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.SMEM),
+            out_shape=jax.ShapeDtypeStruct(
+                (2 * max_groups + num_steps + 2,), jnp.int32
+            ),
+            interpret=True,
+        )(row[0, union_len:])
+        got, want = np.asarray(got), np.asarray(want[0, union_len:])
+        meta, count = want[:max_groups], want[max_groups : 2 * max_groups]
+        live = np.asarray(msa._live_groups(meta, count))
+        used = int(live.sum())
+        np.testing.assert_array_equal(got[:used], meta[:used])
+        np.testing.assert_array_equal(got[max_groups : max_groups + used], count[:used])
+        np.testing.assert_array_equal(got[2 * max_groups : -1], want[2 * max_groups :])

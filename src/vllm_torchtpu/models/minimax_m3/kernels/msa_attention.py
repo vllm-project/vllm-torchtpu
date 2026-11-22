@@ -449,6 +449,20 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     per-group list (a SparseCore offload of ~65 us per 2,048-token call in
     the c4 prefill twin, j-3c651507).
     """
+    union = _tile_unions(selected, block_q)
+    groups_per_tile = _groups_per_tile(block_q, selected.shape[1], pages_per_step)
+    if union.shape[0] == 1:
+        meta, count = _single_tile_groups(union[0], groups_per_tile, pages_per_step)
+        num_groups = jnp.sum(_live_groups(meta, count), dtype=jnp.int32)
+    else:
+        meta, count, num_groups = _tile_groups(union, groups_per_tile, pages_per_step)
+    pages = _union_slots(union, groups_per_tile, pages_per_step)
+    return pages, meta.astype(jnp.int32), num_groups, count
+
+
+def _tile_unions(selected: jax.Array, block_q: int) -> jax.Array:
+    """Each `block_q`-row tile's distinct pages of ``selected [T, K]``,
+    ascending, `_NO_PAGE` filled: ``[tiles, block_q * K]``."""
     num_tokens, topk = selected.shape
     num_tiles = num_tokens // block_q
     union_size = block_q * topk
@@ -456,21 +470,31 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
         num_tiles, union_size
     )
     if num_tiles * union_size**2 <= _DENSE_WORK_LIST_ELEMS:
-        union = _dense_unions(per_tile)
-    else:
-        union = _sorted_unions(per_tile)
-    groups_per_tile = _groups_per_tile(block_q, topk, pages_per_step)
-    if num_tiles == 1:
-        meta, count = _single_tile_groups(union[0], groups_per_tile, pages_per_step)
-        num_groups = jnp.sum(_live_groups(meta, count), dtype=jnp.int32)
-    else:
-        meta, count, num_groups = _tile_groups(union, groups_per_tile, pages_per_step)
+        return _dense_unions(per_tile)
+    return _sorted_unions(per_tile)
+
+
+def _tile_page_lists(selected: jax.Array, block_q: int, pages_per_step: int):
+    """`_work_list`'s unions without their group words: ``(pages [tiles *
+    groups_per_tile * pages_per_step]`` (tile ``t``'s distinct pages,
+    ascending, from slot ``t * groups_per_tile * pages_per_step``, -1
+    after), ``counts [tiles]`` (its page count)). A kernel derives the
+    group words from the counts (`msa_attention_lse`)."""
+    union = _tile_unions(selected, block_q)
+    groups_per_tile = _groups_per_tile(block_q, selected.shape[1], pages_per_step)
+    counts = jnp.sum(union != _NO_PAGE, axis=1, dtype=jnp.int32)
+    return _union_slots(union, groups_per_tile, pages_per_step), counts
+
+
+def _union_slots(union: jax.Array, groups_per_tile: int, pages_per_step: int):
+    """The tiles' unions as the kernel reads them: tile ``t``'s pages from
+    slot ``t * groups_per_tile * pages_per_step``, -1 after (`_slot`)."""
     union = jnp.pad(
         jnp.where(union == _NO_PAGE, -1, union),
-        ((0, 0), (0, groups_per_tile * pages_per_step - union_size)),
+        ((0, 0), (0, groups_per_tile * pages_per_step - union.shape[1])),
         constant_values=-1,
     )
-    return union.reshape(-1), meta.astype(jnp.int32), num_groups, count
+    return union.reshape(-1)
 
 
 def _tile_groups(union: jax.Array, groups_per_tile: int, pages_per_step: int):

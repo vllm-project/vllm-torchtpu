@@ -496,6 +496,42 @@ def _store_unaligned_rows(o_ref, start, rows, packed, out):
     )
 
 
+def _tile_group_words(
+    counts_ref, words_ref, *, groups_per_tile, pages_per_step, tiles_per_step
+):
+    """`msa_attention._tile_groups`' meta words, page counts and step
+    starts (`_packed_work`'s layout) from each tile's page count, on the
+    scalar unit: XLA built them in ~10 small ops whose scalars sat in HBM.
+    Straight-line per tile: a tile's possible groups store to the words or,
+    past its groups, to `words_ref`'s last slot, which nothing reads."""
+    num_tiles = counts_ref.shape[0]
+    max_groups = num_tiles * groups_per_tile
+    count_at, start_at = max_groups, 2 * max_groups
+    unused = words_ref.shape[0] - 1
+
+    def tile(t, groups):
+        n = counts_ref[t]
+        # A tile with no page still gets one group, so its output is set.
+        num_groups = jnp.maximum(-(-n // pages_per_step), 1)
+        for g in range(groups_per_tile):
+            live = g < num_groups
+            w = groups + g
+            words_ref[jnp.where(live, w, unused)] = (
+                ((t * groups_per_tile + g) << msa_attention._ROW_SHIFT)
+                | (msa_attention._FIRST_BIT if g == 0 else 0)
+                | jnp.where(g == num_groups - 1, msa_attention._LAST_BIT, 0)
+            )
+            words_ref[jnp.where(live, count_at + w, unused)] = jnp.clip(
+                n - g * pages_per_step, 0, pages_per_step
+            )
+        first = t % tiles_per_step == 0
+        words_ref[jnp.where(first, start_at + t // tiles_per_step, unused)] = groups
+        return groups + num_groups
+
+    total = jax.lax.fori_loop(0, num_tiles, tile, jnp.int32(0))
+    words_ref[start_at + num_tiles // tiles_per_step] = total
+
+
 def _attention_call(
     q,
     kv_cache,
@@ -523,8 +559,10 @@ def _attention_call(
     ``tile_offset`` (``int32[1]``): scalar-prefetch inputs, not statics, so
     one kernel serves every head and chunk, and no call slices its inputs.
 
-    ``work = (packed, num_groups)``: the call's `msa_attention._work_list`
-    as `_packed_work` packs it, and its group count.
+    ``work = (packed, tiles, tiles_per_step, in_kernel)``: the call's
+    `msa_attention._work_list` as `_packed_work` packs it, or with
+    `in_kernel` its ``[pages | tile counts]`` row, whose group words the
+    kernel builds (`_tile_group_words`).
 
     Writes those heads' and tokens' rows of ``(out [G * Hg, T, D], lse
     [G, T / Bq, 1, Hg * Bq])`` (a tile's lse a lane-dense row, ``h * Bq +
@@ -538,23 +576,40 @@ def _attention_call(
     # One KV head's [K | V] slice of each row.
     row_width = 2 * head_dim
     topk = selected.shape[2]
-    packed, tiles, tiles_per_step = work
+    packed, tiles, tiles_per_step, in_kernel = work
     groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
     num_steps = tiles // tiles_per_step
     max_groups = tiles * groups_per_tile
     union_len = max_groups * pages_per_step
+    words_len = 2 * max_groups + num_steps + 1  # meta words, counts, step starts
 
-    def kernel(packed_ref, *refs, **kwargs):
+    def run(packed_ref, words_ref, *refs, **kwargs):
         return _kernel(
             packed_ref.at[pl.ds(0, union_len)],
-            packed_ref.at[pl.ds(union_len, max_groups)],
-            packed_ref.at[pl.ds(union_len + max_groups, max_groups)],
+            words_ref.at[pl.ds(0, max_groups)],
+            words_ref.at[pl.ds(max_groups, max_groups)],
             *refs,
-            block_start_ref=packed_ref.at[
-                pl.ds(union_len + 2 * max_groups, num_steps + 1)
-            ],
+            block_start_ref=words_ref.at[pl.ds(2 * max_groups, num_steps + 1)],
             **kwargs,
         )
+
+    def kernel(packed_ref, *refs, **kwargs):
+        if not in_kernel:
+            return run(
+                packed_ref, packed_ref.at[pl.ds(union_len, words_len)], *refs, **kwargs
+            )
+        *refs, words_ref = refs
+        pl.when(pl.program_id(0) == 0)(
+            functools.partial(
+                _tile_group_words,
+                packed_ref.at[pl.ds(union_len, tiles)],
+                words_ref,
+                groups_per_tile=groups_per_tile,
+                pages_per_step=pages_per_step,
+                tiles_per_step=tiles_per_step,
+            )
+        )
+        return run(packed_ref, words_ref, *refs, **kwargs)
 
     def tile_block(b, packed, table, heads, offset):
         return (offset[0] // tiles_per_step + b, 0)
@@ -639,6 +694,7 @@ def _attention_call(
                 if transposed
                 else []
             ),
+            *([pltpu.SMEM((words_len + 1,), jnp.int32)] if in_kernel else []),
         ],
     )
     num_inputs = 4 + 5 + len(scale_inputs)
@@ -714,20 +770,31 @@ def _tiles_per_step(num_tiles: int, rows: int = 1, align: int = 1) -> int:
     )
 
 
-def _packed_work(selected, block_q, pages_per_step, align=1):
+def _packed_work(selected, block_q, pages_per_step, align=1, in_kernel=False):
     """`msa_attention._work_list` of each call's ``selected [C, T, K]`` as
     one int32 row per call, ``[unions | meta words | counts | step
     starts]``, and the tiles each grid step takes: a call then takes one
     slice of its work list, not one per array (each an XLA op of ~1.3 us,
     x 4 calls x G per layer). Step ``b``'s first group is its
-    ``tiles_per_step * b``-th tile's; the last entry is the group count."""
+    ``tiles_per_step * b``-th tile's; the last entry is the group count.
+    With `in_kernel`, the row is ``[unions | tile page counts]`` and the
+    kernel builds the rest (`_tile_group_words`)."""
+    num_tiles = selected.shape[1] // block_q
+    tiles_per_step = _tiles_per_step(num_tiles, block_q, align)
+    if in_kernel:
+        pages, tile_counts = jax.vmap(
+            functools.partial(
+                msa_attention._tile_page_lists,
+                block_q=block_q,
+                pages_per_step=pages_per_step,
+            )
+        )(selected)
+        return jnp.concatenate([pages, tile_counts], axis=1), tiles_per_step
     pages, meta, _, counts = jax.vmap(
         functools.partial(
             msa_attention._work_list, block_q=block_q, pages_per_step=pages_per_step
         )
     )(selected)
-    num_tiles = selected.shape[1] // block_q
-    tiles_per_step = _tiles_per_step(num_tiles, block_q, align)
     groups_per_tile = msa_attention._groups_per_tile(
         block_q, selected.shape[2], pages_per_step
     )
@@ -805,11 +872,17 @@ def _chunked_call(
     # Every call's work list in one batched pass ahead of the loop: built
     # per call inside it, each call paid its own two union sorts and glue
     # (~9 us per call, x G x 4 calls per layer).
+    # Decode-sized calls of several tiles take their group words from the
+    # kernel's scalar unit; one tile's come from vector ops alone
+    # (`msa_attention._single_tile_groups`), where a page count would be a
+    # scalar the kernel waits for.
+    in_kernel = block_q == msa_attention.SMALL_BATCH_BLOCK_Q and step > block_q
     packed, tiles_per_step = _packed_work(
         selected.reshape(num_heads * num_chunks, step, selected.shape[2]),
         block_q,
         pages_per_step,
         align=_merged_store_rows(block_q, num_q_heads // num_heads, q.dtype),
+        in_kernel=in_kernel,
     )
 
     def head_chunk(i, out):
@@ -826,7 +899,7 @@ def _chunked_call(
             heads,
             offset,
             out,
-            (packed[i], step // block_q, tiles_per_step),
+            (packed[i], step // block_q, tiles_per_step, in_kernel),
         )
 
     out = head_chunk(0, None)
