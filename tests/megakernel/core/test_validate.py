@@ -25,6 +25,7 @@ from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.core.geometry import FromHF, ModelGeometry
 from vllm_torchtpu.megakernel.core.module import Module
 from vllm_torchtpu.megakernel.core.modules.gdn import GDN
+from vllm_torchtpu.megakernel.core.modules.gqa import GQA
 from vllm_torchtpu.megakernel.core.modules.moe import MoE, MoEModule
 from vllm_torchtpu.megakernel.core.modules.norm import Norm
 from vllm_torchtpu.megakernel.core.profile import Profile
@@ -427,6 +428,8 @@ def test_validate_multi_key_alias_field_specs_and_default_cfg_norms():
     assert validate_model_hf_config(_AliasMoEModel, {"experts": 128}).eligible
     zero_alias = validate_model_hf_config(_AliasMoEModel, {"E": 0})
     assert not zero_alias.eligible and zero_alias.code == "non_moe_checkpoint"
+    false_alias = validate_model_hf_config(_AliasMoEModel, {"E": False})
+    assert not false_alias.eligible and false_alias.code == "non_moe_checkpoint"
 
     # 3. Tuple `(hf_key, default)` specs on `FromHF` and `MoE.bind(..., experts=...)`.
     class _TupleSpecModel(_AliasMoEModel):
@@ -441,6 +444,8 @@ def test_validate_multi_key_alias_field_specs_and_default_cfg_norms():
     assert validate_model_hf_config(_TupleSpecModel, {}).eligible
     tup_dense = validate_model_hf_config(_TupleSpecModel, {"n_routed_experts": 0})
     assert not tup_dense.eligible and tup_dense.code == "non_moe_checkpoint"
+    tup_false = validate_model_hf_config(_TupleSpecModel, {"n_routed_experts": False})
+    assert not tup_false.eligible and tup_false.code == "non_moe_checkpoint"
     tup_mismatch = validate_model_hf_config(_TupleSpecModel, {"n_embd": 2048})
     assert not tup_mismatch.eligible and tup_mismatch.code == "geometry_mismatch"
 
@@ -469,3 +474,120 @@ def test_validate_multi_key_alias_field_specs_and_default_cfg_norms():
 
     with pytest.raises(MegakernelConfigError, match="zero_centered=False"):
         validate_model_def(_BadNormWithDefCfg, "bad_def_zc", (), (), _BadNormWithDefCfg)
+
+
+def test_validate_partial_hf_config_merges_nested_rope_dicts():
+    """Partial `hf_config` merges nested `rope_parameters` and `rope_scaling`
+    mappings (both top-level and inside `text_config`) without dropping sibling keys."""
+    gqa = GQA.bind("self_attn")
+    gdn = GDN.bind("linear_attn")
+    in_norm = Norm.bind("input_layernorm", zero_centered=True)
+    post_norm = Norm.bind("post_attention_layernorm", zero_centered=True)
+    final_norm_b = Norm.bind("model.norm", zero_centered=True)
+    base_fields = {
+        "hidden_size": 1024,
+        "num_hidden_layers": 4,
+        "rms_norm_eps": 1e-6,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "num_experts": 128,
+    }
+
+    def _derive_from_gqa(cls: Any, hf_cfg: Any) -> ModelGeometry:
+        merged = dict(hf_cfg)
+        if isinstance(merged.get("text_config"), dict):
+            merged.update(merged["text_config"])
+        for rk in ("rope_parameters", "rope_scaling"):
+            sub = merged.get(rk)
+            if isinstance(sub, dict) and sub.get("rope_type") not in (None, "default"):
+                raise MegakernelConfigError(f"unsupported {rk}")
+        res = cls.geometry.resolve(merged)
+        gqa_g = gqa.resolve(merged)
+        return ModelGeometry(
+            L=int(res["layers"]),
+            att_every=2,
+            H=int(res["hidden"]),
+            NH=int(gqa_g.NH),
+            NKV=int(gqa_g.NKV),
+            HD=int(gqa_g.HD),
+            ROT=int(gqa_g.ROT),
+            KH=8,
+            VH=8,
+            KD=128,
+            VD=128,
+            E=128,
+            TOPK=2,
+            I=512,
+            IS=512,
+            theta=float(gqa_g.theta),
+        )
+
+    class _TopRopeModel:
+        default_hf_config = {
+            **base_fields,
+            "rope_parameters": {
+                "rope_theta": 1_000_000.0,
+                "partial_rotary_factor": 0.25,
+            },
+        }
+        geometry = FromHF(
+            hidden="hidden_size", layers="num_hidden_layers", eps="rms_norm_eps"
+        )
+        schedule = Schedule(
+            mixer=Every(n=2, last=gqa, rest=gdn),
+            ffn=MoE.bind("mlp"),
+            pre_norm=in_norm,
+            post_norm=post_norm,
+        )
+        final_norm = final_norm_b
+
+        @classmethod
+        def _from_hf_decl(cls) -> FromHF:
+            return cls.geometry
+
+        derive_geometry = classmethod(_derive_from_gqa)
+
+    class _TextCfgRopeModel(_TopRopeModel):
+        default_hf_config = {
+            "model_type": "stub",
+            "text_config": {
+                **base_fields,
+                "rope_parameters": {
+                    "rope_theta": 1_000_000.0,
+                    "partial_rotary_factor": 0.25,
+                },
+                "rope_scaling": {"rope_type": "default"},
+            },
+        }
+
+    for model_cls in (_TopRopeModel, _TextCfgRopeModel):
+        partial_ok = validate_model_hf_config(
+            model_cls,
+            {"num_experts": 128, "rope_parameters": {"rope_theta": 1_000_000.0}},
+        )
+        assert partial_ok.eligible, partial_ok.message
+
+        nested_mismatch = validate_model_hf_config(
+            model_cls,
+            {"num_experts": 128, "rope_parameters": {"rope_theta": 500_000.0}},
+        )
+        assert (
+            not nested_mismatch.eligible
+            and nested_mismatch.code == "geometry_mismatch"
+            and "theta=500000.0" in (nested_mismatch.message or "")
+        )
+
+        flat_mismatch = validate_model_hf_config(
+            model_cls, {"num_experts": 128, "partial_rotary_factor": 0.5}
+        )
+        assert (
+            not flat_mismatch.eligible
+            and flat_mismatch.code == "geometry_mismatch"
+            and "ROT=64 (expected 32)" in (flat_mismatch.message or "")
+        )
+
+        scaled_bad = validate_model_hf_config(
+            model_cls, {"num_experts": 128, "rope_scaling": {"rope_type": "yarn"}}
+        )
+        assert not scaled_bad.eligible and scaled_bad.code == "invalid_geometry"
