@@ -91,6 +91,8 @@ max(tolerance, 1.645 * hypot(stderr_baseline, stderr_run))
 When only one side records a standard error, the two cases differ:
 
 - **Baseline only**: it sets the scale for both sides, `sqrt(2) * stderr_baseline`.
+  A baseline calibrated from 5 or more runs stores the standard error of their
+  mean, so the single run gets `stderr_baseline * sqrt(num_runs)`.
 - **Run only**: it covers only its own side, and the baseline is treated as
   exact, `stderr_run`.
 
@@ -119,11 +121,18 @@ depends on the number of runs N:
   only when every run reported one. The gate is as wide as for a single run.
 - 5 or more runs: the measured spread, `stdev(values) / sqrt(N)`, in place of
   the per-run `lm_eval` estimate. Runs that agree exactly give 0, so a
-  deterministic task falls back to the flat tolerance on its side. This gate
-  can be tighter than the single-run gate.
+  deterministic task falls back to the flat tolerance on its side. When every
+  run reported a standard error, their mean caps the measured spread, so one
+  broken run cannot widen the gate that judges it. Runs that report none have
+  no such cap.
 
 The spread of fewer than 5 runs is too rough an estimate to narrow a gate with.
-The allowed drop is the same formula as above.
+
+The allowed drop is the same formula as above, except for the factor 1.645. A
+non-zero standard error measured from N runs has N - 1 degrees of freedom, so
+the one-sided 95% Student-t value takes its place (2.132 at 5 runs). When both
+sides are measured, the smaller N applies. This gate is tighter than the
+single-run gate when the runs agree closely, and wider when they do not.
 
 A metric that any of the runs lacks is dropped, so a run that lost a task fails
 the check as a missing result. `--calibrate` exits `2` instead of writing a
