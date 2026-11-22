@@ -33,8 +33,9 @@ the oracle instead of a hand-written layout:
   checkpoints in place; the megakernel gather reads them back.
 * stale rows: the stock kernel moves only the live conv granules (u32 rows
   0..35 of the conv page for this geometry), so rows 36..127 keep whatever the
-  block held before. Every case also runs with those rows filled with
-  0xFFFFFFFF (f32 NaN) and must give the same bytes and a finite output.
+  block held before. The three cases above also run with those rows filled
+  with 0xFFFFFFFF (f32 NaN) and must give the same bytes and a finite output;
+  `test_pool_bytes_match_stock_state_utils` runs only the clean fill.
 
 Geometry: one Qwen3.5 TP=8 rank (2 K heads, 8 V heads, KD = VD = 128, so
 QKV = 1536), fp8 pages `(2, 64, 4, 128)` (64 KiB), and per slot 4 bf16
@@ -50,7 +51,9 @@ addresses state through `granule_view` (`ref.bitcast(uint32).reshape(...)`), so
 bitcast to a wider dtype packs consecutive second-minor rows into one word,
 the TPU convention `tests/kernels/gdn/v3/gdn_pool_state_utils.py`
 documents; `test_pool_bytes_match_stock_state_utils` checks the pool bytes
-against that module.
+against that module. Delete the shim (`_byte_index` through `_VIEW_FNS`, and
+their patching in `_stock_interpret`) once JAX interpret mode resolves bitcast
+and reshape refs.
 """
 
 from __future__ import annotations
@@ -112,7 +115,9 @@ def _use_cpu_default_device() -> Iterator[None]:
 
 
 # ---------------------------------------------------------------------------
-# Stock kernel in Pallas TPU interpret mode
+# Stock kernel in Pallas TPU interpret mode. The ref-view shim below exists
+# because JAX interpret mode resolves only `NDIndexer` ref transforms; delete
+# it once JAX interpret mode resolves bitcast and reshape refs.
 # ---------------------------------------------------------------------------
 def _byte_index(shape: tuple[int, ...], dtype: Any, transforms: Any) -> Any:
     """Byte offsets into a C-contiguous `shape` `dtype` buffer of a ref view.
@@ -526,6 +531,9 @@ def test_pool_bytes_match_stock_state_utils():
         split=PPS,
         recurrent_dtype=jnp.bfloat16,
     )
+    # `write_states` builds the pool on CPU and hands it back on
+    # `jax.devices()[0]` (the TPU on a TPU host); keep the read on CPU.
+    placed = jax.device_put(placed, jax.devices("cpu")[0])
     conv, rec = _mk_read(placed, _STOCK_SLOTS)
     _assert_bytes_equal(conv, ref["dec"][0], "state-utils-placed conv via megakernel")
     _assert_bytes_equal(rec, ref["dec"][1], "state-utils-placed rec via megakernel")
@@ -557,9 +565,8 @@ def _mk_checkpoints(
             [win[s, 1 + t : 1 + t + TAPS] for s in range(NS) for t in range(T)]
         )
     rec = (jax.random.normal(k[1], (1, B * N_V, D, D)) * 0.1).astype(jnp.bfloat16)
-    raw_u8 = _fill_stale_rows(_garbage_pool(seed), slots, fill)
-    raw = _mk_write(_to_pool(raw_u8), slots, conv, rec)
-    # The scatter rewrites whole conv pages; restore the stale rows after it.
+    raw = _mk_write(_to_pool(_garbage_pool(seed)), slots, conv, rec)
+    # The scatter rewrites whole conv pages, so stale rows are set after it.
     raw = _to_pool(_fill_stale_rows(_to_u8(raw), slots, fill))
     return raw, exp_conv, np.asarray(rec)[0].reshape(B, N_V, D, D)
 
@@ -591,7 +598,9 @@ def test_megakernel_checkpoints_through_stock_verify(fill: int):
     verify window (`num_spec_tokens=3`) reads checkpoint `read_offsets[s]` and
     rewrites all four checkpoints in place -> megakernel gather reads them."""
     NS, T = 2, 4
-    slots = 2 + np.arange(NS * T).reshape(NS, T)
+    # Non-contiguous, unordered checkpoint slots, so every checkpoint goes
+    # through the `ckpt_indices` table (slot 0 is null, slot 11 holds KV).
+    slots = np.array([[9, 2, 6, 4], [3, 10, 1, 7]])
     read_offsets = np.array([2, 1])
     raw, exp_conv, exp_rec = _mk_checkpoints(slots, fill, seed=50)
     tokens = _tokens(51, NS * T)
