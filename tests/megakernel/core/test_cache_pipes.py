@@ -27,6 +27,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+import vllm_torchtpu.megakernel.core as mk
 from tests.megakernel.core.megakernel_fakes import TINY_TILES, make_fake_model_spec
 from tests.megakernel.core.megakernel_synth import synth_hybrid_spec
 from vllm_torchtpu.megakernel.core import (
@@ -47,6 +48,7 @@ from vllm_torchtpu.megakernel.core.modules.gdn import GDNModule
 from vllm_torchtpu.megakernel.core.ops import F32
 from vllm_torchtpu.megakernel.core.pool.config import CacheExec, cache_exec
 from vllm_torchtpu.megakernel.core.reference import spec_reference_step
+from vllm_torchtpu.megakernel.core.spec import ModelSpec
 from vllm_torchtpu.megakernel.core.weights.spec_inputs import (
     pack_spec_inputs,
     random_spec_inputs,
@@ -250,15 +252,15 @@ def test_flat_pooled_step_admits_only_replicated_metadata():
     flat_fn, *_ = cache.make_flat_pooled_step(c.mesh, spec, c.ex, donate_pools=False)
     pt_ok = np.asarray(c.pt)
     flat_fn(*c.flat_args(c.pools(), *c.meta(pt=pt_ok[None])))  # (1, NS, K)
-    bad_meta = {
-        "page_table": dict(pt=np.concatenate([pt_ok] * R)),  # (R * NS, K)
-        "page_table ": dict(pt=np.stack([pt_ok] * R)),  # (R, NS, K)
-        "page_table  ": dict(pt=pt_ok[:, :1]),  # K < max_pages_per_seq
-        "ckpt_indices": dict(ckpt=np.stack([np.asarray(c.ckpt)] * R)),  # (R, ...)
-        "read_offsets": dict(roff=np.stack([np.asarray(c.roff)] * R)),  # (R, ...)
-    }
-    for name, kw in bad_meta.items():
-        with pytest.raises(ValueError, match=name.strip()):
+    bad_meta = [
+        ("page_table", dict(pt=np.concatenate([pt_ok] * R))),  # (R * NS, K)
+        ("page_table", dict(pt=np.stack([pt_ok] * R))),  # (R, NS, K)
+        ("page_table", dict(pt=pt_ok[:, :1])),  # K < max_pages_per_seq
+        ("ckpt_indices", dict(ckpt=np.stack([np.asarray(c.ckpt)] * R))),  # (R, ...)
+        ("read_offsets", dict(roff=np.stack([np.asarray(c.roff)] * R))),  # (R, ...)
+    ]
+    for match, kw in bad_meta:
+        with pytest.raises(ValueError, match=match):
             flat_fn(*c.flat_args(c.pools(), *c.meta(**kw)))
 
 
@@ -290,46 +292,88 @@ def test_flat_pooled_step_uses_cache_exec_act_mode(T: int, gpr: Any):
         cache.make_flat_pooled_step(c.mesh, spec, ex_ref)
 
 
-@pytest.mark.parametrize(
-    ("T", "gpr", "fused", "bad", "msg"),
-    [
-        (4, "eligible", False, "roff", "read_offset"),
-        (1, False, True, "ckpt", "checkpoint write slot"),
-    ],
-    ids=["gpr_read_offsets", "fused_ckpt_slot"],
-)
-def test_flat_pooled_step_checks_ckpt_bounds_in_kernel_io_paths(
-    T: int, gpr: Any, fused: bool, bad: str, msg: str
-):
-    """With `check_ckpt_bounds`, the fused / GPR flat step validates its metadata
-    (GPR skips the gather kernel, fused I/O skips gather and scatter)."""
-    # Fused GDN I/O needs `2 * kh <= vh` per rank.
+def test_flat_pooled_step_rejects_ref_before_building(monkeypatch):
+    """`act_mode="ref"` raises before any kernel build, KV-only specs included
+    (they used to be remapped to `"all"`)."""
+
+    def _no_build(ms: Any, ex_k: ExecSpec) -> Any:
+        raise AssertionError(f"built a kernel for act_mode={cache_exec(ex_k).act_mode}")
+
+    monkeypatch.setattr(mk_kernel, "build", _no_build)
+    mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
+    ex_ref = _make_paged_ex(B=4, T=1, act_mode="ref")
+    for att_every in (1, 2):  # KV-only, hybrid
+        spec = synth_hybrid_spec(L=2, att_every=att_every, R=R)
+        assert spec.cache_backend.has_recurrent_pool is (att_every > 1)
+        with pytest.raises(MegakernelConfigError, match="act_mode='ref'"):
+            cache.make_flat_pooled_step(mesh, spec, ex_ref)
+
+
+def _expect_step_error(c: _Case, step: Any, meta: list[Any], match: str) -> None:
+    """`step` raises `match` on `meta`, then still runs on `c`'s metadata."""
+    try:
+        with pytest.raises((ValueError, jax.errors.JaxRuntimeError), match=match):
+            jax.block_until_ready(step(*c.flat_args(c.pools(), *meta)))
+    finally:
+        # Reset even if the assertion failed. The failed metadata callback's
+        # error stays in JAX's effect tokens (private `dispatch` state), and
+        # every later computation with effects would re-raise it. A kernel
+        # interpreted while the callback failed leaves TPU interpret mode's
+        # global shared memory uncleaned, which later kernels would trip on.
+        dispatch.runtime_tokens.clear()
+        pltpu.reset_tpu_interpret_mode_state()
+    jax.block_until_ready(step(*c.flat_args(c.pools(), *c.meta())))
+
+
+def test_flat_pooled_step_checks_ckpt_bounds_in_gpr_path():
+    """With `check_ckpt_bounds`, the GPR flat step (which skips the gather
+    kernel) validates its read offsets and admits only `ckpt_indices` with
+    `K >= T`."""
+    T = 4
     spec = synth_hybrid_spec(L=2, att_every=2, R=R, VH=4)
-    ex = _make_paged_ex(B=4, T=T, gpr=gpr, check_ckpt_bounds=True)
+    ex = _make_paged_ex(B=4, T=T, gpr="eligible", check_ckpt_bounds=True)
     c = _Case(spec, ex, seed=6)
     flat_fn, *_ = cache.make_flat_pooled_step(
-        c.mesh, spec, ex, fused_pool_io=fused, donate_pools=True
+        c.mesh, spec, ex, fused_pool_io=False, donate_pools=True
     )
     jax.block_until_ready(flat_fn(*c.flat_args(c.pools(), *c.meta())))
-    if bad == "roff":
-        meta = c.meta(roff=np.full_like(np.asarray(c.roff), T))  # == K
-    else:
-        ckpt_bad = np.asarray(c.ckpt).copy()
-        ckpt_bad[..., -1] = 10_000  # checkpoint write slot past the pool
-        meta = c.meta(ckpt=ckpt_bad)
-    with pytest.raises((ValueError, jax.errors.JaxRuntimeError), match=msg):
-        jax.block_until_ready(flat_fn(*c.flat_args(c.pools(), *meta)))
-    # The failed callback's error stays in JAX's effect tokens, and every later
-    # computation with effects would re-raise it: reset them. A kernel that was
-    # interpreted while the callback failed leaves TPU interpret mode's global
-    # shared memory uncleaned, which later kernels would trip on: reset it too.
-    dispatch.runtime_tokens.clear()
-    pltpu.reset_tpu_interpret_mode_state()
+    roff_k = np.full_like(np.asarray(c.roff), T)  # == K
+    _expect_step_error(c, flat_fn, c.meta(roff=roff_k), "read_offset")
+    narrow = c.meta(ckpt=np.asarray(c.ckpt)[..., :1])  # trace-time shape check
+    with pytest.raises(ValueError, match="ckpt_indices last dim"):
+        flat_fn(*c.flat_args(c.pools(), *narrow))
+
+
+def test_flat_pooled_step_checks_ckpt_bounds_in_fused_path():
+    """With `check_ckpt_bounds`, the fused flat step (which skips the gather and
+    scatter kernels) validates its checkpoint write slots."""
+    # Fused GDN I/O needs `2 * kh <= vh` per rank.
+    spec = synth_hybrid_spec(L=2, att_every=2, R=R, VH=4)
+    ex = _make_paged_ex(B=4, T=1, check_ckpt_bounds=True)
+    c = _Case(spec, ex, seed=6)
+    flat_fn, *_ = cache.make_flat_pooled_step(
+        c.mesh, spec, ex, fused_pool_io=True, donate_pools=True
+    )
     jax.block_until_ready(flat_fn(*c.flat_args(c.pools(), *c.meta())))
-    if T > 1:  # trace-time shape admission: ckpt_indices narrower than T
-        narrow = c.meta(ckpt=np.asarray(c.ckpt)[..., :1])
-        with pytest.raises(ValueError, match="ckpt_indices last dim"):
-            flat_fn(*c.flat_args(c.pools(), *narrow))
+    ckpt_bad = np.asarray(c.ckpt).copy()
+    ckpt_bad[..., -1] = 10_000  # checkpoint write slot past the pool
+    _expect_step_error(c, flat_fn, c.meta(ckpt=ckpt_bad), "checkpoint write slot")
+
+
+def test_flat_pooled_step_all_mode_checks_every_sequence():
+    """Under `act_mode="all"` the metadata check covers a sequence whose
+    checkpoint column 0 is 0 (inactive under `"from_ckpt"`, active here)."""
+    T = 4
+    spec = synth_hybrid_spec(L=2, att_every=2, R=R, VH=4)
+    ex = _make_paged_ex(
+        B=4, T=T, gpr="eligible", act_mode="all", check_ckpt_bounds=True
+    )
+    c = _Case(spec, ex, seed=6)
+    flat_fn, *_ = cache.make_flat_pooled_step(c.mesh, spec, ex, donate_pools=True)
+    jax.block_until_ready(flat_fn(*c.flat_args(c.pools(), *c.meta())))
+    ckpt_bad = np.asarray(c.ckpt).copy()
+    ckpt_bad[:, 0, 0] = 0  # seq 0 writes checkpoint slot 0 (the reserved pages)
+    _expect_step_error(c, flat_fn, c.meta(ckpt=ckpt_bad), "distinct positive")
 
 
 def test_pooled_step_checks_rank_folded_metadata_per_rank():
@@ -473,11 +517,91 @@ def test_resolve_pool_layout_prefers_the_specs_own_cache_backend(monkeypatch):
         )
 
 
-def test_resolve_model_spec_dispatch():
-    """Specs pass through; geometries resolve via their `ModelDef`; else TypeError."""
+class _TinyHybridModel(mk.ModelDef):
+    """Unregistered tiny hybrid `ModelDef` for `resolve_model_spec`."""
+
+    name = "cache_pipes_tiny_hybrid"
+    supported_tp_sizes = (2,)
+    default_hf_config = {
+        "n_vocab": 256,
+        "n_layers": 2,
+        "d_model": 256,
+        "n_heads": 4,
+        "n_kv_heads": 2,
+        "d_head": 256,
+        "theta": 10000.0,
+        "norm_eps": 1e-6,
+        "ssm_k_heads": 2,
+        "ssm_v_heads": 4,
+        "ssm_k_dim": 128,
+        "ssm_v_dim": 128,
+        "ssm_conv_kernel": 4,
+        "n_experts": 128,
+        "top_k": 2,
+        "d_ff": 256,
+    }
+    geometry = mk.FromHF(
+        hidden="d_model",
+        layers="n_layers",
+        vocab="n_vocab",
+        eps="norm_eps",
+        rope_theta="theta",
+        rope_partial=0.25,
+    )
+    attn = mk.GQA.bind(
+        prefix="self_attn",
+        heads="n_heads",
+        kv_heads="n_kv_heads",
+        head_dim="d_head",
+        qk_norm=True,
+        output_gate=True,
+    )
+    linear = mk.GDN.bind(
+        prefix="linear_attn",
+        k_heads="ssm_k_heads",
+        v_heads="ssm_v_heads",
+        k_dim="ssm_k_dim",
+        v_dim="ssm_v_dim",
+        conv_kernel="ssm_conv_kernel",
+    )
+    moe = mk.MoE.bind(
+        prefix="mlp",
+        experts="n_experts",
+        top_k="top_k",
+        inter="d_ff",
+        shared_inter="d_ff",
+        shared_gate=True,
+    )
+    schedule = mk.Schedule(
+        mixer=mk.Every(n=2, last=attn, rest=linear),
+        ffn=moe,
+        pre_norm=mk.Norm.bind("input_layernorm", zero_centered=True),
+        post_norm=mk.Norm.bind("post_attention_layernorm", zero_centered=True),
+    )
+    embed = mk.Embedding("model.embed_tokens")
+    final_norm = mk.Norm.bind("model.norm", zero_centered=True)
+    lm_head = mk.LMHead("lm_head")
+
+
+def test_resolve_model_spec_dispatch(monkeypatch):
+    """Specs pass through; a `ModelDef` and a geometry derived from one resolve
+    to that `ModelDef`'s spec; model names and other inputs raise TypeError."""
     spec = synth_hybrid_spec(L=2, att_every=2, R=R)
     assert cache_common.resolve_model_spec(spec) is spec
-    for bad in (object(), spec.config, "synth"):
+    m_def = _TinyHybridModel
+    g_default = m_def.derive_geometry()
+    g_l4 = m_def.derive_geometry(dict(m_def.default_hf_config, n_layers=4))
+    assert model_def.find_model(g_l4) is m_def and (g_default.L, g_l4.L) == (2, 4)
+    for target, geom in ((m_def, g_default), (g_l4, g_l4)):
+        got = cache_common.resolve_model_spec(target)
+        want = m_def.to_model_spec(geom)
+        assert isinstance(got, ModelSpec) and got.name == want.name
+        assert got.config == geom
+        assert got.cache_backend.layout == want.cache_backend.layout
+    # A registered name resolves to a `ModelDef` but is still rejected.
+    monkeypatch.setitem(model_def._MODEL_REGISTRY, m_def.name, m_def)
+    assert model_def.find_model(m_def.name) is m_def
+    for bad in (object(), spec.config, "synth", m_def.name):
         with pytest.raises(TypeError, match="ModelSpec"):
             cache_common.resolve_model_spec(bad)
 

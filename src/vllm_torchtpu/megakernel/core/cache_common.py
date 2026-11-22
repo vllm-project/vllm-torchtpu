@@ -43,7 +43,8 @@ def resolve_model_spec(g_or_spec: Any) -> ModelSpec:
     """`g_or_spec` itself if it is a `ModelSpec`, else its `ModelDef`'s spec.
 
     A geometry resolves through `model_def.find_model` (the `ModelDef` it was
-    derived from); a `ModelDef` subclass resolves to its default spec.
+    derived from); a `ModelDef` subclass resolves to its default spec. Model
+    names are rejected: a name does not say which geometry to build.
     """
     if isinstance(g_or_spec, ModelSpec):
         return g_or_spec
@@ -237,6 +238,17 @@ class PooledBuild:
     info: dict[str, Any]
 
 
+def default_act_mode(b: PooledBuild) -> str:
+    """Sequence activity of a step called without an `active_seqs` input.
+
+    This is `CacheExec.act_mode`, except that without recurrent pools the
+    default `"from_ckpt"` (which reads checkpoint slots) means `"all"`.
+    `"ref"` is returned as is; it needs a mask, so callers must raise.
+    """
+    mode = cache_exec(b.ex_paged).act_mode
+    return "all" if mode == "from_ckpt" and not b.has_rec else mode
+
+
 def build_pooled(
     mesh: Any,
     model_spec: Any,
@@ -317,6 +329,7 @@ def build_pooled(
 __all__ = [
     "PooledBuild",
     "build_pooled",
+    "default_act_mode",
     "require_fused_donation",
     "require_pool_backend",
     "resolve_model_spec",

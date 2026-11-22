@@ -23,7 +23,12 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 from . import kernel
-from .cache_common import PooledBuild, build_pooled, validate_page_table_shape
+from .cache_common import (
+    PooledBuild,
+    build_pooled,
+    default_act_mode,
+    validate_page_table_shape,
+)
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .pool import check_ckpt_bounds, check_step_pool_metadata
@@ -127,6 +132,12 @@ def run_local(
         if cx.check_ckpt_bounds:
             # Fused I/O skips the scatter kernel and GPR the gather kernel, so
             # validate the step's pool metadata (read offsets included) here.
+            # Under "all" the kernel treats every sequence as active, so check
+            # every sequence (with no mask the check infers activity from
+            # checkpoint / page-table column 0, as "from_ckpt" does).
+            check_mask = (
+                jnp.ones((ex_paged.NS,), jnp.bool_) if act_mode == "all" else act_mask
+            )
             check_step_pool_metadata(
                 pb.layout,
                 ex_paged,
@@ -134,7 +145,7 @@ def run_local(
                 pos,
                 ckpt_indices=ckpt_indices if has_rec else None,
                 read_offsets=read_offsets if has_rec else None,
-                active_seqs=act_mask,
+                active_seqs=check_mask,
                 check_bounds=True,
                 force_under_jit=True,
             )
@@ -205,10 +216,17 @@ def make_flat_pooled_step(
 
     The metadata is replicated (`P()`): `page_table` is `(NS, K)` or
     `(1, NS, K)`; rank-folded metadata is not accepted. Sequence activity is
-    `CacheExec.act_mode` (`"from_ckpt"` or `"all"`; `"ref"` needs an
-    `active_seqs` input, which this signature does not have). The per-rank
-    body is `run_local`, shared with `make_pooled_step`.
+    `CacheExec.act_mode` (`"from_ckpt"`, read as `"all"` without recurrent
+    pools, or `"all"`); `"ref"` needs an `active_seqs` input, which this
+    signature does not have, so it raises `MegakernelConfigError` before any
+    kernel is built. The per-rank body is `run_local`, shared with
+    `make_pooled_step`.
     """
+    if cache_exec(ex).act_mode == "ref":
+        raise MegakernelConfigError(
+            "make_flat_pooled_step: CacheExec.act_mode='ref' needs an active_seqs "
+            "mask, which the flat signature does not take; use 'from_ckpt' or 'all'"
+        )
     b = build_pooled(
         mesh,
         model_spec,
@@ -218,12 +236,7 @@ def make_flat_pooled_step(
         max_b_low=max_b_low,
         min_b_hi=min_b_hi,
     )
-    act_mode = cache_exec(b.ex_paged).act_mode if b.has_rec else "all"
-    if act_mode == "ref":
-        raise MegakernelConfigError(
-            "make_flat_pooled_step: CacheExec.act_mode='ref' needs an active_seqs "
-            "mask, which the flat signature does not take; use 'from_ckpt' or 'all'"
-        )
+    act_mode = default_act_mode(b)
     if b.n_extra:
         names = [x.name for x in b.extras]
         raise MegakernelConfigError(
