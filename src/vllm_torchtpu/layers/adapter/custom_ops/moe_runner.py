@@ -17,6 +17,7 @@ import inspect
 from collections.abc import Callable
 
 import torch
+from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
@@ -70,13 +71,17 @@ class VllmMoERunner(MoERunner):
         # The scale this runner gives the routed output before adding the
         # shared expert's, for a fused EP op that does both
         # (MOE_FUSED_EP_PUSH_SHARED_ADD); read when the op is built. The op
-        # scales in bf16, so only a scale bf16 holds exactly is handed over.
+        # scales in bf16, so it is handed over only for a bf16 model and a
+        # scale bf16 holds exactly.
         scale = float(self.routed_scaling_factor)
         exact = torch.tensor(scale, dtype=torch.bfloat16).item() == scale
+        model_config = get_current_vllm_config().model_config
         if (
             self._tpu_shared_mlp is not None
             and exact
             and self.routed_output_transform is None
+            and model_config is not None
+            and model_config.dtype == torch.bfloat16
         ):
             setattr(
                 self.routed_experts,
