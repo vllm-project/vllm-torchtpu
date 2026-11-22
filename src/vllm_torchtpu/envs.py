@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     TPU_DCP_PREFILL_TOKEN_PARALLEL: bool = True
     TPU_DCP_TP_EPILOGUE_3D_SHIFT_QUANT: bool = True
     TPU_DCP_TP_FUSED_WUV_EPILOGUE: bool = True
-    TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP: int = 0
+    TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP: int = 4
     TPU_DCP_TP_IN_BRANCH_QB_MLA: bool = True
     TPU_DCP_TP_PREFILL_LOCAL_OPROJ: bool = True
     TPU_DCP_TP_PREFILL_OPROJ_PAIR_HALVES: bool = True
@@ -929,7 +929,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Chunk-0 SparseCore KV gather; caps above this hold lead_mla behind the
     # barrier so pure-TC fused_qb overlaps SparseCore-offloaded gather_latent.
     "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP": env_int(
-        "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP", 0
+        "TPU_DCP_TP_IN_BRANCH_QB_FREE_MAX_CAP", 4
     ),
     # With TPU_DCP_TP_PREFILL_LOCAL_OPROJ and query replication on non-indexer
     # layers: defer fused q_b_proj + RoPE + absorb_q and lead MLA inside the
