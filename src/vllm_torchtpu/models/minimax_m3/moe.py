@@ -29,6 +29,7 @@ from vllm_torchtpu.layers.adapter.dense_fp4_shared import (
     model_side_shared,
     shared_operands,
 )
+from vllm_torchtpu.models.minimax_m3.ops.rows_join import join_rows_op
 from vllm_torchtpu.models.minimax_m3.quant import (
     _KERNEL_SWIGLU,
     MiniMaxM3Mxfp8LinearMethod,
@@ -205,6 +206,14 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.experts",
         )
 
+    def _join_pieces(self, pieces: list[Rows]) -> torch.Tensor:
+        """The gathered pieces' bf16 rows in one block: e4m3 pieces in one
+        dequantizing pass (`kernels.rows_join`)."""
+        join = join_rows_op(len(pieces))
+        if join is not None and all(isinstance(p, tuple) for p in pieces):
+            return join(*(t for p in pieces for t in p))
+        return torch.cat([_dequant(p) for p in pieces])
+
     def forward(
         self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     ) -> torch.Tensor:
@@ -214,9 +223,10 @@ class MiniMaxM3MoE(nn.Module):
         expert contracts them as e4m3."""
         if isinstance(hidden_states, list):
             # Gathered pieces: dequantize and route each as it lands.
-            xs = [_dequant(p) for p in hidden_states]
-            router_logits = torch.cat([self.gate(p)[0] for p in xs])
-            x = torch.cat(xs)
+            router_logits = torch.cat(
+                [self.gate(_dequant(p))[0] for p in hidden_states]
+            )
+            x = self._join_pieces(hidden_states)
             hidden_states = cat_rows(hidden_states)
         else:
             x = _dequant(hidden_states)
