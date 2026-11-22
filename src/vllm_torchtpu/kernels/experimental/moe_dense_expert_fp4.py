@@ -205,12 +205,16 @@ def _weight_vmem_bytes(h: int, chunk: int, i_s: int) -> int:
 def _vmem_bytes(m: int, h: int, chunk: int, i_s: int, sparse: bool = False) -> int:
     """VMEM of one call: `_weight_vmem_bytes`, the token-sized scratch and the
     compiler's temporaries (tpu7x AOT compiles: ~16 bytes per token element
-    when a unit evaluates every token, measured at 16 and 64 rows; with
-    ``sparse``, 16 per element of one 16-row tile)."""
+    when a unit evaluates every token, measured at 16 and 64 rows). A
+    sparse-row call holds _CALIBRATED_TOKEN_BYTES per token element (its
+    measured need, 54.4 / 56.6 MiB at 48 / 64 rows and 64.6 MiB at 128 with
+    768-column units) and 16 per element of one 16-row tile."""
     mp = m + (-m % _ROW_ALIGN)
-    scratch = 2 + 4 + 4 + 2 + (2 if sparse else 0)
-    temporaries = 16 * _ROW_ALIGN if sparse else 16 * mp
-    return _weight_vmem_bytes(h, chunk, i_s) + (mp * scratch + temporaries) * h
+    if sparse:
+        tokens = mp * _CALIBRATED_TOKEN_BYTES + 16 * _ROW_ALIGN
+    else:
+        tokens = mp * (2 + 4 + 4 + 2 + 16)
+    return _weight_vmem_bytes(h, chunk, i_s) + tokens * h
 
 
 def _choose_replicas(
