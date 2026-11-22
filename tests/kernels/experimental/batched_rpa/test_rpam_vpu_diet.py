@@ -50,6 +50,15 @@ def _require_tpu():
         pytest.skip("Mosaic kernel needs a TPU")
 
 
+@pytest.fixture(autouse=True)
+def _clear_jax_caches():
+    # `_run` patches `vpu_diet_enabled`, which is read at trace time, and
+    # clears the caches before each compile. Clear them after the test too, so
+    # a later test does not reuse an executable traced under the patch.
+    yield
+    jax.clear_caches()
+
+
 _LAYOUT = configs.KVLayout.SEQ_ALONG_LANE
 _PAGE = 128
 _NQ, _NKV, _D = 4, 1, 256
