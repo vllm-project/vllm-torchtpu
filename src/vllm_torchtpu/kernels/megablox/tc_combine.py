@@ -45,6 +45,8 @@ TILE_ROWS = 16
 # Rows per MXU contraction chunk.
 _CHUNK_ROWS = 256
 _TILES_PER_CHUNK = _CHUNK_ROWS // TILE_ROWS
+# Chunks one MXU product contracts at most (bounds its weight matrix).
+_PRODUCT_CHUNKS = 3
 TOKEN_BLOCK = 256
 _VMEM_LIMIT_BYTES = 60 * 1024 * 1024
 # Output columns per shared-expert product (bounds its f32 temporary).
@@ -79,6 +81,7 @@ def supported(
         + 2 * TOKEN_BLOCK * hidden * 2  # output blocks
         + shared_inter * hidden  # e4m3 shared weights
         + 2 * TOKEN_BLOCK * shared_inter * 2  # activation blocks
+        + TOKEN_BLOCK * _PRODUCT_CHUNKS * _CHUNK_ROWS * (4 + 2)  # product weights
     )
     return vmem <= _VMEM_LIMIT_BYTES - 8 * 1024 * 1024
 
@@ -219,38 +222,53 @@ def _kernel(
 
     lax.fori_loop(0, n, mask_edge, 0)
 
-    # One MXU product per chunk of buffer rows against the block's weight
-    # matrix for that chunk (at most `topk` nonzeros per token row).
+    # MXU products of the loaded rows against the block's weight matrix (at
+    # most `topk` nonzeros per token row), each contracted over up to
+    # _PRODUCT_CHUNKS chunks: the MXU sums those chunks in its accumulator,
+    # where a product per chunk popped every chunk's [TB, H] f32 result and
+    # summed them through VMEM.
     rows = row_ref[...]
     w = w_ref[...].astype(jnp.float32)
     p_dtype = jnp.bfloat16 if w_ref.dtype == jnp.bfloat16 else jnp.float32
-    lane = lax.broadcasted_iota(jnp.int32, (1, _CHUNK_ROWS), 1)
 
-    def product(c):
-        local = rows - c * _CHUNK_ROWS
-        p = jnp.zeros((rows.shape[0], _CHUNK_ROWS), jnp.float32)
+    def product(first, chunks):
+        size = chunks * _CHUNK_ROWS
+        lane = lax.broadcasted_iota(jnp.int32, (1, size), 1)
+        local = rows - first * _CHUNK_ROWS
+        p = jnp.zeros((rows.shape[0], size), jnp.float32)
         for j in range(topk):
             p = jnp.where(local[:, j : j + 1] == lane, w[:, j : j + 1], p)
-        start = pl.multiple_of(c * _CHUNK_ROWS, _CHUNK_ROWS)
-        xs = buf[parity, pl.ds(start, _CHUNK_ROWS), :]
+        start = pl.multiple_of(first * _CHUNK_ROWS, _CHUNK_ROWS)
+        xs = buf[parity, pl.ds(start, size), :]
         return jnp.dot(
             p.astype(p_dtype), xs.astype(p_dtype), preferred_element_type=jnp.float32
         )
 
-    # Chunks before the last accumulate in VMEM; the last one's product is
-    # added on the way to the output, so the sum is not stored and reloaded.
-    def chunk(c, carry):
-        @pl.when(c == 0)
+    def accumulate(first, chunks):
+        @pl.when(first == 0)
         def _():
-            acc[...] = product(c)
+            acc[...] = product(first, chunks)
 
-        @pl.when(c > 0)
+        @pl.when(first > 0)
         def _():
-            acc[...] += product(c)
+            acc[...] += product(first, chunks)
 
+    # No product reads past the buffer (maxt tiles, whole chunks).
+    group = min(_PRODUCT_CHUNKS, maxt // _TILES_PER_CHUNK)
+    full = n_chunks // group
+
+    def full_product(g, carry):
+        accumulate(g * group, group)
         return carry
 
-    lax.fori_loop(0, n_chunks - 1, chunk, 0)
+    lax.fori_loop(0, full, full_product, 0)
+    rest = n_chunks - full * group
+    first = full * group
+    for chunks in range(1, group):
+
+        @pl.when(rest == chunks)
+        def _(chunks=chunks):
+            accumulate(first, chunks)
 
     def finish(total):
         if not shared:
@@ -270,13 +288,9 @@ def _kernel(
     def _():
         finish(jnp.zeros(acc.shape, jnp.float32))
 
-    @pl.when(n_chunks == 1)
+    @pl.when(n_chunks > 0)
     def _():
-        finish(product(0))
-
-    @pl.when(n_chunks > 1)
-    def _():
-        finish(acc[...] + product(n_chunks - 1))
+        finish(acc[...])
 
 
 @functools.partial(jax.jit, static_argnames=("topk", "fallback", "interpret"))
