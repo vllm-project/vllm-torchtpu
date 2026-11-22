@@ -342,6 +342,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_GC_GEN2_THRESHOLD",
     "VLLM_TPU_GC_GEN2_PERIOD_S",
     "VLLM_TPU_GC_CENSUS",
+    # New requests built in the engine core's waits (core/preproc_in_wait.py).
+    "VLLM_TPU_PREPROC_IN_WAIT",
+    "VLLM_TPU_PREPROC_IN_WAIT_AB_MS",
     # Host timeline and py-spy windows (runner/host_admit_probe.py).
     "VLLM_TPU_HOSTADMIT_PROBE",
     "VLLM_TPU_HOSTADMIT_PYSPY",

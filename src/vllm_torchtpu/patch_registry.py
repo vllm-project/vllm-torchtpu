@@ -129,6 +129,11 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu.runner.gc_at_waits:patch_gc_at_waits", _ENGINE),
     Patch("vllm_torchtpu.runner.gc_at_waits:patch_engine_core_gc", ("engine_core",)),
+    # New requests built in the engine core's waits (inert unless
+    # VLLM_TPU_PREPROC_IN_WAIT): outermost preprocess_add_request wrapper.
+    Patch(
+        "vllm_torchtpu.core.preproc_in_wait:patch_preproc_in_wait", ("engine_core",)
+    ),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),

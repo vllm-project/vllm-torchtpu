@@ -404,6 +404,8 @@ if TYPE_CHECKING:
     VLLM_TPU_GC_GEN2_THRESHOLD: int = 0
     VLLM_TPU_GC_GEN2_PERIOD_S: float = 0.0
     VLLM_TPU_GC_CENSUS: str = ""
+    VLLM_TPU_PREPROC_IN_WAIT: int = 0
+    VLLM_TPU_PREPROC_IN_WAIT_AB_MS: int = 0
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -2798,6 +2800,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tracked heap and the length of one generation-2 pass. Also logs every
     # generation-2 pass. "" is off. Host-only.
     "VLLM_TPU_GC_CENSUS": env_str("VLLM_TPU_GC_CENSUS", ""),
+    # Engine core: new requests are built (prompt copy + prefix-cache block
+    # hashes) only while the main thread waits on the workers' tokens or an
+    # empty input queue; the value caps a request's wait for that window in ms.
+    # 0 is off (core/preproc_in_wait.py). Host-only.
+    "VLLM_TPU_PREPROC_IN_WAIT": env_nonnegative_int("VLLM_TPU_PREPROC_IN_WAIT", 0),
+    # Engine core: in-process A/B of VLLM_TPU_PREPROC_IN_WAIT in wall-clock
+    # windows of this many ms (on in even windows); 0 is off. Host-only.
+    "VLLM_TPU_PREPROC_IN_WAIT_AB_MS": env_nonnegative_int(
+        "VLLM_TPU_PREPROC_IN_WAIT_AB_MS", 0
+    ),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
     "VLLM_TORCHTPU_IPC_KEY": lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),

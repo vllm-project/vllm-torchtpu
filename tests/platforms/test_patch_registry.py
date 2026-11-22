@@ -235,6 +235,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "patch_prompt_token_array",
         "patch_gc_at_waits",
         "patch_engine_core_gc",
+        "patch_preproc_in_wait",
         "_patch_vllm_merge_multimodal_embeddings",
         "patch_engine_core_cpu_pin",
     ]
