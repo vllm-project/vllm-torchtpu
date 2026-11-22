@@ -25,11 +25,12 @@ import pytest
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from tests.megakernel.conftest import host_device, tpu_mesh
 from tests.megakernel.core.megakernel_synth import TINY_TILES, synth_hybrid_spec
 from vllm_torchtpu.megakernel.core import kernel, pool
 from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.core.geometry import ModelGeometry
-from vllm_torchtpu.megakernel.core.ops import F32, I32
+from vllm_torchtpu.megakernel.core.ops import F32
 from vllm_torchtpu.megakernel.core.pool.config import (
     POOL_STATE_NAME,
     CacheExec,
@@ -40,30 +41,6 @@ from vllm_torchtpu.megakernel.core.weights.spec_inputs import (
     pack_spec_inputs,
     random_spec_inputs,
 )
-
-
-def _tpu_mesh(R: int) -> Mesh:
-    """Return an `R`-device TPU mesh, skipping cleanly when TPU is absent or busy."""
-    try:
-        devs = list(jax.devices("tpu"))
-    except RuntimeError as exc:
-        pytest.skip(f"TPU backend unavailable or busy: {exc}")
-    if len(devs) < R:
-        pytest.skip(f"Requires >= {R} TPU devices, found {len(devs)}")
-    try:
-        jax.device_put(jnp.zeros((1,), dtype=I32), devs[0]).block_until_ready()
-    except RuntimeError as exc:
-        pytest.skip(f"TPU device busy or unusable: {exc}")
-    return Mesh(np.asarray(devs[:R]), ("tp",))
-
-
-def _host_device(fallback: jax.Device) -> jax.Device:
-    """Prefer CPU for reference input construction when available, else `fallback`."""
-    try:
-        cpu_devs = jax.devices("cpu")
-    except RuntimeError:
-        cpu_devs = []
-    return cpu_devs[0] if cpu_devs else fallback
 
 
 def _synth_geom(R: int, *, L: int = 4, att_every: int = 2) -> Any:
@@ -104,13 +81,12 @@ def _pack_pooled_raw_ref_states(
     mesh: Mesh,
     *,
     pool_gather: bool,
-) -> tuple[dict[str, Any], jax.Array, jax.Array, jax.Array]:
+) -> dict[str, Any]:
     assert spec.cache_backend is not None
     lay = spec.cache_backend.layout
     pt, ckpt, roff, min_pages = pool.allocate_test_layout(lay, ex)
     assert ex.cache is not None and ex.cache.num_pages >= min_pages
     tp = NamedSharding(mesh, P("tp"))
-    rep = NamedSharding(mesh, P())
     raw_host = pool.states_to_pool(lay, ex, st_log, pt, ckpt, roff)
     out_states = dict(st_mk)
     out_states[POOL_STATE_NAME] = tuple(
@@ -123,9 +99,7 @@ def _pack_pooled_raw_ref_states(
         out_states.pop("rec", None)
         out_states["ckpt_indices"] = jax.device_put(jnp.tile(ckpt, (ex.R, 1, 1)), tp)
         out_states["read_offsets"] = jax.device_put(jnp.tile(roff, (ex.R, 1)), tp)
-    else:
-        del rep
-    return out_states, pt, ckpt, roff
+    return out_states
 
 
 @pytest.mark.tpu_test
@@ -139,7 +113,7 @@ def test_kernel_make_step_matches_spec_reference_step_on_tpu(
 ) -> None:
     """Compiled (`interpret=False`) `kernel.make_step` matches `spec_reference_step`
     on `synth_hybrid_spec` across single-rank and multi-rank decode/verify steps."""
-    mesh = _tpu_mesh(R)
+    mesh = tpu_mesh(R)
     g = _synth_geom(R)
     spec = synth_hybrid_spec(g, R=R)
     ex = ExecSpec(
@@ -151,7 +125,7 @@ def test_kernel_make_step_matches_spec_reference_step_on_tpu(
         tiles=_base_tiles(),
         interpret=False,
     )
-    host_dev = _host_device(mesh.devices.flat[0])
+    host_dev = host_device(mesh.devices.flat[0])
     with jax.default_device(host_dev):
         ex_ref = replace(ex, interpret=True)
         pos, hid, w_log, st_log = random_spec_inputs(
@@ -188,7 +162,7 @@ def test_kernel_make_step_matches_spec_reference_step_on_tpu(
     conv_mk = np.asarray(kernel.unfold(out_st_mk[conv_key], R), dtype=np.float32)
     rec_mk = np.asarray(kernel.unfold(out_st_mk[rec_key], R), dtype=np.float32)
     if T == 1:
-        conv_valid = slice(0, 3 * B)
+        conv_valid: Any = (slice(None), slice(None), slice(0, 3 * B), slice(None))
     else:
         conv_valid = (slice(None), slice(None), slice(None), slice(0, 3 + T))
     np.testing.assert_allclose(
@@ -218,7 +192,7 @@ def test_kernel_make_step_pooled_raw_ref_matches_reference_on_tpu(
 ) -> None:
     """Compiled (`interpret=False`) `kernel.make_step` over pooled `raw_pool` refs
     (both `pool_gather=False` and `pool_gather=True`) matches `spec_reference_step`."""
-    mesh = _tpu_mesh(R)
+    mesh = tpu_mesh(R)
     g = _synth_geom(R)
     spec = synth_hybrid_spec(g, R=R)
     ex = ExecSpec(
@@ -231,7 +205,7 @@ def test_kernel_make_step_pooled_raw_ref_matches_reference_on_tpu(
         interpret=False,
         cache=CacheExec(paged_kv=True, num_pages=128, pool_gather=pool_gather),
     )
-    host_dev = _host_device(mesh.devices.flat[0])
+    host_dev = host_device(mesh.devices.flat[0])
     with jax.default_device(host_dev):
         ex_ref = replace(
             ex, interpret=True, cache=CacheExec(paged_kv=True, num_pages=128)
@@ -261,7 +235,7 @@ def test_kernel_make_step_pooled_raw_ref_matches_reference_on_tpu(
         for k, v in st_mk_base.items()
         if not (pool_gather and k in ("conv", "rec"))
     }
-    st_pooled, _, _, _ = _pack_pooled_raw_ref_states(
+    st_pooled = _pack_pooled_raw_ref_states(
         st_base_tpu, st_log, spec, ex, mesh, pool_gather=pool_gather
     )
 
@@ -302,7 +276,7 @@ def test_kernel_make_step_pooled_raw_ref_matches_reference_on_tpu(
     conv_mk = np.asarray(kernel.unfold(out_st[conv_key], R), dtype=np.float32)
     rec_mk = np.asarray(kernel.unfold(out_st[rec_key], R), dtype=np.float32)
     if T == 1:
-        conv_valid = slice(0, 3 * B)
+        conv_valid: Any = (slice(None), slice(None), slice(0, 3 * B), slice(None))
     else:
         conv_valid = (slice(None), slice(None), slice(None), slice(0, 3 + T))
     np.testing.assert_allclose(
@@ -327,7 +301,7 @@ def test_kernel_make_step_tiles_inplace_on_tpu(paged_kv: bool) -> None:
     aliases `rw` GDN `conv`/`rec` states in-place and matches `tiles.inplace=False`
     bit-for-bit as well as `spec_reference_step` on both direct and pooled paths."""
     R, T, B = 1, 1, 4
-    mesh = _tpu_mesh(R)
+    mesh = tpu_mesh(R)
     g = _synth_geom(R)
     spec = synth_hybrid_spec(g, R=R)
     cache_cfg = CacheExec(paged_kv=True, num_pages=128) if paged_kv else CacheExec()
@@ -345,7 +319,7 @@ def test_kernel_make_step_tiles_inplace_on_tpu(paged_kv: bool) -> None:
     )
     ex_inp = replace(ex_oop, tiles=tiles_inp)
 
-    host_dev = _host_device(mesh.devices.flat[0])
+    host_dev = host_device(mesh.devices.flat[0])
     with jax.default_device(host_dev):
         ex_ref = replace(ex_oop, interpret=True)
         pos, hid, w_log, st_log = random_spec_inputs(
@@ -382,7 +356,7 @@ def test_kernel_make_step_tiles_inplace_on_tpu(paged_kv: bool) -> None:
             k: jax.device_put(np.asarray(v).copy(), tp) for k, v in st_mk_base.items()
         }
         if paged_kv:
-            st_tpu, _, _, _ = _pack_pooled_raw_ref_states(
+            st_tpu = _pack_pooled_raw_ref_states(
                 st_tpu, st_log, spec, ex_oop, mesh, pool_gather=False
             )
         return st_tpu

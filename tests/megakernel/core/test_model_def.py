@@ -65,10 +65,11 @@ from vllm_torchtpu.megakernel.core.modules import (
     MoEModule,
     Norm,
 )
-from vllm_torchtpu.megakernel.core.ops import BF16, F32, I32, round_bf16
+from vllm_torchtpu.megakernel.core.ops import BF16, F32, I32, rmsnorm, round_bf16
 from vllm_torchtpu.megakernel.core.pool import PoolBackend, with_cache
 from vllm_torchtpu.megakernel.core.profile import DEFAULT_PROFILE, Profile
 from vllm_torchtpu.megakernel.core.spec import ModelSpec, Module, SwitchSlot
+from vllm_torchtpu.megakernel.core.weights.spec_inputs import random_spec_inputs
 
 
 @pytest.fixture()
@@ -998,9 +999,6 @@ def test_model_def_random_reference_step_matches_independent_loop_and_norm_renam
 ):
     """`reference_step` with random non-zero weights matches an independent loop
     across `T=1`, `T=2` verify, `pool_io=True`, and `Norm.bind(..., rename=...)`."""
-    from vllm_torchtpu.megakernel.core.ops import rmsnorm
-    from vllm_torchtpu.megakernel.core.weights.spec_inputs import random_spec_inputs
-
     hf_cfg = {
         "hidden_size": 256,
         "num_hidden_layers": 4,
@@ -1105,7 +1103,10 @@ def test_model_def_random_reference_step_matches_independent_loop_and_norm_renam
         for k in spec_st:
             np.testing.assert_array_equal(np.asarray(got_st[k]), np.asarray(spec_st[k]))
 
-        # Independent manual layer loop calling module `.reference()` directly.
+        # Manual per-layer loop calling module `.reference()` directly (note:
+        # `prepare_reference_step_state` and `finalize_reference_step_state`
+        # are shared with `composed_reference_step`, so this checks per-layer
+        # norm/module dispatch and residual rounding).
         gqa_ref = GQAModule(geometry=g, qk_norm=True, output_gate=True)
         gdn_ref = GDNModule(geometry=g)
         moe_ref = MoEModule(geometry=g, shared_gate=True)

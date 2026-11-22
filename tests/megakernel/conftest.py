@@ -430,6 +430,67 @@ def route_lazy_loggers(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.setattr(lazy, "_logger", logging.getLogger(lazy._name))
 
 
+_BUSY_TPU_SUBSTRINGS = (
+    "device or resource busy",
+    "resource busy",
+    "ebusy",
+    "libtpu_lockfile",
+    "already in use",
+    "chips in use",
+)
+_ABSENT_TPU_SUBSTRINGS = (
+    "unknown backend",
+    "no platforms that are instances of tpu",
+    "could not find any tpu",
+    "no tpu devices",
+)
+
+
+def _is_busy_tpu_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(tok in msg for tok in _BUSY_TPU_SUBSTRINGS)
+
+
+def _is_absent_tpu_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(tok in msg for tok in _ABSENT_TPU_SUBSTRINGS)
+
+
+def tpu_mesh(R: int) -> Any:
+    """Return an `R`-device TPU `Mesh`, skipping only when TPU is absent or busy."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh
+
+    try:
+        devs = list(jax.devices("tpu"))
+    except RuntimeError as exc:
+        if _is_absent_tpu_error(exc) or _is_busy_tpu_error(exc):
+            pytest.skip(f"TPU backend absent or busy: {exc}")
+        raise
+    if len(devs) < R:
+        pytest.skip(f"Requires >= {R} TPU devices, found {len(devs)}")
+    try:
+        jax.device_put(jnp.zeros((1,), dtype=jnp.int32), devs[0]).block_until_ready()
+    except RuntimeError as exc:
+        if _is_busy_tpu_error(exc):
+            pytest.skip(f"TPU device busy: {exc}")
+        raise
+    return Mesh(np.asarray(devs[:R]), ("tp",))
+
+
+def host_device(fallback: Any) -> Any:
+    """Prefer CPU for reference input construction when available, else `fallback`."""
+    import jax
+
+    try:
+        cpu_devs = jax.devices("cpu")
+    except RuntimeError:
+        cpu_devs = []
+    return cpu_devs[0] if cpu_devs else fallback
+
+
 @pytest.fixture
 def fake_ex() -> ExecSpec:
     return ExecSpec(B=4, T=1, R=2, ctx=256, tiles=TINY_TILES, interpret=True)

@@ -472,3 +472,68 @@ def test_allreduce_ring_single_slot_layer_parity_alternation():
     )
     for r in range(R):
         assert jnp.allclose(out_u[r], ref, atol=2e-2, rtol=2e-2)
+
+
+def test_tiles_inplace_rejects_multi_rank_and_tpu_mesh_narrows_skip(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """`tiles.inplace` with `R > 1` raises `MegakernelConfigError`, and `tpu_mesh`
+    skips only on absent/busy TPU errors while propagating real `RuntimeError`s."""
+    from tests.megakernel import conftest as mk_conftest
+
+    devs = jax.devices("cpu")
+    mesh = Mesh(devs[:2], ("tp",))
+    spec = synth_hybrid_spec(L=2, att_every=2, R=2)
+    ex_bad = ExecSpec(
+        B=4,
+        T=1,
+        R=2,
+        ctx=256,
+        tiles=dataclasses.replace(
+            TINY_TILES, bank=512 << 10, inplace=True
+        ).with_modules({"gqa": {"kv_blk": 128, "nkv": 2}}),
+        interpret=False,
+    )
+    with pytest.raises(MegakernelConfigError, match=r"tiles\.inplace.*R > 1"):
+        kernel.make_step(mesh, spec, ex_bad, donate_states=True)
+
+    monkeypatch.setattr(
+        jax,
+        "devices",
+        lambda backend=None: (_ for _ in ()).throw(
+            RuntimeError("RESOURCE_UNAVAILABLE: Device or resource busy")
+        ),
+    )
+    with pytest.raises(pytest.skip.Exception, match="busy"):
+        mk_conftest.tpu_mesh(1)
+
+    monkeypatch.setattr(
+        jax,
+        "devices",
+        lambda backend=None: (_ for _ in ()).throw(
+            RuntimeError("INTERNAL: broken PjRt plugin")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="broken PjRt plugin"):
+        mk_conftest.tpu_mesh(1)
+
+    monkeypatch.setattr(jax, "devices", lambda backend=None: [devs[0]])
+    monkeypatch.setattr(
+        jax,
+        "device_put",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            RuntimeError("RESOURCE_EXHAUSTED: Device or resource busy (EBUSY)")
+        ),
+    )
+    with pytest.raises(pytest.skip.Exception, match="TPU device busy"):
+        mk_conftest.tpu_mesh(1)
+
+    monkeypatch.setattr(
+        jax,
+        "device_put",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            RuntimeError("INTERNAL: HBM transfer failed")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="HBM transfer failed"):
+        mk_conftest.tpu_mesh(1)
