@@ -246,12 +246,20 @@ def selection_groups(
 
 
 def export_selection(
-    ids: Any, context: Any, starts: Any, *, T: int, K: int, rows: int
+    ids: Any, context: Any, starts: Any, *, T: int, K: int, rows: int, tails: bool = False
 ) -> Any:
-    """The draft's shared-selection sink rows `[rows, 4 K + 3]` int32 (stock
-    `pooled_qsa`'s `selected`: `selected_tokens` of the groups, plus each row's partial
-    group's tokens) of the kernel's exported ids (`selection_groups`)."""
-    from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import selected_tokens
-
+    """The draft's shared-selection sink rows `[rows, 4 K + 3]` int32 of the kernel's
+    exported ids (`selection_groups`), in stock `pooled_qsa`'s `selected` layout: group j
+    as tokens `4 g + 0..3` at columns `[4 j, 4 j + 4)`, -1 for none. The only reader,
+    `pooled_qsa.shared_blocks`, takes the groups from columns `4 j` alone, so by default
+    the partial group's tokens (`selected_tokens`' per-row scatters, ~+20 us at 32 rows)
+    are left -1: one elementwise fusion. `tails`: those tokens too (the full stock row)."""
     groups, lens = selection_groups(ids, context, starts, T=T, K=K)
-    return selected_tokens(groups[:rows], lens[:rows], GROUP * K, GROUP)
+    groups, lens = groups[:rows], lens[:rows]
+    if tails:
+        from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import selected_tokens
+
+        return selected_tokens(groups, lens, GROUP * K, GROUP)
+    tok = groups[:, :, None] * GROUP + jnp.arange(GROUP, dtype=jnp.int32)
+    tok = jnp.where(groups[:, :, None] >= 0, tok, -1).reshape(rows, GROUP * K)
+    return jnp.pad(tok, ((0, 0), (0, GROUP - 1)), constant_values=-1)
