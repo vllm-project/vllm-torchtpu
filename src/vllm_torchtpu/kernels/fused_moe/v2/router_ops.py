@@ -41,7 +41,7 @@ logger = init_logger(__name__)
 NEG = -3.0e38  # below any real softmax score (>=0); avoids inf
 
 
-_SELECTOR_ROW_TILES = {(2048, 384, 6, 256): 2048}
+_SELECTOR_ROW_TILES = {(2048, 384, 6, 256): 2048, (1024, 384, 6, 256): 1024}
 
 
 def normalized_router_block_rows(
