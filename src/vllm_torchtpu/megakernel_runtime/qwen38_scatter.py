@@ -39,7 +39,7 @@ from vllm_torchtpu.megakernel.models.qwen38_gdn_pool import (
     pool_rows,
 )
 
-from .qwen38_gdn_state import Qwen38GdnPoolLayout, _conv_windows
+from .qwen38_gdn_state import Qwen38GdnPoolLayout
 
 RING = 4
 # Deep prefetch for large calls (j-0158b3f2, 64 rows = 192 checkpoints: 132.6 -> 63.3 us
@@ -105,13 +105,17 @@ def scatter_gdn_ckpts_fast(
     assert 1 <= P < RING_, (prefetch, ring)
     vh, KD, VD, QKV = layout.n_v, layout.d_k, layout.d_v, layout.conv_dim
     rec = rec_ckpt.reshape(n, vh, KD, VD)  # row block (l, s, t), [layout: (s*T+t)*vh]
-    win = _conv_windows(conv_ckpt.astype(jnp.float32), T).reshape(n, 3, QKV)
+    # The conv window of checkpoint (l, s, t) is history rows t+1 .. t+3 of
+    # conv[l, s]; the kernel loads the request's history and cuts the window.
+    conv = conv_ckpt.astype(jnp.float32)
+    HR = conv.shape[2]
+    assert conv.shape[:2] == (NL, NS) and HR >= T + 3, (conv.shape, (NL, NS, T))
     ids = write_blocks.reshape(-1).astype(jnp.int32)
     per = QKV // 256
     f8 = pool.dtype
 
     def kernel(
-        ids_ref, rec_ref, win_ref, pool_in, pool_out, vin, cin, vout, cout, sin, sout
+        ids_ref, rec_ref, conv_ref, pool_in, pool_out, vin, cin, vout, cout, sin, sout
     ):
         del pool_in
 
@@ -134,9 +138,12 @@ def scatter_gdn_ckpts_fast(
             return cps
 
         def in_copies(i, slot):
+            layer, s = i // (NS * T), lax.rem(i // T, NS)
             return (
                 pltpu.make_async_copy(rec_ref.at[i], vin.at[slot], sin.at[slot, 0]),
-                pltpu.make_async_copy(win_ref.at[i], cin.at[slot], sin.at[slot, 1]),
+                pltpu.make_async_copy(
+                    conv_ref.at[layer, s], cin.at[slot], sin.at[slot, 1]
+                ),
             )
 
         for k in range(min(P, n)):
@@ -170,18 +177,24 @@ def scatter_gdn_ckpts_fast(
                 _store_typed(
                     vout.at[slot, j], vals[j * rows : (j + 1) * rows], interpret
                 )
-            cv = cin[slot]
-            # 256-lane rows of the conv history in row-major order, padded to 16.
-            crow = jnp.concatenate(
-                [
-                    cv[r : r + 1, c * 256 : (c + 1) * 256]
-                    for r in range(3)
-                    for c in range(per)
-                ]
-                + [jnp.zeros((CONV_ROWS - 3 * per, 256), jnp.float32)],
-                axis=0,
-            )
-            _store_typed(cout.at[slot], crow, interpret)
+            t = lax.rem(i, T)
+            # One branch per t, so the window's unaligned sublane offset is static.
+            for tt in range(T):
+
+                @pl.when(t == tt)
+                def _(tt=tt):
+                    cv = cin[slot, tt + 1 : tt + 4]
+                    # 256-lane rows of the conv window in row-major order, padded to 16.
+                    crow = jnp.concatenate(
+                        [
+                            cv[r : r + 1, c * 256 : (c + 1) * 256]
+                            for r in range(3)
+                            for c in range(per)
+                        ]
+                        + [jnp.zeros((CONV_ROWS - 3 * per, 256), jnp.float32)],
+                        axis=0,
+                    )
+                    _store_typed(cout.at[slot], crow, interpret)
 
             @pl.when(ids_ref[i] != 0)
             def _():
@@ -214,7 +227,7 @@ def scatter_gdn_ckpts_fast(
             out_specs=pl.BlockSpec(memory_space=any_),
             scratch_shapes=[
                 pltpu.VMEM((RING_, vh, KD, VD), rec.dtype),
-                pltpu.VMEM((RING_, 3, QKV), jnp.float32),
+                pltpu.VMEM((RING_, HR, QKV), jnp.float32),
                 pltpu.VMEM((RING_, SSM_BLOCKS, SSM_ROWS) + tuple(pool.shape[2:]), f8),
                 pltpu.VMEM((RING_, CONV_ROWS) + tuple(pool.shape[2:]), f8),
                 pltpu.SemaphoreType.DMA((RING_, 2)),
@@ -224,4 +237,4 @@ def scatter_gdn_ckpts_fast(
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
         input_output_aliases={3: 0},
         interpret=interpret,
-    )(ids, rec, win, pool)
+    )(ids, rec, conv, pool)

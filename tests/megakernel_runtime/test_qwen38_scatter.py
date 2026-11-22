@@ -179,3 +179,28 @@ def test_auto_ring_follows_the_checkpoint_count(monkeypatch):
     a = np.asarray(jax.lax.bitcast_convert_type(auto, jnp.uint8)).reshape(NMB, 512, -1)
     b = np.asarray(jax.lax.bitcast_convert_type(ref, jnp.uint8)).reshape(NMB, 512, -1)
     np.testing.assert_array_equal(a[1:, :399], b[1:, :399])
+
+
+def test_fast_scatter_long_window_crosses_a_history_tile():
+    """T = 8 (history of rup(3 + 8, 8) = 16 rows): windows t + 1 .. t + 3 start past the
+    first 8-row tile and straddle it, which the in-kernel window cut must handle."""
+    t8, nl, ns = 8, 1, 2
+    nmb = 1 + nl * ns * t8
+    SHAPE = (nmb * 4, 128, 1, 4, 256)
+    LAYOUT = gs.Qwen38GdnPoolLayout(pool_shape=SHAPE, pool_dtype="float8_e4m3fn")
+    rng = np.random.default_rng(3)
+    pool = jax.lax.bitcast_convert_type(
+        jnp.asarray(rng.integers(0, 256, size=SHAPE, dtype=np.uint8)), jnp.float8_e4m3fn
+    )
+    conv = jnp.asarray(rng.standard_normal((nl, ns, 16, 1280)), jnp.float32)
+    rec = jnp.asarray(
+        rng.standard_normal((nl, ns * t8 * 6, 128, 128)), jnp.float32
+    ).astype(jnp.bfloat16)
+    wb = jnp.asarray(1 + np.arange(nl * ns * t8, dtype=np.int32).reshape(nl, ns, t8))
+    ref = gs.scatter_gdn_ckpts(pool, conv, rec, wb, layout=LAYOUT, interpret=True)
+    got = scatter_gdn_ckpts_fast(
+        pool, conv, rec, wb, layout=LAYOUT, interpret=True, ring=4, prefetch=1
+    )
+    a = np.asarray(jax.lax.bitcast_convert_type(ref, jnp.uint8)).reshape(nmb, 512, -1)
+    b = np.asarray(jax.lax.bitcast_convert_type(got, jnp.uint8)).reshape(nmb, 512, -1)
+    np.testing.assert_array_equal(b[1:, :399], a[1:, :399])
