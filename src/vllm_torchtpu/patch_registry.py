@@ -170,6 +170,10 @@ PATCHES = (
     Patch("vllm_torchtpu.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE),
     # API-server reasoning-token count (VLLM_TPU_REASONING_COUNT_FAST).
     Patch("vllm_torchtpu.reasoning_count:patch_reasoning_count_fast", _ACTIVE),
+    # EngineCore / API-server CPU affinity (q38 SV-PAIR; inert unless
+    # VLLM_TPU_CPU_PIN_ENGINE is set, which needs VLLM_TPU_CPU_PIN=slice).
+    Patch("vllm_torchtpu.worker.cpu_pinning:patch_engine_core_cpu_pin", ("engine_core",)),
+    Patch("vllm_torchtpu.worker.cpu_pinning:patch_api_server_cpu_pin", _ACTIVE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.

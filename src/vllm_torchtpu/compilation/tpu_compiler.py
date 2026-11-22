@@ -219,6 +219,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",
     "USE_PHASED_PROFILER",
+    # q38 SV-PAIR: EngineCore / API-server process CPU affinity only
+    # (worker/cpu_pinning.py).
+    "VLLM_TPU_CPU_PIN_ENGINE",
     # Raiden KV-transfer orchestration/identity only; consumed at serving time
     # by the KV connector and never affect the compiled graph.
     # TPU_RAIDEN_ADVERTISE_HOST is the pod IP in the P/D recipes, so hashing it
