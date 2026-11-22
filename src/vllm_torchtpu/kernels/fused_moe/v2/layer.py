@@ -28,7 +28,9 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2 import combine_small
 from vllm_torchtpu.kernels.fused_moe.v2.direct_all_gather import (
     direct_all_gather,
+    direct_all_gather_to_hbm,
     supports_direct_all_gather,
+    supports_direct_all_gather_to_hbm,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
@@ -1269,11 +1271,14 @@ def fused_ep_moe_v2(
                     compiler_options={"sparse_core_config": {"core_ids": [0]}},
                 )(packed).reshape(ep, layout[-1])
         else:
-            q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
+            direct_tokens = uses_direct_token_gather(q_l)
+            q_g = gather_tokens(q_l, direct_tokens)
             topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
                 gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
             )
-            exchange = gather_exchange(packed)
+            # The direct token copy takes core 1 and the routing exchange core 0:
+            # issued together, this placement ends first.
+            exchange = gather_exchange(packed, route_core=0 if direct_tokens else 1)
         return compute_local(
             q_g,
             exchange,
@@ -1291,7 +1296,26 @@ def fused_ep_moe_v2(
             expert_load_l,
         )
 
-    def gather_exchange(packed):
+    def uses_direct_token_gather(q_l):
+        return 0 < t_local <= envs.MOE_DIRECT_TOKEN_AG_MAX_TOKENS and (
+            supports_direct_all_gather_to_hbm(
+                ep, q_l.size * q_l.dtype.itemsize, single_host
+            )
+        )
+
+    def gather_tokens(q_l, direct):
+        """Every shard's token rows [ep * t_local, ...], in rank order.
+
+        Small buckets take one round of SparseCore remote copies on core 1 in
+        place of XLA's barrier-separated stages. Same rows.
+        """
+        if direct:
+            return direct_all_gather_to_hbm(
+                q_l, ax, ep, core_id=1, name="moe_direct_token_ag"
+            )
+        return lax.all_gather(q_l, ax, axis=0, tiled=True)
+
+    def gather_exchange(packed, route_core=1):
         """The routing exchange [ep, width]: every shard's packed routing row.
 
         Where supports_direct_all_gather admits the exchange, each shard
@@ -1302,7 +1326,7 @@ def fused_ep_moe_v2(
         if supports_direct_all_gather(
             ep, packed.size * packed.dtype.itemsize, single_host
         ):
-            gathered = direct_all_gather(packed, ax, ep)
+            gathered = direct_all_gather(packed, ax, ep, route_core)
         else:
             gathered = lax.all_gather(packed, ax, axis=0, tiled=True)
         return gathered.reshape(ep, layout[-1])

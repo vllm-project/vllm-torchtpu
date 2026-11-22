@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_PLAN_KERNEL: bool = False
     MOE_FUSED_EP_V2_COMBINE_ONE_CALL: bool = False
+    MOE_DIRECT_TOKEN_AG_MAX_TOKENS: int = 0
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     MOE_FUSED_EP_V2_WEIGHT_DMA_PRIORITY: int = 1
     MOE_FUSED_EP_V2_LIVE_ROWS_ONLY: bool = False
@@ -983,6 +984,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fused EP MoE v2 three-slot input stream: fetch and wait only each
     # tile's live token rows instead of all tile_m rows.
     "MOE_FUSED_EP_V2_LIVE_ROWS_ONLY": env_bool("MOE_FUSED_EP_V2_LIVE_ROWS_ONLY"),
+    # Fused EP MoE v2 gathers the fp8 token rows with one round of SparseCore
+    # remote copies straight into every peer's output (direct_all_gather_to_hbm)
+    # instead of XLA's offloaded all-gather, for buckets of at most this many
+    # local tokens (0: never).
+    "MOE_DIRECT_TOKEN_AG_MAX_TOKENS": env_int("MOE_DIRECT_TOKEN_AG_MAX_TOKENS", 0),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the
