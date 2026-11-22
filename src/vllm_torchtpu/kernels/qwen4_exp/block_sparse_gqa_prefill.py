@@ -2206,8 +2206,16 @@ def block_sparse_gqa_attention(
     if ascending:
         offset["ascending"] = True
 
+    def guarded_output(output, extra):
+        # Only the bound guard reads lse: the caller keeps bf16(out), so cast
+        # before any row copy (copy_row_segments of the f32 out from HBM took
+        # ~1 ms at 8192 rows; of the bf16 cast, 7 us).
+        if extra.get("return_lse") and not return_lse:
+            return output[0].astype(jnp.bfloat16), output[1]
+        return output
+
     def run_aligned(_, extra):
-        return block_sparse_gqa_prefill(
+        output = block_sparse_gqa_prefill(
             query,
             blocks,
             lengths,
@@ -2222,6 +2230,7 @@ def block_sparse_gqa_attention(
             bf16_io=True,
             **{**offset, **extra},
         )
+        return guarded_output(output, extra)
 
     padded = ((real + query_block - 1) // query_block) * query_block
     offsets = jnp.concatenate((jnp.zeros((1,), jnp.int32), jnp.cumsum(padded)))
@@ -2322,6 +2331,7 @@ def block_sparse_gqa_attention(
             bf16_io=True,
             **{**offset, **extra},
         )
+        output = guarded_output(output, extra)
         if extra.get("return_lse", return_lse):
             out, lse = realign(output[0]), realign(output[1])
             if mask_in_padding:
@@ -2398,8 +2408,9 @@ def block_sparse_gqa_attention(
             jnp.isnan(lse) | jnp.isposinf(lse) | (lse - stab > BOUND_STAB_GUARD_HIGH)
         )
         rerun = jnp.any(low | lost | high)
-        # Without return_lse the kernel writes bf16(out): the same values.
-        output = (out_b, lse) if return_lse else out_b.astype(jnp.bfloat16)
+        # Without return_lse out_b is already bf16(out) (guarded_output), the
+        # values the kernel writes without lse.
+        output = (out_b, lse) if return_lse else out_b
         output = lax.cond(rerun, lambda o: routed({}), lambda o: o, output)
     else:
         output = routed({})

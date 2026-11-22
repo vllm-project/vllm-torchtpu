@@ -466,3 +466,27 @@ def test_bound_route_on_when_eligible(interpret, monkeypatch):
         ratio=RATIO, query_block=256, query_tile=256, kv_tile=PAGE, dcp=True,
         cache_dtype=jnp.float8_e4m3fn,
     )
+
+
+def test_guarded_gated_output_realigns_bf16(interpret, monkeypatch):
+    """Gated call with the bound on: only the guard reads lse, so the row-segment
+    DMA back to token order moves bf16(out), bit-identical to the scatter layout."""
+    case = make_case(np.random.default_rng(8), CASES["two"], 24)
+    bsp.note_key_norm_bound(case[-1])
+    copied = []
+    original = bsp.copy_row_segments
+
+    def spy(src, dst, *args, **kwargs):
+        copied.append(src.dtype)
+        return original(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(bsp, "copy_row_segments", spy)
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_ALIGN_DMA", False)
+    want = attend_replicated(case, 1, gated=True)
+    assert not copied
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_PREFILL_ALIGN_DMA", True)
+    got = attend_replicated(case, 1, gated=True)
+    assert copied and set(copied) == {jnp.dtype(jnp.bfloat16)}
+    np.testing.assert_array_equal(
+        bits(got[0].astype(jnp.float32)), bits(want[0].astype(jnp.float32))
+    )
