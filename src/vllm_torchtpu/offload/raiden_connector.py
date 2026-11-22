@@ -398,6 +398,260 @@ class _ParkedStore:
     acks: int = 0
 
 
+# -- q38 PSTEP-VASYNC (VLLM_TPU_OFFLOAD_VICTIM_ASYNC; default 0 = off) ----------
+#
+# The victim policy stores a block when BlockPool.get_new_blocks evicts it, and
+# get_new_blocks hands that block to its new owner in the same schedule pass, so
+# the store must drain before the pass's metadata ships (_store_victims). With
+# the key set to N > 0 the scheduler also evicts ahead: after the pass's own
+# victims drained, it takes up to N cached blocks from the head of each pool's
+# free queue (the blocks the next allocations would evict), removes them from
+# the free queue and from the prefix cache, submits their store job and does not
+# wait. The blocks are held out of the free queue ("parked") until the manager
+# reports the job terminal (a FinishedJob record, read by a non-blocking poll at
+# the next pass's first allocation and at build_connector_meta); only then do
+# they go back to the head of the free queue, hashless, so the next allocations
+# take them without evicting (and without a synchronous store). The pool still
+# counts parked blocks as free; an allocation that needs more blocks than the
+# free queue holds drains this pool's parked jobs first, oldest first, with
+# today's synchronous drain. Device programs are unchanged.
+
+_VASYNC: _VictimAsync | None = None
+
+
+def _patch_block_pool_victim_async() -> None:
+    """Wraps ``BlockPool.get_new_blocks`` and ``BlockPool.get_num_free_blocks``
+    at class level; inert unless a ``_VictimAsync`` is active. Installed after
+    ``victim.patch_block_pool_victims`` (its allocation window and victim record
+    stay inside this wrapper). Idempotent."""
+    from vllm.v1.core.block_pool import BlockPool
+
+    if BlockPool.__dict__.get("_q38_vasync_patch", False):
+        return
+    orig_get = BlockPool.get_new_blocks
+    orig_free = BlockPool.get_num_free_blocks
+
+    def get_new_blocks(self, num_blocks):
+        vasync = _VASYNC
+        if vasync is None:
+            return orig_get(self, num_blocks)
+        vasync.before_alloc(self, num_blocks)
+        seen = len(vasync.tap.pending)
+        out = orig_get(self, num_blocks)
+        if len(vasync.tap.pending) > seen:
+            # This pool evicts blocks the policy stores: evict ahead on it.
+            vasync.pools.setdefault(id(self), self)
+        return out
+
+    def get_num_free_blocks(self):
+        vasync = _VASYNC
+        n = orig_free(self)
+        return n if vasync is None else n + vasync.parked_blocks(self)
+
+    BlockPool.get_new_blocks = get_new_blocks
+    BlockPool.get_num_free_blocks = get_num_free_blocks
+    BlockPool._q38_vasync_patch = True
+
+
+@dataclass
+class _ParkedVictims:
+    """The source blocks of one asynchronous victim store job, held out of the
+    free queue and out of the prefix cache until the job is terminal."""
+
+    pool: object
+    blocks: list
+    queued_at: float
+
+
+class _VictimAsync:
+    """VLLM_TPU_OFFLOAD_VICTIM_ASYNC state of one scheduler connector (the
+    EngineCore process; the scheduler thread is the only caller)."""
+
+    def __init__(self, sched: TPURaidenOffloadingScheduler, reserve: int):
+        self.sched = sched
+        self.reserve = reserve
+        self.tap = sched._victim_tap
+        self.fatal = bool(sched.__dict__.get("_fatal_drain", False))
+        # Pools whose allocations evicted a block the policy stores.
+        self.pools: dict[int, object] = {}
+        # job_id -> parked blocks, in submission order.
+        self.parked: dict[int, _ParkedVictims] = {}
+        self.count: dict[int, int] = {}
+        # Records of other jobs a reclaim polled before build_connector_meta;
+        # the next poll_finished_jobs returns them first.
+        self.stash: list = []
+        # Jobs a timed-out drain gave up (single store only): their late
+        # records are dropped, never echoed.
+        self.abandoned: set[int] = set()
+        self.reclaimed_at: int | None = None
+        manager = sched._raiden_manager
+        # The manager's own chain (lookup_log's wrappers, then the class).
+        self._poll = manager.poll_finished_jobs
+        self._drain = manager.drain_jobs
+        # Every poll of the manager's jobs goes through _route: a parked job's
+        # record releases its blocks and never reaches the workers' echo (vLLM's
+        # update_connector_output knows no victim job ids).
+        manager.poll_finished_jobs = self.poll_finished_jobs
+
+    def parked_blocks(self, pool) -> int:
+        return self.count.get(id(pool), 0)
+
+    def _tel(self, name: str, n: int = 1) -> None:
+        tel = self.sched.telemetry
+        tel[name] = tel.get(name, 0) + n
+
+    def _release(self, rec: _ParkedVictims, success: bool) -> None:
+        pool = rec.pool
+        self.count[id(pool)] -= len(rec.blocks)
+        pool.free_block_queue.prepend_n(rec.blocks)
+        self._tel("victim_async_done" if success else "victim_async_failed")
+        self._tel("victim_async_released_blocks", len(rec.blocks))
+        self._tel("victim_async_park_us", int((time.perf_counter() - rec.queued_at) * 1e6))
+
+    def _route(self, finished: list) -> list:
+        """Releases the blocks of every parked job whose terminal record is in
+        ``finished`` (each job only its own blocks); returns the other records."""
+        rest = []
+        for f in finished:
+            rec = self.parked.pop(f.job_id, None)
+            if rec is not None:
+                self._release(rec, f.success)
+            elif f.job_id in self.abandoned:
+                self.abandoned.discard(f.job_id)
+            else:
+                rest.append(f)
+        return rest
+
+    def poll_finished_jobs(self) -> list:
+        out = self.stash + self._route(self._poll())
+        self.stash = []
+        return out
+
+    def reclaim(self) -> None:
+        """Non-blocking: frees the blocks of parked jobs the manager reports terminal."""
+        if self.parked:
+            self.stash.extend(self._route(self._poll()))
+
+    def before_alloc(self, pool, num_blocks: int) -> None:
+        if self.parked and self.reclaimed_at != self.tap.step:
+            # Once per pass, before its first allocation.
+            self.reclaimed_at = self.tap.step
+            self.reclaim()
+        queue = pool.free_block_queue
+        if num_blocks <= queue.num_free_blocks or not self.count.get(id(pool), 0):
+            return
+        # The free queue would run dry: today's synchronous drain, on this
+        # pool's parked jobs, oldest first, until the queue holds the request.
+        self.reclaim()
+        t0 = time.perf_counter()
+        for job_id in [j for j, r in self.parked.items() if r.pool is pool]:
+            if num_blocks <= queue.num_free_blocks:
+                break
+            if job_id not in self.parked:
+                continue
+            done = self._drain({job_id})
+            finished = [f for f in done if f.job_id == job_id]
+            if not finished and self.fatal:
+                # The blocks stay parked: the engine stops.
+                raise RuntimeError(
+                    "TPURaidenOffloadingConnector: parked victim store job "
+                    f"{job_id} ({len(self.parked[job_id].blocks)} blocks) did not finish within the "
+                    "drain timeout; its source blocks are about to be reused under a "
+                    "live transfer, so the engine stops before they return to the "
+                    "free queue (VLLM_TPU_OFFLOAD_VICTIM_ASYNC). Rerun."
+                )
+            rec = self.parked.pop(job_id)
+            if not finished:
+                # Without the tier classes a timed-out drain poisons the job
+                # (it finalizes as a failure and publishes nothing), as today.
+                self.abandoned.add(job_id)
+            self._release(rec, bool(finished) and finished[0].success)
+            self._tel("victim_async_fallback_jobs")
+        self._tel("victim_async_fallbacks")
+        self._tel("victim_async_fallback_us", int((time.perf_counter() - t0) * 1e6))
+
+    def top_up(self, step: int) -> None:
+        """Evicts ahead: parks eligible cached blocks from the head of each pool's
+        free queue and stores them without waiting, until N blocks at the head
+        (or parked) need no store when allocated."""
+        from vllm.v1.core.kv_cache_utils import get_block_hash, get_group_id
+
+        t0 = time.perf_counter()
+        sched = self.sched
+        manager = sched._raiden_manager
+        min_age, groups = sched._victim_min_age, sched._victim_groups
+        freed_at = self.tap.freed_at
+        for pool in list(self.pools.values()):
+            queue = pool.free_block_queue
+            watched = getattr(pool, "_reuse_watchers", None) or {}
+            have = self.count.get(id(pool), 0)
+            take: list = []
+            keys: list[OffloadKey] = []
+            seen: set[OffloadKey] = set()
+            tail = queue.fake_free_list_tail
+            block = queue.fake_free_list_head.next_free_block
+            # Every block walked needs no store when allocated: it stays (as
+            # it needs none) or it is parked and comes back hashless.
+            while block is not None and block is not tail and have < self.reserve:
+                have += 1
+                block_hash = block.block_hash
+                if block_hash is None or block.is_null or block.block_id in watched:
+                    # Hashless (nothing to store), or readable until reused
+                    # (unpin_blocks): left where it is.
+                    block = block.next_free_block
+                    continue
+                group = get_group_id(block_hash)
+                freed = freed_at.get(block.block_id)
+                if group not in groups or freed is None or step - freed < min_age:
+                    # Not stored when an allocation evicts it either
+                    # (victim.select_victims): left where it is.
+                    block = block.next_free_block
+                    continue
+                key = make_offload_key(get_block_hash(block_hash), group)
+                if key not in seen:
+                    seen.add(key)
+                    take.append(block)
+                    keys.append(key)
+                block = block.next_free_block
+            if not take:
+                continue
+            for block in take:
+                queue.remove(block)
+                # Outside an allocation the victim hook records nothing.
+                pool._maybe_evict_cached_block(block)
+            self._tel("victim_async_seen", len(take))
+            want = set(manager.prepare_victim_store(keys))
+            store = [(k, b) for k, b in zip(keys, take) if k in want]
+            idle = [b for k, b in zip(keys, take) if k not in want]
+            if idle:
+                # Already on the host (or being stored): nothing to wait for.
+                queue.prepend_n(idle)
+                self._tel("victim_async_resident", len(idle))
+            if store:
+                job_id = sched._generate_job_id()
+                manager.submit_store_job(
+                    job_id, [k for k, _ in store], [b.block_id for _, b in store]
+                )
+                self.parked[job_id] = _ParkedVictims(
+                    pool, [b for _, b in store], time.perf_counter()
+                )
+                self.count[id(pool)] = self.count.get(id(pool), 0) + len(store)
+                self._tel("victim_async_stores")
+                self._tel("victim_async_store_keys", len(store))
+        self._tel("victim_async_topup_us", int((time.perf_counter() - t0) * 1e6))
+
+    def telemetry(self) -> str:
+        return (
+            f"victim_async_parked={sum(self.count.values())} "
+            f"victim_async_jobs={len(self.parked)} victim_async_reserve={self.reserve}"
+        )
+
+    def deactivate(self) -> None:
+        global _VASYNC
+        if _VASYNC is self:
+            _VASYNC = None
+
+
 class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     """Scheduler for the store-backed offload path.
 
@@ -439,6 +693,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             self._enable_victim_policy(spec, vllm_config)
         if tpu_envs.VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE:
             self._enable_exclusive_restore()
+        if tpu_envs.VLLM_TPU_OFFLOAD_VICTIM_ASYNC:
+            self._enable_victim_async(tpu_envs.VLLM_TPU_OFFLOAD_VICTIM_ASYNC)
 
     @property
     def restores_state_with_every_load(self) -> bool:
@@ -575,6 +831,29 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             else "single store",
         )
 
+    def _enable_victim_async(self, reserve: int) -> None:
+        """VLLM_TPU_OFFLOAD_VICTIM_ASYNC=N: evict ahead up to N blocks a pool and
+        store them without waiting (see _VictimAsync). Only with the victim
+        policy, whose evictions it moves ahead of the allocations."""
+        global _VASYNC
+        if not self.__dict__.get("_victim", False):
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_VICTIM_ASYNC needs "
+                f"{victim.POLICY_ENV}=victim (it stores the blocks HBM evicts)"
+            )
+        if _VASYNC is not None and _VASYNC.sched is not self:
+            raise RuntimeError("a VLLM_TPU_OFFLOAD_VICTIM_ASYNC scheduler is already active")
+        _patch_block_pool_victim_async()
+        self._vasync = _VictimAsync(self, reserve)
+        _VASYNC = self._vasync
+        logger.info(
+            "TPURaidenOffloadingConnector: victim stores asynchronous (evict ahead up "
+            "to %d blocks a pool, held out of the free queue until each store job is "
+            "terminal; an allocation the free queue cannot hold drains them first); %s",
+            reserve,
+            "drain timeout fatal" if self._vasync.fatal else "drain timeout poisons",
+        )
+
     def _store_victims(self) -> None:
         """Store this step's evicted blocks and drain them before the step's
         metadata ships, so the new owners' forward passes cannot overwrite a
@@ -623,6 +902,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     ):
                         name = f"victim_store_keys_g{group}"
                         tel[name] = tel.get(name, 0) + n
+        vasync = self.__dict__.get("_vasync")
+        if vasync is not None:
+            # After this pass's own victims drained, before its metadata ships.
+            vasync.top_up(tap.step)
         tap.advance()
 
     # Cumulative host-tier counters, logged every VLLM_TPU_OFFLOAD_TELEMETRY_S
@@ -669,6 +952,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         for name, counts in sorted(self.__dict__.get("_tier_check_totals", {}).items()):
             fields = " ".join(f"{k}={v}" for k, v in zip(CHECK_FIELDS, counts))
             line += f" tier_check[{name}] {fields} unhashed={unhashed.get(name, 0)}"
+        vasync = self.__dict__.get("_vasync")
+        if vasync is not None:
+            line += " " + vasync.telemetry()
         return line
 
     def _maybe_log_telemetry(self) -> None:
@@ -873,6 +1159,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         super().update_connector_output(connector_output)
 
     def shutdown(self) -> None:
+        vasync = self.__dict__.get("_vasync")
+        if vasync is not None:
+            vasync.deactivate()
         tap = self.__dict__.get("_victim_tap")
         if tap is not None:
             victim.deactivate(tap)
