@@ -139,6 +139,27 @@ def test_sparse_rows_match_dense(m, with_shared):
     )
 
 
+def test_sparse_rows_match_dense_with_f32_weights_and_repeated_ids():
+    """A row naming one local expert twice adds it once with the summed
+    weight, and f32 routing weights reach the scatter unrounded."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    m, h, i, e, topk = 48, 512, 1024, 4, 4
+    x, w1, w2, s1, s2, _, ids = _inputs(m, h, i, e, topk, seed=7)
+    local = np.where(np.asarray(ids) >= e, np.asarray(ids) - e, -1)
+    local[5, :2] = 2
+    local[9, :] = 3
+    weights = jnp.asarray(
+        np.random.default_rng(3).uniform(0.1, 1.0, size=(m, topk)), jnp.float32
+    )
+    args = (x, w1, w2, s1, s2, weights, jnp.asarray(local, jnp.int32))
+    dense = kernel.dense_expert_moe_fp4(*args)
+    sparse = kernel.dense_expert_moe_fp4(*args, sparse_rows=True)
+    np.testing.assert_array_equal(
+        np.asarray(sparse, np.float32), np.asarray(dense, np.float32)
+    )
+
+
 def test_dense_fp4_shared_without_local_route_is_the_shared_expert():
     if jax.default_backend() != "tpu":
         pytest.skip("requires TPU")

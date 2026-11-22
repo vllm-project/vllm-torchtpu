@@ -60,9 +60,12 @@ _VMEM_HEADROOM = 1 << 20
 # per token element, and a margin. tpu7x AOT compiles (libtpu 0.0.50) of the
 # MiniMax-M3 EP8 call (h 6144, i 3072, shared 384) need 50.3 MiB at 16 rows
 # and 52.7 MiB at 32; XLA keeps the call's neighbours in VMEM only with
-# limits up to ~53.7 MiB. The sparse-row mode stays within the same bound at
-# every size it serves (EP4xTP2 call, i 1536: 54.6 / 56.8 / 46.1 / 50.7 MiB at
-# 48 / 64 / 96 / 128 rows, chunk 768 / 768 / 512 / 512).
+# limits up to ~53.7 MiB. The sparse-row mode's need stays within the same
+# per-element bound (EP4xTP2 call, i 1536: 54.6 / 56.8 / 46.1 / 50.7 MiB at
+# 48 / 64 / 96 / 128 rows, chunk 768 / 768 / 512 / 512), above that neighbour
+# limit at 48 and 64 rows: 512-column units would fit under it but leave the
+# call issue-bound (twin 48-row step: +8.7 us per MoE layer for -4.3 us of
+# neighbour stalls).
 _CALIBRATED_ROWS = 32
 _CALIBRATED_TOKEN_BYTES = 24
 _CALIBRATED_MARGIN = 256 << 10
