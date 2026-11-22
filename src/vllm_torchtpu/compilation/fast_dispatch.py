@@ -141,10 +141,6 @@ def _memo_live(refs: tuple, objs: list) -> bool:
     return all(ref() is obj for ref, obj in zip(refs, objs, strict=True))
 
 
-def memo_stats() -> dict[str, int]:
-    return dict(_MEMO_STATS)
-
-
 def configure_guard_memo(enabled: bool) -> None:
     """Turn the guard memo on or off for this process (``runner.host_trims``)."""
     _MEMO["on"] = bool(enabled)
