@@ -48,6 +48,7 @@ _PERF_FLAGS_OFF = {
     "gqa.pair_kv": False,
     "dmm_unroll": 0,
     "gqa.gq_pack": False,
+    "gqa.rope_fp32": False,
     "moe.topk_lanes": False,
     "gdn.conv_stage": False,
     "gdn.gdn_head_major": False,
@@ -109,8 +110,13 @@ def test_exact_flip_list_covers_registry():
         }
         flipped = with_tile_fields(TINY_TILES, tile_ov)
         assert tile_field(flipped, field_name) == flip_val
+
+
+def test_synth_fixture_specs_build_valid_model_specs():
+    """Synthetic fixture helpers construct valid `ModelSpec`s across overrides."""
+    for _, _, _, _, extra in EXACT_FLIPS:
         spec = synth_hybrid_spec(R=2, **extra.get("geom_kw", {}))
-        assert isinstance(spec.config, SynthHybrid)
+        assert spec.name == "synth_hybrid" and len(spec.layer_type.slots) == 2
     full_spec = synth_full_scale_spec(moe_tp=False, R=8)
     assert full_spec.config.L == 60 and full_spec.config.E == 512
     ov_spec = synth_hybrid_spec(SynthHybrid(), R=2, L=2, att_every=2)
