@@ -2032,6 +2032,28 @@ def test_json_schema_task_config_in_the_environment_is_ignored(
     assert _json_schema_results(flow)["meta"]["total_trials"] == 28
 
 
+def test_missing_json_schema_task_config_fails_before_cleanup(flow):
+    config = flow.write_config(
+        "missing-task",
+        _FIXTURE_CONFIG_BODY + 'JSON_SCHEMA_TASK_CONFIG="/nonexistent/task.yaml"\n',
+    )
+
+    # No endpoint flag: this run would boot a server for the suite.
+    proc = flow.run_unchecked(
+        "--eval-suites", "mmlu_pro,json_schema", "--perf-suites", "none", config=config
+    )
+
+    assert proc.returncode == 1
+    assert (
+        "ERROR: JSON_SCHEMA_TASK_CONFIG of missing-task is not a file: "
+        "/nonexistent/task.yaml" in proc.stdout
+    )
+    assert "Running benchmarks" not in proc.stdout
+    assert flow.argv("cleanup_server") == []
+    assert flow.argv("vllm") == []
+    assert flow.argv("lm_eval") == []
+
+
 def test_eval_suites_all_includes_json_schema(flow):
     flow.run(*flow.host_args, "--eval-suites", "all", "--perf-suites", "none")
 

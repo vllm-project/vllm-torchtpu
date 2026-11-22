@@ -600,6 +600,13 @@ if [ -n "$effective_eval_suites" ]; then
     done
 fi
 
+# Checked here, before any server boots: the json_schema suite would only find
+# its task config missing after the boot and every suite that runs before it.
+if [[ " ${SELECTED_EVAL_SUITES[*]} " == *" json_schema "* ]] && [ ! -f "$JSON_SCHEMA_TASK_CONFIG" ]; then
+    echo "ERROR: JSON_SCHEMA_TASK_CONFIG of $CONFIG_NAME is not a file: $JSON_SCHEMA_TASK_CONFIG"
+    exit 1
+fi
+
 NEEDS_LIVE_SERVER=0
 if [ "$RUN_BENCH_SERVE" = "1" ] || [ "${#SELECTED_EVAL_SUITES[@]}" -gt 0 ]; then
     NEEDS_LIVE_SERVER=1

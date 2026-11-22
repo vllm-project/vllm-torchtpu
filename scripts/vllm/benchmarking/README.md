@@ -289,5 +289,5 @@ prints the rows without posting them.
 | `SERVED_MODEL_NAME` (config var) | (empty) | Optional `--served-model-name` passed in `spec_bench` mode |
 | `EVAL_SUITES` (config var) | (empty) | Default comma-separated accuracy suites when neither `--eval-suites` nor `--run-*-eval` is passed |
 | `PERF_SUITES` (config var) | (empty) | Default comma-separated performance suites (`bench_serve`, `all`, or `none`) when `--perf-suites` is omitted; legacy `--skip-benchmark` still removes `bench_serve` |
-| `JSON_SCHEMA_TASK_CONFIG` (config var) | `task_configs/json_schema_default.yaml` | Task config of the `json_schema` suite. Read from the config file only, not from the environment |
+| `JSON_SCHEMA_TASK_CONFIG` (config var) | `task_configs/json_schema_default.yaml` | Task config of the `json_schema` suite. Read from the config file only, not from the environment. A run that selects `json_schema` stops before it starts a server when the file does not exist |
 | `OPENAI_API_KEY` | (empty) | Sent as a bearer token to `/v1/models` and by `eval_json_schema.py`, and as `--api-key` to `evalscope` (in addition to `lm_eval` and `vllm bench serve`). `FORWARD` in `.buildkite/kubernetes/common.sh` does not name it, so a key set on a Buildkite kube step does not reach the pod; a gateway that requires the key then answers the `/v1/models` lookup with 401 and the run stops |
