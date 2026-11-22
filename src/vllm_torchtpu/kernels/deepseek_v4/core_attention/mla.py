@@ -564,7 +564,7 @@ def _mla_ragged_paged_attention_kernel(
             out = (
                 lax.div(acc, l_sum[:, :, None])
                 if q_dtype == jnp.float32
-                else (acc * pl.reciprocal(l_sum[:, :, None], approx=True)).astype(
+                else (acc * pltpu.reciprocal(l_sum[:, :, None], approx=True)).astype(
                     q_dtype
                 )
             )
