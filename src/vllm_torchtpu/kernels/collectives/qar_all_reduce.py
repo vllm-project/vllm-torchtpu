@@ -649,7 +649,11 @@ def _put_body(q_cw, s_cw, q_cc, s_cc, f_cw, f_cc):
 
 
 @functools.cache
-def _fused_call(t: int, h: int):
+def _fused_call(t: int, h: int, int8_sib: bool = False):
+    """int8_sib: instead of the closing bf16 d2d all-gather of this core's half,
+    forward the int8 chunks (owned + gathered) to the sibling as they arrive
+    and let it dequantize them: half the bytes on the last, unhidden leg; the
+    same bits (every core dequantizes the same bytes)."""
     hh = h // 2
     w = hh // 8
     th = t // 2  # rows per half
@@ -660,8 +664,12 @@ def _fused_call(t: int, h: int):
     def slot(i, d, hf):
         return (i * 2 + d) * 2 + hf
 
-    def kernel(rank_ref, tab_ref, x_ref, full, recv, sq, ss, rq, rs, fq, fs, aq, as_,
-               d2d_send, d2d_recv, rs_send, rs_recv, ag_send, ag_recv, fin_send, fin_recv):
+    def kernel(rank_ref, tab_ref, x_ref, full, recv, sq, ss, rq, rs, fq, fs, aq, as_, *rest):
+        if int8_sib:
+            (saq, sas, sfq, sfs, d2d_send, d2d_recv, rs_send, rs_recv, ag_send, ag_recv,
+             fin_send, fin_recv, sib_send, sib_recv) = rest
+        else:
+            d2d_send, d2d_recv, rs_send, rs_recv, ag_send, ag_recv, fin_send, fin_recv = rest
         me = rank_ref[0]
         core = tab_ref[CORE, me]
         pos = tab_ref[POS, me]
@@ -766,6 +774,12 @@ def _fused_call(t: int, h: int):
                         cq.start()
                         cs.start()
                         sends += [cq, cs]
+                        if int8_sib:
+                            for src, dst, n in ((fq.at[qs], sfq.at[qs], 0), (fs.at[ssl], sfs.at[ssl], 1)):
+                                c = remote(src, dst, sib_send.at[2 * nbuf + 2 * j + n],
+                                           sib_recv.at[2 * nbuf + 2 * j + n], sib)
+                                c.start()
+                                sends.append(c)
 
         # 3. ring all-gather: receive, forward unchanged, put in place.
         def ag_pair(g, d, hf, dev, ssem_base):
@@ -781,6 +795,13 @@ def _fused_call(t: int, h: int):
                     g = slot(jstep, d, hf)
                     for c in ag_pair(g, d, hf, peer[d], ag_send):
                         c.wait_recv()
+                    if int8_sib:  # the sibling gets the same bytes
+                        gq = pl.ds(g * th, th)
+                        gs = pl.ds(g * (th // QROWS), th // QROWS)
+                        for src, dst, n in ((aq.at[gq], saq.at[gq], 0), (as_.at[gs], sas.at[gs], 1)):
+                            c = remote(src, dst, sib_send.at[2 * g + n], sib_recv.at[2 * g + n], sib)
+                            c.start()
+                            sends.append(c)
                     if jstep < 2:  # forward the same bytes into the next ring slot
                         g2 = slot(jstep + 1, d, hf)
                         src_q = pl.ds(g * th, th)
@@ -803,7 +824,32 @@ def _fused_call(t: int, h: int):
                              tile_spec(hb, core * 8 + kblk(1, k[1]))]
                 pltpu.emit_pipeline(_put_body, grid=(nt,), in_specs=in_specs,
                                     out_specs=out_specs)(aq, as_, aq, as_, full, full)
-                if jstep == 2:  # half done: 4. d2d all-gather of this half
+                if jstep == 2 and int8_sib:
+                    # 4'. the sibling's half from its int8 chunks
+                    def sib_wait(buf_q, buf_s, slot_idx, sem_base):
+                        gq = pl.ds(slot_idx * th, th)
+                        gs = pl.ds(slot_idx * (th // QROWS), th // QROWS)
+                        remote(buf_q.at[gq], buf_q.at[gq], sib_send.at[sem_base], sib_recv.at[sem_base], sib).wait_recv()
+                        remote(buf_s.at[gs], buf_s.at[gs], sib_send.at[sem_base + 1], sib_recv.at[sem_base + 1], sib).wait_recv()
+
+                    other_core = 1 - core
+                    pieces = [(sfq, sfs, [d * 2 + hf for d in range(2)], [2 * nbuf + 2 * (d * 2 + hf) for d in range(2)],
+                               (pos + 1, pos - 1))]
+                    for js in range(3):
+                        gg = [slot(js, d, hf) for d in range(2)]
+                        pieces.append((saq, sas, gg, [2 * x for x in gg], (pos - js, pos + js)))
+                    for bq, bs, slots_, sems_, kk in pieces:
+                        for sl, sb in zip(slots_, sems_):
+                            sib_wait(bq, bs, sl, sb)
+                        in_specs = []
+                        for sl in slots_:
+                            in_specs += [pl.BlockSpec((_TILE, w), lambda r, sl=sl: (sl * nt + r, 0)),
+                                         pl.BlockSpec((sr, w), lambda r, sl=sl: (sl * nt + r, 0))]
+                        out_specs = [tile_spec(hb, other_core * 8 + kblk(0, kk[0])),
+                                     tile_spec(hb, other_core * 8 + kblk(1, kk[1]))]
+                        pltpu.emit_pipeline(_put_body, grid=(nt,), in_specs=in_specs,
+                                            out_specs=out_specs)(bq, bs, bq, bs, full, full)
+                elif jstep == 2:  # half done: 4. d2d all-gather of this half
                     mine = pl.ds(pl.multiple_of(core * hh, 128), hh)
                     c = remote(full.at[rows(hf), mine], full.at[rows(hf), mine],
                                fin_send.at[8 + hf], fin_recv.at[hf], sib)
@@ -828,6 +874,15 @@ def _fused_call(t: int, h: int):
         jax.ShapeDtypeStruct((nbuf * th, w), I8),                # aq (all-gather slots)
         jax.ShapeDtypeStruct((nbuf * th // QROWS, w), F32),      # as
     )
+    sib_scratch = []
+    if int8_sib:
+        outs = outs + (
+            jax.ShapeDtypeStruct((nbuf * th, w), I8),            # saq (sibling's gathered chunks)
+            jax.ShapeDtypeStruct((nbuf * th // QROWS, w), F32),  # sas
+            jax.ShapeDtypeStruct((4 * th, w), I8),               # sfq (sibling's owned chunks)
+            jax.ShapeDtypeStruct((4 * th // QROWS, w), F32),     # sfs
+        )
+        sib_scratch = [pltpu.SemaphoreType.DMA((2 * nbuf + 8,)), pltpu.SemaphoreType.DMA((2 * nbuf + 8,))]
     return pl.pallas_call(
         kernel,
         out_shape=outs,
@@ -840,15 +895,16 @@ def _fused_call(t: int, h: int):
                 pltpu.SemaphoreType.DMA((2 * nbuf,)), pltpu.SemaphoreType.DMA((2 * nbuf,)),  # rs
                 pltpu.SemaphoreType.DMA((2 * nbuf,)), pltpu.SemaphoreType.DMA((2 * nbuf,)),  # ag
                 pltpu.SemaphoreType.DMA((10,)), pltpu.SemaphoreType.DMA((2,)),          # owned AG start + d2d ag
-            ],
+            ] + sib_scratch,
         ),
         compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
-        name=f"qar_fused-t_{t}-h_{h}",
+        name=f"qar_fused-t_{t}-h_{h}" + ("-i8sib" if int8_sib else ""),
     )
 
 
-def all_reduce_v2(x: jax.Array, me: jax.Array, tab: np.ndarray) -> jax.Array:
-    """v2 of `all_reduce` (TPU only): one fused call, two interleaved row halves."""
+def all_reduce_v2(x: jax.Array, me: jax.Array, tab: np.ndarray, int8_sib: bool = False) -> jax.Array:
+    """v2 of `all_reduce` (TPU only): one fused call, two interleaved row halves.
+    int8_sib: the closing d2d all-gather forwards int8 chunks (same bits)."""
     rows, h = x.shape
     if h % (2 * 2 * 4 * 128):
         raise ValueError(f"hidden {h} must split into 16 lane-aligned chunks")
@@ -856,7 +912,7 @@ def all_reduce_v2(x: jax.Array, me: jax.Array, tab: np.ndarray) -> jax.Array:
     if t != rows:
         x = jnp.pad(x, ((0, t - rows), (0, 0)))
     rank = me.reshape(1).astype(jnp.int32)
-    full = _fused_call(t, h)(rank, jnp.asarray(tab), x)[0]
+    full = _fused_call(t, h, int8_sib)(rank, jnp.asarray(tab), x)[0]
     return full[:rows]
 
 
