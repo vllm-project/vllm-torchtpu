@@ -1,0 +1,3 @@
+{
+  "_pending": "No measured baseline yet. The 1P1D correctness step runs no benchmark; a benchmark instantiation of this recipe will calibrate its vllm bench serve cells with check_regression.py --mode perf --calibrate over at least two runs of the recipe's own launcher and commit them with a _source block. Until then check_regression.py refuses this file."
+}
