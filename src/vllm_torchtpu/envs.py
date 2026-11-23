@@ -263,6 +263,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
     VLLM_TPU_PREFILL_SPACING_SHORT_TOKENS: int = 0
     VLLM_TPU_PREFILL_TPOT_PRICED: bool = False
+    VLLM_TPU_PREFILL_SPACING_SHORT_TPOT_SLACK: float = 0.0
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
@@ -1695,6 +1696,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prompts still run; prefill is deferred only when less than one KV block
     # fits.
     "VLLM_TPU_PREFILL_TPOT_PRICED": env_bool("VLLM_TPU_PREFILL_TPOT_PRICED", False),
+    # PrefillSpacingScheduler: with VLLM_TPU_PREFILL_SPACING_SHORT_TOKENS set,
+    # let the (unpriced) TPOT hold also run short prompts whole: up to that
+    # many tokens, and only the tokens whose cost (per token, measured on
+    # long-chunk steps) fits in this fraction of the smallest slack of the
+    # decoding requests it protects. 0 keeps the hold deferring all prefill.
+    "VLLM_TPU_PREFILL_SPACING_SHORT_TPOT_SLACK": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_SPACING_SHORT_TPOT_SLACK", 0.0
+    ),
     # MiniMax M3 DCP steps of at most this many tokens merge the attention
     # partials with one packed all-to-all instead of an LSE all-gather plus an
     # output reduce-scatter (`models.minimax_m3.dcp_pack`). 0 keeps the

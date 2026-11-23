@@ -234,3 +234,44 @@ def test_priced_tpot_without_slack_runs_prefill(shared_model_config, monkeypatch
     )
     monkeypatch.setattr(scheduler, "_short_of_slack", lambda decoders, now: None)
     assert set(scheduler.schedule().num_scheduled_tokens) == {"dec", "short", "big"}
+
+
+@pytest.mark.parametrize(
+    ("short_tokens", "slack_frac", "slack_s", "debt_s", "expected"),
+    [
+        # Off: the TPOT hold defers all prefill.
+        (40, 0.0, 0.08, 0.0, {"dec": 8}),
+        # 0.5 x 0.08 s / 2 ms = 20 tokens: `short` whole; `big` never cut.
+        (40, 0.5, 0.08, 0.0, {"dec": 8, "short": 16}),
+        # Only 10 tokens fit: `short` (16) does not run.
+        (40, 0.5, 0.04, 0.0, {"dec": 8}),
+        # Short-prompt cap below `short`: nothing runs.
+        (8, 1.0, 0.08, 0.0, {"dec": 8}),
+        # 1.0 x 0.2 s = 100 tokens, cap 64: still whole prompts only, so
+        # `short` and `big` (48 left) both fit in 64 tokens.
+        (64, 1.0, 0.2, 0.0, {"dec": 8, "short": 16, "big": 48}),
+        # With the debt too: the debt's cap (40) also applies, `big` waits.
+        (40, 1.0, 0.2, 0.05, {"dec": 8, "short": 16}),
+    ],
+)
+def test_short_prompts_bypass_tpot_hold(
+    shared_model_config,
+    monkeypatch,
+    short_tokens,
+    slack_frac,
+    slack_s,
+    debt_s,
+    expected,
+):
+    scheduler = _decoding_scheduler(
+        shared_model_config,
+        monkeypatch,
+        VLLM_TPU_PREFILL_SPACING_FRAC=0.5,
+        VLLM_TPU_PREFILL_TPOT_TARGET_MS=20,
+        VLLM_TPU_PREFILL_SPACING_SHORT_TOKENS=short_tokens,
+        VLLM_TPU_PREFILL_SPACING_SHORT_TPOT_SLACK=slack_frac,
+    )
+    scheduler._debt_s = debt_s
+    monkeypatch.setattr(scheduler, "_short_of_slack", lambda decoders, now: slack_s)
+    out = scheduler.schedule()
+    assert dict(out.num_scheduled_tokens) == expected

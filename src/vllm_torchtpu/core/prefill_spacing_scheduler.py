@@ -53,6 +53,9 @@ warmest-first admission, each step this scheduler:
   step's prefill by its tokens: prefill is cut to the tokens whose cost (per
   token, measured on long-chunk steps) fits in the smallest slack it
   protects, and deferred only when less than one KV block fits.
+* with ``VLLM_TPU_PREFILL_SPACING_SHORT_TPOT_SLACK`` also set, the unpriced
+  TPOT hold runs short prompts whole too, as many tokens as fit in that
+  fraction of the smallest slack it protects (at most the short-prompt cap).
 
 Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.prefill_spacing_scheduler.PrefillSpacingScheduler``.
@@ -100,6 +103,13 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self.max_hold_s = envs.VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S
         self.short_tokens = envs.VLLM_TPU_PREFILL_SPACING_SHORT_TOKENS
         self.tpot_priced = envs.VLLM_TPU_PREFILL_TPOT_PRICED
+        self.short_tpot_slack = (
+            envs.VLLM_TPU_PREFILL_SPACING_SHORT_TPOT_SLACK
+            if self.short_tokens > 0
+            else 0.0
+        )
+        # Whether this step's TPOT hold admits only whole short prompts.
+        self._tpot_short = False
         # Prefill tokens per long-chunk step (moving average): with the
         # long-chunk step time it prices one prefill token.
         self._long_tokens: float | None = None
@@ -136,13 +146,14 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         logger.info(
             "PrefillSpacingScheduler active (spacing_frac=%.2f, "
             "long_prompt_tokens=%d, max_starved_steps=%d, tpot_target_ms=%.1f, "
-            "short_tokens=%d, tpot_priced=%s)",
+            "short_tokens=%d, tpot_priced=%s, short_tpot_slack=%.2f)",
             self.spacing_frac,
             self.long_prompt_tokens,
             self.max_starved_steps,
             self.tpot_target_s * 1e3,
             self.short_tokens,
             self.tpot_priced,
+            self.short_tpot_slack,
         )
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
@@ -193,6 +204,7 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         cap = None
         if in_debt:
             cap = self.short_tokens
+        self._tpot_short = False
         if self.tpot_target_s > 0:
             fit = self._hold_for_tpot(decoders, queue)
             if fit is not None:
@@ -204,7 +216,7 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self._cap_left = cap if capped else None
         # The debt allows only whole short prompts; the TPOT price alone
         # allows a cut chunk.
-        self._cap_whole = capped and in_debt
+        self._cap_whole = capped and (in_debt or self._tpot_short)
         defer = throttle_prefills or spacing
         prefilling = [r for r in self.running if r.is_prefill_chunk]
         self._reserve = {} if defer else self._plan_reserve(prefilling)
@@ -248,9 +260,15 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             # Bounds one run of holds; the next step may start another.
             self._held_since = None
             return None
-        if not self.tpot_priced:
-            return 0
-        return self._tokens_within(slack_s)
+        if self.tpot_priced:
+            return self._tokens_within(slack_s)
+        if self.short_tpot_slack > 0:
+            self._tpot_short = True
+            return min(
+                self.short_tokens,
+                self._tokens_within(slack_s * self.short_tpot_slack),
+            )
+        return 0
 
     def _tokens_within(self, slack_s: float) -> int:
         """Prefill tokens whose cost fits in slack_s, at the per-token cost of
@@ -303,7 +321,7 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             # A request already past the target is not protected: holding
             # prefill for it cannot bring it back under.
             if 0 < slack_s < extra_s:
-                if not self.tpot_priced:
+                if not (self.tpot_priced or self.short_tpot_slack > 0):
                     return slack_s
                 if smallest is None or slack_s < smallest:
                     smallest = slack_s
