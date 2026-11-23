@@ -558,6 +558,7 @@ def calculate_block_sizes(
         "schedule_in_hbm",
         "selection_word_rows",
         "return_carry",
+        "page_table_prefix",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -612,6 +613,7 @@ def ragged_paged_attention(
     selection_word_rows: bool = False,
     carry: tuple[jax.Array, jax.Array] | None = None,
     return_carry: bool = False,
+    page_table_prefix: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -722,6 +724,11 @@ def ragged_paged_attention(
         return_carry: Return ``(output, kv_cache, LSE)`` with the output and
             LSE in the kernel's layout, for a later call's ``carry`` and
             ``finish_carry``. Defaults to False.
+        page_table_prefix: (q38 RPAD-HIGHROWS F4) Decode-only, read-only
+            cache: the decode kernel takes page_indices in HBM, not as a scalar
+            prefetch, and copies into SMEM only each sequence's KV tiles below
+            its kv_lens (whole tiles) plus the table's first tile. The fetch
+            reads no other entry: same DMAs, same results. Defaults to False.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -815,6 +822,7 @@ def ragged_paged_attention(
         selection_mask=selection_bits is not None,
         selection_word_rows=selection_word_rows and selection_bits is not None,
         read_only_cache=read_only_cache,
+        page_table_prefix=page_table_prefix,
     )
     if read_only_cache and not skip_kv_update:
         raise ValueError("read_only_cache needs skip_kv_update")
@@ -835,6 +843,8 @@ def ragged_paged_attention(
         )
     if kv_skip_group and not compact_kv_schedule:
         raise ValueError("kv_skip_group needs compact_kv_schedule")
+    if page_table_prefix and not (decode_only and read_only_cache):
+        raise ValueError("page_table_prefix needs decode_only and read_only_cache")
     if compact_kv_schedule and not (
         kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE and skip_kv_update
     ):
@@ -984,6 +994,7 @@ def ragged_paged_attention(
                     selection_mask=False,
                     selection_word_rows=False,
                     read_only_cache=False,
+                    page_table_prefix=False,
                 ),
             ),
             computer_cls=computer_cls,

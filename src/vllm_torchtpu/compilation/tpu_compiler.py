@@ -300,6 +300,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",
     "USE_PHASED_PROFILER",
+    # q38 SV-PAIR: EngineCore / API-server process CPU affinity only
+    # (worker/cpu_pinning.py).
+    "VLLM_TPU_CPU_PIN_ENGINE",
     # Raiden KV-transfer orchestration/identity only; consumed at serving time
     # by the KV connector and never affect the compiled graph.
     # TPU_RAIDEN_ADVERTISE_HOST is the pod IP in the P/D recipes, so hashing it
@@ -384,6 +387,14 @@ _TPU_COMPILE_ENV_IGNORED = {
     "QWEN4_EXP_PD_EARLY_POLL",
     # Per-step host phase logging (runner/host_phases.py).
     "VLLM_TPU_HOST_PHASES",
+    # q38 SV-KNOB GIL-SW: the interpreter's thread switch interval and its A/B
+    # windows, set per process at its first step (core/host_knobs.py).
+    "VLLM_TPU_HOST_SWITCH_US",
+    "VLLM_TPU_HOST_AB_PERIOD_MS",
+    # Row-incremental target-walk block-table pack (q38 SV-PAM PAM-INCR): host
+    # only, the staged bytes are the stock pack's (runner/pam_incr.py).
+    "VLLM_TPU_PAM_INCR",
+    "VLLM_TPU_PAM_INCR_AB_MS",
     # Last pipeline stage replies from the output thread (host only;
     # runner/pp_last_async_output.py).
     "VLLM_TPU_PP_LAST_ASYNC_OUTPUT",
@@ -416,6 +427,18 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_GC_GEN2_THRESHOLD",
     "VLLM_TPU_GC_GEN2_PERIOD_S",
     "VLLM_TPU_GC_CENSUS",
+    # New requests built in the engine core's waits (core/preproc_in_wait.py).
+    "VLLM_TPU_PREPROC_IN_WAIT",
+    "VLLM_TPU_PREPROC_IN_WAIT_AB_MS",
+    # Finished requests freed in the engine core's waits (core/defer_fin.py).
+    "VLLM_TPU_DEFER_FIN",
+    "VLLM_TPU_DEFER_FIN_AB_MS",
+    # Non-output ranks' step replies read one call late (core/fanin_late.py).
+    "VLLM_TPU_FANIN_LATE",
+    "VLLM_TPU_FANIN_LATE_AB_MS",
+    # Remote-KV admissions run in the engine core's waits (core/admit_off.py).
+    "VLLM_TPU_ADMIT_OFF",
+    "VLLM_TPU_ADMIT_OFF_AB_MS",
     # Host timeline and py-spy windows (runner/host_admit_probe.py).
     "VLLM_TPU_HOSTADMIT_PROBE",
     "VLLM_TPU_HOSTADMIT_PYSPY",
@@ -490,7 +513,17 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE",
     "VLLM_TPU_OFFLOAD_TIER_X2",
     "VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS",
+    "VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM",
+    "VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM_MARGIN",
     "VLLM_TPU_OFFLOAD_DIVERGENT_HITS",
+    # q38 PSTEP-VASYNC: when victim stores run (scheduler only).
+    "VLLM_TPU_OFFLOAD_VICTIM_ASYNC",
+    # Scheduler-side arrival pins and host-tier refresh only.
+    "VLLM_TPU_ARRIVAL_TOUCH",
+    "VLLM_TPU_ARRIVAL_TOUCH_HBM_FRAC",
+    "VLLM_TPU_ARRIVAL_TOUCH_MIN_FREE_FRAC",
+    "VLLM_TPU_ARRIVAL_TOUCH_TTL_S",
+    "VLLM_TPU_ARRIVAL_TOUCH_TIER",
     "VLLM_TPU_OFFLOAD_TIER_KEY_ROWS",
     "VLLM_TPU_OFFLOAD_FP4",
     "VLLM_TPU_OFFLOAD_FP4_SLOTS",

@@ -126,6 +126,35 @@ def reserve_scheduling_group_ids(count: int) -> int:
     return first
 
 
+# q38 PSTEP-IDX (VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND): fixed per-layer ranges for
+# the ragged prefill indexer without its early-exit cond. There every QSA layer's
+# chunk groups sit in the program's top computation, and a layer whose op hits a
+# trace cache (StreamIndex's jit cache, torch_tpu's export cache) would bring the
+# earlier layer's counter ids with it. A static range per layer key goes into both
+# cache keys instead. The ranges start far above the counter's ids (which restart
+# at 1 for every program) and do not depend on what the process traced before.
+LAYER_SCHEDULING_GROUP_FIRST = 4096
+LAYER_SCHEDULING_GROUP_STRIDE = 256
+_layer_scheduling_group_bases: dict[str, int] = {}
+
+
+def layer_scheduling_group_base(key: str) -> int:
+    """First id of the fixed range of the layer `key` (e.g. its module prefix).
+
+    Keys get consecutive ranges of `LAYER_SCHEDULING_GROUP_STRIDE` ids in the
+    order this process first asks for them; a key asked again gets its range back.
+    """
+    with _scheduling_group_ids_lock:
+        base = _layer_scheduling_group_bases.get(key)
+        if base is None:
+            base = (
+                LAYER_SCHEDULING_GROUP_FIRST
+                + len(_layer_scheduling_group_bases) * LAYER_SCHEDULING_GROUP_STRIDE
+            )
+            _layer_scheduling_group_bases[key] = base
+    return base
+
+
 def reset_scheduling_group_ids() -> None:
     """Restarts the ids at 1, for the start of a new compiled program.
 

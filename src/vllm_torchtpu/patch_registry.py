@@ -119,6 +119,9 @@ PATCHES = (
     # pool: it checks the functions it encodes as they are installed.
     Patch("vllm_torchtpu.core.kv_decode_fast_path:patch_kv_decode_fast_path", _ENGINE),
     Patch("vllm_torchtpu.core.kv_load_pacing:patch_kv_load_pacing", _ENGINE),
+    # Arrival-time prefix pins and host-tier refresh (inert unless
+    # VLLM_TPU_ARRIVAL_TOUCH), around the final add_request / schedule.
+    Patch("vllm_torchtpu.core.arrival_touch:patch_arrival_touch", _ENGINE),
     # Host admission costs (inert unless their flags are on).
     Patch(
         "vllm_torchtpu.core.prompt_token_array:patch_prompt_token_array",
@@ -126,6 +129,20 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu.runner.gc_at_waits:patch_gc_at_waits", _ENGINE),
     Patch("vllm_torchtpu.runner.gc_at_waits:patch_engine_core_gc", ("engine_core",)),
+    # New requests built in the engine core's waits (inert unless
+    # VLLM_TPU_PREPROC_IN_WAIT): outermost preprocess_add_request wrapper.
+    Patch(
+        "vllm_torchtpu.core.preproc_in_wait:patch_preproc_in_wait", ("engine_core",)
+    ),
+    # Finished requests freed in the engine core's waits (inert unless
+    # VLLM_TPU_DEFER_FIN): outermost Scheduler free / update / schedule wrappers.
+    Patch("vllm_torchtpu.core.defer_fin:patch_defer_fin", ("engine_core",)),
+    # Non-output ranks' step replies read one call late (inert unless
+    # VLLM_TPU_FANIN_LATE): replaces MultiprocExecutor.collective_rpc.
+    Patch("vllm_torchtpu.core.fanin_late:patch_fanin_late", ("engine_core",)),
+    # Remote-KV admissions in the engine core's waits (inert unless
+    # VLLM_TPU_ADMIT_OFF): outermost Scheduler schedule / finish / scan wrappers.
+    Patch("vllm_torchtpu.core.admit_off:patch_admit_off", ("engine_core",)),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
@@ -167,6 +184,10 @@ PATCHES = (
     Patch("vllm_torchtpu.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE),
     # API-server reasoning-token count (VLLM_TPU_REASONING_COUNT_FAST).
     Patch("vllm_torchtpu.reasoning_count:patch_reasoning_count_fast", _ACTIVE),
+    # EngineCore / API-server CPU affinity (q38 SV-PAIR; inert unless
+    # VLLM_TPU_CPU_PIN_ENGINE is set, which needs VLLM_TPU_CPU_PIN=slice).
+    Patch("vllm_torchtpu.worker.cpu_pinning:patch_engine_core_cpu_pin", ("engine_core",)),
+    Patch("vllm_torchtpu.worker.cpu_pinning:patch_api_server_cpu_pin", _ACTIVE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.

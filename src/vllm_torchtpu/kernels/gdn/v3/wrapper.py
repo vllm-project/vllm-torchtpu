@@ -39,6 +39,7 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+
 def _unpack_qkv_2d(
     qkv_slot_ref: jax.Ref,
     act_scratch_ref: jax.Ref,
@@ -1165,10 +1166,7 @@ def fused_conv1d_gdn(
         # One pad builds both gate inputs, b's lanes then a's (GDN's gate is
         # as wide as b); the kernels slice them out of it.
         assert num_v_padding_size == gate_padding_size
-        b = jnp.pad(
-            jnp.stack([b, a], axis=1),
-            ((0, batch_padding_size), (0, 0), (0, num_v_padding_size)),
-        ).reshape(padded_batch_size, -1)
+        b = pack_gate_inputs(b, a, batch_padding_size, num_v_padding_size, padded_batch_size)
         a = None
     else:
         b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
@@ -1401,3 +1399,25 @@ def fused_conv1d_gdn(
     out_recurrent_state = out_recurrent_state.astype(recurrent_out_dtype)
 
     return (out_conv_state, out_recurrent_state), out_act
+
+
+# Padded row counts traced with the one-concatenate gate operand (log once each).
+_GATE_GLUE_TRACED: set = set()
+
+
+def pack_gate_inputs(b, a, batch_padding_size, num_v_padding_size, padded_batch_size):
+    """GDN's packed gate operand: each row b's lanes then a's, both padded to
+    the lane multiple, rows padded to ``padded_batch_size``. q38 DEC-STEP-3
+    (VLLM_TPU_DECODE_ROWS_GLUE): the same rows by one concatenate of the padded
+    halves, without the stack whose layout needed a relayout copy per GDN
+    layer at 448 rows (t160 traces)."""
+    if envs.VLLM_TPU_DECODE_ROWS_GLUE:
+        if padded_batch_size not in _GATE_GLUE_TRACED:
+            _GATE_GLUE_TRACED.add(padded_batch_size)
+            logger.info("q38 DEC-STEP-3 ROWS_GLUE traced: gdn gate rows %d", padded_batch_size)
+        pads = ((0, batch_padding_size), (0, num_v_padding_size))
+        return jnp.concatenate([jnp.pad(b, pads), jnp.pad(a, pads)], axis=1)
+    return jnp.pad(
+        jnp.stack([b, a], axis=1),
+        ((0, batch_padding_size), (0, 0), (0, num_v_padding_size)),
+    ).reshape(padded_batch_size, -1)

@@ -27,7 +27,7 @@ while True:
 
 FAKE_NODE = r'''
 import os, socket, sys, time
-args = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--"))
+args = dict((a[2:].split("=", 1) + [""])[:2] for a in sys.argv[1:] if a.startswith("--"))
 open(os.path.join(os.environ["FAKE_ARGS_DIR"], args["job_name"] + ".argv"), "w").write("\n".join(sys.argv[1:]))
 if "bad" in args["job_name"]:
     sys.exit(3)
@@ -35,6 +35,8 @@ time.sleep(0.3)
 if "mute" not in args["job_name"]:
     s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((args["store_server_ip"], int(args["raiden_controller_port"]))); s.listen(8)
+if "stats_period_s" in args:
+    print("Q38X2NODE_STATS free=3 total=4 job=" + args["job_name"], flush=True)
 while True:
     time.sleep(1)
 '''
@@ -146,6 +148,61 @@ def test_node_commands_name_the_prefill_shards_pool_groups(monkeypatch):
     del env["POD_IP"]
     with pytest.raises(ValueError, match="unset environment variable"):
         node_commands(env, "/bin/node")
+
+
+def test_node_commands_carry_the_lru_flags_only_when_asked():
+    """W1f: the node's own evict sweep, stats line and log threshold, only on request (a W1e node exits on an
+    unknown flag)."""
+    from vllm_torchtpu.offload import tier_x2_sidecar as sc
+
+    base = {"Q38X2_NODES": "main.r1:1000", "Q38X2_NODE_REGISTRY": "r:1", "Q38X2_NODE_IP": "10.0.0.2"}
+    lru = ("--enable_evict_sweep", "--evict_low_watermark", "--evict_high_watermark", "--evict_sweep_period_s",
+           "--stats_period_s", "--log_stderr_threshold")
+    ((_, _, argv),) = sc.node_commands(base, "/bin/node")
+    assert not [a for a in argv if any(k in a for k in lru)]
+    ((_, _, argv),) = sc.node_commands({**base, "Q38X2_NODE_EVICT_SWEEP": "0"}, "/bin/node")
+    assert not [a for a in argv if any(k in a for k in lru)]
+    ((_, _, argv),) = sc.node_commands({**base, "Q38X2_NODE_EVICT_SWEEP": "1"}, "/bin/node")
+    assert argv[-4:] == [
+        "--enable_evict_sweep", "--evict_low_watermark=0.05", "--evict_high_watermark=0.1", "--evict_sweep_period_s=1",
+    ]
+    ((_, _, argv),) = sc.node_commands(
+        {
+            **base, "Q38X2_NODE_EVICT_SWEEP": "1", "Q38X2_NODE_EVICT_LOW": "0.2", "Q38X2_NODE_EVICT_HIGH": "0.4",
+            "Q38X2_NODE_EVICT_PERIOD_S": "0.5", "Q38X2_NODE_STATS_S": "30", "Q38X2_NODE_LOG_THRESHOLD": "0",
+        },
+        "/bin/node",
+    )
+    assert argv[-6:] == [
+        "--enable_evict_sweep", "--evict_low_watermark=0.2", "--evict_high_watermark=0.4",
+        "--evict_sweep_period_s=0.5", "--stats_period_s=30", "--log_stderr_threshold=0",
+    ]
+    for bad in (
+        {"Q38X2_NODE_EVICT_LOW": "0.3", "Q38X2_NODE_EVICT_HIGH": "0.2"},
+        {"Q38X2_NODE_EVICT_PERIOD_S": "0"},
+        {"Q38X2_NODE_STATS_S": "-1"},
+        {"Q38X2_NODE_LOG_THRESHOLD": "5"},
+    ):
+        with pytest.raises(ValueError):
+            sc.node_commands({**base, "Q38X2_NODE_EVICT_SWEEP": "1", **bad}, "/bin/node")
+
+
+def test_watch_gives_each_node_its_own_output_file(tmp_path):
+    """Each node's output (its Q38X2NODE_STATS lines) lands in node_<shard>.log, so the read can tell the nodes apart."""
+    from vllm_torchtpu.offload import tier_x2_sidecar as sc
+
+    root = _fake_root(tmp_path)
+    env = _env(tmp_path, nodes="main.r1:1000;ple:2000", registry=False, Q38X2_NODE_EVICT_SWEEP="1", Q38X2_NODE_STATS_S="1")
+    try:
+        sc.watch(root, env, poll_s=0.1, stop_after_s=3)
+        for shard, other in (("main.r1", "ple"), ("ple", "main.r1")):
+            text = (tmp_path / "out" / "q38x2" / f"node_{shard}.log").read_text()
+            assert f"Q38X2NODE_STATS free=3 total=4 job=q38x2-node-{shard}" in text
+            assert f"job=q38x2-node-{other}" not in text
+        argv = (tmp_path / "args" / "q38x2-node-main.r1.argv").read_text().splitlines()
+        assert "--enable_evict_sweep" in argv and "--stats_period_s=1" in argv
+    finally:
+        _kill_started(tmp_path)
 
 
 def test_inert_without_the_environment(tmp_path):

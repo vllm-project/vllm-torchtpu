@@ -45,8 +45,30 @@ MAIN_KV_DMA_BATCHES = {
 }
 
 
+_Q38_MKV_LOGGED: set = set()
+
+
 def get_main_kv_dma_batch(pool: jax.Array, rows: jax.Array) -> int:
-    """Select measured row concurrency, preserving serial writes on misses."""
+    """Select measured row concurrency, preserving serial writes on misses.
+
+    ``VLLM_TPU_QSA_MAIN_KV_DMA_BATCH`` > 0 (q38 MKV-B8) overrides the table with
+    the largest power of two <= the override that divides the 128-row tile.
+    """
+    override = envs.VLLM_TPU_QSA_MAIN_KV_DMA_BATCH
+    if override:
+        if rows.dtype != pool.dtype:
+            return 1
+        batch = 1 << (min(override, 128).bit_length() - 1)
+        while 128 % batch:
+            batch //= 2
+        key = (pool.shape[1:], batch)
+        if key not in _Q38_MKV_LOGGED:  # q38 PSTEP-GLUE engagement line (trace time, log only)
+            _Q38_MKV_LOGGED.add(key)
+            logger.info(
+                "q38 PGLUE MKV-B8 main KV DMA batch %d for page %s "
+                "(VLLM_TPU_QSA_MAIN_KV_DMA_BATCH=%d)", batch, tuple(pool.shape[1:]), override,
+            )
+        return batch
     key = (
         pltpu.get_tpu_info().chip_version,
         pool.shape[1:],

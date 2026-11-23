@@ -14,6 +14,12 @@ the pod's environment asks for them. Inert unless ``Q38X2_REGISTRY_PORT`` or ``Q
   plus the shard's position.
 - ``Q38X2_TPU_SYNC_VERSION``: nothing starts until the installed tpu_sync_torch has this version (the leg
   installs the car's wheel before vllm serve; the image's older wheel must not answer instead).
+- ``Q38X2_NODE_EVICT_SWEEP=1`` (W1f wheels only; a W1e node refuses the flags): each node runs its own evict sweep
+  (``--enable_evict_sweep``, watermarks ``Q38X2_NODE_EVICT_LOW`` / ``Q38X2_NODE_EVICT_HIGH``, default 0.05 / 0.10, period
+  ``Q38X2_NODE_EVICT_PERIOD_S``, default 1 s), so a full node drops its coldest blocks instead of refusing every
+  demotion: tier 2 is an LRU. ``Q38X2_NODE_STATS_S=<s>``: each node prints ``Q38X2NODE_STATS free=<n> total=<n>``
+  every <s> seconds; ``Q38X2_NODE_LOG_THRESHOLD=<0..3>``: the nodes' absl stderr threshold. With ``CDK_OUTPUT_DIR``
+  each node's own output goes to ``$CDK_OUTPUT_DIR/q38x2/node_<shard>.log``.
 
 A detached watcher (its own session, so it outlives the importing process) starts the binaries and prints one
 line per event to stderr and to ``$CDK_OUTPUT_DIR/q38x2/sidecar.log``: ``Q38X2_REGISTRY_UP``,
@@ -36,6 +42,13 @@ NODE_IP = "Q38X2_NODE_IP"
 NODE_GROUP_PREFIX = "Q38X2_NODE_GROUP_PREFIX"
 NODE_PORT_BASE = "Q38X2_NODE_PORT_BASE"
 TPU_SYNC_VERSION = "Q38X2_TPU_SYNC_VERSION"
+# W1f: the store node's own LRU (its evict sweep), its stats line and its log threshold.
+NODE_EVICT_SWEEP = "Q38X2_NODE_EVICT_SWEEP"
+NODE_EVICT_LOW = "Q38X2_NODE_EVICT_LOW"
+NODE_EVICT_HIGH = "Q38X2_NODE_EVICT_HIGH"
+NODE_EVICT_PERIOD_S = "Q38X2_NODE_EVICT_PERIOD_S"
+NODE_STATS_S = "Q38X2_NODE_STATS_S"
+NODE_LOG_THRESHOLD = "Q38X2_NODE_LOG_THRESHOLD"
 # Where the lock and the executable copies live (tests point them elsewhere); one lock per pod.
 LOCK_DIR = "Q38X2_LOCK_DIR"
 BIN_DIR = "Q38X2_BIN_DIR"
@@ -73,6 +86,37 @@ def parse_nodes(spec: str) -> list[tuple[str, int]]:
     return out
 
 
+def node_lru_flags(env) -> list[str]:
+    """The W1f node flags the environment asks for (none by default: a W1e node exits on an unknown flag)."""
+    flags: list[str] = []
+    if env.get(NODE_EVICT_SWEEP, "") == "1":
+        low = float(env.get(NODE_EVICT_LOW, "0.05"))
+        high = float(env.get(NODE_EVICT_HIGH, "0.10"))
+        period = float(env.get(NODE_EVICT_PERIOD_S, "1"))
+        if not (0.0 <= low <= high <= 1.0) or period <= 0.0:
+            raise ValueError(
+                f"{NODE_EVICT_SWEEP}: need 0 <= {NODE_EVICT_LOW} <= {NODE_EVICT_HIGH} <= 1 and "
+                f"{NODE_EVICT_PERIOD_S} > 0 (got {low}, {high}, {period})"
+            )
+        flags += [
+            "--enable_evict_sweep",
+            f"--evict_low_watermark={low:g}",
+            f"--evict_high_watermark={high:g}",
+            f"--evict_sweep_period_s={period:g}",
+        ]
+    if env.get(NODE_STATS_S):
+        stats = float(env[NODE_STATS_S])
+        if stats <= 0.0:
+            raise ValueError(f"{NODE_STATS_S} must be > 0 (got {stats})")
+        flags.append(f"--stats_period_s={stats:g}")
+    if env.get(NODE_LOG_THRESHOLD):
+        level = int(env[NODE_LOG_THRESHOLD])
+        if not 0 <= level <= 3:
+            raise ValueError(f"{NODE_LOG_THRESHOLD} must be 0..3 (got {level})")
+        flags.append(f"--log_stderr_threshold={level}")
+    return flags
+
+
 def node_commands(env, node_bin: str) -> list[tuple[str, int, list[str]]]:
     """[(shard, controller port, argv)] for the decode pod's store nodes."""
     registry = _expand(NODE_REGISTRY, env.get(NODE_REGISTRY, ""), env)
@@ -81,6 +125,7 @@ def node_commands(env, node_bin: str) -> list[tuple[str, int, list[str]]]:
         raise ValueError(f"{NODES} needs {NODE_REGISTRY} and {NODE_IP}")
     prefix = env.get(NODE_GROUP_PREFIX, "q38x2")
     base = int(env.get(NODE_PORT_BASE, "31700"))
+    lru = node_lru_flags(env)
     out = []
     for i, (shard, size) in enumerate(parse_nodes(env[NODES])):
         port = base + i
@@ -98,6 +143,7 @@ def node_commands(env, node_bin: str) -> list[tuple[str, int, list[str]]]:
                     "--evict_tier=1",
                     f"--dram_budget_bytes={size}",
                     "--parallelism=4",
+                    *lru,
                 ],
             )
         )
@@ -289,8 +335,15 @@ def watch(root: str, env=None, poll_s: float = 1.0, stop_after_s: float | None =
     if env.get(NODES):
         node = _install(os.path.join(root, *NODE_BIN), "kv_cache_host_store_node_main", env)
         ip = _expand(NODE_IP, env.get(NODE_IP, ""), env)
+        out_dir = os.path.join(env["CDK_OUTPUT_DIR"], "q38x2") if env.get("CDK_OUTPUT_DIR") else None
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         for shard, port, argv in node_commands(env, node):
-            p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, env=dict(env))
+            # Each node's own output (its Q38X2NODE_STATS lines among it) in a file of its own.
+            sink = open(os.path.join(out_dir, f"node_{shard}.log"), "ab") if out_dir else None
+            p = subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT if sink else None, env=dict(env)
+            )
             procs.append((shard, p, {"host": ip, "port": port, "up": False, "t": time.monotonic()}))
             _say(f"Q38X2_NODE_START shard={shard} pid={p.pid} " + " ".join(argv[1:]), env)
     nodes = [x for x in procs if x[0] != "registry"]

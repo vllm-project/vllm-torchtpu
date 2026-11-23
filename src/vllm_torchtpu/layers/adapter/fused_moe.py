@@ -15,6 +15,7 @@
 
 import enum
 import functools
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -22,6 +23,7 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
@@ -150,6 +152,26 @@ def _allocate_kernel_instance_id() -> int:
     return kernel_instance_id
 
 
+logger = init_logger(__name__)
+
+
+def nonep_dispatch_values(rform_port: bool) -> tuple[str, str, str, bool]:
+    """(nonep_permute, nonep_gather, nonep_dispatch_chunks, combine_presorted) for the non-EP prefill MoE path.
+
+    q38 MOEPORT-R umbrella TPU_MOE_NONEP_RFORM_PORT (ruling (iii)): on, the four values are forced to our stack's
+    (packed_onehot, sc_fp8, 2, True) whatever TPU_MOE_NONEP_PERMUTE / _GATHER / _DISPATCH_CHUNKS and
+    TPU_MOE_COMBINE_PRESORTED say (e.g. an explicit TPU_MOE_NONEP_GATHER=sc_padded is overridden); off, they are the env's,
+    exactly as before the umbrella."""
+    if rform_port:
+        return "packed_onehot", "sc_fp8", "2", True
+    return (
+        envs.TPU_MOE_NONEP_PERMUTE.lower(),
+        envs.TPU_MOE_NONEP_GATHER.lower(),
+        envs.TPU_MOE_NONEP_DISPATCH_CHUNKS,
+        envs.TPU_MOE_COMBINE_PRESORTED,
+    )
+
+
 def _build_fused_moe_custom_op(
     *,
     topk: int,
@@ -168,6 +190,14 @@ def _build_fused_moe_custom_op(
     # RPA onto --attention-backend CUSTOM. Note MoEBackend has no CUSTOM slot
     # yet, so that also needs an upstream OOT-backend hook.
     use_sparse_core = envs.USE_MOE_SPARSE_CORE
+    rform_port = envs.TPU_MOE_NONEP_RFORM_PORT
+    nonep_permute, nonep_gather, nonep_dispatch_chunks, combine_presorted = nonep_dispatch_values(rform_port)
+    # Engagement marker of the umbrella, on every rank (plain info, not info_once).
+    logger.info(
+        "q38 MOEPORT-R init: TPU_MOE_NONEP_RFORM_PORT=%d effective TPU_MOE_NONEP_GATHER=%s "
+        "TPU_MOE_NONEP_DISPATCH_CHUNKS=%s TPU_MOE_COMBINE_PRESORTED=%d TPU_MOE_NONEP_PERMUTE=%s pid=%d",
+        int(rform_port), nonep_gather, nonep_dispatch_chunks, int(combine_presorted), nonep_permute, os.getpid(),
+    )
 
     # Pass experts_start as a runtime tensor rather than static closure arg so every EP
     # rank compiles an identical program.
@@ -182,8 +212,8 @@ def _build_fused_moe_custom_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         # Token movement of the whole-expert (non-EP) path; envs.TPU_MOE_NONEP_*.
-        nonep_permute=envs.TPU_MOE_NONEP_PERMUTE.lower(),
-        nonep_gather=envs.TPU_MOE_NONEP_GATHER.lower(),
+        nonep_permute=nonep_permute,
+        nonep_gather=nonep_gather,
         nonep_gather_cols=envs.TPU_MOE_NONEP_GATHER_COLS,
         nonep_gather_chunk=envs.TPU_MOE_NONEP_GATHER_CHUNK,
         nonep_combine_split=int(envs.TPU_MOE_NONEP_COMBINE_SPLIT),
@@ -195,6 +225,14 @@ def _build_fused_moe_custom_op(
         nonep_gmm_bucket=int(envs.TPU_MOE_NONEP_GMM_BUCKET),
         nonep_gmm2_experts_per_visit=int(envs.TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT),
         nonep_fused_mlp=envs.TPU_MOE_NONEP_FUSED_MLP,
+        **({"ep_gather": envs.TPU_MOE_EP_GATHER.lower()} if envs.TPU_MOE_EP_GATHER.lower() != "sc" else {}),
+        **({"ep_gmm_stack": True} if envs.TPU_MOE_EP_GMM_STACK else {}),
+        **({"ep_combine": "dense"} if envs.TPU_MOE_EP_COMBINE.lower() == "dense" else {}),
+        **({"nonep_dispatch_chunks": int(nonep_dispatch_chunks)}
+           if nonep_dispatch_chunks != "1" else {}),
+        **({"ep_packed_sorts": envs.TPU_MOE_EP_PACKED_SORTS.lower()}
+           if envs.TPU_MOE_EP_PACKED_SORTS.lower() != "off" else {}),
+        **({"combine_presorted": True} if combine_presorted else {}),
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)

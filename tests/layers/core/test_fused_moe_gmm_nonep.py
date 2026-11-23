@@ -21,6 +21,7 @@ intermediate 640, per-channel fp8 weights) and add the SparseCore gather.
 """
 
 import itertools
+import re
 
 import jax
 import jax.numpy as jnp
@@ -373,7 +374,7 @@ def _fused_mlp_case(monkeypatch, *, use_ep=False, split=1, e1=2, e2=0, fused=Tru
     log_lines = []
 
     class _Log:  # the engine logger needs vLLM; record the once-lines instead
-        def info_once(self, msg, *args):
+        def info_once(self, msg, *args, **kwargs):  # int6 passes scope="process"
             log_lines.append(msg % args if args else msg)
 
     monkeypatch.setattr(fused_moe_gmm, "logger", _Log())
@@ -771,6 +772,9 @@ def test_fused_moe_func_nonep_choices_bitwise_on_tpu(tokens):
         dict(nonep_gmm_hoist_quant=True),
         dict(nonep_gather="xla_colchunk", nonep_combine_split=2, nonep_permute="two_sorts",
              nonep_gmm_tile_m=1024),
+        dict(nonep_gather="sc_fp8"),
+        dict(nonep_gather="sc_fp8", nonep_gmm_bucket=64, nonep_gmm_experts_per_visit=2,
+             nonep_fused_mlp=True, nonep_combine_packed=True),
     ):
         np.testing.assert_array_equal(_bits(run(**kw)), ref, err_msg=str(kw))
     # The comparison must be able to fail: moving token 0's first route to an
@@ -949,3 +953,792 @@ def test_sc_padded_gather_matches_sc_and_keeps_padded_rows(monkeypatch):
     ref = _bits(run("xla"))
     np.testing.assert_array_equal(_bits(run("sc")), ref)
     np.testing.assert_array_equal(_bits(run("sc_padded")), ref)
+
+
+# --- TPU_MOE_NONEP_GATHER=sc_fp8 (packed fp8 dispatch) ---------------------------------------
+
+
+def test_sc_fp8_is_a_gather_choice(monkeypatch):
+    from vllm_torchtpu import envs
+    monkeypatch.setenv("TPU_MOE_NONEP_GATHER", "SC_FP8")
+    assert envs.TPU_MOE_NONEP_GATHER.lower() == "sc_fp8"
+
+
+def test_fp8_words_round_trip_every_byte_in_column_order():
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import pack_fp8_words, unpack_fp8_words
+
+    b = np.arange(4 * 128 * 2, dtype=np.uint32) % 256          # every byte value, in all four positions
+    q = jax.lax.bitcast_convert_type(jnp.asarray(b.reshape(2, 512).astype(np.uint8)), jnp.float8_e4m3fn)
+    u = np.asarray(pack_fp8_words(q))
+    assert u.shape == (2, 128) and u.dtype == np.uint32
+    # word j holds columns (j, j + 128, j + 256, j + 384) as bytes 3..0
+    assert u[0, 5] == (b[5] << 24 | b[133] << 16 | b[261] << 8 | b[389])
+    back = jax.lax.bitcast_convert_type(unpack_fp8_words(jnp.asarray(u), jnp.float8_e4m3fn), jnp.uint8)
+    np.testing.assert_array_equal(np.asarray(back), b.reshape(2, 512).astype(np.uint8))
+
+
+def _carrier_ref(x):
+    """pack_fp8_rows' layout in plain JAX (the kernel itself needs a TPU or interpret mode)."""
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+        LHS_PACK_PAD_WORDS, LHS_QUANT_BLOCK, pack_fp8_words, quantize_lhs_block)
+
+    qs, ss = [], []
+    for b in range(x.shape[1] // LHS_QUANT_BLOCK):
+        q, sc = quantize_lhs_block(x[:, b * LHS_QUANT_BLOCK:(b + 1) * LHS_QUANT_BLOCK], jnp.float8_e4m3fn)
+        qs.append(q)
+        ss.append(sc.astype(jnp.float32))
+    words = jax.lax.bitcast_convert_type(pack_fp8_words(jnp.concatenate(qs, axis=1)), jnp.float32)
+    pad = jnp.zeros((x.shape[0], LHS_PACK_PAD_WORDS - len(ss)), jnp.float32)
+    return jnp.concatenate([words] + ss + [pad], axis=1)
+
+
+def _sc_fp8_case(monkeypatch, *, fused=True, bias=False, bf16_weights=False, no_scale=False, gather="sc_fp8"):
+    """fused_moe_func with stand-ins for the SparseCore kernels, pack_fp8_rows and the GMMs, recording what reaches
+    the gather and the GMMs."""
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import LHS_QUANT_BLOCK, unpack_fp8_rows
+
+    experts, hidden, inter, topk, tokens = 16, 512, 128, 4, 640
+    k1, k2, k3 = jax.random.split(jax.random.key(21), 3)
+    w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (experts, inter, hidden))
+    if bf16_weights:
+        w1, w2 = (w1.astype(jnp.float32) * s1[:, 0]).astype(jnp.bfloat16), (w2.astype(jnp.float32) * s2[:, 0]).astype(jnp.bfloat16)
+        s1 = s2 = None
+    if no_scale:
+        s1 = None
+    b1 = jnp.zeros((experts, 1, 2 * inter), jnp.float32) if bias else None
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(8)
+    ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+    seen = dict(gather=[], gmm_lp=[], mlp_lp=[], log=[])
+
+    def fake_sc_gather(src, idx, start, end, trim_rows=True, copy_mode="vector", **kw):
+        seen["gather"].append(dict(dtype=str(src.dtype), cols=src.shape[1], copy_mode=copy_mode, trim_rows=trim_rows))
+        pad = -idx.shape[0] % 2048
+        out = src[jnp.pad(idx, (0, pad))]
+        return out[: idx.shape[0]] if trim_rows else out
+
+    def dequant(lhs, lhs_packed_dtype):
+        if lhs_packed_dtype is None:
+            return lhs
+        q, sc = unpack_fp8_rows(lhs, (lhs.shape[1] - 128) * 4, jnp.float8_e4m3fn)
+        sc = jnp.repeat(sc, LHS_QUANT_BLOCK, axis=1)
+        return (q.astype(jnp.float32) * sc).astype(lhs_packed_dtype)
+
+    ref0 = _ref_gmm([])
+
+    def ref(lhs, rhs, rhs_scale, *a, **k):  # unscaled (bf16) weights: scale 1
+        if rhs_scale is None:
+            rhs_scale = jnp.ones((rhs.shape[0], 1, 1, rhs.shape[2]), jnp.float32)
+        return ref0(lhs, rhs, rhs_scale, *a, **k)
+
+    def gmm(lhs, *a, lhs_packed_dtype=None, **k):
+        seen["gmm_lp"].append(lhs_packed_dtype)
+        return ref(dequant(lhs, lhs_packed_dtype), *a, **k)
+
+    def mlp(x_, w1_, s1_, w2_, s2_, gs_, *, fuse_act, rhs_quant_dtype=None, tile_m=0, bucket=0,
+            experts_per_visit=1, pack_out=False, lhs_packed_dtype=None):
+        seen["mlp_lp"].append(lhs_packed_dtype)
+        h = ref(dequant(x_, lhs_packed_dtype), w1_, s1_, None, gs_, jnp.array([0], jnp.int32),
+                fuse_act=fuse_act)[:, : w2_.shape[1]]
+        return ref(h, w2_, s2_, None, gs_, jnp.array([0], jnp.int32), preferred_element_type=h.dtype,
+                   pack_out=pack_out)
+
+    class _Log:
+        def info_once(self, msg, *args, **kwargs):  # int6 passes scope="process"
+            seen["log"].append(msg % args if args else msg)
+
+    from jax._src import tpu_info as ti
+    from jax._src.pallas.mosaic import tpu_info as pti
+    from jax.experimental.pallas import tpu as pltpu
+
+    info = ti.get_tpu_info_for_chip(ti.ChipVersion.TPU_7X, 1)   # the gate reads the chip's fp8 support
+    for mod in (pltpu, ti, pti):
+        monkeypatch.setattr(mod, "get_tpu_info", lambda: info, raising=False)
+    monkeypatch.setattr(fused_moe_gmm, "logger", _Log())
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_v2", fake_sc_gather)
+    monkeypatch.setattr(fused_moe_gmm, "pack_fp8_rows", _carrier_ref)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", gmm)
+    monkeypatch.setattr(fused_moe_gmm, "mlp_wrapper", mlp)
+    monkeypatch.setattr(fused_moe_gmm, "_local_ragged_combine_eligible", lambda *a, **k: True)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3",
+                        lambda rows, rev, wts, valid, reduce_group_size, x_packed=False: _ref_combine(
+                            rows, rev, wts, valid, reduce_group_size))
+    out = fused_moe_gmm.fused_moe_func.__wrapped__(
+        x, w1, w2, s1, s2, b1, None, w, ids, topk=topk, activation="silu", use_ep=False,
+        use_sparse_core=True, nonep_gather=gather, nonep_fused_mlp=fused)
+    return out, seen, (tokens, hidden)
+
+
+@pytest.mark.parametrize("fused", [True, False])
+def test_sc_fp8_gathers_packed_rows_dma_only_and_gmm1_reads_them_packed(monkeypatch, fused):
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import lhs_packed_width
+
+    out, seen, (tokens, hidden) = _sc_fp8_case(monkeypatch, fused=fused)
+    assert seen["gather"] == [dict(dtype="float32", cols=lhs_packed_width(hidden), copy_mode="dma",
+                                   trim_rows=False)], seen["gather"]
+    if fused:
+        assert seen["mlp_lp"] == [jnp.bfloat16] and seen["gmm_lp"] == []
+    else:
+        assert seen["gmm_lp"] == [jnp.bfloat16, None]   # gmm1 packed, gmm2 reads gmm1's bf16 output
+    assert out.dtype == jnp.bfloat16 and out.shape == (tokens, hidden)
+    assert np.isfinite(np.asarray(out, np.float32)).all()
+    assert any("sc_fp8" in m for m in seen["log"])
+    # the stand-in GMM dequantizes the packed rows, so the result is close to the bf16 path's
+    ref, _, _ = _sc_fp8_case(monkeypatch, fused=fused, gather="sc_padded")
+    np.testing.assert_allclose(np.asarray(out, np.float32), np.asarray(ref, np.float32), rtol=0.1, atol=0.02)
+
+
+@pytest.mark.parametrize("kw", [dict(bias=True), dict(bf16_weights=True), dict(no_scale=True)])
+def test_sc_fp8_falls_back_to_sc_padded_where_it_does_not_apply(monkeypatch, kw):
+    out, seen, (tokens, hidden) = _sc_fp8_case(monkeypatch, **kw)
+    assert seen["gather"] == [dict(dtype="bfloat16", cols=hidden, copy_mode="vector", trim_rows=False)], seen
+    assert all(v is None for v in seen["mlp_lp"] + seen["gmm_lp"])
+    assert any("not applicable" in m for m in seen["log"])
+    ref, _, _ = _sc_fp8_case(monkeypatch, gather="sc_padded", **kw)
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+# --- TPU_MOE_EP_GATHER / TPU_MOE_EP_GMM_STACK (the P-MOE stack on the EP path) ----------------
+
+
+def test_ep_knobs_are_registered_choices(monkeypatch):
+    from vllm_torchtpu import envs
+
+    for name in ("TPU_MOE_EP_GATHER", "TPU_MOE_EP_GMM_STACK"):
+        assert name in envs.environment_variables, name
+    monkeypatch.setenv("TPU_MOE_EP_GATHER", "SC_FP8")
+    assert envs.TPU_MOE_EP_GATHER.lower() == "sc_fp8"
+    monkeypatch.setenv("TPU_MOE_EP_GATHER", "xla")
+    with pytest.raises(Exception):
+        envs.TPU_MOE_EP_GATHER
+    monkeypatch.delenv("TPU_MOE_EP_GMM_STACK", raising=False)
+    assert envs.TPU_MOE_EP_GMM_STACK is False
+    monkeypatch.setenv("TPU_MOE_EP_GMM_STACK", "1")
+    assert envs.TPU_MOE_EP_GMM_STACK is True
+
+
+def _ep_case(monkeypatch, *, tokens=640, ep_gather="sc", stack=False, fused=True, threshold=0, counting=False,
+             combine="served", packed=False, packed_sorts=False, presorted=False):
+    """fused_moe_func on the EP path (rank 0 of 2: 8 local experts of 16, path D's argsort positions) with stand-ins
+    for the SparseCore kernels, pack_fp8_rows and the GMMs, recording what reaches the gather and the GMMs."""
+    from jax._src import tpu_info as ti
+    from jax._src.pallas.mosaic import tpu_info as pti
+    from jax.experimental.pallas import tpu as pltpu
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import LHS_QUANT_BLOCK, unpack_fp8_rows
+
+    experts, local, hidden, inter, topk = 16, 8, 512, 128, 4
+    k1, k2, k3 = jax.random.split(jax.random.key(31), 3)
+    w1, s1 = _fp8_per_channel(k1, (local, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (local, inter, hidden))
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(5)
+    ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+    seen = dict(gather=[], gmm=[], mlp=[], log=[], combine=[])
+
+    def fake_sc_gather(src, idx, start, end, trim_rows=True, copy_mode="vector", **kw):
+        seen["gather"].append(dict(dtype=str(src.dtype), cols=src.shape[1], copy_mode=copy_mode, trim_rows=trim_rows))
+        pad = -idx.shape[0] % 2048
+        out = src[jnp.pad(idx, (0, pad))]
+        return out[: idx.shape[0]] if trim_rows else out
+
+    def dequant(lhs, lp):
+        if lp is None:
+            return lhs
+        q, sc = unpack_fp8_rows(lhs, (lhs.shape[1] - 128) * 4, jnp.float8_e4m3fn)
+        return (q.astype(jnp.float32) * jnp.repeat(sc, LHS_QUANT_BLOCK, axis=1)).astype(lp)
+
+    ref = _ref_gmm([])
+
+    def gmm(lhs, rhs, rhs_scale, rhs_bias, gs, off, *a, lhs_packed_dtype=None, experts_per_visit=1, bucket=0, **k):
+        seen["gmm"].append(dict(lp=lhs_packed_dtype, e=experts_per_visit, bucket=bucket))
+        return ref(dequant(lhs, lhs_packed_dtype), rhs, rhs_scale, rhs_bias, gs, off, *a, **k)
+
+    def mlp(x_, w1_, s1_, w2_, s2_, gs_, *, fuse_act, rhs_quant_dtype=None, tile_m=0, bucket=0,
+            experts_per_visit=1, pack_out=False, lhs_packed_dtype=None):
+        seen["mlp"].append(dict(lp=lhs_packed_dtype, e=experts_per_visit, bucket=bucket, pack=pack_out))
+        h = ref(dequant(x_, lhs_packed_dtype), w1_, s1_, None, gs_, jnp.array([0], jnp.int32),
+                fuse_act=fuse_act)[:, : w2_.shape[1]]
+        return ref(h, w2_, s2_, None, gs_, jnp.array([0], jnp.int32), preferred_element_type=h.dtype,
+                   pack_out=pack_out)
+
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import _fallback_implementation
+
+    def served_combine(rows, rev, wts, valid, reduce_group_size):
+        seen["combine"].append("served")
+        return _fallback_implementation(rows, rev, wts, valid, reduce_group_size)
+
+    def v3_combine(rows, rev, wts, valid, reduce_group_size, x_packed=False, **kw):
+        from vllm_torchtpu.kernels.megablox.gmm_v2 import unpack_halves
+        seen["combine"].append(dict(v3=True, packed=x_packed, all_valid=bool(np.asarray(valid).all()), **kw))
+        return _fallback_implementation(unpack_halves(rows) if x_packed else rows, rev, wts, valid, reduce_group_size)
+
+    class _Log:
+        def info_once(self, msg, *args, **kwargs):  # int6 passes scope="process"
+            seen["log"].append(msg % args if args else msg)
+
+    info = ti.get_tpu_info_for_chip(ti.ChipVersion.TPU_7X, 1)
+    for mod in (pltpu, ti, pti):
+        monkeypatch.setattr(mod, "get_tpu_info", lambda: info, raising=False)
+    monkeypatch.setattr(fused_moe_gmm, "logger", _Log())
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_v2", fake_sc_gather)
+    monkeypatch.setattr(fused_moe_gmm, "pack_fp8_rows", _carrier_ref)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", gmm)
+    monkeypatch.setattr(fused_moe_gmm, "mlp_wrapper", mlp)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce", served_combine)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3", v3_combine)
+    monkeypatch.setattr(fused_moe_gmm, "_local_ragged_combine_eligible",
+                        lambda *a, use_ep, **k: not use_ep)   # the non-EP combine is eligible; EP keeps its own
+    out = fused_moe_gmm.fused_moe_func.__wrapped__(
+        x, w1, w2, s1, s2, None, None, w, ids, experts_start=jnp.array(0, jnp.int32), topk=topk,
+        activation="silu", use_ep=True, use_sparse_core=True, onehot_moe_permute_threshold=threshold,
+        ep_counting_sort=counting, ep_gather=ep_gather, ep_gmm_stack=stack, nonep_fused_mlp=fused,
+        nonep_gmm_experts_per_visit=2, nonep_gmm_bucket=64, ep_combine=combine, nonep_combine_packed=packed,
+        **({"ep_packed_sorts": packed_sorts} if packed_sorts else {}),
+        **({"combine_presorted": True} if presorted else {}))
+    return out, seen
+
+
+def test_ep_knobs_off_keep_the_served_ep_path(monkeypatch):
+    out, seen = _ep_case(monkeypatch)
+    assert seen["gather"] == [dict(dtype="bfloat16", cols=512, copy_mode="vector", trim_rows=True)], seen
+    assert seen["mlp"] == [] and seen["gmm"] == [dict(lp=None, e=1, bucket=0)] * 2, seen
+    assert out.dtype == jnp.bfloat16 and np.isfinite(np.asarray(out, np.float32)).all()
+
+
+def test_ep_gather_sc_padded_keeps_padded_blocks_and_the_output(monkeypatch):
+    ref, _ = _ep_case(monkeypatch)
+    out, seen = _ep_case(monkeypatch, ep_gather="sc_padded")
+    assert seen["gather"] == [dict(dtype="bfloat16", cols=512, copy_mode="vector", trim_rows=False)], seen
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+def test_ep_gmm_stack_runs_the_fused_mlp_with_the_non_ep_knobs(monkeypatch):
+    ref, _ = _ep_case(monkeypatch)
+    out, seen = _ep_case(monkeypatch, stack=True)
+    assert seen["mlp"] == [dict(lp=None, e=2, bucket=64, pack=False)] and seen["gmm"] == [], seen
+    np.testing.assert_array_equal(_bits(out), _bits(ref))   # stand-ins are per-row exact either way
+    out2, seen2 = _ep_case(monkeypatch, stack=True, fused=False)
+    assert seen2["mlp"] == [] and seen2["gmm"] == [dict(lp=None, e=2, bucket=64)] * 2, seen2
+
+
+def test_ep_gather_sc_fp8_feeds_the_gmm_packed_rows(monkeypatch):
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import lhs_packed_width
+
+    out, seen = _ep_case(monkeypatch, ep_gather="sc_fp8", stack=True)
+    assert seen["gather"] == [dict(dtype="float32", cols=lhs_packed_width(512), copy_mode="dma",
+                                   trim_rows=False)], seen
+    assert seen["mlp"] == [dict(lp=jnp.bfloat16, e=2, bucket=64, pack=False)], seen
+    ref, _ = _ep_case(monkeypatch, stack=True)
+    np.testing.assert_allclose(np.asarray(out, np.float32), np.asarray(ref, np.float32), rtol=0.1, atol=0.02)
+
+
+def test_ep_gather_sc_fp8_stays_bf16_on_the_one_hot_path(monkeypatch):
+    # 64 tokens x top-4 = 256 routes <= threshold 2,048: the rows come from the one-hot matmul, never packed
+    out, seen = _ep_case(monkeypatch, tokens=64, ep_gather="sc_fp8", stack=True, threshold=2048)
+    assert seen["gather"] == [] and all(c["lp"] is None for c in seen["mlp"] + seen["gmm"]), seen
+
+
+def test_ep_knobs_leave_the_non_ep_program_unchanged():
+    tokens = 640
+    x = _hidden(tokens, HIDDEN)
+    ids, w = _routing(tokens)
+
+    def jaxpr(**kw):
+        fn = lambda a, b, c: prepare_routed_gmm_inputs(  # noqa: E731
+            a, b, c, local_num_experts=EXPERTS, topk=TOPK, use_ep=False, use_sparse_core=False, **kw)
+        return str(jax.make_jaxpr(fn)(x, ids, w))
+
+    assert jaxpr(ep_gather="sc_fp8") == jaxpr() == jaxpr(ep_gather="sc_padded")
+
+
+def test_ep_all_valid_routes_is_exact_and_never_reads_unwritten_rows():
+    """ep_all_valid_routes: invalid routes read the zeroed last row with weight 0, every route becomes valid, and the
+    valid-mask combine's output is reproduced bit for bit, even with NaN in the rows the GMMs never wrote."""
+    rng = np.random.default_rng(3)
+    tokens, topk, hidden = 96, 10, 256
+    routes = tokens * topk
+    valid = rng.random(routes) < 0.5
+    n_valid = int(valid.sum())
+    rows = rng.standard_normal((routes + 64, hidden)).astype(np.float32)
+    rows[n_valid:] = np.nan                                   # unwritten rows past the computed prefix
+    rows[:n_valid][rng.random((n_valid, hidden)) < 0.05] = -0.0
+    rows = jnp.asarray(rows, jnp.bfloat16)
+    rev = np.empty(routes, np.int32)
+    rev[valid] = rng.permutation(n_valid)                     # valid routes -> computed rows
+    rev[~valid] = n_valid + rng.integers(0, routes - n_valid, int((~valid).sum()))   # invalid -> garbage rows
+    rev = jnp.asarray(rev)
+    wts = jnp.asarray(rng.random(routes), jnp.bfloat16)
+    valid = jnp.asarray(valid)
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import _fallback_implementation
+
+    ref = _fallback_implementation(rows, rev, wts, valid, topk)
+    r2, rev2, w2, v2 = fused_moe_gmm.ep_all_valid_routes(rows, rev, wts, valid)
+    assert bool(np.asarray(v2).all())
+    z = rows.shape[0] - 1
+    assert (np.asarray(rev2)[~np.asarray(valid)] == z).all() and (np.asarray(w2)[~np.asarray(valid)] == 0).all()
+    np.testing.assert_array_equal(_bits(r2[z]), np.zeros(hidden, np.uint16))
+    np.testing.assert_array_equal(_bits(r2[:z]), _bits(rows[:z]))
+    got = _fallback_implementation(r2, rev2, w2, v2, topk)
+    assert np.isfinite(np.asarray(got, np.float32)).all()
+    np.testing.assert_array_equal(_bits(got), _bits(ref))
+    # all valid: nothing changes
+    allv = jnp.ones_like(valid)
+    r3, rev3, w3, _ = fused_moe_gmm.ep_all_valid_routes(rows, rev, wts, allv)
+    np.testing.assert_array_equal(_bits(r3), _bits(rows))
+    np.testing.assert_array_equal(np.asarray(rev3), np.asarray(rev))
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_ep_combine_dense_runs_the_non_ep_combine_on_all_valid_routes(monkeypatch, packed):
+    ref, seen0 = _ep_case(monkeypatch, stack=True)
+    assert seen0["combine"] == ["served"], seen0["combine"]
+    out, seen = _ep_case(monkeypatch, stack=True, combine="dense", packed=packed)
+    assert seen["combine"] == [dict(v3=True, packed=packed, all_valid=True)], seen["combine"]
+    assert seen["mlp"] == [dict(lp=None, e=2, bucket=64, pack=packed)], seen["mlp"]
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+def test_ep_combine_dense_stays_served_on_the_one_hot_path(monkeypatch):
+    out, seen = _ep_case(monkeypatch, tokens=64, stack=True, combine="dense", packed=True, threshold=2048)
+    assert all(c == "served" or not isinstance(c, dict) for c in seen["combine"]), seen["combine"]
+    assert all(not c["pack"] for c in seen["mlp"]), seen["mlp"]
+
+
+# --- TPU_MOE_NONEP_DISPATCH_CHUNKS (expert-range chunked dispatch) ------------------------------
+
+
+def _chunk_case(monkeypatch, *, gather="sc_padded", chunks=1, fused=True, tokens=640, sizes_skew=False, permute="sorts",
+                presorted=False):
+    """fused_moe_func on the non-EP SparseCore path with stand-ins: the gather returns whole 2,048-row blocks, the
+    fused MLP honours out_buffer/out_row_offset (rows outside the call's groups keep the buffer), the combine is v3's
+    reference. Records gather and MLP calls."""
+    from jax._src import tpu_info as ti
+    from jax._src.pallas.mosaic import tpu_info as pti
+    from jax.experimental.pallas import tpu as pltpu
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import LHS_QUANT_BLOCK, pack_halves, unpack_fp8_rows, unpack_halves
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import _fallback_implementation
+
+    experts, hidden, inter, topk = 16, 512, 128, 4
+    k1, k2, k3 = jax.random.split(jax.random.key(41), 3)
+    w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (experts, inter, hidden))
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(6)
+    if sizes_skew:   # most routes on the first experts: some chunks nearly empty
+        p = np.exp(-np.arange(experts) / 2.0); p /= p.sum()
+        ids = np.stack([rng.choice(experts, topk, replace=False, p=p) for _ in range(tokens)])
+    else:
+        ids = np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)])
+    ids = jnp.asarray(ids, jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+    seen = dict(gather=[], mlp=[])
+
+    def fake_sc_gather(src, idx, start, end, trim_rows=True, copy_mode="vector", **kw):
+        seen["gather"].append(dict(rows=int(idx.shape[0]), copy_mode=copy_mode))
+        pad = -idx.shape[0] % 2048
+        out = src[jnp.pad(idx, (0, pad))]
+        return out[: idx.shape[0]] if trim_rows else out
+
+    def dequant(lhs, lp):
+        if lp is None:
+            return lhs
+        q, sc = unpack_fp8_rows(lhs, (lhs.shape[1] - 128) * 4, jnp.float8_e4m3fn)
+        return (q.astype(jnp.float32) * jnp.repeat(sc, LHS_QUANT_BLOCK, axis=1)).astype(lp)
+
+    ref = _ref_gmm([])
+
+    def mlp(x_, w1_, s1_, w2_, s2_, gs_, *, fuse_act, rhs_quant_dtype=None, tile_m=0, bucket=0,
+            experts_per_visit=1, pack_out=False, lhs_packed_dtype=None, out_buffer=None, out_row_offset=None):
+        nz = np.nonzero(np.asarray(gs_))[0]
+        seen["mlp"].append(dict(offset=out_row_offset is not None, rows=int(x_.shape[0]),
+                                experts=(int(nz.min()), int(nz.max())) if nz.size else None))
+        h = ref(dequant(x_, lhs_packed_dtype), w1_, s1_, None, gs_, jnp.array([0], jnp.int32),
+                fuse_act=fuse_act)[:, : w2_.shape[1]]
+        full = ref(h, w2_, s2_, None, gs_, jnp.array([0], jnp.int32), preferred_element_type=h.dtype,
+                   pack_out=pack_out)
+        if out_buffer is None:
+            return full
+        assert int(out_row_offset) % 16 == 0, ("chunk output offset not sublane-aligned", int(out_row_offset))
+        n = gs_.sum()
+        rows = jnp.arange(full.shape[0])
+        src_rows = jnp.clip(rows - out_row_offset, 0, full.shape[0] - 1)
+        inside = (rows >= out_row_offset) & (rows < out_row_offset + n)
+        return jnp.where(inside[:, None], full[src_rows], out_buffer)
+
+    def combine(rows, rev, wts, valid, reduce_group_size, x_packed=False, **kw):
+        seen.setdefault("combine_kw", []).append(dict(kw))
+        return _fallback_implementation(unpack_halves(rows) if x_packed else rows, rev, wts, valid,
+                                        reduce_group_size)
+
+    info = ti.get_tpu_info_for_chip(ti.ChipVersion.TPU_7X, 1)
+    for mod in (pltpu, ti, pti):
+        monkeypatch.setattr(mod, "get_tpu_info", lambda: info, raising=False)
+
+    class _Log:
+        def info_once(self, *a, **k):
+            pass
+
+    monkeypatch.setattr(fused_moe_gmm, "logger", _Log())
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_v2", fake_sc_gather)
+    monkeypatch.setattr(fused_moe_gmm, "pack_fp8_rows", _carrier_ref)
+    monkeypatch.setattr(fused_moe_gmm, "mlp_wrapper", mlp)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", ref)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3", combine)
+    monkeypatch.setattr(fused_moe_gmm, "_local_ragged_combine_eligible", lambda *a, **k: True)
+    out = fused_moe_gmm.fused_moe_func.__wrapped__(
+        x, w1, w2, s1, s2, None, None, w, ids, topk=topk, activation="silu", use_ep=False, use_sparse_core=True,
+        nonep_gather=gather, nonep_fused_mlp=fused, nonep_gmm_experts_per_visit=2, nonep_gmm_bucket=64,
+        nonep_combine_packed=True, nonep_dispatch_chunks=chunks, nonep_permute=permute,
+        **({"combine_presorted": True} if presorted else {}))
+    return out, seen
+
+
+@pytest.mark.parametrize("gather", ["sc_padded", "sc_fp8"])
+@pytest.mark.parametrize("chunks", [2, 4])
+@pytest.mark.parametrize("skew", [False, True])
+def test_chunked_dispatch_is_bitwise_the_one_chunk_path(monkeypatch, gather, chunks, skew):
+    ref, seen0 = _chunk_case(monkeypatch, gather=gather, chunks=1, sizes_skew=skew)
+    out, seen = _chunk_case(monkeypatch, gather=gather, chunks=chunks, sizes_skew=skew)
+    assert len(seen0["gather"]) == 1 and len(seen0["mlp"]) == 1 and not seen0["mlp"][0]["offset"]
+    assert len(seen["gather"]) == chunks and len(seen["mlp"]) == chunks, seen
+    assert [c["offset"] for c in seen["mlp"]] == [False] + [True] * (chunks - 1)
+    for k, c in enumerate(seen["mlp"]):   # each chunk visits only its own expert range (no repeated work)
+        lo, hi = k * 16 // chunks, (k + 1) * 16 // chunks
+        assert c["experts"] is None or (lo <= c["experts"][0] and c["experts"][1] < hi), (k, c)
+    assert all(g["copy_mode"] == ("dma" if gather == "sc_fp8" else "vector") for g in seen["gather"])
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+@pytest.mark.parametrize("permute", ["packed", "packed_onehot"])
+@pytest.mark.parametrize("chunks", [1, 2])
+@pytest.mark.parametrize("skew", [False, True])
+def test_packed_sorts_and_presorted_combine_stack_with_chunked_dispatch(monkeypatch, permute, chunks, skew):
+    """P-MOE-6 CP1 stack (PP8): T10-MOE's packed routing sorts (M2) and presorted combine flag (M3) together with the
+    chunked dispatch give the served one-chunk, three-sort output bits; 2,560 routes is above the single-sort cap and
+    below M2's 65,536 packing limit. The chunk remap of the revert indices must use M2's inverse permutation."""
+    ref, _ = _chunk_case(monkeypatch, gather="sc_fp8", chunks=1, sizes_skew=skew)
+    out, seen = _chunk_case(monkeypatch, gather="sc_fp8", chunks=chunks, sizes_skew=skew, permute=permute,
+                            presorted=True)
+    assert len(seen["gather"]) == chunks and len(seen["mlp"]) == chunks, seen
+    assert seen["combine_kw"] and all(k.get("presorted") == "check" for k in seen["combine_kw"]), seen["combine_kw"]
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+def test_chunked_dispatch_falls_back_without_the_fused_mlp(monkeypatch):
+    ref, _ = _chunk_case(monkeypatch, chunks=1, fused=False)
+    out, seen = _chunk_case(monkeypatch, chunks=2, fused=False)
+    assert len(seen["gather"]) == 1 and seen["mlp"] == [], seen
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+def test_chunked_dispatch_stays_off_where_it_does_not_apply(monkeypatch):
+    out, seen = _chunk_case(monkeypatch, gather="xla", chunks=2)
+    assert seen["gather"] == [] and len(seen["mlp"]) == 1 and not seen["mlp"][0]["offset"]
+
+
+def test_dispatch_chunks_env_choice(monkeypatch):
+    from vllm_torchtpu import envs
+    assert "TPU_MOE_NONEP_DISPATCH_CHUNKS" in envs.environment_variables
+    monkeypatch.setenv("TPU_MOE_NONEP_DISPATCH_CHUNKS", "4")
+    assert envs.TPU_MOE_NONEP_DISPATCH_CHUNKS == "4"
+    monkeypatch.setenv("TPU_MOE_NONEP_DISPATCH_CHUNKS", "3")
+    with pytest.raises(Exception):
+        envs.TPU_MOE_NONEP_DISPATCH_CHUNKS
+# --- T10-MOE: packed routing sorts (TPU_MOE_EP_PACKED_SORTS, TPU_MOE_NONEP_PERMUTE=packed) and the presorted
+# --- combine metadata (TPU_MOE_COMBINE_PRESORTED) -------------------------------------------------------------
+
+
+def _ref_three_sorts(keys: np.ndarray, topk: int, num_keys: int):
+    """Numpy reference of the served three-sort permutation: stable argsort, its inverse, the packed (key, token)
+    sort's token ids, and the one-hot group sizes of the valid (non-sentinel) keys."""
+    m = keys.shape[0]
+    sorted_indices = np.argsort(keys, kind="stable").astype(np.int32)
+    revert = np.argsort(sorted_indices, kind="stable").astype(np.int32)
+    tokens = np.arange(m // topk, dtype=np.int64).repeat(topk)
+    token_bits = max(1, (m // topk - 1).bit_length())
+    packed = np.sort((keys.astype(np.int64) << token_bits) | tokens)
+    token_sorted = (packed & ((1 << token_bits) - 1)).astype(np.int32)
+    group_sizes = np.bincount(keys[keys < num_keys - 1], minlength=num_keys - 1).astype(np.int32)
+    return sorted_indices, revert, token_sorted, group_sizes
+
+
+def test_packed_sorts_fit_bounds():
+    fit = fused_moe_gmm.packed_sorts_fit
+    assert fit(64000, 257) and fit(65536, 257) and fit(32000, 513) and fit(65536, 513)
+    assert not fit(65537, 257) and not fit(81920, 257) and not fit(71680, 257)
+
+
+@pytest.mark.parametrize("routes", [40, 640, 2048, 32000, 32768, 32770, 64000, 65536])
+@pytest.mark.parametrize("num_keys,invalid", [(257, 0.5), (513, 0.0), (513, 0.1), (257, 1.0)])
+def test_packed_sorts_match_the_three_sort_permutation(routes, num_keys, invalid):
+    """_packed_sorts_permutation returns the same four integer arrays as the served three sorts + one-hot reduce,
+    on both sides of the 2 * flat_bits == 32 offset (32,768 / 32,770 routes) and at the int32 limit (65,536)."""
+    topk = 10 if routes % 10 == 0 else 4
+    rng = np.random.default_rng(routes + num_keys)
+    keys = rng.integers(0, num_keys - 1, routes).astype(np.int32)
+    keys[rng.random(routes) < invalid] = num_keys - 1        # invalid routes carry the sentinel key
+    got = fused_moe_gmm._packed_sorts_permutation(jnp.asarray(keys), topk, num_keys)
+    for g, r, name in zip(got, _ref_three_sorts(keys, topk, num_keys), ("sorted", "revert", "tokens", "sizes")):
+        assert np.asarray(g).dtype == np.int32, name
+        np.testing.assert_array_equal(np.asarray(g), r, err_msg=name)
+
+
+def _t10_routing(tokens: int, local: int = 256, seed: int = 7):
+    """EP rank 0 of 2 at the T10 shape: 512 experts, top-10, local ids < 256 kept, the rest marked -1 (zero weight)."""
+    ids, w = _routing(tokens, seed)
+    local_ids = jnp.where(ids < local, ids, -1)
+    w = jnp.where(local_ids >= 0, w, jnp.zeros_like(w))
+    return local_ids, w
+
+
+def _count_prims(closed, names) -> int:
+    """Primitive applications in a jaxpr, counting each call site of a nested (pjit / custom) jaxpr."""
+    n = 0
+    for eqn in closed.jaxpr.eqns:
+        n += eqn.primitive.name in names
+        for v in eqn.params.values():
+            for sub in (v if isinstance(v, (list, tuple)) else [v]):
+                if hasattr(sub, "jaxpr") and hasattr(sub, "consts"):
+                    n += _count_prims(sub, names)
+                elif hasattr(sub, "eqns"):
+                    n += _count_prims(jax.extend.core.ClosedJaxpr(sub, []), names)
+    return n
+
+
+class _QuietLog:
+    def __init__(self):
+        self.msgs = []
+
+    def info_once(self, msg, *args, **kwargs):
+        self.msgs.append(msg % args if args else msg)
+
+
+def _fake_sc_gather(src, idx, start, end, trim_rows=True, copy_mode="vector", **kw):
+    pad = -idx.shape[0] % 2048
+    out = src[jnp.pad(idx, (0, pad))]
+    return out[: idx.shape[0]] if trim_rows else out
+
+
+@pytest.mark.parametrize("mode", ["on", "onehot"])
+@pytest.mark.parametrize("tokens", [64, 640, 3200, 6400])
+def test_ep_packed_sorts_are_bitwise_on_path_d_and_drop_a_sort(monkeypatch, tokens, mode):
+    """TPU_MOE_EP_PACKED_SORTS on EP path D (argsort positions, SparseCore gather): every output of
+    prepare_routed_gmm_inputs is bit-identical, and the program runs 2 sorts instead of 3; "on" also drops the
+    one-hot group-size reduce (its one_hot), "onehot" keeps it."""
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_v2", _fake_sc_gather)
+    monkeypatch.setattr(fused_moe_gmm, "logger", _QuietLog())
+    x = _hidden(tokens, 256)
+    ids, w = _t10_routing(tokens)
+
+    def run(**kw):
+        return prepare_routed_gmm_inputs(x, ids, w, local_num_experts=256, topk=TOPK, use_ep=True,
+                                         use_sparse_core=True, skip_padded_tokens=True, ep_counting_sort=False,
+                                         ep_gather="sc_padded", **kw)
+
+    ref, got = run(), run(ep_packed_sorts=mode)
+    for r, g, name in zip(ref, got, ("x", "sizes", "revert", "weights", "valid", "tokens")):
+        np.testing.assert_array_equal(_bits(g) if g.dtype == jnp.bfloat16 else np.asarray(g),
+                                      _bits(r) if r.dtype == jnp.bfloat16 else np.asarray(r), err_msg=name)
+
+    def sorts(**kw):
+        fn = lambda a, b, c: prepare_routed_gmm_inputs(  # noqa: E731
+            a, b, c, local_num_experts=256, topk=TOPK, use_ep=True, use_sparse_core=True, skip_padded_tokens=True,
+            ep_counting_sort=False, ep_gather="sc_padded", **kw)
+        return _count_prims(jax.make_jaxpr(fn)(x, ids, w), {"sort"})
+
+    assert sorts() == 3 and sorts(ep_packed_sorts=mode) == 2
+
+    def onehots(**kw):
+        fn = lambda a, b, c: prepare_routed_gmm_inputs(  # noqa: E731
+            a, b, c, local_num_experts=256, topk=TOPK, use_ep=True, use_sparse_core=True, skip_padded_tokens=True,
+            ep_counting_sort=False, ep_gather="sc_padded", **kw)
+        return len(re.findall(r"i32\[\d+,256\]", str(jax.make_jaxpr(fn)(x, ids, w))))
+
+    assert onehots() > 0 and (onehots(ep_packed_sorts=mode) > 0) == (mode == "onehot")
+
+
+def test_ep_packed_sorts_fall_back_above_the_int32_packing(monkeypatch):
+    """8,192 tokens x top-10 = 81,920 routes: the inverse does not pack into int32, so the served sorts run."""
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_v2", _fake_sc_gather)
+    tokens = 8192
+    x = _hidden(tokens, 128)
+    ids, w = _t10_routing(tokens)
+    fn = lambda a, b, c, **kw: prepare_routed_gmm_inputs(  # noqa: E731
+        a, b, c, local_num_experts=256, topk=TOPK, use_ep=True, use_sparse_core=True, skip_padded_tokens=True,
+        ep_counting_sort=False, ep_gather="sc_padded", **kw)
+    on = str(jax.make_jaxpr(lambda a, b, c: fn(a, b, c, ep_packed_sorts="on"))(x, ids, w))
+    off = str(jax.make_jaxpr(lambda a, b, c: fn(a, b, c))(x, ids, w))
+    assert on == off
+
+
+def test_ep_packed_sorts_leave_the_counting_sort_and_non_ep_paths_alone(monkeypatch):
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_v2", _fake_sc_gather)
+    tokens = 640
+    x = _hidden(tokens, 128)
+    ids, w = _t10_routing(tokens)
+
+    def jaxpr(use_ep, counting, **kw):
+        fn = lambda a, b, c: prepare_routed_gmm_inputs(  # noqa: E731
+            a, b, c, local_num_experts=256, topk=TOPK, use_ep=use_ep, use_sparse_core=use_ep,
+            ep_counting_sort=counting, **kw)
+        return str(jax.make_jaxpr(fn)(x, jnp.where(ids >= 0, ids, 0), w))
+
+    assert jaxpr(True, True, ep_packed_sorts="on") == jaxpr(True, True)
+    assert jaxpr(False, False, ep_packed_sorts="on") == jaxpr(False, False)
+    with pytest.raises(ValueError):
+        jaxpr(True, False, ep_packed_sorts="yes")
+
+
+@pytest.mark.parametrize("permute", ["packed", "packed_onehot"])
+@pytest.mark.parametrize("tokens,skip_padded", [(640, False), (640, True), (3200, True), (6400, False)])
+def test_nonep_permute_packed_matches_the_served_sorts(monkeypatch, tokens, skip_padded, permute):
+    """TPU_MOE_NONEP_PERMUTE=packed / packed_onehot on the whole-expert path above the single-sort cap: bitwise
+    every output, with padded tokens (zero weights) skipped or not."""
+    log = _QuietLog()
+    monkeypatch.setattr(fused_moe_gmm, "logger", log)
+    x = _hidden(tokens, 256)
+    ids, w = _routing(tokens)
+    w = w.at[-7:].set(0)                                      # trailing padded tokens
+
+    def run(permute):
+        return prepare_routed_gmm_inputs(x, ids, w, local_num_experts=EXPERTS, topk=TOPK, use_ep=False,
+                                         use_sparse_core=False, skip_padded_tokens=skip_padded,
+                                         nonep_permute=permute)
+
+    ref = run("sorts")
+    assert "MoE permutation runs as two packed sorts." not in log.msgs
+    got = run(permute)
+    assert "MoE permutation runs as two packed sorts." in log.msgs
+    for r, g, name in zip(ref, got, ("x", "sizes", "revert", "weights", "valid", "tokens")):
+        np.testing.assert_array_equal(_bits(g) if g.dtype == jnp.bfloat16 else np.asarray(g),
+                                      _bits(r) if r.dtype == jnp.bfloat16 else np.asarray(r), err_msg=name)
+
+
+def test_ep_packed_sorts_end_to_end_bitwise(monkeypatch):
+    ref, _ = _ep_case(monkeypatch, stack=True)
+    out, seen = _ep_case(monkeypatch, stack=True, packed_sorts="on")
+    assert "MoE permutation runs as two packed sorts." in seen["log"], seen["log"]
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+def _route_meta(tokens, topk, valid, presorted, partitions=2, seed=4):
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import build_route_metadata
+
+    rng = np.random.default_rng(seed)
+    idx = jnp.asarray(rng.integers(0, tokens * topk, tokens * topk), jnp.int32)
+    wts = jnp.asarray(rng.random(tokens * topk), jnp.bfloat16)
+    return build_route_metadata(idx, wts, jnp.asarray(valid), topk, partitions, presorted)
+
+
+@pytest.mark.parametrize("tokens", [128, 640, 1000, 3200])
+@pytest.mark.parametrize("trailing_invalid", [0, 3])
+def test_presorted_metadata_equals_the_partition_sort_when_valid_routes_form_a_prefix(tokens, trailing_invalid):
+    """All real routes valid, or invalid only on trailing (padded) tokens: the stable partition is the identity, so
+    "static" and "check" give the same metadata as the sort; 1,000 tokens also pads to the row-partition alignment."""
+    topk = 10
+    valid = np.ones(tokens * topk, bool)
+    if trailing_invalid:
+        valid[-trailing_invalid * topk:] = False
+    ref = _route_meta(tokens, topk, valid, "")
+    for mode in ("static", "check"):
+        got = _route_meta(tokens, topk, valid, mode)
+        for r, g, name in zip(ref[:3], got[:3], ("metadata", "weights", "counts")):
+            np.testing.assert_array_equal(np.asarray(g), np.asarray(r), err_msg=f"{mode} {name}")
+        assert got[3:] == ref[3:]
+
+
+@pytest.mark.parametrize("tokens", [128, 640])
+def test_presorted_check_falls_back_to_the_sort_on_interleaved_invalid_routes(tokens):
+    """EP's served valid mask (non-local routes interleaved): "check" must take the sort and match it, while
+    "static" (whose precondition is broken here) differs -- the test can see a wrong skip."""
+    topk = 10
+    valid = np.random.default_rng(tokens).random(tokens * topk) < 0.5
+    ref = _route_meta(tokens, topk, valid, "")
+    chk = _route_meta(tokens, topk, valid, "check")
+    for r, g in zip(ref[:3], chk[:3]):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(r))
+    stat = _route_meta(tokens, topk, valid, "static")
+    assert not np.array_equal(np.asarray(stat[0]), np.asarray(ref[0]))
+
+
+def test_blocks_presorted_detects_prefix_blocks():
+    """The "check" predicate: true for all-valid blocks and for invalid routes that only trail (padding), false
+    when an invalid route sits before a valid one in any block."""
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import blocks_presorted
+
+    full = np.ones((4, 640), bool)
+    trail = full.copy()
+    trail[3, 600:] = False
+    hole = full.copy()
+    hole[1, 5] = False
+    assert bool(blocks_presorted(jnp.asarray(full))) and bool(blocks_presorted(jnp.asarray(trail)))
+    assert not bool(blocks_presorted(jnp.asarray(hole)))
+
+
+def test_presorted_rejects_unknown_modes():
+    with pytest.raises(ValueError):
+        _route_meta(128, 10, np.ones(1280, bool), "maybe")
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_combine_presorted_is_static_on_the_ep_all_valid_combine(monkeypatch, packed):
+    ref, _ = _ep_case(monkeypatch, stack=True, combine="dense", packed=packed)
+    out, seen = _ep_case(monkeypatch, stack=True, combine="dense", packed=packed, presorted=True)
+    assert seen["combine"] == [dict(v3=True, packed=packed, all_valid=True, presorted="static")], seen["combine"]
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+def test_combine_presorted_leaves_the_served_ep_combine_alone(monkeypatch):
+    _, seen = _ep_case(monkeypatch, stack=True, presorted=True)
+    assert seen["combine"] == ["served"], seen["combine"]
+
+
+def test_combine_presorted_checks_on_the_non_ep_combine_and_is_absent_when_off(monkeypatch):
+    calls = []
+    experts, hidden, inter, topk, tokens = 16, 512, 128, 4, 640
+    k1, k2, k3 = jax.random.split(jax.random.key(9), 3)
+    w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (experts, inter, hidden))
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(8)
+    ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import _fallback_implementation
+
+    def v3(rows, rev, wts, valid, reduce_group_size, x_packed=False, **kw):
+        calls.append(kw)
+        return _fallback_implementation(rows, rev, wts, valid, reduce_group_size)
+
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _ref_gmm([]))
+    monkeypatch.setattr(fused_moe_gmm, "_local_ragged_combine_eligible", lambda *a, **k: True)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3", v3)
+    run = lambda **kw: fused_moe_gmm.fused_moe_func.__wrapped__(  # noqa: E731
+        x, w1, w2, s1, s2, None, None, w, ids, topk=topk, activation="silu", use_ep=False, use_sparse_core=False,
+        **kw)
+    ref = run()
+    out = run(combine_presorted=True)
+    assert calls == [{}, {"presorted": "check"}], calls
+    np.testing.assert_array_equal(_bits(out), _bits(ref))
+
+
+def test_t10moe_knobs_are_registered(monkeypatch):
+    from vllm_torchtpu import envs
+
+    for name in ("TPU_MOE_EP_PACKED_SORTS", "TPU_MOE_COMBINE_PRESORTED"):
+        assert name in envs.environment_variables, name
+        monkeypatch.delenv(name, raising=False)
+    assert envs.TPU_MOE_EP_PACKED_SORTS == "off" and envs.TPU_MOE_COMBINE_PRESORTED is False
+    monkeypatch.setenv("TPU_MOE_COMBINE_PRESORTED", "1")
+    assert envs.TPU_MOE_COMBINE_PRESORTED is True
+    for v in ("ON", "onehot"):
+        monkeypatch.setenv("TPU_MOE_EP_PACKED_SORTS", v)
+        assert envs.TPU_MOE_EP_PACKED_SORTS.lower() == v.lower()
+    monkeypatch.setenv("TPU_MOE_EP_PACKED_SORTS", "1")
+    with pytest.raises(Exception):
+        envs.TPU_MOE_EP_PACKED_SORTS
+    for v in ("PACKED", "packed_onehot"):
+        monkeypatch.setenv("TPU_MOE_NONEP_PERMUTE", v)
+        assert envs.TPU_MOE_NONEP_PERMUTE.lower() == v.lower()

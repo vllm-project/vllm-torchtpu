@@ -12,6 +12,10 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
 from vllm_torchtpu.kernels.qwen4_exp.hc_decode import hc_decode_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_decode_cmp import hc_decode_mix_auto
+from vllm_torchtpu.kernels.qwen4_exp.hc_decode_wide import (
+    MODES as WIDE_MODES,
+    hc_decode_mix_wide_auto,
+)
 from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_norm import _normalize
 from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_cmp import hc_prefill_mix_cmp
@@ -126,6 +130,52 @@ def build_up_epilogue_op(branches: int, hidden: int, token_tile: int):
     return op
 
 
+def _decode_mix_choice():
+    """The fused decode HC mix and its op-name tag.
+
+    TPU_QWEN4_HC_DECODE_WIDE (q38 HC-HIGHROWS, 0 = off) 1 / 2 runs
+    hc_decode_wide.py's served-order / cmp-math mode at 160-511 rows (a
+    multiple of 16); TPU_QWEN4_HC_DECODE_COMPARE runs hc_decode_cmp.py at
+    16-256 rows. They are exclusive. TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID
+    (q38 HC-HIGHROWS-2 CMP-S, only with COMPARE) takes the served sigmoid in
+    the cmp mix term (_cmps). Unset, it is hc_decode_mix, untagged.
+    TPU_QWEN4_HC_DECODE_INJECT_FOLD (q38 INJ-MXU, numerics-changing) needs
+    TPU_QWEN4_HC_DECODE_WIDE=1: W1 takes the injection logits from its down
+    projection (_w1f); with WIDE 0, 2 or 3 it is refused.
+    """
+    wide = envs.TPU_QWEN4_HC_DECODE_WIDE
+    fold = envs.TPU_QWEN4_HC_DECODE_INJECT_FOLD
+    if fold and wide != 1:
+        raise ValueError(
+            "TPU_QWEN4_HC_DECODE_INJECT_FOLD needs TPU_QWEN4_HC_DECODE_WIDE=1 "
+            f"(got {wide})"
+        )
+    if wide:
+        if wide not in WIDE_MODES:
+            raise ValueError(
+                f"TPU_QWEN4_HC_DECODE_WIDE={wide}: expected 0 (off), 1, 2 or 3"
+            )
+        cmp_set = envs.TPU_QWEN4_HC_DECODE_COMPARE
+        if cmp_set or envs.TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID:
+            raise ValueError(
+                "TPU_QWEN4_HC_DECODE_WIDE and TPU_QWEN4_HC_DECODE_COMPARE are "
+                "exclusive"
+            )
+        if fold:
+            return functools.partial(hc_decode_mix_wide_auto, mode=1, fold=True), "_w1f"
+        return functools.partial(hc_decode_mix_wide_auto, mode=wide), f"_w{wide}"
+    if envs.TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID:
+        if not envs.TPU_QWEN4_HC_DECODE_COMPARE:
+            raise ValueError(
+                "TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID needs "
+                "TPU_QWEN4_HC_DECODE_COMPARE=1"
+            )
+        return functools.partial(hc_decode_mix_auto, sigmoid=True), "_cmps"
+    if envs.TPU_QWEN4_HC_DECODE_COMPARE:
+        return hc_decode_mix_auto, "_cmp"
+    return hc_decode_mix, ""
+
+
 @functools.cache
 def build_decode_mix_op(branches: int, hidden: int, eps: float, inject: bool):
     """Register the fused decode HC mix; callers gate it on decode_token_tile.
@@ -136,8 +186,7 @@ def build_decode_mix_op(branches: int, hidden: int, eps: float, inject: bool):
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
     max_tile = envs.TPU_QWEN4_HC_DECODE_TILE_ROWS
     static = dict(branches=branches, hidden=hidden, eps=eps, max_tile=max_tile)
-    mix = hc_decode_mix_auto if envs.TPU_QWEN4_HC_DECODE_COMPARE else hc_decode_mix
-    cmp_tag = "_cmp" if envs.TPU_QWEN4_HC_DECODE_COMPARE else ""
+    mix, cmp_tag = _decode_mix_choice()
     if inject:
 
         def core(
@@ -196,9 +245,8 @@ def build_decode_combine_mix_op(
     max_tile = envs.TPU_QWEN4_HC_DECODE_TILE_ROWS
     static = dict(branches=branches, hidden=hidden, eps=eps, max_tile=max_tile)
     tile_tag = f"_t{max_tile}" if max_tile else ""
-    if envs.TPU_QWEN4_HC_DECODE_COMPARE:
-        tile_tag += "_cmp"
-    mix = hc_decode_mix_auto if envs.TPU_QWEN4_HC_DECODE_COMPARE else hc_decode_mix
+    mix, impl_tag = _decode_mix_choice()
+    tile_tag += impl_tag
     if inject:
 
         def core(
@@ -286,13 +334,20 @@ def build_prefill_inj_mix_op(
     partial: bool = False,
     norm_impl: str = "vpu",
     cmp: bool = False,
+    down_asm: bool = False,
 ):
     """TPU_QWEN4_HC_PREFILL_FUSED_MIX: prefill HC mix returning ``(mixed,
     injection)``; ``norm`` stays on chip. Callers gate it to whole tiles.
     ``cmp`` (TPU_QWEN4_HC_PREFILL_COMPARE): hc_prefill_cmp's kernel, which
-    ignores ``norm_impl``."""
+    ignores ``norm_impl``. ``down_asm``: TPU_QWEN4_HC_PREFILL_DOWN_ASM (the
+    stock kernel only; refused with ``cmp``)."""
+    if cmp and down_asm:
+        raise ValueError(
+            "TPU_QWEN4_HC_PREFILL_COMPARE and TPU_QWEN4_HC_PREFILL_DOWN_ASM are exclusive"
+        )
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
     mix = hc_prefill_mix_cmp if cmp else hc_prefill_mix
+    stock_only = {} if cmp else {"down_asm": down_asm}
 
     def core(
         x: jax.Array,
@@ -313,12 +368,14 @@ def build_prefill_inj_mix_op(
             token_tile=token_tile,
             partial=partial,
             norm_impl=norm_impl,
+            **stock_only,
         )
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_prefill_inj_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
         f"{'_p' if partial else ''}"
-        f"{'_cmp' if cmp else '' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
+        f"{'_cmp' if cmp else '' if norm_impl == 'vpu' else '_n' + norm_impl}"
+        f"{'_da' if down_asm else ''}_v1",
         core,
     )
 
@@ -341,15 +398,26 @@ def build_prefill_combine_mix_op(
     partial: bool = False,
     norm_impl: str = "vpu",
     cmp: bool = False,
+    reread: bool = False,
+    down_asm: bool = False,
 ):
     """The previous HC's combine fused ahead of this HC's prefill mix.
 
     Returns ``(mixed, injection, combined)``; ``combined`` is the hyper input
     this HC mixed (the next combine's residual). ``cmp`` as in
-    ``build_prefill_inj_mix_op``.
+    ``build_prefill_inj_mix_op``. ``reread``: the norm reads the combined rows
+    back from VMEM (TPU_QWEN4_HC_PREFILL_FOLD); ``down_asm``:
+    TPU_QWEN4_HC_PREFILL_DOWN_ASM. Both are the stock kernel's and refused with
+    ``cmp``.
     """
+    if cmp and (reread or down_asm):
+        raise ValueError(
+            "TPU_QWEN4_HC_PREFILL_COMPARE excludes TPU_QWEN4_HC_PREFILL_FOLD's reread "
+            "and TPU_QWEN4_HC_PREFILL_DOWN_ASM"
+        )
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
     mix = hc_prefill_mix_cmp if cmp else hc_prefill_mix
+    stock_only = {} if cmp else {"reread": reread, "down_asm": down_asm}
 
     def core(
         residual: jax.Array,
@@ -374,12 +442,14 @@ def build_prefill_combine_mix_op(
             prev_injection=prev_injection,
             partial=partial,
             norm_impl=norm_impl,
+            **stock_only,
         )
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_prefill_combine_c{branches}_h{hidden}_m{token_tile}"
         f"_e{eps_tag}{'_p' if partial else ''}"
-        f"{'_cmp' if cmp else '' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
+        f"{'_cmp' if cmp else '' if norm_impl == 'vpu' else '_n' + norm_impl}"
+        f"{'_rr' if reread else ''}{'_da' if down_asm else ''}_v1",
         core,
     )
 

@@ -231,10 +231,16 @@ def test_manifest_preserves_lifecycle_dependencies():
         "patch_prefix_lookup_log",
         "patch_kv_decode_fast_path",
         "patch_kv_load_pacing",
+        "patch_arrival_touch",
         "patch_prompt_token_array",
         "patch_gc_at_waits",
         "patch_engine_core_gc",
+        "patch_preproc_in_wait",
+        "patch_defer_fin",
+        "patch_fanin_late",
+        "patch_admit_off",
         "_patch_vllm_merge_multimodal_embeddings",
+        "patch_engine_core_cpu_pin",
     ]
     assert stages["platform_activation"] == (
         stages["worker_init"] + stages["model_load"]
