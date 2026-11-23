@@ -512,8 +512,10 @@ def fused_conv1d_gdn(
             )
 
     if beta_scale != 1.0 and not is_kda:
-        raise ValueError(
-            f"beta_scale only applies to KDA; got attention_mode={attention_mode}."
+        # GDN's delta rule has the same beta; only the KDA path scales it.
+        raise NotImplementedError(
+            "beta_scale is only implemented for KDA; got "
+            f"attention_mode={attention_mode}."
         )
     if beta_scale <= 0:
         raise ValueError(f"beta_scale must be positive; got {beta_scale}.")
@@ -561,9 +563,16 @@ def fused_conv1d_gdn(
     # The unified pool addresses its state regions in lane-row granules
     # (`_GranuleStateRef._granule_width`), which a wider value head would
     # straddle.
-    if is_shared and d_v > num_lanes:
+    if is_shared and d_v != num_lanes:
         raise NotImplementedError(
-            f"The unified KV pool requires d_v <= {num_lanes}; got d_v={d_v}."
+            f"The unified KV pool requires d_v == {num_lanes}; got d_v={d_v}."
+        )
+    # A bf16 recurrent state is packed (d_k // 2, 2, d_v) before the uint32
+    # bitcast; the full-row granule for d_v > num_lanes is only exercised for
+    # fp32 states.
+    if not is_shared and jnp.dtype(recurrent_dtype) == jnp.bfloat16 and d_v > num_lanes:
+        raise NotImplementedError(
+            f"A bf16 recurrent state requires d_v <= {num_lanes}; got d_v={d_v}."
         )
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing

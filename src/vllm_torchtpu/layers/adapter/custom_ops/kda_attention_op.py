@@ -468,6 +468,9 @@ def build_kimi_dispatched_kda_op(
     """Build fused KDA with separately guarded speculative and prefill segments."""
     core = _build_fused_core(lower_bound, eps, num_spec_tokens, beta_scale)
     variant = "fused_window" if num_spec_tokens else "fused"
+    # The scale is baked into the traced core, and ops dispatch by name.
+    if beta_scale != 1.0:
+        variant += f"_beta{beta_scale:g}".replace(".", "p")
     logger.info("KDA op %s: using the %s GDN v3 path.", prefix, variant)
     op_name = f"pallas::kimi_dispatched_kda_{variant}_{prefix.replace('.', '_')}"
     dispatched_op = pallas.jax_op(op_name, core, donate_argnums=(4, 5))
@@ -583,6 +586,13 @@ def _pooled_kda_core(
         state_indices = ckpt_indices.reshape(-1)
     num_heads = a_log.shape[0]
     head_dim = norm_weight.shape[0]
+    # The pooled path uses one head width for both state axes and the conv;
+    # d_v != d_k is only supported by the dispatched (dense) op.
+    if dt_bias.shape[0] != num_heads * head_dim:
+        raise NotImplementedError(
+            "Pooled KDA requires equal key and value head widths; got key width "
+            f"{dt_bias.shape[0] // num_heads} and value width {head_dim}."
+        )
     kernel_size = conv_weight.shape[0]
     # The pool dtype is the attention KV dtype. The state regions keep the
     # dtypes gdn_pool_layout fixes for every reader of pool bytes (block
@@ -750,6 +760,7 @@ def build_kimi_pooled_kda_op(
     eps: float,
     vllm_config: VllmConfig,
     num_spec_tokens: int = 0,
+    beta_scale: float = 1.0,
 ):
     """Build the KDA op that reads and writes its state through the pool.
 
@@ -767,7 +778,15 @@ def build_kimi_pooled_kda_op(
     adjusted value exists), so a value captured at build time is the
     pre-adjustment one (16) and the op would size its regions against the
     wrong manager block.
+
+    `beta_scale` and a value head wider than the key head are only supported
+    by the dispatched op; both raise here rather than fail at trace time.
     """
+    if beta_scale != 1.0:
+        raise NotImplementedError(
+            f"Pooled KDA does not support beta_scale (got {beta_scale}); use the "
+            "dispatched op (TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0)."
+        )
 
     conv_shard_heads = None
     if (

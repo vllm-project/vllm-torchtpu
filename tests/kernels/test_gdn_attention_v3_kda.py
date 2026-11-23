@@ -393,6 +393,20 @@ _SHAPES = (
         d_v=512,
         beta_scale=2.0,
     ),
+    # OLMo 3.5 at TP2 (four heads per rank), resuming from random conv and
+    # recurrent states: seq_lens exceed the query lengths, so the wide state
+    # is DMA'd in from HBM rather than zero-initialized.
+    dict(
+        name="olmo35_heads_tp2_warm_state",
+        max_reqs=3,
+        q_loc=[0, 1, 2, 130],
+        distribution=[2, 3, 3],
+        n_v=4,
+        d_k=256,
+        d_v=512,
+        beta_scale=2.0,
+        initial_state=True,
+    ),
 )
 
 # Kimi-Linear-48B sets no bound; every K3 variant sets -5.0.
@@ -429,6 +443,7 @@ class KdaAttentionV3Test(parameterized.TestCase):
         d_v=128,
         beta_scale=1.0,
         prefill_only=False,
+        initial_state=False,
     ):
         # K3, Kimi-Linear and OLMo 3.5 all run KDA without GQA: n_kq == n_v.
         n_kq = n_v
@@ -443,14 +458,22 @@ class KdaAttentionV3Test(parameterized.TestCase):
         num_blocks = max_reqs + 1
         dim_size = 2 * n_kq * d_k + n_v * d_v
 
-        rngs = iter(jax.random.split(jax.random.key(0), 8))
+        rngs = iter(jax.random.split(jax.random.key(0), 10))
         qkv = jax.random.normal(next(rngs), (num_tokens, dim_size))
         b = jax.random.normal(next(rngs), (num_tokens, n_v))
         # The KDA gate is per-channel: n_v * d_k wide, not n_v.
         a = jax.random.normal(next(rngs), (num_tokens, n_v * d_k))
 
-        conv_state = jnp.zeros((num_blocks, kernel_size - 1, dim_size))
-        recurrent_state = jnp.zeros((num_blocks, n_v, d_k, d_v))
+        if initial_state:
+            conv_state = jax.random.normal(
+                next(rngs), (num_blocks, kernel_size - 1, dim_size)
+            )
+            recurrent_state = 0.1 * jax.random.normal(
+                next(rngs), (num_blocks, n_v, d_k, d_v)
+            )
+        else:
+            conv_state = jnp.zeros((num_blocks, kernel_size - 1, dim_size))
+            recurrent_state = jnp.zeros((num_blocks, n_v, d_k, d_v))
         conv_weight = jax.random.normal(next(rngs), (dim_size, 1, kernel_size))
         conv_bias = jax.random.normal(next(rngs), (dim_size,))
 
@@ -462,6 +485,9 @@ class KdaAttentionV3Test(parameterized.TestCase):
         seq_lens = jnp.asarray(
             q_loc[1 : max_reqs + 1] - q_loc[:max_reqs], dtype=jnp.int32
         )
+        if initial_state:
+            # Earlier context: every sequence resumes from its stored state.
+            seq_lens = seq_lens + 64
 
         common_kwargs = dict(
             qkv=qkv,
@@ -1054,6 +1080,19 @@ class KdaTilingAndValidationTest(parameterized.TestCase):
         {
             "testcase_name": "non_negative_bound",
             "overrides": {"gate_lower_bound": 0.0},
+            "error": ValueError,
+        },
+        {
+            "testcase_name": "beta_scale_under_gdn",
+            "overrides": {
+                "attention_mode": config.AttentionMode.GDN,
+                "beta_scale": 2.0,
+            },
+            "error": NotImplementedError,
+        },
+        {
+            "testcase_name": "non_positive_beta_scale",
+            "overrides": {"beta_scale": 0.0},
             "error": ValueError,
         },
     )
@@ -1665,36 +1704,67 @@ class KdaTilingAndValidationTest(parameterized.TestCase):
                         atol=0.0,
                     )
 
-    def test_rejects_wide_value_heads_on_the_unified_pool(self):
-        """The unified pool's lane-row granules cannot hold d_v > 128."""
+    def _wide_value_head_kwargs(self, states, **overrides):
         n_kq = n_v = 1
         d_k, d_v = 256, 512
         kernel_size = 4
         dim_size = 2 * n_kq * d_k + n_v * d_v
-        with self.assertRaisesRegex(NotImplementedError, "d_v <= 128"):
-            wrapper.fused_conv1d_gdn(
-                qkv=jnp.zeros((8, dim_size)),
-                b=jnp.zeros((8, n_v)),
-                a=jnp.zeros((8, n_v * d_k)),
-                # fp32 unified pool: [blocks, granules, packing=1, lanes].
-                states=jnp.zeros((9, 64, 1, 128)),
-                conv_dtype=jnp.float32,
-                recurrent_dtype=jnp.float32,
-                conv_weight=jnp.zeros((dim_size, 1, kernel_size)),
-                conv_bias=None,
-                a_log=jnp.zeros((n_v,)),
-                dt_bias=jnp.zeros((n_v, d_k)),
-                query_start_loc=jnp.arange(9, dtype=jnp.int32),
-                state_indices=jnp.arange(1, 9),
-                distribution=jnp.array([8, 8, 8], dtype=jnp.int32),
-                seq_lens=jnp.ones((8,), dtype=jnp.int32),
-                n_kq=n_kq,
-                n_v=n_v,
-                d_k=d_k,
-                d_v=d_v,
-                kernel_size=kernel_size,
-                attention_mode=config.AttentionMode.KDA,
+        kwargs = dict(
+            qkv=jnp.zeros((8, dim_size)),
+            b=jnp.zeros((8, n_v)),
+            a=jnp.zeros((8, n_v * d_k)),
+            states=states,
+            conv_weight=jnp.zeros((dim_size, 1, kernel_size)),
+            conv_bias=None,
+            a_log=jnp.zeros((n_v,)),
+            dt_bias=jnp.zeros((n_v, d_k)),
+            query_start_loc=jnp.arange(9, dtype=jnp.int32),
+            state_indices=jnp.arange(1, 9),
+            distribution=jnp.array([8, 8, 8], dtype=jnp.int32),
+            seq_lens=jnp.ones((8,), dtype=jnp.int32),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            attention_mode=config.AttentionMode.KDA,
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_rejects_wide_value_heads_on_the_unified_pool(self):
+        """The unified pool's lane-row granules need d_v == 128."""
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        # fp32 unified pool: [blocks, granules, packing=1, lanes].
+        kwargs = self._wide_value_head_kwargs(
+            jnp.zeros((9, 64, 1, 128)),
+            conv_dtype=jnp.float32,
+            recurrent_dtype=jnp.float32,
+        )
+        with (
+            use_abstract_mesh(mesh),
+            self.assertRaisesRegex(NotImplementedError, "d_v == 128"),
+        ):
+            wrapper.fused_conv1d_gdn(**kwargs)
+
+    def test_rejects_wide_value_heads_with_a_bf16_recurrent_state(self):
+        """The full-row granule for d_v > 128 is only used with fp32 states."""
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        kwargs = self._wide_value_head_kwargs(
+            (
+                jnp.zeros((9, 3, 1024)),
+                jnp.zeros((9, 1, 256, 512), dtype=jnp.bfloat16),
             )
+        )
+        with (
+            use_abstract_mesh(mesh),
+            self.assertRaisesRegex(NotImplementedError, "bf16 recurrent"),
+        ):
+            wrapper.fused_conv1d_gdn(**kwargs)
 
 
 class KdaCustomOpWideValueHeadTest(parameterized.TestCase):
