@@ -42,6 +42,8 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import compressed_kernel_pages
 from vllm_torchtpu.kernels.qwen4_exp.qsa_state import read_ring_and_tags
 
+from .qwen38_io_lean import io_lean
+
 RING_ROWS = 8  # newest positions kept per request (lane = position % 8), >= ratio
 IDX_DIM = 128
 GROUP = 4  # compress ratio
@@ -76,7 +78,29 @@ def manager_page_table(cktab: Any, mp: int, lp: int, physical: int) -> Any:
     return cktab[..., ::mp] // mp
 
 
-def _layer_batched_tables(pool, tables, slots, live, ctx, n_req, nreq, pages_per_seq, n_ck, lp):
+def manager_page_table_direct(comp: Any, cslots: Any, mp: int, lp: int, physical: int,
+                              n_ck: int) -> Any:
+    """`manager_page_table(cktab, mp, lp, physical)` of the per-kernel-page table
+    `cktab[..., k] = comp[..., k // lp] * physical + cslot * lp + k % lp` (k < n_ck), built at
+    its final width from the block-column table `comp [layers, nreq, cols]` without the
+    `[..., cols * lp]` table (VLLM_TPU_MK_IO_LEAN=cktab).
+
+    Entry m reads page k = m * mp: column `m // q`, j = `(m % q) * mp` with q = lp // mp. Since
+    mp divides `physical`, `lp` and j, `(comp * physical + cslot * lp + j) // mp` =
+    `comp * (physical // mp) + cslot * q + m % q` exactly, for any int32 values for which the
+    left side does not overflow (served: block ids < 2**31 / physical).
+    """
+    assert mp > 0 and lp % mp == 0 and physical % mp == 0 and n_ck % mp == 0, (
+        mp, lp, physical, n_ck)
+    q = lp // mp
+    m = jnp.arange(n_ck // mp, dtype=jnp.int32)
+    col = comp[..., m // q] if q > 1 else comp[..., : n_ck // mp]
+    first = (jnp.asarray(cslots, jnp.int32) * q)[:, None, None] + (m % q)[None, None, :]
+    return (col * (physical // mp) + first).astype(jnp.int32)
+
+
+def _layer_batched_tables(pool, tables, slots, live, ctx, n_req, nreq, pages_per_seq, n_ck, lp,
+                          manager_pages=0):
     """`qsa_step_inputs`' per-layer table and ring prep for all layers at once
     (VLLM_TPU_MK_WHOLE_BATCHED_INPUTS): `[layers, nreq, cols]` page tables and one ring
     read for every layer's requests. Same values as the per-layer loop; 11 ring-read calls
@@ -89,12 +113,18 @@ def _layer_batched_tables(pool, tables, slots, live, ctx, n_req, nreq, pages_per
     mtab = stacked(1, pages_per_seq)
     cols = -(-n_ck // lp)
     comp = stacked(2, cols)
-    # `compressed_kernel_pages` with each layer's slot offset.
-    first = jnp.asarray([[cslot * lp + j for j in range(lp)] for _, cslot in slots], jnp.int32)
     physical = carrier_pages_per_block(pool)
-    cktab = comp[..., None] * physical + first[:, None, None, :]
-    cktab = cktab.reshape(len(tables), nreq, cols * lp)
-    cktab = cktab[:, :, :n_ck].astype(jnp.int32)
+    if manager_pages:  # VLLM_TPU_MK_IO_LEAN=cktab: the manager-page table directly
+        cktab = manager_page_table_direct(
+            comp, [cslot for _, cslot in slots], manager_pages, lp, physical, n_ck
+        )
+    else:
+        # `compressed_kernel_pages` with each layer's slot offset.
+        first = jnp.asarray([[cslot * lp + j for j in range(lp)] for _, cslot in slots],
+                            jnp.int32)
+        cktab = comp[..., None] * physical + first[:, None, None, :]
+        cktab = cktab.reshape(len(tables), nreq, cols * lp)
+        cktab = cktab[:, :, :n_ck].astype(jnp.int32)
     ids = jnp.stack(
         [_fit(tab[0].reshape(n_req, -1)[:, 0].astype(jnp.int32), nreq) for tab in tables]
     )
@@ -153,9 +183,14 @@ def qsa_step_inputs(
     # mapping.
     lp = pool.shape[1] // 128
     if envs.VLLM_TPU_MK_WHOLE_BATCHED_INPUTS:
+        # VLLM_TPU_MK_IO_LEAN=cktab: the manager-page key table built at its final width.
+        direct = manager_pages if io_lean("cktab") else 0
         mtab, cktab, ring = _layer_batched_tables(
-            pool, tables, slots, live, ctx, n_req, nreq, pages_per_seq, n_ck, lp
+            pool, tables, slots, live, ctx, n_req, nreq, pages_per_seq, n_ck, lp,
+            manager_pages=direct,
         )
+        if direct:
+            manager_pages = 0  # already applied
         if not layer_major_tables:
             mtab = mtab.reshape(-1, mtab.shape[-1])
             cktab = cktab.reshape(-1, cktab.shape[-1])
