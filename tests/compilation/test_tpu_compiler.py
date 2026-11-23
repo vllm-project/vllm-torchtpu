@@ -286,6 +286,7 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/layers/adapter/cp_prefill_attention.py",
             "vllm_torchtpu/layers/adapter/moe_hierarchical.py",
             "vllm_torchtpu/layers/adapter/moe_routing.py",
+            "vllm_torchtpu/models/vllm/gemma4/cp_prefill.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
             "vllm_torchtpu/runner/utils.py",

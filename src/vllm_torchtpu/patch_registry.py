@@ -163,6 +163,11 @@ PATCHES = (
         ("platform_activation", "model_load"),
         model_config=True,
     ),
+    Patch(
+        "vllm_torchtpu.models.vllm.gemma4:maybe_patch_gemma4",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
 )
 
 _applied: set[str] = set()

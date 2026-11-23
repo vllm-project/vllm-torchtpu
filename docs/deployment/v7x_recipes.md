@@ -2,7 +2,7 @@
 
 **TPU v7x (Ironwood)** is Google Cloud's 7th-generation TPU architecture. Each physical TPU v7x chip exposes **2 logical TensorCore devices** to PyTorch and JAX (`192 GB` HBM per chip / `96 GB` per logical device), so a single 4-chip TPU v7x host (`tpu7x-8`) provides **8 logical TPU devices** and `768 GB` of total HBM.
 
-The recipes below are extracted directly from the repository's active PR and nightly CI performance benchmark configurations in [`scripts/vllm/benchmarking/configs/`](https://github.com/vllm-project/vllm-torchtpu/tree/main/scripts/vllm/benchmarking/configs) (scheduled via [`.buildkite/pipeline_perf.yml`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/pipeline_perf.yml)).
+Most recipes below are extracted directly from the repository's active PR and nightly CI performance benchmark configurations in [`scripts/vllm/benchmarking/configs/`](https://github.com/vllm-project/vllm-torchtpu/tree/main/scripts/vllm/benchmarking/configs) (scheduled via [`.buildkite/pipeline_perf.yml`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/pipeline_perf.yml)). Long-context single-chip and single-host configurations validated outside PR CI note their target topology explicitly.
 
 ---
 
@@ -14,7 +14,8 @@ The recipes below are extracted directly from the repository's active PR and nig
 | `Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8` | `v7x-8` (1 host, 8 devices) | `TP=8, DP=1` + EP | `fp8` weights, `fp8` KV | [`qwen3-coder-480b-fp8-tp8-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/qwen3-coder-480b-fp8-tp8-ep.sh) |
 | `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8` | `v7x-8` (1 host, 8 devices) | `TP=8, DP=1` + EP | `fp8` weights, `fp8` KV | [`qwen3-coder-30b-fp8-tp8-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/qwen3-coder-30b-fp8-tp8-ep.sh) |
 | `Qwen/Qwen3.5-35B-A3B-FP8` | `v7x-8` (1 host, 8 devices) | `TP=8, DP=1` + EP | `fp8` weights, `fp8` KV | [`qwen3.5-35b-fp8-tp8-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/qwen3.5-35b-fp8-tp8-ep.sh) |
-| `RedHatAI/gemma-4-31B-it-FP8-Dynamic` | `v7x-8` (1 host, 8 devices) | `TP=2, DP=4` | `compressed-tensors` FP8 | [`gemma-4-31b-fp8-dp4-tp2-multimodal.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/gemma-4-31b-fp8-dp4-tp2-multimodal.sh) |
+| `RedHatAI/gemma-4-31B-it-FP8-Dynamic` | `v7x-8` (or 1 chip, 2 devices) | `TP=2, DP=4` (or `TP=2, DP=1`) | `compressed-tensors` FP8, `fp8` KV | [`gemma-4-31b-fp8-dp4-tp2-multimodal.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/gemma-4-31b-fp8-dp4-tp2-multimodal.sh) |
+| `RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic` | `v7x-8` (or 1 chip, 2 devices) | `TP=2, DP=4` + EP (or `TP=2` / `TP=8` + EP) | `compressed-tensors` FP8, `fp8` KV | [`gemma-4-26b-fp8-dp4-tp2-ep-text.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/gemma-4-26b-fp8-dp4-tp2-ep-text.sh) |
 | `deepseek-ai/DeepSeek-V4-Flash` | `v7x-8` (1 host, 8 devices) | `TP=1, DP=8` + EP | `deepseek_v4_fp8` (W4A8 MoE), `fp8_e4m3` KV | [`deepseek-v4-flash-dp8-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/deepseek-v4-flash-dp8-ep.sh) |
 | `zai-org/GLM-5.2-FP8` | `v7x-16` (2 hosts, 16 devices) | `TP=1, DP=16` + EP | `fp8` weights, `fp8` KV | [`glm-5.2-fp8-dp16-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/glm-5.2-fp8-dp16-ep.sh) |
 | `deepseek-ai/DeepSeek-V4-Pro-0813` | `v7x-16` (2 hosts, 16 devices) | `TP=1, DP=16` + EP | `deepseek_v4_fp8` (W4A8 MoE), `fp8_e4m3` KV | [`deepseek-v4-pro-dp16-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/deepseek-v4-pro-dp16-ep.sh) |
@@ -139,6 +140,68 @@ vllm bench serve \
   --ignore-eos \
   --skip-chat-template
 ```
+
+### `RedHatAI/gemma-4-31B-it-FP8-Dynamic` (`TP=2` long-context text & `TP=2, DP=4` multimodal)
+
+Long-context single-chip text serving (`1` physical TPU v7x chip / `2` logical devices, up to `163,840` tokens; scale across all 4 chips on a `v7x-8` host by removing `TPU_VISIBLE_CHIPS=0` and passing `--data-parallel-size 4`):
+
+```bash
+export VLLM_ENGINE_READY_TIMEOUT_S=1800
+export TPU_VISIBLE_CHIPS=0
+
+vllm serve RedHatAI/gemma-4-31B-it-FP8-Dynamic \
+  --tensor-parallel-size 2 \
+  --data-parallel-size 1 \
+  --limit-mm-per-prompt '{"image": 0, "video": 0, "audio": 0}' \
+  --language-model-only \
+  --hf-overrides '{"architectures": ["Gemma4ForCausalLM"]}' \
+  --attention-backend CUSTOM \
+  --kv-cache-dtype fp8 \
+  --block-size 256 \
+  --max-model-len 163840 \
+  --max-num-seqs 64 \
+  --max-num-batched-tokens 16384 \
+  --gpu-memory-utilization 0.90 \
+  --async-scheduling \
+  --no-enable-prefix-caching \
+  --port 8000
+```
+
+For full-host multimodal image+text serving (`TP=2, DP=4`), see [`scripts/vllm/benchmarking/configs/gemma-4-31b-fp8-dp4-tp2-multimodal.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/gemma-4-31b-fp8-dp4-tp2-multimodal.sh).
+
+### `RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic` (`TP=2 + EP` / `TP=8 + EP`, long-context with context-parallel prefill)
+
+Validated on long-context traces (`10K`-`160K` prompt tokens, up to `64` concurrent sequences) on a single TPU v7x chip (`TPU_VISIBLE_CHIPS=0`, `TP=2 + EP`) or across a full `v7x-8` host (`TP=8 + EP` for minimal single-stream TTFT):
+
+```bash
+export VLLM_ENGINE_READY_TIMEOUT_S=3600
+export TPU_VISIBLE_CHIPS=0
+export VLLM_KV_CACHE_LAYOUT=HND
+
+vllm serve RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic \
+  --tensor-parallel-size 2 \
+  --data-parallel-size 1 \
+  --enable-expert-parallel \
+  --scheduler-cls vllm_torchtpu.core.experimental.prefill_first_scheduler.PrefillFirstScheduler \
+  --limit-mm-per-prompt '{"image": 0, "video": 0, "audio": 0}' \
+  --language-model-only \
+  --hf-overrides '{"architectures": ["Gemma4ForCausalLM"]}' \
+  --attention-backend CUSTOM \
+  --kv-cache-dtype fp8 \
+  --block-size 256 \
+  --max-model-len 163840 \
+  --max-num-seqs 64 \
+  --max-num-batched-tokens 163840 \
+  --gpu-memory-utilization 0.85 \
+  --async-scheduling \
+  --no-enable-prefix-caching \
+  --compilation-config '{"compile_sizes": [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536, 73728, 81920, 90112, 98304, 106496, 114688, 122880, 131072, 139264, 147456, 155648, 163840]}' \
+  --api-server-count 4 \
+  --port 8000
+```
+
+- `PrefillFirstScheduler` schedules prompts over `8,192` tokens solo and enables zigzag context-parallel prefill across tensor-parallel ranks for every `compile_sizes` bucket from `16,384` upward (padded in `8,192`-token increments). To run a single 8-rank long-context instance across a full `v7x-8` host, drop `TPU_VISIBLE_CHIPS=0` and pass `--tensor-parallel-size 8`. For short-context 4-way data-parallel throughput on `v7x-8`, omit `--scheduler-cls` (`PrefillFirstScheduler` targets `DP=1` engines) and follow [`scripts/vllm/benchmarking/configs/gemma-4-26b-fp8-dp4-tp2-ep-text.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/gemma-4-26b-fp8-dp4-tp2-ep-text.sh).
+- With a single KV head per TP rank, `VLLM_KV_CACHE_LAYOUT=HND` removes sublane K/V head padding to double physical KV cache capacity, while `attention_k_eq_v` full-attention layers store compact shared `K=V` pages to cut attention HBM bandwidth and VMEM usage without changing the allocated KV block count.
 
 ---
 
