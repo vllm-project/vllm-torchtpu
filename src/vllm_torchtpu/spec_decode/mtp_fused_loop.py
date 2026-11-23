@@ -224,3 +224,70 @@ def build_mk_draft_step0(
     with set_current_vllm_config(vllm_config):
         return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp,
                    rows_per_request=rows_per_request)
+
+
+class _MkDraftStep0Loop(_MtpFusedLoop):
+    """VLLM_TPU_MK_DRAFT_FUSED_LOOP: MK draft step 0 (`_MkDraftStep0`) and the stock
+    loop steps 1..K-1 (`_MtpFusedLoop`) as one program, so the host launches one
+    compiled call per decode step for the whole draft instead of two.
+
+    The forward context holds the loop's (step 1's) metadata; step 0's kernel takes
+    its own query starts and seq_lens as arguments (the block tables are the same).
+    The loop runs at `draft_rows`' width (the request capacity): rows past the
+    chunk's requests are padding, as in `_MtpFusedLoop`. Returns the K draft tokens,
+    one [width] int32 tensor per step, token 0 first."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "", mtp: MtpDraftModel,
+                 num_steps: int, rows_per_request: int) -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix, mtp=mtp,
+                         num_steps=num_steps)
+        self.rows_per_request = rows_per_request
+
+    def forward(  # type: ignore[override]
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        draft_rows: torch.Tensor,
+        step0_starts: torch.Tensor,
+        step0_seq_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        carry, tokens = self.mtp.mk_draft_step(  # type: ignore[attr-defined]
+            input_ids, positions, hidden_states, self.rows_per_request,
+            starts=step0_starts, seq_lens=step0_seq_lens,
+        )
+        rows = draft_rows.clamp_min(0)
+        token0 = torch.index_select(tokens, 0, rows)
+        loop = _MtpFusedLoop.forward(
+            self,
+            token0,
+            torch.index_select(positions, positions.ndim - 1, rows),
+            torch.index_select(carry, 0, rows),
+            seq_lens,
+        )
+        return (token0, *loop)
+
+
+def build_mk_draft_step0_loop(
+    *,
+    vllm_config: VllmConfig,
+    prefix: str,
+    mtp: MtpDraftModel,
+    num_steps: int,
+    rows_per_request: int,
+    dynamic_arg_dims: dict,
+) -> nn.Module:
+    """Compile `_MkDraftStep0Loop` as `build_mk_draft_step0` compiles step 0: the
+    draft's own dynamic dims, and the backend pinned to `vllm_config` (the MK
+    step-0 compile sizes)."""
+    args = inspect.signature(_MkDraftStep0Loop.forward).parameters
+    dims = {k: v for k, v in dict(dynamic_arg_dims).items() if k in args}
+    cls = support_torch_compile(dynamic_arg_dims=dims)(
+        type("MkDraftStep0Loop", (_MkDraftStep0Loop,), {})
+    )
+    with set_current_vllm_config(vllm_config):
+        return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp, num_steps=num_steps,
+                   rows_per_request=rows_per_request)

@@ -437,6 +437,9 @@ class Eagle3Proposer:
         # VLLM_TPU_MK_DRAFT: draft step 0 as one MK call (built on first use).
         self._mk_draft_step0: torch.nn.Module | None = None
         self._mk_draft_step0_warm = False
+        # VLLM_TPU_MK_DRAFT_FUSED_LOOP: step 0 + loop as one program (first use).
+        self._mk_draft_step0_loop: torch.nn.Module | None = None
+        self._mk_draft_step0_loop_warm = False
         self._mtp_fused_loop_warm = False
         # Draft step 0 evaluated at each request's last token only
         # (VLLM_TPU_MTP_DRAFT_ROWS). Resolved in load_model.
@@ -500,6 +503,12 @@ class Eagle3Proposer:
             self._draft_tp_matches_target,
             materialize_if_mismatched=False,
         )
+        if envs.VLLM_TPU_MK_DRAFT_FUSED_LOOP and not envs.MOE_FUSED_EP_SORTED_GATHER:
+            # One program cannot hold the MK draft kernel (rank-ordered mesh) and
+            # the draft MoE kernel on an EP mesh in device-id order.
+            raise ValueError(
+                "VLLM_TPU_MK_DRAFT_FUSED_LOOP needs MOE_FUSED_EP_SORTED_GATHER=1"
+            )
         if envs.VLLM_TPU_DRAFT_LM_HEAD_FP8:
             if not attach_fp8_head(self.draft_model):
                 raise ValueError(
@@ -1203,6 +1212,171 @@ class Eagle3Proposer:
             self._mk_fused_loop_for(width) is None
         )
 
+    def _loop_rejected_dev(
+        self, chunk: DraftChunkInputs, nr: np.ndarray | torch.Tensor | None, is_async: bool
+    ) -> torch.Tensor | None:
+        """The chunk's rejected counts on device, padded to kernel_num_reqs so the
+        loop's seq_lens subtraction is full-length (constant): no per-num_reqs
+        recompile. Sync pads on the host; async pads the device tensor."""
+        runner = self.runner
+        knr = (
+            runner.num_reqs_max_model_len
+            if chunk.attn_ctx.use_max_model_len
+            else runner.num_reqs_most_model_len
+        )
+        assert knr is not None
+        if is_async and id(chunk) in self._seed_extras:
+            # Padded to knr inside the fused seed program.
+            return self._seed_extras[id(chunk)][1]
+        if is_async:
+            # nr is at the sampler's request-padding width, which can sit above
+            # a chunk's kernel_num_reqs; the rows past the chunk's requests are
+            # zeros either way.
+            return (
+                _maybe_pad_dim0(cast(torch.Tensor, nr)[:knr], knr)
+                if nr is not None
+                else None
+            )
+        if nr is not None and np.any(nr):
+            padded_nr = np.zeros(knr, dtype=np.int32)
+            padded_nr[: chunk.num_reqs] = cast(np.ndarray, nr).astype(np.int32, copy=False)
+            return torch.from_numpy(padded_nr).to(runner.device)
+        return None
+
+    def _loop_qsl_and_reqdist(
+        self, chunk: DraftChunkInputs
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Loop-step query_start_loc and request_distribution: they depend only on
+        num_reqs (not the step), so they are device constants per chunk shape
+        instead of an H2D on every one of the K-1 steps."""
+        runner = self.runner
+        knr = (
+            runner.num_reqs_max_model_len
+            if chunk.attn_ctx.use_max_model_len
+            else runner.num_reqs_most_model_len
+        )
+        assert knr is not None
+        n = chunk.num_reqs
+        qsl = self._device_constant(
+            ("loop_qsl", knr, n),
+            lambda: torch.from_numpy(np.minimum(np.arange(knr + 1, dtype=np.int32), n)),
+        )
+        reqdist = self._device_constant(
+            ("loop_reqdist", n), lambda: torch.tensor([n] * 3, dtype=torch.int32)
+        )
+        return qsl, reqdist
+
+    def _mk_fused_loop_wanted(self, num_steps: int) -> bool:
+        """VLLM_TPU_MK_DRAFT_FUSED_LOOP on a step that would run MK step 0 then the
+        stock fused loop (not the MK loop, not EP-DP lockstep)."""
+        return (
+            envs.VLLM_TPU_MK_DRAFT_FUSED_LOOP
+            and num_steps > 1
+            and self._mtp_fused_loop is not None
+            and not envs.VLLM_TPU_MK_DRAFT_LOOP
+            and not self.runner._dp_lockstep_enabled()
+        )
+
+    def _run_mk_draft_step0_loop(
+        self,
+        chunk: DraftChunkInputs,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        last_token_indices: torch.Tensor,
+        num_rejected_np: np.ndarray | None,
+        num_rejected_dev: torch.Tensor | None,
+    ) -> list[torch.Tensor] | None:
+        """The K draft tokens of one chunk ([request capacity] each) from one
+        `_MkDraftStep0Loop` call, or None when the loop cannot take this chunk
+        (the caller then runs step 0 and the loop as two programs)."""
+        width = self._draft_rows_len(chunk)
+        if width < last_token_indices.shape[0] or self._loop_bucket(width) != width:
+            return None
+        qsl, reqdist = self._loop_qsl_and_reqdist(chunk)
+        loop_md = self._build_draft_attn_metadata(
+            chunk=chunk,
+            step_idx=1,
+            seq_lens_delta=1,
+            num_rejected_np=num_rejected_np,
+            num_rejected_dev=num_rejected_dev,
+            loop_query_start_loc=qsl,
+            loop_request_distribution=reqdist,
+        )
+        self._draft_md_cache.pop(id(chunk), None)
+        # As in _run_mtp_fused_loop: the program bumps this one seq_lens in place.
+        seq_lens_set = {id(md.seq_lens): md.seq_lens for md in loop_md.values()}
+        if len(seq_lens_set) != 1:
+            return None
+        (seq_lens,) = seq_lens_set.values()
+        step0_md = self._build_draft_attn_metadata(
+            chunk=chunk,
+            step_idx=0,
+            seq_lens_delta=0,
+            num_rejected_np=num_rejected_np,
+            num_tokens_padded=input_ids.shape[0],
+        )
+        mk = cast(Any, self.draft_model).model.mk_draft
+        step0_starts = step0_md[mk.attn_prefix].query_start_loc
+        step0_seq_lens = step0_md[mk.attn_prefix].seq_lens
+        extras = self._seed_extras.get(id(chunk))
+        draft_rows = (
+            extras[0]
+            if extras is not None
+            else self._padded_draft_rows(last_token_indices, width)
+        )
+        K = self.speculative_config.num_speculative_tokens
+        if self._mk_draft_step0_loop is None:
+            from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mk_draft_step0_loop
+
+            # The MK step-0 compile config (sizes cut to the kernel's rows), as
+            # _run_mk_draft_step0.
+            with (
+                set_model_tag("eagle_head"),
+                set_vllm_model_wrapper_context(
+                    mesh=self.runner.mesh, vllm_config=self._mk_step0_cfg
+                ),
+                set_current_vllm_config(self._mk_step0_cfg),
+            ):
+                self._mk_draft_step0_loop = build_mk_draft_step0_loop(
+                    vllm_config=self._mk_step0_cfg,
+                    prefix=f"mk_draft_step0_loop_k{K}",
+                    mtp=self.draft_model,
+                    num_steps=K - 1,
+                    rows_per_request=4,
+                    dynamic_arg_dims=getattr(self.draft_model, "_dynamic_arg_dims", {}),
+                )
+            self._mk_draft_step0_loop_warm = False
+            logger.info("MK draft step 0 and the draft loop run as one program.")
+        self._mark_draft_padding(chunk.num_reqs, width)
+        args = (
+            input_ids, positions, target_hidden_states, draft_rows,
+            step0_starts, step0_seq_lens, seq_lens,
+        )
+        # The loop's context, as _run_mtp_fused_loop sets it (the step-0 kernel
+        # reads only its arguments and the block tables).
+        with (
+            set_model_tag("eagle_head"),
+            set_forward_context(
+                loop_md,
+                self.draft_vllm_config,
+                num_tokens=width,
+                num_tokens_across_dp=self.runner._dp_num_tokens_across_dp(width),
+            ),
+            set_vllm_model_wrapper_context(
+                mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+            ),
+        ):
+            if not self._mk_draft_step0_loop_warm:
+                # Trace + compile, then run compiled (as the fused loop): the
+                # repeat rewrites the same draft K/V rows; seq_lens is put back
+                # first because the loop advanced it.
+                seq_lens_step1 = seq_lens.clone()
+                self._mk_draft_step0_loop(*args)
+                seq_lens.copy_(seq_lens_step1)
+                self._mk_draft_step0_loop_warm = True
+            return list(self._mk_draft_step0_loop(*args))
+
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
 
@@ -1896,6 +2070,8 @@ class Eagle3Proposer:
         # IndexShare: each chunk's step-0 top-k rows, saved right after its
         # compaction (see _mtp_compact_and_save).
         saved_topk_per_chunk: list[list[torch.Tensor]] = []
+        # Set when one program produced every draft token (MK_DRAFT_FUSED_LOOP).
+        draft_done = False
         host_phases.mark("dp_entry")
         for ci, chunk in enumerate(chunks):
             if uses_aux_hidden_state:
@@ -1942,6 +2118,23 @@ class Eagle3Proposer:
             )
             mk0 = self._mk_draft_step0_ready(chunk, len(chunks), int(input_ids.shape[0]))
             self._mk_draft_count("mk_draft_step0" if mk0 else "stock_step0")
+            if mk0 and self._mk_fused_loop_wanted(K):
+                # VLLM_TPU_MK_DRAFT_FUSED_LOOP: all K draft tokens from one program.
+                all_tokens = _mk_program(
+                    self._run_mk_draft_step0_loop, "fused step-0 + loop program"
+                )(
+                    chunk, input_ids, positions, target_hidden_states, last_token_indices,
+                    rejected_np_per_chunk[ci],
+                    self._loop_rejected_dev(chunk, num_rejected, is_async),
+                )
+                if all_tokens is not None:
+                    # MK step 0 takes single-chunk steps only (_mk_draft_step0_ready),
+                    # so this chunk's tokens are the step's.
+                    assert len(chunks) == 1
+                    host_phases.mark("dp_carries")
+                    draft_tokens_per_chunk.append(all_tokens)
+                    draft_done = True
+                    continue
             if mk0:
                 # VLLM_TPU_MK_DRAFT: step 0 + carry + token 0 as one kernel call.
                 hidden_carry, fused_token0, positions_carry = _mk_program(
@@ -2132,7 +2325,7 @@ class Eagle3Proposer:
 
         pad_dp_draft_step(0)
 
-        if K > 1:
+        if K > 1 and not draft_done:
             # Loop steps: uniform decode shape, one query per request. The
             # carries are padded to the chunk's bucket p, or wider (MK draft
             # step 0 may return the request capacity, _run_mk_draft_step0), so
@@ -2156,63 +2349,16 @@ class Eagle3Proposer:
             # seq_lens subtraction is full-length (constant) — no per-num_reqs
             # recompile. Sync pads on the host (free, reused across the K-1 loop
             # steps); async pads the device tensor.
-            rejected_dev_per_chunk = []
-            for c, nr in zip(chunks, rejected_per_chunk):
-                knr = (
-                    runner.num_reqs_max_model_len
-                    if c.attn_ctx.use_max_model_len
-                    else runner.num_reqs_most_model_len
-                )
-                assert knr is not None
-                if is_async and id(c) in self._seed_extras:
-                    # Padded to knr inside the fused seed program.
-                    rejected_dev_per_chunk.append(self._seed_extras[id(c)][1])
-                elif is_async:
-                    # nr is at the sampler's request-padding width, which can
-                    # sit above a chunk's kernel_num_reqs; the rows past the
-                    # chunk's requests are zeros either way.
-                    rejected_dev_per_chunk.append(
-                        _maybe_pad_dim0(cast(torch.Tensor, nr)[:knr], knr)
-                        if nr is not None
-                        else None
-                    )
-                elif nr is not None and np.any(nr):
-                    padded_nr = np.zeros(knr, dtype=np.int32)
-                    padded_nr[: c.num_reqs] = cast(np.ndarray, nr).astype(
-                        np.int32, copy=False
-                    )
-                    rejected_dev_per_chunk.append(
-                        torch.from_numpy(padded_nr).to(runner.device)
-                    )
-                else:
-                    rejected_dev_per_chunk.append(None)
-            # Loop-step query_start_loc and request_distribution depend only on
-            # num_reqs (not the step), so build them once per chunk instead of
-            # rebuilding (with an H2D) on every one of the K-1 steps.
+            rejected_dev_per_chunk = [
+                self._loop_rejected_dev(c, nr, is_async)
+                for c, nr in zip(chunks, rejected_per_chunk)
+            ]
             loop_qsl_per_chunk = []
             loop_reqdist_per_chunk = []
             for c in chunks:
-                knr = (
-                    runner.num_reqs_max_model_len
-                    if c.attn_ctx.use_max_model_len
-                    else runner.num_reqs_most_model_len
-                )
-                assert knr is not None
-                n = c.num_reqs
-                loop_qsl_per_chunk.append(
-                    self._device_constant(
-                        ("loop_qsl", knr, n),
-                        lambda knr=knr, n=n: torch.from_numpy(
-                            np.minimum(np.arange(knr + 1, dtype=np.int32), n)
-                        ),
-                    )
-                )
-                loop_reqdist_per_chunk.append(
-                    self._device_constant(
-                        ("loop_reqdist", n),
-                        lambda n=n: torch.tensor([n] * 3, dtype=torch.int32),
-                    )
-                )
+                qsl, reqdist = self._loop_qsl_and_reqdist(c)
+                loop_qsl_per_chunk.append(qsl)
+                loop_reqdist_per_chunk.append(reqdist)
 
             def run_draft_step(ci: int, step: int) -> None:
                 """One separate draft step for chunk `ci`: a draft forward

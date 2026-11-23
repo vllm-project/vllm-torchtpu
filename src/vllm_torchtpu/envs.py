@@ -182,6 +182,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_BUCKET_TUNE: bool = False
     VLLM_TPU_MK_ROW_BUCKET: bool = False
     VLLM_TPU_MK_DRAFT: bool = False
+    VLLM_TPU_MK_DRAFT_FUSED_LOOP: bool = False
     VLLM_TPU_MK_DRAFT_LOOP: bool = False
     VLLM_TPU_MK_QSEL_ASYNC: bool = False
     VLLM_TPU_MK_QSA_XREQ_PREFETCH: int = 0
@@ -1308,6 +1309,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # too (else only draft step 0). Off: at T=1 the call is slower than stock
     # (16 request slots per kernel tile; j-1767564a).
     "VLLM_TPU_MK_DRAFT_LOOP": env_bool("VLLM_TPU_MK_DRAFT_LOOP"),
+    # With VLLM_TPU_MK_DRAFT and VLLM_TPU_FUSED_DRAFT_LOOP (not MK_DRAFT_LOOP): MK
+    # draft step 0 and the stock loop steps 1..K-1 in one compiled program
+    # (mtp_fused_loop._MkDraftStep0Loop), one host launch per decode step for the
+    # draft instead of two; the loop runs at the request capacity. Same tokens.
+    # Needs MOE_FUSED_EP_SORTED_GATHER: one program's Pallas kernels must share a
+    # device order, and only that flag puts the draft MoE's EP mesh in the MK
+    # draft kernel's (rank) order; without it the program fails to compile.
+    "VLLM_TPU_MK_DRAFT_FUSED_LOOP": env_bool("VLLM_TPU_MK_DRAFT_FUSED_LOOP"),
     # Whole-step QSA selection: the per-row id copies into SMEM and the new group's
     # loads / stores are issued together and waited once instead of in start-wait
     # pairs (distinct destinations; same bytes).

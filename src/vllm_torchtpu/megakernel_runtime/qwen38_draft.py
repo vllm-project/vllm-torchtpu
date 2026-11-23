@@ -346,12 +346,15 @@ class MkDraft(nn.Module):
             kind.pool_index = self.n_w
 
     def step(self, hidden: torch.Tensor, positions: torch.Tensor, T: int,
-             metadata: dict) -> tuple[torch.Tensor, torch.Tensor]:
+             metadata: dict, starts: torch.Tensor | None = None,
+             seq_lens: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """`(residual, tokens)` of one draft step on the fused input `hidden`
-        `[rows, hc*H]` (`Qwen4ExpMTP.fuse_inputs`), `T` rows per request."""
+        `[rows, hc*H]` (`Qwen4ExpMTP.fuse_inputs`), `T` rows per request.
+        `starts` / `seq_lens` replace the metadata's query_start_loc / seq_lens
+        (a program whose forward context holds another step's metadata)."""
         md = metadata[self.attn_prefix]
-        starts = md.query_start_loc.to(torch.int32)
-        seq = md.seq_lens.to(torch.int32)
+        starts = (md.query_start_loc if starts is None else starts).to(torch.int32)
+        seq = (md.seq_lens if seq_lens is None else seq_lens).to(torch.int32)
         context = seq - (starts[1:] - starts[:-1])
         args = [getattr(self, f"w_{i}") for i in range(self.n_w)] + [
             self.pool,

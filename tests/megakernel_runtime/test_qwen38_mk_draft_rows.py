@@ -144,3 +144,45 @@ def test_loop_advances_step0_positions(use_mk, monkeypatch):
     loop.forward(ids, pos, hidden, seq_lens)
     assert [p.tolist() for p in seen] == [(pos + 1).tolist(), (pos + 2).tolist()]
     assert seq_lens.tolist() == [8] * 4
+
+
+def test_step0_loop_program_matches_two_programs(monkeypatch):
+    """_MkDraftStep0Loop = _MkDraftStep0 then _MtpFusedLoop on its outputs: step 0
+    takes the explicit starts / seq_lens, the loop the context's seq_lens."""
+    seen = {}
+
+    class _Mtp(_StubMtp):
+        def mk_draft_step(self, input_ids, positions, hidden, rows_per_request,
+                          starts=None, seq_lens=None):
+            seen["step0"] = (rows_per_request, starts, seq_lens)
+            return hidden + 1, input_ids + 7
+
+    monkeypatch.setattr(fl, "greedy_draft_token", lambda model, h: h[:, 0].to(torch.int32))
+    mtp = _Mtp()
+    merged = fl._MkDraftStep0Loop.__new__(fl._MkDraftStep0Loop)
+    torch.nn.Module.__init__(merged)
+    merged.mtp, merged.num_steps, merged.prefix, merged.use_mk = mtp, 2, "", False
+    merged.rows_per_request = 4
+    step0 = fl._MkDraftStep0.__new__(fl._MkDraftStep0)
+    torch.nn.Module.__init__(step0)
+    step0.mtp, step0.prefix, step0.rows_per_request = mtp, "", 4
+    loop = _loop(False)
+    loop.mtp = mtp
+
+    tokens = 16
+    ids = torch.arange(tokens, dtype=torch.int32)
+    pos = torch.arange(tokens) * 3
+    hidden = torch.arange(tokens * 4, dtype=torch.float32).reshape(tokens, 4)
+    rows = torch.tensor([3, 7, -1, -1])
+    starts, seq0 = torch.tensor([0, 4, 8, 8, 8]), torch.tensor([20, 30, 0, 0])
+
+    seq_a = torch.full((4,), 9)
+    got = merged.forward(ids, pos, hidden, rows, starts, seq0, seq_a)
+    assert seen["step0"] == (4, starts, seq0)
+    carry, tok0, pos0 = step0.forward(ids, pos, hidden, rows)
+    seq_b = torch.full((4,), 9)
+    want = (tok0, *loop.forward(tok0, pos0, carry, seq_b))
+    assert len(got) == 3
+    for g, w in zip(got, want):
+        assert torch.equal(g, w)
+    assert torch.equal(seq_a, seq_b)

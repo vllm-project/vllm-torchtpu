@@ -5250,6 +5250,7 @@ class TPUModelRunner(GPUModelRunner):
                 "_run_mtp_fused_loop",
                 "_draft_rows_carry_and_token",
                 "_run_mk_draft_step0",
+                "_run_mk_draft_step0_loop",
                 "_build_draft_attn_metadata",
             ):
                 out.append((drafter, name, "x_dp" + name))
