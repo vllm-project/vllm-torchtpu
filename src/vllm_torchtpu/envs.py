@@ -438,6 +438,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FORWARD_CTX_PREBUILT: bool = False
     VLLM_TPU_MAMBA_RD_REUSE: bool = False
     VLLM_TPU_KV_CONNECTOR_SKIP_NOOP: bool = False
+    VLLM_TPU_PREP_FOLD_PRECHECK_MEMO: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
     VLLM_TPU_MK_WHOLE_DIRECT_EXEC: bool = False
     VLLM_TPU_ENVS_FREEZE: bool = False
@@ -2800,6 +2801,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # both do nothing then (tpu_runner._kv_connector_setup_is_noop). With a
     # connector configured the block runs as before.
     "VLLM_TPU_KV_CONNECTOR_SKIP_NOOP": env_bool("VLLM_TPU_KV_CONNECTOR_SKIP_NOOP"),
+    # With VLLM_TPU_PREFWD_PREP_FOLD and VLLM_TPU_STEADY_DECODE_METADATA: keep
+    # the fold precheck's host token-substitution indices on the steady entry
+    # and reuse them while the requests' rows in the previous step's results
+    # and the token slice repeat (tpu_runner._fold_subst_memo).
+    "VLLM_TPU_PREP_FOLD_PRECHECK_MEMO": env_bool(
+        "VLLM_TPU_PREP_FOLD_PRECHECK_MEMO"
+    ),
     # Freshly AOT-compiled models skip the per-call Dynamo guard check when
     # vLLM does not evaluate guards (as it already does for cached artifacts).
     "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),

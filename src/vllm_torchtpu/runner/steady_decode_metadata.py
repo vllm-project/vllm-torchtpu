@@ -187,6 +187,10 @@ class SteadyDecodeEntry:
     # previous step's results) -> (seq_idx upload, pos_idx upload).
     subtract_key: tuple | None = None
     subtract_idx: tuple | None = None
+    # VLLM_TPU_PREP_FOLD_PRECHECK_MEMO: (subtract_key, local token slice) ->
+    # the fold precheck's host substitution indices (read-only arrays).
+    fold_subst_key: tuple | None = None
+    fold_subst: tuple | None = None
 
 
 @dataclass
