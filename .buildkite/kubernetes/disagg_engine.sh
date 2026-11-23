@@ -100,6 +100,7 @@ serve_args=(
   --no-enable-prefix-caching
   --no-async-scheduling
   --tensor-parallel-size=1
+  --default-chat-template-kwargs '{"enable_thinking":false}'
 )
 
 case "$role" in
