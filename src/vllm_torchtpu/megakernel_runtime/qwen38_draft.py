@@ -334,7 +334,10 @@ class MkDraft(nn.Module):
         mtp_model = draft.model
         layer = mtp_model.layers[0]
         attn = layer.self_attn
-        lm = draft.lm_head
+        # Raw bf16 head tiles: the shared head even with VLLM_TPU_DRAFT_LMHEAD_FP8.
+        from vllm_torchtpu.models.vllm.qwen4_exp.draft_lm_head import bf16_lm_head
+
+        lm = bf16_lm_head(draft)
         R = mesh.size
         V = int(lm.weight.shape[0])
         vocab = int(getattr(lm, "org_vocab_size", V * R) or V * R)

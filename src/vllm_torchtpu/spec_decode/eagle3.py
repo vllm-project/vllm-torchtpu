@@ -526,6 +526,11 @@ class Eagle3Proposer:
             target_model, self.vllm_config.scheduler_config.max_num_batched_tokens
         ):
             logger.info("MTP draft attends the target's last QSA selection.")
+        # After every maybe_share_lm_head above: a draft may swap in its own head
+        # derived from the borrowed one (Qwen4ExpMTP, VLLM_TPU_DRAFT_LMHEAD_FP8).
+        bind_head = getattr(self.draft_model, "bind_draft_lm_head", None)
+        if bind_head is not None and bind_head():
+            logger.info("MTP draft lm_head: own FP8 copy (target lm_head unchanged).")
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
         self._build_mtp_fused_loop()

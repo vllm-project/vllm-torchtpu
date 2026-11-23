@@ -451,6 +451,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PROPOSE_DEVICE_CONSTANTS: bool = False
     VLLM_TPU_DRAFT_SHARD_ARGMAX: bool = False
     VLLM_TPU_DRAFT_CARRY_SHARD_ARGMAX: bool = False
+    VLLM_TPU_DRAFT_LMHEAD_FP8: bool = False
     VLLM_TPU_MTP_DRAFT_ROWS: bool = False
     VLLM_TPU_MTP_DRAFT_DECODE_ROWS: bool = False
     VLLM_TPU_MTP_DRAFT_PADDING_MASK: bool = False
@@ -2864,6 +2865,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DRAFT_CARRY_SHARD_ARGMAX": env_bool(
         "VLLM_TPU_DRAFT_CARRY_SHARD_ARGMAX", default=False
     ),
+    # Qwen4Exp MTP draft: project through its own FP8 E4M3 copy of the shared
+    # lm_head shard (per-vocab-row f32 scales, the FP8 dense matmul) instead of
+    # the target's bf16 head (models/vllm/qwen4_exp/draft_lm_head.py). NOT
+    # bitwise: draft tokens can change where top logits nearly tie; target
+    # verify is unchanged, so only the real acceptance length can move.
+    "VLLM_TPU_DRAFT_LMHEAD_FP8": env_bool("VLLM_TPU_DRAFT_LMHEAD_FP8", default=False),
     # MTP draft step 0 on a draft declaring `supports_draft_rows` (Qwen4Exp):
     # write the draft layer's caches for every token of the target's step but
     # run attention, MoE and hyper-connections only at each request's last
