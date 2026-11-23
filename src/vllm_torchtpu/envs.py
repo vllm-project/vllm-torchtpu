@@ -436,6 +436,7 @@ if TYPE_CHECKING:
     VLLM_TPU_STEADY_DECODE_METADATA: bool = False
     VLLM_TPU_ATTN_METADATA_REUSE: bool = False
     VLLM_TPU_FORWARD_CTX_PREBUILT: bool = False
+    VLLM_TPU_MAMBA_RD_REUSE: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
     VLLM_TPU_MK_WHOLE_DIRECT_EXEC: bool = False
     VLLM_TPU_ENVS_FREEZE: bool = False
@@ -2787,6 +2788,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # set_forward_context is not the version this replicates
     # (tpu_runner._prebuilt_forward_scope).
     "VLLM_TPU_FORWARD_CTX_PREBUILT": env_bool("VLLM_TPU_FORWARD_CTX_PREBUILT"),
+    # With VLLM_TPU_FAST_TOKEN_SUBSTITUTION and mamba read offsets: while the
+    # combined RPA + GDN request distribution's key (decode, windowed,
+    # num_reqs) repeats, take the previous step's two views of the cached
+    # device copy instead of rewriting the six host values (already equal) and
+    # slicing the same device tensor again (tpu_runner._prepare_inputs).
+    "VLLM_TPU_MAMBA_RD_REUSE": env_bool("VLLM_TPU_MAMBA_RD_REUSE"),
     # Freshly AOT-compiled models skip the per-call Dynamo guard check when
     # vLLM does not evaluate guards (as it already does for cached artifacts).
     "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),

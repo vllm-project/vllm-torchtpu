@@ -4842,6 +4842,27 @@ class TPUModelRunner(GPUModelRunner):
             *subtract_idx,
         )
 
+    def _reused_comb_views(
+        self, chunk_comb_key: tuple
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """VLLM_TPU_MAMBA_RD_REUSE: the previous step's `[0:3]` / `[3:6]`
+        views of the cached combined request distribution, when this step
+        would reuse that same device copy (its key repeats).
+
+        Exact: the key fixes all six values, so the host staging tensor
+        already holds exactly what the skipped writes would store (every
+        fast-substitution step either writes these values under this key or
+        re-keys the cache), and the views are of the same unmutated device
+        tensor with the same offsets the fresh slices would have."""
+        views = self.__dict__.get("_cached_comb_views")
+        if (
+            views is None
+            or getattr(self, "_cached_comb_key", None) != chunk_comb_key
+            or views[0] is not getattr(self, "_cached_comb_dev", None)
+        ):
+            return None
+        return views[1], views[2]
+
     def _prep_fold_precheck(
         self,
         start_index: int,
@@ -5509,26 +5530,40 @@ class TPUModelRunner(GPUModelRunner):
             # why these must not be independent device tensors). Overrides
             # the RPA tensor built above so both fields always come from the
             # same base tensor, matching the traced graph structure.
-            combined = self._combined_request_distribution_cpu
-            combined[0] = chunk_num_decode
-            combined[1] = chunk_num_decode
-            combined[2] = num_reqs
-            combined[3] = chunk_num_windowed
-            combined[4] = chunk_num_windowed
-            combined[5] = num_reqs
-            if getattr(self, "_fast_token_substitution", False):
-                chunk_comb_key = (chunk_num_decode, chunk_num_windowed, num_reqs)
-                if (
-                    not hasattr(self, "_cached_comb_dev")
-                    or getattr(self, "_cached_comb_key", None) != chunk_comb_key
-                ):
-                    self._cached_comb_dev = combined.to(self.device, non_blocking=True)
-                    self._cached_comb_key = chunk_comb_key
-                combined_device = self._cached_comb_dev
+            fast_subst = getattr(self, "_fast_token_substitution", False)
+            rd_reuse = fast_subst and envs.VLLM_TPU_MAMBA_RD_REUSE
+            chunk_comb_key = (chunk_num_decode, chunk_num_windowed, num_reqs)
+            reused = self._reused_comb_views(chunk_comb_key) if rd_reuse else None
+            if reused is not None:
+                request_distribution, mamba_request_distribution = reused
             else:
-                combined_device = combined.to(self.device, non_blocking=True)
-            request_distribution = combined_device[0:3]
-            mamba_request_distribution = combined_device[3:6]
+                combined = self._combined_request_distribution_cpu
+                combined[0] = chunk_num_decode
+                combined[1] = chunk_num_decode
+                combined[2] = num_reqs
+                combined[3] = chunk_num_windowed
+                combined[4] = chunk_num_windowed
+                combined[5] = num_reqs
+                if fast_subst:
+                    if (
+                        not hasattr(self, "_cached_comb_dev")
+                        or getattr(self, "_cached_comb_key", None) != chunk_comb_key
+                    ):
+                        self._cached_comb_dev = combined.to(
+                            self.device, non_blocking=True
+                        )
+                        self._cached_comb_key = chunk_comb_key
+                    combined_device = self._cached_comb_dev
+                else:
+                    combined_device = combined.to(self.device, non_blocking=True)
+                request_distribution = combined_device[0:3]
+                mamba_request_distribution = combined_device[3:6]
+                if rd_reuse:
+                    self._cached_comb_views = (
+                        combined_device,
+                        request_distribution,
+                        mamba_request_distribution,
+                    )
         assert request_distribution is not None
 
         if prep_fold_subtract is not None:
