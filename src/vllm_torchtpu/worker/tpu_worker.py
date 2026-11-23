@@ -20,6 +20,7 @@ import ctypes
 import gc
 import os
 import time
+from collections.abc import Mapping
 from typing import Any, cast
 from urllib.parse import urlparse
 
@@ -38,6 +39,7 @@ from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
     get_pp_group,
     get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
     get_world_group,
     init_distributed_environment,
     model_parallel_is_initialized,
@@ -93,6 +95,61 @@ def _release_free_host_heap() -> None:
     elif hasattr(process, "malloc_trim"):
         process.malloc_trim(0)
         logger.info("Released free host heap via glibc malloc_trim.")
+
+
+def _resolve_sharding_coords(worker: "TPUWorker"):
+    """Return local ``ShardingCoords`` for ``tp``, ``ep``, and ``moe_tp``."""
+    from vllm_torchtpu.rl.weight_installer import ShardingCoords
+
+    pc = getattr(worker, "parallel_config", None)
+    if model_parallel_is_initialized():
+        tp_size = int(get_tensor_model_parallel_world_size())
+        tp_rank = int(get_tensor_model_parallel_rank())
+    else:
+        tp_size = int(getattr(pc, "tensor_parallel_size", 1) or 1)
+        tp_rank = int(getattr(worker, "rank", 0)) % tp_size
+
+    enable_ep = bool(getattr(pc, "enable_expert_parallel", False))
+    dp_size = int(utils.get_dp_size(pc)) if pc is not None else 1
+    if enable_ep:
+        if model_parallel_is_initialized():
+            from vllm.distributed.parallel_state import get_dp_group, get_ep_group
+
+            ep_group = get_ep_group()
+            ep_size = int(ep_group.world_size)
+            ep_rank = int(ep_group.rank_in_group)
+            dp_group = get_dp_group()
+            dp_rank = int(dp_group.rank_in_group)
+            if int(dp_group.world_size) > 1:
+                dp_size = int(dp_group.world_size)
+            moe_tp_size = max(1, (dp_size * tp_size) // ep_size)
+            global_rank = dp_rank * tp_size + tp_rank
+            moe_tp_rank = global_rank % moe_tp_size
+        else:
+            ep_size = int(getattr(pc, "expert_parallel_size", 0) or (dp_size * tp_size))
+            moe_tp_size = max(1, (dp_size * tp_size) // ep_size)
+            dp_rank = getattr(pc, "data_parallel_rank", None)
+            global_rank = (
+                int(dp_rank) * tp_size + tp_rank
+                if dp_rank is not None
+                else int(getattr(worker, "rank", 0))
+            )
+            moe_tp_rank = global_rank % moe_tp_size
+            ep_rank = (global_rank // moe_tp_size) % ep_size
+    else:
+        ep_size = 1
+        ep_rank = 0
+        moe_tp_size = tp_size
+        moe_tp_rank = tp_rank
+
+    return ShardingCoords(
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        moe_tp_rank=moe_tp_rank,
+        moe_tp_size=moe_tp_size,
+    )
 
 
 class TPUWorker(WorkerBase):
@@ -954,6 +1011,73 @@ class TPUWorker(WorkerBase):
             transpose_keys=transpose_keys,
             reshard_fn=reshard_fn,
         )
+
+    def get_weight_mapping_manifest(self) -> str:
+        """Return the serialized ``weight_mapping`` JSON manifest for this model."""
+        from vllm_torchtpu.rl.manifest_generator import generate_manifest
+
+        return generate_manifest(
+            self.get_model(),
+            parallel_config=self.parallel_config,
+            model_config=self.model_config,
+        )
+
+    def apply_converted_weights(
+        self,
+        converted_weights: Mapping[str, torch.Tensor],
+        manifest_json: str | None = None,
+    ) -> None:
+        """Install pre-converted global tensors in-place into live model buffers.
+
+        Delegates manifest validation, rank slicing, and exact key/shape/dtype
+        checks to :func:`vllm_torchtpu.rl.weight_installer.stage_converted_weights`,
+        then copies shards in-place without calling ``load_weights()`` or
+        ``process_weights_after_loading()`` and materializes TPU buffers via
+        ``synchronize_tensors()``.
+        """
+        from vllm_torchtpu.rl.weight_installer import stage_converted_weights
+
+        manifest_str = (
+            manifest_json
+            if manifest_json is not None
+            else self.get_weight_mapping_manifest()
+        )
+        staged = stage_converted_weights(
+            self.get_model(),
+            converted_weights,
+            manifest_str,
+            _resolve_sharding_coords(self),
+        )
+
+        updated_tensors: list[torch.Tensor] = []
+        with torch.no_grad():
+            for param, shard in staged:
+                src = (
+                    utils.fresh_buffer(shard)
+                    if shard.device.type == "tpu"
+                    else shard.contiguous()
+                )
+                param.data.copy_(src)
+                updated_tensors.append(param.data)
+
+        if updated_tensors and any(t.device.type == "tpu" for t in updated_tensors):
+            utils.synchronize_tensors(updated_tensors, wait=True)
+
+    def load_from_hf(
+        self,
+        hf_weights: Mapping[str, torch.Tensor],
+        manifest_json: str | None = None,
+    ) -> None:
+        """Convert HF weights via the manifest protocol and install them in-place."""
+        from vllm_torchtpu.rl.weight_conversion import from_hf
+
+        manifest_str = (
+            manifest_json
+            if manifest_json is not None
+            else self.get_weight_mapping_manifest()
+        )
+        converted = from_hf(manifest_str, hf_weights)
+        self.apply_converted_weights(converted, manifest_json=manifest_str)
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         if not has_kv_transfer_group():
