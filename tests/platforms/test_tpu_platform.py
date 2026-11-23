@@ -1806,7 +1806,13 @@ def test_default_ep_weight_filter_respects_cli_opt_out_via_parser(
 
 @pytest.mark.parametrize(
     "flag",
-    ["--disable-ep-weight-filter", "--no-enable-ep-weight-filter"],
+    [
+        "--disable-ep-weight-filter",
+        "--no-enable-ep-weight-filter",
+        # FlexibleArgumentParser accepts underscores in option names.
+        "--disable_ep_weight_filter",
+        "--no_enable_ep_weight_filter",
+    ],
 )
 @pytest.mark.parametrize(
     "parser_opt_out, expected",

@@ -279,8 +279,12 @@ def _is_ep_weight_filter_cli_disabled() -> bool:
     if _ep_weight_filter_cli_opt_out is not None:
         return _ep_weight_filter_cli_opt_out
     # Fallback for entry points (e.g. EngineArgs.add_cli_args) that do not
-    # invoke pre_register_and_update(parser).
-    return any(flag in sys.argv[1:] for flag in _EP_WEIGHT_FILTER_CLI_DISABLE_FLAGS)
+    # invoke pre_register_and_update(parser). FlexibleArgumentParser also
+    # accepts underscores in option names, so compare the dashed spelling.
+    return any(
+        arg.replace("_", "-") in _EP_WEIGHT_FILTER_CLI_DISABLE_FLAGS
+        for arg in sys.argv[1:]
+    )
 
 
 def _apply_default_ep_weight_filter(vllm_config: "VllmConfig") -> None:
