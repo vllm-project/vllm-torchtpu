@@ -241,6 +241,7 @@ class DecodeSlots:
             (len(config.group_widths), num_slots), dtype=np.int32
         )
         self._slot_by_req: dict[str, int] = {}
+        # One entry per live slot: the null slot never holds a request.
         self._req_by_slot: list[str | None] = [None] * config.max_num_reqs
         # LIFO free list, as MRV2's RequestState; the lowest slot goes first.
         self._free = list(range(config.max_num_reqs - 1, -1, -1))
