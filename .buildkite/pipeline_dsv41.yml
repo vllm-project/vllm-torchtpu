@@ -188,6 +188,11 @@ steps:
             .buildkite/kubernetes/run.sh python -m pytest
             tests/runner/test_min_tokens.py -m "not tpu_test"
             -q --junitxml=perf_eval_results/dsv41-min-tokens.xml
+          - >-
+            .buildkite/kubernetes/run.sh python -m pytest
+            tests/runner/test_tpu_runner.py
+            -k "spec_warmup or one_pcp_mtp"
+            -q --junitxml=perf_eval_results/dsv41-warmup-ownership.xml
 
       - label: "DeepSeek-V4.1 index configuration: CPU contracts"
         key: "dsv41_kernel_config_cpu"
