@@ -221,6 +221,12 @@ _PAGES_PER_CHUNK = 32
 _DMA_ISSUE_CHUNKS = 2
 # Page groups in `_kernel_v3`'s DMA ring.
 _RING_SLOTS = 3
+# The decode block-select call's ring: three groups in flight ahead of the
+# scored one. With a step's scoring at ~1,560 bundles per 128 pages the copies
+# bind, and the third group in flight cut decode block select by 0.9 / 2.7 us
+# at 3 / 5 requests of ~115K context (kbench j-a48608a4); a fourth and fifth
+# were slower (their step-0 issue delays the first group's scores).
+_SELECT_RING_SLOTS = 4
 # Folded 4-bit and fp8 tiles of up to this many rows score transposed
 # (`_chunk_scores_t`, maxima across lanes); larger ones score token-major
 # (maxima across sublanes), a folded page with its slot scales folded into
@@ -411,9 +417,10 @@ def _kernel_v3(
     pending=None,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
-    `_RING_SLOTS` groups: one scalar address per page and no copy for pages
+    groups (``buf.shape[0]``: `_RING_SLOTS`, the select call's
+    `_SELECT_RING_SLOTS`): one scalar address per page and no copy for pages
     past the request's end (their scores are never read). A step issues the
-    group `_RING_SLOTS - 1` steps ahead: with one group ahead, each step
+    group ``buf.shape[0] - 1`` steps ahead: with one group ahead, each step
     waited out its pages' DMA latency (~1.3 us per step at 64 or 128 pages,
     bench j-9956cd34).
 
@@ -1102,7 +1109,7 @@ def _class_scores(
                 jnp.max(jnp.where(seq_in_class, seq_pages, 1)),
                 grid=grid_spec.grid,
                 q_spec=grid_spec.in_specs[0],
-                ring=(_RING_SLOTS, pages_per_step, rows_per_page, head_dim),
+                ring=(_SELECT_RING_SLOTS, pages_per_step, rows_per_page, head_dim),
                 groups=num_groups_per_seq,
                 block_q=block_q,
                 params=params,
