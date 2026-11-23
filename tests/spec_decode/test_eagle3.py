@@ -1863,6 +1863,45 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
     assert wrapper_configs == [proposer.draft_vllm_config]
 
 
+def test_replicated_draft_load_disables_ep_weight_filter(monkeypatch):
+    """A replicated draft forces tp=1 while parallel_config stays at target TP;
+    loading it must turn enable_ep_weight_filter off without mutating the
+    target config."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    proposer = _make_proposer(draft_tp=1, target_tp=8, method="mtp")
+    proposer.vllm_config.parallel_config.enable_ep_weight_filter = True
+    proposer.runner = SimpleNamespace(mesh=object())
+    proposer.vllm_config.load_config = object()
+    proposer.vllm_config.compilation_config = SimpleNamespace(
+        inductor_compile_config={}
+    )
+    proposer.speculative_config.draft_model_config = SimpleNamespace(runner_type=None)
+    loaded = {}
+
+    class _Loader:
+        def load_model(self, *, vllm_config, model_config):
+            loaded["vllm_config"] = vllm_config
+            return object()
+
+    monkeypatch.setattr(e3, "get_model_loader", lambda _cfg: _Loader())
+    monkeypatch.setattr(e3, "set_model_tag", lambda _tag: contextlib.nullcontext())
+    monkeypatch.setattr(
+        e3, "set_current_vllm_config", lambda _cfg: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        e3,
+        "set_vllm_model_wrapper_context",
+        lambda **_kw: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(e3, "_force_draft_tp1", lambda: contextlib.nullcontext())
+
+    proposer._load_draft_model()
+
+    assert loaded["vllm_config"].parallel_config.enable_ep_weight_filter is False
+    assert proposer.vllm_config.parallel_config.enable_ep_weight_filter is True
+
+
 @pytest.mark.tpu_test
 def test_forward_draft_uses_saved_draft_config_in_both_contexts(monkeypatch, device):
     """Both vLLM forward metadata and the TPU wrapper must observe the saved

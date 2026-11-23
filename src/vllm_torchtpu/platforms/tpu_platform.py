@@ -21,7 +21,7 @@ import importlib.util
 import os
 import sys
 import time
-from typing import TYPE_CHECKING, Any, Protocol, Union, cast
+from typing import TYPE_CHECKING, Protocol, Union, cast
 
 import portpicker
 import torch
@@ -219,7 +219,10 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 
 _dynamic_compile_unwrapped = False
 _tpu_kv_connectors_registered = False
-_ep_weight_filter_cli_opt_out = False
+# Process-global CLI opt-out state: None until pre_register_and_update(parser)
+# runs (which resets it to False), then True/False from the last parsed
+# --[no-]enable-ep-weight-filter flag (including --config YAML files).
+_ep_weight_filter_cli_opt_out: bool | None = None
 
 
 class _TrackedEpWeightFilterAction(argparse.BooleanOptionalAction):
@@ -231,23 +234,33 @@ class _TrackedEpWeightFilterAction(argparse.BooleanOptionalAction):
         _ep_weight_filter_cli_opt_out = getattr(namespace, self.dest, None) is False
 
 
-def _track_ep_weight_filter_cli_action(parser: Any) -> None:
+def _track_ep_weight_filter_cli_action(parser: "FlexibleArgumentParser") -> None:
     """Attach opt-out tracking to vLLM's --enable-ep-weight-filter CLI action."""
     global _ep_weight_filter_cli_opt_out
-    _ep_weight_filter_cli_opt_out = False
-    for action in getattr(parser, "_actions", ()):
-        if (
-            getattr(action, "dest", None) == "enable_ep_weight_filter"
-            and type(action) is argparse.BooleanOptionalAction
-        ):
+    for action in parser._actions:
+        if action.dest != "enable_ep_weight_filter":
+            continue
+        if type(action) is argparse.BooleanOptionalAction:
             action.__class__ = _TrackedEpWeightFilterAction
-            break
+            _ep_weight_filter_cli_opt_out = False
+        elif isinstance(action, _TrackedEpWeightFilterAction):
+            _ep_weight_filter_cli_opt_out = False
+        else:
+            _ep_weight_filter_cli_opt_out = None
+            logger.warning_once(
+                "Unexpected action class %s for --enable-ep-weight-filter; "
+                "falling back to sys.argv opt-out detection.",
+                type(action).__name__,
+            )
+        break
 
 
 def _is_ep_weight_filter_cli_disabled() -> bool:
-    return _ep_weight_filter_cli_opt_out or (
-        "--no-enable-ep-weight-filter" in sys.argv[1:]
-    )
+    if _ep_weight_filter_cli_opt_out is not None:
+        return _ep_weight_filter_cli_opt_out
+    # Fallback for entry points (e.g. EngineArgs.add_cli_args) that do not
+    # invoke pre_register_and_update(parser).
+    return "--no-enable-ep-weight-filter" in sys.argv[1:]
 
 
 def _apply_default_ep_weight_filter(vllm_config: "VllmConfig") -> None:
@@ -259,13 +272,12 @@ def _apply_default_ep_weight_filter(vllm_config: "VllmConfig") -> None:
         or not model_config.is_moe
         or not parallel_config.enable_expert_parallel
         or parallel_config.enable_eplb
-        or not hasattr(parallel_config, "enable_ep_weight_filter")
         or parallel_config.enable_ep_weight_filter
         or _is_ep_weight_filter_cli_disabled()
     ):
         return
     parallel_config.enable_ep_weight_filter = True
-    logger.info(
+    logger.info_once(
         "Defaulting enable_ep_weight_filter=True on TPU for MoE with expert "
         "parallelism (pass --no-enable-ep-weight-filter to disable)."
     )

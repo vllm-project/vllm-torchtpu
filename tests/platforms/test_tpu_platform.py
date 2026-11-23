@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import argparse
 import copy
 import math
 import os
@@ -1697,6 +1696,38 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
         _validate_peer_replay_config()
 
 
+def _make_ep_filter_vllm_config(
+    *,
+    is_moe: bool,
+    enable_expert_parallel: bool,
+    enable_eplb: bool = False,
+    enable_ep_weight_filter: bool = False,
+) -> VllmConfig:
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=8 if enable_expert_parallel else 1,
+        enable_expert_parallel=enable_expert_parallel,
+        enable_ep_weight_filter=enable_ep_weight_filter,
+    )
+    # ParallelConfig validation rejects enable_eplb on TPU; assign directly to
+    # verify our guard leaves EP filtering off when EPLB is enabled.
+    parallel_config.enable_eplb = enable_eplb
+    with _device_left_unset():
+        vllm_config = VllmConfig(parallel_config=parallel_config)
+    model_config = MagicMock(spec=ModelConfig)
+    model_config.is_moe = is_moe
+    model_config.dtype = torch.bfloat16
+    model_config.is_hybrid = False
+    model_config.is_attention_free = False
+    model_config.is_mla = False
+    model_config.hf_config = None
+    model_config.architectures = []
+    model_config.runner_type = "generate"
+    model_config.get_head_size.return_value = 128
+    model_config.multimodal_config = None
+    vllm_config.model_config = model_config
+    return vllm_config
+
+
 @pytest.mark.parametrize(
     "is_moe, enable_ep, enable_eplb, initial_filter, expected",
     [
@@ -1707,20 +1738,27 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
         (True, True, True, True, True),
     ],
 )
+@patch("vllm_torchtpu.patch_registry.apply")
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
 def test_default_ep_weight_filter_gates_on_moe_ep_without_eplb(
-    monkeypatch, is_moe, enable_ep, enable_eplb, initial_filter, expected
+    mock_prepare_env,
+    mock_apply_patches,
+    monkeypatch,
+    is_moe,
+    enable_ep,
+    enable_eplb,
+    initial_filter,
+    expected,
 ):
-    monkeypatch.setattr(tpu_platform, "_ep_weight_filter_cli_opt_out", False)
+    monkeypatch.setattr(tpu_platform, "_ep_weight_filter_cli_opt_out", None)
     monkeypatch.setattr(sys, "argv", ["vllm", "serve"])
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(is_moe=is_moe),
-        parallel_config=SimpleNamespace(
-            enable_expert_parallel=enable_ep,
-            enable_eplb=enable_eplb,
-            enable_ep_weight_filter=initial_filter,
-        ),
+    vllm_config = _make_ep_filter_vllm_config(
+        is_moe=is_moe,
+        enable_expert_parallel=enable_ep,
+        enable_eplb=enable_eplb,
+        enable_ep_weight_filter=initial_filter,
     )
-    tpu_platform._apply_default_ep_weight_filter(vllm_config)
+    TpuPlatform.check_and_update_config(vllm_config)
     assert vllm_config.parallel_config.enable_ep_weight_filter is expected
 
 
@@ -1733,41 +1771,51 @@ def test_default_ep_weight_filter_gates_on_moe_ep_without_eplb(
         (["--enable-ep-weight-filter", "--no-enable-ep-weight-filter"], False),
     ],
 )
+@patch("vllm_torchtpu.patch_registry.apply")
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
 def test_default_ep_weight_filter_respects_cli_opt_out_via_parser(
-    monkeypatch, cli_args, expected
+    mock_prepare_env, mock_apply_patches, monkeypatch, cli_args, expected
 ):
-    monkeypatch.setattr(tpu_platform, "_ep_weight_filter_cli_opt_out", False)
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    monkeypatch.setattr(tpu_platform, "_ep_weight_filter_cli_opt_out", None)
     monkeypatch.setattr(sys, "argv", ["vllm", "serve"])
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--enable-ep-weight-filter",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
-    TpuPlatform.pre_register_and_update(parser)
+    with _device_left_unset():
+        parser = AsyncEngineArgs.add_cli_args(FlexibleArgumentParser())
+    action = next(a for a in parser._actions if a.dest == "enable_ep_weight_filter")
+    assert isinstance(action, tpu_platform._TrackedEpWeightFilterAction)
     parsed = parser.parse_args(cli_args)
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(is_moe=True),
-        parallel_config=SimpleNamespace(
-            enable_expert_parallel=True,
-            enable_eplb=False,
-            enable_ep_weight_filter=parsed.enable_ep_weight_filter,
-        ),
+    vllm_config = _make_ep_filter_vllm_config(
+        is_moe=True,
+        enable_expert_parallel=True,
+        enable_ep_weight_filter=parsed.enable_ep_weight_filter,
     )
-    tpu_platform._apply_default_ep_weight_filter(vllm_config)
+    TpuPlatform.check_and_update_config(vllm_config)
     assert vllm_config.parallel_config.enable_ep_weight_filter is expected
 
 
-def test_default_ep_weight_filter_respects_sys_argv_opt_out(monkeypatch):
-    monkeypatch.setattr(tpu_platform, "_ep_weight_filter_cli_opt_out", False)
+@pytest.mark.parametrize(
+    "parser_opt_out, expected",
+    [
+        # Without parser hook (e.g. direct EngineArgs entry point), fall back
+        # to raw sys.argv.
+        (None, False),
+        # Once the parser hook ran without opt-out, ignore stale sys.argv.
+        (False, True),
+    ],
+)
+@patch("vllm_torchtpu.patch_registry.apply")
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
+def test_default_ep_weight_filter_sys_argv_fallback(
+    mock_prepare_env, mock_apply_patches, monkeypatch, parser_opt_out, expected
+):
+    monkeypatch.setattr(tpu_platform, "_ep_weight_filter_cli_opt_out", parser_opt_out)
     monkeypatch.setattr(sys, "argv", ["vllm", "bench", "--no-enable-ep-weight-filter"])
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(is_moe=True),
-        parallel_config=SimpleNamespace(
-            enable_expert_parallel=True,
-            enable_eplb=False,
-            enable_ep_weight_filter=False,
-        ),
+    vllm_config = _make_ep_filter_vllm_config(
+        is_moe=True,
+        enable_expert_parallel=True,
+        enable_ep_weight_filter=False,
     )
-    tpu_platform._apply_default_ep_weight_filter(vllm_config)
-    assert vllm_config.parallel_config.enable_ep_weight_filter is False
+    TpuPlatform.check_and_update_config(vllm_config)
+    assert vllm_config.parallel_config.enable_ep_weight_filter is expected
