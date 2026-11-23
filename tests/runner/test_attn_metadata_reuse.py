@@ -280,3 +280,23 @@ def test_reused_metadata_is_a_new_object_each_step():
                 for md in prev.values():
                     assert isinstance(md.seq_lens, torch.Tensor)
             prev = out["metadata"]
+
+
+def test_hit_counters_match_reuse_and_log(counts, monkeypatch, caplog):
+    """The self-check counters count exactly the reuses taken, and the rank-0
+    line reports them (counting only: outputs are checked by `_run`)."""
+    import logging
+
+    monkeypatch.setattr(am, "_reuse_counts", {"stage": [0, 0], "build": [0, 0]})
+    monkeypatch.setattr(am, "REUSE_LOG_FIRST", 50)
+    monkeypatch.setattr(am, "REUSE_LOG_EVERY", 100)
+    with caplog.at_level(logging.INFO):
+        _run(0, 4, {}, counts, steps=200)
+    stage_hit, stage_miss = am._reuse_counts["stage"]
+    build_hit, build_miss = am._reuse_counts["build"]
+    assert stage_hit == counts.stage_fast and stage_hit > 0
+    assert build_hit == counts.md_reuse and build_hit > 0
+    assert stage_miss > 0 and build_miss >= 0
+    lines = [r.getMessage() for r in caplog.records if "METADATA_REUSE hits" in r.getMessage()]
+    assert lines and lines[-1].startswith("VLLM_TPU_ATTN_METADATA_REUSE hits: stage ")
+    assert am.metadata_reuse_line().endswith("%)")

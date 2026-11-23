@@ -139,6 +139,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadataBuilderContext,
     MambaStackRef,
     attention_block_table_width,
+    note_metadata_reuse,
     stage_block_table_uploads,
     stacked_mamba_metadata,
     stage_h2d_upload,
@@ -2897,7 +2898,9 @@ class TPUModelRunner(GPUModelRunner):
                 and rec.compact is compact
                 and rec.key == reuse_key
             ):
+                note_metadata_reuse("build", True)
                 return self._reuse_attention_metadata(ctx, rec)
+            note_metadata_reuse("build", False)
         for gid, is_mamba, _ in plan[1]:
             if gid not in staged or (
                 is_mamba and unified and (products is None or gid not in products)
