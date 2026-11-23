@@ -116,6 +116,11 @@ def tail_env(monkeypatch):
     monkeypatch.setattr(
         runner_mod, "_spec_tail_stack_compiled", _compiled(runner_mod._spec_tail_stack)
     )
+    monkeypatch.setattr(
+        runner_mod,
+        "_spec_tail_stack_dense0_compiled",
+        _compiled(runner_mod._spec_tail_stack_dense0),
+    )
     monkeypatch.setattr(runner_mod, "synchronize_tensors", lambda *a, **k: None)
 
 
@@ -349,4 +354,271 @@ def test_stack_tail_traces_fullgraph_static():
     args = (nt, lengths, n, n, 16 * (1 + k), n, *steps)
     got = fn(*args)
     ref = runner_mod._spec_tail_stack(*args)
+    assert all(torch.equal(a, b) for a, b in zip(got, ref))
+
+
+# VLLM_TPU_SPEC_TAIL_DENSE_STEP0 ------------------------------------------
+
+
+def _spy(monkeypatch, name):
+    """Records the args of every call to runner_mod.<name>."""
+    calls = []
+    orig = getattr(runner_mod, name)
+
+    def call(*args):
+        calls.append(args)
+        return orig(*args)
+
+    monkeypatch.setattr(runner_mod, name, call)
+    return calls
+
+
+def _views(args):
+    return [a for a in args if isinstance(a, torch.Tensor) and a._base is not None]
+
+
+def _served_step(k: int, n: int, seed: int):
+    """`_step` with the sampler's rows padded as serving pads them
+    (`_get_padded_num_reqs_with_upper_limit`), the shapes warmup compiles."""
+    nt, state, steps = _step(k, n, seed)
+    rows = runner_mod._get_padded_num_reqs_with_upper_limit(n, 16)
+    pad = rows - nt.shape[0]
+    if pad > 0:
+        nt = torch.cat([nt, torch.full((pad, k + 1), -1, dtype=torch.int32)])
+        lengths = state.spec_decode_metadata_list[0].draft_lengths
+        lengths = torch.cat([lengths, torch.zeros(pad, dtype=torch.int32)])
+        state.spec_decode_metadata_list[0] = SimpleNamespace(
+            draft_lengths=lengths, draft_lengths_cpu=lengths.numpy()
+        )
+    return nt, state, steps
+
+
+def _mk_steps(k: int, n: int, cap: int, seed: int):
+    """MK-draft-shaped steps: step 0 is `_mk_step0_trim`'s [:p] view of a [cap]
+    token (garbage past p), steps 1.. are dense [p] loop outputs."""
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    nt, state, steps = _served_step(k, n, seed)
+    p = steps[0].shape[0]
+    g = torch.Generator().manual_seed(seed + 1)
+    token = torch.randint(0, 1000, (cap,), generator=g, dtype=torch.int32)
+    token[:p] = steps[0]
+    carry = torch.randn(cap, 4, generator=g)
+    pos = torch.arange(cap, dtype=torch.int32)
+    _, step0, _, _ = Eagle3Proposer._mk_step0_trim((carry, token, pos), p)
+    return nt, state, [step0, *steps[1:]], token
+
+
+@pytest.fixture
+def dense_env(tail_env, monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_TPU_SPEC_TAIL_DENSE_STEP0", True, raising=False)
+
+
+def _mk_runner(k, caps=(16, 16)):
+    runner = _runner(k)
+    runner.num_reqs_max_model_len, runner.num_reqs_most_model_len = caps
+    return runner
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_mk_step0_token_is_a_prefix_view(fresh):
+    """The premise: at p < capacity MK draft step 0's token reaches the tail as
+    a [:p] view (offset 0) of its [capacity] output, with or without
+    MK_DRAFT_ROWS_FRESH's 4th output."""
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    cap = 16
+    token = torch.arange(cap, dtype=torch.int32)
+    out = (torch.zeros(cap, 4), token, torch.zeros(cap, dtype=torch.int32))
+    if fresh:
+        out = out + (torch.zeros(cap, dtype=torch.int32),)
+    for p in (4, 8):
+        step0 = Eagle3Proposer._mk_step0_trim(out, p)[1]
+        assert step0._base is token
+        assert step0.storage_offset() == 0 and step0.shape == (p,)
+        assert runner_mod._dense_step0_base(step0) is token
+
+
+def test_stack_path_hands_the_step0_view_to_the_program(tail_env, monkeypatch):
+    """Flag off (SPEC_TAIL_STACK alone): the MK step-0 view crosses the
+    compiled-call boundary -- the param -> copy program on TPU."""
+    k, n = 3, 6
+    runner = _mk_runner(k)
+    _precompile(runner)
+    calls = _spy(monkeypatch, "_spec_tail_stack_compiled")
+    nt, state, steps, token = _mk_steps(k, n, 16, seed=5)
+    runner._assemble_async_spec_substitution(DraftStepTokens(steps, n), [nt], state)
+    assert len(calls) == 1
+    assert [v._base for v in _views(calls[0])] == [token]
+
+
+@pytest.mark.parametrize("k", [1, 2, 3])
+@pytest.mark.parametrize("caps", [(16, 16), (16, 8)])
+def test_dense_step0_on_matches_off(dense_env, monkeypatch, k, caps):
+    """ON == OFF == stock bitwise over every request count and each warmed
+    capacity >= p (MK draft: cap 16, p in {4, 8}), and ON passes no view."""
+    on_runner = _mk_runner(k, caps)
+    _precompile(on_runner)
+    monkeypatch.setattr(envs, "VLLM_TPU_SPEC_TAIL_DENSE_STEP0", False, raising=False)
+    off_runner = _mk_runner(k, caps)
+    _precompile(off_runner)
+    dense_calls = _spy(monkeypatch, "_spec_tail_stack_dense0_compiled")
+    stack_calls = _spy(monkeypatch, "_spec_tail_stack_compiled")
+    order = list(range(1, 17)) + [8, 4, 3, 16, 5, 1, 7]
+    checked = 0
+    for i, n in enumerate(order):
+        for cap in sorted(set(caps)):
+            if cap < _bucket(n):
+                continue
+            nt, state, steps, _ = _mk_steps(k, n, cap, seed=100 * k + 10 * i + cap)
+            dense = DraftStepTokens(steps, n).materialize()
+            ref = off_runner._assemble_async_spec_substitution(dense, [nt], state)
+            monkeypatch.setattr(
+                envs, "VLLM_TPU_SPEC_TAIL_DENSE_STEP0", False, raising=False
+            )
+            off = off_runner._assemble_async_spec_substitution(
+                DraftStepTokens(steps, n), [nt], state
+            )
+            monkeypatch.setattr(
+                envs, "VLLM_TPU_SPEC_TAIL_DENSE_STEP0", True, raising=False
+            )
+            del dense_calls[:], stack_calls[:]
+            on = on_runner._assemble_async_spec_substitution(
+                DraftStepTokens(steps, n), [nt], state
+            )
+            assert len(dense_calls) == 1 and not stack_calls, (n, cap)
+            assert _views(dense_calls[0]) == []
+            _equal(on, off)
+            _equal(on, ref)
+            checked += 1
+    assert checked >= len(order)
+
+
+def test_dense_step0_fallbacks_match_off(dense_env, monkeypatch):
+    """Step 0 dense, an offset view, a strided view or a view of a 2-D tensor:
+    the stack variant runs as before, with the stock result."""
+    k, n = 3, 6
+    runner = _mk_runner(k)
+    _precompile(runner)
+    dense_calls = _spy(monkeypatch, "_spec_tail_stack_dense0_compiled")
+    stack_calls = _spy(monkeypatch, "_spec_tail_stack_compiled")
+    nt, state, steps = _served_step(k, n, seed=9)
+    p = steps[0].shape[0]
+    shifted = torch.zeros(16, dtype=torch.int32)
+    shifted[1 : p + 1] = steps[0]
+    strided = torch.zeros(2 * p, dtype=torch.int32)
+    strided[::2] = steps[0]
+    wide = torch.zeros(16, 2, dtype=torch.int32)
+    wide[:p, 0] = steps[0]
+    for step0 in (steps[0], shifted[1 : p + 1], strided[::2], wide[:p, 0]):
+        assert torch.equal(step0, steps[0])
+        assert runner_mod._dense_step0_base(step0) is None
+        cur = [step0, *steps[1:]]
+        ref = runner._assemble_async_spec_substitution(
+            DraftStepTokens(cur, n).materialize(), [nt], state
+        )
+        del stack_calls[:]
+        got = runner._assemble_async_spec_substitution(
+            DraftStepTokens(cur, n), [nt], state
+        )
+        assert len(stack_calls) == 1
+        _equal(got, ref)
+    assert not dense_calls
+
+
+def test_dense_step0_unwarmed_cap_falls_back(dense_env, monkeypatch):
+    """A base length warmup did not compile keeps the (warmed) stack variant:
+    no serve-time compile of either program."""
+    k, n = 3, 6
+    runner = _mk_runner(k, caps=(16, 16))
+    _precompile(runner)
+    dense_calls = _spy(monkeypatch, "_spec_tail_stack_dense0_compiled")
+    stack_calls = _spy(monkeypatch, "_spec_tail_stack_compiled")
+    nt, state, steps, _ = _mk_steps(k, n, 32, seed=13)
+    ref = runner._assemble_async_spec_substitution(
+        DraftStepTokens(steps, n).materialize(), [nt], state
+    )
+    got = runner._assemble_async_spec_substitution(
+        DraftStepTokens(steps, n), [nt], state
+    )
+    assert not dense_calls and len(stack_calls) == 1
+    _equal(got, ref)
+
+
+@pytest.mark.parametrize("caps", [(16, 16), (16, 8), (8, 16)])
+def test_dense_step0_warmup_covers_serving_keys(dense_env, caps):
+    """Every key serving can build -- the stock dense steps at each request
+    count, and the MK step-0 view at each capacity >= p -- is warmed."""
+    k = 3
+    runner = _mk_runner(k, caps)
+    _precompile(runner)
+    keys = runner._spec_tail_stack_keys
+    want = set()
+    for n in range(1, 17):
+        nt, state, steps = _served_step(k, n, seed=n)
+        lengths = state.spec_decode_metadata_list[0].draft_lengths
+        want.add(runner_mod._spec_tail_stack_key(nt, lengths, n, steps))
+        for cap in set(caps):
+            if cap < _bucket(n):
+                continue
+            _, _, mk_steps, token = _mk_steps(k, n, cap, seed=n)
+            base = runner_mod._dense_step0_base(mk_steps[0])
+            assert base is token
+            want.add(
+                runner_mod._spec_tail_stack_dense0_key(nt, lengths, n, mk_steps, base)
+            )
+    assert want <= keys
+    assert keys == want  # nothing warmed that serving cannot reach
+
+
+def test_dense_step0_off_warms_no_dense_keys(tail_env):
+    runner = _mk_runner(3)
+    _precompile(runner)
+    assert len(runner._spec_tail_stack_keys) == 16
+    assert all(len(key) == 6 for key in runner._spec_tail_stack_keys)
+
+
+def test_dense_step0_wrong_slice_is_caught(dense_env, monkeypatch):
+    """Negative control: a variant slicing the base one row late differs from
+    OFF, so the equality checks above can fail."""
+    k, n = 3, 6
+    runner = _mk_runner(k)
+    _precompile(runner)
+
+    def wrong(nt, dl, rows, num_reqs, bound, n_, p, base, *rest):
+        return runner_mod._spec_tail_stack(
+            nt, dl, rows, num_reqs, bound, n_, base[1 : p + 1], *rest
+        )
+
+    nt, state, steps, _ = _mk_steps(k, n, 16, seed=21)
+    ref = runner._assemble_async_spec_substitution(
+        DraftStepTokens(steps, n).materialize(), [nt], state
+    )
+    monkeypatch.setattr(runner_mod, "_spec_tail_stack_dense0_compiled", wrong)
+    got = runner._assemble_async_spec_substitution(
+        DraftStepTokens(steps, n), [nt], state
+    )
+    with pytest.raises(AssertionError):
+        _equal(got, ref)
+
+
+@pytest.mark.parametrize("k", [1, 3])
+def test_dense0_tail_traces_fullgraph_static(k):
+    """The dense-step-0 variant traces as one static graph and matches the
+    stack variant on the view bitwise."""
+    import torch._dynamo
+
+    torch._dynamo.reset()
+    fn = torch.compile(
+        runner_mod._spec_tail_stack_dense0,
+        backend="eager",
+        fullgraph=True,
+        dynamic=False,
+    )
+    n = 5
+    nt, state, steps, token = _mk_steps(k, n, 16, seed=31)
+    lengths = state.spec_decode_metadata_list[0].draft_lengths
+    p = steps[0].shape[0]
+    got = fn(nt, lengths, n, n, 16 * (1 + k), n, p, token, *steps[1:])
+    ref = runner_mod._spec_tail_stack(nt, lengths, n, n, 16 * (1 + k), n, *steps)
     assert all(torch.equal(a, b) for a, b in zip(got, ref))

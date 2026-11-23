@@ -1349,6 +1349,54 @@ def _spec_tail_stack_key(next_tokens, draft_lengths, n, steps) -> tuple:
     )
 
 
+def _spec_tail_stack_dense0(
+    next_tokens, draft_lengths, rows, num_reqs, bound, n, p, step0_base, *rest
+):
+    """VLLM_TPU_SPEC_TAIL_DENSE_STEP0: `_spec_tail_stack` taking draft step 0
+    as the untrimmed 1-D tensor its `[:p]` view was cut from, sliced in-graph.
+    torch_tpu materializes every view handed to a compiled program with a
+    program of its own (a 2-instruction param -> copy); a base is dense."""
+    return _spec_tail_stack(
+        next_tokens, draft_lengths, rows, num_reqs, bound, n, step0_base[:p], *rest
+    )
+
+
+_spec_tail_stack_dense0_compiled = _static_shape_args(
+    torch.compile(_spec_tail_stack_dense0, backend="tpu", fullgraph=True, dynamic=False)
+)
+
+
+def _dense_step0_base(step0: torch.Tensor) -> torch.Tensor | None:
+    """The tensor `step0` is a leading `[:p]` slice of, when that tensor is
+    1-D and contiguous and the slice starts at its first element with unit
+    stride, so `base[:p]` reads exactly `step0`'s elements; else None (step 0
+    is dense already, or a view of another kind)."""
+    base = step0._base
+    if base is None or step0.dim() != 1 or base.dim() != 1:
+        return None
+    try:
+        if not (
+            base.dtype == step0.dtype
+            and base.is_contiguous()
+            and step0.shape[0] <= base.shape[0]
+            and (step0.shape[0] <= 1 or step0.stride(0) == 1)
+            and step0.storage_offset() == base.storage_offset()
+        ):
+            return None
+    except (RuntimeError, NotImplementedError):
+        # A tensor without strided storage metadata: keep the stock path.
+        return None
+    return base
+
+
+def _spec_tail_stack_dense0_key(next_tokens, draft_lengths, n, steps, base) -> tuple:
+    """The shapes `_spec_tail_stack_dense0_compiled` specializes on: the stack
+    key of the same steps plus step 0's base."""
+    return _spec_tail_stack_key(next_tokens, draft_lengths, n, steps) + (
+        ("dense_step0", tuple(base.shape), base.dtype),
+    )
+
+
 def _prep_fold_impl(
     seq_lens,
     positions,
@@ -4519,23 +4567,62 @@ class TPUModelRunner(GPUModelRunner):
         nt_chunk = next_tokens_per_chunk[0]
         num_reqs = drafts.num_reqs
         md = state.spec_decode_metadata_list[0]
-        key = _spec_tail_stack_key(nt_chunk, md.draft_lengths, num_reqs, drafts.steps)
-        if key not in self._spec_tail_stack_keys:
-            logger.warning_once(
-                "SPEC_TAIL_STACK: key %s was not precompiled; stacking eagerly.",
-                key,
-            )
-            return None
         assert self.speculative_config is not None
-        src, num_rejected = _spec_tail_stack_compiled(
-            nt_chunk,
-            md.draft_lengths,
-            num_reqs,
-            num_reqs,
-            self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens),
-            num_reqs,
-            *drafts.steps,
-        )
+        bound = self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
+        steps = drafts.steps
+        result = None
+        if envs.VLLM_TPU_SPEC_TAIL_DENSE_STEP0:
+            # Step 0 is a [:p] view (MK draft step 0's trim): hand the program
+            # its dense base and slice in-graph, so no view crosses the call.
+            base = _dense_step0_base(steps[0])
+            if base is not None:
+                dkey = _spec_tail_stack_dense0_key(
+                    nt_chunk, md.draft_lengths, num_reqs, steps, base
+                )
+                if dkey in self._spec_tail_stack_keys:
+                    result = _spec_tail_stack_dense0_compiled(
+                        nt_chunk,
+                        md.draft_lengths,
+                        num_reqs,
+                        num_reqs,
+                        bound,
+                        num_reqs,
+                        steps[0].shape[0],
+                        base,
+                        *steps[1:],
+                    )
+                    if not getattr(self, "_spec_tail_dense0_logged", False):
+                        self._spec_tail_dense0_logged = True
+                        logger.info(
+                            "SPEC_TAIL_DENSE_STEP0: step 0 passed as its [%d] "
+                            "base, sliced to %d rows in-graph",
+                            base.shape[0],
+                            steps[0].shape[0],
+                        )
+                else:
+                    logger.warning_once(
+                        "SPEC_TAIL_DENSE_STEP0: key %s was not precompiled; "
+                        "passing the step-0 view.",
+                        dkey,
+                    )
+        if result is None:
+            key = _spec_tail_stack_key(nt_chunk, md.draft_lengths, num_reqs, steps)
+            if key not in self._spec_tail_stack_keys:
+                logger.warning_once(
+                    "SPEC_TAIL_STACK: key %s was not precompiled; stacking eagerly.",
+                    key,
+                )
+                return None
+            result = _spec_tail_stack_compiled(
+                nt_chunk,
+                md.draft_lengths,
+                num_reqs,
+                num_reqs,
+                bound,
+                num_reqs,
+                *steps,
+            )
+        src, num_rejected = result
         return (
             [src],
             {r: r for r in range(num_reqs)},
@@ -10347,6 +10434,23 @@ class TPUModelRunner(GPUModelRunner):
             if envs.VLLM_TPU_SPEC_TAIL_STACK and not bucketed
             else None
         )
+        # VLLM_TPU_SPEC_TAIL_DENSE_STEP0: the step-0 base lengths serving can
+        # hand over -- MK draft step 0's token is [capacity] long, the chunk's
+        # request capacity (`Eagle3Proposer._draft_rows_len`).
+        dense_step0_caps = (
+            sorted(
+                {
+                    int(c)
+                    for c in (
+                        getattr(self, "num_reqs_max_model_len", None),
+                        getattr(self, "num_reqs_most_model_len", None),
+                    )
+                    if c
+                }
+            )
+            if stack_bucket is not None and envs.VLLM_TPU_SPEC_TAIL_DENSE_STEP0
+            else []
+        )
         with self._precompile_timed("async-spec substitution tail"):
             for num_reqs in range(1, self.max_num_reqs + 1):
                 rows = _get_padded_num_reqs_with_upper_limit(
@@ -10394,6 +10498,36 @@ class TPUModelRunner(GPUModelRunner):
                             next_tokens, draft_lengths, num_reqs, steps
                         )
                     )
+                    for cap in dense_step0_caps:
+                        if cap < steps[0].shape[0]:
+                            continue
+                        # VLLM_TPU_SPEC_TAIL_DENSE_STEP0: step 0 as a [:p]
+                        # view of a [cap] int32 base (MK draft step 0's
+                        # token at the chunk's request capacity).
+                        base = torch.zeros(cap, dtype=torch.int32).to(self.device)
+                        step0 = base[: steps[0].shape[0]]
+                        synchronize_tensors(
+                            _spec_tail_stack_dense0_compiled(
+                                next_tokens,
+                                draft_lengths,
+                                num_reqs,
+                                num_reqs,
+                                bound,
+                                num_reqs,
+                                step0.shape[0],
+                                base,
+                                *steps[1:],
+                            )
+                        )
+                        self._spec_tail_stack_keys.add(
+                            _spec_tail_stack_dense0_key(
+                                next_tokens,
+                                draft_lengths,
+                                num_reqs,
+                                [step0, *steps[1:]],
+                                base,
+                            )
+                        )
 
     def _precompile_prep_fold(self) -> None:
         """VLLM_TPU_PREFWD_PREP_FOLD: compile the folded prep program for every
