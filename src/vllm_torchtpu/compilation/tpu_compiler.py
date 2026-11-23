@@ -628,6 +628,12 @@ class TpuCompilerAdaptor(CompilerInterface):
         if re.fullmatch(r"rank_\d+_\d+", os.path.basename(rank_dir)) is None:
             return None
         torch_compile_cache = os.path.dirname(os.path.dirname(rank_dir))
+        # Only vLLM's own compile cache: the profile run compiles under
+        # <VLLM_CACHE_ROOT>/profile_cache, kept off persistent storage so the
+        # free-HBM probe runs fresh, and a custom cache_dir may not sit under
+        # VLLM_CACHE_ROOT at all; neither may write into the store.
+        if os.path.basename(torch_compile_cache) != "torch_compile_cache":
+            return None
         root = os.path.join(os.path.dirname(torch_compile_cache), "tpu_artifact_store")
 
         def meta(value: Any) -> Any:

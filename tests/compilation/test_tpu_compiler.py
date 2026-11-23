@@ -1549,6 +1549,7 @@ class TestTpuArtifactStore:
             key="artifact_compile_range_8_8_subgraph_0",
             config_hash="cfg1",
             rank="rank_0_0",
+            parent="torch_compile_cache",
         ):
             from vllm.config.utils import Range
 
@@ -1556,9 +1557,7 @@ class TestTpuArtifactStore:
 
             compiler = TpuCompilerAdaptor()
             compiler.initialize_cache(
-                cache_dir=str(
-                    root / "torch_compile_cache" / vllm_hash / rank / "backbone"
-                )
+                cache_dir=str(root / parent / vllm_hash / rank / "backbone")
             )
             compiler._tpu_hash = tpu_hash
             compiler._config_hash = config_hash
@@ -1618,6 +1617,22 @@ class TestTpuArtifactStore:
         )
         compile(vllm_hash="hashA")
         compile(vllm_hash="hashB")
+
+        assert len(compiled) == 2
+        assert replayed == []
+        assert not store.exists()
+
+    @pytest.mark.parametrize("parent", ["profile_cache", "my_cache"])
+    def test_only_vllms_compile_cache_uses_the_store(
+        self, tmp_path, monkeypatch, parent
+    ):
+        """The profile run compiles under <VLLM_CACHE_ROOT>/profile_cache,
+        which stays off persistent storage so the free-HBM probe runs fresh;
+        a custom cache_dir need not sit under VLLM_CACHE_ROOT. Neither may
+        write into, or replay from, the store next to it."""
+        compile, compiled, replayed, store = self._setup(tmp_path, monkeypatch)
+        compile(vllm_hash="hashA", parent=parent)
+        compile(vllm_hash="hashB", parent=parent)
 
         assert len(compiled) == 2
         assert replayed == []
