@@ -9,6 +9,7 @@ import importlib.metadata
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -421,6 +422,52 @@ def main() -> None:
             ]
             assert_no_compilation((args.out / "server.log").read_text(), intervals)
             timing["formal_status"] = "passed"
+            # DSV41_PYSPY_SECONDS=<n> samples every server process's Python
+            # stacks for n seconds over decode rounds on the cached prefixes,
+            # so the host loop's time can be split by function.
+            if decode and (seconds := int(env.get("DSV41_PYSPY_SECONDS", "0"))):
+                if shutil.which("py-spy") is None:
+                    subprocess.run(
+                        ["uv", "pip", "install", "--system", "-q", "py-spy"],
+                        check=True,
+                    )
+                sampler = subprocess.Popen(
+                    [
+                        "py-spy",
+                        "record",
+                        "--pid",
+                        str(server.pid),
+                        "--subprocesses",
+                        "--nonblocking",
+                        "--idle",
+                        "--rate",
+                        "200",
+                        "--duration",
+                        str(seconds),
+                        "--format",
+                        "raw",
+                        "--output",
+                        str(args.out / "pyspy.txt"),
+                    ],
+                    stdout=(args.out / "pyspy.log").open("w"),
+                    stderr=subprocess.STDOUT,
+                )
+                with (args.out / "client-pyspy.log").open("w") as pyspy_log:
+                    subprocess.run(
+                        [
+                            *base,
+                            "--out",
+                            str(args.out / "fixed-pyspy"),
+                            "--rounds",
+                            "4",
+                            "--reuse-prefix",
+                        ],
+                        env=env,
+                        stdout=pyspy_log,
+                        stderr=subprocess.STDOUT,
+                        check=True,
+                    )
+                sampler.wait(timeout=seconds + 120)
             if args.profile:
                 timing["profile_status"] = "failed"
                 with (args.out / "client-profile.log").open("w") as profile_log:
