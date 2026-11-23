@@ -310,7 +310,6 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_RAIDEN_ENGINE_ID",
     "TPU_RAIDEN_JOB_NAME",
     "TPU_RAIDEN_TRANSFER_PARALLELISM",
-    "TPU_RAIDEN_TRANSFER_STREAMS",
     # Store-mode reshard/dispatch service addresses only. The advertised host
     # is the per-pod IP, so it must stay out of a key shared across pods.
     "TPU_RAIDEN_RESHARD_PORT_BASE",

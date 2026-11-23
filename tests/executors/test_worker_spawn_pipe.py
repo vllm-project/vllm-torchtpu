@@ -194,7 +194,7 @@ def patched_spawn(monkeypatch):
             raising=False,
         )
 
-        def binding(pc, rank, local_rank, env):
+        def binding(pc, rank, local_rank, env, dp_collectives=False):
             return SimpleNamespace(
                 as_env=lambda: {"RANK": str(rank)},
                 rank=rank,
@@ -212,6 +212,10 @@ def patched_spawn(monkeypatch):
             binding,
         )
         monkeypatch.setenv("VLLM_TPU_DEVICE_ORDER", "")
+        monkeypatch.setattr(
+            "vllm_torchtpu.models.parallel_requirements.requires_dp_collectives",
+            lambda vllm_config: False,
+        )
         vllm_torchtpu._patch_multiproc_worker_global_rank_env()
         return multiproc_executor.WorkerProc.make_worker_process
 
