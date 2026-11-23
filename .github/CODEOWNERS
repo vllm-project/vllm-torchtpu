@@ -77,10 +77,10 @@
 /tests/distributed/test_zmq_*.py @harutmov @sixiang-google @Nanfang-Li @richardsliu @mrjunwan-lang @aman2930 @yinlin09 @benliangw
 
 # Model Layers
-/src/vllm_torchtpu/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen
+/src/vllm_torchtpu/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @wenxindongwork
 /src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @pritha90 @m-liu @aaronndx
 /src/vllm_torchtpu/layers/core/dcp_indexer_cache.py @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @pritha90 @m-liu @aaronndx
-/tests/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen
+/tests/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @wenxindongwork
 
 # Model Implementations & Model Loader
 /src/vllm_torchtpu/models/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin
