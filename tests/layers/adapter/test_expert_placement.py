@@ -528,6 +528,42 @@ def test_the_loader_renumbers_routers_before_post_processing(
     expert_placement.check_routers_permuted()
 
 
+def test_a_gate_weight_split_is_built_from_the_renumbered_rows(
+    placement_file, monkeypatch, tensor_parallel_group
+):
+    """TpuGateLinear splits its weight after the loader patch renumbers it."""
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe import GateLinear
+    from vllm.model_executor.model_loader import base_loader
+
+    def post_process(model, model_config, target_device):
+        for module in model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                quant_method.process_weights_after_loading(module)
+
+    monkeypatch.setattr(base_loader, "process_weights_after_loading", post_process)
+    model_loader_patches.patch_expert_placement_routers()
+    runner = _Runner("model.layers.3.ffn.experts", hidden=16)
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig("cpu"))):
+        gate = GateLinear(
+            16, 8, bias=False, params_dtype=torch.float32,
+            out_dtype=torch.float32, prefix="gate",
+        )  # fmt: skip
+    gate.weight.data.copy_(runner.gate.weight.detach())
+    gate.e_score_correction_bias = runner.gate.e_score_correction_bias
+    runner.gate = gate
+    weight = gate.weight.detach().clone()
+    expert_placement.apply(runner)
+    base_loader.process_weights_after_loading(_model(runner), None, None)
+    torch.testing.assert_close(
+        gate._bf16x3_weight.double().sum(0),
+        weight[list(ORDER)].double(),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_a_gate_with_tensors_the_renumbering_misses_is_refused(placement_file):
     runner = _Runner("model.layers.3.ffn.experts")
     runner.gate.weight_scale = torch.nn.Parameter(torch.ones(1), requires_grad=False)

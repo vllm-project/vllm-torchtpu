@@ -36,6 +36,7 @@ from vllm_torchtpu.experimental.export import (
     weight_mapper,
 )
 from vllm_torchtpu.experimental.export.trace import trace
+from vllm_torchtpu.layers.adapter.gate_linear import BF16X3_WEIGHT_BUFFER
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 # The vLLM TPU runner's smallest request padding (`tpu_runner.MIN_NUM_SEQS`).
@@ -716,6 +717,10 @@ def _current_vllm_config(vllm_config: Any) -> contextlib.AbstractContextManager[
 # buffers qualify.
 _MAX_CONSTANT_ELEMENTS = 4096
 
+# TpuGateLinear's bf16 split of its fp32 router weight: a replicated weight,
+# too large for a constant.
+_WEIGHT_BUFFER_NAME = BF16X3_WEIGHT_BUFFER
+
 
 # Per-rank constant naming the rank's slice of a `RowParallelLinear` input.
 _TP_RANK_BUFFER = "export_tp_rank"
@@ -1098,9 +1103,9 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
     def abstract_params(self) -> Mapping[str, api.ShapeDtypeStruct]:
         """Builds abstract specs for the model's parameters and buffers.
 
-        Buffers are constants: not in the checkpoint, their per-rank values come
-        from `constant_axis_values`. The exporter keeps only the tensors that a
-        subgraph actually reads.
+        Buffers are constants (see `constant_names`): not in the checkpoint,
+        their per-rank values come from `constant_axis_values`. The exporter
+        keeps only the tensors that a subgraph actually reads.
         """
         params: dict[str, api.ShapeDtypeStruct] = {}
         tp_size = self._export_config.tensor_parallel_size
@@ -1210,9 +1215,14 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         return bufs
 
     def constant_names(self) -> set[str]:
-        """Names in `abstract_params()` that are buffers rather than parameters."""
+        """Names in `abstract_params()` that are buffers rather than parameters,
+        except buffers that hold a weight (`_WEIGHT_BUFFER_NAME`)."""
         params = {name for name, _ in self._model.named_parameters()}
-        return {name for name in self._buffers() if name not in params}
+        return {
+            name
+            for name in self._buffers()
+            if name not in params and name.rpartition(".")[2] != _WEIGHT_BUFFER_NAME
+        }
 
     def constant_axis_values(self, name: str) -> list[Any]:
         """Values of buffer `name` on every tensor-parallel rank, in rank order.

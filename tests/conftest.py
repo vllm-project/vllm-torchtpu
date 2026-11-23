@@ -30,6 +30,8 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
 os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -128,6 +130,25 @@ def vllm_config_context():
     resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
     with set_current_vllm_config(config):
         yield
+
+
+@pytest.fixture
+def tensor_parallel_group(monkeypatch):
+    """A one-rank tensor-parallel group for building vLLM layers on the host."""
+    from vllm.distributed import parallel_state
+
+    group = SimpleNamespace(rank_in_group=0, world_size=1)
+    monkeypatch.setattr(parallel_state, "_TP", group)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+    monkeypatch.setattr(
+        parallel_state, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        "vllm.distributed.get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr("vllm.distributed.get_tensor_model_parallel_rank", lambda: 0)
+    return group
 
 
 @pytest.fixture(scope="module")

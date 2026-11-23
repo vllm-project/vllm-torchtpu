@@ -36,23 +36,7 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
     validate_online_fp8,
 )
 
-
-@pytest.fixture(autouse=True)
-def tensor_parallel_group(monkeypatch):
-    from vllm.distributed import parallel_state
-
-    group = SimpleNamespace(rank_in_group=0, world_size=1)
-    monkeypatch.setattr(parallel_state, "_TP", group)
-    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
-    monkeypatch.setattr(
-        parallel_state, "get_tensor_model_parallel_world_size", lambda: 1
-    )
-    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(
-        "vllm.distributed.get_tensor_model_parallel_world_size", lambda: 1
-    )
-    monkeypatch.setattr("vllm.distributed.get_tensor_model_parallel_rank", lambda: 0)
-    return group
+pytestmark = pytest.mark.usefixtures("tensor_parallel_group")
 
 
 def make_config(kind="fp8", targets=None, exclude=None, **options):

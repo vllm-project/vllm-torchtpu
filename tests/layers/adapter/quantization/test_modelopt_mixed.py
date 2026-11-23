@@ -61,6 +61,8 @@ PACKED_MODULES = {
     "in_proj_ba": ["in_proj_b", "in_proj_a"],
 }
 
+pytestmark = pytest.mark.usefixtures("tensor_parallel_group")
+
 
 def _nvfp4(group_size: int, algo: str = "NVFP4") -> dict:
     return {"quant_algo": algo, "group_size": group_size}
@@ -109,24 +111,6 @@ def _linear(input_size: int = 64, output_size: int = 32) -> LinearBase:
     layer.input_size = input_size
     layer.output_size = output_size
     return layer
-
-
-@pytest.fixture(autouse=True)
-def tensor_parallel_group(monkeypatch):
-    from vllm.distributed import parallel_state
-
-    group = SimpleNamespace(rank_in_group=0, world_size=1)
-    monkeypatch.setattr(parallel_state, "_TP", group)
-    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
-    monkeypatch.setattr(
-        parallel_state, "get_tensor_model_parallel_world_size", lambda: 1
-    )
-    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(
-        "vllm.distributed.get_tensor_model_parallel_world_size", lambda: 1
-    )
-    monkeypatch.setattr("vllm.distributed.get_tensor_model_parallel_rank", lambda: 0)
-    return group
 
 
 class _FakeRoutedExperts(RoutedExperts):
