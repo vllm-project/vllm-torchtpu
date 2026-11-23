@@ -355,6 +355,10 @@ def _register_tpu_kv_connectors() -> None:
             "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector",
         ),
         ("TPURaidenOffloadingConnector", "vllm_torchtpu.offload.raiden_connector"),
+        (
+            "TPUDecodeBenchConnector",
+            "vllm_torchtpu.distributed.kv_transfer.decode_bench_connector",
+        ),
     ):
         KVConnectorFactory.register_connector(name, module_path, name)
 
@@ -1038,6 +1042,7 @@ class TpuPlatform(Platform):
                 "TPURaidenConnector",
                 "TPUMultiConnector",
                 "TPURaidenOffloadingConnector",
+                "TPUDecodeBenchConnector",
             }
             assert kv_transfer_config.kv_connector in _TPU_SUPPORTED_KV_CONNECTORS, (
                 f"TPU only supports the following KV connectors: "
