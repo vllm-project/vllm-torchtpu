@@ -158,6 +158,20 @@ def test_get_chip_version_resolves_generations(accelerator_type, expected):
         tpu_info.get_chip_version.cache_clear()
 
 
+@pytest.mark.parametrize("unrecognized", ["unknown-tpu-8", "v7-8"])
+def test_get_chip_version_unrecognized_warns_and_defaults_to_7x(caplog, unrecognized):
+    tpu_info.get_chip_version.cache_clear()
+    try:
+        with caplog.at_level(logging.WARNING):
+            assert (
+                tpu_info.get_chip_version(unrecognized)
+                == tpu_info.pltpu.ChipVersion.TPU_7X
+            )
+        assert "Unrecognized TPU accelerator type" in caplog.text
+    finally:
+        tpu_info.get_chip_version.cache_clear()
+
+
 @pytest.mark.parametrize(
     ("tpu_type", "expected_cores"),
     [
@@ -174,7 +188,6 @@ def test_get_chip_version_resolves_generations(accelerator_type, expected):
         ("v5p-8", 2),
         ("tpu7x-8", 2),
         ("v7x-16", 2),
-        ("TPU v7", 2),
         ("tpu8i-8", 2),
         ("v8i-4", 2),
     ],
@@ -199,3 +212,30 @@ def test_get_tpu_metadata_passes_request_timeout(monkeypatch):
     monkeypatch.setattr(tpu_info.requests, "get", fake_get)
     assert tpu_info.get_tpu_metadata("accelerator-type") == "v8t-16"
     assert seen_kwargs["timeout"] == 2.0
+
+
+def test_env_override_fetch_tpu_type_passes_request_timeout(monkeypatch):
+    import requests
+
+    from vllm_torchtpu import env_override
+
+    seen_kwargs = {}
+
+    class _Resp:
+        status_code = 200
+        text = "v8t-16"
+
+    def fake_get(url, **kwargs):
+        seen_kwargs.update(kwargs)
+        seen_kwargs["url"] = url
+        return _Resp()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    assert env_override._fetch_tpu_type_from_metadata() == "v8t-16"
+    assert seen_kwargs["timeout"] == 2.0
+
+    def timeout_get(_url, **_kwargs):
+        raise requests.Timeout("timed out")
+
+    monkeypatch.setattr(requests, "get", timeout_get)
+    assert env_override._fetch_tpu_type_from_metadata() is None

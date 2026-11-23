@@ -87,6 +87,8 @@ logger = init_logger(__name__)
 #     devices, so key == X*Y*Z*T, twice the chip count.
 #   - Hierarchical BoardFly (TPU v8i): 4 chips per board,
 #     up to 8 boards per group, up to 32 groups per slice, so key == C*B*G.
+#   - 3D Torus (TPU v8t): one core per chip exposed as a single device,
+#     so key == X*Y*Z.
 #
 # Multi-host TPU slice mesh topologies for 2D Torus architectures.
 TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
@@ -142,8 +144,8 @@ TPU_8I_MULTIHOST_TOPOLOGY_MAP = {
     1024: "4,8,32",
 }
 
-# Multi-host TPU slice mesh topologies for TPU v8t (3D Torus X,Y,Z with 1
-# device per chip; single-host bounds are 2,2,1 = 4 chips).
+# TPU slice mesh topologies for TPU v8t (3D Torus X,Y,Z with 1 device per
+# chip: single-host 1/2/4-chip slices plus multi-host meshes).
 TPU_8T_MULTIHOST_TOPOLOGY_MAP = {
     1: "1,1,1",
     2: "1,2,1",

@@ -71,7 +71,6 @@ def parse_chip_version(accelerator_type: str) -> pltpu.ChipVersion | None:
     name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu").strip()
     name = {
         "v5litepod": "v5e",
-        "v7": "7",
         "v7x": "7x",
         "v8i": "8i",
         "v8t": "8t",
