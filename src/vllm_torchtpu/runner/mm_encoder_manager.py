@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, cast
 
+import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import (
@@ -28,6 +29,7 @@ from vllm.v1.worker.encoder_cudagraph import (
 )
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.mm_host_copy_patch import copy_bytes_
 from vllm_torchtpu.runner.mm_encoder_rows import split_batch_output
 from vllm_torchtpu.runner.mm_video_chunking import (
     embed_multimodal_chunked,
@@ -49,19 +51,99 @@ def _to_device(mm_kwargs: Any, device: torch.device) -> Any:
     )
 
 
+# Host rows reach the device as ROW_CHUNKS chunks of 1/ROW_CHUNKS of a budget's
+# rows (`rows_to_device`), so no device program depends on the row count. Each
+# transfer holds up the H2D copies after it (8 chunks cost a 5200-row image
+# 5 ms of TTFT); 2 chunks cover any batch without a host copy, as a batch has
+# more rows than the next smaller budget, at least half of its own.
+ROW_CHUNKS = 2
+
+
+def rows_to_device(
+    parts: Sequence[torch.Tensor], template: torch.Tensor
+) -> torch.Tensor:
+    """The concatenated host rows of `parts`, zero-padded to `template`'s shape
+    and dtype, on its device.
+
+    The span of host memory holding the parts uploads as ROW_CHUNKS views,
+    spread evenly over it (overlapping when it is shorter than the budget),
+    and a gather by a host-built index picks each part's rows in order, and
+    the padding rows from a zero row. The device ops then have the budget's
+    shapes only, and fuse with the budget-inputs hook's into one program per
+    budget (compiled by `MMEncoderManager._capture_budget_graph`).
+    """
+    rows, rest = template.shape[0], tuple(template.shape[1:])
+    size = -(-rows // ROW_CHUNKS)
+    span, offsets, copied = _span(parts, rows)
+    if span.shape[0] < size:
+        # Shorter than one chunk (the smallest budgets): pad it on the host.
+        span = torch.cat([span, span.new_zeros(size - span.shape[0], *rest)])
+        copied = True
+    last = span.shape[0] - size
+    starts = np.linspace(0, last, ROW_CHUNKS).round().astype(np.int64)
+    # A host copy dies with this call, so it uploads blocking.
+    chunks = [
+        span[start : start + size].to(template.device, non_blocking=not copied)
+        for start in starts
+    ]
+    at = np.concatenate(
+        [np.arange(o, o + p.shape[0]) for o, p in zip(offsets, parts, strict=True)]
+    )
+    chunk = np.searchsorted(starts, at, side="right") - 1
+    index = np.full(rows, ROW_CHUNKS * size, dtype=np.int64)  # the zero row
+    index[: len(at)] = chunk * size + at - starts[chunk]
+    source = torch.cat([*chunks, chunks[0].new_zeros(1, *rest)])
+    picks = torch.from_numpy(index).to(template.device, non_blocking=True)
+    return source[picks].to(template.dtype)
+
+
+def _span(
+    parts: Sequence[torch.Tensor], rows: int
+) -> tuple[torch.Tensor, list[int], bool]:
+    """A host tensor holding every part, each part's first row in it, and
+    whether it is a copy: a view of the parts' own storage when they are row
+    slices of one tensor within `rows` rows of each other, else a
+    concatenation."""
+    first = parts[0]
+    row = first[0].numel() if first.shape[0] else 0
+    if row and all(
+        p.is_contiguous()
+        and p.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+        and (p.storage_offset() - first.storage_offset()) % row == 0
+        for p in parts
+    ):
+        base = min(p.storage_offset() for p in parts)
+        end = max(p.storage_offset() + p.numel() for p in parts)
+        if end - base <= rows * row:
+            shape = ((end - base) // row, *first.shape[1:])
+            span = first.as_strided(shape, first.stride(), base)
+            return span, [(p.storage_offset() - base) // row for p in parts], False
+    starts = np.cumsum([0] + [p.shape[0] for p in parts[:-1]])
+    out = first.new_empty((int(starts[-1]) + parts[-1].shape[0], *first.shape[1:]))
+    flat = out.view(-1).view(torch.uint8)
+    pairs, at = [], 0
+    for part in parts:
+        src = part.contiguous().view(-1).view(torch.uint8)
+        pairs.append((flat[at : at + src.numel()], src))
+        at += src.numel()
+    copy_bytes_(pairs)
+    return out, [int(s) for s in starts], True
+
+
 @contextmanager
 def host_encoder_batches(runner: Any) -> Iterator[None]:
     """Hand the encoder manager this step's batches on the host.
 
-    Its model then pads each budget graph's pixels on the host
-    (`BUDGET_INPUTS_HOOK`), so no device program takes an item's patch count.
-    A step with a modality the manager does not encode keeps the upload; so
-    does a manager without a layout-free path (see `layout_free`).
+    Its model's budget-inputs hook (`BUDGET_INPUTS_HOOK`) then returns each
+    budget graph's pixels as host rows, which reach the device in chunks of
+    the budget (`rows_to_device`), so no device program takes an item's patch
+    count. A step with a modality the manager does not encode keeps the
+    upload; so does a manager without a layout-free path (see `layout_free`).
     """
     from vllm.v1.worker import gpu_model_runner
 
     manager = runner.encoder_cudagraph_manager
-    if not isinstance(manager, MMEncoderManager) or not manager.host_pixels:
+    if not isinstance(manager, MMEncoderManager) or not manager.layout_free:
         yield
         return
     upstream = gpu_model_runner.group_and_batch_mm_kwargs
@@ -196,10 +278,9 @@ class MMEncoderManager(EncoderCudaGraphManager):
             getattr(type(self.model), BUDGET_INPUTS_HOOK, None)
         )
         # The layout-free path (`enable_layout_free`): encoder outputs as row
-        # handles into their batch output, optionally with this step's
-        # batches on the host (`host_pixels`, `host_batches`).
+        # handles into their batch output, and this step's batches on the
+        # host (`host_batches`, see `host_encoder_batches`).
         self.layout_free = False
-        self.host_pixels = False  # pad pixels on the host (`host_encoder_batches`)
         self.host_batches = False
         self._layout_free_off = False  # a batch on the per-item-tensor path
         # CUDA graph metadata owns CUDA replay buffers. Track XLA warmup
@@ -238,6 +319,11 @@ class MMEncoderManager(EncoderCudaGraphManager):
             src = replay_values.get(key)
             if src is None or tmpl is None:
                 padded[key] = tmpl
+                continue
+
+            if isinstance(src, list):
+                # Host rows from the budget-inputs hook (`host_encoder_batches`).
+                padded[key] = rows_to_device(src, tmpl)
                 continue
 
             if not hasattr(src, "shape") or src.ndim == 0:
@@ -279,14 +365,15 @@ class MMEncoderManager(EncoderCudaGraphManager):
             out = self._compiled_budget_forward(dict(template), path=path)
             synchronize_tensors(out, wait=True)
             if self.has_budget_inputs_hook:
-                # The hook's device ops have the budget's shapes: compile them now.
+                # The hook's device ops, and the upload of its host rows, have
+                # the budget's shapes: compile the program they fuse into, as
+                # `_run_budget_graph` runs them.
                 values = getattr(self.model, BUDGET_INPUTS_HOOK)(
                     None, template, self.max_batch_size, self.max_frames_per_batch
                 )
-                synchronize_tensors(
-                    [v for v in values.values() if isinstance(v, torch.Tensor)],
-                    wait=True,
-                )
+                padded = self._pad_to_template(values, token_budget, path=path)
+                out = self._compiled_budget_forward(dict(padded), path=path)
+                synchronize_tensors(out, wait=True)
             self.compiled_budgets[path].add(token_budget)
         except Exception as e:
             logger.warning(

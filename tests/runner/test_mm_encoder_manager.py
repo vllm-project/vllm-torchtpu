@@ -131,6 +131,20 @@ def test_padding_clears_previous_request_and_preserves_defaults(manager):
     torch.testing.assert_close(result["pixels"][1:], torch.zeros(3, 2))
 
 
+@pytest.mark.parametrize("lengths", [[5, 6], [16], [1], [2, 2], [7]])
+@pytest.mark.parametrize("one_storage", [True, False])
+def test_host_rows_reach_the_device_at_the_template_shape(lengths, one_storage):
+    template = torch.zeros(16, 3, dtype=torch.bfloat16)
+    rows = torch.randn(sum(lengths), 3)
+    parts = list(rows.split(lengths))
+    if not one_storage:
+        parts = [part.clone() for part in parts]
+    out = mm.rows_to_device(parts, template)
+    assert out.shape == template.shape and out.dtype == template.dtype
+    torch.testing.assert_close(out[: len(rows)], rows.to(torch.bfloat16))
+    assert not out[len(rows) :].any()
+
+
 def test_exact_shape_uses_input_without_overwriting_template(manager):
     source = torch.ones(4, 2)
     result = manager._pad_to_template({"pixels": source}, 4, "global")

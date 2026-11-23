@@ -4085,30 +4085,38 @@ class TPUModelRunner(GPUModelRunner):
             logger.info("Multimodal encoder keeps per-item outputs: %s.", reason)
 
     def _precompile_layout_free_embeds(self) -> None:
-        """Compile the row-handle gathers (every encoder budget at every token
-        bucket) and the embedding merge (every token bucket)."""
+        """Compile the embedding merge with its row-handle gather fused in, at
+        every encoder budget and token bucket.
+
+        A separate program for the gather would need a flush of its own,
+        which holds the host until the encoder is done (4.5 ms a step).
+        """
         manager = self.encoder_cudagraph_manager
         if not isinstance(manager, MMEncoderManager) or not manager.layout_free:
             return
         hidden, dtype = manager.config.out_hidden_size, manager.dtype
         one = np.zeros(1, dtype=np.int64)
-        parts: list[EncoderRows] = []
-        for budget in manager.token_budgets:
+        staged = getattr(self.model, "_get_deepstack_input_embeds", None)
+        clear = getattr(self.model, "_clear_deepstack_input_embeds", None)
+        for i, budget in enumerate(manager.token_budgets):
             source = torch.zeros(budget, hidden, dtype=dtype, device=self.device)
             parts = [EncoderRows(source, one)]
             for num_tokens in self.num_tokens_paddings:
-                synchronize_tensors([EncoderEmbeds(parts).gather(num_tokens)])
-        for num_tokens in self.num_tokens_paddings:
-            is_mm = torch.zeros(num_tokens, dtype=torch.bool)
-            is_mm[0] = True
-            ids = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
-            _, embeds = self._get_model_inputs(ids, ([EncoderEmbeds(parts)], is_mm))
-            synchronize_tensors([embeds])
-            # Nothing consumes this merge: drop what it staged for the forward
-            # (Qwen3-VL's deepstack inputs), or the next forward would add it.
-            clear = getattr(self.model, "_clear_deepstack_input_embeds", None)
-            if clear is not None:
-                clear(num_tokens)
+                is_mm = torch.zeros(num_tokens, dtype=torch.bool)
+                is_mm[0] = True
+                ids = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
+                mm = ([EncoderEmbeds(parts)], is_mm)
+                _, embeds = self._get_model_inputs(ids, mm)
+                synchronize_tensors([embeds])
+                # What the merge staged for the forward (Qwen3-VL's deepstack
+                # inputs): read it as the forward does, which compiles the read
+                # at this bucket, then drop it, or the next forward would add it.
+                if i == 0 and staged is not None:
+                    inputs = staged(num_tokens)
+                    if inputs is not None:
+                        synchronize_tensors(list(inputs.tensors.values()))
+                if clear is not None:
+                    clear(num_tokens)
 
     def _get_model_inputs(
         self,
@@ -4121,9 +4129,6 @@ class TPUModelRunner(GPUModelRunner):
                 # Row handles: gathers at the token bucket's shape.
                 (embeds,) = mm_embeds
                 mm_embeds = [embeds.gather(input_ids.shape[0])]
-                # A program of its own: fused into the merge, the gather would
-                # make a merge program per encoder budget and token bucket.
-                synchronize_tensors(mm_embeds, wait=False)
 
             # _gather_mm_embeddings returns is_mm_embed sized to the number
             # of scheduled tokens, but TPU pads input_ids to a fixed bucket.
