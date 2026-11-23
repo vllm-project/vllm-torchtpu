@@ -26,7 +26,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
-from vllm_torchtpu.layers.adapter import expert_placement
+from vllm_torchtpu.layers.adapter import expert_count_tap, expert_placement
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
 
@@ -62,6 +62,7 @@ class VllmMoERunner(MoERunner):
         # a placed layer loads its experts in slot order.
         expert_placement.apply(self)
         self.capture_fn = None
+        expert_count_tap.register(self.routed_experts)
 
     @property
     def capture_fn(self) -> Callable[[torch.Tensor], None] | None:
@@ -179,3 +180,40 @@ class VllmMoERunner(MoERunner):
                 return shared_output, hidden_states
             return hidden_states
         return super()._maybe_combine(shared_output, hidden_states)
+
+    def _rows_gathered(self) -> tuple[bool, bool]:
+        """Whether `_maybe_dispatch` gathered the rows over DP, and over PCP."""
+        if self._fused_ep_owns_pcp_collectives():
+            return False, False
+        over_pcp = (
+            self.moe_config.pcp_size > 1
+            and not self.moe_config.moe_parallel_config.use_all2all_kernels
+        )
+        return self.do_naive_dispatch_combine, over_pcp
+
+    def _apply_quant_method(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
+        shared_experts_overlapping: bool = False,
+    ):
+        # Every MoE layer passes here, whatever its kernel.
+        if expert_count_tap.is_tapped(self.routed_experts):
+            over_dp, over_pcp = self._rows_gathered()
+            expert_count_tap.record(
+                self.routed_experts,
+                router_logits,
+                input_ids,
+                hidden_states=hidden_states,
+                over_dp=over_dp,
+                over_pcp=over_pcp,
+            )
+        return super()._apply_quant_method(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            shared_experts_input=shared_experts_input,
+            input_ids=input_ids,
+            shared_experts_overlapping=shared_experts_overlapping,
+        )

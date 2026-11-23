@@ -115,6 +115,8 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    TPU_MOE_EXPERT_COUNT_TAP_DIR: str = ""
+    TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS: int = 1000
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
@@ -903,6 +905,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ascending device-id order, so the SparseCore gather gets its
     # N-dimensional algorithm without moving the program's DeviceAssignment.
     "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
+    # Directory for routed-expert count snapshots (expert_count_tap.py); needs
+    # TPU_MOE_SKIP_PADDED_TOKENS=1. Empty disables the tap.
+    "TPU_MOE_EXPERT_COUNT_TAP_DIR": env_str("TPU_MOE_EXPERT_COUNT_TAP_DIR", ""),
+    # Runner steps between the tap's snapshots; <= 0 is refused at load.
+    "TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS": env_int(
+        "TPU_MOE_EXPERT_COUNT_TAP_EVERY_STEPS", 1000
+    ),
     # A static expert placement for expert parallelism: a JSON table naming,
     # per MoE layer, which global experts each EP rank holds and in what slot
     # order -- a permutation, experts / ranks to a rank
