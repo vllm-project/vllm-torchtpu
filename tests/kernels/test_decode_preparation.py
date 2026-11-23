@@ -168,10 +168,12 @@ def test_compressor_inputs_problem(change):
 
 
 @pytest.mark.parametrize(
-    "tokens,requests,total", [(96, 16, 640), (192, 32, 640), (288, 48, 200)]
+    "tokens,requests,total",
+    [(72, 12, 640), (96, 16, 640), (192, 32, 640), (288, 48, 200)],
 )
 def test_compressor_state_packed_matches_native(tokens, requests, total):
-    """Interpret-mode kernel equals native addresses + scatter compaction."""
+    """Interpret-mode kernel equals native addresses + scatter compaction of
+    the rows the compressor pads to 16 (pad rows carry no record)."""
     inputs = _compressor_inputs(tokens, requests)
     layout = prep.DEFAULT_COMPRESSOR_LAYOUT
     prev, valid, wp, wo, rp, ro = prep.compressor_state_packed(
@@ -180,8 +182,10 @@ def test_compressor_state_packed_matches_native(tokens, requests, total):
     n_prev, n_valid, write, read = prep._compressor_state_addresses(*inputs, layout)
     np.testing.assert_array_equal(prev[:, 0], n_prev)
     np.testing.assert_array_equal(valid[:, 0], n_valid)
+    padded = -(-tokens // 16) * 16
     for pairs, offsets, records in ((wp, wo, write), (rp, ro, read)):
-        expected = compress_rope._compact(records, total, 1, tokens)  # CPU scatter
+        records = jnp.pad(records, (0, padded - tokens), constant_values=-1)
+        expected = compress_rope._compact(records, total, 1, padded)  # CPU scatter
         np.testing.assert_array_equal(pairs, expected[0])
         np.testing.assert_array_equal(offsets, expected[1])
 

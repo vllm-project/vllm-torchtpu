@@ -312,10 +312,12 @@ def _admit_compressor(region, buckets, x, weight, inputs, *page_tables) -> bool:
     if problem is None and weight.shape != (x.shape[1], 2 * _HEAD_DIM):
         problem = f"weight {list(weight.shape)} is not [hidden, {2 * _HEAD_DIM}]"
     if problem is None and tokens in buckets:
-        # The precomputed ring tables cover one whole, unpadded token tile.
-        tile = compress_kernel.select_config(tokens, x.shape[1], 2).token_block
-        if tile != tokens or tokens % compress_kernel._ROW_ALIGN:
-            problem = f"compressor tile {tile} does not cover {tokens} tokens"
+        # The precomputed ring tables cover one whole tile of the padded rows.
+        align = compress_kernel._ROW_ALIGN
+        padded = -(-tokens // align) * align
+        tile = compress_kernel.select_config(padded, x.shape[1], 2).token_block
+        if tile != padded:
+            problem = f"compressor tile {tile} does not cover {padded} rows"
     return decode_preparation.admit(region, problem, tokens=tokens, buckets=buckets)
 
 

@@ -20,6 +20,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.attention_preprocessing import compress_rope
 from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import get_tpu_version
 
 # Stdlib logging under vLLM's namespace: kernels/ must not import vLLM
@@ -467,16 +468,25 @@ def _compressor_state_addresses(
 
 
 def _compact_ring(records, total_records):
-    """Stable ``(token, record)`` pairs and ``[0, count)`` for one whole tile."""
+    """Stable ``(token, record)`` pairs and ``[0, count)`` for one whole tile.
+
+    The pair table has the compressor's 16-padded row count; pad rows own no
+    pairs, so the compressor takes it without its own compaction.
+    """
     n = records.size
     r = records.reshape(1, n)
     valid = (r >= 0) & (r < total_records)
     rank = prefix_sum(valid.astype(jnp.int32), axis=1) - 1
-    match = valid & (rank == jnp.arange(n, dtype=jnp.int32)[:, None])
+    match = valid & (rank == jnp.arange(_ring_rows(n), dtype=jnp.int32)[:, None])
     token = jnp.sum(jnp.where(match, jnp.arange(n)[None, :], 0), axis=1)
     record = jnp.sum(jnp.where(match, r, 0), axis=1)
     count = jnp.sum(valid, dtype=jnp.int32)
     return jnp.stack((token, record), axis=1), jnp.stack((jnp.int32(0), count))
+
+
+def _ring_rows(tokens: int) -> int:
+    align = compress_rope._ROW_ALIGN
+    return -(-tokens // align) * align
 
 
 def _check_compressor_inputs(*args):
@@ -515,11 +525,12 @@ def compressor_state_packed(
             ref[...] = value
 
     n = positions.shape[0]
+    rows = _ring_rows(n)
     outputs = pl.pallas_call(
         kernel,
         out_shape=tuple(
             jax.ShapeDtypeStruct(s, jnp.int32)
-            for s in ((n,), (n,), (n, 2), (2,), (n, 2), (2,))
+            for s in ((n,), (n,), (rows, 2), (2,), (rows, 2), (2,))
         ),
         name="dsv41_compressor_state_packed",
         interpret=interpret,
@@ -566,6 +577,7 @@ def compressor_addresses_packed(
     args = (table, starts, kv_starts, positions, minimum, main, index)
     _check_compressor_inputs(*args)
     n, requests = positions.shape[0], table.shape[0]
+    ring = _ring_rows(n)
 
     def kernel(*refs):
         state, ss, ks, pos, mins, mt, it = (r[...] for r in refs[:7])
@@ -616,7 +628,7 @@ def compressor_addresses_packed(
         kernel,
         out_shape=tuple(
             jax.ShapeDtypeStruct(s, jnp.int32)
-            for s in ((n,), (n,), (n, 2), (2,), (n, 2), (2,), (n,), (n,))
+            for s in ((n,), (n,), (ring, 2), (2,), (ring, 2), (2,), (n,), (n,))
         ),
         name=(
             "dsv41_compressor_addresses_packed"
@@ -629,7 +641,7 @@ def compressor_addresses_packed(
         x.reshape(s)
         for x, s in zip(
             outputs,
-            ((n, 1), (n, 1), (2 * n,), (2,), (2 * n,), (2,), (n,), (n,)),
+            ((n, 1), (n, 1), (2 * ring,), (2,), (2 * ring,), (2,), (n,), (n,)),
             strict=True,
         )
     )

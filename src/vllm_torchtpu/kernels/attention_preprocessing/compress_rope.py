@@ -392,7 +392,8 @@ def fused_compress_rope(
 
     ``ring_tables`` may replace the two record vectors with precomputed
     ``(write_pairs, write_offsets, read_pairs, read_offsets)`` from the same
-    stable compaction. This requires unpadded tokens and matching tile offsets.
+    stable compaction, sized for the rows padded to 16 (pad rows own no pairs)
+    with matching tile offsets.
     """
     tokens, hidden = x.shape
     width = ratio * _DIM
@@ -408,15 +409,13 @@ def fused_compress_rope(
     banks = _check_ring(state, ring_write, ring_read, tokens, ratio, ring_tables)
     pools = () if state is None else (state if isinstance(state, tuple) else (state,))
     padded = -(-tokens // _ROW_ALIGN) * _ROW_ALIGN
-    if ring_tables is not None and padded != tokens:
-        raise ValueError("Precomputed ring tables require unpadded token rows")
     if padded != tokens:
         extra = padded - tokens
         x = jnp.pad(x, ((0, extra), (0, 0)))
         rope_rows = jnp.pad(rope_rows, ((0, extra), (0, 0)))
         has_prev = jnp.pad(has_prev, ((0, extra), (0, 0)), constant_values=1)
         valid = jnp.pad(valid, ((0, extra), (0, 0)))
-        if ratio == 2:
+        if ratio == 2 and ring_tables is None:
             ring_write = jnp.pad(ring_write, (0, extra), constant_values=-1)
             ring_read = jnp.pad(ring_read, (0, extra), constant_values=-1)
     if config is None:
