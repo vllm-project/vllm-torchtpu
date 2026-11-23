@@ -197,6 +197,26 @@ def route(
     )
 
 
+# Routes (rows x top-k) up to which `_pick` selects by one-hot. Below it the
+# gather is a TensorCore fusion through scalar indices (0.62 us per MoE layer
+# at 8 x 4, MiniMax-M3.1 twin, j-5e7f2de1; the one-hot select ~0.07 us).
+# Above it XLA offloads the gather to the SparseCore, which beat the one-hot
+# select at 8192 x 4 (14.5 vs 20.2 us per layer, j-744b7442 vs j-4d84af3f).
+# Measured only at those two MiniMax-M3.1 (top-4) shapes: a heuristic cutoff,
+# not a located crossover; both branches give the same values.
+_ONEHOT_PICK_MAX_ROUTES = 2048
+
+
+def _pick(scores: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+    """``scores.gather(-1, topk_ids)``, as an exact one-hot select and sum
+    (each sum adds one picked score to zeros) for small batches."""
+    if topk_ids.numel() > _ONEHOT_PICK_MAX_ROUTES:
+        return scores.gather(-1, topk_ids.long())
+    experts = torch.arange(scores.shape[-1], device=scores.device)
+    hit = topk_ids.unsqueeze(-1) == experts
+    return torch.where(hit, scores.unsqueeze(-2), 0.0).sum(dim=-1)
+
+
 def _apply_scoring_fn(scoring_fn: str, router_logits: torch.Tensor) -> torch.Tensor:
     scores = router_logits.float()
     if scoring_fn == "softmax":
@@ -323,7 +343,7 @@ def select_experts(
         bias = e_score_correction_bias.float().view(bias_shape)
         scores_for_choice = scores + bias
         _, topk_ids = _topk(scores_for_choice, topk)
-        topk_weights = scores.gather(-1, topk_ids.long())
+        topk_weights = _pick(scores, topk_ids)
     else:
         topk_weights, topk_ids = _topk(scores, topk)
 
