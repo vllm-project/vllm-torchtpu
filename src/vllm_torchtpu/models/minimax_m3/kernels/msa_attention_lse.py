@@ -1806,25 +1806,80 @@ def adaptive_prefill() -> tuple[int, dict] | None:
     configuration's kernel kwargs), or None (unset). The optional fields give
     the wide configuration its own pages per step and step widths ("." between
     widths; unset = the configured ones). Read when the calling program is
-    traced, through `envs` (part of the compile-cache key)."""
+    traced, through `envs` (part of the compile-cache key). A spec of more
+    than one tier (`adaptive_tiers`) gives its first tier."""
+    tiers = adaptive_tiers()
+    return tiers[0][:2] if tiers else None
+
+
+def adaptive_tiers() -> list[tuple[int, dict, str]]:
+    """``envs.TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE`` as tiers, ";" between
+    them: [(threshold, kernel kwargs, stat)], thresholds increasing within a
+    stat. A call runs the last tier whose threshold its selections exceed,
+    or the configured tiles if none. Each tier is "[<stat>]<threshold>:
+    <block_q>:<tile_pages>[:<pages_per_step>[:<w.w...>]]"; the stat is the
+    mean distinct pages per narrow query tile (no prefix, `selection_width`)
+    or "x" for the widest sampled tile's distinct pages (`selection_width`
+    max), so the calls with the widest tiles, which set the slowest KV head,
+    can take their own configuration. Empty: []."""
     from vllm_torchtpu import envs
 
     spec = envs.TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE.strip()
     if not spec:
-        return None
-    fields = spec.replace("/", ":").split(":")
-    want = "<threshold>:<block_q>:<tile_pages>[:<pages_per_step>[:<w.w...>]]"
-    if not 3 <= len(fields) <= 5:
-        raise ValueError(f"{ADAPTIVE_ENV}={spec!r}: want {want}")
-    parts = [int(x) for x in fields[:4]]
-    if min(parts) <= 0:
-        raise ValueError(f"{ADAPTIVE_ENV}={spec!r}: want {want}")
-    wide = dict(block_q=parts[1], page_cache_tile_pages=parts[2])
-    if len(parts) > 3:
-        wide["pages_per_step"] = parts[3]
-    if len(fields) > 4:
-        wide["step_widths"] = tuple(sorted(int(w) for w in fields[4].split(".")))
-    return parts[0], wide
+        return []
+    want = "[x]<threshold>:<block_q>:<tile_pages>[:<pages_per_step>[:<w.w...>]]"
+    tiers = []
+    for tier in spec.split(";"):
+        fields = tier.strip().replace("/", ":").split(":")
+        stat = "max" if fields[0].startswith("x") else "mean"
+        fields[0] = fields[0].removeprefix("x")
+        if not 3 <= len(fields) <= 5:
+            raise ValueError(f"{ADAPTIVE_ENV}={spec!r}: want {want} per tier")
+        parts = [int(x) for x in fields[:4]]
+        if min(parts) <= 0:
+            raise ValueError(f"{ADAPTIVE_ENV}={spec!r}: want {want} per tier")
+        kw = dict(block_q=parts[1], page_cache_tile_pages=parts[2])
+        if len(parts) > 3:
+            kw["pages_per_step"] = parts[3]
+        if len(fields) > 4:
+            kw["step_widths"] = tuple(sorted(int(w) for w in fields[4].split(".")))
+        if tiers and stat == tiers[-1][2] and parts[0] <= tiers[-1][0]:
+            raise ValueError(f"{ADAPTIVE_ENV}={spec!r}: thresholds must increase")
+        tiers.append((parts[0], kw, stat))
+    return tiers
+
+
+def selection_width(
+    selected: jax.Array, block_q: int, max_tiles: int = 64
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """(distinct pages summed over the sampled tiles, sampled tiles holding
+    any page, the most distinct pages of one sampled tile) of ``selected [T,
+    G, K]`` (page keys, ``-1`` padded) in `block_q`-token tiles of each KV
+    head; int32 scalars. Sampling as `wide_selection`."""
+    num_tokens, num_heads, topk = selected.shape
+    pad = -num_tokens % block_q
+    keys = jnp.pad(selected, ((0, pad), (0, 0), (0, 0)), constant_values=-1)
+    keys = keys.transpose(1, 0, 2).reshape(num_heads, -1, block_q * topk)
+    keys = keys[:, :: max(1, keys.shape[1] // max_tiles)]
+    width = keys.shape[-1]
+    earlier = jnp.arange(width)[None, :] < jnp.arange(width)[:, None]
+    seen = jnp.any((keys[..., :, None] == keys[..., None, :]) & earlier, axis=-1)
+    per_tile = jnp.sum((keys >= 0) & ~seen, axis=-1, dtype=jnp.int32)
+    tiles = jnp.sum(jnp.any(keys >= 0, axis=-1), dtype=jnp.int32)
+    return jnp.sum(per_tile), tiles, jnp.max(per_tile)
+
+
+def adaptive_tier(
+    selected: jax.Array, block_q: int, tiers: list[tuple[int, dict, str]]
+) -> jax.Array:
+    """Index into [configured tiles, *tiers] of the configuration a call
+    with page keys ``selected [T, G, K]`` runs (`adaptive_tiers`): int32."""
+    distinct, tiles, widest = selection_width(selected, block_q)
+    index = jnp.int32(0)
+    for i, (threshold, _, stat) in enumerate(tiers):
+        over = widest > threshold if stat == "max" else distinct > threshold * tiles
+        index = jnp.where(over, jnp.int32(i + 1), index)
+    return index
 
 
 def wide_selection(

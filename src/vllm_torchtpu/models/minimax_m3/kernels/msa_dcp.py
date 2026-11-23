@@ -895,34 +895,35 @@ def msa_attend_dcp(
         elif _fp8_opt():
             common["prefill_precision"] = _fp8_opt()
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
-    adaptive = (
-        msa_attention_lse.adaptive_prefill()
+    tiers = (
+        msa_attention_lse.adaptive_tiers()
         if scale_cache is not None
         and num_tokens >= _MIN_CANDIDATE_TOKENS
         and common.get("page_cache_slots")
-        else None
+        else []
     )
-    if adaptive is not None:
-        # Two kernel configurations in the program; each call runs one, by
-        # how wide its selections are (the other's outputs are not computed).
-        threshold, wide_kw = adaptive
+    if tiers:
+        # Several kernel configurations in the program; each call runs one,
+        # by how wide its selections are (the others' outputs are not
+        # computed).
         msa_attention_lse._proof(
             msa_attention_lse.ADAPTIVE_ENV,
-            f"MSA prefill tiles per call: > {threshold} pages per "
-            f"{common['block_q']}-token tile -> block_q {wide_kw['block_q']}, "
-            f"tile pages {wide_kw['page_cache_tile_pages']}"
-            + (
-                f", pages per step {wide_kw['pages_per_step']}"
-                if "pages_per_step" in wide_kw
-                else ""
-            )
-            + (
-                f", widths {wide_kw['step_widths']}"
-                if "step_widths" in wide_kw
-                else ""
+            "MSA prefill tiles per call: "
+            + "; ".join(
+                f"> {threshold} pages per "
+                + (f"{common['block_q']}-token tile" if stat == "mean"
+                   else f"widest sampled {common['block_q']}-token tile")
+                + f" -> block_q {kw['block_q']}, "
+                f"tile pages {kw['page_cache_tile_pages']}"
+                + (
+                    f", pages per step {kw['pages_per_step']}"
+                    if "pages_per_step" in kw
+                    else ""
+                )
+                + (f", widths {kw['step_widths']}" if "step_widths" in kw else "")
+                for threshold, kw, stat in tiers
             ),
         )
-        wide = dict(common, **wide_kw)
 
         def attend(kw):
             def run(operands):
@@ -938,11 +939,19 @@ def msa_attend_dcp(
 
             return run
 
-        return jax.lax.cond(
-            msa_attention_lse.wide_selection(keys, common["block_q"], threshold),
-            attend(wide),
-            attend(common),
-            (q, kv_cache, keys, scale_cache, *args),
+        operands = (q, kv_cache, keys, scale_cache, *args)
+        if len(tiers) == 1 and tiers[0][2] == "mean":
+            threshold, wide_kw, _ = tiers[0]
+            return jax.lax.cond(
+                msa_attention_lse.wide_selection(keys, common["block_q"], threshold),
+                attend(dict(common, **wide_kw)),
+                attend(common),
+                operands,
+            )
+        return jax.lax.switch(
+            msa_attention_lse.adaptive_tier(keys, common["block_q"], tiers),
+            [attend(common)] + [attend(dict(common, **kw)) for _, kw, _ in tiers],
+            operands,
         )
     if scale_cache is not None:
         if num_heads == 1:
