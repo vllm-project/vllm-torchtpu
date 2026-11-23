@@ -748,6 +748,43 @@ _SYNTHETIC_ROW_SPLIT_MIN_ROWS = 4
 #      gather_logprobs) so _dummy_run and execute_model trace identically.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
+
+class _HostPhaseTimer:
+    """TPU_HOST_PHASE_TIMING_MS: host wall time per execute_model phase; logs a
+    step whose slowest phase exceeds the threshold (diagnostic, default off)."""
+
+    def __init__(self, threshold_ms: float):
+        self.threshold_ms = threshold_ms
+        self.t0 = self.last = None
+        self.phases: list[tuple[str, float]] = []
+        self.steps = self.logged = 0
+
+    def start(self) -> None:
+        self.t0 = self.last = time.perf_counter()
+        self.phases = []
+
+    def mark(self, name: str) -> None:
+        if self.last is None:
+            return
+        now = time.perf_counter()
+        self.phases.append((name, (now - self.last) * 1e3))
+        self.last = now
+
+    def finish(self, tag: str) -> None:
+        if self.t0 is None:
+            return
+        self.mark("tail")
+        self.steps += 1
+        worst = max(self.phases, key=lambda p: p[1]) if self.phases else ("", 0.0)
+        if worst[1] >= self.threshold_ms:
+            self.logged += 1
+            logger.info(
+                "host_phase_timing step=%d slow=%s %.2fms total=%.2fms %s [%s] (%d/%d steps logged)",
+                self.steps, worst[0], worst[1], (time.perf_counter() - self.t0) * 1e3, tag,
+                " ".join(f"{n}={v:.2f}" for n, v in self.phases), self.logged, self.steps,
+            )
+        self.t0 = self.last = None
+
 class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     drafter: NgramProposer | DFlashProposer | Eagle3Proposer | None
@@ -1176,6 +1213,11 @@ class TPUModelRunner(GPUModelRunner):
         # (input_ids_cpu, positions_cpu, seq_lens_cpu, ...); the next chunk
         # waits on it before rewriting them.
         self._input_staging_fence: Any = None
+        self._phase_timer = (
+            _HostPhaseTimer(envs.TPU_HOST_PHASE_TIMING_MS)
+            if envs.TPU_HOST_PHASE_TIMING_MS > 0
+            else None
+        )
         # Per-call host sources of non-blocking uploads (block tables, mamba
         # slot ids), kept alive alongside their post-fence release callback
         # until a fence recorded after them has been waited on; see
@@ -3768,8 +3810,13 @@ class TPUModelRunner(GPUModelRunner):
 
     def _wait_input_staging_fence(self) -> None:
         fence = self._input_staging_fence
+        if self._phase_timer is not None:
+            self._phase_timer.mark("pre_fence_wait")
         if fence is not None:
             fence.synchronize()
+        if self._phase_timer is not None:
+            self._phase_timer.mark("staging_fence_wait")
+        if fence is not None:
             self._input_staging_fence = None
             for _, release_cb in self._fenced_h2d_sources:
                 release_cb()
@@ -4105,8 +4152,13 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        pt = self._phase_timer
+        if pt is not None:
+            pt.start()
         # Update cached state
         self._update_states(scheduler_output)
+        if pt is not None:
+            pt.mark("update_states")
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
@@ -4247,6 +4299,8 @@ class TPUModelRunner(GPUModelRunner):
                 wait_for_completion=raiden_inline,
                 report_completion=not raiden_inline,
             )
+        if self._phase_timer is not None:
+            self._phase_timer.mark("kv_setup")
 
         nan_check = (
             begin_kv_save_nan_check(get_kv_transfer_group())
@@ -4274,6 +4328,8 @@ class TPUModelRunner(GPUModelRunner):
             ) = self._prepare_inputs(
                 scheduler_output, start_index, num_decode_reqs, num_windowed_reqs
             )
+            if self._phase_timer is not None:
+                self._phase_timer.mark("prepare_inputs")
 
             # Seed newly-advanced mamba state blocks before the forward reads
             # them (chunk boundaries, decode crossings, prefix-cache resumes).
@@ -4362,6 +4418,8 @@ class TPUModelRunner(GPUModelRunner):
                     chunk_embeds = []
                 chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
+            if self._phase_timer is not None:
+                self._phase_timer.mark("post_prepare")
             self._record_input_staging_fence()
             if self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(
@@ -5397,6 +5455,8 @@ class TPUModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
+        if self._phase_timer is not None:
+            self._phase_timer.finish("sample_tokens")
         if self.execute_model_state is None:
             if not self._pp_is_last:
                 return self._sample_tokens_pp_intermediate_stage()
@@ -9088,6 +9148,8 @@ class TPUModelRunner(GPUModelRunner):
         kwargs = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
+        if self._phase_timer is not None:
+            self._phase_timer.mark("model_inputs")
         out = self.model(
             input_ids=input_ids,
             positions=positions,

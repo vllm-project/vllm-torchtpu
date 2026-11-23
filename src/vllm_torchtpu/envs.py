@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS: int = 0
     TPU_TP_AR_QDQ_ROWS: int = 0
     TPU_TP_QAR_MIN_TOKENS: int = 0
+    TPU_HOST_PHASE_TIMING_MS: float = 0.0
     TPU_TP_AR_QDQ_MIN_TOKENS: int = 0
     TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS: int = 0
     TPU_MOE_TC_COMBINE: bool = False
@@ -875,6 +876,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MAX_BYTES > 0) on a tpu7x 2x2x1 TP8 group. Changes numerics (~0.9% rel
     # L2 per all-reduce). 0 = off.
     "TPU_TP_QAR_MIN_TOKENS": env_int("TPU_TP_QAR_MIN_TOKENS", 0),
+    # Diagnostic: time the host phases of TPUModelRunner.execute_model and log
+    # every step in which one phase takes longer than this many ms (0 = off).
+    "TPU_HOST_PHASE_TIMING_MS": lambda: float(os.environ.get("TPU_HOST_PHASE_TIMING_MS", "0") or 0),
     "TPU_TP_AR_QDQ_MIN_TOKENS": env_int("TPU_TP_AR_QDQ_MIN_TOKENS", 0),
     # Pallas TP all-reduces of at most this many rows (a multiple of 8) run
     # the one-shot kernel: each rank pushes its whole activation to every
