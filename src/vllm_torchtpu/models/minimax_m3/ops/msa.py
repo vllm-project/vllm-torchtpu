@@ -401,9 +401,10 @@ def merge_head_partials(
     this rank's heads along the leading axis, and only that ``1 / DCP``
     share is transposed back to ``[T, H / DCP, D]`` (and, with a 4-bit
     cache's `hadamard`, unrotated: the rotation is linear, so the merged sum
-    unrotates as its terms would, up to bf16 rounding order). The MSA merge
-    always reduce-scatters: `TPU_DCP_LSE_MERGE_A2A` (the MLA merge's
-    all-to-all for small steps) does not apply here."""
+    unrotates as its terms would, up to bf16 rounding order). Decode-sized
+    steps of the 8/16-bit op merge over one all-to-all instead
+    (`merge_head_partials_a2a`); `TPU_DCP_LSE_MERGE_A2A` (the MLA merge's
+    switch) does not apply here."""
     # The LSEs cross the all-gather token-major ([T, H], as the MLA merge
     # sends them): gathered head-major they took 2x as long (c48 / c64
     # twins, j-fe812c28, j-c5c4bdfc).
@@ -420,6 +421,65 @@ def merge_head_partials(
     if hadamard is not None:
         merged = _rotate_heads(merged, hadamard)
     return merged.transpose(0, 1)
+
+
+# Steps of at most this many tokens (decode batches) exchange data in fewer,
+# packed collectives: there each collective costs its ~2-3 us latency, not
+# its bytes (`merge_head_partials_a2a`).
+PACKED_EXCHANGE_MAX_TOKENS = 64
+
+
+def _words(x: torch.Tensor) -> torch.Tensor:
+    """`x` as int32 words along its last dim: a collective copies integers
+    bit for bit, while a float collective may flush or canonicalize the
+    subnormals and NaNs that packed 16-bit pairs and ids form."""
+    return x.contiguous().view(torch.int32)
+
+
+def pack_head_partials(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+    """Head-major ``out [H, T, D]`` and ``lse [H, T]`` as one int32 tensor
+    ``[H, T, D * itemsize / 4 + 1]`` (`unpack_head_partials`)."""
+    return torch.cat([_words(out), _words(lse.to(torch.float32).unsqueeze(-1))], dim=-1)
+
+
+def unpack_head_partials(
+    packed: torch.Tensor, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    split = packed.shape[-1] - 1
+    return (
+        packed[..., :split].contiguous().view(dtype),
+        packed[..., split:].contiguous().view(torch.float32).squeeze(-1),
+    )
+
+
+def merge_received_partials(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+    """The log-sum-exp merge of the ranks' partials ``out [R, ..., D]``,
+    ``lse [R, ...]`` over their leading axis, in f32, rounded once to
+    `out`'s dtype. The ranks are summed term by term: a multiply-then-sum
+    reduction lowers to a dot that rounds its f32 operands to bf16."""
+    weight = torch.exp(lse - torch.logsumexp(lse, dim=0, keepdim=True)).unsqueeze(-1)
+    merged = None
+    for r in range(out.shape[0]):
+        term = out[r].to(torch.float32) * weight[r]
+        # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+        term = torch.where(weight[r] > 0, term, torch.zeros_like(term))
+        merged = term if merged is None else merged + term
+    return merged.to(out.dtype)
+
+
+def merge_head_partials_a2a(
+    out: torch.Tensor, lse: torch.Tensor, group: Any
+) -> torch.Tensor:
+    """`merge_head_partials` (no 4-bit rotation) over one all-to-all: rank
+    ``r`` receives every rank's partial and lse of its own heads, packed
+    (`pack_head_partials`), and merges them locally, instead of an lse
+    all-gather and a reduce-scatter. Returns ``[T, H / DCP, D]``."""
+    dcp = group.world_size
+    num_heads, num_tokens, _ = out.shape
+    recv = _all_to_all(pack_head_partials(out, lse), group)
+    recv = recv.view(dcp, num_heads // dcp, num_tokens, -1)
+    parts, lses = unpack_head_partials(recv, out.dtype)
+    return merge_received_partials(parts, lses).transpose(0, 1)
 
 
 def gather_group_heads(
@@ -644,6 +704,9 @@ def get_msa_dcp_op(
             metadata.query_start_loc,
             dcp_rank,
         )
+        # Fixed per traced bucket: the token count is static.
+        if kv_heads == 1 and q.shape[0] <= PACKED_EXCHANGE_MAX_TOKENS:
+            return merge_head_partials_a2a(out, lse, group)
         return merge_head_partials(out, lse, group)
 
     return op
