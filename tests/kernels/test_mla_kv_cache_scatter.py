@@ -19,6 +19,9 @@ with SparseCore; `test_mla_kv_cache_utils.py` covers the reference itself on
 CPU.
 """
 
+import os
+from unittest import mock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -225,6 +228,34 @@ class SparseMLAScatterTest(parameterized.TestCase):
     ):
         inp = self._generate_inputs(num_seqs, tokens_per_seq, max_seq_len, num_pages)
         self._check_scatter(inp, "rope_sc_128", inp["k_pe"], inp["k_pe_u8"])
+
+    @parameterized.named_parameters(
+        ("decode_b16", 16, 1, 1024, 64),
+        ("prefill_b2_t128", 2, 128, 1024, 64),
+    )
+    def test_fused_pad_writes_the_same_cache(
+        self, num_seqs, tokens_per_seq, max_seq_len, num_pages
+    ):
+        """`TPU_KV_PACK_FUSED_PAD=1` pads inside the pack; the written cache
+        must be byte-identical to the default pack-then-pad path."""
+        inp = self._generate_inputs(num_seqs, tokens_per_seq, max_seq_len, num_pages)
+        for key, values in (("nope_sc", inp["kv_c_normed"]), ("rope_sc", inp["k_pe"])):
+            outs = []
+            for flag in ("0", "1"):
+                with mock.patch.dict(os.environ, {"TPU_KV_PACK_FUSED_PAD": flag}):
+                    outs.append(
+                        scatter.scatter(
+                            inp["caches"][key],
+                            values,
+                            inp["specs"][key],
+                            inp["seq_lens"],
+                            inp["block_tables"],
+                            inp["query_start_loc"],
+                        )
+                    )
+            np.testing.assert_array_equal(
+                np.asarray(outs[1]), np.asarray(outs[0]), err_msg=key
+            )
 
     def test_nope_sparsecore_is_byte_identical_to_tensorcore(self):
         """`pack_tokens` reproduces the TC sublane fold, so the two nope

@@ -15,6 +15,7 @@
 
 import jax
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.mla import kv_cache_utils, scatter_utils
 
 
@@ -62,6 +63,16 @@ def scatter(
         )
     if spec.layout is kv_cache_utils.KVCacheLayout.TENSORCORE:
         src = kv_cache_utils.as_token_bytes(values, spec.token_bytes)
+    elif envs.TPU_KV_PACK_FUSED_PAD:
+        # The SparseCore writer reads a whole number of descriptor blocks, so
+        # a 16-token decode step is padded to 32 rows. Pad here, inside the
+        # pack, so that one op produces the padded packed rows; scatter_rows
+        # then pads only `dst_rows`.
+        src = kv_cache_utils.pack_tokens(
+            values,
+            spec.token_bytes,
+            num_rows=scatter_utils.padded_num_tokens(values.shape[0]),
+        )
     else:
         src = kv_cache_utils.pack_tokens(values, spec.token_bytes)
     return scatter_utils.scatter_rows(

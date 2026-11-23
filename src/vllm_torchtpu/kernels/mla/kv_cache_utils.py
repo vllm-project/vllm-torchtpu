@@ -235,16 +235,38 @@ def as_token_bytes(values: jax.Array, token_bytes: int) -> jax.Array:
     return jnp.pad(u8, ((0, 0), (0, pad))) if pad else u8
 
 
-def pack_tokens(values: jax.Array, token_bytes: int) -> jax.Array:
-    """`[num_tokens, n]` -> `[num_tokens, token_bytes // WORD_BYTES]` uint32.
+def pack_tokens(
+    values: jax.Array, token_bytes: int, num_rows: int | None = None
+) -> jax.Array:
+    """`[num_tokens, n]` -> `[num_rows, token_bytes // WORD_BYTES]` uint32.
 
     Each word takes one byte from each of WORD_BYTES equal bands of the token,
     the same interleave `ref.bitcast(jnp.int32)` produces from uint8 rows.
+
+    Args:
+      values: `[num_tokens, n]` token data of any dtype, for example fp8
+        latents.
+      token_bytes: bytes reserved per token; must be a multiple of WORD_BYTES.
+      num_rows: number of output rows. `None` returns one row per token.
+        A larger value appends zero rows. The SparseCore writer needs its
+        input padded to its plan size (`scatter_utils.padded_num_tokens`), for
+        example 16 tokens to 32 rows. Padding here, before the byte
+        interleave, lets XLA produce the padded rows in the pack fusion,
+        instead of a separate pad op on the packed words. The pad is applied
+        to the uint8 view, never to `values`: on TPU a float8 pad or
+        concatenate can canonicalize NaN bytes. A zero byte packs to a zero
+        word, so the result is bit-identical to padding the packed output
+        with zeros.
+
+    Returns:
+      `[num_rows, token_bytes // WORD_BYTES]` uint32 words.
     """
     assert token_bytes % WORD_BYTES == 0, (
         f"token_bytes ({token_bytes}) must be a multiple of {WORD_BYTES}"
     )
     u8 = as_token_bytes(values, token_bytes)
+    if num_rows is not None and num_rows > u8.shape[0]:
+        u8 = jnp.pad(u8, ((0, num_rows - u8.shape[0]), (0, 0)))
     bands = u8.reshape(u8.shape[0], WORD_BYTES, token_bytes // WORD_BYTES).astype(
         jnp.uint32
     )

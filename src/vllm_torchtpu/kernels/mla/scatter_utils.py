@@ -142,6 +142,59 @@ def _scatter_kernel(
     )(dst_hbm_ref, src_words)
 
 
+def _sparse_core_plan(num_tokens: int) -> Plan:
+    """`split_plan` for this chip's SparseCore vector subcores."""
+    sc_info = pltpu.get_tpu_info().sparse_core
+    assert sc_info is not None, "SparseCore info is missing."
+    num_cores = sc_info.num_cores * sc_info.num_subcores
+    return split_plan(num_tokens, sc_info.num_lanes, num_cores)
+
+
+def padded_num_tokens(num_tokens: int) -> int:
+    """Rows that `scatter_rows` reads for a step of `num_tokens` tokens.
+
+    A caller that builds `src` itself can pad it to this size in the same op
+    that produces it. `scatter_rows` then pads only `dst_rows`, which is
+    layer-invariant within a step.
+    """
+    return _sparse_core_plan(num_tokens).total_tokens
+
+
+def pad_to_plan(
+    src: jax.Array, dst_rows: jax.Array, total_tokens: int
+) -> tuple[jax.Array, jax.Array]:
+    """Pads `src` with zero rows and `dst_rows` with SKIP_ROW to `total_tokens`.
+
+    The two inputs are padded independently, so `src` may already have
+    `total_tokens` rows (see `kv_cache_utils.pack_tokens(num_rows=...)`) while
+    `dst_rows` still has one entry per real token. A padded row is never
+    written, because its destination is SKIP_ROW.
+
+    Args:
+      src: `[n, row_width]` rows, where `n` is the real token count or
+        `total_tokens`.
+      dst_rows: `[num_tokens]` destination rows of the real tokens.
+      total_tokens: rows the scatter grid covers (`Plan.total_tokens`).
+
+    Returns:
+      `(src, dst_rows)`, both with `total_tokens` rows.
+    """
+    num_tokens = dst_rows.shape[0]
+    assert src.shape[0] in (num_tokens, total_tokens), (
+        f"src has {src.shape[0]} rows; expected {num_tokens} tokens or the"
+        f" padded {total_tokens}"
+    )
+    if total_tokens > num_tokens:
+        dst_rows = jnp.pad(
+            dst_rows,
+            (0, total_tokens - num_tokens),
+            constant_values=kv_cache_utils.SKIP_ROW,
+        )
+    if total_tokens > src.shape[0]:
+        src = jnp.pad(src, ((0, total_tokens - src.shape[0]), (0, 0)))
+    return src, dst_rows
+
+
 def scatter_rows(
     cache: jax.Array,
     src: jax.Array,
@@ -179,15 +232,10 @@ def scatter_rows(
 
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None, "SparseCore info is missing."
-    num_cores = sc_info.num_cores * sc_info.num_subcores
-    plan = split_plan(src.shape[0], sc_info.num_lanes, num_cores)
-
-    pad_tokens = plan.total_tokens - src.shape[0]
-    if pad_tokens > 0:
-        dst_rows = jnp.pad(
-            dst_rows, (0, pad_tokens), constant_values=kv_cache_utils.SKIP_ROW
-        )
-        src = jnp.pad(src, ((0, pad_tokens), (0, 0)))
+    # The plan is sized from the real token count (`dst_rows`), because `src`
+    # may arrive already padded to the plan size.
+    plan = _sparse_core_plan(dst_rows.shape[0])
+    src, dst_rows = pad_to_plan(src, dst_rows, plan.total_tokens)
 
     # A TC-tiled token is WORD_BYTES uint8 rows the kernel folds back into one.
     row_width = kv_cache_utils.TILE_LANE_BYTES if tc_tiled else src.shape[-1]
