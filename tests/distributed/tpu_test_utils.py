@@ -73,6 +73,7 @@ def run_in_isolated_process(
 def prepare_tpu_environment(world_size: int | None = None) -> None:
     """Prepare single-host TPU environment variables."""
     import torch
+    import torch_tpu  # noqa: F401
 
     torch.tpu.distributed.set_tpu_launch_env(nproc_per_node=world_size)
 
