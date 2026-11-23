@@ -55,13 +55,13 @@ QROWS = 32  # rows per quantization scale (int8 sublane tile)
 _MESH = pl.DeviceIdType.MESH
 _N = 8
 # Rows of the layout table.
-SIB, CW_NEXT, CW_PREV, POS, CORE = range(5)
+SIB, CW_NEXT, CW_PREV, POS, CORE, DIAG = range(6)
 
 
 def layout_table(devices: Sequence) -> np.ndarray:
-    """int32 [5, 8] over the mesh order: sibling core, clockwise ring next and
-    previous (same core index on the neighbouring chip), ring position and
-    core index. The chip ring is (x0,y0) -> (x1,y0) -> (x1,y1) -> (x0,y1)."""
+    """int32 [6, 8] over the mesh order: sibling core, clockwise ring next and
+    previous (same core index on the neighbouring chip), ring position, core
+    index, and the diagonal chip's same core. The chip ring is (x0,y0) -> (x1,y0) -> (x1,y1) -> (x0,y1)."""
     if len(devices) != _N:
         raise ValueError(f"qar_all_reduce needs 8 TensorCores, got {len(devices)}")
     devices = [_physical(d) for d in devices]
@@ -72,7 +72,7 @@ def layout_table(devices: Sequence) -> np.ndarray:
     ys = sorted({c[1] for c in chips})
     ring = [(xs[0], ys[0]), (xs[1], ys[0]), (xs[1], ys[1]), (xs[0], ys[1])]
     index = {(tuple(d.coords[:2]), d.core_on_chip): i for i, d in enumerate(devices)}
-    tab = np.zeros((5, _N), np.int32)
+    tab = np.zeros((6, _N), np.int32)
     for i, d in enumerate(devices):
         chip, core = tuple(d.coords[:2]), d.core_on_chip
         p = ring.index(chip)
@@ -81,6 +81,7 @@ def layout_table(devices: Sequence) -> np.ndarray:
         tab[CW_PREV, i] = index[(ring[(p - 1) % 4], core)]
         tab[POS, i] = p
         tab[CORE, i] = core
+        tab[DIAG, i] = index[(ring[(p + 2) % 4], core)]
     return tab
 
 
@@ -857,3 +858,169 @@ def all_reduce_v2(x: jax.Array, me: jax.Array, tab: np.ndarray) -> jax.Array:
     rank = me.reshape(1).astype(jnp.int32)
     full = _fused_call(t, h)(rank, jnp.asarray(tab), x)[0]
     return full[:rows]
+
+
+# --------------------------------------------------------------------------
+# v3: small all-reduces (T <= 512 rows). v2's 6 ring steps and 2 row halves
+# cost ~52 us of fixed latency, more than XLA's all-reduce below ~256 rows.
+# v3 keeps the d2d legs but replaces the ring by a one-shot scatter: each
+# chip's pair sum is quantized once per destination chunk and sent straight
+# to the chunk's owner (the diagonal chip is 2 hops, routed), the owner sums
+# the 4 contributions in f32, quantizes once and sends its chunk straight to
+# the 3 others. 4 serial transfers instead of 8. Whole working set in VMEM.
+V3_MAX_ROWS = 512
+_OFFS = ((1, CW_NEXT), (3, CW_PREV), (2, DIAG))  # (ring offset, table row)
+
+
+def all_reduce_v3_ref(x: jax.Array, me: jax.Array, tab: np.ndarray, exchange: Exchange) -> jax.Array:
+    """v3's algorithm with pluggable data movement (CPU reference)."""
+    rows, h = x.shape
+    hh = h // 2
+    w4 = hh // 4
+    t = padded_rows(rows)
+    if t != rows:
+        x = jnp.pad(x, ((0, t - rows), (0, 0)))
+    tab_j = jnp.asarray(tab)
+    me = me.reshape(()).astype(jnp.int32)
+    core, pos = tab_j[CORE, me], tab_j[POS, me]
+    mine = lax.dynamic_slice_in_dim(x, core * hh, hh, axis=1)
+    other = lax.dynamic_slice_in_dim(x, (1 - core) * hh, hh, axis=1)
+    (recv,) = exchange([other], [SIB])
+    part = mine.astype(F32) + recv.astype(F32)
+
+    def chunk(k):
+        return lax.dynamic_slice_in_dim(part, ((pos + k) % 4) * w4, w4, axis=1)
+
+    sends = []
+    for off, _ in _OFFS:
+        sends += list(quantize(chunk(off)))
+    got = exchange(sends, [r for _, r in _OFFS for _ in (0, 1)])
+    acc = chunk(0)
+    for j in range(3):
+        acc = acc + dequantize(got[2 * j], got[2 * j + 1])
+    q, s_ = quantize(acc)
+    ag = exchange([q, s_] * 3, [r for _, r in _OFFS for _ in (0, 1)])
+    half = jnp.zeros((t, hh), F32)
+    half = lax.dynamic_update_slice_in_dim(half, dequantize(q, s_), pos * w4, axis=1)
+    for j, (off, _) in enumerate(_OFFS):
+        # what arrived from offset `off` was sent by the chip at pos - off,
+        # which owns chunk pos - off
+        half = lax.dynamic_update_slice_in_dim(
+            half, dequantize(ag[2 * j], ag[2 * j + 1]), ((pos - off) % 4) * w4, axis=1)
+    half = half.astype(BF16)
+    (sib_half,) = exchange([half], [SIB])
+    full = jnp.zeros((t, h), BF16)
+    full = lax.dynamic_update_slice_in_dim(full, half, core * hh, axis=1)
+    full = lax.dynamic_update_slice_in_dim(full, sib_half, (1 - core) * hh, axis=1)
+    return full[:rows]
+
+
+@functools.cache
+def _v3_call(t: int, h: int):
+    hh, w4, sr = h // 2, h // 8, t // QROWS
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+
+    def kernel(rank_ref, tab_ref, x_ref, out_ref, rd2d, sq, ss, rq, rs, oq, os_, aq, as_,
+               d2d_s, d2d_r, sc_s, sc_r, ag_s, ag_r, fin_s, fin_r):
+        me = rank_ref[0]
+        core, pos, sib = tab_ref[CORE, me], tab_ref[POS, me], tab_ref[SIB, me]
+        peers = [tab_ref[row, me] for _, row in _OFFS]
+        barrier = pltpu.get_barrier_semaphore()
+        for d in range(_N):
+            pl.semaphore_signal(barrier, 1, device_id=(d,), device_id_type=_MESH)
+        pl.semaphore_wait(barrier, _N)
+
+        def remote(src, dst, ssem, rsem, dev):
+            return pltpu.make_async_remote_copy(src, dst, ssem, rsem, device_id=(dev,),
+                                                device_id_type=_MESH)
+
+        mine = pl.ds(pl.multiple_of(core * hh, 128), hh)
+        other = pl.ds(pl.multiple_of((1 - core) * hh, 128), hh)
+        sends = []
+        # 1. d2d reduce-scatter
+        c = remote(x_ref.at[:, other], rd2d, d2d_s.at[0], d2d_r.at[0], sib)
+        c.start()
+        sends.append(c)
+        c.wait_recv()
+
+        def part(k):  # f32 pair sum of chunk (pos + k) % 4 of this core's half
+            col = pl.multiple_of(lax.rem(pos + k, 4) * w4, 128)
+            return (x_ref[:, pl.ds(pl.multiple_of(core * hh + col, 128), w4)].astype(F32)
+                    + rd2d[:, pl.ds(col, w4)].astype(F32))
+
+        # 2. one-shot scatter of the 3 non-owned chunks
+        for j, (off, _) in enumerate(_OFFS):
+            sq[j], ss[j] = _quant_tile(part(off))
+            cq = remote(sq.at[j], rq.at[j], sc_s.at[2 * j], sc_r.at[2 * j], peers[j])
+            cs = remote(ss.at[j], rs.at[j], sc_s.at[2 * j + 1], sc_r.at[2 * j + 1], peers[j])
+            cq.start()
+            cs.start()
+            sends += [cq, cs]
+        # 3. owner: sum, quantize once, gather
+        acc = part(0)
+        for j in range(3):
+            remote(sq.at[j], rq.at[j], sc_s.at[2 * j], sc_r.at[2 * j], peers[j]).wait_recv()
+            remote(ss.at[j], rs.at[j], sc_s.at[2 * j + 1], sc_r.at[2 * j + 1], peers[j]).wait_recv()
+            acc = acc + _deq_tile(rq[j], rs[j])
+        oq[...], os_[...] = _quant_tile(acc)
+        for j in range(3):
+            cq = remote(oq, aq.at[j], ag_s.at[2 * j], ag_r.at[2 * j], peers[j])
+            cs = remote(os_, as_.at[j], ag_s.at[2 * j + 1], ag_r.at[2 * j + 1], peers[j])
+            cq.start()
+            cs.start()
+            sends += [cq, cs]
+        own = pl.multiple_of(core * hh + pos * w4, 128)
+        out_ref[:, pl.ds(own, w4)] = _deq_tile(oq[...], os_[...]).astype(BF16)
+        for j, (off, _) in enumerate(_OFFS):
+            remote(oq, aq.at[j], ag_s.at[2 * j], ag_r.at[2 * j], peers[j]).wait_recv()
+            remote(os_, as_.at[j], ag_s.at[2 * j + 1], ag_r.at[2 * j + 1], peers[j]).wait_recv()
+            col = pl.multiple_of(core * hh + lax.rem(pos - off + 4, 4) * w4, 128)
+            out_ref[:, pl.ds(col, w4)] = _deq_tile(aq[j], as_[j]).astype(BF16)
+        # 4. d2d all-gather of this core's half into the sibling's output
+        c = remote(out_ref.at[:, mine], out_ref.at[:, mine], fin_s.at[0], fin_r.at[0], sib)
+        c.start()
+        sends.append(c)
+        c.wait_recv()
+        for c in sends:
+            c.wait_send()
+
+    work = t * h * 2 * 2 + t * hh * 2 + 13 * t * w4 + 13 * sr * w4 * 4
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((t, h), BF16),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[vmem],
+            out_specs=vmem,
+            scratch_shapes=[
+                pltpu.VMEM((t, hh), BF16),                                   # rd2d
+                pltpu.VMEM((3, t, w4), I8), pltpu.VMEM((3, sr, w4), F32),    # scatter send
+                pltpu.VMEM((3, t, w4), I8), pltpu.VMEM((3, sr, w4), F32),    # scatter recv
+                pltpu.VMEM((t, w4), I8), pltpu.VMEM((sr, w4), F32),          # owned
+                pltpu.VMEM((3, t, w4), I8), pltpu.VMEM((3, sr, w4), F32),    # gather recv
+                pltpu.SemaphoreType.DMA((1,)), pltpu.SemaphoreType.DMA((1,)),
+                pltpu.SemaphoreType.DMA((6,)), pltpu.SemaphoreType.DMA((6,)),
+                pltpu.SemaphoreType.DMA((6,)), pltpu.SemaphoreType.DMA((6,)),
+                pltpu.SemaphoreType.DMA((1,)), pltpu.SemaphoreType.DMA((1,)),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=COLLECTIVE_ID, vmem_limit_bytes=int(work * 1.5) + (8 << 20)
+        ),
+        name=f"qar_small-t_{t}-h_{h}",
+    )
+
+
+def all_reduce_v3(x: jax.Array, me: jax.Array, tab: np.ndarray) -> jax.Array:
+    """v3 (TPU, VMEM-resident one-shot scatter) for rows <= V3_MAX_ROWS; bits are
+    all_reduce_v3_ref's."""
+    rows, h = x.shape
+    if h % (2 * 4 * 128):
+        raise ValueError(f"hidden {h} must split into 8 lane-aligned chunks")
+    t = padded_rows(rows)
+    if t > V3_MAX_ROWS:
+        raise ValueError(f"all_reduce_v3 takes <= {V3_MAX_ROWS} rows (padded {t})")
+    if t != rows:
+        x = jnp.pad(x, ((0, t - rows), (0, 0)))
+    rank = me.reshape(1).astype(jnp.int32)
+    return _v3_call(t, h)(rank, jnp.asarray(tab), x)[:rows]
