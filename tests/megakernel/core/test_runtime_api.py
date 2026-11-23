@@ -925,8 +925,8 @@ def test_checks_hlo_ir_warmup_and_sentinel():
             is_eager=False,
         )
 
-    # pool_schedule_info raises (`require_pool_backend`) without a cache_backend
-    with pytest.raises(ValueError, match="does not configure a cache_backend"):
+    # pool_schedule_info raises a named layout error without a cache_backend
+    with pytest.raises(mk.MegakernelLayoutError, match="has no pool backend layout"):
         pool_schedule_info(types.SimpleNamespace(name="kv", cache_backend=None))
 
 

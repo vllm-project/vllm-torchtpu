@@ -27,7 +27,7 @@ from jax.sharding import NamedSharding
 
 from .. import cache
 from ..cache_common import require_pool_backend
-from ..errors import MegakernelConfigError
+from ..errors import MegakernelConfigError, MegakernelLayoutError
 from ..exec_spec import ExecSpec
 from ..spec import ModelSpec
 from .constants import MTP_VERIFY_TOKENS
@@ -49,7 +49,13 @@ class PoolScheduleInfo:
 
 def pool_schedule_info(spec: ModelSpec) -> PoolScheduleInfo:
     """Extract `PoolScheduleInfo` from `spec.cache_backend`."""
-    pb = require_pool_backend(spec)
+    # A named layout decline (not require_pool_backend's ValueError), so the
+    # driver records a named layout decline instead of bind_error.
+    pb = spec.cache_backend
+    if pb is None:
+        raise MegakernelLayoutError(
+            f"MegakernelDriver: ModelSpec {spec.name!r} has no pool backend layout"
+        )
     lay = pb.layout
     rec, npools = pb.recurrent_slots_per_pool, pb.num_pools
     pps, spp = lay.pages_per_slot, lay.slots_per_pool
