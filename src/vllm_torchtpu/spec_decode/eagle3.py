@@ -1115,9 +1115,10 @@ class Eagle3Proposer:
         target_hidden_states: torch.Tensor,
         last_token_indices: torch.Tensor,
         num_rejected_np: np.ndarray | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """`(hidden carry, token 0, positions carry)` of draft step 0 from one MK call
-        (`mtp_fused_loop.build_mk_draft_step0`), trimmed to the chunk's p rows."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """`(hidden carry, token 0, positions carry, step-1 positions or None)` of draft
+        step 0 from one MK call (`mtp_fused_loop.build_mk_draft_step0`), trimmed to the
+        chunk's p rows (`_mk_step0_trim`)."""
         if self._mk_draft_step0 is None:
             from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mk_draft_step0
 
@@ -1148,7 +1149,7 @@ class Eagle3Proposer:
             num_tokens_padded=input_ids.shape[0],
         )
         rows = last_token_indices.shape[0]
-        draft_rows = self._padded_draft_rows(last_token_indices, self._draft_rows_len(chunk))
+        draft_rows = self._mk_step0_draft_rows(chunk, last_token_indices)
         num_tokens = input_ids.shape[0]
         with (
             set_model_tag("eagle_head"),
@@ -1168,11 +1169,58 @@ class Eagle3Proposer:
                 # the repeat rewrites the same draft K/V rows.
                 self._mk_draft_step0(input_ids, positions, target_hidden_states, draft_rows)
                 self._mk_draft_step0_warm = True
-            carry, token, pos = self._mk_draft_step0(
-                input_ids, positions, target_hidden_states, draft_rows
-            )
-        # draft_rows is the chunk's request capacity, >= p: plain row slices.
-        return self._fit_draft_rows_output(carry, rows), token[:rows], pos[..., :rows]
+            out = self._mk_draft_step0(input_ids, positions, target_hidden_states, draft_rows)
+        return self._mk_step0_trim(out, rows)
+
+    @staticmethod
+    def _loop_step1_positions(
+        positions_next: torch.Tensor | None,
+        positions_carry: torch.Tensor,
+        loop_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """The fused loop's step-1 positions: MK step 0's `positions + 1` output
+        (VLLM_TPU_MK_DRAFT_ROWS_FRESH) when the carry reached the loop unpadded,
+        else the eager add."""
+        if positions_next is not None and positions_carry is loop_positions:
+            return positions_next
+        return loop_positions + 1
+
+    def _mk_step0_draft_rows(
+        self, chunk: DraftChunkInputs, last_token_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """MK draft step 0's [capacity] `draft_rows`. VLLM_TPU_MK_DRAFT_ROWS_FRESH: the
+        seed program's (DRAFT_SEED_EXTRAS, as the stock step 0 takes it), else
+        last_token_indices itself when it is already capacity long; the padded slice
+        (a view torch_tpu materializes with its own program) only otherwise."""
+        num_rows = self._draft_rows_len(chunk)
+        if envs.VLLM_TPU_MK_DRAFT_ROWS_FRESH:
+            extras = self._seed_extras.get(id(chunk))
+            if extras is not None:
+                return extras[0]
+            if last_token_indices.shape[0] == num_rows:
+                return last_token_indices
+        return self._padded_draft_rows(last_token_indices, num_rows)
+
+    @staticmethod
+    def _mk_step0_trim(
+        out: tuple[torch.Tensor, ...], rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """`(hidden carry, token 0, positions carry, step-1 positions or None)` at the
+        chunk's p rows from MK step 0's [capacity] outputs (capacity >= p).
+
+        VLLM_TPU_MK_DRAFT_ROWS_FRESH (step 0 also returned positions + 1): at
+        p == capacity the outputs are handed on as they are -- no slice op at all,
+        since even a full-length [:rows] view costs an execute_as_strided program. At
+        p < capacity the slices stay (one eager program, as before) and the step-1
+        positions are left to the caller's add (None)."""
+        carry, token, pos = out[:3]
+        if len(out) == 4 and carry.shape[0] == rows:
+            return carry, token, pos, out[3]
+        # Plain row slices (draft_rows is the chunk's request capacity, >= p).
+        return (
+            Eagle3Proposer._fit_draft_rows_output(carry, rows), token[:rows],
+            pos[..., :rows], None,
+        )
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
@@ -1859,6 +1907,9 @@ class Eagle3Proposer:
         # num_reqs only once at the end.
         hidden_carry_per_chunk = []
         positions_carry_per_chunk = []
+        # VLLM_TPU_MK_DRAFT_ROWS_FRESH: the fused loop's step-1 positions straight
+        # from MK step 0 (chunk id -> [p] tensor), when its carry needs no trim.
+        positions_next_per_chunk: dict[int, torch.Tensor | None] = {}
         rejected_per_chunk = []
         # The same counts as host arrays for the draft metadata builds; None
         # when async, where they stay on device.
@@ -1917,7 +1968,7 @@ class Eagle3Proposer:
             self._mk_draft_count("mk_draft_step0" if mk0 else "stock_step0")
             if mk0:
                 # VLLM_TPU_MK_DRAFT: step 0 + carry + token 0 as one kernel call.
-                hidden_carry, fused_token0, positions_carry = _mk_program(
+                hidden_carry, fused_token0, positions_carry, positions_next = _mk_program(
                     self._run_mk_draft_step0, "step-0 program"
                 )(
                     chunk, input_ids, positions, target_hidden_states, last_token_indices,
@@ -1926,6 +1977,7 @@ class Eagle3Proposer:
                 host_phases.mark("dp_carries")
                 hidden_carry_per_chunk.append(hidden_carry)
                 positions_carry_per_chunk.append(positions_carry)
+                positions_next_per_chunk[id(chunk)] = positions_next
                 draft_tokens_per_chunk.append([fused_token0])
                 continue
             capacity_rows = (
@@ -2220,7 +2272,11 @@ class Eagle3Proposer:
                     fused = self._run_mtp_fused_loop(
                         chunk=chunk,
                         input_ids=draft_tokens_per_chunk[ci][-1],
-                        positions=loop_positions[ci] + 1,
+                        positions=self._loop_step1_positions(
+                            positions_next_per_chunk.get(id(chunk)),
+                            positions_carry_per_chunk[ci],
+                            loop_positions[ci],
+                        ),
                         hidden_states=loop_hidden[ci],
                         num_rejected_np=rejected_np_per_chunk[ci],
                         num_rejected_dev=rejected_dev_per_chunk[ci],
