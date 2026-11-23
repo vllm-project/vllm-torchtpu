@@ -32,7 +32,13 @@ from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
     config as pcp_config,
 )
-from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, config, tiling, wrapper
+from vllm_torchtpu.kernels.gdn.v3 import (
+    compute_gdn,
+    config,
+    tiling,
+    triangular_solve,
+    wrapper,
+)
 
 
 def _l2_normalize(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
@@ -437,13 +443,13 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
         from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
             compute_gdn as pcp_compute_gdn,
         )
-        from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, compute_kda
+        from vllm_torchtpu.kernels.gdn.v3 import compute_kda
 
         strict = jnp.tril(jnp.ones((2, 128, 128), dtype=jnp.float32), k=-1)
         rhs = jnp.ones((2, 128, 128), dtype=jnp.float32)
 
         for fork_name, mod in (
-            ("v3", compute_gdn),
+            ("v3", triangular_solve),
             ("gdn_pcp_fused", pcp_compute_gdn),
         ):
             with self.subTest(fork=fork_name):
@@ -576,7 +582,6 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
     def test_solve_triangular_rhs_block_sizes_agree(self):
         """Every block size solves the same triangular system identically,
         so changing 24 heads from B=4 to B=8 only changes the schedule."""
-        from vllm_torchtpu.kernels.gdn.v3 import compute_gdn
 
         rng = jax.random.key(7)
         # Unit lower-triangular, as the chunked solve produces.
@@ -589,7 +594,7 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
             reference = jnp.linalg.inv(t)
             for block_size in (16, 8, 5, 4, 2):
                 with self.subTest(block_size=block_size):
-                    inv = compute_gdn.solve_triangular_rhs(
+                    inv = triangular_solve.solve_triangular_rhs(
                         strict, eye, block_size=block_size
                     )
                     np.testing.assert_allclose(inv, reference, rtol=1e-4, atol=1e-4)
@@ -1104,7 +1109,7 @@ class GDNChunkedComputeTest(parameterized.TestCase):
         rhs = jax.random.normal(k1, (num_heads, chunk, d_v), dtype=jnp.float32)
 
         with jax.default_matmul_precision("float32"):
-            solved = compute_gdn.solve_triangular_rhs(
+            solved = triangular_solve.solve_triangular_rhs(
                 strict_lower, rhs, block_size=block_size
             )
             ref = jnp.linalg.solve(t, rhs)

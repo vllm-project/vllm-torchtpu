@@ -16,7 +16,7 @@
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.kernels.gdn.v3 import config
+from vllm_torchtpu.kernels.gdn.v3 import config, triangular_solve
 
 
 def l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
@@ -34,64 +34,6 @@ def get_mask_dtype(dtype: jnp.dtype) -> jnp.dtype:
             return jnp.int16
         case _:
             raise ValueError(f"Unsupported dtype: {dtype}")
-
-
-def solve_triangular_rhs(
-    strict_lower: jax.Array, rhs: jax.Array, block_size: int
-) -> jax.Array:
-    """Solves the unit lower-triangular system (I + L) @ x = rhs in blocks.
-
-    Args:
-        strict_lower: L, the strictly lower-triangular part of the system
-            matrix, [num_heads, chunk, chunk]. Its diagonal and upper triangle
-            must be zero; the unit diagonal is implicit.
-        rhs: Right-hand side [num_heads, chunk, n].
-        block_size: Diagonal block size B. Blocks are solved in order; each
-            block first removes the coupling to the already-solved rows with
-            one matmul and then runs a dense in-block forward substitution.
-
-    Returns:
-        x with the dtype of `strict_lower`.
-    """
-    out_dtype = strict_lower.dtype
-    chunk = strict_lower.shape[-1]
-    block_size = min(block_size, chunk)
-    num_blocks = (chunk + block_size - 1) // block_size
-    rhs_f32 = rhs.astype(jnp.float32)
-
-    def local_forward_sub(l_block: jax.Array, b_block: jax.Array) -> jax.Array:
-        # Column-oriented (right-looking) substitution over the whole dense
-        # [num_heads, B, n] block: after step j, row j is final and the rows
-        # below it have column j's contribution removed. Rows <= j are
-        # untouched because their coefficient in the strictly lower block is
-        # zero, so each step is one multiply-subtract over B rows held densely
-        # in sublanes. A row-by-row chain costs one vreg op per head per
-        # (row, column) pair instead, which made the solve VALU-bound at 8-
-        # and 16-row blocks (few V heads per core).
-        x = b_block
-        for j in range(l_block.shape[1] - 1):
-            x = x - l_block[:, :, j : j + 1] * x[:, j : j + 1, :]
-        return x
-
-    x_blocks = []
-    for i in range(num_blocks):
-        start = i * block_size
-        end = min((i + 1) * block_size, chunk)
-        target_b = rhs_f32[:, start:end, :]
-        if i > 0:
-            solved_x = jnp.concatenate(x_blocks, axis=1)
-            prev_sum = jax.lax.dot(
-                strict_lower[:, start:end, :start],
-                solved_x,
-                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
-                preferred_element_type=jnp.float32,
-            )
-            target_b = target_b - prev_sum
-
-        l_block = strict_lower[:, start:end, start:end].astype(jnp.float32)
-        x_blocks.append(local_forward_sub(l_block, target_b).astype(out_dtype))
-
-    return jnp.concatenate(x_blocks, axis=1)
 
 
 def fused_transpose_broadcast(x: jax.Array, src_dim: int, dst_dim: int) -> jax.Array:
@@ -236,7 +178,7 @@ def chunked_gdn_per_seq(
     # [num_v_heads, chunk, v_head_dim]
     v_diff = v_large - k_state * gating_forward
     u_ws = (
-        solve_triangular_rhs(
+        triangular_solve.solve_triangular_rhs(
             gating_beta_k_k_t, v_diff, block_size=cfg.triangular_block_size
         )
         * beta_large
