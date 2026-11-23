@@ -2642,9 +2642,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # shape, warmed) and keep returning the [:num_reqs] view. Same values in
     # every slot a reader sees; the TPU sampler reads none of these tensors.
     "VLLM_TPU_SAMPLING_COPIES_WHOLE": env_bool("VLLM_TPU_SAMPLING_COPIES_WHOLE"),
-    # With VLLM_TPU_VERIFY_ONE_DRAW (and VERIFY_FUSED_READ_OFFSETS off): the
-    # post-verify mamba read-offset scatter runs inside the verify program
-    # (one program instead of two). Same values.
+    # With VLLM_TPU_VERIFY_ONE_DRAW: the post-verify mamba read-offset scatter
+    # runs inside the verify program (one program instead of two, or instead
+    # of VERIFY_FUSED_READ_OFFSETS' eager scatter when that is on too). Same
+    # values. Compiled after the spec-decode warmup at every verify bucket x
+    # slot-group layout x width; a step whose key was not compiled keeps the
+    # other path and logs one WARNING per key ("VERIFY_RO_INGRAPH: key ...").
     "VLLM_TPU_VERIFY_RO_INGRAPH": env_bool("VLLM_TPU_VERIFY_RO_INGRAPH"),
     # With VLLM_TPU_VERIFY_FUSED: compute the mamba read offsets inside the
     # fused verify program and apply them with one eager scatter.
