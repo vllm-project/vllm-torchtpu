@@ -215,8 +215,9 @@ def finalize(layer: Any, ep_w13_scale: torch.Tensor) -> None:
     del w13, s13k, w2, s2k
     layer.register_buffer("_tpd_w", w, persistent=False)
     layer.register_buffer("_tpd_s", s, persistent=False)
-    st["raw"] = {}
-    st["seen"] = None
+    # Traced code reads only the buffers and plain ints, never the load-time state.
+    layer._tpd = None
+    layer._tpd_fs = int(i_s)
     nbytes = sum(int(t.numel()) * t.element_size() for t in (w, s))
     _STATS["layers"] += 1
     _STATS["bytes"] += nbytes
@@ -250,7 +251,7 @@ def _pack_op():
 
 
 def active(layer: Any) -> bool:
-    return getattr(layer, "_tpd", None) is not None and hasattr(layer, "_tpd_w")
+    return hasattr(layer, "_tpd_w")
 
 
 # --------------------------------------------------------------------------- traced
@@ -322,8 +323,7 @@ def get_op(*, topk: int, fs: int, activation: str = "silu"):
 
 def fused_moe(layer: Any, kwargs: dict, logical_ids: torch.Tensor) -> torch.Tensor:
     """Torch side: the EP fused-MoE call of nvfp4 apply, plus the TP copy."""
-    op = get_op(topk=kwargs["topk"], fs=layer._tpd["I"] // layer._tpd["ep"],
-                activation=kwargs["activation"])
+    op = get_op(topk=kwargs["topk"], fs=layer._tpd_fs, activation=kwargs["activation"])
     return op(kwargs["hidden_states"], kwargs["w1"], kwargs["w2"], kwargs["w1_scale"],
               kwargs["w2_scale"], kwargs["topk_weights"], kwargs["topk_ids"],
               kwargs["experts_start"], logical_ids.to(torch.int32), layer._tpd_w,
