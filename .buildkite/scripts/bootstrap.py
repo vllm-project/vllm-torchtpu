@@ -21,6 +21,8 @@ CLI entry points (compatible with Python 3.10+ stdlib on `queue=cpu`):
 - `bootstrap.py vllm-pin`: print the pinned upstream vLLM ref from `pyproject.toml`.
 - `bootstrap.py verified-key-prefix`: print the key prefix of the TPU generation whose
   nightly tests-lane steps a verified commit pair needs passed.
+- `bootstrap.py tpu-shapes <generation>`: print a TPU generation's single- and
+  multi-chip pod shapes, space-separated (upload_models_and_features.sh).
 """
 
 from __future__ import annotations
@@ -1443,7 +1445,7 @@ def run_bootstrap_dev(
 
 _USAGE = (
     "Usage: bootstrap.py [dev | vllm-pin | verified-key-prefix | "
-    "upload-stages <stage> [<stage> ...]]"
+    "tpu-shapes <generation> | upload-stages <stage> [<stage> ...]]"
 )
 
 
@@ -1464,6 +1466,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             rc = 0
         elif args == ["verified-key-prefix"]:
             print(tpu_generations.VERIFIED_TPU_GENERATION.key_prefix)
+            rc = 0
+        elif args[:1] == ["tpu-shapes"] and len(args) == 2:
+            by_name = tpu_generations.TPU_GENERATIONS_BY_NAME
+            gen = by_name.get(args[1])
+            if gen is None:
+                raise BootstrapError(
+                    f"ERROR: unknown TPU generation '{args[1]}'; "
+                    f"known: {' '.join(sorted(by_name))}"
+                )
+            print(gen.shape_single, gen.shape_multi)
             rc = 0
         elif args[:1] == ["upload-stages"]:
             stages = tuple(_split_labels(arg) for arg in args[1:])

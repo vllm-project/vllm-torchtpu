@@ -56,9 +56,10 @@ class TpuGeneration:
         }
 
 
-# upload_models_and_features.sh keeps its own copy of these shapes, for the
-# nightly model and feature tests; test_tpu_generations.py checks they agree.
-# TODO: make that script read them from here (a bootstrap.py subcommand).
+# Each generation's shapes are kept here alone: upload_models_and_features.sh
+# reads them for the nightly model and feature tests (`bootstrap.py tpu-shapes
+# <name>`), and pipeline_tests.yml's defaults, for an upload of that file on its
+# own, are v7x's; test_tpu_generations.py checks both.
 TPU_V7X = TpuGeneration(
     name="v7x",
     shape_single="tpu7x-standard-1t/1x1x1",
@@ -69,6 +70,9 @@ TPU_V6E = TpuGeneration(
     shape_single="ct6e-standard-1t/1x1",
     shape_multi="ct6e-standard-8t/2x4",
 )
+TPU_GENERATIONS_BY_NAME: Mapping[str, TpuGeneration] = {
+    gen.name: gen for gen in (TPU_V6E, TPU_V7X)
+}
 # Pipeline files uploaded once per TPU generation in the listed order (last
 # shows/queues first in Buildkite). Files not listed here are uploaded once.
 TPU_GENERATION_FILES: Mapping[str, tuple[TpuGeneration, ...]] = {

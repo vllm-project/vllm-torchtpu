@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib
 import pathlib
 import re
+import subprocess
 import sys
 import unittest
 from typing import Any
@@ -122,23 +123,53 @@ class TestTpuGenerations(unittest.TestCase):
             with self.subTest(step=step), self.assertRaises(ValueError):
                 gens.stamp_tpu_generation([step], v6e)
 
-    def test_shapes_agree_with_the_nightly_model_uploads(self) -> None:
-        # upload_models_and_features.sh keeps its own copy of each generation's
-        # shapes (see the TODO in tpu_generations.py). Until it reads them from
-        # there, the two must agree.
+    def test_nightly_model_uploads_read_the_shapes_from_here(self) -> None:
+        # upload_models_and_features.sh keeps no copy of the shapes: it asks
+        # `bootstrap.py tpu-shapes` for each generation's, and uses them in that
+        # generation's own upload.
         script = (_SCRIPTS_DIR / "upload_models_and_features.sh").read_text(
             encoding="utf-8"
         )
-        single, multi = (
-            re.findall(rf'^\s*export MODEL_SHAPE_{kind}="(.+)"$', script, re.M)
-            for kind in ("SINGLE", "MULTI")
+        self.assertNotRegex(script, r"MODEL_SHAPE_\w+=")
+        bootstrap = str(_SCRIPTS_DIR / "bootstrap.py")
+        for name, gen in self.gens.TPU_GENERATIONS_BY_NAME.items():
+            with self.subTest(gen=name):
+                var = f"{name.upper()}_SHAPES"
+                self.assertIn(
+                    f'{var}="$(python3 "${{SCRIPTS}}/bootstrap.py" tpu-shapes {name})"',
+                    script,
+                )
+                upload = script.split(f"Uploading TPU {name} Pipeline Group")[1]
+                upload = upload.split("--- Uploading")[0]
+                self.assertIn(
+                    f'read -r MODEL_SHAPE_SINGLE MODEL_SHAPE_MULTI <<< "${{{var}}}"',
+                    upload,
+                )
+                printed = subprocess.run(
+                    [sys.executable, bootstrap, "tpu-shapes", name],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+                self.assertEqual(printed.split(), [gen.shape_single, gen.shape_multi])
+        unknown = subprocess.run(
+            [sys.executable, bootstrap, "tpu-shapes", "v5e"],
+            capture_output=True,
+            text=True,
         )
-        generations = {
-            gen for listed in self.gens.TPU_GENERATION_FILES.values() for gen in listed
-        }
+        self.assertEqual(unknown.returncode, 1)
+        self.assertIn("unknown TPU generation 'v5e'", unknown.stderr)
+
+    def test_tests_lane_defaults_are_v7x_shapes(self) -> None:
+        # pipeline_tests.yml's shapes for an upload of the file on its own.
+        yml = (_SCRIPTS_DIR.parent / "pipeline_tests.yml").read_text(encoding="utf-8")
+        v7x = self.gens.TPU_V7X
         self.assertEqual(
-            set(zip(single, multi, strict=True)),
-            {(gen.shape_single, gen.shape_multi) for gen in generations},
+            dict(re.findall(r"\$\{(KUBE_SHAPE_\w+):-([^}]+)\}", yml)),
+            {
+                "KUBE_SHAPE_SINGLE": v7x.shape_single,
+                "KUBE_SHAPE_MULTI": v7x.shape_multi,
+            },
         )
 
 
