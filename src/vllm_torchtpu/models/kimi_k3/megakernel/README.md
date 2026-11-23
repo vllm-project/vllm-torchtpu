@@ -28,7 +28,7 @@ and it changes no existing model, runner, or scheduler path.
 | Path | What it holds | RFC #2595 row | Stack PR |
 | --- | --- | --- | --- |
 | `config.py`, `layout.py` | kernel config, cache layout | B4 | 1/6 |
-| `common/` | 32-rank collectives, VMEM pool, memref reinterpret hook | A1 | 1/6 |
+| `common/` | 32-rank collectives, constants, protocols, stdlib path helpers, VMEM pool, memref reinterpret hook | A1 | 1/6 |
 | `runtime_shim/` | backend capabilities, torch bridge, compile and export cache | B1 | 1/6 |
 | `kernels/decode_megakernel.py`, `kernels/mla_dcp.py`, `kernels/paged.py`, `kernels/load.py` | decode megakernel, DCP MLA attention, paged serving step, weight layout | A1, A4 | 2/6 |
 | `kernels/prefill_megakernel.py`, `kernels/prefill_moe/`, `kernels/helpers.py` | sequence-parallel prefill kernels and prefill MoE | A2 | 3/6 |
@@ -71,7 +71,7 @@ separate PRs.
 
 | Shim module / option | Shared `megakernel/` replacement | Removal phase |
 | --- | --- | --- |
-| `runtime_shim/program.py` (`MegakernelProgram`, `Capabilities`) | `megakernel/core/runtime/contract.py` (`MonoProgram`, `TpuMonoSpec`) | Phase 2 (RFC B1 / C1) |
+| `runtime_shim/program.py` (`Capabilities`, `StepOutput`) | `megakernel/core/runtime/contract.py` (`MonoProgram`, `TpuMonoSpec`) | Phase 2 (RFC B1 / C1) |
 | `runtime_shim/backend.py` (`role`, `--model-loader-extra-config`) | `megakernel/adapter/config.py` (`collect_config`, `additional_config["megakernel"]`) | Phase 2 (RFC C1 / C2) |
 | `runtime_shim/config.py` (`MegakernelEngineConfig`) | `megakernel/adapter/plugin.py` (`RunnerView`) | Phase 2 (RFC C1) |
 | `runtime_shim/layout.py` (`KVLayout`) | `megakernel/core/pool/layout.py` (`PoolLayout`, once extended with bf16 256-token / fp8 512-token pages, fp32 recurrent state, and draft-ring region support) | Phase 1 (RFC D1, before runner C1 binds pools) |

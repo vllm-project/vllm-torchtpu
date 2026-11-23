@@ -15,8 +15,9 @@
 # Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/kimi_k3/prefill.py
 """Kimi-K3 prefill: the sequence-parallel prefill stack over vLLM's unified pools.
 
-:class:`KimiPrefiller` (the prefill role's :class:`MegakernelProgram`) computes
-every scheduled prompt chunk into vLLM's unified pools for the KV connector:
+:class:`KimiPrefiller` (implementing the prefill program interface in
+``runtime_shim.program``) computes every scheduled prompt chunk into vLLM's
+unified pools for the KV connector:
 
 * **Windows.** A step's rows are cut into pieces of at most the largest window
   (:func:`plan_pieces`); the i-th pieces of all rows are packed, up to
@@ -1164,8 +1165,11 @@ class _Request:
 
 
 class KimiPrefiller:
-    """The prefill role's program (:class:`MegakernelProgram`; see the module
-    docstring)."""
+    """Sequence-parallel prefill program over vLLM unified KV pools.
+
+    Implements the prefill program interface defined by
+    ``runtime_shim.program`` (see the module docstring).
+    """
 
     def __init__(
         self,

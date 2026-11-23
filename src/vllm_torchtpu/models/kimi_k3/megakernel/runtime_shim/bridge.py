@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/bridge.py
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# src/vllm_torchtpu/megakernel/bridge.py
 """Running JAX/Pallas megakernels as torch ops inside vLLM's workers.
 
 A megakernel is a pure JAX/Pallas SPMD program over every device; each worker
@@ -35,57 +36,99 @@ No vLLM dependencies: the standalone tools use this module as serving does.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import inspect
 import threading
 import time
-from collections.abc import Callable, Sequence
-from typing import Any
+import types
+from collections.abc import Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, Unpack, cast, overload
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import torch
 from jax._src.pallas import core as pallas_core
-from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from torch_tpu._internal.distributed import tpu_distributed
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import export_cache
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
-    get_active_kernel_config,
-)
+from vllm_torchtpu.megakernel.core.collectives.spmd import mesh_axis_index
+
+from ..common.constants import GIB_BYTES
+from . import export_cache
+from .config import get_active_kernel_config
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator
+
+type RegisteredOp = Callable[..., tuple[torch.Tensor, ...]]
+"""Torch custom op handle returned by register_op."""
+
+type _LegacyRegisteredOp = Any
+"""Transitional return handle for tuple-spec register_op callers."""
+
+type _PallasSpec = tuple[str, ...]
+"""Positional axis-name tuple accepted by ``torch_tpu`` Pallas type stubs."""
+
 
 logger = init_logger(__name__)
 
 _MESH: dict[str, tuple[Mesh, int]] = {}
 _STOCK_AXIS_INDEX = jax.lax.axis_index
+
+
+@dataclasses.dataclass
+class _AxisIndexState:
+    """Tracks nesting depth for :func:`spmd_safe_axis_index`."""
+
+    depth: int = 0
+
+
 _AXIS_INDEX_LOCK = threading.Lock()
-_AXIS_INDEX_DEPTH = 0
+_AXIS_INDEX_STATE = _AxisIndexState()
 
 
 def kernel_mesh(axis: str, world_size: int | None = None) -> tuple[Mesh, int]:
-    """The mesh the ops run on (all devices in ascending id, on one axis
-    named ``axis``) and this worker's position in it: its kernel rank, which
-    need not be its vLLM TP rank. ``world_size``: the device count the
-    program needs."""
+    """Return the global device mesh on ``axis`` and this worker's kernel rank.
+
+    The returned position is this worker's kernel rank, which need not be its
+    vLLM TP rank.
+
+    Args:
+        axis: Mesh axis name (for example ``"tp"``).
+        world_size: Expected total TPU device count, if enforced.
+
+    Returns:
+        Pair of ``(mesh, position)`` for the calling worker.
+
+    Raises:
+        RuntimeError: If visible devices do not match ``world_size`` or fail to
+            include the worker's global device ID.
+    """
     if axis in _MESH:
-        return _MESH[axis]
-    devices = sorted(jax.devices(), key=lambda d: int(d.id))
+        cached_mesh, cached_position = _MESH[axis]
+        if world_size is not None and cached_mesh.size != world_size:
+            msg = (
+                f"the megakernel needs all {world_size} TPU devices visible to "
+                f"every worker; cached mesh '{axis}' has {cached_mesh.size}"
+            )
+            raise RuntimeError(msg)
+        return cached_mesh, cached_position
+    devices = sorted(jax.devices(), key=lambda dev: int(dev.id))
     if world_size is not None and len(devices) != world_size:
-        raise RuntimeError(
+        msg = (
             f"the megakernel needs all {world_size} TPU devices visible to "
             f"every worker; this worker sees {len(devices)}"
         )
-    from torch_tpu._internal.distributed import tpu_distributed
+        raise RuntimeError(msg)
 
     device_id = int(tpu_distributed.global_device_id())
-    ids = [int(d.id) for d in devices]
+    ids = [int(dev.id) for dev in devices]
     if device_id not in ids:
-        raise RuntimeError(
-            f"worker device {device_id} is not among the JAX devices {ids}"
-        )
+        msg = f"worker device {device_id} is not among the JAX devices {ids}"
+        raise RuntimeError(msg)
     position = ids.index(device_id)
     _MESH[axis] = (Mesh(np.asarray(devices), axis_names=(axis,)), position)
     if position == 0:
@@ -94,16 +137,29 @@ def kernel_mesh(axis: str, world_size: int | None = None) -> tuple[Mesh, int]:
 
 
 @contextlib.contextmanager
-def spmd_safe_axis_index():
+def spmd_safe_axis_index() -> Iterator[None]:
     """Route XLA-level ``jax.lax.axis_index`` through Pallas while active.
 
     Outside a Pallas body ``axis_index`` lowers to an HLO ``partition-id``,
-    which torch_tpu's SPMD partitioner rejects; such calls become a one-scalar
-    Pallas kernel reading the device's position on the axis. Calls inside a
-    Pallas kernel keep the stock primitive.
+    which torch_tpu's SPMD partitioner rejects; string axis calls delegate to
+    shared ``mesh_axis_index`` (a one-scalar Pallas kernel), and non-string
+    axis names raise ``TypeError``. Calls inside a Pallas kernel keep the
+    standard primitive.
+
+    Yields:
+        Control to the caller with ``jax.lax.axis_index`` patched.
     """
 
-    def axis_index(axis_name):
+    def axis_index(axis_name: object) -> jax.Array:
+        """Read ``axis_name`` coordinate via scalar Pallas call when outside a grid.
+
+        Args:
+            axis_name: Mesh axis name passed to ``jax.lax.axis_index``.
+
+        Returns:
+            Scalar int32 ``jax.Array`` holding this device's coordinate on
+            ``axis_name``.
+        """
         # A Pallas kernel body is being traced (``tracing_grid_env`` sets
         # ``grid_context``; ``core_map`` kernels too) or lowered/interpreted
         # (``grid_env`` pushes the stack).
@@ -112,70 +168,142 @@ def spmd_safe_axis_index():
             or pallas_core.current_grid_env() is not None
         ):
             return _STOCK_AXIS_INDEX(axis_name)
+        if not isinstance(axis_name, str):
+            msg = (
+                "spmd_safe_axis_index requires a str axis name outside a "
+                f"Pallas kernel, got {axis_name!r}"
+            )
+            raise TypeError(msg)
+        return mesh_axis_index(axis_name)
 
-        def kernel(out_ref):
-            out_ref[0] = _STOCK_AXIS_INDEX(axis_name).astype(jnp.int32)
-
-        return pl.pallas_call(
-            kernel,
-            out_shape=jax.ShapeDtypeStruct((1,), jnp.int32),
-            out_specs=pl.BlockSpec(memory_space=pltpu.SMEM),
-            name="spmd_safe_axis_index",
-        )()[0]
-
-    global _AXIS_INDEX_DEPTH
     with _AXIS_INDEX_LOCK:
-        if _AXIS_INDEX_DEPTH == 0:
+        if _AXIS_INDEX_STATE.depth == 0:
             jax.lax.axis_index = axis_index
-        _AXIS_INDEX_DEPTH += 1
+        _AXIS_INDEX_STATE.depth += 1
     try:
         yield
     finally:
         with _AXIS_INDEX_LOCK:
-            _AXIS_INDEX_DEPTH -= 1
-            if _AXIS_INDEX_DEPTH == 0:
+            _AXIS_INDEX_STATE.depth -= 1
+            if _AXIS_INDEX_STATE.depth == 0:
                 jax.lax.axis_index = _STOCK_AXIS_INDEX
 
 
 def _keyed_on_kernel_config(export_key: str | None) -> str | None:
-    """``export_key`` with the active kernel config's key: its settings are
-    baked into every trace."""
+    """Append the active kernel config digest to ``export_key``.
+
+    Its settings are baked into every trace.
+
+    Args:
+        export_key: Base export cache key, or ``None`` if caching is disabled.
+
+    Returns:
+        Composite export cache key including the active kernel config digest.
+    """
     config = get_active_kernel_config()
     if export_key is None or config is None:
         return export_key
     return f"{export_key}|config={config.key()}"
 
 
+def _validate_partition_specs(in_specs: object, out_specs: object) -> None:
+    """Validate that ``in_specs`` and ``out_specs`` hold ``PartitionSpec`` entries.
+
+    Args:
+        in_specs: Positional input sharding sequence.
+        out_specs: Output sharding sequence.
+
+    Raises:
+        TypeError: If ``in_specs`` or ``out_specs`` is a bare ``PartitionSpec``, is
+            not a ``Sequence``, or contains a non-``PartitionSpec`` entry.
+        ValueError: If any entry in ``in_specs`` or ``out_specs`` is ``None``.
+    """
+    if isinstance(in_specs, PartitionSpec) or isinstance(out_specs, PartitionSpec):
+        msg = "partition specs must be a sequence, not a bare PartitionSpec."
+        raise TypeError(msg)
+    if not isinstance(in_specs, Sequence) or not isinstance(out_specs, Sequence):
+        msg = "partition specs must be a sequence of PartitionSpec instances."
+        raise TypeError(msg)
+    entries = (*in_specs, *out_specs)
+    if any(entry is None for entry in entries):
+        msg = (
+            "partition spec entries cannot be None; "
+            "pass PartitionSpec() for replicated tensors"
+        )
+        raise ValueError(msg)
+    if not all(isinstance(entry, PartitionSpec) for entry in entries):
+        msg = "partition spec entries must be PartitionSpec instances."
+        raise TypeError(msg)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class OpRegistrationSpec:
+    """Partitioning, buffer donation, and export-cache contract for a custom op.
+
+    Attributes:
+        in_specs: Input ``PartitionSpec`` tuple (one per positional array input).
+        out_specs: Output ``PartitionSpec`` tuple (one per returned array shard).
+        donate_argnums: Zero-based input indices donated in-place to XLA.
+        export_key: Static export-cache key prefix, or ``None`` to bypass cache.
+    """
+
+    in_specs: tuple[PartitionSpec, ...]
+    out_specs: tuple[PartitionSpec, ...]
+    donate_argnums: tuple[int, ...] = ()
+    export_key: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate input and output partition spec sequences on construction."""
+        _validate_partition_specs(self.in_specs, self.out_specs)
+
+
 def _register_sharded_op(
     name: str,
     fn: Callable[..., object],
-    *,
     mesh: Mesh,
-    input_partition_specs: Sequence[PartitionSpec],
-    output_partition_specs: Sequence[PartitionSpec],
-    donate_argnums: Sequence[int] | None = None,
-    configure_callable: Callable[[pallas_impl.JaxCallable], None] | None = None,
-) -> Any:
+    spec: OpRegistrationSpec,
+    configure_callable: Callable[[export_cache.JaxCallableProtocol], None]
+    | None = None,
+) -> RegisteredOp:
     """Register a Kimi-K3 SPMD JAX function as a torch custom op over ``mesh``.
 
     Attaches ``out_shardings`` to ``jax.jit`` so exported shardings survive on
     ``lowered._out_named_shardings`` for ``export_cache``, passes one
     ``PartitionSpec`` per output to ``pallas_impl.JaxCallable``, and applies an
     optional K3-local ``configure_callable`` hook before custom-op registration.
+
+    Args:
+        name: Qualified torch custom op name ``"namespace::op"``.
+        fn: Annotated JAX callable taking positional ``jax.Array`` inputs.
+        mesh: Global JAX device mesh over which ``fn`` executes.
+        spec: Partitioning, buffer-donation, and export-key contract.
+        configure_callable: Optional callback mutating ``JaxCallable`` prior to
+            ``torch.library.custom_op`` registration.
+
+    Returns:
+        Registered torch custom op callable.
+
+    Raises:
+        TypeError: If ``spec.in_specs`` or ``spec.out_specs`` is not a sequence
+            of ``PartitionSpec`` instances.
+        ValueError: If ``name`` lacks ``"namespace::op"`` format or a spec
+            entry is ``None``.
     """
-    if isinstance(output_partition_specs, PartitionSpec):
-        msg = "output_partition_specs must be a sequence, not a bare PartitionSpec."
-        raise TypeError(msg)
-    if "::" not in name or len(name.split("::")) != 2:
+    _validate_partition_specs(spec.in_specs, spec.out_specs)
+    namespace_part, sep, op_part = name.partition("::")
+    if not sep or not namespace_part or not op_part or "::" in op_part:
         msg = f"Op name {name} must be 'namespace::op', with one '::'."
         raise ValueError(msg)
 
     signature = inspect.signature(inspect.unwrap(fn), eval_str=True)
     pallas_impl._verify_signature(signature)
     static_argnums = pallas_impl._infer_static_argnums(signature)
-    in_specs: Any = tuple(input_partition_specs)
-    out_specs: Any = tuple(output_partition_specs)
-    out_shardings = tuple(NamedSharding(mesh, spec) for spec in out_specs)
+    in_specs = tuple(spec.in_specs)
+    out_specs = tuple(spec.out_specs)
+    donate_argnums = spec.donate_argnums or None
+    pallas_in_specs = cast("tuple[_PallasSpec, ...]", in_specs)
+    pallas_out_specs = cast("tuple[_PallasSpec, ...]", out_specs)
+    out_shardings = tuple(NamedSharding(mesh, item) for item in out_specs)
 
     jit_fn = jax.jit(
         fn,
@@ -198,118 +326,315 @@ def _register_sharded_op(
         jit_fn=jit_fn,
         trace_key=trace_key,
         mesh=mesh,
-        input_partition_specs=in_specs,
-        output_partition_specs=out_specs,
+        input_partition_specs=pallas_in_specs,
+        output_partition_specs=pallas_out_specs,
         static_argnums=static_argnums,
         donate_argnums=list(donate_argnums) if donate_argnums is not None else None,
     )
     if configure_callable is not None:
-        configure_callable(wrapped_fn)
+        configure_callable(cast("export_cache.JaxCallableProtocol", wrapped_fn))
 
     op = torch.library.custom_op(name, wrapped_fn, mutates_args=())
 
-    def fake_fn(*args: Any, **kwargs: Any) -> Any:
-        """Trace the exported JAX function to size sharded torch placeholders."""
+    def fake_fn(*args: object, **kwargs: object) -> object:
+        """Trace the exported JAX function to size sharded torch placeholders.
+
+        Args:
+            *args: Positional FakeTensor or placeholder inputs to ``op``.
+            **kwargs: Keyword arguments forwarded to ``wrapped_fn.exported``.
+
+        Returns:
+            Unflattened PyTree of per-rank ``torch.Tensor`` placeholders.
+        """
         jax_args = pallas_impl.jax_placeholders(
-            args, mesh=mesh, partition_specs=in_specs
+            args, mesh=mesh, partition_specs=pallas_in_specs
         )
         with jax._src.config.export_ignore_forward_compatibility(True):
             lowered = wrapped_fn.exported(*jax_args, **kwargs)
         return lowered.out_tree.unflatten(
-            pallas_impl.torch_placeholder(aval, mesh=mesh, partition_spec=spec)
-            for aval, spec in zip(lowered.out_avals, out_specs, strict=True)
+            pallas_impl.torch_placeholder(aval, mesh=mesh, partition_spec=out_spec)
+            for aval, out_spec in zip(lowered.out_avals, pallas_out_specs, strict=True)
         )
 
     op.register_fake(fake_fn)
+    return cast("RegisteredOp", op)
+
+
+class _LegacyOpKwargs(TypedDict, total=False):
+    """Keyword form of the donation and cache fields of :class:`OpRegistrationSpec`.
+
+    Transitional: program callers still pass these next to a
+    ``(in_specs, out_specs)`` pair until they move to :class:`OpRegistrationSpec`.
+
+    Attributes:
+        donate_argnums: Zero-based input indices donated in-place to XLA.
+        export_key: Static export-cache key prefix, or ``None`` to bypass cache.
+    """
+
+    donate_argnums: tuple[int, ...]
+    export_key: str | None
+
+
+class _AnnotatedCallable(Protocol):
+    """Protocol for a Python function carrying dynamic annotations and signature."""
+
+    __annotations__: dict[str, object]
+    __signature__: inspect.Signature
+
+    def __call__(self, *args: jax.Array) -> object:
+        """Execute the underlying wrapped callable."""
+        ...
+
+
+_ITER_DONE = object()
+
+
+def _build_typed_op(
+    traced: Callable[..., object],
+    *,
+    in_count: int,
+    out_count: int,
+) -> Callable[..., object]:
+    """Attach an explicit positional ``jax.Array`` signature to ``traced``.
+
+    ``torch_tpu`` derives the custom op schema from annotated positional
+    parameters; constructing ``inspect.Signature`` and ``__annotations__``
+    directly avoids dynamic ``exec()`` code generation.
+
+    Args:
+        traced: Underlying traced callable accepting positional JAX arrays.
+        in_count: Number of input ``jax.Array`` parameters.
+        out_count: Number of output ``jax.Array`` elements in the return tuple.
+
+    Returns:
+        Wrapper callable carrying ``__signature__`` and ``__annotations__``.
+    """
+
+    def op(*args: jax.Array) -> object:
+        """Execute the traced JAX callable over positional array inputs.
+
+        Args:
+            *args: Positional ``jax.Array`` inputs matching ``in_specs``.
+
+        Returns:
+            Tuple of output ``jax.Array`` shards.
+        """
+        return traced(*args)
+
+    param_names = [f"arg_{index}" for index in range(in_count)]
+    parameters = [
+        inspect.Parameter(
+            param_name,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            annotation=jax.Array,
+        )
+        for param_name in param_names
+    ]
+    return_type = types.GenericAlias(tuple, (jax.Array,) * out_count)
+    annotations: dict[str, object] = dict.fromkeys(param_names, jax.Array)
+    annotations["return"] = return_type
+    annotated_op = cast("_AnnotatedCallable", op)
+    annotated_op.__annotations__ = annotations
+    annotated_op.__signature__ = inspect.Signature(
+        parameters,
+        return_annotation=return_type,
+    )
     return op
+
+
+def _resolve_op_spec(
+    in_specs: OpRegistrationSpec | tuple[PartitionSpec, ...],
+    out_specs: tuple[PartitionSpec, ...] | None,
+    legacy_kwargs: _LegacyOpKwargs,
+) -> OpRegistrationSpec:
+    """Normalize an :class:`OpRegistrationSpec` or ``(in_specs, out_specs)`` pair.
+
+    Args:
+        in_specs: Full :class:`OpRegistrationSpec` or input ``PartitionSpec``
+            tuple.
+        out_specs: Output ``PartitionSpec`` tuple when ``in_specs`` is a tuple,
+            or ``None`` when ``in_specs`` is an :class:`OpRegistrationSpec`.
+        legacy_kwargs: ``donate_argnums`` / ``export_key`` passed next to a
+            ``(in_specs, out_specs)`` pair; empty with an
+            :class:`OpRegistrationSpec`.
+
+    Returns:
+        Resolved :class:`OpRegistrationSpec` instance.
+
+    Raises:
+        TypeError: If ``out_specs`` is omitted for a tuple ``in_specs``, or
+            ``out_specs`` or a legacy keyword is supplied alongside an
+            :class:`OpRegistrationSpec`.
+    """
+    if isinstance(in_specs, OpRegistrationSpec):
+        if out_specs is not None:
+            msg = "out_specs must be omitted when passing OpRegistrationSpec"
+            raise TypeError(msg)
+        if legacy_kwargs:
+            msg = "donate_argnums/export_key belong in the OpRegistrationSpec"
+            raise TypeError(msg)
+        return in_specs
+    if out_specs is None:
+        msg = "out_specs is required when in_specs is a PartitionSpec tuple"
+        raise TypeError(msg)
+    return OpRegistrationSpec(
+        in_specs=in_specs,
+        out_specs=out_specs,
+        donate_argnums=legacy_kwargs.get("donate_argnums", ()),
+        export_key=legacy_kwargs.get("export_key"),
+    )
+
+
+@overload
+def register_op(
+    name: str,
+    mesh: Mesh,
+    body: Callable[..., object],
+    in_specs: OpRegistrationSpec,
+    out_specs: None = None,
+) -> RegisteredOp: ...
+
+
+@overload
+def register_op(
+    name: str,
+    mesh: Mesh,
+    body: Callable[..., object],
+    in_specs: tuple[PartitionSpec, ...],
+    out_specs: tuple[PartitionSpec, ...],
+    **legacy_kwargs: Unpack[_LegacyOpKwargs],
+) -> _LegacyRegisteredOp: ...
 
 
 def register_op(
     name: str,
     mesh: Mesh,
-    body: Callable[..., Any],
-    in_specs: tuple,
-    out_specs: tuple,
-    donate_argnums: tuple[int, ...] = (),
-    export_key: str | None = None,
-) -> Any:
-    """A torch custom op running ``shard_map(body)`` over ``mesh``.
+    body: Callable[..., object],
+    in_specs: OpRegistrationSpec | tuple[PartitionSpec, ...],
+    out_specs: tuple[PartitionSpec, ...] | None = None,
+    **legacy_kwargs: Unpack[_LegacyOpKwargs],
+) -> RegisteredOp | _LegacyRegisteredOp:
+    """Register a torch custom op running ``shard_map(body)`` over ``mesh``.
 
-    torch_tpu derives the op schema from annotated positional parameters, so
-    the wrapper spells out one ``jax.Array`` parameter per input.
-    ``export_key``: the static configuration ``body`` bakes into its trace,
-    opting the op into the persistent export cache (``export_cache``).
+    ``torch_tpu`` derives the op schema from annotated positional parameters, so
+    the wrapper attaches one ``jax.Array`` parameter per input. Passing an
+    :class:`OpRegistrationSpec` with ``export_key`` opts the op into the
+    persistent export cache.
+
+    Args:
+        name: Custom op registration name.
+        mesh: Global JAX device mesh.
+        body: Per-shard function wrapped with ``jax.shard_map``.
+        in_specs: Full :class:`OpRegistrationSpec` or input ``PartitionSpec``
+            tuple.
+        out_specs: Output ``PartitionSpec`` tuple when ``in_specs`` is a tuple,
+            or ``None`` when ``in_specs`` is an :class:`OpRegistrationSpec`.
+        **legacy_kwargs: Transitional ``donate_argnums`` / ``export_key``
+            keywords for a ``(in_specs, out_specs)`` pair.
+
+    Returns:
+        Registered torch custom op callable.
     """
+    spec = _resolve_op_spec(in_specs, out_specs, legacy_kwargs)
     mapped = jax.shard_map(
-        body, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
+        body,
+        mesh=mesh,
+        in_specs=spec.in_specs,
+        out_specs=spec.out_specs,
+        check_vma=False,
     )
-    count = len(in_specs)
 
-    def traced(*args):
+    def traced(*args: jax.Array) -> object:
+        """Trace ``mapped`` under ``spmd_safe_axis_index``.
+
+        Args:
+            *args: Positional ``jax.Array`` inputs.
+
+        Returns:
+            Result of ``mapped(*args)``.
+        """
         with spmd_safe_axis_index():
             return mapped(*args)
 
-    params = ", ".join(f"a{i}: jax.Array" for i in range(count))
-    call = ", ".join(f"a{i}" for i in range(count))
-    returns = ", ".join("jax.Array" for _ in out_specs)
-    namespace: dict[str, Any] = {"jax": jax, "_traced": traced}
-    exec(  # noqa: S102 -- fixed template, no external input
-        f"def op({params}) -> tuple[{returns}]:\n    return _traced({call})\n",
-        namespace,
+    typed_op = _build_typed_op(
+        traced,
+        in_count=len(spec.in_specs),
+        out_count=len(spec.out_specs),
     )
     return _register_sharded_op(
         name,
-        namespace["op"],
-        mesh=mesh,
-        input_partition_specs=in_specs,
-        output_partition_specs=out_specs,
-        donate_argnums=donate_argnums or None,
-        configure_callable=export_cache.hook(_keyed_on_kernel_config(export_key)),
+        typed_op,
+        mesh,
+        spec,
+        export_cache.hook(_keyed_on_kernel_config(spec.export_key)),
     )
 
 
 def register_global_op(
     name: str,
     mesh: Mesh,
-    fn: Callable[..., Any],
-    in_specs: tuple,
-    out_specs: tuple,
-    donate_argnums: tuple[int, ...] = (),
-    export_key: str | None = None,
-) -> Any:
-    """A torch custom op for a *global-view* JAX function over ``mesh``.
+    fn: Callable[..., object],
+    in_specs: OpRegistrationSpec | tuple[PartitionSpec, ...],
+    out_specs: tuple[PartitionSpec, ...] | None = None,
+    **legacy_kwargs: Unpack[_LegacyOpKwargs],
+) -> RegisteredOp:
+    """Register a torch custom op for a global-view JAX function over ``mesh``.
 
-    ``fn`` sees global arrays (``in_specs`` say how each worker's tensor is
-    its shard) and may call the kernels' own ``jit(shard_map(...))``
-    programs; it is traced under ``spmd_safe_axis_index`` like :func:`register_op`.
+    ``fn`` sees global arrays (``in_specs`` describe how each worker's tensor is
+    its shard) and may call the kernels' own ``jit(shard_map(...))`` programs;
+    it is traced under ``spmd_safe_axis_index`` like :func:`register_op`.
+
+    Args:
+        name: Custom op registration name.
+        mesh: Global JAX device mesh.
+        fn: Global-view JAX function.
+        in_specs: Full :class:`OpRegistrationSpec` or input ``PartitionSpec``
+            tuple.
+        out_specs: Output ``PartitionSpec`` tuple when ``in_specs`` is a tuple,
+            or ``None`` when ``in_specs`` is an :class:`OpRegistrationSpec`.
+        **legacy_kwargs: Transitional ``donate_argnums`` / ``export_key``
+            keywords for a ``(in_specs, out_specs)`` pair.
+
+    Returns:
+        Registered torch custom op callable.
     """
-    count = len(in_specs)
+    spec = _resolve_op_spec(in_specs, out_specs, legacy_kwargs)
 
-    def traced(*args):
+    def traced(*args: jax.Array) -> object:
+        """Trace ``fn`` under ``spmd_safe_axis_index``.
+
+        Args:
+            *args: Positional ``jax.Array`` inputs.
+
+        Returns:
+            Result of ``fn(*args)``.
+        """
         with spmd_safe_axis_index():
             return fn(*args)
 
-    params = ", ".join(f"a{i}: jax.Array" for i in range(count))
-    call = ", ".join(f"a{i}" for i in range(count))
-    returns = ", ".join("jax.Array" for _ in out_specs)
-    namespace: dict[str, Any] = {"jax": jax, "_traced": traced}
-    exec(  # noqa: S102 -- fixed template, no external input
-        f"def op({params}) -> tuple[{returns}]:\n    return _traced({call})\n",
-        namespace,
+    typed_op = _build_typed_op(
+        traced,
+        in_count=len(spec.in_specs),
+        out_count=len(spec.out_specs),
     )
     return _register_sharded_op(
         name,
-        namespace["op"],
-        mesh=mesh,
-        input_partition_specs=in_specs,
-        output_partition_specs=out_specs,
-        donate_argnums=donate_argnums or None,
-        configure_callable=export_cache.hook(_keyed_on_kernel_config(export_key)),
+        typed_op,
+        mesh,
+        spec,
+        export_cache.hook(_keyed_on_kernel_config(spec.export_key)),
     )
 
 
 def upload(value: np.ndarray) -> torch.Tensor:
-    """Host array -> ``[1, ...]`` device tensor (bf16 via its uint16 view)."""
+    """Upload a host NumPy array as a ``[1, ...]`` TPU tensor.
+
+    Args:
+        value: Host NumPy shard array (bfloat16 arrays are reinterpreted via uint16).
+
+    Returns:
+        TPU ``torch.Tensor`` with a leading rank axis of size ``1``.
+    """
     value = np.ascontiguousarray(value)
     if value.dtype.name == "bfloat16":
         tensor = torch.from_numpy(value.view(np.uint16)).view(torch.bfloat16)
@@ -319,10 +644,18 @@ def upload(value: np.ndarray) -> torch.Tensor:
 
 
 UPLOAD_THREADS = 4
-UPLOAD_INFLIGHT_BYTES = 16 * 2**30
+UPLOAD_INFLIGHT_BYTES = 16 * GIB_BYTES
 
 
 def _part_of(name: str) -> tuple[str, int, int] | None:
+    """Parse a multi-part weight name ``family@index/count`` if present.
+
+    Args:
+        name: Weight tensor identifier string.
+
+    Returns:
+        Tuple of ``(family, index, count)`` for split expert tensors, else ``None``.
+    """
     if "@" not in name:
         return None
     family, part = name.split("@")
@@ -330,26 +663,42 @@ def _part_of(name: str) -> tuple[str, int, int] | None:
     return family, int(index), int(count)
 
 
-def stream_to_device(iterator, store) -> dict[str, float]:
-    """Upload every ``(group, name, array)`` the kernel's rank iterator yields
-    and hand each device tensor to ``store(group, name, tensor)``.
+def stream_to_device(
+    iterator: Iterable[tuple[str, str, np.ndarray]],
+    store: Callable[[str, str, torch.Tensor], None],
+) -> dict[str, float]:
+    """Upload ``(group, name, array)`` tuples concurrently and pass them to ``store``.
 
     Uploads run concurrently on ``UPLOAD_THREADS`` threads with at most that
     many arrays and ``UPLOAD_INFLIGHT_BYTES`` of host buffers pending. Arrays
     named ``family@index/count`` (``rank_loader.iter_*_rank``'s expert files)
     are joined on the device along the layer axis once all parts are up.
-    Returns wall time, time blocked on the reader, time blocked on uploads
-    and the GiB moved.
-    """
-    from concurrent.futures import ThreadPoolExecutor
 
+    Args:
+        iterator: Iterable yielding ``(group, name, host_array)`` triples.
+        store: Callback ``store(group, name, device_tensor)`` receiving uploaded
+            tensors.
+
+    Returns:
+        Dictionary of ``wall``, ``wait``, ``upload`` seconds and ``gib``
+        transferred.
+
+    Raises:
+        RuntimeError: If any split ``family@index/count`` tensor is incomplete
+            at EOF.
+    """
     started = time.perf_counter()
     wait = upload_wait = 0.0
     total = 0
-    pending: list[Any] = []  # (future, nbytes)
+    pending: list[tuple[Future[tuple[str, str, torch.Tensor]], int]] = []
     parts: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
 
-    def finish(future) -> None:
+    def finish(future: Future[tuple[str, str, torch.Tensor]]) -> None:
+        """Commit one completed upload future to ``store`` or the split-part table.
+
+        Args:
+            future: Completed upload future returning ``(group, name, tensor)``.
+        """
         group, name, tensor = future.result()
         part = _part_of(name)
         if part is None:
@@ -359,12 +708,21 @@ def stream_to_device(iterator, store) -> dict[str, float]:
         collected = parts.setdefault((group, family), {})
         collected[index] = tensor
         if len(collected) == count:
-            joined = torch.cat([collected[i] for i in range(count)], dim=1)
+            joined = torch.cat([collected[idx] for idx in range(count)], dim=1)
             del parts[(group, family)]
             collected.clear()
             store(group, family, joined)
 
     def drain(limit_count: int, limit_bytes: int) -> float:
+        """Drain oldest pending uploads until count and byte limits are satisfied.
+
+        Args:
+            limit_count: Maximum number of pending futures to leave in flight.
+            limit_bytes: Maximum total pending bytes to leave in flight.
+
+        Returns:
+            Wall-clock seconds spent waiting for drained uploads.
+        """
         before = time.perf_counter()
         while pending and (
             len(pending) > limit_count or sum(n for _, n in pending) > limit_bytes
@@ -377,12 +735,11 @@ def stream_to_device(iterator, store) -> dict[str, float]:
         it = iter(iterator)
         while True:
             before = time.perf_counter()
-            try:
-                group, name, value = next(it)
-            except StopIteration:
-                wait += time.perf_counter() - before
-                break
+            item = next(it, _ITER_DONE)
             wait += time.perf_counter() - before
+            if item is _ITER_DONE:
+                break
+            group, name, value = cast("tuple[str, str, np.ndarray]", item)
             nbytes = int(value.nbytes)
             total += nbytes
             upload_wait += drain(
@@ -390,32 +747,51 @@ def stream_to_device(iterator, store) -> dict[str, float]:
             )
             pending.append(
                 (
-                    pool.submit(lambda g=group, n=name, v=value: (g, n, upload(v))),
+                    pool.submit(
+                        lambda grp=group, nm=name, arr=value: (grp, nm, upload(arr))
+                    ),
                     nbytes,
                 )
             )
-            del value
+            del item, value
         upload_wait += drain(0, 0)
     if parts:
-        raise RuntimeError(f"megakernel weights: incomplete parts {sorted(parts)}")
+        msg = f"megakernel weights: incomplete parts {sorted(parts)}"
+        raise RuntimeError(msg)
     return {
         "wall": time.perf_counter() - started,
         "wait": wait,
         "upload": upload_wait,
-        "gib": total / 2**30,
+        "gib": total / GIB_BYTES,
     }
 
 
 def report_load_stats(label: str, position: int, stats: dict[str, float]) -> None:
-    """Gather every rank's weight-load stats; mesh position 0 logs
-    min/median/max (the default process group: one per device)."""
-    gathered: list[Any] = [None] * torch.distributed.get_world_size()
+    """Gather all ranks' weight-load statistics and log min/median/max on rank 0.
+
+    Args:
+        label: Role or weight-group label for the log line.
+        position: Calling worker's position in the kernel mesh.
+        stats: Timing and byte statistics returned by :func:`stream_to_device`.
+    """
+    gathered: list[object] = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(gathered, (position, stats))
     if position != 0:
         return
-    rows = sorted(gathered, key=lambda item: item[1]["wall"])
+    typed_rows: list[tuple[int, dict[str, float]]] = [
+        item for item in gathered if isinstance(item, tuple)
+    ]
+    rows = sorted(typed_rows, key=lambda item: item[1]["wall"])
 
-    def spread(key):
+    def spread(key: str) -> str:
+        """Format min/median/max across ranks for metric ``key``.
+
+        Args:
+            key: Metric key in ``stats`` (``"wall"``, ``"wait"``, or ``"upload"``).
+
+        Returns:
+            Slash-separated ``min/median/max`` string in seconds.
+        """
         values = sorted(item[1][key] for item in rows)
         return f"{values[0]:.1f}/{values[len(values) // 2]:.1f}/{values[-1]:.1f}"
 
@@ -434,18 +810,36 @@ def report_load_stats(label: str, position: int, stats: dict[str, float]) -> Non
 
 
 def materialize(tensor: torch.Tensor) -> None:
-    """Force torch_tpu's lazy work up to ``tensor`` (a one-element read)."""
+    """Force ``torch_tpu`` lazy execution up to ``tensor`` (a one-element read).
+
+    Args:
+        tensor: Device tensor whose pending lazy graph work should be flushed.
+    """
     tensor.reshape(-1)[:1].cpu()
 
 
 def hbm(position: int) -> str:
+    """Format current and peak HBM usage on mesh ``position`` for diagnostics.
+
+    Args:
+        position: Device position in the sorted JAX device list.
+
+    Returns:
+        Formatted GiB usage string, or ``"unavailable (...)"`` if unsupported.
+    """
     try:
-        device = sorted(jax.devices(), key=lambda d: int(d.id))[position]
+        device = sorted(jax.devices(), key=lambda dev: int(dev.id))[position]
         stats = device.memory_stats() or {}
-        return "{:.1f} GiB in use, peak {:.1f} of {:.1f}".format(
-            stats.get("bytes_in_use", 0) / 2**30,
-            stats.get("peak_bytes_in_use", 0) / 2**30,
-            stats.get("bytes_limit", 0) / 2**30,
-        )
-    except Exception as exc:  # noqa: BLE001 -- diagnostics only
+        in_use = stats.get("bytes_in_use", 0) / GIB_BYTES
+        peak = stats.get("peak_bytes_in_use", 0) / GIB_BYTES
+        limit = stats.get("bytes_limit", 0) / GIB_BYTES
+    except (
+        ImportError,
+        AttributeError,
+        RuntimeError,
+        IndexError,
+        TypeError,
+        ValueError,
+    ) as exc:
         return f"unavailable ({exc})"
+    return f"{in_use:.1f} GiB in use, peak {peak:.1f} of {limit:.1f}"
