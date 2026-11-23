@@ -53,7 +53,7 @@ DEFAULT_LARGE_BLOCK_Q = 512
 DEFAULT_PAGES_PER_STEP = 128
 # The block_q class (decode, MTP verify) runs the v3 DMA ring; 128 pages per
 # step keep more bytes in flight (j-dba77583: 32 req x 8 tokens at 128K,
-# 1.95 -> 1.66 ms). The large prefill class keeps 32.
+# 1.95 -> 1.66 ms).
 DEFAULT_SMALL_PAGES_PER_STEP = 128
 DEFAULT_KERNEL = "v3"
 # Rows per token-major query tile of the block_q class (see `block_scores`).

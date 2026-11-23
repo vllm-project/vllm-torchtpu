@@ -195,12 +195,14 @@ def _candidates_kernel(
 # (keys span less than 2**31) with its low `_key_bits(num_cols)` bits holding
 # the inverted column, so that the larger key is the higher score and, among
 # equal kept scores, the lower column. Keys are distinct, so a pick is the
-# largest key below the previous pick: ``max(key - (prev ^ INT_MIN))``, two
-# VALU ops per vreg and no store (the f32 picks took five, a store and a
-# second load: 56 bundles per 32 vregs, AOT). The scores keep 11 mantissa
+# largest key below the previous pick: ``max(key - (prev ^ INT_MIN))``, three
+# VALU ops per vreg (an int32 max is a compare and a select) and no store
+# (the f32 picks took five, a store and a second load: 56 -> 26 bundles per
+# 32 vregs, AOT). The scores keep 11 mantissa
 # bits (they come from fp8 / 4-bit keys and bf16 or e4m3 queries); every
 # rank keys with the same bits, so a DCP group's lists merge exactly
-# (`merge_pair_candidates`) on the scores the picks return.
+# (`merge_pair_candidates`) on the scores the picks return. (The non-DCP
+# `msa_select` orders full f32 scores: near-ties may resolve differently.)
 _KEY_TOP = 1 << 30
 _INT_MIN = -(1 << 31)
 _PICK_ACCUMULATORS = 4
@@ -229,7 +231,7 @@ def _key_scores(keys: jax.Array, col_bits: int) -> tuple[jax.Array, jax.Array]:
     """Keys -> (their kept f32 scores, -inf for -inf scores; columns)."""
     low = (1 << col_bits) - 1
     high = keys & ~low
-    neg_inf_code = (-0x7F800000 ^ 0x7FFFFFFF) >> 1  # -inf's (code >> 1)
+    neg_inf_code = (-0x00800000 ^ 0x7FFFFFFF) >> 1  # -inf (0xFF800000): code >> 1
     code = high << 1
     bits = jnp.where(code < 0, code ^ 0x7FFFFFFF, code)
     score = jnp.where(

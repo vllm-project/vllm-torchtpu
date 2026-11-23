@@ -147,6 +147,34 @@ def test_candidates_order_kept_scores(num_tokens, num_cols, rank, layout):
     np.testing.assert_array_equal(np.asarray(got_s), want_s)
 
 
+@pytest.mark.parametrize("pretransposed", [False, True])
+@pytest.mark.parametrize("num_tokens", [8, 300])
+def test_candidates_negative_scores_and_few_visible_blocks(num_tokens, pretransposed):
+    """Negative scores are picked like any other, also where a row sees
+    fewer blocks than topk (only its visible ones, the rest (-inf, -1))."""
+    rng = np.random.default_rng(num_tokens)
+    num_cols, rank = 256, 1
+    scores = -np.abs(rng.normal(0, 3, (num_tokens, num_cols))).astype(np.float32)
+    scores[:, ::3] *= -1
+    pos = rng.integers(0, 40 * 128, num_tokens).astype(np.int32)
+    pos[:4] = [5, 300, 1500, 3000]  # 1, 3, 12, 24 visible blocks
+    got_s, got_b = local_candidates(
+        jnp.asarray(scores).T if pretransposed else jnp.asarray(scores)[:, None, :],
+        jnp.asarray(pos),
+        block_size=BLOCK,
+        topk=TOPK,
+        init_blocks=0,
+        local_blocks=1,
+        rank=rank,
+        dcp=2,
+        interpret=True,
+    )
+    want_s, want_b = _reference(_kept_scores(scores, num_cols), pos, rank, 2, 0, 1)
+    want_s, want_b = want_s[:, ::-1], want_b[:, ::-1]  # odd rank
+    np.testing.assert_array_equal(np.asarray(got_b), want_b)
+    np.testing.assert_array_equal(np.asarray(got_s), want_s)
+
+
 @pytest.mark.parametrize("num_tokens", [256, 384, 300, 129])
 def test_row_blocks_stay_inside_the_scores(num_tokens):
     """Without `live_rows` every row block runs: the scores the kernel reads
