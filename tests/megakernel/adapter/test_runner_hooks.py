@@ -235,8 +235,9 @@ def test_worker_sync_weights_runs_the_weight_update_guard() -> None:
 
 def _worker_compile_or_warm_up_model() -> Any:
     """`TPUWorker.compile_or_warm_up_model`; compiled from source with stand-ins
-    for the thread, cache and GC helpers it calls."""
+    for the global-state, thread, cache and GC helpers it calls."""
     import ast
+    import contextlib
     import textwrap
     import time
     from pathlib import Path
@@ -256,6 +257,7 @@ def _worker_compile_or_warm_up_model() -> Any:
         "time": time,
         "CompilationTimes": lambda **kw: SimpleNamespace(**kw),
         "CacheArtifactManager": SimpleNamespace(clear=lambda: None),
+        "_serving_global_state": contextlib.nullcontext,
         "set_torch_threads_for_runtime": lambda: None,
         "freeze_gc_heap": lambda: None,
         "maybe_attach_gc_debug_callback": lambda: None,

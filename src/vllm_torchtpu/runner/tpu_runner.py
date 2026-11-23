@@ -215,6 +215,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
     SpecLogprobsChunk,
+    extract_draft_token_ids,
     extract_draft_token_ids_impl,
     spec_substitution_impl,
 )
@@ -8214,6 +8215,27 @@ class TPUModelRunner(GPUModelRunner):
                 draft_token_ids, num_drafts = out[8], out[9]
             advanced = list(carry_inputs[:3])
 
+    def _precompile_extract_draft_token_ids(
+        self, target_logits_indices: torch.Tensor
+    ) -> None:
+        """Compile `extract_draft_token_ids` at one verify logits length, for
+        every step token bucket that holds it: a verify chunk can ride in a
+        step of any size (a prefill beside it), and an unwarmed one re-traced
+        while serving."""
+        logits_len = target_logits_indices.shape[0]
+        final_logits_indices = torch.zeros(logits_len, dtype=torch.int32).to(
+            self.device
+        )
+        for num_tokens in self.num_tokens_paddings:
+            if num_tokens < logits_len:
+                continue
+            input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
+            synchronize_tensors(
+                extract_draft_token_ids(
+                    input_ids, final_logits_indices, target_logits_indices
+                )
+            )
+
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
 
@@ -8282,6 +8304,8 @@ class TPUModelRunner(GPUModelRunner):
                         torch.zeros(num_tokens, dtype=torch.int64).to(self.device),
                         torch.zeros(num_tokens, dtype=torch.int32).to(self.device),
                     )
+                    if self.scheduler_config.async_scheduling:
+                        self._precompile_extract_draft_token_ids(token_inputs[2])
                 (
                     dummy_logits,
                     draft_token_ids,

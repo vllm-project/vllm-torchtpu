@@ -16,6 +16,7 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import contextlib
 import ctypes
 import os
 import time
@@ -60,6 +61,19 @@ from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
 logger = init_logger(__name__)
+
+
+@contextlib.contextmanager
+def _serving_global_state():
+    """Serving's torch thread count and grad mode (execute_model and
+    sample_tokens run under no_grad), for a startup phase that traces
+    programs: dynamo guards every compiled graph on both, so a graph traced
+    at the startup thread count (cores / TP) or with grad on misses when
+    served and re-traces there. That cost a Cosmos3-Super image 9.6 s on the
+    first request of each encoder budget."""
+    set_torch_threads_for_runtime()
+    with torch.no_grad():
+        yield
 
 
 def _get_kv_connector_handshake_metadata_key(metadata=None) -> tuple[int, int]:
@@ -571,11 +585,9 @@ class TPUWorker(WorkerBase):
                 self.cache_config.num_gpu_blocks_override,
             )
         else:
-            # In serving's global state, like the warm-up (see
-            # compile_or_warm_up_model): the warm-up then finds this run's
-            # sampling graphs in dynamo's cache instead of re-tracing them (40 s).
-            set_torch_threads_for_runtime()
-            with torch.no_grad():
+            # The warm-up then finds this run's sampling graphs in dynamo's
+            # cache instead of re-tracing them (40 s).
+            with _serving_global_state():
                 self.model_runner.profile_run(self.model_runner.max_num_tokens)
 
         # VLLM directive of the percentage of HBM memory the model executor can use
@@ -846,13 +858,7 @@ class TPUWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
-        # Warm up in serving's global state: dynamo guards every compiled graph
-        # on the torch thread count and grad mode, so a graph traced at the
-        # startup count (cores / TP) or with grad on misses at serving, under
-        # execute_model's no_grad, and re-traces there. That cost a Cosmos3-Super
-        # image 9.6 s on the first request of each encoder budget.
-        set_torch_threads_for_runtime()
-        with torch.no_grad():
+        with _serving_global_state():
             self.model_runner.capture_model()
         # After the stock precompile too: the megakernel's once-per-bind hook.
         if self.model_runner._megakernel is not None:
@@ -931,7 +937,9 @@ class TPUWorker(WorkerBase):
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
-        self.model_runner.initialize_kv_cache(kv_cache_config)
+        # It precompiles the async token substitution, which serving calls.
+        with _serving_global_state():
+            self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def get_node_kv_ip_port(self) -> tuple[int, str, int]:
         node_id = dist_utils.get_node_id()
