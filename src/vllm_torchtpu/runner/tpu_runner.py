@@ -1439,6 +1439,15 @@ _prep_fold_compiled = _static_shape_args(
 )
 
 
+def _direct(fn, name: str):
+    """`fn` behind its process-wide `DirectCall` (compilation/direct_exec.py):
+    each call shape's executable is recorded on its first call (warmup) and
+    called directly after that, skipping Dynamo and the AOTAutograd wrapper."""
+    from vllm_torchtpu.compilation.direct_exec import direct_call
+
+    return direct_call(fn, name)
+
+
 def _prep_fold_reference(*args, fault: bool = False, **static):
     """VLLM_TPU_PREFWD_PREP_FOLD_CHECK: the unfolded sequence the folded program
     replaces, eagerly (`fault`: seq_lens - 1, the positive control)."""
@@ -5137,7 +5146,12 @@ class TPUModelRunner(GPUModelRunner):
                 "PREFWD_PREP_FOLD=2: the spec-tail/draft-cat fold is not "
                 "implemented; folding level 1 only"
             )
-        out = _prep_fold_compiled(*args, **static)
+        fold = (
+            _direct(_prep_fold_compiled, "prep_fold")
+            if envs.VLLM_TPU_FOLD_DIRECT_EXEC
+            else _prep_fold_compiled
+        )
+        out = fold(*args, **static)
         if envs.VLLM_TPU_PREFWD_PREP_FOLD_CHECK not in ("", "0"):
             self._prep_fold_check(args, static, out)
         seq_lens, self.position_ids, ids, drafts, *prepped = out
@@ -7472,18 +7486,28 @@ class TPUModelRunner(GPUModelRunner):
         if flat_u is not None:
             call_args = (*args[:6], flat_u, *args[9:])
 
+            one_draw_fn = (
+                _direct(_verify_fused_one_draw_compiled, "verify_one_draw")
+                if envs.VLLM_TPU_VERIFY_DIRECT_EXEC
+                else _verify_fused_one_draw_compiled
+            )
+
             def verify(*extra):
                 if logits_blocks:
                     num_reqs_arg = extra[0] if extra else None
-                    return _verify_fused_one_draw_compiled(
-                        *call_args, num_reqs_arg, logits_blocks
-                    )
-                return _verify_fused_one_draw_compiled(*call_args, *extra)
+                    return one_draw_fn(*call_args, num_reqs_arg, logits_blocks)
+                return one_draw_fn(*call_args, *extra)
 
         else:
 
+            fused_fn = (
+                _direct(_verify_fused_compiled, "verify_fused")
+                if envs.VLLM_TPU_VERIFY_DIRECT_EXEC
+                else _verify_fused_compiled
+            )
+
             def verify(*extra):
-                return _verify_fused_compiled(*args, *extra)
+                return fused_fn(*args, *extra)
 
         ro_groups, ro_num_reqs = self._fused_read_offsets
         fold_ro = (
@@ -7506,7 +7530,11 @@ class TPUModelRunner(GPUModelRunner):
             and _on_tpu(self.mamba_slot_read_offsets)
         ) and self._ro_ingraph_warmed_for(list(ro_groups), call_args, logits_blocks)
         if ingraph_ro and logits_blocks:
-            out = _verify_one_draw_ro_lb_compiled(
+            out = (
+                _direct(_verify_one_draw_ro_lb_compiled, "verify_ro_lb")
+                if envs.VLLM_TPU_VERIFY_DIRECT_EXEC
+                else _verify_one_draw_ro_lb_compiled
+            )(
                 self.mamba_slot_read_offsets,
                 list(ro_groups),
                 self._num_reqs_tensor(ro_num_reqs),
@@ -7515,7 +7543,11 @@ class TPUModelRunner(GPUModelRunner):
             )
             self._fused_read_offsets_applied = True
         elif ingraph_ro:
-            out = _verify_one_draw_ro_compiled(
+            out = (
+                _direct(_verify_one_draw_ro_compiled, "verify_ro")
+                if envs.VLLM_TPU_VERIFY_DIRECT_EXEC
+                else _verify_one_draw_ro_compiled
+            )(
                 self.mamba_slot_read_offsets,
                 list(ro_groups),
                 self._num_reqs_tensor(ro_num_reqs),
@@ -9882,8 +9914,13 @@ class TPUModelRunner(GPUModelRunner):
                         key = _ro_ingraph_key(groups, call_args, logits_blocks)
                         if key in warmed:
                             continue
+                        direct = envs.VLLM_TPU_VERIFY_DIRECT_EXEC
                         if logits_blocks:
-                            out = _verify_one_draw_ro_lb_compiled(
+                            out = (
+                                _direct(_verify_one_draw_ro_lb_compiled, "verify_ro_lb")
+                                if direct
+                                else _verify_one_draw_ro_lb_compiled
+                            )(
                                 scratch,
                                 groups,
                                 ro_num_reqs,
@@ -9891,9 +9928,11 @@ class TPUModelRunner(GPUModelRunner):
                                 *call_args,
                             )
                         else:
-                            out = _verify_one_draw_ro_compiled(
-                                scratch, groups, ro_num_reqs, *call_args
-                            )
+                            out = (
+                                _direct(_verify_one_draw_ro_compiled, "verify_ro")
+                                if direct
+                                else _verify_one_draw_ro_compiled
+                            )(scratch, groups, ro_num_reqs, *call_args)
                         synchronize_tensors(out)
                         warmed.add(key)
         self._ro_ingraph_warmed = warmed
@@ -10669,7 +10708,11 @@ class TPUModelRunner(GPUModelRunner):
                                 num_tokens=tokens, ids_dtype=self.input_ids_cpu.dtype
                             )
                             kw.update(static)
-                            out = _prep_fold_compiled(*args, **kw)
+                            out = (
+                                _direct(_prep_fold_compiled, "prep_fold")
+                                if envs.VLLM_TPU_FOLD_DIRECT_EXEC
+                                else _prep_fold_compiled
+                            )(*args, **kw)
                             synchronize_tensors([*out[:-1], *out[-1]])
                             key = _prep_fold_key(args, kw)
                             if key not in keys:

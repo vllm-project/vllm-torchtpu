@@ -442,6 +442,11 @@ if TYPE_CHECKING:
     VLLM_TPU_PREP_LAZY_INPUT_IDS: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
     VLLM_TPU_MK_WHOLE_DIRECT_EXEC: bool = False
+    VLLM_TPU_FOLD_DIRECT_EXEC: bool = False
+    VLLM_TPU_VERIFY_DIRECT_EXEC: bool = False
+    VLLM_TPU_DRAFT_DIRECT_EXEC: bool = False
+    VLLM_TPU_DRAFT_LOOP_DIRECT_EXEC: bool = False
+    VLLM_TPU_DIRECT_EXEC_SNAPSHOT: bool = False
     VLLM_TPU_ENVS_FREEZE: bool = False
     VLLM_TPU_HOST_TOKEN_LISTS: bool = False
     VLLM_TPU_PREFILL_CKPT_DECODE_SKIP: bool = False
@@ -2824,6 +2829,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # piecewise / AOTAutograd wrapper layers (compilation/direct_exec.py). Any
     # call the record does not cover takes the normal path.
     "VLLM_TPU_MK_WHOLE_DIRECT_EXEC": env_bool("VLLM_TPU_MK_WHOLE_DIRECT_EXEC"),
+    # The same direct call for plain `torch.compile` functions
+    # (compilation/direct_exec.py DirectCall): each call shape's executable,
+    # operands, input-mutation copies and outputs are recorded on its first call
+    # (warmup); later calls whose tensor guards hold call the executable
+    # directly, skipping the Dynamo frame and guard check and the AOTAutograd
+    # wrapper. FOLD: the folded pre-forward prep (`_prep_fold_compiled`).
+    # VERIFY: the fused verify programs (`_verify_one_draw_ro[_lb]_compiled`,
+    # `_verify_fused[_one_draw]_compiled`).
+    "VLLM_TPU_FOLD_DIRECT_EXEC": env_bool("VLLM_TPU_FOLD_DIRECT_EXEC"),
+    "VLLM_TPU_VERIFY_DIRECT_EXEC": env_bool("VLLM_TPU_VERIFY_DIRECT_EXEC"),
+    # DirectExec (as VLLM_TPU_MK_WHOLE_DIRECT_EXEC) for the MK draft step-0
+    # program (DRAFT) and the fused MTP draft loop program (DRAFT_LOOP).
+    "VLLM_TPU_DRAFT_DIRECT_EXEC": env_bool("VLLM_TPU_DRAFT_DIRECT_EXEC"),
+    "VLLM_TPU_DRAFT_LOOP_DIRECT_EXEC": env_bool("VLLM_TPU_DRAFT_LOOP_DIRECT_EXEC"),
+    # With any DirectExec flag above: a bucket whose runner operands are all
+    # either the call's own tensors or tensors held by the program's module
+    # tree is also called without the Dynamo bytecode that gathers them, from
+    # a snapshot guarded by the version tags of every dict on the way to each
+    # held tensor. Anything else keeps the bytecode.
+    "VLLM_TPU_DIRECT_EXEC_SNAPSHOT": env_bool("VLLM_TPU_DIRECT_EXEC_SNAPSHOT"),
     # After warmup, each worker keeps the first value it reads of every
     # variable in this module as a module attribute (freeze_reads), so a read
     # on the step path is a dict hit instead of os.getenv plus parsing
