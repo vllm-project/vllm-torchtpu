@@ -435,6 +435,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM",
     "VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM_MARGIN",
     "VLLM_TPU_OFFLOAD_DIVERGENT_HITS",
+    # q38 PSTEP-VASYNC: when victim stores run (scheduler only).
+    "VLLM_TPU_OFFLOAD_VICTIM_ASYNC",
     # Scheduler-side arrival pins and host-tier refresh only.
     "VLLM_TPU_ARRIVAL_TOUCH",
     "VLLM_TPU_ARRIVAL_TOUCH_HBM_FRAC",

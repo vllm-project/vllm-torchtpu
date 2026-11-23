@@ -376,6 +376,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM: bool = False
     VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM_MARGIN: int = 16
     VLLM_TPU_OFFLOAD_DIVERGENT_HITS: bool = False
+    VLLM_TPU_OFFLOAD_VICTIM_ASYNC: int = 0
     VLLM_TPU_ARRIVAL_TOUCH: bool = False
     VLLM_TPU_ARRIVAL_TOUCH_HBM_FRAC: float = 0.25
     VLLM_TPU_ARRIVAL_TOUCH_MIN_FREE_FRAC: float = 0.10
@@ -2653,6 +2654,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # never loads and does not veto. Same bytes as a tier hit; scheduler-only.
     "VLLM_TPU_OFFLOAD_DIVERGENT_HITS": env_bool(
         "VLLM_TPU_OFFLOAD_DIVERGENT_HITS", default=False
+    ),
+    # q38 PSTEP-VASYNC, with QWEN4_EXP_HOST_TIER_POLICY=victim: N > 0 evicts
+    # ahead up to N blocks a pool from the head of the free queue, stores them
+    # without waiting and holds them out of the free queue and the prefix cache
+    # until each store job is terminal, so allocations take clean blocks instead
+    # of evicting and draining a store in the schedule pass. An allocation the
+    # free queue cannot hold drains the held jobs first (today's synchronous
+    # drain). 0 (default) off. Scheduler-only (offload/raiden_connector.py
+    # _VictimAsync); device programs unchanged.
+    "VLLM_TPU_OFFLOAD_VICTIM_ASYNC": env_nonnegative_int(
+        "VLLM_TPU_OFFLOAD_VICTIM_ASYNC", 0
     ),
     # Scheduler: when a request enters the waiting queue, pin its cached HBM
     # prefix blocks until it is scheduled or ends, and refresh the host-tier
