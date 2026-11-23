@@ -51,9 +51,11 @@ def _run(
     zero: tuple[str, ...] = (),
     identical_experts: bool = False,
     hc_fp8: bool = False,
+    hc_prefetch: bool = False,
+    tiles: Tiles = _TILES,
 ):
     R = 2
-    ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
+    ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=tiles)
     # Router gain: eight chained layers drift enough for a near-tied top-k router logit
     # to flip one row's expert set; the library tests use the same knob for the same
     # reason.
@@ -75,7 +77,9 @@ def _run(
                 q, sc = wi._fp8_columns(w)
                 d["hc"][name][k] = (q.astype(jnp.float32) * sc[..., None, :]).astype(w.dtype)
     ref, kv_ref = wi.wholestep_reference(G, ex, d, L)
-    spec = wholestep_spec(G, R, L=L, qsa=dict(budget=BUDGET), hc_fp8=hc_fp8)
+    spec = wholestep_spec(
+        G, R, L=L, qsa=dict(budget=BUDGET), hc_fp8=hc_fp8, hc_prefetch=hc_prefetch
+    )
     w_mk, states = wi.pack_wholestep(spec, G, ex, d, L, hc_fp8=hc_fp8)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
@@ -294,7 +298,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
            async_dma: bool = False, B: int | None = None, xreq: int = 0,
            skip_idle: bool = False, xmerge: bool = False, key_mp: int = 0, key_slots: int = 2,
            req_async: int = 0, nvis_balance: bool = False, uattn_lite: bool = False,
-           key_lanes: int = 0, export: bool = False):
+           key_lanes: int = 0, export: bool = False, hc_prefetch: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -351,6 +355,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
             max_groups=MG, pages_per_seq=pps, debug=True, async_dma=async_dma,
             **(long_kw if long else {}), **(dict(export_ids=True) if export else {})
         ),
+        hc_prefetch=hc_prefetch,
     )
     w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
@@ -1286,7 +1291,7 @@ def test_last_layer_step_with_per_layer_metadata_matches_reference(T):
         assert dd.mean() < 3e-2 * k * scale, (r, dd.mean() / scale)
 
 
-def _partial_last_cycle_run(tiles, export: bool = False):
+def _partial_last_cycle_run(tiles, export: bool = False, hc_prefetch: bool = False):
     """`L = 5`, `first="qsa"` whole-step call; returns (kernel residual, reference).
     `export`: also `(SEL_IDS, last QSA layer's DBG_IDS)` (the served L45 export)."""
     R, T, Lt = 2, 4, 5
@@ -1309,7 +1314,8 @@ def _partial_last_cycle_run(tiles, export: bool = False):
         **(dict(export_ids=True, debug=True) if export else {}),
     )
     spec = wholestep_spec(
-        G, R, L=Lt, qsa=dict(budget=BUDGET), step=True, indexed=idx, first="qsa"
+        G, R, L=Lt, qsa=dict(budget=BUDGET), step=True, indexed=idx, first="qsa",
+        hc_prefetch=hc_prefetch,
     )
     w_mk, states = wi.pack_wholestep(spec, G, ex, d, Lt)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
@@ -1750,3 +1756,99 @@ def test_skip_idle_buckets_keeps_nvis_balance_bit_identical(monkeypatch):
     base = _main_run(monkeypatch, 16, skip_idle=False, nvis_balance=True, **kw)
     assert np.isfinite(base[0]).all()
     _assert_xreq_identical(base, run)
+
+
+# --------------------------------------------------------------------------------------
+# VLLM_TPU_MK_HC_PREFETCH: each HC sublayer's `hdn` through one VMEM buffer, one sublayer
+# ahead (`HdnPrefetch`). VLLM_TPU_MK_GDN_DRAIN_LATE: tests/megakernel/test_qwen38_gdn_pool.py.
+
+
+def test_hc_prefetch_side_weights_leave_the_dense_schedule():
+    """`hdn` is tiled and packed as before (same operand shapes and order) but no longer
+    in the dense stream schedule; every other weight keeps its order."""
+    from vllm_torchtpu.megakernel import planner
+
+    ex = ExecSpec(R=2, B=8, T=4, ctx=128, interpret=True, tiles=_TILES)
+    p0 = planner.plan(wholestep_spec(G, 2, L=L, qsa=dict(budget=BUDGET)), ex)
+    p1 = planner.plan(wholestep_spec(G, 2, L=L, qsa=dict(budget=BUDGET), hc_prefetch=True), ex)
+    assert p1.w_names == p0.w_names
+    assert planner.weight_shapes(p1.model_spec, ex, p1) == planner.weight_shapes(
+        p0.model_spec, ex, p0)
+    hdn = {"moe_hdn", "gdn_hdn", "qsa_full_hdn"}
+    assert hdn <= set(p1.static_kinds)
+    for s0, s1 in zip(p0.branch_segs, p1.branch_segs):
+        assert [k for k, *_ in s1] == [k for k, *_ in s0 if k not in hdn]
+    assert p1.T_TOTAL < p0.T_TOTAL
+
+
+@pytest.mark.parametrize("hc_fp8", [False, True])
+def test_hc_prefetch_bit_identical(hc_fp8):
+    """`first="gdn"` cycles (GDN x3, QSA): residual and KV byte-identical."""
+    base = _run(identical_experts=True, hc_fp8=hc_fp8)
+    run = _run(identical_experts=True, hc_fp8=hc_fp8, hc_prefetch=True)
+    np.testing.assert_array_equal(run[0], base[0])
+    np.testing.assert_array_equal(run[3], base[3])
+
+
+@pytest.mark.parametrize("tiles", [
+    dataclasses.replace(_TILES, rel_fetch=True),
+    # `dmatmul`'s pair path (TINY cannot split `hdn` into two K tiles: other weights'
+    # 128-row tiles need the 1 MiB bank; the served FULL `hdn` is two tiles, TPU DHASH).
+    dataclasses.replace(_TILES, dense_acc_pair=True),
+], ids=["rel_fetch", "pair_path"])
+def test_hc_prefetch_partial_last_cycle_bit_identical(tiles):
+    """The served L45 form: `first="qsa"`, a partial last cycle ending on its QSA layer,
+    per-layer metadata; the chain's first copy in the prologue, none after the last."""
+    base, _ = _partial_last_cycle_run(tiles)
+    run, _ = _partial_last_cycle_run(tiles, hc_prefetch=True)
+    np.testing.assert_array_equal(run, base)
+
+
+def test_hc_prefetch_wrong_layer_is_caught(monkeypatch):
+    """Positive control: HC(MoE) prefetching this layer's mixer `hdn` instead of the next
+    layer's changes the residual (the compared outputs do read `hc_pf`)."""
+    from vllm_torchtpu.megakernel.blocks.hc import block as hcb
+
+    base = _run(identical_experts=True)
+    orig = hcb.HCSublayer._pf_next
+
+    def stale(self, ctx, lyr):
+        if self.name == self.pf.moe:
+            return orig(self, ctx, lyr - 1)
+        return orig(self, ctx, lyr)
+
+    monkeypatch.setattr(hcb.HCSublayer, "_pf_next", stale)
+    run = _run(identical_experts=True, hc_prefetch=True)
+    assert not np.array_equal(run[0], base[0])
+
+
+def test_main_hc_prefetch_and_gdn_drain_bit_identical(monkeypatch):
+    """The served main-call form (sharded selection, union attention, request loop) with
+    both VLLM_TPU_MK_HC_PREFETCH and VLLM_TPU_MK_GDN_DRAIN_LATE: every output identical."""
+    base = _main_run(monkeypatch, 8)
+    monkeypatch.setenv("VLLM_TPU_MK_GDN_DRAIN_LATE", "1")
+    run = _main_run(monkeypatch, 8, hc_prefetch=True)
+    assert np.isfinite(base[0]).all()
+    _assert_live_identical(base, run, 4)
+
+
+def test_hc_prefetch_mode_buckets(monkeypatch):
+    """Per-bucket gate: listed buckets only, never above 32 rows; mode 2 trades two dense
+    ring slots in the main call's tiles only (not the draft's)."""
+    from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_call as wc
+
+    monkeypatch.delenv("VLLM_TPU_MK_HC_PREFETCH", raising=False)
+    monkeypatch.delenv("VLLM_TPU_MK_HC_PREFETCH_BUCKETS", raising=False)
+    assert [wc.hc_prefetch_mode(b) for b in (4, 16, 32)] == [0, 0, 0]
+    nbd = {b: wc.wholestep_tiles(b, 1024, main=True).nbd for b in (4, 16, 24, 48, 64)}
+    monkeypatch.setenv("VLLM_TPU_MK_HC_PREFETCH", "1")
+    assert [wc.hc_prefetch_mode(b) for b in (4, 8, 16, 24, 32, 48, 64)] == [1] * 5 + [0, 0]
+    monkeypatch.setenv("VLLM_TPU_MK_HC_PREFETCH_BUCKETS", "4;8")
+    assert [wc.hc_prefetch_mode(b) for b in (4, 8, 16, 32)] == [1, 1, 0, 0]
+    monkeypatch.setenv("VLLM_TPU_MK_HC_PREFETCH", "2")
+    monkeypatch.setenv("VLLM_TPU_MK_HC_PREFETCH_BUCKETS", "4,8,16,24,32,48,64")
+    for b in (4, 16, 24):
+        assert wc.wholestep_tiles(b, 1024, main=True).nbd == nbd[b] - 2
+        assert wc.wholestep_tiles(b, 1024).nbd == nbd[b]
+    for b in (48, 64):
+        assert wc.wholestep_tiles(b, 1024, main=True).nbd == nbd[b]

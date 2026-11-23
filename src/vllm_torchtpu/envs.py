@@ -195,6 +195,8 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS: str = ""
     VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC: bool = False
     VLLM_TPU_MK_GDN_DRAIN_LATE: bool = False
+    VLLM_TPU_MK_HC_PREFETCH: int = 0
+    VLLM_TPU_MK_HC_PREFETCH_BUCKETS: str = "4,8,16,24,32"
     VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_MK_WHOLE_L45: bool = False
     VLLM_TPU_MK_WHOLE_EXPORT_SELECTION: bool = False
@@ -1395,6 +1397,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of before it, so the write-back drain overlaps the projection's weight stream.
     # Exact: scheduling only, same values in the same buffers.
     "VLLM_TPU_MK_GDN_DRAIN_LATE": env_bool("VLLM_TPU_MK_GDN_DRAIN_LATE"),
+    # Whole-step megakernel (main call): each HC sublayer's `<name>_hdn` mix weight leaves
+    # the dense ring and is copied whole into one VMEM buffer as soon as the previous HC
+    # sublayer has used it, i.e. one sublayer ahead (`HCSublayer` `hdn_prefetch`). 1: +1
+    # buffer (FP8: 3.75 MiB); 2: the same with two fewer dense ring slots (VMEM-neutral).
+    # Exact: same K tiles, same accumulation order. Only in the row buckets of
+    # VLLM_TPU_MK_HC_PREFETCH_BUCKETS, never above 32 rows (c32 b48 / b64 unchanged).
+    "VLLM_TPU_MK_HC_PREFETCH": env_int("VLLM_TPU_MK_HC_PREFETCH", 0),
+    "VLLM_TPU_MK_HC_PREFETCH_BUCKETS": env_str(
+        "VLLM_TPU_MK_HC_PREFETCH_BUCKETS", "4,8,16,24,32"
+    ),
     # Whole-step megakernel: also run the last QSA layer (model layer 47) in the whole-step
     # call, as a one-layer kernel after layers 3..46, its step tokens written with theirs;
     # the stock L47 attention core and last segment kernel are skipped.

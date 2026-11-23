@@ -139,7 +139,7 @@ class _WholeKind:
                 self.layout,
                 self.qsa,
                 L=self.L,
-                tiles=wholestep_tiles(B, self.kw["max_groups"]),
+                tiles=wholestep_tiles(B, self.kw["max_groups"], main=True),
                 tail=self.tail,
                 **self.kw,
             )

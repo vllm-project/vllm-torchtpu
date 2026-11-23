@@ -33,6 +33,13 @@ weights stream as FP8 E4M3 with per-output-column scales (`<name>_hdn_s`,
 inner
 block alone and `xn` is recomputed for the injection (`<name>_hinj`).
 
+`hdn_prefetch` (`HdnPrefetch`, whole-step main call, VLLM_TPU_MK_HC_PREFETCH):
+`<name>_hdn` is not streamed through the dense ring (`stream_ring="side"`). One VMEM buffer `hc_pf`
+holds the next HC sublayer's whole `hdn`: right after a sublayer's `hdn` matmul has read
+it, the next sublayer's copy starts (HC(mixer) -> HC(MoE) of the same layer, HC(MoE) ->
+the next layer's HC(mixer)), so it lands while the inner block runs. Same K tiles and
+accumulation order as the ring (`TwoRing.side_matmul`): bit-identical outputs.
+
 The inner block sees a context whose geometry is `inner_geometry` (width `h`)
 and whose `xb` / `part` buffers are `h` wide; everything else (stream, smalls,
 states) is the kernel's. The wrapper takes the inner block's name, so the
@@ -55,6 +62,22 @@ from ...spec import Block, ScratchReq, SmallField, StateDecl, WeightDecl
 from .comm import hc_comm_scratch, hc_drain, hc_ring
 
 RESIDUAL_OUT = "hc_res"
+
+
+@dataclasses.dataclass(frozen=True)
+class HdnPrefetch:
+    """The chain of HC sublayers whose `hdn` weights go through the `hc_pf` buffer.
+
+    `mixers`: the HC(mixer) block names in `SwitchSlot` branch order, `counts` their
+    per-cycle layer counts (branch 0 runs at `l % period < counts[0]`, so layer 0 is
+    branch 0); `moe`: the HC(MoE) block name (every layer, after the mixer)."""
+
+    mixers: tuple[str, ...]
+    counts: tuple[int, ...]
+    moe: str
+
+    def is_b1(self, lyr: Any) -> Any:
+        return (lyr % sum(self.counts)) >= self.counts[0]
 
 
 def _as_reqs(scr: Any) -> list[ScratchReq]:
@@ -85,6 +108,7 @@ class HCSublayer(Block):
         emit_residual: bool = False,
         ar_slot: int = 0,
         fp8_weights: bool = False,
+        hdn_prefetch: HdnPrefetch | None = None,
     ) -> None:
         self.inner = inner
         self.gi = inner_geometry
@@ -96,6 +120,7 @@ class HCSublayer(Block):
         self.emit_residual = bool(emit_residual)
         self.ar_slot = int(ar_slot)
         self.fp8 = bool(fp8_weights) and self.mix
+        self.pf = hdn_prefetch if self.mix else None
         self.prefix = getattr(inner, "prefix", "")
 
     # ------------------------------------------------------------ geometry
@@ -125,8 +150,11 @@ class HCSublayer(Block):
         n = self.name
         if self.mix:
             dt = FP8 if self.fp8 else BF16
+            ring = "side" if self.pf is not None else "static"
             own = [
-                WeightDecl(f"{n}_hdn", K=self.width, N=self.n_down, dtype=dt),
+                WeightDecl(
+                    f"{n}_hdn", K=self.width, N=self.n_down, dtype=dt, stream_ring=ring
+                ),
             ] + [
                 WeightDecl(f"{n}_hup{b}", K=self.k_up, N=self.h, dtype=dt)
                 for b in range(self.nhc)
@@ -176,6 +204,15 @@ class HCSublayer(Block):
         ]
         if self.emit_residual:
             reqs.append(ScratchReq("hc_res_sem", pltpu.SemaphoreType.DMA(())))
+        if self.pf is not None:
+            k = f"{self.name}_hdn"
+            dt = FP8 if self.fp8 else BF16
+            reqs += [
+                ScratchReq(
+                    "hc_pf", pltpu.VMEM((plan.nt[k], plan.tk[k], self.n_down), dt)
+                ),
+                ScratchReq("hc_pf_sem", pltpu.SemaphoreType.DMA(())),
+            ]
         if self.allreduce:
             reqs += hc_comm_scratch(ex, self.h)
         return reqs
@@ -188,6 +225,36 @@ class HCSublayer(Block):
 
     def prologue(self, ctx: Any) -> None:
         self.inner.prologue(self._inner_ctx(ctx))
+        # Layer 0 is the first mixer branch: its HC `hdn` heads the prefetch chain.
+        pf = self.pf
+        if pf is not None and self.name == pf.mixers[0] and "dense" not in ctx.skip:
+            o = ctx.stream.sp.block_ord(jnp.int32(0), self.name)
+            self._pf_copy(ctx, self.name, o).start()
+
+    # ------------------------------------------------------- hdn prefetch
+    @staticmethod
+    def _pf_copy(ctx: Any, name: str, o: Any) -> Any:
+        return pltpu.make_async_copy(
+            ctx.W[f"{name}_hdn"].at[o], ctx.scr["hc_pf"], ctx.scr["hc_pf_sem"]
+        )
+
+    def _pf_next(self, ctx: Any, lyr: Any) -> None:
+        """Start the next HC sublayer's `hdn` copy into `hc_pf` (this one read it)."""
+        pf, sp = self.pf, ctx.stream.sp
+        assert pf is not None
+        if "dense" in ctx.skip:
+            return
+        if self.name != pf.moe:  # HC(mixer) -> this layer's HC(MoE)
+            self._pf_copy(ctx, pf.moe, sp.block_ord(lyr, pf.moe)).start()
+            return
+        nxt = lyr + 1  # HC(MoE) -> the next layer's HC(mixer), whichever branch it is
+        b1 = pf.is_b1(nxt)
+        for b, name in enumerate(pf.mixers):
+            on = b1 if b == 1 else jnp.logical_not(b1)
+
+            @pl.when(jnp.logical_and(nxt < sp.L, on))
+            def _(name=name):
+                self._pf_copy(ctx, name, sp.block_ord(nxt, name)).start()
 
     def init_buffers(self, ctx: Any) -> None:
         ctx.scr["hc_g"][...] = jnp.zeros(ctx.scr["hc_g"].shape, BF16)
@@ -211,13 +278,20 @@ class HCSublayer(Block):
         inj = 2.0 * jax.nn.sigmoid(rnd(y[:, : self.nhc]) / self.nhc)
         ctx.scr["hc_inj"][:, : self.nhc] = inj
 
-    def _mix(self, ctx: Any, slot: Any) -> Any:
+    def _mix(self, ctx: Any, slot: Any, lyr: Any = None) -> Any:
         """HC mix into `scr['hc_xb']`; returns the mixed input as f32."""
         n, nhc, lr, h = self.name, self.nhc, self.lowrank, self.h
         s, scr = ctx.stream, ctx.scr
         with ctx.sc("hc_mix"):
             self._normalize(ctx, slot)
-            y = s.dmatmul(f"{n}_hdn", scr["xb"], self.n_down)
+            if self.pf is not None:
+                if "dense" not in ctx.skip:
+                    with ctx.sc("hc_pf_wait", 2):
+                        self._pf_copy(ctx, n, 0).wait()
+                y = s.side_matmul(f"{n}_hdn", scr["hc_pf"], scr["xb"], self.n_down)
+                self._pf_next(ctx, lyr)
+            else:
+                y = s.dmatmul(f"{n}_hdn", scr["xb"], self.n_down)
             if self.fp8:
                 y = y * ctx.sm(slot, f"{n}_hdn_s")
             gate = rnd(jax.nn.silu(rnd(rnd(y[:, :lr]) / nhc)))
@@ -248,7 +322,7 @@ class HCSublayer(Block):
         s = ctx.stream
         with s.segment(lazy=False):
             if self.mix:
-                mixed = self._mix(ctx, slot)
+                mixed = self._mix(ctx, slot, l)
             else:
                 with ctx.sc("hc_inj"):
                     self._normalize(ctx, slot)

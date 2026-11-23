@@ -26,6 +26,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..blocks.hc import HCSublayer
+from ..blocks.hc.block import HdnPrefetch
 from ..models.qwen38 import (
     QWEN38_SEGMENT,
     Qwen38GDN,
@@ -51,12 +52,17 @@ def wholestep_spec(
     first: str = "gdn",
     tail: dict[str, Any] | None = None,
     hc_fp8: bool = False,
+    hc_prefetch: bool = False,
 ) -> ModelSpec:
     """`L` (a multiple of `att_every`) layers starting at a group boundary (layer 0 =
     GDN).
 
     `hc_fp8`: FP8 mix weights for the layers' HC(mixer) and HC(MoE) sublayers
     (`HCSublayer(fp8_weights=True)`); the tail's HC (`tail`) stays BF16.
+
+    `hc_prefetch`: the layers' HC sublayers take their `hdn` mix weight through one VMEM
+    buffer filled one sublayer ahead (`HdnPrefetch`, VLLM_TPU_MK_HC_PREFETCH); needs a
+    two-branch mixer (`L > 1`). Same outputs bit for bit.
 
     `indexed`: `QSAFullIndexedBlock` options (`max_groups`, `pages_per_seq`) — the
     indexer,
@@ -74,8 +80,9 @@ def wholestep_spec(
         gdn_cls = Qwen38GDN
     gi = g.inner(R, L)  # L = 1: one QSA layer, no GDN
     hc = dict(inner_geometry=gi, nhc=g.NHC, lowrank=g.LOWRANK)
-    hcl = dict(hc, fp8_weights=hc_fp8)  # the layers' sublayers (not the tail)
-    gdn = HCSublayer(gdn_cls(geometry=gi), ar_slot=0, **hcl)
+    # The layers' sublayers (not the tail).
+    hcl: dict[str, Any] = dict(hc, fp8_weights=hc_fp8)
+    gdn_inner = gdn_cls(geometry=gi)
     if indexed is not None and step:  # stage C: + the step's own tokens and group
         from .qsa_full_c import QSAFullStepBlock
 
@@ -86,6 +93,16 @@ def wholestep_spec(
         qsa_block = QSAFullIndexedBlock(**indexed, **(qsa or {}))
     else:
         qsa_block = QSAFullBlock(**(qsa or {}))
+    moe_inner = Qwen38MoE(geometry=gi, moe_tp=False)
+    if hc_prefetch:
+        assert L > 1, "hc_prefetch needs the two-branch mixer"
+        c0 = 1 if first == "qsa" else g.att_every - 1  # branch 0 layers per cycle
+        names = (qsa_block.name, gdn_inner.name) if first == "qsa" else (
+            gdn_inner.name, qsa_block.name)
+        hcl["hdn_prefetch"] = HdnPrefetch(
+            mixers=names, counts=(c0, g.att_every - c0), moe=moe_inner.name
+        )
+    gdn = HCSublayer(gdn_inner, ar_slot=0, **hcl)
     attn = HCSublayer(qsa_block, ar_slot=0, **hcl)
     # Counts are per cycle (period = att_every): branch 0 runs at l % period < c0.
     # `first="qsa"`
@@ -102,9 +119,7 @@ def wholestep_spec(
         mixer = SwitchSlot(
             "mixer", branches=(gdn, attn), branch_counts=(g.att_every - 1, 1)
         )
-    moe = HCSublayer(
-        Qwen38MoE(geometry=gi, moe_tp=False), ar_slot=1, emit_residual=True, **hcl
-    )
+    moe = HCSublayer(moe_inner, ar_slot=1, emit_residual=True, **hcl)
     slots: tuple = (mixer, moe)
     if (
         tail is not None

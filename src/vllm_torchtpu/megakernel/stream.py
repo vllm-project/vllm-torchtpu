@@ -462,6 +462,59 @@ class TwoRing:
             lax.fori_loop(1, n_s, body_pair, 0)
         return acc[:, :N]
 
+    def side_matmul(self, kind: str, buf: Any, xsrc, N: int):
+        """`acc[:, :N] = xsrc[:, :K] @ W(kind)` with the tiles already in VMEM `buf`
+        (`[nt, tk, N]`, a `stream_ring="side"` weight): the K tiles, the MXU calls and
+        the f32 accumulation order of `dmatmul` (both its paths); no ring slot, no
+        cursor."""
+        sp = self.sp
+        n_t, t_k = sp.nt[kind], sp.tk[kind]
+        acc = self.scr["acc"]
+        DMU = min(sp.dmm_unroll, sp.NBD)
+        if n_t <= DMU or sp.dense_acc_pair:
+            DCW = 512
+            U = n_t if n_t <= DMU else (2 if n_t % 2 == 0 and N > DCW else 1)
+            chunks = [(c0, min(DCW, N - c0)) for c0 in range(0, N, DCW)]
+            n_s = n_t // U
+
+            def step(t, first):
+                ws, xs = [], []
+                for u in range(U):
+                    ws.append(buf.at[t + u])
+                    k0 = (t + u) * t_k
+                    if not isinstance(k0, int):
+                        k0 = pl.multiple_of(k0, t_k)
+                    xs.append(xsrc[:, pl.ds(k0, t_k)])
+                for c0, cw in chunks:
+                    p = self.mm(xs[0], ws[0][:, c0 : c0 + cw])
+                    for u in range(1, U):
+                        p = p + self.mm(xs[u], ws[u][:, c0 : c0 + cw])
+                    if first:
+                        acc[:, c0 : c0 + cw] = p
+                    else:
+                        acc[:, c0 : c0 + cw] += p
+
+            step(0, True)
+            if n_s == 2:
+                step(U, False)
+            elif n_s > 2:
+
+                def body_pair(i, carry):
+                    step(i * U, False)
+                    return carry
+
+                lax.fori_loop(1, n_s, body_pair, 0)
+            return acc[:, :N]
+        acc[:, :N] = jnp.zeros((sp.MB, N), F32)
+
+        def body(t, carry):
+            k0 = pl.multiple_of(t * t_k, t_k)
+            acc[:, :N] += self.mm(xsrc[:, pl.ds(k0, t_k)], buf.at[t][...])
+            return carry
+
+        lax.fori_loop(0, n_t, body, 0)
+        return acc[:, :N]
+
     def dmatmul(
         self,
         kind: str,

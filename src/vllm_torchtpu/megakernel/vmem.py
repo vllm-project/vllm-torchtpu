@@ -347,6 +347,8 @@ def build_scratch(
 
     if typed:
         for k in p.static_kinds:
+            if p.weight_decls[k].stream_ring == "side":  # not in the dense ring
+                continue
             scratch["dring_" + k] = pltpu.VMEM((NBD,) + vshape[k], vdtype[k])
             phase_map["dring_" + k] = "persistent"
         for k in p.dynamic_kinds:

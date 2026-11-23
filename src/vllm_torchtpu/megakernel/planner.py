@@ -247,7 +247,7 @@ def plan(
             assert w.name not in weight_decls, f"Duplicate weight declaration: {w.name}"
             weight_decls[w.name] = w
             weight_owners[w.name] = b.name
-            if w.stream_ring == "static":
+            if w.stream_ring in ("static", "side"):
                 kinds[w.name] = (w.K, w.N, w.dtype)
                 static_kinds.append(w.name)
             elif w.stream_ring == "dynamic":
@@ -406,7 +406,7 @@ def weight_shapes(
     for name, w in p.weight_decls.items():
         owner = p.weight_owners[name]
         l_cnt = max(1, p.block_layer_counts[owner])
-        if w.stream_ring in ("static", "dynamic"):
+        if w.stream_ring in ("static", "dynamic", "side"):
             t_shape = (p.nt[name], p.tk[name], w.N)
             if w.layout == "per_layer":
                 out[name] = tuple(

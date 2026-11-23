@@ -65,7 +65,9 @@ class WeightDecl:
     K: int  # Reduction dimension (or row dim for non-streamed HBM weight)
     N: int  # Output column dimension per rank
     dtype: Any
-    stream_ring: Literal["static", "dynamic", "hbm"] = "static"
+    # "side": tiled and packed like "static" (same `[L, nt, tk, N]` operand), but not
+    # in the dense stream schedule; the owning block copies it (`HCSublayer` prefetch).
+    stream_ring: Literal["static", "dynamic", "hbm", "side"] = "static"
     layout: Literal["stacked", "per_layer"] = "stacked"
     lead_dims: tuple[int, ...] = ()  # Extra per-layer leading dims (e.g. `(EW,)`)
 

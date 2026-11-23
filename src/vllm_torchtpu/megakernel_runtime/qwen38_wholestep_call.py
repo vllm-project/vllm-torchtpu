@@ -211,6 +211,11 @@ def mk_options_line(B: int, spec: Any, tiles: Any, label: str = "MK") -> str:
     if blk is not None:
         parts += [f"{k}={_fmt(getattr(blk, a))}" for k, a in _MK_BLOCK_FIELDS if hasattr(blk, a)]
     parts += [f"{k}={_fmt(getattr(tiles, k))}" for k in _MK_TILE_FIELDS if hasattr(tiles, k)]
+    # Off by default: listed only when on, so the line is unchanged otherwise.
+    if any(getattr(b, "pf", None) is not None for b in spec.all_blocks()):
+        parts.append("hc_prefetch=1")
+    if envs.VLLM_TPU_MK_GDN_DRAIN_LATE:
+        parts.append("gdn_drain_late=1")
     return f"qwen38 {label} options b{B}: " + " ".join(parts)
 
 
@@ -282,6 +287,21 @@ def skip_idle_on(B: int | None) -> bool:
     return B is not None and str(B) in bucket_entries(raw)
 
 
+# VLLM_TPU_MK_HC_PREFETCH (exact; envs.py): never above this many rows, so the c32 b48 / b64
+# kernels (DCP-2 pair buffers, no VMEM for the 3.75 MiB `hc_pf`) are unchanged.
+HC_PREFETCH_MAX_ROWS = 32
+
+
+def hc_prefetch_mode(B: int | None) -> int:
+    """VLLM_TPU_MK_HC_PREFETCH of the `B`-row main kernel: 0 off, 1 `hdn` through `hc_pf`,
+    2 the same with two fewer dense ring slots (VMEM-neutral). 0 unless `B` is listed in
+    VLLM_TPU_MK_HC_PREFETCH_BUCKETS and `B <= HC_PREFETCH_MAX_ROWS`."""
+    mode = int(envs.VLLM_TPU_MK_HC_PREFETCH or 0)
+    if mode <= 0 or B is None or B > HC_PREFETCH_MAX_ROWS:
+        return 0
+    return mode if str(B) in bucket_entries(envs.VLLM_TPU_MK_HC_PREFETCH_BUCKETS) else 0
+
+
 def main_call_options(B: int | None = None) -> dict:
     """Main whole-step call only (the draft passes its own `skip_idle`): VLLM_TPU_MK_QSA_XMERGE
     (one exchange per QSA layer) and `skip_idle` (request loops stop after the last live
@@ -336,7 +356,7 @@ def _apply_tile_overrides(t: Tiles, over: dict[str, Any]) -> Tiles:
     return t.with_blocks(blocks) if blocks else t
 
 
-def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
+def wholestep_tiles(B: int, max_groups: int = 0, main: bool = False) -> Tiles:
     """`_wholestep_tiles`; with main-KV DCP-2 up to 32 rows the expert ring drops one more 2 MiB
     slot: the pair exchange buffers and the doubled-head union attention put b32 (f32 state)
     over scoped VMEM (tpu_bench_wholestep_call j-677db355: CompileTimeScopedVmemOom), and the
@@ -373,6 +393,11 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     # VLLM_TPU_MK_BUCKET_TUNE: per-bucket core / block knobs (BUCKET_TUNE, by row bucket).
     if envs.VLLM_TPU_MK_BUCKET_TUNE:
         t = _apply_tile_overrides(t, BUCKET_TUNE.get(B, {}))
+    # VLLM_TPU_MK_HC_PREFETCH=2: the `hdn` tiles left the dense ring; two fewer 2 MiB slots
+    # pay for the 3.75 MiB `hc_pf` buffer (`nbd` is a scheduling knob: exact).
+    # `main`: the main whole-step call's tiles (not the draft's, which has no prefetch).
+    if main and hc_prefetch_mode(B) == 2:
+        t = dataclasses.replace(t, nbd=max(2, t.nbd - 2))
     t = _vmem_cuts(t, B)
     # VLLM_TPU_MK_TILES="nbd=14,rel_fetch=1,gdn.gdn_bufs=3" (bench sweeps): any core field or
     # `<block>.<field>` tunable.
@@ -500,7 +525,7 @@ def build_wholestep_call(
     # VLLM_TPU_MK_DEBUG_SKIP=experts,comm,...: phase ablation (benchmarks only; wrong outputs).
     skip = frozenset(x for x in os.environ.get("VLLM_TPU_MK_DEBUG_SKIP", "").split(",") if x)
     ex = ExecSpec(
-        R=R, B=B, T=T, ctx=128, tiles=wholestep_tiles(B, max_groups) if tiles is None else tiles,
+        R=R, B=B, T=T, ctx=128, tiles=wholestep_tiles(B, max_groups, main=True) if tiles is None else tiles,
         interpret=interpret, debug=DebugOptions(scopes=scopes, skip=skip),
     )
     # QSA layers in the L-layer kernel (first="qsa": a partial last cycle is its QSA
@@ -530,6 +555,8 @@ def build_wholestep_call(
                 **({"export_ids": True} if export_ids else {}),
             ),
             hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
+            # The L-layer kernel only (the one-layer tail has no next HC to prefetch).
+            hc_prefetch=layers > 1 and hc_prefetch_mode(B) > 0,
         )
 
     export_main = export and not tail
