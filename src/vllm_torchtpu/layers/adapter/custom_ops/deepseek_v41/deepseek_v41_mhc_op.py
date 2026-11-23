@@ -78,12 +78,14 @@ def _post_pre_rms_jax(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     tokens, mult = pre.shape
     dim = flat.shape[1] // mult
-    # Every op is per token, so the kernel takes the tokens padded to its
-    # 32-token mix groups: the real rows are the kernel's rows. 16-token
-    # groups run slower than the XLA layer at decode sizes (72 rows padded to
-    # 80: 25.0 us against 20.1), 96 rows take 11.7.
-    padded = -(-tokens // 32) * 32
-    if not shifted_post_pre_rms.is_supported_shape(padded, mult, dim):
+    # Every op is per token, so the tokens run in 32-token mix groups, padded
+    # when needed: the real rows are bitwise the kernel's rows. Up to one
+    # tile (128 rows, whole 8-row tiles) the kernel moves only the real rows.
+    # 16-token groups (240 rows: 20.8 us against 43.9 padded) round
+    # differently, so they wait for their accuracy check.
+    supported = shifted_post_pre_rms.is_supported_shape
+    padded = tokens if tokens <= 128 and tokens % 8 == 0 else -(-tokens // 32) * 32
+    if not supported(padded, mult, dim):
         return _unfused(
             x,
             flat,

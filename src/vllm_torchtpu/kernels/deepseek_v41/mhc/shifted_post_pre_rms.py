@@ -43,7 +43,8 @@ def _truncate_bf16(values: jax.Array) -> jax.Array:
 
 
 def is_supported_shape(t: int, m: int, d: int) -> bool:
-    return t > 0 and t % 16 == 0 and m == 4 and d == 5120
+    # Up to one tile, only the real rows move: DMAs take whole 8-row tiles.
+    return t > 0 and t % (8 if t <= 128 else 16) == 0 and m == 4 and d == 5120
 
 
 def _token_tile(t: int) -> int:
@@ -79,7 +80,9 @@ def shifted_post_pre_rms(
     """Update residuals and collapse with incoming pre; predict gates separately.
 
     TPU7x: M=4, D=5120, positive local T divisible by 16 (by 32 uses 32-token
-    mix groups; otherwise 16-token groups, e.g. T=240 in 80-token tiles).
+    mix groups; otherwise 16-token groups, e.g. T=240 in 80-token tiles), or
+    T up to 128 divisible by 8: one tile of T rounded up to 32, moving only
+    the T real rows (decode's 72 rows need no padded copies around the call).
     Activations are BF16; gates are FP32. Weight is packed BF16 [20480,128].
     Three-component mixing and BF16 residual/collapse rounding are retained;
     streamed square sums change the reference reduction order.
@@ -95,8 +98,12 @@ def shifted_post_pre_rms(
         activation tiles are still in flight instead of after they land.
     """
     t, d = x.shape
-    token_tile = _token_tile(t)
-    num_tiles = t // token_tile
+    # Every op is per token except the block-diagonal mix, which multiplies a
+    # group's rows together: pad rows only need to be finite (masked to zero).
+    ragged = t % 32 != 0 and t <= 128
+    rows = -(-t // 32) * 32 if ragged else t
+    token_tile = rows if ragged else _token_tile(t)
+    num_tiles = rows // token_tile
     input_buffers = min(3, num_tiles)
     output_buffers = min(2, num_tiles)
     # Early stores shorten the drain for batches that fit in the input buffers.
@@ -108,7 +115,7 @@ def shifted_post_pre_rms(
     assert info.chip_version == pltpu.ChipVersion.TPU_7X, "Requires TPU7x"
     mixes = m * (m + 2)
     assert is_supported_shape(t, m, d)
-    gate_tokens = (t + 127) // 128 * 128
+    gate_tokens = (rows + 127) // 128 * 128
     tuning = PostPreTuning(
         token_tile, 32 if token_tile % 32 == 0 else 16, 256, 50 * 1024 * 1024
     )
@@ -253,23 +260,29 @@ def shifted_post_pre_rms(
 
         def input_copies(tile_index):
             slot = tile_index % input_buffers
-            rows = pl.ds(tile_index * tile, tile)
+            src = pl.ds(0, t) if ragged else pl.ds(tile_index * tile, tile)
+            dst = pl.ds(0, t) if ragged else pl.ds(0, tile)
             return (
                 pltpu.make_async_copy(
-                    xh.at[rows, :], input_x.at[slot], input_sems.at[slot, 0]
+                    xh.at[src, :], input_x.at[slot, dst, :], input_sems.at[slot, 0]
                 ),
                 pltpu.make_async_copy(
-                    rh.at[rows, :], input_residual.at[slot], input_sems.at[slot, 1]
+                    rh.at[src, :],
+                    input_residual.at[slot, dst, :],
+                    input_sems.at[slot, 1],
                 ),
             )
 
         def output_copy(tile_index, component):
             slot = tile_index % output_buffers
-            rows = pl.ds(tile_index * tile, tile)
+            dst = pl.ds(0, t) if ragged else pl.ds(tile_index * tile, tile)
+            src = pl.ds(0, t) if ragged else pl.ds(0, tile)
             source = (output_y, output_v)[component]
             target = (yh, vh)[component]
             return pltpu.make_async_copy(
-                source.at[slot], target.at[rows, :], output_sems.at[slot, component]
+                source.at[slot, src, :],
+                target.at[dst, :],
+                output_sems.at[slot, component],
             )
 
         def output_copies(tile_index):
@@ -290,9 +303,22 @@ def shifted_post_pre_rms(
             slot = tile_index % 2
             for ri in range(tile // group):
                 r = pl.ds(ri * group, group)
-                acts[:group, :] = xr[r, :]
+                live = t - ri * group if ragged else group
+                if live < group:  # rows past T hold stale VMEM
+
+                    def real(v):
+                        keep = jax.lax.broadcasted_iota(jnp.int32, v.shape, 0) < live
+                        return jnp.where(keep, v, jnp.zeros_like(v))
+                else:
+
+                    def real(v):
+                        return v
+
+                acts[:group, :] = real(xr[r, :])
                 for i in range(m):
-                    acts[pl.ds((i + 1) * group, group), :] = rr[r, pl.ds(i * d, d)]
+                    acts[pl.ds((i + 1) * group, group), :] = real(
+                        rr[r, pl.ds(i * d, d)]
+                    )
                 # Accumulate squares from the rounded residual in column order.
                 residual_squares = jnp.zeros((group, 128), jnp.float32)
                 c = jnp.pad(
@@ -409,7 +435,10 @@ def shifted_post_pre_rms(
         store_projection(projection_buf[...], num_tiles - 1)
 
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    gate_args = (post.reshape(t, m).T, comb.transpose(1, 2, 0), pre.T)
+    gate_args = tuple(
+        jnp.pad(g, [(0, 0)] * (g.ndim - 1) + [(0, rows - t)])
+        for g in (post.reshape(t, m).T, comb.transpose(1, 2, 0), pre.T)
+    )
     if gate_input_mode == GateInputMode.HBM:
         gate_spec = hbm
         gate_args = tuple(

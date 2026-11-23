@@ -72,8 +72,8 @@ def test_early_prep_is_bitwise_identical(tokens):
 @pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU7x mHC kernel")
 @pytest.mark.parametrize("tokens", [240, 72, 60])
 def test_padded_tokens_equal_the_kernel_rows(tokens):
-    """Tokens off the 32-token groups run padded; the kernel is per token, so
-    their rows equal the same rows of an aligned call bitwise."""
+    """Tokens off the 32-token groups (one ragged tile, or padded) equal the
+    same rows of an aligned call bitwise: the kernel is per token."""
     from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
         deepseek_v41_mhc_op as op,
     )
