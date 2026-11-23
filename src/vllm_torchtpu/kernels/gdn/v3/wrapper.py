@@ -87,12 +87,17 @@ def inner_kernel(
         p_id = pl.program_id(0)
 
     # Prepare states.
-    real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
+    real_sizes, prev_conv = vmem_ldst.load_and_select_conv_state(
         metadata_ref=metadata_ref,
         p_id=p_id,
         conv_state_in_slot_ref=conv_state_in_slot_ref,
-        recurrent_in_slot_ref=recurrent_in_slot_ref,
         carry_conv_scratch_ref=carry_conv_scratch_ref,
+        cfg=cfg,
+    )
+    prev_recurrent = vmem_ldst.load_and_select_recurrent_state(
+        metadata_ref=metadata_ref,
+        p_id=p_id,
+        recurrent_in_slot_ref=recurrent_in_slot_ref,
         carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
         cfg=cfg,
     )
