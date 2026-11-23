@@ -37,11 +37,15 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
 from vllm_torchtpu import envs  # noqa: E402
+from vllm_torchtpu.megakernel_runtime import qwen38_gdn_state as gs  # noqa: E402
 from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_inputs as wsi  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.qwen38_io_lean import (  # noqa: E402
     LEVERS,
     io_lean_levers,
     ring_columns,
+)
+from vllm_torchtpu.megakernel_runtime.qwen38_scatter import (  # noqa: E402
+    scatter_gdn_ckpts_fast,
 )
 
 
@@ -54,7 +58,7 @@ def test_lever_parsing():
     assert io_lean_levers("0") == frozenset()
     assert io_lean_levers("1") == frozenset(LEVERS)
     assert io_lean_levers("all") == frozenset(LEVERS)
-    assert io_lean_levers("ring") == {"ring"}
+    assert io_lean_levers("ring, conv") == {"ring", "conv"}
     with pytest.raises(AssertionError):
         io_lean_levers("rign")
 
@@ -157,3 +161,61 @@ def test_cktab_negative_control(monkeypatch):
     monkeypatch.setattr(wsi, "manager_page_table_direct", wrong)
     with pytest.raises(AssertionError):
         test_qsa_step_inputs_lean_is_bitwise(4, True, False, monkeypatch)
+
+
+# --- conv: the scatter reads windows from the history -------------------------------------
+
+NL, NS, T = 2, 3, 4
+NMB = 1 + NL * NS * T
+
+
+def _scatter_case(seed, kb, pad):
+    shape = (NMB * (512 // kb), kb, 1, 4, 256)
+    layout = gs.Qwen38GdnPoolLayout(pool_shape=shape, pool_dtype="float8_e4m3fn")
+    rng = np.random.default_rng(seed)
+    raw = rng.integers(0, 256, size=shape, dtype=np.uint8)
+    pool = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
+    conv = jnp.asarray(rng.standard_normal((NL, NS, 8, 1280)), jnp.float32)
+    rec = jnp.asarray(rng.standard_normal((NL, NS * T * 6, 128, 128)), jnp.float32).astype(
+        jnp.bfloat16)
+    wb = 1 + np.arange(NL * NS * T, dtype=np.int32).reshape(NL, NS, T)
+    if pad:
+        wb[:, -1] = 0
+    return pool, conv, rec, jnp.asarray(wb), layout
+
+
+@pytest.mark.parametrize("kb,pad,ring,prefetch", [
+    (128, False, 4, 1), (128, True, 4, 1), (512, True, 4, 3), (128, True, 16, 12),
+    (512, False, 12, 6),
+])
+def test_scatter_from_history_is_bitwise(kb, pad, ring, prefetch):
+    pool, conv, rec, wb, layout = _scatter_case(kb + ring, kb, pad)
+    kw = dict(layout=layout, interpret=True, ring=ring, prefetch=prefetch)
+    want = scatter_gdn_ckpts_fast(pool, conv, rec, wb, hist=False, **kw)
+    got = scatter_gdn_ckpts_fast(pool, conv, rec, wb, hist=True, **kw)
+    np.testing.assert_array_equal(
+        _bytes(jax.lax.bitcast_convert_type(got, jnp.uint8)),
+        _bytes(jax.lax.bitcast_convert_type(want, jnp.uint8)))
+
+
+def test_scatter_from_history_follows_the_flag(monkeypatch):
+    """Unset `hist` reads VLLM_TPU_MK_IO_LEAN (conv); the result stays the same bytes."""
+    pool, conv, rec, wb, layout = _scatter_case(3, 128, True)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "conv", raising=False)
+    got = scatter_gdn_ckpts_fast(pool, conv, rec, wb, layout=layout, interpret=True)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "", raising=False)
+    want = scatter_gdn_ckpts_fast(pool, conv, rec, wb, layout=layout, interpret=True)
+    np.testing.assert_array_equal(
+        _bytes(jax.lax.bitcast_convert_type(got, jnp.uint8)),
+        _bytes(jax.lax.bitcast_convert_type(want, jnp.uint8)))
+
+
+def test_scatter_from_history_negative_control():
+    """The history shifted by one row (a window off by one) must change the conv rows."""
+    pool, conv, rec, wb, layout = _scatter_case(5, 128, False)
+    kw = dict(layout=layout, interpret=True, ring=4, prefetch=1)
+    want = scatter_gdn_ckpts_fast(pool, conv, rec, wb, hist=False, **kw)
+    got = scatter_gdn_ckpts_fast(pool, jnp.roll(conv, 1, axis=2), rec, wb, hist=True, **kw)
+    assert not np.array_equal(
+        _bytes(jax.lax.bitcast_convert_type(got, jnp.uint8)),
+        _bytes(jax.lax.bitcast_convert_type(want, jnp.uint8)))
