@@ -19,6 +19,9 @@ with SparseCore; `test_mla_kv_cache_utils.py` covers the reference itself on
 CPU.
 """
 
+import os
+from unittest import mock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -441,6 +444,178 @@ class SparseMLAScatterTest(parameterized.TestCase):
             written += int(rows.any(axis=1).sum())
         # Ownership is a partition: every valid token on exactly one rank.
         self.assertEqual(written, inp["num_tokens"])
+
+    @parameterized.named_parameters(
+        dict(
+            testcase_name=f"t{num_tokens}_rope{rope_words}w",
+            num_tokens=num_tokens,
+            rope_words=rope_words,
+        )
+        for num_tokens in (1, 37, 300, 1030)
+        for rope_words in (16, 32)
+    )
+    def test_scatter_rows_pair_matches_two_scatter_rows(self, num_tokens, rope_words):
+        """`scatter_rows_pair` equals one `scatter_rows` call per cache.
+
+        The caches start with random words, so a dropped write and a stray
+        write both show up. `dst_rows` mixes distinct valid rows with
+        `SKIP_ROW`, other negative rows and rows past the end of the cache.
+        The token counts are not multiples of the lane count, so the kernel
+        also sees its own padding tokens. Both widths of the rope row are
+        covered: 16 words (64-byte token) and 32 words (128-byte token).
+        """
+        nope_words = LKV_DIM // kv_cache_utils.WORD_BYTES
+        num_rows = 64 * PAGE_SIZE
+        rng = np.random.default_rng(num_tokens * 100 + rope_words)
+        dst = rng.choice(num_rows, size=num_tokens, replace=False).astype(np.int32)
+        kind = rng.integers(0, 8, size=num_tokens)
+        dst = np.where(kind == 0, SKIP_ROW, dst)
+        dst = np.where(kind == 1, -1, dst)
+        dst = np.where(kind == 2, num_rows + rng.integers(0, 4096, num_tokens), dst)
+        dst_rows = jnp.asarray(dst, jnp.int32)
+
+        keys = jax.random.split(jax.random.PRNGKey(num_tokens), 4)
+        nope_cache = jax.random.bits(keys[0], (64, PAGE_SIZE, nope_words), jnp.uint32)
+        rope_cache = jax.random.bits(
+            keys[1],
+            (
+                64,
+                PAGE_SIZE * rope_words // kv_cache_utils.TILE_LANE_BYTES,
+                kv_cache_utils.TILE_LANE_BYTES,
+            ),
+            jnp.uint32,
+        )
+        nope_src = jax.random.bits(keys[2], (num_tokens, nope_words), jnp.uint32)
+        rope_src = jax.random.bits(keys[3], (num_tokens, rope_words), jnp.uint32)
+
+        want_nope = scatter_utils.scatter_rows(nope_cache, nope_src, dst_rows)
+        want_rope = scatter_utils.scatter_rows(rope_cache, rope_src, dst_rows)
+        got_nope, got_rope = scatter_utils.scatter_rows_pair(
+            nope_cache, nope_src, rope_cache, rope_src, dst_rows
+        )
+        np.testing.assert_array_equal(np.asarray(got_nope), np.asarray(want_nope))
+        np.testing.assert_array_equal(np.asarray(got_rope), np.asarray(want_rope))
+
+        # The two-call path itself must write exactly the valid tokens.
+        valid = (dst >= 0) & (dst < num_rows)
+        np.testing.assert_array_equal(
+            np.asarray(got_nope).reshape(num_rows, nope_words)[dst[valid]],
+            np.asarray(nope_src)[valid],
+        )
+        np.testing.assert_array_equal(
+            np.asarray(got_rope).reshape(num_rows, rope_words)[dst[valid]],
+            np.asarray(rope_src)[valid],
+        )
+
+    @parameterized.named_parameters(
+        dict(
+            testcase_name=f"d{dcp_size}_i{interleave_size}_rope{rope_dim}",
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+            rope_dim=rope_dim,
+        )
+        for dcp_size, interleave_size in ((2, 4), (4, 64), (8, 16))
+        for rope_dim in (ROPE_DIM, 128)
+    )
+    def test_dcp_update_with_kv_write_pair(self, dcp_size, interleave_size, rope_dim):
+        """`TPU_MLA_SC_KV_WRITE_PAIR=1` leaves the DCP writer's result unchanged.
+
+        On every rank, the one-program writer must equal the two-program
+        writer (the flag unset) and the pure-XLA golden
+        `update_sparse_mla_kv_cache_dcp_jax`, bit for bit. The inputs cover
+        rows owned by other ranks (`OOB_PAGE`, so `SKIP_ROW`), a padded tail
+        whose length is not a multiple of the lane count, block-table
+        ordinals past the end of the shard, and caches that start with random
+        words.
+        """
+        inp = self._generate_inputs(8, 16, 512, 64)
+        num_pages = inp["num_pages"]
+        specs = {
+            "nope_spec": SparseMLAKVCacheSpec.create(
+                KVCacheType.NOPE,
+                KVCacheLayout.SPARSECORE,
+                num_pages,
+                PAGE_SIZE,
+                LKV_DIM,
+                KV_PACKING,
+            ),
+            "rope_spec": SparseMLAKVCacheSpec.create(
+                KVCacheType.ROPE,
+                KVCacheLayout.SPARSECORE,
+                num_pages,
+                PAGE_SIZE,
+                rope_dim,
+                KV_PACKING,
+            ),
+        }
+        num_pad = 21
+
+        def _pad(values):
+            # On the uint8 view: a float8 concatenate canonicalizes NaN bytes.
+            raw = jax.lax.bitcast_convert_type(values, jnp.uint8)
+            tail = jnp.full((num_pad, raw.shape[1]), 0xAB, jnp.uint8)
+            return jax.lax.bitcast_convert_type(
+                jnp.concatenate([raw, tail], axis=0), values.dtype
+            )
+
+        # Every other ordinal is shifted by whole shards: the writer resolves
+        # it with `% num_pages`, so it addresses the same page.
+        block_tables = np.asarray(inp["block_tables"]).copy()
+        block_tables[::2] += num_pages * (1 + np.arange(block_tables[::2].size) % 3)
+
+        keys = jax.random.split(jax.random.PRNGKey(7), 2)
+        args = (
+            jax.random.bits(keys[0], specs["nope_spec"].shape, jnp.uint32),
+            jax.random.bits(keys[1], specs["rope_spec"].shape, jnp.uint32),
+            _pad(inp["kv_c_normed"]),
+            _pad(
+                jax.lax.bitcast_convert_type(
+                    jax.random.randint(
+                        jax.random.PRNGKey(9),
+                        (inp["num_tokens"], rope_dim),
+                        0,
+                        256,
+                        jnp.uint8,
+                    ),
+                    jnp.float8_e4m3fn,
+                )
+            ),
+            inp["seq_lens"],
+            jnp.asarray(block_tables),
+            inp["query_start_loc"],
+        )
+        for rank in range(dcp_size):
+            kwargs = dict(specs, dcp_size=dcp_size, interleave_size=interleave_size)
+            with (
+                mock.patch.dict(os.environ, {"TPU_MLA_SC_KV_WRITE_PAIR": "1"}),
+                mock.patch.object(
+                    scatter, "scatter_pair", wraps=scatter.scatter_pair
+                ) as pair_spy,
+            ):
+                got = kv_cache_utils.update_sparse_mla_kv_cache_dcp(
+                    *args, jnp.int32(rank), **kwargs
+                )
+            # The flag must route to the pair writer, or this test compares
+            # the two-program writer with itself.
+            self.assertEqual(pair_spy.call_count, 1)
+            with mock.patch.dict(os.environ, {"TPU_MLA_SC_KV_WRITE_PAIR": "0"}):
+                two_calls = kv_cache_utils.update_sparse_mla_kv_cache_dcp(
+                    *args, jnp.int32(rank), **kwargs
+                )
+            want = kv_cache_utils.update_sparse_mla_kv_cache_dcp_jax(
+                *args, jnp.int32(rank), **kwargs
+            )
+            for name, g, t, w in zip(("nope", "rope"), got, two_calls, want):
+                np.testing.assert_array_equal(
+                    np.asarray(g),
+                    np.asarray(t),
+                    err_msg=f"rank {rank}: {name} pair writer differs from two calls",
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(g),
+                    np.asarray(w),
+                    err_msg=f"rank {rank}: {name} pair writer differs from jnp",
+                )
 
 
 class ScatterContractTest(parameterized.TestCase):

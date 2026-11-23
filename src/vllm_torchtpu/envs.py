@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
+    TPU_MLA_SC_KV_WRITE_PAIR: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -468,6 +469,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
+    # Sparse MLA KV cache write: when both the nope and the rope cache use
+    # the SPARSECORE layout, write a step's new tokens into both caches with
+    # one SparseCore program (`scatter_rows_pair`) instead of one program per
+    # cache. The second program otherwise waits for the first, then adds an
+    # idle gap and a program launch on every layer. Bit-identical caches.
+    "TPU_MLA_SC_KV_WRITE_PAIR": env_bool("TPU_MLA_SC_KV_WRITE_PAIR", default=False),
     # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
     # with the unified GDN state pool: its kernel reads segment-major
     # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must

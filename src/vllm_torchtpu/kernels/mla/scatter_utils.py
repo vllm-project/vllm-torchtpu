@@ -219,3 +219,184 @@ def scatter_rows(
     )(dst_rows, src.reshape(-1, row_width), cache_ref)
 
     return jax.freeze(cache_ref).reshape(cache.shape)
+
+
+def _scatter_pair_kernel(
+    dst_hbm_ref: Any,
+    nope_src_ref: Any,
+    rope_src_ref: Any,
+    nope_cache_ref: Any,
+    rope_cache_ref: Any,
+    sem: Any,
+    *,
+    core_axis_name: str,
+    subcore_axis_name: str,
+    plan: Plan,
+) -> None:
+    """Copies one nope row and one rope row per lane to the same row index.
+
+    The structure is the same as `_scatter_kernel` with `tc_tiled=False`. Each
+    lane starts both of its copies before any lane waits, so the two DMAs of a
+    token are in flight together. `sem` holds `2 * plan.lanes_per_block`
+    semaphores: entry `i` belongs to the nope copy of lane `i`, and entry
+    `plan.lanes_per_block + i` to its rope copy.
+    """
+    core_index = lax.axis_index((core_axis_name, subcore_axis_name))
+    # Both caches hold one row per token slot, so a row index addresses the
+    # same (page, slot) in each. `scatter_rows_pair` asserts equal row counts.
+    num_rows = nope_cache_ref.shape[0]
+
+    block_slot = core_index // plan.cores_per_block
+    lane_group = lax.rem(core_index, plan.cores_per_block)
+
+    def block_index(step):
+        return step * plan.blocks_per_round + block_slot
+
+    def body(dst_ref, nope_buf, rope_buf):
+        dst_rows = dst_ref[...]
+        copies = []
+        for i in range(plan.lanes_per_block):
+            dst = dst_rows[i]
+            write = jnp.logical_and(dst >= 0, dst < num_rows)
+            if plan.cores_per_block > 1:
+                write = jnp.logical_and(write, lane_group == i // plan.lanes_per_core)
+            row = jnp.clip(dst, 0, num_rows - 1)
+            nope_copy = pltpu.make_async_copy(
+                nope_buf.at[pl.ds(i, 1)],
+                nope_cache_ref.at[pl.ds(row, 1)],
+                sem.at[i],
+            )
+            rope_copy = pltpu.make_async_copy(
+                rope_buf.at[pl.ds(i, 1)],
+                rope_cache_ref.at[pl.ds(row, 1)],
+                sem.at[plan.lanes_per_block + i],
+            )
+            copies.append((write, nope_copy, rope_copy))
+
+            @pl.when(write)
+            def _(nope_copy=nope_copy, rope_copy=rope_copy):
+                nope_copy.start()
+                rope_copy.start()
+
+        for write, nope_copy, rope_copy in copies:
+
+            @pl.when(write)
+            def _(nope_copy=nope_copy, rope_copy=rope_copy):
+                nope_copy.wait()
+                rope_copy.wait()
+
+    pltpu.emit_pipeline(
+        body,
+        grid=(plan.steps_per_core,),
+        tiling=pltpu.Tiling.SPARSE_CORE,
+        in_specs=(
+            pl.BlockSpec(
+                (plan.lanes_per_block,),
+                lambda r: (block_index(r),),
+            ),
+            pl.BlockSpec(
+                (plan.lanes_per_block, nope_src_ref.shape[-1]),
+                lambda r: (block_index(r), 0),
+            ),
+            pl.BlockSpec(
+                (plan.lanes_per_block, rope_src_ref.shape[-1]),
+                lambda r: (block_index(r), 0),
+            ),
+        ),
+    )(dst_hbm_ref, nope_src_ref, rope_src_ref)
+
+
+def scatter_rows_pair(
+    nope_cache: jax.Array,
+    nope_src: jax.Array,
+    rope_cache: jax.Array,
+    rope_src: jax.Array,
+    dst_rows: jax.Array,
+    name: str = "scatter_nope_rope_sparsecore_cache",
+) -> tuple[jax.Array, jax.Array]:
+    """Writes one token row into each of two caches in one SparseCore program.
+
+    The result is the same as two `scatter_rows` calls with the same
+    `dst_rows`. One program instead of two removes, per call, the second
+    program's launch and the idle time between the two programs, and it lets
+    the nope and rope DMAs of a token run at the same time. Only the native
+    SparseCore layout (uint32, one word row per token) is supported.
+
+    Args:
+      nope_cache: uint32 nope KV cache in HBM, any leading dims; flattened to
+        one row of `nope_src.shape[-1]` words per token.
+      nope_src: [num_tokens, nope_words] uint32 packed nope tokens.
+      rope_cache: uint32 rope KV cache in HBM, any leading dims; flattened to
+        one row of `rope_src.shape[-1]` words per token.
+      rope_src: [num_tokens, rope_words] uint32 packed rope tokens.
+      dst_rows: [num_tokens] destination row, the same in both caches. A
+        negative or out-of-range row drops the token from both caches.
+      name: Pallas kernel name, as it appears in a profile.
+
+    Returns:
+      The updated (nope_cache, rope_cache), same shapes and dtypes as the
+      inputs.
+    """
+    for label, cache, src in (
+        ("nope", nope_cache, nope_src),
+        ("rope", rope_cache, rope_src),
+    ):
+        assert cache.dtype == jnp.uint32 and src.dtype == jnp.uint32, (
+            f"{label}: the pair writer supports only the uint32 SparseCore"
+            f" layout (cache {cache.dtype}, src {src.dtype})"
+        )
+    assert nope_src.shape[0] == rope_src.shape[0] == dst_rows.shape[0], (
+        f"token counts differ: nope {nope_src.shape[0]}, rope"
+        f" {rope_src.shape[0]}, dst_rows {dst_rows.shape[0]}"
+    )
+    nope_rows = nope_cache.size // nope_src.shape[-1]
+    rope_rows = rope_cache.size // rope_src.shape[-1]
+    assert nope_rows == rope_rows, (
+        f"the caches hold different token counts ({nope_rows} nope rows,"
+        f" {rope_rows} rope rows), so one dst_rows cannot address both"
+    )
+
+    sc_info = pltpu.get_tpu_info().sparse_core
+    assert sc_info is not None, "SparseCore info is missing."
+    num_cores = sc_info.num_cores * sc_info.num_subcores
+    plan = split_plan(nope_src.shape[0], sc_info.num_lanes, num_cores)
+
+    pad_tokens = plan.total_tokens - nope_src.shape[0]
+    if pad_tokens > 0:
+        dst_rows = jnp.pad(
+            dst_rows, (0, pad_tokens), constant_values=kv_cache_utils.SKIP_ROW
+        )
+        nope_src = jnp.pad(nope_src, ((0, pad_tokens), (0, 0)))
+        rope_src = jnp.pad(rope_src, ((0, pad_tokens), (0, 0)))
+
+    nope_ref = jax.new_ref(nope_cache.reshape(-1, nope_src.shape[-1]))
+    rope_ref = jax.new_ref(rope_cache.reshape(-1, rope_src.shape[-1]))
+
+    vector_mesh = plsc.VectorSubcoreMesh(
+        num_cores=sc_info.num_cores,
+        num_subcores=sc_info.num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    pl.kernel(
+        functools.partial(
+            _scatter_pair_kernel,
+            core_axis_name=vector_mesh.core_axis_name,
+            subcore_axis_name=vector_mesh.subcore_axis_name,
+            plan=plan,
+        ),
+        out_type=(),
+        scratch_types=(pltpu.SemaphoreType.DMA((2 * plan.lanes_per_block,)),),
+        compiler_params=pltpu.CompilerParams(
+            use_tc_tiling_on_sc=False,
+            needs_layout_passes=True,
+            disable_bounds_checks=True,
+        ),
+        mesh=vector_mesh,
+        name=name,
+    )(dst_rows, nope_src, rope_src, nope_ref, rope_ref)
+
+    return (
+        jax.freeze(nope_ref).reshape(nope_cache.shape),
+        jax.freeze(rope_ref).reshape(rope_cache.shape),
+    )
