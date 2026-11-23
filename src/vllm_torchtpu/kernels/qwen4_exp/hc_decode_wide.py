@@ -90,11 +90,27 @@ VMEM_LIMIT = 56 << 20
 # q38 HCK schedule v2 (TPU_QWEN4_HC_DECODE_W1_SCHED).
 SCHED_LOOKAHEAD_MIB = 64
 ONEPASS_ROWS = 320
+# q38 HCK floor key (TPU_QWEN4_HC_DECODE_WIDE_MIN_ROWS): mode 1 below MIN_TOKENS, down to 64 rows, when every row
+# block holds at least two 32-row pieces (mode 1's served-piece loop asserts it).
+FLOOR_CHOICES = (64, 80, 96, 112, 128, 144)
 
 
-def wide_applies(tokens: int) -> bool:
-    """Whether ``tokens`` rows run this kernel (a concrete count)."""
-    return MIN_TOKENS <= tokens <= MAX_TOKENS and tokens % ROW_UNIT == 0
+def wide_applies(tokens: int, min_rows=None) -> bool:
+    """Whether ``tokens`` rows run this kernel (a concrete count).
+
+    ``min_rows`` (q38 HCK floor key, one of ``FLOOR_CHOICES``; mode 1 only) lowers
+    the floor from ``MIN_TOKENS``: below it, ``tokens >= min_rows`` and every row
+    block must hold at least two 32-row pieces. Unset, MIN_TOKENS-MAX_TOKENS as
+    before."""
+    if tokens % ROW_UNIT or tokens > MAX_TOKENS:
+        return False
+    if tokens >= MIN_TOKENS:
+        return True
+    if min_rows is None:
+        return False
+    if min_rows not in FLOOR_CHOICES:
+        raise ValueError(f"HC decode mix (wide): floor {min_rows!r} not in {FLOOR_CHOICES}")
+    return tokens >= min_rows and all(rows // SERVED_PIECE >= 2 for _, rows in row_blocks(tokens))
 
 
 def row_blocks(tokens: int, max_rows: int = BLOCK_ROWS) -> tuple:
@@ -579,6 +595,7 @@ def hc_decode_mix_wide(
     fold: bool = False,
     sched_dma: bool = False,
     sched_onepass: bool = False,
+    min_rows=None,
 ):
     """``hc_decode.hc_decode_mix`` for ``wide_applies`` row counts.
 
@@ -600,6 +617,10 @@ def hc_decode_mix_wide(
 
     ``sched_dma`` / ``sched_onepass`` (q38 HCK, ``TPU_QWEN4_HC_DECODE_W1_SCHED``;
     mode 1 only; kernel name gains ``s``): see the module docstring.
+
+    ``min_rows`` (q38 HCK floor key, ``TPU_QWEN4_HC_DECODE_WIDE_MIN_ROWS``; mode 1
+    only): accept the row counts ``wide_applies(tokens, min_rows)`` admits below
+    MIN_TOKENS. It changes only the accepted range, never the kernel body.
     """
     return _hc_decode_mix_wide(
         x,
@@ -619,6 +640,7 @@ def hc_decode_mix_wide(
         fold=fold,
         sched_dma=sched_dma,
         sched_onepass=sched_onepass,
+        min_rows=min_rows,
     )
 
 
@@ -647,6 +669,7 @@ def kernel_name(
         "fold",
         "sched_dma",
         "sched_onepass",
+        "min_rows",
     ),
 )
 def _hc_decode_mix_wide(
@@ -668,6 +691,7 @@ def _hc_decode_mix_wide(
     fold=False,
     sched_dma=False,
     sched_onepass=False,
+    min_rows=None,
 ):
     tokens, width = x.shape
     lowrank = down.shape[0]
@@ -677,13 +701,15 @@ def _hc_decode_mix_wide(
         raise ValueError(f"HC decode mix (wide): fold needs mode 1, got mode {mode}")
     if (sched_dma or sched_onepass) and mode != 1:
         raise ValueError(f"HC decode mix (wide): the HCK schedule needs mode 1, got mode {mode}")
+    if min_rows is not None and mode != 1:
+        raise ValueError(f"HC decode mix (wide): the HCK floor needs mode 1, got mode {mode}")
 
     # Without the injection gate there is nothing to fold: mode 1 unchanged.
     fold = bool(fold) and inject
     if (
         mode not in MODES
         or timing not in TIMINGS
-        or not wide_applies(tokens)
+        or not wide_applies(tokens, min_rows)
         or width != branches * hidden
         or hidden % CHUNK
         or weight.shape != (width,)
@@ -702,7 +728,7 @@ def _hc_decode_mix_wide(
     ):
         raise ValueError(
             "HC decode mix (wide) requires BF16 rows that are a multiple of 16 "
-            f"in [{MIN_TOKENS}, {MAX_TOKENS}] and mode 1, 2 or 3"
+            f"in [{MIN_TOKENS if min_rows is None else min_rows}, {MAX_TOKENS}] and mode 1, 2 or 3"
         )
 
     if sched_dma or sched_onepass:
@@ -712,6 +738,14 @@ def _hc_decode_mix_wide(
         print(
             f"q38 HCK W1_SCHED traced: rows {tokens}, kernel {kernel_name(prologue, mode, timing, fold, True)}, "
             f"sched_dma {int(bool(sched_dma))}, sched_onepass {int(bool(sched_onepass))}, b2 blocks {b2}",
+            flush=True,
+        )
+    if tokens < MIN_TOKENS:
+        # q38 HCK floor key trace-time engagement line (cold compile): the wide kernel below MIN_TOKENS.
+        print(
+            f"q38 HCK WIDE_MIN_ROWS traced: rows {tokens}, kernel "
+            f"{kernel_name(prologue, mode, timing, fold, bool(sched_dma or sched_onepass))}, floor {min_rows}, "
+            f"blocks {len(row_blocks(tokens))}",
             flush=True,
         )
     any_space = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
@@ -806,6 +840,7 @@ def hc_decode_mix_wide_auto(
     interpret=False,
     fold=False,
     sched=False,
+    min_rows=None,
 ):
     """``hc_decode_mix_wide`` where ``wide_applies``, else ``hc_decode_mix``.
 
@@ -814,6 +849,8 @@ def hc_decode_mix_wide_auto(
     reaches only the wide kernel; other row counts keep ``hc_decode_mix``.
     ``sched`` (q38 HCK, TPU_QWEN4_HC_DECODE_W1_SCHED; mode 1) turns on both
     schedule-v2 switches of the wide kernel; other row counts are unchanged.
+    ``min_rows`` (q38 HCK floor key; mode 1) lowers the wide floor; it is passed
+    on only below MIN_TOKENS, so calls at MIN_TOKENS and above are unchanged.
     """
     kwargs = dict(
         branches=branches,
@@ -823,9 +860,11 @@ def hc_decode_mix_wide_auto(
         prev_injection=prev_injection,
         interpret=interpret,
     )
-    if wide_applies(x.shape[0]):
+    if wide_applies(x.shape[0], min_rows):
         if sched:
             kwargs.update(sched_dma=True, sched_onepass=True)
+        if x.shape[0] < MIN_TOKENS:
+            kwargs.update(min_rows=min_rows)
         return hc_decode_mix_wide(
             x, weight, down, up, inject_weight, mode=mode, fold=fold, **kwargs
         )

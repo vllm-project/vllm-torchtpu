@@ -145,6 +145,17 @@ def _log_w1_sched(tag: str) -> None:
     print(msg, flush=True)
 
 
+@functools.cache
+def _log_wide_floor(tag: str, rows: int) -> None:
+    """q38 HCK floor-key runtime engagement line (once per tag, at decode HC op build)."""
+    msg = (
+        f"q38 HCK: TPU_QWEN4_HC_DECODE_WIDE_MIN_ROWS={rows} engaged: hc_decode_wide mode 1 "
+        f"from {rows} rows (multiples of 16, >= 2 32-row pieces per block), op tag {tag}"
+    )
+    logger.warning(msg)
+    print(msg, flush=True)
+
+
 def _decode_mix_choice():
     """The fused decode HC mix and its op-name tag.
 
@@ -159,10 +170,15 @@ def _decode_mix_choice():
     projection (_w1f); with WIDE 0, 2 or 3 it is refused.
     TPU_QWEN4_HC_DECODE_W1_SCHED=1 (q38 HCK) needs TPU_QWEN4_HC_DECODE_WIDE=1:
     the W1 kernel runs its schedule v2 (_w1s / _w1fs); refused otherwise.
+    TPU_QWEN4_HC_DECODE_WIDE_MIN_ROWS (q38 HCK floor key) needs
+    TPU_QWEN4_HC_DECODE_WIDE=1: mode 1 runs from that row count (tags gain
+    l<rows>); refused otherwise.
     """
     wide = envs.TPU_QWEN4_HC_DECODE_WIDE
     fold = envs.TPU_QWEN4_HC_DECODE_INJECT_FOLD
     sched = envs.TPU_QWEN4_HC_DECODE_W1_SCHED == "1"
+    floor = envs.TPU_QWEN4_HC_DECODE_WIDE_MIN_ROWS
+    min_rows = int(floor) if floor else None
     if fold and wide != 1:
         raise ValueError(
             "TPU_QWEN4_HC_DECODE_INJECT_FOLD needs TPU_QWEN4_HC_DECODE_WIDE=1 "
@@ -171,6 +187,11 @@ def _decode_mix_choice():
     if sched and wide != 1:
         raise ValueError(
             "TPU_QWEN4_HC_DECODE_W1_SCHED=1 needs TPU_QWEN4_HC_DECODE_WIDE=1 "
+            f"(got {wide})"
+        )
+    if min_rows is not None and wide != 1:
+        raise ValueError(
+            f"TPU_QWEN4_HC_DECODE_WIDE_MIN_ROWS={floor} needs TPU_QWEN4_HC_DECODE_WIDE=1 "
             f"(got {wide})"
         )
     if wide:
@@ -184,16 +205,23 @@ def _decode_mix_choice():
                 "TPU_QWEN4_HC_DECODE_WIDE and TPU_QWEN4_HC_DECODE_COMPARE are "
                 "exclusive"
             )
+        fl = {} if min_rows is None else {"min_rows": min_rows}
+        sfx = "" if min_rows is None else f"l{min_rows}"
         if sched:
-            tag = "_w1fs" if fold else "_w1s"
+            tag = ("_w1fs" if fold else "_w1s") + sfx
             _log_w1_sched(tag)
+            if fl:
+                _log_wide_floor(tag, min_rows)
             return (
-                functools.partial(hc_decode_mix_wide_auto, mode=1, fold=fold, sched=True),
+                functools.partial(hc_decode_mix_wide_auto, mode=1, fold=fold, sched=True, **fl),
                 tag,
             )
+        tag = ("_w1f" if fold else f"_w{wide}") + sfx
+        if fl:
+            _log_wide_floor(tag, min_rows)
         if fold:
-            return functools.partial(hc_decode_mix_wide_auto, mode=1, fold=True), "_w1f"
-        return functools.partial(hc_decode_mix_wide_auto, mode=wide), f"_w{wide}"
+            return functools.partial(hc_decode_mix_wide_auto, mode=1, fold=True, **fl), tag
+        return functools.partial(hc_decode_mix_wide_auto, mode=wide, **fl), tag
     if envs.TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID:
         if not envs.TPU_QWEN4_HC_DECODE_COMPARE:
             raise ValueError(

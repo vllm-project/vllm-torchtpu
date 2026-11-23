@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     TPU_QWEN4_HC_DECODE_WIDE: int = 0
     TPU_QWEN4_HC_DECODE_INJECT_FOLD: bool = False
     TPU_QWEN4_HC_DECODE_W1_SCHED: str = ""
+    TPU_QWEN4_HC_DECODE_WIDE_MIN_ROWS: str = ""
     TPU_QWEN4_HC_PREFILL_ODD_TILES: bool = False
     TPU_QWEN4_HC_PREFILL_FUSED_MIX: bool = False
     TPU_QWEN4_HC_PREFILL_PARTIAL_TILE: bool = False
@@ -1645,6 +1646,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Compile-hashed (read when the decode HC ops are built).
     "TPU_QWEN4_HC_DECODE_W1_SCHED": env_with_choices(
         "TPU_QWEN4_HC_DECODE_W1_SCHED", "", ["", "0", "1"]
+    ),
+    # q38 HCK floor key, only with TPU_QWEN4_HC_DECODE_WIDE=1 (refused otherwise):
+    # "64" / "80" / "96" / "112" / "128" / "144" lets the wide kernel's mode 1 run
+    # below its 160-row floor, at rows >= the value that are a multiple of 16 and
+    # whose row blocks each hold at least two 32-row pieces (hc_decode_wide.py
+    # wide_applies). Mode 1 keeps hc_decode.py's math on the same 32-row pieces
+    # (bitwise is decided by the HCK proofs). Rows >= 160 are unchanged; op tags
+    # gain "l<rows>". "" = off (default). Compile-hashed (read when the decode HC
+    # ops are built).
+    "TPU_QWEN4_HC_DECODE_WIDE_MIN_ROWS": env_with_choices(
+        "TPU_QWEN4_HC_DECODE_WIDE_MIN_ROWS", "", ["", "64", "80", "96", "112", "128", "144"]
     ),
     # qwen4_exp prefill: let the fused HC mix (hc_full) and the gated_residual
     # combine take any whole number (>= 2) of hc_prefill_full_tile tiles, not
