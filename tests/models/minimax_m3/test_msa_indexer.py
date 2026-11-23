@@ -158,13 +158,19 @@ def test_served_page_groups_match_reference(cache_kind, q_lens, ctx_lens):
         num_pages_r = -(-seq_lens[r] // PAGE)
         q_r = queries[cu_q[r] : cu_q[r + 1]]
         large = cu_q[r + 1] - cu_q[r] > msa_indexer.DEFAULT_BLOCK_Q
+        keys_r = keys[tables[r, :num_pages_r]]
         if large and msa_indexer.FP8_MXU_QUERIES and cache_kind != jnp.bfloat16:
             # The prefill tiles score e4m3 queries (msa_indexer.FP8_MXU_QUERIES).
             q_r = np.asarray(jnp.asarray(q_r).astype(jnp.float8_e4m3fn), np.float32)
-        expected = np.einsum("psd,td->tps", keys[tables[r, :num_pages_r]], q_r).max(-1)
-        np.testing.assert_allclose(
-            scores[cu_q[r] : cu_q[r + 1], :num_pages_r], expected, **tol
-        )
+        expected = np.einsum("psd,td->tps", keys_r, q_r).max(-1)
+        got = scores[cu_q[r] : cu_q[r + 1], :num_pages_r]
+        if large and cache_kind == "fp4":
+            # 4-bit keys times their scales round to e4m3 too: bounded as in
+            # `test_fp4_folded_prefill_tiles_close_to_reference`.
+            err = np.abs(got - expected) / np.abs(expected).mean()
+            assert err.max() < 0.12 and err.mean() < 0.025, (err.max(), err.mean())
+            continue
+        np.testing.assert_allclose(got, expected, **tol)
 
 
 @pytest.mark.parametrize("kernel", ["v1", "v2", "v3"])
