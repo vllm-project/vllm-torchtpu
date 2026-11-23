@@ -4746,6 +4746,24 @@ class TPUModelRunner(GPUModelRunner):
             *subtract_idx,
         )
 
+    def _materialize_input_ids(self) -> torch.Tensor:
+        """VLLM_TPU_PREP_LAZY_INPUT_IDS: this chunk's deferred input-ids
+        upload, issued now.
+
+        Exact: the same `.to()` of the same host slice; nothing writes
+        `input_ids_cpu` between the deferral point in `_prepare_inputs` and
+        the end of that call, where every unfolded step materializes it (only
+        the chunk's own index_select / zero padding / layout repack write it,
+        all before the deferral). A step that folds reads `self.input_ids`
+        only on the scatter, which materializes it here first; the 1:1 slice
+        takes its ids from the previous step's source and needs only the dtype
+        (`input_ids_cpu`'s, which `.to(device)` keeps)."""
+        if self.input_ids is None:
+            self.input_ids = self.input_ids_cpu[self._deferred_input_ids_slice].to(
+                self.device, non_blocking=True
+            )
+        return self.input_ids
+
     def _reused_comb_views(
         self, chunk_comb_key: tuple
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -4891,8 +4909,11 @@ class TPUModelRunner(GPUModelRunner):
         else:
             # The scatter, on fast substitution's padded num_tokens-long indices
             # (the same cached uploads the unfolded path would use).
+            input_ids = self.input_ids
+            if input_ids is None:  # VLLM_TPU_PREP_LAZY_INPUT_IDS
+                input_ids = self._materialize_input_ids()
             subst_args = (
-                self.input_ids,
+                input_ids,
                 *self._cached_substitution_indices(num_tokens, cur, pre),
             )
         adapter_args, static = self.model_adapter.prep_fold_args(
@@ -4909,7 +4930,11 @@ class TPUModelRunner(GPUModelRunner):
             *adapter_args,
             *subst_args,
         )
-        static = dict(num_tokens=num_tokens, ids_dtype=self.input_ids.dtype, **static)
+        # A deferred upload has its host source's dtype (VLLM_TPU_PREP_LAZY_INPUT_IDS).
+        ids_dtype = (
+            self.input_ids_cpu if self.input_ids is None else self.input_ids
+        ).dtype
+        static = dict(num_tokens=num_tokens, ids_dtype=ids_dtype, **static)
         # The full key walks every operand (~20 us of host time per step); the
         # operands' shapes vary only with these, so remember each verdict.
         fast = (
@@ -5213,9 +5238,21 @@ class TPUModelRunner(GPUModelRunner):
             self.input_ids_cpu[
                 total_num_scheduled_tokens:padded_total_num_scheduled_tokens
             ] = 0
-        self.input_ids = self.input_ids_cpu[local_token_slice].to(
-            self.device, non_blocking=True
+        # VLLM_TPU_PREP_LAZY_INPUT_IDS: a step that may fold uploads its input
+        # ids only if something reads them (`_materialize_input_ids`).
+        defer_input_ids = bool(
+            envs.VLLM_TPU_PREP_LAZY_INPUT_IDS
+            and envs.VLLM_TPU_PREFWD_PREP_FOLD
+            and layout_plan.kind is SequenceLayoutKind.ALL
+            and not self._pcp_enabled
         )
+        if defer_input_ids:
+            self.input_ids = None
+            self._deferred_input_ids_slice = local_token_slice
+        else:
+            self.input_ids = self.input_ids_cpu[local_token_slice].to(
+                self.device, non_blocking=True
+            )
         if self.uses_mrope:
             if layout_plan.kind is SequenceLayoutKind.ALL:
                 self.mrope_positions.cpu[
@@ -5534,6 +5571,9 @@ class TPUModelRunner(GPUModelRunner):
                     seq_lens, prep_fold_subtract
                 )
 
+        if defer_input_ids and self.input_ids is None and self._prep_fold_out is None:
+            # Not folded: execute_model substitutes into self.input_ids.
+            self._materialize_input_ids()
         host_phases.mark("prep_host_and_uploads")
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
