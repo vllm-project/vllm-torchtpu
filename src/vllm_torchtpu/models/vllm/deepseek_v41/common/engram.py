@@ -1358,10 +1358,13 @@ class Engram(upstream.Engram):
         x = embedded.flatten(-2)
         if self._fused_gate(x):
             assert _ENGRAM_GATE_OP is not None, "initialize_engram_gate() first"
-            # The op's output is shaped like hidden_states alone; without the
-            # XLA path's broadcast nothing tells the tracer that the embedding
-            # rows are the same tokens, and that row count stays symbolic.
+            # The op's output is shaped like hidden_states alone. The XLA
+            # path's broadcasts told the tracer that the embedding rows and
+            # the mask are the same tokens; without them each row count stays
+            # its own symbol, which a static-size compile cannot resolve.
             torch._check(x.shape[0] == hidden_states.shape[0])
+            if token_mask is not None:
+                torch._check(token_mask.shape[0] == hidden_states.shape[0])
             return _ENGRAM_GATE_OP(
                 x,
                 self.wkv.weight,
