@@ -211,7 +211,7 @@ def _fp4_bf16_fast(kv_ref, scratch_ref) -> jax.Array:
 _PV8_UNIT = 64.0
 _FP8_MAX = 448.0
 PREFILL_PRECISION_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION"
-_PRECISION_LEVERS = ("qk8", "pv8", "msub", "unpk")
+_PRECISION_LEVERS = ("qk8", "pv8", "msub", "unpk", "e16")
 # 4-bit `attend` levers (default off, not bitwise):
 # "msub": no running max per score. A group's shift is m = max(m_prev, max
 # over the raw scaled scores of the group's FIRST page + _MSUB_HEADROOM),
@@ -222,6 +222,8 @@ _PRECISION_LEVERS = ("qk8", "pv8", "msub", "unpk")
 # "unpk": int4 -> bf16 by bit arithmetic: two nibbles of a word become one
 # 32-bit lane of two bf16 values 128 + (n ^ 8) (exponent bits OR'ed in),
 # interleaved into slot order by strided VMEM stores, minus 136 (exact).
+# "e16": p = exp2(s - m) and p * v_scale in bf16 (p enters the PV dot in
+# bf16 anyway); l sums the bf16 p in f32.
 # Debug-only removal arms (timing; outputs wrong): rmmax, rmsum, rmvs, rmks,
 # rmmask, rmunpk.
 _DEBUG_LEVERS = ("rmmax", "rmsum", "rmvs", "rmks", "rmmask", "rmunpk")
@@ -559,6 +561,7 @@ def _kernel(
     vt_t = not fp4 and ("vt" in precision or lmxu_t)
     out_unit = 1.0 / _PV8_UNIT if pv8 else 1.0
     msub = fp4 and "msub" in precision
+    e16 = fp4 and "e16" in precision
     dbg = precision & frozenset(_DEBUG_LEVERS) if fp4 else frozenset()
 
     def group_head(w):
@@ -1067,12 +1070,17 @@ def _kernel(
                     m_new = jnp.maximum(m_prev, jnp.zeros_like(s[:, :1]))
                 elif not msub:
                     m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
-                p = jnp.exp2(s - m_new)
-                if "rmsum" in dbg:
-                    l_cur = jnp.ones_like(p[:, :1])
+                if e16:
+                    p = jnp.exp2((s - m_new).astype(jnp.bfloat16))
+                    l_cur = jnp.sum(p.astype(jnp.float32), axis=1, keepdims=True)
+                    p_v = p * v_scale.astype(jnp.bfloat16)
                 else:
-                    l_cur = jnp.sum(p, axis=1, keepdims=True)
-                p_v = p * v_scale if fp4 and "rmvs" not in dbg else p
+                    p = jnp.exp2(s - m_new)
+                    if "rmsum" in dbg:
+                        l_cur = jnp.ones_like(p[:, :1])
+                    else:
+                        l_cur = jnp.sum(p, axis=1, keepdims=True)
+                    p_v = p * v_scale if fp4 and "rmvs" not in dbg else p
                 pv = jax.lax.dot_general(
                     p_v.astype(v.dtype),
                     v,
