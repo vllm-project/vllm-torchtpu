@@ -32,11 +32,15 @@ INTERPRET = os.environ.get("INTERPRET", "1") == "1"
 S, D, K, HG = 128, 128, 16, 16
 ENV = "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION"
 # Relative rms output error bound vs the oracle (incumbent: bf16 rounding only).
-BOUNDS = {"": 1e-2, "pv8": 4e-2, "qk8": 6e-2, "qk8,pv8": 8e-2}
-LSE_BOUNDS = {"": 1e-5, "pv8": 1e-5, "qk8": 0.3, "qk8,pv8": 0.3}
+BOUNDS = {"": 1e-2, "pv8": 4e-2, "qk8": 6e-2, "qk8,pv8": 8e-2,
+          "qk8,msub": 6e-2, "qk8,unpk": 6e-2, "qk8,msub,unpk": 6e-2, "unpk": 1e-2}
+LSE_BOUNDS = {"": 1e-5, "pv8": 1e-5, "qk8": 0.3, "qk8,pv8": 0.3,
+              "qk8,msub": 0.3, "qk8,unpk": 0.3, "qk8,msub,unpk": 0.3, "unpk": 1e-5}
+# Levers that must give their partner's bits ("unpk" unpacks the same values).
+SAME_BITS = {"qk8,unpk": "qk8", "unpk": ""}
 
 
-def make(T, seed, G, wide=False):
+def make(T, seed, G, wide=False, qscale=1.5):
     rng = np.random.default_rng(seed)
     pool, nkeys = 64, 48
     sel = np.full((T, G, K), -1, np.int32)
@@ -54,7 +58,7 @@ def make(T, seed, G, wide=False):
     local = sel[:, 0, 0].copy()
     ll = (pos % S + 1).astype(np.int32)
     pt = rng.permutation(pool)[:nkeys].astype(np.int32)
-    q = jnp.asarray(rng.standard_normal((T, G * HG, D)) * 1.5, jnp.bfloat16)
+    q = jnp.asarray(rng.standard_normal((T, G * HG, D)) * qscale, jnp.bfloat16)
     nib = jnp.asarray(rng.integers(0, 16, size=(pool, S, G * 2 * D)), jnp.uint8)
     kv = msa_fp4.pack_rows(nib)
     scv = rng.uniform(0.02, 0.4, size=(pool, msa_fp4.scale_rows(G), S))
@@ -114,6 +118,8 @@ def errors(new, ora):
 
 CASES = (
     (2, 128, False, dict(page_cache_slots=512)),
+    # c64 head-parallel config (8:64::1024, 16 query heads a tile)
+    (1, 128, True, dict(page_cache_slots=1024, block_q=8, pages_per_step=64)),
     (2, 96, True, dict(page_cache_slots=512, pages_per_step=32,
                        step_widths=(2, 4, 8, 12, 16, 20, 24))),
 )
@@ -134,10 +140,28 @@ def test_levers_vs_oracle(case):
         if not spec:
             for a, b in zip(inc, new):
                 np.testing.assert_array_equal(a, b)
+    outs = {spec: run(args, sc, spec, **kw) for spec in SAME_BITS}
+    for spec, ref in SAME_BITS.items():
+        for a, b in zip(outs[spec], run(args, sc, ref, **kw)):
+            np.testing.assert_array_equal(a, b)
     for spec, bound in BOUNDS.items():
         rel, lmax = got[spec]
         assert rel <= bound, spec
         assert lmax <= LSE_BOUNDS.get(spec, 3e-2), spec
+
+
+@pytest.mark.parametrize("qscale", (8.0, 24.0))
+def test_msub_sharp_scores(qscale):
+    """Sharper scores (large q): msub's shift estimate stays finite and close."""
+    G, T = 1, 64
+    args, sc = make(T, 7, G, True, qscale=qscale)
+    ora = oracle(args, sc, G)
+    kw = dict(page_cache_slots=1024, block_q=8, pages_per_step=64)
+    base = errors(run(args, sc, "qk8", **kw), ora)
+    new = errors(run(args, sc, "qk8,msub", **kw), ora)
+    print(f"q x{qscale}: qk8 {base} qk8,msub {new}")
+    assert new[0] <= 1.5 * base[0] + 1e-3
+    assert new[1] <= 1.5 * base[1] + 1e-3
 
 
 def test_decode_ignores_levers():

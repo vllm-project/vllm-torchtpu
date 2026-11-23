@@ -186,6 +186,23 @@ def _fp4_ints(kv_ref) -> jax.Array:
     return pltpu.bitcast(words, jnp.int4)
 
 
+def _fp4_bf16_fast(kv_ref, scratch_ref) -> jax.Array:
+    """`_fp4_ints(kv_ref).astype(bf16)` by bit arithmetic (`prefill_precision_levers`
+    "unpk"). Word row w holds slots 8w + j at nibble j; 32-bit lane row r of
+    `scratch_ref` ([S / 2, 2D] uint32) takes slots 2r, 2r + 1 as two bf16
+    halves of 128 + (n ^ 8), so the bitcast's bf16 rows are in slot order."""
+    words = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]  # [S / 8, 2D]
+    n = words.shape[0]
+    for k in range(4):
+        lo = (words >> jnp.uint32(8 * k)) & jnp.uint32(0xF)
+        sh = 12 - 8 * k
+        hi = (words << jnp.uint32(sh)) if sh > 0 else (words >> jnp.uint32(-sh))
+        hi = hi & jnp.uint32(0xF0000)
+        scratch_ref[pl.ds(k, n, stride=4), :] = (lo | hi) ^ jnp.uint32(0x43084308)
+    rows = pltpu.bitcast(scratch_ref[...], jnp.bfloat16)  # [S, 2D], 128 + n + 8
+    return rows - jnp.asarray(136.0, jnp.bfloat16)
+
+
 # `prefill_precision_levers` "pv8": V enters the MXU as its exact int4 values
 # in fp8, and the probabilities carry the V scale times _PV8_UNIT (lifting
 # p * scale out of fp8's subnormal range), capped so that p * scale * unit
@@ -194,7 +211,21 @@ def _fp4_ints(kv_ref) -> jax.Array:
 _PV8_UNIT = 64.0
 _FP8_MAX = 448.0
 PREFILL_PRECISION_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION"
-_PRECISION_LEVERS = ("qk8", "pv8")
+_PRECISION_LEVERS = ("qk8", "pv8", "msub", "unpk")
+# 4-bit `attend` levers (default off, not bitwise):
+# "msub": no running max per score. A group's shift is m = max(m_prev, max
+# over the raw scaled scores of the group's FIRST page + _MSUB_HEADROOM),
+# from a small [rows, S] dot ahead of the group's dot (stale slots hold finite
+# values, so the estimate is finite); exp2(s - m) is the exact softmax for any
+# m while the true row max stays within ~2^7 of it. `finish` divides by l
+# unclamped (l can be < 1); a row that sees no slot still gets 0 / -inf.
+# "unpk": int4 -> bf16 by bit arithmetic: two nibbles of a word become one
+# 32-bit lane of two bf16 values 128 + (n ^ 8) (exponent bits OR'ed in),
+# interleaved into slot order by strided VMEM stores, minus 136 (exact).
+# Debug-only removal arms (timing; outputs wrong): rmmax, rmsum, rmvs, rmks,
+# rmmask, rmunpk.
+_DEBUG_LEVERS = ("rmmax", "rmsum", "rmvs", "rmks", "rmmask", "rmunpk")
+_MSUB_HEADROOM = 16.0
 # TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT levers of 8-bit (fp8) pages on the
 # transposed prefill path (`_kernel.attend_t`), default off, not bitwise:
 # "exp16": p = exp2(s - m) in bf16 (p enters p @ v in bf16 anyway; l sums the
@@ -239,7 +270,7 @@ def prefill_precision_levers(spec: str | None = None) -> frozenset:
 
         spec = envs.TPU_MINIMAX_M3_MSA_PREFILL_PRECISION
     levers = frozenset(x.strip() for x in spec.replace("/", ",").split(",") if x.strip())
-    bad = levers - set(_PRECISION_LEVERS)
+    bad = levers - set(_PRECISION_LEVERS) - set(_DEBUG_LEVERS)
     if bad:
         raise ValueError(f"{PREFILL_PRECISION_ENV}: unknown levers {sorted(bad)}")
     if levers:
@@ -495,6 +526,11 @@ def _kernel(
     (`_one_call_heads`): a group's cache-row KV head is its tile //
     `tiles_per_head`, not `head_ref[0]`."""
     fp4 = fp4_rows is not None
+    # "unpk" (4-bit, `prefill_precision_levers`): the last scratch is
+    # `_fp4_bf16_fast`'s [S / 2, 2D] uint32 interleave buffer.
+    unpk_ref = None
+    if fp4 and "unpk" in precision:
+        unpk_ref, refs = refs[-1], refs[:-1]
     # `bf16_cache`: the last scratch is the cache's pages unpacked to bf16,
     # [cache_size, S, 2D]; filled after the cache, read when it is in use.
     bfc_ref = refs[-1] if bf16_cache else None
@@ -522,6 +558,8 @@ def _kernel(
     lmxu_t = not fp4 and "lmxu" in precision
     vt_t = not fp4 and ("vt" in precision or lmxu_t)
     out_unit = 1.0 / _PV8_UNIT if pv8 else 1.0
+    msub = fp4 and "msub" in precision
+    dbg = precision & frozenset(_DEBUG_LEVERS) if fp4 else frozenset()
 
     def group_head(w):
         if not tiles_per_head:
@@ -766,12 +804,11 @@ def _kernel(
             finite). A row that saw no slot has ``denom = 0`` and ``acc = 0``:
             its output is 0 and its lse ``m + log(0) = -inf`` with no select (a
             seen row has ``denom >= 1``)."""
-            write(
-                acc * (out_unit / jnp.maximum(denom, 1.0)),
-                m * _LN_2 + jnp.log(denom),
-                part,
-                parts,
-            )
+            if msub:  # l can be < 1; a row that saw no slot has l = 0
+                inv = jnp.where(denom > 0, out_unit / jnp.where(denom > 0, denom, 1.0), 0.0)
+            else:
+                inv = out_unit / jnp.maximum(denom, 1.0)
+            write(acc * inv, m * _LN_2 + jnp.log(denom), part, parts)
 
         def attend_t(width, single):
             """`attend` for 8/16-bit caches on transposed scores ``s^T [keys,
@@ -946,6 +983,15 @@ def _kernel(
                     if from_bf16:
                         rows = bfc_ref[slot]
                         sk, sv = _fp4_scales(scale_ref, k_row, v_row)
+                    elif unpk_ref is not None:
+                        rows = _fp4_bf16_fast(kv_ref, unpk_ref)  # exact bf16 [S, 2D]
+                        sk, sv = _fp4_scales(scale_ref, k_row, v_row)
+                    elif "rmunpk" in dbg:  # removal arm: no unpack (wrong values)
+                        words = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]
+                        rows = jnp.concatenate(
+                            [pltpu.bitcast(words, jnp.bfloat16)] * 4, axis=0
+                        )
+                        sk, sv = _fp4_scales(scale_ref, k_row, v_row)
                     elif qk8 or pv8:
                         rows = _fp4_ints(kv_ref)  # int4 [S, 2D]
                         sk, sv = _fp4_scales(scale_ref, k_row, v_row)
@@ -996,22 +1042,37 @@ def _kernel(
                     q = (q.astype(jnp.float32) * scale).astype(q.dtype)
                 elif qk8:
                     q = q.astype(jnp.float8_e4m3fn)
-                s = jax.lax.dot_general(
-                    q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-                )
-                if fp4:  # x = int4 * scale: K scales the score columns, V scales p
-                    s = s * k_scale
-                s = jnp.where(mask, s, -jnp.inf)
-
-                # The running max starts at a finite floor (`_MASK_VALUE`), so a
-                # row with no visible slot gets p = exp2(-inf) = 0, not exp2(nan).
                 m_prev = (
                     m_ref[rows_at] if not single else msa_attention._MASK_VALUE
                 )
-                m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
+                if msub:
+                    # The group's shift from its first page's raw scores (no mask).
+                    s0 = jax.lax.dot_general(
+                        q, k[:page_size], (((1,), (1,)), ((), ())),
+                        preferred_element_type=jnp.float32,
+                    ) * k_scale[:, :page_size]
+                    m_est = jnp.max(s0, axis=1, keepdims=True) + _MSUB_HEADROOM
+                    m_new = jnp.maximum(m_prev, m_est)
+                s = jax.lax.dot_general(
+                    q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+                )
+                if fp4 and "rmks" not in dbg:  # x = int4 * scale: K scales the score columns, V scales p
+                    s = s * k_scale
+                if "rmmask" not in dbg:
+                    s = jnp.where(mask, s, -jnp.inf)
+
+                # The running max starts at a finite floor (`_MASK_VALUE`), so a
+                # row with no visible slot gets p = exp2(-inf) = 0, not exp2(nan).
+                if "rmmax" in dbg:
+                    m_new = jnp.maximum(m_prev, jnp.zeros_like(s[:, :1]))
+                elif not msub:
+                    m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
                 p = jnp.exp2(s - m_new)
-                l_cur = jnp.sum(p, axis=1, keepdims=True)
-                p_v = p * v_scale if fp4 else p
+                if "rmsum" in dbg:
+                    l_cur = jnp.ones_like(p[:, :1])
+                else:
+                    l_cur = jnp.sum(p, axis=1, keepdims=True)
+                p_v = p * v_scale if fp4 and "rmvs" not in dbg else p
                 pv = jax.lax.dot_general(
                     p_v.astype(v.dtype),
                     v,
@@ -1396,6 +1457,11 @@ def _attention_call(
         if bf16_cache
         else ()
     )
+    unpk_scratch = (
+        (pltpu.VMEM((rows_per_page * 4, row_width), jnp.uint32),)
+        if fp4 and "unpk" in precision
+        else ()
+    )
     if row_split < 1 or num_heads % row_split or (num_heads // row_split * block_q) % 128:
         row_split = 1
     grid_spec = pltpu.PrefetchScalarGridSpec(
@@ -1439,6 +1505,7 @@ def _attention_call(
             pltpu.SemaphoreType.DMA(semaphores),
             *scale_scratch,
             *bf16_scratch,
+            *unpk_scratch,
         ],
     )
     num_inputs = 4 + 5 + len(scale_inputs)
