@@ -40,6 +40,7 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.runner import host_phases
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
+    DraftStepTokens,
     _force_draft_tp1,
     iter_mtp_shared_heads,
     maybe_share_embeddings,
@@ -1805,7 +1806,7 @@ class Eagle3Proposer:
         return_device: bool = False,
         next_tokens_per_chunk: list[torch.Tensor] | None = None,
         device_seed: torch.Tensor | None = None,
-    ) -> list[list[int]] | torch.Tensor:
+    ) -> list[list[int]] | torch.Tensor | DraftStepTokens:
         """Generate K draft tokens per request via the eagle3 draft model.
 
         Args:
@@ -1829,7 +1830,9 @@ class Eagle3Proposer:
                 ``[total_reqs]`` device tensor of the just-sampled tokens.
 
         Returns (sync) a list of length num_reqs, each inner list holding K
-        draft tokens; or (return_device) the ``[num_reqs, K]`` device tensor.
+        draft tokens; or (return_device) the ``[num_reqs, K]`` device tensor,
+        or, for one async chunk under VLLM_TPU_SPEC_TAIL_STACK, its unstacked
+        per-step tokens (``DraftStepTokens``).
         """
         runner = self.runner
         self._draft_md_cache.clear()
@@ -2247,6 +2250,17 @@ class Eagle3Proposer:
                     pad_dp_draft_step(step)
 
         host_phases.mark("dp_loop")
+        if (
+            return_device
+            and is_async
+            and len(chunks) == 1
+            and envs.VLLM_TPU_SPEC_TAIL_STACK
+            and envs.VLLM_TPU_SPEC_TAIL_COMPILED
+        ):
+            # Steady async decode: the runner's spec-tail program stacks and
+            # slices the steps in-graph (DraftStepTokens.materialize for any
+            # other consumer).
+            return DraftStepTokens(draft_tokens_per_chunk[0], chunks[0].num_reqs)
         # Assemble [total_num_reqs, K]. Each chunk's tokens are padded to p; slice
         # to the real num_reqs at the end. Sync slices on the host (the [p, K] D2H
         # is constant-shape, so no recompile); async keeps the device slice

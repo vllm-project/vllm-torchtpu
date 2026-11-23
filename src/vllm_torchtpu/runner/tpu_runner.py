@@ -193,6 +193,7 @@ from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer, _static_shape_args
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
+    DraftStepTokens,
     fit_rows,
     handoff_seed_tokens,
     normalize_draft_config,
@@ -1194,6 +1195,31 @@ _spec_tail_compiled = _static_shape_args(
 )
 
 
+def _spec_tail_stack(next_tokens, draft_lengths, rows, num_reqs, bound, n, *steps):
+    """VLLM_TPU_SPEC_TAIL_STACK: `_spec_tail` taking the drafter's K per-step
+    `[p]` tokens, stacked and sliced to the chunk's `n` requests in-graph (the
+    stack/slice `DraftStepTokens.materialize` runs eagerly)."""
+    drafts = torch.stack(steps, dim=1)[:n]
+    return _spec_tail(next_tokens, drafts, draft_lengths, rows, num_reqs, bound)
+
+
+_spec_tail_stack_compiled = _static_shape_args(
+    torch.compile(_spec_tail_stack, backend="tpu", fullgraph=True, dynamic=False)
+)
+
+
+def _spec_tail_stack_key(next_tokens, draft_lengths, n, steps) -> tuple:
+    """The shapes `_spec_tail_stack_compiled` specializes on (with `n`)."""
+    return (
+        tuple(next_tokens.shape),
+        next_tokens.dtype,
+        tuple(draft_lengths.shape),
+        draft_lengths.dtype,
+        n,
+        tuple((tuple(t.shape), t.dtype) for t in steps),
+    )
+
+
 def _prep_fold_impl(
     seq_lens,
     positions,
@@ -2017,6 +2043,8 @@ class TPUModelRunner(GPUModelRunner):
         # 1 on TP rank 0, else 0; built lazily on first use by
         # _sync_replicated_drafts_across_tp (needs the TP group initialized).
         self._tp_rank0_mask: torch.Tensor | None = None
+        # VLLM_TPU_SPEC_TAIL_STACK: `_spec_tail_stack_key`s warmup compiled.
+        self._spec_tail_stack_keys: set[tuple] = set()
 
         # Caches for decode-fast-path: avoid re-creating identical device
         # tensors across consecutive decode steps.
@@ -4251,6 +4279,71 @@ class TPUModelRunner(GPUModelRunner):
             off += n
         return out
 
+    def _spec_tail_from_steps(
+        self, drafts: DraftStepTokens, next_tokens_per_chunk, state
+    ):
+        """VLLM_TPU_SPEC_TAIL_STACK: the spec-tail result (as
+        `_assemble_async_spec_substitution` returns it) from the unstacked
+        drafts, or None when the step is not the one-chunk steady case or its
+        shapes were not precompiled (the caller then materializes)."""
+        if not (
+            envs.VLLM_TPU_SPEC_TAIL_COMPILED
+            and len(next_tokens_per_chunk) == 1
+            and state.spec_decode_metadata_list[0] is not None
+            and state.num_reqs_list[0] == drafts.num_reqs
+            and not getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
+        ):
+            return None
+        nt_chunk = next_tokens_per_chunk[0]
+        num_reqs = drafts.num_reqs
+        md = state.spec_decode_metadata_list[0]
+        key = _spec_tail_stack_key(nt_chunk, md.draft_lengths, num_reqs, drafts.steps)
+        if key not in self._spec_tail_stack_keys:
+            logger.warning_once(
+                "SPEC_TAIL_STACK: key %s was not precompiled; stacking eagerly.",
+                key,
+            )
+            return None
+        assert self.speculative_config is not None
+        src, num_rejected = _spec_tail_stack_compiled(
+            nt_chunk,
+            md.draft_lengths,
+            num_reqs,
+            num_reqs,
+            self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens),
+            num_reqs,
+            *drafts.steps,
+        )
+        return (
+            [src],
+            {r: r for r in range(num_reqs)},
+            num_rejected,
+            {r: int(md.draft_lengths_cpu[r]) for r in range(num_reqs)},
+        )
+
+    def _keep_draft_steps(
+        self, is_spec_step: bool, copy_state, scheduler_output
+    ) -> bool:
+        """VLLM_TPU_SPEC_TAIL_STACK: whether the spec tail is the only reader
+        of this step's drafts, so they may stay unstacked. The KV fence, the
+        structured-output host copy and the replicated-drafter TP pin read
+        the dense tensor."""
+        if not (is_spec_step and self.scheduler_config.async_scheduling):
+            return False
+        if copy_state is not None and self._fence_spec_kv_under_token_copy:
+            return False
+        if scheduler_output.has_structured_output_requests:
+            return False
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.draft_tensor_parallel_size == 1
+        ):
+            from vllm.distributed import get_tensor_model_parallel_world_size
+
+            if get_tensor_model_parallel_world_size() > 1:
+                return False
+        return True
+
     def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk, state):
         """Async-spec substitution assembler.
 
@@ -4270,10 +4363,15 @@ class TPUModelRunner(GPUModelRunner):
             "async spec substitution requires the eagle3 drafts proposed "
             "earlier in sample_tokens"
         )
-        drafts_per_chunk = self._drafts_per_chunk(drafts, state.num_reqs_list)
         # Bucketed drafters keep the sampler's padded rows (an exact-count slice
         # would compile a program per request count); others keep exact rows.
         bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
+        if isinstance(drafts, DraftStepTokens):
+            stacked = self._spec_tail_from_steps(drafts, next_tokens_per_chunk, state)
+            if stacked is not None:
+                return stacked
+            drafts = drafts.materialize()
+        drafts_per_chunk = self._drafts_per_chunk(drafts, state.num_reqs_list)
         if (
             envs.VLLM_TPU_SPEC_TAIL_COMPILED
             and len(next_tokens_per_chunk) == 1
@@ -7566,6 +7664,10 @@ class TPUModelRunner(GPUModelRunner):
                         device_seed=device_seed,
                     )
 
+        if isinstance(eagle3_drafts, DraftStepTokens) and not self._keep_draft_steps(
+            is_spec_step, copy_state, scheduler_output
+        ):
+            eagle3_drafts = eagle3_drafts.materialize()
         host_phases.mark("draft_propose")
         if defer_prev_wait:
             self._modify_prev_results()
@@ -10025,6 +10127,13 @@ class TPUModelRunner(GPUModelRunner):
         k = self.speculative_config.num_speculative_tokens
         bound = self.max_num_reqs * (1 + k)
         bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
+        # VLLM_TPU_SPEC_TAIL_STACK: the unstacked-drafts variant at the
+        # drafter's loop bucket p for each request count.
+        stack_bucket = (
+            getattr(getattr(self, "drafter", None), "_loop_bucket", None)
+            if envs.VLLM_TPU_SPEC_TAIL_STACK and not bucketed
+            else None
+        )
         with self._precompile_timed("async-spec substitution tail"):
             for num_reqs in range(1, self.max_num_reqs + 1):
                 rows = _get_padded_num_reqs_with_upper_limit(
@@ -10047,6 +10156,31 @@ class TPUModelRunner(GPUModelRunner):
                         bound,
                     )
                 )
+                if stack_bucket is not None:
+                    # The drafter's K per-step [p] tokens (int32, as
+                    # greedy_draft_token returns them).
+                    steps = [
+                        torch.zeros(stack_bucket(num_reqs), dtype=torch.int32).to(
+                            self.device
+                        )
+                        for _ in range(k)
+                    ]
+                    synchronize_tensors(
+                        _spec_tail_stack_compiled(
+                            next_tokens,
+                            draft_lengths,
+                            num_reqs,
+                            num_reqs,
+                            bound,
+                            num_reqs,
+                            *steps,
+                        )
+                    )
+                    self._spec_tail_stack_keys.add(
+                        _spec_tail_stack_key(
+                            next_tokens, draft_lengths, num_reqs, steps
+                        )
+                    )
 
     def _precompile_prep_fold(self) -> None:
         """VLLM_TPU_PREFWD_PREP_FOLD: compile the folded prep program for every

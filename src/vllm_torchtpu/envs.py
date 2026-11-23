@@ -382,6 +382,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SUBTRACT_REJECTED_COMPILED: bool = False
     VLLM_TPU_SUBTRACT_REJECTED_PAD_ROWS: bool = False
     VLLM_TPU_SPEC_TAIL_COMPILED: bool = False
+    VLLM_TPU_SPEC_TAIL_STACK: bool = False
     VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
     VLLM_TPU_LOOP_LAG_WATCHDOG_S: float = 30.0
     VLLM_TPU_FREEZE_PYSPY_S: float = 120.0
@@ -2513,6 +2514,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Async spec decode, one chunk: the next step's substitution source and the
     # rejected count (with their row fits and the source pad) as one program.
     "VLLM_TPU_SPEC_TAIL_COMPILED": env_bool("VLLM_TPU_SPEC_TAIL_COMPILED"),
+    # With SPEC_TAIL_COMPILED: eagle3 hands its per-step draft tokens to the
+    # spec-tail program, which stacks and slices them in-graph, instead of
+    # stacking and concatenating them in an eager program. Same values.
+    "VLLM_TPU_SPEC_TAIL_STACK": env_bool("VLLM_TPU_SPEC_TAIL_STACK"),
     # Dump all processes' stacks when no step starts for N s with live
     # requests (stall_watchdog.py; read directly there, registered here).
     "VLLM_TPU_STALL_WATCHDOG_S": env_float("VLLM_TPU_STALL_WATCHDOG_S", 0.0),
