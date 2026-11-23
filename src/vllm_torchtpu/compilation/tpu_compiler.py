@@ -1107,6 +1107,6 @@ def tpu_compilation_cache_subdir(
             compute_tpu_compilation_hash(vllm_config, include_kv=False),
         ]
         if vllm_config.quant_config is not None:
-            factors.append(vllm_config.quant_config.compute_hash())
+            factors.append(str(vllm_config.quant_config))
     digest = hashlib.sha256(str(factors).encode()).hexdigest()[:10]
     return os.path.join(base_dir, kind, digest)
