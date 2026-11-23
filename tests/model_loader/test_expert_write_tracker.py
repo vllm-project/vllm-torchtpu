@@ -125,6 +125,25 @@ def test_flush_all_drops_the_buffers_flushes_left_behind():
     assert not stager._pool
 
 
+def test_flush_all_clears_tracker_and_written_early(monkeypatch):
+    from vllm_torchtpu import model_loader_patches
+
+    monkeypatch.setattr(model_loader_patches, "_MAX_STAGED", 1)
+    stager = ExpertParamStager()
+    first, second = _param(2, 4, 4), _param(2, 4, 4)
+    stager.host_param(first)
+    assert not stager.written(first, 0, "w2")
+    stager.host_param(second)
+    assert not stager.written(second, 0, "w2")
+    assert id(first) in stager.written_early
+    assert stager._tracker._seen
+    stager.flush_all()
+    assert not stager._pool
+    assert not stager._tracker._seen
+    assert not stager.written_early
+    assert stager.staging(first)
+
+
 def test_flush_uploads_in_chunks(monkeypatch):
     from vllm_torchtpu import model_loader_patches
 

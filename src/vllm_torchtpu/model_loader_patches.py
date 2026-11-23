@@ -945,6 +945,8 @@ class ExpertParamStager:
         for param, _ in list(self._staged.values()):
             self.flush(param)
         self._pool.clear()
+        self._tracker._seen.clear()
+        self.written_early.clear()
 
     def __len__(self) -> int:
         return len(self._staged)
