@@ -560,7 +560,8 @@ def _attention_call(
     one kernel serves every head and chunk, and no call slices its inputs.
 
     ``work = (packed, tiles, tiles_per_step, in_kernel)``: the call's
-    `msa_attention._work_list` as `_packed_work` packs it, or with
+    `msa_attention._work_list` as `_packed_work` packs it (``[R]``, or a
+    ``[1, R]`` row read in place: slicing it to 1D was a relayout op), or with
     `in_kernel` its ``[pages | tile counts]`` row, whose group words the
     kernel builds (`_tile_group_words`).
 
@@ -594,6 +595,8 @@ def _attention_call(
         )
 
     def kernel(packed_ref, *refs, **kwargs):
+        if len(packed_ref.shape) == 2:  # a caller's [1, R] row (`_chunked_call`)
+            packed_ref = packed_ref.at[0]
         if not in_kernel:
             return run(
                 packed_ref, packed_ref.at[pl.ds(union_len, words_len)], *refs, **kwargs
@@ -824,6 +827,7 @@ def _chunked_call(
     head_major=False,
     q_head_major=False,
     lse_bits=False,
+    work=None,
 ):
     """`_attention_call` per KV head and chunk of at most
     `MAX_TOKENS_PER_CALL` tokens (the work list lives in SMEM).
@@ -840,7 +844,8 @@ def _chunked_call(
     The calls after the first run as one `fori_loop`, so the kernel is
     emitted twice per call site (the first call creates the output) rather
     than once per head and chunk. With `q_head_major`, q comes ``[G * Hg, T,
-    D]``, as the kernel reads it."""
+    D]``, as the kernel reads it. `work` is the one call's `_packed_work` row
+    ``[1, R]`` if the caller built it (`msa_dcp.pair_work`)."""
     if not q_head_major:
         q = q.transpose(1, 0, 2)
     num_q_heads, num_tokens, _ = q.shape
@@ -878,13 +883,19 @@ def _chunked_call(
     # (`msa_attention._single_tile_groups`), where a page count would be a
     # scalar the kernel waits for.
     in_kernel = block_q == msa_attention.SMALL_BATCH_BLOCK_Q and step > block_q
-    packed, tiles_per_step = _packed_work(
-        selected.reshape(num_heads * num_chunks, step, selected.shape[2]),
-        block_q,
-        pages_per_step,
-        align=_merged_store_rows(block_q, num_q_heads // num_heads, q.dtype),
-        in_kernel=in_kernel,
-    )
+    align = _merged_store_rows(block_q, num_q_heads // num_heads, q.dtype)
+    if work is None:
+        packed, tiles_per_step = _packed_work(
+            selected.reshape(num_heads * num_chunks, step, selected.shape[2]),
+            block_q,
+            pages_per_step,
+            align=align,
+            in_kernel=in_kernel,
+        )
+    else:
+        if num_heads * num_chunks != 1:
+            raise ValueError("a given work list serves one call")
+        packed, tiles_per_step = work, _tiles_per_step(step // block_q, block_q, align)
 
     def head_chunk(i, out):
         h, c = i // num_chunks, i % num_chunks
@@ -900,7 +911,12 @@ def _chunked_call(
             heads,
             offset,
             out,
-            (packed[i], step // block_q, tiles_per_step, in_kernel),
+            (
+                packed if work is not None else packed[i],
+                step // block_q,
+                tiles_per_step,
+                in_kernel,
+            ),
         )
 
     out = head_chunk(0, None)
@@ -981,6 +997,7 @@ def msa_sparse_attention_lse(
     head_major: bool = False,
     q_head_major: bool = False,
     lse_bits: bool = False,
+    work: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_attention.msa_sparse_attention` (kernel v2, page keys translated
     by `page_table`) returning ``(out [T, H, D], lse [T, H] f32)``.
@@ -994,7 +1011,8 @@ def msa_sparse_attention_lse(
     ``lse [H, T]``; with `q_head_major`, q comes head-major, ``[H, T, D]``.
     With `lse_bits`, the lse comes as its uint32 bits, for a consumer that
     moves bits (a one-tile call's f32 relayout was a ~0.65 us reduce of its
-    own, bitcast first it fuses).
+    own, bitcast first it fuses). `work` is the call's work list row when
+    the caller built it with the selection (`msa_dcp.pair_work`).
     """
     num_tokens, head_dim = selected.shape[0], q.shape[2]
     msa_attention.check_cache(kv_cache, scale_cache)
@@ -1019,6 +1037,7 @@ def msa_sparse_attention_lse(
         head_major=head_major,
         q_head_major=q_head_major,
         lse_bits=lse_bits,
+        work=work,
     )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]

@@ -27,7 +27,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_dcp, msa_indexer, msa_write
+from vllm_torchtpu.models.minimax_m3.kernels import (
+    msa,
+    msa_attention_lse,
+    msa_dcp,
+    msa_indexer,
+    msa_write,
+)
 
 _TOPK = 16
 _BLOCK = 128
@@ -323,6 +329,40 @@ def _attend_case(tokens, rank, shared, seed):
         interpret=True,
     )
     return (q, kv_cache, candidates, seq_lens, block_tables, cu), common
+
+
+# One tile (8 tokens; 4 padded to it) and several (16 to `_PAIR_WORK_MAX_TOKENS`).
+@pytest.mark.parametrize("tokens", [4, 8, 16, 48, 64])
+@pytest.mark.parametrize("shared", [False, True])
+def test_pair_work_matches_xla(tokens, shared):
+    """`pair_work`'s kept page keys and work list row equal
+    `kept_own_candidates`' keys and `_packed_work` of them, bit for bit."""
+    rng = np.random.default_rng(tokens + shared)
+    pages_per_seq, seqs = 40, 16
+    candidates = [
+        _rank_candidates(rng, tokens, pages_per_seq, r, 2, shared) for r in (0, 1)
+    ]
+    seq_id = jnp.asarray(np.minimum(np.arange(tokens) // 8, seqs - 1), jnp.int32)
+    valid = jnp.asarray(rng.random(tokens) < 0.9)
+    blocks, kept = msa_dcp.kept_own_candidates(jnp.stack(candidates), _TOPK)
+    want_keys = jnp.where(
+        kept & valid[:, None], seq_id[:, None] * pages_per_seq + blocks // 2, -1
+    )
+    pages_per_step = msa_dcp._small_pages_per_step(tokens)
+    padded = jnp.pad(want_keys, ((0, -tokens % 8), (0, 0)), constant_values=-1)
+    want_work, _ = msa_attention_lse._packed_work(
+        padded[None],
+        8,
+        pages_per_step,
+        align=msa_attention_lse._merged_store_rows(8, 16, jnp.bfloat16),
+        in_kernel=padded.shape[0] > 8,
+    )
+    key_base = jnp.where(valid, seq_id * pages_per_seq, -1)[:, None]
+    keys, work = msa_dcp.pair_work(
+        *candidates, key_base, pages_per_step=pages_per_step, interpret=True
+    )
+    np.testing.assert_array_equal(np.asarray(keys), np.asarray(want_keys))
+    np.testing.assert_array_equal(np.asarray(work), np.asarray(want_work))
 
 
 # Tokens 8 (one tile), 24 (three tiles, one per step), 48 (a request of 5 rows

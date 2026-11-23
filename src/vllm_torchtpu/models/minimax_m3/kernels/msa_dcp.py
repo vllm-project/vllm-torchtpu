@@ -88,6 +88,13 @@ _SMALL_BATCH_PAGES_PER_STEP = 32
 _WIDE_GROUP_MIN_TOKENS = 129
 
 
+def _small_pages_per_step(num_tokens: int) -> int:
+    """Pages per kernel step of a decode-sized DCP batch's 8-token tiles."""
+    if num_tokens >= _WIDE_GROUP_MIN_TOKENS:
+        return _SMALL_BATCH_PAGES_PER_STEP
+    return msa_attention.DEFAULT_PAGES_PER_STEP
+
+
 def rank_array(rank: int | jax.Array) -> jax.Array:
     """The DCP rank as an ``int32[1]`` array.
 
@@ -784,6 +791,184 @@ def kept_own_candidates(
     return b[:, :topk], (s[:, :topk] > _NEG_INF) & (place < topk)
 
 
+# Tokens per tile of `pair_work`: `msa_attention.SMALL_BATCH_BLOCK_Q` decode rows,
+# whose `_TILE_KEYS` page keys fill one vreg's lanes.
+_TILE_ROWS = msa_attention.SMALL_BATCH_BLOCK_Q
+_TILE_KEYS = 128
+# Page keys `pair_work` ranks in f32, exactly.
+_F32_EXACT_KEYS = 1 << 24
+# Decode buckets up to this many tokens build their work list in `pair_work`,
+# which unrolls its tiles (AOT: 896 bundles at 8 tokens, 1,364 at 48, 2,059
+# at 64); larger batches keep XLA's, which handles their tiles side by side.
+_PAIR_WORK_MAX_TOKENS = 64
+# lcm(1 .. _TILE_ROWS): a key's share of its distinct value when it occurs
+# k <= _TILE_ROWS times in a tile (at most once per row) is this / k, exactly.
+_SHARES = 840
+
+
+def _kept_keys_t(own, peer, base):
+    """`kept_own_candidates`' page keys, transposed: ``own``, ``peer [T, 2 *
+    topk]`` packed candidates, ``base [T, 1]`` (-1 for a padding token) ->
+    ``[topk, T]`` keys, -1 where not kept. Candidates down sublanes: a
+    candidate's row broadcasts along sublanes, where a lane broadcast per
+    candidate was a cross-lane permute each (64 per tile, the longest chain
+    of the kernel in the AOT schedule)."""
+    topk = own.shape[1] // 2
+    own_t, peer_t = own.T, peer.T
+    s_i, b_i = own_t[:topk], own_t[topk:]
+    place = jnp.zeros(s_i.shape, jnp.int32)
+    for cand in (own_t, peer_t):
+        for j in range(topk):
+            s_j = jnp.broadcast_to(cand[j : j + 1], s_i.shape)
+            b_j = jnp.broadcast_to(cand[topk + j : topk + j + 1], s_i.shape)
+            ahead = (s_j > _NEG_INF) & ((s_j > s_i) | ((s_j == s_i) & (b_j < b_i)))
+            place += ahead.astype(jnp.int32)
+    base_t = base.T
+    kept = (s_i > _NEG_INF) & (place < topk) & (base_t >= 0)
+    # A kept block is real (>= 0); the pair path has dcp == 2.
+    return jnp.where(kept, base_t + (b_i.astype(jnp.int32) >> 1), -1)
+
+
+def _tile_union(keys_t, tile):
+    """Tile `tile`'s distinct page keys, ascending, -1 after (as
+    `msa_attention._tile_unions` and `_union_slots` order them), ``[1, 128]``,
+    and their count on every lane, from the kept keys ``keys_t [topk, T]``
+    (`_kept_keys_t`; the tile's are columns ``[8 * tile, 8 * tile + 8)``).
+
+    Each key's slot is the number of distinct keys below it, counted as the
+    sum of every smaller key's share of its value (`_SHARES` over its
+    multiplicity), so no compare against earlier lanes and no second
+    pass is needed. The keys are exact f32 values (below `_F32_EXACT_KEYS`),
+    every sum an integer below 2**24: the reductions run exactly in f32."""
+    topk, num_tokens = keys_t.shape
+    rows, lanes = _TILE_ROWS, _TILE_KEYS
+    if num_tokens < lanes:
+        keys_t = jnp.concatenate(
+            [keys_t, jnp.full((topk, lanes - num_tokens), -1, jnp.int32)], axis=1
+        )
+    if tile:  # the tile's columns to lanes [0, 8)
+        keys_t = pltpu.roll(keys_t, lanes - rows * tile, 1)
+    column = jax.lax.broadcasted_iota(jnp.int32, keys_t.shape, 1)
+    wide = jnp.where(column < rows, keys_t, -1)
+    # Key (k, t) to lane k * 8 + t: down one lane vector, and across the lanes
+    # of one sublane vector.
+    spread = pltpu.roll(wide, 0, 1, stride=rows, stride_axis=0)
+    by_lane = jnp.max(spread, axis=0, keepdims=True).astype(jnp.float32)
+    across = jnp.broadcast_to(by_lane, (lanes, lanes))
+    down = across.T
+    count = jnp.sum(jnp.where(down == across, 1.0, 0.0), axis=0, keepdims=True)
+    share = jnp.zeros_like(count)
+    for k in range(1, rows + 1):
+        share = jnp.where(count == k, float(_SHARES // k), share)
+    share = jnp.where(by_lane >= 0, share, 0.0)  # [1, L]
+    below = jnp.sum(
+        jnp.where(across < down, jnp.broadcast_to(share, (lanes, lanes)), 0.0),
+        axis=1,
+        keepdims=True,
+    )  # [L, 1]: the distinct keys below each key, times _SHARES
+    slot = _SHARES * jax.lax.broadcasted_iota(jnp.int32, (lanes, lanes), 1)
+    union = jnp.max(
+        jnp.where((down >= 0) & (below == slot.astype(jnp.float32)), down, -1.0),
+        axis=0,
+        keepdims=True,
+    )
+    distinct = jnp.round(jnp.sum(share, axis=1, keepdims=True) * (1.0 / _SHARES))
+    return union.astype(jnp.int32), jnp.broadcast_to(distinct, (1, lanes)).astype(
+        jnp.int32
+    )
+
+
+def _pair_work_kernel(
+    own_ref, peer_ref, base_ref, keys_ref, work_ref, *, single, groups
+):
+    """`pair_work` in VMEM: this rank's kept candidates' page keys
+    (`_kept_keys_t`), then each tile's page union (`_tile_union`)."""
+    num_tokens = keys_ref.shape[0]
+    tiles = num_tokens // _TILE_ROWS
+    union_len = _TILE_KEYS
+    lane = jax.lax.broadcasted_iota(jnp.int32, (1, union_len), 1)
+    keys_t = _kept_keys_t(own_ref[...], peer_ref[...], base_ref[...])
+    keys_ref[...] = keys_t.T
+    # Unrolled: the tiles' chains are independent and short of work each.
+    counts = jnp.zeros_like(lane)
+    for t in range(tiles):
+        union, count = _tile_union(keys_t, t)
+        work_ref[:, t * union_len : (t + 1) * union_len] = union
+        counts = jnp.where(lane == t, count, counts)
+    if not single:  # `_tile_page_lists`' tile counts after the unions
+        work_ref[:, tiles * union_len :] = counts[:, :tiles]
+        return
+    # One tile: `msa_attention._single_tile_groups`' meta words and counts, and
+    # the grid's group bounds (`msa_attention_lse._packed_work`), in one row:
+    # lanes [0, G) meta words, [G, 2G) counts, 2G and 2G + 1 the bounds.
+    pages_per_step = union_len // groups
+    g = lane % groups
+    group_count = jnp.clip(count - g * pages_per_step, 0, pages_per_step)
+    # Groups holding a page, or the first: pages_per_step is a power of two.
+    num_live = jnp.maximum(
+        (count + pages_per_step - 1) >> (pages_per_step.bit_length() - 1), 1
+    )
+    meta = (
+        (g << msa_attention._ROW_SHIFT)
+        | jnp.where(g == 0, msa_attention._FIRST_BIT, 0)
+        | jnp.where(g == num_live - 1, msa_attention._LAST_BIT, 0)
+    )
+    row = jnp.where(lane < groups, meta, group_count)
+    row = jnp.where(lane < 2 * groups, row, jnp.where(lane == 2 * groups, 0, num_live))
+    work_ref[:, union_len:] = row[:, : 2 * groups + 2]
+
+
+def pair_work(
+    own: jax.Array,
+    peer: jax.Array,
+    key_base: jax.Array,
+    *,
+    pages_per_step: int,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """A DCP pair's decode attention inputs from both ranks' packed candidates
+    (``own`` this rank's, ``peer`` the other's, ``[T, 2 * topk]``) in one
+    kernel: the page keys of this rank's kept candidates ``[T, topk]``
+    (`kept_own_candidates`; ``key_base [T, 1]`` is a token's ``seq_id *
+    pages_per_seq``, or -1 for a padding token) and the attention's work list
+    row (`msa_attention_lse._packed_work` of those keys). XLA built both in
+    ~20 dependent small ops between the candidate exchange and the attention
+    (~2 us per layer in the served b8 decode step, j-f07a4a0e)."""
+    num_tokens, width = own.shape
+    topk = width // 2
+    if topk * _TILE_ROWS != _TILE_KEYS:
+        raise ValueError(
+            f"pair_work tiles {_TILE_ROWS} rows of {_TILE_KEYS // _TILE_ROWS} keys"
+        )
+    pad = -num_tokens % _TILE_ROWS
+    if num_tokens + pad > _TILE_KEYS:
+        raise ValueError(f"pair_work takes up to {_TILE_KEYS} tokens, got {num_tokens}")
+    if pad:
+        own = jnp.pad(own, ((0, pad), (0, 0)), constant_values=_NEG_INF)
+        peer = jnp.pad(peer, ((0, pad), (0, 0)), constant_values=_NEG_INF)
+        key_base = jnp.pad(key_base, ((0, pad), (0, 0)), constant_values=-1)
+    tiles = (num_tokens + pad) // _TILE_ROWS
+    groups = msa_attention._groups_per_tile(_TILE_ROWS, topk, pages_per_step)
+    if groups * pages_per_step != _TILE_KEYS:
+        raise ValueError(
+            f"{pages_per_step} pages per step do not tile {_TILE_KEYS} keys"
+        )
+    single = tiles == 1
+    # `_packed_work`'s row: [union | meta words | counts | step bounds] for one
+    # tile, [unions | tile counts] for several (`in_kernel`).
+    width = _TILE_KEYS + 2 * groups + 2 if single else tiles * (_TILE_KEYS + 1)
+    keys, work = pl.pallas_call(
+        functools.partial(_pair_work_kernel, single=single, groups=groups),
+        out_shape=(
+            jax.ShapeDtypeStruct((num_tokens + pad, topk), jnp.int32),
+            jax.ShapeDtypeStruct((1, width), jnp.int32),
+        ),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_pair_work",
+    )(own, peer, key_base)
+    return keys[:num_tokens], work
+
+
 def merge_head_candidates(
     candidates: jax.Array, topk: int, interpret: bool = False
 ) -> jax.Array:
@@ -1159,21 +1344,38 @@ def msa_attend_dcp(
     )
     # Page keys (seq * pages_per_seq + logical block) of the selected blocks
     # this rank holds, as `msa.sparse_attention`; [T, G, topk].
-    if own_first and num_heads == 1:
+    work = None
+    if (
+        own_first
+        and num_heads == 1
+        and dcp == 2
+        and num_tokens <= _PAIR_WORK_MAX_TOKENS
+        and max_num_seqs * pages_per_seq <= _F32_EXACT_KEYS
+    ):
+        # One kernel: kept page keys and the attention's work list.
+        key_base = jnp.where(valid, seq_id * pages_per_seq, -1)[:, None]
+        keys, work = pair_work(
+            candidates[0],
+            candidates[1],
+            key_base,
+            pages_per_step=_small_pages_per_step(num_tokens),
+            interpret=interpret,
+        )
+        keys = keys[:, None]
+    elif own_first and num_heads == 1:
         blocks, kept = kept_own_candidates(candidates, topk)
         mine, selected = (kept & valid[:, None])[:, None], blocks[:, None]
     else:
         selected = merge_head_candidates(candidates, topk, interpret)
         mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
-    keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
+    if work is None:
+        keys = jnp.where(
+            mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1
+        )
     small = num_tokens <= DCP_SMALL_BATCH_TOKENS
     if small:
         block_q = msa_attention.SMALL_BATCH_BLOCK_Q
-        pages_per_step = (
-            _SMALL_BATCH_PAGES_PER_STEP
-            if num_tokens >= _WIDE_GROUP_MIN_TOKENS
-            else msa_attention.DEFAULT_PAGES_PER_STEP
-        )
+        pages_per_step = _small_pages_per_step(num_tokens)
     elif scale_cache is not None:
         block_q = msa_attention.PREFILL_BLOCK_Q_4BIT
         pages_per_step = msa_attention.PREFILL_PAGES_PER_STEP_4BIT
@@ -1187,6 +1389,7 @@ def msa_attend_dcp(
         q_head_major=q_head_major,
         interpret=interpret,
     )
+    work_arg = {} if work is None else {"work": work}
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
     if scale_cache is not None:
         if num_heads == 1:
@@ -1199,6 +1402,7 @@ def msa_attend_dcp(
                 head_major=True,
                 lse_bits=lse_bits,
                 **common,
+                **work_arg,
                 **msa._fp4_attention_kwargs(scale_cache),
             )
         # KV head h's K / V scales are scale-page rows 2h / 2h + 1.
@@ -1215,6 +1419,7 @@ def msa_attend_dcp(
             head_major=True,
             lse_bits=lse_bits,
             **common,
+            **work_arg,
         )
     # One kernel for all the group's KV heads (the head is a kernel input).
     return msa_attention_lse.msa_sparse_attention_lse_heads(
