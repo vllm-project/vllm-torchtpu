@@ -57,7 +57,6 @@ steps:
         .buildkite/kubernetes/run.sh bash
         .buildkite/scripts/selector_prototype/record_script.sh
         integration_k3_pruned75_apc_offload_correctness "$${BUILDKITE_COMMIT}"
-        bash ./scripts/vllm/integration/run_k3_pruned75_apc_offload_correctness.sh
 
   # No automatic retry, unlike CI: two attempts would upload the same
   # recording paths. Rerun the build if its known cache flake hits.
@@ -78,4 +77,3 @@ steps:
         .buildkite/kubernetes/run.sh bash
         .buildkite/scripts/selector_prototype/record_script.sh
         integration_compilation_cache_e2e "$${BUILDKITE_COMMIT}"
-        bash ./scripts/vllm/integration/run_compilation_cache_e2e.sh
