@@ -26,7 +26,7 @@ import jax.numpy as jnp
 
 from vllm_torchtpu import envs
 
-LEVERS = ("ring",)
+LEVERS = ("ring", "cktab")
 
 
 def io_lean_levers(raw: str | None = None) -> frozenset[str]:
