@@ -133,10 +133,10 @@ def backend(name: str) -> Callable[[fx.GraphModule, list[Any]], Any]:
 
         from vllm.config.utils import Range
 
-        from vllm_torchtpu.compilation.graph_fingerprint import _graph_fingerprint
         from vllm_torchtpu.compilation.tpu_compiler import (
             TpuCompilerAdaptor,
             _ensure_tuple_output,
+            _graph_fingerprint,
         )
 
         # The adaptor fingerprints the graph after its output-tuple rewrite,
@@ -157,6 +157,8 @@ def backend(name: str) -> Callable[[fx.GraphModule, list[Any]], Any]:
 
         adaptor = TpuCompilerAdaptor()
         adaptor.initialize_cache(cache_dir=os.path.join(root, name))
+        # Helper graphs hold no HBM worth a reload and a GC pass per graph.
+        adaptor.reload_saved = False
         compile_range = Range(start=_HELPER_RANGE_START, end=_HELPER_RANGE_END)
         path = os.path.join(root, name, key)
         if os.path.exists(path):

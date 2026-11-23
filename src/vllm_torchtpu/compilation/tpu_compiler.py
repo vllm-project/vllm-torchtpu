@@ -737,6 +737,9 @@ class TpuCompilerAdaptor(CompilerInterface):
     name = "tpu"
 
     def __init__(self):
+        # Run a freshly compiled bucket from the artifact it just saved (see
+        # `compile`); helper graphs turn this off (compilation/helper_cache.py).
+        self.reload_saved = True
         self.cache_dir: str | None = None
         self._disable_cache = False
         # compute_tpu_compilation_hash of this run, set by compute_hash, which
@@ -1244,7 +1247,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # different block counts then give the backbone a different
         # compile-cache key. The rebuilt runnable is what replaying ranks and
         # warm starts run.
-        if handle is not None:
+        if handle is not None and self.reload_saved:
             reloaded = self._replay(handle[1], graph, was_wrapped, fingerprint)
             if reloaded is not None:
                 compiled_fn = (
