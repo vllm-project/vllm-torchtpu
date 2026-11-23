@@ -183,6 +183,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_ROW_BUCKET: bool = False
     VLLM_TPU_MK_DRAFT: bool = False
     VLLM_TPU_MK_DRAFT_LOOP: bool = False
+    VLLM_TPU_MK_DRAFT_ROWS_FRESH: bool = False
     VLLM_TPU_MK_QSEL_ASYNC: bool = False
     VLLM_TPU_MK_QSA_XREQ_PREFETCH: int = 0
     VLLM_TPU_MK_QSA_REQ_ASYNC: int = 0
@@ -1320,6 +1321,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # too (else only draft step 0). Off: at T=1 the call is slower than stock
     # (16 request slots per kernel tile; j-1767564a).
     "VLLM_TPU_MK_DRAFT_LOOP": env_bool("VLLM_TPU_MK_DRAFT_LOOP"),
+    # With VLLM_TPU_MK_DRAFT: no eager programs between MK draft step 0 and the fused
+    # loop. Step 0's draft_rows is the seed program's (DRAFT_SEED_EXTRAS) or
+    # last_token_indices itself at full length, step 0 also returns positions + 1,
+    # and at p == capacity its outputs feed the loop as they are (a full-length
+    # [:rows] view still costs torch_tpu an execute_as_strided program). Same values.
+    "VLLM_TPU_MK_DRAFT_ROWS_FRESH": env_bool("VLLM_TPU_MK_DRAFT_ROWS_FRESH"),
     # Whole-step QSA selection: the per-row id copies into SMEM and the new group's
     # loads / stores are issued together and waited once instead of in start-wait
     # pairs (distinct destinations; same bytes).

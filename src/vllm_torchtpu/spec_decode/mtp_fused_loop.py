@@ -191,7 +191,7 @@ class _MkDraftStep0(nn.Module):
         draft_rows: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         carry, tokens = self.mtp.mk_draft_step(  # type: ignore[attr-defined]
             input_ids, positions, hidden_states, self.rows_per_request
         )
@@ -203,11 +203,12 @@ class _MkDraftStep0(nn.Module):
                 draft_rows, input_ids.shape[0]
             )
         rows = draft_rows.clamp_min(0)
-        return (
-            torch.index_select(carry, 0, rows),
-            torch.index_select(tokens, 0, rows),
-            torch.index_select(positions, positions.ndim - 1, rows),
-        )
+        pos = torch.index_select(positions, positions.ndim - 1, rows)
+        out = (torch.index_select(carry, 0, rows), torch.index_select(tokens, 0, rows), pos)
+        if envs.VLLM_TPU_MK_DRAFT_ROWS_FRESH:
+            # Also the fused loop's step-1 positions, so the caller needs no eager add.
+            return (*out, pos + 1)
+        return out
 
 
 def build_mk_draft_step0(
