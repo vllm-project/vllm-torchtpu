@@ -1077,6 +1077,19 @@ class Qwen38SegmentDriver:
             )
         return _StackedContexts(fast[1])
 
+    def _whole_direct(self) -> Any:
+        """VLLM_TPU_MK_WHOLE_DIRECT_EXEC: the whole-step program behind a
+        `DirectExec`, which records each bucket's executable on its first call
+        (warmup) and calls it directly after that (compilation/direct_exec.py)."""
+        direct = self.__dict__.get("_whole_direct_exec")
+        if direct is None or direct.program is not self.whole_program:
+            from vllm_torchtpu.compilation.direct_exec import DirectExec
+
+            direct = self._whole_direct_exec = DirectExec(
+                self.whole_program, "model_mk_whole"
+            )
+        return direct
+
     def bind_and_warmup(self, runner: Any) -> None:
         from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpSegmentModel
 
@@ -2465,8 +2478,13 @@ class Qwen38SegmentDriver:
                 self._count("drafts_whole", n_req * (T_VERIFY - 1))
                 self._note(f"whole_b{rows}")
                 assert self.whole_program is not None
+                whole_call = (
+                    self._whole_direct()
+                    if envs.VLLM_TPU_MK_WHOLE_DIRECT_EXEC
+                    else self.whole_program
+                )
                 with self._whole_contexts(runner):
-                    out = self.whole_program(
+                    out = whole_call(
                         input_ids=input_ids, positions=positions, **kw
                     )
                 runner._mk_whole_step = True
