@@ -2432,9 +2432,13 @@ class TestBootstrapUnits(unittest.TestCase):
         steps = [step for lane in uploaded.values() for step in lane]
 
         # Buildkite rejects a duplicate key, and GitHub names a commit status
-        # after its step's label, so neither repeats in a build.
+        # after the first 50 characters of its step's label, so neither repeats
+        # in a build: two labels that differ only past the cut would share one
+        # status, and one step's result would hide the other's.
         keys = [s["key"] for s in steps if "key" in s]
-        labels = [name for s in steps if (name := s.get("label") or s.get("group"))]
+        labels = [
+            name[:50] for s in steps if (name := s.get("label") or s.get("group"))
+        ]
         self.assertCountEqual(keys, set(keys))
         self.assertCountEqual(labels, set(labels))
         # Every depends_on names a step of the build: one bootstrap uploads, or
