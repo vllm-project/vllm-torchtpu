@@ -137,14 +137,16 @@ def _batched_fn(
             logits_padded = logits_padded[:, 0]
         vectors_out, caches_out, positions_out = fused(
             weights,
-            caches,
-            cache_positions,
-            aux_padded,
-            logits_padded,
-            vectors,
-            bases,
-            forced_count,
-            forced_anchor,
+            dspark.FusedDraftStepInputs(
+                cache=caches,
+                positions=cache_positions,
+                aux=aux_padded,
+                logits=logits_padded,
+                previous=vectors,
+                position=bases,
+                forced_count=forced_count,
+                forced_anchor=forced_anchor,
+            ),
         )
         if R == 1:
             caches_out = caches_out[:, None]
@@ -372,14 +374,16 @@ class DsparkDraft:
             forced_count, forced_anchor = decisions[0, 0], decisions[0, 1]
             vector, cache, positions = fused(
                 weights,
-                cache,
-                positions,
-                aux,
-                logits,
-                previous,
-                base[None],
-                forced_count[None],
-                forced_anchor[None],
+                dspark.FusedDraftStepInputs(
+                    cache=cache,
+                    positions=positions,
+                    aux=aux,
+                    logits=logits,
+                    previous=previous,
+                    position=base[None],
+                    forced_count=forced_count[None],
+                    forced_anchor=forced_anchor[None],
+                ),
             )
             accepted, bonus = vector[0, dspark.OUT_COUNT], vector[0, dspark.OUT_BONUS]
             row = jnp.arange(rows, dtype=jnp.int32)
