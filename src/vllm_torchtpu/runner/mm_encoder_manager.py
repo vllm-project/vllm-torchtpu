@@ -33,6 +33,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.mm_host_copy_patch import copy_bytes_
 from vllm_torchtpu.platforms.tpu_platform import _get_linear_token_paddings
+from vllm_torchtpu.runner.mm_encoder_rows import split_batch_output
 from vllm_torchtpu.runner.mm_video_chunking import (
     embed_multimodal_chunked,
     get_video_chunk_patch_size,
@@ -45,6 +46,11 @@ logger = init_logger(__name__)
 # The optional model hook that builds a budget graph's inputs at the budget's
 # template shapes (see `MMEncoderManager._run_budget_graph`).
 BUDGET_INPUTS_HOOK = "prepare_encoder_budget_inputs"
+# The optional model hook that ends an embedding merge run without a forward
+# (warm-up, `TPUModelRunner._precompile_layout_free_embeds`): it handles what
+# the merge staged for the forward as the forward would, then drops it.
+MERGE_WARMUP_HOOK = "finish_warmup_merge"
+_UNSET = object()
 
 
 def _to_device(mm_kwargs: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -297,11 +303,14 @@ class MMEncoderManager(EncoderCudaGraphManager):
         # the runner installs its input staging (`stage_h2d_upload`), which
         # keeps the sources until its next fence.
         self.upload: Callable[[torch.Tensor], torch.Tensor] = self._upload_blocking
-        # The layout-free path (`enable_layout_free`): this step's batches on
-        # the host (`host_batches`, see `host_encoder_batches`).
+        # The layout-free path (`enable_layout_free`): encoder outputs as row
+        # handles into their batch output, and this step's batches on the
+        # host (`host_batches`, see `host_encoder_batches`).
         self.layout_free = False
         self.host_batches = False
-        self._layout_free_off = False  # a batch on the device path
+        self._layout_free_off = False  # a batch on the per-item-tensor path
+        # Each warmed budget's output rows: the sources row handles index.
+        self.output_rows: dict[int, int] = {}
         # CUDA graph metadata owns CUDA replay buffers. Track XLA warmup
         # separately rather than storing template dicts in that upstream map.
         self.compiled_budgets: dict[str, set[int]] = {
@@ -402,6 +411,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
                     )
                     out = self._compiled_budget_forward(dict(padded), path=path)
                     synchronize_tensors(out, wait=True)
+                    self.output_rows[token_budget] = out.shape[0]
                 else:
                     synchronize_tensors(
                         [v for v in values.values() if isinstance(v, torch.Tensor)],
@@ -478,20 +488,25 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 return self.model.encoder_eager_forward(mm_kwargs, path=path)
 
     def enable_layout_free(self) -> str | None:
-        """Take this step's batches on the host (`host_encoder_batches`); None
-        if enabled, else why this manager keeps per-batch uploads."""
+        """Hold encoder outputs as row handles into their batch output
+        (`runner.mm_encoder_rows`); None if enabled, else why this manager
+        keeps vLLM's per-item tensors."""
         if not self.has_budget_inputs_hook:
             return f"{type(self.model).__name__} has no {BUDGET_INPUTS_HOOK}"
+        postprocess = type(self.model).postprocess_encoder_output
+        if postprocess is not SupportsEncoderCudaGraph.postprocess_encoder_output:
+            owner = postprocess.__qualname__
+            return f"the model post-processes encoder outputs ({owner})"
         if tuple(self.path_token_budgets) != ("default",) or self.use_dp:
             return "it has several encoder paths or encodes data-parallel"
         self.layout_free = True
         return None
 
     def _execute_local_layout_free(self, mm_kwargs: dict[str, Any]) -> list[Any]:
-        """`_execute_local` on a host batch.
+        """`_execute_local` with outputs as row handles.
 
         A batch whose items' total is past the largest budget (as a video to
-        chunk) takes today's path, on the device, instead.
+        chunk) takes today's per-item-tensor path, on the device, instead.
         """
         item_specs = self._get_item_specs(mm_kwargs)
         max_budget = max(self.token_budgets, default=0)
@@ -508,7 +523,30 @@ class MMEncoderManager(EncoderCudaGraphManager):
             finally:
                 self.host_batches, self._layout_free_off = host_batches, False
 
-        return super()._execute_local(mm_kwargs)
+        def to_rows(
+            outputs: dict[str, torch.Tensor],
+            indices: list[int],
+            per_item_out_tokens: list[int],
+            dest: dict[int, torch.Tensor] | list[torch.Tensor | None],
+            clone: bool = False,
+            batch_mm_kwargs: dict[str, Any] | None = None,
+        ) -> None:
+            items = split_batch_output(
+                outputs["default"], [per_item_out_tokens[i] for i in indices]
+            )
+            for index, item in zip(indices, items, strict=True):
+                # Row handles stand in for vLLM's per-item tensors.
+                cast(Any, dest)[index] = item
+
+        previous = self.model.__dict__.get("postprocess_encoder_output", _UNSET)
+        self.model.postprocess_encoder_output = to_rows
+        try:
+            return super()._execute_local(mm_kwargs)
+        finally:
+            if previous is _UNSET:
+                self.model.__dict__.pop("postprocess_encoder_output", None)
+            else:
+                self.model.postprocess_encoder_output = previous
 
     def _execute_local(
         self,

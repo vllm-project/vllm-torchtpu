@@ -756,16 +756,33 @@ def _select_encoder_items(upstream):
     return select
 
 
+def _finish_warmup_merge(self, num_tokens: int) -> None:
+    """Read the deepstack inputs the merge staged, as the forward does (which
+    compiles the read at this token bucket), then clear them, or the next
+    forward would add them."""
+    from vllm_torchtpu.utils import synchronize_tensors
+
+    try:
+        staged = self._get_deepstack_input_embeds(num_tokens)
+        if staged is not None:
+            synchronize_tensors(list(staged.tensors.values()))
+    finally:
+        self._clear_deepstack_input_embeds(num_tokens)
+
+
 def maybe_patch_qwen3_vl_budget_inputs(
     model_config: Optional["ModelConfig"] = None,
 ) -> bool | None:
-    """Give the Qwen3-VL vision tower the encoder manager's budget-inputs hook
-    and host-batch item selection."""
+    """Give the Qwen3-VL vision tower the encoder manager's budget-inputs and
+    merge warm-up hooks, and host-batch item selection."""
     if model_config is None or not _has_qwen3_vl_vision(model_config):
         return False
     from vllm.model_executor.models import qwen3_vl
 
-    from vllm_torchtpu.runner.mm_encoder_manager import BUDGET_INPUTS_HOOK
+    from vllm_torchtpu.runner.mm_encoder_manager import (
+        BUDGET_INPUTS_HOOK,
+        MERGE_WARMUP_HOOK,
+    )
 
     model_cls = qwen3_vl.Qwen3VLForConditionalGeneration
     if (
@@ -773,6 +790,7 @@ def maybe_patch_qwen3_vl_budget_inputs(
         is not _prepare_encoder_budget_inputs
     ):
         setattr(model_cls, BUDGET_INPUTS_HOOK, _prepare_encoder_budget_inputs)
+        setattr(model_cls, MERGE_WARMUP_HOOK, _finish_warmup_merge)
         model_cls.select_encoder_cudagraph_items = _select_encoder_items(
             model_cls.select_encoder_cudagraph_items
         )
