@@ -12,16 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# PROTOTYPE (experiment/selector-prototype, not for merging): records what CI
-# steps run, for the diff-aware selector prototype.
+# PROTOTYPE (experiment/selector-prototype, not for merging): records what
+# every selectable PR TPU step runs, for the diff-aware selector prototype.
 #
 # Trigger: https://buildkite.com/vllm/vllm-torchtpu-dev -> "New Build", branch
-# experiment/selector-prototype. Each recording step uploads its recordings
-# under selector_recordings/fnrec/<step>/shard<N>/.
+# experiment/selector-prototype. Each step records with the same shape, env,
+# markers and command as in pipeline_tests.yml / pipeline_integration.yml and
+# uploads under selector_recordings/fnrec/<step>/shard<N>/.
 #
-# Round 1 (build #1449) recorded unit_tests_cpu_pr and unit_tests_general_pr.
-# Round 2 records two integration steps (Kimi-K3 and compilation cache), with
-# the same command, shape and env as pipeline_integration.yml.
+#   pytest steps            record_step.sh   (one job per shard)
+#   single-host integration record_script.sh (the step's own script)
+#   multi-host integration  record_pod.sh    (exec'd by the manifests on this
+#                                             branch, in every pod)
+
+x-record: &record
+  depends_on: build_docker
+  # Covers queueing too, as in CI.
+  timeout_in_minutes: 1440
+  agents:
+    queue: "kube"
+  plugins:
+    - kubernetes:
+        podTemplate: tpu-launcher
+
+x-single: &single "tpu7x-standard-1t/1x1x1"
+x-multi: &multi "tpu7x-standard-4t/2x2x1"
+x-spec-file: &spec_file tests/entrypoints/llm/test_speculative_decoding.py
 
 steps:
   - label: ":docker: Build and Push Dev Image"
@@ -30,50 +46,187 @@ steps:
       queue: cpu_64_core
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
-    retry:
+    retry: &image_build_retry
       automatic:
         - exit_status: 1
           limit: 2
 
-  # Kimi-K3 first, as suggested in review. Same command and env as CI; the
-  # checkpoint (~443 GiB) streams from GCS, so the boot is long.
-  - label: "[prototype] record integration_k3_pruned75_apc_offload_correctness"
-    key: record_k3
-    depends_on: build_docker
-    timeout_in_minutes: 1440
+  - label: ":docker: Build and Push Omni Image"
+    key: build_docker_omni
     agents:
-      queue: "kube"
-    plugins:
-      - kubernetes:
-          podTemplate: tpu-launcher
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh omni
+    retry: *image_build_retry
+
+  # ----------------------------------------------------------------- unit tests
+  - label: "[record] unit_tests_general_pr (shard {{matrix}})"
+    key: record_unit_tests_general_pr
+    <<: *record
+    matrix: ["0", "1", "2"]
+    env: {SHAPE: *single, ARTIFACTS_DIR: selector_recordings}
+    commands:
+      - >-
+        .buildkite/kubernetes/run.sh bash .buildkite/scripts/selector_prototype/record_step.sh
+        unit_tests_general_pr {{matrix}} 3 "$${BUILDKITE_COMMIT}"
+        "tpu_test and not nightly and not multichip"
+        tests/entrypoints/llm/test_speculative_decoding.py
+
+  - label: "[record] unit_tests_multichip_pr"
+    key: record_unit_tests_multichip_pr
+    <<: *record
+    env: {SHAPE: *multi, ARTIFACTS_DIR: selector_recordings}
+    commands:
+      - >-
+        .buildkite/kubernetes/run.sh bash .buildkite/scripts/selector_prototype/record_step.sh
+        unit_tests_multichip_pr 0 1 "$${BUILDKITE_COMMIT}"
+        "not nightly and multichip"
+        tests/entrypoints/llm/test_speculative_decoding.py
+
+  - label: "[record] unit_tests_spec_decode_pr (shard {{matrix}})"
+    key: record_unit_tests_spec_decode_pr
+    <<: *record
+    matrix: ["0", "1", "2"]
+    env: {SHAPE: *single, ARTIFACTS_DIR: selector_recordings}
+    commands:
+      - >-
+        .buildkite/kubernetes/run.sh bash .buildkite/scripts/selector_prototype/record_step.sh
+        unit_tests_spec_decode_pr {{matrix}} 3 "$${BUILDKITE_COMMIT}"
+        "not nightly and not multichip" --only tests/entrypoints/llm/test_speculative_decoding.py
+
+  - label: "[record] unit_tests_spec_decode_multichip_pr"
+    key: record_unit_tests_spec_decode_multichip_pr
+    <<: *record
+    env: {SHAPE: *multi, ARTIFACTS_DIR: selector_recordings}
+    commands:
+      - >-
+        .buildkite/kubernetes/run.sh bash .buildkite/scripts/selector_prototype/record_step.sh
+        unit_tests_spec_decode_multichip_pr 0 1 "$${BUILDKITE_COMMIT}"
+        "not nightly and multichip" --only tests/entrypoints/llm/test_speculative_decoding.py
+
+  # On the -omni image, with golden/ staged as in CI. The commit is passed as
+  # $1 of the inner shell so the agent expands it.
+  - label: "[record] unit_tests_omni_pr"
+    key: record_unit_tests_omni_pr
+    <<: *record
+    depends_on: build_docker_omni
+    env: {SHAPE: *single, DOCKER_IMAGE_SUFFIX: "-omni", ARTIFACTS_DIR: selector_recordings}
+    commands:
+      - >-
+        .buildkite/kubernetes/run.sh bash -c
+        'bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/golden/ "$$HF_HOME"
+        && bash .buildkite/scripts/selector_prototype/record_step.sh
+        unit_tests_omni_pr 0 1 "$$1" "not nightly" --tests-dir tests_omni'
+        _ "$${BUILDKITE_COMMIT}"
+
+  # ---------------------------------------------------- single-host integration
+  - label: "[record] integration_qwen35_pcp4_dp4_disagg_correctness"
+    key: record_integration_qwen35_pcp4_dp4_disagg_correctness
+    <<: *record
     env:
-      SHAPE: "tpu7x-standard-4t/2x2x1"
+      SHAPE: *multi
+      TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+      RUN_ROOT: "perf_eval_results/qwen35_pcp4_dp4_disagg_ci"
+      ARTIFACTS_DIR: selector_recordings
+    commands:
+      - .buildkite/kubernetes/run.sh bash .buildkite/scripts/selector_prototype/record_script.sh integration_qwen35_pcp4_dp4_disagg_correctness "$${BUILDKITE_COMMIT}"
+
+  - label: "[record] integration_qwen35_pcp4_2tp2dp_disagg_correctness"
+    key: record_integration_qwen35_pcp4_2tp2dp_disagg_correctness
+    <<: *record
+    env:
+      SHAPE: *multi
+      TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+      RUN_ROOT: "perf_eval_results/qwen35_pcp4_2tp2dp_disagg_ci"
+      ARTIFACTS_DIR: selector_recordings
+    commands:
+      - .buildkite/kubernetes/run.sh bash .buildkite/scripts/selector_prototype/record_script.sh integration_qwen35_pcp4_2tp2dp_disagg_correctness "$${BUILDKITE_COMMIT}"
+
+  - label: "[record] integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness"
+    key: record_integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness
+    <<: *record
+    env:
+      SHAPE: *multi
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+      RUN_ROOT: "perf_eval_results/qwen35_pcp4tp1_tp4dcp2_disagg_ci"
+      ARTIFACTS_DIR: selector_recordings
+    commands:
+      - .buildkite/kubernetes/run.sh bash .buildkite/scripts/selector_prototype/record_script.sh integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness "$${BUILDKITE_COMMIT}"
+
+  - label: "[record] presubmit_disagg_single_host"
+    key: record_presubmit_disagg_single_host
+    <<: *record
+    env: {SHAPE: *multi, ARTIFACTS_DIR: selector_recordings}
+    commands:
+      - .buildkite/kubernetes/run.sh bash .buildkite/scripts/selector_prototype/record_script.sh presubmit_disagg_single_host "$${BUILDKITE_COMMIT}"
+
+  - label: "[record] integration_qwen35_apc_correctness"
+    key: record_integration_qwen35_apc_correctness
+    <<: *record
+    env:
+      SHAPE: *multi
+      RUN_ROOT: "perf_eval_results/qwen35_apc_ci"
+      ARTIFACTS_DIR: selector_recordings
+    commands:
+      - .buildkite/kubernetes/run.sh bash .buildkite/scripts/selector_prototype/record_script.sh integration_qwen35_apc_correctness "$${BUILDKITE_COMMIT}"
+
+  - label: "[record] integration_qwen35_gpc_global_dram_pool"
+    key: record_integration_qwen35_gpc_global_dram_pool
+    <<: *record
+    env:
+      SHAPE: *multi
+      RUN_ROOT: "perf_eval_results/qwen35_gpc_dram_pool_ci"
+      ARTIFACTS_DIR: selector_recordings
+    commands:
+      - .buildkite/kubernetes/run.sh bash .buildkite/scripts/selector_prototype/record_script.sh integration_qwen35_gpc_global_dram_pool "$${BUILDKITE_COMMIT}"
+
+  # No automatic retry, unlike CI: two attempts would upload the same paths.
+  - label: "[record] integration_compilation_cache_e2e"
+    key: record_integration_compilation_cache_e2e
+    <<: *record
+    env: {SHAPE: *single, ARTIFACTS_DIR: selector_recordings}
+    commands:
+      - .buildkite/kubernetes/run.sh bash .buildkite/scripts/selector_prototype/record_script.sh integration_compilation_cache_e2e "$${BUILDKITE_COMMIT}"
+
+  - label: "[record] integration_k3_pruned75_apc_offload_correctness"
+    key: record_integration_k3_pruned75_apc_offload_correctness
+    <<: *record
+    env:
+      SHAPE: *multi
       TPU_ACCELERATOR_TYPE: "tpu7x"
       RUN_ROOT: "perf_eval_results/k3_pruned75_apc_offload_ci"
       SERVED_MODEL_NAME: "mgoin/Kimi-K3-pruned75"
-      ARTIFACTS_DIR: "selector_recordings"
+      ARTIFACTS_DIR: selector_recordings
     commands:
-      - >-
-        .buildkite/kubernetes/run.sh bash
-        .buildkite/scripts/selector_prototype/record_script.sh
-        integration_k3_pruned75_apc_offload_correctness "$${BUILDKITE_COMMIT}"
+      - .buildkite/kubernetes/run.sh bash .buildkite/scripts/selector_prototype/record_script.sh integration_k3_pruned75_apc_offload_correctness "$${BUILDKITE_COMMIT}"
 
-  # No automatic retry, unlike CI: two attempts would upload the same
-  # recording paths. Rerun the build if its known cache flake hits.
-  - label: "[prototype] record integration_compilation_cache_e2e"
-    key: record_compilation_cache
-    depends_on: build_docker
-    timeout_in_minutes: 1440
-    agents:
-      queue: "kube"
-    plugins:
-      - kubernetes:
-          podTemplate: tpu-launcher
-    env:
-      SHAPE: "tpu7x-standard-1t/1x1x1"
-      ARTIFACTS_DIR: "selector_recordings"
+  # ----------------------------------------------------- multi-host integration
+  # Same commands as CI. The manifests on this branch exec record_pod.sh in
+  # every pod, and each pod uploads its own recordings.
+  - label: "[record] vllm_torchtpu_multihost_presubmit"
+    key: record_vllm_torchtpu_multihost_presubmit
+    <<: *record
     commands:
       - >-
-        .buildkite/kubernetes/run.sh bash
-        .buildkite/scripts/selector_prototype/record_script.sh
-        integration_compilation_cache_e2e "$${BUILDKITE_COMMIT}"
+        .buildkite/kubernetes/run_multihost.sh --topology 2x2x2
+        python3 examples/offline_inference.py
+        --model Qwen/Qwen3-0.6B
+        --tensor-parallel-size 16
+        --max-model-len 256
+        --max-num-batched-tokens 256
+        --max-num-seqs 64
+        --compilation-config '{"compile_sizes":[64,256]}'
+        --max-tokens 32
+
+  - label: "[record] integration_qwen35_pcp8_2tp4dp_disagg_correctness"
+    key: record_integration_qwen35_pcp8_2tp4dp_disagg_correctness
+    <<: *record
+    commands:
+      - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-p8d8-disagg.yaml
+
+  - label: "[record] integration_qwen35_gpc_correctness"
+    key: record_integration_qwen35_gpc_correctness
+    <<: *record
+    commands:
+      - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-gpc-two-replica.yaml

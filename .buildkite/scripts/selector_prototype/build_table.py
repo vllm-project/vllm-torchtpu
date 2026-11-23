@@ -138,7 +138,10 @@ def build(artifacts: pathlib.Path, repo: pathlib.Path, commit: str) -> dict:
             health["shards_expected"] = max(
                 health["shards_expected"], int(meta["shards"])
             )
-            health["exit_codes"].append(int(meta["exit_code"]))
+            # A peer pod torn down once the head finished exits by signal;
+            # only pods marked judged speak for the step.
+            if meta.get("judged", 1):
+                health["exit_codes"].append(int(meta["exit_code"]))
             if meta.get("commit"):
                 health["commits"].add(meta["commit"])
             for proc_file in shard_dir.glob("fn.*.txt"):

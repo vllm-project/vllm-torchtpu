@@ -72,8 +72,8 @@ spec:
                 args:
                   - |
                     set -euo pipefail
-                    exec bash .buildkite/kubernetes/single_host_engine.sh \
-                      bash ./scripts/vllm/integration/run_qwen35_gpc_correctness.sh
+                    # PROTOTYPE: record this pod (selector_prototype/record_pod.sh).
+                    exec bash .buildkite/scripts/selector_prototype/record_pod.sh gpc_worker
                 env:
                 - name: GPC_ROLE
                   value: worker
@@ -144,8 +144,8 @@ spec:
                     # no network of its own, and the single-host GPC test
                     # already starts it this way.
                     global_registry_server --port="$${REGISTRY_PORT}" &
-                    exec bash .buildkite/kubernetes/single_host_engine.sh \
-                      bash ./scripts/vllm/integration/run_qwen35_gpc_correctness.sh
+                    # PROTOTYPE: record this pod (selector_prototype/record_pod.sh).
+                    exec bash .buildkite/scripts/selector_prototype/record_pod.sh gpc_head
                 env:
                 - name: GPC_ROLE
                   value: head

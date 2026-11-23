@@ -22,6 +22,20 @@ case "$step" in
     cmd=(bash ./scripts/vllm/integration/run_k3_pruned75_apc_offload_correctness.sh) ;;
   integration_qwen35_apc_correctness)
     cmd=(bash ./scripts/vllm/integration/run_qwen35_apc_correctness.sh) ;;
+  integration_qwen35_pcp4_dp4_disagg_correctness)
+    cmd=(bash ./scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh) ;;
+  integration_qwen35_pcp4_2tp2dp_disagg_correctness)
+    cmd=(bash ./scripts/vllm/integration/run_qwen35_pcp4_2tp2dp_disagg_correctness.sh) ;;
+  integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness)
+    cmd=(bash ./scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh) ;;
+  integration_qwen35_gpc_global_dram_pool)
+    cmd=(bash ./scripts/vllm/integration/run_qwen35_gpc_global_dram_pool.sh) ;;
+  presubmit_disagg_single_host)
+    cmd=(env TPU_KV_RESHARD_TRANSPORT=zmq
+         LOG_DIR=perf_eval_results/disagg_single_host
+         "PREFILL_EXTRA_ARGS=--max-num-seqs 8"
+         "DECODE_EXTRA_ARGS=--max-num-batched-tokens 128 --max-num-seqs 128"
+         bash ./examples/disagg/run_disagg_single_host.sh) ;;
   *)
     echo "record_script.sh: no command known for step '$step'" >&2
     exit 2 ;;

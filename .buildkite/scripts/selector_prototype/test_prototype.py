@@ -152,6 +152,15 @@ class PrototypeTest(unittest.TestCase):
         table = build_table.build(self.artifacts, self.repo.root, self.recorded_at)
         self.assertIn("the step's command failed",
                       table["rows"]["integration_x"]["health"]["thin"])
+        # A peer pod torn down by signal does not count against the step.
+        fake_recording(self.artifacts, "integration_x", 1, 2, [(MOD, "called")],
+                       passed=0)
+        meta.write_text(json.dumps({**data, "kind": "script", "shards": 2}))
+        peer = self.artifacts / "fnrec" / "integration_x" / "shard1" / "meta.json"
+        peer.write_text(json.dumps({**json.loads(peer.read_text()), "kind": "script",
+                                    "exit_code": 143, "judged": 0}))
+        table = build_table.build(self.artifacts, self.repo.root, self.recorded_at)
+        self.assertEqual(table["rows"]["integration_x"]["health"]["thin"], [])
 
     def test_failed_or_missing_shards_make_a_row_thin(self) -> None:
         self.assertIn("tests failed", self.table(failed=1).rows[GENERAL]["health"]["thin"])

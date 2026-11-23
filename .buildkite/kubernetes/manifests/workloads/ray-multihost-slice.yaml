@@ -71,8 +71,9 @@ spec:
                   args:
                     - |
                       export VLLM_HOST_IP="$${POD_IP}"
-                      readarray -d '' _args < <(printf '%s' "$${MULTIHOST_ARGS_B64}" | base64 -d)
-                      exec bash .buildkite/kubernetes/multihost_entry.sh "$${_args[@]}"
+                      # PROTOTYPE: record this pod (selector_prototype/record_pod.sh),
+                      # which decodes MULTIHOST_ARGS_B64 and runs multihost_entry.sh.
+                      exec bash .buildkite/scripts/selector_prototype/record_pod.sh ray
                   env:
                     - name: HEAD_HOST
                       value: ${WORKLOAD_NAME}-slice-0-0.${WORKLOAD_NAME}

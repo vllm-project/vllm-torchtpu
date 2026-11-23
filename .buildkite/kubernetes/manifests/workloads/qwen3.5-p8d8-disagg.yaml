@@ -70,8 +70,8 @@ spec:
                 command: ["/bin/bash", "-c"]
                 args:
                   - |
-                    exec bash .buildkite/kubernetes/single_host_engine.sh \
-                      bash ./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh
+                    # PROTOTYPE: record this pod (selector_prototype/record_pod.sh).
+                    exec bash .buildkite/scripts/selector_prototype/record_pod.sh p8d8_decode
                 env:
                 - name: ROLE
                   value: decode
@@ -139,8 +139,8 @@ spec:
                 command: ["/bin/bash", "-c"]
                 args:
                   - |
-                    exec bash .buildkite/kubernetes/single_host_engine.sh \
-                      bash ./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh
+                    # PROTOTYPE: record this pod (selector_prototype/record_pod.sh).
+                    exec bash .buildkite/scripts/selector_prototype/record_pod.sh p8d8_head
                 env:
                 # head, not prefill: this role serves the prefill engine and
                 # also drives the proxy and the correctness smoke.
