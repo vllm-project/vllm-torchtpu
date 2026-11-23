@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
     TPU_MOE_ROUTER_FUSED_EPILOGUE: bool = False
+    TPU_KV_PACK_FUSED_PAD: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -805,6 +806,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and 2-D scores; the arithmetic is the same float32 sequence. Off by
     # default.
     "TPU_MOE_ROUTER_FUSED_EPILOGUE": env_bool("TPU_MOE_ROUTER_FUSED_EPILOGUE"),
+    # Pad the MLA latents to the SparseCore KV writer's row count before the
+    # uint32 bit-pack (kernels/mla/scatter.py), so one op produces the padded
+    # packed rows instead of a pack followed by a separate pad op (for
+    # example 16 tokens padded to 32 rows at decode). The written cache is
+    # bit-identical. SparseCore cache layout only. Off by default.
+    "TPU_KV_PACK_FUSED_PAD": env_bool("TPU_KV_PACK_FUSED_PAD"),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's

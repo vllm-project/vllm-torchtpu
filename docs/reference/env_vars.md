@@ -87,6 +87,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
+| `TPU_KV_PACK_FUSED_PAD` | `False` | Opt-in. For the SparseCore MLA KV cache layout, pads the new latents to the SparseCore writer's row count (for example 16 tokens to 32 rows) before the uint32 bit-pack, so one op produces the padded packed rows instead of a pack followed by a separate pad. The written cache is bit-identical. |
 
 ---
 
