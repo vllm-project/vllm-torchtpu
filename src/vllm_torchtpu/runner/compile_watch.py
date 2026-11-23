@@ -26,6 +26,23 @@ logger = init_logger(__name__)
 _installed = False
 
 
+def _arg_shape(v) -> str | None:
+    """`(shape):dtype` of a tensor arg; `[n x (first)..(last):dtype]` of a
+    non-empty list/tuple of tensors (e.g. VERIFY_RO_INGRAPH's slot groups)."""
+    if isinstance(v, torch.Tensor):
+        return f"{tuple(v.shape)}:{str(v.dtype).replace('torch.', '')}"
+    if (
+        isinstance(v, (list, tuple))
+        and v
+        and all(isinstance(t, torch.Tensor) for t in v)
+    ):
+        return (
+            f"[{len(v)}x{tuple(v[0].shape)}..{tuple(v[-1].shape)}:"
+            f"{str(v[0].dtype).replace('torch.', '')}]"
+        )
+    return None
+
+
 def _trigger_frame() -> str:
     """The innermost vllm_torchtpu frame, with the shapes of its tensor locals
     (which name the bucket that was not warmed)."""
@@ -46,9 +63,9 @@ def _trigger_frame() -> str:
                 # wrapped function and its tensor args' shapes/dtypes.
                 label += f" -> {getattr(fn, '__qualname__', repr(fn))}"
                 shapes = [
-                    f"a{i}={tuple(v.shape)}:{str(v.dtype).replace('torch.', '')}"
+                    f"a{i}={_arg_shape(v)}"
                     for i, v in enumerate(loc["args"])
-                    if isinstance(v, torch.Tensor)
+                    if _arg_shape(v) is not None
                 ][:8]
             return label + (f" [{' '.join(shapes)}]" if shapes else "")
         frame = frame.f_back

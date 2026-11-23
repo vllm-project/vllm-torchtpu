@@ -65,6 +65,31 @@ def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:
     return F.pad(t, pad, value=value)
 
 
+class DraftStepTokens:
+    """VLLM_TPU_SPEC_TAIL_STACK: one chunk's device drafts, not yet stacked.
+
+    `steps` holds the K per-step draft tokens, each `[p]` (p >= num_reqs, the
+    chunk's loop bucket). The spec-tail program stacks and slices them
+    in-graph; any other consumer calls `materialize()`, which runs the eager
+    stack and slice that `Eagle3Proposer.propose` returns without the flag.
+    """
+
+    __slots__ = ("steps", "num_reqs", "_dense")
+
+    def __init__(self, steps: list[torch.Tensor], num_reqs: int) -> None:
+        self.steps = tuple(steps)
+        self.num_reqs = num_reqs
+        self._dense: torch.Tensor | None = None
+
+    def materialize(self) -> torch.Tensor:
+        """The `[num_reqs, K]` drafts, built by the same ops as the stock
+        propose return."""
+        if self._dense is None:
+            stacked = torch.stack(self.steps, dim=1)
+            self._dense = torch.cat([stacked[: self.num_reqs]], dim=0)
+        return self._dense
+
+
 @dataclass
 class DraftChunkInputs:
     # Full padded request-major token ids for this draft chunk, captured before a

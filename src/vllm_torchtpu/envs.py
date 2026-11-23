@@ -382,6 +382,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SUBTRACT_REJECTED_COMPILED: bool = False
     VLLM_TPU_SUBTRACT_REJECTED_PAD_ROWS: bool = False
     VLLM_TPU_SPEC_TAIL_COMPILED: bool = False
+    VLLM_TPU_SPEC_TAIL_STACK: bool = False
     VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
     VLLM_TPU_LOOP_LAG_WATCHDOG_S: float = 30.0
     VLLM_TPU_FREEZE_PYSPY_S: float = 120.0
@@ -432,6 +433,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_METADATA_BUILD: bool = False
     VLLM_TPU_STEADY_DECODE_METADATA: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
+    VLLM_TPU_MK_WHOLE_DIRECT_EXEC: bool = False
     VLLM_TPU_ENVS_FREEZE: bool = False
     VLLM_TPU_HOST_TOKEN_LISTS: bool = False
     VLLM_TPU_PREFILL_CKPT_DECODE_SKIP: bool = False
@@ -2512,6 +2514,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Async spec decode, one chunk: the next step's substitution source and the
     # rejected count (with their row fits and the source pad) as one program.
     "VLLM_TPU_SPEC_TAIL_COMPILED": env_bool("VLLM_TPU_SPEC_TAIL_COMPILED"),
+    # With SPEC_TAIL_COMPILED: eagle3 hands its per-step draft tokens to the
+    # spec-tail program, which stacks and slices them in-graph, instead of
+    # stacking and concatenating them in an eager program. Same values.
+    "VLLM_TPU_SPEC_TAIL_STACK": env_bool("VLLM_TPU_SPEC_TAIL_STACK"),
     # Dump all processes' stacks when no step starts for N s with live
     # requests (stall_watchdog.py; read directly there, registered here).
     "VLLM_TPU_STALL_WATCHDOG_S": env_float("VLLM_TPU_STALL_WATCHDOG_S", 0.0),
@@ -2642,9 +2648,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # shape, warmed) and keep returning the [:num_reqs] view. Same values in
     # every slot a reader sees; the TPU sampler reads none of these tensors.
     "VLLM_TPU_SAMPLING_COPIES_WHOLE": env_bool("VLLM_TPU_SAMPLING_COPIES_WHOLE"),
-    # With VLLM_TPU_VERIFY_ONE_DRAW (and VERIFY_FUSED_READ_OFFSETS off): the
-    # post-verify mamba read-offset scatter runs inside the verify program
-    # (one program instead of two). Same values.
+    # With VLLM_TPU_VERIFY_ONE_DRAW: the post-verify mamba read-offset scatter
+    # runs inside the verify program (one program instead of two, or instead
+    # of VERIFY_FUSED_READ_OFFSETS' eager scatter when that is on too). Same
+    # values. Compiled after the spec-decode warmup at every verify bucket x
+    # slot-group layout x width; a step whose key was not compiled keeps the
+    # other path and logs one WARNING per key ("VERIFY_RO_INGRAPH: key ...").
     "VLLM_TPU_VERIFY_RO_INGRAPH": env_bool("VLLM_TPU_VERIFY_RO_INGRAPH"),
     # With VLLM_TPU_VERIFY_FUSED: compute the mamba read offsets inside the
     # fused verify program and apply them with one eager scatter.
@@ -2744,6 +2753,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Freshly AOT-compiled models skip the per-call Dynamo guard check when
     # vLLM does not evaluate guards (as it already does for cached artifacts).
     "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),
+    # Qwen3.8 whole-step megakernel call: record each bucket's executable,
+    # operand order, input-mutation copies and outputs on its first call, then
+    # call the executable directly, skipping the decorator / AOT / split_gm /
+    # piecewise / AOTAutograd wrapper layers (compilation/direct_exec.py). Any
+    # call the record does not cover takes the normal path.
+    "VLLM_TPU_MK_WHOLE_DIRECT_EXEC": env_bool("VLLM_TPU_MK_WHOLE_DIRECT_EXEC"),
     # After warmup, each worker keeps the first value it reads of every
     # variable in this module as a module attribute (freeze_reads), so a read
     # on the step path is a dict hit instead of os.getenv plus parsing
