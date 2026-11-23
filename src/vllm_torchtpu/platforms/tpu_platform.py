@@ -32,6 +32,7 @@ import vllm.envs as vllm_envs
 from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
+from vllm.utils.argparse_utils import EnableDisableAction
 
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
@@ -220,12 +221,17 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 _dynamic_compile_unwrapped = False
 _tpu_kv_connectors_registered = False
 # Process-global CLI opt-out state: None until pre_register_and_update(parser)
-# runs (which resets it to False), then True/False from the last parsed
-# --[no-]enable-ep-weight-filter flag (including --config YAML files).
+# hooks the flag action (which resets it to False), then True/False from the
+# last parsed --enable-ep-weight-filter / --disable-ep-weight-filter /
+# --no-enable-ep-weight-filter flag (including --config YAML files).
 _ep_weight_filter_cli_opt_out: bool | None = None
+_EP_WEIGHT_FILTER_CLI_DISABLE_FLAGS = (
+    "--disable-ep-weight-filter",
+    "--no-enable-ep-weight-filter",
+)
 
 
-class _TrackedEpWeightFilterAction(argparse.BooleanOptionalAction):
+class _TrackedEnableDisableEpWeightFilterAction(EnableDisableAction):
     """Records whether CLI arguments explicitly opted out of EP weight filtering."""
 
     def __call__(self, parser, namespace, values, option_string=None):
@@ -234,16 +240,34 @@ class _TrackedEpWeightFilterAction(argparse.BooleanOptionalAction):
         _ep_weight_filter_cli_opt_out = getattr(namespace, self.dest, None) is False
 
 
+class _TrackedBooleanOptionalEpWeightFilterAction(argparse.BooleanOptionalAction):
+    """Fallback tracker when a parser uses plain BooleanOptionalAction."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        global _ep_weight_filter_cli_opt_out
+        super().__call__(parser, namespace, values, option_string)
+        _ep_weight_filter_cli_opt_out = getattr(namespace, self.dest, None) is False
+
+
+_TRACKED_EP_WEIGHT_FILTER_ACTION_TYPES = (
+    _TrackedEnableDisableEpWeightFilterAction,
+    _TrackedBooleanOptionalEpWeightFilterAction,
+)
+
+
 def _track_ep_weight_filter_cli_action(parser: "FlexibleArgumentParser") -> None:
     """Attach opt-out tracking to vLLM's --enable-ep-weight-filter CLI action."""
     global _ep_weight_filter_cli_opt_out
     for action in parser._actions:
         if action.dest != "enable_ep_weight_filter":
             continue
-        if type(action) is argparse.BooleanOptionalAction:
-            action.__class__ = _TrackedEpWeightFilterAction
+        if type(action) is EnableDisableAction:
+            action.__class__ = _TrackedEnableDisableEpWeightFilterAction
             _ep_weight_filter_cli_opt_out = False
-        elif isinstance(action, _TrackedEpWeightFilterAction):
+        elif type(action) is argparse.BooleanOptionalAction:
+            action.__class__ = _TrackedBooleanOptionalEpWeightFilterAction
+            _ep_weight_filter_cli_opt_out = False
+        elif isinstance(action, _TRACKED_EP_WEIGHT_FILTER_ACTION_TYPES):
             _ep_weight_filter_cli_opt_out = False
         else:
             _ep_weight_filter_cli_opt_out = None
@@ -260,7 +284,7 @@ def _is_ep_weight_filter_cli_disabled() -> bool:
         return _ep_weight_filter_cli_opt_out
     # Fallback for entry points (e.g. EngineArgs.add_cli_args) that do not
     # invoke pre_register_and_update(parser).
-    return "--no-enable-ep-weight-filter" in sys.argv[1:]
+    return any(flag in sys.argv[1:] for flag in _EP_WEIGHT_FILTER_CLI_DISABLE_FLAGS)
 
 
 def _apply_default_ep_weight_filter(vllm_config: "VllmConfig") -> None:
@@ -279,7 +303,7 @@ def _apply_default_ep_weight_filter(vllm_config: "VllmConfig") -> None:
     parallel_config.enable_ep_weight_filter = True
     logger.info_once(
         "Defaulting enable_ep_weight_filter=True on TPU for MoE with expert "
-        "parallelism (pass --no-enable-ep-weight-filter to disable)."
+        "parallelism (pass --disable-ep-weight-filter to disable)."
     )
 
 

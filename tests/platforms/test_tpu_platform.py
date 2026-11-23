@@ -1708,11 +1708,12 @@ def _make_ep_filter_vllm_config(
         enable_expert_parallel=enable_expert_parallel,
         enable_ep_weight_filter=enable_ep_weight_filter,
     )
-    # ParallelConfig validation rejects enable_eplb on TPU; assign directly to
-    # verify our guard leaves EP filtering off when EPLB is enabled.
-    parallel_config.enable_eplb = enable_eplb
     with _device_left_unset():
         vllm_config = VllmConfig(parallel_config=parallel_config)
+    # ParallelConfig validation rejects enable_eplb on TPU; assign after
+    # VllmConfig construction to verify our guard keeps EP filtering off if
+    # EPLB is enabled.
+    vllm_config.parallel_config.enable_eplb = enable_eplb
     model_config = MagicMock(spec=ModelConfig)
     model_config.is_moe = is_moe
     model_config.dtype = torch.bfloat16
@@ -1766,8 +1767,11 @@ def test_default_ep_weight_filter_gates_on_moe_ep_without_eplb(
     "cli_args, expected",
     [
         ([], True),
+        (["--disable-ep-weight-filter"], False),
         (["--no-enable-ep-weight-filter"], False),
+        (["--disable-ep-weight-filter", "--enable-ep-weight-filter"], True),
         (["--no-enable-ep-weight-filter", "--enable-ep-weight-filter"], True),
+        (["--enable-ep-weight-filter", "--disable-ep-weight-filter"], False),
         (["--enable-ep-weight-filter", "--no-enable-ep-weight-filter"], False),
     ],
 )
@@ -1784,7 +1788,7 @@ def test_default_ep_weight_filter_respects_cli_opt_out_via_parser(
     with _device_left_unset():
         parser = AsyncEngineArgs.add_cli_args(FlexibleArgumentParser())
     action = next(a for a in parser._actions if a.dest == "enable_ep_weight_filter")
-    assert isinstance(action, tpu_platform._TrackedEpWeightFilterAction)
+    assert isinstance(action, tpu_platform._TRACKED_EP_WEIGHT_FILTER_ACTION_TYPES)
     parsed = parser.parse_args(cli_args)
     vllm_config = _make_ep_filter_vllm_config(
         is_moe=True,
@@ -1795,6 +1799,10 @@ def test_default_ep_weight_filter_respects_cli_opt_out_via_parser(
     assert vllm_config.parallel_config.enable_ep_weight_filter is expected
 
 
+@pytest.mark.parametrize(
+    "flag",
+    ["--disable-ep-weight-filter", "--no-enable-ep-weight-filter"],
+)
 @pytest.mark.parametrize(
     "parser_opt_out, expected",
     [
@@ -1808,10 +1816,10 @@ def test_default_ep_weight_filter_respects_cli_opt_out_via_parser(
 @patch("vllm_torchtpu.patch_registry.apply")
 @patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
 def test_default_ep_weight_filter_sys_argv_fallback(
-    mock_prepare_env, mock_apply_patches, monkeypatch, parser_opt_out, expected
+    mock_prepare_env, mock_apply_patches, monkeypatch, flag, parser_opt_out, expected
 ):
     monkeypatch.setattr(tpu_platform, "_ep_weight_filter_cli_opt_out", parser_opt_out)
-    monkeypatch.setattr(sys, "argv", ["vllm", "bench", "--no-enable-ep-weight-filter"])
+    monkeypatch.setattr(sys, "argv", ["vllm", "bench", flag])
     vllm_config = _make_ep_filter_vllm_config(
         is_moe=True,
         enable_expert_parallel=True,
