@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Decode MoE layer of one TP rank, shared expert and TP all-reduce included,
 """arm99 prototype: TP-sharded small-T decode MoE, dense over tokens, sparse over hit experts (own design).
 
 Every core holds a 1/TP slice of every expert: w1 [E, K, 2Fs] (gate slice | up slice), w2 [E, Fs, N], fp4 with

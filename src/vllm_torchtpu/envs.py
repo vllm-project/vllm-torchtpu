@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTE_TRACE_EVERY: int = 8192
     VLLM_TPU_MOE_REDUNDANT_EXPERTS: int = 0
     TPU_MOE_REPLICA_ASSIGN_REFINE: int = 0
+    TPU_MOE_TP_DENSE_FP4_MAX_TOKENS: int = 0
     TPU_MOE_REPLICA_ASSIGN_FAST: bool = False
     TPU_MOE_NVFP4_SKIP_PADDED: bool = False
     TPU_MINIMAX_M3_INDEXER_DECODE_OPT: str = ""
@@ -968,6 +969,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # an expert, not the math. 0 (default) = greedy only.
     "TPU_MOE_REPLICA_ASSIGN_REFINE": env_nonnegative_int(
         "TPU_MOE_REPLICA_ASSIGN_REFINE", 0
+    ),
+    # EP layers: decode steps of up to this many tokens run the routed experts
+    # with a TP-sliced copy of the NVFP4 expert weights (every rank holds 1/ep
+    # of every expert's intermediate dim; layers/adapter/moe_tp_dense.py,
+    # kernels/experimental/moe_tp_dense_fp4). Larger steps keep the EP path.
+    # Costs one extra 1/ep copy of the routed expert weights per rank (less KV).
+    # 0 disables it.
+    "TPU_MOE_TP_DENSE_FP4_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MOE_TP_DENSE_FP4_MAX_TOKENS", 0
     ),
     # With redundant experts: the same copy assignment from a leaner kernel
     # (copy table flattened with each copy's rank at load, no per-step init
