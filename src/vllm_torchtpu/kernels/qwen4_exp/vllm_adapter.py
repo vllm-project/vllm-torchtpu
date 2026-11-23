@@ -139,7 +139,7 @@ def _log_w1_sched(tag: str) -> None:
     construction, so it prints on a warm compile cache too)."""
     msg = (
         "q38 HCK: TPU_QWEN4_HC_DECODE_W1_SCHED=1 engaged: hc_decode_wide mode 1 "
-        f"schedule v2 (all copies at entry, slab weights, one-pass B2), op tag {tag}"
+        f"schedule v2 (all copies at entry, one-pass B2), op tag {tag}"
     )
     logger.warning(msg)
     print(msg, flush=True)

@@ -1638,8 +1638,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_QWEN4_HC_DECODE_INJECT_FOLD": env_bool("TPU_QWEN4_HC_DECODE_INJECT_FOLD"),
     # q38 HCK, only with TPU_QWEN4_HC_DECODE_WIDE=1 (refused otherwise): "1" runs
     # the W1 kernel's schedule v2 at its 160-511 rows (hc_decode_wide.py: every
-    # copy started at kernel entry, the down / up weights as row slabs with their
-    # own semaphores, and phase B2's up projection in one pass up to 320 rows);
+    # copy started at kernel entry, and phase B2's up projection in one pass up to
+    # 320 rows);
     # op and kernel names gain an "s" (_w1s / _w1fs). Every expression of mode 1 is
     # unchanged (bitwise is decided by the HCK proofs). "" / "0" = off (default).
     # Compile-hashed (read when the decode HC ops are built).

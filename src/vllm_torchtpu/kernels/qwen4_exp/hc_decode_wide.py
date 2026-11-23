@@ -55,10 +55,8 @@ Schedule v2 (q38 HCK, ``TPU_QWEN4_HC_DECODE_W1_SCHED=1``; mode 1 only, default o
 kernel names gain ``s``), two static switches, both on under the key:
 
 * ``sched_dma`` (data movement only): every copy is started at kernel entry
-  (budget ``SCHED_LOOKAHEAD_MIB``, today's queue order), the down rows travel as
-  ``DN_SLABS`` row slabs and the up rows as one slab per branch, each with its own
-  semaphore; the down slabs are all waited where the single down copy was, and up
-  slab ``b`` just before branch ``b``'s first up projection. No compute changes.
+  (budget ``SCHED_LOOKAHEAD_MIB`` instead of ``lookahead``: today's queue order and
+  copies, every wait where it was). No compute changes.
 * ``sched_onepass``: phase B2 runs over the fewest row blocks of at most
   ``ONEPASS_ROWS`` rows (one pass up to 320 rows), so each branch's up weights
   stream through the matrix unit once; every expression of mode 1 is unchanged
@@ -91,7 +89,6 @@ W3_LOOKAHEAD_MIB = 12
 VMEM_LIMIT = 56 << 20
 # q38 HCK schedule v2 (TPU_QWEN4_HC_DECODE_W1_SCHED).
 SCHED_LOOKAHEAD_MIB = 64
-DN_SLABS = 4
 ONEPASS_ROWS = 320
 
 
@@ -212,17 +209,8 @@ def _kernel(
         rows = pl.ds(r0, rb)
         rows_in.append(copy(res_hbm.at[rows, :], res_vm.at[rows, :]))
         blk_in.append(copy(blk_hbm.at[rows, :], blk_vm.at[rows, :]) if prologue else None)
-    if sched_dma:
-        # HCK: the down rows as DN_SLABS row slabs, the up rows one slab per branch.
-        dr = lowrank // DN_SLABS
-        dn_in = [
-            copy(down_hbm.at[pl.ds(i * dr, dr), :], dn_vm.at[pl.ds(i * dr, dr), :])
-            for i in range(DN_SLABS)
-        ]
-        up_in = [copy(up_hbm.at[stream(b), :], up_vm.at[stream(b), :]) for b in range(branches)]
-    else:
-        dn_in = copy(down_hbm, dn_vm.at[pl.ds(0, lowrank), :])
-        up_in = copy(up_hbm, up_vm)
+    dn_in = copy(down_hbm, dn_vm.at[pl.ds(0, lowrank), :])
+    up_in = copy(up_hbm, up_vm)
 
     # Copies in consumption order: a copy starts once the copies started ahead
     # of it and not yet waited hold less than ``lookahead`` MiB, or when it is
@@ -244,14 +232,8 @@ def _kernel(
         if fold:
             # Fold: the inject rows are first read by the down projection.
             queue.append((inj_in, branches * width * 2))
-        if sched_dma:
-            queue += [(c, dr * width * 2) for c in dn_in]
-        else:
-            queue.append((dn_in, lowrank * width * 2))
-    if sched_dma:
-        queue += [(c, hidden * 3 * LANES * 2) for c in up_in]
-    else:
-        queue.append((up_in, width * 3 * LANES * 2))
+        queue.append((dn_in, lowrank * width * 2))
+    queue.append((up_in, width * 3 * LANES * 2))
     budget = (W3_LOOKAHEAD_MIB if mode == 3 else lookahead) << 20
     if sched_dma:
         # HCK: every copy in flight from kernel entry (all scratch is allocated).
@@ -440,11 +422,7 @@ def _kernel(
     # ---------------------------------------------------------------- phase B1
     if inject and (mode == 2 or fold):
         need(inj_in)
-    if sched_dma:
-        for c in dn_in:
-            need(c)
-    else:
-        need(dn_in)
+    need(dn_in)
     if compute and mode == 3:
         down_block(len(blocks) - 1)
     elif compute and mode == 1:
@@ -514,21 +492,14 @@ def _kernel(
         injo_out.start()
 
     # ---------------------------------------------------------------- phase B2
-    if not sched_dma:
-        need(up_in)
-    elif not (compute and mode in (1, 3)):
-        for c in up_in:
-            need(c)
+    need(up_in)
     mixed_out = []
-    for ci, (c0, rc) in enumerate(b2_blocks):
+    for c0, rc in b2_blocks:
         rows = pl.ds(c0, rc)
         if compute and mode in (1, 3):
             # hc_decode.py's up projection and branch mean, unchanged, on rc rows.
             mixed = None
             for b in range(branches):
-                if sched_dma and ci == 0:
-                    # HCK: branch b's up rows, just before their first read.
-                    need(up_in[b])
                 start = b * hidden
                 logits = (
                     jax.lax.dot_general(
@@ -578,9 +549,7 @@ def _kernel(
         out.wait()
 
 
-def sem_count(
-    tokens: int, prologue: bool, inject: bool, sched_dma: bool = False, branches: int = 4
-) -> int:
+def sem_count(tokens: int, prologue: bool, inject: bool) -> int:
     """DMA semaphores the kernel takes: one per copy."""
     blocks = len(row_blocks(tokens))
     count = 3 + blocks * 2  # w, down, up; rows in and mixed out per block
@@ -588,8 +557,6 @@ def sem_count(
         count += 2  # inject rows in, injection out
     if prologue:
         count += 1 + blocks * 2  # prev injection; block rows in, h out per block
-    if sched_dma:
-        count += (DN_SLABS - 1) + (branches - 1)  # HCK: down / up slabs
     return count
 
 
@@ -710,11 +677,7 @@ def _hc_decode_mix_wide(
         raise ValueError(f"HC decode mix (wide): fold needs mode 1, got mode {mode}")
     if (sched_dma or sched_onepass) and mode != 1:
         raise ValueError(f"HC decode mix (wide): the HCK schedule needs mode 1, got mode {mode}")
-    if sched_dma and lowrank % (DN_SLABS * ROW_UNIT):
-        raise ValueError(
-            f"HC decode mix (wide): the HCK schedule needs a low rank divisible by {DN_SLABS * ROW_UNIT}, "
-            f"got {lowrank}"
-        )
+
     # Without the injection gate there is nothing to fold: mode 1 unchanged.
     fold = bool(fold) and inject
     if (
@@ -742,6 +705,15 @@ def _hc_decode_mix_wide(
             f"in [{MIN_TOKENS}, {MAX_TOKENS}] and mode 1, 2 or 3"
         )
 
+    if sched_dma or sched_onepass:
+        # q38 HCK trace-time engagement line (prints when this shape is traced, i.e. on a cold compile; the
+        # key's runtime line in vllm_adapter prints at op build): the served op compiled the schedule kernel.
+        b2 = len(row_blocks(tokens, ONEPASS_ROWS) if sched_onepass else row_blocks(tokens))
+        print(
+            f"q38 HCK W1_SCHED traced: rows {tokens}, kernel {kernel_name(prologue, mode, timing, fold, True)}, "
+            f"sched_dma {int(bool(sched_dma))}, sched_onepass {int(bool(sched_onepass))}, b2 blocks {b2}",
+            flush=True,
+        )
     any_space = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     n_in = (3 if prologue else 1) + (4 if inject else 3)
     out_shape = [jax.ShapeDtypeStruct((tokens, hidden), jnp.bfloat16)]
@@ -775,11 +747,7 @@ def _hc_decode_mix_wide(
         ]
     if inject:
         scratch.append(pltpu.VMEM((tokens, branches), jnp.float32))  # injo_vm
-    if sched_dma:
-        sems = sem_count(tokens, prologue, inject, True, branches)
-    else:
-        sems = sem_count(tokens, prologue, inject)
-    scratch.append(pltpu.SemaphoreType.DMA((sems,)))
+    scratch.append(pltpu.SemaphoreType.DMA((sem_count(tokens, prologue, inject),)))
     args = [x, block, prev_injection] if prologue else [x]
     args += [weight, down, up] + ([inject_weight] if inject else [])
     outs = pl.pallas_call(

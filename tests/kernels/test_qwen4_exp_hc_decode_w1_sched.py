@@ -3,7 +3,8 @@
 
 Fast checks: flag reads, compile key, the adapter's refusals, op names and engagement line, dispatch, the flag-off trace
 (identical to K3b.2's hc_decode_wide.py, a pinned copy in q38_ref/), the schedule's structure (the DMA switch leaves every
-compute equation identical; the one-pass switch runs one up projection per branch), and small interpret-mode numerics
+copy and compute equation identical and starts every input copy before the first wait; the one-pass switch runs one up
+projection per branch), and small interpret-mode numerics
 (DMAs executed on wait, NaN for uninitialised memory, race detection): bitwise on vs off. The full-size bitwise legs, the
 deviceless VMEM compiles and the code mutants run in the HCK CPU proof (scratch/hck/cpu)."""
 
@@ -221,14 +222,21 @@ def test_sched_needs_mode_1(mode, switch):
         jax.eval_shape(f, *args)
 
 
-def test_sched_dma_refuses_an_odd_low_rank():
-    args, extra = _specs(288, lowrank=48)
-
-    def f(*a):
-        return hc_decode_mix_wide(*a, branches=BRANCHES, hidden=HIDDEN, eps=EPS, mode=1, sched_dma=True, **extra)
-
-    with pytest.raises(ValueError, match="low rank divisible by 64"):
-        jax.eval_shape(f, *args)
+@pytest.mark.parametrize("tokens", [160, 288, 496])
+def test_trace_line(capsys, tokens):
+    """The trace-time engagement line prints (once per traced shape) with the schedule and never without it."""
+    jax.clear_caches()   # a shape traced by an earlier test would not trace (or print) again
+    capsys.readouterr()
+    for prologue in (True, False):
+        _wide_trace(hc_decode_wide, tokens, 1, True, prologue, fold=True)
+    assert "q38 HCK W1_SCHED traced" not in capsys.readouterr().out
+    jax.clear_caches()
+    _wide_trace(hc_decode_wide, tokens, 1, True, True, fold=True, sched_dma=True, sched_onepass=True)
+    out = capsys.readouterr().out
+    b2 = 1 if tokens <= 320 else 2
+    want = (f"q38 HCK W1_SCHED traced: rows {tokens}, kernel qwen4exp_hc_decode_combine_w1fs, sched_dma 1, sched_onepass 1, "
+            f"b2 blocks {b2}")
+    assert out.count(want) == 1, out
 
 
 @pytest.mark.parametrize("tokens", [16, 144, 512])
@@ -398,17 +406,32 @@ def _compute_seq_all(kjx):
 SHAPES = [(True, True, True), (True, True, False), (False, True, False), (True, False, True)]  # (inject, prologue, fold)
 
 
+def _starts_before_first_wait(kjx):
+    """dma_start equations before the kernel's first dma_wait (top level, program order)."""
+    n = 0
+    for eqn in kjx.eqns:
+        if eqn.primitive.name == "dma_wait":
+            return n
+        n += eqn.primitive.name == "dma_start"
+    return n
+
+
 @pytest.mark.parametrize("tokens", [160, 288, 320, 496])
 @pytest.mark.parametrize("shape", SHAPES)
 def test_sched_dma_keeps_every_compute_equation(tokens, shape):
+    """Data movement only: the same copies and the same compute equations in the same order; every input copy (norm weight,
+    inject rows, previous gate, row blocks, block rows, down, up) is started before the first wait."""
     inject, prologue, fold = shape
     fx = {"fold": True} if fold else {}
     off = _kernel_jaxpr(tokens, inject, prologue, **fx)
     dma = _kernel_jaxpr(tokens, inject, prologue, sched_dma=True, **fx)
     assert _compute_seq(dma) == _compute_seq(off)
-    extra = (hc_decode_wide.DN_SLABS - 1) + (BRANCHES - 1)
-    assert _count(dma, "dma_start") == _count(off, "dma_start") + extra
-    assert _count(dma, "dma_wait") == _count(off, "dma_wait") + extra
+    assert _count(dma, "dma_start") == _count(off, "dma_start")
+    assert _count(dma, "dma_wait") == _count(off, "dma_wait")
+    blocks = len(hc_decode_wide.row_blocks(tokens))
+    n_in = 3 + blocks + int(inject) + (1 + blocks if prologue else 0)
+    assert _starts_before_first_wait(dma) == n_in
+    assert _starts_before_first_wait(off) < n_in
 
 
 @pytest.mark.parametrize("tokens", [160, 288, 320, 496])
