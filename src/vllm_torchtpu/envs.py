@@ -255,7 +255,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_ARTIFACT_STORE: bool = False
-    TPU_HELPER_COMPILE_CACHE: bool = True
+    TPU_HELPER_COMPILE_CACHE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -1950,8 +1950,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # substitution) in <VLLM_CACHE_ROOT>/tpu_helper_cache, so a later start, and
     # under TPU_PRECOMPILE_PEER_REPLAY another rank of the host, replays them
     # instead of lowering and compiling each shape again; see
-    # compilation/helper_cache.py. Off with VLLM_DISABLE_COMPILE_CACHE too.
-    "TPU_HELPER_COMPILE_CACHE": env_bool("TPU_HELPER_COMPILE_CACHE", default=True),
+    # compilation/helper_cache.py. Off by default and with VLLM_DISABLE_COMPILE_CACHE.
+    "TPU_HELPER_COMPILE_CACHE": env_bool("TPU_HELPER_COMPILE_CACHE", default=False),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
