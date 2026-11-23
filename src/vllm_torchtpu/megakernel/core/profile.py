@@ -55,8 +55,27 @@ from .profiles.default import default_tiles
 
 # Name of the model-agnostic library default profile.
 DEFAULT_PROFILE_NAME = "default"
-# Tile rule: `(B, *, moe_tp, R) -> Tiles` for a bucket of `B` rows.
-TileRule = Callable[..., Tiles]
+
+
+@dataclass(frozen=True)
+class TileContext:
+    """Bucket execution context passed to a `TileRule` callable."""
+
+    B: int
+    T: int = 1
+    R: int = 8
+    moe_tp: bool = False
+    ctx: int = 2048
+    g: Any = None
+
+    @property
+    def NS(self) -> int:
+        assert self.B % self.T == 0, (self.B, self.T)
+        return self.B // self.T
+
+
+# Tile rule: `(tc: TileContext) -> Tiles`.
+TileRule = Callable[[TileContext], Tiles]
 # Fields automatically derived by `Profile.with_overrides`.
 _DERIVED_PROFILE_FIELDS = frozenset({"name", "numerics", "model_default"})
 
@@ -96,6 +115,7 @@ class Profile:
     # buckets where eligible; exact) | True (every bucket where eligible, never
     # a T=1 bucket; approx, see `pool.POOL_IO_NUMERICS`).
     pool_gather: bool | None = False
+    supported_tp_sizes: tuple[int, ...] | None = None
     baseline: Baseline | None = None
     description: str = ""
     # The default profile of `model` (registered by the model; the reference
@@ -167,14 +187,35 @@ class Profile:
         ref = model_default_profile(self.model)
         return None if ref is self else ref.tiles
 
-    def tiles_for(self, B: int, *, R: int, moe_tp: bool = False) -> Tiles:
-        """Return this profile's tiles for a bucket of `B` rows on `R` ranks.
+    def tiles_for(
+        self,
+        B: int | TileContext,
+        *,
+        R: int | None = None,
+        moe_tp: bool = False,
+        T: int = 1,
+        ctx: int = 2048,
+        g: Any = None,
+    ) -> Tiles:
+        """Return this profile's tiles for a bucket of `B` rows (or `TileContext`).
 
         For the library default rule (`tile_rule() is None`) these are the
         tiles before build-time VMEM refinement.
         """
+        if isinstance(B, TileContext):
+            tc = B
+        else:
+            if R is None:
+                raise TypeError(
+                    "Profile.tiles_for(B, *, R=...) requires explicit R "
+                    "when B is an int"
+                )
+            tc = TileContext(B=int(B), T=T, R=R, moe_tp=moe_tp, ctx=ctx, g=g)
         rule = self.tile_rule()
-        return (default_tiles if rule is None else rule)(B, moe_tp=moe_tp, R=R)
+        t = default_tiles(tc) if rule is None else rule(tc)
+        if self.numerics == "exact":
+            _check_exact_bucket(self, tc, t)
+        return t
 
     def exec_for(self, base: ExecSpec, *, B: int, T: int, g: Any = None) -> ExecSpec:
         """Specialize `base` for bucket `(T, B)` under this profile.
@@ -185,18 +226,19 @@ class Profile:
           (`tile_rule`; left `None` for the library default rule, which may be
           refined at build time to fit the VMEM budget);
         - `pool_gather`: the `CacheExec.pool_gather` of `base` unless it is the
-          library default
-          `False` ("no explicit choice"), else the profile's: `None` -> auto,
-          `True` -> `"eligible"` (gather wherever the pool backend can, e.g.
-          never on a `T=1` bucket). Pass `pool_gather="split"` to force split
-          under a GPR profile.
+          library default `False` ("no explicit choice"), else the profile's:
+          `None` -> auto, `True` -> `"eligible"` (gather wherever the pool
+          backend can, e.g. never on a `T=1` bucket). Pass `pool_gather="split"`
+          to force split under a GPR profile.
         Fused pool I/O is resolved by the caller because it also depends on the
         pool backend.
         """
         moe_tp = bool(getattr(g, "moe_tp", False)) if g is not None else False
         tiles = base.tiles
         if tiles is None and self.tile_rule() is not None:
-            tiles = self.tiles_for(B, R=base.R, moe_tp=moe_tp)
+            tiles = self.tiles_for(
+                TileContext(B=B, T=T, R=base.R, moe_tp=moe_tp, ctx=base.ctx, g=g)
+            )
         base_gather = cache_exec(base).pool_gather
         if base_gather is not False:
             pool_gather = base_gather
@@ -216,7 +258,9 @@ _MODEL_DEFAULTS: dict[str, str] = {}
 
 # Bucket grid on which a profile's tile rule is compared to its reference.
 _NUMERICS_GRID_B = range(1, MAX_BATCH_ROWS + 1)
+_NUMERICS_GRID_T = (1, 2, 3, 4, 5, 6, 8)
 _NUMERICS_GRID_R = (1, 2, 4, 8, 16)
+_NUMERICS_GRID_CTX = (2048, 8192, 32768, 131072, 262144)
 
 
 def _knob(t: Tiles, key: str) -> Any:
@@ -225,6 +269,33 @@ def _knob(t: Tiles, key: str) -> Any:
         return getattr(t, key)
     module, field = key.split(".", 1)
     return getattr(t.module(module), field)
+
+
+def _reference_tile_rule(profile: Profile) -> TileRule | None:
+    ref_name = _MODEL_DEFAULTS.get(profile.model or "", DEFAULT_PROFILE_NAME)
+    ref = _REGISTRY.get(ref_name)
+    return None if ref is None else ref.tile_rule()
+
+
+def _check_exact_bucket(profile: Profile, tc: TileContext, t: Tiles) -> None:
+    if profile.model_default:
+        return
+    ref_rule = _reference_tile_rule(profile)
+    if profile.tile_rule() is ref_rule:
+        return
+    d = default_tiles(tc) if ref_rule is None else ref_rule(tc)
+    if t == d:
+        return
+    diffs = sorted(
+        f"tiles.{k}"
+        for k, cls in tile_numerics().items()
+        if cls == "approx" and _knob(t, k) != _knob(d, k)
+    )
+    if diffs:
+        raise ValueError(
+            f"profile {profile.name!r} is declared numerics='exact' but turns on "
+            f"approx features {diffs} on {tc}; declare numerics='approx'"
+        )
 
 
 def _check_exact(profile: Profile) -> None:
@@ -243,10 +314,15 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
     The reference is `model_default_profile(profile.model)`; a model default
     profile is its own reference (no features). A tile field counts when the
     two tile rules give it different values on any bucket of the grid (`B` in
-    `1..MAX_BATCH_ROWS`, `R` in `{1, 2, 4, 8, 16}`, `moe_tp` in `{False, True}`)
-    and the knob is `approx` in `exec_spec.tile_numerics()` (module knobs as
-    `tiles.<module>.<field>`); a pool-I/O mode the profile turns on and the
-    reference does not counts per `POOL_IO_NUMERICS`.
+    `1..MAX_BATCH_ROWS`, `T` in `{1, 2, 3, 4, 5, 6, 8}` with `B % T == 0`, `R`
+    in `{1, 2, 4, 8, 16}`, `moe_tp` in `{False, True}`, `ctx` in
+    `{2048, 8192, 32768, 131072, 262144}`) and the knob is `approx` in
+    `exec_spec.tile_numerics()` (module knobs as `tiles.<module>.<field>`); a
+    pool-I/O mode the profile turns on and the reference does not counts per
+    `POOL_IO_NUMERICS`. In addition, `Profile.tiles_for` (and `exec_for`)
+    compares the actual bucket's tiles against the reference for `exact`
+    profiles, catching any `T`, `ctx`, or `g`-dependent approx difference at
+    specialization time.
     """
     if profile.model_default:
         return ()
@@ -255,24 +331,32 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
     if ref is profile:
         return ()
     # While the `default` profile itself is being built, its rule is the
-    # library default with split pool I/O.
-    ref_tiles = default_tiles if ref is None else ref.tiles_for
-    ref_rule = default_tiles if ref is None else ref.tile_rule()
+    # library default (`None` -> `default_tiles`) with split pool I/O.
+    ref_rule = None if ref is None else ref.tile_rule()
     ref_fused = False if ref is None else ref.fused_pool_io
     ref_gather = False if ref is None else ref.pool_gather
+    numerics = tile_numerics()
     feats: set[str] = set()
-    if profile.tile_rule() is not ref_rule:
-        approx_knobs = [k for k, v in tile_numerics().items() if v == "approx"]
+    rule = profile.tile_rule()
+    if rule is not ref_rule:
+        approx_knobs = [k for k, v in numerics.items() if v == "approx"]
         for R in _NUMERICS_GRID_R:
             for moe_tp in (False, True):
-                for B in _NUMERICS_GRID_B:
-                    t = profile.tiles_for(B, moe_tp=moe_tp, R=R)
-                    d = ref_tiles(B, moe_tp=moe_tp, R=R)
-                    if t == d:
-                        continue
-                    feats.update(
-                        f"tiles.{k}" for k in approx_knobs if _knob(t, k) != _knob(d, k)
-                    )
+                for ctx in _NUMERICS_GRID_CTX:
+                    for T in _NUMERICS_GRID_T:
+                        for B in _NUMERICS_GRID_B:
+                            if B % T != 0:
+                                continue
+                            tc = TileContext(B=B, T=T, R=R, moe_tp=moe_tp, ctx=ctx)
+                            t = default_tiles(tc) if rule is None else rule(tc)
+                            d = default_tiles(tc) if ref_rule is None else ref_rule(tc)
+                            if t == d:
+                                continue
+                            feats.update(
+                                f"tiles.{k}"
+                                for k in approx_knobs
+                                if _knob(t, k) != _knob(d, k)
+                            )
     if (
         profile.fused_pool_io != ref_fused
         and POOL_IO_NUMERICS["fused_pool_io"] == "approx"
@@ -390,6 +474,7 @@ __all__ = [
     "DEFAULT_PROFILE",
     "Baseline",
     "Profile",
+    "TileContext",
     "TileRule",
     "approx_features",
     "get_profile",

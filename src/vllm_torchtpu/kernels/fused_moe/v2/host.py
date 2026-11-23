@@ -25,8 +25,9 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 
-FP8_MAX = 448.0
-FP8 = jnp.float8_e4m3fn
+from vllm_torchtpu.kernels.fp8_wire import FP8, FP8_E4M3_MAX
+
+FP8_MAX = FP8_E4M3_MAX
 # Storage only: there is no four-bit MXU, so each block is widened to e4m3.
 FP4 = jnp.float4_e2m1fn
 # Default scale block along the contraction axis for a block-scaled weight.
@@ -1008,12 +1009,67 @@ def local_slab_rows(routing, me, *, shard_stride):
     )
 
 
-def shard_token_gather(routing, me, *, shard_stride, rows=None):
+# The most SparseCore vector subcores (SparseCores x subcores each) a chip
+# may have and still build the slab tables on the TensorCore. Where the
+# compiler offloads a scatter-add to a full SparseCore (v7x and TPU8t: 2 x 16;
+# v6e 2 x 16; v5p 4 x 16), both slab tables stay scatter-adds: the SparseCore
+# runs them async, beside the activation all-gather, and they cost the
+# TensorCore almost nothing. Every alternative is TensorCore work there: a
+# scatter-set (about 3x the add's wall), the scale-slab lookup kernel and the
+# token-gather sort (+0.36 ms a layer between them at 16k tokens, measured on
+# v7x, EP8). TPU8i's SparseCore is 1 x 4 and XLA offloads neither scatter form,
+# so both run on the TensorCore one element at a time (0.95 ms each at 16k);
+# there the token-gather table is a sort, the scale slab a lookup through it,
+# and any scatter left (past the sort's or the lookup's limits) a set, which
+# skips the add's read-back. A chip without a SparseCore keeps the adds too:
+# the TensorCore builds have not been measured there.
+TENSORCORE_TABLES_MAX_SC_SUBCORES = 4
+
+
+def slab_tables_on_tensorcore(info=None):
+    """Whether this chip builds the slab tables on the TensorCore.
+
+    True, for a chip whose SparseCore has at most
+    TENSORCORE_TABLES_MAX_SC_SUBCORES subcores, selects the TensorCore builds
+    (token-gather sort, scale-slab lookup, scatter-set for any scatter left).
+    False keeps both tables scatter-adds: a full SparseCore runs them, and a
+    chip without one keeps them until the TensorCore builds are measured there.
+    Read off the same device record the VMEM accounting reads, so the layer
+    answers it once per build.
+    """
+    if info is None:
+        info = pltpu.get_tpu_info()
+    sc = info.sparse_core
+    return sc is not None and sc.num_cores * sc.num_subcores <= (
+        TENSORCORE_TABLES_MAX_SC_SUBCORES
+    )
+
+
+def slab_scatter(size, rows, values, *, by_set):
+    """`zeros([size]).at[rows]` <- `values`, the out-of-range rows dropped.
+
+    Every live row receives at most one routed pair and the destination
+    starts at zero, so the add and the set build the same bits, and `by_set`
+    picks whichever the chip builds faster (slab_tables_on_tensorcore). The
+    two differ only at or past row shard_stride, the slab's end, where
+    local_slab_rows sends every off-shard pair: rows past `size` are dropped,
+    and the few the activation-scale view holds past the slab's end are never
+    read. On those rows the add sums the colliding pairs and the set keeps
+    one of them.
+    """
+    slab = jnp.zeros((size,), values.dtype).at[rows]
+    if by_set:
+        return slab.set(values, mode="drop")
+    return slab.add(values, mode="drop")
+
+
+def shard_token_gather(routing, me, *, shard_stride, rows=None, by_set=False):
     """The token number each of shard `me`'s slab rows computes, [stride].
 
     `rows` is the destination slab row of each routed pair, which is derived
     here when the caller does not hold it already; passing it in keeps both
-    slab scatters on one index.
+    slab scatters on one index. `by_set` is the scatter form, as
+    slab_tables_on_tensorcore answers it for this chip.
 
     The scatter runs against this shard's slab alone rather than against the
     replicated ep-wide slab followed by a slice, which built seven eighths
@@ -1044,10 +1100,174 @@ def shard_token_gather(routing, me, *, shard_stride, rows=None):
         else rows
     )
     gather_lo, gather_hi = gather_clamp_bounds(T)
-    scattered = (
-        jnp.zeros((shard_stride,), jnp.int32).at[row].add(token_of_pair, mode="drop")
-    )
+    scattered = slab_scatter(shard_stride, row, token_of_pair, by_set=by_set)
     return jnp.clip(scattered, jnp.int32(gather_lo), jnp.int32(gather_hi))
+
+
+def token_gather_sort_fits(n_tokens, topk, *, e_total, ep):
+    """Whether shard_token_gather_sorted's sort keys fit in int32."""
+    run_span = (n_tokens // ep) * topk + (ROWBLK - 1)
+    return e_total * run_span < 2**31
+
+
+def shard_token_gather_sorted(expert_ids, routing, me, *, e_total, ep, shard_stride):
+    """shard_token_gather built by one sort instead of a scatter.
+
+    The scatter writes every routed pair of every shard to find the few
+    that land here: where XLA runs it on the TensorCore one element at a
+    time (TPU8i), that is most of the time between the routing exchange and
+    the kernel. The slab is a sorted order, though. This shard's experts sit
+    back to back; inside an expert, the runs of the sources follow in source
+    order, each padded to a whole ROWBLK; inside a run, the pairs keep their
+    pair order. Sorting every pair on the key (local expert, source, position
+    in the source) puts the pairs that land here first, in slab order, and
+    the off-shard pairs after them on one key past every live one. A pair
+    whose expert id is outside [0, e_total) -- the id e_total the layer gives
+    padding rows -- is in no local expert, so it takes the off-shard key, as
+    both plan builders send it off-shard.
+
+    The run padding goes into the same sort: each (expert, source) run
+    carries ROWBLK - 1 extra elements with token 0 and the keys just past
+    the run's own pairs. The ones the run's padding uses keep those keys;
+    the others take the off-shard key. So the sorted token numbers are the
+    slab's live rows exactly, and everything after them is cleared, as the
+    scatter left the rows no pair lands on.
+
+    `expert_ids` holds the expert of each routed pair in pair order: source
+    by source, each source's t_local * topk pairs in token order, which is
+    the gathered routing payload as it arrives. The same bits as
+    shard_token_gather, clip included; token_gather_sort_fits says where the
+    keys hold.
+    """
+    T, K = routing.pair_grid
+    g_local = e_total // ep
+    src_pairs = (T // ep) * K
+    pad_slots = ROWBLK - 1
+    run_span = src_pairs + pad_slots
+    off_key = jnp.int32(g_local * ep * run_span)
+    first = me * g_local
+
+    g = expert_ids.reshape(ep, src_pairs).astype(jnp.int32) - first
+    on_me = (g >= 0) & (g < g_local)
+    src = lax.broadcasted_iota(jnp.int32, (ep, src_pairs), 0)
+    pos = lax.broadcasted_iota(jnp.int32, (ep, src_pairs), 1)
+    pair_key = jnp.where(on_me, (g * ep + src) * run_span + pos, off_key)
+    token_of_pair = jnp.broadcast_to(
+        jnp.arange(T, dtype=jnp.int32)[:, None], (T, K)
+    ).reshape(ep, src_pairs)
+
+    run_pad = lax.dynamic_slice(
+        routing.run_rows_aligned - routing.run_rows, (first, 0), (g_local, ep)
+    )
+    slot = lax.broadcasted_iota(jnp.int32, (g_local, ep, pad_slots), 2)
+    run_key = (
+        jnp.arange(g_local, dtype=jnp.int32)[:, None] * ep
+        + jnp.arange(ep, dtype=jnp.int32)[None, :]
+    ) * run_span + src_pairs
+    pad_key = jnp.where(slot < run_pad[:, :, None], run_key[:, :, None] + slot, off_key)
+
+    keys = jnp.concatenate([pair_key.reshape(-1), pad_key.reshape(-1)])
+    tokens = jnp.concatenate(
+        [token_of_pair.reshape(-1), jnp.zeros((pad_key.size,), jnp.int32)]
+    )
+    keys, tokens = lax.sort((keys, tokens), num_keys=1, is_stable=False)
+    table = jnp.where(keys < off_key, tokens, 0)
+    if table.shape[0] >= shard_stride:
+        table = table[:shard_stride]
+    else:
+        table = jnp.pad(table, (0, shard_stride - table.shape[0]))
+    gather_lo, gather_hi = gather_clamp_bounds(T)
+    return jnp.clip(table, jnp.int32(gather_lo), jnp.int32(gather_hi))
+
+
+def sender_sorted_pairs(local_ids, me, *, t_local, topk, scale_bits):
+    """This shard's routed pairs in expert order: (token numbers, scale bits).
+
+    The sender's half of building the slab tables by run copy. A stable sort
+    of the shard's own t_local * topk pairs on the expert id leaves each
+    expert's pairs contiguous and in pair order, which is the order a run of
+    the slab holds them in; once gathered, every (expert, source) run is a
+    single stretch of its source's payload. Each pair carries its token's
+    number (in mesh order, the numbering the gather table uses) and its
+    token's row-scale bits, so the receiver copies both tables in one pass
+    and looks nothing up. A pair routed nowhere (expert id e_total) sorts
+    past every expert and lies in no run.
+
+    The ids are the layer's own: top-k or hash-table selections in
+    [0, e_total), or e_total for a padding row. An id above e_total would
+    sort past every expert too, but a negative one would sort ahead of them
+    while no count covers it, shifting every run of its source; nothing
+    upstream produces one.
+    """
+    if scale_bits.dtype != jnp.int32:
+        raise ValueError(
+            f"scale_bits must be the int32 bit patterns of the row scales, "
+            f"got {scale_bits.dtype}"
+        )
+    ids = local_ids.reshape(t_local * topk).astype(jnp.int32)
+    tokens = jnp.broadcast_to(
+        (me * t_local + jnp.arange(t_local, dtype=jnp.int32))[:, None], (t_local, topk)
+    ).reshape(-1)
+    scales = jnp.broadcast_to(scale_bits[:, None], (t_local, topk)).reshape(-1)
+    _, tokens, scales = lax.sort((ids, tokens, scales), num_keys=1, is_stable=True)
+    return tokens, scales
+
+
+def slab_run_copy_rows(t_local, topk, ep, shard_stride):
+    """(source, destination) lane rows of build_slab_run_copy for one shard.
+
+    The source is the two gathered streams as [2, rows, 128]: ep sources of
+    align_up(t_local * topk, 128) expert-sorted pairs each, padded to whole
+    (8, 128) tiles. The destination is the scale slab's lane rows, padded the
+    same way; the token-gather table is the first shard_stride elements of
+    the other stream's output.
+    """
+    pairs = ep * align_up(t_local * topk, HIDDEN_LANE_BLOCK)
+    src_rows = (
+        align_up(pairs, HIDDEN_LANE_BLOCK * U32_SUBLANE_TILE) // HIDDEN_LANE_BLOCK
+    )
+    out_rows = align_up(act_scale_slab_rows(shard_stride), U32_SUBLANE_TILE)
+    return src_rows, out_rows
+
+
+def slab_run_copy_fits(t_local, topk, ep, shard_stride, info=None):
+    """Whether build_slab_run_copy's streams and tables fit the VMEM budget.
+
+    The kernel holds both gathered streams and both output tables in VMEM at
+    once (one grid step): 2 x (source + destination) lane rows of int32. Past
+    the budget the layer keeps the sort and the lookup rather than failing to
+    compile; for top-10 routing on TPU8i that is about 1.2 million tokens a
+    step.
+    """
+    src_rows, out_rows = slab_run_copy_rows(t_local, topk, ep, shard_stride)
+    return 2 * (src_rows + out_rows) * HIDDEN_LANE_BLOCK * 4 <= vmem_limit(info)
+
+
+def slab_run_copy_runs(routing, me, *, e_total, ep, src_stride):
+    """(source offset, destination offset, length) of each run of shard me.
+
+    The runs in slab order: local expert-major, source-minor. A run's source
+    is its stretch of the gathered expert-sorted payload, `src_stride`
+    elements a source: past that source's pairs of every lower expert. Its
+    destination is its row in this shard's slab, where the runs follow one
+    another each padded to a whole ROWBLK -- the same rows the routing plan's
+    expert bases and aligned run starts give it.
+    """
+    g_local = e_total // ep
+    first = me * g_local
+    run_rows = routing.run_rows  # [e_total, ep]: pairs of expert e from source s
+    by_source = run_rows.T
+    ahead = jnp.cumsum(by_source, axis=1) - by_source
+    src_prefix = lax.dynamic_slice(ahead, (0, first), (ep, g_local)).T
+    src_off = (
+        jnp.arange(ep, dtype=jnp.int32)[None, :] * src_stride + src_prefix
+    ).reshape(-1)
+    length = lax.dynamic_slice(run_rows, (first, 0), (g_local, ep)).reshape(-1)
+    aligned = lax.dynamic_slice(
+        routing.run_rows_aligned, (first, 0), (g_local, ep)
+    ).reshape(-1)
+    dst_off = jnp.cumsum(aligned) - aligned
+    return src_off, dst_off, length
 
 
 def expert_visit_list(rows, g_local):
@@ -1362,6 +1582,7 @@ def vmem_scratch_arrays(
     rhs_qb=QB4,
     has_w1_bias=False,
     has_w2_bias=False,
+    scale_slots=None,
 ):
     """The kernel's VMEM scratch buffers, as (name, shape, dtype).
 
@@ -1395,8 +1616,8 @@ def vmem_scratch_arrays(
         weights = [
             ("w1_vm", (nbuf, hidden // PACK4, 2 * inter), jnp.uint32),
             ("w2_vm", (nbuf, inter // PACK4, hidden), jnp.uint32),
-            ("w1s_vm", (nbuf, hidden // rhs_qb, 2 * inter), jnp.float32),
-            ("w2s_vm", (nbuf, inter // rhs_qb, hidden), jnp.float32),
+            ("w1s_vm", (scale_slots or nbuf, hidden // rhs_qb, 2 * inter), jnp.float32),
+            ("w2s_vm", (scale_slots or nbuf, inter // rhs_qb, hidden), jnp.float32),
         ]
     else:
         weights = [
@@ -1532,6 +1753,7 @@ def vmem_estimate_bytes(
     has_w1_bias=False,
     has_w2_bias=False,
     info=None,
+    scale_slots=None,
 ):
     """VMEM one built kernel occupies, from the arrays it declares.
 
@@ -1557,6 +1779,7 @@ def vmem_estimate_bytes(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        scale_slots=scale_slots,
     )
     arrays += vmem_tile_body_arrays(
         capacity, hidden, inter, weight_format=weight_format, rhs_qb=rhs_qb

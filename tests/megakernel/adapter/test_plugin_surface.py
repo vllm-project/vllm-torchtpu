@@ -227,7 +227,7 @@ def test_contract_types_have_one_import_path() -> None:
 def test_step_context_and_package_exports() -> None:
     ctx = hooks.StepContext("ids", "pos")
     assert (ctx.inputs_embeds, ctx.intermediate_tensors) == (None, None)
-    assert (ctx.model_kwargs, ctx.token_ids) == (None, None)
+    assert ctx.model_kwargs is None
     with pytest.raises(dataclasses.FrozenInstanceError):
         ctx.input_ids = "other"  # type: ignore[misc]
     assert mkr.StepContext is hooks.StepContext

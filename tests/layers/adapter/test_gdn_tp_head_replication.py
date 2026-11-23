@@ -354,3 +354,31 @@ def test_interleaved_scale_partition(make_gdn_attention, tp_size, quantization):
         scale.weight_loader(scale, checkpoint)
         expected = _select_heads(segments, tp_size, rank, channels).flatten()
         torch.testing.assert_close(scale.float().flatten(), expected)
+
+
+@pytest.mark.parametrize("quantization", ["bf16", "fp8_block"])
+def test_qwen3_5_27b_tp2_constructs_with_24_local_value_heads(
+    make_gdn_attention, monkeypatch, quantization
+):
+    """Qwen3.5/3.6-27B (16 K heads, 48 V heads) at TP=2 and its FP8 checkpoints.
+
+    Each rank owns 8 K + 24 V heads and forwards those local head counts to
+    the pooled GDN kernel with a 5120-channel conv1d projection.
+    """
+    for rank in range(2):
+        attention, _ = make_gdn_attention(
+            2, rank, quantization, num_key_heads=16, num_value_heads=48
+        )
+        core = MagicMock()
+        monkeypatch.setattr(gdn_attention_op, "gdn_attention_pooled_core_tpu", core)
+        (pooled_fn,) = [
+            call.args[1]
+            for call in gdn_attention_op.pallas.jax_op.call_args_list
+            if call.args[0].startswith("pallas::gdn_attention_pooled_")
+        ]
+        pooled_fn(*([None] * 12))
+        n_kq = core.call_args.kwargs["n_kq"]
+        n_v = core.call_args.kwargs["n_v"]
+        assert (n_kq, n_v) == (8, 24)
+        assert attention.conv1d.weight.shape[0] == (2 * 8 + 24) * HEAD_DIM == 5120
+        gdn_attention_op.pallas.jax_op.reset_mock()

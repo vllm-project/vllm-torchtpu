@@ -317,6 +317,18 @@ def test_plan_is_pure_and_rejects_inactive_debug_module(
         planner.plan(ms, ex_bad_dbg)
 
 
+@pytest.mark.parametrize("bad_field", ["nbd", "nbe"])
+def test_planner_ring_depth_minimum_check(fake_ex: ExecSpec, bad_field: str):
+    """`planner.plan` rejects `nbd <= 1` with static weights and `nbe <= 1` with
+    dynamic weights (double-buffered streaming requires >= 2 slots)."""
+    ms = make_fake_model_spec(L=4, att_every=1, H=256)
+    bad_tiles = dataclasses.replace(fake_ex.resolved_tiles, **{bad_field: 1})
+    with pytest.raises(
+        MegakernelConfigError, match="Weight stream ring depth must be >= 2"
+    ):
+        planner.plan(ms, dataclasses.replace(fake_ex, tiles=bad_tiles))
+
+
 def test_planner_transitive_imports_exclude_vmem_kernel_and_cache():
     """`planner.py`'s transitive intra-package imports never reach `vmem`,
     `kernel`, or `cache*`."""
@@ -373,7 +385,9 @@ def test_planner_transitive_imports_exclude_vmem_kernel_and_cache():
             "kernel.py",
             "stream.py",
             "dma/stream.py",
-            "comm.py",
+            "collectives/__init__.py",
+            "collectives/params.py",
+            "collectives/ring.py",
         }
         or Path(r).name.startswith("cache")
     }

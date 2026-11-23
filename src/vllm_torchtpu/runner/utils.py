@@ -14,6 +14,7 @@
 """Utility functions and classes for TPU runners."""
 
 import datetime
+import gc
 import json
 import os
 from enum import Enum
@@ -354,6 +355,11 @@ class PhaseBasedProfiler:
         logger.info("Profiling for %s phase finished", self.current_phase)
         self.current_phase = ""
         self.profiling_n_steps_left = 0
+        # Some of the capture's results are left in reference cycles, which
+        # only the cyclic collector frees, and on a serving worker its next
+        # full pass can be far off. Collect now so the phase does not keep
+        # that host memory until then.
+        gc.collect()
 
     def finish(self) -> None:
         """Force-stops a phase capture in progress.

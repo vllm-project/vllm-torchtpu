@@ -52,6 +52,16 @@ def get_dcp_group() -> Any | None:
         return None
 
 
+def get_tp_group_or_none() -> Any | None:
+    """Return vLLM's TP GroupCoordinator, or None if not initialized."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group as _get_group
+
+        return _get_group()
+    except (AssertionError, ImportError):
+        return None
+
+
 def get_dcp_rank() -> int:
     group = get_dcp_group()
     return 0 if group is None else int(group.rank_in_group)

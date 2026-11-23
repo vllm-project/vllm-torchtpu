@@ -13,8 +13,10 @@
 # limitations under the License.
 """Tests for TPUWorker"""
 
+import gc
 import multiprocessing
 import os
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -279,6 +281,39 @@ class TestProfileCaptureAndMerge:
 
         assert not list(tmp_path.iterdir())
 
+    def test_stop_frees_capture_results_left_in_cycles(self, tmp_path):
+        """Stopping collects, so a capture's cyclic garbage does not wait for
+        the next full collection."""
+        worker = self._make_worker(tmp_path, rank=0, world_size=1)
+        results_refs = []
+
+        class _Results:
+            pass
+
+        def exit_leaving_a_cycle(*args):
+            results = _Results()
+            results.self_ref = results
+            results_refs.append(weakref.ref(results))
+
+        # With automatic collection off, only an explicit collection can free
+        # the cycle; assert before turning it back on.
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with patch("vllm_torchtpu.worker.tpu_worker.torch.profiler") as profiler:
+                profiler.profile.return_value.__exit__.side_effect = (
+                    exit_leaving_a_cycle
+                )
+                worker.profile(is_start=True)
+                self._stage_capture(worker, "t1v-n-host-w-0.xplane.pb", "trace")
+                worker.profile(is_start=False)
+
+            assert len(results_refs) == 1
+            assert results_refs[0]() is None
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
 
 def test_reset_encoder_cache_delegates_to_model_runner():
     worker = TPUWorker.__new__(TPUWorker)
@@ -348,7 +383,7 @@ def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
     worker.vllm_config = SimpleNamespace(kv_transfer_config=None)
     worker.devices = []
     worker.model_runner = MagicMock(is_pooling_model=False)
-    # No KV connector, no LoRA and no ring hand-off, so nothing is reserved.
+    # No KV connector, no LoRA and no buffered hand-off, so nothing is reserved.
     worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
         kv_connector=0, lora_slot_write=0, pp_handoff=0
     )
@@ -398,7 +433,7 @@ def test_determine_available_memory_leaves_room_for_lora_slot_write(monkeypatch)
 
 
 def test_determine_available_memory_reserves_the_pp_hand_off_buffers(monkeypatch):
-    """The ring hand-off allocates its buffers after profile_run, so the KV
+    """The buffered hand-off allocates its buffers after profile_run, so the KV
     cache leaves room for them."""
     worker = _ep_dp_worker(
         monkeypatch, dp_size=1, expert_parallel=False, local=7 * utils.GBYTES, peer=0

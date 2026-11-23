@@ -26,6 +26,7 @@ from vllm import utils
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.math_utils import largest_divisor as largest_divisor
 
 GBYTES = 1024 * 1024 * 1024
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -46,14 +47,6 @@ def enable_megacore() -> None:
 
 def get_megacore() -> bool:
     return _megacore
-
-
-def largest_divisor(x: int, cap: int) -> int:
-    """Largest divisor of `x` that is <= `cap`."""
-    for candidate in range(min(x, cap), 0, -1):
-        if x % candidate == 0:
-            return candidate
-    return 1
 
 
 def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
@@ -241,7 +234,7 @@ class HbmReserves(NamedTuple):
       kv_connector:    what the KV connector allocates, such as the offload
                        H2D staging pool.
       lora_slot_write: what an adapter swap holds while it runs.
-      pp_handoff:      what the pipeline ring hand-off's buffers take.
+      pp_handoff:      what the buffered pipeline hand-off's buffers take.
     """
 
     kv_connector: int

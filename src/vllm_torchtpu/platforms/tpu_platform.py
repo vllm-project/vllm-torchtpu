@@ -34,6 +34,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.moe_reference_parity import get_moe_reference_parity
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
@@ -108,10 +109,11 @@ TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
     256: "4,8,8,2",
 }
 
-# Multi-host TPU slice mesh topologies for TPU v7x / Ironwood, which exposes
-# both cores of a chip as separate devices (8 devices per host). Same meshes
-# as above, addressed by twice as many devices.
+# TPU slice mesh topologies for TPU v7x / Ironwood, which exposes both cores
+# of a chip as separate devices (two devices per chip): one 2x2x1 host
+# (8 devices) plus the multi-host meshes above at twice their device counts.
 TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP = {
+    8: "2,2,1,2",
     16: "2,2,2,2",
     32: "2,2,4,2",
     64: "2,4,4,2",
@@ -217,9 +219,9 @@ _tpu_kv_connectors_registered = False
 
 
 def _configure_torchtpu_eager_mode() -> None:
-    from torch_tpu._internal import execution_mode
+    from torch import tpu
 
-    previous_mode = execution_mode.eager_mode
+    previous_mode = tpu.eager_mode
     # Kernel-iteration mode keeps DEFER_NEVER: DEFER_AND_FUSE fuses the eager
     # region around the split-out Pallas ops into per-context device programs,
     # each of which recompiles after a kernel hot-swap. With DEFER_NEVER the
@@ -229,10 +231,10 @@ def _configure_torchtpu_eager_mode() -> None:
             "TorchTPU eager mode left at %s (TPU_KERNEL_ITER_MODE).", previous_mode.name
         )
         return
-    execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
+    tpu.eager_mode = tpu.EagerMode.DEFER_AND_FUSE
     logger.info(
         "TorchTPU eager mode configured: %s (previous=%s)",
-        execution_mode.eager_mode.name,
+        tpu.eager_mode.name,
         previous_mode.name,
     )
 
@@ -470,6 +472,7 @@ class TpuPlatform(Platform):
         "fp8",
         "mxfp4",
         "modelopt_fp4",
+        "modelopt_mixed",
         "deepseek_v4_fp8",
     ]
 
@@ -850,6 +853,14 @@ class TpuPlatform(Platform):
                 "nothing. Unset it; the fused expert-parallel MoE kernel is "
                 "USE_MOE_FUSED_EP_KERNEL=1."
             )
+        if "TPU_MOE_TOPK_WEIGHTS_FLOAT32" in os.environ:
+            raise ValueError(
+                "TPU_MOE_TOPK_WEIGHTS_FLOAT32 is no longer supported. Unset it "
+                "and pass --additional-config "
+                "'{\"tpu_moe_topk_weights_float32\": true}' instead."
+            )
+        # Rejects non-bool MoE reference-parity values before any worker starts.
+        get_moe_reference_parity(vllm_config)
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )
@@ -934,13 +945,12 @@ class TpuPlatform(Platform):
             # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
             # get the hand-off's engine side here; engine-core processes
             # install it again on their side.
-            from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_handoff
+            from vllm_torchtpu.distributed.pp_engine import (
+                patch_executor_for_pp_buffered,
+            )
 
-            patch_executor_for_pp_handoff(vllm_config)
+            patch_executor_for_pp_buffered(vllm_config)
             _configure_pipeline_chunks(vllm_config)
-            from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
-
-            patch_engine_core_for_lazy_push(vllm_config)
 
         from vllm.config import CompilationMode
 
@@ -951,8 +961,11 @@ class TpuPlatform(Platform):
         else:
             compilation_config.mode = CompilationMode.VLLM_COMPILE
 
-        # No graph splitting — TPU handles the full graph including
-        compilation_config.splitting_ops = []
+        # Compile whole graphs by default (TPU handles the full graph), but
+        # keep explicit boundaries a model config hook or the caller declared:
+        # model hooks run before this, in VllmConfig.try_verify_and_update_config.
+        if compilation_config.splitting_ops is None:
+            compilation_config.splitting_ops = []
 
         # Kernel-iteration mode splits the compiled graph at the Pallas RPA
         # custom ops so they execute eagerly outside the compiled pieces.
@@ -962,11 +975,30 @@ class TpuPlatform(Platform):
         # are allocated at model build, so list every id the registry could
         # plausibly allocate (should_split does exact name matching).
         if envs.TPU_KERNEL_ITER_MODE:
-            compilation_config.splitting_ops = [
+            rpa_ops = [
                 f"pallas::{prefix}_{i}"
                 for prefix in ("rpa_kernel", "rpa_kernel_batched")
                 for i in range(64)
             ]
+            declared = set(compilation_config.splitting_ops)
+            compilation_config.splitting_ops.extend(
+                rpa_op for rpa_op in rpa_ops if rpa_op not in declared
+            )
+        else:
+            # The RPA ops donate kv_cache unless TPU_KERNEL_ITER_MODE is set
+            # (layers/adapter/attention.py); run eagerly at a graph boundary,
+            # the donation would kill the buffer the next piece still reads.
+            rpa_boundaries = [
+                op
+                for op in compilation_config.splitting_ops
+                if op.startswith("pallas::rpa_kernel")
+            ]
+            if rpa_boundaries:
+                raise ValueError(
+                    f"compilation_config.splitting_ops splits at RPA kernels "
+                    f"({rpa_boundaries[:2]}...) without TPU_KERNEL_ITER_MODE; "
+                    "set TPU_KERNEL_ITER_MODE=1 or drop those boundaries."
+                )
 
         # Disable inductor-specific fusion passes (only available on CUDA).
         compilation_config.pass_config.fuse_norm_quant = False
@@ -1118,7 +1150,8 @@ class TpuPlatform(Platform):
             )
 
         parallel_config = vllm_config.parallel_config
-        parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
+        if parallel_config.worker_cls == "auto":
+            parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
 
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
         if multihost_backend != "ray" and parallel_config.nnodes > 1:
@@ -1157,8 +1190,9 @@ class TpuPlatform(Platform):
                 # vLLM may pass per-engine ParallelConfig objects to workers
                 # with data_parallel_size collapsed to 1. Preserve the original
                 # single-host DP size for TorchTPU rank/env setup.
-                # TODO: Remove TORCH_TPU_DP_SIZE once TorchTPU physical
-                # chip/PjRt binding no longer depends on torchrun-style
+                # TODO(https://github.com/google-pytorch/torch_tpu/issues/6757):
+                # Remove TORCH_TPU_DP_SIZE once TorchTPU physical chip/PjRt
+                # binding no longer depends on torchrun-style
                 # RANK/LOCAL_RANK/WORLD_SIZE before vLLM distributed init.
                 os.environ["TORCH_TPU_DP_SIZE"] = str(dp_size)
                 os.environ.setdefault(
@@ -1499,17 +1533,18 @@ def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[i
 
 
 def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
-    """Install the time-budget scheduler for a pipeline and the engine-core
-    hook that times the stages. Off when the env disables it, when the DP
-    scheduler or another scheduler is configured, or when chunked prefill is
-    disabled."""
+    """Install the pipeline chunk scheduler and the engine-core hook that
+    collects its chunk limits from the stages. Off when both
+    TPU_PP_LONE_PROMPT_CHUNKS and TPU_PP_EQUAL_COST_CHUNKS are off, when the
+    DP scheduler or another scheduler is configured, or when chunked prefill
+    is disabled."""
     from vllm_torchtpu.core.pp_chunk_scheduler import (
         SCHEDULER_CLS,
         patch_engine_core_for_pp_chunks,
     )
 
     scheduler_config = vllm_config.scheduler_config
-    if not envs.TPU_PP_DYNAMIC_CHUNKS:
+    if not (envs.TPU_PP_LONE_PROMPT_CHUNKS or envs.TPU_PP_EQUAL_COST_CHUNKS):
         return
     if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
         logger.warning(
@@ -1523,7 +1558,7 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     if not scheduler_config.enable_chunked_prefill:
         logger.warning("Pipeline chunk sizing is off: chunked prefill is disabled.")
         return
-    if envs.TPU_PP_CHUNK_SLACK < 0:
+    if envs.TPU_PP_EQUAL_COST_CHUNKS and envs.TPU_PP_CHUNK_SLACK < 0:
         raise ValueError(
             f"TPU_PP_CHUNK_SLACK must not be negative: {envs.TPU_PP_CHUNK_SLACK}"
         )

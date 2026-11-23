@@ -22,6 +22,7 @@ import multiprocessing
 import traceback
 
 import pytest
+from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -58,9 +59,11 @@ def _run_generation_worker(
     max_num_seqs: int,
     monkeypatch_tpu_runner_refresh,
     queue: multiprocessing.Queue,
+    repetition_penalties: list[float] | None = None,
 ):
     """
     Helper function to instantiate LLM and run generation within a child process.
+    With `repetition_penalties`, prompt `i` gets `repetition_penalties[i]`.
     """
     try:
         # We apply the monkeypatch dynamically
@@ -77,7 +80,16 @@ def _run_generation_worker(
             disable_log_stats=True,
         )
 
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
+        sampling_params: SamplingParams | list[SamplingParams]
+        if repetition_penalties is None:
+            sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
+        else:
+            sampling_params = [
+                SamplingParams(
+                    temperature=0.0, max_tokens=max_tokens, repetition_penalty=penalty
+                )
+                for penalty in repetition_penalties
+            ]
         outputs = llm.generate(prompts, sampling_params=sampling_params)
 
         tokens = [o.outputs[0].token_ids for o in outputs]
@@ -96,6 +108,7 @@ def run_llm_generation_in_isolated_process(
     max_tokens: int,
     max_num_seqs: int,
     monkeypatch_tpu_runner_refresh=None,
+    repetition_penalties: list[float] | None = None,
 ) -> list[list[int]]:
     """
     Spawns a clean OS process to run the LLM generation and retrieves the token IDs.
@@ -111,6 +124,7 @@ def run_llm_generation_in_isolated_process(
             max_num_seqs,
             monkeypatch_tpu_runner_refresh,
             queue,
+            repetition_penalties,
         ),
     )
     p.start()
@@ -201,4 +215,32 @@ def test_async_scheduling_preserves_output_when_batch_is_split_into_multiple_for
 
     assert sync_tokens == async_tokens, (
         "Async scheduling corrupted output during chunked multi-pass generation!"
+    )
+
+
+@pytest.mark.timeout(1200)
+def test_sync_scheduling_applies_repetition_penalty():
+    """
+    A penalized request goes through `execute_model` and `sample_tokens` on the
+    TPU, in one batch with the same prompt without a penalty. The penalty only
+    scales the logits; at 100 a seen token cannot stay the greedy choice in a
+    short output. `repetition_penalty` is applied with sync scheduling only.
+    """
+    prompt = "Repeat the word banana ten times: banana banana banana"
+    plain_tokens, penalized_tokens = run_llm_generation_in_isolated_process(
+        async_scheduling=False,
+        prompts=[prompt, prompt],
+        max_tokens=16,
+        max_num_seqs=2,
+        repetition_penalties=[1.0, 100.0],
+    )
+    prompt_tokens = set(AutoTokenizer.from_pretrained(MODEL_NAME)(prompt).input_ids)
+
+    # Control: without the penalty, the greedy output repeats tokens.
+    assert len(set(plain_tokens)) < len(plain_tokens)
+    assert len(set(penalized_tokens)) == len(penalized_tokens), (
+        "A penalized request repeated one of its output tokens."
+    )
+    assert prompt_tokens.isdisjoint(penalized_tokens), (
+        "A penalized request repeated a prompt token."
     )

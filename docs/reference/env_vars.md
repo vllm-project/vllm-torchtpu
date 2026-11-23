@@ -21,6 +21,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TORCH_TPU_MP_RENDEZVOUS_PORT` | `None` | Optional explicit TCP port for multi-host `mp` `TCPStore` rendezvous. |
 | `TPU_ACCELERATOR_TYPE` | `None` | Explicit accelerator type override (e.g., `"tpu7x"`, `"v6e-8"`) when running offline compilation or CPU tests. |
 | `TPU_LIBRARY_PATH` | `None` | `libtpu.so` loaded by the TPU runtime. `import libtpu` sets it to the pip package's own library. A custom path (any other file) takes precedence over an installed `libtpu` package: a fingerprint of that file replaces the package version in the compile and Raiden layout cache keys, and the minimum libtpu version check is skipped. |
+| `VLLM_TPU_EXPERIMENTAL_USE_RUST` | `False` | Opt-in. Serves models with the native Rust runtime (`rvllm`) directly behind `vllm serve` (covers both HTTP frontend and engine backend). Off by default until feature parity. Cannot be combined with `VLLM_USE_RUST_FRONTEND`. |
+| `VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY` | `""` | The `rvllm` binary to run when `VLLM_TPU_EXPERIMENTAL_USE_RUST` is enabled. Takes the same values as the launcher's `--rvllm-binary`: a binary's path, or a location (`gs://`, `https://` or a directory) holding `rvllm` and its `metadata.json`. When unset, `rvllm` is looked up on `PATH`. |
 
 ---
 
@@ -33,16 +35,26 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `VLLM_TPU_SRPT_ATTN_WORK_CAP` | `0` | In `SrptPrefillScheduler`, cap on a step's attention work (`sum(n * (c + n / 2))` over scheduled chunks with `n` new tokens after `c` computed ones); while this rank decodes, or another DP rank decodes under EP lockstep (`DP > 1` with expert parallel), prefill chunks are shrunk to stay under it (`0` disables). |
 | `VLLM_TPU_SRPT_ATTN_TILE_TOKENS` | `32` | In `SrptPrefillScheduler`, a chunk shrunk by `VLLM_TPU_SRPT_ATTN_WORK_CAP` ends on a multiple of this many tokens, rounded down (the attention kernel's query tile). |
 | `VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP` | `False` | Sets `SpeculativeConfig.disable_eagle_block_drop`. With EAGLE or MTP, keeps the trailing prefix-cache block vLLM otherwise drops from each hit and skips the matching one-block Mamba split back-off. This also turns off vLLM's lookahead block hashes, which otherwise keep the block themselves, so hashes stop covering the token after each block. Changes speculative acceptance, not target KV. |
-| `TPU_PP_DYNAMIC_CHUNKS` | `True` | Dynamically sizes microbatch chunks in Pipeline Parallelism (`--pipeline-parallel-size`). |
-| `TPU_PP_CHUNK_SLACK` | `0.1` | Slack ratio for dynamic pipeline-parallel chunk sizing. |
-| `TPU_PP_HANDOFF` | `wave` | How pipeline stages hand activations on: `wave` launches one collective on every stage per forward; `ring` sends each forward's output point to point to the next stage as soon as it is done (needs libtpu 0.0.50 or later with torch_tpu 0.2.0 or later). |
-| `TPU_PP_RING_DEPTH` | `2` | With `TPU_PP_HANDOFF=ring`, the forwards a stage may queue for sending before it waits for room; each device holds up to this many outgoing buffers and up to 7 landing buffers for receives posted ahead of their forwards, each `--max-num-batched-tokens` x hidden size in the model dtype, and that memory is reserved before the KV cache is sized. |
+| `TPU_PP_LONE_PROMPT_CHUNKS` | `True` | In Pipeline Parallelism (`--pipeline-parallel-size`), while the pending prefill work cannot fill every stage with a full step (for example, a lone prompt), spreads it over the stages in smaller steps. |
+| `TPU_PP_EQUAL_COST_CHUNKS` | `True` | In Pipeline Parallelism, sizes prefill chunks so every step takes about the same time, using step costs each stage times at startup, instead of filling the token budget. |
+| `TPU_PP_CHUNK_SLACK` | `0.1` | With `TPU_PP_EQUAL_COST_CHUNKS`, the fraction above the time of a full prefix-free step that a step may take before its chunks are shortened. |
+| `TPU_PP_HANDOFF_DEPTH` | `2` | The forwards a pipeline stage may queue for sending to the next stage before it waits for room; each device holds up to this many outgoing buffers and up to 7 landing buffers for receives posted ahead of their forwards, each `--max-num-batched-tokens` x hidden size in the model dtype, and that memory is reserved before the KV cache is sized. |
 | `TPU_PCP_TOPOLOGY_AWARE_MESH` | `True` | Orders Prefill Context Parallel (`PCP`) ranks along adjacent ICI torus neighbors to minimize ring hop count. |
+| `USE_TPU_PCP_MANAGER` | `False` | Runs `PCP` through the PCP manager. Only supports sparse MLA models with `DCP` = `PCP` x `TP`. See [PCP with PCP manager](../user_guide/parallelism.md#pcp-with-pcp-manager). |
+| `TPU_PCP_KV_WORKSPACE_TOKENS` | `1048576` | With `USE_TPU_PCP_MANAGER=1`, the context tokens one forward's prefills may gather; a step that needs more runs as several forwards. Must be at least `--max-model-len`. |
+| `TPU_PCP_KV_CHUNK_TOKENS` | `65536` | With `USE_TPU_PCP_MANAGER=1`, the context tokens each all-gather moves. |
 | `TPU_DCP_MLA_TOPK_CAP` | `0` | Caps top-k selection per Decode Context Parallel (`DCP`) rank in Sparse MLA (`0` disables cap). |
 | `TPU_DP_VOCAB_PARALLEL` | `False` | Opt-in. Shards the input embedding and lm_head over every DP x TP rank (the EP group) instead of each DP engine's TP group, cutting their HBM per device by DP x. Needs DP with expert parallelism; ignored, with a warning, under pipeline or context parallelism, speculative decoding, LoRA, pooling or multimodal models, or `TPU_GREEDY_TOP_TOKENS`. |
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
 | `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
+
+Removed pipeline variables. Startup with pipeline parallelism fails while any of them is set:
+
+- `TPU_PP_HANDOFF`: the buffered point-to-point hand-off is the only one; unset it.
+- `TPU_PP_RING_DEPTH`: renamed to `TPU_PP_HANDOFF_DEPTH`.
+- `TPU_PP_LAZY_PUSH`: timed the pushes of the removed lockstep hand-off; unset it.
+- `TPU_PP_DYNAMIC_CHUNKS`: split into `TPU_PP_LONE_PROMPT_CHUNKS` and `TPU_PP_EQUAL_COST_CHUNKS`.
 
 ---
 
@@ -61,6 +73,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `USE_MOE_TP_DECODE_KERNEL` | `False` | Serves eligible tensor-parallel FP8 MoE layers with a fused TP decode MoE Pallas kernel (in-kernel routing, shared expert, and all-reduce; requires `TPU_MOE_SKIP_PADDED_TOKENS=1`, and arms nothing while `FUSED_MOE_DECODE_KERNEL` is set). |
 | `TPU_EXPERT_PLACEMENT` | `""` | Static expert placement for `EP`: a JSON table (a local path or a `gs://` URI) that sets, per MoE layer, which experts each EP rank holds, as a permutation. Applied at weight load to the experts and the router, so every MoE kernel serves it unchanged. With Ray DP engines, also list it in `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`: vLLM copies only `VLLM_` variables and the names listed there to the engine actors. |
 | `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts. |
+| `TPU_MOE_EP_HIER_RS` | `"off"` | `"bf16"` or `"fp8"` runs the EP MoE combine's reduce-scatter on the hierrs_tc TensorCore kernels (on-chip first, then between chips) instead of the group's collective, sending that dtype between chips; accumulation stays bf16. `"fp8"` requires `TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE`, and calls below 16 MiB per device keep the bf16 wire. It only changes that collective, not how tokens are dispatched or where experts run, unlike `TPU_MOE_HIERARCHICAL_EP`. Off by default until it has an end-to-end accuracy and throughput evaluation. Arms only on one tpu7x 2x2x1 host (4 chips x 2 TensorCores) with the EP group equal to the DP group and to the whole world (8 devices), an EP mesh in ascending device id (so not `MOE_FUSED_EP_SORTED_GATHER`), and no MTP draft model; otherwise every rank logs a warning and keeps the group's reduce-scatter. It has no effect on layers that `USE_MOE_FUSED_EP_KERNEL=1` or `MOE_FUSED_EP_KERNEL_IMPL=adaptive` serve (their combine, transport and wire dtype are the fused EP kernel's own), nor on the multi-chunk pipeline (`TPU_MOE_COLLECTION_CHUNK_SIZE`), which keeps the group's collective so it overlaps the next chunk's compute. Per call it also needs a 2-D bf16 input whose rows split evenly over 8 devices (at least 8 rows each) and a hidden size that is a multiple of 512; other calls use the group's reduce-scatter and log the reason once. |
+| `TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE` | `None` | With `TPU_MOE_EP_HIER_RS=fp8`, the multiplier applied before the cast to FP8; must be positive. Partial sums above `448 / scale` are clipped there without any signal. What gets quantized is a partial sum over 2 devices (hypercube step 0) and 4 devices (step 1), not one device's input. `16` was calibrated on Qwen3.5-397B-A17B-FP8: its largest per-device input was `\|x\| = 13.88` over 1.68e9 captured elements, so the bound of 28 leaves 2x headroom for one device. Partial sums can exceed that, so recalibrate before reusing it on another model. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
@@ -73,7 +87,17 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_GDN_QKVZ_KERNEL_LAYOUT` | `False` | Opt-in. Stores the GDN `in_proj_qkvz` weight in the matmul's (k, n) layout instead of vLLM's [n_out, n_in], removing a per-step weight copy on the per-block FP8 path. Ignored with prefill context parallelism; the experimental AOT export rejects it at TP > 1. |
 | `MOE_REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time MoE expert weight requantization (e.g., `"fp4"`). |
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `None` | Target block size for load-time MoE expert weight requantization. |
+| `TPU_MOE_REQUANT_CHUNK_BYTES` | `1073741824` (1 GiB) | Float32 bytes one load-time MoE requantization chunk materializes on the device. Must be > 0. Lower it if requantization runs out of device memory after loading. |
 | `VLLM_TPU_MXFP4_DEVICE_DEQUANT` | `True` | Performs MXFP4 weight dequantization on TPU device during load rather than on CPU. |
+
+### MoE reference parity
+
+RL and distillation workloads that compare TPU rollouts with an unfused `bfloat16` MoE (the GPU vLLM path: `w13` GEMM -> `bfloat16` -> `SiluAndMul` -> `w2` GEMM -> `bfloat16` -> top-k combine) can turn on two independent `--additional-config` settings, each of which changes one rounding point:
+
+- `"tpu_moe_topk_weights_float32": true` keeps the top-k routing weights and the expert combine of the grouped-matmul MoE path (`fused_moe_gmm`) in `float32` instead of the activation dtype. The `FUSED_MOE_DECODE_KERNEL` and `USE_MOE_TP_DECODE_KERNEL` kernels round the weights to `bfloat16`, so they are not used for MoE layers while it is set. It replaces the removed `TPU_MOE_TOPK_WEIGHTS_FLOAT32` environment variable; startup fails if that variable is still set.
+- `"tpu_moe_silu_bf16": true` rounds the `gmm_v2`-fused SwiGLU `gate`, `up`, and `silu(gate)` to `bfloat16`, as upstream `SiluAndMul` does. It applies only to the `silu` activation: other activations, and the clamped SiLU of DeepSeek-V4 MXFP4 layers (`silu_and_mul_with_clamp`), keep `float32` intermediates. SiLU layers then run on `gmm_v2`, so the v2 fused EP (`USE_MOE_FUSED_EP_KERNEL`), `FUSED_MOE_DECODE_KERNEL`, `USE_MOE_TP_DECODE_KERNEL`, and `TPU_MOE_DENSE_EXPERT_THRESHOLD` paths are not used for them, and `MOE_FUSED_EP_KERNEL_IMPL=adaptive` fails at startup.
+
+Both are off by default; set both (`--additional-config '{"tpu_moe_topk_weights_float32": true, "tpu_moe_silu_bf16": true}'`) to reproduce the unfused `bfloat16` MoE's rounding.
 
 ---
 

@@ -21,6 +21,7 @@ import torch
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 
+from vllm_torchtpu.layers.adapter.sample.token_bitmask import unpack_token_bitmask
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
 if TYPE_CHECKING:
@@ -450,21 +451,12 @@ class StructuredDecodingManager:
             f"vocab_size ({self.vocab_size}) (padded to hardware alignment "
             f"boundary), but got logits.shape[-1]={target_dim}",
         )
-        # Unpack the bitmask for the entire batch at once.
+        # Unpack the bitmask for the entire batch at once: a set bit allows
+        # the token, so mask the tokens whose bit is clear.
         # grammar_bitmask: (B, N) where B=num_reqs, N=cdiv(vocab_size, 32)
-        # arange: (32,)
-        # (B, N, 1) and (1, 1, 32) broadcast to (B, N, 32)
-        unpacked_bitmask = (
-            torch.bitwise_right_shift(
-                grammar_bitmask[:, :, None], arange[None, None, :]
-            )
-            & 1
-        ) == 0
-        # Reshape to (B, vocab_size) and apply to logits.
-        # (B, N * 32) -> (B, vocab_size)
-        unpacked_bitmask = unpacked_bitmask.reshape(logits.shape[0], -1)[
-            :, : self.vocab_size
-        ]
+        unpacked_bitmask = ~unpack_token_bitmask(
+            grammar_bitmask, arange, self.vocab_size
+        )
         if target_dim > self.vocab_size:
             unpacked_bitmask = torch.nn.functional.pad(
                 unpacked_bitmask,

@@ -400,7 +400,11 @@ class _InProcessEngine:
         outputs = self._llm.generate(prompts, sampling_config)
         return [output.outputs[0].text for output in outputs]
 
-    def generate_outputs(self, prompts: list[str], sampling_config: SamplingParams):
+    def generate_outputs(
+        self,
+        prompts: list[str],
+        sampling_config: SamplingParams | list[SamplingParams],
+    ):
         """The full RequestOutputs, for callers that need more than text."""
         return self._llm.generate(prompts, sampling_config)
 
@@ -507,6 +511,56 @@ def test_ngram_correctness_greedy(
             "num_speculative_tokens": 3,
         },
     )
+
+
+@pytest.mark.timeout(1800)
+def test_ngram_prompt_logprobs(monkeypatch: pytest.MonkeyPatch, model_name: str):
+    """Prompt logprobs under ngram speculative decoding match a no-spec run.
+
+    Requests stop after different numbers of tokens and only max_num_seqs run
+    at once, so later prompts prefill in the same steps as earlier requests
+    verify their drafts.
+    """
+    prompts = get_ngram_test_prompts()
+    sampling = [
+        SamplingParams(
+            temperature=0, max_tokens=8 + 4 * i, ignore_eos=True, prompt_logprobs=1
+        )
+        for i in range(len(prompts))
+    ]
+    kwargs = {
+        "max_model_len": 256,
+        "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
+        "max_num_seqs": 4,
+        "tensor_parallel_size": _get_tensor_parallel_size(),
+        "disable_log_stats": False,
+    }
+    with monkeypatch.context():
+        with _engine(model_name, None, kwargs) as ref_engine:
+            ref_outputs = ref_engine.generate_outputs(prompts, sampling)
+        with _engine(
+            model_name,
+            {
+                "method": "ngram",
+                "prompt_lookup_max": 5,
+                "prompt_lookup_min": 3,
+                "num_speculative_tokens": 3,
+            },
+            kwargs,
+        ) as spec_engine:
+            spec_outputs = spec_engine.generate_outputs(prompts, sampling)
+            assert spec_engine.num_drafts() > 0
+
+    for ref_output, spec_output in zip(ref_outputs, spec_outputs):
+        token_ids = spec_output.prompt_token_ids
+        ref_rows, spec_rows = ref_output.prompt_logprobs, spec_output.prompt_logprobs
+        assert spec_rows is not None and len(spec_rows) == len(token_ids)
+        assert ref_rows is not None and spec_rows[0] is None
+        for pos, token in enumerate(token_ids[1:], start=1):
+            ref_lp = ref_rows[pos][token].logprob
+            spec_lp = spec_rows[pos][token].logprob
+            # One bf16 step of the logsumexp around the logits' magnitude.
+            assert abs(ref_lp - spec_lp) <= 0.125, (pos, ref_lp, spec_lp)
 
 
 @pytest.mark.timeout(1800)

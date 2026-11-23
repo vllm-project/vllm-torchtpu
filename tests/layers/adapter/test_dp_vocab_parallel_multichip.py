@@ -23,10 +23,7 @@ Run on one host (4 chips x 2 cores = 8 ranks).
 """
 
 import argparse
-import json
 import os
-import signal
-import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -35,60 +32,16 @@ import pytest
 
 pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
 WORLD_SIZE = 8
 DP, TP = 4, 2
 VOCAB = 1000  # pads to 1024: 8 shards of 128
 HIDDEN = 256
 TOKENS = 24
 ROWS = 16
-# Under the per-PR multichip lane's pytest --timeout=600, so this limit, not
-# pytest's, ends a hung launch and the finally below can reap the workers.
+# Under the per-PR multichip lane's pytest --timeout=600.
 LAUNCH_TIMEOUT_SECONDS = 480
-
-
-def _worker_command(result_dir: Path) -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nnodes=1",
-        f"--nproc-per-node={WORLD_SIZE}",
-        str(Path(__file__).resolve()),
-        "--worker",
-        "--result-dir",
-        str(result_dir),
-    ]
-
-
-def _prepare_worker_env() -> dict[str, str]:
-    try:
-        from tests.distributed.tpu_test_utils import prepare_tpu_environment
-    except ImportError as exc:
-        pytest.skip(f"TorchTPU is unavailable: {exc}")
-    keys = (
-        "TORCH_TPU_XPROF_SESSION_ID",
-        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
-        "TORCH_TPU_TOPOLOGY",
-    )
-    saved = {k: os.environ.get(k) for k in keys}
-    try:
-        for k in keys:
-            os.environ.pop(k, None)
-        prepare_tpu_environment(world_size=WORLD_SIZE)
-        env = os.environ.copy()
-    except ValueError as exc:
-        pytest.skip(f"Eight TPU devices are unavailable: {exc}")
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-    env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
-    env.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
-    env.setdefault("VLLM_USE_AOT_COMPILE", "0")
-    return env
 
 
 def _check(rank: int) -> dict:
@@ -182,84 +135,25 @@ def _check(rank: int) -> dict:
     return out
 
 
-def _run_worker(result_dir: Path) -> None:
-    import torch
-    import torch_tpu  # noqa: F401
-    from torch import distributed as dist
-
-    rank = int(os.environ["RANK"])
-    world = int(os.environ["WORLD_SIZE"])
-    result: dict[str, object] = {"rank": rank, "world": world}
-    initialized = False
-    try:
-        dist.init_process_group(backend="tpu_dist")
-        initialized = True
-        torch.empty((1,), device="tpu").cpu()
-        from vllm.distributed.parallel_state import init_distributed_environment
-
-        init_distributed_environment(
-            world_size=world,
-            rank=rank,
-            local_rank=int(os.environ["LOCAL_RANK"]),
-            distributed_init_method="env://",
-            backend="tpu_dist",
-        )
-        result["check"] = _check(rank)
-    except BaseException as exc:  # noqa: BLE001 - reported to the parent
-        traceback.print_exc()
-        result["error"] = repr(exc)
-    finally:
-        (result_dir / f"rank_{rank}.json").write_text(json.dumps(result, indent=2))
-        if rank == 0:
-            print("RESULT rank0", json.dumps(result), flush=True)
-        if initialized:
-            try:
-                dist.destroy_process_group()
-            except Exception:
-                traceback.print_exc()
-    if "error" in result:
-        raise SystemExit(1)
-
-
-def _launch(result_dir: Path) -> subprocess.CompletedProcess[str]:
-    process = subprocess.Popen(
-        _worker_command(result_dir),
-        cwd=Path(__file__).resolve().parents[3],
-        env=_prepare_worker_env(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        errors="replace",
-        start_new_session=True,
-    )
-    output = ""
-    try:
-        output, _ = process.communicate(timeout=LAUNCH_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired as exc:
-        output = exc.output or ""
-    finally:
-        # Also on pytest's own timeout, which raises out of communicate(): the
-        # workers run in their own session and would keep holding the chips.
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=60)
-    return subprocess.CompletedProcess(process.args, process.returncode, output, "")
-
-
 def test_dp_vocab_parallel_on_real_collectives(tmp_path):
     result_dir = tmp_path / "dp_vocab"
     result_dir.mkdir()
-    completed = _launch(result_dir)
-    results = []
-    for rank in range(WORLD_SIZE):
-        path = result_dir / f"rank_{rank}.json"
-        results.append(
-            json.loads(path.read_text())
-            if path.exists()
-            else {"rank": rank, "error": "missing worker result"}
-        )
-    errors = [r for r in results if "error" in r]
-    assert not errors, (errors, (completed.stdout or "")[-4000:])
+    from tests.distributed.tpu_test_utils import (
+        launch_torchrun_workers,
+        read_worker_results,
+        torchrun_worker_env,
+    )
+
+    env = torchrun_worker_env(WORLD_SIZE)
+    completed = launch_torchrun_workers(
+        Path(__file__).resolve(),
+        result_dir,
+        world_size=WORLD_SIZE,
+        env=env,
+        cwd=REPO_ROOT,
+        timeout=LAUNCH_TIMEOUT_SECONDS,
+    )
+    results = read_worker_results(result_dir, WORLD_SIZE, completed)
     for r in results:
         check = r["check"]
         for how in ("eager", "compiled"):
@@ -283,4 +177,8 @@ if __name__ == "__main__":
     parser.add_argument("--result-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.worker:
-        _run_worker(args.result_dir)
+        # Run as a script: the repo root is not on sys.path.
+        sys.path.insert(0, str(REPO_ROOT))
+        from tests.distributed.tpu_test_utils import run_torchrun_worker
+
+        run_torchrun_worker(args.result_dir, _check)

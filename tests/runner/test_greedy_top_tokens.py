@@ -270,6 +270,7 @@ def _runner(weight, speculative_config=None):
     runner._greedy_head_owner = owner
     runner.speculative_config = speculative_config
     runner._min_tokens = min_tokens.MinTokensTracker()
+    runner._repetition_penalty = SimpleNamespace(active=lambda _batch: False)
     return runner
 
 

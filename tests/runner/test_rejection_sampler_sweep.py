@@ -23,7 +23,10 @@ import torch
 
 from tests.runner.precompile_sweep_checks import ops_outside_aten as _ops_outside_aten
 from vllm_torchtpu.layers.adapter.sample import rejection_sampler as rs
-from vllm_torchtpu.layers.adapter.sample.top_k_top_p import CANDIDATE_BLOCK
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
+    CANDIDATE_BLOCK,
+    random_sampler_variants,
+)
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -33,15 +36,21 @@ K = 3
 
 class _Sampler:
     """Records the (num_tokens, num_reqs) of each warmup call, read off the
-    tensors the sweep built for it."""
+    tensors the sweep built for it, and the (topk_candidates,
+    apply_topk_topp) of each non-greedy one."""
 
     synthetic_mode = False
 
     def __init__(self):
         self.calls: list[tuple[int, int]] = []
+        self.variants: list[tuple[int, bool]] = []
 
     def __call__(self, *, draft_token_ids, num_draft_tokens, **kwargs):
         self.calls.append((draft_token_ids.shape[0], num_draft_tokens.shape[0]))
+        if kwargs.get("do_sampling"):
+            self.variants.append(
+                (kwargs.get("topk_candidates", 0), kwargs.get("apply_topk_topp", True))
+            )
         return draft_token_ids
 
 
@@ -121,6 +130,21 @@ def test_flag_starts_each_local_rank_at_its_share_of_the_sweep(monkeypatch, rank
     # 8 local ranks per host; a local rank past 8 wraps around.
     start = rank % 8 * len(PAIRS) // 8
     assert _sweep(monkeypatch, "1", rank=rank) == PAIRS[start:] + PAIRS[:start]
+
+
+@pytest.mark.parametrize("blocks", [0, 2])
+def test_non_greedy_warmups_are_the_random_sampler_variants(monkeypatch, blocks):
+    """Each shape warms the non-greedy verify path once per
+    random_sampler_variants entry, the list _precompile_sample_from_logits
+    warms too, so a new variant reaches both precompiles."""
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda out: None)
+    monkeypatch.delenv(FLAG, raising=False)
+    runner, _ = _runner()
+    runner._topk_candidate_blocks = lambda: blocks
+    TPUModelRunner._precompile_rejection_sampler(runner)  # type: ignore[arg-type]
+    assert runner.rejection_sampler.variants == (
+        random_sampler_variants(blocks) * len(PAIRS)
+    )
 
 
 def _recording(fn, graphs, also=None):

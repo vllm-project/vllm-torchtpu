@@ -126,6 +126,92 @@ def reserve_scheduling_group_ids(count: int) -> int:
     return first
 
 
+# Ids for callers that name their call site (`scheduling_group_slot`, e.g. the
+# layer index). The counter above is read while tracing, so a call that hits
+# `jax.jit`'s cache -- a model's second layer with the first one's shapes --
+# reuses the first call's ids, and XLA joins the two layers into one group: the
+# path between them is un-annotated, which libtpu 0.0.50 rejects ("annotation
+# groups with gaps"). A slot is a static argument instead, so it is part of the
+# cache key: slot `s` owns `[SLOT_ID_BASE + s * MAX_IDS_PER_SLOT, +
+# MAX_IDS_PER_SLOT)`, the same ids whatever was compiled before. The base keeps
+# them clear of the counter's.
+#
+# A pipeline over `n` chunks takes `n - 1` ids, and `chunk_tokens` may be any
+# multiple of 4, so a slot holds enough for a 64Ki-chunk call (e.g. a 2M-token
+# bucket in chunks of 32). Ids stay well inside int32 for every slot below
+# `MAX_SCHEDULING_GROUP_SLOT`.
+SLOT_ID_BASE = 1 << 20
+MAX_IDS_PER_SLOT = 1 << 16
+MAX_SCHEDULING_GROUP_SLOT = ((1 << 31) - SLOT_ID_BASE) // MAX_IDS_PER_SLOT - 1
+
+
+def slot_scheduling_group_ids(slot: int, count: int) -> int:
+    """The first of `count` scheduling group ids owned by call site `slot`."""
+    if not 0 <= slot <= MAX_SCHEDULING_GROUP_SLOT:
+        raise ValueError(
+            f"scheduling group slot ({slot}) must be in "
+            f"[0, {MAX_SCHEDULING_GROUP_SLOT}]."
+        )
+    if not 1 <= count <= MAX_IDS_PER_SLOT:
+        raise ValueError(
+            f"count ({count}) must be in [1, {MAX_IDS_PER_SLOT}]: a slot owns "
+            f"{MAX_IDS_PER_SLOT} ids."
+        )
+    return SLOT_ID_BASE + slot * MAX_IDS_PER_SLOT
+
+
+def num_chunks(num_tokens: int, chunk_tokens: int | None) -> int:
+    """How many chunks the top-k pipeline cuts a `num_tokens` bucket into.
+
+    One (an unpipelined pass) unless `chunk_tokens` divides `num_tokens` into
+    at least two.
+    """
+    if chunk_tokens is None or num_tokens % chunk_tokens:
+        return 1
+    return num_tokens // chunk_tokens
+
+
+def chunked_scheduling_group_slot(
+    slot: int | None, num_tokens: int, chunk_tokens: int | None
+) -> int | None:
+    """`slot` if a `num_tokens` call is pipelined, else None.
+
+    Only a pipelined call has scheduling groups, so only it needs its own
+    slot. The slot is a static argument of the jitted kernel: passing one to
+    an unpipelined call would split `jax.jit`'s trace cache by call site for
+    nothing, and every layer would trace every unchunked bucket again.
+    """
+    return slot if num_chunks(num_tokens, chunk_tokens) > 1 else None
+
+
+# Slots for call sites whose name holds no single layer index. They start past
+# any real layer index, so they cannot collide with `layer_scheduling_group_slot`'s
+# index-derived slots.
+_FALLBACK_SLOT_BASE = 1 << 12
+_fallback_slots: dict[str, int] = {}
+_fallback_slots_lock = threading.Lock()
+
+
+def layer_scheduling_group_slot(layer_prefix: str) -> int:
+    """The `scheduling_group_slot` for the layer whose module prefix is given.
+
+    The layer index when the prefix holds exactly one integer component
+    ("model.layers.7.self_attn.indexer.k_cache" -> 7): layers of one forward
+    have distinct indices (MTP layers continue after the target's), and the
+    slot, and so the HLO and the compile cache key, depend on nothing but the
+    layer -- not on construction order or on other models built in the same
+    process. Any other prefix gets a fallback slot, numbered in first-seen
+    order, which is the same on every rank.
+    """
+    ints = [int(part) for part in layer_prefix.split(".") if part.isdigit()]
+    if len(ints) == 1 and ints[0] < _FALLBACK_SLOT_BASE:
+        return ints[0]
+    with _fallback_slots_lock:
+        return _fallback_slots.setdefault(
+            layer_prefix, _FALLBACK_SLOT_BASE + len(_fallback_slots)
+        )
+
+
 def reset_scheduling_group_ids() -> None:
     """Restarts the ids at 1, for the start of a new compiled program.
 

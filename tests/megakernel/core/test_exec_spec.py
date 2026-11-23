@@ -113,9 +113,10 @@ def test_tiles_module_tunables_are_canonical_and_hashable():
 
 
 def test_exec_spec_imports_only_ops_and_profiles():
-    """`exec_spec` and `module_options` depend only on stdlib, `ops` and `profiles`."""
+    """`exec_spec` and `module_options` depend only on stdlib, `ops` and
+    `profiles` (and the stdlib-only `_builtins` loader)."""
     for mod_obj, allowed_rel in (
-        (module_options, set()),
+        (module_options, {"_builtins"}),
         (exec_spec, {"module_options", "ops", "profiles"}),
     ):
         path = Path(mod_obj.__file__)

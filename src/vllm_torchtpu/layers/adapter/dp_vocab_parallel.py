@@ -28,11 +28,16 @@ re-sharded: this module replaces their forward and logits path, which a
 subclass may override with its own reduction over the TP group, and other
 tables (positions, per-layer or multimodal embedders) may run outside the
 decoder's forward, where the engines are not in lockstep. Their collectives
-span DP engines,
-which is sound only because EP + DP runs the engines in lockstep: every step,
-each engine runs the same number of forward chunks at the same DP-wide token
-bucket (TPUModelRunner._dp_coordinated_step; idle engines run dummy chunks), and
-every chunk, dummy or not, computes logits exactly once.
+span DP engines, which is sound only because EP + DP runs the engines in
+lockstep. Every step, each engine:
+- runs the same number of forward chunks at the same DP-wide token bucket
+  (TPUModelRunner._dp_coordinated_step; idle engines run dummy chunks), each
+  computing logits once;
+- on a step that scores prompt logprobs, makes the same number of extra logits
+  calls after its chunks. _dp_coordinated_step all-reduces the step's
+  prompt-row count, every engine derives the same bound from it, and engines
+  that need fewer calls pad with dummy calls
+  (TPUModelRunner._score_prompt_logprobs).
 
 Embedding: all-gather the token ids over the DP group (an engine's TP ranks hold
 the same ids), look up this rank's vocab shard, reduce-scatter over the DP group

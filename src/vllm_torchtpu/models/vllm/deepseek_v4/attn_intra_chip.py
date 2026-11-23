@@ -50,11 +50,15 @@ TPU_DSV4_ATTN_INTRA_CHIP_TP=1. When every compile size allows it (2 x size <= 51
 size a multiple of 8), step 5 is fused into step 6: the neighboring chiplet's rows
 are fetched by remote DMA inside the `wo_a` kernel. Otherwise the exchange runs as
 described.
+Step 3 is one remote DMA of the neighboring chiplet's [T, H/2, D] q heads, and
+q-norm + RoPE reads both blocks in place (see `_QSendRope`). XLA overlaps the
+DMA with the layer's KV work (q_send.py marks it as an async pair).
 """
 
 from __future__ import annotations
 
 import functools
+from typing import Any
 
 import jax
 import torch
@@ -64,15 +68,20 @@ from torch_tpu._internal import pallas
 from vllm.distributed import parallel_state
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 
+from vllm_torchtpu.kernels.deepseek_v4 import q_send
+from vllm_torchtpu.kernels.deepseek_v4.collective_ids import Q_SEND_COLLECTIVE_ID
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     O_FETCH_MAX_TOKENS,
     fused_reverse_rope_wo_a_projection_o_fetch,
 )
+from vllm_torchtpu.kernels.deepseek_v4.rope import qnorm_rope_pair
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import (
     VllmDeepseekV4MLAAttention,
+    _name_float,
     _pallas_op_cache,
 )
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import get_pallas_op_mesh
 
 logger = init_logger(__name__)
 
@@ -173,34 +182,41 @@ def _neighbor_device_id(current_device: int) -> int:
     topology = get_chip_topology()
     if topology is None:
         raise RuntimeError(
-            "The fused o-fetch kernel needs the chip topology to find the "
-            "neighboring chiplet, but the devices do not expose it"
+            "chip-pair kernels need the chip topology to find the neighboring "
+            "chiplet, but the devices do not expose it"
         )
     chip = next(ids for ids in topology.chips if current_device in ids)
     (neighbor,) = [d for d in chip if d != current_device]
     return neighbor
 
 
+def _chip_pair_mesh() -> tuple[Any, int, int]:
+    """The EP mesh the chip-pair kernels run on -- the one the fused MoE kernel
+    uses, since every Pallas kernel in a program must share one device
+    assignment -- with this device's id and its neighbor's index on the mesh.
+    The mesh's first construction is a collective, so build at weight load.
+    """
+    from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
+    from vllm_torchtpu.distributed.mesh_utils import _get_tpu_global_device_id
+
+    mesh = build_ep_mesh()
+    if mesh is None:
+        raise RuntimeError("chip-pair kernels need the expert-parallel mesh")
+    ids = [int(d.id) for d in mesh.devices.flat]
+    current_device = _get_tpu_global_device_id()
+    return mesh, current_device, ids.index(_neighbor_device_id(current_device))
+
+
 class _FusedOFetch:
     """The chip-pair wo_a op, which addresses the neighboring chiplet directly.
 
-    It runs on the EP mesh -- the one the fused MoE kernel uses, since every
-    Pallas kernel in a program must share one device assignment -- and takes
-    the neighboring chiplet's mesh index and the current chiplet's index (0 or
-    1) as device data. Built at weight load: the mesh's first construction is a
-    collective.
+    It runs on `_chip_pair_mesh` and takes the neighboring chiplet's mesh index
+    and the current chiplet's index (0 or 1) as device data. Built at weight
+    load.
     """
 
     def __init__(self, group, device, head_dim: int) -> None:
-        from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
-        from vllm_torchtpu.distributed.mesh_utils import _get_tpu_global_device_id
-
-        mesh = build_ep_mesh()
-        if mesh is None:
-            raise RuntimeError("chip-pair kernels need the expert-parallel mesh")
-        ids = [int(d.id) for d in mesh.devices.flat]
-        current_device = _get_tpu_global_device_id()
-        neighbor_mesh_index = ids.index(_neighbor_device_id(current_device))
+        mesh, current_device, neighbor_mesh_index = _chip_pair_mesh()
         as_i32 = functools.partial(torch.tensor, dtype=torch.int32, device=device)
         logger.info_once(
             "chip-pair wo_a in-kernel o exchange armed (device %d, neighbor "
@@ -271,12 +287,141 @@ def _check_fused_o_fetch_supported(vllm_config) -> bool:
     return not unsupported
 
 
+def _q_send_fn(mesh: Mesh, head_dim: int):
+    def local(q_half, neighbor_mesh_index, chiplet_index):
+        # q_half [2, T, W]: the wq_b output for chiplet 0's tokens, then chiplet 1's,
+        # with the current chiplet's heads flattened (W = heads * head_dim).
+        _, num_tokens, width = q_half.shape
+        qh = q_half.reshape(
+            2, num_tokens, width // head_dim, head_dim
+        )  # relayout: [2, T, W] -> [2, T, W/D, D]
+        handle = q_send.start_q_send(
+            qh, neighbor_mesh_index, chiplet_index, collective_id=Q_SEND_COLLECTIVE_ID
+        )
+        return handle[0], q_send.wait_q_send(handle, collective_id=Q_SEND_COLLECTIVE_ID)
+
+    def fn(
+        q_half: jax.Array, neighbor_mesh_index: jax.Array, chiplet_index: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        (ax,) = mesh.axis_names
+        return jax.shard_map(
+            local, mesh=mesh, in_specs=P(ax), out_specs=P(ax), check_vma=False
+        )(q_half, neighbor_mesh_index, chiplet_index)
+
+    return fn
+
+
+def _qnorm_rope_pair_jax(
+    current_heads: jax.Array,
+    neighbor_heads: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    chiplet_index: jax.Array,
+    *,
+    eps: float,
+) -> jax.Array:
+    return qnorm_rope_pair(
+        current_heads, neighbor_heads, positions, cos_sin_cache, chiplet_index, eps=eps
+    )
+
+
+class _QSendRope:
+    """The q send, fused with q-norm + RoPE of both chiplets' heads.
+
+    The send op relayouts the wq_b output over both chiplets' tokens once, to
+    [2, T, H/2, D], and swaps the token blocks with one DMA
+    (q_send.py), marked as an async pair so XLA overlaps the transfer with the
+    layer's KV work; both buffers stay in HBM, since they live across those
+    kernels. q-norm + RoPE (rope.qnorm_rope_pair) then reads the current
+    chiplet's block and the received one in place. The neighboring chiplet's mesh
+    index and the current chiplet's index are device data. Built at weight load
+    (see `_chip_pair_mesh`).
+    """
+
+    def __init__(self, group, device, head_dim: int, eps: float) -> None:
+        mesh, current_device, neighbor_mesh_index = _chip_pair_mesh()
+        chiplet_index = group.rank_in_group
+        logger.info_once(
+            "chip-pair q send armed (device %d, neighbor mesh index %d, "
+            "chiplet index %d)",
+            current_device,
+            neighbor_mesh_index,
+            chiplet_index,
+        )
+        as_i32 = functools.partial(torch.tensor, dtype=torch.int32, device=device)
+        self.neighbor_mesh_index = as_i32([neighbor_mesh_index])
+        self.chiplet_index = as_i32([chiplet_index])
+        self.head_dim = head_dim
+
+        name = f"pallas::deepseek_v4_q_send_d{head_dim}"
+        send = _pallas_op_cache.get(name)
+        if send is None:
+            (ax,) = mesh.axis_names
+            # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
+            # pyrefly: ignore[no-matching-overload]
+            send = pallas.jax_op(
+                name,
+                _q_send_fn(mesh, head_dim),
+                mesh=mesh,
+                input_partition_specs=(P(ax),) * 3,
+                output_partition_specs=(P(ax),) * 2,
+            )
+            send.register_fake(
+                lambda q_half, *_: (
+                    q_half.new_empty(
+                        (*q_half.shape[:2], q_half.shape[2] // head_dim, head_dim)
+                    ),
+                    q_half.new_empty(
+                        (q_half.shape[1], q_half.shape[2] // head_dim, head_dim)
+                    ),
+                )
+            )
+            _pallas_op_cache[name] = send
+        self._send = send
+
+        # The chiplet index is an input, not a static: both chiplets build one op.
+        name = f"pallas::deepseek_v4_qnorm_rope_pair_e{_name_float(eps)}"
+        rope = _pallas_op_cache.get(name)
+        if rope is None:
+            # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
+            # pyrefly: ignore[no-matching-overload]
+            rope = pallas.jax_op(
+                name,
+                functools.partial(_qnorm_rope_pair_jax, eps=eps),
+                mesh=get_pallas_op_mesh(),
+                input_partition_specs=(P(),) * 5,
+            )
+            rope.register_fake(
+                lambda current, neighbor, *_: neighbor.new_empty(
+                    (neighbor.shape[0], 2 * neighbor.shape[1], neighbor.shape[2])
+                )
+            )
+            _pallas_op_cache[name] = rope
+        self._rope = rope
+
+    def __call__(self, q_half, positions, cos_sin_cache):
+        """``q_half`` [2, T, W]: wq_b over both chiplets' tokens with the current
+        chiplet's heads. Returns the current chiplet's tokens' q over all heads,
+        normed and roped."""
+        _, num_tokens, width = q_half.shape
+        heads = width // self.head_dim
+        qh, neighbor = self._send(q_half, self.neighbor_mesh_index, self.chiplet_index)
+        return self._rope(
+            qh.view(2 * num_tokens, heads, self.head_dim),
+            neighbor.view(num_tokens, heads, self.head_dim),
+            positions,
+            cos_sin_cache,
+            self.chiplet_index,
+        )
+
+
 class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
     """DSv4 attention with `wq_b`/`wo_a`/`wo_b` split across a chip's two cores."""
 
     # Set with object.__setattr__ in __init__, outside nn.Module's registry.
     _chip_pair: parallel_state.GroupCoordinator
     _fused_o_fetch: _FusedOFetch
+    _q_send_rope: _QSendRope
 
     def __init__(self, vllm_config, prefix: str = "", *args, **kwargs) -> None:
         # The split halves a layer that holds all heads; under vLLM TP>1 the
@@ -374,12 +519,21 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
                 self._chip_pair, self.wo_b.weight.device, int(self.head_dim)
             )
             object.__setattr__(self, "_fused_o_fetch", fetch)
+        q_send_rope = _QSendRope(
+            self._chip_pair,
+            self.wo_b.weight.device,
+            int(self.mla_attn.head_dim),
+            float(self.mla_attn.eps),
+        )
+        object.__setattr__(self, "_q_send_rope", q_send_rope)
 
-    def _project_q(self, qr: torch.Tensor) -> torch.Tensor:
-        # Each core projects both cores' tokens onto its half of the heads, then
-        # the cores swap so each holds all heads for its own tokens.
+    def _project_q_rope(
+        self, qr: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        # Each chiplet projects both chiplets' tokens onto its half of the heads;
+        # the neighboring chiplet's block is then sent over, and q-norm + RoPE
+        # reads both blocks in place (_QSendRope).
         group = self._chip_pair
-        rank = group.rank_in_group
         num_tokens = qr.shape[0]
         qr_pair = group.all_gather(qr.contiguous(), dim=0)
         if qr_pair.shape[0] != 2 * num_tokens:
@@ -388,10 +542,8 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
                 f"2 x {num_tokens}; both cores must run at the same token count"
             )
         q_half = self.wq_b(qr_pair).view(2, num_tokens, -1)
-        neighbor = _swap_with_neighbor_chiplet(group, q_half[rank], q_half[1 - rank])
-        pieces = [q_half[rank], neighbor] if rank == 0 else [neighbor, q_half[rank]]
-        return torch.cat(pieces, dim=-1).view(
-            num_tokens, self.mla_attn.n_local_heads, self.mla_attn.head_dim
+        return self._q_send_rope(
+            q_half, positions, self.mla_attn.rotary_emb.cos_sin_cache
         )
 
     def _o_proj(self, o, positions):

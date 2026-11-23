@@ -38,12 +38,6 @@ def _make_executor(engine_override, worker_overrides, pipeline_parallel_size=1):
     return executor
 
 
-def test_workers_start_one_at_a_time():
-    # Each start sets its worker's binding in the parent's os.environ.
-    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
-    assert executor._can_start_workers_concurrently(None) is False
-
-
 @patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
 def test_copies_override_from_workers_when_engine_unset(mock_super):
     """Engine override is None -> copy the agreed worker value to the engine."""

@@ -15,6 +15,35 @@
 from dataclasses import dataclass
 from typing import Any
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.gdn_pool_layout import (
+    QWEN_GDN_ARCHITECTURES,
+    unified_kv_layout_enabled_for_architecture,
+)
+from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
+    fused_qkvz_pcp_dma_row_alignment,
+)
+
+
+def validate_pooled_qwen_gdn_pcp_interleave(
+    architecture: object, interleave_size: int
+) -> None:
+    """Reject PCP interleave sizes unaligned to the pooled Qwen GDN DMA tile."""
+    if not isinstance(architecture, str):
+        return
+    if (
+        architecture in QWEN_GDN_ARCHITECTURES
+        and unified_kv_layout_enabled_for_architecture(architecture)
+    ):
+        row_alignment = fused_qkvz_pcp_dma_row_alignment()
+        if interleave_size < row_alignment or interleave_size % row_alignment != 0:
+            raise ValueError(
+                "PCP on pooled Qwen GDN models requires "
+                "--cp-kv-cache-interleave-size to be a positive multiple of "
+                f"{row_alignment} (for example, --cp-kv-cache-interleave-size "
+                f"128), got {interleave_size}."
+            )
+
 
 @dataclass(frozen=True)
 class PcpStaticConfig:
@@ -91,6 +120,16 @@ class PcpStaticSupportValidator:
                 "cp_kv_cache_interleave_size to be a multiple of 128, "
                 f"got {config.interleave_size}."
             )
+        if config.enabled and vllm_config.model_config is not None:
+            validate_pooled_qwen_gdn_pcp_interleave(
+                vllm_config.model_config.architecture,
+                config.interleave_size,
+            )
+        if envs.USE_TPU_PCP_MANAGER:
+            # TODO(weiyulin): Once we merge two PCP paths, we will validate
+            # in one place. For now, PcpManager.from_vllm_config validates the
+            # config in the workers.
+            return config
         if not config.enabled:
             return config
 
