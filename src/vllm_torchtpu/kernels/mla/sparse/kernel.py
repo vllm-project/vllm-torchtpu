@@ -933,13 +933,6 @@ def _attention_kernel(
             bkv = load_bkv(bi_sem_idx, batch_idx)
             bq = load_bq(bi_sem_idx, batch_idx)
 
-            if prev_out is not None:
-                # Artificial dependency to force MXU/VPU interleaving by limiting
-                # LLO's QK runahead
-                # We use jnp.where to prevent XLA from optimizing the dependency away.
-                # prev_out won't be inf in practice.
-                bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
-
             p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
 
             if prev_p is not None:
