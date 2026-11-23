@@ -71,7 +71,8 @@ the devices are quiet while the engine is idle. The forwards between two
 settles form a burst; the next burst starts with the prologue again.
 
 Two rules keep the launches pairing across stages: every launch runs the
-same compiled program (one buffer padded to the largest token bucket), and
+same compiled program (one buffer padded to the largest token bucket a
+device's forward runs at, a rank's local cap under context parallelism), and
 every launch is submitted to the device right away, even on a stage that
 never reads the result.
 
@@ -226,6 +227,11 @@ class PPWave:
     def _pad(
         self, carried: tuple[torch.Tensor, ...], rows: int
     ) -> tuple[torch.Tensor, ...]:
+        if rows > self.max_rows:
+            raise RuntimeError(
+                f"PP wave rank {self.rank}: forward of {rows} rows exceeds the "
+                f"hand-off buffer of {self.max_rows}"
+            )
         if rows == self.max_rows:
             return carried
         return tuple(torch.cat([t, z[rows:]]) for t, z in zip(carried, self.zeros))

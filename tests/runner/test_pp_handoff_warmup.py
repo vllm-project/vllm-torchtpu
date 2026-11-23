@@ -52,3 +52,38 @@ def test_handoff_warmup_runs_the_full_ladder_without_pcp(monkeypatch):
     runner = _runner(cap=None)
     runner._warmup_handoff_forwards()
     assert runner.ran == [512, 1024, 2048, 4096, 8192]
+
+
+def _capture_runner(monkeypatch, cap):
+    runner = _runner(cap)
+    runner._pp_wave = None
+    runner.parallel_config = SimpleNamespace(pipeline_parallel_size=2)
+    runner.max_num_tokens = 8192
+    runner.device = "cpu"
+    runner.enforce_eager = True
+    runner._pp_topk_buffer = None
+    runner._pp_intermediate_template = {}
+    runner._add_pipeline_chunk_buckets = lambda: None
+    runner._pp_intermediate_tensors = lambda *a, **k: None
+    built = []
+
+    class _Wave:
+        def __init__(self, device, max_rows, template):
+            built.append(max_rows)
+
+        def warmup(self):
+            pass
+
+    monkeypatch.setattr(tpu_runner, "PPWave", _Wave)
+    runner.capture_model()
+    return built
+
+
+def test_handoff_buffer_is_the_pcp_local_cap(monkeypatch):
+    """Each device hands off only its own rows, so the buffer stops at the
+    largest local bucket rather than the global step."""
+    assert _capture_runner(monkeypatch, cap=1100) == [2048]
+
+
+def test_handoff_buffer_is_the_full_step_without_pcp(monkeypatch):
+    assert _capture_runner(monkeypatch, cap=None) == [8192]

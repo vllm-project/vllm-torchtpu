@@ -287,6 +287,19 @@ def test_a_forward_that_drops_a_side_tensor_is_refused(monkeypatch):
         )
 
 
+def test_a_forward_larger_than_the_hand_off_buffer_is_refused(monkeypatch):
+    _, waves = _build_stages(monkeypatch, _template(False), size=3)
+    rows = MAX_ROWS * 2
+    with pytest.raises(RuntimeError, match="exceeds the hand-off buffer"):
+        waves[0].end_forward(
+            {
+                "hidden_states": torch.zeros(rows, HIDDEN),
+                "residual": torch.zeros(rows, HIDDEN),
+            },
+            rows,
+        )
+
+
 def test_summing_before_the_hand_off_keeps_the_residual_and_rounds_the_norm_input_once():  # noqa: E501
     """The next stage's first norm adds hidden states and residual in
     float32, normalizes the sum and keeps it rounded as the residual. The
