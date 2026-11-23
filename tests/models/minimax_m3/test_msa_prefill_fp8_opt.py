@@ -113,7 +113,7 @@ def test_mask_levers_are_bitwise(block_q, other, lever):
 
 
 @pytest.mark.parametrize("block_q", [16, 32])
-@pytest.mark.parametrize("lever", ["vt", "lmxu", "exp16,lmxu"])
+@pytest.mark.parametrize("lever", ["vt", "lmxu", "exp16,lmxu", "mdot", "lmxu,mdot", "msub", "lmxu,msub"])
 def test_vt_close(block_q, lever):
     args = make(64, seed=11 + block_q)
     o0, l0 = run(args, block_q, "")
@@ -123,6 +123,28 @@ def test_vt_close(block_q, lever):
     o0 = np.asarray(o0, np.float64); o1 = np.asarray(o1, np.float64)
     assert np.array_equal(np.isfinite(np.asarray(l0)), np.isfinite(np.asarray(l1)))
     assert np.sqrt(np.mean((o1 - o0) ** 2)) / np.sqrt(np.mean(o0 ** 2)) < 1e-2
+
+
+@pytest.mark.parametrize("lever", ["lmxu", "lmxu,mdot", "lmxu,msub"])
+@pytest.mark.parametrize("q_scale", [1.0, 8.0])
+def test_mdot_against_oracle(lever, q_scale):
+    """"mdot" shifts by the first page's raw max (+ headroom), not the running
+    max: still the float64 oracle within bf16 bounds, also on sharp scores
+    (queries x8: row maxima tens of log2 units above the first page's)."""
+    q, *rest = make(64, seed=23)
+    args = (q * q_scale, *rest)
+    ref_o, ref_l = oracle(*args)
+    fin = np.isfinite(ref_l)
+    o0, l0 = run(args, 32, "lmxu")
+    o1, l1 = run(args, 32, lever)
+    o1 = np.asarray(o1, np.float64); l1 = np.asarray(l1, np.float64)
+    assert np.array_equal(np.isfinite(l1), fin)
+    assert np.all(np.isfinite(o1))
+    rms = lambda a: np.sqrt(np.mean(a ** 2))
+    err0 = rms(np.asarray(o0, np.float64) - ref_o) / rms(ref_o)
+    err1 = rms(o1 - ref_o) / rms(ref_o)
+    assert err1 < max(2e-2, 2 * err0), (err0, err1)
+    assert np.max(np.abs(np.where(fin, l1 - ref_l, 0))) < 5e-2
 
 
 def test_unknown_lever_raises():
