@@ -1305,6 +1305,38 @@ class TPUModelRunner(GPUModelRunner):
         self.phase_based_profiler.finish()
         self.phase_based_profiler = None
 
+    def _maybe_autostart_phased_profiling(self, scheduler_output) -> None:
+        """DEBUG (not for merge): arm the phased profiler on one matching step.
+
+        TPU_DEBUG_PHASED_AUTOSTART="tokens,min_kv,max_kv,skip,steps" arms it on
+        the (skip+1)-th single-request step of `tokens` tokens whose computed
+        prefix is in [min_kv, max_kv], and captures `steps` steps.
+        """
+        spec = os.environ.get("TPU_DEBUG_PHASED_AUTOSTART", "")
+        if not spec or getattr(self, "_autostart_done", False):
+            return
+        tokens, min_kv, max_kv, skip, steps = (int(v) for v in spec.split(","))
+        if (
+            scheduler_output.total_num_scheduled_tokens != tokens
+            or self.input_batch.num_reqs != 1
+        ):
+            return
+        kv = int(self.input_batch.num_computed_tokens_cpu[0])
+        if not min_kv <= kv <= max_kv:
+            return
+        self._autostart_seen = getattr(self, "_autostart_seen", 0) + 1
+        if self._autostart_seen <= skip:
+            return
+        self._autostart_done = True
+        if not self.phased_profiling_dir:
+            self.phased_profiling_dir = os.path.join(
+                os.environ.get("CDK_OUTPUT_DIR", "/tmp"), "xprof"
+            )
+        logger.info("DEBUG phased profiler autostart at kv=%d tokens=%d", kv, tokens)
+        self.start_phased_profiling()
+        if self.phase_based_profiler is not None:
+            self.phase_based_profiler.num_steps_to_profile_for = steps
+
     # ----- Backend hooks overridden from GPUModelRunner -----
 
     def _init_device_properties(self) -> None:
@@ -3887,6 +3919,7 @@ class TPUModelRunner(GPUModelRunner):
                 if has_encoder_inputs:
                     synchronize_tensors()
 
+        self._maybe_autostart_phased_profiling(scheduler_output)
         # Profile the current batch composition (prefill vs decode) if phased profiling
         # is enabled.
         batch_composition_stats = None
