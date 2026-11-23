@@ -115,8 +115,25 @@ python3 scripts/vllm/benchmarking/check_regression.py \
 ```
 
 `--calibrate` writes a baseline as the median of the runs, one `--results-dir`
-per run. It exits `2` instead of writing a baseline when a run has no selected
-task or lacks an accuracy metric that another run has.
+per run:
+
+```bash
+python3 scripts/vllm/benchmarking/check_regression.py \
+  --mode eval --calibrate --task-filter <task> \
+  --results-dir <RUN1> --results-dir <RUN2> --results-dir <RUN3>
+```
+
+`--task-filter` selects the tasks that go into the baseline. It takes
+comma-separated tasks, or `all` for every task in the runs. Its default is
+`mmlu_llama`, `mmlu_llama_humanities`, `mmlu_llama_stem`,
+`mmlu_llama_social_sciences`, `mmlu_llama_other`, `mmlu_pro`,
+`humaneval_plus_tpu`, and `mbpp_plus_tpu`. Any other task, such as `mmmu_pro`,
+needs the flag.
+
+`--calibrate` exits `2` instead of writing a baseline when a run has no
+selected task or lacks an accuracy metric that another run has. A run may lack
+a standard error. The baseline then takes the median of the standard errors
+that the other runs reported.
 
 ## Accuracy Evaluation (`lm_eval`)
 

@@ -73,6 +73,18 @@ ACC_KEYS = (
     "pass_at_1,none",
 )
 
+# The tasks that eval calibration selects when --task-filter is not given.
+DEFAULT_TASK_FILTER = (
+    "mmlu_llama",
+    "mmlu_llama_humanities",
+    "mmlu_llama_stem",
+    "mmlu_llama_social_sciences",
+    "mmlu_llama_other",
+    "mmlu_pro",
+    "humaneval_plus_tpu",
+    "mbpp_plus_tpu",
+)
+
 
 def stderr_key(metric: str) -> str:
     base, sep, filter_ = metric.partition(",")
@@ -440,8 +452,9 @@ def calibrate_eval(
     """
     collected: dict[str, dict[str, list[float]]] = {}
     for d in results_dirs:
+        run = load_eval_results(d)
         selected = False
-        for task, metrics in load_eval_results(d).items():
+        for task, metrics in run.items():
             if task_filter is not None and task not in task_filter:
                 continue
             selected = True
@@ -449,7 +462,12 @@ def calibrate_eval(
             for k, v in metrics.items():
                 slot.setdefault(k, []).append(float(v))
         if not selected:
-            raise ValueError(f"no selected eval results under {d}")
+            found = ", ".join(sorted(run)) or "none"
+            raise ValueError(
+                f"no selected eval results under {d} (tasks found: {found}); "
+                "--task-filter takes comma-separated tasks or 'all' and defaults "
+                f"to {', '.join(DEFAULT_TASK_FILTER)}"
+            )
 
     missing = sorted(
         f"{task} {k}"
@@ -524,16 +542,7 @@ def main() -> int:
                     s.strip() for s in args.task_filter.split(",") if s.strip()
                 )
             else:
-                task_filter = {
-                    "mmlu_llama",
-                    "mmlu_llama_humanities",
-                    "mmlu_llama_stem",
-                    "mmlu_llama_social_sciences",
-                    "mmlu_llama_other",
-                    "mmlu_pro",
-                    "humaneval_plus_tpu",
-                    "mbpp_plus_tpu",
-                }
+                task_filter = set(DEFAULT_TASK_FILTER)
             try:
                 baseline = calibrate_eval(args.results_dir, task_filter)
             except ValueError as e:

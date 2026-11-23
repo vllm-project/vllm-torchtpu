@@ -622,6 +622,15 @@ def _run_cli(monkeypatch, *argv):
     return check_regression.main()
 
 
+# How the error for a run with no selected task ends.
+_TASK_FILTER_HINT = (
+    "--task-filter takes comma-separated tasks or 'all' and defaults to "
+    "mmlu_llama, mmlu_llama_humanities, mmlu_llama_stem, "
+    "mmlu_llama_social_sciences, mmlu_llama_other, mmlu_pro, "
+    "humaneval_plus_tpu, mbpp_plus_tpu"
+)
+
+
 def test_calibrate_eval_rejects_bad_runs(tmp_path, monkeypatch, capsys):
     good = _write_eval_run(tmp_path / "good", {"mmlu_pro": {"acc,none": 0.5}})
     other = _write_eval_run(tmp_path / "other", {"mbpp": {"acc,none": 0.5}})
@@ -641,7 +650,11 @@ def test_calibrate_eval_rejects_bad_runs(tmp_path, monkeypatch, capsys):
 
     argv = ["--mode", "eval", "--calibrate", "--task-filter", "all"]
     for bad, error in (
-        (empty, f"ERROR: no selected eval results under {empty}\n"),
+        (
+            empty,
+            f"ERROR: no selected eval results under {empty} (tasks found: none); "
+            f"{_TASK_FILTER_HINT}\n",
+        ),
         (both, "ERROR: not in every run: mbpp acc,none\n"),
     ):
         ret = _run_cli(
@@ -652,26 +665,66 @@ def test_calibrate_eval_rejects_bad_runs(tmp_path, monkeypatch, capsys):
         assert (captured.out, captured.err) == ("", error)
 
 
-def test_cli_calibrate_eval_writes_median_of_selected_tasks(
+def test_cli_calibrate_eval_names_task_filter_when_no_task_is_selected(
     tmp_path, monkeypatch, capsys
 ):
-    # `extra` is in the first run only; the task filter removes it before the
-    # runs are compared, so it does not count as a metric lost by a run. The
-    # asymmetric values separate the median (0.5) from the mean (0.6).
-    runs = [
-        _write_eval_run(tmp_path / f"run{i}", results)
-        for i, results in enumerate(
+    # Without --task-filter the default list selects mmlu_pro in the first run
+    # and leaves out mmmu_pro, the only task of the second.
+    good = _write_eval_run(tmp_path / "good", {"mmlu_pro": {"acc,none": 0.5}})
+    mmmu = _write_eval_run(tmp_path / "mmmu", {"mmmu_pro": {"acc,none": 0.5}})
+    argv = ["--mode", "eval", "--calibrate"]
+    ret = _run_cli(
+        monkeypatch, *argv, "--results-dir", str(good), "--results-dir", str(mmmu)
+    )
+    assert ret == 2
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == (
+        "",
+        f"ERROR: no selected eval results under {mmmu} (tasks found: mmmu_pro); "
+        f"{_TASK_FILTER_HINT}\n",
+    )
+
+
+@pytest.mark.parametrize(
+    ("run_results", "expected_baseline"),
+    [
+        # `extra` is in the first run only; the task filter removes it before
+        # the runs are compared, so it does not count as a metric lost by a
+        # run. The asymmetric values separate the median (0.5) from the mean
+        # (0.6).
+        pytest.param(
             (
                 {"mmlu_pro": {"acc,none": 0.5}, "extra": {"acc,none": 0.1}},
                 {"mmlu_pro": {"acc,none": 0.5}},
                 {"mmlu_pro": {"acc,none": 0.8}},
-            )
-        )
+            ),
+            {"mmlu_pro": {"acc,none": 0.5}},
+            id="filtered_task_in_one_run",
+        ),
+        # The second run lacks only the stderr. It still calibrates, and the
+        # baseline takes the median of the stderrs the other two reported.
+        pytest.param(
+            (
+                {"mmlu_pro": {"acc,none": 0.5, "acc_stderr,none": 0.02}},
+                {"mmlu_pro": {"acc,none": 0.6}},
+                {"mmlu_pro": {"acc,none": 0.9, "acc_stderr,none": 0.04}},
+            ),
+            {"mmlu_pro": {"acc,none": 0.6, "acc_stderr,none": 0.03}},
+            id="stderr_missing_from_one_run",
+        ),
+    ],
+)
+def test_cli_calibrate_eval_writes_median_of_selected_tasks(
+    tmp_path, monkeypatch, capsys, run_results, expected_baseline
+):
+    runs = [
+        _write_eval_run(tmp_path / f"run{i}", results)
+        for i, results in enumerate(run_results)
     ]
     argv = ["--mode", "eval", "--calibrate", "--task-filter", "mmlu_pro"]
     for run in runs:
         argv += ["--results-dir", str(run)]
     assert _run_cli(monkeypatch, *argv) == 0
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {"mmlu_pro": {"acc,none": 0.5}}
+    assert json.loads(captured.out) == expected_baseline
     assert captured.err == ""
