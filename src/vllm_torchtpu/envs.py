@@ -433,6 +433,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_METADATA_BUILD: bool = False
     VLLM_TPU_STEADY_DECODE_METADATA: bool = False
     VLLM_TPU_ATTN_METADATA_REUSE: bool = False
+    VLLM_TPU_FORWARD_CTX_PREBUILT: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
     VLLM_TPU_MK_WHOLE_DIRECT_EXEC: bool = False
     VLLM_TPU_ENVS_FREEZE: bool = False
@@ -2761,6 +2762,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # attention_metadata._steady_stage_fast_path and
     # tpu_runner._build_attention_metadata_staged.
     "VLLM_TPU_ATTN_METADATA_REUSE": env_bool("VLLM_TPU_ATTN_METADATA_REUSE"),
+    # The main forward's contexts without the per-step context-manager stack:
+    # when no trace annotation, stage timing, DP metadata or batch-size
+    # tracking would act, set vLLM's forward context and the model wrapper
+    # context directly (a fresh ForwardContext from vLLM's own
+    # create_forward_context and a fresh VllmModelWrapperContext each step,
+    # as before) and restore both on exit. Falls back to the original
+    # `with` stack whenever any of those is live or vLLM's
+    # set_forward_context is not the version this replicates
+    # (tpu_runner._prebuilt_forward_scope).
+    "VLLM_TPU_FORWARD_CTX_PREBUILT": env_bool("VLLM_TPU_FORWARD_CTX_PREBUILT"),
     # Freshly AOT-compiled models skip the per-call Dynamo guard check when
     # vLLM does not evaluate guards (as it already does for cached artifacts).
     "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),
