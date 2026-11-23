@@ -76,12 +76,16 @@ def _qdq(x: jax.Array) -> jax.Array:
 
 
 def _body(n: int, max_bytes: int, axis: str, qdq_min_rows: int = 0,
-          qar_min_rows: int = 0, qar_tab: np.ndarray | None = None):
+          qar_min_rows: int = 0, qar_tab: np.ndarray | None = None,
+          qar_v3_min_rows: int = 0):
     def body(x, rank):
         rows, hidden = x.shape
         # Static per bucket: decided at trace time inside the op.
         if qar_tab is not None and 0 < qar_min_rows <= rows:
             return qar.all_reduce_v2(x, rank, qar_tab)
+        if (qar_tab is not None and 0 < qar_v3_min_rows <= rows
+                and qar.padded_rows(rows) <= 256):
+            return qar.all_reduce_v3(x, rank, qar_tab)
         qdq = 0 < qdq_min_rows <= rows
         if qdq:
             x = _qdq(x)
@@ -103,12 +107,15 @@ def _qdq_min_rows() -> int:
     return max(1, envs.TPU_TP_AR_QDQ_MIN_TOKENS)
 
 
-def _make_op(mesh, max_bytes: int, qdq_min_rows: int = 0, qar_min_rows: int = 0):
+def _make_op(mesh, max_bytes: int, qdq_min_rows: int = 0, qar_min_rows: int = 0,
+             qar_v3_min_rows: int = 0):
     axis = mesh.axis_names[0]
-    qar_tab = qar.layout_table(list(mesh.devices.flat)) if qar_min_rows else None
+    qar_tab = (qar.layout_table(list(mesh.devices.flat))
+               if (qar_min_rows or qar_v3_min_rows) else None)
     specs = (P(axis), P(axis))
     sharded = jax.shard_map(
-        _body(int(mesh.size), max_bytes, axis, qdq_min_rows, qar_min_rows, qar_tab),
+        _body(int(mesh.size), max_bytes, axis, qdq_min_rows, qar_min_rows, qar_tab,
+              qar_v3_min_rows),
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
@@ -128,7 +135,8 @@ def _make_op(mesh, max_bytes: int, qdq_min_rows: int = 0, qar_min_rows: int = 0)
     op = pallas.jax_op(
         "pallas::tp_all_reduce"
         + ("_qdq" if qdq_min_rows else "")
-        + ("_qar" if qar_min_rows else ""),
+        + ("_qar" if qar_min_rows else "")
+        + ("_qar3" if qar_v3_min_rows else ""),
         fn,
         mesh=mesh,
         input_partition_specs=specs,
@@ -244,15 +252,19 @@ def arm(hidden: int, device: torch.device) -> bool:
             f"tp_all_reduce: self-test failed (rows per rank): {failures}"
         )
     qar_min_rows = envs.TPU_TP_QAR_MIN_TOKENS
-    if qar_min_rows > 0:
-        op = _make_op(mesh, max_bytes, _qdq_min_rows(), qar_min_rows)
-        seen = _gather(_qar_selftest(op, rank, n, hidden, device, qar_min_rows))
-        if len({r["digest"] for r in seen}) != 1 or max(r["rel"] for r in seen) >= 0.03:
-            raise RuntimeError(f"qar_all_reduce: self-test failed: {seen}")
+    qar_v3_min_rows = envs.TPU_TP_QAR_V3_MIN_TOKENS
+    if qar_min_rows > 0 or qar_v3_min_rows > 0:
+        op = _make_op(mesh, max_bytes, _qdq_min_rows(), qar_min_rows, qar_v3_min_rows)
+        for test_rows in sorted({r for r in (qar_min_rows, qar_v3_min_rows) if r > 0}):
+            seen = _gather(_qar_selftest(op, rank, n, hidden, device, test_rows))
+            if len({r["digest"] for r in seen}) != 1 or max(r["rel"] for r in seen) >= 0.03:
+                raise RuntimeError(f"qar_all_reduce: self-test failed at {test_rows} rows: {seen}")
         logger.info(
             "tp_all_reduce: qar_all_reduce (int8 ICI payload) on all-reduces of >= %d"
-            " rows (TPU_TP_QAR_MIN_TOKENS); self-test passed",
+            " rows (TPU_TP_QAR_MIN_TOKENS), v3 on %d..256 rows (TPU_TP_QAR_V3_MIN_TOKENS);"
+            " self-test passed",
             qar_min_rows,
+            qar_v3_min_rows,
         )
     qdq_min_rows = _qdq_min_rows()
     if qdq_min_rows and qar_min_rows <= 0:

@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     TPU_TP_AR_QDQ_ROWS: int = 0
     TPU_TP_QAR_MIN_TOKENS: int = 0
+    TPU_TP_QAR_V3_MIN_TOKENS: int = 0
     TPU_TP_AR_QDQ_MIN_TOKENS: int = 0
     TPU_MOE_TC_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -835,6 +836,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MAX_BYTES > 0) on a tpu7x 2x2x1 TP8 group. Changes numerics (~0.9% rel
     # L2 per all-reduce). 0 = off.
     "TPU_TP_QAR_MIN_TOKENS": env_int("TPU_TP_QAR_MIN_TOKENS", 0),
+    # All-reduces of TPU_TP_QAR_V3_MIN_TOKENS..256 rows (and below
+    # TPU_TP_QAR_MIN_TOKENS) run qar_all_reduce v3: the same int8 payload with a
+    # one-shot scatter in VMEM (~36 us flat up to 256 rows; XLA's all-reduce
+    # is faster below ~160 rows). 0 = off.
+    "TPU_TP_QAR_V3_MIN_TOKENS": env_int("TPU_TP_QAR_V3_MIN_TOKENS", 0),
     "TPU_TP_AR_QDQ_MIN_TOKENS": env_int("TPU_TP_AR_QDQ_MIN_TOKENS", 0),
     # Expert-parallel MoE combine of large batches on the TensorCore
     # (kernels/megablox/tc_combine.py) instead of the SparseCore
