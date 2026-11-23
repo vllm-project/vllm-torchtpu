@@ -1048,6 +1048,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "uniform_q_len",
+        "scheduling_group_slot",
     ),
 )
 def streamindex_topk(
@@ -1077,6 +1078,7 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     uniform_q_len: int | None = None,
+    scheduling_group_slot: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1142,6 +1144,18 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+      scheduling_group_slot: index of this call among the calls that share
+        one compiled program, usually the model layer index. Chunk pipelining
+        needs `num_chunks - 1` XLA scheduling group ids, which must be unique
+        within the program. This function is a `jax.jit`, so every layer that
+        calls it with the same static arguments reuses one trace, and ids
+        reserved at trace time would be the same in every layer. XLA then
+        refuses the program ("annotation groups with gaps"), because layer
+        L + 1's scoring depends on layer L's group through unannotated ops. The
+        slot gives each layer the ids `1 + slot * (num_chunks - 1)` onward; for
+        example 16 chunks in layer 3 use ids 46..60. None keeps the old
+        process-wide counter, which is correct only when one program traces
+        this function once.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1531,7 +1545,9 @@ def streamindex_topk(
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
         group_base = 0
-        if num_chunks > 1:
+        if num_chunks > 1 and scheduling_group_slot is not None:
+            group_base = 1 + scheduling_group_slot * (num_chunks - 1)
+        elif num_chunks > 1:
             group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
 
         chunk_starts = (
@@ -1652,6 +1668,7 @@ def streamindex_topk(
         "chunk_tokens",
         "dcp_axis_name",
         "a2a_merge",
+        "scheduling_group_slot",
     ),
 )
 def streamindex_topk_dcp(
@@ -1677,6 +1694,7 @@ def streamindex_topk_dcp(
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
     a2a_merge: bool = False,
+    scheduling_group_slot: int | None = None,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1745,6 +1763,7 @@ def streamindex_topk_dcp(
       dcp_axis_name: name of the DCP mesh axis.
       a2a_merge: merge over the token axis with an `all_to_all` instead of over
         the candidate axis with an `all_gather`; see above. Same result.
+      scheduling_group_slot: forwarded to `streamindex_topk`; see there.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1808,6 +1827,7 @@ def streamindex_topk_dcp(
             cp_rank=dcp_rank,
             interleave_size=interleave_size,
             return_scores=True,
+            scheduling_group_slot=scheduling_group_slot,
         )
 
         if a2a_merge:

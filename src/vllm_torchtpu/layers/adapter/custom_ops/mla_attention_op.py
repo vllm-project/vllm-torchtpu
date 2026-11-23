@@ -409,6 +409,25 @@ def _cp_scatter_indexer_k(
     )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
 
 
+def _scheduling_group_slot(prefix: str) -> int | None:
+    """The layer index in `prefix`, used to keep chunk-pipeline group ids unique.
+
+    `streamindex_topk` is a `jax.jit`, so every indexer layer reuses one trace.
+    Its XLA scheduling group ids must still differ between layers of one
+    compiled program; see `streamindex_topk`'s `scheduling_group_slot`.
+
+    Args:
+      prefix: the indexer K-cache module name, e.g.
+        "model.layers.3.self_attn.indexer.k_cache".
+
+    Returns:
+      The layer index (3 in the example), or None if the name holds no single
+      integer, in which case the kernel falls back to its process-wide counter.
+    """
+    ints = [int(part) for part in prefix.split(".") if part.isdigit()]
+    return ints[0] if len(ints) == 1 else None
+
+
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
     def __init__(self, *args, **kwargs):
@@ -444,6 +463,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        group_slot = _scheduling_group_slot(self.k_cache.prefix)
         small_bucket = (
             envs.TPU_STREAMIDX_SMALL_BUCKET_BQ,
             envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,
@@ -526,6 +546,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
+                scheduling_group_slot=group_slot,
             )
             return cache_kv, topk_indices
 
@@ -560,6 +581,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Chunking cuts the replicated query-token axis, which is orthogonal to
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        group_slot = _scheduling_group_slot(self.k_cache.prefix)
         a2a_merge = envs.TPU_DCP_INDEXER_A2A_MERGE
         a2a_min_tokens = envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS
         small_bucket = (
@@ -626,6 +648,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 a2a_merge=_dcp_indexer_a2a_for_bucket(
                     q.shape[0], a2a_merge, a2a_min_tokens
                 ),
+                scheduling_group_slot=group_slot,
             )
             return cache_kv, local_topk
 
