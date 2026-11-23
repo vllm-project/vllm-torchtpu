@@ -47,6 +47,7 @@ from vllm.distributed.kv_transfer import (
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats,
 )
+import vllm.forward_context as _vllm_forward_context
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -148,7 +149,9 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.parallel_requirements import requires_dp_collectives
+from vllm_torchtpu.models.vllm import vllm_model_wrapper_context as _wrapper_ctx
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    VllmModelWrapperContext,
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
@@ -290,6 +293,65 @@ class _AttentionMetadataReuse:
             layer_groups=tuple(layer_groups),
             appended=tuple(appended),
         )
+
+
+# VLLM_TPU_FORWARD_CTX_PREBUILT: sha256 prefixes of the vLLM sources
+# `_PrebuiltForwardScope` stands in for (vLLM v0.31.0 and v0.32.0 have the
+# same forward_context.py). Any other source keeps the original `with` stack.
+_FORWARD_CTX_SOURCE_SHA = {
+    "set_forward_context": "70c3bad7ccba8e9b",
+    "override_forward_context": "96a30187fd05b912",
+}
+
+
+def _forward_ctx_source_matches() -> bool:
+    import hashlib
+
+    for name, want in _FORWARD_CTX_SOURCE_SHA.items():
+        fn = getattr(_vllm_forward_context, name, None)
+        fn = getattr(fn, "__wrapped__", None)
+        try:
+            src = inspect.getsource(fn)
+        except (OSError, TypeError):
+            return False
+        if hashlib.sha256(src.encode()).hexdigest()[:16] != want:
+            return False
+    return True
+
+
+class _PrebuiltForwardScope:
+    """VLLM_TPU_FORWARD_CTX_PREBUILT: the main forward's
+    `set_forward_context` + `set_vllm_model_wrapper_context` pair as one
+    plain context manager, for steps where the rest of the original stack
+    (TraceAnnotation, stage timing) would do nothing.
+
+    `set_forward_context` with no DP metadata, no batch-size tracking and the
+    default cudagraph / ubatch / slot-mapping arguments is: ask the platform
+    for its additional kwargs, `create_forward_context(...)`, then
+    `override_forward_context` swaps vLLM's module global in and back out.
+    `set_vllm_model_wrapper_context` swaps its module global the same way.
+    The contexts have the same fields as the stack's, so the forward sees
+    equal contexts; exit restores both globals in the original order
+    (wrapper first), also when the forward raises.
+    """
+
+    __slots__ = ("_fc", "_wrapper", "_prev_fc", "_prev_wrapper")
+
+    def __init__(self, fc, wrapper) -> None:
+        self._fc = fc
+        self._wrapper = wrapper
+
+    def __enter__(self):
+        self._prev_fc = _vllm_forward_context._forward_context
+        _vllm_forward_context._forward_context = self._fc
+        self._prev_wrapper = _wrapper_ctx._vllm_model_wrapper_context
+        _wrapper_ctx._vllm_model_wrapper_context = self._wrapper
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        _wrapper_ctx._vllm_model_wrapper_context = self._prev_wrapper
+        _vllm_forward_context._forward_context = self._prev_fc
+        return False
 
 
 @dataclass
@@ -6258,41 +6320,32 @@ class TPUModelRunner(GPUModelRunner):
             if seed_late:
                 self._stage_seed_copies_late(scheduler_output, start_index, num_reqs)
                 host_phases.mark("seed_copies_late")
-            trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
-            if "min_kv_len" in trace_kwargs:
-                trace_name += (
-                    f", kv_len min={trace_kwargs['min_kv_len']} "
-                    f"avg={trace_kwargs['avg_kv_len']} "
-                    f"max={trace_kwargs['max_kv_len']}"
+            prebuilt_scope = (
+                self._prebuilt_forward_scope(
+                    attn_metadata, num_tokens_padded, trace_kwargs
                 )
-
-            with (
-                TraceAnnotation(
-                    name=trace_name,
-                    num_reqs=num_reqs,
-                    **trace_kwargs,
-                ),
-                set_forward_context(
+                if envs.VLLM_TPU_FORWARD_CTX_PREBUILT
+                else None
+            )
+            if prebuilt_scope is not None:
+                with prebuilt_scope:
+                    hidden_states, aux_hidden_states = self.forward_model(
+                        input_ids=input_ids,
+                        positions=self.position_ids,
+                        inputs_embeds=inputs_embeds,
+                        intermediate_tensors=intermediate_tensors,
+                        model_kwargs=model_kwargs,
+                    )
+            else:
+                hidden_states, aux_hidden_states = self._forward_in_contexts(
                     attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_tokens_padded,
-                    num_tokens_across_dp=self._dp_num_tokens_across_dp(
-                        num_tokens_padded
-                    ),
-                ),
-                set_vllm_model_wrapper_context(
-                    mesh=self.mesh,
-                    vllm_config=self.vllm_config,
-                    kv_cache_bundle=self._kv_cache_bundle,
-                ),
-                self._stage_timing.stage("main_forward"),
-            ):
-                hidden_states, aux_hidden_states = self.forward_model(
-                    input_ids=input_ids,
-                    positions=self.position_ids,
-                    inputs_embeds=inputs_embeds,
-                    intermediate_tensors=intermediate_tensors,
-                    model_kwargs=model_kwargs,
+                    num_reqs,
+                    num_tokens_padded,
+                    trace_kwargs,
+                    input_ids,
+                    inputs_embeds,
+                    intermediate_tensors,
+                    model_kwargs,
                 )
             host_phases.mark("forward_dispatch")
             if pending_extract is not None:
@@ -10881,6 +10934,157 @@ class TPUModelRunner(GPUModelRunner):
             # Padding-mask support is currently limited to the ALL layout.
             num_valid_tokens = num_tokens_padded
         padding_state.update(num_valid_tokens, num_tokens_padded)
+
+    def _forward_in_contexts(
+        self,
+        attn_metadata,
+        num_reqs: int,
+        num_tokens_padded: int,
+        trace_kwargs: dict[str, Any],
+        input_ids,
+        inputs_embeds,
+        intermediate_tensors,
+        model_kwargs,
+    ):
+        """The main forward inside its trace annotation, vLLM forward
+        context, model wrapper context and stage timing."""
+        trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
+        if "min_kv_len" in trace_kwargs:
+            trace_name += (
+                f", kv_len min={trace_kwargs['min_kv_len']} "
+                f"avg={trace_kwargs['avg_kv_len']} "
+                f"max={trace_kwargs['max_kv_len']}"
+            )
+
+        with (
+            TraceAnnotation(
+                name=trace_name,
+                num_reqs=num_reqs,
+                **trace_kwargs,
+            ),
+            set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens_padded,
+                num_tokens_across_dp=self._dp_num_tokens_across_dp(
+                    num_tokens_padded
+                ),
+            ),
+            set_vllm_model_wrapper_context(
+                mesh=self.mesh,
+                vllm_config=self.vllm_config,
+                kv_cache_bundle=self._kv_cache_bundle,
+            ),
+            self._stage_timing.stage("main_forward"),
+        ):
+            return self.forward_model(
+                input_ids=input_ids,
+                positions=self.position_ids,
+                inputs_embeds=inputs_embeds,
+                intermediate_tensors=intermediate_tensors,
+                model_kwargs=model_kwargs,
+            )
+
+    def _forward_scope_static_ok(self) -> bool:
+        """VLLM_TPU_FORWARD_CTX_PREBUILT: the per-run half of the check, once:
+        vLLM's set_forward_context is the source `_PrebuiltForwardScope`
+        replicates, and this configuration never builds DP metadata (no DP,
+        no sequence-parallel MoE, so `set_forward_context` skips that branch,
+        and `_dp_num_tokens_across_dp` is None)."""
+        ok = self.__dict__.get("_forward_scope_ok")
+        if ok is None:
+            pc = self.vllm_config.parallel_config
+            builds_dp_metadata = (
+                pc.data_parallel_size > 1
+                or getattr(pc, "use_sequence_parallel_moe", False)
+            ) and getattr(pc, "is_moe_model", None) is not False
+            reason = None
+            if not _forward_ctx_source_matches():
+                reason = "vLLM set_forward_context differs from the replicated one"
+            elif builds_dp_metadata or self._dp_lockstep_enabled():
+                reason = "DP metadata is built per forward"
+            ok = self._forward_scope_ok = reason is None
+            logger.info(
+                "FORWARD_CTX_PREBUILT: %s",
+                "on" if ok else f"off ({reason}); the main forward keeps its "
+                "context stack",
+            )
+        return ok
+
+    def _prebuilt_forward_scope(
+        self, attn_metadata, num_tokens_padded: int, trace_kwargs: dict
+    ) -> "_PrebuiltForwardScope | None":
+        """VLLM_TPU_FORWARD_CTX_PREBUILT: the scope that stands in for
+        `_forward_in_contexts`' stack this step, or None to run the stack.
+
+        Exact only when each dropped piece would have done nothing: the trace
+        annotation records only while a profiler is on (its name and kwargs
+        are unused otherwise), stage timing does nothing without a sink
+        (`_has_sink` is called here as `stage()` would call it, keeping its
+        side effect), batch-size tracking is off, and the runner's context
+        functions are the ones `_PrebuiltForwardScope` replicates (not
+        patched). The ForwardContext is a new object every step, built from
+        the same arguments by vLLM's own create_forward_context, because the
+        forward writes into it (e.g. vLLM's MoE layer index) and its
+        attn_metadata changes every step. The VllmModelWrapperContext has the
+        same fields as the stack's but is reused while its inputs are the
+        same objects.
+        """
+        if trace_kwargs or TraceAnnotation.is_enabled():
+            return None
+        if (
+            set_forward_context is not _vllm_forward_context.set_forward_context
+            or set_vllm_model_wrapper_context
+            is not _wrapper_ctx.set_vllm_model_wrapper_context
+            or _vllm_forward_context.track_batchsize
+            or not self._forward_scope_static_ok()
+            or self._stage_timing._has_sink()
+        ):
+            return None
+        vllm_config = self.vllm_config
+        none_mode = CUDAGraphMode.NONE
+        platform = _vllm_forward_context.current_platform
+        additional_kwargs = platform.set_additional_forward_context(
+            attn_metadata=attn_metadata,
+            vllm_config=vllm_config,
+            dp_metadata=None,
+            num_tokens=num_tokens_padded,
+            num_tokens_across_dp=None,
+            cudagraph_runtime_mode=none_mode,
+            batch_descriptor=None,
+            ubatch_slices=None,
+        )
+        fc = _vllm_forward_context.create_forward_context(
+            attn_metadata,
+            vllm_config,
+            None,
+            none_mode,
+            None,
+            None,
+            None,
+            additional_kwargs,
+            False,
+            is_padding=None,
+        )
+        # The wrapper context is read-only to everything under it (nothing
+        # assigns its fields) and depends only on these three objects, so one
+        # built from the same objects is kept across steps.
+        mesh, bundle = self.mesh, self._kv_cache_bundle
+        cached = self.__dict__.get("_forward_scope_wrapper")
+        if (
+            cached is None
+            or cached.mesh is not mesh
+            or cached.vllm_config is not vllm_config
+            or cached.kv_cache_bundle is not bundle
+        ):
+            cached = self._forward_scope_wrapper = VllmModelWrapperContext(
+                kv_caches=None,
+                mesh=mesh,
+                layer_name_to_kvcache_index=None,
+                vllm_config=vllm_config,
+                kv_cache_bundle=bundle,
+            )
+        return _PrebuiltForwardScope(fc, cached)
 
     def forward_model(
         self,
