@@ -458,6 +458,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SAMPLER_CANDIDATES_ONLY: bool = False
     VLLM_TPU_SAMPLER_LOGITS_BLOCKS: int = 0
     VLLM_TPU_SAMPLER_TOPP_NARROW: bool = False
+    VLLM_TPU_DRAFT_LOOP_MAX_COMPILE_T: int = 0
     VLLM_TPU_GDN_MIXED_TILE_POW2: bool = False
     VLLM_TPU_SPEC_BOUNDARY_STATE_COPY: bool = False
     VLLM_TPU_GDN_V3_WINDOW_VERIFY: bool = False
@@ -2908,6 +2909,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of the 32-step float bisection; each step evaluates the same
     # mass sum, so the threshold and the kept set are the same.
     "VLLM_TPU_SAMPLER_TOPP_NARROW": env_bool("VLLM_TPU_SAMPLER_TOPP_NARROW"),
+    # Compile the fused MTP draft loop (VLLM_TPU_FUSED_DRAFT_LOOP) only at
+    # token buckets <= max(this, the bucket of max_num_seqs). The loop runs one
+    # row per request, so larger buckets are never executed; dropping them
+    # saves their cold compile (~7 min/rank at c32) and compile-cache bytes
+    # (~14.8 GB). Runtime programs are unchanged. 0 = off (every bucket).
+    "VLLM_TPU_DRAFT_LOOP_MAX_COMPILE_T": env_nonnegative_int(
+        "VLLM_TPU_DRAFT_LOOP_MAX_COMPILE_T", 0
+    ),
     # GDN v3 static tiling: round the mixed tile down to a power of two so a
     # 24/40-row bucket stays divisible by the triangular solve's block, and
     # assert that divisibility (PR #2821 ece3d83b5). Dynamic tiling
