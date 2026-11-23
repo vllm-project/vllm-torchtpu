@@ -432,6 +432,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_METADATA_BUILD: bool = False
     VLLM_TPU_STEADY_DECODE_METADATA: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
+    VLLM_TPU_MK_WHOLE_DIRECT_EXEC: bool = False
     VLLM_TPU_ENVS_FREEZE: bool = False
     VLLM_TPU_HOST_TOKEN_LISTS: bool = False
     VLLM_TPU_PREFILL_CKPT_DECODE_SKIP: bool = False
@@ -2744,6 +2745,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Freshly AOT-compiled models skip the per-call Dynamo guard check when
     # vLLM does not evaluate guards (as it already does for cached artifacts).
     "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),
+    # Qwen3.8 whole-step megakernel call: record each bucket's executable,
+    # operand order, input-mutation copies and outputs on its first call, then
+    # call the executable directly, skipping the decorator / AOT / split_gm /
+    # piecewise / AOTAutograd wrapper layers (compilation/direct_exec.py). Any
+    # call the record does not cover takes the normal path.
+    "VLLM_TPU_MK_WHOLE_DIRECT_EXEC": env_bool("VLLM_TPU_MK_WHOLE_DIRECT_EXEC"),
     # After warmup, each worker keeps the first value it reads of every
     # variable in this module as a module attribute (freeze_reads), so a read
     # on the step path is a dict hit instead of os.getenv plus parsing
