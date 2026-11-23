@@ -920,7 +920,7 @@ def _build_fused_ep_moe_kernel(
         w2b_vm = next(it) if has_w2_bias else None
         ls_vm = next(it) if has_act_scale else None
         out_vm = next(it)
-        oscl_vm = next(it)  # [parities, tile blocks, ROWBLK] f32
+        oscl_vm = next(it)  # [parities, mirror rows, tile_m / mirror rows] f32
         token_gather_sem0, token_gather_sem1 = (next(it) for _ in range(2))
         lhs_sems, w1_sems, w2_sems = (next(it) for _ in range(3))
         w1s_sems = next(it) if has_scales else None

@@ -603,14 +603,20 @@ def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
 
 
 @pytest.mark.parametrize(
-    "shape",
+    "shape,shared_weights",
     [
-        pytest.param(dict(SMALL), id="small"),
-        pytest.param(dict(PROD, tokens=PROD_TOKENS[0]), id="prod_t2048"),
-        pytest.param(dict(PROD, tokens=PROD_TOKENS[1]), id="prod_t16384"),
+        pytest.param(dict(SMALL), None, id="small"),
+        # The production weights are 6.4GB, so these shapes run against the
+        # module's one build of them rather than making their own.
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[0]), "production_weights", id="prod_t2048"
+        ),
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[1]), "production_weights", id="prod_t16384"
+        ),
     ],
 )
-def test_256_row_tiles_track_the_128_row_build(shape):
+def test_256_row_tiles_track_the_128_row_build(request, shape, shared_weights):
     """A taller tile changes how rows are grouped, not what each row computes.
 
     Tiles above 128 rows need the scale mirrors stored at 128 lanes
@@ -621,14 +627,17 @@ def test_256_row_tiles_track_the_128_row_build(shape):
     are checked to carry each height's kernel, so the comparison is real.
     """
     mesh = _mesh()
-    w1, w2, w1_scale, w2_scale = _make_weights(
-        mesh,
-        80,
-        hidden=shape["hidden"],
-        inter=shape["inter"],
-        e_total=shape["e_total"],
-        weight_format=WeightFormat.FP8,
-    )
+    if shared_weights is not None:
+        w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
+    else:
+        w1, w2, w1_scale, w2_scale = _make_weights(
+            mesh,
+            80,
+            hidden=shape["hidden"],
+            inter=shape["inter"],
+            e_total=shape["e_total"],
+            weight_format=WeightFormat.FP8,
+        )
     x, gating = _make_inputs(
         mesh,
         81,
