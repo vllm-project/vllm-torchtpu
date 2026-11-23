@@ -1863,13 +1863,16 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
     assert wrapper_configs == [proposer.draft_vllm_config]
 
 
-def test_replicated_draft_load_disables_ep_weight_filter(monkeypatch):
+@pytest.mark.parametrize("draft_tp, draft_filter", [(1, False), (8, True)])
+def test_replicated_draft_load_disables_ep_weight_filter(
+    monkeypatch, draft_tp, draft_filter
+):
     """A replicated draft forces tp=1 while parallel_config stays at target TP;
     loading it must turn enable_ep_weight_filter off without mutating the
-    target config."""
+    target config. A sharded draft keeps the TP group, so it keeps the filter."""
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
-    proposer = _make_proposer(draft_tp=1, target_tp=8, method="mtp")
+    proposer = _make_proposer(draft_tp=draft_tp, target_tp=8, method="mtp")
     proposer.vllm_config.parallel_config.enable_ep_weight_filter = True
     proposer.runner = SimpleNamespace(mesh=object())
     proposer.vllm_config.load_config = object()
@@ -1898,7 +1901,8 @@ def test_replicated_draft_load_disables_ep_weight_filter(monkeypatch):
 
     proposer._load_draft_model()
 
-    assert loaded["vllm_config"].parallel_config.enable_ep_weight_filter is False
+    draft_parallel_config = loaded["vllm_config"].parallel_config
+    assert draft_parallel_config.enable_ep_weight_filter is draft_filter
     assert proposer.vllm_config.parallel_config.enable_ep_weight_filter is True
 
 
