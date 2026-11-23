@@ -168,17 +168,9 @@ else
     BASE_URL="http://$HOST:$PORT"
 fi
 
-# A server this script starts serves the config's MODEL, so another name would
-# send every request to a model that is not there.
-if [ "$SERVED_MODEL_NAME_CLI_SET" = "1" ]; then
-    if [ -z "$SERVED_MODEL_NAME_CLI" ]; then
-        echo "ERROR: --served-model-name cannot be empty"
-        exit 1
-    fi
-    if [ "$START_SERVER" = "1" ]; then
-        echo "ERROR: --served-model-name needs a running server (--base-url, or --host and --port)"
-        exit 1
-    fi
+if [ "$SERVED_MODEL_NAME_CLI_SET" = "1" ] && [ -z "$SERVED_MODEL_NAME_CLI" ]; then
+    echo "ERROR: --served-model-name cannot be empty"
+    exit 1
 fi
 
 if [ "$EVAL_SUITES_CLI_SET" = "1" ] && [ -z "${EVAL_SUITES_CLI// /}" ]; then
@@ -595,6 +587,13 @@ if [ "$START_SERVER" = "1" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
     fi
 fi
 
+# A server this script starts serves the config's MODEL, so another name would
+# send every request to a model that is not there.
+if [ "$SERVED_MODEL_NAME_CLI_SET" = "1" ] && [ "$BOOT_SERVER" = "1" ]; then
+    echo "ERROR: --served-model-name needs a running server (--base-url, --host and --port, or --skip-benchmark for the one already on localhost:8000)"
+    exit 1
+fi
+
 # A spec_bench config has no server outside its own (BS, K) sweep, which starts
 # and stops one per cell, so there is none to keep for the evals. Checked here,
 # before the cleanup below kills whatever is serving.
@@ -669,6 +668,10 @@ fi
 
 # Read model name from config
 MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$RESULTS_DIR/config.json")
+if [ "$BOOT_SERVER" = "0" ] && [ "$NEEDS_LIVE_SERVER" = "1" ] && [ -z "$SERVED_MODEL" ] && [ "$MODEL" != "$CONFIG_MODEL" ]; then
+    echo "ERROR: $CONFIG_NAME sets MODEL to '$CONFIG_MODEL' when run_eval_flow.sh reads it and to '$MODEL' when run_benchmarks.sh does. $BASE_URL/v1/models was checked for the first name and the clients send the second." >&2
+    exit 1
+fi
 if [ -n "$SERVED_MODEL" ]; then
     if [ "$SERVED_MODEL" != "$MODEL" ]; then
         echo "Sending requests for served model $SERVED_MODEL (config model: $MODEL)"

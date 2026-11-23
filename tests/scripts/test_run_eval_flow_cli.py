@@ -927,6 +927,39 @@ def test_run_stops_when_the_endpoint_does_not_list_the_model_to_send(
     assert flow.argv("lm_eval") == []
 
 
+# The lookup checks the MODEL run_eval_flow.sh reads from the config, and the
+# clients send the one run_benchmarks.sh reads after setting more defaults.
+def test_run_stops_when_the_clients_would_send_a_model_the_lookup_did_not_check(
+    flow, make_gateway
+):
+    config = flow.write_config(
+        "model-from-a-default",
+        _FIXTURE_CONFIG_BODY + 'MODEL="$MODEL-${ENABLE_EP:-no-default}"\n',
+    )
+    gateway = make_gateway("", [f"{_CONFIG_MODEL}-no-default"])
+
+    proc = flow.run_unchecked(
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(gateway.port),
+        "--eval-suites",
+        "mmlu_pro",
+        "--perf-suites",
+        "none",
+        config=config,
+    )
+
+    assert proc.returncode == 1
+    assert (
+        f"ERROR: model-from-a-default sets MODEL to '{_CONFIG_MODEL}-no-default' "
+        f"when run_eval_flow.sh reads it and to '{_CONFIG_MODEL}-false' when "
+        f"run_benchmarks.sh does. {gateway.url}/v1/models was checked for the "
+        "first name and the clients send the second." in proc.stderr
+    )
+    assert flow.argv("lm_eval") == []
+
+
 def test_skip_benchmark_without_host_checks_the_model_on_localhost(flow, make_gateway):
     gateway = make_gateway("", ["another-model"])
 
@@ -940,6 +973,29 @@ def test_skip_benchmark_without_host_checks_the_model_on_localhost(flow, make_ga
         f"'{_CONFIG_MODEL}' is not a model the endpoint serves" in proc.stderr
     )
     assert flow.argv("lm_eval") == []
+
+
+def test_skip_benchmark_sends_served_model_name_to_the_server_on_localhost(
+    flow, make_gateway
+):
+    gateway = make_gateway("", ["my-served"])
+
+    flow.run(
+        "--skip-benchmark",
+        "--run-lm-eval",
+        "--port",
+        str(gateway.port),
+        "--served-model-name",
+        "my-served",
+    )
+
+    assert flow.option("lm_eval", "--model_args") == {
+        "model=my-served,"
+        f"base_url=http://localhost:{gateway.port}/v1/chat/completions,"
+        "num_concurrent=128"
+    }
+    assert flow.argv("cleanup_server") == []
+    assert flow.argv("vllm") == []
 
 
 def test_host_and_port_keep_config_model_and_host_port_flags(flow, make_gateway):
@@ -988,6 +1044,12 @@ def test_served_model_name_flag_applies_with_host(flow, make_gateway):
     assert flow.option("lm_eval", "--model_args") == {
         f"model=my-served,base_url={gateway.url}/v1/chat/completions,num_concurrent=128"
     }
+
+
+_SERVED_MODEL_NAME_NEEDS_A_RUNNING_SERVER = (
+    "ERROR: --served-model-name needs a running server (--base-url, --host and "
+    "--port, or --skip-benchmark for the one already on localhost:8000)"
+)
 
 
 @pytest.mark.parametrize(
@@ -1044,8 +1106,20 @@ def test_served_model_name_flag_applies_with_host(flow, make_gateway):
         pytest.param(
             ["--served-model-name", "my-served"],
             "stdout",
-            "ERROR: --served-model-name needs a running server",
+            _SERVED_MODEL_NAME_NEEDS_A_RUNNING_SERVER,
             id="served_model_name_with_self_started_server",
+        ),
+        pytest.param(
+            [
+                "--served-model-name",
+                "my-served",
+                "--skip-benchmark",
+                "--perf-suites",
+                "bench_serve",
+            ],
+            "stdout",
+            _SERVED_MODEL_NAME_NEEDS_A_RUNNING_SERVER,
+            id="served_model_name_with_skip_benchmark_that_still_boots",
         ),
         pytest.param(
             ["--base-url", "--eval-suites", "mmlu_pro"],
@@ -1358,6 +1432,42 @@ def test_skip_benchmark_with_perf_suites_none_uses_the_running_server(flow):
         f"base_url=http://localhost:{flow.server.port}/v1/chat/completions,"
         "num_concurrent=128"
     }
+
+
+# The other half of that rule: --perf-suites bench_serve boots a server even
+# next to --skip-benchmark. The boot is the one every run_eval_flow.sh call in
+# .buildkite/pipeline_perf.yml makes: cleanup, a server kept alive, the bench
+# cells against it, then the evals.
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param(["--run-lm-eval"], id="run_lm_eval"),
+        pytest.param(
+            ["--skip-benchmark", "--perf-suites", "bench_serve", "--run-lm-eval"],
+            id="skip_benchmark_with_perf_suites_bench_serve",
+        ),
+    ],
+)
+def test_local_boot_keeps_the_server_alive_for_bench_cells_and_evals(flow, args):
+    port = str(flow.server.port)
+
+    proc = flow.run(*args, "--port", port)
+
+    assert "Keeping vLLM server alive in background (--keep-alive)." in proc.stdout
+    assert flow.argv("vllm")[:2] == ["serve", _CONFIG_MODEL]
+    assert flow.values("vllm", "--port") == [port, port]
+    assert flow.option("vllm", "--host") == {"localhost"}
+    assert flow.values("vllm", "--result-filename") == [
+        str(flow.results_dir / "isl128_osl64_c1.json")
+    ]
+    assert flow.values("lm_eval", "--tasks") == ["mmlu_llama", "mmlu_pro"]
+    assert flow.option("lm_eval", "--model_args") == {
+        f"model={_CONFIG_MODEL},"
+        f"base_url=http://localhost:{port}/v1/chat/completions,"
+        "num_concurrent=128"
+    }
+    # Initial cleanup before booting + EXIT trap cleanup on finish.
+    assert flow.argv("cleanup_server") == ["cleanup", "cleanup"]
 
 
 def test_no_suites_selected_runs_dry_run_without_server_or_cleanup(flow):

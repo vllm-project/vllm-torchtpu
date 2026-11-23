@@ -24,7 +24,10 @@
 #   --skip-bench-cells start the server (if local) and write config.json without running bench cells
 #   --base-url URL     API root of a running server (cannot be combined with --host or --port)
 #   --served-model-name NAME
-#                      model name sent in requests to a running server
+#                      model name sent in requests to a running server. Direct
+#                      --host/--base-url runs do not query /v1/models and send
+#                      the name unchecked; use run_eval_flow.sh to validate it
+#                      against the endpoint's model list first.
 #
 # Examples:
 #   ./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3-0.6b-smoke
