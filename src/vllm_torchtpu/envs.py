@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTE_TRACE_EVERY: int = 8192
     VLLM_TPU_MOE_REDUNDANT_EXPERTS: int = 0
     TPU_MOE_REPLICA_ASSIGN_REFINE: int = 0
+    TPU_MOE_REPLICA_ASSIGN_FAST: bool = False
     TPU_MOE_NVFP4_SKIP_PADDED: bool = False
     TPU_MINIMAX_M3_INDEXER_DECODE_OPT: str = ""
     TPU_MOE_SKIP_PADDED_MIN_ROUTES: int = 0
@@ -965,6 +966,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_REPLICA_ASSIGN_REFINE": env_nonnegative_int(
         "TPU_MOE_REPLICA_ASSIGN_REFINE", 0
     ),
+    # With redundant experts: the same copy assignment from a leaner kernel
+    # (copy table flattened with each copy's rank at load, no per-step init
+    # input or table reshape, branch-free scalar loops). Same output.
+    "TPU_MOE_REPLICA_ASSIGN_FAST": env_bool("TPU_MOE_REPLICA_ASSIGN_FAST"),
     # Which experts get the redundant slots: a JSON file path, inline JSON
     # ('{"L3": [17, ...]}', hottest first), or "builtin:<name>". Empty = the
     # built-in round-robin fill. Placement reaches the compiled graph as
