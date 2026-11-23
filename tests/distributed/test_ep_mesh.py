@@ -28,6 +28,8 @@ from vllm_torchtpu.distributed import ep_mesh as ep
 def mesh_cache(monkeypatch):
     monkeypatch.setattr(ep, "_MESH_CACHE", {})
     monkeypatch.setattr(ep, "_TOKEN_GROUP_CACHE", {})
+    monkeypatch.setattr(ep, "_GATHERED_DEVICE_IDS", {})
+    monkeypatch.setattr(ep, "_PLACEMENT_KEY_READ", False)
     monkeypatch.setattr(ep, "get_pcp_world_size", lambda: 1)
     monkeypatch.setattr(ep, "get_dcp_world_size", lambda: 1)
 
@@ -63,6 +65,7 @@ def test_disabled_ep_helpers(monkeypatch):
     assert ep.ep_rank_order() is None
     assert ep.ep_mesh_index() is None
     assert ep.build_ep_mesh() is None
+    assert ep.ep_placement_cache_key() == ()
 
 
 @pytest.fixture
@@ -85,6 +88,27 @@ def test_ep_rank_mapping_and_mesh_index(monkeypatch, group):
     # Devices 10, 20, 30, 40 belong to EP ranks 2, 1, 3, 0.
     assert ep.ep_rank_order() == (2, 1, 3, 0)
     assert ep.ep_mesh_index() == 0
+
+
+def test_placement_cache_key_holds_the_gathered_device_ids(monkeypatch, group):
+    monkeypatch.setattr(
+        ep, "_collect_rank_to_device_id", lambda *a: {2: 40, 4: 20, 6: 10, 8: 30}
+    )
+    ep.ep_device_ids()
+    assert ep.ep_placement_cache_key() == (((2, 4, 6, 8), (40, 20, 10, 30)),)
+
+
+def test_placement_gathered_after_the_key_raises(monkeypatch, group):
+    """Gathering the same placement again is fine; a new one would be missing
+    from a compile cache key already in use."""
+    placement = {2: 40, 4: 20, 6: 10, 8: 30}
+    monkeypatch.setattr(ep, "_collect_rank_to_device_id", lambda *a: placement)
+    ep.ep_device_ids()
+    ep.ep_placement_cache_key()
+    assert ep.ep_device_ids() == (40, 20, 10, 30)
+    placement = {2: 10, 4: 20, 6: 30, 8: 40}
+    with pytest.raises(RuntimeError, match="after the compile cache key"):
+        ep.ep_device_ids()
 
 
 @_RANK_ORDERED_CP

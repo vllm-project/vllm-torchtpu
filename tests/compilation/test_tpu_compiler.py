@@ -203,6 +203,33 @@ class TestTpuCompilerCache:
 
         assert first_pod == second_pod
 
+    def test_tpu_hash_covers_the_ep_placement(self):
+        """A fused EP MoE program has the EP placement compiled in, so a start
+        whose EP ranks sit on other devices must not load it."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+        from vllm_torchtpu.distributed import ep_mesh
+
+        ranks = tuple(range(16))
+        # Two 8-chip hosts; local ranks 0-7 sit on devices 0, 1, 4, 5, 6, 7, 2, 3.
+        host = (0, 1, 4, 5, 6, 7, 2, 3)
+        upper = tuple(d + 8 for d in host)
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            with patch.dict(
+                ep_mesh._GATHERED_DEVICE_IDS, {ranks: host + upper}, clear=True
+            ):
+                first = compute_tpu_compilation_hash(self._config())
+                first_again = compute_tpu_compilation_hash(self._config())
+            with patch.dict(
+                ep_mesh._GATHERED_DEVICE_IDS, {ranks: upper + host}, clear=True
+            ):
+                hosts_swapped = compute_tpu_compilation_hash(self._config())
+
+        assert first == first_again
+        assert first != hosts_swapped
+
     def test_tpu_hash_covers_native_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 
