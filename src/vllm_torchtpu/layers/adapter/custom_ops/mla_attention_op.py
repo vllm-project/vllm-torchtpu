@@ -73,6 +73,7 @@ from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core import turboquant
 from vllm_torchtpu.layers.core.attention_interface import (
+    _tq_pack_sparse_mla_latent,
     sparse_mla_cache_partition_spec,
     sparse_mla_write_kv_shard,
 )
@@ -1604,6 +1605,7 @@ def mla_kv_write_caches(
     kv_cache_mode: str | None,
     dcp_size: int = 1,
     interleave_size: int = 1,
+    tq_tables: turboquant.TQTables | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Write one step's MLA latents and indexer-K rows, without the attention.
 
@@ -1616,11 +1618,19 @@ def mla_kv_write_caches(
     indexer's top-k op runs (`indexer_k_append`, or `_cp_scatter_indexer_k`
     under DCP), with the same writer / layout resolution for
     `kv_cache_mode`.
+
+    With `tq_tables` (a TurboQuant cache), `kv_c` is the unquantized latent
+    and `k_pe` the fp8 RoPE row, and both are packed as `sparse_mla_attention`
+    packs them before its write. TurboQuant has no DCP path.
     """
+    if tq_tables is not None and dcp_size > 1:
+        raise NotImplementedError("MLA KV write: TurboQuant caches have no DCP path")
     nope_spec, rope_spec = mla_kv_spec
     cache_spec = sparse_mla_cache_partition_spec(dcp_size)
 
     def _local(nope_, rope_, kv_c_, k_pe_, sl_, bt_, qsl_):
+        if tq_tables is not None:
+            kv_c_, k_pe_ = _tq_pack_sparse_mla_latent(kv_c_, k_pe_, tq_tables)
         return sparse_mla_write_kv_shard(
             nope_,
             rope_,
@@ -1730,6 +1740,19 @@ class MlaKvWriteOp:
                 f"{dcp_size} vs {indexer_op.dcp_size}"
             )
         self.dcp_size = dcp_size
+        # A TurboQuant cache stores packed 4-bit latents; pack them as the
+        # full pass does. The TurboQuant config check refuses DCP.
+        tq_tables = None
+        if impl._is_turboquant(mla_layer):
+            if dcp_size > 1:
+                raise NotImplementedError(
+                    "MLA KV write: TurboQuant caches have no DCP path"
+                )
+            tq_tables = turboquant.make_mla_latent_tables()
+        self.tq_tables = tq_tables
+        # Only a TurboQuant write takes the tables; other writes call the
+        # helper exactly as before.
+        tq_kwargs = {} if tq_tables is None else {"tq_tables": tq_tables}
         # The indexer op's own mode, so both writers of its cache agree.
         kv_cache_mode = indexer_op.kv_cache_mode
         interleave_size = 1
@@ -1775,6 +1798,7 @@ class MlaKvWriteOp:
                 kv_cache_mode=kv_cache_mode,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
+                **tq_kwargs,
             )
 
         def _fake(nope, rope, idx_cache, *rest):

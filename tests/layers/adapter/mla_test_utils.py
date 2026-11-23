@@ -229,11 +229,15 @@ TPU_PREFIX = 320  # request 0's tokens cached before the step
 TPU_TOKENS = TPU_PREFIX  # the largest chunk (the prefix)
 
 
-def build_tpu_sparse_mla(mla_name: str, idx_name: str) -> SimpleNamespace:
+def build_tpu_sparse_mla(
+    mla_name: str, idx_name: str, cache_dtype: str = "fp8"
+) -> SimpleNamespace:
     """A synthetic sparse MLA layer on one TPU chip: the real wrapper, indexer,
     indexer op (streamidx top-k + K write), MLA layer and backend impl
-    (sparse MLA + latent write), with stand-in projections and fp8 caches in
-    the default layouts, under the writers' default modes.
+    (sparse MLA + latent write), with stand-in projections and fp8 caches
+    (or, with `cache_dtype="turboquant_4bit_nc"`, TurboQuant caches; the
+    caller sets the active TurboQuant preset) in the default layouts, under
+    the writers' default modes.
 
     Ops register under names derived from `mla_name` and `idx_name`, so each
     build in one process needs its own pair."""
@@ -280,6 +284,10 @@ def build_tpu_sparse_mla(mla_name: str, idx_name: str) -> SimpleNamespace:
     layer.v_head_dim = V_DIM
     layer.scale = QK**-0.5
     layer.kv_cache_quantized_dtype = torch.float8_e4m3fn
+    if cache_dtype != "fp8":
+        # A TurboQuant layer: its quantized dtype is the uint8 code storage.
+        layer.kv_cache_dtype = cache_dtype
+        layer.kv_cache_quantized_dtype = torch.uint8
     layer._k_scale_float = 1.0
     layer.W_UK_T = (
         (torch.randn(TPU_HEADS, NOPE, KV_LORA, generator=gen) / math.sqrt(NOPE))
@@ -292,7 +300,7 @@ def build_tpu_sparse_mla(mla_name: str, idx_name: str) -> SimpleNamespace:
         .to(dev)
     )
     specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
-        TPU_PAGES, TPU_PAGE, KV_LORA + ROPE, "fp8"
+        TPU_PAGES, TPU_PAGE, KV_LORA + ROPE, cache_dtype
     )
     layer.mla_kv_spec = specs
     layer.kv_cache = tuple(
