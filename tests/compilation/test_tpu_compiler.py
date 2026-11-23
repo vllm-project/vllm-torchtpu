@@ -203,7 +203,7 @@ class TestTpuCompilerCache:
 
         assert first_pod == second_pod
 
-    def test_tpu_hash_covers_the_ep_placement(self):
+    def test_tpu_hash_covers_the_ep_device_placement(self):
         """A fused EP MoE program has the EP placement compiled in, so a start
         whose EP ranks sit on other devices must not load it."""
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash

@@ -97,6 +97,17 @@ def _empty_shared_mamba_ops():
         mod_after._shared_mamba_ops.clear()
 
 
+@pytest.fixture(autouse=True)
+def _reset_ep_device_placement(monkeypatch):
+    """Any compile hash marks the EP placement key as read for the rest of the
+    process, and `ep_device_ids` then raises on a placement it has not seen.
+    Start every test with no placement recorded and the key unread."""
+    ep_mesh = sys.modules.get("vllm_torchtpu.distributed.ep_mesh")
+    if ep_mesh is not None:
+        monkeypatch.setattr(ep_mesh, "_GATHERED_DEVICE_IDS", {})
+        monkeypatch.setattr(ep_mesh, "_PLACEMENT_KEY_READ", False)
+
+
 @pytest.fixture
 def vllm_config_context():
     """Run backend helpers with the same resolved layout as worker startup."""

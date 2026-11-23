@@ -60,7 +60,7 @@ _TOKEN_GROUP_CACHE: dict[tuple, tuple[tuple[int, ...], ...]] = {}
 _SORTED_GATHER_CACHE: dict[tuple, tuple[Any, tuple[int, ...]]] = {}
 # EP group ranks -> the device ids `ep_device_ids` gathered for them.
 _GATHERED_DEVICE_IDS: dict[tuple[int, ...], tuple[int, ...]] = {}
-# Set once `ep_placement_cache_key` has been read.
+# Set once `ep_device_placement_key` has been read.
 _PLACEMENT_KEY_READ = False
 
 
@@ -138,7 +138,7 @@ def ep_device_ids() -> tuple[int, ...] | None:
 
     This is the natural order -- mesh index i would be EP rank i -- but it is
     NOT the order `build_ep_mesh` uses; see `ep_rank_order` for why. Returns
-    None when EP is off. Records the result for `ep_placement_cache_key`.
+    None when EP is off. Records the result for `ep_device_placement_key`.
     """
     group = get_ep_group()
     if group is None:
@@ -164,7 +164,7 @@ def ep_device_ids() -> tuple[int, ...] | None:
     return device_ids
 
 
-def ep_placement_cache_key() -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
+def ep_device_placement_key() -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
     """Every (EP ranks, device ids) pair `ep_device_ids` has gathered here.
 
     Programs built over the EP mesh have the EP placement compiled in as
