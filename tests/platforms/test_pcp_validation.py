@@ -40,7 +40,15 @@ def _vllm_config(
 ):
     return SimpleNamespace(
         model_config=(
-            None if architecture is None else SimpleNamespace(architecture=architecture)
+            None
+            if architecture is None
+            else SimpleNamespace(
+                architecture=architecture,
+                use_mla=False,
+                is_multimodal_model=False,
+                multimodal_config=None,
+                runner_type="generate",
+            )
         ),
         additional_config={},
         parallel_config=SimpleNamespace(
@@ -48,6 +56,7 @@ def _vllm_config(
             cp_kv_cache_interleave_size=interleave_size,
             decode_context_parallel_size=dcp_size,
             pipeline_parallel_size=pipeline_parallel_size,
+            data_parallel_size=1,
             enable_expert_parallel=enable_expert_parallel,
             is_moe_model=is_moe_model,
         ),
@@ -60,6 +69,7 @@ def _vllm_config(
                 num_speculative_tokens=num_speculative_tokens,
             )
         ),
+        lora_config=None,
         kv_transfer_config=(
             None
             if kv_role is None

@@ -933,10 +933,23 @@ class TestTpuPlatform:
         monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
         monkeypatch.setattr(tpu_platform.envs, "USE_TPU_PCP_MANAGER", use_pcp_manager)
         vllm_config.model_config.architecture = "Qwen3_5ForConditionalGeneration"
+        vllm_config.model_config.use_mla = False
+        vllm_config.model_config.is_multimodal_model = True
+        vllm_config.model_config.multimodal_config = SimpleNamespace(
+            language_model_only=True
+        )
+        vllm_config.model_config.runner_type = "generate"
         vllm_config.model_config.get_head_size.return_value = 128
         vllm_config.cache_config.block_size = 256
         vllm_config.parallel_config.prefill_context_parallel_size = 4
+        vllm_config.parallel_config.decode_context_parallel_size = 1
+        vllm_config.parallel_config.pipeline_parallel_size = 1
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.is_moe_model = False
         vllm_config.parallel_config.cp_kv_cache_interleave_size = 1
+        vllm_config.speculative_config = None
+        vllm_config.lora_config = None
+        vllm_config.kv_transfer_config = None
 
         with pytest.raises(ValueError, match="multiple of 16"):
             TpuPlatform.check_and_update_config(vllm_config)
