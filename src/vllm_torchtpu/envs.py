@@ -431,6 +431,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_TRYFWD_LEAN: bool = False
     VLLM_TPU_FAST_METADATA_BUILD: bool = False
     VLLM_TPU_STEADY_DECODE_METADATA: bool = False
+    VLLM_TPU_ATTN_METADATA_REUSE: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
     VLLM_TPU_ENVS_FREEZE: bool = False
     VLLM_TPU_HOST_TOKEN_LISTS: bool = False
@@ -2741,6 +2742,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # walk's mamba indices while no request can cross a mamba block
     # (runner/steady_decode_metadata.py). Any other step rebuilds as before.
     "VLLM_TPU_STEADY_DECODE_METADATA": env_bool("VLLM_TPU_STEADY_DECODE_METADATA"),
+    # With VLLM_TPU_STEADY_DECODE_METADATA: a steady-decode target walk whose
+    # staged-walk inputs repeat the previous walk's (same block-table version,
+    # geometry, upload and walk products, mamba offsets stable) takes the
+    # previous walk's tables and mamba products without re-deriving the stage
+    # key and geometry over every group, and the inline metadata build reuses
+    # each group's per-group fields, filling only the per-step ones (positions,
+    # seq_lens, ...). Same objects in every field; see
+    # attention_metadata._steady_stage_fast_path and
+    # tpu_runner._build_attention_metadata_staged.
+    "VLLM_TPU_ATTN_METADATA_REUSE": env_bool("VLLM_TPU_ATTN_METADATA_REUSE"),
     # Freshly AOT-compiled models skip the per-call Dynamo guard check when
     # vLLM does not evaluate guards (as it already does for cached artifacts).
     "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),
