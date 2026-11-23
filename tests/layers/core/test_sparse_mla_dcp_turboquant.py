@@ -81,26 +81,28 @@ ROPE = 64
 QK_NOPE = 192
 V_DIM = 256
 HEADS = 8
-TOPK = 256
-TOPK_CAP = 64
-TOPK_CAP_CHUNK = 64
+# TPU-valid widths: the capped path's blocks need a lane-aligned (128) cap.
+TOPK = 512
+TOPK_CAP = 128
+TOPK_CAP_CHUNK = 128
 K_SCALE = 0.75
 SM_SCALE = (NOPE + ROPE) ** -0.5
 SHARD_PAGE = 64  # positions per page on one rank
-PAGES = 12  # per rank; the unsharded cache has as many, each dcp times longer
-PAGES_PER_SEQ = 6
+PAGES = 24  # per rank; the unsharded cache has as many, each dcp times longer
+PAGES_PER_SEQ = 12
 TOKENS = 16  # padded step width
 # Every byte 0x7F: each k_pe byte of an unwritten slot is an fp8 NaN.
 POISON = np.uint32(0x7F7F7F7F)
 # Context per request before the steps, then each step's new tokens. A spans
 # several virtual pages; B (4 positions at most, inside one interleave chunk)
 # lives on rank 0 alone, so the dummy entry the other ranks are handed for it
-# points at an unwritten slot; C crosses a virtual page at DCP 2.
-PRIOR = (600, 2, 150)
+# points at an unwritten slot; C crosses a virtual page at DCP 2. A's prior
+# length is 8 mod 16, so its step-1 rows sit on rank 1 at DCP 2, interleave 8.
+PRIOR = (1208, 2, 150)
 STEP1 = (3, 1, 6)
 STEP2 = (1, 1, 1)
 # Step 1's C tokens attend 1 (themselves), ... and all positions so far.
-C_TOPK = (1, 37, 64, 65, 100, None)
+C_TOPK = (1, 37, 128, 129, 150, None)
 
 
 def _owner(pos, dcp, interleave):
