@@ -31,6 +31,7 @@ from typing import Any
 import torch
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner import mk_call_marks as _mkm
 
 logger = init_logger(__name__)
 
@@ -83,6 +84,8 @@ class _Entry:
     )
 
     def call(self, args: tuple) -> Any:
+        # VLLM_TPU_HOST_PHASES: laps of the megakernel try_forward split.
+        hp = _mkm.active
         for i, v in self.ints:
             if args[i] != v:
                 return None
@@ -91,7 +94,12 @@ class _Entry:
                 return None
         if self.flat:
             # Unboxed, all tensors: itemgetter's tuple is the runner's argument.
-            outs = self.runner(self.take(args))
+            flat_ops = self.take(args)
+            if hp:
+                _mkm.lap("x_mkf_key")
+                if _mkm.FLUSH:
+                    _mkm.flush(flat_ops)
+            outs = self.runner(flat_ops)
         else:
             if self.n_in == 1:
                 ops = [self.take(args)]
@@ -101,9 +109,17 @@ class _Entry:
                 ops = []
             for pos, value in self.consts:
                 ops.insert(pos, value)
+            if hp:
+                _mkm.lap("x_mkf_key")
+                if _mkm.FLUSH:
+                    _mkm.flush(ops)
             outs = self.runner((ops,)) if self.boxed else self.runner(tuple(ops))
+        if hp:
+            _mkm.lap("x_mkf_runner")
         for ai, oi in self.copies:
             args[ai].copy_(outs[oi])
+        if hp:
+            _mkm.lap("x_mkf_epilogue")
         items = []
         for kind, idx in self.out_items:
             if kind == 0:
@@ -139,6 +155,8 @@ class _Interceptor:
         return getattr(self.orig, name)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if _mkm.active:
+            _mkm.lap("x_mkf_gather")
         if kwargs or not args:
             return self.orig(*args, **kwargs)
         if self.k0 is None:
@@ -407,6 +425,8 @@ class DirectExec:
         ):
             self.stats["module"] += 1
             return prog(*args, **kwargs)
+        if _mkm.active:
+            _mkm.lap("x_mkf_de_check")
         return self._fn(prog, *args, **kwargs)
 
 

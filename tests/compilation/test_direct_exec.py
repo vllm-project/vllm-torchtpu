@@ -366,3 +366,45 @@ def test_driver_uses_direct_exec_only_with_the_flag(monkeypatch):
     drv.whole_program = object()
     assert drv._whole_direct().program is drv.whole_program
     assert envs.VLLM_TPU_MK_WHOLE_DIRECT_EXEC is False
+
+
+@pytest.mark.parametrize("boxed", [True, False])
+def test_host_phases_laps_only_inside_try_forward(monkeypatch, boxed):
+    """VLLM_TPU_HOST_PHASES split of x_mk_try_forward (runner/mk_call_marks.py):
+    a direct call laps de_check / gather / key / runner / epilogue only while
+    the driver's try_forward is active, with outputs unchanged."""
+    from vllm_torchtpu.runner import host_phases
+    from vllm_torchtpu.runner import mk_call_marks as mkm
+
+    monkeypatch.setattr(FakeExecutable, "_boxed_call", boxed)
+    monkeypatch.setattr(host_phases, "_EVERY", 10**9)
+    monkeypatch.setattr(host_phases, "_samples", {})
+    monkeypatch.setattr(host_phases, "_cur", [])
+    monkeypatch.setattr(host_phases, "_kind", "dec")
+    (off, on), _ = _pair()
+    direct = direct_exec.DirectExec(on, "test")
+    for step, rows in enumerate([8, 8, 8]):
+        if step == 2:
+            mkm.start()
+        try:
+            ref_out, ref_pool = _run(off, off, rows, step)
+            out, pool = _run(direct, on, rows, step)
+        finally:
+            if step == 2:
+                mkm.finish(0, rows)
+        for a, b in zip(out, ref_out):
+            assert _bitwise(a, b)
+        assert _bitwise(pool, ref_pool)
+        if step < 2:
+            assert host_phases._samples == {}
+    assert direct.stats["direct"] == 2
+    names = [n for n, _ in host_phases._cur]
+    assert names == [
+        "x_mkf_de_check",
+        "x_mkf_gather",
+        "x_mkf_key",
+        "x_mkf_runner",
+        "x_mkf_epilogue",
+        "x_mkf_tail",
+    ]
+    assert mkm.active is False

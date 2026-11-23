@@ -40,6 +40,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.errors import MegakernelSetupError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen38
+from vllm_torchtpu.runner import mk_call_marks as _mkm
 
 from .driver import (
     MegakernelDriver,
@@ -52,6 +53,9 @@ from .operand_hold import hbm_summary
 from .qwen38_mtp_tail import MtpTailKind
 from .qwen38_segment_call import GDN_META, T_VERIFY, build_segment_call, segment_tiles
 from .qwen38_weights import head_groups, pack_segment_operands, segment_layers
+
+# VLLM_TPU_HOST_PHASES: laps inside try_forward (runner/mk_call_marks.py).
+_HP = _mkm.ON
 
 logger = init_logger(__name__)
 
@@ -2322,6 +2326,17 @@ class Qwen38SegmentDriver:
         intermediate_tensors: Any,
         model_kwargs: Any = None,
     ) -> tuple[bool, Any]:
+        if _HP and not _mkm.active:
+            _mkm.start()
+            try:
+                # The class function: the instance attribute may be the HOST_PHASES
+                # timing wrapper (x_mk_try_forward), which must not count twice.
+                return Qwen38SegmentDriver.try_forward(
+                    self, runner, input_ids, positions, inputs_embeds,
+                    intermediate_tensors, model_kwargs,
+                )
+            finally:
+                _mkm.finish(self.seq, int(input_ids.shape[0]))
         self.calls_total = getattr(self, "calls_total", 0) + 1
         # VLLM_TPU_MK_DRAFT: draft step 0 takes its MK call only after a whole-step
         # target forward (a uniform verify step).
@@ -2343,6 +2358,8 @@ class Qwen38SegmentDriver:
         ok, n_req, t_seq, reason = MegakernelDriver._inspect_step_detail(
             None, None, runner
         )
+        if _HP:
+            _mkm.lap("x_mkf_inspect")
         rows = int(input_ids.shape[0])
         if not ok or t_seq != T_VERIFY:
             self._note(reason if not ok else f"stock_t{t_seq}")
@@ -2379,6 +2396,8 @@ class Qwen38SegmentDriver:
             self._note(f"dry_whole_b{rows}")
             self._count("drafts_whole", n_req * (T_VERIFY - 1))
             return False, None
+        if _HP:
+            _mkm.lap("x_mkf_gate")
         self._note(f"mk_b{rows}")
         self.mk_calls += 1
         if self.mk_calls <= 4:
@@ -2483,10 +2502,21 @@ class Qwen38SegmentDriver:
                     if envs.VLLM_TPU_MK_WHOLE_DIRECT_EXEC
                     else self.whole_program
                 )
+                if _HP:
+                    _mkm.whole = True
+                    _mkm.lap("x_mkf_pre")
                 with self._whole_contexts(runner):
+                    if _HP:
+                        _mkm.lap("x_mkf_ctx_enter")
+                        _mkm.call_begin()
                     out = whole_call(
                         input_ids=input_ids, positions=positions, **kw
                     )
+                    if _HP:
+                        _mkm.lap("x_mkf_call")
+                        _mkm.call_end()
+                if _HP:
+                    _mkm.lap("x_mkf_ctx_exit")
                 runner._mk_whole_step = True
                 from . import qwen38_wholestep_call as wsc
 
