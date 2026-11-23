@@ -317,18 +317,21 @@ def _gather_sc_banked_deep(words, scales, records):
                 slot = step % slots
                 for stream in range(streams):
                     offset = base + (step * streams + stream) * lanes
-                    for kind, (src, dst) in enumerate(
-                        ((word_buf, word_out), (scale_buf, scale_out))
-                    ):
-                        copy = pltpu.make_async_copy(
-                            src.at[slot, stream],
-                            dst.at[pl.ds(offset, lanes)],
-                            write_sem.at[slot, stream],
-                        )
-                        if wait:
-                            copy.wait()
-                        else:
-                            copy.start()
+
+                    # Rows past the real ids are padding: not stored, so the
+                    # output is exactly count rows and needs no slice copy.
+                    @pl.when(offset < count)
+                    def _(offset=offset, stream=stream):
+                        for src, dst in ((word_buf, word_out), (scale_buf, scale_out)):
+                            copy = pltpu.make_async_copy(
+                                src.at[slot, stream],
+                                dst.at[pl.ds(offset, lanes)],
+                                write_sem.at[slot, stream],
+                            )
+                            if wait:
+                                copy.wait()
+                            else:
+                                copy.start()
 
             gather(jnp.int32(0))
             gather(jnp.int32(1))
@@ -360,8 +363,8 @@ def _gather_sc_banked_deep(words, scales, records):
         pl.kernel(
             kernel,
             out_type=(
-                jax.ShapeDtypeStruct((count + padding, 128), jnp.int32),
-                jax.ShapeDtypeStruct((count + padding,), jnp.float32),
+                jax.ShapeDtypeStruct((count, 128), jnp.int32),
+                jax.ShapeDtypeStruct((count,), jnp.float32),
             ),
             scratch_types=(
                 pltpu.VMEM((slots, streams, lanes, 128), jnp.int32),
@@ -385,9 +388,7 @@ def _gather_sc_banked_deep(words, scales, records):
             indices,
         ),
     )
-    return out[:count].reshape(*records.shape, 128), scale_out[:count].reshape(
-        records.shape
-    )
+    return out.reshape(*records.shape, 128), scale_out.reshape(records.shape)
 
 
 @functools.partial(jax.jit, donate_argnums=(0, 1))
