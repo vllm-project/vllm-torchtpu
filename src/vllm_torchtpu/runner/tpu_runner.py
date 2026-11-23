@@ -2405,6 +2405,50 @@ class TPUModelRunner(GPUModelRunner):
         else:
             kv_connector.start_load_kv(None)
 
+    def _setup_kv_connector_for_step(self, scheduler_output) -> None:
+        """execute_model: bind this step's KV connector metadata (and start
+        its loads) before the chunk loop."""
+        if self._kv_connector_setup_is_noop():
+            return
+        # NOTE: setup current batch's metadata for kv connector.
+        # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
+        with set_forward_context(None, self.vllm_config):
+            # Raiden overlap: block the worker main thread on the KV load only
+            # in inline mode. In the default async mode the load (network pull
+            # + DMA H2D into the cache) runs entirely on the Raiden C++
+            # threads while this step's forward computes; the request stays in
+            # WAITING_FOR_REMOTE_KVS until every rank reports done_recving.
+            raiden_inline = dist_utils.get_raiden_inline_load()
+            self.maybe_setup_kv_connector(
+                scheduler_output,
+                wait_for_completion=raiden_inline,
+                report_completion=not raiden_inline,
+            )
+
+    def _kv_connector_setup_is_noop(self) -> bool:
+        """VLLM_TPU_KV_CONNECTOR_SKIP_NOOP: True when execute_model's
+        per-step `with set_forward_context(None, ...)` +
+        `maybe_setup_kv_connector` would do nothing, so it can be skipped.
+
+        Exact: without a KV transfer group `maybe_setup_kv_connector` (this
+        class's, not overridden) returns at once, and vLLM's
+        set_forward_context (the source `_forward_ctx_source_matches` pins)
+        with no attention metadata and no token count tracks no batch size,
+        builds no DP metadata (the platform hook then has nothing to move)
+        and only swaps the module's forward context for the duration of the
+        block, restoring the previous one on exit."""
+        if not envs.VLLM_TPU_KV_CONNECTOR_SKIP_NOOP or has_kv_transfer_group():
+            return False
+        static = self.__dict__.get("_kv_setup_noop_static")
+        if static is None:
+            static = self._kv_setup_noop_static = bool(
+                set_forward_context is _vllm_forward_context.set_forward_context
+                and type(self).maybe_setup_kv_connector
+                is TPUModelRunner.maybe_setup_kv_connector
+                and _forward_ctx_source_matches()
+            )
+        return static
+
     def maybe_wait_for_kv_save(self) -> None:
         if has_kv_transfer_group():
             get_kv_transfer_group().wait_for_save()
@@ -6271,20 +6315,7 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output
         )
 
-        # NOTE: setup current batch's metadata for kv connector.
-        # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
-        with set_forward_context(None, self.vllm_config):
-            # Raiden overlap: block the worker main thread on the KV load only
-            # in inline mode. In the default async mode the load (network pull
-            # + DMA H2D into the cache) runs entirely on the Raiden C++
-            # threads while this step's forward computes; the request stays in
-            # WAITING_FOR_REMOTE_KVS until every rank reports done_recving.
-            raiden_inline = dist_utils.get_raiden_inline_load()
-            self.maybe_setup_kv_connector(
-                scheduler_output,
-                wait_for_completion=raiden_inline,
-                report_completion=not raiden_inline,
-            )
+        self._setup_kv_connector_for_step(scheduler_output)
 
         while chunk_index < target_num_chunks:
             if start_index >= self.input_batch.num_reqs:

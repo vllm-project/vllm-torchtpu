@@ -19,6 +19,7 @@ the program itself).
 from __future__ import annotations
 
 from contextlib import ExitStack
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -230,7 +231,7 @@ def _check_coverage(stats):
 
 
 def test_registered_and_out_of_compile_key(monkeypatch):
-    for name in ("VLLM_TPU_MAMBA_RD_REUSE",):
+    for name in ("VLLM_TPU_MAMBA_RD_REUSE", "VLLM_TPU_KV_CONNECTOR_SKIP_NOOP"):
         assert name in envs.environment_variables
         assert name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
         monkeypatch.delenv(name, raising=False)
@@ -306,3 +307,120 @@ def test_mamba_rd_reuse_negative_control(monkeypatch):
     monkeypatch.setattr(tpu_runner.TPUModelRunner, "_reused_comb_views", broken)
     with pytest.raises(AssertionError, match="MISMATCH"):
         run_pair(monkeypatch, D_FLAG, seed=0)
+
+
+# --------------------------------------------------------------------------
+# E. VLLM_TPU_KV_CONNECTOR_SKIP_NOOP
+# --------------------------------------------------------------------------
+
+
+def _kv_runner():
+    r = object.__new__(tpu_runner.TPUModelRunner)
+    r.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, use_sequence_parallel_moe=False, is_moe_model=True
+        ),
+        compilation_config=SimpleNamespace(
+            fast_moe_cold_start=False, static_forward_context={}
+        ),
+    )
+    return r
+
+
+def _kv_step(monkeypatch, runner, flag: bool, connector):
+    """One execute_model KV setup; returns what it observably did."""
+    from vllm import forward_context as fc
+
+    monkeypatch.setenv("VLLM_TPU_KV_CONNECTOR_SKIP_NOOP", "1" if flag else "0")
+    monkeypatch.setattr(
+        tpu_runner, "has_kv_transfer_group", lambda: connector is not None
+    )
+    monkeypatch.setattr(tpu_runner, "get_kv_transfer_group", lambda: connector)
+    seen = []
+    if connector is not None:
+        connector.bind_connector_metadata.side_effect = lambda md: seen.append(
+            ("bind", md, fc._forward_context)
+        )
+    before = (fc._forward_context, dict(fc.batchsize_forward_time))
+    so = SimpleNamespace(kv_connector_metadata=object())
+    runner._setup_kv_connector_for_step(so)
+    after = (fc._forward_context, dict(fc.batchsize_forward_time))
+    return before, after, seen, so
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_kv_connector_skip_no_group_is_noop(monkeypatch, flag):
+    """No KV transfer group: flag on skips the block; off runs it. Either way
+    the forward context and batch-size stats are as before and nothing else
+    is touched (connector getters would raise)."""
+    from unittest.mock import Mock
+
+    r = _kv_runner()
+
+    def boom():
+        raise AssertionError("connector looked up without a group")
+
+    monkeypatch.setattr(tpu_runner, "get_kv_transfer_group", boom)
+    entered = Mock(wraps=tpu_runner.set_forward_context)
+    monkeypatch.setattr(tpu_runner, "set_forward_context", entered)
+    monkeypatch.setenv("VLLM_TPU_KV_CONNECTOR_SKIP_NOOP", "1" if flag else "0")
+    monkeypatch.setattr(tpu_runner, "has_kv_transfer_group", lambda: False)
+    from vllm import forward_context as fc
+
+    before = (fc._forward_context, dict(fc.batchsize_forward_time))
+    r._setup_kv_connector_for_step(SimpleNamespace(kv_connector_metadata=None))
+    assert (fc._forward_context, dict(fc.batchsize_forward_time)) == before
+    # Patched set_forward_context (as tests do) is not the pinned one: the
+    # skip only applies to vLLM's own function.
+    assert entered.call_count == 1
+    monkeypatch.setattr(tpu_runner, "set_forward_context", fc.set_forward_context)
+    r.__dict__.pop("_kv_setup_noop_static", None)
+    calls = []
+    real = fc.set_forward_context
+
+    def spy(*a, **k):
+        calls.append(a)
+        return real(*a, **k)
+
+    monkeypatch.setattr(fc, "set_forward_context", spy)
+    monkeypatch.setattr(tpu_runner, "set_forward_context", spy)
+    monkeypatch.setattr(tpu_runner, "_forward_ctx_source_matches", lambda: True)
+    r._setup_kv_connector_for_step(SimpleNamespace(kv_connector_metadata=None))
+    assert (fc._forward_context, dict(fc.batchsize_forward_time)) == before
+    assert len(calls) == (0 if flag else 1)
+
+
+def test_kv_connector_skip_real_source_pinned():
+    # The installed vLLM is the source the exactness argument was made on.
+    assert tpu_runner._forward_ctx_source_matches()
+    r = _kv_runner()
+    assert r._kv_connector_setup_is_noop() is False  # flag off by default
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_kv_connector_skip_keeps_connector_path(monkeypatch, flag):
+    """With a KV transfer group the block runs as before: the connector binds
+    this step's metadata under a forward context, which is restored after."""
+    from unittest.mock import MagicMock
+
+    r = _kv_runner()
+    connector = MagicMock()
+    monkeypatch.setattr(tpu_runner.dist_utils, "get_raiden_inline_load", lambda: False)
+    before, after, seen, so = _kv_step(monkeypatch, r, flag, connector)
+    assert after == before
+    assert len(seen) == 1 and seen[0][1] is so.kv_connector_metadata
+    assert seen[0][2] is not None and seen[0][2] is not before[0]
+    connector.handle_preemptions.assert_called_once_with(so.kv_connector_metadata)
+    connector.start_load_kv.assert_called_once_with(None)
+
+
+def test_kv_connector_skip_negative_control(monkeypatch):
+    """A broken skip that ignores the transfer group drops the connector's
+    metadata bind, which the connector test catches."""
+    monkeypatch.setattr(
+        tpu_runner.TPUModelRunner,
+        "_kv_connector_setup_is_noop",
+        lambda self: envs.VLLM_TPU_KV_CONNECTOR_SKIP_NOOP,
+    )
+    with pytest.raises(AssertionError):
+        test_kv_connector_skip_keeps_connector_path(monkeypatch, True)
