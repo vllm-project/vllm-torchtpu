@@ -1596,3 +1596,25 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
     with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
         _validate_peer_replay_config()
+
+
+def test_peer_replay_scheduler_validation(monkeypatch):
+    """additional_config.peer_replay_scheduler rejects unknown values and
+    fails fast when 'claims' is set without peer replay."""
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "0")
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "0")
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "0")
+
+    bad_cfg = SimpleNamespace(additional_config={"peer_replay_scheduler": "bogus"})
+    with pytest.raises(ValueError, match="peer_replay_scheduler"):
+        _validate_peer_replay_config(bad_cfg)
+
+    claims_cfg = SimpleNamespace(additional_config={"peer_replay_scheduler": "claims"})
+    with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_REPLAY=1"):
+        _validate_peer_replay_config(claims_cfg)
+
+    monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "1")
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "1")
+    _validate_peer_replay_config(claims_cfg)

@@ -20,6 +20,8 @@ when it starts: local rank 0 must start on it, not reach it after the smallest.
 """
 
 import itertools
+import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -412,13 +414,16 @@ def test_deferred_falls_back_when_cache_disabled_or_host_unknown(
 def test_peer_replay_claims_list_schedules_and_respects_claim_wait(
     compile_all_ranges, monkeypatch, tmp_path
 ):
-    """VLLM_TPU_PEER_REPLAY_CLAIMS=1 claims unclaimed ranges biggest-first via
-    O_EXCL files (recording rank_<r>_<dp> dir names) and replays peer-claimed
-    ranges with bounded wait."""
-    monkeypatch.setenv("VLLM_TPU_PEER_REPLAY_CLAIMS", "1")
+    """peer_replay_scheduler='claims' claims unclaimed ranges via O_EXCL files
+    (recording rank_<r>_<dp> dir names and subgraph index) and replays
+    peer-claimed ranges with bounded wait."""
+    from vllm_torchtpu import profiler_trace
+
+    monkeypatch.setenv("TPU_PRECOMPILE_BIGGEST_FIRST", "1")
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", "42")
     monkeypatch.setattr(tpu_compiler, "_graph_fingerprint", lambda graph: "fp" * 16)
     cache_dir = str(tmp_path / "hash1" / "rank_0_1" / "backbone")
+    vllm_config = SimpleNamespace(additional_config={"peer_replay_scheduler": "claims"})
 
     def _run_claim_rank(pre_claim: dict[int, str] | None = None):
         _host(monkeypatch, 8)
@@ -431,13 +436,14 @@ def test_peer_replay_claims_list_schedules_and_respects_claim_wait(
                 (
                     compile_range.end,
                     getattr(tpu_compiler._peer_wait, "timeout_s", 0.0),
-                    getattr(tpu_compiler._peer_wait, "peer_ranks", None),
+                    getattr(tpu_compiler._peer_wait, "allowed_dirs", None),
                 )
             )
             return lambda *a: a
 
         backend = SimpleNamespace(
             graph=object(),
+            vllm_config=vllm_config,
             range_entries={
                 Range(s, s): piecewise_backend.RangeEntry(compile_range=Range(s, s))
                 for s in [16, 64, 256]
@@ -461,23 +467,23 @@ def test_peer_replay_claims_list_schedules_and_respects_claim_wait(
                 tmp_path
                 / "hash1"
                 / "peer_claims"
-                / peer_replay._run_id()
+                / profiler_trace.profile_session_id(include_starttime=True)
                 / "backbone"
                 / ("fp" * 12)
                 / "1"
             )
             cdir.mkdir(parents=True, exist_ok=True)
             for size, owner in pre_claim.items():
-                (cdir / f"{size}_{size}").write_text(owner)
+                (cdir / f"{size}_{size}_sg0").write_text(owner)
         compile_all_ranges(backend)
         return calls
 
     calls = _run_claim_rank(pre_claim={256: "rank_0_0", 16: "rank_0_1"})
-    # 64 is unclaimed -> rank_0_1 claims and compiles it (wait=0).
-    # 16 was claimed by rank_0_1 -> never waits on own claim (wait=0).
-    # 256 was claimed by rank_0_0 -> waits up to 42s with peer_ranks={"rank_0_0"}.
+    # 64 is unclaimed -> rank_0_1 claims and compiles it (wait=0, allowed_dirs=None).
+    # 16 was claimed by rank_0_1 -> waits 0 with allowed_dirs={"rank_0_1"}.
+    # 256 was claimed by rank_0_0 -> waits up to 42s with allowed_dirs={"rank_0_0"}.
     assert calls == [
-        (64, 0.0, {"rank_0_1"}),
+        (64, 0.0, None),
         (16, 0.0, {"rank_0_1"}),
         (256, 42.0, {"rank_0_0"}),
     ]
@@ -486,16 +492,17 @@ def test_peer_replay_claims_list_schedules_and_respects_claim_wait(
 def test_peer_replay_claims_falls_back_to_rotated_without_fingerprint(
     compile_all_ranges, monkeypatch, tmp_path
 ):
-    """When a graph cannot be fingerprinted, VLLM_TPU_PEER_REPLAY_CLAIMS falls
-    back to the rotated order (wait=0) instead of the static deal."""
-    monkeypatch.setenv("VLLM_TPU_PEER_REPLAY_CLAIMS", "1")
+    """When a graph cannot be fingerprinted, claims falls back to the rotated
+    order (wait=0) instead of the static deal."""
     monkeypatch.setattr(tpu_compiler, "_graph_fingerprint", lambda graph: None)
     _host(monkeypatch, 8)
     monkeypatch.setenv("LOCAL_RANK", "1")
     calls = []
     cache_dir = str(tmp_path / "hash1" / "rank_0_0" / "backbone")
+    vllm_config = SimpleNamespace(additional_config={"peer_replay_scheduler": "claims"})
     backend = SimpleNamespace(
         graph=object(),
+        vllm_config=vllm_config,
         range_entries={
             Range(s, s): piecewise_backend.RangeEntry(compile_range=Range(s, s))
             for s in SIZES
@@ -525,3 +532,212 @@ def test_peer_replay_claims_falls_back_to_rotated_without_fingerprint(
     compile_all_ranges(backend)
     assert all(wait == 0.0 for _, wait in calls)
     assert sorted(end for end, _ in calls) == SIZES
+
+
+def test_peer_replay_claims_falls_back_on_oserror(
+    compile_all_ranges, monkeypatch, tmp_path
+):
+    """Read-only / unwritable claim directories fall back to rotated order."""
+    monkeypatch.setattr(tpu_compiler, "_graph_fingerprint", lambda graph: "fp" * 16)
+    monkeypatch.setattr(
+        os,
+        "makedirs",
+        lambda *a, **kw: (_ for _ in ()).throw(PermissionError("read-only")),
+    )
+    _host(monkeypatch, 8)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    calls = []
+    cache_dir = str(tmp_path / "hash1" / "rank_0_0" / "backbone")
+    vllm_config = SimpleNamespace(additional_config={"peer_replay_scheduler": "claims"})
+    backend = SimpleNamespace(
+        graph=object(),
+        vllm_config=vllm_config,
+        range_entries={
+            Range(s, s): piecewise_backend.RangeEntry(compile_range=Range(s, s))
+            for s in SIZES
+        },
+        vllm_backend=SimpleNamespace(
+            compiler_manager=SimpleNamespace(
+                compile=lambda g, a, *r, compile_range, **kw: (
+                    calls.append(
+                        (
+                            compile_range.end,
+                            getattr(tpu_compiler._peer_wait, "timeout_s", 0.0),
+                        )
+                    )
+                    or (lambda *x: x)
+                ),
+                disable_cache=False,
+                compiler=SimpleNamespace(cache_dir=cache_dir),
+            ),
+            inductor_config={},
+            is_encoder=False,
+        ),
+        compilation_config=None,
+        piecewise_compile_index=0,
+        total_piecewise_compiles=1,
+        _log_compile_start=lambda compile_range: None,
+    )
+    compile_all_ranges(backend)
+    assert all(wait == 0.0 for _, wait in calls)
+    assert sorted(end for end, _ in calls) == SIZES
+
+
+def test_peer_replay_claims_real_compilers_two_ranks_and_deferred_subgraphs(
+    compile_all_ranges, monkeypatch, tmp_path
+):
+    """End-to-end test with real TpuCompilerAdaptor instances:
+    1) Two ranks (including across DP engines sharing TORCH_TPU_DP_MASTER_PORT)
+       compile each range once, and a waiter waits for the claim owner even
+       when another rank already saved an artifact for the same key.
+    2) compile_deferred with two subgraphs sharing a range and fingerprint
+       claims and compiles both without colliding on one claim file.
+    """
+    import threading
+
+    import torch
+
+    _host(monkeypatch, 2)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("TPU_PRECOMPILE_BIGGEST_FIRST", "1")
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", "5")
+    monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "29511")
+    monkeypatch.setattr(tpu_compiler, "_PEER_POLL_S", 0.01)
+
+    replayed_calls = []
+    gate = threading.Event()
+    compiled_by_rank: list[tuple[str, int]] = []
+
+    def _make_adaptor(rank_dir: str):
+        adaptor = tpu_compiler.TpuCompilerAdaptor()
+        adaptor.initialize_cache(
+            cache_dir=str(tmp_path / "hash1" / rank_dir / "backbone")
+        )
+        return adaptor
+
+    def _make_backend(adaptor, graph, sg_idx: int, ranges: list[int]):
+        def cm_compile(g, args, *rest, compile_range, key=None, **kwargs):
+            k = key or f"range_{compile_range.start}_{compile_range.end}_sg{sg_idx}"
+            fn, _ = adaptor.compile(g, args, {}, compile_range, key=k)
+            return fn
+
+        return SimpleNamespace(
+            graph=graph,
+            _tpu_trace=0,
+            vllm_config=SimpleNamespace(
+                additional_config={"peer_replay_scheduler": "claims"}
+            ),
+            range_entries={
+                Range(s, s): piecewise_backend.RangeEntry(compile_range=Range(s, s))
+                for s in ranges
+            },
+            vllm_backend=SimpleNamespace(
+                compiler_manager=SimpleNamespace(
+                    compile=cm_compile,
+                    disable_cache=False,
+                    compiler=adaptor,
+                ),
+                inductor_config={},
+                is_encoder=False,
+            ),
+            compilation_config=None,
+            piecewise_compile_index=sg_idx,
+            total_piecewise_compiles=2,
+            _log_compile_start=lambda compile_range: None,
+        )
+
+    def tracked_backend(graph, inputs):
+        # Identify caller via thread name or call order.
+        name = threading.current_thread().name
+        if name == "owner-r0":
+            gate.wait(timeout=2.0)
+        size = (
+            int(inputs[0].shape[0]) if hasattr(inputs[0], "shape") else int(inputs[0])
+        )
+        compiled_by_rank.append((name, size))
+
+        class Entry:
+            def __call__(self, *a):
+                return f"compiled-{name}"
+
+            def serialize(self):
+                return f"entry-{name}"
+
+        return Entry()
+
+    monkeypatch.setattr(tpu_compiler, "_tpu_backend", tracked_backend)
+    monkeypatch.setattr(
+        tpu_compiler,
+        "_deserialize_entry",
+        lambda entry: replayed_calls.append(entry) or (lambda *a: entry),
+    )
+
+    graph0 = torch.fx.symbolic_trace(lambda x: x + 1)
+    graph1 = torch.fx.symbolic_trace(lambda x: x + 1)
+    other_graph = torch.fx.symbolic_trace(lambda x: x * 9)
+
+    # Pre-populate rank_2_0 with an artifact for the same key from another graph:
+    # waiter rank_0_1 must still wait for claim owner rank_0_0, not fail on rank_2_0.
+    r2 = _make_adaptor("rank_2_0")
+    r2.compile(
+        other_graph, [torch.zeros(64, 4)], {}, Range(64, 64), key="range_64_64_sg0"
+    )
+
+    r0 = _make_adaptor("rank_0_0")
+    r1 = _make_adaptor("rank_0_1")
+    b0 = _make_backend(r0, graph0, 0, [64])
+    b1 = _make_backend(r1, graph0, 0, [64])
+
+    # Pre-seed args on range_entries so compile_entry can pass example_inputs.
+    b0.range_entries[Range(64, 64)].args = [torch.zeros(64, 4)]
+    b1.range_entries[Range(64, 64)].args = [torch.zeros(64, 4)]
+
+    def _compile_entry(b, e):
+        re_fn = b.vllm_backend.compiler_manager.compile(
+            b.graph, e.args, compile_range=e.compile_range
+        )
+        e.runnable = re_fn
+        e.compiled = True
+
+    def run_r0():
+        monkeypatch.setattr(peer_replay, "_claim_call_counter", itertools.count(1))
+        peer_replay.compile_claimed(
+            [(b0, b0.range_entries[Range(64, 64)])], _compile_entry
+        )
+
+    def run_r1():
+        monkeypatch.setattr(peer_replay, "_claim_call_counter", itertools.count(1))
+        peer_replay.compile_claimed(
+            [(b1, b1.range_entries[Range(64, 64)])], _compile_entry
+        )
+
+    t0 = threading.Thread(target=run_r0, name="owner-r0")
+    t1 = threading.Thread(target=run_r1, name="waiter-r1")
+    t0.start()
+    time.sleep(0.05)  # Let r0 claim 64 before r1 runs; r0 blocks on gate.
+    t1.start()
+    time.sleep(0.05)  # r1 is waiting on r0 even though rank_2_0 has an artifact.
+    gate.set()
+    t0.join(timeout=5.0)
+    t1.join(timeout=5.0)
+
+    # Range 64 was compiled only once (by owner-r0) and replayed by waiter-r1.
+    assert [c for c in compiled_by_rank if c[0] != "MainThread"] == [("owner-r0", 64)]
+    assert "entry-owner-r0" in replayed_calls
+
+    # Part 2: compile_deferred with two subgraphs sharing a range and fingerprint.
+    compiled_by_rank.clear()
+    monkeypatch.setattr(peer_replay, "_claim_call_counter", itertools.count(1))
+    b_sg0 = _make_backend(r0, graph0, 0, [32])
+    b_sg1 = _make_backend(r0, graph1, 1, [32])
+    e0 = b_sg0.range_entries[Range(32, 32)]
+    e1 = b_sg1.range_entries[Range(32, 32)]
+    e0.args = [torch.zeros(32, 4)]
+    e1.args = [torch.zeros(32, 4)]
+    e0._tpu_deferred = "compile"
+    e1._tpu_deferred = "compile"
+    assert shape_variants._deferred_compiler is not None
+    shape_variants._deferred_compiler([b_sg0, b_sg1])
+    assert len(compiled_by_rank) == 2
+    assert e0.compiled
+    assert e1.compiled

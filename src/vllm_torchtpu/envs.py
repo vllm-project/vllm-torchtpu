@@ -131,7 +131,6 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_PRECOMPILE_PEER_WAIT_S: float = 600.0
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
-    VLLM_TPU_PEER_REPLAY_CLAIMS: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
@@ -976,12 +975,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # before the next group is even traced, so the groups run one after
     # another and most ranks wait. Needs TPU_PARALLEL_PRECOMPILE.
     "TPU_PRECOMPILE_TRACE_FIRST": env_bool("TPU_PRECOMPILE_TRACE_FIRST", default=False),
-    # Under TPU_PRECOMPILE_PEER_REPLAY, schedule ranges by atomic file claim
-    # (list scheduling, largest unclaimed range first) instead of a static
-    # deal, with no collective required.
-    "VLLM_TPU_PEER_REPLAY_CLAIMS": env_bool(
-        "VLLM_TPU_PEER_REPLAY_CLAIMS", default=False
-    ),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.

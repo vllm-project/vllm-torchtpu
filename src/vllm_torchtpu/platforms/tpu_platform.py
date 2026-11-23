@@ -320,13 +320,31 @@ def _patch_api_server_kernel_reload_endpoint() -> None:
     )
 
 
-def _validate_peer_replay_config() -> None:
-    """Fail fast on TPU_PRECOMPILE_PEER_REPLAY with vLLM's compile cache off.
+def _validate_peer_replay_config(vllm_config: "VllmConfig | None" = None) -> None:
+    """Fail fast on invalid peer-replay settings.
 
     Peer replay hands a compiled range to the host's other ranks through the
     compile cache (TpuCompilerAdaptor saves and replays the cache artifact),
     so with VLLM_DISABLE_COMPILE_CACHE=1 there is nothing to replay.
+    `additional_config.peer_replay_scheduler` selects `'static'` (default) or
+    `'claims'` and requires both `TPU_PARALLEL_PRECOMPILE=1` and
+    `TPU_PRECOMPILE_PEER_REPLAY=1`.
     """
+    extra = getattr(vllm_config, "additional_config", None) if vllm_config else None
+    scheduler = extra.get("peer_replay_scheduler") if isinstance(extra, dict) else None
+    if scheduler is not None:
+        if scheduler not in ("static", "claims"):
+            raise ValueError(
+                "additional_config.peer_replay_scheduler must be 'static' or "
+                f"'claims', got {scheduler!r}"
+            )
+        if scheduler == "claims" and not (
+            envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY
+        ):
+            raise ValueError(
+                "additional_config.peer_replay_scheduler='claims' requires "
+                "TPU_PARALLEL_PRECOMPILE=1 and TPU_PRECOMPILE_PEER_REPLAY=1."
+            )
     if not (envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY):
         return
     # Parse it now, so a bad value fails the launch rather than the precompile
@@ -844,7 +862,7 @@ class TpuPlatform(Platform):
             "Use --data-parallel-size and --enable-expert-parallel instead."
         )
         _validate_phased_profiling_config(vllm_config)
-        _validate_peer_replay_config()
+        _validate_peer_replay_config(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "

@@ -100,36 +100,30 @@ _PEER_POLL_S = 0.5
 # are ignored; one written this run is minutes newer than the process start,
 # so clock skew between the host and a shared cache filesystem does not matter.
 _FAILED_SUFFIX = ".failed"
+_FP_SUFFIX = ".fp"
 _PROCESS_START = time.time()
 
 _peer_wait = threading.local()
 
 
 @contextlib.contextmanager
-def wait_for_peer_artifact(timeout_s: float):
+def wait_for_peer_artifact(timeout_s: float, allowed_dirs: set[str] | None = None):
     """Within this block, `compile` waits up to `timeout_s` for another rank
     of this host to save the bucket, and replays it, before compiling it.
 
-    Outside it, `compile` still replays an artifact a peer has already saved,
-    but does not wait for one.
+    If `allowed_dirs` is given (e.g. `{"rank_0_1"}`), only artifacts from those
+    rank directories are considered. Outside this block, `compile` still
+    replays an artifact a peer has already saved, but does not wait for one.
     """
+    prev_timeout = getattr(_peer_wait, "timeout_s", 0.0)
+    prev_allowed = getattr(_peer_wait, "allowed_dirs", None)
     _peer_wait.timeout_s = timeout_s
+    _peer_wait.allowed_dirs = allowed_dirs
     try:
         yield
     finally:
-        _peer_wait.timeout_s = 0.0
-
-
-@contextlib.contextmanager
-def replay_only_from(rank_dirs: set[str] | None):
-    """Within this block, `compile` replays only artifacts from these rank dirs
-    (e.g. `{"rank_0_1"}`)."""
-    prev = getattr(_peer_wait, "peer_ranks", None)
-    _peer_wait.peer_ranks = rank_dirs
-    try:
-        yield
-    finally:
-        _peer_wait.peer_ranks = prev
+        _peer_wait.timeout_s = prev_timeout
+        _peer_wait.allowed_dirs = prev_allowed
 
 
 def _deserialize_entry(entry: Any) -> Callable[..., Any]:
@@ -189,7 +183,6 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PRECOMPILE_PEER_REPLAY",
     "TPU_PRECOMPILE_PEER_WAIT_S",
     "TPU_PRECOMPILE_TRACE_FIRST",
-    "VLLM_TPU_PEER_REPLAY_CLAIMS",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would
@@ -666,6 +659,12 @@ class TpuCompilerAdaptor(CompilerInterface):
             with open(tmp_path, "wb") as f:
                 pickle.dump(payload, f)
             os.replace(tmp_path, path)
+            if fingerprint is not None:
+                fp_tmp = f"{path}{_FP_SUFFIX}.{os.getpid()}.tmp"
+                with contextlib.suppress(OSError):
+                    with open(fp_tmp, "w") as f:
+                        f.write(fingerprint)
+                    os.replace(fp_tmp, path + _FP_SUFFIX)
             logger.info("[TpuCompilerAdaptor] Saved compiled artifact to %s", path)
             return True
         except Exception as e:
@@ -740,7 +739,23 @@ class TpuCompilerAdaptor(CompilerInterface):
             )
             return None
 
-    def _peer_paths(self, key: str) -> list[str]:
+    @staticmethod
+    def parse_cache_dir(cache_dir: str | None) -> tuple[str, str, str] | None:
+        """Return `(cache_hash_dir, rank_dir, prefix)` for a `rank_<r>_<dp>` dir."""
+        if not cache_dir:
+            return None
+        own = os.path.normpath(cache_dir)
+        rank_path, prefix = os.path.split(own)
+        rank_dir = os.path.basename(rank_path)
+        if re.fullmatch(r"rank_\d+_\d+", rank_dir) is None:
+            return None
+        return os.path.dirname(rank_path), rank_dir, prefix
+
+    def rank_dir_name(self) -> str | None:
+        parsed = self.parse_cache_dir(self.cache_dir)
+        return parsed[1] if parsed is not None else None
+
+    def _peer_paths(self, key: str, allowed_dirs: set[str] | None = None) -> list[str]:
         """Where the other ranks have saved their artifact for `key`.
 
         vLLM gives each rank its own `<hash>/rank_<rank>_<dp_rank>/<prefix>`
@@ -750,19 +765,27 @@ class TpuCompilerAdaptor(CompilerInterface):
         fingerprint check decides whether its artifact fits. Only dirs on this
         host's disk are seen unless the cache root is shared.
         """
+        parsed = self.parse_cache_dir(self.cache_dir)
+        if parsed is None:
+            return []
+        cache_hash_dir, _, prefix = parsed
         assert self.cache_dir is not None
         own = os.path.normpath(self.cache_dir)
-        rank_dir, prefix = os.path.split(own)
-        if re.fullmatch(r"rank_\d+_\d+", os.path.basename(rank_dir)) is None:
-            return []
         pattern = os.path.join(
-            glob.escape(os.path.dirname(rank_dir)),
+            glob.escape(cache_hash_dir),
             "rank_*_*",
             glob.escape(prefix),
             glob.escape(key),
         )
         mine = os.path.join(own, key)
-        return sorted(p for p in glob.glob(pattern) if p != mine)
+        paths = sorted(p for p in glob.glob(pattern) if p != mine)
+        if allowed_dirs is None:
+            return paths
+        return [
+            p
+            for p in paths
+            if os.path.basename(os.path.dirname(os.path.dirname(p))) in allowed_dirs
+        ]
 
     def _mark_failed(self, key: str, fingerprint: str) -> None:
         """Tell this host's waiting ranks that this rank will not save `key`.
@@ -791,9 +814,14 @@ class TpuCompilerAdaptor(CompilerInterface):
         with contextlib.suppress(OSError):
             os.remove(os.path.join(self.cache_dir, key + _FAILED_SUFFIX))
 
-    def _peer_failed(self, key: str, fingerprint: str) -> str | None:
+    def _peer_failed(
+        self,
+        key: str,
+        fingerprint: str,
+        allowed_dirs: set[str] | None = None,
+    ) -> str | None:
         """A marker another rank tracing this graph left this run for `key`."""
-        for path in self._peer_paths(key + _FAILED_SUFFIX):
+        for path in self._peer_paths(key + _FAILED_SUFFIX, allowed_dirs=allowed_dirs):
             with contextlib.suppress(OSError):
                 if os.path.getmtime(path) < _PROCESS_START:
                     continue
@@ -801,6 +829,26 @@ class TpuCompilerAdaptor(CompilerInterface):
                     if f.read() == fingerprint:
                         return path
         return None
+
+    @staticmethod
+    def _peer_fingerprint_matches(path: str, fingerprint: str) -> bool:
+        """Check `<path>.fp` before unpickling to skip mismatched graphs."""
+        fp_path = path + _FP_SUFFIX
+        try:
+            with open(fp_path) as f:
+                peer_fp = f.read().strip()
+        except OSError:
+            return True
+        if peer_fp == fingerprint:
+            return True
+        logger.warning(
+            "[TpuCompilerAdaptor] Ignoring artifact %s: "
+            "built from a different graph (%s vs %s)",
+            path,
+            peer_fp,
+            fingerprint,
+        )
+        return False
 
     def _replay_from_peer(
         self,
@@ -818,25 +866,11 @@ class TpuCompilerAdaptor(CompilerInterface):
         do not trace the same program and waiting on would not help.
         """
         deadline = time.monotonic() + getattr(_peer_wait, "timeout_s", 0.0)
-        allowed = getattr(_peer_wait, "peer_ranks", None)
+        allowed = getattr(_peer_wait, "allowed_dirs", None)
 
-        def candidates() -> list[str]:
-            paths = self._peer_paths(key)
-            if allowed is None:
-                return paths
-            # replay_only_from: only rank dirs known to trace this rank's
-            # graph, so no other process group's artifact is unpickled and
-            # refused.
-            out = []
-            for p in paths:
-                rank_dir = os.path.basename(os.path.dirname(os.path.dirname(p)))
-                if rank_dir in allowed:
-                    out.append(p)
-            return out
-
-        paths = candidates()
+        paths = self._peer_paths(key, allowed_dirs=allowed)
         while not paths and time.monotonic() < deadline:
-            failed = self._peer_failed(key, fingerprint)
+            failed = self._peer_failed(key, fingerprint, allowed_dirs=allowed)
             if failed is not None:
                 logger.info(
                     "[TpuCompilerAdaptor] %s: its owner could not save it; "
@@ -845,10 +879,12 @@ class TpuCompilerAdaptor(CompilerInterface):
                 )
                 return None
             time.sleep(_PEER_POLL_S)
-            paths = candidates()
+            paths = self._peer_paths(key, allowed_dirs=allowed)
         # Try each peer's artifact, not just the first: with peers in other
         # process groups, the first path can be one this rank must refuse.
         for path in paths:
+            if not self._peer_fingerprint_matches(path, fingerprint):
+                continue
             compiled_fn = self._replay(path, graph, was_wrapped, fingerprint)
             if compiled_fn is not None:
                 return compiled_fn, path
@@ -866,6 +902,16 @@ class TpuCompilerAdaptor(CompilerInterface):
             except OSError:
                 shutil.copyfile(src, tmp)
             os.replace(tmp, dst)
+            src_fp = src + _FP_SUFFIX
+            if os.path.exists(src_fp):
+                dst_fp = dst + _FP_SUFFIX
+                fp_tmp = f"{dst_fp}.{os.getpid()}.tmp"
+                with contextlib.suppress(OSError):
+                    try:
+                        os.link(src_fp, fp_tmp)
+                    except OSError:
+                        shutil.copyfile(src_fp, fp_tmp)
+                    os.replace(fp_tmp, dst_fp)
             return True
         except Exception as e:
             logger.warning(

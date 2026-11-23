@@ -48,20 +48,34 @@ CANONICAL_TS_POLL_TIMEOUT_S = 5.0
 CANONICAL_TS_POLL_INTERVAL_S = 0.05
 
 
-def profile_session_id() -> str:
+def _ppid_with_starttime() -> str:
+    ppid = os.getppid()
+    starttime = ""
+    with contextlib.suppress(OSError, IndexError), open(f"/proc/{ppid}/stat") as f:
+        # Field 22 (index 19 after the comm field's closing ')') is starttime.
+        starttime = f.read().rsplit(")", 1)[1].split()[19]
+    return f"{ppid}_{starttime}" if starttime else str(ppid)
+
+
+def profile_session_id(*, include_starttime: bool = False) -> str:
     """Return an id shared by every worker process of this server run.
 
     Markers are keyed by this id so that a stale marker left behind by an
     earlier run is never mistaken for the current one. ``TORCH_TPU_DP_MASTER_PORT``
     is picked once per server and inherited by every engine and worker, which
     also covers DP>1 with TP>1, where workers of different DP replicas have
-    different parents. The parent pid is the fallback for DP=1, where the port
-    is unset and all workers are children of the same engine core.
+    different parents. ``TORCH_TPU_XPROF_SESSION_ID`` is picked once per server
+    start and forwarded to Ray workers (whose parent is the raylet). The parent
+    pid is the fallback for standalone / DP=1 mp runs, optionally including its
+    kernel start time so PID reuse cannot collide with an earlier run.
     """
     dp_master_port = os.environ.get("TORCH_TPU_DP_MASTER_PORT")
     if dp_master_port:
         return f"dp{dp_master_port}"
-    return str(os.getppid())
+    xprof_session_id = os.environ.get("TORCH_TPU_XPROF_SESSION_ID")
+    if xprof_session_id:
+        return f"xprof_{xprof_session_id}"
+    return _ppid_with_starttime() if include_starttime else str(os.getppid())
 
 
 def rank_capture_dir(dst_root: str, worker_rank: int) -> str:

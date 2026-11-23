@@ -542,7 +542,14 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
 
-        if envs.VLLM_TPU_PEER_REPLAY_CLAIMS:
+        vllm_cfg = getattr(pairs[0][0], "vllm_config", None) if pairs else None
+        extra = getattr(vllm_cfg, "additional_config", None)
+        scheduler = (
+            extra.get("peer_replay_scheduler", "static")
+            if isinstance(extra, dict)
+            else "static"
+        )
+        if scheduler == "claims":
             from vllm_torchtpu.compilation.peer_replay import compile_claimed
 
             # Without claims, fall back to the rotated order, which never waits
