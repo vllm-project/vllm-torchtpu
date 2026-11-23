@@ -16,10 +16,12 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import argparse
 import importlib.util
 import os
+import sys
 import time
-from typing import TYPE_CHECKING, Protocol, Union, cast
+from typing import TYPE_CHECKING, Any, Protocol, Union, cast
 
 import portpicker
 import torch
@@ -48,6 +50,7 @@ if TYPE_CHECKING:
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
@@ -216,6 +219,56 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 
 _dynamic_compile_unwrapped = False
 _tpu_kv_connectors_registered = False
+_ep_weight_filter_cli_opt_out = False
+
+
+class _TrackedEpWeightFilterAction(argparse.BooleanOptionalAction):
+    """Records whether CLI arguments explicitly opted out of EP weight filtering."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        global _ep_weight_filter_cli_opt_out
+        super().__call__(parser, namespace, values, option_string)
+        _ep_weight_filter_cli_opt_out = getattr(namespace, self.dest, None) is False
+
+
+def _track_ep_weight_filter_cli_action(parser: Any) -> None:
+    """Attach opt-out tracking to vLLM's --enable-ep-weight-filter CLI action."""
+    global _ep_weight_filter_cli_opt_out
+    _ep_weight_filter_cli_opt_out = False
+    for action in getattr(parser, "_actions", ()):
+        if (
+            getattr(action, "dest", None) == "enable_ep_weight_filter"
+            and type(action) is argparse.BooleanOptionalAction
+        ):
+            action.__class__ = _TrackedEpWeightFilterAction
+            break
+
+
+def _is_ep_weight_filter_cli_disabled() -> bool:
+    return _ep_weight_filter_cli_opt_out or (
+        "--no-enable-ep-weight-filter" in sys.argv[1:]
+    )
+
+
+def _apply_default_ep_weight_filter(vllm_config: "VllmConfig") -> None:
+    """Default-enable EP weight filtering on TPU for MoE EP without EPLB."""
+    model_config = vllm_config.model_config
+    parallel_config = vllm_config.parallel_config
+    if (
+        model_config is None
+        or not model_config.is_moe
+        or not parallel_config.enable_expert_parallel
+        or parallel_config.enable_eplb
+        or not hasattr(parallel_config, "enable_ep_weight_filter")
+        or parallel_config.enable_ep_weight_filter
+        or _is_ep_weight_filter_cli_disabled()
+    ):
+        return
+    parallel_config.enable_ep_weight_filter = True
+    logger.info(
+        "Defaulting enable_ep_weight_filter=True on TPU for MoE with expert "
+        "parallelism (pass --no-enable-ep-weight-filter to disable)."
+    )
 
 
 def _configure_torchtpu_eager_mode() -> None:
@@ -512,6 +565,13 @@ class TpuPlatform(Platform):
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
     ]
+
+    @classmethod
+    def pre_register_and_update(
+        cls, parser: "FlexibleArgumentParser | None" = None
+    ) -> None:
+        if parser is not None:
+            _track_ep_weight_filter_cli_action(parser)
 
     # The "Platform" base class has import_kernels() that tries to import
     # vllm._C, which is not available in the TPU Platform setup.
@@ -868,6 +928,7 @@ class TpuPlatform(Platform):
         # Apply before VllmConfig is pickled so EngineCore and all workers see
         # the same setting.
         apply_eagle_block_drop_override(vllm_config)
+        _apply_default_ep_weight_filter(vllm_config)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(

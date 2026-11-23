@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 import copy
 import math
 import os
@@ -1694,3 +1695,79 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
     with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
         _validate_peer_replay_config()
+
+
+@pytest.mark.parametrize(
+    "is_moe, enable_ep, enable_eplb, initial_filter, expected",
+    [
+        (True, True, False, False, True),
+        (False, True, False, False, False),
+        (True, False, False, False, False),
+        (True, True, True, False, False),
+        (True, True, True, True, True),
+    ],
+)
+def test_default_ep_weight_filter_gates_on_moe_ep_without_eplb(
+    monkeypatch, is_moe, enable_ep, enable_eplb, initial_filter, expected
+):
+    monkeypatch.setattr(tpu_platform, "_ep_weight_filter_cli_opt_out", False)
+    monkeypatch.setattr(sys, "argv", ["vllm", "serve"])
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(is_moe=is_moe),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=enable_ep,
+            enable_eplb=enable_eplb,
+            enable_ep_weight_filter=initial_filter,
+        ),
+    )
+    tpu_platform._apply_default_ep_weight_filter(vllm_config)
+    assert vllm_config.parallel_config.enable_ep_weight_filter is expected
+
+
+@pytest.mark.parametrize(
+    "cli_args, expected",
+    [
+        ([], True),
+        (["--no-enable-ep-weight-filter"], False),
+        (["--no-enable-ep-weight-filter", "--enable-ep-weight-filter"], True),
+        (["--enable-ep-weight-filter", "--no-enable-ep-weight-filter"], False),
+    ],
+)
+def test_default_ep_weight_filter_respects_cli_opt_out_via_parser(
+    monkeypatch, cli_args, expected
+):
+    monkeypatch.setattr(tpu_platform, "_ep_weight_filter_cli_opt_out", False)
+    monkeypatch.setattr(sys, "argv", ["vllm", "serve"])
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--enable-ep-weight-filter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    TpuPlatform.pre_register_and_update(parser)
+    parsed = parser.parse_args(cli_args)
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(is_moe=True),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True,
+            enable_eplb=False,
+            enable_ep_weight_filter=parsed.enable_ep_weight_filter,
+        ),
+    )
+    tpu_platform._apply_default_ep_weight_filter(vllm_config)
+    assert vllm_config.parallel_config.enable_ep_weight_filter is expected
+
+
+def test_default_ep_weight_filter_respects_sys_argv_opt_out(monkeypatch):
+    monkeypatch.setattr(tpu_platform, "_ep_weight_filter_cli_opt_out", False)
+    monkeypatch.setattr(sys, "argv", ["vllm", "bench", "--no-enable-ep-weight-filter"])
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(is_moe=True),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True,
+            enable_eplb=False,
+            enable_ep_weight_filter=False,
+        ),
+    )
+    tpu_platform._apply_default_ep_weight_filter(vllm_config)
+    assert vllm_config.parallel_config.enable_ep_weight_filter is False
