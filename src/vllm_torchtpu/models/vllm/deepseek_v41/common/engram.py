@@ -608,12 +608,7 @@ def initialize_engram_gate() -> None:
     before tracing: dynamo cannot trace the op's construction."""
     global _ENGRAM_GATE_OP
     if _ENGRAM_GATE_OP is None:
-        from jax.sharding import PartitionSpec as P
         from torch_tpu._internal import pallas
-
-        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-            get_pallas_op_mesh,
-        )
 
         def call(
             x: jax.Array,
@@ -632,14 +627,8 @@ def initialize_engram_gate() -> None:
                 x, w, w_scale, hidden, q_weight, k_weight, mask, eps=eps, clamp=clamp
             )
 
-        op = pallas.jax_op(
-            "pallas::dsv41_engram_gate",
-            call,
-            mesh=get_pallas_op_mesh(),
-            input_partition_specs=cast(
-                tuple[tuple[str, ...], ...], (P(),) * 7 + (None,) * 2
-            ),
-        )
+        # A per-rank kernel, like quantized_matmul: no mesh.
+        op = pallas.jax_op("pallas::dsv41_engram_gate", call)
         op.register_fake(lambda x, w, w_scale, hidden, *_: torch.empty_like(hidden))
         _ENGRAM_GATE_OP = op
 
