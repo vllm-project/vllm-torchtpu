@@ -40,6 +40,7 @@ from vllm_torchtpu.megakernel.models.qwen38_gdn_pool import (
 )
 
 from .qwen38_gdn_state import Qwen38GdnPoolLayout, _conv_windows
+from .qwen38_io_lean import io_lean
 
 RING = 4
 # Deep prefetch for large calls (j-0158b3f2, 64 rows = 192 checkpoints: 132.6 -> 63.3 us
@@ -77,6 +78,7 @@ def scatter_gdn_ckpts_fast(
     interpret: bool = False,
     ring: int | None = None,
     prefetch: int | None = None,
+    hist: bool | None = None,
 ) -> Any:
     """Same contract as `scatter_gdn_ckpts` (per-rank arrays); returns the pool.
 
@@ -91,7 +93,15 @@ def scatter_gdn_ckpts_fast(
     written, as the stock pooled GDN kernel moves no bytes for padded rows:
     the null block's pages are also read (masked) as KV, and f32 state bytes
     there would carry FP8 NaN encodings.
+
+    `hist` (default: VLLM_TPU_MK_IO_LEAN=conv): the kernel reads each request's whole
+    conv history `[HR, QKV]` and picks the window of checkpoint t (rows t+1..t+3) itself,
+    instead of taking `[n, 3, QKV]` windows stacked by XLA before the call (xprof
+    j-3d2506a9: a slice / pad / relayout chain of ~8 us at 8 rows, ~16 us at 16, per call).
+    Same bytes in the pool; each checkpoint loads HR - 3 more conv rows.
     """
+    if hist is None:
+        hist = io_lean("conv")
     NL, NS, T = write_blocks.shape
     n = NL * NS * T
     if ring is None and prefetch is None and envs.VLLM_TPU_MK_SCATTER_DEEP and n >= DEEP_MIN_CKPTS:
@@ -105,7 +115,14 @@ def scatter_gdn_ckpts_fast(
     assert 1 <= P < RING_, (prefetch, ring)
     vh, KD, VD, QKV = layout.n_v, layout.d_k, layout.d_v, layout.conv_dim
     rec = rec_ckpt.reshape(n, vh, KD, VD)  # row block (l, s, t), [layout: (s*T+t)*vh]
-    win = _conv_windows(conv_ckpt.astype(jnp.float32), T).reshape(n, 3, QKV)
+    if hist:  # [NL * NS, HR, QKV]: checkpoint i reads row block i // T
+        HR = conv_ckpt.shape[2]
+        assert HR >= T + 3, (conv_ckpt.shape, T)
+        win = conv_ckpt.astype(jnp.float32).reshape(NL * NS, HR, QKV)
+        win_rows = HR
+    else:
+        win = _conv_windows(conv_ckpt.astype(jnp.float32), T).reshape(n, 3, QKV)
+        win_rows = 3
     ids = write_blocks.reshape(-1).astype(jnp.int32)
     per = QKV // 256
     f8 = pool.dtype
@@ -136,7 +153,9 @@ def scatter_gdn_ckpts_fast(
         def in_copies(i, slot):
             return (
                 pltpu.make_async_copy(rec_ref.at[i], vin.at[slot], sin.at[slot, 0]),
-                pltpu.make_async_copy(win_ref.at[i], cin.at[slot], sin.at[slot, 1]),
+                pltpu.make_async_copy(
+                    win_ref.at[i // T if hist else i], cin.at[slot], sin.at[slot, 1]
+                ),
             )
 
         for k in range(min(P, n)):
@@ -171,6 +190,16 @@ def scatter_gdn_ckpts_fast(
                     vout.at[slot, j], vals[j * rows : (j + 1) * rows], interpret
                 )
             cv = cin[slot]
+            if hist:  # checkpoint t's window: history rows t+1 .. t+3 (`_conv_windows`)
+                t = lax.rem(i, T)
+
+                def hist_row(r):  # row t + 1 + r, by selection over the T static rows
+                    row = cv[1 + r : 2 + r]
+                    for k in range(1, T):
+                        row = jnp.where(t == k, cv[k + 1 + r : k + 2 + r], row)
+                    return row
+
+                cv = jnp.concatenate([hist_row(r) for r in range(3)], axis=0)
             # 256-lane rows of the conv history in row-major order, padded to 16.
             crow = jnp.concatenate(
                 [
@@ -214,7 +243,7 @@ def scatter_gdn_ckpts_fast(
             out_specs=pl.BlockSpec(memory_space=any_),
             scratch_shapes=[
                 pltpu.VMEM((RING_, vh, KD, VD), rec.dtype),
-                pltpu.VMEM((RING_, 3, QKV), jnp.float32),
+                pltpu.VMEM((RING_, win_rows, QKV), jnp.float32),
                 pltpu.VMEM((RING_, SSM_BLOCKS, SSM_ROWS) + tuple(pool.shape[2:]), f8),
                 pltpu.VMEM((RING_, CONV_ROWS) + tuple(pool.shape[2:]), f8),
                 pltpu.SemaphoreType.DMA((RING_, 2)),
