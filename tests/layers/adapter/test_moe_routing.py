@@ -153,6 +153,38 @@ def test_select_experts_rowmax_matches_sort(monkeypatch):
     assert torch.equal(got_i, ref_i.to(torch.int32))
 
 
+def test_select_experts_biased_rowmax_matches_sort(monkeypatch):
+    """With a routing bias the rowmax path picks the unbiased scores at the
+    biased top-k, as the sort path does, end to end."""
+    torch = pytest.importorskip("torch")
+    torch.manual_seed(0)
+    hidden = torch.randn(64, 8, dtype=torch.bfloat16)
+    logits = torch.randn(64, 128)
+    layer = _routing_layer(topk=4)
+    layer.scoring_func = "sigmoid"
+    layer.e_score_correction_bias = torch.randn(128) * 0.1
+    layer.routed_scaling_factor = 2.0
+
+    def run():
+        return moe_routing.select_experts(
+            hidden_states=hidden,
+            router_logits=logits,
+            topk=4,
+            renormalize=True,
+            scoring_fn="sigmoid",
+            layer=layer,
+        )
+
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+    ref_w, ref_i = run()
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "rowmax")
+    got_w, got_i = run()
+
+    assert got_w.dtype == ref_w.dtype and got_i.dtype == torch.int32
+    assert torch.equal(got_w, ref_w)
+    assert torch.equal(got_i, ref_i.to(torch.int32))
+
+
 def test_router_topk_op_is_registered_at_import():
     """The op must exist before the first call: a lazy, lock-guarded
     registration is untraceable by Dynamo and aborts the MoE compile."""

@@ -17,7 +17,7 @@ import torch
 import vllm.envs as vllm_envs
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
+from vllm_torchtpu.layers.adapter.router_topk import rowmax_select, rowmax_select_pick
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -342,8 +342,11 @@ def select_experts(
         bias_shape = [1] * (scores.dim() - 1) + [-1]
         bias = e_score_correction_bias.float().view(bias_shape)
         scores_for_choice = scores + bias
-        _, topk_ids = _topk(scores_for_choice, topk)
-        topk_weights = _pick(scores, topk_ids)
+        if _ROUTER_TOPK == "rowmax":
+            topk_weights, topk_ids = rowmax_select_pick(scores_for_choice, scores, topk)
+        else:
+            _, topk_ids = _topk(scores_for_choice, topk)
+            topk_weights = _pick(scores, topk_ids)
     else:
         topk_weights, topk_ids = _topk(scores, topk)
 

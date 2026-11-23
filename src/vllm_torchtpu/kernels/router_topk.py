@@ -35,42 +35,60 @@ NEG = -3.0e38
 MAX_BLOCK_ROWS = 512
 
 
-def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
+def _select_kernel(x_ref, *refs, topk: int, n: int, pick: bool):
     """One block of rows: top ``topk`` by repeated max-and-mask.
 
     Scores at or below ``NEG`` are clamped up to it first, so every row has a
     maximum some column equals and every index written is a real expert. Ties
-    go to the lowest id.
+    go to the lowest id. With `pick`, the weights are the ``values`` (first of
+    `refs`) at the selected columns instead of the selected scores.
 
     The clamp tests ``x > NEG`` rather than ``isnan(x)`` to catch all three
     spellings of the hazard -- NaN, ``-inf``, ``-FLT_MAX`` -- any of which a
     whole row can be made of. Without it such a row would stay tied with the
     ``finfo.min`` mask and every pass would return column 0.
     """
+    v_ref, w_ref, i_ref = refs if pick else (None, *refs)
     x = jnp.where(x_ref[...] > NEG, x_ref[...], NEG)
     masked = jnp.finfo(x.dtype).min
     iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+    best = None
     for j in range(topk):
         m = jnp.max(x, axis=1, keepdims=True)
+        best = m if best is None else best
         # Lowest column attaining the max; the rest fill with the last expert
         # so the min never selects a phantom.
         idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
-        w_ref[:, j] = m[:, 0]
+        hit = iota == idx[:, None]
+        if pick:
+            # On the bits: an integer sum of the hit value and zeros is that
+            # value exactly (a float max drops NaN, a float sum turns -0.0
+            # into +0.0).
+            bits = jax.lax.bitcast_convert_type(v_ref[...], jnp.int32)
+            picked = jnp.sum(jnp.where(hit, bits, 0), axis=1)
+            w_ref[:, j] = jax.lax.bitcast_convert_type(picked, jnp.float32)
+        else:
+            w_ref[:, j] = m[:, 0]
         i_ref[:, j] = idx.astype(jnp.int32)
-        x = jnp.where(iota == idx[:, None], masked, x)
+        x = jnp.where(hit, masked, x)
     # No score above the sentinel means no real maximum: keep the row
     # poisonous rather than letting renormalization make it plausible.
-    w_ref[...] = jnp.where(w_ref[:, :1] <= NEG, jnp.nan, w_ref[...])
+    w_ref[...] = jnp.where(best <= NEG, jnp.nan, w_ref[...])
 
 
 def select(
-    scores: jax.Array, topk: int, interpret: bool = False
+    scores: jax.Array,
+    topk: int,
+    interpret: bool = False,
+    values: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Top-k over ``[rows, experts]`` f32 scores, values descending.
+    """Top-k over ``[rows, experts]`` f32 scores.
 
-    Returns ``(weights f32, indices int32)`` of shape ``[rows, topk]``, values
-    descending. ``interpret`` runs the kernel on the host, for tests without a
-    TPU.
+    Returns ``(weights f32, indices int32)`` of shape ``[rows, topk]``, the
+    selected scores descending. With ``values`` (``[rows, experts]`` f32,
+    e.g. the scores before a selection bias), the weights are ``values`` at
+    the selected indices: ``take_along_axis(values, indices, 1)`` without an XLA gather.
+    ``interpret`` runs the kernel on the host, for tests without a TPU.
 
     The last grid step reads a partial block when ``rows`` is not a multiple
     of the block; Mosaic discards the stores past ``rows``, and every
@@ -79,10 +97,12 @@ def select(
     """
     rows, n = scores.shape
     block = min(MAX_BLOCK_ROWS, rows)
+    pick = values is not None
+    row_block = pl.BlockSpec((block, n), lambda i: (i, 0))
     return pl.pallas_call(
-        functools.partial(_select_kernel, topk=topk, n=n),
+        functools.partial(_select_kernel, topk=topk, n=n, pick=pick),
         grid=(pl.cdiv(rows, block),),
-        in_specs=[pl.BlockSpec((block, n), lambda i: (i, 0))],
+        in_specs=[row_block, row_block] if pick else [row_block],
         out_specs=[
             pl.BlockSpec((block, topk), lambda i: (i, 0)),
             pl.BlockSpec((block, topk), lambda i: (i, 0)),
@@ -92,9 +112,16 @@ def select(
             jax.ShapeDtypeStruct((rows, topk), jnp.int32),
         ],
         interpret=interpret,
-    )(scores)
+    )(scores, *((values,) if pick else ()))
 
 
 def router_topk(scores: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
     """``select`` with a jax_op-compatible signature (arrays, then statics)."""
     return select(scores, topk)
+
+
+def router_topk_pick(
+    scores: jax.Array, values: jax.Array, topk: int
+) -> tuple[jax.Array, jax.Array]:
+    """``select`` of `scores` returning `values` at the picks (jax_op signature)."""
+    return select(scores, topk, values=values)

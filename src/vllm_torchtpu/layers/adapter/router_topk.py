@@ -21,7 +21,7 @@ elsewhere as the identical plain-torch algorithm in
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.router_topk import router_topk
+from vllm_torchtpu.kernels.router_topk import router_topk, router_topk_pick
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 
@@ -37,6 +37,8 @@ def _fake_router_topk(scores: torch.Tensor, topk: int):
 # forward, and Dynamo cannot trace a lock-guarded registration there.
 _op = pallas.jax_op("pallas::moe_router_topk", router_topk)
 _op.register_fake(_fake_router_topk)
+_pick_op = pallas.jax_op("pallas::moe_router_topk_pick", router_topk_pick)
+_pick_op.register_fake(lambda scores, values, topk: _fake_router_topk(scores, topk))
 
 
 def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -48,3 +50,23 @@ def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.
             f"router top-k kernel expects [rows, experts], got {scores.shape}"
         )
     return _op(scores.float(), topk)
+
+
+def rowmax_select_pick(
+    scores: torch.Tensor, values: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`rowmax_select` of `scores`, returning `values` at the picked experts.
+
+    On TPU the kernel picks them, which saves the XLA gather (a scalar-indexed
+    fusion at decode sizes) and the relayouts around it.
+    """
+    if scores.device.type != "tpu":
+        weights, ids = rowmax_topk(scores, topk)
+        picked = values.gather(-1, ids.long())
+        # As the kernel: a row with no real score keeps NaN weights.
+        return torch.where(weights.isnan(), weights, picked), ids
+    if scores.dim() != 2:
+        raise ValueError(
+            f"router top-k kernel expects [rows, experts], got {scores.shape}"
+        )
+    return _pick_op(scores.float(), values.float(), topk)

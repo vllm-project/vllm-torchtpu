@@ -164,3 +164,22 @@ def test_kernel_ties_and_nan_match_the_reference():
 def test_grid_rounds_up_over_the_tuned_block(rows, grid):
     block = min(MAX_BLOCK_ROWS, rows)
     assert -(-rows // block) == grid
+
+
+@pytest.mark.parametrize("rows", [1, 8, 24, 513])
+def test_values_are_picked_at_the_selected_experts(rows):
+    """With ``values`` the indices are unchanged and the weights are the
+    values at them, bit for bit (NaN, -inf and -0.0 included)."""
+    rng = np.random.default_rng(rows)
+    scores = rng.random((rows, EXPERTS), dtype=np.float32)
+    scores[:, :7] = scores[:, :1]  # ties
+    values = rng.standard_normal((rows, EXPERTS)).astype(np.float32)
+    for special in (np.nan, -np.inf, -0.0):
+        values[rng.random(values.shape) < 0.05] = special
+    _, ki = select(jnp.asarray(scores), TOPK, interpret=True)
+    pw, pi = select(
+        jnp.asarray(scores), TOPK, interpret=True, values=jnp.asarray(values)
+    )
+    np.testing.assert_array_equal(np.asarray(pi), np.asarray(ki))
+    want = np.take_along_axis(values, np.asarray(pi), axis=1)
+    np.testing.assert_array_equal(np.asarray(pw).view(np.uint32), want.view(np.uint32))
