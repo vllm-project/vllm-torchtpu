@@ -3594,7 +3594,7 @@ def test_unmap_keeps_async_results_until_sample_tokens_waits(
     On TP ranks other than the executor's output rank, vLLM may drop the
     AsyncTPUModelRunnerOutput when the RPC returns, so _pre_async_results is
     the copy's only owner. execute_model() must neither free it before the
-    copy is waited on (#985) nor block on it ahead of the forward; only a
+    copy is waited on nor block on it ahead of the forward; only a
     request this step continues stays mapped. sample_tokens() waits on the
     copy in _modify_prev_results() and rolls back the committed requests.
     """
@@ -3620,7 +3620,7 @@ def test_unmap_settles_async_results_on_a_zero_token_step():
 
     TPUModelRunner._unmap_disjoint_async_results(runner, zero_token_step=True)
 
-    # Waited on before the results, its only owner, are dropped (#985).
+    # Waited on before the results, its only owner, are dropped.
     assert events == ["wait", "freed"]
     assert runner._pre_async_results is None
     assert req_state.output_token_ids == [7]

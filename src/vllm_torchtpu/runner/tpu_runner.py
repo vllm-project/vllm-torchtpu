@@ -2832,8 +2832,8 @@ class TPUModelRunner(GPUModelRunner):
         _modify_prev_results(), rolls back the requests that left, and replaces
         them. Never drop them unsynchronized: on TP ranks other than the
         executor's output rank, vLLM may discard the AsyncTPUModelRunnerOutput
-        when the RPC returns, leaving these results the only owner of the copy
-        (#985).
+        when the RPC returns, leaving these results the only owner of the copy,
+        whose buffers would be freed mid-transfer.
 
         A zero-token step has no sample_tokens() and no forward to overlap, so
         settle results with committed tokens there instead: kept, they would be
@@ -3000,7 +3000,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # Wait even when there is nothing to roll back: every caller drops or
         # replaces these results afterwards, and on non-output TP ranks they can
-        # be the only owner of the in-flight D2H copy (#985).
+        # be the only owner of the in-flight D2H copy.
         pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
         assert pre_next_tokens_cpu is not None
 
