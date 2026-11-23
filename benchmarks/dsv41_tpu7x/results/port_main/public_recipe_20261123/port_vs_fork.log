@@ -1,0 +1,8 @@
+[PORT-vs-FORK] n=   64 64 greedy tokens identical to fork: True first_div=None | this request: drafts=15 accepted=48 tau=4.200
+[PORT-vs-FORK] n=  700 64 greedy tokens identical to fork: True first_div=None | this request: drafts=21 accepted=42 tau=3.000
+[PORT-vs-FORK] n= 1500 64 greedy tokens identical to fork: True first_div=None | this request: drafts=20 accepted=43 tau=3.150
+[PORT-vs-FORK] n= 5000 64 greedy tokens identical to fork: True first_div=None | this request: drafts=17 accepted=46 tau=3.706
+[PORT-vs-FORK] n=20000 64 greedy tokens identical to fork: True first_div=None | this request: drafts=17 accepted=46 tau=3.706
+[PORT-vs-FORK] USA answer text identical to fork: True (len port=1205 fork=1205, first differing char=None) states=50/50
+[PORT-vs-FORK] USA request acceptance: port drafts=76 accepted=255 tau=4.3553 | fork tau=4.2987 (fork figure was measured through the proxy)
+[PORT-vs-FORK] ALL IDENTICAL: True

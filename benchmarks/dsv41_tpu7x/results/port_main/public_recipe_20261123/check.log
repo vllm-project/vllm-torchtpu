@@ -1,0 +1,14 @@
+[GATE-2+2] pd_passed=True pd=['4', '4', '4', '4', '4', '4', '4', '4', '4', '4', '4', '4', '4', '4', '4', '4']
+[GATE-2+2] local_passed=True local=['4', '4', '4', '4', '4', '4', '4', '4', '4', '4', '4', '4', '4', '4', '4', '4']
+[GATE-USA] pd_states=50/50 local_states=50/50 pd==local=True tau=4.3553 pd_tail='ampshire**, **New Jersey**, **New Mexico**, **North Carolina**, **North Dakota**, **Rhode Island**, **South Carolina**, **South Dakota**, and **West Virginia**.'
+[GATE-EQ] n=64 equal=True first_div=None pd='739204, Alabama, Alaska, Arizona, Arkansas, California, Colorado, Connecticut, D' local='739204, Alabama, Alaska, Arizona, Arkansas, California, Colorado, Connecticut, D'
+[GATE-EQ] n=700 equal=True first_div=None pd='739204, Alabama, Alaska, Arizona, Arkansas, California, Colorado, Connecticut, D' local='739204, Alabama, Alaska, Arizona, Arkansas, California, Colorado, Connecticut, D'
+[GATE-EQ] n=1500 equal=True first_div=None pd='739204, Alabama, Alaska, Arizona, Arkansas, California, Colorado, Connecticut, D' local='739204, Alabama, Alaska, Arizona, Arkansas, California, Colorado, Connecticut, D'
+[GATE-EQ] n=5000 equal=True first_div=None pd='739204, Alabama, Alaska, Arizona, Arkansas, California, Colorado, Connecticut, D' local='739204, Alabama, Alaska, Arizona, Arkansas, California, Colorado, Connecticut, D'
+[GATE-EQ] n=20000 equal=True first_div=None pd='739204, Alabama, Alaska, Arizona, Arkansas, California, Colorado, Connecticut, D' local='739204, Alabama, Alaska, Arizona, Arkansas, California, Colorado, Connecticut, D'
+[PD-GATES] hard_gates_passed=True
+STAGE3_REGISTERED_SENDS 102
+STAGE3_COMPLETED_SENDS 102
+STAGE3_SKIPPED_SENDS 0
+STAGE3_TRIM_CHECKED 84 requests; worst case req=cmpl-ef61747a-768b-4822-a802-319573a49254-0-84eefa23 n=19872 max_group_pages=20 untrimmed_would_be=156
+STAGE3_CHECK_OK 1

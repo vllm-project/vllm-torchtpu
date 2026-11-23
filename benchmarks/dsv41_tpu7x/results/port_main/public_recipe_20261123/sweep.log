@@ -1,0 +1,12 @@
+--- repeat 1
+[X1] conc= 256 seqs/rank= 32 tok/step/rank= 192 | step=53.63 ms tau=3.0905 | interior=14751.75 tok/s (3688/chip, 57.6/user) | @3.5=16706.41 | tpot=32.264 ms ttft_p50=28.9603 s
+[X1] conc= 512 seqs/rank= 64 tok/step/rank= 384 | step=82.52 ms tau=3.1015 | interior=19244.21 tok/s (4811/chip, 37.6/user) | @3.5=21716.84 | tpot=36.302 ms ttft_p50=15.0664 s
+[X1] fit: step_ms = 24.7 + 0.150 * tokens_per_rank  (ctx=4000)
+--- repeat 2
+[X1] conc= 256 seqs/rank= 32 tok/step/rank= 192 | step=48.43 ms tau=3.0798 | interior=16280.33 tok/s (4070/chip, 63.6/user) | @3.5=18501.56 | tpot=18.012 ms ttft_p50=2.7276 s
+[X1] conc= 512 seqs/rank= 64 tok/step/rank= 384 | step=72.69 ms tau=3.0831 | interior=21715.11 tok/s (5429/chip, 42.4/user) | @3.5=24651.44 | tpot=27.148 ms ttft_p50=5.687 s
+[X1] fit: step_ms = 24.2 + 0.126 * tokens_per_rank  (ctx=4000)
+--- repeat 3
+[X1] conc= 256 seqs/rank= 32 tok/step/rank= 192 | step=48.29 ms tau=3.0974 | interior=16419.93 tok/s (4105/chip, 64.1/user) | @3.5=18554.2 | tpot=17.011 ms ttft_p50=2.7031 s
+[X1] conc= 512 seqs/rank= 64 tok/step/rank= 384 | step=72.89 ms tau=3.0921 | interior=21719.78 tok/s (5430/chip, 42.4/user) | @3.5=24584.98 | tpot=25.771 ms ttft_p50=5.3776 s
+[X1] fit: step_ms = 23.7 + 0.128 * tokens_per_rank  (ctx=4000)

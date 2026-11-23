@@ -1,0 +1,4 @@
+[BOOTSTRAP] vllm-torchtpu 630a3aae60 | vllm v0.33.0 + 4 patches
+[BOOTSTRAP] runtime: torch=2.13.0+cpu torch_tpu=0.2.0 libtpu=0.0.50 jax=0.11.2 tpu-sync-torch=0.0.1.dev20261029081917 vllm=0.33.0+empty
+CKPT_READY in 655.7s (source=deepseek-ai/DeepSeek-V4.1-Flash)
+BOOTSTRAP_OK in 673s

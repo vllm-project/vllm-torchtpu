@@ -1,0 +1,37 @@
+# Pod template for the DeepSeek-V4.1-Flash 1P1D recipe: one tpu7x 2x2x1 host (4 chips) per role.
+#   for r in prefill decode; do sed "s/ROLE/$r/g" pod.yaml | kubectl apply -f -; done
+# hostNetwork: the Raiden KV transport maps data NICs to NUMA nodes and needs the host's NICs.
+# hostPath /dev/shm: the checkpoint (510 GB) and the compile caches live in tmpfs; the host has ~940 GB of RAM.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dsv41-ROLE
+  labels: {app: dsv41, role: ROLE}
+  annotations: {cluster-autoscaler.kubernetes.io/safe-to-evict: "false"}
+spec:
+  restartPolicy: Never
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeSelector:
+    cloud.google.com/gke-tpu-accelerator: tpu7x
+    cloud.google.com/gke-tpu-topology: 2x2x1
+  tolerations: [{operator: Exists}]
+  volumes:
+    - {name: dshm, hostPath: {path: /dev/shm}}
+  containers:
+    - name: tpu-worker
+      image: vllm/vllm-tpu:nightly
+      securityContext: {privileged: true}
+      command: ["bash", "-lc", "sleep infinity"]
+      env:
+        - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
+        - {name: TPU_WORKER_ID, value: "0"}
+        - {name: TPU_LOG_DIR, value: /tmp/tpu_logs/tpu-worker}
+        - {name: TPU_PROCESS_PORT, value: "8471"}
+        - {name: TPU_PROCESS_ADDRESSES, value: "localhost:8471"}
+        - {name: TPU_WORKER_HOSTNAMES, value: localhost}
+      resources:
+        limits: {google.com/tpu: "4"}
+        requests: {google.com/tpu: "4", memory: 200Gi}
+      volumeMounts:
+        - {name: dshm, mountPath: /dev/shm}

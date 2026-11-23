@@ -1,0 +1,1 @@
+docker.io/vllm/vllm-tpu@sha256:97da0de1581c928ea8a76b4e3ba501a980df6bfafca1b5c22b810827c6ca8e87
