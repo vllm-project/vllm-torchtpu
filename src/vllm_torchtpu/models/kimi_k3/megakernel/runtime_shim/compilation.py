@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import importlib
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
@@ -27,7 +29,7 @@ from vllm_torchtpu.logger import init_logger
 from . import export_cache
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Iterator, Mapping
 
 logger = init_logger(__name__)
 
@@ -101,6 +103,27 @@ def _drain_pending_compiles(
     return drain_error
 
 
+@contextlib.contextmanager
+def custom_compiler_options_context(
+    options: Mapping[str, str],
+) -> Iterator[None]:
+    """Apply ``torch_tpu`` custom compiler ``options`` for the enclosed block.
+
+    Centralizes access to ``torch_tpu._internal.compiler_options`` inside
+    ``runtime_shim`` so program modules do not import private ``torch_tpu``
+    submodules directly.
+
+    Args:
+        options: Mapping of compiler option names to string values.
+
+    Yields:
+        Control to the caller while ``options`` are active.
+    """
+    compiler_options = importlib.import_module("torch_tpu._internal.compiler_options")
+    with compiler_options.custom_compiler_options(dict(options)):
+        yield
+
+
 def compile_ops(calls: Iterable[CompileCall]) -> None:
     """Populate the eager executable cache with at most eight pending compiles.
 
@@ -114,9 +137,8 @@ def compile_ops(calls: Iterable[CompileCall]) -> None:
         calls: Iterable of :class:`CompileCall` specifications to compile.
     """
     execution_mode = export_cache.resolve_execution_mode_module()
-    # Deferred imports keep torch_tpu out of import time for standalone tools.
+    # Deferred import keeps torch_tpu out of import time for standalone tools.
     from torch_tpu._internal.compile import tpu_torch_compile
-    from torch_tpu._internal.compiler_options import custom_compiler_options
 
     pending: list[tuple[_CompileHandle, tuple[object, ...], tuple[object, ...]]] = []
     eager_mode = export_cache.resolve_compile_fx_eager_mode(execution_mode)
@@ -130,7 +152,7 @@ def compile_ops(calls: Iterable[CompileCall]) -> None:
             )
             with execution_mode.set_eager_mode(eager_mode):
                 outputs = call.op(*inputs)
-            with custom_compiler_options(call.options):
+            with custom_compiler_options_context(call.options):
                 handle = tpu_torch_compile.async_traverse_and_compile(
                     list(outputs), list(inputs), fast_compile=True
                 )
