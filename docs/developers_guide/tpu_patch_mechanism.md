@@ -61,8 +61,13 @@ registry does not reload modules.
 
 To add TPU patches or workarounds for a new model architecture or family:
 
-1. Implement the patch callback in `src/vllm_torchtpu/models/vllm/<model_name>_patch.py`
-   (e.g., `maybe_patch_<model>`).
+1. Implement the patch callback in the model directory, for example
+   `src/vllm_torchtpu/models/<model_name>/patch.py` (e.g., `maybe_patch`; the
+   directory already names the model). Existing patches of the legacy models stay in
+   `src/vllm_torchtpu/models/vllm/`; do not add new ones there. A patch changes
+   vLLM or library behaviour; registering the architecture or its config hook
+   goes in the directory's `register()` instead (see
+   [Model directories](model_directories.md)).
 2. Inside the callback:
     - Accept `model_config: Optional["ModelConfig"] = None`.
     - Inspect `model_config` to check if it matches the target model family.
@@ -75,7 +80,7 @@ To add TPU patches or workarounds for a new model architecture or family:
 
 ```python
 Patch(
-    "vllm_torchtpu.models.vllm.<model_name>_patch:maybe_patch_<model>",
+    "vllm_torchtpu.models.<model_name>.patch:maybe_patch",
     ("platform_activation", "model_load"),
     model_config=True,
 ),
