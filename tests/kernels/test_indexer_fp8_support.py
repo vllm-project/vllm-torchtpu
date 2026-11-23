@@ -17,7 +17,7 @@ def descriptors(tokens=288, width=128, key_dtype=jnp.bfloat16):
 
 
 @pytest.mark.parametrize("page", [128, 256])
-@pytest.mark.parametrize("tokens", [128, 256, 288, 384, 512])
+@pytest.mark.parametrize("tokens", [72, 128, 256, 288, 384, 512])
 def test_verified_shapes_supported(monkeypatch, tokens, page):
     monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
     assert prepare.supports_sorted_fp8(*descriptors(tokens), page)
@@ -60,7 +60,7 @@ def test_layout_contract_fallback(monkeypatch, change):
 @pytest.mark.parametrize("page_size", [128, 256])
 @pytest.mark.parametrize(
     ("tokens", "invalid", "contiguous"),
-    [(128, False, False), (288, True, False), (300, False, True)],
+    [(72, True, False), (128, False, False), (288, True, False), (300, False, True)],
 )
 def test_sorted_write_matches_native(
     monkeypatch, page_size, tokens, invalid, contiguous

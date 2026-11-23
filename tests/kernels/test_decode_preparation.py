@@ -269,3 +269,30 @@ def test_swa_word_pool_pack_matches_native(tokens, case):
     np.testing.assert_array_equal(fused[0].reshape(-1), np.asarray(native[0]))
     for got, want in zip(fused[1:], native[1:]):
         np.testing.assert_array_equal(got[keep], np.asarray(want)[keep])
+
+
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="fused TPU region")
+@pytest.mark.parametrize("tokens,requests", sorted(prep.MAIN_RECORD_BATCHES))
+def test_main_records_match_native(tokens, requests):
+    """Every admitted (tokens, requests) bucket is bitwise the native lookup."""
+    rng = np.random.default_rng(tokens * 1000 + requests)
+    page_size, columns = 128, 300
+    lengths = rng.multinomial(tokens - requests, np.ones(requests) / requests) + 1
+    starts = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32)
+    pages = rng.integers(0, 2**31 - 1, (requests, columns), dtype=np.int64).astype(
+        np.int32
+    )
+    selected = rng.integers(0, columns * page_size, (tokens, 512)).astype(np.int32)
+    selected[rng.random((tokens, 512)) < 0.2] = -1
+    inputs = tuple(jnp.asarray(a) for a in (selected, pages, starts))
+    records, counts = prep.main_records_call(inputs, page_size=page_size)(*inputs)
+    req = np.repeat(np.arange(requests), lengths)
+    valid = selected >= 0
+    logical = np.maximum(selected, 0)
+    want = np.where(
+        valid,
+        pages[req[:, None], logical // page_size] * page_size + logical % page_size,
+        -1,
+    )
+    np.testing.assert_array_equal(np.asarray(records), want)
+    np.testing.assert_array_equal(np.asarray(counts), valid.sum(axis=1))
