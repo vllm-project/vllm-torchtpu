@@ -417,6 +417,13 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     else:
         union = _sorted_unions(per_tile)
     groups_per_tile = _groups_per_tile(block_q, topk, pages_per_step)
+    padded = jnp.pad(
+        jnp.where(union == _NO_PAGE, -1, union),
+        ((0, 0), (0, groups_per_tile * pages_per_step - union_size)),
+        constant_values=-1,
+    )
+    if num_tiles == 1:
+        return _single_tile_work(padded, pages_per_step)
     # A tile with no page still gets one all-masked group so its output is set.
     pages_in_tile = jnp.sum(union != _NO_PAGE, axis=1, dtype=jnp.int32)
     groups_in_tile = jnp.maximum(-(-pages_in_tile // pages_per_step), 1)
@@ -440,12 +447,39 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
         | jnp.where(w == start, _FIRST_BIT, 0)
         | jnp.where(w + 1 == end, _LAST_BIT, 0)
     )
-    union = jnp.pad(
-        jnp.where(union == _NO_PAGE, -1, union),
-        ((0, 0), (0, groups_per_tile * pages_per_step - union_size)),
-        constant_values=-1,
+    return padded.reshape(-1), meta.astype(jnp.int32), ends[-1], count
+
+
+def _single_tile_work(padded: jax.Array, pages_per_step: int):
+    """`_work_list` of one tile (a decode batch) from per-group counts.
+
+    The union's pages are its first slots, so group ``w``'s count is the
+    number of pages in its own slots. With one tile, the general path's
+    per-tile totals are rank-0 values, which XLA routes through scalar memory
+    and a chain of scalar ops (~1.9 us per layer in the b1 decode twin,
+    j-5e7f2de1); these per-group reductions stay vector ops.
+    """
+    groups = padded.shape[1] // pages_per_step
+    count = jnp.sum(
+        padded.reshape(groups, pages_per_step) >= 0, axis=1, dtype=jnp.int32
     )
-    return union.reshape(-1), meta.astype(jnp.int32), ends[-1], count
+    w = jnp.arange(groups, dtype=jnp.int32)
+    live = _single_tile_live(count)
+    last = live & ~jnp.pad(live[1:], (0, 1))
+    meta = (
+        (w << _ROW_SHIFT)
+        | jnp.where(w == 0, _FIRST_BIT, 0)
+        | jnp.where(last, _LAST_BIT, 0)
+    )
+    return padded.reshape(-1), meta, jnp.sum(live, dtype=jnp.int32), count
+
+
+def _single_tile_live(count: jax.Array) -> jax.Array:
+    """Which of a single tile's groups (`_single_tile_work`) are in its work
+    list: the first always (an empty tile still gets one group), the rest
+    while they hold a page."""
+    first = jnp.arange(count.shape[-1], dtype=jnp.int32) == 0
+    return (count > 0) | first
 
 
 def _attention_call(

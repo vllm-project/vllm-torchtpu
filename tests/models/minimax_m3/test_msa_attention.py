@@ -267,6 +267,32 @@ def test_dense_work_list_matches_unique(
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
+@pytest.mark.parametrize("pages_cap", [1, 7, 40, 4000])
+@pytest.mark.parametrize("drop", [0.0, 0.5, 1.0])
+def test_single_tile_work_list_matches_general_path(pages_cap, drop):
+    """A one-tile work list (`_single_tile_work`) equals that tile's part of
+    the general path, run with an empty second tile appended (one more
+    all-masked group)."""
+    block_q, topk, pages_per_step = 8, 16, 16
+    rng = np.random.default_rng(pages_cap + int(drop * 10))
+    for _ in range(20):
+        selected = rng.integers(0, pages_cap, size=(block_q, topk)).astype(np.int32)
+        selected[rng.random(selected.shape) < drop] = -1
+        one = msa_attention._work_list(jnp.asarray(selected), block_q, pages_per_step)
+        two = msa_attention._work_list(
+            jnp.asarray(np.concatenate([selected, np.full_like(selected, -1)])),
+            block_q,
+            pages_per_step,
+        )
+        union, meta, num_groups, count = (np.asarray(x) for x in one)
+        groups = meta.shape[0]
+        assert int(num_groups) == int(two[2]) - 1
+        np.testing.assert_array_equal(union, np.asarray(two[0])[: union.shape[0]])
+        live = slice(0, int(num_groups))
+        np.testing.assert_array_equal(meta[live], np.asarray(two[1])[live])
+        np.testing.assert_array_equal(count, np.asarray(two[3])[:groups])
+
+
 def test_fp4_lse_small_tiles_match_default_tiles():
     """The DCP attention's 8-token tiles (small batches) on a 4-bit cache give
     the 16-token tiles' output and lse."""
