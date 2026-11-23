@@ -75,6 +75,7 @@ if [ "$1" = "meta-data" ]; then
         set) printf '%s' "$4" > "$META_DIR/$3" ;;
         get) cat "$META_DIR/$3" ;;
         exists)
+            [ "${META_EXISTS_FAIL_KEY:-}" = "$3" ] && exit "${META_EXISTS_FAIL_CODE:-2}"
             [ -e "$META_DIR/$3" ] && exit 0
             case "$3" in release-*) exit 100 ;; esac
             exit 1
@@ -396,6 +397,19 @@ def test_no_release_image_is_built_from_a_commit_preflight_did_not_gate(release)
         f"this step's checkout is at {later}, but preflight gated the release on"
         f" {release.head}." in completed.stderr
     )
+    assert calls == []
+
+
+@pytest.mark.parametrize("key", ["release-version", "release-revision"])
+def test_release_build_stops_when_metadata_lookup_fails(release, key):
+    completed, calls = release.run(
+        _RELEASE_SCRIPT,
+        META_EXISTS_FAIL_KEY=key,
+        META_EXISTS_FAIL_CODE="2",
+    )
+
+    assert completed.returncode == 1
+    assert f"could not read meta-data {key} (exit 2)." in completed.stderr
     assert calls == []
 
 
