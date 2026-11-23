@@ -1021,7 +1021,10 @@ class Eagle3Proposer:
                 mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
             ),
         ):
-            if loop is not self._mtp_fused_loop:
+            mk_loop = loop is not self._mtp_fused_loop
+            if envs.VLLM_TPU_DRAFT_LOOP_DIRECT_EXEC:
+                loop = self._fused_loop_direct(loop)
+            if mk_loop:
                 loop = _mk_program(loop, "fused draft loop")
             if not getattr(self, warm_attr):
                 # The first call traces and compiles; like the loop-step
@@ -1033,6 +1036,22 @@ class Eagle3Proposer:
                 seq_lens.copy_(seq_lens_step1)
                 setattr(self, warm_attr, True)
             return loop(input_ids, positions, hidden_states, seq_lens)
+
+    def _fused_loop_direct(self, loop: torch.nn.Module) -> Any:
+        """VLLM_TPU_DRAFT_LOOP_DIRECT_EXEC: `loop` behind its `DirectExec`, which
+        records each bucket on its first compiled call and calls the executable
+        directly after that (compilation/direct_exec.py)."""
+        cache = self.__dict__.setdefault("_fused_loop_direct_exec", {})
+        direct = cache.get(id(loop))
+        if direct is None or direct.program is not loop:
+            from vllm_torchtpu.compilation.direct_exec import DirectExec
+
+            direct = cache[id(loop)] = DirectExec(
+                loop,
+                "mtp_fused_loop",
+                snapshot=envs.VLLM_TPU_DIRECT_EXEC_SNAPSHOT,
+            )
+        return direct
 
     def _mk_fused_loop_for(self, num_tokens: int) -> torch.nn.Module | None:
         """The MK fused loop when this step's token count is one of its compile sizes
@@ -1139,6 +1158,16 @@ class Eagle3Proposer:
                     mtp=self.draft_model,
                     rows_per_request=4,
                     dynamic_arg_dims=getattr(self.draft_model, "_dynamic_arg_dims", {}),
+                )
+            if envs.VLLM_TPU_DRAFT_DIRECT_EXEC:
+                # Called as the module: compiles through it, then each bucket
+                # is recorded once and called directly (compilation/direct_exec.py).
+                from vllm_torchtpu.compilation.direct_exec import DirectExec
+
+                self._mk_draft_step0 = DirectExec(
+                    self._mk_draft_step0,
+                    "mk_draft_step0",
+                    snapshot=envs.VLLM_TPU_DIRECT_EXEC_SNAPSHOT,
                 )
             self._mk_draft_step0_warm = False
         attn_metadata = self._build_draft_attn_metadata(

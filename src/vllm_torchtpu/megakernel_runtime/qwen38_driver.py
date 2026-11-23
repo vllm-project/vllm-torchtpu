@@ -1086,7 +1086,9 @@ class Qwen38SegmentDriver:
             from vllm_torchtpu.compilation.direct_exec import DirectExec
 
             direct = self._whole_direct_exec = DirectExec(
-                self.whole_program, "model_mk_whole"
+                self.whole_program,
+                "model_mk_whole",
+                snapshot=envs.VLLM_TPU_DIRECT_EXEC_SNAPSHOT,
             )
         return direct
 
