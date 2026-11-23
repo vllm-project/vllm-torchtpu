@@ -26,6 +26,11 @@ and a larger tensor (a prefill chunk) takes a psum over the same mesh, which
 XLA lowers as it lowers the usual all-reduce. The kernel's output bits can
 differ from XLA's all-reduce: it sums in f32 in rank order and rounds once;
 every rank gets the same bits.
+
+With TPU_MINIMAX_M3_SP_QRS (and a rank-ordered mesh), `arm` also builds a row
+reduce-scatter op for the sequence-parallel steps (`reduce_scatter`): steps of
+>= TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS rows run qar_reduce_scatter (int8 ICI
+payload), smaller ones XLA's reduce-scatter (psum_scatter) over the same mesh.
 """
 
 import dataclasses
@@ -46,6 +51,7 @@ from vllm.distributed import parallel_state
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
 from vllm_torchtpu.kernels.collectives import qar_all_reduce as qar
+from vllm_torchtpu.kernels.collectives import qar_reduce_scatter as qrs
 from vllm_torchtpu.kernels.collectives import tp_all_reduce as kernel
 from vllm_torchtpu.logger import init_logger
 
@@ -64,10 +70,13 @@ class _Armed:
     # Every rank's mesh index equals its group rank (decided once, from all
     # ranks' indices, so the answer is the same on every rank).
     rank_ordered: bool = False
+    # Row reduce-scatter op (TPU_MINIMAX_M3_SP_QRS), or None.
+    rs_op: Any = None
 
 
 _ARMED: _Armed | None = None
 _QAR_TRACED: set[int] = set()
+_QRS_TRACED: set[int] = set()
 
 
 def _qdq(x: jax.Array) -> jax.Array:
@@ -190,6 +199,70 @@ def _make_op(mesh, max_bytes: int, direct_rows: int = 0,
     )
     op.register_fake(lambda x, rank: torch.empty_like(x))
     return op
+
+
+def qrs_applies(rows: int, hidden: int, min_rows: int) -> bool:
+    """Whether a [rows, hidden] row reduce-scatter runs qar_reduce_scatter."""
+    return 0 < min_rows <= rows and rows % 8 == 0 and hidden % 256 == 0
+
+
+def _rs_body(axis: str, min_rows: int, tab: np.ndarray):
+    def body(x, rank):
+        rows, hidden = x.shape
+        # Static per bucket: decided at trace time inside the op.
+        if qrs_applies(rows, hidden, min_rows):
+            if rows not in _QRS_TRACED:
+                _QRS_TRACED.add(rows)
+                logger.warning("tp_reduce_scatter: qar_reduce_scatter lowered for [%d, %d]",
+                               rows, hidden)
+            return qrs.reduce_scatter(x, rank, tab)
+        return lax.psum_scatter(x, axis, scatter_dimension=0, tiled=True)
+
+    return body
+
+
+def _make_rs_op(mesh, min_rows: int):
+    axis = mesh.axis_names[0]
+    n = int(mesh.size)
+    tab = qrs.layout_table(_qar_devices(mesh))
+    specs = (P(axis), P(axis))
+    sharded = jax.shard_map(
+        _rs_body(axis, min_rows, tab),
+        mesh=mesh,
+        in_specs=specs,
+        out_specs=P(axis),
+        check_vma=False,
+    )
+
+    def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
+        args = (x, rank)
+        return sharded(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        "pallas::tp_qar_reduce_scatter",
+        fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=P(axis),
+    )
+    op.register_fake(lambda x, rank: x.new_empty((x.shape[0] // n, x.shape[1])))
+    return op
+
+
+def _qrs_selftest(op, rank, n: int, hidden: int, device, rows: int) -> dict:
+    """One row reduce-scatter of known partials: rel L2 of this rank's chunk
+    against the exact sum of its rows (a chunk in the wrong place shows)."""
+    gen = torch.Generator().manual_seed(4321)
+    parts = torch.randn((n, rows, hidden), generator=gen).to(torch.bfloat16)
+    me = int(rank.reshape(-1)[0].item())
+    out = op(parts[me].to(device), rank).float().cpu()
+    c = rows // n
+    exact = parts.double().sum(0)[me * c : (me + 1) * c]
+    rel = float((out.double() - exact).norm() / exact.norm())
+    return dict(rank=me, rel=rel)
 
 
 def _refusal() -> str | None:
@@ -322,11 +395,32 @@ def arm(hidden: int, device: torch.device) -> bool:
             envs.TPU_TP_AR_QDQ_ROWS,
             qdq_min_rows,
         )
+    rs_op = None
+    if envs.TPU_MINIMAX_M3_SP_QRS:
+        rs_min = envs.TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS
+        test_rows = max(-(-rs_min // 8) * 8, 8 * qrs.TILE)
+        if not rank_ordered:
+            logger.warning("tp_reduce_scatter: qar_reduce_scatter not armed: mesh index"
+                           " != TP rank on some rank")
+        elif n != 8 or not qrs_applies(test_rows, hidden, rs_min):
+            logger.warning("tp_reduce_scatter: qar_reduce_scatter not armed: %d ranks,"
+                           " hidden %d, min rows %d", n, hidden, rs_min)
+        else:
+            rs_op = _make_rs_op(mesh, rs_min)
+            seen = _gather(_qrs_selftest(rs_op, rank, n, hidden, device, test_rows))
+            if max(r["rel"] for r in seen) >= 0.03:
+                raise RuntimeError(f"qar_reduce_scatter: self-test failed: {seen}")
+            logger.info(
+                "tp_reduce_scatter: qar_reduce_scatter (int8 ICI payload) on SP row"
+                " reduce-scatters of >= %d rows (TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS);"
+                " self-test passed: %s", rs_min, [round(r["rel"], 4) for r in seen],
+            )
     _ARMED = _Armed(
         ranks=tuple(int(r) for r in tp.ranks),
         op=op,
         rank=rank,
         rank_ordered=rank_ordered,
+        rs_op=rs_op,
     )
     logger.info(
         "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views"
@@ -360,6 +454,20 @@ def all_reduce(ranks, x: torch.Tensor) -> torch.Tensor | None:
     # branch here would give the model's Dynamo traces different graphs (and
     # inputs) per bucket, which shape_variants refuses to hand buckets between.
     return armed.op(x, armed.rank)
+
+
+def reduce_scatter(ranks, x: torch.Tensor) -> torch.Tensor | None:
+    """Row reduce-scatter of x over the group of `ranks` with the armed
+    qar_reduce_scatter op (rank r gets rows [r T/n, (r + 1) T/n) of the sum),
+    or None when it is not armed for this group or tensor (the caller takes
+    its usual path). Sizes below the op's minimum take a psum_scatter inside
+    the op, so every bucket traces the same graph."""
+    armed = _ARMED
+    if armed is None or armed.rs_op is None or tuple(ranks) != armed.ranks:
+        return None
+    if x.dtype != torch.bfloat16 or x.dim() != 2:
+        return None
+    return armed.rs_op(x, armed.rank)
 
 
 def armed_rank(ranks) -> torch.Tensor | None:
