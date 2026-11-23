@@ -695,6 +695,52 @@ class TestAttentionMetadataBuilderPlumbing:
         stage_block_table_uploads(runner, ctx_preinit, 4)
         assert ctx_preinit.staged_block_tables is None
 
+    @pytest.mark.parametrize("keep", [False, True])
+    def test_dummy_walk_keeps_its_zero_table_on_device(self, monkeypatch, keep):
+        monkeypatch.setenv("TPU_DP_IDLE_DUMMY_KEEP_BLOCK_TABLE", "1" if keep else "0")
+        runner = self._make_runner_mock(num_groups=2)
+        builders = [
+            self._make_builder(runner, kv_cache_group_id=gid) for gid in range(2)
+        ]
+        self._make_attn_groups(runner, builders)
+
+        def dummy_walk():
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=4,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones((4,), dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+                position_ids_override=torch.zeros((8,), dtype=torch.int32),
+            )
+            stage_block_table_uploads(runner, ctx, 4)
+            return ctx.staged_block_tables
+
+        first = dummy_walk()
+        # A real walk in between must not change what the next dummy reads.
+        real = AttentionMetadataBuilderContext(
+            num_reqs=4,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.full((4,), 64, dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+        )
+        stage_block_table_uploads(runner, real, 4)
+        assert int(real.staged_block_tables[1].max()) > 0
+        second = dummy_walk()
+
+        # Kept: the 2 dummy walks upload once in total (the real walk adds 1).
+        assert len(runner._unfenced_h2d_sources) == (2 if keep else 3)
+        for tables in (first, second):
+            assert set(tables) == {0, 1}
+            for table in tables.values():
+                assert table.shape == (4 * 4,)
+                assert torch.equal(table, torch.zeros_like(table))
+        # Each walk still gets its own product buffers.
+        assert first[0].data_ptr() != second[0].data_ptr()
+
     def test_active_block_table_columns_buckets_partial_prefill(self):
         """Partial-prefill steps copy only power-of-2 bucketed active columns
         while preserving full-row strides for downstream kernels."""
