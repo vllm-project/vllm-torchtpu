@@ -595,6 +595,9 @@ class TPUWorker(WorkerBase):
     def pp_settle(self):
         return self.model_runner.pp_settle()
 
+    def pp_flush(self, force: bool = True):
+        return self.model_runner.pp_flush(force)
+
     def pp_drains_before_handoff(self) -> bool:
         """Whether this worker's stage drains the slice before each hand-off
         launch."""

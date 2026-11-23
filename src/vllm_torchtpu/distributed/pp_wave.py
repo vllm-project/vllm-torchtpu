@@ -80,13 +80,31 @@ worker of the slice before each hand-off: with a stage program and a hand-off
 running at the same time, a core of the stage stops inside a stage collective
 and the runtime halts the device. A one-chip stage never showed this and
 launches the hand-off without waiting.
+
+That drain blocks stage 0's host until its forward has finished, so all the
+host work of the next step (reading the engine's message, updating the
+batch, preparing inputs) runs while the device idles. With
+``TPU_PP_DEFER_HANDOFF`` on a two-stage pipeline, stage 0 instead keeps the
+output of forward m and launches it right before forward m+1, once that
+forward's inputs are prepared, the way later stages launch: the launch
+number and its payload stay the same, only the moment moves. The engine
+tells stage 0 to launch what it holds (``flush``) when it would otherwise
+wait for that step with nothing more to dispatch, before any call that is
+not part of a step, and, without forcing, whenever a result arrives: stage 0
+then launches only if its device has already finished, decided by every
+worker of the stage together so that they all keep the same order of
+programs.
 """
 
+import time
+from collections import defaultdict
 from typing import Any
 
 import torch
 from vllm.sequence import IntermediateTensors
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.pp_push import defer_handoff
 from vllm_torchtpu.distributed.pp_shift import get_or_create_pp_mesh, pp_permute_op
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
@@ -106,6 +124,120 @@ def pp_rank_flags(parallel_config: Any) -> tuple[bool, bool]:
 
     group = get_pp_group()
     return bool(group.is_first_rank), bool(group.is_last_rank)
+
+
+class _HostTiming:
+    """Host time between forwards, summarized every ``every`` forwards."""
+
+    # (name, from mark, to mark); a cycle ends at each forward's dispatch.
+    SEGMENTS = (
+        ("drain", "drain_start", "drain_end"),
+        ("barrier", "drain_end", "barrier_end"),
+        ("launch", "barrier_end", "launch_end"),
+        ("idle_to_dispatch", "drain_end", "dispatched"),
+        ("ret_to_entry", "ret", "entry"),
+        ("sample", "sample_start", "sample_end"),
+        ("entry_to_prep", "entry", "prep"),
+        ("prep_to_dispatch", "prep", "dispatched"),
+    )
+
+    def __init__(self, label: str, every: int = 200):
+        self.label = label
+        self.every = every
+        self.marks: dict[str, float] = {}
+        self.samples: dict[str, list[float]] = defaultdict(list)
+        self.counts: dict[str, int] = defaultdict(int)
+        self.forwards = 0
+
+    def count(self, name: str) -> None:
+        self.counts[name] += 1
+
+    def note(self, mark: str) -> None:
+        now = time.perf_counter()
+        self.marks[mark] = now
+        if mark != "dispatched":
+            return
+        for name, a, b in self.SEGMENTS:
+            ta, tb = self.marks.get(a), self.marks.get(b)
+            if ta is not None and tb is not None and 0.0 <= tb - ta < 60.0:
+                self.samples[name].append((tb - ta) * 1e3)
+        self.marks = {}
+        self.forwards += 1
+        if self.forwards % self.every == 0:
+            parts = []
+            for name, _, _ in self.SEGMENTS:
+                xs = sorted(self.samples.get(name, ()))
+                if xs:
+                    parts.append(
+                        f"{name} n={len(xs)} mean={sum(xs) / len(xs):.2f} "
+                        f"p50={xs[len(xs) // 2]:.2f} p90={xs[int(len(xs) * 0.9)]:.2f}"
+                    )
+            parts += [f"{name}={n}" for name, n in sorted(self.counts.items())]
+            logger.info(
+                "PP host timing %s, forwards %d: %s (ms)",
+                self.label,
+                self.forwards,
+                "; ".join(parts),
+            )
+            self.samples = defaultdict(list)
+            self.counts = defaultdict(int)
+
+
+# The timing of this process's wave, noted from inside _drain_slice.
+_timing: _HostTiming | None = None
+
+
+def _note(mark: str) -> None:
+    if _timing is not None:
+        _timing.note(mark)
+
+
+def _submit(tensors: tuple[torch.Tensor, ...]) -> None:
+    """Submits every pending program, then those producing ``tensors``,
+    without waiting; the same flushes as a launch, minus the launch."""
+    from torch_tpu._internal.sync import sync
+
+    sync.synchronize(None, wait=False)
+    sync.synchronize(list(tensors), wait=False)
+
+
+def _record_event() -> Any:
+    """A device event after everything submitted so far."""
+    event = torch.tpu.Event()
+    event.record()
+    return event
+
+
+def _device_idle(event: Any) -> bool:
+    """Whether the device has passed ``event``, without waiting."""
+    return event is None or bool(event.query())
+
+
+def _all_idle(idle: bool, group: Any) -> bool:
+    """True only if every worker of ``group`` reported idle."""
+    import torch.distributed as dist
+
+    flag = torch.tensor([1 if idle else 0], dtype=torch.int32, device="cpu")
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+    return bool(flag.item())
+
+
+def _stage_cpu_group(rank: int) -> Any:
+    """A CPU group of every worker of this worker's pipeline stage; every
+    worker of the world calls this together."""
+    import torch.distributed as dist
+    from vllm.distributed.parallel_state import get_world_group
+
+    world = get_world_group()
+    stages: list[int] = [0] * len(world.ranks)
+    dist.all_gather_object(stages, rank, group=world.cpu_group)
+    mine = None
+    for stage in sorted(set(stages)):
+        ranks = [world.ranks[i] for i, s in enumerate(stages) if s == stage]
+        group = dist.new_group(ranks, backend="gloo")
+        if stage == rank:
+            mine = group
+    return mine
 
 
 def stage_chips() -> int:
@@ -129,6 +261,7 @@ def _drain_slice() -> None:
     from vllm.distributed.parallel_state import get_world_group
 
     sync.synchronize(None, wait=True)
+    _note("drain_end")
     dist.barrier(group=get_world_group().cpu_group)
 
 
@@ -202,26 +335,75 @@ class PPWave:
         self.burst_launches = 0
         self.forwards = 0
         self.pending: tuple[torch.Tensor, ...] | None = None
+        # Stage 0 holds its last forward's output in pending, with an event
+        # after it, until its next forward or a flush (module docstring).
+        self.defer = defer_handoff(self.size)
+        self.pending_event: Any = None
+        self.vote_group: Any = None
+        if self.defer:
+            self.vote_group = _stage_cpu_group(self.rank)
+        global _timing
+        self.timing: _HostTiming | None = None
+        if envs.TPU_PP_HOST_TIMING and self.column == 0:
+            self.timing = _HostTiming(f"stage {self.rank}")
+            _timing = self.timing
         logger.info(
-            "PP wave: rank %d/%d column %d/%d, hand-off carries %s",
+            "PP wave: rank %d/%d column %d/%d%s, hand-off carries %s",
             self.rank,
             self.size,
             self.column,
             self.columns,
+            ", stage 0 defers its hand-off" if self.defer else "",
             ", ".join(
                 f"{key}[{self.max_rows}, {template[key][0][0]}] {template[key][1]}"
                 for key in self.carried
             ),
         )
 
+    def note(self, mark: str) -> None:
+        """Marks a point of the host's step for TPU_PP_HOST_TIMING."""
+        if self.timing is not None:
+            self.timing.note(mark)
+
     def _launch(self, carried: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
         with TraceAnnotation("PP:Handoff"):
             if self.drain_before_handoff:
+                self.note("drain_start")
                 _drain_slice()
+                self.note("barrier_end")
             out = _launch_now(self.op, carried)
+            self.note("launch_end")
         self.launches += 1
         self.burst_launches += 1
         return out
+
+    def _holding(self) -> bool:
+        return self.rank == 0 and self.defer and self.pending is not None
+
+    def _launch_pending(self) -> None:
+        """Stage 0 launches the output it holds."""
+        assert self.pending is not None
+        held, self.pending, self.pending_event = self.pending, None, None
+        self._launch(held)
+
+    def flush(self, force: bool) -> None:
+        """Stage 0 launches the output it holds: always when forced,
+        otherwise only if every worker of the stage has finished the forward
+        that produced it. Other stages hold nothing for this."""
+        if not self._holding():
+            return
+        if not force:
+            idle = _device_idle(self.pending_event)
+            if self.vote_group is not None:
+                idle = _all_idle(idle, self.vote_group)
+            if self.timing is not None:
+                self.timing.count("early_flush" if idle else "kept")
+            if not idle:
+                return
+        elif self.timing is not None:
+            self.timing.count("forced_flush")
+        self._launch_pending()
+        self._check_count()
 
     def _pad(
         self, carried: tuple[torch.Tensor, ...], rows: int
@@ -265,7 +447,7 @@ class PPWave:
                 self._launch(self.zeros)
 
     def _check_count(self, extra: int = 0) -> None:
-        expected = self.forwards + max(self.rank, 1) + extra
+        expected = self.forwards + max(self.rank, 1) + extra - self._holding()
         if self.burst_launches != expected:
             raise RuntimeError(
                 f"PP wave rank {self.rank}: burst of {self.forwards} forwards "
@@ -275,8 +457,11 @@ class PPWave:
     def start_forward(self, rows: int) -> IntermediateTensors | None:
         """Called before forward number m of the burst with its padded token
         count. Returns the incoming activations (None on the first stage)."""
+        self.note("prep")
         self._open_burst()
         if self.rank == 0:
+            if self._holding():
+                self._launch_pending()
             return None
         send = self.pending if self.pending is not None else self.zeros
         self.pending = None
@@ -305,7 +490,13 @@ class PPWave:
         total = tensors[HIDDEN_STATES] + tensors[RESIDUAL]
         outgoing = (total, *(tensors[key] for key in self.carried[1:]))
         padded = self._pad(outgoing, rows)
-        if self.rank == 0:
+        if self.rank == 0 and self.defer:
+            # Submit the output's producers now so the event follows them.
+            assert self.pending is None
+            _submit(padded)
+            self.pending = padded
+            self.pending_event = _record_event()
+        elif self.rank == 0:
             self._launch(padded)
         else:
             self.pending = padded
@@ -318,6 +509,8 @@ class PPWave:
         self._open_burst()
         with TraceAnnotation("PP:Push"):
             if self.rank == 0:
+                if self._holding():
+                    self._launch_pending()
                 self._launch(self.zeros)
             else:
                 send = self.pending if self.pending is not None else self.zeros
@@ -334,6 +527,8 @@ class PPWave:
         if not self.burst_open:
             return
         with TraceAnnotation("PP:Settle"):
+            if self._holding():
+                self._launch_pending()
             if 0 < self.rank < self.last:
                 assert self.pending is not None
                 self._launch(self.pending)

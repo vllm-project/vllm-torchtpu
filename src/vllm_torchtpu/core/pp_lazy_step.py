@@ -65,7 +65,9 @@ _MEASURE_WEIGHT = 0.25
 _MEASURE_BAND = 2.0
 
 # Executor calls that belong to a step; any other call settles first.
-_STEP_METHODS = frozenset({"execute_model", "sample_tokens", "pp_push", "pp_settle"})
+_STEP_METHODS = frozenset(
+    {"execute_model", "sample_tokens", "pp_push", "pp_settle", "pp_flush"}
+)
 
 # Fields of a step without tokens that hold nothing for the workers.
 _STATELESS_FIELDS = frozenset(

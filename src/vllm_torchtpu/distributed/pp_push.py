@@ -42,15 +42,31 @@ creates its own rings, the engine its broadcast ring and every worker its
 reply ring, so the widening is installed in the engine process and, through
 ``widen_message_rings``, in every worker process; the ring size is the
 widest any pipeline in the process asked for.
+
+With ``TPU_PP_DEFER_HANDOFF`` stage 0 of a two-stage pipeline holds each
+forward's output until its next forward (see ``pp_wave``), so the newest
+step reaches the last stage only once another step follows it. Before the
+engine waits for the newest step, and before any call that is not part of a
+step, it sends ``pp_flush`` to have stage 0 launch what it holds; whenever a
+result arrives while a later step is in flight it sends an unforced one,
+which stage 0 obeys only if that step's forward has already finished.
 """
 
 import contextlib
 from concurrent.futures import Future
 from typing import Any, cast
 
-from vllm.logger import init_logger
+from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def defer_handoff(stages: int) -> bool:
+    """Whether stage 0 holds each forward's output until its next forward
+    (see ``pp_wave``); the engine and every worker read the same."""
+    from vllm_torchtpu import envs
+
+    return envs.TPU_PP_DEFER_HANDOFF and stages == 2 and not envs.TPU_PP_LAZY_PUSH
 
 
 class _WaveState:
@@ -70,6 +86,12 @@ class _WaveState:
         self.settles = 0
         # The engine core times the pushes itself (core/pp_lazy_step.py).
         self.lazy = False
+        # Stage 0 defers its hand-off; held is the newest step whose output
+        # it may still hold (0: none), answered the newest step read.
+        self.defer = defer_handoff(stages)
+        self.held = 0
+        self.answered = 0
+        self.flushes = 0
 
     def dispatched(self) -> int:
         """Records a scheduler step and returns its number."""
@@ -77,7 +99,32 @@ class _WaveState:
         self.last_step = self.steps
         self.real_steps += 1
         self.open = True
+        if self.defer:
+            self.held = self.steps
         return self.steps
+
+    def flush(self, executor: Any, force: bool) -> None:
+        """Sends one ``pp_flush``; a forced one empties stage 0's hold."""
+        self.flushes += 1
+        if self.flushes <= 3 or self.flushes % 1000 == 0:
+            logger.info("PP wave flush %d (force=%s)", self.flushes, force)
+        executor.collective_rpc(
+            "pp_flush",
+            args=(force,),
+            non_block=True,
+            unique_reply_rank=executor.output_rank,
+        )
+        if force:
+            self.held = 0
+
+    def after_result(self, executor: Any, step: int) -> None:
+        """A result of ``step`` arrived: if stage 0 may hold a later step,
+        have it launch that step's output if its forward is done."""
+        if not self.defer or step <= self.answered:
+            return
+        self.answered = step
+        if self.held > step:
+            self.flush(executor, force=False)
 
     def push(self, executor: Any) -> tuple[int, Future]:
         """Sends one ``pp_push`` and returns its step number and the last
@@ -115,6 +162,11 @@ class _WaveState:
         lacks, counting the pushes as later steps for the waits that
         follow. With lazy pushes the engine core sends the pushes, and a
         wait settles."""
+        # Stage 0 holds the newest step until something follows it.
+        if self.defer:
+            if self.held == step:
+                self.flush(executor, force=True)
+            return
         # With one or two stages every launch pairs on its own: stage 1's
         # launch before forward m is stage 0's launch after it.
         if not self.open or self.stages <= 2:
@@ -167,7 +219,9 @@ class _PushFuture(Future):
 
     def result(self, timeout=None):
         self._before_waiting()
-        return self._inner.result(timeout)
+        out = self._inner.result(timeout)
+        self._wave.after_result(self._executor, self._step)
+        return out
 
     def exception(self, timeout=None):
         self._before_waiting()
@@ -191,6 +245,12 @@ class _PushFuture(Future):
 
     def add_done_callback(self, fn):
         self._inner.add_done_callback(lambda _: fn(self))
+
+
+# Worker calls that belong to a step.
+_STEP_RPCS = frozenset(
+    {"execute_model", "sample_tokens", "pp_push", "pp_settle", "pp_flush"}
+)
 
 
 def wave_state(executor: Any) -> _WaveState:
@@ -277,6 +337,7 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         return
     orig_execute = MultiprocExecutor.execute_model
     orig_sample = MultiprocExecutor.sample_tokens
+    orig_rpc = MultiprocExecutor.collective_rpc
 
     def execute_model(self, scheduler_output, non_block=False):
         state = wave_state(self)
@@ -297,10 +358,20 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         future = _PushFuture(inner, self, state, state.last_step, state.real_steps)
         return future if non_block else future.result()
 
+    def collective_rpc(self, method, *args, **kwargs):
+        # A call outside a step must not find stage 0 holding a hand-off
+        # the last stage waits for.
+        state = getattr(self, "_tpu_wave_state", None)
+        if state is not None and state.held and method not in _STEP_RPCS:
+            state.flush(self, force=True)
+        return orig_rpc(self, method, *args, **kwargs)
+
     MultiprocExecutor.execute_model = execute_model
     MultiprocExecutor.sample_tokens = sample_tokens
+    MultiprocExecutor.collective_rpc = collective_rpc
     MultiprocExecutor._tpu_pp_wave_patch = True
     logger.info(
-        "PP wave: engine push and settle installed, message ring %d chunks",
+        "PP wave: engine push and settle installed, message ring %d chunks%s",
         _ring_chunks_needed,
+        ", stage 0 defers its hand-off" if defer_handoff(stages) else "",
     )

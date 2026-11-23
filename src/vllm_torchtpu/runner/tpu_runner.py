@@ -3822,6 +3822,8 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if self._pp_wave is not None:
+            self._pp_wave.note("entry")
         pinner = getattr(self, "_cpu_pinner", None)
         if pinner is not None:
             pinner.maybe_pin()
@@ -4130,6 +4132,8 @@ class TPUModelRunner(GPUModelRunner):
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
                 )
+            if self._pp_wave is not None:
+                self._pp_wave.note("dispatched")
 
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling
@@ -4239,6 +4243,8 @@ class TPUModelRunner(GPUModelRunner):
 
         if not self._pp_is_last:
             self._pp_pending_scheduler_output = scheduler_output
+            if self._pp_wave is not None:
+                self._pp_wave.note("ret")
             return None
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -4801,7 +4807,12 @@ class TPUModelRunner(GPUModelRunner):
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
         if self.execute_model_state is None:
             if not self._pp_is_last:
-                return self._sample_tokens_pp_intermediate_stage()
+                if self._pp_wave is not None:
+                    self._pp_wave.note("sample_start")
+                output = self._sample_tokens_pp_intermediate_stage()
+                if self._pp_wave is not None:
+                    self._pp_wave.note("sample_end")
+                return output
             # Nothing to do, output isn't used.
             return None  # type: ignore[return-value]
 
@@ -8002,6 +8013,12 @@ class TPUModelRunner(GPUModelRunner):
         no-op without a pipeline."""
         if self._pp_wave is not None:
             self._pp_wave.settle()
+
+    def pp_flush(self, force: bool = True) -> None:
+        """Stage 0 launches the hand-off it deferred (TPU_PP_DEFER_HANDOFF);
+        unless forced, only once its forward has finished. A no-op elsewhere."""
+        if self._pp_wave is not None:
+            self._pp_wave.flush(force)
 
     def _sample_tokens_pp_intermediate_stage(self) -> ModelRunnerOutput:
         """Sampling runs on the last stage only; earlier stages report just
