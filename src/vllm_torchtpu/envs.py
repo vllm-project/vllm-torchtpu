@@ -802,9 +802,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # refused when a decode MoE kernel that reduces its own output is armed
     # (USE_MOE_TP_DECODE_KERNEL, FUSED_MOE_DECODE_KERNEL on fp8 experts).
     # Sequence-parallel steps keep their own path.
-    "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR": env_int(
-        "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR", 0
-    ),
+    "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR": env_int("TPU_MINIMAX_M3_FUSED_RESIDUAL_AR", 0),
     # With it, qkv_proj (and o_proj above the fused calls' rows) contract e4m3
     # rows (per-row amax / 448 scales) against the e4m3 weights (e4m3 x e4m3)
     # instead of converting the weight to bf16 inside the dot's fusion.

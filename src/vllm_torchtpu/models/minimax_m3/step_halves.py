@@ -15,8 +15,6 @@
 
 import dataclasses
 
-import torch
-
 
 def split_metadata[M](md: M, split: int) -> tuple[M, M, M]:
     """`md` (an AttentionMetadata: seq_lens, query_start_loc and init=False CPU
