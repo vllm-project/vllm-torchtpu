@@ -1052,6 +1052,7 @@ def test_ranks_get_the_same_devices_whichever_host_libtpu_numbers_first(
     assert rank0_env["MASTER_ADDR"] == first_host
     assert rank0_env["TORCH_TPU_SLICEBUILDER_ADDRESSES"].startswith(first_host)
     assert executor._host_order[0] == first_host
+    executor._finalizer.detach()
 
 
 @patch("vllm.v1.executor.ray_executor_v2.RayExecutorV2.__init__", lambda x, y: None)
@@ -1069,7 +1070,7 @@ def test_stop_workers_waits_for_every_killed_worker(mock_ray):
         return answer
 
     actor.__ray_ready__.remote.return_value = ready
-    mock_ray.get.side_effect = lambda ref: ref()
+    mock_ray.get.side_effect = lambda ref, timeout: ref()
     executor = RayDistributedExecutorV2(MockVllmConfig())
     executor.ray_worker_handles = [MagicMock(actor=actor)]
     executor._finalizer = MagicMock()
@@ -1079,6 +1080,34 @@ def test_stop_workers_waits_for_every_killed_worker(mock_ray):
     executor._finalizer.detach.assert_called_once()
     executor.shutdown.assert_called_once()
     assert actor.__ray_ready__.remote.call_count == 2
+
+
+class _GetTimeout(Exception):
+    pass
+
+
+@patch("vllm.v1.executor.ray_executor_v2.RayExecutorV2.__init__", lambda x, y: None)
+@patch("vllm_torchtpu.executors.ray_distributed_executor_v2.ray")
+def test_stop_workers_names_a_worker_that_outlives_the_budget(mock_ray):
+    mock_ray.exceptions.RayActorError = _ActorDied
+    mock_ray.exceptions.GetTimeoutError = _GetTimeout
+    mock_ray.get.side_effect = _GetTimeout
+    executor = RayDistributedExecutorV2(MockVllmConfig())
+    stuck = MagicMock(rank=5, node_id="node_2")
+    stuck.actor.__ray_ready__ = MagicMock()
+    executor.ray_worker_handles = [stuck]
+    executor._finalizer = MagicMock()
+    executor.shutdown = MagicMock()
+    clock = iter([0.0, 1.0, 200.0])
+    with (
+        patch(
+            "vllm_torchtpu.executors.ray_distributed_executor_v2.time.monotonic",
+            side_effect=lambda: next(clock),
+        ),
+        pytest.raises(RuntimeError, match="rank=5 on node node_2"),
+    ):
+        executor._stop_workers()
+    assert mock_ray.get.call_args.kwargs["timeout"] == 119.0
 
 
 def test_ray_distributed_executor_bundle_expansion():
