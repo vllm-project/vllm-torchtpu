@@ -132,12 +132,13 @@ def _set_md(step):
     )
 
 
-def _compile(prog, executables):
+def _compile(prog, executables, dynamic=True):
     args, kw = _inputs(8, 0)
     _set_md(0)
-    torch._dynamo.mark_dynamic(args[0], 0)
-    torch._dynamo.mark_dynamic(args[1], 0)
-    torch._dynamo.mark_dynamic(kw["valid_tokens"], 0)
+    if dynamic:
+        torch._dynamo.mark_dynamic(args[0], 0)
+        torch._dynamo.mark_dynamic(args[1], 0)
+        torch._dynamo.mark_dynamic(kw["valid_tokens"], 0)
     prog.aot_compiled_fn = None
     with torch._dynamo.config.patch(enable_aot_compile=True), torch.inference_mode():
         compiled = torch.compile(
@@ -156,14 +157,14 @@ def _leaf(monkeypatch):
     torch._dynamo.reset()
 
 
-def _pair(**kw):
+def _pair(dynamic=True, **kw):
     """Two identically initialised programs, each compiled on its own."""
     progs, exes = [], []
     for _ in range(2):
         torch.manual_seed(0)
         p = Prog(**kw)
         e: list = []
-        _compile(p, e)
+        _compile(p, e, dynamic)
         progs.append(p)
         exes.append(e)
     return progs, exes
@@ -191,7 +192,10 @@ def _bitwise(a, b):
 SCHEDULE = [8, 8, 16, 16, 24, 8, 24, 16, 32, 32, 8, 16]
 
 
-def test_direct_matches_normal_bitwise_across_buckets():
+@pytest.mark.parametrize("boxed", [True, False])
+def test_direct_matches_normal_bitwise_across_buckets(monkeypatch, boxed):
+    # torch_tpu's executable is called unboxed (flat operands); also cover boxed.
+    monkeypatch.setattr(FakeExecutable, "_boxed_call", boxed)
     (off, on), _ = _pair()
     direct = direct_exec.DirectExec(on, "test")
     for step, rows in enumerate(SCHEDULE):
@@ -209,9 +213,28 @@ def test_direct_matches_normal_bitwise_across_buckets():
     entries = list(direct._interceptor.entries.values())
     assert all(type(e) is direct_exec._Entry for e in entries)
     # The pool update is replayed as the epilogue's one copy_; the runner is
-    # called boxed, as AOTAutograd calls it; the SymInt bucket is in the key.
-    assert all(len(e.copies) == 1 and e.boxed for e in entries)
+    # called the way AOTAutograd calls it; the SymInt bucket is in the key.
+    assert all(len(e.copies) == 1 for e in entries)
+    assert all(e.boxed is boxed for e in entries)
+    assert all(e.flat is (not boxed and not e.consts) for e in entries)
     assert sorted(k[2] for k in direct._interceptor.entries) == [8, 16, 24, 32]
+
+
+def test_static_unboxed_call_passes_the_operand_tuple(monkeypatch):
+    """No SymInt and an unboxed executable (torch_tpu's case): the runner is
+    handed itemgetter's tuple as is."""
+    monkeypatch.setattr(FakeExecutable, "_boxed_call", False)
+    (off, on), _ = _pair(dynamic=False)
+    direct = direct_exec.DirectExec(on, "test")
+    for step in range(4):
+        ref_out, ref_pool = _run(off, off, 8, step)
+        out, pool = _run(direct, on, 8, step)
+        for a, b in zip(out, ref_out):
+            assert _bitwise(a, b)
+        assert _bitwise(pool, ref_pool)
+    (entry,) = direct._interceptor.entries.values()
+    assert entry.flat and not entry.boxed and not entry.consts and not entry.ints
+    assert direct.stats["direct"] == 3
 
 
 def test_direct_call_skips_the_chain():
