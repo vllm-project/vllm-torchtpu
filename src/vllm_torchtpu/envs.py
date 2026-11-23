@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
+    TPU_MOE_ROUTER_FUSED_EPILOGUE: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -794,6 +795,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_TOPK_WEIGHTS_FLOAT32": env_bool(
         "TPU_MOE_TOPK_WEIGHTS_FLOAT32", default=False
     ),
+    # Run the bias-corrected router (scores + e_score_correction_bias, as in
+    # GLM-5.2 and DeepSeek-V3) as one Pallas call: bias add, top-k, gather of
+    # the unbiased weights, renormalization and routed scale. Without it these
+    # are the top-k kernel plus four small XLA ops, each dominated by launch
+    # cost at decode token counts. Applies only with TPU_MOE_ROUTER_TOPK=rowmax
+    # and 2-D scores; the arithmetic is the same float32 sequence. Off by
+    # default.
+    "TPU_MOE_ROUTER_FUSED_EPILOGUE": env_bool("TPU_MOE_ROUTER_FUSED_EPILOGUE"),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's

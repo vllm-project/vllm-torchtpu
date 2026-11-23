@@ -98,3 +98,118 @@ def select(
 def router_topk(scores: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
     """``select`` with a jax_op-compatible signature (arrays, then statics)."""
     return select(scores, topk)
+
+
+def _select_fused_kernel(
+    s_ref, b_ref, w_ref, i_ref, *, topk: int, n: int, renormalize: bool, scale: float
+):
+    """One block of rows: biased top-k, then the routing-weight epilogue.
+
+    The kernel selects experts on ``scores + bias`` but returns the unbiased
+    ``scores`` at the selected columns. This is the DeepSeek-V3 style
+    correction bias, which GLM-5.2 uses. The epilogue then applies the same
+    float32 operations, in the same order, that ``moe_routing.select_experts``
+    applies after an unfused top-k: divide by ``max(sum, 1e-20)`` when
+    ``renormalize`` is set, then multiply by ``scale``. The selection rules
+    (clamp at ``NEG``, ties to the lowest id) are those of ``_select_kernel``.
+
+    The gather of the unbiased score is a masked row sum: exactly one column
+    of ``hit`` is true, and adding the other columns' zeros does not change
+    a float32 value, so the result equals the score bit for bit.
+
+    The renormalization row sum is a plain ``jnp.sum``, as in the unfused
+    path. Float32 addition is not associative, and the order in which a
+    backend adds the ``topk`` values is its own choice: XLA:CPU, for example,
+    adds an 8-wide row sequentially for small row counts and in halving order
+    for large ones. So the weights equal the unfused path's bit for bit only
+    where both sums use the same order, and otherwise differ by at most one
+    float32 rounding of the sum. The indices do not depend on the sum.
+    """
+    s = s_ref[...]
+    biased = s + b_ref[...]
+    x = jnp.where(biased > NEG, biased, NEG)
+    masked = jnp.finfo(x.dtype).min
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+    for j in range(topk):
+        m = jnp.max(x, axis=1, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
+        hit = iota == idx[:, None]
+        w_ref[:, j] = jnp.sum(jnp.where(hit, s, 0.0), axis=1)
+        i_ref[:, j] = idx.astype(jnp.int32)
+        x = jnp.where(hit, masked, x)
+    w = w_ref[...]
+    if renormalize:
+        w = w / jnp.maximum(jnp.sum(w, axis=1, keepdims=True), 1e-20)
+    if scale != 1.0:
+        w = w * scale
+    w_ref[...] = w
+
+
+def select_fused(
+    scores: jax.Array,
+    bias: jax.Array,
+    topk: int,
+    renormalize: bool,
+    scale: float,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """Biased top-k plus the routing-weight epilogue in one kernel call.
+
+    Without this kernel the router runs the top-k kernel on ``scores + bias``
+    and then four small XLA ops: the bias add before the kernel, and the
+    gather, the renormalization and the scale after it. At a 16-token decode
+    step each of those ops costs a fixed launch time that is larger than its
+    work, so one kernel call replaces all of them.
+
+    Args:
+      scores: ``[rows, experts]`` float32 routing scores after the scoring
+        function (for example sigmoid).
+      bias: ``[experts]`` float32 expert-selection correction bias. It changes
+        which experts are selected, not the returned weights.
+      topk: number of experts to select per row.
+      renormalize: divide the selected weights by their row sum, clamped
+        below at ``1e-20``.
+      scale: routed scaling factor that multiplies the final weights. ``1.0``
+        skips the multiply.
+      interpret: run the kernel on the host, for tests without a TPU.
+
+    Returns:
+      ``(weights f32, indices int32)``, both ``[rows, topk]``. The indices are
+      in descending order of the biased score. For example, with scores
+      ``[0.1, 0.4, 0.3]``, bias ``[0.5, 0.0, 0.0]``, ``topk=2``,
+      ``renormalize=True`` and ``scale=2.0``, the biased scores are
+      ``[0.6, 0.4, 0.3]``, the indices are ``[0, 1]``, and the weights are
+      ``[0.1, 0.4] / 0.5 * 2.0 = [0.4, 1.6]``.
+    """
+    rows, n = scores.shape
+    block = min(MAX_BLOCK_ROWS, rows)
+    return pl.pallas_call(
+        functools.partial(
+            _select_fused_kernel,
+            topk=topk,
+            n=n,
+            renormalize=renormalize,
+            scale=scale,
+        ),
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[
+            pl.BlockSpec((block, n), lambda i: (i, 0)),
+            pl.BlockSpec((1, n), lambda i: (0, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((rows, topk), jnp.float32),
+            jax.ShapeDtypeStruct((rows, topk), jnp.int32),
+        ],
+        interpret=interpret,
+    )(scores, bias.reshape(1, n))
+
+
+def router_topk_fused(
+    scores: jax.Array, bias: jax.Array, topk: int, renormalize: bool, scale: float
+) -> tuple[jax.Array, jax.Array]:
+    """``select_fused`` with a jax_op-compatible signature (arrays, then statics)."""
+    return select_fused(scores, bias, topk, renormalize, scale)
