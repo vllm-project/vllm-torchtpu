@@ -170,6 +170,52 @@ def test_rank_device_collective(monkeypatch, missing):
         assert mesh_utils._collect_rank_to_device_id(group, 6, 20) == {6: 20, 2: 40}
 
 
+def _record_world(monkeypatch, gathered):
+    group = SimpleNamespace(world_size=3, ranks=[0, 1, 2], cpu_group=object())
+    monkeypatch.setattr(mesh_utils, "_WORLD_DEVICE_IDS", None)
+    monkeypatch.setattr(mesh_utils, "_get_current_global_rank", lambda: 1)
+    monkeypatch.setattr(mesh_utils, "_get_tpu_global_device_id", lambda: 12)
+    gather = Mock(return_value=gathered)
+    monkeypatch.setattr(mesh_utils, "_collect_rank_to_device_id", gather)
+    return group, gather
+
+
+def test_world_device_ids_are_recorded_in_rank_order(monkeypatch):
+    group, gather = _record_world(monkeypatch, {2: 0, 0: 8, 1: 12})
+    assert mesh_utils.record_world_device_ids(group) == (8, 12, 0)
+    gather.assert_called_once_with(group, 1, 12)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    assert mesh_utils.world_device_ids() == (8, 12, 0)
+
+
+@pytest.mark.parametrize(
+    "gathered,match",
+    [
+        ({0: 8, 1: 8, 2: 0}, "same TPU global device id"),
+        ({0: 8, 2: 0}, r"missing=\[1\]"),
+    ],
+)
+def test_an_ambiguous_world_device_map_is_not_recorded(monkeypatch, gathered, match):
+    group, _ = _record_world(monkeypatch, gathered)
+    with pytest.raises(RuntimeError, match=match):
+        mesh_utils.record_world_device_ids(group)
+    assert mesh_utils._WORLD_DEVICE_IDS is None
+
+
+def test_world_device_ids_before_a_record(monkeypatch):
+    """One process alone has no peers, and no device is probed for it; a
+    distributed one that skipped the record must not be handed a guess."""
+    monkeypatch.setattr(mesh_utils, "_WORLD_DEVICE_IDS", None)
+    monkeypatch.setattr(
+        mesh_utils, "_get_tpu_global_device_id", Mock(side_effect=AssertionError)
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    assert mesh_utils.world_device_ids() == ()
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    with pytest.raises(RuntimeError, match="not recorded"):
+        mesh_utils.world_device_ids()
+
+
 def test_group_layout_orders_mapping_and_scopes_cache(monkeypatch):
     group = SimpleNamespace(world_size=4, ranks=[2, 4, 6, 8], rank_in_group=2)
     monkeypatch.setattr(pcp, "get_pcp_group", lambda: group)

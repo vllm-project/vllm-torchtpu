@@ -61,6 +61,7 @@ class CpGroupLayout:
 
 
 _LAYOUT_CACHE: dict[tuple[int, tuple[int, ...], int, int], CpGroupLayout] = {}
+_WORLD_DEVICE_IDS: tuple[int, ...] | None = None
 
 
 def _get_current_global_rank() -> int:
@@ -103,6 +104,51 @@ def _collect_rank_to_device_id(
         rank, gathered_device_id = item
         rank_to_device_id[int(rank)] = int(gathered_device_id)
     return rank_to_device_id
+
+
+def record_world_device_ids(world_group: Any) -> tuple[int, ...]:
+    """Gather and keep the TPU global device id of every rank of `world_group`,
+    in rank order; `world_device_ids` returns it from then on.
+
+    Every mesh here is built from this rank -> device map, so it is part of
+    what a compiled program is for. A collective: each rank calls it once,
+    right after distributed init.
+    """
+    global _WORLD_DEVICE_IDS
+    ranks = tuple(int(rank) for rank in world_group.ranks)
+    rank_to_device_id = _collect_rank_to_device_id(
+        world_group, _get_current_global_rank(), _get_tpu_global_device_id()
+    )
+    missing = [rank for rank in ranks if rank not in rank_to_device_id]
+    if missing:
+        raise RuntimeError(
+            "Could not map all ranks to TPU global device ids: "
+            f"missing={missing}, ranks={ranks}, gathered={rank_to_device_id}"
+        )
+    device_ids = tuple(rank_to_device_id[rank] for rank in ranks)
+    if len(set(device_ids)) != len(device_ids):
+        raise RuntimeError(
+            f"Two ranks report the same TPU global device id: {device_ids}"
+        )
+    _WORLD_DEVICE_IDS = device_ids
+    return device_ids
+
+
+def world_device_ids() -> tuple[int, ...]:
+    """The rank -> TPU device map `record_world_device_ids` gathered.
+
+    Without torch.distributed there are no peers to address, so it is empty
+    (and no device is probed). With it and nothing recorded this raises: a
+    caller keying compiled programs on the map must not get a guess.
+    """
+    if _WORLD_DEVICE_IDS is not None:
+        return _WORLD_DEVICE_IDS
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        raise RuntimeError(
+            "The rank -> TPU device map was not recorded after distributed "
+            "init (record_world_device_ids)."
+        )
+    return ()
 
 
 def get_cp_group_layout(group: Any | None) -> CpGroupLayout:
