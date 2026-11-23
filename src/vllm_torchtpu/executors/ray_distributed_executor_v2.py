@@ -37,6 +37,10 @@ from vllm.v1.executor.ray_utils import (
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.distributed.mesh_utils import (
+    SliceHostOrderError,
+    expect_hosts_in_device_order,
+)
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.executors.kv_block_override import reconcile_num_gpu_blocks_override
 from vllm_torchtpu.logger import init_logger
@@ -64,6 +68,15 @@ def get_tpu_bundles_for_indices(
 
 
 logger = init_logger(__name__)
+
+# How long killed workers get to exit before a rebinding gives up on them.
+_WORKER_EXIT_TIMEOUT_S = 120
+
+
+def _expect_hosts_in_device_order(_worker_proc: Any, host_of_rank: list[int]) -> None:
+    # Runs inside a worker actor (`__ray_call__`), before its distributed init;
+    # a call rather than an env var keeps the worker free of another env read.
+    expect_hosts_in_device_order(host_of_rank)
 
 
 class RayDistributedExecutorV2(RayExecutorV2):
@@ -188,7 +201,53 @@ class RayDistributedExecutorV2(RayExecutorV2):
         return {"num_gpus": 0, "resources": {device_key: 1.0}}
 
     def _init_executor(self) -> None:
-        """Initialize the RayDistributedExecutorV2 executor.
+        """Start the workers, rebinding them once if their ranks sit on the
+        slice's hosts out of the order libtpu numbers the devices in.
+
+        libtpu numbers devices by physical position, and nothing a host reports
+        before its TPU runtime is up says where it sits (Ray's tpu-worker-id
+        label is the pod index), so the first bring-up reads that order and a
+        second one binds ranks in it. Rank r then owns the same device on every
+        slice, and every slice compiles the same programs.
+        """
+        try:
+            self._start_slice(host_order=None)
+        except SliceHostOrderError as err:
+            host_order = [self._host_order[i] for i in err.host_order]
+            logger.info(
+                "RayDistributedExecutorV2 | TPU hosts %s are out of device "
+                "order (device ids by rank: %s); restarting the workers with "
+                "hosts in device order: %s",
+                self._host_order,
+                list(err.device_ids),
+                host_order,
+            )
+            self._stop_workers()
+            self._start_slice(host_order=host_order)
+
+    def _stop_workers(self) -> None:
+        """Kill the workers and wait until Ray has seen each one exit, which
+        frees its chip and its actor name for a replacement."""
+        actors = [handle.actor for handle in self.ray_worker_handles]
+        self._finalizer.detach()
+        self.shutdown()
+        deadline = time.monotonic() + _WORKER_EXIT_TIMEOUT_S
+        for actor in actors:
+            while True:
+                try:
+                    ray.get(actor.__ray_ready__.remote())
+                except ray.exceptions.RayActorError:
+                    break
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        "Ray workers were still alive "
+                        f"{_WORKER_EXIT_TIMEOUT_S} s after being killed."
+                    )
+                time.sleep(1)
+
+    def _start_slice(self, host_order: list[str] | None) -> None:
+        """Start this engine's workers, with ranks on `host_order` (node IPs;
+        None = the order `_slice_host_layout` resolves).
 
         NOTE(ranlihao): This method shares the exact same 10-step structure as
         vLLM's base RayExecutorV2._init_executor(). The main differences are:
@@ -233,6 +292,18 @@ class RayDistributedExecutorV2(RayExecutorV2):
         # _initialize_ray_cluster sets the placement group or raises.
         assert placement_group is not None
 
+        default_host_order, chips_per_host = self._slice_host_layout(
+            current_platform.ray_device_key
+        )
+        if host_order is None:
+            host_order = default_host_order
+        elif sorted(host_order) != sorted(default_host_order):
+            raise RuntimeError(
+                f"TPU slice hosts changed from {sorted(host_order)} to "
+                f"{sorted(default_host_order)} while the workers restarted."
+            )
+        self._host_order = host_order
+
         # Step 2: Build bundle assignments for worker rank placement while
         # respecting VLLM_RAY_BUNDLE_INDICES. If it specifies a complete 1:1
         # rank-to-bundle mapping (len == world_size), respect it; otherwise
@@ -247,8 +318,15 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 bundle_to_node_id = get_tpu_bundles_for_indices(
                     placement_group, indices
                 )
+        # Ranks follow the slice's host order, which Step 7 numbers the slice
+        # by, rather than starting on the driver's host: a rebinding has to be
+        # able to move rank 0 to whichever host libtpu numbers first.
+        bind_in_host_order = bundle_to_node_id is None and dp_size == 1
         if bundle_to_node_id is None:
             bundle_to_node_id = get_bundles_sorted_by_node(placement_group)
+        host_index = {ip: i for i, ip in enumerate(host_order)}
+        if bind_in_host_order:
+            bundle_to_node_id.sort(key=lambda bundle: host_index[bundle[2]])
 
         bundle_assignments = self._get_bundle_assignments(
             placement_group, bundle_to_node_id
@@ -358,9 +436,6 @@ class RayDistributedExecutorV2(RayExecutorV2):
         # slice. All of it is derived from the slice-wide assignment so that
         # every DP engine computes an identical view and merely reads different
         # entries out of it.
-        host_order, chips_per_host = self._slice_host_layout(
-            current_platform.ray_device_key
-        )
         if dp_size > 1 and sum(chips_per_host.values()) != slice_world_size:
             # Only meaningful under DP, where the slice is by definition every
             # chip in the cluster. A single engine may legitimately occupy
@@ -486,6 +561,26 @@ class RayDistributedExecutorV2(RayExecutorV2):
                     "engine a contiguous, aligned set of chips."
                 )
 
+        # Each worker checks its binding against libtpu's device ids right
+        # after distributed init, before any weights load (TPUWorker).
+        # Only when this engine spans every slice host: a rebinding reorders
+        # the hosts its ranks sit on, and the slice is numbered over all.
+        check_host_order = (
+            bind_in_host_order
+            and len(host_order) > 1
+            and {a["node_ip"] for a in bundle_assignments} == set(host_order)
+        )
+        if check_host_order:
+            host_of_rank = [host_index[a["node_ip"]] for a in bundle_assignments]
+            ray.get(
+                [
+                    h.actor.__ray_call__.remote(
+                        _expect_hosts_in_device_order, host_of_rank
+                    )
+                    for h in self.ray_worker_handles
+                ]
+            )
+
         # Let rank 0 reserve its TCPStore on its own host, matching vLLM's
         # two-phase RayWorkerProc startup and avoiding a free-port race.
         distributed_init_method = ray.get(
@@ -570,6 +665,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 node_physical_tpu_ids[node_id_0]
             )
         ray.get(init_worker_refs)
+        if check_host_order:
+            logger.info(
+                "RayDistributedExecutorV2 | TPU hosts in device order: %s",
+                host_order,
+            )
 
         # Step 8: Collect response MQ handles
         init_results = ray.get(

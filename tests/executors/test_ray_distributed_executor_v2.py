@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from vllm.config import CacheConfig
 
+from vllm_torchtpu.distributed import mesh_utils
 from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
     RayDistributedExecutorV2,
     get_tpu_bundles_for_indices,
@@ -355,6 +356,8 @@ class TestTpuRayDistributedExecutorV2:
             # ray.remote(RayWorkerProc).options().remote() mocks
             mock_remote_class = MagicMock()
             actors = [mock_worker_actor_1, mock_worker_actor_2]
+            for actor in actors:
+                actor.__ray_call__ = MagicMock()
             mock_remote_class.options.return_value.remote.side_effect = [
                 actors[i] for i in ordered_indices
             ]
@@ -364,6 +367,9 @@ class TestTpuRayDistributedExecutorV2:
             mock_ray.get.side_effect = [
                 # Discover GPU/TPU IDs (Step 6)
                 [(f"node_{i + 1}", [0]) for i in ordered_indices],
+                # Ranks bound in host order are checked against the device
+                # order; an explicit bundle permutation is taken as given.
+                *([[None, None]] if not bundle_indices else []),
                 "tcp://10.0.0.1:9000",  # rank 0 reserves the TCPStore
                 # Initialize workers (Step 7)
                 [None, None],
@@ -885,6 +891,194 @@ class TestTpuRayDistributedExecutorV2:
                 actor.initialize_worker.remote.assert_not_called()
 
             executor.ray_worker_handles = []
+
+
+class _ActorDied(Exception):
+    pass
+
+
+class _FakeSlice:
+    """Fake Ray actors on two hosts of two chips each. Their initialize_worker
+    plays libtpu, which numbers devices by each host's physical position and
+    not by the pod index Ray labels it with, and runs TPUWorker's host-order
+    check on the resulting map."""
+
+    def __init__(self, physical_position: dict[str, int]):
+        self.physical_position = physical_position
+        self.launches: list[list[MagicMock]] = []
+        self.bundle_ip = {0: "10.0.0.1", 1: "10.0.0.1", 2: "10.0.0.2", 3: "10.0.0.2"}
+
+    def actor_factory(self):
+        remote_cls = MagicMock()
+
+        def options(**kwargs):
+            bundle = kwargs["scheduling_strategy"].placement_group_bundle_index
+            created = MagicMock()
+            created.remote.side_effect = lambda **ctor: self._actor(bundle, ctor)
+            return created
+
+        remote_cls.options.side_effect = options
+        return remote_cls
+
+    def _actor(self, bundle: int, ctor: dict) -> MagicMock:
+        if ctor["rank"] == 0:
+            self.launches.append([])
+        launch = self.launches[-1]
+        ip = self.bundle_ip[bundle]
+        actor = MagicMock()
+        actor.__ray_call__ = MagicMock()
+        actor.__ray_ready__ = MagicMock()
+        actor.killed = False
+        actor.rank = ctor["rank"]
+        actor.ip = ip
+        node = "node_1" if ip == "10.0.0.1" else "node_2"
+        chip = bundle % 2
+        actor.get_node_and_physical_gpu_ids.remote.side_effect = lambda: (
+            lambda: (node, [chip])
+        )
+        actor.__ray_call__.remote.side_effect = lambda fn, *a: lambda: fn(actor, *a)
+        actor.create_dist_init_method.remote.side_effect = lambda: (
+            lambda: "tcp://10.0.0.1:9000"
+        )
+
+        def initialize_worker(local_rank, *args, **kwargs):
+            actor.device_id = self.physical_position[ip] * 2 + local_rank
+
+            def run():
+                world = sorted(launch, key=lambda a: a.rank)
+                mesh_utils.check_hosts_in_device_order([a.device_id for a in world])
+
+            return run
+
+        actor.initialize_worker.remote.side_effect = initialize_worker
+        actor.wait_for_init.remote.side_effect = lambda: (
+            lambda: {"status": "READY", "handle": f"h{actor.rank}"}
+        )
+
+        def ready():
+            if actor.killed:
+                raise _ActorDied
+            return True
+
+        actor.__ray_ready__.remote.side_effect = lambda: ready
+        launch.append(actor)
+        return actor
+
+    def get(self, refs, timeout=None):
+        if isinstance(refs, list):
+            return [self.get(ref) for ref in refs]
+        return refs()
+
+
+@patch("vllm.v1.executor.ray_executor_v2.RayExecutorV2.__init__", lambda x, y: None)
+@patch("vllm_torchtpu.executors.ray_distributed_executor_v2.ray")
+@patch("vllm_torchtpu.executors.ray_distributed_executor_v2.current_platform")
+@patch("vllm_torchtpu.executors.ray_distributed_executor_v2.MessageQueue")
+@patch(
+    "vllm_torchtpu.executors.ray_distributed_executor_v2.get_driver_env_vars",
+    return_value={},
+)
+@patch(
+    "vllm_torchtpu.executors.ray_distributed_executor_v2.get_open_port",
+    return_value=9000,
+)
+@patch(
+    "vllm_torchtpu.executors.ray_distributed_executor_v2.get_tpu_multihost_topology",
+    return_value="2x2x1",
+)
+@pytest.mark.parametrize(
+    "physical_position",
+    [{"10.0.0.1": 0, "10.0.0.2": 1}, {"10.0.0.1": 1, "10.0.0.2": 0}],
+    ids=["pod0-first", "pod1-first"],
+)
+def test_ranks_get_the_same_devices_whichever_host_libtpu_numbers_first(
+    mock_topology,
+    mock_port,
+    mock_driver_env,
+    mock_mq,
+    mock_platform,
+    mock_ray,
+    physical_position,
+    monkeypatch,
+):
+    monkeypatch.setattr(mesh_utils, "_HOST_OF_RANK", None)
+    monkeypatch.delenv("VLLM_RAY_BUNDLE_INDICES", raising=False)
+    fake = _FakeSlice(physical_position)
+    mock_platform.ray_device_key = "TPU"
+    mock_ray.exceptions.RayActorError = _ActorDied
+    mock_ray.get.side_effect = fake.get
+    mock_ray.kill.side_effect = lambda actor: setattr(actor, "killed", True)
+    mock_ray.remote.return_value = fake.actor_factory()
+    mock_ray.get_runtime_context().get_node_id.return_value = "node_1"
+    mock_ray.nodes.return_value = [
+        {
+            "NodeID": f"node_{i + 1}",
+            "Alive": True,
+            "NodeManagerAddress": ip,
+            "Resources": {"TPU": 2.0},
+            "labels": {"ray.io/tpu-worker-id": str(i)},
+        }
+        for i, ip in enumerate(["10.0.0.1", "10.0.0.2"])
+    ]
+    # Driver first, as vLLM sorts them: the pod-index order.
+    bundles = [(b, f"node_{b // 2 + 1}", fake.bundle_ip[b]) for b in range(4)]
+
+    vllm_config = MockVllmConfig()
+    pc = vllm_config.parallel_config
+    pc.world_size = pc.tensor_parallel_size = 4
+    pc.placement_group = MagicMock()
+    executor = RayDistributedExecutorV2(vllm_config)
+    executor.vllm_config = vllm_config
+    executor.parallel_config = pc
+    executor.start_worker_monitor = MagicMock()
+    with (
+        patch(
+            "vllm_torchtpu.executors.ray_distributed_executor_v2.get_bundles_sorted_by_node",
+            side_effect=lambda pg: list(bundles),
+        ),
+        # vLLM's shutdown() kills the workers through its own module's ray.
+        patch("vllm.v1.executor.ray_executor_v2.ray", mock_ray),
+        patch("vllm_torchtpu.executors.ray_distributed_executor_v2.time.sleep"),
+    ):
+        executor._init_executor()
+
+    final = sorted(fake.launches[-1], key=lambda a: a.rank)
+    assert [a.device_id for a in final] == [0, 1, 2, 3]
+    assert len(fake.launches) == 1 + physical_position["10.0.0.1"]
+    for stale in fake.launches[:-1]:
+        assert all(a.killed for a in stale)
+    rank0_env = final[0].initialize_worker.remote.call_args.args[1]
+    first_host = final[0].ip
+    assert rank0_env["MASTER_ADDR"] == first_host
+    assert rank0_env["TORCH_TPU_SLICEBUILDER_ADDRESSES"].startswith(first_host)
+    assert executor._host_order[0] == first_host
+
+
+@patch("vllm.v1.executor.ray_executor_v2.RayExecutorV2.__init__", lambda x, y: None)
+@patch("vllm_torchtpu.executors.ray_distributed_executor_v2.ray")
+def test_stop_workers_waits_for_every_killed_worker(mock_ray):
+    mock_ray.exceptions.RayActorError = _ActorDied
+    actor = MagicMock()
+    actor.__ray_ready__ = MagicMock()
+    answers = iter([True, _ActorDied()])
+
+    def ready():
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    actor.__ray_ready__.remote.return_value = ready
+    mock_ray.get.side_effect = lambda ref: ref()
+    executor = RayDistributedExecutorV2(MockVllmConfig())
+    executor.ray_worker_handles = [MagicMock(actor=actor)]
+    executor._finalizer = MagicMock()
+    executor.shutdown = MagicMock()
+    with patch("vllm_torchtpu.executors.ray_distributed_executor_v2.time.sleep"):
+        executor._stop_workers()
+    executor._finalizer.detach.assert_called_once()
+    executor.shutdown.assert_called_once()
+    assert actor.__ray_ready__.remote.call_count == 2
 
 
 def test_ray_distributed_executor_bundle_expansion():
