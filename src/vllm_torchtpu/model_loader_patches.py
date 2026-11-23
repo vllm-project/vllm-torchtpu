@@ -48,6 +48,7 @@ tensors (ModelOpt NVFP4, needed globally by FlashInfer backends) are not
 in the allowlist and stay unfiltered.
 """
 
+import datetime
 import functools
 import gc
 import json
@@ -55,7 +56,7 @@ import os
 import struct
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -396,6 +397,9 @@ def patch_default_loader_ep_weight_filter() -> None:
             _start_ep_range_prefetch(
                 sorted(hf_weights_files, key=weight_utils._natural_sort_key),
                 local_expert_ids,
+                # No unused-tensor test on this branch: the iterator skips
+                # only the other ranks' experts, and so does the prefetch.
+                None,
                 kwargs.get(
                     "safetensors_prefetch_num_threads",
                     weight_utils.DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
@@ -425,9 +429,15 @@ def patch_default_loader_ep_weight_filter() -> None:
 
 
 def _local_tensor_ranges(
-    path: str, local_expert_ids: set[int]
+    path: str,
+    local_expert_ids: set[int],
+    is_unused: Callable[[str], bool] | None = None,
 ) -> list[tuple[int, int]]:
-    """Merged [start, end) file offsets of the tensors this rank keeps."""
+    """Merged [start, end) file offsets of the tensors this rank keeps.
+
+    Skips what the lazy iterator skips (``_should_skip_weight_tpu``): the
+    other ranks' experts, and the tensors ``is_unused`` names, if given.
+    """
     with open(path, "rb") as f:
         (header_len,) = struct.unpack("<Q", f.read(8))
         header = json.loads(f.read(header_len))
@@ -435,7 +445,9 @@ def _local_tensor_ranges(
     spans = sorted(
         (base + v["data_offsets"][0], base + v["data_offsets"][1])
         for name, v in header.items()
-        if name != "__metadata__" and not _should_skip(name, local_expert_ids)
+        if name != "__metadata__"
+        and not (is_unused is not None and is_unused(name))
+        and not _should_skip(name, local_expert_ids)
     )
     merged: list[list[int]] = []
     for start, end in spans:
@@ -449,6 +461,7 @@ def _local_tensor_ranges(
 def _start_ep_range_prefetch(
     sorted_files: list[str],
     local_expert_ids: set[int],
+    is_unused: Callable[[str], bool] | None,
     num_threads: int,
     block_size: int,
 ) -> None:
@@ -459,10 +472,11 @@ def _start_ep_range_prefetch(
     finds its pages cached. Dense tensors are kept by every rank; ranks on
     one host share those pages.
 
-    The thread can outlive the load it serves: a draft model that keeps a
-    few tensors still prefetches every local range of the checkpoint.
-    ``_stop_ep_range_prefetch`` stops it, and the page cache eviction calls
-    that first so the thread cannot read evicted pages back in.
+    The thread can outlive the load it serves. ``_stop_ep_range_prefetch``
+    stops it once the runner has loaded every model, before any page cache
+    eviction, so it cannot read evicted pages back in. Only these threads can
+    be stopped: upstream's whole-file prefetch (the "prefetch" strategy
+    without the EP filter) runs in a thread this module does not own.
     """
     stop = threading.Event()
 
@@ -482,7 +496,7 @@ def _start_ep_range_prefetch(
                     break
                 fd = os.open(path, os.O_RDONLY)
                 fds.append(fd)
-                for lo, hi in _local_tensor_ranges(path, local_expert_ids):
+                for lo, hi in _local_tensor_ranges(path, local_expert_ids, is_unused):
                     jobs.extend(
                         (fd, off, min(block_size, hi - off))
                         for off in range(lo, hi, block_size)
@@ -525,10 +539,12 @@ def _start_ep_range_prefetch(
     )
     thread = threading.Thread(target=run, name="ep-range-prefetch", daemon=True)
     with _prefetch_lock:
-        # Without eviction nothing stops these threads; drop the ones that ended.
+        # Drop the threads that ended. Started under the lock, so every
+        # registered thread is alive until it ends, and a concurrent stop
+        # never joins one that has not started.
         _prefetches[:] = [(t, e) for t, e in _prefetches if t.is_alive()]
         _prefetches.append((thread, stop))
-    thread.start()
+        thread.start()
 
 
 # Prefetch threads started by _start_ep_range_prefetch that may still be running.
@@ -638,20 +654,60 @@ def patch_default_model_loader_page_cache() -> None:
 _loaded_weight_files: dict[str, None] = {}
 
 
-def evict_loaded_weights_page_cache() -> None:
-    """Evict host page cache for every weight file loaded so far.
+# How long a rank waits for the others to finish loading. A draft load on a
+# later pipeline stage can lag by minutes; a rank later than this has failed
+# or stalled, and the engine cannot serve anyway.
+_LOADER_WAIT_TIMEOUT_S = 1800.0
 
-    Called by the runner after the target and any draft model are loaded.
 
-    Every rank first stops its own prefetch threads, which may still be
-    reading this checkpoint (see ``_start_ep_range_prefetch``), then evicts.
-    The page cache is shared across a host's ranks, but each rank evicts
-    after its own stop, so the last eviction on a host comes after every
-    rank there has stopped reading. A second eviction of a file is cheap.
+def _wait_for_every_loader(timeout_s: float = _LOADER_WAIT_TIMEOUT_S) -> None:
+    """Wait until every rank of this engine has finished loading.
+
+    A bounded barrier over the world group's CPU (gloo) group. A rank that
+    failed or stalled before this point fails the load with an error (rank 0's
+    names the first rank that did not arrive) instead of hanging the others.
     """
-    if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE or not _loaded_weight_files:
+    from vllm.distributed import parallel_state
+
+    try:
+        group = parallel_state.get_world_group()
+    except AssertionError:
+        return  # distributed state not initialized: a single process
+    if group.world_size <= 1:
         return
+    try:
+        torch.distributed.monitored_barrier(
+            group=group.cpu_group, timeout=datetime.timedelta(seconds=timeout_s)
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "TPU_EVICT_WEIGHTS_PAGE_CACHE: not every rank finished loading "
+            f"within {timeout_s:.0f} s; a rank failed or stalled during the load"
+        ) from e
+
+
+def evict_loaded_weights_page_cache() -> None:
+    """Stop the prefetch, then evict the host page cache of the loaded files.
+
+    Called by every rank's runner after the target and any draft model are
+    loaded.
+
+    The prefetch threads (``_start_ep_range_prefetch``) serve no load after
+    this point, so every rank stops its own first, with or without eviction.
+
+    With TPU_EVICT_WEIGHTS_PAGE_CACHE (opt-in), every rank then waits, for at
+    most ``_LOADER_WAIT_TIMEOUT_S``, for every other rank to finish loading
+    before it evicts. The page cache is shared across a host's ranks, and a
+    slower rank (or, under pipeline parallelism, a later stage's draft load)
+    may still be reading the checkpoint. A rank that never arrives fails the
+    load instead of hanging the others. A second eviction of a file is cheap.
+    """
     _stop_ep_range_prefetch()
+    if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE:
+        return
+    _wait_for_every_loader()
+    if not _loaded_weight_files:
+        return
     files = list(_loaded_weight_files)
     _loaded_weight_files.clear()
     try:

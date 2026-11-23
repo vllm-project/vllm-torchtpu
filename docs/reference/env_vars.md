@@ -48,6 +48,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `USE_MOE_FUSED_EP_KERNEL` | `False` | Enables the fused Expert-Parallel (`EP`) Pallas MoE kernel. |
 | `MOE_FUSED_EP_KERNEL_IMPL` | `None` | Selects a specific fused EP MoE kernel implementation (`"v1"` or `"v2"`). |
 | `MOE_FUSED_EP_ENABLE_W4A8` | `False` | Enables 4-bit weight / 8-bit activation (`W4A8`) execution in the fused EP MoE kernel. |
+| `TPU_EVICT_WEIGHTS_PAGE_CACHE` | `false` | Drop the host page cache of the checkpoint weight files (`posix_fadvise` `DONTNEED`) once the runner has loaded every model, the draft included, to free host memory (for example for a host KV cache tier). Every rank waits (at most 30 minutes) until every rank has finished loading, then evicts; a rank that never arrives fails the load. The EP range prefetch (the `prefetch` load strategy with the EP weight filter) is stopped first, with or without this flag. Upstream's whole-file prefetch thread cannot be stopped, so with eviction prefer the EP filter or the `lazy` strategy. |
 | `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |

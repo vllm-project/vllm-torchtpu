@@ -1977,8 +1977,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-block transfers from F independent DMAs into a single hardware DMA.
     # Refer to `vllm_torchtpu.offload.block_major_layout` for contract details.
     "VLLM_TPU_BLOCK_MAJOR_KV": env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
-    # Evict host page cache for checkpoint weight files via posix_fadvise
-    # after loading into TPU HBM.
+    # Evict the host page cache of the checkpoint weight files (posix_fadvise
+    # DONTNEED) once the runner has loaded every model (target and draft).
+    # Every rank waits (at most 30 min) for every other rank to finish loading,
+    # then evicts; a rank that never arrives fails the load.
+    # The EP range prefetch is stopped first either way.
     "TPU_EVICT_WEIGHTS_PAGE_CACHE": env_bool(
         "TPU_EVICT_WEIGHTS_PAGE_CACHE", default=False
     ),
