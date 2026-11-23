@@ -436,6 +436,7 @@ def generate_block_specs(
         rhs_scale_block_spec = pl.BlockSpec(
             (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
             index_map.rhs_scale_index_map,
+            pipeline_mode=pl.Buffered(buffer_count=3) if _decode_tiles(cfgs) else None,
         )
 
     rhs_block_spec = WeightsRef(
@@ -1178,8 +1179,16 @@ def gmm_vmem_estimate(
     rhs_bias_vmem = 0
     if rhs_cfgs.has_bias:
         rhs_bias_vmem = tn * 4
+    # Decode tiles (_decode_tiles) triple-buffer the scale: with one expert per
+    # grid step, a double-buffered scale DMA is exposed. The estimate cannot
+    # see the buckets, so this is a superset of _decode_tiles: it may count a
+    # third buffer the kernel does not allocate, never the reverse.
+    decode = tm <= FP8_DECODE_TILE_M
+    scale_buffers = (
+        3 if decode and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None else 2
+    )
     rhs_vmem = fuse_act_factor * (
-        3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
+        3 * rhs_weight_vmem + scale_buffers * rhs_scale_vmem + 2 * rhs_bias_vmem
     )
 
     # 3. Accumulator
