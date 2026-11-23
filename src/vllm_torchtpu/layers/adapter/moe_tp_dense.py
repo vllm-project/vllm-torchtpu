@@ -36,8 +36,6 @@ bucket) and made inside one custom op that takes both weight sets, so every
 bucket's graph has the same inputs.
 """
 
-from __future__ import annotations
-
 import functools
 from typing import Any
 
@@ -235,7 +233,7 @@ def finalize(layer: Any, ep_w13_scale: torch.Tensor) -> None:
 _PACK_OP = None
 
 
-def _pack_jax(w13: jax.Array, s13: jax.Array, w2: jax.Array, s2: jax.Array):
+def _pack_jax(w13: jax.Array, s13: jax.Array, w2: jax.Array, s2: jax.Array) -> tuple[jax.Array, jax.Array]:
     from vllm_torchtpu.kernels.experimental.moe_tp_dense_fp4 import pack
 
     return pack(w13, s13.reshape(s13.shape[0], s13.shape[1], -1), w2,
