@@ -832,7 +832,9 @@ def stage_block_table_uploads(
     )
     if steady_target:
         if _steady_stage_fast_path(runner, ctx, num_reqs_padded):
+            note_metadata_reuse("stage", True)
             return
+        note_metadata_reuse("stage", False)
         runner._steady_stage_record = None
 
     # Walk in the same order the builds will, deduping shared group ids. The
@@ -995,6 +997,43 @@ def _record_steady_stage(
         mamba_products=ctx.staged_mamba_products,
         mamba_classes=classes,
     )
+
+
+# VLLM_TPU_ATTN_METADATA_REUSE self-check: hit / miss counts of the two reuse points
+# (block-table stage walk, per-group metadata build) on steady-decode target walks,
+# logged on TP rank 0 after the first REUSE_LOG_FIRST stage attempts and then every
+# REUSE_LOG_EVERY. Counting only; no decision reads these.
+REUSE_LOG_FIRST, REUSE_LOG_EVERY = 1000, 50000
+_reuse_counts = {"stage": [0, 0], "build": [0, 0]}  # kind -> [hits, misses]
+
+
+def _reuse_rank0() -> bool:
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank() == 0
+    except Exception:  # no TP group (CPU tests, tools)
+        return True
+
+
+def metadata_reuse_line() -> str:
+    parts = []
+    for kind, (hit, miss) in _reuse_counts.items():
+        n = hit + miss
+        parts.append(f"{kind} {hit}/{n} ({100.0 * hit / n if n else 0.0:.1f}%)")
+    return "VLLM_TPU_ATTN_METADATA_REUSE hits: " + ", ".join(parts)
+
+
+def note_metadata_reuse(kind: str, hit: bool) -> None:
+    c = _reuse_counts[kind]
+    c[0 if hit else 1] += 1
+    if kind != "stage":
+        return
+    n = c[0] + c[1]
+    if (n == REUSE_LOG_FIRST or (n > REUSE_LOG_FIRST and n % REUSE_LOG_EVERY == 0)) and _reuse_rank0():
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(metadata_reuse_line())
 
 
 def _steady_stage_fast_path(
