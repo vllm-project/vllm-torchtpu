@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable
 from typing import Any, cast
 
 import torch
@@ -52,24 +51,27 @@ def _materialize_vision_qkv(
     return materialized_qkv, output[1]
 
 
-def _materialized_pos_embeds(
-    get_pos_embeds: Callable[[Any], torch.Tensor], grid_thws: Any
+def _add_materialized_pos_embeds(
+    pos_emb: nn.Module, x: torch.Tensor, grid_thws: Any
 ) -> torch.Tensor:
-    """Give the interpolated position table a device program of its own.
+    """`pos_emb.forward`, with the interpolated position table in a device
+    program of its own.
 
     Eager execution would otherwise fuse the bilinear resize of the table into
     the patch projection's convolution, and for some grids (162x104 and
     306x216 among them) the TPU compiler aborts the process with
-    "TransformWindow: split of a padded window dim is not supported". Skipped
-    while compiling, as in `_materialize_vision_qkv`.
+    "TransformWindow: split of a padded window dim is not supported". Encoder
+    replay does not come through here: it builds the table with
+    `get_pos_embeds` while preparing its inputs and adds it inside the replayed
+    program. Skipped while compiling, as in `_materialize_vision_qkv`.
     """
-    pos_embeds = get_pos_embeds(grid_thws)
+    pos_embeds = pos_emb.get_pos_embeds(grid_thws)
     if pos_embeds.device.type != "tpu" or torch.compiler.is_compiling():
-        return pos_embeds
+        return x + pos_embeds
 
     materialized = fresh_buffer(pos_embeds)
     synchronize_tensors(materialized)
-    return materialized
+    return x + materialized
 
 
 class KimiK3MoonViT3dPretrainedModel(MoonViT3dPretrainedModel):
@@ -80,6 +82,4 @@ class KimiK3MoonViT3dPretrainedModel(MoonViT3dPretrainedModel):
         for block in self.encoder.blocks:
             cast(nn.Module, block.wqkv).register_forward_hook(_materialize_vision_qkv)
         pos_emb = self.patch_embed.pos_emb
-        pos_emb.get_pos_embeds = functools.partial(
-            _materialized_pos_embeds, pos_emb.get_pos_embeds
-        )
+        pos_emb.forward = functools.partial(_add_materialized_pos_embeds, pos_emb)
