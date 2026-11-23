@@ -14,7 +14,10 @@
 """OLMo 3.5 (Ai2's hybrid KDA / attention / latent-MoE model) for TPU.
 
 Follows MaxText's `decoder_block: olmoe3`, the training reference for the
-checkpoints. Per layer:
+checkpoints (branch `agagik-olmo35`, pinned):
+https://github.com/AI-Hypercomputer/maxtext/blob/37d1e72aa3c8a31a1ce1570b539cea83fafe0104/src/maxtext/models/olmoe3.py
+
+Per layer:
 
     h   = x + attn_out_norm(mixer(attn_in_norm(x)))
     out = h + ffn_out_norm(shared_ffn(y) + latent_up(moe(latent_down(y))))
