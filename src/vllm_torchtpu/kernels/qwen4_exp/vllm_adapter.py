@@ -3,6 +3,7 @@
 
 import functools
 import hashlib
+import logging
 
 import jax
 import torch
@@ -21,6 +22,8 @@ from vllm_torchtpu.kernels.qwen4_exp.hc_norm import _normalize
 from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_cmp import hc_prefill_mix_cmp
 from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_fused import hc_prefill_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_up import _up_epilogue
+
+logger = logging.getLogger(__name__)
 
 
 @functools.cache
@@ -130,6 +133,18 @@ def build_up_epilogue_op(branches: int, hidden: int, token_tile: int):
     return op
 
 
+@functools.cache
+def _log_w1_sched(tag: str) -> None:
+    """q38 HCK runtime engagement line (once per tag, at decode HC op build: model
+    construction, so it prints on a warm compile cache too)."""
+    msg = (
+        "q38 HCK: TPU_QWEN4_HC_DECODE_W1_SCHED=1 engaged: hc_decode_wide mode 1 "
+        f"schedule v2 (all copies at entry, slab weights, one-pass B2), op tag {tag}"
+    )
+    logger.warning(msg)
+    print(msg, flush=True)
+
+
 def _decode_mix_choice():
     """The fused decode HC mix and its op-name tag.
 
@@ -142,12 +157,20 @@ def _decode_mix_choice():
     TPU_QWEN4_HC_DECODE_INJECT_FOLD (q38 INJ-MXU, numerics-changing) needs
     TPU_QWEN4_HC_DECODE_WIDE=1: W1 takes the injection logits from its down
     projection (_w1f); with WIDE 0, 2 or 3 it is refused.
+    TPU_QWEN4_HC_DECODE_W1_SCHED=1 (q38 HCK) needs TPU_QWEN4_HC_DECODE_WIDE=1:
+    the W1 kernel runs its schedule v2 (_w1s / _w1fs); refused otherwise.
     """
     wide = envs.TPU_QWEN4_HC_DECODE_WIDE
     fold = envs.TPU_QWEN4_HC_DECODE_INJECT_FOLD
+    sched = envs.TPU_QWEN4_HC_DECODE_W1_SCHED == "1"
     if fold and wide != 1:
         raise ValueError(
             "TPU_QWEN4_HC_DECODE_INJECT_FOLD needs TPU_QWEN4_HC_DECODE_WIDE=1 "
+            f"(got {wide})"
+        )
+    if sched and wide != 1:
+        raise ValueError(
+            "TPU_QWEN4_HC_DECODE_W1_SCHED=1 needs TPU_QWEN4_HC_DECODE_WIDE=1 "
             f"(got {wide})"
         )
     if wide:
@@ -160,6 +183,13 @@ def _decode_mix_choice():
             raise ValueError(
                 "TPU_QWEN4_HC_DECODE_WIDE and TPU_QWEN4_HC_DECODE_COMPARE are "
                 "exclusive"
+            )
+        if sched:
+            tag = "_w1fs" if fold else "_w1s"
+            _log_w1_sched(tag)
+            return (
+                functools.partial(hc_decode_mix_wide_auto, mode=1, fold=fold, sched=True),
+                tag,
             )
         if fold:
             return functools.partial(hc_decode_mix_wide_auto, mode=1, fold=True), "_w1f"

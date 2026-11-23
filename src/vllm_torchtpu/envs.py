@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     TPU_QWEN4_HC_DECODE_COMPARE_SIGMOID: bool = False
     TPU_QWEN4_HC_DECODE_WIDE: int = 0
     TPU_QWEN4_HC_DECODE_INJECT_FOLD: bool = False
+    TPU_QWEN4_HC_DECODE_W1_SCHED: str = ""
     TPU_QWEN4_HC_PREFILL_ODD_TILES: bool = False
     TPU_QWEN4_HC_PREFILL_FUSED_MIX: bool = False
     TPU_QWEN4_HC_PREFILL_PARTIAL_TILE: bool = False
@@ -1635,6 +1636,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # vector-unit sum. Numerics-changing (f32 summation order of the logits;
     # bound reports/prereg/q38_injmxu_bound_LOCKED.md); op names gain _w1f.
     "TPU_QWEN4_HC_DECODE_INJECT_FOLD": env_bool("TPU_QWEN4_HC_DECODE_INJECT_FOLD"),
+    # q38 HCK, only with TPU_QWEN4_HC_DECODE_WIDE=1 (refused otherwise): "1" runs
+    # the W1 kernel's schedule v2 at its 160-511 rows (hc_decode_wide.py: every
+    # copy started at kernel entry, the down / up weights as row slabs with their
+    # own semaphores, and phase B2's up projection in one pass up to 320 rows);
+    # op and kernel names gain an "s" (_w1s / _w1fs). Every expression of mode 1 is
+    # unchanged (bitwise is decided by the HCK proofs). "" / "0" = off (default).
+    # Compile-hashed (read when the decode HC ops are built).
+    "TPU_QWEN4_HC_DECODE_W1_SCHED": env_with_choices(
+        "TPU_QWEN4_HC_DECODE_W1_SCHED", "", ["", "0", "1"]
+    ),
     # qwen4_exp prefill: let the fused HC mix (hc_full) and the gated_residual
     # combine take any whole number (>= 2) of hc_prefill_full_tile tiles, not
     # only even counts, so 6,400- and 3,200-token steps leave the unfused
