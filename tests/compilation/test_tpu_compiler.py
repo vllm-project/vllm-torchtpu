@@ -335,10 +335,13 @@ class TestTpuCompilerCache:
             path.relative_to(source_root).as_posix()
             for path in tpu_compiler._iter_runtime_cache_key_files(source_root)
         }
+        # A file builds a jax_op either as `pallas.jax_op(...)` or, after
+        # `from torch.tpu.pallas import jax_op`, as `jax_op(...)`.
+        markers = ("pallas.jax_op", "import jax_op")
         custom_op_boundaries = {
             path.relative_to(source_root).as_posix()
             for path in (source_root / "vllm_torchtpu").rglob("*.py")
-            if "pallas.jax_op" in path.read_text()
+            if any(marker in path.read_text() for marker in markers)
         }
         excluded_files = set(tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
         excluded_dirs = tuple(
