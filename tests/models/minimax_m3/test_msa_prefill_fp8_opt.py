@@ -144,7 +144,10 @@ def test_mdot_against_oracle(lever, q_scale):
     err0 = rms(np.asarray(o0, np.float64) - ref_o) / rms(ref_o)
     err1 = rms(o1 - ref_o) / rms(ref_o)
     assert err1 < max(2e-2, 2 * err0), (err0, err1)
-    assert np.max(np.abs(np.where(fin, l1 - ref_l, 0))) < 5e-2
+    # The bf16 scaled queries alone put the lse ~0.05 off at x8 (any lever).
+    lerr0 = np.max(np.abs(np.where(fin, np.asarray(l0, np.float64) - ref_l, 0)))
+    lerr1 = np.max(np.abs(np.where(fin, l1 - ref_l, 0)))
+    assert lerr1 < max(1e-2, 1.25 * lerr0), (lerr0, lerr1)
 
 
 def test_unknown_lever_raises():
