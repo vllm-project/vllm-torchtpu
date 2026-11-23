@@ -430,12 +430,31 @@ PACKED_EXCHANGE_MAX_TOKENS = 64
 
 
 def _halves(x: torch.Tensor) -> torch.Tensor:
-    """`x` as int16 along its last dim: a collective copies integers bit for
-    bit, while a float collective may flush or canonicalize the subnormals
-    and NaNs that split f32 words and ids form. A 16-bit `x` reinterprets in
-    place; a wider view (int32 of bf16 pairs) lowered to strided slices of
-    the operand (1.4 us per layer at 8 tokens, c4 twin j-42ceea6d)."""
+    """16-bit `x` as int16, reinterpreted in place: a collective copies
+    integers bit for bit, while a float collective may flush or canonicalize
+    subnormal and NaN bit patterns. (An int32 view of bf16 pairs lowered to
+    strided slices of the operand, 1.4 us per layer at 8 tokens, c4 twin
+    j-42ceea6d.)"""
     return x.contiguous().view(torch.int16)
+
+
+def _f32_halves(x: torch.Tensor) -> torch.Tensor:
+    """f32 ``[..., n]`` as int16 ``[..., 2n]``: every high half, then every
+    low half (`_f32_from_halves`). An int16 view would interleave them, and
+    joining interleaved halves back lowered to strided slices and relayout
+    copies (~0.9 us per layer at 8 tokens, c4 twin j-73e59e3d); shifts and
+    masks of whole blocks fuse into their neighbours."""
+    words = x.contiguous().view(torch.int32)
+    # Both halves sign-extended into int16 range, so the narrowing is exact.
+    low = (words << 16) >> 16
+    return torch.cat([(words >> 16).to(torch.int16), low.to(torch.int16)], dim=-1)
+
+
+def _f32_from_halves(halves: torch.Tensor) -> torch.Tensor:
+    """f32 ``[..., n]`` from `_f32_halves`' ``[..., 2n]`` blocks of high,
+    then low halves (not an interleaved int16 view)."""
+    high, low = halves.to(torch.int32).chunk(2, dim=-1)
+    return ((high << 16) | (low & 0xFFFF)).view(torch.float32)
 
 
 def exchange_queries_and_candidates(
@@ -447,7 +466,7 @@ def exchange_queries_and_candidates(
     dcp = group.world_size
     num_tokens, num_heads, head_dim = q.shape
     q_halves = _halves(q.reshape(num_tokens, num_heads * head_dim))
-    packed = torch.cat([q_halves, _halves(candidates)], dim=1)
+    packed = torch.cat([q_halves, _f32_halves(candidates)], dim=1)
     gathered = group.all_gather(packed, dim=0).view(dcp, num_tokens, -1)
     split = q_halves.shape[1]
     q_all = (
@@ -458,7 +477,7 @@ def exchange_queries_and_candidates(
         .transpose(0, 1)
         .reshape(num_tokens, dcp * num_heads, head_dim)
     )
-    return q_all, gathered[..., split:].contiguous().view(candidates.dtype)
+    return q_all, _f32_from_halves(gathered[..., split:])
 
 
 # The int16 halves of an f32 lse (`pack_head_partials`).
@@ -469,7 +488,7 @@ def pack_head_partials(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
     """Head-major 16-bit ``out [H, T, D]`` and ``lse [H, T]`` as one int16
     tensor ``[H, T, D + 2]`` (`unpack_head_partials`)."""
     return torch.cat(
-        [_halves(out), _halves(lse.to(torch.float32).unsqueeze(-1))], dim=-1
+        [_halves(out), _f32_halves(lse.to(torch.float32).unsqueeze(-1))], dim=-1
     )
 
 
@@ -479,7 +498,7 @@ def unpack_head_partials(
     split = packed.shape[-1] - _LSE_HALVES
     return (
         packed[..., :split].contiguous().view(dtype),
-        packed[..., split:].contiguous().view(torch.float32).squeeze(-1),
+        _f32_from_halves(packed[..., split:]).squeeze(-1),
     )
 
 

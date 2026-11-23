@@ -109,3 +109,14 @@ def test_all_to_all_merge_is_the_exact_merge_rounded_once(dcp, num_tokens, monke
         assert merged.dtype == torch.bfloat16
         torch.testing.assert_close(merged.double(), want, rtol=2**-8, atol=1e-6)
         assert (merged[1] == 0).all()
+
+
+def test_f32_halves_round_trip_every_bit_pattern_class():
+    bits = torch.randint(-(2**31), 2**31 - 1, (512, 8), dtype=torch.int64)
+    bits = bits.to(torch.int32)
+    # 0, -0, inf, -inf, a NaN payload, the smallest subnormal
+    special = [0, -(2**31), 0x7F800000, -8388608, 0x7FC00001, 1]
+    bits[0, : len(special)] = torch.tensor(special, dtype=torch.int32)
+    halves = msa._f32_halves(bits.view(torch.float32))
+    assert halves.dtype == torch.int16 and halves.shape == (512, 16)
+    assert torch.equal(msa._f32_from_halves(halves).view(torch.int32), bits)
