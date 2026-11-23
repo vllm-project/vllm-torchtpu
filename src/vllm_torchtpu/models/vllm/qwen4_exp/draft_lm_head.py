@@ -88,6 +88,11 @@ class Fp8DraftLMHead(nn.Module):
         self.w_q = nn.Parameter(w_q, requires_grad=False)
         self.w_s = nn.Parameter(w_s, requires_grad=False)
         self.quant_method = _Fp8HeadMethod()
+        # The runner pre-warms the op (`_initialize_quantization_kernels`): its lazy
+        # build takes a Lock that Dynamo cannot trace. Build it here too, eagerly.
+        from vllm_torchtpu.layers.adapter.linear_common import _get_quantized_matmul_op
+
+        _get_quantized_matmul_op()
 
     def extra_repr(self) -> str:
         return f"w_q={tuple(self.w_q.shape)} {self.w_q.dtype}, per-row f32 scale"
