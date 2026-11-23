@@ -150,7 +150,7 @@ def test_a_rank_replays_a_helper_graph_a_peer_saved(helpers, monkeypatch):
 def test_a_graph_without_a_fingerprint_uses_the_plain_backend(helpers, monkeypatch):
     run, compiled, replayed, plain, root = helpers
     monkeypatch.setattr(
-        "vllm_torchtpu.compilation.graph_fingerprint._graph_fingerprint",
+        "vllm_torchtpu.compilation.tpu_compiler._graph_fingerprint",
         lambda graph: None,
     )
     assert run()() == "plain"
