@@ -86,7 +86,9 @@ def _runner(k: int, max_reqs: int = 16):
 def _step(k: int, num_reqs: int, seed: int):
     """One steady step's sampler output, metadata and drafter tokens."""
     g = torch.Generator().manual_seed(seed)
-    rows = _bucket(num_reqs)
+    # Served padding of the sampler rows (min MIN_NUM_SEQS), as warmup uses;
+    # the drafter's per-step tokens use its loop bucket.
+    rows = runner_mod._get_padded_num_reqs_with_upper_limit(num_reqs, 16)
     p = _bucket(num_reqs)
     next_tokens = torch.randint(0, 1000, (rows, k + 1), generator=g, dtype=torch.int32)
     # Random accepted prefix per row; INVALID (-1) after it.
@@ -148,6 +150,12 @@ def test_on_matches_off_across_buckets(tail_env, monkeypatch, k):
             DraftStepTokens(steps, n), [nt], state
         )
         _equal(got, ref)
+        # The ON step must hit a warmed key (compiled stack), not the eager
+        # fallback.
+        key = runner_mod._spec_tail_stack_key(
+            nt, state.spec_decode_metadata_list[0].draft_lengths, n, steps
+        )
+        assert key in runner._spec_tail_stack_keys, (n, key)
         # The dense drafts equal the stock propose return's ops.
         stacked = torch.stack(steps, dim=1)
         assert torch.equal(dense, torch.cat([stacked[:n]], dim=0))
