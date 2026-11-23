@@ -113,7 +113,7 @@ def test_mask_levers_are_bitwise(block_q, other, lever):
 
 
 @pytest.mark.parametrize("block_q", [16, 32])
-@pytest.mark.parametrize("lever", ["vt", "lmxu", "exp16,lmxu", "mdot", "lmxu,mdot"])
+@pytest.mark.parametrize("lever", ["vt", "lmxu", "exp16,lmxu", "mdot", "lmxu,mdot", "msub", "lmxu,msub"])
 def test_vt_close(block_q, lever):
     args = make(64, seed=11 + block_q)
     o0, l0 = run(args, block_q, "")
@@ -125,7 +125,7 @@ def test_vt_close(block_q, lever):
     assert np.sqrt(np.mean((o1 - o0) ** 2)) / np.sqrt(np.mean(o0 ** 2)) < 1e-2
 
 
-@pytest.mark.parametrize("lever", ["lmxu", "lmxu,mdot"])
+@pytest.mark.parametrize("lever", ["lmxu", "lmxu,mdot", "lmxu,msub"])
 @pytest.mark.parametrize("q_scale", [1.0, 8.0])
 def test_mdot_against_oracle(lever, q_scale):
     """"mdot" shifts by the first page's raw max (+ headroom), not the running

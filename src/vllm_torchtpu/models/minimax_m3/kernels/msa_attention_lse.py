@@ -219,7 +219,9 @@ FP8_OPT_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT"
 # contraction whose extra column is 1 for every key and -m for every row, so
 # it yields s - m directly. Exact softmax for any m; f32 / bf16 keep p in
 # range while the true row max stays within ~2^7 of m.
-_FP8_LEVERS = ("exp16", "bias", "lanemask", "vt", "lmxu", "mdot")
+# "msub": the same first-page shift, subtracted per score on the VALU (128-wide
+# contraction); only the per-score running max goes.
+_FP8_LEVERS = ("exp16", "bias", "lanemask", "vt", "lmxu", "mdot", "msub")
 _MDOT_HEADROOM = 16.0
 
 
@@ -530,6 +532,9 @@ def _kernel(
     lmxu_t = not fp4 and "lmxu" in precision
     vt_t = not fp4 and ("vt" in precision or lmxu_t)
     mdot_t = not fp4 and "mdot" in precision
+    msub_t = not fp4 and "msub" in precision and not mdot_t
+    # A first-page shift may sit above a row's max: l can be below 1.
+    mshift_t = mdot_t or msub_t
     out_unit = 1.0 / _PV8_UNIT if pv8 else 1.0
 
     def group_head(w):
@@ -848,7 +853,7 @@ def _kernel(
             q = q_ref[...].reshape(num_heads * block_q, head_dim)
             q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
             m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
-            if mdot_t and packing == 4:
+            if mshift_t and packing == 4:
                 # Raw scores of the first page (finite: slots no token sees zeroed).
                 k0 = jnp.where(row_slots < mdot_seen, keys[0], 0).astype(k.dtype)
                 s0 = jax.lax.dot_general(
@@ -859,6 +864,7 @@ def _kernel(
                 )
                 # The shift passes through the dot in bf16: keep that exact value.
                 m_new = m_new.astype(jnp.bfloat16).astype(jnp.float32)
+            if mdot_t and packing == 4:
                 lane = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
                 k_aug = jnp.broadcast_to((lane == 0).astype(k.dtype), (k.shape[0], 128))
                 q_aug = jnp.where(lane == 0, -m_new.T, 0.0).astype(q.dtype)  # [rows, 128]
@@ -897,7 +903,9 @@ def _kernel(
             else:
                 mask = jnp.concatenate(masks, axis=0)
                 s = jnp.where(mask, s, -jnp.inf)
-            if mdot_t and packing == 4:
+            if mshift_t and packing == 4:
+                if msub_t:
+                    s = s - m_new
                 p = jnp.exp2(s.astype(jnp.bfloat16) if exp16_t else s)
                 if not lmxu_t:
                     l_cur = jnp.sum(p.astype(jnp.float32), axis=0, keepdims=True)
@@ -939,7 +947,11 @@ def _kernel(
 
         def finish_t(m, denom, acc_t):
             """`finish` for `attend_t`'s lane-vector state."""
-            put((acc_t * (1.0 / jnp.maximum(denom, 1.0))).T)
+            if mshift_t and packing == 4:
+                inv = 1.0 / jnp.where(denom > 0, denom, 1.0)
+            else:
+                inv = 1.0 / jnp.maximum(denom, 1.0)
+            put((acc_t * inv).T)
             lse_ref[...] = (m * _LN_2 + jnp.log(denom)).reshape(lse_ref.shape)
 
         def attend(width, single, from_bf16=False):
