@@ -437,6 +437,7 @@ if TYPE_CHECKING:
     VLLM_TPU_ATTN_METADATA_REUSE: bool = False
     VLLM_TPU_FORWARD_CTX_PREBUILT: bool = False
     VLLM_TPU_MAMBA_RD_REUSE: bool = False
+    VLLM_TPU_KV_CONNECTOR_SKIP_NOOP: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
     VLLM_TPU_MK_WHOLE_DIRECT_EXEC: bool = False
     VLLM_TPU_ENVS_FREEZE: bool = False
@@ -2794,6 +2795,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # device copy instead of rewriting the six host values (already equal) and
     # slicing the same device tensor again (tpu_runner._prepare_inputs).
     "VLLM_TPU_MAMBA_RD_REUSE": env_bool("VLLM_TPU_MAMBA_RD_REUSE"),
+    # Without a KV transfer group, skip execute_model's per-step
+    # `set_forward_context(None, ...)` block around maybe_setup_kv_connector:
+    # both do nothing then (tpu_runner._kv_connector_setup_is_noop). With a
+    # connector configured the block runs as before.
+    "VLLM_TPU_KV_CONNECTOR_SKIP_NOOP": env_bool("VLLM_TPU_KV_CONNECTOR_SKIP_NOOP"),
     # Freshly AOT-compiled models skip the per-call Dynamo guard check when
     # vLLM does not evaluate guards (as it already does for cached artifacts).
     "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),
