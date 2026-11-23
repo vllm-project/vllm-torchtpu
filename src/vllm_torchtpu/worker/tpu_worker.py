@@ -843,12 +843,11 @@ class TPUWorker(WorkerBase):
 
         patch_registry.apply("model_load", model_config=self.model_config)
         self.model_runner.load_model()
-        # Flush pending device copies and collect cyclic references to host
-        # weight buffers before returning freed allocator pages to the OS,
-        # ahead of initialize_from_config where a KV connector may allocate
-        # its host store.
-        if torch.accelerator.is_available():
-            torch.accelerator.synchronize()
+        # Materialize and wait on any deferred device weight copies, then
+        # collect cyclic references to host staging/loader buffers before
+        # returning freed allocator pages to the OS, ahead of
+        # initialize_from_config where a KV connector may allocate its host store.
+        utils.synchronize_tensors(wait=True)
         gc.collect()
         _release_free_host_heap()
 

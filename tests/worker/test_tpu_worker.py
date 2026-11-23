@@ -624,10 +624,7 @@ def test_kv_connector_handshake_metadata_uses_pp_tp_rank_key(
     assert worker.get_kv_connector_handshake_metadata() == {(2, 3): metadata}
 
 
-@pytest.mark.parametrize("accel_available", [False, True])
-def test_load_model_patches_loads_then_releases_free_host_heap(
-    monkeypatch, accel_available
-):
+def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
     from vllm_torchtpu.worker import tpu_worker
 
     events = []
@@ -636,12 +633,9 @@ def test_load_model_patches_loads_then_releases_free_host_heap(
         patch_registry, "apply", lambda stage, **kwargs: events.append((stage, kwargs))
     )
     monkeypatch.setattr(
-        tpu_worker.torch.accelerator, "is_available", lambda: accel_available
-    )
-    monkeypatch.setattr(
-        tpu_worker.torch.accelerator,
-        "synchronize",
-        lambda: events.append("sync"),
+        tpu_worker.utils,
+        "synchronize_tensors",
+        lambda *, wait=True: events.append(("sync", wait)),
     )
     monkeypatch.setattr(tpu_worker.gc, "collect", lambda: events.append("gc"))
     monkeypatch.setattr(
@@ -653,11 +647,13 @@ def test_load_model_patches_loads_then_releases_free_host_heap(
         model_runner=SimpleNamespace(load_model=lambda: events.append("load")),
     )
     TPUWorker.load_model(worker)
-    expected = [("model_load", {"model_config": config}), "load"]
-    if accel_available:
-        expected.append("sync")
-    expected.extend(["gc", "release"])
-    assert events == expected
+    assert events == [
+        ("model_load", {"model_config": config}),
+        "load",
+        ("sync", True),
+        "gc",
+        "release",
+    ]
 
 
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])

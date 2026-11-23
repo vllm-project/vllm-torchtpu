@@ -125,23 +125,33 @@ def test_flush_all_drops_the_buffers_flushes_left_behind():
     assert not stager._pool
 
 
-def test_flush_all_clears_tracker_and_written_early(monkeypatch):
+def test_flush_all_resets_state_for_subsequent_loads(monkeypatch):
     from vllm_torchtpu import model_loader_patches
 
     monkeypatch.setattr(model_loader_patches, "_MAX_STAGED", 1)
     stager = ExpertParamStager()
     first, second = _param(2, 4, 4), _param(2, 4, 4)
-    stager.host_param(first)
+    stager.host_param(first)[0] = 1
     assert not stager.written(first, 0, "w2")
-    stager.host_param(second)
+    # Staging a second parameter evicts `first` early while leaving a partial
+    # tracker record for both parameters.
+    stager.host_param(second)[0] = 2
     assert not stager.written(second, 0, "w2")
-    assert id(first) in stager.written_early
-    assert stager._tracker._seen
+    assert not stager.staging(first)
+
     stager.flush_all()
-    assert not stager._pool
-    assert not stager._tracker._seen
-    assert not stager.written_early
+
+    # After flush_all, re-using the same parameter id on a subsequent load
+    # (e.g. a draft model) must stage again and must not complete early from
+    # pre-flush tracker state.
     assert stager.staging(first)
+    host = stager.host_param(first)
+    host[0] = 3
+    assert not stager.written(first, 0, "w2")
+    host[1] = 4
+    assert stager.written(first, 1, "w2")
+    assert torch.equal(first.data[0], torch.full((4, 4), 3.0))
+    assert torch.equal(first.data[1], torch.full((4, 4), 4.0))
 
 
 def test_flush_uploads_in_chunks(monkeypatch):

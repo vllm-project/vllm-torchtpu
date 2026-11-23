@@ -837,6 +837,9 @@ class ExpertWriteTracker:
             del self._seen[id(param)]
         return complete
 
+    def clear(self) -> None:
+        self._seen.clear()
+
 
 # Host bytes per device upload of a staged parameter.
 _UPLOAD_CHUNK_BYTES = 256 << 20
@@ -945,7 +948,7 @@ class ExpertParamStager:
         for param, _ in list(self._staged.values()):
             self.flush(param)
         self._pool.clear()
-        self._tracker._seen.clear()
+        self._tracker.clear()
         self.written_early.clear()
 
     def __len__(self) -> int:
