@@ -196,7 +196,7 @@ def _reference_slots(kv_starts, positions, table, capacity, requests):
     return live, block, logical % capacity
 
 
-@pytest.mark.parametrize("tokens,requests", [(96, 16), (288, 48)])
+@pytest.mark.parametrize("tokens,requests", [(72, 12), (96, 16), (288, 48)])
 @pytest.mark.parametrize("main_columns", [8, 130])  # crosses a 128-lane chunk
 def test_compressor_addresses_match_reference(tokens, requests, main_columns):
     inputs = _compressor_inputs(tokens, requests)

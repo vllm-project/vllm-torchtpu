@@ -37,15 +37,17 @@ class FusionMode(enum.Enum):
 # prefill-sized call and falls back silently, even under REQUIRE.
 ROUTING_TOKENS = frozenset({96, 192, 256, 288, 384})  # per-shard t_local
 PRESORT_TOKENS = ROUTING_TOKENS
-COMPACT_TOKENS = frozenset({96, 192, 240, 256, 288, 384})
+COMPACT_TOKENS = frozenset({80, 96, 192, 240, 256, 288, 384})
 COMPRESSOR_STATE_TOKENS = frozenset({96, 192, 240, 256, 288})
-COMPRESSOR_ADDRESS_TOKENS = frozenset({288})
-INDEXER_TOKENS = frozenset({128, 256, 288, 384, 512})
+COMPRESSOR_ADDRESS_TOKENS = frozenset({72, 288})
+INDEXER_TOKENS = frozenset({72, 128, 256, 288, 384, 512})
 MHC_TOKENS = frozenset({288})
 CACHE_UNPACK_RECORDS = frozenset({12288, 36864})
-SWA_PACK_TOKENS = frozenset({96, 192, 288})
+SWA_PACK_TOKENS = frozenset({40, 60, 72, 96, 192, 288})
 # (tokens, requests): the region builds token x request matrices.
-MAIN_RECORD_BATCHES = frozenset({(96, 16), (192, 32), (288, 32), (288, 48)})
+MAIN_RECORD_BATCHES = frozenset(
+    {(72, 12), (96, 16), (128, 12), (192, 32), (288, 32), (288, 48)}
+)
 # The main-record kernel's one-hot gather costs O(T * requests * columns);
 # smaller page tables than the largest measured one are strictly cheaper.
 MAIN_RECORD_MAX_COLUMNS = 772
