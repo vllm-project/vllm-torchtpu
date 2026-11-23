@@ -101,8 +101,8 @@
 /tests/kernels/test_dsa_gather.py @kyuyeunk @qizzzh @bigeye @annyan09023 @lenscloth @pritha90 @m-liu @aaronndx
 
 # Kernels: Fused MoE
-/src/vllm_torchtpu/kernels/fused_moe/ @kyuyeunk @qizzzh @bigeye @gxd3 @annyan09023 @helloworld1
-/tests/kernels/fused_moe/ @kyuyeunk @qizzzh @bigeye @gxd3 @annyan09023 @helloworld1
+/src/vllm_torchtpu/kernels/fused_moe/ @kyuyeunk @qizzzh @bigeye @gxd3 @annyan09023 @helloworld1 @vanbasten23
+/tests/kernels/fused_moe/ @kyuyeunk @qizzzh @bigeye @gxd3 @annyan09023 @helloworld1 @vanbasten23
 
 # Kernels: SparseCore Offload & Gather
 /src/vllm_torchtpu/kernels/sparse_core/ @kyuyeunk @qizzzh @bigeye @guowei-dev
