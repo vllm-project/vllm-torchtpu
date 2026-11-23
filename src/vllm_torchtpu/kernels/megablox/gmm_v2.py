@@ -1083,9 +1083,9 @@ def run_gmm_pipeline(
     last_step_hook runs at the start of the last grid step, when the pipeline
     fetches nothing more (kernel_mlp issues the next gmm's first DMA there).
 
-    rhs_weight_window: [2, tile_k, tile_n] VMEM whose slot 0 already holds the
-    first grid step's rhs weight block (see kernel_mlp); the pipeline then
-    double-buffers rhs weights in it instead of fetching that block itself.
+    rhs_weight_window: [slots, tile_k, tile_n] VMEM whose slot 0 already holds
+    the first grid step's rhs weight block (see kernel_mlp); the pipeline then
+    buffers rhs weights in its slots instead of fetching that block itself.
     """
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
@@ -1179,13 +1179,14 @@ def kernel_mlp(
     *,
     cfgs1: GmmConfigs,
     cfgs2: GmmConfigs,
+    window_slots: int,
 ):
     """Two chained gmms over the same groups in one call (see gmm_v2_mlp)."""
     num_gm = fill_metadata(
         lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs1
     )
 
-    # The second gmm's first rhs block (a whole expert, see _mlp_fusable)
+    # The second gmm's first rhs block (a whole expert, see _mlp_window_slots)
     # streams in under the first gmm's last compute step instead of after it.
     def run(window_ref, sem_ref):
         first = pltpu.make_async_copy(
@@ -1227,7 +1228,7 @@ def kernel_mlp(
     tiles2 = cfgs2.tiles
     pl.run_scoped(
         run,
-        pltpu.VMEM((2, tiles2.tile_k, tiles2.tile_n), rhs2_ref.weight.dtype),
+        pltpu.VMEM((window_slots, tiles2.tile_k, tiles2.tile_n), rhs2_ref.weight.dtype),
         pltpu.SemaphoreType.DMA(()),
     )
 
@@ -1845,8 +1846,14 @@ def _decode_tiles(cfgs: GmmConfigs) -> bool:
     )
 
 
-def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) -> bool:
-    """Whether kernel_mlp can run both gmms on one fill_metadata layout."""
+def _mlp_window_slots(
+    cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int
+) -> int:
+    """Down weight blocks kernel_mlp's prefetch window holds (3 when they fit,
+    else 2), or 0 when kernel_mlp cannot run both gmms on one fill_metadata
+    layout. With 2 slots only one down block is in flight; on decode tiles
+    the step's compute is shorter than the DMA issue gap, so a third slot
+    keeps the weight stream busy."""
 
     def vmem(cfgs):
         t = cfgs.tiles
@@ -1859,11 +1866,10 @@ def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) ->
             fuse_act=cfgs.fuse_act,
         )
 
-    # The prefetch window (2 down weight blocks) lives through both pipelines;
-    # down's pipeline double-buffers its weights in it.
+    # The prefetch window lives through both pipelines; down's pipeline
+    # buffers its weights in it.
     t2 = cfgs2.tiles
     block2 = rhs_weight_block_bytes(t2.tile_k, t2.tile_n, cfgs2.rhs_cfgs)
-    window = 2 * block2
 
     # kernel_mlp's scratch keeps both pipelines' partial_out and acc resident.
     def scratch(cfgs):
@@ -1872,13 +1878,14 @@ def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) ->
             for x in pipeline_scratch_shapes(cfgs)
         )
 
-    fits = (
-        vmem(cfgs1) + scratch(cfgs2) + window <= vmem_limit_bytes
-        and vmem(cfgs2) - 3 * block2 + scratch(cfgs1) + window <= vmem_limit_bytes
-    )
-    return (
-        fits
-        and
+    def fits(slots):
+        window = slots * block2
+        return (
+            vmem(cfgs1) + scratch(cfgs2) + window <= vmem_limit_bytes
+            and vmem(cfgs2) - 3 * block2 + scratch(cfgs1) + window <= vmem_limit_bytes
+        )
+
+    fusable = (
         # Decode-sized tiles only: the fused program holds both gmms' bucket
         # bodies, and large ones would bloat it.
         _decode_tiles(cfgs1)
@@ -1896,6 +1903,9 @@ def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) ->
         and cfgs2.tiles.tile_n == cfgs2.dims.size_n
         and cfgs1.out_size_n % pltpu.get_tpu_info().num_lanes == 0
     )
+    if not fusable:
+        return 0
+    return next((slots for slots in (3, 2) if fits(slots)), 0)
 
 
 @jax.jit(static_argnames=["fuse_act", "preferred_element_type", "maybe_quantize_lhs"])
@@ -1982,7 +1992,8 @@ def gmm_v2_mlp(
         out_dtype=preferred_element_type,
         **common,
     )
-    if not _mlp_fusable(cfgs1, cfgs2, vmem_limit_bytes):
+    window_slots = _mlp_window_slots(cfgs1, cfgs2, vmem_limit_bytes)
+    if not window_slots:
         return two_calls()[:size_m]
 
     def weights_ref(rhs, rhs_scale):
@@ -2001,7 +2012,9 @@ def gmm_v2_mlp(
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     cost1, cost2 = get_cost_estimate(cfgs1), get_cost_estimate(cfgs2)
     out, _ = pl.pallas_call(
-        functools.partial(kernel_mlp, cfgs1=cfgs1, cfgs2=cfgs2),
+        functools.partial(
+            kernel_mlp, cfgs1=cfgs1, cfgs2=cfgs2, window_slots=window_slots
+        ),
         out_shape=(
             jax.ShapeDtypeStruct(
                 (padded_size_m, align_to(cfgs2.out_size_n, num_lanes)),

@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.megablox import gmm_v2 as gmm_v2_module
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     FP8_DECODE_BUCKETS,
     Dimensions,
@@ -655,7 +656,6 @@ def test_gmm_fp8_ntile_loop_matches_unrolled(
     """The fp8-feed matmul as a loop over MXU column tiles must equal the fully
     unrolled form bit for bit."""
     _require_tpu()
-    import vllm_torchtpu.kernels.megablox.gmm_v2 as gmm_v2_module
 
     in_size, out_size, num_groups, block_size = 1024, 1024, 16, 128
     keys = jax.random.split(jax.random.key(0), 3)
@@ -688,3 +688,108 @@ def test_gmm_fp8_ntile_loop_matches_unrolled(
     monkeypatch.setattr(gmm_v2_module, "_fp8_ntile_loop_ok", lambda *_: False)
     unrolled = run()
     np.testing.assert_array_equal(looped, unrolled)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "num_groups, inter, window_slots",
+    [
+        # Half an expert per core (EP4 x TP2): the down window takes 3 slots.
+        (32, 1536, 3),
+        # Whole experts (EP8): 3 slots of 9.4 MB do not fit, so 2.
+        (16, 3072, 2),
+    ],
+)
+def test_gmm_v2_mlp_window_slots_match_two_gmms(num_groups, inter, window_slots):
+    """At MiniMax-M3.1 decode shapes (hidden 6144, block-128 fp32 scales) the
+    fused MLP picks the expected down-proj window depth and still equals
+    gate_up gmm followed by down gmm bit for bit."""
+    _require_tpu()
+
+    hidden, block_size, batch_size = 6144, 128, 32
+    keys = jax.random.split(jax.random.key(1), 5)
+    w1 = jax.random.normal(keys[0], (num_groups, hidden, 2 * inter)).astype(
+        jnp.float4_e2m1fn
+    )
+    w2 = jax.random.normal(keys[1], (num_groups, inter, hidden)).astype(
+        jnp.float4_e2m1fn
+    )
+    s1 = jax.random.uniform(
+        keys[2], (num_groups, hidden // block_size, 1, 2 * inter), jnp.float32, 0.5, 2
+    )
+    s2 = jax.random.uniform(
+        keys[3], (num_groups, inter // block_size, 1, hidden), jnp.float32, 0.5, 2
+    )
+    lhs = jax.random.normal(keys[4], (batch_size, hidden), jnp.bfloat16)
+    # 9 active experts, rows as decode routes them (8 tokens x top-4).
+    sizes = [0] * num_groups
+    for row in range(batch_size):
+        sizes[(row % 9) * (num_groups // 9)] += 1
+    group_sizes = jnp.asarray(sizes, dtype=jnp.int32)
+
+    vmem_limit = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+    common = dict(
+        tile_info=calculate_tiling,
+        vmem_limit_bytes=vmem_limit,
+        acc_dtype=None,
+        maybe_quantize_lhs=False,
+        zero_initialize=False,
+    )
+    group_offset = jnp.zeros((1,), jnp.int32)
+    cfgs1 = gmm_v2_module.make_gmm_configs(
+        lhs,
+        w1,
+        s1,
+        None,
+        group_sizes,
+        group_offset,
+        out_dtype=None,
+        fuse_act="swigluoai",
+        **common,
+    )
+    h_shape = jax.ShapeDtypeStruct((batch_size, inter), cfgs1.out_dtype)
+    cfgs2 = gmm_v2_module.make_gmm_configs(
+        h_shape,
+        w2,
+        s2,
+        None,
+        group_sizes,
+        group_offset,
+        out_dtype=jnp.bfloat16,
+        **common,
+    )
+    assert gmm_v2_module._mlp_window_slots(cfgs1, cfgs2, vmem_limit) == window_slots
+
+    h = gmm_v2(
+        lhs,
+        w1,
+        group_sizes,
+        rhs_scale=s1,
+        zero_initialize=False,
+        fuse_act="swigluoai",
+        maybe_quantize_lhs=False,
+    )
+    expected = gmm_v2(
+        h,
+        w2,
+        group_sizes,
+        rhs_scale=s2,
+        zero_initialize=False,
+        preferred_element_type=jnp.bfloat16,
+        maybe_quantize_lhs=False,
+    )
+    actual = gmm_v2_mlp(
+        lhs,
+        w1,
+        w2,
+        group_sizes,
+        rhs1_scale=s1,
+        rhs2_scale=s2,
+        fuse_act="swigluoai",
+        preferred_element_type=jnp.bfloat16,
+        maybe_quantize_lhs=False,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(actual.astype(jnp.float32)),
+        np.asarray(expected.astype(jnp.float32)),
+    )
