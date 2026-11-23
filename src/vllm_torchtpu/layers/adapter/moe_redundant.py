@@ -239,6 +239,37 @@ def compute_placement(
     return LayerPlacement(num_logical, ep, slots, tuple(rep))
 
 
+def explicit_placement(
+    num_logical: int, ep: int, slots: int, rep: Iterable[int]
+) -> LayerPlacement:
+    """A placement given copy by copy: ``rep[r * slots + j]`` is the logical
+    expert held by redundant slot ``j`` of rank ``r`` (``{"rep": [...]}`` in a
+    placement table, e.g. one fitted offline to a served route trace).
+
+    Every copy must sit off its expert's home rank and an expert gets at most
+    one copy, so the assignment kernel sees the same ``[E, 2]`` copies table
+    as with `compute_placement`.
+    """
+    rep = tuple(int(x) for x in rep)
+    local = num_logical // ep if ep else 0
+    if ep < 2 or slots < 1 or num_logical % ep or len(rep) != ep * slots:
+        raise ValueError(
+            f"explicit redundant placement needs {ep} * {slots} entries for "
+            f"E={num_logical}; got {len(rep)}"
+        )
+    for i, logical in enumerate(rep):
+        if not 0 <= logical < num_logical:
+            raise ValueError(f"explicit redundant placement: expert {logical} out of range")
+        if logical // local == i // slots:
+            raise ValueError(
+                f"explicit redundant placement: expert {logical} copied onto its "
+                f"home rank {i // slots}"
+            )
+    if len(set(rep)) != len(rep):
+        raise ValueError("explicit redundant placement: an expert has two copies")
+    return LayerPlacement(num_logical, ep, slots, rep)
+
+
 def layer_key(name: str) -> str:
     """``model.layers.17.mlp.experts`` -> ``L17``; MTP/draft -> ``mtp<N>``.
 
@@ -401,7 +432,10 @@ def prepare(layer: Any) -> int:
     ordinal = _ORDINAL[0]
     _ORDINAL[0] += 1
     hot = hot_for_layer(placement_source(), name, ordinal)
-    plan = compute_placement(num_logical, ep, SLOTS_PER_RANK, hot)
+    if isinstance(hot, dict) and "rep" in hot:
+        plan = explicit_placement(num_logical, ep, SLOTS_PER_RANK, hot["rep"])
+    else:
+        plan = compute_placement(num_logical, ep, SLOTS_PER_RANK, hot)
     layer._rx_plan = plan
     layer._rx_from_source = hot is not None
     return SLOTS_PER_RANK
