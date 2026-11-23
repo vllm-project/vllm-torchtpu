@@ -35,6 +35,7 @@ from vllm.model_executor.models.utils import (
 
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
+from vllm_torchtpu.models.minimax_m3 import quant
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
 
 
@@ -76,6 +77,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif quant.fp8_norm_applies(self.self_attn.qkv_proj, hidden_states.shape[0]):
+            hidden_states, residual = quant.fused_add_rms_norm_e4m3(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+            )
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)

@@ -86,6 +86,69 @@ _split_e4m3.register_fake(
 )
 
 
+_E4M3_MAX = 448.0
+
+
+def _fp8_cast_matmul(x: jax.Array, w: jax.Array, scale: jax.Array) -> jax.Array:
+    """``bf16(e4m3(clip(x)) @ w * scale)`` with f32 accumulation: no
+    per-token scale, so the cast is elementwise and fuses into x's producer."""
+    if x.dtype == jnp.float8_e4m3fn:
+        x8 = x
+    else:
+        x8 = jnp.clip(x, -_E4M3_MAX, _E4M3_MAX).astype(jnp.float8_e4m3fn)
+    acc = jax.lax.dot_general(
+        x8, w, (((x.ndim - 1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+    )
+    return (acc * scale.astype(jnp.float32).reshape(-1)).astype(jnp.bfloat16)
+
+
+_fp8_cast_linear = pallas.jax_op("pallas::minimax_m3_fp8_cast_linear", _fp8_cast_matmul)
+_fp8_cast_linear.register_fake(
+    lambda x, w, scale: torch.empty(
+        (*x.shape[:-1], w.shape[1]), dtype=torch.bfloat16, device=x.device
+    )
+)
+
+
+def _fp8_cast_applies(layer: torch.nn.Module, rows: int) -> bool:
+    min_rows = envs.TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS
+    if not min_rows or rows < min_rows:
+        return False
+    prefix = getattr(layer, "prefix", "")
+    skip = [s for s in envs.TPU_MINIMAX_M3_FP8_CAST_SKIP.split(",") if s]
+    return not any(prefix.endswith(s) for s in skip)
+
+
+def fp8_norm_applies(qkv_proj: torch.nn.Module, rows: int) -> bool:
+    """TPU_MINIMAX_M3_FP8_CAST_NORM: the input RMSNorm emits e4m3 for a qkv
+    projection that casts its activations at this bucket."""
+    return (
+        envs.TPU_MINIMAX_M3_FP8_CAST_NORM
+        and isinstance(getattr(qkv_proj, "quant_method", None), MiniMaxM3Mxfp8LinearMethod)
+        and qkv_proj.weight.dtype == torch.float8_e4m3fn
+        and _fp8_cast_applies(qkv_proj, rows)
+    )
+
+
+def fused_add_rms_norm_e4m3(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    gemma_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GemmaRMSNorm's fused add + norm (the `tpu` IR provider's rounding
+    points: residual rounded to the activation dtype, FP32 norm, output
+    rounded to it) with the output cast to e4m3 (clamped) in the same
+    expression, so XLA writes the e4m3 activation once instead of a bf16
+    copy that a second pass re-reads (the IR op is a fusion boundary)."""
+    orig_dtype = x.dtype
+    residual = (x.to(torch.float32) + residual.to(torch.float32)).to(orig_dtype)
+    r = residual.to(torch.float32)
+    out = r * torch.rsqrt(r.pow(2).mean(dim=-1, keepdim=True) + eps)
+    out = (out * (gemma_weight.to(torch.float32) + 1.0)).to(orig_dtype)
+    return out.clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn), residual
+
+
 QUANT_METHOD = "mxfp8"
 MXFP8_BLOCK = 32
 _E8M0_BIAS = 127
@@ -245,6 +308,20 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
                 max(1, envs.TPU_MINIMAX_M3_FP8_SPLIT_MIN_ROWS),
                 envs.TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS,
             )
+        if envs.TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS:
+            logger.info_once(
+                "TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS=%d: MXFP8 linears cast "
+                "activations to e4m3 (unscaled) and run fp8 x fp8 for token "
+                "buckets of >= %d rows, except %s.",
+                envs.TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS,
+                envs.TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS,
+                envs.TPU_MINIMAX_M3_FP8_CAST_SKIP or "none",
+            )
+            if envs.TPU_MINIMAX_M3_FP8_CAST_NORM:
+                logger.info_once(
+                    "TPU_MINIMAX_M3_FP8_CAST_NORM=1: input RMSNorms emit e4m3 for "
+                    "casting qkv projections."
+                )
         logger.debug(
             "MXFP8 linear %s kept e4m3: %d of %d elements below e4m3's normal "
             "range after the block shift.",
@@ -277,6 +354,15 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
             and x.dtype == torch.bfloat16
         ):
             return _split_e4m3(x, layer.weight, layer.weight_scale)
+        if x.dtype == torch.float8_e4m3fn:
+            # Already cast by its producer (fused_add_rms_norm_e4m3).
+            return _fp8_cast_linear(x, layer.weight, layer.weight_scale)
+        if x.dtype == torch.bfloat16 and _fp8_cast_applies(layer, rows):
+            if envs.TPU_MINIMAX_M3_FP8_CAST_IN_TORCH:
+                # Cast outside the jax_op, so XLA can fuse it into x's
+                # producer (the op boundary kept it a separate pass).
+                x = x.clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn)
+            return _fp8_cast_linear(x, layer.weight, layer.weight_scale)
         if rows >= _UPCAST_MIN_ROWS and x.dtype == torch.bfloat16:
             weight = _materialized_bf16(layer.weight)
         else:
