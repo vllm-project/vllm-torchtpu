@@ -1323,8 +1323,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whole-step megakernel call: leaner operand prep around the kernel, same values bit for
     # bit. "1" / "all" = every lever, or a comma list of: ring (each QSA layer's ring id read
     # once from the flat table, no [requests, cols] relayout), cktab (the manager-page key
-    # table built at its final width), rope (one rope-table gather for both row sets).
-    # Empty / "0": off.
+    # table built at its final width), rope (one rope-table gather for both row sets), conv
+    # (the GDN checkpoint scatter reads the conv windows from the kernel's history
+    # directly). Empty / "0": off.
     "VLLM_TPU_MK_IO_LEAN": env_str("VLLM_TPU_MK_IO_LEAN", ""),
     # Whole-step megakernel: per-row-bucket tile / tunable overrides (BUCKET_TUNE in
     # qwen38_wholestep_call). Layout-only entries keep the bytes; see its comments.
