@@ -313,7 +313,8 @@ def test_vllm_engine_core_looks_schedule_up_per_call():
         assert "self.scheduler.schedule(" in inspect.getsource(fn), fn
     lazy = (SRC / "core/pp_lazy_step.py").read_text()
     assert "scheduler = core.scheduler\n        scheduler_output = scheduler.schedule(" in lazy
-    entry = (SRC / "__init__.py").read_text()
+    # On the Q38_OXPD_FORM-gated package the default form's body is _bl_init.py (vllm_torchtpu/__init__.py is the gate).
+    entry = (SRC / "_bl_init.py" if (SRC / "_bl_init.py").exists() else SRC / "__init__.py").read_text()
     body = entry.split("def _run_engine_core_with_tpu_patches(", 1)[1].split("\ndef ", 1)[0]
     assert body.count("patch_engine_core_for_host_knobs()") == 1
     assert body.index("patch_engine_core_for_lazy_push(") < body.index("patch_engine_core_for_host_knobs()") < body.index(
