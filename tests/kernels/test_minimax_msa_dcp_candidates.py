@@ -87,14 +87,21 @@ def test_decode_step_returns_token_rows() -> None:
     )
 
 
-# Transposed picks (up to 768 columns) and row-major ones.
-@pytest.mark.parametrize("width", [256, 1024])
+# Transposed picks (up to 768 columns; up to 64 rows as two halves) and
+# row-major ones.
+@pytest.mark.parametrize("width", [256, 512, 768, 1024])
 @pytest.mark.parametrize("rank", [0, 1])
-def test_packed_pick_matches_local_candidates(width: int, rank: int) -> None:
-    rng = np.random.default_rng(width + rank)
-    tokens = 24
+@pytest.mark.parametrize("tokens", [8, 24, 48, 72])
+@pytest.mark.parametrize("ties", [True, False])
+def test_packed_pick_matches_local_candidates(width, rank, tokens, ties) -> None:
+    rng = np.random.default_rng(width + rank + tokens)
     # Few distinct values, so most picks break ties.
-    scores = jnp.asarray(rng.integers(-3, 4, (tokens, width)), jnp.float32)
+    values = (
+        rng.integers(-3, 4, (tokens, width))
+        if ties
+        else rng.normal(size=(tokens, width))
+    )
+    scores = jnp.asarray(values, jnp.float32)
     pos = jnp.asarray(rng.integers(0, 2 * _BLOCK * width, tokens), jnp.int32)
     want = msa_dcp.pack_candidates(*_pick(scores[:, None, :], pos, rank))
     pick = msa_dcp._PackedPick(_BLOCK, _TOPK, 1, 2, 2)

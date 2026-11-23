@@ -229,6 +229,70 @@ def _pick_t(st, num_visible, rank, *, topk, init_blocks, local_blocks, dcp):
     )
 
 
+def _pick_t_halves(s, num_visible, rank, *, topk, init_blocks, local_blocks, dcp):
+    """`_pick` of row-major scores ``s [rows, width]`` (``num_visible [rows, 1]``, ``2 * rows <= 128``,
+    ``width % 16 == 0``) as two `_pick_t`s side by side on the vreg lanes the
+    transposed rows leave idle, then a merge of their two ordered lists.
+
+    The transposed pick takes rows on lanes: at decode sizes (8 to 64 rows)
+    most of each vreg's 128 lanes were idle, and a step's max and first index
+    ran over ``width / 8`` vregs. Here each step runs over half as many, the
+    second half of the columns on lanes ``[rows, 2 * rows)``. The merge ranks
+    each real candidate by the real candidates of the other half ahead of it
+    (score descending, ties to the lower block; the halves hold disjoint
+    blocks), so the result equals `_pick`'s."""
+    rows, width = s.shape
+    half = width // 2
+    st = jnp.concatenate([s[:, :half], s[:, half:]], axis=0).T  # [half, 2 * rows]
+    lane = jax.lax.broadcasted_iota(jnp.int32, (1, 2 * rows), 1)
+    offset = jnp.where(lane >= rows, half, 0)
+    cols = jax.lax.broadcasted_iota(jnp.int32, st.shape, 0) + offset
+    vis = jnp.concatenate([num_visible.T, num_visible.T], axis=1)  # [1, 2 * rows]
+    blocks = cols * dcp + rank
+    visible = blocks < vis
+    st = jnp.where(visible, st, _NEG_INF)
+    st = jnp.where(
+        visible & (blocks >= vis - local_blocks), msa_select._FORCED_LOCAL_SCORE, st
+    )
+    st = jnp.where(visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, st)
+    ids = cols.astype(jnp.float32)
+    scores, picks = [], []
+    for _ in range(topk):
+        best_score = jnp.max(st, axis=0, keepdims=True)
+        best = jnp.min(jnp.where(st == best_score, ids, float(width)), axis=0, keepdims=True)
+        scores.append(best_score)
+        picks.append(best)
+        st = jnp.where(ids == best, _NEG_INF, st)
+    sc = jnp.concatenate(scores, axis=0)  # [topk, 2 * rows]
+    ix = jnp.concatenate(picks, axis=0)
+    a_s, b_s, a_i, b_i = sc[:, :rows], sc[:, rows:], ix[:, :rows], ix[:, rows:]
+
+    def ahead(xs, xi, ys, yi):
+        """Per real candidate of ``x``: the real candidates of ``y`` ahead of it."""
+        n = jnp.zeros(xs.shape, jnp.int32)
+        for j in range(topk):
+            s_j, i_j = ys[j : j + 1], yi[j : j + 1]
+            first = (s_j > xs) | ((s_j == xs) & (i_j < xi))
+            n = n + (first & (s_j > _NEG_INF)).astype(jnp.int32)
+        return n
+
+    slot = jax.lax.broadcasted_iota(jnp.int32, a_s.shape, 0)
+    a_rank = jnp.where(a_s > _NEG_INF, slot + ahead(a_s, a_i, b_s, b_i), topk)
+    b_rank = jnp.where(b_s > _NEG_INF, slot + ahead(b_s, b_i, a_s, a_i), topk)
+    out_s, out_b = [], []
+    for k in range(topk):
+        in_a, in_b = a_rank == k, b_rank == k
+        sk = jnp.max(
+            jnp.where(in_a, a_s, jnp.where(in_b, b_s, _NEG_INF)), axis=0, keepdims=True
+        )
+        bk = jnp.max(
+            jnp.where(in_a, a_i, jnp.where(in_b, b_i, -1.0)), axis=0, keepdims=True
+        )
+        out_s.append(sk)
+        out_b.append(jnp.where(sk > _NEG_INF, bk.astype(jnp.int32) * dcp + rank, -1))
+    return jnp.concatenate(out_s, axis=0).T, jnp.concatenate(out_b, axis=0).T
+
+
 class _PackedPick(NamedTuple):
     """The top-k of token rows at their positions, packed (`pack_candidates`):
     the `msa_indexer.RowSelect` of a decode step's local candidates."""
@@ -249,6 +313,8 @@ class _PackedPick(NamedTuple):
         num_visible = pos // self.block_size + 1
         if s.shape[1] > _TRANSPOSED_PICK_WIDTH:
             return pack_candidates(*_pick(s, num_visible, rank, **options))
+        if 2 * s.shape[0] <= _LANES and s.shape[1] % 16 == 0:
+            return pack_candidates(*_pick_t_halves(s, num_visible, rank, **options))
         scores, blocks = _pick_t(s.T, num_visible.T, rank, **options)
         return pack_candidates(scores.T, blocks.T)
 
@@ -258,6 +324,7 @@ class _PackedPick(NamedTuple):
 # picks' ~7,600 at any width, AOT); its widths step by `_PICK_WIDTH_STEP`,
 # one unrolled body each.
 _TRANSPOSED_PICK_WIDTH = 768
+_LANES = 128
 _PICK_WIDTH_STEP = 256
 
 
