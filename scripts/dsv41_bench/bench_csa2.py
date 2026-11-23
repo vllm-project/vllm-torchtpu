@@ -165,7 +165,7 @@ def main():
     parser.add_argument("--batch", type=int, default=48)
     parser.add_argument("--num-tokens", type=int, default=6)
     parser.add_argument("--heads", type=int, default=64)
-    parser.add_argument("--page-size", type=int, choices=(32, 64), default=64)
+    parser.add_argument("--page-size", type=int, choices=(16, 32, 64), default=64)
     parser.add_argument("--bq", type=int, default=6)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
