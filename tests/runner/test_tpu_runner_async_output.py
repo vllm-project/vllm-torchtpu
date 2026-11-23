@@ -336,13 +336,19 @@ def test_get_output_leaves_logprobs_none(num_rows, logprobs):
     assert out.logprobs is None
 
 
-def test_from_device_chunks_copies_logprobs_and_waits_for_them(monkeypatch):
-    calls = []
+@pytest.fixture
+def tpu_events(monkeypatch):
+    """A stand-in for torch.tpu.Event: every event is the mock it returns."""
     event = MagicMock()
-    event.record.side_effect = lambda: calls.append("event.record")
     monkeypatch.setattr(
         torch, "tpu", SimpleNamespace(Event=lambda: event), raising=False
     )
+    return event
+
+
+def test_from_device_chunks_copies_logprobs_and_waits_for_them(monkeypatch, tpu_events):
+    calls = []
+    tpu_events.record.side_effect = lambda: calls.append("event.record")
     to_cpu_nonblocking = LogprobsTensors.to_cpu_nonblocking
     host_copies = []
 
@@ -371,7 +377,7 @@ def test_from_device_chunks_copies_logprobs_and_waits_for_them(monkeypatch):
     assert state._logprobs_tpu is not None
     assert state._logprobs_tpu[0] is device_logprobs
     state.wait()
-    event.synchronize.assert_called_once_with()
+    tpu_events.synchronize.assert_called_once_with()
     assert state._logprobs_tpu is None
     empty = AsyncTPUCopyState.from_device_chunks(tokens, [5])
     assert empty.logprobs is None and empty._logprobs_tpu is None
@@ -428,14 +434,6 @@ def test_deferred_logprobs_from_device_match_a_blocking_cpu_copy(
     assert out.sampled_token_ids == [
         [100 * i + j] for i, n in enumerate(real_rows) for j in range(n)
     ]
-
-
-@pytest.fixture
-def tpu_events(monkeypatch):
-    event = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
-    monkeypatch.setattr(
-        torch, "tpu", SimpleNamespace(Event=lambda: event), raising=False
-    )
 
 
 def _packed(num_rows, num_logprobs, seed=0):
