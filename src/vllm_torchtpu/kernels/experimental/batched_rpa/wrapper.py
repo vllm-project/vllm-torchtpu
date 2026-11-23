@@ -173,6 +173,45 @@ def prepare_outputs(out: jax.Array) -> jax.Array:
     return out.reshape(kv_heads, max_tokens, q_per_kv_packed * q_packing, d)
 
 
+def _finish_output(o_hbm_alias_q_hbm: jax.Array, shape, num_kv_heads: int) -> jax.Array:
+    """The kernel's output buffer as the queries' [T, H, D]."""
+    num_q_heads, head_dim = shape[1], shape[2]
+    # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
+    o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
+    # after: [kv_heads, max_tokens, q_per_kv, d]
+
+    # slice back to original shape if padded
+    num_q_heads_per_kv_head = num_q_heads // num_kv_heads
+    o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
+    return o_hbm.swapaxes(1, 0).reshape(shape)
+
+
+def _finish_lse(lse_hbm: jax.Array, shape, num_kv_heads: int, q_dtype) -> jax.Array:
+    """The kernel's LSE buffer [num_kv_heads, max_tokens, q_per_kv // q_packing,
+    q_packing, num_lanes] as [max_tokens, num_q_heads]."""
+    max_tokens, num_q_heads = shape[0], shape[1]
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    q_packing = utils.get_dtype_packing(q_dtype)
+    num_q_heads_per_kv_head = num_q_heads // num_kv_heads
+    aligned_num_q_heads_per_kv_head = utils.align_to(num_q_heads_per_kv_head, q_packing)
+    # Extract first lane (scalar LSE value per token-head pair).
+    lse = lse_hbm.reshape(
+        num_kv_heads, max_tokens, aligned_num_q_heads_per_kv_head, num_lanes
+    )[:, :max_tokens, :num_q_heads_per_kv_head, 0]
+    return lse.swapaxes(0, 1).reshape(max_tokens, num_q_heads)
+
+
+def finish_carry(
+    carry, shape, num_kv_heads: int, q_dtype
+) -> tuple[jax.Array, jax.Array]:
+    """(output [T, H, D], LSE [T, H]) from the buffers ``ragged_paged_attention``
+    returned with return_carry, for queries of ``shape`` and ``q_dtype``."""
+    return (
+        _finish_output(carry[0], shape, num_kv_heads),
+        _finish_lse(carry[1], shape, num_kv_heads, q_dtype),
+    )
+
+
 def get_kv_cache_shape(
     total_num_pages,
     page_size,
@@ -517,6 +556,9 @@ def calculate_block_sizes(
         "kv_skip_group",
         "read_only_cache",
         "schedule_in_hbm",
+        "selection_word_rows",
+        "return_carry",
+        "page_table_prefix",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -568,6 +610,10 @@ def ragged_paged_attention(
     selection_bits: jax.Array | None = None,
     read_only_cache: bool = False,
     schedule_in_hbm: bool = False,
+    selection_word_rows: bool = False,
+    carry: tuple[jax.Array, jax.Array] | None = None,
+    return_carry: bool = False,
+    page_table_prefix: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -664,6 +710,25 @@ def ragged_paged_attention(
             so XLA keeps them where the attention kernel reads them instead of
             placing them in VMEM and copying each one to HBM. Same schedule.
             Defaults to False.
+        selection_word_rows: With selection_bits, the kernel reads the words
+            as [max_num_seqs * tiles, bkv // 128, 1, 128], which has the flat
+            int32 layout of selection_bits, so XLA passes them without the
+            relayout to [..., bkv // 128, 128]. Same words and results.
+            Defaults to False.
+        carry: With return_lse, the (output, LSE) buffers in the kernel's
+            layout that an earlier call over the same queries returned with
+            return_carry. The kernel reads the queries of this call's
+            sequences from the output buffer (rows no earlier call wrote) and
+            writes its rows into both buffers in place; ``queries`` gives only
+            shapes and dtypes. None (default) builds both from ``queries``.
+        return_carry: Return ``(output, kv_cache, LSE)`` with the output and
+            LSE in the kernel's layout, for a later call's ``carry`` and
+            ``finish_carry``. Defaults to False.
+        page_table_prefix: (q38 RPAD-HIGHROWS F4) Decode-only, read-only
+            cache: the decode kernel takes page_indices in HBM, not as a scalar
+            prefetch, and copies into SMEM only each sequence's KV tiles below
+            its kv_lens (whole tiles) plus the table's first tile. The fetch
+            reads no other entry: same DMAs, same results. Defaults to False.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -755,7 +820,9 @@ def ragged_paged_attention(
         compact_kv_schedule=compact_kv_schedule,
         kv_skip_group=kv_skip_group,
         selection_mask=selection_bits is not None,
+        selection_word_rows=selection_word_rows and selection_bits is not None,
         read_only_cache=read_only_cache,
+        page_table_prefix=page_table_prefix,
     )
     if read_only_cache and not skip_kv_update:
         raise ValueError("read_only_cache needs skip_kv_update")
@@ -776,6 +843,8 @@ def ragged_paged_attention(
         )
     if kv_skip_group and not compact_kv_schedule:
         raise ValueError("kv_skip_group needs compact_kv_schedule")
+    if page_table_prefix and not (decode_only and read_only_cache):
+        raise ValueError("page_table_prefix needs decode_only and read_only_cache")
     if compact_kv_schedule and not (
         kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE and skip_kv_update
     ):
@@ -796,6 +865,8 @@ def ragged_paged_attention(
             f"one packed sublane and a slot within it, got {kv_slot=}"
         )
 
+    if (carry is not None or return_carry) and not return_lse:
+        raise ValueError("carry and return_carry need return_lse")
     q_hbm, new_kv_hbm = prepare_inputs(
         queries,
         keys,
@@ -807,6 +878,8 @@ def ragged_paged_attention(
         kv_layout=kv_layout,
         page_size=page_size,
     )
+    if carry is not None:
+        q_hbm = carry[0]
 
     default_decode, default_prefill = calculate_block_sizes(
         model_cfgs,
@@ -816,7 +889,9 @@ def ragged_paged_attention(
     )
     # Pre-allocate LSE buffer.
     lse_hbm_init: jax.Array | None = None
-    if return_lse:
+    if carry is not None:
+        lse_hbm_init = carry[1]
+    elif return_lse:
         num_lanes = pltpu.get_tpu_info().num_lanes
         q_packing = utils.get_dtype_packing(queries.dtype)
         num_q_heads_per_kv_head = num_q_heads // num_kv_heads
@@ -917,7 +992,9 @@ def ragged_paged_attention(
                     kv_slot=None,
                     kv_skip_group=0,
                     selection_mask=False,
+                    selection_word_rows=False,
                     read_only_cache=False,
+                    page_table_prefix=False,
                 ),
             ),
             computer_cls=computer_cls,
@@ -935,7 +1012,10 @@ def ragged_paged_attention(
                     f"multiple of {num_lanes} and divide {tokens} tokens"
                 )
             selection_hbm = selection_bits.reshape(
-                max_num_seqs * (tokens // bkv), bkv // num_lanes, num_lanes
+                max_num_seqs * (tokens // bkv),
+                bkv // num_lanes,
+                *((1,) if selection_word_rows else ()),
+                num_lanes,
             )
         result = kernel.rpa_kernel(
             cu_q_lens,
@@ -968,26 +1048,12 @@ def ragged_paged_attention(
         o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
             configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
         )
-
-    # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
-    o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
-    # after: [kv_heads, max_tokens, q_per_kv, d]
-
-    # slice back to original shape if padded
-    num_q_heads_per_kv_head = num_q_heads // num_kv_heads
-    o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
-    o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
-
+    if return_carry:
+        return o_hbm_alias_q_hbm, kv_cache, cast(jax.Array, lse_hbm)
+    o_hbm = _finish_output(o_hbm_alias_q_hbm, queries.shape, num_kv_heads)
     if not return_lse:
         return o_hbm, kv_cache
-
-    # Reshape LSE from [num_kv_heads, max_tokens, q_per_kv // q_packing, q_packing
-    # , num_lanes] to [max_tokens, num_q_heads].
-    max_tokens = queries.shape[0]
-    # Extract first lane (scalar LSE value per token-head pair).
-    lse = cast(jax.Array, lse_hbm).reshape(
-        num_kv_heads, max_tokens, aligned_num_q_heads_per_kv_head, num_lanes
-    )[:, :max_tokens, :num_q_heads_per_kv_head, 0]
-    lse = lse.swapaxes(0, 1).reshape(max_tokens, num_q_heads)
-
+    lse = _finish_lse(
+        cast(jax.Array, lse_hbm), queries.shape, num_kv_heads, queries.dtype
+    )
     return o_hbm, kv_cache, lse

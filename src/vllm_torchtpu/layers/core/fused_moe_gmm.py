@@ -25,10 +25,12 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     dense_expert_moe,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    LHS_QUANT_BLOCK,
     calculate_tiling,
     get_packing_factor,
     gmm_mlp_v2,
     gmm_v2,
+    pack_fp8_rows,
 )
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
@@ -260,6 +262,7 @@ def gmm_wrapper(
     experts_per_visit=1,
     pack_out=False,
     bucket=0,
+    lhs_packed_dtype=None,
 ):
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
@@ -287,6 +290,7 @@ def gmm_wrapper(
         **({"rhs_split": rhs_split} if rhs_split > 1 else {}),
         **({"experts_per_visit": experts_per_visit} if experts_per_visit > 1 else {}),
         **({"pack_out": True} if pack_out else {}),
+        **({"lhs_packed_dtype": lhs_packed_dtype} if lhs_packed_dtype is not None else {}),
     )
 
 
@@ -304,6 +308,9 @@ def mlp_wrapper(
     bucket=0,
     experts_per_visit=1,
     pack_out=False,
+    lhs_packed_dtype=None,
+    out_buffer=None,
+    out_row_offset=None,
 ):
     """Both non-EP GMMs as one fused expert-MLP kernel (gmm_v2.gmm_mlp_v2,
     TPU_MOE_NONEP_FUSED_MLP): bit-identical to gmm_wrapper(gmm_wrapper(x, w1,
@@ -321,7 +328,107 @@ def mlp_wrapper(
         rhs_quant_dtype=rhs_quant_dtype,
         pack_out=pack_out,
         experts_per_visit=experts_per_visit,
+        **({"lhs_packed_dtype": lhs_packed_dtype} if lhs_packed_dtype is not None else {}),
+        **({"out_buffer": out_buffer, "out_row_offset": out_row_offset} if out_buffer is not None else {}),
     )
+
+
+# Row alignment of each dispatch chunk's output rows (the activation dtype's
+# sublane block): a chunk never shares a sublane group with the next one.
+_CHUNK_ROW_ALIGN = 16
+
+
+def nonep_chunked_mlp(src, token_indices_sorted, group_sizes, argsort_revert_indices, w1, w1_scale, w2, w2_scale, *,
+                      chunks, copy_mode, mlp_kw):
+    """TPU_MOE_NONEP_DISPATCH_CHUNKS: the dispatch gather and the fused expert
+    MLP in `chunks` expert-range chunks, so the SparseCore gathers chunk k+1's
+    rows while the TensorCore runs chunk k's GMMs.
+
+    Chunk k covers experts [k*E/c, (k+1)*E/c). Its rows (sorted positions
+    [start_k, start_k + n_k)) are gathered into their own buffer from row 0
+    (the index array rolled by -start_k), and its GMM output rows land at
+    R_k = sum_{j<k} align16(n_j) in one output buffer (chunk 0 a plain call,
+    later chunks gmm_mlp_v2 out_buffer/out_row_offset, in place). R_k is a
+    multiple of the sublane block, so no two chunks share a block: a chunk's
+    last partial block writes masked zeros only into its own alignment gap,
+    which no route reads. The combine's revert indices are moved by
+    R_k - start_k, so every route reads the row the unchunked path would, with
+    the same value: same output bits.
+    Returns (gmm2 output, remapped revert indices)."""
+    e = group_sizes.shape[0]
+    a = _CHUNK_ROW_ALIGN
+    bounds = [k * e // chunks for k in range(chunks + 1)]
+    csum = jnp.cumsum(group_sizes, dtype=jnp.int32)
+    zero = jnp.zeros((), jnp.int32)
+    starts = [zero] + [csum[b - 1] for b in bounds[1:-1]]
+    ends = starts[1:] + [csum[-1]]
+    ns = [ends[k] - starts[k] for k in range(chunks)]
+    pads = [(-ns[k]) % a for k in range(chunks - 1)] + [zero]
+    offs, r = [], zero
+    for k in range(chunks):
+        offs.append(r)
+        r = r + ns[k] + pads[k]
+    # spare output rows for the alignment gaps, whatever the kernel's row blocking
+    idx = jnp.pad(token_indices_sorted, (0, a * chunks))
+    experts = jnp.arange(e, dtype=jnp.int32)
+    out = None
+    for k in range(chunks):
+        x_k = ragged_gather_v2(
+            src, jnp.roll(idx, -starts[k]), jnp.array([0], jnp.int32), ns[k][None],
+            trim_rows=False, copy_mode=copy_mode,
+        )
+        in_chunk = (experts >= bounds[k]) & (experts < bounds[k + 1])
+        sizes_k = jnp.where(in_chunk, group_sizes, 0)
+        if out is None:
+            out = mlp_wrapper(x_k, w1, w1_scale, w2, w2_scale, sizes_k, **mlp_kw)
+        else:
+            out = mlp_wrapper(x_k, w1, w1_scale, w2, w2_scale, sizes_k, out_buffer=out, out_row_offset=offs[k],
+                              **mlp_kw)
+    chunk_of = jnp.searchsorted(jnp.stack(starts[1:]), argsort_revert_indices, side="right")
+    delta = jnp.stack([offs[k] - starts[k] for k in range(chunks)])
+    return out, (argsort_revert_indices + delta[chunk_of]).astype(argsort_revert_indices.dtype)
+
+
+def nonep_fp8_dispatch_ok(
+    hidden_states, w1, w1_scale, w1_bias, w2_bias, *, activation, use_ep, use_sparse_core,
+    rhs_quant_dtype, padded_hidden_size,
+) -> bool:
+    """Whether the packed fp8 dispatch (TPU_MOE_NONEP_GATHER=sc_fp8 on the
+    non-EP path, TPU_MOE_EP_GATHER=sc_fp8 on the EP path) can serve this call:
+    the SparseCore path with fp8 E4M3 weights carrying scales (so gmm_v2
+    quantizes its lhs to fp8 per LHS_QUANT_BLOCK columns), bf16 activations
+    whose width needs no padding, and no biases. Otherwise the caller uses
+    sc_padded (the same routed rows, bf16). use_ep is accepted for the
+    caller's convenience; the conditions are the same on both paths."""
+    del use_ep
+    return (
+        use_sparse_core
+        and activation is not None
+        and w1_bias is None
+        and w2_bias is None
+        and w1_scale is not None
+        and hidden_states.dtype == jnp.bfloat16
+        and w1.dtype == jnp.float8_e4m3fn
+        and get_packing_factor(w1.dtype, rhs_quant_dtype) == 1
+        and hidden_states.shape[1] == padded_hidden_size
+        and hidden_states.shape[1] % LHS_QUANT_BLOCK == 0
+        and pltpu.get_tpu_info().fp8_ops_per_second > 0
+    )
+
+
+def log_nonep_fp8_choice(applied: bool) -> None:
+    """Log the TPU_MOE_NONEP_GATHER=sc_fp8 outcome once per process.
+
+    scope="process", not vLLM's default "local": "local" prints only on each
+    host's local rank 0, so on a one-host PP8 prefill only PP0 showed the line
+    and PP1-PP7 could not be checked (Q38 FR9 arm A read). Every worker
+    decides sc_fp8 for its own stage, so every worker reports it."""
+    if applied:
+        logger.info_once("MoE dispatch gathers packed fp8 rows (sc_fp8).", scope="process")
+    else:
+        logger.info_once(
+            "MoE sc_fp8 dispatch not applicable here; sc_padded.", scope="process"
+        )
 
 
 # Rows per block of the rank contraction: the triangular matmul is B x B, so this
@@ -391,6 +498,61 @@ def _single_sort_permutation(
     return sorted_indices, revert, sorted_indices // topk
 
 
+def packed_sorts_fit(num_routes: int, num_keys: int) -> bool:
+    """Whether `_packed_sorts_permutation` can pack this routing into int32:
+    (key, flat position) in 31 bits, and (position, rank) in 32."""
+    flat_bits = max(1, (num_routes - 1).bit_length())
+    key_bits = max(1, (num_keys - 1).bit_length())
+    return key_bits + flat_bits <= 31 and 2 * flat_bits <= 32
+
+
+def _packed_sorts_permutation(
+    sort_keys: jax.Array, topk: int, num_keys: int, sizes_from_keys: bool = True
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
+    """The routing permutation from two single-operand packed sorts and no scatter
+    (TPU_MOE_EP_PACKED_SORTS on EP path D, TPU_MOE_NONEP_PERMUTE=packed).
+
+    Returns (sorted_indices, revert, token_indices_sorted, group_sizes), the same
+    integer arrays as the three-sort path (argsort, argsort of it, packed token
+    sort) and its one-hot group-size reduce:
+    - (key << flat_bits | position) is unique per route, so one unstable sort
+      orders routes exactly as the stable argsort of the keys;
+    - flat position p belongs to token p // topk, and within one key the
+      positions ascend, so the token ids ascend as in the packed token sort;
+    - sorted_indices is a permutation, so sorting (sorted_indices[r] << flat_bits
+      | r) returns, at index p, the rank r with sorted_indices[r] == p: the
+      inverse, without the TensorCore scatter that loses to two sorts above
+      2,048 routes (_SINGLE_SORT_MAX_ROWS). When 2 * flat_bits == 32 the high
+      part is offset by 2^(flat_bits - 1) to stay in signed int32 order;
+    - the group sizes are the bucket bounds of the sorted keys (keys
+      num_keys - 1 = the sentinel of invalid routes sort last); with
+      sizes_from_keys=False they are None and the caller keeps its one-hot reduce
+      (which, unlike the bounds, does not wait for the sort).
+    The caller checks packed_sorts_fit first.
+    """
+    m = sort_keys.shape[0]
+    flat_bits = max(1, (m - 1).bit_length())
+    mask = (1 << flat_bits) - 1
+    pos = jnp.arange(m, dtype=jnp.int32)
+    packed = jax.lax.sort(
+        jnp.left_shift(sort_keys.astype(jnp.int32), flat_bits) | pos, is_stable=False
+    )
+    sorted_indices = jnp.bitwise_and(packed, mask)
+    sorted_keys = jnp.right_shift(packed, flat_bits)
+    high = sorted_indices
+    if 2 * flat_bits == 32:
+        high = high - (1 << (flat_bits - 1))
+    inverse = jax.lax.sort(jnp.left_shift(high, flat_bits) | pos, is_stable=False)
+    revert = jnp.bitwise_and(inverse, mask)
+    group_sizes = None
+    if sizes_from_keys:
+        bounds = jnp.searchsorted(
+            sorted_keys, jnp.arange(num_keys, dtype=jnp.int32), side="left"
+        ).astype(jnp.int32)
+        group_sizes = bounds[1:] - bounds[:-1]
+    return sorted_indices, revert, sorted_indices // topk, group_sizes
+
+
 def prepare_routed_gmm_inputs(
     hidden_states_local: jax.Array,
     topk_indices_local: jax.Array,
@@ -406,8 +568,23 @@ def prepare_routed_gmm_inputs(
     nonep_gather: str = "xla",
     nonep_gather_cols: int = 0,
     nonep_gather_chunk: int = 16384,
+    ep_counting_sort: bool = True,
+    ep_gather: str = "sc",
+    ep_packed_sorts: str = "",
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
+
+    ``ep_packed_sorts`` (``TPU_MOE_EP_PACKED_SORTS``: "on" or "onehot") on EP
+    path D, and ``nonep_permute="packed"`` / ``"packed_onehot"`` on the non-EP
+    path above the single-sort cap, build the permutation with
+    `_packed_sorts_permutation` (two packed sorts) where it fits int32, with the
+    group sizes from the sorted keys or ("onehot") from the served one-hot
+    reduce; the same arrays.
+
+    ``ep_counting_sort=False`` (``TPU_MOE_EP_ARGSORT_PERMUTE``) builds the EP
+    SparseCore path's positions and group sizes with argsort instead of the
+    counting sort, keeping the SparseCore gather: the counting sort's rank
+    matmul returns wrong positions at some route counts on TPU (q38 G2M-2).
 
     ``nonep_permute`` and ``nonep_gather`` select how the non-EP path above the
     single-sort row cap builds its permutation and gathers the routed rows
@@ -444,7 +621,7 @@ def prepare_routed_gmm_inputs(
     )
     argsort_revert_indices, bucket_counts = (
         _counting_sort_positions(sort_keys, local_num_experts + 1)
-        if ragged_permute
+        if ragged_permute and ep_counting_sort
         else (None, None)
     )
     token_bits = max(1, (num_tokens_local - 1).bit_length())
@@ -456,9 +633,29 @@ def prepare_routed_gmm_inputs(
         and token_indices_flat.shape[0] <= _SINGLE_SORT_MAX_ROWS
         and (local_num_experts + 1).bit_length() + flat_bits < 31
     )
+    # TPU_MOE_EP_PACKED_SORTS (EP path D) / TPU_MOE_NONEP_PERMUTE=packed: two
+    # packed sorts and the group sizes from the sorted keys; the same arrays.
+    if ep_packed_sorts not in ("", "on", "onehot"):
+        raise ValueError(f"ep_packed_sorts must be '', 'on' or 'onehot', got {ep_packed_sorts!r}")
+    packed_mode = (
+        ep_packed_sorts
+        if ragged_permute and not ep_counting_sort
+        else {"packed": "on", "packed_onehot": "onehot"}.get(nonep_permute, "")
+        if not use_ep and not ragged_permute and not single_sort
+        else ""
+    )
+    packed_perm = (
+        _packed_sorts_permutation(
+            sort_keys, topk, local_num_experts + 1, sizes_from_keys=packed_mode == "on"
+        )
+        if packed_mode and packed_sorts_fit(token_indices_flat.shape[0], local_num_experts + 1)
+        else None
+    )
     sorted_indices = (
         jnp.argsort(sort_keys)
-        if not single_sort and (argsort_revert_indices is None or not packable)
+        if packed_perm is None
+        and not single_sort
+        and (argsort_revert_indices is None or not packable)
         else None
     )
     token_indices_sorted: jax.Array | None = None
@@ -467,7 +664,13 @@ def prepare_routed_gmm_inputs(
     # forward permutation, then either a second argsort (its inverse) and a
     # packed sort (the token ids), or the token ids by division, or the
     # inverse and the group sizes from the counting sort.
-    if not use_ep and not ragged_permute and not single_sort and nonep_permute != "sorts":
+    if (
+        packed_perm is None
+        and not use_ep
+        and not ragged_permute
+        and not single_sort
+        and nonep_permute != "sorts"
+    ):
         if sorted_indices is None:
             sorted_indices = jnp.argsort(sort_keys)
         # jnp.argsort is stable, so this is the packed sort's token order.
@@ -492,7 +695,18 @@ def prepare_routed_gmm_inputs(
                     f"{local_num_experts + 1} rows"
                 )
 
-    if argsort_revert_indices is not None:
+    if packed_perm is not None:
+        logger.info_once("MoE permutation runs as two packed sorts.")
+        sorted_indices, argsort_revert_indices, token_indices_sorted, group_sizes_local = (
+            packed_perm
+        )
+        if group_sizes_local is None:
+            topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
+            group_sizes_local = jax.nn.one_hot(
+                topk_indices_for_count, local_num_experts, dtype=jnp.int32
+            ) * valid_mask[:, None].astype(jnp.int32)
+            group_sizes_local = group_sizes_local.sum(axis=0)
+    elif argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
     else:
         if single_sort:
@@ -537,12 +751,41 @@ def prepare_routed_gmm_inputs(
             # expert prefix through SparseCore ragged_gather. Invalid
             # non-local rows are sorted after the valid prefix.
             valid_count = group_sizes_local.sum(dtype=jnp.int32)
+            # TPU_MOE_EP_GATHER: "sc" trims the kernel's padded row blocks (a
+            # copy of the whole output); "sc_padded" keeps them, as the non-EP
+            # sc_padded does (the GMMs visit only the valid prefix's groups and
+            # the combine reads rows by index); "sc_fp8" gathers the packed fp8
+            # carrier rows DMA-only (the caller checks nonep_fp8_dispatch_ok and
+            # passes lhs_packed_dtype to the GMM). Same rows read either way.
+            src, gkw = hidden_states_local, {}
+            if ep_gather == "sc_padded":
+                gkw = dict(trim_rows=False)
+            elif ep_gather == "sc_fp8":
+                src, gkw = pack_fp8_rows(hidden_states_local), dict(trim_rows=False, copy_mode="dma")
             x = ragged_gather_v2(
-                hidden_states_local,
+                src,
                 token_indices_sorted,
                 jnp.array([0], dtype=jnp.int32),
                 valid_count[None],
+                **gkw,
             )
+    elif not use_ep and nonep_gather == "sc_fp8":
+        # The routed rows already quantized: each token row is quantized once
+        # (pack_fp8_rows, gmm_v2's own lhs quantizer) into a packed f32
+        # carrier of 768 words (fp8 bytes + block scales), and the SparseCore
+        # gathers those rows DMA-only, 3,072 bytes per routed row instead of
+        # 5,120. The GMM reads them with lhs_packed_dtype and multiplies the
+        # same values and scales it would compute from the bf16 rows. Padded
+        # row blocks are kept as in sc_padded. The caller checks
+        # nonep_fp8_dispatch_ok first.
+        x = ragged_gather_v2(
+            pack_fp8_rows(hidden_states_local),
+            token_indices_sorted,
+            jnp.array([0], dtype=jnp.int32),
+            jnp.array([token_indices_sorted.shape[0]], dtype=jnp.int32),
+            trim_rows=False,
+            copy_mode="dma",
+        )
     elif not use_ep and nonep_gather in ("sc", "sc_padded"):
         # "sc_padded" keeps the kernel's whole row blocks (64,000 routed rows
         # come back as 65,536): the GMMs visit only rows inside expert groups
@@ -567,6 +810,9 @@ def prepare_routed_gmm_inputs(
                 hidden_states_local.dtype.itemsize,
             ),
         )
+    elif not use_ep and nonep_gather == "none":
+        # chunked dispatch (TPU_MOE_NONEP_DISPATCH_CHUNKS): moe_gmm gathers per chunk
+        x = None
     elif not use_ep and nonep_gather == "xla_chunked":
         x = chunked_gather(hidden_states_local, token_indices_sorted, nonep_gather_chunk)
     else:
@@ -669,6 +915,28 @@ def _local_ragged_combine_eligible(
     return num_tokens >= alignment and padded_tokens * 2 <= num_tokens * 3
 
 
+def ep_all_valid_routes(rows, revert, weights, valid):
+    """The EP combine's routes made all valid (TPU_MOE_EP_COMBINE=dense).
+
+    Non-local routes (and skipped padded tokens) read row z = rows.shape[0] - 1
+    with weight 0, and z is set to zeros when any route is invalid; then every
+    destination block is all-valid, so the SparseCore combine takes its dense
+    run-table path (and, with packed rows, half the gather bytes), as on the
+    non-EP path. z is never a computed row while a route is invalid: the GMMs
+    write only the valid-route prefix, which is then shorter than the route
+    count <= rows.shape[0]. Same output bits as the valid-mask combine: each
+    destination's f32 accumulator starts at +0.0 and adds its routes in route
+    order; an accumulator that starts at +0.0 is never -0.0 under round-to-
+    nearest, so the extra terms (0 * +0.0 = +0.0) leave every value and sign
+    unchanged, and a zero row cannot carry a stale NaN into them (0 * NaN)."""
+    z = rows.shape[0] - 1
+    any_invalid = jnp.logical_not(jnp.all(valid))
+    rows = rows.at[z].set(jnp.where(any_invalid, jnp.zeros_like(rows[z]), rows[z]))
+    revert = jnp.where(valid, revert, z).astype(revert.dtype)
+    weights = jnp.where(valid, weights, jnp.zeros_like(weights))
+    return rows, revert, weights, jnp.ones_like(valid)
+
+
 def moe_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -699,8 +967,35 @@ def moe_gmm(
     nonep_gmm_bucket: int = 0,
     nonep_gmm2_experts_per_visit: int = 0,
     nonep_fused_mlp: bool = False,
+    nonep_lhs_packed_dtype: jnp.dtype | None = None,
+    ep_gmm_stack: bool = False,
+    ep_combine: str = "served",
+    nonep_chunks: int = 1,
+    chunk_src: jax.Array | None = None,
+    chunk_copy_mode: str = "vector",
+    combine_presorted: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
+
+    ``nonep_chunks`` > 1 (``TPU_MOE_NONEP_DISPATCH_CHUNKS``): ``x`` is None and
+    the routed rows are gathered from ``chunk_src`` per expert-range chunk
+    (nonep_chunked_mlp), overlapping each chunk's gather with the previous
+    chunk's fused GMMs. Needs the fused expert MLP; same output bits.
+    ``combine_presorted`` (``TPU_MOE_COMBINE_PRESORTED``): the SparseCore
+    combine skips its per-block partition sort where the valid routes already
+    form a prefix: statically under ``ep_combine="dense"`` (all routes valid),
+    by a runtime check on the non-EP path. Same output bits.
+
+    ``ep_gmm_stack`` (``TPU_MOE_EP_GMM_STACK``): the non-EP GMM knobs (experts
+    per visit, gmm2's experts per visit, row bucket, fused expert MLP) apply on
+    the EP path too. EP keeps group offset 0 and every local group, which is
+    what they need; the combine stays the EP combine. Same output bits.
+    ``ep_combine="dense"`` (``TPU_MOE_EP_COMBINE``): the EP combine runs the
+    non-EP SparseCore combine (packed with TPU_MOE_NONEP_COMBINE_PACKED) on
+    all-valid routes (ep_all_valid_routes). Same output bits.
+
+    ``nonep_lhs_packed_dtype`` set: ``x`` is the packed fp8 carrier of routed
+    rows of that dtype (``TPU_MOE_NONEP_GATHER=sc_fp8``); gmm1 reads it as is.
 
     ``nonep_combine_split`` > 1 (``TPU_MOE_NONEP_COMBINE_SPLIT``) runs the
     second GMM and the SparseCore combine per block of output columns, so each
@@ -712,26 +1007,37 @@ def moe_gmm(
     EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
+    if nonep_chunks > 1 and x is None:
+        # shape only (the chunks gather their own rows): the dtype and a row count for the combine checks below
+        x = jax.ShapeDtypeStruct(
+            (token_indices_sorted.shape[0] + _CHUNK_ROW_ALIGN * nonep_chunks, chunk_src.shape[1]), chunk_src.dtype)
+    # The routed rows' activation dtype (x may be their packed fp8 carrier).
+    act_dtype = x.dtype if nonep_lhs_packed_dtype is None else jnp.dtype(nonep_lhs_packed_dtype)
+    # passed only when set, so the bf16 path's GMM calls are unchanged
+    lpkw = {} if nonep_lhs_packed_dtype is None else {"lhs_packed_dtype": nonep_lhs_packed_dtype}
     # m-tile override of the non-EP GMMs (TPU_MOE_NONEP_GMM_TILE_M); 0 = default.
     tile_m = 0 if use_ep else nonep_gmm_tile_m
     hoist = nonep_gmm_hoist_quant and not use_ep
     # gmm2's weight tile as this many concurrent column-part DMAs (non-EP).
     rhs_split = 1 if use_ep else nonep_gmm2_rhs_split
-    # Consecutive experts per gmm_v2 pipeline step in both GMMs (non-EP: all
-    # groups local, no group offset).
-    epv = 1 if use_ep else nonep_gmm_experts_per_visit
+    # The GMM stack knobs below apply on the non-EP path, and on the EP path
+    # with ep_gmm_stack (TPU_MOE_EP_GMM_STACK).
+    stack = not use_ep or ep_gmm_stack
+    # Consecutive experts per gmm_v2 pipeline step in both GMMs (all groups
+    # local, no group offset).
+    epv = nonep_gmm_experts_per_visit if stack else 1
     # gmm2's own experts per step (TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT); 0 =
     # gmm1's. gmm2's per-expert weight block is half gmm1's, so it streams
     # slower; more experts per step give it larger blocks.
-    epv2 = epv if use_ep or not nonep_gmm2_experts_per_visit else nonep_gmm2_experts_per_visit
-    # Finer row buckets for both non-EP GMMs (TPU_MOE_NONEP_GMM_BUCKET); 0 = default.
-    bucket = 0 if use_ep else nonep_gmm_bucket
+    epv2 = epv if not stack or not nonep_gmm2_experts_per_visit else nonep_gmm2_experts_per_visit
+    # Finer row buckets for both GMMs (TPU_MOE_NONEP_GMM_BUCKET); 0 = default.
+    bucket = nonep_gmm_bucket if stack else 0
 
     # TPU_MOE_NONEP_FUSED_MLP: both GMMs in one kernel (one weight step of w1 +
     # w2 per expert visit), bit-identical to the two calls below.
     fused_mlp = (
         nonep_fused_mlp
-        and not use_ep
+        and stack
         and activation is not None
         and w1_bias is None
         and w2_bias is None
@@ -743,9 +1049,15 @@ def moe_gmm(
         and get_packing_factor(w2.dtype, rhs_quant_dtype) == 1
         and jax.dtypes.itemsize_bits(w1.dtype) == 8
     )
+    if nonep_chunks > 1 and not fused_mlp:
+        # chunked dispatch needs the fused expert MLP: gather every routed row now
+        x = ragged_gather_v2(chunk_src, token_indices_sorted, jnp.array([0], jnp.int32),
+                             jnp.array([token_indices_sorted.shape[0]], jnp.int32), trim_rows=False,
+                             copy_mode=chunk_copy_mode)
+        nonep_chunks = 1
     if fused_mlp:
         # shapes only; gmm2 below runs both GMMs from x
-        gmm1_res = jax.ShapeDtypeStruct((x.shape[0], w2.shape[1]), x.dtype)
+        gmm1_res = jax.ShapeDtypeStruct((x.shape[0], w2.shape[1]), act_dtype)
     else:
         gmm1_res = gmm_wrapper(
             x,
@@ -761,6 +1073,7 @@ def moe_gmm(
             hoist_lhs_quant=hoist,
             experts_per_visit=epv,
             bucket=bucket,
+            **lpkw,
         )
         packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
         gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
@@ -768,9 +1081,21 @@ def moe_gmm(
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
+    # TPU_MOE_EP_COMBINE=dense: the EP combine on all-valid routes, through the
+    # non-EP combine selection below (above the one-hot cutoff only).
+    ep_dense = (
+        use_ep
+        and ep_combine == "dense"
+        and use_sparse_core
+        and argsort_revert_indices.size > onehot_moe_permute_threshold
+    )
+    # TPU_MOE_COMBINE_PRESORTED: a runtime prefix check selects the identity or
+    # the partition sort; after ep_all_valid_routes (below) every route is
+    # valid, so the identity holds by construction ("static").
+    pkw = {"presorted": "check"} if combine_presorted else {}
     combine_kw = dict(
         use_sparse_core=use_sparse_core,
-        use_ep=use_ep,
+        use_ep=use_ep and not ep_dense,
         topk=topk,
         num_routes=argsort_revert_indices.size,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
@@ -784,7 +1109,7 @@ def moe_gmm(
         and w2_bias is None
         and get_packing_factor(w2.dtype, rhs_quant_dtype) == 1
         and _local_ragged_combine_eligible(
-            gmm1_res.shape[0], split_width, x.dtype, **combine_kw
+            gmm1_res.shape[0], split_width, act_dtype, **combine_kw
         )
     ):
         blocks = []
@@ -797,7 +1122,7 @@ def moe_gmm(
                 group_sizes,
                 group_offset,
                 zero_initialize=False,
-                preferred_element_type=x.dtype,
+                preferred_element_type=act_dtype,
                 rhs_quant_dtype=rhs_quant_dtype,
                 n_window=(start, split_width),
                 tile_m=tile_m,
@@ -813,7 +1138,8 @@ def moe_gmm(
                     topk_weights_flat,
                     valid_mask_flat,
                     reduce_group_size=topk,
-                ).astype(x.dtype)
+                    **pkw,
+                ).astype(act_dtype)
             )
         return jnp.concatenate(blocks, axis=1)
 
@@ -823,18 +1149,34 @@ def moe_gmm(
     # gather bytes, the same values and sums.
     packed = (
         nonep_combine_packed
-        and not use_ep
+        and (not use_ep or ep_dense)
         and w2_bias is None
         and rhs_split == 1
-        and x.dtype == jnp.bfloat16
+        and act_dtype == jnp.bfloat16
         and get_packing_factor(w2.dtype, rhs_quant_dtype) == 1
         and (size_n // 2) % 128 == 0
         and _local_ragged_combine_eligible(
-            gmm1_res.shape[0], size_n, x.dtype, packed=True, **combine_kw
+            gmm1_res.shape[0], size_n, act_dtype, packed=True, **combine_kw
         )
     )
     gmm2_res = None
-    if fused_mlp:
+    if fused_mlp and nonep_chunks > 1:
+        try:
+            gmm2_res, argsort_revert_indices = nonep_chunked_mlp(
+                chunk_src, token_indices_sorted, group_sizes, argsort_revert_indices,
+                w1, w1_scale, w2, w2_scale, chunks=nonep_chunks, copy_mode=chunk_copy_mode,
+                mlp_kw=dict(fuse_act=activation, rhs_quant_dtype=rhs_quant_dtype, tile_m=tile_m, bucket=bucket,
+                            experts_per_visit=epv, pack_out=packed, **lpkw))
+            logger.info_once("MoE dispatch runs in %d expert-range chunks.", nonep_chunks)
+        except ValueError as e:
+            logger.info_once("Chunked dispatch not applicable here (%s); one chunk.", e)
+            gmm2_res = None
+    if gmm2_res is None and nonep_chunks > 1:
+        # unchunked fallback: gather every routed row now (the chunked path's source)
+        x = ragged_gather_v2(chunk_src, token_indices_sorted, jnp.array([0], jnp.int32),
+                             jnp.array([token_indices_sorted.shape[0]], jnp.int32), trim_rows=False,
+                             copy_mode=chunk_copy_mode)
+    if fused_mlp and gmm2_res is None:
         try:
             gmm2_res = mlp_wrapper(
                 x, w1, w1_scale, w2, w2_scale, group_sizes,
@@ -844,6 +1186,7 @@ def moe_gmm(
                 bucket=bucket,
                 experts_per_visit=epv,
                 pack_out=packed,
+                **lpkw,
             )
             logger.info_once("MoE expert GMMs run as one fused expert-MLP kernel.")
         except ValueError as e:
@@ -853,6 +1196,7 @@ def moe_gmm(
                 x, w1, w1_scale, w1_bias, group_sizes, group_offset,
                 zero_initialize=False, fuse_act=activation, rhs_quant_dtype=rhs_quant_dtype,
                 tile_m=tile_m, hoist_lhs_quant=hoist, experts_per_visit=epv, bucket=bucket,
+                **lpkw,
             )[:, : w2.shape[1] * get_packing_factor(w2.dtype, rhs_quant_dtype)]
     if gmm2_res is None:
         gmm2_res = gmm_wrapper(
@@ -863,7 +1207,7 @@ def moe_gmm(
             group_sizes,
             group_offset,
             zero_initialize=False,
-            preferred_element_type=x.dtype,
+            preferred_element_type=act_dtype,
             rhs_quant_dtype=rhs_quant_dtype,
             tile_m=tile_m,
             hoist_lhs_quant=hoist,
@@ -872,6 +1216,15 @@ def moe_gmm(
             pack_out=packed,
             bucket=bucket,
         )
+    if ep_dense and _local_ragged_combine_eligible(
+        gmm2_res.shape[0], size_n, act_dtype, packed=packed, **combine_kw
+    ):
+        gmm2_res, argsort_revert_indices, topk_weights_flat, valid_mask_flat = (
+            ep_all_valid_routes(gmm2_res, argsort_revert_indices, topk_weights_flat, valid_mask_flat)
+        )
+        if combine_presorted:
+            pkw = {"presorted": "static"}
+        logger.info_once("EP MoE combine runs on all-valid routes (dense%s).", ", packed" if packed else "")
     if packed:
         return ragged_gather_reduce_v3(
             gmm2_res,
@@ -880,7 +1233,8 @@ def moe_gmm(
             valid_mask_flat,
             reduce_group_size=topk,
             x_packed=True,
-        ).astype(x.dtype)
+            **pkw,
+        ).astype(act_dtype)
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
     if _local_ragged_combine_eligible(
@@ -892,7 +1246,8 @@ def moe_gmm(
             topk_weights_flat,
             valid_mask_flat,
             reduce_group_size=topk,
-        ).astype(x.dtype)
+            **pkw,
+        ).astype(act_dtype)
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
@@ -928,7 +1283,7 @@ def moe_gmm(
                     topk_weights_sorted,
                     valid_count,
                     num_tokens=num_tokens,
-                ).astype(x.dtype)
+                ).astype(act_dtype)
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
@@ -943,21 +1298,21 @@ def moe_gmm(
             combine = (onehot * topk_weights[..., None] * valid_mask[..., None]).sum(
                 axis=1
             )
-            return (combine @ gmm2_res).astype(x.dtype)
+            return (combine @ gmm2_res).astype(act_dtype)
         return ragged_gather_reduce(
             gmm2_res,
             argsort_revert_indices,
             topk_weights_flat,
             valid_mask_flat,
             reduce_group_size=topk,
-        ).astype(x.dtype)
+        ).astype(act_dtype)
 
     token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape((num_tokens, topk, gmm2_res.shape[-1]))
     token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights, axis=-1)
     token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
     # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
-    return token_topk_hidden.sum(axis=1).astype(x.dtype)
+    return token_topk_hidden.sum(axis=1).astype(act_dtype)
 
 
 @functools.partial(
@@ -983,6 +1338,13 @@ def moe_gmm(
         "nonep_gmm_bucket",
         "nonep_gmm2_experts_per_visit",
         "nonep_fused_mlp",
+        "ep_counting_sort",
+        "ep_gather",
+        "ep_gmm_stack",
+        "ep_combine",
+        "nonep_dispatch_chunks",
+        "ep_packed_sorts",
+        "combine_presorted",
     ),
 )
 def fused_moe_func(
@@ -1016,6 +1378,13 @@ def fused_moe_func(
     nonep_gmm_bucket: int = 0,
     nonep_gmm2_experts_per_visit: int = 0,
     nonep_fused_mlp: bool = False,
+    ep_counting_sort: bool = True,
+    ep_gather: str = "sc",
+    ep_gmm_stack: bool = False,
+    ep_combine: str = "served",
+    nonep_dispatch_chunks: int = 1,
+    ep_packed_sorts: str = "",
+    combine_presorted: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -1094,6 +1463,46 @@ def fused_moe_func(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
 
+    # TPU_MOE_NONEP_GATHER=sc_fp8 where it applies; elsewhere sc_padded, which
+    # gathers the same routed rows in bf16.
+    lhs_packed_dtype = None
+    # On the EP path the SparseCore gather runs only above the one-hot permute
+    # threshold (below it the routed rows come from a matmul, in bf16).
+    ep_fp8 = (
+        use_ep and ep_gather == "sc_fp8" and num_tokens * topk > onehot_moe_permute_threshold
+    )
+    if use_ep and ep_gather == "sc_fp8" and not ep_fp8:
+        ep_gather = "sc_padded"
+    if (nonep_gather == "sc_fp8" and not use_ep) or ep_fp8:
+        if nonep_fp8_dispatch_ok(
+            hidden_states, w1, w1_scale, w1_bias, w2_bias, activation=activation,
+            use_ep=use_ep, use_sparse_core=use_sparse_core,
+            rhs_quant_dtype=rhs_quant_dtype, padded_hidden_size=padded_hidden_size,
+        ):
+            lhs_packed_dtype = hidden_states.dtype
+            log_nonep_fp8_choice(True)
+        else:
+            nonep_gather = "sc_padded" if nonep_gather == "sc_fp8" else nonep_gather
+            ep_gather = "sc_padded" if ep_gather == "sc_fp8" else ep_gather
+            log_nonep_fp8_choice(False)
+
+    # TPU_MOE_NONEP_DISPATCH_CHUNKS: the non-EP SparseCore gather (sc_padded or
+    # sc_fp8) and the fused expert MLP per expert-range chunk (moe_gmm).
+    chunks = (
+        nonep_dispatch_chunks
+        if nonep_dispatch_chunks in (2, 4)
+        and not use_ep
+        and use_sparse_core
+        and nonep_gather in ("sc_padded", "sc_fp8")
+        and w1.shape[0] % (2 * nonep_dispatch_chunks) == 0
+        and hidden_states.shape[1] == padded_hidden_size
+        else 1
+    )
+    chunk_src = chunk_copy_mode = None
+    if chunks > 1:
+        chunk_src = pack_fp8_rows(hidden_states) if lhs_packed_dtype is not None else hidden_states
+        chunk_copy_mode = "dma" if lhs_packed_dtype is not None else "vector"
+
     (
         x,
         group_sizes,
@@ -1112,11 +1521,15 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
         nonep_permute=nonep_permute,
-        nonep_gather=nonep_gather,
+        nonep_gather="none" if chunks > 1 else nonep_gather,
         nonep_gather_cols=nonep_gather_cols,
         nonep_gather_chunk=nonep_gather_chunk,
+        ep_counting_sort=ep_counting_sort,
+        ep_gather=ep_gather,
+        ep_packed_sorts=ep_packed_sorts,
     )
-    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    if lhs_packed_dtype is None and x is not None:
+        x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,
         w1,
@@ -1146,5 +1559,10 @@ def fused_moe_func(
         nonep_gmm_bucket=nonep_gmm_bucket,
         nonep_gmm2_experts_per_visit=nonep_gmm2_experts_per_visit,
         nonep_fused_mlp=nonep_fused_mlp,
+        nonep_lhs_packed_dtype=lhs_packed_dtype,
+        ep_gmm_stack=ep_gmm_stack,
+        ep_combine=ep_combine,
+        **({"nonep_chunks": chunks, "chunk_src": chunk_src, "chunk_copy_mode": chunk_copy_mode} if chunks > 1 else {}),
+        combine_presorted=combine_presorted,
     )
     return x[:num_tokens, :hidden_size]

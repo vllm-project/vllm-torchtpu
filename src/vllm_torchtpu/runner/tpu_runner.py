@@ -152,10 +152,13 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
 )
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner import host_phases
+from vllm_torchtpu.runner import pam_incr
 from vllm_torchtpu.runner import l6_seedspec as _l6_seedspec
 from vllm_torchtpu.runner import pp_last_async_output
+from vllm_torchtpu.runner import pp_last_async_drafter as _pparf  # q38 PPARF (VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER, default off)
 from vllm_torchtpu.runner import host_admit_probe
 from vllm_torchtpu.runner import step_buckets
+from vllm_torchtpu.core import host_knobs as _host_knobs  # q38 SV-KNOB GIL-SW (default off)
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
     StaticPoolerSpec,
@@ -686,6 +689,34 @@ _KV_CONNECTOR_OUTPUT_SUPPORTS_FAILED_RECVING = (
 )
 
 
+def kv_early_poll_refusals(transfer_config: Any, connector: Any) -> list[str]:
+    """Why QWEN4_EXP_PD_EARLY_POLL cannot run with this KV connector (empty:
+    it can). The early poll gives up the drafter-first order a save needs: a
+    KV producer publishes and fences the drafter's KV writes, and an
+    offloading connector records its save fence in get_finished. A Raiden PD
+    consumer has neither (its wait_for_save is TPUConnector's no-op)."""
+    from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+        TPUConnector,
+        TPURaidenConnector,
+    )
+
+    why = []
+    if (
+        transfer_config is None
+        or not transfer_config.is_kv_consumer
+        or transfer_config.is_kv_producer
+    ):
+        why.append("only on a KV consumer that is not also a producer")
+    if not isinstance(connector, TPURaidenConnector):
+        why.append(
+            "only with a Raiden PD consumer connector, not "
+            + type(connector).__name__
+        )
+    elif type(connector).wait_for_save is not TPUConnector.wait_for_save:
+        why.append(type(connector).__name__ + " has a save path (wait_for_save)")
+    return why
+
+
 def _build_kv_connector_output(
     *,
     finished_sending: set[str] | None,
@@ -896,11 +927,27 @@ class TPUModelRunner(GPUModelRunner):
         host (the consumer pulls as soon as the first token is out)."""
         if not self._is_async_drafter:
             return False
+        if _pparf.enabled():
+            # q38 PPARF: the connector registers ahead for every pipeline
+            # producer, whatever TPU_RAIDEN_STAGE3_REGISTER_AHEAD says.
+            return self._copygate_registers_ahead
         transfer_config = self.vllm_config.kv_transfer_config
         return (
             transfer_config is not None
             and bool(transfer_config.is_kv_producer)
             and dist_utils.get_stage3_register_ahead_enabled()
+        )
+
+    @property
+    def _copygate_registers_ahead(self) -> bool:
+        """q38 PPARF (VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER): this producer's
+        Stage-3 send can be pulled before its finish
+        (pp_last_async_drafter.registers_ahead)."""
+        transfer_config = self.vllm_config.kv_transfer_config
+        return transfer_config is not None and _pparf.registers_ahead(
+            is_kv_producer=bool(transfer_config.is_kv_producer),
+            pipeline_parallel_size=int(self.parallel_config.pipeline_parallel_size),
+            register_ahead_flag=dist_utils.get_stage3_register_ahead_enabled(),
         )
 
     def __init__(
@@ -968,10 +1015,21 @@ class TPUModelRunner(GPUModelRunner):
             self.model_config is not None and self.model_config.runner_type == "pooling"
         )
         self._pp_last_async_output, reason = pp_last_async_output.decide(
-            vllm_config, self._pp_is_last, self.is_pooling_model
+            vllm_config,
+            self._pp_is_last,
+            self.is_pooling_model,
+            prefill_only_drafter=self._mtp_prefill_only,
         )
         if envs.VLLM_TPU_PP_LAST_ASYNC_OUTPUT and self._pp_is_last:
             logger.info("PP last stage async output: %s", reason)
+        if _pparf.enabled():
+            # q38 PPARF: the one-time engagement line (flag off: nothing).
+            _pparf.note_decision(
+                self._pp_last_async_output,
+                reason,
+                is_last_stage=self._pp_is_last,
+                prefill_only_drafter=self._mtp_prefill_only,
+            )
         # Resolved in load_model; None keeps the eager pooler path.
         self._static_pooler_spec: StaticPoolerSpec | None = None
         self._static_pooler_reason = "not resolved"
@@ -1229,6 +1287,9 @@ class TPUModelRunner(GPUModelRunner):
         )
         self.seq_lens_np = self.seq_lens_cpu.numpy()
         self._block_table_stage_cpu: torch.Tensor | None = None
+        # q38 SV-PAM PAM-INCR (runner/pam_incr.py): a no-op unless VLLM_TPU_PAM_INCR
+        # is set (nothing is patched).
+        pam_incr.patch_pam_incr()
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(
                 self.max_num_tokens,
@@ -1497,6 +1558,12 @@ class TPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().wait_for_save()
 
     def get_finished_kv_transfers(self, scheduler_output):
+        early = self.__dict__.pop("_kv_early_poll_result", None)
+        if early is not None:
+            # QWEN4_EXP_PD_EARLY_POLL: this step's poll already ran, before the
+            # previous-results wait (_early_poll_kv_connector); hand its result
+            # to the stock call site after the drafter.
+            return early
         if not has_kv_transfer_group():
             self._stage_timing.take_samples()
             return None, None, None, set(), None, None
@@ -1551,6 +1618,45 @@ class TPUModelRunner(GPUModelRunner):
             invalid_block_group_index,
             kv_connector_stats,
         )
+
+    def _kv_early_poll(self) -> bool:
+        """QWEN4_EXP_PD_EARLY_POLL engaged on this runner (decided once, at the
+        first step that asks with a KV connector present; the same on every
+        rank: the key and the KV transfer config are)."""
+        on = self.__dict__.get("_kv_early_poll_on")
+        if on is None:
+            if not has_kv_transfer_group():
+                # vLLM's memory-profiling dummy run reaches sample_tokens before
+                # initialize_from_config creates the KV connector: decide at the
+                # first step that has one (served q38_ds2x74 A1 cached this
+                # 'no connector' state and never engaged).
+                return False
+            on = self._decide_kv_early_poll()
+            self._kv_early_poll_on = on
+        return on
+
+    def _decide_kv_early_poll(self) -> bool:
+        if not envs.QWEN4_EXP_PD_EARLY_POLL:
+            return False
+        why = kv_early_poll_refusals(
+            self.vllm_config.kv_transfer_config, get_kv_transfer_group()
+        )
+        if why:
+            raise ValueError("QWEN4_EXP_PD_EARLY_POLL is refused: " + "; ".join(why))
+        logger.info(
+            "q38 EARLY_POLL engaged=1 connector=%s (KV poll before the previous-results wait)",
+            type(get_kv_transfer_group()).__name__,
+        )
+        return True
+
+    def _early_poll_kv_connector(self, scheduler_output) -> None:
+        """QWEN4_EXP_PD_EARLY_POLL: sample_tokens' save and poll, run right
+        after the step's deferred submit and before the previous-results wait.
+        The stock call site after the drafter receives this result from
+        get_finished_kv_transfers and builds the step's output from it as
+        before."""
+        self.maybe_wait_for_kv_save()
+        self._kv_early_poll_result = self.get_finished_kv_transfers(scheduler_output)
 
     def kv_connector_no_forward(
         self, scheduler_output, vllm_config
@@ -2723,6 +2829,15 @@ class TPUModelRunner(GPUModelRunner):
                     np.arange(len(input_ids), dtype=np.int32),
                 )
             ):
+                if (
+                    envs.VLLM_TPU_GLUE_FOLD
+                    and self.__dict__.get("_glue_pre_md") is not None
+                    and self._pre_async_results.next_tokens_tpu.numel() >= len(input_ids)
+                ):
+                    # q38 DEC-STEP-3 GLUE_FOLD: fast path 1 + the extraction.
+                    return _glue_pre(
+                        self, input_ids, None, None, self.__dict__.pop("_glue_pre_md")
+                    )
                 next_tpu = self._pre_async_results.next_tokens_tpu.flatten().to(
                     input_ids.dtype
                 )
@@ -2793,6 +2908,14 @@ class TPUModelRunner(GPUModelRunner):
                 padded_token_in_tpu_pre_next_tokens_indices
             ).to(self.device, non_blocking=True)
 
+        glue_md = (
+            self.__dict__.pop("_glue_pre_md", None) if envs.VLLM_TPU_GLUE_FOLD else None
+        )
+        if glue_md is not None:
+            # q38 DEC-STEP-3 GLUE_FOLD: substitution + the extraction.
+            return _glue_pre(
+                self, input_ids, cur_input_indices, pre_next_tokens_indices, glue_md
+            )
         return _substitute_placeholder_token(
             input_ids,
             cur_input_indices,
@@ -3186,6 +3309,11 @@ class TPUModelRunner(GPUModelRunner):
             compute_num_rejected,
         )
 
+        if envs.VLLM_TPU_GLUE_FOLD:
+            # q38 DEC-STEP-3 GLUE_FOLD: the step _glue_post_verify folded.
+            folded = _glue_assemble(self, drafts, next_tokens_per_chunk, state)
+            if folded is not None:
+                return folded
         assert drafts is not None, (
             "async spec substitution requires the eagle3 drafts proposed "
             "earlier in sample_tokens"
@@ -3560,6 +3688,9 @@ class TPUModelRunner(GPUModelRunner):
                     seq_idx_np[i] = pos
                     pos_idx_np[acc : acc + n_sched] = pos
                 acc += n_sched
+            if envs.VLLM_TPU_GLUE_FOLD:
+                # q38 DEC-STEP-3 GLUE_FOLD: the same function as one program.
+                subtract_num_rejected_tokens = functools.partial(_glue_subtract, self)
             seq_lens, self.position_ids = subtract_num_rejected_tokens(
                 seq_lens,
                 self.position_ids,
@@ -4175,6 +4306,8 @@ class TPUModelRunner(GPUModelRunner):
                 "after execute_model() returns None."
             )
         host_phases.begin_step()
+        if _host_knobs.ENABLED:
+            _host_knobs.on_step("worker")
         if host_admit_probe.ENABLED:
             host_admit_probe.runner_step(self, scheduler_output)
         if self._mtp_prefill_only:
@@ -4182,6 +4315,8 @@ class TPUModelRunner(GPUModelRunner):
             # Wang's tree): drop the all -1 draft-placeholder rows vLLM pads onto a final prompt token, before the states
             # absorb them and before the prefill-only refusal below would raise on them (F2 prefill under load).
             self._strip_prefill_only_padding(scheduler_output)
+        if _pparf.enabled():
+            _pparf.take_roots(self)  # q38 PPARF: the copy gate's roots are per step
         # Update cached state
         self._update_states(scheduler_output)
         host_phases.mark("update_states")
@@ -4364,9 +4499,22 @@ class TPUModelRunner(GPUModelRunner):
             # offset; clear it before this chunk's forward gathers it.
             self._reset_read_offsets_for_new_requests(start_index, num_reqs)
 
+            if envs.VLLM_TPU_GLUE_FOLD:
+                # q38 DEC-STEP-3 GLUE_FOLD: the substitution folds with the
+                # draft extraction below (into spec_decode_metadata).
+                self._glue_pre_md = (
+                    spec_decode_metadata
+                    if self.scheduler_config.async_scheduling
+                    and self._is_async_drafter
+                    and spec_decode_metadata is not None
+                    and target_num_chunks == 1
+                    else None
+                )
             input_ids = self._apply_async_token_substitution(
                 self.input_ids, cur_input_indices, pre_next_tokens_indices
             )
+            if envs.VLLM_TPU_GLUE_FOLD:
+                self.__dict__.pop("_glue_pre_md", None)
             host_phases.mark("seed_reset_subst")
             # Async spec: the drafts the target verifies live in the substituted
             # input_ids (host input_ids_cpu holds placeholders), so re-source the
@@ -4375,6 +4523,9 @@ class TPUModelRunner(GPUModelRunner):
                 self.scheduler_config.async_scheduling
                 and spec_decode_metadata is not None
                 and len(cur_input_indices) > 0
+                and not (
+                    envs.VLLM_TPU_GLUE_FOLD and self.__dict__.pop("_glue_pre_done", False)
+                )
             ):
                 from vllm_torchtpu.runner.tpu_runner_async_output import (
                     extract_draft_token_ids,
@@ -5614,6 +5765,12 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
+                    if envs.VLLM_TPU_GLUE_FOLD and _glue_post_verify(
+                        self, mamba_indices, next_tokens, num_reqs, md, state
+                    ):
+                        # q38 DEC-STEP-3 GLUE_FOLD: the fold scattered the read
+                        # offsets; the stock call below returns at once.
+                        mamba_indices = None
                     self._update_mamba_slot_read_offsets(
                         mamba_indices, next_tokens, num_reqs
                     )
@@ -5852,11 +6009,18 @@ class TPUModelRunner(GPUModelRunner):
             and not has_kv_transfer_group()
         )
         host_phases.mark("token_d2h_bookkeeping")
-        if envs.QWEN4_EXP_PD_DEFER_LOAD_SUBMIT:
+        if envs.QWEN4_EXP_PD_DEFER_LOAD_SUBMIT or envs.QWEN4_EXP_PD_LANDX_DEFER_REPACK:
             # The forward and sampling are dispatched and the wait below holds
             # the host until the forward ends: submit the step's loads now.
             self._submit_deferred_kv_loads()
             host_phases.mark("kv_load_submit")
+        if envs.QWEN4_EXP_PD_EARLY_POLL and self._kv_early_poll():
+            # q38 DEC-STEP-2 (QWEN4_EXP_PD_EARLY_POLL): a PD consumer polls its
+            # connector here, while the device still runs the previous step,
+            # off the host chain that starts when the wait below returns and
+            # ends at the next forward's dispatch.
+            self._early_poll_kv_connector(scheduler_output)
+            host_phases.mark("kv_poll_early")
         if self.scheduler_config.async_scheduling and not defer_prev_wait:
             self._modify_prev_results()
 
@@ -5872,6 +6036,13 @@ class TPUModelRunner(GPUModelRunner):
         # keeps proposing from the host-materialized output in the sync block
         # below.
         is_async = bool(self.scheduler_config.async_scheduling)
+        if _pparf.enabled() and self._pp_last_async_output:
+            # q38 PPARF: under PP last async output the prefill-only drafter
+            # returns its device drafts (the async return form), so its graph
+            # is not forced through a blocking host copy; the copy-gate fence
+            # below enqueues it without waiting. is_async picks only the
+            # return form here.
+            is_async = True
         eagle3_drafts = None
         if (
             self._is_async_drafter
@@ -5938,7 +6109,26 @@ class TPUModelRunner(GPUModelRunner):
             # barrier does not materialize their writes before Raiden reads.
             synchronize_tensors()
 
-        if copy_state is not None and self._fence_spec_kv_under_token_copy:
+        if copy_state is not None and _pparf.enabled() and self._copygate_registers_ahead:
+            # q38 PPARF copy-gate fence (port of HIGHC-PPAE1's
+            # TPU_PP_COPYGATE_FENCE mode 1): enqueue without waiting the
+            # drafter's graph (through its bucketed per-chunk drafts, one call
+            # each, as the synchronous .cpu() materializes them) and every
+            # KV-writing root registered for this step, then re-arm the gate,
+            # before the unwaited return. Applies to every producer that
+            # registers ahead, with or without a drafter
+            # (pp_last_async_drafter docstring).
+            _pparf_drafts = [eagle3_drafts] if isinstance(eagle3_drafts, torch.Tensor) else list(eagle3_drafts or ())
+            _pparf_roots = _pparf.take_roots(self)
+            _pparf.fence(
+                copy_state,
+                _pparf_drafts,
+                _pparf_roots,
+                synchronize=lambda ts: synchronize_tensors(ts, wait=False),
+                skip_dispatch=False,
+                skip_fence=False,
+            )
+        elif copy_state is not None and self._fence_spec_kv_under_token_copy:
             # A Raiden producer registers a request's KV blocks ahead of its
             # finish, so a consumer may pull as soon as the first token is
             # out, while the drafter's KV writes above are still deferred.
@@ -9519,3 +9709,358 @@ def _get_num_slices_per_kv_cache_update_block(page_size_bytes: int) -> int:
     if num_slices_per_block > 64:
         num_slices_per_block = 64
     return num_slices_per_block
+
+
+# q38 DEC-STEP-3 (VLLM_TPU_GLUE_FOLD, default off): the async spec step's
+# integer glue folded into four programs, each the same ops in the same order
+# as the stock path it replaces, so its outputs are bitwise the same:
+#   post  after the verify: the mamba read-offset scatter
+#         (_update_read_offsets_impl) + compute_num_rejected + the bonus
+#         column assemble_spec_next_tokens gathers (stock: one program for the
+#         scatter, the rest eager after the drafter);
+#   asm   after the drafter: the [bonus, drafts] source + its append-pad to the
+#         fixed bound (stock: eager cat, cat, pad);
+#   sub   in the next step's _prepare_inputs: subtract_num_rejected_tokens as
+#         one program (stock: eager new_zeros / sub / sub);
+#   pre   before the forward: the warmed source cast + the placeholder
+#         substitution scatter + extract_draft_token_ids (stock: an eager cast,
+#         the substitution program and an eager gather).
+# The verify program and the three uniform draws are not touched: the draws
+# stay eager, with the same generator, shapes and order, so the random stream
+# is unchanged. Everything folded is integer data movement. Engages only on a
+# single-chunk async spec step with an async drafter; any other step takes the
+# stock path. VLLM_TPU_GLUE_FOLD_CHECK=N also runs the stock ops on copies for
+# the first N folded steps and logs the mismatch counts (must be 0).
+_GLUE_STATS_EVERY = 2000
+
+
+def _glue_post_verify_impl(
+    read_offsets: torch.Tensor,
+    groups: list[torch.Tensor],
+    next_tokens: torch.Tensor,
+    num_reqs: torch.Tensor,
+    draft_lengths: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`_update_read_offsets_impl`, then `compute_num_rejected` and the bonus
+    column of `assemble_spec_next_tokens` for the chunk's
+    ``draft_lengths.shape[0]`` rows (the stock assembler's rows)."""
+    _update_read_offsets_impl(read_offsets, groups, next_tokens, num_reqs)
+    rows = draft_lengths.shape[0]
+    nt = next_tokens[:rows]
+    num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1)
+    num_rejected = (draft_lengths - num_valid + 1).clamp(min=0).to(torch.int32)
+    last_valid_col = (nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1) - 1
+    bonus = nt.gather(1, last_valid_col.unsqueeze(1))
+    return num_rejected, bonus
+
+
+def _glue_assemble_impl(
+    bonus: torch.Tensor, drafts: torch.Tensor, bound: int
+) -> torch.Tensor:
+    """`assemble_spec_next_tokens`' concatenation from the bonus column, then
+    sample_tokens' append-pad of the source to ``bound``."""
+    src = torch.cat([bonus.to(drafts.dtype), drafts], dim=1).reshape(-1)
+    if src.shape[0] < bound:
+        src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
+    return src
+
+
+def _glue_pre_impl(
+    input_ids: torch.Tensor,
+    cur_input_indices: torch.Tensor,
+    pre_next_tokens_indices: torch.Tensor,
+    next_tokens: torch.Tensor,
+    final_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    warm: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`_warmed_next_tokens` (``warm`` = its target length, 0 when it returns
+    the source unchanged), `_substitute_placeholder_token`, then
+    `extract_draft_token_ids` on the substituted ids."""
+    if warm:
+        flat = next_tokens.reshape(-1).to(torch.int64)
+        if warm > flat.shape[0]:
+            flat = torch.nn.functional.pad(flat, (0, warm - flat.shape[0]))
+        next_tokens = flat
+    mask = pre_next_tokens_indices > -1
+    safe_idx = torch.clamp_min(pre_next_tokens_indices, 0)
+    new_token_values = next_tokens[safe_idx].to(input_ids.dtype)
+    original_values = input_ids[cur_input_indices]
+    update_values = torch.where(mask, new_token_values, original_values)
+    input_ids.scatter_(0, cur_input_indices, update_values)
+    drafts = input_ids[final_logits_indices[target_logits_indices + 1]]
+    return input_ids, drafts
+
+
+def _glue_pre_identity_impl(
+    next_tokens: torch.Tensor,
+    like: torch.Tensor,
+    final_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`_apply_async_token_substitution`'s fast path 1 (every slot substituted
+    in order: the source itself) + `extract_draft_token_ids`."""
+    ids = next_tokens.flatten().to(like.dtype)[: like.shape[0]]
+    drafts = ids[final_logits_indices[target_logits_indices + 1]]
+    return ids, drafts
+
+
+# _static_shape_args: vLLM marks the forward's input_ids / positions dynamic on
+# the tensor object, and the folds take positions (sub) and input_ids (pre); a
+# stamped tensor would lift a SymInt the TPU backend refuses (see eagle3).
+_glue_post_verify_compiled = _static_shape_args(_tpu_compile(_glue_post_verify_impl))
+_glue_assemble_compiled = _static_shape_args(_tpu_compile(_glue_assemble_impl))
+_glue_pre_compiled = _static_shape_args(_tpu_compile(_glue_pre_impl))
+_glue_pre_identity_compiled = _static_shape_args(_tpu_compile(_glue_pre_identity_impl))
+_glue_subtract_compiled = None  # built on first use (tpu_runner_async_output)
+
+
+def _glue_on_tpu(t: torch.Tensor) -> bool:
+    # The tpu backend cannot trace CPU tensors: CPU (tests) runs the bodies.
+    return t.device.type == "tpu"
+
+
+def _glue_count(runner: Any, name: str) -> None:
+    st = runner.__dict__.get("_glue_stats")
+    if st is None:
+        st = runner._glue_stats = dict(steps=0, post=0, asm=0, pre=0, pre_id=0, sub=0)
+        logger.info(
+            "q38 GLUE_FOLD engaged=1 (post / asm / sub / pre programs; RNG draws eager; "
+            "check=%d)",
+            envs.VLLM_TPU_GLUE_FOLD_CHECK,
+        )
+    st[name] += 1
+    if name == "post":
+        st["steps"] += 1
+        if st["steps"] == envs.VLLM_TPU_GLUE_FOLD_CHECK:
+            _glue_check_report(runner)
+        if st["steps"] % _GLUE_STATS_EVERY == 0:
+            logger.info(
+                "q38 GLUE_FOLD steps=%d post=%d asm=%d sub=%d pre=%d pre_id=%d",
+                st["steps"], st["post"], st["asm"], st["sub"], st["pre"], st["pre_id"],
+            )
+
+
+def _glue_check_on(runner: Any) -> bool:
+    st = runner.__dict__.get("_glue_stats")
+    steps = 0 if st is None else st["steps"]
+    return steps < envs.VLLM_TPU_GLUE_FOLD_CHECK
+
+
+def _glue_check_add(runner: Any, name: str, bad: torch.Tensor) -> None:
+    """Accumulate one fold's mismatch count on device; one host read when the
+    check window closes."""
+    acc = runner.__dict__.get("_glue_check_bad")
+    if acc is None:
+        acc = runner._glue_check_bad = {}
+    acc[name] = acc[name] + bad if name in acc else bad.to(torch.int64)
+    n = runner.__dict__.setdefault("_glue_check_n", {})
+    n[name] = n.get(name, 0) + 1
+
+
+def _glue_check_report(runner: Any) -> None:
+    acc = runner.__dict__.get("_glue_check_bad") or {}
+    n = runner.__dict__.get("_glue_check_n") or {}
+    vals = {k: int(v.item()) for k, v in acc.items()}
+    logger.info(
+        "q38 GLUE_FOLD check: %s (mismatches / checked folds; must be 0)",
+        " ".join(f"{k}={vals[k]}/{n[k]}" for k in sorted(vals)),
+    )
+    runner._glue_check_bad = {}
+    runner._glue_check_n = {}
+
+
+@torch.no_grad()
+def _glue_post_verify(
+    runner: Any, mamba_indices: Any, next_tokens: torch.Tensor, num_reqs: int, md: Any, state: Any
+) -> bool:
+    """Fold `_update_mamba_slot_read_offsets` for a single-chunk async spec
+    verify with its post-verify integer glue; park (next_tokens, rejected,
+    bonus) for `_glue_assemble`. False: the stock path runs."""
+    runner.__dict__.pop("_glue_post_extras", None)
+    if (
+        not runner.scheduler_config.async_scheduling
+        or not runner._is_async_drafter
+        or runner.mamba_slot_read_offsets is None
+        or not mamba_indices
+        or not envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
+        or len(state.spec_decode_metadata_list) != 1
+        or md is None
+    ):
+        return False
+    bucketed = getattr(getattr(runner, "drafter", None), "bucketed_drafts", False)
+    rows = next_tokens.shape[0] if bucketed else num_reqs
+    draft_lengths = fit_rows(md.draft_lengths, rows)
+    groups = list(mamba_indices)
+    num_reqs_t = runner._num_reqs_tensor(num_reqs)
+    check = _glue_check_on(runner)
+    if check:
+        ref_offsets = runner.mamba_slot_read_offsets.clone()
+    fn = (
+        _glue_post_verify_compiled
+        if _glue_on_tpu(runner.mamba_slot_read_offsets)
+        else _glue_post_verify_impl
+    )
+    rejected, bonus = fn(
+        runner.mamba_slot_read_offsets, groups, next_tokens, num_reqs_t, draft_lengths
+    )
+    runner._glue_post_extras = (next_tokens, rejected, bonus, rows)
+    if check:
+        from vllm_torchtpu.runner.tpu_runner_async_output import compute_num_rejected
+
+        _update_read_offsets_impl(ref_offsets, groups, next_tokens, num_reqs_t)
+        ref_rej = compute_num_rejected(next_tokens, draft_lengths)
+        nt = next_tokens[:rows]
+        ref_bonus = nt.gather(
+            1, ((nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1) - 1).unsqueeze(1)
+        )
+        bad = (ref_offsets != runner.mamba_slot_read_offsets).sum()
+        bad = bad + (ref_rej != rejected).sum() + (ref_bonus != bonus).sum()
+        _glue_check_add(runner, "post", bad)
+    _glue_count(runner, "post")
+    return True
+
+
+@torch.no_grad()
+def _glue_assemble(runner: Any, drafts: Any, next_tokens_per_chunk: list, state: Any):
+    """`_assemble_async_spec_substitution` for the step `_glue_post_verify`
+    folded, with the source already padded to sample_tokens' bound (so its
+    pad is a no-op). None: the stock assembler runs."""
+    extras = runner.__dict__.pop("_glue_post_extras", None)
+    if (
+        extras is None
+        or drafts is None
+        or len(next_tokens_per_chunk) != 1
+        or extras[0] is not next_tokens_per_chunk[0]
+        or len(state.num_reqs_list) != 1
+        or state.spec_decode_metadata_list[0] is None
+    ):
+        return None
+    nt, rejected, bonus, rows = extras
+    num_reqs = state.num_reqs_list[0]
+    md = state.spec_decode_metadata_list[0]
+    drafts_chunk = fit_rows(runner._drafts_per_chunk(drafts, state.num_reqs_list)[0], rows)
+    assert runner.speculative_config is not None
+    bound = runner.max_num_reqs * (1 + runner.speculative_config.num_speculative_tokens)
+    fn = _glue_assemble_compiled if _glue_on_tpu(nt) else _glue_assemble_impl
+    src = fn(bonus, drafts_chunk, bound)
+    _glue_count(runner, "asm")
+    if _glue_check_on(runner):
+        from vllm_torchtpu.runner.tpu_runner_async_output import assemble_spec_next_tokens
+
+        bucketed = getattr(getattr(runner, "drafter", None), "bucketed_drafts", False)
+        ref = assemble_spec_next_tokens(nt, drafts_chunk, None if bucketed else num_reqs)
+        if ref.shape[0] < bound:
+            ref = torch.nn.functional.pad(ref, (0, bound - ref.shape[0]))
+        _glue_check_add(runner, "asm", (ref != src).sum())
+    next_token_indices = {r: r for r in range(num_reqs)}
+    num_draft_per_req = {r: int(md.draft_lengths_cpu[r]) for r in range(num_reqs)}
+    return [src], next_token_indices, rejected, num_draft_per_req
+
+
+def _glue_subtract_fn():
+    """subtract_num_rejected_tokens as one program (the same function)."""
+    global _glue_subtract_compiled
+    if _glue_subtract_compiled is None:
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            subtract_num_rejected_tokens,
+        )
+
+        _glue_subtract_compiled = _static_shape_args(
+            _tpu_compile(subtract_num_rejected_tokens)
+        )
+    return _glue_subtract_compiled
+
+
+def _glue_subtract(runner: Any, seq_lens, positions, rejected, seq_idx, pos_idx):
+    """The fold of subtract_num_rejected_tokens: the same function compiled
+    as one program (CPU: the function itself)."""
+    from vllm_torchtpu.runner.tpu_runner_async_output import (
+        subtract_num_rejected_tokens,
+    )
+
+    fn = _glue_subtract_fn() if _glue_on_tpu(seq_lens) else subtract_num_rejected_tokens
+    out = fn(seq_lens, positions, rejected, seq_idx, pos_idx)
+    _glue_count(runner, "sub")
+    if _glue_check_on(runner):
+        ref = subtract_num_rejected_tokens(seq_lens, positions, rejected, seq_idx, pos_idx)
+        _glue_check_add(
+            runner, "sub", (ref[0] != out[0]).sum() + (ref[1] != out[1]).sum()
+        )
+    return out
+
+
+def _glue_warm_target(runner: Any, next_tokens: torch.Tensor) -> int:
+    """`_warmed_next_tokens`' decision on the host: its target length, or 0
+    when it returns the source unchanged."""
+    if not envs.VLLM_TPU_WARMED_SUBSTITUTE_SOURCE:
+        return 0
+    n = next_tokens.numel()
+    lens = runner.__dict__.get("_substitute_lens_cache")
+    if lens is None:
+        lens = runner._substitute_next_lens()
+        runner._substitute_lens_cache = lens
+    target = next((m for m in lens if m >= n), None)
+    if target is None:
+        return 0
+    if next_tokens.dim() == 1 and n == target and next_tokens.dtype == torch.int64:
+        return 0
+    return target
+
+
+def _glue_pre(
+    runner: Any,
+    input_ids: torch.Tensor,
+    cur_input_indices: torch.Tensor | None,
+    pre_next_tokens_indices: torch.Tensor | None,
+    md: Any,
+) -> torch.Tensor:
+    """The fold of `_apply_async_token_substitution`'s substitution with
+    `extract_draft_token_ids` into ``md.draft_token_ids``; marks the step so
+    execute_model skips its own extraction. ``cur_input_indices`` None: fast
+    path 1 (the source itself)."""
+    nxt = runner._pre_async_results.next_tokens_tpu
+    check = _glue_check_on(runner)
+    on_tpu = _glue_on_tpu(input_ids)
+    if cur_input_indices is None:
+        fn = _glue_pre_identity_compiled if on_tpu else _glue_pre_identity_impl
+        ids, drafts = fn(nxt, input_ids, md.final_logits_indices, md.target_logits_indices)
+        _glue_count(runner, "pre_id")
+        if check:
+            ref = nxt.flatten().to(input_ids.dtype)[: len(input_ids)]
+            ref_d = ref[md.final_logits_indices[md.target_logits_indices + 1]]
+            _glue_check_add(runner, "pre", (ref != ids).sum() + (ref_d != drafts).sum())
+    else:
+        warm = _glue_warm_target(runner, nxt)
+        if check:
+            ref_in = input_ids.clone()
+        fn = _glue_pre_compiled if on_tpu else _glue_pre_impl
+        ids, drafts = fn(
+            input_ids,
+            cur_input_indices,
+            pre_next_tokens_indices,
+            nxt,
+            md.final_logits_indices,
+            md.target_logits_indices,
+            warm,
+        )
+        _glue_count(runner, "pre")
+        if check:
+            src = runner._warmed_next_tokens(nxt) if envs.VLLM_TPU_WARMED_SUBSTITUTE_SOURCE else nxt
+            ref = _substitute_placeholder_token(
+                ref_in, cur_input_indices, pre_next_tokens_indices, src
+            ) if on_tpu else _glue_substitute_eager(
+                ref_in, cur_input_indices, pre_next_tokens_indices, src
+            )
+            ref_d = ref[md.final_logits_indices[md.target_logits_indices + 1]]
+            _glue_check_add(runner, "pre", (ref != ids).sum() + (ref_d != drafts).sum())
+    md.draft_token_ids = drafts
+    runner._glue_pre_done = True
+    return ids
+
+
+def _glue_substitute_eager(input_ids, cur, pre, next_tokens):
+    """`_substitute_placeholder_token`'s body (CPU: the tpu backend cannot
+    trace CPU tensors)."""
+    fn = getattr(_substitute_placeholder_token, "_torchdynamo_orig_callable", None)
+    return (fn or _substitute_placeholder_token)(input_ids, cur, pre, next_tokens)

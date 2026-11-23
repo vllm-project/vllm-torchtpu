@@ -409,6 +409,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prev_residual,
                 self.attn_hyper_connection,
                 prefill_fused=False,
+                prefill_fold=envs.TPU_QWEN4_HC_PREFILL_FOLD,
             )
         else:
             hidden = self.apply_ple(
@@ -715,6 +716,24 @@ class Qwen4ExpBackbone(nn.Module):
             else PPMissingLayer()
         )
         self.hidden_width = self.hc_count * t.hidden_size
+        if envs.TPU_QWEN4_HC_PREFILL_FOLD:
+            # Engagement line (static counts only): layers whose mlp combine
+            # runs as the next layer's attn-mix prologue at whole-tile prefill
+            # steps. The last layer's combine stays separate (stage hand-off,
+            # or the final mixer, which has no injection gate).
+            stage = list(self.stage)
+            folded = [
+                index
+                for index, following in zip(stage, stage[1:])
+                if cast(Qwen4ExpDecoderLayer, self.layers[following]).ple is None
+            ]
+            logger.info(
+                "q38 HC PREFILL FOLD: on; stage layers %s; mlp combines folded "
+                "after layers %s (%d)",
+                stage,
+                folded,
+                len(folded),
+            )
 
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
@@ -825,7 +844,10 @@ class Qwen4ExpBackbone(nn.Module):
         # TPU_QWEN4_HC_DECODE_FOLD: a layer hands its mlp combine to the next
         # attn mix (or the final mixer) unless the next layer adds its PLE
         # embedding to the combined streams first.
-        fold = envs.TPU_QWEN4_HC_DECODE_FOLD and not sequence_parallel
+        # TPU_QWEN4_HC_PREFILL_FOLD (q38 PSTEP-HC L3) uses the same plumbing.
+        fold = (
+            envs.TPU_QWEN4_HC_DECODE_FOLD or envs.TPU_QWEN4_HC_PREFILL_FOLD
+        ) and not sequence_parallel
         stage = list(self.stage)
         pending = None
         for position, index in enumerate(stage):
@@ -869,6 +891,7 @@ class Qwen4ExpBackbone(nn.Module):
                 last_residual,
                 self.hyper_connection_mixer,
                 prefill_fused=False,
+                prefill_fold=envs.TPU_QWEN4_HC_PREFILL_FOLD,
             )
         else:
             mixed = self.hyper_connection_mixer.mix(hidden)[0]

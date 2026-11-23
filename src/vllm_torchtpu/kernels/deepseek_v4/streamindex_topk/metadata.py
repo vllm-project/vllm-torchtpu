@@ -328,6 +328,17 @@ def compute_batched_seq_metadata(
             bkv_idx=bkv_idx,
         )
 
+    from vllm_torchtpu import envs
+
+    if envs.VLLM_TPU_QSA_INDEXER_META_SELECT:
+        # The arrays come out of plain fusions that XLA can place in HBM, where
+        # the kernel's scalar prefetch reads them; a conditional's outputs land
+        # in VMEM and are copied out. An empty pass's schedule is computed and
+        # discarded, zeros as the empty branch gives.
+        return jax.tree_util.tree_map(
+            lambda x: jnp.where(is_empty_pass, jnp.zeros_like(x), x),
+            _compute_schedule(),
+        )
     return jax.lax.cond(is_empty_pass, _empty_schedule, _compute_schedule)
 
 

@@ -407,11 +407,41 @@ UNION_REQUESTS = 32  # requests per union RPA call; its [32, P] page table at
 # P = 2080 is 266 KB of scalar memory, as the 128-row per-row call's is.
 
 
+def union_call_requests(rows, max_query_len):
+    """Requests per union RPA call for a step of ``rows`` rows: ``UNION_REQUESTS``,
+    or, under q38 DEC-STEP-3's port of DECODE-QSA WIDE v2
+    (VLLM_TPU_QSA_DECODE_RPA_UNION_WIDE), 64 for a step past one
+    ``UNION_REQUESTS`` call's rows (448 / 480 rows: 3 calls a QSA layer instead
+    of 5). Steps of at most ``UNION_REQUESTS * max_query_len`` rows keep
+    ``UNION_REQUESTS``. Each request stays its own RPA sequence over its own
+    tiles, so every row's sums run in the same order either way."""
+    wide = envs.VLLM_TPU_QSA_DECODE_RPA_UNION_WIDE
+    if wide and rows > UNION_REQUESTS * max_query_len:
+        if wide != 64:
+            raise ValueError(
+                f"VLLM_TPU_QSA_DECODE_RPA_UNION_WIDE={wide}: only 64 (a [64, 2080] "
+                "page table, 532 KB of the 1 MiB scalar memory) is supported"
+            )
+        return wide
+    return UNION_REQUESTS
+
+
+# (rows, request slots) of the programs traced with WIDE calls (log once each).
+WIDE_TRACED: dict = {}
+# (site, rows) traced under VLLM_TPU_DECODE_ROWS_GLUE (log once each).
+ROWS_GLUE_TRACED: set = set()
+
+
 def union_page_slots(budget, ratio, tile, rows=4):
     """Union page slots a request: ``rows`` rows' ``budget`` groups and their
     tail groups, in whole ``tile``-token KV tiles."""
     per_tile = tile // ratio
     return -(-(rows * (budget + 1)) // per_tile) * per_tile
+
+
+# (rows, request slots) of the programs traced with VLLM_TPU_QSA_DECODE_RPA_PT_PREFIX
+# (q38 RPAD-HIGHROWS F4; log once each).
+PT_PREFIX_TRACED: dict = {}
 
 
 # Diagnostics for the bench (scripts/bench_qsa_rpa_decode.py f15c): build the
@@ -528,16 +558,40 @@ def union_decode_attention(
         )
     starts, pages, sel, meta, live = metadata
     requests = len(starts) - 1
-    chunks = -(-requests // UNION_REQUESTS)
-    pad = chunks * UNION_REQUESTS - requests
+    per_call = union_call_requests(len(q), max_query_len)
+    if per_call != UNION_REQUESTS and (len(q), requests) not in WIDE_TRACED:
+        WIDE_TRACED[(len(q), requests)] = -(-requests // per_call)
+        # q38 DEC-STEP-3 WIDE engagement marker, once per traced program.
+        logger.info(
+            "q38 DEC-STEP-3 WIDE traced: rows %d, request slots %d, requests per call %d, calls %d",
+            len(q), requests, per_call, -(-requests // per_call),
+        )
+    chunks = -(-requests // per_call)
+    # WIDE: the last call takes the remaining requests (no padded requests,
+    # no copies of the page table / words / meta); 32-request calls pad as before.
+    pad = chunks * per_call - requests if per_call == UNION_REQUESTS else 0
     if pad > 0:
         starts = jnp.concatenate([starts, jnp.broadcast_to(starts[-1:], (pad,))])
         pages, sel, meta = (jnp.pad(x, ((0, pad), (0, 0))) for x in (pages, sel, meta))
-    call_rows = UNION_REQUESTS * max_query_len
+    call_rows = per_call * max_query_len
+    # VLLM_TPU_QSA_UNION_LEAN_GLUE: when one call covers the step, it runs over
+    # the step's own rows, so its query, output and LSE buffers have the step's
+    # size and call row r is step row r. A row before starts[0] belongs to no
+    # request; union_row_live masks whatever the kernel leaves in it.
+    # VLLM_TPU_QSA_UNION_CHAINED_CALLS: with several calls, each runs over the
+    # whole step too and takes the previous call's output and LSE buffers, in
+    # the kernel's layout, as its own (wrapper carry). A call reads the queries
+    # of its own sequences, rows no earlier call wrote, and writes only them.
+    lean = bool(envs.VLLM_TPU_QSA_UNION_LEAN_GLUE)
+    chained = bool(envs.VLLM_TPU_QSA_UNION_CHAINED_CALLS) and chunks > 1
+    whole = (lean and chunks == 1 and len(q) <= call_rows) or chained
+    span = call_rows
+    if whole:
+        call_rows = len(q)
     # Rows past the last call's slice are padding, so a slice never clamps.
     query = jnp.pad(
         q.astype(jnp.float32),
-        ((0, call_rows), (0, 0), (0, cache.shape[-1] - q.shape[-1])),
+        ((0, 0 if whole else call_rows), (0, 0), (0, cache.shape[-1] - q.shape[-1])),
     )
     dummy_k = jnp.zeros((call_rows, 1, query.shape[-1]), cache.dtype)
     virtual_cache = cache.reshape(-1, ratio, *cache.shape[2:])
@@ -548,14 +602,33 @@ def union_decode_attention(
         batch_size=envs.VLLM_TPU_QSA_DECODE_RPA_LANES,
     )
     skip = envs.VLLM_TPU_QSA_DECODE_RPA_SKIP_EMPTY
-    out = jnp.zeros(query.shape, jnp.float32)
-    lse = jnp.full(query.shape[:2], -jnp.inf, jnp.float32)
+    # q38 RPAD-HIGHROWS F4: copy only the used page-table prefix into SMEM
+    # (read-only calls only; the kernel needs read_only_cache).
+    pt_prefix = bool(envs.VLLM_TPU_QSA_DECODE_RPA_PT_PREFIX) and read_only
+    if pt_prefix and (len(q), requests) not in PT_PREFIX_TRACED:
+        PT_PREFIX_TRACED[(len(q), requests)] = True
+        logger.info(
+            "q38 RPAD-HIGHROWS PT_PREFIX traced: rows %d, request slots %d, %d union calls "
+            "of [%d, %d] page tables",
+            len(q), requests, chunks, UNION_REQUESTS, pages.shape[1],
+        )
+    out = None if whole else jnp.zeros(query.shape, jnp.float32)
+    lse = None if whole else jnp.full(query.shape[:2], -jnp.inf, jnp.float32)
+    carry = None
     for c in range(chunks):
-        first = c * UNION_REQUESTS
-        part = slice(first, first + UNION_REQUESTS)
-        row0 = starts[first]
+        first = c * per_call
+        take = per_call if per_call == UNION_REQUESTS else min(per_call, requests - first)
+        part = slice(first, first + take)
+        row0 = 0 if whole else starts[first]
+        edges = starts[first : first + take + 1]
+        if chained:
+            # The rows a sliced call would attend, [starts[first], + span),
+            # in step coordinates.
+            cu_q_lens = jnp.clip(edges, edges[0], jnp.minimum(edges[0] + span, len(q)))
+        else:
+            cu_q_lens = jnp.clip(edges - row0, 0, call_rows)
         out_c, virtual_cache, lse_c = wrapper.ragged_paged_attention(
-            jax.lax.dynamic_slice_in_dim(query, row0, call_rows),
+            query if whole else jax.lax.dynamic_slice_in_dim(query, row0, call_rows),
             dummy_k,
             dummy_k,
             virtual_cache,
@@ -564,8 +637,8 @@ def union_decode_attention(
             # A request of more than max_query_len rows (the precompile's
             # dummy steps) could carry a call past its query slice; rows
             # past the slice are not attended.
-            jnp.clip(starts[first : first + UNION_REQUESTS + 1] - row0, 0, call_rows),
-            jnp.full((3,), UNION_REQUESTS, jnp.int32),
+            cu_q_lens,
+            jnp.full((3,), take, jnp.int32),
             sm_scale=q.shape[-1] ** -0.5,
             q_scale=None,
             k_scale=k_scale,
@@ -588,11 +661,22 @@ def union_decode_attention(
             selection_bits=sel[part],
             **({"read_only_cache": True} if read_only else {}),
             schedule_in_hbm=envs.VLLM_TPU_RPA_SCHEDULE_HBM,
+            **({"selection_word_rows": True} if lean else {}),
+            **({"carry": carry, "return_carry": True} if chained else {}),
+            **({"page_table_prefix": True} if pt_prefix else {}),
         )
+        if chained:
+            carry = (out_c, lse_c)
+            continue
+        if whole:
+            out, lse = out_c, lse_c.astype(jnp.float32)
+            continue
         # Later calls start at their own first row, so each row keeps the
         # value its own call wrote.
         out = jax.lax.dynamic_update_slice_in_dim(out, out_c, row0, 0)
         lse = jax.lax.dynamic_update_slice_in_dim(lse, lse_c.astype(jnp.float32), row0, 0)
+    if chained:
+        out, lse = wrapper.finish_carry(carry, query.shape, 1, query.dtype)
     out = jnp.where(live[:, None, None], out[: len(q), :, : q.shape[-1]], 0)
     lse = jnp.where(live[:, None], lse[: len(q)], -jnp.inf)
     return out, lse, virtual_cache.reshape(cache.shape)
@@ -858,6 +942,15 @@ def _prefill_attention(
             **({"in_place": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_IN_PLACE else {}),
             **({"sc_bits_plan": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_SC_BITS_PLAN else {}),
             **({"gathered_lean": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_GATHERED_LEAN else {}),
+            **({"mask_view": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_MASK_VIEW else {}),
+            **({"vguard_lean": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_VGUARD_LEAN else {}),
+            **({"align_gather": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_ALIGN_GATHER else {}),
+            **({"walk_pipe": envs.VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE} if envs.VLLM_TPU_QSA_PREFILL_UNION_WALK_PIPE else {}),
+            **({"dot16": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_DOT16 else {}),
+            **({"vguard_none": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_VGUARD_NONE else {}),
+            **({"bf16_softmax": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_BF16_SOFTMAX else {}),
+            **({"fos": int(envs.VLLM_TPU_QSA_PREFILL_UNION_FOS)} if envs.VLLM_TPU_QSA_PREFILL_UNION_FOS else {}),
+            **({"lean_tile": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_LEAN_TILE else {}),
         )
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
         block_sparse_gqa_attention,
@@ -1568,6 +1661,19 @@ def selected_tokens(blocks, lengths, token_topk, compress_ratio):
     ).reshape(len(blocks), token_topk)
     selected = jnp.pad(selected, ((0, 0), (0, compress_ratio - 1)), constant_values=-1)
     count = jnp.minimum(lengths // compress_ratio, blocks.shape[1])
+    if envs.VLLM_TPU_DECODE_ROWS_GLUE:
+        # q38 DEC-STEP-3: the same tail fill as selects over the columns, not
+        # a scatter (a scatter_fusion above 384 rows); one column a row each.
+        if ("selected_tokens", len(blocks)) not in ROWS_GLUE_TRACED:
+            ROWS_GLUE_TRACED.add(("selected_tokens", len(blocks)))
+            logger.info("q38 DEC-STEP-3 ROWS_GLUE traced: selected_tokens rows %d", len(blocks))
+        columns = jnp.arange(selected.shape[1], dtype=count.dtype)[None, :]
+        for tail in range(compress_ratio - 1):
+            token = lengths // compress_ratio * compress_ratio + tail
+            value = jnp.where(token < lengths, token, -1).astype(selected.dtype)
+            at = (count * compress_ratio + tail)[:, None]
+            selected = jnp.where(columns == at, value[:, None], selected)
+        return selected
     for tail in range(compress_ratio - 1):
         token = lengths // compress_ratio * compress_ratio + tail
         selected = selected.at[

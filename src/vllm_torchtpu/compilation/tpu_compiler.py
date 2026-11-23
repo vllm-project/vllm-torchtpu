@@ -219,6 +219,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",
     "USE_PHASED_PROFILER",
+    # q38 SV-PAIR: EngineCore / API-server process CPU affinity only
+    # (worker/cpu_pinning.py).
+    "VLLM_TPU_CPU_PIN_ENGINE",
     # Raiden KV-transfer orchestration/identity only; consumed at serving time
     # by the KV connector and never affect the compiled graph.
     # TPU_RAIDEN_ADVERTISE_HOST is the pod IP in the P/D recipes, so hashing it
@@ -293,17 +296,42 @@ _TPU_COMPILE_ENV_IGNORED = {
     "QWEN4_EXP_PD_FAST_ADMIT",
     # Stage-3 load submit after the forward dispatch (same submits).
     "QWEN4_EXP_PD_DEFER_LOAD_SUBMIT",
+    # When a landed load's staged repack is dispatched (after the forward
+    # instead of before) and the step its request joins (q38 LAND-OVERLAP):
+    # the repack programs, the bytes and every model program are the same.
+    "QWEN4_EXP_PD_LANDX_DEFER_REPACK",
+    # When a PD consumer polls its KV connector within a step (q38 DEC-STEP-2,
+    # before the previous-results wait instead of after the drafter): host
+    # order only; every program and input is the same.
+    "QWEN4_EXP_PD_EARLY_POLL",
     # Per-step host phase logging (runner/host_phases.py).
     "VLLM_TPU_HOST_PHASES",
+    # q38 SV-KNOB GIL-SW: the interpreter's thread switch interval and its A/B
+    # windows, set per process at its first step (core/host_knobs.py).
+    "VLLM_TPU_HOST_SWITCH_US",
+    "VLLM_TPU_HOST_AB_PERIOD_MS",
+    # Row-incremental target-walk block-table pack (q38 SV-PAM PAM-INCR): host
+    # only, the staged bytes are the stock pack's (runner/pam_incr.py).
+    "VLLM_TPU_PAM_INCR",
+    "VLLM_TPU_PAM_INCR_AB_MS",
     # Last pipeline stage replies from the output thread (host only;
     # runner/pp_last_async_output.py).
     "VLLM_TPU_PP_LAST_ASYNC_OUTPUT",
+    # q38 PPARF: the same with a prefill-only MTP drafter (host only: the
+    # drafter's graph is unchanged; runner/pp_last_async_drafter.py).
+    "VLLM_TPU_PP_LAST_ASYNC_PREFILL_DRAFTER",
     # Engine-core KV cache bookkeeping shortcut (core/kv_decode_fast_path.py).
     "VLLM_TPU_KV_DECODE_FAST_PATH",
     # q38 SEED-SPEC (runner/l6_seedspec.py): whether the block-edge GDN seed
     # waits for the previous step's copy; the seed rows, their programs and
     # every model program are the same.
     "VLLM_TPU_L6_SEED_SPEC",
+    # q38 DEC-STEP-3 GLUE_FOLD (runner/tpu_runner.py _glue_*): which programs
+    # run the async spec step's integer glue (four folded programs or the
+    # stock ones, and the check's copies); each is keyed by its own graph and
+    # no program compiles differently.
+    "VLLM_TPU_GLUE_FOLD",
+    "VLLM_TPU_GLUE_FOLD_CHECK",
     # Engine-core cap on remote KV loads started a pass (core/kv_load_pacing.py).
     "VLLM_TPU_KV_LOAD_STARTS_PER_STEP",
     # New-request prompt arrays (core/prompt_token_array.py).
@@ -318,6 +346,18 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_GC_GEN2_THRESHOLD",
     "VLLM_TPU_GC_GEN2_PERIOD_S",
     "VLLM_TPU_GC_CENSUS",
+    # New requests built in the engine core's waits (core/preproc_in_wait.py).
+    "VLLM_TPU_PREPROC_IN_WAIT",
+    "VLLM_TPU_PREPROC_IN_WAIT_AB_MS",
+    # Finished requests freed in the engine core's waits (core/defer_fin.py).
+    "VLLM_TPU_DEFER_FIN",
+    "VLLM_TPU_DEFER_FIN_AB_MS",
+    # Non-output ranks' step replies read one call late (core/fanin_late.py).
+    "VLLM_TPU_FANIN_LATE",
+    "VLLM_TPU_FANIN_LATE_AB_MS",
+    # Remote-KV admissions run in the engine core's waits (core/admit_off.py).
+    "VLLM_TPU_ADMIT_OFF",
+    "VLLM_TPU_ADMIT_OFF_AB_MS",
     # Host timeline and py-spy windows (runner/host_admit_probe.py).
     "VLLM_TPU_HOSTADMIT_PROBE",
     "VLLM_TPU_HOSTADMIT_PYSPY",
@@ -389,6 +429,18 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_OFFLOAD_TIER_CLASSES",
     "VLLM_TPU_OFFLOAD_TIER_CLASS_RATIO",
     "VLLM_TPU_OFFLOAD_TIER_CHECK",
+    "VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE",
+    "VLLM_TPU_OFFLOAD_TIER_X2",
+    "VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS",
+    "VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM",
+    "VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM_MARGIN",
+    "VLLM_TPU_OFFLOAD_DIVERGENT_HITS",
+    # Scheduler-side arrival pins and host-tier refresh only.
+    "VLLM_TPU_ARRIVAL_TOUCH",
+    "VLLM_TPU_ARRIVAL_TOUCH_HBM_FRAC",
+    "VLLM_TPU_ARRIVAL_TOUCH_MIN_FREE_FRAC",
+    "VLLM_TPU_ARRIVAL_TOUCH_TTL_S",
+    "VLLM_TPU_ARRIVAL_TOUCH_TIER",
     "VLLM_TPU_OFFLOAD_TIER_KEY_ROWS",
     # Scheduler prefix-cache hit length only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",

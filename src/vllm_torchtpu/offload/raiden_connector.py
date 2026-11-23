@@ -339,7 +339,13 @@ def _build_tier_check(connector_worker, kv_caches, group_regions) -> TierCheck:
                 raw.setdefault(index[name], tensor)
     regions: dict[str, list[torch.Tensor]] = {}
     live: dict[str, int] = {}
+    rank = parallel_state.get_world_group().rank_in_group
     for tier_class in plan.classes:
+        if tier_class.shard_of is not None and not tier_class.worker_regions[rank]:
+            # TIER-X2: another shard of the class moves this rank's rows.
+            regions[tier_class.name] = []
+            live[tier_class.name] = tier_class.row_bytes
+            continue
         own = sorted({r for g in tier_class.groups for r in group_regions[g]})
         missing = [r for r in own if r not in raw]
         if missing:
@@ -349,13 +355,38 @@ def _build_tier_check(connector_worker, kv_caches, group_regions) -> TierCheck:
             )
         regions[tier_class.name] = [raw[r] for r in own]
         live[tier_class.name] = tier_class.row_bytes
-    rank = parallel_state.get_world_group().rank_in_group
     logger.info(
         "TPURaidenOffloadingConnector: tier check mode on, rank %d hashes classes %s",
         rank,
         {name: len(r) for name, r in regions.items() if r},
     )
     return TierCheck(regions, live, rank)
+
+
+def divergent_hits_restore_state(
+    kv_cache_config: KVCacheConfig, offloaded_group_ids: Iterable[int]
+) -> bool:
+    """Whether every load from this host tier restores the recurrent state at the
+    boundary it ends on, so a local hit that adopted no state is complete once the
+    load lands (VLLM_TPU_OFFLOAD_DIVERGENT_HITS).
+
+    True when the model has prefix-cacheable state (Mamba-kind: GDN, PLE) groups
+    and the tier offloads every one of them: the connector looks a state group up
+    as a one-chunk window that ends exactly at the hit
+    (``OffloadingConnectorScheduler._lookup_complete_chunks``), so no tier hit
+    exists without each state group's checkpoint at that boundary, and the load
+    writes it. A model with no state group gains nothing from a divergent hit, and
+    a state group the tier does not hold could never be restored.
+    """
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    state = {
+        gid
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups)
+        if group.kv_cache_spec.prefix_cacheable
+        and isinstance(group.kv_cache_spec, MambaSpec)
+    }
+    return bool(state) and state <= set(offloaded_group_ids)
 
 
 @dataclass
@@ -388,6 +419,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             self.manager
         )
         self._fence_pending: dict[int, _ParkedStore] = {}
+        # VLLM_TPU_OFFLOAD_DIVERGENT_HITS: every load restores the state groups
+        # at its boundary (read by the connector's
+        # supports_divergent_local_hybrid_hits).
+        self._restores_state = divergent_hits_restore_state(
+            kv_cache_config, [g.group_idx for g in self.config.kv_group_configs]
+        )
         # With the tier classes a drain that times out stops the engine: the
         # source blocks are about to be reused under a live DMA, and a save
         # that lands later would publish their new bytes under the old hash.
@@ -400,6 +437,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         )
         if victim.host_tier_policy() == "victim":
             self._enable_victim_policy(spec, vllm_config)
+        if tpu_envs.VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE:
+            self._enable_exclusive_restore()
+
+    @property
+    def restores_state_with_every_load(self) -> bool:
+        """Every tier load restores each state group at its boundary
+        (``divergent_hits_restore_state``)."""
+        return bool(self.__dict__.get("_restores_state", False))
 
     def host_resident_tokens(self, request: Request, num_local_tokens: int) -> int:
         """Prompt tokens past ``num_local_tokens`` that every offloaded group
@@ -460,6 +505,28 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     return 0
         return end - num_local_tokens
 
+    def touch_load_keys(self, request: Request, start: int, end: int) -> int:
+        """Refreshes the host-tier entries a load of ``request``'s tokens
+        ``[start, end)`` would read (VLLM_TPU_ARRIVAL_TOUCH): every
+        full-attention group's chunks from the one ``start`` falls in, and each
+        windowed group's window ending at ``end``, the keys
+        ``host_resident_tokens`` probed. Moves them to the store's Most Recently
+        Used end; loads nothing and keeps no pin. Returns the keys asked."""
+        hashes = request.block_hashes
+        keys: list[OffloadKey] = []
+        for group in self.config.kv_group_configs:
+            tpc, step = group.tokens_per_chunk, group.hashes_per_chunk
+            stop = min(end // tpc, len(hashes) // step)
+            window = group.sliding_window_size_in_chunks
+            first = start // tpc if window is None else max(stop - window, 0)
+            keys.extend(
+                make_offload_key(hashes[(chunk + 1) * step - 1], group.group_idx)
+                for chunk in range(first, stop)
+            )
+        if keys:
+            self._raiden_manager.touch_run(keys)
+        return len(keys)
+
     # -- victim policy (QWEN4_EXP_HOST_TIER_POLICY=victim; offload/victim.py) --
 
     def _enable_victim_policy(self, spec, vllm_config) -> None:
@@ -484,6 +551,28 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             "eviction, keep on load); groups %s, young-block guard %d steps",
             sorted(self._victim_groups),
             self._victim_min_age,
+        )
+
+    def _enable_exclusive_restore(self) -> None:
+        """VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE: a landed load's host copy is
+        evicted. Only with the victim policy, which stores the block again
+        when HBM evicts it; write-through would never store it back."""
+        if not self.__dict__.get("_victim", False):
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE "
+                f"needs {victim.POLICY_ENV}=victim (the host tier stores a block "
+                "again only when HBM evicts it)"
+            )
+        manager = self._raiden_manager
+        manager.set_exclusive_restore(True)
+        self._excl = True
+        logger.info(
+            "TPURaidenOffloadingConnector: host-tier exclusive restore on (a "
+            "landed load's host copy is evicted with KVCacheStore.evict; HBM "
+            "eviction stores it again); %s",
+            "classes " + ",".join(c.name for c in manager.classes)
+            if isinstance(manager, TieredOffloadingManager)
+            else "single store",
         )
 
     def _store_victims(self) -> None:
@@ -563,6 +652,19 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         manager = self.__dict__.get("_raiden_manager")
         if isinstance(manager, TieredOffloadingManager):
             line += " " + manager.telemetry_line()
+        if self.__dict__.get("_excl", False):
+            stats = manager.excl_stats()
+            if isinstance(stats, dict):
+                stats = [stats]
+            totals = {
+                k: sum(s[k] for s in stats)
+                for k in ("calls", "asked", "evicted", "abandoned", "discarded")
+            }
+            line += " excl_restore=" + ",".join(f"{k}:{v}" for k, v in totals.items())
+        if isinstance(manager, TieredOffloadingManager):
+            x2 = manager.x2_stats()
+            if x2 is not None:
+                line += " tier_x2=" + ",".join(f"{k}:{v}" for k, v in x2.items())
         unhashed = self.__dict__.get("_tier_check_unhashed", {})
         for name, counts in sorted(self.__dict__.get("_tier_check_totals", {}).items()):
             fields = " ".join(f"{k}={v}" for k, v in zip(CHECK_FIELDS, counts))
@@ -791,6 +893,27 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         return None
 
     @property
+    def supports_divergent_local_hybrid_hits(self) -> bool:
+        """VLLM_TPU_OFFLOAD_DIVERGENT_HITS on a scheduler whose every load
+        restores the state groups (``divergent_hits_restore_state``).
+
+        The scheduler then takes the local hit as the attention groups' cached
+        run (``core/divergent_hybrid_hits.divergent_local_hit``), adopting no
+        state block unless every state group holds one exactly there, and asks
+        this connector for the rest: a tier hit from that boundary brings the
+        attention blocks past it and every state group's checkpoint at its end.
+        When the tier finds nothing, vLLM's scheduler falls back to the hit every
+        group agrees on (``get_computed_blocks``). Off (the default) reports
+        False, the upstream value.
+        """
+        if not tpu_envs.VLLM_TPU_OFFLOAD_DIVERGENT_HITS:
+            return False
+        scheduler = self.__dict__.get("connector_scheduler")
+        return bool(
+            scheduler is not None and scheduler.restores_state_with_every_load
+        )
+
+    @property
     def prefer_cross_layer_blocks(self) -> bool:
         # Opt in to uniform cross-layer KV cache allocation when block-major layout is
         # enabled. Satisfies `KVConnectorModelRunnerMixin.use_uniform_kv_cache()`
@@ -868,6 +991,19 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             return 0
         bound = self._max_loadable_tokens(request, num_local_tokens)
         return hit if bound is None else min(hit, bound)
+
+    def arrival_touch(self, request: Request, num_local_tokens: int) -> int:
+        """VLLM_TPU_ARRIVAL_TOUCH: when ``request`` enters the waiting queue,
+        refresh the host-tier entries a load past ``num_local_tokens`` would
+        read for it now (``host_tier_hit_tokens``), so its wait does not age
+        them. Nothing is loaded and no pin is kept. Returns the keys refreshed
+        (0 when the tier holds nothing past the local hit)."""
+        hit = self.host_tier_hit_tokens(request, num_local_tokens)
+        if hit <= 0:
+            return 0
+        scheduler = self.connector_scheduler
+        assert scheduler is not None
+        return scheduler.touch_load_keys(request, num_local_tokens, num_local_tokens + hit)
 
     def reset_cache(self) -> bool | None:
         # External cache reset is unsupported by the Raiden store. Report

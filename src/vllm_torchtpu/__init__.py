@@ -17,8 +17,13 @@
 import vllm_torchtpu.env_override  # noqa: F401
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.offload import tier_x2_sidecar as _tier_x2_sidecar
 
 logger = init_logger(__name__)
+
+# TIER-X2 sidecars (the global registry on the prefill pod, the host store nodes on the decode
+# pod): inert unless the pod's environment names them (Q38X2_REGISTRY_PORT / Q38X2_NODES).
+_tier_x2_sidecar.maybe_start()
 
 
 def _patch_vllm_compact_mamba_streaming_input() -> None:
@@ -722,6 +727,11 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
     patch_executor_for_pp_handoff(kwargs.get("vllm_config"))
     patch_engine_core_for_pp_chunks(kwargs.get("vllm_config"))
     patch_engine_core_for_lazy_push(kwargs.get("vllm_config"))
+    # q38 SV-KNOB GIL-SW (core/host_knobs.py): wraps scheduler.schedule once the engine
+    # core is built; a no-op unless VLLM_TPU_HOST_SWITCH_US / VLLM_TPU_HOST_AB_PERIOD_MS is set.
+    from vllm_torchtpu.core.host_knobs import patch_engine_core_for_host_knobs
+
+    patch_engine_core_for_host_knobs()
 
     from vllm.v1.engine.core import EngineCoreProc
 

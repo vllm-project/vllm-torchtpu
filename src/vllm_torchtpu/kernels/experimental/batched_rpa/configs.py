@@ -196,10 +196,21 @@ class ServingConfigs:
     # window and scope masks. Query j of a sequence attends key t when bit j of
     # the word for t is set. Each lane-tile fetches its words beside its KV.
     selection_mask: bool = False
+    # With selection_mask: the words arrive as [sequences * tiles_per_seq,
+    # bkv // 128, 1, 128], each 128-word row its own (1, 128) tile, which is a
+    # flat int32 array's layout; [..., bkv // 128, 128] pads each lane-tile's
+    # rows to eight sublanes, so a flat source needs a relayout.
+    selection_word_rows: bool = False
     # Read-only decode (skip_kv_update): the kernel neither writes nor returns
     # the KV cache, so a caller can run it inside a conditional that must not
     # return the cache (XLA would copy the whole pool).
     read_only_cache: bool = False
+    # q38 RPAD-HIGHROWS F4 (read-only decode): the page table arrives in HBM,
+    # not as a scalar prefetch, and the kernel copies into SMEM only each
+    # sequence's KV tiles below its kv_lens (whole tiles) plus the table's first
+    # tile (idle lanes index it). The fetch reads no other entry, so every page
+    # id it reads is the one the full copy holds: same DMAs, same results.
+    page_table_prefix: bool = False
 
     @property
     def max_decode_bkv_p_new(self) -> int:
@@ -501,9 +512,11 @@ class RpaConfigs:
         )
 
     @property
-    def selection_vmem_shape(self) -> tuple[int, int, int]:
+    def selection_vmem_shape(self) -> tuple[int, ...]:
         """One lane-tile's selection words per batch lane, 128 tokens a row."""
         num_lanes = pltpu.get_tpu_info().num_lanes
+        if self.serve.selection_word_rows:
+            return (self.block.batch_size, self.block.bkv_sz // num_lanes, 1, num_lanes)
         return (self.block.batch_size, self.block.bkv_sz // num_lanes, num_lanes)
 
     @property

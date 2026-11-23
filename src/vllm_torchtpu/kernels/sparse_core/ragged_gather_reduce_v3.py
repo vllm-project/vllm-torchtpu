@@ -555,7 +555,102 @@ def unpack_rows(x: jax.Array) -> jax.Array:
     return jnp.concatenate([hi.astype(jnp.bfloat16), lo.astype(jnp.bfloat16)], axis=-1)
 
 
-@functools.partial(jax.jit, static_argnames=("reduce_group_size", "x_packed"))
+def blocks_presorted(valid_blocks: jax.Array) -> jax.Array:
+    """Whether every block's valid routes form a prefix (valid never rises along
+    a block); then the stable partition argsort(~valid) is the identity."""
+    v8 = valid_blocks.astype(jnp.int8)
+    return jnp.all(v8[:, 1:] <= v8[:, :-1])
+
+
+def build_route_metadata(
+    indices: jax.Array,
+    topk_weights: jax.Array,
+    valid_rows_mask: jax.Array,
+    reduce_group_size: int,
+    num_row_partitions: int,
+    presorted: str = "",
+) -> tuple[jax.Array, jax.Array, jax.Array, int, int]:
+    """The destination-major kernel's route metadata (pure JAX; see ragged_gather_reduce).
+
+    Returns (route_metadata, route_weights, route_counts, padded_num_tokens, num_blocks)."""
+    num_tokens = indices.size // reduce_group_size
+    token_alignment = num_row_partitions * _TOKEN_BLOCK
+    padded_num_tokens = _align_to(num_tokens, token_alignment)
+    token_padding = padded_num_tokens - num_tokens
+
+    indices_2d = indices.reshape(num_tokens, reduce_group_size)
+    weights_2d = topk_weights.reshape(num_tokens, reduce_group_size)
+    valid_2d = valid_rows_mask.reshape(num_tokens, reduce_group_size)
+    if token_padding:
+        indices_2d = jnp.pad(indices_2d, ((0, token_padding), (0, 0)))
+        weights_2d = jnp.pad(weights_2d, ((0, token_padding), (0, 0)))
+        valid_2d = jnp.pad(valid_2d, ((0, token_padding), (0, 0)))
+
+    num_blocks = padded_num_tokens // _TOKEN_BLOCK
+    metadata_block_size = _TOKEN_BLOCK * reduce_group_size
+    indices_blocks = indices_2d.reshape(num_blocks, metadata_block_size)
+    valid_blocks = valid_2d.reshape(num_blocks, metadata_block_size)
+    destination_template = jnp.repeat(
+        jnp.arange(_TOKEN_BLOCK, dtype=jnp.int32), reduce_group_size
+    )
+    destination_blocks = jnp.broadcast_to(destination_template, indices_blocks.shape)
+
+    weights_blocks = weights_2d.reshape(num_blocks, metadata_block_size)
+
+    # A stable boolean partition keeps routes for each destination adjacent
+    # while placing the exact valid prefix first in every destination block.
+    def partition(valid_b, indices_b, destinations_b, weights_b):
+        route_order = jnp.argsort(~valid_b, axis=1, stable=True)
+        return tuple(
+            jnp.take_along_axis(a, route_order, axis=1)
+            for a in (valid_b, indices_b, destinations_b, weights_b)
+        )
+
+    operands = (valid_blocks, indices_blocks, destination_blocks, weights_blocks)
+    if presorted == "static":
+        compact_valid, route_indices, route_destinations, route_weights = operands
+    elif presorted == "check":
+        compact_valid, route_indices, route_destinations, route_weights = jax.lax.cond(
+            blocks_presorted(valid_blocks), lambda *a: tuple(a), partition, *operands
+        )
+    elif presorted:
+        raise ValueError(f"presorted must be '', 'static' or 'check', got {presorted!r}")
+    else:
+        compact_valid, route_indices, route_destinations, route_weights = partition(*operands)
+    route_indices = jnp.where(compact_valid, route_indices, 0).astype(jnp.int32)
+    route_destinations = jnp.where(compact_valid, route_destinations, 0).astype(
+        jnp.int32
+    )
+    route_metadata = jnp.bitwise_or(
+        route_indices,
+        jnp.left_shift(route_destinations, _ROUTE_INDEX_BITS),
+    ).reshape(-1)
+    route_weights = jnp.where(compact_valid, route_weights, 0).reshape(-1)
+    route_weights = route_weights.astype(jnp.float32)
+    route_counts = jnp.sum(valid_blocks, axis=1, dtype=jnp.int32)
+    paired_destinations = route_destinations[:, : 2 * _TOKEN_BLOCK].reshape(
+        num_blocks, _TOKEN_BLOCK, 2
+    )
+    fixed_two_route_blocks = jnp.logical_and(
+        route_counts == 2 * _TOKEN_BLOCK,
+        jnp.all(paired_destinations[:, :, 0] == paired_destinations[:, :, 1], axis=1),
+    )
+    # Count 128 selects the adjacent-pair fast path in the SC kernel. If a full
+    # two-route block does not actually have adjacent equal destinations,
+    # expose one already-zero compacted slot as a harmless sentinel so the block
+    # takes the generic path instead.
+    needs_zero_weight_sentinel = jnp.logical_and(
+        route_counts == 2 * _TOKEN_BLOCK,
+        jnp.logical_not(fixed_two_route_blocks),
+    )
+    route_counts += needs_zero_weight_sentinel.astype(jnp.int32)
+    route_counts = jnp.broadcast_to(
+        route_counts[:, None], (num_blocks, _TOKEN_SUBCHUNK)
+    ).reshape(-1)
+    return route_metadata, route_weights, route_counts, padded_num_tokens, num_blocks
+
+
+@functools.partial(jax.jit, static_argnames=("reduce_group_size", "x_packed", "presorted"))
 def ragged_gather_reduce(
     x: jax.Array,
     indices: jax.Array,
@@ -563,11 +658,20 @@ def ragged_gather_reduce(
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
     x_packed: bool = False,
+    presorted: str = "",
 ) -> jax.Array:
     """Destination-major prototype for MoE output combine.
 
     x_packed: x is gmm_v2's pack_out layout, uint32 [rows, hidden / 2]; the
-    result is the same bf16 [tokens, hidden] as for the unpacked rows."""
+    result is the same bf16 [tokens, hidden] as for the unpacked rows.
+
+    presorted (TPU_MOE_COMBINE_PRESORTED): skip the per-block stable partition
+    sort when every destination block's valid routes already form a prefix, as
+    they do when every real route is valid (the padded tokens trail). Then the
+    stable argsort(~valid) is the identity and the metadata is the same.
+    "static": the caller guarantees it (the EP combine on all-valid routes);
+    "check": a runtime test selects the identity or the sort (lax.cond).
+    "" sorts as before."""
     if x_packed:
         assert x.dtype == jnp.uint32, x.dtype
         hidden = 2 * x.shape[-1]
@@ -625,65 +729,9 @@ def ragged_gather_reduce(
         hidden_size, pltpu.get_tpu_info(), packed=x_packed
     )
 
-    token_alignment = num_row_partitions * _TOKEN_BLOCK
-    padded_num_tokens = _align_to(num_tokens, token_alignment)
-    token_padding = padded_num_tokens - num_tokens
-
-    indices_2d = indices.reshape(num_tokens, reduce_group_size)
-    weights_2d = topk_weights.reshape(num_tokens, reduce_group_size)
-    valid_2d = valid_rows_mask.reshape(num_tokens, reduce_group_size)
-    if token_padding:
-        indices_2d = jnp.pad(indices_2d, ((0, token_padding), (0, 0)))
-        weights_2d = jnp.pad(weights_2d, ((0, token_padding), (0, 0)))
-        valid_2d = jnp.pad(valid_2d, ((0, token_padding), (0, 0)))
-
-    num_blocks = padded_num_tokens // _TOKEN_BLOCK
-    metadata_block_size = _TOKEN_BLOCK * reduce_group_size
-    indices_blocks = indices_2d.reshape(num_blocks, metadata_block_size)
-    valid_blocks = valid_2d.reshape(num_blocks, metadata_block_size)
-    destination_template = jnp.repeat(
-        jnp.arange(_TOKEN_BLOCK, dtype=jnp.int32), reduce_group_size
+    route_metadata, route_weights, route_counts, padded_num_tokens, num_blocks = build_route_metadata(
+        indices, topk_weights, valid_rows_mask, reduce_group_size, num_row_partitions, presorted
     )
-    destination_blocks = jnp.broadcast_to(destination_template, indices_blocks.shape)
-
-    # A stable boolean partition keeps routes for each destination adjacent
-    # while placing the exact valid prefix first in every destination block.
-    route_order = jnp.argsort(~valid_blocks, axis=1, stable=True)
-    compact_valid = jnp.take_along_axis(valid_blocks, route_order, axis=1)
-    route_indices = jnp.take_along_axis(indices_blocks, route_order, axis=1)
-    route_destinations = jnp.take_along_axis(destination_blocks, route_order, axis=1)
-    weights_blocks = weights_2d.reshape(num_blocks, metadata_block_size)
-    route_weights = jnp.take_along_axis(weights_blocks, route_order, axis=1)
-    route_indices = jnp.where(compact_valid, route_indices, 0).astype(jnp.int32)
-    route_destinations = jnp.where(compact_valid, route_destinations, 0).astype(
-        jnp.int32
-    )
-    route_metadata = jnp.bitwise_or(
-        route_indices,
-        jnp.left_shift(route_destinations, _ROUTE_INDEX_BITS),
-    ).reshape(-1)
-    route_weights = jnp.where(compact_valid, route_weights, 0).reshape(-1)
-    route_weights = route_weights.astype(jnp.float32)
-    route_counts = jnp.sum(valid_blocks, axis=1, dtype=jnp.int32)
-    paired_destinations = route_destinations[:, : 2 * _TOKEN_BLOCK].reshape(
-        num_blocks, _TOKEN_BLOCK, 2
-    )
-    fixed_two_route_blocks = jnp.logical_and(
-        route_counts == 2 * _TOKEN_BLOCK,
-        jnp.all(paired_destinations[:, :, 0] == paired_destinations[:, :, 1], axis=1),
-    )
-    # Count 128 selects the adjacent-pair fast path in the SC kernel. If a full
-    # two-route block does not actually have adjacent equal destinations,
-    # expose one already-zero compacted slot as a harmless sentinel so the block
-    # takes the generic path instead.
-    needs_zero_weight_sentinel = jnp.logical_and(
-        route_counts == 2 * _TOKEN_BLOCK,
-        jnp.logical_not(fixed_two_route_blocks),
-    )
-    route_counts += needs_zero_weight_sentinel.astype(jnp.int32)
-    route_counts = jnp.broadcast_to(
-        route_counts[:, None], (num_blocks, _TOKEN_SUBCHUNK)
-    ).reshape(-1)
 
     col_size = hidden_size // num_column_partitions
     blocks_per_row_partition = num_blocks // num_row_partitions

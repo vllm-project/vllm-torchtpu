@@ -300,6 +300,9 @@ class InputConfigs:
     dtype: jnp.dtype
     has_bias: bool = False
     has_scale: bool = False
+    # lhs only: the lhs ref is the packed fp8 carrier (pack_fp8_rows) of rows
+    # of `dtype`; the kernel unpacks each tile instead of quantizing it.
+    packed_fp8: bool = False
 
     @property
     def should_unpack(self) -> bool:
@@ -381,12 +384,24 @@ def trace_scope(cfgs: "GmmConfigs", name: str, level: int):
     return jax.named_scope(name) if cfgs.trace_scopes >= level else contextlib.nullcontext()
 
 
+def lhs_tile_cols(cfgs: "GmmConfigs") -> int:
+    """Columns of one lhs tile as stored: tile_k, or the packed carrier's
+    words per row (a packed lhs has a single k tile)."""
+    if cfgs.lhs_cfgs.packed_fp8:
+        return lhs_packed_width(cfgs.dims.size_k)
+    return cfgs.tiles.tile_k
+
+
 class IndexMaps:
     """Index maps for GMM kernel."""
 
-    def __init__(self, metadata_ref: MetadataRef, cfgs: GmmConfigs):
+    def __init__(self, metadata_ref: MetadataRef, cfgs: GmmConfigs, out_row_block_offset=None):
         self.metadata_ref = metadata_ref
         self.cfgs = cfgs
+        # Output rows start this many sublane blocks into the output (gmm_mlp_v2
+        # out_row_offset): the lhs is read from row 0, the output is written at
+        # the offset. None keeps the kernel unchanged.
+        self.out_row_block_offset = out_row_block_offset
 
     def lhs_index_map(self, _: jax.Array, gm_id: jax.Array, k_id: jax.Array):
         m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
@@ -425,20 +440,22 @@ class IndexMaps:
         last_row_end = pl.cdiv(m_end, self.cfgs.dims.size_lhs_sublane)
         row_end = jnp.where(is_last_gm, last_row_end, capped_row_end)
         row_size = row_end - row_start
+        if self.out_row_block_offset is not None:
+            row_start = row_start + self.out_row_block_offset
 
         return (pl.ds(row_start, row_size), 0, n_id)
 
 
 def generate_block_specs(
-    metadata_ref: MetadataRef, cfgs: GmmConfigs
+    metadata_ref: MetadataRef, cfgs: GmmConfigs, out_row_block_offset=None
 ) -> tuple[tuple[pl.BlockSpec, WeightsRef], pl.BlockSpec]:
     """Generates block specs for the given lhs, rhs, and out refs."""
 
-    index_map = IndexMaps(metadata_ref, cfgs)
+    index_map = IndexMaps(metadata_ref, cfgs, out_row_block_offset)
     bounded_slice_gm = pl.BoundedSlice(cfgs.tiles.tile_m // cfgs.dims.size_lhs_sublane)
 
     lhs_block_spec = pl.BlockSpec(
-        (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_k),
+        (bounded_slice_gm, cfgs.dims.size_lhs_sublane, lhs_tile_cols(cfgs)),
         index_map.lhs_index_map,
     )
 
@@ -495,6 +512,129 @@ def unpack_halves(u: jax.Array) -> jax.Array:
     hi = lax.bitcast_convert_type(jnp.bitwise_and(u, jnp.uint32(0xFFFF0000)), jnp.float32)
     lo = lax.bitcast_convert_type(jnp.left_shift(u, jnp.uint32(16)), jnp.float32)
     return jnp.concatenate([hi.astype(jnp.bfloat16), lo.astype(jnp.bfloat16)], axis=-1)
+
+
+# Packed fp8 lhs rows (fused_moe_gmm's TPU_MOE_NONEP_GATHER=sc_fp8). The
+# routed rows reach the GMM already quantized, so the dispatch gather moves
+# 3,072 bytes per row instead of 5,120 (bf16). Each row of the f32 carrier
+# [m, k / 4 + LHS_PACK_PAD_WORDS] holds:
+#   word j < k / 4: the fp8 bytes of columns (j, j + k/4, j + k/2, j + 3k/4)
+#     as byte 3..0 (column-packed, so unpacking is four lane-aligned slabs);
+#   word k / 4 + b: the row's scale of lhs quant block b, as f32 (the scale is
+#     computed in the activation dtype and widened exactly);
+#   the remaining words: 0.
+# The rows are quantized by quantize_lhs_block, the same ops the kernel runs
+# per tile, so a GMM on packed rows multiplies exactly the values and scales it
+# would compute from the bf16 rows. The carrier is f32 because the SparseCore
+# gather takes 32-bit rows as f32; no float op touches the packed words.
+LHS_QUANT_BLOCK = 512  # lhs quantization block (columns per scale)
+LHS_PACK_PAD_WORDS = 128
+
+
+def lhs_packed_width(size_k: int) -> int:
+    """Words per packed fp8 lhs row (carrier columns) for k columns."""
+    return size_k // 4 + LHS_PACK_PAD_WORDS
+
+
+def quantize_lhs_block(block_lhs: jax.Array, lhs_q_dtype: jnp.dtype):
+    """gmm_v2's lhs quantization of one k block: per row, scale = max|x| / the
+    quant dtype's max (in x's dtype), values = x * (1 / scale) cast to the quant
+    dtype (0 where the scale is 0). Shared by the kernel's own per-tile
+    quantization and pack_fp8_rows, so both run the same ops."""
+    if jnp.issubdtype(lhs_q_dtype, jnp.floating):
+        dtype_max = float(jnp.finfo(lhs_q_dtype).max)
+    else:
+        dtype_max = float(jnp.iinfo(lhs_q_dtype).max)
+    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
+    block_scale = block_abs_max / dtype_max
+
+    # If block_scale=0, it will cause division by zero and return either
+    # NaN or Inf. Since this can cause numeric issue when downcasting to
+    # quantized value, we convert them into 0.
+    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
+    # Convert lhs into quantized dtype.
+    return (block_lhs * block_scale_inv).astype(lhs_q_dtype), block_scale
+
+
+def pack_fp8_words(q: jax.Array) -> jax.Array:
+    """fp8 [r, k] -> uint32 [r, k/4]: word j = byte(j) << 24 | byte(j + k/4) << 16
+    | byte(j + k/2) << 8 | byte(j + 3k/4)."""
+    w = q.shape[1] // 4
+    b = lax.bitcast_convert_type(q, jnp.uint8).astype(jnp.uint32)
+    return (
+        (b[:, :w] << 24) | (b[:, w : 2 * w] << 16) | (b[:, 2 * w : 3 * w] << 8) | b[:, 3 * w :]
+    )
+
+
+def unpack_fp8_words(u: jax.Array, q_dtype: jnp.dtype) -> jax.Array:
+    """Inverse of pack_fp8_words: uint32 [r, w] -> q_dtype [r, 4w] (exact)."""
+    parts = [
+        lax.bitcast_convert_type((u >> s).astype(jnp.uint8), q_dtype) for s in (24, 16, 8, 0)
+    ]
+    return jnp.concatenate(parts, axis=1)
+
+
+def unpack_fp8_rows(rows: jax.Array, size_k: int, q_dtype: jnp.dtype):
+    """Packed carrier rows [r, lhs_packed_width(size_k)] -> (values [r, size_k]
+    in q_dtype, scales [r, size_k // LHS_QUANT_BLOCK] in f32)."""
+    w = size_k // 4
+    u = lax.bitcast_convert_type(rows[:, :w], jnp.uint32)
+    return unpack_fp8_words(u, q_dtype), rows[:, w : w + size_k // LHS_QUANT_BLOCK]
+
+
+@functools.partial(jax.jit, static_argnames=("q_dtype", "tile_rows"))
+def pack_fp8_rows(
+    x: jax.Array, q_dtype: jnp.dtype = jnp.float8_e4m3fn, tile_rows: int = 256
+) -> jax.Array:
+    """x [m, k] -> the packed carrier [m, lhs_packed_width(k)] f32 (see above).
+
+    Quantizes each row once with quantize_lhs_block per LHS_QUANT_BLOCK
+    columns, as gmm_v2 does per lhs tile; a row's result depends on that row
+    alone, so rows can be quantized before a gather and gathered afterwards."""
+    m, k = x.shape
+    if k % LHS_QUANT_BLOCK or k % (4 * pltpu.get_tpu_info().num_lanes):
+        raise ValueError(f"pack_fp8_rows needs k a multiple of {LHS_QUANT_BLOCK} and 512 ({k=})")
+    nblk = k // LHS_QUANT_BLOCK
+    w = k // 4
+    if nblk > LHS_PACK_PAD_WORDS or jax.dtypes.itemsize_bits(x.dtype) > 32:
+        raise ValueError(f"pack_fp8_rows: {nblk=} scales or {x.dtype=} do not fit the carrier")
+    sub = max(
+        pltpu.get_tpu_info().get_sublane_tiling(jnp.dtype(q_dtype)),
+        pltpu.get_tpu_info().get_sublane_tiling(x.dtype),
+    )
+    # The largest row tile <= tile_rows (halving) that divides the sublane-
+    # aligned row count, so served step sizes (e.g. 3,200) need no padding copy.
+    ma = align_to(m, sub)
+    tr = min(tile_rows, ma)
+    while tr > sub and ma % tr:
+        tr //= 2
+    tr = max(tr, sub)
+    mp = align_to(m, tr)
+    xp = jnp.pad(x, ((0, mp - m), (0, 0))) if mp != m else x
+
+    def kernel(x_ref, o_ref):
+        xv = x_ref[...]
+        qs, ss = [], []
+        for b in range(nblk):
+            q, s = quantize_lhs_block(xv[:, b * LHS_QUANT_BLOCK : (b + 1) * LHS_QUANT_BLOCK], q_dtype)
+            qs.append(q)
+            ss.append(s.astype(jnp.float32))
+        o_ref[:, :w] = lax.bitcast_convert_type(
+            pack_fp8_words(jnp.concatenate(qs, axis=1)), jnp.float32
+        )
+        o_ref[:, w:] = jnp.concatenate(
+            ss + [jnp.zeros((tr, LHS_PACK_PAD_WORDS - nblk), jnp.float32)], axis=1
+        )
+
+    out = pl.pallas_call(
+        kernel,
+        grid=(mp // tr,),
+        in_specs=[pl.BlockSpec((tr, k), lambda i: (i, 0))],
+        out_specs=pl.BlockSpec((tr, lhs_packed_width(k)), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((mp, lhs_packed_width(k)), jnp.float32),
+        name=f"pack_fp8_rows-m_{mp}-k_{k}-tr_{tr}",
+    )(xp)
+    return out[:m] if mp != m else out
 
 
 # Define kernels.
@@ -560,12 +700,18 @@ def inner_kernel(
         mxu_size = tpu_info.mxu_column_size
 
         # Step 1: Input pre-processing.
+        lhs_cols = lhs_tile_cols(cfgs)
         if sub_mode:
-            tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[
-                pl.ds(row_start, bucket_m)
-            ]
+            tiled_lhs = tiled_lhs_ref.reshape(-1, lhs_cols)[pl.ds(row_start, bucket_m)]
         else:
-            tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
+            tiled_lhs = tiled_lhs_ref.reshape(-1, lhs_cols)[:bucket_m]
+        # Packed fp8 rows (pack_fp8_rows): the values and block scales that
+        # quantize_block would compute from the bf16 rows.
+        packed_scale = None
+        if cfgs.lhs_cfgs.packed_fp8:
+            tiled_lhs, packed_scale = unpack_fp8_rows(
+                tiled_lhs, cfgs.dims.size_k, cast(jnp.dtype, cfgs.lhs_cfgs.quant_dtype)
+            )
         split = isinstance(tiled_rhs_ref, SplitWeightsRef)
         # A split tile is read block by block from its parts (rhs_block below).
         tiled_rhs = None if split else tiled_rhs_ref.get_weight()
@@ -649,15 +795,12 @@ def inner_kernel(
                 with trace_scope(cfgs, "gmm_quant", 2):
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
                     block_lhs = tiled_lhs[:, start_k:end_k]
-                    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
-                    block_scale = block_abs_max / dtype_max
-
-                    # If block_scale=0, it will cause division by zero and return either
-                    # NaN or Inf. Since this can cause numeric issue when downcasting to
-                    # quantized value, we convert them into 0.
-                    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-                    # Convert lhs into quantized dtype.
-                    return (block_lhs * block_scale_inv).astype(lhs_q_dtype), block_scale
+                    if packed_scale is not None:
+                        # Already quantized (pack_fp8_rows); the f32 scale is
+                        # the activation-dtype scale widened exactly.
+                        b = start_k // q_block_size
+                        return block_lhs, packed_scale[:, b : b + 1]
+                    return quantize_lhs_block(block_lhs, lhs_q_dtype)
 
             hoisted = (
                 {k: quantize_block(k) for k in range(0, cfgs.tiles.tile_k, q_block_size)}
@@ -1345,6 +1488,7 @@ def fused_mlp_kernel_main(
     *,
     cfgs1: GmmConfigs,
     cfgs2: GmmConfigs,
+    out_row_offset: bool = False,
 ):
     """Fused expert MLP (gmm1 + activation + gmm2) in one pipeline: each step
     loads one expert's w1 and w2 and runs both GMMs on that visit's rows.
@@ -1366,7 +1510,10 @@ def fused_mlp_kernel_main(
     else:
         num_gm = fill_metadata(lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs1)
     (lhs_spec, rhs1_spec), _ = generate_block_specs(metadata_ref, cfgs1)
-    (_, rhs2_spec), out_spec = generate_block_specs(metadata_ref, cfgs2)
+    # out_row_offset: group_offset_ref = [group offset, output row offset] (the
+    # offset a multiple of the sublane block; gmm_mlp_v2 checks it).
+    out_off = group_offset_ref[1] // cfgs2.dims.size_lhs_sublane if out_row_offset else None
+    (_, rhs2_spec), out_spec = generate_block_specs(metadata_ref, cfgs2, out_off)
     rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs1.out_size_n :], rhs1_ref)
     rhs1_ref = FusedWeightsRef(gate=rhs1_ref, up=rhs_up_ref)
     rhs1_spec = FusedWeightsRef(gate=rhs1_spec, up=rhs1_spec)
@@ -1390,6 +1537,15 @@ def fused_mlp_kernel_main(
     )
 
 
+def _fused_mlp_kernel_out_alias(gs_ref, goff_ref, lhs_ref, rhs1_ref, rhs2_ref, out_alias_ref, out_ref, *scratch,
+                                cfgs1, cfgs2):
+    """fused_mlp_kernel_main writing into an aliased output buffer at a row offset
+    (gmm_mlp_v2 out_buffer / out_row_offset); out_alias_ref is out_ref's buffer."""
+    del out_alias_ref
+    fused_mlp_kernel_main(gs_ref, goff_ref, lhs_ref, rhs1_ref, rhs2_ref, out_ref, *scratch,
+                          cfgs1=cfgs1, cfgs2=cfgs2, out_row_offset=True)
+
+
 def gmm_mlp_v2(
     lhs: jax.Array,  # [size_m, size_k]
     w1: jax.Array,  # [size_group, size_k, 2 * inter]
@@ -1405,19 +1561,28 @@ def gmm_mlp_v2(
     pack_out: bool = False,
     vmem_limit_bytes: int | None = None,
     experts_per_visit: int = 1,
+    lhs_packed_dtype: jnp.dtype | None = None,
+    out_buffer: jax.Array | None = None,
+    out_row_offset: jax.Array | int | None = None,
 ) -> jax.Array:
     """gmm_v2(gmm_v2(lhs, w1, fuse_act), w2) as one kernel (fused expert MLP),
     bitwise equal to the two calls with zero_initialize=False and the same
     tilings, at experts_per_visit E in (1, 2, 4) (both stages visit the same E
     consecutive experts per step; the two-kernel path is bitwise across E).
-    Non-EP only (group offset 0)."""
+    Non-EP only (group offset 0). lhs_packed_dtype as gmm_v2's (gmm1 reads the
+    packed fp8 carrier of rows of that dtype).
+
+    out_buffer / out_row_offset (both or neither): write the result rows into
+    out_buffer (aliased, updated in place) starting at row out_row_offset, a
+    traced or static multiple of the lhs sublane block; lhs rows are still read
+    from row 0. Rows outside the visited groups' rows keep out_buffer's values.
+    Used to assemble one output from expert-range chunks (fused_moe_gmm chunked
+    dispatch). Each row is computed by the same ops as without the offset."""
     tile_info1 = calculate_tiling if tile_info1 is None else tile_info1
     tile_info2 = calculate_tiling if tile_info2 is None else tile_info2
     size_m = lhs.shape[0]
-    sub = _get_lhs_sublane_size(lhs.dtype, size_m)
-    padded = align_to(size_m, sub)
-    if padded != size_m:
-        lhs = jnp.pad(lhs, ((0, padded - size_m), (0, 0)))
+    lhs, lhs_desc = _packed_lhs_desc(lhs, lhs_packed_dtype)
+    sub = _get_lhs_sublane_size(lhs_desc.dtype, size_m)
     group_offset = jnp.array([0], dtype=jnp.int32)
     if vmem_limit_bytes is None:
         vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
@@ -1425,11 +1590,12 @@ def gmm_mlp_v2(
     common = dict(vmem_limit_bytes=vmem_limit_bytes, acc_dtype=None, maybe_quantize_lhs=True,
                   zero_initialize=False, rhs_quant_dtype=rhs_quant_dtype,
                   experts_per_visit=experts_per_visit)
-    cfgs1 = make_gmm_configs(lhs, w1, w1_scale, None, group_sizes, group_offset, tile_info=tile_info1,
-                             out_dtype=lhs.dtype, fuse_act=fuse_act, **common)
-    act_shape = jax.ShapeDtypeStruct((lhs.shape[0], inter), lhs.dtype)
+    cfgs1 = make_gmm_configs(lhs_desc, w1, w1_scale, None, group_sizes, group_offset, tile_info=tile_info1,
+                             out_dtype=lhs_desc.dtype, fuse_act=fuse_act,
+                             lhs_packed_fp8=lhs_packed_dtype is not None, **common)
+    act_shape = jax.ShapeDtypeStruct((lhs.shape[0], inter), lhs_desc.dtype)
     cfgs2 = make_gmm_configs(act_shape, w2, w2_scale, None, group_sizes, group_offset, tile_info=tile_info2,
-                             out_dtype=lhs.dtype, pack_out=pack_out, **common)
+                             out_dtype=lhs_desc.dtype, pack_out=pack_out, **common)
     t1, t2 = cfgs1.tiles, cfgs2.tiles
     if not (
         t1.tile_m == t2.tile_m
@@ -1471,28 +1637,50 @@ def gmm_mlp_v2(
         ),
     ]
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    out = pl.pallas_call(
-        functools.partial(fused_mlp_kernel_main, cfgs1=cfgs1, cfgs2=cfgs2),
-        out_shape=out_init,
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            in_specs=[
-                hbm,
-                WeightsRef(weight=hbm, scale=hbm if w1_scale is not None else None, bias=None),
-                WeightsRef(weight=hbm, scale=hbm if w2_scale is not None else None, bias=None),
-            ],
-            out_specs=hbm,
-            scratch_shapes=scratch_shapes,
-        ),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit_bytes, disable_bounds_checks=True),
-        name="gmm_mlp_v2-" + get_scope_name(cfgs1) + "+" + get_scope_name(cfgs2),
-    )(
+    in_specs = [
+        hbm,
+        WeightsRef(weight=hbm, scale=hbm if w1_scale is not None else None, bias=None),
+        WeightsRef(weight=hbm, scale=hbm if w2_scale is not None else None, bias=None),
+    ]
+    args = [
         group_sizes,
         group_offset,
         lhs,
         WeightsRef(weight=w1, scale=w1_scale, bias=None),
         WeightsRef(weight=w2, scale=w2_scale, bias=None),
-    )
+    ]
+    kernel = functools.partial(fused_mlp_kernel_main, cfgs1=cfgs1, cfgs2=cfgs2)
+    name = "gmm_mlp_v2-" + get_scope_name(cfgs1) + "+" + get_scope_name(cfgs2)
+    aliases = {}
+    if (out_buffer is None) != (out_row_offset is None):
+        raise ValueError("gmm_mlp_v2: out_buffer and out_row_offset go together")
+    if out_buffer is not None:
+        if size_m % sub:
+            raise ValueError(f"gmm_mlp_v2: out_buffer needs size_m ({size_m}) a multiple of {sub} (no row padding)")
+        if out_buffer.shape != out_init.shape or out_buffer.dtype != out_init.dtype:
+            raise ValueError(f"gmm_mlp_v2: out_buffer {out_buffer.shape} {out_buffer.dtype} != {out_init}")
+        if isinstance(out_row_offset, int) and out_row_offset % sub:
+            raise ValueError(f"gmm_mlp_v2: out_row_offset {out_row_offset} is not a multiple of {sub}")
+        # [group offset, output row offset]: the kernel reads the second.
+        args[1] = jnp.concatenate([group_offset, jnp.reshape(out_row_offset, (1,)).astype(jnp.int32)])
+        in_specs.append(hbm)
+        args.append(out_buffer)
+        aliases = {len(jax.tree.leaves(args)) - 1: 0}
+        kernel = functools.partial(_fused_mlp_kernel_out_alias, cfgs1=cfgs1, cfgs2=cfgs2)
+        name += "+oo"
+    out = pl.pallas_call(
+        kernel,
+        out_shape=out_init,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=in_specs,
+            out_specs=hbm,
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit_bytes, disable_bounds_checks=True),
+        input_output_aliases=aliases,
+        name=name,
+    )(*args)
     return out[:size_m, : cfgs2.out_size_n // 2 if pack_out else cfgs2.out_size_n]
 
 
@@ -1724,6 +1912,7 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
     window += f"-rs{cfgs.rhs_split}" if cfgs.rhs_split > 1 else ""
     window += f"-ev{cfgs.experts_per_visit}" if cfgs.experts_per_visit > 1 else ""
     window += "-po" if cfgs.pack_out else ""
+    window += "-lp" if cfgs.lhs_cfgs.packed_fp8 else ""
     return (
         f"gmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
         f"-n_{dims.size_n}{window}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
@@ -1753,8 +1942,13 @@ def make_gmm_configs(
     rhs_split: int = 1,
     experts_per_visit: int = 1,
     pack_out: bool = False,
+    lhs_packed_fp8: bool = False,
 ):
-    """Fills the GMM config for the GMM kernel."""
+    """Fills the GMM config for the GMM kernel.
+
+    lhs_packed_fp8: `lhs` describes the logical rows ([size_m, size_k] in the
+    activation dtype) whose packed fp8 carrier (pack_fp8_rows) the kernel reads.
+    """
 
     packing_factor = get_packing_factor(rhs.dtype, rhs_quant_dtype)
 
@@ -1825,9 +2019,22 @@ def make_gmm_configs(
         # scale value. Since this operation is very memory intensive, we use a
         # block size that is small enough to minimize memory overhead but large
         # enough to minimize compute overhead of quantization.
-        quant_block_size=512,
+        quant_block_size=LHS_QUANT_BLOCK,
         dtype=lhs.dtype,
+        packed_fp8=lhs_packed_fp8,
     )
+    if lhs_packed_fp8 and (
+        lhs_q_dtype is None
+        or jnp.dtype(lhs_q_dtype) != jnp.dtype(jnp.float8_e4m3fn)
+        or not jnp.issubdtype(lhs.dtype, jnp.floating)
+        or dims.size_k % LHS_QUANT_BLOCK
+        or (dims.size_k // 4) % pltpu.get_tpu_info().num_lanes
+    ):
+        raise ValueError(
+            f"a packed fp8 lhs needs the kernel to quantize its lhs to float8_e4m3fn "
+            f"({lhs_q_dtype=}), a float activation dtype ({lhs.dtype=}) and size_k a "
+            f"multiple of {LHS_QUANT_BLOCK} ({dims=})"
+        )
 
     if out_dtype is None:
         out_dtype = lhs.dtype
@@ -1845,6 +2052,9 @@ def make_gmm_configs(
         tiles = tile_info
     else:
         tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+
+    if lhs_packed_fp8 and tiles.tile_k < dims.size_k:
+        raise ValueError(f"a packed fp8 lhs needs a single k tile ({dims=}, {tiles=})")
 
     if rhs_split > 1:
         # Parts must hold whole mxu-wide column chunks: the inner loop reads one
@@ -1946,6 +2156,27 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
     return ret
 
 
+def _packed_lhs_desc(lhs: jax.Array, lhs_packed_dtype: jnp.dtype | None):
+    """(lhs padded to its sublane block, the logical rows' description for
+    make_gmm_configs). For a packed fp8 carrier the rows are [m, size_k] of
+    lhs_packed_dtype and the sublane block is theirs, so the kernel visits the
+    same row groups as on the unpacked rows."""
+    size_m = lhs.shape[0]
+    if lhs_packed_dtype is None:
+        row_dtype = lhs.dtype
+    else:
+        row_dtype = jnp.dtype(lhs_packed_dtype)
+        size_k = (lhs.shape[1] - LHS_PACK_PAD_WORDS) * 4
+        if lhs.dtype != jnp.float32 or size_k <= 0 or lhs_packed_width(size_k) != lhs.shape[1]:
+            raise ValueError(f"not a packed fp8 carrier: {lhs.shape=} {lhs.dtype=}")
+    padded = align_to(size_m, _get_lhs_sublane_size(row_dtype, size_m))
+    if padded != size_m:
+        lhs = jnp.pad(lhs, ((0, padded - size_m), (0, 0)))
+    if lhs_packed_dtype is None:
+        return lhs, lhs
+    return lhs, jax.ShapeDtypeStruct((padded, size_k), row_dtype)
+
+
 @jax.jit(
     static_argnames=[
         "tile_info",
@@ -1963,6 +2194,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "rhs_split",
         "experts_per_visit",
         "pack_out",
+        "lhs_packed_dtype",
     ]
 )
 def gmm_v2(
@@ -1988,6 +2220,7 @@ def gmm_v2(
     rhs_split: int = 1,
     experts_per_visit: int = 1,
     pack_out: bool = False,
+    lhs_packed_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -2032,6 +2265,11 @@ def gmm_v2(
         pack_out: Return uint32 [size_m, size_n / 2] holding the bf16 output
             column pairs (j, j + size_n / 2) as one word (pack_halves), so each
             row is whole 32-bit words. Same values (unpack_halves recovers them).
+        lhs_packed_dtype: None, or the activation dtype of rows packed by
+            pack_fp8_rows: lhs is then that f32 carrier [size_m,
+            lhs_packed_width(size_k)] and the kernel uses its fp8 values and
+            scales instead of quantizing each tile. Needs fp8 lhs quantization
+            and a single k tile. Same output as gmm_v2 on the unpacked rows.
 
     Returns:
         Output of shape [size_m, size_n] ([size_m, width] with n_window).
@@ -2043,10 +2281,7 @@ def gmm_v2(
     # The extra rows sit past every group, so they add no work, and they are
     # sliced back off the output below.
     size_m = lhs.shape[0]
-    size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
-    padded_size_m = align_to(size_m, size_lhs_sublane)
-    if padded_size_m != size_m:
-        lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+    lhs, lhs_desc = _packed_lhs_desc(lhs, lhs_packed_dtype)
 
     if group_offset is None:
         group_offset = jnp.array([0], dtype=jnp.int32)
@@ -2058,7 +2293,7 @@ def gmm_v2(
         vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
     cfgs = make_gmm_configs(
-        lhs,
+        lhs_desc,
         rhs,
         rhs_scale,
         rhs_bias,
@@ -2078,6 +2313,7 @@ def gmm_v2(
         rhs_split=rhs_split,
         experts_per_visit=experts_per_visit,
         pack_out=pack_out,
+        lhs_packed_fp8=lhs_packed_dtype is not None,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles

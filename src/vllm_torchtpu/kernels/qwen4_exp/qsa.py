@@ -87,9 +87,16 @@ def produce(
 ):
     head_dim, index_dim = nq.shape[0], niq.shape[0]
     qgate = qgate.reshape(len(qgate), qgate.shape[1] // (2 * head_dim), 2 * head_dim)
-    q = main_rope(
-        gemma_norm(qgate[..., :head_dim], nq, norm_eps), positions, trig, rotary_dim
-    )
+    gate = None
+    if envs.VLLM_TPU_QSA_PREFILL_QPREP_FUSED:  # q38 PSTEP-QSAGLUE: prefill rows only (>= 1024); NOT bitwise (norm order)
+        from vllm_torchtpu.kernels.qwen4_exp import qsa_qprep_fused as qpf
+
+        if qpf.applies(len(qgate), qgate.shape[1], head_dim, rotary_dim):
+            q, gate = qpf.fused_qprep(qgate, nq, positions, trig, norm_eps, rotary_dim)
+    if gate is None:
+        q = main_rope(
+            gemma_norm(qgate[..., :head_dim], nq, norm_eps), positions, trig, rotary_dim
+        )
     key, value = produce_kv(key, value, nk, positions, trig, norm_eps, rotary_dim)
     index_heads = index_qk.shape[1] // index_dim - 1
     iq = index_rope(
@@ -102,7 +109,8 @@ def produce(
         trig,
         rotary_dim,
     )
-    return q, key, value, qgate[..., head_dim:], iq, index_qk[:, -index_dim:]
+    gate = qgate[..., head_dim:] if gate is None else gate
+    return q, key, value, gate, iq, index_qk[:, -index_dim:]
 
 
 def _token_metadata(count, starts, context, slots):

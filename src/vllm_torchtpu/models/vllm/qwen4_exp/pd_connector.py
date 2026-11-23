@@ -78,6 +78,41 @@ def sync_repack_on(now: float | None = None) -> bool:
     return bool(envs.QWEN4_EXP_PD_SYNC_REPACK)
 
 
+# q38 LAND-OVERLAP (QWEN4_EXP_PD_LANDX_DEFER_REPACK; HCDEC-LANDX q38-hcdec-landx
+# 9be68404d on the q38 tree, ported onto this tree by BLSTACK-LANDX). On a staged
+# decode the repack of a load that landed on every rank runs in start_load_kv,
+# before the forward of the step whose scheduler names it, because that step also
+# admits the request. Its host work (plan, descriptor tables, dispatch: 4.38 ms per
+# load on TP rank 0 at c112 and 3.64 ms at c96 on the q38 engine, measured) sits on
+# the serial chain before the forward dispatch. With the key on, the scheduler
+# holds the load out of vLLM's finished_recving for one step and names it in
+# qwen_landx_repack_req_ids; every rank repacks it in submit_deferred_loads, after
+# the step's forward and sampling dispatch; the scheduler releases it at its next
+# update_connector_output, so the request is first scheduled one step later. Device
+# order (the repack enqueued before that later step's forward) keeps the request
+# reading its repacked pages; the staging quarantine already covers a repack
+# enqueued after the forward.
+_LANDX_STATS_EVERY = 2000  # worker steps between rank-0 'q38 LANDX rank0' lines
+_LANDX_SCHED_EVERY = 100  # landed loads between 'q38 LANDX sched' lines
+
+
+def landx_enabled() -> bool:
+    """QWEN4_EXP_PD_LANDX_DEFER_REPACK is set (read once, at connector build)."""
+    return bool(envs.QWEN4_EXP_PD_LANDX_DEFER_REPACK)
+
+
+def landx_refusals(sync_repack: bool, shared_compressed: bool) -> list[str]:
+    """Why QWEN4_EXP_PD_LANDX_DEFER_REPACK cannot run on this consumer (empty: it can)."""
+    why = []
+    if not sync_repack:
+        why.append("needs QWEN4_EXP_PD_SYNC_REPACK=1 on a staged consumer")
+    if int(envs.QWEN4_EXP_PD_SYNC_REPACK_AB_S) > 0:
+        why.append("not with QWEN4_EXP_PD_SYNC_REPACK_AB_S > 0")
+    if shared_compressed:
+        why.append("not with QWEN4_EXP_PD_SHARED_COMPRESSED (its landing runs TP all-gathers)")
+    return why
+
+
 # A hybrid pool's block IDs are only unique within a group, so vLLM rejects
 # invalid_block_ids for it; failed loads go back as request-level failures.
 _REQUEST_LEVEL_LOAD_FAILURES = "failed_recving" in getattr(
@@ -195,6 +230,13 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         from .pd_shared_compressed import enabled as _shared_enabled
 
         self._shared_compressed = self._sync_repack and _shared_enabled()
+        # q38 LAND-OVERLAP: on a consumer only; an unsupported setting is refused
+        # at build, never left as a silent no-op.
+        self._landx = landx_enabled() and not (transfer is not None and transfer.is_kv_producer)
+        if self._landx:
+            why = landx_refusals(self._sync_repack, self._shared_compressed)
+            if why:
+                raise ValueError("QWEN4_EXP_PD_LANDX_DEFER_REPACK is refused: " + "; ".join(why))
         self._load_requests: dict[str, Any] = {}
         self._qwen_divergent_hits = bool(cache.enable_prefix_caching) and os.environ.get(
             "QWEN4_EXP_PD_DIVERGENT_HITS", "1"
@@ -286,6 +328,7 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         finished = set(connector_output.finished_recving or ())
         failed = set(getattr(connector_output, "failed_recving", None) or ())
         guard = self._guards_landing()
+        n0 = len(self._landed_on_all_ranks)
         for req_id in sorted(finished - failed):
             if guard and not self._still_waiting(req_id):
                 # Aborted while landing: naming it would repack (or gather)
@@ -298,6 +341,48 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
             self._failed_on_some_rank.append(req_id)
             if guard:
                 self._loads().pop(req_id, None)
+        if getattr(self, "_landx", False) or self.__dict__.get("_landx_named"):
+            self._landx_hold_and_release(connector_output, self._landed_on_all_ranks[n0:])
+
+    def _landx_hold_and_release(self, connector_output: Any, landed_now: list[str]) -> None:
+        """q38 LAND-OVERLAP, scheduler side (vLLM v0.31 calls update_connector_output
+        before it reads finished_recving, scheduler._update_from_kv_xfer_finished).
+        Hold: the loads that landed on every rank in this output leave
+        finished_recving, so vLLM keeps their requests in WAITING_FOR_REMOTE_KVS;
+        the next build_connector_meta names them for the deferred repack. Release:
+        the loads an earlier build_connector_meta named (kept or dropped) go back
+        into finished_recving, so their requests are scheduled (or, if aborted
+        meanwhile, their blocks freed) from the next schedule() on: after the step
+        whose workers repack them."""
+        st = self.__dict__
+        held = st.setdefault("_landx_held", set())
+        release = st.get("_landx_named") or []
+        hold = list(landed_now) if getattr(self, "_landx", False) else []
+        if not hold and not release:
+            return
+        recving = set(connector_output.finished_recving or ())
+        c = self._landx_sched_counts()
+        if hold:
+            recving.difference_update(hold)
+            held.update(hold)
+            c["held"] += len(hold)
+        if release:
+            recving.update(release)
+            st["_landx_named"] = []
+            c["released"] += len(release)
+        connector_output.finished_recving = recving or None
+        before = c["held"] - len(hold)
+        if hold and (before == 0 or before // _LANDX_SCHED_EVERY != c["held"] // _LANDX_SCHED_EVERY):
+            # The first hold, then every _LANDX_SCHED_EVERY held loads.
+            logger.info(
+                "q38 LANDX sched held=%d released=%d sync=%d dropped=%d holding=%d",
+                c["held"], c["released"], c["sync"], c["dropped"], len(held),
+            )
+
+    def _landx_sched_counts(self) -> dict[str, int]:
+        return self.__dict__.setdefault(
+            "_landx_sched", dict(held=0, released=0, sync=0, dropped=0)
+        )
 
     def _still_waiting(self, req_id: str) -> bool:
         """A recorded load whose request still waits for it. A load with no
@@ -313,6 +398,7 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         self._record_producer_hits(scheduler_output)
         if self._sync_repack:
             named = self._landed_on_all_ranks
+            named_all = list(named)
             if self._guards_landing():
                 loads = self._loads()
                 keep = []
@@ -326,7 +412,24 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
                 # Requests that finished before landing never get named.
                 for req_id in [r for r, q in loads.items() if q.is_finished()]:
                     loads.pop(req_id)
+            # q38 LAND-OVERLAP: held loads are repacked after this step's forward;
+            # every held load named here (kept or dropped by the guard) is released
+            # at the next update_connector_output.
+            deferred: list[str] = []
+            held = self.__dict__.get("_landx_held")
+            if held:
+                deferred = [r for r in named if r in held]
+                named = [r for r in named if r not in held]
+                released = [r for r in named_all if r in held]
+                held.difference_update(released)
+                self.__dict__.setdefault("_landx_named", []).extend(released)
+                c = self._landx_sched_counts()
+                c["dropped"] += len(released) - len(deferred)
+            if getattr(self, "_landx", False):
+                self._landx_sched_counts()["sync"] += len(named)
             meta.qwen_repack_req_ids = named
+            if deferred or getattr(self, "_landx", False):
+                meta.qwen_landx_repack_req_ids = deferred
             meta.qwen_drop_req_ids = self._failed_on_some_rank
             self._landed_on_all_ranks, self._failed_on_some_rank = [], []
         return meta
@@ -339,6 +442,16 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
             # Staging pages released QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS steps
             # ago are free again, before this step's repacks and admission.
             advance()
+        if self._sync_repack and worker is not None and (
+            getattr(self, "_landx", False)
+            or hasattr(self._connector_metadata, "qwen_landx_repack_req_ids")
+            or self.__dict__.get("_landx_pending")
+        ):
+            # q38 LAND-OVERLAP: keep this step's deferred names for
+            # submit_deferred_loads (and flush names an earlier step left behind).
+            # A worker obeys the scheduler's metadata (the field exists only when
+            # the scheduler runs the key), whatever its own copy of the key reads.
+            self._landx_take(worker)
         if self._sync_repack and worker is not None:
             # Before this step's forward, so a request admitted in this step
             # reads its repacked pages.
@@ -364,13 +477,72 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         submit-time failure still reaches the same step's output. Every rank
         reaches both call sites in the same order, so the submit's CPU-group
         collectives stay paired across ranks.
+
+        q38 LAND-OVERLAP: the loads this step's metadata named for the deferred
+        repack are repacked here first, on every rank at the same point, so their
+        programs follow this step's forward on the device.
         """
+        if self.__dict__.get("_landx_pending"):
+            self._landx_run()
         pending = self._deferred_load_submit
         if pending is None:
             return
         self._deferred_load_submit = None
         args, kwargs = pending
         super().start_load_kv(*args, **kwargs)
+
+    # --- q38 LAND-OVERLAP, worker side -----------------------------------------
+
+    def _landx_stats(self) -> dict[str, int]:
+        return self.__dict__.setdefault(
+            "_landx_counts",
+            dict(steps=0, deferred_steps=0, deferred_loads=0, post_loads=0,
+                 fallback_loads=0, presync_loads=0, post_ns=0),
+        )
+
+    def _landx_take(self, worker) -> None:
+        """start_load_kv, before the pre-forward repack: keep this step's deferred
+        names for submit_deferred_loads. Names a previous step left behind (its
+        post-forward point never ran) are repacked now, before this step's forward:
+        their requests are released only after the step that named them, so they
+        cannot be in an earlier forward, and this keeps them ahead of any later one."""
+        st = self.__dict__
+        c = self._landx_stats()
+        left = st.get("_landx_pending")
+        if left:
+            st["_landx_pending"] = None
+            worker.repack_landed(left)
+            c["fallback_loads"] += len(left)
+        meta = self._connector_metadata
+        names = list(getattr(meta, "qwen_landx_repack_req_ids", None) or ())
+        st["_landx_pending"] = names or None
+        c["steps"] += 1
+        c["presync_loads"] += len(getattr(meta, "qwen_repack_req_ids", None) or ())
+        if names:
+            c["deferred_steps"] += 1
+            c["deferred_loads"] += len(names)
+        if c["steps"] % _LANDX_STATS_EVERY == 0 and getattr(worker, "tp_rank", 0) == 0:
+            logger.info(
+                "q38 LANDX rank0 steps=%d deferred_steps=%d share=%.4f deferred_loads=%d "
+                "post_loads=%d fallback_loads=%d presync_loads=%d post_repack_ms_mean=%.3f",
+                c["steps"], c["deferred_steps"], c["deferred_steps"] / c["steps"],
+                c["deferred_loads"], c["post_loads"], c["fallback_loads"],
+                c["presync_loads"], c["post_ns"] / max(1, c["post_loads"]) / 1e6,
+            )
+
+    def _landx_run(self) -> bool:
+        """submit_deferred_loads: this step's deferred repacks, once."""
+        names = self.__dict__.get("_landx_pending")
+        worker = self.connector_worker
+        if not names or worker is None:
+            return False
+        self._landx_pending = None
+        t0 = time.perf_counter_ns()
+        worker.repack_landed(names)
+        c = self._landx_stats()
+        c["post_loads"] += len(names)
+        c["post_ns"] += time.perf_counter_ns() - t0
+        return True
 
     @staticmethod
     def _build_stage3_transfer_groups(

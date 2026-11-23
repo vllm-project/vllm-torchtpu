@@ -48,6 +48,13 @@ Scope: the local host DRAM tier. The flag is refused with a global registry, a p
 store group, a storage tier or a shared-memory host pool: the classes register different
 region counts by stage, and Raiden's transfer spec for those paths wants equal worker
 geometry.
+
+TIER-X2 (``VLLM_TPU_OFFLOAD_TIER_X2=1``) lifts the first two refusals: ``shard_plan`` cuts
+each class into shards of one per-worker region count, each shard store joins the global
+registry under its own pool group and key namespace, Raiden's evict sweep demotes its cold
+blocks to that group's store nodes on another host, and a miss reads them back with
+``read_remote``. A group then belongs to several classes (the shards of one) and every key
+goes to each.
 """
 
 from __future__ import annotations
@@ -99,6 +106,20 @@ SERVED_CLASSES = {
     "ple": (1, 1),
 }
 
+# TIER-X2 (VLLM_TPU_OFFLOAD_TIER_X2): the served classes split into shards of one
+# per-worker geometry (``shard_plan``), regions and workers as above.
+SERVED_SHARDS = {
+    "main.r1": (4, 4),
+    "main.r2": (8, 4),
+    "keys.r1": (4, 4),
+    "keys.r2": (8, 4),
+    "gdn-ab.r1": (4, 4),
+    "gdn-ab.r2": (8, 4),
+    "gdn-c.r1": (4, 4),
+    "gdn-c.r2": (8, 4),
+    "ple": (1, 1),
+}
+
 
 @dataclass(frozen=True)
 class TierClass:
@@ -116,10 +137,24 @@ class TierClass:
     # Device rows a scheduler page spans in this class's registered views (1: whole-page
     # rows).
     rows_per_page: int = 1
+    # TIER-X2: the class this shard was cut from (``shard_plan``); None for a whole
+    # class.
+    shard_of: str | None = None
 
     @property
     def per_checkpoint(self) -> bool:
         return self.kind in STATE_KINDS
+
+    @property
+    def workers(self) -> tuple[int, ...]:
+        """The workers (indices into ``worker_regions``) that register with this class."""
+        return tuple(i for i, regions in enumerate(self.worker_regions) if regions)
+
+    def node_id(self, worker: int) -> int:
+        """The worker's dense node id in this class's store: its position among the
+        workers that register. Raiden's transfer spec and a store node pair workers by
+        node id over the range [0, workers)."""
+        return self.workers.index(worker)
 
     @property
     def num_workers(self) -> int:
@@ -279,6 +314,64 @@ def build_tier_plan(
     return plan
 
 
+def shard_plan(plan: TierPlan) -> TierPlan:
+    """TIER-X2: each class cut into shards whose workers all register the same number
+    of regions, renumbered in order.
+
+    Raiden's transfer spec (the one a store node mirrors to receive a pool group's
+    demoted blocks) describes every worker of a store with one block geometry, and a
+    class's workers register 1 or 2 regions by stage. A shard keeps the class's kind,
+    groups, row and capacity, and only its own workers' regions; a class whose workers
+    already agree stays whole under its own name. Shards of one class hold the same
+    keys, so every key goes to each of them (``TieredOffloadingManager``), and the
+    shard sizes sum to the class's.
+    """
+    shards: list[TierClass] = []
+    for tier_class in plan.classes:
+        by_count: dict[int, list[int]] = {}
+        for worker in tier_class.workers:
+            by_count.setdefault(len(tier_class.worker_regions[worker]), []).append(worker)
+        for count, workers in sorted(by_count.items()):
+            keep = set(workers)
+            shards.append(
+                TierClass(
+                    name=(
+                        f"{tier_class.name}.r{count}"
+                        if len(by_count) > 1
+                        else tier_class.name
+                    ),
+                    index=len(shards),
+                    kind=tier_class.kind,
+                    groups=tier_class.groups,
+                    worker_regions=tuple(
+                        regions if i in keep else ()
+                        for i, regions in enumerate(tier_class.worker_regions)
+                    ),
+                    row_bytes=tier_class.row_bytes,
+                    rows_per_page=tier_class.rows_per_page,
+                    shard_of=tier_class.name,
+                )
+            )
+    return TierPlan(
+        classes=tuple(shards),
+        budget=plan.budget,
+        ratio=plan.ratio,
+        token_blocks=plan.token_blocks,
+        checkpoints=plan.checkpoints,
+    )
+
+
+def check_served_shards(plan: TierPlan) -> None:
+    """Holds a sharded plan to the reviewed served table."""
+    got = {c.name: (c.num_regions, c.num_workers) for c in plan.classes}
+    if got != SERVED_SHARDS:
+        raise ValueError(
+            "VLLM_TPU_OFFLOAD_TIER_X2: the model's plan gives shards (regions, "
+            f"workers) {got}, not the served prefill's {SERVED_SHARDS}. The shards are "
+            "sized and validated for that geometry only."
+        )
+
+
 def check_served_plan(plan: TierPlan) -> None:
     """Holds the derived classes to the reviewed served table."""
     got = {c.name: (c.num_regions, c.num_workers) for c in plan.classes}
@@ -321,7 +414,14 @@ class TieredOffloadingManager(OffloadingManager):
         self._plan = plan
         self._classes = plan.classes
         self._managers = list(managers)
-        self._class_of_group = {g: c.index for c in plan.classes for g in c.groups}
+        # Group -> the classes holding it, in class order: one class, or under TIER-X2
+        # the shards of one class (every key goes to each).
+        classes_of_group: dict[int, list[int]] = {}
+        for c in plan.classes:
+            for g in c.groups:
+                classes_of_group.setdefault(g, []).append(c.index)
+        self._classes_of_group = {g: tuple(cs) for g, cs in classes_of_group.items()}
+        self._class_of_group = {g: cs[0] for g, cs in self._classes_of_group.items()}
         self._parents: dict[int, _Parent] = {}
         self._finished: list[FinishedJob] = []
         self._load_keys = [0] * len(managers)
@@ -344,36 +444,45 @@ class TieredOffloadingManager(OffloadingManager):
 
     # -- routing ------------------------------------------------------------
 
-    def class_of(self, key: OffloadKey) -> int:
+    def classes_of(self, key: OffloadKey) -> tuple[int, ...]:
+        """The classes holding the key's group: one, or a class's shards (TIER-X2)."""
         group = get_offload_group_idx(key)
         try:
-            return self._class_of_group[group]
+            return self._classes_of_group[group]
         except KeyError:
             raise KeyError(
                 f"host tier classes: group {group} belongs to no class"
             ) from None
 
+    def class_of(self, key: OffloadKey) -> int:
+        """The key's class (the first shard of it under TIER-X2)."""
+        return self.classes_of(key)[0]
+
     def _split(
         self, keys: Iterable[OffloadKey], device_block_ids: Sequence[int] | None = None
     ) -> dict[int, tuple[list[OffloadKey], list[int]]]:
-        """Keys (and their block IDs) by class, each class keeping the job's order."""
+        """Keys (and their block IDs) by class, each class keeping the job's order. A
+        sharded class's key goes to every shard."""
         parts: dict[int, tuple[list[OffloadKey], list[int]]] = {}
         for i, key in enumerate(keys):
-            ks, ids = parts.setdefault(self.class_of(key), ([], []))
-            ks.append(key)
-            if device_block_ids is not None:
-                ids.append(device_block_ids[i])
+            for c in self.classes_of(key):
+                ks, ids = parts.setdefault(c, ([], []))
+                ks.append(key)
+                if device_block_ids is not None:
+                    ids.append(device_block_ids[i])
         return dict(sorted(parts.items()))
 
-    def _runs(self, keys: Sequence[OffloadKey]) -> list[tuple[int, list[OffloadKey]]]:
-        """Maximal runs of consecutive keys of one class, in order."""
-        runs: list[tuple[int, list[OffloadKey]]] = []
+    def _runs(
+        self, keys: Sequence[OffloadKey]
+    ) -> list[tuple[tuple[int, ...], list[OffloadKey]]]:
+        """Maximal runs of consecutive keys held by the same classes, in order."""
+        runs: list[tuple[tuple[int, ...], list[OffloadKey]]] = []
         for key in keys:
-            c = self.class_of(key)
-            if runs and runs[-1][0] == c:
+            cs = self.classes_of(key)
+            if runs and runs[-1][0] == cs:
                 runs[-1][1].append(key)
             else:
-                runs.append((c, [key]))
+                runs.append((cs, [key]))
         return runs
 
     # -- OffloadingManager contract -------------------------------------------
@@ -382,12 +491,24 @@ class TieredOffloadingManager(OffloadingManager):
         return RequestOffloadingContext()
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        return self._managers[self.class_of(key)].lookup(key, req_context)
+        classes = self.classes_of(key)
+        if len(classes) == 1:
+            return self._managers[classes[0]].lookup(key, req_context)
+        # A sharded class (TIER-X2) holds the key only if every shard does; the first
+        # shard that misses ends the walk, so the rest are not asked.
+        pending = False
+        for c in classes:
+            result = self._managers[c].lookup(key, req_context)
+            if result == LookupResult.MISS:
+                return LookupResult.MISS
+            if result == LookupResult.HIT_PENDING:
+                pending = True
+        return LookupResult.HIT_PENDING if pending else LookupResult.HIT
 
     def host_resident_prefix(self, keys: list[OffloadKey]) -> int:
         resident = 0
-        for c, run in self._runs(list(keys)):
-            found = self._managers[c].host_resident_prefix(run)
+        for cs, run in self._runs(list(keys)):
+            found = min(self._managers[c].host_resident_prefix(run) for c in cs)
             resident += found
             if found < len(run):
                 break
@@ -396,6 +517,11 @@ class TieredOffloadingManager(OffloadingManager):
     def touch(self, keys, req_context: ReqContext) -> None:
         for c, (ks, _) in self._split(keys).items():
             self._managers[c].touch(ks, req_context)
+
+    def touch_run(self, keys) -> int:
+        """``RaidenOffloadingManager.touch_run`` per class (each key to its class, or
+        to every shard of it); returns the sub-hashes moved over all classes."""
+        return sum(self._managers[c].touch_run(ks) for c, (ks, _) in self._split(keys).items())
 
     def prepare_load(self, keys, req_context: ReqContext) -> LoadStoreSpec:
         keys = list(keys)
@@ -436,6 +562,28 @@ class TieredOffloadingManager(OffloadingManager):
         for manager in self._managers:
             manager.set_victim_mode(on)
 
+    def set_exclusive_restore(self, on: bool) -> None:
+        """Each class evicts its part of a load only once the whole parent
+        succeeded: a failed parent recomputes every block, so no class may have
+        dropped its host copy (``RaidenOffloadingManager.excl_resolve``)."""
+        for manager in self._managers:
+            manager.set_exclusive_restore(on, defer=True)
+        self.__dict__["_excl"] = bool(on)
+
+    def excl_stats(self) -> list[dict[str, int]]:
+        return [manager.excl_stats() for manager in self._managers]
+
+    def x2_stats(self) -> dict[str, int] | None:
+        """TIER-X2 counters summed over the shard stores; None when TIER-X2 is off."""
+        on = [m for m in self._managers if m.__dict__.get("_x2", False)]
+        if not on:
+            return None
+        total = dict.fromkeys(raiden_store.X2_COUNTERS, 0)
+        for manager in on:
+            for name, value in manager.x2_stats().items():
+                total[name] += value
+        return total
+
     def prepare_victim_store(self, keys) -> list[OffloadKey]:
         keys = list(keys)
         chosen: set[OffloadKey] = set()
@@ -468,9 +616,30 @@ class TieredOffloadingManager(OffloadingManager):
     def _sub_hashes(self, key: OffloadKey) -> list[bytes]:
         return self._managers[self.class_of(key)]._sub_hashes(key)
 
-    def _class_of_sub_hash(self, sub_hash: bytes) -> int:
+    def _classes_of_sub_hash(self, sub_hash: bytes) -> tuple[int, ...]:
         group = int.from_bytes(sub_hash[-8:-4], "big", signed=False)
-        return self._class_of_group[group]
+        return self._classes_of_group[group]
+
+    def _class_of_sub_hash(self, sub_hash: bytes) -> int:
+        return self._classes_of_sub_hash(sub_hash)[0]
+
+    def _shard_probe(self, classes: tuple[int, ...], run: list[bytes]) -> list:
+        """A run of the first shard's sub-hashes, found only where every shard holds
+        it (each shard keys its entries under its own namespace)."""
+        first = self._managers[classes[0]]
+        found = first._probe(run)
+        for c in classes[1:]:
+            if not found:
+                break
+            manager = self._managers[c]
+            theirs = []
+            for sub_hash in run[: len(found)]:
+                parsed = first._sub_hash_to_offload_key(sub_hash)
+                assert parsed is not None, sub_hash
+                key, sub_idx = parsed
+                theirs.append(manager._sub_hashes(key)[sub_idx])
+            found = found[: len(manager._probe(theirs))]
+        return found
 
     def _probe(
         self, sub_hashes: list[bytes], *, enable_global: bool = False
@@ -481,10 +650,14 @@ class TieredOffloadingManager(OffloadingManager):
         for i, sub_hash in enumerate(sub_hashes):
             run.append(sub_hash)
             last = i + 1 == len(sub_hashes)
-            if last or self._class_of_sub_hash(
+            if last or self._classes_of_sub_hash(
                 sub_hashes[i + 1]
-            ) != self._class_of_sub_hash(sub_hash):
-                found = self._managers[self._class_of_sub_hash(sub_hash)]._probe(run)
+            ) != self._classes_of_sub_hash(sub_hash):
+                classes = self._classes_of_sub_hash(sub_hash)
+                if len(classes) == 1:
+                    found = self._managers[classes[0]]._probe(run)
+                else:
+                    found = self._shard_probe(classes, run)
                 out.extend(found)
                 if len(found) < len(run):
                     break
@@ -588,14 +761,18 @@ class TieredOffloadingManager(OffloadingManager):
         if parent.waiting:
             return
         del self._parents[finished.job_id]
+        if parent.op == AdmissionOp.LOAD and self.__dict__.get("_excl", False):
+            for manager in self._managers:
+                manager.excl_resolve(finished.job_id, not parent.failed)
         if (
             self._check is not None
             and parent.op == AdmissionOp.LOAD
             and not parent.failed
         ):
             self._check[1].extend(
-                (self._classes[self.class_of(k)].name, bytes(k), b)
+                (self._classes[c].name, bytes(k), b)
                 for k, b in zip(parent.keys, parent.device_block_ids)
+                for c in self.classes_of(k)
             )
         self._finished.append(
             FinishedJob(
@@ -659,7 +836,9 @@ class TieredOffloadingManager(OffloadingManager):
 
     def bytes_of_keys(self, keys: Sequence[OffloadKey]) -> int:
         """Host bytes behind ``keys``, each at its class's entry size."""
-        return sum(self._classes[self.class_of(k)].bytes_per_entry for k in keys)
+        return sum(
+            self._classes[c].bytes_per_entry for k in keys for c in self.classes_of(k)
+        )
 
     def telemetry_line(self, now: float | None = None) -> str:
         """One line of per-class tier state.
@@ -688,6 +867,11 @@ class TieredOffloadingManager(OffloadingManager):
                 f"stored={stored} evicted={evicted}{rate} "
                 f"oldest_stored_at={stamp} oldest_age_s={age} "
                 f"load_keys={self._load_keys[c.index]}"
+                + (
+                    f" discarded={self._managers[c.index].excl_stats()['discarded']}"
+                    if self.__dict__.get("_excl", False)
+                    else ""
+                )
             )
         self._telemetry_last = (now, [(s[1], s[2]) for s in stats])
         return " ".join(parts)
