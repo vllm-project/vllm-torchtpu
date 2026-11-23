@@ -62,7 +62,7 @@ def events(monkeypatch):
             assert self.ready, "The store consumer must wait for copy readiness"
             self.synchronized = True
 
-    monkeypatch.setattr(kv_save_nan_check, "TpuEvent", Event)
+    monkeypatch.setattr(kv_save_nan_check, "Event", Event)
     return events
 
 

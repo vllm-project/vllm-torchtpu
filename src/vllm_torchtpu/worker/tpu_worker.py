@@ -27,7 +27,7 @@ import torch
 import torch.profiler
 import torch_tpu  # noqa: F401
 from torch.compiler._cache import CacheArtifactManager
-from torch_tpu._internal.profiler import TpuProfilerConfig
+from torch.tpu.profiler import TpuProfilerConfig
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
