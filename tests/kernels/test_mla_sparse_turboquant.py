@@ -224,3 +224,97 @@ def test_sparse_mla_attention_interface_prerotated():
     out_unrot = run(ql_nope, False)
     out_rot = run(tq.rotate(ql_nope, hadamard).astype(ql_nope.dtype), True)
     assert _cos(out_unrot, tq.rotate(out_rot, hadamard)).min() > 0.999
+
+
+# The arguments `sparse_mla_attention_dcp` passes on each rank: a capped top-k
+# (TPU_DCP_MLA_TOPK_CAP=512, chunk 256) with an in-kernel overflow pass, an LSE
+# for the cross-rank merge (lane-dense with split q), and a per-token live
+# width set by how much of the token's top-k this rank owns.
+DCP_TOPK = 2048
+DCP_CAP = 512
+DCP_CAP_CHUNK = 256
+# Per-token live widths on one rank: a single entry, odd, just under / at /
+# just over the cap, and well past it (the overflow pass).
+DCP_KV_LENS = (1, 37, 511, 512, 513, 700, 1200, 2048)
+
+
+def _masked_reference(p, latent_rows, k_scale, kv_lens, *, mask=True):
+    """f32 dequantize-then-attend: (output [T, H, 512], lse [T, H])."""
+    k = jnp.concatenate(
+        [latent_rows.astype(jnp.float32), p["k_pe"].astype(jnp.float32) * k_scale], -1
+    )[jnp.maximum(p["topk"], 0)]
+    s = jnp.einsum("thd,tkd->thk", p["q"].astype(jnp.float32), k) * SM_SCALE
+    if mask:
+        live = jnp.arange(s.shape[-1])[None, :] < jnp.asarray(kv_lens)[:, None]
+        s = jnp.where(live[:, None, :], s, -jnp.inf)
+    lse = jax.nn.logsumexp(s, axis=-1)
+    out = jnp.einsum("thk,tkd->thd", jax.nn.softmax(s, -1), k)[..., :NOPE_DIM]
+    return out, lse
+
+
+@pytest.mark.parametrize("heads", [8, 64], ids=["h8", "h64"])
+@pytest.mark.parametrize("split_q", [True, False], ids=["split_q", "concat_q"])
+def test_dcp_rank_call_matches_dequantized_reference(heads, split_q):
+    """One DCP rank's kernel call (capped top-k + overflow pass, LSE out,
+    k_scale != 1, skewed per-token live widths) against an f32 dequantized
+    reference, for both the output and the LSE; plus two negative controls
+    the comparison must catch."""
+    _skip_if_not_tpu()
+    k_scale = 0.75
+    rng = np.random.default_rng(7)
+    tokens = 2 * len(DCP_KV_LENS)
+    p = _build(rng, query_tokens=tokens, topk=DCP_TOPK, k_scale=k_scale)
+    p["q"] = jnp.asarray(
+        rng.normal(size=(tokens, heads, NOPE_DIM + ROPE_DIM)), jnp.bfloat16
+    )
+    kv_lens = np.array(DCP_KV_LENS * 2, np.int32)
+    live = np.arange(DCP_TOPK)[None, :] < kv_lens[:, None]
+    p["topk"] = jnp.where(jnp.asarray(live), p["topk"], -1)
+
+    hadamard = jnp.asarray(p["tables"].hadamard)
+    q_nope = tq.rotate(p["q"][..., :NOPE_DIM], hadamard).astype(jnp.bfloat16)
+    if split_q:
+        q, kw = q_nope, dict(q_pe=p["q"][..., NOPE_DIM:], lse_lane_dense=True)
+    else:
+        q, kw = jnp.concatenate([q_nope, p["q"][..., NOPE_DIM:]], -1), {}
+    out, lse = jax.block_until_ready(
+        sparse_mla.sparse_ragged_paged_attention(
+            q,
+            p["nope"],
+            p["rope"],
+            p["topk"],
+            p["page_table"],
+            p["cu_q_lens"],
+            p["distribution"],
+            sm_scale=SM_SCALE,
+            k_scale=k_scale,
+            return_lse=True,
+            cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+            turboquant=True,
+            topk_cap=DCP_CAP,
+            gather_and_attention_chunk_size=DCP_CAP_CHUNK,
+            **kw,
+        )
+    )
+    lse = jnp.reshape(lse, (tokens, heads))
+    assert not bool(jnp.isnan(out).any()) and not bool(jnp.isnan(lse).any())
+    out = tq.rotate(out[..., :NOPE_DIM], hadamard)
+
+    codes, _ = tq.quantize_mla_latent(p["latent"], p["tables"])
+    norm = p["rope_row"][:, tq.MLA_TQ_NORM_BYTE_OFFSET :]
+    dequant = tq.dequant_mla_latent_ref(codes, norm, p["tables"])
+    ref_out, ref_lse = _masked_reference(p, dequant, k_scale, kv_lens)
+    lse_err = np.abs(np.asarray(lse) - np.asarray(ref_lse))
+    assert _cos(out, ref_out).min() > 0.995
+    assert lse_err.max() < 0.25 and lse_err.mean() < 0.05, (
+        lse_err.max(),
+        lse_err.mean(),
+    )
+
+    # Negative controls: the same comparisons must fail when the reference
+    # drops the latent norms (output) or ignores the -1 tail (LSE).
+    unit = dequant / jnp.linalg.norm(dequant, axis=-1, keepdims=True)
+    bad_out, _ = _masked_reference(p, unit, k_scale, kv_lens)
+    assert _cos(out, bad_out).min() <= 0.995
+    _, bad_lse = _masked_reference(p, dequant, k_scale, kv_lens, mask=False)
+    assert np.abs(np.asarray(lse) - np.asarray(bad_lse)).max() >= 0.25
