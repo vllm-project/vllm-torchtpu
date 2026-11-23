@@ -442,6 +442,90 @@ class SparseMLAScatterTest(parameterized.TestCase):
         # Ownership is a partition: every valid token on exactly one rank.
         self.assertEqual(written, inp["num_tokens"])
 
+    @parameterized.named_parameters(
+        dict(
+            testcase_name=f"d{dcp_size}_i{interleave_size}",
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+        for dcp_size, interleave_size in ((2, 4), (4, 8), (8, 16))
+    )
+    def test_dcp_update_turboquant_rows_match_the_jnp_writer(
+        self, dcp_size, interleave_size
+    ):
+        """TurboQuant rows through `update_sparse_mla_kv_cache_dcp` on every rank
+        equal the jnp twin: 256-B NoPE codes (two tokens per 512-B SparseCore
+        row) and 66-B RoPE rows (fp8 `k_pe` + the bf16 norm), over two steps
+        whose boundary splits row pairs, so a half-row write must keep the
+        row-mate an earlier step wrote."""
+        from vllm_torchtpu.layers.core import turboquant as tq
+
+        rng = np.random.default_rng(3)
+        num_seqs, num_pages = 4, 64
+        # Odd first step: each sequence's second step starts on the second half
+        # of a NoPE row whose first half the first step wrote.
+        steps = (37, 27)
+        nope_spec = SparseMLAKVCacheSpec.create(
+            KVCacheType.NOPE,
+            KVCacheLayout.SPARSECORE,
+            num_pages,
+            PAGE_SIZE,
+            tq.MLA_TQ_NOPE_BYTES,
+            KV_PACKING,
+        )
+        rope_spec = SparseMLAKVCacheSpec.create(
+            KVCacheType.ROPE,
+            KVCacheLayout.SPARSECORE,
+            num_pages,
+            PAGE_SIZE,
+            ROPE_DIM + 2,
+            KV_PACKING,
+        )
+        block_tables = jnp.asarray(rng.permutation(num_pages)[:num_seqs], jnp.int32)
+        step_args = []
+        done = 0
+        for n in steps:
+            tokens = num_seqs * n
+            step_args.append(
+                (
+                    jnp.asarray(
+                        rng.integers(0, 256, (tokens, tq.MLA_TQ_NOPE_BYTES)), jnp.uint8
+                    ),
+                    jnp.asarray(
+                        rng.integers(0, 256, (tokens, ROPE_DIM + 2)), jnp.uint8
+                    ),
+                    jnp.full((num_seqs,), done + n, jnp.int32),
+                    block_tables,
+                    jnp.arange(0, tokens + 1, n, dtype=jnp.int32),
+                )
+            )
+            done += n
+        kwargs = dict(
+            nope_spec=nope_spec,
+            rope_spec=rope_spec,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+        for rank in range(dcp_size):
+            got = (
+                jnp.zeros(nope_spec.shape, nope_spec.jax_dtype),
+                jnp.zeros(rope_spec.shape, rope_spec.jax_dtype),
+            )
+            want = got
+            for args in step_args:
+                got = kv_cache_utils.update_sparse_mla_kv_cache_dcp(
+                    *got, *args, jnp.int32(rank), **kwargs
+                )
+                want = kv_cache_utils.update_sparse_mla_kv_cache_dcp_jax(
+                    *want, *args, jnp.int32(rank), **kwargs
+                )
+            for name, g, w in zip(("nope", "rope"), got, want):
+                np.testing.assert_array_equal(
+                    np.asarray(g).view(np.uint8),
+                    np.asarray(w).view(np.uint8),
+                    err_msg=f"rank {rank}: TurboQuant {name} cache differs",
+                )
+
 
 class ScatterContractTest(parameterized.TestCase):
     """Host-side argument checks; no device work, so these run anywhere."""
