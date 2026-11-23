@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the Qwen3-VL video prompt patch."""
+"""Tests for the Qwen3-VL processor patches."""
 
 import numpy as np
 import pytest
+import torch
 from huggingface_hub import snapshot_download
 from vllm.config import ModelConfig
 from vllm.model_executor.models import qwen3_vl
@@ -68,3 +69,71 @@ def test_maybe_patch_qwen3_vl_video_prompt_expands_trained_format(
         "<0.2 seconds><|vision_start|><|vision_end|>"
         "<1.2 seconds><|vision_start|><|vision_end|>Hi"
     )
+
+
+def test_budget_inputs_match_upstream_metadata_padded():
+    """The budget-inputs hook gives upstream's encoder metadata in its first rows
+    and zeros after them (on the CPU, where both build the tables)."""
+    from types import MethodType, SimpleNamespace
+
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    tower_cls = qwen3_vl.Qwen3_VisionTransformer
+    grid_side, merge, hidden, rope = 8, 2, 32, 16
+    torch.manual_seed(0)
+    cache = torch.randn(64, rope)
+    visual = SimpleNamespace(
+        spatial_merge_size=merge,
+        num_grid_per_side=grid_side,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        pos_embed=torch.nn.Embedding(grid_side**2, hidden).to(torch.bfloat16),
+        rotary_pos_emb=SimpleNamespace(
+            cos_sin_cache=cache, get_cos_sin=lambda n: cache[:n].chunk(2, dim=-1)
+        ),
+        _rot_pos_ids_cache={},
+        attn_backend=AttentionBackendEnum.TORCH_SDPA,
+        hidden_size=hidden,
+        tp_size=1,
+        fp8_padded_hidden_size=None,
+    )
+    visual.fast_pos_embed_interpolate = lambda grid: torch.cat(
+        [
+            qwen3_vl.pos_embed_interpolate_native(
+                visual.pos_embed.weight, t, h, w, grid_side, merge, visual.dtype
+            )
+            for t, h, w in grid
+        ]
+    )
+    for name in ("rot_pos_ids", "rot_pos_emb", "prepare_encoder_metadata"):
+        setattr(visual, name, MethodType(getattr(tower_cls, name), visual))
+    model_cls = qwen3_vl.Qwen3VLForConditionalGeneration
+    model = SimpleNamespace(visual=visual)
+    for name in (
+        "get_input_modality",
+        "_get_grid_thw_by_modality",
+        "_get_pixel_values_by_modality",
+    ):
+        setattr(model, name, MethodType(getattr(model_cls, name), model))
+
+    grid = [[1, 4, 6], [2, 6, 2]]
+    rows = 64
+    n = sum(t * h * w for t, h, w in grid)
+    pixels = torch.randint(0, 256, (n, 12), dtype=torch.uint8)
+    template = {"pos_embeds": torch.zeros(rows, hidden, dtype=torch.bfloat16)}
+    got = qwen3_vl_patch._prepare_encoder_budget_inputs(
+        model,
+        {"pixel_values": pixels, "image_grid_thw": torch.tensor(grid)},
+        template,
+        max_batch_size=4,
+        max_frames_per_batch=8,
+    )
+    want = visual.prepare_encoder_metadata(grid, max_batch_size=4)
+    assert got["pixel_values"] is pixels
+    for key in ("pos_embeds", "rotary_pos_emb_cos", "rotary_pos_emb_sin"):
+        assert got[key].shape[0] == rows
+        assert torch.equal(got[key][:n], want[key].to(got[key].dtype)), key
+        assert not got[key][n:].any(), key
+    for key in ("cu_seqlens", "max_seqlen"):
+        assert torch.equal(torch.as_tensor(got[key]), torch.as_tensor(want[key])), key
+    assert got["sequence_lengths"] is None and want["sequence_lengths"] is None

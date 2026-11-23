@@ -34,6 +34,11 @@ from vllm_torchtpu.utils import align_to, synchronize_tensors
 logger = init_logger(__name__)
 
 
+# The optional model hook that builds a budget graph's inputs at the budget's
+# template shapes (see `MMEncoderManager._run_budget_graph`).
+BUDGET_INPUTS_HOOK = "prepare_encoder_budget_inputs"
+
+
 def _pack_encoder_items(
     tokens: list[int], budgets: list[int], max_items: int
 ) -> list[tuple[list[int], int]]:
@@ -145,6 +150,10 @@ class MMEncoderManager(EncoderCudaGraphManager):
                         for key, val in capture.values.items()
                     }
                 self.budget_templates[path] = templates
+        # Whether the model builds its inputs at each budget's shapes.
+        self.has_budget_inputs_hook = callable(
+            getattr(type(self.model), BUDGET_INPUTS_HOOK, None)
+        )
         # CUDA graph metadata owns CUDA replay buffers. Track XLA warmup
         # separately rather than storing template dicts in that upstream map.
         self.compiled_budgets: dict[str, set[int]] = {
@@ -221,6 +230,15 @@ class MMEncoderManager(EncoderCudaGraphManager):
         try:
             out = self._compiled_budget_forward(dict(template), path=path)
             synchronize_tensors(out, wait=True)
+            if self.has_budget_inputs_hook:
+                # The hook's device ops have the budget's shapes: compile them now.
+                values = getattr(self.model, BUDGET_INPUTS_HOOK)(
+                    None, template, self.max_batch_size, self.max_frames_per_batch
+                )
+                synchronize_tensors(
+                    [v for v in values.values() if isinstance(v, torch.Tensor)],
+                    wait=True,
+                )
             self.compiled_budgets[path].add(token_budget)
         except Exception as e:
             logger.warning(
@@ -252,13 +270,24 @@ class MMEncoderManager(EncoderCudaGraphManager):
             self.graph_misses += num_items
             return None
 
-        # Prepare dynamic inputs
-        replay = self.model.prepare_encoder_cudagraph_replay_buffers(
-            mm_kwargs, self.max_batch_size, self.max_frames_per_batch, path=path
-        )
+        # Prepare dynamic inputs. A model with the budget-inputs hook builds its
+        # layout-derived inputs at the template's shapes, so their device ops
+        # are the same for every item layout that fits the budget; upstream's
+        # replay buffers compile them for each new layout.
+        if self.has_budget_inputs_hook:
+            values = getattr(self.model, BUDGET_INPUTS_HOOK)(
+                mm_kwargs,
+                self.budget_templates[path][token_budget],
+                self.max_batch_size,
+                self.max_frames_per_batch,
+            )
+        else:
+            values = self.model.prepare_encoder_cudagraph_replay_buffers(
+                mm_kwargs, self.max_batch_size, self.max_frames_per_batch, path=path
+            ).values
 
         # Pad dynamic inputs to strictly match the static budget shape
-        padded = self._pad_to_template(replay.values, token_budget, path=path)
+        padded = self._pad_to_template(values, token_budget, path=path)
 
         # Run encoder with eager fallback on compilation/execution failure
         try:
