@@ -704,14 +704,12 @@ class BlockTableWalkPlan:
     - mamba_geom: (entry_index, num_blocks, block_size,
       prefill_ckpt_spec_blocks) per unified-pool mamba entry, the static
       argument of `_staged_walk_products`.
-    - mamba_entry_indices: the entry index of each mamba_geom item.
     - total: int32 elements of the flat staged buffer.
     """
 
     entries: tuple[tuple[int, Any, int], ...]
     table_geom: tuple[tuple[int, int, int], ...]
     mamba_geom: tuple[tuple[int, int, int, int | None], ...]
-    mamba_entry_indices: tuple[int, ...]
     total: int
 
     @property
@@ -719,9 +717,21 @@ class BlockTableWalkPlan:
         return tuple(gid for gid, _, _ in self.entries)
 
     @property
+    def mamba_entry_indices(self) -> tuple[int, ...]:
+        """The entry index of each mamba_geom item."""
+        return tuple(entry_index for entry_index, _, _, _ in self.mamba_geom)
+
+    @property
     def single_table(self) -> bool:
         """One group and no mamba derivation: the flat upload is the table."""
         return len(self.entries) == 1 and not self.mamba_geom
+
+
+def _walk_derives_unified_mamba(runner: Any, compact_slot_ids: bool) -> bool:
+    """Whether a walk derives unified-pool mamba indices from its staged
+    tables: with the unified layout, unless the builders get compact slot
+    ids, which win in build()."""
+    return runner._unified_kv_layout and not compact_slot_ids
 
 
 def block_table_walk_plan(
@@ -768,9 +778,10 @@ def block_table_walk_plan(
         offset += num_reqs_padded * target_num_blocks
 
     if unified_mamba is None:
-        unified_mamba = runner._unified_kv_layout and not runner._has_mamba_state
+        # The runner hands the builders compact slot ids exactly when it
+        # keeps a compact mamba slot pool.
+        unified_mamba = _walk_derives_unified_mamba(runner, runner._has_mamba_state)
     mamba_geom: list[tuple[int, int, int, int | None]] = []
-    mamba_entry_indices: list[int] = []
     if unified_mamba:
         for i, builder in enumerate(entry_builders):
             if builder.is_mamba_group:
@@ -782,12 +793,10 @@ def block_table_walk_plan(
                         builder.prefill_ckpt_spec_blocks,
                     )
                 )
-                mamba_entry_indices.append(i)
     return BlockTableWalkPlan(
         entries=tuple(entries),
         table_geom=tuple(table_geom),
         mamba_geom=tuple(mamba_geom),
-        mamba_entry_indices=tuple(mamba_entry_indices),
         total=offset,
     )
 
@@ -888,7 +897,9 @@ def stage_block_table_uploads(
         ctx.mamba_ckpt_window,
         num_reqs_padded,
         gids,
-        unified_mamba=ctx.mamba_state_indices is None and runner._unified_kv_layout,
+        unified_mamba=_walk_derives_unified_mamba(
+            runner, ctx.mamba_state_indices is not None
+        ),
     )
     if plan is None:
         return
