@@ -498,8 +498,11 @@ def _prepare_encoder_budget_inputs(
     layout-only parts (corner indices, bilinear weights, rotary position ids)
     are built on the host and padded to the budget's rows; the device only
     gathers and sums at the budget's shape. Padding rows come out zero, like
-    the template's. The pixels pass through for the manager to pad.
-    `mm_kwargs=None` builds a stand-in that fills the budget (warm-up).
+    the template's. Device pixels pass through for the manager to pad; host
+    pixels (a list of item slices, see `_select_encoder_items`) are copied
+    into one host buffer of the budget's rows and uploaded once.
+    `mm_kwargs=None` builds a stand-in that fills the budget, with host-path
+    pixels (warm-up).
     """
     from vllm.model_executor.layers.attention.mm_encoder_attention import (
         MMEncoderAttention,
@@ -510,13 +513,16 @@ def _prepare_encoder_budget_inputs(
     rows = template["pos_embeds"].shape[0]
     if mm_kwargs is None:
         side = int(rows**0.5) // merge * merge
-        grid, is_video, pixels = [(1, side, side)], False, None
+        grid, is_video = [(1, side, side)], False
+        pixels = _budget_pixels([], template["pixel_values"], visual.device)
     else:
         grid = [
             tuple(int(v) for v in g) for g in self._get_grid_thw_by_modality(mm_kwargs)
         ]
         is_video = self.get_input_modality(mm_kwargs) == "video"
         pixels = self._get_pixel_values_by_modality(mm_kwargs)
+        if isinstance(pixels, list):
+            pixels = _budget_pixels(pixels, template["pixel_values"], visual.device)
 
     cos, sin = visual.rotary_pos_emb.get_cos_sin(
         visual.rotary_pos_emb.cos_sin_cache.shape[0]
@@ -586,19 +592,68 @@ def _prepare_encoder_budget_inputs(
     return values
 
 
+def _budget_pixels(
+    items: list[torch.Tensor], template: torch.Tensor, device: torch.device
+) -> torch.Tensor:
+    """Host item pixels in one buffer of the template's shape, zero-padded, on
+    the device."""
+    from vllm_torchtpu.mm_host_copy_patch import copy_bytes_
+
+    buffer = torch.empty(template.shape, dtype=template.dtype)
+    flat = buffer.view(-1).view(torch.uint8)
+    pairs, offset = [], 0
+    for item in items:
+        src = item.to(template.dtype).contiguous().view(-1).view(torch.uint8)
+        pairs.append((flat[offset : offset + src.numel()], src))
+        offset += src.numel()
+    copy_bytes_(pairs)
+    flat[offset:] = 0
+    return buffer.to(device, non_blocking=True)
+
+
+def _select_encoder_items(upstream):
+    """Qwen3-VL's item selection, leaving host pixels as per-item slices.
+
+    Upstream concatenates the selected items' pixels; on host batches that is
+    a one-thread copy the budget-inputs hook would repeat, so the slices go to
+    the hook, which copies them once into the budget's buffer.
+    """
+
+    @functools.wraps(upstream)
+    def select(self, mm_kwargs, indices):
+        pixel_values = self._get_pixel_values_by_modality(mm_kwargs)
+        if not indices or not pixel_values.is_cpu:
+            return upstream(self, mm_kwargs, indices)
+        grid_thw = self._get_grid_thw_by_modality(mm_kwargs)
+        offsets = np.cumsum([0] + [t * h * w for t, h, w in grid_thw])
+        modality = self.get_input_modality(mm_kwargs)
+        key = "pixel_values" if modality == "image" else "pixel_values_videos"
+        return {
+            key: [pixel_values[offsets[i] : offsets[i + 1]] for i in indices],
+            f"{modality}_grid_thw": [grid_thw[i] for i in indices],
+        }
+
+    return select
+
+
 def maybe_patch_qwen3_vl_budget_inputs(
     model_config: Optional["ModelConfig"] = None,
 ) -> bool | None:
-    """Give the Qwen3-VL vision tower the encoder manager's budget-inputs hook."""
+    """Give the Qwen3-VL vision tower the encoder manager's budget-inputs hook
+    and host-batch item selection."""
     if model_config is None or not _has_qwen3_vl_vision(model_config):
         return False
     from vllm.model_executor.models import qwen3_vl
 
     from vllm_torchtpu.runner.mm_encoder_manager import BUDGET_INPUTS_HOOK
 
-    setattr(
-        qwen3_vl.Qwen3VLForConditionalGeneration,
-        BUDGET_INPUTS_HOOK,
-        _prepare_encoder_budget_inputs,
-    )
+    model_cls = qwen3_vl.Qwen3VLForConditionalGeneration
+    if (
+        getattr(model_cls, BUDGET_INPUTS_HOOK, None)
+        is not _prepare_encoder_budget_inputs
+    ):
+        setattr(model_cls, BUDGET_INPUTS_HOOK, _prepare_encoder_budget_inputs)
+        model_cls.select_encoder_cudagraph_items = _select_encoder_items(
+            model_cls.select_encoder_cudagraph_items
+        )
     return None

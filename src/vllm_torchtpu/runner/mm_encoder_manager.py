@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, cast
 
 import torch
@@ -19,12 +21,14 @@ from vllm.model_executor.models.interfaces import (
     SupportsEncoderCudaGraph,
     supports_encoder_cudagraph,
 )
+from vllm.utils.jsontree import json_map_leaves
 from vllm.v1.worker.encoder_cudagraph import (
     CaptureAxisKeys,
     EncoderCudaGraphManager,
 )
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.mm_encoder_rows import split_batch_output
 from vllm_torchtpu.runner.mm_video_chunking import (
     embed_multimodal_chunked,
     get_video_chunk_patch_size,
@@ -37,6 +41,43 @@ logger = init_logger(__name__)
 # The optional model hook that builds a budget graph's inputs at the budget's
 # template shapes (see `MMEncoderManager._run_budget_graph`).
 BUDGET_INPUTS_HOOK = "prepare_encoder_budget_inputs"
+
+
+def _to_device(mm_kwargs: Any, device: torch.device) -> Any:
+    return json_map_leaves(
+        lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, mm_kwargs
+    )
+
+
+@contextmanager
+def host_encoder_batches(runner: Any) -> Iterator[None]:
+    """Hand the encoder manager this step's batches on the host.
+
+    Its model then pads each budget graph's pixels on the host
+    (`BUDGET_INPUTS_HOOK`), so no device program takes an item's patch count.
+    A step with a modality the manager does not encode keeps the upload; so
+    does a manager without a layout-free path (see `layout_free`).
+    """
+    from vllm.v1.worker import gpu_model_runner
+
+    manager = runner.encoder_cudagraph_manager
+    if not isinstance(manager, MMEncoderManager) or not manager.host_pixels:
+        yield
+        return
+    upstream = gpu_model_runner.group_and_batch_mm_kwargs
+
+    def group_and_batch(mm_kwargs, *, device=None, pin_memory=False):
+        if all(manager.supports_modality(modality) for modality, _ in mm_kwargs):
+            return upstream(mm_kwargs)
+        return upstream(mm_kwargs, device=device, pin_memory=pin_memory)
+
+    gpu_model_runner.group_and_batch_mm_kwargs = group_and_batch
+    manager.host_batches = True
+    try:
+        yield
+    finally:
+        gpu_model_runner.group_and_batch_mm_kwargs = upstream
+        manager.host_batches = False
 
 
 def _pack_encoder_items(
@@ -154,6 +195,13 @@ class MMEncoderManager(EncoderCudaGraphManager):
         self.has_budget_inputs_hook = callable(
             getattr(type(self.model), BUDGET_INPUTS_HOOK, None)
         )
+        # The layout-free path (`enable_layout_free`): encoder outputs as row
+        # handles into their batch output, optionally with this step's
+        # batches on the host (`host_pixels`, `host_batches`).
+        self.layout_free = False
+        self.host_pixels = False  # pad pixels on the host (`host_encoder_batches`)
+        self.host_batches = False
+        self._layout_free_off = False  # a batch on the per-item-tensor path
         # CUDA graph metadata owns CUDA replay buffers. Track XLA warmup
         # separately rather than storing template dicts in that upstream map.
         self.compiled_budgets: dict[str, set[int]] = {
@@ -306,14 +354,69 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 e,
             )
             self.graph_misses += num_items
+            if self.host_batches:
+                mm_kwargs = _to_device(mm_kwargs, self.device)
             with torch.inference_mode():
                 return self.model.encoder_eager_forward(mm_kwargs, path=path)
+
+    def enable_layout_free(self) -> str | None:
+        """Hold encoder outputs as row handles into their batch output
+        (`runner.mm_encoder_rows`); None if enabled, else why this manager
+        keeps vLLM's per-item tensors."""
+        if not self.has_budget_inputs_hook:
+            return f"{type(self.model).__name__} has no {BUDGET_INPUTS_HOOK}"
+        postprocess = type(self.model).postprocess_encoder_output
+        default = SupportsEncoderCudaGraph.postprocess_encoder_output
+        if postprocess.__qualname__ != default.__qualname__:
+            owner = postprocess.__qualname__
+            return f"the model post-processes encoder outputs ({owner})"
+        if tuple(self.path_token_budgets) != ("default",) or self.use_dp:
+            return "it has several encoder paths or encodes data-parallel"
+        self.layout_free = True
+        return None
+
+    def _execute_local_layout_free(self, mm_kwargs: dict[str, Any]) -> list[Any]:
+        """`_execute_local` with outputs as row handles.
+
+        A batch the budgets cannot hold whole (an item past the largest
+        budget, or a video to chunk) takes today's per-item-tensor path, on
+        the device, instead.
+        """
+        item_specs = self._get_item_specs(mm_kwargs)
+        max_budget = max(self.token_budgets, default=0)
+        if sum(spec.output_tokens for spec in item_specs) > max_budget:
+            host_batches, self.host_batches, self._layout_free_off = (
+                self.host_batches,
+                False,
+                True,
+            )
+            try:
+                if host_batches:
+                    mm_kwargs = _to_device(mm_kwargs, self.device)
+                return self._execute_local(mm_kwargs)
+            finally:
+                self.host_batches, self._layout_free_off = host_batches, False
+
+        def to_rows(outputs, indices, per_item_out_tokens, dest, **_):
+            items = split_batch_output(
+                outputs["default"], [per_item_out_tokens[i] for i in indices]
+            )
+            for index, item in zip(indices, items, strict=True):
+                dest[index] = item
+
+        self.model.postprocess_encoder_output = to_rows
+        try:
+            return super()._execute_local(mm_kwargs)
+        finally:
+            del self.model.postprocess_encoder_output
 
     def _execute_local(
         self,
         mm_kwargs: dict[str, Any],
     ) -> list[torch.Tensor]:
         """Execute locally, temporally chunking videos that exceed max budget."""
+        if self.layout_free and not self._layout_free_off:
+            return self._execute_local_layout_free(mm_kwargs)
         item_specs = self._get_item_specs(mm_kwargs)
         total_tokens = sum(spec.output_tokens for spec in item_specs)
         max_budget = max(self.token_budgets, default=0)

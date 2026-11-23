@@ -178,8 +178,10 @@ from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
     MMEncoderManager,
+    host_encoder_batches,
     maybe_create_mm_encoder_manager,
 )
+from vllm_torchtpu.runner.mm_encoder_rows import EncoderEmbeds, EncoderRows
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
 from vllm_torchtpu.runner.pcp import (
     PcpManager,
@@ -694,6 +696,14 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
             f"{shapes}; the pipeline hand-off carries one per stage"
         )
     return next(iter(found.values()))
+
+
+def _concat_mm_embeds(embeds: list) -> "torch.Tensor | EncoderEmbeds":
+    """A step's multimodal embeddings in order: row handles when every item is
+    one (`runner.mm_encoder_rows`), else one tensor."""
+    if all(isinstance(e, EncoderRows) for e in embeds):
+        return EncoderEmbeds(embeds)
+    return torch.cat([e.tensor() if isinstance(e, EncoderRows) else e for e in embeds])
 
 
 # Recompilation-avoidance contract:
@@ -4040,8 +4050,65 @@ class TPUModelRunner(GPUModelRunner):
             List of multimodal embedding tensors for inputs processed by the
             encoder.
         """
-        with chunked_video_encoding(self.model, self.model_config):
+        with (
+            chunked_video_encoding(self.model, self.model_config),
+            host_encoder_batches(self),
+        ):
             return super()._execute_mm_encoder(scheduler_output)
+
+    def _maybe_enable_layout_free_encoder(self, manager: MMEncoderManager) -> None:
+        """Keep encoder outputs as row handles (see `runner.mm_encoder_rows`)
+        unless this config needs vLLM's per-item output tensors."""
+        from vllm.distributed.ec_transfer import has_ec_transfer
+
+        spec = self.speculative_config
+        if has_ec_transfer():
+            reason = "an EC connector saves and loads encoder outputs as tensors"
+        elif self._dp_lockstep_enabled():
+            reason = "DP-coordinated encoding"
+        elif (
+            self.is_multimodal_pruning_enabled
+            or self.requires_sequential_video_encoding
+        ):
+            reason = "the model prunes or encodes videos one by one"
+        elif self.lora_config is not None:
+            reason = "multimodal LoRA"
+        elif spec is not None and spec.method != "ngram":
+            reason = f"the {spec.method} drafter reads encoder outputs"
+        elif self.mm_budget is None:
+            reason = "no encoder cache budget"
+        else:
+            reason = manager.enable_layout_free()
+        if reason is None:
+            logger.info("Layout-free multimodal encoder: outputs as row handles.")
+        else:
+            logger.info("Multimodal encoder keeps per-item outputs: %s.", reason)
+
+    def _precompile_layout_free_embeds(self) -> None:
+        """Compile the row-handle gathers (every encoder budget at every token
+        bucket) and the embedding merge (every token bucket)."""
+        manager = self.encoder_cudagraph_manager
+        if not isinstance(manager, MMEncoderManager) or not manager.layout_free:
+            return
+        hidden, dtype = manager.config.out_hidden_size, manager.dtype
+        one = np.zeros(1, dtype=np.int64)
+        parts: list[EncoderRows] = []
+        for budget in manager.token_budgets:
+            source = torch.zeros(budget, hidden, dtype=dtype, device=self.device)
+            parts = [EncoderRows(source, one)]
+            for num_tokens in self.num_tokens_paddings:
+                synchronize_tensors([EncoderEmbeds(parts).gather(num_tokens)])
+        for num_tokens in self.num_tokens_paddings:
+            is_mm = torch.zeros(num_tokens, dtype=torch.bool)
+            is_mm[0] = True
+            ids = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
+            _, embeds = self._get_model_inputs(ids, ([EncoderEmbeds(parts)], is_mm))
+            synchronize_tensors([embeds])
+            # Nothing consumes this merge: drop what it staged for the forward
+            # (Qwen3-VL's deepstack inputs), or the next forward would add it.
+            clear = getattr(self.model, "_clear_deepstack_input_embeds", None)
+            if clear is not None:
+                clear(num_tokens)
 
     def _get_model_inputs(
         self,
@@ -4050,6 +4117,13 @@ class TPUModelRunner(GPUModelRunner):
     ):
         if self.supports_mm_inputs:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
+            if mm_embeds and isinstance(mm_embeds[0], EncoderEmbeds):
+                # Row handles: gathers at the token bucket's shape.
+                (embeds,) = mm_embeds
+                mm_embeds = [embeds.gather(input_ids.shape[0])]
+                # A program of its own: fused into the merge, the gather would
+                # make a merge program per encoder budget and token bucket.
+                synchronize_tensors(mm_embeds, wait=False)
 
             # _gather_mm_embeddings returns is_mm_embed sized to the number
             # of scheduled tokens, but TPU pads input_ids to a fixed bucket.
@@ -4446,7 +4520,7 @@ class TPUModelRunner(GPUModelRunner):
                 scheduler_output
             )
             if mm_embeds_list:
-                mm_embeds_flat = torch.cat(mm_embeds_list)
+                mm_embeds_flat = _concat_mm_embeds(mm_embeds_list)
             req_tok = np.array(
                 [
                     scheduler_output.num_scheduled_tokens[r]
@@ -7785,6 +7859,7 @@ class TPUModelRunner(GPUModelRunner):
                 self.vllm_config, self.device, self.model
             )
             if self.encoder_cudagraph_manager is not None:
+                self._maybe_enable_layout_free_encoder(self.encoder_cudagraph_manager)
                 max_step_tokens = (
                     self.mm_budget.get_encoder_budget()
                     if self.mm_budget is not None
@@ -7794,6 +7869,7 @@ class TPUModelRunner(GPUModelRunner):
                     self.encoder_cudagraph_manager.precompile_vision_encoder(
                         max_step_tokens=max_step_tokens
                     )
+                    self._precompile_layout_free_embeds()
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
