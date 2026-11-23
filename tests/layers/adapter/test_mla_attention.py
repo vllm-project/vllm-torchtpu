@@ -1327,6 +1327,12 @@ def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
 
     monkeypatch.setattr(mla_attention_op.pallas, "jax_op", _fake_jax_op)
     monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    # With the backend reported as TPU, the StreamIdx block sizes would read
+    # the TPU's SMEM size for the long-context step cap; a cap of 0 keeps the
+    # default block sizes, as on CPU.
+    monkeypatch.setattr(
+        mla_attention_op._streamidx_meta, "generate_max_steps", lambda *a, **kw: 0
+    )
     orig_append = kv_cache_append.coalesced_kv_append
     monkeypatch.setattr(
         mla_attention_op,
