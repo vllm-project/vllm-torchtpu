@@ -140,6 +140,19 @@ class PrototypeTest(unittest.TestCase):
         self.assertEqual(row["health"]["thin"], [])
         self.assertEqual(row["health"]["shards_seen"], [0, 1, 2])
 
+    def test_script_step_is_judged_by_its_exit_code(self) -> None:
+        fake_recording(self.artifacts, "integration_x", 0, 1, [(MOD, "called")],
+                       passed=0)
+        meta = self.artifacts / "fnrec" / "integration_x" / "shard0" / "meta.json"
+        data = json.loads(meta.read_text())
+        meta.write_text(json.dumps({**data, "kind": "script"}))
+        table = build_table.build(self.artifacts, self.repo.root, self.recorded_at)
+        self.assertEqual(table["rows"]["integration_x"]["health"]["thin"], [])
+        meta.write_text(json.dumps({**data, "kind": "script", "exit_code": 1}))
+        table = build_table.build(self.artifacts, self.repo.root, self.recorded_at)
+        self.assertIn("the step's command failed",
+                      table["rows"]["integration_x"]["health"]["thin"])
+
     def test_failed_or_missing_shards_make_a_row_thin(self) -> None:
         self.assertIn("tests failed", self.table(failed=1).rows[GENERAL]["health"]["thin"])
         fake_recording(self.artifacts, "unit_tests_multichip_pr", 0, 2, [(MOD, "called")])
@@ -176,6 +189,21 @@ class PrototypeTest(unittest.TestCase):
 
     def test_import_time_change_runs_every_importer(self) -> None:
         self.assertTrue(self.general(self.change("X = 1", "X = 2"), self.table()).run)
+
+    def test_signature_change_is_not_an_import_time_change(self) -> None:
+        (q,) = self.change("def not_called():", "def not_called(x=1):")
+        self.assertEqual(q.names, {"not_called"})
+        self.assertFalse(self.general([q], self.table()).run)
+
+    def test_docstring_only_change_is_inert(self) -> None:
+        (q,) = self.change("        return 3", '        """Doc."""\n        return 3')
+        self.assertTrue(q.inert)
+        self.assertFalse(decide.decide([q], self.table(), self.config)[
+            "unit_tests_multichip_pr"].run)
+
+    def test_docs_inside_a_code_pr_need_no_tpu_step(self) -> None:
+        q = self.change("", "# x\n", path="docs/page.md")
+        self.assertFalse(self.general(q, self.table()).run)
 
     def test_thin_row_never_skips(self) -> None:
         d = self.general(self.change("return 2", "return 22"), self.table(failed=1))

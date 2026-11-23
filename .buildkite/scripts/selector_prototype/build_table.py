@@ -98,10 +98,14 @@ def thin_reasons(health: dict) -> list[str]:
         reasons.append(f"shards missing: {missing}")
     if any(rc not in (0, 5) for rc in health["exit_codes"]):
         reasons.append(f"a shard failed (exit codes {health['exit_codes']})")
-    if health["tests"].get("failed") or health["tests"].get("errors"):
-        reasons.append("tests failed")
-    if not health["tests"].get("passed"):
-        reasons.append("no test passed")
+    if health["kind"] == "pytest":
+        if health["tests"].get("failed") or health["tests"].get("errors"):
+            reasons.append("tests failed")
+        if not health["tests"].get("passed"):
+            reasons.append("no test passed")
+    elif any(rc != 0 for rc in health["exit_codes"]):
+        # A script step has no test count: its exit code is the verdict.
+        reasons.append("the step's command failed")
     if not health["clean_exits"]:
         reasons.append("no process exited cleanly")
     return reasons
@@ -125,9 +129,11 @@ def build(artifacts: pathlib.Path, repo: pathlib.Path, commit: str) -> dict:
             "recorder_errors": 0,
             "tests": defaultdict(int),
             "commits": set(),
+            "kind": "pytest",
         }
         for shard_dir in shard_dirs:
             meta = json.loads((shard_dir / "meta.json").read_text())
+            health["kind"] = meta.get("kind", "pytest")
             health["shards_seen"].append(int(meta["shard"]))
             health["shards_expected"] = max(
                 health["shards_expected"], int(meta["shards"])
@@ -181,6 +187,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=pathlib.Path, default=pathlib.Path("table.json"))
     args = ap.parse_args(argv)
     table = build(args.artifacts, args.repo, args.commit)
+    if not table["rows"]:
+        sys.exit(f"no recordings (meta.json files) under {args.artifacts}")
     args.out.write_text(json.dumps(table, indent=1, sort_keys=True))
     for step, row in table["rows"].items():
         h = row["health"]

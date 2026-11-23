@@ -141,6 +141,9 @@ def decide(queries: list[FileQuery], table: Table, config) -> dict[str, StepDeci
         row, why_not = table.usable_row(step)
         for query in queries:
             verdict: bool | None = None
+            if query.inert and query.answerable:
+                # Only comments, docstrings or annotations changed.
+                continue
             if row is not None and query.answerable:
                 verdict, why = _recording_verdict(query, row, table)
                 if verdict is not None:

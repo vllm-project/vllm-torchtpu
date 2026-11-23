@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# PROTOTYPE (experiment/selector-prototype, not for merging): records what two
-# CI steps run, for the diff-aware selector prototype.
+# PROTOTYPE (experiment/selector-prototype, not for merging): records what CI
+# steps run, for the diff-aware selector prototype.
 #
 # Trigger: https://buildkite.com/vllm/vllm-torchtpu-dev -> "New Build", branch
-# experiment/selector-prototype. Each recording step uploads its shard's
-# recordings under selector_recordings/fnrec/<step>/shard<N>/.
+# experiment/selector-prototype. Each recording step uploads its recordings
+# under selector_recordings/fnrec/<step>/shard<N>/.
+#
+# Round 1 (build #1449) recorded unit_tests_cpu_pr and unit_tests_general_pr.
+# Round 2 records two integration steps, with the same command, shape and env
+# as pipeline_integration.yml.
 
 steps:
   - label: ":docker: Build and Push Dev Image"
@@ -31,48 +35,43 @@ steps:
         - exit_status: 1
           limit: 2
 
-  # Same marker filter and files as Unit Tests - CPU (PR), on the cpu queue.
-  - label: "[prototype] record unit_tests_cpu_pr (shard {{matrix}})"
-    key: record_cpu
+  - label: "[prototype] record integration_qwen35_apc_correctness"
+    key: record_qwen35_apc
     depends_on: build_docker
-    timeout_in_minutes: 120
-    agents:
-      queue: "kube"
-    plugins:
-      - kubernetes:
-          podTemplate: tpu-launcher
-    matrix: ["0", "1", "2"]
-    env:
-      SHAPE: "cpu"
-      JAX_PLATFORMS: "cpu"
-      ARTIFACTS_DIR: "selector_recordings"
-    commands:
-      - >-
-        .buildkite/kubernetes/run.sh bash
-        .buildkite/scripts/selector_prototype/record_step.sh
-        unit_tests_cpu_pr {{matrix}} 3 "$${BUILDKITE_COMMIT}"
-        "not tpu_test and not multichip and not nightly"
-
-  # Same marker filter and files as Unit Tests - General (PR): one v7x chip
-  # per shard, three shards, as in CI.
-  - label: "[prototype] record unit_tests_general_pr (shard {{matrix}})"
-    key: record_tpu_general
-    depends_on: build_docker
-    # Covers queueing too, as in pipeline_tests.yml.
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
     plugins:
       - kubernetes:
           podTemplate: tpu-launcher
-    matrix: ["0", "1", "2"]
+    env:
+      SHAPE: "tpu7x-standard-4t/2x2x1"
+      RUN_ROOT: "perf_eval_results/qwen35_apc_ci"
+      ARTIFACTS_DIR: "selector_recordings"
+    commands:
+      - >-
+        .buildkite/kubernetes/run.sh bash
+        .buildkite/scripts/selector_prototype/record_script.sh
+        integration_qwen35_apc_correctness "$${BUILDKITE_COMMIT}"
+        bash ./scripts/vllm/integration/run_qwen35_apc_correctness.sh
+
+  # No automatic retry, unlike CI: two attempts would upload the same
+  # recording paths. Rerun the build if its known cache flake hits.
+  - label: "[prototype] record integration_compilation_cache_e2e"
+    key: record_compilation_cache
+    depends_on: build_docker
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
     env:
       SHAPE: "tpu7x-standard-1t/1x1x1"
       ARTIFACTS_DIR: "selector_recordings"
     commands:
       - >-
         .buildkite/kubernetes/run.sh bash
-        .buildkite/scripts/selector_prototype/record_step.sh
-        unit_tests_general_pr {{matrix}} 3 "$${BUILDKITE_COMMIT}"
-        "tpu_test and not nightly and not multichip"
-        tests/entrypoints/llm/test_speculative_decoding.py
+        .buildkite/scripts/selector_prototype/record_script.sh
+        integration_compilation_cache_e2e "$${BUILDKITE_COMMIT}"
+        bash ./scripts/vllm/integration/run_compilation_cache_e2e.sh

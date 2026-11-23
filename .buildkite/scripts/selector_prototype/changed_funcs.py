@@ -3,7 +3,8 @@
 PROTOTYPE. Adapted from vllm-project/ci-infra (Apache-2.0),
 buildkite/ci_selector/ci_selector/coverage/changed_funcs.py at 04dd673a92:
 `hunks`, `attribute` and the code-object helpers are kept as upstream wrote
-them. Dropped: platform guards, inert-change detection, and vLLM's scopes.
+them. Also kept: `_drop_unchanged` and the helpers it uses (changes that
+leave behaviour alone). Dropped: platform guards and vLLM's scopes.
 
 Names come from CPython (compile the source and read the qualnames and line
 tables off the code objects), which is how the recorder spells them.
@@ -11,8 +12,11 @@ tables off the code objects), which is how the recorder spells them.
 
 from __future__ import annotations
 
+import ast
+import io
 import re
 import subprocess
+import tokenize
 import types
 from dataclasses import dataclass
 from inspect import CO_OPTIMIZED
@@ -37,6 +41,9 @@ class FileQuery:
     import_time: frozenset[str] = frozenset()
     # Why the names could not be read. Empty when they could.
     failed: str = ""
+    # Every change in the file leaves behaviour alone (comments, docstrings,
+    # annotations, reformatting), so no step needs it.
+    inert: bool = False
 
     @property
     def python(self) -> bool:
@@ -263,10 +270,9 @@ def build(repo: Path, base: str, head: str | None = None) -> list[FileQuery]:
         names: set[str] = set()
         at_import: set[str] = set()
         notes: list[str] = []
-        sides = (
-            (base, None if status == "A" else (old_path or path), base_lines),
-            (head, None if status == "D" else path, head_lines),
-        )
+        base_side = None if status == "A" else (old_path or path)
+        head_side = None if status == "D" else path
+        sides = ((base, base_side, base_lines), (head, head_side, head_lines))
         for ref, side_path, lines in sides:
             if side_path is None or not lines:
                 continue
@@ -282,8 +288,242 @@ def build(repo: Path, base: str, head: str | None = None) -> list[FileQuery]:
                     notes.append("a changed line is outside every scope")
             except Exception as exc:  # anything compile() cannot handle
                 notes.append(f"{type(exc).__name__}: {exc}")
+        query.failed = "; ".join(notes)
+        if not query.failed and base_side and head_side:
+            before = read_at(repo, base, base_side)
+            after = read_at(repo, head, head_side)
+            if before is not None and after is not None:
+                kept, kept_import, query.inert = drop_unchanged(
+                    repo, head, before, after, base_side, head_side,
+                    frozenset(names), frozenset(at_import),
+                )
+                names, at_import = set(kept), set(kept_import)
         query.names, query.import_time = _normalize(
             frozenset(names), frozenset(at_import)
         )
-        query.failed = "; ".join(notes)
     return queries
+
+
+# ---------------------------------------------------------------------------
+# Changes that leave behaviour alone. Kept as upstream wrote them
+# (`_equivalent`, `_strip_annotations`, `_strip_docstrings`, `_logical_lines`,
+# `_docstring_read`, `_preserving`, `_Shell`, `_shell_equal`,
+# `_drop_unchanged`), with the readers of annotations adapted to this repo.
+# ---------------------------------------------------------------------------
+
+
+def _equivalent(a: types.CodeType, b: types.CodeType) -> bool:
+    """Same code, line numbers aside: bytecode, names, locals, flags and
+    constants, nested code compared the same way."""
+    if (
+        a.co_code != b.co_code
+        or a.co_names != b.co_names
+        or a.co_varnames != b.co_varnames
+        or a.co_freevars != b.co_freevars
+        or a.co_cellvars != b.co_cellvars
+        or a.co_flags != b.co_flags
+        or a.co_argcount != b.co_argcount
+        or a.co_posonlyargcount != b.co_posonlyargcount
+        or a.co_kwonlyargcount != b.co_kwonlyargcount
+        or a.co_qualname != b.co_qualname
+        or len(a.co_consts) != len(b.co_consts)
+    ):
+        return False
+    for x, y in zip(a.co_consts, b.co_consts):
+        if isinstance(x, types.CodeType) or isinstance(y, types.CodeType):
+            if not (
+                isinstance(x, types.CodeType)
+                and isinstance(y, types.CodeType)
+                and _equivalent(x, y)
+            ):
+                return False
+        elif type(x) is not type(y) or x != y:
+            return False
+    return True
+
+
+# A module naming one of these may read function annotations at runtime:
+# torch custom op registration infers the op schema from them, and
+# support_torch_compile the dynamic dims from forward's.
+_ANNOTATION_READERS = (
+    "direct_register_custom_op",
+    "library.custom_op",
+    "infer_schema",
+    "get_type_hints",
+    "signature(",
+    "support_torch_compile",
+    "torch.library",
+)
+
+
+def _strip_annotations(tree: ast.AST) -> ast.AST:
+    """Remove parameter and return annotations of undecorated functions that
+    import defines. Decorated ones keep theirs, as do class-level fields."""
+    todo = [(tree, False)]
+    while todo:
+        node, in_function = todo.pop()
+        is_def = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        if is_def and not in_function and not node.decorator_list:
+            node.returns = None
+            a = node.args
+            for arg in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg):
+                if arg is not None:
+                    arg.annotation = None
+        todo.extend((c, in_function or is_def) for c in ast.iter_child_nodes(node))
+    return tree
+
+
+def _strip_docstrings(tree: ast.AST) -> list[tuple[str, str | None]]:
+    """Remove the leading docstring of every undecorated function, and return
+    (name, docstring) for each in walk order."""
+    found = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not node.decorator_list
+        ):
+            doc = ast.get_docstring(node, clean=False)
+            if doc is not None:
+                node.body = node.body[1:]
+            found.append((node.name, doc))
+    return found
+
+
+def _logical_lines(text: str) -> list[str]:
+    """Each statement line of the source, comments left out."""
+    lines, cur = [], []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
+                lines.append(" ".join(cur))
+                cur = []
+            elif tok.type not in (tokenize.COMMENT, tokenize.NL):
+                cur.append(tok.string)
+    except (tokenize.TokenError, SyntaxError):
+        return [text]
+    return lines
+
+
+def _docstring_read(repo: Path, ref: str | None, names: set[str]) -> bool:
+    """Whether a statement that reads `__doc__` or `getdoc` names one of these.
+    A search that fails counts as a read."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "grep", "-l", "-z", "-I", "-E", "__doc__|getdoc"]
+        + ([ref] if ref else [])
+        + ["--", "*.py"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    if proc.returncode not in (0, 1):
+        return True
+    word = re.compile(r"\b(?:" + "|".join(map(re.escape, sorted(names))) + r")\b")
+    for hit in filter(None, proc.stdout.split("\0")):
+        path = hit[len(ref) + 1 :] if ref else hit
+        text = read_at(repo, ref, path)
+        if text is None:
+            return True
+        for line in _logical_lines(text):
+            if ("__doc__" in line or "getdoc" in line) and word.search(line):
+                return True
+    return False
+
+
+def _preserving(repo: Path, ref: str | None, before: str, after: str) -> bool:
+    """Whether the two sources differ only in removable annotations and
+    docstrings, with no changed docstring read at runtime."""
+    annotations = not any(m in before or m in after for m in _ANNOTATION_READERS)
+    try:
+        trees = [ast.parse(before), ast.parse(after)]
+    except SyntaxError:
+        return False
+    if annotations:
+        trees = [_strip_annotations(t) for t in trees]
+    old_docs, new_docs = (_strip_docstrings(t) for t in trees)
+    if ast.dump(trees[0]) != ast.dump(trees[1]):
+        return False
+    edited = {n for (n, a), (_, b) in zip(old_docs, new_docs) if a != b}
+    return not edited or not _docstring_read(repo, ref, edited)
+
+
+class _Shell(ast.NodeTransformer):
+    """A module with what import does not run taken out: function bodies,
+    parameter lists and annotations, and defaults that are plain literals.
+    Decorators stay, and so does any default that is an expression."""
+
+    def _fn(self, node):
+        args = node.args
+        kept = [
+            d
+            for d in [*args.defaults, *(k for k in args.kw_defaults if k is not None)]
+            if not isinstance(d, ast.Constant)
+        ]
+        for d in kept:
+            self.visit(d)
+        node.decorator_list = [self.visit(d) for d in node.decorator_list]
+        node.body = [ast.Pass()]
+        node.returns = None
+        node.args = ast.arguments(
+            posonlyargs=[], args=[], vararg=None, kwonlyargs=[],
+            kw_defaults=[], kwarg=None, defaults=kept,
+        )
+        if hasattr(node, "type_params"):
+            node.type_params = []
+        return node
+
+    visit_FunctionDef = visit_AsyncFunctionDef = _fn
+
+
+def _shell_equal(before: str, after: str) -> bool:
+    """Whether import runs the same code on both sides."""
+    try:
+        a = _Shell().visit(ast.parse(before))
+        b = _Shell().visit(ast.parse(after))
+    except SyntaxError:
+        return False
+    return ast.dump(a) == ast.dump(b)
+
+
+def drop_unchanged(
+    repo: Path, head: str | None, before: str, after: str,
+    base_side: str, head_side: str,
+    names: frozenset[str], import_time: frozenset[str],
+) -> tuple[frozenset[str], frozenset[str], bool]:
+    """(names whose code changed, their import-time subset, nothing left).
+
+    A changed line can belong to a function whose code is identical (a split
+    signature, a comment). A module body differs whenever a def in it does, so
+    if only function bodies, signatures or literal defaults changed, import
+    runs the same code and the module body is not a change of its own.
+    """
+    try:
+        old: dict[str, list] = {}
+        for c in code_objects(compile(before, base_side, "exec")):
+            old.setdefault(c.co_qualname, []).append(c)
+        new: dict[str, list] = {}
+        for c in code_objects(compile(after, head_side, "exec")):
+            new.setdefault(c.co_qualname, []).append(c)
+    except Exception:
+        return names, import_time, False
+
+    def same(name: str) -> bool:
+        a, b = old.get(name), new.get(name)
+        return (
+            a is not None
+            and b is not None
+            and len(a) == len(b)
+            and all(_equivalent(x, y) for x, y in zip(a, b))
+        )
+
+    unchanged = {n for n in names if same(n)}
+    left = names - unchanged
+    if left and _preserving(repo, head, before, after):
+        unchanged |= left
+        left = frozenset()
+    if left & import_time and left - import_time and _shell_equal(before, after):
+        unchanged |= left & import_time
+        left = left - import_time
+    if left and left <= import_time:
+        # Only import-time names would be left: keep the file as it was.
+        return names, import_time, False
+    return frozenset(names - unchanged), frozenset(import_time - unchanged), not left

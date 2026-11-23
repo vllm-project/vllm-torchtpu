@@ -55,6 +55,12 @@ cpu_only:
   - .buildkite/pipeline_coverage.yml
   - .buildkite/pipeline_dev.yml
   - .buildkite/pipeline_nightly_image.yml
+  # PROTOTYPE additions (also proposed for PR 2a): bootstrap only skips a
+  # build that is docs-only, so a docs edit inside a code PR ran everything.
+  - docs/
+  - README.md
+  # Read only by the CPU typecheck step.
+  - .pyrefly-baseline-full.json
 
 # Integration scripts run by exactly these steps. The scripts and manifests
 # they call are not listed, so a change to those runs the full build.
