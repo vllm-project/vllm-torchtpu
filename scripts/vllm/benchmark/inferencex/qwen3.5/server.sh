@@ -56,7 +56,39 @@ case "$SHARDING" in
       --tensor-parallel-size=8
       --data-parallel-size=1
       --enable-expert-parallel
-    ) ;;
+      --mamba-ssm-cache-dtype="${GDN_STATE_DTYPE:-bfloat16}"
+      --kernel-config='{"ir_op_priority":{"rms_norm":"native","fused_add_rms_norm":"native"}}'
+    )
+    export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:-1}"
+    export RAGGED_GATED_DELTA_RULE_IMPL="${RAGGED_GATED_DELTA_RULE_IMPL:-chunked_kernel_v3_pd}"
+    export TPU_GDN_QKVZ_KERNEL_LAYOUT="${TPU_GDN_QKVZ_KERNEL_LAYOUT:-1}"
+    export TPU_GDN_TABLES_IN_KERNEL="${TPU_GDN_TABLES_IN_KERNEL:-1}"
+    export TPU_GDN_FUSED_NORM_QUANT="${TPU_GDN_FUSED_NORM_QUANT:-1}"
+    export TPU_GDN_PREFILL_CHECKPOINT="${TPU_GDN_PREFILL_CHECKPOINT:-0}"
+    export VLLM_TPU_FAST_TOKEN_SUBSTITUTION="${VLLM_TPU_FAST_TOKEN_SUBSTITUTION:-1}"
+    export TPU_FUSED_QK_NORM_ROPE="${TPU_FUSED_QK_NORM_ROPE:-1}"
+    export TPU_NORM_WEIGHT_HOIST="${TPU_NORM_WEIGHT_HOIST:-1}"
+    export TPU_GREEDY_TOP_TOKENS="${TPU_GREEDY_TOP_TOKENS:-1}"
+    export TPU_SMALL_ALL_REDUCE="${TPU_SMALL_ALL_REDUCE:-1}"
+    export TPU_RPA_DECODE_BATCHED="${TPU_RPA_DECODE_BATCHED:-1}"
+    export TPU_GATED_NORM_TILE="${TPU_GATED_NORM_TILE:-256}"
+    export TPU_MOE_COUNTING_SORT="${TPU_MOE_COUNTING_SORT:-1}"
+    export TPU_MOE_LOWTOK="${TPU_MOE_LOWTOK:-1}"
+    export TPU_MOE_LOWTOK_FROM_SCORES="${TPU_MOE_LOWTOK_FROM_SCORES:-1}"
+    export TPU_MOE_LOWTOK_SCORES_STRICT="${TPU_MOE_LOWTOK_SCORES_STRICT:-1}"
+    export TPU_MOE_LOWTOK_QUANT_BLOCK="${TPU_MOE_LOWTOK_QUANT_BLOCK:-0}"
+    export TPU_MOE_SEQUENCE_PARALLEL="${TPU_MOE_SEQUENCE_PARALLEL:-1}"
+    export TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER="${TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER:-1}"
+    export TPU_SP_MIN_ROWS="${TPU_SP_MIN_ROWS:-257}"
+    export MOE_FUSED_EP_KERNEL_IMPL="${MOE_FUSED_EP_KERNEL_IMPL:-v3}"
+    export MOE_FUSED_EP_SORTED_GATHER="${MOE_FUSED_EP_SORTED_GATHER:-1}"
+    export MOE_KERNEL_THRESHOLD="${MOE_KERNEL_THRESHOLD:-256}"
+    export TPU_TOKEN_BUCKET_EXTRA="${TPU_TOKEN_BUCKET_EXTRA-4,8,48,4608,5120,5632,6144,6656,7168,7680,8704,9216,9728}"
+    export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true --xla_enable_async_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=true --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=262144 --xla_tpu_dvfs_p_state=7 --xla_tpu_alternate_memory_benefit_scaling_factor_for_large_buffers=${XLA_ALT_SCALE:-NO_SCALE}"
+    if [ -n "${XLA_SCOPED_VMEM_KIB:-}" ]; then
+      export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS} --xla_tpu_scoped_vmem_limit_kib=${XLA_SCOPED_VMEM_KIB}"
+    fi
+    ;;
   DP4TP2_EP)
     # Data-parallel attention across all 4 chips with tensor-parallel across 2 cores
     # on the same chip + expert-parallel MoE.
