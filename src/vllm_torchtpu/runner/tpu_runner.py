@@ -48,6 +48,7 @@ from vllm.distributed.kv_transfer import (
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats,
 )
+import vllm.forward_context as _vllm_forward_context
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -138,6 +139,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadataBuilderContext,
     MambaStackRef,
     attention_block_table_width,
+    note_metadata_reuse,
     stage_block_table_uploads,
     stacked_mamba_metadata,
     stage_h2d_upload,
@@ -149,7 +151,9 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.parallel_requirements import requires_dp_collectives
+from vllm_torchtpu.models.vllm import vllm_model_wrapper_context as _wrapper_ctx
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    VllmModelWrapperContext,
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
@@ -226,6 +230,131 @@ class SpecBoundaryPlan(NamedTuple):
     block_size: int
     # Host source of `entries`, kept until the upload has been consumed.
     host_entries: torch.Tensor
+
+
+# The AttentionMetadata fields `_build_attention_metadata_staged` takes from
+# the step (its `shared` dict) and, for mamba groups, from the builder context
+# as well; every other field is per group.
+_MD_STEP_FIELDS = (
+    "input_positions",
+    "seq_lens",
+    "query_start_loc",
+    "request_distribution",
+    "sequence_layout_kind",
+    "sequence_layout_protocol",
+    "sequence_layout_version",
+)
+_MD_MAMBA_STEP_FIELDS = _MD_STEP_FIELDS + (
+    "mamba_slot_read_offsets",
+    "mamba_request_distribution",
+    "mamba_prefill_ckpt",
+)
+
+
+@dataclass
+class _AttentionMetadataReuse:
+    """VLLM_TPU_ATTN_METADATA_REUSE: the last steady-decode inline build's
+    per-group inputs (compared by identity; held here so no id is recycled)
+    and, per group, its class and field dict with the step fields blanked.
+    See `TPUModelRunner._reuse_attention_metadata`."""
+
+    plan: tuple
+    staged: dict
+    products: dict | None
+    compact: Any
+    key: tuple
+    # (class, fields with the step fields set to None, is_mamba) per group.
+    templates: tuple
+    # (layer name, index into templates), in the build's insertion order.
+    layer_groups: tuple
+    # What the build appended to ctx.unified_mamba_state_indices, in order.
+    appended: tuple
+
+    @classmethod
+    def record(cls, plan, staged, products, compact, key, built_groups, appended):
+        templates = []
+        layer_groups = []
+        for i, ((_, is_mamba, layer_names), md) in enumerate(
+            zip(plan[1], built_groups, strict=True)
+        ):
+            step = _MD_MAMBA_STEP_FIELDS if is_mamba else _MD_STEP_FIELDS
+            fields = dict(md.__dict__)
+            for name in step:
+                # Blank, not dropped: keeps the constructor's field order
+                # and holds no earlier step's tensors.
+                assert name in fields, name
+                fields[name] = None
+            templates.append((type(md), fields, is_mamba))
+            layer_groups.extend((name, i) for name in layer_names)
+        return cls(
+            plan=plan,
+            staged=staged,
+            products=products,
+            compact=compact,
+            key=key,
+            templates=tuple(templates),
+            layer_groups=tuple(layer_groups),
+            appended=tuple(appended),
+        )
+
+
+# VLLM_TPU_FORWARD_CTX_PREBUILT: sha256 prefixes of the vLLM sources
+# `_PrebuiltForwardScope` stands in for (vLLM v0.31.0 and v0.32.0 have the
+# same forward_context.py). Any other source keeps the original `with` stack.
+_FORWARD_CTX_SOURCE_SHA = {
+    "set_forward_context": "70c3bad7ccba8e9b",
+    "override_forward_context": "96a30187fd05b912",
+}
+
+
+def _forward_ctx_source_matches() -> bool:
+    import hashlib
+
+    for name, want in _FORWARD_CTX_SOURCE_SHA.items():
+        fn = getattr(_vllm_forward_context, name, None)
+        fn = getattr(fn, "__wrapped__", None)
+        try:
+            src = inspect.getsource(fn)
+        except (OSError, TypeError):
+            return False
+        if hashlib.sha256(src.encode()).hexdigest()[:16] != want:
+            return False
+    return True
+
+
+class _PrebuiltForwardScope:
+    """VLLM_TPU_FORWARD_CTX_PREBUILT: the main forward's
+    `set_forward_context` + `set_vllm_model_wrapper_context` pair as one
+    plain context manager, for steps where the rest of the original stack
+    (TraceAnnotation, stage timing) would do nothing.
+
+    `set_forward_context` with no DP metadata, no batch-size tracking and the
+    default cudagraph / ubatch / slot-mapping arguments is: ask the platform
+    for its additional kwargs, `create_forward_context(...)`, then
+    `override_forward_context` swaps vLLM's module global in and back out.
+    `set_vllm_model_wrapper_context` swaps its module global the same way.
+    The contexts have the same fields as the stack's, so the forward sees
+    equal contexts; exit restores both globals in the original order
+    (wrapper first), also when the forward raises.
+    """
+
+    __slots__ = ("_fc", "_wrapper", "_prev_fc", "_prev_wrapper")
+
+    def __init__(self, fc, wrapper) -> None:
+        self._fc = fc
+        self._wrapper = wrapper
+
+    def __enter__(self):
+        self._prev_fc = _vllm_forward_context._forward_context
+        _vllm_forward_context._forward_context = self._fc
+        self._prev_wrapper = _wrapper_ctx._vllm_model_wrapper_context
+        _wrapper_ctx._vllm_model_wrapper_context = self._wrapper
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        _wrapper_ctx._vllm_model_wrapper_context = self._prev_wrapper
+        _vllm_forward_context._forward_context = self._prev_fc
+        return False
 
 
 @dataclass
@@ -2750,6 +2879,28 @@ class TPUModelRunner(GPUModelRunner):
         compact = ctx.mamba_state_indices
         unified = compact is None and self._unified_kv_layout
         products = ctx.staged_mamba_products
+        reuse_key = None
+        # Steady-decode target walks only (a draft or dummy build in between
+        # neither uses nor evicts the record); the reuse itself rests on
+        # identity alone, not on the step being a steady hit.
+        if ctx.steady_walk_bounds is not None and envs.VLLM_TPU_ATTN_METADATA_REUSE:
+            reuse_key = (
+                bool(unified),
+                ctx.unified_mamba_state_indices is not None,
+                bool(envs.VLLM_TPU_STAGED_WALK_STACKED),
+            )
+            rec = self.__dict__.get("_attn_metadata_reuse")
+            if (
+                rec is not None
+                and rec.plan is plan
+                and rec.staged is staged
+                and rec.products is products
+                and rec.compact is compact
+                and rec.key == reuse_key
+            ):
+                note_metadata_reuse("build", True)
+                return self._reuse_attention_metadata(ctx, rec)
+            note_metadata_reuse("build", False)
         for gid, is_mamba, _ in plan[1]:
             if gid not in staged or (
                 is_mamba and unified and (products is None or gid not in products)
@@ -2766,6 +2917,12 @@ class TPUModelRunner(GPUModelRunner):
             sequence_layout_version=descriptor.version,
         )
         per_layer: dict[str, AttentionMetadata] = {}
+        built_groups: list[AttentionMetadata] = []
+        appended_from = (
+            len(ctx.unified_mamba_state_indices)
+            if ctx.unified_mamba_state_indices is not None
+            else 0
+        )
         for gid, is_mamba, layer_names in plan[1]:
             if is_mamba:
                 ckpt = None
@@ -2800,9 +2957,74 @@ class TPUModelRunner(GPUModelRunner):
                 )
             else:
                 built = AttentionMetadata(block_tables=staged[gid], **shared)
+            built_groups.append(built)
             for layer_name in layer_names:
                 per_layer[layer_name] = built
+        if reuse_key is not None:
+            self._attn_metadata_reuse = _AttentionMetadataReuse.record(
+                plan,
+                staged,
+                products,
+                compact,
+                reuse_key,
+                built_groups,
+                (
+                    ctx.unified_mamba_state_indices[appended_from:]
+                    if ctx.unified_mamba_state_indices is not None
+                    else []
+                ),
+            )
         return per_layer
+
+    def _reuse_attention_metadata(
+        self, ctx, rec: "_AttentionMetadataReuse"
+    ) -> dict[str, AttentionMetadata]:
+        """VLLM_TPU_ATTN_METADATA_REUSE: `_build_attention_metadata_staged`
+        for a step whose per-group inputs are the recorded build's.
+
+        A group's metadata is (its per-group fields) + (the step fields, the
+        same for every group of its kind). The per-group fields --
+        `block_tables = staged[gid]`, the mamba state / checkpoint ids or the
+        stack ref, the stack row -- are functions of (`staged`, `products`,
+        `compact`, `unified`, the plan), all identical to the recorded
+        build's (same objects; nothing writes into the staged-table or
+        products dicts after the walk returns them), so the recorded values
+        are what the build would compute. The step fields are taken from this
+        ctx exactly as the build takes them: positions, seq_lens,
+        query_start_loc, request distributions, read offsets, the prefill
+        checkpoint and the sequence layout all change between steps (or may)
+        and are never reused. Each group still gets a new object of the same
+        class with the same field order, as the build's constructor call
+        gives it (neither class defines `__post_init__`), so nothing that
+        holds or replaces an earlier step's metadata sees a change. The
+        build's one side effect, appending the per-group state ids to
+        `ctx.unified_mamba_state_indices`, is replayed in order.
+        """
+        descriptor = ctx.sequence_layout_descriptor
+        shared = dict(
+            input_positions=self.position_ids,
+            seq_lens=ctx.seq_lens,
+            query_start_loc=ctx.query_start_loc,
+            request_distribution=ctx.request_distribution,
+            sequence_layout_kind=descriptor.kind.value,
+            sequence_layout_protocol=descriptor.protocol,
+            sequence_layout_version=descriptor.version,
+        )
+        mamba_shared = dict(
+            shared,
+            mamba_slot_read_offsets=ctx.mamba_slot_read_offsets,
+            mamba_request_distribution=ctx.mamba_request_distribution,
+            mamba_prefill_ckpt=ctx.mamba_prefill_ckpt,
+        )
+        new = object.__new__
+        groups = []
+        for cls, template, is_mamba in rec.templates:
+            md = new(cls)
+            md.__dict__ = {**template, **(mamba_shared if is_mamba else shared)}
+            groups.append(md)
+        if ctx.unified_mamba_state_indices is not None:
+            ctx.unified_mamba_state_indices.extend(rec.appended)
+        return {name: groups[i] for name, i in rec.layer_groups}
 
     def build_attention_metadata_for_layers(
         self,
@@ -6241,41 +6463,32 @@ class TPUModelRunner(GPUModelRunner):
             if seed_late:
                 self._stage_seed_copies_late(scheduler_output, start_index, num_reqs)
                 host_phases.mark("seed_copies_late")
-            trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
-            if "min_kv_len" in trace_kwargs:
-                trace_name += (
-                    f", kv_len min={trace_kwargs['min_kv_len']} "
-                    f"avg={trace_kwargs['avg_kv_len']} "
-                    f"max={trace_kwargs['max_kv_len']}"
+            prebuilt_scope = (
+                self._prebuilt_forward_scope(
+                    attn_metadata, num_tokens_padded, trace_kwargs
                 )
-
-            with (
-                TraceAnnotation(
-                    name=trace_name,
-                    num_reqs=num_reqs,
-                    **trace_kwargs,
-                ),
-                set_forward_context(
+                if envs.VLLM_TPU_FORWARD_CTX_PREBUILT
+                else None
+            )
+            if prebuilt_scope is not None:
+                with prebuilt_scope:
+                    hidden_states, aux_hidden_states = self.forward_model(
+                        input_ids=input_ids,
+                        positions=self.position_ids,
+                        inputs_embeds=inputs_embeds,
+                        intermediate_tensors=intermediate_tensors,
+                        model_kwargs=model_kwargs,
+                    )
+            else:
+                hidden_states, aux_hidden_states = self._forward_in_contexts(
                     attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_tokens_padded,
-                    num_tokens_across_dp=self._dp_num_tokens_across_dp(
-                        num_tokens_padded
-                    ),
-                ),
-                set_vllm_model_wrapper_context(
-                    mesh=self.mesh,
-                    vllm_config=self.vllm_config,
-                    kv_cache_bundle=self._kv_cache_bundle,
-                ),
-                self._stage_timing.stage("main_forward"),
-            ):
-                hidden_states, aux_hidden_states = self.forward_model(
-                    input_ids=input_ids,
-                    positions=self.position_ids,
-                    inputs_embeds=inputs_embeds,
-                    intermediate_tensors=intermediate_tensors,
-                    model_kwargs=model_kwargs,
+                    num_reqs,
+                    num_tokens_padded,
+                    trace_kwargs,
+                    input_ids,
+                    inputs_embeds,
+                    intermediate_tensors,
+                    model_kwargs,
                 )
             host_phases.mark("forward_dispatch")
             if pending_extract is not None:
@@ -11071,6 +11284,157 @@ class TPUModelRunner(GPUModelRunner):
             # Padding-mask support is currently limited to the ALL layout.
             num_valid_tokens = num_tokens_padded
         padding_state.update(num_valid_tokens, num_tokens_padded)
+
+    def _forward_in_contexts(
+        self,
+        attn_metadata,
+        num_reqs: int,
+        num_tokens_padded: int,
+        trace_kwargs: dict[str, Any],
+        input_ids,
+        inputs_embeds,
+        intermediate_tensors,
+        model_kwargs,
+    ):
+        """The main forward inside its trace annotation, vLLM forward
+        context, model wrapper context and stage timing."""
+        trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
+        if "min_kv_len" in trace_kwargs:
+            trace_name += (
+                f", kv_len min={trace_kwargs['min_kv_len']} "
+                f"avg={trace_kwargs['avg_kv_len']} "
+                f"max={trace_kwargs['max_kv_len']}"
+            )
+
+        with (
+            TraceAnnotation(
+                name=trace_name,
+                num_reqs=num_reqs,
+                **trace_kwargs,
+            ),
+            set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens_padded,
+                num_tokens_across_dp=self._dp_num_tokens_across_dp(
+                    num_tokens_padded
+                ),
+            ),
+            set_vllm_model_wrapper_context(
+                mesh=self.mesh,
+                vllm_config=self.vllm_config,
+                kv_cache_bundle=self._kv_cache_bundle,
+            ),
+            self._stage_timing.stage("main_forward"),
+        ):
+            return self.forward_model(
+                input_ids=input_ids,
+                positions=self.position_ids,
+                inputs_embeds=inputs_embeds,
+                intermediate_tensors=intermediate_tensors,
+                model_kwargs=model_kwargs,
+            )
+
+    def _forward_scope_static_ok(self) -> bool:
+        """VLLM_TPU_FORWARD_CTX_PREBUILT: the per-run half of the check, once:
+        vLLM's set_forward_context is the source `_PrebuiltForwardScope`
+        replicates, and this configuration never builds DP metadata (no DP,
+        no sequence-parallel MoE, so `set_forward_context` skips that branch,
+        and `_dp_num_tokens_across_dp` is None)."""
+        ok = self.__dict__.get("_forward_scope_ok")
+        if ok is None:
+            pc = self.vllm_config.parallel_config
+            builds_dp_metadata = (
+                pc.data_parallel_size > 1
+                or getattr(pc, "use_sequence_parallel_moe", False)
+            ) and getattr(pc, "is_moe_model", None) is not False
+            reason = None
+            if not _forward_ctx_source_matches():
+                reason = "vLLM set_forward_context differs from the replicated one"
+            elif builds_dp_metadata or self._dp_lockstep_enabled():
+                reason = "DP metadata is built per forward"
+            ok = self._forward_scope_ok = reason is None
+            logger.info(
+                "FORWARD_CTX_PREBUILT: %s",
+                "on" if ok else f"off ({reason}); the main forward keeps its "
+                "context stack",
+            )
+        return ok
+
+    def _prebuilt_forward_scope(
+        self, attn_metadata, num_tokens_padded: int, trace_kwargs: dict
+    ) -> "_PrebuiltForwardScope | None":
+        """VLLM_TPU_FORWARD_CTX_PREBUILT: the scope that stands in for
+        `_forward_in_contexts`' stack this step, or None to run the stack.
+
+        Exact only when each dropped piece would have done nothing: the trace
+        annotation records only while a profiler is on (its name and kwargs
+        are unused otherwise), stage timing does nothing without a sink
+        (`_has_sink` is called here as `stage()` would call it, keeping its
+        side effect), batch-size tracking is off, and the runner's context
+        functions are the ones `_PrebuiltForwardScope` replicates (not
+        patched). The ForwardContext is a new object every step, built from
+        the same arguments by vLLM's own create_forward_context, because the
+        forward writes into it (e.g. vLLM's MoE layer index) and its
+        attn_metadata changes every step. The VllmModelWrapperContext has the
+        same fields as the stack's but is reused while its inputs are the
+        same objects.
+        """
+        if trace_kwargs or TraceAnnotation.is_enabled():
+            return None
+        if (
+            set_forward_context is not _vllm_forward_context.set_forward_context
+            or set_vllm_model_wrapper_context
+            is not _wrapper_ctx.set_vllm_model_wrapper_context
+            or _vllm_forward_context.track_batchsize
+            or not self._forward_scope_static_ok()
+            or self._stage_timing._has_sink()
+        ):
+            return None
+        vllm_config = self.vllm_config
+        none_mode = CUDAGraphMode.NONE
+        platform = _vllm_forward_context.current_platform
+        additional_kwargs = platform.set_additional_forward_context(
+            attn_metadata=attn_metadata,
+            vllm_config=vllm_config,
+            dp_metadata=None,
+            num_tokens=num_tokens_padded,
+            num_tokens_across_dp=None,
+            cudagraph_runtime_mode=none_mode,
+            batch_descriptor=None,
+            ubatch_slices=None,
+        )
+        fc = _vllm_forward_context.create_forward_context(
+            attn_metadata,
+            vllm_config,
+            None,
+            none_mode,
+            None,
+            None,
+            None,
+            additional_kwargs,
+            False,
+            is_padding=None,
+        )
+        # The wrapper context is read-only to everything under it (nothing
+        # assigns its fields) and depends only on these three objects, so one
+        # built from the same objects is kept across steps.
+        mesh, bundle = self.mesh, self._kv_cache_bundle
+        cached = self.__dict__.get("_forward_scope_wrapper")
+        if (
+            cached is None
+            or cached.mesh is not mesh
+            or cached.vllm_config is not vllm_config
+            or cached.kv_cache_bundle is not bundle
+        ):
+            cached = self._forward_scope_wrapper = VllmModelWrapperContext(
+                kv_caches=None,
+                mesh=mesh,
+                layer_name_to_kvcache_index=None,
+                vllm_config=vllm_config,
+                kv_cache_bundle=bundle,
+            )
+        return _PrebuiltForwardScope(fc, cached)
 
     def forward_model(
         self,

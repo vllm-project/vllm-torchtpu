@@ -368,6 +368,7 @@ if TYPE_CHECKING:
     VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = False
     VLLM_TPU_CPU_PIN: str = "off"
     VLLM_TPU_HOST_PHASES: int = 0
+    VLLM_TPU_OUTPUT_PATH_LEAN: bool = False
     VLLM_TPU_PROMPT_IDS_NDARRAY: bool = False
     VLLM_TPU_PAW_SKIP_FULL: bool = False
     VLLM_TPU_PROMPT_IDS_NDARRAY_EARLY: bool = False
@@ -432,6 +433,8 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_TRYFWD_LEAN: bool = False
     VLLM_TPU_FAST_METADATA_BUILD: bool = False
     VLLM_TPU_STEADY_DECODE_METADATA: bool = False
+    VLLM_TPU_ATTN_METADATA_REUSE: bool = False
+    VLLM_TPU_FORWARD_CTX_PREBUILT: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
     VLLM_TPU_MK_WHOLE_DIRECT_EXEC: bool = False
     VLLM_TPU_ENVS_FREEZE: bool = False
@@ -2450,6 +2453,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log each rank's per-step host time by runner phase every N steps
     # (0 = off); runner/host_phases.py.
     "VLLM_TPU_HOST_PHASES": env_nonnegative_int("VLLM_TPU_HOST_PHASES", 0),
+    # Output rank under async scheduling: send execute_model's None response
+    # inline on the step thread when the output thread is idle (queued as
+    # before otherwise, so the engine sees the same responses in the same
+    # order), and write responses to the reply ring with a reused pickler
+    # and buffer (same bytes; falls back to vLLM's enqueue outside the
+    # free-slot in-ring case); worker/output_path_lean.py.
+    "VLLM_TPU_OUTPUT_PATH_LEAN": env_bool("VLLM_TPU_OUTPUT_PATH_LEAN"),
     # Ship a new request's prompt token ids to the workers as one int32
     # ndarray (converted once when the request is added) instead of a Python
     # list. A ~100K-token agentic prompt otherwise costs every rank a list
@@ -2750,6 +2760,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # walk's mamba indices while no request can cross a mamba block
     # (runner/steady_decode_metadata.py). Any other step rebuilds as before.
     "VLLM_TPU_STEADY_DECODE_METADATA": env_bool("VLLM_TPU_STEADY_DECODE_METADATA"),
+    # With VLLM_TPU_STEADY_DECODE_METADATA: a steady-decode target walk whose
+    # staged-walk inputs repeat the previous walk's (same block-table version,
+    # geometry, upload and walk products, mamba offsets stable) takes the
+    # previous walk's tables and mamba products without re-deriving the stage
+    # key and geometry over every group, and the inline metadata build reuses
+    # each group's per-group fields, filling only the per-step ones (positions,
+    # seq_lens, ...). Same objects in every field; see
+    # attention_metadata._steady_stage_fast_path and
+    # tpu_runner._build_attention_metadata_staged.
+    "VLLM_TPU_ATTN_METADATA_REUSE": env_bool("VLLM_TPU_ATTN_METADATA_REUSE"),
+    # The main forward's contexts without the per-step context-manager stack:
+    # when no trace annotation, stage timing, DP metadata or batch-size
+    # tracking would act, set vLLM's forward context and the model wrapper
+    # context directly (a fresh ForwardContext from vLLM's own
+    # create_forward_context and a fresh VllmModelWrapperContext each step,
+    # as before) and restore both on exit. Falls back to the original
+    # `with` stack whenever any of those is live or vLLM's
+    # set_forward_context is not the version this replicates
+    # (tpu_runner._prebuilt_forward_scope).
+    "VLLM_TPU_FORWARD_CTX_PREBUILT": env_bool("VLLM_TPU_FORWARD_CTX_PREBUILT"),
     # Freshly AOT-compiled models skip the per-call Dynamo guard check when
     # vLLM does not evaluate guards (as it already does for cached artifacts).
     "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),

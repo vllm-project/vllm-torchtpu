@@ -821,6 +821,22 @@ def stage_block_table_uploads(
         # groups exist; each build() synthesizes its own table there.
         return
 
+    # VLLM_TPU_ATTN_METADATA_REUSE: only steady-decode target walks (whole
+    # batch, `steady_walk_bounds` set) use or seed the fast path, so a draft or
+    # dummy walk in between leaves the record alone; anything such a walk
+    # changes is caught by the record's identity checks.
+    steady_target = (
+        gids is None
+        and ctx.steady_walk_bounds is not None
+        and envs.VLLM_TPU_ATTN_METADATA_REUSE
+    )
+    if steady_target:
+        if _steady_stage_fast_path(runner, ctx, num_reqs_padded):
+            note_metadata_reuse("stage", True)
+            return
+        note_metadata_reuse("stage", False)
+        runner._steady_stage_record = None
+
     # Walk in the same order the builds will, deduping shared group ids. The
     # result depends only on the groups and the walk's geometry inputs, so
     # VLLM_TPU_STAGE_ENTRIES_CACHE keeps it instead of re-walking all groups
@@ -899,6 +915,183 @@ def stage_block_table_uploads(
         reused_key,
         stage_key,
     )
+    if steady_target:
+        _record_steady_stage(runner, ctx, num_reqs_padded, stage_key)
+
+
+@dataclass
+class _SteadyStageRecord:
+    """VLLM_TPU_ATTN_METADATA_REUSE: what the last steady-decode target walk
+    of `stage_block_table_uploads` ran on and produced. See
+    `_steady_stage_fast_path` for why it is exact."""
+
+    # `_steady_stage_key`: every scalar input of the walk's stage key and
+    # geometry.
+    key: tuple
+    # The objects the walk read, compared by identity (the record holds them,
+    # so an id cannot be recycled while it lives).
+    attn_groups: Any
+    input_batch: Any
+    entries_cache: tuple
+    stage_prev: tuple
+    walk: SteadyWalkProducts
+    # The `ctx.staged_mamba_products` the walk handed the build: a function of
+    # `walk.products` and the (fixed) geometry. Read-only downstream.
+    mamba_products: dict
+    # One `(_, num_blocks, block_size)` per mamba geometry class: all
+    # `mamba_offsets_stable` reads of the geometry.
+    mamba_classes: tuple
+
+
+def _steady_stage_key(runner: Any, ctx: AttentionMetadataBuilderContext, n: int):
+    return (
+        _BLOCK_TABLE_VERSION[0],
+        ctx.start_index,
+        ctx.num_reqs,
+        n,
+        ctx.use_max_model_len,
+        ctx.mamba_ckpt_window,
+        ctx.mamba_state_indices is None and bool(runner._unified_kv_layout),
+        ctx.position_ids_override is None,
+        bool(envs.VLLM_TPU_STAGE_ENTRIES_CACHE),
+        bool(envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE),
+        bool(envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER),
+        bool(envs.VLLM_TPU_STAGED_WALK_STACKED),
+    )
+
+
+def _record_steady_stage(
+    runner: Any, ctx: AttentionMetadataBuilderContext, n: int, stage_key: tuple
+) -> None:
+    """Seed `_steady_stage_record` after a full steady-decode target walk
+    that left the steady-walk state matching this walk: the upload record
+    keyed on this walk's stage key, and the steady walk products this walk
+    either reused (bounds chained to this ctx's) or produced."""
+    d = runner.__dict__
+    walk = d.get("_steady_walk_products")
+    prev = d.get("_block_table_stage_prev")
+    entries_cache = d.get("_stage_entries_cache")
+    if (
+        walk is None
+        or walk.bounds is not ctx.steady_walk_bounds
+        or walk.stage_key != stage_key
+        or walk.staged_block_tables is not ctx.staged_block_tables
+        or prev is None
+        or prev[3] != stage_key
+        or entries_cache is None
+        or ctx.staged_mamba_products is None
+        or not envs.VLLM_TPU_STAGE_ENTRIES_CACHE
+        or not envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE
+        or ctx.position_ids_override is not None
+    ):
+        return
+    mamba_geom = walk.geometry[1]
+    classes = tuple((None, t, bs) for t, bs in {(t, bs) for _, t, bs in mamba_geom})
+    runner._steady_stage_record = _SteadyStageRecord(
+        key=_steady_stage_key(runner, ctx, n),
+        attn_groups=runner.attn_groups,
+        input_batch=runner.input_batch,
+        entries_cache=entries_cache,
+        stage_prev=prev,
+        walk=walk,
+        mamba_products=ctx.staged_mamba_products,
+        mamba_classes=classes,
+    )
+
+
+# VLLM_TPU_ATTN_METADATA_REUSE self-check: hit / miss counts of the two reuse points
+# (block-table stage walk, per-group metadata build) on steady-decode target walks,
+# logged on TP rank 0 after the first REUSE_LOG_FIRST stage attempts and then every
+# REUSE_LOG_EVERY. Counting only; no decision reads these.
+REUSE_LOG_FIRST, REUSE_LOG_EVERY = 1000, 50000
+_reuse_counts = {"stage": [0, 0], "build": [0, 0]}  # kind -> [hits, misses]
+
+
+def _reuse_rank0() -> bool:
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank() == 0
+    except Exception:  # no TP group (CPU tests, tools)
+        return True
+
+
+def metadata_reuse_line() -> str:
+    parts = []
+    for kind, (hit, miss) in _reuse_counts.items():
+        n = hit + miss
+        parts.append(f"{kind} {hit}/{n} ({100.0 * hit / n if n else 0.0:.1f}%)")
+    return "VLLM_TPU_ATTN_METADATA_REUSE hits: " + ", ".join(parts)
+
+
+def note_metadata_reuse(kind: str, hit: bool) -> None:
+    c = _reuse_counts[kind]
+    c[0 if hit else 1] += 1
+    if kind != "stage":
+        return
+    n = c[0] + c[1]
+    if (n == REUSE_LOG_FIRST or (n > REUSE_LOG_FIRST and n % REUSE_LOG_EVERY == 0)) and _reuse_rank0():
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(metadata_reuse_line())
+
+
+def _steady_stage_fast_path(
+    runner: Any, ctx: AttentionMetadataBuilderContext, n: int
+) -> bool:
+    """VLLM_TPU_ATTN_METADATA_REUSE: hand this steady-decode target walk the
+    previous walk's tables and mamba products when the full walk would
+    reuse them too, without re-deriving the per-group entries, table
+    geometry, stage key and steady geometry (one Python pass per group, 59
+    groups on Qwen3.8, every step).
+
+    Exact: the full walk takes `_issue_walk_products`' steady branch
+    (`ctx.staged_block_tables = walk.staged_block_tables`, products =
+    `walk.products`) iff (a) `ctx.steady_hit`, (b) the upload is reused
+    outright (`_block_table_stage_prev[3] == stage_key`), (c)
+    `walk.stage_key == stage_key`, (d) `walk.geometry` equals this walk's and
+    (e) `mamba_offsets_stable(walk.bounds, bounds, mamba_geom)`. The stage
+    key is (block-table version, the entries' table ids, start_index,
+    num_reqs, table geometry) and the geometry is (table geometry, mamba
+    geometry, ckpt window, stacked, class gather, gids); with the entries
+    cache on, entries and their builders come from `_stage_entries_cache`,
+    whose key is (attn_groups, input_batch, use_max_model_len, ckpt window,
+    gids). So an equal `_steady_stage_key`, the same `attn_groups`,
+    `input_batch` and `_stage_entries_cache` objects give the recorded walk's
+    stage key and geometry; the same `_block_table_stage_prev` and
+    `_steady_walk_products` objects give (b)-(d) (checked when the record was
+    made, and neither object is mutated but `walk.bounds`); (a) and (e) are
+    checked here. The record's `mamba_products` is the dict the full walk
+    builds from `walk.products` for this geometry. The full walk's other side
+    effects are the steady counters and the bounds chaining, done here, and
+    `_record_ro_group_shapes`, which re-adds shapes the recorded walk
+    already added.
+    """
+    rec = runner.__dict__.get("_steady_stage_record")
+    if rec is None or not ctx.steady_hit:
+        return False
+    d = runner.__dict__
+    if (
+        rec.attn_groups is not runner.attn_groups
+        or rec.input_batch is not runner.input_batch
+        or d.get("_stage_entries_cache") is not rec.entries_cache
+        or d.get("_block_table_stage_prev") is not rec.stage_prev
+        or d.get("_steady_walk_products") is not rec.walk
+        or rec.key != _steady_stage_key(runner, ctx, n)
+    ):
+        return False
+    walk = rec.walk
+    bounds = ctx.steady_walk_bounds
+    if not mamba_offsets_stable(walk.bounds, bounds, rec.mamba_classes):
+        return False
+    ctx.staged_block_tables = walk.staged_block_tables
+    ctx.staged_mamba_products = rec.mamba_products
+    walk.bounds = bounds
+    cache = d.get("_steady_decode_cache")
+    if cache is not None:
+        cache.walks += 1
+        cache.walk_skips += 1
+    return True
 
 
 def _pack_and_upload(runner, ctx, entries, num_reqs_padded, table_geom, stage_key):
