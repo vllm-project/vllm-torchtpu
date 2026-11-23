@@ -228,6 +228,72 @@ class SpecBoundaryPlan(NamedTuple):
     host_entries: torch.Tensor
 
 
+# The AttentionMetadata fields `_build_attention_metadata_staged` takes from
+# the step (its `shared` dict) and, for mamba groups, from the builder context
+# as well; every other field is per group.
+_MD_STEP_FIELDS = (
+    "input_positions",
+    "seq_lens",
+    "query_start_loc",
+    "request_distribution",
+    "sequence_layout_kind",
+    "sequence_layout_protocol",
+    "sequence_layout_version",
+)
+_MD_MAMBA_STEP_FIELDS = _MD_STEP_FIELDS + (
+    "mamba_slot_read_offsets",
+    "mamba_request_distribution",
+    "mamba_prefill_ckpt",
+)
+
+
+@dataclass
+class _AttentionMetadataReuse:
+    """VLLM_TPU_ATTN_METADATA_REUSE: the last steady-decode inline build's
+    per-group inputs (compared by identity; held here so no id is recycled)
+    and, per group, its class and field dict with the step fields blanked.
+    See `TPUModelRunner._reuse_attention_metadata`."""
+
+    plan: tuple
+    staged: dict
+    products: dict | None
+    compact: Any
+    key: tuple
+    # (class, fields with the step fields set to None, is_mamba) per group.
+    templates: tuple
+    # (layer name, index into templates), in the build's insertion order.
+    layer_groups: tuple
+    # What the build appended to ctx.unified_mamba_state_indices, in order.
+    appended: tuple
+
+    @classmethod
+    def record(cls, plan, staged, products, compact, key, built_groups, appended):
+        templates = []
+        layer_groups = []
+        for i, ((_, is_mamba, layer_names), md) in enumerate(
+            zip(plan[1], built_groups, strict=True)
+        ):
+            step = _MD_MAMBA_STEP_FIELDS if is_mamba else _MD_STEP_FIELDS
+            fields = dict(md.__dict__)
+            for name in step:
+                # Blank, not dropped: keeps the constructor's field order
+                # and holds no earlier step's tensors.
+                assert name in fields, name
+                fields[name] = None
+            templates.append((type(md), fields, is_mamba))
+            layer_groups.extend((name, i) for name in layer_names)
+        return cls(
+            plan=plan,
+            staged=staged,
+            products=products,
+            compact=compact,
+            key=key,
+            templates=tuple(templates),
+            layer_groups=tuple(layer_groups),
+            appended=tuple(appended),
+        )
+
+
 @dataclass
 class ExecuteModelState:
     scheduler_output: "SchedulerOutput"
@@ -2750,6 +2816,26 @@ class TPUModelRunner(GPUModelRunner):
         compact = ctx.mamba_state_indices
         unified = compact is None and self._unified_kv_layout
         products = ctx.staged_mamba_products
+        reuse_key = None
+        # Steady-decode target walks only (a draft or dummy build in between
+        # neither uses nor evicts the record); the reuse itself rests on
+        # identity alone, not on the step being a steady hit.
+        if ctx.steady_walk_bounds is not None and envs.VLLM_TPU_ATTN_METADATA_REUSE:
+            reuse_key = (
+                bool(unified),
+                ctx.unified_mamba_state_indices is not None,
+                bool(envs.VLLM_TPU_STAGED_WALK_STACKED),
+            )
+            rec = self.__dict__.get("_attn_metadata_reuse")
+            if (
+                rec is not None
+                and rec.plan is plan
+                and rec.staged is staged
+                and rec.products is products
+                and rec.compact is compact
+                and rec.key == reuse_key
+            ):
+                return self._reuse_attention_metadata(ctx, rec)
         for gid, is_mamba, _ in plan[1]:
             if gid not in staged or (
                 is_mamba and unified and (products is None or gid not in products)
@@ -2766,6 +2852,12 @@ class TPUModelRunner(GPUModelRunner):
             sequence_layout_version=descriptor.version,
         )
         per_layer: dict[str, AttentionMetadata] = {}
+        built_groups: list[AttentionMetadata] = []
+        appended_from = (
+            len(ctx.unified_mamba_state_indices)
+            if ctx.unified_mamba_state_indices is not None
+            else 0
+        )
         for gid, is_mamba, layer_names in plan[1]:
             if is_mamba:
                 ckpt = None
@@ -2800,9 +2892,74 @@ class TPUModelRunner(GPUModelRunner):
                 )
             else:
                 built = AttentionMetadata(block_tables=staged[gid], **shared)
+            built_groups.append(built)
             for layer_name in layer_names:
                 per_layer[layer_name] = built
+        if reuse_key is not None:
+            self._attn_metadata_reuse = _AttentionMetadataReuse.record(
+                plan,
+                staged,
+                products,
+                compact,
+                reuse_key,
+                built_groups,
+                (
+                    ctx.unified_mamba_state_indices[appended_from:]
+                    if ctx.unified_mamba_state_indices is not None
+                    else []
+                ),
+            )
         return per_layer
+
+    def _reuse_attention_metadata(
+        self, ctx, rec: "_AttentionMetadataReuse"
+    ) -> dict[str, AttentionMetadata]:
+        """VLLM_TPU_ATTN_METADATA_REUSE: `_build_attention_metadata_staged`
+        for a step whose per-group inputs are the recorded build's.
+
+        A group's metadata is (its per-group fields) + (the step fields, the
+        same for every group of its kind). The per-group fields --
+        `block_tables = staged[gid]`, the mamba state / checkpoint ids or the
+        stack ref, the stack row -- are functions of (`staged`, `products`,
+        `compact`, `unified`, the plan), all identical to the recorded
+        build's (same objects; nothing writes into the staged-table or
+        products dicts after the walk returns them), so the recorded values
+        are what the build would compute. The step fields are taken from this
+        ctx exactly as the build takes them: positions, seq_lens,
+        query_start_loc, request distributions, read offsets, the prefill
+        checkpoint and the sequence layout all change between steps (or may)
+        and are never reused. Each group still gets a new object of the same
+        class with the same field order, as the build's constructor call
+        gives it (neither class defines `__post_init__`), so nothing that
+        holds or replaces an earlier step's metadata sees a change. The
+        build's one side effect, appending the per-group state ids to
+        `ctx.unified_mamba_state_indices`, is replayed in order.
+        """
+        descriptor = ctx.sequence_layout_descriptor
+        shared = dict(
+            input_positions=self.position_ids,
+            seq_lens=ctx.seq_lens,
+            query_start_loc=ctx.query_start_loc,
+            request_distribution=ctx.request_distribution,
+            sequence_layout_kind=descriptor.kind.value,
+            sequence_layout_protocol=descriptor.protocol,
+            sequence_layout_version=descriptor.version,
+        )
+        mamba_shared = dict(
+            shared,
+            mamba_slot_read_offsets=ctx.mamba_slot_read_offsets,
+            mamba_request_distribution=ctx.mamba_request_distribution,
+            mamba_prefill_ckpt=ctx.mamba_prefill_ckpt,
+        )
+        new = object.__new__
+        groups = []
+        for cls, template, is_mamba in rec.templates:
+            md = new(cls)
+            md.__dict__ = {**template, **(mamba_shared if is_mamba else shared)}
+            groups.append(md)
+        if ctx.unified_mamba_state_indices is not None:
+            ctx.unified_mamba_state_indices.extend(rec.appended)
+        return {name: groups[i] for name, i in rec.layer_groups}
 
     def build_attention_metadata_for_layers(
         self,
