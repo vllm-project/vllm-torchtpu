@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
     TPU_MOE_ROUTER_FUSED_EPILOGUE: bool = False
     TPU_KV_PACK_FUSED_PAD: bool = False
+    TPU_KV_SCATTER_PAIR: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -812,6 +813,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # example 16 tokens padded to 32 rows at decode). The written cache is
     # bit-identical. SparseCore cache layout only. Off by default.
     "TPU_KV_PACK_FUSED_PAD": env_bool("TPU_KV_PACK_FUSED_PAD"),
+    # Write the nope and rope MLA KV caches of a layer with one SparseCore
+    # program (kernels/mla/scatter_utils.scatter_rows_pair) instead of one
+    # program per cache. Both writes use the same destination rows, so the
+    # second program only adds a launch and an input DMA wait per layer. The
+    # written caches are bit-identical. Applies only when both caches use the
+    # SparseCore layout. Off by default.
+    "TPU_KV_SCATTER_PAIR": env_bool("TPU_KV_SCATTER_PAIR"),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's

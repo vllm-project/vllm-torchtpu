@@ -257,6 +257,107 @@ class SparseMLAScatterTest(parameterized.TestCase):
                 np.asarray(outs[1]), np.asarray(outs[0]), err_msg=key
             )
 
+    @parameterized.named_parameters(
+        dict(
+            testcase_name=f"{name}_pad{fused_pad}",
+            num_seqs=num_seqs,
+            tokens_per_seq=tokens_per_seq,
+            fused_pad=fused_pad,
+        )
+        for name, num_seqs, tokens_per_seq in (
+            ("decode_b16", 16, 1),
+            ("decode_b32", 32, 1),
+            ("decode_b256", 256, 1),
+            ("prefill_b2_t128", 2, 128),
+        )
+        for fused_pad in ("0", "1")
+    )
+    def test_scatter_pair_matches_two_scatters(
+        self, num_seqs, tokens_per_seq, fused_pad
+    ):
+        """`scatter.scatter_pair` (one SparseCore program) writes caches
+        bit-identical to two `scatter.scatter` calls. The destinations include
+        SKIP_ROW (a padded token or a row another DCP rank owns) and a row past
+        the end of the cache; both must be dropped in both caches."""
+        inp = self._generate_inputs(num_seqs, tokens_per_seq, 1024, 64)
+        nope_spec, rope_spec = inp["specs"]["nope_sc"], inp["specs"]["rope_sc"]
+        dst_rows = kv_cache_utils.get_dst_rows(
+            num_tokens=inp["num_tokens"],
+            seq_lens=inp["seq_lens"],
+            block_tables=inp["block_tables"],
+            query_start_loc=inp["query_start_loc"],
+            page_size=PAGE_SIZE,
+        )
+        num_rows = nope_spec.num_pages * nope_spec.page_size
+        dst_rows = dst_rows.at[1::3].set(SKIP_ROW).at[2::7].set(num_rows + 5)
+        # Nonzero caches, so a dropped token that was written anyway, or a
+        # write to the wrong cache, changes a visible byte.
+        nope_cache = jnp.full(nope_spec.shape, 0x5A5A5A5A, nope_spec.jax_dtype)
+        rope_cache = jnp.full(rope_spec.shape, 0xA5A5A5A5, rope_spec.jax_dtype)
+        with mock.patch.dict(os.environ, {"TPU_KV_PACK_FUSED_PAD": fused_pad}):
+            want_nope = scatter.scatter(
+                nope_cache, inp["kv_c_normed"], nope_spec, dst_rows=dst_rows
+            )
+            want_rope = scatter.scatter(
+                rope_cache, inp["k_pe"], rope_spec, dst_rows=dst_rows
+            )
+            got_nope, got_rope = scatter.scatter_pair(
+                nope_cache,
+                inp["kv_c_normed"],
+                nope_spec,
+                rope_cache,
+                inp["k_pe"],
+                rope_spec,
+                dst_rows,
+            )
+        np.testing.assert_array_equal(np.asarray(got_nope), np.asarray(want_nope))
+        np.testing.assert_array_equal(np.asarray(got_rope), np.asarray(want_rope))
+        # Positive control: the comparison detects a rope write one row off.
+        shifted = jnp.where(dst_rows >= 0, dst_rows + 1, dst_rows)
+        wrong_rope = scatter.scatter(
+            rope_cache, inp["k_pe"], rope_spec, dst_rows=shifted
+        )
+        self.assertFalse(np.array_equal(np.asarray(got_rope), np.asarray(wrong_rope)))
+
+    def test_update_with_scatter_pair_matches_the_jnp_writer(self):
+        """`TPU_KV_SCATTER_PAIR=1` through `update_sparse_mla_kv_cache` and
+        the DCP writer equals the pure-XLA writer."""
+        inp = self._generate_inputs(8, 16, 512, 64)
+        specs = {
+            "nope_spec": inp["specs"]["nope_sc"],
+            "rope_spec": inp["specs"]["rope_sc"],
+        }
+        args = (
+            inp["caches"]["nope_sc"],
+            inp["caches"]["rope_sc"],
+            inp["kv_c_normed"],
+            inp["k_pe"],
+            inp["seq_lens"],
+            inp["block_tables"],
+            inp["query_start_loc"],
+        )
+        env = {"TPU_KV_SCATTER_PAIR": "1", "TPU_KV_PACK_FUSED_PAD": "1"}
+        with mock.patch.dict(os.environ, env):
+            got = kv_cache_utils.update_sparse_mla_kv_cache(*args, **specs)
+            dcp_kwargs = dict(specs, dcp_size=4, interleave_size=64)
+            got_dcp = [
+                kv_cache_utils.update_sparse_mla_kv_cache_dcp(
+                    *args, jnp.int32(rank), **dcp_kwargs
+                )
+                for rank in range(4)
+            ]
+        want = kv_cache_utils.update_sparse_mla_kv_cache_jax(*args, **specs)
+        for g, w in zip(got, want):
+            np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+        for rank, got_rank in enumerate(got_dcp):
+            want_rank = kv_cache_utils.update_sparse_mla_kv_cache_dcp_jax(
+                *args, jnp.int32(rank), **dcp_kwargs
+            )
+            for g, w in zip(got_rank, want_rank):
+                np.testing.assert_array_equal(
+                    np.asarray(g), np.asarray(w), err_msg=f"rank {rank}"
+                )
+
     def test_nope_sparsecore_is_byte_identical_to_tensorcore(self):
         """`pack_tokens` reproduces the TC sublane fold, so the two nope
         caches hold the same physical bytes -- which is why `dsa_gather` needs

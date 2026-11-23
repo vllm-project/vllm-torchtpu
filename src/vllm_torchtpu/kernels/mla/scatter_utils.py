@@ -267,3 +267,166 @@ def scatter_rows(
     )(dst_rows, src.reshape(-1, row_width), cache_ref)
 
     return jax.freeze(cache_ref).reshape(cache.shape)
+
+
+def _scatter_pair_kernel(
+    dst_hbm_ref: Any,
+    src_a_ref: Any,
+    src_b_ref: Any,
+    cache_a_ref: Any,
+    cache_b_ref: Any,
+    sem: Any,
+    *,
+    core_axis_name: str,
+    subcore_axis_name: str,
+    plan: Plan,
+) -> None:
+    """`_scatter_kernel` for two uint32 caches that share `dst_rows`.
+
+    Lane `i` of a block issues two DMAs: row `i` of `src_a` to row `dst` of
+    `cache_a` on semaphore `i`, and row `i` of `src_b` to row `dst` of
+    `cache_b` on semaphore `lanes_per_block + i`. Both DMAs use the same write
+    predicate as `_scatter_kernel`, so each cache receives exactly the rows
+    that a separate `scatter_rows` call would write.
+    """
+    core_index = lax.axis_index((core_axis_name, subcore_axis_name))
+    num_rows_a = cache_a_ref.shape[0]
+    num_rows_b = cache_b_ref.shape[0]
+    lanes = plan.lanes_per_block
+
+    block_slot = core_index // plan.cores_per_block
+    lane_group = lax.rem(core_index, plan.cores_per_block)
+
+    def block_index(step):
+        return step * plan.blocks_per_round + block_slot
+
+    def body(dst_ref, src_a_buf, src_b_buf):
+        dst_rows = dst_ref[...]
+        copies = []
+        for i in range(lanes):
+            dst = dst_rows[i]
+            owned = dst >= 0
+            if plan.cores_per_block > 1:
+                owned = jnp.logical_and(owned, lane_group == i // plan.lanes_per_core)
+            for src_buf, cache, num_rows, sem_index in (
+                (src_a_buf, cache_a_ref, num_rows_a, i),
+                (src_b_buf, cache_b_ref, num_rows_b, lanes + i),
+            ):
+                write = jnp.logical_and(owned, dst < num_rows)
+                copy = pltpu.make_async_copy(
+                    src_buf.at[pl.ds(i, 1)],
+                    cache.at[pl.ds(jnp.clip(dst, 0, num_rows - 1), 1)],
+                    sem.at[sem_index],
+                )
+                copies.append((write, copy))
+
+                @pl.when(write)
+                def _(copy=copy):
+                    copy.start()
+
+        for write, copy in copies:
+
+            @pl.when(write)
+            def _(copy=copy):
+                copy.wait()
+
+    pltpu.emit_pipeline(
+        body,
+        grid=(plan.steps_per_core,),
+        tiling=pltpu.Tiling.SPARSE_CORE,
+        in_specs=(
+            pl.BlockSpec((lanes,), lambda r: (block_index(r),)),
+            pl.BlockSpec((lanes, src_a_ref.shape[-1]), lambda r: (block_index(r), 0)),
+            pl.BlockSpec((lanes, src_b_ref.shape[-1]), lambda r: (block_index(r), 0)),
+        ),
+    )(dst_hbm_ref, src_a_ref, src_b_ref)
+
+
+def scatter_rows_pair(
+    cache_a: jax.Array,
+    src_a: jax.Array,
+    cache_b: jax.Array,
+    src_b: jax.Array,
+    dst_rows: jax.Array,
+    name: str = "scatter_kv_cache_pair",
+) -> tuple[jax.Array, jax.Array]:
+    """Writes row `t` of `src_a` and of `src_b` to row `dst_rows[t]` of each cache.
+
+    The result equals `scatter_rows(cache_a, src_a, dst_rows)` followed by
+    `scatter_rows(cache_b, src_b, dst_rows)`. The difference is that one
+    SparseCore program issues both writes. The MLA KV cache write stores every
+    token in two caches (nope and rope) at the same destination row, so one
+    program per layer saves the fixed cost of a second SparseCore launch: the
+    launch preamble, the idle gap between two programs, and one wait for the
+    input DMA of `dst_rows`.
+
+    Only the native SparseCore layout (uint32 caches, one word row per token)
+    is supported. The TensorCore-tiled uint8 layout folds several rows into one
+    word row and stays on `scatter_rows`.
+
+    Args:
+      cache_a: first uint32 KV cache in HBM, any leading dims; flattened to one
+        row per token.
+      src_a: `[n, row_width_a]` uint32 rows for `cache_a`. `n` is the real token
+        count or `padded_num_tokens(num_tokens)`.
+      cache_b: second uint32 KV cache, same contract as `cache_a`. The row width
+        may differ from `cache_a`, for example 16 words of rope and 128 words of
+        nope per token.
+      src_b: `[n, row_width_b]` uint32 rows for `cache_b`.
+      dst_rows: `[num_tokens]` destination row, shared by both caches. A
+        negative value, or a value outside a cache, drops that token for that
+        cache.
+      name: Pallas kernel name, as it appears in a profile.
+
+    Returns:
+      `(cache_a, cache_b)` updated, with the input shapes and dtypes.
+    """
+    for label, cache, src in (("a", cache_a, src_a), ("b", cache_b, src_b)):
+        assert cache.dtype == jnp.uint32 and src.dtype == jnp.uint32, (
+            f"scatter_rows_pair supports uint32 (SparseCore) caches only; cache_{label}"
+            f" is {cache.dtype}, src_{label} is {src.dtype}"
+        )
+        assert cache.size % src.shape[-1] == 0, (
+            f"cache_{label} of {cache.size} words is not a whole number of"
+            f" {src.shape[-1]}-word rows"
+        )
+
+    sc_info = pltpu.get_tpu_info().sparse_core
+    assert sc_info is not None, "SparseCore info is missing."
+    # Sized from the real token count, as in `scatter_rows`. Both sources use
+    # the same plan, so the padded `dst_rows` is shared.
+    plan = _sparse_core_plan(dst_rows.shape[0])
+    src_a, padded_dst_rows = pad_to_plan(src_a, dst_rows, plan.total_tokens)
+    src_b, _ = pad_to_plan(src_b, dst_rows, plan.total_tokens)
+
+    cache_a_ref = jax.new_ref(cache_a.reshape(-1, src_a.shape[-1]))
+    cache_b_ref = jax.new_ref(cache_b.reshape(-1, src_b.shape[-1]))
+
+    vector_mesh = plsc.VectorSubcoreMesh(
+        num_cores=sc_info.num_cores,
+        num_subcores=sc_info.num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    pl.kernel(
+        functools.partial(
+            _scatter_pair_kernel,
+            core_axis_name=vector_mesh.core_axis_name,
+            subcore_axis_name=vector_mesh.subcore_axis_name,
+            plan=plan,
+        ),
+        out_type=(),
+        scratch_types=(pltpu.SemaphoreType.DMA((2 * plan.lanes_per_block,)),),
+        compiler_params=pltpu.CompilerParams(
+            use_tc_tiling_on_sc=False,
+            needs_layout_passes=True,
+            disable_bounds_checks=True,
+        ),
+        mesh=vector_mesh,
+        name=name,
+    )(padded_dst_rows, src_a, src_b, cache_a_ref, cache_b_ref)
+
+    return (
+        jax.freeze(cache_a_ref).reshape(cache_a.shape),
+        jax.freeze(cache_b_ref).reshape(cache_b.shape),
+    )
