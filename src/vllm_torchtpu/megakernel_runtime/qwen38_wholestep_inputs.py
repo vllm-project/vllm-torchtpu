@@ -234,6 +234,11 @@ def qsa_step_inputs(
     # First position of the group a verify window of T = 4 completes (stock: the group's
     # first member's position, from the step or from the ring tags).
     j0 = ctx + (GROUP - 1 - ctx % GROUP) % GROUP - (GROUP - 1)
+    lean_rope = io_lean("rope")
+    if lean_rope:
+        # VLLM_TPU_MK_IO_LEAN=rope: one gather + widen for both row sets (same rows, same
+        # values) instead of two gathers and two converts.
+        both = trig32(jnp.concatenate([pos, jnp.maximum(j0, 0)]))
     return {
         "qsa_pool": pool,
         "qsa_ck": pool.reshape(-1, 128 // GROUP // 2, pool.shape[-2], pool.shape[-1]),
@@ -243,10 +248,10 @@ def qsa_step_inputs(
         "qsa_mtab": mtab,
         "qsa_off": jnp.asarray([max(m, 0) for m, _ in slots], jnp.int32),
         "qsa_scales": jnp.asarray([k_scale, v_scale], jnp.float32),
-        "qsa_rope": trig32(pos),
+        "qsa_rope": both[:M] if lean_rope else trig32(pos),
         "qsa_ctx": ctx,
         "qsa_ring": ring,
-        "qsa_rope_ck": trig32(jnp.maximum(j0, 0))[:, None, :],
+        "qsa_rope_ck": (both[M:] if lean_rope else trig32(jnp.maximum(j0, 0)))[:, None, :],
     }
 
 

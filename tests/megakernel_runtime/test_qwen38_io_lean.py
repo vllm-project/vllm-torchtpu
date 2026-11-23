@@ -138,7 +138,7 @@ def test_qsa_step_inputs_lean_is_bitwise(mp, layer_major, big_ids, monkeypatch):
     flat = [x for t in tables for x in t]
     lean_tabs = ring_columns(flat, n_req)
     lean_tabs = [tuple(lean_tabs[i:i + 3]) for i in range(0, len(lean_tabs), 3)]
-    got = run("ring,cktab", lean_tabs)
+    got = run("ring,cktab,rope", lean_tabs)
     assert want.keys() == got.keys()
     for k in want:
         a, b = np.asarray(want[k]), np.asarray(got[k])
