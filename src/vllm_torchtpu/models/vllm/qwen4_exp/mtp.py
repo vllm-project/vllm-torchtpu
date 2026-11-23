@@ -43,6 +43,7 @@ from vllm_torchtpu import envs as vllm_torchtpu_envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from .config import mtp_layer_prefixes
+from .draft_lm_head import maybe_fp8_draft_lm_head
 from .hyperconnection import GatedResidual, legacy_prefill_policy
 from .model import (
     Qwen4ExpDecoderLayer,
@@ -380,6 +381,12 @@ class Qwen4ExpMTP(nn.Module):
                 "_selection_rows", torch.full_like(sink, -1), persistent=False
             )
         return True
+
+    def bind_draft_lm_head(self) -> bool:
+        """VLLM_TPU_DRAFT_LMHEAD_FP8: after the proposer bound the target's head on the
+        draft, give the draft its own FP8 copy (`draft_lm_head.py`; NOT bitwise, the
+        target head is untouched). Returns whether it bound."""
+        return maybe_fp8_draft_lm_head(self)
 
     def carry_shared_selection(self, rows: torch.Tensor, num_tokens: int) -> None:
         """What stock draft step 0 does to the shared selection, for a step 0 that does
