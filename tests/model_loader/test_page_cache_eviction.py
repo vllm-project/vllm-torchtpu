@@ -20,10 +20,17 @@ prefetch first, or the prefetch reads the evicted pages back in. No TPU, no
 network.
 """
 
+import datetime
+import json
+import logging
+import multiprocessing
 import os
 import threading
+import time
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm_torchtpu import envs
 from vllm_torchtpu import model_loader_patches as mlp
@@ -185,12 +192,26 @@ def test_wait_for_every_loader_without_distributed_state():
     mlp._wait_for_every_loader()
 
 
-class _Group:
-    world_size = 2
-    cpu_group = object()
+def _group(monkeypatch, cpu_timeout):
+    # This vLLM's GroupCoordinator keeps no CPU timeout: the wait reads it as
+    # vLLM read it to create the CPU group.
+    from vllm.distributed import utils
+
+    monkeypatch.setattr(
+        utils, "get_cpu_distributed_timeout_or_none", lambda: cpu_timeout
+    )
+    return SimpleNamespace(world_size=2, cpu_group=object(), local_rank=0)
 
 
-def test_wait_for_every_loader_is_bounded(monkeypatch):
+@pytest.mark.parametrize(
+    "cpu_timeout, expected_s",
+    [(datetime.timedelta(seconds=12), 12.0), (None, 1800.0)],
+    ids=["cpu-distributed-timeout", "torch-default"],
+)
+def test_wait_for_every_loader_uses_the_cpu_group_timeout(
+    monkeypatch, cpu_timeout, expected_s
+):
+    # The CPU group's timeout (None: torch's 30-minute default) bounds the wait.
     from vllm.distributed import parallel_state
 
     calls = []
@@ -198,10 +219,11 @@ def test_wait_for_every_loader_is_bounded(monkeypatch):
     def barrier(group, timeout):
         calls.append((group, timeout.total_seconds()))
 
-    monkeypatch.setattr(parallel_state, "get_world_group", lambda: _Group)
+    group = _group(monkeypatch, cpu_timeout)
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: group)
     monkeypatch.setattr(mlp.torch.distributed, "monitored_barrier", barrier)
-    mlp._wait_for_every_loader(timeout_s=12.0)
-    assert calls == [(_Group.cpu_group, 12.0)]
+    mlp._wait_for_every_loader()
+    assert calls == [(group.cpu_group, expected_s)]
 
 
 def test_load_fails_fast_when_a_rank_never_arrives(evicted, monkeypatch):
@@ -213,68 +235,172 @@ def test_load_fails_fast_when_a_rank_never_arrives(evicted, monkeypatch):
     def barrier(group, timeout):
         raise RuntimeError("Rank 1 failed to pass monitoredBarrier")
 
-    monkeypatch.setattr(parallel_state, "get_world_group", lambda: _Group)
+    group = _group(monkeypatch, datetime.timedelta(seconds=12))
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: group)
     monkeypatch.setattr(mlp.torch.distributed, "monitored_barrier", barrier)
     mlp._loaded_weight_files.update(dict.fromkeys(["a"]))
-    with pytest.raises(RuntimeError, match="not every rank finished loading"):
+    with pytest.raises(
+        RuntimeError, match="not every rank finished loading within 12 s"
+    ):
         mlp.evict_loaded_weights_page_cache()
     assert evicted == []
 
 
-def test_patched_loader_records_loaded_files(evicted, monkeypatch):
-    # The eviction evicts what the patched DefaultModelLoader recorded.
-    from vllm.model_executor.model_loader import default_loader as dl
-
-    class Loader:
-        def _prepare_weights(self, *args, **kwargs):
-            return ("folder", ["shard-1", "shard-2"], False)
-
-        def load_weights(self, model, model_config):
-            pass
-
-    monkeypatch.setattr(dl, "DefaultModelLoader", Loader)
-    mlp.patch_default_model_loader_page_cache()
-    loader = Loader()
-    loader._prepare_weights("model", None, True)
-    loader.load_weights(None, None)
-    assert list(mlp._loaded_weight_files) == ["shard-1", "shard-2"]
-    mlp.evict_loaded_weights_page_cache()
-    assert evicted == [["shard-1", "shard-2"]]
+# The CPU group's timeout in the two-rank test below.
+_GLOO_TIMEOUT_S = 3
+# Per case: when each rank arrives at the loader wait, in seconds after the
+# case starts (None: never), and the outcome expected on each rank.
+_TWO_RANK_CASES = {
+    "rank1-late": ((0, 1), ("ok", "ok")),
+    "rank1-absent": ((0, None), ("RuntimeError", "absent")),
+    "rank0-absent": ((None, 0), ("absent", "RuntimeError")),
+}
 
 
-def _write_safetensors(path, names_and_sizes):
-    import json
-    import struct
+def _loader_wait_rank(rank, init_file, out_file):
+    """One rank of a two-rank gloo world; runs the cases in turn.
 
-    header, offset = {}, 0
-    for name, size in names_and_sizes:
-        header[name] = {
-            "dtype": "U8",
-            "shape": [size],
-            "data_offsets": [offset, offset + size],
-        }
-        offset += size
-    raw = json.dumps(header).encode()
-    path.write_bytes(struct.pack("<Q", len(raw)) + raw + b"\0" * offset)
-    return 8 + len(raw)
+    Each case has its own gloo group, made as vLLM makes the world group's
+    CPU group: with the CPU timeout. A rank absent from a case waits for the
+    next case on the default group instead, so it stays up until the other
+    rank's wait has ended. Writes the outcomes to ``out_file``.
+    """
+    from vllm.distributed import parallel_state, utils
 
-
-def test_ranges_skip_the_loading_models_unused_tensors(tmp_path):
-    # The prefetch reads what the lazy iterator reads: not a draft's unused
-    # tensors.
-    path = tmp_path / "shard.safetensors"
-    base = _write_safetensors(
-        path,
-        [
-            ("model.a.weight", 16),
-            ("model.unused.weight", 32),
-            ("model.b.weight", 8),
-        ],
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+        # The default group only lines the cases up.
+        timeout=datetime.timedelta(seconds=60),
     )
-    keep_all = mlp._local_tensor_ranges(str(path), set())
-    assert keep_all == [(base, base + 56)]
-    used = mlp._local_tensor_ranges(str(path), set(), lambda name: "unused" in name)
-    assert used == [(base, base + 16), (base + 48, base + 56)]
+    timeout = datetime.timedelta(seconds=_GLOO_TIMEOUT_S)
+    # The timeout vLLM would read from the config to make the CPU group.
+    utils.get_cpu_distributed_timeout_or_none = lambda: timeout
+    # Made up front: making a group waits, at most its timeout, for both ranks.
+    cpu_groups = [
+        torch.distributed.new_group(backend="gloo", timeout=timeout)
+        for _ in _TWO_RANK_CASES
+    ]
+    outcomes = {}
+    for cpu_group, (case, (arrivals, _)) in zip(cpu_groups, _TWO_RANK_CASES.items()):
+        group = SimpleNamespace(world_size=2, cpu_group=cpu_group, local_rank=rank)
+        parallel_state.get_world_group = lambda group=group: group
+        torch.distributed.barrier()
+        if arrivals[rank] is None:
+            outcomes[case] = {"outcome": "absent"}
+            continue
+        time.sleep(arrivals[rank])
+        start = time.monotonic()
+        try:
+            mlp._wait_for_every_loader()
+            outcome = {"outcome": "ok"}
+        except Exception as e:
+            outcome = {
+                "outcome": type(e).__name__,
+                "message": str(e),
+                "cause": repr(e.__cause__),
+            }
+        outcome["elapsed_s"] = time.monotonic() - start
+        outcomes[case] = outcome
+    torch.distributed.barrier()
+    with open(out_file, "w") as f:
+        json.dump(outcomes, f)
+    # Exit without the interpreter teardown, which a broken group could stall.
+    os._exit(0)
+
+
+@pytest.fixture(scope="module")
+def two_rank_outcomes(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("gloo")
+    ctx = multiprocessing.get_context("spawn")
+    procs = [
+        ctx.Process(
+            target=_loader_wait_rank,
+            args=(rank, str(tmp / "init"), str(tmp / f"rank{rank}.json")),
+        )
+        for rank in range(2)
+    ]
+    for proc in procs:
+        proc.start()
+    deadline = time.monotonic() + 120
+    try:
+        for proc in procs:
+            proc.join(timeout=max(0.0, deadline - time.monotonic()))
+    finally:
+        for proc in procs:
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
+    assert [proc.exitcode for proc in procs] == [0, 0]
+    outcomes = [json.loads((tmp / f"rank{r}.json").read_text()) for r in range(2)]
+    return {case: [o[case] for o in outcomes] for case in _TWO_RANK_CASES}
+
+
+@pytest.mark.skipif(
+    not (torch.distributed.is_available() and torch.distributed.is_gloo_available()),
+    reason="needs torch.distributed with gloo",
+)
+@pytest.mark.parametrize("case", list(_TWO_RANK_CASES))
+def test_two_rank_loader_wait(two_rank_outcomes, case):
+    """A real gloo barrier: a late rank passes; an absent one fails every rank.
+
+    ``monitored_barrier`` enforces its timeout on rank 0 only, so the
+    rank0-absent case shows the gloo group's own timeout bounds rank 1.
+    """
+    outcomes = two_rank_outcomes[case]
+    _, expected = _TWO_RANK_CASES[case]
+    assert [o["outcome"] for o in outcomes] == list(expected), outcomes
+    for rank, outcome in enumerate(outcomes):
+        if outcome["outcome"] == "RuntimeError":
+            assert f"loading within {_GLOO_TIMEOUT_S} s" in outcome["message"]
+            assert outcome["elapsed_s"] < _GLOO_TIMEOUT_S + 5, outcomes
+            if rank == 0:
+                # monitored_barrier's error, chained, names the absent rank.
+                assert "Rank 1" in outcome["cause"], outcomes
+        elif outcome["outcome"] == "ok":
+            assert outcome["elapsed_s"] < _GLOO_TIMEOUT_S, outcomes
+
+
+class _RecordingLogger:
+    """Stands in for the module's logger: records (level, message) pairs."""
+
+    def __init__(self):
+        self.records: list[tuple[int, str]] = []
+
+    def log(self, level, msg, *args, **kwargs):
+        self.records.append((level, msg % args))
+
+    def info(self, msg, *args, **kwargs):
+        self.log(logging.INFO, msg, *args)
+
+    def warning(self, msg, *args, **kwargs):
+        self.log(logging.WARNING, msg, *args)
+
+
+@pytest.mark.parametrize(
+    "local_rank, level", [(0, logging.INFO), (1, logging.DEBUG)], ids=["first", "other"]
+)
+def test_eviction_logs_at_info_once_per_host(tmp_path, monkeypatch, local_rank, level):
+    # Every rank evicts; only the host's first rank logs the files and the
+    # total at INFO.
+    from vllm.distributed import parallel_state
+
+    path = tmp_path / "shard.safetensors"
+    path.write_bytes(b"\0" * 16)
+    advice = []
+    monkeypatch.setattr(os, "posix_fadvise", lambda fd, off, n, a: advice.append(a))
+    monkeypatch.setattr(
+        parallel_state,
+        "get_world_group",
+        lambda: SimpleNamespace(local_rank=local_rank),
+    )
+    logger = _RecordingLogger()
+    monkeypatch.setattr(mlp, "logger", logger)
+    mlp._evict_checkpoint_page_cache([str(path)])
+    assert advice == [os.POSIX_FADV_DONTNEED]
+    assert [lvl for lvl, msg in logger.records if "Evicted" in msg] == [level, level]
 
 
 def test_stop_during_header_scan_skips_reads(tmp_path, monkeypatch):
@@ -296,15 +422,19 @@ def test_stop_during_header_scan_skips_reads(tmp_path, monkeypatch):
         assert stop.wait(timeout=5.0)
         return [(0, 64)]
 
-    def no_pread(*args):
-        raise AssertionError("a stopped prefetch read")
+    reads = []
+
+    def recording_pread(fd, size, off):
+        reads.append((fd, size, off))
+        return b""
 
     monkeypatch.setattr(mlp, "_local_tensor_ranges", ranges)
-    monkeypatch.setattr(os, "pread", no_pread)
+    monkeypatch.setattr(os, "pread", recording_pread)
     mlp._start_ep_range_prefetch(paths, set(), None, num_threads=1, block_size=64)
     assert in_scan.wait(timeout=5.0)
     mlp._stop_ep_range_prefetch()
     assert scanned == paths[:1]
+    assert reads == []
 
 
 def test_ended_prefetch_threads_are_dropped(tmp_path, monkeypatch):
@@ -322,3 +452,232 @@ def test_ended_prefetch_threads_are_dropped(tmp_path, monkeypatch):
     assert [t for t, _ in mlp._prefetches] != [first]
     assert len(mlp._prefetches) == 1
     mlp._stop_ep_range_prefetch()
+
+
+# ---------------------------------------------------------------------------
+# The installed patch: recorded files, stoppable whole-file prefetch
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def page_cache_patch(monkeypatch):
+    """Applies the page cache patch (flag on); restores what it replaces."""
+    from vllm.model_executor.model_loader import default_loader as dl
+    from vllm.model_executor.model_loader import weight_utils
+
+    monkeypatch.setattr(envs, "TPU_EVICT_WEIGHTS_PAGE_CACHE", True, raising=False)
+    loader = dl.DefaultModelLoader
+    monkeypatch.setattr(loader, "_prepare_weights", loader._prepare_weights)
+    monkeypatch.setattr(loader, "load_weights", loader.load_weights)
+    # setattr, not delattr(raising=False), so teardown removes the stamp.
+    monkeypatch.setattr(loader, "_tpu_cache_evict_patch", False, raising=False)
+    monkeypatch.setattr(
+        weight_utils,
+        "_prefetch_all_checkpoints",
+        weight_utils._prefetch_all_checkpoints,
+    )
+    monkeypatch.setattr(mlp, "_upstream_prefetch_all_checkpoints", None)
+    monkeypatch.setattr(mlp, "_prefetches", [])
+    mlp.patch_default_model_loader_page_cache()
+
+
+def _save_shards(tmp_path, count):
+    from safetensors.torch import save_file
+
+    paths = []
+    for i in range(count):
+        path = tmp_path / f"model-{i:05d}.safetensors"
+        tensor = torch.full((64,), i, dtype=torch.uint8)
+        save_file({f"layers.{i}.weight": tensor}, str(path))
+        paths.append(str(path))
+    return paths
+
+
+def test_patched_loader_records_loaded_files(
+    evicted, page_cache_patch, tmp_path, monkeypatch
+):
+    # The real DefaultModelLoader records the shards its _prepare_weights
+    # returned, and the eviction evicts them.
+    from vllm.config.load import LoadConfig
+    from vllm.model_executor.model_loader import default_loader as dl
+
+    paths = _save_shards(tmp_path, 2)
+    prepared = []
+    patched_prepare_weights = dl.DefaultModelLoader._prepare_weights
+
+    def recording_prepare_weights(self, *args, **kwargs):
+        res = patched_prepare_weights(self, *args, **kwargs)
+        prepared.append(res)
+        return res
+
+    monkeypatch.setattr(
+        dl.DefaultModelLoader, "_prepare_weights", recording_prepare_weights
+    )
+    # It reads the engine's vLLM config, which a CPU test cannot build; with
+    # the EP weight filter off it sets nothing.
+    monkeypatch.setattr(
+        dl.DefaultModelLoader, "_init_ep_weight_filter", lambda self, config: None
+    )
+    loaded = []
+    model = SimpleNamespace(
+        load_weights=lambda weights: loaded.extend(name for name, _ in weights)
+    )
+    model_config = SimpleNamespace(
+        model=str(tmp_path),
+        revision=None,
+        quantization=None,
+        multimodal_config=None,
+    )
+    loader = dl.DefaultModelLoader(LoadConfig(load_format="safetensors"))
+    loader.load_weights(model, model_config)
+
+    assert sorted(loaded) == ["layers.0.weight", "layers.1.weight"]
+    ((_, shards, _),) = prepared
+    assert sorted(shards) == paths
+    assert list(mlp._loaded_weight_files) == shards
+    mlp.evict_loaded_weights_page_cache()
+    assert evicted == [shards]
+
+
+@pytest.mark.parametrize("rank, world_size", [(0, 1), (1, 2)])
+def test_whole_file_prefetch_reads_this_ranks_files(
+    tmp_path, monkeypatch, page_cache_patch, rank, world_size
+):
+    # The "prefetch" strategy without the EP filter: this rank's share of the
+    # files, whole, as upstream's prefetch reads them.
+    from vllm.model_executor.model_loader import weight_utils
+
+    paths = _save_shards(tmp_path, 3)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: world_size > 1)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: world_size)
+    read: dict[str, set[int]] = {}
+    real_pread = os.pread
+
+    def recording_pread(fd, size, off):
+        path = os.readlink(f"/proc/self/fd/{fd}")
+        read.setdefault(path, set()).update(range(off, off + size))
+        return real_pread(fd, size, off)
+
+    monkeypatch.setattr(os, "pread", recording_pread)
+    weights = weight_utils.safetensors_weights_iterator(
+        paths, False, "prefetch", safetensors_prefetch_block_size=64
+    )
+    assert len(list(weights)) == len(paths)
+    ((thread, _),) = mlp._prefetches
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    assert read == {
+        os.path.realpath(p): set(range(os.path.getsize(p)))
+        for p in paths[rank::world_size]
+    }
+
+
+def test_prefetch_skips_a_file_it_cannot_read(tmp_path, monkeypatch):
+    # As upstream's prefetch: a file that fails is skipped, the rest is read.
+    paths = _save_shards(tmp_path, 2)
+    missing = str(tmp_path / "missing.safetensors")
+    read: set[str] = set()
+    real_pread = os.pread
+
+    def recording_pread(fd, size, off):
+        read.add(os.readlink(f"/proc/self/fd/{fd}"))
+        return real_pread(fd, size, off)
+
+    monkeypatch.setattr(os, "pread", recording_pread)
+    monkeypatch.setattr(mlp, "_prefetches", [])
+    mlp._prefetch_all_checkpoints_stoppable([paths[0], missing, paths[1]])
+    ((thread, _),) = mlp._prefetches
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    assert read == {os.path.realpath(p) for p in paths}
+
+
+def test_whole_file_prefetch_stops_before_eviction(
+    tmp_path, monkeypatch, page_cache_patch
+):
+    from vllm.model_executor.model_loader import weight_utils
+
+    paths = _save_shards(tmp_path, 2)
+    reads: list[int] = []
+    first_read = threading.Event()
+    real_pread = os.pread
+
+    def pread_until_stopped(fd, size, off):
+        # The first read holds until the stop, so the reads still queued must
+        # be the ones the stop skips.
+        reads.append(off)
+        if len(reads) == 1:
+            _, stop = mlp._prefetches[0]
+            first_read.set()
+            stop.wait(timeout=5.0)
+        return real_pread(fd, size, off)
+
+    monkeypatch.setattr(os, "pread", pread_until_stopped)
+    # One reader thread and 64-byte blocks: several reads per file, in turn.
+    list(
+        weight_utils.safetensors_weights_iterator(
+            paths,
+            False,
+            "prefetch",
+            safetensors_prefetch_num_threads=1,
+            safetensors_prefetch_block_size=64,
+        )
+    )
+    ((thread, _),) = mlp._prefetches
+    assert first_read.wait(timeout=5.0)
+    mlp._stop_ep_range_prefetch()
+    assert not thread.is_alive()
+    assert not mlp._prefetches
+    assert reads == [0]
+
+
+def test_upstream_whole_file_prefetch_is_replaceable():
+    """Fails when upstream renames ``_prefetch_all_checkpoints``, changes its
+    parameters, or stops calling it through the ``weight_utils`` global."""
+    import inspect
+
+    from vllm.model_executor.model_loader import weight_utils
+
+    upstream = (
+        mlp._upstream_prefetch_all_checkpoints or weight_utils._prefetch_all_checkpoints
+    )
+    params = inspect.signature(upstream).parameters
+    assert list(params) == ["sorted_files", "num_prefetch_threads", "block_size"]
+    ours = inspect.signature(mlp._prefetch_all_checkpoints_stoppable).parameters
+    assert [(p.name, p.default) for p in ours.values()] == [
+        (p.name, p.default) for p in params.values()
+    ]
+    iterator = inspect.unwrap(weight_utils.safetensors_weights_iterator)
+    assert "_prefetch_all_checkpoints" in iterator.__code__.co_names
+
+
+def test_flag_off_keeps_upstream_prefetch(monkeypatch):
+    from vllm.model_executor.model_loader import weight_utils
+
+    upstream = weight_utils._prefetch_all_checkpoints
+    monkeypatch.setattr(envs, "TPU_EVICT_WEIGHTS_PAGE_CACHE", False, raising=False)
+    mlp.patch_default_model_loader_page_cache()
+    assert weight_utils._prefetch_all_checkpoints is upstream
+
+
+@pytest.mark.parametrize(
+    "changed", [None, lambda files, threads=8: None], ids=["missing", "renamed"]
+)
+def test_changed_upstream_prefetch_is_left_in_place(monkeypatch, changed):
+    # Fails open: the eviction still runs, upstream's thread keeps its reads.
+    from vllm.model_executor.model_loader import weight_utils
+
+    if changed is None:
+        monkeypatch.delattr(weight_utils, "_prefetch_all_checkpoints")
+    else:
+        monkeypatch.setattr(weight_utils, "_prefetch_all_checkpoints", changed)
+    monkeypatch.setattr(mlp, "_upstream_prefetch_all_checkpoints", None)
+    logger = _RecordingLogger()
+    monkeypatch.setattr(mlp, "logger", logger)
+    mlp._install_stoppable_checkpoint_prefetch()
+    assert getattr(weight_utils, "_prefetch_all_checkpoints", None) is changed
+    assert mlp._upstream_prefetch_all_checkpoints is None
+    ((level, msg),) = logger.records
+    assert level == logging.WARNING
+    assert "--safetensors-load-strategy=lazy" in msg

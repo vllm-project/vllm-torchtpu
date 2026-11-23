@@ -5344,10 +5344,13 @@ class TPUModelRunner(GPUModelRunner):
 
             arm_runner_models(self)
 
-        # After the drafter: an MTP draft re-reads the target checkpoint.
+        # After the drafter: an MTP draft re-reads the target checkpoint. In
+        # the config context: the wait for every rank reads the CPU group
+        # timeout from it.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
 
-        evict_loaded_weights_page_cache()
+        with set_current_vllm_config(self.vllm_config):
+            evict_loaded_weights_page_cache()
 
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
