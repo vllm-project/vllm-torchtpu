@@ -2134,6 +2134,10 @@ class TPUModelRunner(GPUModelRunner):
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
         host_phases.set_rank(profiler_rank)
+        # Thread-wake diagnostics (HOST_PHASES marks, VLLM_TPU_DIAG_PREWARM).
+        from vllm_torchtpu.runner import wake_marks
+
+        wake_marks.install(self)
         stall_watchdog.start(profiler_rank)
 
     def _init_phased_profiling(self) -> None:
