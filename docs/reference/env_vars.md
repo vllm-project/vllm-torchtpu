@@ -56,7 +56,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `FUSED_MOE_DECODE_KERNEL_MAX_TOKENS` | `256` | Maximum token count per step for `FUSED_MOE_DECODE_KERNEL`; larger steps fall back to the grouped-matmul MoE path. |
 | `USE_MOE_TP_DECODE_KERNEL` | `False` | Serves eligible tensor-parallel FP8 MoE layers with a fused TP decode MoE Pallas kernel (in-kernel routing, shared expert, and all-reduce; requires `TPU_MOE_SKIP_PADDED_TOKENS=1`, and arms nothing while `FUSED_MOE_DECODE_KERNEL` is set). |
 | `TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES` | `0` | All-reduces the TP group's 2-D bf16 activations with one Pallas call (barrier, reduce-scatter, f32 sum, all-gather; `distributed/pallas_all_reduce.py`) when the kernel's view of the tensor is at most this many bytes, a psum above it. Capped at 4 MiB (VMEM); needs the EP group to span the TP group and the whole world; `0` keeps XLA's all-reduce. |
-| `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts. |
+| `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts (models that build their experts under `hierarchical_moe_parallel_config`: Kimi K3, MiniMax M3). |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |

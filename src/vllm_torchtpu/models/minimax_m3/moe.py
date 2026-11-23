@@ -16,6 +16,7 @@
 import torch
 from torch import nn
 from transformers import PreTrainedConfig
+from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
@@ -25,6 +26,10 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+from vllm_torchtpu.layers.adapter.moe_hierarchical import (
+    hierarchical_moe_parallel_config,
+    hierarchical_split_or_none,
+)
 from vllm_torchtpu.models.minimax_m3.quant import MXFP8_DEQUANTIZE_ATTR
 
 # The checkpoint config may omit swiglu_beta; SwiGLU-OAI's up-bias is 1.
@@ -40,6 +45,25 @@ def swiglu_params(config: PreTrainedConfig) -> tuple[float, float, float]:
         config.swiglu_alpha,
         getattr(config, "swiglu_beta", _DEFAULT_SWIGLU_BETA),
     )
+
+
+def _refuse_hierarchical_runai_load() -> None:
+    """MiniMax-M3.1 served with TP-sharded experts through the Run:ai
+    streaming loader produced generations that never terminated: with the
+    EP weight filter, half the ranks fetched no expert tensors; with the full
+    checkpoint stream, the expert stager ended with parameters incomplete.
+    The cause is not found. The default loader serves the same split
+    correctly, so the split refuses runai_streamer rather than load silently
+    wrong weights."""
+    if hierarchical_split_or_none() is None:
+        return
+    load_format = get_current_vllm_config().load_config.load_format
+    if str(getattr(load_format, "value", load_format)) == "runai_streamer":
+        raise ValueError(
+            "TPU_MOE_HIERARCHICAL_EP is not supported with --load-format "
+            "runai_streamer for MiniMax M3; load with the default loader or "
+            "unset TPU_MOE_HIERARCHICAL_EP."
+        )
 
 
 class MiniMaxM3MLP(nn.Module):
@@ -116,25 +140,30 @@ class MiniMaxM3MoE(nn.Module):
         for linear in (self.shared_experts.gate_up_proj, self.shared_experts.down_proj):
             setattr(linear, MXFP8_DEQUANTIZE_ATTR, True)
         limit, alpha, beta = swiglu_params(config)
-        self.experts = FusedMoEFactory(
-            num_experts=num_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            scoring_func=config.scoring_func,
-            e_score_correction_bias=self.e_score_correction_bias,
-            renormalize=True,
-            # w13 is [all gates; all ups], not gpt-oss's interleaved layout.
-            activation="swigluoai_uninterleave",
-            swiglu_limit=limit,
-            swiglu_alpha=alpha,
-            swiglu_beta=beta,
-            routed_scaling_factor=config.routed_scaling_factor,
-            router_logits_dtype=torch.float32,
-            shared_experts=self.shared_experts,
-            quant_config=quant_config,
-            prefix=f"{prefix}.experts",
-        )
+        # Under TPU_MOE_HIERARCHICAL_EP this builds the routed experts with
+        # expert parallelism between chips and tensor parallelism within one
+        # chip; otherwise it is vLLM's flat expert parallelism.
+        _refuse_hierarchical_runai_load()
+        with hierarchical_moe_parallel_config():
+            self.experts = FusedMoEFactory(
+                num_experts=num_experts,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                scoring_func=config.scoring_func,
+                e_score_correction_bias=self.e_score_correction_bias,
+                renormalize=True,
+                # w13 is [all gates; all ups], not gpt-oss's interleaved layout.
+                activation="swigluoai_uninterleave",
+                swiglu_limit=limit,
+                swiglu_alpha=alpha,
+                swiglu_beta=beta,
+                routed_scaling_factor=config.routed_scaling_factor,
+                router_logits_dtype=torch.float32,
+                shared_experts=self.shared_experts,
+                quant_config=quant_config,
+                prefix=f"{prefix}.experts",
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits, _ = self.gate(hidden_states)
