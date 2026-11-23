@@ -486,3 +486,97 @@ def maybe_patch_qwen3_vl_video_prompt(
         "Applied TPU patch: Qwen3-VL videos expand in the trained prompt format."
     )
     return None
+
+
+def maybe_patch_qwen3_vl_image_hf_text(
+    model_config: Optional["ModelConfig"] = None,
+) -> bool | None:
+    """Process Qwen3-VL images without the dummy prompt vLLM tokenizes and drops.
+
+    vLLM's Qwen3-VL processor hands the HF processor a dummy prompt with one
+    placeholder per item, which HF expands to one token per merged patch and
+    tokenizes. vLLM discards those ids (the renderer has tokenized the real
+    prompt), and the image fields come from the image processor alone. Skipping
+    the prompt takes the HF step of Cosmos3-Super's 3-image request (5841 image
+    tokens) from 30 to 19 ms. A request with a video keeps it, as Qwen3-VL's
+    processor reads `input_ids` back from that call; so does an HF processor
+    with a call of its own, as in the video patch below.
+    """
+    if model_config is None or not _has_qwen3_vl_vision(model_config):
+        return False
+    from transformers.processing_utils import ProcessorMixin
+    from vllm.model_executor.models import qwen3_vl
+
+    processor_cls = qwen3_vl.Qwen3VLMultiModalProcessor
+    if not getattr(processor_cls, "_tpu_image_hf_text_skipped", False):
+        upstream = processor_cls._get_hf_mm_text
+
+        @functools.wraps(upstream)
+        def _get_hf_mm_text(self, mm_counts):
+            hf_call = type(self.info.get_hf_processor()).__call__
+            if mm_counts.get("video", 0) or hf_call is not ProcessorMixin.__call__:
+                return upstream(self, mm_counts)
+            return None
+
+        # Qwen3-VL narrows the base method's `str | None`, which its caller takes.
+        # pyrefly: ignore[bad-assignment]
+        processor_cls._get_hf_mm_text = _get_hf_mm_text
+        processor_cls._tpu_image_hf_text_skipped = True
+        logger.info("Applied TPU patch: Qwen3-VL images skip the HF dummy prompt.")
+    return None
+
+
+# Set while this thread runs Qwen3-VL's `_apply_hf_processor_main`.
+_qwen3_vl_hf_main = threading.local()
+
+
+def maybe_patch_qwen3_vl_video_hf_text(
+    model_config: Optional["ModelConfig"] = None,
+) -> bool | None:
+    """Process each Qwen3-VL video without the HF text vLLM discards.
+
+    vLLM's Qwen3-VL processor calls the HF processor once per video with the
+    text ``<|vision_start|><|video_pad|><|vision_end|>``, which HF expands and
+    tokenizes; vLLM pops the ids and builds the video's tokens itself
+    (`get_video_repl`), and the video processor computes the video fields
+    without the text. Dropping the text takes the HF step of Cosmos3-Super's
+    9360-patch video from 10.8 to 7.5 ms. The call is told apart by its
+    `videos`, which upstream pops from the data of its other call. Only an HF
+    processor whose call is `ProcessorMixin.__call__` drops the text, as that
+    call reads the text for the tokenizer alone.
+    """
+    if model_config is None or not _has_qwen3_vl_vision(model_config):
+        return False
+    from transformers.processing_utils import ProcessorMixin
+    from vllm.model_executor.models import qwen3_vl
+    from vllm.multimodal.processing import context
+
+    processor_cls = qwen3_vl.Qwen3VLMultiModalProcessor
+    if not getattr(processor_cls, "_tpu_video_hf_text_skipped", False):
+        upstream_main = processor_cls._apply_hf_processor_main
+        upstream_call = context.InputProcessingContext.call_hf_processor
+
+        @functools.wraps(upstream_main)
+        def _apply_hf_processor_main(self, mm_items, hf_kwargs):
+            outer = getattr(_qwen3_vl_hf_main, "active", False)
+            _qwen3_vl_hf_main.active = True
+            try:
+                return upstream_main(self, mm_items, hf_kwargs)
+            finally:
+                _qwen3_vl_hf_main.active = outer
+
+        @functools.wraps(upstream_call)
+        def call_hf_processor(self, hf_processor, data, *args, **kwargs):
+            if (
+                getattr(_qwen3_vl_hf_main, "active", False)
+                and "videos" in data
+                and type(hf_processor).__call__ is ProcessorMixin.__call__
+            ):
+                data = {k: v for k, v in data.items() if k != "text"}
+            return upstream_call(self, hf_processor, data, *args, **kwargs)
+
+        processor_cls._apply_hf_processor_main = _apply_hf_processor_main
+        context.InputProcessingContext.call_hf_processor = call_hf_processor
+        processor_cls._tpu_video_hf_text_skipped = True
+        logger.info("Applied TPU patch: Qwen3-VL videos skip the HF text vLLM drops.")
+    return None
