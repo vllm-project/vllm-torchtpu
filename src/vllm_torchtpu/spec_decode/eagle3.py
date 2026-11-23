@@ -940,17 +940,35 @@ class Eagle3Proposer:
         if K < 2:
             return
         try:
-            from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mtp_fused_loop
+            from vllm_torchtpu.spec_decode.mtp_fused_loop import (
+                build_mtp_fused_loop,
+                loop_compile_config,
+            )
 
+            loop_cfg = self.draft_vllm_config
+            self._mtp_fused_loop_max_t = 0
+            if envs.VLLM_TPU_DRAFT_LOOP_MAX_COMPILE_T > 0:
+                # Only the token buckets the loop can run (one row per
+                # request): no prefill-sized loop programs.
+                loop_cfg, sizes, cap = loop_compile_config(
+                    self.draft_vllm_config,
+                    self.runner.max_num_reqs,
+                    envs.VLLM_TPU_DRAFT_LOOP_MAX_COMPILE_T,
+                )
+                self._mtp_fused_loop_max_t = cap
+                logger.info(
+                    "DRAFT_LOOP_MAX_COMPILE_T: fused draft loop compile sizes %s "
+                    "(cap %d)", sizes, cap,
+                )
             with (
                 set_model_tag("eagle_head"),
                 set_vllm_model_wrapper_context(
-                    mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
+                    mesh=self.runner.mesh, vllm_config=loop_cfg
                 ),
-                set_current_vllm_config(self.draft_vllm_config),
+                set_current_vllm_config(loop_cfg),
             ):
                 self._mtp_fused_loop = build_mtp_fused_loop(
-                    vllm_config=self.draft_vllm_config,
+                    vllm_config=loop_cfg,
                     prefix=f"mtp_fused_loop_k{K}",
                     mtp=draft_model,
                     num_steps=K - 1,
@@ -984,6 +1002,15 @@ class Eagle3Proposer:
         K-1 tokens, or None when this chunk's metadata doesn't fit the
         program (the caller then runs the per-step loop).
         """
+        max_t = getattr(self, "_mtp_fused_loop_max_t", 0)
+        if max_t and input_ids.shape[0] > max_t:
+            # VLLM_TPU_DRAFT_LOOP_MAX_COMPILE_T: no fused program at this size
+            # (unreachable by construction; the per-step loop is the fallback).
+            logger.warning_once(
+                "fused draft loop: %d tokens exceed the compiled cap %d; "
+                "running the per-step loop", input_ids.shape[0], max_t,
+            )
+            return None
         attn_metadata = self._build_draft_attn_metadata(
             chunk=chunk,
             step_idx=1,
