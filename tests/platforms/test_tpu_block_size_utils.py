@@ -53,6 +53,12 @@ class FakePlainAttentionBackend(FakeBatchedRPAAttentionBackend):
         return []
 
 
+class FakeMultiBlockBatchedRPAAttentionBackend(FakeBatchedRPAAttentionBackend):
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [128, 256]
+
+
 class FakeLargeMinimumBackend(FakeBatchedRPAAttentionBackend):
     @staticmethod
     def get_min_page_size(_vllm_config):
@@ -535,3 +541,30 @@ def test_hybrid_gdn_pcp_rejects_non_sharding_shape_calculator(vllm_config):
         update_tpu_block_size_and_slot_config(
             vllm_config, FakeBatchedRPAAttentionBackend
         )
+
+
+def test_user_block_size_256_keeps_256_alignment_over_128(vllm_config):
+    """Explicit --block-size 256 must not be downgraded to a 128-token kernel
+    multiple (384) when a batched backend supports both [128, 256]."""
+    _configure_hybrid(vllm_config, block_size=256, user_specified=True, tp_size=8)
+    vllm_config.model_config.hf_text_config = SimpleNamespace(
+        linear_num_key_heads=16,
+        linear_num_value_heads=64,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+    )
+
+    class _FakeBf16GdnModel(FakeConfiguredGdnModel):
+        @staticmethod
+        def get_mamba_state_dtype_from_config(_):
+            return (torch.float32, torch.bfloat16)
+
+    _update(
+        vllm_config,
+        backend_cls=FakeMultiBlockBatchedRPAAttentionBackend,
+        model_cls=_FakeBf16GdnModel,
+    )
+
+    assert vllm_config.cache_config.block_size == 512
+    assert vllm_config.cache_config.mamba_page_size_padded == 512 * 1024

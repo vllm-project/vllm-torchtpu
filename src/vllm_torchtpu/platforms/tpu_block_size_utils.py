@@ -84,19 +84,28 @@ def _round_up_to_multiple(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
-def _align_block_to_backend(block_size: int, supported) -> int:
+def _align_block_to_backend(
+    block_size: int, supported, *, user_block_size: int | None = None
+) -> int:
     """Smallest manager block >= block_size the backend can serve.
 
     A fixed int entry means the kernel runs that exact block size, so the
     manager block must be a multiple of it (vLLM's kernel-block machinery
     splits manager blocks into kernel blocks); a MultipleOf(b) entry accepts
-    any multiple of b directly."""
+    any multiple of b directly. When ``user_block_size`` divides at least one
+    supported kernel block size, restrict alignment to those divisors so an
+    explicit ``--block-size 256`` is not downgraded to a 128-token block."""
     from vllm.v1.attention.backend import MultipleOf
 
-    candidates = []
-    for entry in supported:
-        base = entry.base if isinstance(entry, MultipleOf) else int(entry)
-        candidates.append(_round_up_to_multiple(block_size, base))
+    bases = [
+        entry.base if isinstance(entry, MultipleOf) else int(entry)
+        for entry in supported
+    ]
+    if user_block_size:
+        aligned_bases = [base for base in bases if base % user_block_size == 0]
+        if aligned_bases:
+            bases = aligned_bases
+    candidates = [_round_up_to_multiple(block_size, base) for base in bases]
     return min(candidates) if candidates else block_size
 
 
@@ -396,7 +405,11 @@ def _derive_tpu_block_slot_config(
             user_block_size_floor or 0,
             backend_min_page_size,
         )
-        final_block_size = _align_block_to_backend(block_size_floor, supported)
+        final_block_size = _align_block_to_backend(
+            block_size_floor,
+            supported,
+            user_block_size=user_block_size_floor,
+        )
         final_block_size = _round_up_to_multiple(final_block_size, fa_pool_row_tokens)
         if (
             user_block_size_floor is not None
