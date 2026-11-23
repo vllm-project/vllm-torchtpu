@@ -241,3 +241,30 @@ def test_adaptive_three_tiers_give_the_picked_configuration(prefill_config):
     for (o, l), (eo, el) in zip(got, base):  # 8- and 16-token tiles agree on CPU
         np.testing.assert_allclose(o, eo, rtol=2e-2, atol=2e-2)
         np.testing.assert_allclose(l, el, rtol=1e-4, atol=1e-4)
+
+
+def _cond_branch_counts(jaxpr):
+    counts = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "cond":
+            counts.append(len(eqn.params["branches"]))
+        for value in eqn.params.values():
+            for sub in value if isinstance(value, (tuple, list)) else [value]:
+                sub = getattr(sub, "jaxpr", sub)
+                if hasattr(sub, "eqns"):
+                    counts += _cond_branch_counts(sub)
+    return counts
+
+
+def test_adaptive_tiers_dispatch_with_two_branch_conds(prefill_config):
+    # A switch over three or more kernels stops the served compiler from
+    # sharing the attention code across layers; tiers nest two-branch conds.
+    args = _inputs(1, union=28, seed=3)
+    prefill_config.setenv(lse_mod.ADAPTIVE_ENV, "20:8:32;x30:8:48:32")
+    jax.clear_caches()
+    jaxpr = jax.make_jaxpr(lambda *a: msa_dcp.msa_attend_dcp(
+        *a[:6], sm_scale=1 / np.sqrt(D), topk=TOPK, rank=0, dcp=1,
+        scale_cache=a[6], interpret=True,
+    ))(*args).jaxpr
+    counts = _cond_branch_counts(jaxpr)  # the kernels' own conds included
+    assert len(counts) >= 2 and set(counts) == {2}

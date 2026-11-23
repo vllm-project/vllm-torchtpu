@@ -948,11 +948,24 @@ def msa_attend_dcp(
                 attend(common),
                 operands,
             )
-        return jax.lax.switch(
-            msa_attention_lse.adaptive_tier(keys, common["block_q"], tiers),
-            [attend(common)] + [attend(dict(common, **kw)) for _, kw, _ in tiers],
-            operands,
-        )
+        # More tiers: nested two-branch conds, the last tier outermost. A
+        # lax.switch over three or more kernels makes the served compiler
+        # inline the attention code into every layer instead of sharing it
+        # (prefill programs 4-7x more bundles, wide prefill steps ~10%
+        # slower); two-branch conds keep it shared.
+        def nest(i):
+            if i == 0:
+                return lambda tier_ops: attend(common)(tier_ops[1])
+            kw = tiers[i - 1][1]
+            return lambda tier_ops: jax.lax.cond(
+                tier_ops[0] >= i,
+                lambda o: attend(dict(common, **kw))(o[1]),
+                nest(i - 1),
+                tier_ops,
+            )
+
+        index = msa_attention_lse.adaptive_tier(keys, common["block_q"], tiers)
+        return nest(len(tiers))((index, operands))
     if scale_cache is not None:
         if num_heads == 1:
             return msa_attention_lse.msa_sparse_attention_lse(
