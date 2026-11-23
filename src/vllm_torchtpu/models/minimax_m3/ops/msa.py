@@ -425,7 +425,7 @@ def merge_head_partials(
 
 # Steps of at most this many tokens (decode batches) exchange data in fewer,
 # packed collectives: there each collective costs its ~2-3 us latency, not
-# its bytes (`merge_head_partials_a2a`).
+# its bytes (`exchange_queries_and_candidates`, `merge_head_partials_a2a`).
 PACKED_EXCHANGE_MAX_TOKENS = 64
 
 
@@ -434,6 +434,29 @@ def _words(x: torch.Tensor) -> torch.Tensor:
     bit for bit, while a float collective may flush or canonicalize the
     subnormals and NaNs that packed 16-bit pairs and ids form."""
     return x.contiguous().view(torch.int32)
+
+
+def exchange_queries_and_candidates(
+    q: torch.Tensor, candidates: torch.Tensor, group: Any
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`gather_query_heads` and the candidates' all-gather in one all-gather
+    of int32 words: ``q [T, Hq, D]`` and ``candidates [T, C]`` f32 ->
+    ``(q_all [T, dcp * Hq, D], candidates [dcp, T, C])``."""
+    dcp = group.world_size
+    num_tokens, num_heads, head_dim = q.shape
+    q_words = _words(q.reshape(num_tokens, num_heads * head_dim))
+    packed = torch.cat([q_words, _words(candidates)], dim=1)
+    gathered = group.all_gather(packed, dim=0).view(dcp, num_tokens, -1)
+    split = q_words.shape[1]
+    q_all = (
+        gathered[..., :split]
+        .contiguous()
+        .view(q.dtype)
+        .view(dcp, num_tokens, num_heads, head_dim)
+        .transpose(0, 1)
+        .reshape(num_tokens, dcp * num_heads, head_dim)
+    )
+    return q_all, gathered[..., split:].contiguous().view(candidates.dtype)
 
 
 def pack_head_partials(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
@@ -673,7 +696,11 @@ def get_msa_dcp_op(
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
-        if kv_heads == 1:
+        # Fixed per traced bucket: the token count is static.
+        packed = kv_heads == 1 and q.shape[0] <= PACKED_EXCHANGE_MAX_TOKENS
+        if packed:
+            q_all = None  # gathered with the candidates
+        elif kv_heads == 1:
             q_all = gather_query_heads(q, group)
         else:
             q_all, k, v, index_q = gather_group_heads(
@@ -694,7 +721,10 @@ def get_msa_dcp_op(
         )
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
-        candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
+        if packed:
+            q_all, candidates = exchange_queries_and_candidates(q, candidates, group)
+        else:
+            candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
         out, lse = attend_op(
             q_all,
             kv_cache,
@@ -704,8 +734,7 @@ def get_msa_dcp_op(
             metadata.query_start_loc,
             dcp_rank,
         )
-        # Fixed per traced bucket: the token count is static.
-        if kv_heads == 1 and q.shape[0] <= PACKED_EXCHANGE_MAX_TOKENS:
+        if packed:
             return merge_head_partials_a2a(out, lse, group)
         return merge_head_partials(out, lse, group)
 

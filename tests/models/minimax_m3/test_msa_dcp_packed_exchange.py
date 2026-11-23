@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The packed DCP exchanges of `ops.msa` for decode steps, every rank run
-on its own thread against an in-process group: the all-to-all merge is the
-exact log-sum-exp merge rounded once."""
+on its own thread against an in-process group: the queries and candidates
+arrive bit for bit, and the all-to-all merge is the exact log-sum-exp merge
+rounded once."""
 
 import threading
 
@@ -62,6 +63,27 @@ class _Group:
         for t in threads:
             t.join()
         return results
+
+
+@pytest.mark.parametrize("dcp,num_tokens", [(2, 8), (2, 24), (4, 5)])
+def test_queries_and_candidates_arrive_bit_for_bit(dcp, num_tokens):
+    torch.manual_seed(dcp * 100 + num_tokens)
+    group = _Group(dcp)
+    qs = [torch.randn(num_tokens, 8, 128).to(torch.bfloat16) for _ in range(dcp)]
+    qs[0][0, 0, :4] = 0  # the high half of a word: a subnormal f32
+    cands = []
+    for _ in range(dcp):
+        scores = torch.randn(num_tokens, 16)
+        scores[0, -1] = float("-inf")
+        blocks = torch.randint(-1, 2048, (num_tokens, 16)).float()
+        cands.append(torch.cat([scores, blocks], dim=1))
+    got = group.run(
+        lambda r: msa.exchange_queries_and_candidates(qs[r], cands[r], group)
+    )
+    want_q, want_c = torch.cat(qs, dim=1), torch.stack(cands)
+    for q_all, c in got:
+        assert torch.equal(q_all.view(torch.int16), want_q.view(torch.int16))
+        assert torch.equal(c.view(torch.int32), want_c.view(torch.int32))
 
 
 @pytest.mark.parametrize("dcp,num_tokens", [(2, 8), (2, 24), (4, 5)])
