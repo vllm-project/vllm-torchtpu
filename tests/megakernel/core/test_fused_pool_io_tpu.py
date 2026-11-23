@@ -202,7 +202,9 @@ def _run_split_and_fused_on_tpu(
     )
     assert ok_hlo, msg_hlo
 
-    hid_fused, raw_fused = compiled_fused(
+    # The compiled executable takes the step's internal arguments, so run the
+    # public step; `compiled_fused` above is only for the HLO check.
+    hid_fused, raw_fused = step_fused(
         pos_tpu, hid_tpu, w_tpu, raw_fused_in, pt_tpu, ckpt_tpu, roff_tpu
     )
     jax.block_until_ready((hid_fused, raw_fused))
