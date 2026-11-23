@@ -88,6 +88,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_E4M3_QKV: bool = False
     TPU_MINIMAX_M3_SP_A2A_OPROJ: str = "off"
     TPU_MINIMAX_M3_SP_A2A_E4M3: bool = False
+    TPU_MINIMAX_M3_SP_QRS: bool = False
+    TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS: int = 4096
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -884,6 +886,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-to-all as e4m3 rows with power-of-two row scales, and o_proj
     # contracts e4m3 x e4m3 (a change to o_proj's input precision).
     "TPU_MINIMAX_M3_SP_A2A_E4M3": env_bool("TPU_MINIMAX_M3_SP_A2A_E4M3", default=False),
+    # Sequence-parallel row reduce-scatters (TPU_MINIMAX_M3_SP_MODE) of at
+    # least TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS rows run qar_reduce_scatter (int8
+    # payload on the ICI links, kernels/collectives/qar_reduce_scatter.py)
+    # instead of XLA's reduce-scatter; smaller ones keep XLA's. Needs the
+    # Pallas all-reduce armed (TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES > 0) on a
+    # rank-ordered tpu7x 2x2x1 TP8 group. Changes numerics (~0.7% rel L2 per
+    # reduce-scatter). Off: the reduce-scatters are unchanged.
+    "TPU_MINIMAX_M3_SP_QRS": env_bool("TPU_MINIMAX_M3_SP_QRS", default=False),
+    "TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS", 4096
+    ),
     # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
     # permutation-free dense-expert kernel (kernels/experimental/
     # moe_dense_expert_fp4.py) instead of sort + grouped GEMM + combine.
