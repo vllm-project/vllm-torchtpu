@@ -14,12 +14,17 @@
 """Sequence parallelism over the TP group with the TP-loaded weights.
 
 Each TP rank holds 1/tp of the rows and runs a projection with every rank's
-weight shard: its own, plus a replica of the others' gathered once at load
-(`gather_other_shards`). Column-parallel projections then give every head
-group of the rank's rows; one all-to-all (`RowExchange.rows_to_heads`) turns
-that into the rank's own head group of all rows, which is exactly a TP
-attention input, and a second one (`heads_to_rows`) returns attention outputs
-to their rows' owners for the row-parallel projection.
+weight shard, replicated once at load. A column-parallel projection gives every
+head group of the rank's rows; one all-to-all (`RowExchange.rows_to_heads`)
+turns that, in rank order, into the rank's own head group of all rows, which is
+exactly a TP attention input, and a second one (`heads_to_rows`) returns
+attention outputs to their rows' owners, in rank order, for the row-parallel
+projection. Two weight layouts feed the exchange. With every rank's shard
+stacked in rank order (`gather_shards`), a projection's output is the
+all-to-all's input as is, and `row_parallel` sums the returned blocks in one
+matmul. With the rank's own shard apart from a replica of the others'
+(`gather_other_shards`, `column`, `row`), `in_rank_order` and `own_and_rest`
+reorder the blocks around the exchange.
 """
 
 from typing import cast
@@ -50,7 +55,7 @@ class RowExchange(nn.Module):
         # program, or torch_tpu pairs their collectives wrongly.
         self.register_buffer("rank", index([rank]), persistent=False)
         self.register_buffer("others_index", index(self.others), persistent=False)
-        # Where destination rank d's block sits in [own, *others].
+        # Where rank d's block sits in [own, *others].
         send_order = [
             0 if d == rank else 1 + self.others.index(d) for d in range(self.world)
         ]
@@ -60,15 +65,22 @@ class RowExchange(nn.Module):
         """This rank's block of the rows."""
         return x.unflatten(0, (self.world, -1)).index_select(0, self.rank)[0]
 
-    def rows_to_heads(self, own: torch.Tensor, rest: torch.Tensor) -> torch.Tensor:
-        """Head groups of this rank's rows -> this rank's head group of all rows."""
-        blocks = torch.cat([own[None], rest]).index_select(0, self.send_order)
+    def rows_to_heads(self, blocks: torch.Tensor) -> torch.Tensor:
+        """Every head group of this rank's rows, [tp, rows, ...] in rank order
+        -> this rank's head group of all rows."""
         return all_to_all(blocks, self.group).flatten(0, 1)
 
-    def heads_to_rows(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """This rank's head group of all rows -> every head group of its rows,
-        as (own group, the others')."""
-        blocks = all_to_all(x.unflatten(0, (self.world, -1)), self.group)
+    def heads_to_rows(self, x: torch.Tensor) -> torch.Tensor:
+        """This rank's head group of all rows -> every head group of this
+        rank's rows, [tp, rows, ...] in rank order."""
+        return all_to_all(x.unflatten(0, (self.world, -1)), self.group)
+
+    def in_rank_order(self, own: torch.Tensor, rest: torch.Tensor) -> torch.Tensor:
+        """Blocks as [own, *others] -> [tp, ...] in rank order."""
+        return torch.cat([own[None], rest]).index_select(0, self.send_order)
+
+    def own_and_rest(self, blocks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Blocks [tp, ...] in rank order -> (own, others')."""
         return blocks.index_select(0, self.rank)[0], blocks.index_select(
             0, self.others_index
         )
@@ -97,9 +109,20 @@ def row(
     return torch.matmul(x_own, in_out(linear)) + rest_out
 
 
-def gather_other_shards(shard: torch.Tensor, others: list[int]) -> torch.Tensor:
-    """The other TP ranks' copies of this rank's `shard`, stacked in rank order."""
+def row_parallel(blocks: torch.Tensor, shards: torch.Tensor) -> torch.Tensor:
+    """A row-parallel projection of every rank's input block, [tp, rows, in],
+    with every rank's shard, [tp, in, out], as one matmul over the whole input
+    (rounded once, like the unsharded layer)."""
+    return torch.matmul(blocks.transpose(0, 1).flatten(1), shards.flatten(0, 1))
+
+
+def gather_shards(shard: torch.Tensor) -> torch.Tensor:
+    """Every TP rank's copy of this rank's `shard`, stacked in rank order."""
     from vllm.distributed import tensor_model_parallel_all_gather
 
-    every = tensor_model_parallel_all_gather(shard.contiguous()[None], dim=0)
-    return every[others].contiguous()
+    return tensor_model_parallel_all_gather(shard.contiguous()[None], dim=0)
+
+
+def gather_other_shards(shard: torch.Tensor, others: list[int]) -> torch.Tensor:
+    """The other TP ranks' copies of this rank's `shard`, stacked in rank order."""
+    return gather_shards(shard)[others].contiguous()
