@@ -29,6 +29,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackend,
     VllmTPUDeepseekV32IndexerBackend,
 )
+from vllm_torchtpu.platforms.tpu_block_size_utils import is_turboquant_kv_cache_dtype
 
 
 def normalize_kv_cache_specs_for_tpu(
@@ -114,6 +115,7 @@ def _is_deepseek_v32_indexer_spec(spec: KVCacheSpec) -> bool:
         and not spec.dtype.is_floating_point
         and spec.tokens_per_state == 1
         and spec.cache_dtype_str != "fp8_ds_mla"
+        and not is_turboquant_kv_cache_dtype(spec.cache_dtype_str)
         and getattr(spec, "model_version", None) != "deepseek_v4"
     )
 
