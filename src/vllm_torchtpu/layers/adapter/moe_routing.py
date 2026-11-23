@@ -17,7 +17,10 @@ import torch
 import vllm.envs as vllm_envs
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
+from vllm_torchtpu.layers.adapter.router_topk import (
+    rowmax_select,
+    rowmax_select_fused,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -25,6 +28,7 @@ logger = init_logger(__name__)
 # Resolved once, at import, so the compiled forward never reads the
 # environment.
 _ROUTER_TOPK = envs.TPU_MOE_ROUTER_TOPK
+_ROUTER_FUSED_EPILOGUE = envs.TPU_MOE_ROUTER_FUSED_EPILOGUE
 
 
 def _get_topk_weights_dtype(default_dtype: torch.dtype) -> torch.dtype:
@@ -318,6 +322,22 @@ def select_experts(
         layer.e_score_correction_bias if layer is not None else None
     )
 
+    routed_scaling_factor = layer.routed_scaling_factor if layer is not None else 1.0
+    if (
+        _ROUTER_FUSED_EPILOGUE
+        and _ROUTER_TOPK == "rowmax"
+        and e_score_correction_bias is not None
+        and scores.dim() == 2
+    ):
+        # One kernel call for bias add, top-k, gather, renormalization and
+        # scale; the same float32 operations as the unfused branch below.
+        topk_weights, topk_ids = rowmax_select_fused(
+            scores, e_score_correction_bias, topk, renormalize, routed_scaling_factor
+        )
+        return topk_weights.to(
+            _get_topk_weights_dtype(hidden_states.dtype)
+        ), topk_ids.to(torch.int32)
+
     if e_score_correction_bias is not None:
         bias_shape = [1] * (scores.dim() - 1) + [-1]
         bias = e_score_correction_bias.float().view(bias_shape)
@@ -331,7 +351,6 @@ def select_experts(
         topk_weights = topk_weights / torch.clamp(
             topk_weights.sum(dim=-1, keepdim=True), min=1e-20
         )
-    routed_scaling_factor = layer.routed_scaling_factor if layer is not None else 1.0
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
 

@@ -62,6 +62,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
+| `TPU_MOE_ROUTER_FUSED_EPILOGUE` | `False` | Opt-in. For routers with an expert-selection correction bias (GLM-5.2, DeepSeek-V3), runs the bias add, the top-k, the gather of the unbiased weights, the renormalization and the routed scale as one Pallas call instead of the top-k kernel plus separate XLA ops. Same float32 operations in the same order. Applies only with `TPU_MOE_ROUTER_TOPK="rowmax"`. |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |
 | `QUANTIZE_ON_LOAD_PREFIXES` | `[]` | Comma-separated dot-bounded module prefix names to quantize to FP8 on load (e.g., `"self_attn,shared_experts,layers.0.mlp"`), including `VocabParallelEmbedding` and `ParallelLMHead`. |
