@@ -1517,6 +1517,36 @@ def _prep_fold_shapes(
 PREP_FOLD_PREV_ROWS = 3
 
 
+# VLLM_TPU_PREFWD_PREP_FOLD self-check: of the steps that ran the async-spec
+# rejected-count correction, how many folded it into the prep program, and why
+# the rest did not ("precheck": not the one-chunk verify step `_prep_fold_precheck`
+# folds; "unwarmed": `_try_prep_fold` found no warmed key for its shapes). Logged
+# on TP rank 0 after the first PREP_FOLD_LOG_FIRST such steps and then every
+# PREP_FOLD_LOG_EVERY. Counting only; no decision reads these.
+PREP_FOLD_LOG_FIRST, PREP_FOLD_LOG_EVERY = 1000, 50000
+
+
+def _prep_fold_rank0() -> bool:
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank() == 0
+    except Exception:  # no TP group (CPU tests, tools)
+        return True
+
+
+def prep_fold_recorded_line(counts: dict[str, int]) -> str:
+    """The self-check line: "PREFWD_PREP_FOLD recorded: folded n/m steps (x%),
+    unfolded: precheck a, unwarmed b"."""
+    n = counts.get("folded", 0)
+    m = n + counts.get("precheck", 0) + counts.get("unwarmed", 0)
+    return (
+        f"PREFWD_PREP_FOLD recorded: folded {n}/{m} steps "
+        f"({100.0 * n / m if m else 0.0:.1f}%), unfolded: "
+        f"precheck {counts.get('precheck', 0)}, unwarmed {counts.get('unwarmed', 0)}"
+    )
+
+
 def _prep_fold_rows(n: int, max_num_reqs: int) -> set[int]:
     """Rejected-count row counts warmed for a step of `n` requests: exact and
     bucketed `n`, and the previous step's count up to PREP_FOLD_PREV_ROWS more."""
@@ -5120,6 +5150,19 @@ class TPUModelRunner(GPUModelRunner):
         )
         return seq_lens
 
+    def _note_prep_fold(self, outcome: str) -> None:
+        """VLLM_TPU_PREFWD_PREP_FOLD self-check: count one correction step's
+        outcome ("folded", "precheck" or "unwarmed") and log the totals on TP
+        rank 0 at PREP_FOLD_LOG_FIRST steps and every PREP_FOLD_LOG_EVERY."""
+        counts = self.__dict__.setdefault("_prep_fold_counts", {})
+        counts[outcome] = counts.get(outcome, 0) + 1
+        m = sum(counts.values())
+        if (
+            m == PREP_FOLD_LOG_FIRST
+            or (m > PREP_FOLD_LOG_FIRST and m % PREP_FOLD_LOG_EVERY == 0)
+        ) and _prep_fold_rank0():
+            logger.info(prep_fold_recorded_line(counts))
+
     def _prep_fold_check(self, args, static, out) -> None:
         """VLLM_TPU_PREFWD_PREP_FOLD_CHECK: compare the folded outputs with the
         unfolded ops run eagerly on the same inputs (`fault`: on seq_lens - 1).
@@ -5494,6 +5537,8 @@ class TPUModelRunner(GPUModelRunner):
                 # folded prep program below; decided there.
                 prep_fold_subtract = subtract_idx
             else:
+                if fold_level:
+                    self._note_prep_fold("precheck")
                 seq_lens, self.position_ids = self._subtract_rejected(
                     seq_lens, subtract_idx
                 )
@@ -5703,6 +5748,9 @@ class TPUModelRunner(GPUModelRunner):
                 start_index,
                 num_reqs,
                 prep_fold_subst,
+            )
+            self._note_prep_fold(
+                "folded" if folded_seq_lens is not None else "unwarmed"
             )
             if folded_seq_lens is not None:
                 seq_lens = folded_seq_lens
