@@ -52,6 +52,8 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa_state import (
     write_ring_and_tags,
 )
 
+from .qwen38_io_lean import io_lean
+
 
 @dataclasses.dataclass(frozen=True)
 class QSALayerCache:
@@ -188,7 +190,7 @@ def _batched_writes(pool, rows, norms, tables, layers, positions, trig, starts, 
         pool = write_main_cache(pool, packed, page, logical, main_valid, **slot_kw)
     raw = jnp.stack([r[2] for r in rows])
     ring_rows = math.ceil(compress_ratio / 8) * 8
-    ids = jnp.concatenate([t[0] for t in tables])
+    ids = _ring_ids(tables)
     ring, tags = read_ring_and_tags(pool, ids, ring_rows * raw.shape[-1], ring_rows * 2)
     ring = ring.reshape(L, nreq, ring_rows, -1)
     tags = tags.reshape(L, nreq, ring_rows, 2)
@@ -219,6 +221,15 @@ def _batched_writes(pool, rows, norms, tables, layers, positions, trig, starts, 
     return write_ring_and_tags(
         pool, ring.reshape(L * nreq, -1), tags.reshape(L * nreq, -1), ids
     )
+
+
+def _ring_ids(tables) -> Any:
+    """All layers' ring ids, layer-major. VLLM_TPU_MK_IO_LEAN=ring: as a stack (rows of the
+    call's one ring-column array, `ring_columns`, which XLA then reads as one slice instead
+    of one op per layer); same values as the concatenation."""
+    if io_lean("ring"):
+        return jnp.stack([t[0] for t in tables]).reshape(-1)
+    return jnp.concatenate([t[0] for t in tables])
 
 
 def _stacked_ok(pool, layers, count: int) -> bool:
@@ -299,7 +310,7 @@ def _stacked_writes(pool, rows, norms, tables, layers, positions, trig, starts, 
 
     raw = jnp.stack([r[2] for r in rows])
     ring_rows = math.ceil(compress_ratio / 8) * 8
-    ids = jnp.concatenate([t[0] for t in tables])
+    ids = _ring_ids(tables)
     ring, tags = read_ring_and_tags(pool, ids, ring_rows * raw.shape[-1], ring_rows * 2)
     ring = ring.reshape(L, nreq, ring_rows, -1)
     tags = tags.reshape(L, nreq, ring_rows, 2)

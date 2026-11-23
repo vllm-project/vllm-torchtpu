@@ -205,7 +205,16 @@ def whole(
     rings,
     num_requests=None,
     batched=True,
+    lean_ring=False,
 ):
+    from vllm_torchtpu.megakernel_runtime.qwen38_io_lean import ring_columns
+
+    def lean(tabs, n):  # VLLM_TPU_MK_IO_LEAN=ring: the call's ring-column rows
+        if not lean_ring:
+            return tabs
+        flat = ring_columns([x for t in tabs for x in t], n)
+        return [tuple(flat[i : i + 3]) for i in range(0, len(flat), 3)]
+
     fn = jax.jit(
         lambda pool,
         rows,
@@ -218,7 +227,7 @@ def whole(
             pool,
             rows,
             norms,
-            tabs,
+            lean(tabs, len(context)),
             LAYERS,
             positions,
             trig,
@@ -359,4 +368,68 @@ def test_check_catches_swapped_ring_pages_in_the_batched_writer(interpret, monke
     got = whole(
         pool0, per_layer, positions, trig, starts, context, main, comp, rings[::-1]
     )
+    assert not np.array_equal(raw(got), raw(want))
+
+
+@pytest.mark.parametrize("stacked", [False, True])
+@pytest.mark.parametrize("pad", [0, 4])
+def test_lean_ring_writes_are_bitwise(interpret, monkeypatch, stacked, pad):
+    """VLLM_TPU_MK_IO_LEAN=ring: the writers fed the call's ring-column rows
+    (`ring_columns`) leave the same pool bytes as with the runner's flat ring tables, over
+    two steps (batched and layer-stacked writers, with and without cropped padding rows)."""
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_FUSED_KV_WRITE", False)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_STACKED_QSA_WRITES", stacked)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_COMPRESSED_UNIQUE_WRITE", stacked)
+    if stacked:
+        monkeypatch.setattr(
+            sys.modules[__name__],
+            "LAYERS",
+            [dataclasses.replace(lay, main_group="main") for lay in LAYERS],
+        )
+    rng = np.random.default_rng(11)
+    contexts, active = CONTEXTS + [0] * pad, ACTIVE + [False] * pad
+    main, comp, rings = tables(rng, contexts, active)
+    pool0 = jnp.asarray(
+        rng.normal(0, 1, (PAGES, PAGE_ROWS, 1, 4, WIDTH)), jnp.float8_e4m3fn
+    )
+    trig = jnp.pad(
+        jnp.asarray(rng.normal(0, 1, (4096, ROTARY)), jnp.bfloat16),
+        ((0, 0), (0, 128 - ROTARY)),
+    )
+    ctx = np.array(contexts, np.int32)
+    p_off = p_on = pool0
+    for _ in range(2):
+        positions, starts, per_layer = step_inputs(rng, ctx, active)
+        context = jnp.asarray(ctx)
+        kw = dict(num_requests=len(CONTEXTS) if pad else None)
+        monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "", raising=False)
+        p_off = whole(p_off, per_layer, positions, trig, starts, context, main, comp, rings,
+                      **kw)
+        monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "ring", raising=False)
+        p_on = whole(p_on, per_layer, positions, trig, starts, context, main, comp, rings,
+                     lean_ring=True, **kw)
+        assert not np.array_equal(raw(p_off), raw(pool0)), "nothing written"
+        np.testing.assert_array_equal(raw(p_on), raw(p_off))
+        ctx = ctx + np.where(active, ACCEPTED + [0] * pad, 0).astype(np.int32)
+
+
+def test_lean_ring_check_catches_swapped_layers(interpret, monkeypatch):
+    """Negative control: the lean arm with its layers' ring rows swapped must differ."""
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_FUSED_KV_WRITE", False)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "ring", raising=False)
+    rng = np.random.default_rng(13)
+    main, comp, rings = tables(rng, CONTEXTS, ACTIVE)
+    pool0 = jnp.asarray(
+        rng.normal(0, 1, (PAGES, PAGE_ROWS, 1, 4, WIDTH)), jnp.float8_e4m3fn
+    )
+    trig = jnp.pad(
+        jnp.asarray(rng.normal(0, 1, (4096, ROTARY)), jnp.bfloat16),
+        ((0, 0), (0, 128 - ROTARY)),
+    )
+    positions, starts, per_layer = step_inputs(rng, np.array(CONTEXTS, np.int32), ACTIVE)
+    context = jnp.asarray(CONTEXTS, jnp.int32)
+    want = whole(pool0, per_layer, positions, trig, starts, context, main, comp, rings,
+                 lean_ring=True)
+    got = whole(pool0, per_layer, positions, trig, starts, context, main, comp, rings[::-1],
+                lean_ring=True)
     assert not np.array_equal(raw(got), raw(want))
