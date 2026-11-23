@@ -252,6 +252,8 @@ if TYPE_CHECKING:
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     TPU_SAMPLER_TOPP_CANDIDATES: str = ""
     TPU_LM_HEAD_E4M3: bool = False
+    TPU_LM_HEAD_E4M3_SPLIT_MAX_ROWS: int = 0
+    TPU_LM_HEAD_E4M3_DUMP: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -1627,6 +1629,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # halving the bytes every logits call reads (`layers.adapter.lm_head_e4m3`).
     # Not exact: logits carry the e4m3 rounding of the weight.
     "TPU_LM_HEAD_E4M3": env_bool("TPU_LM_HEAD_E4M3", False),
+    # With TPU_LM_HEAD_E4M3: logits calls of at most this many rows split the
+    # activations into two e4m3 terms and run one fp8 x fp8 matmul (the weight
+    # is read once, in e4m3, by the fp8 MXU); larger calls keep the bf16
+    # matmul on the upcast weight. 0 = off.
+    "TPU_LM_HEAD_E4M3_SPLIT_MAX_ROWS": env_nonnegative_int(
+        "TPU_LM_HEAD_E4M3_SPLIT_MAX_ROWS", 0
+    ),
+    # Debug only, with TPU_LM_HEAD_E4M3: rank 0 saves its bf16 head shard and,
+    # for this many decode steps, the LM head inputs under
+    # $CDK_OUTPUT_DIR/lm_head_dump. 0 = off.
+    "TPU_LM_HEAD_E4M3_DUMP": env_nonnegative_int("TPU_LM_HEAD_E4M3_DUMP", 0),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).

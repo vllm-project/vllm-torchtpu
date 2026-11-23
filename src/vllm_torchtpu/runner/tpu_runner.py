@@ -1150,6 +1150,8 @@ class TPUModelRunner(GPUModelRunner):
         # sample_tokens, mirroring vLLM's async path).
         self.mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         self.execute_model_state: ExecuteModelState | None = None
+        # Debug only (TPU_LM_HEAD_E4M3_DUMP): saves the LM head inputs.
+        self._lm_head_dump = None
         self._pre_async_results: AsyncPreResults | None = None
         self._min_tokens = min_tokens_mask.MinTokensTracker()
         # 1 on TP rank 0, else 0; built lazily on first use by
@@ -4105,6 +4107,9 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if self._lm_head_dump is not None:
+            # Debug only: the previous step's LM head inputs.
+            self._lm_head_dump.save()
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
@@ -6130,7 +6135,12 @@ class TPUModelRunner(GPUModelRunner):
         if envs.TPU_LM_HEAD_E4M3:
             from vllm_torchtpu.layers.adapter import lm_head_e4m3
 
-            lm_head_e4m3.arm(self.model, getattr(self.drafter, "draft_model", None))
+            if lm_head_e4m3.arm(
+                self.model, getattr(self.drafter, "draft_model", None)
+            ) and envs.TPU_LM_HEAD_E4M3_DUMP:
+                self._lm_head_dump = lm_head_e4m3.HeadDump.maybe_create(
+                    self.model.lm_head, envs.TPU_LM_HEAD_E4M3_DUMP
+                )
 
         # After the drafter, so its MTP layer is armed too.
         if envs.FUSED_MOE_DECODE_KERNEL:

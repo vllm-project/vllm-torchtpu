@@ -91,3 +91,34 @@ def test_arm_accepts_bf16_head_dtype():
     model = _Model(_Head(_w()))
     model.logits_processor.head_dtype = torch.bfloat16
     assert lm_head_e4m3.arm(model, None)
+
+
+def test_split_logits_matches_upcast_weight():
+    """The split-e4m3 fp8 matmul equals the upcast-weight matmul up to the
+    bf16 output rounding; the high term alone (per-token W8A8) does not."""
+    import jax.numpy as jnp
+    import numpy as np
+
+    w = _w(rows=512, hidden=768)
+    q, s = lm_head_e4m3.quantize_rows(w)
+    g = torch.Generator().manual_seed(3)
+    x = torch.randn(16, 768, generator=g)
+    x[:, :8] *= 20  # outlier channels
+    x = x.to(torch.bfloat16)
+    deq = q.double() * s.double()[:, None]
+    oracle = x.double() @ deq.t()
+    upcast = (x.float() @ deq.float().t()).to(torch.bfloat16).double()
+
+    def rel(a):
+        return ((a - oracle).norm() / oracle.norm()).item()
+
+    qj = jnp.asarray(q.view(torch.uint8).numpy()).view(jnp.float8_e4m3fn)
+    xj = jnp.asarray(x.float().numpy()).astype(jnp.bfloat16)
+    out = lm_head_e4m3.split_e4m3_logits(xj, qj, jnp.asarray(s.numpy()))
+    out = torch.from_numpy(np.asarray(out.astype(jnp.float32))).double()
+    assert rel(out) <= 2 * rel(upcast) + 1e-4
+    # Positive control: dropping the low term is a 4-bit activation.
+    xf = x.double()
+    sc = torch.exp2(torch.ceil(torch.log2(xf.abs().amax(1, keepdim=True) / 448)))
+    hi = (xf / sc).float().to(torch.float8_e4m3fn).double() * sc
+    assert rel(hi @ deq.t()) > 5 * rel(out)
