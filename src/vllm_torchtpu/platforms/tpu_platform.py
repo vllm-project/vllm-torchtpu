@@ -239,7 +239,7 @@ class _TrackedEnableDisableEpWeightFilterAction(EnableDisableAction):
     def __call__(self, parser, namespace, values, option_string=None):
         global _ep_weight_filter_cli_opt_out
         super().__call__(parser, namespace, values, option_string)
-        _ep_weight_filter_cli_opt_out = getattr(namespace, self.dest, None) is False
+        _ep_weight_filter_cli_opt_out = getattr(namespace, self.dest) is False
 
 
 class _TrackedBooleanOptionalEpWeightFilterAction(argparse.BooleanOptionalAction):
@@ -248,7 +248,7 @@ class _TrackedBooleanOptionalEpWeightFilterAction(argparse.BooleanOptionalAction
     def __call__(self, parser, namespace, values, option_string=None):
         global _ep_weight_filter_cli_opt_out
         super().__call__(parser, namespace, values, option_string)
-        _ep_weight_filter_cli_opt_out = getattr(namespace, self.dest, None) is False
+        _ep_weight_filter_cli_opt_out = getattr(namespace, self.dest) is False
 
 
 _TRACKED_EP_WEIGHT_FILTER_ACTION_TYPES = (

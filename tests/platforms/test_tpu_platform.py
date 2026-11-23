@@ -1833,3 +1833,35 @@ def test_default_ep_weight_filter_sys_argv_fallback(
     )
     TpuPlatform.check_and_update_config(vllm_config)
     assert vllm_config.parallel_config.enable_ep_weight_filter is expected
+
+
+@pytest.mark.parametrize(
+    "yaml_body, expected",
+    [
+        ("enable-ep-weight-filter: false\n", False),
+        ("disable-ep-weight-filter: true\n", False),
+        ("enable-ep-weight-filter: true\n", True),
+    ],
+)
+@patch("vllm_torchtpu.patch_registry.apply")
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
+def test_default_ep_weight_filter_respects_config_yaml_opt_out(
+    mock_prepare_env, mock_apply_patches, monkeypatch, tmp_path, yaml_body, expected
+):
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    cfg_path = tmp_path / "serve.yaml"
+    cfg_path.write_text(yaml_body, encoding="utf-8")
+    monkeypatch.setattr(tpu_platform, "_ep_weight_filter_cli_opt_out", None)
+    monkeypatch.setattr(sys, "argv", ["vllm", "serve", "--config", str(cfg_path)])
+    with _device_left_unset():
+        parser = AsyncEngineArgs.add_cli_args(FlexibleArgumentParser())
+    parsed = parser.parse_args(["--config", str(cfg_path)])
+    vllm_config = _make_ep_filter_vllm_config(
+        is_moe=True,
+        enable_expert_parallel=True,
+        enable_ep_weight_filter=parsed.enable_ep_weight_filter,
+    )
+    TpuPlatform.check_and_update_config(vllm_config)
+    assert vllm_config.parallel_config.enable_ep_weight_filter is expected
