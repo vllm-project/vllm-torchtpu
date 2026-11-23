@@ -804,14 +804,14 @@ def fused_moe_decode_runner_forward(
         shared_gate_weight,
     )
 
-    router_logits = runner.router.prepare_monolithic_logits(router_logits)
+    # vLLM releases that preprocess logits for monolithic MoE kernels expose
+    # `prepare_monolithic_logits`; v0.32 passes the router logits through
+    # unchanged, so the identity is the matching behaviour there.
+    prepare = getattr(runner.router, "prepare_monolithic_logits", None)
+    if prepare is not None:
+        router_logits = prepare(router_logits)
     qm = runner._quant_method
-    topk_weights, topk_ids = moe_routing.route(
-        layer,
-        hidden_states,
-        router_logits,
-        topk_weights_float32=getattr(qm, "_tpu_topk_weights_float32", False),
-    )
+    topk_weights, topk_ids = moe_routing.route(layer, hidden_states, router_logits)
     if envs.TPU_MOE_SKIP_PADDED_TOKENS:
         topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
             topk_ids, topk_weights, is_local_tensor=False
