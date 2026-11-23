@@ -291,6 +291,7 @@ class TestTpuPlatform:
         vllm_config.model_config.hf_config = None
         # Set in ModelConfig.__post_init__, so the spec has no such attribute.
         vllm_config.model_config.runner_type = "generate"
+        vllm_config.model_config.model_arch_config = None
         vllm_config.cache_config = CacheConfig()
         vllm_config.cache_config.block_size = None
         vllm_config.cache_config.enable_prefix_caching = False
@@ -477,7 +478,11 @@ class TestTpuPlatform:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
 
-    @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
+    @pytest.mark.parametrize("layout", ["HND", "NHD"])
+    @pytest.mark.parametrize(
+        "swa_head_dim,global_head_dim,refused_under_hnd",
+        [(64, None, True), (128, None, False), (256, 64, True), (256, 512, False)],
+    )
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
@@ -488,17 +493,32 @@ class TestTpuPlatform:
         mock_apply_patches,
         vllm_config,
         monkeypatch,
-        head_size,
-        refused,
+        layout,
+        swa_head_dim,
+        global_head_dim,
+        refused_under_hnd,
     ):
-        """The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND."""
+        """The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND,
+        including heterogeneous models whose `ModelArchitectureConfig[i]` mixes
+        a 64-dim layer with wider layers."""
+        from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+        from vllm.transformers_utils.model_arch_config_convertor import (
+            ModelArchConfigConvertorBase,
+        )
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        glob_hd = global_head_dim or swa_head_dim
+        cfg = Gemma4TextConfig(
+            head_dim=swa_head_dim, global_head_dim=glob_hd, num_hidden_layers=6
+        )
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", layout)
         vllm_config.attention_config.backend = AttentionBackendEnum.CUSTOM
-        vllm_config.model_config.get_head_size = lambda: head_size
+        vllm_config.model_config.get_head_size = lambda: max(swa_head_dim, glob_hd)
+        vllm_config.model_config.model_arch_config = ModelArchConfigConvertorBase(
+            cfg, cfg
+        ).convert()
 
-        if refused:
+        if layout == "HND" and refused_under_hnd:
             with pytest.raises(NotImplementedError, match="head_dim==64"):
                 TpuPlatform.check_and_update_config(vllm_config)
         else:

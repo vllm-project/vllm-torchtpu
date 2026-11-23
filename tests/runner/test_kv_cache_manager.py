@@ -25,6 +25,7 @@ import pytest
 import torch
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -233,86 +234,326 @@ def test_get_kv_cache_spec_sparse_mla(monkeypatch, layout):
     assert spec.num_head_slots == 1
 
 
+def _build_mock_cpu_runner(
+    *,
+    block_size: int = 16,
+    kv_cache_dtype: torch.dtype = torch.bfloat16,
+    kv_cache_layout: str | None = None,
+) -> MagicMock:
+    """Construct a CPU-backed `TPUModelRunner` mock wired to a real `KVCacheManager`."""
+    model_config = ModelConfig(
+        tokenizer_mode="auto",
+        trust_remote_code=False,
+        seed=0,
+        dtype=torch.bfloat16,
+    )
+    cache_config = CacheConfig(
+        block_size=block_size,
+        gpu_memory_utilization=0.9,
+        cache_dtype="auto",
+    )
+    if kv_cache_layout is not None:
+        cache_config.kv_cache_layout = kv_cache_layout
+    scheduler_config = SchedulerConfig(
+        max_num_seqs=16,
+        max_model_len=1024,
+        is_encoder_decoder=False,
+    )
+    parallel_config = ParallelConfig(
+        pipeline_parallel_size=1,
+        tensor_parallel_size=1,
+    )
+    vllm_config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        model_config=model_config,
+        cache_config=cache_config,
+        scheduler_config=scheduler_config,
+        parallel_config=parallel_config,
+        observability_config={},
+        additional_config={},
+    )
+
+    runner = MagicMock(spec=TPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.block_size = block_size
+    runner.kv_cache_dtype = kv_cache_dtype
+    runner.use_spmd = False
+    runner.vllm_config = vllm_config
+    runner.cache_config = vllm_config.cache_config
+    runner.scheduler_config = vllm_config.scheduler_config
+    runner.parallel_config = vllm_config.parallel_config
+    runner._hybrid_uniform_page_size_bytes = None
+    runner._subpage_kernel_block_size = None
+    runner.max_num_reqs = 16
+    runner.max_model_len = 1024
+    runner.max_num_tokens = 2048
+    runner.pin_memory = False
+    runner.model_config = vllm_config.model_config
+    runner.shared_kv_cache_layers = {}
+    runner.runner_only_attn_layers = set()
+    runner.enforce_eager = False
+    runner.speculative_config = None
+    runner.pcp_manager = None
+    runner.lora_slot_write_hbm_bytes.return_value = 0
+    runner.pp_handoff_hbm_reserve_bytes.return_value = 0
+    runner.post_profile_hbm_reserves = TPUModelRunner.post_profile_hbm_reserves.__get__(
+        runner
+    )
+    runner._mamba_slot_stride = 1
+    runner.kv_cache_manager = KVCacheManager(runner)
+    runner._mamba_num_blocks = None
+    runner._uniform_mamba_layout = vllm_config.kv_transfer_config is not None
+    runner._unified_kv_layout = False
+    runner.kv_cache_raw_tensors = []
+    runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(runner)
+    runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(runner)
+    return runner
+
+
+@pytest.mark.parametrize(
+    "layout,backend,block_size,full_page_bytes,sliding_heads,sliding_page_bytes,shared",
+    [
+        ("LBNHC", PallasAttentionBackend, 256, 524288, 4, 524288, True),
+        ("LBNHC", PallasAttentionBackend, 256, 524288, 8, 1048576, True),
+        ("LBNHC", PallasAttentionBackend, 256, 524288, 6, 786432, False),
+        ("LBHNC", PallasBatchedRPAAttentionBackend, 128, 131072, 2, 131072, True),
+        ("LBHNC", PallasBatchedRPAAttentionBackend, 128, 131072, 4, 262144, True),
+        ("LBHNC", PallasBatchedRPAAttentionBackend, 128, 131072, 3, 196608, False),
+    ],
+)
+def test_gemma_hma_native_geometries_fit_scheduler_budget(
+    layout,
+    backend,
+    block_size,
+    full_page_bytes,
+    sliding_heads,
+    sliding_page_bytes,
+    shared,
+):
+    """Compatible shapes share 4D regions; other shapes retain native arrays."""
+    from vllm.v1.core.kv_cache_planning import (
+        get_kv_cache_config_from_groups,
+        get_kv_cache_groups,
+    )
+
+    assert get_current_vllm_config_or_none() is None
+    runner = _build_mock_cpu_runner(
+        block_size=block_size,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_layout=layout,
+    )
+    runner.scheduler_config.disable_hybrid_kv_cache_manager = False
+    layers = {}
+    for prefix, count, heads, head_size, window in [
+        ("full", 2, 1, 512, None),
+        ("swa", 6, sliding_heads, 256, 1024),
+    ]:
+        for index in range(count):
+            layer = _attention_layer_mock()
+            layer.attn_type = AttentionType.DECODER
+            layer.num_kv_heads = heads
+            layer.head_size = head_size
+            layer.sliding_window = window
+            layer.kv_sharing_target_layer_name = None
+            layers[f"{prefix}.{index}"] = layer
+    with (
+        patch.object(TpuPlatform, "_find_non_ssm_backend", return_value=backend),
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+            return_value=layers,
+        ),
+    ):
+        specs = runner.get_kv_cache_spec()
+    groups = get_kv_cache_groups(runner.vllm_config, specs)
+    assert len(groups) == 4
+    assert (
+        sum(isinstance(group.kv_cache_spec, SlidingWindowSpec) for group in groups) == 3
+    )
+    num_blocks = 4
+    page_bytes = (
+        max(full_page_bytes, sliding_page_bytes)
+        if shared
+        else full_page_bytes + sliding_page_bytes
+    )
+    budget = num_blocks * 2 * page_bytes
+    config = get_kv_cache_config_from_groups(runner.vllm_config, groups, budget)
+    runner.vllm_config.compilation_config.static_forward_context = {}
+    runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+    runner.input_batch = SimpleNamespace(
+        block_table=[
+            SimpleNamespace(
+                max_num_blocks_per_req=4,
+                get_cpu_tensor=lambda: runner.block_table_cpu,
+            )
+            for _ in groups
+        ]
+    )
+    with (
+        patch.object(TpuPlatform, "_find_non_ssm_backend", return_value=backend),
+        patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as bind,
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+            return_value=False,
+        ),
+    ):
+        runner.initialize_kv_cache(config)
+    caches = bind.call_args.args[0]
+    unique = {id(cache): cache for cache in caches.values()}
+    assert config.num_blocks == num_blocks
+    assert len(unique) == (2 if shared else 4)
+    assert sum(cache.nbytes for cache in unique.values()) == budget
+    words_per_token = page_bytes // (block_size * 4)
+    if shared:
+        assert caches["full.0"] is caches["swa.0"]
+        assert caches["full.0"].shape == (
+            (num_blocks, words_per_token, 4, block_size)
+            if layout == "LBHNC"
+            else (num_blocks, block_size, 4, words_per_token)
+        )
+    else:
+        assert caches["full.0"].shape == (
+            (num_blocks, 2, 128, 4, block_size)
+            if layout == "LBHNC"
+            else (num_blocks, block_size, 1, 4, 512)
+        )
+        assert caches["swa.0"].shape == (
+            (num_blocks, sliding_heads * 2, 64, 4, block_size)
+            if layout == "LBHNC"
+            else (num_blocks, block_size, sliding_heads // 2, 4, 256)
+        )
+        assert caches["full.0"] is not caches["swa.0"]
+    assert caches["swa.0"] is caches["swa.1"] is caches["swa.2"]
+    assert caches["swa.3"] is caches["swa.4"] is caches["swa.5"]
+    caches["swa.0"][-1].fill_(7)
+    assert torch.all(caches["swa.2"][-1].float() == 7)
+    assert torch.count_nonzero(caches["swa.0"][:-1].float()) == 0
+    assert torch.count_nonzero(caches["swa.3"].float()) == 0
+    if not shared:
+        assert torch.count_nonzero(caches["full.0"].float()) == 0
+
+
+@pytest.mark.parametrize("layout", ["LBHNC", "LBNHC"])
+@pytest.mark.parametrize(
+    "attn_type,shared_target,refused_under_hnd",
+    [
+        (AttentionType.DECODER, None, True),
+        (AttentionType.DECODER, "target.0", True),
+        (AttentionType.ENCODER_ONLY, None, False),
+    ],
+)
+def test_get_kv_cache_spec_refuses_hd64_decoder_layer_under_hnd(
+    layout, attn_type, shared_target, refused_under_hnd
+):
+    """Refuse 64-dim decoder/draft layers under HND; allow encoder-only and NHD."""
+    runner = _build_mock_cpu_runner(block_size=128, kv_cache_layout=layout)
+    layers = {}
+    if shared_target is not None:
+        target = _attention_layer_mock(num_kv_heads=2, head_size=64)
+        target.attn_type = AttentionType.DECODER
+        target.kv_sharing_target_layer_name = None
+        target.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
+        layers[shared_target] = target
+    draft = _attention_layer_mock(num_kv_heads=2, head_size=64)
+    draft.attn_type = attn_type
+    draft.kv_sharing_target_layer_name = shared_target
+    draft.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
+    layers["draft.0"] = draft
+    with (
+        patch.object(
+            TpuPlatform,
+            "_find_non_ssm_backend",
+            return_value=PallasBatchedRPAAttentionBackend,
+        ),
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+            return_value=layers,
+        ),
+    ):
+        if layout == "LBHNC" and refused_under_hnd:
+            with pytest.raises(NotImplementedError, match="head_dim==64"):
+                runner.get_kv_cache_spec()
+        else:
+            runner.get_kv_cache_spec()
+
+
+@pytest.mark.parametrize("layout", ["LBHNC", "LBNHC"])
+def test_shared_attention_pool_rejects_mixed_hd64_under_hnd(layout):
+    """Mixing head_size 64 and 128 in one shared pool raises under HND only."""
+    runner = _build_mock_cpu_runner(block_size=128, kv_cache_layout=layout)
+    page_b = 2 * 128 * 2 * 128 * torch.bfloat16.itemsize
+    groups = [
+        KVCacheGroupSpec(
+            layer_names=["full.0"],
+            kv_cache_spec=FullAttentionSpec(
+                block_size=128,
+                num_kv_heads=2,
+                head_size=128,
+                dtype=torch.bfloat16,
+                page_size_padded=page_b,
+            ),
+        ),
+        KVCacheGroupSpec(
+            layer_names=["swa.0"],
+            kv_cache_spec=SlidingWindowSpec(
+                block_size=128,
+                num_kv_heads=2,
+                head_size=64,
+                dtype=torch.bfloat16,
+                sliding_window=512,
+                page_size_padded=page_b,
+            ),
+        ),
+    ]
+    config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=4 * page_b,
+                layers=["full.0", "swa.0"],
+                layer_stride=0,
+                block_stride=page_b,
+            )
+        ],
+        kv_cache_groups=groups,
+    )
+    runner.vllm_config.compilation_config.static_forward_context = {}
+    runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+    runner.input_batch = SimpleNamespace(
+        block_table=[
+            SimpleNamespace(
+                max_num_blocks_per_req=4,
+                get_cpu_tensor=lambda: runner.block_table_cpu,
+            )
+            for _ in groups
+        ]
+    )
+    with (
+        patch.object(
+            TpuPlatform,
+            "_find_non_ssm_backend",
+            return_value=PallasBatchedRPAAttentionBackend,
+        ),
+        patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as bind,
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+            return_value=False,
+        ),
+    ):
+        if layout == "LBHNC":
+            with pytest.raises(NotImplementedError, match="head_dim==64"):
+                runner.initialize_kv_cache(config)
+        else:
+            runner.initialize_kv_cache(config)
+            caches = bind.call_args.args[0]
+            assert caches["full.0"] is caches["swa.0"]
+            assert caches["full.0"].shape == (4, 128, 2, 256)
+
+
 @pytest.mark.tpu_test
 class TestKVCacheManager:
     def setup_method(self):
         self.mock_device = torch.device("cpu")
-
-        model_config = ModelConfig(
-            tokenizer_mode="auto",
-            trust_remote_code=False,
-            seed=0,
-            dtype=torch.bfloat16,
-        )
-        cache_config = CacheConfig(
-            block_size=16,
-            gpu_memory_utilization=0.9,
-            cache_dtype="auto",
-        )
-        scheduler_config = SchedulerConfig(
-            max_num_seqs=16,
-            max_model_len=1024,
-            is_encoder_decoder=False,
-        )
-        parallel_config = ParallelConfig(
-            pipeline_parallel_size=1,
-            tensor_parallel_size=1,
-        )
-        vllm_config = VllmConfig(
-            model_config=model_config,
-            cache_config=cache_config,
-            scheduler_config=scheduler_config,
-            parallel_config=parallel_config,
-            observability_config={},
-            additional_config={},
-        )
-
-        self.runner = MagicMock(spec=TPUModelRunner)
-        self.runner.device = self.mock_device
-        self.runner.block_size = 16
-        self.runner.kv_cache_dtype = torch.bfloat16
-        self.runner.use_spmd = False
-        self.runner.vllm_config = vllm_config
-        self.runner.cache_config = vllm_config.cache_config
-        self.runner.scheduler_config = vllm_config.scheduler_config
-        self.runner._hybrid_uniform_page_size_bytes = None
-        self.runner._subpage_kernel_block_size = None
-        self.runner.max_num_reqs = 16
-        self.runner.max_model_len = 1024
-        self.runner.max_num_tokens = 2048
-        self.runner.pin_memory = False
-        self.runner.model_config = vllm_config.model_config
-        self.runner.shared_kv_cache_layers = {}
-        self.runner.runner_only_attn_layers = set()
-        self.runner.enforce_eager = False
-        self.runner.speculative_config = None
-        self.runner.pcp_manager = None
-        # No LoRA, so adapter swaps reserve no HBM.
-        self.runner.lora_slot_write_hbm_bytes.return_value = 0
-        # No buffered hand-off, so no buffers are reserved for it.
-        self.runner.pp_handoff_hbm_reserve_bytes.return_value = 0
-        self.runner.post_profile_hbm_reserves = (
-            TPUModelRunner.post_profile_hbm_reserves.__get__(self.runner)
-        )
-        # Slots per request in the mamba pool (1 without spec decode).
-        self.runner._mamba_slot_stride = 1
-
-        # Bind the actual methods to our mock. The KV-cache spec/sizing bodies
-        # live on KVCacheManager, which reads all of its state back off the
-        # runner, so a real manager over the mock exercises the real code.
-        self.runner.kv_cache_manager = KVCacheManager(self.runner)
-        # Compact-mamba state starts unset (matches real __init__).
-        self.runner._mamba_num_blocks = None
-        self.runner._uniform_mamba_layout = vllm_config.kv_transfer_config is not None
-        self.runner._unified_kv_layout = False
-        self.runner.kv_cache_raw_tensors = []
-        self.runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(
-            self.runner
-        )
-        self.runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(
-            self.runner
-        )
-
+        self.runner = _build_mock_cpu_runner()
         self._find_non_ssm_backend_patcher = patch.object(
             TpuPlatform, "_find_non_ssm_backend", return_value=PallasAttentionBackend
         )
@@ -1526,101 +1767,6 @@ class TestKVCacheManager:
         assert torch.all(caches["swa.0"][num_blocks - 1] == 7)
         assert torch.count_nonzero(caches["full.0"][: num_blocks - 1]) == 0
         assert torch.count_nonzero(caches["full.1"]) == 0
-
-    @pytest.mark.parametrize(
-        "sliding_heads, sliding_page_bytes, shared",
-        [
-            (4, 524288, True),
-            (8, 1048576, True),
-            (6, 786432, False),
-        ],
-    )
-    def test_gemma_hma_native_geometries_fit_scheduler_budget(
-        self, sliding_heads, sliding_page_bytes, shared
-    ):
-        """Compatible shapes share regions; other shapes retain native arrays."""
-        from vllm.v1.core.kv_cache_planning import (
-            get_kv_cache_config_from_groups,
-            get_kv_cache_groups,
-        )
-        from vllm.v1.kv_cache_interface import SlidingWindowSpec
-
-        self.runner.block_size = 256
-        self.runner.cache_config.block_size = 256
-        self.runner.cache_config.kv_cache_layout = "LBNHC"
-        self.runner.kv_cache_dtype = torch.float8_e4m3fn
-        self.runner.scheduler_config.disable_hybrid_kv_cache_manager = False
-        layers = {}
-        for prefix, count, heads, head_size, window in [
-            ("full", 2, 1, 512, None),
-            ("swa", 6, sliding_heads, 256, 1024),
-        ]:
-            for index in range(count):
-                layer = _attention_layer_mock()
-                layer.attn_type = AttentionType.DECODER
-                layer.num_kv_heads = heads
-                layer.head_size = head_size
-                layer.sliding_window = window
-                layer.kv_sharing_target_layer_name = None
-                layers[f"{prefix}.{index}"] = layer
-        with patch(
-            "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
-            return_value=layers,
-        ):
-            specs = self.runner.get_kv_cache_spec()
-        groups = get_kv_cache_groups(self.runner.vllm_config, specs)
-        assert len(groups) == 4
-        assert (
-            sum(isinstance(group.kv_cache_spec, SlidingWindowSpec) for group in groups)
-            == 3
-        )
-        num_blocks = 4
-        page_bytes = (
-            max(524288, sliding_page_bytes) if shared else 524288 + sliding_page_bytes
-        )
-        budget = num_blocks * 2 * page_bytes
-        config = get_kv_cache_config_from_groups(
-            self.runner.vllm_config, groups, budget
-        )
-        self.runner.vllm_config.compilation_config.static_forward_context = {}
-        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
-        self.runner.input_batch = SimpleNamespace(
-            block_table=[
-                SimpleNamespace(
-                    max_num_blocks_per_req=4,
-                    get_cpu_tensor=lambda: self.runner.block_table_cpu,
-                )
-                for _ in groups
-            ]
-        )
-        with (
-            patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as bind,
-            patch(
-                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
-                return_value=False,
-            ),
-        ):
-            self.runner.initialize_kv_cache(config)
-        caches = bind.call_args.args[0]
-        unique = {id(cache): cache for cache in caches.values()}
-        assert config.num_blocks == num_blocks
-        assert len(unique) == (2 if shared else 4)
-        assert sum(cache.nbytes for cache in unique.values()) == budget
-        if shared:
-            assert caches["full.0"] is caches["swa.0"]
-            assert caches["full.0"].shape == (4, 256, 4, page_bytes // 1024)
-        else:
-            assert caches["full.0"].shape == (4, 256, 1, 4, 512)
-            assert caches["swa.0"].shape == (4, 256, sliding_heads // 2, 4, 256)
-            assert caches["full.0"] is not caches["swa.0"]
-        assert caches["swa.0"] is caches["swa.1"] is caches["swa.2"]
-        assert caches["swa.3"] is caches["swa.4"] is caches["swa.5"]
-        caches["swa.0"][-1].fill_(7)
-        assert torch.all(caches["swa.2"][-1].float() == 7)
-        assert torch.count_nonzero(caches["swa.0"][:-1].float()) == 0
-        assert torch.count_nonzero(caches["swa.3"].float()) == 0
-        if not shared:
-            assert torch.count_nonzero(caches["full.0"].float()) == 0
 
     @pytest.mark.usefixtures("vllm_config_context")
     @pytest.mark.parametrize(

@@ -55,6 +55,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 from vllm.v1.worker.utils import (
     AttentionGroup,
     add_kv_sharing_layers_to_kv_cache_groups,
@@ -353,6 +354,18 @@ class KVCacheManager:
                     kv_cache_spec[layer_name] = spec
             # Classic Attention path
             elif isinstance(attn_module, Attention):
+                if (
+                    attn_module.attn_type == AttentionType.DECODER
+                    and attn_module.head_size == 64
+                    and self.runner.cache_config.kv_cache_layout is not None
+                    and self.runner.cache_config.get_resolved_kv_cache_layout()
+                    is VllmKVCacheLayout.LBHNC
+                ):
+                    raise NotImplementedError(
+                        f"Layer {layer_name} has head_dim==64, which the "
+                        "SEQ_ALONG_LANE (VLLM_KV_CACHE_LAYOUT=HND) RPA kernel "
+                        "does not implement. Use VLLM_KV_CACHE_LAYOUT=NHD."
+                    )
                 if (
                     kv_tgt_layer := attn_module.kv_sharing_target_layer_name
                 ) is not None:

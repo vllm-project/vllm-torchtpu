@@ -379,7 +379,8 @@ def materialize_shared_attention_cache(
 ) -> torch.Tensor:
     """Allocate one tensor for attention groups sharing scheduler pages.
 
-    Axis 1 is `kernel_block_size`, the page size the block tables index.
+    Axis 1 (or axis 3 under `SEQ_ALONG_LANE`) is `kernel_block_size`, the page
+    size the block tables index.
     """
     if not layer_specs:
         raise ValueError("layer_specs must contain an attention layer")
@@ -411,15 +412,21 @@ def materialize_shared_attention_cache(
     pool_shape = shapes[0]
     if (
         any(shape != pool_shape for shape in shapes)
+        or any(
+            (layer_spec.head_size == 64) != (spec.head_size == 64)
+            for _, layer_spec in layer_specs
+        )
         or math.prod(pool_shape) != num_blocks * page_elements
     ):
         # Keep the packed dtype axis separate when reinterpreting head shapes.
         packing = 4 // spec.dtype.itemsize
-        pool_shape = (
+        words_per_token = page_elements // (kernel_block_size * packing)
+        pool_shape = attn_backend.get_shared_pool_shape(
             num_blocks,
             kernel_block_size,
             packing,
-            page_elements // (kernel_block_size * packing),
+            words_per_token,
+            [layer_spec.head_size for _, layer_spec in layer_specs],
         )
     return torch.zeros(pool_shape, dtype=spec.dtype, device=device)
 
