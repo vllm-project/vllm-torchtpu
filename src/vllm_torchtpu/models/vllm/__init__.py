@@ -48,7 +48,10 @@ def register_models() -> None:
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
     from vllm_torchtpu.models.qwen4_exp.config import TPUQwen4ExpConfig
-    from vllm_torchtpu.models.vllm.olmo35.config import register_olmo35_config
+    from vllm_torchtpu.models.vllm.olmo35.config import (
+        TPUOlmo35Config,
+        register_olmo35_config,
+    )
 
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
     ModelRegistry.register_model("KimiK3ForConditionalGeneration", _KIMI_K3_MODEL)
@@ -70,3 +73,4 @@ def register_models() -> None:
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen2ForCausalLM"] = _TPUQwen2Config
+    MODELS_CONFIG_MAP["Olmo35ForCausalLM"] = TPUOlmo35Config

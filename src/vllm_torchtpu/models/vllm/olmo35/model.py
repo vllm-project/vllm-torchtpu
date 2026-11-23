@@ -13,9 +13,8 @@
 # limitations under the License.
 """OLMo 3.5 (Ai2's hybrid KDA / attention / latent-MoE model) for TPU.
 
-Follows MaxText's `decoder_block: olmoe3` (`maxtext/models/olmoe3.py`), the
-training reference for the checkpoints.
-Per layer:
+Follows MaxText's `decoder_block: olmoe3`, the training reference for the
+checkpoints. Per layer:
 
     h   = x + attn_out_norm(mixer(attn_in_norm(x)))
     out = h + ffn_out_norm(shared_ffn(y) + latent_up(moe(latent_down(y))))
@@ -30,6 +29,30 @@ The KDA layers run the same fused conv1d + GDN v3 Pallas kernel as Kimi, with
 OLMo's value heads twice as wide as its key heads and beta in [0, 2). The
 routed experts go through vLLM's TPU fused-MoE backend with the latent
 projections as its routed input / output transforms, as in Kimi K3.
+
+Checkpoint names (HF safetensors), per layer `model.layers.{i}.`:
+
+    attn_in_norm / attn_out_norm / ffn_in_norm / ffn_out_norm .weight
+    KDA layers, mixer.:
+        q_proj / k_proj / v_proj / b_proj .weight       -> qkvb_proj
+        f_a_proj / g_a_proj .weight                     -> fg_a_proj
+        f_b_proj.weight, g_b_proj.weight / .bias
+        q_conv1d / k_conv1d / v_conv1d .weight          [channels, 1, kernel]
+        A_log, dt_bias, o_norm.weight, o_proj.weight
+    attention layers, mixer.:
+        q_proj / k_proj / v_proj .weight                -> qkv_proj
+        g_proj.weight, o_proj.weight, q_norm, k_norm    [heads, head_dim]
+        ssmax_scale                                     [heads], when used
+    dense layers (i < first_k_dense_replace), mlp.:
+        gate_proj / up_proj / down_proj .weight
+    MoE layers, moe.:
+        gate.weight, latent_down.weight, latent_up.weight
+        shared_experts.{gate_proj,up_proj,down_proj}.weight
+        experts.{e}.{gate_proj,up_proj,down_proj}.weight
+
+plus `model.embed_tokens.weight`, `model.embedding_norm.weight`,
+`model.norm.weight` and `lm_head.weight`. Ai2 has not published the release
+format; the loader will follow it once it is.
 """
 
 from __future__ import annotations
@@ -109,14 +132,22 @@ from .config import Olmo35Config
 
 
 def _config(vllm_config: VllmConfig) -> Olmo35Config:
-    return cast(Olmo35Config, vllm_config.model_config.hf_text_config)
+    config = vllm_config.model_config.hf_text_config
+    if not isinstance(config, Olmo35Config):
+        raise TypeError(
+            f"OLMo 3.5 needs the TPU Olmo35Config; got {type(config).__qualname__}. "
+            "Another class may own model_type 'olmo35' (see the warning from "
+            "register_olmo35_config)."
+        )
+    return config
 
 
 def _kda_local_dims(config: Olmo35Config, tp_size: int) -> tuple[int, int, int, int]:
     """Per-rank (heads, key head dim, value head dim, conv channels)."""
     if config.linear_num_heads % tp_size:
         raise ValueError(
-            f"OLMo 3.5 KDA heads ({config.linear_num_heads}) must divide TP ({tp_size})"
+            f"TP ({tp_size}) must divide the OLMo 3.5 KDA heads "
+            f"({config.linear_num_heads})"
         )
     heads = config.linear_num_heads // tp_size
     head_k = config.linear_key_head_dim
@@ -402,11 +433,16 @@ class Olmo35Attention(nn.Module):
             self.k_norm,
             {"weight_loader": _head_sharded_loader(self.total_num_kv_heads)},
         )
-        self.ssmax_scale = nn.Parameter(torch.ones(self.num_heads, dtype=torch.float32))
-        set_weight_attrs(
-            self.ssmax_scale,
-            {"weight_loader": _head_sharded_loader(self.total_num_heads)},
-        )
+        # Per-head scalable-softmax gain; only checkpoints that use scalable
+        # softmax carry it.
+        if self.use_scalable_softmax:
+            self.ssmax_scale = nn.Parameter(
+                torch.ones(self.num_heads, dtype=torch.float32)
+            )
+            set_weight_attrs(
+                self.ssmax_scale,
+                {"weight_loader": _head_sharded_loader(self.total_num_heads)},
+            )
         self.attn = Attention(
             self.num_heads,
             self.head_dim,

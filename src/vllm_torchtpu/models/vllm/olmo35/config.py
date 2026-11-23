@@ -20,7 +20,17 @@ MaxText `decoder_block: olmoe3` configs; the defaults are OLMo 3.5 Small
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from transformers import PretrainedConfig
+from vllm.model_executor.models.config import VerifyAndUpdateConfig
+
+from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+
+logger = init_logger(__name__)
 
 
 class Olmo35Config(PretrainedConfig):
@@ -107,6 +117,12 @@ class Olmo35Config(PretrainedConfig):
             ]
         if len(layer_types) != num_hidden_layers:
             raise ValueError("layer_types needs one entry per layer")
+        unknown = sorted(set(layer_types) - {"full_attention", "linear_attention"})
+        if unknown:
+            raise ValueError(
+                f"Unknown layer_types {unknown}; expected 'full_attention' or "
+                "'linear_attention'"
+            )
         self.layer_types = layer_types
         if tie_word_embeddings:
             # The model has its own lm_head and the loader has no tied path.
@@ -115,8 +131,14 @@ class Olmo35Config(PretrainedConfig):
         self.tie_word_embeddings = tie_word_embeddings
 
 
-def register_olmo35_config() -> None:
-    """Make `AutoConfig` (and so vLLM) resolve `model_type: olmo35`."""
+def register_olmo35_config() -> bool:
+    """Make `AutoConfig` (and so vLLM) resolve `model_type: olmo35`.
+
+    Runs for every model at plugin load, so a clash (e.g. a transformers
+    release that ships its own `olmo35` config) logs and skips instead of
+    failing every model. The OLMo 3.5 model itself then refuses a config that
+    is not `Olmo35Config` (`model._config`). Returns whether ours is in place.
+    """
     from transformers import AutoConfig
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
@@ -124,11 +146,67 @@ def register_olmo35_config() -> None:
         registered = CONFIG_MAPPING[Olmo35Config.model_type]
     except KeyError:
         AutoConfig.register(Olmo35Config.model_type, Olmo35Config)
-        return
-    # `register_models()` can run more than once per process. A repeat call is
-    # a no-op only when the name already maps to this class.
-    if registered is not Olmo35Config:
-        raise ValueError(
-            f"model_type {Olmo35Config.model_type!r} is already registered to "
-            f"{registered.__module__}.{registered.__qualname__}"
+        return True
+    if registered is Olmo35Config:
+        # `register_models()` can run more than once per process.
+        return True
+    logger.warning(
+        "model_type %r is already registered to %s.%s; not registering the "
+        "TPU Olmo35Config.",
+        Olmo35Config.model_type,
+        registered.__module__,
+        registered.__qualname__,
+    )
+    return False
+
+
+class TPUOlmo35Config(VerifyAndUpdateConfig):
+    """Reject or turn off what the TPU OLMo 3.5 model does not support yet."""
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: VllmConfig) -> None:
+        from vllm_torchtpu.gdn_pool_layout import (
+            unified_kv_layout_enabled_for_architecture,
         )
+
+        # The KDA state lives in per-layer slot arrays, not the unified pool,
+        # so it cannot be prefix-cached. The platform would otherwise demand
+        # the unified pool for a hybrid model with prefix caching on.
+        cache_config = vllm_config.cache_config
+        if cache_config.enable_prefix_caching:
+            logger.warning(
+                "OLMo 3.5 on TPU does not support prefix caching; turning it "
+                "off. Pass --no-enable-prefix-caching to silence this."
+            )
+            cache_config.enable_prefix_caching = False
+        if unified_kv_layout_enabled_for_architecture(
+            vllm_config.model_config.architecture
+        ):
+            raise NotImplementedError(
+                "OLMo 3.5 on TPU has no unified-pool KDA path; set "
+                "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0."
+            )
+        if vllm_config.speculative_config is not None:
+            raise NotImplementedError(
+                "OLMo 3.5 on TPU has no speculative decoding; remove "
+                "--speculative-config."
+            )
+        kv_transfer = vllm_config.kv_transfer_config
+        if kv_transfer is not None and kv_transfer.kv_connector != (
+            "DecodeBenchConnector"
+        ):
+            raise NotImplementedError(
+                "OLMo 3.5 on TPU supports no KV connector except "
+                f"DecodeBenchConnector (got {kv_transfer.kv_connector}); remove "
+                "--kv-transfer-config."
+            )
+        parallel = vllm_config.parallel_config
+        if (
+            parallel.prefill_context_parallel_size > 1
+            or parallel.decode_context_parallel_size > 1
+        ):
+            raise NotImplementedError(
+                "OLMo 3.5 on TPU has no context parallelism; set "
+                "--prefill-context-parallel-size 1 and "
+                "--decode-context-parallel-size 1."
+            )
