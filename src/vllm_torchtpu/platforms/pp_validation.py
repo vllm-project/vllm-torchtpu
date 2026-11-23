@@ -22,11 +22,17 @@ from vllm_torchtpu.distributed.pipeline_stage import stage_size
 
 def _torch_tpu_builds_stage_meshes() -> bool:
     """Whether the installed torch_tpu compiles a process group's collectives
-    and Pallas meshes for the group's own devices; its releases compile them
-    over the world and accept world-size meshes only."""
-    from torch_tpu._internal.pallas import pallas
+    and Pallas meshes for the group's own devices (0.3.0 and later); earlier
+    releases compile collectives over the world."""
+    from importlib import metadata as importlib_metadata
 
-    return not hasattr(pallas, "_validate_pallas_mesh_world_size")
+    from packaging.version import Version
+
+    try:
+        installed = importlib_metadata.version("torch-tpu")
+    except importlib_metadata.PackageNotFoundError:
+        return False
+    return Version(installed).release >= (0, 3)
 
 
 def _stage_devices(parallel_config: Any) -> int:
@@ -46,7 +52,6 @@ def _stage_mixes_groups(parallel_config: Any) -> bool:
     sizes = (
         parallel_config.tensor_parallel_size,
         parallel_config.prefill_context_parallel_size,
-        parallel_config.decode_context_parallel_size or 1,
     )
     return any(1 < size < _stage_devices(parallel_config) for size in sizes)
 
@@ -137,17 +142,16 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
 
     unsupported = None
     remedy = ""
-    if _stage_devices(parallel_config) > 1 and not _torch_tpu_builds_stage_meshes():
+    if (parallel_config.decode_context_parallel_size or 1) > 1:
+        unsupported = "decode context parallelism"
+        remedy = " Pass --decode-context-parallel-size 1."
+    elif _stage_devices(parallel_config) > 1 and not _torch_tpu_builds_stage_meshes():
         # A stage of several devices runs its collectives and builds its
         # meshes over process groups smaller than the world, and launches
         # them while the other stages launch theirs.
-        # TODO(yinlin): drop this guard once the pinned torch_tpu compiles a
-        # process group's programs for the group's own devices.
+        # TODO(yinlin): drop this guard once the pinned torch_tpu is 0.3.0+.
         unsupported = "pipeline stages of several devices with this torch_tpu"
-        remedy = (
-            " They need a torch_tpu that compiles a process group's programs"
-            " for the group's own devices."
-        )
+        remedy = " Upgrade to torch_tpu 0.3.0 or later."
     elif _stage_mixes_groups(parallel_config):
         # torch_tpu compiles a program that combines groups of different
         # devices over the world, so a stage could launch it only together
@@ -159,8 +163,8 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
             "with this torch_tpu"
         )
         remedy = (
-            " Inside a stage, use one of tensor, prefill context and decode"
-            " context parallelism, or give them the same size."
+            " Inside a stage, use only one of tensor, prefill context, or"
+            " data-parallel expert parallelism."
         )
     elif vllm_config.scheduler_config.async_scheduling:
         # Stages before the last never see the sampled tokens the async

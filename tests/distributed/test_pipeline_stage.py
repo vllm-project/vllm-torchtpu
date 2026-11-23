@@ -34,15 +34,25 @@ def _distributed(monkeypatch, world_size, rank):
     monkeypatch.setattr(dist, "get_rank", lambda *a, **k: rank)
 
 
-def _pipeline(monkeypatch, stage_of_rank, rank):
+def _pipeline(monkeypatch, stage_of_rank, rank, group_ranks=None):
     """A world whose rank r runs stage `stage_of_rank[r]`, seen from `rank`.
     Returns the rank lists the stage groups are formed from."""
     stages = max(stage_of_rank) + 1
     _distributed(monkeypatch, len(stage_of_rank), rank)
+    if group_ranks is None:
+        by_stage = [
+            [r for r, s in enumerate(stage_of_rank) if s == stage]
+            for stage in range(stages)
+        ]
+        group_ranks = [list(column) for column in zip(*by_stage)]
     monkeypatch.setattr(
         parallel_state,
         "get_pp_group",
-        lambda: SimpleNamespace(world_size=stages, rank_in_group=stage_of_rank[rank]),
+        lambda: SimpleNamespace(
+            world_size=stages,
+            rank_in_group=stage_of_rank[rank],
+            group_ranks=group_ranks,
+        ),
     )
     world = SimpleNamespace(
         world_size=len(stage_of_rank),
@@ -53,12 +63,10 @@ def _pipeline(monkeypatch, stage_of_rank, rank):
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: world)
     monkeypatch.setattr(dist, "get_backend", lambda group: "tpu_dist")
 
-    def all_gather_object(seen, mine, group):
-        assert group is world.cpu_group
-        assert mine == (rank, stage_of_rank[rank])
-        seen[:] = list(enumerate(stage_of_rank))
+    def unexpected_all_gather(*_args, **_kwargs):
+        raise AssertionError("init_pipeline_stage must not run all_gather_object")
 
-    monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(dist, "all_gather_object", unexpected_all_gather)
     formed = []
 
     def init_model_parallel_group(group_ranks, local_rank, backend, group_name):
@@ -133,8 +141,8 @@ def test_a_stage_holds_the_workers_of_its_layers(
 
 
 def test_stages_of_different_sizes_are_refused(monkeypatch):
-    _pipeline(monkeypatch, [0, 0, 0, 1], rank=0)
-    with pytest.raises(RuntimeError, match="different numbers of workers"):
+    _pipeline(monkeypatch, [0, 0, 0, 1], rank=0, group_ranks=[[0, 3], [1], [2]])
+    with pytest.raises(RuntimeError, match="different numbers of stages"):
         pipeline_stage.init_pipeline_stage()
 
 

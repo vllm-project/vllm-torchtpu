@@ -18,11 +18,12 @@ does. Every other axis shards the work of the layers a worker holds, so it
 lives inside a stage, and a stage is to those axes what the whole world is
 without a pipeline: the ranks their meshes cover and their collectives span.
 
-The two sides meet here and nowhere else. Code of an axis inside a stage asks
-for the stage where it would have asked for the world, and never whether a
-pipeline is on. Pipeline code sees a stage as its `size` workers, each at a
-`position`, and never which axes put them there; the worker at one position
-of every stage forms a pipeline group, the hand-off's column.
+The two sides meet here. Code of an axis inside a stage asks for the stage
+where it would have asked for the world, and never whether a pipeline is on
+(custom kernels tuned to a fixed whole-host topology still check the world and
+fall back to c10d inside a pipeline). Pipeline code sees a stage as its `size`
+workers, each at a `position`, and never which axes put them there; the worker
+at one position of every stage forms a pipeline group, the hand-off's column.
 
 Without a pipeline the one stage is the world.
 """
@@ -71,17 +72,15 @@ def stage_size(parallel_config: Any) -> int:
     return parallel_config.world_size // parallel_config.pipeline_parallel_size
 
 
-def _stage_ranks(seen: list[tuple[int, int]], stages: int) -> list[list[int]]:
-    """The ranks of each stage, from every worker's (rank, stage)."""
-    ranks: list[list[int]] = [[] for _ in range(stages)]
-    for rank, stage in seen:
-        ranks[stage].append(rank)
-    sizes = {len(members) for members in ranks}
-    if len(sizes) != 1:
+def _stage_ranks(group_ranks: list[list[int]], stages: int) -> list[list[int]]:
+    """The ranks of each stage, from the pipeline group's columns."""
+    if not group_ranks or any(len(column) != stages for column in group_ranks):
         raise RuntimeError(
-            f"Pipeline stages hold different numbers of workers: {ranks}."
+            f"Pipeline columns hold different numbers of stages: {group_ranks}."
         )
-    return [sorted(members) for members in ranks]
+    return [
+        sorted(int(column[stage]) for column in group_ranks) for stage in range(stages)
+    ]
 
 
 def init_pipeline_stage() -> None:
@@ -104,12 +103,8 @@ def init_pipeline_stage() -> None:
     if stages == 1:
         return
     world = get_world_group()
-    seen: list[Any] = [None] * int(world.world_size)
-    dist.all_gather_object(
-        seen, (int(dist.get_rank()), int(pipeline.rank_in_group)), group=world.cpu_group
-    )
     group = init_model_parallel_group(
-        _stage_ranks(seen, stages),
+        _stage_ranks(pipeline.group_ranks, stages),
         world.local_rank,
         dist.get_backend(world.device_group),
         group_name=STAGE_GROUP_NAME,

@@ -486,10 +486,6 @@ def _produce(monkeypatch, topo: Topology, num_tokens: int, per_layer_tags: bool)
                         return_value=SimpleNamespace(rank_in_group=stage),
                     ),
                     patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=p),
-                    patch(
-                        "vllm_torchtpu.distributed.pipeline_stage._STAGE",
-                        SimpleNamespace(position=position),
-                    ),
                 ):
                     rank = worker._local_raiden_transfer_rank()
                     assert rank == stage * topo.pcp * topo.ptp + position

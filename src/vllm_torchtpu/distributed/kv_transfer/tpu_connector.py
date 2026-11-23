@@ -105,7 +105,7 @@ from vllm_torchtpu.distributed.kv_transfer.zmq_shm_base import (
     _CoordRecvEntry,
     _CoordSendEntry,
 )
-from vllm_torchtpu.distributed.pipeline_stage import get_pipeline_stage, stage_size
+from vllm_torchtpu.distributed.pipeline_stage import stage_size
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
@@ -3203,12 +3203,14 @@ class TPURaidenConnectorWorker:
             raise ValueError(
                 f"{supported}; got prefill_context_parallel_size={pcp_size}"
             )
+        pp_size = _pipeline_parallel_size(self.vllm_config)
         if self.is_producer:
-            if dp_size != 1:
+            if dp_size != 1 or (pp_size > 1 and tp_size != 1):
                 raise ValueError(
                     f"{supported}; got producer "
                     f"tensor_parallel_size={tp_size}, "
-                    f"data_parallel_size={dp_size}"
+                    f"data_parallel_size={dp_size}, "
+                    f"pipeline_parallel_size={pp_size}"
                 )
             if int(parallel_config.decode_context_parallel_size) > 1:
                 return self._glm_dcp_producer_topology(supported)
@@ -3216,7 +3218,7 @@ class TPURaidenConnectorWorker:
                 self._validate_glm_dcp_destination(supported)
             return f"tp{tp_size}_prefill"
         dcp_size = int(parallel_config.decode_context_parallel_size or 1)
-        if tp_size > 1 and dcp_size == tp_size and dp_size == 1:
+        if pp_size == 1 and tp_size > 1 and dcp_size == tp_size and dp_size == 1:
             # Every TP worker holds one DCP shard of the token positions, so
             # it must be the DCP rank its producer spans are routed to.
             from vllm_torchtpu.distributed.dcp import get_dcp_rank
@@ -3227,12 +3229,13 @@ class TPURaidenConnectorWorker:
                     f"dcp_rank={get_dcp_rank()}, tp_rank={self.tp_rank}"
                 )
             return f"tp{tp_size}dcp{dcp_size}_decode"
-        if tp_size != 1:
+        if tp_size != 1 or pp_size != 1:
             raise ValueError(
                 f"{supported}; got consumer "
                 f"tensor_parallel_size={tp_size}, "
                 f"decode_context_parallel_size={dcp_size}, "
-                f"data_parallel_size={dp_size}"
+                f"data_parallel_size={dp_size}, "
+                f"pipeline_parallel_size={pp_size}"
             )
         return f"dp{dp_size}_decode"
 
@@ -3665,13 +3668,16 @@ class TPURaidenConnectorWorker:
         if _engine_is_pipeline(self.vllm_config):
             from vllm.distributed.parallel_state import get_pp_group
 
+            from vllm_torchtpu.distributed.pcp import get_pcp_rank
+
             stage = int(get_pp_group().rank_in_group)
             workers = stage_size(self.vllm_config.parallel_config)
             if not self.is_producer or workers == 1:
                 return stage
-            # A pipeline producer is one unit per worker, stage-major: inside
-            # a stage, the index its kernels own tokens and GDN heads by.
-            return stage * workers + get_pipeline_stage().position
+            # A pipeline producer is one unit per engine worker, stage-major:
+            # inside a stage, the index its kernels own tokens and GDN heads by.
+            position = int(get_pcp_rank()) * int(self.tp_size) + int(self.tp_rank)
+            return stage * workers + position
         if not self.is_producer:
             return int(self.tp_rank)
         if _uses_tp_stage3_source(self.vllm_config):
@@ -4042,15 +4048,23 @@ class TPURaidenConnectorWorker:
             )
         if tp_size == 1 and pcp_size == 1 and dp_size == 1 and pp_size in (2, 4, 8):
             return f"pp{pp_size}_decode"
-        if pcp_size != 1 or tp_size not in (1, 2, 4) or dp_size not in (2, 4, 8, 16):
+        if (
+            pp_size != 1
+            or pcp_size != 1
+            or tp_size not in (1, 2, 4)
+            or dp_size not in (2, 4, 8, 16)
+        ):
             raise ValueError(
-                "Raiden Qwen3.5 admission topology dp{N}_decode or "
-                "dp{N}tp{2,4}_decode requires kv_consumer with "
-                "prefill_context_parallel_size=1, tensor_parallel_size in "
-                "(1, 2, 4), data_parallel_size in (2, 4, 8, 16); got "
+                "Raiden Qwen3.5 admission topology pp{2,4,8}_decode, "
+                "dp{N}_decode, or dp{N}tp{2,4}_decode requires "
+                "kv_consumer with prefill_context_parallel_size=1 and either "
+                "pipeline_parallel_size=1, tensor_parallel_size in (1, 2, 4), "
+                "data_parallel_size in (2, 4, 8, 16); or "
+                "pipeline_parallel_size in (2, 4, 8) alone; got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
-                f"data_parallel_size={dp_size}"
+                f"data_parallel_size={dp_size}, "
+                f"pipeline_parallel_size={pp_size}"
             )
         if tp_size > 1:
             # Head-sharded decode engine: every TP worker is its own

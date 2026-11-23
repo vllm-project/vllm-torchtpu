@@ -400,10 +400,7 @@ def _pp_pcp_coordinates(stage, pcp_rank):
             "vllm.distributed.parallel_state.get_pp_group",
             return_value=SimpleNamespace(rank_in_group=stage),
         ),
-        patch(
-            "vllm_torchtpu.distributed.pipeline_stage._STAGE",
-            SimpleNamespace(position=pcp_rank),
-        ),
+        patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=pcp_rank),
     )
 
 
@@ -440,8 +437,9 @@ def test_pp_tp_producer_topology_and_unit_identity(monkeypatch, pp, tp):
     ranks, ports = [], set()
     for stage in range(pp):
         for t in range(tp):
-            pp_group, tp_rank = _pp_pcp_coordinates(stage, t)
-            with pp_group, tp_rank:
+            worker.tp_rank = t
+            pp_group, pcp_rank = _pp_pcp_coordinates(stage, 0)
+            with pp_group, pcp_rank:
                 rank = worker._local_raiden_transfer_rank()
                 endpoint, node = worker._raiden_endpoint_identity()
             assert endpoint == node == rank
@@ -463,6 +461,13 @@ def test_pp_pcp_decode_stage_keeps_the_stage_rank(monkeypatch):
     pp_group, pcp_rank = _pp_pcp_coordinates(3, 5)
     with pp_group, pcp_rank:
         assert worker._local_raiden_transfer_rank() == 3
+
+
+def test_pp_tp_decode_consumer_is_rejected(monkeypatch):
+    worker = _pp_pcp_worker(monkeypatch, pp=2, pcp=1, tp=2, producer=False)
+    worker.vllm_config.parallel_config.data_parallel_size = 2
+    with pytest.raises(ValueError, match="pipeline_parallel_size=2"):
+        worker._raiden_qwen35_admission_topology()
 
 
 @pytest.mark.parametrize(

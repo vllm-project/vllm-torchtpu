@@ -7086,18 +7086,22 @@ def test_glm_admission_topology_accepts_supported_shapes(
 
 
 @pytest.mark.parametrize(
-    ("is_producer", "tp_size", "dp_size", "pcp_size", "message"),
+    ("is_producer", "tp_size", "dp_size", "pcp_size", "pp_size", "dcp_size", "message"),
     [
         # A TP>1 decode engine would need one plan per destination worker
-        (False, 4, 2, 1, "consumer tensor_parallel_size=4"),
+        (False, 4, 2, 1, 1, 1, "consumer tensor_parallel_size=4"),
         # A DP>1 prefill engine has no single source unit set.
-        (True, 8, 2, 1, "producer tensor_parallel_size=8"),
+        (True, 8, 2, 1, 1, 1, "producer tensor_parallel_size=8"),
         # PCP is not supported on either role.
-        (False, 1, 8, 2, "prefill_context_parallel_size=2"),
+        (False, 1, 8, 2, 1, 1, "prefill_context_parallel_size=2"),
+        # GLM pipeline prefill supports TP=1 only.
+        (True, 2, 1, 1, 4, 1, "pipeline_parallel_size=4"),
+        # GLM pipeline decode with TP/DCP > 1 is not supported.
+        (False, 2, 1, 1, 4, 2, "pipeline_parallel_size=4"),
     ],
 )
 def test_glm_admission_topology_rejects_unsupported_shapes(
-    is_producer, tp_size, dp_size, pcp_size, message
+    is_producer, tp_size, dp_size, pcp_size, pp_size, dcp_size, message
 ):
     worker = _make_raiden_worker(
         tp_rank=0,
@@ -7105,7 +7109,9 @@ def test_glm_admission_topology_rejects_unsupported_shapes(
         is_producer=is_producer,
         dp_size=dp_size,
         pcp_size=pcp_size,
+        pp_size=pp_size,
     )
+    worker.vllm_config.parallel_config.decode_context_parallel_size = dcp_size
 
     with pytest.raises(ValueError, match=message):
         worker._raiden_glm_admission_topology()
