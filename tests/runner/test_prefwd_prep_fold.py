@@ -791,3 +791,133 @@ def test_prep_fold_scatter_shapes_cover_steady_keys():
                 assert (rows, tokens) in shapes, (max_reqs, n, rows)
         assert {(1, 4), (2, 8), (3, 16), (16, 64)} <= shapes
     assert (30, 128) in _prep_fold_scatter_shapes(32, 4, paddings)
+
+
+# The za10y B arm's served flags around the fold (c16/c32): metadata reuse, the
+# prebuilt forward contexts, the stacked spec tail, the in-graph verify scatter.
+# None of them feeds an operand of the folded program; the source and rejected
+# counts the fold reads come from the stacked spec tail.
+B_ARM_FLAGS = (
+    ("VLLM_TPU_ATTN_METADATA_REUSE", True),
+    ("VLLM_TPU_FORWARD_CTX_PREBUILT", True),
+    ("VLLM_TPU_SPEC_TAIL_COMPILED", True),
+    ("VLLM_TPU_SPEC_TAIL_STACK", True),
+    ("VLLM_TPU_VERIFY_RO_INGRAPH", True),
+    ("VLLM_TPU_MK_WHOLE_DIRECT_EXEC", True),
+    ("VLLM_TPU_OUTPUT_PATH_LEAN", True),
+    ("VLLM_TPU_SUBST_FRESH_IDS", True),
+    ("VLLM_TPU_SUBTRACT_REJECTED_COMPILED", True),
+    # Served on too; off here only because its owned-alias wrapper compiles the
+    # unfolded reference's scatter, which needs a TPU.
+    ("VLLM_TPU_SUBST_STATIC_ARGS", False),
+)
+
+
+def _stacked_tail_pre(prev_index, seed, slots=8, step_dtype=torch.int64):
+    """The previous step's async results as the stacked spec tail
+    (`_spec_tail_stack`, VLLM_TPU_SPEC_TAIL_STACK) leaves them for a one-chunk
+    steady step of `len(prev_index)` requests: the `[bonus, drafts]` source
+    padded to the bound and the per-request rejected counts."""
+    from vllm_torchtpu.runner.tpu_runner import _spec_tail_stack
+    from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+
+    g = torch.Generator().manual_seed(1000 + seed)
+    n = len(prev_index)
+    accepted = torch.randint(0, K + 1, (n,), generator=g)
+    next_tokens = torch.randint(100, 900, (n, K + 1), generator=g, dtype=torch.int32)
+    cols = torch.arange(K + 1).expand(n, K + 1)
+    next_tokens[cols > accepted[:, None]] = INVALID_TOKEN_ID
+    steps = [
+        torch.randint(100, 900, (slots,), generator=g, dtype=step_dtype)
+        for _ in range(K)
+    ]
+    draft_lengths = torch.full((n,), K, dtype=torch.int32)
+    src, num_rejected = _spec_tail_stack(
+        next_tokens, draft_lengths, n, n, slots * WIDTH, n, *steps
+    )
+    return NS(
+        next_tokens_tpu=src,
+        spec_decode_num_rejected_tokens=num_rejected,
+        req_id_to_index_copy=dict(prev_index),
+    )
+
+
+@pytest.mark.parametrize("step_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("pooled", [False, True])
+def test_b_arm_flags_steady_steps_fold_after_warmup(monkeypatch, pooled, step_dtype):
+    """With the B arm's flags and the stacked spec tail's source / rejected
+    counts, every steady verify step after warmup folds (its key is a warmed
+    one: no aliasing or shape the warmup lacks) and the folded forward inputs
+    are bitwise the unfolded ones."""
+    if not hasattr(tpu_runner, "_spec_tail_stack"):
+        pytest.skip("no VLLM_TPU_SPEC_TAIL_STACK on this branch")
+    _fold_envs(monkeypatch, window="1")
+    for name, value in B_ARM_FLAGS:
+        monkeypatch.setattr(envs, name, value, raising=False)
+    r_ref, a_ref = _make_runner(pooled)
+    r_fold, a_fold = _make_runner(pooled)
+    TPUModelRunner._precompile_prep_fold(r_fold)
+    misses = []
+    monkeypatch.setattr(
+        tpu_runner.logger,
+        "info",
+        lambda msg, *a, **k: misses.append(a) if "not warmed" in msg else None,
+    )
+    steps = [
+        (["a", "b", "c", "d"], {"a": 0, "b": 1, "c": 2, "d": 3}),
+        (["a", "b", "c", "d"], {"a": 0, "b": 1, "c": 2, "d": 3}),
+        (["b", "a", "d", "c"], {"b": 0, "a": 1, "d": 2, "c": 3}),
+        (["c", "b"], {"c": 0, "b": 1}),
+        # Scatter: rows moved, a partial bucket, a request with host tokens.
+        (["b", "a", "d", "c"], {"a": 0, "b": 1, "c": 2, "d": 3}),
+        (["a", "b", "c"], {"c": 0, "a": 1, "b": 2}),
+        (["a", "b", "c", "x"], {"a": 0, "b": 1, "c": 2}),
+    ]
+    for step, (req_ids, prev_index) in enumerate(steps):
+        outs = []
+        for runner, adapter, fold in ((r_ref, a_ref, 0), (r_fold, a_fold, 1)):
+            monkeypatch.setattr(envs, "VLLM_TPU_PREFWD_PREP_FOLD", fold)
+            tokens = next(b for b in (4, 8, 16, 32, 64) if b >= len(req_ids) * WIDTH)
+            s = _step_inputs(runner, req_ids, prev_index, seed=step, bucket=tokens)
+            s["pre"] = _stacked_tail_pre(prev_index, step, step_dtype=step_dtype)
+            adapter.begin_step()
+            run = _run_folded if fold else _run_unfolded
+            outs.append(run(runner, adapter, s))  # _run_folded asserts it folded
+        ref, got = outs
+        for i in range(4):
+            assert ref[i].dtype == got[i].dtype, (step, i)
+            assert torch.equal(ref[i], got[i]), (step, i)
+        assert ref[4].keys() == got[4].keys()
+        for key in ref[4]:
+            assert torch.equal(ref[4][key], got[4][key]), (step, key)
+    assert not misses
+
+
+def test_prep_fold_recorded_self_check(monkeypatch):
+    """The rank-0 self-check line counts folded / unfolded correction steps and
+    is logged at PREP_FOLD_LOG_FIRST steps and every PREP_FOLD_LOG_EVERY."""
+    monkeypatch.setattr(tpu_runner, "PREP_FOLD_LOG_FIRST", 4)
+    monkeypatch.setattr(tpu_runner, "PREP_FOLD_LOG_EVERY", 8)
+    lines = []
+    monkeypatch.setattr(
+        tpu_runner.logger, "info", lambda msg, *a, **k: lines.append(msg)
+    )
+    runner = NS()
+    for outcome in ["folded"] * 3 + ["unwarmed"] + ["folded"] * 7 + ["precheck"]:
+        TPUModelRunner._note_prep_fold(runner, outcome)
+    assert lines == [
+        "PREFWD_PREP_FOLD recorded: folded 3/4 steps (75.0%), unfolded: "
+        "precheck 0, unwarmed 1",
+        "PREFWD_PREP_FOLD recorded: folded 7/8 steps (87.5%), unfolded: "
+        "precheck 0, unwarmed 1",
+    ]
+    assert tpu_runner.prep_fold_recorded_line(runner._prep_fold_counts) == (
+        "PREFWD_PREP_FOLD recorded: folded 10/12 steps (83.3%), unfolded: "
+        "precheck 1, unwarmed 1"
+    )
+    # Other TP ranks count but do not log.
+    monkeypatch.setattr(tpu_runner, "_prep_fold_rank0", lambda: False)
+    lines.clear()
+    for _ in range(12):
+        TPUModelRunner._note_prep_fold(runner, "folded")
+    assert lines == [] and runner._prep_fold_counts["folded"] == 22
