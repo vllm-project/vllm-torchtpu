@@ -232,7 +232,7 @@ def pipelined_fused_moe_gmm(
         w2_bias: Optional second projection bias tensor.
         topk_weights: Routing top-k weights [S, topk].
         topk_ids: Routing top-k expert IDs [S, topk].
-        experts_start: Optional 0-d tensor of starting expert ID for this shard.
+        experts_start: Optional [topk] tensor of starting expert ID for this shard.
         topk: Number of experts selected per token.
         activation: Gated activation function string (e.g., "silu" for SwiGLU).
         rhs_quant_dtype: Optional RHS quantization data type.

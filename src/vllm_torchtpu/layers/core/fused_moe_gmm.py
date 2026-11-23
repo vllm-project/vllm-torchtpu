@@ -730,7 +730,8 @@ def fused_moe_func(
     """Run MoE with precomputed expert ids and weights.
 
     For linear EP placement, ``experts_start`` is the first global expert id
-    owned by this shard, passed as a 0-d int32 array (real traced data, not a
+    owned by this shard, passed as an int32 array of shape ``[topk]`` (every
+    entry the same; a 0-d array also works) -- real traced data, not a
     Python int/compile-time constant -- every EP rank owns a different value,
     and binding it as a constant would make each rank JIT-compile a
     structurally different program under the same custom-op name, which

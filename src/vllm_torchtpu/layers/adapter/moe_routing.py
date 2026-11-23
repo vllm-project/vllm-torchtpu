@@ -377,8 +377,13 @@ def get_experts_start(layer) -> int | None:
 
 
 def register_experts_start_buffer(layer, *, device: torch.device) -> None:
-    """Register ``layer._experts_start`` as a persistent 0-d int32 buffer
-    (``None`` for non-EP layers).
+    """Register ``layer._experts_start`` as a persistent int32 buffer of shape
+    ``[topk]``, every entry the start (``None`` for non-EP layers).
+
+    A vector, not a 0-d tensor: XLA copies a 0-d operand into scalar memory
+    synchronously before broadcasting it (~0.66 us per MoE layer at decode,
+    MiniMax-M3.1 twin, j-5e7f2de1), while a vector broadcast along the top-k
+    axis stays a vector op.
 
     Call once per layer -- e.g. from ``process_weights_after_loading`` --
     before the first forward call. Registering this as a buffer, rather than
@@ -397,7 +402,12 @@ def register_experts_start_buffer(layer, *, device: torch.device) -> None:
     """
     experts_start = get_experts_start(layer)
     buffer = (
-        torch.tensor(experts_start, dtype=torch.int32, device=device)
+        torch.full(
+            (layer.moe_config.experts_per_token,),
+            experts_start,
+            dtype=torch.int32,
+            device=device,
+        )
         if experts_start is not None
         else None
     )

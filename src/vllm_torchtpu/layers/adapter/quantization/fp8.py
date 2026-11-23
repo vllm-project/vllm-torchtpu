@@ -1191,7 +1191,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             )
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
-        # elementwise subtract from `experts_start` (scalar).
+        # elementwise subtract from `experts_start` (a [topk] vector).
         kwargs = {
             "hidden_states": x,
             "w1": layer.w13_weight,

@@ -258,8 +258,8 @@ def fused_moe_gmm(
 
     ``experts_start`` is the first global expert id owned by this shard under
     linear EP placement (or ``None`` for non-EP) -- see
-    ``moe_routing.get_experts_start_buffer``. It must be a 0-d int32 tensor
-    (a persistent buffer registered once per layer), not a Python int: every
+    ``moe_routing.register_experts_start_buffer``. It must be an int32 tensor
+    (a persistent ``[topk]`` buffer registered once per layer), not a Python int: every
     EP rank owns a different value, and passing it as real tensor data (vs.
     binding it as a Python int into the compiled closure) keeps the compiled
     program identical across ranks. The kernel remaps global ids to local ids
