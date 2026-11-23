@@ -281,7 +281,7 @@ def test_range_prefetch_reads_only_local_ranges(tmp_path, monkeypatch):
     monkeypatch.setattr(model_loader_patches, "_prefetches", [])
     monkeypatch.setattr(model_loader_patches.os, "pread", tracking_pread)
 
-    _start_ep_range_prefetch([shard], {0}, num_threads=2, block_size=16)
+    _start_ep_range_prefetch([shard], {0}, None, num_threads=2, block_size=16)
     for thread in started:
         thread.join(timeout=30)
 
@@ -322,7 +322,7 @@ def test_prefetch_strategy_under_filter_switches_to_lazy(tmp_path, monkeypatch):
     monkeypatch.setattr(
         model_loader_patches,
         "_start_ep_range_prefetch",
-        lambda files, ids, threads, block: prefetches.append((files, ids)),
+        lambda files, ids, is_unused, threads, block: prefetches.append((files, ids)),
     )
     patch_default_loader_ep_weight_filter()
     iterator = weight_utils.safetensors_weights_iterator
