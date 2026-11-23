@@ -1107,6 +1107,37 @@ def test_prepare_routed_onehot_permute_matches_plain_gather():
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
+@pytest.mark.parametrize("skip_padded_tokens", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 8, 64])
+def test_computed_rows_match_group_sizes_prefix(num_tokens, skip_padded_tokens):
+    """`computed_rows` from the routes equals ``arange < group_sizes.sum()``
+    for EP-masked (-1) and zero-weight (padded) routes."""
+    topk, local_experts = 4, 16
+    rng = np.random.default_rng(num_tokens + 100 * skip_padded_tokens)
+    hidden_states = jnp.zeros((num_tokens, 128), jnp.bfloat16)
+    for _ in range(25):
+        ids = rng.integers(-1, local_experts, size=(num_tokens, topk))
+        weights = rng.random((num_tokens, topk)).astype(np.float32)
+        weights[rng.random(weights.shape) < 0.3] = 0.0
+        _, group_sizes, revert, _, valid, _ = fused_moe_gmm.prepare_routed_gmm_inputs(
+            hidden_states,
+            jnp.asarray(ids, jnp.int32),
+            jnp.asarray(weights),
+            local_num_experts=local_experts,
+            topk=topk,
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=num_tokens * topk,
+            skip_padded_tokens=skip_padded_tokens,
+        )
+        rows = num_tokens * topk
+        got = fused_moe_gmm.computed_rows(
+            revert.reshape(num_tokens, topk), valid.reshape(num_tokens, topk), rows
+        )
+        want = np.arange(rows) < int(np.asarray(group_sizes).sum())
+        np.testing.assert_array_equal(np.asarray(got), want)
+
+
 def test_moe_gmm_onehot_combine_matches_plain_reduce(monkeypatch):
     num_tokens, topk, hidden = 4, 2, 8
     rows = num_tokens * topk

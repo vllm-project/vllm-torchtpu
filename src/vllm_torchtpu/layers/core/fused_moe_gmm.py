@@ -503,6 +503,22 @@ def prepare_routed_gmm_inputs(
     )
 
 
+def computed_rows(
+    revert_indices: jax.Array, valid_mask: jax.Array, num_rows: int
+) -> jax.Array:
+    """The GMM rows ``[0, group_sizes.sum())`` the routes in `revert_indices`
+    fill, as a ``[num_rows]`` mask: the valid routes' sorted rows, since valid
+    keys sort before the sentinel. Built from the routes, it stays a vector
+    fusion, where comparing against ``group_sizes.sum()`` routes a scalar
+    through memory (~1.2 us per MoE layer at decode, MiniMax-M3.1 twin,
+    j-5e7f2de1)."""
+    rows = jnp.arange(num_rows, dtype=revert_indices.dtype)
+    return jnp.any(
+        (revert_indices[..., None] == rows) & valid_mask[..., None],
+        axis=tuple(range(revert_indices.ndim)),
+    )
+
+
 def moe_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -668,11 +684,9 @@ def moe_gmm(
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
-            computed = jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < group_sizes.sum(
-                dtype=jnp.int32
-            )
-            gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
+            computed = computed_rows(revert_indices, valid_mask, gmm2_res.shape[0])
+            gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             onehot = jax.nn.one_hot(
                 revert_indices, argsort_revert_indices.size, dtype=gmm2_res.dtype
             )
