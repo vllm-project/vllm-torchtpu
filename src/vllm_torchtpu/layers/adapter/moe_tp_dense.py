@@ -53,7 +53,7 @@ logger = init_logger(__name__)
 MAX_TOKENS: int = int(envs.TPU_MOE_TP_DENSE_FP4_MAX_TOKENS)
 ENABLED: bool = MAX_TOKENS > 0
 QB = 128
-ROW_ALIGN = 16
+ROW_ALIGN = 8
 
 _RAW = ("w13_weight", "w13_weight_scale", "w13_weight_scale_2",
         "w2_weight", "w2_weight_scale", "w2_weight_scale_2")
@@ -106,7 +106,7 @@ def _capture(st: dict, pname: str, param: torch.Tensor, lw: torch.Tensor,
     if not 0 <= eid < E:
         return
     i_s = I // ep
-    dev = param.device
+    dev = torch.device("cpu")
     if pname in ("w13_weight", "w13_weight_scale"):
         if shard_id not in ("w1", "w3"):
             return
@@ -137,6 +137,10 @@ def _capture(st: dict, pname: str, param: torch.Tensor, lw: torch.Tensor,
         buf = _raw_buffer(st, pname, (E,), torch.float32, dev)
         buf[eid].copy_(lw.reshape(-1)[0].to(torch.float32).to(dev))
         st["seen"][pname].add((eid, shard_id))
+    want = 2 * E if pname.startswith("w13") else E
+    if len(st["seen"][pname]) == want and pname in st["raw"] and st["raw"][pname].device.type == "cpu":
+        # One host-to-device copy per tensor once every expert's slice is in.
+        st["raw"][pname] = st["raw"][pname].to(param.device)
 
 
 def wrap_weight_loaders(layer: Any) -> None:
@@ -208,38 +212,60 @@ def finalize(layer: Any, ep_w13_scale: torch.Tensor) -> None:
     del s13
     w2, s2k = requant_load_kmajor_fp4(raw.pop("w2_weight"), s2, QB)
     del s2
-    for name, t in (("_tpd_w13", w13), ("_tpd_s13", s13k), ("_tpd_w2", w2), ("_tpd_s2", s2k)):
-        layer.register_buffer(name, t, persistent=False)
+    w, s = _pack_op()(w13, s13k, w2, s2k)
+    shapes = [list(w13.shape), list(s13k.shape), list(w2.shape), list(s2k.shape)]
+    del w13, s13k, w2, s2k
+    layer.register_buffer("_tpd_w", w, persistent=False)
+    layer.register_buffer("_tpd_s", s, persistent=False)
     st["raw"] = {}
     st["seen"] = None
-    nbytes = sum(int(t.numel()) * t.element_size() for t in (w13, s13k, w2, s2k))
+    nbytes = sum(int(t.numel()) * t.element_size() for t in (w, s))
     _STATS["layers"] += 1
     _STATS["bytes"] += nbytes
     if dev.type == "tpu":
-        get_op(topk=layer.moe_config.experts_per_token)
+        get_op(topk=layer.moe_config.experts_per_token, fs=i_s)
     if _STATS["layers"] == 1:
         logger.info(
             "[moe-tp-dense] TPU_MOE_TP_DENSE_FP4_MAX_TOKENS=%d on: E=%d ep=%d rank=%d "
-            "slice I/ep=%d w13=%s s13=%s w2=%s s2=%s bytes/layer=%d first_layer=%s",
-            MAX_TOKENS, E, ep, st["rank"], i_s, list(w13.shape), list(s13k.shape),
-            list(w2.shape), list(s2k.shape), nbytes, getattr(layer, "layer_name", "?"))
+            "slice I/ep=%d w13/s13/w2/s2=%s packed w=%s s=%s bytes/layer=%d row_align=%d first_layer=%s",
+            MAX_TOKENS, E, ep, st["rank"], i_s, shapes, list(w.shape), list(s.shape), nbytes,
+            ROW_ALIGN, getattr(layer, "layer_name", "?"))
+
+
+_PACK_OP = None
+
+
+def _pack_jax(w13: jax.Array, s13: jax.Array, w2: jax.Array, s2: jax.Array):
+    from vllm_torchtpu.kernels.experimental.moe_tp_dense_fp4 import pack
+
+    return pack(w13, s13.reshape(s13.shape[0], s13.shape[1], -1), w2,
+                s2.reshape(s2.shape[0], s2.shape[1], -1))
+
+
+def _pack_op():
+    global _PACK_OP
+    if _PACK_OP is None:
+        from torch_tpu._internal import pallas
+
+        _PACK_OP = pallas.jax_op("pallas::moe_tp_dense_pack", _pack_jax)
+    return _PACK_OP
 
 
 def active(layer: Any) -> bool:
-    return getattr(layer, "_tpd", None) is not None and hasattr(layer, "_tpd_w13")
+    return getattr(layer, "_tpd", None) is not None and hasattr(layer, "_tpd_w")
 
 
 # --------------------------------------------------------------------------- traced
 
 
-def tp_dense_routed(x, topk_weights, topk_ids, w13, s13, w2, s2):
+def tp_dense_routed(x, topk_weights, topk_ids, w, s, *, fs):
     """Routed experts of one rank's TP slice for all T tokens (jax). x [T, H];
-    topk_* [T, k] with LOGICAL ids; w13 [E, H, 2Is] fp4; s13 [E, H/128, 1, 2Is];
-    w2 [E, Is, H] fp4; s2 [E, Is/128, 1, H]. Returns this rank's partial [T, H]."""
-    from vllm_torchtpu.kernels.experimental.moe_tp_dense_fp4 import tp_dense_moe
+    topk_* [T, k] with LOGICAL ids; w, s the packed per-expert records
+    (moe_tp_dense_fp4.pack). Returns this rank's partial [T, H]."""
+    from vllm_torchtpu.kernels.experimental.moe_tp_dense_fp4 import tp_dense_moe_packed
 
     t, _ = x.shape
-    e = w13.shape[0]
+    e = w.shape[0]
     mp = -(-t // ROW_ALIGN) * ROW_ALIGN
     ids = topk_ids.astype(jnp.int32)
     tw = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0).astype(jnp.float32)
@@ -251,16 +277,14 @@ def tp_dense_routed(x, topk_weights, topk_ids, w13, s13, w2, s2):
     gw = jnp.pad(gw, ((0, mp - t), (0, 0))).T  # [E, Mp]
     gw = jnp.broadcast_to(gw[:, :, None], (e, mp, 128))
     xp = jnp.pad(x, ((0, mp - t), (0, 0)))
-    out = tp_dense_moe(xp, gw, w13, s13.reshape(s13.shape[0], s13.shape[1], -1), w2,
-                       s2.reshape(s2.shape[0], s2.shape[1], -1), hit, nhit)
+    out = tp_dense_moe_packed(xp, gw, w, s, hit, nhit, fs=fs)
     return out[:t]
 
 
 def _op_body(hidden_states: jax.Array, w1: jax.Array, w2: jax.Array, w1_scale: jax.Array,
              w2_scale: jax.Array, topk_weights: jax.Array, topk_ids: jax.Array,
-             experts_start: jax.Array, logical_ids: jax.Array, tw13: jax.Array,
-             ts13: jax.Array, tw2: jax.Array, ts2: jax.Array, *, topk: int,
-             activation: str) -> jax.Array:
+             experts_start: jax.Array, logical_ids: jax.Array, tw: jax.Array,
+             ts: jax.Array, *, topk: int, activation: str, fs: int) -> jax.Array:
     from vllm_torchtpu.layers.core.fused_moe_gmm import (
         fused_moe_func,
         resolve_onehot_permute_threshold,
@@ -268,7 +292,7 @@ def _op_body(hidden_states: jax.Array, w1: jax.Array, w2: jax.Array, w1_scale: j
 
     if 0 < hidden_states.shape[0] <= MAX_TOKENS and activation == "silu":
         logger.info_once("[moe-tp-dense] TP-dense fp4 decode MoE selected (T<=%d)", MAX_TOKENS)
-        return tp_dense_routed(hidden_states, topk_weights, logical_ids, tw13, ts13, tw2, ts2)
+        return tp_dense_routed(hidden_states, topk_weights, logical_ids, tw, ts, fs=fs)
     return fused_moe_func(
         hidden_states, w1, w2, w1_scale, w2_scale, None, None, topk_weights, topk_ids,
         experts_start, topk=topk, activation=activation, use_ep=True,
@@ -280,14 +304,14 @@ def _op_body(hidden_states: jax.Array, w1: jax.Array, w2: jax.Array, w1_scale: j
 _OPS: dict = {}
 
 
-def get_op(*, topk: int, activation: str = "silu"):
-    key = (topk, activation)
+def get_op(*, topk: int, fs: int, activation: str = "silu"):
+    key = (topk, activation, fs)
     op = _OPS.get(key)
     if op is not None:
         return op
     from torch_tpu._internal import pallas
 
-    fn = functools.partial(_op_body, topk=topk, activation=activation)
+    fn = functools.partial(_op_body, topk=topk, activation=activation, fs=fs)
     op = pallas.jax_op(f"pallas::fused_moe_tp_dense_{len(_OPS)}", fn)
 
     def _fake(hidden_states, *args, **kwargs):
@@ -300,8 +324,9 @@ def get_op(*, topk: int, activation: str = "silu"):
 
 def fused_moe(layer: Any, kwargs: dict, logical_ids: torch.Tensor) -> torch.Tensor:
     """Torch side: the EP fused-MoE call of nvfp4 apply, plus the TP copy."""
-    op = get_op(topk=kwargs["topk"], activation=kwargs["activation"])
+    op = get_op(topk=kwargs["topk"], fs=layer._tpd["I"] // layer._tpd["ep"],
+                activation=kwargs["activation"])
     return op(kwargs["hidden_states"], kwargs["w1"], kwargs["w2"], kwargs["w1_scale"],
               kwargs["w2_scale"], kwargs["topk_weights"], kwargs["topk_ids"],
-              kwargs["experts_start"], logical_ids.to(torch.int32), layer._tpd_w13,
-              layer._tpd_s13, layer._tpd_w2, layer._tpd_s2)
+              kwargs["experts_start"], logical_ids.to(torch.int32), layer._tpd_w,
+              layer._tpd_s)

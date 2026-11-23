@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """TP-sliced fp4 decode MoE, dense over tokens and sparse over hit experts (prototype, not wired)."""
-from vllm_torchtpu.kernels.experimental.moe_tp_dense_fp4.kernel import reference, tp_dense_moe
+from vllm_torchtpu.kernels.experimental.moe_tp_dense_fp4.kernel import (
+    pack,
+    reference,
+    tp_dense_moe,
+    tp_dense_moe_packed,
+)
 
-__all__ = ["reference", "tp_dense_moe"]
+__all__ = ["pack", "reference", "tp_dense_moe", "tp_dense_moe_packed"]

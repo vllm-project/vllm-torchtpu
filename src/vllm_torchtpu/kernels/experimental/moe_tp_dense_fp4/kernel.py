@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""arm99 prototype: TP-sharded small-T decode MoE, dense over tokens, sparse over hit experts (own design).
+"""TP-sharded small-T decode MoE, dense over tokens, sparse over hit experts (own design).
 
 Every core holds a 1/TP slice of every expert: w1 [E, K, 2Fs] (gate slice | up slice), w2 [E, Fs, N], fp4 with
 128-row block scales. All T tokens are on every core (x [Mp, K]). For each HIT expert (scalar-prefetched list) the
@@ -112,6 +112,105 @@ def tp_dense_moe(x, gw, w1, s1, w2, s2, hit, nhit, *, slots=3, interpret=False):
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=48 << 20),
         name=f"tp_dense_moe-e{e}-m{mp}-fs{fs}",
     )(hit, nhit, x, gw, w1, s1, w2, s2)
+
+
+# Packed layout: one fp4 record + one f32 scale record per expert (2 weight DMAs instead of 4).
+# W[e] [K + (N/2Fs)*Fs, 2Fs]: rows [0,K) = w1 (gate|up slice), then chunk j of w2 (columns j*2Fs..) as Fs rows.
+# S[e] [K/128 + (N/2Fs)*(Fs/128), 2Fs] f32: s1 rows, then the s2 rows of chunk j.
+
+
+def pack(w1, s1, w2, s2):
+    """w1 [E,K,2Fs] fp4, s1 [E,K/128,2Fs], w2 [E,Fs,N] fp4, s2 [E,Fs/128,N] -> (W, S)."""
+    e, k, f2 = w1.shape
+    fs, n = w2.shape[1], w2.shape[2]
+    nch = n // f2
+    w2r = w2.reshape(e, fs, nch, f2).transpose(0, 2, 1, 3).reshape(e, nch * fs, f2)
+    s2r = s2.reshape(e, fs // QB, nch, f2).transpose(0, 2, 1, 3).reshape(e, nch * (fs // QB), f2)
+    return jnp.concatenate([w1, w2r], axis=1), jnp.concatenate([s1, s2r], axis=1)
+
+
+def _kernel_packed(hit_ref, nhit_ref, x_ref, gw_hbm, w_hbm, s_hbm, out_ref, wv, sv, gwv, acc, sem,
+            *, slots, fs, k, nch, compute):
+    f2 = 2 * fs
+    nh = nhit_ref[0]
+    acc[...] = jnp.zeros_like(acc)
+
+    def copies(t):
+        slot = t % slots
+        e = hit_ref[t]
+        return (pltpu.make_async_copy(w_hbm.at[e], wv.at[slot], sem.at[slot, 0]),
+                pltpu.make_async_copy(s_hbm.at[e], sv.at[slot], sem.at[slot, 1]),
+                pltpu.make_async_copy(gw_hbm.at[e], gwv.at[slot], sem.at[slot, 2]))
+
+    for i in range(slots - 1):
+        @pl.when(i < nh)
+        def _():
+            for c in copies(i):
+                c.start()
+
+    x = x_ref[...]
+
+    def body(t, carry):
+        @pl.when(t + slots - 1 < nh)
+        def _():
+            for c in copies(t + slots - 1):
+                c.start()
+        for c in copies(t):
+            c.wait()
+        if not compute:
+            return carry
+        slot = t % slots
+        w = wv.at[slot]
+        s = sv.at[slot]
+        g = jnp.zeros((x.shape[0], f2), jnp.float32)
+        for kb in range(k // QB):
+            blk = jnp.matmul(x[:, kb * QB:(kb + 1) * QB], w[kb * QB:(kb + 1) * QB, :].astype(jnp.float8_e4m3fn),
+                             preferred_element_type=jnp.float32)
+            g = g + blk * s[kb:kb + 1, :]
+        h = jax.nn.silu(g[:, :fs]) * g[:, fs:]
+        h = (h * gwv[slot][:, 0:1]).astype(x.dtype)
+        nkb = fs // QB
+        for j in range(nch):
+            part = jnp.zeros((x.shape[0], f2), jnp.float32)
+            for kb in range(nkb):
+                r0 = k + j * fs + kb * QB
+                blk = jnp.matmul(h[:, kb * QB:(kb + 1) * QB], w[r0:r0 + QB, :].astype(jnp.float8_e4m3fn),
+                                 preferred_element_type=jnp.float32)
+                srow = k // QB + j * nkb + kb
+                part = part + blk * s[srow:srow + 1, :]
+            acc[:, j * f2:(j + 1) * f2] += part
+        return carry
+
+    lax.fori_loop(0, nh, body, 0)
+    out_ref[...] = acc[...].astype(out_ref.dtype)
+
+
+def tp_dense_moe_packed(x, gw, W, S, hit, nhit, *, fs, slots=3, compute=True, interpret=False):
+    mp, k = x.shape
+    e, rows, f2 = W.shape
+    nch = (rows - k) // fs
+    n = nch * f2
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    vm = pl.BlockSpec(memory_space=pltpu.VMEM)
+    kern = functools.partial(_kernel_packed, slots=slots, fs=fs, k=k, nch=nch, compute=compute)
+    extra = {"interpret": pltpu.InterpretParams()} if interpret else {}
+    return pl.pallas_call(
+        kern, **extra,
+        out_shape=jax.ShapeDtypeStruct((mp, n), x.dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[vm, hbm, hbm, hbm],
+            out_specs=vm,
+            scratch_shapes=[
+                pltpu.VMEM((slots, rows, f2), W.dtype),
+                pltpu.VMEM((slots, S.shape[1], f2), jnp.float32),
+                pltpu.VMEM((slots, mp, 128), jnp.float32),
+                pltpu.VMEM((mp, n), jnp.float32),
+                pltpu.SemaphoreType.DMA((slots, 3)),
+            ]),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=48 << 20),
+        name=f"tp_dense_moe_packed-e{e}-m{mp}-fs{fs}",
+    )(hit, nhit, x, gw, W, S)
 
 
 def reference(x, gw, w1, s1, w2, s2, hit, nhit):
