@@ -101,6 +101,7 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTER_FUSED_EPILOGUE: bool = False
     TPU_KV_PACK_FUSED_PAD: bool = False
     TPU_KV_SCATTER_PAIR: bool = False
+    TPU_SC_TOPK_ROWLEN_DMA: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -820,6 +821,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # written caches are bit-identical. Applies only when both caches use the
     # SparseCore layout. Off by default.
     "TPU_KV_SCATTER_PAIR": env_bool("TPU_KV_SCATTER_PAIR"),
+    # In the cooperative SparseCore top-k (kernels/deepseek_v4/
+    # sparsecore_topk.py, p > 1), copy each row's score slice from HBM only up
+    # to the row length, in DMAs of up to 2,048 words, instead of the whole
+    # slice. The DSA indexer's score rows are sized for max-model-len (65,536
+    # positions), so most of the copied words are padding. The result is
+    # identical. Off by default.
+    "TPU_SC_TOPK_ROWLEN_DMA": env_bool("TPU_SC_TOPK_ROWLEN_DMA"),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's

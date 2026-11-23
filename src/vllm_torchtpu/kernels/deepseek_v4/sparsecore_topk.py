@@ -41,6 +41,8 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from vllm_torchtpu import envs
+
 LANES = 16
 NUM_BUCKETS = 256
 # Largest per-subcore resident slice, in 32-bit words (128KB; double-buffered by
@@ -84,6 +86,8 @@ def _topk_body(
     shared_counts_vmem,
     shared_idx_vmem,
     shared_key_vmem,
+    scores_scratch_vmem=None,
+    scores_dma_sem=None,
     *,
     b: int,
     n: int,
@@ -94,6 +98,7 @@ def _topk_body(
     write_empty: bool,
     return_scores: bool,
     local_idxs_hbm: Any = None,
+    rowlen_dma: bool = False,
 ):
     dcp_merge = local_idxs_hbm is not None
     num_subcores = 16
@@ -621,6 +626,55 @@ def _topk_body(
                 in_specs=(*in_specs, *out_specs) if dcp_merge else in_specs,
                 out_specs=out_specs,
             )(scores_hbm, lengths_hbm, *extra_in, out_hbm)
+    elif rowlen_dma:
+        # Copy only the live part of this subcore's slice. The pipelined
+        # BlockSpec below copies the whole slice (32,768 words at n = 65,536,
+        # p = 2) even when the row holds a few hundred positions, and every
+        # read of the slice in `_run_step` stops at `walk_chunks`, which
+        # covers the first `live` words. The copy is `num_chunks` DMAs of
+        # `chunk` words, so for live = 3,000 and chunk = 2,048 it moves 4,096
+        # words; the words past `live` are masked by the tail mask as before.
+        chunk = _dma_chunk_words(slice_len)
+
+        def pipeline_step_coop_rowlen(len_slice_vmem):
+            w = pl.program_id(0)
+            row = w * groups_per_chip + core * groups_per_core + group_id
+            row_len = jnp.minimum(vec_at(len_slice_vmem, 0), n)
+            live = jnp.clip(jnp.where(row < b, row_len, 0) - col_base, 0, slice_len)
+            num_chunks = (live + (chunk - 1)) // chunk
+            src_base = (w * cores_per_chip + flat) * slice_len
+
+            def chunk_copy(c):
+                return pltpu.make_async_copy(
+                    scores_hbm.at[pl.ds(src_base + c * chunk, chunk)],
+                    scores_scratch_vmem.at[pl.ds(c * chunk, chunk)],
+                    scores_dma_sem,
+                )
+
+            def start(c, carry):
+                chunk_copy(c).start()
+                return carry
+
+            def wait(c, carry):
+                chunk_copy(c).wait()
+                return carry
+
+            lax.fori_loop(0, num_chunks, start, 0)
+            lax.fori_loop(0, num_chunks, wait, 0)
+            _run_step(scores_scratch_vmem, len_slice_vmem)
+
+        pltpu.emit_pipeline(
+            pipeline_step_coop_rowlen,
+            grid=(num_waves,),
+            in_specs=(
+                pl.BlockSpec(
+                    (LANES,),
+                    lambda w: (w * cores_per_chip + flat,),
+                    pipeline_mode=pl.Buffered(buf_count),
+                ),
+            ),
+            out_specs=(),
+        )(lengths_hbm)
     else:
 
         def pipeline_step_coop(scores_vmem, len_slice_vmem):
@@ -646,6 +700,17 @@ def _topk_body(
         )(scores_hbm, lengths_hbm)
 
 
+def _dma_chunk_words(slice_len: int) -> int:
+    """DMA size in words for the row-length-bounded copy of one slice.
+
+    The largest power of two that divides `slice_len` and is at most 2,048
+    words (8 KiB). It divides `slice_len`, so the last chunk never reads past
+    the slice. It is at least LANES, because `slice_len` is a multiple of
+    LANES. Example: slice_len = 32,768 gives 2,048; slice_len = 400 gives 16.
+    """
+    return min(2048, slice_len & -slice_len)
+
+
 def _sc_topk_direct(
     scores: jax.Array,  # f32[b, n]
     k: int,
@@ -656,6 +721,7 @@ def _sc_topk_direct(
     write_empty: bool = True,
     return_scores: bool = True,
     scheduling_group_id: int | None = None,
+    rowlen_dma: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Single-stage SparseCore top-k on 32 subcores.
 
@@ -663,10 +729,17 @@ def _sc_topk_direct(
     When ``p > 1``, groups of ``p`` subcores on the same SparseCore cooperatively
     process a row using a shared global histogram in ``VMEM_SHARED``.
 
+    ``rowlen_dma`` (``p > 1`` only) copies each slice from HBM only up to the
+    row length, rounded up to `_dma_chunk_words`, instead of the whole slice.
+    The result is identical; see `TPU_SC_TOPK_ROWLEN_DMA` in `envs.py`.
+
     ``scores`` may be f32 or the same values already bitcast to i32; the kernel
     compares raw bits either way.
     """
     b, n = scores.shape
+    # The bounded copy is written for the cooperative (p > 1) path, which
+    # never has a dcp merge input.
+    rowlen_dma = rowlen_dma and p > 1 and local_idxs is None
     info = pltpu.get_tpu_info()
     sc = info.sparse_core
     if sc is None:
@@ -730,6 +803,8 @@ def _sc_topk_direct(
         pltpu.VMEM_SHARED((2 * sc.num_subcores * k,), jnp.int32)
         if (p > 1 and return_scores)
         else None,  # shared_key_vmem
+        pltpu.VMEM((slice_len,), jnp.int32) if rowlen_dma else None,
+        pltpu.SemaphoreType.DMA if rowlen_dma else None,
     )
 
     body_fn = functools.partial(
@@ -742,6 +817,7 @@ def _sc_topk_direct(
         num_waves=num_waves,
         write_empty=write_empty,
         return_scores=return_scores,
+        rowlen_dma=rowlen_dma,
     )
     if local_idxs is not None:
         orig_body = body_fn
@@ -803,6 +879,7 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "write_empty_rows",
         "scheduling_group_id",
         "return_scores",
+        "rowlen_dma",
     ),
 )
 def sparsecore_topk(
@@ -813,8 +890,12 @@ def sparsecore_topk(
     write_empty_rows: bool = True,
     scheduling_group_id: int | None = None,
     return_scores: bool = False,
+    rowlen_dma: bool | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
+
+    ``rowlen_dma`` selects the row-length-bounded HBM copy of the cooperative
+    path (see `_sc_topk_direct`). None reads `TPU_SC_TOPK_ROWLEN_DMA`.
 
     When ``p > 1`` (for ``b < 32`` or ``n > 32K``), subcores on the same
     SparseCore cooperatively compute a global histogram in ``VMEM_SHARED`` to
@@ -839,6 +920,8 @@ def sparsecore_topk(
     else:
         row_lengths = row_lengths.astype(jnp.int32)
 
+    if rowlen_dma is None:
+        rowlen_dma = envs.TPU_SC_TOPK_ROWLEN_DMA
     p = _pick_partition(b, n, k)
     return _sc_topk_direct(
         scores,
@@ -848,6 +931,7 @@ def sparsecore_topk(
         write_empty=write_empty_rows,
         return_scores=return_scores,
         scheduling_group_id=scheduling_group_id,
+        rowlen_dma=rowlen_dma,
     )
 
 
