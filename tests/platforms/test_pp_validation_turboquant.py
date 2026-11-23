@@ -20,8 +20,17 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_torchtpu.layers.adapter import turboquant_attention
 from vllm_torchtpu.layers.adapter.turboquant_attention import check_turboquant_config
+from vllm_torchtpu.platforms import pp_validation
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
+
+
+@pytest.fixture(autouse=True)
+def _reset_active_preset(monkeypatch: pytest.MonkeyPatch) -> None:
+    # check_turboquant_config records the preset process-wide before checking.
+    monkeypatch.setattr(turboquant_attention, "_active_preset", None)
+
 
 RAIDEN_PRODUCER = SimpleNamespace(
     kv_connector="TPURaidenConnector", is_kv_producer=True
@@ -81,8 +90,6 @@ def test_pp8_prefill_config_accepts_turboquant(kv_transfer):
 
 
 def test_pp8_turboquant_still_refuses_pcp_stages(monkeypatch):
-    from vllm_torchtpu.platforms import pp_validation
-
     monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: True)
     config = _pp8(pcp=2)
     validate_pipeline_parallel_config(config)

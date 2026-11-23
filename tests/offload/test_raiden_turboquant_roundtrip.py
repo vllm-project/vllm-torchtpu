@@ -31,6 +31,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_torchtpu.layers.adapter import turboquant_attention
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
 
@@ -41,13 +42,9 @@ INDEXER_PAGE_BYTES = 132 * BLOCK
 
 
 @pytest.fixture
-def turboquant_preset():
-    from vllm_torchtpu.layers.adapter import turboquant_attention
-
-    previous = turboquant_attention._active_preset
-    turboquant_attention.set_active_turboquant_preset("turboquant_4bit_nc")
-    yield "turboquant_4bit_nc"
-    turboquant_attention._active_preset = previous
+def turboquant_preset(monkeypatch):
+    monkeypatch.setattr(turboquant_attention, "_active_preset", "turboquant_4bit_nc")
+    return "turboquant_4bit_nc"
 
 
 def _fake_connector():

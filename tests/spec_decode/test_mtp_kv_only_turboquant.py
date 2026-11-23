@@ -296,41 +296,48 @@ def tq_tpu_layer():
 
     previous = turboquant_attention._active_preset
     turboquant_attention.set_active_turboquant_preset("turboquant_4bit_nc")
-    torch._dynamo.reset()
-    layer = build_tpu_sparse_mla(TQ_MLA, TQ_IDX, cache_dtype="turboquant_4bit_nc")
-    # Both passes are in TurboQuant mode: the full pass's op was built for a
-    # TurboQuant layer over TurboQuant-shaped caches, and the write op packs.
-    mla = layer.mla_layer
-    assert PallasMLAttentionBackendImpl._is_turboquant(mla)
-    nope_spec, rope_spec = mla.mla_kv_spec
-    assert tuple(nope_spec.shape[1:]) == (TPU_PAGE * tq.MLA_TQ_NOPE_BYTES // 512, 128)
-    assert tuple(mla.kv_cache[0].shape) == tuple(nope_spec.shape)
-    with set_vllm_model_wrapper_context(mesh=layer.mesh):
-        write_op = mla_op.MlaKvWriteOp(layer.wrapper, layer.mesh)
-    assert write_op.tq_tables is not None
-    layer.full_c = tpu_compiled(kvw._FullPass(layer.wrapper))
-    layer.kv_only_c = tpu_compiled(kvw._KvOnly(layer.wrapper, write_op))
-    gen = torch.Generator().manual_seed(9)
-    dev = torch.device("tpu")
-
-    def tokens(positions):
-        n = len(positions)
-        return (
-            torch.tensor(positions, dtype=torch.int32, device=dev),
-            torch.randn(n, HIDDEN, generator=gen).bfloat16().to(dev),
+    try:
+        torch._dynamo.reset()
+        layer = build_tpu_sparse_mla(TQ_MLA, TQ_IDX, cache_dtype="turboquant_4bit_nc")
+        # Both passes are in TurboQuant mode: the full pass's op was built for a
+        # TurboQuant layer over TurboQuant-shaped caches, and the write op packs.
+        mla = layer.mla_layer
+        assert PallasMLAttentionBackendImpl._is_turboquant(mla)
+        nope_spec, rope_spec = mla.mla_kv_spec
+        assert tuple(nope_spec.shape[1:]) == (
+            TPU_PAGE * tq.MLA_TQ_NOPE_BYTES // 512,
+            128,
         )
+        assert tuple(mla.kv_cache[0].shape) == tuple(nope_spec.shape)
+        with set_vllm_model_wrapper_context(mesh=layer.mesh):
+            write_op = mla_op.MlaKvWriteOp(layer.wrapper, layer.mesh)
+        assert write_op.tq_tables is not None
+        layer.full_c = tpu_compiled(kvw._FullPass(layer.wrapper))
+        layer.kv_only_c = tpu_compiled(kvw._KvOnly(layer.wrapper, write_op))
+        gen = torch.Generator().manual_seed(9)
+        dev = torch.device("tpu")
 
-    end = TPU_PREFIX + 32
-    prefix = tokens(list(range(TPU_PREFIX)))
-    prefix_md = _tq_md([TPU_PREFIX, 0], [0, TPU_PREFIX, TPU_PREFIX], [0, 0, 1])
-    on_tpu(layer, layer.full_c, prefix_md, *prefix)
-    layer.prefix_caches = [c.cpu() for c in layer.caches]
-    layer.step = tokens(list(range(TPU_PREFIX, end)) + list(range(24)) + [0] * 8)
-    layer.step_md = lambda: _tq_md([end, 24], [0, 32, 56], [0, 0, 2])
-    layer.last_rows = torch.tensor([31, 55] + [0] * 6, dtype=torch.int64, device=dev)
-    layer.rows_md = lambda: _tq_md([end, 24], [0, 1, 2], [2, 2, 2])
-    yield layer
-    turboquant_attention._active_preset = previous
+        def tokens(positions):
+            n = len(positions)
+            return (
+                torch.tensor(positions, dtype=torch.int32, device=dev),
+                torch.randn(n, HIDDEN, generator=gen).bfloat16().to(dev),
+            )
+
+        end = TPU_PREFIX + 32
+        prefix = tokens(list(range(TPU_PREFIX)))
+        prefix_md = _tq_md([TPU_PREFIX, 0], [0, TPU_PREFIX, TPU_PREFIX], [0, 0, 1])
+        on_tpu(layer, layer.full_c, prefix_md, *prefix)
+        layer.prefix_caches = [c.cpu() for c in layer.caches]
+        layer.step = tokens(list(range(TPU_PREFIX, end)) + list(range(24)) + [0] * 8)
+        layer.step_md = lambda: _tq_md([end, 24], [0, 32, 56], [0, 0, 2])
+        layer.last_rows = torch.tensor(
+            [31, 55] + [0] * 6, dtype=torch.int64, device=dev
+        )
+        layer.rows_md = lambda: _tq_md([end, 24], [0, 1, 2], [2, 2, 2])
+        yield layer
+    finally:
+        turboquant_attention._active_preset = previous
 
 
 @pytest.mark.tpu_test

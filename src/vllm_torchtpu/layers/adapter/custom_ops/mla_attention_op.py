@@ -1741,7 +1741,9 @@ class MlaKvWriteOp:
             )
         self.dcp_size = dcp_size
         # A TurboQuant cache stores packed 4-bit latents; pack them as the
-        # full pass does. The TurboQuant config check refuses DCP.
+        # full pass does. The TurboQuant config check refuses DCP; refusing
+        # here too fails at load rather than at the first traced write, and
+        # `mla_kv_write_caches` keeps its own check for direct callers.
         tq_tables = None
         if impl._is_turboquant(mla_layer):
             if dcp_size > 1:
@@ -1750,8 +1752,7 @@ class MlaKvWriteOp:
                 )
             tq_tables = turboquant.make_mla_latent_tables()
         self.tq_tables = tq_tables
-        # Only a TurboQuant write takes the tables; other writes call the
-        # helper exactly as before.
+        # The tables are passed only for a TurboQuant cache.
         tq_kwargs = {} if tq_tables is None else {"tq_tables": tq_tables}
         # The indexer op's own mode, so both writers of its cache agree.
         kv_cache_mode = indexer_op.kv_cache_mode

@@ -283,8 +283,9 @@ def build_tpu_sparse_mla(
     layer.qk_rope_head_dim = ROPE
     layer.v_head_dim = V_DIM
     layer.scale = QK**-0.5
-    layer.kv_cache_quantized_dtype = torch.float8_e4m3fn
-    if cache_dtype != "fp8":
+    if cache_dtype == "fp8":
+        layer.kv_cache_quantized_dtype = torch.float8_e4m3fn
+    else:
         # A TurboQuant layer: its quantized dtype is the uint8 code storage.
         layer.kv_cache_dtype = cache_dtype
         layer.kv_cache_quantized_dtype = torch.uint8
