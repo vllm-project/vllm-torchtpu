@@ -62,6 +62,49 @@ def _quantized_all_gather(
     return ag_hidden_states
 
 
+def _all_gather_routing(
+    collective_group,
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Gather the routing weights and ids, in one collective when both are 32-bit."""
+    if (
+        topk_weights is None
+        or topk_ids is None
+        or topk_weights.element_size() != 4
+        or topk_ids.element_size() != 4
+        or topk_weights.shape != topk_ids.shape
+    ):
+        return (
+            collective_group.all_gather(topk_weights, dim=0)
+            if topk_weights is not None
+            else None,
+            collective_group.all_gather(topk_ids, dim=0)
+            if topk_ids is not None
+            else None,
+        )
+    k = topk_ids.shape[-1]
+    packed = torch.cat(
+        [topk_ids.view(torch.int32), topk_weights.view(torch.int32)], dim=-1
+    )
+    gathered = collective_group.all_gather(packed, dim=0)
+    return (
+        gathered[:, k:].contiguous().view(topk_weights.dtype),
+        gathered[:, :k].contiguous().view(topk_ids.dtype),
+    )
+
+
+def _chunk_of_gathered(
+    gathered: torch.Tensor | None, parallel_size: int, chunk: int, chunk_size_local: int
+) -> torch.Tensor | None:
+    """Rows of chunk `chunk` from a rank-major gather of whole local tensors."""
+    if gathered is None:
+        return None
+    per_rank = gathered.view(parallel_size, -1, *gathered.shape[1:])
+    rows = per_rank[:, chunk * chunk_size_local : (chunk + 1) * chunk_size_local]
+    return rows.reshape(-1, *gathered.shape[1:])
+
+
 def calculate_moe_chunks(
     seq_len: int, parallel_size: int, chunk_size: int
 ) -> tuple[int, int]:
@@ -206,15 +249,8 @@ def pipelined_fused_moe_gmm(
                 )
             else:
                 ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
-            ag_topk_weights = (
-                collective_group.all_gather(topk_weights, dim=0)
-                if topk_weights is not None
-                else None
-            )
-            ag_topk_ids = (
-                collective_group.all_gather(topk_ids, dim=0)
-                if topk_ids is not None
-                else None
+            ag_topk_weights, ag_topk_ids = _all_gather_routing(
+                collective_group, topk_weights, topk_ids
             )
         else:
             ag_hidden_states = hidden_states
@@ -252,22 +288,18 @@ def pipelined_fused_moe_gmm(
         hidden_states[i * chunk_size_local : (i + 1) * chunk_size_local]
         for i in range(num_chunks)
     ]
-    weights_slices = (
-        [
-            topk_weights[i * chunk_size_local : (i + 1) * chunk_size_local]
-            for i in range(num_chunks)
-        ]
-        if topk_weights is not None
-        else [None] * num_chunks
+    # The routing is small, so one gather of it serves every chunk.
+    ag_weights_all, ag_ids_all = _all_gather_routing(
+        collective_group, topk_weights, topk_ids
     )
-    ids_slices = (
-        [
-            topk_ids[i * chunk_size_local : (i + 1) * chunk_size_local]
-            for i in range(num_chunks)
-        ]
-        if topk_ids is not None
-        else [None] * num_chunks
-    )
+    weights_chunks = [
+        _chunk_of_gathered(ag_weights_all, parallel_size, i, chunk_size_local)
+        for i in range(num_chunks)
+    ]
+    ids_chunks = [
+        _chunk_of_gathered(ag_ids_all, parallel_size, i, chunk_size_local)
+        for i in range(num_chunks)
+    ]
 
     def _all_gather_hs(hs_slice):
         if quantize_ag:
@@ -276,37 +308,14 @@ def pipelined_fused_moe_gmm(
 
     # Prime pipeline with initial all-gather for chunk 0
     ag_hs_curr = _all_gather_hs(hs_slices[0])
-    ag_tw_curr = (
-        collective_group.all_gather(weights_slices[0], dim=0)
-        if weights_slices[0] is not None
-        else None
-    )
-    ag_ti_curr = (
-        collective_group.all_gather(ids_slices[0], dim=0)
-        if ids_slices[0] is not None
-        else None
-    )
 
     rs_outputs = []
 
     for i in range(num_chunks):
-        ag_hs_next = ag_tw_next = ag_ti_next = None
+        ag_hs_next = None
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
             ag_hs_next = _all_gather_hs(hs_slices[i + 1])
-            # Locals let the None checks below narrow; subscripts do not.
-            weights_next = weights_slices[i + 1]
-            ag_tw_next = (
-                collective_group.all_gather(weights_next, dim=0)
-                if weights_next is not None
-                else None
-            )
-            ids_next = ids_slices[i + 1]
-            ag_ti_next = (
-                collective_group.all_gather(ids_next, dim=0)
-                if ids_next is not None
-                else None
-            )
 
         # Compute MoE kernel for current gathered chunk
         out_i = fused_moe_gmm(
@@ -317,8 +326,8 @@ def pipelined_fused_moe_gmm(
             w2_scale=w2_scale,
             w1_bias=w1_bias,
             w2_bias=w2_bias,
-            topk_weights=cast(torch.Tensor, ag_tw_curr),
-            topk_ids=cast(torch.Tensor, ag_ti_curr),
+            topk_weights=cast(torch.Tensor, weights_chunks[i]),
+            topk_ids=cast(torch.Tensor, ids_chunks[i]),
             experts_start=experts_start,
             topk=topk,
             activation=activation,
@@ -332,6 +341,6 @@ def pipelined_fused_moe_gmm(
 
         if i + 1 < num_chunks:
             assert ag_hs_next is not None
-            ag_hs_curr, ag_tw_curr, ag_ti_curr = ag_hs_next, ag_tw_next, ag_ti_next
+            ag_hs_curr = ag_hs_next
 
     return torch.cat(rs_outputs, dim=0)

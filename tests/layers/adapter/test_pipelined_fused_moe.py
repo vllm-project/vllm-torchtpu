@@ -245,12 +245,14 @@ def test_pipelined_moe_execution_flow_and_numerical_parity():
     # Numerical parity check: each token should be exactly hs * 2.0
     torch.testing.assert_close(out, hidden_states * 2.0)
 
-    # Call log should record 2 all-gathers (for hidden_states, topk_weights, topk_ids)
-    # and 2 reduce-scatters
+    # Call log should record the hidden-state gather of each chunk, the routing
+    # gathered once, and 2 reduce-scatters
     ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
     rs_calls = [c for c in dp_group.call_log if c[0] == "reduce_scatter"]
     # 3 tensors gathered per chunk * 2 chunks = 6 all_gather calls
-    assert len(ag_calls) == 6
+    # 1 hidden-state gather per chunk + the routing gathered once (bf16 weights
+    # do not pack with int32 ids, so 2 gathers) = 4 all_gather calls
+    assert len(ag_calls) == 4
     # 1 tensor reduce-scattered per chunk * 2 chunks = 2 reduce_scatter calls
     assert len(rs_calls) == 2
 
@@ -300,9 +302,94 @@ def test_pcp_uses_chunk_pipeline_and_not_dp_collectives():
         )
 
     torch.testing.assert_close(out, hidden_states * 2.0)
-    assert len([c for c in pcp_group.call_log if c[0] == "all_gather"]) == 6
+    assert len([c for c in pcp_group.call_log if c[0] == "all_gather"]) == 4
     assert len([c for c in pcp_group.call_log if c[0] == "reduce_scatter"]) == 2
     assert dp_group.call_log == []
+
+
+class _OffsetPeersGroup(_MockCollectiveGroup):
+    """Peer r holds rank 0's tokens shifted by r * offset, so rows stay traceable.
+
+    A float tensor is shifted directly. An int32 tensor is the packed routing:
+    its first `topk` columns are ids, the rest are f32 weight bits.
+    """
+
+    def __init__(self, world_size, offset, topk):
+        super().__init__(world_size=world_size, rank=0)
+        self.offset = offset
+        self.topk = topk
+
+    def _peer(self, tensor, r):
+        if tensor.dtype is torch.int32:
+            ids = tensor[:, : self.topk] + r * self.offset
+            weights = tensor[:, self.topk :].contiguous().view(torch.float32)
+            weights = (weights + r * self.offset).view(torch.int32)
+            return torch.cat([ids, weights], dim=-1)
+        return tensor + r * self.offset
+
+    def all_gather(self, tensor, dim=0):
+        self.call_log.append(("all_gather", tensor.shape, tensor.dtype))
+        return torch.cat([self._peer(tensor, r) for r in range(self.world_size)])
+
+
+@pytest.mark.parametrize("seq_len,chunk_size", [(64, 512), (64, 128), (64, 64)])
+def test_packed_routing_gather_matches_each_chunk_rows(seq_len, chunk_size):
+    """32-bit weights and ids cross in one gather, and every chunk's routing
+    rows line up with the hidden-state rows the kernel receives."""
+    world, topk, hidden_dim = 4, 2, 8
+    offset = 1000
+    token = torch.arange(seq_len, dtype=torch.float32)
+    hidden_states = token[:, None].expand(seq_len, hidden_dim).contiguous()
+    topk_weights = token[:, None].expand(seq_len, topk).contiguous()
+    topk_ids = topk_weights.to(torch.int32)
+    group = _OffsetPeersGroup(world, offset, topk)
+    seen = []
+
+    def mock_kernel_fn(hidden_states, topk_weights, topk_ids, **kwargs):
+        rows = hidden_states[:, 0]
+        torch.testing.assert_close(topk_weights[:, 0], rows, rtol=0, atol=0)
+        torch.testing.assert_close(topk_ids[:, 1].to(torch.float32), rows)
+        seen.append(rows.numel())
+        return hidden_states * 2.0
+
+    with (
+        patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", chunk_size),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_pcp_group",
+            return_value=group,
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_dp_group",
+            return_value=_MockCollectiveGroup(world_size=1, rank=0),
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.fused_moe_gmm",
+            side_effect=lambda **kw: mock_kernel_fn(**kw),
+        ),
+    ):
+        out = pipelined_fused_moe_gmm(
+            hidden_states=hidden_states,
+            w1=torch.empty(0),
+            w2=torch.empty(0),
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=None,
+            topk=topk,
+            activation="silu",
+        )
+
+    num_chunks = max(1, seq_len * world // chunk_size)
+    assert seen == [seq_len * world // num_chunks] * num_chunks
+    torch.testing.assert_close(out, hidden_states * 2.0)
+    routing = [
+        c for c in group.call_log if c[0] == "all_gather" and c[2] is torch.int32
+    ]
+    assert routing == [("all_gather", torch.Size([seq_len, 2 * topk]), torch.int32)]
+    assert len([c for c in group.call_log if c[0] == "all_gather"]) == 1 + num_chunks
 
 
 def test_fp8_all_gather_is_off_by_default():
@@ -1078,7 +1165,7 @@ def test_pipelined_moe_four_stage_pipeline():
     torch.testing.assert_close(out, hidden_states * 4.0)
     ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
     rs_calls = [c for c in dp_group.call_log if c[0] == "reduce_scatter"]
-    # 3 tensors * 4 chunks = 12 all_gather calls
-    assert len(ag_calls) == 12
+    # 4 hidden-state chunks + weights and ids gathered once = 6 all_gather calls
+    assert len(ag_calls) == 6
     # 4 reduce_scatter calls
     assert len(rs_calls) == 4
