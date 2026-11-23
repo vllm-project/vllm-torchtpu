@@ -12,29 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/kimi_k3/kernels/helpers.py
-"""Kimi-K3 model math shared by the prefill and decode megakernels.
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+#   src/vllm_torchtpu/megakernel/kimi_k3/kernels/helpers.py
+"""Value-level Kimi-K3 model math helpers used by the prefill megakernel.
 
-Value-level functions (``jax.Array`` in, ``jax.Array`` out) that both
-kernels evaluate, on VMEM loads or on whole arrays, with the same operations
-in the same order. ``prefill_megakernel`` uses them; ``decode_megakernel``
-has its own copies of some of them (``_gated_activation``, its inline KDA
-normalization and decay, its E8M0 decode).
+Pure ``jax.Array`` functions evaluated on VMEM loads or whole arrays with the
+same operation order as ``decode_megakernel`` (which keeps its own copies:
+``_gated_activation``, inline KDA normalization and decay, and E8M0 decode).
 """
 
 import jax
 import jax.numpy as jnp
 
+_EXPONENT_MANTISSA_SHIFT = 23
 
-def expert_activation(gate, value):
-    """K3's expert activation, ``4 tanh(g / 4) sigmoid(g) * 25 tanh(v / 25)``
-    (shared, routed and dense FFNs), in the inputs' dtype."""
+
+def expert_activation(gate: jax.Array, value: jax.Array) -> jax.Array:
+    """Compute the Kimi-K3 gated expert activation in the inputs' dtype."""
     return 4 * jnp.tanh(gate / 4) * jax.nn.sigmoid(gate) * 25 * jnp.tanh(value / 25)
 
 
-def kda_normalize_query_key(query, key, channels):
-    """KDA's L2-normalized query (scaled by ``channels ** -0.5``) and key,
-    over the last axis, in FP32."""
+def kda_normalize_query_key(
+    query: jax.Array,
+    key: jax.Array,
+    channels: float,
+) -> tuple[jax.Array, jax.Array]:
+    """Return L2-normalized KDA query (scaled by ``channels**-0.5``) and key."""
     query = query * (
         jax.lax.rsqrt(jnp.sum(query * query, axis=-1, keepdims=True) + 1e-6)
         * channels**-0.5
@@ -43,12 +46,19 @@ def kda_normalize_query_key(query, key, channels):
     return query, key
 
 
-def kda_decay(decay_lower_bound, decay_rate, raw_gate, time_step_bias):
-    """KDA's per-channel log decay, ``lower_bound * sigmoid(rate * (gate +
-    bias))``; ``decay_rate`` is ``exp(A_log)``, broadcast by the caller."""
+def kda_decay(
+    decay_lower_bound: float | jax.Array,
+    decay_rate: jax.Array,
+    raw_gate: jax.Array,
+    time_step_bias: jax.Array,
+) -> jax.Array:
+    """Compute per-channel KDA log decay from ``exp(A_log)`` and gate logits."""
     return decay_lower_bound * jax.nn.sigmoid(decay_rate * (raw_gate + time_step_bias))
 
 
-def e8m0_scale(exponents):
-    """MXFP4 E8M0 exponent bytes as the exact FP32 powers of two they encode."""
-    return jax.lax.bitcast_convert_type(exponents.astype(jnp.uint32) << 23, jnp.float32)
+def e8m0_scale(exponents: jax.Array) -> jax.Array:
+    """Decode MXFP4 E8M0 exponent bytes into exact FP32 powers of two."""
+    return jax.lax.bitcast_convert_type(
+        exponents.astype(jnp.uint32) << _EXPONENT_MANTISSA_SHIFT,
+        jnp.float32,
+    )
