@@ -7192,23 +7192,32 @@ class TPUModelRunner(GPUModelRunner):
             raise ValueError(
                 "TPU_PRECOMPILE_TRACE_FIRST=1 needs TPU_PARALLEL_PRECOMPILE=1"
             )
+        ladder = self._backbone_token_paddings()
         with shape_variants.warmup() as buckets:
             with (
                 shape_variants.trace_only() if trace_first else contextlib.nullcontext()
             ) as deferred:
-                for num_tokens in self._backbone_token_paddings():
+                for num_tokens in ladder:
                     logger.info("  -- num_tokens: %d", num_tokens)
                     if buckets.needs_retrace(num_tokens):
                         shape_variants.retrace(self.model, self.vllm_config)
                     self._backbone_dummy_runs(num_tokens)
-                if buckets.refused:
+                # Buckets above the PCP local cap are compiled but never run.
+                unreachable = {n for n in buckets.refused if n > ladder[-1]}
+                if unreachable:
+                    logger.info(
+                        "Buckets above the backbone ladder (%d) left uncompiled: %s",
+                        ladder[-1],
+                        sorted(unreachable),
+                    )
+                refused = buckets.refused - unreachable
+                if refused:
                     # A refusal that no trace picked up leaves a raising
                     # closure in the live graph, which would surface as a
                     # failed request. Fail the start instead, where it can be
                     # read.
                     raise shape_variants.ShapeSpecializationError(
-                        "warmup left token buckets uncompiled: "
-                        f"{sorted(buckets.refused)}"
+                        f"warmup left token buckets uncompiled: {sorted(refused)}"
                     )
             if deferred is not None:
                 started = time.perf_counter()
