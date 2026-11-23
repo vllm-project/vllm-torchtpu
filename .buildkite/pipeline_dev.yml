@@ -20,8 +20,8 @@
 # under selector_recordings/fnrec/<step>/shard<N>/.
 #
 # Round 1 (build #1449) recorded unit_tests_cpu_pr and unit_tests_general_pr.
-# Round 2 records two integration steps, with the same command, shape and env
-# as pipeline_integration.yml.
+# Round 2 records two integration steps (Kimi-K3 and compilation cache), with
+# the same command, shape and env as pipeline_integration.yml.
 
 steps:
   - label: ":docker: Build and Push Dev Image"
@@ -35,8 +35,10 @@ steps:
         - exit_status: 1
           limit: 2
 
-  - label: "[prototype] record integration_qwen35_apc_correctness"
-    key: record_qwen35_apc
+  # Kimi-K3 first, as suggested in review. Same command and env as CI; the
+  # checkpoint (~443 GiB) streams from GCS, so the boot is long.
+  - label: "[prototype] record integration_k3_pruned75_apc_offload_correctness"
+    key: record_k3
     depends_on: build_docker
     timeout_in_minutes: 1440
     agents:
@@ -46,14 +48,16 @@ steps:
           podTemplate: tpu-launcher
     env:
       SHAPE: "tpu7x-standard-4t/2x2x1"
-      RUN_ROOT: "perf_eval_results/qwen35_apc_ci"
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      RUN_ROOT: "perf_eval_results/k3_pruned75_apc_offload_ci"
+      SERVED_MODEL_NAME: "mgoin/Kimi-K3-pruned75"
       ARTIFACTS_DIR: "selector_recordings"
     commands:
       - >-
         .buildkite/kubernetes/run.sh bash
         .buildkite/scripts/selector_prototype/record_script.sh
-        integration_qwen35_apc_correctness "$${BUILDKITE_COMMIT}"
-        bash ./scripts/vllm/integration/run_qwen35_apc_correctness.sh
+        integration_k3_pruned75_apc_offload_correctness "$${BUILDKITE_COMMIT}"
+        bash ./scripts/vllm/integration/run_k3_pruned75_apc_offload_correctness.sh
 
   # No automatic retry, unlike CI: two attempts would upload the same
   # recording paths. Rerun the build if its known cache flake hits.
