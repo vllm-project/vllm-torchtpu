@@ -57,6 +57,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_attention,
     msa_attention_lse,
     msa_dcp,
+    msa_fp4,
 )
 
 FUSED_ENV = "TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS"
@@ -184,6 +185,7 @@ def _body(
     sm_scale: float,
     topk: int,
     interpret: bool,
+    scale_row0: int = 0,
 ):
     num_heads, num_tokens, head_dim = q_ref.shape
     tiles, groups_per_tile, offsets, _ = _layout(num_tokens, topk)
@@ -258,7 +260,7 @@ def _body(
     fp4 = scale_hbm_ref is not None
     fp4_in = (scale_hbm_ref,) if fp4 else ()
     fp4_scratch = (scale_buf_ref, scale_sem_ref) if fp4 else ()
-    fp4_rows = {"fp4_rows": (0, 1)} if fp4 else {}
+    fp4_rows = {"fp4_rows": (scale_row0, scale_row0 + 1)} if fp4 else {}
     msa_attention_lse._kernel(
         work.at[pl.ds(offsets[0], union_len)],
         work.at[pl.ds(offsets[1], max_groups)],
@@ -386,6 +388,7 @@ def fused_attend_and_merge(
         raise ValueError(
             f"{num_tokens} rows: need a multiple of {_BLOCK_Q} up to {MAX_TOKENS}"
         )
+    scale_cache, scale_row0 = msa_fp4.split_scales(scale_cache)
     msa_attention.check_cache(kv_cache, scale_cache)
     msa_attention_lse._check_rows(kv_cache, head_dim, 0)
     rank = msa_dcp.rank_array(rank)
@@ -461,6 +464,7 @@ def fused_attend_and_merge(
             sm_scale=sm_scale,
             topk=topk,
             interpret=interpret,
+            **({"scale_row0": scale_row0} if scale_row0 else {}),
         ),
         grid_spec=grid_spec,
         out_shape=jax.ShapeDtypeStruct((num_tokens, num_heads * head_dim), q.dtype),

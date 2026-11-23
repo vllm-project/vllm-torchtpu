@@ -141,6 +141,61 @@ def scale_rows(kv_heads: int) -> int:
     return -(-(2 * kv_heads) // SCALE_ROWS) * SCALE_ROWS
 
 
+def layers_per_scale_page(kv_heads: int) -> int:
+    """Layers whose K/V scale rows fit one scale page (shared scale pages,
+    TPU_MINIMAX_M3_KV4_SHARED_SCALES): 4 at one KV head per rank, 2 at two,
+    1 (no sharing) from three."""
+    return max(1, SCALE_ROWS // (2 * kv_heads))
+
+
+@jax.tree_util.register_pytree_node_class
+class SharedScales:
+    """A layer's view of a scale page shared by several layers: the page
+    array ``[pages, R, S]`` and the static first row of this layer's K/V
+    rows (``row0 + 2h`` / ``row0 + 2h + 1`` for KV head ``h``).
+
+    A pytree whose only leaf is the array, so it passes through jit, cond
+    and shard_map like the array; `row0` is static (part of the treedef).
+    It is deliberately not array-like: every reader unpacks it with
+    `split_scales`.
+    """
+
+    def __init__(self, pages: jax.Array, row0: int) -> None:
+        self.pages = pages
+        self.row0 = int(row0)
+
+    def tree_flatten(self):
+        return (self.pages,), self.row0
+
+    @classmethod
+    def tree_unflatten(cls, row0, children):
+        return cls(children[0], row0)
+
+
+def with_row0(scale_cache, row0: int):
+    """`scale_cache` as a layer's view at `row0` (the array itself at 0)."""
+    if scale_cache is None or row0 == 0:
+        return scale_cache
+    return SharedScales(scale_cache, row0)
+
+
+def split_scales(scale_cache):
+    """``(pages, row0)`` of a scale cache or its `SharedScales` view."""
+    if isinstance(scale_cache, SharedScales):
+        return scale_cache.pages, scale_cache.row0
+    return scale_cache, 0
+
+
+def pages_of(scale_cache):
+    """The page array of a scale cache or its view (None stays None)."""
+    return split_scales(scale_cache)[0]
+
+
+def like(scale_cache, pages):
+    """`pages` wrapped as `scale_cache` is (a view at the same row)."""
+    return with_row0(pages, split_scales(scale_cache)[1])
+
+
 def index_scale_row(kv_heads: int) -> int:
     """Scale-page row of the index-key scales, after the K and V rows of every head."""
     return 2 * kv_heads

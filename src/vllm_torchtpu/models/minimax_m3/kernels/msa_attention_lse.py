@@ -576,8 +576,9 @@ def _kernel(
     writes its zero output.
 
     A 4-bit cache (`fp4_rows`: static K / V scale-page rows, or ``"head"``
-    for rows ``2k, 2k + 1`` of the cache-row KV head ``k``) copies each
-    page's scale page beside it.
+    for rows ``2k, 2k + 1`` of the cache-row KV head ``k``, or ``("head",
+    row0)`` for rows ``row0 + 2k, row0 + 2k + 1``) copies each page's scale
+    page beside it.
 
     Grid step ``b`` runs the groups ``block_start_ref[b] ..
     block_start_ref[b + 1] - 1`` of its `tiles_per_step` tiles in a loop
@@ -1076,6 +1077,10 @@ def _kernel(
                     # their p = 0 contributes nothing.
                     if fp4_rows == "head":
                         k_row = 2 * group_head(w)
+                        v_row = k_row + 1
+                    elif isinstance(fp4_rows, tuple) and fp4_rows[0] == "head":
+                        # ("head", row0): a shared scale page's rows from row0.
+                        k_row = fp4_rows[1] + 2 * group_head(w)
                         v_row = k_row + 1
                     else:
                         k_row, v_row = fp4_rows
@@ -2325,6 +2330,8 @@ def msa_sparse_attention_lse(
     ``lse [H, T]``; with `q_head_major`, q comes head-major, ``[H, T, D]``.
     """
     num_tokens, head_dim = selected.shape[0], q.shape[2]
+    scale_cache, row0 = msa_fp4.split_scales(scale_cache)
+    k_scale_row, v_scale_row = k_scale_row + row0, v_scale_row + row0
     msa_attention.check_cache(kv_cache, scale_cache)
     _check_rows(kv_cache, head_dim, head)
     q, selected, local_page, local_limit = _pad_tokens(
@@ -2411,8 +2418,9 @@ def msa_sparse_attention_lse_heads(
     """
     num_tokens, num_heads = selected.shape[:2]
     num_q_heads, head_dim = q.shape[0 if q_head_major else 1], q.shape[2]
+    scale_cache, row0 = msa_fp4.split_scales(scale_cache)
     msa_attention.check_cache(kv_cache, scale_cache)
-    if scale_cache is not None and scale_cache.shape[1] < 2 * num_heads:
+    if scale_cache is not None and scale_cache.shape[1] < row0 + 2 * num_heads:
         raise ValueError(
             f"scale pages {scale_cache.shape} miss K/V rows of {num_heads} heads."
         )
@@ -2437,7 +2445,9 @@ def msa_sparse_attention_lse_heads(
         pages_per_step=pages_per_step,
         interpret=interpret,
         scale_cache=scale_cache,
-        scale_rows=None if scale_cache is None else "head",
+        scale_rows=(
+            None if scale_cache is None else "head" if row0 == 0 else ("head", row0)
+        ),
         head_major=head_major,
         step_widths=step_widths,
         page_cache_slots=page_cache_slots,

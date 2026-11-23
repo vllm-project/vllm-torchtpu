@@ -75,6 +75,13 @@ def test_fused_matches_unfused_bitwise_max_free(kind):
     _run(kind, "5000,3000,700", "8", "0", "maxfree")
 
 
+def test_fused_matches_unfused_bitwise_shared_scale_page():
+    """TPU_MINIMAX_M3_KV4_SHARED_SCALES: with the layer's K/V scales at rows
+    6 / 7 of a scale page shared with three layers, the fused call matches
+    the unfused one over the layer's own page bit for bit."""
+    _run("fp4", "5000,3000,700", "8", "0", "shared")
+
+
 def test_fused_matches_unfused_bitwise_128_rows():
     """16 requests (the c16 128-row bucket): 16 tiles, the work list's
     bitonic unions (the unfused call's XLA work list)."""

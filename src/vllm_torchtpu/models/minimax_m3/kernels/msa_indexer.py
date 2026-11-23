@@ -1264,6 +1264,10 @@ def class_plan(
     elif msa_fp4.is_fp4(index_cache):
         if scale_cache is None or scale_row is None:
             raise ValueError("a 4-bit index cache needs scale_cache and scale_row")
+        if isinstance(scale_cache, msa_fp4.SharedScales):
+            raise NotImplementedError(
+                "shared scale pages need index pages with folded scales"
+            )
     else:
         check_page_dtype(index_cache.shape[2], index_cache.dtype)
         scale_row = None

@@ -742,7 +742,8 @@ def _exchange_pages(
             direct=direct,
         )
     # Destination rank d = h * replicas + j gets part j of head h.
-    sc = scale_cache[pages][:, : 2 * heads]  # K/V rows of every head
+    scale_cache, row0 = msa_fp4.split_scales(scale_cache)
+    sc = scale_cache[pages][:, row0 : row0 + 2 * heads]  # K/V rows of every head
     sc = sc.reshape(replicas, part, heads, 2, sc.shape[-1])
     # [dcp, part * 2, lanes]: a [.., 2, lanes] block pads its (8, 128) tiles
     # four times over.

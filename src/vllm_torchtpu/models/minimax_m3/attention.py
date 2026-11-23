@@ -36,6 +36,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
@@ -352,15 +353,32 @@ class MiniMaxM3SparseAttention(nn.Module):
             "int4" if self.fp4 else "fp8" if dtype.itemsize == 1 else "bf16"
         ]
         self.scale_cache = None
+        # First K/V scale row of this layer in its scale page (> 0: a page
+        # shared with the layers before it, TPU_MINIMAX_M3_KV4_SHARED_SCALES).
+        self.scale_row0 = 0
         if self.fp4:
             if self.index_shards > 1:
                 raise NotImplementedError(
                     "--kv-cache-dtype int4_per_token_head needs an unsharded "
                     f"index cache; got {self.index_shards} index shards."
                 )
-            self.scale_cache = MiniMaxM3ScaleCache(
-                self.dcp_kv_heads, prefix=f"{prefix}.attn.scale_cache"
-            )
+            share = self._scale_page_share(layer_id)
+            owner = None if layer_id is None else layer_id - layer_id % share
+            if share > 1 and owner != layer_id:
+                # The owner layer (built first) holds the page; keep a plain
+                # reference, not a submodule, so the page is allocated once.
+                key = prefix.replace(
+                    f".layers.{layer_id}.", f".layers.{owner}.", 1
+                ) + ".attn.scale_cache"
+                static = get_current_vllm_config().compilation_config
+                object.__setattr__(
+                    self, "scale_cache", static.static_forward_context[key]
+                )
+                self.scale_row0 = (layer_id - owner) * 2 * self.dcp_kv_heads
+            else:
+                self.scale_cache = MiniMaxM3ScaleCache(
+                    self.dcp_kv_heads, prefix=f"{prefix}.attn.scale_cache"
+                )
         msa_config = (
             scaling,
             sparse_cfg["sparse_topk_blocks"],
@@ -394,6 +412,8 @@ class MiniMaxM3SparseAttention(nn.Module):
                     f"{self.dcp_size}."
                 )
             reuse_kwargs = {"index_reuse": True} if plan is not None else {}
+            if self.scale_row0:
+                reuse_kwargs["scale_row0"] = self.scale_row0
             self.msa_op = get_msa_dcp_op(
                 *msa_config,
                 self.dcp_size,
@@ -434,6 +454,27 @@ class MiniMaxM3SparseAttention(nn.Module):
             eps,
             self.q_head_major,
         )
+
+    def _scale_page_share(self, layer_id: int | None) -> int:
+        """Layers per scale page: `msa_fp4.layers_per_scale_page` with
+        TPU_MINIMAX_M3_KV4_SHARED_SCALES under DCP (whose ops take the row
+        offset), else 1."""
+        if not envs.TPU_MINIMAX_M3_KV4_SHARED_SCALES or layer_id is None:
+            return 1
+        if self.dcp_size == 1:
+            logger.warning_once(
+                "TPU_MINIMAX_M3_KV4_SHARED_SCALES needs "
+                "--decode-context-parallel-size > 1; every layer keeps its "
+                "own scale page."
+            )
+            return 1
+        share = msa_fp4.layers_per_scale_page(self.dcp_kv_heads)
+        logger.info_once(
+            "MiniMax M3 4-bit caches: %d layers share each scale page "
+            "(TPU_MINIMAX_M3_KV4_SHARED_SCALES).",
+            share,
+        )
+        return share
 
     def score_bound(self) -> float:
         """``|q . k| * head_dim**-0.5`` bound from the loaded norms (see

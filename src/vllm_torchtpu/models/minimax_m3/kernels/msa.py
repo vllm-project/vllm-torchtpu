@@ -166,9 +166,11 @@ def write_fp4(
 
     Scale-page rows ``2h`` / ``2h + 1`` hold the K / V scales of head ``h``;
     the index-key scales are folded into the index pages' last word row
-    (`msa_fp4.scales_in_page`).
+    (`msa_fp4.scales_in_page`). A `msa_fp4.SharedScales` view writes rows
+    ``row0 + 2h`` / ``row0 + 2h + 1`` and comes back as a view.
     """
     num_tokens, num_heads, _ = k.shape
+    scale_pages, row0 = msa_fp4.split_scales(scale_cache)
     k_nib, k_scale = msa_fp4.quantize(msa_fp4.rotate_keys(k))
     v_nib, v_scale = msa_fp4.quantize(msa_fp4.rotate_keys(v))
     i_nib, i_scale = msa_fp4.quantize(msa_fp4.rotate_keys(index_k))
@@ -178,14 +180,14 @@ def write_fp4(
         [
             msa_write.Rows(kv_cache, kv_rows, 4),
             msa_write.Rows(index_cache, i_nib, 4, i_scale),
-            msa_write.SlotValues(scale_cache, scales),
+            msa_write.SlotValues(scale_pages, scales, row0),
         ],
         pages,
         pos,
         max_num_seqs=max_num_seqs,
         interpret=interpret,
     )
-    return kv_cache, index_cache, scale_cache
+    return kv_cache, index_cache, msa_fp4.with_row0(scale_cache, row0)
 
 
 def sparse_attention(
@@ -246,7 +248,8 @@ def _fp4_attention_kwargs(scale_cache: jax.Array | None) -> dict:
     head per call, its K / V scales in scale-page rows 0 / 1."""
     if scale_cache is None:
         return {}
-    return dict(scale_cache=scale_cache, k_scale_row=0, v_scale_row=1)
+    pages, row0 = msa_fp4.split_scales(scale_cache)  # row0: a shared page's
+    return dict(scale_cache=pages, k_scale_row=row0, v_scale_row=row0 + 1)
 
 
 def _select_and_attend(

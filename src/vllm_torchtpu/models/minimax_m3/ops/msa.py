@@ -450,6 +450,21 @@ def _rotate_heads(x: torch.Tensor, hadamard: torch.Tensor) -> torch.Tensor:
     return torch.matmul(x, hadamard) * (1.0 / x.shape[-1])
 
 
+def _at_scale_row(fn: Callable[..., Any], arg: int, row0: int) -> Callable[..., Any]:
+    """`fn` with its positional argument `arg`, a scale page array, viewed at
+    a shared page's row `row0` (`msa_fp4.SharedScales`,
+    TPU_MINIMAX_M3_KV4_SHARED_SCALES); `fn` itself at row 0."""
+    if not row0:
+        return fn
+
+    def at_row(*args, **kwargs):
+        args = list(args)
+        args[arg] = msa_fp4.with_row0(args[arg], row0)
+        return fn(*args, **kwargs)
+
+    return at_row
+
+
 def gather_query_heads(q: torch.Tensor, group: Any) -> torch.Tensor:
     """The DCP group's query heads ``[T, dcp * q_heads, D]``, gathered as
     they leave the rope: any op on `q` before the gather (a head-major
@@ -584,6 +599,7 @@ def get_msa_dcp_op(
     fp4: bool = False,
     decode_rows: int = 1,
     index_reuse: bool = False,
+    scale_row0: int = 0,
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_op` for a KV head's context split over ``dcp`` ranks
     (`kernels.msa_dcp`).
@@ -602,7 +618,9 @@ def get_msa_dcp_op(
     longer requests may attend head-parallel (`kernels.msa_dcp_heads`).
 
     With `fp4` (4-bit caches, one KV head per rank) the op also takes and
-    updates the layer's ``scale_cache``.
+    updates the layer's ``scale_cache``; ``scale_row0`` > 0: the layer's K/V
+    scale rows start there in a scale page it shares with other layers
+    (TPU_MINIMAX_M3_KV4_SHARED_SCALES).
 
     The returned op takes this rank's DCP rank as an ``int32[1]`` device
     tensor (``dcp_rank``, a module buffer of the caller), not a Python int:
@@ -640,7 +658,10 @@ def get_msa_dcp_op(
             kv_head_replicas,
             decode_rows,
             index_reuse,
+            scale_row0,
         )
+    if scale_row0:
+        raise ValueError("shared scale pages need 4-bit caches")
 
     def _score_jax(
         k: jax.Array,
@@ -906,7 +927,9 @@ def _index_reuse_env() -> str:
     return f"{index_reuse.ENV}={envs.TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE!r}"
 
 
-def _get_msa_dcp_write_op(dcp: int, suffix: str, fp4: bool) -> Callable[..., Any]:
+def _get_msa_dcp_write_op(
+    dcp: int, suffix: str, fp4: bool, scale_row0: int = 0
+) -> Callable[..., Any]:
     """A Shared layer's writes of MSA index reuse (`msa_dcp.msa_write_dcp`:
     the score op's writes alone, the same bytes). With `fp4` it also takes
     and updates the scale cache and rotates this rank's queries, as the
@@ -949,7 +972,7 @@ def _get_msa_dcp_write_op(dcp: int, suffix: str, fp4: bool) -> Callable[..., Any
         dcp_rank: jax.Array,
         q: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        return *msa_dcp.msa_write_dcp(
+        kv_cache, index_cache, scale_cache = msa_dcp.msa_write_dcp(
             k,
             v,
             index_k,
@@ -960,8 +983,14 @@ def _get_msa_dcp_write_op(dcp: int, suffix: str, fp4: bool) -> Callable[..., Any
             query_start_loc,
             rank=dcp_rank,
             dcp=dcp,
-            scale_cache=scale_cache,
-        ), msa_fp4.rotate_queries(q)
+            scale_cache=msa_fp4.with_row0(scale_cache, scale_row0),
+        )
+        return (
+            kv_cache,
+            index_cache,
+            msa_fp4.pages_of(scale_cache),
+            msa_fp4.rotate_queries(q),
+        )
 
     if fp4:
         op = pallas.jax_op(
@@ -1001,6 +1030,7 @@ def _get_msa_dcp_fp4_op(
     kv_head_replicas: int,
     decode_rows: int,
     index_reuse: bool = False,
+    scale_row0: int = 0,
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_dcp_op` for 4-bit caches."""
     kv_heads = max(1, dcp // kv_head_replicas)
@@ -1025,24 +1055,33 @@ def _get_msa_dcp_fp4_op(
         # group's heads: inside a JAX op the rotation leaves the rope
         # fusions that produce q alone (a torch matmul on q re-laid them
         # out, +0.3 ms per layer at 8K tokens, j-c5c4bdfc).
-        return *msa_dcp.msa_write_and_candidates_dcp(
-            k,
-            v,
-            index_q,
-            index_k,
+        kv_cache, index_cache, scale_cache, packed = (
+            msa_dcp.msa_write_and_candidates_dcp(
+                k,
+                v,
+                index_q,
+                index_k,
+                kv_cache,
+                index_cache,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                topk=topk,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                rank=dcp_rank,
+                dcp=dcp,
+                scale_cache=msa_fp4.with_row0(scale_cache, scale_row0),
+            )
+        )
+        return (
             kv_cache,
             index_cache,
-            seq_lens,
-            block_tables,
-            query_start_loc,
-            request_distribution,
-            topk=topk,
-            init_blocks=init_blocks,
-            local_blocks=local_blocks,
-            rank=dcp_rank,
-            dcp=dcp,
-            scale_cache=scale_cache,
-        ), msa_fp4.rotate_queries(q)
+            msa_fp4.pages_of(scale_cache),
+            packed,
+            msa_fp4.rotate_queries(q),
+        )
 
     def _attend_jax(
         q: jax.Array,
@@ -1065,7 +1104,7 @@ def _get_msa_dcp_fp4_op(
             topk=topk,
             rank=dcp_rank,
             dcp=dcp,
-            scale_cache=scale_cache,
+            scale_cache=msa_fp4.with_row0(scale_cache, scale_row0),
         )
 
     def _attend_rot_jax(
@@ -1104,6 +1143,8 @@ def _get_msa_dcp_fp4_op(
     suffix = (
         f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_dcp{dcp}_g{kv_heads}"
     ).replace(".", "p")
+    if scale_row0:  # one op set per row of a shared scale page
+        suffix += f"_sr{scale_row0}"
     early = msa_dcp_heads.early_q_gather_enabled()
     attend_rot_op = None
     if early and kv_heads == 1:
@@ -1147,11 +1188,21 @@ def _get_msa_dcp_fp4_op(
 
     score_op.register_fake(_score_fake)
     attend_merge_op = (
-        _get_msa_dcp_attend_merge_op(sm_scale, topk, dcp, True, suffix)
+        _get_msa_dcp_attend_merge_op(
+            sm_scale, topk, dcp, True, suffix, scale_row0=scale_row0
+        )
         if kv_heads == 1
         else None
     )
-    fused_max, fused_op = _fused_decode_op(sm_scale, topk, dcp, kv_heads, True, suffix)
+    fused_max, fused_op = _fused_decode_op(
+        sm_scale,
+        topk,
+        dcp,
+        kv_heads,
+        True,
+        suffix,
+        **({"scale_row0": scale_row0} if scale_row0 else {}),
+    )
     attend_op = None
     if kv_heads == 1 and _packed_collectives_enabled():
         attend_op = pallas.jax_op(
@@ -1160,7 +1211,13 @@ def _get_msa_dcp_fp4_op(
         attend_op.register_fake(_head_major_attend_fake)
     heads_op = (
         _get_msa_dcp_heads_op(
-            sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix
+            sm_scale,
+            topk,
+            dcp,
+            kv_head_replicas,
+            decode_rows,
+            suffix,
+            scale_row0=scale_row0,
         )
         if kv_heads > 1
         else None
@@ -1168,10 +1225,24 @@ def _get_msa_dcp_fp4_op(
     early_q_op = early_dec_op = None
     if kv_heads > 1 and early:
         early_q_op = _get_msa_dcp_heads_op(
-            sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix, q_gathered=True
+            sm_scale,
+            topk,
+            dcp,
+            kv_head_replicas,
+            decode_rows,
+            suffix,
+            q_gathered=True,
+            scale_row0=scale_row0,
         )
         early_dec_op = _get_msa_dcp_heads_op(
-            sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix, q_dec=True
+            sm_scale,
+            topk,
+            dcp,
+            kv_head_replicas,
+            decode_rows,
+            suffix,
+            q_dec=True,
+            scale_row0=scale_row0,
         )
     # MSA index reuse. One KV head (DCP 2): attend+merge, whose Full program
     # also returns the merged selection and whose Shared program takes it.
@@ -1190,13 +1261,15 @@ def _get_msa_dcp_fp4_op(
     )
     write_op = am_select_op = am_given_op = None
     if reuse:
-        write_op = _get_msa_dcp_write_op(dcp, suffix, True)
+        write_op = _get_msa_dcp_write_op(
+            dcp, suffix, True, **({"scale_row0": scale_row0} if scale_row0 else {})
+        )
     if reuse and kv_heads == 1:
         am_select_op = _get_msa_dcp_attend_merge_op(
-            sm_scale, topk, dcp, True, suffix, "return"
+            sm_scale, topk, dcp, True, suffix, "return", scale_row0=scale_row0
         )
         am_given_op = _get_msa_dcp_attend_merge_op(
-            sm_scale, topk, dcp, True, suffix, "given"
+            sm_scale, topk, dcp, True, suffix, "given", scale_row0=scale_row0
         )
 
     def op(
@@ -1420,7 +1493,13 @@ def _get_msa_dcp_fp4_op(
 
 
 def _fused_decode_op(
-    sm_scale: float, topk: int, dcp: int, kv_heads: int, fp4: bool, suffix: str
+    sm_scale: float,
+    topk: int,
+    dcp: int,
+    kv_heads: int,
+    fp4: bool,
+    suffix: str,
+    scale_row0: int = 0,
 ) -> tuple[int, Callable[..., Any] | None]:
     """TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS: ``(max tokens, op)`` of
     the fused attention call (`msa_dcp_fused`) that small decode steps of a
@@ -1437,7 +1516,7 @@ def _fused_decode_op(
         fused_max,
     )
     return fused_max, _get_msa_dcp_attend_merge_op(
-        sm_scale, topk, dcp, fp4, suffix, fused=True
+        sm_scale, topk, dcp, fp4, suffix, fused=True, scale_row0=scale_row0
     )
 
 
@@ -1449,6 +1528,7 @@ def _get_msa_dcp_attend_merge_op(
     suffix: str,
     selection: str = "candidates",
     fused: bool = False,
+    scale_row0: int = 0,
 ) -> Callable[..., Any]:
     """The attention half of the DCP op over one KV head, as one SPMD op over
     the DCP mesh (`msa_dcp.attend_and_merge`): this rank's head-major
@@ -1478,7 +1558,13 @@ def _get_msa_dcp_attend_merge_op(
     specs = (sharded,) * 4 + (replicated,) * 3 + ((sharded, replicated) if fp4 else ())
     body = jax.shard_map(
         functools.partial(
-            msa_dcp_fused.fused_attend_and_merge if fused else msa_dcp.attend_and_merge,
+            _at_scale_row(  # scale_cache: argument 7
+                msa_dcp_fused.fused_attend_and_merge
+                if fused
+                else msa_dcp.attend_and_merge,
+                7,
+                scale_row0,
+            ),
             axis=DCP_AXIS_NAME,
             dcp=dcp,
             sm_scale=sm_scale,
@@ -1611,6 +1697,7 @@ def _get_msa_dcp_heads_op(
     suffix: str,
     q_gathered: bool = False,
     q_dec: bool = False,
+    scale_row0: int = 0,
 ) -> Callable[..., torch.Tensor]:
     """The attention half of the 4-bit DCP op over several KV heads, as one
     SPMD op over the DCP mesh (`msa_dcp_heads.attend_and_merge`): its
@@ -1634,7 +1721,7 @@ def _get_msa_dcp_heads_op(
 
     body = jax.shard_map(
         functools.partial(
-            fn,
+            _at_scale_row(fn, 3, scale_row0),  # scale_cache: argument 3
             axis=DCP_AXIS_NAME,
             dcp=dcp,
             kv_head_replicas=kv_head_replicas,

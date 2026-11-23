@@ -34,6 +34,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import tight_vmem
+from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
     check_page_dtype,
     slot_ids,
@@ -624,6 +625,8 @@ def msa_sparse_attention(
       ``[T, H, D]`` outputs; padding tokens get zeros.
     """
     num_tokens, _, head_dim = q.shape
+    scale_cache, row0 = msa_fp4.split_scales(scale_cache)
+    k_scale_row, v_scale_row = k_scale_row + row0, v_scale_row + row0
     check_cache(kv_cache, scale_cache)
     if kv_cache.shape[3] != 2 * head_dim:
         raise ValueError(
