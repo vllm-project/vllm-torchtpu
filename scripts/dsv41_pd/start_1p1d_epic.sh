@@ -20,7 +20,8 @@ cd "${CODE_DIR}"
 export PYTHONPATH="${CODE_DIR}/src${PYTHONPATH:+:$PYTHONPATH}"
 # Rocky/RHEL 宿主（glibc 2.34）：venv 里自编的 tpu_sync _tpu_raiden_torch_2_13_0.so 是 Ubuntu 24.04 编的（要 glibc 2.38），
 # 换用 overlay-el9 里在 Rocky 上重编的版本（src/build-tpusync-1031-el9.sh）。PYTHONPATH 排在 site-packages 前面。
-if [[ -f /etc/redhat-release && -d /zzlfs/temu/overlay-el9/tpu_sync ]]; then
+# USE_EL9_OVERLAY=1 强制使用（如 GKE 里的 ubuntu:22.04 容器，glibc 2.35 同样跑不了 Ubuntu 24.04 编的 .so）。
+if [[ ( "${USE_EL9_OVERLAY:-0}" == "1" || -f /etc/redhat-release ) && -d /zzlfs/temu/overlay-el9/tpu_sync ]]; then
   export PYTHONPATH="${PYTHONPATH}:/zzlfs/temu/overlay-el9"
 fi
 ulimit -c 0
@@ -85,12 +86,13 @@ export TPU_KV_TRANSFER_PORT=9100
 export TPU_SIDE_CHANNEL_PORT=9600
 export TPU_RAIDEN_PREFIX_AWARE_LOAD="${TPU_RAIDEN_PREFIX_AWARE_LOAD:-1}"
 if [[ "${ROLE}" == "prefill" ]]; then
-  export TPU_KV_TRANSFER_NAMESPACE="gke_prefill" TPU_RAIDEN_ENGINE_ID="gke-prefill-engine" TPU_RAIDEN_JOB_NAME="prefill"
+  # 多个 P（2P1D）时每个 P 要有不同的 engine id / job name，由调用方覆盖（gke-script/pod_start.sh）。
+  export TPU_KV_TRANSFER_NAMESPACE="${TPU_KV_TRANSFER_NAMESPACE:-gke_prefill}" TPU_RAIDEN_ENGINE_ID="${TPU_RAIDEN_ENGINE_ID:-gke-prefill-engine}" TPU_RAIDEN_JOB_NAME="${TPU_RAIDEN_JOB_NAME:-prefill}"
   export TPU_RAIDEN_RESHARD_PORT_BASE=27000 TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100
   KV_ROLE="kv_producer"; SERVER_PORT=8100
   COMPILE_SIZES="${PREFILL_COMPILE_SIZES:-[128,256,${MAX_BATCHED_TOKENS:-2048}]}"
 elif [[ "${ROLE}" == "decode" ]]; then
-  export TPU_KV_TRANSFER_NAMESPACE="gke_decode" TPU_RAIDEN_ENGINE_ID="gke-decode-engine" TPU_RAIDEN_JOB_NAME="decode"
+  export TPU_KV_TRANSFER_NAMESPACE="${TPU_KV_TRANSFER_NAMESPACE:-gke_decode}" TPU_RAIDEN_ENGINE_ID="${TPU_RAIDEN_ENGINE_ID:-gke-decode-engine}" TPU_RAIDEN_JOB_NAME="${TPU_RAIDEN_JOB_NAME:-decode}"
   export TPU_RAIDEN_RESHARD_PORT_BASE=28000 TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=28100
   KV_ROLE="kv_consumer"; SERVER_PORT=8200
   # 16：单请求 decode（1 + K5 = 6 行）；96：16 请求的 verify；128/2048：D 本地 prefill / 回退重算

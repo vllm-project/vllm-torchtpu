@@ -434,6 +434,12 @@ async def lifespan(app: FastAPI):
             }
         )
 
+    if _SESSION_AFFINITY_DP > 1 and _PREFILL_INSTANCES != len(app.state.prefill_clients):
+        raise ValueError(
+            f"PROXY_PREFILL_INSTANCES={_PREFILL_INSTANCES} but "
+            f"{len(app.state.prefill_clients)} prefill instances were given"
+        )
+
     # Initialize round-robin iterators
     app.state.prefill_iterator = itertools.cycle(range(len(app.state.prefill_clients)))
     app.state.decode_iterator = itertools.cycle(range(len(app.state.decode_clients)))
@@ -765,6 +771,20 @@ _HIT_DIAG = (
 )
 
 _SESSION_AFFINITY_DP = int(os.environ.get("PROXY_SESSION_AFFINITY_DP", "0"))
+# Number of prefill instances (xPyD with x > 1). The prefix / session routers
+# then pick among _SESSION_AFFINITY_DP * _PREFILL_INSTANCES global P ranks, so
+# a conversation sticks to one rank of one P (prefix caches are per instance
+# and per rank). Global ranks interleave instances (g -> instance g % n, DP
+# rank g // n): the routers break load ties toward the lowest rank, and with
+# blocked numbering (instance g // dp) the first P took 82% of an AgentX c512
+# run. Must equal the number of --prefiller-hosts (checked at startup).
+_PREFILL_INSTANCES = int(os.environ.get("PROXY_PREFILL_INSTANCES", "1"))
+
+
+def _split_prefill_rank(global_rank: int) -> tuple[int, int]:
+    """Global P rank -> (prefill instance index, DP rank within it)."""
+    local, instance = divmod(global_rank, _PREFILL_INSTANCES)
+    return instance, local
 
 
 def _dumps(obj: Any) -> bytes:
@@ -958,7 +978,7 @@ class _PrefixRouter:
 
 _PREFIX_ROUTER = (
     _PrefixRouter(
-        _SESSION_AFFINITY_DP,
+        _SESSION_AFFINITY_DP * _PREFILL_INSTANCES,
         int(os.environ.get("PROXY_PREFIX_RANK_TOKENS", "8874043")),
         float(os.environ.get("PROXY_PREFIX_MIGRATE_FACTOR", "0")),
     )
@@ -1044,7 +1064,7 @@ _DECODE_ROUTER = (
 
 _SESSION_ROUTER = (
     _SessionRouter(
-        _SESSION_AFFINITY_DP,
+        _SESSION_AFFINITY_DP * _PREFILL_INSTANCES,
         balance=os.environ.get("PROXY_AFFINITY_BALANCE", "1") != "0",
         migrate_factor=float(os.environ.get("PROXY_AFFINITY_MIGRATE_FACTOR", "3")),
     )
@@ -1077,15 +1097,16 @@ async def _handle_completions(api: str, request: Request):
         if "X-data-parallel-rank" not in forwarded and _PREFIX_ROUTER is not None:
             routed = _PREFIX_ROUTER.assign(req_data)
             if routed is not None:
-                forwarded["X-data-parallel-rank"] = str(routed[0])
+                forwarded["X-data-parallel-rank"] = str(_split_prefill_rank(routed[0])[1])
                 session_key = _session_key(req_data)
         elif "X-data-parallel-rank" not in forwarded and _SESSION_ROUTER is not None:
             if (session_key := _session_key(req_data)) is not None:
                 prompt_tokens = len(await request.body()) // 4
                 routed = _SESSION_ROUTER.assign(session_key, prompt_tokens)
-                forwarded["X-data-parallel-rank"] = str(routed[0])
+                forwarded["X-data-parallel-rank"] = str(_split_prefill_rank(routed[0])[1])
         route_log = (
-            f" rank={routed[0]} work={routed[1]} migrations={router.migrations}"
+            f" rank={routed[0]} p_inst={_split_prefill_rank(routed[0])[0]}"
+            f" work={routed[1]} migrations={router.migrations}"
             if routed is not None
             else ""
         )
@@ -1095,8 +1116,13 @@ async def _handle_completions(api: str, request: Request):
             flush=True,
         )
 
-        # Get the next prefill client in round-robin fashion
-        prefill_client_info = get_next_client(request.app, "prefill")
+        # Routed requests go to the routed rank's instance; others round-robin.
+        if routed is not None:
+            prefill_client_info = request.app.state.prefill_clients[
+                _split_prefill_rank(routed[0])[0]
+            ]
+        else:
+            prefill_client_info = get_next_client(request.app, "prefill")
         render_endpoint = _render_endpoint_for_api(api)
         if render_endpoint is not None and isinstance(req_data.get("prompt"), str):
             t_render = time.perf_counter()
