@@ -439,6 +439,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MAMBA_RD_REUSE: bool = False
     VLLM_TPU_KV_CONNECTOR_SKIP_NOOP: bool = False
     VLLM_TPU_PREP_FOLD_PRECHECK_MEMO: bool = False
+    VLLM_TPU_PREP_LAZY_INPUT_IDS: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
     VLLM_TPU_MK_WHOLE_DIRECT_EXEC: bool = False
     VLLM_TPU_ENVS_FREEZE: bool = False
@@ -2808,6 +2809,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_PREP_FOLD_PRECHECK_MEMO": env_bool(
         "VLLM_TPU_PREP_FOLD_PRECHECK_MEMO"
     ),
+    # With VLLM_TPU_PREFWD_PREP_FOLD: upload a chunk's input ids only when
+    # something reads them, i.e. not on a step that folds with the 1:1 slice
+    # (its ids come from the previous step's source); the scatter fold and
+    # every unfolded step upload the same host slice as before
+    # (tpu_runner._materialize_input_ids).
+    "VLLM_TPU_PREP_LAZY_INPUT_IDS": env_bool("VLLM_TPU_PREP_LAZY_INPUT_IDS"),
     # Freshly AOT-compiled models skip the per-call Dynamo guard check when
     # vLLM does not evaluate guards (as it already does for cached artifacts).
     "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),

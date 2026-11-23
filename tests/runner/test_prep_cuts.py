@@ -242,6 +242,7 @@ def test_registered_and_out_of_compile_key(monkeypatch):
         "VLLM_TPU_MAMBA_RD_REUSE",
         "VLLM_TPU_KV_CONNECTOR_SKIP_NOOP",
         "VLLM_TPU_PREP_FOLD_PRECHECK_MEMO",
+        "VLLM_TPU_PREP_LAZY_INPUT_IDS",
     ):
         assert name in envs.environment_variables
         assert name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
@@ -504,3 +505,106 @@ def test_fold_precheck_memo_negative_control(monkeypatch):
     monkeypatch.setattr(tpu_runner.TPUModelRunner, "_fold_subst_memo", broken)
     with pytest.raises(AssertionError, match="MISMATCH"):
         run_pair(monkeypatch, F_FLAG, seed=0)
+
+
+# --------------------------------------------------------------------------
+# C. VLLM_TPU_PREP_LAZY_INPUT_IDS
+# --------------------------------------------------------------------------
+
+C_FLAG = {"VLLM_TPU_PREP_LAZY_INPUT_IDS": "1"}
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_lazy_input_ids_bitwise(monkeypatch, seed):
+    _check_coverage(run_pair(monkeypatch, C_FLAG, seed))
+
+
+def test_lazy_input_ids_uploads_only_when_read(monkeypatch):
+    """1:1 folds upload no input ids (runner.input_ids stays unset: nothing
+    reads it); the scatter fold and every unfolded step upload exactly once,
+    the same values the flag-off step uploads."""
+    monkeypatch.setattr(tpu_runner, "_prep_fold_compiled", _fake_fold)
+    monkeypatch.setattr(tpu_runner, "_prep_fold_key", lambda args, static: _WARM)
+    uploads = []
+    real = tpu_runner.TPUModelRunner._materialize_input_ids
+
+    def spy(self):
+        before = self.input_ids
+        out = real(self)
+        uploads.append(before is None)
+        return out
+
+    monkeypatch.setattr(tpu_runner.TPUModelRunner, "_materialize_input_ids", spy)
+    wl = Workload(11, 4, k=K, max_model_len=8192, churn=0.1, prefill=0.08)
+    on = make_fold_runner()
+    off = make_fold_runner()
+    kinds = set()
+    for step in range(50):
+        if step:
+            wl.step()
+        num_decode, num_windowed = wl.segments()
+        apply(wl, on, step)
+        apply(wl, off, step)
+        so = wl.scheduler_output()
+        warm = step % 6 != 5
+        uploads.clear()
+        with env(steady=True, extra=FOLD_ENV):
+            ref = run_step(off, so, num_decode, num_windowed, warm)
+        with env(steady=True, extra={**FOLD_ENV, **C_FLAG}):
+            out = run_step(on, so, num_decode, num_windowed, warm)
+        assert_step_equal(ref, out, step)
+        if out["folded"] is None:
+            kind = "unfolded"
+            assert torch.equal(on.input_ids, off.input_ids), step
+        elif len(out["fold_calls"][0][0]) == 9:
+            kind = "one_to_one"
+            assert on.input_ids is None, step
+        else:
+            kind = "scatter"
+            assert torch.equal(out["fold_calls"][0][0][9], off.input_ids), step
+        kinds.add(kind)
+        assert uploads == ([] if kind == "one_to_one" else [True]), (step, kind)
+    assert kinds == {"unfolded", "one_to_one", "scatter"}
+
+
+def test_lazy_input_ids_off_paths_unchanged(monkeypatch):
+    """Without PREFWD_PREP_FOLD the flag defers nothing."""
+    monkeypatch.setattr(tpu_runner, "_prep_fold_compiled", _fake_fold)
+    r = make_fold_runner()
+    wl = Workload(2, 4, k=K, max_model_len=8192)
+    for step in range(3):
+        if step:
+            wl.step()
+        num_decode, num_windowed = wl.segments()
+        apply(wl, r, step)
+        extra = {**FOLD_ENV, **C_FLAG, "VLLM_TPU_PREFWD_PREP_FOLD": "0"}
+        with env(steady=True, extra=extra):
+            run_step(r, wl.scheduler_output(), num_decode, num_windowed)
+        assert isinstance(r.input_ids, torch.Tensor)
+
+
+def test_lazy_input_ids_negative_control(monkeypatch):
+    """A broken deferred upload (reading the host buffer at the wrong place)
+    is caught."""
+
+    def broken(self):
+        if self.input_ids is None:
+            sl = self._deferred_input_ids_slice
+            self.input_ids = self.input_ids_cpu[sl.start + 1 : sl.stop + 1].clone()
+        return self.input_ids
+
+    monkeypatch.setattr(tpu_runner.TPUModelRunner, "_materialize_input_ids", broken)
+    with pytest.raises(AssertionError, match="MISMATCH"):
+        run_pair(monkeypatch, C_FLAG, seed=0)
+
+
+# --------------------------------------------------------------------------
+# All four together.
+# --------------------------------------------------------------------------
+
+ALL_FLAGS = {**C_FLAG, **D_FLAG, **F_FLAG}
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_all_cuts_stacked_bitwise(monkeypatch, seed):
+    _check_coverage(run_pair(monkeypatch, ALL_FLAGS, seed, steps=80))
