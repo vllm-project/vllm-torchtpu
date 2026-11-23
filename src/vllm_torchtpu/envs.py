@@ -89,7 +89,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_A2A_OPROJ: str = "off"
     TPU_MINIMAX_M3_SP_A2A_E4M3: bool = False
     TPU_MINIMAX_M3_SP_QRS: bool = False
-    TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS: int = 4096
+    TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS: int = 2048
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -892,10 +892,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of XLA's reduce-scatter; smaller ones keep XLA's. Needs the
     # Pallas all-reduce armed (TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES > 0) on a
     # rank-ordered tpu7x 2x2x1 TP8 group. Changes numerics (~0.7% rel L2 per
-    # reduce-scatter). Off: the reduce-scatters are unchanged.
+    # reduce-scatter). Off: the reduce-scatters are unchanged. exos
+    # microbench (hidden 6144): 0.34 vs 0.90 ms at 8192 rows, 0.15 vs 0.28 at
+    # 2048, slower than XLA at 1024: hence the 2048 default minimum.
     "TPU_MINIMAX_M3_SP_QRS": env_bool("TPU_MINIMAX_M3_SP_QRS", default=False),
     "TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS": env_nonnegative_int(
-        "TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS", 4096
+        "TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS", 2048
     ),
     # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
     # permutation-free dense-expert kernel (kernels/experimental/

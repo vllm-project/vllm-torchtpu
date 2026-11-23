@@ -62,7 +62,7 @@ _SP_ENV = {
     "TPU_MINIMAX_M3_SP_A2A_OPROJ": "off",
     "TPU_MINIMAX_M3_SP_A2A_E4M3": False,
     "TPU_MINIMAX_M3_SP_QRS": False,
-    "TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS": 4096,
+    "TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS": 2048,
 }
 # The production config this port targets.
 _TARGET = dict(
