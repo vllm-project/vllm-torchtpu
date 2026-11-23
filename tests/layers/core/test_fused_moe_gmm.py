@@ -1406,6 +1406,7 @@ def test_prepare_routed_counting_sort_env_gate_restores_sorts(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=threshold,
         skip_padded_tokens=False,
+        onehot_sortfree=False,
     )
     on_out = prepare_routed_gmm_inputs(
         hidden_states, topk_indices, topk_weights, **common

@@ -37,7 +37,6 @@ and uses our native TorchTPU + Pallas kernels.
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
     UnquantizedFusedMoEMethod,
@@ -50,10 +49,14 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.utils import replace_parameter
 
+from vllm_torchtpu import tpu_info
+from vllm_torchtpu.kernels.quantized_matmul import decode_gemv
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -63,6 +66,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    decode_matmul_nt,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -103,12 +107,10 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer = cast("TpuLinear", layer)
-        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
-            # A consumer reads this weight raw and expects [n_out, n_in];
-            # `apply` below falls back to the stock contraction.
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False) or getattr(
+            layer, WEIGHT_FLIPPED_ATTR, False
+        ):
             return
-        if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
-            return  # already flipped; reload paths re-enter this hook
         weight = layer.weight.data
         if weight.dim() != 2:
             # Not a plain dense weight; leave the stock behaviour alone.
@@ -144,6 +146,46 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         orig_out_shape = (*x.shape[:-1], weight.shape[-1])
         x_2d = x.reshape(-1, x.shape[-1])
         return torch.addmm(bias, x_2d, weight).reshape(orig_out_shape)
+
+
+DECODE_LM_HEAD_MAX_ROWS = 64
+
+
+class VllmDecodeLMHeadMethod(UnquantizedEmbeddingMethod):
+    """Unquantized LM head streaming bf16 `[vocab_shard, hidden]` weights on decode."""
+
+    def __init__(self, max_rows: int = DECODE_LM_HEAD_MAX_ROWS):
+        super().__init__()
+        self.max_rows = max_rows
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        weight = layer.weight
+        if not isinstance(weight, torch.Tensor):
+            return super().apply(layer, x, bias)
+        rows = x.shape[0] if x.dim() == 2 else 0
+        if (
+            bias is None
+            and 0 < rows <= self.max_rows
+            and x.dtype == weight.dtype
+            and decode_gemv.supports_nt(
+                rows, weight.shape[1], weight.shape[0], weight.dtype.itemsize
+            )
+        ):
+            return decode_matmul_nt(x, weight)
+        return super().apply(layer, x, bias)
+
+
+def decode_lm_head_method(
+    layer: torch.nn.Module,
+) -> VllmDecodeLMHeadMethod | None:
+    if isinstance(layer, ParallelLMHead) and tpu_info.v7x_model_fastpaths_enabled():
+        return VllmDecodeLMHeadMethod(DECODE_LM_HEAD_MAX_ROWS)
+    return None
 
 
 @register_quantization_config(get_tpu_quant_method(UNQUANTIZED))
@@ -218,15 +260,11 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
                 # forward pass is (m, k) @ (k, n) rather than vLLM's
                 # (m, k) @ (n, k).T.
                 return VllmUnquantizedLinearMethod()
-            return None
+            return decode_lm_head_method(layer)
 
         if isinstance(layer, RoutedExperts):
-            # For MoE layers, use our custom TPU implementation
-            moe_config = self.get_moe_config(layer)
-            return VllmUnquantizedFusedMoEMethod(moe_config)
+            return VllmUnquantizedFusedMoEMethod(self.get_moe_config(layer))
 
-        if isinstance(layer, Attention):
-            return None
         return None
 
 

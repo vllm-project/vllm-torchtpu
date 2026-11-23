@@ -11,19 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 from collections.abc import Callable
 from threading import Lock
 
 import jax
 import jax.numpy as jnp
 import torch
-from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.kernels.gelu_quant import (
+    gelu_tanh_and_mul_quantize as _gelu_tanh_and_mul_quantize_kernel,
+)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.kernels.quantized_matmul import decode_gemv
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    quantize_tensor,
+    xla_prequantized_matmul,
+    xla_quantized_matmul,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -39,17 +47,6 @@ logger = init_logger(__name__)
 # is made -- and it moves with the code if a layer is renamed, which a
 # name-matched list would not.
 KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
-
-# Idempotence guard, set by the linear method once it has flipped a weight.
-# Not how `apply` picks its contraction -- that keys off the marker above.
-#
-# It has to be a stored flag rather than a property of the weight: the flip
-# cannot be recovered from the shape (`o_proj` and friends are square in most
-# models), and encoding it in a Parameter subclass does not survive vLLM's
-# `replace_parameter`, which re-wraps by type. Meanwhile
-# `process_weights_after_loading` IS re-entered by vLLM's reload paths
-# (`dummy_loader`, `reload/layerwise`), where a second flip would transpose
-# back and silently corrupt the values.
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 
 
@@ -66,11 +63,30 @@ def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
     raise ValueError(f"Unsupported quantized dtype: {w_q_dtype}")
 
 
+def _use_decode_gemv(
+    rows: int, w_q: jax.Array, w_s: jax.Array, decode_gemv_max_rows: int
+) -> bool:
+    if not 0 < rows <= decode_gemv_max_rows:
+        return False
+    k, n = w_q.shape
+    use = decode_gemv.supports(rows, k, n, w_q.dtype, w_s.ndim)
+    logger.info_once(
+        "FP8 dense linear [%d, %d] -> [%d] on %d-row bucket: %s.",
+        rows,
+        k,
+        n,
+        rows,
+        "decode weight-streaming kernel" if use else "XLA",
+    )
+    return use
+
+
 def _quantized_matmul_jax(
     x: jax.Array,
     w_q: jax.Array,
     w_s: jax.Array,
     w8a16_max_rows: int = 0,
+    decode_gemv_max_rows: int = 0,
 ) -> jax.Array:
     """FP8 dense matmul on the canonical (k, n) weight layout.
 
@@ -121,10 +137,12 @@ def _quantized_matmul_jax(
         # compile cache.
         logger.info_once(
             "FP8 dense linears use W8A16 (bf16 activations) for the %d-row "
-            "token bucket (TPU_FP8_LINEAR_W8A16_MAX_ROWS=%d).",
+            "token bucket (w8a16_max_rows=%d).",
             rows,
             w8a16_max_rows,
         )
+    elif _use_decode_gemv(rows, w_q, w_s, decode_gemv_max_rows):
+        return decode_gemv.fp8_decode_matmul(x, w_q, w_s)
     return xla_quantized_matmul(x, w_q, w_s, quantize_activation=not use_w8a16)
 
 
@@ -148,8 +166,9 @@ def _get_quantized_matmul_op() -> Callable:
             w_q: torch.Tensor,
             w_s: torch.Tensor,
             w8a16_max_rows: int = 0,
+            decode_gemv_max_rows: int = 0,
         ):
-            del w_s, w8a16_max_rows
+            del w_s, w8a16_max_rows, decode_gemv_max_rows
             return torch.empty(
                 x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device
             )
@@ -164,6 +183,7 @@ def quantized_matmul(
     w_q: torch.Tensor,
     w_s: torch.Tensor,
     w8a16_max_rows: int = 0,
+    decode_gemv_max_rows: int = 0,
 ) -> torch.Tensor:
     """Torch entry point for the runtime FP8 dense-linear matmul.
 
@@ -181,25 +201,173 @@ def quantized_matmul(
 
     orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
-    out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s, w8a16_max_rows)
+    out_2d = _get_quantized_matmul_op()(
+        x_2d, w_q, w_s, w8a16_max_rows, decode_gemv_max_rows
+    )
     return out_2d.reshape(orig_out_shape)
+
+
+_ACTIVATION_QUANT_DTYPES = (
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+    torch.int8,
+)
+
+
+def _quantize_activation_jax(
+    x: jax.Array, *, quant_dtype: jnp.dtype
+) -> tuple[jax.Array, jax.Array]:
+    return quantize_tensor(x, quant_dtype)
+
+
+def _make_quantize_activation_op(quant_dtype: torch.dtype) -> Callable:
+    name = str(quant_dtype).removeprefix("torch.")
+    op = pallas.jax_op(
+        f"pallas::quantize_activation_{name}",
+        functools.partial(_quantize_activation_jax, quant_dtype=jnp.dtype(name)),
+    )
+
+    def _fake(x: torch.Tensor):
+        return (
+            torch.empty(x.shape, dtype=quant_dtype, device=x.device),
+            torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device),
+        )
+
+    op.register_fake(_fake)
+    return op
+
+
+_quantize_activation_ops = {
+    dtype: _make_quantize_activation_op(dtype) for dtype in _ACTIVATION_QUANT_DTYPES
+}
+
+
+def quantize_activation(
+    x: torch.Tensor, w_q: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize 2-D `x` per row identically to `quantized_matmul`."""
+    if x.dim() != 2:
+        raise ValueError(f"expected a 2-D activation, got {tuple(x.shape)}")
+    op = _quantize_activation_ops.get(w_q.dtype)
+    if op is None:
+        raise ValueError(f"no per-token activation quantization for {w_q.dtype}")
+    return op(x)
+
+
+def _prequantized_matmul_bf16_jax(
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    decode_gemv_max_rows: int = 0,
+) -> jax.Array:
+    if _use_decode_gemv(x_q.shape[0], w_q, w_s, decode_gemv_max_rows):
+        return decode_gemv.fp8_decode_prequantized_matmul(
+            x_q, x_scale, w_q, w_s, jnp.bfloat16
+        )
+    return xla_prequantized_matmul(x_q, x_scale, w_q, w_s, jnp.bfloat16)
+
+
+_prequantized_matmul_bf16_op = pallas.jax_op(
+    "pallas::prequantized_matmul_bf16", _prequantized_matmul_bf16_jax
+)
+
+
+def _fake_prequantized_matmul_bf16(x_q, x_scale, w_q, w_s, decode_gemv_max_rows=0):
+    del x_scale, w_s, decode_gemv_max_rows
+    return torch.empty(
+        x_q.shape[0], w_q.shape[-1], dtype=torch.bfloat16, device=x_q.device
+    )
+
+
+_prequantized_matmul_bf16_op.register_fake(_fake_prequantized_matmul_bf16)
+
+
+def prequantized_matmul(
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    decode_gemv_max_rows: int = 0,
+) -> torch.Tensor:
+    """Per-channel FP8 matmul on pre-quantized `(x_q, x_scale)` returning bf16."""
+    if w_s.dim() != 1:
+        raise ValueError(f"expected a per-channel weight scale, got {w_s.shape}")
+    if x_q.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Input hidden dim {x_q.shape[-1]} must match weight hidden dim "
+            f"{w_q.shape[0]}."
+        )
+    return _prequantized_matmul_bf16_op(x_q, x_scale, w_q, w_s, decode_gemv_max_rows)
+
+
+def _decode_matmul_nt_jax(x: jax.Array, w: jax.Array) -> jax.Array:
+    return decode_gemv.decode_matmul_nt(x, w)
+
+
+_decode_matmul_nt_op = pallas.jax_op("pallas::decode_matmul_nt", _decode_matmul_nt_jax)
+
+
+def _fake_decode_matmul_nt(x, w):
+    return torch.empty(x.shape[0], w.shape[0], dtype=x.dtype, device=x.device)
+
+
+_decode_matmul_nt_op.register_fake(_fake_decode_matmul_nt)
+
+
+def decode_matmul_nt(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """`F.linear(x, w)` for a decode bucket via `decode_gemv.decode_matmul_nt`."""
+    return _decode_matmul_nt_op(x, w)
+
+
+def _gelu_tanh_and_mul_quantize_jax(
+    x: jax.Array, *, quant_dtype: jnp.dtype
+) -> tuple[jax.Array, jax.Array]:
+    return _gelu_tanh_and_mul_quantize_kernel(x, quant_dtype)
+
+
+def _make_gelu_quantize_op(quant_dtype: torch.dtype) -> Callable:
+    name = str(quant_dtype).removeprefix("torch.")
+    op = pallas.jax_op(
+        f"pallas::gelu_tanh_and_mul_quantize_{name}",
+        functools.partial(_gelu_tanh_and_mul_quantize_jax, quant_dtype=jnp.dtype(name)),
+    )
+
+    def _fake(x: torch.Tensor):
+        d = x.shape[-1] // 2
+        return (
+            torch.empty((x.shape[0], d), dtype=quant_dtype, device=x.device),
+            torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device),
+        )
+
+    op.register_fake(_fake)
+    return op
+
+
+_gelu_quantize_ops = {
+    dtype: _make_gelu_quantize_op(dtype)
+    for dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+}
+
+
+def gelu_tanh_and_mul_quantize(
+    x: torch.Tensor, w_q: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`quantize_activation(GeluAndMul("tanh")(x), w_q)` in one Pallas pass."""
+    if x.dim() != 2:
+        raise ValueError(f"expected 2-D gate/up rows, got {tuple(x.shape)}")
+    op = _gelu_quantize_ops.get(w_q.dtype)
+    if op is None:
+        raise ValueError(f"no fused GELU quantization for {w_q.dtype}")
+    return op(x)
 
 
 def _quantized_matmul_fp4_jax(
     x: jax.Array, w_q: jax.Array, w_s: jax.Array
 ) -> jax.Array:
-    """W4A16 dense matmul for NVFP4 weights via gmm_v2 (single group).
-
-    `w_q` is the native fp4 weight in K-major layout [n_in, n_out] (unpacked at
-    load); it only needs a leading group axis for the gmm_v2 rhs layout
-    [1, n_in, n_out]. `w_s` is the fused fp32 block scale [1, num_blocks, 1,
-    n_out]. gmm_v2 selects the regime from the block size: block-16 dequantizes
-    the fp4 weight per block and keeps bf16 activations (W4A16).
-    """
-    rhs = w_q[None]  # [n_in, n_out] fp4 -> [1, n_in, n_out]
     return gmm_v2(
         lhs=x,
-        rhs=rhs,
+        rhs=w_q[None],
         group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
         rhs_scale=w_s,
         group_offset=jnp.array([0], dtype=jnp.int32),
@@ -273,12 +441,12 @@ def sharded_quantized_matmul(
             output = jax.lax.psum(output, axis_name=in_axis)
         return output
 
-    return shard_map(
+    return jax.shard_map(
         wrapper,
         mesh=mesh,
         in_specs=(x_sharding, weight_sharding, scale_sharding),
         out_specs=(out_sharding),
-        check_rep=False,
+        check_vma=False,
     )(x, w_q, w_s)
 
 

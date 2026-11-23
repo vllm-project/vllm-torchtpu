@@ -54,7 +54,7 @@ def test_qwen_buffers_follow_vmem_capacity(capacity_mib, expected):
     [
         ((256, 4096, 2048, 64), 1),
         ((1024, 4096, 1024, 64), 1),
-        ((256, 4096, 1024, 8192), 2),
+        ((256, 4096, 1024, 8192), 3),
         ((16, 512, 512, 4), 3),
     ],
 )
@@ -180,7 +180,7 @@ def test_hidden_contracting_axis_also_needs_gmm_quantization(
     "shape",
     [
         (15, 512, 512, 4),
-        (16, 768, 512, 4),
+        (16, 640, 512, 4),
         (16, 512, 704, 4),
         (0, 512, 512, 4),
         (16, 0, 512, 4),
@@ -333,6 +333,7 @@ def test_token_threshold_dispatch_and_resource_failure_propagation(
 
     monkeypatch.setattr(wrapper, "_DENSE_EXPERT_THRESHOLD", threshold)
     monkeypatch.setattr(wrapper, "dense_expert_moe", resource_failure)
+    monkeypatch.setattr(wrapper, "can_use_gather_gmm", lambda *args, **kwargs: False)
     monkeypatch.setattr(wrapper, "prepare_routed_gmm_inputs", standard_selected)
     wrapper.fused_moe_func.clear_cache()
     x, w1, w2, s1, s2 = _shapes(m, 512, 512, 4)

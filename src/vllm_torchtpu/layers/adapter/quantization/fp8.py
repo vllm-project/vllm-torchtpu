@@ -46,6 +46,7 @@ from math import gcd
 from typing import TYPE_CHECKING, Literal, cast
 
 import torch
+from vllm.distributed import parallel_state
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.linear import (
@@ -75,7 +76,7 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, tpu_info
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
@@ -88,6 +89,8 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    prequantized_matmul,
+    quantize_activation,
     quantized_matmul,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -760,12 +763,18 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                 )
 
                 return VllmUnquantizedLinearMethod()
-            return VllmFp8LinearMethodTPU(self, self.get_linear_config(layer))
+            return VllmFp8LinearMethodTPU(
+                self, self.get_linear_config(layer), prefix=prefix
+            )
 
         if isinstance(layer, Attention):
             return None
 
-        return None
+        from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+            decode_lm_head_method,
+        )
+
+        return decode_lm_head_method(layer)
 
 
 class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
@@ -1347,6 +1356,21 @@ def _wrap_block_scale_weight_loader(weight_loader: Callable) -> Callable:
     return _wrapped
 
 
+_DECODE_GEMV_MAX_ROWS = 64
+_DECODE_GEMV_MAX_TP_SIZE = 8
+
+
+def _default_decode_gemv_max_rows() -> int:
+    if not tpu_info.v7x_model_fastpaths_enabled():
+        return 0
+    tp_size = (
+        parallel_state.get_tensor_model_parallel_world_size()
+        if parallel_state.model_parallel_is_initialized()
+        else 1
+    )
+    return _DECODE_GEMV_MAX_ROWS if tp_size <= _DECODE_GEMV_MAX_TP_SIZE else 0
+
+
 @register_weight_loader_v2_supported_method
 class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     """
@@ -1399,6 +1423,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             if linear_config is not None
             else envs.TPU_FP8_LINEAR_W8A16_MAX_ROWS
         )
+        self.decode_gemv_max_rows = _default_decode_gemv_max_rows()
 
         if quant_config.is_checkpoint_fp8_serialized:
             self._linear_quant_config = _get_linear_quant_config(self.linear_config)
@@ -1638,11 +1663,6 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if hasattr(layer, "weight_scale_inv"):
             delattr(layer, "weight_scale_inv")
         replace_parameter(layer, "weight_scale", weight_scale)
-        # Derive weight_block_size explicitly from weight_scale layout when
-        # requant_block_size is unspecified.
-        # Setting (1, weight.shape[1]) vs (weight.shape[0], 1) guarantees downstream
-        # linear kernels and dequantization pipelines properly recognize scale broadcast
-        # granularity right across tensor-parallel shards.
         if requant_block_size is None:
             # Stated in checkpoint [n_out, n_in] terms, which is what the
             # downstream dequantization pipelines read; the transpose above
@@ -1686,6 +1706,14 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if isinstance(layer, VocabParallelEmbedding):
             # Prevent the quantization of activations to FP8 (W8A16).
             out = torch.matmul(x, weight.to(x.dtype)) * layer.weight_scale.to(x.dtype)
+        elif self.decode_gemv_max_rows:
+            out = quantized_matmul(
+                x,
+                weight,
+                layer.weight_scale,
+                w8a16_max_rows=self.w8a16_max_rows,
+                decode_gemv_max_rows=self.decode_gemv_max_rows,
+            )
         else:
             out = quantized_matmul(
                 x,
@@ -1696,6 +1724,37 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if bias is not None:
             out = out + bias
         return out
+
+    def supports_quantized_input(self, layer: torch.nn.Module, rows: int) -> bool:
+        """Whether `apply` on `rows` rows runs per-token W8A8 FP8."""
+        layer = cast("TpuLinear", layer)
+        return (
+            layer.weight_scale.dim() == 1
+            and not getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+            and not isinstance(layer, VocabParallelEmbedding)
+            and getattr(layer, "params_dtype", None) == torch.bfloat16
+            and rows > self.w8a16_max_rows
+        )
+
+    def quantize_input(
+        self, layer: torch.nn.Module, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize 2-D `x` per token identically to `apply`."""
+        layer = cast("TpuLinear", layer)
+        return quantize_activation(x, layer.weight)
+
+    def apply_quantized_input(
+        self, layer: torch.nn.Module, x_q: torch.Tensor, x_scale: torch.Tensor
+    ) -> torch.Tensor:
+        """Complete `apply` on activations produced by `quantize_input`."""
+        layer = cast("TpuLinear", layer)
+        return prequantized_matmul(
+            x_q,
+            x_scale,
+            layer.weight,
+            layer.weight_scale,
+            decode_gemv_max_rows=self.decode_gemv_max_rows,
+        )
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         layer = cast("TpuLinear", layer)

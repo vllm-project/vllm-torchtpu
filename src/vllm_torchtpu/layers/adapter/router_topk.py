@@ -21,7 +21,10 @@ elsewhere as the identical plain-torch algorithm in
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.router_topk import router_topk
+from vllm_torchtpu.kernels.router_topk import (
+    router_topk,
+    router_topk_scaled,
+)
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 
@@ -33,10 +36,19 @@ def _fake_router_topk(scores: torch.Tensor, topk: int):
     )
 
 
+def _fake_router_topk_scaled(scores: torch.Tensor, scale: torch.Tensor, topk: int):
+    del scale
+    weights, ids = _fake_router_topk(scores, topk)
+    return weights, ids, torch.empty_like(weights)
+
+
 # Registered at import, not lazily: this op is called from inside the MoE
 # forward, and Dynamo cannot trace a lock-guarded registration there.
 _op = pallas.jax_op("pallas::moe_router_topk", router_topk)
 _op.register_fake(_fake_router_topk)
+
+_op_scaled = pallas.jax_op("pallas::moe_router_topk_scaled", router_topk_scaled)
+_op_scaled.register_fake(_fake_router_topk_scaled)
 
 
 def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -48,3 +60,17 @@ def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.
             f"router top-k kernel expects [rows, experts], got {scores.shape}"
         )
     return _op(scores.float(), topk)
+
+
+def rowmax_select_scaled(
+    scores: torch.Tensor, topk: int, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``rowmax_select`` plus the per-expert ``scale`` at the selected ids."""
+    if scores.device.type != "tpu":
+        values, ids = rowmax_topk(scores, topk)
+        return values, ids, scale.float()[ids.long()]
+    if scores.dim() != 2:
+        raise ValueError(
+            f"router top-k kernel expects [rows, experts], got {scores.shape}"
+        )
+    return _op_scaled(scores.float(), scale.float(), topk)
