@@ -263,3 +263,44 @@ def export_selection(
     tok = groups[:, :, None] * GROUP + jnp.arange(GROUP, dtype=jnp.int32)
     tok = jnp.where(groups[:, :, None] >= 0, tok, -1).reshape(rows, GROUP * K)
     return jnp.pad(tok, ((0, 0), (0, GROUP - 1)), constant_values=-1)
+
+
+def shared_selection_inputs(
+    rows: Any, context: Any, starts: Any, *, T: int, K: int, M: int
+) -> tuple[Any, Any]:
+    """`(ids [M, 1, K] int32, meta [M] int32)`: the MK draft kernel's selection
+    (`QSAFullIndexedBlock.shared_sel`, VLLM_TPU_MK_DRAFT_SHARED_SELECTION) from the
+    target's shared-selection rows `rows [B, 4 K + 3]` (`export_selection`'s layout, one
+    per draft row: step 0 the sink's first B rows, a loop step the carried rows).
+
+    Each draft row keeps the stock shared-selection rule (`pooled_qsa.shared_blocks`):
+    a row that sees at most K complete groups attends all of them; otherwise it attends
+    the target row's groups (columns `4 j`, ascending, -1 for none). In the kernel's
+    terms (`QSAFullStepBlock._select`): the pool path is the groups below the row's own
+    `g_a = context // 4`, ascending, slots past the count 0 (`ids`), and `meta` is
+    `kept * 2 + flag`, flag = g_a is selected and complete for the row (its recent tile
+    then attends it). For step 0 the draft rows are the target's rows, so this gives back
+    the target kernel's own `qi_id` and flag; at a loop step (`context` a few tokens on)
+    a selected target `g_a` below the row's `g_a` joins the pool path. Idle requests
+    (no query tokens) and rows past B select nothing."""
+    B = rows.shape[0]
+    nreq = M // T
+    ctx = _fit(context.astype(jnp.int32), nreq)
+    q_len = _fit((starts[1:] - starts[:-1]).astype(jnp.int32), nreq)
+    t = jnp.arange(T, dtype=jnp.int32)
+    lens = jnp.where((q_len > 0)[:, None], ctx[:, None] + t[None] + 1, 0).reshape(M)
+    nv = lens // GROUP
+    ga = jnp.where(lens > 0, jnp.repeat(ctx // GROUP, T), 0)
+    col = rows[:, 0 : GROUP * K : GROUP].astype(jnp.int32)
+    grp = jnp.where(col >= 0, col // GROUP, -1)
+    grp = _fit(grp, M) if B != M else grp
+    if B < M:  # rows past B: no selection
+        grp = jnp.where(jnp.arange(M)[:, None] < B, grp, -1)
+    j = jnp.arange(K, dtype=jnp.int32)[None]
+    over = (nv > K)[:, None]
+    pool = (grp >= 0) & (grp < ga[:, None])
+    kept = jnp.where(over[:, 0], jnp.sum(pool.astype(jnp.int32), axis=1), ga)
+    ids = jnp.where(over, jnp.where(pool, grp, 0), jnp.where(j < ga[:, None], j, 0))
+    sel_ga = jnp.where(over[:, 0], jnp.any(grp == ga[:, None], axis=1), True)
+    flag = (sel_ga & (ga < nv)).astype(jnp.int32)
+    return ids[:, None, :], kept * 2 + flag

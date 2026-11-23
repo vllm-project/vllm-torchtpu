@@ -130,8 +130,12 @@ def test_whole_step_writes_the_selection_only_under_the_flag():
 
     for module in (qwen38_driver, qwen38_draft):
         src = inspect.getsource(module)
+        if module is qwen38_draft:
+            # VLLM_TPU_MK_DRAFT_SHARED_SELECTION: the draft reads (never writes) the rows.
+            src = src.replace(inspect.getsource(qwen38_draft.MkDraft.shared_rows), "")
         assert "_selection_sink" not in src and "_selection_rows" not in src, module.__name__
-        assert "write_selection_sink" not in src, module.__name__
+        assert "_selection_source" not in src, module.__name__
+        assert "write_selection_sink" not in src and "update_rows_" not in src, module.__name__
     src = inspect.getsource(qwen38_wholestep.Qwen38WholeStep._export_target)
     assert "VLLM_TPU_MK_WHOLE_EXPORT_SELECTION" in src
     src = inspect.getsource(mtp_fused_loop._MkDraftStep0.forward)

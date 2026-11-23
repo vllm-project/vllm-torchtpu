@@ -63,6 +63,13 @@ DBG_IDS = "qsa_dbg_ids"
 # the row's count 0, g_a's flag in slot K-1 as `selection_groups` reads it) for the MTP
 # draft's shared selection (VLLM_TPU_MK_WHOLE_EXPORT_SELECTION). Not per layer: one buffer.
 SEL_IDS = "qsa_sel_ids"
+# `shared_sel` (the MK draft, VLLM_TPU_MK_DRAFT_SHARED_SELECTION): per row the pool-path ids
+# `[M, 1, K]` in `qi_id`'s format (ascending ids below g_a, slots past the count 0) and
+# `[M]` `kept * 2 + g_a flag`, built outside the kernel from the target's exported
+# selection (`qwen38_wholestep_inputs.shared_selection_inputs`). They replace the
+# kernel's own indexer (scores, thresholds, compaction, exchange).
+SH_IDS = "qsa_sh_ids"
+SH_META = "qsa_sh_meta"
 UNION_SLOTS = 3  # attention ring slots with `union_attn`
 NVIS_DIGIT = int(os.environ.get("VLLM_TPU_MK_QSA_NVIS_DIGIT", "3"))  # bits per bisection pass
 # Timing-only attribution arm of the key stream (tests/megakernel/tpu_bench_wholestep_call.py
@@ -109,6 +116,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         nvis_balance: bool = False,
         uattn_lite: bool = False,
         export_ids: bool = False,
+        shared_sel: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -196,6 +204,12 @@ class QSAFullIndexedBlock(QSAFullBlock):
         # `export_ids`: copy the last QSA layer's `qi_id` to the `SEL_IDS` output (stage C;
         # with `n_layers` the layer ordinal `n_layers - 1`, else every layer, the last wins).
         self.export_ids = bool(export_ids)
+        # `shared_sel` (stage C, `loop_requests`): the selection comes in (`SH_IDS`,
+        # `SH_META`); the kernel scores nothing and exchanges nothing (`QSAFullStepBlock`).
+        self.shared_sel = bool(shared_sel)
+        assert not shared_sel or (loop_requests and not compressed_dcp and not debug), (
+            "shared selection: the served request loop, no compressed-key DCP, no debug ids"
+        )
         self.hbm_tables, self.per_request_scores = hbm_tables, per_request_scores
         self.bounded_chunks = bounded_chunks
         self.shard_index = shard_index

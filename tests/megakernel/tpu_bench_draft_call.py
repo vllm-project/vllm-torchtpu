@@ -102,6 +102,23 @@ def main():
                     help="digest of the first call's residual, tokens and pool (bitwise checks)")
     ap.add_argument("--ctx-min", type=int, default=0,
                     help="mixed contexts: request q gets ctx - q * (ctx - ctx_min) // (nreq - 1)")
+    ap.add_argument("--export", type=int, default=0, choices=(0, 1, 2),
+                    help="VLLM_TPU_MK_WHOLE_EXPORT_SELECTION's draft-side consumer in the same "
+                    "program as the MK call (`_MkDraftStep0` -> `carry_shared_selection`): "
+                    "0 none (A), 1 gather each request's row from the whole [sink-rows, 4K+3] "
+                    "int32 sink + donated row update of the carried rows (C served: "
+                    "QSA_DRAFT_SELECTION_SLICE off), 2 the same from sink[:B] (SELECTION_SLICE=1)")
+    ap.add_argument("--sink-rows", type=int, default=8192,
+                    help="shared-selection sink rows (max_num_batched_tokens)")
+    ap.add_argument("--shared", type=int, default=0, choices=(0, 1),
+                    help="VLLM_TPU_MK_DRAFT_SHARED_SELECTION: the kernel takes each row's "
+                    "target selection (sink layout) instead of running its own indexer; with "
+                    "--export the rows are the sink's first B rows (step 0), else a separate "
+                    "replicated [B, 4K+3] operand (a loop step's carried rows)")
+    ap.add_argument("--sel-mode", default="low", choices=("low", "rand"),
+                    help="--shared selection: low = groups 0..K-1 (what the own indexer picks "
+                    "on the bench's all-zero keys: matched work), rand = a random sorted "
+                    "K-subset below g_a per request, shared by its rows")
     ap.add_argument("--trace-only", action="store_true")
     ap.add_argument("--interpret", action="store_true")
     a = ap.parse_args()
@@ -155,7 +172,8 @@ def main():
             kw = dict(budget=a.budget, max_groups=a.max_groups, norm_eps=1e-6,
                       rotary_dim=64, vocab_shard=a.vocab_shard)
             call, in_specs, out_specs, donate = build_draft_call(
-                mesh, g, B, T, layout, layer, interpret=a.interpret, **kw
+                mesh, g, B, T, layout, layer, interpret=a.interpret, shared=bool(a.shared),
+                **kw
             )
             ex = ExecSpec(R=R, B=B, T=T, ctx=128, tiles=wholestep_tiles(B, a.max_groups))
             spec = draft_spec(g, R, budget=a.budget, max_groups=a.max_groups,
@@ -226,13 +244,61 @@ def main():
             args = [hidden, *ws, pool, put(ring.reshape(-1)), put(main.reshape(-1)),
                     put(comp.reshape(-1)), put(positions), put(qsl), put(ctx), put(trig),
                     put(jnp.zeros((256,), jnp.bfloat16)), put(jnp.zeros((128,), jnp.bfloat16))]
-            f = jax.jit(call, donate_argnums=donate)
+            W = 4 * a.budget + 3
+            sel_rows = np.full((B, W), -1, np.int32)
+            if a.shared:
+                for q in range(nreq):
+                    ga = ctx_q[q] // 4
+                    if a.sel_mode == "low" or ga <= a.budget:
+                        grp = np.arange(min(a.budget, ga))
+                    else:
+                        grp = np.sort(rng.choice(ga, a.budget, replace=False))
+                    tok = (grp[:, None] * 4 + np.arange(4)).reshape(-1)
+                    sel_rows[q * T : (q + 1) * T, : len(tok)] = tok
+                if not a.export:  # a loop step's carried rows: the call's last operand
+                    args.append(put(sel_rows))
+            n_args = len(args)
+            if a.export:
+                # The served C program: MK draft call, then the step-0 carry of the
+                # target's exported selection (qsa.shared_step0_rows + update_rows_).
+                sink_np = (np.arange(a.sink_rows * W, dtype=np.int64).reshape(a.sink_rows, W)
+                           % 65536 - 1).astype(np.int32)
+                if a.shared:  # this step's rows: the target's selection
+                    sink_np[:B] = sel_rows
+                sink = jax.device_put(jnp.asarray(sink_np), rep)
+                carried = jax.device_put(jnp.full((a.sink_rows, W), -1, jnp.int32), rep)
+                drows = np.full((NRQ,), -1, np.int32)
+                drows[:nreq] = np.arange(nreq) * T + T - 1
+                drows = put(drows)
+                mode = a.export
+
+                def fused(*xs):
+                    *ka, sk, cr, dr = xs
+                    if a.shared:  # step 0 reads the sink's first B rows (SELECTION_SLICE)
+                        ka = [*ka, sk[:B]]
+                    res, tok, pl_ = call(*ka)
+                    src = sk if mode == 1 else sk[:B]
+                    rows_ = src[jnp.maximum(dr, 0)]
+                    cr = jax.lax.dynamic_update_slice(cr, rows_.astype(cr.dtype), (0, 0))
+                    return res, tok, pl_, cr
+
+                args += [sink, carried, drows]
+                f = jax.jit(fused, donate_argnums=tuple(donate) + (n_args + 1,))
+            else:
+                f = jax.jit(call, donate_argnums=donate)
+
+            def run(xs):
+                o = f(*xs)
+                if a.export:
+                    xs[n_args + 1] = o[3]
+                return o[0], o[1], o[2]
+
             if a.trace_only:
                 out = jax.eval_shape(f, *args)
                 print(f"T={T} reqs={nreq} B={B} traced: {[o.shape for o in out]}", flush=True)
                 continue
             t0 = time.time()
-            res, tok, pool = f(*args)
+            res, tok, pool = run(args)
             jax.block_until_ready(res)
             if a.dhash:
                 import hashlib
@@ -260,7 +326,7 @@ def main():
             for _ in range(a.iters):
                 args[pi] = pool
                 t0 = time.perf_counter()
-                res, tok, pool = f(*args)
+                res, tok, pool = run(args)
                 jax.block_until_ready((res, tok, pool))
                 ts.append(time.perf_counter() - t0)
             if a.profile:
@@ -268,7 +334,7 @@ def main():
                 with jax.profiler.trace(d):
                     for _ in range(5):
                         args[pi] = pool
-                        res, tok, pool = f(*args)
+                        res, tok, pool = run(args)
                     jax.block_until_ready((res, tok, pool))
                 device_report(d, f"T={T} reqs={nreq} B={B}")
             ts = np.sort(np.asarray(ts) * 1e3)
