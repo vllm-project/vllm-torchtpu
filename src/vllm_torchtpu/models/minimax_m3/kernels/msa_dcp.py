@@ -229,25 +229,63 @@ def _pick_t(st, num_visible, rank, *, topk, init_blocks, local_blocks, dcp):
     )
 
 
-def _pick_t_halves(s, num_visible, rank, *, topk, init_blocks, local_blocks, dcp):
-    """`_pick` of row-major scores ``s [rows, width]`` (``num_visible [rows, 1]``, ``2 * rows <= 128``,
-    ``width % 16 == 0``) as two `_pick_t`s side by side on the vreg lanes the
-    transposed rows leave idle, then a merge of their two ordered lists.
+def _merge_ordered(a_s, a_i, b_s, b_i, topk):
+    """The top-k of two ordered candidate lists ``[topk, rows]`` (scores, f32
+    column ids; non-real entries score -inf) as one ordered list, non-real
+    slots ``(-inf, -1)``: each real candidate's place is its slot plus the
+    other list's real candidates ahead of it (score descending, ties to the
+    lower column; the lists hold disjoint columns)."""
+
+    def ahead(xs, xi, ys, yi):
+        n = jnp.zeros(xs.shape, jnp.int32)
+        for j in range(topk):
+            s_j, i_j = ys[j : j + 1], yi[j : j + 1]
+            first = (s_j > xs) | ((s_j == xs) & (i_j < xi))
+            n = n + (first & (s_j > _NEG_INF)).astype(jnp.int32)
+        return n
+
+    slot = jax.lax.broadcasted_iota(jnp.int32, a_s.shape, 0)
+    a_rank = jnp.where(a_s > _NEG_INF, slot + ahead(a_s, a_i, b_s, b_i), topk)
+    b_rank = jnp.where(b_s > _NEG_INF, slot + ahead(b_s, b_i, a_s, a_i), topk)
+    out_s, out_i = [], []
+    for k in range(topk):
+        in_a, in_b = a_rank == k, b_rank == k
+        out_s.append(
+            jnp.max(
+                jnp.where(in_a, a_s, jnp.where(in_b, b_s, _NEG_INF)),
+                axis=0,
+                keepdims=True,
+            )
+        )
+        out_i.append(
+            jnp.max(
+                jnp.where(in_a, a_i, jnp.where(in_b, b_i, -1.0)), axis=0, keepdims=True
+            )
+        )
+    return jnp.concatenate(out_s, axis=0), jnp.concatenate(out_i, axis=0)
+
+
+def _pick_t_folded(
+    s, num_visible, rank, *, folds, topk, init_blocks, local_blocks, dcp
+):
+    """`_pick` of row-major scores ``s [rows, width]`` (``num_visible [rows,
+    1]``, ``folds * rows <= 128``, ``width % (8 * folds) == 0``) as `folds`
+    `_pick_t`s side by side on the vreg lanes the transposed rows leave idle,
+    then merges of their ordered lists (`_merge_ordered`).
 
     The transposed pick takes rows on lanes: at decode sizes (8 to 64 rows)
-    most of each vreg's 128 lanes were idle, and a step's max and first index
-    ran over ``width / 8`` vregs. Here each step runs over half as many, the
-    second half of the columns on lanes ``[rows, 2 * rows)``. The merge ranks
-    each real candidate by the real candidates of the other half ahead of it
-    (score descending, ties to the lower block; the halves hold disjoint
-    blocks), so the result equals `_pick`'s."""
+    most of each vreg's 128 lanes were idle, and each of its dependent picks
+    ran over ``width / 8`` vregs. Here column block ``f`` of ``width /
+    folds`` runs on lanes ``[f * rows, (f + 1) * rows)``, so each pick runs
+    over ``folds`` times fewer vregs; the merges give `_pick`'s result."""
     rows, width = s.shape
-    half = width // 2
-    st = jnp.concatenate([s[:, :half], s[:, half:]], axis=0).T  # [half, 2 * rows]
-    lane = jax.lax.broadcasted_iota(jnp.int32, (1, 2 * rows), 1)
-    offset = jnp.where(lane >= rows, half, 0)
-    cols = jax.lax.broadcasted_iota(jnp.int32, st.shape, 0) + offset
-    vis = jnp.concatenate([num_visible.T, num_visible.T], axis=1)  # [1, 2 * rows]
+    part = width // folds
+    st = jnp.concatenate(
+        [s[:, f * part : (f + 1) * part] for f in range(folds)], axis=0
+    ).T  # [part, folds * rows]
+    lane = jax.lax.broadcasted_iota(jnp.int32, (1, folds * rows), 1)
+    cols = jax.lax.broadcasted_iota(jnp.int32, st.shape, 0) + lane // rows * part
+    vis = jnp.concatenate([num_visible.T] * folds, axis=1)  # [1, folds * rows]
     blocks = cols * dcp + rank
     visible = blocks < vis
     st = jnp.where(visible, st, _NEG_INF)
@@ -259,38 +297,26 @@ def _pick_t_halves(s, num_visible, rank, *, topk, init_blocks, local_blocks, dcp
     scores, picks = [], []
     for _ in range(topk):
         best_score = jnp.max(st, axis=0, keepdims=True)
-        best = jnp.min(jnp.where(st == best_score, ids, float(width)), axis=0, keepdims=True)
+        best = jnp.min(
+            jnp.where(st == best_score, ids, float(width)), axis=0, keepdims=True
+        )
         scores.append(best_score)
         picks.append(best)
         st = jnp.where(ids == best, _NEG_INF, st)
-    sc = jnp.concatenate(scores, axis=0)  # [topk, 2 * rows]
+    sc = jnp.concatenate(scores, axis=0)  # [topk, folds * rows]
     ix = jnp.concatenate(picks, axis=0)
-    a_s, b_s, a_i, b_i = sc[:, :rows], sc[:, rows:], ix[:, :rows], ix[:, rows:]
-
-    def ahead(xs, xi, ys, yi):
-        """Per real candidate of ``x``: the real candidates of ``y`` ahead of it."""
-        n = jnp.zeros(xs.shape, jnp.int32)
-        for j in range(topk):
-            s_j, i_j = ys[j : j + 1], yi[j : j + 1]
-            first = (s_j > xs) | ((s_j == xs) & (i_j < xi))
-            n = n + (first & (s_j > _NEG_INF)).astype(jnp.int32)
-        return n
-
-    slot = jax.lax.broadcasted_iota(jnp.int32, a_s.shape, 0)
-    a_rank = jnp.where(a_s > _NEG_INF, slot + ahead(a_s, a_i, b_s, b_i), topk)
-    b_rank = jnp.where(b_s > _NEG_INF, slot + ahead(b_s, b_i, a_s, a_i), topk)
-    out_s, out_b = [], []
-    for k in range(topk):
-        in_a, in_b = a_rank == k, b_rank == k
-        sk = jnp.max(
-            jnp.where(in_a, a_s, jnp.where(in_b, b_s, _NEG_INF)), axis=0, keepdims=True
-        )
-        bk = jnp.max(
-            jnp.where(in_a, a_i, jnp.where(in_b, b_i, -1.0)), axis=0, keepdims=True
-        )
-        out_s.append(sk)
-        out_b.append(jnp.where(sk > _NEG_INF, bk.astype(jnp.int32) * dcp + rank, -1))
-    return jnp.concatenate(out_s, axis=0).T, jnp.concatenate(out_b, axis=0).T
+    lists = [
+        (sc[:, f * rows : (f + 1) * rows], ix[:, f * rows : (f + 1) * rows])
+        for f in range(folds)
+    ]
+    while len(lists) > 1:
+        lists = [
+            _merge_ordered(*lists[i], *lists[i + 1], topk)
+            for i in range(0, len(lists), 2)
+        ]
+    out_s, out_i = lists[0]
+    out_b = jnp.where(out_s > _NEG_INF, out_i.astype(jnp.int32) * dcp + rank, -1)
+    return out_s.T, out_b.T
 
 
 class _PackedPick(NamedTuple):
@@ -313,8 +339,18 @@ class _PackedPick(NamedTuple):
         num_visible = pos // self.block_size + 1
         if s.shape[1] > _TRANSPOSED_PICK_WIDTH:
             return pack_candidates(*_pick(s, num_visible, rank, **options))
-        if 2 * s.shape[0] <= _LANES and s.shape[1] % 16 == 0:
-            return pack_candidates(*_pick_t_halves(s, num_visible, rank, **options))
+        folds = next(
+            (
+                f
+                for f in (_PICK_FOLDS, 2)
+                if f * s.shape[0] <= _LANES and s.shape[1] % (8 * f) == 0
+            ),
+            1,
+        )
+        if folds > 1:
+            return pack_candidates(
+                *_pick_t_folded(s, num_visible, rank, folds=folds, **options)
+            )
         scores, blocks = _pick_t(s.T, num_visible.T, rank, **options)
         return pack_candidates(scores.T, blocks.T)
 
@@ -325,6 +361,10 @@ class _PackedPick(NamedTuple):
 # one unrolled body each.
 _TRANSPOSED_PICK_WIDTH = 768
 _LANES = 128
+# Column blocks `_pick_t_folded` lays side by side, if their rows fit the lanes
+# (else 2): AOT at 512 / 768 columns, 8 rows: 3,444 / 4,167 bundles at 2 folds,
+# 3,327 / 3,759 at 4, 3,517 / - at 8.
+_PICK_FOLDS = 4
 _PICK_WIDTH_STEP = 256
 
 

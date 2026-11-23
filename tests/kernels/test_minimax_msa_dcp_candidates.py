@@ -87,8 +87,8 @@ def test_decode_step_returns_token_rows() -> None:
     )
 
 
-# Transposed picks (up to 768 columns; up to 64 rows as two halves) and
-# row-major ones.
+# Transposed picks (up to 768 columns; as four column blocks up to 32 rows,
+# two up to 64) and row-major ones.
 @pytest.mark.parametrize("width", [256, 512, 768, 1024])
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("tokens", [8, 24, 48, 72])
