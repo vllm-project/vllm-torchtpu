@@ -1302,6 +1302,8 @@ def sparse_mla_attention_dcp(
     dcp_size: int,
     interleave_size: int,
     dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+    tq_tables: tq.TQTables | None = None,
+    tq_prerotated: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1318,6 +1320,12 @@ def sparse_mla_attention_dcp(
         sequence coordinates, replicated. `block_tables` holds virtual page
         ordinals, resolved per rank exactly as on the indexer side.
       dcp_size, interleave_size: the shard layout.
+      tq_tables: TurboQuant latent tables (`tq.make_mla_latent_tables`). When
+        set, `kv_c_normed` arrives unquantized and each rank stores its rows as
+        4-bit codes, as `sparse_mla_attention` does; `k_pe` is still fp8.
+      tq_prerotated: must be `True` with `tq_tables`: the Hadamard rotation is
+        folded into `W_UK_T` and `W_UV` at load time, so the partial outputs are
+        merged in the rotated basis and the caller's `W_UV` unrotates them.
 
     Returns:
       `(kv_cache_nope, kv_cache_rope, output, lse)`. `output` is
@@ -1383,11 +1391,25 @@ def sparse_mla_attention_dcp(
         P(dcp_axis_name, None),  # partial lse
     )
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
-    if (
-        nope_spec.token_bytes
-        != kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
-    ):
-        raise NotImplementedError("TurboQuant sparse MLA does not support DCP yet.")
+    use_tq = tq_tables is not None
+    expected_nope_bytes = (
+        tq.MLA_TQ_NOPE_BYTES
+        if use_tq
+        else kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
+    )
+    if nope_spec.token_bytes != expected_nope_bytes:
+        raise ValueError(
+            f"sparse MLA with DCP: a {nope_spec.token_bytes}-byte NoPE token does "
+            f"not match {'TurboQuant' if use_tq else 'an fp8'} latent cache "
+            f"({expected_nope_bytes} bytes)"
+        )
+    if use_tq and not tq_prerotated:
+        # The cross-rank merge would otherwise need every partial output
+        # unrotated first; serving folds the rotation into the weights.
+        raise NotImplementedError(
+            "TurboQuant sparse MLA with DCP needs W_UK_T and W_UV pre-rotated "
+            "at load (tq_prerotated=True)."
+        )
     # One cache_layout below governs both caches, so they must agree.
     if nope_spec.layout is not rope_spec.layout:
         raise ValueError(
@@ -1409,6 +1431,8 @@ def sparse_mla_attention_dcp(
         query_start_loc_,
         request_distribution_,
     ):
+        if tq_tables is not None:
+            kv_c_normed, k_pe = _tq_pack_sparse_mla_latent(kv_c_normed, k_pe, tq_tables)
         kv_cache_nope, kv_cache_rope = sparse_mla_write_kv_shard(
             kv_cache_nope,
             kv_cache_rope,
@@ -1472,10 +1496,15 @@ def sparse_mla_attention_dcp(
             # Ranks own ~topk/dcp of each row: a static top-k width with an
             # exact in-kernel overflow pass for the rows that need more.
             topk_cap=topk_cap,
+            turboquant=use_tq,
             **chunk_kwargs,
             **split_kwargs,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
+        if use_tq:
+            # The merge weighs this rank's output by exp(-inf) = 0; keep a
+            # non-finite value from the dummy row out of 0 * x as well.
+            output = jnp.where(owns[:, None, None], output, jnp.zeros_like(output))
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
         return (kv_cache_nope, kv_cache_rope, output[..., : ql_nope.shape[-1]], lse)
 

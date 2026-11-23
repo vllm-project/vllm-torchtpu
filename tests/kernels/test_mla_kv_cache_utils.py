@@ -36,6 +36,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 )
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.kernels.mla.sparse import native_sc_cache_layout, native_sc_gather
+from vllm_torchtpu.layers.core import turboquant as tq
 
 LKV_DIM = 512
 ROPE_DIM = 64
@@ -61,6 +62,17 @@ ROPE_SPEC = SparseMLAKVCacheSpec.create(
     PAGE_SIZE,
     ROPE_DIM,
     KV_PACKING,
+)
+
+# TurboQuant rows: 256-B NoPE codes, two tokens per 128-word SparseCore row,
+# and a 66-B RoPE row (fp8 k_pe, then a bf16 norm) padded to 128 B.
+TQ_NOPE_BYTES = tq.MLA_TQ_NOPE_BYTES
+TQ_ROPE_BYTES = ROPE_DIM + 2
+TQ_NOPE_SPEC = SparseMLAKVCacheSpec.create(
+    KVCacheType.NOPE, KVCacheLayout.SPARSECORE, TOTAL_PAGES, PAGE_SIZE, TQ_NOPE_BYTES
+)
+TQ_ROPE_SPEC = SparseMLAKVCacheSpec.create(
+    KVCacheType.ROPE, KVCacheLayout.SPARSECORE, TOTAL_PAGES, PAGE_SIZE, TQ_ROPE_BYTES
 )
 
 
@@ -634,6 +646,123 @@ class UpdateSparseMLAKvCacheDcpTest(parameterized.TestCase):
                 rope_spec=ROPE_SPEC,
                 dcp_size=2,
                 interleave_size=4,
+            )
+
+    def _tq_inputs(self, dcp_size, interleave_size, seed=5):
+        """`_inputs`' positions with TurboQuant rows of random nonzero bytes,
+        so a written slot never looks empty."""
+        inputs = self._inputs(dcp_size, interleave_size)
+        rng = np.random.default_rng(seed)
+        total = inputs["kv_c"].shape[0]
+        inputs["kv_c"] = jnp.asarray(
+            rng.integers(1, 256, (total, TQ_NOPE_BYTES), dtype=np.uint8)
+        )
+        inputs["k_pe"] = jnp.asarray(
+            rng.integers(1, 256, (total, TQ_ROPE_BYTES), dtype=np.uint8)
+        )
+        return inputs
+
+    @parameterized.named_parameters(
+        dict(testcase_name="d2_i4", dcp_size=2, interleave_size=4),
+        dict(testcase_name="d4_i8", dcp_size=4, interleave_size=8),
+        dict(testcase_name="d8_i4", dcp_size=8, interleave_size=4),
+    )
+    def test_turboquant_rows_land_where_the_interleave_says(
+        self, dcp_size, interleave_size
+    ):
+        """TurboQuant row geometry (NoPE `uint32[pages, page/2, 128]`, 66-B
+        RoPE rows four to a 128-word row): every rank's whole decoded shard
+        equals a golden placed position by position from the documented
+        interleave, so no row lands twice, elsewhere, or over a row-mate."""
+        self.assertEqual(TQ_NOPE_SPEC.jax_dtype, jnp.uint32)
+        self.assertEqual(TQ_NOPE_SPEC.shape, (TOTAL_PAGES, PAGE_SIZE // 2, 128))
+        self.assertEqual(TQ_ROPE_SPEC.shape, (TOTAL_PAGES, PAGE_SIZE // 4, 128))
+        inputs = self._tq_inputs(dcp_size, interleave_size)
+        shards = self._run_group(
+            inputs, dcp_size, interleave_size, TQ_NOPE_SPEC, TQ_ROPE_SPEC
+        )
+
+        shape = (dcp_size, TOTAL_PAGES, PAGE_SIZE)
+        want_nope = np.zeros((*shape, TQ_NOPE_BYTES), np.uint8)
+        want_rope = np.zeros((*shape, TQ_ROPE_SPEC.token_bytes), np.uint8)
+        owner, virtual_page, slot = _interleave_placement(
+            inputs["pos"], dcp_size, interleave_size, PAGE_SIZE
+        )
+        codes, rows = np.asarray(inputs["kv_c"]), np.asarray(inputs["k_pe"])
+        for token in range(inputs["num_valid"]):
+            seq = inputs["seq_of"][token]
+            page = inputs["block_tables_2d"][seq, virtual_page[token]] % TOTAL_PAGES
+            want_nope[owner[token], page, slot[token]] = codes[token]
+            want_rope[owner[token], page, slot[token], :TQ_ROPE_BYTES] = rows[token]
+        self.assertEqual(set(owner.tolist()), set(range(dcp_size)))
+        for rank, (nope, rope) in enumerate(shards):
+            np.testing.assert_array_equal(
+                token_bytes(nope, TQ_NOPE_SPEC), want_nope[rank], f"NoPE, rank {rank}"
+            )
+            np.testing.assert_array_equal(
+                token_bytes(rope, TQ_ROPE_SPEC), want_rope[rank], f"RoPE, rank {rank}"
+            )
+
+    @parameterized.named_parameters(
+        dict(testcase_name="mate_written_next_step", rewrite=21),
+        dict(testcase_name="even_half_rewritten", rewrite=20),
+    )
+    def test_turboquant_half_row_write_keeps_the_row_mate(self, rewrite):
+        """Positions 20 and 21 share a 512-B NoPE row (and a RoPE row) on
+        rank 0. A step that writes one of them leaves every other byte of
+        every shard as the previous step left it, the row-mate included."""
+        dcp_size, interleave_size = 2, 8
+        owner, virtual_page, slot = _interleave_placement(
+            np.asarray([20, 21]), dcp_size, interleave_size, PAGE_SIZE
+        )
+        self.assertEqual(owner.tolist(), [0, 0])
+        self.assertEqual(virtual_page.tolist(), [0, 0])
+        self.assertEqual(slot.tolist(), [12, 13])
+        # Virtual ordinals; the first resolves to page 3 of each shard.
+        block_tables = jnp.asarray([3 + TOTAL_PAGES, 7, 1, 5], jnp.int32)
+        page = 3
+        rng = np.random.default_rng(9)
+
+        def write(shards, seq_len, q_len):
+            codes = rng.integers(1, 256, (q_len, TQ_NOPE_BYTES), dtype=np.uint8)
+            rows = rng.integers(1, 256, (q_len, TQ_ROPE_BYTES), dtype=np.uint8)
+            written = [
+                update_sparse_mla_kv_cache_dcp_jax(
+                    nope,
+                    rope,
+                    jnp.asarray(codes),
+                    jnp.asarray(rows),
+                    jnp.asarray([seq_len], jnp.int32),
+                    block_tables,
+                    jnp.asarray([0, q_len], jnp.int32),
+                    jnp.int32(rank),
+                    nope_spec=TQ_NOPE_SPEC,
+                    rope_spec=TQ_ROPE_SPEC,
+                    dcp_size=dcp_size,
+                    interleave_size=interleave_size,
+                )
+                for rank, (nope, rope) in enumerate(shards)
+            ]
+            return written, codes[-1], rows[-1]
+
+        # Step 1 writes positions 0..21, or 0..20 when step 2 writes 21.
+        first_len = 22 if rewrite == 20 else 21
+        empty = [(_empty(TQ_NOPE_SPEC), _empty(TQ_ROPE_SPEC))] * dcp_size
+        first, _, _ = write(empty, first_len, first_len)
+        second, codes, rows = write(first, rewrite + 1, 1)
+        k = rewrite - 20
+        for rank in range(dcp_size):
+            want_nope = token_bytes(first[rank][0], TQ_NOPE_SPEC).copy()
+            want_rope = token_bytes(first[rank][1], TQ_ROPE_SPEC).copy()
+            if rank == owner[k]:
+                self.assertTrue(want_nope[page, slot[1 - k]].any(), "no row-mate")
+                want_nope[page, slot[k]] = codes
+                want_rope[page, slot[k], :TQ_ROPE_BYTES] = rows
+            np.testing.assert_array_equal(
+                token_bytes(second[rank][0], TQ_NOPE_SPEC), want_nope
+            )
+            np.testing.assert_array_equal(
+                token_bytes(second[rank][1], TQ_ROPE_SPEC), want_rope
             )
 
 

@@ -394,8 +394,14 @@ def check_turboquant_config(vllm_config: VllmConfig) -> None:
     parallel = vllm_config.parallel_config
     if parallel.prefill_context_parallel_size > 1:
         raise NotImplementedError("TurboQuant KV cache does not support PCP.")
-    if parallel.decode_context_parallel_size > 1:
-        raise NotImplementedError("TurboQuant KV cache does not support DCP.")
+    if parallel.decode_context_parallel_size > 1 and not (
+        model_config is not None and model_config.use_mla
+    ):
+        # Sparse MLA shards its 4-bit latent cache over DCP like the fp8 one
+        # (`sparse_mla_attention_dcp`); the non-MLA backend has no DCP path.
+        raise NotImplementedError(
+            "TurboQuant KV cache supports DCP only on sparse MLA models."
+        )
 
     if cache_config.kv_cache_dtype_skip_layers:
         logger.warning_once(

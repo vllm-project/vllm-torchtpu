@@ -24,6 +24,11 @@ TurboQuant pack's own tests' concern, and the SparseCore writers need a TPU.
 not) is the projection's, not the writer's.
 """
 
+import os
+import signal
+import subprocess
+import sys
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -216,9 +221,177 @@ def test_kv_only_write_comparison_sees_one_changed_row(monkeypatch, page):
     )
 
 
-def test_write_caches_refuses_turboquant_under_dcp():
-    with pytest.raises(NotImplementedError, match="TurboQuant"):
-        _kv_only_caches(_step(), tq.make_mla_latent_tables(), dcp_size=2)
+# The DCP write needs two devices; on CPU they exist only when XLA is told so
+# before jax initializes, so the check runs in a subprocess.
+_TWO_RANK_WORKER_ENV = "MTP_KV_ONLY_TQ_TWO_RANK_WORKER"
+
+
+def test_write_caches_turboquant_dcp_two_ranks_keep_their_own_rows(request):
+    """Under DCP each rank packs the step's latents and writes exactly the
+    rows it owns: every rank's shard equals the DCP writer's golden for that
+    rank on the packed rows, and every slot the step does not write keeps its
+    earlier bytes, so a token's row-mate survives (two 256-B TurboQuant tokens
+    share each 512-B NoPE row; the shards start from nonzero bytes)."""
+    flags = os.environ.get("XLA_FLAGS", "")
+    env = dict(
+        os.environ,
+        JAX_PLATFORMS="cpu",
+        XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count=2",
+        **{_TWO_RANK_WORKER_ENV: "1"},
+    )
+    node = f"{__file__}::test_two_rank_worker"
+    plugins = [arg for p in request.config.option.plugins or () for arg in ("-p", p)]
+    returncode, out, err = _run_bounded(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            *plugins,
+            node,
+        ],
+        env,
+    )
+    assert returncode == 0, out[-3000:] + err[-3000:]
+    assert "1 passed" in out, out[-3000:]
+
+
+def _run_bounded(cmd, env, timeout=300):
+    """Run `cmd` in its own process group with a timeout under half the CPU
+    lane's pytest --timeout=600 (the worker takes <= ~170 s), killing the whole
+    group on expiry, so a hung worker fails with its output shown instead of
+    being cut off by pytest-timeout."""
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, err = proc.communicate()
+        pytest.fail(f"worker timed out after {timeout} s\n{out[-3000:]}\n{err[-3000:]}")
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+    return proc.returncode, out, err
+
+
+if os.environ.get(_TWO_RANK_WORKER_ENV) == "1":
+
+    def test_two_rank_worker(monkeypatch):
+        _two_ranks_keep_their_own_rows(monkeypatch)
+
+
+def _two_ranks_keep_their_own_rows(monkeypatch):
+    from vllm_torchtpu.distributed.dcp import DCP_LANE_AXIS_NAME
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
+    from vllm_torchtpu.kernels.mla import kv_cache_utils
+
+    assert len(jax.devices()) >= 2, jax.devices()
+    _xla_latent_writers(monkeypatch)
+    dcp, interleave = 2, 8
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:dcp]).reshape(1, dcp),
+        (DCP_LANE_AXIS_NAME, DCP_AXIS_NAME),
+    )
+    tables = tq.make_mla_latent_tables()
+    s = _step(page=32)
+    nope_spec, rope_spec = s["specs"]
+    sharded = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec(DCP_AXIS_NAME)
+    )
+    # Nonzero prior bytes on every rank, so an untouched slot (a written
+    # token's row-mate included) is distinguishable from a cleared one.
+    prior_rng = np.random.default_rng(11)
+    prior = {}
+    for key, spec in (("nope", nope_spec), ("rope", rope_spec)):
+        prior[key] = prior_rng.integers(
+            1, 2**32, (dcp * spec.shape[0], *spec.shape[1:]), dtype=np.uint32
+        )
+        s[key] = jax.device_put(jnp.asarray(prior[key]), sharded)
+    idx_cache, k_packed, idx_seq_lens, idx_pages, idx_cu = _indexer_inputs()
+    idx_cache = jax.device_put(
+        jnp.zeros((dcp * idx_cache.shape[0], *idx_cache.shape[1:]), jnp.uint8), sharded
+    )
+    got_nope, got_rope, _ = mla_op.mla_kv_write_caches(
+        s["nope"],
+        s["rope"],
+        idx_cache,
+        s["kv_c"],
+        s["k_pe"],
+        k_packed,
+        s["seq_lens"],
+        s["block_tables"],
+        s["qsl"],
+        idx_seq_lens,
+        idx_pages,
+        idx_cu,
+        mla_kv_spec=s["specs"],
+        mesh=mesh,
+        kv_cache_mode="xla",
+        dcp_size=dcp,
+        interleave_size=interleave,
+        tq_tables=tables,
+    )
+    codes, rope_row = attention_interface._tq_pack_sparse_mla_latent(
+        s["kv_c"], s["k_pe"], tables
+    )
+    written = 0
+    for r in range(dcp):
+        n0, r0 = nope_spec.shape[0], rope_spec.shape[0]
+        want_nope, want_rope = kv_cache_utils.update_sparse_mla_kv_cache_dcp_jax(
+            jnp.asarray(prior["nope"][r * n0 : (r + 1) * n0]),
+            jnp.asarray(prior["rope"][r * r0 : (r + 1) * r0]),
+            codes,
+            rope_row,
+            s["seq_lens"],
+            s["block_tables"],
+            s["qsl"],
+            jnp.int32(r),
+            nope_spec=nope_spec,
+            rope_spec=rope_spec,
+            dcp_size=dcp,
+            interleave_size=interleave,
+        )
+        _same_bytes(np.asarray(got_nope)[r * n0 : (r + 1) * n0], want_nope)
+        _same_bytes(np.asarray(got_rope)[r * r0 : (r + 1) * r0], want_rope)
+        # Independently of the golden: every slot this rank does not write in
+        # this step keeps its prior bytes (row-mates of half-row writes too).
+        page, slot = kv_cache_utils._get_dcp_page_and_slot(
+            s["kv_c"].shape[0],
+            s["seq_lens"],
+            s["block_tables"],
+            s["qsl"],
+            jnp.int32(r),
+            nope_spec=nope_spec,
+            dcp_size=dcp,
+            interleave_size=interleave,
+        )
+        page, slot = np.asarray(page), np.asarray(slot)
+        live = page < kv_cache_utils.OOB_PAGE
+        owned = np.zeros((n0, nope_spec.page_size), bool)
+        owned[page[live], slot[live]] = True
+        for key, got, n in (("nope", got_nope, n0), ("rope", got_rope, r0)):
+            got_slots = np.asarray(got)[r * n : (r + 1) * n].reshape(
+                n0, nope_spec.page_size, -1
+            )
+            prior_slots = prior[key][r * n : (r + 1) * n].reshape(
+                n0, nope_spec.page_size, -1
+            )
+            np.testing.assert_array_equal(
+                got_slots[~owned], prior_slots[~owned], err_msg=key
+            )
+        written += int(owned.any())
+    # Both ranks own some of the step's rows (positions 33..35 and 6..9 with
+    # an interleave of 8 fall on both ranks).
+    assert written == dcp
 
 
 def _tq_wrapper(dcp_size=1):
@@ -267,10 +440,25 @@ def test_write_op_without_turboquant_has_no_tables(monkeypatch):
     assert mla_op.MlaKvWriteOp(_op_wrapper(), mesh=None).tq_tables is None
 
 
-def test_write_op_refuses_turboquant_under_dcp(monkeypatch):
-    _record_jax_ops(monkeypatch)
-    with pytest.raises(NotImplementedError, match="TurboQuant"):
-        mla_op.MlaKvWriteOp(_tq_wrapper(dcp_size=2), mesh=None)
+def test_write_op_hands_turboquant_tables_under_dcp(monkeypatch):
+    """Under DCP the op still builds the latent tables and hands them to the
+    DCP-sharded write, with the DCP size and interleave."""
+    built = _record_jax_ops(monkeypatch)
+    mesh = object()
+    monkeypatch.setattr(mla_op, "get_or_create_dcp_mesh", lambda axis_name: mesh)
+    seen = {}
+
+    def writer(*args, **kwargs):
+        seen.update(kwargs)
+        return args[0], args[1], args[2]
+
+    monkeypatch.setattr(mla_op, "mla_kv_write_caches", writer)
+    op = mla_op.MlaKvWriteOp(_tq_wrapper(dcp_size=2), mesh=None)
+    (jax_op,) = built
+    jax_op.fn(*range(12))
+    assert op.tq_tables is tq.make_mla_latent_tables()
+    assert seen["tq_tables"] is op.tq_tables
+    assert seen["dcp_size"] == 2 and seen["mesh"] is mesh
 
 
 # --- On TPU: the real SparseCore writers and the compiled ops -------------

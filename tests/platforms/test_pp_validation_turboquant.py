@@ -97,9 +97,10 @@ def test_pp8_turboquant_still_refuses_pcp_stages(monkeypatch):
         check_turboquant_config(config)
 
 
-def test_pp8_turboquant_refuses_dcp():
-    with pytest.raises(NotImplementedError, match="DCP"):
-        check_turboquant_config(_pp8(dcp=2))
+def test_turboquant_config_accepts_dcp_on_sparse_mla():
+    # Sparse MLA shards its 4-bit latent cache over DCP like the fp8 one; the
+    # non-MLA TurboQuant backend still refuses DCP (test_turboquant_attention).
+    check_turboquant_config(_pp8(dcp=2))
 
 
 def test_pp8_turboquant_refuses_presets_other_than_4bit_nc():
