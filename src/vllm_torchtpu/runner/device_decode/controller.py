@@ -93,8 +93,10 @@ DEVICE_STEPS = "device_steps"
 VERIFY_STEPS = "verify_steps"
 VERIFY_MISMATCHES = "verify_mismatches"
 
-# A request whose slot disagrees with the runner this many steps in a row
-# points at a slot bug, not at a rollback the write-back repairs.
+# A request whose slot disagrees with the runner on this many checks in a
+# row points at a slot bug, not at a rollback the write-back repairs. A
+# check where every mirror agrees ends the row; a step that never reaches
+# the check leaves it as it is.
 _MAX_MIRROR_MISMATCHES = 3
 
 
@@ -350,7 +352,6 @@ class DeviceDecodeController:
         )
         self.slots.note_device_step(idx_np[:num_reqs])
         self._counters[DEVICE_STEPS] += 1
-        self._mirror_mismatches = (None, 0)
         r.execute_model_state = DeviceDecodeState(
             scheduler_output=scheduler_output,
             shape=shape,
@@ -471,6 +472,7 @@ class DeviceDecodeController:
         mismatch = self.slots.mismatch_reason(r, num_reqs)
         if mismatch is not None:
             return mismatch
+        self._mirror_mismatches = (None, 0)
         # A device step keeps every row's token and advances its slot, so a
         # row with tokens left to compute after this one (whose token the
         # stock path discards) runs on the stock path.
@@ -513,7 +515,7 @@ class DeviceDecodeController:
         if count >= _MAX_MIRROR_MISMATCHES:
             self._disable(
                 f"the slot of request {req_id!r} disagreed with the runner "
-                f"{count} steps in a row"
+                f"on {count} checks in a row"
             )
 
     def _disable(self, reason: str) -> None:

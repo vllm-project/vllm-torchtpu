@@ -452,13 +452,48 @@ def test_a_slot_that_keeps_disagreeing_turns_the_path_off(
     engine.run(2)
     assert engine.controller.enabled
     if tensor_parallel_size > 1:
-        with pytest.raises(DeviceDecodeInvariantError, match="3 steps in a row"):
+        with pytest.raises(DeviceDecodeInvariantError, match="3 checks in a row"):
             engine.step()
         return
     engine.run(1)
     assert not engine.controller.enabled
-    assert "3 steps in a row" in engine.controller.disabled_reason
+    assert "3 checks in a row" in engine.controller.disabled_reason
     assert engine.controller.counters()[MIRROR_MISMATCH] == 3
+
+
+def test_a_check_where_the_mirrors_agree_ends_the_mismatch_run(monkeypatch):
+    """Three separate rollbacks of one request keep device steps on when a
+    check where every mirror agrees follows each of them, even with no
+    device step in between."""
+    engine = SimEngine(monkeypatch, async_scheduling=False, device=True)
+    engine.add("a", 5, temperature=0.8, max_tokens=20)
+    engine.run(2)
+    controller = engine.controller
+    slots = controller.slots
+    agrees = slots.mismatch_reason
+    checks = []
+
+    def every_other_check_drifts(runner, num_reqs):
+        checks.append(num_reqs)
+        if len(checks) % 2:
+            slots.last_mismatch_req_id = "a"
+            return MIRROR_MISMATCH
+        return agrees(runner, num_reqs)
+
+    monkeypatch.setattr(slots, "mismatch_reason", every_other_check_drifts)
+    # With no compiled programs, a step whose check passes still runs on the
+    # stock path, so no device step ends the run.
+    registry = set(controller.registry)
+    controller.registry.clear()
+    engine.run(6)
+    counters = controller.counters()
+    assert counters[MIRROR_MISMATCH] == 3, counters
+    assert counters["unregistered_shape"] == 3, counters
+    assert controller.enabled, controller.disabled_reason
+    monkeypatch.setattr(slots, "mismatch_reason", agrees)
+    controller.registry.update(registry)
+    engine.run(1)
+    assert controller.counters()["device_steps"] == 2
 
 
 def test_a_zero_token_step_frees_the_slots_it_preempts(monkeypatch):
