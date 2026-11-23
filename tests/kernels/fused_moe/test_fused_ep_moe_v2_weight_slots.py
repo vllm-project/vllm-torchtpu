@@ -245,6 +245,9 @@ def _build_input_case(monkeypatch, input_slots, cache_rows, *, g_local=51, limit
     monkeypatch.setattr(kernel.pltpu, "get_tpu_info", lambda: info)
     key = (info.chip_version, 128, 5120, 2560, 512)
     monkeypatch.setattr(tuned_block_sizes, "INPUT_SLOTS", {key: input_slots})
+    # These cases test the mechanisms' plumbing at a tiny slab, not the
+    # per-bucket gate (test_fused_ep_moe_v2_input_slots.py), so no minimum.
+    monkeypatch.setattr(tuned_block_sizes, "INPUT_SLOTS_MIN_ROWS", {})
     monkeypatch.setattr(
         tuned_block_sizes,
         "INPUT_LAYOUT_ROWS",
