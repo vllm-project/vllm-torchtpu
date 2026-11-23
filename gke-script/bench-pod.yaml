@@ -1,0 +1,43 @@
+# 压测客户端 pod（CPU，default-pool e2-standard-16），和 2P1D 在同一个 VPC 里，直接打 P0 pod 上的 proxy :8000。
+#   kubectl apply -f bench-pod.yaml
+#   kubectl exec -it dsv41-bench -- bash -l
+#   # 里面：/zzlfs 是共享盘，.venv-epic 可直接用；proxy 地址：bash /zzlfs/temu/vllm-torchtpu-1p1d/gke-script/status.sh 在开发机上看 p0 的 IP（:8000）
+# ubuntu:24.04 自带 glibc 2.39 / python3.12 与 .venv-epic 一致；Ubuntu 24.04 编的 tpu_sync 在这里也能加载（压测用不到）。
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dsv41-bench
+  namespace: default
+  labels:
+    app: dsv41-bench
+spec:
+  nodeSelector:
+    cloud.google.com/gke-nodepool: default-pool
+  restartPolicy: Always
+  containers:
+  - name: bench
+    image: ubuntu:24.04
+    command: ["bash", "-c"]
+    args:
+    - |
+      set -e
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq
+      apt-get install -y -qq python3.12 python3.12-venv curl ca-certificates git jq procps iproute2 >/dev/null
+      git config --global --add safe.directory '*'
+      mkdir -p /tmp/dsv41-tokenizer && cp -r --no-preserve=mode,ownership /zzlfs/temu/tools/dsv41-tokenizer/. /tmp/dsv41-tokenizer/
+      touch /tmp/ready
+      exec sleep infinity
+    readinessProbe:
+      exec: {command: ["test", "-f", "/tmp/ready"]}
+      periodSeconds: 5
+    resources:
+      requests: {cpu: "12", memory: 40Gi}
+    volumeMounts:
+    - {name: zzlfs, mountPath: /zzlfs}
+    - {name: dshm, mountPath: /dev/shm}
+  volumes:
+  - name: zzlfs
+    nfs: {server: 10.128.0.30, path: /zzlfs}
+  - name: dshm
+    emptyDir: {medium: Memory, sizeLimit: 16Gi}
