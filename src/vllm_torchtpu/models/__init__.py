@@ -22,5 +22,9 @@ _BEAM_MODEL = "vllm_torchtpu.models.beam.model:BeamForCausalLM"
 
 def register_top_level_models() -> None:
     from vllm.model_executor.models import ModelRegistry
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+
+    from vllm_torchtpu.models.beam.config import TPUBeamConfig
 
     ModelRegistry.register_model("BeamForCausalLM", _BEAM_MODEL)
+    MODELS_CONFIG_MAP["BeamForCausalLM"] = TPUBeamConfig

@@ -96,7 +96,7 @@ class BeamAttention(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         total_num_heads = config.num_attention_heads
         total_num_kv_heads = config.num_key_value_heads
-        # BeamForCausalLM checks that TP divides the KV head count, so the
+        # TPUBeamConfig checks that TP divides the KV head count, so the
         # merged projection gives every rank whole KV heads.
         self.num_heads = total_num_heads // tp_size
         self.num_kv_heads = total_num_kv_heads // tp_size
@@ -180,10 +180,6 @@ class BeamMLP(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         super().__init__()
         config = _beam_config(vllm_config)
-        if config.hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {config.hidden_act}. Only silu is supported."
-            )
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [config.intermediate_size] * 2,
@@ -317,12 +313,6 @@ class BeamModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = _beam_config(vllm_config)
-        # As upstream's BeamModel: Beam drives SWA per layer off `layer_types`,
-        # passing an explicit `per_layer_sliding_window` (None on the
-        # full-attention layers). Without this, those layers would pick up
-        # `cache_config.sliding_window` as a fallback in `Attention.__init__`
-        # and silently get a window.
-        vllm_config.cache_config.sliding_window = None
         self.rms_norm_eps = config.rms_norm_eps
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -400,37 +390,6 @@ class BeamForCausalLM(nn.Module, SupportsQuant):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = _beam_config(vllm_config)
-        parallel_config = vllm_config.parallel_config
-        if parallel_config.enable_eplb:
-            # Expert parallelism is validated; expert rebalancing is not.
-            raise NotImplementedError(
-                "Beam has not been validated with EPLB; run without --enable-eplb."
-            )
-        if parallel_config.use_sequence_parallel_moe:
-            # Data-parallel attention with expert-parallel MoE routes tokens
-            # through the sequence-parallel path, which is not yet validated.
-            raise NotImplementedError(
-                "Beam has not been validated with sequence-parallel MoE "
-                "(data parallelism with expert parallelism)."
-            )
-        if config.tie_word_embeddings:
-            raise NotImplementedError("Beam requires tie_word_embeddings=False.")
-        # The merged QKV + output-gate projection shards whole KV heads.
-        tp_size = parallel_config.tensor_parallel_size
-        num_heads, num_kv_heads = config.num_attention_heads, config.num_key_value_heads
-        if num_kv_heads % tp_size or num_heads % tp_size:
-            valid = [
-                n
-                for n in range(1, num_kv_heads + 1)
-                if not num_kv_heads % n and not num_heads % n
-            ]
-            raise NotImplementedError(
-                f"Beam on TPU: tensor_parallel_size must divide "
-                f"num_key_value_heads ({num_kv_heads}): use one of {valid}, got "
-                f"{tp_size}. Scale further with --data-parallel-size and "
-                "--enable-expert-parallel."
-            )
-
         self.model = BeamModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -454,8 +413,7 @@ class BeamForCausalLM(nn.Module, SupportsQuant):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if intermediate_tensors is not None:
-            raise NotImplementedError("Beam on TPU does not support PP")
+        assert intermediate_tensors is None, "TPUBeamConfig rejects PP"
         return self.model(input_ids, positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

@@ -13,8 +13,8 @@
 # limitations under the License.
 """Unit tests for the TPU Reflection Beam model.
 
-Covers registration, the decoder-stack wiring and the pure PyTorch ops, on CPU
-and on TPU.
+Covers registration, the config checks, the decoder-stack wiring and the pure
+PyTorch ops, on CPU and on TPU.
 """
 
 import functools
@@ -32,6 +32,7 @@ from vllm.config import (
 )
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.models import ModelRegistry
+from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 from vllm.models.beam.nvidia.model import (
     _depth_scaled_coeffs as upstream_depth_scaled_coeffs,
 )
@@ -39,10 +40,44 @@ from vllm.transformers_utils.configs.beam import BeamConfig
 
 import vllm_torchtpu.models.beam.model as beam_model
 from vllm_torchtpu.models.beam import ops
+from vllm_torchtpu.models.beam.config import TPUBeamConfig
 from vllm_torchtpu.models.beam.model import BeamForCausalLM, _depth_scaled_coeffs
 from vllm_torchtpu.models.vllm import register_models
 
 BF16, FP32 = torch.bfloat16, torch.float32
+
+# The fields of the released Beam-1.0-501B-A23B config.json.
+RELEASED_CONFIG = dict(
+    vocab_size=151936,
+    hidden_size=5120,
+    intermediate_size=20480,
+    num_hidden_layers=52,
+    num_attention_heads=48,
+    num_key_value_heads=8,
+    head_dim=128,
+    hidden_act="silu",
+    max_position_embeddings=1048576,
+    rms_norm_eps=1e-06,
+    tie_word_embeddings=False,
+    rope_parameters={
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        "full_attention": None,
+    },
+    sliding_window=512,
+    # Five sliding layers per full one, then three sliding and one full: 52.
+    layer_types=(["sliding_attention"] * 5 + ["full_attention"]) * 8
+    + ["sliding_attention"] * 3
+    + ["full_attention"],
+    mlp_layer_types=["dense"] * 3 + ["sparse"] * 49,
+    moe_intermediate_size=2560,
+    num_experts_per_tok=8,
+    num_experts=256,
+    norm_topk_prob=True,
+    n_group=8,
+    topk_group=4,
+    routed_scaling_factor=2.5,
+    final_logit_softcapping=30.0,
+)
 
 # Op-test heads: 6 Q heads and 1 K / V head of 128 channels.
 HEAD_DIM, Q_HEADS = 128, 6
@@ -55,7 +90,7 @@ TINY_CONFIG = dict(
     layer_types=["sliding_attention", "full_attention"],
     mlp_layer_types=["dense", "sparse"],
 )  # fmt: skip
-# Positions up to the last of Beam's 2**20 max_position_embeddings.
+# Positions up to the last of the released max_position_embeddings.
 SSMAX_POSITIONS = [0, 1, 15, 2047, 2048, 16384, 100000, 1048575]
 
 
@@ -64,6 +99,90 @@ def test_beam_resolves_to_this_package():
     register_models()
     model_cls = ModelRegistry.models["BeamForCausalLM"].load_model_cls()
     assert model_cls is BeamForCausalLM
+    assert MODELS_CONFIG_MAP["BeamForCausalLM"] is TPUBeamConfig
+
+
+UNSUPPORTED_FLAGS = (
+    "TPU_MOE_SEQUENCE_PARALLEL",
+    "VLLM_TPU_BLOCK_MAJOR_KV",
+    "TPU_GREEDY_TOP_TOKENS",
+)
+
+
+@pytest.fixture
+def clean_check_flags(monkeypatch):
+    """Unsets the TPU flags the config checks reject."""
+    for name in UNSUPPORTED_FLAGS:
+        monkeypatch.delenv(name, raising=False)
+
+
+_PARALLEL_DEFAULTS = dict(
+    tensor_parallel_size=8,
+    pipeline_parallel_size=1,
+    prefill_context_parallel_size=1,
+    decode_context_parallel_size=1,
+    enable_eplb=False,
+)
+
+
+def _config_for_checks(
+    dtype=BF16, speculative_config=None, lora_config=None, **overrides
+):
+    """A VllmConfig stand-in: the released Beam config, no extra features.
+
+    ``overrides`` set parallel_config fields, or else BeamConfig fields.
+    """
+    parallel = {
+        key: overrides.pop(key, value) for key, value in _PARALLEL_DEFAULTS.items()
+    }
+    hf_config = BeamConfig(**{**RELEASED_CONFIG, **overrides})
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf_config, dtype=dtype),
+        parallel_config=SimpleNamespace(**parallel),
+        speculative_config=speculative_config,
+        lora_config=lora_config,
+        # As arg_utils fills it from the model's sliding_window.
+        cache_config=SimpleNamespace(sliding_window=hf_config.sliding_window),
+    )
+
+
+def test_config_accepts_released_model(clean_check_flags):
+    config = _config_for_checks()
+    assert config.cache_config.sliding_window is not None
+    TPUBeamConfig.verify_and_update_config(config)
+    # The full-attention layers must not inherit the window.
+    assert config.cache_config.sliding_window is None
+
+
+REJECTED_CONFIGS = {  # id: (overrides, error match)
+    "dtype": ({"dtype": torch.float16}, "--dtype bfloat16"),
+    "spec": ({"speculative_config": object()}, "--speculative-config"),
+    "lora": ({"lora_config": object()}, "--enable-lora"),
+    "pp": ({"pipeline_parallel_size": 2}, "--pipeline-parallel-size 1"),
+    "pcp": ({"prefill_context_parallel_size": 2}, "context parallelism"),
+    "dcp": ({"decode_context_parallel_size": 2}, "context parallelism"),
+    "eplb": ({"enable_eplb": True}, "--enable-eplb"),
+    # Divides the 48 Q heads but not the 8 KV heads.
+    "tp": ({"tensor_parallel_size": 3}, r"use one of \[1, 2, 4, 8\], got 3"),
+    "hidden_act": ({"hidden_act": "gelu"}, "hidden_act='silu'"),
+    "tied_embeddings": ({"tie_word_embeddings": True}, "tie_word_embeddings=False"),
+}
+
+
+@pytest.mark.parametrize(
+    "overrides,match", REJECTED_CONFIGS.values(), ids=REJECTED_CONFIGS.keys()
+)
+def test_config_rejects_unsupported(clean_check_flags, overrides, match):
+    """Rejected when the config is built, before any worker starts."""
+    with pytest.raises(NotImplementedError, match=match):
+        TPUBeamConfig.verify_and_update_config(_config_for_checks(**overrides))
+
+
+@pytest.mark.parametrize("flag", UNSUPPORTED_FLAGS)
+def test_config_rejects_unsupported_flag(clean_check_flags, monkeypatch, flag):
+    monkeypatch.setenv(flag, "1")
+    with pytest.raises(NotImplementedError, match=f"unset {flag}"):
+        TPUBeamConfig.verify_and_update_config(_config_for_checks())
 
 
 @pytest.mark.parametrize("is_attention", [True, False], ids=["attention", "mlp"])
