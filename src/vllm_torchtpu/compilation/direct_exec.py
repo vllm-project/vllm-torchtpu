@@ -79,6 +79,7 @@ class _Entry:
         "out_kind",
         "out_items",
         "marks",
+        "flat",
     )
 
     def call(self, args: tuple) -> Any:
@@ -88,15 +89,19 @@ class _Entry:
         for i, j in self.dups:
             if args[i] is not args[j]:
                 return None
-        if self.n_in == 1:
-            ops = [self.take(args)]
-        elif self.n_in:
-            ops = list(self.take(args))
+        if self.flat:
+            # Unboxed, all tensors: itemgetter's tuple is the runner's argument.
+            outs = self.runner(self.take(args))
         else:
-            ops = []
-        for pos, value in self.consts:
-            ops.insert(pos, value)
-        outs = self.runner((ops,)) if self.boxed else self.runner(tuple(ops))
+            if self.n_in == 1:
+                ops = [self.take(args)]
+            elif self.n_in:
+                ops = list(self.take(args))
+            else:
+                ops = []
+            for pos, value in self.consts:
+                ops.insert(pos, value)
+            outs = self.runner((ops,)) if self.boxed else self.runner(tuple(ops))
         for ai, oi in self.copies:
             args[ai].copy_(outs[oi])
         items = []
@@ -325,6 +330,7 @@ class _Interceptor:
         e.out_kind = out_kind
         e.out_items = out_items
         e.marks = marks
+        e.flat = not boxed and not consts and len(take_idx) > 1
         return e
 
 
@@ -404,8 +410,16 @@ class DirectExec:
         return self._fn(prog, *args, **kwargs)
 
 
+_FC: Any = None
+
+
 def _skip_compiled() -> bool:
     """The decorator's per-call `skip_compiled` check."""
-    from vllm import forward_context as fc
+    global _FC
+    if _FC is None:
+        from vllm import forward_context
 
-    return fc.is_forward_context_available() and fc.get_forward_context().skip_compiled
+        _FC = forward_context
+    return (
+        _FC.is_forward_context_available() and _FC.get_forward_context().skip_compiled
+    )
