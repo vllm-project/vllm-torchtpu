@@ -21,16 +21,16 @@ suite.
 By default, the `tests` lane's TPU steps run only on TPU v7x. A build picks
 other chips with one of these extras in `CI_EXTRAS` (set it in the Buildkite UI
 or API, alone or with another extra, e.g.
-`CI_EXTRAS=perf-eval,all-tpu-generations`):
+`CI_EXTRAS=perf-eval,tpu-all`):
 
 | `CI_EXTRAS` | The `tests` lane's TPU steps run on |
 |---|---|
 | neither extra | v7x |
-| `all-tpu-generations` | v6e and v7x, each step twice, side by side |
-| `tpu-v6e-only` | v6e alone |
+| `tpu-all` | v6e and v7x, each step twice, side by side |
+| `tpu-v6e` | v6e alone, not alongside v7x |
 
-A build names one of the two at most. `tpu-v6e-only` is refused on a build
-that runs the nightly report (`NIGHTLY=1` or a tag), which waits on the v7x
+A build names one of the two at most. `tpu-v6e` is refused on a build that
+runs the nightly report (`NIGHTLY=1` or a tag), which waits on the v7x
 steps. A merge-queue, release or integration build refuses either one, since a
 failing v6e step would block the merge, the release or the LKG promotion. A
 build that sets `KUBE_SHAPE_SINGLE` or `KUBE_SHAPE_MULTI` is rejected: the

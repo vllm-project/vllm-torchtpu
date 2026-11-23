@@ -78,31 +78,30 @@ TPU_GENERATIONS_BY_NAME: Mapping[str, TpuGeneration] = {
 TPU_GENERATION_FILES: Mapping[str, tuple[TpuGeneration, ...]] = {
     ".buildkite/pipeline_tests.yml": (TPU_V6E, TPU_V7X),
 }
-# The generations those files go up for without ALL_TPU_GENERATIONS_EXTRA.
+# The generations those files go up for without TPU_ALL_EXTRA.
 DEFAULT_TPU_GENERATIONS: tuple[TpuGeneration, ...] = (TPU_V7X,)
 # The generation whose nightly tests-lane steps a verified commit pair needs
 # passed. pipeline_verify.yml's nightly report waits on those steps by key, and
 # nightly_report.sh asks for the key prefix (`bootstrap.py verified-key-prefix`).
 VERIFIED_TPU_GENERATION = TPU_V7X
 # The build extras (CI_EXTRAS, bootstrap.py) that change which generations
-# those files go up for; a build names one at most. ALL_TPU_GENERATIONS_EXTRA
-# sends them up for every generation they list, side by side, and
-# TPU_V6E_ONLY_EXTRA for v6e alone, which leaves out
-# VERIFIED_TPU_GENERATION and so is refused on a build that runs the nightly
-# report. The generation brings its shapes, so the build names no
-# KUBE_SHAPE_* of its own.
-ALL_TPU_GENERATIONS_EXTRA = "all-tpu-generations"
-TPU_V6E_ONLY_EXTRA = "tpu-v6e-only"
-TPU_GENERATION_EXTRAS = (ALL_TPU_GENERATIONS_EXTRA, TPU_V6E_ONLY_EXTRA)
+# those files go up for; a build names one at most. TPU_ALL_EXTRA sends them
+# up for every generation they list, side by side, and TPU_V6E_EXTRA for v6e
+# alone (not alongside v7x), which leaves out VERIFIED_TPU_GENERATION and so is
+# refused on a build that runs the nightly report. The generation brings its
+# shapes, so the build names no KUBE_SHAPE_* of its own.
+TPU_ALL_EXTRA = "tpu-all"
+TPU_V6E_EXTRA = "tpu-v6e"
+TPU_GENERATION_EXTRAS = (TPU_ALL_EXTRA, TPU_V6E_EXTRA)
 
 
 def picked_generations(
     generations: Sequence[TpuGeneration], extras: Collection[str]
 ) -> tuple[TpuGeneration, ...]:
     """The `generations` a file lists that a build with `extras` runs it on."""
-    if ALL_TPU_GENERATIONS_EXTRA in extras:
+    if TPU_ALL_EXTRA in extras:
         return tuple(generations)
-    wanted = (TPU_V6E,) if TPU_V6E_ONLY_EXTRA in extras else DEFAULT_TPU_GENERATIONS
+    wanted = (TPU_V6E,) if TPU_V6E_EXTRA in extras else DEFAULT_TPU_GENERATIONS
     return tuple(gen for gen in generations if gen in wanted)
 
 

@@ -15,10 +15,10 @@
 # The TPU unit test suite on the Kueue fleet; bootstrap.py uploads it with the
 # image build from pipeline_build.yml (CPU checks live in pipeline_cpu.yml).
 # It goes up once for each TPU generation the build runs - v7x alone unless
-# the build's CI_EXTRAS has all-tpu-generations or tpu-v6e-only (see
-# README.md) - with the same steps and tests on each: bootstrap.py fills in the
-# generation's shapes and puts its name before the group name, every label and
-# every key (tpu_generations.py), so no step here names it.
+# the build's CI_EXTRAS has tpu-all or tpu-v6e (see README.md) - with the same
+# steps and tests on each: bootstrap.py fills in the generation's shapes and
+# puts its name before the group name, every label and every key
+# (tpu_generations.py), so no step here names it.
 
 # The `tests` plugin runs on the agent and exports BUILDKITE_TEST_ENGINE_*;
 # bktec runs in the pod, and run.sh forwards that configuration across - see

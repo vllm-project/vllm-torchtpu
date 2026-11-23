@@ -270,8 +270,8 @@ class BuildContext:
                 raise BootstrapError(
                     f"ERROR: {shape_var} was removed; each TPU generation brings "
                     "its own shapes. Set CI_EXTRAS="
-                    f"{tpu_generations.ALL_TPU_GENERATIONS_EXTRA} to run every "
-                    f"generation, or {tpu_generations.TPU_V6E_ONLY_EXTRA} to run "
+                    f"{tpu_generations.TPU_ALL_EXTRA} to run every "
+                    f"generation, or {tpu_generations.TPU_V6E_EXTRA} to run "
                     "v6e alone"
                 )
         ci_extras = _parse_ci_extras(env.get("CI_EXTRAS", ""))
@@ -422,8 +422,8 @@ def choose_suite(ctx: BuildContext) -> Suite:
 def tpu_generations_note(ctx: BuildContext, suite: Suite) -> str | None:
     """Check the build's TPU generation extra; return its annotation, if any.
 
-    Without one a lane runs DEFAULT_TPU_GENERATIONS; ALL_TPU_GENERATIONS_EXTRA
-    adds every other generation the lane lists, and TPU_V6E_ONLY_EXTRA runs v6e
+    Without one a lane runs DEFAULT_TPU_GENERATIONS; TPU_ALL_EXTRA
+    adds every other generation the lane lists, and TPU_V6E_EXTRA runs v6e
     alone (see upload_generations).
 
     Raises BootstrapError on a merge-queue, release or integration build, whose
@@ -474,10 +474,10 @@ def tpu_generations_note(ctx: BuildContext, suite: Suite) -> str | None:
         raise BootstrapError(
             f"ERROR: the {name} extra leaves out TPU {verified.name}, whose "
             "steps the nightly report of this NIGHTLY=1 or release build waits "
-            f"on; use {gens.ALL_TPU_GENERATIONS_EXTRA} instead"
+            f"on; use {gens.TPU_ALL_EXTRA} instead"
         )
     defaults = gens.DEFAULT_TPU_GENERATIONS
-    if name == gens.TPU_V6E_ONLY_EXTRA:
+    if name == gens.TPU_V6E_EXTRA:
         runs = [lane for lane, p in picked.items() if p != tuple(defaults)]
         if not runs:
             return None
