@@ -13,8 +13,10 @@
 # limitations under the License.
 """Tests for TPUWorker"""
 
+import gc
 import multiprocessing
 import os
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -278,6 +280,39 @@ class TestProfileCaptureAndMerge:
             worker.profile(is_start=False)
 
         assert not list(tmp_path.iterdir())
+
+    def test_stop_frees_capture_results_left_in_cycles(self, tmp_path):
+        """Stopping collects, so a capture's cyclic garbage does not wait for
+        the next full collection."""
+        worker = self._make_worker(tmp_path, rank=0, world_size=1)
+        results_refs = []
+
+        class _Results:
+            pass
+
+        def exit_leaving_a_cycle(*args):
+            results = _Results()
+            results.self_ref = results
+            results_refs.append(weakref.ref(results))
+
+        # With automatic collection off, only an explicit collection can free
+        # the cycle; assert before turning it back on.
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with patch("vllm_torchtpu.worker.tpu_worker.torch.profiler") as profiler:
+                profiler.profile.return_value.__exit__.side_effect = (
+                    exit_leaving_a_cycle
+                )
+                worker.profile(is_start=True)
+                self._stage_capture(worker, "t1v-n-host-w-0.xplane.pb", "trace")
+                worker.profile(is_start=False)
+
+            assert len(results_refs) == 1
+            assert results_refs[0]() is None
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
 
 def test_reset_encoder_cache_delegates_to_model_runner():

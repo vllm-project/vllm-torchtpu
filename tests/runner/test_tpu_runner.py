@@ -1451,6 +1451,7 @@ class TestTPURunner:
         self.runner.cache_config = vllm_config.cache_config
         self.runner.scheduler_config = vllm_config.scheduler_config
         self.runner._hybrid_uniform_page_size_bytes = None
+        self.runner._subpage_kernel_block_size = None
         self.runner.max_num_reqs = 16
         self.runner.max_model_len = 1024
         self.runner.max_num_tokens = 2048

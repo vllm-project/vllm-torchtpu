@@ -917,6 +917,33 @@ class TestTpuPlatform:
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is False
 
+    @pytest.mark.parametrize("use_pcp_manager", [False, True])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_validates_pooled_qwen_gdn_pcp_interleave(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        use_pcp_manager,
+    ):
+        monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
+        monkeypatch.setattr(tpu_platform.envs, "USE_TPU_PCP_MANAGER", use_pcp_manager)
+        vllm_config.model_config.architecture = "Qwen3_5ForConditionalGeneration"
+        vllm_config.model_config.get_head_size.return_value = 128
+        vllm_config.cache_config.block_size = 256
+        vllm_config.parallel_config.prefill_context_parallel_size = 4
+        vllm_config.parallel_config.cp_kv_cache_interleave_size = 1
+
+        with pytest.raises(ValueError, match="multiple of 16"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+        vllm_config.parallel_config.cp_kv_cache_interleave_size = 128
+        TpuPlatform.check_and_update_config(vllm_config)
+
     @pytest.mark.parametrize(
         ("initial_cls", "expected_cls"),
         [

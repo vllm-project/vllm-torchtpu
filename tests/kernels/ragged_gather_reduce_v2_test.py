@@ -171,6 +171,42 @@ class ScatterTest(jtu.JaxTestCase):
             except Exception as e:  # pylint: disable=broad-except
                 print(f"Skipping {name} correctness check due to error: {e}")
 
+    def test_sc_ragged_gather_reduce_v2_narrow_hidden(self):
+        """v2 is correct at a 768-wide hidden (a latent-MoE width), where the
+        column split has to continue past the pipeline-depth preference until
+        the row partitions fit the SIMD lanes. Covers v2 only: v1 still
+        asserts on this width.
+        """
+        out_size, hidden, rgs = 16384, 768, 8
+        start, end = 300, 2358
+        key = jax.random.key(0)
+        x = jax.random.normal(key, (out_size, hidden), jnp.float32)
+        x = x.astype(jnp.bfloat16)
+        indices = jax.random.permutation(key, out_size)
+        topk_weights = jax.random.normal(key, (out_size,), jnp.bfloat16)
+        valid_rows_mask = jnp.logical_and(start <= indices, indices < end)
+        # The SparseCore kernel, not the TensorCore fallback, has to serve this
+        # shape, or the test passes without reaching the column split.
+        cfg = rgr_v2_config.Config(
+            input_size=indices.size,
+            hidden_size=hidden,
+            source_rows=out_size,
+            reduce_group_size=rgs,
+            in_dtype=x.dtype,
+            core_axis_name="core",
+            subcore_axis_name="subcore",
+            tpu_info=pltpu.get_tpu_info(),
+        )
+        if get_sparse_core_info(cfg.tpu_info) is None:
+            self.skipTest("no SparseCore on this TPU")
+        self.assertFalse(cfg.should_fallback)
+        self.assertLessEqual(cfg.num_row_partitions, cfg.sc_info.num_lanes)
+        desired = reference_ragged_gather_reduce(
+            x, indices, topk_weights, valid_rows_mask, rgs
+        )
+        actual = ragged_gather_reduce_v2(x, indices, topk_weights, valid_rows_mask, rgs)
+        np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
+
     def test_sc_ragged_gather_reduce_v2_multiwindow(self):
         """v2 is correct when the input spans multiple resident sort-permutation
         windows: the windowed DMA and window-relative indexing, and -- at

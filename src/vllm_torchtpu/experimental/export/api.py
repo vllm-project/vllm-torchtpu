@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
@@ -104,6 +105,9 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
         max_verify_tokens: The draft tokens a step can verify beyond the drafter's,
             such as tokens a grammar forces: a recurrent model keeps a checkpoint per
             verify token, as it does per draft token. 0 for only the drafter's.
+        additional_config: Optional JSON-serializable backend/runtime configuration
+            copied from `vllm_config.additional_config` and recorded as
+            `serving_config.additional_config` when non-empty; None for none.
     """
 
     vocab_size: int = 151936
@@ -125,8 +129,14 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     uses_mrope: bool = False
     speculative_config: dict[str, Any] | None = None
     max_verify_tokens: int = 0
+    additional_config: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.additional_config is not None:
+            try:
+                json.dumps(self.additional_config)
+            except TypeError as exc:
+                raise TypeError("additional_config must be JSON-serializable") from exc
         if self.max_verify_tokens < 0:
             raise ValueError(
                 f"max_verify_tokens must be >= 0, got {self.max_verify_tokens}"

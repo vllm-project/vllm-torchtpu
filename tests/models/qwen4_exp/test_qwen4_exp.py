@@ -38,13 +38,13 @@ from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEFp8EmbeddingMethod,
 )
 
-import vllm_torchtpu.models.vllm.qwen4_exp.model as qwen4_model
+import vllm_torchtpu.models.qwen4_exp.model as qwen4_model
 from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
 from vllm_torchtpu.layers import register_layers
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
-from vllm_torchtpu.models.vllm.qwen4_exp.config import TPUQwen4ExpConfig
-from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpForCausalLM
-from vllm_torchtpu.models.vllm.qwen4_exp.ple import (
+from vllm_torchtpu.models.qwen4_exp.config import TPUQwen4ExpConfig
+from vllm_torchtpu.models.qwen4_exp.model import Qwen4ExpForCausalLM
+from vllm_torchtpu.models.qwen4_exp.ple import (
     PLEInputs,
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLELayer,

@@ -46,6 +46,9 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from tests.runner.runner_input_test_utils import (
+    attention_layer_mock as _attention_layer_mock,
+)
 from vllm_torchtpu import utils
 from vllm_torchtpu.core.runner_slot_mamba import RunnerSlotMambaSpec
 from vllm_torchtpu.layers.adapter.attention import (
@@ -66,18 +69,6 @@ from vllm_torchtpu.runner.kv_cache_manager import (
 )
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_worker import TPUWorker
-
-
-def _attention_layer_mock():
-    """An `Attention` mock whose `get_attn_backend()` returns a real backend.
-
-    `get_kv_cache_spec` measures page padding through the backend the layer
-    reports. A bare `MagicMock` returns a mock shape, which iterates as empty
-    and silently makes that arithmetic meaningless.
-    """
-    layer = MagicMock(spec=Attention)
-    layer.get_attn_backend.return_value = PallasAttentionBackend
-    return layer
 
 
 class DummyMamba(MambaBase):
@@ -210,6 +201,7 @@ def test_get_kv_cache_spec_sparse_mla(monkeypatch, layout):
     runner.vllm_config.attention_config = None  # no HiSparse
     runner.use_spmd = False
     runner._hybrid_uniform_page_size_bytes = None
+    runner._subpage_kernel_block_size = None
     runner._unified_kv_layout = False
     runner._mamba_num_blocks = None
     runner._uniform_mamba_layout = False
@@ -284,6 +276,7 @@ class TestKVCacheManager:
         self.runner.cache_config = vllm_config.cache_config
         self.runner.scheduler_config = vllm_config.scheduler_config
         self.runner._hybrid_uniform_page_size_bytes = None
+        self.runner._subpage_kernel_block_size = None
         self.runner.max_num_reqs = 16
         self.runner.max_model_len = 1024
         self.runner.max_num_tokens = 2048
@@ -2734,6 +2727,7 @@ def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
         shared_kv_cache_layers={},
         runner_only_attn_layers=set(),
         _hybrid_uniform_page_size_bytes=None,
+        _subpage_kernel_block_size=None,
         _unified_kv_layout=False,
         _uniform_mamba_layout=False,
         _mamba_num_blocks=None,

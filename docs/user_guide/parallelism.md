@@ -109,13 +109,14 @@ A pipeline stage may also span a prefill context-parallel group (`--prefill-cont
 
 For long-context workloads (32K–256K+ tokens) or Prefill/Decode disaggregated serving:
 
-- **Prefill Context Parallelism (`--prefill-context-parallel-size`)**: Distributes prefill sequence chunks across `PCP` ranks. `TPU_PCP_TOPOLOGY_AWARE_MESH=1` (enabled by default) binds consecutive PCP ranks to adjacent physical chips on the ICI torus to minimize ring-attention hop latency.
+- **Prefill Context Parallelism (`--prefill-context-parallel-size`)**: Distributes prefill sequence chunks across `PCP` ranks. `TPU_PCP_TOPOLOGY_AWARE_MESH=1` (enabled by default) binds consecutive PCP ranks to adjacent physical chips on the ICI torus to minimize ring-attention hop latency. Pooled Qwen GDN hybrid models require `--cp-kv-cache-interleave-size` to be a multiple of `16` (for example, `128` or `256`; vLLM defaults to `1`).
 - **Decode Context Parallelism (`--decode-context-parallel-size`)**: Distributes KV cache pages across `DCP` ranks during decode.
 
 ```bash
 vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
   --tensor-parallel-size 2 \
   --prefill-context-parallel-size 4 \
+  --cp-kv-cache-interleave-size 128 \
   --enable-expert-parallel \
   --kv-cache-dtype fp8 \
   --max-model-len 65536

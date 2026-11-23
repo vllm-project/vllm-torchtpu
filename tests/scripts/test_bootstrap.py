@@ -1580,6 +1580,31 @@ class TestBootstrapUnits(unittest.TestCase):
             [],
         )
 
+        # API-triggered nightly/canary builds do not skip on a docs-only HEAD commit.
+        api_torchtpu_nightly = self._run_bootstrap(
+            {
+                "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-torchtpu-nightly",
+                "TORCHTPU_NIGHTLY": "1",
+                "BUILDKITE_SOURCE": "api",
+                "BUILDKITE_BRANCH": "main",
+            },
+            files=[".github/CODEOWNERS"],
+        )
+        self.assertEqual(
+            [u[0] for u in api_torchtpu_nightly.uploads],
+            ["verify", "integration", "tests", "cpu", "build"],
+        )
+        api_nightly = self._run_bootstrap(
+            {
+                "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-nightly",
+                "NIGHTLY": "1",
+                "BUILDKITE_SOURCE": "api",
+                "BUILDKITE_BRANCH": "main",
+            },
+            files=["README.md"],
+        )
+        self.assertNotEqual(api_nightly.uploads, [])
+
     def test_orchestration_merge_queue_and_ci_commands(self) -> None:
         # /ci run with CI_EXTRAS=perf-eval runs pr+perf-eval 2-stage with author group.
         ci_run = self._run_bootstrap(

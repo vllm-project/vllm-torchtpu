@@ -19,9 +19,12 @@ from unittest.mock import MagicMock
 import numpy as np
 import torch
 from vllm.config.reasoning import ReasoningConfig
+from vllm.model_executor.layers.attention import Attention
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
+from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import create_sequence_layout_planner
@@ -430,3 +433,28 @@ def _make_sample_runner(
         runner  # type: ignore[arg-type]
     )
     return runner
+
+
+def attention_layer_mock(backend=PallasAttentionBackend, **attrs):
+    """An `Attention` mock whose `get_attn_backend()` returns a real backend.
+
+    `get_kv_cache_spec` measures page padding through the backend the layer
+    reports. A bare `MagicMock` returns a mock shape, which iterates as empty
+    and silently makes that arithmetic meaningless.
+
+    `attrs` set layer attributes; when given, the layer is also a plain
+    decoder layer with no sliding window, KV sharing or draft role unless
+    `attrs` say otherwise.
+    """
+    layer = MagicMock(spec=Attention)
+    layer.get_attn_backend.return_value = backend
+    if attrs:
+        defaults = {
+            "attn_type": AttentionType.DECODER,
+            "sliding_window": None,
+            "kv_sharing_target_layer_name": None,
+            "is_draft_layer": False,
+        }
+        for name, value in {**defaults, **attrs}.items():
+            setattr(layer, name, value)
+    return layer
