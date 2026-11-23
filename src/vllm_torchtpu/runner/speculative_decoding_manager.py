@@ -12,6 +12,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 from vllm_torchtpu.layers.core.attention_metadata import stage_h2d_upload
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+from vllm_torchtpu.spec_decode.utils import DraftStepTokens
 
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -156,7 +157,7 @@ class SpeculativeDecodingManager:
         return_device: bool = False,
         next_tokens_per_chunk: list[torch.Tensor] | None = None,
         device_seed: torch.Tensor | list[torch.Tensor] | None = None,
-    ) -> torch.Tensor | list[torch.Tensor] | None:
+    ) -> torch.Tensor | list[torch.Tensor] | DraftStepTokens | None:
         """Proposes draft token IDs based on the speculative decoding method.
 
         The single dispatch point for all draft proposing. eagle3 is called
@@ -249,7 +250,7 @@ class SpeculativeDecodingManager:
                     device_seed=device_seed,
                 )
             if return_device:
-                assert isinstance(result, torch.Tensor | list)
+                assert isinstance(result, torch.Tensor | list | DraftStepTokens)
                 return result
             assert isinstance(result, list)
             self._draft_token_ids = cast("list[list[int]]", result)
