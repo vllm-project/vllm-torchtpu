@@ -2437,6 +2437,41 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return sparse_mla_dcp_impl
 
+    def _quantized_kv_latents(
+        self, layer: Any, kv_c_normed: torch.Tensor, k_pe: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`(kv_c_normed, k_pe)` as `forward`'s cache writes take them: quantized
+        to the cache dtype when the cache is quantized (otherwise left in their
+        input dtype), flattened to `[num_tokens, kv_lora_rank]` and
+        `[num_tokens, qk_rope_head_dim]`.
+
+        A writer that must store the same bytes as `forward` should call this too.
+
+        Under a TurboQuant cache only `k_pe` is quantized here (to the fp8 RoPE
+        cache format); the latent stays in its input dtype and is quantized to
+        4-bit codes inside the sparse op. That branch is checked first because
+        a TurboQuant layer's `kv_cache_quantized_dtype` is `torch.uint8`.
+        """
+        if self._is_turboquant(layer):
+            _, k_scale, _ = self._get_kv_scales(layer)
+            assert k_scale is not None
+            k_pe, _ = quantize_kv(
+                torch.float8_e4m3fn, k_pe, value=None, k_scale=k_scale
+            )
+        elif layer.kv_cache_quantized_dtype is not None:
+            _, k_scale, _ = self._get_kv_scales(layer)
+            assert k_scale is not None
+            kv_c_normed, _ = quantize_kv(
+                layer.kv_cache_quantized_dtype, kv_c_normed, value=None, k_scale=k_scale
+            )
+            k_pe, _ = quantize_kv(
+                layer.kv_cache_quantized_dtype, k_pe, value=None, k_scale=k_scale
+            )
+        return (
+            kv_c_normed.view(-1, layer.kv_lora_rank),
+            k_pe.view(-1, layer.qk_rope_head_dim),
+        )
+
     def forward(
         self,
         layer: Any,
@@ -2507,28 +2542,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             ql_nope = ql_nope * w_uk_t_scale
         ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
 
-        q_scale, k_scale, v_scale = self._get_kv_scales(layer)
-
-        if self._is_turboquant(layer):
-            # The latent is quantized to 4-bit codes inside the sparse op;
-            # only the RoPE key keeps the fp8 cache format.
-            assert k_scale is not None
-            k_pe, _ = quantize_kv(
-                torch.float8_e4m3fn, k_pe, value=None, k_scale=k_scale
-            )
-        elif layer.kv_cache_quantized_dtype is not None:
-            assert k_scale is not None
-            kv_c_normed, _ = quantize_kv(
-                layer.kv_cache_quantized_dtype, kv_c_normed, value=None, k_scale=k_scale
-            )
-            k_pe, _ = quantize_kv(
-                layer.kv_cache_quantized_dtype, k_pe, value=None, k_scale=k_scale
-            )
-
         ql_nope_flat = ql_nope.view(-1, attn_heads, layer.kv_lora_rank)
         q_pe_flat = q_pe.view(-1, attn_heads, layer.qk_rope_head_dim)
-        kv_c_normed_flat = kv_c_normed.view(-1, layer.kv_lora_rank)
-        k_pe_flat = k_pe.view(-1, layer.qk_rope_head_dim)
+        kv_c_normed_flat, k_pe_flat = self._quantized_kv_latents(
+            layer, kv_c_normed, k_pe
+        )
 
         if topk_indices is not None:
             assert isinstance(kv_cache, (tuple, list)) and len(kv_cache) == 2, (
@@ -2608,6 +2626,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 )
         else:
             if not hasattr(layer, "mla_op") or layer.mla_op is None:
+                q_scale, k_scale, v_scale = self._get_kv_scales(layer)
                 layer.mla_op = self._build_mla_op(
                     layer, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
                 )
