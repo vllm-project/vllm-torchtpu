@@ -97,6 +97,14 @@ def test_settles_when_the_awaited_step_is_the_newest():
     assert [c[0] for c in executor.calls] == ["pp_push", "pp_settle", "pp_settle"]
 
 
+def test_two_stages_settle_without_pushes():
+    executor = _Executor()
+    wave = pp_push._WaveState(stages=2)
+    assert _futures(executor, wave, 1)[0].result() == 1
+    assert [c[0] for c in executor.calls] == ["pp_settle"]
+    assert not wave.open
+
+
 def test_the_future_forwards_to_the_executors_future():
     executor = _Executor()
     wave = pp_push._WaveState(stages=2)
@@ -283,10 +291,36 @@ def test_each_executor_pushes_for_its_own_pipeline_size(monkeypatch, queue):
     two = _install_on_fake_executor(monkeypatch, stages=2)
     four = type(two)(stages=4)
     pp_push.patch_executor_for_pp_wave(four.vllm_config)
-    # two stages: every launch pairs on its own, so neither push nor settle
+    # two stages: launches pair directly without pushes, but the burst still settles
     assert two.execute_model(_step(16, 1)) == ("forward", 1)
-    assert two.calls == []
+    assert [c[0] for c in two.calls] == ["pp_settle"]
     # four stages: the same lone step settles as well
     assert four.execute_model(_step(16, 1)) == ("forward", 1)
     assert [c[0] for c in four.calls] == ["pp_settle"]
     assert queue(1, 1).kwargs["max_chunks"] == 24
+
+
+def test_pipeline_executor_never_asks_the_workers_for_draft_tokens(monkeypatch, queue):
+    executor = _install_on_fake_executor(monkeypatch, stages=4)
+    assert executor.take_draft_token_ids() is None
+    assert executor.calls == []
+
+
+def test_the_listener_hears_every_push_and_settle():
+    executor = _Executor()
+    wave = pp_push._WaveState(stages=8)
+    heard = []
+    wave.listener = lambda pushes, settled: heard.append((pushes, settled))
+    futures = _futures(executor, wave, 9)
+    # Waiting on step 5 with 4 later steps in flight sends two pushes.
+    assert futures[4].result() == 5
+    assert heard == [(2, False)]
+    # A push the engine core sends itself (lazy pushes) is heard too.
+    wave.push(executor)
+    assert heard == [(2, False), (1, False)]
+    # The settle that closes the burst is heard as such.
+    assert futures[8].result() == 9
+    assert heard == [(2, False), (1, False), (0, True)]
+    # A settle with nothing open is not sent and not heard.
+    assert wave.settle(executor) is None
+    assert len(heard) == 3

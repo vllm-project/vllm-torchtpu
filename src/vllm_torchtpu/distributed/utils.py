@@ -105,12 +105,12 @@ def get_stage3_status_probe_s() -> float:
 
 
 def get_stage3_register_ahead_enabled() -> bool:
-    """Whether a PCP, TP or DP Stage-3 producer publishes a request's send
-    in the scheduler step that completes its prompt, so its workers
-    register the KV blocks while that step runs instead of in the step
-    after the finish response, where the registration first waits for the
-    next batch's forward (default on). Pipeline producers always register
-    ahead."""
+    """Whether a PCP, TP or DP Stage-3 producer, or a GLM pipeline producer,
+    publishes a request's send in the scheduler step that completes its
+    prompt, so its workers register the KV blocks while that step runs
+    instead of in the step after the finish response, where the
+    registration first waits for the next batch's forward (default on).
+    Other pipeline producers always register ahead."""
     return bool(envs.TPU_RAIDEN_STAGE3_REGISTER_AHEAD)
 
 

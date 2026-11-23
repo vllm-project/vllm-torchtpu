@@ -24,7 +24,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from vllm_torchtpu.distributed.mesh_utils import CpGroupLayout, get_cp_group_layout
+from vllm_torchtpu.distributed.mesh_utils import (
+    CpGroupLayout,
+    get_cp_group_layout,
+    get_pipeline_stage,
+    get_stage_mesh,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -32,8 +37,8 @@ logger = init_logger(__name__)
 # The JAX mesh axis the DCP kernels shard the KV cache over.
 DCP_AXIS_NAME = "dcp"
 # The TP lanes DCP does not shard over. No kernel collects over it; it is
-# there so the mesh spans the world, which torch_tpu requires of a Pallas
-# kernel mesh.
+# there so the mesh spans the world (or the pipeline stage), which torch_tpu
+# requires of a Pallas kernel mesh.
 DCP_LANE_AXIS_NAME = "dcp_lane"
 
 # DCP builds its own mesh rather than going through Torchtpu-free helpers, so
@@ -85,7 +90,7 @@ def dcp_rank_operand(device: Any = None) -> Any:
 
 
 def dcp_lane_operand(device: Any = None) -> Any:
-    """This rank's lane, ``global_rank // dcp_size``, as an int32 ``[1]``
+    """This rank's lane, ``stage_rank // dcp_size``, as an int32 ``[1]``
     tensor: its index on the ``(lane, DCP)`` mesh's lane axis, which
     ``dcp_rank_operand`` does not carry (`TPU_DCP_INDEXER_SMALL_AG`, whose
     remote DMAs address a peer as ``(my lane, j)``). Passed like the rank
@@ -100,10 +105,24 @@ def dcp_lane_operand(device: Any = None) -> Any:
     t = _RANK_OPERANDS.get(key)
     if t is None:
         dcp_size = get_dcp_world_size()
-        rank = int(dist.get_rank()) if dist.is_initialized() else 0
+        rank = 0
+        if dist.is_initialized():
+            rank = int(dist.get_rank()) - _stage_span()[0]
         t = torch.tensor([rank // max(dcp_size, 1)], dtype=torch.int32, device=device)
         _RANK_OPERANDS[key] = t
     return t
+
+
+def _stage_span() -> tuple[int, int]:
+    """The first global rank and the rank count of this worker's pipeline
+    stage; the whole world without pipeline parallelism. vLLM orders ranks
+    with the pipeline outside TP, so a stage is a contiguous run."""
+    import torch.distributed as dist
+
+    world_size = int(dist.get_world_size()) if dist.is_initialized() else 1
+    stage, stages = get_pipeline_stage()
+    stage_size = world_size // stages
+    return stage * stage_size, stage_size
 
 
 def get_dcp_world_size() -> int:
@@ -117,19 +136,21 @@ def get_dcp_group_layout() -> CpGroupLayout:
 
 
 def _validate_dcp_rank_alignment(group: Any, dcp_size: int) -> None:
-    """Check DCP is the fastest-varying factor of the global rank.
+    """Check DCP is the fastest-varying factor of the rank within the stage.
 
     ``get_pallas_mesh`` numbers mesh positions by PyTorch rank, so a
     ``(lane, dcp)`` mesh only describes the DCP grouping when
-    ``global_rank == lane * dcp_size + dcp_rank``. If it does not, the mesh
-    still builds and the kernels still run -- they collect over the wrong
-    partners, which is a wrong answer rather than an error.
+    ``global_rank == stage_start + lane * dcp_size + dcp_rank``. If it does
+    not, the mesh still builds and the kernels still run -- they collect over
+    the wrong partners, which is a wrong answer rather than an error.
     """
     import torch.distributed as dist
 
     rank = int(dist.get_rank())
-    lane, dcp_rank = divmod(rank, dcp_size)
-    expected = tuple(range(lane * dcp_size, (lane + 1) * dcp_size))
+    stage_start, _ = _stage_span()
+    lane, dcp_rank = divmod(rank - stage_start, dcp_size)
+    first = stage_start + lane * dcp_size
+    expected = tuple(range(first, first + dcp_size))
     actual = tuple(int(value) for value in group.ranks)
     if actual != expected or int(group.rank_in_group) != dcp_rank:
         raise RuntimeError(
@@ -150,14 +171,32 @@ def _single_device_dcp_mesh(axis_names: tuple[str, str]) -> Any:
     return Mesh(devices, axis_names=axis_names)
 
 
-def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
-    """Build the full-world ``(lane, DCP)`` mesh the DCP Pallas ops run on.
+def _dcp_stage_mesh(
+    axis_names: tuple[str, str], shape: tuple[int, int], stage_size: int
+) -> Any:
+    """The ``(lane, DCP)`` mesh over one pipeline stage, built on the stage's
+    TP group so its kernels launch on the stage's devices only."""
+    from vllm.distributed.parallel_state import get_tp_group
 
-    torch_tpu requires a Pallas kernel's mesh to span the whole world, so the
-    mesh carries a leading axis for the TP lanes DCP does not shard over. The
-    kernels still collect only over `axis_name`, which gives one independent
-    DCP group per lane. Under `dcp == tp` the shape is `(1, world)` and the
-    device order is the one the single-axis builder used to produce.
+    tp_group = get_tp_group()
+    if int(tp_group.world_size) != stage_size:
+        raise NotImplementedError(
+            "DCP with pipeline parallelism needs a stage made of one TP group: "
+            f"TP={tp_group.world_size}, stage of {stage_size} ranks."
+        )
+    layout = get_cp_group_layout(tp_group)
+    return get_stage_mesh(axis_names, shape, tp_group, layout.device_ids)
+
+
+def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
+    """Build the ``(lane, DCP)`` mesh the DCP Pallas ops run on.
+
+    The mesh spans the whole world, or this worker's pipeline stage under
+    pipeline parallelism, so it carries a leading axis for the TP lanes DCP
+    does not shard over. The kernels still collect only over `axis_name`,
+    which gives one independent DCP group per lane. Under `dcp == tp` the
+    shape is `(1, world)` and the device order is the one the single-axis
+    builder used to produce.
 
     The axis name defaults to `DCP_AXIS_NAME`; the kernels take the same
     constant from here, so a caller that overrides it has to override it in
@@ -173,26 +212,30 @@ def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
         return _single_device_dcp_mesh(axis_names)
 
     dcp_size = int(group.world_size)
-    world_size = int(dist.get_world_size())
-    if dcp_size <= 0 or world_size % dcp_size:
+    _, stages = get_pipeline_stage()
+    _, stage_size = _stage_span()
+    if dcp_size <= 0 or stage_size % dcp_size:
         raise NotImplementedError(
-            f"dcp_size={dcp_size} must divide the torch.distributed world of "
-            f"{world_size}."
+            f"dcp_size={dcp_size} must divide the {stage_size} ranks of a "
+            "pipeline stage."
         )
     _validate_dcp_rank_alignment(group, dcp_size)
 
-    shape = (world_size // dcp_size, dcp_size)
+    shape = (stage_size // dcp_size, dcp_size)
     ranks = tuple(int(value) for value in group.ranks)
-    cache_key = (axis_names, shape, ranks)
+    cache_key = (axis_names, shape, ranks, stages)
     cached = _MESH_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    from torch_tpu._internal.pallas import get_pallas_mesh
+    if stages > 1:
+        mesh = _dcp_stage_mesh(axis_names, shape, stage_size)
+    else:
+        from torch_tpu._internal.pallas import get_pallas_mesh
 
-    # No device array: get_pallas_mesh numbers mesh positions by PyTorch rank,
-    # which is the binding torch_tpu#3522 guarantees.
-    mesh = get_pallas_mesh(axis_names=axis_names, mesh_shape=shape)
+        # No device array: get_pallas_mesh numbers mesh positions by PyTorch
+        # rank, which is the binding torch_tpu#3522 guarantees.
+        mesh = get_pallas_mesh(axis_names=axis_names, mesh_shape=shape)
     logger.info(
         "DCP device mesh | axes=%s shape=%s rank_in_group=%d ranks=%s",
         axis_names,

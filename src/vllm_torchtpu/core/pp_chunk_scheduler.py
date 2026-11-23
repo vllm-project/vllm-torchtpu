@@ -11,8 +11,12 @@ whatever their position in the running queue. When the pending prefill
 work cannot fill every stage with a full step, the step shrinks to that
 work spread over the pipeline, so a lone prompt runs as one small step per
 stage instead of trailing itself through the pipeline one full step at a
-time; a busy server keeps full steps and first-come order. A step also holds
-at most as many (query block, KV block) attention pairs as the batched
+time; a busy server keeps full steps and first-come order. The stages advance
+in lockstep, so while a larger step is still in the pipeline every step lasts
+at least as long as it does: the spreads are costed against the steps in
+flight, which the scheduler tracks from its own steps and from the pushes and
+settles the engine sends between them (``pipeline_advanced``). A step also
+holds at most as many (query block, KV block) attention pairs as the batched
 attention kernel can schedule, which bounds a chunk deep in a very long
 prompt so the kernel never overruns its SMEM. The cost model
 arrives after the engine core has built its executor and scheduler; until
@@ -20,9 +24,11 @@ then chunks are cut by token count alone.
 """
 
 import math
+from itertools import islice
 from typing import Any, cast
 
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.core.pp_chunks import StepCostModel
@@ -31,6 +37,12 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 SCHEDULER_CLS = "vllm_torchtpu.core.pp_chunk_scheduler.TpuPipelineChunkScheduler"
+# The scheduler classes that size pipeline steps by time: this module's and
+# its prefix-aware subclass, which the platform leaves configured.
+CHUNK_SCHEDULER_CLSES = (
+    SCHEDULER_CLS,
+    "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwarePipelineChunkScheduler",
+)
 
 
 def uses_dynamic_chunks(vllm_config: Any) -> bool:
@@ -39,8 +51,12 @@ def uses_dynamic_chunks(vllm_config: Any) -> bool:
     return (
         vllm_config is not None
         and vllm_config.parallel_config.pipeline_parallel_size > 1
-        and vllm_config.scheduler_config.scheduler_cls == SCHEDULER_CLS
+        and vllm_config.scheduler_config.scheduler_cls in CHUNK_SCHEDULER_CLSES
     )
+
+
+# Waiting requests looked at per queue for TPU_PP_SHORTER_PREFILL_FIRST.
+_SHORTER_FIRST_WINDOW = 64
 
 
 def _prefill_end(request: Any) -> int:
@@ -61,14 +77,41 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._step_prefill_tokens = 0
         self._step_schedule = 0
         self._seeded: set[str] = set()
+        # Modelled time of the steps still in the pipeline, newest first: a
+        # step launched k steps ago runs for pp_size - k more steps. A push
+        # enters as a step of no cost and ages the steps before it; a settle
+        # leaves the pipeline empty (pipeline_advanced).
+        self._inflight_ms: list[float] = []
         self._clips = 0
         self._waits = 0
+        # TPU_PP_SHORTER_PREFILL_FIRST: prompt tokens left per request, for
+        # the requests this step has not sized yet.
+        self._unsized: dict[str, int] = {}
+        self._yield_to_waiting = True
+        self._yields = 0
         logger.info("Pipeline chunk scheduler: waiting for the step cost model")
 
     def install_cost_model(self, model: StepCostModel) -> None:
         self._cost = model
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
         logger.info("Pipeline chunk scheduler: %s", model.describe())
+
+    def _enter(self, step_ms: float) -> None:
+        """Records a step entering the pipeline; the oldest one leaves."""
+        self._inflight_ms = [step_ms, *self._inflight_ms][: max(self._pp_size - 1, 0)]
+
+    def pipeline_advanced(self, pushes: int = 0, settled: bool = False) -> None:
+        """Keeps the in-flight history in step with the pipeline outside
+        scheduler steps: each push is a step that carries nothing, so it
+        enters at no cost and ages the steps before it; a settle, sent once
+        nothing is in flight, leaves the pipeline empty. Without this a
+        burst that follows a wait would be costed against steps that have
+        long left the pipeline."""
+        if settled:
+            self._inflight_ms = []
+            return
+        for _ in range(max(int(pushes), 0)):
+            self._enter(0.0)
 
     def _account(self, tokens: int, prefix: int) -> None:
         self._step_tokens += tokens
@@ -92,7 +135,18 @@ class TpuPipelineChunkScheduler(Scheduler):
             if computed >= _prefill_end(request) and request.num_tokens > computed:
                 self._account(1, computed)
                 self._seeded.add(request.request_id)
-        return super().schedule(throttle_prefills)
+        self._unsized, waiting_ids = self._shorter_first_plan()
+        output = super().schedule(throttle_prefills)
+        # Room no waiting request took (none was admitted) would be left
+        # again next step; that step leaves room for running requests only.
+        self._yield_to_waiting = not waiting_ids or any(
+            req_id in output.num_scheduled_tokens for req_id in waiting_ids
+        )
+        if self._cost is not None and output.total_num_scheduled_tokens > 0:
+            estimate = self.step_estimate_ms(output)
+            assert estimate is not None
+            self._enter(estimate)
+        return output
 
     def step_estimate_ms(self, scheduler_output: Any) -> float | None:
         """Modelled time on one stage of the step the last ``schedule``
@@ -111,14 +165,94 @@ class TpuPipelineChunkScheduler(Scheduler):
         bucket = next((b for b in buckets if b >= total), buckets[-1])
         return self._cost.step_ms(bucket, pairs, squares)
 
+    def _shorter_first_plan(self) -> tuple[dict[str, int], set[str]]:
+        """Prompt tokens left per request that this step can serve: the
+        running prefills and, up to the free request slots, the waiting
+        requests with less left than the longest of them. Also returns the
+        ids of those waiting requests. Empty unless a prefill is running."""
+        if not envs.TPU_PP_SHORTER_PREFILL_FIRST or self._cost is None:
+            return {}, set()
+        left = {}
+        for request in self.running:
+            tokens = _prefill_end(request) - request.num_computed_tokens
+            if tokens > 0:
+                left[request.request_id] = tokens
+        if not left or not self._yield_to_waiting:
+            return left, set()
+        longest = max(left.values())
+        free_slots = (
+            self.max_num_running_reqs
+            - len(self.running)
+            - self.num_waiting_for_streaming_input
+        )
+        shorter = []
+        for queue in (self.waiting, self.skipped_waiting):
+            for request in islice(queue, _SHORTER_FIRST_WINDOW):
+                if not self._admits_now(request):
+                    continue
+                tokens = self._waiting_prefill_tokens(request)
+                if 0 < tokens < longest:
+                    shorter.append(
+                        (tokens, request.arrival_time, request.request_id)
+                    )
+        waiting_ids = set()
+        for tokens, _, req_id in sorted(shorter)[: max(free_slots, 0)]:
+            left[req_id] = tokens
+            waiting_ids.add(req_id)
+        return left, waiting_ids
+
+    def _admits_now(self, request: Any) -> bool:
+        """Whether the waiting loop would take the request this step."""
+        if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return request.request_id in self.finished_recving_kv_req_ids
+        return request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+
+    def _waiting_prefill_tokens(self, request: Any) -> int:
+        """Prompt tokens a waiting request computes once it is admitted."""
+        computed = request.num_computed_tokens
+        kvm = self.kv_cache_manager
+        if (
+            computed == 0
+            and kvm.enable_caching
+            and not request.skip_reading_prefix_cache
+        ):
+            hit = kvm.coordinator.find_longest_cache_hit(
+                request.block_hashes, max(request.num_tokens - 1, 0)
+            )
+            computed = int(hit[1])
+        return max(_prefill_end(request) - computed, 1)
+
+    def _yielded_tokens(self, request: Any) -> int:
+        """Tokens of this step that a running prefill leaves to the requests
+        sized after it that have less prompt left. A waiting request is never
+        held back: its turn ends the waiting loop when it gets no tokens."""
+        mine = self._unsized.pop(request.request_id, None)
+        if mine is None or request.status != RequestStatus.RUNNING:
+            return 0
+        assert self._cost is not None
+        top = self._cost.buckets[-1]
+        owed = sum(min(t, top) for t in self._unsized.values() if t < mine)
+        if owed:
+            self._yields += 1
+            if self._yields == 1 or self._yields % 1000 == 0:
+                logger.info(
+                    "Pipeline chunk scheduler: %d running prefill chunks left "
+                    "room for shorter requests",
+                    self._yields,
+                )
+        return min(owed, top)
+
     def _pending_step_limit(self) -> int | None:
         """The bucket a step is held to: the prefill work still to schedule
         spread over up to as many steps as the pipeline has stages, rounded
         up to a granule, at most a full step. Of those spreads the one that
         gets the work through the pipeline soonest is taken: a step of half
-        the tokens that takes as long as the whole one only adds steps.
-        None until the cost model is installed or when no prefill work is
-        pending."""
+        the tokens that takes as long as the whole one only adds steps. The
+        stages advance in lockstep, so while a larger step is still in the
+        pipeline every step lasts at least as long as it does and a smaller
+        one finishes no sooner; the spreads are costed against the steps in
+        flight. None until the cost model is installed or when no prefill
+        work is pending."""
         if self._cost is None:
             return None
         pending = 0
@@ -139,7 +273,15 @@ class TpuPipelineChunkScheduler(Scheduler):
             # The last of the work leaves the pipeline a stage count minus
             # one steps after its step enters.
             steps = -(-pending // share) + self._pp_size - 1
-            done_ms = steps * self._cost.step_ms(bucket, 0.0, float(share) * share)
+            step_ms = self._cost.step_ms(bucket, 0.0, float(share) * share)
+            done_ms = 0.0
+            for step in range(steps):
+                # The step launched k steps ago is still in the pipeline
+                # during candidate step s while k + s < pp_size - 1; past
+                # that no step in flight overlaps, and the bound must not
+                # go negative, which would read the oldest entries back in.
+                live = self._inflight_ms[: max(self._pp_size - 1 - step, 0)]
+                done_ms += max(step_ms, *live) if live else step_ms
             if done_ms < soonest:
                 limit, soonest = share, done_ms
         return limit
@@ -160,11 +302,17 @@ class TpuPipelineChunkScheduler(Scheduler):
             if request.request_id not in self._seeded:
                 self._account(num_new_tokens, start)
             return num_new_tokens
+        # A waiting request with one prompt token left after its prefix hit
+        # arrives padded to 1 + num_spec_tokens rows of a verify step. A
+        # pipeline runs MTP over the prompt only and never verifies
+        # (TPUModelRunner._prefill_only_mtp), so the chunk ends at the last
+        # prompt token and the base scheduler drops the padding.
+        num_new_tokens = min(num_new_tokens, request.num_tokens - start)
         if self._cost is not None and num_new_tokens > 0:
             cap = self._cost.chunk(
                 start,
                 num_new_tokens,
-                self._step_tokens,
+                self._step_tokens + self._yielded_tokens(request),
                 self._step_pairs,
                 self._step_squares,
                 self._step_limit,
@@ -222,6 +370,19 @@ def profile_and_install_cost_model(scheduler: Any, executor: Any) -> None:
     scheduler.install_cost_model(model)
 
 
+def attach_pipeline_listener(scheduler: Any, executor: Any) -> None:
+    """Have the executor's push and settle accounting (``pp_push``) age the
+    scheduler's in-flight step costs; a no-op for other schedulers and for
+    executors without a pipeline."""
+    if not isinstance(scheduler, TpuPipelineChunkScheduler):
+        return
+    if getattr(executor, "vllm_config", None) is None:
+        return
+    from vllm_torchtpu.distributed.pp_push import wave_state
+
+    wave_state(executor).listener = scheduler.pipeline_advanced
+
+
 def patch_engine_core_for_pp_chunks(vllm_config: Any) -> None:
     """Have the engine core time the stages once its executor and scheduler
     exist. Installed from the platform's config check (in-process engines)
@@ -237,6 +398,7 @@ def patch_engine_core_for_pp_chunks(vllm_config: Any) -> None:
     def __init__(self, *args, **kwargs):
         orig_init(self, *args, **kwargs)
         profile_and_install_cost_model(self.scheduler, self.model_executor)
+        attach_pipeline_listener(self.scheduler, self.model_executor)
 
     EngineCore.__init__ = __init__
     EngineCore._tpu_pp_chunks_patch = True

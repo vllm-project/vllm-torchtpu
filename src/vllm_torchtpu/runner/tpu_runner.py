@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Ensure environment overrides are applied before any other imports,
 # especially torch_tpu which might read them at import time.
+import functools
+
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import bisect
@@ -16,7 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -30,6 +32,7 @@ from jax.sharding import Mesh
 from packaging import version
 from vllm.config import (
     CUDAGraphMode,
+    ParallelConfig,
     VllmConfig,
     get_layers_from_vllm_config,
     set_current_vllm_config,
@@ -160,7 +163,11 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
-from vllm_torchtpu.spec_decode.utils import DraftChunkInputs, normalize_draft_config
+from vllm_torchtpu.spec_decode.utils import (
+    DraftChunkInputs,
+    handoff_seed_tokens,
+    normalize_draft_config,
+)
 from vllm_torchtpu.structured_decoding import StructuredDecodingManager
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
@@ -373,6 +380,23 @@ def _substitute_placeholder_token(
 logger = init_logger(__name__)
 
 
+def _pp_step[**P, R](
+    method: Callable[Concatenate[Any, P], R],
+) -> Callable[Concatenate[Any, P], R]:
+    """Brackets a runner call that traces device ops with the pipeline wave's
+    step."""
+
+    @functools.wraps(method)
+    def wrapper(self: Any, *args: P.args, **kwargs: P.kwargs) -> R:
+        wave = self._pp_wave
+        if wave is None:
+            return method(self, *args, **kwargs)
+        with wave.step():
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 def _spec_warmup_all_token_ids(
     req_ids: list[str], num_computed_tokens: list[int]
 ) -> dict[str, list[int]]:
@@ -433,6 +457,17 @@ def _build_kv_connector_output(
     if _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
         kwargs["invalid_block_group_index"] = invalid_block_group_index
     return KVConnectorOutput(**kwargs)
+
+
+def _publishes_ahead_send(metadata: Any) -> bool:
+    """Whether a step's connector metadata, or a MultiConnector child's,
+    publishes a Stage-3 send registered ahead of its finish."""
+    children = getattr(metadata, "metadata", None)
+    for meta in children if isinstance(children, tuple) else (metadata,):
+        sends = getattr(meta, "reqs_to_send", None) or {}
+        if any(getattr(s, "registered_ahead", False) is True for s in sends.values()):
+            return True
+    return False
 
 
 # Smallest output size
@@ -614,6 +649,8 @@ class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     input_ids: torch.Tensor
     empty_slot_mappings: dict[int, torch.Tensor]
+    # Default for a runner built without __init__.
+    _pp_wave: PPWave | None = None
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -621,9 +658,28 @@ class TPUModelRunner(GPUModelRunner):
         assert isinstance(drafter, (DFlashProposer, Eagle3Proposer))
         return drafter
 
+    @staticmethod
+    def _prefill_only_mtp(
+        parallel_config: ParallelConfig, pcp_enabled: bool, mtp_enabled: bool
+    ) -> bool:
+        """Whether MTP runs over prefill chunks only, never verifying.
+
+        A context-parallel or pipeline-parallel producer drafts to fill the
+        draft layer's KV for a decode peer, so the decode/verify programs
+        are never compiled or warmed (`_warmup_mtp_prefill`).
+        """
+        return mtp_enabled and (
+            pcp_enabled or parallel_config.pipeline_parallel_size > 1
+        )
+
     @property
     def _is_async_drafter(self) -> bool:
-        if not self.speculative_config:
+        """Whether this worker runs a hidden-state drafter.
+
+        Under a pipeline only the last stage samples, so only it hosts the
+        draft; the other stages hand their hidden states on and never draft.
+        """
+        if not self.speculative_config or not self._pp_is_last:
             return False
         return (
             self.speculative_config.use_eagle()
@@ -662,6 +718,13 @@ class TPUModelRunner(GPUModelRunner):
         pcp_config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
         self._pcp_enabled = pcp_config.enabled
         self._mtp_enabled = pcp_config.speculative_method == "mtp"
+        # Pipeline parallelism: this worker runs one stage's layer slice.
+        # Stages before the last hand their hidden states to the next stage
+        # instead of sampling; stages after the first take them as input.
+        self._pp_is_first, self._pp_is_last = pp_rank_flags(vllm_config.parallel_config)
+        self._mtp_prefill_only = self._prefill_only_mtp(
+            vllm_config.parallel_config, self._pcp_enabled, self._mtp_enabled
+        )
         sequence_layout_planner = create_sequence_layout_planner(vllm_config)
         if sequence_layout_planner.requires_backend_preinit:
             # GPUModelRunner probes torch.cuda.mem_get_info during init. The
@@ -1055,13 +1118,13 @@ class TPUModelRunner(GPUModelRunner):
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
 
-        # Pipeline parallelism: this worker runs one stage's layer slice.
-        # Stages before the last hand their hidden states to the next stage
-        # instead of sampling; stages after the first take them as input.
-        self._pp_is_first, self._pp_is_last = pp_rank_flags(self.parallel_config)
         # Hand-off wave over ICI; built in capture_model, where every stage
         # reaches the same point.
-        self._pp_wave: PPWave | None = None
+        self._pp_wave = None
+        # TPU_PP_DEFER_PARTIAL_STEP_WAIT: the last stage's step whose device
+        # wait was put off to the end of the next step.
+        self._pp_deferred_step: AsyncTPUCopyState | None = None
+        self._pp_deferred_steps = 0
         # A sparse model's shared top-k index table, when this stage's layers
         # cannot all recompute it; set at load time under a pipeline.
         self._pp_topk_buffer: torch.Tensor | None = None
@@ -1371,7 +1434,10 @@ class TPUModelRunner(GPUModelRunner):
     def _init_speculative_decoding(self) -> None:
         self.drafter = None
         self.rejection_sampler = None
-        if self.speculative_config:
+        # Drafting and verification happen where sampling happens, on the
+        # last pipeline stage; the other stages keep the config for the KV
+        # cache spec and the scheduler, and nothing else.
+        if self.speculative_config and self._pp_is_last:
             self.rejection_sampler = RejectionSampler(
                 self.speculative_config, self.device
             )
@@ -1976,13 +2042,41 @@ class TPUModelRunner(GPUModelRunner):
         num_computed = self.input_batch.num_computed_tokens_cpu
         req_ids = self.input_batch.req_ids
         crossings: list[tuple[int, int, int]] = []
+        previous = (
+            self._pre_async_results
+            if self.scheduler_config.async_scheduling and self.speculative_config
+            else None
+        )
+        sampled_cpu: torch.Tensor | None = None
         for i in range(num_reqs):
             row = start_index + i
             req_id = req_ids[row]
             assert req_id is not None
             computed = int(num_computed[row])
             scheduled = scheduler_output.num_scheduled_tokens[req_id]
-            curr = (computed + scheduled - 1) // col_stride
+            end_position = computed + scheduled - 1
+            if previous is not None and previous.num_draft_per_req:
+                previous_row = previous.req_id_to_index_copy.get(req_id)
+                drafts = (
+                    previous.num_draft_per_req.get(previous_row, 0)
+                    if previous_row is not None
+                    else 0
+                )
+                # Host positions assume every previous draft was accepted.
+                # Only near a block edge can the correction change the seed
+                # destination; reuse the pending sampling copy in that case.
+                if end_position // col_stride != (end_position - drafts) // col_stride:
+                    if sampled_cpu is None:
+                        sampled_cpu = previous.wait_for_copy()
+                        assert sampled_cpu is not None
+                    assert previous_row is not None
+                    accepted = int(
+                        (sampled_cpu[previous_row] != INVALID_TOKEN_ID).sum().item()
+                    )
+                    rejected = max(0, drafts + 1 - accepted)
+                    computed -= rejected
+                    end_position -= rejected
+            curr = end_position // col_stride
             prev = self._mamba_state_pos.get(req_id, (computed - 1) // col_stride)
             self._mamba_state_pos[req_id] = curr
             if 0 <= prev != curr:
@@ -3674,10 +3768,9 @@ class TPUModelRunner(GPUModelRunner):
         # Phase 1: all TARGET dummy forwards.
         for _ in range(num_chunks):
             self._run_dp_dummy_chunk(bucket)
-        # Phase 2: all DRAFT dummy forwards (num_chunks * K).
-        # use_eagle() covers every hidden-state drafter, dflash included.
-        spec = self.speculative_config
-        if num_chunks > 0 and spec is not None and spec.use_eagle():
+        # Phase 2: all DRAFT dummy forwards (num_chunks * K), on the
+        # workers that host a drafter.
+        if num_chunks > 0 and self._is_async_drafter:
             self._async_drafter.run_dp_dummy_draft(num_chunks)
 
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
@@ -3691,6 +3784,7 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     @torch.no_grad()
+    @_pp_step
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3719,7 +3813,7 @@ class TPUModelRunner(GPUModelRunner):
             # safe to do for a zero-token step since no collectives are
             # triggered.
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
-        if self._pcp_enabled and self._mtp_enabled:
+        if self._mtp_prefill_only:
             # Validate the actual scheduled span before any forward/collective.
             # Ending exactly at the prompt boundary produces the first output;
             # consuming any generated token would enter unsupported decode or
@@ -3730,7 +3824,7 @@ class TPUModelRunner(GPUModelRunner):
                 num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
                 if num_computed + num_tokens > num_prompt:
                     raise RuntimeError(
-                        "PCP + MTP only supports prefill and the first output "
+                        "Prefill-only MTP supports prefill and the first output "
                         "token; refusing decode/verify for "
                         f"request {req_id!r}: num_computed_tokens={num_computed}, "
                         f"num_scheduled_tokens={num_tokens}, "
@@ -4673,6 +4767,7 @@ class TPUModelRunner(GPUModelRunner):
             **verify_kwargs,
         )
 
+    @_pp_step
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
@@ -5028,13 +5123,24 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     ]
                 )
+                if self._mtp_prefill_only:
+                    # The producer's sample at the prompt boundary is thrown
+                    # away; the draft row there takes the token the consumer
+                    # computes, carried by this step's published send.
+                    device_seed = handoff_seed_tokens(
+                        device_seed, req_ids, scheduler_output.kv_connector_metadata
+                    )
                 with self._stage_timing.stage("draft_propose"):
+                    # A prefill-only drafter writes the draft layer's KV and
+                    # its drafts are never verified, so even a sync producer
+                    # keeps them on device: the host list would block the
+                    # last stage on the drafter every step.
                     eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
                         sampled_token_ids=[],
                         discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
                         num_rejected_tokens_np=None,
                         scheduler_output=scheduler_output,
-                        return_device=is_async,
+                        return_device=is_async or self._mtp_prefill_only,
                         device_seed=device_seed,
                     )
 
@@ -5052,6 +5158,25 @@ class TPUModelRunner(GPUModelRunner):
             # of the whole forward again.
             if isinstance(eagle3_drafts, torch.Tensor):
                 synchronize_tensors([eagle3_drafts], wait=False)
+            if (
+                self._pp_wave is not None
+                and envs.use_raiden_glm_admission()
+                and _publishes_ahead_send(scheduler_output.kv_connector_metadata)
+            ):
+                # A GLM pipeline's last stage also flushes every pending op,
+                # as each hand-off does (pp_wave._launch_now), in a step that
+                # registered a send ahead: a drafter KV write that the drafts
+                # do not read would otherwise be submitted only by the next
+                # step's hand-off, which an idle engine never issues (settle
+                # launches nothing on the last stage). That work is moved
+                # earlier, not added, and only these steps wait for it.
+                # Without a drafter no KV write follows the sampled-token
+                # copy, which comes after every target layer's (each feeds
+                # the logits). The earlier stages need nothing here: each
+                # flushed this step's KV writes before the hand-off carrying
+                # the step on, and runs in order, and this stage's forward
+                # consumed what those hand-offs carried.
+                synchronize_tensors(None, wait=False)
             copy_state.fence_pending_device_work()
 
         # Save, poll and clear the KV connector only after the drafter. Its
@@ -5220,6 +5345,25 @@ class TPUModelRunner(GPUModelRunner):
             )
 
         if not self.scheduler_config.async_scheduling:
+            if self._defers_step_wait(
+                copy_state, len(discard_sampled_tokens_req_indices), len(req_ids)
+            ) and not needs_logprobs:
+                # No request finishes its prompt in this step, so the output
+                # holds no token and nothing in it comes from the device. Wait
+                # for the previous deferred step instead of this one: the
+                # engine stays one step ahead of this stage's device at most,
+                # and the next step's host work runs under this forward.
+                self._settle_deferred_step()
+                self._pp_deferred_step = copy_state
+                self._pp_deferred_steps += 1
+                if self._pp_deferred_steps == 1:
+                    logger.info(
+                        "PP last stage: steps that sample no token return "
+                        "before their forward finishes"
+                    )
+                model_runner_output.sampled_token_ids = [[] for _ in req_ids]
+                return model_runner_output
+            self._settle_deferred_step()
             final_output = async_output.get_output()
             if not self.is_pooling_model:
                 for i, req_state, seq_len, req_id in request_seq_lens:
@@ -5254,6 +5398,29 @@ class TPUModelRunner(GPUModelRunner):
             return final_output
 
         return async_output
+
+    def _defers_step_wait(
+        self, copy_state: "AsyncTPUCopyState | None", num_discarded: int, num_reqs: int
+    ) -> bool:
+        """TPU_PP_DEFER_PARTIAL_STEP_WAIT: whether this step, on a pipeline's
+        last stage, may return before its forward finishes. Only a step whose
+        every request is mid-prompt qualifies: its sampled tokens are all
+        discarded, no request finishes and no KV leaves for a consumer."""
+        return (
+            envs.TPU_PP_DEFER_PARTIAL_STEP_WAIT
+            and self._pp_wave is not None
+            and self._pp_is_last
+            and copy_state is not None
+            and num_reqs > 0
+            and num_discarded == num_reqs
+            and not self.is_pooling_model
+        )
+
+    def _settle_deferred_step(self) -> None:
+        """Waits for the step TPU_PP_DEFER_PARTIAL_STEP_WAIT put off, if any."""
+        deferred, self._pp_deferred_step = self._pp_deferred_step, None
+        if deferred is not None:
+            deferred.wait()
 
     def load_model(self) -> None:
         self.device_config.device = torch.device("tpu")
@@ -5579,6 +5746,7 @@ class TPUModelRunner(GPUModelRunner):
         self._attention_kernels_initialized = True
 
     @torch.no_grad()
+    @_pp_step
     def _dummy_run(
         self,
         num_tokens: int,
@@ -5994,6 +6162,14 @@ class TPUModelRunner(GPUModelRunner):
             self.vllm_config.compilation_config.compile_sizes = list(
                 self.num_tokens_paddings
             )
+            # The draft compiles under its own copy of the compilation
+            # config, taken when it was loaded. The last stage pads the
+            # hidden states it drafts from to these buckets, so the draft
+            # needs a graph for every one of them.
+            if isinstance(self.drafter, Eagle3Proposer):
+                self.drafter.draft_vllm_config.compilation_config.compile_sizes = list(
+                    self.num_tokens_paddings
+                )
         logger.info(
             "Pipeline chunks: granularity %d tokens (KV block %d, block "
             "aligned %s), buckets added %s",
@@ -6215,11 +6391,9 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
-            # Prefill-only PCP MTP K1 skips _precompile_rejection_sampler(), so
+            # Prefill-only MTP skips _precompile_rejection_sampler(), so
             # we skip it here as well.
-            if self.speculative_config is None or (
-                self._pcp_enabled and self._mtp_enabled
-            ):
+            if self.speculative_config is None or self._mtp_prefill_only:
                 return
             # For spec decoding, target logits have padded_logits_length rows.
             max_target_rows = (
@@ -6875,26 +7049,58 @@ class TPUModelRunner(GPUModelRunner):
 
             # Warm the drafter's forward + sampling subgraphs at every
             # bucket shape it may see at runtime.
-            if self._is_async_drafter:
-                self._async_drafter.precompile()
-                if self._pcp_enabled and self._mtp_enabled:
+            if self._mtp_prefill_only:
+                if self._is_async_drafter:
+                    self._async_drafter.precompile()
                     logger.info(
                         "Skipping rejection replay and decode/verify warmup "
-                        "for prefill-only PCP MTP K1"
+                        "for prefill-only MTP"
                     )
-                    self._warmup_pcp_mtp_prefill()
-                else:
-                    self._precompile_rejection_sampler()
-                    self._precompile_spec_logprobs()
-                    # The isolated precompiles above emit standalone fused
-                    # programs; the real per-step propose+verify+sampling
-                    # dispatch fuses them differently, so the first real
-                    # request would otherwise compile new graphs. Warm those
-                    # through the real two-phase spec-decode path.
-                    self._warmup_spec_decode()
+                # Every pipeline stage takes part: the synthetic prefill
+                # goes through the hand-off like a served one.
+                self._warmup_mtp_prefill()
+                # After the warmup, not before: only the last stage holds a
+                # drafter, and a stage that raised first would leave the
+                # others waiting at the warmup's hand-off barrier.
+                self._check_draft_buckets()
+            elif self._is_async_drafter:
+                self._async_drafter.precompile()
+                self._precompile_rejection_sampler()
+                self._precompile_spec_logprobs()
+                # The isolated precompiles above emit standalone fused
+                # programs; the real per-step propose+verify+sampling
+                # dispatch fuses them differently, so the first real
+                # request would otherwise compile new graphs. Warm those
+                # through the real two-phase spec-decode path.
+                self._warmup_spec_decode()
 
-    def _warmup_pcp_mtp_prefill(self) -> None:
-        """Warm the real PCP MTP K1 prefill proposal and nothing else.
+    def _check_draft_buckets(self) -> None:
+        """Refuses to start a producer whose draft lacks a target bucket.
+
+        The draft runs on the target's padded hidden states, so a step can
+        reach it at any bucket in ``num_tokens_paddings``. It compiles one
+        graph per size in its own copy of the compilation config, and with
+        compile ranges disabled a size with no graph fails an assert in
+        ``PiecewiseBackend`` on the first live step that pads to it. The
+        warmup drives only the smallest bucket and cannot catch that.
+        """
+        if not isinstance(self.drafter, Eagle3Proposer):
+            return
+        draft_sizes = sorted(
+            int(size)
+            for size in self.drafter.draft_vllm_config.compilation_config.compile_sizes
+            or ()
+        )
+        missing = sorted(set(self.num_tokens_paddings) - set(draft_sizes))
+        if missing:
+            raise RuntimeError(
+                f"the MTP draft has no compiled graph for token buckets {missing}: "
+                f"target buckets {self.num_tokens_paddings}, draft compile "
+                f"sizes {draft_sizes}"
+            )
+
+    def _warmup_mtp_prefill(self) -> None:
+        """Warm the real prefill-only MTP K1 proposal and nothing else.
 
         The real path may fail once while its draft forward is being cold
         compiled. Run one bounded retry during startup so no live request
@@ -6902,34 +7108,71 @@ class TPUModelRunner(GPUModelRunner):
 
         This lifecycle is intentionally separate from ``_warmup_spec_decode``:
         a prefill-only producer must never synthesize decode/verify work.
+
+        The prompt lengths fill every per-rank token bucket
+        (``num_tokens_paddings`` are per rank; a context-parallel step
+        spreads the prompt over the ranks), so no live prompt is the first to
+        run its bucket. The KV profile never runs the draft, so the largest
+        bucket is where the draft's own program temporaries, such as an MoE
+        token gather, first have to fit.
+
+        Under a pipeline every stage runs the synthetic prefills, since the
+        last stage's forward takes its input from the hand-off, and there is
+        no retry: a stage retrying alone would leave the others waiting. A
+        stage's output leaves it on its next launch (see ``PPWave``), and
+        one forward alone has none, so each stage settles the burst right
+        after each forward; those launches carry the prefill on to the last
+        stage, whose forward waits for it.
         """
         if not envs.SPEC_WARMUP:
             return
-        if self.enforce_eager or not self._is_async_drafter:
+        if self.enforce_eager or self.speculative_config is None:
             return
-        P = min(int(self.num_tokens_paddings[0]), self.max_model_len)
+        pcp = max(1, int(self.parallel_config.prefill_context_parallel_size))
+        longest = min(
+            self.max_model_len, int(self.scheduler_config.max_num_batched_tokens)
+        )
+        prompt_lens = sorted(
+            {min(int(bucket) * pcp, longest) for bucket in self.num_tokens_paddings}
+        )
         n0 = self.num_xla_graphs
+        pipeline = self.parallel_config.pipeline_parallel_size > 1
         with (
             _suspend_kv_transfer_group(),
-            self._precompile_timed("PCP MTP real prefill warmup"),
+            self._precompile_timed("MTP real prefill warmup"),
         ):
-            if not self._warmup_one_pcp_mtp_prefill(P, quiet=True):  # noqa: SIM102 (retry)
-                if not self._warmup_one_pcp_mtp_prefill(P):
-                    raise RuntimeError(
-                        "PCP MTP prefill warmup failed after retry; refusing "
-                        "to start a producer whose first live proposal would "
-                        "hit the same failure"
-                    )
+            for P in prompt_lens:
+                if pipeline:
+                    assert self._pp_wave is not None
+                    try:
+                        warmed = self._warmup_one_mtp_prefill(P)
+                    finally:
+                        self._pp_wave.settle()
+                    if not warmed:
+                        raise RuntimeError(
+                            f"MTP prefill warmup failed at P={P}; refusing to "
+                            "start a producer whose first live proposal would "
+                            "hit the same failure"
+                        )
+                elif not self._warmup_one_mtp_prefill(P, quiet=True):  # noqa: SIM102 (retry)
+                    if not self._warmup_one_mtp_prefill(P):
+                        raise RuntimeError(
+                            f"MTP prefill warmup failed at P={P} after retry; "
+                            "refusing to start a producer whose first live "
+                            "proposal would hit the same failure"
+                        )
         logger.info(
-            "PCP MTP prefill warmup compiled %d graphs", self.num_xla_graphs - n0
+            "MTP prefill warmup at P=%s compiled %d graphs",
+            prompt_lens,
+            self.num_xla_graphs - n0,
         )
 
-    def _warmup_one_pcp_mtp_prefill(self, P: int, quiet: bool = False) -> bool:
-        """Run one synthetic PCP prefill through target sampling + K1 propose."""
+    def _warmup_one_mtp_prefill(self, P: int, quiet: bool = False) -> bool:
+        """Run one synthetic prefill through target sampling + K1 propose."""
         from vllm.sampling_params import SamplingParams
         from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 
-        rid = "__pcp_mtp_warmup__"
+        rid = "__mtp_prefill_warmup__"
         max_pos = min(self.max_model_len, P + 1)
         assert self.kv_cache_config is not None
         top = int(self.kv_cache_config.num_blocks)
@@ -6945,7 +7188,7 @@ class TPUModelRunner(GPUModelRunner):
             max_nblk = max(max_nblk, group_num_blocks)
         if top <= max_nblk + 1:
             raise RuntimeError(
-                "PCP MTP prefill warmup has not enough KV blocks for its "
+                "MTP prefill warmup has not enough KV blocks for its "
                 f"synthetic request: num_blocks={top}, required>{max_nblk + 1}"
             )
 
@@ -6972,18 +7215,18 @@ class TPUModelRunner(GPUModelRunner):
             attempt_succeeded = False
             if quiet:
                 logger.warning(
-                    "PCP MTP prefill warmup P=%d first attempt failed; retrying once.",
+                    "MTP prefill warmup P=%d first attempt failed; retrying once.",
                     P,
                     exc_info=True,
                 )
             else:
-                logger.exception("PCP MTP prefill warmup P=%d retry failed", P)
+                logger.exception("MTP prefill warmup P=%d failed", P)
         finally:
             cleanup_succeeded = self._warmup_spec_decode_cleanup(rid)
 
         if not cleanup_succeeded:
             raise RuntimeError(
-                "PCP MTP prefill warmup cleanup failed; refusing to retry or "
+                "MTP prefill warmup cleanup failed; refusing to retry or "
                 "start with residual synthetic request state"
             )
         return attempt_succeeded
@@ -7242,15 +7485,35 @@ class TPUModelRunner(GPUModelRunner):
                         # also fails).
                         self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
             # (2) The propose+verify+sampling fusions are also keyed on the
-            # decode batch size (num_reqs). Only relevant when serving actually
-            # batches (>1 concurrent request); sweep real multi-request batches
-            # so nr>1 serving steps are cached too -- both greedy and non-greedy.
-            if self.scheduler_config.max_num_seqs > 1:
-                P_small = int(self.num_tokens_paddings[0])
-                for R in self.num_reqs_paddings:
-                    if int(R) > 1:
-                        self._warmup_spec_batch(int(R), P_small, greedy=True)
-                        self._warmup_spec_batch(int(R), P_small, greedy=False)
+            # decode batch size (num_reqs). Sync steps run at the request
+            # paddings; under async scheduling the substitution, rejection
+            # count and seed glue run at the live request count, so there
+            # every count up to max_num_seqs is its own set of programs.
+            # Sweep the counts at the shortest prompt bucket, and the request
+            # paddings again at the longest prompt bucket a request can hold
+            # -- both greedy and non-greedy.
+            max_reqs = int(self.scheduler_config.max_num_seqs)
+            if max_reqs > 1:
+                prompt_buckets = [
+                    int(P)
+                    for P in self.num_tokens_paddings
+                    if int(P) <= self.max_model_len
+                ]
+                paddings = [
+                    int(R) for R in self.num_reqs_paddings if 1 < int(R) <= max_reqs
+                ]
+                counts = (
+                    range(2, max_reqs + 1)
+                    if self.scheduler_config.async_scheduling
+                    else paddings
+                )
+                for R in counts:
+                    self._warmup_spec_batch(R, prompt_buckets[0], greedy=True)
+                    self._warmup_spec_batch(R, prompt_buckets[0], greedy=False)
+                if prompt_buckets[-1] != prompt_buckets[0]:
+                    for R in paddings:
+                        self._warmup_spec_batch(R, prompt_buckets[-1], greedy=True)
+                        self._warmup_spec_batch(R, prompt_buckets[-1], greedy=False)
         logger.info("spec-decode warmup compiled %d graphs", self.num_xla_graphs - n0)
 
     def _warmup_spec_batch(self, R: int, P: int, greedy: bool = True) -> None:
@@ -7272,13 +7535,13 @@ class TPUModelRunner(GPUModelRunner):
         room = self.max_model_len - P
         n_decode = min(max(5, K + 2), max(0, room // (1 + K) - 1))
         max_pos = min(self.max_model_len, P + n_decode * (1 + K))
-        # Per-group block counts at each group's own block size (see
+        # Per-group block counts in the group's own block-table units (see
         # _warmup_one_spec_request); the per-request stride uses the widest
         # group so every group's ranges stay disjoint across requests.
-        group_nblks = []
-        for group in self.kv_cache_config.kv_cache_groups:
-            gbs = int(group.kv_cache_spec.block_size)
-            group_nblks.append(min(cdiv(max_pos, gbs), cdiv(self.max_model_len, gbs)))
+        group_nblks = [
+            group.kv_cache_spec.max_num_blocks_per_req(self.vllm_config, max_pos)
+            for group in self.kv_cache_config.kv_cache_groups
+        ]
         nblk = max(group_nblks)
         top = int(self.kv_cache_config.num_blocks)
         if top <= R * nblk + 1:
@@ -7383,17 +7646,19 @@ class TPUModelRunner(GPUModelRunner):
         # of the pool. Warmup runs before serving and tears down each request;
         # real requests overwrite their valid KV positions on first prefill.
         # Cover the highest context this request reaches, reserving block 0.
-        # Count blocks per kv-cache group at that group's own block size:
-        # groups differ on hybrid models (mamba vs attention), and the
-        # runner-level self.block_size predates the executor's post-load
-        # block-size finalization.
+        # Count blocks per kv-cache group the way vLLM sizes that group's
+        # block-table row: groups differ on hybrid models (mamba vs
+        # attention), an attention block spans block_size x DCP tokens of
+        # context, and the runner-level self.block_size predates the
+        # executor's post-load block-size finalization.
         max_pos = min(self.max_model_len, max([P] + decode_ncts) + (1 + K))
         top = int(self.kv_cache_config.num_blocks)
         block_ids_per_group = []
         max_nblk = 0
         for group in self.kv_cache_config.kv_cache_groups:
-            gbs = int(group.kv_cache_spec.block_size)
-            g_nblk = min(cdiv(max_pos, gbs), cdiv(self.max_model_len, gbs))
+            g_nblk = group.kv_cache_spec.max_num_blocks_per_req(
+                self.vllm_config, max_pos
+            )
             block_ids_per_group.append(list(range(1, 1 + g_nblk)))
             max_nblk = max(max_nblk, g_nblk)
         if top <= max_nblk + 1:

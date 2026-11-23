@@ -36,7 +36,25 @@ def _config(
     )
 
 
-RAIDEN = SimpleNamespace(kv_connector="TPURaidenConnector")
+RAIDEN = SimpleNamespace(kv_connector="TPURaidenConnector", is_kv_producer=True)
+RAIDEN_CONSUMER = SimpleNamespace(
+    kv_connector="TPURaidenConnector", is_kv_producer=False
+)
+OFFLOAD = SimpleNamespace(
+    kv_connector="TPURaidenOffloadingConnector", is_kv_producer=True
+)
+
+
+def _multi(*children):
+    return SimpleNamespace(
+        kv_connector="TPUMultiConnector",
+        is_kv_producer=True,
+        kv_connector_extra_config={
+            "connectors": [{"kv_connector": name} for name in children]
+        },
+    )
+
+
 # Qwen3.5-0.8B: 24 layers, full attention on every fourth.
 HYBRID_24 = ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(24)]
 
@@ -58,9 +76,35 @@ def test_rejects_async_scheduling_and_names_the_flag():
         validate_pipeline_parallel_config(_config(pp=2, async_scheduling=True))
 
 
-def test_rejects_speculative_decoding():
-    with pytest.raises(NotImplementedError, match="speculative decoding"):
-        validate_pipeline_parallel_config(_config(pp=2, speculative=object()))
+MTP_K1 = SimpleNamespace(method="mtp", num_speculative_tokens=1)
+
+
+def test_accepts_prefill_only_mtp_k1_on_a_kv_producer():
+    validate_pipeline_parallel_config(
+        _config(pp=2, speculative=MTP_K1, kv_transfer=RAIDEN, layer_types=HYBRID_24)
+    )
+
+
+@pytest.mark.parametrize(
+    "speculative, kv_transfer",
+    [
+        (SimpleNamespace(method="eagle3", num_speculative_tokens=1), RAIDEN),
+        (SimpleNamespace(method="mtp", num_speculative_tokens=2), RAIDEN),
+        # Without a consumer to hand the draft KV to, the drafts serve
+        # nothing and every decode step would be refused at runtime.
+        (MTP_K1, None),
+        (MTP_K1, RAIDEN_CONSUMER),
+    ],
+)
+def test_rejects_speculative_decoding_other_than_mtp_k1_on_a_producer(
+    speculative, kv_transfer
+):
+    with pytest.raises(
+        NotImplementedError, match="prefill-only MTP.*num_speculative_tokens=1"
+    ):
+        validate_pipeline_parallel_config(
+            _config(pp=2, speculative=speculative, kv_transfer=kv_transfer)
+        )
 
 
 def test_rejects_kv_transfer_connectors_other_than_raiden():
@@ -71,6 +115,36 @@ def test_rejects_kv_transfer_connectors_other_than_raiden():
 
 def test_accepts_the_raiden_connector():
     validate_pipeline_parallel_config(_config(pp=2, kv_transfer=RAIDEN))
+
+
+def test_accepts_the_raiden_offloading_connector():
+    validate_pipeline_parallel_config(_config(pp=2, kv_transfer=OFFLOAD))
+
+
+def test_accepts_a_multi_connector_of_raiden_connectors():
+    validate_pipeline_parallel_config(
+        _config(
+            pp=2,
+            kv_transfer=_multi("TPURaidenConnector", "TPURaidenOffloadingConnector"),
+        )
+    )
+
+
+def test_rejects_a_multi_connector_with_another_child():
+    with pytest.raises(NotImplementedError, match="TPUConnectorHMA"):
+        validate_pipeline_parallel_config(
+            _config(pp=2, kv_transfer=_multi("TPURaidenConnector", "TPUConnectorHMA"))
+        )
+
+
+def test_offloading_rejects_a_stage_of_linear_attention_layers_only(monkeypatch):
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    with pytest.raises(
+        NotImplementedError, match=r"stage 0 holds layers 0-2, linear_attention only"
+    ):
+        validate_pipeline_parallel_config(
+            _config(pp=8, kv_transfer=OFFLOAD, layer_types=HYBRID_24)
+        )
 
 
 def test_raiden_rejects_a_stage_of_linear_attention_layers_only(monkeypatch):
@@ -103,7 +177,8 @@ def test_linear_attention_stages_are_fine_without_kv_transfer():
     validate_pipeline_parallel_config(_config(pp=8, layer_types=HYBRID_24))
 
 
-def test_rejects_tensor_parallel_stages():
+def test_rejects_tensor_parallel_stages_on_world_size_meshes(monkeypatch):
+    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: False)
     with pytest.raises(NotImplementedError, match="tensor-parallel-size 1"):
         validate_pipeline_parallel_config(_config(pp=2, tp=4))
 
@@ -112,6 +187,10 @@ def test_rejects_tensor_parallel_stages():
 def stage_meshes(monkeypatch):
     """A torch_tpu that builds meshes over a stage's process group."""
     monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: True)
+
+
+def test_accepts_tensor_parallel_stages(stage_meshes):
+    validate_pipeline_parallel_config(_config(pp=2, tp=4))
 
 
 def test_accepts_context_parallel_stages(stage_meshes):
@@ -148,6 +227,10 @@ def test_rejects_other_kv_transfer_with_context_parallel_stages(stage_meshes):
 
 def test_raiden_accepts_context_parallel_stages(stage_meshes):
     validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=RAIDEN))
+
+
+def test_offloading_accepts_context_parallel_stages(stage_meshes):
+    validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=OFFLOAD))
 
 
 def test_rejects_the_legacy_ray_executor(monkeypatch):

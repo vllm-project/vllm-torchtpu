@@ -271,6 +271,7 @@ def measured_glm_layout_fingerprint(
     package_version: Callable[[str], str] | None = None,
     hash_indexer: bool = True,
     indexer_seq_along_lane: bool = False,
+    page_agnostic: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Fingerprint of the admitted GLM cache layout, compared across peers.
 
@@ -285,6 +286,11 @@ def measured_glm_layout_fingerprint(
     ``indexer_seq_along_lane`` checks the indexer page by its lane width (one
     token per lane). Its page shape differs from the packed-row one, so the
     two layouts never fingerprint alike.
+
+    ``page_agnostic`` is for transfers that re-page (the lane-span transfer,
+    whose peers page at different sizes): it hashes each class's per-token
+    geometry instead of its page shape, and the indexer layout by name, which
+    then stays in the hash even when the indexer class does not.
     """
     layouts = _measure_packed_row_layouts(
         manifest,
@@ -295,14 +301,28 @@ def measured_glm_layout_fingerprint(
     )
     if not hash_indexer:
         layouts.pop(TAG_DSA_IDX, None)
+    if page_agnostic:
+        for tag, measured in layouts.items():
+            rows, packing, width = measured.pop("page_shape")
+            if tag == TAG_DSA_IDX and indexer_seq_along_lane:
+                # One word per token in each lane row: the page width is
+                # the page's token count.
+                measured.pop("row_bytes")
+                measured["lane_rows"] = [rows, packing]
+            else:
+                # One packed row per `packing` tokens: the row count is.
+                measured["row_shape"] = [packing, width]
     version = package_version or importlib.metadata.version
-    payload = {
+    payload: dict[str, Any] = {
         "schema": GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
         "libtpu": version("libtpu"),
-        "page_tokens": int(page_tokens),
         "layouts": layouts,
     }
+    if page_agnostic:
+        payload["indexer_layout"] = "sal" if indexer_seq_along_lane else "has"
+    else:
+        payload["page_tokens"] = int(page_tokens)
     return canonical_layout_fingerprint(payload), payload
 
 

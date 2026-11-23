@@ -45,6 +45,7 @@ widest any pipeline in the process asked for.
 """
 
 import contextlib
+from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any, cast
 
@@ -70,6 +71,14 @@ class _WaveState:
         self.settles = 0
         # The engine core times the pushes itself (core/pp_lazy_step.py).
         self.lazy = False
+        # Told of every advance the pipeline makes outside scheduler steps,
+        # as (pushes, settled); the chunk scheduler keeps its in-flight step
+        # costs in step with it (core/pp_chunk_scheduler.py).
+        self.listener: Callable[[int, bool], None] | None = None
+
+    def _advanced(self, pushes: int = 0, settled: bool = False) -> None:
+        if self.listener is not None:
+            self.listener(pushes, settled)
 
     def dispatched(self) -> int:
         """Records a scheduler step and returns its number."""
@@ -87,6 +96,7 @@ class _WaveState:
         self.pushes += 1
         if self.pushes <= 5 or self.pushes % 100 == 0:
             logger.debug("PP wave push %d as step %d", self.pushes, self.steps)
+        self._advanced(pushes=1)
         return self.steps, executor.collective_rpc(
             "pp_push", non_block=True, unique_reply_rank=executor.output_rank
         )
@@ -103,6 +113,7 @@ class _WaveState:
             logger.debug(
                 "PP wave settle %d after step %d", self.settles, self.last_step
             )
+        self._advanced(settled=True)
         return executor.collective_rpc(
             "pp_settle", non_block=True, unique_reply_rank=executor.output_rank
         )
@@ -115,10 +126,10 @@ class _WaveState:
         lacks, counting the pushes as later steps for the waits that
         follow. With lazy pushes the engine core sends the pushes, and a
         wait settles."""
-        # With one or two stages every launch pairs on its own: stage 1's
-        # launch before forward m is stage 0's launch after it.
-        if not self.open or self.stages <= 2:
+        if not self.open:
             return
+        # With two stages the launches pair without pushes; the settle still
+        # goes out and issues stage 0's queued hand-off.
         if self.lazy or real_step == self.real_steps:
             self.settle(executor)
             return
@@ -139,6 +150,7 @@ class _WaveState:
                 "pp_push", non_block=True, unique_reply_rank=executor.output_rank
             )
         self.steps += need
+        self._advanced(pushes=need)
 
 
 class _PushFuture(Future):
@@ -297,8 +309,18 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         future = _PushFuture(inner, self, state, state.last_step, state.real_steps)
         return future if non_block else future.result()
 
+    def take_draft_token_ids(self):
+        # A pipeline admits prefill-only MTP alone (pp_validation): its
+        # drafts exist to fill the draft layer's KV, and no step consumes
+        # them. Asking the workers would also deadlock. The engine asks with
+        # a blocking RPC right after dispatching a step, while a stage can
+        # still sit in that step's hand-off, waiting for a push that only a
+        # wait on the step's future sends.
+        return None
+
     MultiprocExecutor.execute_model = execute_model
     MultiprocExecutor.sample_tokens = sample_tokens
+    MultiprocExecutor.take_draft_token_ids = take_draft_token_ids
     MultiprocExecutor._tpu_pp_wave_patch = True
     logger.info(
         "PP wave: engine push and settle installed, message ring %d chunks",

@@ -45,8 +45,12 @@ def _scheduler(
     scheduler._step_prefill_tokens = 0
     scheduler._step_schedule = 0
     scheduler._seeded = set()
+    scheduler._inflight_ms = []
     scheduler._clips = 0
     scheduler._waits = 0
+    scheduler._unsized = {}
+    scheduler._yield_to_waiting = True
+    scheduler._yields = 0
     return scheduler
 
 
@@ -260,8 +264,8 @@ def test_schedule_resets_the_step_accounting():
     scheduler._step_squares = 9.0
     scheduler._step_prefill_tokens = 5
     scheduler._seeded = {"x"}
-    with patch.object(Scheduler, "schedule", return_value="out") as schedule:
-        assert scheduler.schedule(throttle_prefills=True) == "out"
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP) as schedule:
+        assert scheduler.schedule(throttle_prefills=True) is _EMPTY_STEP
     schedule.assert_called_once_with(True)
     assert scheduler._step_tokens == 0 and scheduler._step_pairs == 0.0
     assert scheduler._step_squares == 0.0
@@ -277,6 +281,12 @@ def _config(pp=8, cls=SCHEDULER_CLS):
 
 def test_uses_dynamic_chunks_follows_the_installed_scheduler_class():
     assert uses_dynamic_chunks(_config())
+    assert uses_dynamic_chunks(
+        _config(
+            cls="vllm_torchtpu.core.prefix_aware_scheduler."
+            "PrefixAwarePipelineChunkScheduler"
+        )
+    )
     assert not uses_dynamic_chunks(_config(pp=1))
     assert not uses_dynamic_chunks(_config(cls=None))
     assert not uses_dynamic_chunks(_config(cls="other.Scheduler"))
@@ -376,3 +386,140 @@ def test_the_step_estimate_prices_the_step_the_cost_model_sees():
     step.total_num_scheduled_tokens = 20000
     assert scheduler.step_estimate_ms(step) == cost.step_ms(16384, pairs, squares)
     assert _scheduler().step_estimate_ms(step) is None
+
+
+def test_the_step_limit_costs_the_spreads_against_the_steps_in_flight():
+    model = _model()
+    full = model.step_ms(16384, 0.0, float(16384**2))
+    # A lone 8K prompt on 4 idle stages leaves soonest as two 4K steps.
+    scheduler = _scheduler(cost=model, running=[_request(0, 8192)])
+    scheduler._pp_size = 4
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+        assert scheduler._step_limit == 4096
+        # Behind a full step the next three steps last a full step
+        # whatever enters, so one 8K step gets the prompt out a step earlier.
+        scheduler._inflight_ms = [full]
+        scheduler.schedule()
+        assert scheduler._step_limit == 8192
+        # A full step that leaves the pipeline this step no longer counts.
+        scheduler._inflight_ms = [0.0, 0.0, full]
+        scheduler.schedule()
+        assert scheduler._step_limit == 4096
+
+
+def test_the_live_history_window_never_wraps_around():
+    # PP4, pending 8K, history [4K, 16K, 4K] newest first. Candidate 4K
+    # steps run five steps; the fifth overlaps nothing in flight. A
+    # negative slice bound there would read the full step back in and
+    # make the 8K step look faster.
+    model = _model()
+    small = model.step_ms(4096, 0.0, float(4096**2))
+    full = model.step_ms(16384, 0.0, float(16384**2))
+    scheduler = _scheduler(cost=model, running=[_request(0, 8192)])
+    scheduler._pp_size = 4
+    scheduler._inflight_ms = [small, full, small]
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert scheduler._step_limit == 4096
+    # The same history costed by hand: the 8K step waits out both full
+    # steps and runs two of its own; the 4K steps wait them out and run
+    # three of their own, which is the cheaper of the two.
+    eight = model.step_ms(8192, 0.0, float(8192**2))
+    assert 2 * full + 3 * small < 2 * full + 2 * eight
+
+
+def test_schedule_keeps_the_last_stage_count_minus_one_step_estimates():
+    model = _model()
+    scheduler = _scheduler(cost=model)
+    scheduler._pp_size = 4
+    scheduler.requests = {"a": _request(4096, 32768, "a")}
+    step = SimpleNamespace(
+        num_scheduled_tokens={"a": 4096}, total_num_scheduled_tokens=4096
+    )
+    estimate = model.step_ms(4096, 0.0, float(4096**2))
+    with patch.object(Scheduler, "schedule", return_value=step):
+        for _ in range(5):
+            scheduler.schedule()
+    assert scheduler._inflight_ms == [estimate] * 3
+    # An empty step launches nothing and leaves the pipeline as it was.
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert scheduler._inflight_ms == [estimate] * 3
+
+
+def test_pushes_and_settles_age_the_steps_in_flight():
+    model = _model()
+    scheduler = _scheduler(cost=model)
+    scheduler._pp_size = 4
+    estimate = model.step_ms(4096, 0.0, float(4096**2))
+    scheduler._inflight_ms = [estimate] * 3
+    # Each push is a step that carries nothing: it enters at no cost and
+    # the oldest step leaves.
+    scheduler.pipeline_advanced(pushes=2)
+    assert scheduler._inflight_ms == [0.0, 0.0, estimate]
+    scheduler.pipeline_advanced(pushes=1)
+    assert scheduler._inflight_ms == [0.0, 0.0, 0.0]
+    # A settle is sent once nothing is in flight.
+    scheduler._inflight_ms = [estimate] * 3
+    scheduler.pipeline_advanced(settled=True)
+    assert scheduler._inflight_ms == []
+    # After a settle a new burst is costed against an empty pipeline.
+    scheduler.running = [_request(0, 8192)]
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert scheduler._step_limit == 4096
+    scheduler.pipeline_advanced(pushes=0)
+    assert scheduler._inflight_ms == []
+
+
+def test_the_engine_core_patch_wires_the_executor_pushes_to_the_scheduler(
+    monkeypatch,
+):
+    from vllm.v1.engine import core as engine_core
+
+    from vllm_torchtpu.distributed import pp_push
+
+    monkeypatch.setattr(pp_chunk_scheduler.envs, "TPU_PP_CHUNK_SLACK", 0.1)
+
+    class Executor(_Executor):
+        def __init__(self, reports):
+            super().__init__(reports)
+            self.vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(pipeline_parallel_size=4)
+            )
+            self.output_rank = 3
+
+        def collective_rpc(self, method, **kwargs):
+            self.calls.append(method)
+            return self.reports
+
+    class FakeCore:
+        def __init__(self):
+            self.scheduler = _scheduler()
+            self.model_executor = Executor([_report(10.0)])
+
+    monkeypatch.setattr(engine_core, "EngineCore", FakeCore)
+    patch_engine_core_for_pp_chunks(_config(pp=4))
+    core = FakeCore()
+    assert core.scheduler._cost is not None
+    # install_cost_model read the fake config's eight stages; test four.
+    core.scheduler._pp_size = 4
+    state = pp_push.wave_state(core.model_executor)
+    assert state.listener == core.scheduler.pipeline_advanced
+    core.scheduler._inflight_ms = [5.0, 5.0, 5.0]
+    state.push(core.model_executor)
+    assert core.scheduler._inflight_ms == [0.0, 5.0, 5.0]
+    state.settle(core.model_executor)
+    assert core.scheduler._inflight_ms == []
+    # Executors without a pipeline config are left alone.
+    pp_chunk_scheduler.attach_pipeline_listener(_scheduler(), _Executor([]))
+
+
+def test_a_padded_last_prompt_token_is_cut_back_to_the_prompt_end():
+    scheduler = _scheduler(cost=_model())
+    request = _request(0, 2 * 2176 + 1)
+    got = scheduler._mamba_block_aligned_split(
+        request, 2, num_new_local_computed_tokens=2 * 2176
+    )
+    assert got == 1

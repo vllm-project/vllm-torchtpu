@@ -10,6 +10,8 @@ TPU.
 """
 
 import contextlib
+import dataclasses
+import json
 import sys
 import threading
 import time
@@ -1080,6 +1082,8 @@ class TestTPURaidenConnectorScheduler:
             assert len(req.prompt_token_ids) == 32
             assert req.num_prompt_tokens == 32
             assert req.kv_transfer_params["_p_side_truncated"] is True
+            # The dropped token seeds a prefill-only draft's boundary row.
+            assert req.kv_transfer_params["_p_side_next_prompt_token_id"] == 32
 
             # Re-admission after preemption must not truncate again.
             producer.on_new_request(req)
@@ -2848,7 +2852,7 @@ class TestTPURaidenConnectorWorker:
 
         assert hints == [fa_pages + 3] * 7 + [fa_pages] + [0, 0]
 
-    def test_raiden_staging_hints_bound_glm_pools_under_dcp_identity(self):
+    def test_raiden_staging_hints_bound_glm_pools_under_every_glm_transfer(self):
         groups = (SimpleNamespace(layer_names=("layers.0", "layers.1")),)
 
         def pool(tag, layer_name, storage_index):
@@ -2878,15 +2882,60 @@ class TestTPURaidenConnectorWorker:
             worker.vllm_config.parallel_config.decode_context_parallel_size = 16
             for max_model_len, pages in ((1_048_576, 256), (5000, 2)):
                 worker.vllm_config.model_config.max_model_len = max_model_len
-                with patch(f"{_MOD}._raiden_glm_dcp_identity", return_value=True):
-                    hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
-                # One page per 256 x 16 = 4096-token scheduler block.
-                assert hints == [pages] * 6 + [0, 0]
+                # The identity transfer and the per-chunk one alike: one page
+                # per 256 x 16 = 4096-token scheduler block.
+                for identity in (True, False):
+                    with patch(
+                        f"{_MOD}._raiden_glm_dcp_identity", return_value=identity
+                    ):
+                        hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
+                    assert hints == [pages] * 6 + [0, 0]
 
-            # Every other GLM transfer keeps the full host mirror.
+        # A pipeline producer: no DCP, the MLA backend's 1024-token page.
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True)
+        worker.vllm_config.cache_config.block_size = 1024
+        worker.vllm_config.parallel_config.decode_context_parallel_size = 1
+        for max_model_len, pages in ((1_048_576, 1024), (5000, 5)):
+            worker.vllm_config.model_config.max_model_len = max_model_len
             with patch(f"{_MOD}._raiden_glm_dcp_identity", return_value=False):
                 hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
-            assert hints == [0] * 8
+            assert hints == [pages] * 6 + [0, 0]
+
+    @pytest.mark.parametrize("interleave", [4, 64, 256])
+    @pytest.mark.parametrize(
+        "num_tokens", [1, 255, 256, 4095, 4096, 4097, 65_536, 131_073, 1_048_576]
+    )
+    def test_glm_per_chunk_transfer_stays_inside_the_request_pages(
+        self, interleave, num_tokens
+    ):
+        """What the staging hints rely on: a pipeline producer's per-chunk
+        lowering reads only the request's pages, and its padded destination
+        extent stays inside the request's pages on every DCP rank."""
+        from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
+            lower_glm_dcp_row_spans,
+        )
+
+        src_page, dst_page, dcp = 1024, 256, 16
+        num_src_pages = -(-num_tokens // src_page)
+        registration = lower_glm_dcp_row_spans(
+            tag="mla.nope.l0",
+            num_tokens=num_tokens,
+            page_tokens=src_page,
+            live_bytes_per_block=src_page * 576,
+            row_bytes=576,
+            block_ids=range(num_src_pages),
+            dst_dcp_size=dcp,
+            interleave_tokens=interleave,
+        )
+        chunk_bytes = registration.spans[0].size_bytes
+        assert chunk_bytes == interleave * 576
+        assert {s.src_block_ordinal for s in registration.spans} <= set(
+            range(num_src_pages)
+        )
+        dst_pages = -(-num_tokens // (dst_page * dcp))
+        for span in registration.spans:
+            end_tokens = (span.dst_offset_bytes + span.size_bytes) // 576
+            assert end_tokens <= dst_pages * dst_page
 
     def test_v2_stage3_startup_registration_payload_golden(self):
         cases = (
@@ -7031,6 +7080,72 @@ class TestGlmPipelineParallelProducer:
         assert all(len(reg.spans) == 3 for reg in spans)
         assert call["block_ids"] == [10, 11, 12]
 
+    def test_stage_ships_a_lane_indexer_as_strided_lane_runs(self):
+        from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
+
+        from .raiden_test_utils import glm_named_kv_caches
+
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=8, block_size=1024)
+        worker.vllm_config.kv_transfer_config.kv_connector_extra_config = {
+            "destination_decode_context_parallel_size": 16,
+            "destination_cp_kv_cache_interleave_size": 256,
+        }
+        named = {
+            name: cache
+            for name, cache in glm_named_kv_caches(idx_shape=(16, 33, 4, 1024)).items()
+            if rpm.layer_index_from_name(name) == 0
+        }
+        manifest = rpm.build_glm_mla_pool_manifest(
+            named_kv_caches=named,
+            raw_tensors=(),
+            block_size_tokens=1024,
+            per_layer_tags=True,
+            indexer_seq_along_lane=True,
+        )
+        env = self._glm_env()
+        with env[4]:
+            worker._stage3_row_geometry = worker._measure_glm_tag_geometry(manifest)
+        worker._raiden_transfer_engine = _FakeRaidenEngine()
+        worker._raiden_controller_facade = facade = _FakeRaidenControllerFacade()
+        worker._raiden_controller_address = "prefill.test:27000"
+        worker._raiden_work_unit = SimpleNamespace(rank=0)
+        metadata = TPUConnectorMetadata()
+        metadata.reqs_to_send["req"] = SimpleNamespace(
+            uuid=7,
+            local_block_ids=[10, 11, 12],
+            num_tokens=2500,
+            expiration_time=1e20,
+        )
+        group = SimpleNamespace(rank_in_group=0)
+        with (
+            env[0],
+            env[1],
+            env[2],
+            env[3],
+            env[4],
+            patch(f"{_MOD}._raiden_dst_shards", return_value=16),
+            patch(f"{_MOD}._glm_indexer_seq_along_lane", return_value=True),
+            patch("vllm.distributed.parallel_state.get_pp_group", return_value=group),
+        ):
+            worker.process_send_load(metadata)
+
+        (call,) = facade.register_request_blocks_calls
+        by_tag = {reg.tag: reg for reg in call["pool_spans"]}
+        assert set(by_tag) == {"mla.nope.l0", "mla.rope.l0", "dsa.idx.l0"}
+        # ceil(2500 / 256) = 10 chunks, padded to one per destination rank.
+        for tag in ("mla.nope.l0", "mla.rope.l0"):
+            assert len(by_tag[tag].spans) == 16
+            assert {span.count for span in by_tag[tag].spans} == {1}
+        lanes = by_tag["dsa.idx.l0"].spans
+        assert len(lanes) == 16
+        # 33 lane rows of 256 words, a 1024-word source row apart, back to
+        # back in the destination page.
+        assert {
+            (s.count, s.size_bytes, s.src_stride_bytes, s.dst_stride_bytes)
+            for s in lanes
+        } == {(33, 1024, 4096, 1024)}
+        assert [s.dst_unit_ordinal for s in lanes] == list(range(16))
+
 
 # ---------------------------------------------------------------------------
 # Pipeline producer: Stage-3 registration in the prompt-completing step
@@ -7570,6 +7685,14 @@ class TestContextParallelRegisterAhead:
         assert producer._stage3_early_requests == {}
         assert producer._stage3_block_tables == {}
 
+    def test_stage3_send_carries_the_dropped_prompt_token(self):
+        producer = self._producer()
+        req = _stage3_request("seed", self.PROMPT)
+        req.kv_transfer_params = {"_p_side_next_prompt_token_id": 4242}
+        with _stage3_producer_env(777):
+            meta = self._register_ahead(producer, req)
+        assert meta.reqs_to_send["seed"].next_prompt_token_id == 4242
+
     def test_stage3_finish_time_send_is_not_marked_ahead(self):
         producer = self._producer()
         req = _stage3_request("late", self.PROMPT)
@@ -7873,3 +7996,610 @@ class TestSpecSourceFenceRegisterAhead:
         assert fences == [(2, True)]
         worker.process_send_load(self._meta(c=False))
         assert fences == [(2, True), (2, True)]
+
+
+# ---------------------------------------------------------------------------
+# GLM pipeline producer: Stage-3 registration in the prompt-completing step
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _glm_pp_producer_env(*uuids: int, register_ahead: bool = True):
+    """A GLM PP8 producer feeding a DCP16 decode, minting the given uuids in
+    order, under the given TPU_RAIDEN_STAGE3_REGISTER_AHEAD."""
+    with (
+        _stage3_producer_env(*uuids),
+        patch(f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER", True, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_GLM_ADMISSION", True, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DST_SHARDS", 16, create=True),
+        patch(
+            f"{_MOD}.tpu_envs.TPU_RAIDEN_STAGE3_REGISTER_AHEAD",
+            register_ahead,
+            create=True,
+        ),
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def _glm_stage_env(*, last_stage: bool = False):
+    """GLM admission on a PP8 stage: stage 7 (the drafter's) or stage 3."""
+    env = TestGlmPipelineParallelProducer._glm_env()
+    group = SimpleNamespace(
+        rank_in_group=7 if last_stage else 3, is_last_rank=last_stage
+    )
+    with (
+        env[0],
+        env[1],
+        env[2],
+        env[3],
+        env[4],
+        patch("vllm.distributed.parallel_state.get_pp_group", return_value=group),
+    ):
+        yield
+
+
+def _logged_events(log: MagicMock, name: str) -> list[dict[str, Any]]:
+    """The JSON events called `name` among a patched logger.info's calls."""
+    events = []
+    for call in log.call_args_list:
+        if len(call.args) == 2 and call.args[0] == "%s":
+            event = json.loads(call.args[1])
+            if event.get("event") == name:
+                events.append(event)
+    return events
+
+
+class TestGlmPipelineRegisterAhead:
+    """A GLM pipeline producer publishes a request's Stage-3 send in the step
+    whose chunk completes the prompt, with the SendMeta and consumer
+    parameters its finish would publish; TPU_RAIDEN_STAGE3_REGISTER_AHEAD=0
+    restores finish-time registration. GLM TP/DCP, DSv4 and Kimi-K3
+    producers keep finish-time registration."""
+
+    # Two 16-token scheduler blocks; the transfer excludes the last token.
+    PROMPT = 32
+
+    @staticmethod
+    def _producer():
+        producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
+        producer.vllm_config.kv_transfer_config.kv_connector_extra_config = {
+            "destination_decode_context_parallel_size": 16,
+            "destination_cp_kv_cache_interleave_size": 256,
+        }
+        return producer
+
+    def _register_ahead(self, producer, req, cached_tokens=0):
+        """Schedules the prompt past its cached tokens in one step and
+        returns the step's metadata."""
+        producer.update_state_after_alloc(req, MagicMock(), 0)
+        return producer.build_connector_meta(
+            _scheduler_output(
+                new_reqs=[(req.request_id, ([100, 101],), cached_tokens)],
+                num_scheduled_tokens={req.request_id: self.PROMPT - cached_tokens},
+            )
+        )
+
+    @pytest.mark.parametrize(
+        ("admission", "pp_size", "flag", "expected"),
+        (
+            ("glm", 16, True, True),
+            ("glm", 16, False, False),
+            ("glm", 1, True, False),
+            ("glm", 1, False, False),
+            ("kimi", 16, True, False),
+            ("kimi", 1, True, False),
+            ("dsv4", 16, True, False),
+            ("dsv4", 1, True, False),
+            (None, 16, True, True),
+            (None, 16, False, True),
+            (None, 1, True, True),
+            (None, 1, False, False),
+        ),
+    )
+    def test_stage3_register_ahead_gate(self, admission, pp_size, flag, expected):
+        kimi = "KimiK3ForConditionalGeneration" if admission == "kimi" else None
+        producer = _make_raiden_scheduler(
+            is_producer=True, pp_size=pp_size, architecture=kimi
+        )
+        with (
+            _stage3_producer_env(),
+            patch(
+                f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER",
+                admission is not None,
+                create=True,
+            ),
+            patch(
+                f"{_MOD}.tpu_envs.TPU_RAIDEN_GLM_ADMISSION",
+                admission == "glm",
+                create=True,
+            ),
+            patch(
+                f"{_MOD}.tpu_envs.TPU_RAIDEN_KIMIK3_ADMISSION",
+                admission == "kimi",
+                create=True,
+            ),
+            patch(
+                f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION",
+                admission == "dsv4",
+                create=True,
+            ),
+            patch(
+                f"{_MOD}.tpu_envs.TPU_RAIDEN_STAGE3_REGISTER_AHEAD", flag, create=True
+            ),
+        ):
+            assert producer._stage3_register_ahead_enabled() is expected
+
+    def test_glm_pp_registers_in_prompt_completing_step(self):
+        producer = self._producer()
+        req = _stage3_request("glm", self.PROMPT)
+        with _glm_pp_producer_env(777):
+            meta = self._register_ahead(producer, req)
+            delay, params = producer.request_finished(req, [100, 101])
+            after_finish = producer.build_connector_meta(_scheduler_output())
+
+        send = meta.reqs_to_send["glm"]
+        assert send.registered_ahead is True
+        assert send.uuid == 777
+        assert send.local_block_ids == [100, 101]
+        assert send.num_tokens == self.PROMPT - 1
+        assert meta.reqs_to_release == {}
+        assert delay
+        assert params["uuid"] == 777
+        assert params["num_tokens"] == self.PROMPT - 1
+        assert params["dst_dcp_size"] == 16
+        assert params["dst_interleave_size"] == 256
+        # The finish adopted the published uuid: no second SendMeta.
+        assert after_finish.reqs_to_send == {}
+        assert after_finish.reqs_to_release == {}
+        assert producer._stage3_early_sends == {}
+        assert producer._stage3_early_requests == {}
+        assert producer._stage3_block_tables == {}
+
+    def test_glm_pp_ahead_send_matches_the_finish_time_send(self):
+        req = _stage3_request("glm", self.PROMPT)
+        ahead = self._producer()
+        with _glm_pp_producer_env(777):
+            ahead_send = self._register_ahead(ahead, req).reqs_to_send["glm"]
+            _, ahead_params = ahead.request_finished(req, [100, 101])
+        late = self._producer()
+        with _glm_pp_producer_env(777, register_ahead=False):
+            assert self._register_ahead(late, req).reqs_to_send == {}
+            _, late_params = late.request_finished(req, [100, 101])
+            late_send = late.build_connector_meta(_scheduler_output()).reqs_to_send[
+                "glm"
+            ]
+
+        assert late_send.registered_ahead is False
+        # The same transfer, but for the flag and the publish time.
+        assert dataclasses.replace(
+            ahead_send, registered_ahead=False, expiration_time=0.0
+        ) == dataclasses.replace(late_send, expiration_time=0.0)
+        assert ahead_params == late_params
+
+    def test_glm_pp_chunked_prompt_publishes_only_in_its_last_chunk(self):
+        producer = self._producer()
+        req = _stage3_request("chunked", self.PROMPT)
+        with _glm_pp_producer_env(777):
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+            first = producer.build_connector_meta(
+                _scheduler_output(
+                    new_reqs=[("chunked", ([100],), 0)],
+                    num_scheduled_tokens={"chunked": 16},
+                )
+            )
+            second = producer.build_connector_meta(
+                _scheduler_output(
+                    cached_reqs=[("chunked", ([101],), 16, False)],
+                    num_scheduled_tokens={"chunked": 16},
+                )
+            )
+            delay, params = producer.request_finished(req, [100, 101])
+            after_finish = producer.build_connector_meta(_scheduler_output())
+
+        assert first.reqs_to_send == {}
+        send = second.reqs_to_send["chunked"]
+        assert send.registered_ahead is True
+        assert send.uuid == 777
+        assert send.local_block_ids == [100, 101]
+        assert send.num_tokens == self.PROMPT - 1
+        assert delay
+        assert params["uuid"] == 777
+        assert after_finish.reqs_to_send == {}
+
+    def test_glm_pp_prefix_hit_with_a_one_token_last_step_publishes(self):
+        producer = self._producer()
+        req = _stage3_request("cached", self.PROMPT)
+        with _glm_pp_producer_env(777):
+            meta = self._register_ahead(producer, req, cached_tokens=self.PROMPT - 1)
+            delay, params = producer.request_finished(req, [100, 101])
+
+        send = meta.reqs_to_send["cached"]
+        assert send.registered_ahead is True
+        assert send.local_block_ids == [100, 101]
+        assert send.num_tokens == self.PROMPT - 1
+        assert delay
+        assert params["uuid"] == 777
+
+    def test_glm_pp_abort_releases_ahead_registration(self):
+        producer = self._producer()
+        req = _stage3_request("aborted", self.PROMPT)
+        with _glm_pp_producer_env(777):
+            self._register_ahead(producer, req)
+            req.status = RequestStatus.FINISHED_ABORTED
+            assert producer.request_finished(req, [100, 101]) == (False, None)
+            meta = producer.build_connector_meta(_scheduler_output())
+
+        assert meta.reqs_to_release == {"aborted": 777}
+        assert meta.reqs_to_send == {}
+        assert producer._stage3_finished_sends == {}
+        assert producer._stage3_early_sends == {}
+
+    def test_glm_pp_preemption_releases_ahead_registration(self):
+        producer = self._producer()
+        req = _stage3_request("preempted", self.PROMPT)
+        with _glm_pp_producer_env(777, 778):
+            self._register_ahead(producer, req)
+            preempted = producer.build_connector_meta(
+                _scheduler_output(preempted_req_ids={"preempted"})
+            )
+            resumed = producer.build_connector_meta(
+                _scheduler_output(
+                    cached_reqs=[("preempted", ([200, 201],), 0, True)],
+                    num_scheduled_tokens={"preempted": self.PROMPT},
+                )
+            )
+            delay, params = producer.request_finished(req, [200, 201])
+
+        assert preempted.reqs_to_release == {"preempted": 777}
+        assert preempted.reqs_to_send == {}
+        send = resumed.reqs_to_send["preempted"]
+        assert send.uuid == 778
+        assert send.registered_ahead is True
+        assert send.local_block_ids == [200, 201]
+        assert delay
+        assert params["uuid"] == 778
+
+
+class TestGlmPipelineRegisterAheadWorker:
+    """A GLM pipeline stage's row-span registration of a send published
+    ahead of the finish waits for finished_req_ids (no TTL, no status
+    probe), a released uuid is retired, and a finish-time send keeps its
+    TTL and declares the same spans; with the flag on only the drafter's
+    stage waits for a finish-time send's KV, and every stage logs its
+    registration timing."""
+
+    @staticmethod
+    def _stage_worker(stage: int = 3, manifest=None):
+        glm = TestGlmPipelineParallelProducer
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=8, block_size=1024)
+        with glm._glm_env()[4]:
+            worker._stage3_row_geometry = worker._measure_glm_tag_geometry(
+                glm._stage_manifest({1}) if manifest is None else manifest
+            )
+        engine = _FakeRaidenEngine()
+        engine.poll_results = []
+        facade = _FakeRaidenControllerFacade()
+        worker._raiden_transfer_engine = engine
+        worker._raiden_controller_facade = facade
+        worker._raiden_controller_address = _STAGE3_CONTROLLER
+        worker._raiden_work_unit = SimpleNamespace(rank=stage)
+        worker._local_raiden_transfer_rank = MagicMock(return_value=stage)
+        return worker, facade
+
+    @staticmethod
+    def _send(
+        uuid: int,
+        *,
+        registered_ahead: bool,
+        expiration_time: float = 1e20,
+        block_ids=(10, 11, 12),
+        num_tokens: int = 2500,
+    ) -> SendMeta:
+        return SendMeta(
+            uuid=uuid,
+            local_block_ids=list(block_ids),
+            num_tokens=num_tokens,
+            expiration_time=expiration_time,
+            registered_ahead=registered_ahead,
+        )
+
+    @staticmethod
+    def _drafter_stage(worker, monkeypatch, sync=None):
+        """Configures a drafter and records the worker's KV waits."""
+        worker.vllm_config.speculative_config = SimpleNamespace(method="mtp")
+        worker.runner = SimpleNamespace(kv_caches=[torch.zeros(1), torch.zeros(1)])
+        fences: list[tuple[int, bool]] = []
+
+        def fence(tensors, *, wait):
+            fences.append((len(tensors), wait))
+            if sync is not None:
+                sync()
+
+        monkeypatch.setattr(f"{_MOD}.synchronize_tensors", fence)
+        return fences
+
+    def test_ahead_registration_is_armed_by_finished_req_ids(self):
+        worker, facade = self._stage_worker()
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["early"] = self._send(
+            1234, registered_ahead=True, expiration_time=time.time() - 1.0
+        )
+        # The store has no row yet (a lagging stage would see UNKNOWN too).
+        facade.request_block_statuses[("early", 1234)] = 1
+        with (
+            _glm_stage_env(),
+            patch(f"{_MOD}.dist_utils.get_stage3_status_probe_s", return_value=1e-9),
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30.0),
+        ):
+            worker.process_send_load(meta)
+            pending = worker._stage3_registered_sends["early"]
+            assert pending.finish_pending
+            assert pending.expiration_time == float("inf")
+            # Pending: the UNKNOWN row is not probed and nothing expires.
+            assert worker.get_finished() == (set(), set())
+            assert worker.get_finished() == (set(), set())
+            assert facade.get_request_block_status_calls == []
+            assert facade.cancel_request_blocks_calls == []
+            # The scheduler's finish arms the registration.
+            assert worker.get_finished({"early"}) == (set(), set())
+            registration = worker._stage3_registered_sends["early"]
+            assert not registration.finish_pending
+            assert registration.expiration_time > time.time()
+            # Armed, the probe runs as for a finish-time registration.
+            assert worker.get_finished() == ({"early"}, set())
+
+        assert [call["uuid"] for call in facade.register_request_blocks_calls] == [1234]
+        assert facade.get_request_block_status_calls == [[("early", 1234)]]
+        assert facade.cancel_request_blocks_calls == []
+        assert worker._stage3_registered_sends == {}
+        assert "early" in worker._stage3_terminal_sends
+
+    def test_finish_time_send_keeps_its_ttl_in_a_pipeline(self):
+        worker, facade = self._stage_worker()
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["late"] = self._send(
+            1234, registered_ahead=False, expiration_time=time.time() - 1.0
+        )
+        with (
+            _glm_stage_env(),
+            patch(f"{_MOD}.dist_utils.get_stage3_status_probe_s", return_value=0.0),
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=0.0),
+        ):
+            worker.process_send_load(meta)
+            registration = worker._stage3_registered_sends["late"]
+            assert not registration.finish_pending
+            assert registration.expiration_time < float("inf")
+            # Already expired: the sweep cancels it unclaimed, no finish needed.
+            assert worker.get_finished() == ({"late"}, set())
+
+        assert facade.cancel_request_blocks_calls == [{"req_id": "late", "uuid": 1234}]
+        assert worker._stage3_registered_sends == {}
+
+    def test_release_meta_drops_registration_silently(self):
+        worker, facade = self._stage_worker()
+        register = TPUConnectorMetadata()
+        register.reqs_to_send["early"] = self._send(1234, registered_ahead=True)
+        release = TPUConnectorMetadata(reqs_to_release={"early": 1234})
+        with _glm_stage_env():
+            worker.process_send_load(register)
+            assert worker._stage3_registered_sends["early"].finish_pending
+            worker.process_send_load(release)
+            assert worker._stage3_registered_sends == {}
+            assert worker.get_finished() == (set(), set())
+
+        assert facade.release_request_blocks_calls == [
+            {"req_id": "early", "uuid": 1234}
+        ]
+        assert facade.cancel_request_blocks_calls == []
+        assert facade.complete_request_blocks_calls == []
+        assert worker._stage3_terminal_sends == {}
+        assert worker._done_sending == set()
+
+    def test_mismatched_release_is_a_noop_and_a_release_precedes_registration(
+        self,
+    ):
+        worker, facade = self._stage_worker()
+        register = TPUConnectorMetadata()
+        register.reqs_to_send["early"] = self._send(1234, registered_ahead=True)
+        stale_release = TPUConnectorMetadata(reqs_to_release={"early": 999})
+        # One metadata carrying the release of the published uuid and the
+        # finish-time registration of its replacement.
+        replace_meta = TPUConnectorMetadata(reqs_to_release={"early": 1234})
+        replace_meta.reqs_to_send["early"] = self._send(
+            1235, registered_ahead=False, block_ids=(10,), num_tokens=1000
+        )
+        with _glm_stage_env():
+            worker.process_send_load(register)
+            worker.process_send_load(stale_release)
+            assert facade.release_request_blocks_calls == []
+            assert worker._stage3_registered_sends["early"].uuid == 1234
+            worker.process_send_load(replace_meta)
+
+        assert facade.release_request_blocks_calls == [
+            {"req_id": "early", "uuid": 1234}
+        ]
+        registration = worker._stage3_registered_sends["early"]
+        assert registration.uuid == 1235
+        assert registration.local_block_ids == (10,)
+        assert not registration.finish_pending
+        assert [call["uuid"] for call in facade.register_request_blocks_calls] == [
+            1234,
+            1235,
+        ]
+
+    @pytest.mark.parametrize("dst_dcp", (1, 16))
+    def test_ahead_and_finish_time_sends_declare_the_same_spans(self, dst_dcp):
+        """Through the replicated lowering (a TP decode) and the DCP lowering
+        with SEQ_ALONG_LANE indexer runs (a DCP16 decode), a send registered
+        ahead declares what its finish-time registration declares; only its
+        TTL waits for finished_req_ids."""
+        from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
+
+        from .raiden_test_utils import glm_named_kv_caches
+
+        lanes = dst_dcp > 1
+        named = {
+            name: cache
+            for name, cache in glm_named_kv_caches(
+                idx_shape=(16, 33, 4, 1024) if lanes else None
+            ).items()
+            if rpm.layer_index_from_name(name) == 0
+        }
+        manifest = rpm.build_glm_mla_pool_manifest(
+            named_kv_caches=named,
+            raw_tensors=(),
+            block_size_tokens=1024,
+            per_layer_tags=True,
+            indexer_seq_along_lane=lanes,
+        )
+        calls = {}
+        for ahead in (True, False):
+            worker, facade = self._stage_worker(manifest=manifest)
+            worker.vllm_config.kv_transfer_config.kv_connector_extra_config = {
+                "destination_decode_context_parallel_size": dst_dcp,
+                "destination_cp_kv_cache_interleave_size": 256,
+            }
+            meta = TPUConnectorMetadata()
+            meta.reqs_to_send["req"] = self._send(
+                1234, registered_ahead=ahead, expiration_time=time.time() + 30.0
+            )
+            with (
+                _glm_stage_env(),
+                patch(f"{_MOD}._raiden_dst_shards", return_value=16),
+                patch(f"{_MOD}._glm_indexer_seq_along_lane", return_value=lanes),
+                patch(f"{_MOD}.dist_utils.get_stage3_status_probe_s", return_value=0.0),
+                patch(
+                    f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30.0
+                ),
+            ):
+                worker.process_send_load(meta)
+                registration = worker._stage3_registered_sends["req"]
+                assert registration.finish_pending is ahead
+                assert (registration.expiration_time == float("inf")) is ahead
+                assert "req" not in worker._stage3_send_outcomes
+                # The finish arms the ahead registration; neither completes.
+                assert worker.get_finished({"req"}) == (set(), set())
+                registration = worker._stage3_registered_sends["req"]
+                assert not registration.finish_pending
+                assert registration.expiration_time < float("inf")
+            (calls[ahead],) = facade.register_request_blocks_calls
+
+        assert calls[True] == calls[False]
+        by_tag = {reg.tag: reg for reg in calls[True]["pool_spans"]}
+        assert set(by_tag) == {"mla.nope.l0", "mla.rope.l0", "dsa.idx.l0"}
+        if lanes:
+            # One run per destination rank: ceil(2500 / 256) = 10 chunks,
+            # padded to 16; the indexer ships as lane-row runs.
+            assert all(len(reg.spans) == 16 for reg in by_tag.values())
+            assert {s.count for s in by_tag["dsa.idx.l0"].spans} == {33}
+        else:
+            assert all(len(reg.spans) == 3 for reg in by_tag.values())
+
+    @pytest.mark.parametrize(
+        ("last_stage", "ahead", "flag", "waits"),
+        (
+            (False, False, True, False),
+            (True, False, True, True),
+            (False, True, True, False),
+            (True, True, True, False),
+            # =0 restores the wait on every stage.
+            (False, False, False, True),
+            (True, False, False, True),
+        ),
+    )
+    def test_only_the_drafter_stage_waits_for_a_finish_time_send(
+        self, monkeypatch, last_stage, ahead, flag, waits
+    ):
+        worker, facade = self._stage_worker(stage=7 if last_stage else 3)
+        fences = self._drafter_stage(worker, monkeypatch)
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["req"] = self._send(1234, registered_ahead=ahead)
+        with (
+            _glm_stage_env(last_stage=last_stage),
+            patch(
+                f"{_MOD}.dist_utils.get_stage3_register_ahead_enabled",
+                return_value=flag,
+            ),
+        ):
+            worker.process_send_load(meta)
+
+        assert fences == ([(2, True)] if waits else [])
+        assert [call["uuid"] for call in facade.register_request_blocks_calls] == [1234]
+
+    @pytest.mark.parametrize(
+        ("glm", "pp_size", "waits"),
+        ((True, 8, False), (False, 8, True), (True, 1, True)),
+    )
+    def test_other_producers_wait_on_every_rank(self, glm, pp_size, waits):
+        """Only a GLM pipeline skips the wait off its drafting stage; other
+        pipelines and GLM TP/DCP producers keep it on every rank."""
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=pp_size)
+        group = SimpleNamespace(rank_in_group=3, is_last_rank=False)
+        with (
+            patch(f"{_MOD}._use_raiden_glm_admission", return_value=glm),
+            patch(
+                f"{_MOD}.dist_utils.get_stage3_register_ahead_enabled",
+                return_value=True,
+            ),
+            patch("vllm.distributed.parallel_state.get_pp_group", return_value=group),
+        ):
+            assert worker._waits_for_finish_time_kv() is waits
+
+    def test_every_stage_logs_its_registration_timing(self):
+        worker, _ = self._stage_worker(stage=3)
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["b"] = self._send(1, registered_ahead=True)
+        meta.reqs_to_send["a"] = self._send(2, registered_ahead=True)
+        before = time.time()
+        with _glm_stage_env(), patch(f"{_MOD}.logger.info") as log:
+            worker.process_send_load(meta)
+            # A step without sends logs nothing.
+            worker.process_send_load(TPUConnectorMetadata())
+
+        (event,) = _logged_events(log, "raiden_stage3_sends_registered")
+        assert set(event) == {
+            "event",
+            "req_ids",
+            "t_enter",
+            "sync_ms",
+            "register_ms",
+            "t",
+            "transfer_rank",
+            "registered_ahead",
+        }
+        assert event["req_ids"] == ["a", "b"]
+        assert event["transfer_rank"] == 3
+        assert event["registered_ahead"] is True
+        assert event["sync_ms"] == 0.0
+        assert event["register_ms"] >= 0.0
+        assert before <= event["t_enter"] <= event["t"] <= time.time()
+
+    def test_registration_timing_includes_the_drafter_stage_wait(self, monkeypatch):
+        worker, _ = self._stage_worker(stage=7)
+        self._drafter_stage(worker, monkeypatch, sync=lambda: time.sleep(0.02))
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["ahead"] = self._send(1, registered_ahead=True)
+        meta.reqs_to_send["late"] = self._send(2, registered_ahead=False)
+        with _glm_stage_env(last_stage=True), patch(f"{_MOD}.logger.info") as log:
+            worker.process_send_load(meta)
+
+        (event,) = _logged_events(log, "raiden_stage3_sends_registered")
+        assert event["transfer_rank"] == 7
+        assert event["registered_ahead"] is False
+        assert event["sync_ms"] >= 15.0
+        assert event["t"] - event["t_enter"] >= 0.015
+
+    @pytest.mark.parametrize(("rank", "logged"), ((0, True), (3, False)))
+    def test_a_non_pipeline_producer_logs_on_transfer_rank_zero(self, rank, logged):
+        worker, _ = TestContextParallelRegisterAheadWorker._pcp_worker()
+        worker._local_raiden_transfer_rank = MagicMock(return_value=rank)
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["pcp"] = TestContextParallelRegisterAheadWorker._send(
+            1234, registered_ahead=True, expiration_time=1e20
+        )
+        with _stage3_worker_env(), patch(f"{_MOD}.logger.info") as log:
+            worker.process_send_load(meta)
+
+        events = _logged_events(log, "raiden_stage3_sends_registered")
+        assert [event["transfer_rank"] for event in events] == ([0] if logged else [])

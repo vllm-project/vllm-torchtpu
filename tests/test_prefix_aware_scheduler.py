@@ -12,13 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 
-from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
+from vllm_torchtpu.core.pp_chunk_scheduler import (
+    CHUNK_SCHEDULER_CLSES,
+    TpuPipelineChunkScheduler,
+)
+from vllm_torchtpu.core.prefix_aware_scheduler import (
+    PrefixAwarePipelineChunkScheduler,
+    PrefixAwareScheduler,
+)
+
+_SCHEDULERS = [PrefixAwareScheduler, PrefixAwarePipelineChunkScheduler]
 
 
 def _make_request(
@@ -48,8 +60,9 @@ def _make_scheduler(
     raise_on_lookup: bool = False,
     tier_warmth: bool = False,
     connector: object | None = None,
+    cls: type = PrefixAwareScheduler,
 ) -> PrefixAwareScheduler:
-    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s = cls.__new__(cls)
     q = FCFSRequestQueue()
     for r in requests:
         q.add_request(r)
@@ -162,11 +175,12 @@ def test_default_knobs():
     assert PrefixAwareScheduler.WINDOW == 64
 
 
-def test_promotes_warmest_within_window():
+@pytest.mark.parametrize("cls", _SCHEDULERS)
+def test_promotes_warmest_within_window(cls):
     now = time.time()
     r_cold = _make_request("cold", num_tokens=1000, arrival_time=now - 10)
     r_warm = _make_request("warm", num_tokens=1000, arrival_time=now - 5)
-    s = _make_scheduler([r_cold, r_warm], {"cold": 0, "warm": 800})
+    s = _make_scheduler([r_cold, r_warm], {"cold": 0, "warm": 800}, cls=cls)
 
     q = s._select_waiting_queue_for_scheduling()
     assert q is not None
@@ -174,24 +188,26 @@ def test_promotes_warmest_within_window():
     assert order == ["warm", "cold"]
 
 
-def test_ranks_by_uncached_tokens_not_hit_ratio():
+@pytest.mark.parametrize("cls", _SCHEDULERS)
+def test_ranks_by_uncached_tokens_not_hit_ratio(cls):
     now = time.time()
     # 100k tokens, 90% cached -> 10k uncached tokens
     r_long = _make_request("long", num_tokens=100_000, arrival_time=now - 10)
     # 20k tokens, 80% cached -> 4k uncached tokens (fewer uncached tokens wins)
     r_short = _make_request("short", num_tokens=20_000, arrival_time=now - 5)
-    s = _make_scheduler([r_long, r_short], {"long": 90_000, "short": 16_000})
+    s = _make_scheduler([r_long, r_short], {"long": 90_000, "short": 16_000}, cls=cls)
 
     q = s._select_waiting_queue_for_scheduling()
     assert q is not None
     assert [r.request_id for r in q] == ["short", "long"]
 
 
-def test_fcfs_order_preserved_when_all_cold():
+@pytest.mark.parametrize("cls", _SCHEDULERS)
+def test_fcfs_order_preserved_when_all_cold(cls):
     now = time.time()
     r1 = _make_request("r1", num_tokens=1000, arrival_time=now - 10)
     r2 = _make_request("r2", num_tokens=1000, arrival_time=now - 5)
-    s = _make_scheduler([r1, r2], {"r1": 0, "r2": 0})
+    s = _make_scheduler([r1, r2], {"r1": 0, "r2": 0}, cls=cls)
 
     q = s._select_waiting_queue_for_scheduling()
     assert q is not None
@@ -199,13 +215,14 @@ def test_fcfs_order_preserved_when_all_cold():
     assert order == ["r1", "r2"]
 
 
-def test_preempted_tier_outranks_normal():
+@pytest.mark.parametrize("cls", _SCHEDULERS)
+def test_preempted_tier_outranks_normal(cls):
     now = time.time()
     r_preempted = _make_request(
         "preempted", num_tokens=1000, arrival_time=now - 5, num_preemptions=1
     )
     r_warm = _make_request("warm", num_tokens=1000, arrival_time=now - 10)
-    s = _make_scheduler([r_preempted, r_warm], {"preempted": 0, "warm": 900})
+    s = _make_scheduler([r_preempted, r_warm], {"preempted": 0, "warm": 900}, cls=cls)
 
     q = s._select_waiting_queue_for_scheduling()
     assert q is not None
@@ -499,3 +516,23 @@ def test_paw_tier_tokens_excludes_already_computed_requests():
     r1.num_computed_tokens = 9 * 4096
     s._select_waiting_queue_for_scheduling()
     assert s._paw_tier_tokens == 4 * 4096
+
+
+def test_variants_keep_their_base_scheduling():
+    """Only admission order is layered on: the async variant stays an
+    AsyncScheduler, the pipeline variant keeps the synchronous time-budget
+    chunk sizing."""
+    assert issubclass(PrefixAwareScheduler, AsyncScheduler)
+    assert issubclass(PrefixAwarePipelineChunkScheduler, TpuPipelineChunkScheduler)
+    assert not issubclass(PrefixAwarePipelineChunkScheduler, AsyncScheduler)
+    for attr in ("schedule", "_mamba_block_aligned_split", "install_cost_model"):
+        assert getattr(PrefixAwarePipelineChunkScheduler, attr) is getattr(
+            TpuPipelineChunkScheduler, attr
+        )
+
+
+@pytest.mark.parametrize("path", CHUNK_SCHEDULER_CLSES)
+def test_chunk_scheduler_class_paths_resolve(path):
+    module, _, name = path.rpartition(".")
+    cls = getattr(importlib.import_module(module), name)
+    assert issubclass(cls, TpuPipelineChunkScheduler)

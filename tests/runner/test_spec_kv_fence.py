@@ -78,6 +78,7 @@ def _runner(*, producer: bool, method: str | None) -> TPUModelRunner:
     runner.vllm_config = SimpleNamespace(
         kv_transfer_config=SimpleNamespace(is_kv_producer=producer)
     )
+    runner._pp_is_last = True
     return runner
 
 
@@ -91,6 +92,10 @@ def test_fence_applies_to_producers_with_a_device_drafter_only():
     runner = _runner(producer=True, method="mtp")
     runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
     assert not runner._fence_spec_kv_under_token_copy
+    # Stages before the last hand their hidden states on and never draft.
+    runner = _runner(producer=True, method="mtp")
+    runner._pp_is_last = False
+    assert not runner._fence_spec_kv_under_token_copy
 
 
 def test_fence_follows_the_register_ahead_flag():
@@ -101,3 +106,39 @@ def test_fence_follows_the_register_ahead_flag():
     ):
         assert not runner._fence_spec_kv_under_token_copy
     assert runner._fence_spec_kv_under_token_copy
+
+
+def test_ahead_send_is_found_in_multiconnector_children():
+    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+        MultiKVConnectorMetadata,
+    )
+
+    from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
+        SendMeta,
+        TPUConnectorMetadata,
+    )
+    from vllm_torchtpu.runner.tpu_runner import _publishes_ahead_send
+
+    def raiden(*flags: bool) -> TPUConnectorMetadata:
+        meta = TPUConnectorMetadata()
+        for index, ahead in enumerate(flags):
+            meta.reqs_to_send[f"r{index}"] = SendMeta(
+                uuid=index + 1,
+                local_block_ids=[index],
+                expiration_time=1e20,
+                registered_ahead=ahead,
+            )
+        return meta
+
+    assert _publishes_ahead_send(raiden(False, True))
+    assert not _publishes_ahead_send(raiden(False))
+    assert not _publishes_ahead_send(raiden())
+    assert not _publishes_ahead_send(None)
+    # The PP prefill pairs the Raiden producer with the offloading connector.
+    offload = SimpleNamespace(reqs_to_store={})
+    assert _publishes_ahead_send(
+        MultiKVConnectorMetadata(metadata=(raiden(True), offload))
+    )
+    assert not _publishes_ahead_send(
+        MultiKVConnectorMetadata(metadata=(raiden(False), offload))
+    )

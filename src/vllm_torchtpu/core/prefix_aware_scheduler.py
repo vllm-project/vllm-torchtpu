@@ -35,6 +35,10 @@ such a request is ranked by the compute it actually needs.
 
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
+
+A pipeline-parallel engine schedules synchronously and sizes its prefill
+chunks against a per-step time budget; PrefixAwarePipelineChunkScheduler, in
+this module too, gives it the same admission order.
 """
 
 import time
@@ -48,10 +52,12 @@ from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
 )
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_offload.base import make_offload_key
 from vllm.v1.request import Request
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.core.pp_chunk_scheduler import TpuPipelineChunkScheduler
 from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
 logger = init_logger("vllm." + __name__)
@@ -63,8 +69,12 @@ _TIER_PREEMPTED = 1
 _TIER_NORMAL = 2
 
 
-class PrefixAwareScheduler(AsyncScheduler):
-    """Admit ready requests prioritizing fewest uncached prompt tokens."""
+class _PrefixAwareAdmission(Scheduler):
+    """Admit ready requests prioritizing fewest uncached prompt tokens.
+
+    Listed ahead of a concrete scheduler class; only the waiting queue's
+    order changes.
+    """
 
     #: Lookahead window of ready requests to evaluate for cached prefix length.
     WINDOW = 64
@@ -87,7 +97,8 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._init_tier_warmth(envs.TPU_PREFIX_AWARE_TIER_WARMTH)
 
         logger.info(
-            "PrefixAwareScheduler ACTIVE (window=%d, tier_warmth=%s)",
+            "%s ACTIVE (window=%d, tier_warmth=%s)",
+            type(self).__name__,
             self.WINDOW,
             self._tier_warmth,
         )
@@ -219,7 +230,8 @@ class PrefixAwareScheduler(AsyncScheduler):
             if not self._paw_scoring_broken:
                 self._paw_scoring_broken = True
                 logger.exception(
-                    "PrefixAwareScheduler: warmth scoring failed; falling back to FCFS."
+                    "%s: warmth scoring failed; falling back to FCFS.",
+                    type(self).__name__,
                 )
             return 0, 0
         tier_tokens = self._tier_tokens(request, hbm_tokens)
@@ -276,3 +288,23 @@ class PrefixAwareScheduler(AsyncScheduler):
                 self._paw_tier_tokens / max(self._paw_prompt_tokens, 1),
                 len(queue),
             )
+
+
+class PrefixAwareScheduler(_PrefixAwareAdmission, AsyncScheduler):
+    """Prefix-aware admission on vLLM's async scheduler."""
+
+
+class PrefixAwarePipelineChunkScheduler(
+    _PrefixAwareAdmission, TpuPipelineChunkScheduler
+):
+    """Prefix-aware admission on the pipeline chunk scheduler, which a
+    pipeline-parallel engine needs: it schedules synchronously and sizes
+    prefill chunks against the step's time budget."""
+
+    def _waiting_prefill_tokens(self, request: Request) -> int:
+        warmth, tier_tokens = self._prefix_warmth_and_tier(request)
+        if tier_tokens > 0 and self._cost is not None:
+            # Admission starts the tier load and computes nothing this step;
+            # a granule of room lets the waiting loop reach the request.
+            return self._cost.granularity
+        return max(request.num_tokens - warmth, 1)

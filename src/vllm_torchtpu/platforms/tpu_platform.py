@@ -413,6 +413,7 @@ class TpuPlatform(Platform):
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_RAIDEN_GLM_DCP_IDENTITY",
+        "TPU_RAIDEN_GLM_SAL_LANE_SPANS",
         "TPU_KV_RESHARD_TRANSPORT",
     ]
 
@@ -1268,10 +1269,12 @@ def _configure_short_prefill_first(scheduler_config) -> None:
 
 def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     """Install the time-budget scheduler for a pipeline and the engine-core
-    hook that times the stages. Off when the env disables it, when the DP
+    hook that times the stages. A configured time-budget scheduler (the
+    prefix-aware one) is kept. Off when the env disables it, when the DP
     scheduler or another scheduler is configured, or when chunked prefill is
     disabled."""
     from vllm_torchtpu.core.pp_chunk_scheduler import (
+        CHUNK_SCHEDULER_CLSES,
         SCHEDULER_CLS,
         patch_engine_core_for_pp_chunks,
     )
@@ -1282,7 +1285,7 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
         logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")
         return
-    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
+    if scheduler_config.scheduler_cls not in (None, *CHUNK_SCHEDULER_CLSES):
         logger.warning(
             "Pipeline chunk sizing is off: scheduler %s is configured.",
             scheduler_config.scheduler_cls,
@@ -1295,7 +1298,8 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
         raise ValueError(
             f"TPU_PP_CHUNK_SLACK must not be negative: {envs.TPU_PP_CHUNK_SLACK}"
         )
-    scheduler_config.scheduler_cls = SCHEDULER_CLS
+    if scheduler_config.scheduler_cls is None:
+        scheduler_config.scheduler_cls = SCHEDULER_CLS
     patch_engine_core_for_pp_chunks(vllm_config)
 
 

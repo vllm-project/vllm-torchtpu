@@ -13,6 +13,7 @@
 # limitations under the License.
 """Order of the KV connector calls around the drafter in sample_tokens."""
 
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -64,6 +65,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     )
     async_source = ([torch.tensor([7, 8])], {0: 0}, None, {"r0": 1})
     runner = SimpleNamespace(
+        _pp_wave=None,
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
             draft_chunks=[],
@@ -95,6 +97,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         ),
         scheduler_config=SimpleNamespace(async_scheduling=is_async),
         _is_async_drafter=method == "mtp",
+        _mtp_prefill_only=False,
         _fence_spec_kv_under_token_copy=fence,
         is_pooling_model=False,
         drafter=SimpleNamespace(),
@@ -236,3 +239,78 @@ def test_spec_kv_fence_runs_after_drafter_before_connector_save(is_async):
     assert output.sampled_token_ids == [[7]]
     expected = ["draft", "fence", "rearm"] if is_async else ["draft", "rearm"]
     assert events == expected + ["save", "poll", "clear"]
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize(
+    ("pipeline", "glm", "ahead", "flushed"),
+    (
+        (True, True, True, True),
+        (True, True, False, False),
+        (True, False, True, False),
+        (False, True, True, False),
+    ),
+)
+def test_pipeline_last_stage_flushes_before_the_fence_for_an_ahead_send(
+    is_async, pipeline, glm, ahead, flushed
+):
+    """A GLM pipeline's last stage whose step publishes a send registered
+    ahead flushes every pending op after the drafter and before re-arming
+    the sampled-token copy's ready event, so the event also covers drafter
+    KV writes the drafts do not read. Steps without such a send, other
+    pipelines and producers without a pipeline keep the drafter-rooted
+    fence alone."""
+    from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
+        SendMeta,
+        TPUConnectorMetadata,
+    )
+
+    events: list[str] = []
+
+    def propose(**kwargs):
+        events.append("draft")
+        return torch.tensor([[8]]) if is_async else None
+
+    def sync(tensors, *, wait):
+        assert wait is False
+        events.append("flush" if tensors is None else "fence")
+
+    def host_copy(chunks, lengths, spec_logprobs=None):
+        state = _host_copy(chunks, lengths, spec_logprobs)
+        state.fence_pending_device_work = lambda: events.append("rearm")
+        return state
+
+    runner = _fake_runner("mtp", is_async, False, propose, fence=True)
+    if pipeline:
+        # A pipeline's last stage samples inside the wave's step.
+        runner._pp_wave = SimpleNamespace(step=contextlib.nullcontext)
+    metadata = TPUConnectorMetadata()
+    metadata.reqs_to_send["r0"] = SendMeta(
+        uuid=1, local_block_ids=[3], expiration_time=1e20, registered_ahead=ahead
+    )
+    runner.execute_model_state.scheduler_output.kv_connector_metadata = metadata
+    connector = _recording_connector(events)
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group",
+            return_value=True,
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+            return_value=connector,
+        ),
+        patch("vllm_torchtpu.runner.tpu_runner.synchronize_tensors", side_effect=sync),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.envs.use_raiden_glm_admission",
+            return_value=glm,
+        ),
+        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=host_copy),
+    ):
+        output = TPUModelRunner.sample_tokens(runner, None)
+
+    if is_async:
+        output = output.get_output()
+    assert output.sampled_token_ids == [[7]]
+    expected = ["draft"] + (["fence"] if is_async else [])
+    expected += ["flush"] if flushed else []
+    assert events == expected + ["rearm", "save", "poll", "clear"]

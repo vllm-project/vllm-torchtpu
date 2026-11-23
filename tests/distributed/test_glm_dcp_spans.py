@@ -77,14 +77,25 @@ def _global_span_pieces(span, *, live, tag_skip=0):
 
 
 def _replay(
-    registration, *, dcp, live, dst_ids, src_pages, num_pages, tag_skip=0, dst=None
+    registration,
+    *,
+    dcp,
+    live,
+    dst_ids,
+    src_pages,
+    num_pages,
+    tag_skip=0,
+    dst=None,
+    src_live=None,
 ):
     """Apply one registration the way the planner does; return each unit's
     destination pages and check the planner's coverage rules.
 
     ``tag_skip`` is the tag's dst_skip_bytes clip: ``dst_ids`` then lists only
     the destination pages past it, and ``dst`` holds the pages as they stand
-    before the copy (zeros by default)."""
+    before the copy (zeros by default). ``src_live`` is the source page's live
+    bytes when it differs from the destination's ``live`` (a pipeline stage
+    paging coarser than the decode)."""
     if dst is None:
         dst = [np.zeros((num_pages, live), dtype=np.uint8) for _ in range(dcp)]
     coverage = [[[] for _ in dst_ids] for _ in range(dcp)]
@@ -94,7 +105,7 @@ def _replay(
         assert span.dst_block_index == 0
         assert span.count == 1 and not span.src_stride_bytes
         assert not span.dst_stride_bytes
-        assert span.src_offset_bytes + span.size_bytes <= live
+        assert span.src_offset_bytes + span.size_bytes <= (src_live or live)
         if dcp == 1:
             assert span.dst_unit_ordinal is None
             units = [0]
@@ -314,6 +325,96 @@ def test_dcp_spans_suffix_pull_lands_past_a_cached_prefix(
         )
         for rank, (page, slot) in enumerate(owners):
             # The adopted cache pages are never transfer targets.
+            assert (dst[rank][cached_ids] == _CACHED).all()
+            tokens = np.flatnonzero(page != kvu.OOB_PAGE)
+            tokens = tokens[tokens >= skip_tokens]
+            assert np.isin(page[tokens], suffix_ids).all()
+            byte_index = slot[tokens, None] * _TOKEN_BYTES + np.arange(_TOKEN_BYTES)
+            landed = dst[rank][page[tokens, None], byte_index]
+            np.testing.assert_array_equal(landed, _token_bytes(tokens, salt))
+
+
+# A pipeline stage paging coarser than the DCP decode it feeds, which pages at
+# its interleave (the PP16 P/D shape): (stage page, dcp, interleave).
+_STAGE_CASES = [(1024, 16, 256), (1024, 8, 256), (512, 4, 128), (256, 2, 64)]
+
+
+def _stage_cases():
+    """(stage page, dcp, interleave, num_tokens, prefix_blocks): whole pulls
+    and suffix pulls with one scheduler block (interleave * dcp tokens) or
+    more left to pull."""
+    out = []
+    for page, dcp, interleave in _STAGE_CASES:
+        block = interleave * dcp
+        for tokens in (interleave + 1, block + 1, 2 * block + interleave + 3):
+            num_blocks = math.ceil(tokens / block)
+            for prefix in sorted({0, 1, num_blocks - 1} & set(range(num_blocks))):
+                out.append((page, dcp, interleave, tokens, prefix))
+    return out
+
+
+@pytest.mark.parametrize(
+    "page_tokens,dcp,interleave,num_tokens,prefix_blocks", _stage_cases()
+)
+def test_dcp_spans_from_a_coarser_stage_page_land_past_a_cached_prefix(
+    page_tokens, dcp, interleave, num_tokens, prefix_blocks
+):
+    """A stage's rows land in the decode's interleave-sized pages, whole or
+    past the decode-cached prefix with the clip its worker computes."""
+    block_tokens = interleave * dcp
+    skip_tokens = prefix_blocks * block_tokens
+    num_src_pages = math.ceil(num_tokens / page_tokens)
+    num_dst_blocks = math.ceil(num_tokens / block_tokens)
+    num_pages = 2 * max(num_src_pages, num_dst_blocks) + 3
+    rng = np.random.default_rng(num_tokens + prefix_blocks)
+    src_ids = [int(i) for i in rng.permutation(num_pages)[:num_src_pages]]
+    dst_ids = [int(i) for i in rng.permutation(num_pages)[:num_dst_blocks]]
+    cached_ids, suffix_ids = dst_ids[:prefix_blocks], dst_ids[prefix_blocks:]
+    owners = _dcp_owner_slots(
+        num_tokens, interleave, dcp, interleave, dst_ids, num_pages
+    )
+    src_live, live = page_tokens * _TOKEN_BYTES, interleave * _TOKEN_BYTES
+    skips = _decode_tag_skips(
+        {"tag0": live, "tag1": live},
+        page_tokens=interleave,
+        dcp=dcp,
+        skip_tokens=skip_tokens,
+    )
+    assert skips == {"tag0": prefix_blocks * live, "tag1": prefix_blocks * live}
+
+    for salt, tokens_per_row in enumerate((1, 4)):
+        src_pages = {}
+        for ordinal, block_id in enumerate(src_ids):
+            page = np.full((page_tokens, _TOKEN_BYTES), _FILLER, dtype=np.uint8)
+            first = ordinal * page_tokens
+            real = min(page_tokens, num_tokens - first)
+            page[:real] = _token_bytes(range(first, first + real), salt)
+            src_pages[block_id] = page.reshape(-1)
+        registration = lower_glm_dcp_row_spans(
+            tag=f"tag{salt}",
+            num_tokens=num_tokens,
+            page_tokens=page_tokens,
+            live_bytes_per_block=src_live,
+            row_bytes=tokens_per_row * _TOKEN_BYTES,
+            block_ids=src_ids,
+            dst_dcp_size=dcp,
+            interleave_tokens=interleave,
+        )
+        dst = [np.zeros((num_pages, live), dtype=np.uint8) for _ in range(dcp)]
+        for pages in dst:
+            pages[cached_ids] = _CACHED
+        dst = _replay(
+            registration,
+            dcp=dcp,
+            live=live,
+            dst_ids=suffix_ids,
+            src_pages=src_pages,
+            num_pages=num_pages,
+            tag_skip=skips[f"tag{salt}"],
+            dst=dst,
+            src_live=src_live,
+        )
+        for rank, (page, slot) in enumerate(owners):
             assert (dst[rank][cached_ids] == _CACHED).all()
             tokens = np.flatnonzero(page != kvu.OOB_PAGE)
             tokens = tokens[tokens >= skip_tokens]

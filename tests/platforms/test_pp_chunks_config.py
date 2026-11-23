@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from vllm_torchtpu.compilation import tpu_compiler
-from vllm_torchtpu.core.pp_chunk_scheduler import SCHEDULER_CLS
+from vllm_torchtpu.core.pp_chunk_scheduler import CHUNK_SCHEDULER_CLSES, SCHEDULER_CLS
 from vllm_torchtpu.platforms import tpu_platform
 
 
@@ -41,6 +41,15 @@ def test_pipeline_gets_the_chunk_scheduler_and_the_engine_hook(monkeypatch):
     config = _config()
     hook = _configure(config)
     assert config.scheduler_config.scheduler_cls == SCHEDULER_CLS
+    hook.assert_called_once_with(config)
+
+
+@pytest.mark.parametrize("cls", CHUNK_SCHEDULER_CLSES)
+def test_a_configured_chunk_scheduler_is_kept_with_the_engine_hook(monkeypatch, cls):
+    _env(monkeypatch)
+    config = _config(cls=cls)
+    hook = _configure(config)
+    assert config.scheduler_config.scheduler_cls == cls
     hook.assert_called_once_with(config)
 
 

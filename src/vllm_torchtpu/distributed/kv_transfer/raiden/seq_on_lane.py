@@ -248,6 +248,7 @@ def build_qwen35_pool_manifest_sol(
     gdn_geometry: GdnHeadGeometry,
     mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
     per_layer_tags: bool = False,
+    layer_index_by_name: Mapping[str, int] | None = None,
 ) -> PoolManifest:
     """The canonical Qwen3.5 manifest with seq-on-lane FA regions; GDN state
     pools derive exactly as in the token-major manifest (byte-level: SSM at
@@ -260,6 +261,7 @@ def build_qwen35_pool_manifest_sol(
         mamba_group_ordinal_by_layer=mamba_group_ordinal_by_layer,
         fa_layout=SolFaLayout(),
         per_layer_tags=per_layer_tags,
+        layer_index_by_name=layer_index_by_name,
     )
 
 

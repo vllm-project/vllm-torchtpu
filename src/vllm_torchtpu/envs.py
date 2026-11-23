@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_KIMIK3_ADMISSION: bool = False
     TPU_RAIDEN_GLM_ADMISSION: bool = False
     TPU_RAIDEN_GLM_DCP_IDENTITY: bool = False
+    TPU_RAIDEN_GLM_SAL_LANE_SPANS: bool = False
     TPU_RAIDEN_DSV4_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
     TPU_RAIDEN_CONTROLLER_ADDRESS: str = ""
@@ -179,6 +180,8 @@ if TYPE_CHECKING:
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_PP_LAZY_PUSH: bool = False
+    TPU_PP_DEFER_PARTIAL_STEP_WAIT: bool = False
+    TPU_PP_SHORTER_PREFILL_FIRST: bool = False
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = True
     TPU_MLA_ROPE_NEOX_PERMUTE: bool = True
@@ -1247,6 +1250,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whole pages need no packed-row geometry, so the indexer K cache may keep
     # its SEQ_ALONG_LANE layout under Raiden GLM admission.
     "TPU_RAIDEN_GLM_DCP_IDENTITY": env_bool("TPU_RAIDEN_GLM_DCP_IDENTITY"),
+    # GLM Stage-3 from a pipeline-parallel TP1 producer to a TP/DCP decode
+    # with the indexer K cache SEQ_ALONG_LANE on both legs: each interleave
+    # chunk of an indexer page ships as one strided span of lane-row runs
+    # (lower_glm_dcp_lane_spans) into a decode page that holds exactly one
+    # chunk, so the decode's interleave must equal its block size. Both peers
+    # must set it.
+    "TPU_RAIDEN_GLM_SAL_LANE_SPANS": env_bool("TPU_RAIDEN_GLM_SAL_LANE_SPANS"),
     # DeepSeek-V4 admits several attention KV cache groups at once: CSA,
     # indexer, HCA, SWA and the compressor states. Every other model here has
     # exactly one.
@@ -1723,6 +1733,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the pipeline only when stage 0 would otherwise idle and drops empty
     # steps, so requests share the pipeline (core/pp_lazy_step.py).
     "TPU_PP_LAZY_PUSH": env_bool("TPU_PP_LAZY_PUSH", default=False),
+    # Pipeline parallelism, last stage: a step that samples no token (every
+    # request in it is mid-prompt) returns without waiting for the device. The
+    # wait moves to the end of the next step, so that step's host work runs
+    # under this step's forward.
+    "TPU_PP_DEFER_PARTIAL_STEP_WAIT": env_bool(
+        "TPU_PP_DEFER_PARTIAL_STEP_WAIT", default=False
+    ),
+    # Pipeline chunk scheduler: a running prefill leaves room in the step for
+    # the requests with less prompt left to compute, running or waiting, so a
+    # short prompt does not wait for a long one to finish.
+    "TPU_PP_SHORTER_PREFILL_FIRST": env_bool(
+        "TPU_PP_SHORTER_PREFILL_FIRST", default=False
+    ),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,
@@ -2014,9 +2037,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT": env_bool(
         "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT", default=True
     ),
-    # On by default: a PCP, TP or DP Stage-3 producer registers a request's
-    # KV blocks in the step that completes its prompt rather than in the step
-    # after its finish response (pipeline producers always do).
+    # On by default: a PCP, TP or DP Stage-3 producer, or a GLM pipeline
+    # producer, registers a request's KV blocks in the step that completes its
+    # prompt rather than in the step after its finish response (other pipeline
+    # producers always do).
     "TPU_RAIDEN_STAGE3_REGISTER_AHEAD": env_bool(
         "TPU_RAIDEN_STAGE3_REGISTER_AHEAD", default=True
     ),

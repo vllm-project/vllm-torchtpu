@@ -1278,13 +1278,14 @@ def indexer_kv_layout(
     allocation and op execution always agree on the layout. Explicitly
     requesting `sal` while Raiden GLM admission is enabled raises `ValueError`.
     `TPU_RAIDEN_GLM_DCP_IDENTITY` lifts that restriction: its transfers ship
-    whole pages, so they need no packed-row geometry.
+    whole pages, so they need no packed-row geometry. So does
+    `TPU_RAIDEN_GLM_SAL_LANE_SPANS`, whose transfers ship lane-row runs.
     """
     try:
         from vllm_torchtpu import envs
 
-        raiden_glm_admission = (
-            envs.use_raiden_glm_admission() and not envs.TPU_RAIDEN_GLM_DCP_IDENTITY
+        raiden_glm_admission = envs.use_raiden_glm_admission() and not (
+            envs.TPU_RAIDEN_GLM_DCP_IDENTITY or envs.TPU_RAIDEN_GLM_SAL_LANE_SPANS
         )
         explicit_env = envs.is_indexer_kv_cache_mode_explicit()
         env_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE

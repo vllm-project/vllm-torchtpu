@@ -525,6 +525,92 @@ def glm_dcp_chunk_bytes(
     return interleave_tokens // tokens_per_row * row_bytes
 
 
+# Bytes of one token in one lane row of a SEQ_ALONG_LANE indexer page: the
+# packing axis fills one 32-bit word (see build_glm_mla_pool_manifest).
+GLM_LANE_WORD_BYTES = 4
+
+
+def lower_glm_dcp_lane_spans(
+    *,
+    tag: str,
+    num_tokens: int,
+    page_tokens: int,
+    live_bytes_per_block: int,
+    block_ids: Sequence[int],
+    dst_dcp_size: int,
+    interleave_tokens: int,
+) -> PoolSpanRegistration:
+    """Lower a SEQ_ALONG_LANE GLM indexer cache holding every token to a
+    DCP-sharded destination whose page is one interleave chunk.
+
+    The page is ``rows`` lane rows of one 32-bit word per token
+    ([blocks, rows, 4, page_tokens] under (4, 128) tiles), so token t of row r
+    sits at byte (r * page_tokens + t) * 4, and an interleave chunk is one run
+    of ``interleave_tokens`` words per row, a page row apart: one span of
+    ``rows`` strided repeats. The destination page holds exactly one chunk
+    (the consumer admits this transfer only with its interleave equal to its
+    page), where the runs lie back to back, so each chunk fills one
+    destination page in the request-global destination space. As in
+    lower_glm_dcp_row_spans, chunk g goes to destination unit g % dst_dcp_size
+    and padding chunks repeat the last real chunk.
+    """
+    if not tag:
+        raise ValueError("pool tag must not be empty")
+    if num_tokens <= 0:
+        raise ValueError("num_tokens must be positive")
+    if dst_dcp_size <= 0:
+        raise ValueError("dst_dcp_size must be positive")
+    if page_tokens <= 0:
+        raise ValueError("page_tokens must be positive")
+    row_bytes = page_tokens * GLM_LANE_WORD_BYTES
+    if live_bytes_per_block <= 0 or live_bytes_per_block % row_bytes:
+        raise ValueError(
+            "a SEQ_ALONG_LANE page must be whole lane rows: "
+            f"live={live_bytes_per_block}, row_bytes={row_bytes}"
+        )
+    rows = live_bytes_per_block // row_bytes
+    if interleave_tokens <= 0 or page_tokens % interleave_tokens:
+        raise ValueError(
+            "the DCP interleave must divide the page: "
+            f"interleave_tokens={interleave_tokens}, page_tokens={page_tokens}"
+        )
+    num_pages = (num_tokens + page_tokens - 1) // page_tokens
+    if len(block_ids) != num_pages:
+        raise ValueError(
+            "block_ids must cover the complete request page set: "
+            f"got {len(block_ids)}, expected {num_pages} for "
+            f"{num_tokens} tokens at {page_tokens} per page"
+        )
+    run_bytes = interleave_tokens * GLM_LANE_WORD_BYTES
+    dst_page_bytes = rows * run_bytes
+    chunks_per_page = page_tokens // interleave_tokens
+    last_chunk = (num_tokens - 1) // interleave_tokens
+    chunks_per_rank = last_chunk // dst_dcp_size + 1
+    spans = []
+    for chunk in range(chunks_per_rank * dst_dcp_size):
+        src_page, src_chunk = divmod(min(chunk, last_chunk), chunks_per_page)
+        spans.append(
+            PoolByteSpan(
+                src_block_ordinal=src_page,
+                src_offset_bytes=src_chunk * run_bytes,
+                dst_block_index=0,
+                dst_offset_bytes=chunk // dst_dcp_size * dst_page_bytes,
+                size_bytes=run_bytes,
+                src_stride_bytes=row_bytes,
+                dst_stride_bytes=run_bytes,
+                count=rows,
+                dst_unit_ordinal=chunk % dst_dcp_size if dst_dcp_size > 1 else None,
+            )
+        )
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(int(block_id) for block_id in block_ids),
+        spans=tuple(spans),
+        declared_bytes=len(spans) * dst_page_bytes,
+        dst_space_version=1,
+    )
+
+
 def lower_glm_dcp_row_spans(
     *,
     tag: str,
@@ -640,6 +726,78 @@ def lower_glm_dcp_identity_spans(
         block_ids=tuple(int(block_id) for block_id in block_ids),
         spans=spans,
         declared_bytes=num_pages * live_bytes_per_block,
+        dst_space_version=1,
+    )
+
+
+def lower_glm_dcp_page_scatter_spans(
+    *,
+    tag: str,
+    num_tokens: int,
+    page_tokens: int,
+    src_dcp_size: int,
+    src_dcp_rank: int,
+    dst_dcp_size: int,
+    live_bytes_per_block: int,
+    block_ids: Sequence[int],
+) -> PoolSpanRegistration:
+    """Lower one DCP rank of a pipeline stage to a larger DCP destination.
+
+    Both legs page at their DCP interleave, so a page holds one interleave
+    chunk of the request: global page ``g`` sits on source rank
+    ``g % src_dcp_size`` at local page ``g // src_dcp_size``, and on
+    destination rank ``g % dst_dcp_size`` at local page ``g // dst_dcp_size``.
+    Every page ships whole. This rank feeds the destination ranks congruent
+    to it modulo ``src_dcp_size``, each with the same number of pages; pages
+    past the request repeat this rank's last page, and decode never reads
+    them before overwriting them.
+    """
+    if not tag:
+        raise ValueError("pool tag must not be empty")
+    if num_tokens <= 0:
+        raise ValueError("num_tokens must be positive")
+    if page_tokens <= 0 or live_bytes_per_block <= 0:
+        raise ValueError("page_tokens and live_bytes_per_block must be positive")
+    if src_dcp_size <= 0 or not 0 <= src_dcp_rank < src_dcp_size:
+        raise ValueError(
+            f"src_dcp_rank {src_dcp_rank} is outside src_dcp_size {src_dcp_size}"
+        )
+    if dst_dcp_size <= 0 or dst_dcp_size % src_dcp_size:
+        raise ValueError(
+            "the destination DCP size must be a multiple of the source's: "
+            f"dst_dcp_size={dst_dcp_size}, src_dcp_size={src_dcp_size}"
+        )
+    scheduler_block_tokens = page_tokens * src_dcp_size
+    num_blocks = (num_tokens + scheduler_block_tokens - 1) // scheduler_block_tokens
+    if len(block_ids) != num_blocks:
+        raise ValueError(
+            "block_ids must cover the complete request scheduler block set: "
+            f"got {len(block_ids)}, expected {num_blocks} for {num_tokens} "
+            f"tokens at {page_tokens} per page and DCP {src_dcp_size}"
+        )
+    last_page = (num_tokens - 1) // page_tokens
+    pages_per_dst = last_page // dst_dcp_size + 1
+    dst_per_src = dst_dcp_size // src_dcp_size
+    spans = []
+    for j in range(dst_per_src):
+        dst_unit = src_dcp_rank + src_dcp_size * j
+        for m in range(pages_per_dst):
+            local_page = j + dst_per_src * m
+            spans.append(
+                PoolByteSpan(
+                    src_block_ordinal=min(local_page, num_blocks - 1),
+                    src_offset_bytes=0,
+                    dst_block_index=0,
+                    dst_offset_bytes=m * live_bytes_per_block,
+                    size_bytes=live_bytes_per_block,
+                    dst_unit_ordinal=dst_unit if dst_dcp_size > 1 else None,
+                )
+            )
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(int(block_id) for block_id in block_ids),
+        spans=tuple(spans),
+        declared_bytes=len(spans) * live_bytes_per_block,
         dst_space_version=1,
     )
 

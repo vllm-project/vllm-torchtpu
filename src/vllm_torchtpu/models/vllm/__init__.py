@@ -7,6 +7,9 @@ _K3_DSPARK_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:K3DSparkForCausalLM"
 _DSV4_DSPARK_MODEL = (
     "vllm_torchtpu.models.vllm.deepseek_v4.dspark:DSparkDeepseekV4ForCausalLM"
 )
+_QWEN35_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MTP"
+_QWEN35_MOE_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MoeMTP"
+_DSA_MTP_MODEL = "vllm_torchtpu.models.vllm.deepseek_mtp:DeepSeekMTP"
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -22,4 +25,9 @@ def register_models() -> None:
     ModelRegistry.register_model("DeepseekV4ForCausalLM", _DSV4_MODEL)
     ModelRegistry.register_model("K3DSparkModel", _K3_DSPARK_MODEL)
     ModelRegistry.register_model("DSparkDraftModel", _DSV4_DSPARK_MODEL)
+    # The Qwen3.5 MTP drafts, so a pipeline-parallel producer can load them.
+    ModelRegistry.register_model("Qwen3_5MTP", _QWEN35_MTP_MODEL)
+    ModelRegistry.register_model("Qwen3_5MoeMTP", _QWEN35_MOE_MTP_MODEL)
+    # The DSA (DeepSeek-V3.2, GLM-5.x) MTP draft, likewise.
+    ModelRegistry.register_model("DeepseekV32MTPModel", _DSA_MTP_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config

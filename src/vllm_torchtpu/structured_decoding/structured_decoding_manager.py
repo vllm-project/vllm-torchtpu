@@ -53,11 +53,9 @@ class StructuredDecodingManager:
         # Only needed with speculative decoding:
         # one row per draft position of the chunk's target_logits, which is
         # padded to a num-tokens bucket (up to max_num_reqs * (1 + K) rows).
-        # Prefill-only PCP MTP K1 skips _precompie_rejection_sampler(), so we
+        # Prefill-only MTP skips _precompile_rejection_sampler(), so we
         # skip it here as well.
-        if runner.speculative_config is not None and not (
-            runner._pcp_enabled and runner._mtp_enabled
-        ):
+        if runner.speculative_config is not None and not runner._mtp_prefill_only:
             from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
 
             num_spec_tokens = runner.speculative_config.num_speculative_tokens

@@ -37,6 +37,7 @@ def make_manager(
         num_tokens_paddings=num_tokens_paddings or [16, 32, 64],
         _pcp_enabled=pcp_enabled,
         _mtp_enabled=mtp_enabled,
+        _mtp_prefill_only=pcp_enabled and mtp_enabled,
     )
     return StructuredDecodingManager(runner)
 
