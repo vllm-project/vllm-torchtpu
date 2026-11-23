@@ -1790,6 +1790,11 @@ def test_default_ep_weight_filter_respects_cli_opt_out_via_parser(
     action = next(a for a in parser._actions if a.dest == "enable_ep_weight_filter")
     assert isinstance(action, tpu_platform._TRACKED_EP_WEIGHT_FILTER_ACTION_TYPES)
     parsed = parser.parse_args(cli_args)
+    # Mirror vllm serve's log_non_default_args(), which constructs a throwaway
+    # parser and parses [] after real CLI parsing.
+    with _device_left_unset():
+        throwaway = AsyncEngineArgs.add_cli_args(FlexibleArgumentParser())
+    throwaway.parse_args([])
     vllm_config = _make_ep_filter_vllm_config(
         is_moe=True,
         enable_expert_parallel=True,
@@ -1806,10 +1811,11 @@ def test_default_ep_weight_filter_respects_cli_opt_out_via_parser(
 @pytest.mark.parametrize(
     "parser_opt_out, expected",
     [
-        # Without parser hook (e.g. direct EngineArgs entry point), fall back
-        # to raw sys.argv.
+        # When no hooked flag action ran (e.g. unhooked EngineArgs subcommand),
+        # fall back to raw sys.argv.
         (None, False),
-        # Once the parser hook ran without opt-out, ignore stale sys.argv.
+        # When a hooked --enable-ep-weight-filter ran last, ignore earlier
+        # disable flags still present in sys.argv.
         (False, True),
     ],
 )

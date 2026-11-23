@@ -220,10 +220,12 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 
 _dynamic_compile_unwrapped = False
 _tpu_kv_connectors_registered = False
-# Process-global CLI opt-out state: None until pre_register_and_update(parser)
-# hooks the flag action (which resets it to False), then True/False from the
-# last parsed --enable-ep-weight-filter / --disable-ep-weight-filter /
-# --no-enable-ep-weight-filter flag (including --config YAML files).
+# Process-global CLI opt-out state: None until a hooked
+# --enable-ep-weight-filter / --disable-ep-weight-filter /
+# --no-enable-ep-weight-filter action actually runs during parse_args()
+# (including --config YAML files). Never reset on parser construction because
+# vLLM's log_non_default_args() builds a throwaway parser after parse_args()
+# and other subcommands (e.g. `vllm bench`) use unhooked EngineArgs parsers.
 _ep_weight_filter_cli_opt_out: bool | None = None
 _EP_WEIGHT_FILTER_CLI_DISABLE_FLAGS = (
     "--disable-ep-weight-filter",
@@ -257,20 +259,14 @@ _TRACKED_EP_WEIGHT_FILTER_ACTION_TYPES = (
 
 def _track_ep_weight_filter_cli_action(parser: "FlexibleArgumentParser") -> None:
     """Attach opt-out tracking to vLLM's --enable-ep-weight-filter CLI action."""
-    global _ep_weight_filter_cli_opt_out
     for action in parser._actions:
         if action.dest != "enable_ep_weight_filter":
             continue
         if type(action) is EnableDisableAction:
             action.__class__ = _TrackedEnableDisableEpWeightFilterAction
-            _ep_weight_filter_cli_opt_out = False
         elif type(action) is argparse.BooleanOptionalAction:
             action.__class__ = _TrackedBooleanOptionalEpWeightFilterAction
-            _ep_weight_filter_cli_opt_out = False
-        elif isinstance(action, _TRACKED_EP_WEIGHT_FILTER_ACTION_TYPES):
-            _ep_weight_filter_cli_opt_out = False
-        else:
-            _ep_weight_filter_cli_opt_out = None
+        elif not isinstance(action, _TRACKED_EP_WEIGHT_FILTER_ACTION_TYPES):
             logger.warning_once(
                 "Unexpected action class %s for --enable-ep-weight-filter; "
                 "falling back to sys.argv opt-out detection.",
