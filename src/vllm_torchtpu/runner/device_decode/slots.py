@@ -54,6 +54,9 @@ MIRROR_MISMATCH: Final[str] = "mirror_mismatch"
     _COL_TOP_P,
 ) = range(8)
 _NUM_SCALAR_COLS: Final[int] = 8
+# The per-slot scalar tensors of `DecodeSlots`, 4 bytes each: num_computed,
+# last_token, temperature, top_k, top_p, seed_lo, seed_hi and mamba_slot.
+_NUM_SLOT_COLUMNS: Final[int] = 8
 
 
 def derive_request_seed(
@@ -114,6 +117,12 @@ class SlotConfig:
     @property
     def null_slot(self) -> int:
         return self.max_num_reqs
+
+    @property
+    def device_bytes(self) -> int:
+        """The HBM the slot tensors of `DecodeSlots` take: one row per slot
+        of the scalar columns and of every group's block table, all 4-byte."""
+        return 4 * self.num_slots * (_NUM_SLOT_COLUMNS + sum(self.group_widths))
 
     @staticmethod
     def from_runner(runner: Any) -> SlotConfig:

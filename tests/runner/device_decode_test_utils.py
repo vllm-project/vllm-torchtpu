@@ -249,6 +249,8 @@ def make_runner(
         block_sizes=[BLOCK],
         max_num_blocks_per_req=[-(-MAX_MODEL_LEN // BLOCK)],
     )
+    # As __init__ syncs it with the block table it allocates.
+    r.max_num_blocks_per_req = r.input_batch.block_table[0].max_num_blocks_per_req
     spec = FullAttentionSpec(
         block_size=BLOCK,
         num_kv_heads=1,

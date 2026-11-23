@@ -6478,6 +6478,15 @@ class TPUModelRunner(GPUModelRunner):
         assert isinstance(lora_manager, TPUWorkerLoRAManager)
         return lora_manager.slot_write_hbm_bytes()
 
+    def device_decode_hbm_reserve_bytes(self) -> int:
+        """HBM the device-decode path takes after the KV cache is sized,
+        which the KV cache budget must leave free
+        (`DeviceDecodeController.hbm_reserve_bytes`); 0 without
+        VLLM_TPU_DEVICE_DECODE."""
+        if self._device_decode is None:
+            return 0
+        return self._device_decode.hbm_reserve_bytes()
+
     def post_profile_hbm_reserves(self) -> utils.HbmReserves:
         """HBM that profile_run does not see, which the KV cache budget must
         leave free.
@@ -6491,6 +6500,7 @@ class TPUModelRunner(GPUModelRunner):
             kv_connector=utils.estimate_kv_connector_hbm_reserve(self.vllm_config),
             lora_slot_write=self.lora_slot_write_hbm_bytes(),
             pp_handoff=self.pp_handoff_hbm_reserve_bytes(),
+            device_decode=self.device_decode_hbm_reserve_bytes(),
         )
 
     def _initialize_pallas_kernels(self):

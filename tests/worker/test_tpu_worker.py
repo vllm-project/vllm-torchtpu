@@ -383,9 +383,10 @@ def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
     worker.vllm_config = SimpleNamespace(kv_transfer_config=None)
     worker.devices = []
     worker.model_runner = MagicMock(is_pooling_model=False)
-    # No KV connector, no LoRA and no buffered hand-off, so nothing is reserved.
+    # No KV connector, LoRA, buffered hand-off or device decode, so nothing is
+    # reserved.
     worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
-        kv_connector=0, lora_slot_write=0, pp_handoff=0
+        kv_connector=0, lora_slot_write=0, pp_handoff=0, device_decode=0
     )
     return worker
 
@@ -426,7 +427,7 @@ def test_determine_available_memory_leaves_room_for_lora_slot_write(monkeypatch)
         peer=7 * utils.GBYTES,
     )
     worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
-        kv_connector=0, lora_slot_write=utils.GBYTES, pp_handoff=0
+        kv_connector=0, lora_slot_write=utils.GBYTES, pp_handoff=0, device_decode=0
     )
 
     assert worker.determine_available_memory() == 6 * utils.GBYTES
@@ -439,7 +440,20 @@ def test_determine_available_memory_reserves_the_pp_hand_off_buffers(monkeypatch
         monkeypatch, dp_size=1, expert_parallel=False, local=7 * utils.GBYTES, peer=0
     )
     worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
-        kv_connector=0, lora_slot_write=0, pp_handoff=utils.GBYTES
+        kv_connector=0, lora_slot_write=0, pp_handoff=utils.GBYTES, device_decode=0
+    )
+
+    assert worker.determine_available_memory() == 6 * utils.GBYTES
+
+
+def test_determine_available_memory_reserves_the_device_decode_hbm(monkeypatch):
+    """The device-decode path builds its slots and compiles its last programs
+    after profile_run, so the KV cache leaves room for them."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=7 * utils.GBYTES, peer=0
+    )
+    worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
+        kv_connector=0, lora_slot_write=0, pp_handoff=0, device_decode=utils.GBYTES
     )
 
     assert worker.determine_available_memory() == 6 * utils.GBYTES
@@ -460,7 +474,10 @@ def test_out_of_memory_error_shows_the_lora_reserve(monkeypatch):
     )
     monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
     worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
-        kv_connector=0, lora_slot_write=2 * utils.GBYTES, pp_handoff=0
+        kv_connector=0,
+        lora_slot_write=2 * utils.GBYTES,
+        pp_handoff=0,
+        device_decode=0,
     )
 
     with pytest.raises(ValueError) as error:
@@ -472,6 +489,33 @@ def test_out_of_memory_error_shows_the_lora_reserve(monkeypatch):
     assert "pp_handoff_hbm_reserve_gb=0.0GiB" in message
     assert "by 1.0GiB" in message
     assert "--max-loras" in message
+
+
+def test_out_of_memory_error_shows_the_device_decode_reserve(monkeypatch):
+    """Only the device-decode reserve pushes the budget below zero, so the
+    error must show it and name the flag that drops it."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=0, peer=0
+    )
+    budget = utils.HbmBudget(
+        total_limit=32 * utils.GBYTES,
+        total_used=18 * utils.GBYTES,
+        cap=19 * utils.GBYTES,
+        available=utils.GBYTES,
+    )
+    monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
+    worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
+        kv_connector=0, lora_slot_write=0, pp_handoff=0, device_decode=2 * utils.GBYTES
+    )
+
+    with pytest.raises(ValueError) as error:
+        worker.determine_available_memory()
+
+    message = str(error.value)
+    assert "device_decode_hbm_reserve_gb=2.0GiB" in message
+    assert "by 1.0GiB" in message
+    assert "unsetting VLLM_TPU_DEVICE_DECODE" in message
+    assert "--max-loras" not in message
 
 
 def test_determine_available_memory_profiles_an_unpinned_kv_cache(monkeypatch):
