@@ -14,7 +14,7 @@
 
 import builtins
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import jax
 import pytest
@@ -22,6 +22,10 @@ import torch
 from vllm.distributed import parallel_state
 
 from vllm_torchtpu.distributed import mesh_utils, pcp
+
+# The real function, captured before any test patches it, so the fakes below
+# reject a call that its signature would reject.
+_REAL_GET_PALLAS_MESH = torch.tpu.pallas.get_pallas_mesh
 
 
 @pytest.fixture(autouse=True)
@@ -257,7 +261,9 @@ def _pcp_mesh_environment(monkeypatch, layout_holder, world_size=2):
             )
         ),
     )
-    get_pallas_mesh = Mock(side_effect=lambda **kwargs: object())
+    get_pallas_mesh = create_autospec(
+        _REAL_GET_PALLAS_MESH, side_effect=lambda **kwargs: object()
+    )
     monkeypatch.setattr(torch.tpu.pallas, "get_pallas_mesh", get_pallas_mesh)
     return get_pallas_mesh
 
@@ -310,7 +316,7 @@ def _stage_mesh_environment(monkeypatch, holder, mesh_device_ids):
             flat=[SimpleNamespace(id=device_id) for device_id in mesh_device_ids]
         )
     )
-    get_pallas_mesh = Mock(return_value=mesh)
+    get_pallas_mesh = create_autospec(_REAL_GET_PALLAS_MESH, return_value=mesh)
     monkeypatch.setattr(torch.tpu.pallas, "get_pallas_mesh", get_pallas_mesh)
     return group, mesh, get_pallas_mesh
 
