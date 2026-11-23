@@ -23,8 +23,10 @@ import vllm.envs as vllm_envs
 
 from vllm_torchtpu.env_validation import (
     PACKAGE_WRITTEN_ENV_VARS,
+    REMOVED_ENV_VARS,
     UnreadEnvVar,
     find_unread_env_vars,
+    reject_removed_env_vars,
 )
 from vllm_torchtpu.platforms import tpu_platform
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
@@ -278,3 +280,53 @@ def test_real_registries_accept_a_normal_start(monkeypatch, _clean_environ, _war
         monkeypatch.setenv(name, "1")
     TpuPlatform.validate_environ(hard_fail=True)
     _warning.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "vllm_names",
+    [VLLM, VLLM | {"VLLM_ATTENTION_BACKENDS"}],
+    ids=["no_near_name", "near_name"],
+)
+def test_removed_names_are_left_to_the_startup_check(vllm_names):
+    """A removed name is not reported as unread, even when a registry holds a
+    close name (VLLM_ATTENTION_BACKENDS scores 0.98): startup rejects it with
+    its replacement, which a "did you mean" hint would contradict."""
+    assert find_unread_env_vars(["VLLM_ATTENTION_BACKEND"], TORCHTPU, vllm_names) == []
+    # The close name is within the cutoff: a name that is not removed gets it.
+    assert find_unread_env_vars(["VLLM_ATTENTION_BACKEND_"], TORCHTPU, vllm_names) == [
+        UnreadEnvVar(
+            "VLLM_ATTENTION_BACKEND_",
+            "VLLM_ATTENTION_BACKENDS"
+            if "VLLM_ATTENTION_BACKENDS" in vllm_names
+            else None,
+        )
+    ]
+
+
+def test_platform_leaves_a_set_removed_name_to_the_startup_check(
+    monkeypatch, _clean_environ, _warning
+):
+    """With the real registries, the set name is neither read by a registry
+    nor reported, so only the startup check below names it."""
+    monkeypatch.setenv("VLLM_ATTENTION_BACKEND", "CUSTOM")
+    TpuPlatform.validate_environ(hard_fail=True)
+    _warning.assert_not_called()
+
+
+def test_no_removed_name_is_read_by_a_real_registry():
+    """A removed name that a registry reads again (for example after a vLLM
+    bump) would be rejected while it works; drop it from the table then."""
+    registered = TpuPlatform.known_env_var_names() | set(
+        vllm_envs.environment_variables
+    )
+    assert not set(REMOVED_ENV_VARS) & registered
+
+
+@pytest.mark.parametrize("value", ["CUSTOM", "0", ""])
+def test_a_set_removed_name_names_its_replacement(value):
+    with pytest.raises(
+        ValueError,
+        match=r"^VLLM_ATTENTION_BACKEND has been removed; pass --attention-backend",
+    ):
+        reject_removed_env_vars({"VLLM_ATTENTION_BACKEND": value})
+    reject_removed_env_vars({})

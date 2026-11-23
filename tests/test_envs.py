@@ -11,22 +11,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""USE_MOE_EP_KERNEL was deleted: setting it must now fail startup.
+"""Removed env vars (``REMOVED_ENV_VARS``): setting one must fail startup.
 
-It is not aliased to USE_MOE_FUSED_EP_KERNEL, which would enable the kernel
-under the recipes that still set the old name and change results they have
-already recorded.
+None is aliased to its replacement. USE_MOE_EP_KERNEL, for example, is not
+an alias of USE_MOE_FUSED_EP_KERNEL, which would enable the kernel under the
+recipes that still set the old name and change results they have already
+recorded.
 """
 
+import re
 from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm.config import CacheConfig, VllmConfig
 from vllm.config.aux_output import AuxOutputConfig
 
+from vllm_torchtpu.env_validation import REMOVED_ENV_VARS
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
-REMOVED = "USE_MOE_EP_KERNEL"
+
+@pytest.fixture(autouse=True)
+def _no_removed_env_vars(monkeypatch):
+    """Every test starts with no removed name set, whatever the shell sets."""
+    for name in REMOVED_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture
@@ -51,42 +59,31 @@ def vllm_config():
     return config
 
 
-@pytest.mark.parametrize("value", ["1", "0", ""])
-def test_startup_rejects_the_removed_knob(monkeypatch, vllm_config, value):
-    """Including `0` and the empty string: what is wrong is naming the knob."""
-    monkeypatch.setenv(REMOVED, value)
-
-    with pytest.raises(ValueError, match="USE_MOE_FUSED_EP_KERNEL=1"):
-        TpuPlatform.check_and_update_config(vllm_config)
-
-
 @patch("vllm_torchtpu.patch_registry.apply")
 @patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
-def test_startup_accepts_the_knob_unset(
+def test_startup_accepts_no_removed_name_set(
     mock_prepare_env, mock_apply_patches, monkeypatch, vllm_config
 ):
-    monkeypatch.delenv(REMOVED, raising=False)
-
     TpuPlatform.check_and_update_config(vllm_config)
-
-
-@pytest.mark.parametrize("value", ["1", "0", ""])
-def test_startup_rejects_topk_weights_float32_env(monkeypatch, vllm_config, value):
-    """The setting moved to additional_config; naming the old knob fails."""
-    monkeypatch.delenv(REMOVED, raising=False)
-    monkeypatch.setenv("TPU_MOE_TOPK_WEIGHTS_FLOAT32", value)
-
-    with pytest.raises(ValueError, match='"tpu_moe_topk_weights_float32": true'):
-        TpuPlatform.check_and_update_config(vllm_config)
 
 
 @pytest.mark.parametrize(
     "key", ["tpu_moe_silu_bf16", "tpu_moe_topk_weights_float32", "tpu_rope_in_graph"]
 )
 def test_startup_rejects_non_bool_additional_config(monkeypatch, vllm_config, key):
-    monkeypatch.delenv(REMOVED, raising=False)
-    monkeypatch.delenv("TPU_MOE_TOPK_WEIGHTS_FLOAT32", raising=False)
     vllm_config.additional_config = {key: "true"}
 
     with pytest.raises(ValueError, match=key):
+        TpuPlatform.check_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize("value", ["1", "0", ""])
+@pytest.mark.parametrize("name", list(REMOVED_ENV_VARS))
+def test_startup_rejects_every_removed_name(monkeypatch, vllm_config, name, value):
+    """Including `0` and the empty string, and the TPU_PP_* names without a
+    pipeline: what is wrong is naming the variable."""
+    monkeypatch.setenv(name, value)
+    expected = f"{name} has been removed; {REMOVED_ENV_VARS[name]}"
+
+    with pytest.raises(ValueError, match=f"^{re.escape(expected)}$"):
         TpuPlatform.check_and_update_config(vllm_config)

@@ -903,18 +903,9 @@ class TpuPlatform(Platform):
         )
         _validate_phased_profiling_config(vllm_config)
         _validate_peer_replay_config()
-        if "USE_MOE_EP_KERNEL" in os.environ:
-            raise ValueError(
-                "USE_MOE_EP_KERNEL is no longer supported and enables "
-                "nothing. Unset it; the fused expert-parallel MoE kernel is "
-                "USE_MOE_FUSED_EP_KERNEL=1."
-            )
-        if "TPU_MOE_TOPK_WEIGHTS_FLOAT32" in os.environ:
-            raise ValueError(
-                "TPU_MOE_TOPK_WEIGHTS_FLOAT32 is no longer supported. Unset it "
-                "and pass --additional-config "
-                "'{\"tpu_moe_topk_weights_float32\": true}' instead."
-            )
+        from vllm_torchtpu.env_validation import reject_removed_env_vars
+
+        reject_removed_env_vars()
         # Rejects non-bool MoE reference-parity values before any worker starts.
         get_moe_reference_parity(vllm_config)
         # Likewise for a non-bool in-graph RoPE value.

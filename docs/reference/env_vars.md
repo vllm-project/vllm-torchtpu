@@ -2,7 +2,7 @@
 
 All environment variables read by `vllm-torchtpu` are declared and validated in [`src/vllm_torchtpu/envs.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/envs.py) (enforced in CI by `tools/check_env_reads.py`). Boolean variables accept `"1"`, `"true"`, `"yes"`, `"on"` or `"0"`, `"false"`, `"no"`, `"off"` (case-insensitive); invalid values raise a `ValueError` at startup.
 
-At startup, `vllm-torchtpu` reports set environment variables that neither vLLM nor this package reads, and suggests the closest name for a likely typo. `--fail-on-environ-validation` turns the report into an error.
+At startup, `vllm-torchtpu` reports set environment variables that neither vLLM nor this package reads, and suggests the closest name for a likely typo. `--fail-on-environ-validation` turns the report into an error. A [removed variable](#7-removed-variables) that is still set is not in that report: startup fails and names what replaced it.
 
 ---
 
@@ -48,13 +48,6 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
 | `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
-
-Removed pipeline variables. Startup with pipeline parallelism fails while any of them is set:
-
-- `TPU_PP_HANDOFF`: the buffered point-to-point hand-off is the only one; unset it.
-- `TPU_PP_RING_DEPTH`: renamed to `TPU_PP_HANDOFF_DEPTH`.
-- `TPU_PP_LAZY_PUSH`: timed the pushes of the removed lockstep hand-off; unset it.
-- `TPU_PP_DYNAMIC_CHUNKS`: split into `TPU_PP_LONE_PROMPT_CHUNKS` and `TPU_PP_EQUAL_COST_CHUNKS`.
 
 ---
 
@@ -151,3 +144,17 @@ The in-graph `cos`/`sin` are not bit-identical to the table, and K is rotated be
 | `TPU_TRACE_MODE` | `"TRACE_COMPUTE"` | SparseCore trace mode (`"TRACE_COMPUTE"`, `"TRACE_COMPUTE_AND_DMA"`, etc.). |
 | `TPU_NUM_SPARSE_CORES_TO_TRACE` | `1` | Number of SparseCores to trace when SparseCore tracing is active. |
 | `TPU_KERNEL_ITER_MODE` | `False` | Enables fast Pallas kernel hot-reloading without restarting the vLLM server (`TPU_KERNEL_RELOAD_MODULES`). |
+
+---
+
+## 7. Removed Variables
+
+Startup fails while any of these is set, even to `0` or an empty string, whatever the model or parallelism:
+
+- `VLLM_ATTENTION_BACKEND`: vLLM no longer reads it; pass `--attention-backend` (for example `--attention-backend CUSTOM`).
+- `USE_MOE_EP_KERNEL`: it enabled nothing; the fused expert-parallel MoE kernel is `USE_MOE_FUSED_EP_KERNEL=1`.
+- `TPU_MOE_TOPK_WEIGHTS_FLOAT32`: replaced by `--additional-config '{"tpu_moe_topk_weights_float32": true}'`.
+- `TPU_PP_HANDOFF`: the buffered point-to-point hand-off is the only one; unset it.
+- `TPU_PP_RING_DEPTH`: renamed to `TPU_PP_HANDOFF_DEPTH`.
+- `TPU_PP_LAZY_PUSH`: timed the pushes of the removed lockstep hand-off; unset it.
+- `TPU_PP_DYNAMIC_CHUNKS`: split into `TPU_PP_LONE_PROMPT_CHUNKS` and `TPU_PP_EQUAL_COST_CHUNKS`.
