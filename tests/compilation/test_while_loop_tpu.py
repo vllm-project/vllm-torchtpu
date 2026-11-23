@@ -37,7 +37,9 @@ from tests.distributed.tpu_test_utils import (
 )
 
 _GOOGLE_PCI_VENDOR = "0x1ae0"
-_MULTICHIP_LAUNCH_TIMEOUT_S = 600
+# Keep well below the multichip PR lane's --timeout=600 so communicate() times
+# out before pytest-timeout fires.
+_MULTICHIP_LAUNCH_TIMEOUT_S = 480
 
 
 def _has_tpu_hardware() -> bool:
@@ -843,12 +845,28 @@ def test_multichip_collectives_and_custom_ep_mesh_device_assignment(
         errors="replace",
         start_new_session=True,
     )
+    timed_out = False
+    output = ""
     try:
         output, _ = proc.communicate(timeout=_MULTICHIP_LAUNCH_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        output, _ = proc.communicate()
-        pytest.fail(f"Multichip worker timed out:\n{(output or '')[-6000:]}")
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        raw_out = exc.output or ""
+        output = (
+            raw_out.decode(errors="replace") if isinstance(raw_out, bytes) else raw_out
+        )
+    finally:
+        # Stop the whole session group whenever proc is still alive (including
+        # if pytest-timeout fires inside communicate()).
+        if proc.returncode is None:
+            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+    if timed_out:
+        pytest.fail(f"Multichip worker timed out:\n{output[-6000:]}")
 
     results = [
         json.loads((result_dir / f"rank_{r}.json").read_text(encoding="utf-8"))

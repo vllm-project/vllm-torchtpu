@@ -44,7 +44,8 @@ class _WhileCarryStorageOverlapError(ValueError):
     """Raised when distinct while-loop carry leaves share underlying storage."""
 
 
-def _is_symbolic_or_fake_tensor(tensor: torch.Tensor) -> bool:
+def _is_wrapped_or_symbolic_tensor(tensor: torch.Tensor) -> bool:
+    """Returns True for Tensor subclasses, functorch/FakeTensor wrappers, or proxies."""
     return (
         type(tensor) is not torch.Tensor
         or torch._C._functorch.is_functorch_wrapped_tensor(tensor)
@@ -190,6 +191,8 @@ def _clone_preserving_strides(tensor: torch.Tensor) -> torch.Tensor:
         )
         return out.copy_(tensor)
     except NotImplementedError:
+        # Backends without aten::empty_strided (e.g. XLA/PrivateUse1) fall back
+        # to a contiguous clone.
         return tensor.clone()
 
 
@@ -197,15 +200,17 @@ def _clone_aliased_eager_outputs(
     outputs: Sequence[torch.Tensor],
     inputs: Sequence[torch.Tensor],
 ) -> tuple[torch.Tensor, ...]:
-    forbidden_ptrs = {t.data_ptr() for t in inputs if t.data_ptr() != 0}
+    forbidden_bases = {
+        base for t in inputs if (base := _tensor_storage_base_ptr(t)) is not None
+    }
     result: list[torch.Tensor] = []
     for out in outputs:
-        ptr = out.data_ptr()
-        if ptr == 0 or ptr in forbidden_ptrs:
+        base = _tensor_storage_base_ptr(out)
+        if base is None or base in forbidden_bases:
             out = _clone_preserving_strides(out)
-            ptr = out.data_ptr()
-        if ptr != 0:
-            forbidden_ptrs.add(ptr)
+            base = _tensor_storage_base_ptr(out)
+        if base is not None:
+            forbidden_bases.add(base)
         result.append(out)
     return tuple(result)
 
@@ -381,7 +386,7 @@ def tpu_while_loop[T](
     if in_eager and all(
         c.device.type == "cpu"
         and not c.requires_grad
-        and not _is_symbolic_or_fake_tensor(c)
+        and not _is_wrapped_or_symbolic_tensor(c)
         for c in unique_carries
     ):
         raw_out: Sequence[torch.Tensor] = _run_eager_cpu_while_loop(

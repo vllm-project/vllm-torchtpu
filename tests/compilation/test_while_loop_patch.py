@@ -75,6 +75,29 @@ def _parse_and_verify_mlir(payload: str | bytes) -> tuple[ir.Module, str]:
         return mod, str(mod.operation.get_asm(enable_debug_info=False))
 
 
+def _build_while_loop_mlir(
+    cond_mlir_text: str,
+    body_mlir_text: str,
+    *,
+    num_carries: int,
+    num_additional_inputs: int = 0,
+    has_rng_state: bool = False,
+    num_partitions: int = 1,
+    allowed_donor_indices: set[int] | None = None,
+) -> wl_mlir._WhileLoopMlirArtifact:
+    with wl_mlir._parse_while_subgraphs(
+        cond_mlir_text, body_mlir_text, num_carries=num_carries
+    ) as parsed:
+        return wl_mlir._assemble_while_loop_mlir(
+            parsed,
+            num_carries=num_carries,
+            num_additional_inputs=num_additional_inputs,
+            has_rng_state=has_rng_state,
+            num_partitions=num_partitions,
+            allowed_donor_indices=allowed_donor_indices,
+        )
+
+
 class _MockTpuTensor(torch.Tensor):
     """Lightweight PrivateUse1 tensor wrapper backed by a CPU tensor."""
 
@@ -506,9 +529,10 @@ class TestPatchLifecycleAndRealTorchTpuPasses:
         assert torch._C.DispatchKey.PrivateUse1 not in while_loop_op.py_kernels
 
     def test_real_clone_mutated_returned_placeholders_pass(self, monkeypatch) -> None:
-        cmrp = pytest.importorskip(
-            "torch_tpu._internal.compile.fx_passes.clone_mutated_returned_placeholders"
+        from torch_tpu._internal.compile.fx_passes import (
+            clone_mutated_returned_placeholders as cmrp,
         )
+
         orig = getattr(
             cmrp._is_returned_compute_placeholder,
             "__wrapped__",
@@ -575,10 +599,10 @@ class TestPatchLifecycleAndRealTorchTpuPasses:
     def test_real_split_compiler_carry_validation_pickle_and_collectives(
         self, monkeypatch
     ) -> None:
-        sc = pytest.importorskip("torch_tpu._internal.compile.split_compiler")
-        compiler_mod = pytest.importorskip("torch_tpu._internal.compile.compiler")
         from functorch.compile import make_boxed_func
         from torch._functorch.aot_autograd import aot_module_simplified
+        from torch_tpu._internal.compile import compiler as compiler_mod
+        from torch_tpu._internal.compile import split_compiler as sc
 
         orig = getattr(
             sc.SplitCompiler._compile_graph,
@@ -719,7 +743,8 @@ class TestPatchLifecycleAndRealTorchTpuPasses:
                 nested_cond_hoisted(torch.tensor(flg), pool[0:4], pool[4:8])
 
     def test_fx_subgraph_collective_classification(self) -> None:
-        pytest.importorskip("torch_tpu")
+        import torch_tpu  # noqa: F401
+
         patch_mod = importlib.import_module(
             "vllm_torchtpu.compilation.while_loop.patch"
         )
@@ -797,7 +822,7 @@ class TestMlirAstBuilder:
             }
             """
         )
-        art = wl_mlir._build_while_loop_mlir(
+        art = _build_while_loop_mlir(
             cond_m,
             body_m,
             num_carries=2,
@@ -806,7 +831,7 @@ class TestMlirAstBuilder:
             num_partitions=8,
         )
         assert art.donated_carry_indices == (1,)
-        mod, text = _parse_and_verify_mlir(art.mlir_text)
+        mod, text = _parse_and_verify_mlir(art.normalized_mlir_text)
         assert text.count("sdy.manual_computation") == 1
         assert "tf.aliasing_output = 1 : i32" in text
         funcs = [
@@ -816,7 +841,7 @@ class TestMlirAstBuilder:
         ]
         assert len([f for f in funcs if f != "main"]) == 2
 
-        art_filtered = wl_mlir._build_while_loop_mlir(
+        art_filtered = _build_while_loop_mlir(
             cond_m,
             body_m,
             num_carries=2,
@@ -829,7 +854,7 @@ class TestMlirAstBuilder:
             and art_filtered.kernel_key != art.kernel_key
         )
 
-    def test_stale_sharding_stripped_on_pure_compute(
+    def test_stale_sharding_stripped_and_gspmd_custom_call_rejected(
         self, installed_while_loop_patch
     ) -> None:
         _, rig = installed_while_loop_patch
@@ -869,6 +894,21 @@ class TestMlirAstBuilder:
             while_loop_op(lambda s: s < 4, lambda s: (s + 1,), (s_in,), ())
         assert rig.custom_kernel_calls[-1]["device_assignment"] == []
 
+        gspmd_body = textwrap.dedent(
+            """
+            module {
+              func.func public @main(%s: tensor<i32>) -> tensor<i32> {
+                %x = stablehlo.custom_call @Sharding(%s) {
+                    mhlo.sharding = "{replicated}"
+                } : (tensor<i32>) -> tensor<i32>
+                return %x : tensor<i32>
+              }
+            }
+            """
+        )
+        with pytest.raises(ValueError, match="Unsupported GSPMD sharding custom_call"):
+            _build_while_loop_mlir(sharded_cond, gspmd_body, num_carries=1)
+
 
 class TestDispatchLoweringContracts:
     def test_strides_donation_and_rng_splicing(
@@ -901,6 +941,19 @@ class TestDispatchLoweringContracts:
             )
         assert seen_strides == [((1, 4), (1, 16))]
         assert out_h.stride() == (1, 4)
+
+        # Eager TPU loop clones non-zero-offset views of inputs.
+        sm_tpu = _MockTpuTensor(torch.zeros((4,), dtype=torch.float32))
+        big_tpu = _MockTpuTensor(torch.arange(8, dtype=torch.float32))
+        _, out_sm, _ = while_loop_op(
+            lambda s, _sm, _bg: s < 1,
+            lambda s, _sm, bg: (s + 1, bg[4:8], bg + 1.0),
+            (step0, sm_tpu, big_tpu),
+            (),
+        )
+        assert (
+            out_sm.untyped_storage().data_ptr() != big_tpu.untyped_storage().data_ptr()
+        )
 
         rig.force_strides_calls.clear()
         kv_init = _MockTpuTensor(torch.zeros((4, 8), dtype=torch.bfloat16))
@@ -1022,6 +1075,19 @@ class TestDispatchLoweringContracts:
             pytest.raises(ValueError, match="Mismatched device_assignment"),
         ):
             while_loop_op(lambda s: s < 2, ep_body, (step0,), ())
+
+        # Unresolvable or empty default device_assignment fails closed when
+        # multi-device ops are present instead of falling back to 1 partition.
+        rig.default_device_assignment = []
+        rig.mlir_queue.extend([cond_i1, body_world_ar])
+        with (
+            rig.execution_mode.set_eager_mode(
+                rig.execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
+            ),
+            pytest.raises(ValueError, match="device_assignment"),
+        ):
+            while_loop_op(lambda s: s < 2, lambda s: (s + 1,), (step0,), ())
+        rig.default_device_assignment = [0, 1, 4, 5, 6, 7, 2, 3]
 
         captured_by_thread: dict[str, list[list[int]]] = {}
 

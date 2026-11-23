@@ -28,6 +28,9 @@ from jax._src.lib.mlir.dialects import func, hlo, sdy
 _MANUAL_MESH_AXIS = "__d"
 _SHARDING_OP_ATTRS = frozenset({"mhlo.sharding", "sdy.sharding", "sdy.sharding_rule"})
 _SHARDING_ARG_RES_ATTRS = frozenset({"mhlo.sharding", "sdy.sharding"})
+_GSPMD_SHARDING_CUSTOM_CALLS = frozenset(
+    {"Sharding", "SPMDFullToShardShape", "SPMDShardToFullShape"}
+)
 _MULTI_DEVICE_OP_NAMES = frozenset(
     {
         "all_gather",
@@ -47,7 +50,6 @@ _MULTI_DEVICE_OP_NAMES = frozenset(
 
 @dataclasses.dataclass(frozen=True)
 class _WhileLoopMlirArtifact:
-    mlir_text: str
     normalized_mlir_text: str
     kernel_key: str
     donated_carry_indices: tuple[int, ...]
@@ -276,6 +278,18 @@ def _strip_sharding_annotations_in_region(region: Any) -> None:
                 raw_op.results[0].replace_all_uses_with(raw_op.operands[0])
                 raw_op.erase()
                 continue
+            if (
+                raw_op.name.rsplit(".", 1)[-1] == "custom_call"
+                and "call_target_name" in raw_op.attributes
+                and isinstance(raw_op.attributes["call_target_name"], ir.StringAttr)
+                and raw_op.attributes["call_target_name"].value
+                in _GSPMD_SHARDING_CUSTOM_CALLS
+            ):
+                target_name = raw_op.attributes["call_target_name"].value
+                raise ValueError(
+                    f"Unsupported GSPMD sharding custom_call '{target_name}' inside "
+                    "while_loop subgraph; use Shardy (sdy) or explicit collectives."
+                )
             for attr_name in _SHARDING_OP_ATTRS:
                 if attr_name in raw_op.attributes:
                     del raw_op.attributes[attr_name]
@@ -700,38 +714,12 @@ def _assemble_while_loop_mlir(
     if not wrapper_mod.operation.verify():
         raise ValueError("Generated stablehlo.while MLIR module failed verification")
 
-    mlir_text = str(wrapper_mod.operation.get_asm(enable_debug_info=True))
     normalized_mlir_text = str(wrapper_mod.operation.get_asm(enable_debug_info=False))
     kernel_key = hashlib.blake2b(
         normalized_mlir_text.encode("utf-8"), digest_size=16
     ).hexdigest()
     return _WhileLoopMlirArtifact(
-        mlir_text=mlir_text,
         normalized_mlir_text=normalized_mlir_text,
         kernel_key=kernel_key,
         donated_carry_indices=donated_carry_indices,
     )
-
-
-def _build_while_loop_mlir(
-    cond_mlir_text: str,
-    body_mlir_text: str,
-    *,
-    num_carries: int,
-    num_additional_inputs: int = 0,
-    has_rng_state: bool = False,
-    num_partitions: int = 1,
-    allowed_donor_indices: Collection[int] | None = None,
-) -> _WhileLoopMlirArtifact:
-    """Assembles ``cond`` and ``body`` StableHLO modules into ``stablehlo.while``."""
-    with _parse_while_subgraphs(
-        cond_mlir_text, body_mlir_text, num_carries=num_carries
-    ) as parsed:
-        return _assemble_while_loop_mlir(
-            parsed,
-            num_carries=num_carries,
-            num_additional_inputs=num_additional_inputs,
-            has_rng_state=has_rng_state,
-            num_partitions=num_partitions,
-            allowed_donor_indices=allowed_donor_indices,
-        )

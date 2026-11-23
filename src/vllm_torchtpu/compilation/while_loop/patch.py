@@ -866,10 +866,22 @@ class _SubgraphTracer:
         )
 
 
-def _try_get_default_device_assignment(device_mesh_mod: Any) -> list[int]:
-    with contextlib.suppress(RuntimeError, TypeError, ValueError):
-        return [int(x) for x in device_mesh_mod.get_device_assignment(None)]
-    return []
+def _require_default_device_assignment(
+    device_mesh_mod: Any, region_label: str
+) -> list[int]:
+    try:
+        default_da = [int(x) for x in device_mesh_mod.get_device_assignment(None)]
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Unable to resolve default device_assignment for multi-device ops "
+            f"inside while_loop {region_label}: {exc}"
+        ) from exc
+    if not default_da:
+        raise ValueError(
+            f"Default device_assignment is empty for multi-device ops inside "
+            f"while_loop {region_label}."
+        )
+    return default_da
 
 
 def _region_da_requirement(
@@ -882,32 +894,27 @@ def _region_da_requirement(
 ) -> _RegionDeviceAssignmentReq:
     if captured_da is not None:
         if has_multi_device_ops:
-            default_da = _try_get_default_device_assignment(device_mesh_mod)
-            if default_da:
-                norm_cap = list(captured_da)
-                norm_def = list(default_da)
-                if sorted(norm_cap) != sorted(norm_def) or (
-                    not allow_permuted_default_da and norm_cap != norm_def
-                ):
-                    raise ValueError(
-                        f"Mismatched device_assignment inside while_loop "
-                        f"{region_label}: custom kernel ({norm_cap}) vs "
-                        f"implicit multi-device ops ({norm_def})."
-                    )
+            norm_cap = list(captured_da)
+            norm_def = _require_default_device_assignment(device_mesh_mod, region_label)
+            if sorted(norm_cap) != sorted(norm_def) or (
+                not allow_permuted_default_da and norm_cap != norm_def
+            ):
+                raise ValueError(
+                    f"Mismatched device_assignment inside while_loop "
+                    f"{region_label}: custom kernel ({norm_cap}) vs "
+                    f"implicit multi-device ops ({norm_def})."
+                )
         return _RegionDeviceAssignmentReq(
             da=captured_da,
             has_requirement=True,
             desc=f"{region_label} custom kernel ({captured_da})",
         )
     if has_multi_device_ops:
-        default_da = _try_get_default_device_assignment(device_mesh_mod)
+        default_da = _require_default_device_assignment(device_mesh_mod, region_label)
         return _RegionDeviceAssignmentReq(
-            da=default_da or None,
+            da=default_da,
             has_requirement=True,
-            desc=(
-                f"{region_label} implicit multi-device ops "
-                f"({default_da or 'unavailable'})"
-            ),
+            desc=f"{region_label} implicit multi-device ops ({default_da})",
         )
     return _RegionDeviceAssignmentReq(da=None, has_requirement=False, desc=region_label)
 
@@ -1466,6 +1473,12 @@ def _patch_split_compiler_while_carry_validation(split_compiler_mod: Any) -> Non
         if plan.uncond_ph_groups:
             split_gm = exe._split_gm
             split_phs = list(split_gm.graph.find_nodes(op="placeholder"))
+            orig_phs = list(graph_module.graph.find_nodes(op="placeholder"))
+            if len(split_phs) != len(orig_phs):
+                raise RuntimeError(
+                    "SplitCompiler changed top-level placeholder count from "
+                    f"{len(orig_phs)} to {len(split_phs)}; cannot bind carry checks."
+                )
             first_exec = next(
                 (n for n in split_gm.graph.nodes if n.op != "placeholder"), None
             )
@@ -1500,6 +1513,12 @@ def install_while_loop_patch() -> None:
     for key in (DispatchKey.PrivateUse1, DispatchKey.XLA):
         if key not in while_loop_op.py_kernels:
             while_loop_op.py_impl(key)(_handle_while_loop_impl)
+        else:
+            logger.info(
+                "Skipping while_loop_op patch for %s: native kernel already "
+                "registered.",
+                key,
+            )
 
     _patch_clone_mutated_returned_placeholders(cmrp_mod)
     _patch_split_compiler_while_carry_validation(split_compiler)

@@ -103,6 +103,35 @@ class TestTpuWhileLoopContracts:
         torch.testing.assert_close(out_t, trans)
         torch.testing.assert_close(out_g, gapped)
 
+        # Non-zero-offset views of inputs or sibling outputs are cloned in eager.
+        small0 = torch.zeros((4,), dtype=torch.float32)
+        big0 = torch.arange(8, dtype=torch.float32)
+        _, out_small, _, out_sib0, out_sib1 = tpu_while_loop(
+            lambda s, *_r: s < 1,
+            lambda s, _sm, b0, _x0, _x1: (
+                s + 1,
+                b0[4:8],
+                b0 + 1.0,
+                *(lambda tmp: (tmp[0:4], tmp[4:8]))(b0 + 10.0),
+            ),
+            (
+                torch.tensor(0, dtype=torch.int32),
+                small0,
+                big0,
+                torch.zeros((4,), dtype=torch.float32),
+                torch.zeros((4,), dtype=torch.float32),
+            ),
+        )
+        assert (
+            out_small.untyped_storage().data_ptr() != big0.untyped_storage().data_ptr()
+        )
+        assert (
+            out_sib0.untyped_storage().data_ptr()
+            != out_sib1.untyped_storage().data_ptr()
+        )
+        torch.testing.assert_close(out_small, big0[4:8])
+        torch.testing.assert_close(out_sib1, big0[4:8] + 10.0)
+
     def test_validation_errors_and_generator_kwarg_rejected(self) -> None:
         s0 = torch.tensor(0, dtype=torch.int32)
         x0 = torch.zeros((2, 2), dtype=torch.float32)

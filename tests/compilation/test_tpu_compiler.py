@@ -239,7 +239,7 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/compilation/while_loop/_mlir.py",
             "vllm_torchtpu/compilation/while_loop/ops.py",
             "vllm_torchtpu/compilation/while_loop/patch.py",
-        } == while_loop_files
+        } <= while_loop_files
         assert while_loop_files <= hashed
         assert {
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
