@@ -183,6 +183,7 @@ def _build_op(
     sorted_gather=None,
     w1_scales_expert_second_minor=False,
     w2_scales_expert_second_minor=False,
+    agq_min_local_tokens=1024,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -207,6 +208,7 @@ def _build_op(
         None if sorted_gather is None else sorted_gather[1],
         w1_scales_expert_second_minor,
         w2_scales_expert_second_minor,
+        agq_min_local_tokens,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -247,6 +249,7 @@ def _build_op(
             act_fn=activation,
             mesh_ep_ranks=mesh_expert_order,
             sharded_plan=sharded_plan,
+            agq_min_local_tokens=agq_min_local_tokens,
             token_replica_groups=token_replica_groups,
             w1_scales_expert_second_minor=w1_scales_expert_second_minor,
             w2_scales_expert_second_minor=w2_scales_expert_second_minor,
@@ -1016,6 +1019,7 @@ def prebuild_fused_moe_ep(
         and _scales_expert_second_minor(w1_scale),
         w2_scales_expert_second_minor=weight_format == "fp4"
         and _scales_expert_second_minor(w2_scale),
+        agq_min_local_tokens=envs.MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

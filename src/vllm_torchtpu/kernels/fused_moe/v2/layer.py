@@ -24,7 +24,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -296,6 +295,7 @@ def fused_ep_moe_v2(
     rank=None,
     mesh_ep_ranks=None,
     sharded_plan=False,
+    agq_min_local_tokens=1024,
     scoring_fn="softmax",
     score_bias=None,
     hash_topk_ids=None,
@@ -345,6 +345,10 @@ def fused_ep_moe_v2(
     It changes routing-plan construction and, where the slab tables are
     built by run copy (a TensorCore-table chip at prefill sizes), the routing
     payload and how both tables are built; never the core kernel.
+
+    agq_min_local_tokens is the local token count at or above which the
+    activation all-gather is enqueued ahead of the slab scatters. It is a
+    build-time constant.
 
     token_replica_groups lists ordered groups of device-mesh indices whose
     x and gating rows are identical (for example, a TP group). Each member
@@ -475,13 +479,10 @@ def fused_ep_moe_v2(
         row_alignment=U32_SUBLANE_TILE,
     )
     t_local = token_layout.local_rows
-    # Local tokens at or above which the activation all-gather is enqueued
-    # ahead of the slab scatters (MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS, 1024 by
-    # default). Measured, not chosen: +2.80% at t_local 2048 and
-    # -0.01 / -7.81 / -1.92 / -1.94% at 1024 / 256 / 64 / 32, because the
-    # scatters lose ~90 us of cover to buy a ~129 us hoist and only the
-    # largest shape's plan is long enough to pay for it.
-    agq_min_local_tokens = envs.MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS
+    # agq_min_local_tokens defaults to 1024. Measured, not chosen: +2.80% at
+    # t_local 2048 and -0.01 / -7.81 / -1.92 / -1.94% at 1024 / 256 / 64 / 32,
+    # because the scatters lose ~90 us of cover to buy a ~129 us hoist and
+    # only the largest shape's plan is long enough to pay for it.
     # route pads its outputs to these rows, which the torch op's fake can size
     # without a guard on the token count; compute drops the padding again.
     t_wire = replica_wire_rows(T // ep, len(token_layout.groups[0]), U32_SUBLANE_TILE)

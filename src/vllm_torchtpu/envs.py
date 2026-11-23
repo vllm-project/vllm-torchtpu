@@ -921,8 +921,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Local tokens per EP rank at or above which fused EP MoE v2 enqueues the
     # activation all-gather ahead of the slab scatters (see the comment where
     # kernels/fused_moe/v2/layer.py reads it).
-    "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS": lambda: int(
-        os.getenv("MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS", "1024")
+    "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS": env_nonnegative_int(
+        "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS", 1024
     ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
