@@ -1339,7 +1339,7 @@ class Engram(upstream.Engram):
         wkv = self.wkv
         scale = getattr(wkv, "weight_scale", None)
         return (
-            not self.uses_hbm_lookup
+            not self.uses_hbm_lookup()
             and x.device.type == "tpu"
             and wkv.weight.dtype == torch.float8_e4m3fn
             and scale is not None
