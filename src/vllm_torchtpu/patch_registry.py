@@ -70,6 +70,14 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops", _ACTIVE),
     # Compilation and cache keys.
+    # TODO: Remove once the pinned torch-tpu natively lowers
+    # torch.ops.higher_order.while_loop and teaches
+    # clone_mutated_returned_placeholders to inspect HigherOrderOp
+    # mutated_arg_indices.
+    Patch(
+        "vllm_torchtpu.compilation.while_loop.patch:install_while_loop_patch",
+        _ACTIVE,
+    ),
     Patch("vllm_torchtpu:_patch_vllm_aot_compile_cache_key", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_compile_all_ranges", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_compile_prefix_isolation", _ACTIVE),

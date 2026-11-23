@@ -228,12 +228,47 @@ class TestTpuCompilerCache:
             for path in hashed
             if path in excluded_files or path.startswith(excluded_dirs)
         }
+        while_loop_files = {
+            path.relative_to(source_root).as_posix()
+            for path in (source_root / "vllm_torchtpu/compilation/while_loop").rglob(
+                "*.py"
+            )
+        }
+        assert {
+            "vllm_torchtpu/compilation/while_loop/__init__.py",
+            "vllm_torchtpu/compilation/while_loop/_mlir.py",
+            "vllm_torchtpu/compilation/while_loop/ops.py",
+            "vllm_torchtpu/compilation/while_loop/patch.py",
+        } == while_loop_files
+        assert while_loop_files <= hashed
         assert {
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
         } <= hashed
+
+    def test_tpu_hash_changes_when_while_loop_lowering_changes(
+        self, tmp_path, monkeypatch
+    ):
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        fake_tpu_compiler = tmp_path / "vllm_torchtpu/compilation/tpu_compiler.py"
+        fake_patch = tmp_path / "vllm_torchtpu/compilation/while_loop/patch.py"
+        fake_patch.parent.mkdir(parents=True)
+        fake_tpu_compiler.write_text("# stub\n")
+        fake_patch.write_text("# lowering v1\n")
+
+        monkeypatch.setattr(tpu_compiler, "__file__", str(fake_tpu_compiler))
+        monkeypatch.setattr(
+            tpu_compiler,
+            "_RUNTIME_CACHE_KEY_PATHS",
+            ("vllm_torchtpu/compilation/while_loop",),
+        )
+        hash_v1 = tpu_compiler.compute_tpu_compilation_hash(self._config())
+        fake_patch.write_text("# lowering v2\n")
+        hash_v2 = tpu_compiler.compute_tpu_compilation_hash(self._config())
+        assert hash_v1 != hash_v2
 
     def test_runtime_hash_excluded_kernels_stay_omni_only(self):
         """Excluded diffusion kernels must have no caller in hashed code.

@@ -285,6 +285,10 @@ _NATIVE_TPU_COMPILE_ENV_VARS = (
 )
 
 _RUNTIME_CACHE_KEY_PATHS = (
+    # Pure-Python higher-order while_loop StableHLO custom-kernel lowering sits
+    # behind a higher-order op boundary that Dynamo's traced-file checks do not
+    # inspect, so edits here must invalidate cached TPU executables.
+    "vllm_torchtpu/compilation/while_loop",
     # Pallas implementations execute behind torch custom-op boundaries, so
     # Dynamo's traced-file validation cannot see their source changes.
     "vllm_torchtpu/kernels",
