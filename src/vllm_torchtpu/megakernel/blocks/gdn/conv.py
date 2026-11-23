@@ -23,6 +23,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from .... import envs
 from ...ops import BF16, F32, I32, rnd, rup
 from .params import GDNParams
 from .states import (
@@ -37,7 +38,13 @@ from .states import (
 
 
 def gdn_in(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> Any:
-    """Start layer `o`'s state reads (after the previous writes), project `lin_in`."""
+    """Start layer `o`'s state reads (after the previous writes), project `lin_in`.
+
+    `VLLM_TPU_MK_GDN_DRAIN_LATE` (non-`GPR` paths): the wait for the previous layer's
+    state write-backs and this layer's state reads move after the projection, so the
+    drain overlaps the `lin_in` weight stream. Same buffers and values (scheduling
+    only).
+    """
     ex, scr, ST, O, skip, sc = ctx.ex, ctx.scr, ctx.ST, ctx.O, ctx.skip, ctx.sc  # noqa: E741
     stream = ctx.stream
     VER = ex.VER
@@ -47,37 +54,44 @@ def gdn_in(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> Any:
     convb, recb, sem = scr["convb"], scr["recb"], scr["st_sem"]
     # The pool reader already gathered the states into `recb` (after the drain).
     rec_in_recb = bool(ST.get("rec_in_recb", False))
-    with sc("gdn_in"):
-        if "gdn_state" not in skip:
-            if GPR:
-                gpr_conv_start(ctx, gp, o)
+    drain_late = bool(envs.VLLM_TPU_MK_GDN_DRAIN_LATE) and not GPR
+
+    def state_io() -> None:
+        if GPR:
+            gpr_conv_start(ctx, gp, o)
+            for s_ in range(NRB):
+                rec_chunk(ctx, gp, o, s_, s_, False).start()
+
+        @pl.when(o > 0)
+        def _():
+            pltpu.make_async_copy(
+                conv_out_src(ctx, gp),
+                O[conv_out_key].at[0],
+                sem.at[2],
+            ).wait()
+            if GCH:
+                rec_drain(ctx, gp, 0)
+            elif not rec_in_recb:
+                pltpu.make_async_copy(recb, O[rec_out_key].at[0], sem.at[3]).wait()
+
+        if not GPR:
+            pltpu.make_async_copy(ST["conv"].at[o], convb, sem.at[0]).start()
+            if GCH:
                 for s_ in range(NRB):
                     rec_chunk(ctx, gp, o, s_, s_, False).start()
+            elif not rec_in_recb:
+                for d in rec_in(ctx, gp, o):
+                    d.start()
 
-            @pl.when(o > 0)
-            def _():
-                pltpu.make_async_copy(
-                    conv_out_src(ctx, gp),
-                    O[conv_out_key].at[0],
-                    sem.at[2],
-                ).wait()
-                if GCH:
-                    rec_drain(ctx, gp, 0)
-                elif not rec_in_recb:
-                    pltpu.make_async_copy(recb, O[rec_out_key].at[0], sem.at[3]).wait()
-
-            if not GPR:
-                pltpu.make_async_copy(ST["conv"].at[o], convb, sem.at[0]).start()
-                if GCH:
-                    for s_ in range(NRB):
-                        rec_chunk(ctx, gp, o, s_, s_, False).start()
-                elif not rec_in_recb:
-                    for d in rec_in(ctx, gp, o):
-                        d.start()
-
+    with sc("gdn_in"):
+        if "gdn_state" not in skip and not drain_late:
+            state_io()
         y = stream.dmatmul("lin_in", scr["xb"], NLI)
         ybuf = scr["ybuf"]
         ybuf[:, :NLI] = rnd(y * ctx.sm(slot, "in_s", NLI))
+    if "gdn_state" not in skip and drain_late:
+        with sc("gdn_drain"):
+            state_io()
     return ybuf
 
 

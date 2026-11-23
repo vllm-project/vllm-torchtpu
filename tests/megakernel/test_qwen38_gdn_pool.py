@@ -121,15 +121,17 @@ def test_pool_gdn_segment_matches_reference(fresh: bool):
         np.testing.assert_allclose(rec_mk[:, l], rec_ref, atol=2e-2, rtol=2e-2)
 
 
-def _wide_pool_step(monkeypatch, chunk_gather: str, has_state: np.ndarray):
-    """Residual and checkpoints of a WIDE (chunked-state) pool segment step."""
+def _wide_pool_step(monkeypatch, chunk_gather: str, has_state: np.ndarray, NS: int = 6,
+                    trace_only: bool = False):
+    """Residual and checkpoints of a WIDE (chunked-state; `NS = 6`) pool segment step.
+    `trace_only`: trace the kernel (lower, no run) and return nothing."""
     from vllm_torchtpu.megakernel.models import qwen38_gdn_pool
 
     monkeypatch.setattr(qwen38_gdn_pool, "CHUNK_GATHER", chunk_gather)
-    R, L, T, NS = 2, qwen38.SEGMENT_LAYERS, 4, 6
+    R, L, T = 2, qwen38.SEGMENT_LAYERS, 4
     B, NL = NS * T, L - 1
     ex = ExecSpec(R=R, B=B, T=T, ctx=128, interpret=True, tiles=TILES)
-    assert ex.WIDE
+    assert (NS > 4) is ex.WIDE
     spec = qwen38.segment_spec(G, R, L=L, pool_gdn=True)
     inp = random_segment_inputs(jax.random.PRNGKey(5), G, ex, L, gain=0.25)
     rng = np.random.default_rng(3)
@@ -156,6 +158,9 @@ def _wide_pool_step(monkeypatch, chunk_gather: str, has_state: np.ndarray):
         jax.device_put(jnp.asarray(has_state, jnp.int32), rep),
     )
     step, _ = kernel.make_step(mesh, spec, ex)
+    if trace_only:
+        jax.jit(step).lower(pos, hid, w_mk, st, *extras)
+        return None
     _, outs = step(pos, hid, w_mk, st, *extras)
     return {k: np.asarray(outs[k]) for k in (RESIDUAL_OUT, "rec_ckpt", "conv_ckpt")}
 
@@ -169,3 +174,60 @@ def test_pool_gdn_chunk_gather_is_exact(monkeypatch):
     chunked = _wide_pool_step(monkeypatch, "1", has_state)
     for k in staged:
         np.testing.assert_array_equal(chunked[k], staged[k], err_msg=k)
+
+
+@pytest.mark.parametrize("NS", [2, 6], ids=["whole_state", "wide_chunked"])
+def test_pool_gdn_drain_late_bit_identical(monkeypatch, NS):
+    """VLLM_TPU_MK_GDN_DRAIN_LATE: the previous layer's write-back wait and this layer's
+    state reads after `lin_in` (scheduling only) -> residual and checkpoints byte-identical,
+    on the whole-state path (b8-like) and the chunked WIDE path (b24-like)."""
+    NL = qwen38.SEGMENT_LAYERS - 1
+    has_state = (np.arange(NL * NS).reshape(NL, NS) % 3 != 1).astype(np.int32)
+    monkeypatch.delenv("VLLM_TPU_MK_GDN_DRAIN_LATE", raising=False)
+    base = _wide_pool_step(monkeypatch, "0", has_state, NS)
+    monkeypatch.setenv("VLLM_TPU_MK_GDN_DRAIN_LATE", "1")
+    late = _wide_pool_step(monkeypatch, "0", has_state, NS)
+    for k in base:
+        np.testing.assert_array_equal(late[k], base[k], err_msg=k)
+
+
+@pytest.mark.parametrize("NS", [2, 6], ids=["whole_state", "wide_chunked"])
+def test_gdn_drain_late_moves_state_io_after_lin_in(monkeypatch, NS):
+    """The flag does move the drain: in the traced kernel every layer's write-back wait
+    (`rec_in` / `rec_drain`) comes after its `lin_in` projection, and before it when off
+    (interpret-mode DMAs are synchronous, so the bitwise test cannot see the order)."""
+    from vllm_torchtpu.megakernel import stream as stream_mod
+    from vllm_torchtpu.megakernel.blocks.gdn import conv
+
+    events: list[str] = []
+    orig_mm = stream_mod.TwoRing.dmatmul
+    orig_in, orig_drain = conv.rec_in, conv.rec_drain
+
+    def mm(self, kind, *a, **k):
+        events.append(kind)
+        return orig_mm(self, kind, *a, **k)
+
+    def rec_in(*a, **k):
+        events.append("drain")
+        return orig_in(*a, **k)
+
+    def rec_drain(*a, **k):
+        events.append("drain")
+        return orig_drain(*a, **k)
+
+    monkeypatch.setattr(stream_mod.TwoRing, "dmatmul", mm)
+    monkeypatch.setattr(conv, "rec_in", rec_in)
+    monkeypatch.setattr(conv, "rec_drain", rec_drain)
+    NL = qwen38.SEGMENT_LAYERS - 1
+    ones = np.ones((NL, NS), np.int32)
+    for late in (False, True):
+        events.clear()
+        if late:
+            monkeypatch.setenv("VLLM_TPU_MK_GDN_DRAIN_LATE", "1")
+        else:
+            monkeypatch.delenv("VLLM_TPU_MK_GDN_DRAIN_LATE", raising=False)
+        _wide_pool_step(monkeypatch, "0", ones, NS, trace_only=True)
+        seq = [e for e in events if e in ("lin_in", "drain")]
+        assert seq and len(seq) % 2 == 0, seq
+        pair = ["lin_in", "drain"] if late else ["drain", "lin_in"]
+        assert seq == pair * (len(seq) // 2), (late, seq)

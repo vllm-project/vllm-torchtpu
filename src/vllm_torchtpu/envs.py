@@ -194,6 +194,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_WHOLE_SKIP_IDLE: bool = False
     VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS: str = ""
     VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC: bool = False
+    VLLM_TPU_MK_GDN_DRAIN_LATE: bool = False
     VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_MK_WHOLE_L45: bool = False
     VLLM_TPU_MK_WHOLE_EXPORT_SELECTION: bool = False
@@ -1389,6 +1390,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scalar SMEM dedup loop (`MoETunables.dedup_vec`). Exact: same experts, same
     # first-appearance order.
     "VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC": env_bool("VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC"),
+    # Megakernel GDN (non-pool-gather path): wait for the previous GDN layer's conv / rec
+    # state write-backs, and start this layer's state reads, after the `lin_in` projection
+    # instead of before it, so the write-back drain overlaps the projection's weight stream.
+    # Exact: scheduling only, same values in the same buffers.
+    "VLLM_TPU_MK_GDN_DRAIN_LATE": env_bool("VLLM_TPU_MK_GDN_DRAIN_LATE"),
     # Whole-step megakernel: also run the last QSA layer (model layer 47) in the whole-step
     # call, as a one-layer kernel after layers 3..46, its step tokens written with theirs;
     # the stock L47 attention core and last segment kernel are skipped.
