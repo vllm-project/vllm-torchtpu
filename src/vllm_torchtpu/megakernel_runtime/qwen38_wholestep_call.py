@@ -170,6 +170,7 @@ _MK_BLOCK_FIELDS = (
     ("dcp", "dcp"),
     ("compressed_dcp", "compressed_dcp"),
     ("export_ids", "export_ids"),  # VLLM_TPU_MK_WHOLE_EXPORT_SELECTION
+    ("shared_sel", "shared_sel"),  # VLLM_TPU_MK_DRAFT_SHARED_SELECTION (MK draft)
 )
 _MK_TILE_FIELDS = ("hier", "rel_fetch", "nbe", "nbd", "vmem_mib")
 

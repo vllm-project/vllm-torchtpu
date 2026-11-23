@@ -184,6 +184,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_DRAFT: bool = False
     VLLM_TPU_MK_DRAFT_LOOP: bool = False
     VLLM_TPU_MK_DRAFT_ROWS_FRESH: bool = False
+    VLLM_TPU_MK_DRAFT_SHARED_SELECTION: bool = False
     VLLM_TPU_MK_QSEL_ASYNC: bool = False
     VLLM_TPU_MK_QSA_XREQ_PREFETCH: int = 0
     VLLM_TPU_MK_QSA_REQ_ASYNC: int = 0
@@ -1340,6 +1341,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and at p == capacity its outputs feed the loop as they are (a full-length
     # [:rows] view still costs torch_tpu an execute_as_strided program). Same values.
     "VLLM_TPU_MK_DRAFT_ROWS_FRESH": env_bool("VLLM_TPU_MK_DRAFT_ROWS_FRESH"),
+    # With VLLM_TPU_MK_DRAFT: the MK draft kernels (step 0, and the loop steps with
+    # VLLM_TPU_MK_DRAFT_LOOP) attend the target's layer-47 selection, as the stock draft
+    # does with VLLM_TPU_QSA_DRAFT_SHARED_SELECTION, instead of running their own
+    # indexer (scores, thresholds, compaction, exchange). Step 0 reads this step's sink
+    # rows, loop steps the rows step 0 carried. Needs VLLM_TPU_MK_WHOLE_EXPORT_SELECTION,
+    # VLLM_TPU_QSA_DRAFT_SHARED_SELECTION and VLLM_TPU_QSA_DRAFT_SELECTION_SLICE. Draft
+    # tokens change (another selection); target outputs do not.
+    "VLLM_TPU_MK_DRAFT_SHARED_SELECTION": env_bool("VLLM_TPU_MK_DRAFT_SHARED_SELECTION"),
     # Whole-step QSA selection: the per-row id copies into SMEM and the new group's
     # loads / stores are issued together and waited once instead of in start-wait
     # pairs (distinct destinations; same bytes).

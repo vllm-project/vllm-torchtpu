@@ -60,7 +60,7 @@ from .qwen38_wholestep_call import (
     log_mk_options,
     wholestep_tiles,
 )
-from .qwen38_wholestep_inputs import qsa_step_inputs
+from .qwen38_wholestep_inputs import qsa_step_inputs, shared_selection_inputs
 
 logger = init_logger(__name__)
 
@@ -96,12 +96,39 @@ def draft_key_slots(B: int | None) -> int:
     return (4 if B <= 48 else 3) * (2 if wsc.KEY_LANES == 128 else 1)
 
 
+def shared_selection_on() -> bool:
+    """VLLM_TPU_MK_DRAFT_SHARED_SELECTION: the MK draft attends the target's exported
+    selection instead of running its own indexer (`QSAFullIndexedBlock.shared_sel`)."""
+    from vllm_torchtpu import envs
+
+    return bool(envs.VLLM_TPU_MK_DRAFT_SHARED_SELECTION)
+
+
+def check_shared_selection() -> None:
+    """VLLM_TPU_MK_DRAFT_SHARED_SELECTION reads this step's rows of the target's sink:
+    the whole-step export must write it (VLLM_TPU_MK_WHOLE_EXPORT_SELECTION, which needs
+    the bound sink, VLLM_TPU_QSA_DRAFT_SHARED_SELECTION), and step 0 reads only the
+    step's rows (VLLM_TPU_QSA_DRAFT_SELECTION_SLICE)."""
+    from vllm_torchtpu import envs
+
+    missing = [
+        name for name in (
+            "VLLM_TPU_MK_WHOLE_EXPORT_SELECTION",
+            "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION",
+            "VLLM_TPU_QSA_DRAFT_SELECTION_SLICE",
+        ) if not getattr(envs, name)
+    ]
+    if missing:
+        raise ValueError(f"VLLM_TPU_MK_DRAFT_SHARED_SELECTION needs {', '.join(missing)}")
+
+
 def draft_spec(g: Any, R: int, *, budget: int, max_groups: int, vocab_shard: int,
-               B: int | None = None) -> Any:
+               B: int | None = None, shared: bool = False) -> Any:
     """The one-layer draft-step kernel spec (BF16 HC: the draft keeps its precision).
     With the served request loop, idle request slots are skipped (`skip_idle`: at one
     row per request a 16-row tile holds 16 request slots). `B`: the row bucket, for
-    the key-ring slots (`draftkeyslots`); None (operand packing) keeps 2."""
+    the key-ring slots (`draftkeyslots`); None (operand packing) keeps 2. `shared`
+    (VLLM_TPU_MK_DRAFT_SHARED_SELECTION): the selection is an input, no indexer."""
     opts = indexed_options()
     dcp = draft_kv_dcp()
     opts.update(dcp=dcp, compressed_dcp=bool(opts.get("compressed_dcp")) and dcp > 1)
@@ -124,6 +151,7 @@ def draft_spec(g: Any, R: int, *, budget: int, max_groups: int, vocab_shard: int
             n_layers=1,
             skip_idle=SKIP_IDLE and bool(opts.get("loop_requests")),
             **opts,
+            **({"shared_sel": True} if shared else {}),
         ),
         tail=dict(vocab_shard=vocab_shard),
         hc_fp8=False,
@@ -162,10 +190,13 @@ def build_draft_call(
     write: bool = True,
     interpret: bool = False,
     tiles: Tiles | None = None,
+    shared: bool = False,
 ) -> tuple[Any, tuple, tuple, tuple]:
     """`call(hidden, *weights, pool, ring, main, comp, positions, starts, context, trig,
-    k_norm, index_k_norm[, dcp_rank]) -> (residual [B, hc*H], tokens [B] int32, pool)`
-    at `B` rows (`B // T` requests of `T` rows each), the pool donated."""
+    k_norm, index_k_norm[, dcp_rank][, sel]) -> (residual [B, hc*H], tokens [B] int32,
+    pool)` at `B` rows (`B // T` requests of `T` rows each), the pool donated. `shared`
+    (VLLM_TPU_MK_DRAFT_SHARED_SELECTION): the last argument `sel [B, 4 budget + 3]` int32
+    is each row's shared selection (`shared_selection_inputs`), replicated."""
     del layout  # the draft layer has no GDN state; kept for the whole-step signature
     R = mesh.size
     assert B % T == 0, (B, T)
@@ -176,7 +207,8 @@ def build_draft_call(
         # VLLM_TPU_MK_SCOPES=N: per-phase named scopes in the kernel (profiling only).
         debug=DebugOptions(scopes=int(os.environ.get("VLLM_TPU_MK_SCOPES", "0") or 0)),
     )
-    spec = draft_spec(g, R, budget=budget, max_groups=max_groups, vocab_shard=vocab_shard, B=B)
+    spec = draft_spec(g, R, budget=budget, max_groups=max_groups, vocab_shard=vocab_shard, B=B,
+                      shared=shared)
     log_mk_options(B, spec, ex.tiles, label="MK draft")
     fn, k_specs, _, n_w = make_flat_segment_step(
         mesh, spec, ex, extra_outs=(KV_NEW, KR_NEW, IR_NEW, TOP)
@@ -207,17 +239,26 @@ def build_draft_call(
     )
     pos0 = jnp.zeros((B,), jnp.int32)
 
-    def per_rank_inputs(pool, ring, main, comp, positions, starts, context, trig):
+    if shared:
+        from vllm_torchtpu.megakernel.wholestep.qsa_full_b import SH_IDS, SH_META
+
+        names = names + (SH_IDS, SH_META)
+
+    def per_rank_inputs(pool, ring, main, comp, positions, starts, context, trig, *sel):
         d = qsa_step_inputs(
             pool, [(ring, main, comp)], [(layer.main_slot, layer.compressed_slot)], trig,
             positions, starts, context, M=M, T=T, pages_per_seq=pps, max_groups=max_groups,
             k_scale=layer.k_scale, v_scale=layer.v_scale,
             layer_major_tables=LONG_CONTEXT["hbm_tables"],
         )
+        if shared:
+            d[SH_IDS], d[SH_META] = shared_selection_inputs(
+                sel[0], context, starts, T=T, K=budget, M=M
+            )
         return tuple(d[n] for n in names)
 
     inputs = jax.shard_map(
-        per_rank_inputs, mesh=mesh, in_specs=(tp,) + (rep,) * 7,
+        per_rank_inputs, mesh=mesh, in_specs=(tp,) + (rep,) * (7 + int(shared)),
         out_specs=tuple(tp if n in hbm else rep for n in names), check_vma=False,
     )
     dcp_size = draft_kv_dcp()
@@ -256,7 +297,11 @@ def build_draft_call(
             i + 1 : i + 10
         ]
         rank = args[i + 10 :]
-        xs = dict(zip(names, inputs(pool, ring, main, comp, positions, starts, context, trig)))
+        sel = ()
+        if shared:
+            rank, sel = rank[:-1], rank[-1:]
+        xs = dict(zip(names, inputs(pool, ring, main, comp, positions, starts, context, trig,
+                                    *sel)))
         outs = fn(pos0, pad(hidden), *(xs[k] for k in fn.extra_names), *w)
         res, kv, kr, ir, top = outs[:5]
         pool = writes(pool, kv, kr, ir, ring, main, comp, positions, starts, context, trig,
@@ -266,6 +311,7 @@ def build_draft_call(
 
     in_specs = (
         (tp,) + (tp,) * n_w + (tp,) + (rep,) * 9 + ((tp,) if dcp_size > 1 else ())
+        + ((rep,) if shared else ())
     )
     return call, in_specs, (tp, rep, tp), (1 + n_w,)
 
@@ -274,13 +320,15 @@ class DraftKind:
     """The draft-step torch op for one `T`; resolves the rows count on the input."""
 
     def __init__(self, mesh: Any, g: Any, layout: Any, layer: QSALayerCache, T: int,
-                 **kw: Any) -> None:
+                 shared: bool = False, **kw: Any) -> None:
         self.mesh, self.g, self.layout, self.layer, self.T, self.kw = (
             mesh, g, layout, layer, T, kw,
         )
+        self.shared = shared
         self._calls: dict[int, Any] = {}
         self.pool_index = -1
-        tag = f"draft_t{T}"
+        # Its own op name under VLLM_TPU_MK_DRAFT_SHARED_SELECTION (one more argument).
+        tag = f"draft_t{T}_sh" if shared else f"draft_t{T}"
         self.tag = tag
 
         @torch.library.custom_op(f"qwen38_mk::{tag}", mutates_args=())
@@ -303,7 +351,8 @@ class DraftKind:
 
             full, in_specs, outs, donate = build_draft_call(
                 self.mesh, self.g, B, self.T, self.layout, self.layer,
-                tiles=wholestep_tiles(B, self.kw["max_groups"]), **self.kw,
+                tiles=wholestep_tiles(B, self.kw["max_groups"]), shared=self.shared,
+                **self.kw,
             )
             typed = make_typed_step_wrapper(
                 f"qwen38_mk_{self.tag}_b{B}", full, len(in_specs), len(outs)
@@ -349,8 +398,15 @@ class MkDraft(nn.Module):
         cache = qsa_layer_cache(attn)
         kw = dict(budget=budget, max_groups=max_groups, norm_eps=norm_eps,
                   rotary_dim=rotary_dim, vocab_shard=V)
+        # VLLM_TPU_MK_DRAFT_SHARED_SELECTION: both kinds read the target's selection rows
+        # (step 0: this step's sink rows; loop steps: the rows step 0 carried).
+        self.shared = shared_selection_on()
+        if self.shared:
+            check_shared_selection()
+        object.__setattr__(self, "attn", attn)  # the shared-selection buffers' owner
         object.__setattr__(self, "kinds", {
-            t: DraftKind(mesh, g, layout, cache, t, **kw) for t in (STEP0_T, LOOP_T)
+            t: DraftKind(mesh, g, layout, cache, t, shared=self.shared, **kw)
+            for t in (STEP0_T, LOOP_T)
         })
         spec = draft_spec(g, R, budget=budget, max_groups=max_groups, vocab_shard=V)
         ex = ExecSpec(R=R, B=4, T=LOOP_T, ctx=128, tiles=wholestep_tiles(4, max_groups))
@@ -393,6 +449,20 @@ class MkDraft(nn.Module):
         ]
         if self.dcp_rank is not None:
             args.append(self.dcp_rank)  # main-KV DCP pair rank
+        if self.shared:
+            args.append(self.shared_rows(T, int(hidden.shape[0])))
         res, tokens, pool = self.kinds[T].op(hidden, args)
         self.pool.copy_(pool)  # as Qwen38WholeStep: the donated pool aliases in place
         return res, tokens
+
+    def shared_rows(self, T: int, rows: int) -> torch.Tensor:
+        """VLLM_TPU_MK_DRAFT_SHARED_SELECTION: each draft row's target selection
+        `[rows, 4 budget + 3]` int32. Step 0's rows are the target step's rows, which the
+        whole-step export wrote to the sink's first rows (as `shared_step0_rows` with
+        VLLM_TPU_QSA_DRAFT_SELECTION_SLICE); a loop step's rows are its requests, whose
+        rows step 0 carried (`Qwen4ExpMTP.carry_shared_selection`, as the stock loop's
+        `carried[:rows]`)."""
+        attn = self.attn
+        if T == STEP0_T:
+            return attn._selection_source[:rows]
+        return attn._selection_rows[:rows]
