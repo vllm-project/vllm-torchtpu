@@ -1640,7 +1640,7 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(
             [u[0] for u in api_torchtpu_nightly.uploads],
-            ["verify", "integration", "tests", "cpu", "build"],
+            ["verify", "integration", *_TESTS, "cpu", "build"],
         )
         api_nightly = self._run_bootstrap(
             {
