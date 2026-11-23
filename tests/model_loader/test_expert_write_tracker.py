@@ -143,13 +143,14 @@ def test_flush_all_resets_state_for_subsequent_loads(monkeypatch):
 
     # After flush_all, re-using the same parameter id on a subsequent load
     # (e.g. a draft model) must stage again and must not complete early from
-    # pre-flush tracker state.
+    # pre-flush tracker state: expert 0 was recorded before the flush, so
+    # expert 1 alone must not complete the parameter.
     assert stager.staging(first)
     host = stager.host_param(first)
-    host[0] = 3
-    assert not stager.written(first, 0, "w2")
     host[1] = 4
-    assert stager.written(first, 1, "w2")
+    assert not stager.written(first, 1, "w2")
+    host[0] = 3
+    assert stager.written(first, 0, "w2")
     assert torch.equal(first.data[0], torch.full((4, 4), 3.0))
     assert torch.equal(first.data[1], torch.full((4, 4), 4.0))
 
