@@ -1329,11 +1329,18 @@ class Engram(upstream.Engram):
 
     def _fused_gate(self, x: torch.Tensor) -> bool:
         """Whether ``engram_gate`` runs wkv, gate and residual in one kernel:
-        a full (not column-sharded) per-channel FP8 wkv on TPU."""
+        a full (not column-sharded) per-channel FP8 wkv on TPU.
+
+        Not for HBM-lookup layers yet: with the op in the v7x-16 encoder head
+        graph, the 2,048-token compile leaves a token-count SymInt unresolved
+        (j-b6629739-8a2f-4a13-8c56, j-c3cac12c-dbe6-4706-829c). Those layers
+        run at decode sizes, where the kernel saves at most 0.13 ms per step.
+        """
         wkv = self.wkv
         scale = getattr(wkv, "weight_scale", None)
         return (
-            x.device.type == "tpu"
+            not self.uses_hbm_lookup()
+            and x.device.type == "tpu"
             and wkv.weight.dtype == torch.float8_e4m3fn
             and scale is not None
             and scale.ndim == 1
