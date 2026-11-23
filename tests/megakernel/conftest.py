@@ -405,6 +405,84 @@ def register_megakernel_cpu_plugin(config: pytest.Config) -> None:
     config.pluginmanager.register(_ParentIsolationPlugin(), _PLUGIN_NAME)
 
 
+_BUSY_TPU_SUBSTRINGS = (
+    "device or resource busy",
+    "resource busy",
+    "ebusy",
+    "libtpu_lockfile",
+    "already in use",
+    "chips in use",
+)
+_ABSENT_TPU_SUBSTRINGS = (
+    "unknown backend",
+    "no platforms that are instances of tpu",
+    "could not find any tpu",
+    "no tpu devices",
+    "failed to open libtpu",
+    "not_found: tpu initialization failed",
+)
+
+
+def _is_busy_tpu_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(tok in msg for tok in _BUSY_TPU_SUBSTRINGS)
+
+
+def _is_absent_tpu_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(tok in msg for tok in _ABSENT_TPU_SUBSTRINGS)
+
+
+def _probe_tpu_devices() -> list[Any]:
+    """Probe the TPU backend and device 0; skip when absent or busy."""
+    import jax
+    import jax.numpy as jnp
+
+    try:
+        devs = list(jax.devices("tpu"))
+    except RuntimeError as exc:
+        if _is_absent_tpu_error(exc) or _is_busy_tpu_error(exc):
+            pytest.skip(f"TPU backend absent or busy: {exc}")
+        raise
+    if not devs:
+        pytest.skip("No TPU devices available")
+    try:
+        jax.device_put(jnp.zeros((1,), dtype=jnp.int32), devs[0]).block_until_ready()
+    except RuntimeError as exc:
+        if _is_busy_tpu_error(exc):
+            pytest.skip(f"TPU device busy: {exc}")
+        raise
+    return devs
+
+
+_tpu_probed: bool = False
+_tpu_skip_reason: str | None = None
+_tpu_probe_error: Exception | None = None
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_call(item: pytest.Item) -> None:
+    """Probe the TPU once per process on `tpu_test` items; skip if absent/busy."""
+    global _tpu_probed, _tpu_skip_reason, _tpu_probe_error
+    if (
+        item.get_closest_marker("tpu_test") is None
+        or item.get_closest_marker("spawns_tpu_workers") is not None
+    ):
+        return
+    if not _tpu_probed:
+        _tpu_probed = True
+        try:
+            _probe_tpu_devices()
+        except pytest.skip.Exception as exc:
+            _tpu_skip_reason = str(exc) or "TPU unavailable or busy"
+        except Exception as exc:
+            _tpu_probe_error = exc
+    if _tpu_skip_reason is not None:
+        pytest.skip(_tpu_skip_reason)
+    if _tpu_probe_error is not None:
+        raise _tpu_probe_error
+
+
 def pytest_configure(config: pytest.Config) -> None:
     register_megakernel_cpu_plugin(config)
 
@@ -430,53 +508,14 @@ def route_lazy_loggers(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.setattr(lazy, "_logger", logging.getLogger(lazy._name))
 
 
-_BUSY_TPU_SUBSTRINGS = (
-    "device or resource busy",
-    "resource busy",
-    "ebusy",
-    "libtpu_lockfile",
-    "already in use",
-    "chips in use",
-)
-_ABSENT_TPU_SUBSTRINGS = (
-    "unknown backend",
-    "no platforms that are instances of tpu",
-    "could not find any tpu",
-    "no tpu devices",
-)
-
-
-def _is_busy_tpu_error(exc: BaseException) -> bool:
-    msg = str(exc).lower()
-    return any(tok in msg for tok in _BUSY_TPU_SUBSTRINGS)
-
-
-def _is_absent_tpu_error(exc: BaseException) -> bool:
-    msg = str(exc).lower()
-    return any(tok in msg for tok in _ABSENT_TPU_SUBSTRINGS)
-
-
 def tpu_mesh(R: int) -> Any:
     """Return an `R`-device TPU `Mesh`, skipping only when TPU is absent or busy."""
-    import jax
-    import jax.numpy as jnp
     import numpy as np
     from jax.sharding import Mesh
 
-    try:
-        devs = list(jax.devices("tpu"))
-    except RuntimeError as exc:
-        if _is_absent_tpu_error(exc) or _is_busy_tpu_error(exc):
-            pytest.skip(f"TPU backend absent or busy: {exc}")
-        raise
+    devs = _probe_tpu_devices()
     if len(devs) < R:
         pytest.skip(f"Requires >= {R} TPU devices, found {len(devs)}")
-    try:
-        jax.device_put(jnp.zeros((1,), dtype=jnp.int32), devs[0]).block_until_ready()
-    except RuntimeError as exc:
-        if _is_busy_tpu_error(exc):
-            pytest.skip(f"TPU device busy: {exc}")
-        raise
     return Mesh(np.asarray(devs[:R]), ("tp",))
 
 
