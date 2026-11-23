@@ -589,3 +589,61 @@ def test_check_regression_cli_output(tmp_path, monkeypatch, capsys):
         " allowed drop | delta | status |" in captured.out
     )
     assert "FAILED: 1 task(s) regressed beyond 8.14pp" in captured.err
+
+
+def test_gsm8k_gates_strict_match_over_flexible_extract():
+    """lm-eval's gsm8k reports both filters; the gate reads strict-match."""
+    entry = {
+        "exact_match,strict-match": 0.95,
+        "exact_match_stderr,strict-match": 0.006,
+        "exact_match,flexible-extract": 0.97,
+        "exact_match_stderr,flexible-extract": 0.005,
+    }
+    metric = check_regression.primary_metric(entry)
+    assert metric == ("exact_match,strict-match", 0.95)
+    assert check_regression.primary_stderr(entry) == 0.006
+
+
+def _run_cli(monkeypatch, mode, results_dir, baseline_file):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "check_regression.py",
+            "--mode",
+            mode,
+            "--results-dir",
+            str(results_dir),
+            "--baseline",
+            str(baseline_file),
+        ],
+    )
+    return check_regression.main()
+
+
+def test_pending_or_metadata_only_baseline_is_refused(tmp_path, monkeypatch, capsys):
+    """A baseline committed before its numbers exist gates nothing, so it must
+    fail the check rather than pass every run."""
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    (results_dir / "results_gsm8k.json").write_text(
+        json.dumps({"results": {"gsm8k": {"exact_match,strict-match": 0.5}}})
+    )
+    (results_dir / "isl8192_osl1024_c64.json").write_text(
+        json.dumps({"median_tpot_ms": 30.0, "completed": 64})
+    )
+    pending = tmp_path / "pending.baseline.json"
+    pending.write_text(json.dumps({"_pending": "measured by the first nightly run"}))
+    metadata_only = tmp_path / "metadata_only.baseline.json"
+    metadata_only.write_text(
+        json.dumps({"_source": {"url": "https://example.invalid"}})
+    )
+
+    for mode in ("eval", "perf"):
+        assert _run_cli(monkeypatch, mode, results_dir, pending) == 3
+        err = capsys.readouterr().err
+        assert "baseline is pending" in err
+        assert "measured by the first nightly run" in err
+
+        assert _run_cli(monkeypatch, mode, results_dir, metadata_only) == 3
+        assert "no entries besides metadata" in capsys.readouterr().err
