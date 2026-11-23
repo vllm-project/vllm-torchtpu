@@ -49,6 +49,7 @@ run in a subprocess.
 
 import os
 import re
+import signal
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -913,7 +914,10 @@ def _run_worker(request, node):
         **{_WORKER_ENV: "1"},
     )
     plugins = [arg for p in request.config.option.plugins or () for arg in ("-p", p)]
-    proc = subprocess.run(
+    # Under half the CPU lane's pytest --timeout=600 (a worker takes <= ~170 s),
+    # in its own process group, so a hung worker fails with its output shown
+    # instead of being cut off.
+    proc = subprocess.Popen(
         [
             sys.executable,
             "-m",
@@ -925,12 +929,22 @@ def _run_worker(request, node):
             f"{__file__}::{node}",
         ],
         env=env,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=900,
+        start_new_session=True,
     )
-    assert proc.returncode == 0, proc.stdout[-6000:] + proc.stderr[-3000:]
-    assert "1 passed" in proc.stdout, proc.stdout[-3000:]
+    try:
+        out, err = proc.communicate(timeout=300)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, err = proc.communicate()
+        pytest.fail(f"worker timed out after 300 s\n{out[-6000:]}\n{err[-3000:]}")
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+    assert proc.returncode == 0, out[-6000:] + err[-3000:]
+    assert "1 passed" in out, out[-3000:]
 
 
 @pytest.mark.parametrize("case", list(_CASES))
