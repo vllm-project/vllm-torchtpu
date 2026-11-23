@@ -303,6 +303,23 @@ def test_slots_start_at_the_null_values():
     assert all(t.dtype == torch.int32 and not t.any() for t in slots.block_tables)
 
 
+@pytest.mark.parametrize(
+    ("max_num_reqs", "widths"),
+    [(8, (5, 1)), (16, (10,)), (256, (128, 1, 1, 1)), (4, ())],
+)
+def test_device_bytes_are_what_the_slot_tensors_take(max_num_reqs, widths):
+    """The HBM reserve counts the slot tensors as `SlotConfig.device_bytes`,
+    so it must equal the bytes of every tensor `DecodeSlots` allocates."""
+    config = SlotConfig(
+        max_num_reqs=max_num_reqs, group_widths=widths, vocab_size=VOCAB, model_seed=0
+    )
+    slots = DecodeSlots(config, torch.device("cpu"))
+    tensors = [v for v in vars(slots).values() if isinstance(v, torch.Tensor)]
+    tensors += list(slots.block_tables)
+    assert config.device_bytes == sum(t.nbytes for t in tensors)
+    assert config.device_bytes == 4 * (max_num_reqs + 1) * (8 + sum(widths))
+
+
 def test_allocation_is_sorted_and_identical_on_every_rank(monkeypatch):
     """Slots and seeds follow sorted request ids, not the scheduler's or the
     batch's order, so every TP rank fed the same outputs ends up equal."""

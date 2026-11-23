@@ -23,7 +23,9 @@ import torch
 from device_decode_test_utils import (
     FLAG,
     MAX_LOGPROBS,
+    MAX_NUM_REQS,
     SimEngine,
+    enable_device_decode,
     make_runner,
 )
 from vllm import SamplingParams
@@ -126,6 +128,45 @@ def test_unsupported_configurations_stay_on_the_stock_path(monkeypatch, name):
     controller.initialize_and_precompile()
     assert not controller.enabled and name in controller.disabled_reason
     assert controller.registry == set()
+
+
+def _kv_cache_layers(monkeypatch, num_layers):
+    """The KV cache layers the HBM reserve counts before the groups exist."""
+    layers = {f"layer.{i}": object() for i in range(num_layers)}
+    monkeypatch.setattr(
+        controller_mod, "get_layers_from_vllm_config", lambda *_args: layers
+    )
+
+
+def test_the_hbm_reserve_counts_only_when_the_path_can_run(monkeypatch):
+    """The KV cache budget leaves room for what the device path allocates
+    after the KV cache is sized, only when the flag is set and the
+    configuration lets the path run: the slot tensors, one block table per
+    KV cache layer, and the program scratch."""
+    monkeypatch.setattr(controller_mod, "_PROGRAM_SCRATCH_BYTES", 3 << 30)
+    _kv_cache_layers(monkeypatch, 4)
+    runner = make_runner(monkeypatch)
+    assert runner.post_profile_hbm_reserves().device_decode == 0
+    monkeypatch.setenv(FLAG, "1")
+    runner._device_decode = DeviceDecodeController.maybe_create(runner)
+    slot_bytes = 4 * (MAX_NUM_REQS + 1) * (8 + 4 * runner.max_num_blocks_per_req)
+    reserves = runner.post_profile_hbm_reserves()
+    assert reserves.device_decode == slot_bytes + (3 << 30)
+    assert sum(reserves) == reserves.device_decode
+    EXCLUDED["enforce_eager"](runner)
+    assert runner.post_profile_hbm_reserves().device_decode == 0
+
+
+@pytest.mark.parametrize("num_layers", [1, 3])
+def test_the_hbm_reserve_holds_the_slots_the_path_builds(monkeypatch, num_layers):
+    """Counted before the KV cache groups are final, the slot tensors in the
+    reserve hold the ones `initialize_and_precompile` builds after them."""
+    _kv_cache_layers(monkeypatch, num_layers)
+    runner = make_runner(monkeypatch)
+    controller = enable_device_decode(monkeypatch, runner)
+    reserved = controller._reserve_slot_config()
+    assert reserved.group_widths == (runner.max_num_blocks_per_req,) * num_layers
+    assert reserved.device_bytes >= controller.slots.config.device_bytes
 
 
 def test_startup_compiles_every_program_a_step_can_run(monkeypatch):

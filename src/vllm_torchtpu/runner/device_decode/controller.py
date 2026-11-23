@@ -31,7 +31,10 @@ from typing import Any
 
 import numpy as np
 import torch
+from vllm.config import get_layers_from_vllm_config
 from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
 
 from vllm_torchtpu import envs
@@ -101,6 +104,14 @@ VERIFY_MISMATCHES = "verify_mismatches"
 # check where every mirror agrees ends the row; a step that never reaches
 # the check leaves it as it is.
 _MAX_MIRROR_MISMATCHES = 3
+
+# HBM that the programs `initialize_and_precompile` compiles after the KV
+# cache is sized take: the prepare and slot-write programs, the int32 token
+# substitution and what the dry steps compile. `hbm_reserve_bytes` adds the
+# slot tensors, which it computes.
+# On TPU v7x (Qwen3.5-0.8B, TP=1) flag on vs off: +5.6 MiB at max_num_seqs 32 and
+# max_model_len 4352, +15.1 MiB at 256 and 16384; plus 16 MiB for noise, rounded up.
+_PROGRAM_SCRATCH_BYTES = 32 << 20
 
 
 def stock_uniform_key(num_rows_padded: int, vocab_size: int) -> tuple:
@@ -243,6 +254,32 @@ class DeviceDecodeController:
         variants = SamplerVariant.all_variants(r)
         self.registry.update(precompile_head(r, variants, r.num_reqs_paddings))
         self.registry.update(self._precompile_stock_uniform())
+
+    def hbm_reserve_bytes(self) -> int:
+        """HBM that `initialize_and_precompile` allocates after the KV cache
+        is sized, which `TPUModelRunner.post_profile_hbm_reserves` leaves
+        free: the slot tensors and the program scratch; 0 when the
+        configuration keeps every step on the stock path."""
+        if self.static_gate_failures():
+            return 0
+        return self._reserve_slot_config().device_bytes + _PROGRAM_SCRATCH_BYTES
+
+    def _reserve_slot_config(self) -> SlotConfig:
+        """The slot config the reserve counts. The budget is computed before
+        `initialize_kv_cache` makes the KV cache groups final, so it counts
+        one block table per KV cache layer (every group holds at least one),
+        each as wide as the runner's block tables are until then."""
+        r = self.runner
+        layers = get_layers_from_vllm_config(
+            r.vllm_config,
+            (AttentionLayerBase, MambaBase),  # type: ignore[type-abstract]
+        )
+        return SlotConfig(
+            max_num_reqs=r.max_num_reqs,
+            group_widths=(r.max_num_blocks_per_req,) * len(layers),
+            vocab_size=r.vocab_size,
+            model_seed=int(r.model_config.seed or 0),
+        )
 
     def initialize_and_precompile(self) -> None:
         """Builds the slots and compiles the rest of the device-decode

@@ -235,11 +235,14 @@ class HbmReserves(NamedTuple):
                        H2D staging pool.
       lora_slot_write: what an adapter swap holds while it runs.
       pp_handoff:      what the buffered pipeline hand-off's buffers take.
+      device_decode:   what the device-decode path (VLLM_TPU_DEVICE_DECODE)
+                       allocates and compiles at the end of capture_model.
     """
 
     kv_connector: int
     lora_slot_write: int
     pp_handoff: int
+    device_decode: int
 
 
 def compute_hbm_budget(devices: Any, gpu_memory_utilization: float) -> HbmBudget:

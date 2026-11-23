@@ -265,7 +265,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     # shapes. The stock sampler takes its noise as an input either way, and
     # verify only reruns stock programs. When the profile run sizes the KV
     # cache, VLLM_TPU_DEVICE_DECODE can still change the hash through
-    # num_gpu_blocks, since the head programs compile in that run.
+    # num_gpu_blocks: the head programs compile in that run, and the budget
+    # leaves the path's HBM reserve free.
     "VLLM_TPU_DEVICE_DECODE",
     "VLLM_TPU_DEVICE_DECODE_VERIFY",
     # `import torch_tpu` (via libtpu.configure_library_path()) sets this to

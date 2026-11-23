@@ -585,9 +585,9 @@ class TPUWorker(WorkerBase):
         # an offload spec with a host<->device transfer staging buffer, or a
         # P/D disagg connector with NCCL receive buffers. An adapter swap
         # holds HBM only while it runs, and the buffered pipeline hand-off
-        # allocates its buffers after profile_run too. vLLM's normal
-        # accounting misses those bytes, so subtract them from the KV-cache
-        # budget.
+        # and the device-decode path allocate after profile_run too. vLLM's
+        # normal accounting misses those bytes, so subtract them from the
+        # KV-cache budget.
         reserves = self.model_runner.post_profile_hbm_reserves()
         available = utils.min_across_ep_dp(
             self.parallel_config, budget.available - sum(reserves)
@@ -599,6 +599,7 @@ class TPUWorker(WorkerBase):
         kv_connector_hbm_reserve_gb = round(reserves.kv_connector / utils.GBYTES, 2)
         lora_slot_write_hbm_gb = round(reserves.lora_slot_write / utils.GBYTES, 2)
         pp_handoff_hbm_reserve_gb = round(reserves.pp_handoff / utils.GBYTES, 2)
+        device_decode_hbm_reserve_gb = round(reserves.device_decode / utils.GBYTES, 2)
         total_hbm_avail_gb = round(available / utils.GBYTES, 2)
         logger.info(
             "Memory statistics | "
@@ -608,6 +609,7 @@ class TPUWorker(WorkerBase):
             "kv_connector_hbm_reserve_gb=%rGiB | "
             "lora_slot_write_hbm_gb=%rGiB | "
             "pp_handoff_hbm_reserve_gb=%rGiB | "
+            "device_decode_hbm_reserve_gb=%rGiB | "
             "total_hbm_avail_gb=%rGiB | "
             "profile_run=%s",
             total_hbm_limit_gb,
@@ -616,6 +618,7 @@ class TPUWorker(WorkerBase):
             kv_connector_hbm_reserve_gb,
             lora_slot_write_hbm_gb,
             pp_handoff_hbm_reserve_gb,
+            device_decode_hbm_reserve_gb,
             total_hbm_avail_gb,
             "skipped" if profile_skipped else "ran",
         )
@@ -627,11 +630,14 @@ class TPUWorker(WorkerBase):
             )
             if reserves.lora_slot_write > 0:
                 fix += ", or lowering --max-loras or --max-lora-rank"
+            if reserves.device_decode > 0:
+                fix += ", or unsetting VLLM_TPU_DEVICE_DECODE"
             raise ValueError(
                 f"{total_hbm_used_gb=}GiB plus the HBM reserved after the "
                 f"memory profile ({kv_connector_hbm_reserve_gb=}GiB, "
                 f"{lora_slot_write_hbm_gb=}GiB, "
-                f"{pp_handoff_hbm_reserve_gb=}GiB) exceeds "
+                f"{pp_handoff_hbm_reserve_gb=}GiB, "
+                f"{device_decode_hbm_reserve_gb=}GiB) exceeds "
                 f"{total_hbm_limit_cap_gb=}GiB by "
                 f"{-total_hbm_avail_gb}GiB. Please consider {fix}."
             )
