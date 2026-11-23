@@ -6557,7 +6557,7 @@ class TPUModelRunner(GPUModelRunner):
                 mm_features=[],
                 sampling_params=SamplingParams(temperature=0.0),
                 pooling_params=None,
-                block_ids=tuple(block_ids_per_group),
+                block_ids=block_ids_per_group,
                 num_computed_tokens=0,
                 lora_request=None,
             )
@@ -7009,6 +7009,15 @@ class TPUModelRunner(GPUModelRunner):
                     next_counts = request_group_counts + [mix_nblks] * len(plist)
                     next_plan = _spec_warmup_block_plan(next_counts, top)
                     if next_plan is None:
+                        logger.warning(
+                            "skip mixed spec-decode warmup R=%d P=%d variant=%d: "
+                            "not enough kv blocks (num_blocks=%d, required=%d)",
+                            R,
+                            P,
+                            vi,
+                            top,
+                            1 + sum(sum(counts) for counts in next_counts),
+                        )
                         break
                     extra_plan = next_plan[len(request_group_counts) :]
                     request_group_counts = next_counts
