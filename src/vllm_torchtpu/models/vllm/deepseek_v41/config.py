@@ -230,8 +230,23 @@ def verify_and_update_config(config: "VllmConfig") -> None:
             and not config.cache_config.swa_bounded_replay
         ):
             raise ValueError("CED with prefix caching requires --swa-bounded-replay")
+    _default_fp32_head(config)
     validate_environment(policy)
     policy.publish(config)
+
+
+def _default_fp32_head(config: "VllmConfig") -> None:
+    """Default the target lm_head to FP32 logits, as the reference does.
+
+    The reference `ParallelHead` keeps the BF16 checkpoint weight in FP32 and
+    returns FP32 logits; vLLM's default (model dtype) rounds them to BF16.
+    An explicit `--hf-overrides '{"head_dtype": ...}'` is left untouched.
+    """
+    hf_config = config.model_config.hf_config if config.model_config else None
+    if hf_config is None or getattr(hf_config, "head_dtype", None) is not None:
+        return
+    hf_config.head_dtype = "float32"
+    logger.info("[DSV41] lm_head dtype defaults to float32 (reference parity)")
 
 
 def engram_cpu_offload(config: "VllmConfig") -> bool:
