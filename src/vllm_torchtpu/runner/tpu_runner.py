@@ -8912,19 +8912,13 @@ class TPUModelRunner(GPUModelRunner):
         # subdirectory ("profile_cache") so it can be cached across warm
         # restarts without colliding with the real serving cache (kv > 0)
         # or across different models / TP sizes / dtypes.
-        import hashlib
-
-        from vllm.compilation.caching import aot_compile_hash_factors
-
-        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+        from vllm_torchtpu.compilation.tpu_compiler import tpu_compilation_cache_subdir
 
         cc = self.vllm_config.compilation_config
-        base_cache_dir = cc.cache_dir or vllm_envs.VLLM_CACHE_ROOT
-        factors = aot_compile_hash_factors(self.vllm_config)
-        factors.append(compute_tpu_compilation_hash(self.vllm_config))
-        hash_key = hashlib.sha256(str(factors).encode()).hexdigest()[:10]
         saved_cache_dir = cc.cache_dir
-        cc.cache_dir = os.path.join(base_cache_dir, "profile_cache", hash_key)
+        cc.cache_dir = tpu_compilation_cache_subdir(
+            self.vllm_config, "profile_cache", include_kv=True
+        )
         os.makedirs(cc.cache_dir, exist_ok=True)
         try:
             yield

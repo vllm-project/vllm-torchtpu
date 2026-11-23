@@ -19,41 +19,58 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.compilation.test_tpu_compiler import _install_fake_backend
 from vllm_torchtpu.compilation import helper_cache, tpu_compiler
+
+
+def _make_config(
+    *,
+    rank: int = 0,
+    dp_index: int = 0,
+    dp_rank: int = 0,
+    config_hash: str = "cfg1",
+    tpu_hash: str = "tpu1",
+    cache_dir: str | None = None,
+    num_gpu_blocks: int | None = None,
+    gpu_memory_utilization: float = 0.9,
+):
+    return SimpleNamespace(
+        tpu_hash=tpu_hash,
+        model_config=SimpleNamespace(compute_hash=lambda: config_hash),
+        parallel_config=SimpleNamespace(
+            rank=rank,
+            data_parallel_rank=dp_rank,
+            data_parallel_index=dp_index,
+            compute_hash=lambda: f"p-dp{dp_index}",
+        ),
+        compilation_config=SimpleNamespace(
+            cache_dir=cache_dir,
+            compute_hash=lambda: "cc1",
+        ),
+        cache_config=SimpleNamespace(
+            num_gpu_blocks=num_gpu_blocks,
+            gpu_memory_utilization=gpu_memory_utilization,
+        ),
+        quant_config=None,
+    )
 
 
 @pytest.fixture
 def helpers(tmp_path, monkeypatch):
-    """A helper backend over a fake TpuBackend that records what it compiled
-    and what it replayed; `run(rank=..)` stands for one process."""
+    """Helper backend over `_install_fake_backend` recording compiles and replays."""
     monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "vllm"))
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "0")
     monkeypatch.setattr(
-        tpu_compiler, "compute_tpu_compilation_hash", lambda config: config.tpu_hash
+        tpu_compiler,
+        "compute_tpu_compilation_hash",
+        lambda config, *, include_kv=True: (
+            f"{config.tpu_hash}-kv{config.cache_config.num_gpu_blocks}"
+            if include_kv
+            else config.tpu_hash
+        ),
     )
-    monkeypatch.setattr(
-        "vllm.compilation.caching.aot_compile_hash_factors",
-        lambda config: [config.compute_hash()],
-    )
-    compiled, replayed, plain = [], [], []
-
-    class Compiled:
-        def __call__(self, *args):
-            return ("compiled",)
-
-        def serialize(self):
-            return f"entry-{len(compiled)}"
-
-    def fake_backend(graph, example_inputs):
-        compiled.append(graph)
-        return Compiled()
-
-    def fake_deserialize(entry):
-        replayed.append(entry)
-        return lambda *args: (entry,)
-
-    monkeypatch.setattr(tpu_compiler, "_tpu_backend", fake_backend)
-    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", fake_deserialize)
+    fake = _install_fake_backend(monkeypatch)
+    plain = []
     monkeypatch.setattr(
         torch._dynamo,
         "lookup_backend",
@@ -62,20 +79,31 @@ def helpers(tmp_path, monkeypatch):
 
     def run(
         rank=0,
+        dp_index=0,
+        dp_rank=0,
         config_hash="cfg1",
         tpu_hash="tpu1",
+        cache_dir=None,
+        num_gpu_blocks=None,
+        gpu_memory_utilization=0.9,
         graph=None,
         inputs=None,
         name="sample",
         configure=True,
     ):
         helper_cache.reset()
+        fake.set_tag(rank)
         if configure:
             helper_cache.configure(
-                SimpleNamespace(
+                _make_config(
+                    rank=rank,
+                    dp_index=dp_index,
+                    dp_rank=dp_rank,
+                    config_hash=config_hash,
                     tpu_hash=tpu_hash,
-                    compute_hash=lambda: config_hash,
-                    parallel_config=SimpleNamespace(rank=rank, data_parallel_rank=0),
+                    cache_dir=cache_dir,
+                    num_gpu_blocks=num_gpu_blocks,
+                    gpu_memory_utilization=gpu_memory_utilization,
                 )
             )
         if graph is None:
@@ -84,7 +112,13 @@ def helpers(tmp_path, monkeypatch):
             inputs = [torch.zeros(4, 8)]
         return helper_cache.backend(name)(graph, inputs)
 
-    yield run, compiled, replayed, plain, tmp_path / "vllm" / "tpu_helper_cache"
+    yield (
+        run,
+        fake.compiled,
+        fake.replayed,
+        plain,
+        tmp_path / "vllm" / "tpu_helper_cache",
+    )
     helper_cache.reset()
 
 
@@ -99,7 +133,6 @@ def test_unconfigured_uses_the_plain_tpu_backend(helpers):
 def test_a_later_start_replays_the_saved_helper_graph(helpers):
     run, compiled, replayed, plain, root = helpers
     first = run()
-    # A later process, same configuration: replayed, not compiled.
     second = run()
 
     assert len(compiled) == 1
@@ -123,6 +156,26 @@ def test_anything_that_decides_the_graph_compiles_again(helpers, change):
     run(**changed)
 
     assert len(compiled) == 2
+
+
+def test_kv_cache_size_does_not_change_helper_digest(helpers):
+    run, compiled, replayed, plain, root = helpers
+    run(num_gpu_blocks=None, gpu_memory_utilization=0.9)
+    run(num_gpu_blocks=128, gpu_memory_utilization=0.95)
+
+    assert len(compiled) == 1
+    assert len(replayed) == 1
+
+
+def test_dense_dp_replicas_use_data_parallel_index(helpers):
+    """Dense DP workers have data_parallel_rank=0 on every replica; using
+    data_parallel_index keeps their helper caches separate."""
+    run, compiled, replayed, plain, root = helpers
+    run(rank=0, dp_rank=0, dp_index=0)
+    run(rank=0, dp_rank=0, dp_index=1)
+
+    assert len(compiled) == 2
+    assert len(os.listdir(root)) == 2
 
 
 def test_helpers_keep_separate_directories(helpers):
@@ -157,8 +210,79 @@ def test_a_graph_without_a_fingerprint_uses_the_plain_backend(helpers, monkeypat
     assert compiled == []
 
 
-def test_helper_compile_cache_env_defaults_to_false(monkeypatch):
-    from vllm_torchtpu import envs
+def test_helper_compile_decorator_replays_bound_method_across_starts(
+    tmp_path, monkeypatch
+):
+    """Decorating a module method with helper_compile produces the same key
+    across two simulated starts when compilation_config.cache_dir is set."""
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "0")
+    monkeypatch.setattr(
+        tpu_compiler,
+        "compute_tpu_compilation_hash",
+        lambda config, *, include_kv=True: "tpu1",
+    )
+    fake = _install_fake_backend(monkeypatch)
+    custom_cache = str(tmp_path / "custom_cache")
 
-    monkeypatch.delenv("TPU_HELPER_COMPILE_CACHE", raising=False)
-    assert envs.TPU_HELPER_COMPILE_CACHE is False
+    class HelperModule(torch.nn.Module):
+        @helper_cache.helper_compile("bound_add")
+        def add_one(self, x: torch.Tensor) -> torch.Tensor:
+            return x + 1
+
+    mod = HelperModule()
+    x = torch.zeros(2, 4)
+
+    helper_cache.reset()
+    helper_cache.configure(_make_config(cache_dir=custom_cache))
+    torch._dynamo.reset()
+    mod.add_one(x)
+    assert len(fake.compiled) == 1
+    assert len(fake.replayed) == 0
+
+    helper_cache.reset()
+    helper_cache.configure(_make_config(cache_dir=custom_cache))
+    torch._dynamo.reset()
+    mod.add_one(x)
+    assert len(fake.compiled) == 1
+    assert len(fake.replayed) == 1
+    assert (tmp_path / "custom_cache" / "tpu_helper_cache").exists()
+    helper_cache.reset()
+
+
+def test_helper_compile_cache_switch_and_worker_gate(monkeypatch):
+    """additional_config.helper_compile_cache defaults to False, rejects non-bools,
+    and gates helper_cache.configure alongside VLLM_DISABLE_COMPILE_CACHE."""
+    import vllm.envs as vllm_envs
+
+    from vllm_torchtpu.worker.tpu_worker import TPUWorker
+
+    assert helper_cache.helper_compile_cache_enabled(SimpleNamespace()) is False
+    assert (
+        helper_cache.helper_compile_cache_enabled(
+            SimpleNamespace(additional_config={"helper_compile_cache": True})
+        )
+        is True
+    )
+    with pytest.raises(ValueError, match="helper_compile_cache"):
+        helper_cache.helper_compile_cache_enabled(
+            SimpleNamespace(additional_config={"helper_compile_cache": "yes"})
+        )
+
+    configured = []
+    monkeypatch.setattr(helper_cache, "configure", lambda cfg: configured.append(cfg))
+
+    def _run_gate(enabled: bool, disable_cache: bool) -> None:
+        monkeypatch.setattr(vllm_envs, "VLLM_DISABLE_COMPILE_CACHE", disable_cache)
+        cfg = SimpleNamespace(additional_config={"helper_compile_cache": enabled})
+        if (
+            helper_cache.helper_compile_cache_enabled(cfg)
+            and not vllm_envs.VLLM_DISABLE_COMPILE_CACHE
+        ):
+            helper_cache.configure(cfg)
+
+    _run_gate(False, False)
+    _run_gate(True, True)
+    assert configured == []
+    _run_gate(True, False)
+    assert len(configured) == 1
+    assert hasattr(TPUWorker, "__init__")

@@ -496,7 +496,10 @@ class TPUWorker(WorkerBase):
         )
         # Persist the runner's helper graphs with the compile cache (see
         # compilation/helper_cache.py).
-        if envs.TPU_HELPER_COMPILE_CACHE and not vllm_envs.VLLM_DISABLE_COMPILE_CACHE:
+        if (
+            helper_cache.helper_compile_cache_enabled(self.vllm_config)
+            and not vllm_envs.VLLM_DISABLE_COMPILE_CACHE
+        ):
             helper_cache.configure(self.vllm_config)
         logger.info(
             "Init worker | "

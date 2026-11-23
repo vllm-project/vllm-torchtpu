@@ -19,23 +19,23 @@ nothing persists them across starts but torch_tpu's XLA binary cache, so every
 start traces, lowers and loads each graph again, and every rank compiles every
 graph on a cold start.
 
-`helper_compile(name)` compiles through `TpuCompilerAdaptor` instead, keyed by
-the graph and its input shapes, in a directory per run configuration:
+When `additional_config={"helper_compile_cache": True}`, `helper_compile(name)`
+compiles through `TpuCompilerAdaptor.compile_keyed` instead, keyed by the graph
+and its input shapes, in a directory per run configuration:
 
-    <VLLM_CACHE_ROOT>/tpu_helper_cache/<hash>/rank_<rank>_<dp_rank>/<name>/
+    <VLLM_CACHE_ROOT>/tpu_helper_cache/<hash>/rank_<rank>_<dp_index>/<name>/
 
 so a start replays the artifacts an earlier start saved, and under
 TPU_PRECOMPILE_PEER_REPLAY a rank replays a graph another rank of the host
 already compiled. `<hash>` covers the TPU compilation hash (kernel sources,
-compiler versions, TPU env), vLLM's config hash and vLLM's compile env; the key
-covers the graph fingerprint (code and constants) and the input metadata.
-Dynamo still traces each shape; lowering and XLA compile are what is skipped.
+compiler versions, TPU env — excluding KV cache size), model/parallel/compile
+configs; the key covers the graph fingerprint (code and constants) and input
+metadata. Dynamo still traces each shape; lowering and XLA compile are skipped.
 
 Until `configure` runs, and for a graph that cannot be fingerprinted, the
 helpers compile with the plain "tpu" backend as before.
 """
 
-import copy
 import hashlib
 import json
 import os
@@ -49,61 +49,41 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Not a single size, so TpuCompilerAdaptor leaves shape_variants out of it.
-_HELPER_RANGE_START, _HELPER_RANGE_END = 0, 1
-
-_config: Any = None
 _cache_root: str | None = None
 
 
+def helper_compile_cache_enabled(vllm_config: Any) -> bool:
+    """Return whether `additional_config.helper_compile_cache` is enabled."""
+    extra = getattr(vllm_config, "additional_config", None)
+    if isinstance(extra, dict) and "helper_compile_cache" in extra:
+        enabled = extra["helper_compile_cache"]
+        if not isinstance(enabled, bool):
+            raise ValueError("additional_config.helper_compile_cache must be a bool")
+        return enabled
+    return False
+
+
 def configure(vllm_config: Any) -> None:
-    """Enable the cache for this process. The directory is fixed at the first
-    helper compile, from the configuration at that point."""
-    global _config, _cache_root
-    _config = vllm_config
-    _cache_root = None
+    """Enable the helper cache for this process and fix its root directory now.
+
+    Computing the root at `TPUWorker.__init__` time reads
+    `compilation_config.cache_dir` before backbone compilation mutates it and
+    avoids any dependence on later `num_gpu_blocks` initialization.
+    """
+    global _cache_root
+    from vllm_torchtpu.compilation.tpu_compiler import tpu_compilation_cache_subdir
+
+    subdir = tpu_compilation_cache_subdir(
+        vllm_config, "tpu_helper_cache", include_kv=False
+    )
+    pc = vllm_config.parallel_config
+    _cache_root = os.path.join(subdir, f"rank_{pc.rank}_{pc.data_parallel_index}")
 
 
 def reset() -> None:
     """Disable the cache (tests)."""
-    global _config, _cache_root
-    _config = None
-    _cache_root = None
-
-
-def _root() -> str | None:
-    """`<VLLM_CACHE_ROOT>/tpu_helper_cache/<hash>/rank_<r>_<dp>`, or None."""
     global _cache_root
-    if _config is None:
-        return None
-    if _cache_root is None:
-        import vllm.envs as vllm_envs
-        from vllm.compilation.caching import aot_compile_hash_factors
-
-        from vllm_torchtpu.compilation.tpu_compiler import (
-            compute_tpu_compilation_hash,
-        )
-
-        # aot_compile_hash_factors is patched at platform activation to append
-        # compute_tpu_compilation_hash and shape_variants.aot_cache_tag(); the
-        # root is fixed on first helper compile (outside any shape-variant
-        # trace), and compute_tpu_compilation_hash is appended explicitly so
-        # unpatched processes still include it.
-        factors = [
-            *aot_compile_hash_factors(_config),
-            compute_tpu_compilation_hash(_config),
-        ]
-        digest = hashlib.sha256(str(factors).encode()).hexdigest()[:10]
-        cc = getattr(_config, "compilation_config", None)
-        base_cache_dir = getattr(cc, "cache_dir", None) or vllm_envs.VLLM_CACHE_ROOT
-        pc = _config.parallel_config
-        _cache_root = os.path.join(
-            base_cache_dir,
-            "tpu_helper_cache",
-            digest,
-            f"rank_{pc.rank}_{pc.data_parallel_rank}",
-        )
-    return _cache_root
+    _cache_root = None
 
 
 def _input_meta(value: Any) -> Any:
@@ -127,22 +107,14 @@ def backend(name: str) -> Callable[[fx.GraphModule, list[Any]], Any]:
     """A `torch.compile` backend that caches the helper `name`'s graphs."""
 
     def compile_helper(graph: fx.GraphModule, example_inputs: list[Any]):
-        root = _root()
+        root = _cache_root
         if root is None:
             return _plain_backend(graph, example_inputs)
 
-        from vllm.config.utils import Range
-
         from vllm_torchtpu.compilation.graph_fingerprint import _graph_fingerprint
-        from vllm_torchtpu.compilation.tpu_compiler import (
-            TpuCompilerAdaptor,
-            _ensure_tuple_output,
-        )
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
 
-        # The adaptor fingerprints the graph after its output-tuple rewrite,
-        # so the key does too.
-        wrapped, was_wrapped = _ensure_tuple_output(copy.deepcopy(graph))
-        fingerprint = _graph_fingerprint(wrapped)
+        fingerprint = _graph_fingerprint(graph)
         if fingerprint is None:
             return _plain_backend(graph, example_inputs)
         key = (
@@ -157,18 +129,7 @@ def backend(name: str) -> Callable[[fx.GraphModule, list[Any]], Any]:
 
         adaptor = TpuCompilerAdaptor()
         adaptor.initialize_cache(cache_dir=os.path.join(root, name))
-        compile_range = Range(start=_HELPER_RANGE_START, end=_HELPER_RANGE_END)
-        path = os.path.join(root, name, key)
-        if os.path.exists(path):
-            # Rebuilds the runnable from the artifact; recompiles and rewrites
-            # it if the artifact does not fit.
-            return adaptor.load(
-                (key, path, was_wrapped), graph, example_inputs, 0, compile_range
-            )
-        compiled_fn, _ = adaptor.compile(
-            graph, example_inputs, {}, compile_range, key=key
-        )
-        return compiled_fn
+        return adaptor.compile_keyed(graph, example_inputs, key)
 
     compile_helper.__name__ = f"tpu_helper_{name}"
     return compile_helper

@@ -48,14 +48,16 @@ PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
 PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_prefill_only_kv_len_threshold"
 )
+HELPER_COMPILE_CACHE_KEY = "helper_compile_cache"
 
-# Diagnostics-only knob: it steers profiling and never changes the compiled
-# graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps it out of the
-# TPU compile cache key.
+# Diagnostics-only / caching knobs: they never change the compiled graph, so
+# `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the TPU
+# compile cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
     {
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
         PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+        HELPER_COMPILE_CACHE_KEY,
     }
 )
 

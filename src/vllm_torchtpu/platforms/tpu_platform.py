@@ -843,8 +843,11 @@ class TpuPlatform(Platform):
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead."
         )
+        from vllm_torchtpu.compilation import helper_cache
+
         _validate_phased_profiling_config(vllm_config)
         _validate_peer_replay_config()
+        helper_cache.helper_compile_cache_enabled(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "

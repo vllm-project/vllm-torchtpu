@@ -16,7 +16,7 @@ export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="/path/to/persistent_cache"
 
 2. **`VLLM_CACHE_ROOT`** (vLLM Python-Level Framework Artifacts):
     - **Purpose**: Controls the root directory for vLLM Python-level framework tracing artifacts.
-    - **Scope**: Stores PyTorch Dynamo FX graph bytecode, Guard expressions, AOTAutograd tracing artifacts (`torch_compile_cache/torch_aot_compile`), and `TpuCompilerAdaptor` metadata pickle handles (`artifact_compile_range_*`).
+    - **Scope**: Stores PyTorch Dynamo FX graph bytecode, Guard expressions, AOTAutograd tracing artifacts (`torch_compile_cache/torch_aot_compile`), `TpuCompilerAdaptor` metadata pickle handles (`artifact_compile_range_*`), and—when `additional_config={"helper_compile_cache": True}` is set (off by default; planned to become the default once the remaining runner helper sites are migrated and CI e2e coverage is established)—the runner's helper graph handles under `tpu_helper_cache/<hash>/rank_<rank>_<dp_index>/<helper>/`.
     - **Note**: `VLLM_CACHE_ROOT` manages Python framework artifacts and is completely independent of the C++ PJRT compiled binary executables managed by `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT`.
 
 ## Compilation Debugging & Telemetry
