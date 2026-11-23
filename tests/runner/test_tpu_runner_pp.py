@@ -19,6 +19,7 @@ def _runner(**attrs):
     runner.model_config.dtype = torch.bfloat16
     runner._pp_intermediate_template = None
     runner._pp_topk_buffer = None
+    runner._pp_wave = None
     for name in (
         "forward_model",
         "_pp_intermediate_tensors",

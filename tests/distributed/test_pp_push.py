@@ -290,3 +290,57 @@ def test_each_executor_pushes_for_its_own_pipeline_size(monkeypatch, queue):
     assert four.execute_model(_step(16, 1)) == ("forward", 1)
     assert [c[0] for c in four.calls] == ["pp_settle"]
     assert queue(1, 1).kwargs["max_chunks"] == 24
+
+
+@pytest.fixture
+def deferred(monkeypatch):
+    """Stage 0 of a two-stage pipeline defers its hand-off."""
+    monkeypatch.setenv("TPU_PP_DEFER_HANDOFF", "1")
+    monkeypatch.delenv("TPU_PP_LAZY_PUSH", raising=False)
+
+
+def test_a_deferred_newest_step_is_flushed_before_the_wait(deferred):
+    executor = _Executor()
+    wave = pp_push._WaveState(stages=2)
+    assert wave.defer
+    first, second = _futures(executor, wave, 2)
+    assert wave.held == 2
+    # step 1's result arrives with step 2 held: an unforced flush
+    assert first.result() == 1
+    assert executor.calls == [
+        ("pp_flush", {"args": (False,), "non_block": True, "unique_reply_rank": 7})
+    ]
+    assert wave.held == 2
+    # reading step 1 again sends nothing
+    assert first.result() == 1 and len(executor.calls) == 1
+    # waiting for the newest step forces stage 0 to launch it
+    assert second.result() == 2
+    assert executor.calls[1] == (
+        "pp_flush",
+        {"args": (True,), "non_block": True, "unique_reply_rank": 7},
+    )
+    assert wave.held == 0 and len(executor.calls) == 2
+    # a step behind which another was dispatched needs no forced flush
+    third, fourth = _futures(executor, wave, 2)
+    assert third.result() == 3
+    assert [c[1]["args"] for c in executor.calls[2:]] == [(False,)]
+
+
+def test_without_deferral_two_stages_send_nothing(monkeypatch):
+    monkeypatch.delenv("TPU_PP_DEFER_HANDOFF", raising=False)
+    executor = _Executor()
+    wave = pp_push._WaveState(stages=2)
+    first, second = _futures(executor, wave, 2)
+    assert first.result() == 1 and second.result() == 2
+    assert executor.calls == [] and wave.held == 0
+
+
+def test_a_call_outside_a_step_flushes_a_held_hand_off(monkeypatch, queue, deferred):
+    executor = _install_on_fake_executor(monkeypatch, stages=2)
+    executor.execute_model(_step(16, 1), non_block=True)
+    executor.collective_rpc("profile", args=(True,))
+    assert [c[0] for c in executor.calls] == ["pp_flush", "profile"]
+    assert executor.calls[0][1]["args"] == (True,)
+    # nothing held any more: the next call goes straight out
+    executor.collective_rpc("profile", args=(False,))
+    assert [c[0] for c in executor.calls] == ["pp_flush", "profile", "profile"]

@@ -111,6 +111,9 @@ def _run_stage(wave, events, results, errors):
             if rows == SETTLE:
                 wave.settle()
                 continue
+            if isinstance(rows, tuple):
+                wave.flush(force=rows[1])
+                continue
             received = wave.start_forward(rows)
             if wave.rank == 0:
                 h = torch.full((rows, HIDDEN), float(g))
@@ -363,3 +366,120 @@ def test_a_stage_of_several_chips_drains_before_every_hand_off(monkeypatch):
     wave.warmup()
     wave.start_forward(16)
     assert drains == [] and wave.launches == 3
+
+
+def _deferred(monkeypatch, idle):
+    """Stage 0 defers its hand-off; ``idle`` answers the device check."""
+    monkeypatch.setenv("TPU_PP_DEFER_HANDOFF", "1")
+    monkeypatch.delenv("TPU_PP_LAZY_PUSH", raising=False)
+    monkeypatch.setattr(pp_wave, "_stage_cpu_group", lambda rank: None)
+    monkeypatch.setattr(pp_wave, "_submit", lambda tensors: None)
+    monkeypatch.setattr(pp_wave, "_record_event", lambda: "event")
+    monkeypatch.setattr(pp_wave, "_device_idle", lambda event: idle())
+
+
+def _flush_events(rng, forwards, bursts=3):
+    """Forwards with the engine's flushes between them: unforced ones as
+    results arrive, a forced one when it waits for the newest step, and a
+    forced one before each settle."""
+    events = []
+    for _ in range(bursts):
+        for _ in range(forwards):
+            events.append(rng.choice(BUCKETS))
+            if rng.random() < 0.5:
+                events.append(("flush", rng.random() < 0.3))
+        events.append(("flush", True))
+        events.append(SETTLE)
+    return events
+
+
+@pytest.mark.parametrize("side", [False, True], ids=["activations", "with_side"])
+def test_a_deferred_hand_off_sends_the_same_payload_on_every_launch(monkeypatch, side):
+    events = _flush_events(random.Random(3), 12)
+    ring, waves = _build_stages(monkeypatch, _template(side), size=2)
+    plain = _run(waves, events)
+
+    answers = iter(random.Random(5).random() < 0.5 for _ in range(10_000))
+    _deferred(monkeypatch, lambda: next(answers))
+    deferred_ring, deferred_waves = _build_stages(monkeypatch, _template(side), size=2)
+    assert [w.defer for w in deferred_waves] == [True, True]
+    deferred = _run(deferred_waves, events)
+
+    assert [(g, rows) for g, rows, *_ in deferred] == [
+        (g, rows) for g, rows, *_ in plain
+    ]
+    for (_, _, h, r, x), (_, _, h2, r2, x2) in zip(plain, deferred):
+        assert torch.equal(h, h2) and torch.equal(r, r2)
+        assert (x is None and x2 is None) or torch.equal(x, x2)
+    # launch p carries the same buffers whenever stage 0 issues it
+    assert ring.slots.keys() == deferred_ring.slots.keys()
+    for key, sent in ring.slots.items():
+        assert all(torch.equal(a, b) for a, b in zip(sent, deferred_ring.slots[key]))
+    assert [w.launches for w in deferred_waves] == [w.launches for w in waves]
+
+
+def test_stage_0_holds_its_output_until_the_next_forward_or_a_flush(monkeypatch):
+    idle = [False]
+    _deferred(monkeypatch, lambda: idle[0])
+    launched = []
+    wave, _ = _column_wave(monkeypatch, stage=0, column=0, received=0)
+    wave.size, wave.last, wave.defer = 2, 1, True
+    monkeypatch.setattr(
+        pp_wave, "_launch_now", lambda op, carried: launched.append(carried) or carried
+    )
+    out = {"hidden_states": torch.ones(8, HIDDEN), "residual": torch.ones(8, HIDDEN)}
+
+    assert wave.start_forward(8) is None  # the prologue only
+    wave.end_forward(out, 8)
+    assert len(launched) == 1 and wave.pending is not None
+    # unforced while the forward still runs: kept
+    wave.flush(force=False)
+    assert len(launched) == 1
+    # the next forward launches it before it runs
+    assert wave.start_forward(8) is None
+    assert len(launched) == 2
+    assert torch.equal(launched[1][0][:8], 2 * torch.ones(8, HIDDEN))
+    wave.end_forward(out, 8)
+    # unforced once the forward has finished: launched
+    idle[0] = True
+    wave.flush(force=False)
+    assert len(launched) == 3 and wave.pending is None
+    # nothing held: a flush does nothing
+    wave.flush(force=True)
+    assert len(launched) == 3
+    assert wave.burst_launches == wave.forwards + 1
+
+
+def test_deferral_is_two_stages_only_and_not_with_lazy_pushes(monkeypatch):
+    monkeypatch.delenv("TPU_PP_DEFER_HANDOFF", raising=False)
+    assert not pp_wave.defer_handoff(2)
+    monkeypatch.setenv("TPU_PP_DEFER_HANDOFF", "1")
+    monkeypatch.delenv("TPU_PP_LAZY_PUSH", raising=False)
+    assert pp_wave.defer_handoff(2)
+    assert not pp_wave.defer_handoff(3)
+    monkeypatch.setenv("TPU_PP_LAZY_PUSH", "1")
+    assert not pp_wave.defer_handoff(2)
+
+
+def test_host_timing_summarizes_the_segments(monkeypatch):
+    clock = iter(range(100))
+    monkeypatch.setattr(pp_wave.time, "perf_counter", lambda: next(clock) / 1000)
+    logged = []
+    monkeypatch.setattr(pp_wave.logger, "info", lambda *a: logged.append(a))
+    timing = pp_wave._HostTiming("stage 0", every=2)
+    for _ in range(2):
+        for mark in (
+            "ret",
+            "entry",
+            "prep",
+            "drain_start",
+            "drain_end",
+            "barrier_end",
+            "launch_end",
+            "dispatched",
+        ):
+            timing.note(mark)
+    assert len(logged) == 1
+    line = logged[0][0] % logged[0][1:]
+    assert "drain n=2 mean=1.00" in line and "idle_to_dispatch n=2 mean=3.00" in line
+    assert "ret_to_entry n=2 mean=1.00" in line and "sample" not in line

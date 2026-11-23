@@ -185,6 +185,8 @@ if TYPE_CHECKING:
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_PP_LAZY_PUSH: bool = False
+    TPU_PP_DEFER_HANDOFF: bool = False
+    TPU_PP_HOST_TIMING: bool = False
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = True
     TPU_MLA_ROPE_NEOX_PERMUTE: bool = True
@@ -1758,6 +1760,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the pipeline only when stage 0 would otherwise idle and drops empty
     # steps, so requests share the pipeline (core/pp_lazy_step.py).
     "TPU_PP_LAZY_PUSH": env_bool("TPU_PP_LAZY_PUSH", default=False),
+    # Two-stage pipelines: stage 0 hands a forward's output on once the next
+    # forward's inputs are prepared, so that host work runs while the device
+    # computes (distributed/pp_wave.py).
+    "TPU_PP_DEFER_HANDOFF": env_bool("TPU_PP_DEFER_HANDOFF", default=False),
+    # Log a summary of the pipeline stages' host time between forwards every
+    # 200 forwards (distributed/pp_wave.py).
+    "TPU_PP_HOST_TIMING": env_bool("TPU_PP_HOST_TIMING", default=False),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,
