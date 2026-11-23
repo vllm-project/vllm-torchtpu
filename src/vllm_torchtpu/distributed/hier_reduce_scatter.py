@@ -128,9 +128,6 @@ def _build_op(
         return reduce_scatter(x)
 
     spec = P(axis_name, None)
-    # torch_tpu annotates the partition specs as tuples of axis-name tuples, but
-    # jax_op takes PartitionSpecs at runtime, as other jax_op call sites pass them.
-    # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
         OP_NAME,
         fn,

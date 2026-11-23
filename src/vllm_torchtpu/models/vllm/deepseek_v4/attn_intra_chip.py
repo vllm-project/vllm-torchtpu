@@ -231,8 +231,6 @@ class _FusedOFetch:
         op = _pallas_op_cache.get(name)
         if op is None:
             (ax,) = mesh.axis_names
-            # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
-            # pyrefly: ignore[no-matching-overload]
             op = pallas.jax_op(
                 name,
                 _wo_a_o_fetch_fn(mesh, head_dim),
@@ -357,8 +355,6 @@ class _QSendRope:
         send = _pallas_op_cache.get(name)
         if send is None:
             (ax,) = mesh.axis_names
-            # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
-            # pyrefly: ignore[no-matching-overload]
             send = pallas.jax_op(
                 name,
                 _q_send_fn(mesh, head_dim),
@@ -383,8 +379,6 @@ class _QSendRope:
         name = f"pallas::deepseek_v4_qnorm_rope_pair_e{_name_float(eps)}"
         rope = _pallas_op_cache.get(name)
         if rope is None:
-            # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
-            # pyrefly: ignore[no-matching-overload]
             rope = pallas.jax_op(
                 name,
                 functools.partial(_qnorm_rope_pair_jax, eps=eps),

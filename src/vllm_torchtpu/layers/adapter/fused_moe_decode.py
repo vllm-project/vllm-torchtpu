@@ -319,9 +319,6 @@ def _build_op(
         )
 
     name = "pallas::fused_moe_decode" + (f"_{len(_OPS)}" if _OPS else "")
-    # torch_tpu types the partition specs as tuples of axis names, but takes
-    # (and fused_moe_ep passes) jax PartitionSpecs.
-    # pyrefly: ignore[no-matching-overload]
     op = jax_op(
         name,
         fn,
