@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     TPU_TP_AR_QDQ_ROWS: int = 0
     TPU_TP_QAR_MIN_TOKENS: int = 0
     TPU_TP_QAR_V3_MIN_TOKENS: int = 0
+    TPU_HOST_PHASE_TIMING_MS: float = 0.0
     TPU_TP_AR_QDQ_MIN_TOKENS: int = 0
     TPU_MOE_TC_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -841,6 +842,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # one-shot scatter in VMEM (~36 us flat up to 256 rows; XLA's all-reduce
     # is faster below ~160 rows). 0 = off.
     "TPU_TP_QAR_V3_MIN_TOKENS": env_int("TPU_TP_QAR_V3_MIN_TOKENS", 0),
+    # Diagnostic: time the host phases of TPUModelRunner.execute_model and log
+    # every step in which one phase takes longer than this many ms (0 = off).
+    "TPU_HOST_PHASE_TIMING_MS": lambda: float(os.environ.get("TPU_HOST_PHASE_TIMING_MS", "0") or 0),
     "TPU_TP_AR_QDQ_MIN_TOKENS": env_int("TPU_TP_AR_QDQ_MIN_TOKENS", 0),
     # Expert-parallel MoE combine of large batches on the TensorCore
     # (kernels/megablox/tc_combine.py) instead of the SparseCore
