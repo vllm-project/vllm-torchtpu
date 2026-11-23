@@ -13,6 +13,10 @@
 # limitations under the License.
 """TurboQuant 4-bit latent cache through the GLM-5.2 sparse MLA kernel."""
 
+import os
+import subprocess
+import sys
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -28,8 +32,6 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla
 from vllm_torchtpu.layers.core import attention_interface
 from vllm_torchtpu.layers.core import turboquant as tq
-
-pytestmark = pytest.mark.tpu_test
 
 NOPE_DIM = 512
 ROPE_DIM = 64
@@ -121,6 +123,29 @@ def _reference(p, latent_rows, k_scale, kv_len=None):
     return jnp.einsum("thk,tkd->thd", jax.nn.softmax(s, -1), k)[..., :NOPE_DIM]
 
 
+@pytest.mark.parametrize(
+    "module",
+    [
+        "vllm_torchtpu.kernels.mla.sparse.kernel",
+        "vllm_torchtpu.kernels.mla.sparse.turboquant",
+        "vllm_torchtpu.kernels.mla.dispatch",
+        "vllm_torchtpu.runner.kv_cache_manager",
+    ],
+)
+def test_fresh_interpreter_import(module: str) -> None:
+    """Verify sparse MLA and KV cache modules import cleanly in any order."""
+    env = {**os.environ, "JAX_PLATFORMS": "cpu"}
+    proc = subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.tpu_test
 def test_scatter_matches_xla_golden():
     _skip_if_not_tpu()
     p = _build(np.random.default_rng(1), query_tokens=16, topk=256, cache_tokens=1024)
@@ -131,6 +156,7 @@ def test_scatter_matches_xla_golden():
     np.testing.assert_array_equal(np.asarray(p["rope"]), np.asarray(golden[1]))
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     ("query_tokens", "topk", "k_scale", "valid_k", "kw"),
     [
@@ -186,6 +212,7 @@ def test_matches_dequantized_reference(query_tokens, topk, k_scale, valid_k, kw)
     assert _cos(out, _reference(p, p["latent"], k_scale, kv_len=valid_k)).mean() > 0.98
 
 
+@pytest.mark.tpu_test
 def test_sparse_mla_attention_interface_prerotated():
     _skip_if_not_tpu()
     p = _build(

@@ -25,7 +25,6 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather, native_sc_gather
-from vllm_torchtpu.kernels.mla.sparse import turboquant as sparse_tq
 from vllm_torchtpu.kernels.pallas_util import (
     align_to,
     cdiv,
@@ -42,13 +41,22 @@ GATHER_ATOM_ROWS = native_sc_gather.OCCURRENCES_PER_ATOM
 NOPE_WORDS_DEFAULT = kv_cache_utils.TILE_LANE_BYTES
 
 
+def _sparse_tq():
+    # Imported on first use: the helpers import layers.core.turboquant, and
+    # loading the layers package imports attention_interface, which reads this
+    # module's attributes at import time.
+    from vllm_torchtpu.kernels.mla.sparse import turboquant
+
+    return turboquant
+
+
 def _nope_words_and_packing(
     *, turboquant: bool, sparsecore_layout: bool
 ) -> tuple[int, int]:
     """`(nope_words, nope_tokens_per_row)` for a SparseCore/TensorCore NoPE row."""
     if turboquant and not sparsecore_layout:
         raise NotImplementedError("TurboQuant sparse MLA needs the sparsecore layout")
-    words = sparse_tq.TQ_NOPE_WORDS if turboquant else NOPE_WORDS_DEFAULT
+    words = _sparse_tq().TQ_NOPE_WORDS if turboquant else NOPE_WORDS_DEFAULT
     return words, NOPE_WORDS_DEFAULT // words
 
 
@@ -743,7 +751,7 @@ def _attention_kernel(
 
     def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len):
         if turboquant:
-            return sparse_tq.unpack_tq_bkv(
+            return _sparse_tq().unpack_tq_bkv(
                 bkv_nope_ref,
                 bkv_rope_ref,
                 get_kv_len,
@@ -944,7 +952,7 @@ def _attention_kernel(
                 _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
         if turboquant:
-            sparse_tq.run_tq_batch(
+            _sparse_tq().run_tq_batch(
                 batch_size=batch_size,
                 batch_start_seq_idx=batch_start_seq_idx,
                 bi_sem_idx=bi_sem_idx,
