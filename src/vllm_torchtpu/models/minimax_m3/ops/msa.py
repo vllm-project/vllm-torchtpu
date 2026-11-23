@@ -429,25 +429,27 @@ def merge_head_partials(
 PACKED_EXCHANGE_MAX_TOKENS = 64
 
 
-def _words(x: torch.Tensor) -> torch.Tensor:
-    """`x` as int32 words along its last dim: a collective copies integers
-    bit for bit, while a float collective may flush or canonicalize the
-    subnormals and NaNs that packed 16-bit pairs and ids form."""
-    return x.contiguous().view(torch.int32)
+def _halves(x: torch.Tensor) -> torch.Tensor:
+    """`x` as int16 along its last dim: a collective copies integers bit for
+    bit, while a float collective may flush or canonicalize the subnormals
+    and NaNs that split f32 words and ids form. A 16-bit `x` reinterprets in
+    place; a wider view (int32 of bf16 pairs) lowered to strided slices of
+    the operand (1.4 us per layer at 8 tokens, c4 twin j-42ceea6d)."""
+    return x.contiguous().view(torch.int16)
 
 
 def exchange_queries_and_candidates(
     q: torch.Tensor, candidates: torch.Tensor, group: Any
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """`gather_query_heads` and the candidates' all-gather in one all-gather
-    of int32 words: ``q [T, Hq, D]`` and ``candidates [T, C]`` f32 ->
+    of int16 halves: ``q [T, Hq, D]`` and ``candidates [T, C]`` f32 ->
     ``(q_all [T, dcp * Hq, D], candidates [dcp, T, C])``."""
     dcp = group.world_size
     num_tokens, num_heads, head_dim = q.shape
-    q_words = _words(q.reshape(num_tokens, num_heads * head_dim))
-    packed = torch.cat([q_words, _words(candidates)], dim=1)
+    q_halves = _halves(q.reshape(num_tokens, num_heads * head_dim))
+    packed = torch.cat([q_halves, _halves(candidates)], dim=1)
     gathered = group.all_gather(packed, dim=0).view(dcp, num_tokens, -1)
-    split = q_words.shape[1]
+    split = q_halves.shape[1]
     q_all = (
         gathered[..., :split]
         .contiguous()
@@ -459,16 +461,22 @@ def exchange_queries_and_candidates(
     return q_all, gathered[..., split:].contiguous().view(candidates.dtype)
 
 
+# The int16 halves of an f32 lse (`pack_head_partials`).
+_LSE_HALVES = 2
+
+
 def pack_head_partials(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
-    """Head-major ``out [H, T, D]`` and ``lse [H, T]`` as one int32 tensor
-    ``[H, T, D * itemsize / 4 + 1]`` (`unpack_head_partials`)."""
-    return torch.cat([_words(out), _words(lse.to(torch.float32).unsqueeze(-1))], dim=-1)
+    """Head-major 16-bit ``out [H, T, D]`` and ``lse [H, T]`` as one int16
+    tensor ``[H, T, D + 2]`` (`unpack_head_partials`)."""
+    return torch.cat(
+        [_halves(out), _halves(lse.to(torch.float32).unsqueeze(-1))], dim=-1
+    )
 
 
 def unpack_head_partials(
     packed: torch.Tensor, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    split = packed.shape[-1] - 1
+    split = packed.shape[-1] - _LSE_HALVES
     return (
         packed[..., :split].contiguous().view(dtype),
         packed[..., split:].contiguous().view(torch.float32).squeeze(-1),
@@ -696,7 +704,9 @@ def get_msa_dcp_op(
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
-        # Fixed per traced bucket: the token count is static.
+        # Fixed while tracing: only the backbone reaches this op, and it is
+        # traced per token-bucket group (compilation/shape_variants). A graph
+        # traced once for every bucket would keep the first size's choice.
         packed = kv_heads == 1 and q.shape[0] <= PACKED_EXCHANGE_MAX_TOKENS
         if packed:
             q_all = None  # gathered with the candidates
