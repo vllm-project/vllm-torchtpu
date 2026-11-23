@@ -1,0 +1,308 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Exact host-side cuts in `_prepare_inputs`' steady MK decode path.
+
+Each cut is a default-off flag; with it on, every device input the step
+produces (the folded prep program's operands and outputs, input ids,
+positions, seq_lens, query_start_loc, both request distributions and the
+whole attention metadata) must be bitwise the flag-off step's, across steps
+with churn (add / finish / reorder), prefill pieces, block growth, folded and
+unfolded steps. Each cut also has an invalidation test and a negative
+control: a deliberately broken cut that the same comparison catches.
+
+The runner is `steady_decode_fakes`' CPU shell, driven through the real
+`_prepare_inputs` up to the attention-metadata build, with
+VLLM_TPU_PREFWD_PREP_FOLD on and the folded program replaced by a recorder
+(its compiled form needs a TPU; tests/runner/test_prefwd_prep_fold.py covers
+the program itself).
+"""
+
+from __future__ import annotations
+
+from contextlib import ExitStack
+
+import pytest
+import torch
+
+from tests.runner.steady_decode_fakes import Workload, _Stop, env, make_runner
+from tests.runner.test_steady_decode_metadata import _assert_metadata_equal
+from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import tpu_compiler
+from vllm_torchtpu.runner import tpu_runner
+
+K = 3
+FOLD_ENV = {
+    "VLLM_TPU_PREFWD_PREP_FOLD": "1",
+    "VLLM_TPU_PREFWD_PREP_FOLD_CHECK": "",
+    "VLLM_TPU_SUBTRACT_REJECTED_PAD_ROWS": "0",
+    "VLLM_TPU_SUBTRACT_REJECTED_COMPILED": "0",
+}
+_WARM = ("warm",)
+
+
+class _FoldAdapter:
+    """The model-adapter surface `_prep_fold_precheck` / `_try_prep_fold`
+    read; its fold operands are the step's query_start_loc."""
+
+    def prep_fold_supported(self):
+        return True
+
+    def prep_fold_args(self, start_index, num_reqs, query_start_loc, msi):
+        return (query_start_loc,), {"window": False}
+
+
+def _fake_fold(*args, num_tokens, ids_dtype, **static):
+    """Stands in for `_prep_fold_compiled`: records its operands and returns
+    outputs that depend on every one of them."""
+    seq_lens, positions, rejected, seq_idx, pos_idx, src, final, target = args[:8]
+    rest = args[8:]
+    if len(rest) == 4:  # (qsl, input_ids, cur, pre): the scatter
+        qsl, ids_in, cur, pre = rest
+        ids = ids_in.clone()
+        ids[cur.long()] = src[pre.long()].to(ids_dtype)
+    else:
+        (qsl,) = rest
+        ids = src[:num_tokens].to(ids_dtype)
+    _fake_fold.calls.append(
+        (tuple(a.clone() for a in args), dict(num_tokens=num_tokens, **static))
+    )
+    return (
+        seq_lens - 1,
+        positions + 1,
+        ids,
+        ids[target.long()],
+        qsl * 2,
+    )
+
+
+_fake_fold.calls = []
+
+
+def make_fold_runner(max_model_len=8192):
+    r = make_runner(max_model_len=max_model_len)
+    r._fast_token_substitution = True
+    r._pp_wave = None
+    r.supports_mm_inputs = False
+    r.model_adapter = _FoldAdapter()
+    r._prep_fold_keys = {_WARM}
+    return r
+
+
+def apply(wl: Workload, runner, step: int) -> None:
+    wl.apply(runner)
+    width = K + 1
+    runner._pre_async_results.next_tokens_tpu = (
+        torch.arange(runner.max_num_reqs * width, dtype=torch.int64) * 13 + step
+    ) % 50000
+
+
+_TO = torch.Tensor.to
+
+
+def _h2d(self, *args, **kwargs):
+    """`.to(device, non_blocking=True)` as an H2D: a new tensor holding the
+    source's values at the time of the call (on CPU `.to` returns `self`,
+    which would let later host writes show through "device" tensors)."""
+    out = _TO(self, *args, **kwargs)
+    if kwargs.get("non_blocking") and out is self:
+        out = self.clone()
+    return out
+
+
+def run_step(runner, scheduler_output, num_decode, num_windowed, warm=True):
+    """`_prepare_inputs` up to the metadata build; returns every device input
+    it produced."""
+    with ExitStack() as stack:
+        stack.callback(setattr, torch.Tensor, "to", _TO)
+        torch.Tensor.to = _h2d
+        return _run_step(runner, scheduler_output, num_decode, num_windowed, warm)
+
+
+def _run_step(runner, scheduler_output, num_decode, num_windowed, warm):
+    captured = {}
+    build = runner._build_attention_metadata
+
+    def capture_build(*args, **kwargs):
+        captured["metadata"] = build(*args, **kwargs)[0]
+        captured["ctx"] = runner._attn_metadata_builder_ctx
+        raise _Stop
+
+    runner._build_attention_metadata = capture_build
+    runner._prep_fold_keys = {_WARM} if warm else set()
+    runner.__dict__.pop("_prep_fold_memo", None)
+    _fake_fold.calls = []
+    try:
+        runner._prepare_inputs(scheduler_output, 0, num_decode, num_windowed)
+    except _Stop:
+        pass
+    finally:
+        del runner._build_attention_metadata
+    folded = runner.__dict__.get("_prep_fold_out")
+    captured["folded"] = folded
+    captured["fold_calls"] = list(_fake_fold.calls)
+    # execute_model reads runner.input_ids only on an unfolded step.
+    captured["input_ids"] = runner.input_ids if folded is None else None
+    captured["position_ids"] = runner.position_ids
+    captured["qsl_np"] = runner.query_start_loc_np.copy()
+    captured["seq_lens_np"] = runner.seq_lens_np.copy()
+    captured["comb_cpu"] = runner._combined_request_distribution_cpu.clone()
+    return captured
+
+
+def _same(a, b, what):
+    if a is None or b is None:
+        assert a is None and b is None, what
+        return
+    if isinstance(a, torch.Tensor):
+        assert a.dtype == b.dtype and a.shape == b.shape, what
+        assert torch.equal(a, b), what
+        return
+    if isinstance(a, (tuple, list)):
+        assert len(a) == len(b), what
+        for i, (x, y) in enumerate(zip(a, b)):
+            _same(x, y, f"{what}[{i}]")
+        return
+    if isinstance(a, dict):
+        assert a.keys() == b.keys(), what
+        for key in a:
+            _same(a[key], b[key], f"{what}.{key}")
+        return
+    assert a == b, what
+
+
+def assert_step_equal(off, on, step):
+    _assert_metadata_equal(off, on, step)
+    for name in ("folded", "fold_calls", "comb_cpu"):
+        _same(off[name], on[name], f"step {step}: {name}")
+    for name in ("mamba_request_distribution", "mamba_state_indices"):
+        _same(
+            getattr(off["ctx"], name),
+            getattr(on["ctx"], name),
+            f"step {step}: ctx.{name}",
+        )
+
+
+def run_pair(
+    monkeypatch,
+    flags: dict,
+    seed: int,
+    steps: int = 60,
+    stats=None,
+    cold_every: int = 7,
+):
+    """Flag off vs `flags` on over one random workload. Returns step stats."""
+    monkeypatch.setattr(tpu_runner, "_prep_fold_compiled", _fake_fold)
+    monkeypatch.setattr(tpu_runner, "_prep_fold_key", lambda args, static: _WARM)
+    wl = Workload(seed, 4, k=K, max_model_len=8192, churn=0.08, prefill=0.05)
+    off = make_fold_runner()
+    on = make_fold_runner()
+    stats = {"folded": 0, "one_to_one": 0, "scatter": 0, "unfolded": 0}
+    for step in range(steps):
+        if step:
+            wl.step()
+        num_decode, num_windowed = wl.segments()
+        apply(wl, off, step)
+        apply(wl, on, step)
+        so = wl.scheduler_output()
+        # Some steps' fold keys are "not warmed": the unfolded fallback.
+        warm = bool(cold_every) and step % cold_every != cold_every - 1
+        with env(steady=True, extra=FOLD_ENV):
+            out_off = run_step(off, so, num_decode, num_windowed, warm)
+        with env(steady=True, extra={**FOLD_ENV, **flags}):
+            out_on = run_step(on, so, num_decode, num_windowed, warm)
+        try:
+            assert_step_equal(out_off, out_on, step)
+        except AssertionError as e:
+            raise AssertionError(f"MISMATCH at step {step}: {e}") from e
+        if out_off["folded"] is None:
+            stats["unfolded"] += 1
+        else:
+            stats["folded"] += 1
+            calls = out_off["fold_calls"]
+            stats["one_to_one" if len(calls[0][0]) == 9 else "scatter"] += 1
+    return stats
+
+
+def _check_coverage(stats):
+    # The workload reaches every kind of step the cuts distinguish.
+    assert stats["one_to_one"] > 5, stats
+    assert stats["scatter"] > 2, stats
+    assert stats["unfolded"] > 5, stats
+
+
+def test_registered_and_out_of_compile_key(monkeypatch):
+    for name in ("VLLM_TPU_MAMBA_RD_REUSE",):
+        assert name in envs.environment_variables
+        assert name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+        monkeypatch.delenv(name, raising=False)
+        assert envs.environment_variables[name]() is False
+        monkeypatch.setenv(name, "1")
+        assert envs.environment_variables[name]() is True
+
+
+def test_harness_baseline_is_deterministic(monkeypatch):
+    """Off vs off: the comparison is exact by itself (no flag)."""
+    stats = run_pair(monkeypatch, {}, seed=3)
+    _check_coverage(stats)
+    print("step mix", stats)
+
+
+# --------------------------------------------------------------------------
+# D. VLLM_TPU_MAMBA_RD_REUSE
+# --------------------------------------------------------------------------
+
+D_FLAG = {"VLLM_TPU_MAMBA_RD_REUSE": "1"}
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_mamba_rd_reuse_bitwise(monkeypatch, seed):
+    _check_coverage(run_pair(monkeypatch, D_FLAG, seed))
+
+
+def test_mamba_rd_reuse_hits_and_invalidates(monkeypatch):
+    """Hits reuse the very same view objects; a new key (other num_reqs or a
+    prefill piece) re-slices a new upload; the views follow the cache."""
+    monkeypatch.setattr(tpu_runner, "_prep_fold_compiled", _fake_fold)
+    monkeypatch.setattr(tpu_runner, "_prep_fold_key", lambda args, static: _WARM)
+    r = make_fold_runner()
+    wl = Workload(5, 4, k=K, max_model_len=8192, churn=0.0, prefill=0.0)
+    seen = []
+    for step in range(6):
+        if step:
+            wl.step()
+        if step == 3:
+            wl._add()  # a new request: num_reqs 4 -> 5
+        num_decode, num_windowed = wl.segments()
+        apply(wl, r, step)
+        with env(steady=True, extra={**FOLD_ENV, **D_FLAG}):
+            out = run_step(r, wl.scheduler_output(), num_decode, num_windowed)
+        seen.append(
+            (
+                out["ctx"].request_distribution,
+                out["ctx"].mamba_request_distribution,
+                r._cached_comb_dev,
+            )
+        )
+    for step in (1, 2):
+        assert seen[step][0] is seen[0][0] and seen[step][1] is seen[0][1]
+    assert seen[3][2] is not seen[0][2]  # re-keyed: a new upload
+    assert seen[3][0] is not seen[0][0]
+    assert seen[3][0]._base is seen[3][2] or seen[3][0].data_ptr() == (
+        seen[3][2].data_ptr()
+    )
+    assert seen[4][0] is seen[3][0] and seen[5][0] is seen[3][0]
+    assert seen[5][0].tolist() == [5, 5, 5] and seen[5][1].tolist() == [5, 5, 5]
+    # A replaced device copy (any other writer of _cached_comb_dev) drops them.
+    r._cached_comb_dev = r._cached_comb_dev.clone()
+    assert r._reused_comb_views(r._cached_comb_key) is None
+
+
+def test_mamba_rd_reuse_negative_control(monkeypatch):
+    """A broken reuse that ignores the key is caught by the comparison."""
+
+    def broken(self, key):
+        views = self.__dict__.get("_cached_comb_views")
+        return None if views is None else (views[1], views[2])
+
+    monkeypatch.setattr(tpu_runner.TPUModelRunner, "_reused_comb_views", broken)
+    with pytest.raises(AssertionError, match="MISMATCH"):
+        run_pair(monkeypatch, D_FLAG, seed=0)
