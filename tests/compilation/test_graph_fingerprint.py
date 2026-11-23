@@ -179,6 +179,8 @@ def install_group_stand_ins(monkeypatch):
 
     pg_ranks = {
         "1": [0, 1],
+        # A second rank-local handle for the group of "1".
+        "17": [0, 1],
         "7": [6, 7],
         "13": [0, 2, 4, 6],
         "15": [1, 3, 5, 7],
@@ -205,35 +207,47 @@ class TestGraphFingerprint:
     def test_fingerprint_canonicalizes_c10d_subgroup_names_and_preserves_graph(
         self, group_stand_ins
     ):
-        """Multi-group and role-indexed graphs match across subgroups without
-        mutating the GraphModule's code or node arguments."""
+        """A graph combining collectives of several groups matches across
+        subgroups (TorchTPU runs it on every device, each group's collectives
+        tiled over its layout), a one-group graph only within its subgroup
+        (TorchTPU compiles it for that subgroup's devices), and
+        canonicalization does not mutate the GraphModule's code or node
+        arguments."""
         gm_rank0 = _trace_multi_collective_graph(tp_group="1", ep_group="13")
+        gm_rank0_alias = _trace_multi_collective_graph(tp_group="17", ep_group="13")
         gm_rank7 = _trace_multi_collective_graph(tp_group="7", ep_group="15")
+        # DP x TP: ranks 0 and 1 share a TP group but not a DP group.
+        gm_rank1 = _trace_multi_collective_graph(tp_group="1", ep_group="15")
 
         code_before = gm_rank0.code
         args_before = [(node.args, dict(node.kwargs)) for node in gm_rank0.graph.nodes]
 
         fp_rank0 = _graph_fingerprint(gm_rank0)
-        fp_rank7 = _graph_fingerprint(gm_rank7)
 
         assert fp_rank0 is not None
-        assert fp_rank0 == fp_rank7
+        assert fp_rank0 == _graph_fingerprint(gm_rank0_alias)
+        assert fp_rank0 == _graph_fingerprint(gm_rank7)
+        assert fp_rank0 == _graph_fingerprint(gm_rank1)
         assert gm_rank0.code == code_before
         assert [
             (node.args, dict(node.kwargs)) for node in gm_rank0.graph.nodes
         ] == args_before
 
-        for role in ("tp", "dp", "pcp", "dcp", "ep"):
+        for role in ("tp", "dp", "pcp", "dcp"):
             assert _graph_fingerprint(
                 _trace_all_reduce_graph(f"{role}:0")
-            ) == _graph_fingerprint(_trace_all_reduce_graph(f"{role}:3"))
+            ) != _graph_fingerprint(_trace_all_reduce_graph(f"{role}:3"))
+        # Both EP handles name the one world-sized group.
+        assert _graph_fingerprint(_trace_all_reduce_graph("ep:0")) == (
+            _graph_fingerprint(_trace_all_reduce_graph("ep:3"))
+        )
 
     def test_fingerprint_with_vllm_parallel_state_and_c10d_stand_ins(
         self, group_stand_ins
     ):
         """Resolved vLLM GroupCoordinators and c10d ProcessGroups encode
-        partition or stride geometry and differ when role, size, or layout
-        differ."""
+        partition or stride geometry, not the group's own ranks, and differ
+        when role, size, or layout differ."""
         assert (
             _canonicalize_process_group_name("tp:0", 0)
             == "vllm_pg:0:tp:size=2:group_ranks=((0, 1), (2, 3), (4, 5), (6, 7))"
@@ -259,18 +273,19 @@ class TestGraphFingerprint:
             _trace_all_reduce_graph("99")
         )
 
-    def test_fingerprint_matches_across_wrap_around_tpu7x_subgroups(
-        self, group_stand_ins
-    ):
-        """Wrap-around tpu7x subgroups (e.g. tp=(0,1,6,7) and tp=(4,5,2,3))
-        share the same GroupCoordinator.group_ranks partition and match whether
-        referenced by unique_name or device_group.group_name."""
+    def test_fingerprint_of_wrap_around_tpu7x_subgroups(self, group_stand_ins):
+        """A wrap-around tpu7x subgroup (e.g. tp=(0,1,6,7)) matches whether
+        referenced by unique_name or device_group.group_name, and differs from
+        the other subgroup of the same partition (tp=(4,5,2,3))."""
         assert _graph_fingerprint(
             _trace_all_reduce_graph("tp_wrap:0")
-        ) == _graph_fingerprint(_trace_all_reduce_graph("tp_wrap:1"))
+        ) == _graph_fingerprint(_trace_all_reduce_graph("tp_wrap_c10d_0"))
+        assert _graph_fingerprint(
+            _trace_all_reduce_graph("tp_wrap:1")
+        ) == _graph_fingerprint(_trace_all_reduce_graph("tp_wrap_c10d_1"))
         assert _graph_fingerprint(
             _trace_all_reduce_graph("tp_wrap_c10d_0")
-        ) == _graph_fingerprint(_trace_all_reduce_graph("tp_wrap_c10d_1"))
+        ) != _graph_fingerprint(_trace_all_reduce_graph("tp_wrap_c10d_1"))
         assert _graph_fingerprint(
             _trace_all_reduce_graph("tp_wrap_c10d_0")
         ) != _graph_fingerprint(_trace_all_reduce_graph("pcp_wrap_c10d_0"))
@@ -299,19 +314,21 @@ class TestGraphFingerprint:
             return fx.GraphModule(torch.nn.Module(), graph)
 
         gm_rank0 = _build_kwarg_graph("1")
+        gm_rank0_alias = _build_kwarg_graph("17")
         gm_rank7 = _build_kwarg_graph("7")
         gm_rank_other = _build_kwarg_graph("13")
         kwargs_before = [dict(node.kwargs) for node in gm_rank0.graph.nodes]
 
         fp_rank0 = _graph_fingerprint(gm_rank0)
         assert fp_rank0 is not None
-        assert fp_rank0 == _graph_fingerprint(gm_rank7)
+        assert fp_rank0 == _graph_fingerprint(gm_rank0_alias)
+        assert fp_rank0 != _graph_fingerprint(gm_rank7)
         assert fp_rank0 != _graph_fingerprint(gm_rank_other)
         assert [dict(node.kwargs) for node in gm_rank0.graph.nodes] == kwargs_before
 
     def test_fingerprint_shares_group_ordinals_across_submodules(self, group_stand_ins):
         """Group ordinals are shared across graph.named_modules() so submodules
-        using distinct same-geometry groups do not reset to ordinal 0."""
+        using distinct handles do not reset to ordinal 0."""
 
         def _build_two_submodule_graph(group_a: str, group_b: str) -> fx.GraphModule:
             root = torch.nn.Module()
@@ -324,15 +341,15 @@ class TestGraphFingerprint:
             graph.output(z)
             return fx.GraphModule(root, graph)
 
-        fp_same_0 = _graph_fingerprint(_build_two_submodule_graph("1", "1"))
-        fp_same_7 = _graph_fingerprint(_build_two_submodule_graph("7", "7"))
-        fp_distinct_07 = _graph_fingerprint(_build_two_submodule_graph("1", "7"))
-        fp_distinct_70 = _graph_fingerprint(_build_two_submodule_graph("7", "1"))
+        fp_same = _graph_fingerprint(_build_two_submodule_graph("1", "1"))
+        fp_same_alias = _graph_fingerprint(_build_two_submodule_graph("17", "17"))
+        fp_distinct = _graph_fingerprint(_build_two_submodule_graph("1", "17"))
+        fp_distinct_swapped = _graph_fingerprint(_build_two_submodule_graph("17", "1"))
 
-        assert fp_same_0 is not None
-        assert fp_same_0 == fp_same_7
-        assert fp_distinct_07 == fp_distinct_70
-        assert fp_same_0 != fp_distinct_07
+        assert fp_same is not None
+        assert fp_same == fp_same_alias
+        assert fp_distinct == fp_distinct_swapped
+        assert fp_same != fp_distinct
 
     def test_non_symmetric_collective_returns_none_fingerprint(self, group_stand_ins):
         """Rooted, point-to-point, or unlisted custom collectives raise
@@ -649,17 +666,29 @@ def _run_worker(result_dir: Path) -> None:
         assert isinstance(payload, TpuCompilationHandle)
         assert payload.entry is not None
 
-        # 2. Cross-subgroup peer replay: in a shared host cache root, only rank 0
-        # compiles while ranks 1..3 and subgroup 1 (ranks 4..7) replay rank 0's
-        # artifact.
+        # 2. Shared host cache root: TorchTPU compiles each subgroup's program
+        # for that subgroup's devices, so subgroup 1 must not replay rank 0's
+        # artifact. Rank 0 compiles, ranks 1..3 replay it. Ranks 4..7 start
+        # once rank 0's artifact is there and wait past it: exactly one of them
+        # claims the bucket for subgroup 1 and compiles it, the others replay
+        # that one's artifact.
         torch._dynamo.reset()
+
+        def _shared_artifact(r: int) -> Path:
+            return (
+                result_dir / "shared" / f"rank_{r}_0" / "backbone" / "all_reduce_bucket"
+            )
+
+        if subgroup == 1:
+            deadline = time.monotonic() + 120.0
+            while not _shared_artifact(0).exists():
+                if time.monotonic() > deadline:
+                    raise TimeoutError("no rank 0 artifact in the shared cache root")
+                time.sleep(0.05)
         shared_val, shared_path, shared_compiled, _ = _compile_and_run(
             result_dir / "shared",
             wait_for_leader=(rank != 0),
-            forbid_backend=(rank != 0),
-        )
-        rank0_shared_path = (
-            result_dir / "shared" / "rank_0_0" / "backbone" / "all_reduce_bucket"
+            forbid_backend=(subgroup == 0 and rank != 0),
         )
 
         result.update(
@@ -677,8 +706,9 @@ def _run_worker(result_dir: Path) -> None:
                 "shared_compiled": shared_compiled,
                 "shared_val": shared_val,
                 "shared_samefile_as_rank0": os.path.samefile(
-                    shared_path, rank0_shared_path
+                    shared_path, _shared_artifact(0)
                 ),
+                "shared_inode": os.stat(shared_path).st_ino,
             }
         )
     except Exception:
@@ -740,10 +770,11 @@ def _results(result_dir: Path) -> list[dict]:
 @pytest.mark.multichip
 @pytest.mark.spawns_tpu_workers
 def test_all_reduce_across_tp_subgroups_compiles_matching_artifacts_on_tpu(tmp_path):
-    """Two TP subgroups ([0, 1, 2, 3] and [4, 5, 6, 7]) trace distinct c10d
-    group names yet produce matching _graph_fingerprint and matching PJRT
-    compiled executables, and subgroup 1 replays subgroup 0's compiled artifact
-    on real TPU devices."""
+    """Two TP subgroups ([0, 1, 2, 3] and [4, 5, 6, 7]) trace the same program
+    on different devices: the ranks of a subgroup share _graph_fingerprint, a
+    PJRT executable and one compiled artifact, while the two subgroups differ,
+    and subgroup 1 compiles its own artifact instead of replaying subgroup 0's,
+    which TorchTPU compiled for subgroup 0's devices."""
     result_dir = tmp_path / "tp_subgroups"
     result_dir.mkdir()
     completed = _launch(result_dir)
@@ -767,20 +798,23 @@ def test_all_reduce_across_tp_subgroups_compiles_matching_artifacts_on_tpu(tmp_p
         == "tp_fingerprint_test:0"
     )
 
+    subgroups = (range(SUBGROUP_SIZE), range(SUBGROUP_SIZE, WORLD_SIZE))
+
+    def _per_subgroup(field: str) -> list[set]:
+        return [{results[r][field] for r in sg} for sg in subgroups]
+
+    for field in ("traced_fingerprint", "handle_fingerprint", "executable_fingerprint"):
+        sg0, sg1 = _per_subgroup(field)
+        assert len(sg0) == 1 and len(sg1) == 1, f"{field} differs within a subgroup"
+    # The executables may still match: the same program, compiled for two
+    # subslices of the same shape, differing only in where they are loaded.
+    for field in ("traced_fingerprint", "handle_fingerprint"):
+        sg0, sg1 = _per_subgroup(field)
+        assert sg0 != sg1, f"{field} matches across subgroups"
     assert results[0]["traced_fingerprint"] is not None
-    assert len({r["traced_fingerprint"] for r in results}) == 1, (
-        f"mismatched traced fingerprints: {[r['traced_fingerprint'] for r in results]}"
-    )
-    assert len({r["handle_fingerprint"] for r in results}) == 1, (
-        f"mismatched handle fingerprints: {[r['handle_fingerprint'] for r in results]}"
-    )
+    assert results[0]["executable_fingerprint"], "empty PJRT executable fingerprint"
     assert len({r["handle_signature"] for r in results}) == 1
     assert len({r["handle_was_wrapped"] for r in results}) == 1
-
-    assert results[0]["executable_fingerprint"], "empty PJRT executable fingerprint"
-    assert len({r["executable_fingerprint"] for r in results}) == 1, (
-        f"mismatched PJRT executables: {[r['executable_fingerprint'] for r in results]}"
-    )
 
     assert [r["indep_compiled"] for r in results] == [
         True,
@@ -792,17 +826,15 @@ def test_all_reduce_across_tp_subgroups_compiles_matching_artifacts_on_tpu(tmp_p
         False,
         False,
     ]
-    assert [r["shared_compiled"] for r in results] == [
-        True,
-        False,
-        False,
-        False,
-        False,
-        False,
-        False,
-        False,
-    ]
-    assert all(r["shared_samefile_as_rank0"] for r in results)
+    shared_compiled = [r["shared_compiled"] for r in results]
+    assert shared_compiled[:SUBGROUP_SIZE] == [True, False, False, False]
+    assert sum(shared_compiled[SUBGROUP_SIZE:]) == 1, shared_compiled
+    sg0_inodes, sg1_inodes = _per_subgroup("shared_inode")
+    assert len(sg0_inodes) == 1 and len(sg1_inodes) == 1
+    assert sg0_inodes != sg1_inodes
+    assert [r["shared_samefile_as_rank0"] for r in results] == (
+        [True] * SUBGROUP_SIZE + [False] * SUBGROUP_SIZE
+    )
 
     # Subgroup 0 ([0, 1, 2, 3]): (1.0 + 2.0 + 3.0 + 4.0) + 1.0 = 11.0
     # Subgroup 1 ([4, 5, 6, 7]): (5.0 + 6.0 + 7.0 + 8.0) + 1.0 = 27.0

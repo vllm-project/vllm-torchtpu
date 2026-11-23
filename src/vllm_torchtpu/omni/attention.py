@@ -48,10 +48,12 @@ class TpuSDPAImpl(SDPAImpl):
         attn_metadata: Any | None = None,
     ) -> torch.Tensor:
         # ---------------------------------------------------------------------
-        # TODO: Remove the math-backend pin, and its canary
-        # test_torch_tpu_still_misreads_query_broadcast_attn_mask, once the
-        # pinned torch_tpu release has the fix for
-        # google-pytorch/torch_tpu#5677 (on torch_tpu main, not in 0.2.0).
+        # TODO: Remove the math-backend pin. torch_tpu 0.3.0 has the fix for
+        #   google-pytorch/torch_tpu#5677: its default SDPA lowering now reads
+        #   the masks below correctly. The pin also makes 1D [K] masks work:
+        #   _forward_impl passes them to SDPA as is, and only the math backend
+        #   broadcasts them (the default one raises IndexError). Reshape 1D
+        #   masks to [1, 1, 1, K] before removing the pin.
         #
         # Problem: torch_tpu 0.2.0's default SDPA lowering, its flash kernel,
         #   misreads an attn_mask of size 1 along the query dim, such as a

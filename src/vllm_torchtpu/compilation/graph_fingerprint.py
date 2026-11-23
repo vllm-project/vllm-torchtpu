@@ -19,7 +19,10 @@ from typing import Any
 import torch
 import torch.fx as fx
 
-from vllm_torchtpu.distributed.utils import _canonicalize_process_group_name
+from vllm_torchtpu.distributed.utils import (
+    _canonicalize_process_group_name,
+    process_group_ranks,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -143,8 +146,13 @@ def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
     replay the other's artifact. A rank-dependent value baked into the graph,
     e.g. a Python int from `rank_in_group`, changes the code and so the hash.
     Rank-local `c10d` `group_name` identifiers on symmetric subgroup collectives
-    are canonicalized via `_normalized_module_code` because TorchTPU lowers
-    symmetric subgroup collectives into global SPMD HLO covering all partitions.
+    are canonicalized via `_normalized_module_code` into tokens naming each
+    group's layout: TorchTPU runs a program that combines the collectives of
+    several groups on every device, so it is the same on all ranks. A program
+    whose collectives all run on the same devices is compiled for those
+    devices only and loaded at the origin of their subslice, so another
+    subgroup cannot run it ("local device count is 0"); its fingerprint also
+    names those ranks, so it is shared only within the subgroup.
     None if the graph cannot be hashed (including when a group cannot be
     resolved or a non-symmetric collective is present); its artifact is then
     only replayed by the rank that saved it.
@@ -172,6 +180,9 @@ def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
                 if value.numel() <= _FINGERPRINT_MAX_NUMEL:
                     flat = value.detach().to("cpu").contiguous().reshape(-1)
                     h.update(flat.view(torch.uint8).numpy().tobytes())
+        devices = {process_group_ranks(raw) for raw in canonical_by_raw}
+        if len(devices) == 1:
+            h.update(f"devices={devices.pop()}".encode())
         return h.hexdigest()
     except Exception as e:
         logger.warning("[TpuCompilerAdaptor] Could not fingerprint graph: %s", e)

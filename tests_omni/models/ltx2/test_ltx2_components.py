@@ -96,9 +96,10 @@ ROPE_MAX_ABS_ERR = 6.2e-8
 ROPE_MAX_REL_L2 = 3.6e-8
 
 # (TPU fp32, TPU bf16) rel_l2 and max_abs bounds vs diffusers CPU fp32, ~3%
-# above the observed values. Both sides are deterministic across hosts.
+# above the values observed on torch_tpu 0.3.0. Both sides are deterministic
+# across hosts.
 DIT_MAX_REL_L2: dict[tuple[str, str], tuple[float, float]] = {
-    ("t2v", "video"): (4.3e-3, 9.3e-3),
+    ("t2v", "video"): (4.5e-3, 9.3e-3),
     ("t2v", "audio"): (2.7e-3, 6.2e-3),
     ("stg", "video"): (4.5e-3, 9.4e-3),
     ("stg", "audio"): (3.0e-3, 6.1e-3),
@@ -107,22 +108,22 @@ DIT_MAX_REL_L2: dict[tuple[str, str], tuple[float, float]] = {
 }
 DIT_MAX_ABS: dict[tuple[str, str], tuple[float, float]] = {
     ("t2v", "video"): (8.5e-3, 2.0e-2),
-    ("t2v", "audio"): (5.6e-3, 1.6e-2),
+    ("t2v", "audio"): (6.2e-3, 1.6e-2),
     ("stg", "video"): (8.6e-3, 1.9e-2),
-    ("stg", "audio"): (5.8e-3, 1.6e-2),
+    ("stg", "audio"): (7.4e-3, 1.6e-2),
     ("modality", "video"): (7.1e-3, 1.3e-2),
-    ("modality", "audio"): (5.8e-3, 1.3e-2),
+    ("modality", "audio"): (6.0e-3, 1.3e-2),
 }
 CONNECTOR_MAX_REL_L2: dict[str, tuple[float, float]] = {
     "video": (2.8e-3, 5.9e-3),
-    "audio": (2.7e-3, 5.6e-3),
+    "audio": (2.7e-3, 5.8e-3),
 }
 CONNECTOR_MAX_ABS: dict[str, tuple[float, float]] = {
     "video": (1.6e-2, 2.7e-2),
     "audio": (1.1e-2, 2.3e-2),
 }
 VIDEO_VAE_MAX_REL_L2: dict[str, tuple[float, float]] = {
-    "mode": (7.3e-3, 1.2e-2),
+    "mode": (7.3e-3, 1.3e-2),
     "decode": (6.5e-3, 1.2e-2),
     "decode-frame": (6.7e-3, 1.3e-2),
 }
@@ -131,7 +132,7 @@ VIDEO_VAE_MAX_ABS: dict[str, tuple[float, float]] = {
     "decode": (1.2e-2, 2.1e-2),
 }
 AUDIO_VAE_MAX_REL_L2: tuple[float, float] = (9.6e-3, 1.9e-2)
-AUDIO_VAE_MAX_ABS: tuple[float, float] = (1.6e-2, 2.6e-2)
+AUDIO_VAE_MAX_ABS: tuple[float, float] = (1.6e-2, 2.9e-2)
 VOCODER_MAX_REL_L2: tuple[float, float] = (1.7e-3, 8.4e-3)
 VOCODER_MAX_ABS: tuple[float, float] = (1.6e-3, 5.5e-3)
 GEMMA3_MAX_REL_L2: tuple[float, float] = (7.4e-3, 1.2e-2)

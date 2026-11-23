@@ -199,31 +199,31 @@ def test_rejects_tensor_parallel_stages():
 
 @pytest.fixture
 def stage_meshes(monkeypatch):
-    """A torch_tpu that builds meshes over a stage's process group."""
-    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: True)
+    """Stages of several devices served (once a TPU test covers them)."""
+    monkeypatch.setattr(
+        pp_validation, "_serves_stages_of_several_devices", lambda: True
+    )
 
 
 def test_accepts_context_parallel_stages(stage_meshes):
     validate_pipeline_parallel_config(_config(pp=4, pcp=2))
 
 
-def test_rejects_context_parallel_stages_on_world_size_meshes(monkeypatch):
-    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: False)
+def test_rejects_context_parallel_stages_until_served():
     with pytest.raises(NotImplementedError, match="stages of several devices"):
         validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=RAIDEN))
 
 
-def test_rejects_expert_parallel_stages_on_world_size_meshes(monkeypatch):
-    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: False)
+def test_rejects_expert_parallel_stages_until_served():
     with pytest.raises(NotImplementedError, match="stages of several devices"):
         validate_pipeline_parallel_config(_config(pp=4, dp=2, ep=True))
 
 
-def test_pipeline_stages_of_one_device_skip_the_torch_tpu_check(monkeypatch):
+def test_pipeline_stages_of_one_device_skip_the_stage_check(monkeypatch):
     def unexpected():
-        raise AssertionError("probed torch_tpu for a stage of one device")
+        raise AssertionError("checked a stage of one device")
 
-    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", unexpected)
+    monkeypatch.setattr(pp_validation, "_serves_stages_of_several_devices", unexpected)
     validate_pipeline_parallel_config(_config(pp=8))
     validate_pipeline_parallel_config(_config(pp=4, dp=2))
     validate_pipeline_parallel_config(_config(pp=8, ep=True))

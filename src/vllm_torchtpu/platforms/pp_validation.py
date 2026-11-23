@@ -19,12 +19,11 @@ from typing import Any
 from vllm_torchtpu.distributed.kv_transfer.connector_names import kv_connector_names
 
 
-def _torch_tpu_builds_stage_meshes() -> bool:
-    """Whether the installed torch_tpu builds a Pallas mesh over a pipeline
-    stage's process group; its releases accept world-size meshes only."""
-    from torch_tpu._internal.pallas import pallas
-
-    return not hasattr(pallas, "_validate_pallas_mesh_world_size")
+def _serves_stages_of_several_devices() -> bool:
+    """Whether pipeline stages of several devices are served. torch_tpu (since
+    0.3.0) builds a Pallas mesh over a stage's process group, but no TPU test
+    serves such a stage yet."""
+    return False
 
 
 # The `layer_types` spellings vLLM counts as full-attention layers
@@ -125,19 +124,19 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
             parallel_config.data_parallel_size > 1
             and parallel_config.enable_expert_parallel
         )
-    ) and not _torch_tpu_builds_stage_meshes():
+    ) and not _serves_stages_of_several_devices():
         # A stage of several devices builds its meshes, and the hand-off its
-        # per-column mesh, over a group smaller than the world.
-        # TODO(yinlin): google-pytorch/torch_tpu#4387 builds those for a group
-        # made standalone; make each stage group standalone and drop this
-        # guard once the pinned torch_tpu has it.
+        # per-column mesh, over the stage's process group, which torch_tpu
+        # supports since 0.3.0; no TPU test serves such a stage yet.
+        # TODO(yinlin): Admit these stages once a TPU integration test serves
+        #   PP x PCP prefill (and PP x DP-EP for the expert-parallel case).
         unsupported = (
             "pipeline stages of several devices (context parallelism, or expert "
-            "parallelism across data-parallel ranks) with this torch_tpu"
+            "parallelism across data-parallel ranks)"
         )
         remedy = (
-            " They need a torch_tpu that builds Pallas meshes over a stage's"
-            " process group."
+            " Use --prefill-context-parallel-size 1, and expert parallelism"
+            " only with --data-parallel-size 1."
         )
     elif (
         parallel_config.prefill_context_parallel_size > 1

@@ -19,15 +19,20 @@ that split is lossless: vision attention is segmented per temporal patch
 (`cu_seqlens` has one entry per frame) and the vision RoPE is spatial-only,
 so each frame is encoded identically however the video is chunked.
 
-These tests hold the feature to that claim end to end: greedy generation with
-chunking on must produce exactly the same token ids as with chunking off.
-They also check that the output still describes the video.
+In bf16 it is not bit-exact: a chunk changes the encoder's matmul shapes,
+and the rounding differences add up to ~4% relative L2 in its output. So
+these tests compare greedy generation with chunking on and off by the model's
+own confidence (see `_mismatch`): logprobs must agree up to the first
+differing token, and tokens may differ only at a near-tie of the reference.
+They also compare the encoder output itself, one temporal patch at a time,
+since a frame-order bug barely moves the tokens of a mostly static video,
+and check that the output still describes the video.
 
 Chunk budgets are derived from the reference run's video-token count instead
 of hard-coded, so the tests keep exercising a multi-chunk split even if the
 processor's resize policy changes the patch grid. Every chunked case asserts
 the video really exceeded its budget; a budget the video fits in would take
-the unchunked path and make the exactness check vacuous.
+the unchunked path and make the comparison vacuous.
 
 Both the eager encoder path (`cudagraph_mm_encoder=False`, via
 `chunked_video_encoding`) and the compiled encoder path
@@ -40,17 +45,19 @@ Run with:
 
 from __future__ import annotations
 
+import dataclasses
 import multiprocessing
 import os
 import queue as queue_lib
 import traceback
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import numpy as np
 import pytest
+import torch
 from PIL import Image
 from vllm import LLM, EngineArgs, SamplingParams
 from vllm.assets.video import VideoAsset
@@ -70,6 +77,9 @@ CHUNK_ENV = "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE"
 FRAME_SIZE = 336
 # Qwen2.5-VL merges 2x2 patches into one LLM token (spatial_merge_size=2).
 PATCHES_PER_VIDEO_TOKEN = 4
+# Vision tokens per temporal patch (two frames): a 24x24 patch grid at 336x336
+# (patch size 14), four patches per token.
+TOKENS_PER_TEMPORAL_PATCH = (FRAME_SIZE // 14) ** 2 // PATCHES_PER_VIDEO_TOKEN
 # Compiled encoder token budget for chunked runs: half of the 16-frame video
 # (4 temporal frames = 576 tokens = 2304 patches), so total_tokens > max_budget
 # triggers MMEncoderManager._execute_local chunking.
@@ -148,6 +158,10 @@ class GenerationResult:
     text: str
     prompt_token_ids: tuple[int, ...]
     num_video_tokens: int
+    # Per generated token: the top-2 (token id, logprob) pairs, best first.
+    top2_logprobs: tuple[tuple[tuple[int, float], ...], ...]
+    # The vision encoder's output for this video, [num_video_tokens, hidden].
+    encoder_output: np.ndarray | None = field(default=None, compare=False, repr=False)
 
     @property
     def num_video_patches(self) -> int:
@@ -226,11 +240,48 @@ def _format_video_inputs(
     ]
 
 
+def _install_encoder_capture(self) -> bool:
+    """Worker side: keep a CPU copy of every vision encoder output."""
+    runner = self.model_runner
+    if hasattr(runner, "_test_encoder_outputs"):
+        return True
+    runner._test_encoder_outputs = []
+    execute = runner._execute_mm_encoder
+
+    def capture(*args, **kwargs):
+        outputs = execute(*args, **kwargs)
+        runner._test_encoder_outputs.extend(
+            t.detach().float().cpu().numpy()
+            for t in outputs
+            if isinstance(t, torch.Tensor)
+        )
+        return outputs
+
+    runner._execute_mm_encoder = capture
+    return True
+
+
+def _pop_encoder_outputs(self) -> list[np.ndarray]:
+    """Worker side: the encoder outputs captured since the last call."""
+    runner = self.model_runner
+    outputs, runner._test_encoder_outputs = runner._test_encoder_outputs, []
+    return outputs
+
+
+def _encoder_output_for(
+    encoder_outputs: list[np.ndarray], num_video_tokens: int
+) -> np.ndarray | None:
+    """The one captured encoder output with this video's token count."""
+    matches = [o for o in encoder_outputs if o.shape[0] == num_video_tokens]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _extract_generation_results(
     outputs: list[Any],
     video_pad_id: int,
+    encoder_outputs: list[np.ndarray],
 ) -> list[GenerationResult]:
-    return [
+    results = [
         GenerationResult(
             token_ids=tuple(out.outputs[0].token_ids),
             text=out.outputs[0].text.strip(),
@@ -238,8 +289,25 @@ def _extract_generation_results(
             num_video_tokens=sum(
                 1 for tok in out.prompt_token_ids if tok == video_pad_id
             ),
+            top2_logprobs=tuple(
+                tuple(
+                    sorted(
+                        ((tok, lp.logprob) for tok, lp in step.items()),
+                        key=lambda pair: -pair[1],
+                    )[:2]
+                )
+                for step in out.outputs[0].logprobs
+            ),
         )
         for out in outputs
+    ]
+    # Every video in these tests has its own token count, which pairs each
+    # result with its encoder output.
+    return [
+        dataclasses.replace(
+            r, encoder_output=_encoder_output_for(encoder_outputs, r.num_video_tokens)
+        )
+        for r in results
     ]
 
 
@@ -305,11 +373,16 @@ def _run_with_chunk_budget(
     assert worker_budgets and all(b == chunk_patch_size for b in worker_budgets), (
         f"Workers did not observe {CHUNK_ENV}={chunk_patch_size}: got {worker_budgets}"
     )
+    llm.llm_engine.collective_rpc(_pop_encoder_outputs)
     outputs = llm.generate(
         _format_video_inputs(prompts, videos),
-        sampling_params=SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS),
+        sampling_params=SamplingParams(
+            temperature=0.0, max_tokens=MAX_TOKENS, logprobs=2
+        ),
     )
-    return _extract_generation_results(outputs, video_pad_id)
+    # Tensor-parallel ranks hold the same encoder output.
+    encoder_outputs = llm.llm_engine.collective_rpc(_pop_encoder_outputs)[0]
+    return _extract_generation_results(outputs, video_pad_id, encoder_outputs)
 
 
 def _run_single_with_chunk_budget(
@@ -359,6 +432,7 @@ def _run_encoder_mode_suite_worker(
             cudagraph_mm_encoder=cudagraph_mm_encoder,
             initial_chunk_patch_size=0,
         )
+        llm.llm_engine.collective_rpc(_install_encoder_capture)
         video_pad_id = llm.get_tokenizer().convert_tokens_to_ids("<|video_pad|>")
 
         reference: CaseOutcome | None = None
@@ -515,10 +589,108 @@ def _first_divergence(a: tuple[int, ...], b: tuple[int, ...]) -> int:
     return min(len(a), len(b))
 
 
-def _assert_bit_exact(
+# How far apart the logprob of the same chosen token may be in two runs.
+# Chunking changes the vision encoder's matmul shapes, so its output differs
+# from the unchunked one by bf16 rounding (~4% relative L2 after 32 ViT
+# layers, on every torch_tpu tested), which moves token logprobs a little:
+# at most 0.14 over every budget, both encoders and two prompts, on torch_tpu
+# 0.2.0 and 0.3.0.
+LOGPROB_ATOL = 0.25
+# Two runs may pick different tokens only where the reference was nearly
+# undecided: a top-2 gap that the noise above can close from both sides.
+NEAR_TIE_GAP = 2 * LOGPROB_ATOL
+# Largest relative L2 error of one temporal patch of the chunked encoder output
+# against the unchunked one. bf16 rounding gives at most 0.08 (every budget,
+# both encoders, torch_tpu 0.2.0 and 0.3.0); a patch from another frame, a
+# stale patch or a dropped one gives 0.8 to 1.05.
+ENCODER_PATCH_MAX_REL_L2 = 0.25
+
+
+def _encoder_mismatch(
+    reference: GenerationResult, chunked: GenerationResult
+) -> str | None:
+    """Why the chunked encoder output does not match the reference's, or None.
+
+    Compared one temporal patch at a time: a chunking bug moves, repeats or
+    drops whole patches, which a single error over the video would dilute.
+    """
+    ref, out = reference.encoder_output, chunked.encoder_output
+    if ref is None or out is None:
+        return "the vision encoder output was not captured"
+    if out.shape != ref.shape:
+        return f"encoder output shape {out.shape} differs from {ref.shape}"
+    n = TOKENS_PER_TEMPORAL_PATCH
+    for i in range(ref.shape[0] // n):
+        ref_patch = ref[i * n : (i + 1) * n]
+        err = float(
+            np.linalg.norm(out[i * n : (i + 1) * n] - ref_patch)
+            / np.linalg.norm(ref_patch)
+        )
+        if err > ENCODER_PATCH_MAX_REL_L2:
+            return (
+                f"encoder output of temporal patch {i} is off by relative L2 "
+                f"{err:.3f} (allowed: {ENCODER_PATCH_MAX_REL_L2})"
+            )
+    return None
+
+
+def _mismatch(reference: GenerationResult, chunked: GenerationResult) -> str | None:
+    """Returns why `chunked` does not match `reference`, or None if it does.
+
+    Bit-exact output is the wrong bar: chunking is lossless in exact
+    arithmetic but not in bf16, and greedy decoding flips wherever the
+    reference had a near-tie. Instead:
+
+    1. Every temporal patch of the encoder output must be within
+       ENCODER_PATCH_MAX_REL_L2 of the reference's. This is what catches a
+       wrong frame order or a stale or dropped chunk: on a mostly static
+       video those barely move the generated tokens.
+    2. Up to the first differing token, every chosen token's logprob must be
+       within LOGPROB_ATOL of the reference's.
+    3. At the first differing token, the chunked run must have picked the
+       reference's runner-up, and the reference's top-2 gap there must be at
+       most NEAR_TIE_GAP. 2 and 3 check the rest of the path end to end.
+    4. After it, the continuations legitimately differ; the callers check
+       that the text still describes the video.
+
+    Args:
+        reference: Generation result from the unchunked reference run.
+        chunked: Generation result from the chunked run.
+    """
+    encoder = _encoder_mismatch(reference, chunked)
+    if encoder is not None:
+        return encoder
+    ref_tokens, out_tokens = reference.token_ids, chunked.token_ids
+    first_diff = _first_divergence(ref_tokens, out_tokens)
+    for i in range(first_diff):
+        ref_lp = dict(reference.top2_logprobs[i]).get(ref_tokens[i])
+        out_lp = dict(chunked.top2_logprobs[i]).get(out_tokens[i])
+        if ref_lp is None or out_lp is None or abs(ref_lp - out_lp) > LOGPROB_ATOL:
+            return (
+                f"logprob of generated token {i} ({ref_tokens[i]}) moved from "
+                f"{ref_lp} to {out_lp} (allowed: {LOGPROB_ATOL})"
+            )
+    if first_diff == min(len(ref_tokens), len(out_tokens)):
+        if len(ref_tokens) != len(out_tokens):
+            return f"lengths differ: {len(ref_tokens)} vs {len(out_tokens)}"
+        return None
+    ref_top2 = reference.top2_logprobs[first_diff]
+    gap = ref_top2[0][1] - ref_top2[1][1] if len(ref_top2) > 1 else float("inf")
+    is_runner_up = len(ref_top2) > 1 and ref_top2[1][0] == out_tokens[first_diff]
+    if is_runner_up and gap <= NEAR_TIE_GAP:
+        return None
+    return (
+        f"generated token {first_diff} differs ({ref_tokens[first_diff]} vs "
+        f"{out_tokens[first_diff]}) where the reference was not a near-tie: "
+        f"reference top-2 {ref_top2}, chunked token is runner-up: "
+        f"{is_runner_up}, gap {gap:.3f} (allowed: {NEAR_TIE_GAP})"
+    )
+
+
+def _assert_matches_reference(
     reference: GenerationResult, chunked: GenerationResult, label: str
 ) -> None:
-    """Asserts that chunked generation output matches reference.
+    """Asserts that chunked generation matches the reference (see _mismatch).
 
     Args:
         reference: Generation result from the unchunked reference run.
@@ -531,34 +703,14 @@ def _assert_bit_exact(
         f"{label}: prompt token ids differ between runs; the runs did not "
         f"see the same input."
     )
-    if chunked.token_ids == reference.token_ids:
-        return
-    first_diff = _first_divergence(reference.token_ids, chunked.token_ids)
-
-    # In bfloat16, Pallas flash-attention sets block_k equal to the total sequence
-    # length, which leads to minor floating-point accumulation differences across
-    # different chunk sizes (~3-5% embedding drift after 32 ViT layers). When
-    # greedy decoding encounters a near-tie between synonyms (e.g. " reading" vs
-    # " holding"), argmax can flip at that token while the surrounding generation
-    # remains semantically equivalent. Allow minor divergence if the prefix
-    # before divergence is substantial (>= 6 tokens) and token agreement over the
-    # common length is high (>= 80%).
-    min_len = min(len(reference.token_ids), len(chunked.token_ids))
-    matching_tokens = sum(
-        1
-        for r, c in zip(reference.token_ids[:min_len], chunked.token_ids[:min_len])
-        if r == c
-    )
-    token_sim = matching_tokens / max(1, min_len)
-    if first_diff >= 6 and token_sim >= 0.8:
-        return
-
-    pytest.fail(
-        f"{label}: chunked output diverges from the unchunked "
-        f"reference at generated token {first_diff}.\n"
-        f"reference: {reference.text!r}\n"
-        f"chunked:   {chunked.text!r}"
-    )
+    reason = _mismatch(reference, chunked)
+    if reason is not None:
+        pytest.fail(
+            f"{label}: chunked output does not match the unchunked reference: "
+            f"{reason}.\n"
+            f"reference: {reference.text!r}\n"
+            f"chunked:   {chunked.text!r}"
+        )
 
 
 @pytest.fixture(scope="module")
@@ -633,7 +785,7 @@ def reference_result(eager_encoder_suite: EncoderModeSuiteResult) -> GenerationR
 def test_video_inference_reference(reference_result: GenerationResult):
     """Tests that unchunked video inference produces a valid description.
 
-    Guards the baseline the exactness tests compare against: if the reference
+    Guards the baseline the chunked tests compare against: if the reference
     is garbage, matching it proves nothing.
     """
     assert reference_result.num_video_tokens > 0, (
@@ -649,34 +801,41 @@ def test_video_baseline_is_deterministic(
     reference_result: GenerationResult,
     request: pytest.FixtureRequest,
 ):
-    """Tests that two unchunked runs agree token for token.
+    """Tests that an unchunked rerun reproduces the reference.
 
-    Exact comparison against chunked runs is only meaningful if the baseline
-    reproduces itself. If this fails, a chunked mismatch below is not evidence
-    against chunking.
+    Comparing chunked runs is only meaningful if the baseline reproduces
+    itself. The eager encoder is deterministic, so its rerun must match the
+    reference exactly, logprobs included. The compiled encoder has one
+    576-token budget, so it splits this 1152-token video in half even with
+    chunking off; it is held to the chunked comparison.
     """
     suite: EncoderModeSuiteResult = request.getfixturevalue(
         "compiled_encoder_suite" if cudagraph_mm_encoder else "eager_encoder_suite"
     )
     label = f"Unchunked rerun (cudagraph_mm_encoder={cudagraph_mm_encoder})"
     rerun = suite.rerun.unwrap(label)
-    _assert_bit_exact(
-        reference_result,
-        rerun,
-        label,
-    )
+    if cudagraph_mm_encoder:
+        _assert_matches_reference(reference_result, rerun, label)
+    else:
+        assert rerun == reference_result and np.array_equal(
+            rerun.encoder_output, reference_result.encoder_output
+        ), (
+            f"{label}: the eager encoder did not reproduce the reference.\n"
+            f"reference: {reference_result.text!r}\n"
+            f"rerun:     {rerun.text!r}"
+        )
 
 
 @pytest.mark.timeout(TEST_TIMEOUT_S)
 @pytest.mark.parametrize("cudagraph_mm_encoder", [False, True])
 @pytest.mark.parametrize("budget_name", list(_BUDGETS))
-def test_video_chunking_is_bit_exact(
+def test_video_chunking_matches_reference(
     cudagraph_mm_encoder: bool,
     budget_name: str,
     reference_result: GenerationResult,
     request: pytest.FixtureRequest,
 ):
-    """Tests that chunked greedy output is identical to unchunked reference."""
+    """Tests that chunked greedy output matches the unchunked reference."""
     total_patches = reference_result.num_video_patches
     budget = _BUDGETS[budget_name](total_patches)
     assert 0 < budget < total_patches, (
@@ -694,7 +853,7 @@ def test_video_chunking_is_bit_exact(
     chunked = suite.chunked_by_budget[budget_name].unwrap(label)
 
     _assert_describes_video(chunked.text, label)
-    _assert_bit_exact(reference_result, chunked, label)
+    _assert_matches_reference(reference_result, chunked, label)
 
 
 @pytest.fixture(scope="module")
@@ -713,14 +872,14 @@ def batched_videos_and_reference(
 
 @pytest.mark.timeout(TEST_TIMEOUT_S)
 @pytest.mark.parametrize("cudagraph_mm_encoder", [False, True])
-def test_batched_videos_chunking_is_bit_exact(
+def test_batched_videos_chunking_matches_reference(
     cudagraph_mm_encoder: bool,
     batched_videos_and_reference: tuple[
         list[str], list[tuple[np.ndarray, dict[str, Any]]], list[GenerationResult]
     ],
     request: pytest.FixtureRequest,
 ):
-    """Tests that batched videos of different lengths stay bit-exact.
+    """Tests that batched videos of different lengths match their references.
 
     Covers the per-item split: when the scheduler hands both videos to one
     encoder call and their combined patches exceed the budget, the group is
@@ -753,4 +912,4 @@ def test_batched_videos_chunking_is_bit_exact(
         )
         assert ref.num_video_patches > budget, label
         _assert_describes_video(ref.text, f"Unchunked {label}")
-        _assert_bit_exact(ref, out, label)
+        _assert_matches_reference(ref, out, label)
