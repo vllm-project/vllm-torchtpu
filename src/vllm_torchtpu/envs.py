@@ -179,6 +179,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_ALLOW_FALLBACK: bool = False
     VLLM_TPU_MK_SCATTER_DEEP: bool = False
     VLLM_TPU_MK_STACKED_MAMBA_OPERANDS: bool = False
+    VLLM_TPU_MK_IO_LEAN: str = ""
     VLLM_TPU_MK_BUCKET_TUNE: bool = False
     VLLM_TPU_MK_ROW_BUCKET: bool = False
     VLLM_TPU_MK_DRAFT: bool = False
@@ -1319,6 +1320,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to the call as the walk's two stacks + a row index + the shared read offsets /
     # query_start_loc / seq_lens (6 operands instead of 5 per GDN layer). Same values.
     "VLLM_TPU_MK_STACKED_MAMBA_OPERANDS": env_bool("VLLM_TPU_MK_STACKED_MAMBA_OPERANDS"),
+    # Whole-step megakernel call: leaner operand prep around the kernel, same values bit for
+    # bit. "1" / "all" = every lever, or a comma list of: ring (each QSA layer's ring id read
+    # once from the flat table, no [requests, cols] relayout). Empty / "0": off.
+    "VLLM_TPU_MK_IO_LEAN": env_str("VLLM_TPU_MK_IO_LEAN", ""),
     # Whole-step megakernel: per-row-bucket tile / tunable overrides (BUCKET_TUNE in
     # qwen38_wholestep_call). Layout-only entries keep the bytes; see its comments.
     "VLLM_TPU_MK_BUCKET_TUNE": env_bool("VLLM_TPU_MK_BUCKET_TUNE"),

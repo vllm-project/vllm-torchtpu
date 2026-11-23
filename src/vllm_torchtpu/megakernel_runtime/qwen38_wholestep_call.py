@@ -46,6 +46,7 @@ from vllm_torchtpu.megakernel.wholestep.qsa_full_b import SEL_IDS
 from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW, UNION_STATS
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
 
+from .qwen38_io_lean import io_lean, ring_columns
 from .qwen38_scatter import scatter_gdn_ckpts_fast
 from .qwen38_segment_call import GDN_META, T_VERIFY, gdn_blocks, ring_depths, segment_tiles
 from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
@@ -732,6 +733,8 @@ def build_wholestep_call(
         tables = args[i : i + n_tab]
         i += n_tab
         positions, starts, context, trig = args[i : i + 4]
+        if io_lean("ring"):
+            tables = ring_columns(tables, context.shape[0], QSA_TABLES)
         norms = args[i + 4 : i + 4 + 2 * n_qsa]  # per QSA layer: k_norm, index k_norm (cache writer)
         rank = args[i + 4 + 2 * n_qsa :]  # main-KV DCP: the pair rank, int32 [1] per rank
         x = pad(hidden)
