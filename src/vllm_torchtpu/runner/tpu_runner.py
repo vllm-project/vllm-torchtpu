@@ -11,6 +11,7 @@ import bisect
 import contextlib
 import copy
 import dataclasses
+import itertools
 import math
 import os
 import time
@@ -776,6 +777,47 @@ def _verify_one_draw_ro_lb_impl(
 _verify_one_draw_ro_lb_compiled = _static_shape_args(
     _tpu_compile(_verify_one_draw_ro_lb_impl)
 )
+
+
+def _on_tpu(t: torch.Tensor) -> bool:
+    """Whether `t` lives on the TPU (the device-only verify read-offset paths)."""
+    return t.device.type == "tpu"
+
+
+def _ro_ingraph_structure(groups: list[torch.Tensor]) -> tuple:
+    """The width-free layout of a step's read-offset slot groups: every group
+    is [width] (per group) or [G, width] (VLLM_TPU_STAGED_WALK_STACKED), and
+    the width is the step's target_num_reqs, so serving reaches this layout
+    at each of the runner's widths. `alias[i]` is the first group that is the
+    same tensor as group i (dynamo guards on repeated inputs)."""
+    first: dict[int, int] = {}
+    alias = tuple(first.setdefault(id(g), i) for i, g in enumerate(groups))
+    return (groups[0].dtype, tuple(tuple(g.shape[:-1]) for g in groups), alias)
+
+
+def _ro_ingraph_key(
+    groups: list[torch.Tensor], call_args: tuple, logits_blocks: int
+) -> tuple:
+    """Identifies one compiled VERIFY_RO_INGRAPH program, cheaply enough to
+    check on every step: the slot groups' count, width and leading dims, the
+    verify inputs whose shapes vary by bucket, and the static args.
+    `call_args` is the one-draw verify's argument tuple."""
+    g0 = groups[0]
+    return (
+        len(groups),
+        tuple(g0.shape),
+        tuple(groups[-1].shape),
+        g0.dtype,
+        tuple(call_args[0].shape),
+        call_args[0].dtype,
+        call_args[1].shape[0],
+        call_args[2].shape[0],
+        call_args[6].shape[0],
+        tuple(call_args[7].shape),
+        call_args[-2],
+        call_args[-1],
+        logits_blocks,
+    )
 
 
 def _reset_read_offsets(
@@ -6775,6 +6817,50 @@ class TPUModelRunner(GPUModelRunner):
             candidates_only=self._sampler_candidates_only(topk_candidates),
         )
 
+    def _ro_ingraph_warmed_for(
+        self, groups: list[torch.Tensor], call_args: tuple, logits_blocks: int
+    ) -> bool:
+        """VLLM_TPU_VERIFY_RO_INGRAPH: whether this step's verify + scatter
+        program was compiled by `_precompile_verify_ro_ingraph`. Before that
+        pass has run (the real spec-decode warmup), record the slot-group
+        layout the step produced, which the pass then compiles at every
+        bucket and width, and answer no. After it, an unwarmed key logs one
+        WARNING and answers no, so the step keeps the fold/separate path
+        instead of compiling mid-serve."""
+        warmed = self.__dict__.get("_ro_ingraph_warmed")
+        if warmed is None:
+            self.__dict__.setdefault("_ro_ingraph_structures", set()).add(
+                _ro_ingraph_structure(groups)
+            )
+            self.__dict__.setdefault("_ro_ingraph_widths", set()).add(
+                int(groups[0].shape[-1])
+            )
+            return False
+        key = _ro_ingraph_key(groups, call_args, logits_blocks)
+        if key in warmed:
+            if not self.__dict__.get("_verify_ro_ingraph_logged"):
+                self._verify_ro_ingraph_logged = True
+                logger.info(
+                    "VERIFY_RO_INGRAPH: verify and the read-offset scatter in one "
+                    "program (%d slot groups of shape %s)",
+                    len(groups),
+                    [tuple(g.shape) for g in groups],
+                )
+            return True
+        missed = self.__dict__.setdefault("_ro_ingraph_missed", set())
+        if key not in missed:
+            missed.add(key)
+            logger.warning(
+                "VERIFY_RO_INGRAPH: key %s was not warmed; these steps keep the "
+                "%s path (%d unwarmed keys so far)",
+                key,
+                "eager fold"
+                if envs.VLLM_TPU_VERIFY_FUSED_READ_OFFSETS
+                else "separate scatter",
+                len(missed),
+            )
+        return False
+
     def _sample_spec_verify_fused(
         self,
         logits: torch.Tensor,
@@ -6894,17 +6980,20 @@ class TPUModelRunner(GPUModelRunner):
             and self.mamba_slot_read_offsets is not None
             and bool(ro_groups)
             and envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
-            and self.mamba_slot_read_offsets.device.type == "tpu"
+            and _on_tpu(self.mamba_slot_read_offsets)
         )
+        # With VERIFY_FUSED_READ_OFFSETS on too, the in-graph scatter takes
+        # precedence over the eager one (same values), but only at a key the
+        # warmup compiled; any other key keeps the fold/separate path rather
+        # than compiling mid-serve.
         ingraph_ro = bool(
             envs.VLLM_TPU_VERIFY_RO_INGRAPH
-            and not fold_ro
             and flat_u is not None
             and self.mamba_slot_read_offsets is not None
             and ro_groups
             and envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
-            and self.mamba_slot_read_offsets.device.type == "tpu"
-        )
+            and _on_tpu(self.mamba_slot_read_offsets)
+        ) and self._ro_ingraph_warmed_for(list(ro_groups), call_args, logits_blocks)
         if ingraph_ro and logits_blocks:
             out = _verify_one_draw_ro_lb_compiled(
                 self.mamba_slot_read_offsets,
@@ -6922,14 +7011,6 @@ class TPUModelRunner(GPUModelRunner):
                 *call_args,
             )
             self._fused_read_offsets_applied = True
-            if not getattr(self, "_verify_ro_ingraph_logged", False):
-                self._verify_ro_ingraph_logged = True
-                logger.info(
-                    "VERIFY_RO_INGRAPH: verify and the read-offset scatter in one "
-                    "program (%d slot groups of shape %s)",
-                    len(ro_groups),
-                    [tuple(g.shape) for g in ro_groups],
-                )
         elif fold_ro:
             out, row_offsets = verify(self._num_reqs_tensor(ro_num_reqs))
             # Pad/truncate to the slot groups' width and scatter eagerly, instead
@@ -9144,35 +9225,29 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(fn(*args, None, logits_blocks))
             else:
                 synchronize_tensors(fn(*args))
-            if (
-                envs.VLLM_TPU_VERIFY_RO_INGRAPH
-                and envs.VLLM_TPU_VERIFY_ONE_DRAW
-                and self.mamba_slot_read_offsets is not None
-            ):
-                # Slot-group shapes the staged walk produced at this width
-                # (recorded by the backbone warmup walks); scatter into a scratch
-                # copy so warmup leaves the live offsets untouched.
-                scratch = self.mamba_slot_read_offsets.clone()
-                for shapes in self.__dict__.get("_ro_group_shapes", {}).get(
-                    num_reqs, ()
-                ):
-                    groups = [
-                        torch.zeros(sh, dtype=torch.int32, device=self.device)
-                        for sh in shapes
-                    ]
-                    if logits_blocks:
-                        out = _verify_one_draw_ro_lb_compiled(
-                            scratch,
-                            groups,
-                            self._num_reqs_tensor(1),
-                            logits_blocks,
-                            *args,
-                        )
-                    else:
-                        out = _verify_one_draw_ro_compiled(
-                            scratch, groups, self._num_reqs_tensor(1), *args
-                        )
-                    synchronize_tensors(out)
+        if (
+            envs.VLLM_TPU_VERIFY_RO_INGRAPH
+            and envs.VLLM_TPU_VERIFY_ONE_DRAW
+            and self.mamba_slot_read_offsets is not None
+        ):
+            # The verify + scatter variant needs the slot-group layout, which
+            # only the real spec-decode warmup produces; remember this bucket
+            # (shapes and dtypes only, no device memory held) for
+            # `_precompile_verify_ro_ingraph`.
+            self.__dict__.setdefault("_ro_ingraph_buckets", []).append(
+                tuple(
+                    (tuple(t.shape), t.dtype)
+                    for t in (
+                        dummy_logits,
+                        bonus_logits_indices,
+                        target_logits_indices,
+                        draft_token_ids,
+                        draft_lengths,
+                        segment_ids,
+                        group_indices,
+                    )
+                )
+            )
         if envs.VLLM_TPU_VERIFY_ONE_DRAW and not getattr(
             self, "_verify_one_draw_stream_checked", False
         ):
@@ -9183,6 +9258,142 @@ class TPUModelRunner(GPUModelRunner):
                 tuple(draft_token_ids.shape),
                 target_logits_indices.shape[0],
             )
+
+    def _precompile_verify_ro_ingraph(self) -> None:
+        """VLLM_TPU_VERIFY_RO_INGRAPH: compile the verify + read-offset
+        scatter program at every verify bucket `_precompile_verify_fused`
+        warmed, for every slot-group layout the real spec-decode warmup
+        produced, at every width a step can have (num_reqs_max_model_len,
+        num_reqs_most_model_len). Runs after `_warmup_spec_decode`; from then
+        on a step takes the in-graph path only at a key compiled here
+        (`_ro_ingraph_warmed_for`). The scatter writes a scratch copy, so the
+        live offsets are untouched."""
+        if not (
+            envs.VLLM_TPU_VERIFY_RO_INGRAPH
+            and envs.VLLM_TPU_VERIFY_ONE_DRAW
+            and self.mamba_slot_read_offsets is not None
+        ):
+            return
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        structures = sorted(
+            self.__dict__.get("_ro_ingraph_structures", set()), key=repr
+        )
+        widths = sorted(
+            {
+                w
+                for w in (self.num_reqs_max_model_len, self.num_reqs_most_model_len)
+                if w
+            }
+            | self.__dict__.get("_ro_ingraph_widths", set())
+        )
+        buckets = list(dict.fromkeys(self.__dict__.get("_ro_ingraph_buckets", [])))
+        warmed: set = set()
+        if not structures or not buckets:
+            self._ro_ingraph_warmed = warmed
+            logger.warning(
+                "VERIFY_RO_INGRAPH: no %s seen during warmup; the in-graph path "
+                "stays off and every step keeps the fold/separate path",
+                "read-offset slot groups" if not structures else "verify buckets",
+            )
+            return
+        candidates = [0]
+        if blocks := self._topk_candidate_blocks():
+            candidates.append(blocks)
+        logits_blocks = self._sampler_logits_blocks()
+        start = time.perf_counter()
+        with self._precompile_timed("verify + read-offset scatter"):
+            scratch = self.mamba_slot_read_offsets.clone()
+            ro_num_reqs = self._num_reqs_tensor(1)
+            for bucket in buckets:
+                (
+                    dummy_logits,
+                    bonus_logits_indices,
+                    target_logits_indices,
+                    draft_token_ids,
+                    draft_lengths,
+                    segment_ids,
+                    group_indices,
+                ) = (
+                    torch.zeros(shape, dtype=dtype).to(self.device)
+                    for shape, dtype in bucket
+                )
+                num_reqs = bonus_logits_indices.shape[0]
+                temps = torch.ones((num_reqs, 1), dtype=dummy_logits.dtype).to(
+                    self.device
+                )
+                top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(self.device)
+                top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
+                u = torch.zeros(
+                    _verify_uniforms_count(
+                        num_reqs,
+                        dummy_logits.shape[-1],
+                        tuple(draft_token_ids.shape),
+                        target_logits_indices.shape[0],
+                    ),
+                    dtype=torch.float32,
+                ).to(self.device)
+                for topk_candidates in candidates:
+                    call_args = (
+                        dummy_logits,
+                        bonus_logits_indices,
+                        target_logits_indices,
+                        temps,
+                        top_k,
+                        top_p,
+                        u,
+                        draft_token_ids,
+                        draft_lengths,
+                        segment_ids,
+                        group_indices,
+                        self.rejection_sampler.synthetic_conditional_rates,
+                        self.speculative_config.num_speculative_tokens,
+                        self.rejection_sampler.synthetic_mode,
+                        topk_candidates,
+                        self._sampler_candidates_only(topk_candidates),
+                    )
+                    for (dtype, leads, alias), width in itertools.product(
+                        structures, widths
+                    ):
+                        groups: list[torch.Tensor] = []
+                        for i, lead in enumerate(leads):
+                            groups.append(
+                                groups[alias[i]]
+                                if alias[i] != i
+                                else torch.zeros((*lead, width), dtype=dtype).to(
+                                    self.device
+                                )
+                            )
+                        key = _ro_ingraph_key(groups, call_args, logits_blocks)
+                        if key in warmed:
+                            continue
+                        if logits_blocks:
+                            out = _verify_one_draw_ro_lb_compiled(
+                                scratch,
+                                groups,
+                                ro_num_reqs,
+                                logits_blocks,
+                                *call_args,
+                            )
+                        else:
+                            out = _verify_one_draw_ro_compiled(
+                                scratch, groups, ro_num_reqs, *call_args
+                            )
+                        synchronize_tensors(out)
+                        warmed.add(key)
+        self._ro_ingraph_warmed = warmed
+        logger.info(
+            "VERIFY_RO_INGRAPH warmup: %d verify + scatter programs in %.1f s "
+            "(%d verify buckets x %d top-k variants x widths %s x %d slot-group "
+            "layouts %s)",
+            len(warmed),
+            time.perf_counter() - start,
+            len(buckets),
+            len(candidates),
+            widths,
+            len(structures),
+            [(len(leads), leads[0] if leads else ()) for _, leads, _ in structures],
+        )
 
     def _log_verify_one_draw_stream(
         self,
@@ -9412,6 +9623,8 @@ class TPUModelRunner(GPUModelRunner):
                 # request would otherwise compile new graphs. Warm those
                 # through the real two-phase spec-decode path.
                 self._warmup_spec_decode()
+                # Needs the slot-group layout the real warmup above produced.
+                self._precompile_verify_ro_ingraph()
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.
