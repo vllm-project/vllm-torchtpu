@@ -1597,11 +1597,12 @@ def _patch_vllm_merge_multimodal_embeddings() -> None:
 def _patch_vllm_dp_vision_all_gather() -> None:
     """Gather data-parallel vision encoder outputs in a program of their own.
 
-    vLLM's run_dp_sharded_vision_model and run_dp_sharded_mrope_vision_model
-    all-gather each rank's encoder output right after rank-local work: ranks
-    with images run the vision tower, ranks without only pad. Eagerly on TPU
-    that collective would be fused into a different program on each rank and
-    hang the engine (see `isolated_all_gather`).
+    vLLM's run_dp_sharded_mrope_vision_model all-gathers each rank's encoder
+    output right after rank-local work: ranks with images run the vision
+    tower, ranks without only pad. Eagerly on TPU that collective would be
+    fused into a different program on each rank and hang the engine (see
+    `isolated_all_gather`). run_dp_sharded_vision_model gathers through the
+    same module attribute, so it gets the isolated all-gather too.
     """
     import vllm.model_executor.models.vision as vision
 
@@ -1609,7 +1610,9 @@ def _patch_vllm_dp_vision_all_gather() -> None:
 
     if vision.tensor_model_parallel_all_gather is not isolated_all_gather:
         vision.tensor_model_parallel_all_gather = isolated_all_gather
-        logger.info("Applied TPU patch: isolated all-gather for data-parallel ViT")
+        logger.info(
+            "Applied TPU patch: isolated all-gather for data-parallel vision encoders"
+        )
 
 
 def _patch_vllm_reset_compile_wrapper() -> None:
