@@ -24,6 +24,10 @@ TurboQuant pack's own tests' concern, and the SparseCore writers need a TPU.
 not) is the projection's, not the writer's.
 """
 
+import os
+import subprocess
+import sys
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -216,9 +220,123 @@ def test_kv_only_write_comparison_sees_one_changed_row(monkeypatch, page):
     )
 
 
-def test_write_caches_refuses_turboquant_under_dcp():
-    with pytest.raises(NotImplementedError, match="TurboQuant"):
-        _kv_only_caches(_step(), tq.make_mla_latent_tables(), dcp_size=2)
+# The DCP write needs two devices; on CPU they exist only when XLA is told so
+# before jax initializes, so the check runs in a subprocess.
+_TWO_RANK_WORKER_ENV = "MTP_KV_ONLY_TQ_TWO_RANK_WORKER"
+
+
+def test_write_caches_turboquant_dcp_two_ranks_keep_their_own_rows(request):
+    """Under DCP each rank packs the step's latents and writes exactly the
+    rows it owns: every rank's shard equals the DCP writer's golden for that
+    rank on the packed rows, and a token's row-mate survives (two 256-B
+    TurboQuant tokens share each 512-B NoPE row)."""
+    flags = os.environ.get("XLA_FLAGS", "")
+    env = dict(
+        os.environ,
+        JAX_PLATFORMS="cpu",
+        XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count=2",
+        **{_TWO_RANK_WORKER_ENV: "1"},
+    )
+    node = f"{__file__}::test_two_rank_worker"
+    plugins = [arg for p in request.config.option.plugins or () for arg in ("-p", p)]
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            *plugins,
+            node,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
+    assert "1 passed" in proc.stdout, proc.stdout[-3000:]
+
+
+if os.environ.get(_TWO_RANK_WORKER_ENV) == "1":
+
+    def test_two_rank_worker(monkeypatch):
+        _two_ranks_keep_their_own_rows(monkeypatch)
+
+
+def _two_ranks_keep_their_own_rows(monkeypatch):
+    from vllm_torchtpu.distributed.dcp import DCP_LANE_AXIS_NAME
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
+    from vllm_torchtpu.kernels.mla import kv_cache_utils
+
+    assert len(jax.devices()) >= 2, jax.devices()
+    _xla_latent_writers(monkeypatch)
+    dcp, interleave = 2, 8
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:dcp]).reshape(1, dcp),
+        (DCP_LANE_AXIS_NAME, DCP_AXIS_NAME),
+    )
+    tables = tq.make_mla_latent_tables()
+    s = _step(page=32)
+    nope_spec, rope_spec = s["specs"]
+    sharded = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec(DCP_AXIS_NAME)
+    )
+    for key, spec in (("nope", nope_spec), ("rope", rope_spec)):
+        s[key] = jax.device_put(
+            jnp.zeros((dcp * spec.shape[0], *spec.shape[1:]), spec.jax_dtype), sharded
+        )
+    idx_cache, k_packed, idx_seq_lens, idx_pages, idx_cu = _indexer_inputs()
+    idx_cache = jax.device_put(
+        jnp.zeros((dcp * idx_cache.shape[0], *idx_cache.shape[1:]), jnp.uint8), sharded
+    )
+    got_nope, got_rope, _ = mla_op.mla_kv_write_caches(
+        s["nope"],
+        s["rope"],
+        idx_cache,
+        s["kv_c"],
+        s["k_pe"],
+        k_packed,
+        s["seq_lens"],
+        s["block_tables"],
+        s["qsl"],
+        idx_seq_lens,
+        idx_pages,
+        idx_cu,
+        mla_kv_spec=s["specs"],
+        mesh=mesh,
+        kv_cache_mode="xla",
+        dcp_size=dcp,
+        interleave_size=interleave,
+        tq_tables=tables,
+    )
+    codes, rope_row = attention_interface._tq_pack_sparse_mla_latent(
+        s["kv_c"], s["k_pe"], tables
+    )
+    written = 0
+    for r in range(dcp):
+        want_nope, want_rope = kv_cache_utils.update_sparse_mla_kv_cache_dcp_jax(
+            jnp.zeros(nope_spec.shape, nope_spec.jax_dtype),
+            jnp.zeros(rope_spec.shape, rope_spec.jax_dtype),
+            codes,
+            rope_row,
+            s["seq_lens"],
+            s["block_tables"],
+            s["qsl"],
+            jnp.int32(r),
+            nope_spec=nope_spec,
+            rope_spec=rope_spec,
+            dcp_size=dcp,
+            interleave_size=interleave,
+        )
+        n0, r0 = nope_spec.shape[0], rope_spec.shape[0]
+        _same_bytes(np.asarray(got_nope)[r * n0 : (r + 1) * n0], want_nope)
+        _same_bytes(np.asarray(got_rope)[r * r0 : (r + 1) * r0], want_rope)
+        written += int(np.asarray(want_nope).view(np.uint8).any())
+    # Both ranks own some of the step's rows (positions 33..35 and 6..9 with
+    # an interleave of 8 fall on both ranks).
+    assert written == dcp
 
 
 def _tq_wrapper(dcp_size=1):
@@ -267,10 +385,25 @@ def test_write_op_without_turboquant_has_no_tables(monkeypatch):
     assert mla_op.MlaKvWriteOp(_op_wrapper(), mesh=None).tq_tables is None
 
 
-def test_write_op_refuses_turboquant_under_dcp(monkeypatch):
-    _record_jax_ops(monkeypatch)
-    with pytest.raises(NotImplementedError, match="TurboQuant"):
-        mla_op.MlaKvWriteOp(_tq_wrapper(dcp_size=2), mesh=None)
+def test_write_op_hands_turboquant_tables_under_dcp(monkeypatch):
+    """Under DCP the op still builds the latent tables and hands them to the
+    DCP-sharded write, with the DCP size and interleave."""
+    built = _record_jax_ops(monkeypatch)
+    mesh = object()
+    monkeypatch.setattr(mla_op, "get_or_create_dcp_mesh", lambda axis_name: mesh)
+    seen = {}
+
+    def writer(*args, **kwargs):
+        seen.update(kwargs)
+        return args[0], args[1], args[2]
+
+    monkeypatch.setattr(mla_op, "mla_kv_write_caches", writer)
+    op = mla_op.MlaKvWriteOp(_tq_wrapper(dcp_size=2), mesh=None)
+    (jax_op,) = built
+    jax_op.fn(*range(12))
+    assert op.tq_tables is tq.make_mla_latent_tables()
+    assert seen["tq_tables"] is op.tq_tables
+    assert seen["dcp_size"] == 2 and seen["mesh"] is mesh
 
 
 # --- On TPU: the real SparseCore writers and the compiled ops -------------

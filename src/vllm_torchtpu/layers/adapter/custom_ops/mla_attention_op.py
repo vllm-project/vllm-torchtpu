@@ -1621,10 +1621,8 @@ def mla_kv_write_caches(
 
     With `tq_tables` (a TurboQuant cache), `kv_c` is the unquantized latent
     and `k_pe` the fp8 RoPE row, and both are packed as `sparse_mla_attention`
-    packs them before its write. TurboQuant has no DCP path.
+    packs them before its write.
     """
-    if tq_tables is not None and dcp_size > 1:
-        raise NotImplementedError("MLA KV write: TurboQuant caches have no DCP path")
     nope_spec, rope_spec = mla_kv_spec
     cache_spec = sparse_mla_cache_partition_spec(dcp_size)
 
@@ -1741,15 +1739,9 @@ class MlaKvWriteOp:
             )
         self.dcp_size = dcp_size
         # A TurboQuant cache stores packed 4-bit latents; pack them as the
-        # full pass does. The TurboQuant config check refuses DCP; refusing
-        # here too fails at load rather than at the first traced write, and
-        # `mla_kv_write_caches` keeps its own check for direct callers.
+        # full pass does (under DCP too: each rank keeps only its rows).
         tq_tables = None
         if impl._is_turboquant(mla_layer):
-            if dcp_size > 1:
-                raise NotImplementedError(
-                    "MLA KV write: TurboQuant caches have no DCP path"
-                )
             tq_tables = turboquant.make_mla_latent_tables()
         self.tq_tables = tq_tables
         # The tables are passed only for a TurboQuant cache.

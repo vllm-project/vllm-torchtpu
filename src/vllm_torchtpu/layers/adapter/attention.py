@@ -2339,8 +2339,21 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         assert mesh is not None
 
         k_scale = None
-        if layer.kv_cache_quantized_dtype is not None:
+        if layer.kv_cache_quantized_dtype is not None or self._is_turboquant(layer):
             _, k_scale, _ = self._get_kv_scales(layer)
+        tq_tables = (
+            turboquant.make_mla_latent_tables() if self._is_turboquant(layer) else None
+        )
+
+        def tq_kwargs() -> dict[str, Any]:
+            # Read at trace time: the load-time Hadamard fold sets the flag
+            # after this op is built.
+            if tq_tables is None:
+                return {}
+            return {
+                "tq_tables": tq_tables,
+                "tq_prerotated": getattr(layer, "_tq_weights_rotated", False) is True,
+            }
 
         def sparse_mla_attention_core_tpu_dcp(
             kv_cache_nope: jax.Array,
@@ -2375,6 +2388,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 k_scale=k_scale,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
+                **tq_kwargs(),
             )
 
         op_name = (
