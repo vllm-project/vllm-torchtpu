@@ -843,12 +843,9 @@ class TPUWorker(WorkerBase):
 
         patch_registry.apply("model_load", model_config=self.model_config)
         self.model_runner.load_model()
-        # Materialize and wait on any deferred device weight copies, then
-        # collect cyclic references to host staging/loader buffers before
-        # returning freed allocator pages to the OS, ahead of
-        # initialize_from_config where a KV connector may allocate its host store.
-        utils.synchronize_tensors(wait=True)
-        gc.collect()
+        # The host buffers the weights were staged in are freed, but the
+        # allocator keeps their pages. Return them before initialize_from_config,
+        # where a KV connector may allocate its host store.
         _release_free_host_heap()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:

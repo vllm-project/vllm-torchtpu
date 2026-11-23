@@ -837,9 +837,6 @@ class ExpertWriteTracker:
             del self._seen[id(param)]
         return complete
 
-    def clear(self) -> None:
-        self._seen.clear()
-
 
 # Host bytes per device upload of a staged parameter.
 _UPLOAD_CHUNK_BYTES = 256 << 20
@@ -948,8 +945,6 @@ class ExpertParamStager:
         for param, _ in list(self._staged.values()):
             self.flush(param)
         self._pool.clear()
-        self._tracker.clear()
-        self.written_early.clear()
 
     def __len__(self) -> int:
         return len(self._staged)
@@ -1031,6 +1026,7 @@ def patch_moe_expert_write_staging() -> None:
         return result
 
     def process_weights_after_loading(model, model_config, target_device):
+        nonlocal stager
         during_load = stager.flushed
         stager.flush_all()
         logger.info(
@@ -1039,6 +1035,13 @@ def patch_moe_expert_write_staging() -> None:
             during_load,
             stager.flushed - during_load,
         )
+        # Weight post-processing replaces the expert parameters (e.g.
+        # layers/adapter/quantization/unquantized.py), so id(param) keys in the
+        # stager go stale once orig_process runs. Swap in a fresh stager so a
+        # later load (e.g. a draft model) starts with clean state and its own
+        # flushed count.
+        stager = ExpertParamStager()
+        calls[0] = 0
         return orig_process(model, model_config, target_device)
 
     RoutedExperts.weight_loader = weight_loader

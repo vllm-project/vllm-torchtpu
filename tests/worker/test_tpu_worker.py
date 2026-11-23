@@ -625,19 +625,11 @@ def test_kv_connector_handshake_metadata_uses_pp_tp_rank_key(
 
 
 def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
-    from vllm_torchtpu.worker import tpu_worker
-
     events = []
     config = object()
     monkeypatch.setattr(
         patch_registry, "apply", lambda stage, **kwargs: events.append((stage, kwargs))
     )
-    monkeypatch.setattr(
-        tpu_worker.utils,
-        "synchronize_tensors",
-        lambda *, wait=True: events.append(("sync", wait)),
-    )
-    monkeypatch.setattr(tpu_worker.gc, "collect", lambda: events.append("gc"))
     monkeypatch.setattr(
         "vllm_torchtpu.worker.tpu_worker._release_free_host_heap",
         lambda: events.append("release"),
@@ -647,13 +639,7 @@ def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
         model_runner=SimpleNamespace(load_model=lambda: events.append("load")),
     )
     TPUWorker.load_model(worker)
-    assert events == [
-        ("model_load", {"model_config": config}),
-        "load",
-        ("sync", True),
-        "gc",
-        "release",
-    ]
+    assert events == [("model_load", {"model_config": config}), "load", "release"]
 
 
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])
