@@ -3599,8 +3599,14 @@ class TPUModelRunner(GPUModelRunner):
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
         needs_draft_proposals: bool = True,
+        local_attn_work: int = 0,
     ) -> "tuple[int | None, int]":
-        """Return the DP-wide padded token bucket and forward chunk count."""
+        """Return the DP-wide padded token bucket and forward chunk count.
+
+        ``local_attn_work`` is this rank's sum over scheduled requests of
+        ``new_tokens * context_end`` (a proxy for the indexer's dense scoring
+        cost). It is only exchanged when ``TPU_DP_ATTN_WORK_LOG`` is set.
+        """
         self._draft_proposals_needed = needs_draft_proposals
         # Every rank reaches this point once per step, dummy steps included,
         # which is what makes a step-cadenced collection land on all of them
@@ -3621,24 +3627,39 @@ class TPUModelRunner(GPUModelRunner):
         # for `step_phase`). The vector's length is the same on every rank.
         controller = self._expert_relayout
         relayout = controller.fields() if controller is not None else (0, 0, 0)
-        t = torch.tensor(
-            [
-                int(local_num_tokens),
-                int(local_num_chunks),
-                int(local_num_reqs),
-                int(has_encoder_inputs),
-                int(needs_draft_proposals),
-                *(int(v) for v in relayout),
-                -int(local_num_tokens),
-                -int(local_num_reqs),
-            ],
-            dtype=torch.int64,
-            device="cpu",
-        )
+        fields = [
+            int(local_num_tokens),
+            int(local_num_chunks),
+            int(local_num_reqs),
+            int(has_encoder_inputs),
+            int(needs_draft_proposals),
+            *(int(v) for v in relayout),
+            -int(local_num_tokens),
+            -int(local_num_reqs),
+        ]
+        work_log = _dp_attn_work_logger()
+        if work_log is not None:
+            # One slot per DP rank: rank r writes its own values at r, the
+            # others write 0, so the MAX all-reduce hands every rank the full
+            # per-rank vectors. Same length on every rank (env is global).
+            dp_group = get_dp_group()
+            n, r = dp_group.world_size, dp_group.rank_in_group
+            tok_slots, work_slots = [0] * n, [0] * n
+            tok_slots[r], work_slots[r] = int(local_num_tokens), int(local_attn_work)
+            fields += tok_slots + work_slots
+        t = torch.tensor(fields, dtype=torch.int64, device="cpu")
         torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
         )
         self._dp_step_index += 1
+        if work_log is not None and r == 0:
+            base = len(fields) - 2 * n
+            work_log.record(
+                self._dp_step_index,
+                t[base : base + n].tolist(),
+                t[base + n : base + 2 * n].tolist(),
+                _get_padded_token_len(self.num_tokens_paddings, int(t[0].item())),
+            )
         bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
         if controller is not None:
             controller.on_step(
@@ -3801,12 +3822,20 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
             scheduler_output
         )
+        local_attn_work = 0
+        if _dp_attn_work_logger() is not None:
+            for req_id, n in scheduler_output.num_scheduled_tokens.items():
+                idx = self.input_batch.req_id_to_index.get(req_id)
+                if idx is not None:
+                    ctx = int(self.input_batch.num_computed_tokens_cpu[idx])
+                    local_attn_work += int(n) * (ctx + int(n))
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
             scheduler_output.total_num_scheduled_tokens,
             local_num_chunks,
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
             needs_draft_proposals=self._needs_draft_proposals(scheduler_output),
+            local_attn_work=local_attn_work,
         )
         self._dp_step_num_chunks = target_num_chunks
 
@@ -7695,6 +7724,46 @@ def _get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:
 def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
     res = MIN_NUM_SEQS if x <= MIN_NUM_SEQS else 1 << (x - 1).bit_length()
     return min(res, upper_limit)
+
+
+class _DpAttnWorkLog:
+    """Per-step DP-wide token / attention-work vectors, written by DP rank 0.
+
+    Enabled by ``TPU_DP_ATTN_WORK_LOG=<dir>``. One JSONL line per coordinated
+    step: wall time, step index, padded bucket, per-rank scheduled tokens and
+    per-rank ``sum(new_tokens * context_end)``. Used to quantify how unevenly
+    the context-dependent attention (indexer) work is spread across ranks
+    that advance in lockstep.
+    """
+
+    def __init__(self, directory: str):
+        self._dir = directory
+        self._f = None
+        self._n = 0
+
+    def record(self, step: int, tokens: list, work: list, bucket: int) -> None:
+        if self._f is None:
+            os.makedirs(self._dir, exist_ok=True)
+            path = os.path.join(self._dir, f"dp_attn_work-{os.getpid()}.jsonl")
+            self._f = open(path, "a", buffering=1 << 20)
+        self._f.write(
+            f'{{"t":{time.time():.4f},"s":{step},"b":{bucket},'
+            f'"tok":{tokens},"w":{work}}}\n'.replace(" ", "")
+        )
+        self._n += 1
+        if self._n % 256 == 0:
+            self._f.flush()
+
+
+_DP_ATTN_WORK_LOG: "_DpAttnWorkLog | None | bool" = False
+
+
+def _dp_attn_work_logger() -> "_DpAttnWorkLog | None":
+    global _DP_ATTN_WORK_LOG
+    if _DP_ATTN_WORK_LOG is False:
+        directory = os.environ.get("TPU_DP_ATTN_WORK_LOG", "")
+        _DP_ATTN_WORK_LOG = _DpAttnWorkLog(directory) if directory else None
+    return _DP_ATTN_WORK_LOG  # type: ignore[return-value]
 
 
 def _get_padded_token_len(paddings: list[int], x: int) -> int:
