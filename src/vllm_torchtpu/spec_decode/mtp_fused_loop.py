@@ -143,6 +143,32 @@ def mk_draft_compile_config(vllm_config: VllmConfig, inner: Any, rows_per_reques
     return cfg, sizes
 
 
+def loop_compile_config(vllm_config: VllmConfig, max_num_reqs: int, max_t: int):
+    """VLLM_TPU_DRAFT_LOOP_MAX_COMPILE_T: `(config, sizes, cap)` with the fused
+    loop's compile sizes cut to `cap`. The loop runs on one row per request,
+    padded to a token bucket (`propose`'s padded_nr), so its token count is at
+    most the bucket of `max_num_reqs`; `cap` is never below that bucket, so
+    every size the loop can run keeps its precompiled program. No open range:
+    a token count past `cap` is not traced (the caller runs the per-step loop
+    for it instead)."""
+    import copy
+
+    all_sizes = sorted(
+        int(s) for s in (vllm_config.compilation_config.compile_sizes or [])
+        if isinstance(s, int) and s > 0
+    )
+    reachable = [s for s in all_sizes if s >= max_num_reqs]
+    loop_bucket = reachable[0] if reachable else (all_sizes[-1] if all_sizes else 0)
+    cap = max(int(max_t), loop_bucket)
+    sizes = [s for s in all_sizes if s <= cap]
+    cfg = copy.copy(vllm_config)
+    cc = copy.copy(vllm_config.compilation_config)
+    cc.compile_sizes = list(sizes)
+    cc.compile_ranges_endpoints = []
+    object.__setattr__(cfg, "compilation_config", cc)
+    return cfg, sizes, cap
+
+
 def build_mtp_fused_loop(
     *,
     vllm_config: VllmConfig,
