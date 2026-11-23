@@ -221,7 +221,8 @@ FP8_OPT_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT"
 # range while the true row max stays within ~2^7 of m.
 # "msub": the same first-page shift, subtracted per score on the VALU (128-wide
 # contraction); only the per-score running max goes.
-_FP8_LEVERS = ("exp16", "bias", "lanemask", "vt", "lmxu", "mdot", "msub")
+# "mh0": with msub, no headroom and no bf16 rounding of the shift.
+_FP8_LEVERS = ("exp16", "bias", "lanemask", "vt", "lmxu", "mdot", "msub", "mh0")
 _MDOT_HEADROOM = 16.0
 
 
@@ -859,11 +860,14 @@ def _kernel(
                 s0 = jax.lax.dot_general(
                     k0, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
                 )  # [S, rows]
+                mh0 = msub_t and "mh0" in precision
                 m_new = jnp.maximum(
-                    m_prev, jnp.max(s0, axis=0, keepdims=True) + _MDOT_HEADROOM
+                    m_prev,
+                    jnp.max(s0, axis=0, keepdims=True) + (0.0 if mh0 else _MDOT_HEADROOM),
                 )
-                # The shift passes through the dot in bf16: keep that exact value.
-                m_new = m_new.astype(jnp.bfloat16).astype(jnp.float32)
+                if not mh0:
+                    # The shift passes through the dot in bf16: keep that exact value.
+                    m_new = m_new.astype(jnp.bfloat16).astype(jnp.float32)
             if mdot_t and packing == 4:
                 lane = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
                 k_aug = jnp.broadcast_to((lane == 0).astype(k.dtype), (k.shape[0], 128))
