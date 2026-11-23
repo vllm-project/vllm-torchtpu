@@ -19,6 +19,10 @@ import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -33,9 +37,14 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.minimax_m3 import sp
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
+
+logger = init_logger(__name__)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -66,6 +75,33 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
+        # Sequence-parallel stream (`sp`): the attention and FFN return TP
+        # partial sums, and forward / forward_sp reduce them.
+        self.partial_outputs = envs.TPU_MINIMAX_M3_SP_MIN_TOKENS > 0
+        if self.partial_outputs:
+            self.self_attn.o_proj.reduce_results = False
+            if self.is_moe_layer:
+                self.block_sparse_moe.experts.moe_config.skip_final_all_reduce = True
+            else:
+                self.mlp.down_proj.reduce_results = False
+        self.sp_fp8_gather = envs.TPU_MINIMAX_M3_SP_GATHER == "fp8"
+        self.sp_fp8_attn_gather = envs.TPU_MINIMAX_M3_SP_ATTN_GATHER == "fp8"
+
+    def _reduced(self, partial: torch.Tensor) -> torch.Tensor:
+        if self.partial_outputs:
+            return tensor_model_parallel_all_reduce(partial)
+        return partial
+
+    def _check_partial_outputs(self) -> None:
+        # A runner that rebuilt its MoE config after __init__ would reduce
+        # the output again; refuse to trace rather than sum it twice.
+        if self.is_moe_layer and not getattr(
+            self.block_sparse_moe.experts.moe_config, "skip_final_all_reduce", False
+        ):
+            raise RuntimeError(
+                "TPU_MINIMAX_M3_SP_MIN_TOKENS: the MoE runner lost "
+                "skip_final_all_reduce"
+            )
 
     def forward(
         self,
@@ -78,10 +114,39 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
+        if self.partial_outputs:
+            self._check_partial_outputs()
+        hidden_states = self._reduced(self.self_attn(positions, hidden_states))
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        return ffn(hidden_states), residual
+        return self._reduced(ffn(hidden_states)), residual
+
+    def forward_sp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None,
+        residual: torch.Tensor,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`forward` on the sequence-parallel stream: `hidden_states` and
+        `residual` hold this rank's tokens (None for the first layer, whose
+        residual is the embedding), as do the returned pair. num_tokens: the
+        step's token count, `input_ids.shape[0]`."""
+        self._check_partial_outputs()
+        if hidden_states is None:
+            hidden_states = self.input_layernorm(residual)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = sp.all_gather(
+            hidden_states, self.sp_fp8_attn_gather, num_tokens
+        )
+        hidden_states = sp.reduce_scatter(self.self_attn(positions, hidden_states))
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = sp.all_gather(
+            hidden_states, self.sp_fp8_gather, num_tokens
+        )
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        return sp.reduce_scatter(ffn(hidden_states)), residual
 
 
 @support_torch_compile(
@@ -106,6 +171,19 @@ class MiniMaxM3Model(nn.Module):
         # residual added, before the next norm) are also returned; set by
         # the DSpark drafter before the first trace.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+        self.sp_min_tokens = envs.TPU_MINIMAX_M3_SP_MIN_TOKENS
+        self.tp_size = get_tensor_model_parallel_world_size()
+        if self.sp_min_tokens and self.tp_size > 1:
+            logger.info(
+                "TPU_MINIMAX_M3_SP_MIN_TOKENS=%d: sequence-parallel residual "
+                "stream for steps of >= %d tokens over TP %d "
+                "(TPU_MINIMAX_M3_SP_ATTN_GATHER=%s, TPU_MINIMAX_M3_SP_GATHER=%s).",
+                self.sp_min_tokens,
+                self.sp_min_tokens,
+                self.tp_size,
+                envs.TPU_MINIMAX_M3_SP_ATTN_GATHER,
+                envs.TPU_MINIMAX_M3_SP_GATHER,
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -116,6 +194,11 @@ class MiniMaxM3Model(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        if inputs_embeds is None and sp.active(
+            positions.shape[0], self.sp_min_tokens, self.tp_size
+        ):
+            assert input_ids is not None
+            return self._forward_sp(input_ids, positions)
         if inputs_embeds is None:
             assert input_ids is not None
             inputs_embeds = self.embed_input_ids(input_ids)
@@ -128,6 +211,38 @@ class MiniMaxM3Model(nn.Module):
             if idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
+
+    def _forward_sp(
+        self, input_ids: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """`forward` on the sequence-parallel stream (`sp`). Reads the same
+        parameters and buffers as `forward`, in the same order."""
+        # The token count as the input_ids symbol: it is lifted first in both
+        # traces, so viewing the gathers with it keeps the graph inputs of the
+        # all-reduce trace (positions has its own symbol, lifted later).
+        num_tokens = input_ids.shape[0]
+        residual = sp.reduce_scatter(
+            sp.embed_partial(self.embed_tokens, input_ids), exact=True
+        )
+        hidden_states = None
+        aux_hidden_states = []
+        if 0 in self.aux_hidden_state_layers:
+            aux_hidden_states.append(sp.all_gather(residual, False, num_tokens))
+        for idx, layer in enumerate(self.layers):
+            hidden_states, residual = layer.forward_sp(
+                positions, hidden_states, residual, num_tokens
+            )
+            if idx + 1 in self.aux_hidden_state_layers:
+                aux_hidden_states.append(
+                    sp.all_gather(
+                        hidden_states + residual, False, num_tokens
+                    )
+                )
+        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = sp.all_gather(hidden_states, False, num_tokens)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states

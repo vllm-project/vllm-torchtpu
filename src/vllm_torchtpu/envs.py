@@ -277,6 +277,12 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT: str = ""
+    TPU_MINIMAX_M3_SP_MIN_TOKENS: int = 0
+    TPU_MINIMAX_M3_SP_GATHER: str = "bf16"
+    TPU_MINIMAX_M3_SP_ATTN_GATHER: str = "bf16"
+    TPU_MINIMAX_M3_SP_HIERARCHICAL: bool = False
+    TPU_MINIMAX_M3_SP_FP8_WIRE: str = "u8"
+    TPU_MINIMAX_M3_SP_SCATTER: str = "bf16"
 
 
 def env_with_choices(
@@ -1801,6 +1807,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION": env_str(
         "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION", ""
+    ),
+    # MiniMax M3 steps of at least this many tokens (and a multiple of the TP
+    # size) keep the residual stream sequence-parallel: every rank holds 1/TP
+    # of the tokens between layers, the attention and FFN partial sums are
+    # reduce-scattered instead of all-reduced, the norms run on the local
+    # tokens, and the normed tokens are all-gathered before the qkv and FFN
+    # input projections (`models.minimax_m3.sp`). 0 = off.
+    "TPU_MINIMAX_M3_SP_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_SP_MIN_TOKENS", 0
+    ),
+    # Wire format of the sequence-parallel all-gather in front of the FFN
+    # (bf16, or fp8 = e4m3 with one f32 scale per token).
+    "TPU_MINIMAX_M3_SP_GATHER": env_with_choices(
+        "TPU_MINIMAX_M3_SP_GATHER", "bf16", ["bf16", "fp8"]
+    ),
+    # The same for the all-gather in front of the attention qkv projection.
+    "TPU_MINIMAX_M3_SP_ATTN_GATHER": env_with_choices(
+        "TPU_MINIMAX_M3_SP_ATTN_GATHER", "bf16", ["bf16", "fp8"]
+    ),
+    # The sequence-parallel reduce-scatter and all-gather in two steps, over
+    # the cores of a chip and then over the chips (the order the all-reduce's
+    # SparseCore hierarchical lowering takes), instead of one flat collective
+    # over the TP group.
+    "TPU_MINIMAX_M3_SP_HIERARCHICAL": env_bool(
+        "TPU_MINIMAX_M3_SP_HIERARCHICAL", default=False
+    ),
+    # Element type the fp8 sequence-parallel gather sends: u8 / s8 (the e4m3
+    # bits bitcast) or f8 (e4m3 itself).
+    "TPU_MINIMAX_M3_SP_FP8_WIRE": env_with_choices(
+        "TPU_MINIMAX_M3_SP_FP8_WIRE", "u8", ["u8", "s8", "f8"]
+    ),
+    # Wire format of the sequence-parallel reduce-scatter: bf16 (psum_scatter)
+    # or fp8 (each rank's partial sums as e4m3 with one f32 scale per row,
+    # exchanged by an all-to-all and summed in f32 by the receiving rank).
+    "TPU_MINIMAX_M3_SP_SCATTER": env_with_choices(
+        "TPU_MINIMAX_M3_SP_SCATTER", "bf16", ["bf16", "fp8"]
     ),
 }
 

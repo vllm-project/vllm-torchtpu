@@ -6175,6 +6175,10 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.distributed import pallas_all_reduce
 
             pallas_all_reduce.arm(self.model_config.get_hidden_size(), self.device)
+        if envs.TPU_MINIMAX_M3_SP_MIN_TOKENS > 0:
+            from vllm_torchtpu.models.minimax_m3 import sp as minimax_m3_sp
+
+            minimax_m3_sp.arm()
 
     def load_lora_model(
         self,
