@@ -201,6 +201,7 @@ if TYPE_CHECKING:
     TPU_GC_COLLECT_EVERY: int = 500
     TPU_GC_TRACE: bool = False
     VLLM_TPU_PREFIX_KEEP_SWA_TAIL: bool = False
+    VLLM_TPU_ENGRAM_GATHER_THREADS: int = 2
 
 
 def env_with_choices(
@@ -1266,6 +1267,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prompt's last block boundary, so the next turn's prefix hit there adopts
     # them and skips the replay (core/prefix_swa_tail.py).
     "VLLM_TPU_PREFIX_KEEP_SWA_TAIL": env_bool("VLLM_TPU_PREFIX_KEEP_SWA_TAIL"),
+    # Copy threads per host Engram row gather, the caller included.
+    "VLLM_TPU_ENGRAM_GATHER_THREADS": env_int("VLLM_TPU_ENGRAM_GATHER_THREADS", 2),
 }
 
 
