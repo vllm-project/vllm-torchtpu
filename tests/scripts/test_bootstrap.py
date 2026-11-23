@@ -104,9 +104,10 @@ def _expand_env(text: str, env: Mapping[str, str]) -> str:
 
 
 # The uploads of a lane in TPU_GENERATION_FILES, as _RunRecorder tags them: one
-# per default generation (v7x). CI_TPU_GENERATIONS=all adds v6e's, first, so
+# per default generation (v7x). The all-tpu-generations extra adds v6e's, first, so
 # v7x's still shows (and queues) first.
 _TESTS = ("tests:v7x",)
+_ALL = "all-tpu-generations"
 
 
 # (extras, actor, error) as returned by `_merge_queue_pr_extras`.
@@ -459,7 +460,8 @@ class TestBootstrapUnits(unittest.TestCase):
         for shape_var in ("KUBE_SHAPE_SINGLE", "KUBE_SHAPE_MULTI"):
             with self.assertRaisesRegex(
                 bp.BootstrapError,
-                rf"ERROR: {shape_var} was removed; .* Set CI_TPU_GENERATIONS=all ",
+                rf"ERROR: {shape_var} was removed; .* "
+                r"Set CI_EXTRAS=all-tpu-generations ",
             ):
                 ctx({shape_var: "ct6e-standard-1t/1x1"})
 
@@ -1399,7 +1401,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     {
                         "JOB_PRIORITY": "6",
                         "BUILDKITE_STEP_KEY": "upload_stage_1",
-                        "CI_TPU_GENERATIONS": "all",
+                        "CI_EXTRAS": "all-tpu-generations",
                     },
                     repo_root=_REPO_ROOT,
                 ),
@@ -2163,14 +2165,14 @@ class TestBootstrapUnits(unittest.TestCase):
             )
         self.assertEqual(set(scanned.stdout.split()), report_deps)
 
-    def test_ci_tpu_generations(self) -> None:
+    def test_all_tpu_generations_extra(self) -> None:
         bp = self.bp
         gens = bp.tpu_generations
         self.assertEqual(
             [bp._and_list(items) for items in ([], ["a"], ["a", "b"], ["a", "b", "c"])],
             ["", "a", "a and b", "a, b and c"],
         )
-        # `all` sends the tests lane up once per generation it lists, v6e's
+        # The extra sends the tests lane up once per generation it lists, v6e's
         # first so v7x's still shows (and queues) first, and says so. (Unset,
         # v7x alone: _TESTS in the tests above.) A PR build passes it on to its
         # second stage's uploader, whose uploads these are.
@@ -2185,59 +2187,139 @@ class TestBootstrapUnits(unittest.TestCase):
             ({"BUILDKITE_PULL_REQUEST": "42"}, ["verify", "integration", *both]),
         ):
             with self.subTest(env=env):
-                rec = self._run_bootstrap({"CI_TPU_GENERATIONS": "all", **env})
+                rec = self._run_bootstrap({"CI_EXTRAS": _ALL, **env})
                 self.assertEqual(
                     _tpu_generations_note(rec),
                     (
                         "info",
                         "Also runs the TPU v6e steps of the tests lane "
-                        "(`CI_TPU_GENERATIONS=all`).",
+                        "(extra `all-tpu-generations`).",
                     ),
                 )
                 if "BUILDKITE_PULL_REQUEST" in env:
                     rec = self._run_next_stage(rec)
                 self.assertEqual([u[0] for u in rec.uploads], uploads)
 
-        # Once every generation is a default, `all` adds none and says nothing.
+        # Once every generation is a default, the extra adds none and says nothing.
         every = (gens.TPU_V6E, gens.TPU_V7X)
         with mock.patch.object(gens, "DEFAULT_TPU_GENERATIONS", every):
-            rec = self._run_bootstrap({"CI_TPU_GENERATIONS": "all"})
+            rec = self._run_bootstrap({"CI_EXTRAS": _ALL})
         self.assertEqual([u[0] for u in rec.uploads], with_both)
         self.assertNotIn("ci-tpu-generations", [c for _, c, _ in rec.annotations])
 
-        # Refused with an error annotation, before any upload: an unknown value
-        # (a generation's name is not one), and a build none of whose lanes is
-        # in TPU_GENERATION_FILES, which would ignore it.
-        for env in (
-            {"CI_TPU_GENERATIONS": "v6e"},
+        # Refused with an error annotation, before any upload: a build none of
+        # whose lanes is in TPU_GENERATION_FILES, which would ignore it.
+        refused = self._run_bootstrap(
             {
-                "CI_TPU_GENERATIONS": "all",
+                "CI_EXTRAS": _ALL,
                 "BUILDKITE_PULL_REQUEST": "42",
                 "BUILDKITE_PULL_REQUEST_LABELS": "skip-tpu-ci",
             },
-        ):
-            with self.subTest(env=env):
-                refused = self._run_bootstrap(env, raises=bp.BootstrapError)
-                self.assertEqual(
-                    refused.annotations[-1][:2], ("error", "ci-tpu-generations")
-                )
-                self.assertEqual(refused.uploads, [])
-        # An uploader run by hand refuses an unknown value too, before anything
-        # (even the next stage's uploader) goes up.
+            raises=bp.BootstrapError,
+        )
+        self.assertEqual(refused.annotations[-1][:2], ("error", "ci-tpu-generations"))
+        self.assertEqual(refused.uploads, [])
+        # A generation's name is not an extra: CI_EXTRAS refuses it, and so does
+        # an uploader run by hand, before anything (even the next stage's
+        # uploader) goes up.
+        refused = self._run_bootstrap({"CI_EXTRAS": "v6e"}, raises=bp.BootstrapError)
+        self.assertEqual(refused.uploads, [])
         by_hand = _RunRecorder(bp)
         with (
             mock.patch.object(bp, "_agent", side_effect=by_hand.agent),
             contextlib.redirect_stdout(by_hand.stdout_buf),
-            self.assertRaises(bp.BootstrapError),
+            self.assertRaisesRegex(bp.BootstrapError, "CI_EXTRAS names 'v6e'"),
         ):
             bp.upload_stages(
                 (("build", "cpu"), ("tests",)),
-                {"CI_TPU_GENERATIONS": "v6e"},
+                {"CI_EXTRAS": "v6e"},
                 repo_root=_REPO_ROOT,
             )
         self.assertEqual(by_hand.uploads, [])
-        with self.assertRaises(bp.BootstrapError):
-            bp.upload_generations(".buildkite/pipeline_tests.yml", "v6e")
+        # The merge queue cannot ask for it: v6e's steps are expected to fail.
+        self.assertIn(_ALL, bp._VALID_CI_EXTRAS)
+        self.assertNotIn(_ALL, bp._VALID_MERGE_EXTRAS)
+
+        # tpu-v6e-only sends the tests lane up for v6e alone, and says so. A PR
+        # build passes it on to its second stage's uploader, whose uploads
+        # these are.
+        v6e_only = gens.TPU_V6E_ONLY_EXTRA
+        for env, uploads in (
+            ({}, ["verify", "integration", "tests:v6e", "cpu", "build"]),
+            ({"BUILDKITE_PULL_REQUEST": "42"}, ["verify", "integration", "tests:v6e"]),
+        ):
+            with self.subTest(env=env):
+                rec = self._run_bootstrap({"CI_EXTRAS": v6e_only, **env})
+                self.assertEqual(
+                    _tpu_generations_note(rec),
+                    (
+                        "info",
+                        "Runs only the TPU v6e steps of the tests lane "
+                        "(extra `tpu-v6e-only`).",
+                    ),
+                )
+                if "BUILDKITE_PULL_REQUEST" in env:
+                    rec = self._run_next_stage(rec)
+                self.assertEqual([u[0] for u in rec.uploads], uploads)
+        self.assertEqual(
+            bp.upload_generations(".buildkite/pipeline_tests.yml", (v6e_only,)),
+            (gens.TPU_V6E,),
+        )
+        # Refused, before any upload, on a build that runs the nightly report,
+        # which waits on v7x's steps; and together with the other generation
+        # extra, which it contradicts.
+        for env in ({"NIGHTLY": "1"}, {"BUILDKITE_TAG": "nightly-20261105"}):
+            with self.subTest(env=env):
+                refused = self._run_bootstrap(
+                    {"CI_EXTRAS": v6e_only, **env}, raises=bp.BootstrapError
+                )
+                self.assertEqual(
+                    refused.annotations[-1][:2], ("error", "ci-tpu-generations")
+                )
+                self.assertIn("leaves out TPU v7x", refused.annotations[-1][2])
+                self.assertEqual(refused.uploads, [])
+        with self.assertRaisesRegex(bp.BootstrapError, "name one at most"):
+            bp._parse_ci_extras(f"{_ALL},{v6e_only}")
+        self.assertNotIn(v6e_only, bp._VALID_MERGE_EXTRAS)
+
+        # Neither extra runs where a failing v6e step would block a release
+        # (ci_gate.py) or the LKG promotion: refused, before any upload.
+        for extra in gens.TPU_GENERATION_EXTRAS:
+            for env in (
+                {"BUILDKITE_BRANCH": "releases/v0.32.0"},
+                {"BUILDKITE_TAG": "v0.32.0"},
+                {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"},
+            ):
+                with self.subTest(extra=extra, env=env):
+                    refused = self._run_bootstrap(
+                        {"CI_EXTRAS": extra, **env}, raises=bp.BootstrapError
+                    )
+                    self.assertEqual(
+                        refused.annotations[-1][:2], ("error", "ci-tpu-generations")
+                    )
+                    self.assertIn(
+                        "refused on a merge-queue, release or integration build",
+                        refused.annotations[-1][2],
+                    )
+                    self.assertEqual(refused.uploads, [])
+        # Nor would a failing one block the merge queue: a queue build takes
+        # its extras from the /ci merge marker, so CI_EXTRAS does not reach its
+        # tests lane, which goes up for v7x alone.
+        for extra in gens.TPU_GENERATION_EXTRAS:
+            with self.subTest(extra=extra, build="merge-queue"):
+                rec = self._run_bootstrap(
+                    {
+                        "CI_EXTRAS": extra,
+                        "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
+                        "BUILDKITE_PULL_REQUEST": "123",
+                    }
+                )
+                self.assertNotIn(
+                    "ci-tpu-generations", [c for _, c, _ in rec.annotations]
+                )
+                rec = self._run_next_stage(rec)
+                self.assertIn("tests:v7x", [u[0] for u in rec.uploads])
+                self.assertNotIn("tests:v6e", [u[0] for u in rec.uploads])
 
     def test_stamped_upload_fails_closed(self) -> None:
         bp = self.bp
@@ -2339,7 +2421,7 @@ class TestBootstrapUnits(unittest.TestCase):
 
     def test_generations_keep_their_steps_apart(self) -> None:
         # A nightly build with every generation, which has the most steps.
-        rec = self._run_bootstrap({"CI_TPU_GENERATIONS": "all", "NIGHTLY": "1"})
+        rec = self._run_bootstrap({"CI_EXTRAS": _ALL, "NIGHTLY": "1"})
         uploaded: dict[str, list[dict[str, Any]]] = {}
         for tag, content, _ in rec.uploads:
             for step in yaml.safe_load(content)["steps"]:

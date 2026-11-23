@@ -22,7 +22,7 @@ the file names no generation, and adding one renames no step of the others.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -74,17 +74,32 @@ TPU_V6E = TpuGeneration(
 TPU_GENERATION_FILES: Mapping[str, tuple[TpuGeneration, ...]] = {
     ".buildkite/pipeline_tests.yml": (TPU_V6E, TPU_V7X),
 }
-# The generations those files go up for when CI_TPU_GENERATIONS is unset.
+# The generations those files go up for without ALL_TPU_GENERATIONS_EXTRA.
 DEFAULT_TPU_GENERATIONS: tuple[TpuGeneration, ...] = (TPU_V7X,)
 # The generation whose nightly tests-lane steps a verified commit pair needs
 # passed. pipeline_verify.yml's nightly report waits on those steps by key, and
 # nightly_report.sh asks for the key prefix (`bootstrap.py verified-key-prefix`).
 VERIFIED_TPU_GENERATION = TPU_V7X
-# CI_TPU_GENERATIONS=all sends those files up for every generation they list,
-# side by side, on any build. The generation brings its shapes, so the build
-# names no KUBE_SHAPE_* of its own. The variable is not named TPU_VERSION
-# because that names one chip to the scripts and model files that read it.
-CI_TPU_GENERATIONS_ALL = "all"
+# The build extras (CI_EXTRAS, bootstrap.py) that change which generations
+# those files go up for; a build names one at most. ALL_TPU_GENERATIONS_EXTRA
+# sends them up for every generation they list, side by side, and
+# TPU_V6E_ONLY_EXTRA for v6e alone, which leaves out
+# VERIFIED_TPU_GENERATION and so is refused on a build that runs the nightly
+# report. The generation brings its shapes, so the build names no
+# KUBE_SHAPE_* of its own.
+ALL_TPU_GENERATIONS_EXTRA = "all-tpu-generations"
+TPU_V6E_ONLY_EXTRA = "tpu-v6e-only"
+TPU_GENERATION_EXTRAS = (ALL_TPU_GENERATIONS_EXTRA, TPU_V6E_ONLY_EXTRA)
+
+
+def picked_generations(
+    generations: Sequence[TpuGeneration], extras: Collection[str]
+) -> tuple[TpuGeneration, ...]:
+    """The `generations` a file lists that a build with `extras` runs it on."""
+    if ALL_TPU_GENERATIONS_EXTRA in extras:
+        return tuple(generations)
+    wanted = (TPU_V6E,) if TPU_V6E_ONLY_EXTRA in extras else DEFAULT_TPU_GENERATIONS
+    return tuple(gen for gen in generations if gen in wanted)
 
 
 def _own_steps(steps: Sequence[Any]) -> list[dict[str, Any]]:

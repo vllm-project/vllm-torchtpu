@@ -36,7 +36,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -62,8 +62,12 @@ _MQ_EXTRAS_RETRY_SECONDS = 10
 _PR_FETCH_DEPTHS = (20, 200, 1000)
 _LABEL_EXTRAS = {"run-perf-eval": "perf-eval", "run-full-ci": "nightly-suite"}
 _PR_SUITE_LABELS = ("skip-tpu-ci", *_LABEL_EXTRAS)
-_VALID_CI_EXTRAS = frozenset(_LABEL_EXTRAS.values())
-_VALID_MERGE_EXTRAS = _VALID_CI_EXTRAS | {"precheck-only"}
+# The TPU generation extras are not merge extras: their v6e steps are expected
+# to fail, so a merge-queue build never runs them.
+_VALID_CI_EXTRAS = frozenset(
+    (*_LABEL_EXTRAS.values(), *tpu_generations.TPU_GENERATION_EXTRAS)
+)
+_VALID_MERGE_EXTRAS = frozenset((*_LABEL_EXTRAS.values(), "precheck-only"))
 _PR_NUM_RE = re.compile(r"^[0-9]+$")
 _MQ_BRANCH_PR_RE = re.compile(r"^gh-readonly-queue/.+/pr-([0-9]+)-[^/]+$")
 _CI_MERGE_MARKER_RE = re.compile(
@@ -89,6 +93,24 @@ def _env_or(env: Mapping[str, str], key: str, default: str) -> str:
 
 def _split_labels(raw: str) -> tuple[str, ...]:
     return tuple(item for item in raw.split(",") if item)
+
+
+def _parse_ci_extras(raw: str) -> tuple[str, ...]:
+    """Split CI_EXTRAS; raise BootstrapError for a name not in _VALID_CI_EXTRAS,
+    or for more than one TPU generation extra."""
+    extras = tuple(p.strip() for p in raw.split(",") if p.strip())
+    bad_extra = next((e for e in extras if e not in _VALID_CI_EXTRAS), None)
+    if bad_extra is not None:
+        raise BootstrapError(
+            f"ERROR: CI_EXTRAS names '{bad_extra}'; "
+            f"valid extras are: {', '.join(sorted(_VALID_CI_EXTRAS))}"
+        )
+    picked = [e for e in tpu_generations.TPU_GENERATION_EXTRAS if e in extras]
+    if len(picked) > 1:
+        raise BootstrapError(
+            f"ERROR: CI_EXTRAS names {_and_list(picked)}; name one at most"
+        )
+    return extras
 
 
 def _and_list(items: Sequence[str]) -> str:
@@ -129,9 +151,6 @@ class BuildContext:
     ci_pr_push_cpu_only: bool = False
     ci_extras: tuple[str, ...] = ()
     mq_extras: tuple[str, ...] = ()
-    # CI_TPU_GENERATIONS: empty runs DEFAULT_TPU_GENERATIONS, and
-    # CI_TPU_GENERATIONS_ALL every generation (see tpu_generations_note).
-    ci_tpu_generations: str = ""
 
     @property
     def is_pr(self) -> bool:
@@ -248,18 +267,12 @@ class BuildContext:
             if env.get(shape_var, "").strip():
                 raise BootstrapError(
                     f"ERROR: {shape_var} was removed; each TPU generation brings "
-                    "its own shapes. Set CI_TPU_GENERATIONS="
-                    f"{tpu_generations.CI_TPU_GENERATIONS_ALL} to run every generation"
+                    "its own shapes. Set CI_EXTRAS="
+                    f"{tpu_generations.ALL_TPU_GENERATIONS_EXTRA} to run every "
+                    f"generation, or {tpu_generations.TPU_V6E_ONLY_EXTRA} to run "
+                    "v6e alone"
                 )
-        ci_extras = tuple(
-            p.strip() for p in env.get("CI_EXTRAS", "").split(",") if p.strip()
-        )
-        bad_extra = next((e for e in ci_extras if e not in _VALID_CI_EXTRAS), None)
-        if bad_extra is not None:
-            raise BootstrapError(
-                f"ERROR: CI_EXTRAS names '{bad_extra}'; "
-                "valid extras are: perf-eval, nightly-suite"
-            )
+        ci_extras = _parse_ci_extras(env.get("CI_EXTRAS", ""))
         pr_raw = _env_or(env, "BUILDKITE_PULL_REQUEST", "false")
         pull_request = None if pr_raw == "false" else pr_raw
         mq_base_branch = env.get("BUILDKITE_MERGE_QUEUE_BASE_BRANCH", "")
@@ -305,7 +318,6 @@ class BuildContext:
             ci_precheck=ci_precheck,
             ci_pr_push_cpu_only=ci_pr_push_cpu_only,
             ci_extras=ci_extras,
-            ci_tpu_generations=env.get("CI_TPU_GENERATIONS", "").strip(),
         )
 
 
@@ -382,15 +394,6 @@ _PR_SUITES: dict[str, Suite] = {
 }
 
 
-def _check_ci_tpu_generations(value: str) -> None:
-    """Raise `BootstrapError` unless `value` is empty or CI_TPU_GENERATIONS_ALL."""
-    if value and value != tpu_generations.CI_TPU_GENERATIONS_ALL:
-        raise BootstrapError(
-            f"ERROR: unknown CI_TPU_GENERATIONS '{value}'; the only value is "
-            f"{tpu_generations.CI_TPU_GENERATIONS_ALL}"
-        )
-
-
 def choose_suite(ctx: BuildContext) -> Suite:
     """Return the `Suite` for `ctx`; `CI_SUITE` takes precedence."""
     if ctx.suite_override:
@@ -415,48 +418,80 @@ def choose_suite(ctx: BuildContext) -> Suite:
 
 
 def tpu_generations_note(ctx: BuildContext, suite: Suite) -> str | None:
-    """Check CI_TPU_GENERATIONS against the build; return its annotation, if any.
+    """Check the build's TPU generation extra; return its annotation, if any.
 
-    Unset runs DEFAULT_TPU_GENERATIONS, and CI_TPU_GENERATIONS_ALL every
-    generation a lane lists, on any build (see upload_generations).
+    Without one a lane runs DEFAULT_TPU_GENERATIONS; ALL_TPU_GENERATIONS_EXTRA
+    adds every other generation the lane lists, and TPU_V6E_ONLY_EXTRA runs v6e
+    alone (see upload_generations).
 
-    Raises BootstrapError for an unknown value, or a value that no lane of the
-    build can use. Returns None when the value is unset or
-    CI_TPU_GENERATIONS_ALL adds nothing beyond the defaults.
+    Raises BootstrapError on a merge-queue, release or integration build, whose
+    failures block a merge, a release (release/ci_gate.py) or the LKG
+    promotion (pipeline_promote.yml's `wait`), since v6e's steps do not pass
+    yet and are not soft_fail; when no lane of the build can use the extra; or
+    when it leaves out VERIFIED_TPU_GENERATION on a build that runs the nightly
+    report, which waits on that generation's steps. Returns None when the
+    build names no such extra or it changes nothing.
     """
-    value = ctx.ci_tpu_generations
-    if not value:
+    gens = tpu_generations
+    name = next((e for e in gens.TPU_GENERATION_EXTRAS if e in ctx.extras), None)
+    if name is None:
         return None
-    _check_ci_tpu_generations(value)
-    files = tpu_generations.TPU_GENERATION_FILES
+    # A merge-queue build's extras come from its /ci merge marker, which cannot
+    # name this one; checked anyway, so the rule does not rest on that.
+    if ctx.is_merge_queue or ctx.is_release or ctx.is_integration:
+        raise BootstrapError(
+            f"ERROR: the {name} extra runs TPU {gens.TPU_V6E.name} steps, which "
+            "do not pass yet and are not soft_fail; it is refused on a "
+            "merge-queue, release or integration build"
+        )
+    files = gens.TPU_GENERATION_FILES
     lanes = [lane for stage in suite.stages for lane in stage]
     # Each lane of the build in TPU_GENERATION_FILES, with the generations its
     # file lists.
     in_build = {
-        lane: gens
+        lane: listed
         for lane in lanes
-        if (gens := files.get(f".buildkite/pipeline_{lane}.yml"))
+        if (listed := files.get(f".buildkite/pipeline_{lane}.yml"))
     }
     if not in_build:
         per_generation = [pathlib.Path(p).stem.removeprefix("pipeline_") for p in files]
         raise BootstrapError(
-            f"ERROR: CI_TPU_GENERATIONS={value} picks the TPU generations of the "
+            f"ERROR: the {name} extra picks the TPU generations of the "
             f"{_lanes_phrase(per_generation)}, and this build runs none"
         )
-    extra = list(
-        dict.fromkeys(
-            gen
-            for gens in in_build.values()
-            for gen in gens
-            if gen not in tpu_generations.DEFAULT_TPU_GENERATIONS
+    picked = {
+        lane: gens.picked_generations(listed, ctx.extras)
+        for lane, listed in in_build.items()
+    }
+    # pipeline_verify.yml runs the nightly report on a NIGHTLY=1 or tag build.
+    runs_report = "verify" in lanes and (
+        ctx.nightly_env or suite.nightly or ctx.is_release or bool(ctx.tag)
+    )
+    verified = gens.VERIFIED_TPU_GENERATION
+    if runs_report and any(verified not in p for p in picked.values()):
+        raise BootstrapError(
+            f"ERROR: the {name} extra leaves out TPU {verified.name}, whose "
+            "steps the nightly report of this NIGHTLY=1 or release build waits "
+            f"on; use {gens.ALL_TPU_GENERATIONS_EXTRA} instead"
         )
+    defaults = gens.DEFAULT_TPU_GENERATIONS
+    if name == gens.TPU_V6E_ONLY_EXTRA:
+        runs = [lane for lane, p in picked.items() if p != tuple(defaults)]
+        if not runs:
+            return None
+        return (
+            f"Runs only the TPU {gens.TPU_V6E.name} steps of the "
+            f"{_lanes_phrase(runs)} (extra `{name}`)."
+        )
+    extra = list(
+        dict.fromkeys(gen for p in picked.values() for gen in p if gen not in defaults)
     )
     if not extra:
         return None
-    runs = [lane for lane, gens in in_build.items() if any(g in gens for g in extra)]
+    runs = [lane for lane, p in picked.items() if any(g in p for g in extra)]
     return (
         f"Also runs the TPU {_and_list([g.name for g in extra])} steps of the "
-        f"{_lanes_phrase(runs)} (`CI_TPU_GENERATIONS={value}`)."
+        f"{_lanes_phrase(runs)} (extra `{name}`)."
     )
 
 
@@ -986,24 +1021,20 @@ def upload_with_priority(
 
 
 def upload_generations(
-    path: str, ci_tpu_generations: str = ""
+    path: str, extras: Collection[str] = ()
 ) -> tuple[tpu_generations.TpuGeneration | None, ...]:
     """Return the TPU generation of each upload of `path`, in upload order.
 
-    A file in TPU_GENERATION_FILES goes up once per generation in
-    DEFAULT_TPU_GENERATIONS, and with CI_TPU_GENERATIONS_ALL, once per
-    generation it lists; an unknown `ci_tpu_generations` is refused. Any other
-    file goes up once, for no generation (None), whatever `ci_tpu_generations`
-    is.
+    A file in TPU_GENERATION_FILES goes up once per generation the build's
+    `extras` pick (tpu_generations.picked_generations): DEFAULT_TPU_GENERATIONS
+    without a TPU generation extra. Any other file goes up once, for no
+    generation (None), whatever `extras` are.
     """
     if path not in tpu_generations.TPU_GENERATION_FILES:
         return (None,)
-    _check_ci_tpu_generations(ci_tpu_generations)
-    generations = tpu_generations.TPU_GENERATION_FILES[path]
-    if ci_tpu_generations != tpu_generations.CI_TPU_GENERATIONS_ALL:
-        defaults = tpu_generations.DEFAULT_TPU_GENERATIONS
-        generations = tuple(gen for gen in generations if gen in defaults)
-    return generations
+    return tpu_generations.picked_generations(
+        tpu_generations.TPU_GENERATION_FILES[path], extras
+    )
 
 
 def upload_stages(
@@ -1018,8 +1049,8 @@ def upload_stages(
     The `wait` step gates `rest` on every step uploaded in `stages[0]` (including
     both Docker image builds in `pipeline_build.yml`, such as `-omni`, and all
     `pipeline_cpu.yml` checks); a retried uploader skips lanes it already uploaded.
-    A file in TPU_GENERATION_FILES goes up once per generation
-    CI_TPU_GENERATIONS picks (see upload_generations).
+    A file in TPU_GENERATION_FILES goes up once per generation the build's
+    CI_EXTRAS picks (see upload_generations).
     """
     for stage in stages:
         for lane in stage:
@@ -1035,16 +1066,10 @@ def upload_stages(
     job_priority = int(_env_or(child_env, "JOB_PRIORITY", str(PRIORITIES["other"][0])))
     nightly = _env_or(child_env, "NIGHTLY", "0") == "1"
     concurrency_group = child_env.get("PR_TPU_CONCURRENCY_GROUP") or None
-    # Checked by run_bootstrap, and passed on to a later stage's uploader in its
-    # step env below. Checked again here, before anything goes up, for an
-    # uploader run by hand.
-    ci_tpu_generations = child_env.get("CI_TPU_GENERATIONS", "").strip()
-    if any(
-        f".buildkite/pipeline_{lane}.yml" in tpu_generations.TPU_GENERATION_FILES
-        for stage in stages
-        for lane in stage
-    ):
-        _check_ci_tpu_generations(ci_tpu_generations)
+    # The build's extras as run_bootstrap resolved them, passed on to a later
+    # stage's uploader in its step env below. Checked again here, before
+    # anything goes up, for an uploader run by hand.
+    extras = _parse_ci_extras(child_env.get("CI_EXTRAS", ""))
 
     # Buildkite inserts each `pipeline upload` right after the currently running
     # step (LIFO), so upload `wait` + the next-stage uploader first and then
@@ -1072,8 +1097,8 @@ def upload_stages(
         step_env = {
             k: child_env[k]
             for k in (
+                "CI_EXTRAS",
                 "CI_FLEET",
-                "CI_TPU_GENERATIONS",
                 "JOB_PRIORITY",
                 "NIGHTLY",
                 "PR_TPU_CONCURRENCY_GROUP",
@@ -1114,7 +1139,7 @@ def upload_stages(
         # A file in TPU_GENERATION_FILES goes up once per generation, each with
         # its own record, so a retried uploader sends up only the ones it has
         # not: Buildkite rejects a step key uploaded twice.
-        for generation in upload_generations(lane_file, ci_tpu_generations):
+        for generation in upload_generations(lane_file, extras):
             upload = f"{lane}:{generation.name}" if generation else lane
             meta_key = f"upload-stages:{stage_key}:{upload}"
             if (
@@ -1328,9 +1353,13 @@ def run_bootstrap(
             env=child_env,
         )
 
-    # 5. Env exports (NIGHTLY, OMNI_IMAGE_SKIP, PR_TPU_CONCURRENCY_GROUP).
+    # 5. Env exports (NIGHTLY, CI_EXTRAS, OMNI_IMAGE_SKIP, PR_TPU_CONCURRENCY_GROUP).
     if nightly:
         child_env["NIGHTLY"] = "1"
+    # upload_stages, here and in a later stage's uploader, reads the generations
+    # from CI_EXTRAS, so it gets the extras resolved above: a merge-queue
+    # build's come from its /ci merge marker, never from CI_EXTRAS.
+    child_env["CI_EXTRAS"] = ",".join(sorted(ctx.extras & _VALID_CI_EXTRAS))
     # pipeline_build.yml skips the -omni image build when this is non-empty.
     # Buildkite rejects the upload if a skip reason is over 70 characters.
     has_tests = any("tests" in stage for stage in suite.stages)

@@ -18,23 +18,33 @@ releases the `wait` once the retry passes and runs the uploader step. The
 `oncall-fix` label raises job and Kueue workload priority without changing the
 suite.
 
-By default, the `tests` lane's TPU steps run only on TPU v7x. To also run them
-on TPU v6e, start a build with the environment variable
-`CI_TPU_GENERATIONS=all` (set it in the Buildkite UI or API). The build then
-runs each of those steps twice, once on each chip, and shows the two sets side
-by side. Any other value is rejected, and so is a build that sets
-`KUBE_SHAPE_SINGLE` or `KUBE_SHAPE_MULTI`: the generation brings its shapes.
+By default, the `tests` lane's TPU steps run only on TPU v7x. A build picks
+other chips with one of these extras in `CI_EXTRAS` (set it in the Buildkite UI
+or API, alone or with another extra, e.g.
+`CI_EXTRAS=perf-eval,all-tpu-generations`):
 
-The v6e steps do not pass yet, and they are not `soft_fail`, so a build with
-`CI_TPU_GENERATIONS=all` is expected to fail: for one, the `tests_omni` tests
-are not qualified for v6e's 32 GB of HBM. No build has to set it. Use it on a
-manual build to see where v6e stands, and not on a merge-queue, release or
-integration build.
+| `CI_EXTRAS` | The `tests` lane's TPU steps run on |
+|---|---|
+| neither extra | v7x |
+| `all-tpu-generations` | v6e and v7x, each step twice, side by side |
+| `tpu-v6e-only` | v6e alone |
 
-`CI_TPU_GENERATIONS` chooses the chips for the `tests` lane only. A build with
+A build names one of the two at most. `tpu-v6e-only` is refused on a build
+that runs the nightly report (`NIGHTLY=1` or a tag), which waits on the v7x
+steps. A merge-queue, release or integration build refuses either one, since a
+failing v6e step would block the merge, the release or the LKG promotion. A
+build that sets `KUBE_SHAPE_SINGLE` or `KUBE_SHAPE_MULTI` is rejected: the
+generation brings its shapes.
+
+The v6e steps do not pass yet, and they are not `soft_fail`, so a build that
+runs them is expected to fail: for one, the `tests_omni` tests are not
+qualified for v6e's 32 GB of HBM. No build has to set either extra. Use them on
+a manual build to see where v6e stands.
+
+These extras choose the chips for the `tests` lane only. A build with
 `NIGHTLY=1` also runs the nightly model and feature tests for both chips (the
 "TPU v6e nightly Tests" and "TPU v7x nightly Tests" groups) and the nightly
-report, whatever `CI_TPU_GENERATIONS` is set to.
+report, whatever `CI_EXTRAS` is set to.
 
 In the Buildkite UI, the name of each of the `tests` lane's TPU steps starts
 with the chip it runs on (`v6e ...` or `v7x ...`).
