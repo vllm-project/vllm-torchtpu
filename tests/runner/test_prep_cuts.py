@@ -90,6 +90,13 @@ def make_fold_runner(max_model_len=8192):
 
 def apply(wl: Workload, runner, step: int) -> None:
     wl.apply(runner)
+    pre = runner._pre_async_results
+    if step % 5 == 2:
+        # The requests sat in other rows of the previous step's results (same
+        # batch, so a steady hit): the scatter substitution.
+        rows = pre.req_id_to_index_copy
+        n = len(wl.reqs)
+        pre.req_id_to_index_copy = {r: (j + 1) % n for r, j in rows.items()}
     width = K + 1
     runner._pre_async_results.next_tokens_tpu = (
         torch.arange(runner.max_num_reqs * width, dtype=torch.int64) * 13 + step
@@ -231,7 +238,11 @@ def _check_coverage(stats):
 
 
 def test_registered_and_out_of_compile_key(monkeypatch):
-    for name in ("VLLM_TPU_MAMBA_RD_REUSE", "VLLM_TPU_KV_CONNECTOR_SKIP_NOOP"):
+    for name in (
+        "VLLM_TPU_MAMBA_RD_REUSE",
+        "VLLM_TPU_KV_CONNECTOR_SKIP_NOOP",
+        "VLLM_TPU_PREP_FOLD_PRECHECK_MEMO",
+    ):
         assert name in envs.environment_variables
         assert name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
         monkeypatch.delenv(name, raising=False)
@@ -424,3 +435,72 @@ def test_kv_connector_skip_negative_control(monkeypatch):
     )
     with pytest.raises(AssertionError):
         test_kv_connector_skip_keeps_connector_path(monkeypatch, True)
+
+
+# --------------------------------------------------------------------------
+# F. VLLM_TPU_PREP_FOLD_PRECHECK_MEMO
+# --------------------------------------------------------------------------
+
+F_FLAG = {"VLLM_TPU_PREP_FOLD_PRECHECK_MEMO": "1"}
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_fold_precheck_memo_bitwise(monkeypatch, seed):
+    _check_coverage(run_pair(monkeypatch, F_FLAG, seed))
+
+
+def test_fold_precheck_memo_hits_and_invalidates(monkeypatch):
+    """Steady hits with the same rows reuse the indices (not recomputed);
+    moved rows, a new batch or a new token slice recompute them."""
+    monkeypatch.setattr(tpu_runner, "_prep_fold_compiled", _fake_fold)
+    monkeypatch.setattr(tpu_runner, "_prep_fold_key", lambda args, static: _WARM)
+    r = make_fold_runner()
+    computed = []
+    real = tpu_runner.TPUModelRunner._prepare_async_token_substitution_indices
+
+    def spy(self, *a):
+        out = real(self, *a)
+        computed.append(out)
+        return out
+
+    monkeypatch.setattr(
+        tpu_runner.TPUModelRunner, "_prepare_async_token_substitution_indices", spy
+    )
+    wl = Workload(7, 4, k=K, max_model_len=8192, churn=0.0, prefill=0.0)
+    log = []
+    for step in range(10):
+        if step:
+            wl.step()
+        if step == 5:
+            wl._add()
+        num_decode, num_windowed = wl.segments()
+        apply(wl, r, step)  # steps 2 and 7: rows rotated
+        computed.clear()
+        with env(steady=True, extra={**FOLD_ENV, **F_FLAG}):
+            out = run_step(r, wl.scheduler_output(), num_decode, num_windowed)
+        log.append(
+            (len(computed), out["fold_calls"][0][0] if out["fold_calls"] else None)
+        )
+    recomputed = [n for n, _ in log]
+    # 0: all requests new (no previous rows, no precheck). 1: first steady
+    # step (miss, seeds the entry). 2: rows moved. 3: moved back. 4: memo.
+    # 5: a new request (no steady key). 6: steady miss. 7: moved. 8: moved
+    # back. 9: memo.
+    assert recomputed == [0, 1, 1, 1, 0, 1, 1, 1, 1, 0], recomputed
+    assert log[4][1] is not None and log[9][1] is not None  # memo steps folded
+    entry = r._steady_decode_cache.entry
+    assert entry.fold_subst is not None
+    assert not entry.fold_subst[0].flags.writeable
+
+
+def test_fold_precheck_memo_negative_control(monkeypatch):
+    """A broken memo key without the previous-step rows is caught."""
+
+    def broken(self, steady, subtract_key, layout_plan):
+        if steady is None or subtract_key is None:
+            return None
+        return steady, (subtract_key[0],)
+
+    monkeypatch.setattr(tpu_runner.TPUModelRunner, "_fold_subst_memo", broken)
+    with pytest.raises(AssertionError, match="MISMATCH"):
+        run_pair(monkeypatch, F_FLAG, seed=0)

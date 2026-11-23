@@ -4775,13 +4775,17 @@ class TPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_per_req: np.ndarray,
         padded_total_num_scheduled_tokens: int,
         layout_plan: Any,
+        subst_memo: tuple | None = None,
     ) -> tuple[np.ndarray, np.ndarray] | None:
         """VLLM_TPU_PREFWD_PREP_FOLD, host side: whether this chunk can run its
         prep as the folded program (`_try_prep_fold` checks the rest), and if so
         its substitution indices (host only, so computed early). Folds only the
         one-chunk verify step that substitutes tokens from the previous step's
         source (the 1:1 slice or the scatter, `_try_prep_fold` picks); everything
-        else keeps today's programs."""
+        else keeps today's programs.
+
+        `subst_memo` (VLLM_TPU_PREP_FOLD_PRECHECK_MEMO): `(steady entry, key)`
+        under which the indices were last computed; see `_fold_subst_memo`."""
         adapter = self.model_adapter
         pre = self._pre_async_results
         if not (
@@ -4803,12 +4807,49 @@ class TPUModelRunner(GPUModelRunner):
             and getattr(adapter, "prep_fold_supported", lambda: False)()
         ):
             return None
-        cur, src = self._prepare_async_token_substitution_indices(
-            start_index, num_reqs, num_scheduled_tokens_per_req
-        )
+        if subst_memo is None:
+            cur, src = self._prepare_async_token_substitution_indices(
+                start_index, num_reqs, num_scheduled_tokens_per_req
+            )
+        else:
+            entry, key = subst_memo
+            if entry.fold_subst_key == key:
+                cur, src = entry.fold_subst
+            else:
+                cur, src = self._prepare_async_token_substitution_indices(
+                    start_index, num_reqs, num_scheduled_tokens_per_req
+                )
+                # Shared with later steps: every reader only reads them.
+                cur.setflags(write=False)
+                src.setflags(write=False)
+                entry.fold_subst_key = key
+                entry.fold_subst = (cur, src)
         if len(cur) == 0:
             return None
         return cur, src
+
+    def _fold_subst_memo(
+        self, steady: Any, subtract_key: tuple | None, layout_plan: Any
+    ) -> tuple | None:
+        """VLLM_TPU_PREP_FOLD_PRECHECK_MEMO: `(entry, key)` for
+        `_prep_fold_precheck`, or None to compute the indices as before.
+
+        `_prepare_async_token_substitution_indices` is a function of the
+        chunk's req_ids order and per-request token counts (in the steady
+        entry's key, so fixed for the entry's lifetime), each request's row in
+        the previous step's results (`subtract_key` holds `index_of.get(r)`
+        for exactly those req_ids, and the padded token count), the stride
+        (`1 + num_speculative_tokens`; the caller runs only with rejected
+        counts present) and the layout plan's local index map (its token
+        slice; plans that remap tokens are not memoized)."""
+        if (
+            steady is None
+            or subtract_key is None
+            or layout_plan._request_major_to_packed_token_indices is not None
+        ):
+            return None
+        sl = layout_plan.token_slice
+        return steady, (subtract_key, sl.start, sl.stop, sl.step)
 
     def _try_prep_fold(
         self,
@@ -5265,6 +5306,11 @@ class TPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_per_req,
                     padded_total_num_scheduled_tokens,
                     layout_plan,
+                    subst_memo=(
+                        self._fold_subst_memo(steady, subtract_key, layout_plan)
+                        if envs.VLLM_TPU_PREP_FOLD_PRECHECK_MEMO
+                        else None
+                    ),
                 )
             if prep_fold_subst is not None:
                 # VLLM_TPU_PREFWD_PREP_FOLD: the correction may run inside the
