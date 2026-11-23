@@ -7368,6 +7368,16 @@ class TPUModelRunner(GPUModelRunner):
                 topk_candidates = self._sampler_topk_candidates(
                     cur_start_idx, cur_end_idx, grammar_output
                 )
+                if (
+                    topk_candidates
+                    and not self._separate_candidates_verify_warm_needed()
+                ):
+                    # Unreachable by construction; a hit means the warmup
+                    # skipped a graph this step now compiles.
+                    logger.error_once(
+                        "RS_WARMUP_SKIP_SEPARATE_CANDIDATES: separate candidates "
+                        "verify reached at runtime (it was not warmed)"
+                    )
                 host_phases.mark("vfy_params")
                 bonus_u = torch.rand_like(
                     bonus_logits, dtype=torch.float32, generator=sampling_generator
@@ -9690,7 +9700,8 @@ class TPUModelRunner(GPUModelRunner):
                         do_sampling=True,
                     )
                     synchronize_tensors(out)
-                    if blocks := self._topk_candidate_blocks():
+                    blocks = self._topk_candidate_blocks()
+                    if blocks and self._separate_candidates_verify_warm_needed():
                         out = self.rejection_sampler(
                             draft_token_ids=draft_token_ids,
                             num_draft_tokens=draft_lengths,
@@ -12140,6 +12151,33 @@ class TPUModelRunner(GPUModelRunner):
         )
         return num_blocks
 
+    def _separate_candidates_verify_reachable(self) -> bool:
+        """Whether a step can run the separate (non-fused) verify with top-k
+        candidates. `_sample_spec_verify_chunk` takes the fused verify for
+        every non-greedy step without a grammar when VLLM_TPU_VERIFY_FUSED is
+        on and the logits are on a TPU; a grammar step gets no candidates
+        (`_sampler_topk_candidates`); greedy steps never sample. Only the
+        fused check (VLLM_TPU_VERIFY_FUSED_CHECK) reruns the separate path."""
+        return separate_candidates_verify_reachable(
+            envs.VLLM_TPU_VERIFY_FUSED,
+            envs.VLLM_TPU_VERIFY_FUSED_CHECK,
+            self._verify_device_type(),
+        )
+
+    def _verify_device_type(self) -> str:
+        """Device type of the verify logits (the runner's device)."""
+        device = self.device
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
+        return device.type
+
+    def _separate_candidates_verify_warm_needed(self) -> bool:
+        """VLLM_TPU_RS_WARMUP_SKIP_SEPARATE_CANDIDATES: warm the separate
+        candidates verify unless it is unreachable (flag off: always warm)."""
+        if not envs.VLLM_TPU_RS_WARMUP_SKIP_SEPARATE_CANDIDATES:
+            return True
+        return self._separate_candidates_verify_reachable()
+
     @staticmethod
     def _sampler_logits_blocks() -> int:
         """VLLM_TPU_SAMPLER_LOGITS_BLOCKS mode for the fused one-draw verify;
@@ -12552,6 +12590,16 @@ def fill_step_seq_lens(
 def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
     res = MIN_NUM_SEQS if x <= MIN_NUM_SEQS else 1 << (x - 1).bit_length()
     return min(res, upper_limit)
+
+
+def separate_candidates_verify_reachable(
+    verify_fused: bool, fused_check: int, device_type: str
+) -> bool:
+    """Whether `_sample_spec_verify_chunk` can run the separate (non-fused)
+    rejection sampler with top-k candidates: only when the fused verify is
+    off or not on a TPU, or when VLLM_TPU_VERIFY_FUSED_CHECK reruns the
+    separate path as its reference."""
+    return not (verify_fused and fused_check <= 0 and device_type == "tpu")
 
 
 def _get_padded_token_len(paddings: list[int], x: int) -> int:

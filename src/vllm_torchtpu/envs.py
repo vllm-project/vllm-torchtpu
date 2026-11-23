@@ -402,6 +402,7 @@ if TYPE_CHECKING:
     VLLM_TPU_TP_ONESHOT_AR_MAX_ROWS: int = 0
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
+    VLLM_TPU_RS_WARMUP_SKIP_SEPARATE_CANDIDATES: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
     VLLM_TPU_DRAFT_SEED_FUSED: bool = False
     VLLM_TPU_DRAFT_CARRY_FUSED: bool = False
@@ -2610,6 +2611,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_TP_ONESHOT_AR_MAX_ROWS": env_nonnegative_int("VLLM_TPU_TP_ONESHOT_AR_MAX_ROWS", 0),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
+    # rejection_sampler warmup: skip the separate (non-fused) candidates
+    # verify graphs when no step can run them, i.e. VLLM_TPU_VERIFY_FUSED on a
+    # TPU device with VLLM_TPU_VERIFY_FUSED_CHECK=0 (every non-greedy step
+    # without a grammar takes the fused verify; a grammar step has no top-k
+    # candidates). Any other combination still compiles them. Default off.
+    "VLLM_TPU_RS_WARMUP_SKIP_SEPARATE_CANDIDATES": env_bool(
+        "VLLM_TPU_RS_WARMUP_SKIP_SEPARATE_CANDIDATES"
+    ),
     # Compare the fused verify and draft seed with the separate programs for
     # the first N chunks; the first _FAULT checks perturb the compared copy
     # (a positive control that must be caught).
