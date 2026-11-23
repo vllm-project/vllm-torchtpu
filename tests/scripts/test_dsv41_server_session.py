@@ -253,7 +253,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
             assert env["TPU_MOE_EPLB_DYNAMIC"] == "1"
             assert env["MOE_FUSED_EP_PREPROCESS_BACKEND"] == "topology"
             assert env["MAX_SEQS"] == "48"
-            assert env["MAX_MODEL_LEN"] == "98816"
+            assert env["MAX_MODEL_LEN"] == "1048576"
             assert env["LD_PRELOAD"] == ""
             assert env["TPU_RECLAIM_COMPILE_MEMORY"] == "1"
             assert json.loads(env["ENGRAM_CONFIG"]) == {
