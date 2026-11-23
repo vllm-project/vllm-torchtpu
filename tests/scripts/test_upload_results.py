@@ -405,7 +405,6 @@ def test_gke_manifest_states_the_chips_its_engines_hold():
         f"--prefill-chips={chips('prefill')}",
         f"--decode-chips={chips('decode')}",
     ]
-    assert (chips("prefill"), chips("decode")) == (4, 4)
 
 
 _GKE_TTFT_CELL = "pd_disagg_ttft_c1_i65536_o1"

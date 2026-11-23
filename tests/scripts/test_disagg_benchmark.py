@@ -23,6 +23,7 @@ import shutil
 import subprocess
 
 import pytest
+import yaml
 
 _SCRIPT = (
     pathlib.Path(__file__).resolve().parents[2]
@@ -30,6 +31,7 @@ _SCRIPT = (
     / "kubernetes"
     / "disagg_benchmark.sh"
 )
+_MANIFEST = _SCRIPT.parent / "manifests" / "workloads" / "qwen3.5-397b-1p1d.yaml"
 _BASH = shutil.which("bash")
 
 
@@ -65,6 +67,19 @@ def test_chip_flags_are_both_absent_or_both_positive_integers(
         0,
         f"Arguments are valid; parse_gke_results.py gets: {forwarded}\n",
     )
+
+
+def test_the_manifest_runs_the_script_with_arguments_it_accepts(tmp_path):
+    """The manifest starts the script only once both engines are Ready, so a
+    flag the script rejects has to fail here to fail before the engines start."""
+    manifest = yaml.safe_load(_MANIFEST.read_text())
+    jobs = {job["name"]: job for job in manifest["spec"]["replicatedJobs"]}
+    pod_spec = jobs["benchmark"]["template"]["spec"]["template"]["spec"]
+    command = pod_spec["containers"][0]["command"]
+
+    returncode, output = _check_args(tmp_path, *command[2:])
+
+    assert returncode == 0, output
 
 
 @pytest.mark.parametrize(

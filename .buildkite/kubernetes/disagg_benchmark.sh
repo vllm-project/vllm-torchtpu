@@ -28,8 +28,10 @@
 
 set -e
 
-# Checked here, before the hours of startup: parse_gke_results.py would
-# reject the same values, but only after the first cell has run.
+# These checks run when this pod starts, because parse_gke_results.py would
+# reject the same values only after the first cell has run. The manifest's
+# dependsOn creates this pod only once both engines are Ready, so a bad flag
+# still costs the engines' startup.
 unset prefill_chips decode_chips
 check_args=0
 for arg in "$@"; do
