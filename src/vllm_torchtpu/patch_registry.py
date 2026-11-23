@@ -124,6 +124,10 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
+    # Leaner output-rank response path (inert unless
+    # VLLM_TPU_OUTPUT_PATH_LEAN is set); before WorkerProc starts its
+    # output thread.
+    Patch("vllm_torchtpu.worker.output_path_lean:patch_output_path_lean", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),
     Patch("vllm_torchtpu:_patch_dflash_bypass_v2_runner_check", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_config_triton_tpu", _ACTIVE),
