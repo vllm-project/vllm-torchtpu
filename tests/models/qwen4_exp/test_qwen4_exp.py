@@ -62,17 +62,7 @@ VOCAB = 32
 LAYER_TYPES = ["linear_attention", "full_attention"]
 
 
-@pytest.fixture(autouse=True)
-def _cpu_model_tests(monkeypatch):
-    # Same guard as the Kimi model tests: keep Dynamo from querying a TPU
-    # device while these CPU-only tests run.
-    tpu = getattr(torch, "tpu", None)
-    if tpu is not None:
-        monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
-    if hasattr(torch, "accelerator"):
-        monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
-        monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
-        monkeypatch.setattr(torch.accelerator, "device_count", lambda: 0)
+pytestmark = pytest.mark.usefixtures("cpu_model_tests")
 
 
 def _text_config(**overrides) -> Qwen4ExpTextConfig:
