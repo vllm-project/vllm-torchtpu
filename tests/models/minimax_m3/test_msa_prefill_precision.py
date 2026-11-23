@@ -34,10 +34,12 @@ ENV = "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION"
 # Relative rms output error bound vs the oracle (incumbent: bf16 rounding only).
 BOUNDS = {"": 1e-2, "pv8": 4e-2, "qk8": 6e-2, "qk8,pv8": 8e-2,
           "qk8,msub": 6e-2, "qk8,unpk": 6e-2, "qk8,msub,unpk": 6e-2, "unpk": 1e-2,
-          "qk8,e16": 6e-2, "qk8,msub,e16": 6e-2}
+          "qk8,e16": 6e-2, "qk8,msub,e16": 6e-2,
+          "qk8,lsum": 6e-2, "qk8,msub,lsum": 6e-2}
 LSE_BOUNDS = {"": 1e-5, "pv8": 1e-5, "qk8": 0.3, "qk8,pv8": 0.3,
               "qk8,msub": 0.3, "qk8,unpk": 0.3, "qk8,msub,unpk": 0.3, "unpk": 1e-5,
-              "qk8,e16": 0.3, "qk8,msub,e16": 0.3}
+              "qk8,e16": 0.3, "qk8,msub,e16": 0.3,
+              "qk8,lsum": 0.3, "qk8,msub,lsum": 0.3}
 # Levers that must give their partner's bits ("unpk" unpacks the same values).
 SAME_BITS = {"qk8,unpk": "qk8", "unpk": ""}
 

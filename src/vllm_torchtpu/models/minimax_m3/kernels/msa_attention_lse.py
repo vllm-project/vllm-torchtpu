@@ -211,7 +211,7 @@ def _fp4_bf16_fast(kv_ref, scratch_ref) -> jax.Array:
 _PV8_UNIT = 64.0
 _FP8_MAX = 448.0
 PREFILL_PRECISION_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_PRECISION"
-_PRECISION_LEVERS = ("qk8", "pv8", "msub", "unpk", "e16")
+_PRECISION_LEVERS = ("qk8", "pv8", "msub", "unpk", "e16", "lsum")
 # 4-bit `attend` levers (default off, not bitwise):
 # "msub": no running max per score. A group's shift is m = max(m_prev, max
 # over the raw scaled scores of the group's FIRST page + _MSUB_HEADROOM),
@@ -224,6 +224,11 @@ _PRECISION_LEVERS = ("qk8", "pv8", "msub", "unpk", "e16")
 # interleaved into slot order by strided VMEM stores, minus 136 (exact).
 # "e16": p = exp2(s - m) and p * v_scale in bf16 (p enters the PV dot in
 # bf16 anyway); l sums the bf16 p in f32.
+# "lsum": the V scales go into V's rows instead of p (a per-page [S, 128]
+# lane broadcast of the scale row from a small transposed dot), and V carries
+# 128 more columns of ones, so the p @ v dot also gives l = sum(p) (the MXU
+# is 256 wide; its N = 128 dot left half of it idle): no p * v_scale and no
+# row sum per score.
 # Debug-only removal arms (timing; outputs wrong): rmmax, rmsum, rmvs, rmks,
 # rmmask, rmunpk.
 _DEBUG_LEVERS = ("rmmax", "rmsum", "rmvs", "rmks", "rmmask", "rmunpk")
@@ -562,6 +567,7 @@ def _kernel(
     out_unit = 1.0 / _PV8_UNIT if pv8 else 1.0
     msub = fp4 and "msub" in precision
     e16 = fp4 and "e16" in precision
+    lsum = fp4 and "lsum" in precision and not pv8
     dbg = precision & frozenset(_DEBUG_LEVERS) if fp4 else frozenset()
 
     def group_head(w):
@@ -1004,9 +1010,23 @@ def _kernel(
                         )
                     k_int, v_int = rows[:, :head_dim], rows[:, head_dim:]
                     # int4 values are exact in fp8; scales apply around the dots.
-                    values.append(
-                        v_int.astype(jnp.float8_e4m3fn if pv8 else jnp.bfloat16)
-                    )
+                    if lsum:
+                        # [S, 128] with every column the V scale row: e's row 0
+                        # is ones, so (sv8^T e)[k, j] = sv[k].
+                        sv8 = jnp.broadcast_to(sv, (8, sv.shape[1]))
+                        e = (jax.lax.broadcasted_iota(jnp.int32, (8, 128), 0) == 0).astype(jnp.float32)
+                        sv_col = jax.lax.dot_general(
+                            sv8, e, (((0,), (0,)), ((), ())),
+                            preferred_element_type=jnp.float32,
+                        )
+                        v_s = (v_int.astype(jnp.float32) * sv_col).astype(jnp.bfloat16)
+                        values.append(
+                            jnp.concatenate([v_s, jnp.ones_like(v_s)], axis=1)
+                        )
+                    else:
+                        values.append(
+                            v_int.astype(jnp.float8_e4m3fn if pv8 else jnp.bfloat16)
+                        )
                     keys.append(
                         k_int.astype(jnp.float8_e4m3fn if qk8 else jnp.bfloat16)
                     )
@@ -1070,7 +1090,10 @@ def _kernel(
                     m_new = jnp.maximum(m_prev, jnp.zeros_like(s[:, :1]))
                 elif not msub:
                     m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
-                if e16:
+                if lsum:
+                    p = jnp.exp2(s - m_new)
+                    p_v = p
+                elif e16:
                     p = jnp.exp2((s - m_new).astype(jnp.bfloat16))
                     l_cur = jnp.sum(p.astype(jnp.float32), axis=1, keepdims=True)
                     p_v = p * v_scale.astype(jnp.bfloat16)
@@ -1087,6 +1110,9 @@ def _kernel(
                     (((1,), (0,)), ((), ())),
                     preferred_element_type=jnp.float32,
                 )
+                if lsum:  # columns D.. of V are ones: l = sum(p) of the bf16 p
+                    l_cur = pv[:, head_dim : head_dim + 1]
+                    pv = pv[:, :head_dim]
                 if single:
                     finish(m_new, l_cur, pv, part, row_split)
                     continue
