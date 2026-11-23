@@ -463,7 +463,14 @@ def prepare_routed_gmm_inputs(
             # sort, build the `[M, T]` permutation directly from it so
             # `fused_moe_gmm` does not depend on `token_indices_sorted` (letting
             # XLA DCE its scatter unless owner-output combine uses it).
-            if bucket_counts is not None:
+            flat = num_tokens_local <= _FLAT_ONEHOT_MAX_TOKENS
+            if bucket_counts is not None and flat:
+                onehot = (
+                    route_token_onehot(argsort_revert_indices, num_tokens_local, topk)
+                    .any(axis=0)
+                    .T.astype(hidden_states_local.dtype)
+                )
+            elif bucket_counts is not None:
                 onehot = (
                     jax.nn.one_hot(
                         argsort_revert_indices.reshape(num_tokens_local, topk),
@@ -501,6 +508,28 @@ def prepare_routed_gmm_inputs(
         valid_mask,
         token_indices_sorted,
     )
+
+
+# Tokens up to which the one-hot permute and combine are built from the flat
+# routes (`route_token_onehot`). Its one-hot is `num_tokens` times the
+# token-major one's, which costs nothing at decode sizes (measured at 8 and
+# 24 tokens) but grows quadratically: larger batches keep the token-major form.
+_FLAT_ONEHOT_MAX_TOKENS = 32
+
+
+def route_token_onehot(
+    revert_indices: jax.Array, num_tokens: int, topk: int
+) -> jax.Array:
+    """``[routes, tokens, rows]`` one-hot of the flat routes: route ``j``
+    belongs to token ``j // topk`` and lands on sorted row
+    ``revert_indices[j]``. Built from the flat routes, so no ``[tokens,
+    topk]`` view of them (a relayout copy each, ~0.07 us at decode) is
+    needed; reduce it over routes for the permute and combine matrices."""
+    routes = revert_indices.shape[0]
+    token = jnp.arange(routes, dtype=jnp.int32) // topk
+    rows = jnp.arange(routes, dtype=revert_indices.dtype)
+    on_token = token[:, None] == jnp.arange(num_tokens, dtype=jnp.int32)
+    return on_token[:, :, None] & (revert_indices[:, None, None] == rows)
 
 
 def computed_rows(
@@ -684,15 +713,28 @@ def moe_gmm(
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
-            revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
-            computed = computed_rows(revert_indices, valid_mask, gmm2_res.shape[0])
+            computed = computed_rows(
+                argsort_revert_indices, valid_mask_flat, gmm2_res.shape[0]
+            )
             gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
-            onehot = jax.nn.one_hot(
-                revert_indices, argsort_revert_indices.size, dtype=gmm2_res.dtype
-            )
-            combine = (onehot * topk_weights[..., None] * valid_mask[..., None]).sum(
-                axis=1
-            )
+            if num_tokens <= _FLAT_ONEHOT_MAX_TOKENS:
+                weight = jnp.where(valid_mask_flat, topk_weights_flat, 0).astype(
+                    jnp.result_type(gmm2_res.dtype, topk_weights_flat.dtype)
+                )
+                combine = jnp.where(
+                    route_token_onehot(argsort_revert_indices, num_tokens, topk),
+                    weight[:, None, None],
+                    0,
+                ).sum(axis=0)
+            else:
+                onehot = jax.nn.one_hot(
+                    argsort_revert_indices.reshape(num_tokens, topk),
+                    argsort_revert_indices.size,
+                    dtype=gmm2_res.dtype,
+                )
+                combine = (
+                    onehot * topk_weights[..., None] * valid_mask[..., None]
+                ).sum(axis=1)
             return (combine @ gmm2_res).astype(x.dtype)
         return ragged_gather_reduce(
             gmm2_res,

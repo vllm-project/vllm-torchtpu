@@ -1138,6 +1138,32 @@ def test_computed_rows_match_group_sizes_prefix(num_tokens, skip_padded_tokens):
         np.testing.assert_array_equal(np.asarray(got), want)
 
 
+@pytest.mark.parametrize("num_tokens", [2, 8, 24])
+def test_route_token_onehot_matches_token_major_one_hot(num_tokens):
+    """The flat-route one-hot reduces to the permute matrix and, weighted, to
+    the combine matrix that the ``[tokens, topk]`` one-hot gives."""
+    topk = 4
+    routes = num_tokens * topk
+    rng = np.random.default_rng(num_tokens)
+    revert = jnp.asarray(rng.permutation(routes), jnp.int32)
+    weights = jnp.asarray(rng.random(routes), jnp.bfloat16)
+    valid = jnp.asarray(rng.random(routes) < 0.7)
+    hit = fused_moe_gmm.route_token_onehot(revert, num_tokens, topk)
+    token_major = jax.nn.one_hot(revert.reshape(num_tokens, topk), routes)
+    np.testing.assert_array_equal(
+        np.asarray(hit.any(axis=0)), np.asarray(token_major.sum(axis=1)) > 0
+    )
+    want = (
+        token_major.astype(jnp.bfloat16)
+        * weights.reshape(num_tokens, topk)[..., None]
+        * valid.reshape(num_tokens, topk)[..., None]
+    ).sum(axis=1)
+    got = jnp.where(hit, jnp.where(valid, weights, 0)[:, None, None], 0).sum(axis=0)
+    np.testing.assert_array_equal(
+        np.asarray(got, np.float32), np.asarray(want, np.float32)
+    )
+
+
 def test_moe_gmm_onehot_combine_matches_plain_reduce(monkeypatch):
     num_tokens, topk, hidden = 4, 2, 8
     rows = num_tokens * topk
