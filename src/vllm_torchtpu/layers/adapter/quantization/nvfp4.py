@@ -507,7 +507,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         moe_redundant.install(layer)
-        moe_tp_dense.finalize(layer, w13_scale_4d)
+        moe_tp_dense.finalize(layer, w13_scale_4d, activation_str)
         moe_route_trace.register(layer)
         if envs.TPU_MOE_NVFP4_SKIP_PADDED and envs.TPU_MOE_SKIP_PADDED_TOKENS:
             _log_skip_padded_once()

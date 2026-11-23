@@ -169,7 +169,7 @@ def _dummy_weights() -> bool:
     return moe_redundant._dummy_weights()
 
 
-def finalize(layer: Any, ep_w13_scale: torch.Tensor) -> None:
+def finalize(layer: Any, ep_w13_scale: torch.Tensor, activation: str) -> None:
     """From process_weights_after_loading, after the EP weights are prepared:
     fuse + requantize the raw TP slices exactly like the EP weights, register
     them as buffers and free the raw slices."""
@@ -222,7 +222,8 @@ def finalize(layer: Any, ep_w13_scale: torch.Tensor) -> None:
     _STATS["layers"] += 1
     _STATS["bytes"] += nbytes
     if dev.type == "tpu":
-        get_op(topk=layer.moe_config.experts_per_token, fs=i_s)
+        # Build the op outside tracing, with the exact key forward uses.
+        get_op(topk=layer.moe_config.experts_per_token, fs=int(i_s), activation=activation)
     if _STATS["layers"] == 1:
         logger.info(
             "[moe-tp-dense] TPU_MOE_TP_DENSE_FP4_MAX_TOKENS=%d on: E=%d ep=%d rank=%d "
