@@ -21,18 +21,21 @@ and the XLA path is the one further from exact. So both paths are judged
 against the same float64 evaluation of the op's math instead:
 
 * new residual: bit for bit ``bf16(x + residual)``;
-* y: every element within 1 bf16 ulp of the float64 add + RMSNorm rounded where
-  the op casts, and no more off-truth elements than
-  ``max(ceil(1e-4 x size), XLA's own count + 2)`` (float32 sums land on bf16
-  midpoints now and then, on either path);
+* y: every element within 2 bf16 ulps of the float64 add + RMSNorm rounded
+  where the op casts, and no more off-truth elements than
+  ``max(ceil(1e-4 x size), XLA's own count + 2)``. A float32 mean of squares can
+  move the normalized value onto the other side of a bf16 midpoint, and times a
+  weight below 1 that can cross a binade: 2 ulps (as test_fused_add_rmsnorm);
 * q_c, kv_c, k_pe: relative L2 error to the float64 quantized math (per-row fp8
   activation quant with an exact division, dot, dequant, split, RMSNorms) at
   most ``REL_L2_MAX`` and at most ``RATIO_MAX`` x the XLA path's own error;
 * above 16 rows, the fp8 q_c and its scales bit for bit ``quantize_tensor`` of
   the kernel's own q_c.
 
-A planted fault (kv_a eps 1e-2) must fail the q_c / kv_c check, and a variant
-with distinct q / kv eps must catch the two eps swapped.
+Controls perturb the kernel itself: run with kv_a eps 1e-2 it must fail the
+kv_c rules (and only those), and with distinct q / kv eps it must pass while
+the run with the two swapped fails. Every test runs in interpret mode on the
+host and compiled on a TPU (``tpu_test``).
 
 Truth-side casts round once, in float64 (``_to_bf16`` / ``_to_fp8``): ml_dtypes
 before 0.7 casts float64 through float32 and can round twice next to a midpoint.
@@ -56,6 +59,7 @@ FP8_MAX = float(ml_dtypes.finfo(ml_dtypes.float8_e4m3fn).max)
 # the XLA path's at every row count and output.
 REL_L2_MAX = 0.006
 RATIO_MAX = 1.10
+Y_ULPS_MAX = 2
 Y_OFF_FRAC = 1e-4
 Y_XLA_SLACK = 2
 
@@ -150,8 +154,29 @@ def _ulps(a, b):
     return np.where(finite, np.abs(key(a) - key(b)), 1 << 30)
 
 
-def _run(args, rows, q_eps, kv_eps):
-    on_tpu = jax.devices()[0].platform == "tpu"
+def _on_tpu():
+    return jax.devices()[0].platform == "tpu"
+
+
+# The same checks run twice: on the host with the kernel in interpret mode (the
+# CPU lane; there it computes what XLA does, so only the truth side and the
+# controls are exercised), and compiled on a TPU (the TPU lane, where the
+# thresholds above were measured).
+BACKENDS = [
+    pytest.param("interpret", id="interpret"),
+    pytest.param("tpu", id="tpu", marks=pytest.mark.tpu_test),
+]
+
+
+def _require(backend):
+    if backend == "tpu" and not _on_tpu():
+        pytest.skip("the compiled kernel needs a TPU")
+    if backend == "interpret" and _on_tpu():
+        pytest.skip("interpret mode is a host-only check")
+
+
+def _run(backend, args, rows, q_eps, kv_eps):
+    tpu = backend == "tpu"
     return K.fused_norm_qkva(
         *args,
         eps=EPS,
@@ -160,8 +185,8 @@ def _run(args, rows, q_eps, kv_eps):
         q_rank=Q,
         kv_rank=KV,
         emit_q8=rows > 16,
-        hbm_pin=on_tpu,
-        interpret=not on_tpu,
+        hbm_pin=tpu,
+        interpret=not tpu,
     )
 
 
@@ -171,53 +196,69 @@ def _qkva_errors(out, args, q_eps, kv_eps):
     return [_rel_l2(g, t) for g, t in zip(out[2:5], truth)]
 
 
-def _check(rows, q_eps, kv_eps):
-    args = _inputs(rows)
-    got = _run(args, rows, q_eps, kv_eps)
+def _failures(rows, args, got, q_eps, kv_eps):
+    """Every rule the kernel outputs ``got`` break, judged at ``q_eps`` /
+    ``kv_eps``; empty when they pass."""
     xla = K.reference(*args, eps=EPS, q_eps=q_eps, kv_eps=kv_eps, q_rank=Q, kv_rank=KV)
-
+    bad = []
     y_truth, res_truth = _addnorm_truth(*args[:3])
-    assert _bits(got[1]) == _bits(res_truth)  # new residual
+    if _bits(got[1]) != _bits(res_truth):
+        bad.append("new residual differs from bf16(x + residual)")
     y_off = _ulps(got[0], y_truth)
     allowed = max(
         math.ceil(Y_OFF_FRAC * y_off.size),
         int((_ulps(xla[0], y_truth) > 0).sum()) + Y_XLA_SLACK,
     )
-    assert y_off.max() <= 1, f"y off by {y_off.max()} ulps"
-    assert (y_off > 0).sum() <= allowed, (
-        f"y: {(y_off > 0).sum()} off-truth elements > {allowed}"
-    )
-
+    if y_off.max() > Y_ULPS_MAX:
+        bad.append(f"y off by {y_off.max()} ulps > {Y_ULPS_MAX}")
+    if (y_off > 0).sum() > allowed:
+        bad.append(f"y: {(y_off > 0).sum()} off-truth elements > {allowed}")
     for name, k_err, x_err in zip(
         ("q_c", "kv_c", "k_pe"),
         _qkva_errors(got, args, q_eps, kv_eps),
         _qkva_errors(xla, args, q_eps, kv_eps),
     ):
-        assert k_err <= REL_L2_MAX, f"{name}: rel-L2 {k_err:.5f} > {REL_L2_MAX}"
-        assert k_err <= RATIO_MAX * x_err, (
-            f"{name}: rel-L2 {k_err:.5f} > {RATIO_MAX} x XLA's {x_err:.5f}"
-        )
-
+        if k_err > REL_L2_MAX:
+            bad.append(f"{name}: rel-L2 {k_err:.5f} > {REL_L2_MAX}")
+        if k_err > RATIO_MAX * x_err:
+            bad.append(f"{name}: rel-L2 {k_err:.5f} > {RATIO_MAX} x XLA's {x_err:.5f}")
     if rows > 16:
         q8, qs = quantize_tensor(got[2], jnp.float8_e4m3fn)
-        assert _bits(got[5]) == _bits(q8)
-        assert _bits(got[6]) == _bits(qs)
-    return args, got
+        if _bits(got[5]) != _bits(q8) or _bits(got[6]) != _bits(qs):
+            bad.append("fp8 q_c differs from quantize_tensor(q_c)")
+    return bad
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("rows", [4, 8, 16, 32, 48, 64])
-def test_matches_float64_truth(rows):
-    args, got = _check(rows, Q_EPS, KV_EPS)
-    # A planted fault must fail the check: the same outputs judged against a
-    # truth with kv_a eps 1e-2.
-    q_err, kv_err, _ = _qkva_errors(got, args, Q_EPS, 1e-2)
-    assert kv_err > REL_L2_MAX and q_err <= REL_L2_MAX
+def test_matches_float64_truth(backend, rows):
+    _require(backend)
+    args = _inputs(rows)
+    got = _run(backend, args, rows, Q_EPS, KV_EPS)
+    assert _failures(rows, args, got, Q_EPS, KV_EPS) == []
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("rows", [4, 64])
-def test_distinct_eps_are_not_swapped(rows):
+def test_planted_fault_is_caught(backend, rows):
+    """The kernel run with kv_a eps 1e-2 must fail the kv_c rules and only them."""
+    _require(backend)
+    args = _inputs(rows)
+    got = _run(backend, args, rows, Q_EPS, 1e-2)
+    bad = _failures(rows, args, got, Q_EPS, KV_EPS)
+    assert bad and all(b.startswith("kv_c") for b in bad), bad
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("rows", [4, 64])
+def test_distinct_eps_are_not_swapped(backend, rows):
+    """With distinct q / kv eps the kernel passes, and the kernel run with the
+    two swapped fails."""
+    _require(backend)
     q_eps, kv_eps = 1e-3, 1e-6
-    args, got = _check(rows, q_eps, kv_eps)
-    swapped = _qkva_errors(got, args, kv_eps, q_eps)
-    right = _qkva_errors(got, args, q_eps, kv_eps)
-    assert swapped[0] > RATIO_MAX * right[0] or swapped[1] > RATIO_MAX * right[1]
+    args = _inputs(rows)
+    got = _run(backend, args, rows, q_eps, kv_eps)
+    assert _failures(rows, args, got, q_eps, kv_eps) == []
+    swapped = _run(backend, args, rows, kv_eps, q_eps)
+    bad = _failures(rows, args, swapped, q_eps, kv_eps)
+    assert any(b.startswith(("q_c", "kv_c")) for b in bad), bad
