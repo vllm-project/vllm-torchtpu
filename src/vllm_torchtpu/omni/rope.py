@@ -37,7 +37,7 @@ from functools import cache as run_once
 
 import jax
 import torch
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 
 from vllm_torchtpu.kernels.diffusion_attention.qk_norm_rope import qk_norm_rope
 

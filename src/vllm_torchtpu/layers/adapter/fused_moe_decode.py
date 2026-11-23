@@ -55,7 +55,7 @@ import jax.numpy as jnp
 import torch
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec
-from torch_tpu._internal.pallas import jax_op
+from torch.tpu.pallas import jax_op
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_mesh_index
@@ -319,9 +319,6 @@ def _build_op(
         )
 
     name = "pallas::fused_moe_decode" + (f"_{len(_OPS)}" if _OPS else "")
-    # torch_tpu types the partition specs as tuples of axis names, but takes
-    # (and fused_moe_ep passes) jax PartitionSpecs.
-    # pyrefly: ignore[no-matching-overload]
     op = jax_op(
         name,
         fn,

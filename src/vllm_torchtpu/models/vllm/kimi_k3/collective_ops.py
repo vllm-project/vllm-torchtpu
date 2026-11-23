@@ -19,7 +19,7 @@ from typing import Any
 import jax
 import torch
 from jax.sharding import PartitionSpec as P
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 from vllm.distributed import get_tp_group
 
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_rank_order, get_ep_group

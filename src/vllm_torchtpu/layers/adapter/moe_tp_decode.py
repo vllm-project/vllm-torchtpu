@@ -43,7 +43,8 @@ import torch
 from jax import lax
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
+from torch_tpu._internal.pallas import pallas as pallas_impl
 from vllm.distributed import parallel_state
 
 import vllm_torchtpu.envs as envs
@@ -114,7 +115,7 @@ def moe_tp_decode_supported(quant_method: Any) -> bool:
 
 def _sds(t: torch.Tensor) -> jax.ShapeDtypeStruct:
     return jax.ShapeDtypeStruct(
-        tuple(t.shape), pallas.pallas.TORCH_TO_JAX_DTYPE_MAP[t.dtype]
+        tuple(t.shape), pallas_impl.TORCH_TO_JAX_DTYPE_MAP[t.dtype]
     )
 
 
@@ -410,9 +411,6 @@ def _get_op(mesh, statics: _OpStatics):
         )
 
     name = "pallas::moe_tp_decode" + (f"_{len(_OPS)}" if _OPS else "")
-    # torch_tpu annotates the partition specs as tuples of axis-name tuples, but
-    # jax_op takes PartitionSpecs at runtime, as other jax_op call sites pass them.
-    # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
         name, fn, mesh=mesh, input_partition_specs=specs, output_partition_specs=P(axis)
     )
@@ -444,8 +442,6 @@ def _selftest_op(mesh, spec: all_reduce.AllReduceSpec):
             *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
         )
 
-    # PartitionSpecs, as in _get_op (torch_tpu's annotation is narrower).
-    # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
         f"pallas::moe_tp_decode_selftest_{len(_SELFTEST_OPS)}",
         fn,

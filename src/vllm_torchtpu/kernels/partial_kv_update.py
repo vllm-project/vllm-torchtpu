@@ -57,7 +57,7 @@ import jax.numpy as jnp
 import torch
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from torch_tpu._internal import pallas as torch_pallas
+from torch.tpu import pallas as torch_pallas
 
 
 def _blockspec_kernel(_sidx_ref, vals_ref, _pool_in_ref, pool_out_ref):

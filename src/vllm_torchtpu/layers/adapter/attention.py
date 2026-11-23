@@ -23,7 +23,8 @@ import jax
 import torch
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
+from torch_tpu._internal.pallas import pallas as pallas_impl
 from vllm.compilation import backends as vllm_compilation_backends
 from vllm.config import (
     VllmConfig,
@@ -312,7 +313,7 @@ def _pallas_rpa_kernel_impl(
                 pool_shape[1],
                 key.shape[1],
                 query.shape[2],
-                pallas.pallas.JAX_TO_TORCH_DTYPE_MAP[kv_cache.dtype],
+                pallas_impl.JAX_TO_TORCH_DTYPE_MAP[kv_cache.dtype],
             )
         native_page_elements = math.prod(native_shape[1:])
         # A padded pool page can span several of this layer's native pages.
@@ -847,7 +848,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
             page_size=block_size,
             actual_num_kv_heads=num_kv_heads,
             actual_head_dim=head_size,
-            kv_dtype=pallas.pallas.TORCH_TO_JAX_DTYPE_MAP[torch_dtype],
+            kv_dtype=pallas_impl.TORCH_TO_JAX_DTYPE_MAP[torch_dtype],
             kv_layout=KV_LAYOUT_BY_VLLM_LAYOUT[
                 get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
             ],

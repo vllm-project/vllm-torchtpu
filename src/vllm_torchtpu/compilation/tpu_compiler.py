@@ -291,6 +291,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
+    # And for the fused decode MoE op (`pallas::fused_moe_decode`).
+    "vllm_torchtpu/layers/adapter/fused_moe_decode.py",
     # And the mesh they export with: `build_ep_mesh` decides the axis, the
     # shape and the device order (the DeviceAssignment) the kernel runs on.
     "vllm_torchtpu/distributed/ep_mesh.py",

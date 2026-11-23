@@ -109,7 +109,7 @@ def _build_op(
 ) -> Any:
     import jax
     from jax.sharding import PartitionSpec as P
-    from torch_tpu._internal import pallas
+    from torch.tpu import pallas
 
     from vllm_torchtpu.kernels.collectives.hierrs_tc.dispatch import (
         make_reduce_scatter_fn,
@@ -128,9 +128,6 @@ def _build_op(
         return reduce_scatter(x)
 
     spec = P(axis_name, None)
-    # torch_tpu annotates the partition specs as tuples of axis-name tuples, but
-    # jax_op takes PartitionSpecs at runtime, as other jax_op call sites pass them.
-    # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
         OP_NAME,
         fn,

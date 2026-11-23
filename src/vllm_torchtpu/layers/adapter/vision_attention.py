@@ -39,7 +39,7 @@ the flash padding) gets a distinct, equality-masked segment.
 import jax
 import torch
 import torch.nn.functional as F
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
 

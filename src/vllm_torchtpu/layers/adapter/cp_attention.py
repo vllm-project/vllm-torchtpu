@@ -25,7 +25,7 @@ import functools
 
 import jax
 import torch
-from torch_tpu._internal import pallas
+from torch.tpu import pallas
 
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
