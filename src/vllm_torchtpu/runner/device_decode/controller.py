@@ -298,13 +298,6 @@ class DeviceDecodeController:
         self.slots.sync_from_runner(self.runner, scheduler_output)
         self.slots.apply_staged_writes(self.runner)
 
-    def step_ineligible_reason(
-        self, scheduler_output: Any, target_num_chunks: int
-    ) -> str | None:
-        """Why the step must run on the stock path, or None. Host only."""
-        plan = self._plan_step(scheduler_output, target_num_chunks)
-        return plan if isinstance(plan, str) else None
-
     def try_execute(self, scheduler_output: Any, target_num_chunks: int) -> bool:
         """Dispatches the step's forward and logits from the slots and leaves
         a `DeviceDecodeState` for `sample_tokens`, or returns False to leave

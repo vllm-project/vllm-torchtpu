@@ -389,9 +389,9 @@ def test_a_row_with_tokens_left_to_compute_runs_on_the_stock_path(monkeypatch):
     runner, controller = engine.runner, engine.controller
     runner._update_states(output)
     controller.on_states_updated(output)
-    assert controller.step_ineligible_reason(output, 1) is None
+    assert not isinstance(controller._plan_step(output, 1), str)
     runner.input_batch.num_tokens_no_spec[runner.input_batch.req_id_to_index["a"]] += 1
-    assert controller.step_ineligible_reason(output, 1) == SLOT_NOT_READY
+    assert controller._plan_step(output, 1) == SLOT_NOT_READY
 
 
 def test_a_device_step_that_would_drop_its_token_stops_the_engine(monkeypatch):

@@ -7876,7 +7876,8 @@ class TPUModelRunner(GPUModelRunner):
             )
             self._pp_handoff.warmup()
         if self.enforce_eager:
-            _initialize_device_decode(self)
+            if self._device_decode is not None:
+                self._device_decode.initialize_and_precompile()
             return
         if self.lora_config is not None:
             lora_manager = self.lora_manager
@@ -7935,7 +7936,8 @@ class TPUModelRunner(GPUModelRunner):
                 self._warmup_spec_decode()
                 if self._adaptive_verification is not None:
                     self._init_adaptive_verification()
-        _initialize_device_decode(self)
+        if self._device_decode is not None:
+            self._device_decode.initialize_and_precompile()
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.
@@ -9660,14 +9662,6 @@ class TPUModelRunner(GPUModelRunner):
         return sampler_math.gather_logprobs_impl(
             logits, sampled_tokens, self.model_config.max_logprobs
         )
-
-
-def _initialize_device_decode(runner: TPUModelRunner) -> None:
-    """Sets up the opt-in device decode path at the end of `capture_model`,
-    or has it log why it stays off."""
-    device_decode = runner._device_decode
-    if device_decode is not None:
-        device_decode.initialize_and_precompile()
 
 
 def _get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:
