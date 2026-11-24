@@ -109,6 +109,33 @@ def test_ngram_ids_lean_matches_stock(layer):
                 assert not torch.equal(moved, ref)
 
 
+@pytest.mark.parametrize("trim,lean", [(False, True), (True, False), (True, True)])
+def test_compute_ids_lean_and_trim_match_stock(monkeypatch, trim, lean):
+    """`Qwen4ExpNGramEmbedding.compute_ids` as the model calls it: constants built at
+    trace time (PLE_TRIM or lean) and the int32 context (lean) give the stock ids."""
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple import Qwen4ExpNGramEmbedding
+
+    vocab_size, eos, heads_per_ngram = 248320, 248044, 8
+    multipliers = layer_multipliers(vocab_size, 3, 1, 1234)
+    sizes = head_vocab_sizes(20_000_000, 2 * heads_per_ngram, 1)
+    offsets = [sum(sizes[:h]) for h in range(len(sizes))]
+    emb = SimpleNamespace(
+        ngram_size=3, eos_token_id=eos, heads_per_ngram=heads_per_ngram,
+        layer_multipliers=torch.tensor(multipliers), ngram_heads_vocab_sizes=torch.tensor(sizes),
+        ngram_heads_offsets=torch.tensor(offsets),
+        _hash_constants=(multipliers, sizes, offsets),
+    )
+    gen = np.random.default_rng(7)
+    for T, qsl in _qsl_cases(gen):
+        ids, ctx = _ngram_case(gen, T, qsl)
+        req, pos = token_requests(torch.tensor(qsl), T)
+        monkeypatch.setattr(envs, "VLLM_TPU_MK_PLE_TRIM", False)
+        ref = Qwen4ExpNGramEmbedding.compute_ids(emb, ids, ctx, req, pos)
+        monkeypatch.setattr(envs, "VLLM_TPU_MK_PLE_TRIM", trim)
+        got = Qwen4ExpNGramEmbedding.compute_ids(emb, ids, ctx, req, pos, lean=lean)
+        assert got.dtype == ref.dtype and torch.equal(got, ref), (T, qsl)
+
+
 def test_context_lens_int32_sign():
     lens = torch.tensor([0, 1, 7, 102400, 204800, 262144, 2**31 - 1], dtype=torch.int64)
     assert torch.equal(lens.to(torch.int32) > 0, lens > 0)

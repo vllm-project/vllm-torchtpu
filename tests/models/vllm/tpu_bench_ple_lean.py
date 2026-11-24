@@ -10,7 +10,8 @@ embedding index work the megakernel programs run before the head kernels:
   form, twice: the lookup and the output mask), the n-gram ids from the int64 context and
   int64 hash buffers, ``context_lens > 0`` on the int64 lengths;
 * lean: the int32 bound buffer, token_requests(compare=True), the int32 context and
-  trace-time hash constants, ``context_lens.to(int32) > 0``.
+  trace-time hash constants as int64 constant tensors, ``context_lens.to(int32) > 0``;
+* leanint: lean with the hash constants as Python ints (one remainder per head).
 
 Prints whether every output is bit-identical, and the device time per call of each
 program from a torch_tpu profile (`OPSUM`: sum of op self time, op count, and the
@@ -32,7 +33,9 @@ import torch
 VOCAB, HIDDEN, TP, RANK, EOS, HEADS_PER_NGRAM = 248320, 2560, 8, 3, 248044, 8
 
 
-def build(B, R, lean, consts):
+def build(B, R, lean, consts, tensor_consts=True):
+    """``lean`` arm: ``tensor_consts`` builds the hash constants as int64 tensors at trace
+    time (HLO constants, the vectorized remainder of the stock path), else Python ints."""
     from vllm_torchtpu.models.vllm.qwen4_exp.ple import ngram_ids, token_requests
 
     mult, sizes, offs = consts
@@ -46,8 +49,13 @@ def build(B, R, lean, consts):
         part = part.masked_fill(mask.unsqueeze(-1), 0)
         req, pos = token_requests(qsl, B, compare=lean)
         if lean:
+            m, z, o = (
+                [torch.tensor(c, dtype=torch.int64, device=ids.device) for c in (mult, sizes, offs)]
+                if tensor_consts
+                else (mult, sizes, offs)
+            )
             grams = ngram_ids(
-                ids.long(), ctx.to(torch.int32), req, pos, mult, sizes, offs,
+                ids.long(), ctx.to(torch.int32), req, pos, m, z, o,
                 eos_token_id=EOS, heads_per_ngram=HEADS_PER_NGRAM, narrow_context=True,
             )
         else:
@@ -138,8 +146,9 @@ def main():
                 b64, b32, *consts_t]
         res = {}
         outs = {}
-        for name, lean in (("stock", False), ("lean", True)):
-            run = build(B, R, lean, (mult, sizes, offs))
+        for name, lean, tc in (("stock", False, False), ("lean", True, True), ("leanint", True, False)):
+            torch._dynamo.reset()
+            run = build(B, R, lean, (mult, sizes, offs), tc)
             outs[name] = [o.cpu() for o in run(*args)]
             prof = profile_ops(run, args, a.iters, f"/tmp/prof_ple_{name}_{B}")
             if prof is None:
@@ -159,7 +168,8 @@ def main():
         res["bitwise"] = all(
             torch.equal(x.view(torch.int16) if x.dtype == torch.bfloat16 else x,
                         y.view(torch.int16) if y.dtype == torch.bfloat16 else y)
-            for x, y in zip(outs["stock"], outs["lean"], strict=True)
+            for arm in ("lean", "leanint")
+            for x, y in zip(outs["stock"], outs[arm], strict=True)
         )
         # Negative control: a context token moved changes the stock ids.
         summary[B] = res
