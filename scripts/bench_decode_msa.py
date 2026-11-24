@@ -87,6 +87,7 @@ def _parse():
         help="whole TP group (8 TCs): scoring served vs split over the DCP groups",
     )
     p.add_argument("--attn", default="served", help="attention half for --tp8")
+    p.add_argument("--steps", default="", help="--comp: only these parts")
     p.add_argument(
         "--comp",
         action="store_true",
@@ -121,6 +122,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (  # noqa: E402
     msa_dcp_fused,
     msa_dcp_heads,
     msa_fp4,
+    msa_write,
 )
 
 AXIS = "dcp"
@@ -344,13 +346,13 @@ def _tp8_devices(dcp):
 
 def tp8_program(
     mesh, num_layers, attend, *, dcp, g, split, interpret, score_only=False, coll=True,
-    attn_only="",
+    attn_only="", localq=False,
 ):
     """`num_layers` layers in one `fori_loop` (the program size does not grow
     with the layer count, so long chains average out the host's noise)."""
     groups = 8 // dcp
 
-    def body(rank, grp, q, k, v, iq, ik, kv, idx, sc, sl, tb, cu, dist, had):
+    def body(rank, grp, q, k, v, iq, ik, kv, idx, sc, sl, tb, cu, dist, had, iqh):
         if attn_only:
             kk, vv, ii = (_gather_kv(k, v, iq, rank, dcp, g) if g > 1
                           else (k[:, None], v[:, None], iq[:, None]))  # fmt: skip
@@ -395,7 +397,9 @@ def tp8_program(
                     kk, vv, ik, kv, idx, sl, tb, cu, rank=rank, dcp=dcp,
                     scale_cache=sc, interpret=interpret,
                 )  # fmt: skip
-                if coll:
+                if localq:  # every index head computed on this rank (no gather)
+                    iq_all = (iqh + link).transpose(1, 0, 2)
+                elif coll:
                     iq_all = jax.lax.all_gather(
                         ii, GAXIS, axis=1, tiled=True
                     )  # [T, 4, D]
@@ -433,7 +437,7 @@ def tp8_program(
         jax.shard_map(
             body,
             mesh=mesh,
-            in_specs=(s, s) + (s,) * 5 + (s, s, s) + (r,) * 5,
+            in_specs=(s, s) + (s,) * 5 + (s, s, s) + (r,) * 6,
             out_specs=(s, s, s, s),
             check_vma=False,
         ),
@@ -497,6 +501,7 @@ def tp8_main(args, dcp, g, ctx, interpret):
         tail = (
             *(jax.device_put(jnp.asarray(m), rep) for m in meta),
             jax.device_put(jnp.asarray(msa_fp4.hadamard(D), jnp.bfloat16), rep),
+            jax.device_put(jnp.asarray(iq_heads, jnp.bfloat16), rep),
         )
 
         def make():
@@ -525,13 +530,14 @@ def tp8_main(args, dcp, g, ctx, interpret):
             mode, attn = spec.split(":")
             cases.append((spec, mode.startswith("split"), "score" in mode,
                           "nocoll" not in mode, attn,
-                          {"attnonly": "attend", "kernelonly": "kernel"}.get(mode, "")))  # fmt: skip
+                          {"attnonly": "attend", "kernelonly": "kernel"}.get(mode, ""),
+                          "localq" in mode))  # fmt: skip
         lo, hi = args.layers // 4, args.layers
-        for name, split, score_only, coll, attn, attn_only in cases:
+        for name, split, score_only, coll, attn, attn_only, localq in cases:
             mk = functools.partial(tp8_program, mesh, attend=VARIANTS[attn], dcp=dcp,
                                    g=g, split=split, interpret=interpret,
                                    score_only=score_only, coll=coll,
-                                   attn_only=attn_only)  # fmt: skip
+                                   attn_only=attn_only, localq=localq)  # fmt: skip
             p_hi = mk(hi)
             (t1, t1m), (tl, tlm) = timed(mk(lo)), timed(p_hi)
             n = max(hi - lo, 1)
@@ -588,8 +594,24 @@ def comp_main(args, dcp, g, ctx, interpret):
                                             interpret=interpret, scale_cache=sc,
                                             scale_row=srow).reshape(4 * T, 1, -1)
 
+        seq_id, pos_, valid = msa.token_positions(T, sl, cu)
+        pages_w = msa_dcp.owner_pages(tb.reshape(sl.shape[0], -1), seq_id, pos_, valid,
+                                      block_size=PAGE, rank=0, dcp=dcp)
+        kn, ks = msa_fp4.quantize(msa_fp4.rotate_keys(kk))
+        inib, isc = msa_fp4.quantize(msa_fp4.rotate_keys(ik))
+        kv_rows0 = jnp.concatenate([kn, kn], axis=-1).reshape(T, -1)
+        scales0 = jnp.stack([ks, ks], axis=-1).reshape(T, -1)
+
+        def write_runs_only(x, kv, idx, sc):
+            z = (x[0, 0, 0] * 0).astype(jnp.uint8)
+            return msa.write_caches(
+                [msa_write.Rows(kv, kv_rows0 + z, 4), msa_write.Rows(idx, inib + z, 4, isc),
+                 msa_write.SlotValues(sc, scales0)],
+                pages_w, pos_, max_num_seqs=sl.shape[0], interpret=interpret)
+
         s_served = jax.jit(served_scores)(iq4, idx, sc)
-        s_split = jax.jit(split_scores)(iq4, idx, sc)
+        has_split = hasattr(msa_dcp, "split_candidates")
+        s_split = jax.jit(split_scores)(iq4, idx, sc) if has_split else s_served
         parts = jnp.asarray(rng.standard_normal((groups, 4, T, 2 * TOPK)), jnp.float32)
 
         def chain(step):
@@ -607,6 +629,13 @@ def comp_main(args, dcp, g, ctx, interpret):
             "write": (kk, lambda x, kv, idx, sc: (lambda o: (o[0][0, 0, 0, :1], *o))(
                 msa_dcp.msa_write_dcp(x, x, ik, kv, idx, sl, tb, cu, rank=rank, dcp=dcp,
                                       scale_cache=sc, interpret=interpret))),
+            "noop": (kk, lambda x, kv, idx, sc: (x[0, 0, :1], kv, idx, sc)),
+            "write_quant": (kk, lambda x, kv, idx, sc: (jnp.sum(jnp.stack([
+                msa_fp4.quantize(msa_fp4.rotate_keys(x))[1].sum(),
+                msa_fp4.quantize(msa_fp4.rotate_keys(x + 1))[1].sum(),
+                msa_fp4.quantize(msa_fp4.rotate_keys(ik + x[0, 0, 0]))[1].sum()])), kv, idx, sc)),
+            "write_runs": (kk, lambda x, kv, idx, sc: (lambda o: (o[0][0, 0, 0, :1], *o))(
+                write_runs_only(x, kv, idx, sc))),
             "idx_served": (iq4, lambda x, kv, idx, sc: (served_scores(x, idx, sc), kv, idx, sc)),
             "idx_split": (iq4, lambda x, kv, idx, sc: (split_scores(x, idx, sc), kv, idx, sc)),
             "topk_served": (s_served, lambda x, kv, idx, sc: (msa_dcp.local_candidates(
@@ -620,8 +649,26 @@ def comp_main(args, dcp, g, ctx, interpret):
         }
         row = dict(conc=args.conc, tokens=T, keys_per_rank=keys,
                    idx_floor_us=keys * (D // 2 + 4) / HBM * 1e6)  # fmt: skip
+        for wflag in ("TPU_MINIMAX_M3_MSA_FUSED_WRITE_MAX_TOKENS",
+                      "TPU_MINIMAX_M3_MSA_WRITE_RUNS_IN_KERNEL_MAX_TOKENS"):  # fmt: skip
+            if os.environ.get(wflag, "0") == "0":
+                continue
+            # Bitwise check of the write path with the flag against without.
+            flag = os.environ[wflag]
+            outs_w = []
+            for val in ("0", flag):
+                os.environ[wflag] = val
+                fw = jax.jit(lambda kv, idx, sc: msa_dcp.msa_write_dcp(
+                    kk, kk * 0.5, ik, kv, idx, sl, tb, cu, rank=rank, dcp=dcp,
+                    scale_cache=sc, interpret=interpret))  # fmt: skip
+                outs_w.append([np.asarray(o) for o in fw(*(jnp.copy(c) for c in (kv, idx, sc)))])
+            row["write_bitwise"] = all(np.array_equal(a, b) for a, b in zip(*outs_w))
         lo, hi = args.layers // 4, args.layers
         for name, (x, step) in steps.items():
+            if args.steps and name not in args.steps.split(","):
+                continue
+            if not has_split and "split" in name:
+                continue
             fn = chain(step)
 
             def timed(n, batch=4):
