@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 
 from tests.models.minimax_m3.packing import pack, rounded
-from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_dcp, msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_dcp, msa_fp4, msa_indexer
 
 PAGE = 128
 HEAD_DIM = 128
@@ -28,16 +28,16 @@ TOPK = 16
 MAX_SEQS = 4
 
 
-def _case(q_lens, ctx_lens, pages_per_seq, cache_kind, pad, seed):
+def _case(q_lens, ctx_lens, pages_per_seq, cache_kind, pad, seed, max_seqs=MAX_SEQS):
     rng = np.random.default_rng(seed)
     num_seqs = len(q_lens)
     num_real = sum(q_lens)
-    num_pages = MAX_SEQS * pages_per_seq + 8
-    seq_lens = np.zeros(MAX_SEQS, np.int32)
+    num_pages = max_seqs * pages_per_seq + 8
+    seq_lens = np.zeros(max_seqs, np.int32)
     seq_lens[:num_seqs] = np.array(ctx_lens) + np.array(q_lens)
-    cu_q = np.full(MAX_SEQS + 1, num_real, np.int32)
+    cu_q = np.full(max_seqs + 1, num_real, np.int32)
     cu_q[: num_seqs + 1] = np.concatenate([[0], np.cumsum(q_lens)])
-    tables = rng.permutation(np.arange(1, num_pages))[: MAX_SEQS * pages_per_seq]
+    tables = rng.permutation(np.arange(1, num_pages))[: max_seqs * pages_per_seq]
     raw = rng.standard_normal((num_pages, PAGE, HEAD_DIM))
     if cache_kind == "fp4":
         nib, scale = msa_fp4.quantize(jnp.asarray(raw, jnp.float32))
@@ -106,6 +106,42 @@ def test_matches_scores_then_picks(
     )
 
 
+@pytest.mark.parametrize("cache_kind", [jnp.float8_e4m3fn, "fp4"])
+def test_long_request_in_decode_step_scores_bf16_queries(cache_kind):
+    """A request longer than a small tile in a decode-sized step (a short
+    chunk beside the decodes) is scored in small tiles with bf16 queries:
+    the candidates of `msa_indexer.block_scores` with every request in the
+    small class (where the token-order path scores it in an e4m3 large tile,
+    so not bit for bit)."""
+    rank, dcp, max_seqs = 0, 2, 24
+    q_lens = [8] * 6 + [136]
+    index_q, cache, seq_lens, tables, cu_q, num_seqs, num_real = _case(
+        q_lens, [3_000 + 977 * i for i in range(7)], 40, cache_kind, 3, 7, max_seqs
+    )
+    num_tokens = index_q.shape[0]
+    seq_id, pos, _ = msa.token_positions(num_tokens, seq_lens, cu_q)
+    local_lens = msa_dcp.local_seq_lens(seq_lens, block_size=PAGE, rank=rank, dcp=dcp)
+    picks = dict(topk=TOPK, init_blocks=0, local_blocks=1, rank=rank, dcp=dcp)
+    got = msa_dcp.decode_candidates(
+        index_q, cache, local_lens, tables, cu_q, num_seqs, seq_id, pos, **picks,
+        interpret=True,
+    )  # fmt: skip
+    options = msa.block_score_options()
+    scores = msa_indexer.block_scores(
+        index_q, cache, local_lens, tables, cu_q, num_seqs,
+        block_q=2 * options["block_q"],
+        small_pages_per_step=options["small_pages_per_step"],
+        transposed_tile_q=options["transposed_tile_q"],
+        interpret=True,
+    )  # fmt: skip
+    want = msa_dcp.pack_candidates(
+        *msa_dcp.local_candidates(scores, pos, block_size=PAGE, **picks, interpret=True)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(got)[:num_real], np.asarray(want)[:num_real]
+    )
+
+
 def _write_caches(cache_kind, num_pages, rng):
     if cache_kind == "fp4":
         nibbles = rng.integers(0, 16, (num_pages, PAGE, 3 * HEAD_DIM))
@@ -138,6 +174,8 @@ def _write_caches(cache_kind, num_pages, rng):
         ([8, 8, 8], [3 * 256 + 124, 9_000, 3], 4),  # one straddles a block boundary
         ([8, 23, 8], [9_000, 4_000, 300], 4),  # unaligned tile starts
         ([8] * 12, [5_000 + 997 * i for i in range(12)], 16),  # 12 runs, 96 rows
+        # A decode step of more rows than a small tile (c48's 192-row buckets).
+        ([8] * 20, [3_000 + 211 * i for i in range(20)], 24),
     ],
 )
 def test_folded_write_matches_write_then_candidates(

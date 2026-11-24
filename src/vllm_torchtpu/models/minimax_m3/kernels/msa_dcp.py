@@ -98,6 +98,9 @@ _PLAN_MAX_TOKENS = 64
 # Page buffers a decode step's folded write may keep in VMEM (every run's
 # pages, in and out): c48's 4-bit 128-row steps take ~5.6 MiB.
 _FOLDED_WRITE_VMEM_BYTES = 16 << 20
+# The f32 block scores `decode_candidates` keeps in VMEM (rows x this rank's
+# pages): c48's 384-row steps at 256K tokens take 1.5 MiB.
+_DECODE_SCORES_VMEM_BYTES = 16 << 20
 # A pair's prefill-sized steps pass the attention their own and the peer's
 # query heads as two arrays and swap back the peer's partials by a permute
 # (`attend_and_merge`): no concatenated copy of the queries (a fusion of
@@ -705,15 +708,29 @@ def _decode_candidates_kernel(
             runs(wait_out)
 
 
-def decodes_in_one_kernel(num_tokens: int, index_cache: jax.Array) -> bool:
+def decodes_in_one_kernel(
+    num_tokens: int, index_cache: jax.Array, max_num_seqs: int, pages_per_seq: int
+) -> bool:
     """Whether `decode_candidates` takes a step of `num_tokens` over this index
-    cache: no request can have more rows than the indexer's small tiles take
-    (`msa_indexer.block_scores` scores longer ones in large tiles, with e4m3
-    queries; the conditional that would route them cost more than the
-    kernel saves at c48's 176-264-row decode steps, twin j-90ea0b66), and the
-    pages are v3's (fp8 or bf16, 4-bit with their scales folded in)."""
+    cache: a step no larger than every request's verify rows
+    (`msa._DECODE_ROWS` each) or than the indexer's small tiles, whose block
+    scores fit `_DECODE_SCORES_VMEM_BYTES`, and pages of v3 (fp8 or bf16,
+    4-bit with their scales folded in).
+
+    A request of more rows than a small tile (a short prefill chunk in a
+    decode-sized step, absent from the c48 trace's mix) is scored in small
+    tiles too, with bf16 queries where `msa_indexer.block_scores` takes a
+    large e4m3 tile: no conditional per layer (that conditional, ~5.8 us per
+    layer at c48's 192-row steps, j-17330f6e, cost more than the kernel
+    saved when it routed such requests, twin j-90ea0b66)."""
     _, rows_per_page, _, _ = index_cache.shape
-    return num_tokens <= msa.block_score_options()["block_q"] and (
+    rows = max(msa.block_score_options()["block_q"], max_num_seqs * msa._DECODE_ROWS)
+    # `decode_candidates`' score scratch: whole row blocks of its page groups.
+    score_rows = -(-num_tokens // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS + _LANES
+    score_cols = -(-pages_per_seq // _LANES) * _LANES + 2 * _LANES
+    return (
+        num_tokens <= rows and 4 * score_rows * score_cols <= _DECODE_SCORES_VMEM_BYTES
+    ) and (
         not msa_fp4.is_fp4(index_cache)
         or msa_fp4.scales_in_page(rows_per_page, index_cache.dtype)
     )
@@ -748,7 +765,12 @@ def decode_candidates(
     requests and positions (`msa.token_positions`)."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, _, _ = index_cache.shape
-    if not decodes_in_one_kernel(num_tokens, index_cache):
+    if not decodes_in_one_kernel(
+        num_tokens,
+        index_cache,
+        local_lens.shape[0],
+        block_tables.shape[0] // local_lens.shape[0],
+    ):
         raise NotImplementedError(
             f"no one-kernel decode of {num_tokens} tokens over {index_cache.shape}"
         )
@@ -1260,7 +1282,12 @@ def msa_write_and_candidates_dcp(
     fold_write = (
         num_heads == 1
         and not msa_indexer.is_prefill_step(num_tokens, max_num_seqs)
-        and decodes_in_one_kernel(num_tokens, index_cache)
+        and decodes_in_one_kernel(
+            num_tokens,
+            index_cache,
+            max_num_seqs,
+            block_tables.shape[0] // max_num_seqs,
+        )
         and max_runs * run_bytes <= _FOLDED_WRITE_VMEM_BYTES
     )
     if not fold_write:
