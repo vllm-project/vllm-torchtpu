@@ -38,16 +38,25 @@ def _pack(keys, layout):
 
 
 @pytest.mark.parametrize(
-    "page_size,max_model_len",
-    [(128, 8192), (128, 50000), (128, 98816), (256, 8192), (256, 98816)],
+    "page_size,max_model_len,reuse_keys",
+    [
+        (128, 8192, False),
+        (128, 50000, False),
+        (128, 98816, False),
+        (256, 8192, False),
+        (256, 98816, False),
+        (256, 81920, True),
+    ],
 )
-def test_paged_mqa_logits_matches_reference(page_size, max_model_len):
+def test_paged_mqa_logits_matches_reference(page_size, max_model_len, reuse_keys):
     if jax.default_backend() != "tpu":
         pytest.skip("Packed FP8 scoring requires TPU")
     rng = np.random.default_rng(7)
     counts = np.array([6, 5, 6])  # A ragged request leaves a partial query tile.
-    # Near-full, empty-to-short, and mid-width histories; one invalid page.
-    bases = np.array([max_model_len - 5, 0, max_model_len // 2 - 3])
+    # Near-full, empty-to-short, and mid-width histories; one invalid page. A
+    # resident tile instead ends one in a live rung below the full width.
+    mid = max_model_len - 6000 if reuse_keys else max_model_len // 2 - 3
+    bases = np.array([max_model_len - 5, 0, mid])
     lengths = np.concatenate([b + np.arange(c) for b, c in zip(bases, counts)])
     owners = np.repeat(np.arange(len(counts)), counts)
     per_request = -(-max_model_len // page_size)
@@ -74,6 +83,7 @@ def test_paged_mqa_logits_matches_reference(page_size, max_model_len):
         q_scale=jnp.ones_like(weights),
         query_size=6,
         cache_layout=layout,
+        reuse_keys=reuse_keys,
     )
     scores = np.asarray(result)
 
