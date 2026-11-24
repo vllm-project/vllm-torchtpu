@@ -36,6 +36,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from typing import Any
 
 import cap_pr_tpu_concurrency
 
@@ -87,6 +88,18 @@ def _split_labels(raw: str) -> tuple[str, ...]:
     return tuple(item for item in raw.split(",") if item)
 
 
+def _and_list(items: Sequence[str]) -> str:
+    """Join `items` as prose: "", "a", "a and b", "a, b and c"."""
+    if not items:
+        return ""
+    return " and ".join(filter(None, (", ".join(items[:-1]), items[-1])))
+
+
+def _lanes_phrase(lanes: Sequence[str]) -> str:
+    """Name `lanes` as prose: "tests lane", "tests and perf lanes"."""
+    return f"{_and_list(lanes)} lane{'s' if len(lanes) > 1 else ''}"
+
+
 @dataclass(frozen=True)
 class BuildContext:
     """Immutable snapshot of the build environment read at startup."""
@@ -113,6 +126,10 @@ class BuildContext:
     ci_pr_push_cpu_only: bool = False
     ci_extras: tuple[str, ...] = ()
     mq_extras: tuple[str, ...] = ()
+    # CI_TPU_GENERATIONS: empty runs DEFAULT_TPU_GENERATIONS,
+    # CI_TPU_GENERATIONS_ALL every generation, and a key of TPU_GENERATIONS
+    # that generation alone (on a manual build only; see tpu_generations_note).
+    ci_tpu_generations: str = ""
 
     @property
     def is_pr(self) -> bool:
@@ -279,6 +296,7 @@ class BuildContext:
             ci_precheck=ci_precheck,
             ci_pr_push_cpu_only=ci_pr_push_cpu_only,
             ci_extras=ci_extras,
+            ci_tpu_generations=env.get("CI_TPU_GENERATIONS", "").strip(),
         )
 
 
@@ -355,6 +373,90 @@ _PR_SUITES: dict[str, Suite] = {
 }
 
 
+@dataclass(frozen=True)
+class TpuGeneration:
+    """What differs between the uploads of a file in TPU_GENERATION_FILES.
+
+    The pod shapes and the perf accelerator type reach the file as upload-time
+    variables (upload_env). The step key prefix (Buildkite rejects a duplicate
+    key) and the label prefix (GitHub names a commit status after its step's
+    label) are stamped on the steps by stamp_tpu_generation, so the step files
+    name neither. Every generation has both, so adding one adds an entry here
+    and renames no step of the others.
+    """
+
+    name: str
+    shape_single: str
+    shape_multi: str
+    key_prefix: str
+    label_prefix: str
+    # The pod's TPU_ACCELERATOR_TYPE, as tpu_info.get_chip_version reads it,
+    # which takes anything it does not know for TPU7x. run_eval_flow.sh also
+    # picks the chip's perf baselines with it.
+    accelerator_type: str
+
+    def upload_env(self) -> dict[str, str]:
+        # TPU_ACCELERATOR_TYPE reaches the pod under the same name. The others
+        # fill in SHAPE (either shape) and the `if` of a step only one
+        # generation runs, so they have names of their own.
+        return {
+            "TPU_GENERATION": self.name,
+            "KUBE_SHAPE_SINGLE": self.shape_single,
+            "KUBE_SHAPE_MULTI": self.shape_multi,
+            "TPU_ACCELERATOR_TYPE": self.accelerator_type,
+        }
+
+
+TPU_V7X = TpuGeneration(
+    name="v7x",
+    shape_single="tpu7x-standard-1t/1x1x1",
+    shape_multi="tpu7x-standard-4t/2x2x1",
+    key_prefix="tpu7x_",
+    label_prefix="v7x ",
+    accelerator_type="tpu7x",
+)
+TPU_V6E = TpuGeneration(
+    name="v6e",
+    shape_single="ct6e-standard-1t/1x1",
+    shape_multi="ct6e-standard-8t/2x4",
+    key_prefix="tpu6e_",
+    label_prefix="v6e ",
+    accelerator_type="v6e",
+)
+# Pipeline files uploaded once per TPU generation in the listed order (last
+# shows/queues first in Buildkite). Files not listed here are uploaded once.
+TPU_GENERATION_FILES: Mapping[str, tuple[TpuGeneration, ...]] = {
+    ".buildkite/pipeline_tests.yml": (TPU_V6E, TPU_V7X),
+    ".buildkite/pipeline_integration.yml": (TPU_V6E, TPU_V7X),
+    ".buildkite/pipeline_perf.yml": (TPU_V6E, TPU_V7X),
+}
+# The generations those files go up for when CI_TPU_GENERATIONS is unset.
+DEFAULT_TPU_GENERATIONS: tuple[TpuGeneration, ...] = (TPU_V7X,)
+# The generation whose nightly tests-lane steps a verified commit pair needs
+# passed. pipeline_verify.yml's nightly report and nightly_report.sh name those
+# steps by key, and take the key prefix from upload_envs.
+VERIFIED_TPU_GENERATION = TPU_V7X
+# CI_TPU_GENERATIONS=all sends those files up for every generation they list,
+# side by side, on any build. A manual build may instead name one generation,
+# as its steps' labels do (v6e, v7x), to run it alone: auditing v6e then holds
+# no v7x slices. The generation brings its shapes, so the build names no
+# KUBE_SHAPE_* of its own. The variable is not named TPU_VERSION because that
+# names one chip to the scripts and model files that read it.
+CI_TPU_GENERATIONS_ALL = "all"
+TPU_GENERATIONS: Mapping[str, TpuGeneration] = {
+    gen.name: gen for gens in TPU_GENERATION_FILES.values() for gen in gens
+}
+
+
+def _check_ci_tpu_generations(value: str) -> None:
+    """Raise `BootstrapError` unless `value` is empty or a known value."""
+    if value and value != CI_TPU_GENERATIONS_ALL and value not in TPU_GENERATIONS:
+        raise BootstrapError(
+            f"ERROR: unknown CI_TPU_GENERATIONS '{value}'; values are: "
+            f"{' '.join((CI_TPU_GENERATIONS_ALL, *TPU_GENERATIONS))}"
+        )
+
+
 def choose_suite(ctx: BuildContext) -> Suite:
     """Return the `Suite` for `ctx`; `CI_SUITE` takes precedence."""
     if ctx.suite_override:
@@ -376,6 +478,85 @@ def choose_suite(ctx: BuildContext) -> Suite:
             return _PR_SUITES["pr+perf"]
         return _PR_SUITES["pr"]
     return SUITES["full"] if ctx.nightly_env or ctx.is_release else SUITES["default"]
+
+
+def tpu_generations_note(ctx: BuildContext, suite: Suite) -> str | None:
+    """Check CI_TPU_GENERATIONS against the build; return its annotation, if any.
+
+    Unset runs DEFAULT_TPU_GENERATIONS, CI_TPU_GENERATIONS_ALL every generation
+    a lane lists (on any build), and a key of TPU_GENERATIONS that generation
+    alone (see upload_envs). One generation alone is only for a UI or API
+    build that is not a PR, merge-queue, /ci, release, tag or integration
+    build, since those must not skip v7x.
+
+    Raises BootstrapError for an unknown value, a disallowed single generation,
+    or a value that no lane of the build can use. Returns None when the value
+    is unset or CI_TPU_GENERATIONS_ALL adds nothing beyond the defaults.
+    """
+    value = ctx.ci_tpu_generations
+    if not value:
+        return None
+    _check_ci_tpu_generations(value)
+    single = TPU_GENERATIONS.get(value)
+    lanes = [lane for stage in suite.stages for lane in stage]
+    if single is not None and (
+        ctx.source not in ("ui", "api")
+        or ctx.is_pr
+        or ctx.is_merge_queue
+        or ctx.is_ci_command
+        or ctx.is_release
+        or ctx.tag
+        or ctx.is_integration
+        or "promote" in lanes
+    ):
+        raise BootstrapError(
+            f"ERROR: CI_TPU_GENERATIONS={value} runs one TPU generation, which "
+            "only a UI or API build that is not a PR, merge-queue, /ci, release, "
+            "tag or integration build may do; set CI_TPU_GENERATIONS="
+            f"{CI_TPU_GENERATIONS_ALL} to run every generation, or leave it unset "
+            "to run the default ones"
+        )
+    # Each lane of the build in TPU_GENERATION_FILES, with the generations its
+    # file lists.
+    in_build = {
+        lane: gens
+        for lane in lanes
+        if (gens := TPU_GENERATION_FILES.get(f".buildkite/pipeline_{lane}.yml"))
+    }
+    if not in_build:
+        per_generation = [
+            pathlib.Path(p).stem.removeprefix("pipeline_") for p in TPU_GENERATION_FILES
+        ]
+        raise BootstrapError(
+            f"ERROR: CI_TPU_GENERATIONS={value} picks the TPU generations of the "
+            f"{_and_list(per_generation)} lanes, and this build runs none"
+        )
+    if single is not None:
+        runs = [lane for lane, gens in in_build.items() if single in gens]
+        if not runs:
+            raise BootstrapError(
+                f"ERROR: CI_TPU_GENERATIONS={value} runs only TPU {single.name} "
+                "steps, and no lane of this build has any"
+            )
+        return (
+            f"Runs only the TPU {single.name} steps of the {_lanes_phrase(runs)} "
+            f"(`CI_TPU_GENERATIONS={value}`)."
+        )
+    extra = list(
+        dict.fromkeys(
+            gen
+            for gens in in_build.values()
+            for gen in gens
+            if gen not in DEFAULT_TPU_GENERATIONS
+        )
+    )
+    if not extra:
+        return None
+    runs = [lane for lane, gens in in_build.items() if any(g in gens for g in extra)]
+    return (
+        f"Also runs the TPU {_and_list([g.name for g in extra])} steps of the "
+        f"{_lanes_phrase(runs)} (`CI_TPU_GENERATIONS={CI_TPU_GENERATIONS_ALL}`)."
+    )
 
 
 # Build kind -> (Buildkite job priority, Kueue workload priority class).
@@ -784,6 +965,75 @@ def _merge_queue_pr_extras(
     return latest_extras, latest_actor, None
 
 
+def _own_steps(steps: Sequence[Any]) -> list[dict[str, Any]]:
+    """The step objects of `steps`, with each group followed by its steps."""
+    found: list[dict[str, Any]] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        found.append(step)
+        if isinstance(step.get("steps"), list):
+            found.extend(_own_steps(step["steps"]))
+    return found
+
+
+def stamp_tpu_generation(steps: Sequence[Any], generation: TpuGeneration) -> None:
+    """Stamp `generation`'s key and label prefixes on a parsed pipeline's steps.
+
+    `steps` is the `steps` of `pipeline upload --dry-run --format json`, edited
+    in place. Every key the pipeline defines takes the key prefix, and so does
+    a `depends_on` entry that names one of them; a dependency on a step of
+    another upload (the image builds) is left as it is. Every label and group
+    name takes the label prefix.
+
+    Raises BootstrapError for a step whose key, label or depends_on is not of a
+    form read here, since a step passed over would go up under another
+    generation's name.
+    """
+    own = _own_steps(steps)
+    for step in own:
+        for field in ("key", "label", "group"):
+            if field in step and not isinstance(step[field], str):
+                raise BootstrapError(
+                    f"ERROR: cannot stamp TPU {generation.name} on a step whose "
+                    f"`{field}` is {step[field]!r}"
+                )
+        # `id`, `identifier` and `name` are Buildkite's aliases of `key` and
+        # `label`. The step files use neither, and one that did would keep its
+        # other generation's name.
+        for alias in ("id", "identifier", "name"):
+            if alias in step:
+                raise BootstrapError(
+                    f"ERROR: cannot stamp TPU {generation.name} on a step that "
+                    f"uses `{alias}`; use `key` and `label`"
+                )
+    defined = {step["key"] for step in own if "key" in step}
+
+    def stamped(dependency: Any) -> Any:
+        if isinstance(dependency, str):
+            if dependency in defined:
+                return generation.key_prefix + dependency
+            return dependency
+        if isinstance(dependency, dict) and isinstance(dependency.get("step"), str):
+            return {**dependency, "step": stamped(dependency["step"])}
+        raise BootstrapError(
+            f"ERROR: cannot stamp TPU {generation.name} on depends_on entry "
+            f"{dependency!r}"
+        )
+
+    for step in own:
+        if "key" in step:
+            step["key"] = generation.key_prefix + step["key"]
+        for field in ("label", "group"):
+            if field in step:
+                step[field] = generation.label_prefix + step[field]
+        depends_on = step.get("depends_on")
+        if isinstance(depends_on, list):
+            step["depends_on"] = [stamped(d) for d in depends_on]
+        elif depends_on is not None:
+            step["depends_on"] = stamped(depends_on)
+
+
 def upload_with_priority(
     yaml_file: str,
     *,
@@ -793,62 +1043,141 @@ def upload_with_priority(
     pr_tpu_concurrency_group: str | None,
     pr_tpu_jobs_per_author: int = PR_TPU_JOBS_PER_AUTHOR,
     env: Mapping[str, str],
+    tpu_generation: str = "",
 ) -> None:
-    """Upload one pipeline YAML file with priority and optional PR TPU capping."""
-    print(f"--- :pipeline: Uploading {yaml_file} with priority {job_priority}")
+    """Upload one pipeline YAML file with priority and optional PR TPU capping.
+
+    `tpu_generation` names the TPU generation whose variables `env` carries,
+    for a file that goes up once per generation. Its key and label prefixes
+    are stamped on the steps here (see stamp_tpu_generation), and that upload
+    fails with BootstrapError rather than go up unstamped: its steps would
+    take the keys and labels of every other generation's.
+    """
+    upload = f"{yaml_file} for TPU {tpu_generation}" if tpu_generation else yaml_file
+    tpu = f"TPU {tpu_generation}" if tpu_generation else "TPU"
+    print(f"--- :pipeline: Uploading {upload} with priority {job_priority}")
     raw_yaml = (repo_root / yaml_file).read_text(encoding="utf-8")
     payload = prepare_upload_yaml(raw_yaml, job_priority=job_priority, nightly=nightly)
+    # The generation to stamp on the steps, if this upload is one's.
+    stamping = TPU_GENERATIONS.get(tpu_generation)
 
-    # A pull-request build's TPU steps go in its author's concurrency group. The
-    # file is read once by the agent via --dry-run (anchors and interpolation
-    # resolved), the group is added, and the result is uploaded as is. If any of
+    if stamping is None and not pr_tpu_concurrency_group:
+        _agent("pipeline", "upload", input_text=payload, env=env)
+        return
+
+    # The file is read once by the agent via --dry-run (anchors and
+    # interpolation resolved), edited, and the result is uploaded as is.
+    pipeline: dict[str, Any] | None = None
+    problem = ""
+    dry_run = _agent(
+        "pipeline",
+        "upload",
+        "--dry-run",
+        "--format",
+        "json",
+        input_text=payload,
+        check=False,
+        env=env,
+    )
+    if dry_run.returncode != 0 or dry_run.stdout is None:
+        problem = f"--dry-run exited {dry_run.returncode}"
+    else:
+        try:
+            parsed = json.loads(dry_run.stdout)
+        except ValueError as exc:
+            problem = f"--dry-run did not print JSON: {exc}"
+        else:
+            if isinstance(parsed, dict):
+                pipeline = parsed
+            else:
+                problem = (
+                    f"expected JSON object from --dry-run, got {type(parsed).__name__}"
+                )
+
+    if stamping is not None:
+        if pipeline is None:
+            raise BootstrapError(
+                f"ERROR: could not read {yaml_file} to stamp {tpu} on its steps "
+                f"({problem}); not uploading it unstamped"
+            )
+        stamp_tpu_generation(pipeline.get("steps") or [], stamping)
+
+    # A pull-request build's TPU steps go in its author's concurrency group. If
     # that fails the file goes up uncapped rather than failing the build.
     if pr_tpu_concurrency_group:
-        dry_run = _agent(
-            "pipeline",
-            "upload",
-            "--dry-run",
-            "--format",
-            "json",
-            input_text=payload,
-            check=False,
-            env=env,
-        )
-        if dry_run.returncode == 0 and dry_run.stdout is not None:
+        capped = None
+        if pipeline is not None:
+            # On a copy: a cap that fails part-way leaves `pipeline` as it was.
+            candidate = json.loads(json.dumps(pipeline))
             try:
-                pipeline = json.loads(dry_run.stdout)
-                if not isinstance(pipeline, dict):
-                    raise TypeError(
-                        "expected JSON object from --dry-run, "
-                        f"got {type(pipeline).__name__}"
-                    )
                 cap_pr_tpu_concurrency.cap(
-                    pipeline.get("steps") or [],
+                    candidate.get("steps") or [],
                     pr_tpu_concurrency_group,
                     pr_tpu_jobs_per_author,
                 )
-                capped = json.dumps(pipeline) + "\n"
             except Exception as exc:
                 print(
-                    f"WARNING: failed to cap TPU concurrency for {yaml_file}: {exc}",
+                    f"WARNING: failed to cap {tpu} concurrency for {yaml_file}: {exc}",
                     file=sys.stderr,
                 )
             else:
-                _agent(
-                    "pipeline",
-                    "upload",
-                    "--no-interpolation",
-                    input_text=capped,
-                    env=env,
+                capped = candidate
+        if capped is None:
+            if problem:
+                print(
+                    f"WARNING: failed to cap {tpu} concurrency for {yaml_file}: "
+                    f"{problem}",
+                    file=sys.stderr,
                 )
-                return
-        print(
-            f"WARNING: could not put {yaml_file} in {pr_tpu_concurrency_group}; "
-            "uploading it uncapped",
-            file=sys.stderr,
-        )
+            print(
+                f"WARNING: could not put {tpu} {yaml_file} in "
+                f"{pr_tpu_concurrency_group}; uploading it uncapped",
+                file=sys.stderr,
+            )
+        else:
+            pipeline = capped
 
-    _agent("pipeline", "upload", input_text=payload, env=env)
+    if pipeline is None:
+        _agent("pipeline", "upload", input_text=payload, env=env)
+        return
+    _agent(
+        "pipeline",
+        "upload",
+        "--no-interpolation",
+        input_text=json.dumps(pipeline) + "\n",
+        env=env,
+    )
+
+
+def upload_envs(path: str, ci_tpu_generations: str = "") -> tuple[dict[str, str], ...]:
+    """Return the extra variables of each upload of `path`, in upload order.
+
+    A file in TPU_GENERATION_FILES goes up once per generation in
+    DEFAULT_TPU_GENERATIONS, with that generation's variables; with
+    CI_TPU_GENERATIONS_ALL, once per generation it lists; and with a key of
+    TPU_GENERATIONS, for that generation alone; an unknown `ci_tpu_generations`
+    is refused. Any other file goes up once, whatever `ci_tpu_generations` is,
+    with the two key prefixes a step there needs to name per-generation steps
+    (the nightly report, the tests lane's): TPU_VERIFIED_KEY_PREFIX,
+    VERIFIED_TPU_GENERATION's, for the steps a verified pair needs passed, and
+    TPU_KEY_PREFIX for the steps to wait on, which are the same ones unless
+    `ci_tpu_generations` names one generation and the build has only its.
+    """
+    single = TPU_GENERATIONS.get(ci_tpu_generations)
+    if path not in TPU_GENERATION_FILES:
+        return (
+            {
+                "TPU_KEY_PREFIX": (single or VERIFIED_TPU_GENERATION).key_prefix,
+                "TPU_VERIFIED_KEY_PREFIX": VERIFIED_TPU_GENERATION.key_prefix,
+            },
+        )
+    _check_ci_tpu_generations(ci_tpu_generations)
+    generations = TPU_GENERATION_FILES[path]
+    if single is not None:
+        generations = tuple(g for g in generations if g is single)
+    elif ci_tpu_generations != CI_TPU_GENERATIONS_ALL:
+        generations = tuple(g for g in generations if g in DEFAULT_TPU_GENERATIONS)
+    return tuple(generation.upload_env() for generation in generations)
 
 
 def upload_stages(
@@ -863,6 +1192,8 @@ def upload_stages(
     The `wait` step gates `rest` on every step uploaded in `stages[0]` (including
     both Docker image builds in `pipeline_build.yml`, such as `-omni`, and all
     `pipeline_cpu.yml` checks); a retried uploader skips lanes it already uploaded.
+    A file in TPU_GENERATION_FILES goes up once per generation
+    CI_TPU_GENERATIONS picks (see upload_envs).
     """
     for stage in stages:
         for lane in stage:
@@ -878,6 +1209,16 @@ def upload_stages(
     job_priority = int(_env_or(child_env, "JOB_PRIORITY", str(PRIORITIES["other"][0])))
     nightly = _env_or(child_env, "NIGHTLY", "0") == "1"
     concurrency_group = child_env.get("PR_TPU_CONCURRENCY_GROUP") or None
+    # Checked by run_bootstrap, and passed on to a later stage's uploader in its
+    # step env below. Checked again here, before anything goes up, for an
+    # uploader run by hand.
+    ci_tpu_generations = child_env.get("CI_TPU_GENERATIONS", "").strip()
+    if any(
+        f".buildkite/pipeline_{lane}.yml" in TPU_GENERATION_FILES
+        for stage in stages
+        for lane in stage
+    ):
+        _check_ci_tpu_generations(ci_tpu_generations)
 
     # Buildkite inserts each `pipeline upload` right after the currently running
     # step (LIFO), so upload `wait` + the next-stage uploader first and then
@@ -906,6 +1247,7 @@ def upload_stages(
             k: child_env[k]
             for k in (
                 "CI_FLEET",
+                "CI_TPU_GENERATIONS",
                 "JOB_PRIORITY",
                 "NIGHTLY",
                 "PR_TPU_CONCURRENCY_GROUP",
@@ -942,25 +1284,32 @@ def upload_stages(
         )
 
     for lane in reversed(stages[0]):
-        meta_key = f"upload-stages:{stage_key}:{lane}"
-        if (
-            _agent(
-                "meta-data", "exists", meta_key, check=False, env=child_env
-            ).returncode
-            == 0
-        ):
-            print(f"Skipping {lane} (already uploaded for {stage_key})")
-            continue
         lane_file = f".buildkite/pipeline_{lane}.yml"
-        upload_with_priority(
-            lane_file,
-            repo_root=repo_root,
-            job_priority=job_priority,
-            nightly=nightly,
-            pr_tpu_concurrency_group=concurrency_group,
-            env=child_env,
-        )
-        _agent("meta-data", "set", meta_key, "1", env=child_env)
+        # A file in TPU_GENERATION_FILES goes up once per generation, each with
+        # its own record, so a retried uploader sends up only the ones it has
+        # not: Buildkite rejects a step key uploaded twice.
+        for extra_env in upload_envs(lane_file, ci_tpu_generations):
+            generation = extra_env.get("TPU_GENERATION", "")
+            upload = f"{lane}:{generation}" if generation else lane
+            meta_key = f"upload-stages:{stage_key}:{upload}"
+            if (
+                _agent(
+                    "meta-data", "exists", meta_key, check=False, env=child_env
+                ).returncode
+                == 0
+            ):
+                print(f"Skipping {upload} (already uploaded for {stage_key})")
+                continue
+            upload_with_priority(
+                lane_file,
+                repo_root=repo_root,
+                job_priority=job_priority,
+                nightly=nightly,
+                pr_tpu_concurrency_group=concurrency_group,
+                env={**child_env, **extra_env},
+                tpu_generation=generation,
+            )
+            _agent("meta-data", "set", meta_key, "1", env=child_env)
     return 0
 
 
@@ -1129,6 +1478,30 @@ def run_bootstrap(
         suite_note,
         env=child_env,
     )
+    try:
+        tpu_note = tpu_generations_note(ctx, suite)
+    except BootstrapError as exc:
+        _agent(
+            "annotate",
+            "--style",
+            "error",
+            "--context",
+            "ci-tpu-generations",
+            str(exc),
+            env=child_env,
+        )
+        raise
+    if tpu_note is not None:
+        print(tpu_note)
+        _agent(
+            "annotate",
+            "--style",
+            "info",
+            "--context",
+            "ci-tpu-generations",
+            tpu_note,
+            env=child_env,
+        )
 
     # 5. Env exports (NIGHTLY, OMNI_IMAGE_SKIP, PR_TPU_CONCURRENCY_GROUP).
     if nightly:

@@ -34,18 +34,26 @@ steps:
     key: "nightly_report"
     # The suites the matrices are built from, and the nightly tests-lane steps a
     # verified commit pair also needs passed. It runs whatever their outcome.
+    # bootstrap.py (upload_envs) names the tests-lane steps by key prefix:
+    # TPU_KEY_PREFIX for the ones to wait on, which are v7x's unless the build
+    # runs one TPU generation alone (CI_TPU_GENERATIONS=v6e) and has only that
+    # generation's, and TPU_VERIFIED_KEY_PREFIX for the ones nightly_report.sh
+    # needs passed, which are always v7x's. Neither has a default here: the
+    # prefix is defined in bootstrap.py alone.
     depends_on:
       - "v6e-group"
       - "v7x-group"
       - "typecheck_full"
       - "unit_tests_cpu_nightly"
-      - "unit_tests_general_nightly"
-      - "unit_tests_multichip_nightly"
-      - "unit_tests_spec_decode_nightly"
-      - "unit_tests_spec_decode_multichip_nightly"
-      - "unit_tests_omni_nightly"
-      - "unit_tests_omni_multichip_nightly"
+      - "${TPU_KEY_PREFIX}unit_tests_general_nightly"
+      - "${TPU_KEY_PREFIX}unit_tests_multichip_nightly"
+      - "${TPU_KEY_PREFIX}unit_tests_spec_decode_nightly"
+      - "${TPU_KEY_PREFIX}unit_tests_spec_decode_multichip_nightly"
+      - "${TPU_KEY_PREFIX}unit_tests_omni_nightly"
+      - "${TPU_KEY_PREFIX}unit_tests_omni_multichip_nightly"
     allow_dependency_failure: true
+    env:
+      TPU_VERIFIED_KEY_PREFIX: "${TPU_VERIFIED_KEY_PREFIX}"
     agents:
       queue: cpu
     commands:
