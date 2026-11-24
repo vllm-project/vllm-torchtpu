@@ -319,6 +319,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
     TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
     TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_DCP_HP_DECODE_MERGE_A2A: bool = False
     TPU_MINIMAX_M3_INDEX_FOLD_OPT: str = ""
     TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT: int = 8
     TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT: bool = False
@@ -2127,6 +2128,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reduce-scatter of the weighted partials. 0 = off.
     "TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS", 0
+    ),
+    # MiniMax M3 head-parallel prefill steps: merge the decode rows' DCP
+    # partials (static max_num_seqs * decode_rows rows) by the all-to-all +
+    # f32 merge kernel of TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS, on
+    # those steps only (decode-only steps keep their merge). At c64 DCP4 the
+    # SparseCore reduce-scatter of the bf16[dcp * Hl, 512, 128] partials
+    # shares the SparseCores with the output projection's weight all-gather
+    # and waits behind it (~187 us per layer served, ~45 us alone); the
+    # all-to-all stays off the SparseCores. f32 merge: more precise than the
+    # bf16 reduce-scatter, not bit-identical to it.
+    "TPU_MINIMAX_M3_DCP_HP_DECODE_MERGE_A2A": env_bool(
+        "TPU_MINIMAX_M3_DCP_HP_DECODE_MERGE_A2A", default=False
     ),
     # MiniMax M3 sharded index scores (`msa.partial_block_scores`): "gather"
     # folds the index heads into query rows by a gather instead of a

@@ -173,13 +173,20 @@ def decode_row_plan(
 
 
 def merge_partials(
-    out: jax.Array, lse: jax.Array, axis: str, *, rs_out_precision: bool
+    out: jax.Array,
+    lse: jax.Array,
+    axis: str,
+    *,
+    rs_out_precision: bool,
+    a2a: bool = False,
+    interpret: bool = False,
 ) -> jax.Array:
     """`ops.msa.merge_head_partials` inside the SPMD program: head-major
     partials ``out [H, T, D]``, ``lse [H, T]`` -> this rank's heads,
-    unrotated, ``[T, H / dcp, D]``."""
-    if out.shape[1] <= _merge_a2a_max_tokens():
-        return _merge_partials_a2a(out, lse, axis)
+    unrotated, ``[T, H / dcp, D]``. `a2a`: merge by `_merge_partials_a2a`
+    whatever the row count."""
+    if a2a or out.shape[1] <= _merge_a2a_max_tokens():
+        return _merge_partials_a2a(out, lse, axis, interpret=interpret)
     lse = lse.astype(jnp.float32).T  # token-major across the gather
     lses = jax.lax.all_gather(lse, axis, axis=0)
     weight = jnp.exp(lse - jax.nn.logsumexp(lses, axis=0)).T[..., None]
@@ -210,7 +217,9 @@ def _merge_a2a_max_tokens() -> int:
     return limit
 
 
-def _merge_partials_a2a(out: jax.Array, lse: jax.Array, axis: str) -> jax.Array:
+def _merge_partials_a2a(
+    out: jax.Array, lse: jax.Array, axis: str, *, interpret: bool = False
+) -> jax.Array:
     """`merge_partials` by one all-to-all of the partials' head blocks (and
     one of their LSEs) and `msa_dcp.merge_partials`, which weights and sums
     them in f32 and unrotates in one pass. The reduce-scatter path rounds
@@ -225,7 +234,7 @@ def _merge_partials_a2a(out: jax.Array, lse: jax.Array, axis: str) -> jax.Array:
     parts = jax.lax.all_to_all(parts, axis, 0, 0, tiled=True)
     lses = jax.lax.all_to_all(lses, axis, 0, 0, tiled=True)
     hadamard = jnp.asarray(msa_fp4.hadamard(head_dim), jnp.bfloat16)
-    merged = msa_dcp.merge_partials(parts, lses, hadamard)
+    merged = msa_dcp.merge_partials(parts, lses, hadamard, interpret=interpret)
     return merged.reshape(num_tokens, local, head_dim)
 
 
@@ -246,6 +255,7 @@ def _dcp_attend(
     rs_out_precision,
     interpret,
     q_gathered=False,
+    merge_a2a=False,
 ):
     """The DCP attention of rows ``q [R, Hl, D]`` (this rank's rotated query
     heads) with this rank's packed ``candidates [R, G * 2 * topk]``.
@@ -270,7 +280,14 @@ def _dcp_attend(
         scale_cache=scale_cache,
         interpret=interpret,
     )
-    return merge_partials(out, lse, axis, rs_out_precision=rs_out_precision)
+    return merge_partials(
+        out,
+        lse,
+        axis,
+        rs_out_precision=rs_out_precision,
+        a2a=merge_a2a,
+        interpret=interpret,
+    )
 
 
 def _per_token(seq_id: jax.Array, table: jax.Array) -> jax.Array:
@@ -785,6 +802,28 @@ def _own_selection(candidates, *, dcp, replicas, topk, axis, interpret):
     return selected
 
 
+HP_DECODE_MERGE_A2A_ENV = "TPU_MINIMAX_M3_DCP_HP_DECODE_MERGE_A2A"
+_hp_decode_merge_a2a_logged = False
+
+
+def hp_decode_merge_a2a() -> bool:
+    """TPU_MINIMAX_M3_DCP_HP_DECODE_MERGE_A2A, read at trace time through
+    `envs`: head-parallel steps merge their decode rows' partials by
+    `_merge_partials_a2a`."""
+    global _hp_decode_merge_a2a_logged
+    from vllm_torchtpu import envs
+
+    on = bool(envs.TPU_MINIMAX_M3_DCP_HP_DECODE_MERGE_A2A)
+    if on and not _hp_decode_merge_a2a_logged:
+        _hp_decode_merge_a2a_logged = True
+        init_logger(__name__).warning(
+            "%s=1: head-parallel steps merge the decode rows' DCP partials "
+            "by all-to-all + f32 kernel.",
+            HP_DECODE_MERGE_A2A_ENV,
+        )
+    return on
+
+
 HP_ROUND_FACTOR_ENV = "TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR"
 _round_factor_logged = False
 
@@ -1161,6 +1200,7 @@ def attend_and_merge(
             cu_d,
             rs_out_precision=rs_out_precision,
             q_gathered=q_dec is not None,
+            merge_a2a=hp_decode_merge_a2a(),
             **common,
         )
 
