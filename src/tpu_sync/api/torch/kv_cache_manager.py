@@ -1,0 +1,731 @@
+# Copyright 2026 Google LLC.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""High-performance PyTorch KV Cache Manager (repurposed as TransferEngine)."""
+
+import dataclasses
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+_HOST_IMPL = None
+_TORCH_IMPL = None
+
+
+def _host_impl():
+  """Returns the host-only extension without importing torch_tpu."""
+  global _HOST_IMPL
+  if _HOST_IMPL is None:
+    # pylint: disable=g-import-not-at-top
+    from tpu_sync.frameworks.torch import _tpu_raiden_host as impl
+    # pylint: enable=g-import-not-at-top
+    _HOST_IMPL = impl
+  return _HOST_IMPL
+
+
+def _torch_impl():
+  """Returns the torch-backed extension, loading torch_tpu runtime first."""
+  global _TORCH_IMPL
+  if _TORCH_IMPL is None:
+    # pylint: disable=g-import-not-at-top
+    from tpu_sync.api.torch import torch_abi
+    from tpu_sync.api.torch import torch_tpu_common_loader
+
+    torch_tpu_common_loader.load_torch_tpu_common()
+    # Multi-ABI wheels bundle one extension per supported torch release;
+    # load_extension picks the variant matching the installed torch (a
+    # source checkout's single unversioned extension imports as before).
+    impl = torch_abi.load_extension(
+        "tpu_sync.frameworks.torch",
+        "_tpu_raiden_torch",
+    )
+    # pylint: enable=g-import-not-at-top
+    _TORCH_IMPL = impl
+  return _TORCH_IMPL
+
+
+@dataclasses.dataclass(frozen=True)
+class SettledTransfer:
+  """What is known about one settled transfer.
+
+  New fields must have defaults, so callers that read only the fields they
+  know keep working.
+
+  Attributes:
+    req_id: The transfer's request ID.
+    completed_ns: When the transfer completed, in time.perf_counter_ns()
+      nanoseconds; None if not recorded.
+  """
+
+  req_id: str
+  completed_ns: Optional[int] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class PollStatsWithDetails:
+  """Result of poll_stats_with_details(): transfers settled since last poll."""
+
+  sent: List[SettledTransfer]
+  received: List[SettledTransfer]
+  # Failed sends and receives.
+  failed: List[SettledTransfer]
+
+
+class KVCacheManager:
+  """Wrapper around compiled C++ KV Cache Manager.
+
+  This class has been repurposed to expose the TransferEngine API interface
+  for distributed disaggregated KV-cache movement on PyTorch TPUs.
+  """
+
+  def __init__(
+      self,
+      kv_caches: List[Any],
+      local_control_port: int,
+      max_blocks: Optional[int] = None,
+      num_slots: Optional[int] = None,
+      timeout_s: float = 120.0,
+      unsafe_skip_buffer_lock: bool = True,
+      host_blocks_to_allocate: Optional[int] = None,
+      parallelism: int = 4,
+      node_id: int = 0,
+      listener_port: Optional[int] = None,
+      raiden_worker_port: int = 0,
+      raiden_controller_address: Optional[str] = None,
+      worker_id: Optional[str] = None,
+      enable_shm: bool = False,
+      backend_configs: Optional[Sequence[Any]] = None,
+  ):
+    """Instantiates the TransferEngine-based KVCacheManager.
+
+    Args:
+      kv_caches: List of device-placed contiguous Tensors representing the
+        sharded KV caches.
+      local_control_port: TCP socket server port for control plane coordination.
+      max_blocks: Maximum number of blocks per staging slot.
+      num_slots: Number of transfer slots to allocate.
+      timeout_s: Timeout in seconds for transfer operations.
+      unsafe_skip_buffer_lock: Skip dynamic safety locking.
+      host_blocks_to_allocate: Legacy/unified total blocks to allocate in host
+        pool.
+      parallelism: Number of parallel network copies per layer.
+      node_id: Unique identifier for this host/node in the distributed mesh.
+      listener_port: Sockets server port for incoming C++ KVCacheListener
+        commands.
+      raiden_worker_port: Port for the gRPC Raiden Worker service.
+      raiden_controller_address: Address of the Raiden Controller.
+      worker_id: Unique identifier for the worker node registered with
+        controller.
+      enable_shm: Opt this manager's host buffers into the shared-memory
+        segments named by RAIDEN_SHM_KEY. The env var supplies the segment
+        namespace; this flag supplies the per-manager decision. Managers whose
+        host buffers are transient staging must leave it off.
+      backend_configs: Optional backend configurations (e.g. persistent
+        storage). Pass the same BackendConfig objects given to the store's
+        secondary_backend_configs. The posix backend derives its storage
+        topology from `parallelism`: declare at least one axis (`tp`, `pcp`,
+        `pp`) with `<axis>_size`, using the same axes and sizes as the store,
+        and set `<axis>_rank` to this worker's rank in [0, size). Duplicate or
+        missing ranks cause wrong or missed recalls. An invalid config aborts
+        the process (LOG(FATAL)) at registration.
+    """
+    self._admission_summary = None
+    impl = _torch_impl()
+    if host_blocks_to_allocate is not None:
+      self._impl = impl.KVCacheManager(
+          kv_caches,
+          local_control_port if local_control_port > 0 else None,
+          host_blocks_to_allocate,
+          unsafe_skip_buffer_lock,
+          parallelism,
+          raiden_worker_port,
+          raiden_controller_address,
+          worker_id,
+          # Pass node_id so ReadRemote can always match src<->dst workers by
+          # node_id (see the non-host_blocks branch, which already forwards it).
+          node_id=node_id,
+          enable_shm=enable_shm,
+      )
+    else:
+      if max_blocks is None or num_slots is None:
+        raise ValueError(
+            "Must specify either (max_blocks, num_slots) or"
+            " host_blocks_to_allocate."
+        )
+      self._impl = impl.KVCacheManager(
+          kv_caches=kv_caches,
+          node_id=node_id,
+          local_control_port=local_control_port,
+          max_blocks=max_blocks,
+          num_slots=num_slots,
+          timeout_s=timeout_s,
+          unsafe_skip_buffer_lock=unsafe_skip_buffer_lock,
+          listener_port=listener_port,
+          parallelism=parallelism,
+          raiden_worker_port=raiden_worker_port,
+          raiden_controller_address=raiden_controller_address,
+          worker_id=worker_id,
+          enable_shm=enable_shm,
+      )
+    if backend_configs:
+      self._impl.register_kv_backends(list(backend_configs))
+
+  @classmethod
+  def create_host_only_for_testing(
+      cls,
+      *,
+      num_layers: int,
+      num_shards: int = 1,
+      slice_byte_size: int,
+      node_id: int,
+      local_port: Optional[int] = None,
+      host_blocks: int,
+      parallelism: int = 4,
+  ) -> "KVCacheManager":
+    """Creates a CPU-only manager backed by Raiden-owned host memory."""
+    obj = cls.__new__(cls)
+    obj._admission_summary = None
+    obj._impl = _host_impl().KVCacheManager(
+        num_layers=num_layers,
+        num_shards=num_shards,
+        slice_byte_size=slice_byte_size,
+        node_id=node_id,
+        local_port=local_port,
+        host_blocks_to_allocate=host_blocks,
+        parallelism=parallelism,
+    )
+    return obj
+
+  @property
+  def node_id(self) -> int:
+    """Returns the active Worker or Shard ID."""
+    return self._impl.node_id()
+
+  @property
+  def raiden_worker_port(self) -> int:
+    """Returns the active gRPC worker service port."""
+    return self._impl.get_raiden_worker_port()
+
+  def get_local_endpoints(self) -> List[Dict[str, Any]]:
+    """Returns the active Raiden endpoint descriptors."""
+    return self._impl.get_local_endpoints()
+
+  @property
+  def local_control_port(self) -> int:
+    """Returns the active control plane listener port."""
+    return self._impl.local_control_port
+
+  @property
+  def local_port(self) -> int:
+    """Returns the active data port."""
+    return self._impl.local_port
+
+  @property
+  def transfer_address(self) -> str:
+    """Returns the formatted data transfer endpoint string (host:port)."""
+    return self._impl.transfer_address
+
+  @property
+  def listener_address(self) -> str:
+    """Returns the formatted control listener endpoint string (host:port)."""
+    return self._impl.listener_address
+
+  def register_active_plan(
+      self, uuid: int, request: Union[bytes, Any], is_sender: bool
+  ) -> None:
+    """Registers a serialized StartTransferRequest for strided push."""
+    if hasattr(request, "SerializeToString"):
+      request = request.SerializeToString()
+    if not isinstance(request, (bytes, bytearray)):
+      raise TypeError("request must be bytes or a protobuf message")
+    self._impl.register_active_plan(uuid, bytes(request), is_sender)
+
+  def unregister_active_plan(self, uuid: int) -> None:
+    """Removes a previously registered strided push plan."""
+    self._impl.unregister_active_plan(uuid)
+
+  def plan_host_blocks(self, uuid: int, block_ids: Sequence[int]) -> List[int]:
+    """Host blocks staging ``block_ids`` under a registered plan.
+
+    A sender stages its device blocks into these before pushing.
+
+    Args:
+      uuid: The plan's identifier, as passed to ``register_active_plan``.
+      block_ids: Device block ids the plan names.
+
+    Returns:
+      One host block id per entry of ``block_ids``; the ids themselves when
+      the plan stages blocks at their own ids.
+
+    Raises:
+      RuntimeError: The plan is not registered, or a block is not staged by
+        the plan.
+    """
+    return [int(b) for b in self._impl.plan_host_blocks(uuid, list(block_ids))]
+
+  def receiver_addrs(self, uuid: int) -> bytes:
+    """Host addresses a sender uses to address this receiver's blocks.
+
+    Args:
+      uuid: The plan's identifier, as passed to ``register_active_plan``.
+
+    Returns:
+      A serialized ``ReceiverAddrsProto``.
+    """
+    return bytes(self._impl.receiver_addrs(uuid))
+
+  def push_registered_plan(
+      self,
+      uuid: int,
+      peer: str,
+      src_block_ids: Sequence[int],
+      dst_block_ids: Sequence[int],
+      layer_idx: int = -1,
+      parallelism: int = 1,
+  ) -> None:
+    """Synchronously pushes host blocks using an already registered plan."""
+    self._impl.push_registered_plan(
+        uuid,
+        peer,
+        list(src_block_ids),
+        list(dst_block_ids),
+        layer_idx,
+        parallelism,
+    )
+
+  def read_block_bytes(self, layer_idx: int, block_id: int) -> bytes:
+    """Returns one host block as bytes."""
+    return self._impl.read_block_bytes(layer_idx, block_id)
+
+  def write_block_bytes(
+      self, layer_idx: int, block_id: int, payload: bytes
+  ) -> None:
+    """Overwrites one host block with bytes."""
+    self._impl.write_block_bytes(layer_idx, block_id, payload)
+
+  def register_pools(
+      self,
+      pools: Sequence[Any],
+      *,
+      staging_leases: int = 0,
+      staging_blocks_per_pool: Optional[Sequence[int]] = None,
+  ) -> Dict[str, Any]:
+    """Registers explicit block pools over the wrapped storages.
+
+    Args:
+      pools: Sequence of ``pool_layout.PoolSpec`` (or equivalent mappings) in
+        the caller's canonical order. Pool indices travel on the wire, so both
+        transfer peers must agree on this order.
+      staging_leases: Bounded host staging:
+        number of concurrent transfers to provision host staging for. With
+        ``staging_blocks_per_pool`` this replaces the full host shadow of each
+        device pool by an arena of ``staging_leases x max(blocks_per_pool)``
+        storage pages leased per transfer. 0 keeps the full mirror.
+      staging_blocks_per_pool: Per pool (same order as ``pools``), the most
+        blocks one transfer can touch in that pool (FA: pages per max-length
+        request; GDN state: 1). Storages with any pool at 0 stay full mirrors.
+
+    Returns:
+      A generic admission summary (also served by ``admission_summary``),
+      including ``host_staging`` (mode/leases/bytes per storage).
+    """
+    # pylint: disable=g-import-not-at-top
+    from tpu_sync.api.torch import pool_layout
+    # pylint: enable=g-import-not-at-top
+
+    coerced = tuple(pool_layout.coerce_pool_spec(pool) for pool in pools)
+    if not coerced:
+      raise ValueError("pool table must be non-empty")
+    num_storages = int(self._impl.num_layers)
+    for pool_idx, pool in enumerate(coerced):
+      try:
+        pool.validate()
+      except Exception as exc:
+        raise ValueError(f"invalid pool {pool_idx}: {exc}") from exc
+      if pool.storage_index >= num_storages:
+        raise ValueError(
+            f"pool {pool_idx} ({pool.tag}) storage_index "
+            f"{pool.storage_index} out of range: manager wraps "
+            f"{num_storages} storages"
+        )
+    staging_leases = int(staging_leases)
+    if staging_leases < 0:
+      raise ValueError("staging_leases must be >= 0")
+    hints: List[int] = []
+    if staging_blocks_per_pool is not None:
+      hints = [int(h) for h in staging_blocks_per_pool]
+      if len(hints) != len(coerced):
+        raise ValueError(
+            f"staging_blocks_per_pool has {len(hints)} entries for "
+            f"{len(coerced)} pools"
+        )
+      if any(h < 0 for h in hints):
+        raise ValueError("staging_blocks_per_pool entries must be >= 0")
+    self._impl.register_pools_native(
+        [pool.to_native_tuple() for pool in coerced], staging_leases, hints
+    )
+    tags: Dict[str, int] = {}
+    for pool in coerced:
+      tags[pool.tag] = tags.get(pool.tag, 0) + 1
+    storages = len({pool.storage_index for pool in coerced})
+    summary = {
+        "admitted": True,
+        "pools": len(coerced),
+        "storages": storages,
+        "tags": tags,
+        "host_staging": dict(self._impl.pool_staging_summary_native()),
+    }
+    self._admission_summary = dict(summary)
+    return dict(summary)
+
+  def get_block_ref(
+      self, pool_idx: int, block_id: int, shard_idx: int = 0
+  ) -> Dict[str, Any]:
+    """Returns a reference descriptor for one host-side pool block."""
+    return dict(
+        self._impl.get_pool_block_ref_native(
+            pool_idx=pool_idx, shard_idx=shard_idx, block_id=block_id
+        )
+    )
+
+  def pool_ids_with_tag(self, tag: str) -> List[int]:
+    """Returns the pool indices registered with the given opaque tag."""
+    return [
+        int(pool_idx)
+        for pool_idx in self._impl.pool_indices_with_tag_native(tag)
+    ]
+
+  def num_pools(self) -> int:
+    """Returns the number of pools (implicit or explicit)."""
+    return int(self._impl.num_pools())
+
+  def pool_spec(self, pool_idx: int) -> Dict[str, Any]:
+    """Returns one pool's descriptor as a dict."""
+    return dict(self._impl.pool_spec_native(pool_idx))
+
+  def d2h_pool_blocks(
+      self,
+      pool_idx: int,
+      block_ids: Sequence[int],
+      shard_idx: Optional[int] = None,
+      uuid: Optional[int] = None,
+  ) -> Any:
+    """Partial D2H of whole pool blocks into the host mirror.
+
+    ``uuid`` selects the staging lease on a bounded-staging storage (required
+    there); full-mirror storages ignore it.
+    """
+    return self._impl.d2h_pool_blocks(
+        pool_idx, list(block_ids), shard_idx, uuid
+    )
+
+  def h2d_pool_blocks(
+      self,
+      pool_idx: int,
+      block_ids: Sequence[int],
+      shard_idx: Optional[int] = None,
+      uuid: Optional[int] = None,
+  ) -> Any:
+    """Partial H2D of whole pool blocks from the host mirror (see
+
+    ``d2h_pool_blocks`` for ``uuid``).
+    """
+    return self._impl.h2d_pool_blocks(
+        pool_idx, list(block_ids), shard_idx, uuid
+    )
+
+  def admission_summary(self) -> Dict[str, Any]:
+    """Returns the last successful pool admission summary."""
+    if self._admission_summary is None:
+      return {"admitted": False}
+    return dict(self._admission_summary)
+
+  def register_recv(
+      self, uuid: int, req_id: str, expected_block_count: int
+  ) -> None:
+    """[EXPERIMENTAL] Registers expected incoming blocks for decentralized push resharding.
+
+    This allocates staging slots in the C++ receiver engine and sets the
+    synchronization barrier for the expected physical block-pushes. The
+    engine will automatically trigger Host-to-Device (H2D) copy to TPU HBM
+    once this count is reached.
+
+    This API is experimental and subject to change.
+
+    Args:
+      uuid: Unique identifier for the transfer transaction.
+      req_id: Request ID associated with the transfer.
+      expected_block_count: The total number of physical block-pushes expected
+        from all contributing source ranks.
+    """
+    self._impl.RegisterRecv(uuid, req_id, expected_block_count)
+
+  def register_read(
+      self, req_id: str, uuid: int, block_ids: List[int]
+  ) -> bool:
+    """Producer node notifies the registry/peer that blocks are ready for read.
+
+    Args:
+      req_id: The request ID of the transfer operation.
+      uuid: The UUID of the request.
+      block_ids: The list of block IDs to be read.
+
+    Returns:
+      True if a transfer is indeed needed; False if there is nothing to be
+      transferred.
+    """
+    return bool(self._impl.notify_for_read(req_id, uuid, block_ids))
+
+  def start_read(
+      self,
+      req_id: str,
+      uuid: int,
+      remote_endpoint: Union[str, List[Dict[str, Any]]],
+      remote_block_ids: List[int],
+      local_block_ids: List[int],
+      parallelism: int = 1,
+  ) -> int:
+    """Consumer node initiates an asynchronous pull of blocks from a remote peer."""
+    return self._impl.start_read(
+        req_id,
+        uuid,
+        remote_endpoint,
+        remote_block_ids,
+        local_block_ids,
+        parallelism,
+    )
+
+  def poll_stats(self) -> Tuple[List[str], List[str], List[str]]:
+    """Polls the status of all active background transfer operations.
+
+    Returns:
+      A tuple of (done_sending, done_recving, failed_recving) lists of request
+      IDs.
+    """
+    sent, received, failed, _ = self._impl.complete_read()
+    return sent, received, failed
+
+  def poll_stats_with_details(self) -> PollStatsWithDetails:
+    """Like poll_stats(), with the details of each settled transfer.
+
+    poll_stats() and poll_stats_with_details() drain the same reports; use one.
+
+    Returns:
+      The settled transfers, one SettledTransfer each.
+    """
+    sent, received, failed, details = self._impl.complete_read()
+
+    def settled(req_ids: List[str]) -> List[SettledTransfer]:
+      return [
+          SettledTransfer(req_id=req_id, **details.get(req_id, {}))
+          for req_id in req_ids
+      ]
+
+    return PollStatsWithDetails(
+        sent=settled(sent),
+        received=settled(received),
+        failed=settled(failed),
+    )
+
+  def d2h(
+      self,
+      src_offsets: List[int],
+      dst_offsets: List[int],
+      copy_sizes: List[int] | None = None,
+  ) -> Any:
+    """Device-to-Host (D2H) copy transfer.
+
+    Args:
+      src_offsets: Source block offsets.
+      dst_offsets: Destination block offsets.
+      copy_sizes: Optional number of contiguous blocks to copy per segment
+        (defaults to 1 block per segment).
+
+    Returns:
+      A future representing the asynchronous copy transfer operation.
+    """
+    if copy_sizes is None:
+      copy_sizes = [1] * len(src_offsets)
+    return self._impl.D2h(src_offsets, dst_offsets, copy_sizes)
+
+  def h2d(
+      self,
+      src_offsets: List[int],
+      dst_offsets: List[int],
+      copy_sizes: List[int] | None = None,
+  ) -> Any:
+    """Host-to-Device (H2D) copy transfer.
+
+    Args:
+      src_offsets: Source block offsets.
+      dst_offsets: Destination block offsets.
+      copy_sizes: Optional number of contiguous blocks to copy per segment
+        (defaults to 1 block per segment).
+
+    Returns:
+      A future representing the asynchronous copy transfer operation.
+    """
+    if copy_sizes is None:
+      copy_sizes = [1] * len(src_offsets)
+    return self._impl.H2d(src_offsets, dst_offsets, copy_sizes)
+
+  @property
+  def listener_port(self) -> Optional[int]:
+    """Returns the active local port assigned to the C++ KVCacheListener."""
+    return self._impl.listener_port
+
+  @property
+  def is_listener_active(self) -> bool:
+    """Returns whether the native C++ KVCacheListener is actively running."""
+    return self._impl.is_listener_active
+
+  # =========================================================================
+  # EXPERIMENTAL SHARED-MEMORY DMA APIs
+  # The following APIs register a caller-owned host memory pool for TPU DMA
+  # and transfer directly to and from tensors inside that pool, bypassing the
+  # manager's own host staging blocks. They are experimental and subject to
+  # change in future releases.
+  # =========================================================================
+
+  def experimental_map_shared_memory(
+      self,
+      mapped_address: int,
+      pool_size_bytes: int,
+      *,
+      page_nbytes: Optional[int] = None,
+  ) -> None:
+    """[EXPERIMENTAL] Registers an existing whole-pool mapping for TPU DMA.
+
+    WARNING: This API is experimental and subject to change in future releases.
+
+    The external pool owner must keep this process-local virtual address
+    mapped and page-locked until ``experimental_unmap_shared_memory``
+    succeeds.
+
+    At most one pool may be mapped at a time; mapping a different pool
+    requires unmapping the current one first.
+
+    ``page_nbytes`` fixes how many bytes ``experimental_h2d`` and
+    ``experimental_d2h`` move per block per layer while this pool stays
+    mapped. Block ids count pages of this size: block ``b`` starts at byte
+    ``b * page_nbytes`` of each layer's device buffer. A page of ``k`` device
+    blocks lets a caller whose block spans ``k`` consecutive device blocks
+    move it with one block id.
+
+    Args:
+      mapped_address: Process-local virtual address of the shared pool.
+      pool_size_bytes: Total byte length of the shared pool.
+      page_nbytes: Bytes per block per layer. Must be a positive multiple of
+        the device block size (the device bytes of one index along the KV
+        cache's leading dimension) and divide each layer's device buffer.
+        Every object tensor passed to ``experimental_h2d`` or
+        ``experimental_d2h`` must have it as its last dimension. Defaults to
+        one device block, which is checked the same way.
+    """
+    self._impl.map_shared_memory(mapped_address, pool_size_bytes, page_nbytes)
+
+  def experimental_unmap_shared_memory(self) -> None:
+    """[EXPERIMENTAL] Drains submitted copies and releases the registration.
+
+    WARNING: This API is experimental and subject to change in future releases.
+    """
+    self._impl.unmap_shared_memory()
+
+  @property
+  def experimental_is_shared_memory_mapped(self) -> bool:
+    """[EXPERIMENTAL] Returns whether shared memory is currently DMA mapped.
+
+    WARNING: This API is experimental and subject to change in future releases.
+    """
+    return self._impl.is_shared_memory_mapped
+
+  def experimental_d2h(
+      self,
+      block_ids: List[int],
+      object_tensors: List[Any],
+      rank_id: int,
+  ) -> Any:
+    """[EXPERIMENTAL] Copies device KV cache blocks into mapped host tensors.
+
+    WARNING: This API is experimental and subject to change in future releases.
+
+    This is not the same addressing scheme as ``d2h``. ``d2h`` takes block
+    offsets into the manager's own host staging buffers; this transfers
+    directly into caller-owned CPU tensors that live inside the shared memory
+    pool registered by ``experimental_map_shared_memory``. DMA is issued
+    against those tensors' memory, so the pool must still be mapped and every
+    tensor must lie entirely inside it.
+
+    Each object tensor is contiguous with a 1-byte dtype (e.g. ``uint8`` or
+    ``int8``) and shape ``[num_ranks, num_layers, page_nbytes]``, where
+    ``page_nbytes`` is the page size the pool was mapped with. Only the
+    ``rank_id`` slice takes part: for layer ``l``, the ``page_nbytes`` bytes at
+    ``tensor[rank_id, l]`` are filled from block ``block_ids[i]`` of layer
+    ``l``'s device buffer, where ``i`` is that tensor's index.
+
+    Args:
+      block_ids: Block ids, one per object tensor. Block ``b`` is the page at
+        byte ``b * page_nbytes`` of each layer's device buffer, so ids count
+        pages, not bytes. Must be unique and within
+        ``[0, layer_nbytes // page_nbytes)``, where ``layer_nbytes`` is the
+        size of one layer's device buffer.
+      object_tensors: Caller-owned contiguous CPU tensors with a 1-byte dtype
+        and shape ``[num_ranks, num_layers, page_nbytes]``, residing inside the
+        mapped pool. One per entry of ``block_ids``.
+      rank_id: Index into each tensor's first dimension, selecting which
+        rank's slice to transfer.
+
+    Returns:
+      A future representing the asynchronous copy transfer operation.
+    """
+    return self._impl.d2h(list(block_ids), list(object_tensors), int(rank_id))
+
+  def experimental_h2d(
+      self,
+      block_ids: List[int],
+      object_tensors: List[Any],
+      rank_id: int,
+  ) -> Any:
+    """[EXPERIMENTAL] Copies mapped host tensors into device KV cache blocks.
+
+    WARNING: This API is experimental and subject to change in future releases.
+
+    This is not the same addressing scheme as ``h2d``. ``h2d`` takes block
+    offsets into the manager's own host staging buffers; this transfers
+    directly from caller-owned CPU tensors that live inside the shared memory
+    pool registered by ``experimental_map_shared_memory``. DMA is issued
+    against those tensors' memory, so the pool must still be mapped and every
+    tensor must lie entirely inside it.
+
+    Each object tensor is contiguous with a 1-byte dtype (e.g. ``uint8`` or
+    ``int8``) and shape ``[num_ranks, num_layers, page_nbytes]``, where
+    ``page_nbytes`` is the page size the pool was mapped with. Only the
+    ``rank_id`` slice takes part: for layer ``l``, the ``page_nbytes`` bytes at
+    ``tensor[rank_id, l]`` are written to block ``block_ids[i]`` of layer
+    ``l``'s device buffer, where ``i`` is that tensor's index.
+
+    Args:
+      block_ids: Block ids, one per object tensor. Block ``b`` is the page at
+        byte ``b * page_nbytes`` of each layer's device buffer, so ids count
+        pages, not bytes. Must be unique and within
+        ``[0, layer_nbytes // page_nbytes)``, where ``layer_nbytes`` is the
+        size of one layer's device buffer.
+      object_tensors: Caller-owned contiguous CPU tensors with a 1-byte dtype
+        and shape ``[num_ranks, num_layers, page_nbytes]``, residing inside the
+        mapped pool. One per entry of ``block_ids``.
+      rank_id: Index into each tensor's first dimension, selecting which
+        rank's slice to transfer.
+
+    Returns:
+      A future representing the asynchronous copy transfer operation.
+    """
+    return self._impl.h2d(list(block_ids), list(object_tensors), int(rank_id))

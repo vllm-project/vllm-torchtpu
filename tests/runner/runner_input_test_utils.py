@@ -122,10 +122,6 @@ def _make_runner(
     runner._upload_unless_unchanged = types.MethodType(
         TPUModelRunner._upload_unless_unchanged, runner
     )
-    # q38 BLSTACK-RFIX: execute_model calls the prefill-only padding strip (69c56a021 port) on prefill-only MTP runners.
-    runner._strip_prefill_only_padding = types.MethodType(
-        TPUModelRunner._strip_prefill_only_padding, runner
-    )
     runner._dp_target_bucket = None
     runner._has_mamba_state = False
     # One pipeline stage: the runner embeds its own inputs.
