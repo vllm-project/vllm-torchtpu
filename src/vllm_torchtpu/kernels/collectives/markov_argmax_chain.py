@@ -23,9 +23,9 @@ roundings of the bias and of the sum.
 
 As XLA ops a slot is a chain of ~15 small dependent ops around an 8-byte
 all-gather. Here the chain runs inside one Pallas call: the Markov shard and
-the logits stream through VMEM in double-buffered chunks (the next slot's
-first chunk loads while a slot exchanges its pairs), the embedding row is a
-DMA, and each slot's pairs go to every peer by remote DMA into a receive slot
+the logits stream through VMEM in chunks, loaded a few chunks ahead (the next
+slot's first chunks load while a slot exchanges its pairs), the embedding row
+is a DMA, and each slot's pairs go to every peer by remote DMA into a receive slot
 of its own, so one barrier at entry covers the whole chain.
 """
 
@@ -50,6 +50,9 @@ MAX_ROWS = 32
 # tiles, so the kernel's VMEM stays small beside what XLA keeps there for the
 # rest of the draft step.
 _CHUNK_TILES = 32
+# Chunk buffers: the DMAs run this many minus one chunks ahead, also through
+# the pair exchange between slots, whose loads do not wait for the winner.
+_BUFFERS = 4
 
 
 def _round_up(x: int, m: int) -> int:
@@ -69,13 +72,13 @@ def chunk_lanes(vocab_shard: int) -> int:
 
 
 def vmem_bytes(n: int, rows: int, slots: int, rank_dim: int, vocab_shard: int):
-    """VMEM one call declares: two buffers of a chunk of the Markov shard and
-    of the logits, one chunk's f32 temporaries, the embedding, pair and id
-    tiles, and headroom."""
+    """VMEM one call declares: the chunk buffers of the Markov shard and of
+    the logits, one chunk's f32 temporaries, the embedding, pair and id tiles,
+    and headroom."""
     rows_p = _round_up(rows, _ROWS)
     chunk = chunk_lanes(vocab_shard)
     return (
-        2 * (rank_dim + rows_p) * chunk * 2  # double-buffered shard and logits
+        _BUFFERS * (rank_dim + rows_p) * chunk * 2  # shard and logits chunks
         + 6 * rows_p * chunk * 4  # f32 temporaries of one chunk
         + rows * _ROWS * rank_dim * 2  # embedding tiles
         + (slots * (n + 1) + 1) * rows_p * _LANES * 4  # pair and id tiles
@@ -95,12 +98,15 @@ def max_rows(n: int, slots: int, rank_dim: int, vocab_shard: int, budget: int) -
 
 
 @functools.cache
-def _call(n: int, rows: int, slots: int, rank_dim: int, vocab_shard: int):
+def _call(n: int, rows: int, slots: int, rank_dim: int, vocab: int, vocab_shard: int):
     if rows > MAX_ROWS:
         raise ValueError(f"{rows} rows: the kernel takes at most {MAX_ROWS}")
     rows_p = _round_up(rows, _ROWS)
+    rows_c = _round_up(rows, 8)  # f32 sublane tile: the rows the math runs on
     chunk = chunk_lanes(vocab_shard)
     chunks = padded_vocab(vocab_shard) // chunk
+    steps = slots * chunks
+    ahead = min(_BUFFERS - 1, steps)
     vmem_limit = vmem_bytes(n, rows, slots, rank_dim, vocab_shard)
     big = jnp.iinfo(I32).max
 
@@ -140,11 +146,13 @@ def _call(n: int, rows: int, slots: int, rank_dim: int, vocab_shard: int):
                 ),
             )
 
-        # The Markov shard and logits stream through two buffers, one chunk
-        # ahead, across slot boundaries: slot s + 1's first chunk loads while
-        # slot s exchanges its pairs. Step g = s * chunks + c uses buffer g % 2.
-        for copy in loads(0, 0, 0):
-            copy.start()
+        # The Markov shard and logits stream through _BUFFERS buffers, `ahead`
+        # chunks ahead across slot boundaries, so the next slot's first chunks
+        # load while a slot exchanges its pairs. Step g = s * chunks + c uses
+        # buffer g % _BUFFERS.
+        for g in range(ahead):
+            for copy in loads(g // chunks, g % chunks, g % _BUFFERS):
+                copy.start()
 
         # Every peer is in the kernel (its receive slots are live) before any
         # pair is sent; the first chunk loads meanwhile.
@@ -156,10 +164,11 @@ def _call(n: int, rows: int, slots: int, rank_dim: int, vocab_shard: int):
         for r in range(rows):
             prev_s[r] = prev0_ref[r]
         tile_row = lax.broadcasted_iota(I32, (_ROWS, rank_dim), 0)
-        emb_row = lax.broadcasted_iota(I32, (rows_p, rank_dim), 0)
-        lane = lax.broadcasted_iota(I32, (rows_p, chunk), 1)
+        emb_row = lax.broadcasted_iota(I32, (rows_c, rank_dim), 0)
+        lane = lax.broadcasted_iota(I32, (rows_c, chunk), 1)
         pair_lane = lax.broadcasted_iota(I32, (rows_p, _LANES), 1)
         ids = jnp.zeros((rows_p, _LANES), I32)
+        send[...] = jnp.zeros_like(send)  # rows past rows_c stay zero
         sends = []
 
         for s in range(slots):
@@ -175,7 +184,7 @@ def _call(n: int, rows: int, slots: int, rank_dim: int, vocab_shard: int):
             ]
             for copy in embeds:
                 copy.start()
-            emb = jnp.zeros((rows_p, rank_dim), F32)
+            emb = jnp.zeros((rows_c, rank_dim), F32)
             for r, copy in enumerate(embeds):
                 copy.wait()
                 tile = emb_tiles[r].astype(F32)
@@ -188,57 +197,44 @@ def _call(n: int, rows: int, slots: int, rank_dim: int, vocab_shard: int):
             emb = emb.astype(BF16)
 
             def chunk_step(c, carry, s=s, emb=emb):
-                best, at, first_nan = carry
+                best, at = carry
                 g = s * chunks + c
-                buf = g % 2
+                buf = g % _BUFFERS
                 for copy in loads(s, c, buf):
                     copy.wait()
 
-                @pl.when(c + 1 < chunks)
+                @pl.when(g + ahead < steps)
                 def _():
-                    for copy in loads(s, c + 1, 1 - buf):
+                    nxt = g + ahead
+                    for copy in loads(nxt // chunks, nxt % chunks, nxt % _BUFFERS):
                         copy.start()
 
-                if s + 1 < slots:
-
-                    @pl.when(c + 1 == chunks)
-                    def _():
-                        for copy in loads(s + 1, 0, 1 - buf):
-                            copy.start()
-
                 # The gathered path's roundings: the bias and the sum are bf16.
+                # Lanes past the shard's ids hold -inf (the wrapper's padding).
                 bias = jnp.dot(emb, w2_buf[buf], preferred_element_type=F32)
-                logits = logits_buf[buf].astype(F32)
+                logits = logits_buf[buf, :rows_c].astype(F32)
                 scores = logits + bias.astype(BF16).astype(F32)
                 scores = scores.astype(BF16).astype(F32)
-                col = lane + c * chunk
-                scores = jnp.where(col < valid, scores, -jnp.inf)
-                nan = scores != scores
-                top = jnp.max(jnp.where(nan, -jnp.inf, scores), axis=1, keepdims=True)
-                hit = (scores == top) & ~nan
-                top_at = jnp.min(jnp.where(hit, col, big), axis=1, keepdims=True)
-                nan_at = jnp.min(jnp.where(nan, col, big), axis=1, keepdims=True)
+                top = jnp.max(scores, axis=1, keepdims=True)
+                top_at = jnp.min(
+                    jnp.where(scores == top, lane, big), axis=1, keepdims=True
+                )
                 # Strictly greater: an earlier chunk keeps a tie (first index).
+                # A chunk whose max is NaN is skipped (NaN > x is false).
                 better = top > best
                 return (
                     jnp.where(better, top, best),
-                    jnp.where(better, top_at, at),
-                    jnp.minimum(first_nan, nan_at),
+                    jnp.where(better, top_at + c * chunk, at),
                 )
 
             init = (
-                jnp.full((rows_p, 1), -jnp.inf, F32),
-                jnp.zeros((rows_p, 1), I32),
-                jnp.full((rows_p, 1), big, I32),
+                jnp.full((rows_c, 1), -jnp.inf, F32),
+                jnp.zeros((rows_c, 1), I32),
             )
-            best, at, first_nan = lax.fori_loop(0, chunks, chunk_step, init)
-            # As torch.argmax: a NaN is the max, and the first NaN wins.
-            has_nan = first_nan < big
-            best = jnp.where(has_nan, jnp.nan, best)
-            gid = (jnp.where(has_nan, first_nan, at) + first_id).astype(F32)
-            send[s] = jnp.where(
-                pair_lane == 0, best, jnp.where(pair_lane == 1, gid, 0.0)
-            )
+            best, at = lax.fori_loop(0, chunks, chunk_step, init)
+            # A NaN matches no lane: its row's id stays a real one of the shard.
+            gid = (jnp.minimum(at, valid - 1) + first_id).astype(F32)
+            send[s, :rows_c] = jnp.where(pair_lane[:rows_c] == 0, best, gid)
 
             for step in range(1, n):
                 t = lax.rem(me + step, n)
@@ -259,18 +255,15 @@ def _call(n: int, rows: int, slots: int, rank_dim: int, vocab_shard: int):
                     recv.at[s, t], recv.at[s, t], recv_sem.at[s, t]
                 ).wait_recv()
 
-            # The lowest id among the maxima (a NaN max first): the shards
-            # hold increasing ids by TP rank, so this is the first rank
-            # torch.argmax picks over the rank-major gathered pairs, whatever
-            # the mesh order.
+            # The lowest id among the maxima: the shards hold increasing ids
+            # by TP rank, so this is the first rank torch.argmax picks over the
+            # rank-major gathered pairs, whatever the mesh order. Clipped: with
+            # a NaN max no id matches, and the next slot DMAs this id's row.
             pairs = recv[s]
             maxima = pairs[:, :, 0:1]
-            nan = maxima != maxima
-            has_nan = jnp.max(nan.astype(F32), axis=0) > 0
-            top = jnp.max(jnp.where(nan, -jnp.inf, maxima), axis=0)
-            at = (nan & has_nan) | ((maxima == top) & ~has_nan)
-            gid = jnp.min(jnp.where(at, pairs[:, :, 1:2], jnp.inf), axis=0)
-            gid = gid.astype(I32)
+            top = jnp.max(maxima, axis=0)
+            gid = jnp.min(jnp.where(maxima == top, pairs[:, :, 1:2], jnp.inf), axis=0)
+            gid = jnp.clip(gid, 0, vocab - 1).astype(I32)
             ids = jnp.where(pair_lane == s, gid, ids)
             if s + 1 < slots:
                 ids_v[...] = jnp.broadcast_to(gid, (rows_p, _LANES))
@@ -293,15 +286,15 @@ def _call(n: int, rows: int, slots: int, rank_dim: int, vocab_shard: int):
             in_specs=[any_space, any_space, any_space],
             out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
             scratch_shapes=[
-                pltpu.VMEM((2, rank_dim, chunk), BF16),
-                pltpu.VMEM((2, rows_p, chunk), BF16),
+                pltpu.VMEM((_BUFFERS, rank_dim, chunk), BF16),
+                pltpu.VMEM((_BUFFERS, rows_p, chunk), BF16),
                 pltpu.VMEM((rows, _ROWS, rank_dim), BF16),
                 pltpu.VMEM((slots, rows_p, _LANES), F32),
                 pltpu.VMEM((slots, n, rows_p, _LANES), F32),
                 pltpu.VMEM((rows_p, _LANES), I32),
                 pltpu.SMEM((rows_p, _LANES), I32),
                 pltpu.SMEM((rows,), I32),
-                pltpu.SemaphoreType.DMA((2, 2)),
+                pltpu.SemaphoreType.DMA((2, _BUFFERS)),
                 pltpu.SemaphoreType.DMA((rows,)),
                 pltpu.SemaphoreType.DMA((1,)),
                 pltpu.SemaphoreType.DMA((slots, n)),
@@ -335,6 +328,9 @@ def markov_argmax_chain(
     token before each row's first slot. scalars (int32, three elements): this
     device's mesh index, the first global id of its shard, and how many of the
     shard's ``vocab_shard`` columns are real ids (the rest are padding).
+
+    A row whose scores hold a NaN gets some real id of the vocab (the NaN
+    matches no lane), not the NaN's index that torch.argmax returns.
     """
     rows, slots, vocab_shard = logits.shape
     rank_dim, lanes = w2t.shape
@@ -348,14 +344,17 @@ def markov_argmax_chain(
             f"logits {logits.shape}"
         )
     rows_p = _round_up(rows, _ROWS)
-    # Slot-major, padded with -inf rows and lanes (the lanes are also masked).
+    scalars = scalars.reshape(3).astype(I32)
+    # Slot-major, -inf in pad rows and in every lane past the shard's ids.
     logits = jnp.pad(
         logits.transpose(1, 0, 2),
         ((0, 0), (0, rows_p - rows), (0, lanes - vocab_shard)),
         constant_values=-jnp.inf,
     )
-    ids = _call(n, rows, slots, rank_dim, vocab_shard)(
-        scalars.reshape(3).astype(I32),
+    real = lax.broadcasted_iota(I32, logits.shape, 2) < scalars[2]
+    logits = jnp.where(real, logits, -jnp.inf)
+    ids = _call(n, rows, slots, rank_dim, w1.shape[0], vocab_shard)(
+        scalars,
         # In range for the embedding DMA, as an XLA gather would clamp it.
         jnp.clip(prev, 0, w1.shape[0] - 1).astype(I32),
         logits,
