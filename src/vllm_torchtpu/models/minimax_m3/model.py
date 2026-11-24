@@ -125,7 +125,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        elif quant.fp8_norm_applies(self.self_attn.qkv_proj, hidden_states.shape[0]):
+        elif envs.TPU_MINIMAX_M3_FP8_CAST_NORM and quant.fp8_norm_applies(
+            self.self_attn.qkv_proj, hidden_states.shape[0]
+        ):
             hidden_states, residual = quant.fused_add_rms_norm_e4m3(
                 hidden_states,
                 residual,
