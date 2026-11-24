@@ -86,8 +86,11 @@ def pipeline_score_topk_bounded(
         for tile in range(num_tiles - 1):
             prepared = prepare(jnp.int32(tile + 1))
             if previous is not None:
-                previous, current, prepared = lax.optimization_barrier(
-                    (previous, current, prepared)
+                # Gating on the output too completes each write within the
+                # next pair, so work the write starts on a tile's selection
+                # overlaps the following scoring instead of trailing it.
+                previous, current, prepared, output = lax.optimization_barrier(
+                    (previous, current, prepared, output)
                 )
                 output = write(tile - 1, previous, output)
             group = group_base + tile
