@@ -45,7 +45,7 @@ source. Every K-line feature is behind its own env key, default off; no existing
 at startup (ValueError): `TPU_QWEN4_HC_PREFILL_COMPARE` with `TPU_QWEN4_HC_PREFILL_FOLD` or `TPU_QWEN4_HC_PREFILL_DOWN_ASM`, and
 `VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND` with `VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS`.
 
-## Read first: two notes
+## Read first (for the user and Jiaxin)
 
 1. **Exos points: set `Q38_OXPD_FORM=1` on every leg.** Forgetting it fails loudly: their env sets `VLLM_TPU_HOST_GC`, which the
    default form refuses with a ValueError at import, so the engine does not start.
@@ -53,6 +53,16 @@ at startup (ValueError): `TPU_QWEN4_HC_PREFILL_COMPARE` with `TPU_QWEN4_HC_PREFI
    grouped Stage-3 producer registration (every Qwen PD producer) applies the scheduler's releases and registers ahead sends with
    no TTL until the request finishes. It fixes a preemption crash (`Conflicting duplicate Stage-3 producer registration`). Every
    default-form point on the sheet ran with it. Everything else this integration adds is behind its own env key, default off.
+
+3. **Decode routing disclosure.** These points run the proxy with `PROXY_DECODE_ROUTING=sticky`, a decode session affinity
+   keyed on aiperf's per-conversation `X-Correlation-ID` header: every B3 point here (T56g c192sp, T57s c192s, T58y c184s,
+   T58n c176s, T58f c168s, and the pending T55d c200spk) and HIX P1 (T58g) / m3 (T58u). Read from each job's stored recipe;
+   B1 T58x, B2 T61v and B4-B6 do not set it (B1 is round-robin with an empty owner map). Prefill routing, eviction and the
+   prefill cache are unaffected. The mechanism is disclosed with IX's llm-d configs as precedent (they use decode session
+   affinity on `x-dynamo-session-id`). A prefix-hash affinity computed from the prompt is being built to replace it, and those
+   points will be re-run with it. Reference: frontier_disclosures_1124.md (in the Q3.8 PD team's reports).
+4. **Tuned values.** Some cache knobs (for example `VLLM_TPU_OFFLOAD_TIER_CLASS_RATIO=8`) were tuned on this workload. That is
+   allowed: the server never reads the traffic.
 
 ## Parity evidence (CPU proof jobs, 0 TPU chips)
 
