@@ -469,14 +469,14 @@ def test_gmm_nonlocal_groups_produce_zeros(group_config):
     in_size = 512
     out_size = 512
     num_groups, group_offset, num_local_groups = group_config
-    key = jax.random.key(0)
+    lhs_key, rhs_key, bias_key = jax.random.split(jax.random.key(0), 3)
 
-    lhs = jax.random.normal(key, (batch_size, in_size), dtype=jnp.bfloat16)
+    lhs = jax.random.normal(lhs_key, (batch_size, in_size), dtype=jnp.bfloat16)
     rhs = jax.random.normal(
-        key, (num_local_groups, in_size, out_size), dtype=jnp.bfloat16
+        rhs_key, (num_local_groups, in_size, out_size), dtype=jnp.bfloat16
     )
     rhs_bias = jax.random.normal(
-        key, (num_local_groups, 1, out_size), dtype=jnp.bfloat16
+        bias_key, (num_local_groups, 1, out_size), dtype=jnp.bfloat16
     )
     group_sizes = get_group_sizes(batch_size, num_groups)
     group_offset = jnp.array(group_offset, dtype=jnp.int32)
