@@ -475,3 +475,63 @@ def to_physical(layer: Any, topk_ids: torch.Tensor) -> torch.Tensor:
     ids = topk_ids.to(torch.int32)
     phys = table[ids.clamp(min=0).to(torch.int64)]
     return torch.where(ids >= 0, phys, ids).to(topk_ids.dtype)
+
+
+_CKSUM_PARAMS = (
+    "w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale",
+    "w13_weight_scale_2", "w2_weight_scale_2",
+)
+
+
+def log_slot_checksums(layer: Any, stage: str) -> None:
+    """Diagnostic (``TPU_MOE_SLOT_CKSUM=1``): log a per-slot checksum of the
+    expert parameters, keyed by the logical expert the slot should hold, so
+    two runs with different placements can be compared expert by expert."""
+    if os.environ.get("TPU_MOE_SLOT_CKSUM", "") not in ("1", "true"):
+        return
+    try:
+        use_ep, ep, rank = _layer_ep(layer)
+        idx = _layer_index(str(getattr(layer, "layer_name", "") or ""))
+        perm = getattr(layer, "_perm_logical_to_physical", None)
+        out: dict[str, Any] = {}
+        n_local = None
+        for pname in _CKSUM_PARAMS:
+            p = getattr(layer, pname, None)
+            if not isinstance(p, torch.Tensor):
+                continue
+            t = p.detach()
+            n_local = int(t.shape[0])
+            x = None
+            for conv in (
+                lambda t: t.reshape(t.shape[0], -1).to(torch.float32),
+                lambda t: t.view(torch.uint8).reshape(t.shape[0], -1).to(torch.float32),
+            ):
+                try:
+                    x = conv(t)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    err = type(e).__name__
+            if x is None:
+                out[pname] = f"err:{err}"
+                continue
+            w = (torch.arange(x.shape[1], device=x.device) % 7 + 1).to(torch.float32)
+            c = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0) @ w
+            out[pname] = [float(v) for v in c.cpu().tolist()]
+        if n_local is None:
+            return
+        start = rank * n_local
+        if perm is not None:
+            inv = {p: e for e, p in enumerate(perm)}
+            logical = [inv[start + j] for j in range(n_local)]
+        else:
+            logical = [start + j for j in range(n_local)]
+        rows = {
+            str(e): [out[k][j] if isinstance(out[k], list) else out[k] for k in out]
+            for j, e in enumerate(logical)
+        }
+        logger.info(
+            "[moe-cksum] %s L%s r%d keys=%s %s",
+            stage, idx, rank, ",".join(out), json.dumps(rows, separators=(",", ":")),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[moe-cksum] failed: %s", e)

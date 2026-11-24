@@ -406,6 +406,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             "TPU NVFP4 MoE expects gated (act_and_mul) experts with a "
             "[gate; up] w13 layout and a per-w1/w3 global scale [E, 2]."
         )
+        moe_permute.log_slot_checksums(layer, "raw")
         self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
         activation_str = self._set_tpu_activation(layer)
 
@@ -513,6 +514,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         moe_redundant.install(layer)
         moe_permute.install(layer)
+        moe_permute.log_slot_checksums(layer, "prepared")
         moe_route_trace.register(layer)
         if envs.TPU_MOE_NVFP4_SKIP_PADDED and envs.TPU_MOE_SKIP_PADDED_TOKENS:
             _log_skip_padded_once()
