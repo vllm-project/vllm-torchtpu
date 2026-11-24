@@ -383,6 +383,15 @@ def _fake_gather_attend(q, raw, high, scales, high_scales, *_):
     )
 
 
+def _fake_select_gather_attend(index_q, index_banks, index_table, weights, *rest):
+    q, raw, high, scales = rest[7:11]
+    return (
+        torch.empty_like(q),
+        raw.new_empty((q.shape[0], 512)),
+        *_fake_gather_attend(q, raw, high, scales, None)[1:],
+    )
+
+
 def _metadata(
     table: jax.Array,
     starts: jax.Array,
@@ -615,6 +624,12 @@ def initialize_csa2_ops() -> None:
             _fake_gather_attend,
         ),
         (
+            "select_gather_attend",
+            _select_gather_attend,
+            (P(),) * 26 + (None,) * 10,
+            _fake_select_gather_attend,
+        ),
+        (
             "project",
             _project,
             (P(),) * 3,
@@ -636,6 +651,7 @@ def initialize_csa2_ops() -> None:
         "publish_main_banked": 4,
         "publish_swa_banked": 2,
         "gather_attend": 4,
+        "select_gather_attend": 5,
     }
     donated = {
         "prepare_publish_swa": (0,),
@@ -703,6 +719,10 @@ def publish_swa(
         cache.raw_hi.copy_(high)
 
 
+def _attention_bq(tokens: int) -> int:
+    return 6 if tokens <= 384 else 16
+
+
 def attention(
     q: torch.Tensor,
     swa: "PagedCacheRows",
@@ -724,7 +744,7 @@ def attention(
 
     if not q.shape[0]:
         return q
-    bq = 6 if q.shape[0] <= 384 else 16
+    bq = _attention_bq(q.shape[0])
     if not records.shape[1]:
         return _ops["attend_swa"](
             q,
@@ -807,6 +827,89 @@ def attention(
         non_causal,
         bq,
     )
+
+
+def select_attention(
+    index_q: torch.Tensor,
+    index_cache: Any,
+    index_table: torch.Tensor,
+    weights: torch.Tensor,
+    index_lengths: torch.Tensor,
+    requests: torch.Tensor,
+    batch_max: torch.Tensor,
+    index_starts: torch.Tensor,
+    lengths: torch.Tensor,
+    swa_valid: torch.Tensor,
+    q: torch.Tensor,
+    swa: "PagedCacheRows",
+    main: "PagedCacheRows",
+    pages: torch.Tensor,
+    main_starts: torch.Tensor,
+    starts: torch.Tensor,
+    positions: torch.Tensor,
+    sink: torch.Tensor,
+    cos_sin: torch.Tensor,
+    metadata: torch.Tensor,
+    bounds: torch.Tensor,
+    *,
+    topk: int,
+    block_size: int,
+    score_width: int,
+    ratio: int,
+    scale: float,
+    non_causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A source layer's index selection and attention (`_select_gather_attend`).
+
+    The index arguments are those of the packed FP8 indexer's dense selection.
+    Returns the attention output and the main records, whose gathered KV is
+    published to the stage's gathered-KV cache for the layers that reuse it.
+    """
+    from . import attention_kernels
+
+    assert main.scale is not None
+    output, records, words, scales, counts = _ops["select_gather_attend"](
+        index_q,
+        index_cache.banks,
+        index_table.int(),
+        weights,
+        index_lengths.flatten().int(),
+        index_lengths.new_empty((index_q.shape[0], 0), dtype=torch.int32),
+        requests.int(),
+        batch_max.reshape(1).int(),
+        index_starts.int(),
+        lengths.int(),
+        swa_valid,
+        q,
+        main.raw,
+        main.raw_hi,
+        main.scale,
+        main.scale_hi,
+        pages.int(),
+        main_starts.int(),
+        swa.raw,
+        swa.raw_hi,
+        starts.int(),
+        positions.int(),
+        sink,
+        cos_sin,
+        metadata.int(),
+        bounds.int(),
+        index_cache._layout_args(),
+        topk,
+        block_size,
+        score_width,
+        main.shape[1],
+        swa.shape[1],
+        ratio,
+        scale,
+        non_causal,
+        _attention_bq(q.shape[0]),
+    )
+    cache = attention_kernels._active_gathered_kv
+    if cache is not None:
+        cache.put(main, records, ("csa2", main.shape[1]), (words, scales), valid_counts=counts)
+    return output, records
 
 
 def project(
