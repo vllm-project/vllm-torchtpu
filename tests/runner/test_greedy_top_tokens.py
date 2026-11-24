@@ -56,15 +56,18 @@ class _HeadShard(torch.nn.Module):
 
 
 class _Owner(torch.nn.Module):
-    def __init__(self, head):
+    def __init__(self, head, vocab_size=None):
         super().__init__()
         self.lm_head = head
+        # get_top_tokens masks a shard's ids at or past the processor's
+        # vocab_size, so a sharded head needs the full vocabulary here.
+        vocab_size = head.weight.shape[0] if vocab_size is None else vocab_size
         with patch.object(
             lp_module,
             "get_current_vllm_config",
             return_value=SimpleNamespace(model_config=None),
         ):
-            self.logits_processor = LogitsProcessor(head.weight.shape[0])
+            self.logits_processor = LogitsProcessor(vocab_size)
 
 
 def _shards(weight, tp_size):
@@ -95,14 +98,15 @@ def _vocab_parallel_top_tokens(weight, hidden_states, tp_size, monkeypatch):
         return pair.repeat(1, tp_size)
 
     monkeypatch.setattr(lp_module, "tensor_model_parallel_all_gather", record)
+    vocab = weight.shape[0]
     for shard in shards:
-        greedy_top_tokens.top_tokens(_Owner(shard), hidden_states)
+        greedy_top_tokens.top_tokens(_Owner(shard, vocab), hidden_states)
     monkeypatch.setattr(
         lp_module,
         "tensor_model_parallel_all_gather",
         lambda pair, dim: torch.cat(pairs, dim=-1),
     )
-    return greedy_top_tokens.top_tokens(_Owner(shards[0]), hidden_states)
+    return greedy_top_tokens.top_tokens(_Owner(shards[0], vocab), hidden_states)
 
 
 def _full_logits_tokens(weight, hidden_states):

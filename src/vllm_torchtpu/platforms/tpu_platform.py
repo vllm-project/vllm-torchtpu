@@ -240,9 +240,11 @@ def _validate_tpu_runner_features(vllm_config: VllmConfig) -> None:
 
     vLLM v0.33.0 rejected these for its V1 model runner
     (``VllmConfig._get_v1_model_runner_unsupported_features``), which TPU relied
-    on; v0.34.0 removed V1 and that check with it. Prefill context
-    parallelism, DSpark (with adaptive verification) and mixed sliding/full
-    DFlash drafts are implemented by TPUModelRunner and stay allowed.
+    on; v0.34.0 removed V1 and that check with it. On TPU this runs from
+    ``VllmConfig._validate_model_runner`` (``_patch_vllm_tpu_runner_validation``),
+    where the V1 check ran. Prefill context parallelism, DSpark (with adaptive
+    verification) and mixed sliding/full DFlash drafts are implemented by
+    TPUModelRunner and stay allowed.
     """
     unsupported: list[str] = []
     spec = vllm_config.speculative_config
@@ -915,7 +917,6 @@ class TpuPlatform(Platform):
         )
         _validate_phased_profiling_config(vllm_config)
         _validate_peer_replay_config()
-        _validate_tpu_runner_features(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "

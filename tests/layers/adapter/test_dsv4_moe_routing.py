@@ -216,7 +216,8 @@ def test_dsv4_forward_lets_vllm_runner_apply_gate_once():
         def _ensure_moe_quant_config_init(self):
             pass
 
-        def forward_monolithic(self, *, x, router_logits, input_ids=None):
+        def forward_monolithic(self, *, x, router_logits, input_ids=None, x_scale=None):
+            assert x_scale is None
             return x * router_logits[:, :1] + input_ids[:, None]
 
     model = DeepseekV4MoE.__new__(DeepseekV4MoE)

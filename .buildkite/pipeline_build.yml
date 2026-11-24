@@ -31,9 +31,10 @@ steps:
 
       - label: ":docker: Build and Push Omni CI Image"
         key: "build_docker_omni"
-        # Empty, and so not skipped, unless bootstrap.py uploads no tests lane,
-        # the only lane that runs on this image.
-        skip: "${OMNI_IMAGE_SKIP:-}"
+        # vllm-omni 0.32.0rc1 does not install with vLLM 0.34, and omni support
+        # is moving to vllm-omni-torchtpu. Restore skip: "${OMNI_IMAGE_SKIP:-}"
+        # (set by bootstrap.py) to build this image again.
+        skip: "Omni is not built on vLLM 0.34 (moving to vllm-omni-torchtpu)"
         agents:
           queue: cpu_64_core
         commands:

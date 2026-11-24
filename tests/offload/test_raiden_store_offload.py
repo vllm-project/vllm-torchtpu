@@ -1323,11 +1323,15 @@ class TestSchedulerFenceFlow(unittest.TestCase):
 class _FakeFinishedRequest:
     """Request stand-in for the finished-request store path."""
 
-    def __init__(self, req_id, num_tokens, num_computed_tokens, status):
+    def __init__(
+        self, req_id, num_tokens, num_computed_tokens, status, num_prompt_tokens=None
+    ):
         self.request_id = req_id
         self.num_tokens = num_tokens
         self.num_computed_tokens = num_computed_tokens
-        self.num_prompt_tokens = num_tokens
+        self.num_prompt_tokens = (
+            num_tokens if num_prompt_tokens is None else num_prompt_tokens
+        )
         self.status = status
         self.kv_transfer_params = None
 
@@ -1482,12 +1486,16 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         self.assertIn("r1", sched._req_status)
 
     def test_normally_finished_request_keys_untouched(self):
-        # Normal completion: computed = num_tokens - 1, both chunks backed by blocks.
+        # Normal completion: an 8-token prompt and one output token, computed =
+        # num_tokens - 1, both chunks backed by blocks. Upstream caps a finished
+        # request at num_computed_tokens, so the prompt must be fully computed.
         from vllm.v1.request import RequestStatus
 
         store = FakeKVCacheStore()
         sched = self._make_sched(make_manager(store))
-        req = _FakeFinishedRequest("r1", 8, 7, RequestStatus.FINISHED_STOPPED)
+        req = _FakeFinishedRequest(
+            "r1", 9, 8, RequestStatus.FINISHED_STOPPED, num_prompt_tokens=8
+        )
         keys = [_key(0), _key(1)]
         self._track(sched, req, keys, [1, 2])
         jobs = sched._build_store_jobs(self._sched_output("r1"))
@@ -4237,7 +4245,7 @@ class TestDivergedHybridHitLookup(unittest.TestCase):
         self.assertEqual(list(job.dst_spec.block_ids), [11, 12, 13, 23])
         (status,) = self.scheduler._jobs.values()
         loaded = {self._key(self.ATTN, chunk) for chunk in (1, 2, 3)}
-        self.assertEqual(status.keys, loaded | {self._key(self.MAMBA, 3)})
+        self.assertEqual(set(status.keys), loaded | {self._key(self.MAMBA, 3)})
         # prepare_load pinned the Mamba state's host blocks for the transfer.
         for sub_hash in sub_hashes(self._key(self.MAMBA, 3)):
             self.assertEqual(self.store.entries[sub_hash].pin_count, 1)
@@ -4357,6 +4365,7 @@ def _make_scheduler_args(manager, *, block_size: int = 16, hybrid: bool = False)
             prefix_cache_retention_interval=None, enable_prefix_caching=True
         ),
         speculative_config=None,
+        num_hash_lookahead_tokens=0,
         parallel_config=SimpleNamespace(world_size=2, decode_context_parallel_size=1),
     )
     return spec, vllm_config, kv_cache_config

@@ -1135,7 +1135,6 @@ class VllmTPUMLAAttention(MLAAttention):
             )
 
     def process_weights_after_loading(self) -> None:
-        act_dtype = self.act_dtype
         # Upstream `MLAAttention.process_weights_after_loading` reads this
         # weight raw -- `get_and_maybe_dequant_weights(kv_b_proj).T` -- and
         # asserts the [n_out, n_in] shape. The TPU linear method has already
@@ -1173,10 +1172,12 @@ class VllmTPUMLAAttention(MLAAttention):
             self.W_UK_T = Parameter(W_UK_T, requires_grad=False)
             self.W_UV = Parameter(W_UV, requires_grad=False)
             self.W_UK_T_scale = Parameter(
-                fresh_buffer(w_uk_scale.to(act_dtype)).to(device), requires_grad=False
+                fresh_buffer(w_uk_scale.to(self.act_dtype)).to(device),
+                requires_grad=False,
             )
             self.W_UV_scale = Parameter(
-                fresh_buffer(w_uv_scale.to(act_dtype)).to(device), requires_grad=False
+                fresh_buffer(w_uv_scale.to(self.act_dtype)).to(device),
+                requires_grad=False,
             )
 
         # move W_UK_T and W_UV into fresh contiguous buffers

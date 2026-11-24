@@ -1737,23 +1737,39 @@ def _patch_vllm_compile_prefix_isolation() -> None:
     )
 
 
-def _patch_vllm_tpu_adaptive_verification() -> None:
-    """Validate adaptive verification against TPU's runner.
+def _patch_vllm_tpu_runner_validation() -> None:
+    """Validate the model runner and adaptive verification against TPU's runner.
 
-    vLLM's ``VllmConfig._validate_adaptive_verification`` requires full CUDA
-    graphs, which have no TPU counterpart, so on TPU the configuration is
-    checked by ``validate_adaptive_verification_config`` instead.
+    On TPU, ``VllmConfig._validate_model_runner`` also rejects what
+    ``TPUModelRunner`` does not implement (``_validate_tpu_runner_features``),
+    where vLLM v0.33.0 ran its V1 runner check. vLLM's
+    ``VllmConfig._validate_adaptive_verification`` requires full CUDA graphs,
+    which have no TPU counterpart, so on TPU the configuration is checked by
+    ``validate_adaptive_verification_config`` instead.
     """
     from vllm.config.vllm import VllmConfig
 
-    if getattr(VllmConfig, "_tpu_adaptive_verification_patch", False):
+    if getattr(VllmConfig, "_tpu_runner_validation_patch", False):
         return
 
+    original_validate_runner = VllmConfig._validate_model_runner
     original_validate_adaptive = VllmConfig._validate_adaptive_verification
 
+    def on_tpu(config) -> bool:
+        device_config = getattr(config, "device_config", None)
+        return device_config is not None and device_config.device_type == "tpu"
+
+    def patched_validate_runner(self):
+        original_validate_runner(self)
+        if on_tpu(self):
+            from vllm_torchtpu.platforms.tpu_platform import (
+                _validate_tpu_runner_features,
+            )
+
+            _validate_tpu_runner_features(self)
+
     def patched_validate_adaptive(self):
-        device_config = getattr(self, "device_config", None)
-        if device_config is None or device_config.device_type != "tpu":
+        if not on_tpu(self):
             return original_validate_adaptive(self)
         from vllm_torchtpu.spec_decode.adaptive_verification import (
             validate_adaptive_verification_config,
@@ -1761,9 +1777,10 @@ def _patch_vllm_tpu_adaptive_verification() -> None:
 
         validate_adaptive_verification_config(self)
 
+    VllmConfig._validate_model_runner = patched_validate_runner
     VllmConfig._validate_adaptive_verification = patched_validate_adaptive
-    VllmConfig._tpu_adaptive_verification_patch = True
-    logger.info("Applied TPU patch: validate adaptive verification on TPU.")
+    VllmConfig._tpu_runner_validation_patch = True
+    logger.info("Applied TPU patch: validate the model runner on TPU.")
 
 
 if "proxy" in envs.JAX_PLATFORMS:

@@ -112,7 +112,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner validation.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
-    Patch("vllm_torchtpu:_patch_vllm_tpu_adaptive_verification", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_vllm_tpu_runner_validation", _ACTIVE),
     # Weight loading and embeddings.
     Patch(
         "vllm_torchtpu.model_loader_patches:patch_default_loader_ep_weight_filter",

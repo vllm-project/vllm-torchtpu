@@ -27,7 +27,6 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
-    KVCacheBlock,
     get_block_hash,
     get_group_id,
     get_request_block_hasher,
@@ -361,17 +360,17 @@ class Lockstep:
                     "offload offer over the wrong state",
                     entry,
                 )
-        for key, blocks in self.pool.cached_block_hash_to_block._cache.items():
+        cached = self.pool.cached_block_hash_to_block
+        # vLLM stores one block id per key, plus all ids of duplicate keys.
+        for key, block_id in cached._cache.items():
             if get_group_id(key) != MAMBA_GROUP:
                 continue
-            for block in (
-                [blocks] if isinstance(blocks, KVCacheBlock) else blocks.values()
-            ):
+            for cached_id in cached._dup_ids.get(key, (block_id,)):
                 expected = get_block_hash(key)
-                if self.content.get(block.block_id) != expected:
-                    assert self._is_partial_hit_copy(block.block_id, expected), (
+                if self.content.get(cached_id) != expected:
+                    assert self._is_partial_hit_copy(cached_id, expected), (
                         "prefix-cache entry over the wrong state",
-                        block.block_id,
+                        cached_id,
                     )
 
     def _is_partial_hit_copy(self, block_id: int, expected: object) -> bool:

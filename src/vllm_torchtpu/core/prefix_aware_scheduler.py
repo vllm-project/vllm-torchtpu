@@ -67,7 +67,8 @@ class PrefixAwareScheduler(AsyncScheduler):
     def _prefix_warmth(self, request: Request) -> int:
         """Prompt tokens of ``request`` resident in the KV cache."""
         kvm = self.kv_cache_manager
-        if not kvm.enable_caching or request.skip_reading_prefix_cache:
+        # A hit limit of 0 means the request skips prefix cache reads.
+        if not kvm.enable_caching or request.prefix_cache_hit_limit == 0:
             return 0
         if request.num_computed_tokens > 0:
             return request.num_computed_tokens

@@ -47,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.worker.gpu.spec_decode.ngram.config import NgramSpeculatorConfig
 
 from vllm_torchtpu import _patch_vllm_dcp_fine_prefix_hits
 
@@ -176,6 +177,16 @@ def _scheduler(monkeypatch, *, prefix_match_unit, use_mtp=False, lookahead_hashe
         monkeypatch.setattr(SpeculativeConfig, "use_eagle", lambda self: True)
         monkeypatch.setattr(
             SpeculativeConfig, "use_multi_module_mtp", lambda self: True
+        )
+        # The scheduler reads the drafter's lookahead and hidden-state use from
+        # its speculator config, so give the ngram one MTP's values.
+        monkeypatch.setattr(NgramSpeculatorConfig, "uses_target_hidden_states", True)
+        mtp_lookahead = property(lambda self: self.num_speculative_tokens)
+        monkeypatch.setattr(
+            NgramSpeculatorConfig, "num_lookahead_tokens", mtp_lookahead
+        )
+        monkeypatch.setattr(
+            NgramSpeculatorConfig, "num_prefill_lookahead_tokens", mtp_lookahead
         )
         speculative_config = SpeculativeConfig(
             model="ngram",

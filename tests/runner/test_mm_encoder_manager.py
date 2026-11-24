@@ -57,6 +57,7 @@ def _make_manager(
         compilation_config=SimpleNamespace(
             cudagraph_mm_encoder=True,
             encoder_cudagraph_token_budgets=list(budgets),
+            encoder_cudagraph_max_token_budget=None,
             encoder_cudagraph_max_vision_items_per_batch=2,
             encoder_cudagraph_max_frames_per_batch=0,
         ),

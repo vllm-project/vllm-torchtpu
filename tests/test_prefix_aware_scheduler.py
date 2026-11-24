@@ -36,7 +36,7 @@ def _make_request(
         arrival_time=arrival_time,
         num_preemptions=num_preemptions,
         num_computed_tokens=num_computed_tokens,
-        skip_reading_prefix_cache=skip_reading_prefix_cache,
+        prefix_cache_hit_limit=0 if skip_reading_prefix_cache else None,
         block_hashes=[object()],
     )
 

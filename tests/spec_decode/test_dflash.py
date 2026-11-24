@@ -427,8 +427,9 @@ def _add_request(scheduler: Scheduler, request_id: str, num_prompt_tokens: int):
     [
         # TPU block drafter: vLLM charges it no drafting slots.
         ("dspark", 40),
-        # PARD has no TPU block drafter and keeps its K-slot charge.
-        ("draft_model", 40 - NUM_SPEC_TOKENS),
+        # A draft model has no TPU block drafter and keeps vLLM's one-slot
+        # charge for its unsliced input token.
+        ("draft_model", 40 - 1),
     ],
 )
 def test_tpu_block_drafter_slots_go_to_prefill(method, expected_prefill):

@@ -62,7 +62,7 @@ def _config(device="tpu", method=None, pcp=1):
 
 @pytest.fixture(autouse=True)
 def _install_patch():
-    plugin._patch_vllm_tpu_adaptive_verification()
+    plugin._patch_vllm_tpu_runner_validation()
 
 
 @pytest.mark.parametrize("method,pcp", [(None, 2), ("dspark", 1), ("dflash", 1)])
@@ -114,6 +114,20 @@ def test_tpu_rejects_what_tpu_model_runner_lacks(feature, reason):
         config.parallel_config.enable_batch_sharded_sampling = True
     with pytest.raises(ValueError, match=reason):
         _validate_tpu_runner_features(config)
+
+
+def test_tpu_validate_model_runner_runs_the_tpu_runner_check():
+    # vLLM's own runner check is where v0.33.0 ran the V1 one.
+    config = _config()
+    config.parallel_config.enable_batch_sharded_sampling = True
+    with pytest.raises(ValueError, match="batch-sharded sampling"):
+        config._validate_model_runner()
+
+
+def test_non_tpu_validate_model_runner_skips_the_tpu_runner_check():
+    config = _config(device="cuda")
+    config.parallel_config.enable_batch_sharded_sampling = True
+    config._validate_model_runner()
 
 
 def _adaptive_dspark_config(device):

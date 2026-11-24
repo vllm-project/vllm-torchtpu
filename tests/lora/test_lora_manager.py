@@ -32,6 +32,8 @@ from vllm.lora.layers import (
     ClassificationHeadWithLoRA,
     ColumnParallelLinearWithLoRA,
     ColumnParallelLinearWithShardedLoRA,
+    DeepseekV4CompressorKVScoreWithLoRA,
+    DeepseekV4GroupedWoAWithLoRA,
     FusedMoE3DWithLoRA,
     FusedMoEWithLoRA,
     LogitsProcessorWithLoRA,
@@ -160,6 +162,8 @@ def _layers(device=CPU, dtype=torch.float32) -> dict[str, BaseLayerWithLoRA]:
     )
     # The view the embedding's forward reads, as create_lora_weights makes it.
     embed.lora_a_stacked_2d = embed.lora_a_stacked.view(NUM_SLOTS * VOCAB, MAX_RANK)
+    # set_lora reads the base layer's embed_scale; an unscaled embedding has none.
+    embed.base_layer = SimpleNamespace()
     return {
         "column": _linear_layer(
             ColumnParallelLinearWithLoRA,
@@ -494,6 +498,9 @@ def test_every_vllm_lora_layer_class_is_classified():
         # serve Step5, so their slicing was not reviewed for the slot write.
         Step5FusedQKVIndexerWithLoRA,
         Step5SparseIndexerWWithLoRA,
+        # Built only for DeepSeek-V4, an MoE model, which LoRA on TPU rejects.
+        DeepseekV4CompressorKVScoreWithLoRA,
+        DeepseekV4GroupedWoAWithLoRA,
     }
     exported = (getattr(vllm.lora.layers, name) for name in vllm.lora.layers.__all__)
     layer_classes = {
