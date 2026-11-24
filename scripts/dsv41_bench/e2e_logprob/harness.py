@@ -73,7 +73,7 @@ def _parse_response(body: dict) -> dict:
     # A thinking model emits reasoning first, then the answer; generation order
     # is the concatenation in that order, so the position index stays aligned
     # with the token stream.
-    content = (logprobs.get("reasoning_content") or []) + (logprobs.get("content") or [])
+    content = (logprobs.get("reasoning_content") or []) + (logprobs.get("content") or [])  # noqa: E501
     tokens, token_logprobs, top_tokens, top_logprobs = [], [], [], []
     for position in content:
         tokens.append(position["token"])
@@ -175,7 +175,7 @@ def _load(path: str) -> dict[str, dict]:
     return {
         record["id"]: record
         for record in (
-            json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()
+            json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()  # noqa: E501
         )
     }
 
@@ -247,7 +247,7 @@ def compare(args) -> int:
         name, _, path = spec.partition("=")
         candidates.append((name, _load(path)))
 
-    header = f"{'pair':<10} {'n':>4} {'pos':>6} {'div%':>6} {'nll_d':>9} {'kl':>9} {'top1':>6} {'exact':>6}"
+    header = f"{'pair':<10} {'n':>4} {'pos':>6} {'div%':>6} {'nll_d':>9} {'kl':>9} {'top1':>6} {'exact':>6}"  # noqa: E501
     print(header)
     print("-" * len(header))
     for name, cand_records in candidates:
@@ -260,7 +260,7 @@ def compare(args) -> int:
         ]
         if mismatched:
             print(
-                f"{name:<10} WARNING: prompt_tokens differ on {len(mismatched)} prompts "
+                f"{name:<10} WARNING: prompt_tokens differ on {len(mismatched)} prompts "  # noqa: E501
                 f"-> chat template mismatch, distances are not comparable"
             )
     for name, cand_records in candidates:
@@ -278,7 +278,7 @@ def compare(args) -> int:
         print(
             f"{name:<10} {len(rows):>4} {positions:>6} "
             f"{100 * diverged / len(rows):>5.1f}% "
-            f"{_mean([r['nll_delta'] for r in rows if r['nll_delta'] is not None]) or 0:>9.2e} "
+            f"{_mean([r['nll_delta'] for r in rows if r['nll_delta'] is not None]) or 0:>9.2e} "  # noqa: E501
             f"{_mean([r['kl'] for r in rows if r['kl'] is not None]) or 0:>9.2e} "
             f"{_mean([r['top1'] for r in rows if r['top1'] is not None]) or 0:>6.3f} "
             f"{100 * sum(r['exact'] for r in rows) / len(rows):>5.1f}%"
@@ -286,7 +286,7 @@ def compare(args) -> int:
     if args.json:
         payload = {
             name: {
-                prompt_id: _compare_prompt(ref_records[prompt_id], cand_records[prompt_id])
+                prompt_id: _compare_prompt(ref_records[prompt_id], cand_records[prompt_id])  # noqa: E501
                 for prompt_id in ref_records
                 if prompt_id in cand_records
             }
@@ -298,13 +298,17 @@ def compare(args) -> int:
 
 
 
+class PromptMismatch(Exception):
+    """The server scored different tokens than the ones sent."""
+
+
 def _root(args) -> str:
     base = args.base_url.rstrip("/")
     return base[: -len("/v1")] if base.endswith("/v1") else base
 
 
 def _tokenize(args, payload: dict, headers: dict) -> list[int]:
-    body = _post(f"{_root(args)}/tokenize", payload, headers, args.timeout, args.retries)
+    body = _post(f"{_root(args)}/tokenize", payload, headers, args.timeout, args.retries)  # noqa: E501
     return [int(token) for token in body["tokens"]]
 
 
@@ -325,9 +329,16 @@ def _score_ids(args, ids: list[int], headers: dict) -> tuple[list[float | None],
             args.timeout,
             args.retries,
         )
+        choice = (body.get("choices") or [{}])[0]
+        served = body.get("prompt_token_ids") or choice.get("prompt_token_ids")
+        if served is not None and [int(t) for t in served] != ids:
+            raise PromptMismatch(
+                f"server scored {len(served)} different prompt tokens than the "
+                f"{len(ids)} sent (truncation or template drift)"
+            )
         entries = body.get("prompt_logprobs")
         if entries is None:
-            entries = (body.get("choices") or [{}])[0].get("prompt_logprobs")
+            entries = choice.get("prompt_logprobs")
         if entries is None:
             raise RuntimeError("server returned no prompt_logprobs")
         if len(entries) != len(ids):
@@ -345,8 +356,10 @@ def _score_ids(args, ids: list[int], headers: dict) -> tuple[list[float | None],
                 raise RuntimeError(
                     f"position {position}: token {key} missing from prompt_logprobs"
                 )
-            values.append(float(logprob["logprob"] if isinstance(logprob, dict) else logprob))
+            values.append(float(logprob["logprob"] if isinstance(logprob, dict) else logprob))  # noqa: E501
         return values, "prompt_logprobs"
+    except PromptMismatch:
+        raise
     except Exception as exc:  # noqa: BLE001 - fall back to the echo form
         # Older/newer servers only expose prompt logprobs through echo.
         body = _post(
@@ -414,13 +427,13 @@ def teacher(args) -> int:
     prompts = {
         prompt["id"]: prompt
         for prompt in (
-            json.loads(line) for line in Path(args.prompts).read_text().splitlines() if line.strip()
+            json.loads(line) for line in Path(args.prompts).read_text().splitlines() if line.strip()  # noqa: E501
         )
     }
     references = {
         record["id"]: record
         for record in (
-            json.loads(line) for line in Path(args.ref).read_text().splitlines() if line.strip()
+            json.loads(line) for line in Path(args.ref).read_text().splitlines() if line.strip()  # noqa: E501
         )
     }
     todo = [prompt_id for prompt_id in references if prompt_id in prompts]
@@ -445,7 +458,7 @@ def teacher(args) -> int:
     failures = 0
     with out_path.open("a") as sink, ThreadPoolExecutor(args.concurrency) as pool:
         futures = [
-            pool.submit(_teacher_one, args, prompts[prompt_id], references[prompt_id], {})
+            pool.submit(_teacher_one, args, prompts[prompt_id], references[prompt_id], {})  # noqa: E501
             for prompt_id in todo
         ]
         for index, future in enumerate(futures, 1):
@@ -489,7 +502,7 @@ def score(args) -> int:
     for name, records in runs[1:]:
         ids &= set(records)
     ids = sorted(ids)
-    header = f"{'run':<8} {'n':>4} {'tokens':>7} {'nats/tok':>10} {'vs first':>12} {'+/-95%':>10}"
+    header = f"{'run':<8} {'n':>4} {'tokens':>7} {'nats/tok':>10} {'vs first':>12} {'+/-95%':>10}"  # noqa: E501
     print(header)
     print("-" * len(header))
     baseline = None
@@ -502,7 +515,7 @@ def score(args) -> int:
         mean = sum(record["nll_sum"] for record in pool) / tokens
         if baseline is None:
             baseline = (name, mean)
-            print(f"{name:<8} {len(pool):>4} {tokens:>7} {mean:>10.4f} {'-':>12} {'-':>10}")
+            print(f"{name:<8} {len(pool):>4} {tokens:>7} {mean:>10.4f} {'-':>12} {'-':>10}")  # noqa: E501
             continue
         baseline_records = runs[0][1]
         deltas = [
@@ -552,10 +565,10 @@ def main() -> int:
     compare_parser.add_argument(
         "--cand", action="append", required=True, help="name=path JSONL, repeatable"
     )
-    compare_parser.add_argument("--json", default="", help="write per-prompt results here")
+    compare_parser.add_argument("--json", default="", help="write per-prompt results here")  # noqa: E501
     compare_parser.set_defaults(func=compare)
 
-    teacher_parser = sub.add_parser("teacher", help="score official text under a local config")
+    teacher_parser = sub.add_parser("teacher", help="score official text under a local config")  # noqa: E501
     teacher_parser.add_argument("--prompts", required=True)
     teacher_parser.add_argument("--ref", required=True, help="official collect JSONL")
     teacher_parser.add_argument("--out", required=True)
