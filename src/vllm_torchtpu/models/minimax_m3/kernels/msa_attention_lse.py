@@ -399,8 +399,7 @@ def _kernel(
             else:
                 store_out(out)
 
-        def write(out, lse):
-            put(out)
+        def store_lse(lse):  # [rows, 1], or [rows, rows] equal along the lanes
             # Lane-dense row: each row's value picked off the diagonal by a
             # sublane sum (a transpose was the finish's critical path).
             rows = lse.shape[0]
@@ -409,6 +408,10 @@ def _kernel(
             ) == jax.lax.broadcasted_iota(jnp.int32, (rows, rows), 1)
             row = jnp.sum(jnp.where(eye, lse, 0.0), axis=0, keepdims=True)
             lse_ref[...] = row.reshape(lse_ref.shape)
+
+        def write(out, lse):
+            put(out)
+            store_lse(lse)
 
         def finish(m, denom, acc):
             """Output and lse from a tile's softmax state (log2 units, ``m``
@@ -690,13 +693,23 @@ def _kernel(
         def fold(l_cur, pv):
             """A unit's group's `update` (`MAX_FREE`), after its earlier groups'."""
             # Straight-line: every group carries its tile's sums and writes
-            # its output (a later group of the tile overwrites it).
+            # its output (a later group of the tile overwrites it). The sums
+            # stay replicated along the lanes (`l_ref` [rows, D], as the lane
+            # reduction leaves them): no per-row broadcast for the division,
+            # and the lse row comes off the diagonal of the same layout.
             carry = jnp.logical_not(first)
+            wide = l_ref.shape[1] > 1  # fewer rows than lanes (`_kernel_scratch`)
+            if wide:
+                l_cur = jnp.broadcast_to(l_cur, l_ref.shape)
             l_new = jnp.where(carry, l_ref[...], 0.0) + l_cur
             acc_new = jnp.where(carry, acc_ref[...], 0.0) + pv
             l_ref[...] = l_new
             acc_ref[...] = acc_new
-            finish(0.0, l_new, acc_new)
+            if not wide:
+                finish(0.0, l_new, acc_new)
+                return
+            put(acc_new * (1.0 / jnp.maximum(l_new, _denom_floor())))
+            store_lse(jnp.log(l_new[:, : l_new.shape[0]]))
 
         def empty():
             write(
@@ -1153,6 +1166,8 @@ def _kernel_scratch(
         ring = 1 + (_FP4_PREFETCH if scale_cache is not None else 1)
     if transposed:
         softmax = [(1, rows), (1, rows), (head_dim, rows)]
+    elif unit_groups > 1 and rows <= head_dim:  # `fold`'s lane-replicated sums
+        softmax = [(rows, 1), (rows, head_dim), (rows, head_dim)]
     else:
         softmax = [(rows, 1), (rows, 1), (rows, head_dim)]
     scratch = [pltpu.VMEM(shape, jnp.float32) for shape in softmax]
