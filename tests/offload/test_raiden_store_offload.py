@@ -1503,6 +1503,32 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         self.assertIn(7, meta.finished_store_job_ids)
         self.assertFalse(manager.is_job_launched(7))
 
+    def test_write_back_flush_keeps_pieces_that_read_no_reused_block(self):
+        from collections import Counter
+
+        from vllm_torchtpu.offload.raiden_connector import WriteBackPolicy
+
+        store = FakeKVCacheStore()
+        manager = make_manager(store, max_inflight_store_sub_blocks=4)
+        keys = [_key(0), _key(1)]
+        manager.prepare_store(keys, _ctx())
+        sched = self._make_scheduler(manager)
+        sched._write_back = WriteBackPolicy()
+        sched.wb_counters = Counter()
+        with patch.object(type(sched), "_write_back_output", lambda self, out: out):
+            self._build_meta(
+                sched, self._stock_meta(store_jobs={7: self._store_job(keys, [5, 6])})
+            )
+        self._ack(sched, [7], count=2)
+        # The tail piece (block 6) is saving; block 5's piece waits its turn.
+        sched._step_reused_blocks = frozenset({6})
+        store.complete_save(store.calls_named("save")[-1].args[0])
+        with patch.object(type(sched), "_write_back_output", lambda self, out: out):
+            meta = self._build_meta(sched, self._stock_meta(jobs_to_flush={7}))
+        self.assertNotIn(7, meta.finished_store_job_ids)
+        self.assertTrue(manager.is_job_launched(7))
+        self.assertEqual(manager.lookup(_key(1), _ctx()), LookupResult.HIT)
+
 
 class _FakeFinishedRequest:
     """Request stand-in for the finished-request store path."""
@@ -4762,15 +4788,21 @@ class TestStorePacing(unittest.TestCase):
         out = self.manager.prepare_store(self.keys, _ctx())
         self.assertEqual(out.keys_to_store, self.keys)
 
-    def test_pieces_launch_in_turn_and_finish_the_job_once(self):
-        self.manager.submit_store_job(7, self.keys, [5, 6, 9])
+    def test_pieces_launch_in_device_block_order(self):
+        self.manager.submit_store_job(7, self.keys, [9, 5, 6])
         (insert,) = self.store.calls_named("insert")
-        self.assertEqual(insert.args[0], sub_hashes(_key(0)) + sub_hashes(_key(1)))
+        self.assertEqual(insert.args[0], sub_hashes(_key(1)) + sub_hashes(_key(2)))
+
+    def test_pieces_launch_in_turn_and_finish_the_job_once(self):
+        # Tail of the chain first, each piece in device-block order.
+        self.manager.submit_store_job(7, self.keys, [6, 5, 9], tail_first=True)
+        (insert,) = self.store.calls_named("insert")
+        self.assertEqual(insert.args[0], sub_hashes(_key(1)) + sub_hashes(_key(2)))
         self.assertTrue(self.manager.is_job_launched(7))
         self.store.complete_save(self.store.calls_named("save")[-1].args[0])
         self.assertEqual(self.manager.poll_finished_jobs(), [])
         save = self.store.calls_named("save")[-1]
-        self.assertEqual(save.args[0], sub_hashes(_key(2)))
+        self.assertEqual(save.args[0], sub_hashes(_key(0)))
         self.store.complete_save(save.args[0])
         (job,) = self.manager.poll_finished_jobs()
         self.assertEqual((job.job_id, job.success), (7, True))
@@ -4788,6 +4820,29 @@ class TestStorePacing(unittest.TestCase):
         self.assertFalse(self.manager.has_pending_work())
         self.assertEqual(self.manager._inflight_store_keys, set())
         self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_drain_for_reused_blocks_keeps_the_other_pieces(self):
+        # Pieces: (k1, k2) on blocks 6 and 9 launched, (k0) on block 5 queued.
+        self.manager.submit_store_job(7, self.keys, [5, 6, 9], tail_first=True)
+        self.assertEqual(self.manager.drain_jobs({7}, reused_blocks={5}), [])
+        self.assertEqual(self.manager.last_drain_hits, 1)
+        self.assertNotIn(_key(0), self.manager._inflight_store_keys)
+        self.store.complete_save(self.store.calls_named("save")[-1].args[0])
+        (job,) = self.manager.poll_finished_jobs()
+        self.assertEqual((job.job_id, job.success), (7, False))
+        self.assertEqual(len(self.store.calls_named("save")), 1)
+        self.assertEqual(self.manager.lookup(_key(2), _ctx()), LookupResult.HIT)
+
+    def test_drain_for_unrelated_blocks_cancels_nothing(self):
+        self.manager.submit_store_job(7, self.keys, [5, 6, 9], tail_first=True)
+        self.assertEqual(self.manager.drain_jobs({7}, reused_blocks={42}), [])
+        self.assertEqual(self.manager.last_drain_hits, 0)
+        for _ in range(2):
+            self.store.complete_save(self.store.calls_named("save")[-1].args[0])
+            finished = self.manager.poll_finished_jobs()
+        self.assertEqual([(j.job_id, j.success) for j in finished], [(7, True)])
+        for key in self.keys:
+            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
 
     def test_a_piece_rejected_at_submit_does_not_hold_up_the_rest(self):
         # Every insert is refused: each piece finishes inside its submit, and

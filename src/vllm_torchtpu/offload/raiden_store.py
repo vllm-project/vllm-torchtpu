@@ -84,7 +84,8 @@ import socket
 import threading
 import time
 from collections import defaultdict, deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
@@ -780,6 +781,9 @@ class RaidenOffloadingManager(OffloadingManager):
         self._store_jobs: dict[int, _PacedStore] = {}
         self._piece_parent: dict[int, int] = {}
         self._piece_sub_blocks: dict[int, int] = {}
+        self._piece_blocks: dict[int, frozenset[int]] = {}
+        # Jobs the last `drain_jobs` cancelled pieces of or waited for.
+        self.last_drain_hits = 0
         self._next_piece_id = -1
 
     # -- sub-hash / block-id expansion ----------------------------------
@@ -1255,7 +1259,11 @@ class RaidenOffloadingManager(OffloadingManager):
     # -- job submission bridge (called by the connector scheduler) --------
 
     def submit_store_job(
-        self, job_id: int, keys: list[OffloadKey], device_block_ids: list[int]
+        self,
+        job_id: int,
+        keys: list[OffloadKey],
+        device_block_ids: list[int],
+        tail_first: bool = False,
     ) -> None:
         """Admit and launch a store job, as pieces when saves are paced."""
         if self._max_inflight_stores <= 0 or not keys:
@@ -1264,10 +1272,20 @@ class RaidenOffloadingManager(OffloadingManager):
         keys_per_piece = max(
             self._max_inflight_stores // self._device_block_size_factor, 1
         )
-        # Device-block order, so each piece keeps runs of consecutive blocks.
-        device_block_ids, keys = map(
-            list, zip(*sorted(zip(device_block_ids, keys), key=lambda p: p[0]))
-        )
+        if tail_first:
+            # `keys` come in chain order. The device frees a request's blocks
+            # tail first, so its tail is reused first, and a head inserted
+            # last stays most recently used on the host. Only worth it when a
+            # flush keeps the pieces a reuse does not touch (`drain_jobs`'s
+            # `reused_blocks`): otherwise a cut store would keep a tail that
+            # no prefix lookup reaches. `_submit_store_batch` puts each piece
+            # in device-block order.
+            keys, device_block_ids = keys[::-1], device_block_ids[::-1]
+        else:
+            # Device-block order, so each piece keeps runs of consecutive blocks.
+            device_block_ids, keys = map(
+                list, zip(*sorted(zip(device_block_ids, keys), key=lambda p: p[0]))
+            )
         self._store_jobs[job_id] = _PacedStore(
             deque(
                 (keys[i : i + keys_per_piece], device_block_ids[i : i + keys_per_piece])
@@ -1298,6 +1316,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 self._piece_sub_blocks[piece_id] = (
                     len(keys) * self._device_block_size_factor
                 )
+                self._piece_blocks[piece_id] = frozenset(device_block_ids)
                 job.live.add(piece_id)
                 self._submit_store_batch(piece_id, keys, device_block_ids)
                 # A piece can finish inside the submit (insert rejected,
@@ -1314,6 +1333,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 kept.append(finished)
                 continue
             self._piece_sub_blocks.pop(finished.job_id, None)
+            self._piece_blocks.pop(finished.job_id, None)
             job = self._store_jobs[job_id]
             job.live.discard(finished.job_id)
             job.failed |= not finished.success
@@ -1326,23 +1346,35 @@ class RaidenOffloadingManager(OffloadingManager):
                 )
         self._finished = kept
 
-    def _cancel_queued_store_pieces(self, job_ids: set[int]) -> set[int]:
+    def _cancel_queued_store_pieces(
+        self, job_ids: set[int], reused_blocks: AbstractSet[int] | None = None
+    ) -> set[int]:
         """Drop the unlaunched pieces of `job_ids` (their source blocks are
-        about to be reused); return the ids of their launched pieces."""
+        about to be reused); return the ids of their launched pieces. With
+        `reused_blocks`, only the pieces reading one of them: the job's other
+        pieces go on."""
+
+        def hit(blocks: Iterable[int]) -> bool:
+            return reused_blocks is None or not reused_blocks.isdisjoint(blocks)
+
         pieces: set[int] = set()
         for job_id in job_ids & self._store_jobs.keys():
             job = self._store_jobs[job_id]
-            if job.queued:
+            kept = deque(piece for piece in job.queued if not hit(piece[1]))
+            live_hits = {p for p in job.live if hit(self._piece_blocks.get(p, ()))}
+            self.last_drain_hits += len(kept) < len(job.queued) or bool(live_hits)
+            if len(kept) < len(job.queued):
                 job.failed = True
-                for keys, _ in job.queued:
-                    self._inflight_store_keys.difference_update(keys)
-                job.queued.clear()
-            if not job.live:
+                for keys, blocks in job.queued:
+                    if hit(blocks):
+                        self._inflight_store_keys.difference_update(keys)
+                job.queued = kept
+            if not job.live and not job.queued:
                 del self._store_jobs[job_id]
                 self._finished.append(
                     FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=False)
                 )
-            pieces |= job.live
+            pieces |= live_hits
         return pieces
 
     def _submit_store_batch(
@@ -1936,7 +1968,9 @@ class RaidenOffloadingManager(OffloadingManager):
         self._finished = []
         return finished
 
-    def drain_jobs(self, job_ids: set[int]) -> list[FinishedJob]:
+    def drain_jobs(
+        self, job_ids: set[int], reused_blocks: AbstractSet[int] | None = None
+    ) -> list[FinishedJob]:
         """Drain in-flight DMA transfers to safely reclaim HBM blocks before reuse.
 
         Synchronously waits until the specified launched jobs complete (bounded
@@ -1948,11 +1982,24 @@ class RaidenOffloadingManager(OffloadingManager):
         remain live until hardware completion, but the finalizer treats them as
         terminal failures to prevent committing corrupted/torn bytes from reused
         blocks. Poisoned jobs are considered drained on subsequent calls.
+
+        `reused_blocks` narrows a paced store job's drain to the pieces that
+        read a reused block; the caller must flush the job again when another
+        of its blocks is reused. Its other pieces go on, and the job is not
+        returned until they finish.
         """
         # Suppress retries for draining jobs: source blocks are being reclaimed,
         # so subsequent reads would transfer invalid/overwritten data.
         self._cancel_queued_loads(set(job_ids))
-        waits = set(job_ids) | self._cancel_queued_store_pieces(set(job_ids))
+        self.last_drain_hits = 0
+        if reused_blocks is None:
+            waits = set(job_ids) | self._cancel_queued_store_pieces(set(job_ids))
+        else:
+            paced = set(job_ids) & self._store_jobs.keys()
+            waits = (set(job_ids) - paced) | self._cancel_queued_store_pieces(
+                paced, reused_blocks
+            )
+            self.last_drain_hits += len(set(job_ids) - paced)
         for job_id in waits:
             admission = self._admissions.get(job_id)
             if admission is not None:

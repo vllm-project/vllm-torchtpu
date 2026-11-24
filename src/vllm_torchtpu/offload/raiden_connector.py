@@ -273,6 +273,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     # Block id -> its prefix-cache hash when its request finished; None until
     # the first finish (see `_drop_reattached_blocks`).
     _finished_block_hashes: dict[int, object] | None = None
+    # The blocks this step hands out for new content, which flush stores.
+    _step_reused_blocks: frozenset[int] = frozenset()
 
     def __init__(
         self,
@@ -358,6 +360,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_req_states(scheduler_output)
         self._drop_reattached_blocks(self._current_batch_allocated_block_ids)
+        self._step_reused_blocks = frozenset(self._current_batch_allocated_block_ids)
 
     def _touch_chain(self, req_id: str) -> None:
         """With ``VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH``, refresh the request's
@@ -587,9 +590,18 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 )
             elif manager.is_job_launched(job_id):
                 launched_flush_ids.add(job_id)
-        if self._write_back is not None:
-            self.wb_counters["flush_drained_jobs"] += len(launched_flush_ids)
-        drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
+        # Write-back stores only finished requests, whose every block is
+        # watched for reuse, so a flushed store may keep the pieces that read
+        # no reused block: a later reuse of theirs flushes it again. (Its
+        # other stores, a hybrid model's boundary and partial-tail ones, watch
+        # their blocks from creation, so the same holds when the base flushes
+        # them for a preemption.)
+        reused = self._step_reused_blocks if self._write_back is not None else None
+        drained: list = []
+        if launched_flush_ids:
+            drained = manager.drain_jobs(launched_flush_ids, reused)
+            if self._write_back is not None:
+                self.wb_counters["flush_drained_jobs"] += manager.last_drain_hits
 
         # Collect completed/drained jobs for the worker echo channel.
         for finished_job in list(drained) + manager.poll_finished_jobs():
@@ -719,7 +731,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 if parked.acks == self.config.num_workers:
                     del self._fence_pending[job_id]
                     self._raiden_manager.submit_store_job(
-                        job_id, parked.keys, parked.device_block_ids
+                        job_id,
+                        parked.keys,
+                        parked.device_block_ids,
+                        tail_first=self._write_back is not None,
                     )
         super().update_connector_output(connector_output)
 
