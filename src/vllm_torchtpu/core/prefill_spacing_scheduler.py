@@ -53,6 +53,15 @@ warmest-first admission, each step this scheduler:
   (running chunks, then the waiting window, each shortest first), the whole
   remaining prefills that fit the largest prefill-token bin whose measured
   step time stays within every decoding request's slack (no chunk is cut).
+* with ``VLLM_TPU_PREFILL_SRPT`` set, ranks the waiting window, the running
+  prefill chunks and the reserve above by one aged shortest-remaining key:
+  uncached prompt tokens left minus ``VLLM_TPU_PREFILL_SRPT_AGING_TOKENS_PER_S``
+  per second since the request arrived. Without it the key is the uncached
+  tokens alone, and a long prompt waits as long as shorter ones keep arriving;
+  with it a prompt with ``R`` tokens left goes ahead of every request that
+  arrived ``R / rate`` seconds or more after it. It changes which prefill a
+  step runs, never whether a step runs prefill (spacing and TPOT holds are
+  unchanged).
 
 Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.prefill_spacing_scheduler.PrefillSpacingScheduler``.
@@ -68,7 +77,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
+from vllm_torchtpu.core.prefix_aware_scheduler import (
+    _TIER_NORMAL,
+    PrefixAwareScheduler,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -102,6 +114,12 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self.priced = envs.VLLM_TPU_PREFILL_TPOT_PRICED
         self.hold_horizon = envs.VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON
         self.max_wait_s = envs.VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S
+        self.srpt = envs.VLLM_TPU_PREFILL_SRPT
+        self.srpt_aging = envs.VLLM_TPU_PREFILL_SRPT_AGING_TOKENS_PER_S
+        # SRPT: wall clock of the current step (arrival_time is wall time) and
+        # the aged keys of the admissible window, parallel to _window_cold.
+        self._srpt_now = time.time()
+        self._window_key: list[float] = []
         # Decoding request id -> when it was first scheduled to decode, and
         # its output tokens at the previous step (TPOT projection).
         self._decode_t0: dict[str, float] = {}
@@ -138,12 +156,31 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self._long_steps = 0
         logger.info(
             "PrefillSpacingScheduler active (spacing_frac=%.2f, "
-            "long_prompt_tokens=%d, max_starved_steps=%d, tpot_target_ms=%.1f)",
+            "long_prompt_tokens=%d, max_starved_steps=%d, tpot_target_ms=%.1f, "
+            "srpt=%s, srpt_aging_tokens_per_s=%.0f)",
             self.spacing_frac,
             self.long_prompt_tokens,
             self.max_starved_steps,
             self.tpot_target_s * 1e3,
+            self.srpt,
+            self.srpt_aging,
         )
+
+    def _age_tokens(self, request: Request) -> float:
+        """SRPT credit of ``request``: aging rate times seconds since arrival."""
+        return self.srpt_aging * max(self._srpt_now - request.arrival_time, 0.0)
+
+    def _srpt_key(self, request: Request) -> float:
+        """Aged shortest-remaining key of a running prefill chunk."""
+        return self._remaining(request) - self._age_tokens(request)
+
+    def _rank_and_warmth(
+        self, request: Request
+    ) -> tuple[tuple[int, float, float], int]:
+        rank, warmth = super()._rank_and_warmth(request)
+        if self.srpt and rank[0] == _TIER_NORMAL:
+            rank = (rank[0], rank[1] - self._age_tokens(request), rank[2])
+        return rank, warmth
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
         """Sort the whole window warmest first (once per step) and keep the
@@ -152,6 +189,7 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             return
         self._sorted_at_step = self.current_step
         self._window_cold = []
+        self._window_key = []
         if self.policy != SchedulingPolicy.FCFS or not queue:
             return
         # Upkeep PrefixAwareScheduler._promote_warmest does: probe refresh
@@ -176,8 +214,16 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             for (_, warmth), r in scored
             if not self._is_blocked_waiting_status(r.status)
         ]
+        if self.srpt:
+            self._window_key = [
+                max(r.num_tokens - warmth, 1) - self._age_tokens(r)
+                for (_, warmth), r in scored
+                if not self._is_blocked_waiting_status(r.status)
+            ]
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        if self.srpt:
+            self._srpt_now = time.time()
         queue = getattr(self, "kv_holding_waiting", None) or getattr(
             self, "waiting", None
         )
@@ -310,19 +356,23 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
     def _plan_reserve(self, prefilling: list[Request]) -> dict[str, int]:
         """Order RUNNING and size each prefill chunk's reserve for the
         shorter waiting requests the free running slots can admit."""
+        # Off: both sides rank by tokens left; SRPT: by the aged key.
+        rank = self._srpt_key if self.srpt else self._remaining
+        window_rank = self._window_key if self.srpt else self._window_cold
         self.running[:] = [r for r in self.running if not r.is_prefill_chunk] + sorted(
-            prefilling, key=self._remaining
+            prefilling, key=rank
         )
         room = min(self.max_num_running_reqs, self.max_num_active_reqs) - len(
             self.running
         )
-        admissible = self._window_cold[: max(room, 0)]
+        room = max(room, 0)
+        admissible = list(zip(window_rank[:room], self._window_cold[:room]))
         reserve = {}
         for r in prefilling:
             if self._starved.get(r.request_id, 0) >= self.max_starved_steps:
                 continue
-            remaining = self._remaining(r)
-            tokens = sum(c for c in admissible if c < remaining)
+            key = rank(r)
+            tokens = sum(c for k, c in admissible if k < key)
             if tokens:
                 reserve[r.request_id] = tokens
         return reserve
