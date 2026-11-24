@@ -1933,7 +1933,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # more than <threshold> distinct pages per query tile on average with
     # <block_q>-token tiles and <tile_pages> cached union pages, other calls
     # with the configured tiles (`msa_attention_lse.adaptive_prefill`). Empty
-    # keeps one configuration.
+    # keeps one configuration. More tiers, ";" between them, each with its
+    # own threshold (prefix "x": the widest sampled tile's distinct pages
+    # instead of the mean) and tiles (`msa_attention_lse.adaptive_tiers`).
     "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE": env_str(
         "TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE", ""
     ),

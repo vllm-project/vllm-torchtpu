@@ -171,3 +171,100 @@ def test_adaptive_spec_parsing(monkeypatch):
     monkeypatch.setenv(lse_mod.ADAPTIVE_ENV, "30:8")
     with pytest.raises(ValueError):
         lse_mod.adaptive_prefill()
+
+
+def test_adaptive_tiers_parsing(monkeypatch):
+    monkeypatch.setenv(lse_mod.ADAPTIVE_ENV, "30:8:64:48:2.4.40;50:8:64:64:2.56")
+    assert lse_mod.adaptive_tiers() == [
+        (30, dict(block_q=8, page_cache_tile_pages=64, pages_per_step=48,
+                  step_widths=(2, 4, 40)), "mean"),
+        (50, dict(block_q=8, page_cache_tile_pages=64, pages_per_step=64,
+                  step_widths=(2, 56)), "mean"),
+    ]
+    assert lse_mod.adaptive_prefill() == (
+        30, dict(block_q=8, page_cache_tile_pages=64, pages_per_step=48,
+                 step_widths=(2, 4, 40)),
+    )
+    monkeypatch.setenv(lse_mod.ADAPTIVE_ENV, "30:8:64;x60:8:64:64")
+    assert [(t, s) for t, _, s in lse_mod.adaptive_tiers()] == [(30, "mean"), (60, "max")]
+    monkeypatch.setenv(lse_mod.ADAPTIVE_ENV, "30:8:64;20:8:64:64")
+    with pytest.raises(ValueError):
+        lse_mod.adaptive_tiers()
+
+
+def _tier_reference(sel, block_q, tiers, max_tiles=64):
+    t, g, k = sel.shape
+    pad = -t % block_q
+    sel = np.concatenate([sel, np.full((pad, g, k), -1, sel.dtype)])
+    stride = max(1, (t + pad) // block_q // max_tiles)
+    widths = []
+    for h in range(g):
+        for t0 in range(0, t + pad, block_q * stride):
+            keys = sel[t0 : t0 + block_q, h].reshape(-1)
+            keys = keys[keys >= 0]
+            if keys.size:
+                widths.append(len(np.unique(keys)))
+    index = 0
+    for i, (threshold, _, stat) in enumerate(tiers):
+        over = (max(widths, default=0) > threshold if stat == "max"
+                else sum(widths) > threshold * len(widths))
+        index = i + 1 if over else index
+    return index
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_adaptive_tier_matches_reference(seed):
+    rng = np.random.default_rng(seed)
+    t = int(rng.integers(20, 90))
+    sel = rng.integers(-1, 40, size=(t, 2, 8)).astype(np.int32)
+    sel[: t // 3] = -1
+    for tiers in ([(6, {}, "mean"), (12, {}, "mean")],
+                  [(4, {}, "mean"), (20, {}, "max")],
+                  [(10, {}, "mean"), (16, {}, "mean"), (30, {}, "max")]):
+        for block_q in (8, 16):
+            got = int(lse_mod.adaptive_tier(jnp.asarray(sel), block_q, tiers))
+            assert got == _tier_reference(sel, block_q, tiers)
+
+
+def test_adaptive_three_tiers_give_the_picked_configuration(prefill_config):
+    narrow = _inputs(1, union=16, seed=1)
+    mid = _inputs(1, union=28, seed=3)
+    wide = _inputs(1, union=40, seed=2)
+    jax.clear_caches()
+    base = [_attend(x) for x in (narrow, mid, wide)]
+    prefill_config.setenv(lse_mod.ADAPTIVE_ENV, "20:8:32;30:8:48:32")
+    ran = _record_runs(prefill_config)
+    jax.clear_caches()
+    got = [_attend(x) for x in (narrow, mid, wide)]
+    jax.effects_barrier()
+    assert ran == [(16, 0), (8, 32), (8, 48)]
+    for (o, l), (eo, el) in zip(got, base):  # 8- and 16-token tiles agree on CPU
+        np.testing.assert_allclose(o, eo, rtol=2e-2, atol=2e-2)
+        np.testing.assert_allclose(l, el, rtol=1e-4, atol=1e-4)
+
+
+def _cond_branch_counts(jaxpr):
+    counts = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "cond":
+            counts.append(len(eqn.params["branches"]))
+        for value in eqn.params.values():
+            for sub in value if isinstance(value, (tuple, list)) else [value]:
+                sub = getattr(sub, "jaxpr", sub)
+                if hasattr(sub, "eqns"):
+                    counts += _cond_branch_counts(sub)
+    return counts
+
+
+def test_adaptive_tiers_dispatch_with_two_branch_conds(prefill_config):
+    # A switch over three or more kernels stops the served compiler from
+    # sharing the attention code across layers; tiers nest two-branch conds.
+    args = _inputs(1, union=28, seed=3)
+    prefill_config.setenv(lse_mod.ADAPTIVE_ENV, "20:8:32;x30:8:48:32")
+    jax.clear_caches()
+    jaxpr = jax.make_jaxpr(lambda *a: msa_dcp.msa_attend_dcp(
+        *a[:6], sm_scale=1 / np.sqrt(D), topk=TOPK, rank=0, dcp=1,
+        scale_cache=a[6], interpret=True,
+    ))(*args).jaxpr
+    counts = _cond_branch_counts(jaxpr)  # the kernels' own conds included
+    assert len(counts) >= 2 and set(counts) == {2}
