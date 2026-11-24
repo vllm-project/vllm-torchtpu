@@ -53,6 +53,7 @@ per word.
 
 import functools
 import inspect
+import itertools
 from typing import Any
 
 import jax
@@ -655,6 +656,7 @@ def attend_cached(
         v_scale=v_scale,
         interpret=interpret,
         native_lse=raw,
+        uniform_blocks=uniform_blocks,
     )
     if raw:
         # The kernel's own layout (`attend_pages` ``native_lse``), for
@@ -703,6 +705,7 @@ def attend_pages(
     v_scale: float | None = None,
     interpret: bool = False,
     native_lse: bool = False,
+    uniform_blocks: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Each request's query tokens (``q [T, H, D]`` rows ``q_starts[r]`` on,
     ``q_lens[r]`` of at most ``max_query_len``) over its window pages
@@ -710,9 +713,15 @@ def attend_pages(
     `_window_pages`), read straight from the paged cache: one grid step per
     request DMAs its L pages and query rows into VMEM (the next request's
     while this one computes), attends every query head to the pages'
-    token-heads and DMAs the output rows back. Returns
+    token-heads and DMAs the output rows back. With ``uniform_blocks`` every
+    request's rows are a full block (`attend_cached`), so each moves as one
+    copy with no per-row branches. Returns
     ``(out [T, H, D] in q's dtype, lse [R, Q, H] f32)``; rows of ``out`` no request
     owns are undefined.
+
+    Every slot of a fetched page must hold finite K and V: masked keys get an
+    additive -inf bias and P = 0, not a select (the cache is zero-initialised
+    and writes clip).
 
     Replaces a page gather to HBM plus XLA attention over the gathered,
     re-laid-out and f32-converted window (~0.35 us per page of grid overhead
@@ -778,7 +787,7 @@ def attend_pages(
             ]
             # A full block is one copy; a shorter request copies its rows one
             # by one (rows past its tokens stay stale and are masked).
-            full = qlen_ref[req] == q_block
+            full = None if uniform_blocks else qlen_ref[req] == q_block
             rows_in = [
                 (
                     full,
@@ -797,17 +806,25 @@ def attend_pages(
                         q_sem.at[dst],
                     ),
                 )
-                for j in range(q_block)
+                for j in range(0 if uniform_blocks else q_block)
             ]
             return pages + rows_in
 
         def run(pairs, method):
-            for todo, cp in pairs:
-                op = getattr(cp, method)
-                if todo is None:
-                    op()
+            # Consecutive copies under one condition (a request's pages) share
+            # one branch.
+            for _, group in itertools.groupby(pairs, key=lambda p: id(p[0])):
+                group = list(group)
+                cond = group[0][0]
+
+                def ops(group=group):
+                    for _, cp in group:
+                        getattr(cp, method)()
+
+                if cond is None:
+                    ops()
                 else:
-                    pl.when(todo)(op)
+                    pl.when(cond)(ops)
 
         @pl.when(r == 0)
         def _():
@@ -820,7 +837,7 @@ def attend_pages(
         run(copies(r, slot), "wait")
 
         def rows_out(req, src):
-            full = qlen_ref[req] == q_block
+            full = None if uniform_blocks else qlen_ref[req] == q_block
             return [
                 (
                     full,
@@ -839,7 +856,7 @@ def attend_pages(
                         o_sem.at[src],
                     ),
                 )
-                for j in range(q_block)
+                for j in range(0 if uniform_blocks else q_block)
             ]
 
         @pl.when(r > 1)
