@@ -142,8 +142,25 @@ def requant_unpack_kmajor(
     )
 
 
+def ceil_pow2_scale(scale: jax.Array) -> jax.Array:
+    """Round a non-negative FP32 block scale up to the next power of two.
+
+    The exponent is read out of the FP32 bits, so the result is an exact power
+    of two rather than ``exp2(ceil(log2(scale)))``, which lands one ulp off for
+    some inputs and would break the exact-FP8 fold such a scale feeds. An
+    all-zero block keeps a zero scale; a subnormal input rounds up to the
+    smallest normal power of two.
+    """
+    bits = jax.lax.bitcast_convert_type(scale, jnp.uint32)
+    exponent = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    rounded = (exponent + (mantissa != 0).astype(jnp.uint32)) << 23
+    rounded = jnp.where(scale == 0, jnp.uint32(0), rounded)
+    return jax.lax.bitcast_convert_type(rounded, jnp.float32)
+
+
 def quantize_to_native_fp4_kmajor(
-    w: jax.Array, block: int, pack: bool = True
+    w: jax.Array, block: int, pack: bool = True, pow2_scale: bool = False
 ) -> tuple[jax.Array, jax.Array]:
     """Quantize K-major float weight ([..., K, N]) to packed uint8 e2m1 and
     per-block FP32 scale.
@@ -154,6 +171,13 @@ def quantize_to_native_fp4_kmajor(
     receives as a native ``torch.float4_e2m1fn_x2`` tensor. Only the transport
     differs: the quantization above is one cast either way, so the two forms
     carry bit-identical weights and a caller may choose per layer.
+
+    ``pow2_scale`` replaces the per-block ``amax / 6`` scale with the next
+    power of two above it, which is the UE8M0 scale the official checkpoint
+    uses. The FP4 codes are then rounded against that grid, so the values are
+    the ones a block-32-exponent kernel would produce for this block size and
+    the scale is exactly ``2^e``. It is a pure requantization change: the
+    scale keeps its shape and dtype, so no kernel has to know about it.
 
     TODO: Make a more generic version of this function;
     possibly combine with quantize_tensor_to_fp4
@@ -167,6 +191,8 @@ def quantize_to_native_fp4_kmajor(
     fp4_max = float(jnp.finfo(jnp.float4_e2m1fn).max)
     abs_max = jnp.max(jnp.abs(blocked), axis=-2, keepdims=True)
     scale = abs_max / fp4_max
+    if pow2_scale:
+        scale = ceil_pow2_scale(scale)
     scale_inv = jnp.where(scale == 0, 0.0, 1.0 / scale)
     quantized = jnp.clip(blocked * scale_inv, -fp4_max, fp4_max).astype(
         jnp.float4_e2m1fn

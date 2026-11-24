@@ -370,6 +370,15 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
 REQUANTIZED_BLOCK_SIZE = (
     int(envs.MOE_REQUANTIZE_BLOCK_SIZE) if envs.MOE_REQUANTIZE_BLOCK_SIZE else 512
 )
+# "pow2" rounds each block scale up to the next power of two (the official
+# UE8M0 grid) instead of using amax/6. The scale keeps its shape and dtype, so
+# the MoE kernels do not change; only the codes and the scale values do.
+REQUANTIZED_SCALE_MODE = envs.MOE_REQUANTIZE_SCALE_MODE
+
+
+def _pow2_requant_scale() -> bool:
+    """Whether the MoE requantization uses the power-of-two block scale."""
+    return REQUANTIZED_SCALE_MODE == "pow2"
 
 
 def _row_padded_flat_block_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -683,12 +692,19 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         """
         w13_block_size = REQUANTIZED_BLOCK_SIZE
         w2_block_size = min(REQUANTIZED_BLOCK_SIZE, orig_intermediate_size)
+        pow2_scale = _pow2_requant_scale()
 
         w13_weight_processed, w13_weight_scale = quantize_native_fp4_kmajor(
-            w13_weight_padded.to(device), block=w13_block_size, pack=pack
+            w13_weight_padded.to(device),
+            block=w13_block_size,
+            pack=pack,
+            pow2_scale=pow2_scale,
         )
         w2_weight_processed, w2_weight_scale = quantize_native_fp4_kmajor(
-            w2_weight_padded.to(device), block=w2_block_size, pack=pack
+            w2_weight_padded.to(device),
+            block=w2_block_size,
+            pack=pack,
+            pow2_scale=pow2_scale,
         )
 
         return (
