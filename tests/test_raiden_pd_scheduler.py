@@ -256,7 +256,6 @@ def _runner_output_for_step(
     )
     return ModelRunnerOutput(
         req_ids=req_ids,
-        req_id_to_index={rid: idx for idx, rid in enumerate(req_ids)},
         sampled_token_ids=sampled,
         logprobs=None,
         prompt_logprobs_dict={},

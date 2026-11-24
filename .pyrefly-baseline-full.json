@@ -108,11 +108,6 @@
     {
       "path": "src/vllm_torchtpu/__init__.py",
       "name": "missing-attribute",
-      "concise_description": "No attribute `_tpu_bypass_v2_runner_patch` in module `vllm.model_executor.models.qwen3_dflash`"
-    },
-    {
-      "path": "src/vllm_torchtpu/__init__.py",
-      "name": "missing-attribute",
       "concise_description": "Object of class `FunctionType` has no attribute `_tpu_same_step_prefix_hit_patch`"
     },
     {

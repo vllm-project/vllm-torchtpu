@@ -60,8 +60,8 @@ def _preemption_state(scheduler: Scheduler) -> _CapacityPreemption:
 
 
 class _HashAdditionalConfig:
-    def compute_hash(self) -> str:
-        return "scheduler-test-config"
+    def compile_factors(self) -> dict[str, object]:
+        return {"name": "scheduler-test-config"}
 
 
 @pytest.fixture(scope="module")
@@ -190,7 +190,6 @@ def _runner_output(
 ) -> ModelRunnerOutput:
     return ModelRunnerOutput(
         req_ids=request_ids,
-        req_id_to_index={request_id: i for i, request_id in enumerate(request_ids)},
         sampled_token_ids=[[token] for _ in request_ids],
         logprobs=None,
         prompt_logprobs_dict={},

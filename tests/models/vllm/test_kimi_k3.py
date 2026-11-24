@@ -851,7 +851,7 @@ def test_kda_forward_dispatches_to_both_custom_ops(monkeypatch) -> None:
     layer.v_conv1d = _ConvWeight()
     # The ops take the fused conv weight, built once at load time.
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
-    KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
+    KimiDeltaAttention.process_weights_after_loading(layer)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
@@ -910,7 +910,7 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(
     layer.k_conv1d = _ConvWeight()
     layer.v_conv1d = _ConvWeight()
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
-    KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
+    KimiDeltaAttention.process_weights_after_loading(layer)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
@@ -1227,7 +1227,7 @@ def _make_bare_kda_layer(use_full_rank_gate: bool = False):
     layer.q_conv1d = _ConvWeight()
     layer.k_conv1d = _ConvWeight()
     layer.v_conv1d = _ConvWeight()
-    KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
+    KimiDeltaAttention.process_weights_after_loading(layer)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
@@ -1517,7 +1517,7 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.v_conv1d = _ConvWeight()
     # The ops take the fused conv weight, built once at load time.
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
-    KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
+    KimiDeltaAttention.process_weights_after_loading(layer)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))

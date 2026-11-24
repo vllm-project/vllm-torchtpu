@@ -633,7 +633,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             raise TypeError("KDA received incompatible attention metadata")
         return layer_metadata
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+    def process_weights_after_loading(self) -> None:
         """Fold the three depthwise conv weights into the kernels' layout.
 
         The checkpoint keeps q/k/v as separate ``[dim, 1, kernel_size]``

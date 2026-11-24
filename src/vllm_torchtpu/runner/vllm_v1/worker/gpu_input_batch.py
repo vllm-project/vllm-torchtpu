@@ -31,16 +31,16 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
-from vllm.v1.sample.logits_processor import (
+
+from vllm_torchtpu.runner.vllm_v1.sample.logits_processor import (
     BatchUpdateBuilder,
     LogitsProcessors,
     MoveDirectionality,
 )
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.thinking_budget_state import (
+from vllm_torchtpu.runner.vllm_v1.sample.metadata import SamplingMetadata
+from vllm_torchtpu.runner.vllm_v1.sample.thinking_budget_state import (
     maybe_create_thinking_budget_state_holder,
 )
-
 from vllm_torchtpu.runner.vllm_v1.utils import copy_slice, swap_dict_values
 from vllm_torchtpu.runner.vllm_v1.worker.block_table import (
     MultiGroupBlockTable,

@@ -211,11 +211,65 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
         "get_masked_input_and_mask",
     ),
     ("vllm.model_executor.layers.fused_moe.router.grouped_topk_router", "grouped_topk"),
-    ("vllm.v1.sample.ops.logprobs", "batched_count_greater_than"),
     ("vllm.utils.deep_gemm", "per_block_cast_to_fp8"),
 ]
 
 _dynamic_compile_unwrapped = False
+
+# Draft architectures TPUModelRunner does not implement, with the method they
+# need (None: any). XPress refiners and DFlash candidate heads exist only in
+# vLLM's GPU speculator, so TPU's DFlashProposer would serve them as plain
+# DFlash.
+_UNSUPPORTED_DRAFT_ARCHITECTURES: dict[str, tuple[str, str | None]] = {
+    "Qwen3XPressModel": ("xpress speculative decoding", "dflash"),
+    "DFlashQwen3XPressModel": ("xpress speculative decoding", "dflash"),
+    "DFlash2DraftModel": ("DFlash candidate-head drafts", "dflash"),
+    "DFlash2BeamDraftModel": ("DFlash candidate-head drafts", "dflash"),
+    "DFlash2RicursiveDraftModel": ("DFlash candidate-head drafts", "dflash"),
+    "LiLiCorrDraftModel": ("DFlash candidate-head drafts", "dflash"),
+    "ParseAuxMTPModel": ("Parse 3.5 MTP", None),
+}
+_UNSUPPORTED_ARCHITECTURES = {
+    "Step5ForCausalLM": "Step5",
+    "Step5ForConditionalGeneration": "Step5",
+}
+
+
+def _validate_tpu_runner_features(vllm_config: VllmConfig) -> None:
+    """Reject features TPUModelRunner does not implement.
+
+    vLLM v0.33.0 rejected these for its V1 model runner
+    (``VllmConfig._get_v1_model_runner_unsupported_features``), which TPU relied
+    on; v0.34.0 removed V1 and that check with it. Prefill context
+    parallelism, DSpark (with adaptive verification) and mixed sliding/full
+    DFlash drafts are implemented by TPUModelRunner and stay allowed.
+    """
+    unsupported: list[str] = []
+    spec = vllm_config.speculative_config
+    if spec is not None:
+        if spec.enable_adaptive_verification and spec.method != "dspark":
+            unsupported.append("adaptive draft verification outside DSpark")
+        if spec.draft_lm_head_quantization is not None:
+            unsupported.append("draft lm_head quantization")
+        draft_config = spec.draft_model_config
+        for arch in (draft_config.architectures or []) if draft_config else []:
+            feature, method = _UNSUPPORTED_DRAFT_ARCHITECTURES.get(arch, ("", ""))
+            if feature and method in (None, spec.method):
+                unsupported.append(feature)
+    model_config = vllm_config.model_config
+    if model_config is not None:
+        if model_config.is_diffusion:
+            unsupported.append("diffusion models")
+        if model_config.architecture in _UNSUPPORTED_ARCHITECTURES:
+            unsupported.append(_UNSUPPORTED_ARCHITECTURES[model_config.architecture])
+    if vllm_config.parallel_config.enable_batch_sharded_sampling:
+        unsupported.append("batch-sharded sampling")
+    if unsupported:
+        raise ValueError(
+            f"TPU does not support: {', '.join(dict.fromkeys(unsupported))}"
+        )
+
+
 _tpu_kv_connectors_registered = False
 
 
@@ -861,6 +915,7 @@ class TpuPlatform(Platform):
         )
         _validate_phased_profiling_config(vllm_config)
         _validate_peer_replay_config()
+        _validate_tpu_runner_features(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "

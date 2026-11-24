@@ -498,7 +498,7 @@ def test_pd_completion_preserves_hash_only_additional_config():
     )
 
     cfg = _make_vllm_config()
-    cfg.additional_config = SimpleNamespace(compute_hash=lambda: "test")
+    cfg.additional_config = SimpleNamespace(compile_factors=lambda: {"name": "test"})
     assert send_completion_enabled(cfg) is False
 
 
@@ -8099,7 +8099,7 @@ def _scheduler_output(
 
     new_reqs: (req_id, per-group block ids, num_computed_tokens) triples.
     cached_reqs: (req_id, per-group new block ids or None,
-    num_computed_tokens, resumed) tuples.
+    num_computed_tokens) triples.
     """
     return SimpleNamespace(
         scheduled_new_reqs=[
@@ -8110,7 +8110,6 @@ def _scheduler_output(
         ],
         scheduled_cached_reqs=SimpleNamespace(
             req_ids=[entry[0] for entry in cached_reqs],
-            resumed_req_ids={entry[0] for entry in cached_reqs if entry[3]},
             new_block_ids=[entry[1] for entry in cached_reqs],
             num_computed_tokens=[entry[2] for entry in cached_reqs],
         ),
@@ -8187,7 +8186,7 @@ class TestPipelineParallelRegisterAhead:
             )
             second = producer.build_connector_meta(
                 _scheduler_output(
-                    cached_reqs=[("chunked", ([101],), 16, False)],
+                    cached_reqs=[("chunked", ([101],), 16)],
                     num_scheduled_tokens={"chunked": 16},
                 )
             )
@@ -8228,8 +8227,9 @@ class TestPipelineParallelRegisterAhead:
             )
             assert producer._stage3_finished_sends == {}
             resumed = producer.build_connector_meta(
+                # vLLM >= 0.34 re-sends a resumed request as a new one.
                 _scheduler_output(
-                    cached_reqs=[("preempted", ([200, 201],), 0, True)],
+                    new_reqs=[("preempted", ([200, 201],), 0)],
                     num_scheduled_tokens={"preempted": self.PROMPT},
                 )
             )
@@ -8611,7 +8611,7 @@ class TestContextParallelRegisterAhead:
             )
             second = producer.build_connector_meta(
                 _scheduler_output(
-                    cached_reqs=[("chunked", ([101],), 32_768, False)],
+                    cached_reqs=[("chunked", ([101],), 32_768)],
                     num_scheduled_tokens={"chunked": self.PROMPT - 32_768},
                 )
             )

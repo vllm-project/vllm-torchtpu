@@ -13,7 +13,8 @@
 # limitations under the License.
 
 # Copied from vLLM v0.33.0 tests/v1/worker/test_gpu_input_batch.py, which v0.34.0
-# deletes with the code it tests; points at the in-tree copies.
+# deletes with the code it tests; points at the in-tree copies, and defines
+# make_tensor_with_pad, which v0.34.0 also removed.
 
 import inspect
 from collections.abc import Sequence
@@ -22,12 +23,12 @@ import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.utils.torch_utils import make_tensor_with_pad
+from vllm.utils.torch_utils import TORCH_DTYPE_TO_NUMPY_DTYPE, make_ndarray_with_pad
 from vllm.v1.pool.metadata import PoolingMetadata
-from vllm.v1.sample.logits_processor import LogitsProcessors
-from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import CpuGpuBuffer
 
+from vllm_torchtpu.runner.vllm_v1.sample.logits_processor import LogitsProcessors
+from vllm_torchtpu.runner.vllm_v1.sample.metadata import SamplingMetadata
 from vllm_torchtpu.runner.vllm_v1.worker.block_table import (
     BlockTable,
     MultiGroupBlockTable,
@@ -44,6 +45,24 @@ MAX_PROMPT_SIZE = 100
 # run on CPU, where these tests run in CI.
 DEVICES = ["cpu"]
 MAX_NUM_PROMPT_TOKENS = 64
+
+
+# Same body as vLLM v0.33.0's vllm/utils/torch_utils.py make_tensor_with_pad.
+def make_tensor_with_pad(
+    x: list[list[int]],
+    pad: int,
+    dtype: torch.dtype,
+    *,
+    max_len: int | None = None,
+    device: str | torch.device | None = None,
+    pin_memory: bool = False,
+) -> torch.Tensor:
+    np_dtype = TORCH_DTYPE_TO_NUMPY_DTYPE[dtype]
+    padded_x = make_ndarray_with_pad(x, pad, np_dtype, max_len=max_len)
+    tensor = torch.from_numpy(padded_x).to(device)
+    if pin_memory:
+        tensor = tensor.pin_memory()
+    return tensor
 
 
 def _compare_objs(obj1, obj2, skip: Sequence = ("logitsprocs", "batch_update_builder")):

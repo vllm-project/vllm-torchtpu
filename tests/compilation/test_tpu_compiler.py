@@ -1518,3 +1518,18 @@ def test_deserialize_entry_does_not_copy_the_entry():
             raise AssertionError("replay must not deepcopy the entry")
 
     assert _deserialize_entry(Entry())(2, 3, 7) == 12
+
+
+def test_compile_factors_carry_the_tpu_compilation_hash(monkeypatch):
+    """vLLM folds `CompilerInterface.compile_factors` into the piecewise cache
+    key; without the TPU hash there, a changed TPU runtime source would reuse
+    stale artifacts."""
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    monkeypatch.setattr(
+        tpu_compiler, "compute_tpu_compilation_hash", lambda config: "tpu-hash"
+    )
+
+    factors = tpu_compiler.TpuCompilerAdaptor().compile_factors(object())
+
+    assert factors == {"tpu": "tpu-hash"}

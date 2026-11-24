@@ -67,7 +67,6 @@ def _vllm_config(*, pcp: int, block_size: int = 4096, dcp: int = 1):
             kv_connector_extra_config={"cpu_bytes_to_use": 1 << 30},
         ),
         kv_events_config=None,
-        use_v2_model_runner=False,
         speculative_config=None,
     )
 

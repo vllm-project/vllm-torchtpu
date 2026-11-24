@@ -72,10 +72,15 @@ def test_async_results_do_not_overwrite_recomputed_request(transition, num_draft
     runner._free_mamba_slots = []
     output = SchedulerOutput.make_empty()
     output.finished_req_ids = {"resumed"} if transition == "finish" else set()
-    output.preempted_req_ids = {"resumed"} if transition == "preempt" else None
-    output.scheduled_cached_reqs.resumed_req_ids = (
-        {"resumed"} if transition == "resume" else set()
+    # vLLM >= 0.34 reports a preempted request in preempted_req_ids and
+    # re-sends it as a new request; "resume" is the same-step case.
+    output.preempted_req_ids = (
+        {"resumed"} if transition in ("preempt", "resume") else None
     )
+    if transition == "resume":
+        output.scheduled_new_reqs = [
+            SimpleNamespace(req_id="resumed", sampling_params=None)
+        ]
 
     def restore_from_scheduler(_output):
         if invalid:

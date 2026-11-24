@@ -2176,9 +2176,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         the dedup record or, when it does not match, releases it.
 
         Block tables are accumulated from the scheduler output the way the
-        workers accumulate theirs: a new request's table is taken whole, a
-        cached request appends its new blocks per group, and a resumed
-        request replaces its table.
+        workers accumulate theirs: a new request's table is taken whole and a
+        cached request appends its new blocks per group. A resumed request
+        arrives as a new one (vLLM >= 0.34).
         """
         for req_id in scheduler_output.preempted_req_ids or ():
             self._stage3_block_tables.pop(req_id, None)
@@ -2196,11 +2196,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         cached = scheduler_output.scheduled_cached_reqs
         for index, req_id in enumerate(cached.req_ids):
             new_block_ids = cached.new_block_ids[index]
-            if req_id in cached.resumed_req_ids:
-                tables[req_id] = [
-                    list(group_ids) for group_ids in (new_block_ids or ())
-                ]
-            elif new_block_ids is not None and req_id in tables:
+            if new_block_ids is not None and req_id in tables:
                 for group, group_ids in zip(tables[req_id], new_block_ids):
                     group.extend(group_ids)
             computed_before[req_id] = int(cached.num_computed_tokens[index])

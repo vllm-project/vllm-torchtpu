@@ -398,15 +398,13 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def process_weights_after_loading(self) -> None:
-        """Fold every AttentionResidual's norm and projection weights.
+        """Finish the MoE routers and the SP-MLA gates after loading.
 
-        The generic loader hook fires per module only for attention layers,
-        so the residuals are folded from here instead.
+        vLLM >= 0.34 runs every module's own hook, children first, so each
+        AttentionResidual folds its weights in its own hook before this one.
         """
         for module in self.modules():
-            if isinstance(module, AttentionResidual):
-                module.process_weights_after_loading()
-            elif isinstance(module, KimiMoE):
+            if isinstance(module, KimiMoE):
                 module.initialize_dummy_router()
             elif isinstance(module, MultiHeadLatentAttention):
                 module.prepare_sp_mla_gate()
@@ -985,10 +983,6 @@ class KimiK3ForConditionalGeneration(
     ) -> torch.Tensor | None:
         del kwargs
         return self.language_model.compute_logits(hidden_states)
-
-    def process_weights_after_loading(self) -> None:
-        # The language model walks its own AttentionResidual modules.
-        self.language_model.process_weights_after_loading()
 
     @classmethod
     def get_mamba_state_dtype_from_config(

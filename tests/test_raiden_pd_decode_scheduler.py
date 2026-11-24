@@ -237,7 +237,6 @@ def _admit_remote_kv_requests(scheduler: Scheduler, hasher, *req_ids: str):
 def _no_forward_runner_output(kv_output: KVConnectorOutput) -> ModelRunnerOutput:
     return ModelRunnerOutput(
         req_ids=[],
-        req_id_to_index={},
         sampled_token_ids=[],
         logprobs=None,
         prompt_logprobs_dict={},

@@ -114,17 +114,6 @@ def test_idle_dp_rank_encodes_before_decoder_pairing(pp_is_last):
     assert order == ["encoder", ("decoder", 8), ("decoder", 8), *logits, ("draft", 2)]
 
 
-def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
-    all_token_ids = tpu_runner._spec_warmup_all_token_ids(
-        ["request-0", "request-1"], [7, 12]
-    )
-
-    assert all_token_ids == {
-        "request-0": [0] * 8,
-        "request-1": [0] * 13,
-    }
-
-
 @pytest.mark.parametrize("dcp_size,expected_blocks", [(1, 65), (8, 9)])
 def test_spec_warmup_request_counts_blocks_in_block_table_units(
     dcp_size, expected_blocks

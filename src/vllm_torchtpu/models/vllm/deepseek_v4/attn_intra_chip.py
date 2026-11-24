@@ -501,14 +501,14 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
             "ATTN_INTRA_CHIP_TP: wq_b/wo_a/wo_b sharded across the chip pair"
         )
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+    def process_weights_after_loading(self) -> None:
         # The base reshapes wo_a by the local head and group counts, which are
         # halved for these weights but not for attention, so swap them in here.
         size = self._chip_pair.world_size
         heads, groups = self.n_local_heads, self.n_local_groups
         self.n_local_heads, self.n_local_groups = heads // size, groups // size
         try:
-            super().process_weights_after_loading(act_dtype)
+            super().process_weights_after_loading()
         finally:
             self.n_local_heads, self.n_local_groups = heads, groups
         if self._use_fused_o_fetch:

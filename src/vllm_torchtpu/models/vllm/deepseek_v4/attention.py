@@ -780,12 +780,11 @@ class VllmDeepseekV4MLAAttention(
         object.__setattr__(self, "_o_proj_op_instance", op)
         return op
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+    def process_weights_after_loading(self) -> None:
         """Store `wo_a` in the layout the fused o-projection kernel wants,
         which is (self.n_local_heads * self.head_dim // self.n_local_groups,
                   self.n_local_groups * self.o_lora_rank).
         """
-        del act_dtype
         weight = cast(torch.Tensor, self.wo_a.weight)
         transposed = (
             self.n_local_heads * self.head_dim // self.n_local_groups,

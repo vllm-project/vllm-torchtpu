@@ -134,7 +134,6 @@ def _engine_config(pp, async_scheduling):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp),
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
-        use_v2_model_runner=False,
     )
 
 

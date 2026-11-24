@@ -489,22 +489,6 @@ def _spec_warmup_num_output_tokens(requests: Any, req_ids: list[str]) -> list[in
     return [len(requests[req_id].output_token_ids) for req_id in req_ids]
 
 
-def _spec_warmup_all_token_ids(
-    req_ids: list[str], num_computed_tokens: list[int]
-) -> dict[str, list[int]]:
-    """Build complete synthetic token histories for async cached requests."""
-    assert len(req_ids) == len(num_computed_tokens), (
-        "spec-decode warmup request IDs and computed-token counts must align: "
-        f"requests={len(req_ids)}, counts={len(num_computed_tokens)}"
-    )
-    # The current sampled token is not computed yet, so the complete sequence
-    # contains num_computed + 1 tokens at scheduler handoff.
-    return {
-        req_id: [0] * (num_computed + 1)
-        for req_id, num_computed in zip(req_ids, num_computed_tokens)
-    }
-
-
 @contextmanager
 def _suspend_kv_transfer_group() -> Iterator[None]:
     """Hide the process-global connector during worker-local warmup."""
@@ -2952,10 +2936,10 @@ class TPUModelRunner(GPUModelRunner):
         input_batch._tpu_spec_room_guard = True
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
-        invalidated_req_ids = (
-            scheduler_output.finished_req_ids
-            | (scheduler_output.preempted_req_ids or set())
-            | scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        # A resumed request was reported in preempted_req_ids in the step it
+        # was preempted (the same one or earlier), so it is already dropped.
+        invalidated_req_ids = scheduler_output.finished_req_ids | (
+            scheduler_output.preempted_req_ids or set()
         )
         for req_id in invalidated_req_ids:
             self._mamba_state_pos.pop(req_id, None)
@@ -4324,7 +4308,6 @@ class TPUModelRunner(GPUModelRunner):
                 self._cache_encoder_output(
                     mm_hash,
                     output,
-                    scheduler_output.ec_manager_metadata,
                     scheduler_output.free_encoder_mm_hashes,
                 )
 
@@ -5588,15 +5571,6 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     )
                     assert target_logits is not None
-                    draft_token_ids = (
-                        self.structured_decoding_manager.mask_invalid_draft_tokens(
-                            draft_token_ids,
-                            grammar_output,
-                            cur_start_idx,
-                            cur_end_idx,
-                            draft_lengths_cpu=md.draft_lengths_cpu,
-                        )
-                    )
                 if min_tokens_rows is not None:
                     target_rows, bonus_rows = min_tokens_rows
                     target_logits = self._mask_min_tokens(
@@ -6191,8 +6165,6 @@ class TPUModelRunner(GPUModelRunner):
         with self._stage_timing.host_stage("output_assembly"):
             model_runner_output = ModelRunnerOutput(
                 req_ids=req_ids,
-                # Snapshot of the req_id_to_index for the VLLM scheduler.
-                req_id_to_index=dict(self.input_batch.req_id_to_index),
                 sampled_token_ids=[],  # Filled in AsyncTPUModelRunnerOutput get_output
                 logprobs=None,  # Filled in AsyncTPUModelRunnerOutput get_output
                 prompt_logprobs_dict=prompt_logprobs.emit(
@@ -7312,11 +7284,6 @@ class TPUModelRunner(GPUModelRunner):
                     arange,
                 )
                 synchronize_tensors(out)
-                out = self.structured_decoding_manager.pin_invalid_draft_tokens(
-                    torch.zeros((num_tokens,), dtype=torch.bool).to(self.device),
-                    torch.zeros((num_tokens,), dtype=torch.int32).to(self.device),
-                )
-                synchronize_tensors(out)
                 logger.info("  -- target_logits_length: %d", num_tokens)
 
     def _verify_logits_paddings(self) -> list[int]:
@@ -8014,6 +7981,7 @@ class TPUModelRunner(GPUModelRunner):
                 block_ids=tuple(block_ids_per_group),
                 num_computed_tokens=0,
                 lora_request=None,
+                prefill_token_ids=[0] * P,
             )
             scheduler_output = SchedulerOutput.make_empty()
             scheduler_output.scheduled_new_reqs = [request]
@@ -8696,6 +8664,7 @@ class TPUModelRunner(GPUModelRunner):
                         ),
                         num_computed_tokens=0,
                         lora_request=None,
+                        prefill_token_ids=[0] * P,
                     )
                 )
             # Prefill in chunks that respect the pre-allocated host token buffers.
@@ -8715,12 +8684,9 @@ class TPUModelRunner(GPUModelRunner):
             # ---- decode all R together: real nr=R propose + verify + sample ---
             nct = [P] * R
             for t in range(n_decode):
-                all_token_ids = _spec_warmup_all_token_ids(rids, nct)
                 creq = CachedRequestData(
                     req_ids=list(rids),
-                    resumed_req_ids=set(),
                     new_token_ids=[],
-                    all_token_ids=all_token_ids,
                     new_block_ids=[None] * R,
                     num_computed_tokens=list(nct),
                     num_output_tokens=_spec_warmup_num_output_tokens(
@@ -8779,15 +8745,13 @@ class TPUModelRunner(GPUModelRunner):
                                 ),
                                 num_computed_tokens=0,
                                 lora_request=None,
+                                prefill_token_ids=[0] * Pk,
                             )
                         )
                     mix_ids.extend(e.req_id for e in extras)
-                    all_token_ids = _spec_warmup_all_token_ids(rids, nct)
                     creq = CachedRequestData(
                         req_ids=list(rids),
-                        resumed_req_ids=set(),
                         new_token_ids=[],
-                        all_token_ids=all_token_ids,
                         new_block_ids=[None] * R,
                         num_computed_tokens=list(nct),
                         num_output_tokens=_spec_warmup_num_output_tokens(
@@ -8878,6 +8842,7 @@ class TPUModelRunner(GPUModelRunner):
                 block_ids=block_ids,
                 num_computed_tokens=0,
                 lora_request=None,
+                prefill_token_ids=[0] * P,
             )
             # The drafts each step proposes are verified by the next one, so
             # every step asks for K of them (a dynamic speculative decoding
@@ -8893,12 +8858,9 @@ class TPUModelRunner(GPUModelRunner):
             cur = d.draft_token_ids[0] if d and d.draft_token_ids else [0] * K
             # ---- decode steps (real propose + verify + sampling) ----
             for t, nct in enumerate(decode_ncts):
-                all_token_ids = _spec_warmup_all_token_ids([rid], [nct])
                 creq = CachedRequestData(
                     req_ids=[rid],
-                    resumed_req_ids=set(),
                     new_token_ids=[],
-                    all_token_ids=all_token_ids,
                     new_block_ids=[None],
                     num_computed_tokens=[nct],
                     num_output_tokens=_spec_warmup_num_output_tokens(

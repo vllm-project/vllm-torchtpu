@@ -204,18 +204,16 @@ def _patch_vllm_aot_compile_cache_key() -> None:
 def _patch_vllm_config_hash_ignore_diagnostics() -> None:
     """Keep diagnostics-only ``additional_config`` keys out of cache keys.
 
-    ``VllmConfig.compute_hash()`` unconditionally folds
-    ``json.dumps(additional_config)`` into its result, and that hash feeds both
-    the AOT compile cache key (``caching.aot_compile_hash_factors``) and the
-    piecewise cache dir (``backends.py``). The phased profiler is configured
-    through ``additional_config``, so a per-run trace directory would force a
-    full recompile on every server start. Upstream takes the same care in
-    ``ProfilerConfig.compute_hash()`` ("this config will not affect the
-    computation graph"); this is the equivalent carve-out for the plugin-owned
+    ``VllmConfig.compile_factors()`` folds a dict ``additional_config`` in
+    whole, and the hash of those factors feeds both the AOT compile cache key
+    (``caching.aot_compile_hash_factors``) and the piecewise cache dir
+    (``backends.py``). The phased profiler is configured through
+    ``additional_config``, so a per-run trace directory would force a full
+    recompile on every server start. Upstream takes the same care in
+    ``ProfilerConfig.compile_factors()`` ("This config does not affect the
+    compiled graph"); this is the equivalent carve-out for the plugin-owned
     keys, mirroring ``_TPU_COMPILE_ENV_IGNORED`` for env vars.
     """
-    import copy
-
     from vllm.config import VllmConfig
 
     from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
@@ -223,30 +221,27 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
     if getattr(VllmConfig, "_tpu_additional_config_hash_patch", False):
         return
 
-    original = VllmConfig.compute_hash
+    original = VllmConfig.compile_factors
 
-    def compute_hash(self, *args, **kwargs) -> str:
-        additional_config = self.additional_config
-        if not isinstance(additional_config, dict):
-            return original(self, *args, **kwargs)
+    def compile_factors(self, *args, **kwargs):
+        factors = original(self, *args, **kwargs)
+        if not isinstance(self.additional_config, dict):
+            return factors
         filtered = {
             key: value
-            for key, value in additional_config.items()
+            for key, value in self.additional_config.items()
             if key not in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
         }
-        if filtered == additional_config:
-            return original(self, *args, **kwargs)
-        # Hash a shallow copy with the filtered dict rather than mutating the
-        # live config: compute_hash() may run while other code holds the same
-        # VllmConfig, and a shallow copy shares every sub-config by reference
-        # (cheap, no re-validation -- __post_init__ is not re-run) while giving
-        # compute_hash its own additional_config to read.
-        proxy = copy.copy(self)
-        proxy.additional_config = filtered
-        return original(proxy, *args, **kwargs)
+        # Replace the entry rather than editing the dict, which is the live
+        # config's additional_config. Upstream leaves an empty one out.
+        if filtered:
+            factors["additional"] = filtered
+        else:
+            factors.pop("additional", None)
+        return factors
 
-    VllmConfig._tpu_upstream_compute_hash = original
-    VllmConfig.compute_hash = compute_hash
+    VllmConfig._tpu_upstream_compile_factors = original
+    VllmConfig.compile_factors = compile_factors
     VllmConfig._tpu_additional_config_hash_patch = True
     logger.info(
         "Applied TPU patch: exclude diagnostics-only additional_config keys "
@@ -1742,121 +1737,17 @@ def _patch_vllm_compile_prefix_isolation() -> None:
     )
 
 
-def _patch_dflash_bypass_v2_runner_check() -> None:
-    """Bypass V2 model runner check in DFlash for TPU execution.
+def _patch_vllm_tpu_adaptive_verification() -> None:
+    """Validate adaptive verification against TPU's runner.
 
-    Upstream ``qwen3_dflash._resolve_layer_attention`` enforces
-    ``use_v2_model_runner`` for mixed SWA/full attention DFlash drafters.
-    TPU uses TPUModelRunner which handles mixed attention without Triton V2 runner.
+    vLLM's ``VllmConfig._validate_adaptive_verification`` requires full CUDA
+    graphs, which have no TPU counterpart, so on TPU the configuration is
+    checked by ``validate_adaptive_verification_config`` instead.
     """
-    try:
-        from vllm.model_executor.models import qwen3_dflash
-    except ImportError:
-        return
-
-    if getattr(qwen3_dflash, "_tpu_bypass_v2_runner_patch", False):
-        return
-
-    original_resolve = qwen3_dflash._resolve_layer_attention
-    _FLAG = "use_v2_model_runner"
-
-    def patched_resolve(config, layer_idx: int):
-        # Force the flag True for the duration of the upstream call only, by
-        # swapping the class attribute and restoring it. Deliberately not
-        # `unittest.mock.patch`: a test helper has no business in the load
-        # path, and — more usefully — looking the attribute up explicitly
-        # means that if upstream ever moves or renames it, this raises here
-        # instead of silently no-op'ing and letting the original V2 check
-        # reject the drafter with an unrelated-looking error.
-        from vllm.config import get_current_vllm_config
-
-        cfg_cls = type(get_current_vllm_config())
-        if not hasattr(cfg_cls, _FLAG):
-            raise RuntimeError(
-                f"VllmConfig no longer defines {_FLAG!r}; the TPU DFlash "
-                "bypass needs updating for this vLLM version."
-            )
-
-        # Restore exactly what was there: if the flag is inherited rather than
-        # defined on this class, putting it back with setattr would leave a
-        # permanent shadow on the subclass.
-        had_own = _FLAG in cfg_cls.__dict__
-        original_flag = cfg_cls.__dict__.get(_FLAG)
-        setattr(cfg_cls, _FLAG, property(lambda self: True))
-        try:
-            return original_resolve(config, layer_idx)
-        finally:
-            if had_own:
-                setattr(cfg_cls, _FLAG, original_flag)
-            else:
-                delattr(cfg_cls, _FLAG)
-
-    qwen3_dflash._resolve_layer_attention = patched_resolve
-    qwen3_dflash._tpu_bypass_v2_runner_patch = True
-    logger.info("Applied TPU patch: bypass DFlash V2 runner check on TPU.")
-
-
-def _patch_vllm_force_v1_runner_tpu() -> None:
-    """Keep TPU's V1 scheduler contract and validate its own capabilities.
-
-    vLLM 0.29 defaults to GPU Model Runner V2 when Triton is available and
-    rejects GPU V2-only features when V1 is selected. TPUModelRunner owns
-    PCP, DSpark (with adaptive verification), and mixed-attention DFlash
-    implementations, but consumes V1-shaped scheduler output. Keep that
-    default regardless of Triton and remove only those implemented features
-    from the native V1 rejection list. The other native checks and TPU's
-    combination checks still apply. Adaptive verification's native check
-    requires full CUDA graphs, so TPU validates it against its own runner.
-    An explicit VLLM_USE_V2_MODEL_RUNNER retains upstream precedence.
-    """
-    from collections.abc import Callable
-    from typing import Any, cast
-
     from vllm.config.vllm import VllmConfig
 
-    if getattr(VllmConfig, "_tpu_force_v1_runner_patch", False):
+    if getattr(VllmConfig, "_tpu_adaptive_verification_patch", False):
         return
-
-    original_prop = VllmConfig.use_v2_model_runner
-    if not isinstance(original_prop, property):
-        logger.warning(
-            "VllmConfig.use_v2_model_runner is no longer a property; skipping "
-            "the TPU V1-runner patch. TPU execution may misbehave until this "
-            "is updated for the current vLLM version."
-        )
-        return
-
-    original_fget = cast(Callable[[Any], bool], original_prop.fget)
-
-    def patched_use_v2(self):
-        import vllm.envs as envs
-
-        if envs.VLLM_USE_V2_MODEL_RUNNER is not None:
-            return original_fget(self)
-        device_config = getattr(self, "device_config", None)
-        if device_config is not None and device_config.device_type == "tpu":
-            return False
-        return original_fget(self)
-
-    original_unsupported = VllmConfig._get_v1_model_runner_unsupported_features
-
-    def patched_unsupported(self):
-        unsupported = original_unsupported(self)
-        device_config = getattr(self, "device_config", None)
-        if device_config is None or device_config.device_type != "tpu":
-            return unsupported
-        # These are limitations of the upstream GPU V1 runner. Do not bypass
-        # the validator: DFlash2 and future features must remain rejected
-        # until TPU implements them. Adaptive verification is DSpark-only.
-        implemented = {
-            "prefill context parallel",
-            "dspark speculative decoding",
-            "mixed sliding/full dflash drafts",
-        }
-        spec = self.speculative_config
-        if spec is not None and spec.method == "dspark":
-            implemented.add("adaptive draft verification")
-        return [feature for feature in unsupported if feature not in implemented]
 
     original_validate_adaptive = VllmConfig._validate_adaptive_verification
 
@@ -1870,11 +1761,9 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
 
         validate_adaptive_verification_config(self)
 
-    VllmConfig._get_v1_model_runner_unsupported_features = patched_unsupported
     VllmConfig._validate_adaptive_verification = patched_validate_adaptive
-    VllmConfig.use_v2_model_runner = property(patched_use_v2)
-    VllmConfig._tpu_force_v1_runner_patch = True
-    logger.info("Applied TPU patch: force V1 model runner semantics on TPU.")
+    VllmConfig._tpu_adaptive_verification_patch = True
+    logger.info("Applied TPU patch: validate adaptive verification on TPU.")
 
 
 if "proxy" in envs.JAX_PLATFORMS:

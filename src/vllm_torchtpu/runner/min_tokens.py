@@ -108,9 +108,10 @@ class MinTokensTracker:
         """The batch rows still below min_tokens. ``num_output_tokens`` must
         count settled tokens for the requests in the batch (None for a request
         that is gone); in-batch requests at or past min_tokens are dropped.
-        Requests outside the batch are kept as they are: a preempted request
-        can still hold unsettled placeholders, and resuming restores its
-        output."""
+        Requests outside the batch are kept as they are: they can still hold
+        unsettled placeholders. A preempted request is gone from ``requests``
+        until it resumes, when ``add`` registers it again and its rebuilt
+        output counts toward min_tokens."""
         state: MinTokensState = {}
         for req_id, req in list(self.requests.items()):
             num_output = num_output_tokens(req_id)

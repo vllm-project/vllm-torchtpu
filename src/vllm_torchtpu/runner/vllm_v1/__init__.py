@@ -15,17 +15,23 @@
 
 vLLM v0.34.0 removes Model Runner V1
 (https://github.com/vllm-project/vllm/pull/63373). TPUModelRunner subclasses
-V1's GPUModelRunner and uses its InputBatch, BlockTable, EC connector mixin
-and NgramProposer, so this package keeps copies of them from vLLM v0.33.0;
-utils.py holds the v0.33.0 helpers the copies call that v0.34.0 deletes. The
-layout mirrors upstream's vllm/v1/ so each file diffs cleanly against its
-source.
+V1's GPUModelRunner and uses its InputBatch, BlockTable, EC connector mixin,
+NgramProposer, sampling metadata and logits processors (sample/), so this
+package keeps copies of them from vLLM v0.33.0. utils.py holds the v0.33.0
+helpers these copies call that v0.34.0 deleted. The layout mirrors upstream's
+vllm/v1/ so each file diffs cleanly against its source.
 
 Only imports differ from upstream, except in two files. worker/gpu_model_runner.py
 keeps only the GPUModelRunner methods TPUModelRunner reaches (including the
 ones vLLM's WorkerBase looks up by name) and drops the GPU-only drafter,
-sampler, CUDA graph and n-gram GPU code. worker/ec_connector_model_runner_mixin.py
-keeps only maybe_save_ec_to_connector. Rules for edits are in
+sampler, CUDA graph and n-gram GPU code; its _update_states follows the
+v0.34.0 scheduler, which drops a preempted request and re-sends it as a new
+request when it resumes. worker/ec_connector_model_runner_mixin.py keeps only
+maybe_save_ec_to_connector.
+
+Custom logits processors must subclass the copied
+sample/logits_processor/interface.py LogitsProcessor; classes written for
+Model Runner V2's interface are rejected. Rules for edits are in
 docs/developers_guide/coding_guidance.md (R-3.1). Moving TPUModelRunner onto
 Model Runner V2 retires this package:
 https://github.com/vllm-project/vllm-torchtpu/issues/3723

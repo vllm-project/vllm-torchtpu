@@ -153,14 +153,18 @@ class ThinkingBudgetTracker:
         ``input_batch`` (``req_id_to_index``) and ``requests``: drops finished
         requests, frees the slots of preempted requests and of budgeted
         requests no longer in the batch, registers new requests, then reseeds
-        resumed requests from their committed outputs.
+        resumed requests from their committed outputs. vLLM >= 0.34 re-sends
+        a request resumed after preemption as a new one whose
+        ``prefill_token_ids`` extend past its prompt.
         """
         self.discard(scheduler_output.finished_req_ids)
         self.on_preempted(scheduler_output.preempted_req_ids)
         self._slots.release_unscheduled(req_id_to_index)
+        resumed_req_ids = []
         for new_req in scheduler_output.scheduled_new_reqs:
             self.add(new_req.req_id, new_req.sampling_params, new_req.prompt_token_ids)
-        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+            if len(new_req.prefill_token_ids) > new_req.prompt_len:
+                resumed_req_ids.append(new_req.req_id)
         if resumed_req_ids:
             self.on_resumed(resumed_req_ids, requests)
 

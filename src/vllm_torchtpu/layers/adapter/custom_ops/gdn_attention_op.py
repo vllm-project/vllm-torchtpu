@@ -549,7 +549,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         conv_state_dtype = torch.float32
         return conv_state_dtype, temporal_state_dtype
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+    def process_weights_after_loading(self) -> None:
         """Back the conv weight with a buffer of its own 3-D shape.
 
         The upstream layer rebinds `conv1d.weight` to an `unsqueeze(1)` view
@@ -560,7 +560,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         standalone `tt_jit_as_strided` program before every forward. One
         `fresh_buffer` copy at load time removes that per-step program.
         """
-        del act_dtype
         w = self.conv1d.weight
         self.conv1d.weight.data = fresh_buffer(w)
 

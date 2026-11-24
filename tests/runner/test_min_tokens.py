@@ -27,7 +27,6 @@ from runner_output_test_utils import (
 )
 from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
-from vllm.v1.sample.logits_processor import LogitsProcessors
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.runner import min_tokens
@@ -36,14 +35,12 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
     AsyncTPUCopyState,
 )
+from vllm_torchtpu.runner.vllm_v1.sample.logits_processor import LogitsProcessors
 from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import (
     CachedRequestState,
     InputBatch,
 )
 from vllm_torchtpu.runner.vllm_v1.worker.gpu_model_runner import GPUModelRunner
-from vllm_torchtpu.structured_decoding.structured_decoding_manager import (
-    StructuredDecodingManager,
-)
 
 NEG_INF = float("-inf")
 
@@ -433,7 +430,6 @@ def test_update_states_tracks_new_requests_and_forgets_finished_ones():
     scheduler_output = SimpleNamespace(
         finished_req_ids={"old"},
         preempted_req_ids=None,
-        scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=set()),
         kv_cache_block_copies=None,
         scheduled_new_reqs=[new_req],
     )
@@ -448,25 +444,26 @@ def test_update_states_tracks_new_requests_and_forgets_finished_ones():
     assert list(runner._min_tokens.requests) == ["new"]
 
 
-def test_update_states_keeps_preempted_and_resumed_requests():
-    """Under the V1 model runner (the TPU default) a preempted request stays
-    in `requests` and comes back as a cached (resumed) request, not a new
-    one, so nothing would re-add it."""
+def test_update_states_tracks_preempted_requests_again_on_resume():
+    """vLLM >= 0.34 drops a preempted request's worker state and re-sends it
+    as a new request when it resumes; `add` registers it again, and its count
+    continues from the output rebuilt from prefill_token_ids."""
     runner = object.__new__(TPUModelRunner)
     runner._min_tokens = min_tokens.MinTokensTracker()
-    runner._min_tokens.add("p", SamplingParams(min_tokens=10, stop_token_ids=[9]))
+    params = SamplingParams(min_tokens=10, stop_token_ids=[9])
+    runner._min_tokens.add("p", params)
     runner._mamba_state_pos, runner._mamba_slot_by_req_id = {}, {}
     runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
     runner._pre_async_results = None
     runner.requests = {}
     runner._install_spec_token_room_guard = lambda: None
-    for preempted, resumed in (({"p"}, set()), (None, {"p"})):
+    resumed = SimpleNamespace(req_id="p", sampling_params=params)
+    for preempted, new_reqs in (({"p"}, []), (None, [resumed])):
         scheduler_output = SimpleNamespace(
             finished_req_ids=set(),
             preempted_req_ids=preempted,
-            scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=resumed),
             kv_cache_block_copies=None,
-            scheduled_new_reqs=[],
+            scheduled_new_reqs=new_reqs,
         )
         with patch.object(GPUModelRunner, "_update_states", return_value=None):
             TPUModelRunner._update_states(runner, scheduler_output)
@@ -831,14 +828,12 @@ def _verify(
     start=0,
     grammar_only_stop=None,
     greedy=True,
-    num_acceptable_drafts=None,
 ):
     """Two requests, drafts of 3 and 1, every draft the target argmax.
     Vocabulary 8; each row prefers token `t` (logit 4), then token 6 (logit 2).
     Not `greedy`: random sampling at temperature 0.01, where a logit gap of 2
-    is a factor e^200. With `num_acceptable_drafts`, the structured requests
-    r0 and r1 get the real draft-token mask. Returns the selected tokens and
-    whether the fused greedy prelude ran."""
+    is a factor e^200. Returns the selected tokens and whether the fused
+    greedy prelude ran."""
     draft_lengths = [3, 1]
     prefer = [[1, 1, 1, 3], [2, 5]]  # per request: draft rows, then the bonus
     rows = [t for req in prefer for t in req]
@@ -883,24 +878,8 @@ def _verify(
                 target[0, grammar_only_stop] = 4.0
             return target, bonus
 
-        def mask_invalid_draft_tokens(draft_token_ids, *_args, **_kwargs):
-            return draft_token_ids
-
-        if num_acceptable_drafts is not None:
-            grammar_output = SimpleNamespace(
-                structured_output_request_ids=["r0", "r1"],
-                num_acceptable_drafts=num_acceptable_drafts,
-            )
-            manager = StructuredDecodingManager.__new__(StructuredDecodingManager)
-            manager.runner = SimpleNamespace(
-                input_batch=SimpleNamespace(
-                    req_id_to_index={"r0": start, "r1": start + 1}
-                )
-            )
-            mask_invalid_draft_tokens = manager.mask_invalid_draft_tokens
         runner.structured_decoding_manager = SimpleNamespace(
-            mask_spec_logits=mask_spec_logits,
-            mask_invalid_draft_tokens=mask_invalid_draft_tokens,
+            mask_spec_logits=mask_spec_logits
         )
     with torch.compiler.set_stance("force_eager"):
         out = TPUModelRunner._sample_spec_verify_chunk(
@@ -958,19 +937,6 @@ def test_verify_masks_the_second_request_at_its_own_rows(grammar):
     (and after its three target rows once gathered)."""
     got, _ = _verify({1: (4, 2, (2,), False)}, grammar)
     assert got == [[1, 1, 1, 3], [6, -1, -1, -1]]
-
-
-@pytest.mark.parametrize("greedy", [True, False])
-def test_verify_rejects_drafts_past_the_grammar_acceptable_count(greedy):
-    """vLLM fills the bitmask rows past num_acceptable_drafts with the
-    all-permissive mask, so the drafts there are pinned to -1, and the
-    rejection sampler must see the pinned IDs, not the raw drafts."""
-    got, _ = _verify({}, grammar=True, greedy=greedy, num_acceptable_drafts=[1, 1])
-    # r0 keeps only its first draft; r1's single draft stands.
-    assert got == [[1, 1, -1, -1], [2, 5, -1, -1]]
-    # Control: with every draft acceptable, nothing is pinned.
-    got, _ = _verify({}, grammar=True, greedy=greedy, num_acceptable_drafts=[3, 1])
-    assert got == [[1, 1, 1, 3], [2, 5, -1, -1]]
 
 
 def test_verify_with_random_sampling_masks_drafts_and_bonus():

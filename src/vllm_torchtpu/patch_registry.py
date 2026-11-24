@@ -110,10 +110,9 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_raiden_pd_completion", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
-    # Process setup and runner selection.
+    # Process setup and runner validation.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
-    Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),
-    Patch("vllm_torchtpu:_patch_dflash_bypass_v2_runner_check", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_vllm_tpu_adaptive_verification", _ACTIVE),
     # Weight loading and embeddings.
     Patch(
         "vllm_torchtpu.model_loader_patches:patch_default_loader_ep_weight_filter",

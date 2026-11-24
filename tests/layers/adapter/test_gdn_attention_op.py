@@ -1495,7 +1495,7 @@ class TestConvWeightReHome:
         weight = torch.nn.Parameter(base.unsqueeze(1), requires_grad=False)
         attn.conv1d = SimpleNamespace(weight=weight)
         aliased_ptr = weight.data_ptr()
-        VllmGatedDeltaNetAttention.process_weights_after_loading(attn, torch.bfloat16)
+        VllmGatedDeltaNetAttention.process_weights_after_loading(attn)
         w = attn.conv1d.weight
         assert w is weight
         assert tuple(w.shape) == (6, 1, 4)
