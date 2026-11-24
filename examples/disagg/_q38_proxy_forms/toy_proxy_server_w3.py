@@ -1,0 +1,922 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import argparse
+import asyncio
+import codecs
+import hashlib
+import itertools
+import json
+import logging
+import os
+import threading
+import time
+import uuid
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+
+class _ProxyLatencyTracker:
+    """Small running latency summary for the proxy path."""
+
+    def __init__(self, log_interval_s: float):
+        self._log_interval_s = log_interval_s
+        self._lock = threading.Lock()
+        self._stats: dict[str, list[float]] = {}
+        self._next_log = time.monotonic() + log_interval_s
+
+    def record(self, phase: str, ms: float) -> None:
+        if self._log_interval_s <= 0:
+            return
+        msg: str | None = None
+        with self._lock:
+            stat = self._stats.setdefault(phase, [0.0, 0.0, ms, ms])
+            stat[0] += 1.0
+            stat[1] += ms
+            stat[2] = min(stat[2], ms)
+            stat[3] = max(stat[3], ms)
+
+            now = time.monotonic()
+            if now >= self._next_log:
+                self._next_log = now + self._log_interval_s
+                parts = []
+                for key in sorted(self._stats):
+                    n, total, min_ms, max_ms = self._stats[key]
+                    parts.append(
+                        f"{key}: n={int(n)} avg={total / n:.2f}ms "
+                        f"min={min_ms:.2f}ms max={max_ms:.2f}ms"
+                    )
+                msg = f"PERF PROXY latency summary | {' | '.join(parts)}"
+        if msg is not None:
+            print(msg, flush=True)
+            logger.info(msg)
+
+
+def _proxy_latency_interval() -> float:
+    val = os.getenv("PROXY_LATENCY_LOG_INTERVAL", "30")
+    try:
+        return float(val)
+    except ValueError:
+        return 30.0
+
+
+_PROXY_LATENCY = _ProxyLatencyTracker(_proxy_latency_interval())
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+# Retries here are deliberately limited to failures that provably occur before
+# any request byte is written to the socket, so the backend holds no state for
+# the request and a replay is indistinguishable from a first attempt:
+#   ConnectError   - the TCP/TLS connection was never established.
+#   ConnectTimeout - timed out establishing that connection.
+#   PoolTimeout    - timed out waiting for a free slot in the local pool, so we
+#                    never even got a socket to write to.
+# ConnectTimeout and PoolTimeout subclass TimeoutException, *not* ConnectError,
+# so they have to be named explicitly.
+#
+# Anything that fails *after* the request hits the wire (ReadError, WriteError,
+# ReadTimeout, 5xx) must NOT be retried from this proxy: vLLM derives its
+# internal request id straight from the X-Request-Id header we send, so a
+# replay is seen by the engine as the same request arriving twice. That trips
+# `assert existing.streaming_queue is not None, "duplicate request id"` in
+# Scheduler.add_request, which raises inside the engine loop and takes down the
+# whole EngineCore rather than failing the single request. On the decode hop it
+# additionally collides with the Raiden Stage-3 KV registration keyed by the
+# same id. Recovering those cases requires re-running prefill under a fresh
+# request id to mint a new KV uuid, which has to happen at the request-flow
+# level (see _handle_completions), not inside a per-hop wrapper.
+_PRE_SEND_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+_MAX_ATTEMPTS = max(1, _env_int("PROXY_MAX_ATTEMPTS", 5))
+_RETRY_BASE_DELAY_S = _env_float("PROXY_RETRY_BASE_DELAY_S", 0.5)
+
+
+def _log_unsafe_transport_failure(
+    phase: str, request_id: str, exc: Exception, detail: str = ""
+) -> None:
+    """Flag a failure that cannot be retried safely at this layer."""
+    msg = (
+        f"[UNSAFE-{phase}] req_id={request_id} failed after the request "
+        f"was already sent: {exc!r}. Not retrying: the server may have "
+        f"admitted this request, and replaying it with the same "
+        f"X-Request-Id would collide with the in-flight vLLM request id "
+        f"(and the Raiden KV registration on the decode hop). Recovery "
+        f"needs a fresh request id + new KV uuid and must be handled at "
+        f"the request-flow level, not in this per-hop retry wrapper."
+    )
+    if detail:
+        msg = f"{msg} {detail}"
+    print(msg, flush=True)
+    logger.error(msg)
+
+
+async def _backoff_before_retry(
+    attempt: int, phase: str, request_id: str, exc: Exception
+) -> None:
+    delay = _RETRY_BASE_DELAY_S * (2**attempt)
+    msg = (
+        f"[RETRY-{phase}] attempt {attempt + 1}/{_MAX_ATTEMPTS} "
+        f"failed for req_id={request_id}: {exc!r}, "
+        f"retrying in {delay:.1f}s"
+    )
+    print(msg, flush=True)
+    logger.warning(msg)
+    await asyncio.sleep(delay)
+
+
+async def _post_with_retries(
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    headers: dict,
+    request_id: str,
+    phase: str,
+):
+    """POST to a backend, retrying only connection-establishment failures."""
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            response = await client_info["client"].post(
+                endpoint, json=req_data, headers=headers
+            )
+            response.raise_for_status()
+            return response
+        except _PRE_SEND_ERRORS as e:
+            if attempt == _MAX_ATTEMPTS - 1:
+                raise
+            await _backoff_before_retry(attempt, phase, request_id, e)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                _log_unsafe_transport_failure(phase, request_id, e)
+            raise
+        except httpx.TransportError as e:
+            _log_unsafe_transport_failure(phase, request_id, e)
+            raise
+
+
+def _render_endpoint_for_api(api: str) -> str | None:
+    # Upstream vLLM does not expose a /render endpoint; tokenization occurs
+    # directly within the prefill engine.
+    return None
+
+
+def _token_ids_from_completion_render(rendered: Any) -> list[int] | list[list[int]]:
+    if not isinstance(rendered, list) or not rendered:
+        raise ValueError("Completion render response must be a non-empty list")
+
+    prompts: list[list[int]] = []
+    for item in rendered:
+        if not isinstance(item, dict):
+            raise ValueError("Completion render item must be an object")
+        token_ids = item.get("token_ids")
+        if not isinstance(token_ids, list) or not all(
+            type(token_id) is int and token_id >= 0 for token_id in token_ids
+        ):
+            raise ValueError("Completion render item must contain token_ids")
+        prompts.append(token_ids)
+
+    return prompts[0] if len(prompts) == 1 else prompts
+
+
+def _replace_prompt_with_rendered_token_ids(req_data: dict, rendered: Any) -> dict:
+    req_data = req_data.copy()
+    req_data["prompt"] = _token_ids_from_completion_render(rendered)
+    req_data.pop("prompt_embeds", None)
+    return req_data
+
+
+def _json_escape_non_ascii(text: str) -> bytes:
+    """Encode text as ASCII bytes while preserving JSON string semantics."""
+    if text.isascii():
+        return text.encode("ascii")
+
+    parts = []
+    for char in text:
+        codepoint = ord(char)
+        if codepoint < 128:
+            parts.append(char)
+        elif codepoint <= 0xFFFF:
+            parts.append(f"\\u{codepoint:04x}")
+        else:
+            codepoint -= 0x10000
+            high_surrogate = 0xD800 + (codepoint >> 10)
+            low_surrogate = 0xDC00 + (codepoint & 0x3FF)
+            parts.append(f"\\u{high_surrogate:04x}\\u{low_surrogate:04x}")
+    return "".join(parts).encode("ascii")
+
+
+class _AsciiSafeStreamEncoder:
+    """Converts UTF-8 stream chunks to ASCII-only JSON-compatible chunks."""
+
+    def __init__(self):
+        self._decoder = codecs.getincrementaldecoder("utf-8")()
+
+    def encode(self, chunk: bytes = b"", *, final: bool = False) -> bytes:
+        text = self._decoder.decode(chunk, final=final)
+        if not text:
+            return b""
+        return _json_escape_non_ascii(text)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Lifespan context manager to handle startup and shutdown events.
+    """
+    # Startup: Initialize client pools for prefiller and decoder services
+    app.state.prefill_clients = []
+    app.state.decode_clients = []
+
+    # keepalive_expiry must stay *below* the backend's keep-alive timeout,
+    # otherwise the pool hands out sockets the server has already reaped and
+    # the next request dies with ReadError/RemoteProtocolError -- which we
+    # cannot retry safely (see _PRE_SEND_ERRORS above). vLLM runs uvicorn with
+    # timeout_keep_alive=VLLM_HTTP_TIMEOUT_KEEP_ALIVE, default 5s, and httpx's
+    # own default expiry is also 5.0, so out of the box the two race exactly.
+    # 4.0 buys a second of margin; raise VLLM_HTTP_TIMEOUT_KEEP_ALIVE on the
+    # backends if you want longer-lived connections.
+    keepalive_expiry = _env_float("PROXY_KEEPALIVE_EXPIRY_S", 4.0)
+    limits = httpx.Limits(
+        max_connections=None,
+        max_keepalive_connections=None,
+        keepalive_expiry=keepalive_expiry,
+    )
+
+    # Create prefill clients
+    for i, (host, port) in enumerate(global_args.prefiller_instances):
+        prefiller_base_url = f"http://{host}:{port}"
+        app.state.prefill_clients.append(
+            {
+                "client": httpx.AsyncClient(
+                    timeout=None, base_url=prefiller_base_url, limits=limits
+                ),
+                "host": host,
+                "port": port,
+                "id": i,
+            }
+        )
+
+    # Create decode clients
+    for i, (host, port) in enumerate(global_args.decoder_instances):
+        decoder_base_url = f"http://{host}:{port}"
+        app.state.decode_clients.append(
+            {
+                "client": httpx.AsyncClient(
+                    timeout=None, base_url=decoder_base_url, limits=limits
+                ),
+                "host": host,
+                "port": port,
+                "id": i,
+            }
+        )
+
+    # Initialize round-robin iterators
+    app.state.prefill_iterator = itertools.cycle(range(len(app.state.prefill_clients)))
+    app.state.decode_iterator = itertools.cycle(range(len(app.state.decode_clients)))
+
+    print(
+        f"Initialized {len(app.state.prefill_clients)} prefill clients "
+        f"and {len(app.state.decode_clients)} decode clients."
+    )
+    app.state.decode_affinity = _make_decode_affinity(len(app.state.decode_clients))
+    if app.state.decode_affinity is not None:
+        print(f"Decode routing: {app.state.decode_affinity.describe()}", flush=True)
+
+    # PROXY_Q38_DECPC_IDENTITY=1: the decode prefix-cache identity driver
+    # (q38_decpc_identity.py); /healthcheck answers 503 until it finishes.
+    if os.getenv("PROXY_Q38_DECPC_IDENTITY", "0") == "1":
+        import q38_decpc_identity
+
+        _Q38_IDENTITY["done"] = False
+        app.state.q38_identity = asyncio.create_task(
+            q38_decpc_identity.start(app, global_args.port, _Q38_IDENTITY)
+        )
+
+    yield
+
+    # Shutdown: Close all clients
+    for client_info in app.state.prefill_clients:
+        await client_info["client"].aclose()
+
+    for client_info in app.state.decode_clients:
+        await client_info["client"].aclose()
+
+
+# Update FastAPI app initialization to use lifespan
+app = FastAPI(lifespan=lifespan)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--host", type=str, default="localhost")
+
+    # For prefiller instances
+    parser.add_argument(
+        "--prefiller-hosts",
+        "--prefiller-host",
+        type=str,
+        nargs="+",
+        default=["localhost"],
+    )
+    parser.add_argument(
+        "--prefiller-ports", "--prefiller-port", type=int, nargs="+", default=[8400]
+    )
+
+    # For decoder instances
+    parser.add_argument(
+        "--decoder-hosts", "--decoder-host", type=str, nargs="+", default=["localhost"]
+    )
+    parser.add_argument(
+        "--decoder-ports", "--decoder-port", type=int, nargs="+", default=[9400]
+    )
+
+    args = parser.parse_args()
+
+    # Validate and pair hosts with ports
+    if len(args.prefiller_hosts) != len(args.prefiller_ports):
+        raise ValueError(
+            "Number of prefiller hosts must match number of prefiller ports"
+        )
+
+    if len(args.decoder_hosts) != len(args.decoder_ports):
+        raise ValueError("Number of decoder hosts must match number of decoder ports")
+
+    # Create tuples of (host, port) for each service type
+    args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
+    args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
+
+    return args
+
+
+class _DecodeSessionAffinity:
+    """Decode-session affinity (PROXY_DECODE_ROUTING=session_affinity; any other
+    value, or unset, keeps the round robin).
+
+    With a decode prefix cache, a returning conversation turn only hits if it
+    reaches the decode instance that holds its earlier KV; a round robin over D
+    decodes finds it about 1 time in D. This router sends a returning turn back
+    to the decode that served the conversation's previous request.
+
+    * Key: the request's prompt as bytes, prefix-stable across turns. Chat: the
+      tools, then each message as sorted-key JSON, one per line, so turn k's key
+      is a byte prefix of turn k+1's. Completions: the prompt text, or its token
+      ids joined by commas. Batched prompts get no key (routed cold).
+    * Digests: cumulative blake2b over fixed-size chunks of the key. For each
+      digest the router keeps the decode that last served it and the first
+      digest that ever followed it ("next").
+    * Returning turn ("sticky"): the request's deepest known digest was the END
+      of an earlier request (no next recorded). Its decode is the target.
+    * A request that only shares a head with other conversations (a common
+      system prompt) matches a digest that an earlier chain continued past
+      ("branch"): it is not a returning turn and goes to the least-loaded
+      decode, as does a request with no known digest ("cold"). Limitation: a
+      conversation whose first request ends less than one chunk past a shared
+      head is indistinguishable from that head, so its second turn routes as
+      a branch; from the turn after, it is sticky.
+    * Guard: with max_skew > 0, a sticky target holding more than max_skew
+      in-flight requests above the least-loaded decode is overridden ("guard").
+    * Load: in-flight requests per decode, from the decode choice until the
+      decode stream ends. Ties go round robin.
+    * PROXY_DECODE_ROUTING=prefix_affinity (q38 CACHE-3; rule "longest") routes
+      to the decode that last served the request's LONGEST known prefix, shared
+      heads included ("prefix" when it is not a returning turn), with
+      LEV-CACHE's bounded load instead of max_skew: a target whose in-flight
+      count exceeds (1 + slack) x the mean over decodes + 1 is overridden
+      ("guard"; the rule of vllm_torchtpu/core/dp_affinity.py within_bound on
+      q38-o4-affine). Decodes are the (host, port) endpoints in the order given,
+      so two decode servers on one host are two targets.
+    """
+
+    def __init__(self, n_decodes: int, chunk: int = 2048, max_skew: int = 16,
+                 max_entries: int = 2_000_000, rule: str = "sticky",
+                 slack: float | None = None) -> None:
+        if n_decodes < 1:
+            raise ValueError(f"n_decodes must be >= 1, got {n_decodes}")
+        if rule not in ("sticky", "longest"):
+            raise ValueError(f"rule must be 'sticky' or 'longest', got {rule!r}")
+        self.rule = rule
+        self.slack = None if slack is None else max(0.0, float(slack))
+        self.n = n_decodes
+        self.chunk = max(64, int(chunk))
+        self.max_skew = max(0, int(max_skew))
+        self.max_entries = max(1, int(max_entries))
+        self._lock = threading.Lock()
+        # digest -> [decode that last served it, first digest that followed it or None]
+        self.entries: OrderedDict[bytes, list] = OrderedDict()
+        self.inflight = [0] * n_decodes
+        self._reqs: dict[str, int] = {}
+        self._tie = 0
+        self.counts = {"sticky": 0, "cold": 0, "branch": 0, "prefix": 0, "guard": 0}
+
+    @staticmethod
+    def key(req_data: dict) -> bytes:
+        messages = req_data.get("messages")
+        if isinstance(messages, list):
+            parts = []
+            if req_data.get("tools") is not None:
+                parts.append(json.dumps(req_data["tools"], sort_keys=True, ensure_ascii=False,
+                                        separators=(",", ":")))
+            for m in messages:
+                parts.append(json.dumps(m, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
+            return ("\n".join(parts) + "\n").encode("utf-8", errors="ignore")
+        prompt = req_data.get("prompt")
+        if isinstance(prompt, str):
+            return prompt.encode("utf-8", errors="ignore")
+        if isinstance(prompt, list) and prompt and all(type(t) is int for t in prompt):
+            return (",".join(map(str, prompt)) + ",").encode()
+        return b""
+
+    def hashes(self, raw: bytes) -> list[bytes]:
+        out: list[bytes] = []
+        h = hashlib.blake2b(digest_size=16)
+        for i in range(0, len(raw) - self.chunk + 1, self.chunk):
+            h.update(raw[i : i + self.chunk])
+            out.append(h.digest())
+        return out
+
+    def _least(self) -> int:
+        lo = min(self.inflight)
+        for k in range(self.n):
+            d = (self._tie + k) % self.n
+            if self.inflight[d] == lo:
+                self._tie = (d + 1) % self.n
+                return d
+        raise AssertionError("unreachable")
+
+    def choose(self, hs: list[bytes], req_id: str) -> tuple[int, str, int]:
+        """(decode index, reason, matched chunks) for a request with digests hs."""
+        with self._lock:
+            depth, target, reason = 0, None, "cold"
+            for i in range(len(hs) - 1, -1, -1):
+                ent = self.entries.get(hs[i])
+                if ent is None:
+                    continue
+                depth = i + 1
+                nxt = hs[i + 1] if i + 1 < len(hs) else None
+                if ent[1] is None or ent[1] == nxt:
+                    target, reason = ent[0], "sticky"
+                elif self.rule == "longest":
+                    target, reason = ent[0], "prefix"
+                else:
+                    reason = "branch"
+                break
+            if target is not None and self.max_skew and self.inflight[target] > min(self.inflight) + self.max_skew:
+                target, reason = None, "guard"
+            if (target is not None and self.slack is not None
+                    and self.inflight[target] > (1.0 + self.slack) * sum(self.inflight) / self.n + 1.0):
+                target, reason = None, "guard"
+            pick = target if target is not None else self._least()
+            self.inflight[pick] += 1
+            self._reqs[req_id] = pick
+            for i, d in enumerate(hs):
+                ent = self.entries.get(d)
+                nxt = hs[i + 1] if i + 1 < len(hs) else None
+                if ent is None:
+                    self.entries[d] = [pick, nxt]
+                else:
+                    ent[0] = pick
+                    if ent[1] is None:
+                        ent[1] = nxt
+                    self.entries.move_to_end(d)
+            while len(self.entries) > self.max_entries:
+                self.entries.popitem(last=False)
+            self.counts[reason] += 1
+            return pick, reason, depth
+
+    def done(self, req_id: str) -> None:
+        with self._lock:
+            d = self._reqs.pop(req_id, None)
+            if d is not None:
+                self.inflight[d] = max(0, self.inflight[d] - 1)
+
+    def describe(self) -> str:
+        mode = "session_affinity" if self.rule == "sticky" else "prefix_affinity"
+        return (f"{mode} decodes={self.n} chunk={self.chunk} max_skew={self.max_skew} "
+                f"max_entries={self.max_entries} rule={self.rule} slack={self.slack}")
+
+
+def _make_decode_affinity(n_decodes: int) -> "_DecodeSessionAffinity | None":
+    """The decode affinity router for PROXY_DECODE_ROUTING=session_affinity (DECPC: sticky
+    returning turns, max_skew guard) or prefix_affinity (q38 CACHE-3: longest prefix incl.
+    shared heads, bounded load (1 + slack) x mean + 1, max_skew off); else None (round robin)."""
+    mode = os.getenv("PROXY_DECODE_ROUTING", "round_robin").strip().lower()
+    if mode == "session_affinity":
+        return _DecodeSessionAffinity(
+            n_decodes,
+            chunk=_env_int("PROXY_DECODE_AFFINITY_CHUNK", 2048),
+            max_skew=_env_int("PROXY_DECODE_AFFINITY_MAX_SKEW", 16),
+            max_entries=_env_int("PROXY_DECODE_AFFINITY_MAX_ENTRIES", 2_000_000),
+        )
+    if mode == "prefix_affinity":
+        return _DecodeSessionAffinity(
+            n_decodes,
+            chunk=_env_int("PROXY_DECODE_AFFINITY_CHUNK", 2048),
+            max_skew=_env_int("PROXY_DECODE_AFFINITY_MAX_SKEW", 0),
+            max_entries=_env_int("PROXY_DECODE_AFFINITY_MAX_ENTRIES", 2_000_000),
+            rule="longest",
+            slack=_env_float("PROXY_DECODE_AFFINITY_SLACK", 0.25),
+        )
+    return None
+
+
+def get_next_client(app, service_type: str):
+    """
+    Get the next client in round-robin fashion.
+
+    Args:
+        app: The FastAPI app instance
+        service_type: Either 'prefill' or 'decode'
+
+    Returns:
+        The next client to use
+    """
+    if service_type == "prefill":
+        client_idx = next(app.state.prefill_iterator)
+        return app.state.prefill_clients[client_idx]
+    elif service_type == "decode":
+        client_idx = next(app.state.decode_iterator)
+        return app.state.decode_clients[client_idx]
+    else:
+        raise ValueError(f"Unknown service type: {service_type}")
+
+
+async def send_request_to_prefill(
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    forwarded: dict | None = None,
+):
+    """
+    Send a request to a service using a client from the pool.
+    """
+    req_data = req_data.copy()
+    # Must overwrite these for prefill workers.
+    req_data["stream"] = False
+    req_data["max_tokens"] = 1
+    if "max_completion_tokens" in req_data:
+        req_data["max_completion_tokens"] = 1
+    if "stream_options" in req_data:
+        del req_data["stream_options"]
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "X-Request-Id": request_id,
+        **(forwarded or {}),
+    }
+
+    return await _post_with_retries(
+        client_info, endpoint, req_data, headers, request_id, phase="PREFILL"
+    )
+
+
+async def render_completion_prompt(
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    forwarded: dict | None = None,
+):
+    """
+    Render/tokenize a completion request once so downstream P/D requests can
+    use prompt token IDs instead of retokenizing raw text independently.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "X-Request-Id": request_id,
+        **(forwarded or {}),
+    }
+
+    return await _post_with_retries(
+        client_info, endpoint, req_data, headers, request_id, phase="RENDER"
+    )
+
+
+async def stream_from_decode(
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    forwarded: dict | None = None,
+):
+    """
+    Asynchronously stream response from a service using a client from the pool.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "X-Request-Id": request_id,
+        **(forwarded or {}),
+    }
+
+    for attempt in range(_MAX_ATTEMPTS):
+        yielded_any = False
+        try:
+            async with client_info["client"].stream(
+                "POST", endpoint, json=req_data, headers=headers
+            ) as response:
+                if response.status_code >= 400:
+                    # Streaming responses are not read on entry, so pull the
+                    # body first or the raised error carries no vLLM detail.
+                    await response.aread()
+                response.raise_for_status()
+                encoder = _AsciiSafeStreamEncoder()
+                async for chunk in response.aiter_bytes():
+                    chunk = encoder.encode(chunk)
+                    if chunk:
+                        yielded_any = True
+                        yield chunk
+                chunk = encoder.encode(final=True)
+                if chunk:
+                    yielded_any = True
+                    yield chunk
+            return
+        except _PRE_SEND_ERRORS as e:
+            # Never reached the decode server, so the KV handle minted by
+            # prefill is still parked and unclaimed: safe to re-send as-is.
+            if attempt == _MAX_ATTEMPTS - 1:
+                raise
+            await _backoff_before_retry(attempt, "DECODE", request_id, e)
+        except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            if yielded_any:
+                detail = (
+                    "Stream had already emitted bytes to the client, "
+                    "so the response is truncated."
+                )
+            else:
+                detail = (
+                    "Failed before the first byte; the client will "
+                    "still see HTTP 200 followed by an empty/short "
+                    "body because StreamingResponse has already "
+                    "flushed headers."
+                )
+            _log_unsafe_transport_failure("DECODE", request_id, e, detail)
+            raise
+
+
+def _prefill_usage_log(response_json: Any) -> str:
+    """`` prompt_tokens=P cached_tokens=C`` from the prefill's usage, if any.
+
+    With --enable-prompt-tokens-details the prefill reports how many prompt
+    tokens its own prefix cache supplied; joined by kv_uuid with the decode's
+    Stage-3 load line (skip_tokens), it shows per request where the decode's
+    local hit reaches beyond the prefill's (decode_prefix_cache.md §13)."""
+    usage = response_json.get("usage") if isinstance(response_json, dict) else None
+    if not isinstance(usage, dict):
+        return ""
+    out = ""
+    if isinstance(usage.get("prompt_tokens"), int):
+        out += f" prompt_tokens={usage['prompt_tokens']}"
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and isinstance(details.get("cached_tokens"), int):
+        out += f" cached_tokens={details['cached_tokens']}"
+    return out
+
+
+_Q38_PREAMBLE_BLOCK = (
+    "[Padding block {i}] This block is neutral padding and carries no "
+    "information about the task. Ignore every padding block and answer only "
+    "the request that follows the padding.\n"
+)
+
+
+def _q38_apply_preamble(req_data: dict) -> dict:
+    """PROXY_Q38_PREAMBLE_REPEATS=N (> 0): prepend the same N-block text
+    preamble to every completion prompt or chat conversation, so every request
+    shares a long common prefix. An accuracy gate for the decode prefix cache
+    sets it in BOTH arms: identical prompts, and with decode caching on every
+    request after the first adopts the shared prefix the decode already holds
+    (a cross-request hit, like a returning turn). Token-id prompts are left
+    unchanged."""
+    repeats = _env_int("PROXY_Q38_PREAMBLE_REPEATS", 0)
+    if repeats <= 0:
+        return req_data
+    text = "".join(_Q38_PREAMBLE_BLOCK.format(i=i + 1) for i in range(repeats))
+    out = dict(req_data)
+    prompt = out.get("prompt")
+    if isinstance(prompt, str):
+        out["prompt"] = text + prompt
+    elif isinstance(prompt, list) and prompt and all(isinstance(p, str) for p in prompt):
+        out["prompt"] = [text + p for p in prompt]
+    messages = out.get("messages")
+    if isinstance(messages, list) and messages:
+        messages = [dict(m) for m in messages]
+        first = messages[0]
+        if first.get("role") == "system" and isinstance(first.get("content"), str):
+            first["content"] = text + first["content"]
+        else:
+            messages.insert(0, {"role": "system", "content": text.rstrip("\n")})
+        out["messages"] = messages
+    return out
+
+
+async def _handle_completions(api: str, request: Request):
+    try:
+        t_request_recv_perf = time.perf_counter()
+        req_data = _q38_apply_preamble(await request.json())
+        request_id = str(uuid.uuid4())
+        # vLLM sends a request carrying X-data-parallel-rank to that DP rank of
+        # the engine. Passed to both hops, so that a client can hold a request
+        # to one prefill replica and one decode replica.
+        forwarded = {}
+        if (dp_rank := request.headers.get("X-data-parallel-rank")) is not None:
+            forwarded["X-data-parallel-rank"] = dp_rank
+        print(
+            f"PERF PROXY req_received req_id={request_id} ts={time.time():.6f}",
+            flush=True,
+        )
+
+        # Get the next prefill client in round-robin fashion
+        prefill_client_info = get_next_client(request.app, "prefill")
+        render_endpoint = _render_endpoint_for_api(api)
+        if render_endpoint is not None:
+            render_response = await render_completion_prompt(
+                prefill_client_info, render_endpoint, req_data, request_id, forwarded
+            )
+            req_data = _replace_prompt_with_rendered_token_ids(
+                req_data, render_response.json()
+            )
+
+        # Send request to prefill service
+        t_prefill_send = time.time()
+        t_prefill_send_perf = time.perf_counter()
+        print(
+            f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
+            flush=True,
+        )
+        response = await send_request_to_prefill(
+            prefill_client_info, api, req_data, request_id, forwarded
+        )
+        t_prefill_recv = time.time()
+        t_prefill_recv_perf = time.perf_counter()
+        prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
+        _PROXY_LATENCY.record("prefill", prefill_ms)
+        _PROXY_LATENCY.record(
+            "prefill_from_req", (t_prefill_recv_perf - t_request_recv_perf) * 1000.0
+        )
+
+        # Extract the needed fields
+        response_json = response.json()
+        kv_transfer_params = response_json.get("kv_transfer_params", {})
+        kv_uuid = kv_transfer_params.get("uuid") if kv_transfer_params else None
+        kv_uuid_log = f" kv_uuid={kv_uuid}" if kv_uuid is not None else ""
+        print(
+            f"PERF PROXY prefill_recv req_id={request_id} ts={t_prefill_recv:.6f} "
+            f"dur_ms={prefill_ms:.2f}{kv_uuid_log}{_prefill_usage_log(response_json)}",
+            flush=True,
+        )
+
+        if kv_transfer_params:
+            req_data["kv_transfer_params"] = kv_transfer_params
+
+        # The decode: round robin, or (PROXY_DECODE_ROUTING=session_affinity)
+        # chosen when the stream starts, so its in-flight count is released in
+        # the same finally that ends the stream.
+        affinity = getattr(request.app.state, "decode_affinity", None)
+        if affinity is None:
+            decode_client_info = get_next_client(request.app, "decode")
+            logger.debug("Using %s %s", prefill_client_info, decode_client_info)
+            route_key = None
+        else:
+            route_key = affinity.key(req_data)
+
+        # Stream response from decode service
+        async def generate_stream():
+            if affinity is not None:
+                hs = affinity.hashes(route_key)
+                idx, reason, depth = affinity.choose(hs, request_id)
+                client_info = request.app.state.decode_clients[idx]
+                print(
+                    f"PERF PROXY decode_route req_id={request_id} decode={idx} "
+                    f"reason={reason} matched={depth}/{len(hs)} "
+                    f"inflight={','.join(map(str, affinity.inflight))}{kv_uuid_log}",
+                    flush=True,
+                )
+            else:
+                client_info = decode_client_info
+            try:
+                async for chunk in _decode_stream(client_info):
+                    yield chunk
+            finally:
+                if affinity is not None:
+                    affinity.done(request_id)
+
+        async def _decode_stream(decode_client_info):
+            t_decode_send = time.time()
+            t_decode_send_perf = time.perf_counter()
+            print(
+                f"PERF PROXY decode_send req_id={request_id} "
+                f"ts={t_decode_send:.6f}{kv_uuid_log}",
+                flush=True,
+            )
+            first = True
+            async for chunk in stream_from_decode(
+                decode_client_info, api, req_data, request_id, forwarded
+            ):
+                if first:
+                    t_first = time.time()
+                    t_first_perf = time.perf_counter()
+                    decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
+                    ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
+                    _PROXY_LATENCY.record("decode_first", decode_first_ms)
+                    _PROXY_LATENCY.record("ttft", ttft_ms)
+                    print(
+                        f"PERF PROXY first_chunk req_id={request_id} "
+                        f"ts={t_first:.6f} "
+                        f"dur_from_decode_send_ms={decode_first_ms:.2f} "
+                        f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
+                        flush=True,
+                    )
+                    first = False
+                yield chunk
+
+        # text/event-stream when the caller asked for a stream, which is what
+        # the decode instance is actually sending back. Declared as
+        # application/json, a client parses each SSE frame - "data: {...}" prefix
+        # and all - as one JSON document, and every request fails; aiperf's
+        # agentic replay does exactly that, while the non-streaming callers this
+        # proxy had until now (check_completions.py, lm_eval) never noticed.
+        media_type = (
+            "text/event-stream" if req_data.get("stream") else "application/json"
+        )
+        return StreamingResponse(generate_stream(), media_type=media_type)
+
+    except Exception as e:
+        import sys
+        import traceback
+
+        exc_info = sys.exc_info()
+        print(f"Error occurred in disagg prefill proxy server - {api} endpoint")
+        print(e)
+        print("".join(traceback.format_exception(*exc_info)))
+        raise
+
+
+@app.post("/v1/completions")
+async def handle_completions(request: Request):
+    return await _handle_completions("/v1/completions", request)
+
+
+@app.post("/v1/chat/completions")
+async def handle_chat_completions(request: Request):
+    return await _handle_completions("/v1/chat/completions", request)
+
+
+@app.get("/v1/models")
+async def models():
+    """The decode instance's model list, which is the pair's.
+
+    Part of the OpenAI surface this proxy presents: a client resolves the served
+    model name here, and the ModelCard's max_model_len is how a benchmark client
+    learns the window it is replaying against. Both instances serve the same
+    model; decode is the one that finishes a request.
+    """
+    client = app.state.decode_clients[0]["client"]
+    response = await client.get("/v1/models")
+    return JSONResponse(status_code=response.status_code, content=response.json())
+
+
+_Q38_IDENTITY = {"done": True}
+
+
+@app.get("/healthcheck")
+async def healthcheck():
+    """Simple endpoint to check if the server is running."""
+    if not _Q38_IDENTITY["done"]:
+        return JSONResponse(status_code=503, content={"status": "identity driver running"})
+    return {
+        "status": "ok",
+        "prefill_instances": len(app.state.prefill_clients),
+        "decode_instances": len(app.state.decode_clients),
+    }
+
+
+if __name__ == "__main__":
+    global global_args
+    global_args = parse_args()
+
+    import uvicorn
+
+    uvicorn.run(app, host=global_args.host, port=global_args.port)

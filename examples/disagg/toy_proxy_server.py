@@ -21,6 +21,43 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
+# q38 proxy form gate (q38 MERGE-1124, 2026-11-24). Q38_PROXY_FORM unset or
+# empty: this file runs exactly as before. Q38_PROXY_FORM=<name>: the proxy a
+# q38 dash point ran, stored byte for byte in
+# _q38_proxy_forms/toy_proxy_server_<name>.py next to this file, runs in its
+# place as __main__ with this process's argv, and this file stops there.
+# Names: w3 (q38 w3 2bc75911f5), k (q38 K line 9f0c924d16), opener (q38
+# 139d15a14e, PROXY_AFFINITY_KEY=opener). Table: q38_bands/merge_1124/README.md.
+_q38_proxy_form = os.environ.get("Q38_PROXY_FORM", "").strip()
+if _q38_proxy_form:
+    if _q38_proxy_form not in ("w3", "k", "opener"):
+        raise RuntimeError(
+            "Q38_PROXY_FORM must be unset or one of w3, k, opener "
+            f"(got {_q38_proxy_form!r})"
+        )
+    if __name__ != "__main__":
+        raise ImportError(
+            "Q38_PROXY_FORM selects the proxy entry point; run this file, "
+            "do not import it"
+        )
+    import runpy as _q38_runpy
+    import sys as _q38_sys
+
+    _q38_proxy_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "_q38_proxy_forms",
+        f"toy_proxy_server_{_q38_proxy_form}.py",
+    )
+    print(
+        f"q38 proxy form gate: Q38_PROXY_FORM={_q38_proxy_form} "
+        f"runs {_q38_proxy_path}",
+        file=_q38_sys.stderr,
+        flush=True,
+    )
+    _q38_runpy.run_path(_q38_proxy_path, run_name="__main__")
+    raise SystemExit(0)
+del _q38_proxy_form
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
