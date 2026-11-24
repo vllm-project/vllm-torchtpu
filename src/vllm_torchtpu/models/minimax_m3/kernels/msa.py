@@ -124,6 +124,27 @@ def write_caches(
     )
 
 
+def plan_cache_write(
+    targets: Sequence[msa_write.Rows],
+    pages: jax.Array,
+    pos: jax.Array,
+    *,
+    max_num_seqs: int,
+) -> msa_write.Write:
+    """`write_caches`' write of 8/16-bit `Rows`, planned for another kernel
+    with one buffer slot per run (`msa_write.plan_write`)."""
+    num_tokens = pages.shape[0]
+    block_size = page_size(targets[0].cache)
+    max_runs = msa_write.max_write_runs(num_tokens, max_num_seqs, block_size)
+    return msa_write.plan_write(
+        [t._replace(rows=_cache_rows(t.cache, t.rows)) for t in targets],
+        pages,
+        pos % block_size,
+        max_runs=max_runs,
+        depth=max_runs,
+    )
+
+
 def write_rows(
     cache: jax.Array,
     rows: jax.Array,

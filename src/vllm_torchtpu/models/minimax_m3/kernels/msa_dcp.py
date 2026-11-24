@@ -71,6 +71,10 @@ _MIN_CANDIDATE_TOKENS = 1024
 # 108.4 -> 116.7 ms per step, c64 DCP8 b57 147.8 -> 191.1 ms; j-82660a13 vs
 # j-8a29ceb0, j-c0fd0e40 vs j-11d1908c).
 DCP_SMALL_BATCH_TOKENS = 128
+# The most VMEM a decode step's write may take inside the block-score kernel,
+# beside its page ring (6 / 12 MiB at 8 / 16 bits) in the core's 64 MiB: a
+# slot per run, ~150 KiB at 8 bits (16 runs: 2.4 MiB).
+_FUSED_WRITE_VMEM_BYTES = 16 << 20
 
 
 def rank_array(rank: int | jax.Array) -> jax.Array:
@@ -697,14 +701,20 @@ def msa_write_and_candidates_dcp(
             interpret=interpret,
         )
         index_q = msa_fp4.rotate_queries(index_q)
-    else:
+    prefill = msa_indexer.is_prefill_step(num_heads * num_tokens, max_num_seqs)
+    write = None
+    if not fp4:
         kv_rows = jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1)
+        rows = [msa_write.Rows(kv_cache, kv_rows), msa_write.Rows(index_cache, index_k)]
+        if num_heads == 1 and not prefill and num_tokens <= msa_indexer.DEFAULT_BLOCK_Q:
+            write = msa.plan_cache_write(rows, pages, pos, max_num_seqs=max_num_seqs)
+    # A decode step's block-score kernel also writes the step's rows
+    # (`msa_indexer.block_scores_and_write`) instead of a write kernel ahead,
+    # when its buffers (one slot per run) fit beside the page ring.
+    fused_write = write is not None and write.vmem_bytes <= _FUSED_WRITE_VMEM_BYTES
+    if not fp4 and not fused_write:
         kv_cache, index_cache = msa.write_caches(
-            [msa_write.Rows(kv_cache, kv_rows), msa_write.Rows(index_cache, index_k)],
-            pages,
-            pos,
-            max_num_seqs=max_num_seqs,
-            interpret=interpret,
+            rows, pages, pos, max_num_seqs=max_num_seqs, interpret=interpret
         )
     local_lens = local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp)
     candidates = functools.partial(
@@ -717,7 +727,7 @@ def msa_write_and_candidates_dcp(
         dcp=dcp,
         interpret=interpret,
     )
-    if msa_indexer.is_prefill_step(num_heads * num_tokens, max_num_seqs):
+    if prefill:
         packed = _class_candidates(
             index_q,
             index_cache,
@@ -735,7 +745,22 @@ def msa_write_and_candidates_dcp(
         if fp4:
             return kv_cache, index_cache, scale_cache, packed
         return kv_cache, index_cache, packed
-    if num_heads == 1:
+    if fused_write:
+        run_tok0 = jnp.minimum(write.prefetch[4], num_tokens - 1)
+        scores, (kv_cache, index_cache) = msa_indexer.block_scores_and_write(
+            index_q,
+            local_lens,
+            block_tables,
+            cu_q_lens,
+            distribution[2],
+            write,
+            msa_indexer.lookup(seq_id, run_tok0),
+            msa_indexer.lookup(pos, run_tok0) // block_size // dcp,
+            target=1,
+            interpret=interpret,
+            **msa.block_score_options(1),
+        )
+    elif num_heads == 1:
         scores = msa._block_scores(
             index_q,
             index_cache,

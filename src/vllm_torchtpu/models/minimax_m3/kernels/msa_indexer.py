@@ -37,7 +37,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4, msa_write
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
     check_page_dtype,
     unpack_page,
@@ -360,6 +360,7 @@ def _kernel_v3(
     sems,  # DMA semaphores [R], one per ring slot
     *,
     transposed=False,
+    write=None,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -376,6 +377,10 @@ def _kernel_v3(
 
     A folded 4-bit page (`msa_fp4.scales_in_page`) is ``S / 8`` word rows of
     int4 keys and one row of f32 slot scales (`_chunk_maxima_t`).
+
+    With `write` (`_FusedWrite`), the kernel also writes the step's rows into
+    the caches, `cache_ref` among them, and scores the pages it writes as
+    written.
     """
     slots, pages_per_step, rows, head_dim = buf.shape
     ahead = slots - 1
@@ -439,8 +444,12 @@ def _kernel_v3(
 
     @pl.when(step == 0)
     def _():
+        if write is not None:
+            write.start()
         for k in range(ahead):
             start(*ahead_group(k), range(pages_per_step), k)
+        if write is not None:
+            write.merge()
 
     base, live = group(step)
     next_base, next_live = ahead_group(step + ahead)
@@ -522,6 +531,13 @@ def _kernel_v3(
         request's last page (their scores are never read) and only issue
         their share of the ahead group's descriptors."""
         wait_pages(live, slot)
+        if write is not None:
+            entry = work_ref[step]
+            write.patch(
+                buf.at[slot],
+                tile_seq_ref[entry >> _TILE_SHIFT] & _SEQ_MASK,
+                (entry & _GROUP_MASK) * pages_per_step,
+            )
         for c in range(num_chunks):
             pages = range(
                 min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
@@ -541,6 +557,99 @@ def _kernel_v3(
             pl.when((step % slots == slot) & (live_chunks > lo) & (live_chunks <= n))(
                 functools.partial(body, slot, n)
             )
+    if write is not None:
+        pl.when(step == num_steps - 1)(write.finish)
+
+
+class _FusedWrite:
+    """A `msa_write` write run by `_kernel_v3` (`block_scores_and_write`):
+    every run's copies start before the page ring's and its merge follows
+    them, so the write's copy latency overlaps the ring's descriptors; a
+    ring page the write rewrites is replaced by its merged copy once its own
+    copy has landed (the ring may have read it before the write landed)."""
+
+    def __init__(self, copies, run_seq_ref, run_block_ref, target: int):
+        self.copies = copies  # msa_write._RunCopies, one buffer slot per run
+        self.run_seq_ref = run_seq_ref  # [R] request of each run
+        self.run_block_ref = run_block_ref  # [R] its page within the request
+        self.target = target  # the write's cache the ring reads
+
+    def _each_run(self, fn):
+        def body(r, carry):
+            fn(r)
+            return carry
+
+        jax.lax.fori_loop(0, self.copies.num_runs(), body, 0)
+
+    def start(self):
+        num_runs = self.copies.num_runs()
+        for r in range(self.copies.layout.depth):
+
+            @pl.when(r < num_runs)
+            def _(r=r):
+                for c in self.copies.in_copies(r, r):
+                    c.start()
+
+    def merge(self):
+        def merge_run(r):
+            for c in self.copies.in_copies(r, r):
+                c.wait()
+            self.copies.merge(r, r)
+            for c in self.copies.out_copies(r, r):
+                c.start()
+
+        self._each_run(merge_run)
+
+    def patch(self, ring_ref, seq, first):
+        """Pages ``[first, first + G)`` of request `seq` in `ring_ref`
+        ``[G, S / p, D]`` (32-bit words): the ones a run wrote, as written."""
+        merged = self.copies.out_bufs[self.target].bitcast(jnp.uint32)
+
+        def patch_run(r):
+            page = self.run_block_ref[r] - first
+            hit = (self.run_seq_ref[r] == seq) & (page >= 0)
+
+            @pl.when(hit & (page < ring_ref.shape[0]))
+            def _():
+                ring_ref[page] = merged[r, :, 0, :]
+
+        self._each_run(patch_run)
+
+    def finish(self):
+        def wait_run(r):
+            for c in self.copies.out_copies(r, r):
+                c.wait()
+
+        self._each_run(wait_run)
+
+
+def _kernel_v3_write(*refs, layout, num_write_inputs: int, target: int, transposed):
+    """`_kernel_v3` with a `_FusedWrite`. Scalar prefetch: `_kernel_v3`'s 4,
+    the write's 5 (`msa_write._RunCopies`), each run's request and page
+    within it; in: the query tile, the write's inputs and its caches (HBM,
+    aliased); out: the scores and the caches; scratch: the ring's, then the
+    write's."""
+    num_caches = len(layout.specs)
+    it = iter(refs)
+    prefetch = [next(it) for _ in range(11)]
+    q_ref = next(it)
+    inputs = [next(it) for _ in range(num_write_inputs)]
+    for _ in range(num_caches):  # the aliased inputs: `caches` below
+        next(it)
+    o_ref = next(it)
+    caches = [next(it) for _ in range(num_caches)]
+    buf, sems, *scratch = it
+    copies = msa_write._RunCopies(layout, prefetch[4:9], inputs, caches, scratch)
+    _kernel_v3(
+        *prefetch[:4],
+        q_ref,
+        caches[target],
+        o_ref,
+        buf,
+        sems,
+        transposed=transposed,
+        write=_FusedWrite(copies, prefetch[9], prefetch[10], target),
+    )
 
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
@@ -614,12 +723,18 @@ def _class_scores(
     scale_cache=None,
     scale_row=None,
     q_pad=None,
+    write=None,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token (`ClassScores`); `token_major` (kernel v3) returns
     them as ``[tiles * block_q, P]`` instead, so a token's scores are one row.
     The query rows are padded by ``q_pad >= block_q`` rows (default
-    `block_q`): classes sharing it share one padded copy."""
+    `block_q`): classes sharing it share one padded copy.
+
+    With ``write = (msa_write.Write, run_seq, run_block, target)`` (kernel
+    v3, token-major), the kernel also writes the step's rows into the
+    write's caches, of which ``caches[target]`` is `index_cache`, scoring
+    the pages it writes as written; returns ``(ClassScores, caches)``."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
     page_size = _page_tokens(rows_per_page, index_cache.dtype)
@@ -740,26 +855,71 @@ def _class_scores(
                 f"pages_per_step must be an even divisor or a multiple of it, "
                 f"got {pages_per_step}"
             )
-        scores_t = pl.pallas_call(
-            functools.partial(_kernel_v3, transposed=token_major),
-            grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=4,
-                grid=grid_spec.grid,
-                in_specs=[grid_spec.in_specs[0], pl.BlockSpec(memory_space=pl.ANY)],
-                out_specs=out_specs,
-                scratch_shapes=[
-                    pltpu.VMEM(
-                        (_RING_SLOTS, pages_per_step, rows_per_page, head_dim),
-                        jnp.uint32,
-                    ),
-                    pltpu.SemaphoreType.DMA((_RING_SLOTS,)),
-                ],
+        ring = [
+            pltpu.VMEM(
+                (_RING_SLOTS, pages_per_step, rows_per_page, head_dim), jnp.uint32
             ),
-            out_shape=out_shape,
-            compiler_params=params,
-            interpret=interpret,
-            name="minimax_m3_msa_block_scores",
-        )(work, tile_info, block_tables, seq_pages, q_rows, index_cache)
+            pltpu.SemaphoreType.DMA((_RING_SLOTS,)),
+        ]
+        prefetch = (work, tile_info, block_tables, seq_pages)
+        if write is None:
+            scores_t = pl.pallas_call(
+                functools.partial(_kernel_v3, transposed=token_major),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=4,
+                    grid=grid_spec.grid,
+                    in_specs=[
+                        grid_spec.in_specs[0],
+                        pl.BlockSpec(memory_space=pl.ANY),
+                    ],
+                    out_specs=out_specs,
+                    scratch_shapes=ring,
+                ),
+                out_shape=out_shape,
+                compiler_params=params,
+                interpret=interpret,
+                name="minimax_m3_msa_block_scores",
+            )(*prefetch, q_rows, index_cache)
+        else:
+            plan, run_seq, run_block, target = write
+            if not token_major or plan.caches[target] is not index_cache:
+                raise ValueError("a fused write needs token-major v3 scores")
+            prefetch += (*plan.prefetch, run_seq, run_block)
+            any_spec = pl.BlockSpec(memory_space=pl.ANY)
+            first_cache = len(prefetch) + 1 + len(plan.inputs)
+            scores_t, *caches = pl.pallas_call(
+                functools.partial(
+                    _kernel_v3_write,
+                    layout=plan.layout,
+                    num_write_inputs=len(plan.inputs),
+                    target=target,
+                    transposed=token_major,
+                ),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=len(prefetch),
+                    grid=grid_spec.grid,
+                    in_specs=[grid_spec.in_specs[0]]
+                    + [any_spec] * (len(plan.inputs) + len(plan.caches)),
+                    out_specs=[out_specs] + [any_spec] * len(plan.caches),
+                    scratch_shapes=ring + plan.scratch,
+                ),
+                out_shape=[out_shape]
+                + [jax.ShapeDtypeStruct(c.shape, c.dtype) for c in plan.caches],
+                input_output_aliases={
+                    first_cache + i: 1 + i for i in range(len(plan.caches))
+                },
+                compiler_params=pltpu.CompilerParams(
+                    dimension_semantics=("arbitrary",),
+                    disable_bounds_checks=True,
+                    vmem_limit_bytes=(
+                        _RING_SLOTS * pages_per_step * rows_per_page * head_dim * 4
+                        + plan.vmem_bytes
+                        + (16 << 20)
+                    ),
+                ),
+                interpret=interpret,
+                name="minimax_m3_msa_block_scores",
+            )(*prefetch, q_rows, *plan.inputs, *plan.caches)
     else:
         kernel_fn = _KERNELS[kernel]
         if fp4:
@@ -791,9 +951,10 @@ def _class_scores(
     offset = tok - lookup(tile_start, seq)
     col = (lookup(first_tile, seq) + offset // block_q) * block_q + offset % block_q
     col = jnp.clip(col, 0, max_tiles * block_q - 1)
-    return ClassScores(
+    scored = ClassScores(
         scores_t, col, tile_seq, tile_row0, num_tiles, first_tile, tile_start
     )
+    return scored if write is None else (scored, caches)
 
 
 class _ClassPlan(NamedTuple):
@@ -1053,3 +1214,48 @@ def block_scores(
         return with_large()[:, None, :]
     # Decode steps have no large request: skip its kernel call and gather.
     return jax.lax.cond(jnp.any(is_large), with_large, small_only)[:, None, :]
+
+
+def block_scores_and_write(
+    index_q: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    num_seqs: jax.Array,
+    write: msa_write.Write,
+    run_seq: jax.Array,
+    run_block: jax.Array,
+    *,
+    target: int,
+    interpret: bool = False,
+    **options,
+) -> tuple[jax.Array, list[jax.Array]]:
+    """`block_scores` of a step with no request over `block_q` rows (decode)
+    whose kernel also makes `write` (`msa_write.plan_write`, one buffer slot
+    per run), of which ``write.caches[target]`` is the index cache scored:
+    the write's copies overlap the page ring's instead of running as a
+    kernel of their own ahead of it. ``run_seq`` / ``run_block`` give each
+    run's request and its page within the request (the column of `scores`).
+    Returns ``(scores [T, 1, P], the write's caches)``; `options` as
+    `block_scores`' tile options (`msa.block_score_options`)."""
+    index_cache = write.caches[target]
+    plan = class_plan(
+        index_q,
+        index_cache,
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        num_seqs,
+        interpret=interpret,
+        **options,
+    )
+    if plan.max_large or not plan.token_major:
+        raise ValueError(
+            "a fused write scores steps of small requests only, token-major"
+        )
+    (small, small_col, *_), caches = plan.small(
+        write=(write, run_seq, run_block, target)
+    )
+    pages = max(small.shape[1], plan.large_pages)
+    rows = small[small_col]
+    return jnp.pad(rows, ((0, 0), (0, pages - rows.shape[1])))[:, None, :], caches
