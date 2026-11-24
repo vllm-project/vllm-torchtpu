@@ -81,3 +81,69 @@ def test_pair_shift_falls_back_on_out_of_range_rows(monkeypatch):
     mask = want[2]
     assert mask[10].any()
     np.testing.assert_array_equal(got[3][mask], want[3][mask])
+
+
+def _written_pool(pool, table, step, dcp):
+    keys, complete, req, logical, starts, context = step
+    return np.asarray(
+        jax.jit(
+            lambda *a: pooled_qsa.write_compressed(
+                pool, *a, table, RATIO, **({"dcp": dcp} if dcp else {})
+            )
+        )(keys, complete, req, logical, starts, context)
+    )
+
+
+@pytest.mark.parametrize("dcp", [False, True])
+@pytest.mark.parametrize(
+    "lens,contexts",
+    [
+        ((4,), (129,)),  # one request's verify rows
+        ((4, 4), (37, 1022)),
+        ((1,) * 8, (5, 0, 77, 130, 3, 255, 64, 9)),  # draft loop rows
+        ((4,) * 4, (11, 300, 4, 1000)),
+        ((3, 17, 1, 11), (9, 0, 1023, 61)),
+        ((4,) * 8, (2, 7, 130, 61, 900, 33, 0, 512)),
+        ((4,) * 16, tuple(range(3, 1000, 62))),  # 64 rows
+        ((1, 1, 1, 509), (37, 4, 130, 6)),  # 512 rows: the shift path
+    ],
+)
+def test_pair_shift_min_rows(lens, contexts, dcp, monkeypatch):
+    """Under _PAIR_SHIFT_MIN_ROWS key rows the flag keeps the gather: every
+    output equals the flag-off one bit for bit, and the pool written is the
+    one the ungated shift path writes. From that many rows up the gate
+    changes nothing."""
+    from jax.experimental import pallas as pl
+
+    original = pl.pallas_call
+    monkeypatch.setattr(
+        pl,
+        "pallas_call",
+        lambda *args, **kwargs: original(*args, **{**kwargs, "interpret": True}),
+    )
+    pool = jnp.asarray(
+        np.random.default_rng(7).normal(size=(64, 256, 1, 128)), jnp.bfloat16
+    )
+    table = jnp.arange(16 * 4, dtype=jnp.int32).reshape(16, 4) % 64
+    step = _step(lens, contexts, seed=sum(lens) + len(lens))
+    dcp_arg = (jnp.asarray([1], jnp.int32), 2) if dcp else None
+    rows = sum(lens)
+    off = _pairs(False, monkeypatch, pool, table, step, dcp_arg)
+    gated = _pairs(True, monkeypatch, pool, table, step, dcp_arg)
+    gated_pool = _written_pool(pool, table, step, dcp_arg)
+    monkeypatch.setattr(pooled_qsa, "_PAIR_SHIFT_MIN_ROWS", 0)
+    ungated = _pairs(True, monkeypatch, pool, table, step, dcp_arg)
+    ungated_pool = _written_pool(pool, table, step, dcp_arg)
+    assert off[2].any()
+    if rows < 128:
+        for g, w in zip(gated, off):
+            np.testing.assert_array_equal(g, w)
+    else:
+        for g, w in zip(gated, ungated):
+            np.testing.assert_array_equal(g, w)
+    for g, w in zip(ungated[:3], off[:3]):
+        np.testing.assert_array_equal(g, w)
+    np.testing.assert_array_equal(ungated[3][off[2]], off[3][off[2]])
+    np.testing.assert_array_equal(
+        gated_pool.view(np.uint16), ungated_pool.view(np.uint16)
+    )
