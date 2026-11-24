@@ -587,10 +587,9 @@ def test_phase_grid_has_prefill_columns_on_prefill_role() -> None:
     # The roles differ, so a prefill column cannot pass on the decode layout.
     assert roles["decode"] != roles["prefill"]
 
-    model_without_deployment = next(
-        name for name in advisor.MODEL_PRESETS if name not in advisor.DEPLOYMENT_PRESETS
+    plain_seed = workbench_phase.build_phase_grid_seed(
+        "unregistered-model-for-plain-seed"
     )
-    plain_seed = workbench_phase.build_phase_grid_seed(model_without_deployment)
     assert plain_seed["roles"] == {}
     assert plain_seed["prefill_token_grid"] == []
     assert plain_seed["t_grid"] == seed["t_grid"]

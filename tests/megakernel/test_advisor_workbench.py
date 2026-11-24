@@ -895,7 +895,7 @@ def test_workbench_multicall_snap_and_inspecting_scope_sync(tmp_path: Path) -> N
     row_limit_16 = 16
     batch_32 = 32
     sweep_38 = advisor.advise_regimes(
-        "qwen3.8-2.4t",
+        "kimi-k3",
         "tpu7x",
         options=advisor.RegimeSweepOptions(
             base_workload=advisor.WorkloadSpec(max_rows_per_call=row_limit_16)
@@ -926,7 +926,7 @@ def test_workbench_multicall_snap_and_inspecting_scope_sync(tmp_path: Path) -> N
     dec_high_reg = sweep_38.regimes[dec_high_idx]
     dec_high_par = sweep_38.parallelism
     expected_report = advisor.advise(
-        "qwen3.8-2.4t",
+        "kimi-k3",
         advisor.WorkloadSpec(
             phase=dec_high_reg.phase,
             batch=batch_32,
@@ -1302,7 +1302,6 @@ def test_coalesced_bucket_schedule_updates_splits(tmp_path: Path) -> None:
 PHASE_MAP_CONTEXT_TOKENS = constants.PHASE_S_GRID[0]
 KIMI_DECODE_ROWS = (8, 64, 128)
 QWEN_DECODE_ROWS = (16, 64)
-MODEL_WITHOUT_DEPLOYMENT = "qwen3.5-0.8b"
 
 
 def _phase_grid_seed_from_html(html_text: str) -> dict[str, object]:
@@ -1391,7 +1390,9 @@ def _phase_snapshots(
     return {str(snapshot["tag"]): snapshot for snapshot in snapshots}
 
 
-def test_phase_map_shows_recommended_scope_on_each_role(tmp_path: Path) -> None:
+def test_phase_map_shows_recommended_scope_on_each_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Verify the phase map runs each column block on its deployment role."""
     kimi_sweep = advisor.advise_regimes("kimi-k3", "tpu7x")
     # The rendered report hands the workbench the role layouts of this model.
@@ -1446,13 +1447,10 @@ def test_phase_map_shows_recommended_scope_on_each_role(tmp_path: Path) -> None:
     )
 
     # A model without a deployment entry has decode columns only.
-    assert MODEL_WITHOUT_DEPLOYMENT not in models.DEPLOYMENT_PRESETS
+    monkeypatch.delitem(models.DEPLOYMENT_PRESETS, "glm-5.2")
+    assert "glm-5.2" not in models.DEPLOYMENT_PRESETS
     plain_row = _phase_map_row(
-        str(
-            _phase_snapshots(tmp_path, MODEL_WITHOUT_DEPLOYMENT, [])["initial"][
-                "phaseMapSvg"
-            ]
-        )
+        str(_phase_snapshots(tmp_path, "glm-5.2", [])["initial"]["phaseMapSvg"])
     )
     assert len(plain_row) == len(constants.PHASE_T_GRID)
     assert all(phase == "decode" for phase, _ in plain_row)
@@ -1809,15 +1807,15 @@ def test_workbench_renders_support_tier_and_unmodeled_notes() -> None:
     for note in kimi_sweep.unmodeled_notes:
         assert html.escape(note, quote=True) in notes_inner
 
-    mistral_sweep = advisor.advise_regimes("mistral-large", "tpu7x")
-    mistral_html = advisor.render_advisor_html(mistral_sweep)
-    mistral_tier = _extract_element_inner_html(mistral_html, "wb-support-tier")
-    assert html.unescape(mistral_tier).strip() == mistral_sweep.support_tier
-    expected_mistral_title = html.escape(
-        specs.SUPPORT_TIER_DESCRIPTIONS[mistral_sweep.support_tier], quote=True
+    glm_sweep = advisor.advise_regimes("glm-5.2", "tpu7x")
+    glm_html = advisor.render_advisor_html(glm_sweep)
+    glm_tier = _extract_element_inner_html(glm_html, "wb-support-tier")
+    assert html.unescape(glm_tier).strip() == glm_sweep.support_tier
+    expected_glm_title = html.escape(
+        specs.SUPPORT_TIER_DESCRIPTIONS[glm_sweep.support_tier], quote=True
     )
-    assert f'id="wb-support-tier" title="{expected_mistral_title}"' in mistral_html
-    assert 'id="wb-unmodeled-notes"' not in mistral_html
+    assert f'id="wb-support-tier" title="{expected_glm_title}"' in glm_html
+    assert 'id="wb-unmodeled-notes"' not in glm_html
 
 
 def test_workbench_auto_regime_upper_band_matches_python(tmp_path: Path) -> None:

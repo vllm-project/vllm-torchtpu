@@ -6,7 +6,7 @@ The `vllm_torchtpu.megakernel.advisor` package evaluates whether a model and ser
 
 ### 1. Prior Estimate (`estimate`)
 
-Evaluate HBM fit, the ideal-kernel VMEM token ceiling, roofline step floor, and uncertainty bands on CPU without an attached TPU or PyTorch runtime:
+Evaluate HBM fit, the ideal-kernel VMEM token ceiling, roofline step floor, and uncertainty bands without a TPU or `jax` installation:
 
 ```bash
 python -m vllm_torchtpu.megakernel.advisor estimate \
@@ -117,20 +117,22 @@ Run `--list-models` to print every shipped preset grouped by tier, its dtype bas
 | Tier | Meaning |
 | --- | --- |
 | `declared` | A megakernel is declared for at least one serving layout. |
-| `core_families` | Every layer family and weight dtype has a megakernel/core counterpart. Not a claim that it was run. |
 | `priced_only` | Priced by the advisor. A layer family or weight dtype has no megakernel/core counterpart. |
-| `partly_unmodeled` | A layer family is not priced, or the model type is not recognized. |
 
 ## Adding a Model
 
-1. Save a trimmed snapshot of the cited `config.json` under `tests/megakernel/data/advisor/hf_configs/` with its repository ID and revision.
-2. Add the preset to `data/presets/models.json` with a `dtype_basis` (`config`, `assumed`, or `unverified`).
-3. Run the preset tests, which compare every preset entry against the parsed snapshot.
-4. Optional: add a deployment entry in `data/presets/deployments.json` and a `megakernel` block with a `source_ref`.
+Only validated presets (`qwen3.5-397b`, `kimi-k3`, `glm-5.2`) are accepted; any other config or model fails closed with `UnsupportedArchitectureError` so unmodeled layer semantics or serving quirks are never silently priced.
+
+To onboard a new model:
+
+1. Save the full authentic `config.json` (untrimmed, wrapped with `repo_id` and `revision`) under `tests/megakernel/data/advisor/hf_configs/`.
+2. Add the verified preset and aliases to `data/presets/models.json` with `dtype_basis: "config"`.
+3. Add a deployment entry in `data/presets/deployments.json` (and a `megakernel` block with a verifiable `source_ref` if a fused runtime exists).
+4. Record a serving or device-trace validation point and run the advisor test suite (which checks every shipped preset against its full authentic snapshot and verifies unsupported configs fail closed).
 
 ## Config Files
 
-`--config` reads quantization skip lists (`ignore`, `modules_to_not_convert`) and a nested `dsa_config`. A config file, directory, or mapping whose architecture equals a shipped preset, and whose dense and expert dtypes equal it when the preset's dtype basis is `config`, takes that preset's name, layouts, and declarations. One that is only named like a preset is priced as `<name>-custom` with no declaration. A preset name with dtype overrides keeps the preset's declarations. When `--config` is used on the CLI, one status line on stderr states whether the loaded config matched a shipped preset. Any layer family the advisor does not price is reported as a blocker.
+`--config` reads quantization skip lists (`ignore`, `modules_to_not_convert`) and nested `dsa_config` blocks, and matches the parsed geometry and config dtypes against the shipped presets. A config matching a shipped preset adopts that preset's name, layouts, and declarations and prints one confirmation line on stderr. Any config that does not match a validated preset raises `UnsupportedArchitectureError` listing the supported repositories and pointing to the onboarding section above. Passing a preset name with CLI dtype overrides keeps that preset's declarations.
 
 ## Drift Gates
 

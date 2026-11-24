@@ -2085,19 +2085,9 @@ def test_cli_list_models_explicit_tiers(
     assert "priced as physics only" not in listing_text
 
     expected_tiers: dict[str, str] = {
-        "deepseek-v3": "priced_only",
         "glm-5.2": "priced_only",
-        "gpt-oss-120b": "priced_only",
         "kimi-k3": "declared",
-        "kimi-k3.1-pro": "priced_only",
-        "llama-3.1-405b": "priced_only",
-        "llama-4-maverick": "core_families",
-        "mistral-large": "priced_only",
-        "mixtral-8x22b": "core_families",
-        "qwen3-30b-a3b": "core_families",
-        "qwen3.5-0.8b": "priced_only",
         "qwen3.5-397b": "declared",
-        "qwen3.8-2.4t": "priced_only",
     }
     assert set(expected_tiers) == set(advisor.MODEL_PRESETS)
 
@@ -2105,11 +2095,8 @@ def test_cli_list_models_explicit_tiers(
     for preset_name, expected_tier in expected_tiers.items():
         entry_text = entries_by_preset[preset_name]
         assert f"tier={expected_tier}" in entry_text
-        dtype_basis = models.MODEL_PRESET_DTYPE_BASIS[preset_name]
-        if dtype_basis == "unverified":
-            assert "not re-read" in entry_text
-        elif dtype_basis == "assumed":
-            assert "assumed serving dtype" in entry_text
+        assert models.MODEL_PRESET_DTYPE_BASIS[preset_name] == "config"
+        assert "dtypes from the cited config" in entry_text
 
     kimi_entry = entries_by_preset["kimi-k3"]
     kimi_deployment = advisor.DEPLOYMENT_PRESETS["kimi-k3"]
