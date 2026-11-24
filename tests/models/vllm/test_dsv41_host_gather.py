@@ -15,9 +15,17 @@ from vllm_torchtpu.models.vllm.deepseek_v41.common.host_gather import (
 @pytest.mark.parametrize("dim,blocks", [(32, 1), (256, 8), (96, 3)])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("layer_slice", [False, True])
+@pytest.mark.parametrize("threads", [1, 2, 3, 4, 7])
 def test_gather_weight_scale(
-    rows: int, dim: int, blocks: int, index_dtype: torch.dtype, layer_slice: bool
+    rows: int,
+    dim: int,
+    blocks: int,
+    index_dtype: torch.dtype,
+    layer_slice: bool,
+    threads: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("VLLM_TPU_ENGRAM_GATHER_THREADS", str(threads))
     generator = torch.Generator().manual_seed(123)
     weight = torch.randint(256, (67, dim), dtype=torch.uint8, generator=generator)
     scales = torch.randint(256, (67, blocks), dtype=torch.uint8, generator=generator)
@@ -58,4 +66,22 @@ def test_gather_weight_scale_rejects_invalid_row(
             torch.tensor([index], dtype=index_dtype),
             torch.empty((1, 32), dtype=torch.uint8),
             torch.empty((1, 1), dtype=torch.uint8),
+        )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("bad_row", [0, 1023, 2047])
+def test_gather_weight_scale_rejects_invalid_row_in_any_range(
+    bad_row: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_TPU_ENGRAM_GATHER_THREADS", "4")
+    indices = torch.zeros((2048, 4), dtype=torch.int64)
+    indices[bad_row, 2] = 67
+    with pytest.raises(IndexError, match="outside the host table"):
+        gather_weight_scale(
+            torch.zeros((67, 32), dtype=torch.uint8),
+            torch.zeros((67, 1), dtype=torch.uint8),
+            indices,
+            torch.empty((indices.numel(), 32), dtype=torch.uint8),
+            torch.empty((indices.numel(), 1), dtype=torch.uint8),
         )

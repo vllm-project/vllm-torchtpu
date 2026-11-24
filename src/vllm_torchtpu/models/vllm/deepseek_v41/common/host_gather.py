@@ -4,18 +4,20 @@
 
 import ctypes
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from functools import cache
 
 import numpy as np
 import torch
 from numba import njit
 
+from vllm_torchtpu import envs
+
 
 @cache
-def _gather_pool() -> ThreadPoolExecutor:
-    # The caller copies one half; one persistent worker copies the other.
-    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="engram-gather")
+def _gather_pool(workers: int) -> ThreadPoolExecutor:
+    # The caller copies the last token range; persistent workers copy the rest.
+    return ThreadPoolExecutor(max_workers=workers, thread_name_prefix="engram-gather")
 
 
 os.register_at_fork(after_in_child=_gather_pool.cache_clear)
@@ -49,7 +51,7 @@ def gather_weight_scale(
     raw_out: torch.Tensor,
     scale_out: torch.Tensor,
 ) -> None:
-    """Gather paired rows with two copy threads and compiled row copies."""
+    """Gather paired rows over VLLM_TPU_ENGRAM_GATHER_THREADS copy threads."""
     tensors = (weight, scales, indices, raw_out, scale_out)
     if any(tensor.device.type != "cpu" for tensor in tensors):
         raise ValueError("Paired host gather requires CPU tensors")
@@ -79,31 +81,38 @@ def gather_weight_scale(
         raw_array = _host_array(raw_out, np.dtype(np.uint8))
         scale_out_array = _host_array(scale_out, np.dtype(np.uint8))
         tokens, heads = index_array.shape
-        if tokens < 2:
+        parts = max(1, min(envs.VLLM_TPU_ENGRAM_GATHER_THREADS, tokens))
+        if parts == 1:
             _gather_weight_scale(
                 weight_array, scale_array, index_array, raw_array, scale_out_array
             )
             return
-        middle = tokens // 2
-        pool = _gather_pool()
-        future = pool.submit(
-            _gather_weight_scale,
-            weight_array,
-            scale_array,
-            index_array[:middle],
-            raw_array[: middle * heads],
-            scale_out_array[: middle * heads],
-        )
+        # Contiguous token ranges; with 2 parts the split is tokens // 2 as before.
+        bounds = [tokens * part // parts for part in range(parts + 1)]
+        pool = _gather_pool(parts - 1)
+        futures = [
+            pool.submit(
+                _gather_weight_scale,
+                weight_array,
+                scale_array,
+                index_array[start:end],
+                raw_array[start * heads : end * heads],
+                scale_out_array[start * heads : end * heads],
+            )
+            for start, end in zip(bounds[:-2], bounds[1:-1])
+        ]
         try:
             _gather_weight_scale(
                 weight_array,
                 scale_array,
-                index_array[middle:],
-                raw_array[middle * heads :],
-                scale_out_array[middle * heads :],
+                index_array[bounds[-2] :],
+                raw_array[bounds[-2] * heads :],
+                scale_out_array[bounds[-2] * heads :],
             )
         finally:
             # Even on failure, no writer may outlive the borrowed tensor storage.
+            wait(futures)
+        for future in futures:
             future.result()
 
 
