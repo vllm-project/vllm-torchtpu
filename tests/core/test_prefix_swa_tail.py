@@ -23,7 +23,6 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 
-from vllm_torchtpu.core import block_hash_bytes, packed_prompt_ids
 from vllm_torchtpu.core import prefix_swa_tail as tail
 
 BLOCK = 256
@@ -129,6 +128,8 @@ def serve(manager, request_id, prompt, outputs=(), free=True, array_prompt=False
     ``array_prompt`` builds the request as the engine serves it with
     VLLM_TPU_ENGINE_ARRAY_PROMPT and VLLM_TPU_BLOCK_HASH_BYTES."""
     if array_prompt:
+        block_hash_bytes = pytest.importorskip("vllm_torchtpu.core.block_hash_bytes")
+        packed_prompt_ids = pytest.importorskip("vllm_torchtpu.core.packed_prompt_ids")
         request = packed_prompt_ids._array_prompt_request(Request)(
             request_id,
             packed_prompt_ids.PromptIds(packed_prompt_ids.TYPECODE, prompt),
@@ -226,6 +227,9 @@ def test_extending_turn_adopts_the_writers_window(switch):
 def test_engine_prompt_array_adopts_the_same_window(switch):
     """With the prompt kept as the received array and hashed as bytes, the
     turn hits, adopts and skips the replay as with vLLM's list prompt."""
+    # Skip until block_hash_bytes and packed_prompt_ids land on this branch.
+    block_hash_bytes = pytest.importorskip("vllm_torchtpu.core.block_hash_bytes")
+    packed_prompt_ids = pytest.importorskip("vllm_torchtpu.core.packed_prompt_ids")
     switch(True)
     manager = make_manager()
     writer = serve(manager, "r0", PROMPT, OUTPUT, array_prompt=True)
