@@ -1655,7 +1655,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         keys_meta = metadata[indexer.k_cache.prefix]
                         index_cache = indexer.k_cache.kv_cache
                         attend = None
-                        if tiled and stage_cache is not None and self._source_attends:
+                        if (
+                            count
+                            and tiled
+                            and stage_cache is not None
+                            and self._source_attends
+                        ):
                             main_cache = source.kv_cache
                             pages = self._compressed_pages(
                                 main_cache, source_meta, stage_cache
