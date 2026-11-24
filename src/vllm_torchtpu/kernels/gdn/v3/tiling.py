@@ -37,28 +37,18 @@ def decode_tile_target(num_seqs: int, n_v: int) -> int:
     return next((t for t in DECODE_TILE_SIZES if t * t * n_v <= budget), 1)
 
 
-# Guard 1: at >= 64 value heads per core (Qwen 3.8 at TP=2, Qwen 3.5 at DP=8),
-# the per-head 128x128 float32 chunk tiles spill vector registers to VMEM, so a
-# 128-token chunk costs nearly as much as two 64-token chunks. C = 128 only wins
-# once a batch holds at least 2,048 tokens (16 chunks of 128).
-_HIGH_V_HEAD_THRESHOLD = 64
-_MIN_HIGH_V_HEAD_BATCH_TOKENS_FOR_C128 = 2048
-
-# Guard 2: in a mixed batch, use C = 128 only if at least 256 prefill tokens
-# (two 128-token chunks) can remain once every other active slot is assumed to
-# be a decode or verify window. Bigger chunks save a fixed setup cost per chunk,
-# but each prefill sequence is padded up to a whole chunk, and on a short,
-# ragged prefill part that padding costs more than the setup it saves. The
-# bound is a fixed token count rather than one that grows with the head count:
-# a per-head bound would also cap a lone prefill of a few hundred tokens in the
-# smallest request bucket, which runs 10% to 20% slower at C = 64.
+# In a mixed batch, use C = 128 only if at least 256 prefill tokens (two
+# 128-token chunks) remain once every other active slot is assumed to be a
+# decode or verify window. Bigger chunks amortize per-chunk setup, but each
+# prefill sequence pads up to a whole chunk; below 256 prefill tokens, that
+# ragged-tail padding outweighs the setup saving.
 _MIN_MIXED_PREFILL_TOKENS = 256
-
-# The chunk size both guards fall back to (64).
-_CAPPED_MIXED_TILE_SIZE = MIXED_TILE_SIZES[1]
+_CAPPED_MIXED_TILE_SIZE = 64
 
 
-def has_prefill_tokens(batch_size: int, active_num_seqs: int, window_size: int) -> bool:
+def _has_prefill_tokens(
+    batch_size: int, active_num_seqs: int, window_size: int
+) -> bool:
     """Whether a batch holds more tokens than `active_num_seqs` decode windows.
 
     A pure decode or speculative-verify bucket gives every sequence at most
@@ -70,7 +60,7 @@ def has_prefill_tokens(batch_size: int, active_num_seqs: int, window_size: int) 
     return batch_size > active_num_seqs * window_size
 
 
-def min_prefill_tokens_in_batch(
+def _min_prefill_tokens_in_batch(
     batch_size: int, active_num_seqs: int, window_size: int
 ) -> int:
     """Lower bound on the prefill tokens of a mixed batch.
@@ -86,30 +76,24 @@ def min_prefill_tokens_in_batch(
 def mixed_tile_target(
     batch_size: int,
     active_num_seqs: int,
-    n_v: int,
     window_size: int = 1,
 ) -> int:
     """Returns the speed-optimal upper bound (64 or 128) on the mixed chunk size.
 
-    `calculate_mixed_tile_size` only checks whether a chunk fits in VMEM. Even
-    when C = 128 fits, C = 64 is faster in two cases:
+    `calculate_mixed_tile_size` only checks whether a chunk fits in VMEM. On
+    fragmented mixed steps, up to `active_num_seqs - 1` slots hold
+    `window_size`-token decodes, leaving
+    `batch_size - (active_num_seqs - 1) * window_size` prefill tokens; below
+    256 of them, 128-token ragged-tail padding costs more than the per-chunk
+    overhead it saves, so this caps the chunk at 64.
 
-    1. `n_v >= 64` and `batch_size < 2048`: the 128x128 per-head tiles spill
-       vector registers, and the batch is too short to amortize the spills.
-    2. Fragmented mixed steps: up to `active_num_seqs - 1` slots hold
-       `window_size`-token decodes, leaving
-       `batch_size - (active_num_seqs - 1) * window_size` prefill tokens. Below
-       256 of them, 128-token ragged-tail padding costs more than the per-chunk
-       overhead it saves.
-
-    Pure decode/verify buckets (no prefill tokens, see `has_prefill_tokens`)
-    are left uncapped at 128.
+    Single-sequence prefills and pure decode/verify buckets (no prefill tokens,
+    see `_has_prefill_tokens`) are left uncapped at 128.
 
     Args:
         batch_size: Token count of the compiled batch bucket (`qkv.shape[0]`),
             which the caller has already padded; not the number of live tokens.
         active_num_seqs: Upper bound on active sequences in the batch.
-        n_v: Number of value heads per device.
         window_size: Tokens per decode or speculative-verify sequence.
 
     Returns:
@@ -117,20 +101,13 @@ def mixed_tile_target(
     """
     max_chunk = MIXED_TILE_SIZES[0]
 
-    # Guard 1: register spills at high value-head counts.
-    if (
-        n_v >= _HIGH_V_HEAD_THRESHOLD
-        and batch_size < _MIN_HIGH_V_HEAD_BATCH_TOKENS_FOR_C128
-    ):
-        return _CAPPED_MIXED_TILE_SIZE
-
-    # Guard 2: ragged-tail padding on fragmented mixed steps. Only a batch
-    # with more than one active sequence and at least one prefill token can
-    # be fragmented; a single prefill or a pure decode/verify bucket is not.
-    if active_num_seqs > 1 and has_prefill_tokens(
+    # Only a batch with more than one active sequence and at least one prefill
+    # token can be fragmented; a single prefill or pure decode/verify bucket
+    # cannot.
+    if active_num_seqs > 1 and _has_prefill_tokens(
         batch_size, active_num_seqs, window_size
     ):
-        effective_prefill_tokens = min_prefill_tokens_in_batch(
+        effective_prefill_tokens = _min_prefill_tokens_in_batch(
             batch_size, active_num_seqs, window_size
         )
         if effective_prefill_tokens < _MIN_MIXED_PREFILL_TOKENS:
@@ -404,7 +381,7 @@ def get_tile_sizes(
     compiles with window_size = 1 under mixed_vmem_limit_bytes.
 
     Args:
-        batch_size: Total unpadded token count in the batch.
+        batch_size: Token count of the compiled batch bucket (`qkv.shape[0]`).
         num_seqs: Total number of sequence slots.
         padded_batch_size: Padded token count in the batch.
         n_kq: Number of key/query heads.
@@ -448,7 +425,10 @@ def get_tile_sizes(
     if mixed_tile_size is None or mixed_tile_size <= 0:
         # Take the smaller of the largest chunk that fits in VMEM
         # (`calculate_mixed_tile_size`) and the speed-optimal chunk bound
-        # (`mixed_tile_target`), mirroring `decode_tile_size` above.
+        # (`mixed_tile_target`), mirroring `decode_tile_size` above. When
+        # `num_seqs` is a static slot capacity (e.g., DCP=4), `mixed_tile_target`
+        # only caps down to 64 and skips `padded_batch_size <= active_num_seqs *
+        # window_size`.
         vmem_fit = calculate_mixed_tile_size(
             seq_len=batch_size,
             n_kq=n_kq,
@@ -464,9 +444,8 @@ def get_tile_sizes(
         )
         mixed_tile_size = min(
             mixed_tile_target(
-                batch_size=batch_size,
+                batch_size=padded_batch_size,
                 active_num_seqs=active_num_seqs,
-                n_v=n_v,
                 window_size=window_size,
             ),
             vmem_fit,
