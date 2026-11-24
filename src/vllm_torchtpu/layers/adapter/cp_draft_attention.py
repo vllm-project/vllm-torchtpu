@@ -730,6 +730,12 @@ def attend_pages(
     num_tokens, num_heads, head_dim = q.shape
     num_reqs, num_cols = pages.shape
     q_block = max_query_len
+    # Uniform blocks copy whole blocks unchecked: they must lie inside q.
+    assert not uniform_blocks or num_reqs * q_block <= num_tokens, (
+        num_reqs,
+        q_block,
+        num_tokens,
+    )
     page_size, words, packing, width = kv_cache.shape[1:]
     halves = _halves(kv_cache.shape[1:], dcp // head_ranks)
     page_rows = page_size * words
