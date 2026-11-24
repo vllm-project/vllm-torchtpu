@@ -622,7 +622,6 @@ class ScopeEstimate:
     hbm_us: float = 0.0
     comm_us: float = 0.0
     fill_drain_us: float = 0.0
-    repass_spill_us: float = 0.0
     launch_us: float = 0.0
     step_achievable_upper_us: float = 0.0
     support: SupportStatus = "hypothetical"
