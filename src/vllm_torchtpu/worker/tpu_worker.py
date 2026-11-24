@@ -1012,7 +1012,7 @@ class TPUWorker(WorkerBase):
             reshard_fn=reshard_fn,
         )
 
-    def get_weight_mapping_manifest(self) -> str:
+    def get_weight_mapping_manifest(self, *, expert_axis_grouped: bool = True) -> str:
         """Return the serialized ``weight_mapping`` JSON manifest for this model."""
         from vllm_torchtpu.rl.manifest_generator import generate_manifest
 
@@ -1020,6 +1020,7 @@ class TPUWorker(WorkerBase):
             self.get_model(),
             parallel_config=self.parallel_config,
             model_config=self.model_config,
+            expert_axis_grouped=expert_axis_grouped,
         )
 
     def apply_converted_weights(

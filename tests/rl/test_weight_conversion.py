@@ -16,8 +16,8 @@
 from __future__ import annotations
 
 import ast
-import inspect
 import json
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
@@ -36,757 +36,273 @@ from vllm_torchtpu.rl import (
 )
 
 
-def _make_manifest(
-    rules: list[dict[str, Any]],
-    *,
-    expert_axis_grouped: bool = False,
-    stripes: dict[str, Any] | None = None,
-    tied_keys: list[list[str]] | None = None,
-    dropped_keys: list[str] | None = None,
-) -> dict[str, Any]:
+def _m(rules: list[dict[str, Any]], **kw: Any) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
-        "expert_axis_grouped": expert_axis_grouped,
-        "stripes": {} if stripes is None else stripes,
-        "tied_keys": [] if tied_keys is None else tied_keys,
-        "dropped_keys": [] if dropped_keys is None else dropped_keys,
+        "expert_axis_grouped": False,
+        "stripes": {},
+        "tied_keys": [],
+        "dropped_keys": [],
         "rules": rules,
+        **kw,
     }
 
 
-def _assert_round_trip(
-    manifest: dict[str, Any],
-    src_weights: dict[str, torch.Tensor],
+def _op_m(
+    op: dict[str, Any], src: list[str] | None = None, dst: list[str] | None = None
+) -> dict[str, Any]:
+    return _m([{"source_keys": src or ["a"], "target_keys": dst or ["b"], "ops": [op]}])
+
+
+def _round_trip(
+    manifest: dict[str, Any], src: dict[str, torch.Tensor]
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     validate_manifest(manifest)
-    dst = from_hf(json.dumps(manifest), src_weights)
+    dst = from_hf(json.dumps(manifest), src)
     inv = invert_manifest(manifest)
     validate_manifest(inv)
-    recovered = to_hf(json.dumps(inv), dst)
-    assert set(recovered.keys()) == set(src_weights.keys())
-    for k, orig in src_weights.items():
-        assert recovered[k].dtype == orig.dtype
-        assert recovered[k].shape == orig.shape
-        assert torch.equal(recovered[k], orig), f"Mismatch on key {k}"
-    return dst, recovered
+    rec = to_hf(json.dumps(inv), dst)
+    assert set(rec) == set(src)
+    for k, v in src.items():
+        assert rec[k].dtype == v.dtype and rec[k].shape == v.shape
+        if v.dtype == torch.bfloat16:
+            assert torch.equal(rec[k], v)
+        else:
+            torch.testing.assert_close(rec[k], v, rtol=0, atol=0)
+    return dst, rec
 
 
-# ---------------------------------------------------------------------------
-# All 12 primitive ops: forward & inverse
-# ---------------------------------------------------------------------------
+def test_all_12_ops_round_trip() -> None:
+    g = torch.Generator().manual_seed(0)
 
+    # stack / unstack (positive & negative axis)
+    es = [torch.randn(4, 6, generator=g, dtype=torch.bfloat16) for _ in range(3)]
+    for axis in (0, -1):
+        m = _op_m({"stack": {"axis": axis}}, ["e0", "e1", "e2"], ["stacked"])
+        dst, _ = _round_trip(m, {"e0": es[0], "e1": es[1], "e2": es[2]})
+        assert torch.equal(dst["stacked"], torch.stack(es, dim=axis))
 
-def test_op_stack_and_unstack() -> None:
-    e0 = torch.arange(6, dtype=torch.float32).reshape(2, 3)
-    e1 = torch.arange(6, 12, dtype=torch.float32).reshape(2, 3)
-    e2 = torch.arange(12, 18, dtype=torch.float32).reshape(2, 3)
-
-    manifest = _make_manifest(
-        [
-            {
-                "source_keys": ["e0", "e1", "e2"],
-                "target_keys": ["stacked"],
-                "ops": [{"stack": {"axis": 0}}],
-                "sharding": ["ep", None, None],
-            }
-        ]
+    # concat / split
+    a = torch.randn(4, 8, generator=g, dtype=torch.bfloat16)
+    b = torch.randn(6, 8, generator=g, dtype=torch.bfloat16)
+    dst, _ = _round_trip(
+        _op_m({"concat": {"axis": 0, "sizes": [4, 6]}}, ["a", "b"], ["c"]),
+        {"a": a, "b": b},
     )
-    dst, _ = _assert_round_trip(manifest, {"e0": e0, "e1": e1, "e2": e2})
-    assert torch.equal(dst["stacked"], torch.stack([e0, e1, e2], dim=0))
+    assert torch.equal(dst["c"], torch.cat([a, b], dim=0))
 
-    # Test negative axis stack/unstack
-    manifest_neg = _make_manifest(
-        [
-            {
-                "source_keys": ["e0", "e1"],
-                "target_keys": ["stacked"],
-                "ops": [{"stack": {"axis": -1}}],
-            }
-        ]
+    # reshape & asymmetric transpose
+    x = torch.randn(2, 3, 4, generator=g, dtype=torch.bfloat16)
+    dst, _ = _round_trip(
+        _op_m({"reshape": {"src_shape": [2, 3, 4], "dst_shape": [6, 4]}}), {"a": x}
     )
-    dst_neg, _ = _assert_round_trip(manifest_neg, {"e0": e0, "e1": e1})
-    assert torch.equal(dst_neg["stacked"], torch.stack([e0, e1], dim=-1))
+    assert torch.equal(dst["b"], x.reshape(6, 4))
+    dst, _ = _round_trip(_op_m({"transpose": {"axes": [2, 0, 1]}}), {"a": x})
+    assert torch.equal(dst["b"], x.permute(2, 0, 1))
 
+    # pad / slice
+    p = torch.randn(5, 4, generator=g, dtype=torch.bfloat16)
+    dst, _ = _round_trip(_op_m({"pad": {"axis": 0, "sizes": [1, 2]}}), {"a": p})
+    assert dst["b"].shape == (8, 4) and torch.equal(dst["b"][1:6], p)
+    assert torch.all(dst["b"][:1] == 0) and torch.all(dst["b"][6:] == 0)
 
-def test_op_concat_and_split() -> None:
-    q = torch.arange(12, dtype=torch.float32).reshape(4, 3)
-    k = torch.arange(12, 18, dtype=torch.float32).reshape(2, 3)
-    v = torch.arange(18, 24, dtype=torch.float32).reshape(2, 3)
+    # repeat / mean_pool
+    r = torch.randn(2, 4, generator=g, dtype=torch.bfloat16)
+    dst, _ = _round_trip(_op_m({"repeat": {"axis": 0, "times": 3}}), {"a": r})
+    assert torch.equal(dst["b"], r.repeat_interleave(3, dim=0))
 
-    manifest = _make_manifest(
-        [
-            {
-                "source_keys": ["q", "k", "v"],
-                "target_keys": ["qkv"],
-                "ops": [{"concat": {"axis": 0, "sizes": [4, 2, 2]}}],
-                "sharding": ["tp", None],
-            }
-        ]
+    # scale (bf16 via fp32 compute + fp64 precision preserved)
+    s32 = torch.randn(4, 4, generator=g, dtype=torch.float32)
+    dst, _ = _round_trip(_op_m({"scale": {"factor": 4.0}}), {"a": s32})
+    torch.testing.assert_close(dst["b"], s32 * 4.0)
+    s64 = torch.tensor([1.0 + 1e-12, -2.0 - 3e-13], dtype=torch.float64)
+    dst64, _ = _round_trip(_op_m({"scale": {"factor": 2.0}}), {"a": s64})
+    assert torch.equal(dst64["b"], s64 * 2.0)
+
+    # cast (bf16 <-> fp32, and fp8 if supported)
+    c = torch.randn(4, 4, generator=g, dtype=torch.bfloat16)
+    dst, _ = _round_trip(
+        _op_m({"cast": {"src_dtype": "bfloat16", "dst_dtype": "float32"}}), {"a": c}
     )
-    dst, _ = _assert_round_trip(manifest, {"q": q, "k": k, "v": v})
-    assert torch.equal(dst["qkv"], torch.cat([q, k, v], dim=0))
-
-
-def test_op_reshape() -> None:
-    t = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
-    manifest = _make_manifest(
-        [
-            {
-                "source_keys": ["x"],
-                "target_keys": ["y"],
-                "ops": [{"reshape": {"src_shape": [2, 3, 4], "dst_shape": [6, 4]}}],
-            }
-        ]
-    )
-    dst, _ = _assert_round_trip(manifest, {"x": t})
-    assert torch.equal(dst["y"], t.reshape(6, 4))
-
-
-def test_op_transpose_asymmetric_permutation() -> None:
-    # Non-self-inverse permutation: [2, 0, 1] -> inverse is [1, 2, 0]
-    t = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
-    manifest = _make_manifest(
-        [
-            {
-                "source_keys": ["x"],
-                "target_keys": ["y"],
-                "ops": [{"transpose": {"axes": [2, 0, 1]}}],
-            }
-        ]
-    )
-    dst, _ = _assert_round_trip(manifest, {"x": t})
-    assert dst["y"].shape == (4, 2, 3)
-    assert torch.equal(dst["y"], t.permute(2, 0, 1))
-    inv = invert_manifest(manifest)
-    assert inv["rules"][0]["ops"] == [{"transpose": {"axes": [1, 2, 0]}}]
-
-
-def test_op_scale_float32_compute_and_inverse() -> None:
-    # Power-of-two scale factor gives bit-exact round-trip even in bfloat16.
-    t = torch.tensor([1.5, -2.25, 0.5, 4.0], dtype=torch.bfloat16)
-    manifest = _make_manifest(
-        [
-            {
-                "source_keys": ["x"],
-                "target_keys": ["y"],
-                "ops": [{"scale": {"factor": 0.25}}],
-            }
-        ]
-    )
-    dst, _ = _assert_round_trip(manifest, {"x": t})
-    assert dst["y"].dtype == torch.bfloat16
-    expected = (t.to(torch.float32) * 0.25).to(torch.bfloat16)
-    assert torch.equal(dst["y"], expected)
-
-    # Verify computation happens in float32 (not bfloat16) before casting back.
-    # For a value where f32 multiply differs from bf16 multiply:
-    v = torch.tensor([1.0078125], dtype=torch.bfloat16)  # 1 + 1/128
-    factor = 1.0 / 3.0
-    m = _make_manifest(
-        [
-            {
-                "source_keys": ["x"],
-                "target_keys": ["y"],
-                "ops": [{"scale": {"factor": factor}}],
-            }
-        ]
-    )
-    out = from_hf_impl(m, {"x": v})
-    assert out["y"].dtype == torch.bfloat16
-    assert torch.equal(out["y"], (v.to(torch.float32) * factor).to(torch.bfloat16))
-
-
-def test_op_pad_and_unpad() -> None:
-    t = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
-    # Asymmetric [left, right] padding
-    manifest = _make_manifest(
-        [
-            {
-                "source_keys": ["x"],
-                "target_keys": ["y"],
-                "ops": [{"pad": {"axis": 1, "sizes": [2, 3]}}],
-            }
-        ]
-    )
-    dst, _ = _assert_round_trip(manifest, {"x": t})
-    assert dst["y"].shape == (3, 9)
-    assert torch.all(dst["y"][:, :2] == 0)
-    assert torch.all(dst["y"][:, 6:] == 0)
-    assert torch.equal(dst["y"][:, 2:6], t)
-
-    # Right == 0 edge case (must not trigger slice(left, -0) empty slice bug)
-    manifest_left_only = _make_manifest(
-        [
-            {
-                "source_keys": ["x"],
-                "target_keys": ["y"],
-                "ops": [{"pad": {"axis": 0, "sizes": [1, 0]}}],
-            }
-        ]
-    )
-    dst_l, _ = _assert_round_trip(manifest_left_only, {"x": t})
-    assert dst_l["y"].shape == (4, 4)
-    assert torch.all(dst_l["y"][0] == 0)
-    assert torch.equal(dst_l["y"][1:], t)
-
-
-def test_op_cast() -> None:
-    t = torch.tensor([1.0, -2.5, 3.25], dtype=torch.bfloat16)
-    manifest = _make_manifest(
-        [
-            {
-                "source_keys": ["x"],
-                "target_keys": ["y"],
-                "ops": [{"cast": {"src_dtype": "bfloat16", "dst_dtype": "float32"}}],
-            }
-        ]
-    )
-    dst, _ = _assert_round_trip(manifest, {"x": t})
-    assert dst["y"].dtype == torch.float32
-    assert torch.equal(dst["y"], t.to(torch.float32))
-
-    fp8 = torch.tensor([1.0, -2.0], dtype=torch.float32).to(torch.float8_e4m3fn)
-    m_fp8 = _make_manifest(
-        [
-            {
-                "source_keys": ["x"],
-                "target_keys": ["y"],
-                "ops": [
-                    {"cast": {"src_dtype": "float8_e4m3fn", "dst_dtype": "float32"}}
-                ],
-            }
-        ]
-    )
-    dst_fp8, _ = _assert_round_trip(m_fp8, {"x": fp8})
-    assert dst_fp8["y"].dtype == torch.float32
-
-
-def test_op_repeat_and_unrepeat() -> None:
-    # GQA KV head replication: 2 KV heads repeated 4x -> 8 heads
-    kv = torch.arange(2 * 4 * 8, dtype=torch.float32).reshape(2, 4, 8)
-    manifest = _make_manifest(
-        [
-            {
-                "source_keys": ["kv"],
-                "target_keys": ["kv_rep"],
-                "ops": [{"repeat": {"axis": 0, "times": 4}}],
-            }
-        ]
-    )
-    dst, _ = _assert_round_trip(manifest, {"kv": kv})
-    assert dst["kv_rep"].shape == (8, 4, 8)
-    assert torch.equal(dst["kv_rep"], torch.repeat_interleave(kv, 4, dim=0))
-
-
-# ---------------------------------------------------------------------------
-# Showcases
-# ---------------------------------------------------------------------------
-
-
-def test_showcase_1_rope_complex_pair_permutation() -> None:
-    """Showcase 1: RoPE complex-pair permutation (reshape -> transpose -> reshape)."""
-    num_heads, head_dim, hidden = 4, 8, 16
-    w_q = torch.arange(num_heads * head_dim * hidden, dtype=torch.float32).reshape(
-        num_heads * head_dim, hidden
-    )
-
-    manifest = _make_manifest(
-        [
-            {
-                "source_keys": ["model.layers.0.self_attn.q_proj.weight"],
-                "target_keys": ["layers.0.attn.q_proj.weight"],
-                "ops": [
-                    {
-                        "reshape": {
-                            "src_shape": [num_heads * head_dim, hidden],
-                            "dst_shape": [num_heads, 2, head_dim // 2, hidden],
-                        }
-                    },
-                    {"transpose": {"axes": [0, 2, 1, 3]}},
-                    {
-                        "reshape": {
-                            "src_shape": [num_heads, head_dim // 2, 2, hidden],
-                            "dst_shape": [num_heads * head_dim, hidden],
-                        }
-                    },
-                ],
-                "sharding": ["tp", None],
-            }
-        ]
-    )
-
-    dst, _ = _assert_round_trip(
-        manifest, {"model.layers.0.self_attn.q_proj.weight": w_q}
-    )
-    expected = (
-        w_q.reshape(num_heads, 2, head_dim // 2, hidden)
-        .permute(0, 2, 1, 3)
-        .reshape(num_heads * head_dim, hidden)
-    )
-    assert torch.equal(dst["layers.0.attn.q_proj.weight"], expected)
-
-
-def test_showcase_2_moe_tp_shard_local_gate_up_interleaving() -> None:
-    """Showcase 2: MoE TP shard-local gate/up interleaving.
-
-    Pipeline: pad -> concat -> reshape -> transpose -> reshape -> transpose.
-    Produces per-TP-shard interleaved [gate_shard_i, up_shard_i] layout with
-    transposed inner dims (E, H, 2 * inter_padded).
-    """
-    num_experts = 4
-    inter = 6
-    pad_inter = 2  # inter_padded = 8, divisible by tp_size = 2
-    inter_padded = inter + pad_inter
-    tp_size = 2
-    hidden = 10
-
-    gate = torch.arange(num_experts * inter * hidden, dtype=torch.bfloat16).reshape(
-        num_experts, inter, hidden
-    )
-    up = (
-        torch.arange(num_experts * inter * hidden, dtype=torch.bfloat16).reshape(
-            num_experts, inter, hidden
+    assert dst["b"].dtype == torch.float32
+    if hasattr(torch, "float8_e4m3fn"):
+        f8 = torch.tensor([1.0, -0.5], dtype=torch.float32).to(torch.float8_e4m3fn)
+        dst8, _ = _round_trip(
+            _op_m({"cast": {"src_dtype": "float8_e4m3fn", "dst_dtype": "float32"}}),
+            {"a": f8},
         )
-        + 1000
-    )
+        assert dst8["b"].dtype == torch.float32
 
-    manifest = _make_manifest(
+
+def test_showcases_rope_and_moe_tp_interleaving() -> None:
+    """Showcase 1 (RoPE complex-pair perm) and Showcase 2 (multi-tensor unary pad)."""
+    g = torch.Generator().manual_seed(7)
+    # Showcase 1: [H*D, C] -> swap real/imag halves
+    w = torch.randn(4 * 8, 16, generator=g, dtype=torch.bfloat16)
+    m1 = _m(
         [
             {
-                "source_keys": ["experts.gate_proj", "experts.up_proj"],
-                "target_keys": ["experts.w13_weight"],
+                "source_keys": ["q.weight"],
+                "target_keys": ["q_rope.weight"],
                 "ops": [
-                    {"pad": {"axis": 1, "sizes": [0, pad_inter]}},
-                    {
-                        "concat": {
-                            "axis": 1,
-                            "sizes": [inter_padded, inter_padded],
-                        }
-                    },
-                    {
-                        "reshape": {
-                            "src_shape": [num_experts, 2 * inter_padded, hidden],
-                            "dst_shape": [
-                                num_experts,
-                                2,
-                                tp_size,
-                                inter_padded // tp_size,
-                                hidden,
-                            ],
-                        }
-                    },
-                    {"transpose": {"axes": [0, 2, 1, 3, 4]}},
-                    {
-                        "reshape": {
-                            "src_shape": [
-                                num_experts,
-                                tp_size,
-                                2,
-                                inter_padded // tp_size,
-                                hidden,
-                            ],
-                            "dst_shape": [num_experts, 2 * inter_padded, hidden],
-                        }
-                    },
-                    {"transpose": {"axes": [0, 2, 1]}},
+                    {"reshape": {"src_shape": [32, 16], "dst_shape": [4, 2, 4, 16]}},
+                    {"transpose": {"axes": [0, 2, 1, 3]}},
+                    {"reshape": {"src_shape": [4, 4, 2, 16], "dst_shape": [32, 16]}},
                 ],
-                "sharding": ["ep", None, "moe_tp"],
+            }
+        ]
+    )
+    _round_trip(m1, {"q.weight": w})
+
+    # Showcase 2: 2 inputs -> unary pad broadcasts to both -> concat -> interleave
+    gate = torch.randn(4, 6, 8, generator=g, dtype=torch.bfloat16)
+    up = torch.randn(4, 6, 8, generator=g, dtype=torch.bfloat16)
+    m2 = _m(
+        [
+            {
+                "source_keys": ["gate", "up"],
+                "target_keys": ["w13"],
+                "ops": [
+                    {"pad": {"axis": 1, "sizes": [0, 2]}},
+                    {"reshape": {"src_shape": [4, 8, 8], "dst_shape": [4, 2, 4, 8]}},
+                    {"concat": {"axis": 2, "sizes": [4, 4]}},
+                    {"reshape": {"src_shape": [4, 2, 8, 8], "dst_shape": [4, 16, 8]}},
+                ],
+                "sharding": ["ep", "moe_tp", None],
             }
         ],
         expert_axis_grouped=True,
+        stripes={"ep_size": 2, "moe_tp_size": 2},
     )
-
-    dst, _ = _assert_round_trip(
-        manifest, {"experts.gate_proj": gate, "experts.up_proj": up}
-    )
-    w13 = dst["experts.w13_weight"]
-    assert w13.shape == (num_experts, hidden, 2 * inter_padded)
-
-    # Verify each TP shard has [gate_shard, up_shard] transposed as (H, 2*shard).
-    gate_pad = torch.cat(
-        [gate, torch.zeros(num_experts, pad_inter, hidden, dtype=gate.dtype)], dim=1
-    )
-    up_pad = torch.cat(
-        [up, torch.zeros(num_experts, pad_inter, hidden, dtype=up.dtype)], dim=1
-    )
-    shard_w = inter_padded // tp_size
-    for rank in range(tp_size):
-        s_start = rank * 2 * shard_w
-        shard = w13[:, :, s_start : s_start + 2 * shard_w]
-        expected_shard = torch.cat(
-            [
-                gate_pad[:, rank * shard_w : (rank + 1) * shard_w, :],
-                up_pad[:, rank * shard_w : (rank + 1) * shard_w, :],
-            ],
-            dim=1,
-        ).transpose(1, 2)
-        assert torch.equal(shard, expected_shard)
+    dst2, _ = _round_trip(m2, {"gate": gate, "up": up})
+    assert dst2["w13"].shape == (4, 16, 8)
 
 
-# ---------------------------------------------------------------------------
-# Cardinalities: 1->1, M->1, 1->N, M->N and API wrappers
-# ---------------------------------------------------------------------------
-
-
-def test_round_trip_all_cardinalities() -> None:
-    a = torch.randn(4, 6)
-    b = torch.randn(2, 6)
-    c = torch.randn(6, 4)
-    d = torch.randn(6, 4)
-
-    manifest = _make_manifest(
+def test_cardinalities_and_api_wrappers() -> None:
+    """1->1, N->1, 1->N, N->M, plus from_hf/to_hf/mesh and TypeError checks."""
+    g = torch.Generator().manual_seed(11)
+    a = torch.randn(4, 4, generator=g, dtype=torch.bfloat16)
+    b = torch.randn(4, 4, generator=g, dtype=torch.bfloat16)
+    m = _m(
         [
-            # 1 -> 1 identity
             {
-                "source_keys": ["id_in"],
-                "target_keys": ["id_out"],
-                "ops": [],
-                "sharding": [None, None],
-            },
-            # M -> 1 concat
-            {
-                "source_keys": ["m1_a", "m1_b"],
-                "target_keys": ["m1_out"],
-                "ops": [{"concat": {"axis": 0, "sizes": [4, 2]}}],
-            },
-            # 1 -> N split
-            {
-                "source_keys": ["s_in"],
-                "target_keys": ["s_out0", "s_out1"],
-                "ops": [{"split": {"axis": 0, "sizes": [2, 4]}}],
-            },
-            # M -> N (stack -> transpose -> unstack)
-            {
-                "source_keys": ["mn_0", "mn_1"],
-                "target_keys": ["mn_out0", "mn_out1", "mn_out2", "mn_out3"],
+                "source_keys": ["a", "b"],
+                "target_keys": ["c", "d"],
                 "ops": [
-                    {"stack": {"axis": 0}},
-                    {"transpose": {"axes": [2, 1, 0]}},
-                    {"unstack": {"axis": 0}},
+                    {"concat": {"axis": 0, "sizes": [4, 4]}},
+                    {"split": {"axis": 0, "sizes": [2, 6]}},
                 ],
+            }
+        ]
+    )
+    dst, _ = _round_trip(m, {"a": a, "b": b})
+    assert dst["c"].shape == (2, 4) and dst["d"].shape == (6, 4)
+    assert torch.equal(from_hf_impl(m, {"a": a, "b": b}, mesh=object())["c"], dst["c"])
+    inv = invert_manifest(m)
+    assert torch.equal(to_hf_impl(inv, dst)["a"], a)
+    with pytest.raises(TypeError, match="from_hf expects dst_rule to be str"):
+        from_hf(m, {"a": a, "b": b})  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="to_hf expects src_rule to be str"):
+        to_hf(inv, dst)  # type: ignore[arg-type]
+
+
+def test_tied_keys_dropped_keys_and_chaining_invariants() -> None:
+    emb = torch.randn(8, 4, dtype=torch.bfloat16)
+    norm = torch.randn(4, dtype=torch.bfloat16)
+    m = _m(
+        [
+            {"source_keys": ["embed"], "target_keys": ["embed"], "ops": []},
+            {"source_keys": ["norm"], "target_keys": ["norm"], "ops": []},
+            {"source_keys": ["drop_src"], "target_keys": ["__tmp__:d"], "ops": []},
+            {"source_keys": ["__tmp__:d"], "target_keys": ["drop_dst"], "ops": []},
+        ],
+        tied_keys=[["embed", "lm_head"]],
+        dropped_keys=["drop_src"],
+    )
+    out = execute_manifest(m, {"embed": emb, "norm": norm})
+    assert set(out) == {"embed", "norm", "lm_head"} and torch.equal(out["lm_head"], emb)
+    inv = invert_manifest(
+        _m(
+            [
+                {"source_keys": ["embed"], "target_keys": ["embed"], "ops": []},
+                {"source_keys": ["norm"], "target_keys": ["norm"], "ops": []},
+            ],
+            tied_keys=[["embed", "lm_head"]],
+        )
+    )
+    assert inv["tied_keys"] == []
+    rec = execute_manifest(inv, out)
+    assert set(rec) == {"embed", "norm"}
+
+    # Same-name source key reused across rules is not pruned or clobbered.
+    x = torch.tensor([1.0, 2.0])
+    m_reuse = _m(
+        [
+            {
+                "source_keys": ["x"],
+                "target_keys": ["x"],
+                "ops": [{"scale": {"factor": 2.0}}],
+            },
+            {
+                "source_keys": ["x"],
+                "target_keys": ["y"],
+                "ops": [{"scale": {"factor": 3.0}}],
             },
         ]
     )
-    src = {
-        "id_in": a,
-        "m1_a": a,
-        "m1_b": b,
-        "s_in": torch.cat([a, b], dim=0),
-        "mn_0": c,
-        "mn_1": d,
-    }
-    _assert_round_trip(manifest, src)
+    res = execute_manifest(m_reuse, {"x": x})
+    torch.testing.assert_close(res["x"], x * 2.0)
+    torch.testing.assert_close(res["y"], x * 3.0)
 
 
-def test_api_wrappers_and_mesh_compat() -> None:
-    manifest = _make_manifest(
-        [{"source_keys": ["w"], "target_keys": ["w_out"], "ops": []}]
-    )
-    manifest_json = json.dumps(manifest)
-    t = torch.tensor([1.0, 2.0])
-
-    # mesh argument is accepted for protocol compatibility
-    out1 = from_hf(manifest_json, {"w": t}, mesh=object())
-    out2 = from_hf_impl(manifest, {"w": t}, mesh=object())
-    out3 = execute_manifest(manifest_json, {"w": t}, mesh=object())
-    assert torch.equal(out1["w_out"], t)
-    assert torch.equal(out2["w_out"], t)
-    assert torch.equal(out3["w_out"], t)
-
-    inv = invert_manifest(manifest_json)
-    back1 = to_hf(json.dumps(inv), out1)
-    back2 = to_hf_impl(inv, out1)
-    assert torch.equal(back1["w"], t)
-    assert torch.equal(back2["w"], t)
-
-    with pytest.raises(TypeError):
-        from_hf(manifest, {"w": t})  # type: ignore[arg-type]
-    with pytest.raises(TypeError):
-        to_hf(inv, out1)  # type: ignore[arg-type]
-
-
-# ---------------------------------------------------------------------------
-# tied_keys and dropped_keys
-# ---------------------------------------------------------------------------
-
-
-def test_tied_keys_and_dropped_keys() -> None:
-    embed = torch.randn(16, 8)
-    norm = torch.randn(8)
-
-    manifest = _make_manifest(
+def test_chained_rules_gqa_qkv_tp_interleaving() -> None:
+    """Option 1 __tmp__:* chaining for heterogeneous GQA QKV + KV replication."""
+    g = torch.Generator().manual_seed(99)
+    q = torch.randn(8, 16, generator=g, dtype=torch.bfloat16)
+    k = torch.randn(2, 16, generator=g, dtype=torch.bfloat16)
+    v = torch.randn(2, 16, generator=g, dtype=torch.bfloat16)
+    m = _m(
         [
             {
-                "source_keys": ["model.embed_tokens.weight"],
-                "target_keys": ["model.embed_tokens.weight"],
-                "ops": [],
+                "source_keys": ["q"],
+                "target_keys": ["__tmp__:q"],
+                "ops": [{"reshape": {"src_shape": [8, 16], "dst_shape": [4, 2, 16]}}],
             },
             {
-                "source_keys": ["model.norm.weight"],
-                "target_keys": ["model.norm.weight"],
-                "ops": [],
+                "source_keys": ["k"],
+                "target_keys": ["__tmp__:k"],
+                "ops": [
+                    {"reshape": {"src_shape": [2, 16], "dst_shape": [2, 1, 16]}},
+                    {"repeat": {"axis": 0, "times": 2}},
+                ],
             },
             {
-                "source_keys": ["visual.patch_embed.weight"],
-                "target_keys": ["visual.patch_embed.weight"],
-                "ops": [],
+                "source_keys": ["v"],
+                "target_keys": ["__tmp__:v"],
+                "ops": [
+                    {"reshape": {"src_shape": [2, 16], "dst_shape": [2, 1, 16]}},
+                    {"repeat": {"axis": 0, "times": 2}},
+                ],
+            },
+            {
+                "source_keys": ["__tmp__:q", "__tmp__:k", "__tmp__:v"],
+                "target_keys": ["qkv"],
+                "ops": [
+                    {"concat": {"axis": 1, "sizes": [2, 1, 1]}},
+                    {"reshape": {"src_shape": [4, 4, 16], "dst_shape": [16, 16]}},
+                ],
+                "sharding": ["tp", None],
             },
         ],
-        tied_keys=[
-            ["model.embed_tokens.weight", "lm_head.weight"],
-            ["model.embed_tokens.weight", "dropped_tie.weight"],
-            ["missing_src.weight", "ignored_tie.weight"],
-        ],
-        dropped_keys=["visual.patch_embed.weight", "dropped_tie.weight"],
+        stripes={"tp_size": 4},
     )
-
-    # Note: dropped source key is intentionally omitted from src_weights.
-    out = from_hf_impl(
-        manifest,
-        {"model.embed_tokens.weight": embed, "model.norm.weight": norm},
-    )
-    assert set(out.keys()) == {
-        "model.embed_tokens.weight",
-        "lm_head.weight",
-        "model.norm.weight",
-    }
-    assert torch.equal(out["lm_head.weight"], embed)
-    # Tied copy is independent of the source tensor.
-    out["lm_head.weight"].zero_()
-    assert torch.equal(out["model.embed_tokens.weight"], embed)
-
-    # Inverse skips the dropped rule cleanly.
-    inv = invert_manifest(manifest)
-    recovered = to_hf_impl(inv, out)
-    assert set(recovered.keys()) == {
-        "model.embed_tokens.weight",
-        "model.norm.weight",
-    }
-    assert torch.equal(recovered["model.embed_tokens.weight"], embed)
-    assert torch.equal(recovered["model.norm.weight"], norm)
+    dst, _ = _round_trip(m, {"q": q, "k": k, "v": v})
+    assert set(dst) == {"qkv"} and dst["qkv"].shape == (16, 16)
 
 
-# ---------------------------------------------------------------------------
-# Strict ValueError validation checks
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "bad_manifest",
-    [
-        "not a mapping",
-        {"schema_version": "wrong_version", "rules": []},
-        {"rules": []},
-        {"schema_version": SCHEMA_VERSION},
-        {"schema_version": SCHEMA_VERSION, "rules": [], "extra_top": 1},
-        {"schema_version": SCHEMA_VERSION, "rules": [], "expert_axis_grouped": 1},
-        {"schema_version": SCHEMA_VERSION, "rules": [], "stripes": [1, 2]},
-        {"schema_version": SCHEMA_VERSION, "rules": [], "stripes": None},
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [],
-            "stripes": {"qkv": {"axis": 0}},
-        },
-        {"schema_version": SCHEMA_VERSION, "rules": [], "stripes": {"tp_size": 0}},
-        {"schema_version": SCHEMA_VERSION, "rules": [], "stripes": {"tp_size": -2}},
-        {"schema_version": SCHEMA_VERSION, "rules": [], "stripes": {"tp_size": True}},
-        {"schema_version": SCHEMA_VERSION, "rules": [], "stripes": {"tp_size": "4"}},
-        {"schema_version": SCHEMA_VERSION, "rules": [], "stripes": {"tp_size": 2.0}},
-        {"schema_version": SCHEMA_VERSION, "rules": [], "stripes": {1: 4}},
-        {"schema_version": SCHEMA_VERSION, "rules": [], "tied_keys": ["not_a_pair"]},
-        {"schema_version": SCHEMA_VERSION, "rules": [], "tied_keys": [["a"]]},
-        {"schema_version": SCHEMA_VERSION, "rules": [], "dropped_keys": [123]},
-        {"schema_version": SCHEMA_VERSION, "rules": "not_a_list"},
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [],
-                    "unknown_rule_key": True,
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [{"source_keys": [], "target_keys": ["b"], "ops": []}],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [{"source_keys": ["a"], "target_keys": [1], "ops": []}],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [],
-                    "sharding": [123],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"unknown_op": {}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"stack": {"axis": 0}, "unstack": {"axis": 0}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"stack": {"axis": True}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"scale": {"factor": 0.0}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"scale": {"factor": float("nan")}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"scale": {"factor": True}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"reshape": {"src_shape": [2, 3], "dst_shape": [2, 4]}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"reshape": {"src_shape": [-1, 3], "dst_shape": [2, 3]}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"transpose": {"axes": [0, 0]}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"pad": {"axis": 0, "sizes": [1]}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"pad": {"axis": 0, "sizes": [-1, 2]}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"cast": {"src_dtype": "float32", "dst_dtype": "int999"}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"repeat": {"axis": 0, "times": 0}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"concat": {"axis": 0, "sizes": [0, 2]}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"stack": {"axis": 0, "extra": 1}}],
-                }
-            ],
-        },
-    ],
-)
-def test_validate_manifest_rejects_invalid_schemas(bad_manifest: Any) -> None:
-    with pytest.raises(ValueError):
-        validate_manifest(bad_manifest)
-
-
-def test_validate_manifest_accepts_strict_mode_edge_cases() -> None:
-    """MappingProxyType, tuple sequences, int scale.factor, and 0-D ops."""
-    manifest = MappingProxyType(
+def test_validate_manifest_strict_edge_cases() -> None:
+    """MappingProxyType, tuples, int scale.factor, and 0-D reshape/transpose."""
+    m = MappingProxyType(
         {
             "schema_version": SCHEMA_VERSION,
             "expert_axis_grouped": False,
@@ -813,15 +329,32 @@ def test_validate_manifest_accepts_strict_mode_edge_cases() -> None:
             ),
         }
     )
-    validate_manifest(manifest)
+    validate_manifest(m)
 
 
 @pytest.mark.parametrize(
-    "bad_manifest",
+    "bad",
     [
+        "{not json",
+        "[]",
+        {"schema_version": "wrong", "rules": []},
+        {"rules": []},
+        {"schema_version": SCHEMA_VERSION, "rules": [], "extra_key": 1},
+        {"schema_version": SCHEMA_VERSION, "rules": [], "expert_axis_grouped": "yes"},
         {"schema_version": SCHEMA_VERSION, "rules": [], "expert_axis_grouped": None},
+        {"schema_version": SCHEMA_VERSION, "rules": [], "stripes": {"tp": 0}},
+        {"schema_version": SCHEMA_VERSION, "rules": [], "stripes": {"tp": True}},
+        {"schema_version": SCHEMA_VERSION, "rules": [], "tied_keys": [["only_one"]]},
         {"schema_version": SCHEMA_VERSION, "rules": [], "tied_keys": None},
         {"schema_version": SCHEMA_VERSION, "rules": [], "dropped_keys": None},
+        {
+            "schema_version": SCHEMA_VERSION,
+            "rules": [{"source_keys": [], "target_keys": ["b"], "ops": []}],
+        },
+        {
+            "schema_version": SCHEMA_VERSION,
+            "rules": [{"source_keys": ["a"], "target_keys": ["b"]}],
+        },
         {
             "schema_version": SCHEMA_VERSION,
             "rules": [
@@ -836,326 +369,58 @@ def test_validate_manifest_accepts_strict_mode_edge_cases() -> None:
         {
             "schema_version": SCHEMA_VERSION,
             "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"scale": {"factor": float("inf")}}],
-                }
+                {"source_keys": ["a"], "target_keys": ["b"], "ops": [], "extra": 1}
             ],
         },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"scale": {"factor": -float("inf")}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{"scale": {"factor": -0.0}}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{}],
-                }
-            ],
-        },
-        {
-            "schema_version": SCHEMA_VERSION,
-            "rules": [
-                {
-                    "source_keys": ["a"],
-                    "target_keys": ["b"],
-                    "ops": [{123: {"axis": 0}}],
-                }
-            ],
-        },
+        _op_m({"unknown_op": {}}),
+        _op_m({"scale": {"factor": 0}}),
+        _op_m({"scale": {"factor": True}}),
+        _op_m({"scale": {"factor": float("nan")}}),
+        _op_m({"scale": {"factor": float("inf")}}),
+        _op_m({"scale": {"factor": -float("inf")}}),
+        _op_m({"reshape": {"src_shape": [2, 3], "dst_shape": [2, 4]}}),
+        _op_m({"reshape": {"src_shape": [-1, 3], "dst_shape": [2, 3]}}),
+        _op_m({"transpose": {"axes": [0, 0]}}),
+        _op_m({"pad": {"axis": 0, "sizes": [1]}}),
+        _op_m({"pad": {"axis": 0, "sizes": [-1, 2]}}),
+        _op_m({"cast": {"src_dtype": "float32", "dst_dtype": "int999"}}),
+        _op_m({"repeat": {"axis": 0, "times": 0}}),
+        _op_m({"concat": {"axis": 0, "sizes": [0, 2]}}),
+        _op_m({"stack": {"axis": 0, "extra": 1}}),
     ],
 )
-def test_validate_manifest_rejects_strict_mode_edge_cases(bad_manifest: Any) -> None:
+def test_validate_manifest_rejects_invalid_schemas(bad: Any) -> None:
     with pytest.raises(ValueError):
-        validate_manifest(bad_manifest)
+        validate_manifest(bad)
 
 
-def test_runtime_shape_size_and_dtype_mismatches_raise_value_error() -> None:
-    # reshape src_shape mismatch
-    m_reshape = _make_manifest(
-        [
-            {
-                "source_keys": ["x"],
-                "target_keys": ["y"],
-                "ops": [{"reshape": {"src_shape": [2, 3], "dst_shape": [3, 2]}}],
-            }
-        ]
-    )
+def test_runtime_mismatches_raise_errors() -> None:
+    t = torch.zeros(4, 4, dtype=torch.float32)
+    with pytest.raises(KeyError, match="missing source weight"):
+        execute_manifest(_op_m({"scale": {"factor": 2.0}}), {})
     with pytest.raises(ValueError, match="reshape"):
-        execute_manifest(m_reshape, {"x": torch.zeros(3, 2)})
-
-    # concat width mismatch
-    m_concat = _make_manifest(
-        [
-            {
-                "source_keys": ["a", "b"],
-                "target_keys": ["c"],
-                "ops": [{"concat": {"axis": 0, "sizes": [4, 2]}}],
-            }
-        ]
-    )
-    with pytest.raises(ValueError, match="concat"):
-        execute_manifest(m_concat, {"a": torch.zeros(3, 2), "b": torch.zeros(2, 2)})
-
-    # split sum(sizes) mismatch
-    m_split = _make_manifest(
-        [
-            {
-                "source_keys": ["c"],
-                "target_keys": ["a", "b"],
-                "ops": [{"split": {"axis": 0, "sizes": [4, 2]}}],
-            }
-        ]
-    )
-    with pytest.raises(ValueError, match="split"):
-        execute_manifest(m_split, {"c": torch.zeros(5, 2)})
-
-    # cast src_dtype mismatch
-    m_cast = _make_manifest(
-        [
-            {
-                "source_keys": ["x"],
-                "target_keys": ["y"],
-                "ops": [{"cast": {"src_dtype": "bfloat16", "dst_dtype": "float32"}}],
-            }
-        ]
-    )
+        execute_manifest(
+            _op_m({"reshape": {"src_shape": [2, 8], "dst_shape": [16]}}), {"a": t}
+        )
     with pytest.raises(ValueError, match="cast"):
-        execute_manifest(m_cast, {"x": torch.zeros(2, dtype=torch.float32)})
-
-    # unpad exceeding dim
-    m_unpad = _make_manifest(
-        [
-            {
-                "source_keys": ["x"],
-                "target_keys": ["y"],
-                "ops": [{"unpad": {"axis": 0, "sizes": [3, 3]}}],
-            }
-        ]
-    )
-    with pytest.raises(ValueError, match="unpad"):
-        execute_manifest(m_unpad, {"x": torch.zeros(4, 2)})
-
-    # unrepeat non-divisible dim
-    m_unrepeat = _make_manifest(
-        [
-            {
-                "source_keys": ["x"],
-                "target_keys": ["y"],
-                "ops": [{"unrepeat": {"axis": 0, "times": 3}}],
-            }
-        ]
-    )
-    with pytest.raises(ValueError, match="unrepeat"):
-        execute_manifest(m_unrepeat, {"x": torch.zeros(5, 2)})
-
-    # invalid JSON string
-    with pytest.raises(ValueError, match="Invalid manifest JSON"):
-        execute_manifest("{not valid json", {})
-
-
-def test_chained_rules_gqa_qkv_tp_interleaving() -> None:
-    """Chained rules for heterogeneous GQA qkv_proj with KV replication."""
-    tp_size = 4
-    num_q_heads = 8  # 2 Q heads per TP rank
-    num_kv_heads = 2  # replicated 2x across 4 TP ranks
-    kv_rep = tp_size // num_kv_heads
-    head_dim = 4
-    hidden = 6
-
-    q_shard = (num_q_heads // tp_size) * head_dim
-    k_shard = head_dim
-    v_shard = head_dim
-
-    q = torch.arange(num_q_heads * head_dim * hidden, dtype=torch.bfloat16).reshape(
-        num_q_heads * head_dim, hidden
-    )
-    k = (
-        torch.arange(num_kv_heads * head_dim * hidden, dtype=torch.bfloat16).reshape(
-            num_kv_heads * head_dim, hidden
+        execute_manifest(
+            _op_m({"cast": {"src_dtype": "bfloat16", "dst_dtype": "float32"}}), {"a": t}
         )
-        + 1000
-    )
-    v = (
-        torch.arange(num_kv_heads * head_dim * hidden, dtype=torch.bfloat16).reshape(
-            num_kv_heads * head_dim, hidden
+    with pytest.raises(ValueError, match="concat"):
+        execute_manifest(
+            _op_m({"concat": {"axis": 0, "sizes": [2, 4]}}, ["a", "b"], ["c"]),
+            {"a": t, "b": t},
         )
-        + 2000
-    )
-
-    manifest = _make_manifest(
-        [
-            {
-                "source_keys": ["q_proj.weight"],
-                "target_keys": ["__q_tp"],
-                "ops": [
-                    {
-                        "reshape": {
-                            "src_shape": [num_q_heads * head_dim, hidden],
-                            "dst_shape": [tp_size, q_shard, hidden],
-                        }
-                    }
-                ],
-            },
-            {
-                "source_keys": ["k_proj.weight"],
-                "target_keys": ["__k_tp"],
-                "ops": [
-                    {
-                        "reshape": {
-                            "src_shape": [num_kv_heads * head_dim, hidden],
-                            "dst_shape": [num_kv_heads, k_shard, hidden],
-                        }
-                    },
-                    {"repeat": {"axis": 0, "times": kv_rep}},
-                ],
-            },
-            {
-                "source_keys": ["v_proj.weight"],
-                "target_keys": ["__v_tp"],
-                "ops": [
-                    {
-                        "reshape": {
-                            "src_shape": [num_kv_heads * head_dim, hidden],
-                            "dst_shape": [num_kv_heads, v_shard, hidden],
-                        }
-                    },
-                    {"repeat": {"axis": 0, "times": kv_rep}},
-                ],
-            },
-            {
-                "source_keys": ["__q_tp", "__k_tp", "__v_tp"],
-                "target_keys": ["qkv_proj.weight"],
-                "ops": [
-                    {"concat": {"axis": 1, "sizes": [q_shard, k_shard, v_shard]}},
-                    {
-                        "reshape": {
-                            "src_shape": [
-                                tp_size,
-                                q_shard + k_shard + v_shard,
-                                hidden,
-                            ],
-                            "dst_shape": [
-                                tp_size * (q_shard + k_shard + v_shard),
-                                hidden,
-                            ],
-                        }
-                    },
-                ],
-                "sharding": ["tp", None],
-            },
-        ],
-        stripes={"tp_size": tp_size, "kv_tp_size": tp_size},
-    )
-
-    src = {"q_proj.weight": q, "k_proj.weight": k, "v_proj.weight": v}
-    dst, recovered = _assert_round_trip(manifest, src)
-
-    # Intermediate keys must be pruned from output.
-    assert set(dst.keys()) == {"qkv_proj.weight"}
-    assert set(recovered.keys()) == set(src.keys())
-
-    # Each contiguous TP shard holds [Q_r; K_{r // kv_rep}; V_{r // kv_rep}].
-    qkv = dst["qkv_proj.weight"]
-    shard_rows = q_shard + k_shard + v_shard
-    assert qkv.shape == (tp_size * shard_rows, hidden)
-    for rank in range(tp_size):
-        actual_shard = qkv[rank * shard_rows : (rank + 1) * shard_rows]
-        kv_idx = rank // kv_rep
-        expected_shard = torch.cat(
-            [
-                q[rank * q_shard : (rank + 1) * q_shard],
-                k[kv_idx * k_shard : (kv_idx + 1) * k_shard],
-                v[kv_idx * v_shard : (kv_idx + 1) * v_shard],
-            ],
-            dim=0,
-        )
-        assert torch.equal(actual_shard, expected_shard)
+    with pytest.raises(ValueError, match="axis"):
+        execute_manifest(_op_m({"pad": {"axis": 5, "sizes": [0, 1]}}), {"a": t})
 
 
-def test_same_name_source_key_reused_across_rules_not_pruned() -> None:
-    """A source key written to the same name and reused by a later rule stays in out."""
-    x = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
-    manifest = _make_manifest(
-        [
-            {
-                "source_keys": ["x"],
-                "target_keys": ["x"],
-                "ops": [{"scale": {"factor": 2.0}}],
-            },
-            {
-                "source_keys": ["x"],
-                "target_keys": ["y"],
-                "ops": [{"scale": {"factor": 3.0}}],
-            },
-        ]
-    )
-
-    out = execute_manifest(manifest, {"x": x})
-    assert set(out.keys()) == {"x", "y"}
-    assert torch.equal(out["x"], x * 2.0)
-    assert torch.equal(out["y"], x * 3.0)
-
-
-def test_dropped_downstream_rule_prunes_tmp_intermediates() -> None:
-    """Skipping a downstream rule via dropped_keys must not leak __tmp__:* keys."""
-    q = torch.randn(4, 6)
-    norm = torch.randn(6)
-    manifest = _make_manifest(
-        [
-            {
-                "source_keys": ["q_proj.weight"],
-                "target_keys": ["__tmp__:q_tp"],
-                "ops": [{"reshape": {"src_shape": [4, 6], "dst_shape": [2, 2, 6]}}],
-            },
-            {
-                "source_keys": ["__tmp__:q_tp", "k_proj.weight"],
-                "target_keys": ["qkv_proj.weight"],
-                "ops": [{"concat": {"axis": 1, "sizes": [2, 2]}}],
-            },
-            {
-                "source_keys": ["norm.weight"],
-                "target_keys": ["norm.weight"],
-                "ops": [],
-            },
-        ],
-        dropped_keys=["k_proj.weight"],
-    )
-
-    out = execute_manifest(manifest, {"q_proj.weight": q, "norm.weight": norm})
-    assert set(out.keys()) == {"norm.weight"}
-    assert torch.equal(out["norm.weight"], norm)
-
-
-def test_zero_jax_imports() -> None:
-    import vllm_torchtpu.rl as rl_pkg
-    import vllm_torchtpu.rl.weight_conversion as wc_mod
-
-    for mod in (rl_pkg, wc_mod):
-        tree = ast.parse(inspect.getsource(mod))
+def test_rl_package_has_zero_jax_imports() -> None:
+    rl_dir = Path(__file__).resolve().parents[2] / "src" / "vllm_torchtpu" / "rl"
+    for py_file in rl_dir.glob("*.py"):
+        tree = ast.parse(py_file.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
-                for alias in node.names:
-                    assert not alias.name.startswith("jax")
-            elif isinstance(node, ast.ImportFrom):
-                assert not (node.module and node.module.startswith("jax"))
+                assert all(not a.name.startswith("jax") for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                assert not node.module.startswith("jax")

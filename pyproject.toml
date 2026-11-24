@@ -76,9 +76,6 @@ dependencies = [
     # scripts/vllm/benchmarking/configs/ were tuned against an earlier libtpu;
     # re-verify those runs when bumping.
     "libtpu==0.0.50",
-    # Imported directly by src/vllm_torchtpu/rl/weight_conversion.py, so
-    # declared here rather than leaned on as a vLLM transitive.
-    "pydantic>=2",
     "ray[default]",
     "ray[data]",
 ]
@@ -285,7 +282,6 @@ ignore-missing-imports = [
     "pathwaysutils", "pathwaysutils.*",
     "portpicker", "portpicker.*",
     "prometheus_client", "prometheus_client.*",
-    "pydantic", "pydantic.*",
     "ray", "ray.*",
     "requests", "requests.*",
     "sympy", "sympy.*",

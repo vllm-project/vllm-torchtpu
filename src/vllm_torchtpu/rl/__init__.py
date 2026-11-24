@@ -22,6 +22,7 @@ from vllm_torchtpu.rl.manifest_generator import (
 from vllm_torchtpu.rl.weight_conversion import (
     SCHEMA_VERSION,
     OpName,
+    OpSpec,
     RuleSpec,
     execute_manifest,
     from_hf,
@@ -34,6 +35,7 @@ from vllm_torchtpu.rl.weight_conversion import (
 
 __all__ = [
     "OpName",
+    "OpSpec",
     "RuleSpec",
     "SCHEMA_VERSION",
     "execute_manifest",

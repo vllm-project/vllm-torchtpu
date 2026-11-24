@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pure-PyTorch 12-op executor, schema validator, and manifest inverter.
+"""Pure-PyTorch 12-op executor, validator, and inverter for ``weight_mapping``.
 
-Implements the Distributed RL Weight Conversion Protocol using only ``torch.*``
-operations (zero JAX imports).
+Implements the Distributed RL Weight Conversion Protocol (zero JAX imports)
+with Option 1 rule chaining (``__tmp__:*`` intermediates) for heterogeneous
+fused TP layers.
 """
 
 from __future__ import annotations
@@ -22,384 +23,412 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
-from enum import StrEnum
-from typing import Annotated, Any, Literal, Self
+from enum import Enum
+from typing import Any, TypeGuard
 
 import torch
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-
-RuleSpec = Mapping[str, Any] | str
 
 SCHEMA_VERSION = "weight_mapping"
-_INTERMEDIATE_KEY_PREFIX = "__tmp__:"
 
 
-class OpName(StrEnum):
-    """Supported self-invertible primitive op names."""
-
-    STACK = "stack"
-    UNSTACK = "unstack"
-    CONCAT = "concat"
-    SPLIT = "split"
+class OpName(str, Enum):
     RESHAPE = "reshape"
     TRANSPOSE = "transpose"
-    SCALE = "scale"
+    SPLIT = "split"
+    CONCAT = "concat"
+    STACK = "stack"
+    UNSTACK = "unstack"
+    SLICE = "slice"
     PAD = "pad"
-    UNPAD = "unpad"
-    CAST = "cast"
     REPEAT = "repeat"
-    UNREPEAT = "unrepeat"
+    MEAN_POOL = "mean_pool"
+    SCALE = "scale"
+    CAST = "cast"
 
+
+OpSpec = dict[str, dict[str, Any]]
+RuleSpec = str | Mapping[str, Any]
 
 _DTYPE_MAP: dict[str, torch.dtype] = {
     "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
     "float16": torch.float16,
+    "fp16": torch.float16,
     "float32": torch.float32,
+    "fp32": torch.float32,
     "float64": torch.float64,
-    "float8_e4m3fn": torch.float8_e4m3fn,
-    "float8_e5m2": torch.float8_e5m2,
-    "int8": torch.int8,
-    "int16": torch.int16,
+    "fp64": torch.float64,
     "int32": torch.int32,
     "int64": torch.int64,
+    "int8": torch.int8,
     "uint8": torch.uint8,
     "bool": torch.bool,
 }
+for _fp8_name in ("float8_e4m3fn", "float8_e5m2"):
+    if hasattr(torch, _fp8_name):
+        _DTYPE_MAP[_fp8_name] = getattr(torch, _fp8_name)
 
-_PositiveInt = Annotated[int, Field(ge=1)]
-_NonNegInt = Annotated[int, Field(ge=0)]
-_NonEmptyStrSeq = Annotated[Sequence[str], Field(min_length=1)]
-_StrPair = Annotated[Sequence[str], Field(min_length=2, max_length=2)]
-_NonEmptyPosIntSeq = Annotated[Sequence[_PositiveInt], Field(min_length=1)]
-_NonNegIntPair = Annotated[Sequence[_NonNegInt], Field(min_length=2, max_length=2)]
-
-
-class _StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _coerce_mapping(cls, data: Any) -> Any:
-        if isinstance(data, Mapping) and not isinstance(data, dict):
-            return dict(data)
-        return data
+_TOP_KEYS = frozenset(
+    {
+        "schema_version",
+        "expert_axis_grouped",
+        "stripes",
+        "tied_keys",
+        "dropped_keys",
+        "rules",
+    }
+)
+_RULE_KEYS = frozenset({"source_keys", "target_keys", "ops", "sharding"})
 
 
-class _AxisKwargs(_StrictModel):
-    axis: int
+def _is_int(x: Any) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
 
 
-class _ConcatSplitKwargs(_StrictModel):
-    axis: int
-    sizes: _NonEmptyPosIntSeq
+def _is_seq(x: Any) -> TypeGuard[Sequence[Any]]:
+    return isinstance(x, Sequence) and not isinstance(x, (str, bytes))
 
 
-class _ReshapeKwargs(_StrictModel):
-    src_shape: Sequence[_NonNegInt]
-    dst_shape: Sequence[_NonNegInt]
+def _check_keys(obj: Mapping[str, Any], expected: set[str], ctx: str) -> None:
+    keys = set(obj.keys())
+    if keys != expected:
+        raise ValueError(f"{ctx}: expected keys {sorted(expected)}, got {sorted(keys)}")
 
-    @model_validator(mode="after")
-    def _check_element_count(self) -> Self:
-        if math.prod(self.src_shape) != math.prod(self.dst_shape):
+
+def _check_pos_ints(seq: Any, ctx: str) -> list[int]:
+    if not _is_seq(seq) or len(seq) == 0 or not all(_is_int(v) and v > 0 for v in seq):
+        raise ValueError(f"{ctx}: expected non-empty sequence of positive ints")
+    return [int(v) for v in seq]
+
+
+def _validate_op(op: Any, ctx: str) -> None:
+    if not isinstance(op, Mapping) or len(op) != 1:
+        raise ValueError(f"{ctx}: each op must be a single-key mapping {{op: kwargs}}")
+    op_name, kw = next(iter(op.items()))
+    if not isinstance(kw, Mapping):
+        raise ValueError(f"{ctx}: kwargs for {op_name!r} must be a mapping")
+
+    if op_name == OpName.RESHAPE:
+        _check_keys(kw, {"src_shape", "dst_shape"}, f"{ctx}.reshape")
+        for field in ("src_shape", "dst_shape"):
+            shape = kw[field]
+            if not _is_seq(shape) or not all(_is_int(v) and v > 0 for v in shape):
+                raise ValueError(f"{ctx}.reshape.{field}: expected positive int dims")
+        if math.prod(kw["src_shape"]) != math.prod(kw["dst_shape"]):
             raise ValueError(
-                f"reshape: element count mismatch between "
-                f"src_shape={list(self.src_shape)} and "
-                f"dst_shape={list(self.dst_shape)}"
+                f"{ctx}.reshape: src_shape and dst_shape element counts differ"
             )
-        return self
+    elif op_name == OpName.TRANSPOSE:
+        _check_keys(kw, {"axes"}, f"{ctx}.transpose")
+        axes = kw["axes"]
+        if not _is_seq(axes) or not all(_is_int(a) for a in axes):
+            raise ValueError(f"{ctx}.transpose.axes: expected int sequence")
+        if sorted(int(a) for a in axes) != list(range(len(axes))):
+            raise ValueError(f"{ctx}.transpose.axes: must be a permutation of 0..N-1")
+    elif op_name in (OpName.SPLIT, OpName.CONCAT):
+        _check_keys(kw, {"axis", "sizes"}, f"{ctx}.{op_name}")
+        if not _is_int(kw["axis"]):
+            raise ValueError(f"{ctx}.{op_name}.axis: expected int")
+        _check_pos_ints(kw["sizes"], f"{ctx}.{op_name}.sizes")
+    elif op_name in (OpName.STACK, OpName.UNSTACK):
+        _check_keys(kw, {"axis"}, f"{ctx}.{op_name}")
+        if not _is_int(kw["axis"]):
+            raise ValueError(f"{ctx}.{op_name}.axis: expected int")
+    elif op_name in (OpName.SLICE, OpName.PAD):
+        _check_keys(kw, {"axis", "sizes"}, f"{ctx}.{op_name}")
+        if not _is_int(kw["axis"]):
+            raise ValueError(f"{ctx}.{op_name}.axis: expected int")
+        sizes = kw["sizes"]
+        if (
+            not _is_seq(sizes)
+            or len(sizes) != 2
+            or not all(_is_int(v) and v >= 0 for v in sizes)
+        ):
+            raise ValueError(f"{ctx}.{op_name}.sizes: expected [left, right] >= 0")
+    elif op_name in (OpName.REPEAT, OpName.MEAN_POOL):
+        _check_keys(kw, {"axis", "times"}, f"{ctx}.{op_name}")
+        if not _is_int(kw["axis"]) or not (_is_int(kw["times"]) and kw["times"] > 0):
+            raise ValueError(f"{ctx}.{op_name}: expected int axis and times > 0")
+    elif op_name == OpName.SCALE:
+        _check_keys(kw, {"factor"}, f"{ctx}.scale")
+        f = kw["factor"]
+        if (
+            not isinstance(f, (int, float))
+            or isinstance(f, bool)
+            or not math.isfinite(f)
+            or f == 0
+        ):
+            raise ValueError(f"{ctx}.scale.factor: expected finite non-zero number")
+    elif op_name == OpName.CAST:
+        _check_keys(kw, {"src_dtype", "dst_dtype"}, f"{ctx}.cast")
+        for field in ("src_dtype", "dst_dtype"):
+            if not isinstance(kw[field], str) or kw[field] not in _DTYPE_MAP:
+                raise ValueError(f"{ctx}.cast.{field}: unknown dtype {kw[field]!r}")
+    else:
+        raise ValueError(f"{ctx}: unknown op {op_name!r}")
 
 
-class _TransposeKwargs(_StrictModel):
-    axes: Sequence[_NonNegInt]
-
-    @field_validator("axes")
-    @classmethod
-    def _check_permutation(cls, v: Sequence[int]) -> Sequence[int]:
-        if sorted(v) != list(range(len(v))):
-            raise ValueError(
-                f"transpose.axes: must be a permutation of 0..{len(v) - 1}, "
-                f"got {list(v)}"
-            )
-        return v
-
-
-class _ScaleKwargs(_StrictModel):
-    factor: Annotated[float, Field(allow_inf_nan=False)]
-
-    @field_validator("factor")
-    @classmethod
-    def _check_non_zero(cls, v: float) -> float:
-        if v == 0:
-            raise ValueError(f"scale.factor: must be finite and non-zero, got {v}")
-        return v
-
-
-class _PadUnpadKwargs(_StrictModel):
-    axis: int
-    sizes: _NonNegIntPair
-
-
-class _CastKwargs(_StrictModel):
-    src_dtype: str
-    dst_dtype: str
-
-    @field_validator("src_dtype", "dst_dtype")
-    @classmethod
-    def _check_dtype(cls, v: str) -> str:
-        if v not in _DTYPE_MAP:
-            raise ValueError(f"cast: unsupported dtype {v!r}")
-        return v
-
-
-class _RepeatUnrepeatKwargs(_StrictModel):
-    axis: int
-    times: _PositiveInt
-
-
-_OP_KWARGS_MODELS: dict[str, type[_StrictModel]] = {
-    OpName.STACK: _AxisKwargs,
-    OpName.UNSTACK: _AxisKwargs,
-    OpName.CONCAT: _ConcatSplitKwargs,
-    OpName.SPLIT: _ConcatSplitKwargs,
-    OpName.RESHAPE: _ReshapeKwargs,
-    OpName.TRANSPOSE: _TransposeKwargs,
-    OpName.SCALE: _ScaleKwargs,
-    OpName.PAD: _PadUnpadKwargs,
-    OpName.UNPAD: _PadUnpadKwargs,
-    OpName.CAST: _CastKwargs,
-    OpName.REPEAT: _RepeatUnrepeatKwargs,
-    OpName.UNREPEAT: _RepeatUnrepeatKwargs,
-}
-
-
-class _RuleModel(_StrictModel):
-    source_keys: _NonEmptyStrSeq
-    target_keys: _NonEmptyStrSeq
-    ops: Sequence[Mapping[str, Any]]
-    sharding: Sequence[str | None] = Field(default_factory=list)
-
-    @field_validator("ops")
-    @classmethod
-    def _validate_ops(
-        cls, v: Sequence[Mapping[str, Any]]
-    ) -> Sequence[Mapping[str, Any]]:
-        for idx, op in enumerate(v):
-            if len(op) != 1:
-                raise ValueError(
-                    f"ops[{idx}]: each op must be a single-key mapping "
-                    f"{{op_name: kwargs}}"
-                )
-            op_name, kwargs = next(iter(op.items()))
-            if op_name not in _OP_KWARGS_MODELS:
-                raise ValueError(f"ops[{idx}]: unknown op {op_name!r}")
-            _OP_KWARGS_MODELS[op_name].model_validate(kwargs)
-        return v
-
-
-class _ManifestModel(_StrictModel):
-    schema_version: Literal["weight_mapping"]
-    expert_axis_grouped: bool = False
-    stripes: Mapping[str, _PositiveInt] = Field(default_factory=dict)
-    tied_keys: Sequence[_StrPair] = Field(default_factory=list)
-    dropped_keys: Sequence[str] = Field(default_factory=list)
-    rules: Sequence[_RuleModel]
-
-
-def validate_manifest(spec: Mapping[str, Any]) -> None:
-    """Strictly validate a ``weight_mapping`` manifest dictionary.
-
-    Args:
-        spec: Parsed manifest mapping to validate.
-
-    Raises:
-        ValueError: On any unknown key, unknown op, missing required field, or
-            type/schema mismatch.
-    """
-    _ManifestModel.model_validate(spec)
-
-
-def _parse_manifest(spec: RuleSpec) -> dict[str, Any]:
-    if isinstance(spec, str):
+def _parse_manifest(manifest: RuleSpec) -> dict[str, Any]:
+    if isinstance(manifest, str):
         try:
-            parsed = json.loads(spec)
+            data = json.loads(manifest)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid manifest JSON: {exc}") from exc
-        if not isinstance(parsed, Mapping):
-            raise ValueError(
-                f"Manifest JSON must decode to a JSON object, "
-                f"got {type(parsed).__name__}"
-            )
-        return dict(parsed)
-    if isinstance(spec, Mapping):
-        return dict(spec)
-    raise ValueError(
-        f"Manifest must be a mapping or JSON string, got {type(spec).__name__}"
-    )
+    elif isinstance(manifest, Mapping):
+        data = dict(manifest)
+    else:
+        raise TypeError(f"Expected str or Mapping, got {type(manifest).__name__}")
 
-
-def _normalize_axis(
-    axis: int,
-    ndim: int,
-    op_name: str,
-    *,
-    allow_end: bool = False,
-) -> int:
-    upper = ndim if allow_end else ndim - 1
-    lower = -(ndim + 1) if allow_end else -ndim
-    if axis < lower or axis > upper:
+    if not isinstance(data, dict):
+        raise ValueError("Manifest JSON must decode to an object")
+    extra = set(data.keys()) - _TOP_KEYS
+    if extra:
+        raise ValueError(f"Unknown top-level manifest keys: {sorted(extra)}")
+    if data.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(
-            f"{op_name}: axis {axis} out of range for tensor with ndim={ndim}"
+            f"schema_version must be {SCHEMA_VERSION!r}, "
+            f"got {data.get('schema_version')!r}"
         )
-    return axis + (ndim + 1 if allow_end else ndim) if axis < 0 else axis
+
+    eag = data.get("expert_axis_grouped", False)
+    if not isinstance(eag, bool):
+        raise ValueError("expert_axis_grouped must be a bool")
+
+    stripes_raw = data.get("stripes", {})
+    if not isinstance(stripes_raw, Mapping):
+        raise ValueError("stripes must be a mapping")
+    stripes: dict[str, int] = {}
+    for k, v in stripes_raw.items():
+        if not isinstance(k, str) or not (_is_int(v) and v > 0):
+            raise ValueError(f"stripes[{k!r}] must be a positive int, got {v!r}")
+        stripes[k] = int(v)
+
+    tied_raw = data.get("tied_keys", [])
+    if not _is_seq(tied_raw):
+        raise ValueError("tied_keys must be a sequence")
+    tied_keys: list[list[str]] = []
+    for pair in tied_raw:
+        if (
+            not _is_seq(pair)
+            or len(pair) != 2
+            or not all(isinstance(s, str) for s in pair)
+        ):
+            raise ValueError(
+                f"tied_keys entries must be [src, dst] pairs, got {pair!r}"
+            )
+        tied_keys.append([pair[0], pair[1]])
+
+    dropped_raw = data.get("dropped_keys", [])
+    if not _is_seq(dropped_raw) or not all(isinstance(s, str) for s in dropped_raw):
+        raise ValueError("dropped_keys must be a sequence of strings")
+
+    rules_raw = data.get("rules")
+    if not _is_seq(rules_raw):
+        raise ValueError("rules is required and must be a sequence")
+    rules: list[dict[str, Any]] = []
+    for idx, rule in enumerate(rules_raw):
+        ctx = f"rules[{idx}]"
+        if not isinstance(rule, Mapping):
+            raise ValueError(f"{ctx}: must be a mapping")
+        extra_r = set(rule.keys()) - _RULE_KEYS
+        if extra_r:
+            raise ValueError(f"{ctx}: unknown keys {sorted(extra_r)}")
+        for req in ("source_keys", "target_keys"):
+            vals = rule.get(req)
+            if (
+                not _is_seq(vals)
+                or not vals
+                or not all(isinstance(s, str) for s in vals)
+            ):
+                raise ValueError(
+                    f"{ctx}.{req}: must be a non-empty sequence of strings"
+                )
+        if "ops" not in rule or not _is_seq(rule["ops"]):
+            raise ValueError(f"{ctx}.ops: is required and must be a sequence")
+        for op_i, op in enumerate(rule["ops"]):
+            _validate_op(op, f"{ctx}.ops[{op_i}]")
+        entry: dict[str, Any] = {
+            "source_keys": list(rule["source_keys"]),
+            "target_keys": list(rule["target_keys"]),
+            "ops": [dict(op) for op in rule["ops"]],
+        }
+        if "sharding" in rule:
+            sh = rule["sharding"]
+            if not _is_seq(sh) or not all(a is None or isinstance(a, str) for a in sh):
+                raise ValueError(f"{ctx}.sharding: must be a sequence of str | None")
+            entry["sharding"] = list(sh)
+        rules.append(entry)
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "expert_axis_grouped": eag,
+        "stripes": stripes,
+        "tied_keys": tied_keys,
+        "dropped_keys": list(dropped_raw),
+        "rules": rules,
+    }
 
 
-def _apply_single_op(
-    op_name: str,
-    kwargs: Mapping[str, Any],
-    tensor: torch.Tensor,
-) -> torch.Tensor:
+def validate_manifest(manifest: RuleSpec) -> dict[str, Any]:
+    """Validate a ``weight_mapping`` manifest and return its normalized dict."""
+    return _parse_manifest(manifest)
+
+
+def _norm_axis(axis: int, ndim: int, op: str) -> int:
+    norm = axis + ndim if axis < 0 else axis
+    if not (0 <= norm < ndim):
+        raise ValueError(f"{op}: axis {axis} out of range for ndim={ndim}")
+    return norm
+
+
+def _apply_unary(op_name: str, kw: Mapping[str, Any], t: torch.Tensor) -> torch.Tensor:
     if op_name == OpName.RESHAPE:
-        src_shape = list(kwargs["src_shape"])
-        dst_shape = list(kwargs["dst_shape"])
-        if list(tensor.shape) != src_shape:
+        if list(t.shape) != list(kw["src_shape"]):
             raise ValueError(
-                f"reshape: expected input shape {src_shape}, got {list(tensor.shape)}"
+                f"reshape: shape {list(t.shape)} != {list(kw['src_shape'])}"
             )
-        return tensor.reshape(dst_shape)
-
+        return t.reshape(tuple(kw["dst_shape"]))
     if op_name == OpName.TRANSPOSE:
-        axes = list(kwargs["axes"])
-        if len(axes) != tensor.ndim:
+        axes = list(kw["axes"])
+        if len(axes) != t.ndim:
+            raise ValueError(f"transpose: len(axes)={len(axes)} != ndim={t.ndim}")
+        return t.permute(*axes)
+    if op_name == OpName.SLICE:
+        axis = _norm_axis(kw["axis"], t.ndim, op_name)
+        left, right = kw["sizes"]
+        length = int(t.shape[axis]) - left - right
+        if length <= 0:
             raise ValueError(
-                f"transpose: len(axes)={len(axes)} does not match "
-                f"tensor.ndim={tensor.ndim}"
+                f"slice: invalid [{left}, {right}] for dim={t.shape[axis]}"
             )
-        return tensor.permute(*axes)
-
-    if op_name == OpName.SCALE:
-        factor = float(kwargs["factor"])
-        orig_dtype = tensor.dtype
-        return (tensor.to(torch.float32) * factor).to(orig_dtype)
-
+        return t.narrow(axis, left, length)
     if op_name == OpName.PAD:
-        axis = _normalize_axis(kwargs["axis"], tensor.ndim, OpName.PAD)
-        left, right = kwargs["sizes"]
+        axis = _norm_axis(kw["axis"], t.ndim, op_name)
+        left, right = kw["sizes"]
         if left == 0 and right == 0:
-            return tensor
-        out_shape = list(tensor.shape)
+            return t
+        out_shape = list(t.shape)
         out_shape[axis] += left + right
-        out = torch.zeros(out_shape, dtype=tensor.dtype, device=tensor.device)
-        slices = [slice(None)] * tensor.ndim
-        slices[axis] = slice(left, left + tensor.shape[axis])
-        out[tuple(slices)] = tensor
+        out = torch.zeros(out_shape, dtype=t.dtype, device=t.device)
+        out.narrow(axis, left, int(t.shape[axis])).copy_(t)
         return out
-
-    if op_name == OpName.UNPAD:
-        axis = _normalize_axis(kwargs["axis"], tensor.ndim, OpName.UNPAD)
-        left, right = kwargs["sizes"]
-        dim = tensor.shape[axis]
-        if left + right > dim:
-            raise ValueError(
-                f"unpad: sizes {[left, right]} exceed dim={dim} on axis {axis}"
-            )
-        slices = [slice(None)] * tensor.ndim
-        slices[axis] = slice(left, dim - right)
-        return tensor[tuple(slices)]
-
-    if op_name == OpName.CAST:
-        expected_src = _DTYPE_MAP[kwargs["src_dtype"]]
-        dst_dtype = _DTYPE_MAP[kwargs["dst_dtype"]]
-        if tensor.dtype != expected_src:
-            raise ValueError(
-                f"cast: expected input dtype {expected_src}, got {tensor.dtype}"
-            )
-        return tensor.to(dst_dtype)
-
     if op_name == OpName.REPEAT:
-        axis = _normalize_axis(kwargs["axis"], tensor.ndim, OpName.REPEAT)
-        return torch.repeat_interleave(tensor, kwargs["times"], dim=axis)
-
-    if op_name == OpName.UNREPEAT:
-        axis = _normalize_axis(kwargs["axis"], tensor.ndim, OpName.UNREPEAT)
-        times = kwargs["times"]
-        dim = tensor.shape[axis]
-        if dim % times != 0:
-            raise ValueError(
-                f"unrepeat: dim={dim} on axis {axis} is not divisible by times={times}"
-            )
-        slices = [slice(None)] * tensor.ndim
-        slices[axis] = slice(None, None, times)
-        return tensor[tuple(slices)]
-
-    raise ValueError(f"Unknown op: {op_name!r}")
+        axis = _norm_axis(kw["axis"], t.ndim, op_name)
+        return t.repeat_interleave(int(kw["times"]), dim=axis)
+    if op_name == OpName.MEAN_POOL:
+        axis = _norm_axis(kw["axis"], t.ndim, op_name)
+        times = int(kw["times"])
+        if int(t.shape[axis]) % times != 0:
+            raise ValueError(f"mean_pool: dim={t.shape[axis]} not divisible by {times}")
+        new_shape = [
+            *t.shape[:axis],
+            int(t.shape[axis]) // times,
+            times,
+            *t.shape[axis + 1 :],
+        ]
+        compute_dt = torch.float64 if t.dtype == torch.float64 else torch.float32
+        return t.reshape(new_shape).to(compute_dt).mean(dim=axis + 1).to(t.dtype)
+    if op_name == OpName.SCALE:
+        compute_dt = torch.float64 if t.dtype == torch.float64 else torch.float32
+        return (t.to(compute_dt) * float(kw["factor"])).to(t.dtype)
+    if op_name == OpName.CAST:
+        src_dt, dst_dt = _DTYPE_MAP[kw["src_dtype"]], _DTYPE_MAP[kw["dst_dtype"]]
+        if t.dtype != src_dt:
+            raise ValueError(f"cast: tensor dtype {t.dtype} != src_dtype {src_dt}")
+        return t.to(dst_dt)
+    raise ValueError(f"Unknown op {op_name!r}")
 
 
 def _apply_op(
-    op_name: str,
-    kwargs: Mapping[str, Any],
-    tensors: list[torch.Tensor],
+    op_name: str, kw: Mapping[str, Any], tensors: list[torch.Tensor]
 ) -> list[torch.Tensor]:
-    if op_name == OpName.STACK:
-        if not tensors:
-            raise ValueError("stack: requires at least one input tensor")
-        axis = _normalize_axis(
-            kwargs["axis"], tensors[0].ndim, OpName.STACK, allow_end=True
-        )
-        ref_shape = tensors[0].shape
-        for idx, t in enumerate(tensors[1:], start=1):
-            if t.shape != ref_shape:
-                raise ValueError(
-                    f"stack: tensor[{idx}] shape {list(t.shape)} != {list(ref_shape)}"
-                )
-        return [torch.stack(tensors, dim=axis)]
-
-    if op_name == OpName.UNSTACK:
-        if len(tensors) != 1:
-            raise ValueError(f"unstack: expected exactly 1 tensor, got {len(tensors)}")
-        axis = _normalize_axis(kwargs["axis"], tensors[0].ndim, OpName.UNSTACK)
-        return list(torch.unbind(tensors[0], dim=axis))
-
     if op_name == OpName.CONCAT:
-        sizes = list(kwargs["sizes"])
-        if len(tensors) != len(sizes):
+        axis = _norm_axis(kw["axis"], tensors[0].ndim, op_name)
+        if [int(t.shape[axis]) for t in tensors] != list(kw["sizes"]):
             raise ValueError(
-                f"concat: expected {len(sizes)} tensors for sizes={sizes}, "
-                f"got {len(tensors)}"
+                f"concat: tensor sizes {[int(t.shape[axis]) for t in tensors]} "
+                f"!= {list(kw['sizes'])}"
             )
-        axis = _normalize_axis(kwargs["axis"], tensors[0].ndim, OpName.CONCAT)
-        ref_other_shape = tensors[0].shape[:axis] + tensors[0].shape[axis + 1 :]
-        for idx, (t, expected_size) in enumerate(zip(tensors, sizes)):
-            if t.ndim != tensors[0].ndim:
-                raise ValueError(
-                    f"concat: tensor[{idx}] ndim={t.ndim} != {tensors[0].ndim}"
-                )
-            if t.shape[axis] != expected_size:
-                raise ValueError(
-                    f"concat: tensor[{idx}] width {t.shape[axis]} on axis {axis} "
-                    f"!= expected size {expected_size}"
-                )
-            other_shape = t.shape[:axis] + t.shape[axis + 1 :]
-            if other_shape != ref_other_shape:
-                raise ValueError(
-                    f"concat: tensor[{idx}] non-concat shape {list(other_shape)} "
-                    f"!= {list(ref_other_shape)}"
-                )
         return [torch.cat(tensors, dim=axis)]
-
+    if op_name == OpName.STACK:
+        axis = _norm_axis(kw["axis"], tensors[0].ndim + 1, op_name)
+        return [torch.stack(tensors, dim=axis)]
     if op_name == OpName.SPLIT:
         if len(tensors) != 1:
-            raise ValueError(f"split: expected exactly 1 tensor, got {len(tensors)}")
-        sizes = list(kwargs["sizes"])
+            raise ValueError(f"split: expected 1 tensor, got {len(tensors)}")
         t = tensors[0]
-        axis = _normalize_axis(kwargs["axis"], t.ndim, OpName.SPLIT)
-        if t.shape[axis] != sum(sizes):
+        axis = _norm_axis(kw["axis"], t.ndim, op_name)
+        if sum(kw["sizes"]) != int(t.shape[axis]):
             raise ValueError(
-                f"split: tensor width {t.shape[axis]} on axis {axis} "
-                f"!= sum(sizes)={sum(sizes)}"
+                f"split: sum({kw['sizes']}) != shape[{axis}]={t.shape[axis]}"
             )
-        return list(torch.split(t, sizes, dim=axis))
+        return list(torch.split(t, list(kw["sizes"]), dim=axis))
+    if op_name == OpName.UNSTACK:
+        if len(tensors) != 1:
+            raise ValueError(f"unstack: expected 1 tensor, got {len(tensors)}")
+        t = tensors[0]
+        axis = _norm_axis(kw["axis"], t.ndim, op_name)
+        return list(torch.unbind(t, dim=axis))
+    return [_apply_unary(op_name, kw, t) for t in tensors]
 
-    return [_apply_single_op(op_name, kwargs, t) for t in tensors]
+
+def _invert_op(op: Mapping[str, Any]) -> OpSpec:
+    op_name, kw = next(iter(op.items()))
+    if op_name == OpName.RESHAPE:
+        return {
+            "reshape": {
+                "src_shape": list(kw["dst_shape"]),
+                "dst_shape": list(kw["src_shape"]),
+            }
+        }
+    if op_name == OpName.TRANSPOSE:
+        axes = list(kw["axes"])
+        inv = [0] * len(axes)
+        for i, a in enumerate(axes):
+            inv[a] = i
+        return {"transpose": {"axes": inv}}
+    if op_name == OpName.CONCAT:
+        return {"split": {"axis": kw["axis"], "sizes": list(kw["sizes"])}}
+    if op_name == OpName.SPLIT:
+        return {"concat": {"axis": kw["axis"], "sizes": list(kw["sizes"])}}
+    if op_name == OpName.STACK:
+        return {"unstack": {"axis": kw["axis"]}}
+    if op_name == OpName.UNSTACK:
+        return {"stack": {"axis": kw["axis"]}}
+    if op_name == OpName.PAD:
+        return {"slice": {"axis": kw["axis"], "sizes": list(kw["sizes"])}}
+    if op_name == OpName.SLICE:
+        return {"pad": {"axis": kw["axis"], "sizes": list(kw["sizes"])}}
+    if op_name == OpName.REPEAT:
+        return {"mean_pool": {"axis": kw["axis"], "times": kw["times"]}}
+    if op_name == OpName.MEAN_POOL:
+        return {"repeat": {"axis": kw["axis"], "times": kw["times"]}}
+    if op_name == OpName.SCALE:
+        return {"scale": {"factor": 1.0 / float(kw["factor"])}}
+    if op_name == OpName.CAST:
+        return {"cast": {"src_dtype": kw["dst_dtype"], "dst_dtype": kw["src_dtype"]}}
+    raise ValueError(f"Unknown op {op_name!r}")
+
+
+def invert_manifest(manifest: RuleSpec) -> dict[str, Any]:
+    """Invert a ``weight_mapping`` manifest (reversing chained rules and ops)."""
+    spec = _parse_manifest(manifest)
+    inv_rules = [
+        {
+            "source_keys": list(r["target_keys"]),
+            "target_keys": list(r["source_keys"]),
+            "ops": [_invert_op(op) for op in reversed(r["ops"])],
+        }
+        for r in reversed(spec["rules"])
+    ]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "expert_axis_grouped": spec["expert_axis_grouped"],
+        "stripes": dict(spec["stripes"]),
+        "tied_keys": [],
+        "dropped_keys": list(spec["dropped_keys"]),
+        "rules": inv_rules,
+    }
 
 
 def execute_manifest(
@@ -407,74 +436,51 @@ def execute_manifest(
     src_weights: Mapping[str, torch.Tensor],
     mesh: Any = None,
 ) -> dict[str, torch.Tensor]:
-    """Execute a ``weight_mapping`` manifest over PyTorch tensors.
-
-    Args:
-        manifest: Validated manifest mapping or JSON string.
-        src_weights: Mapping from source weight names to ``torch.Tensor``.
-        mesh: Optional mesh argument accepted for protocol signature
-            compatibility (unused by the pure-PyTorch executor).
-
-    Returns:
-        Dictionary mapping target weight names to converted ``torch.Tensor``.
-    """
+    """Execute a ``weight_mapping`` manifest over PyTorch tensors (with chaining)."""
     del mesh
     spec = _parse_manifest(manifest)
-    validate_manifest(spec)
-
-    # Rule chaining invariant: ``src_weights`` always takes precedence over
-    # ``out`` so a key written to the same name (``x -> x``) and read by a later
-    # rule (``x -> y``) reads the original source tensor and is never treated as
-    # an intermediate. Only keys absent from ``src_weights`` that are produced by
-    # an earlier rule and consumed downstream (or prefixed with ``__tmp__:``) are
-    # pruned before returning, including when a downstream rule is skipped via
-    # ``dropped_keys``.
-    dropped: set[str] = set(spec.get("dropped_keys", ()))
+    dropped = set(spec["dropped_keys"])
     out: dict[str, torch.Tensor] = {}
-    intermediate_keys: set[str] = set()
+    intermediates: set[str] = set()
 
-    for rule_idx, rule in enumerate(spec["rules"]):
-        source_keys: Sequence[str] = rule["source_keys"]
-        target_keys: Sequence[str] = rule["target_keys"]
-
-        if any(k in dropped for k in source_keys):
-            for k in source_keys:
+    for idx, rule in enumerate(spec["rules"]):
+        if any(k in dropped for k in rule["source_keys"]):
+            for k in rule["source_keys"]:
                 if k not in src_weights and k in out:
-                    intermediate_keys.add(k)
-            dropped.update(target_keys)
+                    intermediates.add(k)
+            dropped.update(rule["target_keys"])
             continue
 
         tensors: list[torch.Tensor] = []
-        for k in source_keys:
+        for k in rule["source_keys"]:
             if k in src_weights:
                 tensors.append(src_weights[k])
             elif k in out:
                 tensors.append(out[k])
-                intermediate_keys.add(k)
+                intermediates.add(k)
             else:
-                raise KeyError(f"rules[{rule_idx}]: missing source weight key {k!r}")
+                raise KeyError(f"rules[{idx}]: missing source weight key {k!r}")
 
         for op in rule["ops"]:
-            op_name, kwargs = next(iter(op.items()))
-            tensors = _apply_op(op_name, kwargs, tensors)
+            op_name, kw = next(iter(op.items()))
+            tensors = _apply_op(op_name, kw, tensors)
 
-        if len(tensors) != len(target_keys):
+        if len(tensors) != len(rule["target_keys"]):
             raise ValueError(
-                f"rules[{rule_idx}]: produced {len(tensors)} tensor(s), "
-                f"expected {len(target_keys)} for target_keys={list(target_keys)}"
+                f"rules[{idx}]: produced {len(tensors)} tensor(s) for "
+                f"{len(rule['target_keys'])} target key(s)"
             )
-        for k, tensor in zip(target_keys, tensors):
-            out[k] = tensor
-            intermediate_keys.discard(k)
+        for tk, tensor in zip(rule["target_keys"], tensors, strict=True):
+            out[tk] = tensor
 
-    for k in list(out.keys()):
-        if k in intermediate_keys or k.startswith(_INTERMEDIATE_KEY_PREFIX):
-            out.pop(k, None)
+    for k in intermediates:
+        out.pop(k, None)
+    for k in [k for k in out if k.startswith("__tmp__:")]:
+        out.pop(k, None)
 
-    for src_key, dst_key in spec.get("tied_keys", ()):
-        if src_key in out and dst_key not in dropped:
-            out[dst_key] = out[src_key].clone()
-
+    for src_k, dst_k in spec["tied_keys"]:
+        if src_k in out and dst_k not in out and dst_k not in dropped:
+            out[dst_k] = out[src_k]
     return out
 
 
@@ -483,7 +489,7 @@ def from_hf_impl(
     hf_weights: Mapping[str, torch.Tensor],
     mesh: Any = None,
 ) -> dict[str, torch.Tensor]:
-    """Convert HuggingFace weights to target engine layout using ``dst_rule``."""
+    """Convert HuggingFace weights using a parsed or JSON ``weight_mapping`` rule."""
     return execute_manifest(dst_rule, hf_weights, mesh=mesh)
 
 
@@ -504,7 +510,7 @@ def to_hf_impl(
     src_rule: RuleSpec,
     src_weights: Mapping[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Convert engine weights to HuggingFace layout using ``src_rule``."""
+    """Convert target-framework weights back to HF format using an inverted rule."""
     return execute_manifest(src_rule, src_weights)
 
 
@@ -512,130 +518,9 @@ def to_hf(
     src_rule: str,
     src_weights: Mapping[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Convert engine weights using a serialized JSON ``src_rule`` string."""
+    """Convert target-framework weights back to HF format using a JSON rule string."""
     if not isinstance(src_rule, str):
         raise TypeError(
             f"to_hf expects src_rule to be str, got {type(src_rule).__name__}"
         )
     return to_hf_impl(src_rule, src_weights)
-
-
-def _invert_op(op: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
-    op_name, kwargs = next(iter(op.items()))
-    if op_name == OpName.STACK:
-        return {OpName.UNSTACK.value: {"axis": kwargs["axis"]}}
-    if op_name == OpName.UNSTACK:
-        return {OpName.STACK.value: {"axis": kwargs["axis"]}}
-    if op_name == OpName.CONCAT:
-        return {
-            OpName.SPLIT.value: {"axis": kwargs["axis"], "sizes": list(kwargs["sizes"])}
-        }
-    if op_name == OpName.SPLIT:
-        return {
-            OpName.CONCAT.value: {
-                "axis": kwargs["axis"],
-                "sizes": list(kwargs["sizes"]),
-            }
-        }
-    if op_name == OpName.RESHAPE:
-        return {
-            OpName.RESHAPE.value: {
-                "src_shape": list(kwargs["dst_shape"]),
-                "dst_shape": list(kwargs["src_shape"]),
-            }
-        }
-    if op_name == OpName.TRANSPOSE:
-        axes = list(kwargs["axes"])
-        inv_axes = [0] * len(axes)
-        for new_pos, old_pos in enumerate(axes):
-            inv_axes[old_pos] = new_pos
-        return {OpName.TRANSPOSE.value: {"axes": inv_axes}}
-    if op_name == OpName.SCALE:
-        return {OpName.SCALE.value: {"factor": 1.0 / float(kwargs["factor"])}}
-    if op_name == OpName.PAD:
-        return {
-            OpName.UNPAD.value: {"axis": kwargs["axis"], "sizes": list(kwargs["sizes"])}
-        }
-    if op_name == OpName.UNPAD:
-        return {
-            OpName.PAD.value: {"axis": kwargs["axis"], "sizes": list(kwargs["sizes"])}
-        }
-    if op_name == OpName.CAST:
-        return {
-            OpName.CAST.value: {
-                "src_dtype": kwargs["dst_dtype"],
-                "dst_dtype": kwargs["src_dtype"],
-            }
-        }
-    if op_name == OpName.REPEAT:
-        return {
-            OpName.UNREPEAT.value: {"axis": kwargs["axis"], "times": kwargs["times"]}
-        }
-    if op_name == OpName.UNREPEAT:
-        return {OpName.REPEAT.value: {"axis": kwargs["axis"], "times": kwargs["times"]}}
-    raise ValueError(f"Unknown op: {op_name!r}")
-
-
-def invert_manifest(spec: RuleSpec) -> dict[str, Any]:
-    """Mechanically derive the exact inverse of a ``weight_mapping`` manifest.
-
-    Swaps ``source_keys`` and ``target_keys``, reverses each rule's ``ops``
-    sequence, and replaces every op with its mathematical inverse.
-
-    Args:
-        spec: Validated manifest mapping or JSON string.
-
-    Returns:
-        Inverse manifest dictionary conforming to ``weight_mapping`` schema.
-    """
-    parsed = _parse_manifest(spec)
-    validate_manifest(parsed)
-
-    dropped = set(parsed.get("dropped_keys", ()))
-    inv_dropped: list[str] = []
-    inv_rules: list[dict[str, Any]] = []
-
-    for rule in parsed["rules"]:
-        source_keys = list(rule["source_keys"])
-        target_keys = list(rule["target_keys"])
-        if any(k in dropped for k in source_keys):
-            dropped.update(target_keys)
-            for tk in target_keys:
-                if tk not in inv_dropped:
-                    inv_dropped.append(tk)
-
-    for rule in reversed(parsed["rules"]):
-        source_keys = list(rule["source_keys"])
-        target_keys = list(rule["target_keys"])
-        inv_ops = [_invert_op(op) for op in reversed(rule["ops"])]
-        inv_rules.append(
-            {
-                "source_keys": target_keys,
-                "target_keys": source_keys,
-                "ops": inv_ops,
-            }
-        )
-
-    stripes = parsed.get("stripes")
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "expert_axis_grouped": parsed.get("expert_axis_grouped", False),
-        "stripes": dict(stripes) if isinstance(stripes, Mapping) else {},
-        "tied_keys": [],
-        "dropped_keys": inv_dropped,
-        "rules": inv_rules,
-    }
-
-
-__all__ = [
-    "OpName",
-    "RuleSpec",
-    "SCHEMA_VERSION",
-    "execute_manifest",
-    "from_hf",
-    "from_hf_impl",
-    "invert_manifest",
-    "to_hf",
-    "to_hf_impl",
-    "validate_manifest",
-]
