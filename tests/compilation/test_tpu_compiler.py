@@ -319,6 +319,9 @@ class TestTpuCompilerCache:
             "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
             "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
             "TPU_LIBRARY_PATH",
+            "VLLM_TPU_SEGMENT_TOKENIZE",
+            "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS",
+            "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS",
         }
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED

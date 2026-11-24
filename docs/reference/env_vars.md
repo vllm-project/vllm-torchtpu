@@ -120,3 +120,13 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_TRACE_MODE` | `"TRACE_COMPUTE"` | SparseCore trace mode (`"TRACE_COMPUTE"`, `"TRACE_COMPUTE_AND_DMA"`, etc.). |
 | `TPU_NUM_SPARSE_CORES_TO_TRACE` | `1` | Number of SparseCores to trace when SparseCore tracing is active. |
 | `TPU_KERNEL_ITER_MODE` | `False` | Enables fast Pallas kernel hot-reloading without restarting the vLLM server (`TPU_KERNEL_RELOAD_MODULES`). |
+
+---
+
+## 7. API Server Prompt Path
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `VLLM_TPU_SEGMENT_TOKENIZE` | `False` | Tokenizes a prompt piece by piece between added tokens and caches the ids of message bodies across requests, so a multi-turn chat request encodes only the text that is new (`segment_tokenize.py`). Same ids as the tokenizer's full encode; tokenizers or requests it cannot handle exactly (offsets, special-token insertion, truncation, `split_special_tokens`, lstrip/rstrip added tokens, a first-split-only Metaspace) take vLLM's path. Off by default: it only pays for long multi-turn prompts and holds the cache below in each API server process. |
+| `VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS` | `33554432` | Token budget of that piece cache per API server process (about 12 bytes per token: id pointers plus piece text). Must be `>= 0`. |
+| `VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS` | `0` | With `VLLM_TPU_SEGMENT_TOKENIZE`, how many recent prompts per API server process keep their ids so a new prompt reuses them up to the last added token the two share, and splits and encodes only the rest (`0`: no prompts kept, every prompt is split and looked up piece by piece). Set it to at least the number of conversations in flight at once, so a conversation's previous turn is still held when its next turn arrives; each held prompt costs its ids and text, tens of bytes per token. Must be `>= 0`. |
