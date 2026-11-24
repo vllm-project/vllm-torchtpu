@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_XCHG_MAX_TOKENS: int = 0
     TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS: int = 0
     TPU_DCP_MLA_OUT_VMEM_MIB: int = 32
+    TPU_DCP_ONLINE_LSE_COMBINE: str = ""
     TPU_SMALL_COLL_HBM_OPERAND: bool = True
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
@@ -128,6 +129,9 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_FAST: bool = True
+    TPU_MOE_TP_DECODE_VMEM_FRACTION: float = 0.75
+    TPU_MOE_TP_DECODE_RG_MIN_ROWS: int = 0
+    TPU_MOE_TP_DECODE_INCUMBENT_MAX_ROWS: int = 0
     TPU_MOE_TP_DECODE_SPLIT_META: bool = True
     TPU_MOE_TP_DECODE_SHARED_META: bool = True
     TPU_MOE_TP_DECODE_AG_PAIRS: int = 0
@@ -211,6 +215,7 @@ if TYPE_CHECKING:
     TPU_SC_TOPK_COOP_MERGE: bool = True
     TPU_SC_TOPK_ONE_SUBCORE_CAPACITY: int = 0
     TPU_DCP_INDEXER_SMALL_AG: bool = True
+    TPU_DCP_INDEXER_A2A_SMALL_COLL: bool = False
     TPU_INDEXER_TOPK_SHARED_READ: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED: bool = False
@@ -230,6 +235,7 @@ if TYPE_CHECKING:
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
     TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS: int = 32
     TPU_INDEXER_QB_OVERLAP: bool = False
+    TPU_INDEXER_OVERLAP_QB_ABSORB: bool = False
     TPU_QB_OVERLAP_HONORS_SKIP_TOPK: bool = False
     TPU_SPARSE_MLA_PACKED_ROPE: bool = False
     TPU_SPARSE_MLA_GATHER_PACKED_ROPE: bool = False
@@ -260,6 +266,9 @@ if TYPE_CHECKING:
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
     TPU_SCHED_KV_PREFETCH_WAITING: int = 0
     TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS: int = 64
+    TPU_PREFIX_AWARE_TIER_WARMTH: bool = False
+    TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS: int = 256
+    TPU_OFFLOAD_KEEP_EAGLE_TAIL: bool = False
     TPU_RAIDEN_INLINE_LOAD: bool = False
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
     KDA_MANUAL_STATE_DMA: bool | None = None
@@ -296,6 +305,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
+    VLLM_TPU_DETOK_PRIME_TOKENS: int = 32
     VLLM_TPU_DETOK_SUFFIX_PRIME: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
@@ -784,6 +794,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefetches it may run under the call). The kernel's scratch is ~13 MiB
     # at T = 64; 32 is the pinned fused small all-to-all calls' limit.
     "TPU_DCP_MLA_OUT_VMEM_MIB": env_int("TPU_DCP_MLA_OUT_VMEM_MIB", 32),
+    # Single-kernel TensorCore online-LSE DCP combine (`small_collectives/
+    # dcp_lse_combine.py`) for backbone decode/mixed buckets supported by
+    # `online_lse_combine_supported`: "" / "0" = off (default),
+    # "1" / "auto" = chip-pair-first 2-stage combine ("pairs") when adjacent
+    # DCP ranks pair each chip's two TensorCores else 1-stage "flat",
+    # "pairs" = require chip-pair-first 2-stage combine, "flat" = 1-stage.
+    "TPU_DCP_ONLINE_LSE_COMBINE": env_with_choices(
+        "TPU_DCP_ONLINE_LSE_COMBINE",
+        "",
+        ["", "0", "1", "auto", "pairs", "flat"],
+        case_sensitive=False,
+    ),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.
     # Unconstrained (pl.ANY), XLA stages it into VMEM with a copy-start/-done
@@ -850,6 +872,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # least this many tokens (0 = every chunked bucket). The lse-gather head
     # split (2) is torch-side and does not follow it (a token-count test there
     # specializes range-compiled graphs).
+    # Buckets that take the V-space merge (TPU_DCP_MERGE_VSPACE_FUSED) use
+    # min(this, TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS) instead.
     "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": env_int(
         "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS", 2048
     ),
@@ -897,7 +921,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # mask, one rounding; layers/adapter/dcp_vspace.py) instead of a pre-merge
     # projection followed by the latent merge path. GLM-5.2 AgentX c4 TP16 x
     # DCP8: P90 TTFT -10..-12% (the separate W_UV bmm, concat and relayouts
-    # cost ~36 ms per 4096-token step).
+    # cost ~36 ms per 4096-token step). Its buckets also take merge pieces down
+    # to TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS (a sliced chunk is a slow copy).
     "TPU_DCP_MERGE_VSPACE_FUSED": env_bool("TPU_DCP_MERGE_VSPACE_FUSED"),
     # Where W_UV is replicated over the DCP group (TPU_DCP_MLA_UV_BEFORE_MERGE),
     # replicate o_proj too, so the backbone buckets that apply W_UV before the
@@ -1093,6 +1118,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # would otherwise idle on the top-k's call-done. Same kernel, same inputs:
     # bit-identical q. Needs the fp8 Pallas q_b site (TPU_FP8_LINEAR_PALLAS).
     "TPU_INDEXER_QB_OVERLAP": env_bool("TPU_INDEXER_QB_OVERLAP", default=False),
+    # Run both the MLA q_b projection (prequantized from TPU_FUSED_NORM_QKVA,
+    # fp8_skinny, or xla_quantized_matmul) and the W_UK query absorption
+    # (`absorb_q`) inside the DCP indexer op, pinned under the local SparseCore
+    # top-k and the cross-rank SparseCore merge / compaction calls respectively
+    # on decode buckets. Hands the pre-absorbed `ql_nope` straight to MLA
+    # attention so `_absorb_q` is skipped after the indexer wait. Bit-identical.
+    "TPU_INDEXER_OVERLAP_QB_ABSORB": env_bool(
+        "TPU_INDEXER_OVERLAP_QB_ABSORB", default=False
+    ),
     # Take the q_b overlap path only in passes that run their own indexer, so an
     # IndexShare draft step traced with skip_topk reads the shared top-k table.
     "TPU_QB_OVERLAP_HONORS_SKIP_TOPK": env_bool(
@@ -1390,6 +1424,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # issued after the compaction instead of inside it, and a ring loop without
     # conditional DMAs or a stale matmul. Default on.
     "TPU_MOE_TP_DECODE_FAST": env_bool("TPU_MOE_TP_DECODE_FAST", True),
+    # With USE_MOE_TP_DECODE_KERNEL: the share of VMEM the kernel's plan may
+    # take for a row count to be admitted (the row-gathered kernel's buffers
+    # need 1.0 at 96-192 rows).
+    "TPU_MOE_TP_DECODE_VMEM_FRACTION": env_float(
+        "TPU_MOE_TP_DECODE_VMEM_FRACTION", 0.75
+    ),
+    # moe_tp_decode: from this many rows up (0 = off), run the row-gathered
+    # kernel (kernel_rg; fast schedule only; same output bits as the incumbent).
+    "TPU_MOE_TP_DECODE_RG_MIN_ROWS": lambda: int(
+        os.getenv("TPU_MOE_TP_DECODE_RG_MIN_ROWS", "0")
+    ),
+    # moe_tp_decode: the incumbent kernel only up to this many rows (0 = every
+    # admitted count); above it, counts the row-gathered kernel does not take
+    # run the usual path.
+    "TPU_MOE_TP_DECODE_INCUMBENT_MAX_ROWS": lambda: int(
+        os.getenv("TPU_MOE_TP_DECODE_INCUMBENT_MAX_ROWS", "0")
+    ),
     # moe_tp_decode: pass n_valid, rank and the expert offset as three [1]
     # scalar operands instead of one stacked int32[3] (one XLA fusion per MoE
     # layer, ~0.6 us in situ). Exact.
@@ -1885,6 +1936,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 13-17 us per idx layer. Needs TPU_DCP_RANK_OPERAND (the kernel's peer
     # addresses take the rank and lane as data). Same bytes, same result.
     "TPU_DCP_INDEXER_SMALL_AG": env_bool("TPU_DCP_INDEXER_SMALL_AG", default=True),
+    # On eligible DCP indexer buckets taking `a2a_merge`
+    # (`supports_indexer_score_all_to_all`), replace XLA's candidate
+    # `all_to_all` and slot `all_gather` with Pallas remote-DMA small
+    # collectives (`small_indexer_score_all_to_all` + `small_all_gather`) over
+    # flat 1-D HBM buffers, eliminating XLA's multi-stage collective schedule
+    # and 2-D sublane relayouts. Bit-identical.
+    "TPU_DCP_INDEXER_A2A_SMALL_COLL": env_bool(
+        "TPU_DCP_INDEXER_A2A_SMALL_COLL", default=False
+    ),
     # The indexed layer's own attention reads its rows back from the updated
     # shared table, the same `table[:num_tokens]` expression the following
     # skip_topk layers read, instead of the fresh rows. One expression lets XLA
@@ -2021,6 +2081,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS": env_nonnegative_int(
         "TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS", 64
     ),
+    # PrefixAwareScheduler: also count the whole chunks the offload tier holds
+    # right past a request's HBM hit as warm (core/prefix_aware_scheduler.py),
+    # so a session HBM evicted but the tier kept is not ranked fully cold.
+    "TPU_PREFIX_AWARE_TIER_WARMTH": env_bool(
+        "TPU_PREFIX_AWARE_TIER_WARMTH", default=False
+    ),
+    # PrefixAwareScheduler: most offload-tier chunks the tier-warmth probe asks
+    # about per request. Past the cap, the rest of a long prompt the tier holds
+    # still ranks as cold. Must be > 0; TPU_PREFIX_AWARE_TIER_WARMTH=0 turns the
+    # probe off. 256 chunks is 1M tokens at 4096 tokens/chunk, which covers whole
+    # prompts at GLM-5.2's max model length. On a GLM-5.2 P/D multi-turn coding
+    # replay at concurrency 80, 256 gave 8.4% more tokens per dollar than 64 at
+    # flat requests/s: long sessions the tier held stopped waiting behind
+    # shorter requests. Cost: one batched store lookup per probed request (split
+    # only around chunks with a save in flight), cached for TIER_PROBE_TTL_S
+    # while the request's HBM hit is unchanged. Operators lower it only if
+    # scheduler step time shows the probe's cost.
+    "TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS": env_positive_int_or_none(
+        "TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS", default=256
+    ),
+    # Offload tier: serve the whole tier hit when no KV cache group is
+    # annotated as an MTP/EAGLE drafter group. The pinned vLLM then flags every
+    # group as a drafter group and pops the last chunk of every tier hit (vLLM
+    # main stopped doing so, vllm-project/vllm#52771). The offload-tier
+    # counterpart of VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP
+    # (offload/raiden_connector.py).
+    # TODO(vllm-project/vllm#52735): Remove once the pinned vLLM includes
+    # vllm-project/vllm#52771.
+    "TPU_OFFLOAD_KEEP_EAGLE_TAIL": env_bool(
+        "TPU_OFFLOAD_KEEP_EAGLE_TAIL", default=False
+    ),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD": env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
     # Comma-separated dot-bounded module prefix names to quantize to FP8 on load.
@@ -2147,6 +2238,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS": env_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS", 33554432
     ),
+    # API server: prime the detokenizer with this many prompt-tail tokens; 0 = off.
+    "VLLM_TPU_DETOK_PRIME_TOKENS": env_int("VLLM_TPU_DETOK_PRIME_TOKENS", 32),
     # API server: prime each request's output detokenizer with the prompt's
     # last 4-24 tokens instead of the whole prompt (detokenizer_suffix.py).
     # Exact; a prompt that ends inside a character keeps the full prime.
@@ -2248,7 +2341,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With TPU_FUSED_OPROJ_AR: the largest decode block, in rows, the fused kernel
     # takes. Above 16 rows the two-call path is XLA's matmul and its quantize, then
     # the small all-reduce; the fused kernel streams the weight under the barrier
-    # round there too. A power of 2 (a bucket edge), at most 64.
+    # round there too. At most 96 (fp8_oproj_all_reduce.LIMIT_M).
     "TPU_FUSED_OPROJ_AR_MAX_ROWS": env_nonnegative_int(
         "TPU_FUSED_OPROJ_AR_MAX_ROWS", 16
     ),

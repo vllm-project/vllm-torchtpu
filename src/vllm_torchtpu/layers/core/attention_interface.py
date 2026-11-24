@@ -1048,6 +1048,24 @@ def dcp_mla_topk_cap(dcp_size: int) -> int:
     return topk_cap
 
 
+def merge_pieces_min_tokens(num_tokens: int) -> int:
+    """TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS, lowered to the W_UV-before-merge
+    gate on buckets that take the V-space merge (`vspace_fused_applies`): a
+    sliced chunk is a slow T(16,128) copy."""
+    min_tokens = envs.TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS
+    if (
+        envs.TPU_DCP_MERGE_VSPACE_FUSED
+        and envs.TPU_DCP_MLA_UV_BEFORE_MERGE
+        and envs.TPU_DCP_MERGE_RS_BF16 != 2
+        and not (
+            envs.TPU_DCP_LSE_MERGE_A2A
+            and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
+        )
+    ):
+        min_tokens = min(min_tokens, envs.TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS)
+    return min_tokens
+
+
 def dcp_small_chunk_gather_atoms(num_tokens: int) -> int:
     """TPU_DCP_MLA_SMALL_CHUNK_GATHER_ATOMS: the small-chunk SparseCore gather's
     atoms per batch at a bucket of `num_tokens` (static: the JAX op's shape),
@@ -1617,7 +1635,7 @@ def sparse_mla_attention_dcp(
             and envs.TPU_MLA_SPARSE_SPLIT_Q
             and topk_cap
             and topk_idx.shape[0]
-            > envs.bucket_gate_edge(envs.TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS)
+            > envs.bucket_gate_edge(merge_pieces_min_tokens(topk_idx.shape[0]))
         ):
             from vllm_torchtpu.layers.adapter.cp_mla_attention import _merge_chunks
 

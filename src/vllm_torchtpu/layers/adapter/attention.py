@@ -2169,6 +2169,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         _cp_mla_attention.prebuild_send_small(self.dcp_size)
                         if envs.TPU_DCP_MLA_SEND_SMALL_A2A_MERGE:
                             _cp_mla_attention.prebuild_send_small_merge(self.dcp_size)
+            if _cp_mla_attention.online_lse_combine_mode_requested():
+                _cp_mla_attention.prebuild_online_lse_combine(self.dcp_size)
 
     def _get_kv_scales(
         self, layer: Any
@@ -2897,6 +2899,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         topk_indices = kwargs.get("topk_indices")
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
+        ql_nope_absorbed = kwargs.get("ql_nope_absorbed")
         use_qrep = uses_query_replication(self, q_dcp_replicated, topk_indices)
         q_rope_table: list[torch.Tensor] = []
         if use_qrep:
@@ -2936,6 +2939,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             # head it reads, so XLA never relays out the whole q head.
             ql_nope, q_pe = _absorb_q_head(q_pe.flatten(1), w_uk_t_src.to(q_pe.dtype))
             ql_nope = ql_nope.to(input_dtype)
+        elif ql_nope_absorbed is not None:
+            ql_nope = ql_nope_absorbed.to(input_dtype)
         elif q_nope.device.type == "tpu" and w_uk_t_scale is None:
             ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
         else:
@@ -3092,12 +3097,27 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     # drafter keeps the reduce-scatter, as with the flag off.
                     is_backbone = vllm_compilation_backends.model_tag == "backbone"
                     wire_dtype = partial.dtype
+                    narrow_uv = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
+                    uv_vdim = (
+                        layer.W_UV_dcp_qrep.shape[-1]
+                        if uv_first
+                        and getattr(layer, "W_UV_dcp_qrep", None) is not None
+                        else partial.shape[2]
+                    )
+                    uv_combine_dtype = wire_dtype if narrow_uv else torch.float32
                     # TPU_DCP_MLA_OPROJ_ALL_REDUCE: on the buckets the merge
                     # would reduce-scatter (not its all-to-all ones).
                     oproj_all_reduce = (
                         uv_first
                         and is_backbone
                         and getattr(layer, "W_O_dcp_qrep", None) is not None
+                        and not _cp_mla_attention.online_lse_combine_applies(
+                            partial.shape[0],
+                            is_backbone,
+                            num_heads=partial.shape[1],
+                            vdim=uv_vdim,
+                            combine_dtype=uv_combine_dtype,
+                        )
                         and not (
                             envs.TPU_DCP_LSE_MERGE_A2A
                             and partial.shape[0]
@@ -3108,7 +3128,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         uv_first
                         and not oproj_all_reduce
                         and _cp_mla_attention.vspace_fused_applies(
-                            partial.shape[0], is_backbone
+                            partial.shape[0],
+                            is_backbone,
+                            num_heads=partial.shape[1],
+                            vdim=uv_vdim,
+                            combine_dtype=uv_combine_dtype,
                         )
                     ):
                         # Experimental TPU_DCP_MERGE_VSPACE_FUSED: the chunked

@@ -54,8 +54,8 @@ weight-streaming kernel (TPU_FP8_LINEAR_PALLAS) whose output this all-reduce
 would sum -- attention's o_proj -- takes ``row_parallel_or`` instead: one kernel
 for the matmul and the all-reduce (kernels/quantized_matmul/
 fp8_oproj_all_reduce.py), bitwise the two-call path, for blocks of at most
-16 rows inside the warmup (TPU_FUSED_OPROJ_AR_MAX_ROWS raises the cap to 32 or
-64 rows, where the two-call path's matmul is XLA's). Everything else keeps the
+16 rows inside the warmup (TPU_FUSED_OPROJ_AR_MAX_ROWS raises the cap up to
+96 rows, where the two-call path's matmul is XLA's). Everything else keeps the
 layer's own forward.
 """
 

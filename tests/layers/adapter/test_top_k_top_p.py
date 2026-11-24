@@ -291,13 +291,14 @@ def test_skip_bits_matches_full_search_when_idle():
 
 
 @pytest.mark.tpu_test
-def test_fast_top_p_matches_bisection(device, monkeypatch):
+# Dynamo's own patch restores the limit; monkeypatch's undo hides the key
+# for later tests. cache_size_limit is an alias of recompile_limit.
+@torch._dynamo.config.patch(recompile_limit=64)
+def test_fast_top_p_matches_bisection(device):
     """On TPU, compiled like the sampler graphs: f32 rows like the verify
     program and bf16 rows like the bonus program."""
     if device.type != "tpu":
         pytest.skip("compiled TPU check")
-    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 64)
-    monkeypatch.setattr(torch._dynamo.config, "cache_size_limit", 64)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def mask(logits, top_k, top_p, fast):

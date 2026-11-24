@@ -399,16 +399,16 @@ def test_flag_defaults_off():
 
 def test_write_semaphore_sets():
     """Up to two rounds each round keeps its own set (the 16- and 32-token
-    kernels as before); four rounds and the single-writer control share one,
-    the three semaphores of a one-round write."""
+    kernels as before); three to six rounds and the single-writer control share
+    one, the three semaphores of a one-round write."""
     sets = native_sc_gather.write_semaphore_sets
-    assert [sets(t, None) for t in (16, 32, 48, 64)] == [1, 2, 1, 1]
-    assert sets(32, "no_fence") == sets(64, "no_fence") == 1
+    assert [sets(t, None) for t in (16, 32, 48, 64, 80, 96)] == [1, 2, 1, 1, 1, 1]
+    assert sets(32, "no_fence") == sets(64, "no_fence") == sets(80, "no_fence") == 1
 
 
 def test_kv_write_in_gather_max_tokens():
-    """The 64-token bucket takes the write only under the knob, and no knob
-    value takes a bucket past four write rounds."""
+    """The 64-, 80- and 96-token buckets take the write only under the knob,
+    and no knob value takes a bucket past six write rounds."""
     from vllm_torchtpu.layers.core import attention_interface
 
     nope_spec, rope_spec = tcw._specs()
@@ -420,18 +420,24 @@ def test_kv_write_in_gather_max_tokens():
         assert not supported(nope_spec, rope_spec, 64, 2048)
     with mock.patch.dict(os.environ, {**env, MAX_TOKENS_FLAG: "64"}):
         assert supported(nope_spec, rope_spec, 64, 2048)
+        assert not supported(nope_spec, rope_spec, 80, 2048)
+    with mock.patch.dict(os.environ, {**env, MAX_TOKENS_FLAG: "96"}):
+        assert supported(nope_spec, rope_spec, 80, 2048)
+        assert supported(nope_spec, rope_spec, 96, 2048)
     with mock.patch.dict(os.environ, {**env, MAX_TOKENS_FLAG: "128"}):
         assert not supported(nope_spec, rope_spec, 128, 2048)
 
 
 def test_one_capped_gather_takes_the_one_chunk_live_group_bucket():
-    """Under the production chunking the 64-token bucket is one live-group
-    chunk (one gather); a bucket of two chunks is not."""
+    """Under the production chunking the 64-, 80- and 96-token buckets are
+    one live-group chunk (one gather); a bucket of two chunks is not."""
     from vllm_torchtpu.layers.core import attention_interface
 
     with mock.patch.dict(os.environ, prologue.PROD_ENV):
         assert attention_interface.one_capped_gather(32, 512)
         assert attention_interface.one_capped_gather(64, 512)
+        assert attention_interface.one_capped_gather(80, 512)
+        assert attention_interface.one_capped_gather(96, 512)
         assert not attention_interface.one_capped_gather(512, 512)
         assert not attention_interface.one_capped_gather(64, None)
 

@@ -63,6 +63,7 @@ rank, so each rank's partial covers its experts x its columns.
 """
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -76,7 +77,22 @@ from vllm_torchtpu.kernels.quantized_matmul.util import quantize_block
 
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8).max)
-ROW_BUCKETS = (16, 32, 64)
+# TPU_MOE_TP_DECODE_EXTRA_ROWS ("80,96,128,..."): more decode row counts to
+# admit (multiples of 16; read once at import, before Ray starts the workers).
+# Each is still subject to can_use_moe_tp_decode's shape and VMEM checks, so a
+# size whose plan does not fit keeps the usual path. Under EP a rank streams
+# only its own experts, so the larger high-concurrency decode steps (EP16 at
+# 80-192 rows) can stay on the fused kernel instead of the gmm-ep path.
+ROW_BUCKETS = tuple(
+    sorted(
+        {16, 32, 64}
+        | {
+            int(r)
+            for r in os.environ.get("TPU_MOE_TP_DECODE_EXTRA_ROWS", "").split(",")
+            if r.strip() and int(r) > 0 and int(r) % 16 == 0
+        }
+    )
+)
 # router_topk's clamp floor, above the finfo.min that masks a pick.
 ROUTER_NEG = -3.0e38
 # _route_fast: routing keys are positive normal f32 bit patterns from here.
@@ -156,9 +172,18 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
     slot = t((h, 2 * i), FP8) + t((i, h), FP8) + t((1, 2 * i), f32) + t((1, h), f32)
     need = fixed + _NUM_BUFFERS * slot + all_reduce.vmem_bytes(spec, info)
     limit = int(need * VMEM_HEADROOM)
-    if limit > int(info.vmem_capacity_bytes * VMEM_FRACTION):
+    if limit > int(info.vmem_capacity_bytes * _vmem_fraction()):
         return None
     return need, min(limit, info.vmem_capacity_bytes)
+
+
+def _vmem_fraction():
+    """TPU_MOE_TP_DECODE_VMEM_FRACTION: the share of VMEM the plan's limit may
+    take (default VMEM_FRACTION). Only admission moves with it; the limit of a
+    plan it admits is need x VMEM_HEADROOM either way."""
+    from vllm_torchtpu import envs
+
+    return float(envs.TPU_MOE_TP_DECODE_VMEM_FRACTION)
 
 
 def kernel_name(

@@ -25,6 +25,8 @@ attention kernel reads of the raw q head), so XLA never copies the whole q
 into the attention kernel's layout.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -35,7 +37,11 @@ from jax.experimental.pallas import tpu as pltpu
 MAX_BLOCK_TOKENS = 128
 # Below this, XLA's matmul is as fast: it prefetches W_UK into VMEM under the
 # previous op, while the kernel has to read it itself (measured at decode).
-MIN_TOKENS = 256
+# But XLA's batched dot emits head-major [H, T, R] and the sparse MLA kernel
+# reads token-major [T, H, R], so below the cut a transpose copy follows the
+# einsum (4-5 us at 64 tokens on GLM-5.2 DCP16). TPU_MLA_ABSORB_Q_MIN_TOKENS
+# lowers the cut (read once at import, before Ray starts the workers).
+MIN_TOKENS = int(os.environ.get("TPU_MLA_ABSORB_Q_MIN_TOKENS", "256"))
 # The 2-D input leaves VMEM for 256 tokens per grid step beside W_UK.
 MAX_HEAD_BLOCK_TOKENS = 256
 # The raw q head lanes the sparse MLA attention kernel reads with its
