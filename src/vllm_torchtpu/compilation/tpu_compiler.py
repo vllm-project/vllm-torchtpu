@@ -191,6 +191,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS",
     "VLLM_TPU_PREFILL_SRPT",
     "VLLM_TPU_PREFILL_SRPT_AGING_TOKENS_PER_S",
+    "VLLM_TPU_SIBLING_HOLD",
+    "VLLM_TPU_SIBLING_HOLD_MAX_S",
     "PYTHON_TRACER_LEVEL",
     # Decode-loop host switches (runner bookkeeping and Dynamo stance only;
     # TPU_HOST_KEEP_INPUT_MUTATIONS does change the graphs and stays keyed).

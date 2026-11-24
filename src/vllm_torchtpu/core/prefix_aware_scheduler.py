@@ -34,6 +34,17 @@ prefix ages out. A request that has waited `paw_max_wait_s` seconds (additional
 config, default 0 = off) is promoted ahead of every normal request,
 oldest first.
 
+With ``VLLM_TPU_SIBLING_HOLD`` (default off), requests that share a prefix
+with a request still prefilling it (subagent forks sent together) are held:
+a fresh waiting request whose next uncached KV block is a prompt block that a
+running request has not yet scheduled is skipped for the step, so it does not
+prefill the shared prefix a second time in parallel. vLLM caches a block when
+it is scheduled (hittable from the next step on TPU), so the held request
+resumes with that prefix as a hit one step after the running request's chunk
+covers it. A request is held at most
+``VLLM_TPU_SIBLING_HOLD_MAX_S`` seconds in total, never when the connector can
+load the block, and never when it is resumed, preempted or holds KV blocks.
+
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
 """
@@ -49,8 +60,9 @@ from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
 )
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.core import reuse_aware_eviction
 from vllm_torchtpu.core.eviction_aware_connector import EvictionAwareConnector
 from vllm_torchtpu.core.external_prefix_probe import ExternalPrefixProbe
@@ -74,6 +86,9 @@ DEFAULT_PAW_MAX_WAIT_S = 0.0
 # every step.
 _EXTERNAL_PROBE_REFRESH_STEPS = 8
 
+# Sibling hold: first-held time of a request whose hold ran out.
+_HOLD_EXPIRED = float("-inf")
+
 
 class PrefixAwareScheduler(AsyncScheduler):
     """Admit ready requests prioritizing fewest uncached prompt tokens."""
@@ -87,6 +102,13 @@ class PrefixAwareScheduler(AsyncScheduler):
     _paw_step: int = 0
     _paw_external_cache: dict[str, tuple[int, int, int, int]] | None = None
     _paw_aged: int = 0
+    # Sibling hold (VLLM_TPU_SIBLING_HOLD).
+    _sib_hold: bool = False
+    _sib_max_s: float = 0.0
+    _sib_first: dict[str, float] | None = None
+    _sib_local: dict[str, int] | None = None
+    _sib_holds: int = 0
+    _sib_expired: int = 0
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -107,6 +129,16 @@ class PrefixAwareScheduler(AsyncScheduler):
         if isinstance(connector, EvictionAwareConnector):
             connector.attach_block_pool(self.kv_cache_manager.block_pool)
         self._paw_external_cache = {}
+        self._sib_hold = envs.VLLM_TPU_SIBLING_HOLD
+        self._sib_max_s = envs.VLLM_TPU_SIBLING_HOLD_MAX_S
+        # Request id -> wall time it was first held; request id -> local
+        # prefix hit (tokens) at its last warmth scoring.
+        self._sib_first = {}
+        self._sib_local = {}
+        if self._sib_hold:
+            logger.info(
+                "PrefixAwareScheduler: sibling hold on (max %.1fs)", self._sib_max_s
+            )
 
         logger.info(
             "PrefixAwareScheduler ACTIVE (window=%d, max_wait=%.0fs, "
@@ -128,6 +160,8 @@ class PrefixAwareScheduler(AsyncScheduler):
                 request.block_hashes, max(request.num_tokens - 1, 0)
             )
             local = int(result[1])
+            if self._sib_hold and self._sib_local is not None:
+                self._sib_local[request.request_id] = local
         except Exception:
             if not self._paw_scoring_broken:
                 self._paw_scoring_broken = True
@@ -166,6 +200,141 @@ class PrefixAwareScheduler(AsyncScheduler):
         external = max(0, min(external, request.num_tokens - local))
         cache[request.request_id] = (local, num_hashes, external, self._paw_step)
         return external
+
+    def _handle_blocked_waiting_request(self, request: Request) -> bool:
+        ready = super()._handle_blocked_waiting_request(request)
+        if (
+            ready
+            and self._sib_hold
+            and self._sib_max_s > 0
+            and self._sibling_held(request, start=True)
+        ):
+            # Skipped for this step only: it stays at its place in the queue.
+            return False
+        return ready
+
+    def _sibling_held(self, request: Request, start: bool = False) -> bool:
+        """Whether ``request`` waits this step for a running request to
+        schedule the next block of their shared prefix. ``start`` starts (and
+        counts) the hold; without it this only checks."""
+        first_held = self._sib_first
+        if first_held is None:
+            first_held = self._sib_first = {}
+        now = time.time()
+        first = first_held.get(request.request_id)
+        if first is not None and now - first >= self._sib_max_s:
+            if start and first != _HOLD_EXPIRED:
+                # Count each expired hold once.
+                first_held[request.request_id] = _HOLD_EXPIRED
+                self._sib_expired += 1
+            return False
+        if not self._sibling_leader_pending(request):
+            return False
+        if start:
+            if first is None:
+                first_held[request.request_id] = now
+                if len(first_held) > 4 * self.WINDOW:
+                    self._sib_prune()
+            self._sib_holds += 1
+            if self._sib_holds % _LOG_EVERY == 0:
+                logger.info(
+                    "sibling hold: held_steps=%d held_requests=%d expired=%d",
+                    self._sib_holds,
+                    len(first_held),
+                    self._sib_expired,
+                )
+        return True
+
+    def _sib_prune(self) -> None:
+        """Drop hold state of requests no longer waiting."""
+        reqs = getattr(self, "requests", {})
+        for state in (self._sib_first, self._sib_local):
+            if not state:
+                continue
+            for req_id in [
+                k
+                for k in state
+                if (r := reqs.get(k)) is None or r.status != RequestStatus.WAITING
+            ]:
+                del state[req_id]
+
+    def _local_hit(self, request: Request) -> int:
+        result = self.kv_cache_manager.coordinator.find_longest_cache_hit(
+            request.block_hashes, max(request.num_tokens - 1, 0)
+        )
+        return int(result[1])
+
+    def _sibling_leader_pending(self, request: Request) -> bool:
+        """Whether a running request still has to prefill the scheduler
+        block that would extend ``request``'s prefix-cache hit.
+
+        Block hashes chain their parent, so equal hashes at one index mean an
+        equal prompt up to there. Blocks are cached when scheduled and are
+        hits from the next step on (the TPU same-step patch hides blocks the
+        current step has not written). So a shared block past the hit is one
+        the running request schedules this step or later, and its hold ends
+        the step after the running request has scheduled it.
+        """
+        if (
+            request.status != RequestStatus.WAITING
+            or request.num_computed_tokens > 0
+            or request.num_preemptions > 0
+            or request.skip_reading_prefix_cache
+            or self._paw_scoring_broken
+        ):
+            return False
+        kvm = self.kv_cache_manager
+        if not kvm.enable_caching:
+            return False
+        hashes = request.block_hashes
+        hash_bs = int(getattr(self, "hash_block_size", 0) or self.block_size)
+        sched_bs = int(self.block_size)
+        if hash_bs <= 0 or sched_bs % hash_bs:
+            return False
+        try:
+            local_cache = self._sib_local
+            if local_cache is None:
+                local_cache = self._sib_local = {}
+            local = local_cache.get(request.request_id)
+            if local is None:
+                local = local_cache[request.request_id] = self._local_hit(request)
+            # Cheap filter at the last scored hit: a running prefill sharing
+            # the block there. Its scheduled blocks only extend the hit.
+            i = local // hash_bs
+            if i >= len(hashes):
+                return False
+            h = hashes[i]
+            leaders = [
+                r
+                for r in self.running
+                if r is not request
+                and r.num_computed_tokens < r.num_prompt_tokens
+                and len(r.block_hashes) > i
+                and r.block_hashes[i] == h
+            ]
+            if not leaders:
+                return False
+            local = local_cache[request.request_id] = self._local_hit(request)
+        except Exception:
+            logger.exception("sibling hold: prefix lookup failed; hold disabled.")
+            self._sib_hold = False
+            return False
+        # Last hash block of the next scheduler block past the hit; a hit
+        # stops one token short of the prompt end.
+        j = local // hash_bs + sched_bs // hash_bs - 1
+        end = (j + 1) * hash_bs
+        if j >= len(hashes) or end > request.num_tokens - 1:
+            return False
+        hj = hashes[j]
+        if not any(
+            end <= r.num_prompt_tokens
+            and len(r.block_hashes) > j
+            and r.block_hashes[j] == hj
+            for r in leaders
+        ):
+            return False
+        # The connector loads it: a DMA, not a prefill, so do not wait.
+        return local + self._external_warmth(request, local) < end
 
     def _rank_and_warmth(
         self, request: Request

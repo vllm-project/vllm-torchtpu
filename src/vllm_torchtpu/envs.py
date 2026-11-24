@@ -304,6 +304,8 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S: float = 0.0
     VLLM_TPU_PREFILL_SRPT: bool = False
     VLLM_TPU_PREFILL_SRPT_AGING_TOKENS_PER_S: float = 256.0
+    VLLM_TPU_SIBLING_HOLD: bool = False
+    VLLM_TPU_SIBLING_HOLD_MAX_S: float = 4.0
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS: int = 0
@@ -2007,6 +2009,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (0: pure shortest-remaining first, no starvation bound).
     "VLLM_TPU_PREFILL_SRPT_AGING_TOKENS_PER_S": env_nonnegative_float(
         "VLLM_TPU_PREFILL_SRPT_AGING_TOKENS_PER_S", 256.0
+    ),
+    # PrefixAwareScheduler (and PrefillSpacingScheduler): in-batch shared-prefix
+    # dedupe. A fresh waiting request whose next uncached KV block is a prompt
+    # block that a running request has still to prefill is held in the queue
+    # until that block is scheduled (and so cached), instead of prefilling the
+    # shared prefix a second time. Off (default): no hold.
+    "VLLM_TPU_SIBLING_HOLD": env_bool("VLLM_TPU_SIBLING_HOLD"),
+    # VLLM_TPU_SIBLING_HOLD: seconds a request may be held in total; after that
+    # it is admitted as usual (bounds the TTFT added by the hold).
+    "VLLM_TPU_SIBLING_HOLD_MAX_S": env_nonnegative_float(
+        "VLLM_TPU_SIBLING_HOLD_MAX_S", 4.0
     ),
     # MiniMax M3 DCP steps of at most this many tokens merge the attention
     # partials with one packed all-to-all instead of an LSE all-gather plus an
