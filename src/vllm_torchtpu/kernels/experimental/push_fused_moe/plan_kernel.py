@@ -635,6 +635,7 @@ def _build_exchange_rows_tables_split(
         tile_m=tile_m,
         light_prepush=light_prepush,
     )
+    pair_rows = not scatter_rows
 
     def start_kernel(rank_sm, idx_sm, x_hbm, src_hbm, out_hbm, dst_hbm, sems):
         send_sem, recv_sem, lsem, gsem = (sems.at[i] for i in range(_N_SPLIT_SEMS))
@@ -658,13 +659,21 @@ def _build_exchange_rows_tables_split(
         del src_hbm, out_in, dst_in
         out_hbm, dst_hbm = rest[:2]
         outs = rest[2 : 2 + N_TABLE_OUTS]
-        csem, cnt_vm, r3_vm = rest[2 + N_TABLE_OUTS :]
+        rest = rest[2 + N_TABLE_OUTS :]
+        if pair_rows:
+            pay_o, psem, *rest = rest
+        csem, cnt_vm, r3_vm = rest
         send_sem, recv_sem, lsem, gsem = (sems.at[i] for i in range(_N_SPLIT_SEMS))
         me = rank_sm[0]
         tx._exchange_wait(ep, me, x_hbm, out_hbm, send_sem, recv_sem, lsem)
+        if pair_rows:
+            pay = pltpu.make_async_copy(out_hbm.at[:, pl.ds(0, 2), :], pay_o, psem)
+            pay.start()
         _tables_after_exchange(
             me, out_hbm, dst_hbm, seg3_vm, outs, csem, gsem, cnt_vm, r3_vm, **table_kw
         )
+        if pair_rows:
+            pay.wait()
 
     def start(packed, rank, rows, idx):
         idx = idx.astype(jnp.int32).reshape(-1)
@@ -703,15 +712,17 @@ def _build_exchange_rows_tables_split(
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=1,
                 in_specs=[tx._HBM, tx._HBM, tx._HBM, tx._HBM, _SEM, vmem],
-                out_specs=(tx._HBM, tx._HBM) + (vmem,) * N_TABLE_OUTS,
-                scratch_shapes=(pltpu.SemaphoreType.DMA,) + _table_scratch(ep, n_cnt),
+                out_specs=(tx._HBM, tx._HBM) + (vmem,) * (N_TABLE_OUTS + pair_rows),
+                scratch_shapes=(pltpu.SemaphoreType.DMA,) * (1 + pair_rows)
+                + _table_scratch(ep, n_cnt),
                 grid=(),
             ),
             out_shape=(
                 jax.ShapeDtypeStruct(out.shape, out.dtype),
                 jax.ShapeDtypeStruct(gathered.shape, gathered.dtype),
             )
-            + _table_out_shapes(ep, g),
+            + _table_out_shapes(ep, g)
+            + ((jax.ShapeDtypeStruct((ep, 2, LANES), jnp.int32),) if pair_rows else ()),
             input_output_aliases={3: 0, 4: 1},
             compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
             name=_exchange_name(
@@ -724,8 +735,12 @@ def _build_exchange_rows_tables_split(
                 scatter_rows,
             ),
         )(r, slab, rows, out, gathered, sems, _seg3(seg_start_local, ep, g))
-        # The raw [ep, rows, 128] payload last, for build_pair_tables.
-        return (tx._unpad(out, ep, width), gathered) + _unpack_tables(tables) + (out,)
+        # The payload last: for build_pair_tables, its pair and scale rows,
+        # copied into VMEM beside the table build (XLA would otherwise stage
+        # the whole HBM payload right before that kernel); for the wide path's
+        # build_pair_rows, which reads every row, the raw [ep, rows, 128].
+        pay = tables.pop() if pair_rows else out
+        return (tx._unpad(out, ep, width), gathered) + _unpack_tables(tables) + (pay,)
 
     return start, done
 
@@ -747,7 +762,9 @@ def build_exchange_rows_tables_split(
     can run while its rows are in flight: start(packed, rank, rows, idx) ->
     handle (barrier, every push and row copy issued, none waited);
     done(handle, rows, seg_start_local) -> build_exchange_rows_tables'
-    outputs. `rows` goes to both, keeping it live for the copies reading it.
+    outputs, the last one (the raw payload) cut to the [ep, 2, 128] rows
+    build_pair_tables reads unless `scatter_rows`. `rows` goes to both,
+    keeping it live for the copies reading it.
     The handle holds buffers peers are still writing: it is opaque, and goes
     to done once and to nothing else (a copy of it would read rows mid-flight)."""
     g = e_total // ep
@@ -901,12 +918,12 @@ def build_pair_tables(
     """routing_pairs_from_tables' arrival rows and mirror positions for this
     shard's pairs, and the activation scale slab its routed pairs fill, in one
     kernel straight from the exchanged payload (`exchange_out`, the exchange
-    kernel's [ep, rows, 128] HBM output: pairs in row 0, row-scale bits in
-    row 1). `recv_base`/`mirror_base` [e_total] and `run_base` [ep, g] are the
-    table kernel's plan tables. Same integers as host.routing_pairs_from_tables
-    and the scale slab's drop-mode scatter (every routed pair has a slab row
-    of its own). Returns (pos [t_local, topk], mirror_pos, scale slab
-    f32 [scale_rows, 128])."""
+    kernel's [ep, rows, 128] output or its first two rows: pairs in row 0,
+    row-scale bits in row 1). `recv_base`/`mirror_base` [e_total] and
+    `run_base` [ep, g] are the table kernel's plan tables. Same integers as
+    host.routing_pairs_from_tables and the scale slab's drop-mode scatter
+    (every routed pair has a slab row of its own). Returns (pos [t_local,
+    topk], mirror_pos, scale slab f32 [scale_rows, 128])."""
     g = e_total // ep
     pad = (-e_total) % LANES
     call = _build_pair_tables(
