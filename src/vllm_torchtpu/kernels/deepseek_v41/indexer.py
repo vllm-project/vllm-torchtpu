@@ -101,7 +101,9 @@ def pipeline_score_topk_bounded(
             previous = select(jnp.int32(tile), current, group)
             current = following
         if previous is not None:
-            previous, current = lax.optimization_barrier((previous, current))
+            previous, current, output = lax.optimization_barrier(
+                (previous, current, output)
+            )
             output, _ = write(num_tiles - 2, previous, output, None)
         last = num_tiles - 1
         selected = select(jnp.int32(last), current, None)
