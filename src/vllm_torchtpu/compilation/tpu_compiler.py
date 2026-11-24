@@ -248,11 +248,12 @@ _TPU_COMPILE_ENV_IGNORED = {
     # the compiled forwards, which take the same inputs either way.
     "TPU_PP_HANDOFF",
     "TPU_PP_RING_DEPTH",
-    # API-server prompt tokenization: it acts in the front end, never in the
-    # compiled model.
+    # API-server prompt tokenization and detokenization: they act in the
+    # front end, never in the compiled model.
     "VLLM_TPU_SEGMENT_TOKENIZE",
     "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS",
     "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS",
+    "VLLM_TPU_DETOK_PRIME_SUFFIX",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the

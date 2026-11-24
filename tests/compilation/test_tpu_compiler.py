@@ -322,6 +322,7 @@ class TestTpuCompilerCache:
             "VLLM_TPU_SEGMENT_TOKENIZE",
             "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS",
             "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS",
+            "VLLM_TPU_DETOK_PRIME_SUFFIX",
         }
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED
