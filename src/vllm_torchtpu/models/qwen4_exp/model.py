@@ -57,14 +57,11 @@ from vllm.models.qwen4_exp.common.hyperconnection import (
     HyperConnectionConfig,
 )
 
+from vllm_torchtpu.models.qwen4_exp.attention import Qwen4ExpAttention
 from vllm_torchtpu.models.qwen4_exp.ple import (
     PLEStateCache,
     Qwen4ExpPLELayer,
     Qwen4ExpPLETable,
-)
-from vllm_torchtpu.models.qwen4_exp.qsa import (
-    Qwen4ExpQSAAttention,
-    Qwen4ExpQSAIndexer,
 )
 
 
@@ -109,7 +106,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
         elif self.layer_type == "indexed_attention":
             # The checkpoint's full_attention (QSA) layers; see config.py.
-            self.self_attn = Qwen4ExpQSAAttention(
+            self.self_attn = Qwen4ExpAttention(
                 config,
                 model_config=vllm_config.model_config,
                 cache_config=vllm_config.cache_config,
@@ -316,9 +313,12 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             # The checkpoint keeps its PLE weights when ple_layer_ids is
             # overridden to [].
             mapper = mapper | WeightsMapper(orig_to_new_substr={".ple.": None})
-        if not any(isinstance(module, Qwen4ExpQSAIndexer) for module in modules):
+        if not any(
+            isinstance(module, Qwen4ExpAttention) and module.indexer is not None
+            for module in modules
+        ):
             # Within dense_max_model_len QSA is dense attention (see
-            # Qwen4ExpQSAAttention) and needs no indexer.
+            # Qwen4ExpAttention) and needs no indexer.
             mapper = mapper | WeightsMapper(
                 orig_to_new_substr={".self_attn.indexer.": None}
             )

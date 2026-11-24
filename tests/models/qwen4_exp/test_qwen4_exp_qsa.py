@@ -22,7 +22,18 @@ import pytest
 import torch
 
 from vllm_torchtpu.models.qwen4_exp.ops.qsa import _qsa_attention, qsa_attention
-from vllm_torchtpu.models.qwen4_exp.qsa import _apply_partial_rope
+
+
+def _apply_partial_rope(
+    x: torch.Tensor, positions: torch.Tensor, cos_sin: torch.Tensor
+) -> torch.Tensor:
+    rotary_dim = cos_sin.shape[-1]
+    cos, sin = cos_sin[positions].float().unsqueeze(1).chunk(2, dim=-1)
+    rot, rest = x[..., :rotary_dim].float(), x[..., rotary_dim:]
+    x1, x2 = rot.chunk(2, dim=-1)
+    rot = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+    return torch.cat([rot.to(x.dtype), rest], dim=-1)
+
 
 H, KVH, D, DI, IH = 4, 2, 32, 16, 3
 RATIO, TOPK = 4, 2
@@ -58,7 +69,10 @@ def _reference(seq, p, k_norm_weight, cos_sin):
         pooled = _gemma_norm(raw.mean(1), k_norm_weight)
         starts = torch.arange(num_blocks) * RATIO
         keys = _apply_partial_rope(pooled[:, None], starts, cos_sin)[:, 0]
-        scores = torch.relu(seq["iq"][p] @ keys.T).sum(0) / math.sqrt(DI)
+        iq_roped = _apply_partial_rope(
+            seq["iq"][p : p + 1], torch.tensor([p]), cos_sin
+        )[0]
+        scores = torch.relu(iq_roped @ keys.T).sum(0) / math.sqrt(DI)
         top = scores.topk(min(TOPK, num_blocks)).indices
         selected = [b * RATIO + i for b in top.tolist() for i in range(RATIO)]
         selected += list(range(num_blocks * RATIO, visible))

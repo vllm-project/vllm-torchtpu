@@ -11,165 +11,78 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""QSA (query-selected sparse attention) PyTorch modules for Qwen4Exp.
+"""QSA (query-selected sparse attention) core module for Qwen4Exp.
 
-Follows the HF reference (``Qwen4ExpTextQSAIndexer``, ``Qwen4ExpTextAttention``).
-The sparse kernel op lives in ``ops/qsa.py`` so optimized Pallas/Tokamax
-backends can be swapped in without changing model or weight wiring.
+Owns the checkpoint indexer weights (``index_qk_proj``, ``q_layernorm``,
+``k_layernorm``) and ``index_cache`` pool registration; all RoPE and sparse
+compute live in ``ops/qsa.py``. Attached as ``self.indexer`` on
+``Qwen4ExpAttention`` so checkpoint paths ``self_attn.indexer.*`` match HF.
 """
 
 from __future__ import annotations
 
-from typing import Any, cast
+from collections.abc import Callable
+from typing import Any
 
 import torch
 from torch import nn
-from transformers import Qwen3NextConfig, Qwen4ExpTextConfig
-from vllm.config import CacheConfig, ModelConfig
-from vllm.forward_context import get_forward_context
+from transformers import Qwen4ExpTextConfig
+from vllm.config import CacheConfig
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
+from vllm_torchtpu.models.qwen4_exp.layout import (
+    QKVLayout,
+    TensorLayout,
+    unfused_o,
+    unfused_qkv,
+)
 from vllm_torchtpu.models.qwen4_exp.ops.qsa import qsa_attention
 
 
-class Qwen4ExpQSAAttention(Qwen3NextAttention):
-    """Qwen3-Next gated attention with the QSA indexer and sparse path."""
+def dense_max_model_len(config: Qwen4ExpTextConfig) -> int:
+    """Longest sequence where every token fits in topk_blocks + open tail."""
+    ratio = config.indexer_compress_ratio
+    budget = config.indexer_budget
+    assert ratio is not None and budget is not None
+    topk_blocks = budget // ratio
+    return (topk_blocks + 1) * ratio - 1
+
+
+def qsa_input_layouts(
+    dtype: torch.dtype, kv_layout: KVCacheLayout
+) -> tuple[QKVLayout, ...]:
+    """(q, kv) input layouts accepted by ``Qwen4ExpQSA.forward``."""
+    if kv_layout is KVCacheLayout.LBHNC:
+        return ()
+    return (unfused_qkv(dtype),)
+
+
+def qsa_output_layouts(
+    dtype: torch.dtype, kv_layout: KVCacheLayout
+) -> tuple[TensorLayout, ...]:
+    """Attention output layouts produced by ``Qwen4ExpQSA.forward``."""
+    if kv_layout is KVCacheLayout.LBHNC:
+        return ()
+    return (unfused_o(dtype),)
+
+
+class Qwen4ExpQSA(nn.Module):
+    """Sparse QSA core: indexer projections, index KV pool, and op dispatch."""
 
     def __init__(
         self,
         config: Qwen4ExpTextConfig,
         *,
-        model_config: ModelConfig,
-        cache_config: CacheConfig,
-        quant_config: QuantizationConfig | None,
-        prefix: str,
-    ) -> None:
-        # The Qwen3-Next layer reads only fields the Qwen4Exp text config also
-        # has; the transformers class just does not subclass Qwen3NextConfig.
-        super().__init__(
-            cast(Qwen3NextConfig, config),
-            model_config=model_config,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
-        ratio = config.indexer_compress_ratio
-        budget = config.indexer_budget
-        index_head_dim = config.indexer_head_dim
-        assert ratio is not None and budget is not None and index_head_dim is not None
-        topk_blocks = budget // ratio
-        # Below this length every visible token fits in topk_blocks + open tail,
-        # so dense paged attention is already exact.
-        self.dense_max_model_len = (topk_blocks + 1) * ratio - 1
-        self.sparse = model_config.max_model_len > self.dense_max_model_len
-        if not self.sparse:
-            return
-        if (
-            cache_config is not None
-            and cache_config.get_resolved_kv_cache_layout() is KVCacheLayout.LBHNC
-        ):
-            raise NotImplementedError(
-                "Qwen4Exp sparse QSA requires NHD (LBNHC) KV cache layout, "
-                "got HND (LBHNC)."
-            )
-        if index_head_dim > self.head_dim:
-            raise NotImplementedError(
-                f"QSA stores index keys in a head_dim={self.head_dim} cache; "
-                f"indexer_head_dim={index_head_dim} does not fit."
-            )
-        self.indexer = Qwen4ExpQSAIndexer(
-            config, quant_config, prefix=f"{prefix}.indexer"
-        )
-        # Same spec as self.attn, so the index keys share its cache group and
-        # block table. Its forward is never called: qsa_attention writes it.
-        # TODO(QSA): this doubles KV memory for QSA layers; replace with a
-        # compact/packed index cache spec so 256k workloads do not pay 2x KV.
-        self.index_cache = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.index_cache",
-        )
-        self.compress_ratio = ratio
-        self.topk_blocks = topk_blocks
-        self.norm_eps = config.rms_norm_eps
-
-    def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v, gate = self._project_qkv_gate(qkv, positions)
-        # Bring-up trade-off: self.attn populates main_pool and supplies dense_out
-        # for positions <= dense_max_model_len; _sparse_attention overwrites tokens
-        # past that threshold. TODO(QSA): replace with a KV-write-only + Pallas QSA
-        # kernel to avoid redundant dense attention on sparse steps.
-        attn_output = self.attn(q, k, v)
-        main_pool = self.attn.kv_cache
-        if self.sparse and main_pool.numel() > 0:
-            attn_output = self._sparse_attention(
-                positions, hidden_states, q, attn_output, main_pool
-            )
-        assert gate is not None
-        attn_output = attn_output * torch.sigmoid(gate)
-        output, _ = self.o_proj(attn_output)
-        return output
-
-    def _sparse_attention(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        q: torch.Tensor,
-        dense_out: torch.Tensor,
-        main_pool: torch.Tensor,
-    ) -> torch.Tensor:
-        cos_sin_cache = self.rotary_emb.cos_sin_cache
-        index_q, raw_keys = self.indexer(hidden_states, positions, cos_sin_cache)
-        attn_metadata = get_forward_context().attn_metadata
-        assert isinstance(attn_metadata, dict)
-        metadata: Any = attn_metadata[self.attn.layer_name]
-        kv_scales = torch.stack(
-            [
-                cast(torch.Tensor, self.attn._k_scale),
-                cast(torch.Tensor, self.attn._v_scale),
-            ]
-        ).float()
-        out = qsa_attention(
-            q=q.view(-1, self.num_heads, self.head_dim),
-            index_q=index_q,
-            raw_keys=raw_keys,
-            dense_out=dense_out.view(-1, self.num_heads, self.head_dim),
-            positions=positions,
-            query_start_loc=metadata.query_start_loc,
-            seq_lens=metadata.seq_lens,
-            block_tables=metadata.block_tables,
-            main_pool=main_pool,
-            index_pool=self.index_cache.kv_cache,
-            cos_sin_cache=cos_sin_cache,
-            k_norm_weight=self.indexer.k_layernorm.weight,
-            kv_scales=kv_scales,
-            num_kv_heads=self.num_kv_heads,
-            compress_ratio=self.compress_ratio,
-            topk_blocks=self.topk_blocks,
-            scale=self.scaling,
-            norm_eps=self.norm_eps,
-        )
-        return out.reshape(dense_out.shape)
-
-
-class Qwen4ExpQSAIndexer(nn.Module):
-    """Index queries and raw index keys; HF's ``Qwen4ExpTextQSAIndexer``."""
-
-    def __init__(
-        self,
-        config: Qwen4ExpTextConfig,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        scaling: float,
+        qkv_layout: QKVLayout,
+        cache_config: CacheConfig | None,
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> None:
@@ -178,45 +91,107 @@ class Qwen4ExpQSAIndexer(nn.Module):
             raise NotImplementedError(
                 f"QSA supports indexer_kv_heads=1, got {config.indexer_kv_heads}."
             )
+        ratio = config.indexer_compress_ratio
+        budget = config.indexer_budget
+        index_head_dim = config.indexer_head_dim
         assert (
-            config.indexer_n_heads is not None and config.indexer_head_dim is not None
+            config.indexer_n_heads is not None
+            and index_head_dim is not None
+            and ratio is not None
+            and budget is not None
         )
-        self.num_heads: int = config.indexer_n_heads
-        self.head_dim: int = config.indexer_head_dim
+        if index_head_dim > head_dim:
+            raise NotImplementedError(
+                f"QSA stores index keys in a head_dim={head_dim} cache; "
+                f"indexer_head_dim={index_head_dim} does not fit."
+            )
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.scaling = scaling
+        self.qkv_layout = qkv_layout
+        self.index_num_heads: int = config.indexer_n_heads
+        self.index_head_dim: int = index_head_dim
+        self.compress_ratio: int = ratio
+        self.topk_blocks: int = budget // ratio
+        self.norm_eps: float = config.rms_norm_eps
+
         self.index_qk_proj = ReplicatedLinear(
             config.hidden_size,
-            (self.num_heads + 1) * self.head_dim,
+            (self.index_num_heads + 1) * self.index_head_dim,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.index_qk_proj",
+            prefix=f"{prefix}.indexer.index_qk_proj",
         )
-        self.q_layernorm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_layernorm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_layernorm = GemmaRMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
+        self.k_layernorm = GemmaRMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
+        # Same spec as main_attn so index keys share its cache group and block
+        # table. Its forward is never called: ops/qsa.py writes it directly.
+        self.index_cache = Attention(
+            num_heads,
+            head_dim,
+            scaling,
+            num_kv_heads=num_kv_heads,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.index_cache",
+        )
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        *,
+        q: torch.Tensor,
+        kv: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        main_pool: torch.Tensor,
+        metadata: Any,
+        kv_scales: torch.Tensor | None,
         cos_sin_cache: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """(normed, roped index queries [T, heads, dim], raw keys [T, dim])."""
+        dense_attn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Runs QSA core attention (KV update + indexer + sparse attend).
+
+        Accepts ``(q, kv)`` in ``self.qkv_layout`` and returns ``o`` in
+        ``qsa_output_layouts`` so switching QSA to packed layouts or Pallas KV
+        writes stays confined to this module.
+        """
+        if not isinstance(kv, tuple):
+            raise NotImplementedError(
+                f"Qwen4ExpQSA does not yet accept packed KV layout {self.qkv_layout}."
+            )
+        k, v = kv
+        q2d = q.reshape(-1, self.num_heads * self.head_dim)
+        k2d = k.reshape(-1, self.num_kv_heads * self.head_dim)
+        v2d = v.reshape(-1, self.num_kv_heads * self.head_dim)
+        dense_out = dense_attn(q2d, k2d, v2d).view(-1, self.num_heads, self.head_dim)
+        if main_pool.numel() == 0:
+            return dense_out
+        assert metadata is not None and kv_scales is not None
         qk, _ = self.index_qk_proj(hidden_states)
-        q, raw_keys = qk.split([self.num_heads * self.head_dim, self.head_dim], -1)
-        q = self.q_layernorm(q.reshape(-1, self.num_heads, self.head_dim))
-        return _apply_partial_rope(q, positions, cos_sin_cache), raw_keys
-
-
-def _apply_partial_rope(
-    x: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor
-) -> torch.Tensor:
-    """NeoX RoPE on the first ``cos_sin_cache.shape[-1]`` dims of ``x``.
-
-    ``x`` is [num_tokens, heads, dim]; ``cos_sin_cache`` [max_pos, rotary_dim]
-    holds cos then sin, as vLLM's RotaryEmbedding builds it.
-    """
-    rotary_dim = cos_sin_cache.shape[-1]
-    cos, sin = cos_sin_cache[positions].float().unsqueeze(1).chunk(2, dim=-1)
-    rot, rest = x[..., :rotary_dim].float(), x[..., rotary_dim:]
-    x1, x2 = rot.chunk(2, dim=-1)
-    rot = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
-    return torch.cat([rot.to(x.dtype), rest], dim=-1)
+        index_q, raw_keys = qk.split(
+            [self.index_num_heads * self.index_head_dim, self.index_head_dim], -1
+        )
+        index_q = self.q_layernorm(
+            index_q.reshape(-1, self.index_num_heads, self.index_head_dim)
+        )
+        return qsa_attention(
+            q=q.reshape(-1, self.num_heads, self.head_dim),
+            index_q=index_q,
+            raw_keys=raw_keys,
+            dense_out=dense_out,
+            positions=positions,
+            query_start_loc=metadata.query_start_loc,
+            seq_lens=metadata.seq_lens,
+            block_tables=metadata.block_tables,
+            main_pool=main_pool,
+            index_pool=self.index_cache.kv_cache,
+            cos_sin_cache=cos_sin_cache,
+            k_norm_weight=self.k_layernorm.weight,
+            kv_scales=kv_scales,
+            num_kv_heads=self.num_kv_heads,
+            compress_ratio=self.compress_ratio,
+            topk_blocks=self.topk_blocks,
+            scale=self.scaling,
+            norm_eps=self.norm_eps,
+        )

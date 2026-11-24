@@ -204,6 +204,7 @@ def _qsa_attention(
         )
     ratio = compress_ratio
     num_reqs = seq_lens.shape[0]
+    index_q = _rope(index_q, positions, cos_sin)
     request, chunk_pos, valid = _token_requests(query_start_loc, num_tokens)
     index_rows = _PagedRows(index_pool, block_tables, num_reqs)
 
@@ -465,12 +466,14 @@ def _rms_norm(x: jax.Array, weight: jax.Array, eps: float) -> jax.Array:
 
 
 def _rope(x: jax.Array, positions: jax.Array, cos_sin: jax.Array) -> jax.Array:
-    """NeoX RoPE on the first ``cos_sin.shape[-1]`` dims of [T, dim] rows."""
+    """NeoX RoPE on the first ``cos_sin.shape[-1]`` dims of [T, ..., dim] rows."""
     rotary_dim = cos_sin.shape[-1]
     half = rotary_dim // 2
     cs = cos_sin[positions].astype(jnp.float32)
     cos, sin = cs[:, :half], cs[:, half:]
-    rot = x[:, :rotary_dim].astype(jnp.float32)
-    x1, x2 = rot[:, :half], rot[:, half:]
+    if x.ndim == 3:
+        cos, sin = cos[:, None, :], sin[:, None, :]
+    rot = x[..., :rotary_dim].astype(jnp.float32)
+    x1, x2 = rot[..., :half], rot[..., half:]
     rot = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
-    return jnp.concatenate([rot.astype(x.dtype), x[:, rotary_dim:]], axis=-1)
+    return jnp.concatenate([rot.astype(x.dtype), x[..., rotary_dim:]], axis=-1)
