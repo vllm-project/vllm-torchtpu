@@ -63,9 +63,6 @@ from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention_pooled,
     run_jax_gdn_attention_pooled_pcp_prefill_projection,
 )
-from vllm_torchtpu.layers.core.sequence_layout import (
-    is_pcp_streaming_attention_metadata,
-)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
@@ -1152,7 +1149,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self, hidden_states: torch.Tensor, state_pool: torch.Tensor, attn_metadata
     ) -> torch.Tensor:
         """Run the mandatory fused path for an allocated pooled PCP call."""
-        if not is_pcp_streaming_attention_metadata(attn_metadata):
+        if not bool(getattr(attn_metadata, "use_pcp_streaming", False)):
             raise RuntimeError(
                 "PCP is configured with a unified pool, but attention "
                 "metadata does not use the PCP streaming sequence layout."
@@ -1364,7 +1361,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 )
                 if mamba_request_distribution is not None:
                     request_distribution = mamba_request_distribution
-                use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
+                use_pcp_streaming = bool(
+                    getattr(attn_metadata, "use_pcp_streaming", False)
+                )
                 if not use_pcp_streaming and self.num_spec > 0:
                     assert slot_read_offsets is not None, (
                         "Speculative decoding with GDN layers requires "

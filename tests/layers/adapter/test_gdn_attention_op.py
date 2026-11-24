@@ -32,7 +32,6 @@ from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
     VllmGatedDeltaNetAttention,
     gdn_attention_core_tpu_pcp_prefill,
 )
-from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -831,6 +830,7 @@ class TestVllmGatedDeltaNetAttention:
 
         mock_fc = MagicMock()
         mock_attn_metadata = MagicMock()
+        mock_attn_metadata.use_pcp_streaming = False
         mock_attn_metadata.seq_lens = torch.ones(2)
         mock_attn_metadata.block_tables = torch.tensor([5, 6, 7, 8])
         # None exercises the legacy block_tables[:, 0] fallback used by
@@ -931,6 +931,7 @@ class TestVllmGatedDeltaNetAttention:
 
         mock_fc = MagicMock()
         mock_attn_metadata = MagicMock()
+        mock_attn_metadata.use_pcp_streaming = False
         mock_attn_metadata.seq_lens = torch.ones(2)
         mock_attn_metadata.block_tables = torch.tensor([5, 6, 7, 8])
         # None exercises the legacy block_tables[:, 0] fallback used by
@@ -1017,6 +1018,7 @@ class TestVllmGatedDeltaNetAttention:
 
         mock_fc = MagicMock()
         mock_attn_metadata = MagicMock()
+        mock_attn_metadata.use_pcp_streaming = False
         mock_attn_metadata.seq_lens = torch.ones(2)
         # block_tables would yield [5, 7] via the fallback; the compact slot
         # ids [3, 1] must win instead.
@@ -1098,8 +1100,7 @@ class TestVllmGatedDeltaNetAttention:
         mock_attn_metadata.seq_lens = torch.tensor([4], dtype=torch.int32)
         mock_attn_metadata.block_tables = torch.tensor([5, 6, 7, 8])
         mock_attn_metadata.mamba_state_indices = torch.tensor([3, 1], dtype=torch.int32)
-        mock_attn_metadata.sequence_layout_kind = SequenceLayoutKind.PARTIAL.value
-        mock_attn_metadata.sequence_layout_protocol = "pcp_streaming"
+        mock_attn_metadata.use_pcp_streaming = True
         mock_attn_metadata.query_start_loc = torch.tensor([0, 4], dtype=torch.int32)
         mock_attn_metadata.request_distribution = torch.zeros(3)
         # PCP prefill does not consume non-PCP verify rollback offsets.
@@ -1195,8 +1196,7 @@ class TestVllmGatedDeltaNetAttention:
             seq_lens=torch.ones(2),
             block_tables=torch.tensor([5, 6, 7, 8]),
             mamba_state_indices=torch.tensor([3, 1], dtype=torch.int32),
-            sequence_layout_kind=SequenceLayoutKind.ALL.value,
-            sequence_layout_protocol="default",
+            use_pcp_streaming=False,
             query_start_loc=torch.zeros(2),
             request_distribution=torch.zeros(3),
             mamba_request_distribution=None,
@@ -1277,8 +1277,7 @@ class TestVllmGatedDeltaNetAttention:
         metadata = MagicMock()
         metadata.seq_lens = torch.tensor([4], dtype=torch.int32)
         metadata.mamba_state_indices = torch.tensor([3, 1], dtype=torch.int32)
-        metadata.sequence_layout_kind = SequenceLayoutKind.PARTIAL.value
-        metadata.sequence_layout_protocol = "pcp_streaming"
+        metadata.use_pcp_streaming = True
         metadata.query_start_loc = torch.tensor([0, 4], dtype=torch.int32)
         metadata.request_distribution = torch.zeros(3, dtype=torch.int32)
         metadata.mamba_prefill_ckpt_offsets = None
@@ -1361,11 +1360,11 @@ class TestVllmGatedDeltaNetAttention:
 
         mock_fc = MagicMock()
         mock_attn_metadata = MagicMock()
+        mock_attn_metadata.use_pcp_streaming = False
         mock_attn_metadata.seq_lens = torch.ones(2)
         mock_attn_metadata.block_tables = torch.tensor([5, 6, 7, 8])
         mock_attn_metadata.mamba_state_indices = torch.tensor([3, 1], dtype=torch.int32)
-        mock_attn_metadata.sequence_layout_kind = SequenceLayoutKind.PARTIAL.value
-        mock_attn_metadata.sequence_layout_protocol = "pcp_streaming"
+        mock_attn_metadata.use_pcp_streaming = True
         mock_attn_metadata.query_start_loc = torch.zeros(2)
         mock_attn_metadata.request_distribution = torch.zeros(3)
         # Non-spec path: the runner leaves these unset (None) unless
@@ -1431,6 +1430,7 @@ class TestVllmGatedDeltaNetAttention:
 
         mock_fc = MagicMock()
         mock_attn_metadata = MagicMock()
+        mock_attn_metadata.use_pcp_streaming = False
         mock_attn_metadata.seq_lens = torch.ones(2)
         mock_attn_metadata.block_tables = torch.tensor([5, 6, 7, 8])
         # None exercises the legacy block_tables[:, 0] fallback used by
@@ -1546,9 +1546,6 @@ def test_fused_pooled_pcp_forward_remaps_state_ids_for_the_block_major_pool(
     if block_major:
         attn._bm_kernel = True
         attn.set_block_major_pool(_BM_POOL_INDEX, _BM_LAYOUT)
-    monkeypatch.setattr(
-        gdn_attention_op, "is_pcp_streaming_attention_metadata", lambda _m: True
-    )
     state_indices = torch.tensor([0, 1, 3], dtype=torch.int32)
     ckpt_offsets = torch.tensor([0, 3072, 0], dtype=torch.int32)
     ckpt_ids = torch.tensor([-1, 2, -1], dtype=torch.int32)
@@ -1559,6 +1556,7 @@ def test_fused_pooled_pcp_forward_remaps_state_ids_for_the_block_major_pool(
         seq_lens=torch.ones(3, dtype=torch.int32),
         mamba_prefill_ckpt_offsets=ckpt_offsets,
         mamba_prefill_ckpt_indices=ckpt_ids,
+        use_pcp_streaming=True,
     )
 
     attn._forward_fused_pooled_pcp(torch.zeros(3, 8), torch.zeros(4, 12, 2), metadata)
@@ -1722,8 +1720,7 @@ def _pooled_metadata(offsets, ids):
         mamba_ckpt_indices=None,
         mamba_prefill_ckpt_offsets=offsets,
         mamba_prefill_ckpt_indices=ids,
-        sequence_layout_kind=SequenceLayoutKind.ALL.value,
-        sequence_layout_protocol="default",
+        use_pcp_streaming=False,
     )
 
 

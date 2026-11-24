@@ -35,14 +35,12 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.pcp_metadata import PcpMetadata
-from vllm_torchtpu.layers.core.pcp_sequence_layout import (
-    ensure_host_token_buffer_capacity,
-)
 from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.pcp.sharding_plan import (
     PcpShardingPlan,
     PcpShardingPlanName,
+    ensure_host_token_buffer_capacity,
     round_up_to_bucket,
 )
 
@@ -498,9 +496,13 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         segments = plan.local_segments(self.pcp_rank)
         split_reqs = [r for r in range(num_reqs) if not plan.replicated[r]]
         request_major_to_local = np.full(num_tokens, -1, dtype=np.int32)
+        local_to_request_major = np.full(local_padded, -1, dtype=np.int64)
         for seg in segments:
             request_major_to_local[seg.global_start : seg.global_stop] = np.arange(
                 seg.local_start, seg.local_stop, dtype=np.int32
+            )
+            local_to_request_major[seg.local_start : seg.local_stop] = np.arange(
+                seg.global_start, seg.global_stop, dtype=np.int64
             )
         full_restore = np.asarray(plan.hidden_restore_idx, dtype=np.int64)
 
@@ -542,6 +544,7 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
             t.to(runner.device, non_blocking=True) for t in hosts
         )
         self.logits_all_local = logits_all_local
+        self.local_to_request_major_token_indices = local_to_request_major
         self.request_major_to_local = request_major_to_local
 
         # Rank-local request view, written over the runner's request buffers.
@@ -630,6 +633,19 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
             ws_page_offset=local_ws_off,
             num_split_reqs=[len(split_reqs)],
             ws_used_pages=[ws.num_used_pages],
+        )
+
+    def padded_num_tokens(
+        self,
+        *,
+        runner: Any,
+        scheduler_output: Any,
+        start_index: int,
+        num_scheduled_tokens_per_req: Any,
+    ) -> int:
+        del runner, scheduler_output, start_index, num_scheduled_tokens_per_req
+        raise NotImplementedError(
+            "HeadTailPcpShardingPlan does not support pipeline parallelism."
         )
 
     def prepare_dummy(

@@ -29,11 +29,6 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     stage_block_table_uploads,
     stage_h2d_upload,
 )
-from vllm_torchtpu.layers.core.sequence_layout import (
-    PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
-    SequenceLayoutDescriptor,
-    SequenceLayoutKind,
-)
 
 
 class TestAttentionMetadataBuilderPlumbing:
@@ -130,15 +125,11 @@ class TestAttentionMetadataBuilderPlumbing:
         runner.input_batch.block_table[0].get_cpu_tensor.assert_not_called()
         assert torch.equal(meta.block_tables, torch.zeros(16, dtype=torch.int32))
 
-    def test_build_carries_sequence_layout_metadata(self):
+    @pytest.mark.parametrize("use_pcp_streaming", [False, True])
+    def test_build_carries_use_pcp_streaming(self, use_pcp_streaming):
         runner = self._make_runner_mock()
         builder = self._make_builder(runner)
 
-        descriptor = SequenceLayoutDescriptor(
-            kind=SequenceLayoutKind.PARTIAL,
-            protocol=PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
-            version=7,
-        )
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=2,
             start_index=0,
@@ -146,14 +137,12 @@ class TestAttentionMetadataBuilderPlumbing:
             seq_lens=torch.ones((4,), dtype=torch.int32),
             query_start_loc=torch.arange(5, dtype=torch.int32),
             request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
-            sequence_layout_descriptor=descriptor,
+            use_pcp_streaming=use_pcp_streaming,
         )
 
         meta = builder.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
 
-        assert meta.sequence_layout_kind == SequenceLayoutKind.PARTIAL.value
-        assert meta.sequence_layout_protocol == PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL
-        assert meta.sequence_layout_version == 7
+        assert meta.use_pcp_streaming is use_pcp_streaming
 
     def test_build_mamba_state_indices_from_current_block_table_entry(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)

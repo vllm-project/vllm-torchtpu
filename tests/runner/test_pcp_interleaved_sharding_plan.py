@@ -11,11 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for `InterleavedPcpShardingPlan` and `PcpManager` validation."""
+"""Unit tests for `InterleavedPcpShardingPlan` and unified `PcpManager`."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -29,13 +30,18 @@ from tests.runner.runner_input_test_utils import (
     _make_runner,
     _scheduler_output,
 )
-from vllm_torchtpu import envs
-from vllm_torchtpu.layers.core.pcp_sequence_layout import (
-    PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR,
-    ensure_host_token_buffer_capacity,
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
+    build_pcp_logits_indices,
+    build_pcp_rank_major_token_order,
+    pcp_local_token_counts,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
-from vllm_torchtpu.runner.pcp import PcpManager, validate_pcp_manager_layers
+from vllm_torchtpu.runner.pcp import (
+    PcpDraftLayout,
+    PcpManager,
+    ensure_host_token_buffer_capacity,
+    validate_pcp_manager_layers,
+)
 from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import HeadTailPcpShardingPlan
 from vllm_torchtpu.runner.pcp.interleaved_sharding_plan import (
     InterleavedPcpShardingPlan,
@@ -43,6 +49,7 @@ from vllm_torchtpu.runner.pcp.interleaved_sharding_plan import (
     interleaved_max_local_tokens,
 )
 from vllm_torchtpu.runner.pcp.manager import PcpShardingPlanName
+from vllm_torchtpu.runner.pcp.sharding_plan import round_up_to_bucket
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -90,7 +97,6 @@ def _attach_interleaved_manager(
 ):
     runner.parallel_config.prefill_context_parallel_size = pcp_size
     runner.parallel_config.cp_kv_cache_interleave_size = interleave_size
-    runner.sequence_layout_planner = None
     budget = (
         max(runner.num_tokens_paddings) * pcp_size
         if max_num_batched_tokens is None
@@ -110,8 +116,8 @@ def _attach_interleaved_manager(
 @pytest.mark.parametrize(
     ("cfg_kw", "kv_layout", "expected_err", "match"),
     [
-        ({"pcp_size": 1}, "NHD", NotImplementedError, "> 1"),
-        ({"dcp_size": 2}, "NHD", NotImplementedError, "decode_context"),
+        ({"dcp_size": 2}, "NHD", NotImplementedError, "DCP"),
+        ({"interleave_size": 0}, "NHD", ValueError, "interleave_size > 0"),
         ({"interleave_size": 3}, "NHD", ValueError, "must divide 512"),
         ({"interleave_size": 4}, "HND", ValueError, "multiple of 128"),
         (
@@ -141,15 +147,24 @@ def _attach_interleaved_manager(
         (
             {
                 "speculative_config": SimpleNamespace(
-                    method="mtp", num_speculative_tokens=1
+                    method="eagle", num_speculative_tokens=1
                 )
             },
             "NHD",
             NotImplementedError,
-            "speculative",
+            "method=mtp",
+        ),
+        (
+            {
+                "speculative_config": SimpleNamespace(
+                    method="mtp", num_speculative_tokens=2
+                )
+            },
+            "NHD",
+            NotImplementedError,
+            "num_speculative_tokens=1",
         ),
         ({"runner_type": "pooling"}, "NHD", NotImplementedError, "pooling"),
-        ({"kv_transfer_config": object()}, "NHD", NotImplementedError, "KV connectors"),
         (
             {"use_mla": True, "hf_text_config": SimpleNamespace()},
             "NHD",
@@ -182,25 +197,84 @@ def _attach_interleaved_manager(
             NotImplementedError,
             "multimodal",
         ),
+        (
+            {
+                "pcp_size": 2,
+                "dcp_size": 8,
+                "tp_size": 4,
+                "use_mla": True,
+                "hf_text_config": SimpleNamespace(index_topk=2048),
+                "kv_transfer_config": object(),
+            },
+            "NHD",
+            NotImplementedError,
+            "KV",
+        ),
+        (
+            {
+                "pcp_size": 2,
+                "dcp_size": 8,
+                "tp_size": 4,
+                "use_mla": True,
+                "hf_text_config": SimpleNamespace(index_topk=2048),
+                "pipeline_parallel_size": 2,
+            },
+            "NHD",
+            NotImplementedError,
+            "pipeline",
+        ),
+        (
+            {
+                "pcp_size": 2,
+                "dcp_size": 8,
+                "tp_size": 4,
+                "use_mla": True,
+                "hf_text_config": SimpleNamespace(index_topk=2048),
+                "speculative_config": SimpleNamespace(
+                    method="mtp", num_speculative_tokens=1
+                ),
+            },
+            "NHD",
+            NotImplementedError,
+            "speculative",
+        ),
     ],
 )
 def test_pcp_manager_static_validation_rejects_invalid_configs(
-    monkeypatch, cfg_kw, kv_layout, expected_err, match
+    cfg_kw, kv_layout, expected_err, match
 ):
-    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", True)
     with pytest.raises(expected_err, match=match):
         PcpStaticSupportValidator.validate_platform_config(
             _vllm_config(**cfg_kw), kv_cache_layout=kv_layout
         )
 
 
-def test_pcp_manager_accepts_language_model_only_and_selects_plans(monkeypatch):
-    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", True)
+@pytest.mark.parametrize("kv_role", [None, "kv_producer", "kv_consumer", "kv_both"])
+def test_pcp_manager_accepts_interleaved_features_and_selects_plans(kv_role):
+    disabled = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(pcp_size=1), kv_cache_layout="NHD"
+    )
+    assert disabled.enabled is False
+    with pytest.raises(NotImplementedError, match="> 1"):
+        PcpManager.from_vllm_config(_vllm_config(pcp_size=1))
+
+    kv_transfer_cfg = (
+        None
+        if kv_role is None
+        else SimpleNamespace(
+            kv_role=kv_role,
+            is_kv_producer=kv_role in ("kv_producer", "kv_both"),
+        )
+    )
     cfg = _vllm_config(
         architecture="Qwen3_5MoeForConditionalGeneration",
         interleave_size=16,
         is_multimodal_model=True,
         multimodal_config=SimpleNamespace(language_model_only=True),
+        pipeline_parallel_size=2,
+        data_parallel_size=2,
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=1),
+        kv_transfer_config=kv_transfer_cfg,
     )
     PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(model_config=None), kv_cache_layout="NHD"
@@ -210,8 +284,9 @@ def test_pcp_manager_accepts_language_model_only_and_selects_plans(monkeypatch):
     assert mgr.plan_name is PcpShardingPlanName.INTERLEAVED
     assert isinstance(mgr.sharding_plan, InterleavedPcpShardingPlan)
     assert mgr.uses_pcp_metadata is False
-    assert mgr.sequence_layout_descriptor == PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR
+    assert mgr.uses_pcp_streaming is True
     assert mgr.requires_backend_preinit is True
+    assert mgr.backend_preinit_world_size == 4
 
     ht_cfg = _vllm_config(
         pcp_size=2,
@@ -225,6 +300,15 @@ def test_pcp_manager_accepts_language_model_only_and_selects_plans(monkeypatch):
     assert ht_mgr.plan_name is PcpShardingPlanName.HEADTAIL
     assert isinstance(ht_mgr.sharding_plan, HeadTailPcpShardingPlan)
     assert ht_mgr.uses_pcp_metadata is True
+    assert ht_mgr.uses_pcp_streaming is False
+    assert ht_mgr.draft_layout() is None
+    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        ht_mgr.padded_num_tokens(
+            runner=None,
+            scheduler_output=None,
+            start_index=0,
+            num_scheduled_tokens_per_req=[1],
+        )
 
 
 def test_validate_pcp_manager_layers_interleaved():
@@ -277,34 +361,49 @@ def test_interleaved_page_size_and_max_local_tokens():
 
 
 @pytest.mark.parametrize(
-    ("computed", "prompts", "scheduled", "interleave", "uses_mrope"),
+    ("pcp_size", "computed", "prompts", "scheduled", "interleave", "uses_mrope"),
     [
-        ([0], [37], [37], 4, False),
-        ([20, 31, 44, 15, 28, 39], [16] * 6, [1] * 6, 4, False),
-        ([40, 8], [32, 48], [1, 23], 4, True),
-        ([0, 12], [260, 300], [260, 270], 128, False),
+        (4, [0], [37], [37], 4, False),
+        (4, [20, 31, 44, 15, 28, 39], [16] * 6, [1] * 6, 4, False),
+        (4, [40, 8], [32, 48], [1, 23], 4, True),
+        (4, [0, 12], [260, 300], [260, 270], 128, False),
+        (2, [16], [32], [16], 16, False),
+        (4, [0, 0], [1024, 512], [1024, 512], 16, False),
+        (8, [0] * 32, [256] * 32, [256] * 32, 256, False),
     ],
 )
-def test_interleaved_plan_matches_legacy_sequence_layout(
-    computed, prompts, scheduled, interleave, uses_mrope
+def test_interleaved_plan_packs_tokens_positions_and_logits_across_ranks(
+    pcp_size, computed, prompts, scheduled, interleave, uses_mrope
 ):
-    pcp_size = 4
     block_size = max(16, interleave)
-    paddings = [512, 1024]
+    paddings = [16, 32, 256, 512, 1024]
     total_tokens = sum(scheduled)
-    for rank in range(pcp_size):
-        ref = _make_runner(
-            num_computed_tokens=computed,
-            prompt_tokens=prompts,
-            scheduled_tokens=scheduled,
-            token_paddings=paddings,
-            uses_mrope=uses_mrope,
-            pcp_size=pcp_size,
-            block_size=block_size,
-        )
-        ref.parallel_config.cp_kv_cache_interleave_size = interleave
-        ref.sequence_layout_planner.eligibility.interleave_size = interleave
+    owner_starts = np.concatenate(([0], np.cumsum(scheduled[:-1], dtype=np.int64)))
+    local_counts = pcp_local_token_counts(
+        scheduled,
+        pcp_size,
+        interleave,
+        token_owner_start_offsets_per_req=owner_starts,
+    )
+    expected_local_padded = round_up_to_bucket(paddings, int(local_counts.max()))
+    global_padded = expected_local_padded * pcp_size
+    packed_to_req, req_to_packed = build_pcp_rank_major_token_order(
+        scheduled,
+        pcp_size=pcp_size,
+        interleave_size=interleave,
+        padded_num_tokens=global_padded,
+        token_owner_start_offsets_per_req=owner_starts,
+    )
+    expected_logits = build_pcp_logits_indices(
+        scheduled,
+        pcp_size=pcp_size,
+        interleave_size=interleave,
+        padded_num_tokens=global_padded,
+        token_owner_start_offsets_per_req=owner_starts,
+    )
 
+    owner_hits = np.zeros(total_tokens, dtype=np.int32)
+    for rank in range(pcp_size):
         mgr = _make_runner(
             num_computed_tokens=computed,
             prompt_tokens=prompts,
@@ -312,6 +411,7 @@ def test_interleaved_plan_matches_legacy_sequence_layout(
             token_paddings=paddings,
             uses_mrope=uses_mrope,
             pcp_size=pcp_size,
+            max_num_reqs=max(8, len(scheduled)),
             block_size=block_size,
         )
         _attach_interleaved_manager(
@@ -321,44 +421,234 @@ def test_interleaved_plan_matches_legacy_sequence_layout(
             interleave_size=interleave,
             max_num_batched_tokens=total_tokens,
         )
-
-        with (
-            patch(
-                "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_rank",
-                return_value=rank,
-            ),
-            patch(
-                "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_world_size",
-                return_value=pcp_size,
-            ),
-        ):
-            ref_attn, ref_logits, *_ = TPUModelRunner._prepare_inputs(
-                ref, _scheduler_output(scheduled), 0, len(scheduled)
+        so = _scheduler_output(scheduled)
+        assert (
+            mgr.pcp_manager.padded_num_tokens(
+                runner=mgr,
+                scheduler_output=so,
+                start_index=0,
+                num_scheduled_tokens_per_req=np.asarray(scheduled, dtype=np.int32),
             )
-        mgr_attn, mgr_logits, *_ = TPUModelRunner._prepare_inputs(
-            mgr, _scheduler_output(scheduled), 0, len(scheduled)
+            == expected_local_padded
         )
 
-        assert torch.equal(mgr.input_ids, ref.input_ids)
-        assert torch.equal(mgr.position_ids, ref.position_ids)
-        assert torch.equal(mgr_logits, ref_logits)
-        md_mgr, md_ref = mgr_attn["layer.0"], ref_attn["layer.0"]
-        assert torch.equal(md_mgr.seq_lens, md_ref.seq_lens)
-        assert torch.equal(md_mgr.query_start_loc, md_ref.query_start_loc)
-        assert (
-            md_mgr.sequence_layout_kind,
-            md_mgr.sequence_layout_protocol,
-        ) == ("partial", "pcp_streaming")
+        mgr_attn, mgr_logits, padded_num_reqs, *_ = TPUModelRunner._prepare_inputs(
+            mgr, so, 0, len(scheduled)
+        )
+        md = mgr_attn["layer.0"]
+        assert md.use_pcp_streaming is True
         plan = mgr.pcp_manager.sharding_plan
+        local_start = rank * expected_local_padded
+        local_end = local_start + expected_local_padded
+        assert plan.token_slice == slice(local_start, local_end)
+        assert plan.local_padded_num_tokens == expected_local_padded
+        assert plan.local_num_tokens == int(local_counts[rank])
         assert plan.local_padded_num_tokens <= mgr.pcp_manager.max_local_num_tokens
-        assert mgr._last_sequence_layout_plan is plan.sequence_layout_plan
-        assert plan.sequence_layout_plan is not None
-        ref_plan = ref._last_sequence_layout_plan
-        assert [
-            plan.local_index_for_request_major_token(u) for u in range(total_tokens)
-        ] == [
-            ref_plan.local_index_for_request_major_token(u) for u in range(total_tokens)
-        ]
+
+        local_map = packed_to_req[local_start:local_end]
+        np.testing.assert_array_equal(
+            mgr.pcp_manager.local_to_request_major_token_indices, local_map
+        )
+
+        req_major_ids = np.concatenate(
+            [
+                mgr.input_batch.token_ids_cpu[i, c : c + s]
+                for i, (c, s) in enumerate(zip(computed, scheduled))
+            ]
+        )
+        expected_ids = np.where(
+            local_map >= 0, req_major_ids[np.maximum(local_map, 0)], 0
+        )
+        np.testing.assert_array_equal(mgr.input_ids.numpy(), expected_ids)
+
+        if uses_mrope:
+            base_pos = np.arange(total_tokens, dtype=np.int32)
+            for row_idx, offset in enumerate((0, 1000, 2000)):
+                row_vals = base_pos + offset
+                expected_pos = np.where(
+                    local_map >= 0, row_vals[np.maximum(local_map, 0)], 0
+                )
+                np.testing.assert_array_equal(
+                    mgr.position_ids[row_idx].numpy(), expected_pos
+                )
+        else:
+            req_major_pos = np.concatenate(
+                [
+                    np.arange(c, c + s, dtype=np.int32)
+                    for c, s in zip(computed, scheduled)
+                ]
+            )
+            expected_pos = np.where(
+                local_map >= 0, req_major_pos[np.maximum(local_map, 0)], 0
+            )
+            np.testing.assert_array_equal(mgr.position_ids.numpy(), expected_pos)
+
+        padded_logits = np.full(padded_num_reqs, -1, dtype=np.int32)
+        padded_logits[: len(scheduled)] = expected_logits
+        np.testing.assert_array_equal(mgr_logits.numpy(), padded_logits)
+
+        for u in range(total_tokens):
+            local_idx = plan.local_index_for_request_major_token(u)
+            if local_start <= int(req_to_packed[u]) < local_end:
+                assert local_idx == int(req_to_packed[u]) - local_start
+                owner_hits[u] += 1
+            else:
+                assert local_idx is None
+
+    np.testing.assert_array_equal(owner_hits, np.ones(total_tokens, dtype=np.int32))
+
+
+def test_padded_num_tokens_honors_dp_bucket_and_rejects_overflow():
+    r = _make_runner(
+        num_computed_tokens=[0, 0],
+        prompt_tokens=[20, 5],
+        scheduled_tokens=[20, 5],
+        token_paddings=[16, 32, 64],
+        pcp_size=2,
+        block_size=16,
+    )
+    _attach_interleaved_manager(r, pcp_size=2, pcp_rank=0, interleave_size=16)
+    counts = np.asarray([20, 5], dtype=np.int32)
+    so = _scheduler_output([20, 5])
+
+    assert (
+        r.pcp_manager.padded_num_tokens(
+            runner=r,
+            scheduler_output=so,
+            start_index=0,
+            num_scheduled_tokens_per_req=counts,
+        )
+        == 16
+    )
+    r._dp_target_bucket = 64
+    assert (
+        r.pcp_manager.padded_num_tokens(
+            runner=r,
+            scheduler_output=so,
+            start_index=0,
+            num_scheduled_tokens_per_req=counts,
+        )
+        == 64
+    )
+
+    overflow = _make_runner(
+        num_computed_tokens=[0],
+        prompt_tokens=[1024],
+        scheduled_tokens=[1024],
+        token_paddings=[128],
+        pcp_size=4,
+        block_size=16,
+    )
+    _attach_interleaved_manager(overflow, pcp_size=4, pcp_rank=0, interleave_size=16)
+    with pytest.raises(ValueError, match="compile bucket"):
+        overflow.pcp_manager.padded_num_tokens(
+            runner=overflow,
+            scheduler_output=_scheduler_output([1024]),
+            start_index=0,
+            num_scheduled_tokens_per_req=np.asarray([1024], dtype=np.int32),
+        )
+
+
+@pytest.mark.parametrize(
+    ("q_lens", "pcp_size", "interleave_size", "padded_num_tokens", "owner_starts"),
+    [
+        ([2, 3], 2, 1, 6, [0, 2]),
+        ([3, 3], 2, 2, 8, [0, 3]),
+        ([2, 5, 1], 4, 2, 16, [0, 2, 7]),
+        ([1], 4, 2, 8, [5]),
+    ],
+)
+def test_pcp_draft_layout_localizes_tokens_and_gathers_uniquely(
+    q_lens, pcp_size, interleave_size, padded_num_tokens, owner_starts
+):
+    packed_to_request, request_to_packed = build_pcp_rank_major_token_order(
+        q_lens,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        padded_num_tokens=padded_num_tokens,
+        token_owner_start_offsets_per_req=owner_starts,
+    )
+    total_num_tokens = sum(q_lens)
+    padded_req_to_packed = np.full(padded_num_tokens, -1, dtype=request_to_packed.dtype)
+    padded_req_to_packed[:total_num_tokens] = request_to_packed
+
+    # Append a padded trailing gather entry to verify num_valid_gathers masking.
+    request_gathers = torch.tensor(
+        list(np.cumsum(q_lens, dtype=np.int64) - 1) + [0],
+        dtype=torch.int64,
+    )
+    request_tokens = torch.arange(total_num_tokens, dtype=torch.int64)
+    local_padded = padded_num_tokens // pcp_size
+    owner_counts = torch.zeros(len(q_lens), dtype=torch.int64)
+
+    for rank in range(pcp_size):
+        local_start = rank * local_padded
+        local_end = local_start + local_padded
+        local_to_req = packed_to_request[local_start:local_end]
+        layout = PcpDraftLayout(
+            local_to_request_major=local_to_req,
+            padded_request_to_packed=padded_req_to_packed,
+            local_start=local_start,
+            local_end=local_end,
+        )
+        local_tokens, local_gathers = layout.localize_token_tensor_and_gather_indices(
+            request_tokens,
+            request_gathers,
+            num_valid_gathers=len(q_lens),
+        )
+        assert int(local_gathers[-1]) == -1
+        if not np.any(local_to_req >= 0):
+            torch.testing.assert_close(local_tokens, torch.zeros_like(local_tokens))
+            torch.testing.assert_close(
+                local_gathers, torch.full_like(local_gathers, -1)
+            )
+        owner_counts += local_gathers[:-1].ge(0)
+
+    torch.testing.assert_close(owner_counts, torch.ones_like(owner_counts))
+
+
+def test_pcp_draft_layout_snapshot_and_owner_masked_reduce():
+    r = _make_runner(
+        num_computed_tokens=[0, 0],
+        prompt_tokens=[17, 25],
+        scheduled_tokens=[17, 25],
+        token_paddings=[32],
+        pcp_size=2,
+        block_size=16,
+    )
+    r.num_reqs_max_model_len = 1
+    _attach_interleaved_manager(r, pcp_size=2, pcp_rank=0, interleave_size=16)
+    so = _scheduler_output([17, 25])
+
+    TPUModelRunner._prepare_inputs(r, so, 0, 0)
+    first_draft = r.pcp_manager.draft_layout()
+    assert first_draft is not None
+    assert first_draft.padded_request_to_packed.shape == (64,)
+    first_local_copy = first_draft.local_to_request_major.copy()
+
+    TPUModelRunner._prepare_inputs(r, so, 1, 0)
+    second_draft = r.pcp_manager.draft_layout()
+    assert second_draft is not None
+    assert first_draft is not second_draft
+    np.testing.assert_array_equal(first_draft.local_to_request_major, first_local_copy)
+
+    local_tensor = torch.tensor([[99.0], [20.0], [7.0]])
+    owner_mask = torch.tensor([False, True, False])
+    reduced_inputs: list[torch.Tensor] = []
+
+    def fake_reduce(masked_tensor: torch.Tensor) -> torch.Tensor:
+        reduced_inputs.append(masked_tensor.clone())
+        remote_owner = torch.zeros_like(masked_tensor)
+        remote_owner[0, 0] = 10.0
+        return masked_tensor + remote_owner
+
+    with patch(
+        "vllm_torchtpu.runner.pcp.sharding_plan.all_reduce_sum", side_effect=fake_reduce
+    ):
+        result = first_draft.aggregate_request_aligned_tensor(local_tensor, owner_mask)
+
+    torch.testing.assert_close(reduced_inputs[0], torch.tensor([[0.0], [20.0], [0.0]]))
+    torch.testing.assert_close(result, torch.tensor([[10.0], [20.0], [0.0]]))
 
 
 def test_interleaved_logits_selection_and_dummy_step():
@@ -390,7 +680,9 @@ def test_interleaved_logits_selection_and_dummy_step():
 
     managers[0].prepare_dummy(num_tokens=512, num_reqs=8, max_num_tokens=1024)
     assert managers[0].sharding_plan.global_padded_num_tokens == 2048
-    assert managers[0].sharding_plan.sequence_layout_plan is not None
+    assert managers[0].sharding_plan.local_padded_num_tokens == 512
+    assert managers[0].sharding_plan.token_slice == slice(0, 512)
+    assert managers[0].uses_pcp_streaming is True
 
 
 def test_interleaved_prepare_real_rejects_boundary_and_encoder_inputs():
@@ -403,7 +695,7 @@ def test_interleaved_prepare_real_rejects_boundary_and_encoder_inputs():
         block_size=16,
     )
     _attach_interleaved_manager(bad_boundary, pcp_size=4, pcp_rank=0, interleave_size=4)
-    with pytest.raises(NotImplementedError, match="boundary"):
+    with pytest.raises(NotImplementedError, match="boundary-crossing"):
         TPUModelRunner._prepare_inputs(bad_boundary, _scheduler_output([4]), 0, 1)
 
     mm_runner = _make_runner(

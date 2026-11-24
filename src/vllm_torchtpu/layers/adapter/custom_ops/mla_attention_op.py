@@ -174,6 +174,7 @@ def _resolve_indexer_kv_cache_mode(
     k_packed: jax.Array,
     *,
     mode: str | None = None,
+    pcp_enabled: bool | None = None,
 ) -> tuple[str, KVLayout]:
     """Resolves the indexer K-cache `(writer, kv_layout)` for `cache_kv` and `k_packed`.
 
@@ -209,7 +210,7 @@ def _resolve_indexer_kv_cache_mode(
         if int(cache_kv.shape[1]) == sal_sublane_groups
         else int(cache_kv.shape[1]) * 4
     )
-    kv_layout = indexer_kv_layout(block_size, mode=mode)
+    kv_layout = indexer_kv_layout(block_size, mode=mode, pcp_enabled=pcp_enabled)
     effective_mode = (
         "has"
         if resolved == "sal" and kv_layout == KVLayout.HEAD_ALONG_SUBLANE
@@ -386,10 +387,6 @@ def _cp_scatter_indexer_k(
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Build eagerly: pallas.jax_op runs inspect.signature(), which Dynamo
-        # cannot trace if the op is first built inside a compiled forward.
-        self.topk_op = self._build_streamidx_op()
-
         vllm_config = get_current_vllm_config_or_none()
         parallel_config = getattr(vllm_config, "parallel_config", None)
         max_model_len = getattr(
@@ -399,22 +396,30 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         pcp_size = pcp_size if isinstance(pcp_size, int) else 1
         dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
         dcp_size = dcp_size if isinstance(dcp_size, int) else 1
-        self.topk_op_dcp = None
+        self.pcp_size = pcp_size
         self.dcp_size = dcp_size
-        self.pcp_kv_gather = envs.USE_TPU_PCP_MANAGER and dcp_size > 1
+        self.pcp_kv_gather = pcp_size > 1 and dcp_size > 1
+        # Build eagerly: pallas.jax_op runs inspect.signature(), which Dynamo
+        # cannot trace if the op is first built inside a compiled forward.
+        self.topk_op = self._build_streamidx_op(pcp_enabled=pcp_size > 1)
+        self.topk_op_dcp = None
         self.interleave_size = 1
         if dcp_size > 1:
             assert parallel_config is not None
             self.interleave_size = parallel_config.cp_kv_cache_interleave_size
             self.topk_op_dcp = self._build_streamidx_dcp_op(
-                dcp_size, self.interleave_size
+                dcp_size, self.interleave_size, pcp_enabled=pcp_size > 1
             )
         if self.pcp_kv_gather:
             self.topk_op_pcp_prefill = self._build_pcp_prefill_topk_op(
                 dcp_size, pcp_size, self.interleave_size, max_model_len
             )
 
-    def _build_streamidx_op(self):
+    def _build_streamidx_op(self, *, pcp_enabled: bool | None = None):
+        if pcp_enabled is None:
+            pcp_size = getattr(self, "pcp_size", None)
+            if isinstance(pcp_size, int):
+                pcp_enabled = pcp_size > 1
         topk = self.topk_tokens
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
@@ -452,7 +457,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             distribution: jax.Array,  # i32 [3]
         ) -> tuple[jax.Array, jax.Array]:
             writer, kv_layout = _resolve_indexer_kv_cache_mode(
-                cache_kv, k_packed, mode=kv_cache_mode
+                cache_kv,
+                k_packed,
+                mode=kv_cache_mode,
+                pcp_enabled=pcp_enabled,
             )
             if writer == "xla":
                 _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
@@ -533,7 +541,13 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         self._streamidx_op = op
         return op
 
-    def _build_streamidx_dcp_op(self, dcp_size: int, interleave_size: int):
+    def _build_streamidx_dcp_op(
+        self,
+        dcp_size: int,
+        interleave_size: int,
+        *,
+        pcp_enabled: bool | None = None,
+    ):
         """The DCP twin of `_build_streamidx_op`.
 
         DCP shards the KV cache and leaves the *queries*
@@ -541,6 +555,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         token-major input arrives already in request-major order and stays
         replicated across the op boundary. Only the cache is split.
         """
+        if pcp_enabled is None:
+            pcp_size = getattr(self, "pcp_size", None)
+            if isinstance(pcp_size, int):
+                pcp_enabled = pcp_size > 1
         topk = self.topk_tokens
         mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
         # Chunking cuts the replicated query-token axis, which is orthogonal to
@@ -574,7 +592,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
             writer, kv_layout = _resolve_indexer_kv_cache_mode(
-                cache_kv, k_packed, mode=kv_cache_mode
+                cache_kv,
+                k_packed,
+                mode=kv_cache_mode,
+                pcp_enabled=pcp_enabled,
             )
             # `_cp_scatter_indexer_k` pads the packed fp8+scale rows out to
             # the cache's record width itself.

@@ -57,9 +57,6 @@ from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.core.sequence_layout import (
-    is_pcp_streaming_attention_metadata,
-)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer
 
@@ -809,7 +806,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
     ) -> torch.Tensor:
         """KDA over the unified pool: conv and recurrent state live in the
         pool's per-block byte regions and are gathered/scattered by the op."""
-        if is_pcp_streaming_attention_metadata(metadata):
+        if bool(getattr(metadata, "use_pcp_streaming", False)):
             raise NotImplementedError(
                 "KDA does not support PCP streaming prefill with the unified KV pool"
             )

@@ -35,7 +35,6 @@ from vllm_torchtpu.layers.adapter.attention import (
     get_tpu_min_page_size,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -97,12 +96,6 @@ def _tensors():
 
 
 def _metadata(*, pcp_streaming=False, block_tables=None):
-    layout_kwargs = {}
-    if pcp_streaming:
-        layout_kwargs = {
-            "sequence_layout_kind": SequenceLayoutKind.PARTIAL.value,
-            "sequence_layout_protocol": "pcp_streaming",
-        }
     return AttentionMetadata(
         input_positions=torch.arange(3, dtype=torch.int32),
         block_tables=(
@@ -113,7 +106,7 @@ def _metadata(*, pcp_streaming=False, block_tables=None):
         seq_lens=torch.tensor([3, 0], dtype=torch.int32),
         query_start_loc=torch.tensor([0, 3, 3], dtype=torch.int32),
         request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
-        **layout_kwargs,
+        use_pcp_streaming=pcp_streaming,
     )
 
 

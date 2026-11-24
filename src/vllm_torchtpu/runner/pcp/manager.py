@@ -22,15 +22,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.kernels.mla.kv_cache_utils import WORD_BYTES
-from vllm_torchtpu.layers.core.pcp_sequence_layout import (
-    ensure_host_token_buffer_capacity,
-)
-from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutDescriptor
 from vllm_torchtpu.platforms.pcp_validation import (
     validate_pooled_qwen_gdn_pcp_interleave,
 )
@@ -40,8 +37,10 @@ from vllm_torchtpu.runner.pcp.interleaved_sharding_plan import (
     validate_interleaved_pcp_params,
 )
 from vllm_torchtpu.runner.pcp.sharding_plan import (
+    PcpDraftLayout,
     PcpShardingPlan,
     PcpShardingPlanName,
+    ensure_host_token_buffer_capacity,
 )
 
 if TYPE_CHECKING:
@@ -75,25 +74,29 @@ def _select_pcp_sharding_plan(model_config: Any) -> PcpShardingPlanName:
     if model_config.use_mla:
         if not hasattr(model_config.hf_text_config, "index_topk"):
             raise NotImplementedError(
-                "The PCP manager does not support dense MLA "
-                "(only sparse MLA or non-MLA attention)."
+                "PCP does not support dense MLA (only sparse MLA or non-MLA attention)."
             )
         return PcpShardingPlanName.HEADTAIL
     return PcpShardingPlanName.INTERLEAVED
 
 
-def validate_pcp_manager_config(vllm_config: Any) -> PcpShardingPlanName:
+def validate_pcp_manager_config(
+    vllm_config: Any,
+    *,
+    kv_cache_layout: str | None = None,
+) -> PcpShardingPlanName:
     parallel_config = vllm_config.parallel_config
     model_config = vllm_config.model_config
     plan = _select_pcp_sharding_plan(model_config)
     pcp_size = int(parallel_config.prefill_context_parallel_size)
     dcp_size = int(parallel_config.decode_context_parallel_size)
+    interleave_size = int(parallel_config.cp_kv_cache_interleave_size)
 
     if plan is PcpShardingPlanName.HEADTAIL:
         tp_size = int(parallel_config.tensor_parallel_size)
         if pcp_size <= 1 or dcp_size <= 1:
             raise NotImplementedError(
-                "USE_TPU_PCP_MANAGER needs prefill and decode context parallel "
+                "Sparse MLA PCP requires prefill and decode context parallel "
                 f"sizes > 1, got pcp={pcp_size}, dcp={dcp_size}."
             )
         if dcp_size != tp_size * pcp_size:
@@ -109,19 +112,48 @@ def validate_pcp_manager_config(vllm_config: Any) -> PcpShardingPlanName:
                 f"TPU_PCP_KV_WORKSPACE_TOKENS ({envs.TPU_PCP_KV_WORKSPACE_TOKENS}); "
                 "raise TPU_PCP_KV_WORKSPACE_TOKENS or lower --max-model-len."
             )
-        interleave_size = int(parallel_config.cp_kv_cache_interleave_size)
-        if interleave_size % WORD_BYTES:
+        if interleave_size <= 0 or interleave_size % WORD_BYTES:
             raise ValueError(
-                "PCP x DCP needs --cp-kv-cache-interleave-size to be a multiple of "
-                f"{WORD_BYTES}, got {interleave_size}."
+                "PCP x DCP needs --cp-kv-cache-interleave-size to be a positive "
+                f"multiple of {WORD_BYTES}, got {interleave_size}."
+            )
+        if vllm_config.kv_transfer_config is not None:
+            raise NotImplementedError("Sparse MLA PCP does not support KV connectors.")
+        if parallel_config.pipeline_parallel_size != 1:
+            raise NotImplementedError(
+                "Sparse MLA PCP does not support pipeline parallelism."
+            )
+        if parallel_config.data_parallel_size != 1:
+            raise NotImplementedError(
+                "Sparse MLA PCP does not support data parallelism."
+            )
+        if vllm_config.speculative_config is not None:
+            raise NotImplementedError(
+                "Sparse MLA PCP does not support speculative decoding yet."
             )
     else:
-        interleave_size = int(parallel_config.cp_kv_cache_interleave_size)
+        if kv_cache_layout == "HND" and (
+            interleave_size <= 0 or interleave_size % 128 != 0
+        ):
+            raise ValueError(
+                "PCP with HND KV cache layout requires "
+                "cp_kv_cache_interleave_size to be a multiple of 128, "
+                f"got {interleave_size}."
+            )
         if pcp_size > 1:
             validate_pooled_qwen_gdn_pcp_interleave(
                 model_config.architecture, interleave_size
             )
         validate_interleaved_pcp_params(pcp_size, dcp_size, interleave_size)
+        if vllm_config.speculative_config is not None:
+            if vllm_config.speculative_config.method != "mtp":
+                raise NotImplementedError(
+                    "PCP speculative decoding currently requires method=mtp."
+                )
+            if vllm_config.speculative_config.num_speculative_tokens != 1:
+                raise NotImplementedError(
+                    "PCP MTP currently requires num_speculative_tokens=1."
+                )
 
     if model_config.is_multimodal_model and not (
         plan is PcpShardingPlanName.INTERLEAVED
@@ -129,7 +161,7 @@ def validate_pcp_manager_config(vllm_config: Any) -> PcpShardingPlanName:
         and model_config.multimodal_config.language_model_only
     ):
         raise NotImplementedError(
-            "PCP manager does not support multimodal inputs"
+            "PCP does not support multimodal inputs"
             + (
                 "; pass --language-model-only for text-only execution."
                 if plan is PcpShardingPlanName.INTERLEAVED
@@ -138,23 +170,13 @@ def validate_pcp_manager_config(vllm_config: Any) -> PcpShardingPlanName:
         )
 
     if model_config.runner_type == "pooling":
-        raise NotImplementedError("PCP manager does not support pooling models.")
-    if vllm_config.kv_transfer_config is not None:
-        raise NotImplementedError("PCP manager does not support KV connectors.")
+        raise NotImplementedError("PCP does not support pooling models.")
     if parallel_config.is_moe_model and not parallel_config.enable_expert_parallel:
         raise NotImplementedError(
             "PCP on an MoE model requires --enable-expert-parallel."
         )
-    if parallel_config.pipeline_parallel_size != 1:
-        raise NotImplementedError("PCP manager does not support pipeline parallelism.")
-    if parallel_config.data_parallel_size != 1:
-        raise NotImplementedError("PCP manager does not support data parallelism.")
-    if vllm_config.speculative_config is not None:
-        raise NotImplementedError(
-            "PCP manager does not support speculative decoding yet."
-        )
     if vllm_config.lora_config is not None:
-        raise NotImplementedError("PCP manager does not support LoRA.")
+        raise NotImplementedError("PCP does not support LoRA.")
     return plan
 
 
@@ -189,8 +211,8 @@ def validate_pcp_manager_layers(
     )
     if unsupported:
         raise NotImplementedError(
-            "USE_TPU_PCP_MANAGER=1 does not support these attention layers: "
-            f"{', '.join(unsupported)}."
+            "prefill_context_parallel_size > 1 does not support these attention "
+            f"layers: {', '.join(unsupported)}."
         )
 
 
@@ -210,6 +232,14 @@ class PcpManager:
     @property
     def uses_pcp_metadata(self) -> bool:
         return self.sharding_plan.uses_pcp_metadata
+
+    @property
+    def uses_pcp_streaming(self) -> bool:
+        return self.sharding_plan.uses_pcp_streaming
+
+    @property
+    def local_to_request_major_token_indices(self) -> np.ndarray | None:
+        return self.sharding_plan.local_to_request_major_token_indices
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> PcpManager:
@@ -248,10 +278,6 @@ class PcpManager:
         return self.sharding_plan.max_local_num_tokens
 
     @property
-    def sequence_layout_descriptor(self) -> SequenceLayoutDescriptor:
-        return self.sharding_plan.sequence_layout_descriptor
-
-    @property
     def requires_backend_preinit(self) -> bool:
         return self.sharding_plan.requires_backend_preinit
 
@@ -278,6 +304,24 @@ class PcpManager:
         self, runner: Any, required_num_tokens: int
     ) -> None:
         ensure_host_token_buffer_capacity(runner, required_num_tokens)
+
+    def padded_num_tokens(
+        self,
+        *,
+        runner: Any,
+        scheduler_output: Any,
+        start_index: int,
+        num_scheduled_tokens_per_req: Any,
+    ) -> int:
+        return self.sharding_plan.padded_num_tokens(
+            runner=runner,
+            scheduler_output=scheduler_output,
+            start_index=start_index,
+            num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
+        )
+
+    def draft_layout(self) -> PcpDraftLayout | None:
+        return self.sharding_plan.draft_layout()
 
     def prepare_real(self, **kwargs: Any) -> None:
         self.sharding_plan.prepare_real(**kwargs)

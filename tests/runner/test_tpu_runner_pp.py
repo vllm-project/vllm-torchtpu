@@ -27,8 +27,11 @@ from vllm_torchtpu.distributed.pp_buffered import PPBuffered, _flush, hbm_reserv
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     _TOPK_ROWS_UPDATE_OP,
 )
-from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
 from vllm_torchtpu.runner import tpu_runner
+from vllm_torchtpu.runner.pcp import PcpManager
+from vllm_torchtpu.runner.pcp.interleaved_sharding_plan import (
+    InterleavedPcpShardingPlan,
+)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -350,22 +353,35 @@ class TestHandOffConstruction:
 
 class TestBufferedForwardRows:
     def _runner(self, scheduled, *, max_reqs=8, most_model_len=None, most_reqs=None):
+        import numpy as np
+
         req_ids = [f"r{i}" for i in range(len(scheduled))]
         runner = SimpleNamespace(
-            input_batch=SimpleNamespace(num_reqs=len(scheduled), req_ids=req_ids),
+            input_batch=SimpleNamespace(
+                num_reqs=len(scheduled),
+                req_ids=req_ids,
+                req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+                num_computed_tokens_cpu=np.zeros(len(scheduled), dtype=np.int32),
+                num_prompt_tokens=np.asarray(scheduled, dtype=np.int32),
+            ),
             most_model_len=most_model_len,
             num_reqs_max_model_len=max_reqs,
             num_reqs_most_model_len=most_reqs,
             num_tokens_paddings=[16, 32, 64, 128],
+            max_num_tokens=128,
             _dp_target_bucket=None,
-            sequence_layout_planner=AllSequenceLayoutPlanner(),
             pcp_manager=None,
         )
-        for name in ("_pp_forward_rows", "_count_input_chunks"):
+        for name in (
+            "_pp_forward_rows",
+            "_count_input_chunks",
+            "_non_pcp_padded_num_tokens",
+        ):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
         scheduler_output = SimpleNamespace(
             num_scheduled_tokens=dict(zip(req_ids, scheduled)),
             total_num_scheduled_tokens=sum(scheduled),
+            scheduled_encoder_inputs={},
         )
         return runner, scheduler_output
 
@@ -388,6 +404,20 @@ class TestBufferedForwardRows:
 
     def test_the_dp_bucket_raises_every_forward(self):
         runner, scheduler_output = self._runner([20, 5])
+        runner._dp_target_bucket = 64
+        assert runner._pp_forward_rows(scheduler_output) == [64]
+
+    def test_pcp_interleaved_plan_sizes_local_padded_rows(self):
+        runner, scheduler_output = self._runner([20, 5])
+        runner.pcp_manager = PcpManager(
+            InterleavedPcpShardingPlan(
+                pcp_size=2,
+                pcp_rank=0,
+                interleave_size=16,
+                max_num_batched_tokens=256,
+            )
+        )
+        assert runner._pp_forward_rows(scheduler_output) == [16]
         runner._dp_target_bucket = 64
         assert runner._pp_forward_rows(scheduler_output) == [64]
 

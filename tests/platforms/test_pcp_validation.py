@@ -19,7 +19,6 @@ import pytest
 # Initialize vLLM's plugin registry before importing the plugin package.
 import vllm  # noqa: F401
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 
@@ -27,9 +26,11 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 def _vllm_config(
     *,
     pcp_size=4,
+    tp_size=1,
     interleave_size=16,
     dcp_size=1,
     pipeline_parallel_size=1,
+    data_parallel_size=1,
     async_scheduling=False,
     speculative_method=None,
     num_speculative_tokens=0,
@@ -37,14 +38,23 @@ def _vllm_config(
     is_moe_model=None,
     enable_expert_parallel=False,
     architecture=None,
+    use_mla=False,
+    index_topk=None,
 ):
+    hf_text_config = (
+        SimpleNamespace()
+        if index_topk is None
+        else SimpleNamespace(index_topk=index_topk)
+    )
     return SimpleNamespace(
         model_config=(
             None
-            if architecture is None
+            if architecture is None and not use_mla
             else SimpleNamespace(
-                architecture=architecture,
-                use_mla=False,
+                architecture=architecture or "LlamaForCausalLM",
+                use_mla=use_mla,
+                hf_text_config=hf_text_config,
+                max_model_len=8192,
                 is_multimodal_model=False,
                 multimodal_config=None,
                 runner_type="generate",
@@ -53,10 +63,11 @@ def _vllm_config(
         additional_config={},
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=pcp_size,
+            tensor_parallel_size=tp_size,
             cp_kv_cache_interleave_size=interleave_size,
             decode_context_parallel_size=dcp_size,
             pipeline_parallel_size=pipeline_parallel_size,
-            data_parallel_size=1,
+            data_parallel_size=data_parallel_size,
             enable_expert_parallel=enable_expert_parallel,
             is_moe_model=is_moe_model,
         ),
@@ -156,12 +167,43 @@ def test_static_validator_accepts_supported_pcp_platform_config():
 
 def test_static_validator_accepts_pcp_inside_pipeline_stages():
     config = PcpStaticSupportValidator.validate_platform_config(
-        _vllm_config(pipeline_parallel_size=2),
+        _vllm_config(pipeline_parallel_size=2, architecture="LlamaForCausalLM"),
         kv_cache_layout="NHD",
     )
 
     assert config.enabled
     assert config.pipeline_parallel_size == 2
+
+
+def test_static_validator_headtail_rejects_pp_kv_transfer_and_mtp():
+    base_ht = dict(
+        pcp_size=2,
+        tp_size=4,
+        dcp_size=8,
+        interleave_size=4,
+        use_mla=True,
+        index_topk=2048,
+    )
+    ok = PcpStaticSupportValidator.validate_platform_config(
+        _vllm_config(**base_ht), kv_cache_layout="HND"
+    )
+    assert ok.enabled is True
+
+    with pytest.raises(NotImplementedError, match="pipeline"):
+        PcpStaticSupportValidator.validate_platform_config(
+            _vllm_config(**base_ht, pipeline_parallel_size=2),
+            kv_cache_layout="HND",
+        )
+    with pytest.raises(NotImplementedError, match="KV"):
+        PcpStaticSupportValidator.validate_platform_config(
+            _vllm_config(**base_ht, kv_role="kv_producer"),
+            kv_cache_layout="HND",
+        )
+    with pytest.raises(NotImplementedError, match="speculative"):
+        PcpStaticSupportValidator.validate_platform_config(
+            _vllm_config(**base_ht, speculative_method="mtp", num_speculative_tokens=1),
+            kv_cache_layout="HND",
+        )
 
 
 def test_static_validator_accepts_moe_pcp_with_expert_parallel():
@@ -243,11 +285,15 @@ def test_hnd_without_pcp_remains_valid():
     assert not config.enabled
 
 
+@pytest.mark.parametrize("architecture", [None, "LlamaForCausalLM"])
 @pytest.mark.parametrize("async_scheduling", [False, True])
 @pytest.mark.parametrize("kv_role", [None, "kv_producer", "kv_consumer", "kv_both"])
-def test_static_validator_accepts_pcp_mtp_k1_for_any_kv_role(async_scheduling, kv_role):
+def test_static_validator_accepts_pcp_mtp_k1_for_any_kv_role(
+    architecture, async_scheduling, kv_role
+):
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(
+            architecture=architecture,
             speculative_method="mtp",
             num_speculative_tokens=1,
             kv_role=kv_role,
@@ -277,14 +323,12 @@ def test_static_validator_does_not_restrict_non_pcp_mtp_k3_consumer():
     assert config.enabled is False
 
 
-@pytest.mark.parametrize("use_pcp_manager", [False, True])
 @pytest.mark.parametrize("architecture", sorted(QWEN_GDN_ARCHITECTURES))
 @pytest.mark.parametrize("interleave_size", [0, 1, 2, 4, 8, 15, 24])
 def test_pooled_qwen_gdn_pcp_rejects_unaligned_interleave(
-    monkeypatch, use_pcp_manager, architecture, interleave_size
+    monkeypatch, architecture, interleave_size
 ):
     monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
-    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", use_pcp_manager)
     with pytest.raises(ValueError, match="multiple of 16"):
         PcpStaticSupportValidator.validate_platform_config(
             _vllm_config(
@@ -296,13 +340,9 @@ def test_pooled_qwen_gdn_pcp_rejects_unaligned_interleave(
         )
 
 
-@pytest.mark.parametrize("use_pcp_manager", [False, True])
 @pytest.mark.parametrize("interleave_size", [16, 32, 64, 128, 256])
-def test_pooled_qwen_gdn_pcp_accepts_aligned_interleave(
-    monkeypatch, use_pcp_manager, interleave_size
-):
+def test_pooled_qwen_gdn_pcp_accepts_aligned_interleave(monkeypatch, interleave_size):
     monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
-    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", use_pcp_manager)
     config = PcpStaticSupportValidator.validate_platform_config(
         _vllm_config(
             pcp_size=4,

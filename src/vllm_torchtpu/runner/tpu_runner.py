@@ -151,11 +151,6 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     stage_h2d_upload,
     zeros_h2d_source,
 )
-from vllm_torchtpu.layers.core.sequence_layout import (
-    SequenceLayoutKind,
-    SequenceLayoutPlanner,
-    create_sequence_layout_planner,
-)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.lora.lora_manager import TPUWorkerLoRAManager
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -790,28 +785,20 @@ class TPUModelRunner(GPUModelRunner):
         self._mtp_prefill_only = self._prefill_only_mtp(
             vllm_config.parallel_config, self._pcp_enabled, self._mtp_enabled
         )
-        pcp_manager: PcpManager | None = None
-        if envs.USE_TPU_PCP_MANAGER:
-            pcp_manager = PcpManager.from_vllm_config(vllm_config)
-            sequence_layout_planner = None
-        else:
-            sequence_layout_planner = create_sequence_layout_planner(vllm_config)
-        pcp_planner = (
-            pcp_manager if pcp_manager is not None else sequence_layout_planner
+        pcp_manager: PcpManager | None = (
+            PcpManager.from_vllm_config(vllm_config) if self._pcp_enabled else None
         )
-        assert pcp_planner is not None
-        if pcp_planner.requires_backend_preinit:
+        if pcp_manager is not None and pcp_manager.requires_backend_preinit:
             # GPUModelRunner probes torch.cuda.mem_get_info during init. The
             # TPU shim maps that to torch.accelerator.get_memory_info, which
             # initializes TorchTPU/PJRT from TORCH_TPU_TOPOLOGY=1,1,1 and would
             # otherwise leave JAX seeing only one chip. Initialize JAX first
-            # so partial sequence layout backends own the full local device
-            # set.
+            # so multi-chip PCP backends own the full local device set.
             layout_devices = list(jax.local_devices())
             logger.info(
-                "Pre-initialized JAX backend for partial sequence layout "
+                "Pre-initialized JAX backend for PCP "
                 "| world_size=%d | visible_devices=%d",
-                pcp_planner.backend_preinit_world_size,
+                pcp_manager.backend_preinit_world_size,
                 len(layout_devices),
             )
         # Disable cudagraphs before parent init so its dispatch self-disables.
@@ -830,8 +817,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         with _torch_tpu_wrapper():
             super().__init__(vllm_config, device)
-        self.pcp_manager = pcp_manager
-        self.sequence_layout_planner = sequence_layout_planner
+        self.pcp_manager: PcpManager | None = pcp_manager
         _validate_libtpu_version()
         self.is_pooling_model = (
             self.model_config is not None and self.model_config.runner_type == "pooling"
@@ -950,9 +936,8 @@ class TPUModelRunner(GPUModelRunner):
         self.bm_pool_layout: BlockMajorPoolLayout | None = None
         # Set by initialize_kv_cache; None until then (dummy runs check this).
         self.kv_cache_config: KVCacheConfig | None = None
-        # Layout plan of the most recent prepared batch; None before the
-        # first execute_model.
-        self._last_sequence_layout_plan = None
+        # Real scheduled token count of the most recent non-PCP chunk.
+        self._last_non_pcp_local_num_tokens: int | None = None
 
         # Block-major KV cache (opt-in via VLLM_TPU_BLOCK_MAJOR_KV). When
         # enabled, `_initialize_kv_cache_states` allocates a single bundled tensor
@@ -2688,7 +2673,6 @@ class TPUModelRunner(GPUModelRunner):
         token_in_tpu_cur_input_indices_list = []
         token_in_tpu_pre_next_tokens_indices_list = []
         acc_cur_len = 0
-        layout_plan = self._last_sequence_layout_plan
         pcp_manager = self.pcp_manager
         pcp_plan = None if pcp_manager is None else pcp_manager.sharding_plan
 
@@ -2715,16 +2699,11 @@ class TPUModelRunner(GPUModelRunner):
             src_start = self._pre_async_results.req_id_to_index_copy[req_id] * stride
             for j in range(n_sched):
                 request_major_index = acc_cur_len - n_sched + j
-                if pcp_plan is not None:
-                    cur_input_index = pcp_plan.local_index_for_request_major_token(
-                        request_major_index
-                    )
-                elif layout_plan is None:
-                    cur_input_index = request_major_index
-                else:
-                    cur_input_index = layout_plan.local_index_for_request_major_token(
-                        request_major_index
-                    )
+                cur_input_index = (
+                    pcp_plan.local_index_for_request_major_token(request_major_index)
+                    if pcp_plan is not None
+                    else request_major_index
+                )
                 if cur_input_index is None:
                     continue
                 token_in_tpu_cur_input_indices_list.append(cur_input_index)
@@ -3414,36 +3393,21 @@ class TPUModelRunner(GPUModelRunner):
             num_draft_per_req,
         )
 
-    # TODO(weiyulin): unify sequence_plan and pcp_manager so that
-    # pcp manager own both pcp sharding plan.
-    def get_pcp_planner(self) -> PcpManager | SequenceLayoutPlanner:
-        if self.pcp_manager is not None:
-            return self.pcp_manager
-        assert self.sequence_layout_planner is not None
-        return self.sequence_layout_planner
+    def _non_pcp_padded_num_tokens(self, total_tokens: int) -> int:
+        return _non_pcp_padded_num_tokens(self, total_tokens)
 
-    def _finalize_hidden_states(
-        self, hidden_states: torch.Tensor, layout_plan: Any
-    ) -> torch.Tensor:
+    def _finalize_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.pcp_manager is not None:
             return self.pcp_manager.finalize_hidden_states(hidden_states)
-        assert self.sequence_layout_planner is not None
-        return self.sequence_layout_planner.finalize_hidden_states(
-            hidden_states, layout_plan
-        )
+        return hidden_states
 
     def _maybe_select_logits_hidden_states(
         self,
         hidden_states: torch.Tensor,
-        layout_plan: Any,
-        logits_indices: torch.Tensor,
     ) -> torch.Tensor | None:
         if self.pcp_manager is not None:
             return self.pcp_manager.maybe_select_logits_hidden_states(hidden_states)
-        assert self.sequence_layout_planner is not None
-        return self.sequence_layout_planner.maybe_select_logits_hidden_states(
-            hidden_states, layout_plan, logits_indices
-        )
+        return None
 
     def _prepare_inputs(
         self,
@@ -3501,8 +3465,10 @@ class TPUModelRunner(GPUModelRunner):
 
         num_reqs = len(num_scheduled_tokens_per_req)
 
-        pcp_planner = self.get_pcp_planner()
-        pcp_planner.reserve_host_token_capacity(self, int(total_num_scheduled_tokens))
+        if self.pcp_manager is not None:
+            self.pcp_manager.reserve_host_token_capacity(
+                self, int(total_num_scheduled_tokens)
+            )
 
         if self.uses_mrope:
             self._calc_mrope_positions(scheduler_output)
@@ -3629,22 +3595,19 @@ class TPUModelRunner(GPUModelRunner):
             num_reqs, self.max_num_reqs
         )
 
-        prepare_kwargs = dict(
-            runner=self,
-            scheduler_output=scheduler_output,
-            start_index=start_index,
-            num_reqs=num_reqs,
-            num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
-            total_num_scheduled_tokens=int(total_num_scheduled_tokens),
-            use_max_model_len=use_max_model_len,
-            target_num_reqs=target_num_reqs,
-            padded_num_reqs=padded_num_reqs,
-        )
         if self.pcp_manager is not None:
-            self.pcp_manager.prepare_real(**prepare_kwargs)
+            self.pcp_manager.prepare_real(
+                runner=self,
+                scheduler_output=scheduler_output,
+                start_index=start_index,
+                num_reqs=num_reqs,
+                num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
+                total_num_scheduled_tokens=int(total_num_scheduled_tokens),
+                use_max_model_len=use_max_model_len,
+                target_num_reqs=target_num_reqs,
+                padded_num_reqs=padded_num_reqs,
+            )
             pcp_plan = self.pcp_manager.sharding_plan
-            layout_plan = pcp_plan.sequence_layout_plan
-            layout_descriptor = self.pcp_manager.sequence_layout_descriptor
             meta_num_reqs = pcp_plan.local_num_reqs
             global_num_tokens = pcp_plan.global_num_tokens
             padded_total_num_scheduled_tokens = pcp_plan.global_padded_num_tokens
@@ -3652,24 +3615,30 @@ class TPUModelRunner(GPUModelRunner):
             local_padded_total_num_scheduled_tokens = pcp_plan.local_padded_num_tokens
             local_token_slice = pcp_plan.token_slice
             logits_indices_cpu = pcp_plan.logits_indices_cpu
+            use_pcp_streaming = self.pcp_manager.uses_pcp_streaming
             # Tokens are repacked rank-major, so there is no padding tail.
             zero_pad_tail = False
-        else:
-            assert self.sequence_layout_planner is not None
-            layout_plan = self.sequence_layout_planner.prepare_real(**prepare_kwargs)
-            pcp_plan = None
-            layout_descriptor = layout_plan.descriptor
-            meta_num_reqs = num_reqs
-            global_num_tokens = layout_plan.global_num_tokens
-            padded_total_num_scheduled_tokens = layout_plan.global_padded_num_tokens
-            local_total_num_scheduled_tokens = layout_plan.local_num_tokens
-            local_padded_total_num_scheduled_tokens = (
-                layout_plan.local_padded_num_tokens
+            self._last_non_pcp_local_num_tokens = None
+            pcp_draft_layout = (
+                self.pcp_manager.draft_layout()
+                if self._mtp_enabled or self.speculative_config is not None
+                else None
             )
-            local_token_slice = layout_plan.token_slice
-            logits_indices_cpu = layout_plan.logits_indices_cpu
-            zero_pad_tail = layout_plan.kind is SequenceLayoutKind.ALL
-        self._last_sequence_layout_plan = layout_plan
+        else:
+            pcp_plan = None
+            meta_num_reqs = num_reqs
+            global_num_tokens = int(total_num_scheduled_tokens)
+            padded_total_num_scheduled_tokens = _non_pcp_padded_num_tokens(
+                self, global_num_tokens
+            )
+            local_total_num_scheduled_tokens = global_num_tokens
+            local_padded_total_num_scheduled_tokens = padded_total_num_scheduled_tokens
+            local_token_slice = slice(0, padded_total_num_scheduled_tokens)
+            logits_indices_cpu = None
+            use_pcp_streaming = False
+            zero_pad_tail = True
+            self._last_non_pcp_local_num_tokens = global_num_tokens
+            pcp_draft_layout = None
         request_major_input_ids = None
         if self._pcp_enabled and self._mtp_enabled:
             assert request_major_input_ids_cpu is not None
@@ -3764,7 +3733,7 @@ class TPUModelRunner(GPUModelRunner):
             num_reqs,
             padded_num_reqs,
             use_max_model_len,
-            layout_descriptor.cache_key,
+            use_pcp_streaming,
         )
 
         # Speculative decoding metadata.
@@ -3957,7 +3926,7 @@ class TPUModelRunner(GPUModelRunner):
                 if self._unified_kv_layout and self.mamba_slot_read_offsets is not None
                 else None
             ),
-            sequence_layout_descriptor=layout_descriptor,
+            use_pcp_streaming=use_pcp_streaming,
         )
         slot_mappings = self.empty_slot_mappings
         per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
@@ -4008,7 +3977,7 @@ class TPUModelRunner(GPUModelRunner):
             pre_next_tokens_indices,
             spec_decode_metadata,
             request_major_input_ids,
-            layout_plan,
+            pcp_draft_layout,
         )
 
     def _record_input_staging_fence(self) -> None:
@@ -4178,9 +4147,6 @@ class TPUModelRunner(GPUModelRunner):
     def _pp_forward_rows(self, scheduler_output: "SchedulerOutput") -> list[int]:
         """The padded token count of each forward this step runs, in order,
         as _prepare_inputs sizes them, without staging any tensors."""
-        # The PCP manager rejects pipeline parallelism.
-        planner = self.sequence_layout_planner
-        assert planner is not None
         num_reqs = self.input_batch.num_reqs
         rows: list[int] = []
         all_counts = [
@@ -4196,14 +4162,16 @@ class TPUModelRunner(GPUModelRunner):
                 assert self.num_reqs_most_model_len is not None
                 chunk_reqs = self.num_reqs_most_model_len
             counts = counts[:chunk_reqs]
-            rows.append(
-                planner.padded_num_tokens(
+            if self.pcp_manager is not None:
+                padded = self.pcp_manager.padded_num_tokens(
                     runner=self,
                     scheduler_output=scheduler_output,
                     start_index=start_index,
                     num_scheduled_tokens_per_req=np.array(counts, dtype=np.int32),
                 )
-            )
+            else:
+                padded = _non_pcp_padded_num_tokens(self, int(sum(counts)))
+            rows.append(padded)
             start_index += len(counts)
         return rows
 
@@ -4565,7 +4533,7 @@ class TPUModelRunner(GPUModelRunner):
                 pre_next_tokens_indices,
                 spec_decode_metadata,
                 request_major_input_ids,
-                draft_sequence_layout_plan,
+                pcp_draft_layout,
             ) = self._prepare_inputs(
                 scheduler_output, start_index, num_decode_reqs, num_windowed_reqs
             )
@@ -4722,15 +4690,15 @@ class TPUModelRunner(GPUModelRunner):
                     "KV store NaN checking requires forward hidden states or "
                     "intermediate tensors"
                 )
-                plan = self._last_sequence_layout_plan
-                assert plan is not None, (
-                    "A real forward chunk must have a sequence layout plan"
-                )
                 nan_check.record(
                     hidden_states,
                     tuple(self.input_batch.req_ids[start_index:end_index]),
                     self.query_start_loc_np[: num_reqs + 1],
-                    plan,
+                    (
+                        self.pcp_manager.local_to_request_major_token_indices
+                        if self.pcp_manager is not None
+                        else None
+                    ),
                 )
 
             if not self._pp_is_last:
@@ -4750,9 +4718,8 @@ class TPUModelRunner(GPUModelRunner):
             # IntermediateTensors.
             hidden_states = cast(torch.Tensor, hidden_states)
 
-            layout_plan = self._last_sequence_layout_plan
             if self.is_pooling_model:
-                hidden_states = self._finalize_hidden_states(hidden_states, layout_plan)
+                hidden_states = self._finalize_hidden_states(hidden_states)
                 logits = torch.empty((0,), device=self.device)
                 pooler_output_list.append(
                     self._pool_chunk(
@@ -4763,17 +4730,14 @@ class TPUModelRunner(GPUModelRunner):
                         num_tokens_padded,
                         padded_num_reqs,
                         logits_indices,
-                        layout_plan,
                     )
                 )
             else:
                 sample_hidden_states = self._maybe_select_logits_hidden_states(
-                    hidden_states, layout_plan, logits_indices
+                    hidden_states
                 )
                 if sample_hidden_states is None:
-                    hidden_states = self._finalize_hidden_states(
-                        hidden_states, layout_plan
-                    )
+                    hidden_states = self._finalize_hidden_states(hidden_states)
                     if top_tokens:
                         logits = self.compute_selected_top_tokens(
                             hidden_states, logits_indices
@@ -4819,10 +4783,13 @@ class TPUModelRunner(GPUModelRunner):
             )
             if is_draft_model:
                 assert isinstance(hidden_states, torch.Tensor)
-                # Capture this chunk's draft inputs while they are valid.
-                assert draft_sequence_layout_plan is not None, (
-                    "the PCP manager does not support speculative decoding"
-                )
+                if self.pcp_manager is not None and pcp_draft_layout is None:
+                    pcp_draft_layout = self.pcp_manager.draft_layout()
+                    if pcp_draft_layout is None:
+                        raise NotImplementedError(
+                            "Active PCP sharding plan does not support "
+                            "speculative decoding."
+                        )
                 draft_chunk = DraftChunkInputs(
                     input_ids=(
                         request_major_input_ids
@@ -4844,7 +4811,7 @@ class TPUModelRunner(GPUModelRunner):
                         else None
                     ),
                     attn_metadata=attn_metadata,
-                    sequence_layout_plan=draft_sequence_layout_plan,
+                    pcp_draft_layout=pcp_draft_layout,
                 )
                 draft_chunks.append(draft_chunk)
 
@@ -4877,11 +4844,11 @@ class TPUModelRunner(GPUModelRunner):
 
     def _prompt_logprobs_unsupported_reason(self) -> str | None:
         """Why this runner cannot compute prompt logprobs, with the fix; None if
-        it can. Read from the PCP manager when USE_TPU_PCP_MANAGER replaces the
-        sequence layout planner."""
+        it can."""
         return prompt_logprobs.unsupported_reason(
             selected_logits_hidden_states=(
-                self.get_pcp_planner().uses_selected_logits_hidden_states
+                self.pcp_manager is not None
+                and self.pcp_manager.uses_selected_logits_hidden_states
             ),
             lora=self.lora_config is not None,
         )
@@ -5035,7 +5002,6 @@ class TPUModelRunner(GPUModelRunner):
         num_tokens_padded: int,
         padded_num_reqs: int,
         logits_indices: torch.Tensor | None,
-        layout_plan: Any,
     ) -> Any:
         """Pool one chunk of requests.
 
@@ -5062,14 +5028,7 @@ class TPUModelRunner(GPUModelRunner):
         finished_np = (num_computed_np + num_scheduled_tokens_np) == prompt_lens_np
 
         spec = self._static_pooler_spec
-        default_layout = self.pcp_manager is None and (
-            layout_plan is None
-            or (
-                getattr(layout_plan, "kind", SequenceLayoutKind.ALL)
-                is SequenceLayoutKind.ALL
-                and getattr(layout_plan, "logits_indices_cpu", None) is None
-            )
-        )
+        default_layout = self.pcp_manager is None
         if (
             spec is not None
             and default_layout
@@ -6290,7 +6249,8 @@ class TPUModelRunner(GPUModelRunner):
         # which TPU_DP_VOCAB_PARALLEL turns off) would bypass the padding.
         assert not (
             self._dp_vocab_logits
-            and self.get_pcp_planner().uses_selected_logits_hidden_states
+            and self.pcp_manager is not None
+            and self.pcp_manager.uses_selected_logits_hidden_states
         ), "TPU_DP_VOCAB_PARALLEL does not support selected logits hidden states"
         self._prompt_logprobs_unsupported = self._prompt_logprobs_unsupported_reason()
         if self.is_pooling_model:
@@ -6641,7 +6601,6 @@ class TPUModelRunner(GPUModelRunner):
         # Same fence discipline as a serving chunk: release the previous
         # chunk's host sources, then fence this one's before its forward.
         self._wait_input_staging_fence()
-        kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
         assert profile_decode_query_lens is None or profiling
 
@@ -6718,14 +6677,9 @@ class TPUModelRunner(GPUModelRunner):
                 num_reqs=num_reqs,
                 max_num_tokens=int(self.num_tokens_paddings[-1]),
             )
-            dummy_layout_descriptor = self.pcp_manager.sequence_layout_descriptor
+            use_pcp_streaming = self.pcp_manager.uses_pcp_streaming
         else:
-            assert self.sequence_layout_planner is not None
-            dummy_layout_descriptor = self.sequence_layout_planner.prepare_dummy(
-                num_tokens=num_tokens,
-                num_reqs=num_reqs,
-                kv_cache_initialized=kv_cache_initialized,
-            ).descriptor
+            use_pcp_streaming = False
 
         if self.kv_cache_config is not None:
             # Dummy compact-mamba slot ids (all null slot 0): the dummy run
@@ -6767,7 +6721,7 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_ckpt_window=self._mamba_ckpt_window,
                 mamba_request_distribution=dummy_mamba_request_distribution,
                 mamba_prefill_ckpt_offsets=dummy_prefill_ckpt_offsets,
-                sequence_layout_descriptor=dummy_layout_descriptor,
+                use_pcp_streaming=use_pcp_streaming,
             )
             slot_mappings = self.empty_slot_mappings
             per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
@@ -6810,9 +6764,7 @@ class TPUModelRunner(GPUModelRunner):
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 pcp_metadata=pcp_metadata,
-                sequence_layout_kind=(dummy_layout_descriptor.kind.value),
-                sequence_layout_protocol=(dummy_layout_descriptor.protocol),
-                sequence_layout_version=(dummy_layout_descriptor.version),
+                use_pcp_streaming=use_pcp_streaming,
             )
 
             per_layer_attn_metadata = {
@@ -7259,7 +7211,10 @@ class TPUModelRunner(GPUModelRunner):
                     synchronize_tensors(out)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
-        if not self.get_pcp_planner().uses_selected_logits_hidden_states:
+        if not (
+            self.pcp_manager is not None
+            and self.pcp_manager.uses_selected_logits_hidden_states
+        ):
             return
         with self._precompile_timed("compute_top_tokens_from_hidden_states"):
             for num_reqs in self.num_reqs_paddings:
@@ -7699,7 +7654,10 @@ class TPUModelRunner(GPUModelRunner):
             # Only the last stage holds the lm_head and samples.
             return
         self._precompile_compute_selected_logits()
-        if self.get_pcp_planner().uses_selected_logits_hidden_states:
+        if (
+            self.pcp_manager is not None
+            and self.pcp_manager.uses_selected_logits_hidden_states
+        ):
             self._precompile_compute_logits_from_hidden_states()
         self._precompile_compute_top_tokens()
         self._precompile_structured_decoding()
@@ -9242,11 +9200,11 @@ class TPUModelRunner(GPUModelRunner):
         padding_state = getattr(self, "_token_padding_state", None)
         if padding_state is None:
             return
-        plan = self._last_sequence_layout_plan
-        if plan is not None and plan.kind is SequenceLayoutKind.ALL:
-            num_valid_tokens = min(plan.local_num_tokens, num_tokens_padded)
+        local_num_tokens = getattr(self, "_last_non_pcp_local_num_tokens", None)
+        if self.pcp_manager is None and local_num_tokens is not None:
+            num_valid_tokens = min(local_num_tokens, num_tokens_padded)
         else:
-            # Padding-mask support is currently limited to the ALL layout.
+            # Padding-mask support is currently limited to non-PCP steps.
             num_valid_tokens = num_tokens_padded
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
@@ -9691,6 +9649,17 @@ def _get_padded_token_len(paddings: list[int], x: int) -> int:
             f"bucket {paddings[-1]} (available paddings: {paddings})"
         )
     return paddings[index]
+
+
+def _non_pcp_padded_num_tokens(runner: Any, total_tokens: int) -> int:
+    """Return the compile token bucket for a non-PCP chunk, raised to DP's bucket."""
+    padded_num_tokens = _get_padded_token_len(
+        runner.num_tokens_paddings, int(total_tokens)
+    )
+    dp_target_bucket = runner._dp_target_bucket
+    if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
+        padded_num_tokens = int(dp_target_bucket)
+    return padded_num_tokens
 
 
 def _get_padded_num_kv_cache_update_slices(

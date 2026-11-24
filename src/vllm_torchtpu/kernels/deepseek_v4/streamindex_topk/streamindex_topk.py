@@ -847,30 +847,39 @@ _INDEXER_KV_LAYOUT_FALLBACK_LOGGED: set[tuple[str, int | str]] = set()
 def indexer_kv_layout(
     block_size: int,
     mode: str | None = None,
+    *,
+    pcp_enabled: bool | None = None,
 ) -> KVLayout:
     """Returns the single-source `KVLayout` for an indexer K cache of `block_size`.
 
     `sal` requires `block_size` to be a positive multiple of 128 and is not
     supported by Raiden GLM Stage-3 admission (`build_glm_mla_pool_manifest` /
-    `lower_glm_row_spans` require packed-row `HEAD_ALONG_SUBLANE` geometry).
-    When `sal` is selected by default and Raiden GLM admission is enabled, or
-    when `block_size < 128` or `block_size % 128 != 0`, this helper selects
-    `KVLayout.HEAD_ALONG_SUBLANE` (logging a one-time warning) so cache
-    allocation and op execution always agree on the layout. Explicitly
-    requesting `sal` while Raiden GLM admission is enabled raises `ValueError`.
+    `lower_glm_row_spans` require packed-row `HEAD_ALONG_SUBLANE` geometry) or
+    when `prefill_context_parallel_size > 1`. When `sal` is selected by default
+    under those modes, or when `block_size < 128` or `block_size % 128 != 0`,
+    this helper selects `KVLayout.HEAD_ALONG_SUBLANE` (logging a one-time
+    warning) so cache allocation and op execution always agree on the layout.
+    Explicitly requesting `sal` while Raiden GLM admission or PCP is enabled
+    raises `ValueError`.
     """
     try:
         from vllm_torchtpu import envs
 
         raiden_glm_admission = envs.use_raiden_glm_admission()
-        pcp_manager = envs.USE_TPU_PCP_MANAGER
         explicit_env = envs.is_indexer_kv_cache_mode_explicit()
         env_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
     except ImportError:
         raiden_glm_admission = False
-        pcp_manager = False
         explicit_env = False
         env_mode = DEFAULT_INDEXER_KV_CACHE_MODE
+
+    if pcp_enabled is None:
+        try:
+            from vllm_torchtpu.distributed.pcp import get_pcp_world_size
+
+            pcp_enabled = get_pcp_world_size() > 1
+        except ImportError:
+            pcp_enabled = False
 
     if mode is None:
         raw_mode = env_mode
@@ -906,22 +915,23 @@ def indexer_kv_layout(
                     "VLLM_TPU_INDEXER_KV_CACHE_MODE=has to silence this warning.",
                 )
             return KVLayout.HEAD_ALONG_SUBLANE
-        if pcp_manager:
+        if pcp_enabled:
             if explicit_mode:
                 raise ValueError(
                     "VLLM_TPU_INDEXER_KV_CACHE_MODE='sal' is not supported with "
-                    "USE_TPU_PCP_MANAGER=1, which requires the HEAD_ALONG_SUBLANE "
-                    "indexer K layout. Set VLLM_TPU_INDEXER_KV_CACHE_MODE=has (or "
-                    "unset it to allow automatic fallback)."
+                    "prefill_context_parallel_size > 1, which requires the "
+                    "HEAD_ALONG_SUBLANE indexer K layout. Set "
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE=has (or unset it to allow "
+                    "automatic fallback)."
                 )
-            key = (resolved, "pcp_manager")
+            key = (resolved, "pcp")
             if key not in _INDEXER_KV_LAYOUT_FALLBACK_LOGGED:
                 _INDEXER_KV_LAYOUT_FALLBACK_LOGGED.add(key)
                 logger.warning(
                     "Default VLLM_TPU_INDEXER_KV_CACHE_MODE='sal' is not supported "
-                    "with USE_TPU_PCP_MANAGER=1; falling back to HEAD_ALONG_SUBLANE "
-                    "layout with 'has' writer. Set VLLM_TPU_INDEXER_KV_CACHE_MODE=has "
-                    "to silence this warning.",
+                    "with prefill_context_parallel_size > 1; falling back to "
+                    "HEAD_ALONG_SUBLANE layout with 'has' writer. Set "
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE=has to silence this warning.",
                 )
             return KVLayout.HEAD_ALONG_SUBLANE
         if block_size < 128 or block_size % 128 != 0:

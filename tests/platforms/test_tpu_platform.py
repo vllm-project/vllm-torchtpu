@@ -917,7 +917,6 @@ class TestTpuPlatform:
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is False
 
-    @pytest.mark.parametrize("use_pcp_manager", [False, True])
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
@@ -928,10 +927,8 @@ class TestTpuPlatform:
         mock_apply_patches,
         vllm_config,
         monkeypatch,
-        use_pcp_manager,
     ):
         monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
-        monkeypatch.setattr(tpu_platform.envs, "USE_TPU_PCP_MANAGER", use_pcp_manager)
         vllm_config.model_config.architecture = "Qwen3_5ForConditionalGeneration"
         vllm_config.model_config.use_mla = False
         vllm_config.model_config.is_multimodal_model = True

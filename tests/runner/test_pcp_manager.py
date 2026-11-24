@@ -189,7 +189,7 @@ def test_glm_attention_layers_support_the_pcp_manager():
 
 
 def test_pcp_manager_config_rejects_pcp_size_one():
-    """`USE_TPU_PCP_MANAGER=1` with pcp_size == 1 fails the manager's config
-    check."""
-    with pytest.raises(NotImplementedError, match="pcp=1"):
+    """Calling `validate_pcp_manager_config` with pcp_size == 1 fails the
+    manager's config check."""
+    with pytest.raises(NotImplementedError, match="pcp=1|> 1"):
         validate_pcp_manager_config(_pcp_manager_config(pcp_size=1, tp_size=8))

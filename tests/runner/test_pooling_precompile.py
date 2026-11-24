@@ -772,9 +772,7 @@ def test_runner_sampling_precompile_bypassed_for_pooling(is_pooling):
     runner = SimpleNamespace(
         is_pooling_model=is_pooling,
         _pp_is_last=True,
-        get_pcp_planner=lambda: SimpleNamespace(
-            uses_selected_logits_hidden_states=True
-        ),
+        pcp_manager=SimpleNamespace(uses_selected_logits_hidden_states=True),
     )
     for name in names:
         setattr(runner, name, MagicMock())
@@ -839,7 +837,7 @@ def test_runner_pool_chunk_gates_chunked_last(use_static):
     hidden = _padded_hidden([6, 4], 16)
 
     out = runner_mod.TPUModelRunner._pool_chunk(
-        runner, sched, hidden, 0, 2, 16, 8, None, None
+        runner, sched, hidden, 0, 2, 16, 8, None
     )
     if use_static:
         assert isinstance(out, StaticPoolerChunkOutput)

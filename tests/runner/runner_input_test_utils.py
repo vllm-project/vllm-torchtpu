@@ -27,8 +27,11 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.core.sequence_layout import create_sequence_layout_planner
 from vllm_torchtpu.runner import min_tokens, repetition_penalty
+from vllm_torchtpu.runner.pcp import PcpManager
+from vllm_torchtpu.runner.pcp.interleaved_sharding_plan import (
+    InterleavedPcpShardingPlan,
+)
 from vllm_torchtpu.runner.thinking_budget_tracker import ThinkingBudgetTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.structured_decoding.structured_decoding_manager import (
@@ -54,6 +57,7 @@ def _make_runner(
     uses_mrope=False,
     mtp_enabled=False,
     pcp_size=2,
+    pcp_rank=0,
     max_num_reqs=8,
     block_size=16,
 ):
@@ -104,9 +108,23 @@ def _make_runner(
         kv_transfer_config=None,
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
-    runner.sequence_layout_planner = create_sequence_layout_planner(runner.vllm_config)
-    runner.pcp_manager = None
-    runner.get_pcp_planner = types.MethodType(TPUModelRunner.get_pcp_planner, runner)
+    runner.pcp_manager = (
+        PcpManager(
+            InterleavedPcpShardingPlan(
+                pcp_size=pcp_size,
+                pcp_rank=pcp_rank,
+                interleave_size=block_size,
+                max_num_batched_tokens=max_num_tokens * pcp_size,
+                page_size=block_size,
+            )
+        )
+        if pcp_size > 1
+        else None
+    )
+    runner._last_non_pcp_local_num_tokens = None
+    runner._non_pcp_padded_num_tokens = types.MethodType(
+        TPUModelRunner._non_pcp_padded_num_tokens, runner
+    )
     runner.cache_config = SimpleNamespace(
         block_size=block_size, num_gpu_blocks=8, num_gpu_blocks_override=None
     )
@@ -264,9 +282,7 @@ def _make_runner(
             query_start_loc=ctx.query_start_loc,
             request_distribution=ctx.request_distribution,
             mamba_state_indices=ctx.mamba_state_indices,
-            sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
-            sequence_layout_protocol=ctx.sequence_layout_descriptor.protocol,
-            sequence_layout_version=ctx.sequence_layout_descriptor.version,
+            use_pcp_streaming=ctx.use_pcp_streaming,
         )
         return {"layer.0": md}, None
 

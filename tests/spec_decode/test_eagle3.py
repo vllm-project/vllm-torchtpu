@@ -22,12 +22,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
-from vllm_torchtpu.layers.core.sequence_layout import (
-    PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
-    SequenceLayoutDescriptor,
-    SequenceLayoutKind,
-    SequenceLayoutPlan,
-)
+from vllm_torchtpu.runner.pcp import PcpDraftLayout
 from vllm_torchtpu.spec_decode import utils as spec_decode_utils
 from vllm_torchtpu.spec_decode.eagle3 import (
     DraftChunkInputs,
@@ -257,7 +252,7 @@ def _make_chunk(
     attn_ctx=None,
     hidden_states=None,
     draft_lengths=None,
-    sequence_layout_plan=None,
+    pcp_draft_layout=None,
 ):
     """Build a DraftChunkInputs for tests. aux/attn_ctx are only needed by
     paths that consume them; _prepare_draft_inputs does not touch attn_ctx, so
@@ -280,28 +275,17 @@ def _make_chunk(
         hidden_states=hidden_states,
         draft_lengths=draft_lengths,
     )
-    if sequence_layout_plan is not None:
-        chunk.sequence_layout_plan = sequence_layout_plan
+    if pcp_draft_layout is not None:
+        chunk.pcp_draft_layout = pcp_draft_layout
     return chunk
 
 
-def _rank0_pcp_plan() -> SequenceLayoutPlan:
-    return SequenceLayoutPlan(
-        descriptor=SequenceLayoutDescriptor(
-            kind=SequenceLayoutKind.PARTIAL,
-            protocol=PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
-        ),
-        token_slice=slice(0, 3),
-        global_num_tokens=5,
-        global_padded_num_tokens=6,
-        local_num_tokens=3,
-        local_padded_num_tokens=3,
-        _packed_to_request_major_token_indices=np.array(
-            [0, 2, 4, 1, 3, -1], dtype=np.int64
-        ),
-        _request_major_to_packed_token_indices=np.array(
-            [0, 3, 1, 4, 2], dtype=np.int64
-        ),
+def _rank0_pcp_draft_layout() -> PcpDraftLayout:
+    return PcpDraftLayout(
+        local_to_request_major=np.array([0, 2, 4], dtype=np.int64),
+        padded_request_to_packed=np.array([0, 3, 1, 4, 2, -1], dtype=np.int64),
+        local_start=0,
+        local_end=3,
     )
 
 
@@ -430,7 +414,7 @@ def test_prepare_draft_inputs_pcp_mtp_seeds_request_major_then_localizes(
         num_tokens_paddings=[16, 32],
         _dp_lockstep_enabled=lambda: False,
     )
-    plan = _rank0_pcp_plan()
+    layout = _rank0_pcp_draft_layout()
     request_major = torch.tensor(
         [10, 11, 20, 21, 22, 0], dtype=torch.int32, device=device
     )
@@ -445,7 +429,7 @@ def test_prepare_draft_inputs_pcp_mtp_seeds_request_major_then_localizes(
         attn_ctx=SimpleNamespace(
             query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32, device=device)
         ),
-        sequence_layout_plan=plan,
+        pcp_draft_layout=layout,
     )
 
     kwargs = {}
@@ -692,7 +676,7 @@ def test_propose_delegates_carry_aggregation_after_gather():
         device=device,
         hidden_states=torch.zeros((3, 1), device=device),
         attn_ctx=SimpleNamespace(use_max_model_len=True),
-        sequence_layout_plan=_CarryAggregationAfterGatherPlan(events),
+        pcp_draft_layout=_CarryAggregationAfterGatherPlan(events),
     )
     proposer.draft_chunks = [chunk]
     proposer.draft_model = SimpleNamespace(
@@ -721,6 +705,7 @@ def test_propose_delegates_carry_aggregation_after_gather():
         return last_hidden[:, 0].to(torch.int32)
 
     proposer._draft_propose_token = record_token
+
     proposer.propose(
         sampled_token_ids=[[101], [202]],
         discard_sampled_tokens_req_indices=[],
@@ -729,6 +714,108 @@ def test_propose_delegates_carry_aggregation_after_gather():
     )
 
     assert events == ["gather", "aggregate", "propose_token"]
+
+
+def test_propose_multi_chunk_pcp_mtp_localizes_and_aggregates_per_chunk(monkeypatch):
+    device = torch.device("cpu")
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 1
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=3, req_ids=["r0", "r1", "r2"]),
+        device=device,
+        requests={},
+        num_tokens_paddings=[16],
+        uses_mrope=False,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    # Chunk 0 (2 reqs, 5 tokens): rank 0 owns req 1's last token (row 2), not req 0's.
+    layout0 = _rank0_pcp_draft_layout()
+    chunk0 = _make_chunk(
+        input_ids=torch.tensor([10, 11, 20, 21, 22, 0], dtype=torch.int32),
+        position_ids=torch.tensor([0, 2, 4], dtype=torch.int32),
+        query_start_loc_np=np.array([0, 2, 5], dtype=np.int32),
+        start_index=0,
+        num_reqs=2,
+        hidden=1,
+        device=device,
+        padded_tokens=3,
+        hidden_states=torch.zeros((3, 1), device=device),
+        attn_ctx=SimpleNamespace(
+            use_max_model_len=True,
+            query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
+        ),
+        pcp_draft_layout=layout0,
+    )
+    # Chunk 1 (1 req, 2 tokens): rank 0 owns req 2's last token at local row 1.
+    layout1 = PcpDraftLayout(
+        local_to_request_major=np.array([0, 1, -1], dtype=np.int64),
+        padded_request_to_packed=np.array([0, 1, -1, -1, -1, -1], dtype=np.int64),
+        local_start=0,
+        local_end=3,
+    )
+    chunk1 = _make_chunk(
+        input_ids=torch.tensor([30, 31, 0, 0, 0, 0], dtype=torch.int32),
+        position_ids=torch.tensor([0, 1, 0], dtype=torch.int32),
+        query_start_loc_np=np.array([0, 2], dtype=np.int32),
+        start_index=2,
+        num_reqs=1,
+        hidden=1,
+        device=device,
+        padded_tokens=3,
+        hidden_states=torch.zeros((3, 1), device=device),
+        attn_ctx=SimpleNamespace(
+            use_max_model_len=True,
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        ),
+        pcp_draft_layout=layout1,
+    )
+    proposer.draft_chunks = [chunk0, chunk1]
+    proposer.draft_model = SimpleNamespace(
+        model=SimpleNamespace(use_aux_hidden_state=False)
+    )
+
+    seen_draft_inputs: list[list[int]] = []
+
+    def fake_forward_draft(*, input_ids, **_kw):
+        seen_draft_inputs.append(input_ids.tolist())
+        return input_ids.to(torch.float32).unsqueeze(-1), torch.zeros((3, 1))
+
+    proposer._draft_seed_input_ids = (
+        Eagle3Proposer._draft_seed_input_ids.__wrapped__.__wrapped__.__get__(proposer)
+    )
+    proposer._forward_draft = fake_forward_draft
+    proposer._draft_gather_carries = (
+        Eagle3Proposer._draft_gather_carries.__wrapped__.__wrapped__.__get__(proposer)
+    )
+    proposer._draft_propose_token = lambda last_h: last_h[:, 0].to(torch.int32)
+
+    reduced_masks: list[list[float]] = []
+
+    def fake_reduce(masked: torch.Tensor) -> torch.Tensor:
+        reduced_masks.append(masked[:, 0].tolist())
+        remote = torch.zeros_like(masked)
+        if len(reduced_masks) == 1:
+            remote[0, 0] = 101.0
+        return masked + remote
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.pcp.sharding_plan.all_reduce_sum", fake_reduce
+    )
+    draft_tokens = proposer.propose(
+        sampled_token_ids=[[101], [202], [303]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(
+            num_scheduled_tokens={}, scheduled_spec_decode_tokens={}
+        ),
+    )
+
+    assert seen_draft_inputs == [[11, 21, 202], [31, 303, 0]]
+    assert reduced_masks == [
+        [0.0, 202.0] + [0.0] * 14,
+        [303.0] + [0.0] * 15,
+    ]
+    assert np.asarray(draft_tokens).tolist() == [[101], [202], [303]]
 
 
 @pytest.mark.tpu_test
@@ -1503,7 +1590,7 @@ def test_build_draft_attn_metadata_loop_cache(device):
             query_start_loc="QSL",
             request_distribution="RD",
             position_ids_override=None,
-            sequence_layout_descriptor=SequenceLayoutDescriptor(),
+            use_pcp_streaming=False,
         ),
     )
 
@@ -1557,14 +1644,13 @@ def test_build_draft_attn_metadata_loop_cache(device):
 
 
 @pytest.mark.tpu_test
-def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
-    """Rebuilding draft metadata must preserve the target chunk's PCP
-    descriptor; defaulting it to ALL selects an incompatible attention path."""
+def test_build_draft_attn_metadata_propagates_chunk_use_pcp_streaming(device):
+    """Rebuilding draft metadata must preserve the target chunk's PCP streaming
+    flag; defaulting it to False selects an incompatible attention path."""
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
     proposer = _make_proposer(draft_tp=1, method="mtp")
     proposer._draft_attn_layer_names = {"draft.attn.0"}
-    descriptor = _rank0_pcp_plan().descriptor
     runner = SimpleNamespace(
         _has_mamba_state=False,
         _unified_kv_layout=False,
@@ -1575,17 +1661,18 @@ def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
         empty_slot_mappings={},
     )
     proposer.runner = runner
-    captured_descriptors = []
+    captured_flags = []
 
     def fake_build_attention_metadata(**_kwargs):
         ctx = runner._attn_metadata_builder_ctx
-        captured_descriptors.append(ctx.sequence_layout_descriptor)
+        captured_flags.append(ctx.use_pcp_streaming)
         md = AttentionMetadata(
             input_positions=torch.zeros(3, device=device),
             block_tables=torch.zeros(1, dtype=torch.int32, device=device),
             seq_lens=ctx.seq_lens,
             query_start_loc=ctx.query_start_loc,
             request_distribution=ctx.request_distribution,
+            use_pcp_streaming=ctx.use_pcp_streaming,
         )
         return {"draft.attn.0": md}, None
 
@@ -1604,7 +1691,7 @@ def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
                 [0, 2, 2], dtype=torch.int32, device=device
             ),
             position_ids_override=None,
-            sequence_layout_descriptor=descriptor,
+            use_pcp_streaming=True,
         ),
     )
 
@@ -1616,7 +1703,7 @@ def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
         num_tokens_padded=3,
     )
 
-    assert captured_descriptors == [descriptor]
+    assert captured_flags == [True]
 
 
 def _target_md_chunk(device, attn_metadata, position_ids_override=None):
@@ -1637,7 +1724,7 @@ def _target_md_chunk(device, attn_metadata, position_ids_override=None):
                 [0, 2, 2], dtype=torch.int32, device=device
             ),
             position_ids_override=position_ids_override,
-            sequence_layout_descriptor=SequenceLayoutDescriptor(),
+            use_pcp_streaming=False,
         ),
         attn_metadata=attn_metadata,
     )

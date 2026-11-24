@@ -85,7 +85,6 @@ def make_runner(device, monkeypatch, k):
     runner._mamba_state_pos = {}
     runner._mamba_offset_seeded = set()
     runner._read_offset_scratch = {}
-    runner._last_sequence_layout_plan = None
     runner.pcp_manager = None
     runner._fast_token_substitution = False
     # Real upstream batch operations and CPU token buffers. The kernels being
@@ -340,7 +339,6 @@ def substitution_runner(device, k):
     runner = object.__new__(TPUModelRunner)
     runner.device = device
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=k)
-    runner._last_sequence_layout_plan = None
     runner.pcp_manager = None
     runner._fast_token_substitution = False
     return runner

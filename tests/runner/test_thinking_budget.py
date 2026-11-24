@@ -238,7 +238,7 @@ def _make_lifecycle_runner(
     runner.use_async_spec_decode = False
     runner.requests, runner.num_prompt_logprobs = {}, {}
     runner._pre_async_results = None
-    runner._last_sequence_layout_plan = None
+    runner.pcp_manager = None
     runner._mamba_state_pos, runner._mamba_slot_by_req_id = {}, {}
     runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
     runner._install_spec_token_room_guard = lambda: None

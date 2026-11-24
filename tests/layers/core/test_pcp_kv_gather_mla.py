@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PCP manager sparse MLA (`USE_TPU_PCP_MANAGER=1`) vs a numpy reference.
+"""PCP manager sparse MLA (`prefill_context_parallel_size > 1`) vs a numpy reference.
 
 One layer on 8 chips, DCP 8 x PCP {2, 4, 8}:
 `HeadTailPcpShardingPlan.prepare_real` plans every PCP rank's step,
