@@ -828,8 +828,8 @@ def select_fp8_indexer_tiles(
     ranges, with ``state`` None at the first call; it returns the new state
     and ``following``. Prefill tiles feed it as their selection completes,
     so its work overlaps the scoring and selection of later tiles.
-    ``following`` is the next tile's scoring input (None if no scoring
-    follows): what the consumer gates it on is issued before that scoring.
+    ``following`` is the input of the pipeline's next step (None at the
+    end): what the consumer gates it on is issued before that step.
     """
     arguments = (
         q,
