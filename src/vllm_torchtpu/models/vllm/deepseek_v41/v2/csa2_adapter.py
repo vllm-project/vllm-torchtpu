@@ -261,7 +261,7 @@ def _select_gather_attend(
     attention output, the main records [T,512] for stage reuse, and the
     gathered words, scales and valid counts, as `_gather_attend` does.
     """
-    from .indexer_fp8 import select_fp8_indexer_jax
+    from .indexer_fp8 import select_fp8_indexer_tiles
 
     tokens = q.shape[0]
     swa_pages = swa_word_pages(
@@ -364,7 +364,7 @@ def _select_gather_attend(
         owners = attend(owners, start, gathered, counts)
         return (*owners, all_scales, all_counts), following
 
-    selected, _, (output, words, gathered_scales, counts) = select_fp8_indexer_jax(
+    selected, _, (output, words, gathered_scales, counts) = select_fp8_indexer_tiles(
         index_q,
         index_banks,
         index_table,

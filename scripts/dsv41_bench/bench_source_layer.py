@@ -4,9 +4,9 @@
 2,048 query rows of one 147K-token request (73,984 index keys, ratio 2), v7x TP1.
   unfused: the indexer op, the torch-side record mask, then the gather/attention op.
   fused: `_select_gather_attend`, each selection tile gathered and attended in place.
-Checks all five outputs bitwise against the unfused path and reports device ms per program,
-the top TC/SC ops, and trace+lower / compile seconds (VARIANT=unfused|fused for a
-fresh-process compile measurement; default runs both and compares).
+Checks all five outputs bitwise against the unfused path and reports device ms
+per program, the top TC/SC ops, and trace+lower / compile seconds
+(VARIANT=unfused|fused measures one in a fresh process; default runs both).
 """
 
 import json

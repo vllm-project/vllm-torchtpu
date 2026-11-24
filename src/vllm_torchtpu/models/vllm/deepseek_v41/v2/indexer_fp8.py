@@ -58,7 +58,7 @@ if TYPE_CHECKING:
     from .indexer_cache import PackedFP8IndexCacheRows
 
 # consume(start, rows, state, following) -> (state, following); see
-# `select_fp8_indexer_jax`.
+# `select_fp8_indexer_tiles`.
 SelectionConsumer = Callable[[int, jax.Array, Any, Any], tuple[Any, Any]]
 
 _query_op = None
@@ -466,7 +466,7 @@ def _select_fp8_indexer_jax(
     prefill_chunk_rows: int | None = None,
     consume: "SelectionConsumer | None" = None,
 ) -> tuple[jax.Array, ...]:
-    """Selected indices and published candidates; see `select_fp8_indexer_jax`."""
+    """Selected indices and published candidates; see `select_fp8_indexer_tiles`."""
 
     def finish(selected, published):
         if consume is None:
@@ -800,7 +800,7 @@ def _select_fp8_indexer_jax(
     return selected, published, state
 
 
-def select_fp8_indexer_jax(
+def select_fp8_indexer_tiles(
     q: jax.Array,
     banks: tuple[jax.Array, ...],
     page_table: jax.Array,
@@ -893,6 +893,46 @@ def select_fp8_indexer_jax(
             )
             for w in widths
         ],
+    )
+
+
+def select_fp8_indexer_jax(
+    q: jax.Array,
+    banks: tuple[jax.Array, ...],
+    page_table: jax.Array,
+    weights: jax.Array,
+    lengths: jax.Array,
+    candidates: jax.Array,
+    requests: jax.Array,
+    batch_max: jax.Array,
+    query_start_loc: jax.Array,
+    layout_args: tuple[int, ...],
+    topk: int,
+    block_size: int,
+    candidate_write: bool,
+    sparse_logits: bool,
+    unordered: bool,
+    score_width: int,
+) -> tuple[jax.Array, jax.Array]:
+    """The registered selection op: `select_fp8_indexer_tiles` without a
+    consumer, whose signature holds only arrays and plain values."""
+    return select_fp8_indexer_tiles(
+        q,
+        banks,
+        page_table,
+        weights,
+        lengths,
+        candidates,
+        requests,
+        batch_max,
+        query_start_loc,
+        layout_args,
+        topk,
+        block_size,
+        candidate_write,
+        sparse_logits,
+        unordered,
+        score_width,
     )
 
 
