@@ -899,8 +899,9 @@ def _build_fused_ep_moe_kernel(
     # read straight back out of it by the push that ships it -- two local
     # passes and, at the small buckets, about a quarter of the visit's DMA
     # enqueues, for a buffer nothing else reads. Where a build's experts are
-    # expected to fit inside one tile -- the same bound the height ladder
-    # above is emitted on -- the tile can be shipped from `out_vm` itself,
+    # expected to fit inside one tile -- `push_from_vmem`, which
+    # density_choices makes above with the height ladder -- the tile can be
+    # shipped from `out_vm` itself,
     # deleting the commits, the drain that gates them and the slab's traffic.
     # It costs a staging buffer that stays live until the wire has read it,
     # which is why a build whose visits carry several tiles keeps the slab:

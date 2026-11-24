@@ -338,6 +338,29 @@ def _unpermute_load_to_ep_rank_order(counts, *, g_local, mesh_ep_ranks):
 # plan is long enough to pay for it.
 AGQ_MIN_LOCAL_TOKENS = 1024
 
+
+def density_build_kwargs(e_total, e_logical, ep, num_tokens, topk, capacity):
+    """Builder kwargs that keep an expert layout's density choices those of
+    the unplaced build, or {} when the layout adds no slots.
+
+    A layout's spare (staging) slots never hold rows, and replicas split an
+    expert's rows without adding any, so a shard's rows spread over its
+    logical experts: occupied_slots is that count, and density_rows_alloc is
+    the slab the same token bucket gets without the extra slots
+    (kernel.density_choices).
+    """
+    g_local = e_total // ep
+    occupied_slots = min(g_local, -(-e_logical // ep))
+    if occupied_slots == g_local:
+        return {}
+    return {
+        "occupied_slots": occupied_slots,
+        "density_rows_alloc": ragged_stride_bound(
+            num_tokens, topk, e_logical, capacity
+        ),
+    }
+
+
 # Per-config cache of the shard_map'd MoE callable; a fresh shard_map
 # body would re-trace the whole kernel for every hidden layer.
 _LAYER_SM_CACHE = {}
@@ -572,9 +595,6 @@ def fused_ep_moe_v2(
     g_local = e_total // ep
     # Global experts the router scores; without a layout, one slot each.
     e_router = gating.shape[1] if expert_slot is not None else e_total
-    # Slots per shard that can receive rows: replicas split an expert's rows
-    # but add none, and staging slots are never in the table.
-    occupied_slots = min(g_local, -(-e_router // ep))
     if T % ep or gating.shape != (T, e_router):
         raise ValueError(
             "input and gating rows must agree and partition evenly over EP"
@@ -671,14 +691,7 @@ def fused_ep_moe_v2(
         logical_intermediate_size=logical_intermediate_size,
         # A layout's spare (staging) slots never hold rows: estimate density
         # over the logical experts per shard, with the unplaced slab.
-        **(
-            {
-                "occupied_slots": occupied_slots,
-                "density_rows_alloc": ragged_stride_bound(T, topk, e_router, capacity),
-            }
-            if occupied_slots != g_local
-            else {}
-        ),
+        **density_build_kwargs(e_total, e_router, ep, T, topk, capacity),
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)

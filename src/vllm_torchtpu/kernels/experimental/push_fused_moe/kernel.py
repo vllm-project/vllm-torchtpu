@@ -60,6 +60,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     _slot_copy,
     _tile_row_scales,
     combine_step_tokens,
+    density_choices,
     expert_ffn_bf16,
     expert_ffn_blockscale,
     expert_ffn_fp8,
@@ -132,10 +133,15 @@ def _build_push_moe_kernel(
     hbm_staging=False,
     dispatch_ahead=1,
     single_barrier=False,
+    occupied_slots=None,
+    density_rows_alloc=None,
 ):
     """Build the pallas_call and the function that invokes it.
 
     The v2 kernel with the activation all-gather replaced by push dispatch.
+    `occupied_slots` and `density_rows_alloc` are v2's (see
+    density_choices): an expert layout's staging slots don't count toward
+    the VMEM-push choice.
     `push_tokens` is t_local: the lhs operand is only this shard's rows,
     sorted by global expert (host.local_sort_activations), and every shard
     pushes each (destination, expert) run of them as one DMA straight into
@@ -434,7 +440,12 @@ def _build_push_moe_kernel(
     #
     # This subsumes the deferred commit drain the same bound used to select:
     # deferring a wait one visit is worth nothing once the wait is gone.
-    push_from_vmem = not hbm_staging and ragged_rows_alloc <= ep * g_local * tile_m
+    push_from_vmem = (
+        not hbm_staging
+        and density_choices(
+            tile_m, ragged_rows_alloc, g_local, ep, occupied_slots, density_rows_alloc
+        )[1]
+    )
     ls_window_rows = host.act_scale_window_rows(tile_m)
     # A segment word packs dest << 24 | local expert << 16 | rows.
     if push_tokens >= 1 << 16 or ep > 128 or g_local > 256:

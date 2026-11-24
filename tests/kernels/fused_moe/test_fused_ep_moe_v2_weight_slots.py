@@ -409,3 +409,119 @@ def test_multi_tile_index_window_disables_input3_without_disabling_cache(monkeyp
 def test_input_scratch_refuses_invalid_geometry(options, message):
     with pytest.raises(ValueError, match=message):
         host.vmem_scratch_arrays(**TUNED, nbuf=2, **options)
+
+
+# --------------------------------------------------------------------------- #
+# Density choices with an expert layout.
+#
+# A dynamic-EPLB layout gives each shard more physical slots than logical
+# experts: at DeepSeek-V4.1 EP8, 48 logical experts + 1 replica + staging slots,
+# 56 slots in all. Staging slots never hold rows and a replica splits an
+# expert's rows without adding any, so the tile-height ladder and the VMEM-push
+# choice are made from the logical experts per shard and from the slab the
+# bucket gets without the extra slots.
+# --------------------------------------------------------------------------- #
+
+DENSITY_TILE_M, DENSITY_EP = 128, 8
+
+# (slab rows at 48 slots, slab rows at 56 slots): host.ragged_stride_bound at
+# each DeepSeek-V4.1 token bucket for 384 vs 448 physical slots (the slab
+# grows by the extra slots' row-block alignment).
+TARGET_BUILDS = [
+    (1280, 1408),
+    (2048, 2176),
+    (3584, 3712),
+    (6656, 6784),
+    (7424, 7552),
+    (12800, 12928),
+    (25088, 25216),
+    (49664, 49792),
+]
+# A smaller model sharing the layout scheme: 16 logical experts per shard
+# in 24 slots.
+SMALL_BUILDS = [(1280, 1280), (2176, 2304), (4096, 4224), (7936, 8064)]
+
+
+@pytest.mark.parametrize("g_local", [8, 16, 48, 56])
+@pytest.mark.parametrize("rows", [1280, 2048, 7424, 12800, 49664, 65536])
+def test_without_occupied_slots_the_density_choices_are_unchanged(g_local, rows):
+    rungs, push = kernel.density_choices(DENSITY_TILE_M, rows, g_local, DENSITY_EP)
+    assert rungs == kernel.tile_height_rungs(DENSITY_TILE_M, rows, g_local, DENSITY_EP)
+    assert push == (rows <= DENSITY_EP * g_local * DENSITY_TILE_M)
+
+
+@pytest.mark.parametrize(
+    "logical, slots, builds", [(48, 56, TARGET_BUILDS), (16, 24, SMALL_BUILDS)]
+)
+def test_staging_slots_get_the_unplaced_density_choices(logical, slots, builds):
+    for rows_plain, rows_placed in builds:
+        plain = kernel.density_choices(DENSITY_TILE_M, rows_plain, logical, DENSITY_EP)
+        placed = kernel.density_choices(
+            DENSITY_TILE_M,
+            rows_placed,
+            slots,
+            DENSITY_EP,
+            occupied_slots=logical,
+            density_rows_alloc=rows_plain,
+        )
+        assert placed == plain, (rows_plain, rows_placed, plain, placed)
+
+
+def test_the_unplaced_slab_decides_at_the_one_tile_bound():
+    """At 8 x 48 x 128 = 49,152 rows the unplaced slab sits on the bound and
+    the placed one (49,280) just past it: occupied slots alone would flip
+    both choices; the unplaced slab keeps the unplaced build's."""
+    plain = kernel.density_choices(DENSITY_TILE_M, 49152, 48, DENSITY_EP)
+    assert plain == ((32, 64, 96, 128), True)
+    occupied_only = kernel.density_choices(
+        DENSITY_TILE_M, 49280, 56, DENSITY_EP, occupied_slots=48
+    )
+    assert occupied_only == ((128,), False)
+    both = kernel.density_choices(
+        DENSITY_TILE_M,
+        49280,
+        56,
+        DENSITY_EP,
+        occupied_slots=48,
+        density_rows_alloc=49152,
+    )
+    assert both == plain
+
+
+def test_the_1024_token_bucket_differed_when_staging_slots_counted():
+    plain = kernel.density_choices(DENSITY_TILE_M, 49664, 48, DENSITY_EP)
+    counted = kernel.density_choices(DENSITY_TILE_M, 49792, 56, DENSITY_EP)
+    assert plain[1] is False and counted[1] is True
+
+
+def test_density_inputs_never_exceed_the_build():
+    assert kernel.density_choices(
+        DENSITY_TILE_M, 49664, 48, DENSITY_EP, occupied_slots=99
+    ) == kernel.density_choices(DENSITY_TILE_M, 49664, 48, DENSITY_EP)
+    assert kernel.density_choices(
+        DENSITY_TILE_M, 49664, 48, DENSITY_EP, density_rows_alloc=10**6
+    ) == kernel.density_choices(DENSITY_TILE_M, 49664, 48, DENSITY_EP)
+
+
+def test_layers_pass_the_unplaced_density_inputs_for_a_layout():
+    """fused_ep_moe_v2 and the push layer build with these kwargs."""
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import density_build_kwargs
+
+    tokens = 8 * 1024
+    kw = density_build_kwargs(448, 384, 8, tokens, 6, 128)
+    assert kw == {
+        "occupied_slots": 48,
+        "density_rows_alloc": host.ragged_stride_bound(tokens, 6, 384, 128),
+    }
+    placed = kernel.density_choices(
+        128, host.ragged_stride_bound(tokens, 6, 448, 128), 56, 8, **kw
+    )
+    assert placed == kernel.density_choices(
+        128, host.ragged_stride_bound(tokens, 6, 384, 128), 48, 8
+    )
+
+
+def test_layers_pass_nothing_without_extra_slots():
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import density_build_kwargs
+
+    assert density_build_kwargs(384, 384, 8, 8 * 1024, 6, 128) == {}
