@@ -22,6 +22,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
@@ -42,6 +43,7 @@ from vllm.model_executor.models.utils import (
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.distributed import pallas_all_reduce
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3 import sp_o_proj
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
@@ -148,7 +150,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         pre-attention one, so the next fused add + norm sees
         ``ffn + attn + residual``."""
         attn = self.self_attn(positions, hidden_states)
-        shard = tensor_model_parallel_reduce_scatter(attn + residual / self.tp_size, 0)
+        shard = _reduce_scatter_rows(attn + residual / self.tp_size)
         normed = _all_gather_rows(
             self.post_attention_layernorm(shard), envs.TPU_MINIMAX_M3_SP_FP8_GATHER
         )
@@ -221,9 +223,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 shard = sp_o_proj.sp_o_proj(o_proj, attn) + rows
             else:
                 attn = self.self_attn(positions, normed)
-                shard = tensor_model_parallel_reduce_scatter(
-                    attn + hidden_states / self.tp_size, 0
-                )
+                shard = _reduce_scatter_rows(attn + hidden_states / self.tp_size)
         else:
             shard, normed = self._norm_gather(
                 self.input_layernorm,
@@ -238,7 +238,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 update = sp_o_proj.sp_o_proj(o_proj, attn)
             else:
                 attn = self.self_attn(positions, normed)
-                update = tensor_model_parallel_reduce_scatter(attn, 0)
+                update = _reduce_scatter_rows(attn)
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         shard, normed = self._norm_gather(
             self.post_attention_layernorm,
@@ -247,7 +247,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             envs.TPU_MINIMAX_M3_SP_FP8_GATHER,
             envs.TPU_MINIMAX_M3_SP_E4M3_QKV,
         )
-        return layer_input, shard, tensor_model_parallel_reduce_scatter(ffn(normed), 0)
+        return layer_input, shard, _reduce_scatter_rows(ffn(normed))
 
 
 def _sp_mode() -> str:
@@ -267,6 +267,17 @@ def _sp_step(num_tokens: int, tp_size: int) -> bool:
         and num_tokens >= envs.TPU_MINIMAX_M3_SP_MIN_TOKENS
         and num_tokens % tp_size == 0
     )
+
+
+def _reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
+    """Reduce-scatter token rows over TP (rank r gets rows [r T/TP, (r + 1)
+    T/TP) of the sum). TPU_MINIMAX_M3_SP_QRS sends them through the armed
+    int8-payload qar_reduce_scatter op when it is armed for the TP group."""
+    if envs.TPU_MINIMAX_M3_SP_QRS:
+        out = pallas_all_reduce.reduce_scatter(get_tp_group().ranks, x)
+        if out is not None:
+            return out
+    return tensor_model_parallel_reduce_scatter(x, 0)
 
 
 _FP8_MAX = 448.0

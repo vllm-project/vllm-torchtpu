@@ -24,6 +24,7 @@ plain path's result: up to summation order without e4m3, within e4m3
 rounding with it. With every key off the forward makes the old calls.
 """
 
+import dataclasses
 import threading
 import types
 import zlib
@@ -33,6 +34,8 @@ import numpy as np
 import pytest
 import torch
 from torch import nn
+
+dataclasses_replace = dataclasses.replace
 
 pytest.importorskip("torch_tpu")
 
@@ -58,6 +61,8 @@ _SP_ENV = {
     "TPU_MINIMAX_M3_SP_E4M3_QKV": False,
     "TPU_MINIMAX_M3_SP_A2A_OPROJ": "off",
     "TPU_MINIMAX_M3_SP_A2A_E4M3": False,
+    "TPU_MINIMAX_M3_SP_QRS": False,
+    "TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS": 2048,
 }
 # The production config this port targets.
 _TARGET = dict(
@@ -482,6 +487,81 @@ def test_target_takes_every_switch(tp, monkeypatch):
     attn_inputs = [c[0] for c in models[0].layers[1].self_attn.calls]
     assert attn_inputs == ["tuple"]
     assert all(c[2] is False for m in models for layer in m.layers for c in layer.self_attn.calls)
+
+
+def _qrs_emulation(tp):
+    """Stand-in for the armed int8 reduce-scatter op: the exact chunk sum
+    rounded to int8 with one absmax scale per lane (logged as "qrs")."""
+
+    def reduce_scatter(ranks, x):
+        assert list(ranks) == list(range(tp.n)) and x.dim() == 2
+        if tp.rank == 0:
+            tp.calls.append("qrs")
+        total = sum(tp._exchange(x.float())).chunk(tp.n, 0)[tp.rank]
+        scale = total.abs().amax(0, keepdim=True).clamp(min=1e-30) / 127
+        return ((total / scale).round().clamp(-127, 127) * scale).to(x.dtype)
+
+    return reduce_scatter
+
+
+@pytest.mark.parametrize("mode", ["full", "attn"])
+def test_qrs_takes_every_sp_reduce_scatter(tp, monkeypatch, mode):
+    """TPU_MINIMAX_M3_SP_QRS: every SP reduce-scatter goes through the armed
+    op (none through XLA's), and the result stays within int8 rounding of
+    the plain path."""
+    want = _plain(tp, monkeypatch)
+    kw = dict(_TARGET, TPU_MINIMAX_M3_SP_MODE=mode, TPU_MINIMAX_M3_SP_QRS=True)
+    if mode == "attn":
+        kw["TPU_MINIMAX_M3_SP_A2A_OPROJ"] = "off"
+    _set_env(monkeypatch, **kw)
+    monkeypatch.setattr(mm, "get_tp_group", tp.group)
+    monkeypatch.setattr(pallas_all_reduce, "reduce_scatter", _qrs_emulation(tp))
+    tp.calls.clear()
+    outs, _ = _forward(tp, monkeypatch, mode, aux=(0, 2, 4))
+    for got in outs[1:]:
+        torch.testing.assert_close(got[0], outs[0][0], rtol=0, atol=0)
+    assert "rs" not in tp.calls
+    # full + a2a o_proj: one (FFN) per layer; attn: one (attention) per layer.
+    assert tp.calls.count("qrs") == 4
+    assert _rel(outs[0][0], want[0]) < 6e-2, _rel(outs[0][0], want[0])
+
+
+def test_qrs_unarmed_falls_back(tp, monkeypatch):
+    """TPU_MINIMAX_M3_SP_QRS on but the op not armed (None): XLA's reduce-scatter."""
+    _set_env(monkeypatch, **dict(_TARGET, TPU_MINIMAX_M3_SP_QRS=True))
+    monkeypatch.setattr(mm, "get_tp_group", tp.group)
+    monkeypatch.setattr(pallas_all_reduce, "reduce_scatter", lambda ranks, x: None)
+    tp.calls.clear()
+    _forward(tp, monkeypatch, "full")
+    assert tp.calls.count("rs") == 4
+
+
+def test_qrs_key_off_never_touches_op(tp, monkeypatch):
+    _set_env(monkeypatch, **_TARGET)
+    monkeypatch.setattr(pallas_all_reduce, "reduce_scatter", _boom)
+    monkeypatch.setattr(mm, "get_tp_group", _boom)
+    tp.calls.clear()
+    _forward(tp, monkeypatch, "full")
+    assert tp.calls.count("rs") == 4
+
+
+def test_pallas_reduce_scatter_gate(monkeypatch):
+    rank = torch.tensor([[1]], dtype=torch.int32)
+    seen = []
+    rs_op = lambda x, r: seen.append((tuple(x.shape), r)) or x[: x.shape[0] // 4]  # noqa: E731
+    x = torch.zeros(64, 8, dtype=torch.bfloat16)
+    monkeypatch.setattr(pallas_all_reduce, "_ARMED", None)
+    assert pallas_all_reduce.reduce_scatter([0, 1, 2, 3], x) is None
+    armed = pallas_all_reduce._Armed(ranks=(0, 1, 2, 3), op=None, rank=rank, rank_ordered=True)
+    monkeypatch.setattr(pallas_all_reduce, "_ARMED", armed)
+    assert pallas_all_reduce.reduce_scatter([0, 1, 2, 3], x) is None  # no rs_op
+    armed = dataclasses_replace(armed, rs_op=rs_op)
+    monkeypatch.setattr(pallas_all_reduce, "_ARMED", armed)
+    assert pallas_all_reduce.reduce_scatter([0, 1], x) is None
+    assert pallas_all_reduce.reduce_scatter([0, 1, 2, 3], x.float()) is None
+    assert pallas_all_reduce.reduce_scatter([0, 1, 2, 3], x[None]) is None
+    assert pallas_all_reduce.reduce_scatter([0, 1, 2, 3], x).shape == (16, 8)
+    assert seen == [((64, 8), rank)]
 
 
 def test_sp_step_off_below_min_tokens_or_ragged(tp, monkeypatch):
