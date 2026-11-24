@@ -539,9 +539,9 @@ def exchange_head_pages_start(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             grid=(1,),
-            in_specs=[pl.BlockSpec(memory_space=pl.ANY)],
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
             out_specs=(
-                pl.BlockSpec(memory_space=pl.ANY),
+                pl.BlockSpec(memory_space=pltpu.HBM),
                 pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
                 pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
                 pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
@@ -583,8 +583,11 @@ def exchange_head_pages_wait(
     # rank enters the wait, when a scratch semaphore would not exist yet.
     # The cache is an operand of the wait only to keep its buffer alive:
     # the start's copies read it until here, and XLA reuses the buffer of a
-    # value whose last consumer has run (an intermediate cache, e.g. a
-    # slice of the caller's, was overwritten mid-copy).
+    # value whose last consumer has run. Both kernels also pin the cache and
+    # the received buffer to HBM: with `pl.ANY`, memory-space assignment
+    # prefetched a small cache into alternate memory for the start alone
+    # and the copies then read a buffer XLA had already handed to the work
+    # in between (wrong pages, deterministically, at DCP4).
     out, send_sem, recv_sem, fwd_sem, src_cache = future
     part = out.shape[2]
     out_shape = jax.ShapeDtypeStruct(out.shape, out.dtype)
@@ -654,13 +657,13 @@ def exchange_head_pages_wait(
             num_scalar_prefetch=2,
             grid=(1,),
             in_specs=[
-                pl.BlockSpec(memory_space=pl.ANY),
+                pl.BlockSpec(memory_space=pltpu.HBM),
                 pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
                 pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
                 pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
-                pl.BlockSpec(memory_space=pl.ANY),
+                pl.BlockSpec(memory_space=pltpu.HBM),
             ],
-            out_specs=pl.BlockSpec(memory_space=pl.ANY),
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
         ),
         out_shape=out_shape,
         input_output_aliases={2: 0},
