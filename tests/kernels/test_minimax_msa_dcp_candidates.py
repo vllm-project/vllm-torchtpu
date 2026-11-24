@@ -29,6 +29,7 @@ import pytest
 
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
+    msa_attention,
     msa_attention_lse,
     msa_dcp,
     msa_indexer,
@@ -294,9 +295,9 @@ def _rank_candidates(rng, tokens, pages_per_seq, rank, dcp, shared):
     return msa_dcp.pack_candidates(jnp.asarray(scores), jnp.asarray(blocks))
 
 
-def _attend_case(tokens, rank, shared, seed):
+def _attend_case(tokens, rank, shared, seed, pages_per_seq=128):
     rng = np.random.default_rng(seed)
-    seqs, dim, dcp, heads, pages_per_seq = 8, 128, 2, 16, 40
+    seqs, dim, dcp, heads = 8, 128, 2, 16
     if tokens == 48:  # a request of 5 rows, a padding tile
         q_lens = np.array([8, 8, 5, 8, 8, 0, 0, 0])
     else:
@@ -331,23 +332,32 @@ def _attend_case(tokens, rank, shared, seed):
     return (q, kv_cache, candidates, seq_lens, block_tables, cu), common
 
 
-# One tile (8 tokens; 4 padded to it) and several (16 to `_PAIR_WORK_MAX_TOKENS`).
+# One tile (8 tokens; 4 padded to it) and several (16 to `_PAIR_WORK_MAX_TOKENS`);
+# a one-vreg table (16 x 40 entries) and the served one (16 x 1,024: 8 vregs).
 @pytest.mark.parametrize("tokens", [4, 8, 16, 48, 64])
 @pytest.mark.parametrize("shared", [False, True])
-def test_pair_work_matches_xla(tokens, shared):
+@pytest.mark.parametrize("pages_per_seq", [40, 1024])
+def test_pair_work_matches_xla(tokens, shared, pages_per_seq):
     """`pair_work`'s kept page keys and work list row equal
-    `kept_own_candidates`' keys and `_packed_work` of them, bit for bit."""
-    rng = np.random.default_rng(tokens + shared)
-    pages_per_seq, seqs = 40, 16
+    `kept_own_candidates`' keys and `_packed_work` of them, bit for bit; with
+    the packed page table the row goes on with the unions' physical pages."""
+    rng = np.random.default_rng(tokens + shared + pages_per_seq)
+    seqs = 16
     candidates = [
         _rank_candidates(rng, tokens, pages_per_seq, r, 2, shared) for r in (0, 1)
     ]
+    # Page ids up to 2**16 - 1 (both 16-bit halves of a word, high bit set);
+    # two logical blocks share a physical page (a shared prefix): the union
+    # stays one of keys.
+    num_pages = 1 << 16
+    table = rng.permutation(num_pages)[: seqs * pages_per_seq].astype(np.int32)
+    table[pages_per_seq + 3] = table[3]
+    table = jnp.asarray(table)
     seq_id = jnp.asarray(np.minimum(np.arange(tokens) // 8, seqs - 1), jnp.int32)
     valid = jnp.asarray(rng.random(tokens) < 0.9)
     blocks, kept = msa_dcp.kept_own_candidates(jnp.stack(candidates), _TOPK)
-    want_keys = jnp.where(
-        kept & valid[:, None], seq_id[:, None] * pages_per_seq + blocks // 2, -1
-    )
+    own_keys = seq_id[:, None] * pages_per_seq + jnp.maximum(blocks, 0) // 2
+    want_keys = jnp.where(kept & valid[:, None], own_keys, -1)
     pages_per_step = msa_dcp._small_pages_per_step(tokens)
     padded = jnp.pad(want_keys, ((0, -tokens % 8), (0, 0)), constant_values=-1)
     want_work, _ = msa_attention_lse._packed_work(
@@ -357,25 +367,43 @@ def test_pair_work_matches_xla(tokens, shared):
         align=msa_attention_lse._merged_store_rows(8, 16, jnp.bfloat16),
         in_kernel=padded.shape[0] > 8,
     )
+    unions = want_work[:, : padded.shape[0] // 8 * 128]
+    want_pages = jnp.where(unions >= 0, table[jnp.maximum(unions, 0)], -1)
     key_base = jnp.where(valid, seq_id * pages_per_seq, -1)[:, None]
-    keys, work = msa_dcp.pair_work(
-        *candidates, key_base, pages_per_step=pages_per_step, interpret=True
-    )
+    common = dict(pages_per_step=pages_per_step, interpret=True)
+    keys, work = msa_dcp.pair_work(*candidates, key_base, **common)
     np.testing.assert_array_equal(np.asarray(keys), np.asarray(want_keys))
     np.testing.assert_array_equal(np.asarray(work), np.asarray(want_work))
+    keys, work = msa_dcp.pair_work(
+        *candidates,
+        key_base,
+        page_table=msa_attention.pack_table16(table, num_pages),
+        **common,
+    )
+    np.testing.assert_array_equal(np.asarray(keys), np.asarray(want_keys))
+    np.testing.assert_array_equal(
+        np.asarray(work), np.concatenate([want_work, want_pages], axis=1)
+    )
 
 
 # Tokens 8 (one tile), 24 (three tiles, one per step), 48 (a request of 5 rows
-# and a padding tile: tiles of several requests and of none).
-@pytest.mark.parametrize("tokens", [8, 24, 48])
+# and a padding tile: tiles of several requests and of none); one tile also
+# with rows of 40 pages.
+@pytest.mark.parametrize(
+    "tokens, pages_per_seq", [(8, 128), (8, 40), (24, 128), (48, 128)]
+)
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("shared", [False, True])
-def test_attention_of_kept_own_candidates(tokens, rank, shared):
+def test_attention_of_kept_own_candidates(tokens, pages_per_seq, rank, shared):
     """A decode step attends the pages of this rank's kept candidates
     (`own_first`): the same outputs, bit for bit, as over its merged
     selection."""
     args, common = _attend_case(
-        tokens, rank, shared, seed=tokens * 4 + rank * 2 + shared
+        tokens,
+        rank,
+        shared,
+        seed=tokens * 4 + rank * 2 + shared,
+        pages_per_seq=pages_per_seq,
     )
     want = msa_dcp.msa_attend_dcp(*args, **common)
     got = msa_dcp.msa_attend_dcp(*args, own_first=True, **common)

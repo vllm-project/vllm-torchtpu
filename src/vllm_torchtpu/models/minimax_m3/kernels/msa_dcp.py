@@ -798,9 +798,14 @@ _TILE_KEYS = 128
 # Page keys `pair_work` ranks in f32, exactly.
 _F32_EXACT_KEYS = 1 << 24
 # Decode buckets up to this many tokens build their work list in `pair_work`,
-# which unrolls its tiles (AOT: 896 bundles at 8 tokens, 1,364 at 48, 2,059
-# at 64); larger batches keep XLA's, which handles their tiles side by side.
+# which unrolls its tiles; larger batches keep XLA's, which handles their
+# tiles side by side.
 _PAIR_WORK_MAX_TOKENS = 64
+# Words of a `msa_attention.pack_table16` table per vreg (`_union_pages`).
+_TABLE_VREG_WORDS = 8 * 128
+# `_union_pages` gathers from every vreg of the packed table: the served 16 x
+# 1,024-entry table is 8 of them.
+_PAIR_WORK_MAX_TABLE_VREGS = 16
 # lcm(1 .. _TILE_ROWS): a key's share of its distinct value when it occurs
 # k <= _TILE_ROWS times in a tile (at most once per row) is this / k, exactly.
 _SHARES = 840
@@ -878,11 +883,38 @@ def _tile_union(keys_t, tile):
     )
 
 
-def _pair_work_kernel(own_ref, peer_ref, base_ref, *refs, single, groups, heads):
+def _union_pages(union, table_ref):
+    """The physical pages ``[1, 128]`` of a tile's union of page keys (-1 for
+    none) from the `msa_attention.pack_table16` table in VMEM, ``table_ref
+    [V, 8, 128]`` words (key ``k`` is the low or high half of word ``k >>
+    1``): one lane gather per table vreg, all on the same lanes, then the
+    key's vreg and sublane picked by selects. Vector work only: an SMEM input
+    would cost the kernel a copy of ~0.5 us before it starts (j-718491f0)."""
+    word = jnp.maximum(union, 0) >> 1
+    lane = jnp.broadcast_to(word & (_LANES - 1), (8, _LANES))
+    vreg = jnp.broadcast_to(word >> 10, (8, _LANES))
+    picked = jnp.zeros((8, _LANES), jnp.int32)
+    for v in range(table_ref.shape[0]):
+        entries = jnp.take_along_axis(
+            table_ref[v], lane, axis=1, mode="promise_in_bounds"
+        )  # [8, 128]: sublane s holds word v * 1024 + s * 128 + lane
+        picked = jnp.where(vreg == v, entries, picked)
+    sublane = jax.lax.broadcasted_iota(jnp.int32, (8, _LANES), 0)
+    picked = jnp.where(sublane == ((word >> 7) & 7), picked, 0)
+    words = jnp.sum(picked, axis=0, keepdims=True)  # one nonzero term per lane
+    pages = (words >> ((union & 1) << 4)) & 0xFFFF
+    return jnp.where(union >= 0, pages, -1)
+
+
+def _pair_work_kernel(own_ref, peer_ref, base_ref, *refs, single, groups, pages, heads):
     """`pair_work` in VMEM: this rank's kept candidates' page keys
-    (`_kept_keys_t`), then each tile's page union (`_tile_union`). With
-    `heads`, the pair's query heads go to their rank-ordered places in HBM by
-    two copies that run under the ranking."""
+    (`_kept_keys_t`), then each tile's page union (`_tile_union`) and, with
+    `pages`, its physical pages (`_union_pages`). With `heads`, the pair's
+    query heads go to their rank-ordered places in HBM by two copies that run
+    under the ranking."""
+    table_ref = None
+    if pages:
+        table_ref, *refs = refs
     if heads:
         rank_ref, q_ref, q_peer_ref, keys_ref, work_ref, q_all_ref, sems = refs
         num_heads = q_ref.shape[0]
@@ -903,14 +935,19 @@ def _pair_work_kernel(own_ref, peer_ref, base_ref, *refs, single, groups, heads)
     lane = jax.lax.broadcasted_iota(jnp.int32, (1, union_len), 1)
     keys_t = _kept_keys_t(own_ref[...], peer_ref[...], base_ref[...])
     keys_ref[...] = keys_t.T
+    # With a table, the unions' physical pages follow `_packed_work`'s row.
+    pages_at = tiles * union_len + (2 * groups + 2 if single else tiles)
     # Unrolled: the tiles' chains are independent and short of work each.
     counts = jnp.zeros_like(lane)
     for t in range(tiles):
         union, count = _tile_union(keys_t, t)
         work_ref[:, t * union_len : (t + 1) * union_len] = union
+        if table_ref is not None:
+            at = pages_at + t * union_len
+            work_ref[:, at : at + union_len] = _union_pages(union, table_ref)
         counts = jnp.where(lane == t, count, counts)
     if not single:  # `_tile_page_lists`' tile counts after the unions
-        work_ref[:, tiles * union_len :] = counts[:, :tiles]
+        work_ref[:, tiles * union_len : pages_at] = counts[:, :tiles]
     else:
         _single_tile_words(work_ref, lane, count, groups)
     if heads:
@@ -938,7 +975,7 @@ def _single_tile_words(work_ref, lane, count, groups):
     )
     row = jnp.where(lane < groups, meta, group_count)
     row = jnp.where(lane < 2 * groups, row, jnp.where(lane == 2 * groups, 0, num_live))
-    work_ref[:, union_len:] = row[:, : 2 * groups + 2]
+    work_ref[:, union_len : union_len + 2 * groups + 2] = row[:, : 2 * groups + 2]
 
 
 def _takes_pair_work(own_first, num_heads, dcp, num_tokens, topk, num_keys):
@@ -956,12 +993,25 @@ def _takes_pair_work(own_first, num_heads, dcp, num_tokens, topk, num_keys):
     )
 
 
+def _pair_work_pages(page_table: jax.Array | None) -> bool:
+    """Whether `pair_work` also looks up its unions' physical pages, given
+    the `msa_attention.pack_table16` table (None if its ids need more than
+    16 bits): the attention then copies no page table into SMEM (~17 ns per
+    KiB, ~0.55 us per call for the served 32 KiB, j-718491f0), and the
+    lookup gathers from every vreg of the table (`_union_pages`)."""
+    return (
+        page_table is not None
+        and -(-page_table.shape[0] // _TABLE_VREG_WORDS) <= _PAIR_WORK_MAX_TABLE_VREGS
+    )
+
+
 def pair_work(
     own: jax.Array,
     peer: jax.Array,
     key_base: jax.Array,
     *,
     pages_per_step: int,
+    page_table: jax.Array | None = None,
     heads: tuple[jax.Array, jax.Array, jax.Array] | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, ...]:
@@ -970,7 +1020,10 @@ def pair_work(
     kernel: the page keys of this rank's kept candidates ``[T, topk]``
     (`kept_own_candidates`; ``key_base [T, 1]`` is a token's ``seq_id *
     pages_per_seq``, or -1 for a padding token) and the attention's work list
-    row (`msa_attention_lse._packed_work` of those keys). XLA built both in
+    row (`msa_attention_lse._packed_work` of those keys), followed with
+    `page_table` (`msa_attention.pack_table16`'s words, `_pair_work_pages`)
+    by the unions' physical pages so that the attention reads no page table.
+    XLA built both in
     ~20 dependent small ops between the candidate exchange and the attention
     (~2 us per layer in the served b8 decode step, j-f07a4a0e).
 
@@ -999,8 +1052,9 @@ def pair_work(
         )
     single = tiles == 1
     # `_packed_work`'s row: [union | meta words | counts | step bounds] for one
-    # tile, [unions | tile counts] for several (`in_kernel`).
-    width = _TILE_KEYS + 2 * groups + 2 if single else tiles * (_TILE_KEYS + 1)
+    # tile, [unions | tile counts] for several (`in_kernel`); then the pages.
+    pages = page_table is not None
+    width = (2 * groups + 2 if single else tiles) + (1 + pages) * tiles * _TILE_KEYS
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     in_specs = [vmem] * 3
     out_specs = [vmem] * 2
@@ -1010,6 +1064,16 @@ def pair_work(
     ]
     scratch_shapes = []
     operands = [own, peer, key_base]
+    if pages:
+        if not _pair_work_pages(page_table):
+            raise ValueError(
+                f"pair_work looks pages up in at most {_PAIR_WORK_MAX_TABLE_VREGS} "
+                f"vregs of a packed table, got {page_table.shape}"
+            )
+        vregs = -(-page_table.shape[0] // _TABLE_VREG_WORDS)
+        table = jnp.pad(page_table, (0, vregs * _TABLE_VREG_WORDS - page_table.shape[0]))
+        in_specs.append(vmem)
+        operands.append(table.reshape(vregs, 8, _LANES))
     if heads is not None:
         rank, q, q_peer = heads
         hbm = pl.BlockSpec(memory_space=pl.ANY)
@@ -1020,7 +1084,11 @@ def pair_work(
         operands += [rank_array(rank), q, q_peer]
     keys, work, *q_all = pl.pallas_call(
         functools.partial(
-            _pair_work_kernel, single=single, groups=groups, heads=heads is not None
+            _pair_work_kernel,
+            single=single,
+            groups=groups,
+            pages=pages,
+            heads=heads is not None,
         ),
         in_specs=in_specs,
         out_specs=out_specs,
@@ -1414,17 +1482,20 @@ def msa_attend_dcp(
     # Page keys (seq * pages_per_seq + logical block) of the selected blocks
     # this rank holds, as `msa.sparse_attention`; [T, G, topk].
     work = None
+    page_table = msa_attention.pack_table16(block_tables.reshape(-1), kv_cache.shape[0])
+    work_pages = _pair_work_pages(page_table)
     if _takes_pair_work(
         own_first, num_heads, dcp, num_tokens, topk, max_num_seqs * pages_per_seq
     ):
-        # One kernel: kept page keys and the attention's work list (and the
-        # pair's query heads in rank order).
+        # One kernel: kept page keys and the attention's work list (with its
+        # physical pages, and the pair's query heads in rank order).
         key_base = jnp.where(valid, seq_id * pages_per_seq, -1)[:, None]
         keys, work, *placed = pair_work(
             candidates[0],
             candidates[1],
             key_base,
             pages_per_step=_small_pages_per_step(num_tokens),
+            page_table=page_table if work_pages else None,
             heads=(rank, *q) if halves else None,
             interpret=interpret,
         )
@@ -1461,7 +1532,7 @@ def msa_attend_dcp(
         q_head_major=q_head_major,
         interpret=interpret,
     )
-    work_arg = {} if work is None else {"work": work}
+    work_arg = {} if work is None else {"work": work, "work_pages": work_pages}
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
     if scale_cache is not None:
         if num_heads == 1:

@@ -79,6 +79,7 @@ def _kernel(
     groups_per_tile: int = 1,
     transposed: bool = False,
     packed_table: bool = False,
+    union_page_ref=None,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -106,7 +107,8 @@ def _kernel(
     Grid step ``b`` runs the groups ``block_start_ref[b] ..
     block_start_ref[b + 1] - 1`` of its `tiles_per_step` tiles in a loop
     (the last entry is the call's group count); the query, selection and
-    output blocks hold those tiles."""
+    output blocks hold those tiles. With `union_page_ref` (the unions'
+    physical pages, slot for slot) the page table is not read."""
     fp4 = fp4_rows is not None
     if transposed:  # a group's masked scores (`attend_t`)
         *refs, s_scr = refs
@@ -179,12 +181,14 @@ def _kernel(
             base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
 
             def start(g, queue=0):
-                key = work_page_ref[base + g]
-                page = (
-                    msa_attention.table16_entry(page_table_ref, key)
-                    if packed_table
-                    else page_table_ref[key]
-                )
+                if union_page_ref is not None:
+                    page = union_page_ref[base + g]
+                elif packed_table:
+                    page = msa_attention.table16_entry(
+                        page_table_ref, work_page_ref[base + g]
+                    )
+                else:
+                    page = page_table_ref[work_page_ref[base + g]]
                 for copy in page_copies(half, g, page):
                     copy.start(priority=queue)
 
@@ -559,11 +563,12 @@ def _attention_call(
     ``tile_offset`` (``int32[1]``): scalar-prefetch inputs, not statics, so
     one kernel serves every head and chunk, and no call slices its inputs.
 
-    ``work = (packed, tiles, tiles_per_step, in_kernel)``: the call's
+    ``work = (packed, tiles, tiles_per_step, in_kernel, physical)``: the call's
     `msa_attention._work_list` as `_packed_work` packs it (``[R]``, or a
     ``[1, R]`` row read in place: slicing it to 1D was a relayout op), or with
     `in_kernel` its ``[pages | tile counts]`` row, whose group words the
-    kernel builds (`_tile_group_words`).
+    kernel builds (`_tile_group_words`); with `physical`, the row goes on with
+    the unions' physical pages and `page_table` is not read.
 
     Writes those heads' and tokens' rows of ``(out [G * Hg, T, D], lse
     [G, T / Bq, 1, Hg * Bq])`` (a tile's lse a lane-dense row, ``h * Bq +
@@ -577,12 +582,19 @@ def _attention_call(
     # One KV head's [K | V] slice of each row.
     row_width = 2 * head_dim
     topk = selected.shape[2]
-    packed, tiles, tiles_per_step, in_kernel = work
+    packed, tiles, tiles_per_step, in_kernel, physical = work
     groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
     num_steps = tiles // tiles_per_step
     max_groups = tiles * groups_per_tile
     union_len = max_groups * pages_per_step
     words_len = 2 * max_groups + num_steps + 1  # meta words, counts, step starts
+    # A `physical` row ends with the unions' physical pages.
+    physical_at = union_len + (tiles if in_kernel else words_len)
+    if physical and packed.shape[-1] != physical_at + union_len:
+        raise ValueError(
+            f"a work row with physical pages has {physical_at + union_len} "
+            f"entries, got {packed.shape}"
+        )
 
     def run(packed_ref, words_ref, *refs, **kwargs):
         return _kernel(
@@ -591,6 +603,9 @@ def _attention_call(
             words_ref.at[pl.ds(max_groups, max_groups)],
             *refs,
             block_start_ref=words_ref.at[pl.ds(2 * max_groups, num_steps + 1)],
+            union_page_ref=(
+                packed_ref.at[pl.ds(physical_at, union_len)] if physical else None
+            ),
             **kwargs,
         )
 
@@ -625,9 +640,13 @@ def _attention_call(
 
     aliased = out is not None
     in_place = (pl.BlockSpec(memory_space=pl.ANY),) * 2 if aliased else ()
-    # Decode-sized calls take the page table as 16-bit ids (`pack_table16`).
+    # Decode-sized calls take the page table as 16-bit ids (`pack_table16`);
+    # a call whose work list holds the physical pages takes none (a page
+    # table in SMEM costs ~17 ns per KiB at every call, `pack_table16`).
     packed_table = None
-    if block_q == msa_attention.SMALL_BATCH_BLOCK_Q:
+    if physical:
+        page_table = jnp.zeros((1,), jnp.int32)
+    elif block_q == msa_attention.SMALL_BATCH_BLOCK_Q:
         packed_table = msa_attention.pack_table16(page_table, kv_cache.shape[0])
     if packed_table is not None:
         page_table = packed_table
@@ -828,6 +847,7 @@ def _chunked_call(
     q_head_major=False,
     lse_bits=False,
     work=None,
+    work_pages=False,
 ):
     """`_attention_call` per KV head and chunk of at most
     `MAX_TOKENS_PER_CALL` tokens (the work list lives in SMEM).
@@ -845,7 +865,9 @@ def _chunked_call(
     emitted twice per call site (the first call creates the output) rather
     than once per head and chunk. With `q_head_major`, q comes ``[G * Hg, T,
     D]``, as the kernel reads it. `work` is the one call's `_packed_work` row
-    ``[1, R]`` if the caller built it (`msa_dcp.pair_work`)."""
+    ``[1, R]`` if the caller built it (`msa_dcp.pair_work`); with
+    `work_pages` it goes on with its unions' physical pages and `page_table`
+    is not read."""
     if not q_head_major:
         q = q.transpose(1, 0, 2)
     num_q_heads, num_tokens, _ = q.shape
@@ -884,6 +906,8 @@ def _chunked_call(
     # scalar the kernel waits for.
     in_kernel = block_q == msa_attention.SMALL_BATCH_BLOCK_Q and step > block_q
     align = _merged_store_rows(block_q, num_q_heads // num_heads, q.dtype)
+    if work_pages and work is None:
+        raise ValueError("work_pages describes a caller's work row")
     if work is None:
         packed, tiles_per_step = _packed_work(
             selected.reshape(num_heads * num_chunks, step, selected.shape[2]),
@@ -916,6 +940,7 @@ def _chunked_call(
                 step // block_q,
                 tiles_per_step,
                 in_kernel,
+                work_pages,
             ),
         )
 
@@ -976,6 +1001,7 @@ def _check_rows(kv_cache, head_dim, head=None):
         "head_major",
         "q_head_major",
         "lse_bits",
+        "work_pages",
     ),
 )
 def msa_sparse_attention_lse(
@@ -998,6 +1024,7 @@ def msa_sparse_attention_lse(
     q_head_major: bool = False,
     lse_bits: bool = False,
     work: jax.Array | None = None,
+    work_pages: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_attention.msa_sparse_attention` (kernel v2, page keys translated
     by `page_table`) returning ``(out [T, H, D], lse [T, H] f32)``.
@@ -1012,7 +1039,9 @@ def msa_sparse_attention_lse(
     With `lse_bits`, the lse comes as its uint32 bits, for a consumer that
     moves bits (a one-tile call's f32 relayout was a ~0.65 us reduce of its
     own, bitcast first it fuses). `work` is the call's work list row when
-    the caller built it with the selection (`msa_dcp.pair_work`).
+    the caller built it with the selection (`msa_dcp.pair_work`); with
+    `work_pages` the row goes on with its unions' physical pages and
+    `page_table` is not read.
     """
     num_tokens, head_dim = selected.shape[0], q.shape[2]
     msa_attention.check_cache(kv_cache, scale_cache)
@@ -1038,6 +1067,7 @@ def msa_sparse_attention_lse(
         q_head_major=q_head_major,
         lse_bits=lse_bits,
         work=work,
+        work_pages=work_pages,
     )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]
