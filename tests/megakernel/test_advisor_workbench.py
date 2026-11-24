@@ -81,7 +81,6 @@ def test_scope_estimate_subterms_conserve_step_bound(model_name: str) -> None:
             hbm_us = cast("float", scope_dict["hbm_us"])
             comm_us = cast("float", scope_dict["comm_us"])
             fill_drain_us = cast("float", scope_dict["fill_drain_us"])
-            repass_spill_us = cast("float", scope_dict["repass_spill_us"])
             launch_us = cast("float", scope_dict["launch_us"])
             roof_floor = cast("float", scope_dict["roof_floor_us"])
             step_bound = cast("float", scope_dict["step_bound_us"])
@@ -92,10 +91,10 @@ def test_scope_estimate_subterms_conserve_step_bound(model_name: str) -> None:
                 else max(chain_us, hbm_us) + comm_us
             )
             roof_reconstructed = roof_core + fill_drain_us
-            step_reconstructed = roof_reconstructed + repass_spill_us + launch_us
-            # 4 rounded terms for roof_floor, 6 for step_bound (0.005 us half-ULP each)
+            step_reconstructed = roof_reconstructed + launch_us
+            # 4 rounded terms for roof_floor, 5 for step_bound (0.005 us half-ULP each)
             assert roof_reconstructed == pytest.approx(roof_floor, abs=4 * 0.005)
-            assert step_reconstructed == pytest.approx(step_bound, abs=6 * 0.005)
+            assert step_reconstructed == pytest.approx(step_bound, abs=5 * 0.005)
 
 
 def test_workbench_carries_row_limit_and_chain_rule() -> None:

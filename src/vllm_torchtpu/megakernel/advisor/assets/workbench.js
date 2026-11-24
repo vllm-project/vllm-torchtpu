@@ -345,16 +345,16 @@
   // Separate kernels: collectives follow the streamed compute.
   const envW = px(coreStepNoLaunch(s) - (isFused ? 0 : s.comm_us));
   const chainW = px(s.chain_us), commW = px(s.comm_us);
-  const fdW = px(s.fill_drain_us), repW = px(s.repass_spill_us);
+  const fdW = px(s.fill_drain_us);
   const x1 = padL + envW, x2 = x1 + (isFused ? 0 : commW);
-  const x3 = x2 + fdW, x4 = x3 + repW;
+  const x3 = x2 + fdW;
   const hiX = padL + px(s.step_upper_us), loX = padL + px(s.step_bound_us);
   const bars = rSvg(padL, y + 2, Math.max(1, chainW), 12, '#3B82F6') +
     rSvg(padL, y + 16, Math.max(1, px(s.hbm_us)), 12, '#009E73') +
     (isFused ? rSvg(padL + chainW, y + 2, commW, 12, '#E69F00')
       : rSvg(x1, y + 2, commW, 26, '#E69F00')) +
-    rSvg(x2, y + 2, fdW, 26, '#56B4E9') + rSvg(x3, y + 2, repW, 26, '#EF4444') +
-    rSvg(x4, y + 2, px(s.launch_us), 26, '#CC79A7');
+    rSvg(x2, y + 2, fdW, 26, '#56B4E9') +
+    rSvg(x3, y + 2, px(s.launch_us), 26, '#CC79A7');
   rows += `<g class="wb-clickable" onclick="showProof('${s.scope}')">` +
   `<text x="10" y="${y + 15}" fill="${isWin ? '#10B981' : 'var(--text)'}"` +
   ` font-size="12" font-weight="${isWin ? 700 : 500}">${isWin ? '* ' : ''}` +
@@ -368,7 +368,7 @@
   `font-size="9" class="tabular">ach ${s.step_achievable_us.toFixed(1)}~${(s.step_achievable_upper_us || s.step_achievable_us).toFixed(1)}us</text></g>`; });
   const leg = [['#3B82F6',0,'Compute Chain'],['#009E73',100,'HBM'],
   ['#E69F00',152,'Collectives'],['#56B4E9',236,'Fill/Drain'],
-  ['#EF4444',314,'Repass'],['#CC79A7',378,'Launch Gap']].map(([c, x, t]) =>
+  ['#CC79A7',314,'Launch Gap']].map(([c, x, t]) =>
   `<rect x="${x}" y="-8" width="8" height="8" fill="${c}"/>` +
   `<text x="${x + 11}" y="0">${t}</text>`).join('');
   el('wb-scope-timeline-svg').innerHTML = `<svg viewBox="0 0 ${W} 224" ` +
@@ -404,7 +404,6 @@
   const terms = [['Compute/HBM Roofline Core', envA - envB],
   ['Exposed Collective Sync & Bounce', commAddA - commAddB],
   ['Cold Pipeline Fill/Drain', scA.fill_drain_us - scB.fill_drain_us],
-  ['Multi-Pass HBM Weight Re-stream', scA.repass_spill_us - scB.repass_spill_us],
   ['Dispatch / Boundary Bubble',
     (scA.ops_per_step - scB.ops_per_step) * (evalA.launchGapPriorUs ?? evalA.launchGapLoUs) +
     ((scA.host_head_us || 0) - (scB.host_head_us || 0))]];
@@ -425,9 +424,9 @@
   `font-size="11">${lbl}</text>${bar}<text x="${W - 14}" y="${y + 14}" ` +
   `text-anchor="end" fill="${col}" font-size="11" font-weight="600" ` +
   `class="tabular">${d0 > 0 ? '+' : ''}${d0.toFixed(2)} us</text></g>`; }).join('');
-  el('wb-waterfall-svg').innerHTML = `<svg viewBox="0 0 ${W} 162" ` +
+  el('wb-waterfall-svg').innerHTML = `<svg viewBox="0 0 ${W} 134" ` +
   `class="chart-svg" role="img" aria-label="Signed Mechanism Waterfall">` +
-  `<line x1="${midX}" y1="8" x2="${midX}" y2="154" stroke="var(--border)" ` +
+  `<line x1="${midX}" y1="8" x2="${midX}" y2="126" stroke="var(--border)" ` +
   `stroke-width="1.5"/>${rows}</svg>`; }
   function renderDerivDrawer(wlA, evalA, evalB, lblB) {
   const selSc = (STATE.selectedTopic || {}).scope;
@@ -465,20 +464,20 @@
   const scopeHeadUs = sc.host_head_us || 0;
   const headFormulaTerm = scopeHeadUs > 0 ? ' + t_head' : '';
   const eqHead = (isFused
-    ? `t_step = max(t_hbm, t_chain + t_comm) + t_fd + t_rep + N*t_gap${headFormulaTerm}`
-    : `t_step = max(t_chain, t_hbm) + t_comm + t_fd + t_rep + N*t_gap${headFormulaTerm}`) +
+    ? `t_step = max(t_hbm, t_chain + t_comm) + t_fd + N*t_gap${headFormulaTerm}`
+    : `t_step = max(t_chain, t_hbm) + t_comm + t_fd + N*t_gap${headFormulaTerm}`) +
     '\nt_chain = t_dense + max(t_routed, t_moe)';
   // A microbatched scope is a sum of calls, so its summed terms do not recombine
   // through one max(); list them instead of printing an equation that would not hold.
   const eqNum = nCalls > 1
     ? `per call, summed over ${nCalls} calls: hbm ${f2(sc.hbm_us)}, chain ` +
       `${f2(sc.chain_us)}, comm ${f2(sc.comm_us)}, fd ${f2(sc.fill_drain_us)}, ` +
-      `rep ${f2(sc.repass_spill_us)}, gaps ${f2(sc.launch_us)}` +
+      `gaps ${f2(sc.launch_us)}` +
       (scopeHeadUs > 0 ? `, step head ${f2(scopeHeadUs)}` : '')
     : (isFused
       ? `= max(${f2(sc.hbm_us)}, ${f2(sc.chain_us)} + ${f2(sc.comm_us)})`
       : `= max(${f2(sc.chain_us)}, ${f2(sc.hbm_us)}) + ${f2(sc.comm_us)}`) +
-      ` + ${f2(sc.fill_drain_us)} + ${f2(sc.repass_spill_us)} + ` +
+      ` + ${f2(sc.fill_drain_us)} + ` +
       `${sc.ops_per_step}*${f2(evalA.launchGapLoUs)}` +
       (scopeHeadUs > 0 ? ` + ${f2(scopeHeadUs)}` : '');
   const eqStr = `${eqHead}\n${eqNum}`;
