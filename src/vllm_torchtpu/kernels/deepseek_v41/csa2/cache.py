@@ -602,9 +602,22 @@ def prepare_swa_metadata(
     # An unaligned first page can add one page to ceil((queries+history)/S).
     columns = (tokens + 128 + page_size - 1) // page_size + 1
     logical_pages = first_page[:, None] + jnp.arange(columns, dtype=jnp.int32)
-    blocks = jnp.take_along_axis(
-        block_table, jnp.minimum(logical_pages, block_table.shape[1] - 1), axis=1
+    req = _requests(starts, tokens, onehot=onehot_requests)
+    # One gather for the window pages and every token's current page: with
+    # two, XLA keeps the [R, W] table live between them (an HBM eviction and
+    # prefetch of the whole table) for a few hundred entries.
+    rows = jnp.concatenate(
+        (jnp.repeat(jnp.arange(requests, dtype=jnp.int32), columns), req)
     )
+    pages = jnp.concatenate(
+        (
+            jnp.minimum(logical_pages, block_table.shape[1] - 1).reshape(-1),
+            jnp.minimum(positions // page_size, block_table.shape[1] - 1),
+        )
+    )
+    looked_up = block_table[rows, pages]
+    blocks = looked_up[: requests * columns].reshape(requests, columns)
+    current_blocks = looked_up[requests * columns :]
     physical = blocks * (page_stride // page_size) + row_offset // page_size
     visible = (
         (count[:, None] > 0)
@@ -619,10 +632,6 @@ def prepare_swa_metadata(
         ),
         axis=1,
     ).astype(jnp.int32)
-    req = _requests(starts, tokens, onehot=onehot_requests)
-    current_blocks = block_table[
-        req, jnp.minimum(positions // page_size, block_table.shape[1] - 1)
-    ]
     records = row_offset + current_blocks * page_stride + positions % page_size
     records = jnp.where(jnp.arange(tokens) < starts[-1], records, -1)
     return metadata, jnp.stack((left, right), axis=1), records.astype(jnp.int32)
