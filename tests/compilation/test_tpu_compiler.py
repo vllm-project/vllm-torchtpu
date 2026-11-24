@@ -23,6 +23,11 @@ import pytest
 
 from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
 
+# A tpu7x 2x2x2 slice's rank -> device map, and the same ranks with the two
+# hosts' blocks swapped, as another slice of that shape can bind them.
+_DEVICE_IDS = (8, 9, 12, 13, 14, 15, 10, 11, 0, 1, 4, 5, 6, 7, 2, 3)
+_SWAPPED_DEVICE_IDS = _DEVICE_IDS[8:] + _DEVICE_IDS[:8]
+
 
 class TestTpuCompilerCache:
     @staticmethod
@@ -172,6 +177,28 @@ class TestTpuCompilerCache:
                 dp4 = compute_tpu_compilation_hash(self._config())
 
         assert dp1 != dp4
+
+    def test_tpu_hash_covers_the_device_assignment(self, tmp_path, monkeypatch):
+        """Another rank -> device map is another cache dir, and the factor
+        file next to it says so."""
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.distributed import mesh_utils
+
+        monkeypatch.setattr(
+            tpu_compiler, "_iter_runtime_cache_key_files", lambda root: []
+        )
+        keys = []
+        for device_ids in (_DEVICE_IDS, _DEVICE_IDS, _SWAPPED_DEVICE_IDS):
+            monkeypatch.setattr(mesh_utils, "_WORLD_DEVICE_IDS", device_ids)
+            keys.append(tpu_compiler.compute_tpu_compilation_hash(self._config()))
+        assert keys[0] == keys[1]
+        assert keys[0] != keys[2]
+
+        compiler = tpu_compiler.TpuCompilerAdaptor()
+        assert compiler.compute_hash(self._config()) == keys[2]
+        compiler.initialize_cache(str(tmp_path))
+        factors = json.loads((tmp_path / compiler.FACTORS_FILE).read_text())
+        assert factors["device_ids"] == list(_SWAPPED_DEVICE_IDS)
 
     def test_runtime_hash_covers_custom_op_boundaries(self):
         from vllm_torchtpu.compilation import tpu_compiler
@@ -864,3 +891,69 @@ class TestTpuCompilerCache:
         assert not os.path.samefile(path, os.path.join(a.cache_dir, key))
         with open(path, "rb") as f:
             assert pickle.load(f).fingerprint is None
+
+    def test_an_artifact_replays_only_on_the_device_assignment_it_was_built_for(
+        self, tmp_path, monkeypatch
+    ):
+        """A cache restored onto a slice that binds the ranks to the devices in
+        another order holds executables that address the wrong peers. The key
+        keeps such a slice out of the dir; forcing it in raises on the peer
+        path and on vLLM's load path instead of replaying. A process group on
+        other devices sharing the dir compiles its own."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.distributed import mesh_utils
+
+        monkeypatch.setattr(mesh_utils, "_WORLD_DEVICE_IDS", _DEVICE_IDS)
+        (a, b, c), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=3
+        )
+        _, handle = compile(a)
+        compile(b)
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+        assert a.load(handle, graph, [], 0, Range(start=1, end=4096))() == (
+            "entry-from-rank-0"
+        )
+        assert compiled == [0]
+        assert replayed == ["entry-from-rank-0"] * 2
+
+        other_devices = tuple(d + len(_DEVICE_IDS) for d in _DEVICE_IDS)
+        monkeypatch.setattr(mesh_utils, "_WORLD_DEVICE_IDS", other_devices)
+        compile(c)
+        assert compiled == [0, 2]
+
+        monkeypatch.setattr(mesh_utils, "_WORLD_DEVICE_IDS", _SWAPPED_DEVICE_IDS)
+        with pytest.raises(RuntimeError, match=r"built for TPU devices \[8, 9, 12"):
+            compile(b)
+        with pytest.raises(RuntimeError, match=r"runs on \[0, 1, 4"):
+            a.load(handle, graph, [], 0, Range(start=1, end=4096))
+        assert compiled == [0, 2]
+        assert replayed == ["entry-from-rank-0"] * 2
+
+    def test_an_artifact_without_a_device_assignment_is_recompiled(
+        self, tmp_path, monkeypatch
+    ):
+        """An artifact saved before the map was recorded cannot say where it
+        runs, so it is refused like any other stale format."""
+        import pickle
+
+        import torch
+
+        from vllm_torchtpu.compilation import shape_variants, tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilationHandle
+
+        monkeypatch.setattr(tpu_compiler, "_deserialize_entry", lambda entry: entry)
+        monkeypatch.setattr(tpu_compiler, "world_device_ids", lambda: _DEVICE_IDS)
+        graph = torch.fx.symbolic_trace(lambda x: (x * 2,))
+        path = tmp_path / "artifact"
+        compiler = tpu_compiler.TpuCompilerAdaptor()
+        for device_ids, replayed in ((None, None), (_DEVICE_IDS, "entry")):
+            handle = TpuCompilationHandle(
+                key="k",
+                entry="entry",
+                signature=shape_variants.graph_signature(graph),
+                device_ids=device_ids,
+            )
+            path.write_bytes(pickle.dumps(handle))
+            assert compiler._replay(str(path), graph, was_wrapped=False) == replayed

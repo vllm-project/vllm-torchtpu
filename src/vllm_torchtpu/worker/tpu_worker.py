@@ -23,6 +23,7 @@ from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
     get_pp_group,
     get_tensor_model_parallel_rank,
+    get_world_group,
     init_distributed_environment,
 )
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
@@ -33,6 +34,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
+from vllm_torchtpu.distributed.mesh_utils import record_world_device_ids
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
@@ -443,6 +445,9 @@ class TPUWorker(WorkerBase):
                 prefill_context_model_parallel_size=pcp_size,
                 decode_context_model_parallel_size=self.parallel_config.decode_context_parallel_size,
             )
+        # The compile cache is keyed on this map (compilation/tpu_compiler.py).
+        device_ids = record_world_device_ids(get_world_group())
+        logger.info("TPU device ids by rank | %s", list(device_ids))
 
         pp_group = get_pp_group()
         is_first_rank = pp_group.is_first_rank

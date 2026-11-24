@@ -37,6 +37,7 @@ from vllm_torchtpu.logger import init_logger
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.distributed.mesh_utils import world_device_ids
 
 logger = init_logger(__name__)
 
@@ -58,6 +59,10 @@ class TpuCompilationHandle:
     `_graph_fingerprint`). Another rank's artifact is only replayed if it
     matches, since vLLM's key names a (bucket, subgraph) and nothing else.
 
+    `device_ids` is the rank -> TPU device map the entry was compiled under
+    (`world_device_ids`). Its collectives and kernels address peers by
+    device id, so it only runs where the ranks sit on the same devices.
+
     Defaults are deliberately "unusable": an older pickle restored into this
     class keeps its own __dict__ and picks up these class defaults for the
     fields it lacks, so it fails the version check rather than being replayed.
@@ -68,6 +73,7 @@ class TpuCompilationHandle:
     signature: tuple | None = None
     was_wrapped: bool = False
     fingerprint: str | None = None
+    device_ids: tuple[int, ...] | None = None
 
 
 _tpu_backend = TpuBackend()
@@ -256,8 +262,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the
-    # local-rank offsets, which move a worker to a different chip without
-    # changing the executable it runs.
+    # local-rank offsets, which move a worker to a different chip; the key
+    # sees that through the device ids it hashes.
     "DEBUG_TPU_LOCAL_RANK_OFFSET",
     "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK",
     "RAIDEN_DISABLE_SINGLETON_WORKER",
@@ -329,6 +335,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/distributed/pcp.py",
     # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
     "vllm_torchtpu/distributed/dcp.py",
+    # The stage mesh, the CP layouts and the rank -> device map hashed below.
+    "vllm_torchtpu/distributed/mesh_utils.py",
     # The DCP merge registers its lse rescale kernel here.
     "vllm_torchtpu/distributed/dcp_comm.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
@@ -436,6 +444,9 @@ def tpu_compilation_hash_factors(vllm_config: VllmConfig) -> dict[str, Any]:
                 vllm_config.parallel_config
             ),
         },
+        # Slices of one shape bind the ranks to devices differently, and the
+        # executables embed device ids (see TpuCompilationHandle.device_ids).
+        "device_ids": list(world_device_ids()),
         # TPU AOT graphs embed the KV tensor extent as a literal. Hash the
         # resolved block count, which every rank shares via kv_cache_config.
         # The raw per-worker num_gpu_blocks_override is a pre-alignment HBM
@@ -670,6 +681,7 @@ class TpuCompilerAdaptor(CompilerInterface):
                 signature=shape_variants.graph_signature(graph),
                 was_wrapped=was_wrapped,
                 fingerprint=fingerprint,
+                device_ids=world_device_ids(),
             )
             # Write-then-rename: a crash or a full disk partway through
             # pickling a 400 MB entry would otherwise leave a truncated file
@@ -700,6 +712,12 @@ class TpuCompilerAdaptor(CompilerInterface):
         format and was built from a graph with this one's input signature.
         With `fingerprint` (another rank's artifact), it must also have been
         built from exactly this graph.
+
+        An artifact compiled for these devices bound to the ranks in another
+        order raises instead: the cache key carries the map, so finding one
+        means the cache is shared across device assignments. One compiled for
+        other devices belongs to another process group sharing a pinned cache
+        dir (a DP engine with its own world) and is just refused.
         """
         try:
             with open(path, "rb") as f:
@@ -713,6 +731,21 @@ class TpuCompilerAdaptor(CompilerInterface):
             reason = f"unexpected payload type {type(payload).__name__}"
         elif payload.entry is None:
             reason = "no bundled entry"
+        elif payload.device_ids is None:
+            reason = "no recorded device assignment"
+        elif set(payload.device_ids) != set(world_device_ids()):
+            reason = (
+                f"compiled for TPU devices {list(payload.device_ids)} of "
+                "another process group"
+            )
+        elif payload.device_ids != world_device_ids():
+            raise RuntimeError(
+                f"Compiled artifact {path} was built for TPU devices "
+                f"{list(payload.device_ids)} (by rank), but this process group "
+                f"runs on {list(world_device_ids())}. Replaying it would "
+                "address the wrong peers; use a compile cache that is not "
+                "shared across device assignments."
+            )
         elif payload.signature != shape_variants.graph_signature(graph):
             # Not what makes the bundled entry safe -- that comes from wrapper
             # and executable being one object, with no lookup left to drift.
@@ -959,7 +992,8 @@ class TpuCompilerAdaptor(CompilerInterface):
         Falls back to a real compile whenever the artifact is missing, stale,
         or built from a different graph. That is never wrong, only slower --
         and with the Tier-3 C++ cache active it is not even much slower, since
-        torch_tpu serves the PJRT binary natively.
+        torch_tpu serves the PJRT binary natively. One compiled for another
+        device assignment raises (`_replay`).
         """
         assert isinstance(handle, tuple) and len(handle) == 3
         key, path, _saved_was_wrapped = handle
