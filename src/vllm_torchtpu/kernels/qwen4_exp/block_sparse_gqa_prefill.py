@@ -67,9 +67,15 @@ def _selection_words(blocks, lengths, *, ratio, groups):
     """
     tail = lengths // ratio
     selected = jnp.concatenate((blocks, tail[:, None]), axis=1)
+    sel_valid = (blocks >= 0) & (blocks < groups)
+    if (
+        envs.VLLM_TPU_QSA_PREFILL_TAIL_ALIGN
+        or envs.VLLM_TPU_QSA_PREFILL_ACTIVE_PREFIX
+    ):
+        sel_valid = sel_valid & (lengths > 0)[:, None]
     valid = jnp.concatenate(
         (
-            (blocks >= 0) & (blocks < groups),
+            sel_valid,
             ((lengths > 0) & (lengths % ratio != 0) & (tail < groups))[:, None],
         ),
         axis=1,
@@ -532,6 +538,33 @@ def _kernel(
         "dcp_interleave",
     ),
 )
+def _block_page_table(page_table, nblocks: int, query_block: int):
+    """Accept either per-block ``[nblocks, P]`` or per-token ``[tokens, P]`` tables."""
+    if page_table.shape[0] == nblocks:
+        return page_table
+    return page_table.reshape(nblocks, query_block, -1)[:, 0]
+
+
+def _aligned_block_sources(starts, offsets, real, rows, max_tokens, query_block):
+    """Block-head source indices ``[max_tokens // query_block]`` for ``page_table``."""
+    dest = jnp.arange(0, max_tokens, query_block, dtype=jnp.int32)
+    requests = real.shape[0]
+    if dest.shape[0] * requests <= 4096:
+        req = jnp.sum(offsets[1:][None, :] <= dest[:, None], axis=1, dtype=jnp.int32)
+    else:
+        req = jnp.searchsorted(offsets[1:], dest, side="right").astype(jnp.int32)
+    req = jnp.minimum(req, requests - 1)
+    position = dest - offsets[req]
+    source = starts[req] + position
+    filled = (
+        (dest < offsets[-1])
+        & (position < real[req])
+        & (source < starts[-1])
+        & (source < rows)
+    )
+    return jnp.clip(source, 0, max(rows - 1, 0)).astype(jnp.int32), filled
+
+
 def block_sparse_gqa_prefill(
     query,
     blocks,
@@ -673,7 +706,7 @@ def block_sparse_gqa_prefill(
             active = jnp.any(part_bits[:, :, :num_kv_tiles] != 0, axis=(1, 3))
         active_tiles = _compact_active(active)
         active_counts = jnp.sum(active, axis=1, dtype=jnp.int32)
-        table = page_table.reshape(nblocks, query_block, -1)[:, 0]
+        table = _block_page_table(page_table, nblocks, query_block)
     elif (
         not dcp
         and paired_pages
@@ -721,7 +754,7 @@ def block_sparse_gqa_prefill(
         )
         active_tiles = _compact_active(active)
         active_counts = jnp.sum(active, axis=1, dtype=jnp.int32)
-        table = page_table.reshape(nblocks, query_block, -1)[:, 0]
+        table = _block_page_table(page_table, nblocks, query_block)
     if parts > 1 and not envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
         block_bits_native = (
             block_bits_native.reshape(nblocks, words, parts, part_width)
@@ -899,22 +932,86 @@ def block_sparse_gqa_attention(
         if len(dcp) > 2 and dcp[2]:
             offset["dcp_interleave"] = dcp[2]
 
+    tail_align = envs.VLLM_TPU_QSA_PREFILL_TAIL_ALIGN
+    active_prefix = envs.VLLM_TPU_QSA_PREFILL_ACTIVE_PREFIX
+    tail_mask = tail_align or active_prefix
+    tok_valid = jnp.arange(len(query), dtype=jnp.int32) < starts[-1]
+
     def run_aligned(_):
-        return block_sparse_gqa_prefill(
-            query,
-            blocks,
-            lengths,
-            page_table,
-            cache,
-            ratio=ratio,
-            kv_heads=kv_heads,
-            query_block=query_block,
-            kv_tile=kv_tile,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            bf16_io=True,
-            **offset,
-        )
+        if not tail_mask:
+            return block_sparse_gqa_prefill(
+                query,
+                blocks,
+                lengths,
+                page_table,
+                cache,
+                ratio=ratio,
+                kv_heads=kv_heads,
+                query_block=query_block,
+                kv_tile=kv_tile,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                bf16_io=True,
+                **offset,
+            )
+        aligned_lengths = jnp.where(tok_valid, lengths, 0)
+
+        def call_prefix(sub_len: int):
+            if sub_len == 0:
+                if return_lse:
+                    return (
+                        jnp.zeros(query.shape, jnp.float32),
+                        jnp.full(query.shape[:2], -jnp.inf, jnp.float32),
+                    )
+                return jnp.zeros(query.shape, jnp.bfloat16)
+            sub_table = (
+                page_table[:sub_len:query_block]
+                if tail_align
+                else page_table[:sub_len]
+            )
+            res = block_sparse_gqa_prefill(
+                query[:sub_len],
+                blocks[:sub_len],
+                aligned_lengths[:sub_len],
+                sub_table,
+                cache,
+                ratio=ratio,
+                kv_heads=kv_heads,
+                query_block=query_block,
+                kv_tile=kv_tile,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                bf16_io=True,
+                **offset,
+            )
+            if sub_len == len(query):
+                return res
+            pad = len(query) - sub_len
+            if return_lse:
+                return (
+                    jnp.pad(res[0], ((0, pad), (0, 0), (0, 0)), constant_values=0),
+                    jnp.pad(res[1], ((0, pad), (0, 0)), constant_values=-jnp.inf),
+                )
+            return jnp.pad(res, ((0, pad), (0, 0), (0, 0)), constant_values=0)
+
+        if active_prefix:
+            nblocks = len(query) // query_block
+            tiers = sorted(
+                {
+                    0,
+                    (nblocks // 4) * query_block,
+                    (nblocks // 2) * query_block,
+                    len(query),
+                }
+            )
+            if len(tiers) > 1:
+                tier_idx = jnp.sum(starts[-1] > jnp.asarray(tiers[:-1], jnp.int32))
+                return lax.switch(
+                    tier_idx,
+                    [functools.partial(lambda n, _: call_prefix(n), n) for n in tiers],
+                    None,
+                )
+        return call_prefix(len(query))
 
     padded = ((real + query_block - 1) // query_block) * query_block
     offsets = jnp.concatenate((jnp.zeros((1,), jnp.int32), jnp.cumsum(padded)))
@@ -949,11 +1046,26 @@ def block_sparse_gqa_attention(
             shape = (max_tokens, *array.shape[1:])
             return jnp.full(shape, fill, array.dtype).at[slots].set(array, mode="drop")
 
+        if tail_align:
+            b_src, b_fill = _aligned_block_sources(
+                starts, offsets, real, len(query), max_tokens, query_block
+            )
+            aligned_table = jnp.where(
+                b_fill[:, None],
+                jnp.take(
+                    page_table,
+                    jnp.minimum(b_src, max(page_table.shape[0] - 1, 0)),
+                    axis=0,
+                ),
+                jnp.asarray(0, page_table.dtype),
+            )
+        else:
+            aligned_table = align(page_table, 0)
         output = block_sparse_gqa_prefill(
             align(query, 0),
             align(blocks, -1),
             align(lengths, 0),
-            align(page_table, 0),
+            aligned_table,
             cache,
             ratio=ratio,
             kv_heads=kv_heads,
@@ -975,13 +1087,23 @@ def block_sparse_gqa_attention(
     route = jnp.sum(offsets[-1] > jnp.asarray(sizes[:-1], jnp.int32))
     if len(query) % query_block == 0:
         branches.insert(0, run_aligned)
-        route = jnp.where(jnp.all(real % query_block == 0), 0, route + 1)
+        if tail_align:
+            aligned_ok = (
+                (starts[0] == 0)
+                & (starts[-1] <= len(query))
+                & jnp.all(
+                    (real == 0) | ((real > 0) & (starts[:-1] % query_block == 0))
+                )
+            )
+        else:
+            aligned_ok = jnp.all(real % query_block == 0)
+        route = jnp.where(aligned_ok, 0, route + 1)
     output = (
         branches[0](None) if len(branches) == 1 else lax.switch(route, branches, None)
     )
+    live = ((lengths > 0) & tok_valid) if tail_mask else (lengths > 0)
     if return_lse:
         out, lse = output
-        live = lengths > 0
         return (
             jnp.where(live[:, None, None], out, 0),
             jnp.where(live[:, None], lse, -jnp.inf),
@@ -991,7 +1113,7 @@ def block_sparse_gqa_attention(
         bf16(output).astype(jnp.float32)
         * bf16(jax.nn.sigmoid(gate.astype(jnp.float32))).astype(jnp.float32)
     )
-    return jnp.where((lengths > 0)[:, None, None], output, 0), cache
+    return jnp.where(live[:, None, None], output, 0), cache
 
 
 @functools.partial(
@@ -1032,9 +1154,15 @@ def _prepare_metadata_bounded(
         selected_blocks, live_lengths = inputs
         tail = live_lengths // ratio
         selected = jnp.concatenate((selected_blocks, tail[:, None]), axis=1)
+        sel_valid = (selected_blocks >= 0) & (selected_blocks < groups)
+        if (
+            envs.VLLM_TPU_QSA_PREFILL_TAIL_ALIGN
+            or envs.VLLM_TPU_QSA_PREFILL_ACTIVE_PREFIX
+        ):
+            sel_valid = sel_valid & (live_lengths > 0)[:, None]
         valid = jnp.concatenate(
             (
-                (selected_blocks >= 0) & (selected_blocks < groups),
+                sel_valid,
                 ((live_lengths > 0) & (live_lengths % ratio != 0) & (tail < groups))[
                     :, None
                 ],
@@ -1072,5 +1200,5 @@ def _prepare_metadata_bounded(
         ),
         batch_size=batch_size,
     )
-    table = page_table.reshape(nblocks, query_block, -1)[:, 0]
+    table = _block_page_table(page_table, nblocks, query_block)
     return table, active_tiles, active_counts, native_bits

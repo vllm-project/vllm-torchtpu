@@ -179,6 +179,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
     VLLM_TPU_QSA_PREFILL_QUERY_TILE: int = 0
     VLLM_TPU_QSA_PREFILL_Q128_FALLBACK: bool = False
+    VLLM_TPU_QSA_PREFILL_TAIL_ALIGN: bool = False
+    VLLM_TPU_QSA_PREFILL_ACTIVE_PREFIX: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_WALK: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT: int = 32768
     VLLM_TPU_QSA_PREFILL_UNION_CAP: int = 12288
@@ -1066,6 +1068,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keys); identity/accuracy gated (reports/prereg/q38_attn_tile3200_plan_DRAFT.md).
     "VLLM_TPU_QSA_PREFILL_Q128_FALLBACK": env_bool(
         "VLLM_TPU_QSA_PREFILL_Q128_FALLBACK", default=False
+    ),
+    # QSA prefill: allow run_aligned when active request starts are
+    # query_block-aligned (single / tail chunk), gate dead-row stale blocks on
+    # lengths > 0, and gather [nblocks, P] block-head page tables instead of
+    # scattering per-token page-table rows (bit-identical, default off).
+    "VLLM_TPU_QSA_PREFILL_TAIL_ALIGN": env_bool(
+        "VLLM_TPU_QSA_PREFILL_TAIL_ALIGN", default=False
+    ),
+    # QSA prefill: inside run_aligned, dispatch active prefix tiers
+    # (0, T//4, T//2, T) guarded by starts[-1] without changing the cache
+    # (bit-identical, default off).
+    "VLLM_TPU_QSA_PREFILL_ACTIVE_PREFIX": env_bool(
+        "VLLM_TPU_QSA_PREFILL_ACTIVE_PREFIX", default=False
     ),
     # Qwen4-exp QSA prefill: the D2 union-walk attention kernel
     # (qsa_union_dense.union_walk_prefill) with query groups of this many rows
