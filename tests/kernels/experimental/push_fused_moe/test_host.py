@@ -296,6 +296,15 @@ def test_local_sort_paths_agree(monkeypatch, t_local, e_total, topk, skew):
     np.testing.assert_array_equal(np.asarray(q_sort)[: len(want), 0, 0], want)
 
 
+@pytest.mark.parametrize("n", [1, 7, 384])
+def test_cumsum_small_equals_jnp_cumsum(n):
+    """local_sort_tokens' masked-sum segment ends equal jnp.cumsum."""
+    counts = jnp.asarray(np.random.default_rng(n).integers(0, 97, n), jnp.int32)
+    got = push_host._cumsum_small(counts)
+    assert got.dtype == jnp.int32
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(jnp.cumsum(counts)))
+
+
 @pytest.mark.parametrize("n,repeats", [(4608, 6), (3840, 3), (2304, 6), (200, 6)])
 def test_repeat_bits_equals_jnp_repeat(n, repeats):
     """Every i32 bit pattern (negatives, NaN and inf f32 patterns among them)

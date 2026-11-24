@@ -63,6 +63,15 @@ def _take_small(table, idx):
     return out.astype(jnp.int32).reshape(idx.shape)
 
 
+def _cumsum_small(x):
+    """jnp.cumsum of a short 1-D int vector as one masked sum: TPU lowers the
+    scan to a chain of reduce-windows, slices and a carry add, several small
+    serial ops at a few hundred elements."""
+    n = x.shape[0]
+    idx = jnp.arange(n, dtype=jnp.int32)
+    return jnp.sum(jnp.where(idx[:, None] <= idx[None, :], x[:, None], 0), axis=0)
+
+
 # Above this many local tokens (prefill), local_sort_activations finds each
 # sorted row's token with a stable argsort instead of the one-hot count: the
 # count's [t_local * topk, t_local] matrix and its HIGHEST-precision matmul
@@ -136,7 +145,7 @@ def local_sort_tokens(my_pairs, my_counts, *, e_total, topk, bf16_counts=False):
     my_counts = my_counts.astype(jnp.int32)
     valid = my_pairs < e_total
     pid = jnp.where(valid, my_pairs, e_total)
-    seg_end = jnp.cumsum(my_counts)
+    seg_end = _cumsum_small(my_counts)
     seg_start_local = seg_end - my_counts
     if t_local > ARGSORT_MIN_TOKENS:
         tok_j = _sorted_tokens_by_argsort(pid, seg_end, t_local=t_local, topk=topk)
