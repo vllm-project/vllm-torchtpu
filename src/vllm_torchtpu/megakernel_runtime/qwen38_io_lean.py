@@ -20,8 +20,8 @@ movement only); it only changes how many XLA ops the call spends around the kern
 before the head kernels: `ple` (megakernel programs only) feeds the n-gram hash and the
 embedding mask int32 operands and trace-time hash constants instead of int64 operands,
 and finds each token's request with one comparison; `pleconv` reads each conv tap's
-rows of the step as a static shift instead of a gather (every program that runs the PLE
-conv op).
+rows of the step as a static shift instead of a gather, and the taps' history rows in one
+gather (every program that runs the PLE conv op).
 """
 
 from __future__ import annotations
