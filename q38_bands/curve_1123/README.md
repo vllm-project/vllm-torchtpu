@@ -45,5 +45,42 @@ source. Every K-line feature is behind its own env key, default off; no existing
 at startup (ValueError): `TPU_QWEN4_HC_PREFILL_COMPARE` with `TPU_QWEN4_HC_PREFILL_FOLD` or `TPU_QWEN4_HC_PREFILL_DOWN_ASM`, and
 `VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND` with `VLLM_TPU_QSA_PREFILL_COMPARE_CORE_STATS`.
 
-The parity evidence per point (identical vs equivalent, with each difference's cover) is in the proof notes added with the
-next commit.
+## Read first: two notes
+
+1. **Exos points: set `Q38_OXPD_FORM=1` on every leg.** Forgetting it fails loudly: their env sets `VLLM_TPU_HOST_GC`, which the
+   default form refuses with a ValueError at import, so the engine does not start.
+2. **One default-behaviour change for everyone on this branch: STAGE3FIX** (`4d87d69b27`, from `466c290598`). With no flag set, the
+   grouped Stage-3 producer registration (every Qwen PD producer) applies the scheduler's releases and registers ahead sends with
+   no TTL until the request finishes. It fixes a preemption crash (`Conflicting duplicate Stage-3 producer registration`). Every
+   default-form point on the sheet ran with it. Everything else this integration adds is behind its own env key, default off.
+
+## Parity evidence (CPU proof jobs, 0 TPU chips)
+
+Per point and leg, the exact env from the job's stored recipe.yaml was applied to the run commit and to this branch, and every
+function / method / class / module the selected form runs was compared body-only with env-decided branches resolved ("GBH").
+IDENTICAL = no difference. EQUIVALENT (n) = n declared differences, each pinned by the sha256 of its diff and cleared by a cover
+that ran and passed of record: program equality (HC ops built by the real GatedResidual; QSA attention, union decode, metadata
+and prefill walk programs) or the K-line member's own proof of record.
+
+| Band | Point | Verdict | Differences by class (prefill + decode) | Covers that ran of record | Row |
+|---|---|---|---|---|---|
+| B1 | T58x c212 | EQUIVALENT (12 prefill + 13 decode) | BASE-FORMS 4; BASE-SCBITS 2; MERGE-HC 4; REFUSAL-QSA 2; SIBLING-HCK 13 | GBH PASS, DYNHC PASS, QSA PASS, REF PASS, member proofs PASS (s7) | PASS |
+| B2 | T61v c136-k3c | EQUIVALENT (32 prefill + 32 decode) | BASE-FORMS + SIBLING-CUT1 4; BASE-SCBITS 2; MERGE-HC 4; REFUSAL-QSA 2; SIBLING-CUT1 38; SIBLING-HCK 12; SIBLING-K3b 2 | GBH PASS, DYNHC PASS, QSA PASS, REF PASS, member proofs PASS (s7) | PASS |
+| B3 | T56g c192sp | EQUIVALENT (31 prefill + 31 decode) | BASE-FORMS + SIBLING-CUT1 4; BASE-SCBITS 2; MERGE-HC 4; REFUSAL-QSA 2; SIBLING-CUT1 38; SIBLING-HCK 12 | GBH PASS, DYNHC PASS, QSA PASS, REF PASS, member proofs PASS (s7) | PASS |
+| B3 | T57s c192s | EQUIVALENT (31 prefill + 31 decode) | BASE-FORMS + SIBLING-CUT1 4; BASE-SCBITS 2; MERGE-HC 4; REFUSAL-QSA 2; SIBLING-CUT1 38; SIBLING-HCK 12 | GBH PASS, DYNHC PASS, QSA PASS, REF PASS, member proofs PASS (s7) | PASS |
+| B3 | T58y c184s | EQUIVALENT (31 prefill + 31 decode) | BASE-FORMS + SIBLING-CUT1 4; BASE-SCBITS 2; MERGE-HC 4; REFUSAL-QSA 2; SIBLING-CUT1 38; SIBLING-HCK 12 | GBH PASS, DYNHC PASS, QSA PASS, REF PASS, member proofs PASS (s7) | PASS |
+| B3 | T58n c176s | EQUIVALENT (31 prefill + 31 decode) | BASE-FORMS + SIBLING-CUT1 4; BASE-SCBITS 2; MERGE-HC 4; REFUSAL-QSA 2; SIBLING-CUT1 38; SIBLING-HCK 12 | GBH PASS, DYNHC PASS, QSA PASS, REF PASS, member proofs PASS (s7) | PASS |
+| B3 | T58f c168s | EQUIVALENT (31 prefill + 31 decode) | BASE-FORMS + SIBLING-CUT1 4; BASE-SCBITS 2; MERGE-HC 4; REFUSAL-QSA 2; SIBLING-CUT1 38; SIBLING-HCK 12 | GBH PASS, DYNHC PASS, QSA PASS, REF PASS, member proofs PASS (s7) | PASS |
+| B3 (pending) | T55d c200spk | EQUIVALENT (25 prefill + 25 decode) | BASE-FORMS + SIBLING-CUT1 4; BASE-SCBITS 2; MERGE-HC 4; REFUSAL-QSA 2; SIBLING-CUT1 38 | GBH PASS, DYNHC PASS, QSA PASS, REF PASS, member proofs PASS (s7) | PASS |
+| B4 | P2C128 | EQUIVALENT (5 prefill + 5 decode) | OX1-OVERLAY 10 | GBH PASS, overlay QSA PASS | PASS |
+| B4 | p2c112 | EQUIVALENT (5 prefill + 5 decode) | OX1-OVERLAY 10 | GBH PASS, overlay QSA PASS | PASS |
+| B5 | p2c104m12r64k48 | EQUIVALENT (5 prefill + 5 decode) | OX1-OVERLAY 10 | GBH PASS, overlay QSA PASS | PASS |
+| B5 | p2c96m12r64k48 | EQUIVALENT (5 prefill + 5 decode) | OX1-OVERLAY 10 | GBH PASS, overlay QSA PASS | PASS |
+| B6 | p3c88 | EQUIVALENT (5 prefill + 5 decode) | OX1-OVERLAY 10 | GBH PASS, overlay QSA PASS | PASS |
+| B6 | p3c80 | EQUIVALENT (5 prefill + 5 decode) | OX1-OVERLAY 10 | GBH PASS, overlay QSA PASS | PASS |
+| B6 | p3c72 | EQUIVALENT (5 prefill + 5 decode) | OX1-OVERLAY 10 | GBH PASS, overlay QSA PASS | PASS |
+| HIX | P1 T58g | IDENTICAL | none | GBH PASS | PASS |
+| HIX | m3 T58u | IDENTICAL | none | GBH PASS | PASS |
+
+Record jobs: tbp_rec1 `j-8a5ff8de-940e-4cc5-93ef` (`TBP_SUMMARY PASS mode record head 4f52f0c40b src ffaa590ed5`: flag-off identity vs 7f9b39a8d5 under no form env and the base's own band envs, per-point parity for all 17 points, HC / QSA / MoE program identity, 3 mutants KILLED) and tbt_rec1 `j-370da087-88af-4572-a7ff` (`TBT_SUMMARY PASS mode record head 4f52f0c40b src ffaa590ed5`: 54 regression test files with 0 new failures, the refused-pairs test, IMAGE + ARGV for one B1, one B3 and one Exos point, 4 mutants KILLED). Proven code head `4f52f0c40b` (SRC ffaa590ed5); this README commit changes no file under src/.
+
