@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     TPU_MOE_REPLICA_ASSIGN_REFINE: int = 0
     TPU_MOE_NVFP4_SKIP_PADDED: bool = False
     TPU_MINIMAX_M3_INDEXER_DECODE_OPT: str = ""
+    TPU_MINIMAX_M3_INDEXER_PREFILL_OPT: str = ""
     TPU_MOE_SKIP_PADDED_MIN_ROUTES: int = 0
     VLLM_TPU_MOE_REDUNDANT_PLACEMENT: str = ""
     USE_PHASED_PROFILER: bool = False
@@ -943,6 +944,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # their order up to that rounding). Empty = off.
     "TPU_MINIMAX_M3_INDEXER_DECODE_OPT": env_str(
         "TPU_MINIMAX_M3_INDEXER_DECODE_OPT", ""
+    ),
+    # MSA indexer large (prefill) tiles, "+"- or comma-separated items:
+    # "causal" scores each query tile only up to the last page its own rows
+    # can see (callers mask later pages; same selection), "chunk<N>" scores
+    # N pages per dot (default 16 at 512-row tiles). Empty = off.
+    "TPU_MINIMAX_M3_INDEXER_PREFILL_OPT": env_str(
+        "TPU_MINIMAX_M3_INDEXER_PREFILL_OPT", ""
     ),
     # TPU_MOE_SKIP_PADDED_TOKENS drops padded rows from the grouped matmul only
     # in batches of at least this many routes (T * top_k); smaller batches run

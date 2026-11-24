@@ -577,6 +577,9 @@ def _class_candidates(
     interpret: bool,
     scale_cache: jax.Array | None,
     scale_row: int | None,
+    block_size: int | None = None,
+    rank: jax.Array | int = 0,
+    dcp: int = 1,
 ) -> jax.Array:
     """Packed candidates ``[T, G * 2 * topk]`` (`pack_candidates` per head,
     head-major) of a prefill-sized step: each `msa_indexer` tile class picks
@@ -596,6 +599,22 @@ def _class_candidates(
         folded, rows = msa.fold_index_heads(index_q, local_lens, cu_q_lens)
         folded = folded[:, None]
     folded_cu = num_heads * cu_q_lens
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    large_bq = msa.block_score_options(num_heads)["large_block_q"]
+
+    def tile_lens(tile_seq, tile_row0):
+        """This rank's length (`local_seq_lens`) up to each large tile's last
+        visible token: its rows are tokens of one request, head-major."""
+        per_tile = functools.partial(msa_indexer.lookup, index=tile_seq)
+        fc = per_tile(folded_cu[:-1])
+        q_len = jnp.maximum(per_tile(q_lens), 1)
+        first = jnp.maximum(tile_row0 - fc, 0)
+        last = jnp.minimum(tile_row0 + large_bq, fc + num_heads * q_len) - 1 - fc
+        last = jnp.maximum(last, first)
+        top = jnp.where(first // q_len == last // q_len, last % q_len, q_len - 1)
+        visible = per_tile(seq_lens) - q_len + top + 1
+        return local_seq_lens(visible, block_size=block_size, rank=rank, dcp=dcp)
+
     plan = msa_indexer.class_plan(
         folded,
         index_cache,
@@ -608,8 +627,8 @@ def _class_candidates(
         scale_row=scale_row,
         interpret=interpret,
         fp8_q=msa_indexer.fp8_queries_enabled(),
+        large_tile_lens_fn=tile_lens if block_size is not None else None,
     )
-    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     max_num_seqs = q_lens.shape[0]
     seq_of_token = jnp.minimum(seq_id, max_num_seqs - 1)
     picks, cols = [], []
@@ -754,6 +773,9 @@ def msa_write_and_candidates_dcp(
             interpret=interpret,
             scale_cache=scale_cache,
             scale_row=scale_row,
+            block_size=block_size,
+            rank=rank,
+            dcp=dcp,
         )
         if fp4:
             return kv_cache, index_cache, scale_cache, packed
