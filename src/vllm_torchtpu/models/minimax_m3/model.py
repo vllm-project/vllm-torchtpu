@@ -271,9 +271,10 @@ def _sp_step(num_tokens: int, tp_size: int) -> bool:
 
 def _reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
     """Reduce-scatter token rows over TP (rank r gets rows [r T/TP, (r + 1)
-    T/TP) of the sum). TPU_MINIMAX_M3_SP_QRS sends them through the armed
-    int8-payload qar_reduce_scatter op when it is armed for the TP group."""
-    if envs.TPU_MINIMAX_M3_SP_QRS:
+    T/TP) of the sum). TPU_MINIMAX_M3_SP_QRS (int8-payload
+    qar_reduce_scatter) or TPU_MINIMAX_M3_SP_HIER_RS (hierrs_tc) sends them
+    through the armed row reduce-scatter op when it is armed for the TP group."""
+    if envs.TPU_MINIMAX_M3_SP_QRS or envs.TPU_MINIMAX_M3_SP_HIER_RS:
         out = pallas_all_reduce.reduce_scatter(get_tp_group().ranks, x)
         if out is not None:
             return out

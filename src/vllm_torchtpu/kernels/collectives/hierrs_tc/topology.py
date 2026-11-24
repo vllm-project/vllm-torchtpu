@@ -14,19 +14,73 @@
 """Device and chunk indexing; devices 2k and 2k+1 are the cores of chip k."""
 
 import jax
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from vllm_torchtpu.kernels.collectives.hierrs_tc.config import Config
 
 
+def _lookup(table: tuple[int, ...], idx):
+    """`table[idx]` for a traced scalar `idx`, as a select chain."""
+    out = jnp.int32(table[0])
+    for i, v in enumerate(table[1:], start=1):
+        out = jnp.where(idx == i, jnp.int32(v), out)
+    return out
+
+
+def check_chip_perm(chip_perm: tuple[int, ...] | None, num_chips: int) -> None:
+    if chip_perm is not None and sorted(chip_perm) != list(range(num_chips)):
+        raise ValueError(
+            f"chip_perm must be a permutation of range({num_chips}), got {chip_perm}"
+        )
+
+
+def logical_order(
+    order: tuple[int, ...] | None,
+    chip_perm: tuple[int, ...] | None,
+    num_devices: int,
+) -> tuple[int, ...] | None:
+    """The input row block of each LOGICAL device under `chip_perm`.
+
+    `order[m]` is the row block mesh index m receives (None = identity).
+    Logical device d sits at mesh index `mesh_device(d)`, so it must reduce
+    block `order[mesh_device(d)]`.
+    """
+    if chip_perm is None:
+        return order
+    base = tuple(range(num_devices)) if order is None else tuple(order)
+    return tuple(base[chip_perm[d // 2] * 2 + d % 2] for d in range(num_devices))
+
+
 class Topology:
-    def __init__(self, axis_name: str):
-        self.cur_id = jax.lax.axis_index(axis_name)
-        self.cur_chip_id = self.cur_id // 2
-        self.cur_chiplet_bit = self.cur_id % 2
+    """Device ids here are LOGICAL hypercube ids: logical chip k is mesh chip
+    `chip_perm[k]` (identity when None), so a mesh whose chips are not in the
+    physical hypercube order (a rank-ordered mesh on tpu7x) still exchanges
+    only between ICI neighbours. `mesh_id` turns a logical id into the mesh
+    index the DMAs address."""
+
+    def __init__(self, axis_name: str, chip_perm: tuple[int, ...] | None = None):
+        identity = chip_perm is None or tuple(chip_perm) == tuple(
+            range(len(chip_perm))
+        )
+        self.chip_perm = None if identity else tuple(chip_perm)
+        mesh_id = jax.lax.axis_index(axis_name)
+        self.cur_chiplet_bit = mesh_id % 2
+        if self.chip_perm is None:
+            self.cur_chip_id = mesh_id // 2
+        else:
+            inverse = tuple(self.chip_perm.index(m) for m in range(len(self.chip_perm)))
+            self.cur_chip_id = _lookup(inverse, mesh_id // 2)
+        self.cur_id = self.cur_chip_id * 2 + self.cur_chiplet_bit
         self.partner_id = jax.lax.select(
             self.cur_chiplet_bit == 0, self.cur_id + 1, self.cur_id - 1
         )
+
+    def mesh_id(self, device_id):
+        """Mesh index of logical device `device_id`."""
+        if self.chip_perm is None:
+            return device_id
+        return _lookup(self.chip_perm, device_id // 2) * 2 + device_id % 2
 
     def get_device_id(self, chip_id, chiplet_bit):
         return chip_id * 2 + chiplet_bit
@@ -39,9 +93,28 @@ class Topology:
 
 
 class ChunkLocator:
-    def __init__(self, config: Config, topo: Topology):
+    def __init__(
+        self, config: Config, topo: Topology, order: tuple[int, ...] | None = None
+    ):
         self.config = config
         self.topo = topo
+        # Input row block order[c] holds chunk c; None is the identity.
+        identity = tuple(range(config.num_devices))
+        self.order = None if order is None or tuple(order) == identity else order
+
+    def input_chunk(self, chunk_idx):
+        """The input row block that holds `chunk_idx`.
+
+        Only the input is permuted: every working buffer is indexed by chunk.
+        """
+        if self.order is None:
+            return chunk_idx
+        if isinstance(chunk_idx, int):
+            return self.order[chunk_idx]
+        block = jnp.int32(self.order[0])
+        for c, b in enumerate(self.order[1:], start=1):
+            block = jnp.where(chunk_idx == c, jnp.int32(b), block)
+        return block
 
     def get_slice(self, chunk_idx, start, size):
         return (
@@ -109,7 +182,7 @@ class ChunkLocator:
     def make_phase1_index_fn(self, mb_idx):
         def phase1_index_fn(chip_idx):
             c_me = self.get_phase1_chunk_idx(self.topo.cur_id, chip_idx)
-            return (c_me, mb_idx)
+            return (self.input_chunk(c_me), mb_idx)
 
         return phase1_index_fn
 

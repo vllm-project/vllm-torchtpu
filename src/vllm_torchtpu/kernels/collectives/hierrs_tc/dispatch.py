@@ -1,0 +1,115 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Picks the hierrs_tc kernel for a reduce-scatter in EP-rank order."""
+
+import jax
+from jax.sharding import PartitionSpec as P
+
+from vllm_torchtpu.kernels.collectives.hierrs_tc.kernel_stream import (
+    reduce_scatter_stream_local,
+    supports_stream,
+)
+from vllm_torchtpu.kernels.collectives.hierrs_tc.wrapper import (
+    hierarchical_reduce_scatter_local,
+)
+
+# Input bytes per device from which the row-streaming kernel serves a call.
+# Wall-clock per call on tpu7x 2x2x1, row-streaming over micro-batched, at
+# every shape both take (hidden 2048 to 6144): 1.04 to 1.11 up to 20 MiB, so
+# the micro-batched kernel serves those; 0.97 to 1.035 from 24 MiB, a tie.
+# There the row-streaming kernel wins on memory: it streams through VMEM,
+# where the micro-batched one needs HBM work buffers of 1.5x the input.
+STREAM_MIN_BYTES = 24 << 20
+# Below this many input bytes per device the FP8 quantize pass costs more than
+# the halved wire bytes save on tpu7x-8, so the call keeps the BF16 wire.
+FP8_MIN_BYTES = 16 << 20
+
+
+def uses_stream(rows: int, hidden: int, itemsize: int) -> bool:
+    """Whether `rows` x `hidden` per device goes to the row-streaming kernel."""
+    return rows * hidden * itemsize >= STREAM_MIN_BYTES and supports_stream(
+        rows, hidden, itemsize
+    )
+
+
+def make_reduce_scatter_fn(
+    mesh,
+    order: tuple[int, ...],
+    *,
+    axis_name: str,
+    fp8_comm: bool = False,
+    fp8_static_scale: float | None = None,
+    chip_perm: tuple[int, ...] | None = None,
+):
+    """Reduce-scatter in which mesh index i gets the block of rank `order[i]`.
+
+    Both kernels read the blocks in that order themselves, so the input is
+    never copied to reorder it. With `fp8_comm`, calls of at least
+    FP8_MIN_BYTES per device send FP8 between chips, scaled by
+    `fp8_static_scale`. `chip_perm[k]` is the mesh chip that plays hypercube
+    chip k (None = identity; see `topology.Topology`).
+    """
+    if fp8_static_scale is not None and fp8_static_scale <= 0:
+        raise ValueError(f"fp8_static_scale must be > 0, got {fp8_static_scale}")
+    if fp8_comm and fp8_static_scale is None:
+        raise ValueError(
+            "fp8_comm needs fp8_static_scale: the row-streaming kernel has no "
+            "dynamic FP8 scale."
+        )
+    num_devices = len(order)
+
+    def local(part: jax.Array) -> jax.Array:
+        rows, hidden = part.shape
+        fp8 = fp8_comm and part.nbytes >= FP8_MIN_BYTES
+        if uses_stream(rows, hidden, part.dtype.itemsize):
+            if not fp8:
+                return reduce_scatter_stream_local(
+                    part, axis_name=axis_name, order=order, chip_perm=chip_perm
+                )
+            assert fp8_static_scale is not None
+            return reduce_scatter_stream_local(
+                part,
+                axis_name=axis_name,
+                order=order,
+                fp8_comm=True,
+                fp8_static_scale=fp8_static_scale,
+                chip_perm=chip_perm,
+            )
+        return hierarchical_reduce_scatter_local(
+            part,
+            num_devices=num_devices,
+            axis_name=axis_name,
+            order=order,
+            fp8_comm=fp8,
+            fp8_static_scale=fp8_static_scale if fp8 else None,
+            chip_perm=chip_perm,
+        )
+
+    reduce_scatter = _shard_mapped(local, mesh, axis_name)
+    # The per-device body, for a caller's own shard_map (benchmarks).
+    reduce_scatter.local = local
+    return reduce_scatter
+
+
+def _shard_mapped(local, mesh, axis_name: str):
+    def reduce_scatter(x: jax.Array) -> jax.Array:
+        return jax.shard_map(
+            local,
+            mesh=mesh,
+            in_specs=P(axis_name, None),
+            out_specs=P(axis_name, None),
+            check_vma=False,
+        )(x)
+
+    return reduce_scatter

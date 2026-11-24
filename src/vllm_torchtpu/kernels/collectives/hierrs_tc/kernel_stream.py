@@ -20,22 +20,69 @@ opposite orders, so both ICI links carry traffic on every step.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import fp8_wire
+from vllm_torchtpu.kernels.collectives.hierrs_tc.topology import (
+    Topology,
+    check_chip_perm,
+    logical_order,
+)
+
 _NUM_DEVICES = 8
 _SUB_TILE = 32
 _SLOTS = 3
 _ROW_BLOCK = 128  # 256 needs ~66 MiB of VMEM
 _VMEM_LIMIT_BYTES = 56 << 20
+# VMEM the compiler needs beyond the declared scratch. On tpu7x, hidden 6656
+# (53.6 MiB of scratch) compiles and 7168 (57.75 MiB) runs out of VMEM.
+_VMEM_HEADROOM_BYTES = 2 << 20
 
 
-def supports_stream(rows: int) -> bool:
+def _vmem_buffers(hidden: int, fp8_comm: bool) -> list[tuple[tuple[int, ...], str]]:
+    """The VMEM buffers of reduce_scatter_stream_local as (shape, kind): per
+    slot, the running sums and phase-1 landing buffer ("x", the input dtype),
+    then for step 0 and step 1 an FP8 staging buffer ("fp8", a one-tile stub
+    on the bf16 wire) and a landing buffer ("wire", the wire dtype). On a bf16
+    input the FP8 wire halves the landing buffers and adds staging of the same
+    size, so the total is the same on both wires."""
+    half_rows = _ROW_BLOCK // 2
+    unused_stage = (1, 1, 1, _SUB_TILE, 128)
+    return [
+        ((_SLOTS, 4, _ROW_BLOCK, hidden), "x"),
+        ((_SLOTS, 4, _ROW_BLOCK, hidden), "x"),
+        ((_SLOTS, 2, 2, half_rows, hidden) if fp8_comm else unused_stage, "fp8"),
+        ((_SLOTS, 2, 2, half_rows, hidden), "wire"),
+        ((_SLOTS, 2, half_rows, hidden) if fp8_comm else unused_stage[1:], "fp8"),
+        ((_SLOTS, 2, half_rows, hidden), "wire"),
+    ]
+
+
+def scratch_bytes(hidden: int, itemsize: int, fp8_comm: bool = False) -> int:
+    size = {"x": itemsize, "fp8": 1, "wire": 1 if fp8_comm else itemsize}
+    return sum(
+        math.prod(shape) * size[kind] for shape, kind in _vmem_buffers(hidden, fp8_comm)
+    )
+
+
+def supports_stream(rows: int, hidden: int, itemsize: int) -> bool:
+    """Whether `rows` x `hidden` per device fits the row-streaming kernel.
+
+    Its scratch grows with `hidden` (33 MiB at bf16 hidden 4096), so a wide
+    shape that would not fit in VMEM is left to the micro-batched kernel.
+    """
     chunk, rem = divmod(rows, _NUM_DEVICES)
-    return rem == 0 and chunk >= _ROW_BLOCK and chunk % _ROW_BLOCK == 0
+    return (
+        rem == 0
+        and chunk >= _ROW_BLOCK
+        and chunk % _ROW_BLOCK == 0
+        and scratch_bytes(hidden, itemsize) <= _VMEM_LIMIT_BYTES - _VMEM_HEADROOM_BYTES
+    )
 
 
 def _kernel(
@@ -43,7 +90,9 @@ def _kernel(
     o_ref,
     sums,
     p1_recv_buf,
+    s0_send_fp8,
     s0_recv_buf,
+    s1_send_fp8,
     s1_recv_buf,
     load_sem,
     p1_send_sem,
@@ -61,16 +110,25 @@ def _kernel(
     chunk_rows,
     block_rows,
     num_blocks,
+    fp8,
+    scale,
+    inv_scale,
     order,
+    chip_perm,
 ):
     half_rows = block_rows // 2
     r = pl.program_id(0)
+    # `chip` is this device's logical hypercube chip; the DMAs address mesh
+    # indices (Topology.mesh_id), which differ when chip_perm is set.
+    topo = Topology(axis_name, chip_perm)
     me = jax.lax.axis_index(axis_name)
     bit = me % 2
-    chip = me // 2
+    chip = topo.cur_chip_id
     partner_bit = 1 - bit
     partner = me + 1 - 2 * bit
-    neighbours = (chip ^ 1) * 2 + bit, (chip ^ 2) * 2 + bit
+    neighbours = tuple(
+        topo.mesh_id(topo.get_neighbor_device_id(dim)) for dim in range(2)
+    )
     dim0_bit = chip & 1
     dim1_bit = chip // 2
     logical = pl.DeviceIdType.LOGICAL
@@ -127,8 +185,13 @@ def _kernel(
         )
 
     def s0_send(sl, h, j):
+        src = (
+            s0_send_fp8.at[sl, h, j]
+            if fp8
+            else half(sums.at[sl, step0_send_chips(h)[j]], h)
+        )
         return pltpu.make_async_remote_copy(
-            src_ref=half(sums.at[sl, step0_send_chips(h)[j]], h),
+            src_ref=src,
             dst_ref=s0_recv_buf.at[sl, h, j],
             send_sem=s0_send_sem.at[sl, h, j],
             recv_sem=s0_recv_sem.at[sl, h, j],
@@ -137,8 +200,9 @@ def _kernel(
         )
 
     def s1_send(sl, h):
+        src = s1_send_fp8.at[sl, h] if fp8 else half(sums.at[sl, step1_send_chip(h)], h)
         return pltpu.make_async_remote_copy(
-            src_ref=half(sums.at[sl, step1_send_chip(h)], h),
+            src_ref=src,
             dst_ref=s1_recv_buf.at[sl, h],
             send_sem=s1_send_sem.at[sl, h],
             recv_sem=s1_recv_sem.at[sl, h],
@@ -160,6 +224,19 @@ def _kernel(
         for i in range(n // _SUB_TILE):
             s = pl.ds(i * _SUB_TILE, _SUB_TILE)
             dst[s, :] = dst[s, :] + src[s, :]
+
+    def add_dequantized_into(dst, src, n):
+        for i in range(n // _SUB_TILE):
+            s = pl.ds(i * _SUB_TILE, _SUB_TILE)
+            dq = fp8_wire.dequantize_to_bf16(src[s, :], scale)
+            dst[s, :] = dst[s, :] + dq
+
+    def quantize(dst, src, n):
+        for i in range(n // _SUB_TILE):
+            s = pl.ds(i * _SUB_TILE, _SUB_TILE)
+            dst[s, :] = fp8_wire.quantize(src[s, :].astype(jnp.float32), inv_scale)
+
+    add_received = add_dequantized_into if fp8 else add_into
 
     def signal_peers(sem, peers):
         for p in peers:
@@ -185,6 +262,15 @@ def _kernel(
         def _():
             signal_peers(p1_slot_free.at[sl], [partner])
 
+        if fp8:
+            for h in range(2):
+                for j in range(2):
+                    quantize(
+                        s0_send_fp8.at[sl, h, j],
+                        half(sums.at[sl, step0_send_chips(h)[j]], h),
+                        half_rows,
+                    )
+
         @pl.when(blk >= _SLOTS)
         def _():
             pl.semaphore_wait(s0_slot_free.at[sl], 2)
@@ -197,7 +283,7 @@ def _kernel(
         for h in range(2):
             for j in range(2):
                 wait_recv(s0_recv_buf.at[sl, h, j], s0_recv_sem.at[sl, h, j])
-                add_into(
+                add_received(
                     half(sums.at[sl, step0_keep_chips(h)[j]], h),
                     s0_recv_buf.at[sl, h, j],
                     half_rows,
@@ -206,6 +292,14 @@ def _kernel(
         @pl.when(blk + _SLOTS < num_blocks)
         def _():
             signal_peers(s0_slot_free.at[sl], list(neighbours))
+
+        if fp8:
+            for h in range(2):
+                quantize(
+                    s1_send_fp8.at[sl, h],
+                    half(sums.at[sl, step1_send_chip(h)], h),
+                    half_rows,
+                )
 
         @pl.when(blk >= _SLOTS)
         def _():
@@ -217,7 +311,7 @@ def _kernel(
     def finish_s1_store(blk, sl):
         for h in range(2):
             wait_recv(s1_recv_buf.at[sl, h], s1_recv_sem.at[sl, h])
-            add_into(half(sums.at[sl, chip], h), s1_recv_buf.at[sl, h], half_rows)
+            add_received(half(sums.at[sl, chip], h), s1_recv_buf.at[sl, h], half_rows)
 
         @pl.when(blk + _SLOTS < num_blocks)
         def _():
@@ -269,22 +363,36 @@ def reduce_scatter_stream_local(
     local_x: jax.Array,
     *,
     axis_name: str = "x",
+    fp8_comm: bool = False,
+    fp8_static_scale: float = 16.0,
     order: tuple[int, ...] | None = None,
+    chip_perm: tuple[int, ...] | None = None,
 ) -> jax.Array:
-    """Mesh index i receives the sum of input row block `order[i]`."""
+    """Mesh index i receives the sum of input row block `order[i]`.
+
+    `chip_perm[k]` is the mesh chip that plays hypercube chip k (None =
+    identity), for a mesh whose chip order is not the physical one.
+    """
+    check_chip_perm(chip_perm, _NUM_DEVICES // 2)
+    order = logical_order(
+        None if order is None else tuple(order), chip_perm, _NUM_DEVICES
+    )
     rows_per_device, hidden = local_x.shape
-    assert supports_stream(rows_per_device), f"{rows_per_device} rows per device"
+    assert supports_stream(rows_per_device, hidden, local_x.dtype.itemsize), (
+        f"{rows_per_device} x {hidden} per device"
+    )
     chunk_rows = rows_per_device // _NUM_DEVICES
     block_rows = _ROW_BLOCK
     num_blocks = chunk_rows // block_rows
-    half_rows = block_rows // 2
     dtype = local_x.dtype
+    fp8 = jnp.float8_e4m3fn
+    wire_dtype = fp8 if fp8_comm else dtype
     # In _kernel's parameter order.
     scratch = [
-        pltpu.VMEM((_SLOTS, 4, block_rows, hidden), dtype),
-        pltpu.VMEM((_SLOTS, 4, block_rows, hidden), dtype),
-        pltpu.VMEM((_SLOTS, 2, 2, half_rows, hidden), dtype),
-        pltpu.VMEM((_SLOTS, 2, half_rows, hidden), dtype),
+        *(
+            pltpu.VMEM(shape, {"x": dtype, "fp8": fp8, "wire": wire_dtype}[kind])
+            for shape, kind in _vmem_buffers(hidden, fp8_comm)
+        ),
         pltpu.SemaphoreType.DMA((_SLOTS, 4)),
         pltpu.SemaphoreType.DMA((_SLOTS, 4)),
         pltpu.SemaphoreType.DMA((_SLOTS, 4)),
@@ -303,7 +411,11 @@ def reduce_scatter_stream_local(
         chunk_rows=chunk_rows,
         block_rows=block_rows,
         num_blocks=num_blocks,
+        fp8=fp8_comm,
+        scale=1.0 / fp8_static_scale,
+        inv_scale=fp8_static_scale,
         order=tuple(range(_NUM_DEVICES)) if order is None else tuple(order),
+        chip_perm=None if chip_perm is None else tuple(chip_perm),
     )
     return pl.pallas_call(
         kernel,
@@ -315,7 +427,7 @@ def reduce_scatter_stream_local(
             scratch_shapes=scratch,
             grid=(num_blocks,),
         ),
-        name=f"hier_rs_stream_r{block_rows}",
+        name=f"hier_rs_stream_r{block_rows}{'_fp8' if fp8_comm else ''}",
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=_VMEM_LIMIT_BYTES,
