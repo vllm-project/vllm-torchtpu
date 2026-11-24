@@ -35,6 +35,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import tight_vmem
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import page_table as page_table_lib
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
     check_page_dtype,
     slot_ids,
@@ -515,7 +516,7 @@ def _attention_call(
         def index_map(w, pages, meta, *rest):
             page = jnp.maximum(pages[_slot(meta[w], pages_per_step, g)], 0)
             if page_table is not None:
-                page = rest[-1][page]
+                page = page_table_lib.load(rest[-1], page)
             return (page, 0, 0, 0)
 
         return pl.BlockSpec((1, rows_per_page, packing, row_width), index_map)

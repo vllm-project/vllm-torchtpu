@@ -34,6 +34,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_select,
     msa_write,
 )
+from vllm_torchtpu.models.minimax_m3.kernels import page_table as page_table_lib
 
 _DROPPED_PAGE = 2**30
 
@@ -248,7 +249,7 @@ def sparse_attention(
             else msa_attention.DEFAULT_BLOCK_Q
         ),
         pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
-        page_table=block_tables_2d.reshape(-1),
+        page_table=page_table_lib.prefetch(block_tables_2d, kv_cache.shape[0]),
         interpret=interpret,
         **_fp4_attention_kwargs(scale_cache),
     )

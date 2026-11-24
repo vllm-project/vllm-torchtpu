@@ -320,6 +320,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
     TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_HP_DECODE_MERGE_A2A: bool = False
+    TPU_MINIMAX_M3_PT16: bool = False
     TPU_MINIMAX_M3_INDEX_FOLD_OPT: str = ""
     TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT: int = 8
     TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT: bool = False
@@ -2141,6 +2142,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_DCP_HP_DECODE_MERGE_A2A": env_bool(
         "TPU_MINIMAX_M3_DCP_HP_DECODE_MERGE_A2A", default=False
     ),
+    # MiniMax M3 MSA kernels read the block table from SMEM as 16-bit page
+    # ids, two per 32-bit word (`models/minimax_m3/kernels/page_table.py`):
+    # half the SMEM per request, so max_num_seqs at a 1M max_model_len
+    # doubles (DCP2 32 -> 64, DCP4 64 -> 128). Tables up to 768 KiB (DCP2 48,
+    # DCP4 96 at 1M) stay int32, the kernels unchanged; larger ones need at
+    # most 65536 KV pages per rank (else they stay int32).
+    "TPU_MINIMAX_M3_PT16": env_bool("TPU_MINIMAX_M3_PT16", default=False),
     # MiniMax M3 sharded index scores (`msa.partial_block_scores`): "gather"
     # folds the index heads into query rows by a gather instead of a
     # scatter; "compose" unfolds the scores inside `block_scores`' layout
