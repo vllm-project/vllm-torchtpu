@@ -655,25 +655,3 @@ def test_flag_off_keeps_upstream_prefetch(monkeypatch):
     monkeypatch.setattr(envs, "TPU_EVICT_WEIGHTS_PAGE_CACHE", False, raising=False)
     mlp.patch_default_model_loader_page_cache()
     assert weight_utils._prefetch_all_checkpoints is upstream
-
-
-@pytest.mark.parametrize(
-    "changed", [None, lambda files, threads=8: None], ids=["missing", "renamed"]
-)
-def test_changed_upstream_prefetch_is_left_in_place(monkeypatch, changed):
-    # Fails open: the eviction still runs, upstream's thread keeps its reads.
-    from vllm.model_executor.model_loader import weight_utils
-
-    if changed is None:
-        monkeypatch.delattr(weight_utils, "_prefetch_all_checkpoints")
-    else:
-        monkeypatch.setattr(weight_utils, "_prefetch_all_checkpoints", changed)
-    monkeypatch.setattr(mlp, "_upstream_prefetch_all_checkpoints", None)
-    logger = _RecordingLogger()
-    monkeypatch.setattr(mlp, "logger", logger)
-    mlp._install_stoppable_checkpoint_prefetch()
-    assert getattr(weight_utils, "_prefetch_all_checkpoints", None) is changed
-    assert mlp._upstream_prefetch_all_checkpoints is None
-    ((level, msg),) = logger.records
-    assert level == logging.WARNING
-    assert "--safetensors-load-strategy=lazy" in msg

@@ -50,7 +50,6 @@ in the allowlist and stay unfiltered.
 
 import functools
 import gc
-import inspect
 import json
 import logging
 import os
@@ -703,6 +702,11 @@ def _prefetch_all_checkpoints_stoppable(
     this rank reads its share of the files, ``sorted_files[rank::world_size]``,
     whole into the page cache in a background thread. Unlike upstream's, the
     thread is registered, so it is stopped before the eviction.
+
+    TODO: drop this copy once upstream's prefetch thread can be stopped. The
+    argument checks and the file split per rank are copied from vLLM v0.33.0
+    ``weight_utils._prefetch_all_checkpoints``, whose thread has no handle
+    (``threading.Thread(target=_run_prefetch, daemon=True).start()``).
     """
     if num_prefetch_threads < 1:
         raise ValueError("safetensors prefetch num threads must be >= 1")
@@ -955,25 +959,15 @@ def _install_stoppable_checkpoint_prefetch() -> None:
     ``safetensors_weights_iterator`` calls ``_prefetch_all_checkpoints``
     through the ``weight_utils`` module global, for the "prefetch" strategy
     and for auto-prefetch on NFS/Lustre. Its thread would keep reading after
-    the eviction. Fails open: if upstream renamed it or changed its
-    parameters, logs a warning and leaves it in place.
+    the eviction. ``test_upstream_whole_file_prefetch_is_replaceable`` fails
+    if the pinned vLLM renames it, changes its parameters or stops calling it
+    through that global.
     """
     global _upstream_prefetch_all_checkpoints
     from vllm.model_executor.model_loader import weight_utils
 
-    upstream = getattr(weight_utils, "_prefetch_all_checkpoints", None)
+    upstream = weight_utils._prefetch_all_checkpoints
     if upstream is _prefetch_all_checkpoints_stoppable:
-        return
-    params = None if upstream is None else list(inspect.signature(upstream).parameters)
-    if params != ["sorted_files", "num_prefetch_threads", "block_size"]:
-        logger.warning(
-            "[tpu-model-loader] vLLM's weight_utils._prefetch_all_checkpoints is "
-            "missing or its parameters changed (%s), so it is not replaced: its "
-            "whole-file prefetch cannot be stopped and may read evicted pages "
-            "back in. Use --safetensors-load-strategy=lazy with "
-            "TPU_EVICT_WEIGHTS_PAGE_CACHE.",
-            params,
-        )
         return
     _upstream_prefetch_all_checkpoints = upstream
     weight_utils._prefetch_all_checkpoints = _prefetch_all_checkpoints_stoppable
