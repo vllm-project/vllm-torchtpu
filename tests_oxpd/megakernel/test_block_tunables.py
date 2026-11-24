@@ -94,6 +94,7 @@ def test_exact_flip_list_covers_registry():
         "gqa.kv_scatter_vec_ns",
         "ar2d_single_slot",
         "moe.dedup_vec",
+        "moe.rb_hoist",
     }
     assert exact == {f for _, f, _, _, _ in EXACT_FLIPS} | separately_tested
 

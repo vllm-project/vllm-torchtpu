@@ -46,7 +46,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ...exec_spec import ExecSpec
-from ...ops import BF16, F32, rmsnorm, rnd, rup
+from ...ops import BF16, F32, FP8, rmsnorm, rnd, rup
 from ...spec import Block, ScratchReq, SmallField, StateDecl, WeightDecl
 from .comm import hc_comm_scratch, hc_drain, hc_ring
 
@@ -80,6 +80,8 @@ class HCSublayer(Block):
         allreduce: bool = True,
         emit_residual: bool = False,
         ar_slot: int = 0,
+        fp8_weights: bool = False,
+        fused_up: bool = False,
     ) -> None:
         self.inner = inner
         self.gi = inner_geometry
@@ -90,7 +92,17 @@ class HCSublayer(Block):
         self.allreduce = bool(allreduce)
         self.emit_residual = bool(emit_residual)
         self.ar_slot = int(ar_slot)
+        self.fp8 = bool(fp8_weights) and self.mix
+        self.fused_up = bool(fused_up)
         self.prefix = getattr(inner, "prefix", "")
+
+    def paired_fp8_up_for(self, ex: ExecSpec) -> bool:
+        return (
+            self.fused_up
+            and self.fp8
+            and self.nhc % 2 == 0
+            and self.k_up * (2 * self.h) <= ex.resolved_tiles.bank
+        )
 
     # ------------------------------------------------------------ geometry
     @property
@@ -118,12 +130,20 @@ class HCSublayer(Block):
         self._check(g)
         n = self.name
         if self.mix:
+            dt = FP8 if self.fp8 else BF16
+            if self.paired_fp8_up_for(ex):
+                ups = [
+                    WeightDecl(f"{n}_hup_p{p}", K=self.k_up, N=2 * self.h, dtype=dt)
+                    for p in range(self.nhc // 2)
+                ]
+            else:
+                ups = [
+                    WeightDecl(f"{n}_hup{b}", K=self.k_up, N=self.h, dtype=dt)
+                    for b in range(self.nhc)
+                ]
             own = [
-                WeightDecl(f"{n}_hdn", K=self.width, N=self.n_down, dtype=BF16),
-            ] + [
-                WeightDecl(f"{n}_hup{b}", K=self.k_up, N=self.h, dtype=BF16)
-                for b in range(self.nhc)
-            ]
+                WeightDecl(f"{n}_hdn", K=self.width, N=self.n_down, dtype=dt),
+            ] + ups
         else:
             own = [WeightDecl(f"{n}_hinj", K=self.width, N=128, dtype=BF16)]
         return own + list(self.inner.weights(self.gi, ex))
@@ -143,9 +163,13 @@ class HCSublayer(Block):
         return list(self.inner.extra_inputs(self.gi, ex))
 
     def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
-        return [SmallField(f"{self.name}_hcn", self.width)] + list(
-            self.inner.smalls(self.gi, ex)
-        )
+        own = [SmallField(f"{self.name}_hcn", self.width)]
+        if self.fp8:
+            own += [
+                SmallField(f"{self.name}_hdn_s", self.n_down),
+                SmallField(f"{self.name}_hup_s", self.width),
+            ]
+        return own + list(self.inner.smalls(self.gi, ex))
 
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
         sw = dict(self.inner.shared_widths(self.gi, ex))
@@ -207,12 +231,66 @@ class HCSublayer(Block):
         with ctx.sc("hc_mix"):
             self._normalize(ctx, slot)
             y = s.dmatmul(f"{n}_hdn", scr["xb"], self.n_down)
+            if self.fp8:
+                y = y * ctx.sm(slot, f"{n}_hdn_s")
             gate = rnd(jax.nn.silu(rnd(rnd(y[:, :lr]) / nhc)))
             scr["hc_g"][:, :lr] = gate.astype(BF16)
             self._set_injection(ctx, y[:, lr : lr + nhc])
+            paired = self.paired_fp8_up_for(ctx.ex)
+            up_kinds = (
+                [f"{n}_hup_p{p}" for p in range(nhc // 2)]
+                if paired
+                else [f"{n}_hup{b}" for b in range(nhc)]
+            )
+            if (
+                self.fused_up
+                and (paired or s.sp.NBD >= len(up_kinds))
+                and all(s.sp.nt[k] == 1 for k in up_kinds)
+            ):
+                if paired:
+                    taken = [
+                        s.consume_single_tile(f"{n}_hup_p{p}")
+                        for p in range(nhc // 2)
+                    ]
+                else:
+                    taken = [
+                        s.consume_single_tile(f"{n}_hup{b}")
+                        for b in range(nhc)
+                    ]
+                hup_s = ctx.sm(slot, f"{n}_hup_s") if self.fp8 else None
+                g_in = scr["hc_g"][...]
+                dcw = 512
+                for c0 in range(0, h, dcw):
+                    cw = min(dcw, h - c0)
+                    acc_s: Any = None
+                    for b in range(nhc):
+                        if paired:
+                            w_ref = taken[b // 2][0]
+                            off = (b % 2) * h + c0
+                            wb = w_ref[:, off : off + cw]
+                        else:
+                            w_ref = taken[b][0]
+                            wb = w_ref[:, c0 : c0 + cw]
+                        u = s.mm(g_in, wb)
+                        if hup_s is not None:
+                            u = u * hup_s[:, b * h + c0 : b * h + c0 + cw]
+                        xn_b = scr["xb"][:, b * h + c0 : b * h + c0 + cw].astype(F32)
+                        term = jax.nn.sigmoid(rnd(u)) * xn_b
+                        acc_s = term if acc_s is None else acc_s + term
+                    assert acc_s is not None
+                    scr["hc_xb"][:, c0 : c0 + cw] = (acc_s / nhc).astype(BF16)
+                for _, give in taken:
+                    give()
+                return (
+                    scr["hc_xb"][...].astype(F32)
+                    if self.inner.input_norm is not None
+                    else None
+                )
             mixed: Any = None
             for b in range(nhc):
                 u = s.dmatmul(f"{n}_hup{b}", scr["hc_g"], h)
+                if self.fp8:
+                    u = u * ctx.sm(slot, f"{n}_hup_s")[:, b * h : (b + 1) * h]
                 xn_b = scr["xb"][:, b * h : (b + 1) * h].astype(F32)
                 term = jax.nn.sigmoid(rnd(u)) * xn_b
                 mixed = term if mixed is None else mixed + term

@@ -150,6 +150,8 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     # bitwise vs the dense loop, aligned [8, 128] tile loads). No-op up to 16 rows.
     if envs.VLLM_TPU_MK_ROW_BUCKET:
         t = t.with_blocks({"moe": {"row_bucket": True}})
+    if envs.VLLM_TPU_MK_HC_MOE_FUSED:
+        t = t.with_blocks({"moe": {"rb_hoist": True}})
     # VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC: vectorized routed-expert dedup (exact; envs.py),
     # from 8 rows up.
     if envs.VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC and B >= 8:
@@ -199,6 +201,13 @@ def _vmem_cuts(t: Tiles, B: int) -> Tiles:
             upd["nbe"], upd["nbd"] = VMEM_CUT_RINGS_AR2D_SS[B]
         elif B in VMEM_CUT_RINGS:
             upd["nbe"], upd["nbd"] = VMEM_CUT_RINGS[B]
+        if (
+            "nbe" in upd
+            and envs.VLLM_TPU_MK_HC_MOE_FUSED
+            and main_kv_dcp() > 1
+            and B >= 96
+        ):
+            upd["nbe"] = min(upd["nbe"], 8)
     return dataclasses.replace(t, **upd) if upd else t
 
 
@@ -297,6 +306,8 @@ def build_wholestep_call(
             n_layers=n_att, **_l47f_options(L, g.att_every),  # q38 L1-L47F: the sink export ({} when off)
             **indexed_options(),
         ),
+        hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
+        hc_fused=envs.VLLM_TPU_MK_HC_MOE_FUSED,
     )
     stats = union_stats_on() or _l47f_sink_out(L, g.att_every)  # q38 L1-L47F: outs[6] = the sink export (not with stats)
     skip_pad = bool(ex.resolved_tiles.block("moe", MoETunables).skip_pad)
