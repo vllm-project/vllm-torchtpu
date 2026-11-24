@@ -2819,26 +2819,26 @@ class TPUModelRunner(GPUModelRunner):
             self._pre_async_results.next_tokens_tpu,
         )
 
-    def _unmap_disjoint_async_results(self, zero_token_step: bool) -> None:
+    def _unmap_disjoint_async_results(self) -> None:
         """Unmap the previous step's results when no request of this step
         continues one of its requests.
 
         This step then reads none of their outputs: the previous step's
         requests committed no tokens (partial prefill chunks) or left the batch
         (finished, preempted or not scheduled), as on every step of one-token
-        requests. Their D2H copy may still be in flight. Keep the results
-        instead of waiting on it here, which would stall the host before this
-        step's forward: sample_tokens() waits on them in
-        _modify_prev_results(), rolls back the requests that left, and replaces
-        them. Never drop them unsynchronized: on TP ranks other than the
-        executor's output rank, vLLM may discard the AsyncTPUModelRunnerOutput
-        when the RPC returns, leaving these results the only owner of the copy,
-        whose buffers would be freed mid-transfer.
+        requests. Their rollback records go too: rolling back a request outside
+        the batch only rewrites its req_state.output_token_ids, which nothing
+        reads while it is out, and vLLM's _update_states() rebuilds that list
+        from the scheduler's tokens if the request returns.
 
-        A zero-token step has no sample_tokens() and no forward to overlap, so
-        settle results with committed tokens there instead: kept, they would be
-        rolled back after a later step re-adds their requests with rebuilt
-        state.
+        Their D2H copy may still be in flight. Keep the results instead of
+        waiting on it here, which would stall the host before this step's
+        forward: sample_tokens() waits on them in _modify_prev_results() and
+        replaces them, after any number of zero-token steps. Never drop them
+        unsynchronized: on TP ranks other than the executor's output rank, vLLM
+        may discard the AsyncTPUModelRunnerOutput when the RPC returns, leaving
+        these results the only owner of the copy, whose buffers would be freed
+        mid-transfer.
         """
         pre = self._pre_async_results
         if pre is None or not pre.req_id_to_index_copy:
@@ -2846,13 +2846,10 @@ class TPUModelRunner(GPUModelRunner):
         current_req_ids = set(self.input_batch.req_ids[: self.input_batch.num_reqs])
         if any(req_id in current_req_ids for req_id in pre.req_id_to_index_copy):
             return
-        if zero_token_step:
-            self._modify_prev_results()
-            self._pre_async_results = None
-        else:
-            # With nothing mapped, _prepare_inputs substitutes no tokens and
-            # skips the rejected-token subtraction.
-            pre.req_id_to_index_copy.clear()
+        # With nothing mapped, _prepare_inputs substitutes no tokens and skips
+        # the rejected-token subtraction.
+        pre.req_id_to_index_copy.clear()
+        pre.request_seq_lens = []
 
     def _install_spec_token_room_guard(self) -> None:
         """Wrap InputBatch.update_req_spec_token_ids to clamp its *write*.
@@ -4358,9 +4355,7 @@ class TPUModelRunner(GPUModelRunner):
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
-            self._unmap_disjoint_async_results(
-                zero_token_step=scheduler_output.total_num_scheduled_tokens == 0
-            )
+            self._unmap_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
@@ -8900,13 +8895,10 @@ class TPUModelRunner(GPUModelRunner):
         # the first real execute_model raise the "State error".
         self.execute_model_state = None
         # The last async warmup step parks an AsyncPreResults (in-flight D2H copy
-        # + optimistic 1+K placeholders) with no follower step to drain it.
-        # Finish the copy and null it BEFORE the drain below, so the drain's
-        # zero-token execute_model() does not settle it in
-        # _unmap_disjoint_async_results() (a stray D2H wait and placeholder
-        # rollback on the torn-down synthetic request), and no in-flight copy
-        # host buffer is freed mid-transfer (defensive: covers the
-        # `if present:`-skip path). No-op in sync (always None).
+        # + optimistic 1+K placeholders) with no follower step to drain it. This
+        # function drops it on every path, so wait on its copy first: dropped
+        # unsynchronized, it could free a host buffer the copy is still writing.
+        # No-op in sync (always None).
         if self._pre_async_results is not None:
             try:
                 self._pre_async_results.wait_for_copy()

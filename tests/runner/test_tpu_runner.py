@@ -3538,10 +3538,31 @@ def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
         assert torch.cuda.synchronize() == "synchronized"
 
 
-def _async_results_runner(prev_req, cur_reqs, committed):
-    """A runner whose previous step left results for `prev_req` (a committed
-    token 7 over one optimistic placeholder, or none), with `cur_reqs` in this
-    step's batch. The results own the only reference to their copy state."""
+@pytest.mark.parametrize(
+    "prev_req, cur_req, committed, mapped, output, row",
+    [
+        # A partial prefill chunk: nothing committed, nothing to roll back.
+        ("req-prefill", "req-prefill", False, {}, [-1], [0, 0, 0, 0]),
+        # The previous request left: unmapped, not rolled back (vLLM rebuilds
+        # its outputs if it returns), and the new request's row is untouched.
+        ("req-done", "req-new", True, {}, [-1], [0, 0, 0, 0]),
+        # Continued: stays mapped and is rolled back, row included.
+        ("req-a", "req-a", True, {"req-a": 0}, [7], [7, 0, 0, 0]),
+    ],
+    ids=["committed_nothing", "left_the_batch", "continues"],
+)
+def test_unmap_keeps_async_results_until_sample_tokens_waits(
+    prev_req, cur_req, committed, mapped, output, row
+):
+    """The previous step's D2H copy may still be in flight.
+
+    On TP ranks other than the executor's output rank, vLLM may drop the
+    AsyncTPUModelRunnerOutput when the RPC returns, so _pre_async_results is
+    the copy's only owner. execute_model() must neither free it before the
+    copy is waited on nor block on it ahead of the forward; only a request this
+    step continues stays mapped and keeps its rollback. sample_tokens() waits
+    on the copy in _modify_prev_results() and rolls back what is left.
+    """
     events = []
 
     class FakeCopyState:
@@ -3550,14 +3571,14 @@ def _async_results_runner(prev_req, cur_reqs, committed):
         def wait(self):
             events.append("wait")
 
-    req_state = SimpleNamespace(output_token_ids=[-1])
+    req_state = SimpleNamespace(output_token_ids=[-1])  # the optimistic placeholder
     copy_state = FakeCopyState()
     weakref.finalize(copy_state, events.append, "freed")
     runner = SimpleNamespace(
         input_batch=SimpleNamespace(
-            num_reqs=len(cur_reqs),
-            req_ids=list(cur_reqs),
-            req_id_to_index={r: i for i, r in enumerate(cur_reqs)},
+            num_reqs=1,
+            req_ids=[cur_req],
+            req_id_to_index={cur_req: 0},
             num_tokens_no_spec=np.ones(1, dtype=np.int64),
             token_ids_cpu=np.zeros((1, 4), dtype=np.int32),
         ),
@@ -3570,60 +3591,18 @@ def _async_results_runner(prev_req, cur_reqs, committed):
             copy_state=copy_state,
         ),
     )
-    runner._modify_prev_results = lambda: TPUModelRunner._modify_prev_results(runner)
-    return runner, req_state, events
-
-
-@pytest.mark.parametrize(
-    "prev_req, cur_req, committed, mapped, row",
-    [
-        # A partial prefill chunk: nothing committed, nothing to roll back.
-        ("req-prefill", "req-prefill", False, {}, [0, 0, 0, 0]),
-        # The previous request left; the new one's row stays untouched.
-        ("req-done", "req-new", True, {}, [0, 0, 0, 0]),
-        # Continued: stays mapped, and the rollback writes its row.
-        ("req-a", "req-a", True, {"req-a": 0}, [7, 0, 0, 0]),
-    ],
-    ids=["committed_nothing", "left_the_batch", "continues"],
-)
-def test_unmap_keeps_async_results_until_sample_tokens_waits(
-    prev_req, cur_req, committed, mapped, row
-):
-    """The previous step's D2H copy may still be in flight.
-
-    On TP ranks other than the executor's output rank, vLLM may drop the
-    AsyncTPUModelRunnerOutput when the RPC returns, so _pre_async_results is
-    the copy's only owner. execute_model() must neither free it before the
-    copy is waited on nor block on it ahead of the forward; only a
-    request this step continues stays mapped. sample_tokens() waits on the
-    copy in _modify_prev_results() and rolls back the committed requests.
-    """
-    runner, req_state, events = _async_results_runner(prev_req, [cur_req], committed)
+    del copy_state  # The runner now holds the only reference.
 
     # execute_model(): neither wait on the copy nor free it.
-    TPUModelRunner._unmap_disjoint_async_results(runner, zero_token_step=False)
+    TPUModelRunner._unmap_disjoint_async_results(runner)
     assert events == []
     assert runner._pre_async_results.req_id_to_index_copy == mapped
 
     # sample_tokens(): wait on the copy, then roll back.
     TPUModelRunner._modify_prev_results(runner)
     assert events == ["wait"]
-    assert req_state.output_token_ids == ([7] if committed else [-1])
+    assert req_state.output_token_ids == output
     assert runner.input_batch.token_ids_cpu[0].tolist() == row
-
-
-def test_unmap_settles_async_results_on_a_zero_token_step():
-    """No sample_tokens() follows a zero-token step, so committed results are
-    waited on and rolled back there, not after a later step re-adds their
-    requests with rebuilt state."""
-    runner, req_state, events = _async_results_runner("req-done", [], True)
-
-    TPUModelRunner._unmap_disjoint_async_results(runner, zero_token_step=True)
-
-    # Waited on before the results, its only owner, are dropped.
-    assert events == ["wait", "freed"]
-    assert runner._pre_async_results is None
-    assert req_state.output_token_ids == [7]
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])

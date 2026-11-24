@@ -67,7 +67,7 @@ def test_execute_model_pcp_mtp_prefill_only_boundary(
     runner.scheduler_config.async_scheduling = async_scheduling
     # The fixture already represents the batch after the scheduler update.
     runner._update_states = lambda _: None
-    runner._unmap_disjoint_async_results = lambda zero_token_step: None
+    runner._unmap_disjoint_async_results = lambda: None
 
     class ForwardBoundaryReached(Exception):
         pass
