@@ -14,6 +14,8 @@
 """MSA sparse attention with log-sum-exp (interpret mode) against a dense
 reference."""
 
+import sys
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -137,6 +139,52 @@ def test_lse_matches_dense_reference(
         0,
     )
     _check(got, want)
+
+
+def test_lse_wide_groups_match_dense_reference(monkeypatch):
+    """8-token tiles in 32-page groups (`msa_dcp.DCP_SMALL_BATCH_PAGES_PER_STEP`)
+    whose unions run at both step widths: under 16 pages and over."""
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "PAGES", 64)
+    monkeypatch.setattr(module, "TOPK", 16)
+    rng = np.random.default_rng(32)
+    q, kv_rows, kv, table, keys, local_key, local_limit = _inputs(
+        rng, 24, 24, 1, jnp.float8_e4m3fn
+    )
+    # Unions of <= 12 and <= 28 pages in the first two tiles; the third's
+    # takes two groups.
+    for tile, pages in ((0, 12), (1, 28)):
+        rows = keys[8 * tile : 8 * tile + 8]
+        rows[:] = np.where(rows >= 0, rows % pages, -1)
+        for row in rows[:, 0]:  # a page counts once per token
+            _, first = np.unique(row, return_index=True)
+            row[np.setdiff1d(np.arange(row.size), first)] = -1
+    unions = [np.unique(keys[t : t + 8][keys[t : t + 8] >= 0]).size for t in (0, 8)]
+    assert unions[0] <= 16 < unions[1] <= 32 < np.unique(keys[16:][keys[16:] >= 0]).size
+    got = msa_sparse_attention_lse(
+        q,
+        kv,
+        jnp.asarray(keys[:, 0]),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        jnp.asarray(table),
+        sm_scale=SCALE,
+        block_q=8,
+        pages_per_step=32,
+        interpret=True,
+    )
+    _check(
+        got,
+        _reference(
+            np.asarray(q.astype(jnp.float32)),
+            kv_rows,
+            keys[:, 0],
+            local_key,
+            local_limit,
+            table,
+            0,
+        ),
+    )
 
 
 def _head_major_call(fn, q, *args, head_major, **kwargs):

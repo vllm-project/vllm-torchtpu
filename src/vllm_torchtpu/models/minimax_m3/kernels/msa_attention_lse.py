@@ -29,8 +29,22 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
 
-# Page counts a kernel step may run at besides the full group (`_kernel`).
+# Page counts a kernel step may run at besides the full group (`_kernel`),
+# for groups of up to 16 pages.
 _STEP_WIDTHS = (4, 8)
+
+
+def _step_widths(pages_per_step: int) -> list[int]:
+    """The page counts `_kernel`'s steps run at: `_STEP_WIDTHS` below a group
+    of up to 16 pages, half and full width of a wider one. Each width is an
+    unrolled body per group kind; 48-page groups at seven widths made the
+    8-token decode tile 3.5 us slower in the c4 twin (j-f371356e), at half
+    and full width 32-page groups made it 1.0 us faster (j-d5a36e72)."""
+    if pages_per_step <= 16:
+        return [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
+    return [pages_per_step // 2, pages_per_step]
+
+
 # Tiles per grid step: a step runs the groups of this many tiles in a loop.
 # One step per group paid a per-step cost worth ~2-3% of the call (pool48
 # selections, 1-2 groups a tile; bench j-caec1354).
@@ -373,7 +387,7 @@ def _kernel(
         # standalone j-952e8a64), and a 16-token tile's union is ~8-12 of its
         # rank's pages at DCP 2, ~2-8 at DCP 8.
         single = first & last
-        widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
+        widths = _step_widths(pages_per_step)
         for i, width in enumerate(widths):
             fits = count > (widths[i - 1] if i else 0)
             if width < pages_per_step:

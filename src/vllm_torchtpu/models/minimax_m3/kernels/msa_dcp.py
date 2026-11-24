@@ -71,6 +71,13 @@ _MIN_CANDIDATE_TOKENS = 1024
 # 108.4 -> 116.7 ms per step, c64 DCP8 b57 147.8 -> 191.1 ms; j-82660a13 vs
 # j-8a29ceb0, j-c0fd0e40 vs j-11d1908c).
 DCP_SMALL_BATCH_TOKENS = 128
+# Pages per attention step of those 8-token tiles with one fp8 KV head per
+# rank at DCP 2 (as c4 / c16 serve): a verify group's tokens pick ~24-40
+# distinct pages of a rank between them, which 16-page groups ran in two or
+# three steps (c4 twin, j-d5a36e72 vs j-3bd57473: lse 5.0 -> 4.5 us per
+# layer at 8 tokens, 12.9 -> 11.0 us at 24). A wider DCP leaves a rank a few
+# pages, which the 4 / 8-page widths of 16-page groups serve.
+DCP_SMALL_BATCH_PAGES_PER_STEP = 32
 # The most VMEM a decode step's write may take inside the block-score kernel,
 # beside its page ring (6 / 12 MiB at 8 / 16 bits) in the core's 64 MiB: a
 # slot per run, ~150 KiB at 8 bits (16 runs: 2.4 MiB).
@@ -844,14 +851,22 @@ def msa_attend_dcp(
     # this rank holds, as `msa.sparse_attention`; [T, G, topk].
     mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
     keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
+    small = num_tokens <= DCP_SMALL_BATCH_TOKENS
     common = dict(
         sm_scale=sm_scale,
         block_q=(
             msa_attention.SMALL_BATCH_BLOCK_Q
-            if num_tokens <= DCP_SMALL_BATCH_TOKENS
+            if small
             else msa_attention.DEFAULT_BLOCK_Q
         ),
-        pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+        pages_per_step=(
+            DCP_SMALL_BATCH_PAGES_PER_STEP
+            if small
+            and dcp == 2
+            and num_heads == 1
+            and kv_cache.dtype == jnp.float8_e4m3fn
+            else msa_attention.DEFAULT_PAGES_PER_STEP
+        ),
         interpret=interpret,
     )
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
