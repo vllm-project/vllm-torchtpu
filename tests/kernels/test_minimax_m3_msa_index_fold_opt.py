@@ -1,4 +1,4 @@
-"""TPU_MINIMAX_M3_INDEX_FOLD_OPT gather / compose: `msa.partial_block_scores`
+"""TPU_MINIMAX_M3_INDEX_FOLD_OPT gather / compose / lookup: `msa.partial_block_scores`
 folds the index heads by a gather and unfolds the scores inside
 `block_scores`' own layout gather, with the same bits as the scatter and the
 second row gather (Pallas interpret mode, 4-bit folded index cache)."""
@@ -27,7 +27,9 @@ def _case(seed, ctx, q_lens, num_tokens, max_num_seqs, pages_per_seq):
     cu[num + 1 :] = cu[num]
     key = jax.random.PRNGKey(seed)
     nib = jax.random.randint(key, (pool, S, D), 0, 16, jnp.int32).astype(jnp.uint8)
-    scl = jax.random.uniform(jax.random.fold_in(key, 1), (pool, D), jnp.float32, 0.01, 0.03)
+    scl = jax.random.uniform(
+        jax.random.fold_in(key, 1), (pool, D), jnp.float32, 0.01, 0.03
+    )
     cache = msa_fp4.pack_rows(nib, scl)
     q = jax.random.normal(jax.random.fold_in(key, 2), (num_tokens, H, D), jnp.float32)
     args = (
@@ -56,7 +58,9 @@ CASES = [
 ]
 
 
-@pytest.mark.parametrize("opt", ["gather", "compose", "gather+compose"])
+@pytest.mark.parametrize(
+    "opt", ["gather", "compose", "gather+compose", "gather+compose+lookup", "lookup"]
+)
 @pytest.mark.parametrize("case", range(len(CASES)))
 def test_index_fold_opt_same_bits(monkeypatch, opt, case):
     ctx, q_lens, num_tokens = CASES[case]
@@ -71,13 +75,16 @@ def test_index_fold_opt_same_bits(monkeypatch, opt, case):
         np.testing.assert_array_equal(got[:, cu[i] : cu[i + 1], :pages], b)
 
 
-def test_fold_gather_same_rows(monkeypatch):
-    ctx, q_lens, num_tokens = CASES[1]
+@pytest.mark.parametrize("case", range(len(CASES)))
+def test_fold_gather_same_rows(monkeypatch, case):
+    ctx, q_lens, num_tokens = CASES[case]
     args, _ = _case(9, ctx, q_lens, num_tokens, 6, 41)
     q, _, seq_lens, _, cu, _ = args
     out = {}
-    for opt in ("", "gather"):
+    opts = ("", "gather", "lookup", "gather+lookup")
+    for opt in opts:
         monkeypatch.setenv("TPU_MINIMAX_M3_INDEX_FOLD_OPT", opt)
         out[opt] = [np.asarray(x) for x in msa.fold_index_heads(q, seq_lens, cu)]
-    for a, b in zip(out[""], out["gather"]):
-        np.testing.assert_array_equal(a, b)
+    for opt in opts[1:]:
+        for a, b in zip(out[""], out[opt]):
+            np.testing.assert_array_equal(a, b)

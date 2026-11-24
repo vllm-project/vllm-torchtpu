@@ -1,6 +1,7 @@
-"""TPU_MINIMAX_M3_INDEXER_DECODE_OPT items noclamp / full / counts / tail<N> / defer:
-the decode (token-major, transposed) block_scores tiles give the same bits as
-the default kernel on a folded 4-bit index cache (Pallas interpret mode)."""
+"""TPU_MINIMAX_M3_INDEXER_DECODE_OPT items noclamp / full / counts / tail<N> /
+defer / lanes: the decode (token-major, transposed) block_scores tiles give
+the same bits as the default kernel on a folded 4-bit index cache (Pallas
+interpret mode)."""
 
 import functools
 
@@ -26,7 +27,9 @@ def _case(seed, ctx, max_num_seqs, pages_per_seq):
     cu[num + 1 :] = cu[num]
     key = jax.random.PRNGKey(seed)
     nib = jax.random.randint(key, (pool, S, D), 0, 16, jnp.int32).astype(jnp.uint8)
-    scl = jax.random.uniform(jax.random.fold_in(key, 1), (pool, D), jnp.float32, 0.01, 0.03)
+    scl = jax.random.uniform(
+        jax.random.fold_in(key, 1), (pool, D), jnp.float32, 0.01, 0.03
+    )
     cache = msa_fp4.pack_rows(nib, scl)
     q = jax.random.normal(jax.random.fold_in(key, 2), (8 * num, 1, D), jnp.float32)
     args = (
@@ -55,9 +58,7 @@ def _run(monkeypatch, spec, args, lower=False):
 
 
 def _valid(out, cu, ctx):
-    return [
-        out[cu[i] : cu[i + 1], 0, : -(-int(c) // S)] for i, c in enumerate(ctx)
-    ]
+    return [out[cu[i] : cu[i + 1], 0, : -(-int(c) // S)] for i, c in enumerate(ctx)]
 
 
 # Requests: 1 to 4 page groups of 128 pages, last groups with 1..4 live
@@ -75,6 +76,10 @@ CTX = [128 * 300 + 5, 128 * 150, 128 * 33 + 1, 128 * 130, 128 * 470 + 77]
         "noclamp,tail8",
         "noclamp,defer",
         "defer,counts",
+        "noclamp,lanes",
+        "noclamp,lanes,defer",
+        "noclamp,lanes,full",
+        "lanes,defer,counts",
     ],
 )
 def test_decode_opt_same_bits(monkeypatch, spec):
@@ -91,7 +96,9 @@ def test_decode_opt_same_bits(monkeypatch, spec):
 
 
 def test_decode_opt_parse(monkeypatch):
-    monkeypatch.setenv("TPU_MINIMAX_M3_INDEXER_DECODE_OPT", "noclamp,full,counts,tail16")
+    monkeypatch.setenv(
+        "TPU_MINIMAX_M3_INDEXER_DECODE_OPT", "noclamp,full,counts,tail16"
+    )
     o = msa_indexer.decode_opt()
     assert (o.noclamp, o.full, o.every_count, o.tail) == (True, True, True, 16)
     monkeypatch.setenv("TPU_MINIMAX_M3_INDEXER_DECODE_OPT", "tail5")
