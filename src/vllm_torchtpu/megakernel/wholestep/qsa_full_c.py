@@ -83,6 +83,9 @@ FP8_MAX = 448.0
 # (request 0's `xreq_loads`, the owned request's first key chunks) go out before the
 # projection (`QSAFullStepBlock._early`); "0" issues them where they are first needed.
 EARLY_LOADS = os.environ.get("VLLM_TPU_MK_QSA_EARLY_LOADS", "1") != "0"
+# Up to R / 2 requests: each request is scored by a core pair (`me`, `me ^ 1`), one half of
+# its key chunks each; the even core selects (`QSAFullStepBlock._paired`). "0": one core.
+PAIR_SCORE = os.environ.get("VLLM_TPU_MK_QSA_PAIR_SCORE", "1") != "0"
 
 
 def _scoped(name: str, level: int = 2):
@@ -192,7 +195,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qx_rope", pltpu.VMEM((2, 1, 128), F32)),
             ScratchReq("qx_old", pltpu.VMEM((2, MICRO, 1, 4, 256), f8)),
             ScratchReq("qx_sem", pltpu.SemaphoreType.DMA((6,))),
-        ] if self.xreq_loads else []) + (self._shard_scratch(ex) if self.shard_index else []) + (
+        ] if self.xreq_loads else []) + ([
+            # `_paired`: the odd core's score-column copies to the even core (send, recv).
+            ScratchReq("qp_sem", pltpu.SemaphoreType.DMA((2,))),
+        ] if self._paired(ex) else []) + (self._shard_scratch(ex) if self.shard_index else []) + (
             self._union_scratch(ex) if self.union_attn else []
         ) + (self._dcp_scratch(g, ex) if self.split > 1 else [])
 
@@ -272,12 +278,46 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
     def _runs(self, ex: ExecSpec) -> int:
         """Request runs of the sharded indexer: one per rank, or per pair (`compressed_dcp`:
-        both ranks of a pair score the same requests, each over its own groups)."""
+        both ranks of a pair score the same requests, each over its own groups; `_paired`:
+        each over half the request's key chunks)."""
+        if self._paired(ex):
+            return ex.R // 2
         return ex.R // self.dcp if self.compressed_dcp else ex.R
 
     def _run(self, ctx: Any) -> Any:
         """This rank's run of requests (`_runs`)."""
+        if self._paired(ctx.ex):
+            return ctx.me // 2
         return ctx.me // self.dcp if self.compressed_dcp else ctx.me
+
+    def _paired(self, ex: ExecSpec) -> bool:
+        """`PAIR_SCORE` applies: the merged exchange of the sharded request loop over the deep
+        key ring, no DCP, and at most one request per core pair (`R / 2` request slots)."""
+        return bool(
+            PAIR_SCORE and self.shard_index and self.loop_requests and self.xmerge
+            and self.carrier and self.bounded_chunks and self.key_slots > 2
+            and not self.compressed_dcp and self.dcp == 1
+            and ex.R % 2 == 0 and ex.MB // ex.T <= ex.R // 2
+        )
+
+    def _half(self, ctx: Any, q: Any) -> tuple[Any, Any, Any]:
+        """`_paired`: (first chunk, chunks) this core scores of request `q`, and the chunks of
+        the odd core: the even core scores chunks `[0, h)`, the odd one `[h, n_q)`."""
+        T, CG = ctx.ex.T, self.chunk_pages * GPK
+        nv = ctx.extra[NVIS][q * T + T - 1]
+        n_q = jnp.clip((nv + CG - 1) // CG, 1, self.n_chunks)
+        h = (n_q + 1) // 2
+        odd = jax.lax.rem(ctx.me, 2) == 1
+        return jnp.where(odd, h, 0), jnp.where(odd, n_q - h, h), n_q - h
+
+    def _pair_col(self, ctx: Any, col: Any) -> Any:
+        """Remote copy of score column `col` (rows `[0, T)`) to the even core of the pair."""
+        ref = ctx.scr["qi_s"].at[pl.ds(0, ctx.ex.T), col]
+        return pltpu.make_async_remote_copy(
+            src_ref=ref, dst_ref=ref, send_sem=ctx.scr["qp_sem"].at[0],
+            recv_sem=ctx.scr["qp_sem"].at[1], device_id=(ctx.me ^ 1,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
 
     def _gather_runs(
         self, ctx: Any, send: Any, recv: Any, ssem: Any, rsem: Any, own_rank: bool = False
@@ -288,6 +328,29 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         each pair rank holds the part for its pair rank (its own union) and sends it to the
         ranks of the same pair rank."""
         ex, me = ctx.ex, ctx.me
+        if self._paired(ex):
+            # Only the even (selecting) core of a pair holds its run's results: it sends them
+            # to every other rank, its pair's odd core included; every rank receives the runs
+            # of the even cores other than itself. (The odd core must not write its own slot:
+            # the even core's copy may already have landed there.)
+            descs = ctx.comm.group_copies(lambda off: send, recv.at[me // 2], ssem, rsem, ex.R)
+            lead = jax.lax.rem(me, 2) == 0
+
+            @pl.when(lead)
+            def _():
+                recv[me // 2] = send[...]
+                for d in descs:
+                    d.start()
+
+            for off, d in enumerate(descs, start=1):
+                pl.when(jax.lax.rem(me ^ off, 2) == 0)(d.wait_recv)
+
+            @pl.when(lead)
+            def _():
+                for d in descs:
+                    d.wait_send()
+
+            return
         recv[self._run(ctx)] = send[...]
         if ex.R == 1:
             return
@@ -997,6 +1060,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         if not self._early_now:  # else waited at the start of `emit` (`_early_loads`)
             self.load_tables(ctx, l)
         npr = self._shard_rows(ex)[0] if self.shard_index else nreq
+        paired = self._paired(ex)
         c_off = jax.lax.rem(ctx.me, self.dcp) * (NC // self.dcp) if cdcp else 0
         if cdcp:  # the first swap's credit (when the pair has a request this layer)
             if self.shard_index:
@@ -1008,18 +1072,47 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             q: Any, qr: Any, ck: Any, gc: Any, first: Any, last: Any, issued: Any = False
         ) -> None:
             """Request `q`'s scores (this rank's groups, then the pair's under `compressed_dcp`)
-            with the completed group's fresh key in its stale cached column; then selected."""
-            self._score_request(
-                ctx, q, qr, self.tab_base(ctx, l), row0=0, first=first, last=last, c_off=c_off,
-                issued=issued,
-            )
+            with the completed group's fresh key in its stale cached column; then selected.
+            `_paired`: each core of the pair scores its half of the chunks; the odd core sends
+            each column to the even core as it is written, and only the even core selects."""
+            if paired:
+                c_lo, n, n_odd = self._half(ctx, q)
+                odd = jax.lax.rem(ctx.me, 2) == 1
+
+                def send(col: Any) -> None:
+                    pl.when(odd)(lambda: self._pair_col(ctx, col).start())
+
+                # Every request starts its own stream (`first`, `last`): a half has no
+                # cross-request prefetch.
+                self._score_request(
+                    ctx, q, qr, self.tab_base(ctx, l), row0=0, first=True, last=True,
+                    issued=issued, rng=(c_lo, n), after=send,
+                )
+
+                def each(fn: Any, k: Any) -> None:  # one column copy's wait per sent column
+                    jax.lax.fori_loop(0, k, lambda i, c: (fn(), c)[1], 0)
+
+                pl.when(odd)(lambda: each(lambda: self._pair_col(ctx, 0).wait_send(), n))
+                pl.when(~odd)(lambda: each(lambda: self._pair_col(ctx, 0).wait_recv(), n_odd))
+            else:
+                self._score_request(
+                    ctx, q, qr, self.tab_base(ctx, l), row0=0, first=first, last=last,
+                    c_off=c_off, issued=issued,
+                )
             if cdcp:
                 self._cdcp_swap(ctx, q)
-            s_new = ix.score_rows(qr, jnp.broadcast_to(ck.astype(BF16), (8, ix.IDX_DIM)))
-            scr["qi_s"][0:T] = jnp.where(
-                gid == gc, s_new[:, :1].reshape(T, 1, 1, 1), scr["qi_s"][0:T]
-            )
-            select_rows(q * T, T, 0)
+
+            def merge_select() -> None:
+                s_new = ix.score_rows(qr, jnp.broadcast_to(ck.astype(BF16), (8, ix.IDX_DIM)))
+                scr["qi_s"][0:T] = jnp.where(
+                    gid == gc, s_new[:, :1].reshape(T, 1, 1, 1), scr["qi_s"][0:T]
+                )
+                select_rows(q * T, T, 0)
+
+            if paired:
+                pl.when(jax.lax.rem(ctx.me, 2) == 0)(merge_select)
+            else:
+                merge_select()
             if cdcp:  # this request's scores are read: the pair may send the next one
                 if isinstance(last, bool):
                     if not last:
@@ -1645,15 +1738,19 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 pl.when(q < n_loop)(lambda q=q: self._tab_copy(ctx, l, q).start())
 
         q0 = self._run(ctx) * self._shard_rows(ex)[0]
-        qb = self.tab_base(ctx, l) + jnp.minimum(q0, nreq - 1)
-        CG = self.chunk_pages * GPK
-        nv = ctx.extra[NVIS][jnp.minimum(q0, nreq - 1) * T + T - 1]
-        n_q = jnp.clip((nv + CG - 1) // CG, 1, self.n_chunks)
+        qc = jnp.minimum(q0, nreq - 1)
+        qb = self.tab_base(ctx, l) + qc
+        if self._paired(ex):  # this core's half (`_half`)
+            c_lo, n_q, _ = self._half(ctx, qc)
+        else:
+            CG = self.chunk_pages * GPK
+            nv = ctx.extra[NVIS][qc * T + T - 1]
+            c_lo, n_q = 0, jnp.clip((nv + CG - 1) // CG, 1, self.n_chunks)
         for k in range(KS - 1):
 
             @pl.when((q0 < n_loop) & (k < n_q))
             def _(k=k):
-                for cp in self._key_copies(ctx, qb, k, k):
+                for cp in self._key_copies(ctx, qb, c_lo + k, k):
                     cp.start()
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741

@@ -521,7 +521,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
     # ------------------------------------------------------------ in kernel
     def _score_request(
         self, ctx: Any, q: int, qr: jax.Array, base: Any = 0, last: bool = True, row0: Any = None,
-        first: bool | None = None, c_off: Any = 0, issued: Any = False,
+        first: bool | None = None, c_off: Any = 0, issued: Any = False, rng: Any = None,
+        after: Any = None,
     ) -> None:
         """Scores of request `q`'s `T` rows into `qi_s[q*T : (q+1)*T]` (chunk-major).
 
@@ -531,8 +532,10 @@ class QSAFullIndexedBlock(QSAFullBlock):
         first chunk is issued here. `first` (default `q == 0`) marks the first request of the
         rank's run when the indexer is sharded by request (`shard_index`). `compressed_dcp`:
         only this rank's own groups (`qsa_cktab` lists its pages), scored into chunks from
-        `c_off` on. `issued` (deep ring): the request's first `key_slots - 1` chunks were
-        already issued (`QSAFullStepBlock` early loads)."""
+        `c_off` on. Deep ring only: `issued`, the request's first `key_slots - 1` chunks were
+        already issued (`QSAFullStepBlock` early loads); `rng = (c_lo, n)`, score only chunks
+        `[c_lo, c_lo + n)` of the request (one request per run: `last`); `after(col)` runs
+        once score column `col` is written."""
         scr, T = ctx.scr, ctx.ex.T
         r0 = q * T if row0 is None else row0
         rows = slice(r0, r0 + T)
@@ -553,8 +556,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
 
         first = (q == 0) if first is None else first
         if self.key_slots > 2:
-            self._score_deep(ctx, q, qr, copies, rows, first, last, c_off, issued)
+            self._score_deep(ctx, q, qr, copies, rows, first, last, c_off, issued, rng, after)
             return
+        assert rng is None and after is None, "chunk ranges need the deep key ring"
 
         def issue_first() -> None:
             for cp in copies(0, 0):
@@ -653,7 +657,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
 
     def _score_deep(
         self, ctx: Any, q: Any, qr: jax.Array, copies: Any, rows: slice, first: Any, last: Any,
-        c_off: Any, issued: Any = False,
+        c_off: Any, issued: Any = False, rng: Any = None, after: Any = None,
     ) -> None:
         """`_score_request`'s key stream through a `key_slots`-slot ring (bounded chunks):
         `key_slots - 1` chunks are in flight while one is scored. Chunk `c` of the rank's
@@ -664,13 +668,19 @@ class QSAFullIndexedBlock(QSAFullBlock):
         and the same scores as the 2-slot ring, only the copy schedule differs."""
         scr, T, KS = ctx.scr, ctx.ex.T, self.key_slots
         CG, NC = self.chunk_pages * GPK, self.n_chunks
-        nv = ctx.extra[NVIS][q * T + T - 1]
-        n_q = jnp.clip((nv + CG - 1) // CG, 1, NC)
+        if rng is None:
+            nv = ctx.extra[NVIS][q * T + T - 1]
+            c_lo, n_q = 0, jnp.clip((nv + CG - 1) // CG, 1, NC)
+        else:
+            assert last is True, "a chunk range has no next request to prefetch"
+            c_lo, n_q = rng
         c0 = jnp.where(first, 0, scr["qi_cc"][0])
 
         def start(c: Any, pos: Any = None, qq: Any = q) -> None:
-            """Copy chunk `c` of request `qq` into the slot of stream position c0 + pos."""
-            for cp in copies(c, jax.lax.rem(c0 + (c if pos is None else pos), KS), qq):
+            """Copy chunk `c_lo + c` of request `qq` into the slot of stream position
+            c0 + pos."""
+            slot = jax.lax.rem(c0 + (c if pos is None else pos), KS)
+            for cp in copies(c_lo + c, slot, qq):
                 cp.start()
 
         for k in range(KS - 1):  # chunks 0..KS-2 (chunk 0 came with the previous request)
@@ -688,7 +698,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
             if last is not True:
                 # The next request's first chunk, into the slot after this request's last.
                 pl.when((c + 1 == n_q) & jnp.logical_not(last))(lambda: start(0, n_q, q + 1))
-            self._consume(ctx, qr, jax.lax.rem(c0 + c, KS), rows, c_off + c)
+            self._consume(ctx, qr, jax.lax.rem(c0 + c, KS), rows, c_off + c_lo + c)
+            if after is not None:
+                after(c_off + c_lo + c)
             return carry
 
         jax.lax.fori_loop(0, n_q, chunk, 0)

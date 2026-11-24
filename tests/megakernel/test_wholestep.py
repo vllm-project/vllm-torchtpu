@@ -781,6 +781,42 @@ def test_early_loads_bit_identical(monkeypatch, key_slots):
         np.testing.assert_array_equal(early[i], late[i], err_msg=name)
 
 
+def test_pair_score_bit_identical(monkeypatch):
+    """VLLM_TPU_MK_QSA_PAIR_SCORE (request slots <= R / 2: 8 ranks, 4 slots): a core pair
+    scores each request, half its key chunks each, the odd core sending its columns to the
+    even one, which selects; the pair's results go out once. Bit-identical residuals,
+    completed keys, rings and every rank's selected ids. Request 0 streams 6 chunks (3 per
+    core), request 1 one chunk (the odd core scores none), requests 2-3 idle. Keys grow with
+    the group id so the top-K reaches the odd core's half; positive control: an odd core that
+    scores one chunk too early (its last column never sent) changes the selection."""
+    from vllm_torchtpu.megakernel.wholestep import qsa_full_c
+
+    def rising(ck):
+        return ck * (1.0 + np.arange(ck.shape[1], dtype=np.float32) / 256.0)[None, :, None]
+
+    geom = dataclasses.replace(G, NH=8, KH=8, VH=24)
+    run = functools.partial(
+        _run_c, long=True, rank_ids=True, ctx=[6000, 100], max_groups=2048, shard=True,
+        union=True, loop=True, xreq=2, skip_idle=True, xmerge=True, key_slots=3, R=8, B=8,
+        geom=geom, ck_fn=rising,
+    )
+    monkeypatch.setattr(qsa_full_c, "PAIR_SCORE", False)
+    one = run()
+    monkeypatch.setattr(qsa_full_c, "PAIR_SCORE", True)
+    pair = run()
+    for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new"), (7, "ids")):
+        np.testing.assert_array_equal(pair[i], one[i], err_msg=name)
+    half = qsa_full_c.QSAFullStepBlock._half
+
+    def early(self, ctx, q):  # noqa: ANN001
+        c_lo, n, n_odd = half(self, ctx, q)
+        return c_lo - (n > 0).astype(c_lo.dtype) * jax.lax.rem(ctx.me, 2), n, n_odd
+
+    monkeypatch.setattr(qsa_full_c.QSAFullStepBlock, "_half", early)
+    bad = run()
+    assert not np.array_equal(bad[7], one[7]), "a missing score column must change the ids"
+
+
 def test_step_tokens_match_stock_semantics():
     """Stage C: the completed group's key and the new ring rows equal the stock write
     for
