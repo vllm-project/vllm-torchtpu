@@ -29,6 +29,7 @@ groups are lane-aligned either way and come out token-major.
 """
 
 import functools
+import math
 from collections.abc import Callable
 from typing import NamedTuple
 
@@ -855,10 +856,9 @@ def _class_scores(
                 f"pages_per_step must be an even divisor or a multiple of it, "
                 f"got {pages_per_step}"
             )
+        ring_shape = (_RING_SLOTS, pages_per_step, rows_per_page, head_dim)
         ring = [
-            pltpu.VMEM(
-                (_RING_SLOTS, pages_per_step, rows_per_page, head_dim), jnp.uint32
-            ),
+            pltpu.VMEM(ring_shape, jnp.uint32),
             pltpu.SemaphoreType.DMA((_RING_SLOTS,)),
         ]
         prefetch = (work, tile_info, block_tables, seq_pages)
@@ -912,9 +912,7 @@ def _class_scores(
                     dimension_semantics=("arbitrary",),
                     disable_bounds_checks=True,
                     vmem_limit_bytes=(
-                        _RING_SLOTS * pages_per_step * rows_per_page * head_dim * 4
-                        + plan.vmem_bytes
-                        + (16 << 20)
+                        math.prod(ring_shape) * 4 + plan.vmem_bytes + (16 << 20)
                     ),
                 ),
                 interpret=interpret,

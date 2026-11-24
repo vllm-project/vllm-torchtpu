@@ -248,7 +248,7 @@ class _RunCopies:
 def _kernel(*refs, layout: _Layout, num_inputs: int):
     """Scalar prefetch (`_RunCopies`), the inputs and the caches (aliased, in
     HBM), the caches out (the same buffers), then the scratch: every run
-    copied in, merged and copied out, up to `_DEPTH` runs in flight."""
+    copied in, merged and copied out, up to `layout.depth` runs in flight."""
     num_caches = len(layout.specs)
     prefetch, refs = refs[:5], refs[5:]
     inputs = refs[:num_inputs]
