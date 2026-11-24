@@ -337,6 +337,36 @@ def test_route_plan_refuses_shapes_over_the_smem_budget(ep, t_local, supported):
     )
 
 
+@pytest.mark.parametrize(
+    "topk,supported",
+    [
+        # 256 tokens x 16 = 4096 pairs: the bitmask's 128 words, full.
+        (16, True),
+        # 4352 pairs need 136 words; the SMEM budget alone would admit it.
+        (17, False),
+    ],
+)
+def test_route_plan_refuses_pairs_past_the_bitmask(topk, supported):
+    ep, e_total, t_local, cap = 2, 768, 256, 128
+    stride = host.ragged_stride_bound(ep * t_local, topk, e_total, cap)
+    smem = route_plan.route_plan_smem_bytes(
+        ep=ep, e_total=e_total, t_local=t_local, topk=topk, shard_stride=stride
+    )
+    assert smem <= route_plan.SMEM_CAPACITY_BYTES - route_plan.SMEM_HEADROOM_BYTES
+    assert (
+        route_plan.route_plan_supported(
+            ep=ep,
+            e_total=e_total,
+            t_local=t_local,
+            topk=topk,
+            block=host.routing_block(t_local, topk),
+            tile_m=cap,
+            shard_stride=stride,
+        )
+        == supported
+    )
+
+
 @pytest.mark.multichip
 @pytest.mark.parametrize("ep,g_local,t_local,topk", GEOMETRIES)
 @pytest.mark.parametrize("routing", ROUTINGS)

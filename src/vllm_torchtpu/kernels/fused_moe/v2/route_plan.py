@@ -129,6 +129,9 @@ def route_plan_supported(*, ep, e_total, t_local, topk, block, tile_m, shard_str
         # expert at most once, so that is at most t_local; aligned up to
         # ROWBLK it is still a bf16-exact MXU operand.
         and align_up(t_local, ROWBLK) <= BF16_EXACT_MAX
+        # The live-pair bitmask is one row of LANES words per source, so it
+        # holds at most LANES * WORD_BITS of this shard's pairs.
+        and t_local * topk <= LANES * WORD_BITS
         and T * topk + ROWBLK * e_total < F32_EXACT_MAX
         and block & (block - 1) == 0
         and tile_m & (tile_m - 1) == 0
