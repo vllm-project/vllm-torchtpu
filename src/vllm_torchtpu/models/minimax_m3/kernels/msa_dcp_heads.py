@@ -559,9 +559,11 @@ def exchange_head_pages_start(
             pltpu.SemaphoreType.DMA(()),
             pltpu.SemaphoreType.DMA(()),
         ),
-        compiler_params=pltpu.CompilerParams(
-            collective_id=_EXCHANGE_COLLECTIVE_ID, has_side_effects=True
-        ),
+        # No has_side_effects (here and in the wait): under the serving
+        # shard_map the SPMD partitioner refuses a side-effecting custom call
+        # without a sharding. The wait consumes every output, and the
+        # optimization barriers order the work around the pair.
+        compiler_params=pltpu.CompilerParams(collective_id=_EXCHANGE_COLLECTIVE_ID),
         interpret=pltpu.InterpretParams() if interpret else False,
         name="minimax_m3_msa_dcp_exchange_start",
     )(pages, live, rank, kv_cache)
@@ -671,7 +673,6 @@ def exchange_head_pages_wait(
         ),
         out_shape=out_shape,
         input_output_aliases={2: 0},
-        compiler_params=pltpu.CompilerParams(has_side_effects=True),
         interpret=pltpu.InterpretParams() if interpret else False,
         name="minimax_m3_msa_dcp_exchange_wait",
     )(live, rank, out, send_sem, recv_sem, fwd_sem, src_cache)
