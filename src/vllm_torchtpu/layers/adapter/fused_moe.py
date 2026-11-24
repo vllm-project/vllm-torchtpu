@@ -34,7 +34,7 @@ _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
-_quantize_native_fp4_kmajor_ops: dict[tuple[int, bool, bool], Callable] = {}
+_quantize_native_fp4_kmajor_ops: dict[tuple[int, bool, str], Callable] = {}
 
 
 def _resolve_activation_name(activation: Any) -> str:
@@ -121,29 +121,26 @@ def requant_load_kmajor_fp4(
 
 
 def quantize_native_fp4_kmajor(
-    w: torch.Tensor, block: int, pack: bool = True, pow2_scale: bool = False
+    w: torch.Tensor, block: int, pack: bool = True, scale_mode: str = "fp32"
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize an already-dequantized, K-major float weight to native FP4.
 
     ``pack=False`` hands the weight back as ``torch.float4_e2m1fn_x2`` rather
     than packed uint8 -- the form the fused EP MoE kernel takes. The two are
-    distinct traced programs with distinct op names, so the cache is keyed on
-    both: one qualname serving two closures would silently dispatch to
-    whichever registered first. ``pow2_scale`` is a third distinct program for
-    the same reason.
+    distinct traced programs, as are the scale modes. Give each its own op.
     """
-    key = (block, pack, pow2_scale)
+    key = (block, pack, scale_mode)
     op = _quantize_native_fp4_kmajor_ops.get(key)
     if op is None:
         op = pallas.jax_op(
             f"pallas::nvfp4_quantize_native_kmajor_b{block}"
             f"{'' if pack else '_unpacked'}"
-            f"{'_pow2' if pow2_scale else ''}",
+            + ("" if scale_mode == "fp32" else f"_{scale_mode}"),
             functools.partial(
                 quantize_to_native_fp4_kmajor,
                 block=block,
                 pack=pack,
-                pow2_scale=pow2_scale,
+                scale_mode=scale_mode,
             ),
         )
         _quantize_native_fp4_kmajor_ops[key] = op

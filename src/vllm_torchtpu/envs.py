@@ -686,10 +686,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     else None,
     # Scale rule for the MoE FP4 requantization. "fp32" derives the per-block
     # scale as amax/6; "pow2" rounds it up to the next power of two, which is
-    # the UE8M0 grid the official checkpoint uses. Both keep the scale's shape
-    # and dtype, so the MoE kernels read either without a change.
+    # the UE8M0 grid the official checkpoint uses. All modes keep the scale's shape
+    # and dtype. Four Over Six chooses amax/4 or amax/6 by block MSE.
     "MOE_REQUANTIZE_SCALE_MODE": env_with_choices(
-        "MOE_REQUANTIZE_SCALE_MODE", "fp32", ["fp32", "pow2"]
+        "MOE_REQUANTIZE_SCALE_MODE", "fp32", ["fp32", "pow2", "four_over_six"]
     ),
     # TPU unified block-pool cache layout. Tri-state: an explicit 0/1 always
     # wins; unset defers to

@@ -88,7 +88,7 @@ def test_pow2_requant_keeps_the_scale_layout_and_stays_a_power_of_two():
     weight = rng.standard_normal((2560, 4)).astype(np.float32)
 
     _, scale_fp32 = quantize_to_native_fp4_kmajor(weight, block=512)
-    _, scale_pow2 = quantize_to_native_fp4_kmajor(weight, block=512, pow2_scale=True)
+    _, scale_pow2 = quantize_to_native_fp4_kmajor(weight, block=512, scale_mode="pow2")
 
     assert scale_pow2.shape == scale_fp32.shape == (5, 1, 4)
     assert scale_pow2.dtype == scale_fp32.dtype == jnp.float32
@@ -110,7 +110,7 @@ def test_pow2_requant_is_a_no_op_when_the_block_scale_is_already_a_power_of_two(
 
     codewords_fp32, scale_fp32 = quantize_to_native_fp4_kmajor(weight, block=512)
     codewords_pow2, scale_pow2 = quantize_to_native_fp4_kmajor(
-        weight, block=512, pow2_scale=True
+        weight, block=512, scale_mode="pow2"
     )
 
     assert np.array_equal(np.asarray(scale_fp32), np.asarray(scale_pow2))
@@ -120,3 +120,21 @@ def test_pow2_requant_is_a_no_op_when_the_block_scale_is_already_a_power_of_two(
     # halved one.
     expected_scales = np.float32([[0.125, 0.125, 0.125, 0.0625]])
     assert np.all(np.asarray(scale_pow2)[..., 0, :] == expected_scales)
+
+
+@pytest.mark.parametrize("pack", [False, True])
+def test_four_over_six_selects_per_block_and_column(pack):
+    _skip_without_float4()
+    rows = np.tile([[4.0, 6.0, 0.0], [1.5, 1.0, 0.0]], (256, 1))
+    w = np.concatenate([rows, rows[:, [1, 0, 2]]]).astype(np.float32)
+    codes, scales = quantize_to_native_fp4_kmajor(
+        w, block=512, pack=pack, scale_mode="four_over_six"
+    )
+    np.testing.assert_array_equal(scales, [[[1.0, 1.0, 0.0]], [[1.0, 1.0, 0.0]]])
+    expected = jnp.asarray(w).astype(jnp.float4_e2m1fn)
+    if pack:
+        from jax import lax
+
+        pairs = expected.reshape(512, 2, 3).swapaxes(-1, -2)
+        expected = lax.bitcast_convert_type(pairs, jnp.uint8)
+    np.testing.assert_array_equal(codes, expected)

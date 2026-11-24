@@ -376,11 +376,6 @@ REQUANTIZED_BLOCK_SIZE = (
 REQUANTIZED_SCALE_MODE = envs.MOE_REQUANTIZE_SCALE_MODE
 
 
-def _pow2_requant_scale() -> bool:
-    """Whether the MoE requantization uses the power-of-two block scale."""
-    return REQUANTIZED_SCALE_MODE == "pow2"
-
-
 def _row_padded_flat_block_scale(scale: torch.Tensor) -> torch.Tensor:
     """[E, K/block, 1, N] -> the kernel's row-padded flat [E * rows, N].
 
@@ -692,19 +687,18 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         """
         w13_block_size = REQUANTIZED_BLOCK_SIZE
         w2_block_size = min(REQUANTIZED_BLOCK_SIZE, orig_intermediate_size)
-        pow2_scale = _pow2_requant_scale()
 
         w13_weight_processed, w13_weight_scale = quantize_native_fp4_kmajor(
             w13_weight_padded.to(device),
             block=w13_block_size,
             pack=pack,
-            pow2_scale=pow2_scale,
+            scale_mode=REQUANTIZED_SCALE_MODE,
         )
         w2_weight_processed, w2_weight_scale = quantize_native_fp4_kmajor(
             w2_weight_padded.to(device),
             block=w2_block_size,
             pack=pack,
-            pow2_scale=pow2_scale,
+            scale_mode=REQUANTIZED_SCALE_MODE,
         )
 
         return (
