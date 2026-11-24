@@ -84,6 +84,7 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time linear weight requantization. |
 | `REQUANTIZE_BLOCK_SIZE` | `None` | Target subchannel block size for load-time linear weight requantization. |
 | `TPU_FP8_LINEAR_W8A16_MAX_ROWS` | `0` | Opt-in. FP8 dense-linear steps whose padded token bucket has at most this many rows keep bf16 activations (W8A16) instead of quantizing them to FP8. Per-channel path with FP8 weights only; measured on v7x. |
+| `TPU_FUSED_ATTN_OUT_FP8` | `False` | Opt-in. Fuses the batched-RPA head-major attention-output relayout with dynamic per-row FP8 activation quantization in a Pallas kernel (`kernels/quantized_matmul/attn_out_fp8.py`) ahead of eligible per-channel FP8 `o_proj` layers; unsupported token buckets fall back to the unfused path. Validated on Gemma 4 31B FP8 on TPU v7x. |
 | `TPU_GDN_QKVZ_KERNEL_LAYOUT` | `False` | Opt-in. Stores the GDN `in_proj_qkvz` weight in the matmul's (k, n) layout instead of vLLM's [n_out, n_in], removing a per-step weight copy on the per-block FP8 path. Ignored with prefill context parallelism; the experimental AOT export rejects it at TP > 1. |
 | `MOE_REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time MoE expert weight requantization (e.g., `"fp4"`). |
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `None` | Target block size for load-time MoE expert weight requantization. |

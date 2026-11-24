@@ -15,14 +15,23 @@ from collections.abc import Callable
 from threading import Lock
 
 import jax
+import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 import torch
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+from vllm_torchtpu.kernels.quantized_matmul.attn_out_fp8 import (
+    MIN_ROW_TILE,
+    attn_out_fp8_matmul,
+    select_row_tile,
+)
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.logger import init_logger
 
@@ -52,6 +61,12 @@ KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 # back and silently corrupt the values.
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 
+# Set on an attention block's `o_proj` after attention kernel init
+# (`tag_attn_out_projections`) to the per-rank `(num_kv_heads, q_per_kv,
+# head_dim)` of the attention whose output feeds it, so FP8 `apply` can
+# quantize that output in its native head-major layout.
+ATTN_OUT_HEAD_LAYOUT_ATTR = "_tpu_attn_out_head_layout"
+
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
     """Return the activation quant dtype paired with a given weight dtype.
@@ -64,6 +79,14 @@ def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
     if jnp.issubdtype(w_q_dtype, jnp.floating):
         return jnp.float8_e4m3fn
     raise ValueError(f"Unsupported quantized dtype: {w_q_dtype}")
+
+
+def _uses_w8a16(rows: int, w_q_dtype: jnp.dtype, w8a16_max_rows: int) -> bool:
+    """Whether a token bucket keeps bf16 activations against FP8 weights.
+
+    W8A16 is only measured with FP8 weights; int8 weights keep W8A8.
+    """
+    return 0 < rows <= w8a16_max_rows and jnp.issubdtype(w_q_dtype, jnp.floating)
 
 
 def _quantized_matmul_jax(
@@ -113,9 +136,8 @@ def _quantized_matmul_jax(
             zero_initialize=True,
         )
     # Rows is static at trace time, so each token bucket picks one path.
-    # W8A16 is only measured with FP8 weights; int8 weights keep W8A8.
     rows = x.shape[0]
-    use_w8a16 = 0 < rows <= w8a16_max_rows and jnp.issubdtype(w_q.dtype, jnp.floating)
+    use_w8a16 = _uses_w8a16(rows, w_q.dtype, w8a16_max_rows)
     if use_w8a16:
         # Logged at trace time, so absent when executables load from the
         # compile cache.
@@ -253,6 +275,203 @@ def quantized_matmul_fp4(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_fp4_op()(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
+
+
+def _attn_out_quantized_matmul_jax(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    num_kv_heads: int,
+    q_per_kv: int,
+    head_dim: int,
+    w8a16_max_rows: int = 0,
+) -> jax.Array:
+    """`o_proj` FP8 matmul reading the attention output in its native layout.
+
+    Token count is static per bucket here, so the kernel/fallback choice adds
+    no TorchDynamo guards. Buckets the kernel does not cover, W8A16 buckets
+    and blockwise weight scales keep the regular `_quantized_matmul_jax` path.
+    """
+    rows = x.shape[0]
+    use_kernel = (
+        w_s.ndim == 1
+        and jnp.issubdtype(w_q.dtype, jnp.floating)
+        and not _uses_w8a16(rows, w_q.dtype, w8a16_max_rows)
+        and select_row_tile(rows, num_kv_heads, q_per_kv, head_dim) is not None
+    )
+    if not use_kernel:
+        return _quantized_matmul_jax(x, w_q, w_s, w8a16_max_rows)
+    return attn_out_fp8_matmul(x, w_q, w_s, num_kv_heads, q_per_kv, head_dim)
+
+
+_attn_out_quantized_matmul_op: Callable | None = None
+_attn_out_quantized_matmul_op_lock = Lock()
+
+
+def _get_attn_out_quantized_matmul_op() -> Callable:
+    global _attn_out_quantized_matmul_op
+    if _attn_out_quantized_matmul_op is not None:
+        return _attn_out_quantized_matmul_op
+
+    with _attn_out_quantized_matmul_op_lock:
+        if _attn_out_quantized_matmul_op is not None:
+            return _attn_out_quantized_matmul_op
+
+        op = pallas.jax_op(
+            "pallas::attn_out_quantized_matmul", _attn_out_quantized_matmul_jax
+        )
+
+        def _fake_attn_out_quantized_matmul(
+            x: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+            num_kv_heads: int,
+            q_per_kv: int,
+            head_dim: int,
+            w8a16_max_rows: int = 0,
+        ):
+            del w_s, num_kv_heads, q_per_kv, head_dim, w8a16_max_rows
+            return torch.empty(
+                x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device
+            )
+
+        op.register_fake(_fake_attn_out_quantized_matmul)
+        _attn_out_quantized_matmul_op = op
+        return op
+
+
+def attn_out_quantized_matmul(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    head_layout: tuple[int, int, int],
+    w8a16_max_rows: int = 0,
+) -> torch.Tensor:
+    """Torch entry for `o_proj` fed directly by the attention output.
+
+    `head_layout` is the per-rank `(num_kv_heads, q_per_kv, head_dim)` of the
+    attention layer whose flattened output `x` is.
+    """
+    if x.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
+            f"{w_q.shape[0]}."
+        )
+    num_kv_heads, q_per_kv, head_dim = head_layout
+    orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
+    x_2d = x.reshape(-1, x.shape[-1])
+    out_2d = _get_attn_out_quantized_matmul_op()(
+        x_2d, w_q, w_s, num_kv_heads, q_per_kv, head_dim, w8a16_max_rows
+    )
+    return out_2d.reshape(orig_out_shape)
+
+
+def _attn_out_head_layout(
+    attn: Attention,
+    o_proj: RowParallelLinear,
+    *,
+    vmem_capacity_bytes: int,
+    qkv_proj: torch.nn.Module | None = None,
+) -> tuple[int, int, int] | None:
+    """Per-rank `(num_kv_heads, q_per_kv, head_dim)` if `o_proj` is a
+    per-channel FP8 linear fed directly by a head-major batched-RPA `attn`
+    layer that fits at least the smallest kernel row tile, else None.
+    """
+    # Local imports: the attention and FP8 adapters pull in most of the package.
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasBatchedRPAAttentionBackendImpl,
+    )
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+        VllmFp8LinearMethodTPU,
+    )
+
+    if not (
+        isinstance(attn.impl, PallasBatchedRPAAttentionBackendImpl)
+        and attn.impl.emits_head_major_batched_rpa_output()
+    ):
+        return None
+    if not isinstance(o_proj.quant_method, VllmFp8LinearMethodTPU):
+        return None
+    # Modules whose `qkv_proj` projects extra query-side heads (such as a
+    # pre-`o_proj` sigmoid output gate) multiply a token-major tensor between
+    # `attn` and `o_proj`, which prevents the relayout from cancelling.
+    if isinstance(qkv_proj, QKVParallelLinear) and qkv_proj.num_heads != attn.num_heads:
+        return None
+    if getattr(o_proj, KEEP_VLLM_LAYOUT_ATTR, False):
+        return None
+    if (
+        not o_proj.weight.dtype.is_floating_point
+        or o_proj.weight.dtype.itemsize != 1
+        or o_proj.weight_scale.ndim != 1
+    ):
+        return None
+    q_per_kv, remainder = divmod(attn.num_heads, attn.num_kv_heads)
+    if remainder or o_proj.input_size_per_partition != (
+        attn.num_heads * attn.head_size
+    ):
+        return None
+    if (
+        select_row_tile(
+            MIN_ROW_TILE,
+            attn.num_kv_heads,
+            q_per_kv,
+            attn.head_size,
+            vmem_capacity_bytes=vmem_capacity_bytes,
+        )
+        is None
+    ):
+        return None
+    return attn.num_kv_heads, q_per_kv, attn.head_size
+
+
+def tag_attn_out_projections(
+    *models: torch.nn.Module,
+    vmem_capacity_bytes: int | None = None,
+) -> int:
+    """Record the attention head layout on eligible FP8 `o_proj` layers.
+
+    Inspects modules owning both an `attn` (vLLM `Attention`) and an `o_proj`
+    (`RowParallelLinear`) after weight loading and `_initialize_attention_kernels`
+    have finalized weight layouts and attention backend modes. Returns immediately
+    with `0` when `TPU_FUSED_ATTN_OUT_FP8` is off.
+    """
+    if not envs.TPU_FUSED_ATTN_OUT_FP8 or not models:
+        return 0
+    if vmem_capacity_bytes is None:
+        vmem_capacity_bytes = (
+            int(pltpu.get_tpu_info().vmem_capacity_bytes)
+            if jax.default_backend() == "tpu"
+            else int(
+                pltpu.get_tpu_info_for_chip(
+                    pltpu.ChipVersion.TPU_7X, 1
+                ).vmem_capacity_bytes
+            )
+        )
+    tagged = 0
+    seen: set[int] = set()
+    for root in models:
+        for module in root.modules():
+            attn = getattr(module, "attn", None)
+            o_proj = getattr(module, "o_proj", None)
+            if not isinstance(attn, Attention) or not isinstance(
+                o_proj, RowParallelLinear
+            ):
+                continue
+            if id(o_proj) in seen:
+                continue
+            seen.add(id(o_proj))
+            if hasattr(o_proj, ATTN_OUT_HEAD_LAYOUT_ATTR):
+                delattr(o_proj, ATTN_OUT_HEAD_LAYOUT_ATTR)
+            head_layout = _attn_out_head_layout(
+                attn,
+                o_proj,
+                vmem_capacity_bytes=vmem_capacity_bytes,
+                qkv_proj=getattr(module, "qkv_proj", None),
+            )
+            if head_layout is not None:
+                setattr(o_proj, ATTN_OUT_HEAD_LAYOUT_ATTR, head_layout)
+                tagged += 1
+    return tagged
 
 
 def sharded_quantized_matmul(

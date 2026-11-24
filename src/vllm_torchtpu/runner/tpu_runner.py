@@ -6412,6 +6412,7 @@ class TPUModelRunner(GPUModelRunner):
 
     def _initialize_quantization_kernels(self):
         from vllm_torchtpu.layers.adapter.linear_common import (
+            _get_attn_out_quantized_matmul_op,
             _get_quantized_matmul_fp4_op,
             _get_quantized_matmul_op,
         )
@@ -6421,6 +6422,8 @@ class TPUModelRunner(GPUModelRunner):
             _get_quantized_matmul_op()
             # Same for the NVFP4 W4A16 matmul op.
             _get_quantized_matmul_fp4_op()
+            if envs.TPU_FUSED_ATTN_OUT_FP8:
+                _get_attn_out_quantized_matmul_op()
 
     def _initialize_attention_kernels(self, force: bool = False) -> None:
         """Pre-build Pallas RPA and custom attention kernels before torch.compile."""
@@ -6558,6 +6561,30 @@ class TPUModelRunner(GPUModelRunner):
             self.reorder_batch_threshold,
         )
         self._attention_kernels_initialized = True
+        self._tag_attn_out_projections()
+
+    def _tag_attn_out_projections(self) -> int:
+        if not envs.TPU_FUSED_ATTN_OUT_FP8:
+            return 0
+        from vllm_torchtpu.layers.adapter.linear_common import (
+            tag_attn_out_projections,
+        )
+
+        roots: list[torch.nn.Module] = []
+        model = getattr(self, "model", None)
+        if isinstance(model, torch.nn.Module):
+            roots.append(model)
+        draft_model = getattr(self.drafter, "draft_model", None)
+        if isinstance(draft_model, torch.nn.Module):
+            roots.append(draft_model)
+        tagged = tag_attn_out_projections(*roots)
+        if tagged:
+            logger.info(
+                "Tagged %d attention o_proj layers for the fused "
+                "attention-output FP8 quantization.",
+                tagged,
+            )
+        return tagged
 
     @torch.no_grad()
     def _dummy_run(
@@ -8982,11 +9009,6 @@ class TPUModelRunner(GPUModelRunner):
     ) -> None:
         from vllm.compilation.wrapper import reset_compile_wrapper
 
-        from vllm_torchtpu.layers.adapter.linear_common import (
-            _get_quantized_matmul_fp4_op,
-            _get_quantized_matmul_op,
-        )
-
         # set_current_vllm_config is required for the post-reset compile
         # path: reset_compile_wrapper restores the wrapper's original
         # forward code, so the next trace re-instantiates CustomOps that
@@ -8999,10 +9021,7 @@ class TPUModelRunner(GPUModelRunner):
         # determine_available_memory() reaches this profile run.
         with set_current_vllm_config(self.vllm_config):
             self._initialize_attention_kernels()
-            # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
-            _get_quantized_matmul_op()
-            # Same for the NVFP4 W4A16 matmul op.
-            _get_quantized_matmul_fp4_op()
+            self._initialize_quantization_kernels()
 
             # Compile backbone here so XLA materializes the FP8 activation
             # slab; vLLM's post-probe sees the real HBM. Cache writes are
