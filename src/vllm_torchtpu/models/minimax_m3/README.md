@@ -22,6 +22,10 @@ Self-contained TPU model directory for
 - `validation/`: serving configs, golden checks, and accuracy/performance
   baselines.
 
+The compile cache key covers the paths in `_RUNTIME_CACHE_KEY_PATHS` plus
+every `kernels/` and `ops/` directory under `vllm_torchtpu/models/`, so keep
+custom-op bridges and kernel copies in those directories.
+
 ## Coordination
 
 Check and claim work items on

@@ -1180,6 +1180,96 @@ def shard_token_gather_sorted(expert_ids, routing, me, *, e_total, ep, shard_str
     return jnp.clip(table, jnp.int32(gather_lo), jnp.int32(gather_hi))
 
 
+def sender_sorted_pairs(local_ids, me, *, t_local, topk, scale_bits):
+    """This shard's routed pairs in expert order: (token numbers, scale bits).
+
+    The sender's half of building the slab tables by run copy. A stable sort
+    of the shard's own t_local * topk pairs on the expert id leaves each
+    expert's pairs contiguous and in pair order, which is the order a run of
+    the slab holds them in; once gathered, every (expert, source) run is a
+    single stretch of its source's payload. Each pair carries its token's
+    number (in mesh order, the numbering the gather table uses) and its
+    token's row-scale bits, so the receiver copies both tables in one pass
+    and looks nothing up. A pair routed nowhere (expert id e_total) sorts
+    past every expert and lies in no run.
+
+    The ids are the layer's own: top-k or hash-table selections in
+    [0, e_total), or e_total for a padding row. An id above e_total would
+    sort past every expert too, but a negative one would sort ahead of them
+    while no count covers it, shifting every run of its source; nothing
+    upstream produces one.
+    """
+    if scale_bits.dtype != jnp.int32:
+        raise ValueError(
+            f"scale_bits must be the int32 bit patterns of the row scales, "
+            f"got {scale_bits.dtype}"
+        )
+    ids = local_ids.reshape(t_local * topk).astype(jnp.int32)
+    tokens = jnp.broadcast_to(
+        (me * t_local + jnp.arange(t_local, dtype=jnp.int32))[:, None], (t_local, topk)
+    ).reshape(-1)
+    scales = jnp.broadcast_to(scale_bits[:, None], (t_local, topk)).reshape(-1)
+    _, tokens, scales = lax.sort((ids, tokens, scales), num_keys=1, is_stable=True)
+    return tokens, scales
+
+
+def slab_run_copy_rows(t_local, topk, ep, shard_stride):
+    """(source, destination) lane rows of build_slab_run_copy for one shard.
+
+    The source is the two gathered streams as [2, rows, 128]: ep sources of
+    align_up(t_local * topk, 128) expert-sorted pairs each, padded to whole
+    (8, 128) tiles. The destination is the scale slab's lane rows, padded the
+    same way; the token-gather table is the first shard_stride elements of
+    the other stream's output.
+    """
+    pairs = ep * align_up(t_local * topk, HIDDEN_LANE_BLOCK)
+    src_rows = (
+        align_up(pairs, HIDDEN_LANE_BLOCK * U32_SUBLANE_TILE) // HIDDEN_LANE_BLOCK
+    )
+    out_rows = align_up(act_scale_slab_rows(shard_stride), U32_SUBLANE_TILE)
+    return src_rows, out_rows
+
+
+def slab_run_copy_fits(t_local, topk, ep, shard_stride, info=None):
+    """Whether build_slab_run_copy's streams and tables fit the VMEM budget.
+
+    The kernel holds both gathered streams and both output tables in VMEM at
+    once (one grid step): 2 x (source + destination) lane rows of int32. Past
+    the budget the layer keeps the sort and the lookup rather than failing to
+    compile; for top-10 routing on TPU8i that is about 1.2 million tokens a
+    step.
+    """
+    src_rows, out_rows = slab_run_copy_rows(t_local, topk, ep, shard_stride)
+    return 2 * (src_rows + out_rows) * HIDDEN_LANE_BLOCK * 4 <= vmem_limit(info)
+
+
+def slab_run_copy_runs(routing, me, *, e_total, ep, src_stride):
+    """(source offset, destination offset, length) of each run of shard me.
+
+    The runs in slab order: local expert-major, source-minor. A run's source
+    is its stretch of the gathered expert-sorted payload, `src_stride`
+    elements a source: past that source's pairs of every lower expert. Its
+    destination is its row in this shard's slab, where the runs follow one
+    another each padded to a whole ROWBLK -- the same rows the routing plan's
+    expert bases and aligned run starts give it.
+    """
+    g_local = e_total // ep
+    first = me * g_local
+    run_rows = routing.run_rows  # [e_total, ep]: pairs of expert e from source s
+    by_source = run_rows.T
+    ahead = jnp.cumsum(by_source, axis=1) - by_source
+    src_prefix = lax.dynamic_slice(ahead, (0, first), (ep, g_local)).T
+    src_off = (
+        jnp.arange(ep, dtype=jnp.int32)[None, :] * src_stride + src_prefix
+    ).reshape(-1)
+    length = lax.dynamic_slice(run_rows, (first, 0), (g_local, ep)).reshape(-1)
+    aligned = lax.dynamic_slice(
+        routing.run_rows_aligned, (first, 0), (g_local, ep)
+    ).reshape(-1)
+    dst_off = jnp.cumsum(aligned) - aligned
+    return src_off, dst_off, length
+
+
 def expert_visit_list(rows, g_local):
     """The local experts to visit, and how many, from rows [g_local] i32."""
     # visit[:n_visit] = the local expert indices with rows > 0, most rows

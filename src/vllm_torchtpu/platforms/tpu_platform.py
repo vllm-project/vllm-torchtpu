@@ -472,6 +472,7 @@ class TpuPlatform(Platform):
         "fp8",
         "mxfp4",
         "modelopt_fp4",
+        "modelopt_mixed",
         "deepseek_v4_fp8",
     ]
 
@@ -497,6 +498,7 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_RELOAD_MODULES",
         "TPU_MOE_ROUTER_TOPK",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
+        "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS",
         "TPU_DP_VOCAB_PARALLEL",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
@@ -1189,8 +1191,9 @@ class TpuPlatform(Platform):
                 # vLLM may pass per-engine ParallelConfig objects to workers
                 # with data_parallel_size collapsed to 1. Preserve the original
                 # single-host DP size for TorchTPU rank/env setup.
-                # TODO: Remove TORCH_TPU_DP_SIZE once TorchTPU physical
-                # chip/PjRt binding no longer depends on torchrun-style
+                # TODO(https://github.com/google-pytorch/torch_tpu/issues/6757):
+                # Remove TORCH_TPU_DP_SIZE once TorchTPU physical chip/PjRt
+                # binding no longer depends on torchrun-style
                 # RANK/LOCAL_RANK/WORLD_SIZE before vLLM distributed init.
                 os.environ["TORCH_TPU_DP_SIZE"] = str(dp_size)
                 os.environ.setdefault(

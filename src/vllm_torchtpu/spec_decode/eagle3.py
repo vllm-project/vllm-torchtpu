@@ -1507,6 +1507,33 @@ class Eagle3Proposer:
             result.extend(s.cpu().tolist()[: c.num_reqs])
         return result
 
+    def _seed_overrides(
+        self,
+        scheduler_output,
+        req_ids: list[str],
+        start: int,
+        rows: np.ndarray,
+        discard_set: set[int],
+    ) -> torch.Tensor:
+        """Per output row, the seed token of request `rows[r]` taken from
+        the host, or INVALID_TOKEN_ID where the device seed stands.
+
+        A partial-prefill (discard) request's sampled token is thrown away, so
+        its seed is its next prompt token, the same value as the host-seeded
+        path's. The callers apply these with a where whether or not the chunk
+        has any, so the seed ops have one sequence and shape for every step.
+        """
+        runner = self.runner
+        overrides = np.full(len(req_ids), INVALID_TOKEN_ID, dtype=np.int32)
+        for i, req_id in enumerate(req_ids):
+            if start + i in discard_set:
+                req_state = runner.requests[req_id]
+                overrides[i] = req_state.get_token_id(
+                    req_state.num_computed_tokens
+                    + scheduler_output.num_scheduled_tokens[req_id]
+                )
+        return torch.from_numpy(overrides[rows]).to(runner.device)
+
     def _prepare_draft_inputs(
         self,
         chunk: DraftChunkInputs,
@@ -1529,9 +1556,10 @@ class Eagle3Proposer:
                 bonus, padded with INVALID_TOKEN_ID). When given, each request's
                 seed token is gathered from it on-device instead of from the
                 host ``sampled_token_ids`` list (which the async path lacks).
-            device_seed: prefill / non-spec async bootstrap only —
-                ``[total_reqs]`` device tensor of the just-sampled tokens
-                (sliced ``[start:start+num_reqs]`` per chunk).
+            device_seed: prefill / non-spec bootstrap, with sync or async
+                scheduling — ``[total_reqs]`` device tensor of the
+                just-sampled tokens; the chunk's rows are gathered from it at
+                the loop bucket p, padded rows repeating the last request.
 
         Returns:
             input_ids: [padded_chunk_tokens] shifted + bonus-patched
@@ -1579,12 +1607,13 @@ class Eagle3Proposer:
             - 1
             - num_rejected_np.astype(np.int64)
         )
-        # The async (next_tokens_device) path recomputes last_token_indices
-        # fully on-device below, only the sync / device_seed paths consume this H2D.
-        if next_tokens_device is None:
-            last_token_indices = torch.from_numpy(last_token_indices_np).to(
-                runner.device
-            )
+        # Bucket the seed scatter + the returned gather index to the chunk's loop
+        # bucket p so neither recompiles as num_reqs shrinks (the dominant draft
+        # propose recompile). Pad by repeating the last real entry: the padded
+        # rows re-write request (num_reqs-1)'s seed to its own slot (idempotent),
+        # so draft_input_ids stays correct, and the padded gather tail re-reads a
+        # real row that propose() slices off.
+        p = self._loop_bucket(num_reqs)
 
         discard_set = set(discard_sampled_tokens_req_indices)
         req_ids = runner.input_batch.req_ids[start : start + num_reqs]
@@ -1629,21 +1658,16 @@ class Eagle3Proposer:
                     [qsl_end, qsl_end[-1:].expand(width - qsl_end.shape[0])]
                 )
             last_token_indices = qsl_end - 1 - num_rejected_out.to(torch.int64)
-            # Partial-prefill (discard) requests have no sampled token; seed
-            # them from the host request state (same value as the sync path).
-            ov_i = [i for i in range(num_reqs) if start + i in discard_set]
-            if ov_i:
-                ov_v = []
-                for i in ov_i:
-                    req_state = runner.requests[req_ids[i]]
-                    seq_len = (
-                        req_state.num_computed_tokens
-                        + scheduler_output.num_scheduled_tokens[req_ids[i]]
-                    )
-                    ov_v.append(req_state.get_token_id(seq_len))
-                next_token_ids[
-                    torch.tensor(ov_i, dtype=torch.long, device=runner.device)
-                ] = torch.tensor(ov_v, dtype=next_token_ids.dtype, device=runner.device)
+            overrides = self._seed_overrides(
+                scheduler_output,
+                req_ids,
+                start,
+                np.minimum(np.arange(width), num_reqs - 1),
+                discard_set,
+            )
+            next_token_ids = torch.where(
+                overrides != INVALID_TOKEN_ID, overrides, next_token_ids
+            )
             if width > num_reqs:
                 # Padding rows repeat the last real request's seed position and
                 # token (after its partial-prefill override, so the duplicate
@@ -1667,21 +1691,19 @@ class Eagle3Proposer:
             # num_rejected_np is zeros) and last_token_indices = qsl_end-1 (set
             # above) is the last prompt position -- the correct prefill seed.
             num_rejected_out = num_rejected_np
-            next_token_ids = device_seed[start : start + num_reqs].to(torch.int32)
-            # Partial-prefill (discard) reqs: override seed from host req_state.
-            ov_i = [i for i in range(num_reqs) if (start + i) in discard_set]
-            if ov_i:
-                next_token_ids = next_token_ids.clone()
-                ov_v = [
-                    runner.requests[req_ids[i]].get_token_id(
-                        runner.requests[req_ids[i]].num_computed_tokens
-                        + scheduler_output.num_scheduled_tokens[req_ids[i]]
-                    )
-                    for i in ov_i
-                ]
-                next_token_ids[
-                    torch.tensor(ov_i, dtype=torch.long, device=runner.device)
-                ] = torch.tensor(ov_v, dtype=next_token_ids.dtype, device=runner.device)
+            # Gathered from the whole device_seed, not the chunk's slice of
+            # it, so no op has the chunk's request count as a shape.
+            rows = np.minimum(np.arange(p), num_reqs - 1)
+            last_token_indices = torch.from_numpy(last_token_indices_np[rows]).to(
+                runner.device
+            )
+            seed = device_seed.index_select(
+                0, torch.from_numpy(start + rows).to(runner.device)
+            ).to(torch.int32)
+            overrides = self._seed_overrides(
+                scheduler_output, req_ids, start, rows, discard_set
+            )
+            next_token_ids = torch.where(overrides != INVALID_TOKEN_ID, overrides, seed)
         else:
             assert sampled_token_ids is not None
             num_rejected_out = num_rejected_np
@@ -1704,13 +1726,6 @@ class Eagle3Proposer:
                     )
                     next_token_ids_np[i] = ids[-1] if ids else 0
             next_token_ids = torch.from_numpy(next_token_ids_np).to(runner.device)
-        # Bucket the seed scatter + the returned gather index to the chunk's loop
-        # bucket p so neither recompiles as num_reqs shrinks (the dominant draft
-        # propose recompile). Pad by repeating the last real entry: the padded
-        # rows re-write request (num_reqs-1)'s seed to its own slot (idempotent),
-        # so draft_input_ids stays correct, and the padded gather tail re-reads a
-        # real row that propose() slices off.
-        p = self._loop_bucket(num_reqs)
         if next_tokens_device is None and device_seed is None:
             # Pure sync: build the padded index + values on the host (free H2D,
             # no recompile), then scatter at the constant [p] shape.
@@ -1728,17 +1743,15 @@ class Eagle3Proposer:
             gather_indices = last_token_indices
         else:
             # Async: the seed scatter runs at the sampler's padded request
-            # width (bucket-shaped, see above). Bootstrap: it stays real
-            # [num_reqs]. Pad just the returned gather index.
+            # width (bucket-shaped, see above). Bootstrap: it runs at p like
+            # the host-seeded path's. Pad just the async gather index.
             draft_input_ids = self._draft_seed_input_ids(
                 chunk.input_ids, last_token_indices, next_token_ids
             )
             if next_tokens_device is not None:
                 gather_indices = _maybe_pad_dim0(last_token_indices[:p], p)
             else:
-                padded_lti_np = np.zeros(p, dtype=np.int64)
-                padded_lti_np[:num_reqs] = last_token_indices_np
-                gather_indices = torch.from_numpy(padded_lti_np).to(runner.device)
+                gather_indices = last_token_indices
 
         draft_input_ids, gather_indices = (
             chunk.sequence_layout_plan.localize_token_tensor_and_gather_indices(

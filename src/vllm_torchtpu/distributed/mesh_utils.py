@@ -180,7 +180,7 @@ def get_stage_mesh(
       group: the stage's process group.
       device_ids: the TPU device ids of `group`, in rank order.
     """
-    from torch_tpu._internal.pallas import get_pallas_mesh
+    from torch.tpu.pallas import get_pallas_mesh
 
     # TODO(yinlin): torch_tpu releases refuse a mesh smaller than the world
     # here, and pp_validation turns such stages away; make the stage group
