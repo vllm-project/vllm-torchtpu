@@ -492,6 +492,7 @@ def test_patched_loader_records_loaded_files(
 ):
     # The real DefaultModelLoader records the shards its _prepare_weights
     # returned, and the eviction evicts them.
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
     from vllm.config.load import LoadConfig
     from vllm.model_executor.model_loader import default_loader as dl
 
@@ -507,11 +508,6 @@ def test_patched_loader_records_loaded_files(
     monkeypatch.setattr(
         dl.DefaultModelLoader, "_prepare_weights", recording_prepare_weights
     )
-    # It reads the engine's vLLM config, which a CPU test cannot build; with
-    # the EP weight filter off it sets nothing.
-    monkeypatch.setattr(
-        dl.DefaultModelLoader, "_init_ep_weight_filter", lambda self, config: None
-    )
     loaded = []
     model = SimpleNamespace(
         load_weights=lambda weights: loaded.extend(name for name, _ in weights)
@@ -521,9 +517,12 @@ def test_patched_loader_records_loaded_files(
         revision=None,
         quantization=None,
         multimodal_config=None,
+        is_moe=False,
     )
     loader = dl.DefaultModelLoader(LoadConfig(load_format="safetensors"))
-    loader.load_weights(model, model_config)
+    # A CPU device: the CPU unit-test agents have no TPU device to resolve.
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))):
+        loader.load_weights(model, model_config)
 
     assert sorted(loaded) == ["layers.0.weight", "layers.1.weight"]
     ((_, shards, _, _),) = prepared
