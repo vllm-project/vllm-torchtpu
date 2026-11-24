@@ -63,7 +63,7 @@ def without_declared_megakernels(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.usefixtures("without_declared_megakernels")
-@pytest.mark.parametrize("model_name", ["qwen3.5-397b", "kimi-k3", "qwen3.8-2.4t"])
+@pytest.mark.parametrize("model_name", ["qwen3.5-397b", "kimi-k3", "glm-5.2"])
 def test_scope_estimate_subterms_conserve_step_bound(model_name: str) -> None:
     """Verify ScopeEstimate sub-terms reconstruct roof_floor_us and step_bound_us."""
     sweep_report = advisor.advise_regimes(
@@ -240,7 +240,7 @@ class _UniqueIdCollector:
         return self.ids
 
 
-@pytest.mark.parametrize("model_name", ["qwen3.5-397b", "kimi-k3", "qwen3.8-2.4t"])
+@pytest.mark.parametrize("model_name", ["qwen3.5-397b", "kimi-k3", "glm-5.2"])
 def test_workbench_html_three_pane_landmarks_and_unique_ids(model_name: str) -> None:
     """Verify 3-pane Fusion Workbench landmarks, unique DOM IDs, and zero CDN links."""
     sweep_report = advisor.advise_regimes(model_name, "tpu7x")
