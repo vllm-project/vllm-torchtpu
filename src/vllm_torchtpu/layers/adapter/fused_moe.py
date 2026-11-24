@@ -18,6 +18,8 @@ import functools
 from collections.abc import Callable
 from typing import Any
 
+import jax
+import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
 
@@ -173,7 +175,7 @@ def _build_fused_moe_custom_op(
     # rank compiles an identical program.
     # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
     wrapped_fn = functools.partial(
-        fused_moe_func,
+        _fused_moe_plain_func,
         topk=topk,
         activation=activation,
         use_ep=use_ep,
@@ -334,20 +336,71 @@ def _get_fused_moe_shared_custom_op(
     return op
 
 
+def _fused_moe_plain_func(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array | None = None,
+    topk: int = 1,
+    activation: str = "silu",
+    use_ep: bool = False,
+    use_sparse_core: bool = True,
+    onehot_moe_permute_threshold: int = 0,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
+) -> jax.Array:
+    """`fused_moe_func` without its shared-expert operands: the op's schema
+    comes from this signature, and unbound Tensor keywords (shared_act, ...)
+    would be kwarg-only Tensor args, which torch custom ops reject."""
+    return fused_moe_func(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        topk_weights,
+        topk_ids,
+        experts_start,
+        topk=topk,
+        activation=activation,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+
+
 def _fused_moe_shared_func(
-    hidden_states,
-    w1,
-    w2,
-    w1_scale,
-    w2_scale,
-    topk_weights,
-    topk_ids,
-    experts_start,
-    shared_act,
-    shared_w,
-    shared_scale,
-    **kwargs,
-):
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array | None,
+    shared_act: jax.Array,
+    shared_w: jax.Array,
+    shared_scale: jax.Array,
+    topk: int = 1,
+    activation: str = "silu",
+    use_ep: bool = False,
+    use_sparse_core: bool = True,
+    onehot_moe_permute_threshold: int = 0,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
+) -> jax.Array:
+    """The shared-in-combine op's function (annotated: jax_op builds the op
+    schema from these annotations)."""
     return fused_moe_func(
         hidden_states,
         w1,
@@ -359,10 +412,16 @@ def _fused_moe_shared_func(
         topk_weights,
         topk_ids,
         experts_start,
+        topk=topk,
+        activation=activation,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
         shared_act=shared_act,
         shared_w=shared_w,
         shared_scale=shared_scale,
-        **kwargs,
     )
 
 

@@ -67,3 +67,19 @@ def test_get_fused_moe_activation_compiles():
 
     res = compiled_fn(torch.ones(1).to("tpu"), _Activation.SILU)
     assert res.cpu() == 2.0
+
+
+@pytest.mark.parametrize("which", ["plain", "shared"])
+def test_fused_moe_ops_build(which):
+    """Both MoE jax_ops build (nvfp4 process_weights_after_loading prebuilds
+    them): the plain op's schema has no kwarg-only Tensor (fused_moe_func's
+    shared_* operands stay out of it) and the shared op's function is
+    annotated."""
+    from vllm_torchtpu.layers.adapter import fused_moe as fm
+
+    build = (
+        fm.prebuild_fused_moe_kernel
+        if which == "plain"
+        else fm.prebuild_fused_moe_shared_kernel
+    )
+    build(topk=3, activation="swigluoai", use_ep=False, skip_padded_tokens=False)

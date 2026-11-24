@@ -438,16 +438,15 @@ class MiniMaxM3SparseAttention(nn.Module):
             )
             # TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS: this rank's DCP group
             # (TP rank // DCP), its part of the split index scoring.
-            self.dcp_lane = None
+            # (A buffer slot either way: a plain attribute of the same name
+            # would make register_buffer raise.)
+            lane = None
             if self.fp4 and envs.TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS:
-                self.register_buffer(
-                    "dcp_lane",
-                    _dcp_rank_tensor(
-                        get_tensor_model_parallel_rank() // self.dcp_size,
-                        str(torch.get_default_device()),
-                    ),
-                    persistent=False,
+                lane = _dcp_rank_tensor(
+                    get_tensor_model_parallel_rank() // self.dcp_size,
+                    str(torch.get_default_device()),
                 )
+            self.register_buffer("dcp_lane", lane, persistent=False)
             if self.fp4:  # each rank rotates its own query heads (get_msa_dcp_op)
                 self.register_buffer(
                     "hadamard",
