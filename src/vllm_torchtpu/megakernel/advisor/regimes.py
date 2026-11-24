@@ -589,7 +589,6 @@ def _serialize_scope_dicts(
             "hbm_us": s.hbm_us,
             "comm_us": s.comm_us,
             "fill_drain_us": s.fill_drain_us,
-            "repass_spill_us": s.repass_spill_us,
             "launch_us": s.launch_us,
             "ops_per_step": s.ops_per_step,
             "n_splits": s.n_splits,
@@ -736,7 +735,7 @@ def _build_tailoring_guide(
         f"High-Batch Decode & Chunked Prefill ({t_ceil} < T <= {t_ridge} tokens): "
         "use scope='single_layer' or 'layer_group' "
         f"(single-layer VMEM ceiling T_max={one_l_sc.t_vmem_max}) "
-        "so weights are not re-streamed across multi-pass token splits.",
+        "so activations fit a single pass without multi-layer weight staging.",
         f"Saturated Decode & Compute-Bound Prefill (T > {t_ridge} tokens, "
         f"AI >= {ridge_fb:.0f} FLOP/B): use scope='per_op' "
         "with moe_mode='grouped_in_hbm': tokens are grouped by expert in HBM "
