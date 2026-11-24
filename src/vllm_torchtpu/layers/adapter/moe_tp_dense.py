@@ -49,6 +49,7 @@ logger = init_logger(__name__)
 
 MAX_TOKENS: int = int(envs.TPU_MOE_TP_DENSE_FP4_MAX_TOKENS)
 ENABLED: bool = MAX_TOKENS > 0
+BD2: bool = bool(envs.TPU_MOE_TP_DENSE_FP4_BD2)
 QB = 128
 ROW_ALIGN = 8
 
@@ -252,9 +253,10 @@ def finalize(layer: Any, ep_w13_scale: torch.Tensor, activation: str) -> None:
     if _STATS["layers"] == 1:
         logger.info(
             "[moe-tp-dense] TPU_MOE_TP_DENSE_FP4_MAX_TOKENS=%d on: E=%d ep=%d rank=%d "
-            "slice I/ep=%d w13/s13/w2/s2=%s packed w=%s s=%s bytes/layer=%d row_align=%d first_layer=%s",
+            "slice I/ep=%d w13/s13/w2/s2=%s packed w=%s s=%s bytes/layer=%d row_align=%d first_layer=%s "
+            "TPU_MOE_TP_DENSE_FP4_BD2=%s",
             MAX_TOKENS, E, ep, st["rank"], i_s, shapes, list(w.shape), list(s.shape), nbytes,
-            ROW_ALIGN, getattr(layer, "layer_name", "?"))
+            ROW_ALIGN, getattr(layer, "layer_name", "?"), BD2)
 
 
 _PACK_OP = None
@@ -302,7 +304,7 @@ def tp_dense_routed(x, topk_weights, topk_ids, w, s, *, fs, act="silu"):
     gw = jnp.pad(gw, ((0, mp - t), (0, 0))).T  # [E, Mp]
     gw = jnp.broadcast_to(gw[:, :, None], (e, mp, 128))
     xp = jnp.pad(x, ((0, mp - t), (0, 0)))
-    out = tp_dense_moe_packed(xp, gw, w, s, hit, nhit, fs=fs, act=act)
+    out = tp_dense_moe_packed(xp, gw, w, s, hit, nhit, fs=fs, act=act, bd2=BD2)
     return out[:t]
 
 

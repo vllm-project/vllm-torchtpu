@@ -105,6 +105,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOE_REDUNDANT_EXPERTS: int = 0
     TPU_MOE_REPLICA_ASSIGN_REFINE: int = 0
     TPU_MOE_TP_DENSE_FP4_MAX_TOKENS: int = 0
+    TPU_MOE_TP_DENSE_FP4_BD2: bool = False
     TPU_MOE_REPLICA_ASSIGN_FAST: bool = False
     TPU_MOE_NVFP4_SKIP_PADDED: bool = False
     TPU_MINIMAX_M3_INDEXER_DECODE_OPT: str = ""
@@ -1010,6 +1011,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_TP_DENSE_FP4_MAX_TOKENS": env_nonnegative_int(
         "TPU_MOE_TP_DENSE_FP4_MAX_TOKENS", 0
     ),
+    # With TPU_MOE_TP_DENSE_FP4_MAX_TOKENS: two 128-row quant blocks per MXU
+    # pass (block-diagonal LHS) in the TP-dense kernel. Same output bits.
+    "TPU_MOE_TP_DENSE_FP4_BD2": env_bool("TPU_MOE_TP_DENSE_FP4_BD2"),
     # With redundant experts: the same copy assignment from a leaner kernel
     # (copy table flattened with each copy's rank at load, no per-step init
     # input or table reshape, branch-free scalar loops). Same output.

@@ -139,8 +139,18 @@ def pack(w1, s1, w2, s2):
     return jnp.concatenate([w1, w2r], axis=1), jnp.concatenate([s1, s2r], axis=1)
 
 
-def _kernel_packed(hit_ref, nhit_ref, x_ref, gw_hbm, w_hbm, s_hbm, out_ref, wv, sv, gwv, acc, sem,
-            *, slots, fs, k, nch, compute, act):
+# Two quant blocks per MXU pass (bd2): the LHS of each 256-row weight slab is block diagonal, [[x_a, 0], [0, x_b]]
+# ([2Mp, 256]), so one matmul gives x_a @ W_a in rows [0, Mp) and x_b @ W_b in rows [Mp, 2Mp); the off-diagonal
+# products are exact zeros, and the per-block scale multiply and accumulation order are unchanged (bitwise the same).
+# Fewer, deeper matmuls per expert (w1 48 -> 24, w2 24 -> 16 at K=6144, Fs=384).
+
+
+def _kernel_packed(hit_ref, nhit_ref, x_ref, gw_hbm, w_hbm, s_hbm, out_ref, wv, sv, gwv, acc, *rest,
+            slots, fs, k, nch, compute, act, bd2=False):
+    if bd2:
+        xbd, hbd, sem = rest
+    else:
+        (sem,) = rest
     f2 = 2 * fs
     nh = nhit_ref[0]
     acc[...] = jnp.zeros_like(acc)
@@ -159,6 +169,17 @@ def _kernel_packed(hit_ref, nhit_ref, x_ref, gw_hbm, w_hbm, s_hbm, out_ref, wv, 
                 c.start()
 
     x = x_ref[...]
+    mp = x.shape[0]
+    if bd2:
+        xbd[...] = jnp.zeros_like(xbd)
+        hbd[...] = jnp.zeros_like(hbd)
+        for q in range(k // QB // 2):
+            for i in range(2):
+                c0 = (2 * q + i) * QB
+                xbd[q, i * mp:(i + 1) * mp, i * QB:(i + 1) * QB] = x[:, c0:c0 + QB]
+
+    def wblock(w, r0, nb=1):
+        return w[r0:r0 + nb * QB, :].astype(jnp.float8_e4m3fn)
 
     def body(t, carry):
         @pl.when(t + slots - 1 < nh)
@@ -172,16 +193,36 @@ def _kernel_packed(hit_ref, nhit_ref, x_ref, gw_hbm, w_hbm, s_hbm, out_ref, wv, 
         slot = t % slots
         w = wv.at[slot]
         s = sv.at[slot]
-        g = jnp.zeros((x.shape[0], f2), jnp.float32)
-        for kb in range(k // QB):
-            blk = jnp.matmul(x[:, kb * QB:(kb + 1) * QB], w[kb * QB:(kb + 1) * QB, :].astype(jnp.float8_e4m3fn),
-                             preferred_element_type=jnp.float32)
-            g = g + blk * s[kb:kb + 1, :]
+        g = jnp.zeros((mp, f2), jnp.float32)
+        if bd2:
+            for q in range(k // QB // 2):
+                r = jnp.matmul(xbd[q], wblock(w, 2 * q * QB, 2), preferred_element_type=jnp.float32)
+                g = g + r[0:mp] * s[2 * q:2 * q + 1, :]
+                g = g + r[mp:2 * mp] * s[2 * q + 1:2 * q + 2, :]
+        else:
+            for kb in range(k // QB):
+                blk = jnp.matmul(x[:, kb * QB:(kb + 1) * QB], wblock(w, kb * QB), preferred_element_type=jnp.float32)
+                g = g + blk * s[kb:kb + 1, :]
         h = _act(g, fs, act)
         h = (h * gwv[slot][:, 0:1]).astype(x.dtype)
         nkb = fs // QB
+        if bd2:
+            hbd[0:mp, 0:QB] = h[:, 0:QB]
+            hbd[mp:2 * mp, QB:2 * QB] = h[:, QB:2 * QB]
+            hb = hbd[...]
         for j in range(nch):
-            part = jnp.zeros((x.shape[0], f2), jnp.float32)
+            part = jnp.zeros((mp, f2), jnp.float32)
+            if bd2:
+                srow = k // QB + j * nkb
+                r = jnp.matmul(hb, wblock(w, k + j * fs, 2), preferred_element_type=jnp.float32)
+                part = part + r[0:mp] * s[srow:srow + 1, :]
+                part = part + r[mp:2 * mp] * s[srow + 1:srow + 2, :]
+                for kb in range(2, nkb):
+                    blk = jnp.matmul(h[:, kb * QB:(kb + 1) * QB], wblock(w, k + j * fs + kb * QB),
+                                     preferred_element_type=jnp.float32)
+                    part = part + blk * s[srow + kb:srow + kb + 1, :]
+                acc[:, j * f2:(j + 1) * f2] += part
+                continue
             for kb in range(nkb):
                 r0 = k + j * fs + kb * QB
                 blk = jnp.matmul(h[:, kb * QB:(kb + 1) * QB], w[r0:r0 + QB, :].astype(jnp.float8_e4m3fn),
@@ -195,14 +236,20 @@ def _kernel_packed(hit_ref, nhit_ref, x_ref, gw_hbm, w_hbm, s_hbm, out_ref, wv, 
     out_ref[...] = acc[...].astype(out_ref.dtype)
 
 
-def tp_dense_moe_packed(x, gw, W, S, hit, nhit, *, fs, slots=3, compute=True, act="silu", interpret=False):
+def tp_dense_moe_packed(x, gw, W, S, hit, nhit, *, fs, slots=3, compute=True, act="silu", bd2=False,
+                        interpret=False):
+    """bd2: two quant blocks per MXU pass (block-diagonal LHS); same output bits."""
     mp, k = x.shape
     e, rows, f2 = W.shape
     nch = (rows - k) // fs
+    bd2 = bool(bd2) and mp % 8 == 0 and (k // QB) % 2 == 0 and fs // QB >= 2
+    bd_scratch = [pltpu.VMEM((k // QB // 2, 2 * mp, 2 * QB), x.dtype),
+                  pltpu.VMEM((2 * mp, 2 * QB), x.dtype)] if bd2 else []
     n = nch * f2
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     vm = pl.BlockSpec(memory_space=pltpu.VMEM)
-    kern = functools.partial(_kernel_packed, slots=slots, fs=fs, k=k, nch=nch, compute=compute, act=act)
+    kern = functools.partial(_kernel_packed, slots=slots, fs=fs, k=k, nch=nch, compute=compute, act=act,
+                             bd2=bd2)
     extra = {"interpret": pltpu.InterpretParams()} if interpret else {}
     return pl.pallas_call(
         kern, **extra,
@@ -216,10 +263,11 @@ def tp_dense_moe_packed(x, gw, W, S, hit, nhit, *, fs, slots=3, compute=True, ac
                 pltpu.VMEM((slots, S.shape[1], f2), jnp.float32),
                 pltpu.VMEM((slots, mp, 128), jnp.float32),
                 pltpu.VMEM((mp, n), jnp.float32),
+                *bd_scratch,
                 pltpu.SemaphoreType.DMA((slots, 3)),
             ]),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=48 << 20),
-        name=f"tp_dense_moe_packed-e{e}-m{mp}-fs{fs}",
+        name=f"tp_dense_moe_packed{'_bd2' if bd2 else ''}-e{e}-m{mp}-fs{fs}",
     )(hit, nhit, x, gw, W, S)
 
 
