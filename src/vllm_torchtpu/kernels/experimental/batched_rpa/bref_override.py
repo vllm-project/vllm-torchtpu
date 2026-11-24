@@ -344,19 +344,11 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         page_size = self.cfgs.serve.page_size
         last_index = self.cfgs.serve.num_page_indices - 1
         for b in range(self.cfgs.batch_size):
-            if not self.cfgs.serve.lean_kv_fetch:
-                for i in range(self.cfgs.bkv_p_cache):
-                    p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
-                    sz = jnp.where(is_no_op, 0, sz)
-                    src_off = page_indices_ref[p_idx] * page_size
-                    pltpu.make_async_copy(
-                        kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
-                        vmem_dst.at[b, pl.ds(dst_off, sz)],
-                        sem,
-                    ).start()
-            elif self.cfgs.serve.compact_kv_schedule:
+            if self.cfgs.serve.compact_kv_schedule:
                 # Compact schedule: the lane-tile's first page-table index and
                 # token count; pages are full except the last nonempty one.
+                # Checked before lean_kv_fetch: the per-page fetch would read
+                # entries past the one this schedule keeps per lane-tile.
                 p0 = schedule_ref.dma_kv_cache[block_idx, b, 0, 0]
                 tokens = schedule_ref.dma_kv_cache[block_idx, b, 0, 2]
                 tokens = jnp.where(is_no_op, 0, tokens)
@@ -385,6 +377,16 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                         pl.when(tokens > lo * page_size)(
                             functools.partial(compact_pages, lo, hi)
                         )
+            elif not self.cfgs.serve.lean_kv_fetch:
+                for i in range(self.cfgs.bkv_p_cache):
+                    p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
+                    sz = jnp.where(is_no_op, 0, sz)
+                    src_off = page_indices_ref[p_idx] * page_size
+                    pltpu.make_async_copy(
+                        kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
+                        vmem_dst.at[b, pl.ds(dst_off, sz)],
+                        sem,
+                    ).start()
             else:
                 # Lean per-page fetch: a tile's cache pages are consecutive
                 # page-table entries landing at i * page_size, so only the
