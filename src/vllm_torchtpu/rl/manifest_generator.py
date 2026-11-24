@@ -382,6 +382,9 @@ def _make_to_hf_key(model: torch.nn.Module) -> Callable[[str], str]:
     inv_prefixes.sort(key=lambda pair: len(pair[0]), reverse=True)
 
     def _to_hf(key: str) -> str:
+        key = key.replace(".experts.routed_experts.", ".experts.")
+        if key.endswith(".experts.routed_experts"):
+            key = key[: -len(".routed_experts")]
         for new_pfx, orig_pfx in inv_prefixes:
             if key.startswith(new_pfx):
                 return orig_pfx + key[len(new_pfx) :]
