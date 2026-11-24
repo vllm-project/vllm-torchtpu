@@ -11,6 +11,7 @@ compared bit for bit on hardware by scripts/bench_qsa_rpa_decode.py
 """
 
 import functools
+import types
 
 import jax
 import jax.numpy as jnp
@@ -190,3 +191,145 @@ def test_fast_fetch_lowers_for_tpu7x(monkeypatch, offset):
         functools.partial(qsa_rpa.qsa_attention, max_query_len=4, **options), *specs
     )
     assert 'kernel_name = "RPAd' in text
+
+
+class _Ref:
+    """A ref stand-in that only records the index path a DMA is built from."""
+
+    shape = (1, 1, 1, 1, 1)
+
+    def __init__(self, path=()):
+        self.path = path
+
+    @property
+    def at(self):
+        return self
+
+    def __getitem__(self, index):
+        return _Ref(self.path + (index,))
+
+    def reshape(self, *shape):
+        return self
+
+
+class _Smem:
+    """Flat SMEM words that refuse a read past the end, as hardware would not."""
+
+    def __init__(self, values):
+        self.values = np.asarray(values, np.int32).reshape(-1)
+        self.reads = []
+
+    @property
+    def at(self):
+        return self
+
+    def __getitem__(self, pos):
+        pos = int(pos)
+        self.reads.append(pos)
+        if not 0 <= pos < self.values.size:
+            raise IndexError(f"SMEM read at {pos} of {self.values.size} words")
+        return jnp.int32(self.values[pos])
+
+
+def _bounds(index):
+    from jax.experimental import pallas as pl
+
+    if isinstance(index, pl.Slice):
+        return int(index.start), int(index.size)
+    return int(index)
+
+
+@pytest.mark.parametrize("compact,lean", [(True, False), (True, True), (False, False)])
+def test_cache_fetch_reads_only_the_schedule_it_has(monkeypatch, compact, lean):
+    """VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE keeps one KV-cache entry per
+    lane-tile. The HEAD_ALONG_SUBLANE fetch must take the compact path whether
+    or not lean_kv_fetch is on: the per-page path reads bkv_p_cache entries
+    per lane, past the end of the compact schedule. Without the compact
+    schedule the per-page path is unchanged."""
+    from vllm_torchtpu.kernels.experimental.batched_rpa import (
+        bref_override,
+        configs,
+        schedule,
+    )
+
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: TPU7X)
+    seqs, pages_per_seq, page = 6, 129, RATIO
+    cfgs = configs.RpaConfigs(
+        block=configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8),
+        model=configs.ModelConfigs(
+            num_q_heads=6, num_kv_heads=2, head_dim=WIDTH, mask_value=-1e30
+        ),
+        serve=configs.ServingConfigs(
+            num_seqs=seqs,
+            page_size=page,
+            total_q_tokens=seqs,
+            num_page_indices=seqs * pages_per_seq,
+            dtype_q=jnp.float32,
+            dtype_kv=jnp.float8_e4m3fn,
+            dtype_out=jnp.float32,
+            skip_kv_update=True,
+            lean_kv_fetch=lean,
+            compact_kv_schedule=compact,
+        ),
+        vmem_limit_bytes=64 * 1024 * 1024,
+        mode=configs.RpaCase.DECODE,
+    )
+    steps, lanes, pages = 3, cfgs.batch_size, cfgs.bkv_p_cache
+    entries = cfgs.kv_schedule_entries
+    assert entries == (1 if compact else pages) and pages > 1
+    # Lane b of the last step: tile starting at page-table entry 7 * b, b * 31
+    # tokens (lane 0 idle, the other lanes span several pages).
+    tokens = np.arange(lanes) * 31
+    p0 = np.arange(lanes) * 7
+    cache = np.zeros((steps, lanes, entries, 3), np.int32)
+    i = np.arange(entries)
+    cache[-1, :, :, 0] = p0[:, None] + i
+    cache[-1, :, :, 1] = i * page
+    cache[-1, :, :, 2] = (
+        tokens[:, None] if compact else np.clip(tokens[:, None] - i * page, 0, page)
+    )
+    dma_kv_cache = _Smem(cache)
+    page_table = _Smem(np.arange(seqs * pages_per_seq) * 3)
+    new_struct = schedule.HeadAlongSublaneDmaNew
+    sched = types.SimpleNamespace(
+        dma_kv_cache=schedule.SmemWrapper(dma_kv_cache, cache.shape),
+        dma_kv_new=schedule.SmemArrayOfStructs(
+            _Smem(np.zeros(steps * lanes * cfgs.bkv_p_new * new_struct.num_fields())),
+            (steps, lanes, cfgs.bkv_p_new),
+            new_struct,
+            new_struct.num_fields(),
+        ),
+    )
+    sched.get_dma_kv_cache = functools.partial(
+        schedule.RpaSchedule.get_dma_kv_cache, sched
+    )
+    copies = []
+
+    class _Copy:
+        def __init__(self, src, dst, sem):
+            if src.path[0] == "cache":
+                lane, offset = dst.path[-1]
+                copies.append((lane, _bounds(offset), _bounds(src.path[-1])))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(bref_override.pltpu, "make_async_copy", _Copy)
+    ref = types.SimpleNamespace(
+        cfgs=cfgs,
+        src_ref=(_Ref(("cache",)), _Ref(("new",)), sched, page_table),
+        sem_recvs=_Ref(("sem",)),
+        window_ref=_Ref(("window",)),
+    )
+    bref_override.KVBufferedRefHeadAlongSublane.copy_in(ref, steps - 1, 0, steps)
+
+    # Every cache-schedule read is an entry of the last step's lanes.
+    first = (steps - 1) * lanes * entries * 3
+    assert all(first <= pos < cache.size for pos in dma_kv_cache.reads)
+    want = []
+    for b in range(lanes):
+        for j in range(pages):
+            sz = int(np.clip(tokens[b] - j * page, 0, page))
+            p = min(p0[b] + j, seqs * pages_per_seq - 1)
+            want.append((b, (j * page, sz), (p * 3 * page, sz)))
+    assert copies == want
