@@ -975,6 +975,23 @@ def is_prefill_step(num_tokens: int, max_num_seqs: int) -> bool:
     return num_tokens > max_num_seqs * _SMALL_TILE_Q
 
 
+# Up to this many (token, score row) pairs, `_select_rows` replaces the gather:
+# 0.48 vs 0.75 us per layer at 8 tokens x 128 rows, 2.8 vs 0.66 us at 24 tokens
+# (MiniMax-M3.1 twin, j-ef2caca5 vs j-420b091e).
+_SELECT_ROWS_MAX = 1024
+
+
+def _select_rows(scores: jax.Array, row: jax.Array) -> jax.Array:
+    """``scores[row]`` as a masked sum over every row: one fused reduction at
+    decode sizes, where the gather is an op of fixed cost (0.75 us per layer
+    at 8 tokens, b1 twin j-f8934801). Summed as integer bits, so the one
+    selected value comes back exactly (NaN, -0.0 and -inf included)."""
+    hit = row[:, None, None] == jnp.arange(scores.shape[0], dtype=row.dtype)[:, None]
+    bits = jax.lax.bitcast_convert_type(scores, jnp.int32)
+    picked = jnp.sum(jnp.where(hit, bits[None], 0), axis=1, dtype=jnp.int32)
+    return jax.lax.bitcast_convert_type(picked, scores.dtype)
+
+
 def class_plan(
     index_q: jax.Array,
     index_cache: jax.Array,
@@ -1180,7 +1197,10 @@ def block_scores(
     pages = max(small.shape[1 if token_major else 0], plan.large_pages)
 
     def small_only():
-        rows = small[small_col] if token_major else small[:, small_col].T
+        if token_major and num_tokens * small.shape[0] <= _SELECT_ROWS_MAX:
+            rows = _select_rows(small, small_col)
+        else:
+            rows = small[small_col] if token_major else small[:, small_col].T
         return jnp.pad(rows, ((0, 0), (0, pages - rows.shape[1])))
 
     if max_large == 0:

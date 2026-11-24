@@ -277,3 +277,15 @@ def test_fp4_folded_lowers_for_tpu(tokens):
             .lower(lowering_platforms=("tpu",))
         )
     assert "tpu_custom_call" in lowered.as_text()
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 32])
+def test_select_rows_matches_gather_bit_for_bit(num_tokens):
+    rng = np.random.default_rng(num_tokens)
+    scores = rng.standard_normal((128, 256)).astype(np.float32)
+    for value in (np.nan, -np.inf, -0.0):
+        scores[rng.random(scores.shape) < 0.02] = value
+    row = jnp.asarray(rng.integers(0, 128, num_tokens), jnp.int32)
+    want = np.asarray(jnp.asarray(scores)[row])
+    got = np.asarray(msa_indexer._select_rows(jnp.asarray(scores), row))
+    np.testing.assert_array_equal(got.view(np.uint32), want.view(np.uint32))
