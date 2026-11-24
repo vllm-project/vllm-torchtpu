@@ -51,7 +51,9 @@ def _chunk(width: int) -> int:
     return min(width, _STREAM_CHUNK)
 
 
-def _vmem_words(rows, width, block_width, k, blocks, block_size, buffers, resident):
+def _vmem_words(
+    rows, width, block_width, k, blocks, block_size, buffers, resident, extra=0
+):
     # Resident rows keep whole score rows; streamed rows keep two chunks and
     # the chosen blocks' fetched keys.
     rows_words = (
@@ -65,18 +67,35 @@ def _vmem_words(rows, width, block_width, k, blocks, block_size, buffers, reside
         + blocks * block_size
         + k
         + _length_words(rows)
+        + extra
     )
 
 
-def _plan(rows, width, block_width, k, blocks, block_size):
+def _records_words(rows, k, table_words):
+    """VMEM of the record stage: page table, row requests, records, counts."""
+    lanes = plsc.get_sparse_core_info().num_lanes
+    return _length_words(table_words) + _length_words(rows) + k + lanes + lanes
+
+
+def _plan(rows, width, block_width, k, blocks, block_size, extra=0):
     """(resident, buffers): resident rows when they fit, double-buffered if room."""
     capacity = plsc.get_sparse_core_info().vmem_capacity_bytes
     sizes = (rows, width, block_width, k, blocks, block_size)
     for resident in (True, False):
         for buffers in (2, 1):
-            if 4 * _vmem_words(*sizes, buffers, resident) <= capacity:
+            if 4 * _vmem_words(*sizes, buffers, resident, extra) <= capacity:
                 return resident, buffers
     return None
+
+
+def records_fit(rows: int, width: int, k: int, block_size: int, table_words: int):
+    """Whether the record stage leaves `block_topk`'s VMEM plan unchanged."""
+    lanes = pltpu.get_tpu_info().num_lanes
+    blocks = default_blocks(k, plsc.get_sparse_core_info().num_lanes)
+    block_width = pl.cdiv(pl.cdiv(width, block_size), lanes) * lanes
+    sizes = (rows, width, block_width, k, blocks, block_size)
+    extra = _records_words(rows, k, table_words)
+    return _plan(*sizes) == _plan(*sizes, extra=extra)
 
 
 def is_supported(rows: int, width: int, k: int, block_size: int) -> bool:
@@ -106,8 +125,9 @@ def block_topk(
     k: int,
     block_size: int,
     publish: int = 0,
+    records: tuple[jax.Array, jax.Array, jax.Array, int] | None = None,
     scheduling_group_id: int | None = None,
-) -> jax.Array | tuple[jax.Array, jax.Array]:
+) -> jax.Array | tuple[jax.Array, ...]:
     """Return ascending top-k key IDs per row, padded with -1.
 
     Args:
@@ -118,6 +138,13 @@ def block_topk(
         publish: Also return the IDs of the `publish` highest block maxima,
             the newest visible block forced first; ascending, -1 padded, and
             ties keep the lowest IDs.
+        records: Also return each row's physical records and valid count:
+            (page table INT32 [requests, columns], row requests INT32
+            [rows], visible INT32 [1], page size). A record is
+            `table[request, id // page] * page + id % page`, -1 for -1 IDs;
+            with `visible` nonzero the IDs are the row's visible keys
+            `0..length-1` instead of the selection. Counts are [rows, lanes],
+            each lane the row's count. `records_fit` bounds the table.
         scheduling_group_id: Optional XLA scheduling-group ID.
     """
     rows, width = scores.shape
@@ -136,6 +163,18 @@ def block_topk(
     lengths = jnp.clip(lengths.astype(jnp.int32), 0, width)
     # 1-D: a [rows, lanes] buffer pads each row to 128 lanes in VMEM.
     token_lengths = jnp.pad(lengths, (0, _length_words(rows) - rows))
+    if records is not None:
+        table, row_requests, visible, page_size = records
+        columns = table.shape[1]
+        if (
+            table.dtype != jnp.int32
+            or row_requests.shape != (rows,)
+            or visible.shape != (1,)
+            or page_size & (page_size - 1)
+            or not records_fit(rows, width, k, block_size, table.size)
+        ):
+            raise ValueError("Unsupported block top-k records")
+        page_shift = page_size.bit_length() - 1
     plan = _plan(rows, width, block_width, k, blocks, block_size)
     assert plan is not None
     resident, buffers = plan
@@ -150,6 +189,21 @@ def block_topk(
     out_types = (jax.ShapeDtypeStruct((rows, k), jnp.int32),)
     if publish:
         out_types += (jax.ShapeDtypeStruct((rows, publish), jnp.int32),)
+    record_scratch = {}
+    if records is not None:
+        out_types += (
+            jax.ShapeDtypeStruct((rows, k), jnp.int32),
+            jax.ShapeDtypeStruct((rows, lanes), jnp.int32),
+        )
+        record_scratch = dict(
+            table_words=pltpu.VMEM((_length_words(table.size),), jnp.int32),
+            requests=pltpu.VMEM((_length_words(rows),), jnp.int32),
+            record_row=pltpu.VMEM((k,), jnp.int32),
+            count_row=pltpu.VMEM((lanes,), jnp.int32),
+            visible_lanes=pltpu.VMEM((lanes,), jnp.int32),
+            record_sems=pltpu.SemaphoreType.DMA((2,)),
+            load_sems=pltpu.SemaphoreType.DMA((3,)),
+        )
 
     @pl.kernel(
         out_type=out_types,
@@ -170,6 +224,7 @@ def block_topk(
             length_sem=pltpu.SemaphoreType.DMA,
             publish_sem=pltpu.SemaphoreType.DMA,
             fetch_sem=pltpu.SemaphoreType.DMA,
+            **record_scratch,
         ),
         compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
         name="block_topk",
@@ -177,8 +232,7 @@ def block_topk(
     def kernel(
         score_ref,
         length_ref,
-        out_ref,
-        *publish_refs,
+        *refs,
         score_buffers,
         maxima,
         histogram,
@@ -192,7 +246,13 @@ def block_topk(
         length_sem,
         publish_sem,
         fetch_sem,
+        **record_refs,
     ):
+        if records is not None:
+            table_ref, request_ref, visible_ref, *refs = refs
+        out_ref, *refs = refs
+        publish_refs = refs[:1] if publish else ()
+        record_out, count_out = refs[len(publish_refs) :] or (None, None)
         radix = Radix(histogram, lanes)
         strided = [radix.lane_ids * block_size + j for j in range(block_size)]
         first = jax.lax.axis_index("core") * mesh.num_subcores
@@ -271,7 +331,64 @@ def block_topk(
 
         length_copy = pltpu.async_copy(length_ref, limits, length_sem)
         pl.when(first < rows)(lambda: start_row(first, 0))
+        if records is not None:
+            loads = [
+                pltpu.async_copy(src, record_refs[dst], record_refs["load_sems"].at[i])
+                for i, (src, dst) in enumerate(
+                    (
+                        (table_ref, "table_words"),
+                        (request_ref, "requests"),
+                        (visible_ref, "visible_lanes"),
+                    )
+                )
+            ]
         length_copy.wait()
+        if records is not None:
+            for load in loads:
+                load.wait()
+
+        def record_copies(row_id):
+            return (
+                pltpu.make_async_copy(
+                    record_refs["record_row"],
+                    record_out.at[row_id],
+                    record_refs["record_sems"].at[0],
+                ),
+                pltpu.make_async_copy(
+                    record_refs["count_row"],
+                    count_out.at[row_id],
+                    record_refs["record_sems"].at[1],
+                ),
+            )
+
+        def emit_records(row_id, tokens):
+            """Physical records of the row's IDs, as `prepare_main_records`."""
+            request = plsc.load_gather(
+                record_refs["requests"], [jnp.full(lanes, row_id, jnp.int32)]
+            )
+            visible = record_refs["visible_lanes"][...] != 0
+            base = request * columns
+
+            @plsc.parallel_loop(
+                0, k // lanes, carry=jnp.zeros(lanes, jnp.int32), unroll=4
+            )
+            def lookup(i, count):
+                positions = radix.positions(i)
+                selected = output[pl.ds(i * lanes, lanes)]
+                ids = jnp.where(
+                    visible, jnp.where(positions < tokens, positions, -1), selected
+                )
+                valid = ids >= 0
+                logical = jnp.maximum(ids, 0)
+                page = jnp.minimum(logical >> page_shift, columns - 1)
+                physical = plsc.load_gather(record_refs["table_words"], [base + page])
+                record = (physical << page_shift) + (logical & (page_size - 1))
+                record_refs["record_row"][pl.ds(i * lanes, lanes)] = jnp.where(
+                    valid, record, -1
+                )
+                return count + plsc.all_reduce_population_count(valid)
+
+            record_refs["count_row"][...] = lookup
 
         @pl.loop(first, rows, step=stride)
         def row(row_id):
@@ -366,6 +483,13 @@ def block_topk(
                 ).wait()
 
             radix.emit(keys, key_chunks, k, selection, output, lambda i: owners(i)[1])
+            if records is not None:
+                pl.when(row_id > first)(
+                    lambda: [c.wait() for c in record_copies(row_id - stride)]
+                )
+                emit_records(row_id, tokens)
+                for copy in record_copies(row_id):
+                    copy.start()
             pltpu.async_copy(output, out_ref.at[row_id], output_sem)
             if buffers == 1:
                 pl.when(row_id + stride < rows)(lambda: start_row(row_id + stride, 0))
@@ -374,8 +498,18 @@ def block_topk(
         def drain():
             last_row = first + ((rows - 1 - first) // stride) * stride
             pltpu.make_async_copy(output, out_ref.at[last_row], output_sem).wait()
+            if records is not None:
+                for copy in record_copies(last_row):
+                    copy.wait()
 
-    result = kernel(scores, token_lengths)
+    inputs = (scores, token_lengths)
+    if records is not None:
+        inputs += (
+            jnp.pad(table.reshape(-1), (0, _length_words(table.size) - table.size)),
+            jnp.pad(row_requests, (0, _length_words(rows) - rows)),
+            jnp.broadcast_to(visible, (lanes,)),
+        )
+    result = kernel(*inputs)
     if scheduling_group_id is not None:
         result = jax.tree.map(
             lambda x: xla_metadata.set_xla_metadata(
@@ -383,4 +517,6 @@ def block_topk(
             ),
             result,
         )
+    if records is not None:
+        return result
     return result if publish else result[0]
