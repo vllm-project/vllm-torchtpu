@@ -64,7 +64,7 @@ _SP_ENV = {
     "TPU_MINIMAX_M3_SP_QRS": False,
     "TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS": 2048,
     "TPU_MINIMAX_M3_SP_HIER_RS": False,
-    "TPU_MINIMAX_M3_SP_HIER_RS_MIN_TOKENS": 1024,
+    "TPU_MINIMAX_M3_SP_HIER_RS_MIN_TOKENS": 8192,
 }
 # The production config this port targets.
 _TARGET = dict(
