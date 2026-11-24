@@ -63,6 +63,7 @@ class TestCiGate(unittest.TestCase):
         statuses = [
             build(11, "success"),
             step(11, "unit-tests-cpu-pr", "success"),
+            step(11, "v7x-unit-tests-general-pr", "success"),
             build(10, "failure"),
             step(10, "perf-nightly-qwen3", "failure"),
             step(10, "v7x-unit-tests-general-nightly", "success"),
@@ -75,6 +76,7 @@ class TestCiGate(unittest.TestCase):
         statuses = [
             build(10, "success"),
             step(10, "unit-tests-cpu-pr", "success"),
+            step(10, "v7x-unit-tests-general-pr", "success"),
             step(10, "e2e-pr", "success"),
         ]
         url, reason = ci_gate.check(SHA, statuses)
