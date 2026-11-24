@@ -49,11 +49,13 @@ logger = init_logger(__name__)
 RING: int = int(envs.TPU_MOE_ROUTE_TRACE)
 ENABLED: bool = RING > 0
 EVERY: int = max(1, int(envs.TPU_MOE_ROUTE_TRACE_EVERY))
+MIN_TOKENS: int = int(envs.TPU_MOE_ROUTE_TRACE_MIN_TOKENS)
 MAX_ROWS = 128
 
 _ring: torch.Tensor | None = None
 _ctr: torch.Tensor | None = None
 _tok: torch.Tensor | None = None
+_pad: torch.Tensor | None = None
 _num_experts: int | None = None
 _names: list[str] = []
 _ep_size = 1
@@ -70,7 +72,7 @@ def _is_target_layer(name: str) -> bool:
 
 def register(layer: Any) -> None:
     """Give ``layer`` a ring row. Call from ``process_weights_after_loading``."""
-    global _ring, _ctr, _tok, _num_experts, _ep_size
+    global _ring, _ctr, _tok, _pad, _num_experts, _ep_size
     if not ENABLED or getattr(layer, "_route_trace_row", None) is not None:
         return
     name = str(getattr(layer, "layer_name", "") or "")
@@ -85,6 +87,7 @@ def register(layer: Any) -> None:
         )
         _ctr = torch.zeros((1,), dtype=torch.int32, device=device)
         _tok = torch.zeros((RING,), dtype=torch.int32, device=device)
+        _pad = torch.zeros((RING,), dtype=torch.int32, device=device)
         moe_config = getattr(layer, "moe_config", None)
         if moe_config is not None and moe_config.moe_parallel_config.use_ep:
             _ep_size = int(moe_config.ep_size)
@@ -96,11 +99,13 @@ def register(layer: Any) -> None:
     _names.append(name)
     if len(_names) == 1:
         logger.info(
-            "[moe-route-trace] TPU_MOE_ROUTE_TRACE=%d on: E=%d ep=%d every=%d",
+            "[moe-route-trace] TPU_MOE_ROUTE_TRACE=%d on: E=%d ep=%d every=%d "
+            "min_tokens=%d",
             RING,
             num_experts,
             _ep_size,
             EVERY,
+            MIN_TOKENS,
         )
 
 
@@ -110,6 +115,9 @@ def record(layer: Any, topk_ids: torch.Tensor) -> None:
     if row is None or _ring is None:
         return
     assert _ctr is not None and _tok is not None and _num_experts is not None
+    if topk_ids.shape[0] < MIN_TOKENS:
+        # Static per bucket: smaller buckets compile without the trace ops.
+        return
     ids = topk_ids.flatten().to(torch.int32)
     counts = torch.zeros(_num_experts, dtype=torch.int32, device=ids.device)
     counts = counts.index_add(0, ids.to(torch.int64), torch.ones_like(ids))
@@ -121,6 +129,15 @@ def record(layer: Any, topk_ids: torch.Tensor) -> None:
             (1,), topk_ids.shape[0], dtype=torch.int32, device=ids.device
         )
         _tok.index_copy_(0, slot, tokens)
+        if MIN_TOKENS and _pad is not None:
+            from vllm_torchtpu.layers.adapter import token_padding
+
+            if token_padding._padding_state is not None:
+                mask = token_padding._padding_state.get_local_padding_mask(
+                    topk_ids.shape[0]
+                )
+                npad = mask.to(torch.int32).sum().view(1)
+                _pad.index_copy_(0, slot, npad)
     _ring[row].index_copy_(0, slot, counts.view(1, _num_experts))
 
 
@@ -146,6 +163,22 @@ def dump() -> None:
     ring = _ring.cpu().numpy()
     tok = _tok.cpu().numpy()
     n = len(_names)
+    if MIN_TOKENS:
+        pad = _pad.cpu().numpy() if _pad is not None else None
+        for s in range(step - new, step):
+            slot = s % RING
+            npad = int(pad[slot]) if pad is not None else -1
+            for r in range(n):
+                logger.info(
+                    "[moe-route-trace] s=%d T=%d pad=%d l=%d c=%s",
+                    s,
+                    int(tok[slot]),
+                    npad,
+                    r,
+                    ",".join(str(int(c)) for c in ring[r, slot]),
+                )
+        _last_step = step
+        return
     for s in range(step - new, step):
         slot = s % RING
         fields = []

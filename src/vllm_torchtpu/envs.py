@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     TPU_MOE_FLAT_ROUTING_MIN_TOKENS: int = 0
     TPU_MOE_ROUTE_TRACE: int = 0
     TPU_MOE_ROUTE_TRACE_EVERY: int = 8192
+    TPU_MOE_ROUTE_TRACE_MIN_TOKENS: int = 0
     VLLM_TPU_MOE_REDUNDANT_EXPERTS: int = 0
     TPU_MOE_REPLICA_ASSIGN_REFINE: int = 0
     TPU_MOE_NVFP4_SKIP_PADDED: bool = False
@@ -920,6 +921,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_ROUTE_TRACE": env_nonnegative_int("TPU_MOE_ROUTE_TRACE", 0),
     "TPU_MOE_ROUTE_TRACE_EVERY": env_nonnegative_int(
         "TPU_MOE_ROUTE_TRACE_EVERY", 8192
+    ),
+    # Trace only forward steps of at least this many (bucket) tokens, e.g.
+    # prefill chunks, and log them one line per layer with dense counts and
+    # the step's padded-row count. 0 = every step, one line per step.
+    "TPU_MOE_ROUTE_TRACE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MOE_ROUTE_TRACE_MIN_TOKENS", 0
     ),
     # NVFP4 GMM MoE: give padded rows of a token bucket zero routing weights
     # (token_padding mask), so TPU_MOE_SKIP_PADDED_TOKENS drops them from the
