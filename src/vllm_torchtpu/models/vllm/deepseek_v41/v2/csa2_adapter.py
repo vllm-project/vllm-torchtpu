@@ -353,7 +353,7 @@ def _select_gather_attend(
         if pending is not None:
             owners = attend(owners, start - pending[1].shape[0], *pending)
         if following is not None:
-            # The gather and the pipeline's next step are issued after it.
+            # The gather and the next tile's scoring are issued after it.
             records, following, owners = jax.lax.optimization_barrier(
                 (records, following, owners)
             )

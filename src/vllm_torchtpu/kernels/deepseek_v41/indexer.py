@@ -66,10 +66,10 @@ def pipeline_score_topk_bounded(
     completion. A group admits no other work into that window, so a writer
     that starts SparseCore work of its own runs without groups.
     ``write(tile, selected, output, following)`` returns ``(output,
-    following)``: ``following`` is the input of the pipeline's next step,
-    the next tile's prepared scoring or the last tile's scores (None at the
-    end), and work the writer gates it on is issued before that step. Up to
-    ``MAX_UNROLLED_TILES``, ``tile`` is a Python int.
+    following)``: ``following`` is the next tile's prepared scoring input
+    (None if no scoring follows), and work the writer gates it on is issued
+    before that scoring. Up to ``MAX_UNROLLED_TILES``, ``tile`` is a Python
+    int.
     """
     if num_tiles < 1:
         raise ValueError("The score/top-k pipeline requires at least one tile")
@@ -107,13 +107,19 @@ def pipeline_score_topk_bounded(
             following = score(prepared, group)
             previous = select(jnp.int32(tile), current, group)
             current = following
-        if previous is not None:
-            previous, current, output = lax.optimization_barrier(
-                (previous, current, output)
-            )
-            output, current = write(num_tiles - 2, previous, output, current)
         last = num_tiles - 1
+        if previous is None:
+            return write(last, select(jnp.int32(last), current, None), output, None)[0]
+        previous, current, output = lax.optimization_barrier(
+            (previous, current, output)
+        )
+        # The last selection heads the serial tail; the preceding write, which
+        # no scoring is left to overlap, waits for it.
         selected = select(jnp.int32(last), current, None)
+        previous, output, selected = lax.optimization_barrier(
+            (previous, output, selected)
+        )
+        output, _ = write(last - 1, previous, output, None)
         return write(last, selected, output, None)[0]
 
 
