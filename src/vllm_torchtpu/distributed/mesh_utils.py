@@ -99,7 +99,7 @@ def _collect_rank_to_device_id(
     rank_to_device_id: dict[int, int] = {}
     for item in gathered:
         if item is None:
-            raise RuntimeError("CP device id gather returned an empty entry.")
+            raise RuntimeError("Group device id gather returned an empty entry.")
         rank, gathered_device_id = item
         rank_to_device_id[int(rank)] = int(gathered_device_id)
     return rank_to_device_id
