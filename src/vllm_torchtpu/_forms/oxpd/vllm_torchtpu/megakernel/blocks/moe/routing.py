@@ -25,6 +25,7 @@ from jax.experimental.pallas import tpu as pltpu
 from .context import MoEEmit
 from .dedup import dedup_ecopy, dedup_local, dedup_vec
 from .ring import fetch_e, fetch_loop
+from .rowbucket import rb_tables
 from .topk import route_topk
 
 
@@ -65,10 +66,17 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     MROW = E // 128
     with sc("route_topk", 2):
         route_topk(m, choice, p8, VEC, slot_ec, NCP, MROW)
+        if mp.RB:
+            rb_tables(m)
     with sc("route_dma", 2):
         cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
         cp.start()
+        if mp.RB:
+            cp_rb = pltpu.make_async_copy(scr["rbcv"], scr["rbcs"], scr["rbc_sem"])
+            cp_rb.start()
         cp.wait()
+        if mp.RB:
+            cp_rb.wait()
     stamp = l_idx + 1
     n_tot: Any = jnp.int32(0)
     n_hit: Any = jnp.int32(0)
