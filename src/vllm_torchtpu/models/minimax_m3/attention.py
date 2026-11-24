@@ -48,7 +48,7 @@ from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_sharded_op,
 )
 from vllm_torchtpu.models.minimax_m3.ops.qk_norm_rope import get_qk_norm_rope_op
-from vllm_torchtpu.models.minimax_m3.step_halves import split_metadata
+from vllm_torchtpu.models.minimax_m3.step_halves import split_metadata, zero_of
 
 
 class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
@@ -287,12 +287,6 @@ class StepHalves:
         return self._metadata[id(md)][2 if half is None else half]
 
 
-def _zero_of(dep: torch.Tensor) -> torch.Tensor:
-    """An exact f32 zero [1, 1] computed from ``dep`` (a data dependence)."""
-    x = dep[:1, :1].float()
-    return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0) * 0
-
-
 def _step_rows(pieces: list[torch.Tensor]) -> torch.Tensor:
     """Rows of the all-gathered pieces (piece i: every rank's i-th row block
     of its shard) back in step order."""
@@ -518,7 +512,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             # The caches are written in place: this call's writes must follow
             # the reads of the call that produced `after` (else XLA copies
             # the caches).
-            qkv = qkv + _zero_of(after).to(qkv.dtype)
+            qkv = qkv + zero_of(after).to(qkv.dtype)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
             positions,

@@ -15,6 +15,8 @@
 
 import dataclasses
 
+import torch
+
 
 def split_metadata[M](md: M, split: int) -> tuple[M, M, M]:
     """`md` (an AttentionMetadata: seq_lens, query_start_loc and init=False CPU
@@ -49,3 +51,10 @@ def split_metadata[M](md: M, split: int) -> tuple[M, M, M]:
         part.seq_lens_cpu = None
         out.append(part)
     return out[0], out[1], md
+
+
+def zero_of(dep: torch.Tensor) -> torch.Tensor:
+    """An exact f32 zero [1, 1] computed from ``dep`` (a data dependence).
+    Subtract it to keep a value's bits (x - 0 keeps the sign of -0)."""
+    x = dep[:1, :1].float()
+    return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0) * 0

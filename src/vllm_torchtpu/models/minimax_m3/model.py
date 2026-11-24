@@ -57,6 +57,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse, sp_norm
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.ops.sp_norm import get_add_norm_quant_op
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
+from vllm_torchtpu.models.minimax_m3.step_halves import zero_of
 
 logger = init_logger(__name__)
 
@@ -306,14 +307,26 @@ class MiniMaxM3DecoderLayer(nn.Module):
         keys) before the second, and each half's all-to-all + o_proj starts
         when its attention is done, under the other half's attention."""
         o_proj = self.self_attn.o_proj
-        out, attn = [], None
+        attns: list[torch.Tensor] = []
         for i, x in enumerate(rows):
             # The second half's cache writes follow the first half's reads.
-            attn = self.self_attn(
-                positions, x, project=False, half=(halves, i), after=attn
+            attns.append(
+                self.self_attn(
+                    positions,
+                    x,
+                    project=False,
+                    half=(halves, i),
+                    after=attns[-1] if attns else None,
+                )
             )
-            out.append(sp_o_proj.sp_o_proj(o_proj, attn))
-        return torch.cat(out)
+        # The first half's o_proj follows the second half's attention, so its
+        # all-to-all lands under that attention instead of before it.
+        return torch.cat(
+            [
+                sp_o_proj.sp_o_proj(o_proj, attns[0], after=attns[1]),
+                sp_o_proj.sp_o_proj(o_proj, attns[1]),
+            ]
+        )
 
     def _ffn_sp(
         self, shard: torch.Tensor, update: torch.Tensor | None, halves: bool = False

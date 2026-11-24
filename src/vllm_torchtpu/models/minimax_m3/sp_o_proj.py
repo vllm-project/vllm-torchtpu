@@ -36,6 +36,7 @@ from vllm.model_executor.utils import replace_parameter
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed import pallas_all_reduce
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.models.minimax_m3.step_halves import zero_of
 
 # Set on the o_proj modules whose quant method prepares the SP operands, and
 # once prepared.
@@ -201,13 +202,20 @@ _o_proj_e4m3_op.register_fake(
 )
 
 
-def sp_o_proj(o_proj: nn.Module, attn: torch.Tensor, pieces: int = 1) -> torch.Tensor:
+def sp_o_proj(
+    o_proj: nn.Module,
+    attn: torch.Tensor,
+    pieces: int = 1,
+    after: torch.Tensor | None = None,
+) -> torch.Tensor:
     """o_proj(attn) summed over TP, for this rank's row shard: ``attn`` is
     this rank's heads for all T rows, bf16 [T, K/TP]; returns [T/TP, N].
     TPU_MINIMAX_M3_SP_A2A_E4M3 sends the heads as e4m3 rows (power-of-two
     row scales) and contracts e4m3 x e4m3, one all-to-all and o_proj per
     row piece of the shard (``pieces``), so a piece's o_proj can run while
-    the next piece crosses; the bf16 path ignores ``pieces``."""
+    the next piece crosses; the bf16 path ignores ``pieces``. The projection
+    of the received rows runs after ``after`` is computed (a data
+    dependence), so the all-to-all can cross under the work producing it."""
     tp = get_tp_group().world_size
     rows, k = attn.shape
     w = _full_weight(o_proj, tp)
@@ -224,11 +232,15 @@ def sp_o_proj(o_proj: nn.Module, attn: torch.Tensor, pieces: int = 1) -> torch.T
             piece_rows = qi.shape[1]
             qi = order(all_to_all_rows(qi.reshape(-1, k)).view(tp, piece_rows, k))
             ri = order(all_to_all_rows(ri.reshape(-1, 1)).view(tp, piece_rows, 1))
+            if after is not None:
+                ri = ri - zero_of(after)
             # The weight is the op's first reader of o_proj's parameters, as in
             # the plain trace (placeholders follow first use; shape_variants
             # compares).
             out.append(_o_proj_e4m3_op(qi, ri, w, o_proj.weight_scale))
         return out[0] if pieces == 1 else torch.cat(out)
     heads = order(all_to_all_rows(attn).view(tp, rows // tp, k))
+    if after is not None:
+        heads = heads - zero_of(after).to(heads.dtype)
     weight = w.to(torch.bfloat16) * o_proj.weight_scale.to(torch.bfloat16)
     return torch.einsum("eti,eio->to", heads, weight)
