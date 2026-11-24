@@ -197,6 +197,18 @@ KV_LAYOUT_BY_VLLM_LAYOUT: dict[VllmKVCacheLayout, batched_rpa_configs.KVLayout] 
 }
 
 
+def page_table_entry_bytes(vllm_config: VllmConfig) -> int:
+    """SMEM bytes per block-table entry: 2 for MiniMax M3 with
+    TPU_MINIMAX_M3_PT16 (its MSA kernels read 16-bit page ids,
+    `models/minimax_m3/kernels/page_table.py`), else 4."""
+    if not envs.TPU_MINIMAX_M3_PT16:
+        return 4
+    from vllm_torchtpu.models.minimax_m3 import _ARCHITECTURES
+
+    architectures = vllm_config.model_config.architectures or ()
+    return 2 if any(arch in _ARCHITECTURES for arch in architectures) else 4
+
+
 def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
     parallel = vllm_config.parallel_config
     if parallel.prefill_context_parallel_size > 1:
@@ -204,7 +216,11 @@ def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
         # bound below applies to the non-PCP batched attention page table.
         return 1
     max_num_page_per_req = (
-        1024 * 1024 // 2 // vllm_config.scheduler_config.max_num_seqs // 4
+        1024
+        * 1024
+        // 2
+        // vllm_config.scheduler_config.max_num_seqs
+        // page_table_entry_bytes(vllm_config)
     )
     # DCP partitions KV pages across ranks. Keep the SMEM page-table bound
     # using the maximum rank-local context length, rounded up for a tail.
@@ -696,11 +712,12 @@ class PallasAttentionBackend(AttentionBackend):
         return PallasAttentionBackend.get_max_num_seqs_for_pages(num_page_per_req)
 
     @staticmethod
-    def get_max_num_seqs_for_pages(pages_per_req: int) -> int:
-        """Budget the page table actually prefetched into SMEM."""
+    def get_max_num_seqs_for_pages(pages_per_req: int, entry_bytes: int = 4) -> int:
+        """Budget the page table actually prefetched into SMEM, of
+        `entry_bytes` per entry (`page_table_entry_bytes`)."""
         if pages_per_req <= 0:
             raise ValueError("pages_per_req must be positive")
-        return 1024 * 1024 // 2 // pages_per_req // 4
+        return 1024 * 1024 // 2 // pages_per_req // entry_bytes
 
     # TPU has limited SREGs (scalar registers), if page_size is too small, we
     # can spill SREGs easily which leads to bad performance. The strategy we
