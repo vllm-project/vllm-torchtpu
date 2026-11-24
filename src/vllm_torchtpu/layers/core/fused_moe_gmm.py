@@ -28,6 +28,10 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     gmm_v2,
     gmm_v2_mlp,
 )
+from vllm_torchtpu.kernels.megablox.moe_decode_dispatch import (
+    MAX_ROUTES as _DECODE_DISPATCH_MAX_ROUTES,
+)
+from vllm_torchtpu.kernels.megablox.moe_decode_dispatch import decode_dispatch
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -548,7 +552,7 @@ def computed_rows(
     )
 
 
-def moe_gmm(
+def grouped_expert_mlp(
     x: jax.Array,
     w1: jax.Array,
     w1_scale: jax.Array | None,
@@ -557,29 +561,13 @@ def moe_gmm(
     w2_scale: jax.Array | None,
     w2_bias: jax.Array | None,
     group_sizes: jax.Array,
-    argsort_revert_indices: jax.Array,
-    topk_weights_flat: jax.Array,
-    valid_mask_flat: jax.Array,
-    token_indices_sorted: jax.Array,
     *,
     activation: str,
-    num_tokens: int,
-    topk: int,
-    use_ep: bool,
-    use_sparse_core: bool,
-    onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
-    """Run grouped GEMM for routed tokens and reduce back to tokens.
-
-    The valid-mask gating below is a no-op for non-EP runs (mask is all
-    True) and keeps the single code path uniform for both EP and non-EP.
-    EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
-    """
+    """Both grouped GEMMs (gate_up with the fused activation, then down) over
+    expert-sorted rows `x`; rows past ``group_sizes.sum()`` are not written."""
     group_offset = jnp.array([0], dtype=jnp.int32)
-
-    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
-    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
     if (
         _is_fp4_weight(w1)
@@ -630,6 +618,51 @@ def moe_gmm(
             preferred_element_type=x.dtype,
             rhs_quant_dtype=rhs_quant_dtype,
         )
+    return gmm2_res
+
+
+def moe_gmm(
+    x: jax.Array,
+    w1: jax.Array,
+    w1_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2: jax.Array,
+    w2_scale: jax.Array | None,
+    w2_bias: jax.Array | None,
+    group_sizes: jax.Array,
+    argsort_revert_indices: jax.Array,
+    topk_weights_flat: jax.Array,
+    valid_mask_flat: jax.Array,
+    token_indices_sorted: jax.Array,
+    *,
+    activation: str,
+    num_tokens: int,
+    topk: int,
+    use_ep: bool,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int = 0,
+    rhs_quant_dtype: jnp.dtype | None = None,
+) -> jax.Array:
+    """Run grouped GEMM for routed tokens and reduce back to tokens.
+
+    The valid-mask gating below is a no-op for non-EP runs (mask is all
+    True) and keeps the single code path uniform for both EP and non-EP.
+    EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
+    """
+    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
+    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
+    gmm2_res = grouped_expert_mlp(
+        x,
+        w1,
+        w1_scale,
+        w1_bias,
+        w2,
+        w2_scale,
+        w2_bias,
+        group_sizes,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
     use_local_ragged_combine = (
@@ -752,6 +785,32 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
+def _uses_decode_dispatch(
+    hidden_states: jax.Array,
+    topk_weights: jax.Array,
+    *,
+    num_experts: int,
+    use_ep: bool,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
+) -> bool:
+    """Whether `decode_dispatch` replaces `prepare_routed_gmm_inputs` and the
+    one-hot combine metadata: the flat-route one-hot EP path, bf16 operands,
+    and every route on one row of lanes."""
+    num_tokens, topk = topk_weights.shape
+    return (
+        use_ep
+        and use_sparse_core
+        and 0 < num_tokens <= _FLAT_ONEHOT_MAX_TOKENS
+        and num_tokens * topk <= onehot_moe_permute_threshold
+        and num_tokens * topk <= _DECODE_DISPATCH_MAX_ROUTES
+        and num_experts + 1 < _DECODE_DISPATCH_MAX_ROUTES
+        and envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() != "on"
+        and hidden_states.dtype == jnp.bfloat16
+        and topk_weights.dtype == jnp.bfloat16
+    )
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -860,6 +919,39 @@ def fused_moe_func(
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
+
+    if _uses_decode_dispatch(
+        hidden_states,
+        topk_weights,
+        num_experts=w1.shape[0],
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+    ):
+        x, group_sizes, combine, computed = decode_dispatch(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            num_experts=w1.shape[0],
+            skip_padded_tokens=skip_padded_tokens,
+        )
+        x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+        gmm2_res = grouped_expert_mlp(
+            x,
+            w1,
+            w1_scale,
+            w1_bias,
+            w2,
+            w2_scale,
+            w2_bias,
+            group_sizes,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+        # As moe_gmm's one-hot combine: rows the GMM did not write are zeroed.
+        gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
+        x = (combine @ gmm2_res).astype(hidden_states.dtype)
+        return x[:num_tokens, :hidden_size]
 
     (
         x,

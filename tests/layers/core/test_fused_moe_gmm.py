@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for the local-routing fused MoE GMM wrapper."""
 
+import functools
 import types
 from unittest.mock import patch
 
@@ -1483,4 +1484,82 @@ def test_prepare_routed_counting_sort_env_gate_restores_sorts(
     num_sorts = _count_primitive(jaxpr.jaxpr, "sort")
     assert num_sorts == expected_sorts, (
         f"Expected {expected_sorts} comparison sort ops, got {num_sorts}"
+    )
+
+
+def _fake_grouped_gmm(
+    lhs,
+    rhs,
+    rhs_scale,
+    rhs_bias,
+    group_sizes,
+    group_offset,
+    zero_initialize=False,
+    fuse_act=None,
+    preferred_element_type=None,
+    rhs_quant_dtype=None,
+):
+    """Per-row expert matmul; rows past ``group_sizes.sum()`` are NaN, as
+    unwritten GMM rows may be."""
+    ends = jnp.cumsum(group_sizes)
+    row = jnp.arange(lhs.shape[0])
+    group = jnp.minimum(jnp.sum(row[:, None] >= ends, axis=1), rhs.shape[0] - 1)
+    out = jnp.einsum(
+        "mk,mkn->mn", lhs.astype(jnp.float32), rhs[group].astype(jnp.float32)
+    )
+    out = jnp.where((row < ends[-1])[:, None], out, jnp.nan)
+    return out.astype(preferred_element_type or lhs.dtype)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 24])
+def test_fused_moe_decode_dispatch_matches_onehot_path(monkeypatch, num_tokens):
+    """The decode dispatch kernel path of fused_moe_func gives the one-hot
+    path's bits, including NaN rows past the GMM's computed prefix."""
+    from vllm_torchtpu.kernels.megablox import moe_decode_dispatch
+
+    num_experts, topk, hidden, inter = 16, 4, 128, 64
+    rng = np.random.default_rng(num_tokens)
+    hidden_states = jnp.asarray(rng.standard_normal((num_tokens, hidden)), jnp.bfloat16)
+    w1 = jnp.asarray(
+        rng.standard_normal((num_experts, hidden, 2 * inter)) / 10, jnp.bfloat16
+    )
+    w2 = jnp.asarray(
+        rng.standard_normal((num_experts, inter, hidden)) / 10, jnp.bfloat16
+    )
+    ids = jnp.asarray(rng.integers(0, 8 * num_experts, (num_tokens, topk)), jnp.int32)
+    weights = rng.random((num_tokens, topk), dtype=np.float32)
+    weights[rng.random((num_tokens, topk)) < 0.2] = 0
+    weights = jnp.asarray(weights, jnp.bfloat16)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _fake_grouped_gmm)
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "decode_dispatch",
+        functools.partial(moe_decode_dispatch.decode_dispatch, interpret=True),
+    )
+
+    def run():
+        return fused_moe_func.__wrapped__(
+            hidden_states,
+            w1,
+            w2,
+            None,
+            None,
+            None,
+            None,
+            weights,
+            ids,
+            experts_start=jnp.full((topk,), 2 * num_experts, jnp.int32),
+            topk=topk,
+            activation="silu",
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=2048,
+            skip_padded_tokens=True,
+        )
+
+    got = run()
+    monkeypatch.setattr(fused_moe_gmm, "_uses_decode_dispatch", lambda *a, **k: False)
+    want = run()
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
     )
