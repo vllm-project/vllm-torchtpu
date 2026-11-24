@@ -875,6 +875,133 @@ def msa_write_and_candidates_dcp(
     return kv_cache, index_cache, packed.reshape(num_tokens, -1)
 
 
+# ---- Decode indexer split over the DCP groups (TPU_MINIMAX_M3_MSA_INDEX_SPLIT)
+#
+# The index keys have one head, written alike by every DCP group (each group
+# keeps all of its context's index keys over its ranks), while each group
+# scores them with its own index-query heads. Member ``r`` of every group
+# holds the same pages (block ``b`` with ``b % dcp == r``), so the ``NG``
+# groups' member-``r`` ranks can split those pages instead of each scoring
+# all of them: part ``p`` takes this rank's columns ``c`` with ``c % NG ==
+# p`` and scores them for all ``NG * G`` index heads (the heads fold into one
+# request's rows, so each key push into the MXU serves 4x the rows). A part
+# is a virtual DCP rank: column ``c' `` of part ``p`` is column ``c' * NG +
+# p``, i.e. block ``c' * (NG * dcp) + p * dcp + r``, so `local_candidates`
+# with ``dcp' = NG * dcp`` and ``rank' = p * dcp + r`` picks its top-k
+# unchanged. The owner of each head merges the ``NG`` parts' lists
+# (`merge_packed_candidates`): the top-k of a union of disjoint top-k lists
+# under one total order (score descending, ties to the lower block) is the
+# top-k of the whole, so the merged candidates equal
+# `msa_write_and_candidates_dcp`'s bit for bit.
+
+
+def split_part_tables(block_tables: jax.Array, max_num_seqs: int, part, parts: int):
+    """The block-table columns ``part, part + parts, ...`` of every request,
+    ``[max_num_seqs * ceil(P / parts)]`` (past-the-end columns repeat the
+    last one; `local_seq_lens` keeps them unread)."""
+    tables = block_tables.reshape(max_num_seqs, -1)
+    width = tables.shape[1]
+    cols = jnp.arange(-(-width // parts), dtype=jnp.int32) * parts + part
+    return tables[:, jnp.minimum(cols, width - 1)].reshape(-1)
+
+
+def split_candidates(
+    index_q: jax.Array,
+    index_cache: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    rank: int | jax.Array,
+    part: int | jax.Array,
+    parts: int,
+    dcp: int,
+    cache_heads: int,
+    scale_cache: jax.Array | None = None,
+    interpret: bool = False,
+) -> jax.Array:
+    """Part `part` of `parts` of a decode step's local candidates, for every
+    index head: ``index_q [T, H, D]`` (all ``H = parts * G`` index heads,
+    unrotated) -> packed ``[H, T, 2 * topk]`` (`pack_candidates`) over this
+    rank's columns ``c % parts == part``. `cache_heads` is ``G`` (the KV
+    heads this rank's caches hold; it sets the 4-bit index scale row).
+    Decode-sized steps only (the transposed indexer tiles)."""
+    num_tokens, num_heads, _ = index_q.shape
+    rank = rank_array(rank)[0]
+    part = rank_array(part)[0]
+    block_size = msa.page_size(index_cache)
+    max_num_seqs = seq_lens.shape[0]
+    _, pos, _ = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
+    vrank, vdcp = part * dcp + rank, parts * dcp
+    fp4 = scale_cache is not None
+    if fp4:
+        index_q = msa_fp4.rotate_queries(index_q)
+    lens = local_seq_lens(seq_lens, block_size=block_size, rank=vrank, dcp=vdcp)
+    tables = split_part_tables(block_tables, max_num_seqs, part, parts)
+    scores = msa.partial_block_scores(
+        index_q,
+        index_cache,
+        lens,
+        tables,
+        cu_q_lens,
+        distribution[2],
+        shards=1,
+        interpret=interpret,
+        scale_cache=scale_cache,
+        scale_row=msa_fp4.index_scale_row(cache_heads) if fp4 else None,
+    )  # [H, T, P']
+    cand_scores, cand_blocks = local_candidates(
+        scores.reshape(num_heads * num_tokens, 1, -1),
+        jnp.tile(pos, num_heads),
+        block_size=block_size,
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        rank=vrank,
+        dcp=vdcp,
+        interpret=interpret,
+    )
+    return pack_candidates(cand_scores, cand_blocks).reshape(num_heads, num_tokens, -1)
+
+
+def merge_packed_candidates(candidates: jax.Array, topk: int) -> jax.Array:
+    """Packed top-k ``[T, 2 * topk]`` of ``n`` packed lists ``[n, T, 2 *
+    topk]`` over disjoint blocks, in `local_candidates`' order (score
+    descending, ties to the lower block; missing picks ``(-inf, -1)``)."""
+    n, num_tokens, _ = candidates.shape
+    s = candidates[..., :topk].transpose(1, 0, 2).reshape(num_tokens, n * topk)
+    b = candidates[..., topk:].transpose(1, 0, 2).reshape(num_tokens, n * topk)
+    real = s > _NEG_INF
+    s_i, b_i = s[:, :, None], b[:, :, None]
+    s_j, b_j = s[:, None, :], b[:, None, :]
+    ahead = real[:, None, :] & ((s_j > s_i) | ((s_j == s_i) & (b_j < b_i)))
+    place = jnp.where(real, jnp.sum(ahead, axis=2, dtype=jnp.int32), topk)
+    hit = place[:, :, None] == jnp.arange(topk, dtype=jnp.int32)[None, None, :]
+    out_s = jnp.max(jnp.where(hit, s_i, _NEG_INF), axis=1)
+    out_b = jnp.max(jnp.where(hit, b_i, -1.0), axis=1)
+    return jnp.concatenate([out_s, out_b], axis=-1)
+
+
+def split_merge(
+    parts_candidates: jax.Array, group: int | jax.Array, cache_heads: int, topk: int
+) -> jax.Array:
+    """This rank's candidates ``[T, G * 2 * topk]`` (as
+    `msa_write_and_candidates_dcp` returns them) from every part's packed
+    lists of every index head ``[parts, H, T, 2 * topk]``: group `group`
+    owns index heads ``[group * G, (group + 1) * G)``."""
+    parts, num_heads, num_tokens, width = parts_candidates.shape
+    group = rank_array(group)[0]
+    mine = jax.lax.dynamic_slice_in_dim(
+        parts_candidates, group * cache_heads, cache_heads, axis=1
+    )  # [parts, G, T, 2K]
+    merged = [merge_packed_candidates(mine[:, h], topk) for h in range(cache_heads)]
+    return jnp.concatenate(merged, axis=-1)
+
+
 def _fp8_opt() -> str:
     """TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT (read when traced)."""
     from vllm_torchtpu import envs
@@ -1085,9 +1212,7 @@ def _attend_selected(
                 else ""
             )
             + (
-                f", widths {wide_kw['step_widths']}"
-                if "step_widths" in wide_kw
-                else ""
+                f", widths {wide_kw['step_widths']}" if "step_widths" in wide_kw else ""
             ),
         )
         wide = dict(common, **wide_kw)
@@ -1097,8 +1222,14 @@ def _attend_selected(
                 q_, kv_, keys_, sc_, *args_ = operands
                 if num_heads == 1:
                     return msa_attention_lse.msa_sparse_attention_lse(
-                        q_, kv_, keys_[:, 0], *args_, head=0, head_major=True,
-                        **kw, **msa._fp4_attention_kwargs(sc_),
+                        q_,
+                        kv_,
+                        keys_[:, 0],
+                        *args_,
+                        head=0,
+                        head_major=True,
+                        **kw,
+                        **msa._fp4_attention_kwargs(sc_),
                     )
                 return msa_attention_lse.msa_sparse_attention_lse_heads(
                     q_, kv_, keys_, *args_, head_major=True, **kw, scale_cache=sc_

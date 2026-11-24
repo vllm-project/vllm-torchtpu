@@ -1191,6 +1191,17 @@ def _get_msa_dcp_fp4_op(
     write_op = am_select_op = am_given_op = None
     if reuse:
         write_op = _get_msa_dcp_write_op(dcp, suffix, True)
+    split_max = index_split_max_tokens()
+    split_score_op = split_merge_op = None
+    if split_max:
+        split_score_op, split_merge_op = _get_msa_dcp_split_ops(
+            topk, init_blocks, local_blocks, dcp, kv_heads, suffix
+        )
+        logger.info_once(
+            "MiniMax M3 DCP decode: steps of <= %d tokens score the index keys "
+            "split over the DCP groups (TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS)",
+            split_max,
+        )
     if reuse and kv_heads == 1:
         am_select_op = _get_msa_dcp_attend_merge_op(
             sm_scale, topk, dcp, True, suffix, "return"
@@ -1214,6 +1225,7 @@ def _get_msa_dcp_fp4_op(
         hadamard: torch.Tensor,
         index_reuse: dict | None = None,
         full: bool = True,
+        dcp_lane: torch.Tensor | None = None,
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
@@ -1287,6 +1299,44 @@ def _get_msa_dcp_fp4_op(
                 q.contiguous(),
             )
             candidates = index_reuse["candidates"]
+        elif (
+            split_score_op is not None
+            and dcp_lane is not None
+            and index_reuse is None
+            and 0 < k.shape[0] <= split_max
+            and not msa_indexer.is_prefill_step(
+                kv_heads * k.shape[0], metadata.seq_lens.shape[0]
+            )
+        ):
+            # Index heads of every TP rank (rank i holds head
+            # i // kv_head_replicas), this rank's write and its part of the
+            # pages for all heads, then every part to every rank.
+            tp_group = get_tp_group()
+            index_q = tp_group.all_gather(index_q.contiguous(), dim=1)[
+                :, ::kv_head_replicas
+            ].contiguous()
+            if kv_heads > 1:
+                k, v = _gather_group_rows(
+                    (k, v), group, dcp, kv_head_replicas, dcp_rank
+                )
+            new_kv_cache, new_index_cache, new_scale_cache, parts, q = split_score_op(
+                k,
+                v,
+                index_q,
+                index_k,
+                kv_cache,
+                index_cache,
+                scale_cache,
+                metadata.seq_lens,
+                metadata.block_tables,
+                metadata.query_start_loc,
+                metadata.request_distribution,
+                dcp_rank,
+                dcp_lane,
+                q.contiguous(),
+            )
+            parts = tp_group.all_gather(parts.unsqueeze(0), dim=0)
+            candidates = split_merge_op(parts, dcp_rank, dcp_lane)
         else:
             if kv_heads > 1:
                 k, v, index_q = gather_group_kv(
@@ -1417,6 +1467,118 @@ def _get_msa_dcp_fp4_op(
 
     op.index_reuse = reuse
     return op
+
+
+def index_split_max_tokens() -> int:
+    """TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS (0 = off)."""
+    return envs.TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS
+
+
+def _get_msa_dcp_split_ops(
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    dcp: int,
+    kv_heads: int,
+    suffix: str,
+) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS (`msa_dcp.split_candidates`):
+    ``(score_op, merge_op)``. The score op writes this rank's tokens (4-bit
+    caches), scores part ``lane`` of its pages for every index head and
+    rotates its queries; the caller all-gathers the parts over the TP group;
+    the merge op keeps this rank's member's parts of its group's heads and
+    merges them into the candidates `msa_write_and_candidates_dcp` returns."""
+
+    def _score_jax(
+        k: jax.Array,
+        v: jax.Array,
+        index_q: jax.Array,
+        index_k: jax.Array,
+        kv_cache: jax.Array,
+        index_cache: jax.Array,
+        scale_cache: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+        dcp_rank: jax.Array,
+        dcp_lane: jax.Array,
+        q: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+        kv_cache, index_cache, scale_cache = msa_dcp.msa_write_dcp(
+            k,
+            v,
+            index_k,
+            kv_cache,
+            index_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            rank=dcp_rank,
+            dcp=dcp,
+            scale_cache=scale_cache,
+        )
+        parts = msa_dcp.split_candidates(
+            index_q,
+            index_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            rank=dcp_rank,
+            part=dcp_lane,
+            parts=index_q.shape[1] // kv_heads,
+            dcp=dcp,
+            cache_heads=kv_heads,
+            scale_cache=scale_cache,
+        )
+        return kv_cache, index_cache, scale_cache, parts, msa_fp4.rotate_queries(q)
+
+    def _merge_jax(
+        parts: jax.Array, dcp_rank: jax.Array, dcp_lane: jax.Array
+    ) -> jax.Array:
+        # parts [tp, H, T, 2K] in TP-rank order (rank = lane * dcp + member):
+        # this member's rank in every lane.
+        lanes = parts.shape[0] // dcp
+        member = msa_dcp.rank_array(dcp_rank)[0]
+        mine = parts.reshape(lanes, dcp, *parts.shape[1:])
+        mine = jax.lax.dynamic_index_in_dim(mine, member, 1, keepdims=False)
+        return msa_dcp.split_merge(mine, dcp_lane, kv_heads, topk)
+
+    score_op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_dcp_fp4_split_score_{suffix}",
+        _score_jax,
+        donate_argnums=(
+            _SHARD_KV_CACHE_ARG,
+            _SHARD_INDEX_CACHE_ARG,
+            _DCP_SCALE_CACHE_ARG,
+        ),
+    )
+    score_op.register_fake(
+        lambda k, v, index_q, index_k, kv_cache, index_cache, scale_cache, *args: (
+            torch.empty_like(kv_cache),
+            torch.empty_like(index_cache),
+            torch.empty_like(scale_cache),
+            torch.empty(
+                (index_q.shape[1], k.shape[0], 2 * topk),
+                dtype=torch.float32,
+                device=k.device,
+            ),
+            torch.empty_like(args[-1]),
+        )
+    )
+    merge_op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_dcp_split_merge_{suffix}", _merge_jax
+    )
+    merge_op.register_fake(
+        lambda parts, dcp_rank, dcp_lane: parts.new_empty(
+            (parts.shape[2], kv_heads * 2 * topk)
+        )
+    )
+    return score_op, merge_op
 
 
 def _fused_decode_op(

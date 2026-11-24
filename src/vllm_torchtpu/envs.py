@@ -285,6 +285,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_WRITE_RUNS_IN_KERNEL_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
     TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT: bool = False
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
@@ -1864,6 +1865,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # off.
     "TPU_MINIMAX_M3_MSA_WRITE_RUNS_IN_KERNEL_MAX_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_MSA_WRITE_RUNS_IN_KERNEL_MAX_TOKENS", 0
+    ),
+    # MiniMax M3 4-bit DCP decode steps of at most this many tokens score the
+    # index keys split over the DCP groups (`kernels.msa_dcp.split_candidates`):
+    # the groups hold the same index keys, so member r of each of the
+    # TP / DCP groups scores 1 / (TP / DCP) of member r's pages for every
+    # index head, and the parts' local top-k lists meet by a TP all-gather.
+    # The candidates are bitwise those of the default scoring. 0 (default) =
+    # off.
+    "TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS", 0
     ),
     # MiniMax M3 4-bit MSA prefill attention with a page cache:
     # "<threshold>:<block_q>:<tile_pages>" runs a call whose selections hold

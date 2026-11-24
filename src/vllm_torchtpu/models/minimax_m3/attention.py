@@ -36,6 +36,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
@@ -411,6 +412,18 @@ class MiniMaxM3SparseAttention(nn.Module):
                 _dcp_rank_tensor(get_dcp_rank(), str(torch.get_default_device())),
                 persistent=False,
             )
+            # TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS: this rank's DCP group
+            # (TP rank // DCP), its part of the split index scoring.
+            self.dcp_lane = None
+            if self.fp4 and envs.TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS:
+                self.register_buffer(
+                    "dcp_lane",
+                    _dcp_rank_tensor(
+                        get_tensor_model_parallel_rank() // self.dcp_size,
+                        str(torch.get_default_device()),
+                    ),
+                    persistent=False,
+                )
             if self.fp4:  # each rank rotates its own query heads (get_msa_dcp_op)
                 self.register_buffer(
                     "hadamard",
@@ -503,6 +516,8 @@ class MiniMaxM3SparseAttention(nn.Module):
                 extra["scale_cache"] = self.scale_cache.kv_cache
                 if self.dcp_size > 1:
                     extra["hadamard"] = self.hadamard
+                    if self.dcp_lane is not None:
+                        extra["dcp_lane"] = self.dcp_lane
             if (
                 index_reuse is not None
                 and self.index_reuse_full is not None
