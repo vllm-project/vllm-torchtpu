@@ -318,6 +318,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
     TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
     TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
+    TPU_MINIMAX_M3_DCP_HP_ROUND_LADDER: str = ""
     TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_HP_DECODE_MERGE_A2A: bool = False
     TPU_MINIMAX_M3_INDEX_FOLD_OPT: str = ""
@@ -2111,6 +2112,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (c64 8k chunks of ~140K-token contexts) in one round.
     "TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR", 1
+    ),
+    # MiniMax M3 head-parallel MSA prefill: smaller round buffers, as
+    # "<tokens>/<tokens>/..." of summed prefill-request context. A step whose
+    # prefill requests fit the smallest such rung attends them in one round
+    # of that buffer instead of the max_model_len-sized one (a lax.switch in
+    # the same program, so no extra compiled programs); the scales' static
+    # gather / all-to-all / all-gather / padding shrink with the buffer.
+    # Same outputs bit for bit. Empty = off. Not with EXCHANGE_ASYNC.
+    "TPU_MINIMAX_M3_DCP_HP_ROUND_LADDER": env_str(
+        "TPU_MINIMAX_M3_DCP_HP_ROUND_LADDER", ""
     ),
     # MiniMax M3 head-parallel MSA prefill: the replicas of a KV head split
     # each kernel call's rows (alternate query tiles) instead of its query
