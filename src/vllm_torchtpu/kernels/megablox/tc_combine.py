@@ -160,11 +160,11 @@ def _kernel(
     if shared:
         # The shared expert's down weight stays in VMEM for the whole grid
         # (sequential, one core): one DMA at the first block.
+        # Started here, waited for just before the first epilogue, so it
+        # overlaps the first block's tile loads and combine products.
         @pl.when(b == 0)
         def _():
-            cp = pltpu.make_async_copy(ws_hbm, ws_vmem, ws_sem.at[0])
-            cp.start()
-            cp.wait()
+            pltpu.make_async_copy(ws_hbm, ws_vmem, ws_sem.at[0]).start()
 
     def tile_copy(block, i, parity):
         t = tiles_ref[block * maxt + i]
@@ -278,6 +278,10 @@ def _kernel(
     @pl.when(n_chunks == 0)
     def _():
         acc[...] = jnp.zeros_like(acc)
+
+    @pl.when(b == 0)
+    def _():
+        pltpu.make_async_copy(ws_hbm, ws_vmem, ws_sem.at[0]).wait()
 
     act = act_ref[...]
     for n0 in range(0, hidden, _SHARED_N_CHUNK):

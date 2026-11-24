@@ -755,6 +755,7 @@ def _moe_with_shared(monkeypatch, on):
     monkeypatch.setattr(envs, "TPU_MINIMAX_M3_SHARED_IN_COMBINE", on, raising=False)
     monkeypatch.setattr(envs, "TPU_MOE_TC_COMBINE", True, raising=False)
     monkeypatch.setattr(tc_combine, "TOKEN_BLOCK", 32)
+    monkeypatch.setattr(envs, "TPU_MINIMAX_M3_SHARED_IN_COMBINE_MIN_TOKENS", T, raising=False)
     tp = _TP(1)
     tp.local.rank = 0
     moe = _moe(("sc",), 0, tp)
@@ -800,6 +801,7 @@ def test_shared_in_combine_gates(monkeypatch):
     moe, _ = _moe_with_shared(monkeypatch, True)
     assert moe._shared_in_combine(T)
     assert not moe._shared_in_combine(T + 8)  # not whole combine blocks
+    assert not moe._shared_in_combine(T // 2)  # below MIN_TOKENS
     monkeypatch.setattr(envs, "TPU_MOE_TC_COMBINE", False)
     assert not moe._shared_in_combine(T)
     monkeypatch.setattr(envs, "TPU_MOE_TC_COMBINE", True)

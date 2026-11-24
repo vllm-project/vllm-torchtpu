@@ -173,7 +173,10 @@ class MiniMaxM3MoE(nn.Module):
         the TensorCore combine tiles (other steps keep the runner's graph)."""
         if not envs.TPU_MINIMAX_M3_SHARED_IN_COMBINE or not envs.TPU_MOE_TC_COMBINE:
             return False
-        if num_tokens % tc_combine.TOKEN_BLOCK:
+        if (
+            num_tokens % tc_combine.TOKEN_BLOCK
+            or num_tokens < envs.TPU_MINIMAX_M3_SHARED_IN_COMBINE_MIN_TOKENS
+        ):
             return False
         runner = self.experts
         if not runner.moe_config.skip_final_all_reduce:
