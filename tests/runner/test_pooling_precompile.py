@@ -13,6 +13,7 @@
 # limitations under the License.
 """CPU tests for the AOT-bucketed static pooler and pooling KV cap (PR2)."""
 
+import functools
 import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -730,6 +731,11 @@ def test_runner_precompile_pooler_grid(monkeypatch):
     monkeypatch.setattr(runner_mod, "static_pool", fake_static_pool)
     monkeypatch.setattr(runner_mod, "synchronize_tensors", lambda *a, **k: None)
     runner = _fake_precompile_runner(_spec("LAST"))
+    # The real context manager, so this pass is shown to run under no_grad.
+    runner._update_num_xla_graphs = lambda _name: None
+    runner._precompile_timed = functools.partial(
+        runner_mod.TPUModelRunner._precompile_timed, runner
+    )
     runner_mod.TPUModelRunner._precompile_pooler_subgraphs(runner)
 
     assert [(t, r) for t, r, _ in calls] == [

@@ -422,7 +422,8 @@ def _substitute_placeholder_token(
         token_in_tpu_cur_input_indices: int tensor [N], destination slots.
         token_in_tpu_pre_next_tokens_indices: int tensor [N], source slots
             in `next_tokens`; -1 marks a padding slot to leave unchanged.
-        next_tokens: int tensor of tokens from the previous async step.
+        next_tokens: int tensor ([M] or [M, 1]) of tokens from the previous
+            async step.
     Return:
         input_ids with real placeholders replaced; padding slots untouched.
     """
@@ -443,7 +444,7 @@ def _substitute_placeholder_token(
     # clamp_min(0) gives a safe in-range gather index for the -1 sentinel
     # slots; their gathered values are discarded by `mask` in `where`.
     safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
-    new_token_values = next_tokens[safe_idx].to(input_ids.dtype)
+    new_token_values = next_tokens.reshape(-1)[safe_idx].to(input_ids.dtype)
     original_values = input_ids[token_in_tpu_cur_input_indices]
     update_values = torch.where(mask, new_token_values, original_values)
     input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
@@ -984,6 +985,10 @@ class TPUModelRunner(GPUModelRunner):
 
         # XLA graph tracker (TPU-specific debug aid).
         self.enforce_eager = self.model_config.enforce_eager
+        if self.check_recompilation and not self.enforce_eager:
+            # The graph counts say that Dynamo traced again. This log says
+            # why, for example "GLOBAL_STATE changed: grad_mode".
+            torch._logging.set_logs(recompiles=True)
         self.num_xla_graphs = 0
         self._update_num_xla_graphs("init")
         # torchTPU doesn't support SymInt yet, so widen Dynamo cache limits.
@@ -1661,6 +1666,10 @@ class TPUModelRunner(GPUModelRunner):
     # attribute has to be assigned above that call to exist in time.
     _xla_graphs_checked_at = None
 
+    # Dynamo graphs counted by the previous report. A class attribute for the
+    # same reason as _xla_graphs_checked_at.
+    _num_dynamo_graphs = 0
+
     @staticmethod
     def _describe_xla_graph(entry) -> str:
         """One line describing a cache entry, from whatever fields it carries.
@@ -1720,10 +1729,32 @@ class TPUModelRunner(GPUModelRunner):
         fresh.sort(key=self._xla_graph_compile_secs, reverse=True)
         return fresh
 
+    def _report_new_dynamo_graphs(self, case_str) -> None:
+        """Logs the graphs Dynamo traced since the previous report.
+
+        The XLA cache cannot show these. After a guard miss Dynamo traces the
+        function again and the backend reuses the cached XLA program, so the
+        entry count stays the same while the step still pays for the trace.
+        """
+        total_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+        new_graphs = total_graphs - self._num_dynamo_graphs
+        self._num_dynamo_graphs = total_graphs
+        if new_graphs > 0:
+            logger.info(
+                "Dynamo traced %d graphs since the last check (%d in total), case: %s",
+                new_graphs,
+                total_graphs,
+                case_str,
+            )
+
     def _update_num_xla_graphs(self, case_str):
         check_comp = self.check_recompilation and not self.enforce_eager
         if not check_comp:
             return
+
+        # Runs before the XLA report, which returns early when the cache did
+        # not grow. A retrace that reuses a cached XLA program is that case.
+        self._report_new_dynamo_graphs(case_str)
 
         stats = torch.tpu._get_cache_stats()
         entries = stats.per_entry_stats
@@ -2643,7 +2674,7 @@ class TPUModelRunner(GPUModelRunner):
             return
         pool_sets = self._dense_kv_copy_pool_sets()
         # At most one CoW pair per newly scheduled request per step.
-        with self._precompile_timed("dense KV CoW copies"), torch.no_grad():
+        with self._precompile_timed("dense KV CoW copies"):
             for split, pools in pool_sets.items():
                 synchronize_tensors(pools)
                 limit = self._bucket_len(self.max_num_reqs * split)
@@ -5082,14 +5113,15 @@ class TPUModelRunner(GPUModelRunner):
     def _get_sampling_generator(self) -> torch.Generator:
         """Return the dedicated non-greedy sampling generator, seeded once.
 
-        Seeded lazily on first use from ``model_config.seed`` -- the same value
-        on every worker -- then advanced naturally by the draws (never reseeded
-        per step). A replica's TP ranks run in lockstep (same ``SchedulerOutput``
-        -> same bucketed draw shapes each step), so with the same seed they stay
-        at the same offset in the stream and sample identical tokens -- the
-        property spec decode needs to keep the TP ranks from diverging. (DP
-        replicas share the same base sequence but draw at their own pace on
-        independent request streams, so they decorrelate, which is fine.)
+        Initialized eagerly in ``load_model`` (with a lazy fallback for unit
+        tests) from ``model_config.seed`` -- the same value on every worker --
+        then advanced naturally by the draws (never reseeded per step). A
+        replica's TP ranks run in lockstep (same ``SchedulerOutput`` -> same
+        bucketed draw shapes each step), so with the same seed they stay at the
+        same offset in the stream and sample identical tokens -- the property
+        spec decode needs to keep the TP ranks from diverging. (DP replicas
+        share the same base sequence but draw at their own pace on independent
+        request streams, so they decorrelate, which is fine.)
         """
         if self._sampling_generator is None:
             gen = torch.Generator(device=self.device)
@@ -5623,6 +5655,7 @@ class TPUModelRunner(GPUModelRunner):
             proc.finish(next_tokens)
         return next_tokens
 
+    @torch.no_grad()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
@@ -5885,7 +5918,10 @@ class TPUModelRunner(GPUModelRunner):
                 combined_selected_tokens.append(selected_token_ids)
                 combined_selected_tokens_real_lens.append(num_reqs)
                 if self.scheduler_config.async_scheduling:
-                    next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
+                    # Keep the [num_reqs, 1] base buffer; _substitute_placeholder_token
+                    # flattens inside the compiled graph so torch_tpu does not emit a
+                    # standalone as_strided view program at step 1.
+                    next_tokens_tpu_chunks.append(selected_token_ids)
                     for req_idx in range(cur_start_idx, cur_end_idx):
                         next_token_indices[req_idx] = (
                             next_tokens_tpu_offset + req_idx - cur_start_idx
@@ -6202,6 +6238,13 @@ class TPUModelRunner(GPUModelRunner):
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
+        if not self.is_pooling_model:
+            # Allocate and seed the device RNG before any non_blocking=True H2D
+            # transfer runs: THPGenerator_pynew / manual_seed block in
+            # TpuMallocAndMemcpyHtoD while holding the GIL, which deadlocks if
+            # libtpu's DMA completion thread is waiting on the GIL to decref a
+            # host tensor from an in-flight async H2D copy.
+            self._get_sampling_generator()
 
         # Set TPU-specific quantization config before model loading.
         # This ensures that TPU-compatible quantization methods are used
@@ -7149,10 +7192,15 @@ class TPUModelRunner(GPUModelRunner):
 
     @contextlib.contextmanager
     def _precompile_timed(self, name: str):
-        """Common boilerplate for each AOT bucket precompile pass."""
+        """Times one AOT bucket precompile pass and runs it under no_grad.
+
+        Serving runs under no_grad and Dynamo guards on grad mode. A pass that
+        traces with grad enabled is traced again at the first request.
+        """
         logger.info("Compiling %s with different input shapes.", name)
         start = time.perf_counter()
-        yield
+        with torch.no_grad():
+            yield
         logger.info("Compilation finished in %.2f [secs].", time.perf_counter() - start)
         self._update_num_xla_graphs(name)
 
@@ -7416,15 +7464,21 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_substitute_placeholder_token(self) -> None:
         if not self.scheduler_config.async_scheduling:
             return
-        # next_tokens source lengths the runtime produces: stride-1 num_reqs
-        # buckets (non-spec / pure-async), plus the bounded stride-(1+K) span
-        # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
-        # substitute doesn't recompile per real num_reqs.
-        next_lens = list(self.num_reqs_paddings)
+        # next_tokens source shapes the runtime produces: [num_reqs, 1] buckets
+        # from non-spec sampling (kept 2D to avoid an eager view program), plus
+        # the bounded 1D stride-(1+K) span async eagle3 parks
+        # (max_num_reqs*(1+K); see sample_tokens) so spec substitute doesn't
+        # recompile per real num_reqs.
+        next_shapes: list[tuple[int, ...]] = [
+            (nlen, 1) for nlen in self.num_reqs_paddings
+        ]
         if self._is_async_drafter:
             assert self.speculative_config is not None
-            next_lens.append(
-                self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
+            next_shapes.append(
+                (
+                    self.max_num_reqs
+                    * (1 + self.speculative_config.num_speculative_tokens),
+                )
             )
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
@@ -7437,8 +7491,8 @@ class TPUModelRunner(GPUModelRunner):
                 pre_next_tokens_indices = torch.full(
                     (num_tokens,), -1, dtype=torch.int32
                 ).to(self.device)
-                for nlen in next_lens:
-                    next_tokens = torch.zeros(nlen, dtype=torch.int64).to(self.device)
+                for shape in next_shapes:
+                    next_tokens = torch.zeros(shape, dtype=torch.int64).to(self.device)
                     out = _substitute_placeholder_token(
                         input_ids,
                         cur_input_indices,
@@ -7446,7 +7500,9 @@ class TPUModelRunner(GPUModelRunner):
                         next_tokens,
                     )
                     synchronize_tensors(out)
-                    logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
+                    logger.info(
+                        "  -- num_tokens: %d, next_len: %d", num_tokens, shape[0]
+                    )
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
@@ -7686,8 +7742,7 @@ class TPUModelRunner(GPUModelRunner):
         bucket grid.
 
         Uses the runtime buckets (num_tokens_paddings x num_reqs_paddings) with
-        the logits precompile's pruning, and runs under no_grad like
-        execute_model so the Dynamo guards match at serve time.
+        the logits precompile's pruning.
         """
         if not self.is_pooling_model or not self._pp_is_last:
             return
@@ -7696,7 +7751,7 @@ class TPUModelRunner(GPUModelRunner):
             logger.info("Skipping pooler precompile: %s", self._static_pooler_reason)
             return
         hsize = self.model_config.get_hidden_size()
-        with self._precompile_timed("static pooler"), torch.no_grad():
+        with self._precompile_timed("static pooler"):
             dummy_hidden = None
             for num_tokens, num_reqs in iter_pooler_precompile_grid(
                 self.num_tokens_paddings, self.num_reqs_paddings, self.max_num_reqs
@@ -8117,9 +8172,7 @@ class TPUModelRunner(GPUModelRunner):
                 tuple(id(r) for r in self.kv_cache_raw_tensors),
                 self.kv_cache_raw_tensors,
             )
-        # Serving calls the program under execute_model's no_grad, and dynamo
-        # guards on grad mode: compile it the same way.
-        with self._precompile_timed("mamba state seed copies"), torch.no_grad():
+        with self._precompile_timed("mamba state seed copies"):
             num_groups = max(
                 1,
                 len(self._mamba_copy_plan),
