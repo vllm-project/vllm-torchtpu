@@ -614,7 +614,9 @@ def _decode_candidates_kernel(
     own = (rows >= cu_ref[seq]) & (rows < cu_ref[seq + 1])
 
     def store(first, m):
-        cols = pl.ds(pl.multiple_of(group * pages_per_step + first, _LANES), m.shape[1])
+        cols = pl.ds(
+            pl.multiple_of(group * pages_per_step + first, m.shape[1]), m.shape[1]
+        )
         window = scores_ref.at[pl.ds(row0, block_q), cols]
         window[...] = jnp.where(own, m, window[...])
 
