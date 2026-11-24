@@ -443,6 +443,10 @@ def exchange_head_pages(
 
 
 EXCHANGE_ASYNC_ENV = "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC"
+# Smallest per-rank cache the asynchronous exchange is used for (see
+# `_head_parallel_attend`): a 16 MB cache was prefetched and broke, 33 MB and
+# 134 MB were not.
+_ASYNC_MIN_CACHE_BYTES = 64 << 20
 _async_logged = False
 
 
@@ -1045,9 +1049,17 @@ def _head_parallel_attend(
     first = jnp.min(jnp.where(hp_req, seq_idx, max_num_seqs))
     plan = plan_round(first)
     future, extra = None, None
-    if between is not None and exchange_async():
+    # A cache small enough for XLA to prefetch into alternate memory for the
+    # start alone is freed under the start's in-flight copies (the HBM
+    # specs below are not honoured for it): such caches exchange
+    # synchronously. Served caches are hundreds of MB per layer.
+    if (
+        between is not None
+        and exchange_async()
+        and kv_cache.size * kv_cache.dtype.itemsize >= _ASYNC_MIN_CACHE_BYTES
+    ):
         future = exchange_head_pages_start(
-            kv_cache,
+            pltpu.with_memory_space_constraint(kv_cache, pltpu.HBM),
             round_pages(plan),
             plan[3].reshape(1),
             jnp.reshape(rank, (1,)),
