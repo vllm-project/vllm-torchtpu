@@ -636,7 +636,7 @@ def _tiles(cu_q_lens: jax.Array, seq_in_class: jax.Array, block_q: int, max_tile
     tile_row0 = (
         lookup(start, tile_seq) + (tile - lookup(first_tile, tile_seq)) * block_q
     )
-    return tile_seq, tile_row0, first_tile, start, tile_ends[-1]
+    return tile_seq, tile_row0, first_tile, start, tile_ends[-1], tiles_per_seq
 
 
 class ClassScores(NamedTuple):
@@ -688,7 +688,7 @@ def class_work(
     pages_per_seq = block_tables.shape[0] // max_num_seqs
     num_groups_per_seq = -(-pages_per_seq // pages_per_step)
 
-    tile_seq, tile_row0, first_tile, tile_start, num_tiles = _tiles(
+    tile_seq, tile_row0, first_tile, tile_start, num_tiles, tiles_per_seq = _tiles(
         cu_q_lens, seq_in_class, block_q, max_tiles
     )
     # The kernel reads each tile's query rows straight from the token-ordered
@@ -714,20 +714,27 @@ def class_work(
         0,
     )
     group_ends = jnp.cumsum(groups_per_tile)
+    # A request's tiles are consecutive and take its group count each, so an
+    # item's request, then its tile and group, come from per-request tables:
+    # searching and one-hot lookups over the max_tiles tiles cost ~10 us per
+    # layer for the c48 mixed step's 816 8-row decode tiles (6,528 items).
+    seq_groups = jnp.maximum(-(-seq_pages // pages_per_step), 1)
+    items = tiles_per_seq * seq_groups
+    item_ends = jnp.cumsum(items)
     w = jnp.arange(max_tiles * num_groups_per_seq, dtype=jnp.int32)
-    work_tile = jnp.minimum(
-        jnp.searchsorted(group_ends, w, side="right", method="compare_all").astype(
+    seq = jnp.minimum(
+        jnp.searchsorted(item_ends, w, side="right", method="compare_all").astype(
             jnp.int32
         ),
-        max_tiles - 1,
+        max_num_seqs - 1,
     )
-    # A one-hot lookup: gathers from these max_tiles-entry tables lowered to
-    # compare/select chains over max_tiles HBM scalar operands each, ~0.6 us
-    # per operand (20 us for this fusion in the decode twin, j-b312f26a).
-    in_tile = work_tile[:, None] == jnp.arange(max_tiles, dtype=jnp.int32)[None, :]
-    work_group = w - jnp.sum(
-        jnp.where(in_tile, (group_ends - groups_per_tile)[None, :], 0), axis=1
-    )
+    # One-hot lookups: gathers from small tables lowered to compare/select
+    # chains over one HBM scalar operand per entry, ~0.6 us each (20 us for
+    # this fusion in the decode twin, j-b312f26a).
+    item = w - lookup(item_ends - items, seq)
+    groups = lookup(seq_groups, seq)
+    work_tile = jnp.minimum(lookup(first_tile, seq) + item // groups, max_tiles - 1)
+    work_group = item % groups
     work = (work_tile << _TILE_SHIFT) | jnp.clip(work_group, 0, _GROUP_MASK)
     return ClassWork(
         work,

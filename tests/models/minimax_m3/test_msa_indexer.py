@@ -343,3 +343,45 @@ def test_fp4_folded_lowers_for_tpu(tokens):
             .lower(lowering_platforms=("tpu",))
         )
     assert "tpu_custom_call" in lowered.as_text()
+
+
+@pytest.mark.parametrize("block_q", [8, 64, 512])
+@pytest.mark.parametrize("seed", range(4))
+def test_class_work_lists_every_group_of_every_tile(block_q, seed):
+    """`class_work`'s items up to `group_ends[-1]`: each live tile's page
+    groups in order, tiles in order."""
+    rng = np.random.default_rng(seed)
+    max_seqs, pages_per_seq, pages_per_step = 12, 40, 8
+    num_seqs = int(rng.integers(1, max_seqs + 1))
+    q_lens = rng.integers(0, 3 * block_q, num_seqs)
+    seq_lens = np.zeros(max_seqs, np.int32)
+    seq_lens[:num_seqs] = q_lens + rng.integers(
+        0, pages_per_seq * PAGE - 3 * block_q, num_seqs
+    )
+    cu = np.full(max_seqs + 1, q_lens.sum(), np.int32)
+    cu[: num_seqs + 1] = np.concatenate([[0], np.cumsum(q_lens)])
+    in_class = np.arange(max_seqs) < num_seqs
+    in_class[rng.permutation(num_seqs)[: num_seqs // 3]] = False
+    num_tokens = int(cu[-1]) + 5
+    max_tiles = num_tokens // block_q + 2 * max_seqs
+    work = msa_indexer.class_work(
+        jnp.zeros((num_tokens, 1, HEAD_DIM), jnp.bfloat16),
+        jnp.asarray(seq_lens),
+        jnp.zeros(max_seqs * pages_per_seq, jnp.int32),
+        jnp.asarray(cu),
+        jnp.asarray(in_class),
+        block_q=block_q,
+        max_tiles=max_tiles,
+        pages_per_step=pages_per_step,
+        page_size=PAGE,
+    )
+    tile_seq = np.asarray(work.tile_seq)
+    want = []
+    for t in range(int(work.num_tiles)):
+        pages = -(-seq_lens[tile_seq[t]] // PAGE)
+        want += [(t, g) for g in range(max(-(-pages // pages_per_step), 1))]
+    total = int(work.group_ends[-1])
+    assert total == len(want)
+    got = np.asarray(work.work)[:total]
+    np.testing.assert_array_equal(got >> 16, [t for t, _ in want])
+    np.testing.assert_array_equal(got & 0xFFFF, [g for _, g in want])
