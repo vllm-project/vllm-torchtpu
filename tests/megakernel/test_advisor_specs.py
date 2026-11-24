@@ -33,6 +33,7 @@ from vllm_torchtpu.megakernel.advisor import (
     constants,
     models,
     specs,
+    workbench_phase,
 )
 from vllm_torchtpu.megakernel.core import errors
 
