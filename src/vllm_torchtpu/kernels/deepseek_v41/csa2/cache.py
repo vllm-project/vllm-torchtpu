@@ -7,10 +7,9 @@ existing native cache as these words.
 """
 
 import functools
-from typing import cast
-
 import jax
 import jax.numpy as jnp
+from jax.experimental import xla_metadata
 
 MIN_KV_AMAX = 1e-4
 # Zero rows that invalid IDs read in the three-slot gather. Gathers whose IDs
@@ -42,18 +41,21 @@ def encode_csa2_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
     return jax.lax.bitcast_convert_type(words, jnp.int32), scales
 
 
-@functools.partial(jax.jit, static_argnames=("deep",))
+@functools.partial(jax.jit, static_argnames=("deep", "scheduling_group_id"))
 def gather_csa2_kv_sc(
     words: jax.Array | tuple[jax.Array, jax.Array],
     scales: jax.Array | tuple[jax.Array, jax.Array],
     records: jax.Array,
     *,
     deep: bool = False,
+    scheduling_group_id: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """SparseCore producer; invalid rows are zeroed once before any reuse.
 
     ``deep`` keeps three staging slots in flight and zeroes invalid rows with
     a masked DMA instead of clearing every slot with vector stores.
+    ``scheduling_group_id`` tags the SparseCore call; it holds only through
+    `gather_csa2_kv_sc_inline`, since a jit boundary drops the tag.
     """
     banks = words if isinstance(words, tuple) else (words,)
     scale_banks = scales if isinstance(scales, tuple) else (scales,)
@@ -74,12 +76,29 @@ def gather_csa2_kv_sc(
         return jnp.zeros((*records.shape, 128), jnp.int32), jnp.zeros(
             records.shape, jnp.float32
         )
-    if deep:
-        return _gather_sc_banked_deep(banks, scale_banks, records)
-    return _gather_sc_banked(banks, scale_banks, records)
+    gather = _gather_sc_banked_deep if deep else _gather_sc_banked
+    return gather(banks, scale_banks, records, scheduling_group_id)
 
 
-def _gather_sc_banked(words, scales, records):
+gather_csa2_kv_sc_inline = jax.jit(
+    gather_csa2_kv_sc.__wrapped__,
+    static_argnames=("deep", "scheduling_group_id"),
+    inline=True,
+)
+
+
+def _tag(outputs, scheduling_group_id):
+    if scheduling_group_id is None:
+        return outputs
+    return jax.tree.map(
+        lambda x: xla_metadata.set_xla_metadata(
+            x, _scheduling_group_id=scheduling_group_id
+        ),
+        outputs,
+    )
+
+
+def _gather_sc_banked(words, scales, records, scheduling_group_id=None):
     """Masked DMA into shared VMEM; no concatenated HBM cache.
 
     Two streams follow the latest epic banked gather's v7x DMA concurrency
@@ -186,8 +205,7 @@ def _gather_sc_banked(words, scales, records):
             ),
         )(ids_ref)
 
-    out, scale_out = cast(
-        tuple[jax.Array, jax.Array],
+    out, scale_out = _tag(
         pl.kernel(
             kernel,
             out_type=(
@@ -213,13 +231,14 @@ def _gather_sc_banked(words, scales, records):
             scales,
             indices,
         ),
+        scheduling_group_id,
     )
     return out[:count].reshape(*records.shape, 128), scale_out[:count].reshape(
         records.shape
     )
 
 
-def _gather_sc_banked_deep(words, scales, records):
+def _gather_sc_banked_deep(words, scales, records, scheduling_group_id=None):
     """``_gather_sc_banked`` with three slots and DMA-zeroed invalid rows.
 
     The gather for step i + 2 is issued while step i's rows are written, so
@@ -358,8 +377,7 @@ def _gather_sc_banked_deep(words, scales, records):
             ),
         )(ids_ref)
 
-    out, scale_out = cast(
-        tuple[jax.Array, jax.Array],
+    out, scale_out = _tag(
         pl.kernel(
             kernel,
             out_type=(
@@ -387,6 +405,7 @@ def _gather_sc_banked_deep(words, scales, records):
             zero_scales,
             indices,
         ),
+        scheduling_group_id,
     )
     return out.reshape(*records.shape, 128), scale_out.reshape(records.shape)
 
