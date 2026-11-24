@@ -273,6 +273,9 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     VLLM_TPU_PREFILL_SPACING_FRAC: float = 0.5
+    VLLM_TPU_EVICT_DECODE_FIRST: bool = False
+    VLLM_TPU_EVICT_PROTECT_HITS: int = 0
+    VLLM_TPU_EVICT_PROTECTED_FRAC: float = 0.3
     VLLM_TPU_PREFILL_SPACING_MIN_TOKENS: int = 8192
     VLLM_TPU_PREFILL_TPOT_TARGET_MS: float = 0.0
     VLLM_TPU_PREFILL_TPOT_MAX_HOLD_S: float = 10.0
@@ -1780,6 +1783,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # PrefixAwareScheduler (and subclasses), reuse-aware eviction
+    # (core/reuse_aware_eviction.py): a finished request's decode-output
+    # blocks (past its last full prompt block) go to the head of the free
+    # queue, reused before any prompt block. For clients that never send our
+    # output back verbatim (AgentX replay, thinking stripped).
+    "VLLM_TPU_EVICT_DECODE_FIRST": env_bool("VLLM_TPU_EVICT_DECODE_FIRST"),
+    # Reuse-aware eviction: free blocks with at least this many prefix hits
+    # since they were filled go to a protected LRU segment evicted after the
+    # probationary one (2-segment LRU; 0 disables).
+    "VLLM_TPU_EVICT_PROTECT_HITS": env_nonnegative_int(
+        "VLLM_TPU_EVICT_PROTECT_HITS", 0
+    ),
+    # Reuse-aware eviction: cap of the protected segment, as a fraction of the
+    # pool's blocks; past it the oldest protected blocks become probationary.
+    "VLLM_TPU_EVICT_PROTECTED_FRAC": env_nonnegative_float(
+        "VLLM_TPU_EVICT_PROTECTED_FRAC", 0.3
     ),
     # PrefillSpacingScheduler: decode-only time owed after a step that runs a
     # chunk of a long prompt, as a fraction of that step's time (0 disables
