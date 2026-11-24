@@ -371,11 +371,14 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
             cls._worker_world_size = world_size
             chips = os.environ.get("TPU_VISIBLE_CHIPS")
             if chips and [int(c) for c in chips.split(",")] != list(range(world_size)):
-                raise ValueError(
-                    f"Diffusion stage is pinned to TPU_VISIBLE_CHIPS={chips}, but "
-                    f"its {world_size} ranks bind chips 0-{world_size - 1} by "
-                    "local rank. Multi-rank diffusion stages on other chips (e.g. "
-                    "in multi-stage pipelines) are not supported on TPU yet."
+                logger.warning(
+                    "Diffusion stage is pinned to TPU_VISIBLE_CHIPS=%s, but its "
+                    "%d ranks bind chips 0-%d by local rank. Multi-rank diffusion "
+                    "stages on other chips (e.g. in multi-stage pipelines) are "
+                    "not supported on TPU yet.",
+                    chips,
+                    world_size,
+                    world_size - 1,
                 )
             cls._set_shared_slicebuilder_addresses(world_size)
             cls._offload_dense_all_to_all()

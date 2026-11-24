@@ -331,13 +331,10 @@ def test_dist_backend_after_world_size_pop(monkeypatch):
     assert OmniTpuPlatform().dist_backend == "tpu_dist"
 
 
-@pytest.mark.parametrize(
-    "chips, raises", [(None, False), ("0,1", False), ("1,2", True)]
-)
-def test_set_device_raises_on_pinned_multi_rank_stage(monkeypatch, chips, raises):
+@pytest.mark.parametrize("chips, warns", [(None, False), ("0,1", False), ("1,2", True)])
+def test_set_device_warns_on_pinned_multi_rank_stage(monkeypatch, chips, warns):
     # Ranks bind chips 0..N-1 by local rank, so a stage pinned to other chips
-    # (e.g. a diffusion stage in a multi-stage pipeline) would land on chips
-    # another stage may own.
+    # (e.g. a diffusion stage in a multi-stage pipeline) is flagged.
     monkeypatch.setenv("WORLD_SIZE", "2")
     monkeypatch.setenv("MASTER_PORT", "29500")
     monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:1")
@@ -352,12 +349,13 @@ def test_set_device_raises_on_pinned_multi_rank_stage(monkeypatch, chips, raises
         staticmethod(lambda world_size: None),
     )
     monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
-    with patch("torch.empty"), patch("torch.device"):
-        if raises:
-            with pytest.raises(ValueError, match="not supported on TPU yet"):
-                OmniTpuPlatform.set_device(None)
-        else:
-            OmniTpuPlatform.set_device(None)
+    with (
+        patch("vllm_torchtpu.omni.platform.logger.warning") as mock_warning,
+        patch("torch.empty"),
+        patch("torch.device"),
+    ):
+        OmniTpuPlatform.set_device(None)
+    assert mock_warning.called == warns
 
 
 def test_memory_methods(monkeypatch):
