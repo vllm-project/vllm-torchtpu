@@ -4,12 +4,15 @@
 import argparse
 import asyncio
 import codecs
+import hashlib
 import itertools
+import json
 import logging
 import os
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -22,6 +25,8 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 _ROUTING_POLICIES = ("round_robin", "least_loaded", "sticky")
+# Decode-only PROXY_DECODE_ROUTING values served by _DecodeSessionAffinity.
+_DECODE_AFFINITY_POLICIES = ("session_affinity", "prefix_affinity")
 
 
 class _LegRouter:
@@ -411,10 +416,16 @@ async def lifespan(app: FastAPI):
         _env_int("PROXY_PREFILL_STICKY_MAX_INFLIGHT", 0),
         log_interval_s,
     )
+    # PROXY_DECODE_ROUTING=session_affinity|prefix_affinity (form-ox) selects the
+    # prompt-digest decode router below instead of _LegRouter's decode policy;
+    # _LegRouter then stays at round_robin and is not used for decode.
+    decode_policy = os.getenv("PROXY_DECODE_ROUTING", "round_robin").strip().lower()
+    if decode_policy in _DECODE_AFFINITY_POLICIES:
+        decode_policy = "round_robin"
     app.state.decode_router = _LegRouter(
         "decode",
         len(app.state.decode_clients),
-        os.getenv("PROXY_DECODE_ROUTING", "round_robin").strip().lower(),
+        decode_policy,
         _env_int("PROXY_DECODE_STICKY_MAX_INFLIGHT", 0),
         log_interval_s,
     )
@@ -432,6 +443,19 @@ async def lifespan(app: FastAPI):
         + f" affinity_header={app.state.affinity_header}",
         flush=True,
     )
+    app.state.decode_affinity = _make_decode_affinity(len(app.state.decode_clients))
+    if app.state.decode_affinity is not None:
+        print(f"Decode routing: {app.state.decode_affinity.describe()}", flush=True)
+
+    # PROXY_Q38_DECPC_IDENTITY=1: the decode prefix-cache identity driver
+    # (q38_decpc_identity.py); /healthcheck answers 503 until it finishes.
+    if os.getenv("PROXY_Q38_DECPC_IDENTITY", "0") == "1":
+        import q38_decpc_identity
+
+        _Q38_IDENTITY["done"] = False
+        app.state.q38_identity = asyncio.create_task(
+            q38_decpc_identity.start(app, global_args.port, _Q38_IDENTITY)
+        )
 
     yield
 
@@ -489,6 +513,177 @@ def parse_args():
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
 
     return args
+
+
+class _DecodeSessionAffinity:
+    """Decode-session affinity (PROXY_DECODE_ROUTING=session_affinity; any other
+    value, or unset, keeps the round robin).
+
+    With a decode prefix cache, a returning conversation turn only hits if it
+    reaches the decode instance that holds its earlier KV; a round robin over D
+    decodes finds it about 1 time in D. This router sends a returning turn back
+    to the decode that served the conversation's previous request.
+
+    * Key: the request's prompt as bytes, prefix-stable across turns. Chat: the
+      tools, then each message as sorted-key JSON, one per line, so turn k's key
+      is a byte prefix of turn k+1's. Completions: the prompt text, or its token
+      ids joined by commas. Batched prompts get no key (routed cold).
+    * Digests: cumulative blake2b over fixed-size chunks of the key. For each
+      digest the router keeps the decode that last served it and the first
+      digest that ever followed it ("next").
+    * Returning turn ("sticky"): the request's deepest known digest was the END
+      of an earlier request (no next recorded). Its decode is the target.
+    * A request that only shares a head with other conversations (a common
+      system prompt) matches a digest that an earlier chain continued past
+      ("branch"): it is not a returning turn and goes to the least-loaded
+      decode, as does a request with no known digest ("cold"). Limitation: a
+      conversation whose first request ends less than one chunk past a shared
+      head is indistinguishable from that head, so its second turn routes as
+      a branch; from the turn after, it is sticky.
+    * Guard: with max_skew > 0, a sticky target holding more than max_skew
+      in-flight requests above the least-loaded decode is overridden ("guard").
+    * Load: in-flight requests per decode, from the decode choice until the
+      decode stream ends. Ties go round robin.
+    * PROXY_DECODE_ROUTING=prefix_affinity (q38 CACHE-3; rule "longest") routes
+      to the decode that last served the request's LONGEST known prefix, shared
+      heads included ("prefix" when it is not a returning turn), with
+      LEV-CACHE's bounded load instead of max_skew: a target whose in-flight
+      count exceeds (1 + slack) x the mean over decodes + 1 is overridden
+      ("guard"; the rule of vllm_torchtpu/core/dp_affinity.py within_bound on
+      q38-o4-affine). Decodes are the (host, port) endpoints in the order given,
+      so two decode servers on one host are two targets.
+    """
+
+    def __init__(self, n_decodes: int, chunk: int = 2048, max_skew: int = 16,
+                 max_entries: int = 2_000_000, rule: str = "sticky",
+                 slack: float | None = None) -> None:
+        if n_decodes < 1:
+            raise ValueError(f"n_decodes must be >= 1, got {n_decodes}")
+        if rule not in ("sticky", "longest"):
+            raise ValueError(f"rule must be 'sticky' or 'longest', got {rule!r}")
+        self.rule = rule
+        self.slack = None if slack is None else max(0.0, float(slack))
+        self.n = n_decodes
+        self.chunk = max(64, int(chunk))
+        self.max_skew = max(0, int(max_skew))
+        self.max_entries = max(1, int(max_entries))
+        self._lock = threading.Lock()
+        # digest -> [decode that last served it, first digest that followed it or None]
+        self.entries: OrderedDict[bytes, list] = OrderedDict()
+        self.inflight = [0] * n_decodes
+        self._reqs: dict[str, int] = {}
+        self._tie = 0
+        self.counts = {"sticky": 0, "cold": 0, "branch": 0, "prefix": 0, "guard": 0}
+
+    @staticmethod
+    def key(req_data: dict) -> bytes:
+        messages = req_data.get("messages")
+        if isinstance(messages, list):
+            parts = []
+            if req_data.get("tools") is not None:
+                parts.append(json.dumps(req_data["tools"], sort_keys=True, ensure_ascii=False,
+                                        separators=(",", ":")))
+            for m in messages:
+                parts.append(json.dumps(m, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
+            return ("\n".join(parts) + "\n").encode("utf-8", errors="ignore")
+        prompt = req_data.get("prompt")
+        if isinstance(prompt, str):
+            return prompt.encode("utf-8", errors="ignore")
+        if isinstance(prompt, list) and prompt and all(type(t) is int for t in prompt):
+            return (",".join(map(str, prompt)) + ",").encode()
+        return b""
+
+    def hashes(self, raw: bytes) -> list[bytes]:
+        out: list[bytes] = []
+        h = hashlib.blake2b(digest_size=16)
+        for i in range(0, len(raw) - self.chunk + 1, self.chunk):
+            h.update(raw[i : i + self.chunk])
+            out.append(h.digest())
+        return out
+
+    def _least(self) -> int:
+        lo = min(self.inflight)
+        for k in range(self.n):
+            d = (self._tie + k) % self.n
+            if self.inflight[d] == lo:
+                self._tie = (d + 1) % self.n
+                return d
+        raise AssertionError("unreachable")
+
+    def choose(self, hs: list[bytes], req_id: str) -> tuple[int, str, int]:
+        """(decode index, reason, matched chunks) for a request with digests hs."""
+        with self._lock:
+            depth, target, reason = 0, None, "cold"
+            for i in range(len(hs) - 1, -1, -1):
+                ent = self.entries.get(hs[i])
+                if ent is None:
+                    continue
+                depth = i + 1
+                nxt = hs[i + 1] if i + 1 < len(hs) else None
+                if ent[1] is None or ent[1] == nxt:
+                    target, reason = ent[0], "sticky"
+                elif self.rule == "longest":
+                    target, reason = ent[0], "prefix"
+                else:
+                    reason = "branch"
+                break
+            if target is not None and self.max_skew and self.inflight[target] > min(self.inflight) + self.max_skew:
+                target, reason = None, "guard"
+            if (target is not None and self.slack is not None
+                    and self.inflight[target] > (1.0 + self.slack) * sum(self.inflight) / self.n + 1.0):
+                target, reason = None, "guard"
+            pick = target if target is not None else self._least()
+            self.inflight[pick] += 1
+            self._reqs[req_id] = pick
+            for i, d in enumerate(hs):
+                ent = self.entries.get(d)
+                nxt = hs[i + 1] if i + 1 < len(hs) else None
+                if ent is None:
+                    self.entries[d] = [pick, nxt]
+                else:
+                    ent[0] = pick
+                    if ent[1] is None:
+                        ent[1] = nxt
+                    self.entries.move_to_end(d)
+            while len(self.entries) > self.max_entries:
+                self.entries.popitem(last=False)
+            self.counts[reason] += 1
+            return pick, reason, depth
+
+    def done(self, req_id: str) -> None:
+        with self._lock:
+            d = self._reqs.pop(req_id, None)
+            if d is not None:
+                self.inflight[d] = max(0, self.inflight[d] - 1)
+
+    def describe(self) -> str:
+        mode = "session_affinity" if self.rule == "sticky" else "prefix_affinity"
+        return (f"{mode} decodes={self.n} chunk={self.chunk} max_skew={self.max_skew} "
+                f"max_entries={self.max_entries} rule={self.rule} slack={self.slack}")
+
+
+def _make_decode_affinity(n_decodes: int) -> "_DecodeSessionAffinity | None":
+    """The decode affinity router for PROXY_DECODE_ROUTING=session_affinity (DECPC: sticky
+    returning turns, max_skew guard) or prefix_affinity (q38 CACHE-3: longest prefix incl.
+    shared heads, bounded load (1 + slack) x mean + 1, max_skew off); else None (round robin)."""
+    mode = os.getenv("PROXY_DECODE_ROUTING", "round_robin").strip().lower()
+    if mode == "session_affinity":
+        return _DecodeSessionAffinity(
+            n_decodes,
+            chunk=_env_int("PROXY_DECODE_AFFINITY_CHUNK", 2048),
+            max_skew=_env_int("PROXY_DECODE_AFFINITY_MAX_SKEW", 16),
+            max_entries=_env_int("PROXY_DECODE_AFFINITY_MAX_ENTRIES", 2_000_000),
+        )
+    if mode == "prefix_affinity":
+        return _DecodeSessionAffinity(
+            n_decodes,
+            chunk=_env_int("PROXY_DECODE_AFFINITY_CHUNK", 2048),
+            max_skew=_env_int("PROXY_DECODE_AFFINITY_MAX_SKEW", 0),
+            max_entries=_env_int("PROXY_DECODE_AFFINITY_MAX_ENTRIES", 2_000_000),
+            rule="longest",
+            slack=_env_float("PROXY_DECODE_AFFINITY_SLACK", 0.25),
+        )
+    return None
 
 
 async def send_request_to_prefill(
@@ -606,10 +801,66 @@ async def stream_from_decode(
             raise
 
 
+def _prefill_usage_log(response_json: Any) -> str:
+    """`` prompt_tokens=P cached_tokens=C`` from the prefill's usage, if any.
+
+    With --enable-prompt-tokens-details the prefill reports how many prompt
+    tokens its own prefix cache supplied; joined by kv_uuid with the decode's
+    Stage-3 load line (skip_tokens), it shows per request where the decode's
+    local hit reaches beyond the prefill's (decode_prefix_cache.md §13)."""
+    usage = response_json.get("usage") if isinstance(response_json, dict) else None
+    if not isinstance(usage, dict):
+        return ""
+    out = ""
+    if isinstance(usage.get("prompt_tokens"), int):
+        out += f" prompt_tokens={usage['prompt_tokens']}"
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and isinstance(details.get("cached_tokens"), int):
+        out += f" cached_tokens={details['cached_tokens']}"
+    return out
+
+
+_Q38_PREAMBLE_BLOCK = (
+    "[Padding block {i}] This block is neutral padding and carries no "
+    "information about the task. Ignore every padding block and answer only "
+    "the request that follows the padding.\n"
+)
+
+
+def _q38_apply_preamble(req_data: dict) -> dict:
+    """PROXY_Q38_PREAMBLE_REPEATS=N (> 0): prepend the same N-block text
+    preamble to every completion prompt or chat conversation, so every request
+    shares a long common prefix. An accuracy gate for the decode prefix cache
+    sets it in BOTH arms: identical prompts, and with decode caching on every
+    request after the first adopts the shared prefix the decode already holds
+    (a cross-request hit, like a returning turn). Token-id prompts are left
+    unchanged."""
+    repeats = _env_int("PROXY_Q38_PREAMBLE_REPEATS", 0)
+    if repeats <= 0:
+        return req_data
+    text = "".join(_Q38_PREAMBLE_BLOCK.format(i=i + 1) for i in range(repeats))
+    out = dict(req_data)
+    prompt = out.get("prompt")
+    if isinstance(prompt, str):
+        out["prompt"] = text + prompt
+    elif isinstance(prompt, list) and prompt and all(isinstance(p, str) for p in prompt):
+        out["prompt"] = [text + p for p in prompt]
+    messages = out.get("messages")
+    if isinstance(messages, list) and messages:
+        messages = [dict(m) for m in messages]
+        first = messages[0]
+        if first.get("role") == "system" and isinstance(first.get("content"), str):
+            first["content"] = text + first["content"]
+        else:
+            messages.insert(0, {"role": "system", "content": text.rstrip("\n")})
+        out["messages"] = messages
+    return out
+
+
 async def _handle_completions(api: str, request: Request):
     try:
         t_request_recv_perf = time.perf_counter()
-        req_data = await request.json()
+        req_data = _q38_apply_preamble(await request.json())
         request_id = str(uuid.uuid4())
         # vLLM sends a request carrying X-data-parallel-rank to that DP rank of
         # the engine. Passed to both hops, so that a client can hold a request
@@ -673,7 +924,7 @@ async def _handle_completions(api: str, request: Request):
         kv_uuid_log = f" kv_uuid={kv_uuid}" if kv_uuid is not None else ""
         print(
             f"PERF PROXY prefill_recv req_id={request_id} ts={t_prefill_recv:.6f} "
-            f"dur_ms={prefill_ms:.2f}{kv_uuid_log}",
+            f"dur_ms={prefill_ms:.2f}{kv_uuid_log}{_prefill_usage_log(response_json)}",
             flush=True,
         )
 
@@ -700,10 +951,22 @@ async def _handle_completions(api: str, request: Request):
                 },
             )
 
+        # The decode: _LegRouter (PROXY_DECODE_ROUTING=round_robin|least_loaded|
+        # sticky), chosen now; or, with PROXY_DECODE_ROUTING=session_affinity|
+        # prefix_affinity (form-ox), _DecodeSessionAffinity, chosen when the
+        # stream starts so its in-flight count is released in the same finally
+        # that ends the stream.
+        affinity = getattr(request.app.state, "decode_affinity", None)
         decode_router = request.app.state.decode_router
-        decode_idx, decode_route = decode_router.acquire(affinity_key)
-        decode_client_info = request.app.state.decode_clients[decode_idx]
         released = False
+        if affinity is None:
+            decode_idx, decode_route = decode_router.acquire(affinity_key)
+            decode_client_info = request.app.state.decode_clients[decode_idx]
+            logger.debug("Using %s %s", prefill_client_info, decode_client_info)
+            route_key = None
+        else:
+            decode_idx, decode_route, decode_client_info = None, None, None
+            route_key = affinity.key(req_data)
 
         def release_decode() -> None:
             # From the stream's finally, and again from the response's
@@ -711,29 +974,41 @@ async def _handle_completions(api: str, request: Request):
             nonlocal released
             if not released:
                 released = True
-                decode_router.release(decode_idx)
+                if decode_idx is not None:
+                    decode_router.release(decode_idx)
 
         async def release_decode_task() -> None:
             # Async so that Starlette runs it on the event loop: a sync
             # background task runs in a threadpool, racing acquire().
             release_decode()
 
-        logger.debug("Using %s %s", prefill_client_info, decode_client_info)
-
         # Stream response from decode service
         async def generate_stream():
+            if affinity is not None:
+                hs = affinity.hashes(route_key)
+                idx, reason, depth = affinity.choose(hs, request_id)
+                client_info = request.app.state.decode_clients[idx]
+                route = f"{affinity.rule}:{reason}"
+                print(
+                    f"PERF PROXY decode_route req_id={request_id} decode={idx} "
+                    f"reason={reason} matched={depth}/{len(hs)} "
+                    f"inflight={','.join(map(str, affinity.inflight))}{kv_uuid_log}",
+                    flush=True,
+                )
+            else:
+                client_info, idx, route = decode_client_info, decode_idx, decode_route
             try:
                 t_decode_send = time.time()
                 t_decode_send_perf = time.perf_counter()
                 print(
                     f"PERF PROXY decode_send req_id={request_id} "
-                    f"ts={t_decode_send:.6f}{kv_uuid_log} decode={decode_idx} "
-                    f"route={decode_route}",
+                    f"ts={t_decode_send:.6f}{kv_uuid_log} decode={idx} "
+                    f"route={route}",
                     flush=True,
                 )
                 first = True
                 async for chunk in stream_from_decode(
-                    decode_client_info, api, req_data, request_id, forwarded
+                    client_info, api, req_data, request_id, forwarded
                 ):
                     if first:
                         t_first = time.time()
@@ -746,12 +1021,14 @@ async def _handle_completions(api: str, request: Request):
                             f"PERF PROXY first_chunk req_id={request_id} "
                             f"ts={t_first:.6f} "
                             f"dur_from_decode_send_ms={decode_first_ms:.2f} "
-                            f"ttft_ms={ttft_ms:.2f}{kv_uuid_log} decode={decode_idx}",
+                            f"ttft_ms={ttft_ms:.2f}{kv_uuid_log} decode={idx}",
                             flush=True,
                         )
                         first = False
                     yield chunk
             finally:
+                if affinity is not None:
+                    affinity.done(request_id)
                 release_decode()
 
         # text/event-stream when the caller asked for a stream, which is what
@@ -804,9 +1081,14 @@ async def models():
     return JSONResponse(status_code=response.status_code, content=response.json())
 
 
+_Q38_IDENTITY = {"done": True}
+
+
 @app.get("/healthcheck")
 async def healthcheck():
     """Simple endpoint to check if the server is running."""
+    if not _Q38_IDENTITY["done"]:
+        return JSONResponse(status_code=503, content={"status": "identity driver running"})
     return {
         "status": "ok",
         "prefill_instances": len(app.state.prefill_clients),
