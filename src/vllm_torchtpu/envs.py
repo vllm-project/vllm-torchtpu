@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_MOE_EPLB_DYNAMIC: bool = False
     TPU_MOE_EPLB_MODE: str = "decode_only"
+    TPU_MOE_V2_INPUT_PIPELINE: str = "auto"
     TPU_MOE_EPLB_WINDOW_STEPS: int = 16
     TPU_MOE_EPLB_MIN_GAIN: float = 0.005
     TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB: int = 256
@@ -873,6 +874,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the effective DYNAMIC value below remains part of the compilation hash.
     "TPU_MOE_EPLB_MODE": env_with_choices(
         "TPU_MOE_EPLB_MODE", "decode_only", ["off", "prefill_only", "decode_only"]
+    ),
+    # Fused EP MoE v2 input pipeline (three-slot input prefetch "input3" and
+    # the 32-row compute-layout cache "cache32"). "auto" (default): use them
+    # where the tuned tables admit the shape; "off": legacy two-slot inputs.
+    # The tuned rungs come from prefill (M128) and are keyed by shape only, so
+    # they also engage on decode; on DSv4.1 1P1D D (AgentX c512) "off" cut the
+    # median decode step 42.7 -> 34.7 ms. Compiled-program flag (hashed).
+    "TPU_MOE_V2_INPUT_PIPELINE": env_with_choices(
+        "TPU_MOE_V2_INPUT_PIPELINE", "auto", ["auto", "off"]
     ),
     "TPU_MOE_EPLB_DYNAMIC": lambda: (
         env_bool("TPU_MOE_EPLB_DYNAMIC")()

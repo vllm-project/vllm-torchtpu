@@ -732,12 +732,16 @@ def _build_fused_ep_moe_kernel(
     tile_shift = host.pow2_shift(tile_m, "tile_m")
     height_rungs = tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
     input_key = (pltpu.get_tpu_info().chip_version, tile_m, hidden, inter, rhs_qb)
+    pipeline_on = envs.TPU_MOE_V2_INPUT_PIPELINE != "off"
     interleave_inputs = (
-        rhs_packed4
+        pipeline_on
+        and rhs_packed4
         and tuned_block_sizes.INPUT_SLOTS.get(input_key, OUT_PARITIES) == 3
         and host.TOKEN_GATHER_TILES_PER_WINDOW == 1
     )
-    layout_rows = tuned_block_sizes.INPUT_LAYOUT_ROWS.get(input_key)
+    layout_rows = (
+        tuned_block_sizes.INPUT_LAYOUT_ROWS.get(input_key) if pipeline_on else None
+    )
     if not rhs_packed4 or (
         layout_rows is not None and any(height % layout_rows for height in height_rungs)
     ):
