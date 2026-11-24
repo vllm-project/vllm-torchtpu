@@ -6,7 +6,7 @@ The `vllm_torchtpu.megakernel.advisor` package evaluates whether a model and ser
 
 ### 1. Prior Estimate (`estimate`)
 
-Evaluate HBM fit, the ideal-kernel VMEM token ceiling, roofline step floor, and uncertainty bands without a TPU or `jax` installation:
+Evaluate HBM fit, the ideal-kernel VMEM token ceiling, roofline step floor, and uncertainty bands on CPU without an attached TPU or PyTorch runtime:
 
 ```bash
 python -m vllm_torchtpu.megakernel.advisor estimate \
@@ -138,5 +138,5 @@ To onboard a new model:
 
 - Snapshot tests compare `data/presets/models.json` fields against the checked-in `hf_configs` snapshots.
 - `verify_core_limits_sync()` imports `megakernel/core` and cross-checks core limits, implemented core module packages, and default bucket tops against `CORE_LIMITS`.
-- Chip constants live in `chips.py` so the advisor imports cleanly without JAX, and a test cross-checks matching fields against JAX's `get_tpu_info_for_chip()`.
+- Built-in chip facts and sublane row tiles are read directly from JAX's `jax.experimental.pallas.tpu.get_tpu_info_for_chip()` in `chips.py`, and tests verify that every non-JAX field is explicitly enumerated.
 - Open request to the core owners: the accepted weight dtypes (`CORE_SUPPORTED_DTYPES`) have no exported symbol name in `megakernel/core/`, so they are not automatically checked by `verify_core_limits_sync()` (the per-layer all-reduce slot limit `max_ar_slots_per_layer` is verified behaviorally against `planner.plan` and `ring_scratch`).
