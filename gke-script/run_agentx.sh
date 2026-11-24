@@ -2,10 +2,13 @@
 # InferenceX AgentX（aiperf --scenario inferencex-agentx-mvp）打 2P1D proxy，每 30s 抓 P0 / P1 / D 的 /metrics。
 # 参数和 scripts/dsv41_pd/run_agentx.sh 相同（同一个 seed / 数据集 / scenario），只是地址从 GKE 现查、多抓一个 P。
 #   source c512.env && TAG=gke2p1d bash run_agentx.sh
-# 在开发机上跑（224 核；dsv41-bench pod 只有 16 vCPU，c512 下客户端可能成瓶颈）。结果：/zzlfs/temu/results/agentx-c<CONC>-<TAG>-<T>/
+# 可在开发机或 dsv41-bench pod 里跑（bench_agentx.sh）。注意开发机 10.128.0.39 有时兼做 VM 1P1D 的 D，那时不要在开发机上跑。结果：/zzlfs/temu/results/agentx-c<CONC>-<TAG>-<T>/
 set -uo pipefail
 source "$(dirname "$0")/common.sh"
-P0_IP=$(pod_ip "$(role_pod p0)"); P1_IP=$(pod_ip "$(role_pod p1)"); D_IP=$(pod_ip "$(role_pod d)")
+# 在没有 kubectl 的地方（dsv41-bench pod）跑时，由调用方传 P0_IP / P1_IP / D_IP
+if [[ -z "${P0_IP:-}" ]]; then
+  P0_IP=$(pod_ip "$(role_pod p0)"); P1_IP=$(pod_ip "$(role_pod p1)"); D_IP=$(pod_ip "$(role_pod d)")
+fi
 PROXY_URL=${PROXY_URL:-http://$P0_IP:8000}
 CONC=${CONC:-512}; DURATION=${DURATION:-3600}; TAG=${TAG:-gke2p1d}; T=$(date +%m%d-%H%M)
 TOKENIZER=${TOKENIZER:-/zzlfs/temu/tools/dsv41-tokenizer}
