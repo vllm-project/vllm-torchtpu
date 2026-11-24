@@ -57,8 +57,8 @@ from .indexer_select import (
 if TYPE_CHECKING:
     from .indexer_cache import PackedFP8IndexCacheRows
 
-# consume(start, rows, state, group) -> state; see `select_fp8_indexer_jax`.
-SelectionConsumer = Callable[[int, jax.Array, Any, int | None], Any]
+# consume(start, rows, state) -> state; see `select_fp8_indexer_jax`.
+SelectionConsumer = Callable[[int, jax.Array, Any], Any]
 
 _query_op = None
 _write_op = None
@@ -420,7 +420,7 @@ def _score_and_select_candidates(
             lambda tile: tile * query_chunk_size,
             score,
             select,
-            lambda tile, src, dst, _: jax.lax.dynamic_update_slice_in_dim(
+            lambda tile, src, dst: jax.lax.dynamic_update_slice_in_dim(
                 dst, src, tile * query_chunk_size, axis=0
             ),
             jnp.full((num_queries, k), -1, jnp.int32),
@@ -467,7 +467,7 @@ def _select_fp8_indexer_jax(
     def finish(selected, published):
         if consume is None:
             return selected, published
-        return selected, published, consume(0, selected, None, None)
+        return selected, published, consume(0, selected, None)
 
     layout = PackedFP8Layout(*layout_args)
     tokens, width = q.shape[0], score_width
@@ -742,7 +742,7 @@ def _select_fp8_indexer_jax(
     unrolled = not bounded or num_tiles <= indexer.MAX_UNROLLED_TILES
     tile_consume = consume if unrolled else None
 
-    def write(tile, selected, output, group):
+    def write(tile, selected, output):
         update = functools.partial(
             jax.lax.dynamic_update_slice_in_dim, start_index=tile * chunk_rows, axis=0
         )
@@ -752,9 +752,7 @@ def _select_fp8_indexer_jax(
         start = tile * chunk_rows
         rows = selected[0] if publish_rows else selected
         rows = jnp.where(short, visible[start : start + chunk_rows], rows)
-        return jax.tree.map(update, output, selected), tile_consume(
-            start, rows, state, group
-        )
+        return jax.tree.map(update, output, selected), tile_consume(start, rows, state)
 
     # Grouped requests need neither sorting nor output reordering, so no
     # runtime branch to the serial path: a branch costs an overlay load at its
@@ -818,11 +816,9 @@ def select_fp8_indexer_jax(
 
     Returns selected [T, topk] logical indices and published candidates. With
     ``consume``, a third result is its final state: every selected row reaches
-    ``consume(start, rows, state, group)`` exactly once, in ascending row
-    ranges, with ``state`` None at the first call. Prefill tiles feed it as
-    their selection completes, so its work overlaps the scoring and selection
-    of later tiles; ``group``, when not None, is the scheduling group of that
-    scoring, for the consumer's SparseCore work.
+    ``consume(start, rows, state)`` exactly once, in ascending row ranges, with
+    ``state`` None at the first call. Prefill tiles feed it as their selection
+    completes, so its work overlaps the scoring and selection of later tiles.
     """
     arguments = (
         q,

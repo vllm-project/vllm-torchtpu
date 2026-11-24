@@ -14,7 +14,7 @@ from vllm_torchtpu.kernels.attention_preprocessing import rope_gather
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
 from vllm_torchtpu.kernels.deepseek_v41 import output_projection
 from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
-    gather_csa2_kv_sc_inline,
+    gather_csa2_kv_sc,
     prepare_main_records,
     prepare_swa_metadata,
     publish_csa2_kv,
@@ -289,7 +289,7 @@ def _select_gather_attend(
         )
         return jnp.where(valid, selected, -1)
 
-    def consume(start, selected, state, group):
+    def consume(start, selected, state):
         selected = mask(start, selected)
         if state is None and selected.shape[0] == tokens:
             output, words, gathered_scales, counts = _gather_attend(
@@ -325,9 +325,7 @@ def _select_gather_attend(
             page_size=main_page_size,
             onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
         )
-        gathered = gather_csa2_kv_sc_inline(
-            word_banks, scale_banks, records, deep=deep, scheduling_group_id=group
-        )
+        gathered = gather_csa2_kv_sc(word_banks, scale_banks, records, deep=deep)
         if state is None:
             owners = None
             all_scales = jnp.zeros((tokens, 512), jnp.float32)

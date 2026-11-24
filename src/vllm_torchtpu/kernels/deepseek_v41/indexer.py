@@ -44,7 +44,7 @@ def pipeline_score_topk_unrolled(
         index = jnp.int32(tile)
         scores = score(prepare(index), None)
         selected = select(index, scores, None)
-        output = write(tile, selected, output, None)
+        output = write(tile, selected, output)
     return output
 
 
@@ -61,8 +61,7 @@ def pipeline_score_topk_bounded(
     Callbacks accept an optional scheduling group after their data arguments.
     Each pair gets a program-unique group so the compiler keeps TensorCore
     scoring between SparseCore selection start and completion. Up to
-    ``MAX_UNROLLED_TILES``, ``write`` receives the tile as a Python int and
-    the group of the scoring it overlaps, for its own SparseCore work.
+    ``MAX_UNROLLED_TILES``, ``write`` receives the tile as a Python int.
     """
     if num_tiles < 1:
         raise ValueError("The score/top-k pipeline requires at least one tile")
@@ -86,7 +85,6 @@ def pipeline_score_topk_bounded(
         previous = None
         for tile in range(num_tiles - 1):
             prepared = prepare(jnp.int32(tile + 1))
-            group = group_base + tile
             if previous is not None:
                 # Gating on the output too completes each write within the
                 # next pair, so work the write starts on a tile's selection
@@ -94,15 +92,16 @@ def pipeline_score_topk_bounded(
                 previous, current, prepared, output = lax.optimization_barrier(
                     (previous, current, prepared, output)
                 )
-                output = write(tile - 1, previous, output, group)
+                output = write(tile - 1, previous, output)
+            group = group_base + tile
             following = score(prepared, group)
             previous = select(jnp.int32(tile), current, group)
             current = following
         if previous is not None:
             previous, current = lax.optimization_barrier((previous, current))
-            output = write(num_tiles - 2, previous, output, None)
+            output = write(num_tiles - 2, previous, output)
         last = num_tiles - 1
-        return write(last, select(jnp.int32(last), current, None), output, None)
+        return write(last, select(jnp.int32(last), current, None), output)
 
 
 def pipeline_score_topk(num_tiles, prepare, score, select, write, output):
@@ -116,7 +115,7 @@ def pipeline_score_topk(num_tiles, prepare, score, select, write, output):
     def advance(tile, state):
         current, result = state
         following = score(prepare(tile + 1))
-        return following, write(tile, select(tile, current), result, None)
+        return following, write(tile, select(tile, current), result)
 
     def body(pair, state):
         tile = 2 * pair
@@ -126,8 +125,8 @@ def pipeline_score_topk(num_tiles, prepare, score, select, write, output):
         prepared, selected = lax.optimization_barrier((prepare(tile + 2), selected))
         replacement = score(prepared)
         following_selected = select(tile + 1, following)
-        result = write(tile, selected, result, None)
-        result = write(tile + 1, following_selected, result, None)
+        result = write(tile, selected, result)
+        result = write(tile + 1, following_selected, result)
         return replacement, result
 
     pairs = (num_tiles - 1) // 2
@@ -137,8 +136,5 @@ def pipeline_score_topk(num_tiles, prepare, score, select, write, output):
             state = advance(jnp.int32(2 * pairs), state)
         last, result = state
         return write(
-            jnp.int32(num_tiles - 1),
-            select(jnp.int32(num_tiles - 1), last),
-            result,
-            None,
+            jnp.int32(num_tiles - 1), select(jnp.int32(num_tiles - 1), last), result
         )
