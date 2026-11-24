@@ -55,7 +55,7 @@ def test_paged_mqa_logits_matches_reference(page_size, max_model_len, reuse_keys
     counts = np.array([6, 5, 6])  # A ragged request leaves a partial query tile.
     # Near-full, empty-to-short, and mid-width histories; one invalid page. A
     # resident tile instead ends one in a live rung below the full width.
-    mid = max_model_len - 6000 if reuse_keys else max_model_len // 2 - 3
+    mid = max_model_len - 10000 if reuse_keys else max_model_len // 2 - 3
     bases = np.array([max_model_len - 5, 0, mid])
     lengths = np.concatenate([b + np.arange(c) for b, c in zip(bases, counts)])
     owners = np.repeat(np.arange(len(counts)), counts)
