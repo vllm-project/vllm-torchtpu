@@ -199,6 +199,8 @@ def _stage_wrapper(original: Any, stage: str) -> Any:
         # Shape metadata only: host dispatch time is not device execution time.
         row["dispatch_ns"] = time.perf_counter_ns()
         result = original(module, *args, **kwargs)
+        # A long dispatch means the device queue was full (host ahead).
+        row["host_return_ns"] = time.perf_counter_ns()
         recorder.stages.append(row)
         if recorder.pending is not None:
             recorder.pending["stages"].append(row)
@@ -224,6 +226,17 @@ class Recorder:
         self.sample = runner.sample_tokens
         runner.execute_model = self.execute_model
         runner.sample_tokens = self.sample_tokens
+        coordinate = runner._dp_coordinated_step
+
+        def dp_coordinated_step(*args: Any, **kwargs: Any) -> Any:
+            # The DP-wide host all-reduce that every rank enters once a step.
+            started = time.perf_counter_ns()
+            result = coordinate(*args, **kwargs)
+            if self.enabled and self.pending is not None:
+                self.pending["dp_sync_ns"] = [started, time.perf_counter_ns()]
+            return result
+
+        runner._dp_coordinated_step = dp_coordinated_step
         if scenario.name == "decode":
             drafter = runner.drafter
             prepare = drafter._prepare_dflash_inputs
@@ -261,13 +274,16 @@ class Recorder:
                 for req, tokens in scheduler_output.scheduled_spec_decode_tokens.items()
             }
         result = self.execute(scheduler_output, *args, **kwargs)
+        self.pending["execute_return_ns"] = time.perf_counter_ns()
         if result is not None:
             self.finish(result)
         return result
 
     def sample_tokens(self, *args: Any, **kwargs: Any) -> Any:
+        started = time.perf_counter_ns()
         result = self.sample(*args, **kwargs)
         if self.enabled and self.pending is not None:
+            self.pending["sample_ns"] = [started, time.perf_counter_ns()]
             self.finish(result)
         return result
 
