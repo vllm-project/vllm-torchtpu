@@ -321,24 +321,34 @@ def _pick_t(
         else:
             s = scores_ref[:, pl.ds(start, chunk)].T
         cols = start + jax.lax.broadcasted_iota(jnp.int32, (chunk, rows), 0)
-        blocks = cols * dcp + rank
-        visible = (blocks < num_visible) & (cols < real_cols)
-        s = jnp.where(visible, s, _NEG_INF)
-        s = jnp.where(
-            visible & (blocks >= num_visible - local_blocks),
-            msa_select._FORCED_LOCAL_SCORE,
+        key_ref[pl.ds(start, chunk), :] = _column_keys(
             s,
+            cols,
+            num_visible,
+            rank,
+            dcp=dcp,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            col_bits=col_bits,
+            real_cols=real_cols,
         )
-        if init_blocks:
-            s = jnp.where(
-                visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
-            )
-        key_ref[pl.ds(start, chunk), :] = _score_keys(s, cols, col_bits)
         return carry
 
     jax.lax.fori_loop(0, chunks, build, 0)
+    picks = _scan_picks(key_ref, chunks * chunk, topk)
+    return _picked(picks, rank, col_bits=col_bits, dcp=dcp)
+
+
+def _scan_picks(key_ref, num_cols, topk) -> list[jax.Array]:
+    """The `topk` largest keys of each column (row) of ``key_ref[:num_cols]``,
+    ``[1, rows]`` each, best first; `num_cols` a traced multiple of 32.
+
+    A pick is the largest key below the last (`_next_pick`): with
+    `_PICK_ACCUMULATORS` running maxima, one per 8-sublane group, its loop
+    unrolled `_PICK_UNROLL` times."""
+    rows = key_ref.shape[1]
     sub = 8 * _PICK_ACCUMULATORS
-    trips = chunks * chunk // sub
+    trips = num_cols // sub
 
     def scan(off, acc, v):
         x = key_ref[pl.ds(pl.multiple_of(v * sub, sub), sub), :]
@@ -348,8 +358,6 @@ def _pick_t(
 
     picks, prev = [], jnp.full((8, rows), _KEY_TOP, jnp.int32)
     for _ in range(topk):
-        # The largest key below the last pick: ``key - off`` wraps the keys
-        # at or above it below every other.
         off = prev ^ _INT_MIN
 
         def unrolled(i, acc, off=off):
@@ -365,11 +373,46 @@ def _pick_t(
             lambda v, acc, off=off: scan(off, acc, v),
             acc,
         )
-        best = functools.reduce(jnp.maximum, acc)
-        for shift in (4, 2, 1):  # across sublanes: every sublane gets the max
-            best = jnp.maximum(best, pltpu.roll(best, shift, 0))
-        prev = best + off
+        prev = _next_pick(acc, off)
         picks.append(prev[:1])
+    return picks
+
+
+def _column_keys(
+    s, cols, num_visible, rank, *, dcp, init_blocks, local_blocks, col_bits, real_cols
+) -> jax.Array:
+    """Pick keys (`_score_keys`) of scores ``s [columns, rows]`` of this rank's
+    columns `cols` for rows that see `num_visible` blocks ``[1, rows]``:
+    invisible blocks -inf, forced blocks `msa_select`'s forced scores."""
+    blocks = cols * dcp + rank
+    visible = (blocks < num_visible) & (cols < real_cols)
+    s = jnp.where(visible, s, _NEG_INF)
+    s = jnp.where(
+        visible & (blocks >= num_visible - local_blocks),
+        msa_select._FORCED_LOCAL_SCORE,
+        s,
+    )
+    if init_blocks:
+        s = jnp.where(
+            visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
+        )
+    return _score_keys(s, cols, col_bits)
+
+
+def _next_pick(acc, off) -> jax.Array:
+    """The pick of a scan's running maxima `acc` (of ``key - off``, `_pick_t`)
+    as an ``[8, rows]`` key, the same in every sublane. ``key - off`` wraps
+    the keys at or above the last pick below every other, so this is the
+    largest key below it."""
+    best = functools.reduce(jnp.maximum, acc)
+    for shift in (4, 2, 1):  # across sublanes: every sublane gets the max
+        best = jnp.maximum(best, pltpu.roll(best, shift, 0))
+    return best + off
+
+
+def _picked(picks, rank, *, col_bits, dcp) -> tuple[jax.Array, jax.Array]:
+    """``(scores, blocks)`` ``[topk, rows]`` of the picked keys (``[1, rows]``
+    each, best first)."""
     # Odd ranks list their picks in reverse (`local_candidates`).
     keys = jnp.where(
         (rank & 1) == 1, jnp.concatenate(picks[::-1]), jnp.concatenate(picks)
@@ -1106,6 +1149,10 @@ def rotate_folded_queries(index_q: jax.Array, *, interpret: bool = False) -> jax
     )
 
 
+# Below every pick key (`_score_keys`): columns a pick scans past the scored.
+_KEY_FLOOR = -_KEY_TOP
+
+
 def _prefill_candidates_kernel(
     # Scalar prefetch
     work_ref,  # [items] tile << _TILE_SHIFT | page group (`msa_indexer.class_work`)
@@ -1126,30 +1173,38 @@ def _prefill_candidates_kernel(
     # Scratch
     buf,  # `msa_indexer._kernel_v3`'s ring and semaphores
     sems,
-    scores_ref,  # [P, Bq] f32 the tile's block maxima
-    key_ref,  # [P, Bq] int32 (`_pick_t`)
+    keys_ref,  # [P, Bq] int32 the tile's pick keys (`_column_keys`)
+    pad_scores,  # [32, 128] f32 and int32: the picks of position 0
+    pad_keys,
     rows_ref,  # [rows + Bq, 2 * topk] f32 the candidates being assembled
     small_buf,  # [small tiles * Bs, 2 * topk] f32
     copy_sems,  # DMA [2]: small-class candidates in, candidates out
     *,
     pick,
+    chunk,
 ):
     """`msa_indexer._kernel_v3` over the large (prefill-chunk) tiles with each
-    tile's block maxima kept in VMEM, ``[P, Bq]`` as scored, and its rows'
-    picks (`_pick_t`) at the tile's last page group: the scores never
-    round-trip through HBM. The picks land at their query rows (rows of
-    other requests, from aligned tile starts and past a request's end, are
-    left to their own tiles); at the last step the small tiles'
-    `pack_candidates` join them at theirs and rows past the last request
-    take the picks of position 0, so the output is in query-row order with
-    no gather."""
+    tile's pick keys built from its block maxima as they are scored, in
+    VMEM, and its rows' picks (`_pick_t`'s scan) at the tile's last page
+    group: the scores never round-trip through HBM. (Spreading a tile's
+    scan over the next tile's scoring bodies made them slower than the scan
+    alone: they have no free vector registers.)
+
+    The picks land at their query rows (rows of other requests, from
+    aligned tile starts and past a request's end, are left to their own
+    tiles); at the last step the small tiles' `pack_candidates` join them
+    at theirs and rows past the last request take the picks of position 0,
+    so the output is in query-row order with no gather. `chunk` is
+    `_kernel_v3`'s pages per dot."""
     tile_shift, row_shift = msa_indexer._TILE_SHIFT, msa_indexer._ROW_SHIFT
     seq_mask = msa_indexer._SEQ_MASK
+    topk, dcp, col_bits = pick["topk"], pick["dcp"], pick["col_bits"]
     step, last = pl.program_id(0), pl.num_programs(0) - 1
     entry = work_ref[step]
     tile = entry >> tile_shift
     group = entry & msa_indexer._GROUP_MASK
     pages_per_step = buf.shape[1]
+    num_cols = keys_ref.shape[0]
     rank = rank_ref[0]
     small_copy = pltpu.make_async_copy(small_ref, small_buf, copy_sems.at[0])
 
@@ -1157,12 +1212,23 @@ def _prefill_candidates_kernel(
     def _():
         small_copy.start()
 
+    num_visible = pos_ref[...] // pick["block_size"] + 1  # [1, Bq]
+
     def store(first, m, rows_major):
         m = m.T if rows_major else m
-        pages = pl.ds(
-            pl.multiple_of(group * pages_per_step + first, m.shape[0]), m.shape[0]
+        col0 = pl.multiple_of(group * pages_per_step + first, m.shape[0])
+        cols = col0 + jax.lax.broadcasted_iota(jnp.int32, m.shape, 0)
+        keys_ref[pl.ds(col0, m.shape[0]), :] = _column_keys(
+            m,
+            cols,
+            num_visible,
+            rank,
+            dcp=dcp,
+            init_blocks=pick["init_blocks"],
+            local_blocks=pick["local_blocks"],
+            col_bits=col_bits,
+            real_cols=pick["real_cols"],
         )
-        scores_ref[pages, :] = m
 
     msa_indexer._kernel_v3(
         work_ref,
@@ -1194,10 +1260,26 @@ def _prefill_candidates_kernel(
 
     @pl.when((step == last) | (next_tile != tile))
     def _():
-        score, block = _pick_t(
-            rank, scores_ref, pos_ref[...], key_ref, pretransposed=True, **pick
+        # As `_pick_t`: the columns its rows can see, in whole key chunks.
+        width = _KEY_CHUNK[True]
+        needed = (jnp.max(num_visible) + dcp - 1) // dcp
+        scanned = jnp.clip(-(-needed // width), 1, num_cols // width) * width
+        # Those past the scored pages (stale VMEM): below every key.
+        info = tile_info_ref[tile]
+        scored = -(-seq_pages_ref[info & seq_mask] // chunk)
+
+        def floor(c, carry):
+            rows = pl.ds(pl.multiple_of(c * chunk, chunk), chunk)
+            keys_ref[rows, :] = jnp.full(
+                (chunk, keys_ref.shape[1]), _KEY_FLOOR, jnp.int32
+            )
+            return carry
+
+        jax.lax.fori_loop(scored, scanned // chunk, floor, 0)
+        score, block = _picked(
+            _scan_picks(keys_ref, scanned, topk), rank, col_bits=col_bits, dcp=dcp
         )
-        put_rows(tile_info_ref[tile], packed(score, block), tile < tiles_ref[0])
+        put_rows(info, packed(score, block), tile < tiles_ref[0])
 
     @pl.when(step == last)
     def _():
@@ -1212,12 +1294,11 @@ def _prefill_candidates_kernel(
         jax.lax.fori_loop(0, tiles_ref[1], merge, 0)
         # Rows past the last request: a padding token's position is 0, which
         # sees one block whatever the scores.
-        lanes = _TRANSPOSED_ROWS
         score, block = _pick_t(
             rank,
-            scores_ref.at[:, :lanes],
-            jnp.zeros((1, lanes), jnp.int32),
-            key_ref.at[:, :lanes],
+            pad_scores,
+            jnp.zeros((1, pad_scores.shape[1]), jnp.int32),
+            pad_keys,
             pretransposed=True,
             **pick,
         )
@@ -1295,8 +1376,9 @@ def _prefill_candidates(
     scratch = [
         pltpu.VMEM(ring, jnp.uint32),
         pltpu.SemaphoreType.DMA((msa_indexer._RING_SLOTS,)),
-        pltpu.VMEM((num_cols, block_q), jnp.float32),
         pltpu.VMEM((num_cols, block_q), jnp.int32),
+        pltpu.VMEM((_KEY_CHUNK[True], _LANES), jnp.float32),
+        pltpu.VMEM((_KEY_CHUNK[True], _LANES), jnp.int32),
         pltpu.VMEM((assembled_rows, width), jnp.float32),
         pltpu.VMEM(small_packed.shape, jnp.float32),
         pltpu.SemaphoreType.DMA((2,)),
@@ -1304,12 +1386,17 @@ def _prefill_candidates(
     # [rows, 2 * topk] f32 pads to 128 lanes in VMEM.
     vmem_bytes = 4 * (
         ring[0] * ring[1] * ring[2] * ring[3]
-        + 2 * num_cols * block_q
+        + num_cols * block_q
         + (assembled_rows + small_packed.shape[0]) * _LANES
         + 2 * block_q * head_dim
     )
+    page_size = msa_indexer._page_tokens(rows_per_page, index_cache.dtype)
     return pl.pallas_call(
-        functools.partial(_prefill_candidates_kernel, pick=pick),
+        functools.partial(
+            _prefill_candidates_kernel,
+            pick=pick,
+            chunk=msa_indexer._v3_chunk(pages_per_step, block_q, page_size),
+        ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalars),
             grid=(jnp.maximum(work.group_ends[-1], 1),),
