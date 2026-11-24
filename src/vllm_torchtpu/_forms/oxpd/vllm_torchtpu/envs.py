@@ -638,8 +638,13 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_MOE_E7: bool = False
     VLLM_TPU_MK_MOE_AR2D: bool = False
     VLLM_TPU_MK_MOE_AR2D_MIN_TOKENS: int = 64
+    VLLM_TPU_MK_MOE_AR2D_ANY16: bool = False
+    VLLM_TPU_MK_AR2D_SINGLE_SLOT: bool = False
     VLLM_TPU_MK_MOE_EXACT_WIDTH: bool = False
     VLLM_TPU_MK_MOE_SKIP_PAD: bool = False
+    VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE: bool = False
+    VLLM_TPU_MK_VMEM_CUTS: str = ""
+    VLLM_TPU_MK_VMEM_CUT_ROWS: int = 33
     # q38 PORT-BL GDN (begin)
     VLLM_TPU_GDN_LEAN_GLUE3: bool = False
     VLLM_TPU_GDN_LEAN_GLUE3_COUNT: int = 0
@@ -3648,12 +3653,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_MK_MOE_AR2D_MIN_TOKENS": env_nonnegative_int(
         "VLLM_TPU_MK_MOE_AR2D_MIN_TOKENS", 64
     ),
+    # Lift HIER=4 AR2D row-divisibility gate from MR%64==0 to MR>=32 and MR%16==0
+    # (covers B=32,48,64,80,96,112,128 instead of falling back to HIER=5/2).
+    "VLLM_TPU_MK_MOE_AR2D_ANY16": env_bool("VLLM_TPU_MK_MOE_AR2D_ANY16", False),
+    # Synchronous HIER=4 AR2D: use 1 scratch/semaphore slot instead of 2 (saves
+    # 1.82 MiB VMEM at B=96, 2.42 MiB at B=128).
+    "VLLM_TPU_MK_AR2D_SINGLE_SLOT": env_bool("VLLM_TPU_MK_AR2D_SINGLE_SLOT", False),
     # Megakernel MoE: E7 exact-width uneven 2-round RS+AG (HIER=5, [384x4, 256x4] for
     # H=2560, R=8, zero padding) + MR-row active slicing in PIPE_EP for B<=8.
     "VLLM_TPU_MK_MOE_EXACT_WIDTH": env_bool("VLLM_TPU_MK_MOE_EXACT_WIDTH", False),
     # Megakernel MoE: skip padded rows (row >= query_start_loc[-1]) in router weights,
     # shared gate, expert dedup, and row-bucket counts (matching TPU_MOE_SKIP_PADDED_TOKENS).
     "VLLM_TPU_MK_MOE_SKIP_PAD": env_bool("VLLM_TPU_MK_MOE_SKIP_PAD", False),
+    # Main-KV DCP-2 whole-step buckets of 128+ rows: drop one expert ring slot
+    # (nbe - 1, 2 MiB VMEM) when not using single-slot AR2D (`hier == 4`).
+    "VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE": env_bool("VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE", False),
+    # Whole-step megakernel VMEM cut tokens (comma-separated, applied for rows >=
+    # VLLM_TPU_MK_VMEM_CUT_ROWS): supports `vmem64` and `ring` (`VMEM_CUT_RINGS` /
+    # `VMEM_CUT_RINGS_AR2D_SS`). Default "" = off.
+    "VLLM_TPU_MK_VMEM_CUTS": env_str("VLLM_TPU_MK_VMEM_CUTS", ""),
+    "VLLM_TPU_MK_VMEM_CUT_ROWS": env_nonnegative_int(
+        "VLLM_TPU_MK_VMEM_CUT_ROWS", 33
+    ),
     # q38 PORT-BL GDN (begin): Benliang Wang's GDN lean glue (aa8e6b237, VLLM_TPU_GDN_LEAN_GLUE) less its
     # window-log piece ("no_ckpt", which needs VLLM_TPU_GDN_WINDOW_LOG and so refuses D14). On the per-region unified
     # pool, every pooled GDN call with read offsets (speculative decoding) reads the step's stacked slot rows (one

@@ -92,6 +92,7 @@ def test_exact_flip_list_covers_registry():
     # 2-rank b1_tiles_profiles exact-flip fixture.
     separately_tested = {
         "gqa.kv_scatter_vec_ns",
+        "ar2d_single_slot",
         "moe.dedup_vec",
     }
     assert exact == {f for _, f, _, _, _ in EXACT_FLIPS} | separately_tested
