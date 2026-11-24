@@ -25,6 +25,8 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+import vllm_torchtpu.envs as envs
+
 # The checkpoint config may omit swiglu_beta; SwiGLU-OAI's up-bias is 1.
 _DEFAULT_SWIGLU_BETA = 1.0
 
@@ -83,6 +85,11 @@ class MiniMaxM3MLP(nn.Module):
                 # gate_up_proj is bias-free and keeps the linear's forward = apply.
                 gate_up = e4m3_apply(self.gate_up_proj, *x)
         else:
+            rows = self.__dict__.get("_e4m3_rows")
+            if rows is not None and rows[0].shape[0] == x.shape[0]:
+                # Shared expert of an SP step (TPU_MINIMAX_M3_SP_E4M3_SHARED):
+                # x is the bf16 dequantization of these e4m3 rows.
+                return self.forward(rows)
             gate_up, _ = self.gate_up_proj(x)
         x, _ = self.down_proj(self.act_fn(gate_up))
         return x
@@ -148,8 +155,19 @@ class MiniMaxM3MoE(nn.Module):
         """``hidden_states`` may come as e4m3 rows with per-row f32 scales (an
         SP step's e4m3 all-gather): the router and the experts (shared expert
         included) take them dequantized to bf16."""
+        rows = None
         if isinstance(hidden_states, tuple):
             q8, row_scale = hidden_states
             hidden_states = (q8.float() * row_scale).to(torch.bfloat16)
+            if envs.TPU_MINIMAX_M3_SP_E4M3_SHARED:
+                rows = (q8, row_scale)
         router_logits, _ = self.gate(hidden_states)
-        return self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        if rows is None:
+            return self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        # The shared expert runs inside the MoE runner on hidden_states; hand
+        # it the e4m3 rows for the duration of this call.
+        self.shared_experts.__dict__["_e4m3_rows"] = rows
+        try:
+            return self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        finally:
+            self.shared_experts.__dict__.pop("_e4m3_rows", None)

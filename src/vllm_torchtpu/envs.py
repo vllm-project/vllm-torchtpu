@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_FP8_ATTN_GATHER: bool = False
     TPU_MINIMAX_M3_SP_FUSED_NORM: bool = False
     TPU_MINIMAX_M3_SP_E4M3_QKV: bool = False
+    TPU_MINIMAX_M3_SP_E4M3_SHARED: bool = False
     TPU_MINIMAX_M3_SP_A2A_OPROJ: str = "off"
     TPU_MINIMAX_M3_SP_A2A_E4M3: bool = False
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
@@ -866,6 +867,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # contract the gathered e4m3 rows against their e4m3 weight (e4m3 x e4m3,
     # f32 accumulation) instead of dequantizing both to bf16.
     "TPU_MINIMAX_M3_SP_E4M3_QKV": env_bool("TPU_MINIMAX_M3_SP_E4M3_QKV", default=False),
+    # With the e4m3 gathers: the MoE layers' shared expert gate_up contracts
+    # the gathered e4m3 rows (e4m3 x e4m3, f32 accumulation) as qkv does,
+    # instead of the bf16 rows dequantized from them (bf16 x bf16).
+    "TPU_MINIMAX_M3_SP_E4M3_SHARED": env_bool(
+        "TPU_MINIMAX_M3_SP_E4M3_SHARED", default=False
+    ),
     # "full" SP: instead of reduce-scattering o_proj's per-rank partial sums
     # (bf16 [T, hidden]), all-to-all the attention output (bf16 [T, heads/TP x
     # head_dim], 1/6 of the bytes) so each rank holds every head of its token
