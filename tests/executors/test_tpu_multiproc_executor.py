@@ -18,6 +18,7 @@ import pytest
 from vllm.config import CacheConfig
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
+from vllm_torchtpu.executors import tpu_multiproc_executor
 from vllm_torchtpu.executors.tpu_multiproc_executor import (
     TpuMultiprocExecutor,
     _may_pack_prompts,
@@ -230,11 +231,11 @@ def test_ray_executor_raises_on_real_disagreement():
 _PROMPT = [7, 129279, 0, 42] * 1000
 
 
-def _new_request(prompt_token_ids):
+def _new_request(prompt_token_ids, req_id="r0"):
     from vllm.v1.core.sched.output import NewRequestData
 
     return NewRequestData(
-        req_id="r0",
+        req_id=req_id,
         prompt_token_ids=prompt_token_ids,
         mm_features=[],
         sampling_params=None,
@@ -305,3 +306,92 @@ def test_execute_model_keeps_lists_when_not_packing(mock_super):
 
     assert type(new_req.prompt_token_ids) is list
     assert new_req.prompt_token_ids == _PROMPT
+
+
+@pytest.fixture
+def prepacked():
+    """The input thread's packed prompts, as when the executor packs."""
+    import weakref
+
+    table = weakref.WeakValueDictionary()
+    with patch.object(tpu_multiproc_executor, "_prepacked", table):
+        yield table
+
+
+def test_prepack_packs_in_the_input_thread_preprocess(prepacked):
+    """The wrapped preprocess_add_request packs the request's prompt and
+    leaves the request's list prompt untouched; the entry lives as long as
+    its request."""
+    from array import array
+    from types import SimpleNamespace
+
+    from vllm.v1.engine.core import EngineCore
+
+    made = {
+        "core_req": SimpleNamespace(
+            request_id="r7", prompt_token_ids=list(_PROMPT), resumable=False
+        ),
+        "chunk": SimpleNamespace(
+            request_id="s1", prompt_token_ids=[5, 6], resumable=True
+        ),
+    }
+
+    def original(self, core_request):
+        return made.pop(core_request), 3
+
+    with patch.object(EngineCore, "preprocess_add_request", original):
+        tpu_multiproc_executor.install_prompt_prepack()
+        tpu_multiproc_executor.install_prompt_prepack()  # idempotent
+        assert EngineCore.preprocess_add_request._tpu_prompt_prepack
+        request, wave = EngineCore.preprocess_add_request(MagicMock(), "core_req")
+        EngineCore.preprocess_add_request(MagicMock(), "chunk")
+
+    assert wave == 3 and request.request_id == "r7"
+    assert type(request.prompt_token_ids) is list
+    packed = prepacked["r7"]
+    assert isinstance(packed, array) and packed.typecode == "i"
+    assert list(packed) == _PROMPT
+    # A streaming-input session's chunk is packed when it is scheduled.
+    assert "s1" not in prepacked
+    del request, packed
+    assert "r7" not in prepacked
+
+
+@patch.object(MultiprocExecutor, "execute_model", return_value="out")
+def test_execute_model_sends_the_prepacked_prompt(mock_super, prepacked):
+    """A prompt packed in the input thread is sent as is and leaves the
+    table."""
+    from array import array
+
+    packed = array("i", _PROMPT)
+    prepacked["r0"] = packed
+    new_req = _new_request(list(_PROMPT))
+    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    executor._pack_prompts = True
+
+    executor.execute_model(MagicMock(scheduled_new_reqs=[new_req]))
+
+    assert new_req.prompt_token_ids is packed
+    assert "r0" not in prepacked
+
+
+@patch.object(MultiprocExecutor, "execute_model", return_value="out")
+def test_execute_model_repacks_a_prompt_scheduled_with_other_tokens(
+    mock_super, prepacked
+):
+    """A stale entry (the prompt grew since it was packed) is not sent: the
+    scheduled prompt is packed instead."""
+    from array import array
+
+    shorter = array("i", _PROMPT[:-1])
+    rewritten = array("i", _PROMPT[:-1] + [99])
+    prepacked.update(r0=shorter, r1=rewritten)
+    new_reqs = [_new_request(list(_PROMPT), req_id) for req_id in ("r0", "r1")]
+    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    executor._pack_prompts = True
+
+    executor.execute_model(MagicMock(scheduled_new_reqs=new_reqs))
+
+    for new_req in new_reqs:
+        assert list(new_req.prompt_token_ids) == _PROMPT
+    assert len(prepacked) == 0

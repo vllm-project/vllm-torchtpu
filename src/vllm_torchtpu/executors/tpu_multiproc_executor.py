@@ -6,9 +6,11 @@ shape so each shape gets its own 60-second shm_broadcast window (~4s per shape)
 instead of all 14 shapes sharing a single window and timing out.
 
 It also sends new requests' prompts to the workers as one buffer
-(`_pack_new_request_prompts`).
+(`_pack_new_request_prompts`), packed in the engine core's input thread
+(`install_prompt_prepack`).
 """
 
+import weakref
 from array import array
 from importlib.metadata import entry_points
 from typing import cast
@@ -24,6 +26,59 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Tokens converted per call when packing a prompt, so the input thread yields
+# the GIL to the engine loop between slices.
+_PACK_SLICE = 16384
+
+# Request id -> its prompt packed by `install_prompt_prepack`. The vLLM Request
+# holds the array, so an entry lives no longer than its request. Written by the
+# engine core's input thread, read by its busy loop. None while prompts are sent
+# as lists.
+_prepacked: "weakref.WeakValueDictionary[str, array] | None" = None
+
+
+def _pack(tokens: list[int]) -> array:
+    packed = array("i")
+    for start in range(0, len(tokens), _PACK_SLICE):
+        packed.fromlist(tokens[start : start + _PACK_SLICE])
+    return packed
+
+
+def install_prompt_prepack() -> None:
+    """Pack each new request's prompt in the engine core's input thread.
+
+    Packing a whole prompt (prefix-cached part included) costs milliseconds for
+    a 100k-token prompt. Done in `execute_model`, it runs on the engine loop
+    between scheduling the request and sending the step to the workers, which
+    then start that step late; an idle DP rank's late start delays every rank.
+    `preprocess_add_request` already runs in the input thread, ahead of the
+    loop, for this kind of per-request work; it has no extension point, so it
+    is wrapped here. Inert unless `TpuMultiprocExecutor` packs prompts. The
+    packed copy (4 bytes per token) stays on the Request until it is freed.
+    """
+    from vllm.v1.engine.core import EngineCore
+
+    original = EngineCore.preprocess_add_request
+    if getattr(original, "_tpu_prompt_prepack", False):
+        return
+
+    def preprocess_add_request(self, request):
+        req, wave = original(self, request)
+        # A resumable (streaming-input) session reuses its request id: each
+        # later ADD carries only its chunk, and the scheduler extends the
+        # session's prompt. Its prompt is packed when it is scheduled.
+        if (
+            _prepacked is not None
+            and not req.resumable
+            and isinstance(req.prompt_token_ids, list)
+        ):
+            req._tpu_packed_prompt = _pack(req.prompt_token_ids)
+            _prepacked[req.request_id] = req._tpu_packed_prompt
+        return req, wave
+
+    preprocess_add_request._tpu_prompt_prepack = True  # type: ignore[attr-defined]
+    EngineCore.preprocess_add_request = preprocess_add_request  # type: ignore[method-assign]
+
 
 def _pack_new_request_prompts(scheduler_output: SchedulerOutput) -> None:
     """Turn each new request's `prompt_token_ids` list into an `array("i")`.
@@ -36,13 +91,24 @@ def _pack_new_request_prompts(scheduler_output: SchedulerOutput) -> None:
     block; indexing it still yields ints. The scheduler's own consumers (KV
     connector metadata) ran in `schedule()`, before this, on the list.
     """
+    prepacked = _prepacked if _prepacked is not None else {}
     for new_req in scheduler_output.scheduled_new_reqs:
-        if isinstance(new_req.prompt_token_ids, list):
-            # Deliberately not the declared list[int]: the same ints, sent as
-            # one buffer to consumers `_may_pack_prompts` vetted.
-            new_req.prompt_token_ids = cast(
-                list[int], array("i", new_req.prompt_token_ids)
-            )
+        packed = prepacked.pop(new_req.req_id, None)
+        if not isinstance(new_req.prompt_token_ids, list):
+            continue
+        prompt = new_req.prompt_token_ids
+        if (
+            packed is None
+            or len(packed) != len(prompt)
+            or (prompt and (packed[0] != prompt[0] or packed[-1] != prompt[-1]))
+        ):
+            # Not packed ahead (a resumable session, the in-process client
+            # without engine_core patches) or the prompt changed after it was
+            # packed (e.g. a KV connector truncated it): pack what is sent.
+            packed = _pack(prompt)
+        # Deliberately not the declared list[int]: the same ints, sent as one
+        # buffer to consumers `_may_pack_prompts` vetted.
+        new_req.prompt_token_ids = cast(list[int], packed)
 
 
 def _may_pack_prompts(vllm_config: VllmConfig) -> bool:
@@ -68,6 +134,9 @@ class TpuMultiprocExecutor(MultiprocExecutor):
         _patch_multiproc_worker_global_rank_env()
         super()._init_executor()
         self._pack_prompts = _may_pack_prompts(self.vllm_config)
+        if self._pack_prompts:
+            global _prepacked
+            _prepacked = weakref.WeakValueDictionary()
         logger.info(
             "New requests' prompts go to the workers as %s.",
             "array('i')" if self._pack_prompts else "lists",

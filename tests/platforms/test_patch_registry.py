@@ -219,6 +219,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_dsv41_page_order",
         "_patch_vllm_merge_multimodal_embeddings",
         "install_engine_core",
+        "install_prompt_prepack",
     ]
     assert stages["platform_activation"] == (
         stages["worker_init"] + stages["model_load"]
