@@ -19,8 +19,8 @@ not branch on the batch size, the rank count or the model; ring depths may be
 refined at build time to fit the VMEM budget when `ExecSpec.tiles` is left
 `None`.
 
-`default_tiles` sizes for `chip` (default: TPU v7x, the only chip the
-megakernel is validated on) and never queries devices: profiles evaluate it at
+`default_tiles` sizes for `chip` (default: TPU v7x, the chip the megakernel is
+validated on) and never queries devices: profiles evaluate it at
 import time, before any JAX backend may be initialized. When unset tiles are
 fitted at build time, the budgets come from `chip_budget()`: `CHIP_BUDGETS[kind]`
 for a supported TPU, `MegakernelConfigError` for an unsupported TPU kind, or
@@ -34,9 +34,14 @@ from dataclasses import dataclass
 from typing import Any
 
 import jax
+from jax.experimental.pallas import tpu as pltpu
 
 from ..errors import MegakernelConfigError
 from ..exec_spec import Tiles
+
+_MIB = 1024 * 1024
+# VMEM kept free for compiler-internal scratch.
+_VMEM_RESERVE_MIB = 2
 
 
 @dataclass(frozen=True)
@@ -48,11 +53,26 @@ class ChipBudget:
     smem_mib: int  # SMEM limit (MiB)
 
 
-# TPU v7x: 64 MiB VMEM per core, 2 MiB kept free for compiler-internal scratch.
-TPU_V7X = ChipBudget(name="tpu_v7x", vmem_mib=62, smem_mib=1)
+def _chip_budget_for(name: str, chip: pltpu.ChipVersion) -> ChipBudget:
+    """Per-core budget from the chip's static `TpuInfo`; queries no device."""
+    info = pltpu.get_tpu_info_for_chip(chip, 1)
+    return ChipBudget(
+        name=name,
+        vmem_mib=info.vmem_capacity_bytes // _MIB - _VMEM_RESERVE_MIB,
+        smem_mib=info.smem_capacity_bytes // _MIB,
+    )
+
+
+TPU_V7X = _chip_budget_for("tpu_v7x", pltpu.ChipVersion.TPU_7X)
+TPU_8I = _chip_budget_for("tpu_8i", pltpu.ChipVersion.TPU_8I)
+TPU_8T = _chip_budget_for("tpu_8t", pltpu.ChipVersion.TPU_8T)
 DEFAULT_CHIP = TPU_V7X
 # `jax.Device.device_kind` -> budget, for the chips the megakernel runs on.
-CHIP_BUDGETS: dict[str, ChipBudget] = {"TPU7x": TPU_V7X}
+CHIP_BUDGETS: dict[str, ChipBudget] = {
+    "TPU7x": TPU_V7X,
+    "TPU8i": TPU_8I,
+    "TPU8t": TPU_8T,
+}
 
 
 @functools.cache
@@ -96,6 +116,8 @@ def default_tiles(
 __all__ = [
     "CHIP_BUDGETS",
     "DEFAULT_CHIP",
+    "TPU_8I",
+    "TPU_8T",
     "TPU_V7X",
     "ChipBudget",
     "chip_budget",
