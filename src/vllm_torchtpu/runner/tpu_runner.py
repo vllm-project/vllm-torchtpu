@@ -8190,7 +8190,7 @@ class TPUModelRunner(GPUModelRunner):
         offsets = self.mamba_slot_read_offsets
         if offsets is None:
             return
-        with self._precompile_timed("mamba rollback helpers"):
+        with self._precompile_timed("mamba rollback helpers"), torch.no_grad():
             num_groups = max(
                 1,
                 len(self._mamba_copy_plan),
@@ -8198,7 +8198,7 @@ class TPUModelRunner(GPUModelRunner):
                 if self.kv_cache_config is not None
                 else 0,
             )
-            limit = self._bucket_len(num_groups * self.max_num_reqs)
+            limit = max(128, self._bucket_len(num_groups * self.max_num_reqs))
             n = 8
             while n <= limit:
                 src = torch.zeros(n, dtype=torch.long).to(offsets.device)
@@ -8206,6 +8206,7 @@ class TPUModelRunner(GPUModelRunner):
                 _rollback_offsets_seed_compiled(offsets, dst)
                 _rollback_offsets_migrate_compiled(offsets, src, dst)
                 n *= 4
+            synchronize_tensors(offsets)
 
     def _warmup_spec_decode(self) -> None:
         """Warm the real spec-decode dispatch so the first request doesn't recompile.
