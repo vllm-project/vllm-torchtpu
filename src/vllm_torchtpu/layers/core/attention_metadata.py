@@ -270,6 +270,9 @@ class AttentionMetadataBuilderContext:
     # whether the step repeats the previous one (runner/steady_decode_metadata.py).
     steady_walk_bounds: tuple | None = None
     steady_hit: bool = False
+    # Set by the staged walk when it reused the previous steady walk's products
+    # outright (same staged tables and mamba products objects).
+    steady_walk_reused: bool = False
 
 
 def _staged_walk_products(
@@ -1122,6 +1125,7 @@ def _issue_walk_products(
         ctx.staged_block_tables = steady_prev.staged_block_tables
         products = steady_prev.products
         n_tables = steady_prev.n_tables
+        ctx.steady_walk_reused = True
         # Each step's bounds overlap the previous one's offsets, so chaining
         # them keeps every reused step equal to the walk that ran.
         steady_prev.bounds = steady_bounds
@@ -1203,10 +1207,17 @@ def _issue_walk_products(
             )
     elif n_mamba:
         states = products[n_tables : n_tables + n_mamba]
-        has_ckpt = ctx.mamba_ckpt_window > 1
-        ckpts = products[n_tables + n_mamba :] if has_ckpt else (None,) * n_mamba
-        ctx.staged_mamba_products = {
-            entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
-            for j, ei in enumerate(mamba_entry_indices)
-        }
+        reused = runner.__dict__.get("_steady_mamba_products")
+        if ctx.steady_walk_reused and reused is not None and reused[0] is products:
+            # Same products tuple as the walk that built this dict.
+            ctx.staged_mamba_products = reused[1]
+        else:
+            has_ckpt = ctx.mamba_ckpt_window > 1
+            ckpts = products[n_tables + n_mamba :] if has_ckpt else (None,) * n_mamba
+            ctx.staged_mamba_products = {
+                entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
+                for j, ei in enumerate(mamba_entry_indices)
+            }
+            if envs.VLLM_TPU_STEADY_METADATA_REUSE:
+                runner._steady_mamba_products = (products, ctx.staged_mamba_products)
         _record_ro_group_shapes(runner, ctx, states)

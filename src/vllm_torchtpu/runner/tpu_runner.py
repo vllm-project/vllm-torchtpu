@@ -2519,6 +2519,12 @@ class TPUModelRunner(GPUModelRunner):
         compact = ctx.mamba_state_indices
         unified = compact is None and self._unified_kv_layout
         products = ctx.staged_mamba_products
+        reuse_key = None
+        if envs.VLLM_TPU_STEADY_METADATA_REUSE and ctx.steady_walk_reused:
+            reuse_key = self._steady_metadata_key(ctx, plan)
+            reused = self._steady_metadata_reuse(ctx, reuse_key)
+            if reused is not None:
+                return reused
         for gid, is_mamba, _ in plan[1]:
             if gid not in staged or (
                 is_mamba and unified and (products is None or gid not in products)
@@ -2571,6 +2577,56 @@ class TPUModelRunner(GPUModelRunner):
                 built = AttentionMetadata(block_tables=staged[gid], **shared)
             for layer_name in layer_names:
                 per_layer[layer_name] = built
+        if reuse_key is not None:
+            built_objs = list({id(md): md for md in per_layer.values()}.values())
+            appended = (
+                None
+                if ctx.unified_mamba_state_indices is None
+                else list(ctx.unified_mamba_state_indices)
+            )
+            self._steady_metadata = (reuse_key, per_layer, built_objs, appended)
+        return per_layer
+
+    def _steady_metadata_key(self, ctx, plan) -> tuple:
+        """Every input of `_build_attention_metadata_staged` except positions
+        and seq_lens. Objects are compared by identity: the cache entry holds
+        them, so an id cannot be reused by a new object while it is kept."""
+        descriptor = ctx.sequence_layout_descriptor
+        return (
+            plan[0],
+            ctx.staged_block_tables,
+            ctx.staged_mamba_products,
+            ctx.mamba_state_indices,
+            ctx.query_start_loc,
+            ctx.request_distribution,
+            ctx.mamba_slot_read_offsets,
+            ctx.mamba_request_distribution,
+            ctx.mamba_prefill_ckpt,
+            ctx.unified_mamba_state_indices is None,
+            (descriptor.kind.value, descriptor.protocol, descriptor.version),
+        )
+
+    def _steady_metadata_reuse(self, ctx, key: tuple):
+        """VLLM_TPU_STEADY_METADATA_REUSE: the previous steady step's per-layer
+        metadata when every other input is the same object, with this step's
+        positions and seq_lens set on its (shared) metadata objects; None on a
+        miss. The objects are rebuilt per step otherwise, and nothing keeps
+        one past the step it was built for (the drafter copies what it
+        changes), so updating them in place is the same as building anew."""
+        prev = self.__dict__.get("_steady_metadata")
+        if prev is None:
+            return None
+        prev_key, per_layer, built_objs, appended = prev
+        if len(prev_key) != len(key) or not all(
+            a is b for a, b in zip(prev_key[:-1], key[:-1])
+        ) or prev_key[-1] != key[-1]:
+            return None
+        positions, seq_lens = self.position_ids, ctx.seq_lens
+        for md in built_objs:
+            md.input_positions = positions
+            md.seq_lens = seq_lens
+        if appended is not None:
+            ctx.unified_mamba_state_indices.extend(appended)
         return per_layer
 
     def build_attention_metadata_for_layers(
