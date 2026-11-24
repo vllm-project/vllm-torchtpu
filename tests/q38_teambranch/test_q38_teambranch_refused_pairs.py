@@ -9,6 +9,7 @@
 Each member alone does not raise. Every check runs on a CPU host: op builders are replaced by stand-ins.
 """
 import importlib
+import re
 import sys
 import types
 from functools import partial
@@ -87,7 +88,7 @@ def test_hc_prefill_builders_refuse_the_pair_and_name_each_member(monkeypatch):
     comb(4, 256, 1e-6, 256, False, "vpu", True)
     comb(4, 256, 1e-6, 256, False, "vpu", False, True, True)
     comb(4, 256, 1e-6, 256, False, "vpu")
-    tails = [n.split("_e", 1)[1].split("_", 1)[1] if "_" in n.split("_e", 1)[1] else "" for n in made]
+    tails = [re.sub(r"^.*_e[0-9a-f]{8}_?", "", n) for n in made]
     assert tails == ["cmp_v1", "da_v1", "v1", "cmp_v1", "rr_da_v1", "v1"], made
 
 
