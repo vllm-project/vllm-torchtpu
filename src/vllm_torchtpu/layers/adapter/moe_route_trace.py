@@ -136,7 +136,7 @@ def record(layer: Any, topk_ids: torch.Tensor) -> None:
                 mask = token_padding._padding_state.get_local_padding_mask(
                     topk_ids.shape[0]
                 )
-                npad = mask.to(torch.int32).sum().view(1)
+                npad = mask.to(torch.int32).sum(dtype=torch.int32).view(1)
                 _pad.index_copy_(0, slot, npad)
     _ring[row].index_copy_(0, slot, counts.view(1, _num_experts))
 
