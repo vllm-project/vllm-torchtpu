@@ -100,8 +100,9 @@ def load_and_select_conv_state(
 ) -> tuple[jax.Array, jax.Array]:
     """Loads and selects convolution state from HBM or the carry scratchpad.
 
-    Selects HBM state on a sequence's first tile, the carry scratchpad on later
-    tiles when provided, and zeros when `has_initial_state` is False.
+    On a sequence's first tile (or when no carry scratchpad is passed), selects HBM
+    state if `has_initial_state` is True and zeros otherwise; on later tiles with a
+    carry scratchpad, selects the carry scratchpad even for fresh sequences.
 
     Args:
         metadata_ref: Metadata reference containing grid and sequence mappings.
@@ -153,8 +154,9 @@ def load_and_select_recurrent_state(
 ) -> jax.Array:
     """Loads and selects recurrent state from HBM or the carry scratchpad.
 
-    Selects HBM state on a sequence's first tile, the carry scratchpad on later
-    tiles when provided, and zeros when `has_initial_state` is False.
+    On a sequence's first tile (or when no carry scratchpad is passed), selects HBM
+    state if `has_initial_state` is True and zeros otherwise; on later tiles with a
+    carry scratchpad, selects the carry scratchpad even for fresh sequences.
 
     Args:
         metadata_ref: Metadata reference containing grid and sequence mappings.
