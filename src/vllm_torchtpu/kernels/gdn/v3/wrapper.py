@@ -540,7 +540,9 @@ def fused_conv1d_gdn(
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
-    num_lanes = pltpu.get_tpu_info().num_lanes
+    tpu_info = pltpu.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
+    mxu_column_size = int(tpu_info.mxu_column_size)
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
@@ -685,6 +687,8 @@ def fused_conv1d_gdn(
                 conv_state=conv_dtype,
             ),
             is_shared=is_shared,
+            num_lanes=num_lanes,
+            mxu_column_size=mxu_column_size,
         )
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer

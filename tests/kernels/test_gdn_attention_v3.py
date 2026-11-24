@@ -987,16 +987,111 @@ class GDNChunkedComputeTest(parameterized.TestCase):
         np.testing.assert_allclose(out, ref_out.swapaxes(0, 1), rtol=1e-5, atol=1e-5)
         np.testing.assert_allclose(state, ref_state[0], rtol=1e-5, atol=1e-5)
 
-    def test_pack_unpack_v_head_pairs_roundtrip(self):
-        """Packing and unpacking 8-KQ / 64-V head pairs along lanes is exact."""
-        n_kq, n_v, d_k, d_v = 8, 64, 128, 128
+    @parameterized.named_parameters(
+        dict(
+            testcase_name=f"{impl_name}_kq{n_kq}_v{n_v}",
+            compute_mod=compute_mod,
+            n_kq=n_kq,
+            n_v=n_v,
+        )
+        for impl_name, compute_mod, _ in _CHUNKED_IMPLS
+        for n_kq, n_v in ((8, 64), (1, 2))
+    )
+    def test_pack_unpack_v_head_pairs_roundtrip(self, compute_mod, n_kq: int, n_v: int):
+        """Packing pairs sibling V heads per KQ group and unpacks bit-exactly."""
+        d_k, d_v = 128, 128
         v_per_kq = n_v // n_kq
+        half_v = v_per_kq // 2
         x = jax.random.normal(jax.random.key(53), (n_v, d_k, d_v))
-        packed = compute_gdn._pack_v_head_pairs(x, v_per_kq)
+        packed = compute_mod._pack_v_head_pairs(x, v_per_kq)
         self.assertEqual(packed.shape, (n_v // 2, d_k, 2 * d_v))
-        unpacked = compute_gdn._unpack_v_head_pairs(packed, v_per_kq)
+        for g in range(n_kq):
+            for j in range(half_v):
+                p = g * half_v + j
+                np.testing.assert_array_equal(packed[p, :, :d_v], x[g * v_per_kq + j])
+                np.testing.assert_array_equal(
+                    packed[p, :, d_v:], x[g * v_per_kq + half_v + j]
+                )
+        unpacked = compute_mod._unpack_v_head_pairs(packed, v_per_kq)
         self.assertEqual(unpacked.shape, x.shape)
         self.assertEqual(float(jnp.max(jnp.abs(unpacked - x))), 0.0)
+
+    @parameterized.named_parameters(
+        dict(
+            testcase_name=f"{impl_name}_{case_name}",
+            compute_mod=compute_mod,
+            config_mod=config_mod,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_v=d_v,
+            mxu_cols=mxu_cols,
+            expect_paired=expect_paired,
+        )
+        for impl_name, compute_mod, config_mod in _CHUNKED_IMPLS
+        for case_name, n_kq, n_v, d_v, mxu_cols, expect_paired in (
+            ("even_d128_mxu256_paired", 2, 16, 128, 256, True),
+            ("odd_v_per_kq_unpaired", 2, 6, 128, 256, False),
+            ("unaligned_d64_unpaired", 2, 4, 64, 256, False),
+            ("wide_d256_mxu256_unpaired", 2, 4, 256, 256, False),
+            ("narrow_mxu128_unpaired", 2, 16, 128, 128, False),
+        )
+    )
+    def test_dot_kq_with_v_heads_pairing_gate_and_jaxpr_shape(
+        self,
+        compute_mod,
+        config_mod,
+        n_kq: int,
+        n_v: int,
+        d_v: int,
+        mxu_cols: int,
+        expect_paired: bool,
+    ):
+        """`pair_v_heads` controls traced dot RHS width and preserves exact math."""
+        chunk, d_k = 16, 128
+        f32 = jnp.dtype(jnp.float32)
+        cfg = config_mod.GDNConfig(
+            mode=config_mod.GDNMode.PER_SEQ,
+            dtypes=config_mod.Dtypes(f32, f32, f32, f32, f32),
+            batch_size=chunk,
+            dim_size=(2 * n_kq) * d_k + n_v * d_v,
+            kernel_size=4,
+            tile_size=chunk,
+            num_kq_heads=n_kq,
+            num_v_heads=n_v,
+            kq_head_dim=d_k,
+            v_head_dim=d_v,
+            num_lanes=128,
+            mxu_column_size=mxu_cols,
+        )
+        self.assertEqual(cfg.pair_v_heads, expect_paired)
+
+        k0, k1 = jax.random.split(jax.random.key(71), 2)
+        kq_op = jax.random.normal(k0, (n_kq, 2 * chunk, d_k))
+        state_prev = jax.random.normal(k1, (n_v, d_k, d_v))
+        dim_nums = (((2,), (1,)), ((0,), (0,)))
+
+        def fn(a, b):
+            return compute_mod._dot_kq_with_v_heads(
+                a, b, dim_nums, pair_v_heads=cfg.pair_v_heads
+            )
+
+        jaxpr = jax.make_jaxpr(fn)(kq_op, state_prev)
+        dot_eqns = [e for e in jaxpr.eqns if e.primitive.name == "dot_general"]
+        self.assertLen(dot_eqns, 1)
+        expected_rhs_shape = (
+            (n_v // 2, d_k, 2 * d_v) if expect_paired else (n_v, d_k, d_v)
+        )
+        self.assertEqual(dot_eqns[0].invars[1].aval.shape, expected_rhs_shape)
+
+        with jax.default_matmul_precision("float32"):
+            actual = fn(kq_op, state_prev)
+            ref = jax.lax.dot(
+                jnp.repeat(kq_op, n_v // n_kq, axis=0),
+                state_prev,
+                dimension_numbers=dim_nums,
+                preferred_element_type=jnp.float32,
+            )
+        np.testing.assert_allclose(actual, ref, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.tpu_test

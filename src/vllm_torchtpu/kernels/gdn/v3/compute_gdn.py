@@ -111,7 +111,12 @@ def fused_transpose_broadcast(x: jax.Array, src_dim: int, dst_dim: int) -> jax.A
 
 
 def _pack_v_head_pairs(x: jax.Array, v_per_kq_head: int) -> jax.Array:
-    """Packs the two V-head halves of each KQ head group along the lane axis."""
+    """Packs sibling V-head halves along the last axis.
+
+    Requires an even `v_per_kq_head` dividing `x.shape[0]`. Maps
+    `[num_v_heads, ..., d_v]` to `[num_v_heads // 2, ..., 2 * d_v]`, pairing
+    head `g * v_per_kq_head + j` with `g * v_per_kq_head + v_per_kq_head // 2 + j`.
+    """
     half_v = v_per_kq_head // 2
     group_starts = range(0, x.shape[0], v_per_kq_head)
     first_half = jnp.concat([x[s : s + half_v] for s in group_starts], axis=0)
@@ -122,7 +127,7 @@ def _pack_v_head_pairs(x: jax.Array, v_per_kq_head: int) -> jax.Array:
 
 
 def _unpack_v_head_pairs(x_pairs: jax.Array, v_per_kq_head: int) -> jax.Array:
-    """Unpacks V-head pairs from the lane axis back to the head axis."""
+    """Unpacks `[num_v_heads // 2, ..., 2 * d_v]` back to `[num_v_heads, ..., d_v]`."""
     half_v = v_per_kq_head // 2
     first_half, second_half = jnp.split(x_pairs, 2, axis=-1)
     heads = []
@@ -135,15 +140,17 @@ def _dot_kq_with_v_heads(
     kq_operand: jax.Array,  # [num_kq_heads, ...]
     v_operand: jax.Array,  # [num_v_heads, ..., v_head_dim]
     dimension_numbers: jax.lax.DotDimensionNumbers,
+    *,
+    pair_v_heads: bool,
 ) -> jax.Array:
     """Contracts a per-KQ-head operand with a per-V-head operand.
 
-    When the number of V heads per KQ head is even and v_head_dim % 128 == 0,
-    V heads are packed in pairs along the lane axis so each matmul fills
-    2 * v_head_dim MXU columns; otherwise V heads are contracted individually.
+    Assumes axis 0 is the batch/head axis in `dimension_numbers` and the
+    trailing axis of `v_operand` (`v_head_dim`) is non-contracting. When
+    `pair_v_heads` is True, packs sibling V heads in pairs along that trailing
+    axis so each matmul fills `2 * v_head_dim` MXU columns.
     """
     v_per_kq_head = v_operand.shape[0] // kq_operand.shape[0]
-    pair_v_heads = v_per_kq_head % 2 == 0 and v_operand.shape[-1] % 128 == 0
     kq_repeats = v_per_kq_head // 2 if pair_v_heads else v_per_kq_head
     kq_operand = jnp.repeat(kq_operand, kq_repeats, axis=0)
     if pair_v_heads:
@@ -228,7 +235,12 @@ def chunked_gdn_per_seq(
     # [num_kq_heads, 2 * chunk, kq_head_dim]
     merged_kq = jnp.concat([k_large, q_large], axis=1)
     # [num_v_heads, 2 * chunk, v_head_dim]
-    kq_state = _dot_kq_with_v_heads(merged_kq, state_prev, (((2,), (1,)), ((0,), (0,))))
+    kq_state = _dot_kq_with_v_heads(
+        merged_kq,
+        state_prev,
+        (((2,), (1,)), ((0,), (0,))),
+        pair_v_heads=cfg.pair_v_heads,
+    )
 
     # [num_v_heads, chunk, v_head_dim]
     k_state, q_state = jnp.split(kq_state, 2, axis=1)
@@ -253,7 +265,12 @@ def chunked_gdn_per_seq(
     # [num_v_heads, chunk, v_head_dim]
     u_ws_gated = u_ws * gating_backward
     # [num_v_heads, kq_head_dim, v_head_dim]
-    state_new = _dot_kq_with_v_heads(k_large, u_ws_gated, (((1,), (1,)), ((0,), (0,))))
+    state_new = _dot_kq_with_v_heads(
+        k_large,
+        u_ws_gated,
+        (((1,), (1,)), ((0,), (0,))),
+        pair_v_heads=cfg.pair_v_heads,
+    )
 
     # [num_v_heads, kq_head_dim, v_head_dim]
     state_updated = state_prev * gating_last

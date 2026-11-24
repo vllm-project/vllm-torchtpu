@@ -1680,7 +1680,9 @@ def fused_qkvz_projection_pcp_gdn(
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = None if conv_bias is None else conv_bias.astype(jnp.float32)
 
-    num_lanes = pltpu.get_tpu_info().num_lanes
+    tpu_info = pltpu.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
+    mxu_column_size = int(tpu_info.mxu_column_size)
     aligned_num_v_heads = pl.cdiv(local_n_v, num_lanes) * num_lanes
     num_v_padding = aligned_num_v_heads - local_n_v
     b = jnp.pad(b, ((0, 0), (0, num_v_padding))).reshape(
@@ -1708,6 +1710,8 @@ def fused_qkvz_projection_pcp_gdn(
         kq_head_dim=d_k,
         v_head_dim=d_v,
         is_shared=True,
+        num_lanes=num_lanes,
+        mxu_column_size=mxu_column_size,
     )
     receive_group_stride = _qkv_receive_group_stride(comm_chunk_size, tile_size)
 
