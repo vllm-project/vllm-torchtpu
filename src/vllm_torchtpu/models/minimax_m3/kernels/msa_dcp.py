@@ -600,42 +600,46 @@ def _class_candidates(
         folded = folded[:, None]
     folded_cu = num_heads * cu_q_lens
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    large_bq = msa.block_score_options(num_heads)["large_block_q"]
+    options = msa.block_score_options(num_heads)
+    opt = msa_indexer.prefill_opt()
 
-    def tile_lens(tile_seq, tile_row0):
-        """This rank's length (`local_seq_lens`) up to each large tile's last
-        visible token: its rows are tokens of one request, head-major."""
-        per_tile = functools.partial(msa_indexer.lookup, index=tile_seq)
-        fc = per_tile(folded_cu[:-1])
-        q_len = jnp.maximum(per_tile(q_lens), 1)
-        first = jnp.maximum(tile_row0 - fc, 0)
-        last = jnp.minimum(tile_row0 + large_bq, fc + num_heads * q_len) - 1 - fc
-        last = jnp.maximum(last, first)
-        top = jnp.where(first // q_len == last // q_len, last % q_len, q_len - 1)
-        visible = per_tile(seq_lens) - q_len + top + 1
-        return local_seq_lens(visible, block_size=block_size, rank=rank, dcp=dcp)
+    def make_plan(large_bq, pages_per_step, max_requests):
+        def tile_lens(tile_seq, tile_row0):
+            """This rank's length (`local_seq_lens`) up to each large tile's
+            last visible token: its rows are tokens of one request, head-major."""
+            per_tile = functools.partial(msa_indexer.lookup, index=tile_seq)
+            fc = per_tile(folded_cu[:-1])
+            q_len = jnp.maximum(per_tile(q_lens), 1)
+            first = jnp.maximum(tile_row0 - fc, 0)
+            last = jnp.minimum(tile_row0 + large_bq, fc + num_heads * q_len) - 1 - fc
+            last = jnp.maximum(last, first)
+            top = jnp.where(first // q_len == last // q_len, last % q_len, q_len - 1)
+            visible = per_tile(seq_lens) - q_len + top + 1
+            return local_seq_lens(visible, block_size=block_size, rank=rank, dcp=dcp)
 
-    plan = msa_indexer.class_plan(
-        folded,
-        index_cache,
-        local_lens,
-        block_tables,
-        folded_cu,
-        num_seqs,
-        **msa.block_score_options(num_heads),
-        scale_cache=scale_cache,
-        scale_row=scale_row,
-        interpret=interpret,
-        fp8_q=msa_indexer.fp8_queries_enabled(),
-        large_tile_lens_fn=tile_lens if block_size is not None else None,
-    )
+        return msa_indexer.class_plan(
+            folded,
+            index_cache,
+            local_lens,
+            block_tables,
+            folded_cu,
+            num_seqs,
+            **dict(options, large_block_q=large_bq, pages_per_step=pages_per_step),
+            scale_cache=scale_cache,
+            scale_row=scale_row,
+            interpret=interpret,
+            fp8_q=msa_indexer.fp8_queries_enabled(),
+            large_tile_lens_fn=tile_lens if block_size is not None else None,
+            large_max_requests=max_requests,
+        )
+
+    plan = make_plan(options["large_block_q"], options["pages_per_step"], 0)
     max_num_seqs = q_lens.shape[0]
     seq_of_token = jnp.minimum(seq_id, max_num_seqs - 1)
-    picks, cols = [], []
-    for scored, block_q, transposed in (
-        (plan.small(), plan.small_block_q, not plan.token_major),
-        (plan.large(), plan.large_block_q, True),
-    ):
+
+    def class_picks(scored, block_q, transposed):
+        """A class's packed picks ``[columns, 2 * topk]`` and each head's and
+        token's column in them ``[G, T]``."""
         # A column's query row sits at offset o of its request's folded rows,
         # token o mod q_len of it: position = len - q_len + o mod q_len.
         per_tile = functools.partial(msa_indexer.lookup, index=scored.tile_seq)
@@ -651,22 +655,51 @@ def _class_candidates(
             col_pos,
             live_rows=scored.num_tiles * block_q,
         )
-        picks.append(pack_candidates(s, b))
+        picks = pack_candidates(s, b)
         # Each head's and token's column in this class (`_class_scores`).
         start = msa_indexer.lookup(scored.tile_start, seq_of_token)[None]
         off = rows - start
         col = (
             msa_indexer.lookup(scored.first_tile, seq_of_token)[None] + off // block_q
         ) * block_q
-        cols.append(jnp.clip(col + off % block_q, 0, picks[-1].shape[0] - 1))
-    # A head's and token's picks: its large-class column if its request is
-    # large, else its small-class one.
-    col = jnp.where(
-        msa_indexer.lookup(plan.is_large, seq_of_token)[None],
-        picks[0].shape[0] + cols[1],
-        cols[0],
+        return picks, jnp.clip(col + off % block_q, 0, picks.shape[0] - 1)
+
+    small_picks, small_col = class_picks(
+        plan.small(), plan.small_block_q, not plan.token_major
     )
-    packed = jnp.concatenate(picks, axis=0)[col.reshape(-1)]  # [G * T, 2 * topk]
+    is_large_tok = msa_indexer.lookup(plan.is_large, seq_of_token)[None]
+    if opt.cond:
+        # Taller tiles (and their pages per step) when at most `opt.cond`
+        # requests are large; the default tiles otherwise. Two branches only:
+        # a wider switch stops the layers sharing the attention code.
+        fast = make_plan(
+            opt.block_q or 2 * msa_indexer.DEFAULT_LARGE_BLOCK_Q,
+            opt.pps or options["pages_per_step"],
+            opt.cond,
+        )
+
+        def large_rows(p):
+            picks, col = class_picks(p.large(), p.large_block_q, True)
+            return picks[col.reshape(-1)]
+
+        large = jax.lax.cond(
+            jnp.sum(plan.is_large.astype(jnp.int32)) <= opt.cond,
+            lambda: large_rows(fast),
+            lambda: large_rows(plan),
+        )
+        packed = jnp.where(
+            jnp.broadcast_to(is_large_tok, small_col.shape).reshape(-1, 1),
+            large,
+            small_picks[small_col.reshape(-1)],
+        )
+    else:
+        large_picks, large_col = class_picks(plan.large(), plan.large_block_q, True)
+        # A head's and token's picks: its large-class column if its request
+        # is large, else its small-class one.
+        col = jnp.where(is_large_tok, small_picks.shape[0] + large_col, small_col)
+        packed = jnp.concatenate([small_picks, large_picks], axis=0)[
+            col.reshape(-1)
+        ]  # [G * T, 2 * topk]
     return (
         packed.reshape(num_heads, num_tokens, -1)
         .transpose(1, 0, 2)

@@ -93,3 +93,28 @@ def test_prefill_opt_parse(monkeypatch):
     monkeypatch.setenv("TPU_MINIMAX_M3_INDEXER_PREFILL_OPT", "bogus")
     with pytest.raises(ValueError):
         msa_indexer.prefill_opt()
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize(
+    "reqs",
+    [[(2944, 1100), (0, 300)], [(1000, 700), (0, 300), (200, 3)]],
+)
+@pytest.mark.parametrize(
+    "spec", ["bq1024+causal+cond2+pps64", "bq1024+cond1", "causal+cond2"]
+)
+def test_prefill_opt_cond_same_candidates(monkeypatch, spec, reqs, rank):
+    # cond2 takes the 1024-row branch on both cases (two large requests and
+    # a decode-sized one), cond1 the default branch.
+    args = _case(1, reqs, rank)
+    base = _run(monkeypatch, "", args, rank)
+    arm = _run(monkeypatch, spec, args, rank)
+    np.testing.assert_array_equal(arm, base)
+
+
+def test_prefill_opt_parse_cond(monkeypatch):
+    monkeypatch.setenv("TPU_MINIMAX_M3_INDEXER_PREFILL_OPT", "bq1024+causal+cond4+pps32")
+    assert msa_indexer.prefill_opt() == msa_indexer.PrefillOpt(
+        causal=True, block_q=1024, cond=4, pps=32
+    )
+    assert msa.block_score_options(4)["large_block_q"] == msa_indexer.DEFAULT_LARGE_BLOCK_Q

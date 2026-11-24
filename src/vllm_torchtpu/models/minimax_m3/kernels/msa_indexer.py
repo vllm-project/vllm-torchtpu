@@ -365,6 +365,14 @@ class PrefillOpt(NamedTuple):
     # are unpacked and scaled once per tile, so taller tiles do that work for
     # more rows; the scores are the same bits (one dot per score either way).
     block_q: int = 0
+    # With `cond<K>`, `block_q` (and `pps<N>` pages per grid step) apply only
+    # to DCP prefill steps (`msa_dcp._class_candidates`) with at most K large
+    # requests, under a two-branch conditional; the large class then pads to
+    # K requests' tiles instead of every request's (one partial tile each),
+    # so its columns and their XLA glue shrink too. Other steps run the
+    # default tiles.
+    cond: int = 0
+    pps: int = 0
 
 
 _PREFILL_OPT_LOGGED = False
@@ -387,6 +395,10 @@ def prefill_opt() -> PrefillOpt:
             opt = opt._replace(every_count=True)
         elif item.startswith("bq") and item[2:] in ("256", "512", "1024", "2048"):
             opt = opt._replace(block_q=int(item[2:]))
+        elif item.startswith("cond") and item[4:].isdigit() and int(item[4:]) > 0:
+            opt = opt._replace(cond=int(item[4:]))
+        elif item.startswith("pps") and item[3:] in ("32", "64", "128"):
+            opt = opt._replace(pps=int(item[3:]))
         else:
             raise ValueError(
                 f"TPU_MINIMAX_M3_INDEXER_PREFILL_OPT: unknown item {item!r} in {spec!r}"
@@ -395,12 +407,14 @@ def prefill_opt() -> PrefillOpt:
         _PREFILL_OPT_LOGGED = True
         logger.info(
             "TPU_MINIMAX_M3_INDEXER_PREFILL_OPT=%s on: MSA indexer prefill tiles "
-            "run causal=%s chunk=%d counts=%s block_q=%d.",
+            "run causal=%s chunk=%d counts=%s block_q=%d cond=%d pps=%d.",
             spec,
             opt.causal,
             opt.chunk,
             opt.every_count,
             opt.block_q,
+            opt.cond,
+            opt.pps,
         )
     return opt
 
@@ -1360,6 +1374,7 @@ def class_plan(
     interpret: bool = False,
     fp8_q: bool = False,
     large_tile_lens_fn: Callable | None = None,
+    large_max_requests: int = 0,
 ) -> _ClassPlan:
     """`block_scores`' tile classes, unscored (arguments as `block_scores`)."""
     num_tokens, num_heads, _ = index_q.shape
@@ -1398,6 +1413,9 @@ def class_plan(
     )
     # Large requests have more than block_q tokens each.
     max_large = min(max_num_seqs, num_tokens // (block_q + 1))
+    if large_max_requests:
+        # The caller guarantees at most this many large requests.
+        max_large = min(max_large, large_max_requests)
     # Kernel v3 reads 4-bit pages with folded scales only.
     unfolded_fp4 = scale_row is not None
     small_kernel = "v2" if kernel == "v3" and unfolded_fp4 else kernel
