@@ -484,9 +484,12 @@ def block_topk(
 
             radix.emit(keys, key_chunks, k, selection, output, lambda i: owners(i)[1])
             if records is not None:
-                pl.when(row_id > first)(
-                    lambda: [c.wait() for c in record_copies(row_id - stride)]
-                )
+
+                @pl.when(row_id > first)
+                def wait_previous_records():
+                    for copy in record_copies(row_id - stride):
+                        copy.wait()
+
                 emit_records(row_id, tokens)
                 for copy in record_copies(row_id):
                     copy.start()
