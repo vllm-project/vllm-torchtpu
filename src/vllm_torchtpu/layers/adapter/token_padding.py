@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+import collections
+import os
+from dataclasses import dataclass, field
 
 import torch
 
@@ -25,6 +27,16 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
+    # TPU_TOKEN_PADDING_ASYNC=1: skip the upload when (valid, padded) did not
+    # change, else upload without blocking from a host buffer kept alive in a
+    # small cache. The synchronous copy below queues behind every DMA already on
+    # the stream (KV offload loads on a served run) and stalls the host ~30 ms
+    # before the forward is dispatched on ~2.5% of decode steps.
+    _async: bool = field(default_factory=lambda: os.environ.get("TPU_TOKEN_PADDING_ASYNC", "0") == "1")
+    _last: tuple[int, int] | None = None
+    _hosts: "collections.OrderedDict[tuple[int, int], torch.Tensor]" = field(
+        default_factory=collections.OrderedDict
+    )
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
@@ -40,6 +52,20 @@ class TokenPaddingState:
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
+        if self._async:
+            key = (int(local_valid_tokens), int(local_padded_tokens))
+            if key == self._last:
+                return
+            host = self._hosts.pop(key, None)
+            if host is None:
+                host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
+                host[key[0]:key[1]] = True
+            self._hosts[key] = host  # most recent last; keeps the source alive
+            while len(self._hosts) > 256:
+                self._hosts.popitem(last=False)
+            self.local_padding_mask.copy_(host, non_blocking=True)
+            self._last = key
+            return
         host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
