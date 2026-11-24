@@ -378,6 +378,80 @@ def _scan_picks(key_ref, num_cols, topk) -> list[jax.Array]:
     return picks
 
 
+def _float_keys(keys: jax.Array, col_bits: int) -> jax.Array:
+    """Pick keys (`_score_keys`) as positive normal f32s of the same order:
+    offset so that the -inf scores' keys start at the smallest normal, the
+    keys of scores past ~2**126 (none: `msa_select`'s forced scores are
+    2**99) saturated with their columns kept. f32 maxima and minima are one
+    vector op each, where an int32 one is a compare and a select."""
+    offset, top = _float_key_range(col_bits)
+    low = (1 << col_bits) - 1
+    keys = jnp.where(keys > top, (top & ~low) | (keys & low), keys)
+    return pltpu.bitcast(keys + offset, jnp.float32)
+
+
+def _float_key_range(col_bits: int) -> tuple[int, int]:
+    """(offset, largest key) of `_float_keys`."""
+    low = (1 << col_bits) - 1
+    neg_inf_key = ((-0x00800000 ^ 0x7FFFFFFF) >> 1) & ~low
+    offset = 0x00800000 - neg_inf_key
+    return offset, 0x7F7FFFFF - offset
+
+
+# `_insert_picks` inserts `_INSERT_UNROLL` key vregs per loop step into the
+# lists of `_INSERT_ROWS` rows: two 128-row blocks' insertions in flight (AOT
+# c48: 9.2 bundles per key vreg of 128 rows, 12.3 one block at a time; all
+# 512 rows spill), and 8 keys amortize the loop's list copies.
+_INSERT_ROWS = 256
+_INSERT_UNROLL = 8
+
+
+def _insert_picks(key_ref, num_cols, topk, col_bits) -> jax.Array:
+    """`_scan_picks` of `_float_keys` ``key_ref [cols, rows]`` f32 (0 below
+    every key), in one pass: each block of `_INSERT_ROWS` rows keeps, per
+    sublane (columns of one residue mod 8), its `topk` largest keys in
+    sorted vregs, a key entering by a max and a min per level (2 * topk - 1
+    ops per key vreg against `_scan_picks`' 3 * topk), then the sublanes'
+    lists merge.
+    Returns the picks' int32 keys ``[topk, rows]``, best first; needs
+    `topk` keys above 0 in every row."""
+    offset, _ = _float_key_range(col_bits)
+    rows = key_ref.shape[1]
+    unroll = _INSERT_UNROLL
+    blocks = []
+    width = min(rows, _INSERT_ROWS)
+    for b in range(rows // width):
+        lanes = pl.ds(b * width, width)
+
+        def insert(i, lists, lanes=lanes):
+            lists = list(lists)
+            for u in range(unroll):
+                first = pl.multiple_of((i * unroll + u) * 8, 8)
+                y = key_ref[pl.ds(first, 8), lanes]
+                for j in range(topk - 1):
+                    lists[j], y = jnp.maximum(lists[j], y), jnp.minimum(lists[j], y)
+                lists[-1] = jnp.maximum(lists[-1], y)
+            return tuple(lists)
+
+        zeros = jnp.zeros((8, width), jnp.float32)
+        lists = jax.lax.fori_loop(0, num_cols // (8 * unroll), insert, (zeros,) * topk)
+        lists, picks = list(lists), []
+        for i in range(topk):
+            best = lists[0]
+            for shift in (4, 2, 1):  # across sublanes: every sublane gets the max
+                best = jnp.maximum(best, pltpu.roll(best, shift, 0))
+            picks.append(best[:1])
+            # Keys are distinct: one sublane holds the pick; pop its list.
+            hit = lists[0] == best
+            depth = topk - i
+            lists[: depth - 1] = [
+                jnp.where(hit, lists[j + 1], lists[j]) for j in range(depth - 1)
+            ]
+        blocks.append(jnp.concatenate(picks))
+    keys = blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks, axis=1)
+    return pltpu.bitcast(keys, jnp.int32) - offset
+
+
 def _column_keys(
     s, cols, num_visible, rank, *, dcp, init_blocks, local_blocks, col_bits, real_cols
 ) -> jax.Array:
@@ -1149,10 +1223,6 @@ def rotate_folded_queries(index_q: jax.Array, *, interpret: bool = False) -> jax
     )
 
 
-# Below every pick key (`_score_keys`): columns a pick scans past the scored.
-_KEY_FLOOR = -_KEY_TOP
-
-
 def _prefill_candidates_kernel(
     # Scalar prefetch
     work_ref,  # [items] tile << _TILE_SHIFT | page group (`msa_indexer.class_work`)
@@ -1173,7 +1243,7 @@ def _prefill_candidates_kernel(
     # Scratch
     buf,  # `msa_indexer._kernel_v3`'s ring and semaphores
     sems,
-    keys_ref,  # [P, Bq] int32 the tile's pick keys (`_column_keys`)
+    keys_ref,  # [P, Bq] f32 the tile's pick keys (`_float_keys`)
     pad_scores,  # [32, 128] f32 and int32: the picks of position 0
     pad_keys,
     rows_ref,  # [rows + Bq, 2 * topk] f32 the candidates being assembled
@@ -1218,7 +1288,7 @@ def _prefill_candidates_kernel(
         m = m.T if rows_major else m
         col0 = pl.multiple_of(group * pages_per_step + first, m.shape[0])
         cols = col0 + jax.lax.broadcasted_iota(jnp.int32, m.shape, 0)
-        keys_ref[pl.ds(col0, m.shape[0]), :] = _column_keys(
+        keys = _column_keys(
             m,
             cols,
             num_visible,
@@ -1229,6 +1299,7 @@ def _prefill_candidates_kernel(
             col_bits=col_bits,
             real_cols=pick["real_cols"],
         )
+        keys_ref[pl.ds(col0, m.shape[0]), :] = _float_keys(keys, col_bits)
 
     msa_indexer._kernel_v3(
         work_ref,
@@ -1260,24 +1331,23 @@ def _prefill_candidates_kernel(
 
     @pl.when((step == last) | (next_tile != tile))
     def _():
-        # As `_pick_t`: the columns its rows can see, in whole key chunks.
-        width = _KEY_CHUNK[True]
+        # The columns its rows can see (`_pick_t`), in whole insert steps.
+        width = 8 * _INSERT_UNROLL
         needed = (jnp.max(num_visible) + dcp - 1) // dcp
         scanned = jnp.clip(-(-needed // width), 1, num_cols // width) * width
-        # Those past the scored pages (stale VMEM): below every key.
+        # Those past the scored pages (stale VMEM): 0, below every key.
         info = tile_info_ref[tile]
         scored = -(-seq_pages_ref[info & seq_mask] // chunk)
 
         def floor(c, carry):
             rows = pl.ds(pl.multiple_of(c * chunk, chunk), chunk)
-            keys_ref[rows, :] = jnp.full(
-                (chunk, keys_ref.shape[1]), _KEY_FLOOR, jnp.int32
-            )
+            keys_ref[rows, :] = jnp.zeros((chunk, keys_ref.shape[1]), jnp.float32)
             return carry
 
         jax.lax.fori_loop(scored, scanned // chunk, floor, 0)
+        keys = _insert_picks(keys_ref, scanned, topk, col_bits)
         score, block = _picked(
-            _scan_picks(keys_ref, scanned, topk), rank, col_bits=col_bits, dcp=dcp
+            [keys[i : i + 1] for i in range(topk)], rank, col_bits=col_bits, dcp=dcp
         )
         put_rows(info, packed(score, block), tile < tiles_ref[0])
 
@@ -1376,7 +1446,7 @@ def _prefill_candidates(
     scratch = [
         pltpu.VMEM(ring, jnp.uint32),
         pltpu.SemaphoreType.DMA((msa_indexer._RING_SLOTS,)),
-        pltpu.VMEM((num_cols, block_q), jnp.int32),
+        pltpu.VMEM((num_cols, block_q), jnp.float32),
         pltpu.VMEM((_KEY_CHUNK[True], _LANES), jnp.float32),
         pltpu.VMEM((_KEY_CHUNK[True], _LANES), jnp.int32),
         pltpu.VMEM((assembled_rows, width), jnp.float32),
