@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, cast
@@ -1101,16 +1102,21 @@ def calculate_tiling(
 
     if rhs_cfgs.has_compact_scale:
         qbs = cast(int, rhs_cfgs.quant_block_size)
-        while (
-            not compact_scale_tile_fits(tile_k, qbs, dims.size_k) and tile_k > num_lanes
-        ):
-            num_k_tiles += 1
-            tile_k = align_to(dims.size_k, num_k_tiles * num_lanes) // num_k_tiles
         if not compact_scale_tile_fits(tile_k, qbs, dims.size_k):
-            raise ValueError(
-                f"No tile_k for compact E4M3 scales with size_k={dims.size_k} and "
-                f"quant block size {qbs}"
+            # Split K evenly into tiles that hold a multiple of the uint8 sublane
+            # tiling in quant blocks, none larger than the tile_k chosen above.
+            step = math.lcm(
+                num_lanes, qbs * pltpu.get_tpu_info().get_sublane_tiling(jnp.uint8)
             )
+            max_tile_k = tile_k // step * step
+            if max_tile_k == 0:
+                raise ValueError(
+                    f"No tile_k for compact E4M3 scales with size_k={dims.size_k} "
+                    f"and quant block size {qbs}: a tile must hold all of K's "
+                    f"blocks or a multiple of {step} rows"
+                )
+            num_k_tiles = pl.cdiv(dims.size_k, max_tile_k)
+            tile_k = align_to(pl.cdiv(dims.size_k, num_k_tiles), step)
 
     if tile_n == 0 or tile_k == 0:
         final_estimate = _gmm_vmem_estimate(tile_m, tile_n, tile_k)

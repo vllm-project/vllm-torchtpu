@@ -836,9 +836,12 @@ def test_gmm_v2_rejects_compact_scale_tiles_off_the_sublane_tiling(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("quant_block_size", [16, 64])
 @pytest.mark.parametrize("size_k", [640, 1024, 2880, 4096, 7168])
 @pytest.mark.parametrize("fuse_act", [None, "silu"])
-def test_calculate_tiling_aligns_compact_scale_tiles(monkeypatch, size_k, fuse_act):
+def test_calculate_tiling_aligns_compact_scale_tiles(
+    monkeypatch, size_k, fuse_act, quant_block_size
+):
     _validation_tpu_info(monkeypatch)
     dims = Dimensions(
         size_m=1024,
@@ -850,7 +853,7 @@ def test_calculate_tiling_aligns_compact_scale_tiles(monkeypatch, size_k, fuse_a
     )
     rhs_cfgs = InputConfigs(
         quant_dtype=jnp.float4_e2m1fn,
-        quant_block_size=16,
+        quant_block_size=quant_block_size,
         dtype=jnp.uint8,
         has_scale=True,
         has_global_scale=True,
@@ -860,7 +863,7 @@ def test_calculate_tiling_aligns_compact_scale_tiles(monkeypatch, size_k, fuse_a
 
     tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, 48 * 1024 * 1024, fuse_act)
 
-    blocks = tiles.tile_k // 16
+    blocks = tiles.tile_k // quant_block_size
     assert blocks % 32 == 0 or tiles.tile_k == size_k, tiles
 
 
