@@ -163,3 +163,103 @@ def test_request_granularity_unchanged():
     s._write_back = WriteBackPolicy(window_blocks=2)
     _held(s, "r", [1, 2, 3, 4])
     assert s._wb_near_eviction() == ["r"]
+
+
+def test_late_store_policy_needs_block_granularity():
+    with pytest.raises(ValueError):
+        WriteBackPolicy.from_extra_config(
+            {"store_policy": {"mode": "write_back", "late_store": True}}
+        )
+
+
+def _late_scheduler(window_blocks=1):
+    s, pool = _scheduler(window_blocks=window_blocks)
+    s._write_back = WriteBackPolicy(
+        window_blocks=window_blocks, granularity="block", late_store=True
+    )
+    # attach again: late_store installs the fresh-block watch
+    s.attach_block_pool(pool)
+    assert s._fresh_block_ids is not None
+    return s, pool
+
+
+def test_late_store_stores_reallocated_held_chunk_now():
+    s, pool = _late_scheduler(window_blocks=1)
+    keys, _ = _held(s, "r", [5, 6, 7])  # free queue head is block 1: not r's
+    _step(s)
+    assert s._wb_allowed == {}
+    s._fresh_block_ids.update({6})
+    _step(s, allocated={6})
+    assert s._wb_allowed == {"r": {keys[1]}}
+    assert s._wb_urgent == {"r"}
+    assert s._wb_blocks["r"] == {5, 7}
+    # A prefix hit (not fresh) is only forgotten.
+    s._fresh_block_ids.clear()
+    _step(s, allocated={5})
+    assert s._wb_allowed == {} and s._wb_urgent == set()
+    assert s._wb_blocks["r"] == {7}
+
+
+def test_late_store_skips_holders_registered_this_step():
+    s, pool = _late_scheduler(window_blocks=1)
+    keys = [f"n-k{i}" for i in range(2)]
+    gs = SimpleNamespace(
+        next_stored_chunk_idx=0, offload_keys=keys, block_ids=[8, 9]
+    )
+    s._req_status["n"] = SimpleNamespace(
+        req=SimpleNamespace(num_prompt_tokens=10_000),
+        req_context=object(),
+        group_states=[gs],
+        transfer_jobs=set(),
+    )
+    s._fresh_block_ids.update({8})
+    _step(s, allocated={8}, finished={"n"})
+    assert s._wb_urgent == set()
+    assert s._wb_blocks["n"] == {9}
+
+
+def test_late_store_job_skips_the_fence():
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+        OffloadingConnectorMetadata,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        OffloadingConnectorScheduler,
+    )
+    from vllm.v1.kv_offload.base import GPULoadStoreSpec
+
+    from vllm_torchtpu.offload.raiden_store import RaidenLoadStoreSpec
+
+    s, pool = _late_scheduler(window_blocks=1)
+    keys, _ = _held(s, "r", [5, 6])
+    _step(s)
+    s._fresh_block_ids.update({6})
+    mgr = MagicMock()
+    mgr.poll_finished_jobs.return_value = []
+    mgr.drain_jobs.return_value = []
+    mgr.is_job_launched.return_value = True
+    s._raiden_manager = mgr
+    s.manager = mgr
+    job = SimpleNamespace(
+        req_id="r",
+        src_spec=GPULoadStoreSpec([6], group_sizes=[1], block_indices=[1]),
+        dst_spec=RaidenLoadStoreSpec([keys[1]]),
+    )
+    meta = OffloadingConnectorMetadata(
+        load_jobs={}, store_jobs={7: job}, jobs_to_flush={7}
+    )
+    out = SimpleNamespace(
+        finished_req_ids=set(), num_scheduled_tokens={}, scheduled_new_reqs=[]
+    )
+    with patch(
+        "vllm_torchtpu.offload.raiden_connector._allocated_block_ids",
+        return_value={6},
+    ), patch(
+        "vllm_torchtpu.offload.raiden_connector.dataclasses.replace",
+        side_effect=lambda o, **kw: SimpleNamespace(**{**vars(o), **kw}),
+    ), patch.object(
+        OffloadingConnectorScheduler, "build_connector_meta", lambda self, o: meta
+    ):
+        s.build_connector_meta(out)
+    mgr.submit_store_job.assert_called_once_with(7, [keys[1]], [6])
+    assert 7 not in s._fence_pending
+    mgr.drain_jobs.assert_called_once_with({7})

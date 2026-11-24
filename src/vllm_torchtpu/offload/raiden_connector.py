@@ -230,6 +230,11 @@ class WriteBackPolicy:
     window_blocks: int = 1024
     max_requests_per_step: int = 8
     granularity: str = "request"
+    # Per-block only: a held chunk whose block is reallocated before the
+    # window stored it is stored in that same step, without the device fence
+    # (its contents were written steps ago), and drained before the step's
+    # forward can overwrite it. Turns the host into a victim cache of HBM.
+    late_store: bool = False
 
     @classmethod
     def from_extra_config(cls, extra_config: Mapping) -> WriteBackPolicy | None:
@@ -254,6 +259,10 @@ class WriteBackPolicy:
         if written.granularity not in ("request", "block"):
             raise ValueError(
                 f"store_policy granularity must be 'request' or 'block': {policy!r}"
+            )
+        if written.late_store and written.granularity != "block":
+            raise ValueError(
+                f"store_policy late_store needs granularity 'block': {policy!r}"
             )
         return written
 
@@ -383,9 +392,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 else WriteBackPolicy.window_blocks
             ),
         )
-        if (self._flush_real_reuse or self._wb_drop_covered) and not getattr(
-            block_pool, "_tpu_raiden_fresh_watch", False
-        ):
+        late_store = self._write_back is not None and self._write_back.late_store
+        if (
+            self._flush_real_reuse or self._wb_drop_covered or late_store
+        ) and not getattr(block_pool, "_tpu_raiden_fresh_watch", False):
             fresh: set[int] = set()
             pool_get_new_blocks = block_pool.get_new_blocks
 
@@ -710,10 +720,25 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         # (prefix hit): either way its old holder no longer stores it.
         reused = allocated & self._wb_owners.keys()
         c["blocks_left_queue"] += len(reused)
-        release = self._wb_forget_blocks(reused)
-        allowed: dict[str, set] = {}
         bpc = self.config.blocks_per_chunk
         picked = self._wb_window_blocks() if self._block_pool is not None else {}
+        urgent: set[str] = set()
+        fresh = self._fresh_block_ids
+        policy = self._write_back
+        if policy is not None and policy.late_store and fresh:
+            # Reallocated this step before the window reached them: store now.
+            # Holders registered this step are skipped (their last forward may
+            # not have been fenced yet).
+            new_holders = finished - passed
+            for bid in reused & fresh:
+                for req_id in self._wb_owners.get(bid, ()):
+                    if req_id in new_holders:
+                        continue
+                    picked.setdefault(req_id, set()).add(bid)
+                    urgent.add(req_id)
+            c["late_store_requests"] += len(urgent)
+        release = self._wb_forget_blocks(reused - set().union(*picked.values()))
+        allowed: dict[str, set] = {}
         for req_id, bids in picked.items():
             req_status = self._req_status.get(req_id)
             if req_status is None:
@@ -734,6 +759,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 c["stored_chunks"] += len(keys)
             release |= self._wb_forget_blocks(chunk_bids | bids)
         self._wb_allowed = allowed
+        self._wb_urgent = urgent & allowed.keys()
         self._wb_to_release = release - passed
         c["held_requests"] = len(self._wb_blocks)
         self._maybe_log_write_back()
@@ -796,6 +822,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         manager = self._raiden_manager
 
         # Park new store jobs: wait for all ranks to complete device fence.
+        urgent_reqs = getattr(self, "_wb_urgent", None) or set()
+        self._wb_urgent = set()
         new_fence_ids: set[int] = set()
         for job_id, job in meta.store_jobs.items():
             src_spec, dst_spec = job.src_spec, job.dst_spec
@@ -806,6 +834,13 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 len(device_block_ids),
                 len(dst_spec.keys),
             )
+            if job.req_id in urgent_reqs:
+                # late_store: the source blocks are reallocated this step;
+                # submit now (no fence needed for old contents) so the flush
+                # below drains the save before the forward overwrites them.
+                manager.submit_store_job(job_id, dst_spec.keys, device_block_ids)
+                self.wb_counters["late_store_jobs"] += 1
+                continue
             self._fence_pending[job_id] = _ParkedStore(
                 keys=dst_spec.keys, device_block_ids=device_block_ids
             )
