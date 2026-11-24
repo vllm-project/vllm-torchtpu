@@ -777,6 +777,48 @@ def select_fp8_indexer_jax(
         PACKED_FP8_MQA_CONFIG.query_tile,
         _INDEX_UNTILED_SCORE_ELEMENTS // max(capacity, 1),
     )
+    # At 96K context the ratio-2 sources fit one compressed key tile;
+    # the uncompressed candidate publisher needs two. Keep decode chunking
+    # in both branches, including when 288 is not divisible by prefill chunk.
+    verify_rows = q.shape[0]
+    decode_width = width * (2 if candidate_write else 1)
+    if verify_rows == 96:
+        decode_width *= 2
+    decode_candidates = (
+        candidates.shape[1] == 2048 and block_size == 8
+        if candidate_write
+        else candidates.shape[1] == 0
+    )
+    if (
+        not sparse_logits
+        and unordered
+        and (verify_rows, page_table.shape[0]) in ((288, 48), (96, 16), (96, 48))
+        and decode_candidates
+        and topk == 512
+        and topk <= decode_width < score_width
+        and jax.default_backend() == "tpu"
+    ):
+        longest = batch_max.max()
+
+        def wider():
+            return jax.lax.cond(
+                longest <= decode_width,
+                lambda: _select_fp8_indexer_jax(*arguments, decode_width),
+                lambda: _select_fp8_indexer_jax(*arguments, score_width),
+            )
+
+        # The 96K decode workload grows by up to 512 tokens. At these
+        # widths the publisher's full score row still fits SparseCore VMEM.
+        if verify_rows == 288:
+            narrow_width = (96 * 1024 + 512) // (1 if candidate_write else 2)
+            if topk <= narrow_width < decode_width:
+                return jax.lax.cond(
+                    longest <= narrow_width,
+                    lambda: _select_fp8_indexer_jax(*arguments, narrow_width),
+                    wider,
+                )
+        return wider()
+
     if (
         width >= score_width
         or chunk >= q.shape[0]
@@ -793,14 +835,22 @@ def select_fp8_indexer_jax(
     # covered by one K tile can narrow the scores and retain their keys.
     live = (requests >= 0) & (requests < page_table.shape[0])
     longest = jnp.where(live, lengths, 0).max()
-    grouped = jnp.all(requests[1:] >= requests[:-1])
-    return jax.lax.cond(
-        grouped & (longest <= width),
-        lambda: _select_fp8_indexer_jax(*arguments, width, prefill_chunk_rows=chunk),
-        lambda: _select_fp8_indexer_jax(
-            *arguments, score_width, prefill_chunk_rows=chunk
-        ),
-    )
+    owners = jnp.where(live, requests, page_table.shape[0])
+    grouped = jnp.all(owners[1:] >= owners[:-1])
+
+    def prefill(columns):
+        return _select_fp8_indexer_jax(*arguments, columns, prefill_chunk_rows=chunk)
+
+    def longer():
+        if q.shape[0] == 2048 and 2 * width < score_width:
+            return jax.lax.cond(
+                grouped & (longest <= 2 * width),
+                lambda: prefill(2 * width),
+                lambda: prefill(score_width),
+            )
+        return prefill(score_width)
+
+    return jax.lax.cond(grouped & (longest <= width), lambda: prefill(width), longer)
 
 
 def _prepare(
