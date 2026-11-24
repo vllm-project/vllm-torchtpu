@@ -78,19 +78,27 @@ def _head_columns(queries, heads, sublanes):
     return columns
 
 
-def _weighted_selector(selector, weights, rows, *, sublanes):
-    """Fold per-query head weights into the MXU head-reduction selector."""
-    queries, heads = selector.shape[0], weights.shape[-1]
+def _head_weights(weights, queries, *, sublanes):
+    """Weights [N, heads] at each head-ordered product column of a query group.
+
+    The one-hot BF16 pass is exact for the BF16 weights the selector keeps, so
+    rows may be expanded all at once or one group at a time.
+    """
+    heads = weights.shape[-1]
     columns = _head_columns(queries, heads, sublanes)
     spread = lax.broadcasted_iota(jnp.int32, (heads, queries * heads), 0) == columns
-    # Row i holds query i's weights at its head-ordered product columns. The
-    # one-hot BF16 pass is exact for the BF16 weights the selector keeps.
-    rows = jnp.concatenate([weights[r][None, :] for r in rows])
-    expanded = lax.dot(
-        rows.astype(jnp.bfloat16),
+    return lax.dot(
+        weights.astype(jnp.bfloat16),
         spread.astype(jnp.bfloat16),
         preferred_element_type=jnp.float32,
     )
+
+
+def _weighted_selector(selector, expanded):
+    """Fold the group's `_head_weights` rows into the MXU head-reduction selector.
+
+    Row i holds query i's weights at its head-ordered product columns.
+    """
     return (selector.astype(jnp.float32) * expanded).astype(jnp.bfloat16)
 
 
