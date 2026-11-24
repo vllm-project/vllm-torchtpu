@@ -119,7 +119,7 @@ def _write_caches(cache_kind, num_pages, rng):
             jnp.float32,
         )
         return kv, index, scales
-    dtype = jnp.float8_e4m3fn
+    dtype = cache_kind
     kv = pack(
         rounded(rng.standard_normal((num_pages, PAGE, 2 * HEAD_DIM)), dtype), dtype
     )
@@ -129,7 +129,7 @@ def _write_caches(cache_kind, num_pages, rng):
     return kv, index, None
 
 
-@pytest.mark.parametrize("cache_kind", [jnp.float8_e4m3fn, "fp4"])
+@pytest.mark.parametrize("cache_kind", [jnp.float8_e4m3fn, "fp4", jnp.bfloat16])
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize(
     "q_lens,ctx_lens,max_seqs",

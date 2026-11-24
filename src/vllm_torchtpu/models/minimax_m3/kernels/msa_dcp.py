@@ -94,6 +94,9 @@ _SMALL_BATCH_PAGES_PER_STEP = 32
 # (standalone bench j-8228a157: 8 tokens 4.0 vs 5.2 us, 48 tokens 4.8 vs 6.6,
 # 128 tokens 9.0 vs 7.9).
 _PLAN_MAX_TOKENS = 64
+# Page buffers a decode step's folded write may keep in VMEM (every run's
+# pages, in and out): c48's 4-bit 128-row steps take ~5.6 MiB.
+_FOLDED_WRITE_VMEM_BYTES = 16 << 20
 # A pair's prefill-sized steps pass the attention their own and the peer's
 # query heads as two arrays and swap back the peer's partials by a permute
 # (`attend_and_merge`): no concatenated copy of the queries (a fusion of
@@ -1200,10 +1203,14 @@ def msa_write_and_candidates_dcp(
         ]
     # A decode step of one KV head writes its caches inside the indexer kernel
     # (`decode_candidates`).
+    max_runs = msa.write_runs_bound(num_tokens, max_num_seqs, block_size)
+    # A folded write keeps every run's pages in VMEM, in and out.
+    run_bytes = 2 * sum(t.cache[0].size * t.cache.dtype.itemsize for t in targets)
     fold_write = (
         num_heads == 1
         and not msa_indexer.is_prefill_step(num_tokens, max_num_seqs)
         and decodes_in_one_kernel(num_tokens, index_cache)
+        and max_runs * run_bytes <= _FOLDED_WRITE_VMEM_BYTES
     )
     if not fold_write:
         kv_cache, index_cache, *rest = msa.write_caches(
@@ -1259,7 +1266,7 @@ def msa_write_and_candidates_dcp(
                 msa.cache_targets(targets),
                 pages,
                 pos % block_size,
-                msa.write_runs_bound(num_tokens, max_num_seqs, block_size),
+                max_runs,
                 index_target=1,
             ),
             interpret=interpret,
