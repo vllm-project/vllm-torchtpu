@@ -77,6 +77,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif quant.tok_norm_applies(self.self_attn.qkv_proj, hidden_states.shape[0]):
+            # (e4m3, per-token factor): self_attn feeds it to qkv_proj directly.
+            hidden_states, residual = quant.fused_add_rms_norm_e4m3_tok(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+            )
         elif quant.fp8_norm_applies(self.self_attn.qkv_proj, hidden_states.shape[0]):
             hidden_states, residual = quant.fused_add_rms_norm_e4m3(
                 hidden_states,

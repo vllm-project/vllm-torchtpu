@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_FP8_CAST_SKIP: str = "shared_experts.gate_up_proj"
     TPU_MINIMAX_M3_FP8_CAST_IN_TORCH: bool = False
     TPU_MINIMAX_M3_FP8_CAST_NORM: bool = False
+    TPU_MINIMAX_M3_FP8_TOKSCALE_MIN_ROWS: int = 0
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -825,6 +826,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of a bf16 copy and a separate cast pass).
     "TPU_MINIMAX_M3_FP8_CAST_NORM": env_bool(
         "TPU_MINIMAX_M3_FP8_CAST_NORM", default=False
+    ),
+    # MiniMax-M3 e4m3 linears: token buckets of at least this many rows quantize
+    # the activations to e4m3 with one scale per token (row abs-max -> 448)
+    # and run fp8 x fp8 on the MXU, rescaling the f32 accumulator per row.
+    # The abs-max fuses into the producer: the input RMSNorm computes it in
+    # the same row pass as the variance and emits e4m3 for qkv (the rsqrt
+    # cancels out of the cast), and the other linears reduce it in the
+    # producer's fusion. Skips TPU_MINIMAX_M3_FP8_CAST_SKIP. Takes precedence
+    # over TPU_MINIMAX_M3_FP8_CAST_MIN_ROWS at these buckets. Changes
+    # numerics. 0 (default) keeps bf16 activations.
+    "TPU_MINIMAX_M3_FP8_TOKSCALE_MIN_ROWS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_FP8_TOKSCALE_MIN_ROWS", 0
     ),
     # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
     # permutation-free dense-expert kernel (kernels/experimental/

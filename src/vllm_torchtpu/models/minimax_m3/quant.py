@@ -149,6 +149,83 @@ def fused_add_rms_norm_e4m3(
     return out.clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn), residual
 
 
+def _fp8_tok_matmul(
+    x8: jax.Array, tok: jax.Array, w: jax.Array, scale: jax.Array
+) -> jax.Array:
+    """``bf16(e4m3(x) @ w * tok * scale)``: ``x8`` already holds each token
+    scaled to its abs-max, ``tok`` [T, 1] f32 undoes that per row."""
+    acc = jax.lax.dot_general(
+        x8, w, (((x8.ndim - 1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+    )
+    out = acc * tok.astype(jnp.float32) * scale.astype(jnp.float32).reshape(-1)
+    return out.astype(jnp.bfloat16)
+
+
+_fp8_tok_linear = pallas.jax_op("pallas::minimax_m3_fp8_tok_linear", _fp8_tok_matmul)
+_fp8_tok_linear.register_fake(
+    lambda x8, tok, w, scale: torch.empty(
+        (*x8.shape[:-1], w.shape[1]), dtype=torch.bfloat16, device=x8.device
+    )
+)
+
+
+def _tokscale_applies(layer: torch.nn.Module, rows: int) -> bool:
+    min_rows = envs.TPU_MINIMAX_M3_FP8_TOKSCALE_MIN_ROWS
+    if not min_rows or rows < min_rows:
+        return False
+    prefix = getattr(layer, "prefix", "")
+    skip = [s for s in envs.TPU_MINIMAX_M3_FP8_CAST_SKIP.split(",") if s]
+    return not any(prefix.endswith(s) for s in skip)
+
+
+def tok_norm_applies(qkv_proj: torch.nn.Module, rows: int) -> bool:
+    """TPU_MINIMAX_M3_FP8_TOKSCALE_MIN_ROWS: the input RMSNorm emits per-token
+    scaled e4m3 for a qkv projection at this bucket."""
+    return (
+        isinstance(getattr(qkv_proj, "quant_method", None), MiniMaxM3Mxfp8LinearMethod)
+        and qkv_proj.weight.dtype == torch.float8_e4m3fn
+        and _tokscale_applies(qkv_proj, rows)
+    )
+
+
+def tok_quant_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token e4m3: rows scaled so their abs-max is 448, plus the [T, 1]
+    f32 factor that undoes it. Written in torch so XLA fuses the abs-max
+    and the cast into x's producer."""
+    xf = x.to(torch.float32)
+    m = xf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)
+    return (xf * (_E4M3_MAX / m)).to(torch.float8_e4m3fn), m * (1.0 / _E4M3_MAX)
+
+
+def fused_add_rms_norm_e4m3_tok(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    gemma_weight: torch.Tensor,
+    eps: float,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """GemmaRMSNorm's fused add + norm emitting per-token scaled e4m3.
+
+    With z = r * (w + 1), the output is z * rsqrt(mean(r^2) + eps), so its
+    row abs-max is rsqrt(...) * max|z|: one row pass gives both reductions,
+    the cast is e4m3(z * 448 / max|z|) (the rsqrt cancels), and the token
+    factor is rsqrt(...) * max|z| / 448. Returns ((x8, tok), residual)."""
+    orig_dtype = x.dtype
+    residual = (x.to(torch.float32) + residual.to(torch.float32)).to(orig_dtype)
+    r = residual.to(torch.float32)
+    rr = torch.rsqrt(r.pow(2).mean(dim=-1, keepdim=True) + eps)
+    z = r * (gemma_weight.to(torch.float32) + 1.0)
+    m = z.abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)
+    x8 = (z * (_E4M3_MAX / m)).to(torch.float8_e4m3fn)
+    return (x8, rr * m * (1.0 / _E4M3_MAX)), residual
+
+
+def fp8_tok_linear(
+    layer: torch.nn.Module, x8: torch.Tensor, tok: torch.Tensor
+) -> torch.Tensor:
+    """The MXFP8 linear of ``layer`` on per-token scaled e4m3 activations."""
+    return _fp8_tok_linear(x8, tok, layer.weight, layer.weight_scale)
+
+
 QUANT_METHOD = "mxfp8"
 MXFP8_BLOCK = 32
 _E8M0_BIAS = 127
@@ -322,6 +399,15 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
                     "TPU_MINIMAX_M3_FP8_CAST_NORM=1: input RMSNorms emit e4m3 for "
                     "casting qkv projections."
                 )
+        if envs.TPU_MINIMAX_M3_FP8_TOKSCALE_MIN_ROWS:
+            logger.info_once(
+                "TPU_MINIMAX_M3_FP8_TOKSCALE_MIN_ROWS=%d: MXFP8 linears quantize "
+                "activations to per-token scaled e4m3 (input RMSNorm emits it for "
+                "qkv) and run fp8 x fp8 for token buckets of >= %d rows, except %s.",
+                envs.TPU_MINIMAX_M3_FP8_TOKSCALE_MIN_ROWS,
+                envs.TPU_MINIMAX_M3_FP8_TOKSCALE_MIN_ROWS,
+                envs.TPU_MINIMAX_M3_FP8_CAST_SKIP or "none",
+            )
         logger.debug(
             "MXFP8 linear %s kept e4m3: %d of %d elements below e4m3's normal "
             "range after the block shift.",
@@ -354,6 +440,9 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
             and x.dtype == torch.bfloat16
         ):
             return _split_e4m3(x, layer.weight, layer.weight_scale)
+        if x.dtype == torch.bfloat16 and _tokscale_applies(layer, rows):
+            x8, tok = tok_quant_e4m3(x)
+            return _fp8_tok_linear(x8, tok, layer.weight, layer.weight_scale)
         if x.dtype == torch.float8_e4m3fn:
             # Already cast by its producer (fused_add_rms_norm_e4m3).
             return _fp8_cast_linear(x, layer.weight, layer.weight_scale)

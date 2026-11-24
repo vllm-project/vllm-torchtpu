@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
+from vllm_torchtpu.models.minimax_m3 import quant
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_dcp_op,
@@ -402,9 +403,19 @@ class MiniMaxM3SparseAttention(nn.Module):
         )
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        if isinstance(hidden_states, tuple):
+            # Per-token scaled e4m3 from the input RMSNorm
+            # (TPU_MINIMAX_M3_FP8_TOKSCALE_MIN_ROWS); qkv_proj has no bias and
+            # gathers no output, so its forward is just this matmul.
+            x8, tok = hidden_states
+            qkv = quant.fp8_tok_linear(self.qkv_proj, x8, tok)
+            hidden_states = x8
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
             positions,
