@@ -2892,6 +2892,17 @@ class TestBootstrapUnits(unittest.TestCase):
                             gen.accelerator_type,
                             (lane, gen.name),
                         )
+                # The stamp alone names the generation: under it, no label,
+                # group or key of the lane's file names one.
+                for step in uploaded[f"{lane}:{gen.name}"]:
+                    for field, prefix in (
+                        ("label", gen.label_prefix),
+                        ("group", gen.label_prefix),
+                        ("key", gen.key_prefix),
+                    ):
+                        own = step.get(field, "").removeprefix(prefix).lower()
+                        for name in gens.TPU_GENERATIONS_BY_NAME:
+                            self.assertNotIn(name, own, (lane, gen.name, field))
                 # A lane bktec shards plans and uploads under the generation's
                 # prefix, which keeps its recorded durations from the others'.
                 prefixes = {
