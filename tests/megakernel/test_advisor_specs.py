@@ -1158,15 +1158,35 @@ def test_preset_loaders_reject_malformed_fields(
         match="dtype_basis must be one of",
     ):
         models.load_preset_dtype_basis()
+    bad_family_models = {
+        "presets": {
+            "bad-family": {
+                "num_layers": 4,
+                "hidden_size": 1024,
+                "layer_families": ["unmodeled_magic"],
+                "dtype_basis": "config",
+            }
+        },
+        "aliases": {},
+    }
+    (tmp_path / "models.json").write_text(
+        json.dumps(bad_family_models), encoding="utf-8"
+    )
+    with pytest.raises(
+        models.UnsupportedArchitectureError,
+        match="unpriced layer families",
+    ):
+        models.load_model_presets()
 
 
 def test_config_notice_reports_preset_match(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Verify `--config` stderr notice covers matched, custom-named, and unmatched."""
-    snapshots = _load_config_snapshots()
+    """Verify `--config` reports preset matches and fails closed on altered configs."""
+    snapshots = _load_preset_snapshots()
     base_cfg = snapshots["kimi-k3"]["config"]
     assert isinstance(base_cfg, dict)
+    assert not hasattr(models, "matching_shipped_preset_name")
 
     matched_dir = tmp_path / "neutral-checkpoint"
     matched_dir.mkdir(parents=True, exist_ok=True)
@@ -1184,31 +1204,15 @@ def test_config_notice_reports_preset_match(
     assert isinstance(text_cfg, dict)
     text_cfg["num_hidden_layers"] = int(str(text_cfg["num_hidden_layers"])) + 1
 
-    preset_named_dir = tmp_path / "kimi_k3"
-    preset_named_dir.mkdir(parents=True, exist_ok=True)
-    preset_named_cfg = preset_named_dir / "config.json"
-    preset_named_cfg.write_text(json.dumps(altered_cfg), encoding="utf-8")
-    renamed_profile = advisor.resolve_model_profile(str(preset_named_cfg))
-    assert renamed_profile.name == "kimi_k3-custom"
-    renamed_tier, _ = support.classify_model_support_tier(renamed_profile)
-    assert renamed_tier != "declared"
-    assert advisor.main(["--config", str(preset_named_cfg), "--chip", "tpu7x"]) == 0
-    renamed_err = capsys.readouterr().err
-    assert "kimi-k3" in renamed_err
-    assert "kimi_k3-custom" in renamed_err
-    assert "no megakernel declaration" in renamed_err
-
-    unmatched_dir = tmp_path / "custom-arch"
-    unmatched_dir.mkdir(parents=True, exist_ok=True)
-    unmatched_cfg = unmatched_dir / "config.json"
-    unmatched_cfg.write_text(json.dumps(altered_cfg), encoding="utf-8")
-    unmatched_profile = advisor.resolve_model_profile(str(unmatched_cfg))
-    assert unmatched_profile.name == "custom-arch"
-    assert advisor.main(["--config", str(unmatched_cfg), "--chip", "tpu7x"]) == 0
-    unmatched_err = capsys.readouterr().err
-    assert (
-        "Config matched no shipped preset: no megakernel declaration applies."
-    ) in unmatched_err
+    for dir_name in ("kimi_k3", "custom-arch"):
+        bad_dir = tmp_path / dir_name
+        bad_dir.mkdir(parents=True, exist_ok=True)
+        bad_cfg = bad_dir / "config.json"
+        bad_cfg.write_text(json.dumps(altered_cfg), encoding="utf-8")
+        with pytest.raises(models.UnsupportedArchitectureError):
+            advisor.resolve_model_profile(str(bad_cfg))
+        with pytest.raises(errors.MegakernelConfigError):
+            advisor.main(["--config", str(bad_cfg), "--chip", "tpu7x"])
 
 
 def test_shipped_presets_are_the_three_validated_models() -> None:

@@ -40,7 +40,6 @@ from .models import (
     ModelProfile,
     ParallelLayout,
     match_preset_by_geometry,
-    matching_shipped_preset_name,
     resolve_model_profile,
 )
 from .regimes import (
@@ -70,32 +69,15 @@ def _emit_config_preset_notice(
     config_arg: Path | None,
     profile: ModelProfile,
 ) -> None:
-    """Write one stderr notice telling whether `--config` matched a preset."""
+    """Write one stderr notice stating which shipped preset `--config` matched."""
     if config_arg is None:
         return
     matched_preset = match_preset_by_geometry(profile)
     if matched_preset is not None:
-        message = (
+        sys.stderr.write(
             f"Config matched shipped preset {matched_preset}: "
             "its layouts and megakernel declarations apply.\n"
         )
-    else:
-        preset_named = (
-            matching_shipped_preset_name(profile.name.removesuffix("-custom"))
-            if profile.name.endswith("-custom")
-            else None
-        )
-        if preset_named is not None:
-            message = (
-                f"Config is named like shipped preset {preset_named} but has a "
-                f"different architecture or dtypes: priced under {profile.name} "
-                "with no megakernel declaration.\n"
-            )
-        else:
-            message = (
-                "Config matched no shipped preset: no megakernel declaration applies.\n"
-            )
-    sys.stderr.write(message)
 
 
 def derive_decoding_sequences(

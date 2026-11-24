@@ -61,9 +61,7 @@ def _esc(val: object) -> str:
 
 SUPPORT_TIER_BADGE_CLASSES: dict[str, str] = {
     "declared": "badge badge-whole_step",
-    "core_families": "badge badge-per_op",
     "priced_only": "badge badge-single_layer",
-    "partly_unmodeled": "badge badge-assumed",
 }
 
 

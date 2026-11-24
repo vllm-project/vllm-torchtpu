@@ -32,12 +32,12 @@ from . import (
 )
 from .chips import (
     BUILTIN_CHIP_SPECS,
-    ChipSpec,
-    FieldSource,
     REQUIRED_CHIP_SPEC_KEYS,
     SUPPORTED_CHIPS,
     TPU6E_TOPOLOGIES,
     TPU7X_TOPOLOGIES,
+    ChipSpec,
+    FieldSource,
     UnsupportedChipError,
     build_builtin_chip_spec,
     detect_tpu_from_sysfs,

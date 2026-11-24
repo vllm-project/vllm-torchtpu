@@ -39,14 +39,8 @@ try:
 except (ImportError, RuntimeError):
     pltpu = None
 
-from tests.megakernel.test_advisor_bounds import (
-    MIXTRAL_8X7B_CFG,
-    QWEN35_08B_CFG,
-)
 from tests.megakernel.test_advisor_specs import (
-    DEEPSEEK_V4_CFG,
-    KIMI_K3_PRO_CFG,
-    QWEN4_EXP_CFG,
+    HF_CONFIG_DIR,
     QWEN35_397B_CFG,
 )
 from vllm_torchtpu import megakernel as mk
@@ -151,60 +145,15 @@ def test_advisor_submodules_and_static_web_assets_packaged() -> None:
 @pytest.mark.parametrize(
     "case",
     [
-        ("qwen3.5-0.8b", "Qwen/Qwen3.5-0.8B", 24, 6, 18, 0, "fp8", "fp8"),
         ("qwen3.5-397b", "Qwen/Qwen3.5-397B-A17B-FP8", 60, 15, 45, 60, "fp8", "fp8"),
-        ("qwen3.8-2.4t", "Qwen/Qwen3.8-2.4T-A95B", 92, 23, 69, 92, "fp8", "nvfp4"),
         ("kimi-k3", "moonshotai/Kimi-K3", 93, 24, 69, 92, "bf16", "mxfp4"),
-        ("kimi-k3.1-pro", "moonshotai/Kimi-K3.1-Pro", 93, 24, 69, 92, "bf16", "mxfp4"),
-        ("deepseek-v3", "deepseek-ai/DeepSeek-V3", 61, 61, 0, 58, "fp8", "fp8"),
         ("glm-5.2", "zai-org/GLM-5.2-FP8", 78, 78, 0, 75, "fp8", "fp8"),
-        (
-            "mistral-large",
-            "mistralai/Mistral-Large-Instruct-2411",
-            88,
-            88,
-            0,
-            0,
-            "fp8",
-            "fp8",
-        ),
-        (
-            "mixtral-8x22b",
-            "mistralai/Mixtral-8x22B-v0.1",
-            56,
-            56,
-            0,
-            56,
-            "bf16",
-            "bf16",
-        ),
-        (
-            "llama-3.1-405b",
-            "meta-llama/Llama-3.1-405B-Instruct-FP8",
-            126,
-            126,
-            0,
-            0,
-            "fp8",
-            "fp8",
-        ),
-        (
-            "llama-4-maverick",
-            "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
-            48,
-            48,
-            0,
-            48,
-            "fp8",
-            "fp8",
-        ),
-        ("gpt-oss-120b", "openai/gpt-oss-120b", 36, 36, 0, 36, "bf16", "mxfp4"),
     ],
 )
 def test_builtin_model_presets_and_hf_aliases(
     case: tuple[str, str, int, int, int, int, str, str],
 ) -> None:
-    """Verify all 13 model presets across architectures."""
+    """Verify all 3 validated model presets across architectures."""
     slug, repo_id, layers, attn_l, lin_l, moe_l, wd, ed = case
     model_profile = advisor.resolve_model_profile(slug)
     assert advisor.resolve_model_profile(repo_id) == model_profile
@@ -226,29 +175,23 @@ def test_builtin_model_presets_and_hf_aliases(
 
 
 def test_kimi_k3_linear_attn_config_normalization() -> None:
-    """Verify KimiLinear / Kimi-K3.1-Pro nested `linear_attn_config` and latent MoE."""
-    model_profile = advisor.model_profile_from_hf_config(
-        KIMI_K3_PRO_CFG, name="kimi-k3.1-pro"
+    """Verify KimiLinear / Kimi-K3 nested `linear_attn_config` and latent MoE."""
+    k3_snapshot = json.loads(
+        (HF_CONFIG_DIR / "kimi-k3.json").read_text(encoding="utf-8")
     )
-    preset = advisor.MODEL_PRESETS["kimi-k3.1-pro"]
+    k3_cfg = k3_snapshot["config"]
+    model_profile = advisor.model_profile_from_hf_config(k3_cfg, name="kimi-k3")
+    preset = advisor.MODEL_PRESETS["kimi-k3"]
     assert model_profile == dataclasses.replace(
         preset,
         dtype_source=model_profile.dtype_source,
     )
+    text_cfg = k3_cfg["text_config"]
     assert (
-        model_profile.routed_expert_hidden_size
-        == KIMI_K3_PRO_CFG["routed_expert_hidden_size"]
+        model_profile.routed_expert_hidden_size == text_cfg["routed_expert_hidden_size"]
     )
-    # Kimi-K3 and Kimi-K3.1-Pro share one public geometry.
-    k3 = advisor.MODEL_PRESETS["kimi-k3"]
-    assert (k3.num_experts, k3.top_k) == (
-        model_profile.num_experts,
-        model_profile.top_k,
-    )
-    expected_kda = len(KIMI_K3_PRO_CFG["linear_attn_config"]["kda_layers"])
-    assert (
-        advisor.resolve_model_profile(KIMI_K3_PRO_CFG).num_linear_layers == expected_kda
-    )
+    expected_kda = len(text_cfg["linear_attn_config"]["kda_layers"])
+    assert advisor.resolve_model_profile(k3_cfg).num_linear_layers == expected_kda
 
 
 @pytest.mark.parametrize(
@@ -275,14 +218,14 @@ def test_kimi_k3_linear_attn_config_normalization() -> None:
         {"text_config": "invalid_not_a_dict"},
         {"vision_config": {}, "text_config": {"num_hidden_layers": 12}},
         {
-            "model_type": "qwen3_5",
+            "model_type": "qwen3_5_moe",
             "num_hidden_layers": 4,
             "hidden_size": 1024,
             "num_attention_heads": 8,
             "layer_types": ["full_attention", "unknown_layer_token", "gdn", "gdn"],
         },
         {
-            "model_type": "qwen3_5",
+            "model_type": "qwen3_5_moe",
             "num_hidden_layers": 4,
             "hidden_size": 1024,
             "num_attention_heads": 8,
@@ -368,7 +311,7 @@ def test_bare_minimum_auto_parallelism_and_html_regime_report(tmp_path: Path) ->
         == by_label["Long Prefill (B=1, T=4096)"].active_tokens // 2
     )
 
-    sweep_k3 = advisor.advise_regimes("kimi-k3.1-pro", "tpu7x")
+    sweep_k3 = advisor.advise_regimes("kimi-k3", "tpu7x")
     assert (sweep_k3.parallelism.tp, sweep_k3.parallelism.ep) == (32, 32)
     assert "2x2x4" in sweep_k3.parallelism.topology
     assert sweep_k3.regimes[0].fastest_scope == "whole_step"
@@ -390,40 +333,6 @@ def test_bare_minimum_auto_parallelism_and_html_regime_report(tmp_path: Path) ->
     assert "Tailoring Guide:" in table_txt
 
 
-def test_qwen38_24t_decode_regime_crossover_and_moe_modes() -> None:
-    """Verify Qwen3.8-2.4T TP32xEP32 recommends whole_step for B=4, 8, 16 decode."""
-    sweep_24t = advisor.advise_regimes("qwen3.8-2.4t", "tpu7x")
-    assert (sweep_24t.parallelism.tp, sweep_24t.parallelism.ep) == (32, 32)
-    min_vmem_tokens = 32  # 16 requests x 2 tokens
-    assert sweep_24t.max_vmem_tokens >= min_vmem_tokens
-    assert sweep_24t.single_layer_vmem_tokens > sweep_24t.max_vmem_tokens
-    by_label = {r.label: r for r in sweep_24t.regimes}
-
-    for small_lbl in (
-        "Decode Small (B=4, T=1, 4K)",
-        "Decode Low (B=8, T=1, 4K)",
-        "Decode Med (B=16, T=1, 4K)",
-        "Spec Verify Small (B=4, K=3)",
-    ):
-        entry = by_label[small_lbl]
-        assert entry.fastest_scope == "whole_step"
-        assert entry.recommended_moe_mode == "masked_on_chip"
-        assert entry.num_vmem_splits == 1
-
-    for wide_lbl in (
-        "Decode High (B=64, T=1, 32K)",
-        "Spec Verify Med (B=16, K=3)",
-        "Chunked Prefill (B=1, T=256)",
-    ):
-        entry = by_label[wide_lbl]
-        assert entry.fastest_scope == "whole_step"
-        assert entry.recommended_moe_mode == "grouped_on_chip"
-
-    long_pre = by_label["Long Prefill (B=1, T=4096)"]
-    assert long_pre.recommended_scope == "per_op"
-    assert long_pre.recommended_moe_mode == "grouped_in_hbm"
-
-
 @pytest.mark.parametrize(
     "bad_extra",
     [
@@ -440,7 +349,7 @@ def test_cli_parameterized_validation_errors(
 ) -> None:
     """Verify parameterized CLI validation boundaries raise `MegakernelConfigError`."""
     cfg_file = tmp_path / "config.json"
-    cfg_file.write_text(json.dumps(QWEN35_08B_CFG), encoding="utf-8")
+    cfg_file.write_text(json.dumps(QWEN35_397B_CFG), encoding="utf-8")
     with pytest.raises(MegakernelConfigError):
         advisor.main(["--config", str(cfg_file), *bad_extra])
 
@@ -450,15 +359,25 @@ def test_cli_json_presets_and_validation_errors(
 ) -> None:
     """Verify CLI JSON/table/HTML output, bare-minimum auto-TP, and error wrapping."""
     cfg_file = tmp_path / "config.json"
-    cfg_file.write_text(json.dumps(QWEN35_08B_CFG), encoding="utf-8")
+    cfg_file.write_text(json.dumps(QWEN35_397B_CFG), encoding="utf-8")
     rc = advisor.main(
-        ["--config", str(cfg_file), "--chip", "tpu7x", "--tp", "8", "--json"]
+        [
+            "--config",
+            str(cfg_file),
+            "--chip",
+            "tpu7x",
+            "--tp",
+            "8",
+            "--ep",
+            "8",
+            "--json",
+        ]
     )
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["recommended_scope"] == "per_op"
-    assert payload["recommended_moe_mode"] == "dense_mlp"
-    assert payload["build_megakernel"] is False
+    assert payload["recommended_scope"] == "whole_step"
+    assert payload["recommended_moe_mode"] == "masked_on_chip"
+    assert payload["build_megakernel"] is True
     assert payload["vmem_budget_mib"] == resolve_chip_spec(
         "tpu7x"
     ).vmem_usable_bytes / (1024 * 1024)
@@ -488,18 +407,18 @@ def test_cli_json_presets_and_validation_errors(
         advisor.main(
             [
                 "--model",
-                "moonshotai/Kimi-K3.1-Pro",
+                "moonshotai/Kimi-K3",
                 "--tp",
-                "16",
+                "32",
                 "--ep",
-                "16",
+                "32",
                 "--vmem-fit-headroom",
                 "--no-vmem-alias",
             ]
         )
         == 0
     )
-    assert "Model: kimi-k3.1-pro" in capsys.readouterr().out
+    assert "Model: kimi-k3" in capsys.readouterr().out
 
     for bad_argv in (
         ["--config", str(tmp_path / "missing.json")],
@@ -510,7 +429,10 @@ def test_cli_json_presets_and_validation_errors(
             advisor.main(bad_argv)
 
     bad_dense = dataclasses.replace(
-        advisor.model_profile_from_hf_config(QWEN35_08B_CFG), top_k=2
+        advisor.resolve_model_profile("qwen3.5-397b"),
+        num_experts=0,
+        num_moe_layers=0,
+        top_k=2,
     )
     with pytest.raises(MegakernelConfigError):
         advisor.advise(bad_dense, advisor.WorkloadSpec(tp=8))
@@ -539,55 +461,12 @@ def test_regime_dot_plot_labels_once_and_inside_viewbox(model: str) -> None:
         assert y <= height
 
 
-@pytest.mark.parametrize("model", ["qwen3.5-397b", "kimi-k3", "qwen3.8-2.4t"])
+@pytest.mark.parametrize("model", ["qwen3.5-397b", "kimi-k3", "glm-5.2"])
 def test_reports_name_mechanisms_not_kernels(model: str) -> None:
     """Verify the text table and HTML name no kernel or hardware unit."""
     sweep = advisor.advise_regimes(model, "tpu7x")
     rendered = advisor.format_regime_table(sweep) + advisor.render_advisor_html(sweep)
     assert KERNEL_NAME_DENYLIST.search(rendered) is None
-
-
-def test_unregistered_model_type_estimates_with_architecture_unverified_flag() -> None:
-    """Verify unseen model_type fails closed on HF dict.
-
-    Direct ModelProfile flags unverified arch.
-    """
-    future_cfg: dict[str, object] = {
-        "model_type": "falcon_future_causal",
-        "num_hidden_layers": 32,
-        "hidden_size": 4096,
-        "intermediate_size": 14336,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-    }
-    with pytest.raises(advisor.UnsupportedArchitectureError):
-        advisor.model_profile_from_hf_config(future_cfg, name="falcon-future")
-
-    model_profile = advisor.ModelProfile(
-        name="falcon-future",
-        num_layers=32,
-        hidden_size=4096,
-        intermediate_size=14336,
-        num_attention_heads=32,
-        num_kv_heads=8,
-        head_dim=128,
-        num_attention_layers=32,
-        num_moe_layers=0,
-        weight_dtype="bf16",
-        expert_dtype="bf16",
-        kv_dtype="bf16",
-        model_type="falcon_future_causal",
-        architecture_unverified=True,
-        layer_families=("gqa", "dense_mlp"),
-    )
-    assert model_profile.architecture_unverified is True
-    assert "gqa" in model_profile.layer_families
-    assert "dense_mlp" in model_profile.layer_families
-    report = advisor.advise(
-        model_profile, advisor.WorkloadSpec(tp=8, batch=16), "tpu7x"
-    )
-    assert "architecture_unverified" in report.flags
 
 
 def test_unknown_chip_requires_chip_spec_fields(tmp_path: Path) -> None:
@@ -626,12 +505,14 @@ def test_unknown_chip_requires_chip_spec_fields(tmp_path: Path) -> None:
     rc = advisor.main(
         [
             "--model",
-            "qwen3.5-0.8b",
+            "qwen3.5-397b",
             "--chip",
             "future_xpu_v99",
             "--chip-spec",
             str(spec_file),
             "--tp",
+            "8",
+            "--ep",
             "8",
         ]
     )
@@ -863,8 +744,7 @@ def test_kimi_k3_preset_matches_public_hf_config() -> None:
     # HF moonshotai/Kimi-K3 config.json: num_experts 896, num_experts_per_token 16.
     assert (k3.num_experts, k3.top_k, k3.num_moe_layers) == (896, 16, 92)
     assert "kimi-k3-pro" not in advisor.MODEL_PRESETS
-    qwen_24t = advisor.resolve_model_profile("qwen3.8-2.4t-a95b")
-    assert qwen_24t.num_experts == advisor.MODEL_PRESETS["qwen3.8-2.4t"].num_experts
+    assert "qwen3.8-2.4t" not in advisor.MODEL_PRESETS
 
 
 def test_step_coverage_never_flags_or_decides_scope() -> None:
@@ -882,8 +762,8 @@ def test_step_coverage_never_flags_or_decides_scope() -> None:
 def test_boundary_cost_uses_sourced_launch_gap() -> None:
     """Verify default `WorkloadSpec` prices non-zero boundary cost with ASSUMED tag."""
     report = advisor.advise(
-        "qwen3.5-0.8b",
-        advisor.WorkloadSpec(phase="decode", batch=4, tp=8),
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(phase="decode", batch=4, tp=8, ep=8),
         "tpu7x",
     )
     assert report.metrics["boundary_cost_us"]["value"] > 0.0
@@ -996,8 +876,8 @@ def test_import_without_jax(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "jax" not in sys.modules
     assert mk_fresh.advisor is adv_fresh
     report = adv_fresh.advise(
-        "qwen3.5-0.8b",
-        adv_fresh.WorkloadSpec(phase="decode", batch=4, tp=8),
+        "glm-5.2",
+        adv_fresh.WorkloadSpec(phase="decode", batch=4, tp=16),
         "tpu7x",
     )
     assert report.recommended_scope == "per_op"
@@ -1030,7 +910,7 @@ def test_tpu7x_topologies_start_at_2x2x1_and_tpu6e_alias() -> None:
     assert c6e.name == "v6e"
     assert min(c6e.topologies) == 1
     par = advisor.recommend_parallelism(
-        advisor.resolve_model_profile("qwen3.5-0.8b"), "tpu7x"
+        advisor.resolve_model_profile("qwen3.5-397b"), "tpu7x"
     )
     assert par.tp * par.dp * par.pp >= min_torus_cores
 
@@ -1137,15 +1017,20 @@ def test_chip_spec_optional_fields_sysfs_auto_int8_quant_and_refs_main(
     assert auto_v6e.name == "v6e"
 
     int8_cfg = {
-        **MIXTRAL_8X7B_CFG,
+        **QWEN35_397B_CFG,
         "quantization_config": {
             "quant_method": "compressed-tensors",
             "config_groups": {"group_0": {"weights": {"num_bits": 8, "type": "int"}}},
         },
     }
-    p_int8 = advisor.model_profile_from_hf_config(int8_cfg, name="mixtral-int8")
+    p_int8 = advisor.models.parse_hf_config_profile(int8_cfg, name="qwen35-int8")
     assert p_int8.weight_dtype == "int8"
+    with pytest.raises(advisor.UnsupportedArchitectureError):
+        advisor.model_profile_from_hf_config(int8_cfg, name="qwen35-int8")
 
+    k3_snapshot = json.loads(
+        (HF_CONFIG_DIR / "kimi-k3.json").read_text(encoding="utf-8")
+    )
     hf_cache = tmp_path / "hf_home"
     repo_root = hf_cache / "hub" / "models--acme--test-qwen"
     snap_old = repo_root / "snapshots" / "zzzz_older_lex_last"
@@ -1154,18 +1039,18 @@ def test_chip_spec_optional_fields_sysfs_auto_int8_quant_and_refs_main(
     snap_new.mkdir(parents=True)
     (repo_root / "refs").mkdir(parents=True)
     (repo_root / "refs" / "main").write_text("aaaa_main_ref\n", encoding="utf-8")
-    expected_hidden = 2048
     (snap_old / "config.json").write_text(
-        json.dumps({**QWEN35_397B_CFG, "hidden_size": 1024}), encoding="utf-8"
+        json.dumps(k3_snapshot["config"]), encoding="utf-8"
     )
     (snap_new / "config.json").write_text(
-        json.dumps({**QWEN35_397B_CFG, "hidden_size": expected_hidden}),
+        json.dumps(QWEN35_397B_CFG),
         encoding="utf-8",
     )
     prof_ref = advisor.resolve_model_profile(
         advisor.resolve_hf_snapshot_config("acme/test-qwen", hf_home=hf_cache)
     )
-    assert prof_ref.hidden_size == expected_hidden
+    assert prof_ref.name == "qwen3.5-397b"
+    assert prof_ref.hidden_size == QWEN35_397B_CFG["hidden_size"]
 
     rc = advisor.main(
         [
@@ -1358,8 +1243,21 @@ def test_adaptive_ring_contraction_single_pass_wide_batch() -> None:
     assert ws_wide.selected_expert_slots == constants.DOUBLE_BUFFER_SLOTS
     assert ws_wide.n_splits == 1
 
+    dense_prof = advisor.models.finalize_model_profile(
+        dataclasses.replace(
+            advisor.resolve_model_profile("qwen3.5-397b"),
+            name="dense-ring-test",
+            num_experts=0,
+            top_k=0,
+            num_moe_layers=0,
+            moe_intermediate_size=0,
+            shared_expert_intermediate_size=0,
+            intermediate_size=14336,
+            layer_families=("gqa", "gdn", "dense_mlp"),
+        )
+    )
     rep_llama = advisor.advise(
-        "llama-3.1-405b",
+        dense_prof,
         advisor.WorkloadSpec(phase="decode", batch=16, tp=8),
         "tpu7x",
     )
@@ -1469,19 +1367,7 @@ def test_dispatch_regimes_and_compiler_proof_gain_split(
 
 def test_no_fused_recommendation_outside_core_limits() -> None:
     """Fused scopes outside core or declared limits stay gated to per_op."""
-    ds4_profile = advisor.model_profile_from_hf_config(
-        DEEPSEEK_V4_CFG, name="deepseek-v4-hf", weight_dtype="fp8"
-    )
-    q4_profile = advisor.model_profile_from_hf_config(
-        QWEN4_EXP_CFG, name="qwen4-exp-hf", weight_dtype="fp8"
-    )
-    targets: tuple[str | advisor.ModelProfile, ...] = (
-        "kimi-k3.1-pro",
-        "glm-5.2",
-        "qwen3.8-2.4t",
-        ds4_profile,
-        q4_profile,
-    )
+    targets: tuple[str | advisor.ModelProfile, ...] = ("glm-5.2",)
     for model_target in targets:
         sweep = advisor.advise_regimes(model_target, "tpu7x")
         assert all(r.recommended_scope == "per_op" for r in sweep.regimes)
@@ -1529,8 +1415,11 @@ def test_cli_prints_evidence_blockers_and_inputs(
     tmp_path: Path,
 ) -> None:
     """CLI summary prints Evidence, Blocked by, and Inputs."""
-    config_path = tmp_path / "deepseek_v4_config.json"
-    config_path.write_text(json.dumps(DEEPSEEK_V4_CFG), encoding="utf-8")
+    glm_snapshot = json.loads(
+        (HF_CONFIG_DIR / "glm-5.2.json").read_text(encoding="utf-8")
+    )
+    config_path = tmp_path / "glm_5_2_config.json"
+    config_path.write_text(json.dumps(glm_snapshot["config"]), encoding="utf-8")
     rc = advisor.main(["--model", str(config_path), "--tp", "16", "--explain"])
     assert rc == 0
     out = capsys.readouterr().out
@@ -1607,7 +1496,7 @@ def test_regime_entry_uses_recommended_scope_not_hypothetical() -> None:
 
 def test_recommend_parallelism_raises_when_no_layout_fits() -> None:
     """Verify recommend_parallelism rejects models that OOM at max TP candidate."""
-    model_profile = advisor.resolve_model_profile("qwen3.8-2.4t")
+    model_profile = advisor.resolve_model_profile("kimi-k3")
     tiny_chip = dataclasses.replace(
         advisor.resolve_chip_spec("tpu7x"),
         hbm_capacity_bytes=1024 * 1024,
@@ -1616,13 +1505,11 @@ def test_recommend_parallelism_raises_when_no_layout_fits() -> None:
         advisor.recommend_parallelism(model_profile, tiny_chip)
 
     v6e_spec = advisor.resolve_chip_spec("v6e")
-    qwen4_v6e_profile = advisor.model_profile_from_hf_config(
-        QWEN4_EXP_CFG, name="qwen4-exp-hf", weight_dtype="fp8"
-    )
-    par_v6e = advisor.recommend_parallelism(qwen4_v6e_profile, v6e_spec)
+    qwen35_v6e_profile = advisor.resolve_model_profile("qwen3.5-397b")
+    par_v6e = advisor.recommend_parallelism(qwen35_v6e_profile, v6e_spec)
     v6e_cores = par_v6e.tp * par_v6e.dp * par_v6e.pp
     assert v6e_cores in v6e_spec.topologies
-    v6e_sweep = advisor.advise_regimes(qwen4_v6e_profile, "v6e")
+    v6e_sweep = advisor.advise_regimes(qwen35_v6e_profile, "v6e")
     assert not v6e_sweep.regimes[0].verdict.startswith("invalid_config(")
 
     dp2_sweep = advisor.advise_regimes(
@@ -2121,7 +2008,7 @@ def test_cli_decoding_sequences_littles_law_and_host_head_flags(
     for invalid_argv in (
         [
             "--model",
-            "qwen3.5-0.8b",
+            "qwen3.5-397b",
             "--tp",
             "8",
             "--batch",
@@ -2129,10 +2016,10 @@ def test_cli_decoding_sequences_littles_law_and_host_head_flags(
             "--decoding-seqs",
             "4",
         ],
-        ["--model", "qwen3.5-0.8b", "--tp", "8", "--output-tok-s", "500.0"],
+        ["--model", "qwen3.5-397b", "--tp", "8", "--output-tok-s", "500.0"],
         [
             "--model",
-            "qwen3.5-0.8b",
+            "qwen3.5-397b",
             "--tp",
             "8",
             "--output-tok-s",
@@ -2140,11 +2027,11 @@ def test_cli_decoding_sequences_littles_law_and_host_head_flags(
             "--mean-tpot-ms",
             "10.0",
         ],
-        ["--model", "qwen3.5-0.8b", "--tp", "8", "--decoding-seqs", "0"],
-        ["--model", "qwen3.5-0.8b", "--tp", "8", "--host-head-us", "per_op=-5"],
-        ["--model", "qwen3.5-0.8b", "--tp", "8", "--host-head-us", "bad_key=10"],
-        ["--model", "qwen3.5-0.8b", "--tp", "8", "--per-op-step-us", "0"],
-        ["--model", "qwen3.5-0.8b", "--tp", "8", "--step-coverage", "1.2"],
+        ["--model", "qwen3.5-397b", "--tp", "8", "--decoding-seqs", "0"],
+        ["--model", "qwen3.5-397b", "--tp", "8", "--host-head-us", "per_op=-5"],
+        ["--model", "qwen3.5-397b", "--tp", "8", "--host-head-us", "bad_key=10"],
+        ["--model", "qwen3.5-397b", "--tp", "8", "--per-op-step-us", "0"],
+        ["--model", "qwen3.5-397b", "--tp", "8", "--step-coverage", "1.2"],
     ):
         with pytest.raises(MegakernelConfigError):
             advisor.main(invalid_argv)
