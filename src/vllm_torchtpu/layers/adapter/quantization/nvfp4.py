@@ -78,6 +78,7 @@ from vllm_torchtpu.layers.adapter import (
     moe_redundant,
     moe_route_trace,
     moe_routing,
+    moe_tp_dense,
     token_padding,
 )
 from vllm_torchtpu.layers.adapter.fused_moe import (
@@ -384,6 +385,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value},
             )
         moe_redundant.wrap_weight_loaders(layer)
+        moe_tp_dense.prepare(layer, hidden_size, intermediate_size_per_partition)
+        moe_tp_dense.wrap_weight_loaders(layer)
 
     def _resolve_tpu_activation(self, layer) -> str:
         activation_str = super()._resolve_tpu_activation(layer)
@@ -405,6 +408,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
         activation_str = self._set_tpu_activation(layer)
 
+        moe_tp_dense.align_global_scales(layer)
         # --- fuse E4M3 block scale * FP32 per-tensor global -> FP32 block scale.
         # w13: global is [E, 2] (separate w1/w3 per-tensor scales); apply to the
         # gate (first half) and up (second half) output rows respectively.
@@ -504,6 +508,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         moe_redundant.install(layer)
+        moe_tp_dense.finalize(layer, w13_scale_4d, activation_str)
         moe_route_trace.register(layer)
         if envs.TPU_MOE_NVFP4_SKIP_PADDED and envs.TPU_MOE_SKIP_PADDED_TOKENS:
             _log_skip_padded_once()
@@ -587,6 +592,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids, topk_weights
             )
+        logical_ids = topk_ids
         if moe_redundant.ENABLED:
             # Logical -> physical slot ids (identity for layers without
             # replicas); experts_start below is then rank * slots.
@@ -607,6 +613,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         }
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
+        if moe_tp_dense.active(layer):
+            return moe_tp_dense.fused_moe(layer, kwargs, logical_ids)
 
         return fused_moe_gmm(**kwargs)
 
