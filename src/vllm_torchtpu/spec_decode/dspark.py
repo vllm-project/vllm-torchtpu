@@ -38,6 +38,7 @@ from typing import NamedTuple
 import torch
 from vllm.config import VllmConfig
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
@@ -91,6 +92,10 @@ class DSparkProposer(DFlashProposer):
         # instead of the all-gathered full-vocab logits; set by load_model
         # when the draft model opts in. The compiled draft step traces on it.
         self._vocab_parallel_markov = False
+        # Up to how many rows that loop runs as the draft's one-call chain
+        # kernel (0: never); set by load_model. The compiled draft step traces
+        # on it.
+        self._markov_chain_max_rows = 0
         # The query block follows K, not the block length the checkpoint was
         # trained at; upstream vLLM likewise only enforces K == block for
         # Qwen3-Omni DSpark. The checkpoint's block is a query-block length in
@@ -157,6 +162,26 @@ class DSparkProposer(DFlashProposer):
                 "DSpark: greedy Markov drafting argmaxes the vocab-parallel "
                 "logits per rank; full-vocab logits are not gathered."
             )
+        # Opt-in on top of the shard path: the draft's
+        # enable_markov_argmax_chain(slots) builds a kernel that runs every
+        # slot's shard argmax and exchange in one call (collective).
+        enable_chain = getattr(self.draft_model, "enable_markov_argmax_chain", None)
+        sample_start = 0 if self.sample_from_anchor else 1
+        if (
+            self._vocab_parallel_markov
+            and not self.use_confidence_head
+            and envs.VLLM_TPU_DSPARK_MARKOV_CHAIN
+            and callable(enable_chain)
+        ):
+            self._markov_chain_max_rows = int(
+                enable_chain(self.block_size - sample_start)
+            )
+        if self._markov_chain_max_rows:
+            logger.info(
+                "DSpark: the greedy Markov chain runs as one kernel call up "
+                "to %d rows.",
+                self._markov_chain_max_rows,
+            )
 
     def _observe_draft_aux(
         self, aux: torch.Tensor, chunk_index: int, chunk: DraftChunkInputs
@@ -219,9 +244,17 @@ class DSparkProposer(DFlashProposer):
             padded_num_reqs, block_size
         )
         prev = ids_3d[:, 0]
+        sample_start = 0 if self.sample_from_anchor else 1
+        if (
+            padded_num_reqs <= self._markov_chain_max_rows
+            and not self.use_confidence_head
+        ):
+            chain = self.draft_model.markov_argmax_chain(
+                logits_3d[:, sample_start:], prev
+            )
+            return chain, hidden
         draft_tokens = []
         markov_embeds = []
-        sample_start = 0 if self.sample_from_anchor else 1
         for i in range(sample_start, block_size):
             markov_embed = self.draft_model.markov_embed(prev)
             if vocab_parallel:

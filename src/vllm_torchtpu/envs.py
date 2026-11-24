@@ -202,6 +202,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    VLLM_TPU_DSPARK_MARKOV_CHAIN: bool = True
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -1235,6 +1236,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # Run a vocab-parallel DSpark draft's greedy Markov chain as one Pallas
+    # call (spec_decode/markov_argmax_chain.py) instead of one all-gather and
+    # a chain of small ops per draft slot. Same ids; 0 keeps the per-slot loop.
+    "VLLM_TPU_DSPARK_MARKOV_CHAIN": env_bool(
+        "VLLM_TPU_DSPARK_MARKOV_CHAIN", default=True
+    ),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
     # 0 searches the full vocab. Used only when every active request has

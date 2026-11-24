@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from vllm.config import SpeculativeConfig
 
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+    from vllm_torchtpu.spec_decode.markov_argmax_chain import MarkovArgmaxChain
 
 logger = init_logger(__name__)
 
@@ -353,6 +354,9 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
         self.register_buffer("markov_w2_shard", None, persistent=False)
         self.register_buffer("vocab_shard_start", None, persistent=False)
         self.register_buffer("vocab_shard_pad_mask", None, persistent=False)
+        # The greedy Markov chain as one kernel call, set by
+        # enable_markov_argmax_chain() once the shard path is on.
+        self._markov_argmax_chain: MarkovArgmaxChain | None = None
 
     def _vocab_parallel_markov_blocker(self) -> str | None:
         """Why the shard argmax cannot reproduce the gathered argmax, or None."""
@@ -425,6 +429,41 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
             self.lm_head.num_embeddings_per_partition,
         )
         return True
+
+    def enable_markov_argmax_chain(self, slots: int) -> int:
+        """DSparkProposer opt-in, after enable_vocab_parallel_markov_argmax:
+        run the greedy chain over the vocab shards as one kernel call
+        (`spec_decode/markov_argmax_chain`). Collective over the TP group;
+        returns the most rows the chain op takes (0: not built)."""
+        from vllm_torchtpu.spec_decode import markov_argmax_chain
+
+        if (
+            self.markov_w2_shard is None
+            or self._markov_cast_dtype is not None
+            or self.draft_id_to_target_id is not None
+        ):
+            return 0
+        shard = self.lm_head.shard_indices
+        head = self.model.markov_head
+        self._markov_argmax_chain = markov_argmax_chain.build(
+            head.markov_w1.weight,
+            head.markov_w2.weight,
+            shard.org_vocab_start_index,
+            shard.org_vocab_end_index - shard.org_vocab_start_index,
+            self.lm_head.num_embeddings_per_partition,
+            slots,
+        )
+        chain = self._markov_argmax_chain
+        return 0 if chain is None else chain.max_rows
+
+    def markov_argmax_chain(
+        self, logits_shard: torch.Tensor, prev: torch.Tensor
+    ) -> torch.Tensor:
+        """int64 ``[rows, slots]`` greedy draft ids: slot s is
+        ``markov_argmax_shard(logits_shard[:, s], markov_embed(id of slot
+        s - 1))``, the id before slot 0 being ``prev``."""
+        assert self._markov_argmax_chain is not None
+        return self._markov_argmax_chain(logits_shard, prev)
 
     def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's vocab shard of ``compute_draft_logits`` (pad columns
