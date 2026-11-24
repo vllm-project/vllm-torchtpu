@@ -1181,8 +1181,8 @@ def _class_candidates(
 
 
 def msa_write_and_candidates_dcp(
-    k: jax.Array,
-    v: jax.Array,
+    k: jax.Array | msa.QuantizedKV,
+    v: jax.Array | None,
     index_q: jax.Array,
     index_k: jax.Array,
     kv_cache: jax.Array,
@@ -1217,12 +1217,13 @@ def msa_write_and_candidates_dcp(
     Shapes as `msa.msa_forward`, except that a rank may hold ``G >= 1`` KV
     heads (DCP wider than a KV head's replicas): ``k``/``v``/``index_q
     [T, G, D]``, cache rows ``[K_0 | V_0 | ... | K_G-1 | V_G-1]``, and the
-    single index-key head shared by all. ``block_tables`` are vLLM's logical
+    single index-key head shared by all; with 4-bit caches `k` may come
+    quantized (`msa.QuantizedKV`, `v` None). ``block_tables`` are vLLM's logical
     DCP blocks of ``dcp * block_size`` tokens. Returns ``(kv_cache,
     index_cache, candidates [T, G * 2 * topk] f32)``: `pack_candidates` per
     head, head-major.
     """
-    num_tokens, num_heads, _ = k.shape
+    num_tokens, num_heads, _ = index_q.shape
     rank = rank_array(rank)[0]
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]

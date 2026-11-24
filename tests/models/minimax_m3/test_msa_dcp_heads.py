@@ -26,10 +26,12 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.models.minimax_m3.kernels import (
+    msa,
     msa_attention,
     msa_dcp,
     msa_dcp_heads,
     msa_fp4,
+    msa_quantize,
 )
 
 PAGE, HEAD_DIM, TOPK, DCP, HEADS, Q_PER_KV = 128, 128, 16, 8, 4, 16
@@ -404,11 +406,12 @@ def test_dcp4_decode_merge_matches_dcp_reference(head_calls, monkeypatch):
         )
 
 
-@pytest.mark.parametrize("num_tokens", [2048, 2047, 384])
+@pytest.mark.parametrize("num_tokens", [2112, 2047, 384])
 def test_gather_group_kv_matches_group_rows(num_tokens):
     """The group's K/V and index queries gathered in the program (DCP 4 over
-    2 KV heads) are every head's rows; 2047 tokens do not split over the
-    replicas."""
+    2 KV heads) are every head's rows: lane-dense rows (2112 tokens, no
+    whole 8-bit tiles to quantize into), 2047 tokens that do not split over
+    the replicas, decode-sized rows."""
     dcp, heads = 4, 2
     if len(jax.devices()) < dcp:
         pytest.skip(
@@ -429,6 +432,7 @@ def test_gather_group_kv_matches_group_rows(num_tokens):
             axis="dcp",
             dcp=dcp,
             kv_head_replicas=dcp // heads,
+            interpret=True,
         )
         return tuple(x[None] for x in got)
 
@@ -443,3 +447,74 @@ def test_gather_group_kv_matches_group_rows(num_tokens):
     for r in range(dcp):
         for g, w in zip(got, group):
             np.testing.assert_array_equal(np.asarray(g[r]), np.asarray(w))
+
+
+@pytest.mark.parametrize("num_tokens", [2048, 2304])
+def test_gather_group_kv_quantizes_the_write_rows(num_tokens):
+    """A step that quantizes its K/V in a kernel gathers them quantized (DCP 4
+    over 2 KV heads): bit for bit the rows and scales `quantize_kv_rows` makes
+    of the group's bf16 heads (what the write stores); quarters of 256 and
+    288 tokens (unpack blocks of 256 and 32)."""
+    dcp, heads = 4, 2
+    if len(jax.devices()) < dcp:
+        pytest.skip(
+            "needs 4 devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)"
+        )
+    rng = np.random.default_rng(num_tokens)
+    group = [
+        jnp.asarray(rng.standard_normal((num_tokens, heads, HEAD_DIM)), jnp.bfloat16)
+        for _ in range(3)
+    ]  # k, v, index_q of the group's heads
+    own = [jnp.repeat(x, dcp // heads, axis=1) for x in group]  # rank r: head r // 2
+    mesh = Mesh(np.asarray(jax.devices()[:dcp]), ("dcp",))
+
+    def body(rank, k, v, index_q):
+        k, v, index_q = msa_dcp_heads.gather_group_kv(
+            k.transpose(1, 0, 2),
+            v.transpose(1, 0, 2),
+            index_q.transpose(1, 0, 2),
+            rank,
+            axis="dcp",
+            dcp=dcp,
+            kv_head_replicas=dcp // heads,
+            interpret=True,
+        )
+        kv = (k.rows, k.scales) if v is None else (k, v)
+        return tuple(x[None] for x in kv), index_q[None]
+
+    f = jax.shard_map(
+        body,
+        mesh=mesh,
+        in_specs=(P("dcp"),) * 4,
+        out_specs=((P("dcp"), P("dcp")), P("dcp")),
+        check_vma=False,
+    )
+    ranks = jnp.arange(dcp, dtype=jnp.int32)
+    (a, b), index_q = f(ranks, *(x.transpose(1, 0, 2) for x in own))
+    rows, scales = msa_quantize.quantize_kv_rows(group[0], group[1], interpret=True)
+    for r in range(dcp):
+        np.testing.assert_array_equal(np.asarray(index_q[r]), np.asarray(group[2]))
+        np.testing.assert_array_equal(np.asarray(a[r]), np.asarray(rows))
+        np.testing.assert_array_equal(np.asarray(b[r]), np.asarray(scales))
+
+
+def test_fp4_targets_take_quantized_kv():
+    """Pre-quantized K/V (`msa.QuantizedKV`) make the write targets bf16 K/V
+    do, bit for bit."""
+    rng = np.random.default_rng(5)
+    num_tokens, heads, pages = 2048, 2, 4
+    k, v = (
+        jnp.asarray(rng.standard_normal((num_tokens, heads, HEAD_DIM)), jnp.bfloat16)
+        for _ in range(2)
+    )
+    index_k = jnp.asarray(rng.standard_normal((num_tokens, HEAD_DIM)), jnp.bfloat16)
+    caches = (
+        jnp.zeros((pages, 16, 4, heads * 2 * HEAD_DIM), jnp.uint8),
+        jnp.zeros((pages, 17, 4, HEAD_DIM), jnp.uint8),
+        jnp.zeros((pages, 8, PAGE), jnp.float32),
+    )
+    want = msa.fp4_targets(*caches, k, v, index_k, interpret=True)
+    kv = msa.QuantizedKV(*msa_quantize.quantize_kv_rows(k, v, interpret=True))
+    got = msa.fp4_targets(*caches, kv, None, index_k, interpret=True)
+    for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want)):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))

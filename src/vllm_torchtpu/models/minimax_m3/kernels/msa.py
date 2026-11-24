@@ -21,6 +21,7 @@ runs over the selected blocks only (`msa_attention.msa_sparse_attention`).
 """
 
 from collections.abc import Sequence
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -193,30 +194,40 @@ def write_fp4(
     return kv_cache, index_cache, scale_cache
 
 
+class QuantizedKV(NamedTuple):
+    """A step's K/V already rotated and quantized for a 4-bit cache, as
+    `msa_quantize.quantize_kv_rows` returns them."""
+
+    rows: jax.Array  # uint8 nibbles [T, 2 * G * D]: [K_0 | V_0 | ... ]
+    scales: jax.Array  # f32 [T, 2 * G]: [k_0, v_0, ...]
+
+
 def fp4_targets(
     kv_cache: jax.Array,
     index_cache: jax.Array,
     scale_cache: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
+    k: jax.Array | QuantizedKV,
+    v: jax.Array | None,
     index_k: jax.Array,
     *,
     interpret: bool = False,
 ) -> list[msa_write.Rows | msa_write.SlotValues]:
     """`write_fp4`'s rotated, quantized write targets: K/V nibbles, index-key
-    nibbles with their folded scales, then the K/V scales."""
-    num_tokens, num_heads, _ = k.shape
-    if (
-        num_heads > 1
-        and num_tokens >= msa_quantize.MIN_TOKENS
+    nibbles with their folded scales, then the K/V scales. `k` may come
+    quantized (`QuantizedKV`, `v` None)."""
+    if isinstance(k, QuantizedKV):
+        kv_rows, scales = k
+    elif (
+        k.shape[1] > 1
+        and k.shape[0] >= msa_quantize.MIN_TOKENS
         and k.dtype == jnp.bfloat16
     ):
         kv_rows, scales = msa_quantize.quantize_kv_rows(k, v, interpret=interpret)
     else:
         k_nib, k_scale = msa_fp4.quantize(msa_fp4.rotate_keys(k))
         v_nib, v_scale = msa_fp4.quantize(msa_fp4.rotate_keys(v))
-        kv_rows = jnp.concatenate([k_nib, v_nib], axis=-1).reshape(num_tokens, -1)
-        scales = jnp.stack([k_scale, v_scale], axis=-1).reshape(num_tokens, -1)
+        kv_rows = jnp.concatenate([k_nib, v_nib], axis=-1).reshape(k.shape[0], -1)
+        scales = jnp.stack([k_scale, v_scale], axis=-1).reshape(k.shape[0], -1)
     i_nib, i_scale = msa_fp4.quantize(msa_fp4.rotate_keys(index_k))
     return [
         msa_write.Rows(kv_cache, kv_rows, 4),

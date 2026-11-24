@@ -47,6 +47,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_attention_lse,
     msa_dcp,
     msa_fp4,
+    msa_quantize,
 )
 
 # Steps of at least this many tokens attend their prefill requests
@@ -217,6 +218,11 @@ def unrotate_replica_rows(
     return merged.reshape(num_tokens, heads * head_dim)
 
 
+# A gathered K/V word holds the nibble pairs of this many quarters of a
+# replica's tokens (`gather_group_kv`).
+_KV_QUARTERS = 4
+
+
 def gather_group_kv(
     k: jax.Array,
     v: jax.Array,
@@ -226,12 +232,20 @@ def gather_group_kv(
     axis: str,
     dcp: int,
     kv_head_replicas: int,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+    interpret: bool = False,
+) -> tuple[jax.Array | msa.QuantizedKV, jax.Array | None, jax.Array]:
     """Inside a ``shard_map`` over `axis`: this rank's KV head's ``k``/``v``/
-    ``index_q [T, 1, D]`` -> the DCP group's KV heads' ``k``/``v``/``index_q
-    [T, G, D]`` for `msa_dcp.msa_write_and_candidates_dcp`. Rank ``i = h *
+    ``index_q [T, 1, D]`` -> the DCP group's KV heads' ``(k, v, index_q [T,
+    G, D])`` for `msa_dcp.msa_write_and_candidates_dcp`. Rank ``i = h *
     kv_head_replicas + j`` holds KV head ``h``, as its other replicas do, so
-    it sends only part ``j`` of the tokens. In the program, unlike as a torch
+    it sends only part ``j`` of the tokens.
+
+    A step that quantizes its K/V in a kernel (`msa.fp4_targets`: bf16, at
+    least `msa_quantize.MIN_TOKENS` rows) quantizes its own part before the
+    gather and sends each K/V nibble pair as one byte, with the scales: the
+    write's exact rows (`msa.QuantizedKV`, ``v`` None) for half the bytes
+    of bf16 K/V rows (the bf16 gather of a c64 8K-token step: 34-106 us per
+    layer, j-9364c1db / j-fa9b2cc7). In the program, unlike as a torch
     collective ahead of it, the gather can run beside work that does not
     need it (`prepare_queries`)."""
     num_tokens, _, head_dim = k.shape
@@ -255,17 +269,92 @@ def gather_group_kv(
         x = x.reshape(heads, reps, part, *x.shape[2:])
         return jnp.moveaxis(x, 0, 2).reshape(num_tokens, heads, *x.shape[3:])
 
-    if num_tokens < HEAD_PARALLEL_MIN_TOKENS:
-        # Decode-sized steps: [part, 3, D] rows (lane-dense rows cost +4.4 us
-        # per decode layer at c64, twin j-899e03a2).
-        rows = mine(jnp.concatenate([k, v, index_q], axis=1))
-        per_rank = per_head(jax.lax.all_gather(rows, axis))  # [T, G, 3, D]
-        return tuple(per_rank[:, :, i] for i in range(3))
-    # Lane-dense [part, 3 D] rows: re-laying gathered [T, 3, D] rows out per
-    # head cost ~88 us per layer at c64 (twin j-9a9fccc2).
-    rows = jnp.concatenate([k, v, index_q], axis=-1).reshape(num_tokens, -1)
-    per_rank = per_head(jax.lax.all_gather(mine(rows), axis))  # [T, G, 3 D]
-    return tuple(per_rank[..., i * head_dim : (i + 1) * head_dim] for i in range(3))
+    quantize = (
+        heads > 1
+        and num_tokens >= msa_quantize.MIN_TOKENS
+        and k.dtype == jnp.bfloat16
+        and part % (32 * _KV_QUARTERS) == 0  # whole 8-bit tiles per quarter
+    )
+    if not quantize:
+        if num_tokens < HEAD_PARALLEL_MIN_TOKENS:
+            # Decode-sized steps: [part, 3, D] rows (lane-dense rows cost
+            # +4.4 us per decode layer at c64, twin j-899e03a2).
+            rows = mine(jnp.concatenate([k, v, index_q], axis=1))
+            per_rank = per_head(jax.lax.all_gather(rows, axis))  # [T, G, 3, D]
+            return tuple(per_rank[:, :, i] for i in range(3))
+        rows = jnp.concatenate([k, v, index_q], axis=-1).reshape(num_tokens, -1)
+        per_rank = per_head(jax.lax.all_gather(mine(rows), axis))  # [T, G, 3 D]
+        return tuple(per_rank[..., i * head_dim : (i + 1) * head_dim] for i in range(3))
+    nibbles, scales = msa_quantize.quantize_kv_rows(
+        mine(k), mine(v), interpret=interpret
+    )  # [part, 2 D] ([K | V]), [part, 2]
+    # A byte per K/V nibble pair, the bytes of four quarters of the tokens
+    # in a word (lane-dense, each quarter whole), then the scales' bits: one
+    # buffer.
+    pairs = (nibbles[:, :head_dim] | (nibbles[:, head_dim:] << 4)).astype(jnp.uint32)
+    n = part // _KV_QUARTERS
+    kv_words = sum(
+        pairs[b * n : (b + 1) * n] << (8 * b) for b in range(_KV_QUARTERS)
+    )  # [part / 4, D]
+    scale_words = jax.lax.bitcast_convert_type(scales, jnp.uint32).reshape(-1)
+    scale_words = jnp.pad(scale_words, (0, -scale_words.shape[0] % head_dim))
+    send = jnp.concatenate([kv_words, scale_words.reshape(-1, head_dim)])
+    got = jax.lax.all_gather(send, axis)  # [dcp, rows, D]
+    got_scales = jax.lax.bitcast_convert_type(
+        got[:, n:].reshape(dcp, -1)[:, : 2 * part], jnp.float32
+    ).reshape(dcp, part, 2)
+    kv = msa.QuantizedKV(
+        _unpack_kv_rows(got, part, heads, interpret=interpret),
+        per_head(got_scales).reshape(num_tokens, -1),
+    )
+    index_q = per_head(jax.lax.all_gather(mine(index_q[:, 0]), axis))
+    return kv, None, index_q
+
+
+def _unpack_kv_rows(
+    words: jax.Array, part: int, heads: int, *, interpret: bool = False
+) -> jax.Array:
+    """`gather_group_kv`'s gathered K/V words ``[dcp, >= part / 4, D]``
+    (rank ``h * reps + j``'s part of KV head ``h``: byte ``b`` of word row
+    ``i`` the nibble pair of its token ``b * part / 4 + i``) -> the write's
+    uint8 nibble rows ``[T, 2 * G * D]`` (`msa_quantize.quantize_kv_rows`):
+    as XLA ops the byte unpack and the head interleave re-laid the 8-bit
+    rows out several times."""
+    dcp, _, head_dim = words.shape
+    reps = dcp // heads
+    n = part // _KV_QUARTERS
+    block = next(b for b in (512, 256, 128, 64, 32) if n % b == 0)
+    per_quarter = n // block
+
+    def kernel(w_ref, o_ref):
+        shift = (8 * (pl.program_id(1) // per_quarter)).astype(jnp.uint32)
+        for h in range(heads):
+            pair = w_ref[h] >> shift
+            for c in range(2):  # K, then V
+                col = (2 * h + c) * head_dim
+                o_ref[:, col : col + head_dim] = ((pair >> (4 * c)) & 0xF).astype(
+                    o_ref.dtype
+                )
+
+    return pl.pallas_call(
+        kernel,
+        grid=(reps, part // block),
+        in_specs=[
+            pl.BlockSpec(
+                (heads, None, block, head_dim),
+                lambda j, i: (0, j, i % per_quarter, 0),
+            )
+        ],
+        out_specs=pl.BlockSpec(
+            (block, 2 * heads * head_dim), lambda j, i: (j * (part // block) + i, 0)
+        ),
+        out_shape=jax.ShapeDtypeStruct((reps * part, 2 * heads * head_dim), jnp.uint8),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_unpack_kv_rows",
+    )(words.reshape(heads, reps, -1, head_dim))
 
 
 def merge_partials(
