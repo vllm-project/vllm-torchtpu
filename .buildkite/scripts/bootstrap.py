@@ -617,20 +617,31 @@ def tpu_generations_note(ctx: BuildContext, suite: Suite) -> str | None:
 
 
 # Build kind -> (Buildkite job priority, Kueue workload priority class).
-# Nightly builds are unclassed on kube, level with the tpu-inference nightlies.
+# The nightly on main uses the fleet's `nightly` Kueue class, which the
+# tpu-inference nightly uses too and which ties with pre-merge: Kueue admits
+# equal priorities in order of age, so the nightly waits for the pull requests
+# already queued and not for the ones submitted after it. Unclassed, it would
+# wait behind every pull request until the launcher's queue limit failed it.
+# A NIGHTLY=1 build off main (a release gate, a manual full suite) and the
+# torch-tpu canary are unclassed. The Buildkite job priority is lowest: it
+# orders agent pickup and the bare-metal steps, while Kueue's class orders the
+# steps that wait for TPU chips.
 PRIORITIES: dict[str, tuple[int, str | None]] = {
     "oncall-fix": (12, "oncall-fix"),
     "post-merge": (11, "post-merge"),
     "pre-merge": (6, "pre-merge"),
     "other": (2, None),
-    "nightly": (1, None),
+    "nightly": (1, "nightly"),
+    "unclassed-nightly": (1, None),
 }
 
 
 def build_kind(ctx: BuildContext) -> str:
     """Classify the build into one of the `PRIORITIES` keys."""
-    if ctx.nightly_env or ctx.is_torchtpu_canary:
-        return "nightly"
+    if ctx.is_torchtpu_canary:
+        return "unclassed-nightly"
+    if ctx.nightly_env:
+        return "nightly" if ctx.branch == "main" else "unclassed-nightly"
     if ctx.is_oncall_fix:
         return "oncall-fix"
     if ctx.is_pr or ctx.is_ci_command:
