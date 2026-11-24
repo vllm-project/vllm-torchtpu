@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     TPU_MOE_COUNTING_SORT: bool = True
     TPU_MOE_VALID_COUNT_FROM_SORT: bool = False
     TPU_MOE_ONEHOT_COMBINE_FLAT: bool = False
+    TPU_MOE_ONEHOT_COMBINE_FLAT_MAX_ROUTES: int = 0
     TPU_MOE_BOUNDED_ONEHOT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
@@ -930,6 +931,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # small contraction instead of reshaping them to [T, topk] (a lane
     # relayout). Same values.
     "TPU_MOE_ONEHOT_COMBINE_FLAT": env_bool("TPU_MOE_ONEHOT_COMBINE_FLAT"),
+    # TPU_MOE_ONEHOT_COMBINE_FLAT only on calls of at most this many routes
+    # (T * topk); 0 = no cap. Its [routes, routes] permutation operand grows
+    # quadratically (c64 decode: 1536-1792 routes).
+    "TPU_MOE_ONEHOT_COMBINE_FLAT_MAX_ROUTES": env_int(
+        "TPU_MOE_ONEHOT_COMBINE_FLAT_MAX_ROUTES", 0
+    ),
     # Run the EP one-hot MoE permute and combine as Pallas kernels that visit
     # only the 128-slot blocks of the valid local prefix (about 1/EP of the
     # routed slots) instead of dense one-hot matmuls over every slot, where

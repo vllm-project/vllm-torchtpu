@@ -811,7 +811,12 @@ def moe_gmm(
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
             computed = jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < valid_count[0]
             gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
-            if envs.TPU_MOE_ONEHOT_COMBINE_FLAT and topk_weights.dtype == gmm2_res.dtype:
+            flat_cap = envs.TPU_MOE_ONEHOT_COMBINE_FLAT_MAX_ROUTES
+            if (
+                envs.TPU_MOE_ONEHOT_COMBINE_FLAT
+                and topk_weights.dtype == gmm2_res.dtype
+                and (flat_cap <= 0 or argsort_revert_indices.size <= flat_cap)
+            ):
                 logger.warning_once(
                     "TPU_MOE_ONEHOT_COMBINE_FLAT=1 on: dense MoE combine one-hot "
                     "from the flat revert indices"

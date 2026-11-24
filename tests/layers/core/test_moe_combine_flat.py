@@ -51,8 +51,7 @@ def test_flat_combine_matrix_bitwise(num_tokens, topk):
     assert int(jnp.count_nonzero(new)) == int(jnp.count_nonzero(valid))  # control
 
 
-@pytest.mark.parametrize("num_tokens", [8, 96])
-def test_moe_gmm_flat_combine_bitwise(monkeypatch, num_tokens):
+def _run_moe(monkeypatch, num_tokens, flat):
     topk, hidden = 4, 128
     rows = num_tokens * topk
     revert, w, valid = _case(num_tokens, topk, 7 + num_tokens)
@@ -60,41 +59,55 @@ def test_moe_gmm_flat_combine_bitwise(monkeypatch, num_tokens):
     gmm1 = jax.random.normal(k1, (rows, hidden), jnp.float32).astype(jnp.bfloat16)
     gmm2 = jax.random.normal(k2, (rows, hidden), jnp.float32).astype(jnp.bfloat16)
     monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *a, **k: 1)
+    monkeypatch.setattr(envs, "TPU_MOE_ONEHOT_COMBINE_FLAT", flat)
+    outputs = iter([gmm1, gmm2])
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", lambda *a, **k: next(outputs))
+    return fused_moe_gmm.moe_gmm(
+        x=jnp.ones((rows, hidden), jnp.bfloat16),
+        w1=jnp.ones((1, hidden, hidden), jnp.bfloat16),
+        w1_scale=None,
+        w1_bias=None,
+        w2=jnp.ones((1, hidden, hidden), jnp.bfloat16),
+        w2_scale=None,
+        w2_bias=None,
+        group_sizes=jnp.array([rows - 3], jnp.int32),
+        argsort_revert_indices=revert,
+        token_indices_sorted=jnp.zeros((rows,), jnp.int32),
+        topk_weights_flat=w.reshape(-1),
+        valid_mask_flat=valid.reshape(-1),
+        activation="silu",
+        num_tokens=num_tokens,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=rows,
+    )
 
-    def run():
-        outputs = iter([gmm1, gmm2])
-        monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", lambda *a, **k: next(outputs))
-        return fused_moe_gmm.moe_gmm(
-            x=jnp.ones((rows, hidden), jnp.bfloat16),
-            w1=jnp.ones((1, hidden, hidden), jnp.bfloat16),
-            w1_scale=None,
-            w1_bias=None,
-            w2=jnp.ones((1, hidden, hidden), jnp.bfloat16),
-            w2_scale=None,
-            w2_bias=None,
-            group_sizes=jnp.array([rows - 3], jnp.int32),
-            argsort_revert_indices=revert,
-            token_indices_sorted=jnp.zeros((rows,), jnp.int32),
-            topk_weights_flat=w.reshape(-1),
-            valid_mask_flat=valid.reshape(-1),
-            activation="silu",
-            num_tokens=num_tokens,
-            topk=topk,
-            use_ep=True,
-            use_sparse_core=True,
-            onehot_moe_permute_threshold=rows,
-        )
 
-    monkeypatch.setattr(envs, "TPU_MOE_ONEHOT_COMBINE_FLAT", False)
-    ref = run()
-    monkeypatch.setattr(envs, "TPU_MOE_ONEHOT_COMBINE_FLAT", True)
+@pytest.mark.parametrize("num_tokens", [8, 96])
+def test_moe_gmm_flat_combine_bitwise(monkeypatch, num_tokens):
+    ref = _run_moe(monkeypatch, num_tokens, flat=False)
     called = []
     orig = fused_moe_gmm._flat_onehot_combine
     monkeypatch.setattr(
         fused_moe_gmm, "_flat_onehot_combine", lambda *a: called.append(1) or orig(*a)
     )
-    new = run()
+    new = _run_moe(monkeypatch, num_tokens, flat=True)
     assert called
     np.testing.assert_array_equal(
         np.asarray(new.view(jnp.uint16)), np.asarray(ref.view(jnp.uint16))
     )
+
+
+@pytest.mark.parametrize("cap,used", [(0, True), (384, True), (383, False)])
+def test_flat_combine_route_cap(monkeypatch, cap, used):
+    """TPU_MOE_ONEHOT_COMBINE_FLAT_MAX_ROUTES: calls past the cap keep the
+    reshaped form (96 tokens x topk 4 = 384 routes)."""
+    monkeypatch.setattr(envs, "TPU_MOE_ONEHOT_COMBINE_FLAT_MAX_ROUTES", cap)
+    called = []
+    orig = fused_moe_gmm._flat_onehot_combine
+    monkeypatch.setattr(
+        fused_moe_gmm, "_flat_onehot_combine", lambda *a: called.append(1) or orig(*a)
+    )
+    _run_moe(monkeypatch, 96, flat=True)
+    assert bool(called) == used
