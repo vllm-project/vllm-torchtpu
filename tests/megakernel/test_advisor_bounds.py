@@ -2712,7 +2712,6 @@ def test_achievable_adds_collectives_while_floor_and_corners_stay_overlapped() -
     expected_floor_us = (
         max(whole_step.hbm_us, whole_step.chain_us + whole_step.comm_us)
         + whole_step.fill_drain_us
-        + whole_step.repass_spill_us
         + whole_step.launch_us
     )
     extra_indexer_radix_us = (
@@ -2736,7 +2735,6 @@ def test_achievable_adds_collectives_while_floor_and_corners_stay_overlapped() -
         + extra_indexer_radix_us
         + whole_step.fill_drain_us
         + ach_boundary_fill_us
-        + whole_step.repass_spill_us
         + whole_step.launch_us
     )
     assert whole_step.comm_us >= min_sublayer_comm_us

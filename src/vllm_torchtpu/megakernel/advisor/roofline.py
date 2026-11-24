@@ -955,7 +955,6 @@ def _compute_achievable_upper_us(
         float,
         float,
         float,
-        float,
     ],
     aux_terms: tuple[tuple[float, float, float], float, tuple[int, int, int, bool]] = (
         (0.0, 0.0, 1.0),
@@ -981,7 +980,6 @@ def _compute_achievable_upper_us(
         a2a_extra_s,
         sync_comm_extra_s,
         pipeline_fill_drain_s,
-        repass_spill_us,
         step_ach_us,
         step_upper_us,
         routed_hbm_s,
@@ -1054,7 +1052,6 @@ def _compute_achievable_upper_us(
         step_ach_us,
         step_upper_us,
         (ach_upper_core_s + pipeline_fill_drain_s) * 1e6
-        + repass_spill_us
         + n_ops * scope_context.launch_gap_upper_us
         + scope_host_head_us,
     )
@@ -1064,12 +1061,11 @@ def _compute_strict_step_floor(
     scope_context: _ScopeContext,
     profile: ModelProfile,
     workload: WorkloadSpec,
-    flags: tuple[bool, bool, bool, int, int, int, bool],
-    scalars: tuple[float, float, float, float, float, float],
+    flags: tuple[bool, bool, int, int, int, bool],
+    scalars: tuple[float, float, float, float, float],
 ) -> tuple[float, float]:
     """Compute strict balanced-routing weight bytes and step latency floor."""
     (
-        one_weight_pass,
         is_fused_multi,
         overlapped_comm,
         n_splits,
@@ -1077,9 +1073,7 @@ def _compute_strict_step_floor(
         xla_ar_factor,
         has_declared_dcp,
     ) = flags
-    comm_s, pipeline_fill_drain_s, act_bytes, eff_state_bytes, base_ai, ar_saving = (
-        scalars
-    )
+    comm_s, pipeline_fill_drain_s, act_bytes, eff_state_bytes, ar_saving = scalars
     w_step_strict = _strict_moe_weights(scope_context, profile)
     t_matmul_dense_strict = (
         (scope_context.flops_dense - scope_context.flops_kv) / scope_context.peak_w
@@ -1090,7 +1084,6 @@ def _compute_strict_step_floor(
     t_matmul_strict = (
         t_matmul_dense_strict + scope_context.flops_moe / scope_context.peak_e
     )
-    weight_passes = 1 if one_weight_pass else n_splits
     eff_state_strict_bytes = (
         eff_state_bytes
         - scope_context.dsa_kv_gather_bytes
@@ -1098,26 +1091,23 @@ def _compute_strict_step_floor(
         if scope_context.has_dsa
         else eff_state_bytes
     )
-    hbm_int_strict = weight_passes * w_step_strict + eff_state_strict_bytes
+    hbm_int_strict = w_step_strict + eff_state_strict_bytes
     hbm_time_strict_s = (hbm_int_strict + act_bytes) / scope_context.bw_hbm
     t_moe_strict = scope_context.flops_moe / scope_context.peak_e
-    routed_strict_s = (
-        weight_passes * (w_step_strict - scope_context.w_static) / scope_context.bw_hbm
-    )
+    routed_bytes_strict = w_step_strict - scope_context.w_static
+    routed_strict_s = routed_bytes_strict / scope_context.bw_hbm
     _, _, vec_ops_dense, vec_ops_moe_strict, vec_rate = _compute_scope_matmuls(
         scope_context,
         profile,
         workload,
-        (1.0, weight_passes * (w_step_strict - scope_context.w_static), False),
+        (1.0, routed_bytes_strict, False),
     )
     # Vector counts are per element. A 32-bit word holds up to
     # VECTOR_MAX_ELEMENTS_PER_WORD packed elements, and
     # VECTOR_SUB_BYTE_ELEMENTS_PER_WORD when it unpacks weights below one byte, so
     # these rates bound every dtype.
     strict_vec_rate = VECTOR_MAX_ELEMENTS_PER_WORD * vec_rate
-    unpack_ops_strict = _sub_byte_unpack_ops(
-        profile, weight_passes * (w_step_strict - scope_context.w_static)
-    )
+    unpack_ops_strict = _sub_byte_unpack_ops(profile, routed_bytes_strict)
     t_vec_moe_strict = (
         vec_ops_moe_strict - unpack_ops_strict
     ) / strict_vec_rate + unpack_ops_strict / (
@@ -1156,16 +1146,9 @@ def _compute_strict_step_floor(
     roof_core_strict_s = _core_time(
         hbm_time_strict_s, chain_strict_s, comm_strict_s, fused=is_fused_multi
     )
-    repass_spill_strict_us = (
-        (act_bytes + (n_splits - 1) * w_step_strict) / scope_context.bw_hbm * 1e6
-        if base_ai >= scope_context.peak_w / scope_context.bw_hbm and weight_passes > 1
-        else 0.0
-    )
     step_floor_strict_us = (
-        (roof_core_strict_s + fill_drain_strict_s) * 1e6
-        + repass_spill_strict_us
-        + n_ops * workload.op_overhead_us
-    )
+        roof_core_strict_s + fill_drain_strict_s
+    ) * 1e6 + n_ops * workload.op_overhead_us
     return w_step_strict, step_floor_strict_us
 
 
@@ -1204,7 +1187,7 @@ def _compute_scope_achievable_step(
     scope_context: _ScopeContext,
     workload: WorkloadSpec,
     scope_flags: tuple[bool, bool, int, float, float],
-    timing_inputs: tuple[float, float, float, float, float, float, float, float],
+    timing_inputs: tuple[float, float, float, float, float, float, float],
     aux_terms: tuple[
         tuple[float, float, float],
         tuple[float, float],
@@ -1235,7 +1218,6 @@ def _compute_scope_achievable_step(
         comm_s,
         sync_stage_s,
         pipeline_fill_drain_s,
-        repass_spill_us,
         t_matmul_upper,
     ) = timing_inputs
     vec_ops_dense, vec_ops_moe, vec_rate = vector_terms
@@ -1308,7 +1290,6 @@ def _compute_scope_achievable_step(
             + pipeline_fill_drain_s
         )
         * 1e6
-        + repass_spill_us
         + n_ops * workload.op_overhead_us
         + scope_host_head_us
     )
@@ -1567,10 +1548,6 @@ def _evaluate_single_scope(
         scope, eval_ctx, profile, (in_call_workload, declaration), n_splits
     )
     tiled = scope in ("whole_step", "layer_group") and n_splits > 1
-    # A fused scope above its row limit and a single-layer kernel stream weights
-    # once: their row tiles move the residual through HBM at every layer instead.
-    one_weight_pass = tiled or scope == "single_layer"
-    weight_passes = 1 if one_weight_pass else n_splits
     # That per-layer residual traffic already holds the call-boundary activations.
     act_bytes = max(act_bytes, extra_act) + (
         PER_OP_INDEXER_SCORE_ROUNDTRIP_BYTES
@@ -1655,7 +1632,7 @@ def _evaluate_single_scope(
         in_call_workload,
         (
             moe_pad_factor,
-            weight_passes * (w_step - eval_ctx.w_static),
+            w_step - eval_ctx.w_static,
             bf16_attention_upper,
         ),
     )
@@ -1666,13 +1643,11 @@ def _evaluate_single_scope(
         * eval_ctx.token_residual_bytes
         - act_bytes
     )
-    hbm_time_s = (
-        weight_passes * w_step + eff_state_bytes + act_bytes
-    ) / eval_ctx.bw_hbm
+    hbm_time_s = (w_step + eff_state_bytes + act_bytes) / eval_ctx.bw_hbm
     d_ops = 2 * eval_ctx.layers_local - n_ops
     # Routed-expert bytes are requested after each layer's router, so they
     # stream under neither the dense compute nor the collectives.
-    routed_hbm_s = weight_passes * (w_step - eval_ctx.w_static) / eval_ctx.bw_hbm
+    routed_hbm_s = (w_step - eval_ctx.w_static) / eval_ctx.bw_hbm
     t_moe = (moe_pad_factor * eval_ctx.flops_moe) / eval_ctx.peak_e
     t_dense = t_matmul - t_moe
     t_vec_moe = vec_ops_moe / vec_rate
@@ -1699,15 +1674,7 @@ def _evaluate_single_scope(
         _core_time(hbm_time_s, chain_s, comm_s, fused=is_fused_multi)
         + pipeline_fill_drain_s
     ) * 1e6
-    base_ai = (eval_ctx.flops_dense + eval_ctx.flops_moe) / max(
-        1.0, w_step + eff_state_bytes
-    )
-    repass_spill_us = (
-        (act_bytes + (n_splits - 1) * w_step) / eval_ctx.bw_hbm * 1e6
-        if base_ai >= eval_ctx.peak_w / eval_ctx.bw_hbm and weight_passes > 1
-        else 0.0
-    )
-    pure_us = roof_us + repass_spill_us
+    pure_us = roof_us
     new_sub_pure_us = pure_us if scope == "per_op" else sub_pure_us
     step_us = pure_us + n_ops * workload.op_overhead_us + scope_host_head_us
     routed_ach_ratio = _routed_achievable_ratio(
@@ -1733,7 +1700,6 @@ def _evaluate_single_scope(
             comm_ach_s,
             sync_stage_ach_s,
             achievable_fill_drain_s,
-            repass_spill_us,
             t_matmul_upper,
         ),
         (
@@ -1761,10 +1727,7 @@ def _evaluate_single_scope(
     ) * 1e6
     step_upper_us = max(
         step_us,
-        roof_upper_us
-        + repass_spill_us
-        + n_ops * eval_ctx.launch_gap_upper_us
-        + scope_host_head_us,
+        roof_upper_us + n_ops * eval_ctx.launch_gap_upper_us + scope_host_head_us,
     )
     step_ach_upper_us = _compute_achievable_upper_us(
         eval_ctx,
@@ -1779,7 +1742,6 @@ def _evaluate_single_scope(
             a2a_extra_ach_s,
             sync_comm_extra_s,
             achievable_fill_drain_s,
-            repass_spill_us,
             step_ach_us,
             step_upper_us,
             routed_hbm_s * routed_ach_ratio,
@@ -1799,7 +1761,6 @@ def _evaluate_single_scope(
         profile,
         in_call_workload,
         (
-            one_weight_pass,
             is_fused_multi,
             overlapped_comm,
             n_splits,
@@ -1812,7 +1773,6 @@ def _evaluate_single_scope(
             pipeline_fill_drain_s,
             act_bytes,
             eff_state_bytes,
-            base_ai,
             ar_strict_saving_s,
         ),
     )
@@ -1852,7 +1812,6 @@ def _evaluate_single_scope(
         comm_us=round(comm_s * 1e6, 2),
         chain_us=round(chain_s * 1e6, 2),
         fill_drain_us=round(pipeline_fill_drain_s * 1e6, 2),
-        repass_spill_us=round(repass_spill_us, 2),
         launch_us=round(n_ops * workload.op_overhead_us, 2),
         step_achievable_upper_us=round(step_ach_upper_us, 2),
         support=support_status,
@@ -1904,7 +1863,6 @@ def _sum_call_estimates(
         comm_us=round(sum(c.comm_us for c in calls), 2),
         chain_us=round(sum(c.chain_us for c in calls), 2),
         fill_drain_us=round(sum(c.fill_drain_us for c in calls), 2),
-        repass_spill_us=round(sum(c.repass_spill_us for c in calls), 2),
         launch_us=round(sum(c.launch_us for c in calls), 2),
         step_achievable_upper_us=round(
             sum(c.step_achievable_upper_us for c in calls), 2
@@ -1958,7 +1916,7 @@ def _evaluate_whole_step_microbatched(
     rest_est, rest_step_us = (parts[1][0], parts[1][1]) if parts[1:] else (None, 0.0)
     est = _sum_call_estimates(full_est, full_calls, rest_est)
     d_ops = 2 * scope_context.layers_local - est.ops_per_step
-    pure_us = est.roof_floor_us + est.repass_spill_us
+    pure_us = est.roof_floor_us
     break_even = (
         round(max(0.0, (pure_us - sub_pure_us) / d_ops), 3) if d_ops > 0 else 0.0
     )
