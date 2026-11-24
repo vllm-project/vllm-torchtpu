@@ -578,7 +578,8 @@ def _decode_candidates_kernel(
     last step. Its copies' latency hides under the indexer's page stream.
 
     Refs after the scalars: run tables (``count``, page, lo, hi, tok0, then
-    each run's request and index page among this rank's, with `write`); in:
+    each request's first run and each run's index page among this rank's,
+    with `write`); in:
     the tile's query rows ``[Bq, D]``, positions ``[1, R]``, the write's
     inputs and caches, or the index cache; out: ``[R, 2 * topk]``
     `pack_candidates` of each row (row = token), then the written caches;
@@ -587,7 +588,7 @@ def _decode_candidates_kernel(
     it = iter(refs)
     if write is not None:
         num_runs_ref, *run_tables = (next(it) for _ in range(5))
-        run_seq_ref, run_page_idx_ref = next(it), next(it)
+        seq_runs_ref, run_page_idx_ref = next(it), next(it)
     q_ref, pos_ref = next(it), next(it)
     if write is None:
         cache_ref = next(it)
@@ -654,17 +655,18 @@ def _decode_candidates_kernel(
         def after_wait(slot):
             first = group * pages_per_step
 
-            def substitute(r):
+            def substitute(r, carry):
                 page = run_page_idx_ref[r] - first
 
-                @pl.when(
-                    (run_seq_ref[r] == seq) & (page >= 0) & (page < pages_per_step)
-                )
+                @pl.when((page >= 0) & (page < pages_per_step))
                 def _():
                     settle(r)
                     buf[slot, page] = merged_index[r, :, 0, :]
 
-            runs(substitute)
+                return carry
+
+            # This tile's request's runs only.
+            jax.lax.fori_loop(seq_runs_ref[seq], seq_runs_ref[seq + 1], substitute, 0)
 
     msa_indexer._kernel_v3(
         work_ref,
@@ -703,8 +705,9 @@ def decodes_in_one_kernel(num_tokens: int, index_cache: jax.Array) -> bool:
     """Whether `decode_candidates` takes a step of `num_tokens` over this index
     cache: no request can have more rows than the indexer's small tiles take
     (`msa_indexer.block_scores` scores longer ones in large tiles, with e4m3
-    queries), and the pages are v3's (fp8 or bf16, 4-bit with their scales
-    folded in)."""
+    queries; the conditional that would route them cost more than the
+    kernel saves at c48's 176-264-row decode steps, twin j-90ea0b66), and the
+    pages are v3's (fp8 or bf16, 4-bit with their scales folded in)."""
     _, rows_per_page, _, _ = index_cache.shape
     return num_tokens <= msa.block_score_options()["block_q"] and (
         not msa_fp4.is_fp4(index_cache)
@@ -837,7 +840,16 @@ def decode_candidates(
         run_tok0 = jnp.minimum(run_tables[-1], num_tokens - 1)
         run_seq = msa_indexer.lookup(seq_id, run_tok0)
         run_page_idx = msa_indexer.lookup(pos, run_tok0) // block_size // dcp
-        scalars += [num_runs[None], *run_tables, run_seq, run_page_idx]
+        # Runs follow the tokens, so each request's are consecutive: request
+        # s has runs [seq_runs[s], seq_runs[s + 1]).
+        live_runs = jnp.arange(write.max_runs) < num_runs
+        seq_runs = jnp.sum(
+            live_runs[None, :]
+            & (run_seq[None, :] < jnp.arange(max_num_seqs + 1)[:, None]),
+            axis=1,
+            dtype=jnp.int32,
+        )
+        scalars += [num_runs[None], *run_tables, seq_runs, run_page_idx]
         first_cache = len(scalars) + len(inputs) + len(ops.inputs)
         inputs += ops.inputs + ops.caches
         in_specs += [any_spec] * (len(ops.inputs) + len(ops.caches))

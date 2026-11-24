@@ -132,27 +132,28 @@ def _write_caches(cache_kind, num_pages, rng):
 @pytest.mark.parametrize("cache_kind", [jnp.float8_e4m3fn, "fp4"])
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize(
-    "q_lens,ctx_lens",
+    "q_lens,ctx_lens,max_seqs",
     [
-        ([8], [70_000]),  # one decode request, its last of 3 page groups
-        ([8, 8, 8], [3 * 256 + 124, 9_000, 3]),  # one straddles a block boundary
-        ([8, 23, 8], [9_000, 4_000, 300]),  # unaligned tile starts
+        ([8], [70_000], 4),  # one decode request, its last of 3 page groups
+        ([8, 8, 8], [3 * 256 + 124, 9_000, 3], 4),  # one straddles a block boundary
+        ([8, 23, 8], [9_000, 4_000, 300], 4),  # unaligned tile starts
+        ([8] * 12, [5_000 + 997 * i for i in range(12)], 16),  # 12 runs, 96 rows
     ],
 )
 def test_folded_write_matches_write_then_candidates(
-    q_lens, ctx_lens, rank, cache_kind, monkeypatch
+    q_lens, ctx_lens, max_seqs, rank, cache_kind, monkeypatch
 ):
     dcp, pages_per_seq, pad = 2, 300, 3
     rng = np.random.default_rng(sum(ctx_lens) + rank)
     num_seqs = len(q_lens)
     num_real = sum(q_lens)
     num_tokens = num_real + pad
-    num_pages = MAX_SEQS * pages_per_seq + 8
-    seq_lens = np.zeros(MAX_SEQS, np.int32)
+    num_pages = max_seqs * pages_per_seq + 8
+    seq_lens = np.zeros(max_seqs, np.int32)
     seq_lens[:num_seqs] = np.array(ctx_lens) + np.array(q_lens)
-    cu_q = np.full(MAX_SEQS + 1, num_real, np.int32)
+    cu_q = np.full(max_seqs + 1, num_real, np.int32)
     cu_q[: num_seqs + 1] = np.concatenate([[0], np.cumsum(q_lens)])
-    tables = rng.permutation(np.arange(1, num_pages))[: MAX_SEQS * pages_per_seq]
+    tables = rng.permutation(np.arange(1, num_pages))[: max_seqs * pages_per_seq]
     meta = [
         jnp.asarray(a.astype(np.int32))
         for a in (seq_lens, tables, cu_q, np.array([0, 0, num_seqs]))
