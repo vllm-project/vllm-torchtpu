@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Multi-shape KV layouts, decided from the recorded per-layer specs.
+"""Multi-shape KV layouts, decided and keyed from the recorded per-layer specs.
 
 `has_multi_shapes_kv_caches` used to match the architecture against
 DeepSeek-V4 and GLM-5.2. It now decides from the per-layer specs of all
@@ -231,50 +231,57 @@ _MULTI_SHAPES_LAYOUTS = (
     "deepseek_v3_2",
 )
 
-# `resolve_kernel_geometry` on each multi-shape layout:
-# layout -> (worker config's geometry, flattened scheduler config's geometry).
-# The geometry is (kernel block, per-block shapes, KV dtypes, device block).
-# A full-attention leaf (the MiniMax M3 DSpark drafter's K/V layers, one fp8
-# KV head of 128) adds its backend page, K/V padded from two rows to four,
-# and its padded page bytes; it comes from the recorded specs, so the
-# scheduler sees it too. The scheduler's config keeps one MLA leaf per group,
-# so its MLA shapes are the first leaf's (#3688 makes them cover every leaf).
-_DRAFTER = (128, 1, 4, 128, 65536)
+# `resolve_kernel_geometry` on each multi-shape layout, the same on the
+# worker and the flattened scheduler configs: (kernel block, one
+# (per-block shape, page bytes, KV cache layout) entry per array kind, KV
+# dtypes, device block). A full-attention leaf (the MiniMax M3 DSpark
+# drafter's K/V layers, one fp8 KV head of 128) has its backend page, K/V
+# padded from two rows to four, and that padded page's bytes.
+_LAYOUT = "LBNHC"
+_DRAFTER_PAGE = 65536
 _EXPECTED_GEOMETRY = {
     "minimax_m3_int4": (
-        (
-            128,
-            {(128, 1, 512), (128, 1, 68), (128, 1, 8), _DRAFTER},
-            {torch.uint8, torch.float32, torch.float8_e4m3fn},
-            128,
-        ),
-        (
-            128,
-            {(128, 1, 512), _DRAFTER},
-            {torch.uint8, torch.float8_e4m3fn},
-            128,
-        ),
+        128,
+        {
+            ((128, 1, 512), 65536, _LAYOUT),
+            ((128, 1, 68), 8704, _LAYOUT),
+            ((128, 1, 8), 4096, _LAYOUT),
+            ((128, 1, 4, 128), _DRAFTER_PAGE, _LAYOUT),
+        },
+        {torch.uint8, torch.float32, torch.float8_e4m3fn},
+        128,
     ),
     "minimax_m3_fp8": (
-        (
-            128,
-            {(128, 1, 1024), (128, 1, 128), _DRAFTER},
-            {torch.float8_e4m3fn},
-            128,
-        ),
-        (128, {(128, 1, 1024), _DRAFTER}, {torch.float8_e4m3fn}, 128),
+        128,
+        {
+            ((128, 1, 1024), 131072, _LAYOUT),
+            ((128, 1, 128), 16384, _LAYOUT),
+            ((128, 1, 4, 128), _DRAFTER_PAGE, _LAYOUT),
+        },
+        {torch.float8_e4m3fn},
+        128,
     ),
     "deepseek_v4": (
-        (256, {(64, 1, 584), (64, 1, 132), (2, 1, 1024)}, {torch.uint8}, 256),
-        (256, {(64, 1, 584)}, {torch.uint8}, 256),
+        256,
+        {
+            ((64, 1, 584), 37376, _LAYOUT),
+            ((64, 1, 132), 8448, _LAYOUT),
+            ((2, 1, 1024), 2048, _LAYOUT),
+        },
+        {torch.uint8},
+        256,
     ),
     "glm_5_2": (
-        (256, {(256, 1, 576), (256, 1, 256)}, {torch.uint8}, 256),
-        (256, {(256, 1, 576)}, {torch.uint8}, 256),
+        256,
+        {((256, 1, 576), 147456, _LAYOUT), ((256, 1, 256), 65536, _LAYOUT)},
+        {torch.uint8},
+        256,
     ),
     "deepseek_v3_2": (
-        (256, {(256, 1, 576), (256, 1, 132)}, {torch.uint8}, 256),
-        (256, {(256, 1, 576)}, {torch.uint8}, 256),
+        256,
+        {((256, 1, 576), 147456, _LAYOUT), ((256, 1, 132), 33792, _LAYOUT)},
+        {torch.uint8},
+        256,
     ),
 }
 
@@ -294,7 +301,7 @@ def test_vllm_planned_tensors_span_the_whole_allocation():
     drafter_pages = [
         leaf.page_size_bytes for leaf in leaves if type(leaf) is FullAttentionSpec
     ]
-    assert drafter_pages == [_DRAFTER[-1]] * 2
+    assert drafter_pages == [_DRAFTER_PAGE] * 2
     assert {t.size for t in worker.kv_cache_tensors} == {
         NUM_BLOCKS * sum(leaf.page_size_bytes for leaf in leaves)
     }
@@ -323,11 +330,17 @@ def test_decision_from_the_recorded_specs(layout):
     )
 
 
-@pytest.mark.parametrize("layout", _MULTI_SHAPES_LAYOUTS)
-def test_geometry_on_worker_and_flattened_scheduler_config(layout):
-    worker = _LAYOUTS[layout]
-    scheduler = generate_scheduler_kv_cache_config([worker])
-    raiden_store.record_all_ranks_leaf_kv_cache_specs([worker] * 8)
+def _vllm_config(kv_cache_layout: str = _LAYOUT):
+    vllm_config = MagicMock()
+    vllm_config.model_config.model = "org/model"
+    vllm_config.model_config.revision = None
+    vllm_config.model_config.quantization = None
+    vllm_config.cache_config.prefix_caching_hash_algo = "sha256"
+    vllm_config.cache_config.kv_cache_layout = kv_cache_layout
+    return vllm_config
+
+
+def _geometry_and_namespace(vllm_config, kv_cache_config):
     with (
         # The TPU full-attention backend, as the drafter's layers select it
         # in the engine core (no model).
@@ -342,8 +355,69 @@ def test_geometry_on_worker_and_flattened_scheduler_config(layout):
         ),
         patch("vllm.config.set_current_vllm_config", return_value=nullcontext()),
     ):
-        worker_geometry = raiden_store.resolve_kernel_geometry(MagicMock(), worker)
-        scheduler_geometry = raiden_store.resolve_kernel_geometry(
-            MagicMock(), scheduler
-        )
-    assert (worker_geometry, scheduler_geometry) == _EXPECTED_GEOMETRY[layout]
+        geometry = raiden_store.resolve_kernel_geometry(vllm_config, kv_cache_config)
+    kernel_block_size, per_block_shape, kv_dtype, device_block_size = geometry
+    namespace = raiden_store.derive_offload_namespace(
+        vllm_config,
+        kernel_block_size=kernel_block_size,
+        per_block_shape=per_block_shape,
+        kv_dtype=kv_dtype,
+        device_block_size=device_block_size,
+        world_size=8,
+        num_kv_cache_groups=len(kv_cache_config.kv_cache_groups),
+        num_kv_cache_tensors=len(kv_cache_config.kv_cache_tensors),
+        offloaded_group_ids=tuple(range(len(kv_cache_config.kv_cache_groups))),
+    )
+    return geometry, namespace
+
+
+@pytest.mark.parametrize("layout", _MULTI_SHAPES_LAYOUTS)
+def test_geometry_on_worker_and_flattened_scheduler_config(layout):
+    worker = _LAYOUTS[layout]
+    scheduler = generate_scheduler_kv_cache_config([worker])
+    raiden_store.record_all_ranks_leaf_kv_cache_specs([worker] * 8)
+    vllm_config = _vllm_config()
+    worker_geometry, worker_namespace = _geometry_and_namespace(vllm_config, worker)
+    scheduler_geometry, scheduler_namespace = _geometry_and_namespace(
+        vllm_config, scheduler
+    )
+    assert worker_geometry == scheduler_geometry == _EXPECTED_GEOMETRY[layout]
+    # The tensor counts match too, so both views key storage alike.
+    assert scheduler_namespace == worker_namespace
+
+
+def _glm_namespace(*, indexer_page_size_padded=None, kv_cache_layout=_LAYOUT):
+    """Scheduler namespace of a GLM-5.2 group (MLA latent + indexer)."""
+    block = 256
+    mla = MLAAttentionSpec(
+        block_size=block, num_kv_heads=1, head_size=576, dtype=torch.uint8
+    )
+    indexer = MLAAttentionSpec(
+        block_size=block,
+        num_kv_heads=1,
+        head_size=256,
+        dtype=torch.uint8,
+        page_size_padded=indexer_page_size_padded,
+    )
+    worker = _config([_uniform(block, {"attn": mla, "indexer": indexer})])
+    scheduler = generate_scheduler_kv_cache_config([worker])
+    raiden_store.record_all_ranks_leaf_kv_cache_specs([worker])
+    return _geometry_and_namespace(_vllm_config(kv_cache_layout), scheduler)[1]
+
+
+def test_namespace_differs_when_a_non_representative_leaf_changes():
+    # The scheduler keeps the latent leaf; the indexer differs only in the
+    # recorded specs.
+    assert _glm_namespace(indexer_page_size_padded=256 * 384) != _glm_namespace()
+
+
+def test_namespace_differs_when_page_size_padded_changes():
+    padded = _glm_namespace(indexer_page_size_padded=256 * 384)
+    assert _glm_namespace(indexer_page_size_padded=256 * 512) != padded
+    assert _glm_namespace(indexer_page_size_padded=256 * 384) == padded
+
+
+def test_namespace_differs_when_kv_cache_layout_changes():
+    assert _glm_namespace(kv_cache_layout="LBNHC") != _glm_namespace(
+        kv_cache_layout="BLNHC"
+    )

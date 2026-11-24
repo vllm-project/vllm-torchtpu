@@ -3043,12 +3043,6 @@ class TestMultiShapesGeometry(unittest.TestCase):
         goes through `resolve_kernel_geometry`, which decides the path."""
         from vllm_torchtpu.offload import raiden_store as rs
 
-        resolve = (
-            rs.resolve_kernel_geometry
-            if through_kernel_geometry
-            else rs._resolve_multi_shapes_kv_geometry
-        )
-
         kv_cache_config = SimpleNamespace(
             kv_cache_groups=[SimpleNamespace(kv_cache_spec=s) for s in group_specs]
         )
@@ -3056,11 +3050,15 @@ class TestMultiShapesGeometry(unittest.TestCase):
             recorded = tuple(
                 leaf for s in group_specs for leaf in rs.iter_leaf_kv_cache_specs(s)
             )
+        vllm_config = MagicMock()
+        vllm_config.cache_config.kv_cache_layout = "LBNHC"
         with (
             patch.object(rs, "_all_ranks_leaf_kv_cache_specs", recorded),
             _full_attention_backend_patches(),
         ):
-            return resolve(MagicMock(), kv_cache_config)
+            if through_kernel_geometry:
+                return rs.resolve_kernel_geometry(vllm_config, kv_cache_config)
+            return rs._resolve_multi_shapes_kv_geometry(vllm_config)
 
     @staticmethod
     def _leaf_shape(leaf, backend=None):
@@ -3074,9 +3072,8 @@ class TestMultiShapesGeometry(unittest.TestCase):
 
         mla = self._mla()
         self.assertEqual(self._leaf_shape(mla), (mla.num_states, 1, 576))
-        # The backend page (8 KV heads x K/V packed two per fp16 sublane)
-        # and the page bytes.
-        self.assertEqual(self._leaf_shape(self._full()), (256, 8, 2, 128, 1048576))
+        # The backend page: 8 KV heads x K/V packed two per fp16 sublane.
+        self.assertEqual(self._leaf_shape(self._full()), (256, 8, 2, 128))
         swa_mla = SlidingWindowMLASpec(
             block_size=64,
             num_kv_heads=1,
@@ -3091,7 +3088,7 @@ class TestMultiShapesGeometry(unittest.TestCase):
         # rows) are padded to four: the page is twice the logical bytes.
         fp8 = self._full(block_size=128, num_kv_heads=1, dtype=torch.float8_e4m3fn)
         self.assertEqual(fp8.page_size_bytes, 32768)
-        self.assertEqual(self._leaf_shape(fp8), (128, 1, 4, 128, 32768))
+        self.assertEqual(self._leaf_shape(fp8), (128, 1, 4, 128))
         # The runner pads every attention spec to the largest page; the
         # padded page size is part of the geometry too.
         padded = self._full(
@@ -3100,7 +3097,11 @@ class TestMultiShapesGeometry(unittest.TestCase):
             dtype=torch.float8_e4m3fn,
             page_size_padded=65536,
         )
-        self.assertEqual(self._leaf_shape(padded), (128, 1, 4, 128, 65536))
+        self.assertEqual(
+            self._resolve(self._mla(block_size=128), fp8)[1]
+            ^ self._resolve(self._mla(block_size=128), padded)[1],
+            {((128, 1, 4, 128), 32768, "LBNHC"), ((128, 1, 4, 128), 65536, "LBNHC")},
+        )
 
     def test_full_attention_leaf_follows_the_backend_page_layout(self):
         # A backend whose page is head-major (LBHNC batched RPA) gives a
@@ -3110,7 +3111,7 @@ class TestMultiShapesGeometry(unittest.TestCase):
         backend.get_kv_cache_shape.return_value = (1, 8, 256, 2, 128)
         self.assertEqual(
             self._leaf_shape(self._full(), backend=backend),
-            (8, 256, 2, 128, 1048576),
+            (8, 256, 2, 128),
         )
 
     def test_mixed_mla_and_full_attention(self):
@@ -3124,9 +3125,9 @@ class TestMultiShapesGeometry(unittest.TestCase):
         self.assertEqual(
             shapes,
             {
-                (mla.num_states, 1, 576),
-                (indexer.num_states, 1, 128),
-                (256, 8, 2, 128, 1048576),
+                ((mla.num_states, 1, 576), mla.page_size_bytes, "LBNHC"),
+                ((indexer.num_states, 1, 128), indexer.page_size_bytes, "LBNHC"),
+                ((256, 8, 2, 128), 1048576, "LBNHC"),
             },
         )
         self.assertEqual(dtypes, {torch.bfloat16, torch.float16})
@@ -3145,8 +3146,8 @@ class TestMultiShapesGeometry(unittest.TestCase):
     def test_full_attention_leaves_come_from_the_recorded_specs(self):
         from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
-        # The scheduler's config keeps the group's first leaf (MLA); the
-        # drafter K/V leaf reaches the geometry from the recorded specs.
+        # The scheduler's config keeps the group's first leaf (MLA); every
+        # leaf reaches the geometry from the recorded specs.
         mla, indexer, full = self._mla(), self._mla(head_size=128), self._full()
         group = UniformTypeKVCacheSpecs(
             block_size=256,
@@ -3155,9 +3156,8 @@ class TestMultiShapesGeometry(unittest.TestCase):
         recorded = (mla, indexer, full) * 4
         worker = self._resolve(group, recorded=recorded, through_kernel_geometry=True)
         scheduler = self._resolve(mla, recorded=recorded, through_kernel_geometry=True)
-        self.assertIn((256, 8, 2, 128, 1048576), worker[1])
-        # The scheduler misses the indexer leaf (#3688), not the drafter's.
-        self.assertEqual(scheduler[1], worker[1] - {(indexer.num_states, 1, 128)})
+        self.assertEqual(scheduler, worker)
+        self.assertIn(((256, 8, 2, 128), 1048576, "LBNHC"), worker[1])
         # A drafter with other KV heads changes the scheduler's geometry.
         other = self._resolve(
             mla,
@@ -3204,8 +3204,8 @@ class TestMultiShapesGeometry(unittest.TestCase):
         mla_page = PallasMLAttentionBackend.get_kv_cache_shape(
             1, 128, 1, 128, torch.float8_e4m3fn
         )[1:]
-        self.assertNotEqual(tuple(mla_page), shape[:-1])
-        self.assertEqual(shape, (128, 1, 4, 128, 32768))
+        self.assertNotEqual(tuple(mla_page), shape)
+        self.assertEqual(shape, (128, 1, 4, 128))
 
     def test_engine_core_selects_the_kv_leaf_backend_as_its_layer(self):
         # Without a model, the K/V leaf's backend is selected as a drafter's
@@ -3229,7 +3229,11 @@ class TestMultiShapesGeometry(unittest.TestCase):
         block_size, shapes, dtypes, device_block = self._resolve(mla_a, mla_b)
         self.assertEqual((block_size, device_block), (256, 256))
         self.assertEqual(
-            shapes, {(mla_a.num_states, 1, 576), (mla_b.num_states, 1, 512)}
+            shapes,
+            {
+                ((mla_a.num_states, 1, 576), mla_a.page_size_bytes, "LBNHC"),
+                ((mla_b.num_states, 1, 512), mla_b.page_size_bytes, "LBNHC"),
+            },
         )
         self.assertEqual(dtypes, {torch.bfloat16})
 
@@ -3382,7 +3386,8 @@ class TestMultiShapesFullAttentionLeaf(unittest.TestCase):
             self.assertEqual(spec.kernel_physical_blocks_capacity, capacity)
             namespaces[name] = spec.key_namespace
         self.assertEqual(capacity, 1024)
-        self.assertEqual(len(namespaces["scheduler"]), 16)
+        # Both views resolve every leaf, so they key storage alike.
+        self.assertEqual(namespaces["scheduler"], namespaces["worker"])
 
     def test_drafter_geometry_reaches_the_scheduler_namespace(self):
         import dataclasses
@@ -3527,8 +3532,10 @@ class TestMultiShapesFullAttentionLeaf(unittest.TestCase):
                 _full_attention_backend_patches(),
             ):
                 rs.record_all_ranks_leaf_kv_cache_specs([config] * 4)
-                shapes.append(rs.resolve_kernel_geometry(MagicMock(), config)[1])
-                counts.append(rs.multi_shapes_kv_leaf_counts(MagicMock()))
+                vllm_config = MagicMock()
+                vllm_config.cache_config.kv_cache_layout = "LBNHC"
+                shapes.append(rs.resolve_kernel_geometry(vllm_config, config)[1])
+                counts.append(rs.multi_shapes_kv_leaf_counts(vllm_config))
         self.assertEqual(shapes[0], shapes[1])
         # One count per rank and drafter layer.
         self.assertEqual([c for _, c in counts[0]], [4])
@@ -3861,6 +3868,7 @@ def _build_spec(
     vllm_config.model_config.quantization = None
     vllm_config.cache_config.prefix_caching_hash_algo = "sha256"
     vllm_config.speculative_config = speculative_config
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
     vllm_config.parallel_config.data_parallel_rank = (
         (0 if dp_rank_local is None else dp_rank_local) if dp_rank is None else dp_rank
     )
