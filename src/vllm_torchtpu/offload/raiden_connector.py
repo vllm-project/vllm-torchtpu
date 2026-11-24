@@ -242,6 +242,10 @@ class WriteBackPolicy:
         return written
 
 
+# Stale entries `_drop_reattached_blocks` tolerates before pruning its map.
+_FINISHED_HASHES_SLACK = 65536
+
+
 def _allocated_block_ids(scheduler_output: SchedulerOutput) -> set[int]:
     """Blocks this step allocates, by the rule of `_update_req_states`
     (which computes the same set inside the base build_connector_meta)."""
@@ -341,9 +345,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 self.wb_counters["reattached_blocks"] += 1
             else:
                 del hashes[bid]  # reallocated: its content is gone
-        # Only blocks a store may still read need their hash.
+        # Only blocks a store may still read need their hash; prune once the
+        # stale entries outnumber the live ones by `_FINISHED_HASHES_SLACK`.
         live = len(self._block_id_to_pending_jobs) + len(self._wb_owners)
-        if len(hashes) > 2 * live + 65536:
+        if len(hashes) > 2 * live + _FINISHED_HASHES_SLACK:
             self._finished_block_hashes = {
                 bid: h
                 for bid, h in hashes.items()
