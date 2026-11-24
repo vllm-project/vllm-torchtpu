@@ -228,22 +228,27 @@ class RayDistributedExecutorV2(RayExecutorV2):
     def _stop_workers(self) -> None:
         """Kill the workers and wait until Ray has seen each one exit, which
         frees its chip and its actor name for a replacement."""
-        actors = [handle.actor for handle in self.ray_worker_handles]
+        handles = list(self.ray_worker_handles)
         self._finalizer.detach()
         self.shutdown()
         deadline = time.monotonic() + _WORKER_EXIT_TIMEOUT_S
-        for actor in actors:
-            while True:
-                try:
-                    ray.get(actor.__ray_ready__.remote())
-                except ray.exceptions.RayActorError:
-                    break
-                if time.monotonic() > deadline:
-                    raise RuntimeError(
-                        "Ray workers were still alive "
-                        f"{_WORKER_EXIT_TIMEOUT_S} s after being killed."
-                    )
-                time.sleep(1)
+        for handle in handles:
+            self._wait_until_dead(handle, deadline)
+
+    @staticmethod
+    def _wait_until_dead(handle: RayWorkerHandle, deadline: float) -> None:
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                ray.get(handle.actor.__ray_ready__.remote(), timeout=remaining)
+            except ray.exceptions.RayActorError:
+                return
+            except ray.exceptions.GetTimeoutError:
+                continue
+            time.sleep(1)
+        raise RuntimeError(
+            f"Ray worker rank={handle.rank} on node {handle.node_id} was still "
+            f"alive {_WORKER_EXIT_TIMEOUT_S} s after being killed."
+        )
 
     def _start_slice(self, host_order: list[str] | None) -> None:
         """Start this engine's workers, with ranks on `host_order` (node IPs;
@@ -579,6 +584,16 @@ class RayDistributedExecutorV2(RayExecutorV2):
                     )
                     for h in self.ray_worker_handles
                 ]
+            )
+        elif len(host_order) > 1:
+            logger.info(
+                "RayDistributedExecutorV2 | Rank -> TPU host binding is not "
+                "checked against device order (%s).",
+                "data parallel"
+                if dp_size > 1
+                else "explicit VLLM_RAY_BUNDLE_INDICES"
+                if not bind_in_host_order
+                else "this engine spans part of the slice",
             )
 
         # Let rank 0 reserve its TCPStore on its own host, matching vLLM's
