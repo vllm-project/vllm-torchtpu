@@ -13,6 +13,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.attention_preprocessing import rope_gather
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
 from vllm_torchtpu.kernels.deepseek_v41 import output_projection
+from vllm_torchtpu.kernels.deepseek_v41.csa2 import cache as cache_kernels
 from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
     gather_csa2_kv_sc,
     prepare_main_records,
@@ -292,8 +293,16 @@ def _select_gather_attend(
         return jnp.where(valid, selected, -1)
 
     def consume(start, selected, state, following):
-        selected = mask(start, selected)
-        if state is None and selected.shape[0] == tokens:
+        if isinstance(selected, tuple):
+            # Resolved by the SparseCore selection, as below.
+            records, counts = selected
+        else:
+            selected = mask(start, selected)
+        if (
+            state is None
+            and not isinstance(selected, tuple)
+            and (selected.shape[0] == tokens)
+        ):
             output, words, gathered_scales, counts = _gather_attend(
                 q,
                 raw,
@@ -319,14 +328,15 @@ def _select_gather_attend(
                 bq,
             )
             return (output, words, gathered_scales, counts), following
-        rows = selected.shape[0]
-        records, counts = prepare_main_records(
-            selected,
-            pages,
-            jnp.clip(main_starts - start, 0, rows),
-            page_size=main_page_size,
-            onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
-        )
+        if not isinstance(selected, tuple):
+            records, counts = prepare_main_records(
+                selected,
+                pages,
+                jnp.clip(main_starts - start, 0, selected.shape[0]),
+                page_size=main_page_size,
+                onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
+            )
+        rows = records.shape[0]
         if following is not None:
             # Records before the pipeline's next step, so the gather is
             # issued ahead of it and runs beside it instead of after it.
@@ -394,6 +404,13 @@ def _select_gather_attend(
         True,
         score_width,
         consume=consume,
+        records=(
+            pages,
+            cache_kernels._requests(
+                main_starts, tokens, onehot=envs.TPU_ONEHOT_TABLE_LOOKUP
+            ),
+            main_page_size,
+        ),
     )
     return output, mask(0, selected), words, gathered_scales, counts
 

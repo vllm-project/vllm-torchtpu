@@ -151,13 +151,14 @@ def _block_rows(ref, start) -> bool:
     return isinstance(start, int) and start % tile == 0
 
 
-def _dma_rows(src, dst, sem, count, wait=False, src_start=0, dst_start=0):
+def _dma_rows(src, dst, sem, count, wait=False, src_start=0, dst_start=0, block=None):
     """Copy (or wait for) the first `count` rows; waits must pass the same count.
 
     A full block moves as one DMA where both slices allow it: issuing and
     waiting row by row cost the dense scorer 9 us of a 222 us resident
-    256-row tile. A wait on a block covers the same bytes as row waits on
-    one semaphore, so starts and waits may differ in granularity.
+    256-row tile. Waits must match their starts' granularity (a block wait
+    on row-by-row starts hangs on v7x), so a wait given other refs than its
+    starts passes the starts' ``block``.
     """
     rows = min(src.shape[0], dst.shape[0])
 
@@ -168,9 +169,12 @@ def _dma_rows(src, dst, sem, count, wait=False, src_start=0, dst_start=0):
         dma = pltpu.make_async_copy(source, target, completion)
         (dma.wait if wait else dma.start)()
 
-    block = (
-        not sem.shape and _block_rows(src, src_start) and _block_rows(dst, dst_start)
-    )
+    if block is None:
+        block = (
+            not sem.shape
+            and _block_rows(src, src_start)
+            and _block_rows(dst, dst_start)
+        )
     if block:
         pl.when(count >= rows)(partial(copy, 0, rows))
     for local in range(rows):
