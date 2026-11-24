@@ -221,12 +221,23 @@ class MiniMaxM3MoE(nn.Module):
         shared gate_up contracts as the runner's shared expert would."""
         down = self.shared_experts.down_proj
         act = self.shared_experts.activation(hidden_states if rows is None else rows)
+        # Consume the shared down_proj weight and scale here, right after the
+        # shared gate_up, as the runner's shared expert does. vLLM's
+        # split_graph orders a subgraph's inputs by first use; left to the
+        # combine op, these two would come after the routed experts' weights,
+        # and the warmup's shape-variant traces (this path only exists in the
+        # >= SHARED_IN_COMBINE_MIN_TOKENS trace) would take their inputs in a
+        # different order than the small-bucket trace, which refuses the
+        # bucket hand-over (ShapeSpecializationError at startup). The views
+        # are free.
+        shared_w = down.weight.view(down.weight.shape)
+        shared_scale = down.weight_scale.view(down.weight_scale.shape)
         routed = self.experts.routed_experts
         return routed.quant_method.apply_monolithic_shared(
             routed,
             hidden_states,
             router_logits,
             act,
-            down.weight,
-            down.weight_scale,
+            shared_w,
+            shared_scale,
         )

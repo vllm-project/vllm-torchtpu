@@ -1018,3 +1018,86 @@ def test_shared_in_combine_gates(monkeypatch):
     assert not moe._shared_in_combine(T)
     moe, _ = _moe_with_shared(monkeypatch, False)
     assert not moe._shared_in_combine(T)
+
+
+def test_shared_in_combine_keeps_trace_input_order(monkeypatch):
+    """The warmup traces each bucket group separately and hands buckets from
+    the small-bucket trace to the live (largest) one, which needs the same
+    subgraph inputs in the same order (shape_variants.BucketExecutables).
+    vLLM's split_graph orders them by first use, so the shared-in-combine
+    step must consume the shared down_proj where the runner path does:
+    after the shared gate_up, before the routed experts' weights."""
+    from vllm.compilation.backends import split_graph
+
+    from vllm_torchtpu.compilation import shape_variants
+
+    bf16 = torch.bfloat16
+
+    def param(*shape, dtype=bf16):
+        return nn.Parameter(torch.randn(*shape).to(dtype), requires_grad=False)
+
+    class Down(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = param(16, H)
+            self.weight_scale = param(H, dtype=torch.float32)
+
+    class Shared(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up = param(H, 32)
+            self.down_proj = Down()
+
+        def activation(self, x):
+            gu = x @ self.gate_up
+            return torch.nn.functional.silu(gu[:, :16]) * gu[:, 16:]
+
+        def forward(self, x):
+            return (self.activation(x) @ self.down_proj.weight) * self.down_proj.weight_scale
+
+    class QM:
+        def apply_monolithic_shared(self, layer, x, router_logits, act, w, scale):
+            return layer.routed(x, router_logits) + (act @ w) * scale
+
+    class Routed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bias = param(8, dtype=torch.float32)
+            self.a = param(H, I)
+            self.b = param(I, H)
+            self.quant_method = QM()
+
+        def routed(self, x, router_logits):
+            gate = torch.sigmoid(router_logits + self.bias).mean(-1, keepdim=True)
+            return (torch.tanh(x @ self.a) * gate).to(bf16) @ self.b
+
+    class Runner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.routed_experts = Routed()
+
+    moe = object.__new__(MiniMaxM3MoE)
+    nn.Module.__init__(moe)
+    moe.shared_experts = Shared()
+    moe.experts = Runner()
+    routed = moe.experts.routed_experts
+
+    def signature(fn):
+        out = []
+
+        def backend(gm, example_inputs):
+            _, items = split_graph(gm, [])
+            out.extend(shape_variants.graph_signature(it.graph) for it in items)
+            return gm.forward
+
+        torch._dynamo.reset()
+        torch.compile(fn, backend=backend, fullgraph=True)(
+            _input(), torch.randn(T, 8)
+        )
+        return out
+
+    # The runner path: the shared expert first, then the routed experts.
+    plain = signature(lambda x, logits: moe.shared_experts(x) + routed.routed(x, logits))
+    combined = signature(lambda x, logits: moe._forward_shared_in_combine(x, logits))
+    assert len(plain) == len(combined) == 1
+    assert combined == plain
