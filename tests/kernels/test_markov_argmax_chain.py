@@ -38,6 +38,9 @@ CASES = (
     (2, 200, "tied", 0),
     (3, 300, "nan", 0),
     (3, 300, "normal", 48),
+    # Shards of two streamed chunks (40 tiles -> 2 x 2560 lanes), ties across them.
+    (2, 5000, "normal", 0),
+    (1, 5000, "tied", 0),
 )
 
 
@@ -52,8 +55,9 @@ def test_max_rows_fits_the_vmem_budget():
     budget = 48 << 20  # 3/4 of a tpu7x TensorCore's VMEM
     rows = chain.max_rows(N_RANKS, SLOTS, RANK_DIM, 25008, budget)
     assert rows == chain.MAX_ROWS
-    assert chain.vmem_bytes(N_RANKS, rows, SLOTS, RANK_DIM, 25008) <= budget
-    assert chain.max_rows(N_RANKS, SLOTS, RANK_DIM, 25008, 20 << 20) == 0
+    # Streaming keeps the kernel's VMEM small beside XLA's own prefetches.
+    assert chain.vmem_bytes(N_RANKS, rows, SLOTS, RANK_DIM, 25008) <= 12 << 20
+    assert chain.max_rows(N_RANKS, SLOTS, RANK_DIM, 25008, 2 << 20) == 0
     with pytest.raises(ValueError, match="at most"):
         chain._call(N_RANKS, rows + 1, SLOTS, RANK_DIM, 25008)
 
