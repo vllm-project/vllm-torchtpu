@@ -159,6 +159,26 @@ def main_call_options() -> dict:
     return out
 
 
+# Under main-KV DCP-2 the union tile stream across requests stops paying above 48 rows
+# (tpu_bench_wholestep_call, c32 env, scoped kernel op vs without it: b24 -41, b32 -51,
+# b48 -90, b64 +183 us; j-7d315b5f).
+XREQ_STREAM_DCP_MAX_ROWS = 48
+
+
+def xreq_prefetch_for(B: int) -> int:
+    """VLLM_TPU_MK_QSA_XREQ_PREFETCH of the main `B`-row call: with the request-loop loads
+    (bit 1) on, the union tile stream across requests (bit 0) from
+    VLLM_TPU_MK_QSA_XREQ_STREAM_ROWS rows on, up to `XREQ_STREAM_DCP_MAX_ROWS` under main-KV
+    DCP (both bits exact)."""
+    x = envs.VLLM_TPU_MK_QSA_XREQ_PREFETCH
+    rows = envs.VLLM_TPU_MK_QSA_XREQ_STREAM_ROWS
+    if not (x & 2 and rows and B >= rows):
+        return x
+    if main_kv_dcp() > 1 and B > XREQ_STREAM_DCP_MAX_ROWS:
+        return x
+    return x | 1
+
+
 # VLLM_TPU_MK_BUCKET_TUNE: knob overrides per row bucket (core `Tiles` fields or
 # `<block>.<field>` tunables), measured with tpu_bench_wholestep_call (~/q38f/d1/BUCKETS.md).
 # rel_fetch (trace-time-decoded dense refills; exact): j-01f264b1, bitwise at b4/b8/b16,
@@ -376,7 +396,7 @@ def build_wholestep_call(
                 pages_per_seq=pps,
                 carrier="fp8",
                 n_layers=n_layers,
-                **indexed_options(B),
+                **{**indexed_options(B), "xreq_prefetch": xreq_prefetch_for(B)},
                 **main_call_options(),
             ),
             hc_fp8=envs.VLLM_TPU_MK_HC_FP8,

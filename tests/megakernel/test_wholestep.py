@@ -762,18 +762,19 @@ def test_key_stream_ring_and_manager_pages_bit_identical(monkeypatch, kw):
     assert not np.array_equal(bad[7], base[7]), "stale-ring scores must change the selection"
 
 
-@pytest.mark.parametrize("key_slots", [3, 4])
-def test_early_loads_bit_identical(key_slots):
+@pytest.mark.parametrize("key_slots,async_dma,xreq", [(3, True, 2), (4, False, 2), (3, True, 3)])
+def test_early_loads_bit_identical(key_slots, async_dma, xreq):
     """VLLM_TPU_MK_QSA_EARLY_LOADS: table rows copied before the HC mix, request 0's loop
     loads, the union's table rows and the owned request's first key chunks issued before the
-    projection, and the completed-group stores waited after the request loop, give
+    projection, and (async DMAs) the completed-group stores waited after the request loop,
+    with and without the union stream across requests, give
     bit-identical residuals, completed keys, rings and selected ids. Request
     0 streams 6 chunks (more than the slots), request 1 one chunk (fewer than the early
     chunks)."""
     run = functools.partial(
         _run_c, long=True, rank_ids=True, ctx=[6000, 100], max_groups=2048, shard=True,
-        union=True, loop=True, xreq=2, skip_idle=True, xmerge=True, key_slots=key_slots,
-        phys=True, async_dma=True,
+        union=True, loop=True, xreq=xreq, skip_idle=True, xmerge=True, key_slots=key_slots,
+        phys=True, async_dma=async_dma,
     )
     late = run()
     early = run(early_loads=True)

@@ -186,6 +186,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_DRAFT_LOOP: bool = False
     VLLM_TPU_MK_QSEL_ASYNC: bool = False
     VLLM_TPU_MK_QSA_XREQ_PREFETCH: int = 0
+    VLLM_TPU_MK_QSA_XREQ_STREAM_ROWS: int = 16
     VLLM_TPU_MK_QSA_SELECT_NVIS: int = 0
     VLLM_TPU_MK_AR_HIER_SMALL: bool = False
     VLLM_TPU_MK_QSA_XMERGE: bool = False
@@ -1339,8 +1340,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # requests (request q+1's ids staged and its first tiles issued while request q's last
     # tiles compute; exos: +10..+113 us per call, the stream is issue-bound). 2: the request
     # loop's per-request loads (raw ring row, RoPE row, recent tile's pool rows) are issued one
-    # request ahead (`wholeloop=1`). 2 is the useful setting; 3 = both.
+    # request ahead (`wholeloop=1`). 2 is the useful setting; 3 = both. The main whole-step
+    # call adds bit 0 to 2 from VLLM_TPU_MK_QSA_XREQ_STREAM_ROWS rows on.
     "VLLM_TPU_MK_QSA_XREQ_PREFETCH": env_int("VLLM_TPU_MK_QSA_XREQ_PREFETCH", 0),
+    # Whole-step main call with VLLM_TPU_MK_QSA_XREQ_PREFETCH bit 1: from this many rows on,
+    # bit 0 too (the union tile stream across requests). tpu_bench_wholestep_call, served
+    # env: scoped kernel -21 / -49 / -105 us at b16 / b32 / b64, +6 us at b8. 0 = never.
+    "VLLM_TPU_MK_QSA_XREQ_STREAM_ROWS": env_int("VLLM_TPU_MK_QSA_XREQ_STREAM_ROWS", 16),
     # Whole-step QSA selection: the threshold bisection and the per-row compaction scan
     # only the score rows that hold visible groups (n_vis) instead of all max_groups / 128
     # (exact: the rows past n_vis are invisible and add nothing). 2: also the union
