@@ -760,3 +760,22 @@ def test_e4m3_shared_expert(monkeypatch):
     # A bf16 input (non-SP step) keeps the bf16 path even with the switch on.
     moe(x)
     assert len(mlp.gate_up_proj.inputs) == 2 and mlp.gate_up_proj.inputs[1] is x
+
+
+def test_e4m3_shared_expert_dynamo(monkeypatch):
+    """The e4m3 rows handed to the shared expert trace under Dynamo
+    (fullgraph) and leave no attribute behind."""
+    monkeypatch.setattr(
+        quant,
+        "_e4m3_matmul",
+        lambda q, rs, w, ws: ((q.float() @ w.float()) * rs * ws.float()).to(torch.bfloat16),
+    )
+    monkeypatch.setattr(envs, "TPU_MINIMAX_M3_SP_E4M3_SHARED", True, raising=False)
+    moe, mlp = _shared_moe()
+    q8, scale = mm._quantize_rows(_input())
+    want = moe((q8, scale))
+    torch._dynamo.reset()
+    got = torch.compile(lambda a, b: moe((a, b)), backend="eager", fullgraph=True)(q8, scale)
+    torch.testing.assert_close(got, want)
+    assert "_e4m3_rows" not in mlp.__dict__
+    assert len(mlp.gate_up_proj.inputs) == 0
