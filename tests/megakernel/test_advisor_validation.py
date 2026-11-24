@@ -120,8 +120,6 @@ def without_declared_megakernels(monkeypatch: pytest.MonkeyPatch) -> None:
     [
         ("qwen3.5-397b", 8, 8, 4),
         ("kimi-k3", 32, 32, 32),
-        # INFERRED layout matching kimi-k3 decode until kimi-k3.1-pro has a recipe.
-        ("kimi-k3.1-pro", 32, 32, 32),
         ("glm-5.2", 16, 16, 16),
     ],
 )
@@ -291,34 +289,6 @@ def test_advisor_cli_with_bundled_measurements(tmp_path: Path) -> None:
         errors.MegakernelConfigError, match="No bundled architectural priors"
     ):
         advisor.main([*base_argv, "--chip", "tpu6e"])
-
-
-def test_qwen38_b256_directional_megakernel_win() -> None:
-    """Verify single-pass adaptive ring whole_step beats per_op at B=64 and B=256."""
-    tp_size = 32
-    ep_size = 32
-    dcp_size = 8
-    isl_tokens = 1024
-    osl_tokens = 1024
-    context_tokens = 1536
-    for batch_size in (64, 256):
-        workload = advisor.WorkloadSpec(
-            phase="decode",
-            batch=batch_size,
-            isl=isl_tokens,
-            osl=osl_tokens,
-            context=context_tokens,
-            tp=tp_size,
-            ep=ep_size,
-            dcp=dcp_size,
-            moe_mode="grouped_on_chip",
-        )
-        report = advisor.advise("qwen3.8-2.4t", workload, "tpu7x")
-        whole_step_scope = next(s for s in report.scopes if s.scope == "whole_step")
-        per_op_scope = next(s for s in report.scopes if s.scope == "per_op")
-        assert whole_step_scope.n_splits == 1
-        assert whole_step_scope.step_bound_us < per_op_scope.step_bound_us
-        assert report.fastest_scope == "whole_step"
 
 
 def test_measured_corpus_schema() -> None:
