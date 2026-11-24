@@ -148,14 +148,18 @@ class MoEBlock(Block):
         )
 
     def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
-        """Debug routing inputs: `rbias` (HBM, `forced_routing`) and `moe_rows`
-        (SMEM `[B]` int32 row mask, `row_mask`)."""
+        """Routing inputs: `rbias` (HBM, `forced_routing`), `moe_rows`
+        (SMEM `[B]` int32 row mask, `row_mask`), and `moe_valid_rows`
+        (SMEM `[1]` int32 active token count, `skip_pad`)."""
         dbg: MoEDebug = self.debug_flags(ex)
+        tt: MoETunables = self.tunables(ex)
         out = []
         if dbg.forced_routing:
             out.append(ExtraInput("rbias", "hbm"))
         if dbg.row_mask:
             out.append(ExtraInput("moe_rows", "smem", (ex.B,), I32))
+        if tt.skip_pad:
+            out.append(ExtraInput("moe_valid_rows", "smem", (1,), I32))
         return out
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
@@ -331,7 +335,12 @@ class MoEBlock(Block):
                 x = ctx.norm_x
                 logits = stream.dmatmul("router", scr["xb"], E)[0:MR]
                 glog = jnp.sum(x * ctx.sm(slot, "sh_gate"), axis=-1, keepdims=True)
-                scr["sg"][...] = jnp.broadcast_to(jax.nn.sigmoid(glog), (MB, 128))
+                sg_val = jax.nn.sigmoid(glog)
+                if mp.skip_pad:
+                    n_valid = jnp.clip(ctx.extra["moe_valid_rows"][0], 0, ex.B)
+                    row_mb = lax.broadcasted_iota(I32, (MB, 1), 0)
+                    sg_val = jnp.where(row_mb < n_valid, sg_val, 0.0)
+                scr["sg"][...] = jnp.broadcast_to(sg_val, (MB, 128))
                 mx = jnp.max(logits, axis=-1, keepdims=True)
                 pexp = jnp.exp(logits - mx)
             with sc("moe_route"):

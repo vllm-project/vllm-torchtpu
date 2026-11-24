@@ -56,7 +56,7 @@ HOT = 5  # expert id the hot case routes (almost) every row to (rank 0)
 
 def _run(
     B: int, row_bucket: bool, hot: bool = False, direct0: bool = False,
-    **interp
+    dedup_vec: bool = False, **interp
 ):
     """Hidden rows after one MoE layer (+ residual), all ranks, and the RB flags."""
     devs = jax.devices("cpu")
@@ -71,6 +71,7 @@ def _run(
                 "r2_direct_store": direct0,
                 "topk_lanes": True,
                 "row_bucket": row_bucket,
+                "dedup_vec": dedup_vec,
             }
         }
     )

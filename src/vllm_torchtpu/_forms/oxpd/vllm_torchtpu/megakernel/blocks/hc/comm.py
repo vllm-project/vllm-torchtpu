@@ -42,6 +42,7 @@ _BUF_NAMES = (
     "ag_recv",
     "s2_send",
     "s2_recv",
+    "ar2d_bf",
 )
 
 
@@ -50,17 +51,40 @@ def hc_comm_params(ex: ExecSpec, h: int) -> CommParams:
     R = ex.R
     tiles = ex.resolved_tiles
     hier = tiles.hier if R > 1 else 0
+    if hier == 4 and not (R == 8 and h % 512 == 0 and ex.MR % 64 == 0):
+        hier = (
+            5
+            if (R >= 2 and h % 128 == 0 and h // 128 >= R)
+            else (2 if (R == 8 and (h // 2) % 128 == 0) else 0)
+        )
+    if hier == 5 and not (R >= 2 and h % 128 == 0 and h // 128 >= R):
+        hier = 2 if (R == 8 and (h // 2) % 128 == 0) else 0
     if hier in (1, 2) and R != 8:
         hier = 0
     if hier == 2 and (h // 2) % 128 != 0:
         hier = 1
     n_hier3 = max(1, R.bit_length() - 1)
     rounds = (
-        tuple(range(n_hier3))
+        tuple(range(10))
+        if hier == 4
+        else (0, 1)
+        if hier == 5
+        else tuple(range(n_hier3))
         if hier == 3
         else ((0, 1, 2) if hier == 2 else ((0, 1) if hier == 1 else (0,)))
     )
-    peers = 1 if hier == 3 else (3 if hier in (1, 2) else max(R - 1, 1))
+    peers = (
+        1
+        if hier in (3, 4)
+        else R
+        if hier == 5
+        else (3 if hier in (1, 2) else max(R - 1, 1))
+    )
+    if hier == 5:
+        _base, _extra = divmod(h // 128, R)
+        cw = 128 * (_base + int(_extra > 0))
+    else:
+        cw = h // R
     return CommParams(
         R=R,
         B=ex.B,
@@ -76,7 +100,7 @@ def hc_comm_params(ex: ExecSpec, h: int) -> CommParams:
         WAR=True,
         AR_R=ex.MR,
         AR_C=h,
-        CW=h // R,
+        CW=cw,
         HC2=h // 2,
         AR_ROUNDS=rounds,
         AR_PEERS=peers,
@@ -87,11 +111,15 @@ def hc_comm_params(ex: ExecSpec, h: int) -> CommParams:
 def hc_comm_scratch(ex: ExecSpec, h: int) -> list[ScratchReq]:
     """Persistent `hc_*` buffers of the shared sublayer all-reduce ring."""
     cp = hc_comm_params(ex, h)
-    R, AR_R, AR_C, HC2 = cp.R, cp.AR_R, cp.AR_C, cp.HC2
+    R, AR_R, AR_C, HC2, CW = cp.R, cp.AR_R, cp.AR_C, cp.HC2, cp.CW
     n_rounds, peers = len(cp.AR_ROUNDS), cp.AR_PEERS
     if cp.HIER == 3:
         send = (cp.N_HIER3, 2, AR_R, AR_C)
         recv = (cp.N_HIER3, 2, 2, AR_R, AR_C)
+    elif cp.HIER == 4:
+        send, recv = (2, 2, AR_R, HC2), (2, AR_R, HC2)
+    elif cp.HIER == 5:
+        send, recv = (2, AR_R, AR_C), (2, R, AR_R, CW)
     elif cp.HIER == 2:
         send, recv = (2, 2, AR_R, HC2), (2, 2, AR_R, HC2)
     elif cp.HIER == 1:
@@ -104,7 +132,22 @@ def hc_comm_scratch(ex: ExecSpec, h: int) -> list[ScratchReq]:
         ScratchReq("hc_ar_ssem", pltpu.SemaphoreType.DMA((n_rounds, 2, peers))),
         ScratchReq("hc_ar_rsem", pltpu.SemaphoreType.DMA((n_rounds, 2, peers))),
     ]
-    if cp.HIER == 1:
+    if cp.HIER == 5:
+        reqs += [
+            ScratchReq("hc_ag_send", pltpu.VMEM((2, AR_R, CW), BF16)),
+            ScratchReq("hc_ag_recv", pltpu.VMEM((2, AR_R, AR_C), BF16)),
+        ]
+    elif cp.HIER == 4:
+        part = AR_C // 4
+        rh, rq = AR_R // 2, AR_R // 4
+        reqs += [
+            ScratchReq("hc_ag_send", pltpu.VMEM((2, AR_R, HC2), BF16)),
+            ScratchReq("hc_ag_recv", pltpu.VMEM((2, 2, AR_R, HC2), BF16)),
+            ScratchReq("hc_s2_send", pltpu.VMEM((2, 4, rh, part), BF16)),
+            ScratchReq("hc_s2_recv", pltpu.VMEM((2, 2, rq, part), BF16)),
+            ScratchReq("hc_ar2d_bf", pltpu.VMEM((2, 2, rh, part), BF16)),
+        ]
+    elif cp.HIER == 1:
         reqs += [
             ScratchReq("hc_ag_send", pltpu.VMEM((2, AR_R, AR_C), BF16)),
             ScratchReq("hc_ag_recv", pltpu.VMEM((2, 4, AR_R, AR_C), BF16)),

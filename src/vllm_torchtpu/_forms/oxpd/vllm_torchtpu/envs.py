@@ -632,6 +632,14 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_QSA_WRITE_KVAL: bool = False
     # Megakernel MoE row-bucketing (default off; aligned [8, 128] tile loads)
     VLLM_TPU_MK_ROW_BUCKET: bool = False
+    # Megakernel all-reduce / MoE E7 collectives & dedup (all default off)
+    VLLM_TPU_MK_AR_HIER_SMALL: bool = False
+    VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC: bool = False
+    VLLM_TPU_MK_MOE_E7: bool = False
+    VLLM_TPU_MK_MOE_AR2D: bool = False
+    VLLM_TPU_MK_MOE_AR2D_MIN_TOKENS: int = 64
+    VLLM_TPU_MK_MOE_EXACT_WIDTH: bool = False
+    VLLM_TPU_MK_MOE_SKIP_PAD: bool = False
     # q38 PORT-BL GDN (begin)
     VLLM_TPU_GDN_LEAN_GLUE3: bool = False
     VLLM_TPU_GDN_LEAN_GLUE3_COUNT: int = 0
@@ -3623,6 +3631,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whole-step megakernel MoE routed-row bucketing (PIPE_EP, >16 rows): each expert runs
     # its matmuls on its gathered routed rows via aligned [8, 128] `rbpreT` tile loads.
     "VLLM_TPU_MK_ROW_BUCKET": env_bool("VLLM_TPU_MK_ROW_BUCKET", False),
+    # Whole-step megakernel small-bucket all-reduce: hier=1 (2-round flat over
+    # chips) up to B<=8, even when E7 / EXACT_WIDTH picks default hier=5.
+    "VLLM_TPU_MK_AR_HIER_SMALL": env_bool("VLLM_TPU_MK_AR_HIER_SMALL", False),
+    # Megakernel MoE: vectorized first-appearance dedup of routed experts instead of
+    # the scalar SMEM dedup loop (`MoETunables.dedup_vec`). Exact on EP.
+    "VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC": env_bool(
+        "VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC", False
+    ),
+    # Whole-step / segment megakernel: umbrella flag enabling all E7 decode MoE wins
+    # (VLLM_TPU_MK_MOE_AR2D + VLLM_TPU_MK_MOE_EXACT_WIDTH + VLLM_TPU_MK_MOE_SKIP_PAD).
+    "VLLM_TPU_MK_MOE_E7": env_bool("VLLM_TPU_MK_MOE_E7", False),
+    # Megakernel MoE / HC collective: 2D torus AR2D all-reduce (HIER=4, matching
+    # FUSED_MOE_DECODE_KERNEL_AR2D_MIN_TOKENS) for R=8, H%512==0, MR%64==0, B>=min_tokens.
+    "VLLM_TPU_MK_MOE_AR2D": env_bool("VLLM_TPU_MK_MOE_AR2D", False),
+    "VLLM_TPU_MK_MOE_AR2D_MIN_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_MK_MOE_AR2D_MIN_TOKENS", 64
+    ),
+    # Megakernel MoE: E7 exact-width uneven 2-round RS+AG (HIER=5, [384x4, 256x4] for
+    # H=2560, R=8, zero padding) + MR-row active slicing in PIPE_EP for B<=8.
+    "VLLM_TPU_MK_MOE_EXACT_WIDTH": env_bool("VLLM_TPU_MK_MOE_EXACT_WIDTH", False),
+    # Megakernel MoE: skip padded rows (row >= query_start_loc[-1]) in router weights,
+    # shared gate, expert dedup, and row-bucket counts (matching TPU_MOE_SKIP_PADDED_TOKENS).
+    "VLLM_TPU_MK_MOE_SKIP_PAD": env_bool("VLLM_TPU_MK_MOE_SKIP_PAD", False),
     # q38 PORT-BL GDN (begin): Benliang Wang's GDN lean glue (aa8e6b237, VLLM_TPU_GDN_LEAN_GLUE) less its
     # window-log piece ("no_ckpt", which needs VLLM_TPU_GDN_WINDOW_LOG and so refuses D14). On the per-region unified
     # pool, every pooled GDN call with read offsets (speculative decoding) reads the step's stacked slot rows (one
