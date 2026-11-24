@@ -399,6 +399,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_GC_GEN2_THRESHOLD",
     "VLLM_TPU_GC_GEN2_PERIOD_S",
     "VLLM_TPU_GC_CENSUS",
+    # Host NUMA page migration after warmup (worker/cpu_pinning.py).
+    "VLLM_TPU_CPU_PIN_MIGRATE",
     # Host timeline and py-spy windows (runner/host_admit_probe.py).
     "VLLM_TPU_HOSTADMIT_PROBE",
     "VLLM_TPU_HOSTADMIT_PYSPY",
