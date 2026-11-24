@@ -51,6 +51,10 @@ x-tests-plugin-defaults: &tests_plugin_defaults
   test-file-pattern: "tests/**/{test_*,*_test}.py"
   install-client: false
   oidc-lifetime: 7200
+  # bktec splits a step's files across its shards by recorded duration, which
+  # differs by generation. With the prefix it plans and uploads under
+  # v6e/tests/... or v7x/tests/..., and strips it before running pytest.
+  location-prefix: "${TPU_GENERATION:-v7x}/"
 
 # The generation's shapes, from bootstrap.py; the defaults are v7x's, for an
 # upload of this file on its own. One chip is two devices on v7x (two

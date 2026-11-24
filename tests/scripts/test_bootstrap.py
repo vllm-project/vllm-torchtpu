@@ -2892,6 +2892,18 @@ class TestBootstrapUnits(unittest.TestCase):
                             gen.accelerator_type,
                             (lane, gen.name),
                         )
+                # A lane bktec shards plans and uploads under the generation's
+                # prefix, which keeps its recorded durations from the others'.
+                prefixes = {
+                    config.get("location-prefix")
+                    for step in uploaded[f"{lane}:{gen.name}"]
+                    for plugin in step.get("plugins", [])
+                    if isinstance(plugin, dict)
+                    for name, config in plugin.items()
+                    if name.startswith("tests#")
+                }
+                if prefixes:
+                    self.assertEqual(prefixes, {f"{gen.name}/"}, (lane, gen.name))
 
 
 if __name__ == "__main__":

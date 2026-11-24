@@ -114,6 +114,13 @@ file's v7x-only `if` (`*v7x_only` or `*nightly_v7x_only`; in
 `pipeline_tests.yml`, `*pr_v7x_only` or `*nightly_v7x_only`), so v6e's upload
 leaves it out.
 
+The sharded steps of `pipeline_tests.yml` report to one Test Engine suite,
+`tpu-ci`, for every generation. Its `tests` plugin sets `location-prefix` to
+the generation's name, so the suite records each generation's test durations
+under its own paths (`v6e/tests/...`, `v7x/tests/...`) and bktec balances a
+generation's shards on its own durations. A new generation gets its prefix from
+`TPU_GENERATION`.
+
 The `integration` and `perf` lanes go up the same way as `tests`, once per
 generation in `TPU_GENERATION_FILES`: their eight-core steps take a v6e 2x4
 slice where v7x's take a 2x2x1, and each upload fills in the generation's
