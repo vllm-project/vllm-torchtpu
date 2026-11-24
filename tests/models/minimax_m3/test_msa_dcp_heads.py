@@ -402,3 +402,44 @@ def test_dcp4_decode_merge_matches_dcp_reference(head_calls, monkeypatch):
         np.testing.assert_allclose(
             got[r][:num_real], np.asarray(want[r])[:num_real], rtol=2e-2, atol=2e-2
         )
+
+
+@pytest.mark.parametrize("num_tokens", [2048, 2047, 384])
+def test_gather_group_kv_matches_group_rows(num_tokens):
+    """The group's K/V and index queries gathered in the program (DCP 4 over
+    2 KV heads) are every head's rows; 2047 tokens do not split over the
+    replicas."""
+    dcp, heads = 4, 2
+    if len(jax.devices()) < dcp:
+        pytest.skip(
+            "needs 4 devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)"
+        )
+    rng = np.random.default_rng(num_tokens)
+    group = [
+        jnp.asarray(rng.standard_normal((num_tokens, heads, HEAD_DIM)), jnp.bfloat16)
+        for _ in range(3)
+    ]  # k, v, index_q of the group's heads
+    own = [jnp.repeat(x, dcp // heads, axis=1) for x in group]  # rank r: head r // 2
+    mesh = Mesh(np.asarray(jax.devices()[:dcp]), ("dcp",))
+
+    def body(rank, *rows):
+        got = msa_dcp_heads.gather_group_kv(
+            *(x.transpose(1, 0, 2) for x in rows),
+            rank,
+            axis="dcp",
+            dcp=dcp,
+            kv_head_replicas=dcp // heads,
+        )
+        return tuple(x[None] for x in got)
+
+    f = jax.shard_map(
+        body,
+        mesh=mesh,
+        in_specs=(P("dcp"),) * 4,
+        out_specs=(P("dcp"),) * 3,
+        check_vma=False,
+    )
+    got = f(jnp.arange(dcp, dtype=jnp.int32), *(x.transpose(1, 0, 2) for x in own))
+    for r in range(dcp):
+        for g, w in zip(got, group):
+            np.testing.assert_array_equal(np.asarray(g[r]), np.asarray(w))

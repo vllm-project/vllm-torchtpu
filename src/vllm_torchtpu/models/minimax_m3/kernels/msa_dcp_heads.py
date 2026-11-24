@@ -217,6 +217,57 @@ def unrotate_replica_rows(
     return merged.reshape(num_tokens, heads * head_dim)
 
 
+def gather_group_kv(
+    k: jax.Array,
+    v: jax.Array,
+    index_q: jax.Array,
+    rank: jax.Array,
+    *,
+    axis: str,
+    dcp: int,
+    kv_head_replicas: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Inside a ``shard_map`` over `axis`: this rank's KV head's ``k``/``v``/
+    ``index_q [T, 1, D]`` -> the DCP group's KV heads' ``k``/``v``/``index_q
+    [T, G, D]`` for `msa_dcp.msa_write_and_candidates_dcp`. Rank ``i = h *
+    kv_head_replicas + j`` holds KV head ``h``, as its other replicas do, so
+    it sends only part ``j`` of the tokens. In the program, unlike as a torch
+    collective ahead of it, the gather can run beside work that does not
+    need it (`prepare_queries`)."""
+    num_tokens, _, head_dim = k.shape
+    reps = kv_head_replicas
+    heads = dcp // reps
+    if num_tokens % reps:
+        rows = jnp.concatenate([k, v, index_q], axis=1)  # [T, 3, D]
+        per_rank = jax.lax.all_gather(rows, axis, axis=1, tiled=True)
+        per_head = per_rank.reshape(num_tokens, dcp, 3, head_dim)[:, ::reps]
+        return tuple(per_head[:, :, i] for i in range(3))
+    part = num_tokens // reps
+    rank = msa_dcp.rank_array(rank)[0]
+
+    def mine(x):
+        """This rank's part of the tokens of ``x [T, ...]``."""
+        x = x.reshape(reps, part, *x.shape[1:])
+        return jax.lax.dynamic_index_in_dim(x, rank % reps, keepdims=False)
+
+    def per_head(x):
+        """Every rank's gathered part ``[dcp, part, ...]`` -> ``[T, G, ...]``."""
+        x = x.reshape(heads, reps, part, *x.shape[2:])
+        return jnp.moveaxis(x, 0, 2).reshape(num_tokens, heads, *x.shape[3:])
+
+    if num_tokens < HEAD_PARALLEL_MIN_TOKENS:
+        # Decode-sized steps: [part, 3, D] rows (lane-dense rows cost +4.4 us
+        # per decode layer at c64, twin j-899e03a2).
+        rows = mine(jnp.concatenate([k, v, index_q], axis=1))
+        per_rank = per_head(jax.lax.all_gather(rows, axis))  # [T, G, 3, D]
+        return tuple(per_rank[:, :, i] for i in range(3))
+    # Lane-dense [part, 3 D] rows: re-laying gathered [T, 3, D] rows out per
+    # head cost ~88 us per layer at c64 (twin j-9a9fccc2).
+    rows = jnp.concatenate([k, v, index_q], axis=-1).reshape(num_tokens, -1)
+    per_rank = per_head(jax.lax.all_gather(mine(rows), axis))  # [T, G, 3 D]
+    return tuple(per_rank[..., i * head_dim : (i + 1) * head_dim] for i in range(3))
+
+
 def merge_partials(
     out: jax.Array,
     lse: jax.Array,
@@ -1192,7 +1243,7 @@ def start_first_round_exchange(
 
 
 def _head_parallel_attend(
-    q,
+    queries,
     kv_cache,
     scale_cache,
     candidates,
@@ -1211,27 +1262,25 @@ def _head_parallel_attend(
     interpret,
     first_exchange=None,
 ):
-    """Token-major ``[T, Hl * D]`` attention of this rank's query heads ``q
-    [T, Hl, D]`` (unrotated) for the rows of the requests in ``hp_req`` over
-    their pages of this rank's KV head; other rows are zero. ``tokens`` is
-    `msa.token_positions` of the step.
+    """Token-major ``[T, Hl * D]`` attention of this rank's query heads
+    (`StepQueries`, ``rows`` or ``pair``) for the rows of the requests in
+    ``hp_req`` over their pages of this rank's KV head; other rows are zero.
+    ``tokens`` is `msa.token_positions` of the step.
 
     Requests are attended in rounds of at most ``pages_per_seq`` logical
     blocks (one max-length request): each round exchanges the live pages
     of one page buffer and attends the round's rows in windows of one
     kernel call. `first_exchange` (`start_first_round_exchange`) has the
     first round's pages in flight."""
-    num_tokens, num_q_heads, head_dim = q.shape
+    num_tokens = tokens[0].shape[0]
+    head_dim = (queries.rows if queries.pair is None else queries.pair[0]).shape[-1]
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
     capacity = block_tables_2d.shape[1]  # logical blocks per round
     replicas = kv_head_replicas
     part = -(-capacity // replicas)  # each replica's share of the buffer
-    # The two replicas of a KV head split the rows (`rotate_replica_rows`):
-    # each attends alternate blocks of the tokens with all the head's query
-    # heads, its own first.
-    split = replicas == 2 and num_tokens % (2 * _INTERLEAVE_TOKENS) == 0
+    split = queries.pair is not None
     rows = num_tokens // replicas if split else num_tokens
     offset = rank % replicas * rows if split else 0
     pair = [(r, r ^ 1) for r in range(dcp)]
@@ -1253,11 +1302,11 @@ def _head_parallel_attend(
         seq_id, pos, valid = (
             jax.lax.dynamic_slice_in_dim(x, offset, rows) for x in tokens
         )
-        own, other = rotate_replica_rows(q, rank, interpret=interpret)
+        own, other = queries.pair
         # Two arrays the attention reads in place: no concatenated copy.
         q = (own, jax.lax.ppermute(other, axis, pair))
     else:
-        q = msa_fp4.rotate_queries(q)
+        q = queries.rows
     seq_blocks = -(-seq_lens // (block_size * dcp))
     blocks = jnp.where(hp_req, seq_blocks, 0)
     seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
@@ -1357,15 +1406,94 @@ def _head_parallel_attend(
 
     _, acc = jax.lax.cond(first < max_num_seqs, more_rounds, lambda s: s, (first, acc))
     if split:
-        heads = num_q_heads
+        heads = queries.pair[0].shape[0]
         other = jax.lax.ppermute(acc[heads:], axis, pair)
         return unrotate_replica_rows(acc, other, rank, interpret=interpret)
     return unrotate_to_rows(acc, interpret=interpret)
 
 
+class StepQueries(NamedTuple):
+    """A step's query heads, rotated (`msa_fp4.rotate_queries`) in the
+    layouts `attend_and_merge` reads them (`prepare_queries`)."""
+
+    # [T, Hl, D]: every row, for a step without head-parallel rounds or
+    # whose rows the replicas do not split.
+    rows: jax.Array | None
+    # `rotate_replica_rows`: (own, partner's) [Hl, T / 2, D].
+    pair: tuple[jax.Array, jax.Array] | None
+    # [max_num_seqs * decode_rows, Hl, D]: a head-parallel step's decode rows.
+    decode: jax.Array | None
+
+
+def _decode_rows(cu_q_lens, distribution, decode_rows):
+    """A head-parallel step's decode requests' rows, compacted: ``(cu_d,
+    src_row, prefix)``, their own cu_q_lens, each row's step row, and whether
+    they are the step's first rows (the runner orders decodes ahead of
+    prefills)."""
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    dcp_req, _ = _request_classes(cu_q_lens, distribution, decode_rows)
+    cu_d = jnp.concatenate(
+        [jnp.zeros((1,), jnp.int32), jnp.cumsum(jnp.where(dcp_req, q_lens, 0))]
+    ).astype(jnp.int32)
+    p = jnp.arange(max_num_seqs * decode_rows, dtype=jnp.int32)
+    # compare_all: the default scan lowers to a loop of small ops.
+    req = jnp.searchsorted(cu_d[1:], p, side="right", method="compare_all")
+    req = jnp.minimum(req, max_num_seqs - 1)
+    src_row = jnp.where(p < cu_d[-1], cu_q_lens[req] + p - cu_d[req], 0)
+    prefix = jnp.all((p >= cu_d[-1]) | (src_row == p))
+    return cu_d, src_row, prefix
+
+
+def _split_rows(num_tokens: int, kv_head_replicas: int) -> bool:
+    """Whether the two replicas of a KV head split a head-parallel step's
+    rows (`rotate_replica_rows`): each attends alternate blocks of the tokens
+    with all the head's query heads, its own first."""
+    return kv_head_replicas == 2 and num_tokens % (2 * _INTERLEAVE_TOKENS) == 0
+
+
+def prepare_queries(
+    q: jax.Array,
+    rank: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    kv_head_replicas: int,
+    decode_rows: int,
+    head_parallel_min_tokens: int = HEAD_PARALLEL_MIN_TOKENS,
+    interpret: bool = False,
+) -> StepQueries:
+    """`attend_and_merge`'s rotated query heads (`StepQueries`) from this
+    rank's ``q [T, Hl, D]``: they need no cache, so a step can compute them
+    beside its K/V gather (`gather_group_kv`), which in the c64 mixed twin
+    otherwise waited exposed (j-fa9b2cc7: 106 us per layer)."""
+    num_tokens = q.shape[0]
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    if not head_parallel_step(
+        num_tokens, max_num_seqs, decode_rows, head_parallel_min_tokens
+    ):
+        return StepQueries(msa_fp4.rotate_queries(q), None, None)
+    _, src_row, prefix = _decode_rows(cu_q_lens, distribution, decode_rows)
+    rows = src_row.shape[0]
+    # The decode rows' queries by a slice when they are the step's first: a
+    # gather of `rows` rows of q cost ~16 us per layer (c64 mixed twin
+    # j-c5ebe0af). Rows past the decodes' (attended, then dropped) differ.
+    # The cond takes the rope's lane-dense rows: a [T, Hl, D] operand cost a
+    # relayout of all of q.
+    decode = jax.lax.cond(
+        prefix, lambda x: x[:rows], lambda x: x[src_row], q.reshape(num_tokens, -1)
+    ).reshape(rows, *q.shape[1:])
+    decode = msa_fp4.rotate_queries(decode)
+    if _split_rows(num_tokens, kv_head_replicas):
+        rank = msa_dcp.rank_array(rank)[0]
+        pair = rotate_replica_rows(q, rank, interpret=interpret)
+        return StepQueries(None, pair, decode)
+    return StepQueries(msa_fp4.rotate_queries(q), None, decode)
+
+
 def attend_and_merge(
     rank: jax.Array,
-    q: jax.Array,
+    q: jax.Array | StepQueries,
     kv_cache: jax.Array,
     scale_cache: jax.Array,
     candidates: jax.Array,
@@ -1387,24 +1515,32 @@ def attend_and_merge(
 ) -> jax.Array:
     """This rank's (``rank``, ``int32[1]``) attention output ``[T, Hl * D]``
     (unrotated) for its query heads ``q [T, Hl, D]`` (unrotated: this op
-    rotates them, `msa_fp4.rotate_queries`) and its packed
-    ``candidates [T, G * 2 * topk]`` (`msa_dcp.msa_write_and_candidates_dcp`);
-    4-bit caches. `page_exchange`: `start_first_round_exchange` of this step.
+    rotates them, `msa_fp4.rotate_queries`; or `prepare_queries` of them)
+    and its packed ``candidates [T, G * 2 * topk]``
+    (`msa_dcp.msa_write_and_candidates_dcp`); 4-bit caches. `page_exchange`:
+    `start_first_round_exchange` of this step.
     Runs inside a ``shard_map`` over `axis` (the DCP group)."""
-    num_tokens = q.shape[0]
+    num_tokens = candidates.shape[0]
     # The rank is an input: torch_tpu's SPMD partitioner refuses the
     # partition-id that `lax.axis_index` lowers to.
     rank = msa_dcp.rank_array(rank)[0]
+    if not isinstance(q, StepQueries):
+        q = prepare_queries(
+            q,
+            rank,
+            cu_q_lens,
+            distribution,
+            kv_head_replicas=kv_head_replicas,
+            decode_rows=decode_rows,
+            head_parallel_min_tokens=head_parallel_min_tokens,
+            interpret=interpret,
+        )
     common = dict(
         axis=axis, rank=rank, dcp=dcp, sm_scale=sm_scale, topk=topk, interpret=interpret
     )
-    max_num_seqs = seq_lens.shape[0]
-    rows = max_num_seqs * decode_rows
-    if not head_parallel_step(
-        num_tokens, max_num_seqs, decode_rows, head_parallel_min_tokens
-    ):
+    if q.decode is None:  # no head-parallel rounds
         return _dcp_attend(
-            msa_fp4.rotate_queries(q),
+            q.rows,
             kv_cache,
             scale_cache,
             candidates,
@@ -1414,31 +1550,11 @@ def attend_and_merge(
             rs_out_precision=rs_out_precision,
             **common,
         ).reshape(num_tokens, -1)
-    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    dcp_req, hp_req = _request_classes(cu_q_lens, distribution, decode_rows)
-
-    # The decode requests' rows, compacted: their own cu_q_lens.
-    cu_d = jnp.concatenate(
-        [jnp.zeros((1,), jnp.int32), jnp.cumsum(jnp.where(dcp_req, q_lens, 0))]
-    ).astype(jnp.int32)
-    p = jnp.arange(rows, dtype=jnp.int32)
-    # compare_all: the default scan lowers to a loop of small ops.
-    req = jnp.searchsorted(cu_d[1:], p, side="right", method="compare_all")
-    req = jnp.minimum(req, max_num_seqs - 1)
-    src_row = jnp.where(p < cu_d[-1], cu_q_lens[req] + p - cu_d[req], 0)
-    num_decode = cu_d[-1]
-    # The runner orders decodes ahead of prefills: the decode rows are then
-    # the step's first rows.
-    prefix = jnp.all((p >= num_decode) | (src_row == p))
-    # Their queries by a slice when they are: a gather of `rows` rows of q
-    # cost ~16 us per layer (c64 mixed twin j-c5ebe0af). Rows past the
-    # decodes' (attended, then dropped) differ. The cond takes the rope's
-    # lane-dense rows: a [T, Hl, D] operand cost a relayout of all of q.
-    q_rows = jax.lax.cond(
-        prefix, lambda x: x[:rows], lambda x: x[src_row], q.reshape(num_tokens, -1)
-    ).reshape(rows, *q.shape[1:])
+    _, hp_req = _request_classes(cu_q_lens, distribution, decode_rows)
+    cu_d, src_row, prefix = _decode_rows(cu_q_lens, distribution, decode_rows)
+    rows = src_row.shape[0]
     dcp_out = _dcp_attend(
-        msa_fp4.rotate_queries(q_rows),
+        q.decode,
         kv_cache,
         scale_cache,
         candidates[src_row],
@@ -1465,6 +1581,8 @@ def attend_and_merge(
         **common,
     )
     dcp_out = dcp_out.reshape(rows, -1)
+    p = jnp.arange(rows, dtype=jnp.int32)
+    num_decode = cu_d[-1]
 
     def decode_prefix(out):
         # One in-place update of `rows` rows.

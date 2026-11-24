@@ -721,8 +721,6 @@ def _get_msa_dcp_fp4_op(
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_dcp_op` for 4-bit caches."""
     kv_heads = max(1, dcp // kv_head_replicas)
-    from vllm_torchtpu.distributed.dcp import get_dcp_group
-
     suffix = (
         f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_dcp{dcp}_g{kv_heads}"
     ).replace(".", "p")
@@ -753,11 +751,6 @@ def _get_msa_dcp_fp4_op(
             hadamard: torch.Tensor,
         ) -> torch.Tensor:
             del hadamard  # the step op rotates its own query heads
-            group = get_dcp_group()
-            assert group is not None, "DCP group is not initialized"
-            k, v, index_q = gather_group_kv(
-                k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
-            )
             new_kv_cache, new_index_cache, new_scale_cache, out = step_op(
                 dcp_rank,
                 q.contiguous(),
@@ -994,9 +987,11 @@ def _get_msa_dcp_heads_step_op(
     step with head-parallel rounds start the first round's page exchange
     right after the write, under the indexer
     (`msa_dcp_heads.start_first_round_exchange`), and the collectives run
-    inside it, so a long step picks its paths and sizes from its requests.
-    Returns the written caches and this rank's unrotated output ``[T, Hl *
-    D]``."""
+    inside it, so a long step picks its paths and sizes from its requests:
+    the group's K/V and index queries are gathered in it
+    (`msa_dcp_heads.gather_group_kv`) beside the query rotation. Takes this
+    rank's KV head's ``k``/``v``/``index_q [T, 1, D]``; returns the written
+    caches and this rank's unrotated output ``[T, Hl * D]``."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
@@ -1024,6 +1019,20 @@ def _get_msa_dcp_heads_step_op(
         distribution,
     ):
         num_tokens = k.shape[0]
+        k, v, index_q = msa_dcp_heads.gather_group_kv(k, v, index_q, rank, **common)
+        queries = msa_dcp_heads.prepare_queries(
+            q,
+            rank,
+            cu_q_lens,
+            distribution,
+            kv_head_replicas=kv_head_replicas,
+            decode_rows=decode_rows,
+        )
+        # The queries are ready by the time the gather lands, so XLA computes
+        # them while it is in flight instead of after the indexer.
+        (k, v, index_q), queries = jax.lax.optimization_barrier(
+            ((k, v, index_q), queries)
+        )
         after_write = None
         if msa_dcp_heads.head_parallel_step(num_tokens, seq_lens.shape[0], decode_rows):
 
@@ -1064,7 +1073,7 @@ def _get_msa_dcp_heads_step_op(
         )
         out = msa_dcp_heads.attend_and_merge(
             rank,
-            q,
+            queries,
             kv_cache,
             scale_cache,
             candidates,
