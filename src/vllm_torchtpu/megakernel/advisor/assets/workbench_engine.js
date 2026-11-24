@@ -1124,7 +1124,7 @@
         act_hbm_mb: sum('act_hbm_mb', 3),
         compute_us: sum('compute_us', 2), chain_us: sum('chain_us', 2),
         hbm_us: sum('hbm_us', 2), comm_us: sum('comm_us', 2),
-        fill_drain_us: sum('fill_drain_us', 2), repass_spill_us: sum('repass_spill_us', 2),
+        fill_drain_us: sum('fill_drain_us', 2),
         launch_us: sum('launch_us', 2), roof_floor_us: sum('roof_floor_us', 2),
         step_bound_us: +(sum('step_bound_us', 2) + stepHeadUs).toFixed(2),
         step_floor_strict_us: sum('step_floor_strict_us', 2),
@@ -1231,10 +1231,6 @@
       }
       const isFusedMulti = sc === 'whole_step' || sc === 'layer_group';
       const tiled = isFusedMulti && nSplits > 1;
-      // A fused scope above its row limit and a single-layer kernel stream weights once:
-      // their row tiles move the residual through HBM at every layer instead.
-      const oneWeightPass = tiled || sc === 'single_layer';
-      const weightPasses = oneWeightPass ? 1 : nSplits;
       const tileTokens = Math.ceil(activeTokens / Math.max(1, nSplits));
       const isGrpMode = moeMode === 'grouped_on_chip';
       const canGroupMoe = !isFusedMulti || scopeEpDp === 1 ||
@@ -1251,7 +1247,7 @@
         const eHit = expertsHit(tEp, topK, nExp, scopeExpertsLoc);
         const pairs = Math.max(1.0, tEp * topK * scopeExpertsLoc / nExp);
         const avgM = Math.max(1.0, pairs / eHit);
-        const hit = oneWeightPass
+        const hit = (tiled || sc === 'single_layer')
           ? expertsHit(activeTokens * scopeEpDp, topK, nExp, scopeExpertsLoc) : eHit;
         wStep = wStatic + lMoe * hit * scopeExpBytes;
         const maskedPhi = Math.max(1.0, (Math.floor((tEp + 15) / 16) * 16 * eHit) / pairs);
@@ -1398,7 +1394,7 @@
         4.0 * activeTokens * ffnDenseInterLocal * (layersLocal - lMoe) +
         4.0 * activeTokens * sharedInterLocal * lMoe + subchannelVecDense +
         vecOpsPreDsaExtra + vecOpsDsa;
-      const routedBytesStreamed = weightPasses * (wStep - wStatic);
+      const routedBytesStreamed = wStep - wStatic;
       const streamedRoutedParams = Math.max(0.0, routedBytesStreamed / Math.max(1e-6, bwE));
       const iExpLocal = scopeIExpLoc;
       const moeTokensLocal = activeTokens * scopeEpDp * scopeExpertsLoc / Math.max(1, nExp);
@@ -1420,10 +1416,10 @@
       const tDenseUpper = Math.max(tMatmulDenseUpper, vecOpsDense / vecRate);
       const tMoe = (moePadFactor * scopeFlopsMoe) / peakE;
       const tVecMoe = vecOpsMoe / vecRate;
-      const tHbm = (weightPasses * wStep + effStateBytes + actBytes) / bwHbm;
+      const tHbm = (wStep + effStateBytes + actBytes) / bwHbm;
       // Routed-expert bytes are requested after each layer's router, so they stream
       // under neither the dense compute nor the collectives.
-      const routedHbmS = weightPasses * (wStep - wStatic) / bwHbm;
+      const routedHbmS = (wStep - wStatic) / bwHbm;
       const dsaStageSeconds = (
         latCollVal, bf16Upper, strictMode, effDenseVal, effHbmVal, effIciVal, xlaFactorVal
       ) => {
@@ -1451,10 +1447,7 @@
       const chainS = routedChain(tDense, routedHbmS, tMoe, tVecMoe, dsaStageS);
       const roofCoreS = coreTime(tHbm, chainS, commS, isFusedMulti);
       const roofUs = (roofCoreS + fillDrainS) * 1e6;
-      const baseAi = (flopsDense + scopeFlopsMoe) / Math.max(1.0, wStep + effStateBytes);
-      const repassUs = (baseAi >= peakW / bwHbm && weightPasses > 1)
-        ? ((actBytes + (nSplits - 1) * wStep) / bwHbm * 1e6) : 0.0;
-      const pureStepUs = roofUs + repassUs;
+      const pureStepUs = roofUs;
       const launchUs = nOps * lgBox.lo;
       const stepUs = pureStepUs + launchUs + scopeHostHeadUs;
       const etaMoe = (groupedMoe && lMoe > 0) ? etaMoeGrp : etaDense;
@@ -1509,7 +1502,7 @@
         tDenseAch, routedHbmAchS, tMoeAch, tVecMoeAch, dsaStageAchS
       );
       const achCoreS = Math.max(tHbmAch, chainAchS) + tCommAch + syncExtraS;
-      const stepAchUs = (achCoreS + achFillDrainS) * 1e6 + repassUs + launchUs + scopeHostHeadUs;
+      const stepAchUs = (achCoreS + achFillDrainS) * 1e6 + launchUs + scopeHostHeadUs;
       const extraLatS = Math.max(0.0, latCollHi - latColl);
       const arHopsUpper = effNumAr * nSplits * upperColl.xlaArFactor * arInfo.intraHops;
       const arExtraUpperS = (arHopsUpper + upperColl.stepHops) * extraLatS;
@@ -1527,7 +1520,7 @@
       ) + a2aExtraUpperS;
       const roofHiUs = (roofHiCoreS + upperFillDrainS) * 1e6;
       const stepHiUs = Math.max(
-        stepUs, roofHiUs + repassUs + nOps * lgBox.hi + scopeHostHeadUs
+        stepUs, roofHiUs + nOps * lgBox.hi + scopeHostHeadUs
       );
       const arHopsAch = achColl.hasMeasuredAr
         ? 0 : (effNumAr * nSplits * achColl.xlaArFactor * arInfo.intraHops);
@@ -1556,7 +1549,7 @@
         syncExtraS + (a2aExtraAchS / effIci);
       const stepAchHiUs = Math.max(
         stepAchUs, stepHiUs,
-        (achHiCoreS + achFillDrainS) * 1e6 + repassUs + nOps * lgBox.hi + scopeHostHeadUs
+        (achHiCoreS + achFillDrainS) * 1e6 + nOps * lgBox.hi + scopeHostHeadUs
       );
       const eStrict = scopeExpertsLoc > 0
         ? Math.min(scopeExpertsLoc, Math.max(1.0, topK * scopeExpertsLoc / Math.max(1, nExp)))
@@ -1569,10 +1562,10 @@
       const tMatmulStrict = tMatmulDenseStrict + scopeFlopsMoe / peakE;
       const effStateStrictBytes = hasDsa
         ? (effStateBytes - dsaKvGatherBytes + dsaKvStrictBytes) : effStateBytes;
-      const tHbmStrict = (weightPasses * wStepStrict + effStateStrictBytes + actBytes) / bwHbm;
+      const tHbmStrict = (wStepStrict + effStateStrictBytes + actBytes) / bwHbm;
       const tMoeStrict = scopeFlopsMoe / peakE;
-      const routedStrictS = weightPasses * (wStepStrict - wStatic) / bwHbm;
-      const routedBytesStrict = weightPasses * (wStepStrict - wStatic);
+      const routedBytesStrict = wStepStrict - wStatic;
+      const routedStrictS = routedBytesStrict / bwHbm;
       const streamedRoutedParamsStrict = Math.max(0.0, routedBytesStrict / Math.max(1e-6, bwE));
       const vecOpsMoeStrict = 4.0 * moeTokensLocal * lMoe * topK * iExpLocal +
         (isFp4Expert ? 2.0 * streamedRoutedParamsStrict : 0.0);
@@ -1599,10 +1592,8 @@
       const commStrictS = commS - (commInCore ? arStrictSavingS : 0.0);
       const fillDrainStrictS = fillDrainS - (commInCore ? 0.0 : arStrictSavingS);
       const roofCoreStrictS = coreTime(tHbmStrict, chainStrictS, commStrictS, isFusedMulti);
-      const repassStrictUs = (baseAi >= peakW / bwHbm && weightPasses > 1)
-        ? ((actBytes + (nSplits - 1) * wStepStrict) / bwHbm * 1e6) : 0.0;
       const stepFloorStrictUs = (roofCoreStrictS + fillDrainStrictS) * 1e6 +
-        repassStrictUs + launchUs;
+        launchUs;
       const supInfo = evaluateSupport(sc, p, wl, ch, {
         activeTokens, effTp, epDp: scopeEpDp, planError: wl.planError || ''
       });
@@ -1629,7 +1620,6 @@
         chain_us: +(chainS * 1e6).toFixed(2),
         hbm_us: +(tHbm * 1e6).toFixed(2), comm_us: +(commS * 1e6).toFixed(2),
         fill_drain_us: +(fillDrainS * 1e6).toFixed(2),
-        repass_spill_us: +repassUs.toFixed(2),
         launch_us: +launchUs.toFixed(2), roof_floor_us: +roofUs.toFixed(2),
         step_bound_us: +stepUs.toFixed(2),
         step_floor_strict_us: +stepFloorStrictUs.toFixed(2),
