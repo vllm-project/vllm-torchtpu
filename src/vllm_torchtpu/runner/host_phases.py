@@ -17,6 +17,8 @@ cost and the schedule-end to runner-start lag (see
 ``core/prefix_aware_scheduler.py``).
 """
 
+import os
+import threading
 import time
 
 import numpy as np
@@ -27,7 +29,10 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _EVERY = envs.VLLM_TPU_HOST_PHASES
+# Also charge each phase's on-CPU time of the step thread to x_cpu_<phase>.
+_CPU = _EVERY and envs.VLLM_TPU_HOST_PHASES_CPU
 _last: int | None = None
+_last_cpu = 0
 _samples: dict[str, dict[str, list[int]]] = {}
 _kind_steps: dict[str, int] = {}
 _steps = 0
@@ -122,18 +127,25 @@ def _log_admit(phases: list[tuple[str, int]], info: str) -> None:
 
 
 def _set_last() -> None:
-    global _last
+    global _last, _last_cpu
     _last = time.perf_counter_ns()
+    if _CPU:
+        _last_cpu = time.thread_time_ns()
 
 
 def mark(name: str) -> None:
-    global _last
+    global _last, _last_cpu
     if not _EVERY:
         return
     now = time.perf_counter_ns()
     if _last is not None:
-        _samples.setdefault(_kind, {}).setdefault(name, []).append(now - _last)
+        per_name = _samples.setdefault(_kind, {})
+        per_name.setdefault(name, []).append(now - _last)
         _cur.append((name, now - _last))
+        if _CPU:
+            cpu = time.thread_time_ns()
+            per_name.setdefault("x_cpu_" + name, []).append(cpu - _last_cpu)
+            _last_cpu = cpu
     _last = now
 
 
@@ -163,3 +175,56 @@ def _report() -> None:
         )
     _samples.clear()
     _kind_steps.clear()
+    log_thread_usage(f"rank={_rank}")
+
+
+# tid -> (name, run ns, runqueue-wait ns, timeslices) at the previous report.
+_thread_prev: dict[int, tuple[str, int, int, int]] = {}
+_thread_prev_wall = 0
+
+
+def _read_threads() -> dict[int, tuple[str, int, int, int]]:
+    out = {}
+    for tid in os.listdir("/proc/self/task"):
+        base = f"/proc/self/task/{tid}/"
+        try:
+            with open(base + "comm") as f:
+                name = f.read().strip()
+            with open(base + "schedstat") as f:
+                run_ns, wait_ns, slices = (int(x) for x in f.read().split())
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # the thread exited between listdir and open
+        out[int(tid)] = (name, run_ns, wait_ns, slices)
+    return out
+
+
+def log_thread_usage(tag: str) -> None:
+    """Log each thread's on-CPU and runqueue-wait time since the previous call
+    (``/proc/self/task/*/schedstat``), so a step thread that waits for a CPU,
+    or another thread of the process that keeps one busy, shows next to the
+    phase times. ``*`` marks the calling thread."""
+    global _thread_prev, _thread_prev_wall
+    now = time.perf_counter_ns()
+    cur = _read_threads()
+    wall = now - _thread_prev_wall
+    if _thread_prev_wall:
+        me = threading.get_native_id()
+        rows = []
+        for tid, (name, run, wait, slices) in cur.items():
+            _, run0, wait0, slices0 = _thread_prev.get(tid, (name, 0, 0, 0))
+            d_run, d_wait = run - run0, wait - wait0
+            if tid == me or d_run + d_wait > wall // 200:
+                rows.append((d_run, tid, name, d_wait, slices - slices0))
+        rows.sort(reverse=True)
+        logger.info(
+            "HOSTTHREADS %s wall_ms=%.0f threads=%d %s",
+            tag,
+            wall / 1e6,
+            len(cur),
+            " ".join(
+                f"{'*' if tid == me else ''}{name.replace(' ', '_')}/{tid}="
+                f"{d_run / 1e6:.0f}/{d_wait / 1e6:.0f}/{n}"
+                for d_run, tid, name, d_wait, n in rows
+            ),
+        )
+    _thread_prev, _thread_prev_wall = cur, now

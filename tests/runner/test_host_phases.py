@@ -62,3 +62,35 @@ def test_off_by_default_is_a_no_op(monkeypatch):
     host_phases.mark("a")
     host_phases.note("x", 1.0)
     assert host_phases._samples == {}
+
+
+def test_cpu_time_per_phase_is_recorded_as_x_cpu(monkeypatch):
+    _reset(monkeypatch, 100)
+    monkeypatch.setattr(host_phases, "_CPU", True)
+    cpu = iter(range(0, 10**9, 400))
+    monkeypatch.setattr(host_phases.time, "thread_time_ns", lambda: next(cpu))
+    host_phases.begin_step("dec")
+    host_phases.mark("a")
+    # Wall 1000 ns, on-CPU 400 ns; x_ entries are not summed into total_mean.
+    assert host_phases._samples["dec"] == {"a": [1000], "x_cpu_a": [400]}
+
+
+def test_thread_usage_logs_deltas_since_the_previous_call(monkeypatch):
+    snaps = iter(
+        [
+            {1: ("step", 0, 0, 0), 2: ("busy", 0, 0, 0), 3: ("idle", 0, 0, 0)},
+            {1: ("step", 4_000_000, 1_000_000, 9), 2: ("busy", 8_000_000, 0, 3), 3: ("idle", 1, 0, 1)},
+        ]
+    )
+    monkeypatch.setattr(host_phases, "_read_threads", lambda: next(snaps))
+    monkeypatch.setattr(host_phases, "_thread_prev", {})
+    monkeypatch.setattr(host_phases, "_thread_prev_wall", 0)
+    monkeypatch.setattr(host_phases.threading, "get_native_id", lambda: 1)
+    clock = iter([5_000_000, 15_000_000])
+    monkeypatch.setattr(host_phases.time, "perf_counter_ns", lambda: next(clock))
+    lines = []
+    monkeypatch.setattr(host_phases.logger, "info", lambda fmt, *a: lines.append(fmt % a))
+    host_phases.log_thread_usage("rank=0")
+    host_phases.log_thread_usage("rank=0")
+    # Busiest first; the calling thread is starred; idle threads are left out.
+    assert lines == ["HOSTTHREADS rank=0 wall_ms=10 threads=3 busy/2=8/0/3 *step/1=4/1/9"]

@@ -364,6 +364,7 @@ if TYPE_CHECKING:
     VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = False
     VLLM_TPU_CPU_PIN: str = "off"
     VLLM_TPU_HOST_PHASES: int = 0
+    VLLM_TPU_HOST_PHASES_CPU: bool = False
     VLLM_TPU_PROMPT_IDS_NDARRAY: bool = False
     VLLM_TPU_PAW_SKIP_FULL: bool = False
     VLLM_TPU_PROMPT_IDS_NDARRAY_EARLY: bool = False
@@ -2435,6 +2436,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log each rank's per-step host time by runner phase every N steps
     # (0 = off); runner/host_phases.py.
     "VLLM_TPU_HOST_PHASES": env_nonnegative_int("VLLM_TPU_HOST_PHASES", 0),
+    # With VLLM_TPU_HOST_PHASES: also record the step thread's on-CPU time per
+    # phase (x_cpu_<phase>), so a phase that waits shows wall >> CPU.
+    "VLLM_TPU_HOST_PHASES_CPU": env_bool("VLLM_TPU_HOST_PHASES_CPU"),
     # Ship a new request's prompt token ids to the workers as one int32
     # ndarray (converted once when the request is added) instead of a Python
     # list. A ~100K-token agentic prompt otherwise costs every rank a list

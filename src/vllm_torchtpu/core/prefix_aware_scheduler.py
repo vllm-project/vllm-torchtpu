@@ -399,6 +399,9 @@ class PrefixAwareScheduler(AsyncScheduler):
             " ".join(parts),
         )
         self._hp_samples.clear()
+        from vllm_torchtpu.runner import host_phases
+
+        host_phases.log_thread_usage("engine")
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
         if not self._hp_every:
