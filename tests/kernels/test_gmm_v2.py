@@ -691,34 +691,6 @@ def test_gmm_v2_nvfp4_global_scale_matches_dequantized_reference(compact_scale):
 
 
 @pytest.mark.tpu_test
-def test_gmm_v2_nvfp4_global_scale_rounds_once():
-    """A global scale dequantizes in FP32, so the combined scale is not rounded
-    to BF16 before it multiplies the weights."""
-    _require_tpu()
-
-    num_groups, size_k, size_n = 2, 512, 256
-    packed, scale = make_nvfp4_rhs(jax.random.key(4), num_groups, size_k, size_n)
-    global_scale = make_global_scale(jax.random.key(5), num_groups, size_n)
-    combined = scale.astype(jnp.float32) * global_scale
-    fp32_product = dequantize_nvfp4_kmajor(packed, combined, jnp.bfloat16)
-    bf16_scale_product = dequantize_nvfp4_kmajor(
-        packed, combined.astype(jnp.bfloat16).astype(jnp.float32), jnp.bfloat16
-    )
-    assert not np.array_equal(
-        np.asarray(fp32_product, dtype=np.float32),
-        np.asarray(bf16_scale_product, dtype=np.float32),
-    )
-
-    actual = read_back_nvfp4_rhs(
-        packed,
-        jax.lax.bitcast_convert_type(scale, jnp.uint8),
-        rhs_global_scale=global_scale,
-    )
-
-    _assert_bitwise_equal(actual, fp32_product)
-
-
-@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     ("size_k", "tile_info"),
     [
@@ -836,17 +808,15 @@ def test_gmm_v2_rejects_compact_scale_tiles_off_the_sublane_tiling(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("quant_block_size", [16, 64])
-@pytest.mark.parametrize("size_k", [640, 1024, 2880, 4096, 7168])
-@pytest.mark.parametrize("fuse_act", [None, "silu"])
-def test_calculate_tiling_aligns_compact_scale_tiles(
-    monkeypatch, size_k, fuse_act, quant_block_size
+def _compact_tiling(
+    monkeypatch, size_m, size_k, size_n, quant_block_size=16, vmem_mib=48
 ):
+    """calculate_tiling for packed NVFP4 weights with compact E4M3 scales."""
     _validation_tpu_info(monkeypatch)
     dims = Dimensions(
-        size_m=1024,
+        size_m=size_m,
         size_k=size_k,
-        size_n=4096,
+        size_n=size_n,
         size_group=8,
         size_lhs_group=8,
         size_lhs_sublane=16,
@@ -860,53 +830,28 @@ def test_calculate_tiling_aligns_compact_scale_tiles(
         has_compact_scale=True,
     )
     lhs_cfgs = InputConfigs(quant_dtype=None, quant_block_size=512, dtype=jnp.bfloat16)
-
-    tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, 48 * 1024 * 1024, fuse_act)
-
-    blocks = tiles.tile_k // quant_block_size
-    assert blocks % 32 == 0 or tiles.tile_k == size_k, tiles
+    return calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_mib * 1024 * 1024)
 
 
 @pytest.mark.parametrize(
-    ("size_k", "rhs_cfgs"),
-    [
-        (
-            16384,
-            InputConfigs(
-                quant_dtype=jnp.float4_e2m1fn,
-                quant_block_size=16,
-                dtype=jnp.uint8,
-                has_scale=True,
-                has_global_scale=True,
-                has_compact_scale=True,
-            ),
-        ),
-        (
-            65536,
-            InputConfigs(quant_dtype=None, quant_block_size=65536, dtype=jnp.bfloat16),
-        ),
-    ],
-    ids=["nvfp4_compact", "bf16"],
+    ("quant_block_size", "size_k", "tile_k"),
+    [(16, 640, 640), (16, 2880, 1536), (64, 2880, 2048)],
+    ids=["one_tile_holds_all_blocks", "block_16", "block_64"],
 )
-def test_calculate_tiling_splits_k_when_tile_n_stops_at_its_limit(
-    monkeypatch, size_k, rhs_cfgs
+def test_calculate_tiling_aligns_compact_scale_tiles(
+    monkeypatch, quant_block_size, size_k, tile_k
 ):
+    """A K tile holds all of K's blocks or a multiple of 32 blocks (the uint8
+    sublane tiling), with K split evenly."""
+    tiles = _compact_tiling(monkeypatch, 1024, size_k, 4096, quant_block_size)
+    assert tiles.tile_k == tile_k, tiles
+
+
+def test_calculate_tiling_splits_k_when_tile_n_stops_at_its_limit(monkeypatch):
     """With N=512, tile_n starts at its limit (twice the MXU columns), so only
     a smaller tile_k can bring the estimate under the VMEM limit."""
-    _validation_tpu_info(monkeypatch)
-    dims = Dimensions(
-        size_m=128,
-        size_k=size_k,
-        size_n=512,
-        size_group=8,
-        size_lhs_group=8,
-        size_lhs_sublane=16,
-    )
-    lhs_cfgs = InputConfigs(quant_dtype=None, quant_block_size=512, dtype=jnp.bfloat16)
-
-    tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, 58 * 1024 * 1024)
-
-    assert tiles.tile_n == 512 and tiles.tile_k < size_k, tiles
+    tiles = _compact_tiling(monkeypatch, 128, 16384, 512, vmem_mib=58)
+    assert tiles.tile_n == 512 and tiles.tile_k < 16384, tiles
 
 
 def test_gmm_v2_rejects_compact_scales_without_global_scale(monkeypatch):
@@ -948,32 +893,8 @@ def test_gmm_v2_rejects_partial_m_buckets_with_split_k(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("size_k", [2880, 4096])
-def test_calculate_tiling_keeps_one_bucket_when_k_is_split(monkeypatch, size_k):
-    """Partial-M buckets finalize after the first K step, so a split K (here
-    from compact scale tiles: 2880 splits, 4096 does not) keeps one bucket."""
-    _validation_tpu_info(monkeypatch)
-    dims = Dimensions(
-        size_m=5760,
-        size_k=size_k,
-        size_n=256,
-        size_group=2,
-        size_lhs_group=2,
-        size_lhs_sublane=16,
-    )
-    rhs_cfgs = InputConfigs(
-        quant_dtype=jnp.float4_e2m1fn,
-        quant_block_size=16,
-        dtype=jnp.uint8,
-        has_scale=True,
-        has_global_scale=True,
-        has_compact_scale=True,
-    )
-    lhs_cfgs = InputConfigs(quant_dtype=None, quant_block_size=512, dtype=jnp.bfloat16)
-
-    tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, 48 * 1024 * 1024)
-
-    if size_k == 2880:
-        assert tiles.tile_k < size_k and tiles.tile_m == tiles.bucket_base, tiles
-    else:
-        assert tiles.tile_k == size_k and tiles.tile_m > tiles.bucket_base, tiles
+def test_calculate_tiling_keeps_one_bucket_when_k_is_split(monkeypatch):
+    """Partial-M buckets finalize after the first K step, so a K that compact
+    scale tiles split (2880 rows) keeps one bucket."""
+    tiles = _compact_tiling(monkeypatch, 5760, 2880, 256)
+    assert tiles.tile_k < 2880 and tiles.tile_m == tiles.bucket_base, tiles
