@@ -49,6 +49,7 @@ from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_op,
     get_msa_sharded_op,
 )
+from vllm_torchtpu.models.minimax_m3 import norm_hoist
 from vllm_torchtpu.models.minimax_m3.ops.qk_norm_rope import get_qk_norm_rope_op
 
 logger = init_logger(__name__)
@@ -219,6 +220,7 @@ def norm_rope_heads(
     norms: tuple[GemmaRMSNorm, GemmaRMSNorm, GemmaRMSNorm, GemmaRMSNorm],
     rotary_emb: nn.Module,
     op: Callable[..., tuple[torch.Tensor, ...]],
+    weight_table: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split ``[q | k | v | index_q | index_k]`` and norm + rotate all but v
     in one kernel, `op` (`ops.qk_norm_rope.get_qk_norm_rope_op` for these
@@ -232,17 +234,20 @@ def norm_rope_heads(
     if not rotary_emb.is_neox_style or rotary_emb.head_size != head_dim:
         raise NotImplementedError("MiniMax M3 rotates NeoX-style within each head.")
     q_norm, k_norm, index_q_norm, index_k_norm = norms
-    weight = (
-        torch.cat(
-            [
-                q_norm.weight.expand(num_heads, head_dim),
-                k_norm.weight.expand(num_kv_heads, head_dim),
-                index_q_norm.weight.expand(num_kv_heads, head_dim),
-                index_k_norm.weight.expand(1, head_dim),
-            ]
-        ).float()
-        + 1.0
-    )
+    if weight_table is not None:
+        weight = weight_table
+    else:
+        weight = (
+            torch.cat(
+                [
+                    q_norm.weight.expand(num_heads, head_dim),
+                    k_norm.weight.expand(num_kv_heads, head_dim),
+                    index_q_norm.weight.expand(num_kv_heads, head_dim),
+                    index_k_norm.weight.expand(1, head_dim),
+                ]
+            ).float()
+            + 1.0
+        )
     assert all(n.variance_epsilon == q_norm.variance_epsilon for n in norms)
     cos_sin = rotary_emb._match_cos_sin_cache_dtype(qkv)
     cos_sin = cos_sin.index_select(0, positions.flatten())
@@ -532,6 +537,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm),
             self.rotary_emb,
             self.norm_rope_op,
+            getattr(self, norm_hoist.QK_TABLE, None),
         )
         rows = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
         num_tokens = rows.shape[0]

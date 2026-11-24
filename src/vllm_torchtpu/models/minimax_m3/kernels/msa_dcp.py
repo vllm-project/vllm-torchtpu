@@ -50,6 +50,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import tight_vmem
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_attention,
@@ -531,7 +532,13 @@ def _merge_kernel_t(c_ref, o_ref, *, topk: int):
 # of the [dcp, rows, 2 * topk] candidates into rows cost ~3 ms per layer in the
 # c64 mixed step (32768 rows; j-c1444339). Narrower merges (DCP 2, as c4/c16/c48
 # serve) keep the dense ranking, cheap at n = 32.
-_KERNEL_MERGE_MIN_CANDIDATES = 64
+_KERNEL_MERGE_MIN_CANDIDATES = envs.TPU_MINIMAX_M3_DCP_MERGE_KERNEL_MIN_CANDIDATES
+if _KERNEL_MERGE_MIN_CANDIDATES != 64:
+    init_logger(__name__).warning(
+        "TPU_MINIMAX_M3_DCP_MERGE_KERNEL_MIN_CANDIDATES=%d on: MSA DCP merges of "
+        "at least that many candidates per token run as the Pallas merge kernel",
+        _KERNEL_MERGE_MIN_CANDIDATES,
+    )
 _MERGE_BLOCK_TOKENS = 256
 
 
@@ -1426,6 +1433,11 @@ def _exchange_partials(
     # As 16-bit integers: float copies may canonicalize NaN or flush
     # subnormal bit patterns (the LSE halves are arbitrary bits).
     words = jax.lax.bitcast_convert_type(parts, jnp.uint16)
+    if envs.TPU_MINIMAX_M3_DCP_LSE_PLANES:
+        init_logger(__name__).warning_once(
+            "TPU_MINIMAX_M3_DCP_LSE_PLANES=1 on: DCP partial LSEs exchanged as lane planes"
+        )
+        return _exchange_partials_planes(words, parts.dtype, lses, rank, axis, dcp)
     bits = jax.lax.bitcast_convert_type(lses, jnp.uint16)  # [dcp, T, Hl, 2]
     bits = bits.reshape(num_ranks, 1, num_tokens, 2 * num_heads)
     bits = jnp.pad(bits, ((0, 0), (0, 0), (0, 0), (0, head_dim - 2 * num_heads)))
@@ -1438,6 +1450,33 @@ def _exchange_partials(
     return (
         jax.lax.bitcast_convert_type(both[:, :num_heads], parts.dtype),
         jax.lax.bitcast_convert_type(bits, lses.dtype),
+    )
+
+
+def _exchange_partials_planes(
+    words: jax.Array, dtype, lses: jax.Array, rank: jax.Array, axis: str, dcp: int
+) -> tuple[jax.Array, jax.Array]:
+    """`_exchange_partials` (TPU_MINIMAX_M3_DCP_LSE_PLANES) with each LSE's
+    low and high 16 bits in two lane planes (lanes ``[0, Hl)`` and ``[Hl,
+    2 Hl)``) of the extra row, not interleaved: the receiver joins two
+    contiguous lane slices with a shift and an or, where the interleaved
+    pairs cost XLA a stride-2 lane slice (~5 us per layer at c48 T=96,
+    j-224a8aae). The same bits arrive."""
+    num_ranks, num_heads, num_tokens, head_dim = words.shape
+    u = jax.lax.bitcast_convert_type(lses, jnp.uint32)  # [dcp, T, Hl]
+    lo = (u & 0xFFFF).astype(jnp.uint16)
+    hi = (u >> 16).astype(jnp.uint16)
+    bits = jnp.concatenate([lo, hi], axis=-1)[:, None]  # [dcp, 1, T, 2 Hl]
+    bits = jnp.pad(bits, ((0, 0), (0, 0), (0, 0), (0, head_dim - 2 * num_heads)))
+    both = all_to_all_by_permute(
+        jnp.concatenate([words, bits], axis=1), rank, axis, dcp
+    )
+    row = both[:, num_heads]
+    lo = row[..., :num_heads].astype(jnp.uint32)
+    hi = row[..., num_heads : 2 * num_heads].astype(jnp.uint32)
+    return (
+        jax.lax.bitcast_convert_type(both[:, :num_heads], dtype),
+        jax.lax.bitcast_convert_type((hi << 16) | lo, lses.dtype),
     )
 
 
