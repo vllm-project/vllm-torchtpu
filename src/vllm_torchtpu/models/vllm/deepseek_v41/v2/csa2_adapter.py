@@ -264,7 +264,9 @@ def _select_gather_attend(
     from .indexer_fp8 import select_fp8_indexer_jax
 
     tokens = q.shape[0]
-    swa_pages = swa_word_pages(swa if swa_high is None else (swa, swa_high), swa_page_size)
+    swa_pages = swa_word_pages(
+        swa if swa_high is None else (swa, swa_high), swa_page_size
+    )
     word_banks = raw if high is None else (raw, high)
     scale_banks = scales if high_scales is None else (scales, high_scales)
     rope = _inverse_rope(cos_sin, positions)
@@ -908,7 +910,9 @@ def select_attention(
     )
     cache = attention_kernels._active_gathered_kv
     if cache is not None:
-        cache.put(main, records, ("csa2", main.shape[1]), (words, scales), valid_counts=counts)
+        cache.put(
+            main, records, ("csa2", main.shape[1]), (words, scales), valid_counts=counts
+        )
     return output, records
 
 

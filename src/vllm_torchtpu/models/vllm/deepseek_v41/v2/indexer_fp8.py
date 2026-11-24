@@ -736,9 +736,11 @@ def _select_fp8_indexer_jax(
     ids = jnp.arange(topk, dtype=jnp.int32)
     visible = jnp.where(ids < lengths[:tokens, None], ids, -1)
     num_tiles = padded // chunk_rows
+    bounded = prefill_chunk_rows is not None or publish_rows
     # Unrolled tiles have static row offsets, so each tile's selection feeds
     # the consumer while later tiles are still scored and selected.
-    tile_consume = consume if num_tiles <= indexer.MAX_UNROLLED_TILES else None
+    unrolled = not bounded or num_tiles <= indexer.MAX_UNROLLED_TILES
+    tile_consume = consume if unrolled else None
 
     def write(tile, selected, output):
         update = functools.partial(
@@ -747,7 +749,7 @@ def _select_fp8_indexer_jax(
         if tile_consume is None:
             return jax.tree.map(update, output, selected)
         output, state = output
-        start = int(tile) * chunk_rows
+        start = tile * chunk_rows
         rows = selected[0] if publish_rows else selected
         rows = jnp.where(short, visible[start : start + chunk_rows], rows)
         return jax.tree.map(update, output, selected), tile_consume(start, rows, state)
@@ -762,7 +764,7 @@ def _select_fp8_indexer_jax(
         output = (output, None)
     pipeline = (
         indexer.pipeline_score_topk_bounded
-        if prefill_chunk_rows is not None or publish_rows
+        if bounded
         else indexer.pipeline_score_topk_unrolled
     )
     selected = pipeline(

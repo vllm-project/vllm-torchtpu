@@ -36,6 +36,7 @@ def pipeline_score_topk_unrolled(
     """Leave independent score/selection tiles available to the scheduler.
 
     Use for tuned small-query batches; score lifetimes are not bounded here.
+    ``write`` receives the tile as a Python int.
     """
     if num_tiles < 1:
         raise ValueError("The score/top-k pipeline requires at least one tile")
@@ -43,7 +44,7 @@ def pipeline_score_topk_unrolled(
         index = jnp.int32(tile)
         scores = score(prepare(index), None)
         selected = select(index, scores, None)
-        output = write(index, selected, output)
+        output = write(tile, selected, output)
     return output
 
 
@@ -59,7 +60,8 @@ def pipeline_score_topk_bounded(
 
     Callbacks accept an optional scheduling group after their data arguments.
     Each pair gets a program-unique group so the compiler keeps TensorCore
-    scoring between SparseCore selection start and completion.
+    scoring between SparseCore selection start and completion. Up to
+    ``MAX_UNROLLED_TILES``, ``write`` receives the tile as a Python int.
     """
     if num_tiles < 1:
         raise ValueError("The score/top-k pipeline requires at least one tile")
@@ -87,16 +89,16 @@ def pipeline_score_topk_bounded(
                 previous, current, prepared = lax.optimization_barrier(
                     (previous, current, prepared)
                 )
-                output = write(jnp.int32(tile - 1), previous, output)
+                output = write(tile - 1, previous, output)
             group = group_base + tile
             following = score(prepared, group)
             previous = select(jnp.int32(tile), current, group)
             current = following
         if previous is not None:
             previous, current = lax.optimization_barrier((previous, current))
-            output = write(jnp.int32(num_tiles - 2), previous, output)
-        last = jnp.int32(num_tiles - 1)
-        return write(last, select(last, current, None), output)
+            output = write(num_tiles - 2, previous, output)
+        last = num_tiles - 1
+        return write(last, select(jnp.int32(last), current, None), output)
 
 
 def pipeline_score_topk(num_tiles, prepare, score, select, write, output):

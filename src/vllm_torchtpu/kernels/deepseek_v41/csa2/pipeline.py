@@ -108,7 +108,9 @@ def csa2_attend_rows(
     """
     end = offset + counts.shape[0]
     destinations = (
-        dict(new_owners=True) if owners is None else dict(out=owners[0], kv_out=owners[1])
+        dict(new_owners=True)
+        if owners is None
+        else dict(out=owners[0], kv_out=owners[1])
     )
     return csa2(
         q,
