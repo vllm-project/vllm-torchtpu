@@ -146,6 +146,29 @@ def dist_ctx():
 
 
 @pytest.fixture
+def cpu_model_tests(monkeypatch):
+    """Keep CPU-only model tests from opening the TPU.
+
+    `import torch` loads torch_tpu through its backend entry point, so
+    `torch.tpu` can be registered even on a host without chips. Each stub
+    guards one way these tests would otherwise open the TPU:
+
+    - `torch.accelerator`: Dynamo queries the current device while it traces
+      CPU code; report no accelerator so it does not open a TPU client.
+    - `torch.tpu.manual_seed_all`: `torch.manual_seed` also seeds every
+      registered device backend, and torch_tpu's `manual_seed_all` opens the
+      TPU.
+    """
+    tpu = getattr(torch, "tpu", None)
+    if tpu is not None:
+        monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
+    if hasattr(torch, "accelerator"):
+        monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+        monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+        monkeypatch.setattr(torch.accelerator, "device_count", lambda: 0)
+
+
+@pytest.fixture
 def make_fp8_experts(monkeypatch):
     """CPU `RoutedExperts` under `quant`, holding TP rank `tp_rank` of the experts."""
     # Here rather than in tests/layers/adapter/quantization/: see dist_ctx.
