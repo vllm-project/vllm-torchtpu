@@ -66,15 +66,18 @@ def _caches(rng, num_pages, g, ties):
 
 
 @pytest.mark.parametrize(
-    "dcp,ctx,ties",
+    "dcp,ctx,ties,row0",
     [
-        (2, [3000, 9000, 700, 5000], False),
-        (2, [6000, 2500], True),
-        (4, [9000, 4100, 12000], False),
-        (4, [8000], True),
+        (2, [3000, 9000, 700, 5000], False, 0),
+        (2, [6000, 2500], True, 0),
+        (4, [9000, 4100, 12000], False, 0),
+        (4, [8000], True, 0),
+        # A layer's view of a shared scale page (TPU_MINIMAX_M3_KV4_SHARED_SCALES).
+        (2, [3000, 9000, 700, 5000], False, 2),
+        (4, [9000, 4100, 12000], False, 4),
     ],
 )
-def test_split_equals_served(dcp, ctx, ties):
+def test_split_equals_served(dcp, ctx, ties, row0):
     rng = np.random.default_rng(dcp * 100 + len(ctx) + 7 * ties)
     g = dcp // 2
     groups = HEADS // g
@@ -86,6 +89,7 @@ def test_split_equals_served(dcp, ctx, ties):
     ik = jnp.asarray(rng.standard_normal((T, D)), jnp.bfloat16)
     for r in range(dcp):
         kv, idx, sc = _caches(rng, num_pages, g, ties)
+        sc = msa_fp4.with_row0(sc, row0)
         served, written = {}, None
         for grp in range(groups):
             out = msa_dcp.msa_write_and_candidates_dcp(

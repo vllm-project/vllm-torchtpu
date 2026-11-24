@@ -60,16 +60,20 @@ def _case(rng, heads, q_lens, starts, pages_total=24):
 
 
 @pytest.mark.parametrize(
-    "heads,q_lens,starts",
+    "heads,q_lens,starts,row0",
     [
-        (1, [8, 8, 8], [3, 120, 64]),  # c48 decode, one run crossing a page
-        (2, [8, 8], [0, 125]),  # c64 (two KV heads per rank)
-        (1, [8] * 9, [8 * i for i in range(9)]),  # 72 tokens
+        (1, [8, 8, 8], [3, 120, 64], 0),  # c48 decode, one run crossing a page
+        (2, [8, 8], [0, 125], 0),  # c64 (two KV heads per rank)
+        (1, [8] * 9, [8 * i for i in range(9)], 0),  # 72 tokens
+        # A layer's rows of a shared scale page (TPU_MINIMAX_M3_KV4_SHARED_SCALES).
+        (1, [8, 8, 8], [3, 120, 64], 2),
+        (2, [8, 8], [0, 125], 4),
     ],
 )
-def test_runs_in_kernel_bitwise(monkeypatch, heads, q_lens, starts):
+def test_runs_in_kernel_bitwise(monkeypatch, heads, q_lens, starts, row0):
     rng = np.random.default_rng(heads * 10 + len(q_lens))
     caches, (k, v, ik), pages, pos = _case(rng, heads, q_lens, starts)
+    caches = (*caches[:2], msa_fp4.with_row0(caches[2], row0))
     monkeypatch.setenv(ENV, "0")
     ref = msa.write_fp4(*caches, k, v, ik, pages, pos, max_num_seqs=len(q_lens) + 1,
                         interpret=True)  # fmt: skip
@@ -77,7 +81,9 @@ def test_runs_in_kernel_bitwise(monkeypatch, heads, q_lens, starts):
     got = msa.write_fp4(*caches, k, v, ik, pages, pos, max_num_seqs=len(q_lens) + 1,
                         interpret=True)  # fmt: skip
     for a, b in zip(ref, got):
+        a, b = msa_fp4.pages_of(a), msa_fp4.pages_of(b)
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    assert msa_fp4.split_scales(got[2])[1] == row0
     assert not np.array_equal(np.asarray(ref[0]), np.asarray(caches[0]))
 
 
