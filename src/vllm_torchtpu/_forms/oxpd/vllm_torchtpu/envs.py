@@ -630,6 +630,8 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_SELECT_OWNED: str = "0"
     VLLM_TPU_MK_QSA_WRITE_ALL: bool = False
     VLLM_TPU_MK_QSA_WRITE_KVAL: bool = False
+    # Megakernel MoE row-bucketing (default off; aligned [8, 128] tile loads)
+    VLLM_TPU_MK_ROW_BUCKET: bool = False
     # q38 PORT-BL GDN (begin)
     VLLM_TPU_GDN_LEAN_GLUE3: bool = False
     VLLM_TPU_GDN_LEAN_GLUE3_COUNT: int = 0
@@ -3618,6 +3620,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whole-step kernel's own QSA cache values (KV_NEW keys, CK_NEW, RING_NEW) instead of recomputing them in XLA.
     # Read when the whole-step call is built (extra kernel outputs, writer operands), so hashed.
     "VLLM_TPU_MK_QSA_WRITE_KVAL": env_bool("VLLM_TPU_MK_QSA_WRITE_KVAL", False),
+    # Whole-step megakernel MoE routed-row bucketing (PIPE_EP, >16 rows): each expert runs
+    # its matmuls on its gathered routed rows via aligned [8, 128] `rbpreT` tile loads.
+    "VLLM_TPU_MK_ROW_BUCKET": env_bool("VLLM_TPU_MK_ROW_BUCKET", False),
     # q38 PORT-BL GDN (begin): Benliang Wang's GDN lean glue (aa8e6b237, VLLM_TPU_GDN_LEAN_GLUE) less its
     # window-log piece ("no_ckpt", which needs VLLM_TPU_GDN_WINDOW_LOG and so refuses D14). On the per-region unified
     # pool, every pooled GDN call with read offsets (speculative decoding) reads the step's stacked slot rows (one

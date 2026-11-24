@@ -125,6 +125,10 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     hier = os.environ.get("VLLM_TPU_MK_HIER", "")
     if hier:
         t = dataclasses.replace(t, hier=int(hier))
+    # VLLM_TPU_MK_ROW_BUCKET: each expert's e13 / e2 on its gathered routed rows (PIPE_EP;
+    # bitwise vs the dense loop, aligned [8, 128] tile loads). No-op up to 16 rows.
+    if envs.VLLM_TPU_MK_ROW_BUCKET:
+        t = t.with_blocks({"moe": {"row_bucket": True}})
     # VLLM_TPU_MK_RINGS=nbe:nbd (bench sweeps): override the ring depths.
     rings = os.environ.get("VLLM_TPU_MK_RINGS", "") or _ring_s1(B)  # q38 L1-IDX RING-S1 (per bucket, S1 on)
     if rings:

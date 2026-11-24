@@ -50,6 +50,7 @@ from .experts import expert, experts_piped, experts_piped_ep
 from .params import MoEDebug, MoEParams, MoETunables, derive_moe_params
 from .reference import moe_reference
 from .routing import route
+from .rowbucket import experts_piped_ep_rb, rb_scratch
 
 
 class MoEBlock(Block):
@@ -245,6 +246,8 @@ class MoEBlock(Block):
         }
         if mp.PIPE_EP:
             scr["acc13"] = pltpu.VMEM((ex.MB, 2 * mp.IR), F32)
+        if mp.RB:
+            scr.update(rb_scratch(ex, mp))
         if mp.ECOPY:
             scr.update(
                 {
@@ -343,6 +346,8 @@ class MoEBlock(Block):
             with sc("moe_experts"):
                 if PIPE:
                     experts_piped(m, l, n_hit)
+                elif PIPE_EP and mp.RB:
+                    experts_piped_ep_rb(m, l, n_hit)
                 elif PIPE_EP:
                     experts_piped_ep(m, l, n_hit)
                 else:
