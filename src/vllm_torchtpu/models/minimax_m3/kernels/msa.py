@@ -120,8 +120,18 @@ def write_caches(
         else t._replace(rows=_cache_rows(t.cache, t.rows))
         for t in targets
     ]
+    from vllm_torchtpu import envs
+
+    in_kernel = (
+        0 < num_tokens <= envs.TPU_MINIMAX_M3_MSA_WRITE_RUNS_IN_KERNEL_MAX_TOKENS
+    )
     return msa_write.write_runs(
-        targets, pages, pos % block_size, max_runs=max_runs, interpret=interpret
+        targets,
+        pages,
+        pos % block_size,
+        max_runs=max_runs,
+        interpret=interpret,
+        runs_in_kernel=in_kernel,
     )
 
 
@@ -521,7 +531,9 @@ def fold_index_heads(
         pad_off = r - num_heads * num_real
         pad_len = jnp.maximum(num_tokens - num_real, 1)
         src_head = jnp.where(pad, pad_off // pad_len, off // r_len)
-        src_tok = jnp.where(pad, num_real + pad_off % pad_len, cu_q_lens[req] + off % r_len)
+        src_tok = jnp.where(
+            pad, num_real + pad_off % pad_len, cu_q_lens[req] + off % r_len
+        )
         folded = index_q.reshape(num_tokens * num_heads, head_dim)[
             src_tok * num_heads + src_head
         ]

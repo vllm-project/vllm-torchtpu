@@ -249,6 +249,47 @@ def _kernel(
     jax.lax.fori_loop(jnp.maximum(num_runs - _DEPTH, 0), num_runs, drain, 0)
 
 
+def _runs_kernel(pages_ref, slots_ref, *refs, num_pages: int, max_runs: int, **kw):
+    """`_kernel` with the token runs (`token_runs`) found in the kernel: a
+    scalar pass over the tokens' ``(page, slot)`` (SMEM) fills the run
+    tables in SMEM scratch, then the run loop reads them. The last five
+    refs are those tables (count, page, first slot, end slot, first token)."""
+    *refs, n_ref, page_ref, lo_ref, hi_ref, tok0_ref = refs
+    num_tokens = pages_ref.shape[0]
+
+    def token(t, carry):
+        n, prev_page, prev_slot, live = carry
+        page, slot = pages_ref[t], slots_ref[t]
+        valid = (page >= 0) & (page < num_pages)
+        start = valid & ((page != prev_page) | (slot != prev_slot + 1))
+        new = start & (n < max_runs)
+        # `live`: the token's run is recorded (runs past `max_runs` are not).
+        live = jnp.where(start, new, live)
+        r = jnp.where(new, n, n - 1)
+
+        @pl.when(new)
+        def _():
+            page_ref[r] = page
+            lo_ref[r] = slot
+            tok0_ref[r] = t
+
+        @pl.when(valid & live)
+        def _():  # one past the run's last token's slot so far
+            hi_ref[r] = slot + 1
+
+        return n + new.astype(jnp.int32), page, slot, live
+
+    n, _, _, _ = jax.lax.fori_loop(
+        0,
+        num_tokens,
+        token,
+        (jnp.int32(0), jnp.int32(-1), jnp.int32(-2), jnp.bool_(False)),
+        unroll=8,  # a decode request's 8 rows per loop step
+    )
+    n_ref[0] = n
+    _kernel(n_ref, page_ref, lo_ref, hi_ref, tok0_ref, *refs, **kw)
+
+
 def _window(page_size: int) -> int:
     """Batch rows a run copies: its page's slots and the alignment slack,
     a multiple of `_ROW_ALIGN` so that a window clamped to the batch's end
@@ -289,9 +330,12 @@ def write_runs(
     *,
     max_runs: int,
     interpret: bool = False,
+    runs_in_kernel: bool = False,
 ) -> list[jax.Array]:
     """Write token ``t``'s rows / values of every target at ``(pages[t],
     slots[t])`` of its cache; returns the caches in `targets` order.
+    `runs_in_kernel`: the kernel finds the token runs itself (`_runs_kernel`)
+    instead of XLA (`token_runs`); the same writes.
 
     The caches share the page geometry (same pages, slots per page). Tokens
     with a page outside the caches are dropped. Consecutive tokens of a run
@@ -306,9 +350,10 @@ def write_runs(
     num_pages = targets[0].cache.shape[0]
     if any(t.cache.shape[0] != num_pages for t in targets):
         raise ValueError("write_runs targets must share their pages")
-    num_runs, run_page, run_lo, run_hi, run_tok0 = token_runs(
-        pages, slots, num_pages, max_runs
-    )
+    if not runs_in_kernel:
+        num_runs, run_page, run_lo, run_hi, run_tok0 = token_runs(
+            pages, slots, num_pages, max_runs
+        )
     words, specs, scale_lanes = [], [], []
     lane_values = None
     page_size = None
@@ -371,17 +416,25 @@ def write_runs(
     vmem_bytes += _DEPTH * buffer_rows * _LANES * 4 * has_lanes
     vmem_bytes += 2 * sum(_DEPTH * c[0].size * c.dtype.itemsize for c in caches)
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
-    first_cache = 5 + len(inputs)
+    kernel_kw = dict(
+        specs=tuple(specs), page_size=page_size, num_tokens=padded, has_lanes=has_lanes
+    )
+    if runs_in_kernel:
+        kernel = functools.partial(
+            _runs_kernel, num_pages=num_pages, max_runs=max_runs, **kernel_kw
+        )
+        scalars = (pages.astype(jnp.int32), slots.astype(jnp.int32))
+        scratch += [pltpu.SMEM((1,), jnp.int32)] + [
+            pltpu.SMEM((max_runs,), jnp.int32) for _ in range(4)
+        ]
+    else:
+        kernel = functools.partial(_kernel, **kernel_kw)
+        scalars = (num_runs[None], run_page, run_lo, run_hi, run_tok0)
+    first_cache = len(scalars) + len(inputs)
     return tight_vmem.pallas_call(
-        functools.partial(
-            _kernel,
-            specs=tuple(specs),
-            page_size=page_size,
-            num_tokens=padded,
-            has_lanes=has_lanes,
-        ),
+        kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=5,
+            num_scalar_prefetch=len(scalars),
             grid=(1,),
             in_specs=[any_spec] * (len(inputs) + len(caches)),
             out_specs=[any_spec] * len(caches),
@@ -395,7 +448,7 @@ def write_runs(
         ),
         interpret=interpret,
         name="minimax_m3_msa_write_runs",
-    )(num_runs[None], run_page, run_lo, run_hi, run_tok0, *inputs, *caches)
+    )(*scalars, *inputs, *caches)
 
 
 def token_runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int):

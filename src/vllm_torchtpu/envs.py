@@ -284,6 +284,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_MSA_WRITE_RUNS_IN_KERNEL_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
     TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT: bool = False
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
@@ -1855,6 +1856,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 (default) keeps the unfused program.
     "TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS", 0
+    ),
+    # MiniMax M3 MSA cache writes of at most this many tokens find their token
+    # runs inside the write kernel (a scalar pass over the tokens' pages and
+    # slots, `kernels.msa_write._runs_kernel`) instead of XLA's compare /
+    # cumsum / gather glue (`token_runs`); the same cache bytes. 0 (default) =
+    # off.
+    "TPU_MINIMAX_M3_MSA_WRITE_RUNS_IN_KERNEL_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_MSA_WRITE_RUNS_IN_KERNEL_MAX_TOKENS", 0
     ),
     # MiniMax M3 4-bit MSA prefill attention with a page cache:
     # "<threshold>:<block_q>:<tile_pages>" runs a call whose selections hold
