@@ -342,8 +342,9 @@ def _chunk_maxima_t(
             pair.append(_transposed_keys(buf, p, live, dtype, folded, side == 1))
             if folded:
                 s = pltpu.bitcast(buf[p, rows - 1 :], jnp.float32)  # [1, S]
-                # Stale VMEM past the request's end, unwritten slots: scale 0.
-                scale_rows[side].append(jnp.where(jnp.isfinite(s) & (p < live), s, 0.0))
+                # Unwritten slots: scale 0. A page past the request's end
+                # scales only its own column, which callers mask.
+                scale_rows[side].append(jnp.where(jnp.isfinite(s), s, 0.0))
         keys.append(jnp.concatenate(pair, axis=1))
     page_size = keys[0].shape[0]
     s = jax.lax.dot_general(
@@ -352,12 +353,19 @@ def _chunk_maxima_t(
         (((1,), (1,)), ((), ())),
         preferred_element_type=jnp.float32,
     )  # [2 Bq, half * S]
-    if folded:
-        left, right = (jnp.concatenate(r, axis=1) for r in scale_rows)
-        row = jax.lax.broadcasted_iota(jnp.int32, s.shape, 0)
-        s = s * jnp.where(row < block_q, left, right)
-    m = jnp.max(s.reshape(2 * block_q, half, page_size), axis=2)  # [2 Bq, half]
-    return jnp.concatenate([m[:block_q], m[block_q:]], axis=1)
+    # Each page's maxima land in their lane by a select: reshaping the
+    # [2 Bq, half * S] scores for one max took ~6 relayout ops per page (AOT).
+    lane = jax.lax.broadcasted_iota(jnp.int32, (block_q, chunk), 1)
+    m = jnp.zeros((block_q, chunk), jnp.float32)
+    for side in range(2):
+        side_scores = s[side * block_q : (side + 1) * block_q]
+        for j in range(half):
+            page = side_scores[:, j * page_size : (j + 1) * page_size]
+            if folded:
+                page = page * scale_rows[side][j]
+            mj = jnp.max(page, axis=1, keepdims=True)
+            m = jnp.where(lane == side * half + j, mj, m)
+    return m
 
 
 def _v3_chunk(pages_per_step: int, block_q: int, page_size: int) -> int:
