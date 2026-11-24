@@ -443,7 +443,9 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
     return factors
 
 
-def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
+def compute_tpu_compilation_hash(
+    vllm_config: VllmConfig, *, include_kv: bool = True
+) -> str:
     """Hash TPU-specific factors used by both AOT and piecewise caches."""
     # Deferred: tpu_info imports Pallas, which this module otherwise avoids.
     from vllm_torchtpu.tpu_info import get_libtpu_cache_key
@@ -451,7 +453,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     cache_config = vllm_config.cache_config
     scheduler_config = vllm_config.scheduler_config
     spec = vllm_config.speculative_config
-    factors = {
+    factors: dict[str, Any] = {
         "torch": torch.__version__,
         "torch_tpu": importlib_metadata.version("torch-tpu"),
         "jax": importlib_metadata.version("jax"),
@@ -463,16 +465,6 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             "effective_data_parallel_size": utils.get_dp_size(
                 vllm_config.parallel_config
             ),
-        },
-        # TPU AOT graphs embed the KV tensor extent as a literal. Hash the
-        # resolved block count, which every rank shares via kv_cache_config.
-        # The raw per-worker num_gpu_blocks_override is a pre-alignment HBM
-        # measurement that diverges by a few blocks across ranks (the executor
-        # aligns the value actually used to min()); hashing it would split
-        # ranks into separate cache dirs and force asymmetric recompiles.
-        "kv_cache": {
-            "gpu_memory_utilization": cache_config.gpu_memory_utilization,
-            "num_gpu_blocks": cache_config.num_gpu_blocks,
         },
         # The GDN op traces with prefill checkpoint operands or with constant
         # None inputs depending on this gate. Its inputs (prefix_match_unit,
@@ -495,6 +487,17 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             else None,
         },
     }
+    if include_kv:
+        # TPU AOT graphs embed the KV tensor extent as a literal. Hash the
+        # resolved block count, which every rank shares via kv_cache_config.
+        # The raw per-worker num_gpu_blocks_override is a pre-alignment HBM
+        # measurement that diverges by a few blocks across ranks (the executor
+        # aligns the value actually used to min()); hashing it would split
+        # ranks into separate cache dirs and force asymmetric recompiles.
+        factors["kv_cache"] = {
+            "gpu_memory_utilization": cache_config.gpu_memory_utilization,
+            "num_gpu_blocks": cache_config.num_gpu_blocks,
+        }
 
     repo_root = Path(__file__).resolve().parents[2]
     hash_obj = hashlib.sha256(
@@ -1096,3 +1099,79 @@ class TpuCompilerAdaptor(CompilerInterface):
         if size is not None:
             shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
         return compiled_fn
+
+    def compile_keyed(
+        self,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        key: str,
+    ) -> Callable[..., Any]:
+        """Compile or replay a graph keyed by `key` (without shape_variants)."""
+        graph = copy.deepcopy(graph)
+        graph, was_wrapped = _ensure_tuple_output(graph)
+        path = (
+            os.path.join(self.cache_dir, key)
+            if self.cache_dir is not None and not self._disable_cache
+            else None
+        )
+
+        compiled_fn: Callable[..., Any] | None = None
+        if path is not None and os.path.exists(path):
+            logger.info("[TpuCompilerAdaptor] Loading compiled artifact from %s", path)
+            compiled_fn = self._replay(path, graph, was_wrapped)
+
+        fingerprint = (
+            _graph_fingerprint(graph)
+            if compiled_fn is None
+            and path is not None
+            and envs.TPU_PRECOMPILE_PEER_REPLAY
+            else None
+        )
+        if compiled_fn is None and fingerprint is not None:
+            assert path is not None
+            peer = self._replay_from_peer(key, graph, was_wrapped, fingerprint)
+            if peer is not None:
+                compiled_fn, peer_path = peer
+                logger.info("[TpuCompilerAdaptor] Replayed %s from %s", key, peer_path)
+                self._link_artifact(peer_path, path)
+
+        if compiled_fn is None:
+            compiled_fn, entry = self._run_backend(graph, example_inputs)
+            if path is not None:
+                self._save_handle(key, path, entry, graph, was_wrapped, fingerprint)
+
+        if was_wrapped:
+            compiled_fn = self._unwrap_compiled_fn(compiled_fn)
+        return compiled_fn
+
+
+def tpu_compilation_cache_subdir(
+    vllm_config: VllmConfig,
+    kind: str,
+    *,
+    base_cache_dir: str | None = None,
+    include_kv: bool = True,
+) -> str:
+    """Return `<base>/<kind>/<10-char digest>` for profile or helper cache."""
+    import vllm.envs as vllm_envs
+    from vllm.compilation.caching import aot_compile_hash_factors
+
+    base_dir = (
+        base_cache_dir
+        if base_cache_dir is not None
+        else (vllm_config.compilation_config.cache_dir or vllm_envs.VLLM_CACHE_ROOT)
+    )
+    if include_kv:
+        factors: list[Any] = [
+            *aot_compile_hash_factors(vllm_config),
+            compute_tpu_compilation_hash(vllm_config, include_kv=True),
+        ]
+    else:
+        factors = [
+            vllm_config.model_config.compute_hash(),
+            vllm_config.parallel_config.compute_hash(),
+            vllm_config.compilation_config.compute_hash(),
+            compute_tpu_compilation_hash(vllm_config, include_kv=False),
+        ]
+    digest = hashlib.sha256(str(factors).encode()).hexdigest()[:10]
+    return os.path.join(base_dir, kind, digest)

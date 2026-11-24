@@ -264,6 +264,43 @@ else
 fi
 
 echo "================================================================="
+echo "=== 🧩 [Test 6] Helper Compile Cache (Cold vs Warm)"
+echo "================================================================="
+HELPER_CACHE_DIR="${CACHE_DIR}/helper_cache_e2e"
+mkdir -p "${HELPER_CACHE_DIR}/vllm" "${HELPER_CACHE_DIR}/tier3"
+
+clean_tpu_processes
+VLLM_DISABLE_COMPILE_CACHE=0 \
+VLLM_CACHE_ROOT="${HELPER_CACHE_DIR}/vllm" \
+TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="${HELPER_CACHE_DIR}/tier3" \
+python3 examples/offline_inference.py --model "${MODEL}" \
+  --max-model-len 256 --max-num-batched-tokens 256 --max-tokens 8 \
+  --additional-config '{"helper_compile_cache": true}' \
+  --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/helper_cold.log"
+
+sync && sleep 5
+if ! find "${HELPER_CACHE_DIR}/vllm/tpu_helper_cache" -type f -name "helper_*" | grep -q .; then
+  echo "❌ [Test 6 FAILED] Cold helper run did not populate tpu_helper_cache!"
+  exit 1
+fi
+
+clean_tpu_processes
+VLLM_DISABLE_COMPILE_CACHE=0 \
+VLLM_CACHE_ROOT="${HELPER_CACHE_DIR}/vllm" \
+TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="${HELPER_CACHE_DIR}/tier3" \
+python3 examples/offline_inference.py --model "${MODEL}" \
+  --max-model-len 256 --max-num-batched-tokens 256 --max-tokens 8 \
+  --additional-config '{"helper_compile_cache": true}' \
+  --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/helper_warm.log"
+
+if grep -q "tpu_helper_cache" "${CACHE_DIR}/helper_warm.log"; then
+  echo "✅ [Test 6 PASSED] Warm helper run replayed artifacts from tpu_helper_cache!"
+else
+  echo "❌ [Test 6 FAILED] Warm helper run did not load from tpu_helper_cache!"
+  exit 1
+fi
+
+echo "================================================================="
 echo "🎉 Compilation Cache E2E Test Suite Completed!"
 echo "Logs saved in: ${CACHE_DIR}"
 echo "================================================================="
