@@ -166,7 +166,7 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
         } <= hashed
 
-    def test_serving_only_kv_knobs_stay_out_of_the_compile_cache_key(self):
+    def test_serving_only_knobs_stay_out_of_the_compile_cache_key(self):
         """Serving-time knobs must stay out of the compile-cache key.
 
         Every `envs.py` entry not in `_TPU_COMPILE_ENV_IGNORED` is hashed, so
@@ -216,6 +216,17 @@ class TestTpuCompilerCache:
             "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
             "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
             "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+            "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
+            "VLLM_TPU_SEGMENT_TOKENIZE",
+            "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS",
+            "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS",
+            "VLLM_TPU_DP_PROMPT_BACKLOG",
+            "VLLM_TPU_DP_PROMPT_BACKLOG_MARGIN",
+            "VLLM_TPU_DP_PREFIX_AFFINITY",
+            "VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS",
+            "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN",
+            "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE",
+            "VLLM_TPU_DETOK_PRIME_SUFFIX",
         }
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED

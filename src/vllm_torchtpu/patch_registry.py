@@ -120,6 +120,11 @@ PATCHES = (
     # The serving gc policy also owns the engine core's heap (gc_policy.py);
     # the runner arms its own at the end of warmup.
     Patch("vllm_torchtpu.gc_policy:install_engine_core", ("engine_core",)),
+    # Engine-core prefix-cache block hashes over token bytes.
+    Patch(
+        "vllm_torchtpu.core.block_hash_bytes:install_byte_block_hasher",
+        ("engine_core",),
+    ),
     # Platform runtime configuration.
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE
@@ -129,6 +134,19 @@ PATCHES = (
         "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint",
         _ACTIVE,
     ),
+    # Prompt ids as 1 packed array across the engine hand-off, encoded in the
+    # API server and decoded in the engine core (VLLM_TPU_PACKED_PROMPT_IDS).
+    Patch("vllm_torchtpu.core.packed_prompt_ids:install", _ENGINE),
+    # API-server prompt tokenization (VLLM_TPU_SEGMENT_TOKENIZE).
+    Patch("vllm_torchtpu.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE),
+    # API-server first-token detokenization (VLLM_TPU_DETOK_PRIME_SUFFIX).
+    Patch("vllm_torchtpu.detok_prime_suffix:patch_detokenizer_prime_suffix", _ACTIVE),
+    # Data-parallel engine choice (VLLM_TPU_DP_PROMPT_BACKLOG): the engine
+    # core publishes pending prompt tokens, the API server's client routes.
+    Patch("vllm_torchtpu.core.dp_prompt_backlog:install_if_enabled", _ENGINE),
+    # After the backlog choice, which it wraps and falls back to
+    # (VLLM_TPU_DP_PREFIX_AFFINITY); the API server's client routes.
+    Patch("vllm_torchtpu.core.dp_prefix_affinity:install_if_enabled", _ACTIVE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.

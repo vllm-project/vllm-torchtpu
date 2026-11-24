@@ -1399,6 +1399,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TABLE_KERNEL", True)
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES", True)
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_V2_PLAN_KERNEL", True)
     bridge._build_op(None, 2, True, "silu", None, False)
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     operands = (
@@ -1429,6 +1430,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
         assert forwarded["table_kernel"] is True
         assert forwarded["exchange_tables"] is True
         assert forwarded["kernel_plan_tables"] is True
+        assert "plan_kernel" not in forwarded
     else:
         push_kernel.assert_not_called()
         forwarded = v2_kernel.call_args.kwargs
@@ -1450,6 +1452,13 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
             "kernel_plan_tables",
         ):
             assert knob not in forwarded
+        assert forwarded["plan_kernel"] is True
+
+
+def test_plan_kernel_switch_is_copied_to_ray_workers():
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    assert "MOE_FUSED_EP_V2_PLAN_KERNEL" in TpuPlatform.additional_env_vars
 
 
 def test_shared_expert_operands_reach_the_push_layer(monkeypatch):
@@ -1557,3 +1566,32 @@ def test_runner_refuses_a_shared_expert_the_op_was_not_built_for():
         VllmMoERunner._apply_quant_method(
             runner, hidden, torch.zeros(2, 3), hidden.clone()
         )
+
+
+def test_op_sees_padded_rows_routed_nowhere_and_real_rows_unchanged():
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    seen = []
+    owner = SimpleNamespace()
+
+    def op(*args):
+        seen.append(args)
+        return args[0]
+
+    setattr(owner, bridge.FUSED_MOE_EP_OP_ATTR, op)
+    hidden = torch.zeros(4, 8)
+    weights = torch.empty(0)
+    scales = torch.ones(1, 1)
+    logits = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    state = token_padding.TokenPaddingState(
+        local_padding_mask=torch.zeros(4, dtype=torch.bool)
+    )
+    token_padding.set_padding_state(state)
+    try:
+        state.update(2, 4)
+        bridge.fused_moe_ep(owner, hidden, weights, weights, scales, scales, logits)
+    finally:
+        token_padding.set_padding_state(None)
+    routed = seen[0][5]
+    assert torch.equal(routed[:2], logits[:2])
+    assert torch.isneginf(routed[2:]).all()
