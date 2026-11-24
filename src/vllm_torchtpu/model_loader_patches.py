@@ -23,8 +23,9 @@ serving from object storage:
   MoE checkpoint at 8 ranks/host this exceeds host RAM long before the
   load finishes (Ray OOM kill at 95% of a 944 GB host).
 - Compressed-tensors MXFP4 checkpoints name their expert weights
-  ``.weight_packed`` / ``.weight_scale``, which the upstream filter never
-  matches.
+  ``.weight_packed`` / ``.weight_scale``, and FP8 block-quantized
+  checkpoints store each expert's block scale as ``.weight_scale_inv``;
+  the upstream filter matches none of these.
 
 The Run:AI patch below teaches the Run:AI path to build its fetch plan from
 the safetensors headers and REQUEST ONLY the byte ranges of tensors this
@@ -34,9 +35,11 @@ experts. Skipped tensors are never fetched from storage at all.
 The DefaultModelLoader patch below fixes the matching gap in vLLM 0.27.0's
 local-files path: ``should_skip_weight`` only matches names ending in
 ``.weight``, so for an MXFP4 checkpoint it keeps every expert's
-``.weight_packed`` and ``.weight_scale`` and the filter is a no-op for all
+``.weight_packed`` and ``.weight_scale`` (and an FP8 checkpoint keeps every
+expert's ``.weight_scale_inv``), so the filter is a no-op for those
 per-expert tensors. The patch replaces the predicate with one whose suffix
-allowlist also covers ``.weight_packed`` and ``.weight_scale``.
+allowlist also covers ``.weight_packed``, ``.weight_scale`` and
+``.weight_scale_inv``.
 
 Divergence from upstream noted: upstream deliberately keeps every expert's
 scale tensors because some GPU backends reduce a global activation-scale
@@ -69,8 +72,15 @@ logger = init_logger(__name__)
 # Suffixes of per-expert tensors that are safe to skip for non-local
 # experts. Anything else (dense, shared experts, gate, norms) is fetched by
 # every rank. ``.scale`` is DeepSeek-V4's per-expert block scale
-# (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts.
-_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
+# (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts;
+# ``.weight_scale_inv`` is the FP8 block scale of DeepSeek-style FP8 checkpoints.
+_EXPERT_WEIGHT_SUFFIXES = (
+    ".weight",
+    ".weight_packed",
+    ".weight_scale",
+    ".weight_scale_inv",
+    ".scale",
+)
 
 # Set to ``source.is_unused_weight`` while ``DefaultModelLoader._get_weights_iterator``
 # runs, so ``_should_skip_weight_tpu`` skips those tensors before ``get_tensor``.
@@ -104,9 +114,10 @@ def _should_skip_weight_tpu(
 
     Same contract as upstream (``local_expert_ids=None`` means no
     filtering), but the suffix allowlist also covers the compressed-tensors
-    MXFP4 ``.weight_packed`` and ``.weight_scale`` names, so non-local
-    experts are skipped before their bytes are read. Also skips weights
-    marked unused by the loading model's ``is_unused_checkpoint_weight``.
+    MXFP4 ``.weight_packed`` and ``.weight_scale`` names and FP8 block-scale
+    ``.weight_scale_inv`` names, so non-local experts are skipped before
+    their bytes are read. Also skips weights marked unused by the loading
+    model's ``is_unused_checkpoint_weight``.
     """
     if _unused_weight_predicate is not None and _unused_weight_predicate(weight_name):
         # Unused by the loading model (e.g. MTP draft). Used tensors still
@@ -517,12 +528,14 @@ def patch_runai_sharded_expert_streaming() -> None:
 
 
 def patch_default_loader_ep_weight_filter() -> None:
-    """Widen ``DefaultModelLoader``'s EP weight filter to MXFP4 names.
+    """Widen ``DefaultModelLoader``'s EP weight filter to MXFP4/FP8 names.
 
     vLLM 0.27.0's ``should_skip_weight`` only skips names ending in
     ``.weight``; a compressed-tensors MXFP4 checkpoint stores per-expert
-    tensors as ``.weight_packed``/``.weight_scale``, so the stock filter
-    reads all 896 experts on every rank. ``weight_utils`` imports the
+    tensors as ``.weight_packed``/``.weight_scale`` and an FP8
+    block-quantized checkpoint stores per-expert block scales as
+    ``.weight_scale_inv``, so the stock filter reads all experts' copies of
+    them on every rank. ``weight_utils`` imports the
     predicate by value, so both module references are replaced. Inert when
     the EP weight filter is off: ``safetensors_weights_iterator`` then
     passes ``local_expert_ids=None`` and the predicate keeps everything.
@@ -614,9 +627,9 @@ def patch_default_loader_ep_weight_filter() -> None:
     weight_utils._tpu_ep_filter_patch = True
     logger.info(
         "Applied TPU patch: EP weight filter covers "
-        ".weight_packed/.weight_scale/.scale, skips unused checkpoint "
-        "tensors before read, and prefetch reads only "
-        "local tensors (DefaultModelLoader)."
+        ".weight_packed/.weight_scale/.weight_scale_inv/.scale, skips unused "
+        "checkpoint tensors before read, and prefetch reads only local "
+        "tensors (DefaultModelLoader)."
     )
 
 
