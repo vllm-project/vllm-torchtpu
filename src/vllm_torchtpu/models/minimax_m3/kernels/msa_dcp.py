@@ -60,6 +60,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_select,
     msa_write,
 )
+from vllm_torchtpu.models.minimax_m3.kernels import page_table as page_table_lib
 
 _NEG_INF = float("-inf")
 # The narrowest column count `local_candidates` scans (a vreg's lanes), and
@@ -1196,7 +1197,8 @@ def _attend_selected(
             common["page_cache_bf16"] = msa_attention_lse.PREFILL_PAGE_CACHE_BF16
         elif _fp8_opt():
             common["prefill_precision"] = _fp8_opt()
-    args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
+    table = page_table_lib.prefetch(block_tables, kv_cache.shape[0])
+    args = (local_key, pos % block_size + 1, table)
     tiers = (
         msa_attention_lse.adaptive_tiers()
         if scale_cache is not None
