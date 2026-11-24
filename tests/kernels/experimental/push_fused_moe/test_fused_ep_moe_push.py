@@ -596,16 +596,23 @@ def test_served_dims_drop_repeated_tail_is_bit_exact(shape, hash_routed):
     assert int(np.asarray(load_kept).sum()) == routed_rows * topk
 
 
+# g25 at 512 rows: the combine kernel over eight 64-row steps, so runs cross
+# step boundaries (g25's 288 rows also take the kernel, g9's 240 do not).
+RUN_SHAPES = {**SERVED_SHAPES, "g25t512": (25, 512, 6)}
+
+
+@pytest.mark.parametrize("fused_runs", [False, True], ids=["xla_runs", "fused_runs"])
 @pytest.mark.parametrize("hash_routed", [False, True], ids=["scored", "hashed"])
-@pytest.mark.parametrize("shape", sorted(SERVED_SHAPES))
-def test_served_dims_drop_repeated_runs_is_bit_exact(shape, hash_routed):
+@pytest.mark.parametrize("shape", sorted(RUN_SHAPES))
+def test_served_dims_drop_repeated_runs_is_bit_exact(shape, hash_routed, fused_runs):
     """Rows repeating the row before them take their run's first result: the
     layer's output is the one without the switch bit for bit, on shards with
     no runs, one run, a run ending before the tail, and runs that break on
     the gating alone, scored and hash-routed, with replicated experts whose
     copy a row picks by its own index; the load accumulator counts one
-    routed row per run."""
-    g_local, rows, topk = SERVED_SHAPES[shape]
+    routed row per run. `fused_runs` has the combine kernel zero unrouted rows
+    and copy each run's result onto its repeats (where the kernel applies)."""
+    g_local, rows, topk = RUN_SHAPES[shape]
     mesh = _mesh()
     e_total = EP * g_local
     # The first EP experts have a second copy in the last EP slots.
@@ -675,6 +682,7 @@ def test_served_dims_drop_repeated_runs_is_bit_exact(shape, hash_routed):
         gating,
         expert_load=jax.device_put(zeros, replicated),
         drop_repeated_runs=True,
+        fused_runs=fused_runs,
         **common,
     )
     np.testing.assert_array_equal(np.asarray(got), want)

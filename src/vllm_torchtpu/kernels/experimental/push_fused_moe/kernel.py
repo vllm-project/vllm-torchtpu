@@ -1872,9 +1872,18 @@ def build_push_moe_kernel(**kwargs):
 
 
 def _build_combine_fs_kernel(
-    *, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype
+    *, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype, run_rows=False
 ):
     """out[i] = sum_k scales[scl[i, k]] * w[i, k] * arrivals[pos[i, k]].
+
+    With `run_rows`, two more scalar-prefetch tables, src [t] (the first row
+    of each row's run, rows in order) and live [t]: out[i] = live[i] ? sum : 0,
+    except that a repeat (src[i] != i) takes out[i - 1], hence its run's first
+    row, so no XLA select or gather over [t, hidden] follows. src[0] must be 0:
+    the carried row is read only after row 0 writes it. A repeat still
+    fetches and sums its own (unread) arrival rows: fetching the run start's
+    instead points thousands of DMAs at the same rows, and those serialize
+    (2048-row padded shard: 75 -> 195 us).
 
     v2's combine kernel with the arrival-scale lookup folded in: `scl` (the
     clamped mirror element), the router weight `w` and the flattened arrival
@@ -1895,19 +1904,12 @@ def _build_combine_fs_kernel(
     groups = tb // gt
     lanes = HIDDEN_LANE_BLOCK
 
-    def kernel(
-        pos_sm,
-        scl_sm,
-        tw_sm,
-        scales_sm,
-        arr_hbm,
-        out_hbm,
-        rows_vm,
-        tile_vm,
-        out_vm,
-        row_sems,
-        out_sems,
-    ):
+    def kernel(pos_sm, scl_sm, tw_sm, scales_sm, *refs):
+        src_sm, live_sm = refs[:2] if run_rows else (None, None)
+        refs = refs[2:] if run_rows else refs
+        arr_hbm, out_hbm, rows_vm, tile_vm, out_vm, row_sems, out_sems, *last = refs
+        last_vm = last[0] if run_rows else None
+
         def start_row(base, parity, i, k):
             # Alternate queues by slot: this kernel is one 4 KiB descriptor per
             # arrival row and an in-order queue retires descriptors at a fixed
@@ -1923,12 +1925,20 @@ def _build_combine_fs_kernel(
         def reduce_token(base, parity, i):
             """One token's weighted sum, in the arrival rows' own layout."""
             acc = None
+            row = base + i
             for k in range(topk):
-                idx = (base + i) * topk + k
+                idx = row * topk + k
                 c_val = scales_sm[scl_sm[idx]] * tw_sm[idx]
                 term = rows_vm[parity, k * tb + i].astype(jnp.float32) * c_val
                 acc = term if acc is None else acc + term
-            tile_vm[i] = cast(jax.Array, acc).astype(out_dtype)
+            out = cast(jax.Array, acc)
+            if src_sm is not None and live_sm is not None and last_vm is not None:
+                # Selects, not products: the unwritten rows may hold NaN.
+                out = jnp.where(live_sm[row] != 0, out, jnp.zeros_like(out))
+                out = out.astype(out_dtype)
+                out = jnp.where(src_sm[row] != row, last_vm[...], out)
+                last_vm[...] = out
+            tile_vm[i] = out.astype(out_dtype)
 
         def one_step(step, parity):
             # The step's rows were started a step ago; the next step's are
@@ -1987,7 +1997,7 @@ def _build_combine_fs_kernel(
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=4,
+            num_scalar_prefetch=6 if run_rows else 4,
             in_specs=[hbm],
             out_specs=hbm,
             scratch_shapes=(
@@ -1998,23 +2008,31 @@ def _build_combine_fs_kernel(
                 pltpu.VMEM((COMBINE_PARITIES, tb, hidden), out_dtype),
                 pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
                 pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
-            ),
+            )
+            # The previous output row, which a repeat takes.
+            + ((pltpu.VMEM((lane_blocks, lanes), out_dtype),) if run_rows else ()),
             grid=(),
         ),
         out_shape=jax.ShapeDtypeStruct((t_local, hidden), out_dtype),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=host.vmem_limit(), disable_bounds_checks=True
         ),
-        name=f"moe_v2_combine_t{t_local}_k{topk}_b{tb}_p{COMBINE_PARITIES}_fs",
+        name=(
+            f"moe_v2_combine_t{t_local}_k{topk}_b{tb}_p{COMBINE_PARITIES}_fs"
+            + ("_runs" if run_rows else "")
+        ),
     )
 
-    def fn(arrivals, arrival_scales, scl, topk_weights, pos):
-        # Every table flattens TOKEN-major, like v2's combine.
+    def fn(arrivals, arrival_scales, scl, topk_weights, pos, runs=()):
+        # Every table flattens TOKEN-major, like v2's combine. `runs` is
+        # (src, live) with `run_rows`.
+        assert len(runs) == (2 if run_rows else 0)
         return call(
             pos.astype(jnp.int32).reshape(-1),
             scl.astype(jnp.int32).reshape(-1),
             topk_weights.astype(jnp.float32).reshape(-1),
             arrival_scales.astype(jnp.float32).reshape(-1),
+            *(r.astype(jnp.int32).reshape(-1) for r in runs),
             arrivals,
         )
 

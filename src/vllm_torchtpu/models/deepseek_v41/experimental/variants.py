@@ -78,5 +78,13 @@ EXPERIMENTAL_VARIANTS: dict[str, dict[str, Variant]] = {
             eligible=_fused_ep_with_ep,
             description="runs of repeated padding rows skip the experts",
         ),
+        # The repeated runs as above, with the combine kernel zeroing unrouted
+        # rows and copying each run's first result onto its repeats: no XLA
+        # select or gather over the [rows, hidden] output. Bit-exact.
+        "push_fused_ep_fused_runs": Variant(
+            params={**_PUSH_LANDING, "drop_repeated_runs": True, "fused_runs": True},
+            eligible=_fused_ep_with_ep,
+            description="repeat copy and unrouted zeroing in the combine kernel",
+        ),
     },
 }

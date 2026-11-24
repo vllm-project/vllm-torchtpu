@@ -141,15 +141,21 @@ def _pack_routing_exchange(pairs, scale_bits, counts, layout):
 
 
 def _combine_arrivals_fs(
-    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype, runs=None
 ):
     """v2's `_combine_arrivals`, with the arrival-scale lookup done inside the
     combine kernel (see kernel._build_combine_fs_kernel) where that kernel
-    applies; v2's XLA epilogue everywhere else."""
+    applies; v2's XLA epilogue everywhere else.
+
+    `runs` = (run_start [t], row_routes [t, 1]) folds the zeroing of rows that
+    routed nowhere and the copy of each run's first row onto its repeats into
+    the kernel; only where the kernel applies (`combine_step_tokens`)."""
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
     if not combine_step_tokens(t_local):
+        if runs is not None:
+            raise ValueError(f"runs need the combine kernel; t_local={t_local}")
         return _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
         )
@@ -164,8 +170,9 @@ def _combine_arrivals_fs(
         lane_blocks=lane_blocks,
         wire_dtype=arrivals.dtype,
         out_dtype=out_dtype,
+        run_rows=runs is not None,
     )
-    return combine(arrivals, arrival_scales, scl, topk_weights, rows)
+    return combine(arrivals, arrival_scales, scl, topk_weights, rows, runs or ())
 
 
 def _to_slots(topk_idx, expert_slot, row_base, *, onehot=False):
@@ -324,6 +331,7 @@ def fused_ep_moe_push(
     early_scale_scatter=0,
     drop_repeated_tail=False,
     drop_repeated_runs=False,
+    fused_runs=False,
     expert_slot=None,
     expert_load=None,
     shared_expert=None,
@@ -377,8 +385,12 @@ def fused_ep_moe_push(
     dropped rows are left out of `expert_load`. `drop_repeated_runs` does
     the same for every run of rows that repeat the row before them, not
     only the trailing one, so padding rows that differ from the last row
-    but come in runs still cost one row per run. The
-    caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
+    but come in runs still cost one row per run. `fused_runs` (with
+    `drop_repeated_runs`) has the combine kernel zero unrouted rows and copy
+    each run's first result onto its repeats itself
+    (kernel._build_combine_fs_kernel `run_rows`), instead of an XLA select
+    and gather over [rows, hidden] after it; the same values, bit for bit.
+    The caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -419,6 +431,8 @@ def fused_ep_moe_push(
         raise ValueError("both weight scales are supplied together or neither is")
     if drop_repeated_tail and drop_repeated_runs:
         raise ValueError("drop_repeated_runs covers drop_repeated_tail; set one")
+    if fused_runs and not drop_repeated_runs:
+        raise ValueError("fused_runs needs drop_repeated_runs")
     T, hidden = x.shape
     e_total = w1.shape[0]
     has_expert_slot = expert_slot is not None
@@ -1019,18 +1033,31 @@ def fused_ep_moe_push(
                 (me * t_local, 0),
                 (t_local, topk),
             )
-        combined = _combine_arrivals_fs(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+        # With fused_runs the kernel zeroes unrouted rows and copies each run's
+        # first result onto its repeats; below the combine kernel's token
+        # minimum the XLA select and gather stay.
+        fold_runs = (
+            run_start is not None and fused_runs and bool(combine_step_tokens(t_local))
         )
-        # A row that routed nowhere read arrival rows nobody wrote; its weight is
-        # zero, but zero times an unwritten NaN is not.
-        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        combined = _combine_arrivals_fs(
+            arrivals,
+            arrival_scales,
+            pos,
+            mirror_pos,
+            topk_weights,
+            out_dtype,
+            runs=(run_start, row_routes) if fold_runs else None,
+        )
+        if not fold_runs:
+            # A row that routed nowhere read arrival rows nobody wrote; its
+            # weight is zero, but zero times an unwritten NaN is not.
+            combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         if tail_start is not None:
             # The dropped repeats of the tail's first row take its result.
             first = lax.dynamic_slice_in_dim(combined, tail_start, 1, axis=0)
             rows = lax.broadcasted_iota(jnp.int32, (t_local, 1), 0)
             combined = jnp.where(rows > tail_start, first, combined)
-        if run_start is not None:
+        if run_start is not None and not fold_runs:
             # The dropped repeats of each run take its first row's result.
             combined = jnp.take(combined, run_start, axis=0, mode="clip")
         out = token_layout.restore(combined, ax)
@@ -1232,6 +1259,7 @@ def fused_ep_moe_push(
         int(early_scale_scatter),
         bool(drop_repeated_tail),
         bool(drop_repeated_runs),
+        bool(fused_runs),
     )
     out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
     out_specs = out_specs if len(out_specs) > 1 else out_specs[0]
