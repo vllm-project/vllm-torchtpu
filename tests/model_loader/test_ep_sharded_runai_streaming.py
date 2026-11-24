@@ -41,6 +41,7 @@ def test_local_expert_ids_use_loader_ownership_mapping():
     """Run:AI filtering must honor hierarchical EP's loader patch."""
     model_config = SimpleNamespace(
         is_moe=True,
+        runner_type="generate",
         get_num_experts=lambda: 896,
     )
     parallel_config = SimpleNamespace(

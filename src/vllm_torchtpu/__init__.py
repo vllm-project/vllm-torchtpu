@@ -2169,3 +2169,41 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
         "Applied TPU patch: register shard index bounds as buffers in "
         "VocabParallelEmbedding"
     )
+
+
+def _patch_circular_buffer_block_zeroing() -> None:
+    """Record newly claimed CircularBufferSpec block IDs when zeroing is active."""
+    import inspect  # noqa: PLC0415 -- deferred import preserves env_override ordering
+    from functools import wraps  # noqa: PLC0415
+
+    from vllm.v1.core.single_type_kv_cache_manager import (  # noqa: PLC0415 -- deferred vLLM import preserves env_override ordering
+        CircularBufferManager,
+    )
+
+    original_init = CircularBufferManager.__init__
+    if getattr(original_init, "_tpu_circular_zeroing_patch", False):
+        return
+
+    # TODO(upstream): Remove once upstream SingleTypeKVCacheManager.__init__
+    # stops forcing _record_new_block_ids=False for CircularBufferSpec while
+    # CircularBufferManager._claim_ring_block checks it.
+    orig_sig = inspect.signature(original_init)
+
+    @wraps(original_init)
+    def patched_init(
+        self: CircularBufferManager,
+        *args,
+        **kwargs,
+    ) -> None:
+        original_init(self, *args, **kwargs)
+        bound = orig_sig.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        if bound.arguments.get("needs_kv_cache_zeroing"):
+            # Avoid SingleTypeKVCacheManager.__init__ skipping CircularBufferSpec:
+            # emit new_block_ids when KV zeroing is requested.
+            self._record_new_block_ids = True  # noqa: SLF001 -- upstream flag gating new_block_ids tracking
+
+    setattr(  # noqa: B010 -- monkeypatch sentinel on __init__
+        patched_init, "_tpu_circular_zeroing_patch", True
+    )
+    CircularBufferManager.__init__ = patched_init
