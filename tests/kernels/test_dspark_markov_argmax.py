@@ -70,7 +70,7 @@ def _inputs(rows, vs, seed, tie_heavy):
     return lg, w1, w2, p0
 
 
-def _run(lg, w1, w2, p0, vs, perm=tuple(range(N))):
+def _run(lg, w1, w2, p0, vs, perm=tuple(range(N)), lanes=False):
     """Mesh position d holds vocab shard perm[d]."""
     perm = np.asarray(perm)
     devs = jax.devices()
@@ -86,7 +86,7 @@ def _run(lg, w1, w2, p0, vs, perm=tuple(range(N))):
     def body(lg, p0, w1, w2p, rank, start):
         return mk.markov_argmax(
             lg[0], p0[0], w1, w2p[0], rank[0], start[0], N, vs,
-            interpret=pltpu.InterpretParams(),
+            interpret=pltpu.InterpretParams(), lanes=lanes,
         )[None]
 
     f = jax.jit(
@@ -116,11 +116,15 @@ def _run(lg, w1, w2, p0, vs, perm=tuple(range(N))):
     return out
 
 
-@pytest.mark.parametrize("rows,tie_heavy", [(3, False), (2, True)])
-def test_markov_argmax_matches_reference(rows, tie_heavy):
+@pytest.mark.parametrize(
+    "rows,tie_heavy,lanes",
+    [(3, False, False), (2, True, False), (3, False, True), (2, True, True),
+     (19, False, True)],
+)
+def test_markov_argmax_matches_reference(rows, tie_heavy, lanes):
     vs = 4000  # padded to 7168: the last tile is partly past the shard
     lg, w1, w2, p0 = _inputs(rows, vs, seed=rows, tie_heavy=tie_heavy)
-    out = _run(lg, w1, w2, p0, vs)
+    out = _run(lg, w1, w2, p0, vs, lanes=lanes)
     ref = _reference(lg, w1, w2, p0, vs)
     assert (out == out[0:1]).all(), "ranks disagree"
     np.testing.assert_array_equal(out[0], ref)
@@ -132,7 +136,8 @@ def test_markov_argmax_padded_vocab():
     assert mk.padded_rows(1) == 16 and mk.padded_rows(17) == 32
 
 
-def test_markov_argmax_ties_go_to_the_lowest_id():
+@pytest.mark.parametrize("lanes", [False, True])
+def test_markov_argmax_ties_go_to_the_lowest_id(lanes):
     """Equal maxima on two ranks and twice within a rank, including one past
     the first bias tile: the lowest global id wins, as torch.argmax picks."""
     vs, rows = 4000, 2
@@ -143,7 +148,7 @@ def test_markov_argmax_ties_go_to_the_lowest_id():
     lg[3, :, :, 3500] = 5.0
     lg[3, :, :, 3700] = 5.0
     # Shards in a mesh order other than vocab order: ties still go by id.
-    out = _run(lg, w1, w2, p0, vs, perm=(5, 2, 7, 3, 0, 6, 1, 4))
+    out = _run(lg, w1, w2, p0, vs, perm=(5, 2, 7, 3, 0, 6, 1, 4), lanes=lanes)
     np.testing.assert_array_equal(out[0], np.full((rows, K), 3 * vs + 3500))
     np.testing.assert_array_equal(out[0], _reference(lg, w1, w2, p0, vs))
 

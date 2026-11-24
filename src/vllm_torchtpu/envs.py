@@ -178,6 +178,7 @@ if TYPE_CHECKING:
     TPU_HOST_SKIP_GUARD_EVAL_AFTER_STEPS: int = 0
     TPU_HOST_KEEP_INPUT_MUTATIONS: int = 0
     TPU_DSPARK_MARKOV_KERNEL: bool = False
+    TPU_DSPARK_MARKOV_KERNEL_LANES: bool = False
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -1370,6 +1371,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # as one Pallas call (kernels/collectives/markov_argmax.py) instead of K
     # steps of XLA matvec + argmax + all-gather. Same ids.
     "TPU_DSPARK_MARKOV_KERNEL": env_bool("TPU_DSPARK_MARKOV_KERNEL", default=False),
+    # With TPU_DSPARK_MARKOV_KERNEL: lane-accumulated scoring in the kernel
+    # (fewer vector ops per vocab column; the cost that grows with the draft
+    # rows at c48/c64 buckets). Same ids.
+    "TPU_DSPARK_MARKOV_KERNEL_LANES": env_bool(
+        "TPU_DSPARK_MARKOV_KERNEL_LANES", default=False
+    ),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),

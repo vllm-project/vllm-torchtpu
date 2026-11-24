@@ -32,6 +32,7 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.distributed import parallel_state
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
 from vllm_torchtpu.kernels.collectives import markov_argmax as kernel
 from vllm_torchtpu.logger import init_logger
@@ -67,13 +68,15 @@ class FusedMarkov:
         return ids.to(torch.int64)
 
 
-def _make_op(mesh, vs: int):
+def _make_op(mesh, vs: int, lanes: bool = False):
     axis = mesh.axis_names[0]
     n = int(mesh.size)
     specs = (P(axis),) * 6
 
     def body(logits, prev0, w1, w2p, rank, start):
-        return kernel.markov_argmax(logits, prev0, w1, w2p, rank, start, n, vs)
+        return kernel.markov_argmax(
+            logits, prev0, w1, w2p, rank, start, n, vs, lanes=lanes
+        )
 
     sharded = jax.shard_map(
         body, mesh=mesh, in_specs=specs, out_specs=P(axis), check_vma=False
@@ -95,7 +98,7 @@ def _make_op(mesh, vs: int):
 
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
-        "pallas::dspark_markov_argmax",
+        "pallas::dspark_markov_argmax" + ("_lanes" if lanes else ""),
         fn,
         mesh=mesh,
         input_partition_specs=specs,
@@ -193,7 +196,10 @@ def arm(
     device = w2_shard.device
     vocab, rank_dim = w1.shape
     vp = kernel.padded_vocab(vs)
-    op = _make_op(mesh, vs)
+    # Lane-accumulated scoring (same ids); pad columns stay -inf because the
+    # w2p pad rows below are zeros.
+    lanes = bool(envs.TPU_DSPARK_MARKOV_KERNEL_LANES)
+    op = _make_op(mesh, vs, lanes)
     rank_t = torch.tensor([[mesh_index]], dtype=torch.int32, device=device)
     tp_rank = tp.rank_in_group
 
@@ -239,7 +245,7 @@ def arm(
     logger.info(
         "TPU_DSPARK_MARKOV_KERNEL=1: fused DSpark Markov kernel armed over %d "
         "ranks (mesh index %d, vocab start %d, shard %d -> %d cols, k=%d, "
-        "w1 %s); self-test passed",
+        "w1 %s, lanes %s); self-test passed",
         n,
         mesh_index,
         vocab_start,
@@ -247,5 +253,6 @@ def arm(
         vp,
         k,
         w1_dtype,
+        lanes,
     )
     return fused

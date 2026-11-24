@@ -36,6 +36,13 @@ A NaN score is not given torch.argmax's NaN-wins semantics here.
 Step i's pairs land in a receive slot of parity i % 2: a rank sends step i + 1
 only after it holds every rank's step-i pair, so a peer is at most one step
 ahead and two slots are enough.
+
+``lanes=True`` (TPU_DSPARK_MARKOV_KERNEL_LANES) scores with fewer vector ops
+per vocab column, which is the part that grows with the rows: a running
+elementwise max and 128-column chunk index per lane (strict ``>``, chunks in
+id order, so each lane keeps its first maximum), one cross-lane reduction per
+step, and pad columns as -inf logits instead of a per-element column mask.
+The first-maximum id is the same as with ``lanes=False``.
 """
 
 import functools
@@ -93,6 +100,7 @@ def _call(
     rows: int,
     interpret=None,
     ablate: frozenset = frozenset(),
+    lanes: bool = False,
 ):
     # `ablate` (timing attribution only; wrong ids): "gather" skips the
     # embedding DMAs, "dot" the bias matmul, "score" the whole tile loop,
@@ -102,6 +110,7 @@ def _call(
     # Only the `rows` real rows gather embeddings and hand ids to the scalar
     # core; pad rows up to rp keep zero embeddings and are never read.
     nt = vp // TILE_COLS
+    chunks = TILE_COLS // _LANES
     # Rows per (sublane) tile of markov_w1: 8 for 32-bit, 16 for bf16.
     blk = _SUBLANES_32 * 4 // jnp.dtype(w1_dtype).itemsize
     assert vocab % blk == 0, (vocab, blk)
@@ -161,6 +170,7 @@ def _call(
             pl.semaphore_wait(barrier, n)
 
         lane = lax.broadcasted_iota(jnp.int32, (rp, _LANES), 1)
+        lane_f = lane.astype(F32)
         col = lax.broadcasted_iota(jnp.int32, (rp, TILE_COLS), 1)
         start = start_ref[0]
 
@@ -197,6 +207,30 @@ def _call(
                 # Markov rows as the streamed operand, embeddings stationary.
                 e = jnp.concatenate([e, jnp.zeros((_LANES - rp, rank_dim), BF16)], 0)
 
+            def tile_lanes(t, carry, par=par, e=e, first=(i == 0)):
+                # acc_m [rp, 128]: each lane's running max; acc_q: the
+                # 128-column chunk (global within the shard) it was first seen.
+                acc_m, acc_q = carry
+                if first and "w2load" not in ablate:
+                    w2_copy(t).wait()
+                c0 = pl.multiple_of(t * TILE_COLS, TILE_COLS)
+                w = w2_v[pl.ds(c0, TILE_COLS), :]
+                if "dot" in ablate:
+                    bias = jnp.zeros((rp, TILE_COLS), BF16) + w[0:1, 0:1]
+                else:
+                    bias = lax.dot_general(
+                        e, w, (((1,), (1,)), ((), ())), preferred_element_type=F32
+                    ).astype(BF16)
+                q0 = jnp.zeros((rp, _LANES), jnp.int32) + t * chunks
+                for c in range(chunks):
+                    lg = lg_v[par, :, pl.ds(c0 + c * _LANES, _LANES)]
+                    b = bias[:, c * _LANES : (c + 1) * _LANES]
+                    sc = (lg.astype(F32) + b.astype(F32)).astype(BF16).astype(F32)
+                    take = sc > acc_m
+                    acc_m = jnp.where(take, sc, acc_m)
+                    acc_q = jnp.where(take, q0 + c, acc_q)
+                return acc_m, acc_q
+
             def tile(t, carry, par=par, e=e, first=(i == 0)):
                 best_m, best_i = carry
                 if first and "w2load" not in ablate:
@@ -224,15 +258,36 @@ def _call(
                 take = m > best_m
                 return jnp.where(take, m, best_m), jnp.where(take, idx, best_i)
 
-            best_m, best_i = lax.fori_loop(
-                0,
-                0 if "score" in ablate else nt,
-                tile,
-                (
-                    jnp.full((rp, 1), -jnp.inf, F32),
-                    jnp.zeros((rp, 1), F32),
-                ),
-            )
+            if lanes:
+                acc_m, acc_q = lax.fori_loop(
+                    0,
+                    0 if "score" in ablate else nt,
+                    tile_lanes,
+                    (
+                        jnp.full((rp, _LANES), -jnp.inf, F32),
+                        jnp.zeros((rp, _LANES), jnp.int32),
+                    ),
+                )
+                # The first column of the maximum: the lowest of the lanes'
+                # first-maximum columns among lanes that reach it.
+                best_m = jnp.max(acc_m, axis=1, keepdims=True)
+                best_i = jnp.min(
+                    jnp.where(
+                        acc_m == best_m, (acc_q * _LANES).astype(F32) + lane_f, 2.0**30
+                    ),
+                    axis=1,
+                    keepdims=True,
+                )
+            else:
+                best_m, best_i = lax.fori_loop(
+                    0,
+                    0 if "score" in ablate else nt,
+                    tile,
+                    (
+                        jnp.full((rp, 1), -jnp.inf, F32),
+                        jnp.zeros((rp, 1), F32),
+                    ),
+                )
             if i == 0 and "score" in ablate and "w2load" not in ablate:
                 for t in range(nt):
                     w2_copy(t).wait()
@@ -302,7 +357,7 @@ def _call(
             collective_id=COLLECTIVE_ID,
             vmem_limit_bytes=vmem_bytes(rp, vp, rank_dim) + (8 << 20),
         ),
-        name=f"dspark_markov_argmax-k_{k}-r_{rows}-v_{vp}-n_{n}",
+        name=f"dspark_markov_argmax-k_{k}-r_{rows}-v_{vp}-n_{n}{'-lanes' if lanes else ''}",
         **({} if interpret is None else {"interpret": interpret}),
     )
 
@@ -318,6 +373,7 @@ def markov_argmax(
     vs: int,
     interpret=None,
     ablate: frozenset = frozenset(),
+    lanes: bool = False,
 ) -> jax.Array:
     """Greedy Markov drafts ``[rows, k]`` int32 (global ids).
 
@@ -339,10 +395,16 @@ def markov_argmax(
     vocab = w1.shape[0]
     rp = padded_rows(rows)
     lg = jnp.transpose(logits, (1, 0, 2))
-    lg = jnp.pad(lg, ((0, 0), (0, rp - rows), (0, vp - vs)))
+    if lanes:
+        # Pad columns can never win: -inf plus any finite bias.
+        lg = jnp.pad(lg, ((0, 0), (0, 0), (0, vp - vs)), constant_values=-jnp.inf)
+        lg = jnp.pad(lg, ((0, 0), (0, rp - rows), (0, 0)))
+    else:
+        lg = jnp.pad(lg, ((0, 0), (0, rp - rows), (0, vp - vs)))
     p0 = jnp.pad(prev0.astype(jnp.int32), (0, rp - rows))
     out = _call(
-        n, k, rp, vp, vs, rank_dim, vocab, jnp.dtype(w1.dtype), rows, interpret, ablate
+        n, k, rp, vp, vs, rank_dim, vocab, jnp.dtype(w1.dtype), rows, interpret, ablate,
+        lanes,
     )(
         rank.reshape(1).astype(jnp.int32),
         start.reshape(1).astype(jnp.int32),
