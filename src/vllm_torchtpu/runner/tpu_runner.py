@@ -7002,8 +7002,11 @@ class TPUModelRunner(GPUModelRunner):
                     f"{self._pp_topk_buffer.shape[0]} rows, fewer than the "
                     f"{self.max_num_tokens} tokens a hand-off carries"
                 )
+            # Sized to a rank's largest local bucket, not the global step.
             self._pp_wave = PPWave(
-                self.device, self.max_num_tokens, self._pp_intermediate_template
+                self.device,
+                self._backbone_token_paddings()[-1],
+                self._pp_intermediate_template,
             )
             self._pp_wave.warmup()
         if self.enforce_eager:
