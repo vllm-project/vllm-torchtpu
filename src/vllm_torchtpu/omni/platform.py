@@ -246,9 +246,12 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         if cls._is_parent_spawn_env_restore(devices):
             cls._restore_spawn_env()
             return
+        # Snapshot before parsing: the caller still makes its closing call when
+        # the pin fails validation, and that call needs a snapshot to be read
+        # as a restore instead of a new pin of the parent's value.
+        cls._save_spawn_env_if_needed()
         chip_ids = _parse_visible_chip_ids(devices)
 
-        cls._save_spawn_env_if_needed()
         cls._clear_distributed_bootstrap_env()
         if not chip_ids:
             cls._clear_visible_chips_env()

@@ -1184,6 +1184,11 @@ def test_set_device_control_env_var_invalid_inputs_atomic(monkeypatch, bad_devic
     with pytest.raises(ValueError, match="Invalid TPU visible devices specification"):
         OmniTpuPlatform.set_device_control_env_var(bad_devices)
 
+    assert "TPU_VISIBLE_CHIPS" not in os.environ
+    assert os.environ["TPU_VISIBLE_DEVICES"] == "0"
+
+    # The snapshot stays until the caller's closing call, which clears it.
+    OmniTpuPlatform.unset_device_control_env_var()
     assert OmniTpuPlatform._saved_spawn_env is None
     assert "TPU_VISIBLE_CHIPS" not in os.environ
     assert os.environ["TPU_VISIBLE_DEVICES"] == "0"
@@ -1285,6 +1290,56 @@ def test_scoped_spawn_device_env_restores_parent_value_that_fails_validation(
     assert os.environ["TPU_VISIBLE_CHIPS"] == "0,2"
     assert os.environ["TPU_VISIBLE_DEVICES"] == "0"
     assert "TPU_RUNTIME_METRICS_PORTS" not in os.environ
+    assert OmniTpuPlatform._saved_spawn_env is None
+
+
+def test_scoped_spawn_device_env_failed_pin_keeps_parent_env(monkeypatch):
+    import threading
+
+    from vllm_omni.engine import stage_engine_startup
+
+    platform = OmniTpuPlatform()
+    monkeypatch.setattr(stage_engine_startup, "current_omni_platform", platform)
+    monkeypatch.setattr(OmniTpuPlatform, "_saved_spawn_env", None)
+    prepared_world_sizes: list[int] = []
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        classmethod(lambda cls, ws: prepared_world_sizes.append(ws)),
+    )
+    parent_env = {
+        "TPU_VISIBLE_CHIPS": "0,1,2,3,4,5,6,7",
+        "MASTER_PORT": "29500",
+        "WORLD_SIZE": "8",
+    }
+    for key, value in parent_env.items():
+        monkeypatch.setenv(key, value)
+    for key in (
+        "ALLOW_MULTIPLE_LIBTPU_LOAD",
+        "DEBUG_TPU_LOCAL_RANK_OFFSET",
+        "TPU_RUNTIME_METRICS_PORTS",
+        "TPU_VISIBLE_DEVICES",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    # "1,2" is rejected as a stage spec. scoped_spawn_device_env's finally then
+    # passes the parent's value, which is a valid stage spec, so it must be
+    # read as a restore and not pinned as a stage.
+    with (
+        pytest.raises(ValueError, match="must start at a multiple of 2"),
+        stage_engine_startup.scoped_spawn_device_env(
+            "1,2", threading.Lock(), stage_id=1, replica_id=0
+        ),
+    ):
+        pass
+
+    for key, value in parent_env.items():
+        assert os.environ[key] == value
+    assert "ALLOW_MULTIPLE_LIBTPU_LOAD" not in os.environ
+    assert "DEBUG_TPU_LOCAL_RANK_OFFSET" not in os.environ
+    assert "TPU_RUNTIME_METRICS_PORTS" not in os.environ
+    assert "TPU_VISIBLE_DEVICES" not in os.environ
+    assert prepared_world_sizes == []
     assert OmniTpuPlatform._saved_spawn_env is None
 
 
