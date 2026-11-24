@@ -302,22 +302,23 @@ def test_workbench_html_three_pane_landmarks_and_unique_ids(model_name: str) -> 
 
 
 @pytest.mark.parametrize(
-    ("chip_name", "expected_max_mib"),
+    ("chip_name", "expected_max_mib", "expected_init_mib"),
     [
-        ("tpu7x", "62.0"),
-        ("v6e", "126.0"),
+        ("tpu7x", "62.0", "56.0"),
+        ("v6e", "126.0", "126.0"),
     ],
 )
 def test_workbench_vmem_slider_bounded_by_chip_usable_ceiling(
     chip_name: str,
     expected_max_mib: str,
+    expected_init_mib: str,
 ) -> None:
-    """Verify #ctl-vmem range slider min/max reflects each chip's usable VMEM."""
+    """Verify #ctl-vmem max reflects usable VMEM and starts at the fit budget."""
     sweep_report = advisor.advise_regimes("qwen3.5-397b", chip_name)
     html_text = advisor.render_advisor_html(sweep_report)
     vmem_tag = (
         f'<input id="ctl-vmem" type="range" min="2.0" max="{expected_max_mib}" '
-        f'step="0.5" value="{expected_max_mib}" oninput="wbOnHwControl()"/>'
+        f'step="0.5" value="{expected_init_mib}" oninput="wbOnHwControl()"/>'
     )
     assert vmem_tag in html_text
     assert 'max="96"' not in html_text
