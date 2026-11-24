@@ -96,6 +96,24 @@ def test_layer_key_and_sources(tmp_path):
     assert {int(e) for e in top} <= set(plan.rep_logical)
 
 
+def test_explicit_placement_and_fitted_builtin():
+    rep = [((r + 1) % 4) * 4 + j for r in range(4) for j in range(2)]
+    plan = rx.explicit_placement(16, 4, 2, rep)
+    assert plan.rep_logical == tuple(rep)
+    assert all(plan.home_rank(e) != plan.alt_rank(i) for i, e in enumerate(rep))
+    with pytest.raises(ValueError):  # copy on its home rank
+        rx.explicit_placement(16, 4, 2, [0, 1] + rep[2:])
+    with pytest.raises(ValueError):  # two copies of one expert
+        rx.explicit_placement(16, 4, 2, rep[:7] + [rep[0]])
+    with pytest.raises(ValueError):  # wrong length
+        rx.explicit_placement(16, 4, 2, rep[:7])
+    fitted = rx._load_source("builtin:minimax_m31_agentx_fit")
+    assert len(fitted) == 57
+    for key, value in fitted.items():
+        plan = rx.explicit_placement(128, 8, 8, value["rep"])
+        assert len(set(plan.rep_logical)) == 64, key
+
+
 # --------------------------------------------------------------------------
 # Router remap
 # --------------------------------------------------------------------------
@@ -181,6 +199,51 @@ def _greedy(ids, table, ep, slots):
         load[best // slots] += 1
     pick[-1] = -1
     return np.vectorize(pick.get)(ids)
+
+
+@pytest.mark.parametrize("refine", [0, 16])
+@pytest.mark.parametrize(
+    "tokens,slots,padded", [(1, 1, 0), (8, 8, 0), (24, 8, 8), (64, 8, 0), (96, 4, 16)]
+)
+def test_fast_kernel_matches_kernel(tokens, slots, padded, refine):
+    jnp = pytest.importorskip("jax.numpy")
+    from vllm_torchtpu.kernels.moe_replica_assign import (
+        flat_table,
+        replica_assign,
+        replica_assign_fast,
+    )
+
+    plan = rx.compute_placement(128, 8, slots, list(range(0, 128, 5)))
+    table = rx.copies_table(plan)
+    flat = rx.flat_copies_table(plan)
+    np.testing.assert_array_equal(
+        flat.numpy(), np.asarray(flat_table(jnp.asarray(table.numpy()), plan.slots_total))
+    )
+    rng = np.random.default_rng(tokens + refine)
+    ids = np.stack([rng.choice(128, 4, replace=False) for _ in range(tokens)])
+    if padded:
+        ids[-padded:] = -1
+    want = rx.remap_ids_reference(
+        torch.from_numpy(ids), table, ep=8, slots=plan.slots_total, refine=refine
+    ).numpy()
+    host = np.asarray(
+        replica_assign_fast(jnp.asarray(ids), jnp.asarray(flat.numpy()), num_experts=128, ep=8)
+    )
+    if not refine:
+        np.testing.assert_array_equal(host, want)
+    try:
+        old = replica_assign(
+            jnp.asarray(ids), jnp.asarray(table.numpy()), ep=8,
+            slots=plan.slots_total, refine=refine, interpret=True,
+        )
+        got = replica_assign_fast(
+            jnp.asarray(ids), jnp.asarray(flat.numpy()), num_experts=128, ep=8,
+            refine=refine, interpret=True,
+        )
+    except Exception as exc:  # pragma: no cover - no Pallas interpreter here
+        pytest.skip(f"pallas interpret unavailable: {exc}")
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(old))
+    np.testing.assert_array_equal(np.asarray(got), want)
 
 
 @pytest.mark.parametrize(

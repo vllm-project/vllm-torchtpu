@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     TPU_MOE_ROUTE_TRACE_EVERY: int = 8192
     VLLM_TPU_MOE_REDUNDANT_EXPERTS: int = 0
     TPU_MOE_REPLICA_ASSIGN_REFINE: int = 0
+    TPU_MOE_REPLICA_ASSIGN_FAST: bool = False
     TPU_MOE_NVFP4_SKIP_PADDED: bool = False
     TPU_MINIMAX_M3_INDEXER_DECODE_OPT: str = ""
     TPU_MOE_SKIP_PADDED_MIN_ROUTES: int = 0
@@ -255,6 +256,9 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     TPU_SAMPLER_TOPP_CANDIDATES: str = ""
+    TPU_LM_HEAD_E4M3: bool = False
+    TPU_LM_HEAD_E4M3_SPLIT_MAX_ROWS: int = 0
+    TPU_LM_HEAD_E4M3_DUMP: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -996,6 +1000,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_REPLICA_ASSIGN_REFINE": env_nonnegative_int(
         "TPU_MOE_REPLICA_ASSIGN_REFINE", 0
     ),
+    # With redundant experts: the same copy assignment from a leaner kernel
+    # (copy table flattened with each copy's rank at load, no per-step init
+    # input or table reshape, branch-free scalar loops). Same output.
+    "TPU_MOE_REPLICA_ASSIGN_FAST": env_bool("TPU_MOE_REPLICA_ASSIGN_FAST"),
     # Which experts get the redundant slots: a JSON file path, inline JSON
     # ('{"L3": [17, ...]}', hottest first), or "builtin:<name>". Empty = the
     # built-in round-robin fill. Placement reaches the compiled graph as
@@ -1653,6 +1661,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # finally the full-vocabulary bisection. Same threshold up to the float32
     # summation order. Empty (default): the full bisection only.
     "TPU_SAMPLER_TOPP_CANDIDATES": env_str("TPU_SAMPLER_TOPP_CANDIDATES", ""),
+    # Store the LM head (shared with the draft) as e4m3 with a per-row scale,
+    # halving the bytes every logits call reads (`layers.adapter.lm_head_e4m3`).
+    # Not exact: logits carry the e4m3 rounding of the weight.
+    "TPU_LM_HEAD_E4M3": env_bool("TPU_LM_HEAD_E4M3", False),
+    # With TPU_LM_HEAD_E4M3: logits calls of at most this many rows split the
+    # activations into two e4m3 terms and run one fp8 x fp8 matmul (the weight
+    # is read once, in e4m3, by the fp8 MXU); larger calls keep the bf16
+    # matmul on the upcast weight. 0 = off.
+    "TPU_LM_HEAD_E4M3_SPLIT_MAX_ROWS": env_nonnegative_int(
+        "TPU_LM_HEAD_E4M3_SPLIT_MAX_ROWS", 0
+    ),
+    # Debug only, with TPU_LM_HEAD_E4M3: rank 0 saves its bf16 head shard and,
+    # for this many decode steps, the LM head inputs under
+    # $CDK_OUTPUT_DIR/lm_head_dump. 0 = off.
+    "TPU_LM_HEAD_E4M3_DUMP": env_nonnegative_int("TPU_LM_HEAD_E4M3_DUMP", 0),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).

@@ -78,6 +78,8 @@ ENABLED: bool = SLOTS_PER_RANK > 0
 MAX_ROUTES: int = 2048
 # Rounds of load-lowering moves after the greedy copy assignment.
 REFINE: int = int(envs.TPU_MOE_REPLICA_ASSIGN_REFINE) if ENABLED else 0
+# Leaner assignment kernel on a load-time flat table (same assignment).
+FAST: bool = bool(envs.TPU_MOE_REPLICA_ASSIGN_FAST) if ENABLED else False
 # Expert ids handed to the loader for replica writes. Distinct from every
 # real id so the expert-write staging tracker counts each slot once.
 _REPLICA_ID_BASE = 1 << 20
@@ -239,6 +241,37 @@ def compute_placement(
     return LayerPlacement(num_logical, ep, slots, tuple(rep))
 
 
+def explicit_placement(
+    num_logical: int, ep: int, slots: int, rep: Iterable[int]
+) -> LayerPlacement:
+    """A placement given copy by copy: ``rep[r * slots + j]`` is the logical
+    expert held by redundant slot ``j`` of rank ``r`` (``{"rep": [...]}`` in a
+    placement table, e.g. one fitted offline to a served route trace).
+
+    Every copy must sit off its expert's home rank and an expert gets at most
+    one copy, so the assignment kernel sees the same ``[E, 2]`` copies table
+    as with `compute_placement`.
+    """
+    rep = tuple(int(x) for x in rep)
+    local = num_logical // ep if ep else 0
+    if ep < 2 or slots < 1 or num_logical % ep or len(rep) != ep * slots:
+        raise ValueError(
+            f"explicit redundant placement needs {ep} * {slots} entries for "
+            f"E={num_logical}; got {len(rep)}"
+        )
+    for i, logical in enumerate(rep):
+        if not 0 <= logical < num_logical:
+            raise ValueError(f"explicit redundant placement: expert {logical} out of range")
+        if logical // local == i // slots:
+            raise ValueError(
+                f"explicit redundant placement: expert {logical} copied onto its "
+                f"home rank {i // slots}"
+            )
+    if len(set(rep)) != len(rep):
+        raise ValueError("explicit redundant placement: an expert has two copies")
+    return LayerPlacement(num_logical, ep, slots, rep)
+
+
 def layer_key(name: str) -> str:
     """``model.layers.17.mlp.experts`` -> ``L17``; MTP/draft -> ``mtp<N>``.
 
@@ -390,6 +423,11 @@ def prepare(layer: Any) -> int:
         )
         return 0
     _widen_ep_weight_filter()
+    if FAST:
+        logger.warning_once(
+            "[moe-redundant] TPU_MOE_REPLICA_ASSIGN_FAST=1: copy assignment by "
+            "moe_replica_assign_fast on a load-time flat table."
+        )
     if REFINE:
         logger.warning_once(
             "[moe-redundant] TPU_MOE_REPLICA_ASSIGN_REFINE=%d: up to %d rounds of "
@@ -401,7 +439,10 @@ def prepare(layer: Any) -> int:
     ordinal = _ORDINAL[0]
     _ORDINAL[0] += 1
     hot = hot_for_layer(placement_source(), name, ordinal)
-    plan = compute_placement(num_logical, ep, SLOTS_PER_RANK, hot)
+    if isinstance(hot, dict) and "rep" in hot:
+        plan = explicit_placement(num_logical, ep, SLOTS_PER_RANK, hot["rep"])
+    else:
+        plan = compute_placement(num_logical, ep, SLOTS_PER_RANK, hot)
     layer._rx_plan = plan
     layer._rx_from_source = hot is not None
     return SLOTS_PER_RANK
@@ -553,9 +594,15 @@ def install(layer: Any) -> None:
     layer.register_buffer(
         "_rx_copies", copies_table(plan).to(device), persistent=False
     )
+    if FAST:
+        layer.register_buffer(
+            "_rx_copies_flat", flat_copies_table(plan).to(device), persistent=False
+        )
     if device.type == "tpu":
         # Register outside tracing: Dynamo cannot trace the registration.
         _get_assign_op()
+        if FAST:
+            _get_assign_fast_op()
     layer._rx_num_physical = plan.num_physical
     per_slot = sum(
         int(p[0].numel()) * p.element_size()
@@ -633,6 +680,10 @@ def to_physical(
         # Zero-weight rows are skipped by the grouped matmul; they must not
         # count as load (and stay skipped: -1 is outside every rank's range).
         ids = torch.where(topk_weights != 0, topk_ids, torch.full_like(topk_ids, -1))
+    if FAST and ids.device.type == "tpu":
+        return _get_assign_fast_op()(
+            ids.to(torch.int32), layer._rx_copies_flat, plan.num_logical, plan.ep
+        )
     return remap_ids(ids, layer._rx_copies, ep=plan.ep, slots=plan.slots_total)
 
 
@@ -657,6 +708,36 @@ def _get_assign_op():
         )
         _assign_op = op
     return _assign_op
+
+
+_assign_fast_op = None
+
+
+def _assign_fast_jax(ids: jax.Array, table: jax.Array, num_experts: int, ep: int) -> jax.Array:
+    from vllm_torchtpu.kernels.moe_replica_assign import replica_assign_fast
+
+    return replica_assign_fast(ids, table, num_experts=num_experts, ep=ep, refine=REFINE)
+
+
+def _get_assign_fast_op():
+    global _assign_fast_op
+    if _assign_fast_op is None:
+        from torch_tpu._internal import pallas
+
+        op = pallas.jax_op("pallas::moe_replica_assign_fast", _assign_fast_jax)
+        op.register_fake(
+            lambda ids, table, num_experts, ep: torch.empty_like(ids, dtype=torch.int32)
+        )
+        _assign_fast_op = op
+    return _assign_fast_op
+
+
+def flat_copies_table(plan: LayerPlacement) -> torch.Tensor:
+    """``copies_table`` as ``[E * c * 2]`` (physical id, rank) pairs, the
+    input of the fast assignment kernel (``kernels.moe_replica_assign.flat_table``)."""
+    tab = copies_table(plan)
+    rank = torch.where(tab >= 0, tab // plan.slots_total, torch.full_like(tab, -1))
+    return torch.stack([tab, rank], dim=-1).reshape(-1).contiguous()
 
 
 def remap_ids(
