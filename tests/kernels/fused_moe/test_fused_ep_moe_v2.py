@@ -658,7 +658,7 @@ def test_256_row_tiles_track_the_128_row_build(
     (host.mirror_rows_per_tile); without that no such build compiles. Every
     row's two matmuls, its scales and its wire quantization are its own, so the layer
     has to stay inside the fp8 bands of the dense reference at both heights
-    and agree with the 128-row build far inside them. The lowered programs
+    and match the 128-row build exactly. The lowered programs
     are checked to carry each height's kernel, so the comparison is real.
 
     A tile shorter than 256 rows stages its scales as whole 128-lane rows and
@@ -743,10 +743,10 @@ def test_256_row_tiles_track_the_128_row_build(
     for capacity, out in outs.items():
         assert _relative_l2(out, want) < FP8_RELATIVE_BOUND, capacity
         assert _worst_token_relative_l2(out, want) < FP8_TOKEN_BOUND, capacity
-    # Far inside the bands. On v7x the two heights are bit-identical at every
-    # shape and plan above (each row's matmuls accumulate in the same order at
-    # both), so the bound only leaves room for a compiler that reorders them.
-    assert _relative_l2(outs[256], outs[128]) < FP8_RELATIVE_BOUND / 10
+    # Each row's matmuls accumulate in the same order at both heights, so the
+    # taller tile reproduces the 128-row build bit for bit (measured on v7x at
+    # every shape and plan above).
+    np.testing.assert_array_equal(np.asarray(outs[256]), np.asarray(outs[128]))
 
 
 @pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
