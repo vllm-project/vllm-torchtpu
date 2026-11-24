@@ -107,6 +107,44 @@ def _run_equivalence(seed, num_reqs, extra, fast_token_substitution):
     assert full._steady_decode_cache.hits == full._steady_decode_cache.misses == 0
 
 
+@pytest.mark.parametrize("num_reqs", [1, 4])
+def test_metadata_reuse_matches_full_rebuild(num_reqs):
+    """VLLM_TPU_STEADY_METADATA_REUSE: a step that hands back the previous
+    step's metadata objects (positions and seq_lens set in place) equals the
+    flag-off rebuild field for field, unified mamba indices included, and
+    every step a walk was skipped on reused them."""
+    wl = Workload(5, num_reqs, max_model_len=8192, churn=0.06, prefill=0.04)
+    full = make_runner(max_model_len=8192)
+    inc = make_runner(max_model_len=8192)
+    extra = {"VLLM_TPU_STEADY_METADATA_REUSE": "1"}
+    reuse = inc._steady_metadata_reuse
+    hits = []
+
+    def counted(ctx, key):
+        out = reuse(ctx, key)
+        hits.append(out is not None)
+        return out
+
+    inc._steady_metadata_reuse = counted
+    for step in range(300):
+        if step:
+            wl.step()
+        num_decode, num_windowed = wl.segments()
+        wl.apply(full)
+        wl.apply(inc)
+        so = wl.scheduler_output()
+        with env(steady=False, extra=extra):
+            out_full = run_prepare(full, so, num_decode, num_windowed)
+        with env(steady=True, extra=extra):
+            out_inc = run_prepare(inc, so, num_decode, num_windowed)
+        _assert_metadata_equal(out_full, out_inc, step)
+    cache = inc._steady_decode_cache
+    assert sum(hits) > 50, (sum(hits), len(hits))
+    # The first steady step after a rebuild re-seeds; every other skip reuses.
+    assert len(hits) <= cache.walk_skips
+    assert "_steady_metadata" not in full.__dict__
+
+
 def test_flag_off_is_a_no_op():
     """Off (the default) the runner never consults or seeds the cache, the
     walk carries no steady-decode bounds and nothing caches walk products."""

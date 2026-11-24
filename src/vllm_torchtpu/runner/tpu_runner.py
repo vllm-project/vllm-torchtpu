@@ -2612,14 +2612,19 @@ class TPUModelRunner(GPUModelRunner):
         positions and seq_lens set on its (shared) metadata objects; None on a
         miss. The objects are rebuilt per step otherwise, and nothing keeps
         one past the step it was built for (the drafter copies what it
-        changes), so updating them in place is the same as building anew."""
+        changes), so updating them in place is the same as building anew.
+        This relies on the identity-keyed memos of metadata objects living
+        for one forward: GdnStepMetadataCache (qwen4_exp model.py) and
+        MicroBatchPlan.gdn (qwen4_exp sequence_parallel.py)."""
         prev = self.__dict__.get("_steady_metadata")
         if prev is None:
             return None
         prev_key, per_layer, built_objs, appended = prev
-        if len(prev_key) != len(key) or not all(
-            a is b for a, b in zip(prev_key[:-1], key[:-1])
-        ) or prev_key[-1] != key[-1]:
+        if (
+            len(prev_key) != len(key)
+            or not all(a is b for a, b in zip(prev_key[:-1], key[:-1]))
+            or prev_key[-1] != key[-1]
+        ):
             return None
         positions, seq_lens = self.position_ids, ctx.seq_lens
         for md in built_objs:
