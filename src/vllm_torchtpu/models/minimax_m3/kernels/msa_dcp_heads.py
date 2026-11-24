@@ -1060,11 +1060,18 @@ def _own_selection(
     packed ``candidates [T, G * 2 * topk]``. Each replica of the head merges
     the candidates of a ``1 / replicas`` share of the tokens (an all-to-all
     of that share) and the replicas all-gather the merged selections, which
-    are 1/8 the candidates' bytes. With `share_only` (the tokens split
-    evenly), the replica's own share ``[T / replicas, topk]`` comes back
-    instead, with no all-gather."""
+    are 1/8 the candidates' bytes. With `share_only` (two replicas that
+    take the alternate blocks of `rotate_replica_rows`), the replica's own
+    share ``[T / 2, topk]`` comes back instead, with no all-gather."""
     num_tokens = candidates.shape[0]
     heads = dcp // replicas
+    if share_only:
+        # Destination rank d = h * 2 + j gets head h's blocks of replica j,
+        # in one transpose.
+        blocks = candidates.reshape(-1, 2, _INTERLEAVE_TOKENS, heads, 2 * topk)
+        send = blocks.transpose(3, 1, 0, 2, 4).reshape(dcp, num_tokens // 2, -1)
+        own = jax.lax.all_to_all(send, axis, 0, 0, tiled=True)
+        return msa_dcp.merge_head_candidates(own, topk, interpret)[:, 0]
     split = replicas if num_tokens % replicas == 0 else 1
     part = num_tokens // split
     per_head = candidates.reshape(num_tokens, heads, 2 * topk).transpose(1, 0, 2)
@@ -1074,9 +1081,6 @@ def _own_selection(
     send = jnp.repeat(send, replicas // split, axis=1).reshape(dcp, part, 2 * topk)
     own = jax.lax.all_to_all(send, axis, 0, 0, tiled=True)  # [dcp, T / split, 2K]
     selected = msa_dcp.merge_head_candidates(own, topk, interpret)[:, 0]
-    if share_only:
-        assert split == replicas, (num_tokens, replicas)
-        return selected
     if split > 1:
         groups = [list(range(h * replicas, (h + 1) * replicas)) for h in range(heads)]
         selected = jax.lax.all_gather(
@@ -1232,7 +1236,6 @@ def _head_parallel_attend(
     offset = rank % replicas * rows if split else 0
     pair = [(r, r ^ 1) for r in range(dcp)]
     if split:
-        candidates = _interleave(candidates)
         tokens = tuple(_interleave(x) for x in tokens)
 
     selected = _own_selection(
