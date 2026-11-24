@@ -210,7 +210,7 @@ def ngram_ids(
             blocks.append(
                 torch.remainder(mixed.unsqueeze(-1), vocab_sizes[heads]) + offsets[heads]
             )
-        else:  # trace-time constants (VLLM_TPU_MK_PLE_TRIM): same int64 math
+        else:  # Python-int constants, one remainder per head: same int64 math
             blocks.append(
                 torch.stack(
                     [
@@ -526,7 +526,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # int32 copy is exact and the gathers below read one word per token.
             ngram_context = ngram_context.to(torch.int32)
         if (envs.VLLM_TPU_MK_PLE_TRIM or lean) and consts is not None:
-            multipliers, sizes, offsets = consts
+            # Built at trace time: HLO constants rather than int64 operands (nothing to
+            # split per step), with the stock path's vectorized per-head remainder.
+            multipliers, sizes, offsets = (
+                torch.tensor(c, dtype=torch.int64, device=input_ids.device) for c in consts
+            )
         else:
             multipliers, sizes, offsets = (
                 self.layer_multipliers,
