@@ -128,9 +128,10 @@ def hc_module():
 class PartialAttention(nn.Module):
     """Rank r returns a fixed share of a linear map, like a row-parallel o_proj."""
 
-    def __init__(self, tp, weight, layer_type):
+    def __init__(self, tp, weight, layer_type, selection=None):
         super().__init__()
         self.tp, self.weight, self.layer_type = tp, weight, layer_type
+        self.selection = selection
         self.decode_token_shard = False
 
     def _partial(self, block):
@@ -151,7 +152,8 @@ class PartialAttention(nn.Module):
         decode_token_shard=False,
     ):
         assert reduce is False
-        return self._partial(block), None
+        selected = None if self.selection is None else self.selection[: block.shape[0]]
+        return self._partial(block), selected
 
 
 class RowwiseMoE(nn.Module):
