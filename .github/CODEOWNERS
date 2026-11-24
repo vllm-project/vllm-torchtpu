@@ -184,15 +184,13 @@
 # Models: Qwen4 Experimental
 /src/vllm_torchtpu/models/qwen4_exp/ @kyuyeunk @BirdsOfAFthr
 
+# Models: Qwen4 Experimental (experimental tier)
+/src/vllm_torchtpu/models/qwen4_exp/experimental/ @caojx-google @DRZDONG @benliangw @mshrihari3
+/tests/models/qwen4_exp/experimental/ @caojx-google @DRZDONG @benliangw @mshrihari3
+
 # Models: Qwen4 Experimental (Alibaba)
 /src/vllm_torchtpu/models/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
 /tests/models/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
-
-# Models: Qwen3.8 Flash
-/src/vllm_torchtpu/models/qwen38_flash/ @DRZDONG @caojx-google
-/tests/models/qwen38_flash/ @DRZDONG @caojx-google
-/src/vllm_torchtpu/models/qwen38_flash/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
-/tests/models/qwen38_flash/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
 
 # Megakernel (root package and shared test setup)
 /src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3
