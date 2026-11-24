@@ -590,8 +590,13 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    shared: tuple | None = None,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
+
+    ``shared`` (act, w, scale, routed_scale), only passed when
+    ``_tc_shared_applies``: the TensorCore combine also adds the shared
+    expert's down projection (``tc_combine_shared``).
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
@@ -758,6 +763,20 @@ def moe_gmm(
                 axis=1
             )
             return (combine @ gmm2_res).astype(x.dtype)
+        if shared is not None:
+            act, ws, wscale, routed_scale = shared
+            return tc_combine_mod.tc_combine_shared(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                group_sizes,
+                act,
+                ws,
+                wscale,
+                topk=topk,
+                routed_scale=routed_scale,
+            ).astype(x.dtype)
         if envs.TPU_MOE_TC_COMBINE and tc_combine_mod.supported(
             num_tokens, gmm2_res.shape[-1], topk, group_sizes.shape[0], gmm2_res.dtype
         ):
@@ -811,6 +830,31 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
+def _tc_shared_applies(
+    num_tokens: int,
+    hidden: int,
+    topk: int,
+    local_num_experts: int,
+    dtype,
+    shared_k: int,
+    *,
+    use_ep: bool,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
+) -> bool:
+    """Whether moe_gmm combines on the TensorCore (its EP branch with
+    TPU_MOE_TC_COMBINE) with room for the shared expert's resident weight."""
+    return (
+        use_ep
+        and use_sparse_core
+        and num_tokens * topk > onehot_moe_permute_threshold
+        and envs.TPU_MOE_TC_COMBINE
+        and tc_combine_mod.supported_shared(
+            num_tokens, hidden, topk, local_num_experts, dtype, shared_k
+        )
+    )
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -821,6 +865,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "shared_routed_scale",
     ),
 )
 def fused_moe_func(
@@ -841,8 +886,19 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    shared_act: jax.Array | None = None,
+    shared_w: jax.Array | None = None,
+    shared_scale: jax.Array | None = None,
+    shared_routed_scale: float = 1.0,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
+
+    With ``shared_act`` [T, Ks], ``shared_w`` [Ks, H] and ``shared_scale``
+    [H], the result is ``bf16(routed) * shared_routed_scale`` plus the shared
+    expert's down projection ``bf16(shared_act @ bf16(shared_w)) *
+    shared_scale``, with the roundings of computing them apart
+    (``tc_combine._shared_epilogue``); on the TensorCore-combine path the
+    combine kernel adds it in its output pass.
 
     For linear EP placement, ``experts_start`` is the first global expert id
     owned by this shard, passed as a 0-d int32 array (real traced data, not a
@@ -870,6 +926,14 @@ def fused_moe_func(
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
     num_tokens, hidden_size = hidden_states.shape
+    shared = None
+    if shared_act is not None:
+        shared = (
+            shared_act.astype(jnp.bfloat16),
+            shared_w.astype(jnp.bfloat16),
+            shared_scale.astype(jnp.bfloat16).reshape(1, -1),
+            float(shared_routed_scale),
+        )
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
@@ -923,8 +987,11 @@ def fused_moe_func(
         logger.info_once("Selected experimental dense-expert decode MoE")
         if onehot_permute:
             hidden_states = _zero_non_finite(hidden_states)
-        return dense_expert_moe(
-            hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+        return _with_shared(
+            dense_expert_moe(
+                hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+            ),
+            shared,
         )
 
     # Decode under EP: a core holds few routed rows per expert and weight
@@ -941,15 +1008,18 @@ def fused_moe_func(
         )
     ):
         logger.info_once("Selected dense-expert fp4 decode MoE")
-        return dense_expert_moe_fp4(
-            hidden_states,
-            w1,
-            w2,
-            w1_scale,
-            w2_scale,
-            topk_weights,
-            topk_ids,
-            activation=activation,
+        return _with_shared(
+            dense_expert_moe_fp4(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                activation=activation,
+            ),
+            shared,
         )
     if (
         _FLAT_ROUTING_MIN_TOKENS
@@ -989,6 +1059,17 @@ def fused_moe_func(
         skip_padded_tokens=skip_padded_tokens,
     )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    tc_shared = shared is not None and _tc_shared_applies(
+        num_tokens,
+        padded_hidden_size,
+        topk,
+        w1.shape[0],
+        x.dtype,
+        shared[0].shape[1],
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+    ) and padded_hidden_size == hidden_size
     x = moe_gmm(
         x,
         w1,
@@ -1009,5 +1090,13 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        shared=shared if tc_shared else None,
     )
-    return x[:num_tokens, :hidden_size]
+    x = x[:num_tokens, :hidden_size]
+    return x if tc_shared else _with_shared(x, shared)
+
+
+def _with_shared(routed: jax.Array, shared: tuple | None) -> jax.Array:
+    if shared is None:
+        return routed
+    return tc_combine_mod._shared_epilogue(routed, shared)

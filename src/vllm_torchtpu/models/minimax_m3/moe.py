@@ -26,6 +26,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.megablox import tc_combine
 
 # The checkpoint config may omit swiglu_beta; SwiGLU-OAI's up-bias is 1.
 _DEFAULT_SWIGLU_BETA = 1.0
@@ -77,6 +78,13 @@ class MiniMaxM3MLP(nn.Module):
     ) -> torch.Tensor:
         """``x`` may come as e4m3 rows with per-row f32 scales (an SP step's
         e4m3 all-gather), which gate_up_proj contracts as e4m3."""
+        x, _ = self.down_proj(self.activation(x))
+        return x
+
+    def activation(
+        self, x: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
+        """``act_fn(gate_up_proj(x))``: the down projection's input."""
         if isinstance(x, tuple):
             e4m3_apply = getattr(self.gate_up_proj.quant_method, "apply_e4m3_rows", None)
             if e4m3_apply is None:
@@ -89,10 +97,9 @@ class MiniMaxM3MLP(nn.Module):
             if rows is not None and rows[0].shape[0] == x.shape[0]:
                 # Shared expert of an SP step (TPU_MINIMAX_M3_SP_E4M3_SHARED):
                 # x is the bf16 dequantization of these e4m3 rows.
-                return self.forward(rows)
+                return self.activation(rows)
             gate_up, _ = self.gate_up_proj(x)
-        x, _ = self.down_proj(self.act_fn(gate_up))
-        return x
+        return self.act_fn(gate_up)
 
 
 class MiniMaxM3MoE(nn.Module):
@@ -162,6 +169,8 @@ class MiniMaxM3MoE(nn.Module):
             if envs.TPU_MINIMAX_M3_SP_E4M3_SHARED:
                 rows = (q8, row_scale)
         router_logits, _ = self.gate(hidden_states)
+        if self._shared_in_combine(hidden_states.shape[0]):
+            return self._forward_shared_in_combine(hidden_states, router_logits, rows)
         if rows is None:
             return self.experts(hidden_states=hidden_states, router_logits=router_logits)
         # The shared expert runs inside the MoE runner on hidden_states; hand
@@ -171,3 +180,53 @@ class MiniMaxM3MoE(nn.Module):
             return self.experts(hidden_states=hidden_states, router_logits=router_logits)
         finally:
             self.shared_experts.__dict__.pop("_e4m3_rows", None)
+
+    def _shared_in_combine(self, num_tokens: int) -> bool:
+        """TPU_MINIMAX_M3_SHARED_IN_COMBINE on a step whose layer reduces the
+        MoE output itself (SP steps: the runner would return shared + routed
+        unreduced), with the plain GMM path, routing weights carrying the
+        routed scale, an e4m3 per-channel shared down_proj, and a token count
+        the TensorCore combine tiles (other steps keep the runner's graph)."""
+        if not envs.TPU_MINIMAX_M3_SHARED_IN_COMBINE or not envs.TPU_MOE_TC_COMBINE:
+            return False
+        if (
+            num_tokens % tc_combine.TOKEN_BLOCK
+            or num_tokens < envs.TPU_MINIMAX_M3_SHARED_IN_COMBINE_MIN_TOKENS
+        ):
+            return False
+        runner = self.experts
+        if not runner.moe_config.skip_final_all_reduce:
+            return False
+        down = self.shared_experts.down_proj
+        qm = runner.routed_experts.quant_method
+        return (
+            getattr(qm, "shared_in_combine_supported", None) is not None
+            and qm.shared_in_combine_supported()
+            and runner.routed_scaling_factor == 1.0
+            and down.weight.dtype == torch.float8_e4m3fn
+            and getattr(down, "weight_scale", None) is not None
+            and down.weight_scale.dim() == 1
+            and getattr(down, "bias", None) is None
+        )
+
+    def _forward_shared_in_combine(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        rows: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """The runner's unreduced shared + routed sum, with the shared
+        down_proj run inside the TensorCore combine (same roundings).
+        ``rows``: the e4m3 rows of TPU_MINIMAX_M3_SP_E4M3_SHARED, which the
+        shared gate_up contracts as the runner's shared expert would."""
+        down = self.shared_experts.down_proj
+        act = self.shared_experts.activation(hidden_states if rows is None else rows)
+        routed = self.experts.routed_experts
+        return routed.quant_method.apply_monolithic_shared(
+            routed,
+            hidden_states,
+            router_logits,
+            act,
+            down.weight,
+            down.weight_scale,
+        )

@@ -83,8 +83,10 @@ from vllm_torchtpu.layers.adapter import (
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
+    fused_moe_gmm_shared,
     load_kmajor_fp4,
     prebuild_fused_moe_kernel,
+    prebuild_fused_moe_shared_kernel,
     requant_load_kmajor_fp4,
 )
 from vllm_torchtpu.layers.adapter.linear_common import quantized_matmul_fp4
@@ -513,6 +515,12 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 activation=activation_str,
                 use_ep=layer.moe_config.moe_parallel_config.use_ep,
             )
+            if envs.TPU_MINIMAX_M3_SHARED_IN_COMBINE:
+                prebuild_fused_moe_shared_kernel(
+                    topk=layer.moe_config.experts_per_token,
+                    activation=activation_str,
+                    use_ep=layer.moe_config.moe_parallel_config.use_ep,
+                )
 
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = op
@@ -567,6 +575,29 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 score_bias_operand(layer),
             )
 
+        topk_weights, topk_ids = self._gmm_route(layer, x, router_logits)
+        kwargs = {
+            "hidden_states": x,
+            "w1": layer.w13_weight,
+            "w2": layer.w2_weight,
+            "w1_scale": layer.w13_weight_scale,
+            "w2_scale": layer.w2_weight_scale,
+            "w1_bias": None,
+            "w2_bias": None,
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "experts_start": layer._experts_start,
+            "topk": layer.moe_config.experts_per_token,
+            "activation": activation_str,
+        }
+        if enable_pipelined_collective_and_compute():
+            return pipelined_fused_moe_gmm(**kwargs)
+
+        return fused_moe_gmm(**kwargs)
+
+    def _gmm_route(
+        self, layer: TpuRoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
@@ -591,24 +622,50 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             # Logical -> physical slot ids (identity for layers without
             # replicas); experts_start below is then rank * slots.
             topk_ids = moe_redundant.to_physical(layer, topk_ids, topk_weights)
-        kwargs = {
-            "hidden_states": x,
-            "w1": layer.w13_weight,
-            "w2": layer.w2_weight,
-            "w1_scale": layer.w13_weight_scale,
-            "w2_scale": layer.w2_weight_scale,
-            "w1_bias": None,
-            "w2_bias": None,
-            "topk_weights": topk_weights,
-            "topk_ids": topk_ids,
-            "experts_start": layer._experts_start,
-            "topk": layer.moe_config.experts_per_token,
-            "activation": activation_str,
-        }
-        if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
+        return topk_weights, topk_ids
 
-        return fused_moe_gmm(**kwargs)
+    def shared_in_combine_supported(self) -> bool:
+        """Whether apply_monolithic takes the plain GMM path (the one
+        apply_monolithic_shared extends) rather than a fused EP kernel."""
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
+        return not (
+            self._use_adaptive_fused_moe
+            or fused_moe_ep_supported(self)
+            or enable_pipelined_collective_and_compute()
+        )
+
+    def apply_monolithic_shared(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_act: torch.Tensor,
+        shared_w: torch.Tensor,
+        shared_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """apply_monolithic's GMM path plus the shared expert's down
+        projection, added inside the TensorCore combine where it runs
+        (TPU_MINIMAX_M3_SHARED_IN_COMBINE)."""
+        layer = cast("TpuRoutedExperts", layer)
+        activation_str = self._tpu_activation_str
+        assert activation_str is not None
+        topk_weights, topk_ids = self._gmm_route(layer, x, router_logits)
+        return fused_moe_gmm_shared(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=layer._experts_start,
+            shared_act=shared_act,
+            shared_w=shared_w,
+            shared_scale=shared_scale,
+            topk=layer.moe_config.experts_per_token,
+            activation=activation_str,
+        )
 
 
 _skip_padded_logged = False

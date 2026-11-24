@@ -97,6 +97,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_FP8_CAST_NORM: bool = False
     TPU_MINIMAX_M3_SP_HIER_RS: bool = False
     TPU_MINIMAX_M3_SP_HIER_RS_MIN_TOKENS: int = 8192
+    TPU_MINIMAX_M3_SHARED_IN_COMBINE: bool = False
+    TPU_MINIMAX_M3_SHARED_IN_COMBINE_MIN_TOKENS: int = 4096
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -896,6 +898,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of the bf16 rows dequantized from them (bf16 x bf16).
     "TPU_MINIMAX_M3_SP_E4M3_SHARED": env_bool(
         "TPU_MINIMAX_M3_SP_E4M3_SHARED", default=False
+    ),
+    # "full" SP steps whose MoE combine runs on the TensorCore
+    # (TPU_MOE_TC_COMBINE): the shared expert's down_proj runs inside the
+    # combine's output pass (kernels/megablox/tc_combine.tc_combine_shared),
+    # so its [T, hidden] partial never round-trips HBM. Same roundings as the
+    # unfused graph; only the K=384 dot's accumulation order may differ.
+    "TPU_MINIMAX_M3_SHARED_IN_COMBINE": env_bool(
+        "TPU_MINIMAX_M3_SHARED_IN_COMBINE", default=False
+    ),
+    # Smallest step it applies to (exos microbench: -69 us/layer at 8192,
+    # -30 at 4096, +6..+15 at 1024-2048).
+    "TPU_MINIMAX_M3_SHARED_IN_COMBINE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_SHARED_IN_COMBINE_MIN_TOKENS", 4096
     ),
     # "full" SP: instead of reduce-scattering o_proj's per-rank partial sums
     # (bf16 [T, hidden]), all-to-all the attention output (bf16 [T, heads/TP x
