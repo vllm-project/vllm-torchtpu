@@ -632,6 +632,8 @@ def _pooled_kda_regions(
     spec: Any,
     row_bytes: int,
     page_bytes: int,
+    extra_conv_rows: int = 0,
+    conv_dtype_override: str | None = None,
 ) -> dict[str, tuple[int, tuple[RegionSpec, ...]]]:
     """Expose KDA's live state through Qwen's two state pool tags.
 
@@ -648,6 +650,8 @@ def _pooled_kda_regions(
     if len(shapes) != 2 or len(dtypes) != 2:
         raise ManifestError("pooled KDA cache requires conv and SSM specs")
     conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(dtypes)
+    if conv_dtype_override is not None:
+        conv_dtype = conv_dtype_override
     try:
         conv_bytes = math.prod(shapes[0]) * pooled_gdn_state_itemsize(conv_dtype)
         ssm_bytes = math.prod(shapes[1]) * pooled_gdn_state_itemsize(ssm_dtype)
@@ -658,10 +662,11 @@ def _pooled_kda_regions(
         )
     except ValueError as exc:
         raise ManifestError(str(exc)) from exc
-    if layout.required_bytes > page_bytes:
+    if layout.required_bytes + extra_conv_rows * row_bytes > page_bytes:
         raise ManifestError(
             "KDA state exceeds its pooled page: "
             f"state={layout.required_bytes}, "
+            f"extra={extra_conv_rows * row_bytes}, "
             f"page={page_bytes}"
         )
     if str(ssm_dtype) != "torch.float32" or row_bytes % 4:
@@ -675,7 +680,11 @@ def _pooled_kda_regions(
             layout.ssm_tokens * row_bytes,
             (
                 RegionSpec(
-                    "kda_conv_rank_blocks", 0, row_bytes, row_bytes, layout.conv_tokens
+                    "kda_conv_rank_blocks",
+                    0,
+                    row_bytes,
+                    row_bytes,
+                    layout.conv_tokens + extra_conv_rows,
                 ),
             ),
         ),
@@ -993,6 +1002,8 @@ def build_kimi_k3_pool_manifest(
     kv_cache_groups: Sequence[Any],
     raw_tensors: Sequence[Any],
     mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
+    extra_state_rows: int = 0,
+    conv_dtype_override: str | None = None,
 ) -> PoolManifest:
     """Describe K3's packed MLA/KDA rows using the shared hybrid pool tags.
 
@@ -1045,7 +1056,11 @@ def build_kimi_k3_pool_manifest(
             )
         if is_state:
             layouts = _pooled_kda_regions(
-                spec=spec, row_bytes=row_bytes, page_bytes=page_bytes
+                spec=spec,
+                row_bytes=row_bytes,
+                page_bytes=page_bytes,
+                extra_conv_rows=extra_state_rows,
+                conv_dtype_override=conv_dtype_override,
             )
             suffix = _state_tag_suffix(layer_name, mamba_group_ordinal_by_layer)
             tags = (TAG_GDN_CONV, TAG_GDN_SSM)

@@ -1,0 +1,1310 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Streaming per-rank readers for the TP32 pre-shards (decode and prefill).
+
+Both megakernels read the same pre-sharded rank directories
+(``<presharded>/rankNN/{index.json, dense.bin, expert_*.bin}``); the prefill
+additionally reads the SP projection cache
+(``latent_down.bin``, ``latent_up.bin``, ``shared_{gu,down}_{0,1}.bin``).
+Seeks and mmap page faults are slow on network storage, so reads are mostly
+large sequential ``readinto`` calls on separate handles, straight into the
+numpy array the caller keeps (the regrouped EP16/EP32 expert parts slice
+memory-mapped shards instead).
+
+The iterators yield ``(group, name, array)`` host arrays for one rank, in
+the per-rank layout the kernels consume (no leading rank axis). They are
+independent of JAX so a vLLM worker can upload them through torch, and
+:func:`to_device` builds the kernels' rank-leading global arrays from them.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import threading
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import numpy as np
+
+from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3 import config as _config_mod
+
+
+def _config() -> _config_mod.KernelConfig:
+    return _config_mod.active()
+
+
+CHUNK = 64 << 20
+EXPERT_FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
+PREFILL_COMMON = (
+    "attn_res",
+    "attn_norm",
+    "mlp_res",
+    "ffn_norm",
+    "dense_gu",
+    "dense_down",
+)
+PREFILL_IO = ("embedding", "lm_head", "output_res", "final_norm")
+PREFILL_KDA = (
+    "k_gate",
+    "k_fb",
+    "k_projection",
+    "k_conv",
+    "k_a_log",
+    "k_dt",
+    "k_norm",
+    "k_o",
+)
+PREFILL_MLA = ("m_qa", "m_qb", "m_ka", "m_kb", "m_gate", "m_qnorm", "m_knorm", "m_o")
+PREFILL_MOE_DENSE = ("router", "router_bias", "latent_norm")
+# Prefill families that are the decode's tensors as loaded (EP8 experts; k_o and
+# m_o differ, and the latent and shared projections come from the SP cache).
+PREFILL_SHARED = (
+    PREFILL_IO
+    + PREFILL_COMMON
+    + tuple(n for n in PREFILL_KDA if n != "k_o")
+    + tuple(n for n in PREFILL_MLA if n != "m_o")
+    + PREFILL_MOE_DENSE
+    + EXPERT_FAMILIES
+)
+
+
+def _dtype(name: str) -> np.dtype:
+    if name == "bfloat16":
+        import ml_dtypes  # pyrefly: ignore[missing-import]
+
+        return np.dtype(ml_dtypes.bfloat16)
+    return np.dtype(name)
+
+
+STREAMS = _config().read_streams  # handles per contiguous range
+MIN_STREAM_BYTES = 256 << 20
+
+
+def _read_range(
+    path: Path, offset: int, view: memoryview, *, drop_cache: bool = False
+) -> None:
+    with open(path, "rb", buffering=0) as handle:
+        try:
+            handle.seek(offset)
+            position = 0
+            while position < len(view):
+                count = handle.readinto(view[position : position + CHUNK])
+                if not count:
+                    raise EOFError(f"{path}: short read at {offset + position}")
+                position += count
+        finally:
+            if (
+                drop_cache
+                and hasattr(os, "posix_fadvise")
+                and hasattr(os, "POSIX_FADV_DONTNEED")
+            ):
+                with contextlib.suppress(OSError):
+                    os.posix_fadvise(
+                        handle.fileno(), offset, len(view), os.POSIX_FADV_DONTNEED
+                    )
+
+
+def read_into(
+    path: Path,
+    offset: int,
+    out: np.ndarray,
+    streams: int | None = None,
+    *,
+    drop_cache: bool = False,
+) -> np.ndarray:
+    """Fill ``out`` (C-contiguous) from ``path`` at ``offset``: ``streams``
+    handles (default ``KernelConfig.read_streams``), each reading its own contiguous
+    part sequentially. Network storage throughput scales with handles, not
+    with threads sharing one."""
+    view = memoryview(out.reshape(-1).view(np.uint8))
+    streams = max(1, min(streams or STREAMS, len(view) // MIN_STREAM_BYTES))
+    if streams == 1:
+        _read_range(path, offset, view, drop_cache=drop_cache)
+        return out
+    step = -(-len(view) // streams)
+    step = -(-step // CHUNK) * CHUNK
+    parts = [(start, view[start : start + step]) for start in range(0, len(view), step)]
+    with ThreadPoolExecutor(len(parts)) as pool:
+        list(
+            pool.map(
+                lambda part: _read_range(
+                    path, offset + part[0], part[1], drop_cache=drop_cache
+                ),
+                parts,
+            )
+        )
+    return out
+
+
+def read_array(path: Path, offset: int, shape, dtype) -> np.ndarray:
+    return read_into(
+        path,
+        offset,
+        np.empty(tuple(shape), _dtype(dtype) if isinstance(dtype, str) else dtype),
+    )
+
+
+class RankDir:
+    """One rank's pre-shard directory and its index."""
+
+    def __init__(self, presharded, rank: int, layers: int = 93):
+        self.path = Path(presharded) / f"rank{rank:02d}"
+        self.index = json.loads((self.path / "index.json").read_text())
+        if self.index.get("rank") != rank or self.index.get("layers") != layers:
+            raise ValueError(f"unexpected pre-shard index in {self.path}")
+        self.families = self.index["families"]
+
+    def spec(self, name):
+        return self.families[name]
+
+    def dense_names(self):
+        return [
+            name
+            for name, spec in self.families.items()
+            if spec.get("file") == "dense.bin"
+        ]
+
+    def read_dense(self, name) -> np.ndarray:
+        spec = self.families[name]
+        return read_array(
+            self.path / "dense.bin", spec["offset"], spec["shape"], spec["dtype"]
+        )
+
+    def read_dense_all(self) -> dict[str, np.ndarray]:
+        """Every dense family in one sequential pass over ``dense.bin``."""
+        spec_of = {name: self.families[name] for name in self.dense_names()}
+        order = sorted(spec_of, key=lambda n: spec_of[n]["offset"])
+        end = max(
+            spec_of[n]["offset"]
+            + int(np.prod(spec_of[n]["shape"])) * _dtype(spec_of[n]["dtype"]).itemsize
+            for n in order
+        )
+        raw = read_into(self.path / "dense.bin", 0, np.empty(end, np.uint8))
+        result = {}
+        for name in order:
+            spec = spec_of[name]
+            dtype = _dtype(spec["dtype"])
+            count = int(np.prod(spec["shape"]))
+            result[name] = (
+                raw[spec["offset"] : spec["offset"] + count * dtype.itemsize]
+                .view(dtype)
+                .reshape(spec["shape"])
+            )
+        return result
+
+    def expert_parts(self, name):
+        """``(label, nbytes, reader)`` per file of an expert family, in layer
+        order; ``label`` is ``name@index/count`` (see ``join_parts``)."""
+        spec = self.families[name]
+        shape = tuple(spec["shape"])
+        dtype = _dtype(spec["dtype"])
+        per_layer = int(np.prod(shape[1:])) * dtype.itemsize
+        count = len(spec["files"])
+        for index, (filename, (lo, hi)) in enumerate(
+            zip(spec["files"], spec["layer_ranges"])
+        ):
+
+            def reader(filename=filename, lo=lo, hi=hi):
+                return read_into(
+                    self.path / filename, 0, np.empty((hi - lo, *shape[1:]), dtype)
+                )
+
+            yield f"{name}@{index}/{count}", (hi - lo) * per_layer, reader
+
+    def regrouped_expert_parts(self, name, quarter_dirs, part, parts):
+        """An expert family regrouped from EP8/TP4 shards, per file like
+        ``expert_parts``: experts ``part`` of ``parts`` equal slices of the EP8
+        group's 112, over the TP4 quarters in ``quarter_dirs`` (all four:
+        whole experts, EP32; two: half the intermediate, EP16/TP2) -- gate
+        quarters then up quarters along N, down and its scales along K."""
+        spec = self.families[name]
+        shape = tuple(spec["shape"])  # [layers, 112, ...] per quarter
+        dtype = _dtype(spec["dtype"])
+        experts = shape[1] // parts
+        count = len(spec["files"])
+        nbytes = (
+            int(np.prod((experts,) + shape[2:])) * dtype.itemsize * len(quarter_dirs)
+        )
+        for index, (filename, (lo, hi)) in enumerate(
+            zip(spec["files"], spec["layer_ranges"])
+        ):
+
+            def reader(filename=filename, lo=lo, hi=hi):
+                quarters = []
+                for rank_dir in quarter_dirs:
+                    array = np.memmap(
+                        rank_dir.path / filename,
+                        dtype,
+                        "r",
+                        shape=(hi - lo, *shape[1:]),
+                    )
+                    quarters.append(
+                        np.array(array[:, part * experts : (part + 1) * experts])
+                    )
+                if name in ("expert_gu", "expert_gus"):
+                    half = shape[-1] // 2
+                    return np.concatenate(
+                        [q[..., :half] for q in quarters]
+                        + [q[..., half:] for q in quarters],
+                        axis=-1,
+                    )
+                return np.concatenate(quarters, axis=2)
+
+            yield f"{name}@{index}/{count}", (hi - lo) * nbytes, reader
+
+    def read_expert_family(self, name) -> np.ndarray:
+        """One expert family ``[92, ...]`` from its files, one reader per file."""
+        spec = self.families[name]
+        shape = tuple(spec["shape"])
+        dtype = _dtype(spec["dtype"])
+        out = np.empty(shape, dtype)
+        with ThreadPoolExecutor(len(spec["files"])) as pool:
+            list(
+                pool.map(
+                    lambda item: read_into(
+                        self.path / item[0], 0, out[item[1][0] : item[1][1]]
+                    ),
+                    zip(spec["files"], spec["layer_ranges"]),
+                )
+            )
+        return out
+
+
+def split_kda_projection(families: dict) -> dict:
+    """Split ``k_gate`` out of an older pre-shard's ``k_projection [.., 1792]``."""
+    combined = families.get("k_projection")
+    if combined is not None and combined.shape[-1] == 1792 and "k_gate" not in families:
+        families["k_gate"] = np.ascontiguousarray(combined[..., 1152:1280])
+        families["k_projection"] = np.ascontiguousarray(
+            np.concatenate((combined[..., :1152], combined[..., 1280:]), axis=-1)
+        )
+    return families
+
+
+# Host bytes one rank may hold in flight while loading. Eight ranks share a
+# host; larger budgets can push a NUMA node into direct reclaim and evict the
+# page cache that keeps restarts warm.
+INFLIGHT_BYTES = int(_config().load_inflight_gb * 2**30)
+
+
+def _budgeted(jobs, *, budget: int = INFLIGHT_BYTES, workers: int = 8):
+    """Run ``(key, nbytes, fn)`` jobs on threads with at most ``budget`` bytes
+    in flight (one job always may run), yielding ``(key, result)`` in job
+    order; a job's bytes are released when the caller resumes after it."""
+    jobs = list(jobs)
+    with ThreadPoolExecutor(workers) as pool:
+        pending: list = []  # (key, nbytes, future) in submission order
+        inflight = 0
+        next_job = 0
+
+        def fill():
+            nonlocal inflight, next_job
+            while next_job < len(jobs):
+                key, nbytes, fn = jobs[next_job]
+                if pending and inflight + nbytes > budget:
+                    return
+                pending.append((key, nbytes, pool.submit(fn)))
+                inflight += nbytes
+                next_job += 1
+
+        fill()
+        while pending:
+            key, nbytes, future = pending.pop(0)
+            result = future.result()
+            yield key, result
+            del result
+            inflight -= nbytes
+            fill()
+
+
+def _dense_bytes(rank_dir: RankDir) -> int:
+    specs = [rank_dir.families[n] for n in rank_dir.dense_names()]
+    return max(
+        s["offset"] + int(np.prod(s["shape"])) * _dtype(s["dtype"]).itemsize
+        for s in specs
+    )
+
+
+def _family_bytes(spec) -> int:
+    return int(np.prod(spec["shape"])) * _dtype(spec["dtype"]).itemsize
+
+
+def _expert_jobs(rank_dir: RankDir, split: bool):
+    """Expert families largest first, whole or (``split``) one job per file."""
+    experts = sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
+    for name in experts:
+        if split:
+            yield from rank_dir.expert_parts(name)
+        else:
+            yield (
+                name,
+                _family_bytes(rank_dir.spec(name)),
+                lambda n=name: rank_dir.read_expert_family(n),
+            )
+
+
+HOT_LOCAL = 112  # EP8 local experts; hot copies follow
+FP4_VALUES = np.array(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    np.float32,
+)
+
+
+# copy slot j is local expert id 112 + j; the expert loop's lane masks hold ids < 128
+MAX_COPY_SLOTS = 16
+
+
+def _plan_path(path):
+    if not os.path.isabs(path) and not os.path.exists(path):
+        # A bare name: one of the plans shipped in kimi_k3/data.
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", path
+        )
+    return path
+
+
+def _check_slots(path, experts, *, groups: int = 8, max_slots: int = MAX_COPY_SLOTS):
+    if (
+        experts.ndim != 3
+        or experts.shape[1] != groups
+        or not 1 <= experts.shape[2] <= max_slots
+    ):
+        raise ValueError(
+            f"plan {path}: experts must be [layers, {groups}, S] with 1 <= S <= "
+            f"{max_slots}"
+        )
+
+
+def hot_plan(rank: int, layers: int):
+    """This rank's hot copy slots, [layers - 1, S] local ids of its own EP group (-1
+    empty), or None.
+    Fails closed when the plan places another group's expert here (home-only copies)."""
+    path = _config().kd_hot_plan
+    if not path:
+        return None
+    path = _plan_path(path)
+    experts = np.load(path)["experts"][: layers - 1]
+    _check_slots(path, experts)
+    group = rank // 4
+    mine = experts[:, group, :]
+    if not np.all((mine < 0) | (mine // HOT_LOCAL == group)):
+        raise ValueError(
+            f"hot plan {path}: EP group {group} slots hold experts of other groups "
+            "(home-only loader)"
+        )
+    return np.where(mine < 0, -1, mine % HOT_LOCAL).astype(np.int32), experts
+
+
+def _family_slice(rank_dir, name, layer, expert):
+    """One expert's entry of a family at one layer, memory-mapped from its file."""
+    spec = rank_dir.families[name]
+    shape = tuple(spec["shape"])
+    dtype = _dtype(spec["dtype"])
+    for filename, (lo, hi) in zip(spec["files"], spec["layer_ranges"]):
+        if lo <= layer < hi:
+            array = np.memmap(
+                rank_dir.path / filename, dtype, "r", shape=(hi - lo, *shape[1:])
+            )
+            return np.array(array[layer - lo, expert])
+    raise KeyError((name, layer))
+
+
+def _fp8_words(packed, scales):
+    """MXFP4 [K/8, N] u32 + E8M0 [K/32, N] -> fp8 e4m3 rows packed 4 per u32 word
+    ([K/4, N], row 4r + b in
+    byte b), FP32 column scales [N], and whether the re-expression was exact."""
+    import ml_dtypes  # pyrefly: ignore[missing-import]
+
+    k8, columns = packed.shape
+    nibbles = np.stack([(packed >> (4 * i)) & 15 for i in range(8)], axis=1).reshape(
+        k8 * 8, columns
+    )
+    values = FP4_VALUES[nibbles]
+    exponents = scales.astype(np.int32)
+    emax = exponents.max(axis=0)
+    relative = np.ldexp(
+        np.float32(1), np.repeat(exponents - emax[None, :], 32, axis=0)
+    ).astype(np.float32)
+    scaled = values * relative
+    fp8 = scaled.astype(ml_dtypes.float8_e4m3fn)
+    exact = bool(np.array_equal(fp8.astype(np.float32), scaled))
+    words = (
+        fp8.view(np.uint8)
+        .reshape(k8 * 2, 4, columns)
+        .transpose(0, 2, 1)
+        .copy()
+        .view("<u4")
+        .reshape(k8 * 2, columns)
+    )
+    column = np.ldexp(np.float32(1), emax - 127).astype(np.float32)
+    return words, column, exact
+
+
+def _extend_hot(rank_dir, name, part, lo, slots):
+    """Append S hot copies (two entries each) to one layer-range part of an expert
+    family."""
+    n_layers, _, rows, columns = part.shape
+    count = slots.shape[1]
+    extra = np.zeros((n_layers, 2 * count, rows, columns), part.dtype)
+    inexact = 0
+    for i in range(n_layers):
+        for j, expert in enumerate(slots[lo + i]):
+            if expert < 0:
+                continue
+            if name in ("expert_gu", "expert_down"):
+                scale_name = "expert_gus" if name == "expert_gu" else "expert_ds"
+                words, _, exact = _fp8_words(
+                    part[i, expert], _family_slice(rank_dir, scale_name, lo + i, expert)
+                )
+                extra[i, 2 * j : 2 * j + 2] = words.reshape(2, rows, columns)
+                inexact += not exact
+            else:
+                exponents = part[i, expert].astype(np.int32)
+                column = np.ldexp(np.float32(1), exponents.max(axis=0) - 127).astype(
+                    np.float32
+                )
+                extra[i, 2 * j, :4] = column.view(np.uint8).reshape(columns, 4).T
+    if inexact:
+        raise ValueError(
+            f"{name}: {inexact} hot copies are not exact in fp8 (E8M0 spread too wide)"
+        )
+    return np.concatenate([part, extra], axis=1)
+
+
+def _hot_table(latent_norm, experts):
+    """The hot-copy table in latent_norm's zero padding lanes (as f32): 3584 + i expert
+    id,
+    3584 + 8S + i holder group, 3584 + 16S + i local slot id, i = g * S + j."""
+    count = experts.shape[2]
+    table = latent_norm.copy()
+    for g in range(8):
+        for j in range(count):
+            i = g * count + j
+            table[:, 0, 3584 + i] = experts[:, g, j]
+            table[:, 0, 3584 + 8 * count + i] = np.where(experts[:, g, j] < 0, -1, g)
+            table[:, 0, 3584 + 16 * count + i] = np.where(
+                experts[:, g, j] < 0, -1, HOT_LOCAL + j
+            )
+    return table
+
+
+def _load_replica_plan(
+    raw_path: str,
+    rank: int,
+    layers: int,
+    *,
+    ep_groups: int,
+    expert_order: np.ndarray | None = None,
+):
+    if not raw_path:
+        return None
+    ep_tp = 32 // ep_groups
+    max_slots = MAX_COPY_SLOTS // (2 if ep_groups == 16 else 1)
+    path = _plan_path(raw_path)
+    plan = np.load(path)
+    experts = plan["experts"][: layers - 1].astype(np.int64)
+    _check_slots(path, experts, groups=ep_groups, max_slots=max_slots)
+    order = plan["order"][: layers - 1].astype(np.int64)
+    is_physical = bool(plan["physical"]) if "physical" in plan else False
+    if expert_order is not None and not is_physical:
+        inv_order = np.argsort(expert_order, axis=1)
+        remapped = experts.copy()
+        for layer in range(experts.shape[0]):
+            mask = experts[layer] >= 0
+            remapped[layer, mask] = inv_order[layer, experts[layer, mask]]
+        experts = remapped
+    count = experts.shape[2]
+    entries = ep_groups * count
+    if order.shape != (experts.shape[0], entries) or any(
+        sorted(order[layer].tolist()) != list(range(entries))
+        for layer in range(order.shape[0])
+    ):
+        raise ValueError(
+            f"replica plan {path}: order must permute the {ep_groups} S slots of "
+            "every layer"
+        )
+    for layer in range(experts.shape[0]):
+        used = experts[layer][experts[layer] >= 0]
+        if (
+            used.max(initial=-1) >= 8 * HOT_LOCAL
+            or len(set(used.tolist())) != used.size
+        ):
+            raise ValueError(
+                f"replica plan {path}: layer {layer} has invalid or repeated experts"
+            )
+    return experts[:, rank // ep_tp, :], experts, order
+
+
+def replica_plan(rank: int, layers: int, *, expert_order: np.ndarray | None = None):
+    return _load_replica_plan(
+        _config().kd_replica_plan,
+        rank,
+        layers,
+        ep_groups=_config().decode_expert_parallel,
+        expert_order=expert_order,
+    )
+
+
+def prefill_replica_plan(
+    rank: int, layers: int, *, expert_order: np.ndarray | None = None
+):
+    return _load_replica_plan(
+        _config().prefill_replica_plan,
+        rank,
+        layers,
+        ep_groups=_config().prefill_expert_parallel,
+        expert_order=expert_order,
+    )
+
+
+def prefill_replica_slots() -> int:
+    raw_path = _config().prefill_replica_plan
+    if not raw_path:
+        return 0
+    ep_groups = _config().prefill_expert_parallel
+    max_slots = MAX_COPY_SLOTS // (2 if ep_groups == 16 else 1)
+    path = _plan_path(raw_path)
+    experts = np.load(path)["experts"]
+    _check_slots(path, experts, groups=ep_groups, max_slots=max_slots)
+    return int(experts.shape[2])
+
+
+def prefill_replica_table(
+    layers: int, *, expert_order: np.ndarray | None = None
+) -> np.ndarray | None:
+    loaded = prefill_replica_plan(0, layers, expert_order=expert_order)
+    if loaded is None:
+        return None
+    _, experts, order = loaded
+    ep_groups, slots = experts.shape[1], experts.shape[2]
+    base_local = (8 * HOT_LOCAL) // ep_groups
+    n_rep = ep_groups * slots
+    table = np.zeros((experts.shape[0], 4 * n_rep), dtype=np.int32)
+    for layer in range(experts.shape[0]):
+        for idx, flat in enumerate(order[layer]):
+            rg, j = divmod(int(flat), slots)
+            he = int(experts[layer, rg, j])
+            if he < 0:
+                table[layer, idx] = -1
+                table[layer, n_rep + idx] = 0
+                table[layer, 2 * n_rep + idx] = 0
+                table[layer, 3 * n_rep + idx] = base_local
+            else:
+                hg = he // base_local
+                if hg == rg:
+                    raise ValueError(
+                        f"prefill replica plan layer {layer}: expert {he} "
+                        f"replicated onto its own home group {rg}"
+                    )
+                table[layer, idx] = he
+                table[layer, n_rep + idx] = hg
+                table[layer, 2 * n_rep + idx] = rg
+                table[layer, 3 * n_rep + idx] = base_local + j
+    return table
+
+
+def _regroup_ep16_expert_quarters(
+    name: str, q0: np.ndarray, q1: np.ndarray
+) -> np.ndarray:
+    if name in ("expert_gu", "expert_gus"):
+        half = q0.shape[-1] // 2
+        return np.concatenate(
+            (q0[..., :half], q1[..., :half], q0[..., half:], q1[..., half:]),
+            axis=-1,
+        )
+    return np.concatenate((q0, q1), axis=0)
+
+
+def _extend_replicas(
+    rank_dir,
+    presharded,
+    name,
+    part,
+    lo,
+    slots,
+    rank,
+    *,
+    expert_order=None,
+    ep_groups: int | None = None,
+):
+    ep = _config().decode_expert_parallel if ep_groups is None else ep_groups
+    local_experts = (8 * HOT_LOCAL) // ep
+    ep_tp = 32 // ep
+    group = rank // ep_tp
+    n_layers = part.shape[0]
+    count = slots.shape[1]
+    extra = np.zeros((n_layers, count, *part.shape[2:]), part.dtype)
+    spec = rank_dir.families[name]
+    shape = tuple(spec["shape"])
+    expert_bytes = int(np.prod(shape[2:])) * part.dtype.itemsize
+    file_ranges = list(zip(spec["files"], spec["layer_ranges"]))
+    sources: dict[int, RankDir] = {}
+    read_jobs: list[tuple[Path, int, memoryview]] = []
+    ep16_merges: list[tuple[int, int, np.ndarray, np.ndarray]] = []
+    quarters = (2 * (rank % 2), 2 * (rank % 2) + 1)
+    for i in range(n_layers):
+        layer = lo + i
+        filename, (r_lo, _) = next(
+            item for item in file_ranges if item[1][0] <= layer < item[1][1]
+        )
+        for j, expert in enumerate(slots[layer]):
+            if expert < 0:
+                continue
+            p = int(expert)
+            if p // local_experts == group:
+                extra[i, j] = part[i, p % local_experts]
+                continue
+            orig_e = int(expert_order[layer, p]) if expert_order is not None else p
+            disk_group = orig_e // HOT_LOCAL
+            offset = ((layer - r_lo) * HOT_LOCAL + (orig_e % HOT_LOCAL)) * expert_bytes
+            if ep == 16:
+                q_bufs = (
+                    np.empty(shape[2:], part.dtype),
+                    np.empty(shape[2:], part.dtype),
+                )
+                for q_idx, q in enumerate(quarters):
+                    owner = 4 * disk_group + q
+                    if owner not in sources:
+                        sources[owner] = RankDir(
+                            presharded, owner, rank_dir.index["layers"]
+                        )
+                    read_jobs.append(
+                        (
+                            sources[owner].path / filename,
+                            offset,
+                            memoryview(q_bufs[q_idx].reshape(-1).view(np.uint8)),
+                        )
+                    )
+                ep16_merges.append((i, j, q_bufs[0], q_bufs[1]))
+            else:
+                owner = 4 * disk_group + rank % 4
+                if owner not in sources:
+                    sources[owner] = RankDir(
+                        presharded, owner, rank_dir.index["layers"]
+                    )
+                read_jobs.append(
+                    (
+                        sources[owner].path / filename,
+                        offset,
+                        memoryview(extra[i, j].reshape(-1).view(np.uint8)),
+                    )
+                )
+    if read_jobs:
+        with ThreadPoolExecutor(min(16, len(read_jobs))) as pool:
+            list(
+                pool.map(
+                    lambda job: _read_range(job[0], job[1], job[2], drop_cache=True),
+                    read_jobs,
+                )
+            )
+    for i, j, q0_buf, q1_buf in ep16_merges:
+        extra[i, j] = _regroup_ep16_expert_quarters(name, q0_buf, q1_buf)
+    return np.concatenate([part, extra], axis=1)
+
+
+def _replica_table(latent_norm, experts, order):
+    ep_groups, count = experts.shape[1], experts.shape[2]
+    local_experts = (8 * HOT_LOCAL) // ep_groups
+    entries = ep_groups * count
+    table = latent_norm.copy()
+    if 3584 + 3 * entries > table.shape[-1] or np.any(
+        table[:, 0, 3584 : 3584 + 3 * entries] != 0
+    ):
+        raise ValueError("latent_norm padding lanes are insufficient or non-zero")
+    for layer in range(experts.shape[0]):
+        for i, flat in enumerate(order[layer]):
+            g, j = divmod(int(flat), count)
+            expert = experts[layer, g, j]
+            table[layer, 0, 3584 + i] = expert
+            table[layer, 0, 3584 + entries + i] = g if expert >= 0 else -1
+            table[layer, 0, 3584 + 2 * entries + i] = (
+                local_experts + j if expert >= 0 else -1
+            )
+    return table
+
+
+def _join_expert_jobs(jobs):
+    jobs = list(jobs)
+    out = []
+    index = 0
+    while index < len(jobs):
+        key = jobs[index][0]
+        family, marker, suffix = key.partition("@")
+        if not marker:
+            out.append(jobs[index])
+            index += 1
+            continue
+        count = int(suffix.split("/")[1])
+        parts = jobs[index : index + count]
+        if [k for k, _, _ in parts] != [f"{family}@{i}/{count}" for i in range(count)]:
+            raise ValueError(f"expert parts of {family} are not consecutive")
+
+        def reader(parts=parts):
+            return np.concatenate([read() for _, _, read in parts], axis=0)
+
+        out.append((family, sum(n for _, n, _ in parts), reader))
+        index += count
+    return out
+
+
+def _ep16_expert_jobs(presharded, rank_dir: RankDir, rank: int, layers: int):
+    group = 4 * (rank // 4)
+    quarters = (2 * (rank % 2), 2 * (rank % 2) + 1)
+    part = (rank // 2) % 2
+    quarter_dirs = [RankDir(presharded, group + q, layers) for q in quarters]
+    for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n))):
+        yield from rank_dir.regrouped_expert_parts(name, quarter_dirs, part, 2)
+
+
+def iter_decode_rank(
+    presharded,
+    rank: int,
+    *,
+    layers: int = 93,
+    split_experts: bool = False,
+    attention_dp: int = 1,
+) -> Iterator[tuple[str, str, np.ndarray]]:
+    """The decode megakernel's weights for ``rank`` (MXFP4 experts as stored).
+
+    Yields ``("decode", name, array)``: the four packed expert families
+    (largest first; with ``split_experts`` one array per file, named
+    ``family@index/count``, layer ranges in order -- the caller joins them),
+    then every dense family (``k_projection`` split into ``k_gate`` and the
+    rest), with at most ``KernelConfig.load_inflight_gb`` of host buffers in flight.
+    With ``attention_dp`` > 1 the head-sharded attention families hold the
+    rank's held TP32 shards (see :func:`attention_dp_families`).
+    """
+    rank_dir = RankDir(presharded, rank, layers)
+    plan = hot_plan(rank, layers)
+    decode_ep = _config().decode_expert_parallel
+    expert_order = (
+        prefill_expert_plan(layers)
+        if _config().prefill_expert_parallel == decode_ep and plan is None
+        else None
+    )
+    replicas = replica_plan(rank, layers, expert_order=expert_order)
+    shared_prefill_replicas = (
+        prefill_replica_plan(rank, layers, expert_order=expert_order)
+        if replicas is None
+        and decode_ep == 16
+        and _config().prefill_expert_parallel == 16
+        else None
+    )
+    weight_replicas = replicas if replicas is not None else shared_prefill_replicas
+    jobs: list[tuple[str, int, object]]
+    if decode_ep == 16:
+        if expert_order is not None:
+            jobs = [
+                job
+                for name in sorted(
+                    EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n))
+                )
+                for job in _planned_expert_parts(
+                    presharded, rank_dir, name, rank, expert_order, layers
+                )
+            ]
+        else:
+            jobs = list(_ep16_expert_jobs(presharded, rank_dir, rank, layers))
+        if not split_experts:
+            jobs = _join_expert_jobs(jobs)
+    elif expert_order is not None:
+        jobs = [
+            job
+            for name in sorted(
+                EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n))
+            )
+            for job in _planned_expert_jobs_ep8(
+                presharded,
+                rank_dir,
+                name,
+                rank,
+                expert_order,
+                layers,
+                split=split_experts,
+            )
+        ]
+    else:
+        jobs = list(_expert_jobs(rank_dir, split_experts))
+    jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
+    for key, value in _budgeted(jobs):
+        if plan is not None and key != "dense":
+            family, _, part = key.partition("@")
+            index = int(part.split("/")[0]) if part else 0
+            lo = rank_dir.families[family]["layer_ranges"][index][0] if part else 0
+            value = _extend_hot(rank_dir, family, value, lo, plan[0])
+        if weight_replicas is not None and key != "dense":
+            family, _, part = key.partition("@")
+            index = int(part.split("/")[0]) if part else 0
+            lo = rank_dir.families[family]["layer_ranges"][index][0] if part else 0
+            value = _extend_replicas(
+                rank_dir,
+                presharded,
+                family,
+                value,
+                lo,
+                weight_replicas[0],
+                rank,
+                expert_order=expert_order,
+                ep_groups=decode_ep,
+            )
+        if key == "dense":
+            families = split_kda_projection(value)
+            if plan is not None:
+                families["latent_norm"] = _hot_table(families["latent_norm"], plan[1])
+            if replicas is not None:
+                families["latent_norm"] = _replica_table(
+                    families["latent_norm"], replicas[1], replicas[2]
+                )
+            if expert_order is not None:
+                for rname in ("router", "router_bias"):
+                    if rname in families:
+                        families[rname] = np.ascontiguousarray(
+                            np.take_along_axis(
+                                families[rname],
+                                expert_order[:, None, :].astype(np.int64),
+                                axis=-1,
+                            )
+                        )
+            if attention_dp > 1:
+                families.update(
+                    attention_dp_families(
+                        families, presharded, rank, layers, attention_dp
+                    )
+                )
+            for name, family in families.items():
+                yield "decode", name, family
+        else:
+            yield "decode", key, value
+
+
+def attention_dp_families(
+    families: dict, presharded, rank: int, layers: int, dp: int
+) -> dict:
+    """Attention DP's head-sharded families for ``rank``: its TP32 shards
+    ``rank % (32 / dp) + k * (32 / dp)`` in order ``k``, concatenated or
+    stacked as ``decode_megakernel.to_attention_dp`` lays them out, the other
+    shards read from their ranks' pre-shards."""
+    from .decode_megakernel import (
+        ATTENTION_DP_WEIGHTS,
+    )
+
+    group = 32 // dp
+    shards = []
+    for shard in range(dp):
+        source = rank % group + shard * group
+        if source == rank:
+            shards.append(families)
+            continue
+        peer = RankDir(presharded, source, layers)
+        names = [name for name in ATTENTION_DP_WEIGHTS if name in peer.families]
+        shards.append(
+            split_kda_projection({name: peer.read_dense(name) for name in names})
+        )
+    held = {}
+    for name, (kind, axis) in ATTENTION_DP_WEIGHTS.items():
+        parts = [shard[name] for shard in shards]
+        if axis is None:  # "stack"
+            held[name] = np.stack(parts, axis=1)
+        else:
+            held[name] = np.concatenate(parts, axis=1 + axis)
+    return held
+
+
+def _sequence_parallel_output(
+    own: np.ndarray, peer_dir: RankDir, name: str, rank: int
+) -> np.ndarray:
+    """Prefill TP32 output projection from the chip pair's decode shards."""
+    pair, part = divmod(rank, 2)
+    rows = slice(part * 384, (part + 1) * 384)
+    peer = peer_dir.read_dense(name)
+    halves = (own, peer) if rank % 2 == 0 else (peer, own)
+    return np.ascontiguousarray(np.concatenate([h[:, rows] for h in halves], axis=-1))
+
+
+def prefill_expert_plan(layers: int):
+    """The prefill EP16 expert placement (``KernelConfig.prefill_expert_plan``):
+    ``order [layers - 1, 896]``, the logical expert at each physical slot
+    (chip c holds slots 56c..56c+55), or None. A bare name loads from
+    kimi_k3/data."""
+    path = _config().prefill_expert_plan
+    if not path:
+        return None
+    order = np.load(_plan_path(path))["order"].astype(np.int64)
+    if order.shape != (layers - 1, 896) or any(
+        sorted(row) != list(range(896)) for row in order.tolist()
+    ):
+        raise ValueError(
+            f"prefill expert plan {path}: order must be [{layers - 1}, 896] "
+            "permutations"
+        )
+    return order
+
+
+def _planned_expert_parts(presharded, rank_dir, name, rank, order, layers):
+    """``RankDir.regrouped_expert_parts`` for EP16/TP2 with a placement plan:
+    chip ``rank // 2`` holds, per layer, the experts ``order[l, 56 c:56 c + 56]``
+    (from any EP8 group's pre-shard), half the intermediate (quarters
+    2 (rank % 2) and 2 (rank % 2) + 1)."""
+    spec = rank_dir.spec(name)
+    shape = tuple(spec["shape"])  # [layers, 112, ...] per quarter
+    dtype = _dtype(spec["dtype"])
+    chip, quarters = rank // 2, (2 * (rank % 2), 2 * (rank % 2) + 1)
+    dirs = {}
+
+    def source(group, q):
+        key = 4 * group + q
+        if key not in dirs:
+            dirs[key] = RankDir(presharded, key, layers)
+        return dirs[key]
+
+    count = len(spec["files"])
+    nbytes = int(np.prod((56,) + shape[2:])) * dtype.itemsize * len(quarters)
+    for index, (filename, (lo, hi)) in enumerate(
+        zip(spec["files"], spec["layer_ranges"])
+    ):
+
+        def reader(filename=filename, lo=lo, hi=hi):
+            # One contiguous read per (layer, expert, quarter), many in flight:
+            # memmap page faults over network storage are far slower.
+            expert_bytes = int(np.prod(shape[2:])) * dtype.itemsize
+            raw = {q: np.empty((hi - lo, 56, *shape[2:]), dtype) for q in quarters}
+            jobs = []
+            for layer in range(lo, hi):
+                experts = order[layer, 56 * chip : 56 * chip + 56]
+                for slot, expert in enumerate(experts):
+                    group, index = int(expert) // 112, int(expert) % 112
+                    for q in quarters:
+                        offset = ((layer - lo) * shape[1] + index) * expert_bytes
+                        jobs.append(
+                            (
+                                source(group, q).path / filename,
+                                offset,
+                                raw[q][layer - lo, slot],
+                            )
+                        )
+            with ThreadPoolExecutor(32) as pool:
+                list(
+                    pool.map(
+                        lambda job: read_into(job[0], job[1], job[2], streams=1), jobs
+                    )
+                )
+            layers_out = []
+            for layer in range(lo, hi):
+                parts = [raw[q][layer - lo] for q in quarters]
+                if name in ("expert_gu", "expert_gus"):
+                    half = shape[-1] // 2
+                    layers_out.append(
+                        np.concatenate(
+                            [q[..., :half] for q in parts]
+                            + [q[..., half:] for q in parts],
+                            axis=-1,
+                        )
+                    )
+                else:
+                    layers_out.append(np.concatenate(parts, axis=1))
+            return np.stack(layers_out)
+
+        yield f"{name}@{index}/{count}", (hi - lo) * nbytes, reader
+
+
+def _planned_expert_jobs_ep8(
+    presharded, rank_dir, name, rank, order, layers, *, split: bool
+):
+    """EP8/TP4 expert parts permuted by ``order [layers - 1, 896]``:
+    EP8 group ``rank // 4`` holds ``order[l, 112 g : 112 g + 112]``
+    (quarter ``rank % 4``)."""
+    spec = rank_dir.spec(name)
+    shape = tuple(spec["shape"])  # [layers, 112, ...] per quarter
+    dtype = _dtype(spec["dtype"])
+    ep_group, quarter = rank // 4, rank % 4
+    dirs = [RankDir(presharded, 4 * g + quarter, layers) for g in range(8)]
+
+    count = len(spec["files"])
+    expert_bytes = int(np.prod(shape[2:])) * dtype.itemsize
+    nbytes = 112 * expert_bytes
+    parts = []
+    for index, (filename, (lo, hi)) in enumerate(
+        zip(spec["files"], spec["layer_ranges"])
+    ):
+        part_bytes = (hi - lo) * nbytes
+
+        def reader(filename=filename, lo=lo, hi=hi):
+            out = np.empty((hi - lo, 112, *shape[2:]), dtype)
+            jobs = []
+            for layer in range(lo, hi):
+                experts = order[layer, 112 * ep_group : 112 * ep_group + 112]
+                for slot, expert in enumerate(experts):
+                    sg, idx = int(expert) // 112, int(expert) % 112
+                    offset = ((layer - lo) * 112 + idx) * expert_bytes
+                    jobs.append(
+                        (dirs[sg].path / filename, offset, out[layer - lo, slot])
+                    )
+            with ThreadPoolExecutor(32) as pool:
+                list(
+                    pool.map(
+                        lambda job: read_into(
+                            job[0], job[1], job[2], streams=1, drop_cache=True
+                        ),
+                        jobs,
+                    )
+                )
+            return out
+
+        parts.append((f"{name}@{index}/{count}", part_bytes, reader))
+
+    if split:
+        yield from parts
+    else:
+        yield (
+            name,
+            _family_bytes(spec),
+            lambda parts=parts: np.concatenate([fn() for _, _, fn in parts], axis=0),
+        )
+
+
+def iter_prefill_rank(
+    presharded,
+    projection_cache,
+    rank: int,
+    *,
+    layers: int = 93,
+    split_experts: bool = False,
+    skip: frozenset = frozenset(),
+) -> Iterator[tuple[str, str, np.ndarray]]:
+    """The prefill stack's weights for ``rank``.
+
+    Yields ``(group, name, array)`` with ``group`` in io/common/kda/mla/moe
+    (per-rank arrays, without the rank axis); expert families first
+    (``split_experts``: per file, as in :func:`iter_decode_rank`). Families in
+    ``skip`` (a subset of :data:`PREFILL_SHARED`, EP8 only for the experts)
+    are not read: the caller already holds them.
+    """
+    if not skip <= set(PREFILL_SHARED):
+        raise ValueError(
+            f"prefill families {sorted(skip - set(PREFILL_SHARED))} cannot be shared"
+        )
+    rank_dir = RankDir(presharded, rank, layers)
+    peer_dir = RankDir(presharded, rank ^ 1, layers)
+    cache = Path(projection_cache)
+    layout = json.loads((cache / "layout.json").read_text())
+    if layout.get("layers") != layers:
+        raise ValueError(f"unexpected projection cache {cache}")
+
+    def projection(name):
+        spec = layout["families"][name]
+        return read_array(cache / spec["file"], 0, spec["shape"], spec["dtype"])
+
+    parity = rank % 2
+
+    def cached(name):
+        spec = layout["families"][name]
+        return (
+            int(np.prod(spec["shape"])) * _dtype(spec["dtype"]).itemsize,
+            lambda: projection(name),
+        )
+
+    ep = _config().prefill_expert_parallel
+    decode_ep = _config().decode_expert_parallel
+    if skip & set(EXPERT_FAMILIES) and (
+        ep != decode_ep or not set(EXPERT_FAMILIES) <= skip
+    ):
+        raise ValueError(
+            "only all four prefill expert families matching decode layout "
+            f"(EP{decode_ep}) are the decode's tensors"
+        )
+    plan = prefill_expert_plan(layers) if ep in (8, 16) else None
+    p_replicas = (
+        prefill_replica_plan(rank, layers, expert_order=plan) if ep == 16 else None
+    )
+    jobs: list[tuple] = []
+    if skip & set(EXPERT_FAMILIES):
+        pass
+    elif ep in (16, 32):  # regrouped from the EP8 group's quarters (same host)
+        group = 4 * (rank // 4)
+        if ep == 32:  # 28 whole experts
+            quarters, part, parts = range(4), rank % 4, 4
+        else:  # 56 experts, half the intermediate (TP2 within the chip)
+            quarters, part, parts = (
+                (2 * (rank % 2), 2 * (rank % 2) + 1),
+                (rank // 2) % 2,
+                2,
+            )
+        quarter_dirs = [RankDir(presharded, group + q, layers) for q in quarters]
+        if plan is not None and ep == 16:
+            jobs += [
+                job
+                for name in sorted(
+                    EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n))
+                )
+                for job in _planned_expert_parts(
+                    presharded, rank_dir, name, rank, plan, layers
+                )
+            ]
+        else:
+            jobs += [
+                job
+                for name in sorted(
+                    EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n))
+                )
+                for job in rank_dir.regrouped_expert_parts(
+                    name, quarter_dirs, part, parts
+                )
+            ]
+        if not split_experts:
+            jobs = _join_expert_jobs(jobs)
+    else:
+        if plan is not None:
+            jobs += [
+                job
+                for name in sorted(
+                    EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n))
+                )
+                for job in _planned_expert_jobs_ep8(
+                    presharded, rank_dir, name, rank, plan, layers, split=split_experts
+                )
+            ]
+        else:
+            jobs += list(_expert_jobs(rank_dir, split_experts))
+    jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
+    for name, source in (
+        ("latent_down", "latent_down"),
+        ("latent_up", "latent_up"),
+        ("shared_gu", f"shared_gu_{parity}"),
+        ("shared_down", f"shared_down_{parity}"),
+    ):
+        nbytes, fn = cached(source)
+        jobs.append((name, nbytes, fn))
+    for key, value in _budgeted(jobs):
+        if key != "dense":
+            family, _, part = key.partition("@")
+            if p_replicas is not None and family in EXPERT_FAMILIES:
+                index = int(part.split("/")[0]) if part else 0
+                lo = rank_dir.families[family]["layer_ranges"][index][0] if part else 0
+                value = _extend_replicas(
+                    rank_dir,
+                    presharded,
+                    family,
+                    value,
+                    lo,
+                    p_replicas[0],
+                    rank,
+                    expert_order=plan,
+                    ep_groups=ep,
+                )
+            yield "moe", key, value
+            continue
+        families = split_kda_projection(value)
+        del value
+        for name in PREFILL_IO:
+            if name not in skip:
+                yield "io", name, families[name]
+        for name in PREFILL_COMMON:
+            if name not in skip:
+                yield "common", name, families[name]
+        for name in PREFILL_KDA:
+            if name in skip:
+                continue
+            family = families[name]
+            if name == "k_o":
+                family = _sequence_parallel_output(family, peer_dir, "k_o", rank)
+            yield "kda", name, family
+        for name in PREFILL_MLA:
+            if name in skip:
+                continue
+            family = families[name]
+            if name == "m_o":
+                family = _sequence_parallel_output(family, peer_dir, "m_o", rank)
+            yield "mla", name, family
+        for name in PREFILL_MOE_DENSE:
+            if name in skip:
+                continue
+            family = families[name]
+            if plan is not None and name in ("router", "router_bias"):
+                # Physical expert p's router column is logical expert order[l, p].
+                family = np.ascontiguousarray(
+                    np.take_along_axis(
+                        family, plan[:, None, :].astype(np.int64), axis=-1
+                    )
+                )
+            yield "moe", name, family
+        del families
+    if p_replicas is not None:
+        rep_table = prefill_replica_table(layers, expert_order=plan)
+        assert rep_table is not None
+        yield "moe", "prefill_replica_table", rep_table
+
+
+def to_device(mesh, iterator_for_rank, *, axis=None, ranks_in_flight: int = 8):
+    """Global rank-leading JAX arrays ``{group: {name: [32, ...]}}`` from a
+    per-rank iterator, for this process's devices of ``mesh``."""
+    import jax
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    axis = axis or mesh.axis_names[0]
+    devices = list(mesh.devices.flat)
+    local = [
+        rank
+        for rank, device in enumerate(devices)
+        if device.process_index == jax.process_index()
+    ]
+    per_rank: dict[int, dict] = {}
+    lock = threading.Lock()
+
+    def load(rank):
+        result: dict = {}
+        for group, name, value in iterator_for_rank(rank):
+            array = jax.device_put(value[None], devices[rank])
+            array.block_until_ready()
+            result.setdefault(group, {})[name] = array
+            del value
+        with lock:
+            per_rank[rank] = result
+
+    with ThreadPoolExecutor(min(ranks_in_flight, len(local))) as pool:
+        list(pool.map(load, local))
+    sharding = NamedSharding(mesh, P(axis))
+    sample = per_rank[local[0]]
+    return {
+        group: {
+            name: jax.make_array_from_single_device_arrays(
+                (len(devices), *sample[group][name].shape[1:]),
+                sharding,
+                [per_rank[rank][group][name] for rank in local],
+            )
+            for name in names
+        }
+        for group, names in sample.items()
+    }

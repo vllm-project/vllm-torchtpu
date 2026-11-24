@@ -1716,6 +1716,28 @@ def resolve_kernel_geometry(
     return kernel_block_size, per_block_shape, spec0.dtype, spec0.block_size
 
 
+def view_on_current_storage(
+    view: torch.Tensor, source: torch.Tensor | None
+) -> torch.Tensor:
+    """Rebuild ``view`` on the current storage of ``source`` (from offset 0)."""
+    if source is None:
+        return view
+    import torch
+
+    storage = source.untyped_storage()
+    assert view.storage_offset() == 0, view.storage_offset()
+    assert view.numel() * view.element_size() == storage.nbytes(), (
+        "registered view does not cover its pool storage: "
+        f"view_bytes={view.numel() * view.element_size()}, "
+        f"storage_bytes={storage.nbytes()}"
+    )
+    return (
+        torch.empty(0, dtype=view.dtype, device=source.device)
+        .set_(storage)
+        .view(view.shape)
+    )
+
+
 class RaidenStoreOffloadingWorker(OffloadingWorker):
     """Worker-side endpoint that registers local TPU HBM device buffers with
     the Controller.
@@ -1751,12 +1773,14 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         # backend, which is right only when the store has no storage tier:
         # with one, every save needs every worker to write its shard.
         backend_configs: Sequence[object] = (),
+        pool_sources: list[torch.Tensor] | None = None,
     ):
         import numpy as np
         import torch
 
         # Set before either branch below starts the registration thread.
         self._backend_configs = list(backend_configs)
+        self._pool_sources = list(pool_sources or ())
 
         (kernel_block_size, per_block_shape, kv_dtype, device_block_size) = (
             resolve_kernel_geometry(vllm_config, kv_cache_config)
@@ -1873,6 +1897,12 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         # Hold strong references to ensure PyTorch tensors remain allocated
         # while Raiden C++ retains raw pointers to their underlying storage.
         self._device_tensors = [[t] for t in device_tensors]
+        source_of = {int(s.untyped_storage().data_ptr()): s for s in self._pool_sources}
+        self._view_sources = (
+            [source_of.get(int(t.untyped_storage().data_ptr())) for t in device_tensors]
+            if source_of
+            else [None] * len(device_tensors)
+        )
         self._host_blocks_to_allocate = host_blocks_to_allocate
         self._controller_address = controller_address
         self._rank = rank
@@ -1927,6 +1957,14 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                         if self._backend_configs
                         else {}
                     )
+                    view_sources = getattr(self, "_view_sources", None)
+                    if view_sources is not None:
+                        self._device_tensors = [
+                            [view_on_current_storage(view, source)]
+                            for [view], source in zip(
+                                self._device_tensors, view_sources, strict=True
+                            )
+                        ]
                     self._mgr = _kcm.KVCacheManager(
                         kv_caches=self._device_tensors,
                         local_control_port=0,
@@ -2611,6 +2649,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         self._manager: RaidenOffloadingManager | None = None
         self._worker: RaidenStoreOffloadingWorker | None = None
+        self.pool_sources: list[torch.Tensor] = []
 
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
@@ -2718,5 +2757,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 rank=rank,
                 block_major_contract=self.block_major_contract,
                 backend_configs=backend_configs,
+                pool_sources=self.pool_sources,
             )
         return self._worker
