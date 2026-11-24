@@ -184,7 +184,7 @@ def qsa_step_inputs(
     lp = pool.shape[1] // 128
     if envs.VLLM_TPU_MK_WHOLE_BATCHED_INPUTS:
         # VLLM_TPU_MK_IO_LEAN=cktab: the manager-page key table built at its final width.
-        direct = manager_pages if io_lean("cktab") else 0
+        direct = manager_pages if io_lean("cktab", rows=M) else 0
         mtab, cktab, ring = _layer_batched_tables(
             pool, tables, slots, live, ctx, n_req, nreq, pages_per_seq, n_ck, lp,
             manager_pages=direct,

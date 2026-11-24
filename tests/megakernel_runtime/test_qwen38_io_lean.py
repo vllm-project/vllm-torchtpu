@@ -219,3 +219,26 @@ def test_scatter_from_history_negative_control():
     assert not np.array_equal(
         _bytes(jax.lax.bitcast_convert_type(got, jnp.uint8)),
         _bytes(jax.lax.bitcast_convert_type(want, jnp.uint8)))
+
+
+@pytest.mark.parametrize("cap", [48, 32])
+def test_cktab_and_conv_are_row_capped(monkeypatch, cap):
+    """cktab / conv switch off above VLLM_TPU_MK_IO_LEAN_MAX_ROWS rows (c32 b64 qsa_select
+    placement flip); the other levers and rows=None are not capped."""
+    from vllm_torchtpu.megakernel_runtime.qwen38_io_lean import io_lean as lean
+
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "all", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN_MAX_ROWS", cap, raising=False)
+    for rows in (4, 8, 16, 24, 32, 48, 64, 96):
+        for lever in ("cktab", "conv"):
+            assert lean(lever, rows=rows) == (rows <= cap), (lever, rows)
+        for lever in ("ring", "rope", "ple", "pleconv"):
+            assert lean(lever, rows=rows)
+    assert lean("cktab") and lean("conv")
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "ring", raising=False)
+    assert not lean("cktab", rows=8) and not lean("conv", rows=8)
+
+
+def test_max_rows_registered_default_48(monkeypatch):
+    monkeypatch.delenv("VLLM_TPU_MK_IO_LEAN_MAX_ROWS", raising=False)
+    assert envs.environment_variables["VLLM_TPU_MK_IO_LEAN_MAX_ROWS"]() == 48

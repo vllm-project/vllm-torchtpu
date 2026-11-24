@@ -48,9 +48,20 @@ def io_lean_levers(raw: str | None = None) -> frozenset[str]:
     return frozenset(parts)
 
 
-def io_lean(lever: str) -> bool:
+# Levers that stay off above VLLM_TPU_MK_IO_LEAN_MAX_ROWS rows (default 48): at c32
+# main-KV DCP-2 b64 either one turns `qsa_select` +12..17 us slower on every rank (an XLA
+# scheduling / placement effect; outputs identical, ~/q38f/scag/mk_iolean.md).
+ROW_CAPPED = frozenset({"cktab", "conv"})
+
+
+def io_lean(lever: str, rows: int | None = None) -> bool:
+    """Whether `lever` is on for a call of `rows` rows (`None`: not bucket-dependent)."""
     assert lever in LEVERS, lever
-    return lever in io_lean_levers()
+    if lever not in io_lean_levers():
+        return False
+    if lever in ROW_CAPPED and rows is not None:
+        return rows <= envs.VLLM_TPU_MK_IO_LEAN_MAX_ROWS
+    return True
 
 
 def ring_columns(tables: Any, n_rows: int, per_layer: int = 3) -> list:

@@ -180,6 +180,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_SCATTER_DEEP: bool = False
     VLLM_TPU_MK_STACKED_MAMBA_OPERANDS: bool = False
     VLLM_TPU_MK_IO_LEAN: str = ""
+    VLLM_TPU_MK_IO_LEAN_MAX_ROWS: int = 48
     VLLM_TPU_MK_BUCKET_TUNE: bool = False
     VLLM_TPU_MK_ROW_BUCKET: bool = False
     VLLM_TPU_MK_DRAFT: bool = False
@@ -1331,6 +1332,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # static shifts instead of gathers, and their history rows in one gather). Empty /
     # "0": off.
     "VLLM_TPU_MK_IO_LEAN": env_str("VLLM_TPU_MK_IO_LEAN", ""),
+    "VLLM_TPU_MK_IO_LEAN_MAX_ROWS": env_int("VLLM_TPU_MK_IO_LEAN_MAX_ROWS", 48),
     # Whole-step megakernel: per-row-bucket tile / tunable overrides (BUCKET_TUNE in
     # qwen38_wholestep_call). Layout-only entries keep the bytes; see its comments.
     "VLLM_TPU_MK_BUCKET_TUNE": env_bool("VLLM_TPU_MK_BUCKET_TUNE"),
