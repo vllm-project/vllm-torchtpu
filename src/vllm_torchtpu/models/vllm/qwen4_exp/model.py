@@ -148,6 +148,21 @@ def verify_shared_expert_replica(mlp, tp, label):
         raise ValueError(f"{label}: shared-expert replica differs from its TP slices")
 
 
+def verify_attn_out_full_replica(layer, tp, label):
+    """The replicated output projection holds exactly this rank's TP slice at
+    its offset (QWEN4_EXP_PREFILL_SP_EXIT_ALL_TO_ALL): both load the same
+    checkpoint tensor."""
+    if layer.layer_type == "linear_attention":
+        sliced = layer.linear_attn.out_proj.weight
+    else:
+        sliced = layer.self_attn.o_proj.weight
+    full, width = layer.attn_out_full.weight, sliced.shape[1]
+    if full.shape != (sliced.shape[0], width * tp.world_size):
+        raise ValueError(f"{label}: o_proj replica is not the unsliced shape")
+    if not torch.equal(full.narrow(1, tp.rank_in_group * width, width), sliced):
+        raise ValueError(f"{label}: o_proj replica differs from its TP slice")
+
+
 def verify_moe_checkpoint(mlp, prefix, source, moe_mapper, label):
     """Every locally owned routed expert and each shared-expert shard loaded.
 
@@ -1905,6 +1920,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             )
             if hasattr(layer.mlp, "shared_expert_local"):
                 verify_shared_expert_replica(layer.mlp, get_tp_group(), f"layer{i}")
+            if getattr(layer, "attn_out_full", None) is not None:
+                verify_attn_out_full_replica(layer, get_tp_group(), f"layer{i}")
             if layer.ple is not None:
                 layer.ple.finalize_weights()
             if layer.layer_type == "full_attention":

@@ -451,6 +451,29 @@ def test_gather_attention_input(tp2, monkeypatch, fp8):
     assert (err > 0).any()
 
 
+@pytest.mark.parametrize("layer_type", ["linear_attention", "full_attention"])
+def test_attn_out_full_replica_check(layer_type):
+    from vllm_torchtpu.models.vllm.qwen4_exp.model import verify_attn_out_full_replica
+
+    full = torch.randn(HIDDEN, 4 * 6)
+    rank = NS(rank_in_group=2, world_size=4)
+    proj = NS(weight=full[:, 12:18].clone())
+    attn = NS(out_proj=proj, o_proj=proj)
+    layer = NS(
+        layer_type=layer_type,
+        linear_attn=attn,
+        self_attn=attn,
+        attn_out_full=NS(weight=full),
+    )
+    verify_attn_out_full_replica(layer, rank, "layer0")
+    proj.weight = full[:, 6:12].clone()  # another rank's slice
+    with pytest.raises(ValueError, match="differs"):
+        verify_attn_out_full_replica(layer, rank, "layer0")
+    layer.attn_out_full = NS(weight=full[:, :18])
+    with pytest.raises(ValueError, match="unsliced shape"):
+        verify_attn_out_full_replica(layer, rank, "layer0")
+
+
 def test_ple_gate_sequence_parallel_matches_tp(tp2):
     from vllm_torchtpu.models.vllm.qwen4_exp.ple import Qwen4ExpPLELayer
 

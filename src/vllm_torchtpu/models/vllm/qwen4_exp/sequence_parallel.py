@@ -464,8 +464,9 @@ def fp8_wire_rows(x: torch.Tensor) -> torch.Tensor:
 
 
 def fp8_wire_restore(rows: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """``fp8_wire_rows``'s rows back to ``dtype`` (the scale applied in
-    ``dtype``, so nothing wider than the result is materialized)."""
+    """``fp8_wire_rows``'s rows back to ``dtype``. The scale is rounded to
+    ``dtype`` and applied in it, so nothing wider than the result is
+    materialized (about 2^-9 relative on top of E4M3's rounding)."""
     width = rows.shape[1] - FP8_WIRE_SCALE_LANES
     values = rows[:, :width].view(torch.float8_e4m3fn)
     scale = rows[:, width : width + 4].contiguous().view(torch.float32)
