@@ -22,6 +22,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.gdn.v3 import (
+    block_doubling,
     compute_conv1d,
     compute_gdn,
     compute_kda,
@@ -195,6 +196,91 @@ def _run_bulk_attention(ctx: _TileContext) -> None:
     )
 
 
+def _run_block_doubling_gdn(ctx: _TileContext) -> None:
+    """Runs block-doubling GDN prefill, streaming Q/K/V, state, and output."""
+    cfg = ctx.cfg
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    state_carry_ref = ctx.carry_recurrent_scratch_ref
+    assert state_carry_ref is not None and cfg.seq_tile_size == 1
+
+    qkv_seq_ref = vmem_ldst.stage_qkv_for_strided_load(
+        ctx.qkv_out_compact,
+        ctx.qkv_slot_ref,
+        cfg,
+        ctx.qkv_pad_scratch_ref,
+    ).at[0]
+
+    def _load_head(kind: vmem_ldst.QKVKind, head: int) -> jax.Array:
+        return vmem_ldst.load_qkv_head(qkv_seq_ref, kind, head, cfg, num_lanes)
+
+    def _load_raw_kq(
+        kqs: list[int],
+    ) -> tuple[dict[int, jax.Array], dict[int, jax.Array]]:
+        return (
+            {kq: _load_head(vmem_ldst.QKVKind.Q, kq) for kq in kqs},
+            {kq: _load_head(vmem_ldst.QKVKind.K, kq) for kq in kqs},
+        )
+
+    def _load_raw_v(vs: list[int]) -> dict[int, jax.Array]:
+        return {v: _load_head(vmem_ldst.QKVKind.V, v) for v in vs}
+
+    def _load_state_v(v: int) -> jax.Array:
+        return state_carry_ref[0, v]
+
+    def _store_state_v(v: int, val: jax.Array) -> None:
+        state_carry_ref[0, v] = val
+
+    out_step = block_doubling.out_stream_step(cfg, ctx.out_slot_ref.dtype.itemsize)
+
+    def _store_out_slice(v0: int, heads: list[jax.Array]) -> None:
+        blk = jnp.stack(heads, axis=0).swapaxes(0, 1)
+        ctx.out_slot_ref[0, :, v0 : v0 + out_step, :] = blk.astype(
+            ctx.out_slot_ref.dtype
+        )
+
+    b_large, a_large = vmem_ldst.load_ba_as_large(ctx.b_slot_ref, ctx.a_slot_ref)
+    out_seq, _ = block_doubling.run_chunk_streamed(
+        load_raw_kq=_load_raw_kq,
+        load_raw_v=_load_raw_v,
+        cfg=cfg,
+        real_sizes=ctx.real_sizes,
+        b_lanes=b_large[0],
+        a_lanes=a_large[0],
+        a_log=ctx.a_log,
+        dt_bias=ctx.dt_bias,
+        load_state_v=_load_state_v,
+        store_state_v=_store_state_v,
+        store_out_slice=_store_out_slice if out_step else None,
+        out_step=out_step,
+        out_dtype=ctx.out_slot_ref.dtype if out_step else None,
+    )
+    if out_seq is not None:
+        ctx.out_slot_ref[...] = out_seq.swapaxes(0, 1)[jnp.newaxis].astype(
+            ctx.out_slot_ref.dtype
+        )
+
+    is_last_tile = ctx.metadata_ref.p_id_is_last_tile[ctx.p_id, 0]
+    r_size = ctx.metadata_ref.p_id_to_r_size[ctx.p_id, 0]
+    should_flush = jnp.logical_and(is_last_tile, r_size > 0)
+    if ctx.metadata_ref.s_idx_to_prefill_ckpt_row is not None:
+        should_flush = jnp.logical_or(
+            should_flush, ctx.metadata_ref.is_prefill_ckpt_tile(ctx.p_id, 0)
+        )
+
+    @pl.when(should_flush)
+    def _flush_recurrent_carry() -> None:
+        for v in range(cfg.num_v_heads):
+            vmem_ldst.store_recurrent_head(
+                ctx.recurrent_out_slot_ref,
+                None,
+                0,
+                v,
+                0,
+                state_carry_ref[0, v],
+                cfg,
+            )
+
+
 def inner_kernel(
     # Inputs.
     qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]
@@ -251,6 +337,29 @@ def inner_kernel(
 
     if p_id is None:
         p_id = pl.program_id(0)
+
+    # Seed block-doubling carry state before Conv1D so the is_first_tile branch
+    # does not split Conv1D from the GDN recurrence.
+    if cfg.use_block_doubling:
+        assert carry_recurrent_scratch_ref is not None and cfg.seq_tile_size == 1
+        s_idx = metadata_ref.p_id_to_s_idx[p_id, 0]
+        is_first_tile = metadata_ref.p_id_is_first_tile[p_id, 0]
+
+        @pl.when(is_first_tile)
+        def _init_recurrent_carry() -> None:
+            has_init = metadata_ref.s_idx_has_initial_state[s_idx]
+            for v in range(cfg.num_v_heads):
+                carry_recurrent_scratch_ref[0, v] = (
+                    vmem_ldst.load_and_select_recurrent_head(
+                        recurrent_in_slot_ref,
+                        None,
+                        0,
+                        v,
+                        has_init,
+                        None,
+                        cfg,
+                    )
+                )
 
     # Prepare states.
     real_sizes, prev_conv = vmem_ldst.load_and_select_conv_state(
@@ -323,6 +432,8 @@ def inner_kernel(
     )
     if cfg.use_recurrent and not cfg.is_kda:
         _run_streamed_recurrent_gdn(ctx)
+    elif cfg.use_block_doubling:
+        _run_block_doubling_gdn(ctx)
     else:
         _run_bulk_attention(ctx)
 
@@ -429,6 +540,49 @@ def outer_kernel(
     _run()
 
 
+def _resolve_gdn_prefill_mode(
+    gdn_prefill_mode: config.GDNPrefillMode | str | None,
+    *,
+    attention_mode: config.AttentionMode,
+    d_k: int,
+    d_v: int,
+) -> config.GDNPrefillMode:
+    """Resolves and validates `gdn_prefill_mode` against model and TPU limits."""
+    is_kda = attention_mode == config.AttentionMode.KDA
+    if gdn_prefill_mode is not None:
+        resolved = config.GDNPrefillMode(gdn_prefill_mode)
+        if is_kda and resolved != config.GDNPrefillMode.SEQUENTIAL:
+            raise ValueError(
+                f"gdn_prefill_mode={resolved.value!r} only applies to GDN; "
+                f"got attention_mode={attention_mode}."
+            )
+    else:
+        resolved = None
+
+    tpu_info = pltpu.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
+    if resolved is None:
+        if not is_kda and d_k % num_lanes == 0 and d_v % num_lanes == 0:
+            return config.GDNPrefillMode.BLOCK_DOUBLING_BF16
+        return config.GDNPrefillMode.SEQUENTIAL
+    if resolved != config.GDNPrefillMode.SEQUENTIAL and (
+        d_k % num_lanes or d_v % num_lanes
+    ):
+        raise ValueError(
+            f"gdn_prefill_mode={resolved.value!r} requires d_k and d_v to be "
+            f"multiples of {num_lanes}; got d_k={d_k}, d_v={d_v}."
+        )
+    mxu_operand_dtype = resolved.mxu_operand_dtype
+    if mxu_operand_dtype is not None and not tpu_info.is_matmul_supported(
+        mxu_operand_dtype, mxu_operand_dtype
+    ):
+        raise NotImplementedError(
+            f"The MXU of TPU {tpu_info.chip_version} does not take "
+            f"{mxu_operand_dtype.name} operands."
+        )
+    return resolved
+
+
 @jax.jit(
     donate_argnames=("states",),
     static_argnames=(
@@ -444,6 +598,7 @@ def outer_kernel(
         "prefill_only",
         "zero_initialize_out",
         "compute_precision",
+        "gdn_prefill_mode",
         "recurrent_dtype",
         "conv_dtype",
         "attention_mode",
@@ -484,6 +639,7 @@ def fused_conv1d_gdn(
     prefill_only: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
+    gdn_prefill_mode: config.GDNPrefillMode | str | None = None,
     kernel_act_dtype: jnp.dtype = jnp.float32.dtype,
     kernel_conv_weight_dtype: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
@@ -557,7 +713,24 @@ def fused_conv1d_gdn(
             untouched. Mutually exclusive with batched_only.
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
-        compute_precision: Computation precision dtype.
+        compute_precision: Working dtype of the GDN / KDA stage. `q`, `k`, `v`,
+            `b`, `a`, `a_log` and `dt_bias` are cast to it after the conv1d
+            stage; sequential GDN and KDA round intermediates back to it between
+            ops, while block-doubling modes use bfloat16/FP8 intermediates. The
+            conv1d stage always runs in float32.
+        gdn_prefill_mode: Chunked GDN prefill recurrence mode, a
+            `GDNPrefillMode`, its string value, or `None`. `None` (the default)
+            selects `"block_doubling_bf16"` for GDN when `d_k` and `d_v` are
+            multiples of the TPU lane count (covering both Qwen 3.8 and
+            Qwen 3.5) and `"sequential"` for KDA or non-lane-aligned head dims.
+            `"sequential"` opts out to the sequential chunked kernel;
+            `"block_doubling_bf16"` and `"block_doubling_fp8"` select Schur
+            block doubling with 16-bit or 8-bit (`float8_e4m3fn`) MXU operands
+            for supported chunk sizes (`32`, `64`, or `>= 128` divisible by
+            `128`), falling back to `"sequential"` on other chunk sizes (GDN
+            only; explicit block-doubling modes raise `ValueError` under KDA or
+            non-lane-aligned `d_k`/`d_v`, and `NotImplementedError` when FP8
+            MXU is unavailable).
         kernel_act_dtype: Dtype qkv, b and a are cast to before the kernel.
         kernel_conv_weight_dtype: Dtype conv_weight and conv_bias are cast to
             before the kernel.
@@ -661,6 +834,12 @@ def fused_conv1d_gdn(
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
+    gdn_prefill_mode = _resolve_gdn_prefill_mode(
+        gdn_prefill_mode,
+        attention_mode=attention_mode,
+        d_k=d_k,
+        d_v=d_v,
+    )
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
@@ -798,6 +977,7 @@ def fused_conv1d_gdn(
             v_head_dim=d_v,
             attention_mode=attention_mode,
             gate_lower_bound=gate_lower_bound,
+            gdn_prefill_mode=gdn_prefill_mode,
             dtypes=config.Dtypes(
                 act_in=act_in_dtype,
                 act_out=act_out_dtype,

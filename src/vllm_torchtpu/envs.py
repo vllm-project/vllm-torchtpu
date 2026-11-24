@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
+    TPU_GDN_PREFILL_MODE: str | None = None
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -520,6 +521,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block boundary. Set it to the same value on every rank and PP stage: the
     # scheduler requires identical MambaSpecs.
     "TPU_GDN_PREFILL_CHECKPOINT": env_bool("TPU_GDN_PREFILL_CHECKPOINT", default=True),
+    # Override GDN v3 chunked prefill recurrence mode. Unset (None) defaults to
+    # "block_doubling_bf16" for eligible GDN (covering Qwen 3.8 and Qwen 3.5);
+    # set "block_doubling_fp8" to opt into 3-pass FP8 on hardware with >3x
+    # FP8-to-BF16 MXU throughput, or "sequential" to opt out.
+    "TPU_GDN_PREFILL_MODE": env_with_choices(
+        "TPU_GDN_PREFILL_MODE",
+        None,
+        ["sequential", "block_doubling_bf16", "block_doubling_fp8"],
+    ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.

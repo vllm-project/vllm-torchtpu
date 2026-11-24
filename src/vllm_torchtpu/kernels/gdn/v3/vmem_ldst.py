@@ -12,11 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import enum
+
 import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
+
+
+class QKVKind(enum.StrEnum):
+    """Component selector for per-head loads from packed `[Q | K | V]`."""
+
+    Q = "q"
+    K = "k"
+    V = "v"
 
 
 def load_strided_heads(
@@ -304,6 +314,25 @@ def load_activation_as_compact(
     return q_compact, k_compact, v_compact, b_compact, a_compact
 
 
+def stage_qkv_for_strided_load(
+    qkv_vreg: jax.Array,
+    qkv_vmem_ref: jax.Ref,
+    cfgs: config.GDNConfig,
+    qkv_pad_vmem_ref: jax.Ref | None = None,
+) -> jax.Ref:
+    """Stages post-Conv1D Q/K/V into VMEM for strided per-head loads."""
+    if qkv_pad_vmem_ref is not None:
+        # Write into the odd-column scratchpad so strided per-head loads hit
+        # distinct VMEM banks instead of colliding on `qkv_vmem_ref`'s even
+        # width.
+        qkv_pad_vmem_ref[:, :, :, : cfgs.dim_size] = qkv_vreg.astype(
+            qkv_pad_vmem_ref.dtype
+        )
+        return qkv_pad_vmem_ref
+    qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
+    return qkv_vmem_ref
+
+
 def load_activation_as_large(
     qkv_vreg: jax.Array,
     qkv_vmem_ref: jax.Ref,
@@ -328,17 +357,9 @@ def load_activation_as_large(
         `(q_large, k_large, v_large, b_large, a_large)` stacked across
         sequences.
     """
-    if qkv_pad_vmem_ref is not None:
-        # Write into the odd-column scratchpad so strided per-head loads below
-        # hit distinct VMEM banks instead of colliding on `qkv_vmem_ref`'s even
-        # width.
-        qkv_pad_vmem_ref[:, :, :, : cfgs.dim_size] = qkv_vreg.astype(
-            qkv_pad_vmem_ref.dtype
-        )
-        qkv_src_ref = qkv_pad_vmem_ref
-    else:
-        qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
-        qkv_src_ref = qkv_vmem_ref
+    qkv_src_ref = stage_qkv_for_strided_load(
+        qkv_vreg, qkv_vmem_ref, cfgs, qkv_pad_vmem_ref
+    )
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     kq_lanes = cfgs.num_kq_heads * (cfgs.kq_head_dim // num_lanes)
@@ -378,3 +399,57 @@ def load_activation_as_large(
         a_large = jnp.expand_dims(load_compact_to_large(a_vmem_ref), axis=1)
 
     return q_large, k_large, v_large, b_large, a_large
+
+
+def load_ba_as_large(
+    b_vmem_ref: jax.Ref,
+    a_vmem_ref: jax.Ref,
+) -> tuple[jax.Array, jax.Array]:
+    """Loads `[seq, 1, chunk, aligned_num_v_heads]` gate inputs without `qkv`."""
+    b_large = jnp.expand_dims(load_compact_to_large(b_vmem_ref), axis=1)
+    a_large = jnp.expand_dims(load_compact_to_large(a_vmem_ref), axis=1)
+    return b_large, a_large
+
+
+def _qkv_head_cols(
+    kind: QKVKind | str, head: int, cfgs: config.GDNConfig, num_lanes: int
+) -> list[int]:
+    """Returns `num_lanes`-wide column indices in `[Q | K | V]` for `(kind, head)`."""
+    if cfgs.kq_head_dim % num_lanes != 0 or cfgs.v_head_dim % num_lanes != 0:
+        raise ValueError(
+            f"Head dimensions must be multiples of {num_lanes}; got "
+            f"kq_head_dim={cfgs.kq_head_dim}, v_head_dim={cfgs.v_head_dim}."
+        )
+    resolved = QKVKind(kind)
+    kq_cols = cfgs.kq_head_dim // num_lanes
+    if resolved == QKVKind.Q:
+        base = head * kq_cols
+        return list(range(base, base + kq_cols))
+    if resolved == QKVKind.K:
+        base = (cfgs.num_kq_heads + head) * kq_cols
+        return list(range(base, base + kq_cols))
+    v_cols = cfgs.v_head_dim // num_lanes
+    base = 2 * cfgs.num_kq_heads * kq_cols + head * v_cols
+    return list(range(base, base + v_cols))
+
+
+def _load_qkv_col(qkv_seq_ref: jax.Ref, col: int, num_lanes: int) -> jax.Array:
+    """Strided VMEM load of one `[rows, num_lanes]` column from a compact ref."""
+    lanes_per_col = qkv_seq_ref.shape[-1] // num_lanes
+    flat_ref = qkv_seq_ref.reshape(-1, num_lanes)  # pyrefly: ignore[missing-attribute]
+    return flat_ref[col::lanes_per_col].astype(jnp.float32)
+
+
+def load_qkv_head(
+    qkv_seq_ref: jax.Ref,
+    kind: QKVKind | str,
+    head: int,
+    cfgs: config.GDNConfig,
+    num_lanes: int,
+) -> jax.Array:
+    """Loads Q, K or V of one head as `[rows, head_dim]` from a compact ref."""
+    cols = [
+        _load_qkv_col(qkv_seq_ref, col, num_lanes)
+        for col in _qkv_head_cols(kind, head, cfgs, num_lanes)
+    ]
+    return cols[0] if len(cols) == 1 else jnp.concat(cols, axis=1)

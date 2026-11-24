@@ -231,3 +231,59 @@ def test_pcp_projection_wrapper_hands_checkpoint_operands_to_the_kernel(
     assert seen["ids_is_none"] is not with_checkpoints
     if with_checkpoints:
         assert float(output[0, 0, 0]) == 3072 + 1000 * 2
+
+
+@pytest.mark.parametrize(
+    "env_value, expected",
+    [
+        (None, None),
+        ("sequential", "sequential"),
+        ("block_doubling_bf16", "block_doubling_bf16"),
+        ("block_doubling_fp8", "block_doubling_fp8"),
+    ],
+)
+def test_pooled_local_forwards_gdn_prefill_mode_env(monkeypatch, env_value, expected):
+    if env_value is None:
+        monkeypatch.delenv("TPU_GDN_PREFILL_MODE", raising=False)
+    else:
+        monkeypatch.setenv("TPU_GDN_PREFILL_MODE", env_value)
+
+    seen = {}
+
+    def fake_kernel(*args, **kwargs):
+        seen["gdn_prefill_mode"] = kwargs["gdn_prefill_mode"]
+        return args[3], jnp.zeros((NUM_TOKENS, 4), jnp.bfloat16)
+
+    monkeypatch.setattr(gdn_attention.gdn_v3_wrapper, "fused_conv1d_gdn", fake_kernel)
+    inputs = _pooled_inputs()
+    gdn_attention.run_jax_gdn_attention_pooled_local(
+        inputs["j_mixed_qkv"],
+        inputs["j_b"],
+        inputs["j_a"],
+        inputs["recurrent_state"],
+        inputs["j_conv_weight"],
+        None,
+        inputs["j_A_log"],
+        inputs["j_dt_bias"],
+        inputs["query_start_loc"],
+        inputs["state_indices"],
+        inputs["distribution"],
+        inputs["seq_lens"],
+        None,
+        None,
+        None,
+        None,
+        n_kq=2,
+        n_v=2,
+        d_k=4,
+        d_v=4,
+        kernel_size=4,
+        pool_block_tokens=4,
+    )
+    assert seen["gdn_prefill_mode"] == expected
+
+
+def test_gdn_prefill_mode_env_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("TPU_GDN_PREFILL_MODE", "not_a_mode")
+    with pytest.raises(ValueError, match="TPU_GDN_PREFILL_MODE"):
+        _ = gdn_attention.tpu_envs.TPU_GDN_PREFILL_MODE

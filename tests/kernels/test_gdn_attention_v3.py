@@ -2530,9 +2530,9 @@ class GDNAttentionTest(parameterized.TestCase):
                 kernel_size=kernel_size,
                 mixed_tile_size=32,
             )
-            np.testing.assert_allclose(out, out_ref, rtol=1e-2, atol=1e-2)
+            np.testing.assert_allclose(out, out_ref, rtol=2e-2, atol=2e-2)
             np.testing.assert_allclose(conv_out, conv_ref, rtol=1e-2, atol=1e-2)
-            np.testing.assert_allclose(rec_out, rec_ref, rtol=1e-2, atol=1e-2)
+            np.testing.assert_allclose(rec_out, rec_ref, rtol=2e-2, atol=2e-2)
 
     def test_qwen3_5_397b_parallelism_execution(self):
         """Executes dynamic-tiled GDN across Qwen3.5-397B head splits and DCP=4."""
@@ -2743,3 +2743,200 @@ class GDNAttentionTest(parameterized.TestCase):
         np.testing.assert_allclose(out[1:], out_ref[1:], rtol=2e-2, atol=2e-2)
         np.testing.assert_allclose(conv_out[2:], conv_ref[2:], rtol=2e-2, atol=2e-2)
         np.testing.assert_allclose(rec_out[2:], rec_ref[2:], rtol=3e-2, atol=3e-2)
+
+    @staticmethod
+    def _rel_l2(ref_x: jax.Array, act_x: jax.Array) -> float:
+        r = np.asarray(ref_x, dtype=np.float32)
+        y = np.asarray(act_x, dtype=np.float32)
+        return float(np.linalg.norm(r - y) / (np.linalg.norm(r) + 1e-12))
+
+    @parameterized.named_parameters(
+        dict(
+            testcase_name="paired_streamed_4_32",
+            n_kq=4,
+            n_v=32,
+            check_outlier=True,
+        ),
+        # 3 V heads per KQ head cannot pair, and 24 is not a multiple of 16.
+        dict(
+            testcase_name="unpaired_unstreamed_8_24",
+            n_kq=8,
+            n_v=24,
+            check_outlier=False,
+        ),
+    )
+    def test_block_doubling_bf16_and_fp8_modes(
+        self, n_kq: int, n_v: int, check_outlier: bool
+    ):
+        """Fused block-doubling BF16 and FP8 modes match the sequential kernel."""
+        rng = np.random.default_rng(77)
+        d_k, d_v, kernel_size = 128, 128, 4
+        dim = 2 * n_kq * d_k + n_v * d_v
+        tok = 200
+        qkv_bf16 = jnp.asarray(rng.standard_normal((tok, dim)), jnp.bfloat16)
+        b = jnp.asarray(rng.standard_normal((tok, n_v)), jnp.bfloat16)
+        a = jnp.asarray(rng.standard_normal((tok, n_v)), jnp.bfloat16)
+        conv_init = jnp.asarray(
+            rng.standard_normal((3, kernel_size - 1, dim)), jnp.float32
+        )
+        rec_init = jnp.asarray(rng.standard_normal((3, n_v, d_k, d_v)), jnp.float32)
+        conv_w = jnp.asarray(rng.standard_normal((dim, 1, kernel_size)), jnp.float32)
+        conv_b = jnp.asarray(rng.standard_normal((dim,)), jnp.float32)
+        a_log = jnp.asarray(rng.uniform(0.0, 2.0, (n_v,)), jnp.float32)
+        dt_bias = jnp.asarray(rng.uniform(-3.0, -1.0, (n_v,)), jnp.bfloat16)
+        qsl = jnp.array([0, tok], dtype=jnp.int32)
+        sidx = jnp.array([1], dtype=jnp.int32)
+        dist = jnp.array([0, 1, 1], dtype=jnp.int32)
+        slens = jnp.array([tok + 128], dtype=jnp.int32)
+        ckpt_offsets = jnp.array([128], dtype=jnp.int32)
+        ckpt_indices = jnp.array([2], dtype=jnp.int32)
+
+        def run(
+            mode: config.GDNPrefillMode,
+            *,
+            act_dtype=jnp.bfloat16,
+            rec_state=rec_init,
+            with_prefill_ckpt: bool = False,
+        ):
+            return wrapper.fused_conv1d_gdn(
+                qkv=qkv_bf16.astype(act_dtype),
+                b=b.astype(act_dtype),
+                a=a.astype(act_dtype),
+                states=(conv_init.copy(), rec_state.copy()),
+                conv_weight=conv_w,
+                conv_bias=conv_b,
+                a_log=a_log,
+                dt_bias=dt_bias,
+                query_start_loc=qsl,
+                state_indices=sidx,
+                distribution=dist,
+                seq_lens=slens,
+                prefill_ckpt_offsets=ckpt_offsets if with_prefill_ckpt else None,
+                prefill_ckpt_indices=ckpt_indices if with_prefill_ckpt else None,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                gdn_prefill_mode=mode,
+                mixed_tile_size=128,
+            )
+
+        for act_dt in (jnp.bfloat16, jnp.float32):
+            rec_st = rec_init.astype(act_dt)
+            (c_ref, r_ref), o_ref = run(
+                config.GDNPrefillMode.SEQUENTIAL,
+                act_dtype=act_dt,
+                rec_state=rec_st,
+                with_prefill_ckpt=True,
+            )
+            (c_db, r_db), o_db = run(
+                config.GDNPrefillMode.BLOCK_DOUBLING_BF16,
+                act_dtype=act_dt,
+                rec_state=rec_st,
+                with_prefill_ckpt=True,
+            )
+            np.testing.assert_allclose(c_db[1], c_ref[1], rtol=1e-5, atol=1e-5)
+            np.testing.assert_allclose(c_db[2], c_ref[2], rtol=1e-5, atol=1e-5)
+            self.assertTrue(bool(jnp.all(jnp.isfinite(o_db))))
+            self.assertTrue(bool(jnp.all(jnp.isfinite(r_db[1]))))
+            o_db_err = self._rel_l2(o_ref, o_db)
+            self.assertGreater(o_db_err, 0.0)
+            self.assertLess(o_db_err, 1.5e-2)
+            self.assertLess(self._rel_l2(r_ref[1], r_db[1]), 1.5e-2)
+            self.assertLess(self._rel_l2(r_ref[2], r_db[2]), 1.5e-2)
+
+        e4m3 = jnp.dtype(jnp.float8_e4m3fn)
+        if pltpu.get_tpu_info().is_matmul_supported(e4m3, e4m3):
+            max_rel_30db = 10.0 ** (-30.0 / 20.0)
+            (c_ref, r_ref), o_ref = run(
+                config.GDNPrefillMode.SEQUENTIAL,
+                rec_state=rec_init.astype(jnp.bfloat16),
+                with_prefill_ckpt=True,
+            )
+            (c_f8, r_f8), o_f8 = run(
+                config.GDNPrefillMode.BLOCK_DOUBLING_FP8,
+                rec_state=rec_init.astype(jnp.bfloat16),
+                with_prefill_ckpt=True,
+            )
+            np.testing.assert_allclose(c_f8[1], c_ref[1], rtol=1e-5, atol=1e-5)
+            np.testing.assert_allclose(c_f8[2], c_ref[2], rtol=1e-5, atol=1e-5)
+            o_f8_err = self._rel_l2(o_ref, o_f8)
+            self.assertGreater(o_f8_err, 0.0)
+            self.assertLessEqual(o_f8_err, max_rel_30db)
+            self.assertLessEqual(self._rel_l2(r_ref[1], r_f8[1]), max_rel_30db)
+            self.assertLessEqual(self._rel_l2(r_ref[2], r_f8[2]), max_rel_30db)
+
+            if check_outlier:
+                rec_outlier = rec_init * jnp.float32(1000.0)
+                (_, r_out_ref), o_out_ref = run(
+                    config.GDNPrefillMode.SEQUENTIAL, rec_state=rec_outlier
+                )
+                (_, r_vs), o_vs = run(
+                    config.GDNPrefillMode.BLOCK_DOUBLING_FP8, rec_state=rec_outlier
+                )
+                self.assertTrue(bool(jnp.all(jnp.isfinite(o_vs))))
+                self.assertTrue(bool(jnp.all(jnp.isfinite(r_vs[1]))))
+                self.assertGreater(self._rel_l2(o_out_ref, o_vs), 0.0)
+                self.assertLessEqual(self._rel_l2(o_out_ref, o_vs), max_rel_30db)
+                self.assertLessEqual(self._rel_l2(r_out_ref[1], r_vs[1]), max_rel_30db)
+
+    def test_block_doubling_multi_seq_nan_init_and_intermediate_tile(self):
+        """Tests NaN stale init, 3-tile carry, 2 sequences, and tile_size=64."""
+        rng = np.random.default_rng(83)
+        n_kq, n_v, d_k, d_v, kernel_size = 4, 32, 128, 128, 4
+        dim = 2 * n_kq * d_k + n_v * d_v
+        # Seq 0: fresh 180-token sequence (3 tiles at tile_size=64; middle tile
+        # has is_first_tile=False and should_flush=False) with NaN stale slot.
+        # Seq 1: resumed 70-token sequence (2 tiles) with valid initial state.
+        lengths = [180, 70]
+        tok = sum(lengths)
+        qkv = jnp.asarray(rng.standard_normal((tok, dim)), jnp.bfloat16)
+        b = jnp.asarray(rng.standard_normal((tok, n_v)), jnp.bfloat16)
+        a = jnp.asarray(rng.standard_normal((tok, n_v)), jnp.bfloat16)
+        conv_init = jnp.asarray(
+            rng.standard_normal((3, kernel_size - 1, dim)), jnp.float32
+        )
+        rec_ref_init = jnp.asarray(rng.standard_normal((3, n_v, d_k, d_v)), jnp.float32)
+        rec_ref_init = rec_ref_init.at[1].set(0.0)
+        rec_poison = rec_ref_init.at[1].set(jnp.nan)
+        conv_w = jnp.asarray(rng.standard_normal((dim, 1, kernel_size)), jnp.float32)
+        conv_b = jnp.asarray(rng.standard_normal((dim,)), jnp.float32)
+        a_log = jnp.asarray(rng.uniform(0.0, 2.0, (n_v,)), jnp.float32)
+        dt_bias = jnp.asarray(rng.uniform(-3.0, -1.0, (n_v,)), jnp.bfloat16)
+        common = dict(
+            qkv=qkv,
+            b=b,
+            a=a,
+            conv_weight=conv_w,
+            conv_bias=conv_b,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=jnp.array([0, lengths[0], tok], dtype=jnp.int32),
+            state_indices=jnp.array([1, 2], dtype=jnp.int32),
+            distribution=jnp.array([0, 2, 2], dtype=jnp.int32),
+            seq_lens=jnp.array([lengths[0], lengths[1] + 64], dtype=jnp.int32),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            mixed_tile_size=64,
+        )
+        (c_ref, r_ref), o_ref = wrapper.fused_conv1d_gdn(
+            states=(conv_init.copy(), rec_ref_init.copy()),
+            gdn_prefill_mode=config.GDNPrefillMode.SEQUENTIAL,
+            **common,
+        )
+        (c_db, r_db), o_db = wrapper.fused_conv1d_gdn(
+            states=(conv_init.copy(), rec_poison.copy()),
+            gdn_prefill_mode=config.GDNPrefillMode.BLOCK_DOUBLING_BF16,
+            **common,
+        )
+        self.assertTrue(bool(jnp.all(jnp.isfinite(o_db))))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(r_db[1:]))))
+        np.testing.assert_allclose(c_db[1:], c_ref[1:], rtol=1e-5, atol=1e-5)
+        self.assertGreater(self._rel_l2(o_ref, o_db), 0.0)
+        self.assertLess(self._rel_l2(o_ref, o_db), 1.5e-2)
+        self.assertLess(self._rel_l2(r_ref[1], r_db[1]), 1.5e-2)
+        self.assertLess(self._rel_l2(r_ref[2], r_db[2]), 1.5e-2)

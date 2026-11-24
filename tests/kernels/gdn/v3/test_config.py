@@ -216,6 +216,7 @@ class QkvPadScratchTest(parameterized.TestCase):
             n_v=8,
             attention_mode=config.AttentionMode.GDN,
             mixed_tile_size=16,
+            gdn_prefill_mode=None,
             want_shape="f32[1,16,1,1664]",
             expect_skip_log=False,
         ),
@@ -225,6 +226,7 @@ class QkvPadScratchTest(parameterized.TestCase):
             n_v=3,
             attention_mode=config.AttentionMode.GDN,
             mixed_tile_size=16,
+            gdn_prefill_mode=None,
             want_shape=None,
             expect_skip_log=False,
         ),
@@ -234,17 +236,29 @@ class QkvPadScratchTest(parameterized.TestCase):
             n_v=8,
             attention_mode=config.AttentionMode.KDA,
             mixed_tile_size=16,
+            gdn_prefill_mode=None,
             want_shape=None,
             expect_skip_log=False,
         ),
         dict(
-            testcase_name="tight_vmem_skips_spacer",
+            testcase_name="tight_vmem_sequential_skips_spacer",
             n_kq=16,
             n_v=64,
             attention_mode=config.AttentionMode.GDN,
             mixed_tile_size=64,
+            gdn_prefill_mode="sequential",
             want_shape=None,
             expect_skip_log=True,
+        ),
+        dict(
+            testcase_name="tight_vmem_default_block_doubling_allocates_spacer",
+            n_kq=16,
+            n_v=64,
+            attention_mode=config.AttentionMode.GDN,
+            mixed_tile_size=64,
+            gdn_prefill_mode=None,
+            want_shape="f32[1,64,1,12416]",
+            expect_skip_log=False,
         ),
     )
     def test_wrapper_pallas_call_qkv_pad_scratch_allocation(
@@ -253,6 +267,7 @@ class QkvPadScratchTest(parameterized.TestCase):
         n_v,
         attention_mode,
         mixed_tile_size,
+        gdn_prefill_mode,
         want_shape,
         expect_skip_log,
     ):
@@ -295,6 +310,7 @@ class QkvPadScratchTest(parameterized.TestCase):
                         d_v=d,
                         kernel_size=kernel_size,
                         attention_mode=attention_mode,
+                        gdn_prefill_mode=gdn_prefill_mode,
                         mixed_tile_size=mixed_tile_size,
                     )
                 )()
@@ -309,6 +325,218 @@ class QkvPadScratchTest(parameterized.TestCase):
             mock_logger.info_once.assert_called_once()
         else:
             mock_logger.info_once.assert_not_called()
+
+
+class GDNPrefillModeTest(parameterized.TestCase):
+    @parameterized.parameters(
+        ("sequential", None),
+        ("block_doubling_bf16", None),
+        ("block_doubling_fp8", jnp.float8_e4m3fn),
+    )
+    def test_mxu_operand_dtype(self, mode, want_dtype):
+        got = config.GDNPrefillMode(mode).mxu_operand_dtype
+        if want_dtype is None:
+            self.assertIsNone(got)
+        else:
+            self.assertEqual(got, jnp.dtype(want_dtype))
+
+
+class GDNConfigUseBlockDoublingTest(parameterized.TestCase):
+    @parameterized.named_parameters(
+        dict(testcase_name="bf16_chunk_32", overrides=dict(tile_size=32), want=True),
+        dict(testcase_name="bf16_chunk_128", overrides=dict(), want=True),
+        dict(
+            testcase_name="fp8_chunk_128",
+            overrides=dict(gdn_prefill_mode=config.GDNPrefillMode.BLOCK_DOUBLING_FP8),
+            want=True,
+        ),
+        dict(
+            testcase_name="sequential",
+            overrides=dict(gdn_prefill_mode=config.GDNPrefillMode.SEQUENTIAL),
+            want=False,
+        ),
+        dict(
+            testcase_name="batched_decode",
+            overrides=dict(mode=config.GDNMode.BATCHED, tile_size=8),
+            want=False,
+        ),
+        dict(
+            testcase_name="speculative_window",
+            overrides=dict(window_size=2),
+            want=False,
+        ),
+        dict(
+            testcase_name="kda",
+            overrides=dict(attention_mode=config.AttentionMode.KDA),
+            want=False,
+        ),
+        dict(testcase_name="small_chunk", overrides=dict(tile_size=16), want=False),
+        dict(
+            testcase_name="non_multiple_of_32",
+            overrides=dict(tile_size=48),
+            want=False,
+        ),
+        dict(
+            testcase_name="chunk_96_rejected",
+            overrides=dict(tile_size=96),
+            want=False,
+        ),
+        dict(
+            testcase_name="chunk_192_rejected",
+            overrides=dict(tile_size=192),
+            want=False,
+        ),
+        dict(
+            testcase_name="chunk_256_supported",
+            overrides=dict(tile_size=256),
+            want=True,
+        ),
+    )
+    def test_use_block_doubling(self, overrides, want):
+        params = dict(gdn_prefill_mode=config.GDNPrefillMode.BLOCK_DOUBLING_BF16)
+        params.update(overrides)
+        cfg = _make_cfg(**params)
+        self.assertEqual(cfg.use_block_doubling, want)
+        if want:
+            self.assertIn(cfg.gdn_prefill_mode.value, cfg.get_kernel_name())
+
+    def test_fits_qkv_pad_scratch_enforces_vmem_limit_for_block_doubling(self):
+        cfg = _make_cfg(
+            num_kq_heads=16,
+            num_v_heads=64,
+            dim_size=(2 * 16 + 64) * 128,
+            tile_size=64,
+            gdn_prefill_mode=config.GDNPrefillMode.BLOCK_DOUBLING_BF16,
+        )
+        qpad_shape = cfg.qkv_pad_scratch_shape(128)
+        self.assertIsNotNone(qpad_shape)
+        self.assertTrue(
+            tiling.fits_qkv_pad_scratch(cfg, qpad_shape, _64MIB_VMEM_LIMIT, 128)
+        )
+        self.assertFalse(
+            tiling.fits_qkv_pad_scratch(cfg, qpad_shape, 16 * 1024 * 1024, 128)
+        )
+
+
+class BlockDoublingWrapperValidationTest(parameterized.TestCase):
+    def _dummy_inputs(
+        self, *, head_dim: int = 128, is_kda: bool = False, tok: int = 32
+    ):
+        n_kq, n_v, kernel_size = 2, 8, 4
+        dim = (2 * n_kq + n_v) * head_dim
+        a_dim = n_v * head_dim if is_kda else n_v
+        dt_shape = (n_v, head_dim) if is_kda else (n_v,)
+        return dict(
+            qkv=jnp.zeros((tok, dim), jnp.bfloat16),
+            b=jnp.zeros((tok, n_v), jnp.bfloat16),
+            a=jnp.zeros((tok, a_dim), jnp.bfloat16),
+            states=(
+                jnp.zeros((2, kernel_size - 1, dim), jnp.float32),
+                jnp.zeros((2, n_v, head_dim, head_dim), jnp.float32),
+            ),
+            conv_weight=jnp.zeros((dim, 1, kernel_size), jnp.float32),
+            conv_bias=jnp.zeros((dim,), jnp.float32),
+            a_log=jnp.zeros((n_v,), jnp.float32),
+            dt_bias=jnp.zeros(dt_shape, jnp.float32),
+            query_start_loc=jnp.array([0, tok], jnp.int32),
+            state_indices=jnp.array([1], jnp.int32),
+            distribution=jnp.array([0, 1, 1], jnp.int32),
+            seq_lens=jnp.array([tok], jnp.int32),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=head_dim,
+            d_v=head_dim,
+            kernel_size=kernel_size,
+        )
+
+    def _trace(
+        self,
+        *,
+        device: str = "TPU7x",
+        head_dim: int = 128,
+        is_kda: bool = False,
+        tok: int = 32,
+        input_overrides: dict | None = None,
+        **kwargs,
+    ) -> str:
+        inputs = self._dummy_inputs(head_dim=head_dim, is_kda=is_kda, tok=tok)
+        if input_overrides:
+            inputs.update(input_overrides)
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice(device, 1, "tpu")
+        )
+        with use_abstract_mesh(mesh):
+            return str(
+                jax.make_jaxpr(lambda: wrapper.fused_conv1d_gdn(**inputs, **kwargs))()
+            )
+
+    @parameterized.named_parameters(
+        dict(
+            testcase_name="unknown_mode",
+            err=ValueError,
+            msg="not a valid GDNPrefillMode",
+            kwargs=dict(gdn_prefill_mode="unknown_mode"),
+        ),
+        dict(
+            testcase_name="kda_with_block_doubling",
+            err=ValueError,
+            msg="only applies to GDN",
+            is_kda=True,
+            kwargs=dict(
+                attention_mode=config.AttentionMode.KDA,
+                gdn_prefill_mode="block_doubling_bf16",
+            ),
+        ),
+        dict(
+            testcase_name="non_lane_head_dims",
+            err=ValueError,
+            msg="d_k and d_v",
+            head_dim=64,
+            kwargs=dict(gdn_prefill_mode="block_doubling_bf16"),
+        ),
+        dict(
+            testcase_name="fp8_without_fp8_mxu",
+            err=NotImplementedError,
+            msg="TPU v5e.*float8_e4m3fn",
+            device="TPU v5e",
+            kwargs=dict(gdn_prefill_mode="block_doubling_fp8"),
+        ),
+    )
+    def test_rejects_invalid_prefill_mode_configs(
+        self, err, msg, kwargs, device="TPU7x", head_dim=128, is_kda=False
+    ):
+        with self.assertRaisesRegex(err, msg):
+            self._trace(device=device, head_dim=head_dim, is_kda=is_kda, **kwargs)
+
+    def test_prefill_mode_selection_and_fallbacks(self):
+        # Default enables BF16 block doubling for eligible GDN; "sequential" opts out.
+        self.assertIn("_block_doubling_bf16", self._trace(mixed_tile_size=64))
+        self.assertNotIn(
+            "_block_doubling",
+            self._trace(gdn_prefill_mode="sequential", mixed_tile_size=64),
+        )
+        # Unsupported chunk sizes, KDA, and non-128 head dims fall back to sequential.
+        self.assertNotIn(
+            "_block_doubling",
+            self._trace(gdn_prefill_mode="block_doubling_bf16", mixed_tile_size=16),
+        )
+        self.assertNotIn(
+            "_block_doubling",
+            self._trace(
+                is_kda=True,
+                attention_mode=config.AttentionMode.KDA,
+                mixed_tile_size=64,
+            ),
+        )
+        self.assertNotIn(
+            "_block_doubling",
+            self._trace(
+                head_dim=64,
+                tok=1,
+                input_overrides={"distribution": jnp.array([1, 1, 1], jnp.int32)},
+                batched_only=True,
+            ),
+        )
 
 
 if __name__ == "__main__":

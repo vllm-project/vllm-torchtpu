@@ -244,7 +244,7 @@ def fits_qkv_pad_scratch(
     vmem_limit_bytes: int,
     num_lanes: int,
 ) -> bool:
-    """Returns whether sequential chunked prefill has VMEM headroom for padding.
+    """Returns whether chunked GDN prefill has VMEM headroom for padding.
 
     Args:
         cfg: Chunked prefill GDN configuration.
@@ -270,10 +270,12 @@ def fits_qkv_pad_scratch(
         window_size=cfg.window_size,
     )
     # Sequential chunked prefill keeps one f32 working state live alongside
-    # `carry_recurrent_scratch_ref`; require that working-state margin so adding
-    # the spacer never causes a compile-time VMEM OOM on tight tiles.
+    # `carry_recurrent_scratch_ref`; block doubling streams heads instead of
+    # holding a full extra working state, so only sequential needs that margin.
     working_state_bytes = (
-        cfg.seq_tile_size * cfg.num_v_heads * cfg.kq_head_dim * cfg.v_head_dim * 4
+        0
+        if cfg.use_block_doubling
+        else cfg.seq_tile_size * cfg.num_v_heads * cfg.kq_head_dim * cfg.v_head_dim * 4
     )
     return vmem_est + working_state_bytes + qpad_bytes <= vmem_limit_bytes
 

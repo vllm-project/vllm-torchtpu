@@ -21,6 +21,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.gdn.v3 import triangular_solve
+
 
 class AttentionMode(enum.StrEnum):
     # Gated Delta Net: one scalar gate per value head.
@@ -28,6 +30,32 @@ class AttentionMode(enum.StrEnum):
     # Kimi Delta Attention: the gate is per-channel, so it carries
     # `kq_head_dim` values per value head instead of one.
     KDA = enum.auto()
+
+
+class GDNPrefillMode(enum.StrEnum):
+    """Solver of the chunked GDN prefill recurrence."""
+
+    # Default chunked kernel (sequential triangular solve).
+    SEQUENTIAL = enum.auto()
+    # Schur block doubling with 16-bit matrix-unit (MXU) operands.
+    BLOCK_DOUBLING_BF16 = enum.auto()
+    # Schur block doubling with 8-bit MXU operands.
+    BLOCK_DOUBLING_FP8 = enum.auto()
+
+    @property
+    def mxu_operand_dtype(self) -> jnp.dtype | None:
+        """The 8-bit MXU operand dtype of this mode, or `None` for 16-bit modes."""
+        if self == GDNPrefillMode.BLOCK_DOUBLING_FP8:
+            return jnp.dtype(jnp.float8_e4m3fn)
+        return None
+
+
+_BLOCK_DOUBLING_MODES = frozenset(
+    {
+        GDNPrefillMode.BLOCK_DOUBLING_BF16,
+        GDNPrefillMode.BLOCK_DOUBLING_FP8,
+    }
+)
 
 
 class GDNMode(enum.StrEnum):
@@ -78,6 +106,8 @@ class GDNConfig:
     window_size: int = 1
     # Indicate the use of unified pool.
     is_shared: bool = False
+    # Solver of the chunked GDN prefill recurrence.
+    gdn_prefill_mode: GDNPrefillMode = GDNPrefillMode.SEQUENTIAL
 
     @property
     def conv_hbm_offset(self) -> int:
@@ -167,6 +197,16 @@ class GDNConfig:
         return self.chunk_size == 1 or self.window_size > 1
 
     @property
+    def use_block_doubling(self) -> bool:
+        """Whether GDN runs BF16 or FP8 block-doubling chunked prefill."""
+        return (
+            self.gdn_prefill_mode in _BLOCK_DOUBLING_MODES
+            and not self.is_kda
+            and not self.use_recurrent
+            and triangular_solve.supports_block_doubling_chunk(self.chunk_size)
+        )
+
+    @property
     def v_dim_size(self) -> int:
         return self.num_v_heads * self.v_head_dim
 
@@ -190,6 +230,8 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
+        if self.use_block_doubling:
+            suffix += f"_{self.gdn_prefill_mode.value}"
         return (
             f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
             f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
