@@ -19,6 +19,7 @@ import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -33,6 +34,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 
+from vllm_torchtpu.distributed import pallas_all_reduce
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
@@ -43,11 +45,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_text_config
         quant_config = vllm_config.quant_config
+        # TPU_TP_QAR_FUSE_NORM: o_proj stays un-reduced and its all-reduce runs
+        # fused with post_attention_layernorm's residual add + RMSNorm.
+        self.fuse_ar_norm = pallas_all_reduce.request_add_norm(config.rms_norm_eps)
         self.self_attn = MiniMaxM3SparseAttention(
             config,
             quant_config,
             vllm_config.cache_config,
             prefix=f"{prefix}.self_attn",
+            reduce_output=not self.fuse_ar_norm,
         )
         # Dense layers name their FFN `mlp`, MoE layers `block_sparse_moe`.
         self.is_moe_layer = bool(config.moe_layer_freq[layer_id])
@@ -79,9 +85,31 @@ class MiniMaxM3DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self.fuse_ar_norm:
+            hidden_states, residual = self._all_reduce_post_attention_norm(
+                hidden_states, residual
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         return ffn(hidden_states), residual
+
+    def _all_reduce_post_attention_norm(
+        self, partial: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        norm = self.post_attention_layernorm
+        out = pallas_all_reduce.all_reduce_add_norm(
+            get_tp_group().ranks,
+            partial,
+            residual,
+            norm.weight.float() + 1.0,
+            norm.variance_epsilon,
+        )
+        if out is not None:
+            return out
+        return norm(tensor_model_parallel_all_reduce(partial), residual)
 
 
 @support_torch_compile(

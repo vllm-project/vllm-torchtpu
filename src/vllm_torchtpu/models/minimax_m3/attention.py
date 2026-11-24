@@ -257,6 +257,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         quant_config: QuantizationConfig | None,
         cache_config: CacheConfig | None,
         prefix: str,
+        reduce_output: bool = True,
     ) -> None:
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
@@ -289,6 +290,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_output,
             prefix=f"{prefix}.o_proj",
         )
         eps = config.rms_norm_eps

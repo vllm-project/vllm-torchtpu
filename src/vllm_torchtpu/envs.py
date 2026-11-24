@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS: int = 0
     TPU_TP_AR_QDQ_ROWS: int = 0
     TPU_TP_QAR_MIN_TOKENS: int = 0
+    TPU_TP_QAR_FUSE_NORM: bool = False
     TPU_TP_AR_QDQ_MIN_TOKENS: int = 0
     TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS: int = 0
     TPU_MOE_TC_COMBINE: bool = False
@@ -875,6 +876,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MAX_BYTES > 0) on a tpu7x 2x2x1 TP8 group. Changes numerics (~0.9% rel
     # L2 per all-reduce). 0 = off.
     "TPU_TP_QAR_MIN_TOKENS": env_int("TPU_TP_QAR_MIN_TOKENS", 0),
+    # With qar armed: models that ask for it (MiniMax-M3: the attention
+    # o_proj all-reduce and post_attention_layernorm) run the residual add and
+    # RMSNorm in the qar kernel's last stage, as each row half lands, instead
+    # of a separate XLA pass over the all-reduce output. Smaller all-reduces
+    # do the same add + norm in XLA inside the op. Same rounding points as
+    # fused_add_rms_norm; the variance sums in another order. Default off.
+    "TPU_TP_QAR_FUSE_NORM": lambda: os.environ.get("TPU_TP_QAR_FUSE_NORM", "0") == "1",
     "TPU_TP_AR_QDQ_MIN_TOKENS": env_int("TPU_TP_AR_QDQ_MIN_TOKENS", 0),
     # Pallas TP all-reduces of at most this many rows (a multiple of 8) run
     # the one-shot kernel: each rank pushes its whole activation to every

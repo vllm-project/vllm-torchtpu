@@ -622,8 +622,32 @@ def _put_body(q_cw, s_cw, q_cc, s_cc, f_cw, f_cc):
     f_cc[...] = _deq_tile(q_cc[...], s_cc[...]).astype(BF16)
 
 
+# Rows per tile of the fused residual-add + RMSNorm epilogue (full width h).
+_NORM_ROWS = 64
+
+
+def _add_norm_body(eps: float, h: int):
+    """new_res = bf16(ar + res); normed = bf16(f32(new_res) * rsqrt(mean(new_res^2)
+    + eps) * w): the rounding points of the TPU fused_add_rms_norm provider
+    (layers/adapter/ir_ops.py), w already in f32 (GemmaRMSNorm passes 1 + w)."""
+
+    def body(f, r, w, o_res, o_norm):
+        nr = (f[...].astype(F32) + r[...].astype(F32)).astype(BF16)
+        o_res[...] = nr
+        x = nr.astype(F32)
+        var = jnp.sum(x * x, axis=-1, keepdims=True) / float(h)
+        o_norm[...] = (x * lax.rsqrt(var + eps) * w[...]).astype(BF16)
+
+    return body
+
+
 @functools.cache
-def _fused_call(t: int, h: int):
+def _fused_call(t: int, h: int, norm_eps: float | None = None):
+    """norm_eps set: also takes res [t, h] bf16 and w [1, h] f32 and returns
+    new_res and normed (`_add_norm_body`) after the all-reduce outputs; each row
+    half runs its epilogue as soon as its d2d all-gather lands, so half 0's
+    overlaps half 1's last DMAs."""
+    norm = norm_eps is not None
     hh = h // 2
     w = hh // 8
     th = t // 2  # rows per half
@@ -634,8 +658,16 @@ def _fused_call(t: int, h: int):
     def slot(i, d, hf):
         return (i * 2 + d) * 2 + hf
 
-    def kernel(rank_ref, tab_ref, x_ref, full, recv, sq, ss, rq, rs, fq, fs, aq, as_,
-               d2d_send, d2d_recv, rs_send, rs_recv, ag_send, ag_recv, fin_send, fin_recv):
+    def kernel(rank_ref, tab_ref, x_ref, *refs):
+        if norm:
+            res_ref, w_ref = refs[:2]
+            refs = refs[2:]
+        (full, recv, sq, ss, rq, rs, fq, fs, aq, as_) = refs[:10]
+        refs = refs[10:]
+        if norm:
+            new_res, normed = refs[:2]
+            refs = refs[2:]
+        d2d_send, d2d_recv, rs_send, rs_recv, ag_send, ag_recv, fin_send, fin_recv = refs
         me = rank_ref[0]
         core = tab_ref[CORE, me]
         pos = tab_ref[POS, me]
@@ -784,8 +816,16 @@ def _fused_call(t: int, h: int):
                     c.start()
                     sends.append(c)
                     fin_sends.append(c)
-        for c in fin_sends:
+        ne = th // _NORM_ROWS
+        for hf, c in enumerate(fin_sends):
             c.wait_recv()
+            if norm:  # half hf of full is complete on this core
+                row = pl.BlockSpec((_NORM_ROWS, h), lambda r, hf=hf: (hf * ne + r, 0))
+                pltpu.emit_pipeline(
+                    _add_norm_body(norm_eps, h), grid=(ne,),
+                    in_specs=[row, row, pl.BlockSpec((1, h), lambda r: (0, 0))],
+                    out_specs=[row, row],
+                )(full, res_ref, w_ref, new_res, normed)
         for c in sends:
             c.wait_send()
 
@@ -802,12 +842,14 @@ def _fused_call(t: int, h: int):
         jax.ShapeDtypeStruct((nbuf * th, w), I8),                # aq (all-gather slots)
         jax.ShapeDtypeStruct((nbuf * th // QROWS, w), F32),      # as
     )
+    if norm:
+        outs += (jax.ShapeDtypeStruct((t, h), BF16),) * 2         # new_res, normed
     return pl.pallas_call(
         kernel,
         out_shape=outs,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
-            in_specs=[hbm],
+            in_specs=[hbm] * (3 if norm else 1),
             out_specs=[hbm] * len(outs),
             scratch_shapes=[
                 pltpu.SemaphoreType.DMA((2,)), pltpu.SemaphoreType.DMA((2,)),          # d2d rs
@@ -820,7 +862,7 @@ def _fused_call(t: int, h: int):
         # partitioner refuses a side-effecting custom call without a sharding; the
         # used output keeps the call alive, like tp_all_reduce.
         compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
-        name=f"qar_fused-t_{t}-h_{h}",
+        name=f"qar_fused-t_{t}-h_{h}" + ("-addnorm" if norm else ""),
     )
 
 
@@ -835,3 +877,30 @@ def all_reduce_v2(x: jax.Array, me: jax.Array, tab: np.ndarray) -> jax.Array:
     rank = me.reshape(1).astype(jnp.int32)
     full = _fused_call(t, h)(rank, jnp.asarray(tab), x)[0]
     return full[:rows]
+
+
+def all_reduce_v2_add_norm(x: jax.Array, res: jax.Array, w: jax.Array, eps: float,
+                           me: jax.Array, tab: np.ndarray) -> tuple[jax.Array, jax.Array]:
+    """all_reduce_v2(x) followed by the residual add and RMSNorm of
+    `_add_norm_body`, fused into the same call: (normed, new_res). w: f32 [h]."""
+    rows, h = x.shape
+    if h % (2 * 2 * 4 * 128):
+        raise ValueError(f"hidden {h} must split into 16 lane-aligned chunks")
+    t = -(-rows // (2 * _TILE)) * (2 * _TILE)
+    if t != rows:
+        x = jnp.pad(x, ((0, t - rows), (0, 0)))
+        res = jnp.pad(res, ((0, t - rows), (0, 0)))
+    rank = me.reshape(1).astype(jnp.int32)
+    out = _fused_call(t, h, float(eps))(
+        rank, jnp.asarray(tab), x, res.astype(BF16), w.reshape(1, h).astype(F32)
+    )
+    return out[-1][:rows], out[-2][:rows]
+
+
+def add_norm_reference(ar: jax.Array, res: jax.Array, w: jax.Array, eps: float):
+    """XLA form of `_add_norm_body` (ar, res bf16 [rows, h]; w f32 [h]):
+    (normed, new_res)."""
+    nr = (ar.astype(F32) + res.astype(F32)).astype(BF16)
+    x = nr.astype(F32)
+    var = jnp.mean(x * x, axis=-1, keepdims=True)
+    return (x * lax.rsqrt(var + eps) * w.astype(F32)).astype(BF16), nr

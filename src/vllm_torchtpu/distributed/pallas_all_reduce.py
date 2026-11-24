@@ -65,6 +65,10 @@ class _Armed:
 
 _ARMED: _Armed | None = None
 _QAR_TRACED: set[int] = set()
+# Fused all-reduce + residual add + RMSNorm (TPU_TP_QAR_FUSE_NORM): eps values
+# models asked for at construction, and the ops arm() built for them.
+_NORM_EPS: set[float] = set()
+_NORM_OPS: dict[float, Any] = {}
 
 
 def _qdq(x: jax.Array) -> jax.Array:
@@ -98,6 +102,102 @@ def _body(n: int, max_bytes: int, axis: str, direct_rows: int = 0,
         return _qdq(out) if qdq else out
 
     return body
+
+
+def _norm_body(n: int, max_bytes: int, axis: str, direct_rows: int, qar_min_rows: int,
+               qar_tab: np.ndarray, eps: float):
+    """(x, res, w, rank) -> (normed, new_res) of the all-reduce of x: qar sizes
+    in one fused kernel call, smaller ones all-reduce as `_body` then add +
+    norm in XLA (same rounding points)."""
+    ar = _body(n, max_bytes, axis, direct_rows, 0, 0, None)
+
+    def body(x, res, w, rank):
+        rows, hidden = x.shape
+        if 0 < qar_min_rows <= rows:
+            if -rows not in _QAR_TRACED:
+                _QAR_TRACED.add(-rows)
+                logger.warning(
+                    "tp_all_reduce: qar_all_reduce+add_norm lowered for [%d, %d]",
+                    rows, hidden,
+                )
+            return qar.all_reduce_v2_add_norm(x, res, w[0], eps, rank, qar_tab)
+        return qar.add_norm_reference(ar(x, rank), res, w[0], eps)
+
+    return body
+
+
+def _make_norm_op(mesh, max_bytes: int, direct_rows: int, qar_min_rows: int, eps: float):
+    axis = mesh.axis_names[0]
+    qar_tab = qar.layout_table(_qar_devices(mesh))
+    specs = (P(axis), P(axis), P(axis), P(axis))
+    sharded = jax.shard_map(
+        _norm_body(int(mesh.size), max_bytes, axis, direct_rows, qar_min_rows, qar_tab, eps),
+        mesh=mesh,
+        in_specs=specs,
+        out_specs=(P(axis), P(axis)),
+        check_vma=False,
+    )
+
+    def fn(x: jax.Array, res: jax.Array, w: jax.Array, rank: jax.Array):
+        args = (x, res, w, rank)
+        return sharded(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        f"pallas::tp_all_reduce_qar_add_norm_{len(_NORM_OPS)}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=(P(axis), P(axis)),
+    )
+    op.register_fake(lambda x, res, w, rank: (torch.empty_like(x), torch.empty_like(x)))
+    return op
+
+
+def request_add_norm(eps: float) -> bool:
+    """Called at model construction: whether the model should leave this
+    all-reduce un-reduced and call `all_reduce_add_norm` (arm() then builds
+    the op for eps; if arming fails the call returns None and the model
+    falls back to all-reduce + norm)."""
+    if not envs.TPU_TP_QAR_FUSE_NORM or envs.TPU_TP_QAR_MIN_TOKENS <= 0:
+        return False
+    _NORM_EPS.add(float(eps))
+    return True
+
+
+def all_reduce_add_norm(ranks, x: torch.Tensor, res: torch.Tensor, w: torch.Tensor,
+                        eps: float):
+    """(normed, new_res) of fused_add_rms_norm(all_reduce(x), res, w, eps) (w
+    f32 [hidden], the norm's effective weight), or None when not armed."""
+    armed = _ARMED
+    op = _NORM_OPS.get(float(eps))
+    if armed is None or op is None or tuple(ranks) != armed.ranks:
+        return None
+    if x.dtype != torch.bfloat16 or x.dim() != 2 or res.dtype != torch.bfloat16:
+        return None
+    return op(x, res, w.reshape(1, -1).to(torch.float32), armed.rank)
+
+
+def _norm_selftest(op, rank, n: int, hidden: int, device, rows: int, eps: float) -> dict:
+    """Exact integer partials (the all-reduce is exact) -> normed / new_res
+    against a numpy f64 reference: max abs error in bf16 ulps of the result."""
+    x = _selftest_inputs(n, rows, hidden)
+    me = int(rank.reshape(-1)[0].item())
+    rng = np.random.default_rng(7)
+    res = np.round(rng.standard_normal((rows, hidden)) * 4).astype(np.float32)
+    w = (1.0 + rng.standard_normal(hidden) * 0.1).astype(np.float32)
+    to_dev = lambda a, dt: torch.from_numpy(a).to(device).to(dt)
+    normed, new_res = op(to_dev(x[me], torch.bfloat16), to_dev(res, torch.bfloat16),
+                         to_dev(w.reshape(1, -1), torch.float32), rank)
+    nr = (x.sum(0) + res).astype(np.float64)  # small integers: exact in bf16
+    ref = nr / np.sqrt((nr * nr).mean(-1, keepdims=True) + eps) * w
+    got = normed.to(torch.float32).cpu().numpy().astype(np.float64)
+    ulp = np.maximum(np.abs(ref), 1e-30) * 2.0**-8
+    return dict(rank=me, res_ok=bool(np.array_equal(new_res.to(torch.float32).cpu().numpy(), nr)),
+                ulps=float(np.max(np.abs(got - ref) / ulp)),
+                digest=float((got.reshape(-1) * np.arange(1, got.size + 1)).sum()))
 
 
 def _qdq_min_rows() -> int:
@@ -312,6 +412,20 @@ def arm(hidden: int, device: torch.device) -> bool:
             " rows (TPU_TP_QAR_MIN_TOKENS); self-test passed",
             qar_min_rows,
         )
+        for eps in sorted(_NORM_EPS):
+            nop = _make_norm_op(mesh, max_bytes, direct_rows, qar_min_rows, eps)
+            seen = []
+            for rows in (qar_min_rows, 24):  # the fused kernel and the XLA form
+                seen += _gather(_norm_selftest(nop, rank, n, hidden, device, rows, eps))
+            if (not all(r["res_ok"] for r in seen) or max(r["ulps"] for r in seen) > 2.0
+                    or len({r["digest"] for r in seen[:n]}) != 1):
+                raise RuntimeError(f"qar add_norm: self-test failed: {seen}")
+            _NORM_OPS[eps] = nop
+            logger.warning(
+                "tp_all_reduce: TPU_TP_QAR_FUSE_NORM=1: all-reduce + residual add + RMSNorm"
+                " fused (eps %g); self-test passed (max %.3f bf16 ulp)",
+                eps, max(r["ulps"] for r in seen),
+            )
     qdq_min_rows = _qdq_min_rows()
     if qdq_min_rows and qar_min_rows <= 0:
         # The self-test checks exact sums; the emulation rounds, so it runs on
