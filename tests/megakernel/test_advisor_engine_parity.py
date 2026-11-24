@@ -30,11 +30,6 @@ import pytest
 from tests.megakernel.test_advisor_bounds import (
     compute_expected_kimi_k3_decode_comm_us,
 )
-from tests.megakernel.test_advisor_specs import (
-    DEEPSEEK_V4_CFG,
-    HOMOGENEOUS_DSA_CFG,
-    QWEN4_EXP_CFG,
-)
 from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import (
     constants,
@@ -90,14 +85,12 @@ class _BatchScenarioItem(TypedDict):
 DISPLAY_ROUND_TOL_US = 0.015
 
 
-def _select_five_models() -> tuple[str, ...]:
-    """Return 5 distinct model presets spanning GQA, GDN, MLA, MoE, and dense FFN."""
+def _select_shipped_models() -> tuple[str, ...]:
+    """Return all 3 shipped model presets spanning GQA, GDN, KDA, MLA, DSA, and MoE."""
     return (
         "qwen3.5-397b",
         "kimi-k3",
-        "qwen3.8-2.4t",
-        "deepseek-v3",
-        "llama-3.1-405b",
+        "glm-5.2",
     )
 
 
@@ -374,7 +367,7 @@ def _build_parity_payloads(
 ]:
     """Assemble reference evaluations and payload items for parity run."""
     chip_dict = dataclasses.asdict(chip_spec)
-    models_sample = _select_five_models()
+    models_sample = _select_shipped_models()
     batch_items: list[_BatchScenarioItem] = []
     expected_refs: list[_EvalParityResult] = []
     payload_items: list[dict[str, object]] = []
@@ -536,7 +529,7 @@ def test_js_engine_runner_executes_static_asset_parity(tmp_path: Path) -> None:
 
     chip_spec = advisor.resolve_chip_spec("tpu7x")
     batch_items, expected_refs, payload_items = _build_parity_payloads(chip_spec)
-    expected_scenario_count = 81  # 81 scenario combinations
+    expected_scenario_count = 51  # 3 shipped models x 15 valid + 6 invalid
     assert len(batch_items) == expected_scenario_count
 
     in_json = tmp_path / "parity_in.json"
@@ -678,18 +671,13 @@ def test_js_engine_support_gating_parity(tmp_path: Path) -> None:
 
     qwen_prof = models.resolve_model_profile("qwen3.5-397b")
     kimi_prof = models.resolve_model_profile("kimi-k3")
-    unv_prof = dataclasses.replace(
-        qwen_prof,
-        name="custom-unverified",
-        model_type="future_arch",
-        architecture_unverified=True,
-    )
+    glm_prof = models.resolve_model_profile("glm-5.2")
 
     cases = [
         (qwen_prof, advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=1)),
         (qwen_prof, advisor.WorkloadSpec(phase="decode", batch=256, tp=8, ep=1)),
         (kimi_prof, advisor.WorkloadSpec(phase="decode", batch=64, tp=4, dp=8, ep=32)),
-        (unv_prof, advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=1)),
+        (glm_prof, advisor.WorkloadSpec(phase="decode", batch=16, tp=16, ep=1)),
         (qwen_prof, advisor.WorkloadSpec(phase="decode", batch=16, tp=6, ep=1)),
     ]
     items = [
@@ -734,98 +722,6 @@ def test_js_engine_support_gating_parity(tmp_path: Path) -> None:
             assert got_sc["step_achievable_upper_us"] == pytest.approx(
                 scope.step_achievable_upper_us, abs=0.015
             )
-
-
-def test_sparse_csa_and_hyper_connection_engine_parity(tmp_path: Path) -> None:
-    """Verify JS parity for deepseek-v4 (CSA + mHC) and qwen4-exp (4x residual)."""
-    js_runtime = shutil.which("node") or shutil.which("gjs")
-    if js_runtime is None:
-        msg = "Neither node nor gjs runtime found; install nodejs"
-        raise RuntimeError(msg)
-
-    seed_defaults = workbench_engine.build_engine_seed_defaults()
-    runner_path = Path(__file__).with_name("advisor_engine_runner.js")
-    engine_path = Path(models.__file__).parent / "assets" / "workbench_engine.js"
-    chip_spec = advisor.resolve_chip_spec("tpu7x")
-    chip_dict = dataclasses.asdict(chip_spec)
-
-    cases: list[tuple[advisor.ModelProfile, advisor.WorkloadSpec]] = []
-    custom_profiles = (
-        models.model_profile_from_hf_config(
-            DEEPSEEK_V4_CFG, name="deepseek-v4-hf", weight_dtype="fp8"
-        ),
-        models.model_profile_from_hf_config(
-            QWEN4_EXP_CFG, name="qwen4-exp-hf", weight_dtype="fp8"
-        ),
-    )
-    for model_profile in custom_profiles:
-        cases.extend(
-            [
-                (
-                    model_profile,
-                    advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=1),
-                ),
-                (
-                    model_profile,
-                    advisor.WorkloadSpec(
-                        phase="prefill",
-                        batch=1,
-                        isl=4096,
-                        chunk_size=512,
-                        tp=8,
-                        ep=1,
-                    ),
-                ),
-            ]
-        )
-
-    items = [
-        {
-            "params": {
-                "only_validate": False,
-                "profile": dataclasses.asdict(model_profile),
-                "chip": chip_dict,
-                "wl": dataclasses.asdict(workload),
-            }
-        }
-        for model_profile, workload in cases
-    ]
-    in_json = tmp_path / "csa_mhc_in.json"
-    out_json = tmp_path / "csa_mhc_out.json"
-    in_json.write_text(
-        json.dumps(
-            {
-                "engine_path": str(engine_path),
-                "seed_data": {"chip_spec": chip_dict, **seed_defaults},
-                "items": items,
-            }
-        ),
-        encoding="utf-8",
-    )
-    _run_engine_runner(js_runtime, runner_path, in_json, out_json)
-    records = json.loads(out_json.read_text(encoding="utf-8"))
-
-    for (model_profile, workload), rec in zip(cases, records, strict=True):
-        report = advisor.advise(model_profile, workload, chip_spec)
-        got = rec["eval"]
-        full = got["full"]
-        assert full["fastestScope"] == report.fastest_scope
-        assert full["recScope"] == report.recommended_scope
-        for scope in report.scopes:
-            got_sc = got["scopes"][scope.scope]
-            assert got_sc["step_bound_us"] == pytest.approx(
-                scope.step_bound_us, abs=0.015
-            )
-            assert got_sc["step_floor_strict_us"] == pytest.approx(
-                scope.step_floor_strict_us, abs=0.015
-            )
-            assert got_sc["step_achievable_us"] == pytest.approx(
-                scope.step_achievable_us, abs=0.015
-            )
-            assert got_sc["step_achievable_upper_us"] == pytest.approx(
-                scope.step_achievable_upper_us, abs=0.015
-            )
-            assert got_sc["act_hbm_mb"] == pytest.approx(scope.act_hbm_mb, abs=0.015)
 
 
 def test_engine_parity_max_rows_per_call(tmp_path: Path) -> None:
@@ -1001,44 +897,21 @@ def test_js_engine_physical_validation_vmem_overflow_and_tps_parity(
     engine_path = Path(models.__file__).parent / "assets" / "workbench_engine.js"
     chip_spec = advisor.resolve_chip_spec("tpu7x")
     chip_dict = dataclasses.asdict(chip_spec)
-    kv_less_prof = dataclasses.replace(
-        models.resolve_model_profile("Qwen/Qwen3-30B-A3B-FP8"),
-        num_kv_heads=0,
-    )
+    qwen_prof = models.resolve_model_profile("Qwen/Qwen3.5-397B-A17B-FP8")
+    kv_less_prof = dataclasses.replace(qwen_prof, num_kv_heads=0)
 
     invalid_cases: list[tuple[advisor.ModelProfile, advisor.WorkloadSpec]] = [
-        (
-            models.resolve_model_profile("Qwen/Qwen3-30B-A3B-FP8"),
-            advisor.WorkloadSpec(phase="decode", batch=8, tp=2, ep=1),
-        ),
-        (
-            models.resolve_model_profile("Qwen/Qwen3-30B-A3B-FP8"),
-            advisor.WorkloadSpec(phase="decode", batch=8, tp=8, dp=3),
-        ),
-        (
-            models.resolve_model_profile("Qwen/Qwen3-30B-A3B-FP8"),
-            advisor.WorkloadSpec(phase="decode", batch=8, tp=8, pcp=3),
-        ),
-        (
-            models.resolve_model_profile("Qwen/Qwen3-30B-A3B-FP8"),
-            advisor.WorkloadSpec(phase="decode", batch=4, tp=8, dp=8),
-        ),
-        (
-            models.resolve_model_profile("Qwen/Qwen3-30B-A3B-FP8"),
-            advisor.WorkloadSpec(phase="decode", batch=8, tp=8, pp=2, pcp=2),
-        ),
-        (
-            models.resolve_model_profile("Qwen/Qwen3-30B-A3B-FP8"),
-            advisor.WorkloadSpec(phase="verify", batch=8, spec_tokens=0, tp=8),
-        ),
-        (
-            kv_less_prof,
-            advisor.WorkloadSpec(phase="decode", batch=8, tp=8, kv_split=2),
-        ),
+        (qwen_prof, advisor.WorkloadSpec(phase="decode", batch=8, tp=2, ep=1)),
+        (qwen_prof, advisor.WorkloadSpec(phase="decode", batch=8, tp=8, dp=3)),
+        (qwen_prof, advisor.WorkloadSpec(phase="decode", batch=8, tp=8, pcp=3)),
+        (qwen_prof, advisor.WorkloadSpec(phase="decode", batch=4, tp=8, dp=8)),
+        (qwen_prof, advisor.WorkloadSpec(phase="decode", batch=8, tp=8, pp=2, pcp=2)),
+        (qwen_prof, advisor.WorkloadSpec(phase="verify", batch=8, spec_tokens=0, tp=8)),
+        (kv_less_prof, advisor.WorkloadSpec(phase="decode", batch=8, tp=8, kv_split=2)),
     ]
     eval_cases: list[tuple[advisor.ModelProfile, advisor.WorkloadSpec]] = [
         (
-            models.resolve_model_profile("qwen3.5-0.8b"),
+            qwen_prof,
             advisor.WorkloadSpec(phase="decode", batch=16, tp=2),
         ),
         (
@@ -1816,11 +1689,36 @@ def test_glm_moe_dsa_and_dcp_engine_parity(
     chip_dict = dataclasses.asdict(chip_spec)
 
     glm_profile = models.resolve_model_profile("glm-5.2")
-    homogeneous_dsa_profile = models.model_profile_from_hf_config(
-        HOMOGENEOUS_DSA_CFG, name="homo-dsa", weight_dtype="fp8"
+    homogeneous_dsa_profile = models.finalize_model_profile(
+        advisor.ModelProfile(
+            name="homo-dsa",
+            model_type="glm_moe_dsa",
+            num_layers=32,
+            num_attention_layers=32,
+            num_moe_layers=32,
+            hidden_size=4096,
+            intermediate_size=8192,
+            moe_intermediate_size=1024,
+            shared_expert_intermediate_size=1024,
+            num_attention_heads=32,
+            num_kv_heads=32,
+            head_dim=128,
+            q_lora_rank=1024,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            num_experts=64,
+            top_k=8,
+            index_topk=2048,
+            index_head_dim=128,
+            index_n_heads=16,
+            num_indexer_layers=32,
+            weight_dtype="fp8",
+            expert_dtype="fp8",
+        )
     )
-    declared_dsa_profile = models.model_profile_from_hf_config(
-        HOMOGENEOUS_DSA_CFG, name="homo-dsa-declared", weight_dtype="fp8"
+    declared_dsa_profile = dataclasses.replace(
+        homogeneous_dsa_profile, name="homo-dsa-declared"
     )
     cases: list[tuple[advisor.ModelProfile, advisor.WorkloadSpec]] = [
         (
@@ -2096,8 +1994,8 @@ def _assert_eval_cases_parity(
 
 
 def test_prefill_sparse_dsa_and_kimi_k31_engine_parity(tmp_path: Path) -> None:
-    """Verify prefill sparse DSA and Kimi-K3.1 Pro JS engine parity."""
-    kimi31_prof = models.resolve_model_profile("kimi-k3.1-pro")
+    """Verify prefill sparse DSA and Kimi-K3 JS engine parity."""
+    kimi31_prof = models.resolve_model_profile("kimi-k3")
     glm_prof = models.resolve_model_profile("glm-5.2")
     cases: list[tuple[advisor.ModelProfile, advisor.WorkloadSpec]] = [
         (
@@ -2122,16 +2020,16 @@ def test_prefill_sparse_dsa_and_kimi_k31_engine_parity(tmp_path: Path) -> None:
 
 def test_core_gap_blockers_engine_parity(tmp_path: Path) -> None:
     """Verify core dtype and family gap blockers match Python advise in JS."""
-    gpt_oss_prof = models.resolve_model_profile("gpt-oss-120b")
-    mistral_prof = models.resolve_model_profile("mistral-large")
+    kimi_prof = models.resolve_model_profile("kimi-k3")
+    glm_prof = models.resolve_model_profile("glm-5.2")
     cases: list[tuple[advisor.ModelProfile, advisor.WorkloadSpec]] = [
         (
-            gpt_oss_prof,
-            advisor.WorkloadSpec(phase="decode", batch=4, context=4096, tp=8),
+            kimi_prof,
+            advisor.WorkloadSpec(phase="decode", batch=4, context=4096, tp=8, ep=8),
         ),
         (
-            mistral_prof,
-            advisor.WorkloadSpec(phase="decode", batch=4, context=4096, tp=8),
+            glm_prof,
+            advisor.WorkloadSpec(phase="decode", batch=4, context=4096, tp=16),
         ),
     ]
     _assert_eval_cases_parity(tmp_path, "core_gap_blockers", cases)

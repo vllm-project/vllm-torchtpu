@@ -20,7 +20,7 @@ import json
 
 from . import constants
 from .assets import load_asset
-from .models import DEPLOYMENT_PRESETS, RECOGNIZED_MODEL_TYPES
+from .models import DEPLOYMENT_PRESETS, SUPPORTED_MODEL_TYPES
 from .specs import (
     CORE_MODULE_FAMILIES,
     CORE_SUPPORTED_DTYPES,
@@ -92,7 +92,7 @@ def build_engine_seed_defaults() -> dict[str, object]:
         "core_module_families": sorted(CORE_MODULE_FAMILIES),
         "core_supported_dtypes": sorted(CORE_SUPPORTED_DTYPES),
         "structural_layer_tags": sorted(STRUCTURAL_LAYER_TAGS),
-        "recognized_model_types": sorted(RECOGNIZED_MODEL_TYPES),
+        "supported_model_types": sorted(SUPPORTED_MODEL_TYPES),
         "declared_megakernels": declared,
         "default_declared_phases": list(constants.DEFAULT_DECLARED_PHASES),
     }

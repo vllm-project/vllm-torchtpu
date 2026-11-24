@@ -32,7 +32,6 @@
   const CORE_FAM = new Set(CORE_LIM.core_module_families || []),
     CORE_DTYPES = new Set(CORE_LIM.core_supported_dtypes || []),
     STRUCTURAL_TAGS = new Set(CORE_LIM.structural_layer_tags || []);
-  const RECOGNIZED_TYPES = new Set(CORE_LIM.recognized_model_types || []);
   const VERIFIED_RANKS = new Set(CORE_LIM.verified_ranks || []);
   const CHIP_KINDS = new Set(
     (CORE_LIM.chip_kinds || []).map(s => String(s).toLowerCase())
@@ -278,16 +277,15 @@
     }
     return false;
   }
-  // Return { hasUnmodeled, familyGap, dtypeGap } matching support.py core gap rules.
+  // Return { familyGap, dtypeGap } matching support.py core gap rules.
   function evaluateCoreGaps(p, hasDecl) {
-    if (hasDecl) return { hasUnmodeled: false, familyGap: false, dtypeGap: false };
+    if (hasDecl) return { familyGap: false, dtypeGap: false };
     const fams = (p.layer_families || []).filter(f => !STRUCTURAL_TAGS.has(f));
-    const hasUnmodeled = fams.some(f => !SUPPORTED_FAM.has(f));
     const familyGap = fams.some(f => SUPPORTED_FAM.has(f) && !CORE_FAM.has(f));
     const weightDtype = String(p.weight_dtype || '').toLowerCase();
     const expertDtype = String(p.expert_dtype || p.weight_dtype || '').toLowerCase();
     const dtypeGap = !CORE_DTYPES.has(weightDtype) || !CORE_DTYPES.has(expertDtype);
-    return { hasUnmodeled, familyGap, dtypeGap };
+    return { familyGap, dtypeGap };
   }
   // Return declared expert_owner_groups (> 0) for p matching wl by sameLayout, else undefined.
   function declaredExpertOwnerGroups(p, wl) {
@@ -340,9 +338,6 @@
     const plannerBad = Boolean(ctx.planError) || (!decl && !isPeriodic) || (arSlots > maxAr);
     const chipName = String(ch.name || '').toLowerCase();
     const chipKind = (chipName === 'tpu7x' || chipName === '7x') ? 'tpu7x' : chipName;
-    const mt = String(p.model_type || '');
-    const archUnv = Boolean(p.architecture_unverified) ||
-      (Boolean(mt) && RECOGNIZED_TYPES.size > 0 && !RECOGNIZED_TYPES.has(mt));
     const blockers = [];
     if (sc === 'single_layer' || sc === 'layer_group') {
       blockers.push('scope_without_core_counterpart');
@@ -366,10 +361,8 @@
     if (ctx.epDp > 1 && !(decl && decl.attention_dp_in_call)) {
       blockers.push('all_to_all_not_in_core');
     }
-    if (gaps.hasUnmodeled) blockers.push('unmodeled_layer_family');
     if (gaps.familyGap) blockers.push('family_not_in_core');
     if (gaps.dtypeGap) blockers.push('dtype_not_in_core');
-    if (archUnv) blockers.push('model_type_unrecognized');
     if (plannerBad) blockers.push('planner_rejected');
     const maxRowsPerCall = wl.maxRowsPerCall ?? wl.max_rows_per_call ?? 0;
     if (sc === 'whole_step' && !decl && maxRowsPerCall === 0 &&
@@ -1167,8 +1160,7 @@
         reason = 'No layer grouping: needs a model preset, pp > 1, or segment_layers';
       } else if (sc === 'whole_step' && noWholeStep) {
         feasible = false;
-        reason = wl.planError ||
-          'Bounded by layer groups, single layers, or unmodeled layer family';
+        reason = wl.planError || 'Bounded by layer groups or single layers';
       }
       let staticBytes = 0, actBytes = 0, nOps = 1, tMax = 1, nSplits = 1;
       let denseStage = 0, expertStage = 0, opScratch = 0, padBytes = 0;
