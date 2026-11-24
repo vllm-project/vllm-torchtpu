@@ -252,9 +252,10 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         dict(routed_scaling_factor=scale + 1.0),
         dict(w1_scales_expert_second_minor=True),
         dict(w2_scales_expert_second_minor=True),
+        dict(use_route_kernel=False),
     ):
         assert bridge._build_op(*args, **(options | changed)) is not replicated
-    assert len(closures) == 7
+    assert len(closures) == 8
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     bias = jnp.arange(4, dtype=jnp.bfloat16)
     operands = (
@@ -276,6 +277,7 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
     assert forwarded["sharded_plan"] is sharded_plan
     assert forwarded["w1_scales_expert_second_minor"] is False
     assert forwarded["w2_scales_expert_second_minor"] is False
+    assert forwarded["use_route_kernel"] is True
     if has_bias:
         np.testing.assert_array_equal(forwarded["score_bias"], bias)
         assert forwarded["score_bias"].dtype == jnp.float32
@@ -293,6 +295,19 @@ def test_sharded_plan_flag_reaches_the_built_op():
             == "op"
         )
     assert seen and seen[0][_SHARDED_PLAN_ARG] is True
+
+
+@pytest.mark.parametrize("route_kernel", [False, True])
+def test_route_kernel_flag_reaches_the_built_op(route_kernel):
+    seen = []
+    with patch.object(envs, "MOE_FUSED_EP_V2_ROUTE_KERNEL", route_kernel):
+        assert (
+            _prebuild(
+                _layer(), build_op=lambda *args, **kwargs: seen.append(kwargs) or "op"
+            )
+            == "op"
+        )
+    assert seen and seen[0]["use_route_kernel"] is route_kernel
 
 
 def test_mesh_expert_order_is_closed_into_the_built_op():

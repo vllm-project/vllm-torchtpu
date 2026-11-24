@@ -113,7 +113,8 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
-    MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT: bool = False
+    MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT: bool = True
+    MOE_FUSED_EP_V2_ROUTE_KERNEL: bool = True
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
@@ -904,7 +905,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of the runner all-reducing it after the layer. Delete once it is
     # measured on serving and made the default.
     "MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT": env_bool(
-        "MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT"
+        "MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT", default=True
+    ),
+    # Run the fused EP MoE's routing exchange and routing plan as one
+    # TensorCore Pallas kernel (route_plan.py) where its shape conditions
+    # hold, instead of the XLA collective and the plan's serial XLA ops. Set
+    # to 0 to fall back to the XLA form.
+    "MOE_FUSED_EP_V2_ROUTE_KERNEL": env_bool(
+        "MOE_FUSED_EP_V2_ROUTE_KERNEL", default=True
     ),
     # Keep the fused EP MoE mesh in EP-rank order and do the activation
     # all-gather outside the kernel's program, over a process group in

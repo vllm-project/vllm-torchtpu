@@ -923,23 +923,25 @@ def test_slab_run_copy_and_sort_lookup_are_bit_exact(
 
 
 @pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
+@pytest.mark.parametrize("t_local", [8, 13, 24, 64, 200, 256, 320, 330])
 def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
-    wire_dtype,
+    t_local, wire_dtype
 ):
-    """Pallas `_build_combine_kernel` keeps NaN arrival rows on padded rows.
+    """`layer._combine_arrivals` zeroes padded rows that read NaN arrivals.
 
     In `fused_ep_moe_v2`, a freshly allocated `arrivals` buffer may contain
     zeroes on TPU rather than `NaN`. This single-chip test calls
-    `layer._combine_arrivals` directly at `t_local = COMBINE_MIN_TOKENS` (256),
-    where `kernel.combine_step_tokens(t_local) > 0` dispatches to the Pallas
-    DMA/reduce combine kernel (`_build_combine_kernel`), with `arrivals` and
-    `arrival_scales` explicitly poisoned with `NaN` at all sentinel positions,
-    followed by the layer's `jnp.where(row_routes, combined, jnp.zeros_like(combined))`.
+    `layer._combine_arrivals` directly, with `arrivals` and `arrival_scales`
+    explicitly poisoned with `NaN` at all sentinel positions; the mask is
+    applied inside the combine.
+
+    8 through 256 run on the unrolled schedule, 8, 24 and 200 with a short
+    last step whose relayout reads stale rows; 320 runs on the rotated one;
+    13 (not a multiple of the row alignment) and 330 (no whole rotations)
+    have no kernel schedule and take the XLA epilogue.
     """
-    t_local = kernel.COMBINE_MIN_TOKENS
-    assert kernel.combine_step_tokens(t_local) > 0
+    assert bool(kernel.combine_step_tokens(t_local)) == (t_local not in (13, 330))
     topk, lane_blocks, lanes, tile_m = 4, 2, 128, 128
-    hidden = lane_blocks * lanes
     block = host.routing_block(t_local, topk)
     recv_rows = block + 64
     active = t_local // 2
@@ -952,7 +954,7 @@ def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
         assert np.isnan(np.asarray(arrivals[:block].astype(jnp.float32))).all()
 
         scales_f32 = np.ones((4, tile_m), dtype=np.float32)
-        scales_f32[: block // tile_m, :] = np.nan
+        scales_f32.reshape(-1)[:block] = np.nan
         arrival_scales = jnp.asarray(scales_f32)
 
         pos = np.full((t_local, topk), block, dtype=np.int32)
@@ -968,22 +970,180 @@ def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
         topk_weights[active:] = 0.0
         row_routes = jnp.asarray([[True]] * active + [[False]] * padded)
 
-        combined = layer._combine_arrivals(
+        out = layer._combine_arrivals(
             arrivals,
             arrival_scales,
             jnp.asarray(pos),
             jnp.asarray(mirror_pos),
             jnp.asarray(topk_weights),
+            row_routes,
             jnp.bfloat16,
         )
-        out = np.asarray(jnp.where(row_routes, combined, jnp.zeros_like(combined)))
+        out = np.asarray(out.astype(jnp.float32))
 
     assert np.isfinite(out).all()
-    np.testing.assert_allclose(out[:active].astype(np.float32), 1.0)
-    np.testing.assert_array_equal(
-        out[active:].astype(np.float32),
-        np.zeros((padded, hidden), dtype=np.float32),
+    np.testing.assert_array_equal(out[:active], 1.0)
+    np.testing.assert_array_equal(out[active:], 0.0)
+
+
+# Every t_local the unrolled schedule takes, then the rotated one at 16- and
+# 32-token steps.
+_COMBINE_TOKENS = [
+    *range(
+        kernel.COMBINE_ROW_ALIGN,
+        kernel.COMBINE_UNROLLED_TOKENS + 1,
+        kernel.COMBINE_ROW_ALIGN,
+    ),
+    320,
+    384,
+]
+
+
+def _combine_case(t_local, topk, lane_blocks, with_shared):
+    """Kernel operands and the exact expected output for one combine.
+
+    Small integer rows and power-of-two coefficients keep every f32 sum exact,
+    so the only rounding is the bf16 one the reference does too. Every third
+    token is unrouted and reads a NaN row at a nonzero coefficient, so only
+    the mask can zero it.
+    """
+    hidden = lane_blocks * 128
+    recv_rows = t_local * topk + 8
+    rng = np.random.default_rng(t_local * 100 + topk * 10 + lane_blocks)
+    arrivals = rng.integers(-8, 9, (recv_rows, lane_blocks, 128)).astype(np.float32)
+    pos = rng.permutation(recv_rows)[: t_local * topk].reshape(t_local, topk)
+    coef = rng.choice([-2.0, -0.5, 0.25, 1.0], (t_local, topk)).astype(np.float32)
+    routes = np.arange(t_local) % 3 != 2
+    want = np.einsum("tk,tkh->th", coef, arrivals[pos].reshape(t_local, topk, hidden))
+    want = np.where(routes[:, None], want, 0.0).astype(jnp.bfloat16)
+    shared = rng.integers(-8, 9, (t_local, hidden)).astype(jnp.bfloat16)
+    if with_shared:
+        want = (want.astype(np.float32) + shared.astype(np.float32)).astype(
+            jnp.bfloat16
+        )
+    arrivals[pos[~routes, 0]] = np.nan
+    return arrivals, pos, coef, routes, shared, want.astype(np.float32)
+
+
+def _run_combine(t_local, topk, lane_blocks, wire_dtype, with_shared):
+    arrivals, pos, coef, routes, shared, want = _combine_case(
+        t_local, topk, lane_blocks, with_shared
     )
+    with jax.default_device(jax.devices()[0]):
+        combine = kernel.build_combine_kernel(
+            t_local=t_local,
+            topk=topk,
+            hidden=lane_blocks * 128,
+            lane_blocks=lane_blocks,
+            wire_dtype=wire_dtype,
+            out_dtype=jnp.bfloat16,
+            with_shared=with_shared,
+        )
+        got = combine(
+            jnp.asarray(arrivals, wire_dtype),
+            jnp.asarray(pos, jnp.int32),
+            jnp.asarray(coef),
+            jnp.asarray(routes),
+            shared=jnp.asarray(shared) if with_shared else None,
+        )
+        got = np.asarray(got.astype(jnp.float32))
+    np.testing.assert_array_equal(got, want)
+
+
+@pytest.mark.parametrize("with_shared", [False, True], ids=["plain", "shared"])
+@pytest.mark.parametrize("t_local", _COMBINE_TOKENS)
+def test_pallas_combine_kernel_matches_reference(t_local, with_shared):
+    """Every token's masked weighted sum lands on its own output row.
+
+    Every multiple of 8 through 256 takes the unrolled schedule, at each of
+    its 16-, 32-, 48- and 64-token steps and every short last step, some of
+    which need both the chunk loop and a tail; 320 and 384 take the rotated
+    one. With `with_shared` the kernel adds the shared rows to the rounded
+    sum.
+    """
+    _run_combine(t_local, 4, 2, jnp.bfloat16, with_shared)
+
+
+@pytest.mark.parametrize(
+    ("t_local", "topk", "lane_blocks", "wire_dtype", "with_shared"),
+    [
+        pytest.param(256, 8, 8, FP8, True, id="t256-k8-h1024-fp8-shared"),
+        pytest.param(512, 8, 2, FP8, True, id="t512-k8-h256-fp8-shared"),
+        pytest.param(40, 1, 4, FP8, False, id="t40-k1-h512-fp8"),
+        pytest.param(200, 6, 16, jnp.bfloat16, True, id="t200-k6-h2048-bf16-shared"),
+        pytest.param(32, 10, 32, FP8, True, id="t32-k10-h4096-fp8-shared"),
+        pytest.param(168, 10, 32, FP8, True, id="t168-k10-h4096-fp8-shared"),
+        pytest.param(2048, 10, 32, FP8, True, id="t2048-k10-h4096-fp8-shared"),
+    ],
+)
+def test_pallas_combine_kernel_matches_reference_across_shapes(
+    t_local, topk, lane_blocks, wire_dtype, with_shared
+):
+    """The fp8 wire, other topk and wider hidden match the reference too.
+
+    256 at topk 8 is the unrolled schedule at full steps over packed-f8 rows;
+    512 is the rotated schedule at 64-token steps over two rotations; topk 1
+    feeds a single DMA queue; topk 6 at hidden 2048 widens the relayout. The
+    last three are the production layer (hidden 4096, topk 10): a decode
+    t_local, a short step after 48-token ones, and the rotated schedule.
+    """
+    _run_combine(t_local, topk, lane_blocks, wire_dtype, with_shared)
+
+
+@pytest.mark.parametrize("t_local", [32, 200, 512])
+def test_combine_arrivals_kernel_matches_xla_epilogue(t_local, monkeypatch):
+    """`layer._combine_arrivals` gives the same bits on both paths.
+
+    Drives the layer's own wiring into the kernel -- the row clamp, the scale
+    and weight fold, [t_local, 1] route flags, the shared add -- against the
+    XLA epilogue on the same inputs. Some routed tokens read past the buffer,
+    so both paths must clamp to its last row; unrouted ones read NaN rows.
+    Values are chosen so every sum and the shared add are exact in bf16,
+    leaving the XLA side no rounding to skip under excess precision.
+    """
+    assert kernel.combine_step_tokens(t_local)
+    topk, lane_blocks, tile_m = 8, 4, 128
+    hidden = lane_blocks * 128
+    recv_rows = t_local * topk + 8
+    rng = np.random.default_rng(t_local)
+    arrivals = rng.integers(-4, 5, (recv_rows, lane_blocks, 128)).astype(np.float32)
+    nan_rows = rng.choice(recv_rows - 1, 64, replace=False)
+    arrivals[nan_rows] = np.nan
+    live = np.setdiff1d(np.arange(recv_rows), nan_rows)
+    routes = np.arange(t_local) % 3 != 2
+    pos = rng.choice(live, (t_local, topk))
+    pos[~routes] = rng.choice(nan_rows, (int((~routes).sum()), topk))
+    pos[routes.nonzero()[0][::7], 0] = recv_rows + 5
+    sublanes = -(-recv_rows // tile_m)
+    scales = rng.choice([0.5, 1.0], (sublanes, tile_m)).astype(np.float32)
+    mirror_pos = rng.integers(0, sublanes * tile_m, (t_local, topk))
+    weights = rng.choice([0.5, 1.0], (t_local, topk)).astype(np.float32)
+    weights[~routes] = 0.0
+    shared = rng.integers(-8, 9, (t_local, hidden)).astype(jnp.bfloat16)
+
+    def combine():
+        out = layer._combine_arrivals(
+            jnp.asarray(arrivals, FP8),
+            jnp.asarray(scales),
+            jnp.asarray(pos, jnp.int32),
+            jnp.asarray(mirror_pos, jnp.int32),
+            jnp.asarray(weights),
+            jnp.asarray(routes[:, None]),
+            jnp.bfloat16,
+            jnp.asarray(shared),
+        )
+        return np.asarray(out.astype(jnp.float32))
+
+    with jax.default_device(jax.devices()[0]):
+        on_kernel = combine()
+        monkeypatch.setattr(layer, "combine_step_tokens", lambda t_local: 0)
+        on_xla = combine()
+
+    assert np.isfinite(on_kernel).all()
+    np.testing.assert_array_equal(
+        on_kernel[~routes], shared[~routes].astype(np.float32)
+    )
+    np.testing.assert_array_equal(on_kernel, on_xla)
 
 
 @pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
@@ -993,13 +1153,11 @@ def test_padded_tokens_on_pallas_combine_and_all_padded_warmup(
 ):
     """Padded rows become exact zero and leave active rows bit-identical.
 
-    Runs at `t_local = 256` (`tokens = EP * 256 = 2048`), where
-    `kernel.combine_step_tokens(t_local) > 0` selects the Pallas combine
-    kernel (`_build_combine_kernel`) rather than the XLA epilogue. Also gates
-    the warmup (`_dummy_run`) case where every row on every shard is NaN-masked.
+    Runs at `t_local = 256` (`tokens = EP * 256`), where the Pallas combine
+    runs on the unrolled schedule at 64-token steps. Also gates the warmup
+    (`_dummy_run`) case where every row on every shard is NaN-masked.
     """
-    t_local = kernel.COMBINE_MIN_TOKENS
-    assert kernel.combine_step_tokens(t_local) > 0
+    t_local = 256
     tokens = EP * t_local
     mesh = _mesh()
     w1, w2, w1_scale, w2_scale = _make_weights(

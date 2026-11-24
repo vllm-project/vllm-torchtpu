@@ -670,13 +670,91 @@ def test_slab_run_copy_fits_its_vmem_budget(t_local, vmem, fits):
     assert host.slab_run_copy_fits(t_local, topk, ep, stride, info) is fits
 
 
+@pytest.mark.parametrize(
+    ("t_local", "tb"),
+    [(320, 16), (384, 32), (512, 64), (2048, 64), (264, 0), (288, 0)],
+)
+def test_combine_rotated_schedule_past_one_rotation(t_local, tb):
+    """Past one unrolled rotation a t_local needs whole rotations of equal
+    steps; without them the layer takes the XLA epilogue."""
+    assert kernel.combine_step_tokens(t_local) == tb
+
+
+def test_combine_unrolls_every_aligned_token_count_up_to_one_rotation():
+    """Up to one rotation every t_local that is a multiple of the row
+    alignment has a schedule of at most one step per buffer; any other takes
+    the XLA epilogue, since its short step's copies would not compile."""
+    for t_local in range(1, kernel.COMBINE_UNROLLED_TOKENS + 1):
+        tb = kernel.combine_step_tokens(t_local)
+        if t_local % kernel.COMBINE_ROW_ALIGN:
+            assert tb == 0, t_local
+            continue
+        assert tb and not tb % kernel.COMBINE_GROUP, t_local
+        assert -(-t_local // tb) <= kernel.COMBINE_PARITIES, t_local
+
+
+def test_combine_rotated_schedules_run_whole_rotations():
+    """Past one rotation every schedule is whole rotations of equal steps,
+    each a whole number of groups and more steps than the row lead."""
+    for t_local in range(kernel.COMBINE_UNROLLED_TOKENS + 1, 4097):
+        tb = kernel.combine_step_tokens(t_local)
+        if not tb:
+            continue
+        steps, rem = divmod(t_local, tb)
+        assert not rem and not tb % kernel.COMBINE_GROUP, t_local
+        assert not steps % kernel.COMBINE_PARITIES, t_local
+        assert steps > kernel.COMBINE_LEAD, t_local
+
+
+def test_combine_kernel_rejects_mismatched_operands(monkeypatch):
+    """The combine refuses a t_local with no schedule and operands that do
+    not match its build, before anything reaches the TPU."""
+    monkeypatch.setattr(host, "vmem_limit", lambda info=None: 64 << 20)
+    shape = dict(
+        t_local=64,
+        topk=4,
+        hidden=256,
+        lane_blocks=2,
+        wire_dtype=jnp.bfloat16,
+        out_dtype=jnp.bfloat16,
+    )
+    for t_local in (1, 264):
+        with pytest.raises(ValueError, match=f"no schedule for {t_local} tokens"):
+            kernel._build_combine_kernel(**{**shape, "t_local": t_local})
+
+    plain = kernel._build_combine_kernel(**shape)
+    with_shared = kernel._build_combine_kernel(**shape, with_shared=True)
+    arrivals = jnp.zeros((264, 2, 128), jnp.bfloat16)
+    pos = jnp.zeros((64, 4), jnp.int32)
+    coef = jnp.zeros((64, 4), jnp.float32)
+    routes = jnp.ones((64, 1), bool)
+    shared = jnp.zeros((64, 256), jnp.bfloat16)
+
+    with pytest.raises(ValueError, match="build the combine with_shared"):
+        plain(arrivals, pos, coef, routes, shared=shared)
+    with pytest.raises(ValueError, match="takes shared"):
+        with_shared(arrivals, pos, coef, routes)
+    with pytest.raises(ValueError, match="shared must be"):
+        with_shared(arrivals, pos, coef, routes, shared=shared.astype(jnp.float32))
+    with pytest.raises(ValueError, match="shared must be"):
+        with_shared(arrivals, pos, coef, routes, shared=shared[:32])
+    with pytest.raises(ValueError, match="pos table"):
+        plain(arrivals, pos.T, coef, routes)
+    with pytest.raises(ValueError, match="coef table"):
+        plain(arrivals, pos, coef[:, :2], routes)
+    with pytest.raises(ValueError, match="one route flag per token"):
+        plain(arrivals, pos, coef, routes[:32])
+
+
 def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens():
     """NaN arrival rows stay isolated to padded rows and zero out via row_routes."""
     from vllm_torchtpu.kernels.fused_moe.v2.layer import _combine_arrivals
 
-    # Use t_local=8 so combine_step_tokens(t_local) is 0 and the XLA epilogue runs
-    # on CPU without invoking the Pallas TPU combine kernel.
-    t_local, topk, lane_blocks, lanes, tile_m = 8, 4, 2, 128, 128
+    # 264 has no rotated combine schedule, so the XLA epilogue runs on CPU
+    # without invoking the Pallas TPU combine kernel.
+    t_local, topk, lane_blocks, lanes, tile_m = 264, 4, 2, 128, 128
+    assert kernel.combine_step_tokens(t_local) == 0
+    active = t_local - 4
     recv_rows = 32
     arrivals = np.ones((recv_rows, lane_blocks, lanes), dtype=np.float32)
     arrival_scales = np.ones((4, tile_m), dtype=np.float32)
@@ -692,26 +770,35 @@ def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens():
     mirror_pos = np.full((t_local, topk), 16, dtype=np.int32)
     topk_weights = np.full((t_local, topk), 0.25, dtype=np.float32)
 
-    # Mark rows 4..7 as padded: pos and mirror_pos span [0, 16), topk_weights=0.0.
-    pos[4:] = sentinel_ranks
-    mirror_pos[4:] = sentinel_ranks
-    topk_weights[4:] = 0.0
-    row_routes = jnp.asarray([[True]] * 4 + [[False]] * 4)
+    # Mark the last 4 rows as padded: pos and mirror_pos span [0, 16),
+    # topk_weights=0.0.
+    pos[active:] = sentinel_ranks
+    mirror_pos[active:] = sentinel_ranks
+    topk_weights[active:] = 0.0
+    row_routes = jnp.asarray([[True]] * active + [[False]] * 4)
 
-    combined = _combine_arrivals(
-        jnp.asarray(arrivals),
-        jnp.asarray(arrival_scales),
-        jnp.asarray(pos),
-        jnp.asarray(mirror_pos),
-        jnp.asarray(topk_weights),
-        jnp.bfloat16,
+    shared = np.full((t_local, lane_blocks * lanes), 0.5, np.float32)
+    out, with_shared = (
+        np.asarray(
+            _combine_arrivals(
+                jnp.asarray(arrivals),
+                jnp.asarray(arrival_scales),
+                jnp.asarray(pos),
+                jnp.asarray(mirror_pos),
+                jnp.asarray(topk_weights),
+                row_routes,
+                jnp.bfloat16,
+                shared_rows,
+            ).astype(jnp.float32)
+        )
+        for shared_rows in (None, jnp.asarray(shared, jnp.bfloat16))
     )
-    out = np.asarray(jnp.where(row_routes, combined, jnp.zeros_like(combined)))
     assert np.isfinite(out).all()
-    np.testing.assert_allclose(out[:4].astype(np.float32), 1.0)
+    np.testing.assert_allclose(out[:active], 1.0)
     np.testing.assert_array_equal(
-        out[4:].astype(np.float32), np.zeros((4, lane_blocks * lanes), np.float32)
+        out[active:], np.zeros((4, lane_blocks * lanes), np.float32)
     )
+    np.testing.assert_array_equal(with_shared, out + shared)
 
 
 @pytest.mark.parametrize("scoring_fn", ["softmax", "sigmoid", "sqrtsoftplus"])

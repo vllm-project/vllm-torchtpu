@@ -499,6 +499,7 @@ class TpuPlatform(Platform):
         "TPU_MOE_ROUTER_TOPK",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT",
+        "MOE_FUSED_EP_V2_ROUTE_KERNEL",
         "TPU_DP_VOCAB_PARALLEL",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",

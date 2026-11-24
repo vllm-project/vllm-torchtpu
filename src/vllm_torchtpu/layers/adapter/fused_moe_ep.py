@@ -190,6 +190,7 @@ def _build_op(
     w1_scales_expert_second_minor=False,
     w2_scales_expert_second_minor=False,
     has_shared_partial=False,
+    use_route_kernel=True,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -220,6 +221,7 @@ def _build_op(
         w1_scales_expert_second_minor,
         w2_scales_expert_second_minor,
         has_shared_partial,
+        use_route_kernel,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -263,6 +265,7 @@ def _build_op(
             token_replica_groups=token_replica_groups,
             w1_scales_expert_second_minor=w1_scales_expert_second_minor,
             w2_scales_expert_second_minor=w2_scales_expert_second_minor,
+            use_route_kernel=use_route_kernel,
             **bias_kw,
             **routing_kw,
         )
@@ -1027,6 +1030,7 @@ def prebuild_fused_moe_ep(
         return None
 
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
+    use_route_kernel = envs.MOE_FUSED_EP_V2_ROUTE_KERNEL
     token_replica_groups = ep_token_replica_groups(
         is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
     )
@@ -1054,6 +1058,7 @@ def prebuild_fused_moe_ep(
         and _scales_expert_second_minor(w1_scale),
         w2_scales_expert_second_minor=weight_format == "fp4"
         and _scales_expert_second_minor(w2_scale),
+        use_route_kernel=use_route_kernel,
     )
     op = _build_op(*build_args, **build_kw)
     if envs.MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT and not (
@@ -1063,9 +1068,9 @@ def prebuild_fused_moe_ep(
         setattr(layer, _SHARED_FOLD_OP_ATTR, fold_op)
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
-        "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
-        "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
-        "token_replica_groups=%s",
+        "pcp=%d topk=%d capacity=%d sharded_plan=%s route_kernel=%s "
+        "format=%s rhs_qb=%s act=%s scoring=%s score_bias=%s hash_routing=%s "
+        "routed_scale=%s token_replica_groups=%s",
         hidden,
         inter,
         local_experts,
@@ -1074,6 +1079,7 @@ def prebuild_fused_moe_ep(
         topk,
         _TILE_M,
         sharded_plan,
+        use_route_kernel,
         weight_format,
         rhs_qb,
         activation,
