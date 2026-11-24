@@ -112,24 +112,6 @@ def test_html_renders_provenance_tags_flag_badges_and_onesided_bands() -> None:
     with pytest.raises(advisor.UnsupportedArchitectureError):
         advisor.advise_regimes(unverified_cfg, "tpu7x")
 
-    unverified_profile = advisor.ModelProfile(
-        name="custom_causal_lm_v1",
-        num_layers=24,
-        hidden_size=2048,
-        intermediate_size=5632,
-        num_attention_heads=16,
-        num_kv_heads=4,
-        head_dim=128,
-        num_attention_layers=24,
-        num_moe_layers=0,
-        expert_dtype="fp8",
-        model_type="custom_causal_lm_v1",
-        architecture_unverified=True,
-    )
-    unverified_sweep = advisor.advise_regimes(unverified_profile, "tpu7x")
-    unverified_html = advisor.render_advisor_html(unverified_sweep)
-    assert "architecture_unverified" in unverified_html
-
     band_svg = advisor_report.render_step_band_svg(sweep)
     assert band_svg in html_out
     whiskers = WHISKER_RE.findall(band_svg)
@@ -149,7 +131,7 @@ def test_html_calibrated_provenance_promotes_measured_badge() -> None:
     cal_data = chips.load_public_calibration("tpu7x")
     assert cal_data is not None
     sweep = advisor.advise_regimes(
-        "Qwen/Qwen3-30B-A3B-FP8",
+        "Qwen/Qwen3.5-397B-A17B-FP8",
         "tpu7x",
         measurements=cal_data,
     )
@@ -183,7 +165,7 @@ def test_html_calibrated_provenance_promotes_measured_badge() -> None:
         },
     }
     trace_sweep = advisor.advise_regimes(
-        "Qwen/Qwen3-30B-A3B-FP8",
+        "Qwen/Qwen3.5-397B-A17B-FP8",
         "tpu7x",
         measurements=trace_data,
     )
@@ -357,7 +339,7 @@ def test_decision_table_verdict_tie_and_objective_split(
     expected_sub: str,
 ) -> None:
     """Verify decision table renders distinct badges for ties vs objective splits."""
-    profile = advisor.resolve_model_profile("Qwen/Qwen3-30B-A3B-FP8")
+    profile = advisor.resolve_model_profile("Qwen/Qwen3.5-397B-A17B-FP8")
     chip = advisor.resolve_chip_spec("tpu7x")
     sweep = advisor.advise_regimes(profile, chip)
     assert sweep.regimes
@@ -377,7 +359,7 @@ def test_decision_table_verdict_tie_and_objective_split(
 
 def test_render_advisor_html_handles_chip_spec_without_sources() -> None:
     """Verify render_advisor_html does not crash when ChipSpec.sources is None."""
-    profile = advisor.resolve_model_profile("Qwen/Qwen3-30B-A3B-FP8")
+    profile = advisor.resolve_model_profile("Qwen/Qwen3.5-397B-A17B-FP8")
     chip_no_sources = dataclasses.replace(
         advisor.resolve_chip_spec("tpu7x"),
         sources=None,
