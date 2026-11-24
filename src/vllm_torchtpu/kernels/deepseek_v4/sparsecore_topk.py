@@ -597,9 +597,30 @@ def _topk_body(
                 descriptor(c).wait()
                 return carry
 
-            count = (live + (chunk - 1)) // chunk
-            lax.fori_loop(0, count, start, 0)
-            lax.fori_loop(0, count, wait, 0)
+            from vllm_torchtpu import envs
+
+            if envs.VLLM_TPU_QSA_DMA_BATCH_OPT:
+
+                @pl.when(live >= slice_len)
+                def _copy_full():
+                    src = pl.multiple_of(row * slice_len, LANES)
+                    full_copy = pltpu.make_async_copy(
+                        scores_hbm.at[pl.ds(src, slice_len)],
+                        bounded_vmem.at[pl.ds(0, slice_len)],
+                        bounded_sem,
+                    )
+                    full_copy.start()
+                    full_copy.wait()
+
+                @pl.when((live > 0) & (live < slice_len))
+                def _copy_partial():
+                    count = (live + (chunk - 1)) // chunk
+                    lax.fori_loop(0, count, start, 0)
+                    lax.fori_loop(0, count, wait, 0)
+            else:
+                count = (live + (chunk - 1)) // chunk
+                lax.fori_loop(0, count, start, 0)
+                lax.fori_loop(0, count, wait, 0)
 
         len_spec = pl.BlockSpec(
             (LANES,),

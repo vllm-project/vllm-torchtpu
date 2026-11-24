@@ -44,6 +44,65 @@ MAIN_KV_DMA_BATCHES = {
     ): 8,
 }
 
+# Expanded TPU v7x unified-pool page shape tables (gated by
+# VLLM_TPU_QSA_DMA_BATCH_OPT=1, default off):
+# BF16 SSM gives block_size=256 (TP8), 512 (TP4), 896 (TP2); FP32 SSM gives
+# 512 (TP8), 896 (TP4), 1664 (TP2); plus 1024-token pages.
+_FP8_PAGE_TOKENS = (256, 512, 896, 1024, 1664)
+_FP8_HEAD_SLOTS = (4, 8)
+_BF16_PAGE_TOKENS = (256, 512, 896, 1024, 1664)
+_BF16_HEAD_SLOTS = (2, 4, 8)
+
+RING_TAG_DMA_BATCHES_OPT = {
+    **RING_TAG_DMA_BATCHES,
+    **{
+        (
+            pltpu.ChipVersion.TPU_7X,
+            (pt, 1, hs, 256),
+            jnp.dtype(jnp.float8_e4m3fn),
+            1024,
+            16,
+        ): 8
+        for pt in _FP8_PAGE_TOKENS
+        for hs in _FP8_HEAD_SLOTS
+    },
+    **{
+        (
+            pltpu.ChipVersion.TPU_7X,
+            (pt, 1, hs, 256),
+            jnp.dtype(jnp.bfloat16),
+            1024,
+            16,
+        ): 8
+        for pt in _BF16_PAGE_TOKENS
+        for hs in _BF16_HEAD_SLOTS
+    },
+}
+
+MAIN_KV_DMA_BATCHES_OPT = {
+    **MAIN_KV_DMA_BATCHES,
+    **{
+        (
+            pltpu.ChipVersion.TPU_7X,
+            (pt, 1, hs, 256),
+            jnp.dtype(jnp.float8_e4m3fn),
+            (1, hs, 256),
+        ): 8
+        for pt in _FP8_PAGE_TOKENS
+        for hs in _FP8_HEAD_SLOTS
+    },
+    **{
+        (
+            pltpu.ChipVersion.TPU_7X,
+            (pt, 1, hs, 256),
+            jnp.dtype(jnp.bfloat16),
+            (1, hs, 256),
+        ): 8
+        for pt in _BF16_PAGE_TOKENS
+        for hs in _BF16_HEAD_SLOTS
+    },
+}
+
 
 def get_main_kv_dma_batch(pool: jax.Array, rows: jax.Array) -> int:
     """Select measured row concurrency, preserving serial writes on misses."""
@@ -53,10 +112,15 @@ def get_main_kv_dma_batch(pool: jax.Array, rows: jax.Array) -> int:
         jnp.dtype(pool.dtype),
         rows.shape[1:],
     )
-    if key not in MAIN_KV_DMA_BATCHES:
+    table = (
+        MAIN_KV_DMA_BATCHES_OPT
+        if envs.VLLM_TPU_QSA_DMA_BATCH_OPT
+        else MAIN_KV_DMA_BATCHES
+    )
+    if key not in table:
         logger.warning_once("QSA uses serial main KV DMA tiles for key: %s", key)
         return 1
-    return MAIN_KV_DMA_BATCHES[key] if rows.dtype == pool.dtype else 1
+    return table[key] if rows.dtype == pool.dtype else 1
 
 
 def get_ring_tag_dma_batch(
@@ -77,8 +141,14 @@ def get_ring_tag_dma_batch(
         while requests % batch:
             batch //= 2
         return batch
-    if key not in RING_TAG_DMA_BATCHES:
+    opt = bool(envs.VLLM_TPU_QSA_DMA_BATCH_OPT)
+    table = RING_TAG_DMA_BATCHES_OPT if opt else RING_TAG_DMA_BATCHES
+    if key not in table:
         logger.warning_once("QSA uses single-request state DMA tiles for key: %s", key)
         return 1
-    batch = RING_TAG_DMA_BATCHES[key]
+    batch = table[key]
+    if opt:
+        while requests % batch:
+            batch //= 2
+        return batch
     return batch if requests % batch == 0 else 1

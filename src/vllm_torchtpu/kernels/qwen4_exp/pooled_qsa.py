@@ -363,12 +363,19 @@ def write_main_cache(
     """
     if slot is not None:
         return _write_main_cache_paired(pool, rows, page, logical, valid, slot)
-    tile = 128
     batch = get_main_kv_dma_batch(pool, rows)
-    if batch == 1:
-        return _write_main_cache_universal(pool, rows, page, logical, valid)
-    if len(rows) % tile or pool.shape[1] % tile:
-        return _write_main_cache_universal(pool, rows, page, logical, valid)
+    if envs.VLLM_TPU_QSA_DMA_BATCH_OPT:
+        while batch > 1 and len(rows) % batch:
+            batch //= 2
+        if batch == 1 or pool.shape[1] % 128:
+            return _write_main_cache_universal(pool, rows, page, logical, valid)
+        tile = 128 if len(rows) >= 128 else len(rows)
+        if len(rows) % tile:
+            return _write_main_cache_universal(pool, rows, page, logical, valid)
+    else:
+        tile = 128
+        if batch == 1 or len(rows) % tile or pool.shape[1] % tile:
+            return _write_main_cache_universal(pool, rows, page, logical, valid)
     offsets = logical % pool.shape[1]
     pp, oo, vv = (
         page.reshape(-1, tile),
@@ -376,7 +383,8 @@ def write_main_cache(
         valid.reshape(-1, tile),
     )
     bulk = (
-        jnp.all(vv, axis=1)
+        (tile == 128)
+        & jnp.all(vv, axis=1)
         & jnp.all(pp == pp[:, :1], axis=1)
         & jnp.all(oo == oo[:, :1] + jnp.arange(tile, dtype=offsets.dtype), axis=1)
     )
