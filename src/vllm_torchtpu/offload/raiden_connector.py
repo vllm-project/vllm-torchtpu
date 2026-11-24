@@ -266,6 +266,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     _write_back: WriteBackPolicy | None = None
     _block_pool = None
     _contiguous_alloc_scan_factor = 3
+    # Block id -> its prefix-cache hash when its request finished; None until
+    # the first finish (see `_drop_reattached_blocks`).
+    _finished_block_hashes: dict[int, object] | None = None
 
     def __init__(
         self,
@@ -297,15 +300,66 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
     def request_finished(self, request: Request):
         result = super().request_finished(request)
-        self._touch_chain(request.request_id)
+        self._remember_block_hashes(request.request_id)
+        # A finishing request's chain is device-resident: in write-back mode its
+        # host copy matters only once the device evicts it, and the flush
+        # touches it then. Touching now would keep duplicates of live chains
+        # most recently used on the host, ahead of idle conversations' chains.
+        if self._write_back is None:
+            self._touch_chain(request.request_id)
         return result
+
+    def _remember_block_hashes(self, req_id: str) -> None:
+        """Record the hashes of a finished request's blocks, whose pending
+        stores `_drop_reattached_blocks` keeps alive across prefix hits."""
+        req_status = self._req_status.get(req_id)
+        if self._block_pool is None or req_status is None:
+            return
+        if self._finished_block_hashes is None:
+            self._finished_block_hashes = {}
+        blocks = self._block_pool.blocks
+        for group_state in req_status.group_states:
+            for bid in group_state.block_ids:
+                block_hash = blocks[bid].block_hash if bid else None
+                if block_hash is not None:
+                    self._finished_block_hashes[bid] = block_hash
+
+    def _drop_reattached_blocks(self, allocated: set[int]) -> None:
+        """Remove from this step's allocated blocks those a prefix hit
+        re-attached: their hash is the one their finished request left, so
+        their content is intact and a store reading them stays valid. vLLM
+        otherwise flushes such a store like a reuse: it cancels its queued
+        pieces (holes in the host chain) and drains its launched ones on the
+        scheduler thread."""
+        hashes = self._finished_block_hashes
+        if not hashes or self._block_pool is None:
+            return
+        blocks = self._block_pool.blocks
+        for bid in [bid for bid in allocated if bid in hashes]:
+            if blocks[bid].block_hash == hashes[bid]:
+                allocated.discard(bid)
+                self.wb_counters["reattached_blocks"] += 1
+            else:
+                del hashes[bid]  # reallocated: its content is gone
+        # Only blocks a store may still read need their hash.
+        live = len(self._block_id_to_pending_jobs) + len(self._wb_owners)
+        if len(hashes) > 2 * live + 65536:
+            self._finished_block_hashes = {
+                bid: h
+                for bid, h in hashes.items()
+                if bid in self._block_id_to_pending_jobs or bid in self._wb_owners
+            }
+
+    def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
+        super()._update_req_states(scheduler_output)
+        self._drop_reattached_blocks(self._current_batch_allocated_block_ids)
 
     def _touch_chain(self, req_id: str) -> None:
         """With ``VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH``, refresh the request's
         host-resident chain. The pool's LRU otherwise ages a chunk from its
         insert (only a load refreshes it), so a long conversation would lose
-        its head first. Write-back touches again at the flush, so the head is
-        not left older than the tail chunks that flush stores."""
+        its head first. Write-through touches at the finish, write-back at the
+        flush, so the head is not left older than the tail chunks it stores."""
         req_status = self._req_status.get(req_id)
         if tpu_envs.VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH and req_status is not None:
             for group_state in req_status.group_states:
@@ -411,13 +465,18 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             "KV write-back: %d steps, %.1f blocks allocated/step, %d requests "
             "stored, %d dropped (blocks reused before the flush), %d held "
             "(%d blocks; free and still cached: holding defers only the "
-            "connector's finish, never the blocks)",
+            "connector's finish, never the blocks); store jobs flushed by "
+            "block reuse: %d cancelled before launch, %d drained; %d "
+            "re-attached blocks did not flush their stores",
             c["steps"],
             c["allocated_blocks"] / max(c["steps"], 1),
             c["flushed_requests"],
             c["dropped_requests"],
             c["held_requests"],
             len(self._wb_owners),
+            c["flush_cancelled_jobs"],
+            c["flush_drained_jobs"],
+            c["reattached_blocks"],
         )
         held = c["held_requests"]
         c.clear()
@@ -511,6 +570,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             parked = self._fence_pending.pop(job_id, None)
             if parked is not None:
                 manager.on_store_job_cancelled(parked.keys)
+                if self._write_back is not None:
+                    self.wb_counters["flush_cancelled_jobs"] += 1
                 finished_store_ids.append(job_id)
                 # Avoid useless TPU sync if created and cancelled in the same step.
                 new_fence_ids.discard(job_id)
@@ -521,6 +582,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 )
             elif manager.is_job_launched(job_id):
                 launched_flush_ids.add(job_id)
+        if self._write_back is not None:
+            self.wb_counters["flush_drained_jobs"] += len(launched_flush_ids)
         drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
 
         # Collect completed/drained jobs for the worker echo channel.

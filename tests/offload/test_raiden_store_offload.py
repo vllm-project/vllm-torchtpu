@@ -1170,6 +1170,63 @@ class TestTouchAndMisc(unittest.TestCase):
             sched.request_finished(SimpleNamespace(request_id="untracked"))
         manager.touch_chain.assert_called_once_with(keys)
 
+    def test_write_back_finish_leaves_the_touch_to_the_flush(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+            OffloadingConnectorScheduler,
+        )
+
+        from vllm_torchtpu.offload.raiden_connector import (
+            TPURaidenOffloadingScheduler,
+            WriteBackPolicy,
+        )
+
+        manager = MagicMock()
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched._raiden_manager = manager
+        sched._write_back = WriteBackPolicy()
+        sched._req_status = {
+            "r1": SimpleNamespace(
+                group_states=[SimpleNamespace(offload_keys=[_key(0)])]
+            )
+        }
+        with (
+            patch.object(
+                OffloadingConnectorScheduler,
+                "request_finished",
+                return_value=(False, None),
+            ),
+            patch.dict(os.environ, {"VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH": "1"}),
+        ):
+            sched.request_finished(SimpleNamespace(request_id="r1"))
+        manager.touch_chain.assert_not_called()
+
+    def test_reattached_blocks_do_not_flush_pending_stores(self):
+        from collections import Counter
+
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        blocks = [SimpleNamespace(block_hash=None) for _ in range(10)]
+        for bid in (1, 2, 3):
+            blocks[bid].block_hash = b"h%d" % bid
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched._block_pool = SimpleNamespace(blocks=blocks)
+        sched.wb_counters = Counter()
+        sched._wb_owners = {}
+        sched._block_id_to_pending_jobs = {1: {5}, 2: {5}, 3: {5}}
+        sched._req_status = {
+            "r1": SimpleNamespace(
+                group_states=[SimpleNamespace(block_ids=[1, 2, 3, 4])]
+            )
+        }
+        sched._remember_block_hashes("r1")
+        # Block 3 was evicted and handed out again; 1 and 2 were prefix hits.
+        blocks[3].block_hash = None
+        allocated = {1, 2, 3, 9}
+        sched._drop_reattached_blocks(allocated)
+        self.assertEqual(allocated, {3, 9})
+        self.assertEqual(sched._finished_block_hashes, {1: b"h1", 2: b"h2"})
+        self.assertEqual(sched.wb_counters["reattached_blocks"], 2)
+
     def test_write_back_flush_touches_chain_again(self):
         from collections import Counter, OrderedDict
 
