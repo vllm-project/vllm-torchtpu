@@ -36,12 +36,13 @@ def _make_config(
 ):
     return SimpleNamespace(
         tpu_hash=tpu_hash,
+        compute_hash=lambda: f"{config_hash}-{tpu_hash}",
         model_config=SimpleNamespace(compute_hash=lambda: config_hash),
         parallel_config=SimpleNamespace(
             rank=rank,
             data_parallel_rank=dp_rank,
             data_parallel_index=dp_index,
-            compute_hash=lambda: f"p-dp{dp_index}",
+            compute_hash=lambda: "p1",
         ),
         compilation_config=SimpleNamespace(
             cache_dir=cache_dir,
@@ -175,7 +176,12 @@ def test_dense_dp_replicas_use_data_parallel_index(helpers):
     run(rank=0, dp_rank=0, dp_index=1)
 
     assert len(compiled) == 2
-    assert len(os.listdir(root)) == 2
+    hashes = os.listdir(root)
+    assert len(hashes) == 1
+    assert sorted(os.listdir(os.path.join(root, hashes[0]))) == [
+        "rank_0_0",
+        "rank_0_1",
+    ]
 
 
 def test_helpers_keep_separate_directories(helpers):
@@ -225,24 +231,34 @@ def test_helper_compile_decorator_replays_bound_method_across_starts(
     custom_cache = str(tmp_path / "custom_cache")
 
     class HelperModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bias = torch.nn.Parameter(torch.ones(4))
+
         @helper_cache.helper_compile("bound_add")
         def add_one(self, x: torch.Tensor) -> torch.Tensor:
-            return x + 1
+            return x + self.bias
 
-    mod = HelperModule()
     x = torch.zeros(2, 4)
 
     helper_cache.reset()
     helper_cache.configure(_make_config(cache_dir=custom_cache))
     torch._dynamo.reset()
-    mod.add_one(x)
+    HelperModule().add_one(x)
     assert len(fake.compiled) == 1
     assert len(fake.replayed) == 0
 
     helper_cache.reset()
     helper_cache.configure(_make_config(cache_dir=custom_cache))
     torch._dynamo.reset()
-    mod.add_one(x)
+    mod2 = HelperModule()
+    mod2.add_one(x)
+    assert len(fake.compiled) == 1
+    assert len(fake.replayed) == 1
+    # A grad-mode change (like logits sweep -> execute_model) re-traces in Dynamo
+    # but reuses the in-process runnable without calling _replay a second time.
+    with torch.no_grad():
+        mod2.add_one(x)
     assert len(fake.compiled) == 1
     assert len(fake.replayed) == 1
     assert (tmp_path / "custom_cache" / "tpu_helper_cache").exists()
@@ -252,11 +268,16 @@ def test_helper_compile_decorator_replays_bound_method_across_starts(
 def test_helper_compile_cache_switch_and_worker_gate(monkeypatch):
     """additional_config.helper_compile_cache defaults to False, rejects non-bools,
     and gates helper_cache.configure alongside VLLM_DISABLE_COMPILE_CACHE."""
+    import inspect
+
     import vllm.envs as vllm_envs
 
     from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
-    assert helper_cache.helper_compile_cache_enabled(SimpleNamespace()) is False
+    assert (
+        helper_cache.helper_compile_cache_enabled(SimpleNamespace(additional_config={}))
+        is False
+    )
     assert (
         helper_cache.helper_compile_cache_enabled(
             SimpleNamespace(additional_config={"helper_compile_cache": True})
@@ -271,18 +292,18 @@ def test_helper_compile_cache_switch_and_worker_gate(monkeypatch):
     configured = []
     monkeypatch.setattr(helper_cache, "configure", lambda cfg: configured.append(cfg))
 
-    def _run_gate(enabled: bool, disable_cache: bool) -> None:
+    for enabled, disable_cache, expected in (
+        (False, False, False),
+        (False, True, False),
+        (True, True, False),
+        (True, False, True),
+    ):
+        configured.clear()
         monkeypatch.setattr(vllm_envs, "VLLM_DISABLE_COMPILE_CACHE", disable_cache)
         cfg = SimpleNamespace(additional_config={"helper_compile_cache": enabled})
-        if (
-            helper_cache.helper_compile_cache_enabled(cfg)
-            and not vllm_envs.VLLM_DISABLE_COMPILE_CACHE
-        ):
-            helper_cache.configure(cfg)
+        assert helper_cache.configure_if_enabled(cfg) is expected
+        assert len(configured) == (1 if expected else 0)
 
-    _run_gate(False, False)
-    _run_gate(True, True)
-    assert configured == []
-    _run_gate(True, False)
-    assert len(configured) == 1
-    assert hasattr(TPUWorker, "__init__")
+    assert "configure_if_enabled" in inspect.getsource(
+        TPUWorker.compile_or_warm_up_model
+    )

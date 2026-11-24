@@ -293,12 +293,22 @@ python3 examples/offline_inference.py --model "${MODEL}" \
   --additional-config '{"helper_compile_cache": true}' \
   --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/helper_warm.log"
 
-if grep -q "tpu_helper_cache" "${CACHE_DIR}/helper_warm.log"; then
-  echo "✅ [Test 6 PASSED] Warm helper run replayed artifacts from tpu_helper_cache!"
-else
+if ! grep -qE "Loading compiled artifact from .*tpu_helper_cache" "${CACHE_DIR}/helper_warm.log"; then
   echo "❌ [Test 6 FAILED] Warm helper run did not load from tpu_helper_cache!"
   exit 1
 fi
+if grep -qE "Saved compiled artifact to .*tpu_helper_cache" "${CACHE_DIR}/helper_warm.log"; then
+  echo "❌ [Test 6 FAILED] Warm helper run recompiled and saved to tpu_helper_cache!"
+  exit 1
+fi
+
+grep -E "^(Prompt:|Generated text:)" "${CACHE_DIR}/helper_cold.log" > "${CACHE_DIR}/helper_cold_output.txt" || true
+grep -E "^(Prompt:|Generated text:)" "${CACHE_DIR}/helper_warm.log" > "${CACHE_DIR}/helper_warm_output.txt" || true
+if [ ! -s "${CACHE_DIR}/helper_cold_output.txt" ] || ! diff -u "${CACHE_DIR}/helper_cold_output.txt" "${CACHE_DIR}/helper_warm_output.txt"; then
+  echo "❌ [Test 6 FAILED] Warm helper output differed from cold helper output!"
+  exit 1
+fi
+echo "✅ [Test 6 PASSED] Warm helper run replayed artifacts from tpu_helper_cache with matching output!"
 
 echo "================================================================="
 echo "🎉 Compilation Cache E2E Test Suite Completed!"

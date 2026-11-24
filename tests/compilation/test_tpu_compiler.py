@@ -128,9 +128,14 @@ class TestTpuCompilerCache:
             different_kv = compute_tpu_compilation_hash(
                 self._config(num_gpu_blocks=2048)
             )
+            no_kv_base = compute_tpu_compilation_hash(self._config(), include_kv=False)
+            no_kv_diff = compute_tpu_compilation_hash(
+                self._config(num_gpu_blocks=2048), include_kv=False
+            )
 
         assert base != different_batch
         assert base != different_kv
+        assert no_kv_base == no_kv_diff
 
     def test_tpu_hash_covers_gdn_prefill_checkpoint_gate_only(self):
         """The hash follows prefill_checkpoint_enabled, not its raw inputs."""

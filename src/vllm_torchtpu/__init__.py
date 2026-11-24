@@ -197,6 +197,7 @@ def _patch_vllm_aot_compile_cache_key() -> None:
         ]
 
     tpu_aot_compile_hash_factors._tpu_compiler_hash_patch = True
+    caching._tpu_upstream_aot_compile_hash_factors = original
     caching.aot_compile_hash_factors = tpu_aot_compile_hash_factors
     logger.info("Applied TPU patch: include compiler hash in AOT cache key.")
 

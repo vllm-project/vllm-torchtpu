@@ -103,6 +103,7 @@ _FAILED_SUFFIX = ".failed"
 _PROCESS_START = time.time()
 
 _peer_wait = threading.local()
+_KEYED_RUNNABLES: dict[tuple[str | None, str], Callable[..., Any]] = {}
 
 
 @contextlib.contextmanager
@@ -880,13 +881,6 @@ class TpuCompilerAdaptor(CompilerInterface):
             compile_range,
         )
 
-        # aot_autograd (inside TpuBackend) requires tuple outputs. Deep-copied
-        # first because _ensure_tuple_output rewrites the output node in place
-        # and vLLM keeps its own reference to `graph`. Only the output node
-        # moves, so the placeholder signature is unaffected.
-        graph = copy.deepcopy(graph)
-        graph, was_wrapped = _ensure_tuple_output(graph)
-
         save_path = (
             os.path.join(self.cache_dir, key)
             if key is not None
@@ -895,6 +889,49 @@ class TpuCompilerAdaptor(CompilerInterface):
             else None
         )
 
+        compiled_fn, handle = self._compile_or_replay(
+            graph,
+            example_inputs,
+            save_path,
+            key,
+            label=f"range {compile_range}",
+        )
+
+        # Offer this bucket to later traces of the same model, so a graph that
+        # refuses it reuses this runnable instead of building a second
+        # executable for it (see shape_variants.BucketExecutables).
+        if key is not None and size is not None:
+            shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
+        return compiled_fn, handle
+
+    def _compile_or_replay(
+        self,
+        graph: fx.GraphModule,
+        example_inputs: list[Any],
+        save_path: str | None,
+        key: str | None,
+        *,
+        label: str,
+        try_local: bool = False,
+    ) -> tuple[Callable[..., Any], tuple[str, str, bool] | None]:
+        """Compile `graph` or replay a local/peer artifact when `save_path` is set."""
+        # aot_autograd (inside TpuBackend) requires tuple outputs. Deep-copied
+        # first because _ensure_tuple_output rewrites the output node in place
+        # and vLLM keeps its own reference to `graph`. Only the output node
+        # moves, so the placeholder signature is unaffected.
+        graph = copy.deepcopy(graph)
+        graph, was_wrapped = _ensure_tuple_output(graph)
+
+        compiled_fn: Callable[..., Any] | None = None
+        handle: tuple[str, str, bool] | None = None
+        if try_local and save_path is not None and os.path.exists(save_path):
+            logger.info(
+                "[TpuCompilerAdaptor] Loading compiled artifact from %s", save_path
+            )
+            compiled_fn = self._replay(save_path, graph, was_wrapped)
+            if compiled_fn is not None and key is not None:
+                handle = (key, save_path, was_wrapped)
+
         # Another rank of this host compiled, or is compiling, this bucket:
         # replay its artifact instead of tracing, lowering and compiling it
         # again. The artifact is the one vLLM's compile cache already holds for
@@ -902,75 +939,50 @@ class TpuCompilerAdaptor(CompilerInterface):
         # With peer replay off, nothing replays another rank's artifact, so
         # none records a fingerprint either: `load` replays a rank's own
         # artifact without one, and a peer with replay on refuses it.
-        peer = None
         fingerprint = (
             _graph_fingerprint(graph)
-            if save_path is not None and envs.TPU_PRECOMPILE_PEER_REPLAY
+            if compiled_fn is None
+            and save_path is not None
+            and envs.TPU_PRECOMPILE_PEER_REPLAY
             else None
         )
-        if fingerprint is not None:
-            assert key is not None
-            peer = self._replay_from_peer(key, graph, was_wrapped, fingerprint)
-        if peer is not None:
+        if compiled_fn is None and fingerprint is not None:
             assert key is not None and save_path is not None
-            compiled_fn, peer_path = peer
-            logger.info(
-                "[TpuCompilerAdaptor] Replayed range %s from %s",
-                compile_range,
-                peer_path,
-            )
-            handle = (
-                (key, save_path, was_wrapped)
-                if self._link_artifact(peer_path, save_path)
-                else None
-            )
-            if was_wrapped:
-                compiled_fn = self._unwrap_compiled_fn(compiled_fn)
-            if size is not None:
-                shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
-            return compiled_fn, handle
+            peer = self._replay_from_peer(key, graph, was_wrapped, fingerprint)
+            if peer is not None:
+                compiled_fn, peer_path = peer
+                logger.info(
+                    "[TpuCompilerAdaptor] Replayed %s from %s",
+                    label,
+                    peer_path,
+                )
+                handle = (
+                    (key, save_path, was_wrapped)
+                    if self._link_artifact(peer_path, save_path)
+                    else None
+                )
 
-        compiled_fn, entry = self._run_backend(graph, example_inputs)
+        if compiled_fn is None:
+            compiled_fn, entry = self._run_backend(graph, example_inputs)
+            if save_path is not None:
+                assert key is not None
+                if self._save_handle(
+                    key, save_path, entry, graph, was_wrapped, fingerprint
+                ):
+                    handle = (key, save_path, was_wrapped)
+            # Under peer replay, other ranks of the host may be waiting for this
+            # artifact: say so when it will not come, so they compile it now.
+            if fingerprint is not None:
+                assert key is not None
+                if handle is None:
+                    self._mark_failed(key, fingerprint)
+                else:
+                    self._clear_failed(key)
 
         if was_wrapped:
             # Undo _ensure_tuple_output on the result side, so callers see the
             # single tensor the original graph returned.
             compiled_fn = self._unwrap_compiled_fn(compiled_fn)
-
-        # Persist torch's bundled AOTAutograd entry -- the aot_autograd wrapper
-        # metadata and the compiled executable as one object. It has to be one
-        # object: `load` cannot rebuild a wrapper from a fresh trace and pair
-        # it with a separately-fetched executable, because nothing at that
-        # point can check the two describe the same program, and a mismatch is
-        # only observable once the program runs -- as e0102
-        # RuntimeProgramInputMismatch if the padded input buffers differ in
-        # size, and as a silently wrong result if they happen not to.
-        #
-        # When the Tier-3 C++ persistent cache is active torch_tpu also keeps
-        # the PJRT binary itself (torch_tpu_tier3/*.bin); that covers the
-        # recompile path in `load`, not this one.
-        handle = None
-        if save_path is not None:
-            assert key is not None
-            if self._save_handle(
-                key, save_path, entry, graph, was_wrapped, fingerprint
-            ):
-                handle = (key, save_path, was_wrapped)
-
-        # Under peer replay, other ranks of the host may be waiting for this
-        # artifact: say so when it will not come, so they compile it now.
-        if fingerprint is not None:
-            assert key is not None
-            if handle is None:
-                self._mark_failed(key, fingerprint)
-            else:
-                self._clear_failed(key)
-
-        # Offer this bucket to later traces of the same model, so a graph that
-        # refuses it reuses this runnable instead of building a second
-        # executable for it (see shape_variants.BucketExecutables).
-        if key is not None and size is not None:
-            shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
         return compiled_fn, handle
 
     def load(
@@ -1040,41 +1052,25 @@ class TpuCompilerAdaptor(CompilerInterface):
         key: str,
     ) -> Callable[..., Any]:
         """Compile or replay a graph keyed by `key` (without shape_variants)."""
-        graph = copy.deepcopy(graph)
-        graph, was_wrapped = _ensure_tuple_output(graph)
-        path = (
+        cache_key = (self.cache_dir, key)
+        cached = _KEYED_RUNNABLES.get(cache_key)
+        if cached is not None:
+            return cached
+
+        save_path = (
             os.path.join(self.cache_dir, key)
             if self.cache_dir is not None and not self._disable_cache
             else None
         )
-
-        compiled_fn: Callable[..., Any] | None = None
-        if path is not None and os.path.exists(path):
-            logger.info("[TpuCompilerAdaptor] Loading compiled artifact from %s", path)
-            compiled_fn = self._replay(path, graph, was_wrapped)
-
-        fingerprint = (
-            _graph_fingerprint(graph)
-            if compiled_fn is None
-            and path is not None
-            and envs.TPU_PRECOMPILE_PEER_REPLAY
-            else None
+        compiled_fn, _ = self._compile_or_replay(
+            graph,
+            example_inputs,
+            save_path,
+            key,
+            label=key,
+            try_local=True,
         )
-        if compiled_fn is None and fingerprint is not None:
-            assert path is not None
-            peer = self._replay_from_peer(key, graph, was_wrapped, fingerprint)
-            if peer is not None:
-                compiled_fn, peer_path = peer
-                logger.info("[TpuCompilerAdaptor] Replayed %s from %s", key, peer_path)
-                self._link_artifact(peer_path, path)
-
-        if compiled_fn is None:
-            compiled_fn, entry = self._run_backend(graph, example_inputs)
-            if path is not None:
-                self._save_handle(key, path, entry, graph, was_wrapped, fingerprint)
-
-        if was_wrapped:
-            compiled_fn = self._unwrap_compiled_fn(compiled_fn)
+        _KEYED_RUNNABLES[cache_key] = compiled_fn
         return compiled_fn
 
 
@@ -1082,29 +1078,20 @@ def tpu_compilation_cache_subdir(
     vllm_config: VllmConfig,
     kind: str,
     *,
-    base_cache_dir: str | None = None,
     include_kv: bool = True,
 ) -> str:
     """Return `<base>/<kind>/<10-char digest>` for profile or helper cache."""
     import vllm.envs as vllm_envs
-    from vllm.compilation.caching import aot_compile_hash_factors
+    from vllm.compilation import caching
 
-    base_dir = (
-        base_cache_dir
-        if base_cache_dir is not None
-        else (vllm_config.compilation_config.cache_dir or vllm_envs.VLLM_CACHE_ROOT)
+    base_dir = vllm_config.compilation_config.cache_dir or vllm_envs.VLLM_CACHE_ROOT
+    upstream_factors = (
+        getattr(caching, "_tpu_upstream_aot_compile_hash_factors", None)
+        or caching.aot_compile_hash_factors
     )
-    if include_kv:
-        factors: list[Any] = [
-            *aot_compile_hash_factors(vllm_config),
-            compute_tpu_compilation_hash(vllm_config, include_kv=True),
-        ]
-    else:
-        factors = [
-            vllm_config.model_config.compute_hash(),
-            vllm_config.parallel_config.compute_hash(),
-            vllm_config.compilation_config.compute_hash(),
-            compute_tpu_compilation_hash(vllm_config, include_kv=False),
-        ]
+    factors: list[Any] = [
+        *upstream_factors(vllm_config),
+        compute_tpu_compilation_hash(vllm_config, include_kv=include_kv),
+    ]
     digest = hashlib.sha256(str(factors).encode()).hexdigest()[:10]
     return os.path.join(base_dir, kind, digest)

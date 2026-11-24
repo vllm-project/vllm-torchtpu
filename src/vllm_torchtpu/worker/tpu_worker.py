@@ -25,7 +25,6 @@ from urllib.parse import urlparse
 import torch
 import torch.profiler
 import torch_tpu  # noqa: F401
-import vllm.envs as vllm_envs
 from torch.compiler._cache import CacheArtifactManager
 from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -494,13 +493,6 @@ class TPUWorker(WorkerBase):
             profiler_rank=self.profile_rank,
             profiler_world_size=self.profile_world_size,
         )
-        # Persist the runner's helper graphs with the compile cache (see
-        # compilation/helper_cache.py).
-        if (
-            helper_cache.helper_compile_cache_enabled(self.vllm_config)
-            and not vllm_envs.VLLM_DISABLE_COMPILE_CACHE
-        ):
-            helper_cache.configure(self.vllm_config)
         logger.info(
             "Init worker | "
             "rank=%s | "
@@ -852,6 +844,7 @@ class TPUWorker(WorkerBase):
         _release_free_host_heap()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        helper_cache.configure_if_enabled(self.vllm_config)
         start = time.perf_counter()
         if getattr(self, "speculative_config", None) is not None:
             # Record the warm-up traces under the serving thread count. Other

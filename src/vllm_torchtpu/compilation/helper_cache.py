@@ -44,8 +44,10 @@ from typing import Any
 
 import torch
 import torch.fx as fx
+import vllm.envs as vllm_envs
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.utils import HELPER_COMPILE_CACHE_KEY
 
 logger = init_logger(__name__)
 
@@ -54,11 +56,13 @@ _cache_root: str | None = None
 
 def helper_compile_cache_enabled(vllm_config: Any) -> bool:
     """Return whether `additional_config.helper_compile_cache` is enabled."""
-    extra = getattr(vllm_config, "additional_config", None)
-    if isinstance(extra, dict) and "helper_compile_cache" in extra:
-        enabled = extra["helper_compile_cache"]
+    extra = vllm_config.additional_config
+    if isinstance(extra, dict) and HELPER_COMPILE_CACHE_KEY in extra:
+        enabled = extra[HELPER_COMPILE_CACHE_KEY]
         if not isinstance(enabled, bool):
-            raise ValueError("additional_config.helper_compile_cache must be a bool")
+            raise ValueError(
+                f"additional_config.{HELPER_COMPILE_CACHE_KEY} must be a bool"
+            )
         return enabled
     return False
 
@@ -66,9 +70,10 @@ def helper_compile_cache_enabled(vllm_config: Any) -> bool:
 def configure(vllm_config: Any) -> None:
     """Enable the helper cache for this process and fix its root directory now.
 
-    Computing the root at `TPUWorker.__init__` time reads
-    `compilation_config.cache_dir` before backbone compilation mutates it and
-    avoids any dependence on later `num_gpu_blocks` initialization.
+    Called from `TPUWorker.compile_or_warm_up_model` after
+    `update_block_size_for_backend` has finalized `mamba_block_size` and after
+    `profile_run` (which stays on the plain backend), before `capture_model`
+    mutates `compilation_config.cache_dir`.
     """
     global _cache_root
     from vllm_torchtpu.compilation.tpu_compiler import tpu_compilation_cache_subdir
@@ -80,10 +85,24 @@ def configure(vllm_config: Any) -> None:
     _cache_root = os.path.join(subdir, f"rank_{pc.rank}_{pc.data_parallel_index}")
 
 
+def configure_if_enabled(vllm_config: Any) -> bool:
+    """Configure the helper cache when enabled and compile caching is on."""
+    enabled = (
+        helper_compile_cache_enabled(vllm_config)
+        and not vllm_envs.VLLM_DISABLE_COMPILE_CACHE
+    )
+    if enabled:
+        configure(vllm_config)
+    return enabled
+
+
 def reset() -> None:
-    """Disable the cache (tests)."""
+    """Disable the cache and drop in-process runnables (tests)."""
     global _cache_root
+    from vllm_torchtpu.compilation.tpu_compiler import _KEYED_RUNNABLES
+
     _cache_root = None
+    _KEYED_RUNNABLES.clear()
 
 
 def _input_meta(value: Any) -> Any:
