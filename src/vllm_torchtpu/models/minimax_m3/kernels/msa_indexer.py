@@ -358,6 +358,13 @@ class PrefillOpt(NamedTuple):
     causal: bool = False
     # Pages per dot (0: `_v3_chunk`'s default).
     chunk: int = 0
+    # One body per count of scored chunks, not per power of two (a group's
+    # last chunks past its live pages are not scored).
+    every_count: bool = False
+    # Query rows per large tile (0: DEFAULT_LARGE_BLOCK_Q). Each page's keys
+    # are unpacked and scaled once per tile, so taller tiles do that work for
+    # more rows; the scores are the same bits (one dot per score either way).
+    block_q: int = 0
 
 
 _PREFILL_OPT_LOGGED = False
@@ -376,6 +383,10 @@ def prefill_opt() -> PrefillOpt:
             opt = opt._replace(causal=True)
         elif item.startswith("chunk") and item[5:] in ("8", "16", "32", "64"):
             opt = opt._replace(chunk=int(item[5:]))
+        elif item == "counts":
+            opt = opt._replace(every_count=True)
+        elif item.startswith("bq") and item[2:] in ("256", "512", "1024", "2048"):
+            opt = opt._replace(block_q=int(item[2:]))
         else:
             raise ValueError(
                 f"TPU_MINIMAX_M3_INDEXER_PREFILL_OPT: unknown item {item!r} in {spec!r}"
@@ -384,10 +395,12 @@ def prefill_opt() -> PrefillOpt:
         _PREFILL_OPT_LOGGED = True
         logger.info(
             "TPU_MINIMAX_M3_INDEXER_PREFILL_OPT=%s on: MSA indexer prefill tiles "
-            "run causal=%s chunk=%d.",
+            "run causal=%s chunk=%d counts=%s block_q=%d.",
             spec,
             opt.causal,
             opt.chunk,
+            opt.every_count,
+            opt.block_q,
         )
     return opt
 
@@ -1040,6 +1053,7 @@ def _class_scores(
     fp8_q=False,
     tile_lens_fn=None,
     max_chunk=0,
+    every_count=False,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token (`ClassScores`); `token_major` (kernel v3) returns
@@ -1222,7 +1236,7 @@ def _class_scores(
                 noclamp=dopt.noclamp,
                 full_bodies=dopt.full,
                 tail=dopt.tail,
-                every_count=dopt.every_count,
+                every_count=dopt.every_count or every_count,
                 token_scores=dopt.token_scores,
                 defer=dopt.defer,
                 per_tile=pages_per_seq if tile_lens_fn is not None else 0,
@@ -1301,6 +1315,8 @@ def _large_opts(large_kernel: str, tile_lens_fn) -> dict:
         out["tile_lens_fn"] = tile_lens_fn
     if opt.chunk:
         out["max_chunk"] = opt.chunk
+    if opt.every_count:
+        out["every_count"] = True
     return out
 
 
