@@ -3490,6 +3490,11 @@ class TPURaidenConnectorWorker:
             page_tokens=page_tokens,
             hash_indexer=not _use_per_layer_pool_tags() or _raiden_glm_dcp_identity(),
             indexer_seq_along_lane=indexer_seq_along_lane,
+            # A row-span transfer (pipeline producer -> DCP destination, per-layer
+            # tags without identity) moves whole rows between pages of different
+            # lengths: the producer pages the whole context, a DCP rank 1/DCP.
+            row_geometry_only=_use_per_layer_pool_tags()
+            and not _raiden_glm_dcp_identity(),
         )
 
     def _measure_stage3_layout(self, manifest: Any) -> tuple[str, dict[str, Any], int]:

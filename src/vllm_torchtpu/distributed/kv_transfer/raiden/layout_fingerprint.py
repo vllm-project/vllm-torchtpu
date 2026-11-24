@@ -271,8 +271,14 @@ def measured_glm_layout_fingerprint(
     package_version: Callable[[str], str] | None = None,
     hash_indexer: bool = True,
     indexer_seq_along_lane: bool = False,
+    row_geometry_only: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Fingerprint of the admitted GLM cache layout, compared across peers.
+
+    ``row_geometry_only`` hashes each class's row format (bytes and tokens
+    per row, tiles, order) instead of its page: a row-span transfer (a
+    pipeline producer to a DCP destination) moves whole rows between pages of
+    different lengths, so only the rows must agree.
 
     Hash per-page geometry only: both peers must agree on it, but they size
     their pools independently.
@@ -290,9 +296,12 @@ def measured_glm_layout_fingerprint(
         manifest,
         page_tokens=page_tokens,
         layout_getter=layout_getter,
-        include_page_shape=True,
+        include_page_shape=not row_geometry_only,
         seq_along_lane_tag=TAG_DSA_IDX if indexer_seq_along_lane else None,
     )
+    if row_geometry_only:
+        for tag, measured in layouts.items():
+            measured["tokens_per_row"] = _tokens_per_row(manifest, tag, page_tokens)
     if not hash_indexer:
         layouts.pop(TAG_DSA_IDX, None)
     version = package_version or importlib.metadata.version
@@ -300,10 +309,26 @@ def measured_glm_layout_fingerprint(
         "schema": GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
         "libtpu": version("libtpu"),
-        "page_tokens": int(page_tokens),
+        "page_tokens": 0 if row_geometry_only else int(page_tokens),
         "layouts": layouts,
     }
     return canonical_layout_fingerprint(payload), payload
+
+
+def _tokens_per_row(manifest: PoolManifest, tag: str, page_tokens: int) -> int:
+    """Tokens in one row of a GLM class's page, read as the page check reads it."""
+    for pool in manifest.pools:
+        if class_tag(pool.tag) != tag:
+            continue
+        tensor = manifest.storages[pool.storage_index]
+        shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
+        rows = shape[1]
+        if tag == TAG_MLA_NOPE:
+            return 1
+        if len(shape) == 3:
+            return page_tokens // rows if rows else 0
+        return shape[2]
+    raise RuntimeError(f"no admitted pool of class {tag}")
 
 
 def measured_dsv4_layout_fingerprint(
