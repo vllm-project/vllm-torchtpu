@@ -162,6 +162,32 @@ def wrap_weight_loaders(layer: Any) -> None:
         param.weight_loader = loader
 
 
+def align_global_scales(layer: Any) -> None:
+    """From process_weights_after_loading, BEFORE the EP scales are fused: the
+    raw slices hold the checkpoint's per-tensor scales, while a model's quant
+    method may have transformed its own copies (MiniMax M3's compressed-tensors
+    checkpoint stores reciprocals and inverts them first). Compare against this
+    rank's native experts and apply the same transform."""
+    st = getattr(layer, "_tpd", None)
+    if st is None or _dummy_weights():
+        return
+    ep, rank, E = st["ep"], st["rank"], st["E"]
+    native = E // ep
+    for name in ("w13_weight_scale_2", "w2_weight_scale_2"):
+        raw = st["raw"].get(name)
+        if raw is None:
+            continue
+        mine = getattr(layer, name).data[:native].to(torch.float32).reshape(native, -1)
+        ref = raw[rank * native:(rank + 1) * native].to(mine.device).reshape(native, -1)
+        if torch.allclose(mine, ref, rtol=1e-5, atol=0):
+            continue
+        if torch.allclose(mine * ref, torch.ones_like(mine), rtol=1e-5, atol=0):
+            st["raw"][name] = torch.reciprocal(raw)
+            logger.info_once("[moe-tp-dense] per-tensor scales inverted like the layer's (%s)", name)
+            continue
+        raise RuntimeError(f"[moe-tp-dense] {name}: captured scales match neither the layer's nor their reciprocal")
+
+
 def _dummy_weights() -> bool:
     from vllm_torchtpu.layers.adapter import moe_redundant
 
@@ -257,7 +283,7 @@ def active(layer: Any) -> bool:
 # --------------------------------------------------------------------------- traced
 
 
-def tp_dense_routed(x, topk_weights, topk_ids, w, s, *, fs):
+def tp_dense_routed(x, topk_weights, topk_ids, w, s, *, fs, act="silu"):
     """Routed experts of one rank's TP slice for all T tokens (jax). x [T, H];
     topk_* [T, k] with LOGICAL ids; w, s the packed per-expert records
     (moe_tp_dense_fp4.pack). Returns this rank's partial [T, H]."""
@@ -276,7 +302,7 @@ def tp_dense_routed(x, topk_weights, topk_ids, w, s, *, fs):
     gw = jnp.pad(gw, ((0, mp - t), (0, 0))).T  # [E, Mp]
     gw = jnp.broadcast_to(gw[:, :, None], (e, mp, 128))
     xp = jnp.pad(x, ((0, mp - t), (0, 0)))
-    out = tp_dense_moe_packed(xp, gw, w, s, hit, nhit, fs=fs)
+    out = tp_dense_moe_packed(xp, gw, w, s, hit, nhit, fs=fs, act=act)
     return out[:t]
 
 
@@ -289,9 +315,9 @@ def _op_body(hidden_states: jax.Array, w1: jax.Array, w2: jax.Array, w1_scale: j
         resolve_onehot_permute_threshold,
     )
 
-    if 0 < hidden_states.shape[0] <= MAX_TOKENS and activation == "silu":
-        logger.info_once("[moe-tp-dense] TP-dense fp4 decode MoE selected (T<=%d)", MAX_TOKENS)
-        return tp_dense_routed(hidden_states, topk_weights, logical_ids, tw, ts, fs=fs)
+    if 0 < hidden_states.shape[0] <= MAX_TOKENS and activation in ("silu", "swigluoai"):
+        logger.info_once("[moe-tp-dense] TP-dense fp4 decode MoE selected (T<=%d, %s)", MAX_TOKENS, activation)
+        return tp_dense_routed(hidden_states, topk_weights, logical_ids, tw, ts, fs=fs, act=activation)
     return fused_moe_func(
         hidden_states, w1, w2, w1_scale, w2_scale, None, None, topk_weights, topk_ids,
         experts_start, topk=topk, activation=activation, use_ep=True,

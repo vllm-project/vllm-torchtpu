@@ -408,6 +408,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
         activation_str = self._set_tpu_activation(layer)
 
+        moe_tp_dense.align_global_scales(layer)
         # --- fuse E4M3 block scale * FP32 per-tensor global -> FP32 block scale.
         # w13: global is [E, 2] (separate w1/w3 per-tensor scales); apply to the
         # gate (first half) and up (second half) output rows respectively.

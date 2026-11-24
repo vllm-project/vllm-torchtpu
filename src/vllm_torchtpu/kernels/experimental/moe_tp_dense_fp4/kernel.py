@@ -29,8 +29,18 @@ from jax.experimental.pallas import tpu as pltpu
 QB = 128
 
 
+def _act(g, fs, act):
+    gate, up = g[:, :fs], g[:, fs:]
+    if act == "swigluoai":
+        # SwiGLU-OAI as kernels/megablox/gmm_v2.swigluoai (alpha 1.702, limit 7).
+        gate = jnp.minimum(gate, 7.0)
+        up = jnp.clip(up, -7.0, 7.0)
+        return (up + 1.0) * (gate * jax.nn.sigmoid(1.702 * gate))
+    return jax.nn.silu(gate) * up
+
+
 def _kernel(hit_ref, nhit_ref, x_ref, gw_hbm, w1_hbm, s1_hbm, w2_hbm, s2_hbm, out_ref,
-            w1v, s1v, w2v, s2v, gwv, acc, sem, *, slots, fs):
+            w1v, s1v, w2v, s2v, gwv, acc, sem, *, slots, fs, act):
     k = x_ref.shape[1]
     n = w2_hbm.shape[2]
     nh = nhit_ref[0]
@@ -68,7 +78,7 @@ def _kernel(hit_ref, nhit_ref, x_ref, gw_hbm, w1_hbm, s1_hbm, w2_hbm, s2_hbm, ou
             blk = jnp.matmul(x[:, kb * QB:(kb + 1) * QB], w1[kb * QB:(kb + 1) * QB, :].astype(jnp.float8_e4m3fn),
                              preferred_element_type=jnp.float32)
             g = g + blk * s1[kb:kb + 1, :]
-        h = jax.nn.silu(g[:, :fs]) * g[:, fs:]
+        h = _act(g, fs, act)
         h = (h * gwv[slot][:, 0:1]).astype(x.dtype)
         w2 = w2v.at[slot]
         s2 = s2v.at[slot]
@@ -82,7 +92,7 @@ def _kernel(hit_ref, nhit_ref, x_ref, gw_hbm, w1_hbm, s1_hbm, w2_hbm, s2_hbm, ou
     out_ref[...] = acc[...].astype(out_ref.dtype)
 
 
-def tp_dense_moe(x, gw, w1, s1, w2, s2, hit, nhit, *, slots=3, interpret=False):
+def tp_dense_moe(x, gw, w1, s1, w2, s2, hit, nhit, *, slots=3, act="silu", interpret=False):
     """x [Mp,K] bf16; gw [E,Mp,128] f32 (lane-replicated); w1 [E,K,2Fs] fp4; s1 [E,K/128,2Fs] f32;
     w2 [E,Fs,N] fp4; s2 [E,Fs/128,N] f32; hit int32[E] (first nhit valid); nhit int32[1]."""
     mp, k = x.shape
@@ -91,7 +101,7 @@ def tp_dense_moe(x, gw, w1, s1, w2, s2, hit, nhit, *, slots=3, interpret=False):
     n = w2.shape[2]
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     vm = pl.BlockSpec(memory_space=pltpu.VMEM)
-    kern = functools.partial(_kernel, slots=slots, fs=fs)
+    kern = functools.partial(_kernel, slots=slots, fs=fs, act=act)
     extra = {"interpret": pltpu.InterpretParams()} if interpret else {}
     return pl.pallas_call(
         kern, **extra,
@@ -130,7 +140,7 @@ def pack(w1, s1, w2, s2):
 
 
 def _kernel_packed(hit_ref, nhit_ref, x_ref, gw_hbm, w_hbm, s_hbm, out_ref, wv, sv, gwv, acc, sem,
-            *, slots, fs, k, nch, compute):
+            *, slots, fs, k, nch, compute, act):
     f2 = 2 * fs
     nh = nhit_ref[0]
     acc[...] = jnp.zeros_like(acc)
@@ -167,7 +177,7 @@ def _kernel_packed(hit_ref, nhit_ref, x_ref, gw_hbm, w_hbm, s_hbm, out_ref, wv, 
             blk = jnp.matmul(x[:, kb * QB:(kb + 1) * QB], w[kb * QB:(kb + 1) * QB, :].astype(jnp.float8_e4m3fn),
                              preferred_element_type=jnp.float32)
             g = g + blk * s[kb:kb + 1, :]
-        h = jax.nn.silu(g[:, :fs]) * g[:, fs:]
+        h = _act(g, fs, act)
         h = (h * gwv[slot][:, 0:1]).astype(x.dtype)
         nkb = fs // QB
         for j in range(nch):
@@ -185,14 +195,14 @@ def _kernel_packed(hit_ref, nhit_ref, x_ref, gw_hbm, w_hbm, s_hbm, out_ref, wv, 
     out_ref[...] = acc[...].astype(out_ref.dtype)
 
 
-def tp_dense_moe_packed(x, gw, W, S, hit, nhit, *, fs, slots=3, compute=True, interpret=False):
+def tp_dense_moe_packed(x, gw, W, S, hit, nhit, *, fs, slots=3, compute=True, act="silu", interpret=False):
     mp, k = x.shape
     e, rows, f2 = W.shape
     nch = (rows - k) // fs
     n = nch * f2
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     vm = pl.BlockSpec(memory_space=pltpu.VMEM)
-    kern = functools.partial(_kernel_packed, slots=slots, fs=fs, k=k, nch=nch, compute=compute)
+    kern = functools.partial(_kernel_packed, slots=slots, fs=fs, k=k, nch=nch, compute=compute, act=act)
     extra = {"interpret": pltpu.InterpretParams()} if interpret else {}
     return pl.pallas_call(
         kern, **extra,
@@ -213,7 +223,7 @@ def tp_dense_moe_packed(x, gw, W, S, hit, nhit, *, fs, slots=3, compute=True, in
     )(hit, nhit, x, gw, W, S)
 
 
-def reference(x, gw, w1, s1, w2, s2, hit, nhit):
+def reference(x, gw, w1, s1, w2, s2, hit, nhit, act="silu"):
     fs = w1.shape[2] // 2
     out = jnp.zeros((x.shape[0], w2.shape[2]), jnp.float32)
     for t in range(int(nhit[0])):
@@ -221,6 +231,6 @@ def reference(x, gw, w1, s1, w2, s2, hit, nhit):
         w1d = (w1[e].astype(jnp.float32).reshape(-1, QB, 2 * fs) * s1[e][:, None, :]).reshape(-1, 2 * fs)
         w2d = (w2[e].astype(jnp.float32).reshape(-1, QB, w2.shape[2]) * s2[e][:, None, :]).reshape(fs, -1)
         g = x.astype(jnp.float32) @ w1d
-        h = (jax.nn.silu(g[:, :fs]) * g[:, fs:]) * gw[e][:, 0:1]
+        h = _act(g, fs, act) * gw[e][:, 0:1]
         out = out + h.astype(jnp.bfloat16).astype(jnp.float32) @ w2d
     return out
