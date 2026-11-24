@@ -172,47 +172,6 @@ def _select_recurrent_state(
     return selected
 
 
-def load_and_select_recurrent_head(
-    recurrent_in_slot_ref: jax.Ref,
-    carry_recurrent_scratch_ref: jax.Ref | None,
-    s: int,
-    v: int,
-    has_initial_state: jax.Array,
-    is_first_tile: jax.Array | None,
-    cfg: config.GDNConfig,
-) -> jax.Array:
-    """Loads and selects one value head's recurrent state from HBM or carry."""
-    carry = (
-        carry_recurrent_scratch_ref[s, v]
-        if carry_recurrent_scratch_ref is not None
-        else None
-    )
-    return _select_recurrent_state(
-        recurrent_in_slot_ref[s, 0, v],
-        carry,
-        has_initial_state,
-        is_first_tile,
-        cfg.dtypes.recurrent_state,
-    )
-
-
-def store_recurrent_head(
-    recurrent_out_slot_ref: jax.Ref,
-    carry_recurrent_scratch_ref: jax.Ref | None,
-    s: int,
-    v: int,
-    w_idx: int,
-    state: jax.Array,
-    cfg: config.GDNConfig,
-) -> None:
-    """Stores one value head's updated recurrent state to VMEM and carry."""
-    if carry_recurrent_scratch_ref is not None and w_idx == cfg.window_size - 1:
-        carry_recurrent_scratch_ref[s, v] = state
-    recurrent_out_slot_ref[s, w_idx, v] = pltpu.bitcast(
-        state.astype(cfg.dtypes.recurrent_state), jnp.uint32
-    )
-
-
 def store_recurrent_state(
     recurrent_out_slot_ref: jax.Ref,
     carry_recurrent_scratch_ref: jax.Ref | None,

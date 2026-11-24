@@ -32,6 +32,7 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     tiling,
     vmem_ldst,
 )
+from vllm_torchtpu.kernels.gdn.v3 import recurrent_state as recurrent_state_lib
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -58,6 +59,18 @@ class _TileContext:
     cfg: config.GDNConfig
 
 
+def _should_flush_per_seq_state(ctx: _TileContext) -> jax.Array:
+    """Returns whether a single-sequence tile must flush state to HBM."""
+    is_last_tile = ctx.metadata_ref.p_id_is_last_tile[ctx.p_id, 0]
+    r_size = ctx.metadata_ref.p_id_to_r_size[ctx.p_id, 0]
+    should_flush = jnp.logical_and(is_last_tile, r_size > 0)
+    if ctx.metadata_ref.s_idx_to_prefill_ckpt_row is not None:
+        should_flush = jnp.logical_or(
+            should_flush, ctx.metadata_ref.is_prefill_ckpt_tile(ctx.p_id, 0)
+        )
+    return should_flush
+
+
 def _run_streamed_recurrent_gdn(ctx: _TileContext) -> None:
     """Runs recurrent GDN via VMEM callbacks (head pairs on 1-token decode)."""
     cfg = ctx.cfg
@@ -73,9 +86,11 @@ def _run_streamed_recurrent_gdn(ctx: _TileContext) -> None:
     seq_s_idx = [
         ctx.metadata_ref.p_id_to_s_idx[ctx.p_id, s] for s in range(cfg.seq_tile_size)
     ]
-    seq_has_init = [
-        ctx.metadata_ref.s_idx_has_initial_state[s_idx] for s_idx in seq_s_idx
-    ]
+    flush_cond = (
+        _should_flush_per_seq_state(ctx)
+        if cfg.mode == config.GDNMode.PER_SEQ and cfg.seq_tile_size == 1
+        else None
+    )
     seq_is_first_tile = (
         [
             ctx.metadata_ref.p_id_is_first_tile[ctx.p_id, s]
@@ -84,30 +99,21 @@ def _run_streamed_recurrent_gdn(ctx: _TileContext) -> None:
         if ctx.carry_recurrent_scratch_ref is not None
         else None
     )
-
-    def _load_rec_head(s: int, v: int) -> jax.Array:
-        return vmem_ldst.load_and_select_recurrent_head(
-            recurrent_in_slot_ref=ctx.recurrent_in_slot_ref,
-            carry_recurrent_scratch_ref=ctx.carry_recurrent_scratch_ref,
-            s=s,
-            v=v,
-            has_initial_state=seq_has_init[s],
-            is_first_tile=(
-                seq_is_first_tile[s] if seq_is_first_tile is not None else None
-            ),
-            cfg=cfg,
-        )
-
-    def _store_ckpt_head(s: int, v: int, w_idx: int, state_j: jax.Array) -> None:
-        vmem_ldst.store_recurrent_head(
-            recurrent_out_slot_ref=ctx.recurrent_out_slot_ref,
-            carry_recurrent_scratch_ref=ctx.carry_recurrent_scratch_ref,
-            s=s,
-            v=v,
-            w_idx=w_idx,
-            state=state_j,
-            cfg=cfg,
-        )
+    state_stream = recurrent_state_lib.RecurrentStateStream(
+        ctx.recurrent_in_slot_ref,
+        ctx.recurrent_out_slot_ref,
+        fmt=cfg.state_format,
+        n_v=cfg.num_v_heads,
+        d_k=cfg.kq_head_dim,
+        d_v=cfg.v_head_dim,
+        window_size=cfg.window_size,
+        seq_has_init=[
+            ctx.metadata_ref.s_idx_has_initial_state[s_idx] for s_idx in seq_s_idx
+        ],
+        carry_ref=ctx.carry_recurrent_scratch_ref,
+        seq_is_first_tile=seq_is_first_tile,
+        flush_cond=flush_cond,
+    )
 
     out, _ = compute_gdn.recurrent_gdn(
         real_sizes=ctx.real_sizes,
@@ -120,8 +126,8 @@ def _run_streamed_recurrent_gdn(ctx: _TileContext) -> None:
         a_log=ctx.a_log,
         dt_bias=ctx.dt_bias,
         cfg=cfg,
-        load_head_fn=_load_rec_head,
-        store_ckpt_head_fn=_store_ckpt_head,
+        load_head_fn=state_stream.load_head,
+        store_ckpt_head_fn=state_stream.store_ckpt_head,
     )
     ctx.out_slot_ref[...] = out.astype(ctx.out_slot_ref.dtype)
 
@@ -129,6 +135,7 @@ def _run_streamed_recurrent_gdn(ctx: _TileContext) -> None:
 def _run_bulk_attention(ctx: _TileContext) -> None:
     """Runs full-state attention (KDA or sequential chunked GDN)."""
     cfg = ctx.cfg
+    assert not recurrent_state_lib.is_scaled(cfg.state_format)
     prev_recurrent = vmem_ldst.load_and_select_recurrent_state(
         metadata_ref=ctx.metadata_ref,
         p_id=ctx.p_id,
@@ -259,26 +266,16 @@ def _run_block_doubling_gdn(ctx: _TileContext) -> None:
             ctx.out_slot_ref.dtype
         )
 
-    is_last_tile = ctx.metadata_ref.p_id_is_last_tile[ctx.p_id, 0]
-    r_size = ctx.metadata_ref.p_id_to_r_size[ctx.p_id, 0]
-    should_flush = jnp.logical_and(is_last_tile, r_size > 0)
-    if ctx.metadata_ref.s_idx_to_prefill_ckpt_row is not None:
-        should_flush = jnp.logical_or(
-            should_flush, ctx.metadata_ref.is_prefill_ckpt_tile(ctx.p_id, 0)
-        )
-
-    @pl.when(should_flush)
+    @pl.when(_should_flush_per_seq_state(ctx))
     def _flush_recurrent_carry() -> None:
-        for v in range(cfg.num_v_heads):
-            vmem_ldst.store_recurrent_head(
-                ctx.recurrent_out_slot_ref,
-                None,
-                0,
-                v,
-                0,
-                state_carry_ref[0, v],
-                cfg,
-            )
+        recurrent_state_lib.pack_carry_to_slot(
+            state_carry_ref,
+            ctx.recurrent_out_slot_ref,
+            n_v=cfg.num_v_heads,
+            d_k=cfg.kq_head_dim,
+            d_v=cfg.v_head_dim,
+            fmt=cfg.state_format,
+        )
 
 
 def inner_kernel(
@@ -347,19 +344,14 @@ def inner_kernel(
 
         @pl.when(is_first_tile)
         def _init_recurrent_carry() -> None:
-            has_init = metadata_ref.s_idx_has_initial_state[s_idx]
-            for v in range(cfg.num_v_heads):
-                carry_recurrent_scratch_ref[0, v] = (
-                    vmem_ldst.load_and_select_recurrent_head(
-                        recurrent_in_slot_ref,
-                        None,
-                        0,
-                        v,
-                        has_init,
-                        None,
-                        cfg,
-                    )
-                )
+            recurrent_state_lib.unpack_slot_to_carry(
+                recurrent_in_slot_ref,
+                carry_recurrent_scratch_ref,
+                metadata_ref.s_idx_has_initial_state[s_idx],
+                n_v=cfg.num_v_heads,
+                d_k=cfg.kq_head_dim,
+                fmt=cfg.state_format,
+            )
 
     # Prepare states.
     real_sizes, prev_conv = vmem_ldst.load_and_select_conv_state(
@@ -544,20 +536,29 @@ def _resolve_gdn_prefill_mode(
     gdn_prefill_mode: config.GDNPrefillMode | str | None,
     *,
     attention_mode: config.AttentionMode,
+    state_fmt: config.RecurrentStateFormat,
     d_k: int,
     d_v: int,
 ) -> config.GDNPrefillMode:
     """Resolves and validates `gdn_prefill_mode` against model and TPU limits."""
     is_kda = attention_mode == config.AttentionMode.KDA
+    is_scaled = recurrent_state_lib.is_scaled(state_fmt)
     if gdn_prefill_mode is not None:
-        resolved = config.GDNPrefillMode(gdn_prefill_mode)
-        if is_kda and resolved != config.GDNPrefillMode.SEQUENTIAL:
+        mode = config.GDNPrefillMode(gdn_prefill_mode)
+        if is_kda and mode != config.GDNPrefillMode.SEQUENTIAL:
             raise ValueError(
-                f"gdn_prefill_mode={resolved.value!r} only applies to GDN; "
+                f"gdn_prefill_mode={mode.value!r} only applies to GDN; "
                 f"got attention_mode={attention_mode}."
             )
+        if is_scaled and mode == config.GDNPrefillMode.SEQUENTIAL:
+            raise NotImplementedError(
+                f"recurrent_state_format={state_fmt.value!r} requires a "
+                "block-doubling gdn_prefill_mode ('block_doubling_bf16' or "
+                "'block_doubling_fp8')."
+            )
+        resolved: config.GDNPrefillMode | None = mode
     else:
-        resolved = None
+        resolved = config.GDNPrefillMode.BLOCK_DOUBLING_BF16 if is_scaled else None
 
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
@@ -583,6 +584,67 @@ def _resolve_gdn_prefill_mode(
     return resolved
 
 
+def _resolve_state_format(
+    states: jax.Array | tuple[jax.Array, jax.Array],
+    *,
+    recurrent_dtype: jnp.dtype | None,
+    recurrent_state_format: config.RecurrentStateFormat | str | None,
+    attention_mode: config.AttentionMode,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+) -> tuple[config.RecurrentStateFormat, jnp.dtype]:
+    """Resolves and validates recurrent state format and tensor dtype/shape."""
+    if (
+        recurrent_state_format is None
+        and recurrent_dtype is not None
+        and jnp.dtype(recurrent_dtype) == jnp.uint32
+    ):
+        raise ValueError(
+            "Received uint32 recurrent_state without recurrent_state_format; "
+            "pass recurrent_state_format='fp8' to use packed FP8 recurrent state."
+        )
+    state_fmt = recurrent_state_lib.resolve_format(
+        recurrent_state_format, recurrent_dtype
+    )
+    is_scaled = recurrent_state_lib.is_scaled(state_fmt)
+    if is_scaled:
+        if isinstance(states, jax.Array):
+            raise NotImplementedError(
+                "Packed scaled recurrent state is not yet supported with "
+                "unified-pool shared states."
+            )
+        expected_rows = recurrent_state_lib.packed_rows(state_fmt, n_v, d_k)
+        rec = states[1]
+        if rec.dtype != jnp.uint32 or rec.shape[1:] != (expected_rows, d_v):
+            raise ValueError(
+                "Expected uint32 recurrent_state of shape [num_blocks, "
+                f"{expected_rows}, {d_v}] for {state_fmt.value}; got "
+                f"{rec.dtype}[{rec.shape}]."
+            )
+        if recurrent_dtype is not None and jnp.dtype(recurrent_dtype) != jnp.uint32:
+            raise ValueError(
+                f"recurrent_state_format={state_fmt.value!r} requires "
+                f"recurrent_dtype=uint32; got {jnp.dtype(recurrent_dtype).name}."
+            )
+        if attention_mode == config.AttentionMode.KDA:
+            raise NotImplementedError(
+                f"recurrent_state_format={state_fmt.value!r} is not supported for KDA."
+            )
+        return state_fmt, jnp.dtype(jnp.uint32)
+
+    fmt_dtype = jnp.dtype(
+        jnp.bfloat16 if state_fmt == config.RecurrentStateFormat.BF16 else jnp.float32
+    )
+    if recurrent_dtype is not None and jnp.dtype(recurrent_dtype) != fmt_dtype:
+        raise ValueError(
+            f"recurrent_state_format={state_fmt.value!r} requires "
+            f"recurrent_dtype={fmt_dtype.name}; got "
+            f"{jnp.dtype(recurrent_dtype).name}."
+        )
+    return state_fmt, fmt_dtype
+
+
 @jax.jit(
     donate_argnames=("states",),
     static_argnames=(
@@ -600,6 +662,7 @@ def _resolve_gdn_prefill_mode(
         "compute_precision",
         "gdn_prefill_mode",
         "recurrent_dtype",
+        "recurrent_state_format",
         "conv_dtype",
         "attention_mode",
         "gate_lower_bound",
@@ -633,6 +696,7 @@ def fused_conv1d_gdn(
     attention_mode: config.AttentionMode = config.AttentionMode.GDN,
     gate_lower_bound: float | None = None,
     recurrent_dtype: jnp.dtype | None = None,
+    recurrent_state_format: config.RecurrentStateFormat | str | None = None,
     conv_dtype: jnp.dtype | None = None,
     num_spec_tokens: int = 0,
     batched_only: bool = False,
@@ -722,15 +786,22 @@ def fused_conv1d_gdn(
             `GDNPrefillMode`, its string value, or `None`. `None` (the default)
             selects `"block_doubling_bf16"` for GDN when `d_k` and `d_v` are
             multiples of the TPU lane count (covering both Qwen 3.8 and
-            Qwen 3.5) and `"sequential"` for KDA or non-lane-aligned head dims.
-            `"sequential"` opts out to the sequential chunked kernel;
-            `"block_doubling_bf16"` and `"block_doubling_fp8"` select Schur
-            block doubling with 16-bit or 8-bit (`float8_e4m3fn`) MXU operands
-            for supported chunk sizes (`32`, `64`, or `>= 128` divisible by
-            `128`), falling back to `"sequential"` on other chunk sizes (GDN
-            only; explicit block-doubling modes raise `ValueError` under KDA or
+            Qwen 3.5) or when using a scaled `recurrent_state_format`, and
+            `"sequential"` for KDA or non-lane-aligned head dims. `"sequential"`
+            opts out to the sequential chunked kernel; `"block_doubling_bf16"`
+            and `"block_doubling_fp8"` select Schur block doubling with 16-bit
+            or 8-bit (`float8_e4m3fn`) MXU operands for supported chunk sizes
+            (`32`, `64`, or `>= 128` divisible by `128`), falling back to
+            `"sequential"` on other chunk sizes (GDN only; explicit
+            block-doubling modes raise `ValueError` under KDA or
             non-lane-aligned `d_k`/`d_v`, and `NotImplementedError` when FP8
             MXU is unavailable).
+        recurrent_state_format: Optional packed storage format for the recurrent
+            state (`"f32"`, `"bf16"`, or `"fp8"`). When `None`, inferred from
+            `recurrent_dtype`. `"fp8"` expects `uint32`
+            `[num_blocks, packed_rows, d_v]` from `recurrent_state.pack_state`
+            and requires GDN with separate `(conv, recurrent)` states and
+            streamed recurrent decode/verify or block-doubling prefill.
         kernel_act_dtype: Dtype qkv, b and a are cast to before the kernel.
         kernel_conv_weight_dtype: Dtype conv_weight and conv_bias are cast to
             before the kernel.
@@ -758,21 +829,43 @@ def fused_conv1d_gdn(
         # Ensure compact layout is used.
         assert states.shape[-2] == state_packing
         assert conv_dtype is not None
-        assert recurrent_dtype is not None
+        if recurrent_dtype is None and recurrent_state_format is None:
+            raise ValueError(
+                "Shared state pool requires recurrent_dtype or recurrent_state_format."
+            )
     else:
         assert len(states) == 2
+        if (
+            recurrent_dtype is not None
+            and jnp.dtype(recurrent_dtype) != states[1].dtype
+        ):
+            raise ValueError(
+                f"recurrent_dtype={jnp.dtype(recurrent_dtype).name} conflicts "
+                f"with recurrent state tensor dtype {states[1].dtype.name}."
+            )
         recurrent_dtype = states[1].dtype
         conv_dtype = states[0].dtype
-    # Conv1D reads the compact layout, which needs fp32. The recurrent state
-    # may be bf16: it is upcast once on load and rounded once on store.
-    if jnp.dtype(conv_dtype) != jnp.float32 or jnp.dtype(recurrent_dtype) not in (
-        jnp.dtype(jnp.float32),
-        jnp.dtype(jnp.bfloat16),
-    ):
+    # Conv1D reads the compact layout, which needs fp32.
+    if jnp.dtype(conv_dtype) != jnp.float32:
         raise NotImplementedError(
-            "GDN v3 needs an fp32 conv state and an fp32 or bf16 recurrent "
-            f"state; got conv={conv_dtype} recurrent={recurrent_dtype}."
+            f"GDN v3 needs an fp32 conv state; got conv={conv_dtype}."
         )
+    state_fmt, recurrent_dtype = _resolve_state_format(
+        states,
+        recurrent_dtype=recurrent_dtype,
+        recurrent_state_format=recurrent_state_format,
+        attention_mode=attention_mode,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+    )
+    gdn_prefill_mode = _resolve_gdn_prefill_mode(
+        gdn_prefill_mode,
+        attention_mode=attention_mode,
+        state_fmt=state_fmt,
+        d_k=d_k,
+        d_v=d_v,
+    )
 
     qkv = qkv.astype(kernel_act_dtype)
     b = b.astype(kernel_act_dtype)
@@ -834,12 +927,6 @@ def fused_conv1d_gdn(
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
-    gdn_prefill_mode = _resolve_gdn_prefill_mode(
-        gdn_prefill_mode,
-        attention_mode=attention_mode,
-        d_k=d_k,
-        d_v=d_v,
-    )
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
@@ -866,6 +953,7 @@ def fused_conv1d_gdn(
             decode_vmem_limit_bytes=decode_vmem_limit_bytes,
             mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
             window_size=window_size,
+            recurrent_state_format=state_fmt,
         )
         logger.info_once(
             "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
@@ -887,8 +975,8 @@ def fused_conv1d_gdn(
         window = num_spec_tokens + 1
         num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
         state_positions = 1 + window
-        recurrent_bytes_per_seq = (
-            state_positions * n_v * d_k * d_v * jnp.dtype(recurrent_dtype).itemsize
+        recurrent_bytes_per_seq = state_positions * recurrent_state_lib.slot_bytes(
+            state_fmt, n_v, d_k, d_v
         )
         bytes_per_seq = (
             # Recurrent checkpoints — the dominant term.
@@ -978,6 +1066,7 @@ def fused_conv1d_gdn(
             attention_mode=attention_mode,
             gate_lower_bound=gate_lower_bound,
             gdn_prefill_mode=gdn_prefill_mode,
+            recurrent_state_format=state_fmt,
             dtypes=config.Dtypes(
                 act_in=act_in_dtype,
                 act_out=act_out_dtype,

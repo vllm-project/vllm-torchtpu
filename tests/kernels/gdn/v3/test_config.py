@@ -23,7 +23,15 @@ from absl.testing import absltest, parameterized
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
-from vllm_torchtpu.kernels.gdn.v3 import config, tiling, vmem_ldst, wrapper
+from vllm_torchtpu.kernels.gdn.v3 import (
+    config,
+    tiling,
+    vmem_ldst,
+    wrapper,
+)
+from vllm_torchtpu.kernels.gdn.v3 import (
+    recurrent_state as recurrent_state_lib,
+)
 
 _64MIB_VMEM_LIMIT = int(
     config.GDNConfig.DEFAULT_VMEM_FRACTION
@@ -138,6 +146,16 @@ class QkvPadScratchTest(parameterized.TestCase):
             want=True,
         ),
         dict(
+            testcase_name="kq16_v64_fp8_c64_64mib_fits",
+            n_kq=16,
+            n_v=64,
+            chunk_sz=64,
+            rec_dtype=jnp.uint32,
+            state_fmt=config.RecurrentStateFormat.FP8,
+            vmem_limit=_64MIB_VMEM_LIMIT,
+            want=True,
+        ),
+        dict(
             testcase_name="kq16_v64_f32_c32_64mib_fits",
             n_kq=16,
             n_v=64,
@@ -166,10 +184,11 @@ class QkvPadScratchTest(parameterized.TestCase):
         ),
     )
     def test_fits_qkv_pad_scratch(
-        self, n_kq, n_v, chunk_sz, rec_dtype, vmem_limit, want
+        self, n_kq, n_v, chunk_sz, rec_dtype, vmem_limit, want, state_fmt=None
     ):
         cfg = _make_cfg(
             recurrent_state_dtype=jnp.dtype(rec_dtype),
+            recurrent_state_format=state_fmt,
             num_kq_heads=n_kq,
             num_v_heads=n_v,
             dim_size=(2 * n_kq + n_v) * 128,
@@ -417,6 +436,50 @@ class GDNConfigUseBlockDoublingTest(parameterized.TestCase):
             tiling.fits_qkv_pad_scratch(cfg, qpad_shape, 16 * 1024 * 1024, 128)
         )
 
+    @parameterized.named_parameters(
+        dict(testcase_name="fp8_chunk_8", tile_size=8, want_recurrent=True),
+        dict(testcase_name="fp8_chunk_16", tile_size=16, want_recurrent=True),
+        dict(testcase_name="fp8_chunk_48", tile_size=48, want_recurrent=True),
+        dict(testcase_name="fp8_chunk_96", tile_size=96, want_recurrent=True),
+        dict(testcase_name="fp8_chunk_192", tile_size=192, want_recurrent=True),
+        dict(testcase_name="fp8_chunk_32", tile_size=32, want_recurrent=False),
+        dict(testcase_name="fp8_chunk_64", tile_size=64, want_recurrent=False),
+        dict(testcase_name="fp8_chunk_128", tile_size=128, want_recurrent=False),
+        dict(testcase_name="fp8_chunk_256", tile_size=256, want_recurrent=False),
+    )
+    def test_fp8_small_chunks_route_to_recurrent_scan(self, tile_size, want_recurrent):
+        cfg = _make_cfg(
+            tile_size=tile_size,
+            gdn_prefill_mode=config.GDNPrefillMode.BLOCK_DOUBLING_BF16,
+            recurrent_state_format=config.RecurrentStateFormat.FP8,
+            recurrent_state_dtype=jnp.dtype(jnp.uint32),
+        )
+        self.assertEqual(cfg.use_recurrent, want_recurrent)
+        self.assertEqual(cfg.use_block_doubling, not want_recurrent)
+
+    def test_shared_pool_conv_hbm_offset_and_kernel_name_for_fp8(self):
+        # GDNConfig delegates conv_hbm_offset to slot_granules (wrapper still
+        # rejects shared-pool FP8 until unified-pool layout consumers land).
+        cfg = _make_cfg(
+            is_shared=True,
+            num_v_heads=16,
+            kq_head_dim=128,
+            v_head_dim=128,
+            recurrent_state_format=config.RecurrentStateFormat.FP8,
+            recurrent_state_dtype=jnp.dtype(jnp.uint32),
+        )
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        with use_abstract_mesh(mesh):
+            self.assertEqual(
+                cfg.conv_hbm_offset,
+                recurrent_state_lib.slot_granules(
+                    config.RecurrentStateFormat.FP8, 16, 128, 128, 128
+                ),
+            )
+        self.assertEndsWith(cfg.get_kernel_name(), "_sfp8")
+
 
 class BlockDoublingWrapperValidationTest(parameterized.TestCase):
     def _dummy_inputs(
@@ -537,6 +600,91 @@ class BlockDoublingWrapperValidationTest(parameterized.TestCase):
                 batched_only=True,
             ),
         )
+
+    def test_fp8_state_validation_errors(self):
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        packed_rows = recurrent_state_lib.packed_rows(
+            config.RecurrentStateFormat.FP8, 8, 128
+        )
+        packed_rec = jnp.zeros((2, packed_rows, 128), jnp.uint32)
+
+        gdn_inputs = self._dummy_inputs()
+        gdn_inputs["states"] = (gdn_inputs["states"][0], packed_rec)
+
+        kda_inputs = self._dummy_inputs(is_kda=True)
+        kda_inputs["states"] = (kda_inputs["states"][0], packed_rec)
+
+        shared_inputs = self._dummy_inputs()
+        shared_inputs["states"] = jnp.zeros((2, 4, 1, 128), jnp.float32)
+
+        d64_rows = recurrent_state_lib.packed_rows(
+            config.RecurrentStateFormat.FP8, 8, 64
+        )
+        d64_inputs = self._dummy_inputs(head_dim=64)
+        d64_inputs["states"] = (
+            d64_inputs["states"][0],
+            jnp.zeros((2, d64_rows, 64), jnp.uint32),
+        )
+
+        cases = [
+            (
+                NotImplementedError,
+                "not supported for KDA",
+                kda_inputs,
+                dict(
+                    attention_mode=config.AttentionMode.KDA,
+                    recurrent_state_format="fp8",
+                ),
+            ),
+            (
+                NotImplementedError,
+                "block-doubling",
+                gdn_inputs,
+                dict(gdn_prefill_mode="sequential", recurrent_state_format="fp8"),
+            ),
+            (
+                ValueError,
+                "Expected uint32 recurrent_state",
+                self._dummy_inputs(),
+                dict(recurrent_state_format="fp8"),
+            ),
+            (
+                NotImplementedError,
+                "unified-pool shared states",
+                shared_inputs,
+                dict(conv_dtype=jnp.float32, recurrent_state_format="fp8"),
+            ),
+            (
+                ValueError,
+                "recurrent_dtype or recurrent_state",
+                shared_inputs,
+                dict(conv_dtype=jnp.float32),
+            ),
+            (
+                ValueError,
+                "conflicts with recurrent state",
+                gdn_inputs,
+                dict(recurrent_dtype=jnp.float32, recurrent_state_format="fp8"),
+            ),
+            (
+                ValueError,
+                "recurrent_state_format='fp8'",
+                gdn_inputs,
+                dict(),
+            ),
+            (
+                ValueError,
+                "d_k and d_v",
+                d64_inputs,
+                dict(recurrent_state_format="fp8"),
+            ),
+        ]
+        with use_abstract_mesh(mesh):
+            for err, msg, inputs, kwargs in cases:
+                with self.assertRaisesRegex(err, msg):
+                    wrapper.fused_conv1d_gdn(**inputs, **kwargs)
 
 
 if __name__ == "__main__":
