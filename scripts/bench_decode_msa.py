@@ -346,13 +346,13 @@ def _tp8_devices(dcp):
 
 def tp8_program(
     mesh, num_layers, attend, *, dcp, g, split, interpret, score_only=False, coll=True,
-    attn_only="",
+    attn_only="", localq=False,
 ):
     """`num_layers` layers in one `fori_loop` (the program size does not grow
     with the layer count, so long chains average out the host's noise)."""
     groups = 8 // dcp
 
-    def body(rank, grp, q, k, v, iq, ik, kv, idx, sc, sl, tb, cu, dist, had):
+    def body(rank, grp, q, k, v, iq, ik, kv, idx, sc, sl, tb, cu, dist, had, iqh):
         if attn_only:
             kk, vv, ii = (_gather_kv(k, v, iq, rank, dcp, g) if g > 1
                           else (k[:, None], v[:, None], iq[:, None]))  # fmt: skip
@@ -397,7 +397,9 @@ def tp8_program(
                     kk, vv, ik, kv, idx, sl, tb, cu, rank=rank, dcp=dcp,
                     scale_cache=sc, interpret=interpret,
                 )  # fmt: skip
-                if coll:
+                if localq:  # every index head computed on this rank (no gather)
+                    iq_all = (iqh + link).transpose(1, 0, 2)
+                elif coll:
                     iq_all = jax.lax.all_gather(
                         ii, GAXIS, axis=1, tiled=True
                     )  # [T, 4, D]
@@ -435,7 +437,7 @@ def tp8_program(
         jax.shard_map(
             body,
             mesh=mesh,
-            in_specs=(s, s) + (s,) * 5 + (s, s, s) + (r,) * 5,
+            in_specs=(s, s) + (s,) * 5 + (s, s, s) + (r,) * 6,
             out_specs=(s, s, s, s),
             check_vma=False,
         ),
@@ -499,6 +501,7 @@ def tp8_main(args, dcp, g, ctx, interpret):
         tail = (
             *(jax.device_put(jnp.asarray(m), rep) for m in meta),
             jax.device_put(jnp.asarray(msa_fp4.hadamard(D), jnp.bfloat16), rep),
+            jax.device_put(jnp.asarray(iq_heads, jnp.bfloat16), rep),
         )
 
         def make():
@@ -527,13 +530,14 @@ def tp8_main(args, dcp, g, ctx, interpret):
             mode, attn = spec.split(":")
             cases.append((spec, mode.startswith("split"), "score" in mode,
                           "nocoll" not in mode, attn,
-                          {"attnonly": "attend", "kernelonly": "kernel"}.get(mode, "")))  # fmt: skip
+                          {"attnonly": "attend", "kernelonly": "kernel"}.get(mode, ""),
+                          "localq" in mode))  # fmt: skip
         lo, hi = args.layers // 4, args.layers
-        for name, split, score_only, coll, attn, attn_only in cases:
+        for name, split, score_only, coll, attn, attn_only, localq in cases:
             mk = functools.partial(tp8_program, mesh, attend=VARIANTS[attn], dcp=dcp,
                                    g=g, split=split, interpret=interpret,
                                    score_only=score_only, coll=coll,
-                                   attn_only=attn_only)  # fmt: skip
+                                   attn_only=attn_only, localq=localq)  # fmt: skip
             p_hi = mk(hi)
             (t1, t1m), (tl, tlm) = timed(mk(lo)), timed(p_hi)
             n = max(hi - lo, 1)
