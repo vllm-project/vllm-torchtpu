@@ -20,7 +20,10 @@ import enum
 
 # Scheduling-group ids are process-wide and shared by every kernel, including
 # this per-model copy, and `TpuCompiler` restarts them for every compiled
-# program. Re-exported so this copy's callers keep using `config.*`.
+# program. Re-exported so this copy's callers keep using `config.*`. Only a
+# selector that overlaps scoring reserves ids: `BisectTopK`
+# (`overlaps_scoring=False`) never does, so programs that select with it
+# carry no ids.
 from vllm_torchtpu.kernels.scheduling_groups import (
     reserve_scheduling_group_ids as reserve_scheduling_group_ids,
 )
