@@ -209,15 +209,22 @@ def _kernel(
     ring = buf_ref.shape[0]  # prefetched groups + the running one
     steps = pl.num_programs(0) if steps_per_call is None else steps_per_call
     num_groups = block_start_ref[steps]
-    row_width = buf_ref.shape[-1]
+    q_leaf = q_ref[0] if isinstance(q_ref, tuple) else q_ref
+    row_width = 2 * q_leaf.shape[-1]
+    # A ring of whole cache rows (`_kernel_scratch`): one contiguous copy per
+    # page, and a group reads its head's lanes.
+    whole_rows = buf_ref.shape[-1] > row_width
 
     def page_copies(half, g, page, n=1):
         """Copies of ``n`` pages from `page` on into slots ``g ..``: every
         copy of a ring slot signals its one semaphore, so a wait sized to
         ``n`` pages waits for any ``n`` of them."""
-        src = kv_hbm_ref.at[
-            pl.ds(page, n), :, :, pl.ds(head_ref[0] * row_width, row_width)
-        ]
+        if whole_rows:
+            src = kv_hbm_ref.at[pl.ds(page, n)]
+        else:
+            src = kv_hbm_ref.at[
+                pl.ds(page, n), :, :, pl.ds(head_ref[0] * row_width, row_width)
+            ]
         copies = [
             pltpu.make_async_copy(
                 src, buf_ref.at[half, pl.ds(g, n), 0], sem_ref.at[half, 0]
@@ -300,7 +307,7 @@ def _kernel(
                 return q_refs[0][...]
             return jnp.concatenate([r[...] for r in q_refs], axis=0)
 
-        rows_per_page, packing, row_width = buf_ref.shape[3:]
+        rows_per_page, packing = buf_ref.shape[3:5]
         page_size = rows_per_page * (msa_fp4.TOKENS_PER_WORD if fp4 else packing)
         # 8-bit pages of `attend` reach the MXU without an unpack.
         direct = not fp4 and not transposed and packing == 4
@@ -359,7 +366,13 @@ def _kernel(
                 pl.when((count & n) != 0)(copy.wait)
             n *= 2
 
-        kv_refs = [buf_ref.at[half, g] for g in range(pages_per_step)]
+        if whole_rows:
+            lanes = pl.ds(pl.multiple_of(head_ref[0] * row_width, row_width), row_width)
+            kv_refs = [
+                buf_ref.at[half, g, :, :, :, lanes] for g in range(pages_per_step)
+            ]
+        else:
+            kv_refs = [buf_ref.at[half, g] for g in range(pages_per_step)]
         widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
 
         def zero_to(span):
@@ -1167,6 +1180,13 @@ def _kernel_scratch(
         ring = (1 + UNIT_PREFETCH) * unit_groups
     else:
         ring = 1 + (_FP4_PREFETCH if scale_cache is not None else 1)
+    # 4-bit units of rows holding two KV heads (c64, DCP4) copy whole rows: a
+    # head's lanes alone are a strided copy of 256-byte runs.
+    whole_rows = (
+        scale_cache is not None
+        and unit_groups > 1
+        and kv_cache.shape[-1] == 2 * (2 * head_dim)
+    )
     if transposed:
         softmax = [(1, rows), (1, rows), (head_dim, rows)]
     elif unit_groups > 1 and rows <= head_dim:  # `fold`'s lane-replicated sums
@@ -1176,7 +1196,14 @@ def _kernel_scratch(
     scratch = [pltpu.VMEM(shape, jnp.float32) for shape in softmax]
     scratch += [
         pltpu.VMEM(
-            (ring, pages_per_step, 1, rows_per_page, packing, 2 * head_dim),
+            (
+                ring,
+                pages_per_step,
+                1,
+                rows_per_page,
+                packing,
+                kv_cache.shape[-1] if whole_rows else 2 * head_dim,
+            ),
             kv_cache.dtype,
         ),
         pltpu.SemaphoreType.DMA((ring, 1)),
