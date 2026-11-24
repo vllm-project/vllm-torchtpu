@@ -1603,14 +1603,22 @@ def test_cp_scatter_indexer_k_xla_has_sal_equivalence(monkeypatch):
         )
 
 
-def test_indexer_kv_layout_pcp_manager(monkeypatch, caplog):
-    """USE_TPU_PCP_MANAGER downgrades default 'sal' to HAS with a one-time
-    warning and rejects explicit 'sal': its split prefills gather the indexer
-    K cache as packed rows."""
+def test_indexer_kv_layout_and_pcp_kv_gather_pure_dcp_vs_pcp(monkeypatch, caplog):
+    """PCP (`prefill_context_parallel_size > 1`) downgrades default 'sal' to HAS
+    with a one-time warning and rejects explicit 'sal', while pure DCP
+    (`pcp_size == 1, dcp_size > 1`) keeps `pcp_kv_gather=False` and `SEQ_ALONG_LANE`."""
     import importlib
     import logging
 
-    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        KVLayout,
+        get_kv_cache_shape,
+    )
+    from vllm_torchtpu.layers.adapter import attention as attn_mod
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasMLAttentionBackendImpl,
+        VllmTPUDeepseekV32IndexerBackend,
+    )
 
     st_mod = importlib.import_module(
         "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
@@ -1622,25 +1630,129 @@ def test_indexer_kv_layout_pcp_manager(monkeypatch, caplog):
     monkeypatch.setattr(envs, "TPU_USE_RAIDEN_KV_CACHE_MANAGER", False)
     monkeypatch.setattr(envs, "TPU_RAIDEN_GLM_ADMISSION", False)
 
-    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", False)
-    assert st_mod.indexer_kv_layout(256) == KVLayout.SEQ_ALONG_LANE
+    assert st_mod.indexer_kv_layout(256, pcp_enabled=False) == KVLayout.SEQ_ALONG_LANE
 
-    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", True)
     caplog.clear()
-    assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
-    assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
+    assert (
+        st_mod.indexer_kv_layout(256, pcp_enabled=True) == KVLayout.HEAD_ALONG_SUBLANE
+    )
+    assert (
+        st_mod.indexer_kv_layout(256, pcp_enabled=True) == KVLayout.HEAD_ALONG_SUBLANE
+    )
     warnings = [
-        r.message for r in caplog.records if "USE_TPU_PCP_MANAGER=1" in r.message
+        r.message
+        for r in caplog.records
+        if "prefill_context_parallel_size > 1" in r.message
     ]
     assert len(warnings) == 1
 
     monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
-    with pytest.raises(ValueError, match="USE_TPU_PCP_MANAGER=1"):
-        st_mod.indexer_kv_layout(256)
+    with pytest.raises(ValueError, match="prefill_context_parallel_size > 1"):
+        st_mod.indexer_kv_layout(256, pcp_enabled=True)
     for explicit_mode in ("has", "xla"):
         monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", explicit_mode)
         monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", explicit_mode)
-        assert st_mod.indexer_kv_layout(256) == KVLayout.HEAD_ALONG_SUBLANE
+        assert (
+            st_mod.indexer_kv_layout(256, pcp_enabled=True)
+            == KVLayout.HEAD_ALONG_SUBLANE
+        )
+
+    # Pure DCP (pcp_size=1, dcp_size=8) must keep pcp_kv_gather=False and SAL.
+    monkeypatch.delenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_INDEXER_KV_CACHE_MODE", "sal")
+    monkeypatch.setattr(attn_mod, "get_or_create_dcp_mesh", lambda: "dcp_mesh")
+
+    def _mla_impl(pcp_size: int, dcp_size: int) -> PallasMLAttentionBackendImpl:
+        cfg = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=pcp_size,
+                decode_context_parallel_size=dcp_size,
+                cp_kv_cache_interleave_size=4,
+            )
+        )
+        monkeypatch.setattr(attn_mod, "get_current_vllm_config_or_none", lambda: cfg)
+        return PallasMLAttentionBackendImpl(
+            num_heads=16,
+            head_size=576,
+            scale=1.0,
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="fp8",
+            logits_soft_cap=None,
+            attn_type="decoder",
+            kv_sharing_target_layer_name=None,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            qk_head_dim=192,
+            v_head_dim=128,
+        )
+
+    pure_dcp = _mla_impl(pcp_size=1, dcp_size=8)
+    assert pure_dcp.pcp_kv_gather is False
+    assert pure_dcp.pcp_size == 1
+    assert VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
+        4, 256, 1, 128
+    ) == get_kv_cache_shape(4, 256, 128, KVLayout.SEQ_ALONG_LANE)
+
+    pcp_dcp = _mla_impl(pcp_size=2, dcp_size=8)
+    assert pcp_dcp.pcp_kv_gather is True
+    assert pcp_dcp.pcp_size == 2
+    assert VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
+        4, 256, 1, 128
+    ) == get_kv_cache_shape(4, 256, 128, KVLayout.HEAD_ALONG_SUBLANE)
+
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    monkeypatch.setattr(
+        mla_attention_op.SparseAttnIndexer, "__init__", lambda self, *_a, **_kw: None
+    )
+
+    def _make_sparse_indexer(pcp_size: int, dcp_size: int):
+        cfg = SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=8192),
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=pcp_size,
+                decode_context_parallel_size=dcp_size,
+                cp_kv_cache_interleave_size=4,
+            ),
+        )
+        monkeypatch.setattr(
+            mla_attention_op, "get_current_vllm_config_or_none", lambda: cfg
+        )
+        stream_op = MagicMock(return_value="stream_op")
+        dcp_op = MagicMock(return_value="dcp_op")
+        pcp_op = MagicMock(return_value="pcp_prefill_op")
+        monkeypatch.setattr(
+            mla_attention_op.VllmTPUSparseAttnIndexer, "_build_streamidx_op", stream_op
+        )
+        monkeypatch.setattr(
+            mla_attention_op.VllmTPUSparseAttnIndexer,
+            "_build_streamidx_dcp_op",
+            dcp_op,
+        )
+        monkeypatch.setattr(
+            mla_attention_op.VllmTPUSparseAttnIndexer,
+            "_build_pcp_prefill_topk_op",
+            pcp_op,
+        )
+        indexer = mla_attention_op.VllmTPUSparseAttnIndexer()
+        return indexer, stream_op, dcp_op, pcp_op
+
+    pure_idx, stream_op, dcp_op, pcp_op = _make_sparse_indexer(pcp_size=1, dcp_size=8)
+    assert pure_idx.pcp_kv_gather is False
+    stream_op.assert_called_once_with(pcp_enabled=False)
+    dcp_op.assert_called_once_with(8, 4, pcp_enabled=False)
+    pcp_op.assert_not_called()
+    assert not hasattr(pure_idx, "topk_op_pcp_prefill")
+
+    pcp_idx, stream_op, dcp_op, pcp_op = _make_sparse_indexer(pcp_size=2, dcp_size=8)
+    assert pcp_idx.pcp_kv_gather is True
+    stream_op.assert_called_once_with(pcp_enabled=True)
+    dcp_op.assert_called_once_with(8, 4, pcp_enabled=True)
+    pcp_op.assert_called_once_with(8, 2, 4, 8192)
+    assert pcp_idx.topk_op_pcp_prefill == "pcp_prefill_op"
 
 
 def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, caplog):

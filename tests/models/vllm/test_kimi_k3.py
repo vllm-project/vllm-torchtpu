@@ -1390,29 +1390,19 @@ def test_metadata_rejects_wrong_layer_metadata_type(
         layer._metadata()
 
 
-def test_core_attention_pooled_rejects_pcp_streaming(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_core_attention_pooled_rejects_pcp_streaming() -> None:
     """The unified-pool KDA path does not support prefill-context-parallel
     streaming metadata and says so up front."""
     layer = _make_bare_kda_layer()
-    monkeypatch.setattr(
-        kimi_attention, "is_pcp_streaming_attention_metadata", lambda md: True
-    )
-    metadata = SimpleNamespace(mamba_slot_read_offsets=None)
+    metadata = SimpleNamespace(mamba_slot_read_offsets=None, use_pcp_streaming=True)
 
     with pytest.raises(NotImplementedError, match="PCP streaming prefill"):
         layer._core_attention_pooled(None, None, None, None, None, metadata)
 
 
-def test_core_attention_pooled_forwards_speculative_verify_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_core_attention_pooled_forwards_speculative_verify_metadata() -> None:
     """Pooled verify forwards accepted-state offsets and noncontiguous checkpoints."""
     layer = _make_bare_kda_layer()
-    monkeypatch.setattr(
-        kimi_attention, "is_pcp_streaming_attention_metadata", lambda md: False
-    )
     metadata = SimpleNamespace(
         query_start_loc=torch.tensor([0, 6], dtype=torch.int32),
         mamba_state_indices=torch.tensor([1], dtype=torch.int32),
@@ -1421,6 +1411,7 @@ def test_core_attention_pooled_forwards_speculative_verify_metadata(
         mamba_request_distribution=torch.tensor([1, 1, 1], dtype=torch.int32),
         mamba_slot_read_offsets=torch.tensor([0, 2], dtype=torch.int32),
         mamba_ckpt_indices=torch.tensor([[1, 3, 5, 7, 9, 11]], dtype=torch.int32),
+        use_pcp_streaming=False,
     )
     mixed_qkv = torch.zeros(6, 12)
     raw_gate = torch.zeros(6, 4)
@@ -1463,16 +1454,15 @@ def test_core_attention_pooled_forwards_speculative_verify_metadata(
     assert all(actual is expected for actual, expected in zip(calls[0], expected_args))
 
 
-def test_core_attention_pooled_requires_state_indices(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_core_attention_pooled_requires_state_indices() -> None:
     """The pooled op gathers and scatters state by `mamba_state_indices`;
     metadata without them is an error, not a silent no-op."""
     layer = _make_bare_kda_layer()
-    monkeypatch.setattr(
-        kimi_attention, "is_pcp_streaming_attention_metadata", lambda md: False
+    metadata = SimpleNamespace(
+        mamba_slot_read_offsets=None,
+        mamba_state_indices=None,
+        use_pcp_streaming=False,
     )
-    metadata = SimpleNamespace(mamba_slot_read_offsets=None, mamba_state_indices=None)
 
     with pytest.raises(RuntimeError, match="requires mamba_state_indices"):
         layer._core_attention_pooled(None, None, None, None, None, metadata)

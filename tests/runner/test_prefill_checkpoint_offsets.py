@@ -32,11 +32,6 @@ from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes
 from vllm_torchtpu.gdn_pool_layout import PrefillCheckpointUnits
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
-_PCP_LAYOUT_RANK = "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_rank"
-_PCP_LAYOUT_WORLD_SIZE = (
-    "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_world_size"
-)
-
 PCP8_B = 384 * 8
 
 
@@ -274,7 +269,7 @@ def test_unresolved_kv_cache_config_is_rejected(pcp8_runner):
         TPUModelRunner._init_prefill_checkpoint_units(runner, _pcp8_kv_cache_config())
 
 
-def test_prepare_inputs_uploads_logical_offsets_under_pcp(monkeypatch):
+def test_prepare_inputs_uploads_logical_offsets_under_pcp():
     # PCP2 with 16-token rank-local blocks: logical B = H = 32. The 80-token
     # request (40 rows per rank) checkpoints at 64, its logical position.
     scheduled = [80, 20]
@@ -284,6 +279,7 @@ def test_prepare_inputs_uploads_logical_offsets_under_pcp(monkeypatch):
         scheduled_tokens=scheduled,
         token_paddings=[256],
         pcp_size=2,
+        pcp_rank=0,
     )
     runner._prefill_ckpt_units = PrefillCheckpointUnits(
         hash_block_size=32,
@@ -296,8 +292,6 @@ def test_prepare_inputs_uploads_logical_offsets_under_pcp(monkeypatch):
     runner._prefill_ckpt_offsets_cpu = torch.full(
         (runner.max_num_reqs,), 7, dtype=torch.int32
     )
-    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 0)
-    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
 
     TPUModelRunner._prepare_inputs(runner, _scheduler_output(scheduled), 0, 0)
 
@@ -305,7 +299,7 @@ def test_prepare_inputs_uploads_logical_offsets_under_pcp(monkeypatch):
     assert offsets.tolist() == [64] + [0] * (runner.num_reqs_max_model_len - 1)
 
 
-def test_prepare_inputs_without_units_sets_no_offsets(monkeypatch):
+def test_prepare_inputs_without_units_sets_no_offsets():
     scheduled = [80]
     runner = _make_runner(
         num_computed_tokens=[0],
@@ -313,10 +307,9 @@ def test_prepare_inputs_without_units_sets_no_offsets(monkeypatch):
         scheduled_tokens=scheduled,
         token_paddings=[256],
         pcp_size=2,
+        pcp_rank=0,
     )
     runner._prefill_ckpt_units = None
-    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 0)
-    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
 
     TPUModelRunner._prepare_inputs(runner, _scheduler_output(scheduled), 0, 0)
 

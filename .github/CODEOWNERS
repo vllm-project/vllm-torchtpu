@@ -137,7 +137,6 @@
 # Context Parallelism
 /src/vllm_torchtpu/distributed/pcp*.py @wenxindongwork @weiyu0824
 /src/vllm_torchtpu/platforms/pcp_validation.py @wenxindongwork @weiyu0824
-/src/vllm_torchtpu/layers/core/pcp_sequence_layout.py @wenxindongwork @weiyu0824
 /src/vllm_torchtpu/layers/adapter/cp_attention.py @wenxindongwork @weiyu0824
 /src/vllm_torchtpu/layers/adapter/cp_mla_attention.py @wenxindongwork @weiyu0824
 /src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/ @wenxindongwork @weiyu0824

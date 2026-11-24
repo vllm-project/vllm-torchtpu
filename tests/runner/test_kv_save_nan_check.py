@@ -33,10 +33,6 @@ from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
     begin_kv_save_nan_check,
     wait_for_save_with_nan_check,
 )
-from vllm_torchtpu.layers.core.sequence_layout import (
-    DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
-    SequenceLayoutPlan,
-)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
 
@@ -66,25 +62,13 @@ def events(monkeypatch):
     return events
 
 
-def plan(size, valid, token_slice=None, mapping=None):
-    return SequenceLayoutPlan(
-        descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
-        token_slice=token_slice or slice(0, size),
-        global_num_tokens=valid,
-        global_padded_num_tokens=size,
-        local_num_tokens=valid,
-        local_padded_num_tokens=size,
-        _packed_to_request_major_token_indices=mapping,
-    )
-
-
 def test_earlier_chunk_and_request_mapping_survive_reused_host_buffers(events):
     check = KVSaveNanCheck()
     query = np.array([0, 2, 3])
     hidden = torch.tensor([[0.0], [float("nan")], [1.0], [float("nan")]])
-    check.record(hidden, ("bad", "good"), query, plan(4, 3))
+    check.record(hidden, ("bad", "good"), query)
     query[:] = 0
-    check.record(torch.ones(4, 1), ("later",), np.array([0, 3]), plan(4, 3))
+    check.record(torch.ones(4, 1), ("later",), np.array([0, 3]))
     assert not check.is_ready()
     assert not any(event.synchronized for event in events)
     for event in events:
@@ -108,9 +92,7 @@ def test_pcp_repacked_tokens_ignore_padding(events, bad_row, expected):
     mapping = np.array([0, 2, -1, 1, 3, 4, -1, -1])
     hidden = torch.ones(4, 2)
     hidden[bad_row, 0] = float("nan")
-    check.record(
-        hidden, ("a", "b"), np.array([0, 2, 5]), plan(8, 5, slice(1, 5), mapping)
-    )
+    check.record(hidden, ("a", "b"), np.array([0, 2, 5]), mapping[1:5])
     events[0].ready = True
     assert check.bad_request_ids() == expected
 
@@ -118,7 +100,7 @@ def test_pcp_repacked_tokens_ignore_padding(events, bad_row, expected):
 def test_steps_hold_independent_copy_events_and_verdicts(events):
     bad, good = KVSaveNanCheck(), KVSaveNanCheck()
     for check, value in [(bad, float("nan")), (good, 0.0)]:
-        check.record(torch.tensor([[value]]), ("same",), np.array([0, 1]), plan(1, 1))
+        check.record(torch.tensor([[value]]), ("same",), np.array([0, 1]))
     events[1].ready = True
     assert good.is_ready() and not bad.is_ready()
     assert good.bad_request_ids() == set()
@@ -169,16 +151,17 @@ def test_intermediate_tensors_records_nans_across_activations(events):
             "topk_indices": torch.zeros((2, 1), dtype=torch.int32),
         }
     )
-    check.record(chunk_0, ("bad_hidden", "good_0"), np.array([0, 1, 2]), plan(2, 2))
-    check.record(chunk_1, ("good_1", "bad_residual"), np.array([0, 1, 2]), plan(2, 2))
+    check.record(chunk_0, ("bad_hidden", "good_0"), np.array([0, 1, 2]))
+    check.record(chunk_1, ("good_1", "bad_residual"), np.array([0, 1, 2]))
     for event in events:
         event.ready = True
     assert check.bad_request_ids() == {"bad_hidden", "bad_residual"}
 
 
+@pytest.mark.parametrize("use_pcp_manager", [False, True])
 @pytest.mark.parametrize("pp_is_last", [True, False])
 def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
-    events, pp_is_last
+    events, pp_is_last, use_pcp_manager
 ):
     class OptInConnector:
         needs_kv_save_nan_check = True
@@ -278,7 +261,6 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         num_prompt_logprobs={},
         _run_dp_dummy_chunk=MagicMock(),
         query_start_loc_np=np.zeros(4, dtype=np.int32),
-        _last_sequence_layout_plan=None,
         position_ids=torch.zeros(2, dtype=torch.int32),
         _flush_mamba_state_seed_copies=lambda: None,
         _reset_read_offsets_for_new_requests=lambda *_args: None,
@@ -293,10 +275,15 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         _kv_cache_bundle=None,
         _stage_timing=MagicMock(),
         is_pooling_model=False,
-        pcp_manager=None,
-        sequence_layout_planner=SimpleNamespace(
-            maybe_select_logits_hidden_states=lambda hs, _plan, _idx: hs[:1]
+        pcp_manager=(
+            SimpleNamespace(
+                local_to_request_major_token_indices=np.array([0, 1]),
+                maybe_select_logits_hidden_states=lambda hs: hs[:1],
+            )
+            if use_pcp_manager
+            else None
         ),
+        _logits_at_dp_vocab_rows=lambda _hs, _idx: torch.zeros(1, 8),
         compute_logits_from_hidden_states=lambda _hs: torch.zeros(1, 8),
         _attn_metadata_builder_ctx=SimpleNamespace(
             mamba_state_indices=None, unified_mamba_state_indices=None, seq_lens=None
@@ -317,7 +304,10 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
     def prepare_inputs(_so, start_index, _num_decode, _num_windowed):
         valid = valid_tokens_per_chunk[start_index]
         runner.query_start_loc_np[:2] = [0, valid]
-        runner._last_sequence_layout_plan = plan(2, valid)
+        if runner.pcp_manager is not None:
+            runner.pcp_manager.local_to_request_major_token_indices = np.array(
+                [0, 1 if valid == 2 else -1]
+            )
         empty = torch.empty(0, dtype=torch.int32)
         return (
             None,
@@ -345,6 +335,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         "_sample_tokens_pp_intermediate_stage",
         "sample_tokens",
         "execute_model",
+        "_finalize_hidden_states",
         "_maybe_select_logits_hidden_states",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))

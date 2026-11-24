@@ -33,12 +33,6 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_torchtpu.layers.core.pcp_metadata import PcpMetadata
-from vllm_torchtpu.layers.core.sequence_layout import (
-    DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
-    DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
-    SequenceLayoutDescriptor,
-    SequenceLayoutKind,
-)
 
 
 def attention_block_table_width(
@@ -74,9 +68,7 @@ def attention_block_table_width(
         "pcp_metadata",
     ],
     meta_fields=[
-        "sequence_layout_kind",
-        "sequence_layout_protocol",
-        "sequence_layout_version",
+        "use_pcp_streaming",
     ],
     drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
 )
@@ -132,9 +124,7 @@ class AttentionMetadata:
     mamba_prefill_ckpt_indices: jax.Array | torch.Tensor | None = None
     # PCP manager only (see `runner/pcp/manager.py`); None elsewhere.
     pcp_metadata: PcpMetadata | None = None
-    sequence_layout_kind: str = SequenceLayoutKind.ALL.value
-    sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
-    sequence_layout_version: int = 1
+    use_pcp_streaming: bool = False
 
     query_start_loc_cpu: Any = field(init=False)
     seq_lens_cpu: Any = field(init=False)
@@ -180,9 +170,7 @@ class AttentionMetadataBuilderContext:
     # read-offset scatter can address every group's state block (groups
     # allocate distinct blocks, unlike the compact pool's shared slots).
     unified_mamba_state_indices: list[torch.Tensor] | None = None
-    sequence_layout_descriptor: SequenceLayoutDescriptor = (
-        DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
-    )
+    use_pcp_streaming: bool = False
     # Per-chunk cache of the shared mamba row-offset plan, keyed by
     # (target_block_size, target_num_blocks) -> (state_index, ckpt_index,
     # ckpt_in_row). Valid only because every context is constructed fresh
@@ -679,9 +667,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             pcp_metadata=pcp_metadata,
             mamba_prefill_ckpt_offsets=mamba_prefill_ckpt_offsets,
             mamba_prefill_ckpt_indices=mamba_prefill_ckpt_indices,
-            sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
-            sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
-            sequence_layout_version=ctx.sequence_layout_descriptor.version,
+            use_pcp_streaming=ctx.use_pcp_streaming,
         )
 
 

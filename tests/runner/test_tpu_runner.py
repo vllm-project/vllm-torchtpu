@@ -903,7 +903,6 @@ def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
         speculative_config=(
             None if spec_k is None else SimpleNamespace(num_speculative_tokens=spec_k)
         ),
-        _last_sequence_layout_plan=None,
         pcp_manager=None,
         input_batch=SimpleNamespace(req_ids=req_ids),
     )
@@ -2830,9 +2829,6 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
     monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **kw: None)
     for name in ("set_forward_context", "set_vllm_model_wrapper_context"):
         monkeypatch.setattr(tpu_runner, name, lambda *a, **kw: contextlib.nullcontext())
-    from vllm_torchtpu.layers.core.sequence_layout import (
-        DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
-    )
 
     runner = SimpleNamespace(
         device=torch.device("cpu"),
@@ -2866,11 +2862,6 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
         _registered_h2d_sources=set(),
         _token_padding_state=None,
         pcp_manager=None,
-        sequence_layout_planner=SimpleNamespace(
-            prepare_dummy=lambda **kw: SimpleNamespace(
-                descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
-            )
-        ),
         maybe_select_dummy_loras=lambda *a, **kw: contextlib.nullcontext(),
         _dp_num_tokens_across_dp=lambda n: None,
         forward_model=forward_model,

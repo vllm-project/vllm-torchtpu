@@ -111,6 +111,14 @@ def test_local_reqs_fit_the_scaled_bucket(pcp_size, num_prefills):
         assert plan.local_num_split_reqs == 2 * num_prefills
         assert plan.rep_num_reqs == MAX_NUM_SEQS - num_prefills
         assert len(plan.host_metadata["ws_page_offset"]) == target
+        local_to_req = plan.local_to_request_major_token_indices
+        assert local_to_req is not None
+        assert local_to_req.shape == (plan.local_padded_num_tokens,)
+        valid_mask = local_to_req >= 0
+        assert int(np.count_nonzero(valid_mask)) == plan.local_num_tokens
+        for local_idx in np.flatnonzero(valid_mask):
+            req_major_idx = int(local_to_req[local_idx])
+            assert plan.local_index_for_request_major_token(req_major_idx) == local_idx
 
 
 @pytest.mark.parametrize("pcp_size", [2, 4])

@@ -1331,11 +1331,12 @@ class Eagle3Proposer:
                     hidden, positions, last_hidden, safe_gather_indices
                 )
             )
-            last_hidden_carry = (
-                chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
-                    last_hidden_carry, owner_mask
+            if chunk.pcp_draft_layout is not None:
+                last_hidden_carry = (
+                    chunk.pcp_draft_layout.aggregate_request_aligned_tensor(
+                        last_hidden_carry, owner_mask
+                    )
                 )
-            )
             hidden_carry_per_chunk.append(hidden_carry)
             positions_carry_per_chunk.append(positions_carry)
             with set_model_tag("eagle_head"):
@@ -1753,13 +1754,14 @@ class Eagle3Proposer:
             else:
                 gather_indices = last_token_indices
 
-        draft_input_ids, gather_indices = (
-            chunk.sequence_layout_plan.localize_token_tensor_and_gather_indices(
-                draft_input_ids,
-                gather_indices,
-                num_valid_gathers=num_reqs,
+        if chunk.pcp_draft_layout is not None:
+            draft_input_ids, gather_indices = (
+                chunk.pcp_draft_layout.localize_token_tensor_and_gather_indices(
+                    draft_input_ids,
+                    gather_indices,
+                    num_valid_gathers=num_reqs,
+                )
             )
-        )
 
         return (draft_input_ids, chunk.position_ids, gather_indices, num_rejected_out)
 
@@ -2011,7 +2013,7 @@ class Eagle3Proposer:
             # positions so the block-table build uses the zeroed-table branch
             # instead of slicing the real (idle-rank) block table.
             position_ids_override=chunk.attn_ctx.position_ids_override,
-            sequence_layout_descriptor=(chunk.attn_ctx.sequence_layout_descriptor),
+            use_pcp_streaming=chunk.attn_ctx.use_pcp_streaming,
         )
         try:
             slot_mappings = runner.empty_slot_mappings

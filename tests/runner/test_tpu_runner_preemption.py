@@ -46,7 +46,6 @@ def test_async_results_do_not_overwrite_recomputed_request(transition, num_draft
         num_tokens_no_spec=np.array([16 + stride, 16 + stride]),
         token_ids_cpu=np.zeros((2, 256), dtype=np.int32),
     )
-    runner._last_sequence_layout_plan = None
     runner.pcp_manager = None
     runner.speculative_config = (
         SimpleNamespace(num_speculative_tokens=num_drafts) if num_drafts else None

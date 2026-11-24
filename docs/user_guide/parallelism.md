@@ -122,12 +122,12 @@ vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
   --max-model-len 65536
 ```
 
-### PCP with PCP manager
+### Sparse MLA (`PCP` and `DCP`)
 
-Set `USE_TPU_PCP_MANAGER=1` to combine `PCP` and `DCP` on sparse MLA models. Each prefill in a step is split over the `PCP` ranks: rank `r` holds chunks `r` and `2P-1-r` of the prompt to balance causal attention. For attention, every rank gathers those prefills' KV from the `DCP`-sharded cache into a workspace. Decode requests are replicated on every `PCP` rank and run the regular `DCP` decode path.
+On sparse MLA models, `--prefill-context-parallel-size > 1` selects `HeadTailPcpShardingPlan` to combine `PCP` and `DCP`. Each prefill in a step is split over the `PCP` ranks: rank `r` holds chunks `r` and `2P-1-r` of the prompt to balance causal attention. For attention, every rank gathers those prefills' KV from the `DCP`-sharded cache into a workspace. Decode requests are replicated on every `PCP` rank and run the regular `DCP` decode path.
 
 ```bash
-USE_TPU_PCP_MANAGER=1 vllm serve zai-org/GLM-5.2-FP8 \
+vllm serve zai-org/GLM-5.2-FP8 \
   --tensor-parallel-size 2 \
   --prefill-context-parallel-size 4 \
   --decode-context-parallel-size 8 \

@@ -102,9 +102,6 @@ from vllm_torchtpu.layers.core.attention_interface import (
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
 from vllm_torchtpu.layers.core.quantization import quantize_kv
-from vllm_torchtpu.layers.core.sequence_layout import (
-    is_pcp_streaming_attention_metadata,
-)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
@@ -1649,7 +1646,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 output.copy_(outputs)
             return outputs
 
-        use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
+        use_pcp_streaming = bool(getattr(attn_metadata, "use_pcp_streaming", False))
         pcp_configured = (
             parallel_config is not None
             and parallel_config.prefill_context_parallel_size > 1
@@ -1987,7 +1984,14 @@ class VllmTPUDeepseekV32IndexerBackend(DeepseekV32IndexerBackend):
         cache_dtype_str: str | torch.dtype = "auto",
     ) -> tuple[int, ...]:
         del num_kv_heads, cache_dtype_str
-        kv_layout = indexer_kv_layout(block_size)
+        parallel_config = getattr(
+            get_current_vllm_config_or_none(), "parallel_config", None
+        )
+        pcp_enabled: bool | None = None
+        if parallel_config is not None:
+            pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+            pcp_enabled = isinstance(pcp_size, int) and pcp_size > 1
+        kv_layout = indexer_kv_layout(block_size, pcp_enabled=pcp_enabled)
         return _get_indexer_kv_cache_shape(
             total_num_pages=num_blocks,
             page_size=block_size,
@@ -2100,7 +2104,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 self.dcp_size,
             )
         pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
-        self.pcp_kv_gather = envs.USE_TPU_PCP_MANAGER and self.dcp_size > 1
+        self.pcp_kv_gather = (
+            isinstance(pcp_size, int) and pcp_size > 1 and self.dcp_size > 1
+        )
         self.pcp_size = pcp_size if self.pcp_kv_gather else 1
         if self.dcp_size > 1:
             if self.dcp_interleave_size % kv_cache_utils.WORD_BYTES:

@@ -19,9 +19,15 @@ from vllm_torchtpu.runner.pcp.manager import (
     validate_pcp_manager_config,
     validate_pcp_manager_layers,
 )
+from vllm_torchtpu.runner.pcp.sharding_plan import (
+    PcpDraftLayout,
+    ensure_host_token_buffer_capacity,
+)
 
 __all__ = [
+    "PcpDraftLayout",
     "PcpManager",
+    "ensure_host_token_buffer_capacity",
     "mla_kv_page_size",
     "validate_pcp_manager_config",
     "validate_pcp_manager_layers",

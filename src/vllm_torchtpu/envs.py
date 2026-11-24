@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
-    USE_TPU_PCP_MANAGER: bool = False
     TPU_PCP_KV_WORKSPACE_TOKENS: int = 1048576
     TPU_PCP_KV_CHUNK_TOKENS: int = 65536
     JAX_PLATFORMS: str = ""
@@ -483,8 +482,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
-    # Run PCP through `runner/pcp/manager.py`.
-    "USE_TPU_PCP_MANAGER": env_bool("USE_TPU_PCP_MANAGER", default=False),
     # PCP manager: max context tokens one forward's prefills may gather.
     "TPU_PCP_KV_WORKSPACE_TOKENS": env_int("TPU_PCP_KV_WORKSPACE_TOKENS", 1048576),
     # PCP manager: context tokens gathered per all-gather chunk.
@@ -1259,7 +1256,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Dequantize and pad MXFP4 expert weights on the TPU, where they already
     # sit after loading, instead of round-tripping them through host memory.
     "VLLM_TPU_MXFP4_DEVICE_DEQUANT": env_bool("VLLM_TPU_MXFP4_DEVICE_DEQUANT", True),
-    # Log the PCP sequence layout window on every step.
+    # Log the interleaved PCP token layout window on every step.
     "VLLM_TPU_DEBUG_PCP_LAYOUT": env_bool("VLLM_TPU_DEBUG_PCP_LAYOUT"),
     # Added to every worker's local rank when it binds to a physical chip.
     # worker/tpu_rank_binding.py reads it from the env mapping it is given.

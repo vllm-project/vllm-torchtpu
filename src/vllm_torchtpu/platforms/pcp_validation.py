@@ -15,7 +15,6 @@
 from dataclasses import dataclass
 from typing import Any
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import (
     QWEN_GDN_ARCHITECTURES,
     unified_kv_layout_enabled_for_architecture,
@@ -110,49 +109,33 @@ class PcpStaticSupportValidator:
         kv_cache_layout: str,
     ) -> PcpStaticConfig:
         config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
-        if envs.USE_TPU_PCP_MANAGER:
-            if vllm_config.model_config is None:
-                return config
-            from vllm_torchtpu.runner.pcp.manager import (
-                PcpShardingPlanName,
-                validate_pcp_manager_config,
-            )
-
-            plan = validate_pcp_manager_config(vllm_config)
-            if (
-                plan is PcpShardingPlanName.INTERLEAVED
-                and kv_cache_layout == "HND"
-                and config.interleave_size % 128 != 0
-            ):
-                raise ValueError(
-                    "PCP with HND KV cache layout requires "
-                    "cp_kv_cache_interleave_size to be a multiple of 128, "
-                    f"got {config.interleave_size}."
-                )
-            return config
         if not config.enabled:
             return config
-        if kv_cache_layout == "HND" and config.interleave_size % 128 != 0:
+
+        if vllm_config.model_config is not None:
+            from vllm_torchtpu.runner.pcp.manager import validate_pcp_manager_config
+
+            validate_pcp_manager_config(vllm_config, kv_cache_layout=kv_cache_layout)
+            return config
+
+        if kv_cache_layout == "HND" and (
+            config.interleave_size <= 0 or config.interleave_size % 128 != 0
+        ):
             raise ValueError(
                 "PCP with HND KV cache layout requires "
                 "cp_kv_cache_interleave_size to be a multiple of 128, "
                 f"got {config.interleave_size}."
             )
-        if vllm_config.model_config is not None:
-            validate_pooled_qwen_gdn_pcp_interleave(
-                vllm_config.model_config.architecture,
-                config.interleave_size,
-            )
+        from vllm_torchtpu.runner.pcp.interleaved_sharding_plan import (
+            validate_interleaved_pcp_params,
+        )
 
-        if config.dcp_size > 1:
-            raise NotImplementedError("PCP runner path does not support DCP yet.")
+        validate_interleaved_pcp_params(
+            config.pcp_size, config.dcp_size, config.interleave_size
+        )
         if config.is_moe and not config.expert_parallel:
             raise NotImplementedError(
-                "PCP on an MoE model requires --enable-expert-parallel: "
-                f"--prefill-context-parallel-size={config.pcp_size} without "
-                "it would shard MoE experts across the PCP ranks, which the "
-                "TPU MoE kernels do not implement. Add the flag, or drop "
-                "--prefill-context-parallel-size."
+                "PCP on an MoE model requires --enable-expert-parallel."
             )
         if config.speculative_enabled:
             if config.speculative_method != "mtp":
@@ -163,8 +146,4 @@ class PcpStaticSupportValidator:
                 raise NotImplementedError(
                     "PCP MTP currently requires num_speculative_tokens=1."
                 )
-        if config.interleave_size <= 0:
-            raise ValueError(
-                "PCP runner path requires cp_kv_cache_interleave_size > 0."
-            )
         return config

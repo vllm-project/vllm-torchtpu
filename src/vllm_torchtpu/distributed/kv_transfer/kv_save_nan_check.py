@@ -26,8 +26,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.sequence import IntermediateTensors
 
-from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutPlan
-
 
 @dataclass
 class _Chunk:
@@ -78,21 +76,21 @@ class KVSaveNanCheck:
         hidden_states: torch.Tensor | IntermediateTensors,
         req_ids: tuple[str, ...],
         query_start_loc: np.ndarray,
-        plan: SequenceLayoutPlan,
+        local_to_request_major_token_indices: np.ndarray | None = None,
     ) -> None:
         flags, hidden_shape = _token_nan_flags(hidden_states)
         flags_cpu = flags.to("cpu", non_blocking=True)
         ready_event = TpuEvent()
         ready_event.record()
 
-        token_indices = plan._packed_to_request_major_token_indices
-        if token_indices is None:
-            token_indices = np.arange(plan.global_padded_num_tokens)
-        token_indices = token_indices[plan.token_slice]
-        assert len(token_indices) == hidden_shape[0], (
-            "NaN check token mapping must cover the rank-local hidden states: "
-            f"mapping={len(token_indices)}, hidden_states={hidden_shape}"
-        )
+        if local_to_request_major_token_indices is None:
+            token_indices = np.arange(hidden_shape[0])
+        else:
+            token_indices = local_to_request_major_token_indices
+            assert len(token_indices) == hidden_shape[0], (
+                "NaN check token mapping must cover the rank-local hidden states: "
+                f"mapping={len(token_indices)}, hidden_states={hidden_shape}"
+            )
         request_indices = np.searchsorted(
             query_start_loc[1:], token_indices, side="right"
         )
