@@ -1423,8 +1423,19 @@ def attend_and_merge(
     req = jnp.searchsorted(cu_d[1:], p, side="right", method="compare_all")
     req = jnp.minimum(req, max_num_seqs - 1)
     src_row = jnp.where(p < cu_d[-1], cu_q_lens[req] + p - cu_d[req], 0)
+    num_decode = cu_d[-1]
+    # The runner orders decodes ahead of prefills: the decode rows are then
+    # the step's first rows.
+    prefix = jnp.all((p >= num_decode) | (src_row == p))
+    # Their queries by a slice when they are: a gather of `rows` rows of q
+    # cost ~16 us per layer (c64 mixed twin j-c5ebe0af). Rows past the
+    # decodes' (attended, then dropped) differ. The cond takes the rope's
+    # lane-dense rows: a [T, Hl, D] operand cost a relayout of all of q.
+    q_rows = jax.lax.cond(
+        prefix, lambda x: x[:rows], lambda x: x[src_row], q.reshape(num_tokens, -1)
+    ).reshape(rows, *q.shape[1:])
     dcp_out = _dcp_attend(
-        msa_fp4.rotate_queries(q[src_row]),
+        msa_fp4.rotate_queries(q_rows),
         kv_cache,
         scale_cache,
         candidates[src_row],
@@ -1451,11 +1462,9 @@ def attend_and_merge(
         **common,
     )
     dcp_out = dcp_out.reshape(rows, -1)
-    num_decode = cu_d[-1]
 
     def decode_prefix(out):
-        # The runner orders decodes ahead of prefills: the decode rows are
-        # then the step's first rows, one in-place update of `rows` rows.
+        # One in-place update of `rows` rows.
         head = jnp.where((p < num_decode)[:, None], dcp_out, out[:rows])
         return jax.lax.dynamic_update_slice_in_dim(out, head, 0, 0)
 
@@ -1465,7 +1474,6 @@ def attend_and_merge(
         dest = jnp.where(p < num_decode, src_row, num_tokens)
         return out.at[dest].set(dcp_out, mode="drop")
 
-    prefix = jnp.all((p >= num_decode) | (src_row == p))
     # The barrier keeps the consumer's ops out of the branches: XLA sank the
     # output projection's f32 convert of the whole output into them (a 32 MB
     # f32 copy, ~20 us per layer at c64's 8K-token steps, twin j-a202588d).
