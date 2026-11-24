@@ -156,3 +156,16 @@ def test_a_pipeline_stage_must_be_formed_before_it_is_read(monkeypatch):
 def test_stage_size_is_the_engines_workers_per_stage(world_size, pp, expected):
     config = SimpleNamespace(world_size=world_size, pipeline_parallel_size=pp)
     assert pipeline_stage.stage_size(config) == expected
+
+
+def test_engine_rank_orders_workers_stage_then_pcp_then_tp():
+    seen = [
+        pipeline_stage.engine_rank(
+            pp_rank=s, pcp_rank=p, pcp_size=2, tp_rank=t, tp_size=4
+        )
+        for s in range(3)
+        for p in range(2)
+        for t in range(4)
+    ]
+    assert seen == list(range(24))
+    assert pipeline_stage.engine_rank(pcp_rank=3, tp_rank=1, tp_size=2) == 7

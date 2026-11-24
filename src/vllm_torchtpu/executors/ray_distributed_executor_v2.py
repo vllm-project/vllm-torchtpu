@@ -38,6 +38,7 @@ from vllm.v1.executor.ray_utils import (
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.distributed.pipeline_stage import stage_size
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.executors.kv_block_override import (
     adopt_worker_num_gpu_blocks_override,
@@ -692,7 +693,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
             # One bundle per pipeline stage, sized to the stage's devices.
             # PACK fills a host before moving to the next, so consecutive
             # stages share a host whenever the stage size allows it.
-            num_devices_per_pp_rank = self.parallel_config.world_size // pp_size
+            num_devices_per_pp_rank = stage_size(self.parallel_config)
             placement_group_specs = [
                 {device_str: num_devices_per_pp_rank} for _ in range(pp_size)
             ]

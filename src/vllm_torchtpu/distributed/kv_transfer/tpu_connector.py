@@ -105,7 +105,7 @@ from vllm_torchtpu.distributed.kv_transfer.zmq_shm_base import (
     _CoordRecvEntry,
     _CoordSendEntry,
 )
-from vllm_torchtpu.distributed.pipeline_stage import stage_size
+from vllm_torchtpu.distributed.pipeline_stage import engine_rank, stage_size
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
@@ -3676,8 +3676,17 @@ class TPURaidenConnectorWorker:
                 return stage
             # A pipeline producer is one unit per engine worker, stage-major:
             # inside a stage, the index its kernels own tokens and GDN heads by.
-            position = int(get_pcp_rank()) * int(self.tp_size) + int(self.tp_rank)
-            return stage * workers + position
+            pcp_size = int(
+                self.vllm_config.parallel_config.prefill_context_parallel_size or 1
+            )
+            tp_size = int(self.tp_size)
+            return engine_rank(
+                pp_rank=stage,
+                pcp_rank=int(get_pcp_rank()),
+                pcp_size=pcp_size,
+                tp_rank=int(self.tp_rank) if tp_size > 1 else 0,
+                tp_size=tp_size,
+            )
         if not self.is_producer:
             return int(self.tp_rank)
         if _uses_tp_stage3_source(self.vllm_config):
@@ -3695,13 +3704,16 @@ class TPURaidenConnectorWorker:
         # enabled device assignment based on PCP rank.
         from vllm_torchtpu.distributed.pcp import get_pcp_rank
 
-        if self.tp_size == 1:
-            return int(get_pcp_rank())
         # A work-unit identity enumerates workers, not GDN head shards. FA
         # lowering consumes PCP and TP coordinates separately; GDN uses the
         # transposed (TP, PCP) head order. Include both axes here so TP peers
         # cannot overwrite each other's source registration.
-        return int(get_pcp_rank()) * self.tp_size + self.tp_rank
+        tp_size = int(self.tp_size)
+        return engine_rank(
+            pcp_rank=int(get_pcp_rank()),
+            tp_rank=int(self.tp_rank) if tp_size > 1 else 0,
+            tp_size=tp_size,
+        )
 
     def _raiden_engine_id(self) -> str:
         env_id = str(tpu_envs.TPU_RAIDEN_ENGINE_ID).strip()

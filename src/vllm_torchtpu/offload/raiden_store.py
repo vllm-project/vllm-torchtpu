@@ -114,6 +114,7 @@ from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import unified_block_major_enabled
+from vllm_torchtpu.distributed.pipeline_stage import engine_rank
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.block_major_layout import (
     BlockMajorContract,
@@ -2343,10 +2344,12 @@ class StorageRankCoords:
         with expert parallelism the torch.distributed world spans every
         replica, making it `dp_rank * world_size + k`.
         """
-        return (
-            self.pp_rank * (self.pcp_size * self.tp_size)
-            + self.pcp_rank * self.tp_size
-            + self.tp_rank
+        return engine_rank(
+            pp_rank=self.pp_rank,
+            pcp_rank=self.pcp_rank,
+            pcp_size=self.pcp_size,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
     @property

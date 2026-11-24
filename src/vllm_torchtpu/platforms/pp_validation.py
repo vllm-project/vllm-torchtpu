@@ -140,11 +140,19 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         if name in os.environ:
             raise ValueError(f"{name} has been removed; {remedy}")
 
+    from vllm_torchtpu import envs
+
     unsupported = None
     remedy = ""
     if (parallel_config.decode_context_parallel_size or 1) > 1:
         unsupported = "decode context parallelism"
         remedy = " Pass --decode-context-parallel-size 1."
+    elif envs.MOE_FUSED_EP_SORTED_GATHER:
+        # ep_sorted_gather_group() forms its process group lazily over one
+        # stage's EP ranks, while torch.distributed.new_group() requires every
+        # rank in the world to pass the same rank list in the same order.
+        unsupported = "MOE_FUSED_EP_SORTED_GATHER"
+        remedy = " Unset MOE_FUSED_EP_SORTED_GATHER or set it to 0."
     elif _stage_devices(parallel_config) > 1 and not _torch_tpu_builds_stage_meshes():
         # A stage of several devices runs its collectives and builds its
         # meshes over process groups smaller than the world, and launches
@@ -215,7 +223,6 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         raise NotImplementedError(
             f"Pipeline parallelism on TPU does not support {unsupported} yet.{remedy}"
         )
-    from vllm_torchtpu import envs
 
     if envs.TPU_PP_HANDOFF_DEPTH < 1:
         # A stage queues at most this many forwards for the next one; with

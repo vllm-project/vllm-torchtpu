@@ -72,6 +72,18 @@ def stage_size(parallel_config: Any) -> int:
     return parallel_config.world_size // parallel_config.pipeline_parallel_size
 
 
+def engine_rank(
+    *,
+    pp_rank: int = 0,
+    pcp_rank: int = 0,
+    pcp_size: int = 1,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+) -> int:
+    """This worker's index among one engine's PP x PCP x TP workers."""
+    return pp_rank * (pcp_size * tp_size) + pcp_rank * tp_size + tp_rank
+
+
 def _stage_ranks(group_ranks: list[list[int]], stages: int) -> list[list[int]]:
     """The ranks of each stage, from the pipeline group's columns."""
     if not group_ranks or any(len(column) != stages for column in group_ranks):

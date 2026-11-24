@@ -204,6 +204,12 @@ def test_rejects_decode_context_parallel_stages(stage_meshes):
         validate_pipeline_parallel_config(_config(pp=2, tp=4, dcp=4))
 
 
+def test_rejects_moe_fused_ep_sorted_gather(monkeypatch):
+    monkeypatch.setenv("MOE_FUSED_EP_SORTED_GATHER", "1")
+    with pytest.raises(NotImplementedError, match="MOE_FUSED_EP_SORTED_GATHER"):
+        validate_pipeline_parallel_config(_config(pp=2))
+
+
 def test_rejects_tensor_parallel_stages_on_world_size_meshes(monkeypatch):
     monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: False)
     with pytest.raises(NotImplementedError, match="torch_tpu 0.3.0 or later"):
