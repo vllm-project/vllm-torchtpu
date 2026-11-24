@@ -194,6 +194,9 @@ class RhsRef(ABC):
     @abstractmethod
     def get_bias(self) -> jax.Array: ...
 
+    @abstractmethod
+    def get_global_scale(self) -> jax.Array: ...
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -211,12 +214,13 @@ class WeightsRef(RhsRef):
     def get_scale(self, replicate_size: int | None = None) -> jax.Array:
         assert self.scale is not None
         if self.global_scale is not None:
-            # Combine on the dense [blocks, tn] block, then add the sublane dim.
+            # E4M3 block scales only: the global scale multiplies the
+            # accumulator. Convert the dense [blocks, tn] block first.
             if self.scale.dtype == jnp.uint8:
                 scale = lax.bitcast_convert_type(self.scale[...], jnp.float8_e4m3fn)
             else:
                 scale = self.scale[:, 0, :]
-            scale = (scale.astype(jnp.float32) * self.global_scale[...])[:, None, :]
+            scale = scale.astype(jnp.float32)[:, None, :]
             if replicate_size is not None:
                 scale = jnp.broadcast_to(
                     scale, (scale.shape[0], replicate_size, scale.shape[-1])
@@ -230,6 +234,10 @@ class WeightsRef(RhsRef):
     def get_bias(self) -> jax.Array:
         assert self.bias is not None
         return self.bias[...]
+
+    def get_global_scale(self) -> jax.Array:
+        assert self.global_scale is not None
+        return self.global_scale[...]
 
 
 @jax.tree_util.register_dataclass
@@ -254,6 +262,11 @@ class FusedWeightsRef(RhsRef):
         b_gate = self.gate.get_bias()
         b_up = self.up.get_bias()
         return interleave_lane(b_gate, b_up)
+
+    def get_global_scale(self) -> jax.Array:
+        g_gate = self.gate.get_global_scale()
+        g_up = self.up.get_global_scale()
+        return interleave_lane(g_gate, g_up)
 
 
 @jax.tree_util.register_dataclass
@@ -507,20 +520,15 @@ def inner_kernel(
         rhs_tile_n = tiled_rhs.shape[1]
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
         if cfgs.rhs_cfgs.should_dequantize_before_matmul:
-            dequant_dtype = (
-                jnp.float32 if cfgs.rhs_cfgs.has_global_scale else cfgs.lhs_cfgs.dtype
-            )
             tiled_rhs_scale = tiled_rhs_ref.get_scale(replicate_size=rhs_qbs).astype(
-                dequant_dtype
+                cfgs.lhs_cfgs.dtype
             )
             num_blocks = cfgs.num_quant_blocks_per_tile_k
-            tiled_rhs_dequant = tiled_rhs.astype(dequant_dtype).reshape(
+            tiled_rhs_dequant = tiled_rhs.astype(cfgs.lhs_cfgs.dtype).reshape(
                 num_blocks, rhs_qbs, rhs_tile_n
             )
             tiled_rhs_dequant = tiled_rhs_dequant * tiled_rhs_scale
-            tiled_rhs = tiled_rhs_dequant.astype(cfgs.lhs_cfgs.dtype).reshape(
-                cfgs.tiles.tile_k, rhs_tile_n
-            )
+            tiled_rhs = tiled_rhs_dequant.reshape(cfgs.tiles.tile_k, rhs_tile_n)
             rhs_qbs = cfgs.tiles.tile_k
 
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
@@ -629,6 +637,9 @@ def inner_kernel(
         acc_m = acc.shape[0]
 
         if is_last_k_step:
+            if cfgs.rhs_cfgs.has_global_scale:
+                # A per-output-channel scale commutes with the K reduction.
+                acc = acc.astype(jnp.float32) * tiled_rhs_ref.get_global_scale()
             if cfgs.rhs_cfgs.has_bias:
                 tiled_rhs_bias = tiled_rhs_ref.get_bias()
                 acc += tiled_rhs_bias.astype(acc.dtype)
@@ -1059,10 +1070,6 @@ def calculate_tiling(
         rhs_vmem = fuse_act_factor * (
             3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_per_channel_vmem
         )
-        if rhs_cfgs.has_global_scale:
-            # FP32 dequantization holds an FP32 [tk, tn] weight tile and an
-            # FP32 [tk, tn] broadcast of the combined block scales.
-            rhs_vmem += fuse_act_factor * 2 * tk * tn * 4
 
         # 3. Accumulator
         acc_cols = fuse_act_factor * tn
@@ -1426,9 +1433,9 @@ def gmm_v2(
             Packed along k-axis
         rhs_global_scale: Optional FP32 [size_group, 1, out_size] multiplier
             for E4M3 block scales. With this input, block scales stay in FP8
-            in HBM, are combined with it in FP32 inside each kernel tile, and
-            the tile is dequantized in FP32 before one rounding to the
-            activation dtype.
+            in HBM, each tile is dequantized with the block scales alone
+            (E2M1 x E4M3 products are exact in BF16), and the global scale
+            multiplies the FP32 accumulator once per output tile.
 
     Returns:
         Output of shape [size_m, size_n].

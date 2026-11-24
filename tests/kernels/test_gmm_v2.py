@@ -590,13 +590,18 @@ def make_global_scale(key, num_groups: int, size_n: int) -> jax.Array:
 
 
 def dequantize_nvfp4_kmajor(
-    packed: jax.Array, block_scale: jax.Array, dtype: jnp.dtype
+    packed: jax.Array,
+    block_scale: jax.Array,
+    global_scale: jax.Array,
+    dtype: jnp.dtype,
 ) -> jax.Array:
-    """Row 2j is the low nibble of byte row j; one rounding of the FP32 product."""
+    """Row 2j is the low nibble of byte row j. The block-scaled weights are exact
+    in FP32, and the global scale multiplies them before the one rounding."""
     lut = jnp.asarray(_E2M1_VALUES, dtype=jnp.float32)
     values = jnp.stack((lut[packed & 15], lut[packed >> 4]), axis=2)
     values = values.reshape(packed.shape[0], -1, packed.shape[-1])
-    return (values * jnp.repeat(block_scale, 16, axis=1)).astype(dtype)
+    weights = values * jnp.repeat(block_scale.astype(jnp.float32), 16, axis=1)
+    return (weights * global_scale).astype(dtype)
 
 
 def read_back_nvfp4_rhs(packed, rhs_scale, **kwargs) -> jax.Array:
@@ -637,9 +642,7 @@ def test_gmm_v2_nvfp4_global_scale_decodes_every_weight(compact_scale, tile_info
     num_groups, size_k, size_n = 4, 1024, 512
     packed, scale = make_nvfp4_rhs(jax.random.key(0), num_groups, size_k, size_n)
     global_scale = make_global_scale(jax.random.key(1), num_groups, size_n)
-    expected = dequantize_nvfp4_kmajor(
-        packed, scale.astype(jnp.float32) * global_scale, jnp.bfloat16
-    )
+    expected = dequantize_nvfp4_kmajor(packed, scale, global_scale, jnp.bfloat16)
     if compact_scale:
         rhs_scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
     else:
@@ -664,12 +667,11 @@ def test_gmm_v2_nvfp4_global_scale_matches_dequantized_reference(compact_scale):
     rhs_key, lhs_key = jax.random.split(jax.random.key(2))
     packed, scale = make_nvfp4_rhs(rhs_key, num_groups, size_k, size_n)
     global_scale = make_global_scale(jax.random.key(3), num_groups, size_n)
-    rhs = dequantize_nvfp4_kmajor(
-        packed, scale.astype(jnp.float32) * global_scale, jnp.bfloat16
-    )
+    rhs = dequantize_nvfp4_kmajor(packed, scale, global_scale, jnp.float32)
     lhs = jax.random.uniform(lhs_key, (batch_size, size_k), jnp.bfloat16, -1, 1)
     group_sizes = get_group_sizes(batch_size, num_groups)
-    expected = reference_gmm(lhs, rhs, group_sizes)
+    with jax.default_matmul_precision("highest"):
+        expected = reference_gmm(lhs, rhs, group_sizes)
     if compact_scale:
         rhs_scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
     else:
@@ -707,9 +709,7 @@ def test_gmm_v2_compact_scales_with_k_off_512(size_k, tile_info):
     num_groups, size_n = 2, 256
     packed, scale = make_nvfp4_rhs(jax.random.key(11), num_groups, size_k, size_n)
     global_scale = make_global_scale(jax.random.key(12), num_groups, size_n)
-    expected = dequantize_nvfp4_kmajor(
-        packed, scale.astype(jnp.float32) * global_scale, jnp.bfloat16
-    )
+    expected = dequantize_nvfp4_kmajor(packed, scale, global_scale, jnp.bfloat16)
 
     actual = read_back_nvfp4_rhs(
         packed,
@@ -731,14 +731,12 @@ def test_gmm_v2_nvfp4_global_scale_fused_silu_matches_reference(compact_scale):
     rhs_key, lhs_key = jax.random.split(jax.random.key(13))
     packed, scale = make_nvfp4_rhs(rhs_key, num_groups, size_k, size_n)
     global_scale = make_global_scale(jax.random.key(14), num_groups, size_n)
-    rhs = dequantize_nvfp4_kmajor(
-        packed, scale.astype(jnp.float32) * global_scale, jnp.bfloat16
-    )
+    rhs = dequantize_nvfp4_kmajor(packed, scale, global_scale, jnp.float32)
     lhs = jax.random.uniform(lhs_key, (batch_size, size_k), jnp.bfloat16, -1, 1)
     group_sizes = get_group_sizes(batch_size, num_groups)
-    gate, up = jnp.split(
-        reference_gmm(lhs.astype(jnp.float32), rhs, group_sizes), 2, axis=-1
-    )
+    with jax.default_matmul_precision("highest"):
+        reference = reference_gmm(lhs.astype(jnp.float32), rhs, group_sizes)
+    gate, up = jnp.split(reference, 2, axis=-1)
     expected = apply_act_fn(interleave_lane(gate, up), "silu").astype(jnp.bfloat16)
     if compact_scale:
         rhs_scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
@@ -850,8 +848,8 @@ def test_calculate_tiling_aligns_compact_scale_tiles(
 def test_calculate_tiling_splits_k_when_tile_n_stops_at_its_limit(monkeypatch):
     """With N=512, tile_n starts at its limit (twice the MXU columns), so only
     a smaller tile_k can bring the estimate under the VMEM limit."""
-    tiles = _compact_tiling(monkeypatch, 128, 16384, 512, vmem_mib=58)
-    assert tiles.tile_n == 512 and tiles.tile_k < 16384, tiles
+    tiles = _compact_tiling(monkeypatch, 128, 65536, 512, vmem_mib=58)
+    assert tiles.tile_n == 512 and tiles.tile_k < 65536, tiles
 
 
 def test_gmm_v2_rejects_compact_scales_without_global_scale(monkeypatch):
