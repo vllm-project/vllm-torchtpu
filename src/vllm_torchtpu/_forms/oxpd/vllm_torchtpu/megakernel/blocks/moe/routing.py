@@ -23,7 +23,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from .context import MoEEmit
-from .dedup import dedup_ecopy, dedup_local, dedup_vec
+from .dedup import dedup_ecopy, dedup_local, dedup_local_vec, dedup_vec
 from .ring import fetch_e, fetch_loop
 from .rowbucket import rb_tables
 from .topk import route_topk
@@ -69,7 +69,14 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
         if mp.RB:
             rb_tables(m)
     with sc("route_dma", 2):
-        cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
+        if mp.dedup_vec:  # hit list + count only (`dedup_rows_vec`)
+            cp = pltpu.make_async_copy(
+                scr["hitv"].at[pl.ds(0, 8)],
+                scr["hits"].at[pl.ds(0, 8)],
+                scr["misc_sem"],
+            )
+        else:
+            cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
         cp.start()
         if mp.RB:
             cp_rb = pltpu.make_async_copy(scr["rbcv"], scr["rbcs"], scr["rbc_sem"])
@@ -83,7 +90,9 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     n_cp: Any = jnp.int32(0)
     if VEC:
         n_tot, n_hit, n_cp = dedup_vec(m, NCP, MROW, nb_picks)
-    if ECOPY:
+    if mp.dedup_vec:
+        n_hit = dedup_local_vec(m)
+    elif ECOPY:
         n_hit = dedup_ecopy(m, VEC, slot_ec, stamp, n_tot, n_hit, n_cp)
     else:
         n_hit = dedup_local(m, stamp)

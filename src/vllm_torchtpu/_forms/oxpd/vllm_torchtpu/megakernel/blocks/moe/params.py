@@ -24,6 +24,8 @@ from ...ops import rup
 
 # Row-bucketed experts (`row_bucket`): rows of the small block (one bf16 sublane tile).
 RB_SMALL = 16
+# Sentinel first-pick position of an expert no row picked (`dedup_vec`); exact in f32.
+DEDUP_BIG = 1 << 20
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,10 @@ class MoEParams:
     rb_chunk: int
     eps: float
     zero_centered_norm: bool
+    # Resolved `MoETunables.dedup_vec` (EP `dedup_local` path, ER <= 128).
+    dedup_vec: bool = False
+    skip_pad: bool = False
+    exact_width: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,6 +104,16 @@ class MoETunables:
     # bit for bit, up to the sign of a zero `part` entry on rows the expert does not
     # route (blocks/moe/rowbucket.py).
     row_bucket: bool = False
+    # Vectorized first-appearance dedup of the routed experts (EP without
+    # redundant copies, `dedup_local`): the hit list is built from the top-k ids
+    # with lane compares instead of the per-pick SMEM `seen` loop. Same experts in
+    # the same order, so bitwise (VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC).
+    dedup_vec: bool = False
+    # Skip padded rows (`row >= moe_valid_rows[0]`) in router weights, shared gate,
+    # expert dedup, and row-bucket counts (`VLLM_TPU_MK_MOE_SKIP_PAD`).
+    skip_pad: bool = False
+    # Slice active `MR` rows in `PIPE_EP` when `MR < MB` (`B <= 8`) (`VLLM_TPU_MK_MOE_EXACT_WIDTH`).
+    exact_width: bool = False
 
     # `exact`: moving the field keeps hidden states and caches bit-identical
     # (scheduling only); `approx`: changes or may change the arithmetic.
@@ -112,6 +128,9 @@ class MoETunables:
         "topk_lanes": "approx",  # Batcher odd-even lane top-k
         "moe_unroll": "approx",  # unrolled expert tiles (not exact on TPU, bisect)
         "row_bucket": "approx",  # routed-row blocks (bitwise up to signed zeros)
+        "dedup_vec": "exact",  # same hit list and order as the scalar dedup
+        "skip_pad": "approx",  # masks padded rows >= n_valid (exact on real rows)
+        "exact_width": "approx",  # slices active MR rows when MR < MB (exact on 0:MR; padding rows untouched)
     }
 
 
@@ -188,6 +207,17 @@ def derive_moe_params(
         and nb_picks >= er  # elist/wlist capacity covers ER local slots
     )
     rb_lanes = 128
+    dedup_vec = bool(
+        tt.dedup_vec
+        and not ecopy  # `dedup_local` path (no redundant-expert placement)
+        and not moe_tp  # EP: ER local experts fit the 128 lanes
+        and not dbg.row_mask
+        and not ex.live_rows  # preserve oxpd X-K-LIVE per-row mask in dedup_local
+        and not dbg.hit_trace  # preserve full per-row hitv picks for trace.py
+        and 0 < er <= 128  # (MR = rup(B, 8): the first 8 `hitv` rows always exist)
+        and g.TOPK <= 128
+        and ex.B * g.TOPK < DEDUP_BIG
+    )
     rb = bool(
         tt.row_bucket
         and pipe_ep
@@ -230,4 +260,7 @@ def derive_moe_params(
         rb_chunk=32 if ex.MB % 32 == 0 else 16,
         eps=g.eps,
         zero_centered_norm=bool(getattr(g, "zero_centered_norm", True)),
+        dedup_vec=dedup_vec,
+        skip_pad=bool(tt.skip_pad),
+        exact_width=bool(tt.exact_width),
     )

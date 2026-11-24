@@ -259,20 +259,46 @@ def build_scratch(
     core_ar = any(i is not None for i in p.slot_ar_index)
     if not core_ar:
         AR_R, AR_C = min(AR_R, 8), 128 * max(R, 2)
-    CW = AR_C // R
+        if HIER in (4, 5):
+            HIER = 0
+    if HIER == 4:
+        # E7 2D-torus AR2D: R=8, AR_C%512==0 (part=AR_C/4 multiple of 128), AR_R%64==0.
+        if not (R == 8 and AR_C % 512 == 0 and AR_R % 64 == 0):
+            HIER = 2 if (R == 8 and (AR_C // 2) % 128 == 0) else 0
+    if HIER == 5:
+        # E7 exact-width 2-round RS+AG: uneven 128-lane tile ownership, zero padding.
+        if not (R >= 2 and AR_C % 128 == 0 and AR_C // 128 >= R):
+            HIER = 2 if (R == 8 and (AR_C // 2) % 128 == 0) else 0
+    if HIER == 5:
+        _base, _extra = divmod(AR_C // 128, R)
+        CW = 128 * (_base + int(_extra > 0))
+    else:
+        CW = AR_C // R
     HC2 = AR_C // 2
     N_HIER3 = max(1, R.bit_length() - 1)
     assert not RSAG or CW % 128 == 0
-    assert HIER in (0, 1, 2, 3) and (
-        HIER == 0 or R == 8 or (HIER == 3 and R >= 2 and (R & (R - 1)) == 0)
+    assert HIER in (0, 1, 2, 3, 4, 5) and (
+        HIER in (0, 5)
+        or R == 8
+        or (HIER == 3 and R >= 2 and (R & (R - 1)) == 0)
     )
     assert HIER != 2 or HC2 % 128 == 0
     AR_ROUNDS = (
-        tuple(range(N_HIER3))
+        tuple(range(10))
+        if HIER == 4
+        else (0, 1)
+        if HIER == 5
+        else tuple(range(N_HIER3))
         if HIER == 3
         else ((0, 1, 2) if HIER == 2 else ((0, 1) if (RSAG or HIER == 1) else (0,)))
     )
-    AR_PEERS = 1 if HIER == 3 else (3 if HIER in (1, 2) else max(R - 1, 1))
+    AR_PEERS = (
+        1
+        if HIER in (3, 4)
+        else R
+        if HIER == 5
+        else (3 if HIER in (1, 2) else max(R - 1, 1))
+    )
 
     vshape = {k: (tk[k], kinds[k][1]) for k in kinds}
     vdtype = {k: kinds[k][2] for k in kinds}
@@ -298,7 +324,9 @@ def build_scratch(
             (N_HIER3, 2, AR_R, AR_C)
             if HIER == 3
             else (2, 2, AR_R, HC2)
-            if HIER == 2
+            if HIER in (2, 4)
+            else (2, AR_R, AR_C)
+            if HIER == 5
             else (2, R, AR_R, CW)
             if RSAG
             else (2, AR_R, AR_C),
@@ -307,6 +335,10 @@ def build_scratch(
         "recv": pltpu.VMEM(
             (N_HIER3, 2, 2, AR_R, AR_C)
             if HIER == 3
+            else (2, AR_R, HC2)
+            if HIER == 4
+            else (2, R, AR_R, CW)
+            if HIER == 5
             else (2, 2, AR_R, HC2)
             if HIER == 2
             else (2, 2, AR_R, AR_C)
@@ -327,6 +359,17 @@ def build_scratch(
     if RSAG:
         scratch["ag_send"] = pltpu.VMEM((2, AR_R, CW), BF16)
         scratch["ag_recv"] = pltpu.VMEM((2, R, AR_R, CW), BF16)
+    elif HIER == 5:
+        scratch["ag_send"] = pltpu.VMEM((2, AR_R, CW), BF16)
+        scratch["ag_recv"] = pltpu.VMEM((2, AR_R, AR_C), BF16)
+    elif HIER == 4:
+        part = AR_C // 4
+        rh, rq = AR_R // 2, AR_R // 4
+        scratch["ag_send"] = pltpu.VMEM((2, AR_R, HC2), BF16)
+        scratch["ag_recv"] = pltpu.VMEM((2, 2, AR_R, HC2), BF16)
+        scratch["s2_send"] = pltpu.VMEM((2, 4, rh, part), BF16)
+        scratch["s2_recv"] = pltpu.VMEM((2, 2, rq, part), BF16)
+        scratch["ar2d_bf"] = pltpu.VMEM((2, 2, rh, part), BF16)
     elif HIER == 1:
         scratch["ag_send"] = pltpu.VMEM((2, AR_R, AR_C), BF16)
         scratch["ag_recv"] = pltpu.VMEM((2, 4, AR_R, AR_C), BF16)

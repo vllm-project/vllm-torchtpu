@@ -38,6 +38,7 @@ from jax.sharding import PartitionSpec as P
 import os
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.megakernel.blocks.moe.params import MoETunables
 from vllm_torchtpu.megakernel.exec_spec import DebugOptions, ExecSpec, Tiles
 from vllm_torchtpu.megakernel.ops import F32, REC
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
@@ -46,7 +47,14 @@ from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW, UNION_
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
 
 from .qwen38_scatter import scatter_gdn_ckpts_fast
-from .qwen38_segment_call import GDN_META, T_VERIFY, gdn_blocks, ring_depths, segment_tiles
+from .qwen38_segment_call import (
+    GDN_META,
+    T_VERIFY,
+    _safe_valid_rows,
+    gdn_blocks,
+    ring_depths,
+    segment_tiles,
+)
 from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
 
 from .qwen38_wholestep_cache import QSALayerCache, wholestep_qsa_writes
@@ -121,6 +129,10 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     # VLLM_TPU_MK_GDN_HM=0 restores the whole-state update.
     if os.environ.get("VLLM_TPU_MK_GDN_HM", "1") not in ("", "0"):
         t = t.with_blocks({"gdn": {"gdn_head_major": True}})
+    # VLLM_TPU_MK_AR_HIER_SMALL: hier=1 up to 8 rows (exact vs hier=2; envs.py).
+    # Preserve hier=1 even when E7 / EXACT_WIDTH picks default hier=5 on small rows.
+    if envs.VLLM_TPU_MK_AR_HIER_SMALL and B <= 8 and t.hier in (2, 5):
+        t = dataclasses.replace(t, hier=1)
     # VLLM_TPU_MK_HIER=N (bench sweeps): override the all-reduce hierarchy.
     hier = os.environ.get("VLLM_TPU_MK_HIER", "")
     if hier:
@@ -129,6 +141,10 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     # bitwise vs the dense loop, aligned [8, 128] tile loads). No-op up to 16 rows.
     if envs.VLLM_TPU_MK_ROW_BUCKET:
         t = t.with_blocks({"moe": {"row_bucket": True}})
+    # VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC: vectorized routed-expert dedup (exact; envs.py),
+    # from 8 rows up.
+    if envs.VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC and B >= 8:
+        t = t.with_blocks({"moe": {"dedup_vec": True}})
     # VLLM_TPU_MK_RINGS=nbe:nbd (bench sweeps): override the ring depths.
     rings = os.environ.get("VLLM_TPU_MK_RINGS", "") or _ring_s1(B)  # q38 L1-IDX RING-S1 (per bucket, S1 on)
     if rings:
@@ -211,6 +227,7 @@ def build_wholestep_call(
         ),
     )
     stats = union_stats_on() or _l47f_sink_out(L, g.att_every)  # q38 L1-L47F: outs[6] = the sink export (not with stats)
+    skip_pad = bool(ex.resolved_tiles.block("moe", MoETunables).skip_pad)
     fn, k_specs, _, n_w = make_flat_segment_step(
         mesh,
         spec,
@@ -353,6 +370,8 @@ def build_wholestep_call(
         rb, wb, hi = gdn_blocks(meta, NS, write)
         xs = dict(zip(names, inputs(pool, tables, positions, starts, context, trig)))
         xs.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32)); xs.update(_live_xs(ex, meta[3], NS, T)); xs.update(_ink_xs(fn, wb))  # noqa: E702  q38 X-GLUE-1
+        if skip_pad:
+            xs["moe_valid_rows"] = _safe_valid_rows(starts, B)
         outs = fn(pos0, x, *(xs[k] for k in fn.extra_names), *w); outs = _ink_outs(fn, outs, pool, interpret)  # noqa: E702  q38 X-GLUE-1
         res, conv_ck, rec_ck, kv, kr, ir = outs[:6]
         pool = writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables, positions, starts, context,
@@ -392,6 +411,8 @@ def build_wholestep_call(
         rb, wb, hi = gdn_blocks_shared(off, qsl, seq, sts, cks, NS, write)
         xs = dict(zip(names, inputs(pool, tables, positions, starts, context, trig)))
         xs.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32)); xs.update(_live_xs(ex, qsl, NS, T)); xs.update(_ink_xs(fn, wb))  # noqa: E702  q38 X-GLUE-1
+        if skip_pad:
+            xs["moe_valid_rows"] = _safe_valid_rows(starts, B)
         outs = fn(pos0, x, *(xs[k] for k in fn.extra_names), *w); outs = _ink_outs(fn, outs, pool, interpret)  # noqa: E702  q38 X-GLUE-1 (call_shared)
         res, conv_ck, rec_ck, kv, kr, ir = outs[:6]
         pool = writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables, positions, starts, context,

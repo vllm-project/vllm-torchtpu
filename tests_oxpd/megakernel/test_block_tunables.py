@@ -88,8 +88,13 @@ def test_tile_numerics_classes_from_evidence():
 
 def test_exact_flip_list_covers_registry():
     exact = {k for k, v in _library_numerics().items() if v == "exact"}
-    # kv_scatter_vec_ns only affects the non-paged path (tested separately).
-    assert exact == {f for _, f, _, _, _ in EXACT_FLIPS} | {"gqa.kv_scatter_vec_ns"}
+    # Exact knobs verified by dedicated kernel/layout suites rather than the tiny
+    # 2-rank b1_tiles_profiles exact-flip fixture.
+    separately_tested = {
+        "gqa.kv_scatter_vec_ns",
+        "moe.dedup_vec",
+    }
+    assert exact == {f for _, f, _, _, _ in EXACT_FLIPS} | separately_tested
 
 
 def test_tiles_field_defaults_turn_perf_flags_off():

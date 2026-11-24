@@ -65,9 +65,10 @@ def dedup_ecopy(
     n_cp: Any,
 ) -> Any:
     """Hit lists with redundant expert copies; returns this rank's hit count."""
-    ex, mp, scr, sc, me = m.ex, m.mp, m.scr, m.sc, m.me
+    ctx, ex, mp, scr, sc, me = m.ctx, m.ex, m.mp, m.scr, m.sc, m.me
     B, R, WIDE = ex.B, ex.R, ex.WIDE
     ER, TOPK = mp.ER, mp.TOPK
+    n_rows = jnp.clip(ctx.extra["moe_valid_rows"][0], 0, B) if mp.skip_pad else B
     if not VEC:
         for r in range(R):
             scr["rload"][r] = jnp.int32(0)
@@ -103,7 +104,7 @@ def dedup_ecopy(
 
         n_tot = jnp.int32(0)
         with sc("route_dedup", 2):
-            if WIDE:
+            if mp.skip_pad or WIDE:
 
                 def row_uniq(b, nt_in):
                     return lax.fori_loop(
@@ -114,7 +115,9 @@ def dedup_ecopy(
                         unroll=True,
                     )
 
-                n_tot = lax.fori_loop(0, B, row_uniq, n_tot, unroll=2)
+                n_tot = lax.fori_loop(
+                    0, n_rows, row_uniq, n_tot, unroll=1 if mp.skip_pad else 2
+                )
             else:
                 for b in range(B):
                     n_tot = lax.fori_loop(
@@ -154,7 +157,7 @@ def dedup_ecopy(
 
         carry = (jnp.int32(0), jnp.int32(0), jnp.int32(0))
         with sc("route_dedup", 2):
-            if WIDE:
+            if mp.skip_pad or WIDE:
 
                 def row_ecopy(b, c_in):
                     return lax.fori_loop(
@@ -165,7 +168,9 @@ def dedup_ecopy(
                         unroll=True,
                     )
 
-                n_hit, n_cp, n_tot = lax.fori_loop(0, B, row_ecopy, carry, unroll=2)
+                n_hit, n_cp, n_tot = lax.fori_loop(
+                    0, n_rows, row_ecopy, carry, unroll=1 if mp.skip_pad else 2
+                )
             else:
                 for b in range(B):
                     carry = lax.fori_loop(
@@ -263,20 +268,38 @@ def dedup_local(m: MoEEmit, stamp: Any) -> Any:
         return n + jnp.where(new, 1, 0).astype(I32)
 
     n_hit = jnp.int32(0)
+    n_rows = jnp.clip(ctx.extra["moe_valid_rows"][0], 0, B) if mp.skip_pad else B
     with sc("route_dedup", 2):
-        if WIDE:
+        if mp.skip_pad or WIDE:
 
             def row(b, n):
                 return lax.fori_loop(
                     0, TOPK, functools.partial(pick, b), n, unroll=True
                 )
 
-            n_hit = lax.fori_loop(0, B, row, n_hit, unroll=2)
+            n_hit = lax.fori_loop(
+                0, n_rows, row, n_hit, unroll=1 if mp.skip_pad else 2
+            )
         else:
             for b in range(B):
                 n_hit = lax.fori_loop(
                     0, TOPK, functools.partial(pick, b), n_hit, unroll=True
                 )
+    return n_hit
+
+
+def dedup_local_vec(m: MoEEmit) -> Any:
+    """`dedup_local` from the `dedup_rows_vec` rows: copy the hit list to `elist`.
+
+    `hits` row 0 holds the first-appearance hit list, row 1 lane 0 the count.
+    Only `elist[0:n_hit]` is ever read (every consumer is under `n_hit > 0`).
+    """
+    scr, sc = m.scr, m.sc
+    n_copy = min(m.mp.ER, m.ex.B * m.mp.TOPK)
+    with sc("route_dedup", 2):
+        n_hit = scr["hits"][1, 0]
+        for i in range(n_copy):
+            scr["elist"][i] = scr["hits"][0, i]
     return n_hit
 
 

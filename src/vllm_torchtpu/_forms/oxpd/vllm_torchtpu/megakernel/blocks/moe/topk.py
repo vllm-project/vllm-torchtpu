@@ -22,6 +22,7 @@ from jax import lax
 
 from ...ops import BF16, F32, I32
 from .context import MoEEmit
+from .params import DEDUP_BIG
 
 NT = (((1,), (1,)), ((), ()))
 TOPK_NL = 16
@@ -85,6 +86,53 @@ def topk_rows_on_lanes(
     return ids, sel
 
 
+def dedup_rows_vec(ids: Any, B: Any, TOPK: int, base: Any, ER: int) -> Any:
+    """Vectorized `dedup_local` (EP, no redundant copies): `[8, 128]` int32 rows.
+
+    `ids[b, k]` (`b < B`, `k < TOPK`) is row `b`'s k-th expert. Row 0 lane `r`
+    is the `r`-th distinct local expert (`base <= e < base + ER`) in the
+    first-appearance order of the scalar loop (`b` major, `k` minor); row 1
+    holds the count `n_hit`. Lanes `r >= n_hit` are 0 (never read).
+    Each local slot's first pick position `b * TOPK + k` is unique per expert,
+    so its rank among the hit slots is its place in the hit list. Positions,
+    counts and expert ids stay below 2**24, so the f32 reductions are exact.
+    """
+    mr = ids.shape[0]
+    row = lax.broadcasted_iota(I32, (mr, 128), 0)
+    tgt = lax.broadcasted_iota(I32, (mr, 128), 1) + base
+    big = jnp.int32(DEDUP_BIG)
+    first_k = jnp.full((mr, 128), big, I32)
+    for k in reversed(range(TOPK)):
+        first_k = jnp.where(ids[:, k : k + 1] == tgt, k, first_k)
+    pos = jnp.where(
+        jnp.logical_and(first_k < big, row < B), row * TOPK + first_k, big
+    ).astype(F32)
+    fp = jnp.min(pos, axis=0, keepdims=True)  # [1, 128] first pick per slot
+    lane1 = lax.broadcasted_iota(I32, (1, 128), 1)
+    fp = jnp.where(lane1 < ER, fp, float(DEDUP_BIG))
+    f_t = jnp.broadcast_to(fp, (128, 128))  # [s, t] = fp[t]
+    f_s = f_t.T  # [s, t] = fp[s]
+    hit_s = f_s[:, 0:1] < float(DEDUP_BIG)
+    rank_s = jnp.sum(jnp.where(f_t < f_s, 1.0, 0.0), axis=1, keepdims=True)
+    sub = lax.broadcasted_iota(I32, (128, 128), 0)
+    lane = lax.broadcasted_iota(I32, (128, 128), 1)
+    elist = jnp.sum(
+        jnp.where(
+            jnp.logical_and(hit_s, rank_s == lane.astype(F32)),
+            (sub + base).astype(F32),
+            0.0,
+        ),
+        axis=0,
+        keepdims=True,
+    )
+    n_hit = jnp.sum(
+        jnp.where(fp < float(DEDUP_BIG), 1.0, 0.0), axis=1, keepdims=True
+    )
+    r8 = lax.broadcasted_iota(I32, (8, 128), 0)
+    out = jnp.where(r8 == 0, elist, jnp.where(r8 == 1, n_hit, 0.0))
+    return out.astype(I32)
+
+
 def route_topk(
     m: MoEEmit, choice: Any, p8: Any, VEC: bool, slot_ec: Any, NCP: int, MROW: int
 ) -> None:
@@ -122,9 +170,10 @@ def route_topk(
             hit = lane_e8 == am_
             sel = jnp.logical_or(sel, hit)
             choice = jnp.where(hit, -jnp.inf, choice)
+    n_valid = jnp.clip(ctx.extra["moe_valid_rows"][0], 0, B) if mp.skip_pad else B
     if VEC:
         hitf = jnp.max(
-            jnp.where(jnp.logical_and(sel, row8 < B), 1, 0).astype(I32),
+            jnp.where(jnp.logical_and(sel, row8 < n_valid), 1, 0).astype(I32),
             axis=0,
             keepdims=True,
         )
@@ -163,9 +212,11 @@ def route_topk(
         lane_r = lax.broadcasted_iota(I32, (1, 128), 1)
         meta = jnp.where(lane_r < NCP, res[0:1] * 32.0 + res[1:2], res[2:3])
         scr["hitv"][MROW : MROW + 1, :] = meta.astype(I32)
+    elif mp.dedup_vec:
+        scr["hitv"][0:8, :] = dedup_rows_vec(ids, n_valid, TOPK, m.me * ER, ER)
     else:
         scr["hitv"][...] = ids
     wsel = jnp.where(sel, p8, 0.0)
     scr["wn"][...] = jnp.where(
-        row8 < B, wsel / jnp.sum(wsel, axis=-1, keepdims=True), 0.0
+        row8 < n_valid, wsel / jnp.sum(wsel, axis=-1, keepdims=True), 0.0
     )
