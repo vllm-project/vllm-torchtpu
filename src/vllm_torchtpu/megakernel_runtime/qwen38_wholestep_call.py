@@ -695,7 +695,10 @@ def build_wholestep_call(
                           ((kv, kv_t), (kr, kr_t), (ir, ir_t)))
         else:
             rank = rest
-        pool = scatter_gdn_ckpts_fast(pool, conv_ck, rec_ck, wb, layout=layout, interpret=interpret)
+        pool = scatter_gdn_ckpts_fast(
+            pool, conv_ck, rec_ck, wb, layout=layout, interpret=interpret,
+            hist=io_lean("conv", rows=B),
+        )
         if not write:
             return pool
         Bq = len(positions)
