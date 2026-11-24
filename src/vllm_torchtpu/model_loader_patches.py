@@ -1093,3 +1093,33 @@ def patch_expert_placement_routers() -> None:
         typing.Any, process_weights_after_loading
     )._tpu_renumbers_expert_routers = True
     base_loader.process_weights_after_loading = process_weights_after_loading
+
+
+def patch_attn_out_relayout_tags() -> None:
+    """Tag FP8 attention `o_proj` layers after every model's weights load."""
+    from vllm.model_executor.model_loader import base_loader
+
+    orig_process = base_loader.process_weights_after_loading
+    if getattr(orig_process, "_tpu_tags_attn_out_relayout", False):
+        return
+
+    @functools.wraps(orig_process)
+    def process_weights_after_loading(model, model_config, target_device):
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            tag_attn_out_relayout_projections,
+        )
+
+        result = orig_process(model, model_config, target_device)
+        tagged = tag_attn_out_relayout_projections(model)
+        if tagged:
+            logger.info(
+                "Fenced the input of %d FP8 attention o_proj layers to keep "
+                "the attention-output relayout in bf16.",
+                tagged,
+            )
+        return result
+
+    typing.cast(
+        typing.Any, process_weights_after_loading
+    )._tpu_tags_attn_out_relayout = True
+    base_loader.process_weights_after_loading = process_weights_after_loading
