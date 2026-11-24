@@ -130,11 +130,26 @@ def _reduce_heads(products, weights, selector, *, sublanes, use_mxu):
     return cast(jax.Array, values)[:queries]
 
 
+def _block_rows(ref, start) -> bool:
+    """Whether rows from `start` of `ref` may move as one multi-row slice.
+
+    A leading dimension is untiled. A two-dimensional ref tiles its rows
+    (8 per 32-bit tile), and Mosaic accepts a multi-row slice of them only
+    from a start it can prove tile-aligned: a static multiple of the tile.
+    """
+    if len(ref.shape) >= 3:
+        return True
+    tile = 8 * 4 // jnp.dtype(ref.dtype).itemsize
+    return isinstance(start, int) and start % tile == 0
+
+
 def _dma_rows(src, dst, sem, count, wait=False, src_start=0, dst_start=0):
     """Copy (or wait for) the first `count` rows; waits must pass the same count.
 
-    A full block moves as one DMA: issuing and waiting row by row cost the
-    dense scorer 9 us of a 222 us resident 256-row tile.
+    A full block moves as one DMA where both slices allow it: issuing and
+    waiting row by row cost the dense scorer 9 us of a 222 us resident
+    256-row tile. A wait on a block covers the same bytes as row waits on
+    one semaphore, so starts and waits may differ in granularity.
     """
     rows = min(src.shape[0], dst.shape[0])
 
@@ -145,6 +160,11 @@ def _dma_rows(src, dst, sem, count, wait=False, src_start=0, dst_start=0):
         dma = pltpu.make_async_copy(source, target, completion)
         (dma.wait if wait else dma.start)()
 
-    pl.when(count >= rows)(partial(copy, 0, rows))
+    block = (
+        not sem.shape and _block_rows(src, src_start) and _block_rows(dst, dst_start)
+    )
+    if block:
+        pl.when(count >= rows)(partial(copy, 0, rows))
     for local in range(rows):
-        pl.when((local < count) & (count < rows))(partial(copy, local, 1))
+        whole = (count < rows) if block else True
+        pl.when((local < count) & whole)(partial(copy, local, 1))
