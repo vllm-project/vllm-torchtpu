@@ -28,8 +28,9 @@ from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .ops import BF16, F32, FP8, rup
 from .planner import Plan, extra_inputs, plan
+from .pool.config import cache_exec
 from .profiles.default import chip_budget
-from .spec import ModelSpec, ScratchReq
+from .spec import ModelSpec, ScratchReq, SwitchSlot
 
 U8 = jnp.uint8
 
@@ -170,6 +171,9 @@ class CorePlan:
     NMIX: int
     smem_bytes: int = 0
     smem_shapes: dict[str, tuple[tuple[int, ...], Any]] | None = None
+    scratch_aliases: tuple[
+        tuple[str, str, int, int, tuple[int, ...], Any], ...
+    ] = ()
 
     def block(self, name: str) -> Any:
         return self.blocks[name]
@@ -427,6 +431,14 @@ def build_scratch(
             scratch["epool"] = pltpu.VMEM((NBE * EBROWS, 128), U8)
             phase_map["epool"] = "persistent"
 
+    scratch_aliases: tuple[
+        tuple[str, str, int, int, tuple[int, ...], Any], ...
+    ] = ()
+    if (not typed) and bool(tiles.scratch_alias):
+        scratch_aliases = _pack_gdn_qsa_scratch_alias(
+            model_spec, g, ex, p, scratch, phase_map
+        )
+
     vmem_bytes = 0
     vmem_shapes: dict[str, tuple[tuple[int, ...], Any]] = {}
     smem_bytes = B * 4  # pos_ref [B] int32
@@ -545,6 +557,7 @@ def build_scratch(
         NMIX=NMIX,
         smem_bytes=smem_bytes,
         smem_shapes=smem_shapes,
+        scratch_aliases=scratch_aliases,
     )
     return core_plan, scratch
 
@@ -605,6 +618,153 @@ def fit_default_tiles(model_spec: ModelSpec, ex: ExecSpec) -> ExecSpec:
                 f"{need:.2f} MiB with ring depths nbd={t.nbd}, nbe={t.nbe}; "
                 "pass explicit tiles or a named profile"
             )
+
+
+# Strictly dead-on-exit, local (non-RDMA) scratch keys eligible for disjoint
+# SwitchSlot (GDN vs QSA) VMEM pool aliasing with zero extra DMA waits.
+# Excludes async-writeback buffers (`convb`, `logb`, `recb` stay alive across
+# GDN layers until drained) and remote-RDMA targets (`qgu_recv`, `qg_recv`,
+# `qd_q`, `qd_or`, `qd_lr`).
+_GDN_TIER1_ALIAS_KEYS: tuple[str, ...] = ("pg_conv", "pg_log", "sbuf")
+_QSA_TIER1_ALIAS_KEYS: tuple[str, ...] = (
+    "qi_s",
+    "qu_code",
+    "qi_q",
+    "qc_rk",
+    "qc_rv",
+    "qf_kv",
+    "qf_rope",
+    "qf_kr",
+)
+
+
+def _is_exact_pool_alias_vmem(spec: Any) -> bool:
+    """True when `spec` is a VMEM array whose tiled storage has zero padding."""
+    if not hasattr(spec, "shape") or "VMEM" not in str(getattr(spec, "memory_space", "")).upper():
+        return False
+    shape = tuple(spec.shape)
+    if len(shape) < 2:
+        return False
+    dtype = jnp.dtype(spec.dtype)
+    nbytes = math.prod(shape) * dtype.itemsize
+    if nbytes <= 0 or nbytes % 4096 != 0:
+        return False
+    return pool_alias.storage_size(shape, dtype) == nbytes
+
+
+def _pack_gdn_qsa_scratch_alias(
+    model_spec: ModelSpec,
+    g: Any,
+    ex: ExecSpec,
+    p: Plan,
+    scratch: dict[str, Any],
+    phase_map: dict[str, str],
+) -> tuple[tuple[str, str, int, int, tuple[int, ...], Any], ...]:
+    """Alias mutually-exclusive SwitchSlot GDN/QSA Tier-1 VMEM onto `gq_pool`.
+
+    Only activates on real TPU (`not typed`) models whose `layer_type.slots`
+    contains a 2-branch `SwitchSlot` separating the two candidate owners, and
+    only re-aliases buffers that pass exact `(8*packing, 128)` tiling and belong
+    exclusively to one branch.
+    """
+    if cache_exec(ex).FUSED:
+        return ()
+
+    # Build owner counts across all blocks so we never alias a shared key.
+    block_key_sets: dict[int, set[str]] = {}
+    key_owner_count: dict[str, int] = {}
+    for b in model_spec.all_blocks():
+        reqs = _normalize_scratch_reqs(b.scratch(g, ex, p))
+        ks = {r.name for r in reqs}
+        block_key_sets[id(b)] = ks
+        for k in ks:
+            key_owner_count[k] = key_owner_count.get(k, 0) + 1
+
+    gdn_set = set(_GDN_TIER1_ALIAS_KEYS)
+    qsa_set = set(_QSA_TIER1_ALIAS_KEYS)
+    pair: tuple[set[str], set[str]] | None = None
+    for slot_entry in model_spec.layer_type.slots:
+        if not isinstance(slot_entry, SwitchSlot):
+            continue
+        active = slot_entry.active_branches
+        if len(active) != 2:
+            continue
+        k0 = block_key_sets.get(id(active[0]), set())
+        k1 = block_key_sets.get(id(active[1]), set())
+        if (k0 & gdn_set) and (k1 & qsa_set) and not (k0 & qsa_set) and not (k1 & gdn_set):
+            pair = (k0, k1)
+            break
+        if (k1 & gdn_set) and (k0 & qsa_set) and not (k1 & qsa_set) and not (k0 & gdn_set):
+            pair = (k1, k0)
+            break
+    if pair is None:
+        return ()
+
+    own_gdn, own_qsa = pair
+
+    def _eligible(
+        order: tuple[str, ...], owner_keys: set[str]
+    ) -> list[tuple[str, int, tuple[int, ...], Any]]:
+        out: list[tuple[str, int, tuple[int, ...], Any]] = []
+        for k in order:
+            if k not in owner_keys or key_owner_count.get(k, 0) != 1:
+                continue
+            spec = scratch.get(k)
+            if spec is None or not _is_exact_pool_alias_vmem(spec):
+                continue
+            sh = tuple(spec.shape)
+            dt = jnp.dtype(spec.dtype)
+            nbytes = math.prod(sh) * dt.itemsize
+            out.append((k, nbytes // 128, sh, dt))
+        return out
+
+    g_items = _eligible(_GDN_TIER1_ALIAS_KEYS, own_gdn)
+    q_items = _eligible(_QSA_TIER1_ALIAS_KEYS, own_qsa)
+    if not g_items or not q_items:
+        return ()
+
+    tot_g = sum(r for _, r, _, _ in g_items)
+    tot_q = sum(r for _, r, _, _ in q_items)
+    overlap_cap = min(tot_g, tot_q)
+
+    # Keep any tail buffers on the larger side standalone typed so we only wrap
+    # the minimum prefix needed to save all `overlap_cap` rows.
+    def _trim(items: list[tuple[str, int, tuple[int, ...], Any]], cap: int):
+        kept: list[tuple[str, int, tuple[int, ...], Any]] = []
+        acc = 0
+        for it in items:
+            if acc >= cap:
+                break
+            kept.append(it)
+            acc += it[1]
+        return kept, acc
+
+    g_pack, g_rows = _trim(g_items, overlap_cap)
+    q_pack, q_rows = _trim(q_items, overlap_cap)
+    pool_rows = max(g_rows, q_rows)
+    if (g_rows + q_rows) <= pool_rows:
+        return ()
+
+    pool_key = "gq_pool"
+    if pool_key in scratch:
+        return ()
+
+    aliases: list[tuple[str, str, int, int, tuple[int, ...], Any]] = []
+    off = 0
+    for k, nr, sh, dt in g_pack:
+        scratch.pop(k)
+        phase_map.pop(k, None)
+        aliases.append((k, pool_key, off, nr, sh, dt))
+        off += nr
+    off = 0
+    for k, nr, sh, dt in q_pack:
+        scratch.pop(k)
+        phase_map.pop(k, None)
+        aliases.append((k, pool_key, off, nr, sh, dt))
+        off += nr
+    scratch[pool_key] = pltpu.VMEM((pool_rows, 128), U8)
+    phase_map[pool_key] = "gdn|qsa"
+    return tuple(aliases)
 
 
 def _all_own_part(model_spec: Any) -> bool:

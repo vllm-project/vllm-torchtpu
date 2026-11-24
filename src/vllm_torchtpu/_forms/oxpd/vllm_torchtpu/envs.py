@@ -647,7 +647,10 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_MOE_DIRECT_STORE: bool = False
     VLLM_TPU_MK_MOE_TOPK_LANES: bool = False
     VLLM_TPU_MK_MOE_LOCAL_WN: bool = False
+    VLLM_TPU_MK_SCRATCH_ALIAS: bool = False
+    VLLM_TPU_MK_WHOLE_MAX_ROWS: int = 96
     VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE: bool = False
+    VLLM_TPU_MK_DRAFT_CLEAN_OPERANDS: bool = False
     VLLM_TPU_MK_VMEM_CUTS: str = ""
     VLLM_TPU_MK_VMEM_CUT_ROWS: int = 33
     # q38 PORT-BL GDN (begin)
@@ -3684,11 +3687,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_MK_MOE_TOPK_LANES": env_bool("VLLM_TPU_MK_MOE_TOPK_LANES", False),
     # Rank-local 128-lane `wn` scratch & wcol scan on EP (E % 128 == 0, E > 128).
     "VLLM_TPU_MK_MOE_LOCAL_WN": env_bool("VLLM_TPU_MK_MOE_LOCAL_WN", False),
+    # Share disjoint SwitchSlot (GDN vs QSA) exact-tiled local VMEM scratch
+    # onto a single uint8 slab via pool_alias.view (zero extra DMA waits).
+    "VLLM_TPU_MK_SCRATCH_ALIAS": env_bool("VLLM_TPU_MK_SCRATCH_ALIAS", False),
+    # Largest whole-step bucket (rows): default 96, at most 128 (the megakernel's
+    # row limit); 0 = default. Above 96 rows may require VMEM cuts and, under
+    # main-KV DCP-2, VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE.
+    "VLLM_TPU_MK_WHOLE_MAX_ROWS": env_nonnegative_int(
+        "VLLM_TPU_MK_WHOLE_MAX_ROWS", 96
+    ),
     # Main-KV DCP-2 whole-step buckets of 128+ rows: drop one expert ring slot
     # (nbe - 1, 2 MiB VMEM) when not using single-slot AR2D (`hier == 4`).
     "VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE": env_bool("VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE", False),
+    # Qwen3.8 draft attention megakernel (`DraftAttn`): hold packed operands as
+    # non-grad nn.Parameter instead of buffers to avoid per-step execute_as_strided.
+    "VLLM_TPU_MK_DRAFT_CLEAN_OPERANDS": env_bool(
+        "VLLM_TPU_MK_DRAFT_CLEAN_OPERANDS", False
+    ),
     # Whole-step megakernel VMEM cut tokens (comma-separated, applied for rows >=
-    # VLLM_TPU_MK_VMEM_CUT_ROWS): supports `vmem64` and `ring` (`VMEM_CUT_RINGS` /
+    # VLLM_TPU_MK_VMEM_CUT_ROWS): supports `alias` (`Tiles.scratch_alias`), `vmem64`
+    # (scoped limit 62 -> 64 MiB), and `ring` (`VMEM_CUT_RINGS` /
     # `VMEM_CUT_RINGS_AR2D_SS`). Default "" = off.
     "VLLM_TPU_MK_VMEM_CUTS": env_str("VLLM_TPU_MK_VMEM_CUTS", ""),
     "VLLM_TPU_MK_VMEM_CUT_ROWS": env_nonnegative_int(

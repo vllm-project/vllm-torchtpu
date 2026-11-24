@@ -26,6 +26,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from . import pool_alias
 from .comm import AllReduceRing
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
@@ -143,6 +144,10 @@ def build(
         O = dict(zip(o_names, refs[k_ : k_ + len(o_names)]))  # noqa: E741
         out_ref = O["hidden"]
         scr = dict(zip(s_names, refs[k_ + len(o_names) :]))
+        for _aname, _pkey, _roff, _nr, _ash, _adt in core_plan.scratch_aliases:
+            scr[_aname] = pool_alias.view(
+                scr[_pkey].at[pl.ds(_roff, _nr)], _ash, _adt
+            )
         pool_key = POOL_STATE_NAME
         raw_refs = (
             (O[pool_key] if bool(ex.interpret) else ST[pool_key])

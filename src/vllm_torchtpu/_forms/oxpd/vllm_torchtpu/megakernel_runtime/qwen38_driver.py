@@ -211,6 +211,18 @@ def _cpu_proxy(m: Any, memo: dict | None = None) -> Any:
 NO_DONATE = False
 # Largest whole-step bucket: its VMEM plan fits up to 96 rows (`wholestep_tiles`).
 WHOLE_MAX_ROWS = 96
+_KERNEL_MAX_ROWS = 128
+
+
+def _whole_max_rows() -> int:
+    """Largest whole-step bucket: `VLLM_TPU_MK_WHOLE_MAX_ROWS` (0 = 96), at most 128."""
+    rows = envs.VLLM_TPU_MK_WHOLE_MAX_ROWS or WHOLE_MAX_ROWS
+    if rows > _KERNEL_MAX_ROWS:
+        raise ValueError(
+            f"VLLM_TPU_MK_WHOLE_MAX_ROWS={rows} exceeds the kernel limit of "
+            f"{_KERNEL_MAX_ROWS} rows"
+        )
+    return rows
 # Model steps after warmup (verify steps; any step once disabled) by which a `whole=1`
 # server must have made a whole-step call.
 WHOLE_SELF_CHECK_STEPS = 200
@@ -1668,7 +1680,7 @@ class Qwen38SegmentDriver:
             # of the segment driver ran out of VMEM, 67.9 of 63 MiB, and disabled the
             # MK).
             buckets = tuple(
-                b for b in self.buckets if b <= min(WHOLE_MAX_ROWS, self.whole_max_rows)
+                b for b in self.buckets if b <= min(_whole_max_rows(), self.whole_max_rows)
             )
             if not buckets:
                 raise ValueError(
@@ -1681,6 +1693,14 @@ class Qwen38SegmentDriver:
             self.whole_cfg = copy.copy(self.cfg)
             cc = copy.copy(self.cfg.compilation_config)
             cc.compile_sizes = list(buckets)
+            cc.compile_ranges_endpoints = []
+            cc.inductor_compile_config = {
+                k: v
+                for k, v in dict(
+                    getattr(cc, "inductor_compile_config", None) or {}
+                ).items()
+                if k != "pre_grad_custom_pass"
+            }
             object.__setattr__(self.whole_cfg, "compilation_config", cc)
             whole = Qwen38WholeStep(
                 runner.model,
@@ -1992,7 +2012,7 @@ class Qwen38SegmentDriver:
 
     def _whole_eligible(self, runner: Any, n_req: int, rows: int) -> bool:
         if self.whole_program is None or rows > min(
-            WHOLE_MAX_ROWS, self.whole_max_rows
+            _whole_max_rows(), self.whole_max_rows
         ):
             return False
         try:
@@ -2296,7 +2316,7 @@ class Qwen38SegmentDriver:
             # a c1
             # AgentX request past the 32K cap started that compile and the sampler RPC
             # timed out).
-            above = rows > min(WHOLE_MAX_ROWS, self.whole_max_rows)
+            above = rows > min(_whole_max_rows(), self.whole_max_rows)
             self._note(f"stock_above_whole_b{rows}" if above else "stock_whole_ctx")
             self._count("drafts_stock", n_req * (T_VERIFY - 1))
             # q38 L5 CTXCENSUS (not in 37b960ea9)
