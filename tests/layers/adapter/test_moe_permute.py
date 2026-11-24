@@ -49,10 +49,14 @@ class _FakeExperts(torch.nn.Module):
 
     def weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id,
                       return_success=False):
+        from vllm_torchtpu import model_loader_patches as mlp
+
         e = self._map_global_expert_id_to_local_expert_id(expert_id)
         if e == -1:
             return False if return_success else None
         param.data[e].copy_(loaded_weight)
+        # What the staging hook in model_loader_patches records.
+        mlp._note_permuted_write(self, e, None, expert_id, weight_name, shard_id)
         return True if return_success else None
 
 
@@ -67,7 +71,13 @@ def _setup(monkeypatch, table):
     monkeypatch.setattr(mp, "SPEC", "test")
     monkeypatch.setattr(mp, "_source_cache", table)
     monkeypatch.setattr(mp, "_ORDINAL", [0])
-    monkeypatch.setattr(mp, "_widen_ep_weight_filter", lambda: None)
+    monkeypatch.setattr(mp, "_patch_expert_id_filter", lambda: None)
+    monkeypatch.setattr(mp, "_LOCAL_BY_LAYER", {})
+    monkeypatch.setattr(mp, "_LOCAL_UNION", set())
+    monkeypatch.setattr(mp, "_LOADING", [False])
+    monkeypatch.setattr(mp, "_STATS", {"layers": 0, "moved": 0, "prepared": 0,
+                                       "checked_experts": 0})
+    monkeypatch.setattr(mp, "write_tracking", lambda: True)
     monkeypatch.setattr(rx, "ENABLED", False)
 
 
@@ -179,3 +189,120 @@ def test_builtin_table_is_valid():
     for key, perm in data.items():
         assert key.startswith("moe")
         mp.validate(perm, 128)
+
+
+def _load_rank(num_logical, ep, rank, name, perm_table, gids):
+    mp._ORDINAL[0] = 0
+    layer = _FakeExperts(num_logical, ep, rank, name)
+    assert mp.prepare(layer)
+    local = num_logical // ep
+    layer.w13_weight = torch.nn.Parameter(torch.zeros(local, 2), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(torch.zeros(local, 2), requires_grad=False)
+    for gid in gids:
+        layer.weight_loader(layer.w13_weight, torch.ones(2), f"{name}.w13_weight", "w1", gid)
+        layer.weight_loader(layer.w13_weight, torch.ones(2), f"{name}.w13_weight", "w3", gid)
+        layer.weight_loader(layer.w2_weight, torch.ones(2), f"{name}.w2_weight", "w2", gid)
+    return layer
+
+
+def test_install_raises_when_permuted_experts_were_filtered(monkeypatch):
+    """The broken load: a linear EP filter streams only linear-local experts,
+    so experts permuted in from other ranks are never written."""
+    num_logical, ep, rank = 32, 4, 1
+    perm = _perm(num_logical, 5)
+    _setup(monkeypatch, {"moe0": perm})
+    local = num_logical // ep
+    linear = range(rank * local, (rank + 1) * local)
+    layer = _load_rank(num_logical, ep, rank, "model.layers.3.mlp.experts", perm, linear)
+    with pytest.raises(RuntimeError, match="permuted-local experts not loaded"):
+        mp.install(layer)
+
+    # A partial write (w3 never arrives for one expert) also fails.
+    _setup(monkeypatch, {"moe0": perm})
+    layer = _load_rank(num_logical, ep, rank, "model.layers.3.mlp.experts", perm, [])
+    lo = rank * local
+    mine = [e for e, p in enumerate(perm) if lo <= p < lo + local]
+    for gid in mine:
+        layer.weight_loader(layer.w13_weight, torch.ones(2), "x.w13_weight", "w1", gid)
+        if gid != mine[0]:
+            layer.weight_loader(layer.w13_weight, torch.ones(2), "x.w13_weight", "w3", gid)
+        layer.weight_loader(layer.w2_weight, torch.ones(2), "x.w2_weight", "w2", gid)
+    with pytest.raises(RuntimeError, match=f"partial=\\[{mine[0]}\\]"):
+        mp.install(layer)
+
+    # The full stream passes and logs the complete count.
+    _setup(monkeypatch, {"moe0": perm})
+    layer = _load_rank(num_logical, ep, rank, "model.layers.3.mlp.experts", perm,
+                       range(num_logical))
+    mp.install(layer)
+    assert mp.summary()["checked_experts"] == local
+
+
+def test_per_layer_filter_streams_exactly_the_permuted_local_experts(monkeypatch):
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    num_logical, ep, rank = 32, 4, 2
+    local = num_logical // ep
+    lo = rank * local
+    p0, p1 = _perm(num_logical, 7), _perm(num_logical, 8)
+    _setup(monkeypatch, {"moe0": p0, "moe2": p1})
+    a = _FakeExperts(num_logical, ep, rank, "model.layers.3.block_sparse_moe.experts")
+    b = _FakeExperts(num_logical, ep, rank, "model.layers.4.block_sparse_moe.experts")
+    c = _FakeExperts(num_logical, ep, rank, "model.layers.5.block_sparse_moe.experts")
+    assert mp.prepare(a) and not mp.prepare(b) and mp.prepare(c)
+    model = torch.nn.Module()
+    model.a, model.b, model.c = a, b, c
+    mine0 = {e for e, p in enumerate(p0) if lo <= p < lo + local}
+    mine2 = {e for e, p in enumerate(p1) if lo <= p < lo + local}
+    linear = set(range(lo, lo + local))
+    union = mine0 | mine2 | linear
+    assert mp.widen_local_expert_ids(set(linear)) == union
+    assert mp.widen_local_expert_ids(None) is None
+
+    def kept(layer_idx):
+        return {
+            e for e in range(num_logical)
+            if not mlp._should_skip(
+                f"language_model.model.layers.{layer_idx}.block_sparse_moe.experts.{e}.w1.weight",
+                union)
+        }
+
+    # Outside a permuted model's load the union filter applies.
+    assert kept(3) == union
+    with mp.loading(model):
+        assert kept(3) == mine0
+        assert kept(4) == linear  # layer without a table stays linear
+        assert kept(5) == mine2
+        assert kept(9) == union  # unknown layer: the caller's filter
+        assert not mlp._should_skip("model.layers.3.self_attn.q_proj.weight", union)
+    assert kept(5) == union
+    # A model without permuted layers (the draft) never gets the per-layer filter.
+    with mp.loading(torch.nn.Module()):
+        assert kept(3) == union
+
+
+def test_launcher_filter_is_widened(monkeypatch):
+    import builtins
+
+    num_logical, ep, rank = 16, 4, 0
+    perm = _perm(num_logical, 2)
+    _setup(monkeypatch, {"moe0": perm})
+    layer = _FakeExperts(num_logical, ep, rank, "model.layers.3.mlp.experts")
+    assert mp.prepare(layer)
+    model = torch.nn.Module()
+    model.layer = layer
+    linear = {0, 1, 2, 3}
+    monkeypatch.setattr(builtins, "_EXOS_MODEL_LOAD_FILTER",
+                        (False, (), "model.layers.60.", set(linear)), raising=False)
+    mp.widen_external_filter()  # not loading: untouched
+    assert builtins._EXOS_MODEL_LOAD_FILTER[3] == linear
+    with mp.loading(model):
+        mp.widen_external_filter()
+    got = builtins._EXOS_MODEL_LOAD_FILTER
+    assert got[:3] == (False, (), "model.layers.60.")
+    assert got[3] == linear | {e for e, p in enumerate(perm) if p < 4}
+    # The MTP load keeps its own filter.
+    monkeypatch.setattr(builtins, "_EXOS_MODEL_LOAD_FILTER", (True, (), None, set(linear)))
+    with mp.loading(model):
+        mp.widen_external_filter()
+    assert builtins._EXOS_MODEL_LOAD_FILTER[3] == linear

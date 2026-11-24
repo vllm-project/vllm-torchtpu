@@ -77,6 +77,28 @@ _EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale
 _unused_weight_predicate: Callable[[str], bool] | None = None
 
 
+# True once ``patch_moe_expert_write_staging`` wraps the expert weight loader;
+# statically permuted MoE layers then check their writes at install.
+EXPERT_WRITE_HOOK = False
+
+
+def _moe_permute():
+    # Imported lazily: the layers package pulls in the model code.
+    from vllm_torchtpu.layers.adapter import moe_permute
+
+    return moe_permute
+
+
+def _note_permuted_write(layer, local_id, result, expert_id, weight_name, shard_id):
+    """Record a written expert of a statically permuted layer (install checks
+    that every permuted-local slot was written)."""
+    if local_id == -1 or result is False:
+        return
+    moe_permute = _moe_permute()
+    if moe_permute.ENABLED:
+        moe_permute.note_write(layer, expert_id, weight_name, shard_id)
+
+
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
 
@@ -85,6 +107,12 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
         return False
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
         return False
+    moe_permute = _moe_permute()
+    if moe_permute.ENABLED:
+        # Statically permuted layers keep their own per-layer expert set.
+        skip = moe_permute.skip_expert_tensor(name, expert_id)
+        if skip is not None:
+            return skip
     return expert_id not in local_expert_ids
 
 
@@ -436,11 +464,15 @@ def patch_runai_sharded_expert_streaming() -> None:
     def load_weights(self, model, model_config):
         self._loading_model = model
         try:
-            return original_load_weights(self, model, model_config)
+            with _moe_permute().loading(model):
+                return original_load_weights(self, model, model_config)
         finally:
             self._loading_model = None
 
     def _get_weights_iterator(self, model_or_path: str, revision: str | None):
+        # A launcher's own linear expert filter would drop experts that a
+        # static permutation moved onto this rank.
+        _moe_permute().widen_external_filter()
         try:
             local_expert_ids = _compute_local_expert_ids()
         except AttributeError:
@@ -960,12 +992,13 @@ def patch_moe_expert_write_staging() -> None:
     ):
         # Experts of other ranks and parameters already written early take
         # the direct path, which skips or writes them as before.
+        local_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if (
             param.data.device.type != "tpu"
             or not stager.staging(param)
-            or self._map_global_expert_id_to_local_expert_id(expert_id) == -1
+            or local_id == -1
         ):
-            return orig_weight_loader(
+            result = orig_weight_loader(
                 self,
                 param,
                 loaded_weight,
@@ -974,6 +1007,8 @@ def patch_moe_expert_write_staging() -> None:
                 expert_id,
                 return_success=return_success,
             )
+            _note_permuted_write(self, local_id, result, expert_id, weight_name, shard_id)
+            return result
         result = orig_weight_loader(
             self,
             stager.host_param(param),
@@ -985,6 +1020,7 @@ def patch_moe_expert_write_staging() -> None:
         )
         if result is not False:
             stager.written(param, expert_id, shard_id)
+        _note_permuted_write(self, local_id, result, expert_id, weight_name, shard_id)
         calls[0] += 1
         if calls[0] % 1000 == 0:
             logger.debug(
@@ -1008,6 +1044,8 @@ def patch_moe_expert_write_staging() -> None:
 
     RoutedExperts.weight_loader = weight_loader
     RoutedExperts._tpu_expert_staging_patch = True
+    global EXPERT_WRITE_HOOK
+    EXPERT_WRITE_HOOK = True
     base_loader.process_weights_after_loading = process_weights_after_loading
     logger.info(
         "Applied TPU patch: expert parameters are staged on the host "
