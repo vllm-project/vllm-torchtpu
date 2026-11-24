@@ -1363,7 +1363,8 @@ def _prefill_candidates_kernel(
 
         jax.lax.fori_loop(0, tiles_ref[1], merge, 0)
         # Rows past the last request: a padding token's position is 0, which
-        # sees one block whatever the scores.
+        # sees one block, scored -inf unless forced.
+        pad_scores[...] = jnp.full(pad_scores.shape, _NEG_INF, jnp.float32)
         score, block = _pick_t(
             rank,
             pad_scores,
@@ -1389,6 +1390,27 @@ def _prefill_candidates_kernel(
         )
         out.start()
         out.wait()
+
+
+# VMEM `_prefill_candidates_kernel` may take (v7x: 64 MiB per core, with room
+# for the compiler's own); a larger step picks its large tiles in their own
+# kernel. c64's 8K-token mixed step (2 heads folded) takes ~17 MiB.
+_PREFILL_VMEM_BYTES = 40 << 20
+
+
+def _prefill_vmem_bytes(plan, index_cache, small_rows: int, num_rows: int) -> int:
+    """VMEM of `_prefill_candidates`: the page ring, the tile's keys, the
+    query tile (double-buffered), the assembled output and the small class's
+    picks, whose [rows, 2 * topk] f32 pad to 128 lanes."""
+    _, rows_per_page, _, head_dim = index_cache.shape
+    block_q = plan.large_block_q
+    ring = msa_indexer._RING_SLOTS * plan.large_pages_per_step * rows_per_page
+    return 4 * (
+        ring * head_dim
+        + plan.large_pages * block_q
+        + 2 * block_q * head_dim
+        + (num_rows + block_q + small_rows) * _LANES
+    )
 
 
 def _prefill_candidates(
@@ -1443,6 +1465,14 @@ def _prefill_candidates(
     width = small_packed.shape[1]
     assembled_rows = num_rows + block_q
     ring = (msa_indexer._RING_SLOTS, pages_per_step, rows_per_page, head_dim)
+    page_size = msa_indexer._page_tokens(rows_per_page, index_cache.dtype)
+    chunk = msa_indexer._v3_chunk(pages_per_step, block_q, page_size)
+    step_cols = 8 * _INSERT_UNROLL
+    if num_cols % step_cols or step_cols % chunk:
+        raise NotImplementedError(
+            f"{num_cols} key columns, {chunk}-page dots: the picks scan whole "
+            f"steps of {step_cols} columns"
+        )
     scratch = [
         pltpu.VMEM(ring, jnp.uint32),
         pltpu.SemaphoreType.DMA((msa_indexer._RING_SLOTS,)),
@@ -1453,20 +1483,9 @@ def _prefill_candidates(
         pltpu.VMEM(small_packed.shape, jnp.float32),
         pltpu.SemaphoreType.DMA((2,)),
     ]
-    # [rows, 2 * topk] f32 pads to 128 lanes in VMEM.
-    vmem_bytes = 4 * (
-        ring[0] * ring[1] * ring[2] * ring[3]
-        + num_cols * block_q
-        + (assembled_rows + small_packed.shape[0]) * _LANES
-        + 2 * block_q * head_dim
-    )
-    page_size = msa_indexer._page_tokens(rows_per_page, index_cache.dtype)
+    vmem_bytes = _prefill_vmem_bytes(plan, index_cache, small_packed.shape[0], num_rows)
     return pl.pallas_call(
-        functools.partial(
-            _prefill_candidates_kernel,
-            pick=pick,
-            chunk=msa_indexer._v3_chunk(pages_per_step, block_q, page_size),
-        ),
+        functools.partial(_prefill_candidates_kernel, pick=pick, chunk=chunk),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalars),
             grid=(jnp.maximum(work.group_ends[-1], 1),),
@@ -1580,7 +1599,14 @@ def _class_candidates(
 
     small = plan.small()
     small_picks = class_picks(small, plan.small_block_q, not plan.token_major)
-    if plan.large_tile_major and plan.token_major:
+    if (
+        plan.large_tile_major
+        and plan.token_major
+        and _prefill_vmem_bytes(
+            plan, index_cache, small_picks.shape[0], num_tokens * num_heads
+        )
+        <= _PREFILL_VMEM_BYTES
+    ):
         packed = _prefill_candidates(
             plan,
             index_cache,
