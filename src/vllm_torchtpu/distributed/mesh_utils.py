@@ -138,7 +138,7 @@ def get_cp_group_layout(group: Any | None) -> CpGroupLayout:
     missing = [rank for rank in ranks if rank not in rank_to_device_id]
     if missing:
         raise RuntimeError(
-            "Could not map all CP ranks to TPU global device ids: "
+            "Could not map all group ranks to TPU global device ids: "
             f"missing={missing}, ranks={ranks}, gathered={rank_to_device_id}"
         )
     device_ids = tuple(rank_to_device_id[rank] for rank in ranks)
