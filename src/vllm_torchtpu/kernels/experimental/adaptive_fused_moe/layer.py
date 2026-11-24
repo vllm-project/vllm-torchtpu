@@ -594,6 +594,7 @@ def adaptive_fused_moe(
                 shard_stride=ragged_stride,
                 window_rows=token_gather_window_rows(capacity),
                 scale_rows=act_scale_slab_rows(ragged_stride),
+                fused_gather=bool(envs.MOE_ADAPTIVE_SC_FUSED_GATHER),
             )
         else:
             token_gather = shard_token_gather(
@@ -736,6 +737,7 @@ def adaptive_fused_moe(
         _combine_landed(),
         bool(envs.MOE_ADAPTIVE_SKIP_UNROUTED),
         bool(envs.MOE_ADAPTIVE_SC_SLAB_SCATTER),
+        bool(envs.MOE_ADAPTIVE_SC_FUSED_GATHER),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

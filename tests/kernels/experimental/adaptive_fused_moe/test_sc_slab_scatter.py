@@ -44,6 +44,14 @@ class _NumpyOps:
         return np.full((LANES,), x, np.int32)
 
     @staticmethod
+    def iota():
+        return np.arange(LANES, dtype=np.int32)
+
+    @staticmethod
+    def div(x, y):
+        return (x // y).astype(np.int32)
+
+    @staticmethod
     def load(ref, at):
         at = int(at)
         assert at >= 0 and at + LANES <= ref.size
@@ -54,6 +62,16 @@ class _NumpyOps:
         at = int(at)
         assert at >= 0 and at + LANES <= ref.size
         ref[at : at + LANES] = x
+
+    @staticmethod
+    def load_gather(ref, index, mask):
+        idx = np.asarray(index, np.int32)
+        m = np.asarray(mask, bool)
+        out = np.zeros((LANES,), np.int32)
+        live = idx[m]
+        assert (live >= 0).all() and (live < ref.size).all(), live
+        out[m] = ref[live]
+        return out
 
     def store_scatter(self, ref, index, x, mask):
         idx = np.asarray(index, np.int32)
@@ -320,6 +338,144 @@ def test_sc_slab_scatter_compiles_for_tpu7x_2x2x1(T, has_scale):
         )
 
     args = (arg, arg, arg) if has_scale else (arg, arg)
+    with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+        compiled = jax.jit(fn).lower(*args).compile()
+    assert compiled.as_text()
+
+
+def _emulate_fused(
+    slab_row,
+    scale_bits_tok,
+    *,
+    n_tokens,
+    topk,
+    shard_stride,
+    tok_out_len,
+    scale_out_len,
+    workers=32,
+):
+    n = len(slab_row)
+    has_scale = scale_bits_tok is not None
+    actual_tok_out = max(shard_stride, tok_out_len)
+    out_len = max(actual_tok_out, scale_out_len if has_scale else 0)
+    slice_len = scs._align_up(out_len, workers * LANES) // workers
+    padded_out = slice_len * workers
+    chunk = scs.CHUNK if n >= scs.CHUNK else scs._align_up(max(n, LANES), LANES)
+    n_pad = scs._align_up(n, chunk)
+    r_pad = np.pad(slab_row, (0, n_pad - n), constant_values=shard_stride).astype(
+        np.int32
+    )
+    if has_scale:
+        t_pad = scs._align_up(max(n_tokens, LANES), LANES)
+        s_tok = np.pad(
+            scale_bits_tok, (0, t_pad - n_tokens), constant_values=0
+        ).astype(np.int32)
+    else:
+        s_tok = None
+
+    out_tok = np.full((padded_out,), GARBAGE, np.int32)
+    out_scl = np.full((padded_out,), GARBAGE, np.int32) if has_scale else None
+    ops = _NumpyOps()
+
+    for w in range(workers):
+        lo = w * slice_len
+        valid_hi = min(lo + slice_len, shard_stride)
+        tok_v = np.full((slice_len,), GARBAGE, np.int32)
+        scl_v = np.full((slice_len,), GARBAGE, np.int32) if has_scale else None
+        chunk_off_v = np.zeros((LANES,), np.int32)
+        scs.zero_buf(ops, tok_v, slice_len // LANES)
+        if has_scale:
+            scs.zero_buf(ops, scl_v, slice_len // LANES)
+        ops.store(chunk_off_v, 0, ops.iota())
+        for c in range(0, n_pad, chunk):
+            scs.scatter_chunk_fused(
+                ops,
+                r_pad[c : c + chunk],
+                s_tok,
+                chunk_off_v,
+                tok_v,
+                scl_v,
+                lo=lo,
+                valid_hi=valid_hi,
+                topk=topk,
+                chunk=chunk,
+                num_vec=chunk // LANES,
+                has_scale=has_scale,
+            )
+        out_tok[lo : lo + slice_len] = tok_v
+        if has_scale:
+            out_scl[lo : lo + slice_len] = scl_v
+
+    return out_tok[:actual_tok_out], (out_scl[:scale_out_len] if has_scale else None)
+
+
+@pytest.mark.parametrize("T,K,ep", [(16, 10, 8), (512, 10, 8), (4096, 10, 8)])
+@pytest.mark.parametrize("has_scale", [True, False])
+def test_fused_gather_emulation_matches_jax_reference_bit_exact(T, K, ep, has_scale):
+    slab_row, scale_bits_tok, shard_stride = _case(
+        T, K, ep, seed=T * 10 + int(has_scale)
+    )
+    window_rows = 256
+    scale_rows = act_scale_slab_rows(shard_stride)
+    scale_out_len = scale_rows * HIDDEN_LANE_BLOCK
+    got_tok, got_scl = _emulate_fused(
+        slab_row,
+        scale_bits_tok if has_scale else None,
+        n_tokens=T,
+        topk=K,
+        shard_stride=shard_stride,
+        tok_out_len=shard_stride + window_rows,
+        scale_out_len=scale_out_len,
+    )
+    tok_ids = np.repeat(np.arange(T, dtype=np.int32), K)
+    ref_tok = np.asarray(
+        jnp.zeros((shard_stride,), jnp.int32).at[slab_row].add(tok_ids, mode="drop")
+    )
+    ref_tok = np.pad(ref_tok, (0, window_rows))
+    np.testing.assert_array_equal(got_tok, ref_tok)
+    if has_scale:
+        ref_scl = np.asarray(
+            jnp.zeros((shard_stride,), jnp.int32)
+            .at[slab_row]
+            .add(np.repeat(scale_bits_tok, K), mode="drop")
+        )
+        np.testing.assert_array_equal(got_scl[:shard_stride], ref_scl)
+        assert not got_scl[shard_stride:].any()
+    else:
+        assert got_scl is None
+
+
+@pytest.mark.parametrize("T,has_scale", [(4096, True), (8192, True), (4096, False)])
+def test_sc_slab_scatter_fused_gather_compiles_for_tpu7x_2x2x1(T, has_scale):
+    from jax.experimental import topologies
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    devices = topologies.get_topology_desc(
+        platform="tpu", topology_name="tpu7x:2x2x1"
+    ).devices
+    mesh = Mesh(np.array(devices[:1]), ("x",))
+    rep = NamedSharding(mesh, PartitionSpec())
+    topk = 10
+    n = T * topk
+    shard_stride = scs._align_up(n + 7 * 512 + 128, 128)
+    scale_out_len = scs._align_up(shard_stride, 128) + 128
+    row_arg = jax.ShapeDtypeStruct((n,), jnp.int32, sharding=rep)
+    scl_arg = jax.ShapeDtypeStruct((T,), jnp.int32, sharding=rep)
+
+    def fn(rows, *scl):
+        return scs.sc_fused_slab_scatter(
+            rows,
+            None,
+            scl[0] if scl else None,
+            shard_stride=shard_stride,
+            scale_out_len=scale_out_len if scl else 0,
+            tok_out_len=shard_stride + 256,
+            n_tokens=T,
+            topk=topk,
+            fused_gather=True,
+        )
+
+    args = (row_arg, scl_arg) if has_scale else (row_arg,)
     with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
         compiled = jax.jit(fn).lower(*args).compile()
     assert compiled.as_text()
