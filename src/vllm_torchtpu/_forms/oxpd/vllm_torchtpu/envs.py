@@ -665,6 +665,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE: bool = False
     VLLM_TPU_MK_REL_FETCH_LARGE: bool = False
     VLLM_TPU_MK_GDN_VEC_REC: bool = False
+    VLLM_TPU_MK_UNION_SKIP_ROWCOMPACT: bool = False
     # q38 internal-v3 GDN/QSA ports (end)
 
 
@@ -3765,6 +3766,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # chunks and gdn_rec / gdn_rec_chunked L2-norm, beta, decay, and output
     # norm/gate writes (wired via GDNTunables.vec_rec). Default off.
     "VLLM_TPU_MK_GDN_VEC_REC": env_bool("VLLM_TPU_MK_GDN_VEC_REC"),
+    # Whole-step QSA with union_attn=True (plain / compressed_dcp path): skip dead
+    # per-row compact_row, qi_id/qi_ids scratch, and shrink sharded selection exchange
+    # width 5x (W=640->128). Note: for non-compressed_dcp configs, VLLM_TPU_MK_UNION_LEAN=1
+    # strictly supersedes this by also eliminating qsa_selx completely. Default off.
+    "VLLM_TPU_MK_UNION_SKIP_ROWCOMPACT": env_bool(
+        "VLLM_TPU_MK_UNION_SKIP_ROWCOMPACT"
+    ),
     # q38 internal-v3 GDN/QSA ports (end)
 }
 

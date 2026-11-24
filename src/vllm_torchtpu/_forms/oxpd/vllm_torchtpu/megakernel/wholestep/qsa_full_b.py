@@ -86,6 +86,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         loop_requests: bool = False,
         dcp: int = 1,
         compressed_dcp: bool = False,
+        skip_rowcompact: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -170,6 +171,12 @@ class QSAFullIndexedBlock(QSAFullBlock):
         )
         self.union_attn = union_attn
         assert not union_attn or per_request_scores, "the union is built per request"
+        # `skip_rowcompact` (VLLM_TPU_MK_UNION_SKIP_ROWCOMPACT, `union_attn=True`):
+        # skip SMEM `qi_ids` DMAs and (when not `debug`) drop VMEM `qi_id`, skip
+        # per-row `compact_row`, and shrink the sharded selection exchange row width
+        # 5x (`W = 640 -> 128`). For `compressed_dcp=False`, `union_lean=True`
+        # strictly supersedes this by folding `qsa_selx` into the union exchange.
+        self.skip_rowcompact = bool(skip_rowcompact) and bool(union_attn)
         self.dcp = max(int(dcp), 1)
         assert self.dcp in (1, 2), dcp
         assert self.dcp == 1 or union_attn, "main-KV DCP is implemented on the union path"

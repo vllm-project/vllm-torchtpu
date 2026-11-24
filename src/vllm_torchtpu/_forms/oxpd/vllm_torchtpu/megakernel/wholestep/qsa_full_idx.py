@@ -336,7 +336,7 @@ class _IdxMixin:
                 kept = jnp.sum((sel & (lid < ga)).astype(I32))
                 # Row bit r - lo of every pool-path group it selects.
                 scr["qu_code"][...] = scr["qu_code"][...] | jnp.where(sel & (lid < ga), jnp.left_shift(1, r - lo), 0)
-                if not lean:  # MM: the row's compacted ids (read only by the per-row path and the debug output)
+                if not lean and self._need_ids():  # MM: the row's compacted ids (read only by the per-row path and the debug output)
                     bp = jnp.where(lid < ga, b, -1)
                     b2 = jnp.where(sel & (lid < ga), bp, -1)
                     pos = ix.compact_row(
@@ -344,18 +344,19 @@ class _IdxMixin:
                         jnp.zeros((1, 1), I32) + kept, K, consts,
                     )
                     scr["qi_id"][r] = pos
-                    cs = [
-                        pltpu.make_async_copy(
-                            scr["qi_id"].at[r], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)], scr["qi_sem"].at[1]
-                        ),
-                        pltpu.make_async_copy(
-                            scr["qi_z"], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)], scr["qi_sem"].at[2]
-                        ),
-                    ]
-                    for c in cs:
-                        c.start()
-                    for c in cs:
-                        c.wait()
+                    if not self._skip_qi_ids():
+                        cs = [
+                            pltpu.make_async_copy(
+                                scr["qi_id"].at[r], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)], scr["qi_sem"].at[1]
+                            ),
+                            pltpu.make_async_copy(
+                                scr["qi_z"], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)], scr["qi_sem"].at[2]
+                            ),
+                        ]
+                        for c in cs:
+                            c.start()
+                        for c in cs:
+                            c.wait()
                 scr["qi_kvl"][r] = 4 * kept
                 return carry
 
