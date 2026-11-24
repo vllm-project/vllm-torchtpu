@@ -54,7 +54,8 @@ def split_metadata[M](md: M, split: int) -> tuple[M, M, M]:
 
 
 def zero_of(dep: torch.Tensor) -> torch.Tensor:
-    """An exact f32 zero [1, 1] computed from ``dep`` (a data dependence).
-    Subtract it to keep a value's bits (x - 0 keeps the sign of -0)."""
+    """An f32 zero [1, 1] computed from ``dep`` (a data dependence): adding
+    or subtracting it keeps every nonzero value's bits (it is -0 when
+    ``dep[0, 0]`` is negative, which may flip a zero's sign)."""
     x = dep[:1, :1].float()
     return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0) * 0

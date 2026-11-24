@@ -275,7 +275,9 @@ class MiniMaxM3MoE(nn.Module):
         rows = out.shape[0] // len(pieces)
         return [
             out[i * rows : (i + 1) * rows]
-            + _shared_expert(act_fn, p if e4m3 else x[i * rows : (i + 1) * rows], *shared)
+            + _shared_expert(
+                act_fn, p if e4m3 else x[i * rows : (i + 1) * rows], *shared
+            )
             for i, p in enumerate(pieces)
         ]
 

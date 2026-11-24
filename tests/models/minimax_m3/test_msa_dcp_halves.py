@@ -18,8 +18,6 @@ the caches donated, equal the whole step's per token (fp8 and 4-bit caches,
 prefill-sized steps). Interpret mode on 2 host devices:
 ``XLA_FLAGS=--xla_force_host_platform_device_count=2 pytest ...``."""
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -95,7 +93,9 @@ def _program(fp4, split, halves):
         # The second half's writes follow the first half's reads (model.py).
         edge = jnp.nan_to_num(out_a[:1, :1].astype(jnp.float32)) * 0
         x = (x[0][split:] + edge.astype(x[0].dtype),) + tuple(t[split:] for t in x[1:])
-        out_b, kv, index, scales = attend(rank, x, kv, index, scales, q[:, split:], second)
+        out_b, kv, index, scales = attend(
+            rank, x, kv, index, scales, q[:, split:], second
+        )
         return jnp.concatenate([out_a, out_b]), kv, index, scales
 
     sh, rep = P("dcp"), P()

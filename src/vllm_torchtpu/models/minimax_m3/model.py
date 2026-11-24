@@ -57,7 +57,6 @@ from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse, sp_norm
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.ops.sp_norm import get_add_norm_quant_op
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
-from vllm_torchtpu.models.minimax_m3.step_halves import zero_of
 
 logger = init_logger(__name__)
 
