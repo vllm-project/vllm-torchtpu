@@ -113,9 +113,14 @@ def test_metadata_reuse_matches_full_rebuild(num_reqs):
     step's metadata objects (positions and seq_lens set in place) and the
     memoized walk geometry equals the flag-off rebuild field for field,
     unified mamba indices included, and the reuse ran."""
-    wl = Workload(5, num_reqs, max_model_len=8192, churn=0.06, prefill=0.04)
-    full = make_runner(max_model_len=8192)
-    inc = make_runner(max_model_len=8192)
+    # Blocks as long as the served ones' runs between crossings (a crossing
+    # bumps the block-table version and rebuilds), plus some churn.
+    blocks = {"attn_block": 256, "mamba_block": 256}
+    wl = Workload(
+        5, num_reqs, max_model_len=8192, churn=0.02, prefill=0.02, **blocks
+    )
+    full = make_runner(max_model_len=8192, **blocks)
+    inc = make_runner(max_model_len=8192, **blocks)
     # The cached combined distribution upload (and its views) is what keeps
     # the request distributions the same objects step to step.
     full._fast_token_substitution = inc._fast_token_substitution = True
