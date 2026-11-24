@@ -19,9 +19,9 @@ decoder layer two torch ops over the armed all-reduce's mesh:
 
   op_a(x, residual, norm_w, w, s, rank) -> (qkv, r): the previous layer's
       FFN partial x all-reduced with the input layernorm's residual add +
-      norm in one kernel, then qkv_proj as an XLA op (left to XLA, it hides
-      the next ops' VMEM prefetches; inside the kernel they were exposed,
-      c4 twin j-ff67a853);
+      norm in one kernel, then qkv_proj: in the same kernel with
+      TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_QKV (its weight streams in under the
+      all-reduce), else as an XLA op;
   op_b(a, w, s, residual, norm_w, rank) -> (normed, r): o_proj on the
       attention heads a, all-reduced, the post-attention residual add + norm,
       one kernel.
@@ -95,7 +95,7 @@ def _op_bodies(n: int, max_rows: int, reduce, eps: float, e4m3: bool, qkv: bool)
 
     def body_b(a, w, s, residual, norm_w, rank):
         m, h = residual.shape
-        if kernel.supported(m, h, n, max_rows, weight=w.shape):
+        if kernel.oproj_supported(m, h, n, max_rows, w.shape):
             return kernel.matmul_ar_norm(a, w, s, residual, norm_w, rank, n, eps)
         return kernel.reference_add_norm(
             reduce(proj(a, w, s), rank), residual, norm_w, eps
@@ -382,9 +382,12 @@ def arm(model: torch.nn.Module, max_rows: int) -> int:
     models[0].residual_ar_armed = True
     logger.info(
         "MiniMax-M3: %d decoder layers fuse their TP all-reduces with o_proj "
-        "and the residual add + norm up to %d rows%s.",
+        "and the residual add + norm up to %d rows%s%s.",
         len(layers),
         max_rows,
+        "; qkv_proj runs in the FFN-exit kernel"
+        if envs.TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_QKV
+        else "",
         "; qkv_proj contracts e4m3 rows"
         if envs.TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_E4M3
         else "",

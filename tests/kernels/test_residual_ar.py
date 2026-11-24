@@ -41,6 +41,37 @@ def test_exchange_shape(m, want):
     assert residual_ar._exchange_shape(m, HIDDEN) == want
 
 
+@pytest.mark.parametrize("n", (4, 8))
+@pytest.mark.parametrize("m", ROWS + (48,))
+def test_oproj_supported_at_minimax_tp(n, m, monkeypatch):
+    """matmul_ar_norm takes MiniMax-M3's decode rows at TP4 and TP8 (o_proj
+    K = 8192 / n per rank), its planned VMEM covering its scratch, with the
+    slice ring inside its byte cap."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    k_, k = residual_ar, 8192 // n
+    assert k_.oproj_supported(m, HIDDEN, n, 48, (k, HIDDEN))
+    scratch = sum(
+        k_.ar.tiled_bytes(shape, dtype, info)
+        for shape, dtype in k_._oproj_buffers(m, HIDDEN, n, k)
+    )
+    planned = k_._oproj_vmem_bytes(m, HIDDEN, n, k, info)
+    assert scratch < planned <= info.vmem_capacity_bytes * k_.ar.VMEM_FRACTION
+    _, _, halves, cw, slots = k_._oproj_layout(m, HIDDEN, n, k)
+    assert slots * halves * k * cw <= k_._OPROJ_RING_BYTES
+
+
+def test_oproj_refuses_unaligned_slices(monkeypatch):
+    """TP16 at 8 rows would slice 192-wide columns: not lane aligned."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    assert not residual_ar.oproj_supported(8, HIDDEN, 16, 48, (512, HIDDEN))
+
+
 def _worker():
     import jax
     import jax.numpy as jnp

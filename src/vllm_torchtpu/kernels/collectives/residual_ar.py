@@ -19,12 +19,17 @@ the all-reduce, the residual add and the RMSNorm as separate programs (plus
 reshapes into and out of the all-reduce's view and a per-layer (1 + w)
 convert). Here:
 
-  `matmul_ar_norm` (attention exit): o_proj ``p = proj(a)`` contracted as its
-      e4m3 weight streams in (the barrier hides under it), all-reduced,
-      ``r = bf16(p + residual)`` and its GemmaRMSNorm;
+  `matmul_ar_norm` (attention exit): o_proj ``p = proj(a)`` streamed by
+      output-column slices, one per rank's all-reduce chunk, each slice sent
+      to its owner as soon as it is contracted (the reduce-scatter runs under
+      the weight stream), then the all-gather, ``r = bf16(p + residual)`` and
+      its GemmaRMSNorm;
   `ar_add_norm` (FFN exit): the FFN's partial all-reduced, ``r = bf16(x +
       residual)`` and its GemmaRMSNorm, optionally as e4m3 rows with per-row
-      scales (kernels/sp_norm.py's quantization) for an e4m3 x e4m3 qkv_proj.
+      scales (kernels/sp_norm.py's quantization) for an e4m3 x e4m3 qkv_proj;
+  `ar_add_norm_matmul` (FFN exit): `ar_add_norm` followed by qkv_proj on
+      its normalized rows, the qkv weight streaming into VMEM during the
+      all-reduce.
 
 The all-reduce is moe_tp_decode/all_reduce.py's epilogue on a layout without
 padding rows (`_exchange_shape`). Rounding follows the torch path: ``proj(v) =
@@ -63,6 +68,9 @@ _FP8_ROW_ALIGN = 32
 _QKV_CHUNK_BYTES = _CHUNK_BYTES
 _QKV_SLOTS = 8
 _VMEM_HEADROOM = 2 << 20
+# matmul_ar_norm holds whole o_proj column slices (all K rows, one rank's
+# columns): at most this many bytes of them at once, and at least one slice.
+_OPROJ_RING_BYTES = 8 << 20
 
 
 def _chunks(
@@ -245,30 +253,130 @@ def _matmul_ar_norm_kernel(
     o_v,
     r_v,
     w_v,
-    acc,
+    send,
+    recv,
     red,
+    x_v,
+    s_row,
     io_sem,
     w_sem,
-    *scr,
-    spec,
-    chunks,
+    rs_send,
+    rs_recv,
+    ag_send,
+    ag_recv,
+    loc,
+    *,
+    n,
+    k_chunks,
     eps,
 ):
+    """o_proj by output-column slices, each the all-reduce's column chunk of
+    one rank: a slice is sent to its owner as soon as it is contracted, so
+    the reduce-scatter runs under the rest of the weight stream; the owner's
+    own slice comes last. Then the rank-order f32 sum and the all-gather of
+    `ar._exchange`, the same bits."""
     m, h = res_v.shape
-    ar.prologue(spec)
+    xm, xh = x_v.shape
+    halves = xm // m
+    cw = xh // n
+    me = meta_ref[0, 0]
+    barrier = pltpu.get_barrier_semaphore()
+    for d in range(n):
+        pl.semaphore_signal(barrier, inc=1, device_id=(d,), device_id_type=ar._MESH)
     a_in, s_in, *rest = _load(
         [(a_hbm, a_v), (s_hbm, s_v), (res_hbm, res_v), (nw_hbm, nw_v)], io_sem
     )
-    ring = _Ring(w_hbm, w_v, w_sem, chunks)
+    slots = w_v.shape[0]
+
+    def owner(k):
+        return lax.rem(me + k, n)
+
+    def copies(k):
+        t = owner(k + 1)
+        return [
+            pltpu.make_async_copy(
+                w_hbm.at[:, pl.ds(pl.multiple_of(j * xh + t * cw, cw), cw)],
+                w_v.at[k % slots, j],
+                w_sem.at[k % slots, j],
+            )
+            for j in range(halves)
+        ]
+
+    for k in range(min(slots, n)):
+        for c in copies(k):
+            c.start()
     a_in.wait()
-    ring.contract(_pad_rows(a_v[...], acc.shape[0]), acc)
     s_in.wait()
-    partial = _to_exchange(_project(acc[pl.ds(0, m), :], _row(s_v)), h)
-    ar.epilogue(spec, meta_ref[0, 0], spec.m, partial, red, scr)
+    # The scale as an f32 [1, nout] row: its column slices start on lane tiles.
+    s_row[...] = _row(s_v)
+    lhs = _pad_rows(a_v[...], _padded(m))
+    pl.semaphore_wait(barrier, n)
+    sends = []
+    for k in range(n):
+        t = owner(k + 1)
+        for c in copies(k):
+            c.wait()
+        parts = []
+        for j in range(halves):
+            acc = jnp.zeros((lhs.shape[0], cw), F32)
+            for k0, kc in k_chunks:
+                acc += jnp.dot(
+                    lhs[:, k0 : k0 + kc],
+                    w_v[k % slots, j, pl.ds(k0, kc), :],
+                    preferred_element_type=F32,
+                )
+            scale = s_row[:, pl.ds(pl.multiple_of(j * xh + t * cw, cw), cw)]
+            parts.append(_project(acc[:m], scale))
+        chunk = (parts[0] if halves == 1 else jnp.concatenate(parts, 0)).astype(BF16)
+        if k + slots < n:
+            for c in copies(k + slots):
+                c.start()
+        if k == n - 1:
+            recv[me] = chunk
+            break
+        send[k] = chunk
+        copy = pltpu.make_async_remote_copy(
+            send.at[k],
+            recv.at[me],
+            rs_send.at[k],
+            rs_recv.at[me],
+            device_id=(t,),
+            device_id_type=ar._MESH,
+        )
+        copy.start()
+        sends.append(copy)
+    for step in range(1, n):
+        q = lax.rem(me + n - step, n)
+        pltpu.make_async_copy(recv.at[q], recv.at[q], rs_recv.at[q]).wait_recv()
+    red[...] = ar._sum_slots(lambda q: recv[q], n).astype(BF16)
+
+    def chunk_of(t):
+        return ar._cols(x_v, t, cw)
+
+    own = pltpu.make_async_copy(red, chunk_of(me), loc.at[0])
+    own.start()
+    for step in range(1, n):
+        t = lax.rem(me + step, n)
+        copy = pltpu.make_async_remote_copy(
+            red,
+            chunk_of(me),
+            ag_send.at[step],
+            ag_recv.at[me],
+            device_id=(t,),
+            device_id_type=ar._MESH,
+        )
+        copy.start()
+        sends.append(copy)
+    own.wait()
+    for step in range(1, n):
+        q = lax.rem(me + n - step, n)
+        pltpu.make_async_copy(chunk_of(q), chunk_of(q), ag_recv.at[q]).wait_recv()
+    for copy in sends:
+        copy.wait_send()
     for copy in rest:
         copy.wait()
     _add_norm_store(
-        _from_exchange(red[...].astype(F32), m),
+        _from_exchange(x_v[...].astype(F32), m),
         res_v,
         nw_v,
         eps,
@@ -466,6 +574,70 @@ def ar_add_norm(
     )
 
 
+def _oproj_layout(m: int, h: int, n: int, k: int) -> tuple[int, int, int, int, int]:
+    """(xm, xh, halves, cw, slots) of matmul_ar_norm on [m, h] rows over n
+    ranks with K = k: the exchange layout, its column halves, a rank's
+    column-slice width and the weight slices in flight."""
+    xm, xh = _exchange_shape(m, h)
+    halves, cw = xm // m, xh // n
+    # A slice over the byte cap leaves one slot: each slice then streams in
+    # only after the previous one is contracted (correct, unoverlapped).
+    slots = max(1, min(_SLOTS, n, _OPROJ_RING_BYTES // (halves * k * cw)))
+    return xm, xh, halves, cw, slots
+
+
+def _oproj_buffers(
+    m: int, h: int, n: int, k: int, a_dtype=BF16, nw_dtype=BF16, s_dtype=BF16
+) -> list[tuple[tuple, jnp.dtype]]:
+    """matmul_ar_norm's VMEM scratch (shape, dtype), in kernel order."""
+    xm, xh, halves, cw, slots = _oproj_layout(m, h, n, k)
+    return [
+        ((m, k), a_dtype),  # the attention heads
+        ((m, h), BF16),  # residual
+        ((h,), nw_dtype),  # norm weight
+        ((h,), s_dtype),  # o_proj channel scale
+        ((m, h), BF16),  # normed rows
+        ((m, h), BF16),  # new residual
+        ((slots, halves, k, cw), FP8),  # o_proj column slices in flight
+        ((n, xm, cw), BF16),  # reduce-scatter sends
+        ((n, xm, cw), BF16),  # reduce-scatter receive slots
+        ((xm, cw), BF16),  # the owned, reduced chunk
+        ((xm, xh), BF16),  # the all-gathered sum
+        ((1, h), F32),  # the scale as an f32 row
+    ]
+
+
+def _oproj_vmem_bytes(m: int, h: int, n: int, k: int, info, dtypes=()) -> int:
+    """An upper bound of matmul_ar_norm's VMEM: its scratch (`dtypes`: the
+    heads', norm weight's and scale's, bf16 by default) plus the padded LHS,
+    the slice accumulators and the f32 temporaries of the sum and the add +
+    norm."""
+    t = functools.partial(ar.tiled_bytes, info=info)
+    xm, _, halves, cw, _ = _oproj_layout(m, h, n, k)
+    buffers = _oproj_buffers(m, h, n, k, *dtypes)
+    scratch = sum(t(shape, dtype) for shape, dtype in buffers)
+    temps = (
+        t((_padded(m), k), BF16)
+        + halves * t((_padded(m), cw), F32)
+        + 2 * t((xm, cw), F32)
+        + 6 * t((_padded(m), h), F32)
+    )
+    return scratch + temps
+
+
+def oproj_supported(m: int, h: int, n: int, max_rows: int, weight) -> bool:
+    """Whether `matmul_ar_norm` of [m, h] rows on the e4m3 o_proj weight [k,
+    nout] = `weight` fits one call (m <= max_rows)."""
+    k, nout = weight
+    if not 0 < m <= max_rows or m % 8 or n < 2 or k % 128 or nout != h:
+        return False
+    info = pltpu.get_tpu_info()
+    if not ar.supported(n, *_exchange_shape(m, h), info):
+        return False
+    need = _oproj_vmem_bytes(m, h, n, k, info) + _VMEM_HEADROOM
+    return need <= info.vmem_capacity_bytes * ar.VMEM_FRACTION
+
+
 def matmul_ar_norm(
     a, w, s, residual, norm_w, rank, n: int, eps: float, interpret=False
 ):
@@ -475,13 +647,20 @@ def matmul_ar_norm(
     r)."""
     m, h = residual.shape
     k, nout = w.shape
+    if not oproj_supported(m, h, n, m, w.shape):
+        raise ValueError(
+            f"matmul_ar_norm: [{m}, {h}] rows on an o_proj weight [{k}, {nout}] "
+            f"over {n} ranks do not fit one call (oproj_supported)"
+        )
     info = pltpu.get_tpu_info()
-    spec = ar.make_spec(n, *_exchange_shape(m, h))
-    chunks, ring = _ring_shape(k, nout, w.dtype.itemsize)
+    _, _, halves, _, slots = _oproj_layout(m, h, n, k)
+    # The K order of the earlier K-chunk ring: the same f32 sums per column.
+    k_chunks = _chunks(k, nout * w.dtype.itemsize)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    limit = _vmem_bytes(m, h, spec, info, (k, nout)) + _VMEM_HEADROOM
+    dtypes = (a.dtype, norm_w.dtype, s.dtype)
+    limit = _oproj_vmem_bytes(m, h, n, k, info, dtypes) + _VMEM_HEADROOM
     return pl.pallas_call(
-        functools.partial(_matmul_ar_norm_kernel, spec=spec, chunks=chunks, eps=eps),
+        functools.partial(_matmul_ar_norm_kernel, n=n, k_chunks=k_chunks, eps=eps),
         # The normed rows go to XLA ops, which read them fastest where XLA
         # puts them.
         out_shape=(
@@ -493,18 +672,14 @@ def matmul_ar_norm(
             in_specs=[hbm] * 5,
             out_specs=[hbm, hbm],
             scratch_shapes=[
-                pltpu.VMEM(a.shape, a.dtype),
-                pltpu.VMEM(residual.shape, residual.dtype),
-                pltpu.VMEM(norm_w.shape, norm_w.dtype),
-                pltpu.VMEM(s.shape, s.dtype),
-                pltpu.VMEM((m, h), BF16),
-                pltpu.VMEM((m, h), BF16),
-                pltpu.VMEM(ring, w.dtype),
-                pltpu.VMEM((_padded(m), nout), F32),
-                pltpu.VMEM((spec.m, spec.h), BF16),
+                *(
+                    pltpu.VMEM(shape, dtype)
+                    for shape, dtype in _oproj_buffers(m, h, n, k, *dtypes)
+                ),
                 pltpu.SemaphoreType.DMA((4,)),
-                pltpu.SemaphoreType.DMA((ring[0],)),
-                *ar.scratch_shapes(spec),
+                pltpu.SemaphoreType.DMA((slots, halves)),
+                *[pltpu.SemaphoreType.DMA((n,)) for _ in range(4)],
+                pltpu.SemaphoreType.DMA((2,)),
             ],
         ),
         compiler_params=pltpu.CompilerParams(
