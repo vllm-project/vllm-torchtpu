@@ -6548,7 +6548,7 @@ class TPUModelRunner(GPUModelRunner):
                             draft_token_ids=draft_token_ids,
                             num_draft_tokens=draft_lengths,
                             target_logits=target_logits_ng,
-                            bonus_token_ids=bonus_token_ids,
+                            bonus_token_ids=sampled_bonus_ids,
                             segment_ids=segment_ids,
                             group_indices=group_indices,
                             max_draft_tokens=k,
