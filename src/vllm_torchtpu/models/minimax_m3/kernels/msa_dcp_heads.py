@@ -456,7 +456,8 @@ def exchange_async() -> bool:
         _async_logged = True
         init_logger(__name__).warning(
             "%s=1: head-parallel MSA page exchange started ahead of the "
-            "decode-row attention and the selection merge, retired after them.",
+            "decode-row attention and the selection merge, retired after them "
+            "(the cache stays an operand until the wait).",
             EXCHANGE_ASYNC_ENV,
         )
     return on
