@@ -57,10 +57,11 @@ from .ring import egive, egive_group, es_wait, etake
 
 def rb_scratch(ex: Any, mp: Any) -> dict[str, Any]:
     """Scratch of the row-bucketed expert loop (row codes are small exact ints)."""
-    nrow = rup(mp.E // 128, 8)
+    rb_cols = 128 if mp.local_wn else mp.E
+    nrow = rup(rb_cols // 128, 8)
     return {
-        "rbpre": pltpu.VMEM((ex.MR, mp.E), BF16),
-        "rbpreT": pltpu.VMEM((mp.E, 128), F32),  # f32: aligned row tiles (aligned_row)
+        "rbpre": pltpu.VMEM((ex.MR, rb_cols), BF16),
+        "rbpreT": pltpu.VMEM((rb_cols, 128), F32),  # f32: aligned row tiles (aligned_row)
         "rbcv": pltpu.VMEM((nrow, 128), I32),
         "rbcs": pltpu.SMEM((nrow, 128), I32),
         "rbc_sem": pltpu.SemaphoreType.DMA(()),
@@ -70,25 +71,27 @@ def rb_scratch(ex: Any, mp: Any) -> dict[str, Any]:
 def rb_tables(m: MoEEmit) -> None:
     """Routed-row counts (`rbcv`, DMA'd to `rbcs` by `route`) and row codes from `wn`."""
     ex, mp, scr, stream = m.ex, m.mp, m.scr, m.stream
-    MR, E = ex.MR, mp.E
-    mk = jnp.where(scr["wn"][...] != 0.0, 1.0, 0.0)  # [MR, E] routed (row, expert)
-    cnt = jnp.sum(mk, axis=0, keepdims=True).astype(I32)  # [1, E]
+    MR = ex.MR
+    rb_cols = 128 if mp.local_wn else mp.E
+    mk = jnp.where(scr["wn"][...] != 0.0, 1.0, 0.0)  # [MR, rb_cols] routed (row, expert)
+    cnt = jnp.sum(mk, axis=0, keepdims=True).astype(I32)  # [1, rb_cols]
     nrow = scr["rbcv"].shape[0]
-    for j in range(E // 128):
+    n_blk = rb_cols // 128
+    for j in range(n_blk):
         scr["rbcv"][j : j + 1, :] = cnt[:, j * 128 : (j + 1) * 128]
-    if E // 128 < nrow:
-        scr["rbcv"][E // 128 :, :] = jnp.zeros((nrow - E // 128, 128), I32)
+    if n_blk < nrow:
+        scr["rbcv"][n_blk:, :] = jnp.zeros((nrow - n_blk, 128), I32)
     r_i = lax.broadcasted_iota(I32, (MR, MR), 0)
     c_i = lax.broadcasted_iota(I32, (MR, MR), 1)
     lstrict = jnp.where(c_i < r_i, 1.0, 0.0).astype(BF16)
     # pre[r, e] = routed rows of expert e above row r (0/1 bf16 products, f32 sums: exact).
     pre = stream.mm(lstrict, mk.astype(BF16))
-    code = jnp.where(mk > 0.0, pre, -1.0)  # [MR, E]
+    code = jnp.where(mk > 0.0, pre, -1.0)  # [MR, rb_cols]
     scr["rbpre"][...] = code.astype(BF16)
     pad = 128 - MR  # transpose a full 128-row tile (as `topk_rows_on_lanes`)
     if pad:
-        code = jnp.concatenate([code, jnp.full((pad, E), -1.0, F32)], axis=0)
-    scr["rbpreT"][...] = code.T  # [E, 128]
+        code = jnp.concatenate([code, jnp.full((pad, rb_cols), -1.0, F32)], axis=0)
+    scr["rbpreT"][...] = code.T  # [rb_cols, 128]
 
 
 def aligned_row(ref: Any, r: Any, n: int) -> jax.Array:
@@ -124,6 +127,8 @@ def experts_piped_ep_rb(m: MoEEmit, l_idx, n_hit):
         DIRECT0 = mp.r2_direct_store
 
         def count(e):
+            if mp.local_wn:
+                return scr["rbcs"][0, lax.bitwise_and(e, 127)]
             return scr["rbcs"][lax.shift_right_logical(e, 7), lax.bitwise_and(e, 127)]
 
         def blocks(cnt, body):
@@ -140,12 +145,23 @@ def experts_piped_ep_rb(m: MoEEmit, l_idx, n_hit):
 
         def gather_mat(e, G, r0):
             """One-hot `P [G, MB]`: P[j, r] = 1 iff row r is expert e's routed row r0 + j."""
-            crow = aligned_row(scr["rbpreT"], e, MB)  # [1, MB]
+            e_idx = lax.bitwise_and(e, 127) if mp.local_wn else e
+            crow = aligned_row(scr["rbpreT"], e_idx, MB)  # [1, MB]
             want = (lax.broadcasted_iota(I32, (G, MB), 0) + r0).astype(F32)
             return jnp.where(crow == want, 1.0, 0.0).astype(BF16)
 
         def code_col(e):
             """Row codes of expert e as a column `[MR, 1]` (f32 ints, -1 = not routed)."""
+            if mp.local_wn:
+                return jnp.sum(
+                    jnp.where(
+                        m.lane128 == lax.bitwise_and(e, 127),
+                        scr["rbpre"][...].astype(F32),
+                        0.0,
+                    ),
+                    axis=1,
+                    keepdims=True,
+                )
             return jnp.sum(
                 jnp.where(lane_e8 == e, scr["rbpre"][...].astype(F32), 0.0),
                 axis=1,
@@ -197,9 +213,20 @@ def experts_piped_ep_rb(m: MoEEmit, l_idx, n_hit):
 
         def finish(e, cnt, s):
             """part[r] += wcol[r] * y[r] on expert e's routed rows (scatter of y)."""
-            wcol = jnp.sum(
-                jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True
-            )
+            if mp.local_wn:
+                wcol = jnp.sum(
+                    jnp.where(
+                        m.lane128 == lax.bitwise_and(e, 127), scr["wn"][...], 0.0
+                    ),
+                    axis=1,
+                    keepdims=True,
+                )
+            else:
+                wcol = jnp.sum(
+                    jnp.where(lane_e8 == e, scr["wn"][...], 0.0),
+                    axis=1,
+                    keepdims=True,
+                )
             ccol = code_col(e)
             if "acc" in _ABLATE:
                 return

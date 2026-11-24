@@ -217,6 +217,18 @@ def route_topk(
     else:
         scr["hitv"][...] = ids
     wsel = jnp.where(sel, p8, 0.0)
-    scr["wn"][...] = jnp.where(
+    wn_full = jnp.where(
         row8 < n_valid, wsel / jnp.sum(wsel, axis=-1, keepdims=True), 0.0
     )
+    if mp.local_wn:
+        blk = lax.shift_right_logical(m.me * ER, 7)
+        wn_loc = wn_full[:, 0:128]
+        for j in range(1, E // 128):
+            wn_loc = jnp.where(
+                jnp.broadcast_to(blk == j, (MR, 128)),
+                wn_full[:, j * 128 : (j + 1) * 128],
+                wn_loc,
+            )
+        scr["wn"][...] = wn_loc
+    else:
+        scr["wn"][...] = wn_full

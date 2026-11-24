@@ -642,6 +642,9 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_AR2D_SINGLE_SLOT: bool = False
     VLLM_TPU_MK_MOE_EXACT_WIDTH: bool = False
     VLLM_TPU_MK_MOE_SKIP_PAD: bool = False
+    VLLM_TPU_MK_MOE_DIRECT_STORE: bool = False
+    VLLM_TPU_MK_MOE_TOPK_LANES: bool = False
+    VLLM_TPU_MK_MOE_LOCAL_WN: bool = False
     VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE: bool = False
     VLLM_TPU_MK_VMEM_CUTS: str = ""
     VLLM_TPU_MK_VMEM_CUT_ROWS: int = 33
@@ -3665,6 +3668,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Megakernel MoE: skip padded rows (row >= query_start_loc[-1]) in router weights,
     # shared gate, expert dedup, and row-bucket counts (matching TPU_MOE_SKIP_PADDED_TOKENS).
     "VLLM_TPU_MK_MOE_SKIP_PAD": env_bool("VLLM_TPU_MK_MOE_SKIP_PAD", False),
+    # Direct VMEM store on MoE expert tile 0 (skips zero-fill + +=).
+    "VLLM_TPU_MK_MOE_DIRECT_STORE": env_bool("VLLM_TPU_MK_MOE_DIRECT_STORE", False),
+    # Batcher odd-even lane top-k for E >= 128 router gating.
+    "VLLM_TPU_MK_MOE_TOPK_LANES": env_bool("VLLM_TPU_MK_MOE_TOPK_LANES", False),
+    # Rank-local 128-lane `wn` scratch & wcol scan on EP (E % 128 == 0, E > 128).
+    "VLLM_TPU_MK_MOE_LOCAL_WN": env_bool("VLLM_TPU_MK_MOE_LOCAL_WN", False),
     # Main-KV DCP-2 whole-step buckets of 128+ rows: drop one expert ring slot
     # (nbe - 1, 2 MiB VMEM) when not using single-slot AR2D (`hier == 4`).
     "VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE": env_bool("VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE", False),

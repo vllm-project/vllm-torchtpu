@@ -76,6 +76,7 @@ class MoEParams:
     dedup_vec: bool = False
     skip_pad: bool = False
     exact_width: bool = False
+    local_wn: bool = False
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,8 @@ class MoETunables:
     skip_pad: bool = False
     # Slice active `MR` rows in `PIPE_EP` when `MR < MB` (`B <= 8`) (`VLLM_TPU_MK_MOE_EXACT_WIDTH`).
     exact_width: bool = False
+    # Rank-local 128-lane `wn` scratch and wcol scan on EP (`VLLM_TPU_MK_MOE_LOCAL_WN`).
+    local_wn: bool = False
 
     # `exact`: moving the field keeps hidden states and caches bit-identical
     # (scheduling only); `approx`: changes or may change the arithmetic.
@@ -131,6 +134,7 @@ class MoETunables:
         "dedup_vec": "exact",  # same hit list and order as the scalar dedup
         "skip_pad": "approx",  # masks padded rows >= n_valid (exact on real rows)
         "exact_width": "approx",  # slices active MR rows when MR < MB (exact on 0:MR; padding rows untouched)
+        "local_wn": "approx",  # rank-local 128-lane wn scratch/reduction on EP
     }
 
 
@@ -225,6 +229,15 @@ def derive_moe_params(
         and ex.MR <= rb_lanes  # per-expert row codes fit one lane row
         and g.E % rb_lanes == 0  # 128-lane rows of the per-expert row counts
     )
+    local_wn = bool(
+        tt.local_wn
+        and not moe_tp
+        and not ecopy
+        and g.E > 128
+        and g.E % 128 == 0
+        and er <= 128
+        and 128 % er == 0
+    )
     return MoEParams(
         H=g.H,
         E=g.E,
@@ -263,4 +276,5 @@ def derive_moe_params(
         dedup_vec=dedup_vec,
         skip_pad=bool(tt.skip_pad),
         exact_width=bool(tt.exact_width),
+        local_wn=local_wn,
     )
