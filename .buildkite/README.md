@@ -18,6 +18,48 @@ releases the `wait` once the retry passes and runs the uploader step. The
 `oncall-fix` label raises job and Kueue workload priority without changing the
 suite.
 
+By default, the `tests` lane's TPU steps run only on TPU v7x. A build picks
+other chips with one of these extras in `CI_EXTRAS` (set it in the Buildkite UI
+or API, alone or with another extra, e.g.
+`CI_EXTRAS=perf-eval,tpu-all`):
+
+| `CI_EXTRAS` | The `tests` lane's TPU steps run on |
+|---|---|
+| neither extra | v7x |
+| `tpu-all` | v6e and v7x, each step twice, side by side |
+| `tpu-v6e` | v6e alone, not alongside v7x |
+
+A build names one of the two at most. `tpu-v6e` is refused on a build that
+runs the nightly report (`NIGHTLY=1` or a tag), which waits on the v7x
+steps. A merge-queue, release or integration build refuses either one, since a
+failing v6e step would block the merge, the release or the LKG promotion. A
+build that sets `KUBE_SHAPE_SINGLE` or `KUBE_SHAPE_MULTI` is rejected: the
+generation brings its shapes.
+
+The v6e steps do not pass yet, and they are not `soft_fail`, so a build that
+runs them is expected to fail: for one, the `tests_omni` tests are not
+qualified for v6e's 32 GB of HBM. No build has to set either extra. Use them on
+a manual build to see where v6e stands.
+
+These extras choose the chips for the `tests` lane only. A build with
+`NIGHTLY=1` also runs the nightly model and feature tests for both chips (the
+"TPU v6e nightly Tests" and "TPU v7x nightly Tests" groups) and the nightly
+report, whatever `CI_EXTRAS` is set to.
+
+In the Buildkite UI, the name of each of the `tests` lane's TPU steps starts
+with the chip it runs on (`v6e ...` or `v7x ...`).
+
+A TPU step in `pipeline_tests.yml` is written once, with no generation in its
+`label` or `key`. For each generation, `bootstrap.py` reads the file through
+`buildkite-agent pipeline upload --dry-run`, puts the generation's name (`v6e`,
+`v7x`) before every label and group name, and the name and an underscore
+(`v6e_`, `v7x_`) before every key the file defines (and before a `depends_on`
+that names one), then uploads the result. If that fails, the upload fails; a
+file never goes up unstamped. A step outside the file that waits on one of its
+steps names the prefixed key, as the nightly report in `pipeline_verify.yml`
+does. A new generation is an entry in `tpu_generations.py` (`TpuGeneration`)
+and no change to a step.
+
 `pipeline_perf.yml` holds the perf/eval
 steps. Post-merge builds do not run them, and PR builds run them only when the
 PR has the `run-perf-eval` label (or `run-full-ci`, which sets `NIGHTLY=1` and
