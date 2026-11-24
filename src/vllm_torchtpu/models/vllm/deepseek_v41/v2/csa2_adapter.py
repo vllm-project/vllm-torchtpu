@@ -329,7 +329,20 @@ def _select_gather_attend(
             # Records before the pipeline's next step, so the gather is
             # issued ahead of it and runs beside it instead of after it.
             records, following = jax.lax.optimization_barrier((records, following))
-        gathered = gather_csa2_kv_sc(word_banks, scale_banks, records, deep=deep)
+        last = start + rows == tokens
+        # The last tile's gather and attention follow every other step, so
+        # in halves the first half's attention overlaps the second's gather.
+        pieces = 2 if last and rows % 32 == 0 else 1
+        size = rows // pieces
+        gathered = [
+            gather_csa2_kv_sc(
+                word_banks,
+                scale_banks,
+                records[piece * size : (piece + 1) * size],
+                deep=deep,
+            )
+            for piece in range(pieces)
+        ]
         if state is None:
             owners, pending = None, None
             all_scales = jnp.zeros((tokens, 512), jnp.float32)
@@ -337,7 +350,8 @@ def _select_gather_attend(
         else:
             owners, all_scales, all_counts, pending = state
         update = functools.partial(jax.lax.dynamic_update_slice_in_dim, axis=0)
-        all_scales = update(all_scales, gathered[1], start)
+        for piece, (_, piece_scales) in enumerate(gathered):
+            all_scales = update(all_scales, piece_scales, start + piece * size)
         all_counts = update(all_counts, counts, start)
 
         def attend(owners, offset, tile_gathered, tile_counts):
@@ -359,9 +373,16 @@ def _select_gather_attend(
         # is complete, so it never waits on the gather just started.
         if pending is not None:
             owners = attend(owners, start - pending[1].shape[0], *pending)
-        if start + rows < tokens:
-            return (owners, all_scales, all_counts, (gathered, counts)), following
-        owners = attend(owners, start, gathered, counts)
+        if not last:
+            return (owners, all_scales, all_counts, (gathered[0], counts)), following
+        for piece, piece_gathered in enumerate(gathered):
+            offset = piece * size
+            owners = attend(
+                owners,
+                start + offset,
+                piece_gathered,
+                counts[offset : offset + size],
+            )
         return (*owners, all_scales, all_counts), following
 
     selected, _, (output, words, gathered_scales, counts) = select_fp8_indexer_tiles(
