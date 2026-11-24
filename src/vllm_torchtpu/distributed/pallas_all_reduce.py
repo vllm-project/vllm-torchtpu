@@ -141,7 +141,9 @@ def _make_norm_op(mesh, max_bytes: int, direct_rows: int, qar_min_rows: int, eps
         check_vma=False,
     )
 
-    def fn(x: jax.Array, res: jax.Array, w: jax.Array, rank: jax.Array):
+    def fn(
+        x: jax.Array, res: jax.Array, w: jax.Array, rank: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
         args = (x, res, w, rank)
         return sharded(
             *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
