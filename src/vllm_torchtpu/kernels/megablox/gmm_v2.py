@@ -211,10 +211,12 @@ class WeightsRef(RhsRef):
     def get_scale(self, replicate_size: int | None = None) -> jax.Array:
         assert self.scale is not None
         if self.global_scale is not None:
-            scale = self.scale[...]
-            if scale.dtype == jnp.uint8:
-                scale = lax.bitcast_convert_type(scale, jnp.float8_e4m3fn)[:, None, :]
-            scale = scale.astype(jnp.float32) * self.global_scale[...]
+            # Combine on the dense [blocks, tn] block, then add the sublane dim.
+            if self.scale.dtype == jnp.uint8:
+                scale = lax.bitcast_convert_type(self.scale[...], jnp.float8_e4m3fn)
+            else:
+                scale = self.scale[:, 0, :]
+            scale = (scale.astype(jnp.float32) * self.global_scale[...])[:, None, :]
             if replicate_size is not None:
                 scale = jnp.broadcast_to(
                     scale, (scale.shape[0], replicate_size, scale.shape[-1])
