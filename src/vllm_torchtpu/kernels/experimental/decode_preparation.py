@@ -37,7 +37,7 @@ class FusionMode(enum.Enum):
 # prefill-sized call and falls back silently, even under REQUIRE.
 ROUTING_TOKENS = frozenset({96, 192, 256, 288, 384})  # per-shard t_local
 PRESORT_TOKENS = ROUTING_TOKENS
-COMPACT_TOKENS = frozenset({96, 192, 240, 256, 288, 384})
+COMPACT_TOKENS = frozenset({16, 32, 64, 96, 128, 144, 192, 240, 256, 288, 384})
 COMPRESSOR_STATE_TOKENS = frozenset({96, 192, 240, 256, 288})
 COMPRESSOR_ADDRESS_TOKENS = frozenset({288})
 INDEXER_TOKENS = frozenset({128, 256, 288, 384, 512})
