@@ -281,6 +281,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = False
     VLLM_TPU_PREFILL_TPOT_HOLD_HORIZON: float = 1.0
     VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S: float = 0.0
+    VLLM_TPU_PREFILL_SRPT: bool = False
+    VLLM_TPU_PREFILL_SRPT_AGING_TOKENS_PER_S: float = 256.0
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS: int = 0
@@ -1832,6 +1834,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ago, which bounds how long holds starve a prompt's TTFT. 0 turns it off.
     "VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S": env_nonnegative_float(
         "VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S", 0.0
+    ),
+    # PrefillSpacingScheduler: order the waiting window and the running prefill
+    # chunks by one aged shortest-remaining key, uncached prompt tokens left
+    # minus VLLM_TPU_PREFILL_SRPT_AGING_TOKENS_PER_S per second since arrival,
+    # so a long prompt eventually goes ahead of every newer short one.
+    # Off (default): uncached tokens alone, no aging.
+    "VLLM_TPU_PREFILL_SRPT": env_bool("VLLM_TPU_PREFILL_SRPT"),
+    # PrefillSpacingScheduler with VLLM_TPU_PREFILL_SRPT: prompt tokens one
+    # second of waiting is worth in the SRPT key. A prompt with R uncached
+    # tokens left outranks any newer request after R / this many seconds
+    # (0: pure shortest-remaining first, no starvation bound).
+    "VLLM_TPU_PREFILL_SRPT_AGING_TOKENS_PER_S": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_SRPT_AGING_TOKENS_PER_S", 256.0
     ),
     # MiniMax M3 DCP steps of at most this many tokens merge the attention
     # partials with one packed all-to-all instead of an LSE all-gather plus an
