@@ -118,6 +118,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasAttentionBackend,
     PallasAttentionBackendImpl,
+    page_table_entry_bytes,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
     static_verify_q_len,
@@ -9213,8 +9214,11 @@ class TPUModelRunner(GPUModelRunner):
                 return self.max_num_blocks_per_req
             return cdiv(model_len, self.block_size)
 
+        entry_bytes = page_table_entry_bytes(self.vllm_config)
         self.num_reqs_max_model_len = min(
-            PallasAttentionBackend.get_max_num_seqs_for_pages(widest_table(None)),
+            PallasAttentionBackend.get_max_num_seqs_for_pages(
+                widest_table(None), entry_bytes
+            ),
             self.max_num_reqs,
             self.max_num_tokens,
         )
@@ -9222,7 +9226,7 @@ class TPUModelRunner(GPUModelRunner):
         if self.most_model_len is not None:
             pages = widest_table(self.most_model_len)
             self.num_reqs_most_model_len = min(
-                PallasAttentionBackend.get_max_num_seqs_for_pages(pages),
+                PallasAttentionBackend.get_max_num_seqs_for_pages(pages, entry_bytes),
                 self.max_num_reqs,
                 self.max_num_tokens,
             )
