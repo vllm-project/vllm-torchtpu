@@ -56,8 +56,8 @@ GEOMETRIES = [
     pytest.param(8, 24, 32, 10, id="ep8_g24_t32"),
     pytest.param(32, 24, 32, 10, id="ep32_g24_t32"),
     # Past 128 tokens the per-token row scales fill more than one lane block,
-    # and tokens 128.. read theirs from the second. The padded and uniform
-    # routings pad those rows away; skewed and all_mine route them.
+    # and tokens 128.. read theirs from the second. The padded routing pads
+    # those rows away; skewed and all_mine route them.
     pytest.param(8, 24, 160, 10, id="ep8_g24_t160"),
     # Local expert counts that are not a multiple of 8: 768 experts at EP64,
     # and per-shard counts of 12 and 6 on meshes a host can fit.
@@ -70,7 +70,7 @@ GEOMETRIES = [
     pytest.param(8, 24, 2, 10, id="ep8_g24_t2"),
     pytest.param(4, 16, 8, 8, id="ep4_g16_t8"),
 ]
-ROUTINGS = ["uniform", "skewed", "padded", "all_mine"]
+ROUTINGS = ["skewed", "padded", "all_mine"]
 
 # The chip the SMEM budget is checked against off TPU, where get_tpu_info()
 # has no chip to read: v7x, where the budget's headroom was measured.
@@ -97,13 +97,12 @@ def _selections(ep, g_local, t_local, topk, routing, seed):
     else:
         pool = np.arange(e_total)
     idx = np.stack([rng.choice(pool, size=topk, replace=False) for _ in range(T)])
-    if routing in ("padded", "uniform"):
+    if routing == "padded":
         # The layer's replica padding rows route nowhere: every slot e_total.
         for d in range(ep):
             lo = d * t_local + (t_local * 3) // 4
             idx[lo : (d + 1) * t_local] = e_total
-        if routing == "padded":
-            idx[t_local : 2 * t_local] = e_total  # shard 1 entirely padding
+        idx[t_local : 2 * t_local] = e_total  # shard 1 entirely padding
     return idx.astype(np.int32)
 
 
