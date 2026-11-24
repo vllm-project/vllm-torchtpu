@@ -96,6 +96,14 @@ def register(layer: Any) -> None:
         logger.warning_once("[moe-route-trace] skipping layer %s", name)
         return
     layer._route_trace_row = len(_names)
+    # The row index is a per-layer buffer (graph input), not a Python
+    # constant: layers can share one compiled layer graph, which would bake
+    # the first layer's row into every layer.
+    layer.register_buffer(
+        "_route_trace_row_t",
+        torch.tensor([len(_names)], dtype=torch.int64, device=layer.w13_weight.device),
+        persistent=False,
+    )
     _names.append(name)
     if len(_names) == 1:
         logger.info(
@@ -135,7 +143,12 @@ def record(layer: Any, topk_ids: torch.Tensor) -> None:
                 )
                 npad = mask.to(torch.int32).sum(dtype=torch.int32).view(1)
                 _pad.index_copy_(0, slot, npad)
-    _ring[row].index_copy_(0, slot, counts.view(1, _num_experts))
+    row_t = getattr(layer, "_route_trace_row_t", None)
+    if row_t is None:
+        _ring[row].index_copy_(0, slot, counts.view(1, _num_experts))
+        return
+    flat = _ring.view(MAX_ROWS * RING, _num_experts)
+    flat.index_copy_(0, row_t * RING + slot, counts.view(1, _num_experts))
 
 
 def _tp_rank() -> int:
