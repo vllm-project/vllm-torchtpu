@@ -794,6 +794,91 @@ def test_fp8_tp_shards_reconstruct_checkpoint(
     torch.testing.assert_close(torch.cat(downs, dim=1), expected.t(), rtol=0, atol=0)
 
 
+def _stub_moe_kernel_setup(monkeypatch):
+    """Stub the routing and kernel setup; return the layers it ran for."""
+    from vllm_torchtpu.layers.adapter import fused_moe_ep
+    from vllm_torchtpu.layers.adapter.quantization import fp8 as fp8_mod
+
+    calls = []
+    monkeypatch.setattr(
+        fp8_mod.moe_routing,
+        "register_experts_start_buffer",
+        lambda layer, **kwargs: calls.append(layer),
+    )
+    monkeypatch.setattr(fp8_mod, "prebuild_fused_moe_kernel", lambda **kwargs: None)
+    monkeypatch.setattr(fused_moe_ep, "prebuild_fused_moe_ep", lambda *a, **k: None)
+    return calls
+
+
+def _runtime_params(layer):
+    return (
+        layer.w13_weight,
+        layer.w13_weight_scale_inv,
+        layer.w2_weight,
+        layer.w2_weight_scale_inv,
+    )
+
+
+def test_fp8_online_experts_dummy_load(make_fp8_experts, monkeypatch):
+    """A dummy load allocates on meta, then vLLM quantizes the layer on its own."""
+    from vllm.config.load import LoadConfig
+    from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+
+    calls = _stub_moe_kernel_setup(monkeypatch)
+    layer = make_fp8_experts(
+        VllmFp8Config(is_checkpoint_fp8_serialized=False),
+        256,
+        tp_size=1,
+        tp_rank=0,
+        load_format="dummy",
+    )
+    assert layer.quant_method.uses_meta_device
+    assert layer.w13_weight.is_meta and layer.w2_weight.is_meta
+
+    DummyModelLoader(LoadConfig(load_format="dummy")).load_weights(layer, None)
+
+    assert layer.w13_weight.dtype == torch.float8_e4m3fn
+    assert layer.w2_weight.dtype == torch.float8_e4m3fn
+    for param in _runtime_params(layer):
+        assert not param.is_meta
+        assert param.float().isfinite().all()
+    assert calls == [layer]
+
+    # The model-wide call after loading leaves the processed layer alone.
+    quantized = _runtime_params(layer)
+    layer.quant_method.process_weights_after_loading(layer)
+    assert calls == [layer]
+    for got, ref in zip(_runtime_params(layer), quantized):
+        assert got is ref
+
+
+def test_fp8_online_experts_real_load_is_eager(make_fp8_experts):
+    """A real checkpoint keeps eager BF16 allocation (quantized after loading)."""
+    layer = make_fp8_experts(
+        VllmFp8Config(is_checkpoint_fp8_serialized=False), 256, tp_size=1, tp_rank=0
+    )
+    assert not layer.quant_method.uses_meta_device
+    assert not layer.w13_weight.is_meta
+    assert layer.w13_weight.dtype == torch.bfloat16
+
+
+def test_fp8_online_experts_load_eagerly_with_expert_placement(
+    make_fp8_experts, monkeypatch
+):
+    """TPU_EXPERT_PLACEMENT needs the whole checkpoint before any processing."""
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", "placement.json")
+    layer = make_fp8_experts(
+        VllmFp8Config(is_checkpoint_fp8_serialized=False),
+        256,
+        tp_size=1,
+        tp_rank=0,
+        load_format="dummy",
+    )
+    assert not layer.quant_method.uses_meta_device
+    assert not layer.w13_weight.is_meta
+    assert layer.w13_weight.dtype == torch.bfloat16
+
+
 class FakeQuant:
     """Minimal quant config for testing."""
 

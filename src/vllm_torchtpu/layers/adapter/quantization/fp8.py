@@ -42,10 +42,12 @@ the blockwise Pallas kernel path instead.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from math import gcd
 from typing import TYPE_CHECKING, Literal, cast
 
 import torch
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.linear import (
@@ -68,6 +70,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_s
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+)
+from vllm.model_executor.model_loader.reload.layerwise import (
+    initialize_online_processing,
 )
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
@@ -801,6 +806,12 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # vLLM types this as a GPU MoE backend; TPU uses none.
         # pyrefly: ignore[bad-assignment]
         self.fp8_backend = None
+        # Read here, while vLLM builds the model under the current config.
+        vllm_config = get_current_vllm_config_or_none()
+        load_format = getattr(
+            getattr(vllm_config, "load_config", None), "load_format", None
+        )
+        self._dummy_load = str(getattr(load_format, "value", load_format)) == "dummy"
 
     @property
     def supports_internal_mk(self) -> bool:
@@ -967,15 +978,35 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 VllmUnquantizedFusedMoEMethod,
             )
 
-            VllmUnquantizedFusedMoEMethod.create_weights(
-                self,
-                layer,
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition,
-                params_dtype,
-                **extra_weight_attrs,
-            )
+            # Online quantization: allocate the BF16 experts on the meta device.
+            # vLLM's loaders then materialize, load and process one layer at a
+            # time, so only one layer's BF16 experts are ever on the device.
+            with torch.device("meta") if self.uses_meta_device else nullcontext():
+                VllmUnquantizedFusedMoEMethod.create_weights(
+                    self,
+                    layer,
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition,
+                    params_dtype,
+                    **extra_weight_attrs,
+                )
+            if self.uses_meta_device:
+                initialize_online_processing(layer)
+
+    @property
+    def uses_meta_device(self) -> bool:  # pyrefly: ignore[bad-override]
+        # Only dummy loads go layer by layer. With a real checkpoint, vLLM's
+        # layerwise loader keeps a layer's loaded tensors in host memory until
+        # all of them arrive, and checkpoints that spread a layer's experts
+        # over distant files (e.g. Qwen3.5-397B) then run out of host RAM.
+        # TPU_EXPERT_PLACEMENT renumbers the routers after the whole checkpoint
+        # loads and before any layer is processed, so it keeps eager loading.
+        return (
+            not self.quant_config.is_checkpoint_fp8_serialized
+            and getattr(self, "_dummy_load", False)
+            and not envs.TPU_EXPERT_PLACEMENT
+        )
 
     @property
     def is_monolithic(self) -> bool:
@@ -994,6 +1025,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         assert isinstance(layer, RoutedExperts)
         layer = cast("TpuRoutedExperts", layer)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
+
+        if self.uses_meta_device:
+            # vLLM's layerwise loading processes the layer as soon as its
+            # weights are in, then calls again for the whole model. It clears
+            # this flag when it reloads the layer.
+            if getattr(layer, "_already_called_process_weights_after_loading", False):
+                return
+            layer._already_called_process_weights_after_loading = True
 
         self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
         activation_str = self._set_tpu_activation(layer)
