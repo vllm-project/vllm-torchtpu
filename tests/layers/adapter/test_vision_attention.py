@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 
 from vllm_torchtpu.layers.adapter.vision_attention import TpuMMEncoderAttention
@@ -27,7 +28,19 @@ def make_attention(num_heads=2, head_size=4, scale=1.0, num_kv_heads=None):
     return attn
 
 
-def test_vision_flash_attention_pads_and_builds_segments(monkeypatch):
+@pytest.mark.parametrize(
+    ("seq_len", "cu", "expected"),
+    [
+        (5, [0, 2, 5], [1, 1, 2, 2, 2] + [3] * (128 - 5)),
+        # Padding past 128 rows of it gets one more segment per 128 rows.
+        (130, [0, 2], [1] * 2 + [2] * 128 + [3] * 126),
+        # MMEncoderManager zero-fills the tail of a shorter cu_seqlens.
+        (300, [0, 300, 0, 0], [3] * 300 + [4] * 84),
+    ],
+)
+def test_vision_flash_attention_pads_and_builds_segments(
+    monkeypatch, seq_len, cu, expected
+):
     calls = {}
 
     def fake_vision_op(q, k, v, q_seg, kv_seg):
@@ -41,20 +54,20 @@ def test_vision_flash_attention_pads_and_builds_segments(monkeypatch):
     monkeypatch.setattr(TpuMMEncoderAttention, "_vision_op", fake_vision_op)
 
     attn = make_attention(scale=0.5)
-    q = torch.arange(1 * 5 * 2 * 4, dtype=torch.float32).reshape(1, 5, 2, 4)
+    q = torch.arange(1 * seq_len * 2 * 4, dtype=torch.float32).reshape(1, seq_len, 2, 4)
     k = q + 100
     v = q + 200
-    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+    cu_seqlens = torch.tensor(cu, dtype=torch.int32)
 
     out = attn._flash_attention(q, k, v, cu_seqlens)
 
+    padded = len(expected)
     assert out.shape == q.shape
-    assert calls["q"].shape == (1, 2, 128, 4)
-    assert calls["k"].shape == (1, 2, 128, 4)
-    assert calls["v"].shape == (1, 2, 128, 4)
-    assert calls["q_seg"].shape == (1, 128)
-    assert calls["kv_seg"].shape == (1, 128)
-    expected = [1, 1, 2, 2, 2] + [3] * (128 - 5)
+    assert calls["q"].shape == (1, 2, padded, 4)
+    assert calls["k"].shape == (1, 2, padded, 4)
+    assert calls["v"].shape == (1, 2, padded, 4)
+    assert calls["q_seg"].shape == (1, padded)
+    assert calls["kv_seg"].shape == (1, padded)
     assert calls["q_seg"][0].tolist() == expected
     assert calls["kv_seg"][0].tolist() == expected
 

@@ -66,6 +66,17 @@ class BlockSizes:
     block_k_major: int
     block_k: int
     block_b: int
+    # With segment ids: walk only each row group's kv window, in row groups of
+    # block_q_group rows. Pays off on packed inputs with many segments (vision
+    # buckets of several images); on one long segment it is slower, so
+    # only the shapes measured with it turn it on.
+    kv_windows: bool = False
+    # The kv-window walk's row group and the chunk that covers what block_k
+    # chunks leave of a window (at block_k 2048, rounding a window up to
+    # block_k wastes 1024 columns on average). Defaults: the Cosmos3 2x72
+    # measurements.
+    block_q_group: int = 1024
+    block_k_tail: int = 512
 
     def __post_init__(self):
         def verify_major_minor(prefix, suffix, major, minor):
@@ -234,12 +245,7 @@ def flash_attention(
                     block_k=kv_seq_len,
                 )
         else:
-            block_sizes = BlockSizes(
-                block_q=tuned_params.block_q,
-                block_k_major=tuned_params.block_k_major,
-                block_k=tuned_params.block_k,
-                block_b=tuned_params.block_b,
-            )
+            block_sizes = BlockSizes(**dataclasses.asdict(tuned_params))
     return _flash_attention(
         q,
         k,
@@ -281,6 +287,12 @@ def _flash_attention(
         block_sizes.block_q,
         block_sizes.block_k_major,
         block_sizes.block_k,
+        # Only the multi-step body has a kv loop to window.
+        (block_sizes.block_q_group, block_sizes.block_k_tail)
+        if segment_ids is not None
+        and block_sizes.kv_windows
+        and block_sizes.block_k != k.shape[2]
+        else None,
         vmem_limit_bytes,
         debug,
     )
@@ -296,13 +308,22 @@ def below_or_on_diag(r, r_blk_size, c, c_blk_size):
     return ((r + 1) * r_blk_size - 1) > (c * c_blk_size)
 
 
-def _flash_attention_kernel(q_tile_ref, *args, **kwargs):
+def _flash_attention_kernel(*refs, kv_windows: tuple[int, int] | None, **kwargs):
+    # With kv windows (row group, tail block_k), the scalar-prefetched kv
+    # windows of every q block's row groups come first.
+    kv_walk = None
+    if kv_windows is not None:
+        kv_windows_ref, *refs = refs
+        kv_walk = (kv_windows_ref, *kv_windows)
+    q_tile_ref, *args = refs
     block_b = q_tile_ref.shape[0]
     # If we're not going to tile the softmax, then we can avoid a bunch of VPU ops.
     if kwargs["block_k"] == kwargs["kv_seq_len"]:
         kernel = _flash_attention_kernel_single_batch_single_step
     else:
-        kernel = _flash_attention_kernel_single_batch
+        kernel = functools.partial(
+            _flash_attention_kernel_single_batch, kv_walk=kv_walk
+        )
     for batch_idx in range(block_b):
         kernel((batch_idx, 0), q_tile_ref, *args, **kwargs)
 
@@ -327,6 +348,7 @@ def _flash_attention_kernel_single_batch(
     block_k,
     kv_seq_len,
     mask_value,
+    kv_walk: tuple[Any, int, int] | None = None,
 ):
     block_k_major = k_tile_ref.shape[2]
     block_q = q_tile_ref.shape[2]
@@ -348,28 +370,42 @@ def _flash_attention_kernel_single_batch(
     else:
         should_run = True
 
+    # The kv-window body (BlockSizes.kv_windows) normalizes acc once, at the
+    # store; the other calls keep the per-step normalization they were tuned
+    # and validated with.
+    deferred_norm = kv_walk is not None
+    head_dim_repeats, rem = divmod(head_dim, MIN_BLOCK_SIZE)
+    l_broadcast = lambda l: jnp.tile(l, (1, head_dim_repeats))
+    if rem:
+        if head_dim_repeats == 0:
+            l_broadcast = lambda l: l[:, :head_dim]
+        else:
+            raise NotImplementedError(
+                f"{head_dim=} should be a multiple of {MIN_BLOCK_SIZE} if larger"
+            )
+
     @pl.when(should_run)
     def run():
-        @pl.loop(0, block_k_major, step=block_k, unroll=True)
-        def _body(start_k):
-            m_prev = m_scratch_ref[batch_idx]
-            l_prev = l_scratch_ref[batch_idx]
-            q = q_tile_ref[batch_idx]  # [block_q, head_dim]
+        def _attend_rows(start_k, block_k, row, rows):
+            rs = pl.dslice(row, rows)
+            m_prev = m_scratch_ref[(*batch_idx, rs)]
+            l_prev = l_scratch_ref[(*batch_idx, rs)]
+            q = q_tile_ref[(*batch_idx, rs)]  # [rows, head_dim]
             k = k_tile_ref[
                 (*batch_idx, pl.dslice(start_k, block_k), slice(None))
             ]  # [block_k, head_dim]
 
             s = jax.lax.dot_general(
                 q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32
-            )  # [block_q, block_k]
+            )  # [rows, block_k]
 
             # Add attention bias if needed.
             # TODO(tanburn) Should the attention bias be added before or after
             # multiplication by sm_scale?
             if ab_tile_ref is not None:
-                ab = ab_tile_ref[
-                    (*batch_idx, pl.dslice(None), pl.dslice(start_k, block_k))
-                ].astype(jnp.float32)
+                ab = ab_tile_ref[(*batch_idx, rs, pl.dslice(start_k, block_k))].astype(
+                    jnp.float32
+                )
                 s += ab
 
             if sm_scale != 1.0:
@@ -383,17 +419,17 @@ def _flash_attention_kernel_single_batch(
                         f"kv block size must be a multiple of {NUM_LANES}"
                     )
                 q_segment_ids = jnp.tile(
-                    q_segment_ids_tile_ref[batch_idx[0]], (1, repeats)
-                )  # [block_q, block_k].
+                    q_segment_ids_tile_ref[batch_idx[0], rs], (1, repeats)
+                )  # [rows, block_k].
                 kv_segment_ids = kv_segment_ids_tile_ref[
                     batch_idx[0], :1, pl.dslice(start_k, block_k)
                 ]  # [1, block_k].
                 mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
             if causal:
-                mask_shape = (block_q, block_k)
+                mask_shape = (rows, block_k)
                 row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
-                row_ids += q_seq_idx * block_q
+                row_ids += q_seq_idx * block_q + row
                 col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
                 col_ids += kv_seq_idx * block_k_major + start_k
                 causal_mask = col_ids <= row_ids
@@ -403,8 +439,8 @@ def _flash_attention_kernel_single_batch(
 
             s = s if mask is None else s + jnp.where(mask, 0.0, mask_value)
 
-            m_curr = jnp.max(s, axis=1)[:, None]  # Row max, shape [block_q, 1].
-            m_next = jnp.maximum(m_prev, m_curr)  # Shape [block_q, 128].
+            m_curr = jnp.max(s, axis=1)[:, None]  # Row max, shape [rows, 1].
+            m_next = jnp.maximum(m_prev, m_curr)  # Shape [rows, 128].
 
             block_k_repeats, rem = divmod(block_k, MIN_BLOCK_SIZE)
             if rem:
@@ -413,35 +449,117 @@ def _flash_attention_kernel_single_batch(
                 )
             p = jnp.exp(s - jnp.tile(m_next, (1, block_k_repeats)))
 
-            alpha = jnp.exp(m_prev - m_next)  # Shape [block_q, 128].
+            alpha = jnp.exp(m_prev - m_next)  # Shape [rows, 128].
 
             l_corr = alpha * l_prev
+            l_next = jnp.sum(p, axis=1)[:, None] + l_corr
 
-            l_next = jnp.sum(p, axis=1)[:, None] + l_corr  # Shape [block_q, 128]
+            l_scratch_ref[(*batch_idx, rs)] = l_next
+            m_scratch_ref[(*batch_idx, rs)] = m_next
 
-            head_dim_repeats, rem = divmod(head_dim, MIN_BLOCK_SIZE)
-            l_broadcast = lambda l: jnp.tile(l, (1, head_dim_repeats))
-            if rem:
-                if head_dim_repeats == 0:
-                    l_broadcast = lambda l: l[:, :head_dim]
-                else:
-                    raise NotImplementedError(
-                        f"{head_dim=} should be a multiple of {MIN_BLOCK_SIZE} if larger"
-                    )
-            l_scratch_ref[batch_idx] = l_next
-            m_scratch_ref[batch_idx] = m_next
-
-            l_next_inv_safe = jnp.where(l_next == 0.0, 1.0, 1.0 / l_next)
-            acc_scratch_ref[batch_idx] *= l_broadcast(l_corr * l_next_inv_safe)
             v = v_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]
             o_curr = jax.lax.dot(
                 p.astype(v.dtype), v, preferred_element_type=jnp.float32
             )
-            acc_scratch_ref[batch_idx] += o_curr * l_broadcast(l_next_inv_safe)
+            if deferred_norm:
+                # acc stays unnormalized until the store: normalizing every
+                # step costs a reciprocal and two more passes over acc per kv
+                # block.
+                acc_scratch_ref[(*batch_idx, rs)] = (
+                    acc_scratch_ref[(*batch_idx, rs)] * l_broadcast(alpha) + o_curr
+                )
+            else:
+                l_next_inv_safe = jnp.where(l_next == 0.0, 1.0, 1.0 / l_next)
+                acc_scratch_ref[(*batch_idx, rs)] *= l_broadcast(
+                    l_corr * l_next_inv_safe
+                )
+                acc_scratch_ref[(*batch_idx, rs)] += o_curr * l_broadcast(
+                    l_next_inv_safe
+                )
+
+        # With kv windows, row groups of at most block_q_group rows: the
+        # scheduler overlaps one group's softmax with the next group's matmuls,
+        # which a single [block_q, block_k] tile serializes.
+        group = block_q if kv_walk is None else kv_walk[1]
+        groups = [(row, min(group, block_q - row)) for row in range(0, block_q, group)]
+
+        def _attend(start_k, block_k=block_k, groups=groups):
+            for row, rows in groups:
+                _attend_rows(start_k, block_k, row, rows)
+
+        if kv_walk is None:
+            pl.loop(0, block_k_major, step=block_k, unroll=True)(_attend)
+            return
+        kv_windows_ref, _, tail_block_k = kv_walk
+
+        # A partial last batch tile's rows past the batch are dropped; they
+        # read the last row's windows to stay inside the table.
+        batch = jnp.minimum(
+            pl.program_id(0) * q_tile_ref.shape[0] + batch_idx[0],
+            kv_windows_ref.shape[0] - 1,
+        )
+        kv_start = kv_seq_idx * block_k_major
+        tail_k = math.gcd(block_k, block_k_major, tail_block_k)
+
+        def _window(g, i):
+            return kv_windows_ref[batch, (q_seq_idx * len(groups) + g) * 2 + i]
+
+        def _walk(g, groups):
+            # Only row group g's kv window [lo, hi) can hold a matching
+            # segment. Cover its part in this kv block with block_k chunks and
+            # the rest with tail_k ones, placed inside the kv block: columns
+            # they add past the window are masked like any other mismatch.
+            lo = jnp.maximum(_window(g, 0), kv_start)
+            hi = jnp.minimum(_window(g, 1), kv_start + block_k_major)
+            width = jnp.maximum(hi - lo, 0)
+            if tail_k == block_k:
+                num_main, num_tail = pl.cdiv(width, block_k), 0
+            else:
+                num_main = width // block_k
+                num_tail = pl.cdiv(width - num_main * block_k, tail_k)
+            # tail_k divides block_k and block_k_major, so the chunks fit.
+            first = jnp.minimum(
+                lo - kv_start, block_k_major - num_main * block_k - num_tail * tail_k
+            )
+
+            @pl.loop(0, num_main)
+            def _main(i):
+                _attend(pl.multiple_of(first + i * block_k, NUM_LANES), groups=groups)
+
+            if tail_k != block_k:
+
+                @pl.loop(0, num_tail)
+                def _tail(i):
+                    start = first + num_main * block_k + i * tail_k
+                    _attend(pl.multiple_of(start, NUM_LANES), tail_k, groups)
+
+        # Row groups with one window walk it together; a q block that
+        # straddles a segment boundary walks each group's own window instead
+        # of their union.
+        same = functools.reduce(
+            jnp.logical_and,
+            [
+                _window(g, i) == _window(0, i)
+                for g in range(1, len(groups))
+                for i in range(2)
+            ],
+            jnp.bool_(True),
+        )
+        pl.when(same)(lambda: _walk(0, groups))
+        if len(groups) > 1:
+
+            @pl.when(jnp.logical_not(same))
+            def _apart():
+                for g, group in enumerate(groups):
+                    _walk(g, [group])
 
     @pl.when(kv_seq_idx == (kv_seq_len // block_k_major) - 1)
     def store_output():
-        o_tile_ref[batch_idx] = acc_scratch_ref[batch_idx].astype(o_tile_ref.dtype)
+        acc = acc_scratch_ref[batch_idx]
+        if deferred_norm:
+            l = l_scratch_ref[batch_idx]
+            acc *= l_broadcast(jnp.where(l == 0.0, 1.0, 1.0 / l))
+        o_tile_ref[batch_idx] = acc.astype(o_tile_ref.dtype)
         if l_ref is not None:
             l_ref[batch_idx] = l_scratch_ref[batch_idx].astype(l_ref.dtype)
         if m_ref is not None:
@@ -563,6 +681,7 @@ def _flash_attention_impl(
     block_q,
     block_k_major,
     block_k,
+    kv_windows,
     vmem_limit_bytes,
     debug,
 ):
@@ -626,6 +745,7 @@ def _flash_attention_impl(
 
     kernel = functools.partial(
         _flash_attention_kernel,
+        kv_windows=kv_windows,
         causal=causal,
         mask_value=DEFAULT_MASK_VALUE,
         sm_scale=sm_scale,
@@ -722,10 +842,28 @@ def _flash_attention_impl(
         kv_segment_ids_spec,
     ]
 
+    windows = ()
+    if kv_windows is not None:
+        # Each row group's kv window, for the kernel to skip the pairs that
+        # cannot match (packed vision inputs: most).
+        windows = (_kv_windows(segment_ids, block_q, kv_windows[0]),)
+        num_prefetch = len(windows)
+
+        def with_prefetch(spec):
+            if spec is None:
+                return None
+            index_map = spec.index_map
+            return pl.BlockSpec(
+                spec.block_shape, lambda *idx: index_map(*idx[:-num_prefetch])
+            )
+
+        in_specs = [with_prefetch(spec) for spec in in_specs]
+        out_specs = [with_prefetch(spec) for spec in out_specs]
+
     o, *aux = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
+            num_scalar_prefetch=len(windows),
             grid=grid,
             in_specs=in_specs,
             out_specs=out_specs,
@@ -753,12 +891,42 @@ def _flash_attention_impl(
             kernel_inputs_specs=(q, k, v, ab, q_segment_ids, kv_segment_ids),
             kernel_outputs_specs=out_shape,
         ),
-    )(q, k, v, ab, q_segment_ids, kv_segment_ids)
+    )(*windows, q, k, v, ab, q_segment_ids, kv_segment_ids)
     if save_residuals:
         l, m = (v[..., 0] for v in aux[-2:])
         return (o, l, m)
     else:
         return o
+
+
+def _block_ranges(segment_ids: jax.Array, block: int) -> jax.Array:
+    """[batch, blocks, 2] int32: each block's lowest and highest segment id. A
+    partial last block repeats its last id."""
+    batch_size, seq_len = segment_ids.shape
+    pad = -seq_len % block
+    ids = jnp.pad(segment_ids, ((0, 0), (0, pad)), mode="edge")
+    ids = ids.reshape(batch_size, -1, block).astype(jnp.int32)
+    return jnp.stack([ids.min(axis=-1), ids.max(axis=-1)], axis=-1)
+
+
+def _kv_windows(segment_ids: SegmentIds, block_q: int, row_group: int) -> jax.Array:
+    """[batch, q blocks * row groups * 2] int32, flat for SMEM: for each row
+    group of each q block, the kv columns [lo, hi) from the first to the last
+    128-column block whose segment range meets the group's (empty: lo >= hi).
+    Columns outside cannot match any of the group's ids; with sorted ids
+    (packed inputs) the window holds only the group's segments."""
+    batch_size, seq_len = segment_ids.q.shape
+    ids = jnp.pad(segment_ids.q, ((0, 0), (0, -seq_len % block_q)), mode="edge")
+    ids = ids.reshape(batch_size, -1, block_q).astype(jnp.int32)
+    groups = [ids[..., r : r + row_group] for r in range(0, block_q, row_group)]
+    q_lo = jnp.stack([g.min(axis=-1) for g in groups], axis=-1)[..., None]
+    q_hi = jnp.stack([g.max(axis=-1) for g in groups], axis=-1)[..., None]
+    kv = _block_ranges(segment_ids.kv, NUM_LANES)[:, None, None]
+    meets = (q_lo <= kv[..., 1]) & (kv[..., 0] <= q_hi)  # [b, q, groups, kv]
+    col = jnp.arange(kv.shape[3], dtype=jnp.int32) * NUM_LANES
+    lo = jnp.min(jnp.where(meets, col, segment_ids.kv.shape[1]), axis=-1)
+    hi = jnp.max(jnp.where(meets, col + NUM_LANES, 0), axis=-1)
+    return jnp.stack([lo, hi], axis=-1).reshape(batch_size, -1)
 
 
 # For autograd testing.

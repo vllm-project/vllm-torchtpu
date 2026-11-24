@@ -45,6 +45,10 @@ class TunableParams:
     block_k_major: int
     block_k: int
     block_b: int
+    # See BlockSizes.kv_windows, block_q_group and block_k_tail.
+    kv_windows: bool = False
+    block_q_group: int = 1024
+    block_k_tail: int = 512
 
 
 def _vision_tuning_key(*, num_heads: int, seq_len: int, head_dim: int) -> TuningKey:
@@ -99,6 +103,18 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     _vision_tuning_key(num_heads=12, seq_len=67_328, head_dim=128): TunableParams(
         8_192, 256, 256, 1
     ),
+    # Cosmos3-Super (Qwen3-VL tower) at TP=8: the packed encoder buckets.
+    # The whole kv stays in VMEM and each q block walks only its row groups'
+    # kv windows in 2048-column chunks: best or within 0.2% of the best at
+    # every length over four packings (full, one or two images + padding, six
+    # images).
+    **{
+        _vision_tuning_key(num_heads=2, seq_len=seq_len, head_dim=72): TunableParams(
+            2_048, seq_len, 2_048, 1, kv_windows=True
+        )
+        # Every 4096-row multiple up to the 32768 maximum encoder budget.
+        for seq_len in range(4_096, 32_769, 4_096)
+    },
     # Qwen2.5-VL.
     _vision_tuning_key(num_heads=16, seq_len=256, head_dim=80): TunableParams(
         256, 256, 256, 1

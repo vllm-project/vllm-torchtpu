@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 from types import SimpleNamespace
 
 import jax
@@ -67,9 +68,12 @@ def test_tuned_entries_use_valid_blocks() -> None:
 def test_tuning_table_has_requested_vision_grids() -> None:
     kimi_seq_lens = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 67328)
     qwen_seq_lens = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536)
-    expected = {(12, 128, seq_len) for seq_len in kimi_seq_lens} | {
-        (16, 80, seq_len) for seq_len in qwen_seq_lens
-    }
+    cosmos3_seq_lens = range(4096, 32769, 4096)
+    expected = (
+        {(12, 128, seq_len) for seq_len in kimi_seq_lens}
+        | {(16, 80, seq_len) for seq_len in qwen_seq_lens}
+        | {(2, 72, seq_len) for seq_len in cosmos3_seq_lens}
+    )
     actual = {
         (key.num_heads, key.head_dim, key.q_seq_len) for key in tuned_params_mapping
     }
@@ -89,12 +93,20 @@ def test_tuning_table_has_requested_vision_grids() -> None:
         (16, 4096, 80, TunableParams(1024, 4096, 512, 1)),
         (16, 16384, 80, TunableParams(512, 16384, 512, 1)),
         (16, 65536, 80, TunableParams(512, 16384, 512, 1)),
+        (2, 4096, 72, TunableParams(2048, 4096, 2048, 1, kv_windows=True)),
     ),
 )
 def test_representative_vision_tuning(
-    num_heads: int, seq_len: int, head_dim: int, expected: TunableParams
+    monkeypatch: pytest.MonkeyPatch,
+    num_heads: int,
+    seq_len: int,
+    head_dim: int,
+    expected: TunableParams,
 ) -> None:
     assert _tuning_params(num_heads, seq_len, head_dim) == expected
+    assert _selected_block_sizes(
+        monkeypatch, num_heads=num_heads, seq_len=seq_len, head_dim=head_dim
+    ) == BlockSizes(**dataclasses.asdict(expected))
 
 
 def test_tuning_lookup_requires_exact_setup() -> None:
@@ -107,10 +119,12 @@ def _selected_block_sizes(
     monkeypatch: pytest.MonkeyPatch,
     *,
     seq_len: int,
+    num_heads: int = 1,
+    head_dim: int = 128,
     explicit: BlockSizes | None = None,
     vmem_limit_bytes: int | None = _VMEM_LIMIT_BYTES,
 ) -> BlockSizes:
-    qkv, segment_ids = _qkv(1, seq_len, 128)
+    qkv, segment_ids = _qkv(num_heads, seq_len, head_dim)
     selected = []
 
     def capture(*args, **_kwargs):
@@ -180,6 +194,7 @@ def test_explicit_block_sizes_take_precedence(monkeypatch: pytest.MonkeyPatch) -
         (12, 67328, 128, True),
         (16, 32768, 80, True),
         (16, 65536, 80, True),
+        (2, 32768, 72, True),
     ),
 )
 def test_profile_compiles(

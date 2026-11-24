@@ -125,14 +125,18 @@ class TpuMMEncoderAttention(MMEncoderAttention):
         padded = seq_len + pad
 
         # segment ids (compile-safe): seg[t] = number of cu_seqlens boundaries
-        # <= t. Real image i -> id i+1; flash-padding positions (>=
-        # cu_seqlens[-1]) -> the highest id. The kernel mask is pure equality, so
-        # real tokens attend only within their image and never to padding.
+        # <= t. Real image i -> id i+1 (plus the zeros MMEncoderManager pads
+        # the tail of cu_seqlens with); padding positions (>= max(cu_seqlens))
+        # -> one more id per _BLOCK_SIZE of them. The kernel mask is pure
+        # equality, so real tokens attend only within their image and never to
+        # padding, and padding attends block-diagonally, so the kernel's kv
+        # windows skip the rest of the padding.
         positions = torch.arange(padded, device=q.device)
         if cu_seqlens is not None:
             cu = cu_seqlens.to(positions.dtype)
-            seg = (positions[None, :] >= cu[:, None]).sum(dim=0).to(torch.int32)
-            seg = seg.unsqueeze(0).expand(bsz, padded).contiguous()
+            seg = (positions[None, :] >= cu[:, None]).sum(dim=0)
+            seg = seg + torch.clamp(positions - cu.max(), min=0) // _BLOCK_SIZE
+            seg = seg.to(torch.int32).unsqueeze(0).expand(bsz, padded).contiguous()
         else:
             seg = torch.zeros((bsz, padded), dtype=torch.int32, device=q.device)
             seg[:, :seq_len] = 1
