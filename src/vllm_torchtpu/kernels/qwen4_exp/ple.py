@@ -48,7 +48,15 @@ def _bf16(x):
 
 
 def resident_lookup_raw(
-    table, ids, vocab_start, *, local_rows: int, head_dim: int, chunk_tokens: int = 8
+    table,
+    ids,
+    vocab_start,
+    *,
+    local_rows: int,
+    head_dim: int,
+    chunk_tokens: int = 8,
+    owned_pct: int = 0,
+    skip_empty: bool = False,
 ):
     """Owner-masked integer bits [T,heads*head_dim]: INT8/FP8 or INT16/BF16.
 
@@ -60,6 +68,12 @@ def resident_lookup_raw(
     ``vocab_start`` (an int or an int32 array of one element) is this shard's
     first row. As an array it is an operand rather than a constant, so every
     TP rank compiles the same program and can replay another rank's.
+
+    ``owned_pct`` (VLLM_TPU_PLE_OWNED_GATHER_PCT, 0 = off): gather only the ids
+    this shard owns. A chunk's owned ids are compacted to the front of a buffer
+    of ``owned_pct`` percent of its ids (rounded up to 8), gathered, and
+    scattered back; a chunk owning more than that takes the full masked gather.
+    Bit-identical either way.
     """
     token_count, heads = ids.shape
     embedding_dim = heads * head_dim
@@ -73,14 +87,62 @@ def resident_lookup_raw(
     )
     start = jnp.asarray(vocab_start, jnp.int32).reshape(())
 
+    def _gather_rows(local):
+        # Fast direct gather when each row aligns to a single table segment.
+        if skip_empty and head_dim == table.shape[-1]:
+            return table[local.astype(jnp.int32)]
+        return compact_rows(table, local, head_dim=head_dim)
+
     def gather(chunk):
         owned = (chunk >= start) & (chunk < start + local_rows)
-        local = jnp.where(owned, chunk - start, 0)
-        bits = compact_rows(table, local, head_dim=head_dim)
-        bits = jnp.where(owned[..., None], bits, jnp.zeros((), table.dtype))
+
+        def _do_gather(_):
+            local = jnp.where(owned, chunk - start, 0)
+            bits = _gather_rows(local)
+            bits = jnp.where(owned[..., None], bits, jnp.zeros((), table.dtype))
+            return jax.lax.bitcast_convert_type(bits, carrier)
+
+        if not skip_empty:
+            return _do_gather(None)
+        return jax.lax.cond(
+            jnp.any(owned),
+            _do_gather,
+            lambda _: jnp.zeros(chunk.shape + (head_dim,), carrier),
+            None,
+        )
+
+    def gather_owned(chunk):
+        flat = chunk.reshape(-1)
+        rows = flat.shape[0]
+        want = -(-rows * owned_pct // 100)
+        cap = min(rows, -(-want // 8) * 8)
+        owned = (flat >= start) & (flat < start + local_rows)
+        pos = jnp.cumsum(owned.astype(jnp.int32)) - 1
+        count = pos[-1] + 1
+        slot = jnp.where(owned, pos, cap)
+        comp_ids = jnp.zeros((cap,), jnp.int32).at[slot].set(flat - start, mode="drop")
+        comp_src = (
+            jnp.full((cap,), rows, jnp.int32)
+            .at[slot]
+            .set(jnp.arange(rows, dtype=jnp.int32), mode="drop")
+        )
+
+        def owned_only():
+            bits = compact_rows(table, comp_ids, head_dim=head_dim)
+            out = jnp.zeros((rows, head_dim), table.dtype)
+            return out.at[comp_src].set(bits, mode="drop")
+
+        def masked():
+            local = jnp.where(owned, flat - start, 0)
+            bits = compact_rows(table, local, head_dim=head_dim)
+            return jnp.where(owned[:, None], bits, jnp.zeros((), table.dtype))
+
+        bits = jax.lax.cond(count <= cap, owned_only, masked)
+        bits = bits.reshape(chunk.shape + (head_dim,))
         return jax.lax.bitcast_convert_type(bits, carrier)
 
-    result = jax.lax.map(gather, padded.reshape(-1, chunk, heads))
+    body = gather_owned if owned_pct else gather
+    result = jax.lax.map(body, padded.reshape(-1, chunk, heads))
     return result.reshape(-1, embedding_dim)[:token_count]
 
 

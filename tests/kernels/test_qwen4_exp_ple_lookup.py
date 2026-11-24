@@ -84,3 +84,89 @@ def test_larger_chunks_match_eight_token_chunks(chunk_tokens, token_count):
     )
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     np.testing.assert_array_equal(np.asarray(got), _expected(rows, ids, LOCAL_ROWS))
+
+
+@pytest.mark.parametrize("owned_pct", [13, 25, 50, 100])
+@pytest.mark.parametrize("chunk_tokens", [8, 64, 256])
+@pytest.mark.parametrize("token_count", [1, 13, 64, 300])
+def test_owned_gather_matches_masked_gather(owned_pct, chunk_tokens, token_count):
+    """VLLM_TPU_PLE_OWNED_GATHER_PCT gathers only this shard's ids and is
+    bit-identical, including chunks that own more than the buffer (they take
+    the masked gather) and -1 padding ids."""
+    rng = np.random.default_rng(owned_pct * 1000 + chunk_tokens + token_count)
+    rows, table = _shard(rng)
+    start = jnp.asarray([2 * LOCAL_ROWS], jnp.int32)
+    # 8 shards' worth of vocab: about 1/8 of the ids are this shard's.
+    ids = rng.integers(0, 8 * LOCAL_ROWS, (token_count, 3))
+    ids[0, 0] = -1
+    want = resident_lookup_raw(
+        table,
+        jnp.asarray(ids),
+        start,
+        local_rows=LOCAL_ROWS,
+        head_dim=HEAD_DIM,
+        chunk_tokens=chunk_tokens,
+    )
+    got = resident_lookup_raw(
+        table,
+        jnp.asarray(ids),
+        start,
+        local_rows=LOCAL_ROWS,
+        head_dim=HEAD_DIM,
+        chunk_tokens=chunk_tokens,
+        owned_pct=owned_pct,
+    )
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    np.testing.assert_array_equal(np.asarray(got), _expected(rows, ids, 2 * LOCAL_ROWS))
+
+
+def test_owned_gather_overflow_takes_masked_path():
+    """A chunk whose ids are all this shard's overflows a 13% buffer."""
+    rng = np.random.default_rng(7)
+    rows, table = _shard(rng)
+    ids = rng.integers(0, LOCAL_ROWS, (64, 3))  # every id owned by shard 0
+    got = resident_lookup_raw(
+        table,
+        jnp.asarray(ids),
+        jnp.asarray([0], jnp.int32),
+        local_rows=LOCAL_ROWS,
+        head_dim=HEAD_DIM,
+        chunk_tokens=64,
+        owned_pct=13,
+    )
+    np.testing.assert_array_equal(np.asarray(got), _expected(rows, ids, 0))
+
+
+@pytest.mark.parametrize("head_dim", [128, HEAD_DIM])
+@pytest.mark.parametrize("chunk_tokens", [8, 16])
+def test_skip_empty_matches_default(head_dim, chunk_tokens):
+    """skip_empty short-circuits unowned chunks and stays bit-identical."""
+    rng = np.random.default_rng(head_dim + chunk_tokens)
+    rows = rng.integers(-128, 128, (LOCAL_ROWS, head_dim), dtype=np.int8)
+    table = jnp.asarray(rows.reshape(-1, 128))
+    start = 2 * LOCAL_ROWS
+    # Chunk 0: all unowned (-1); chunk 1: mixed; chunk 2: all owned.
+    ids = np.full((24, 2), -1, dtype=np.int32)
+    ids[8:16] = rng.integers(start - 4, start + LOCAL_ROWS + 4, (8, 2))
+    ids[16:24] = rng.integers(start, start + LOCAL_ROWS, (8, 2))
+    ids_j = jnp.asarray(ids)
+    start_j = jnp.asarray([start], jnp.int32)
+    want = resident_lookup_raw(
+        table,
+        ids_j,
+        start_j,
+        local_rows=LOCAL_ROWS,
+        head_dim=head_dim,
+        chunk_tokens=chunk_tokens,
+    )
+    got = resident_lookup_raw(
+        table,
+        ids_j,
+        start_j,
+        local_rows=LOCAL_ROWS,
+        head_dim=head_dim,
+        chunk_tokens=chunk_tokens,
+        skip_empty=True,
+    )
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    np.testing.assert_array_equal(np.asarray(got), _expected(rows, ids, start))

@@ -153,11 +153,22 @@ class ResidentPLETable(Qwen4ExpPLETable):
             dtype=torch.int32,
             device=self.table.device,
         )
-        self._raw_lookup = build_raw_lookup_op(
-            self.shard_indices.num_org_elements,
-            self.embedding_dim,
-            envs.VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS,
-        )
+        owned_pct = envs.VLLM_TPU_PLE_OWNED_GATHER_PCT
+        skip_empty = envs.VLLM_TPU_PLE_SKIP_EMPTY_CHUNKS
+        if owned_pct or skip_empty:
+            self._raw_lookup = build_raw_lookup_op(
+                self.shard_indices.num_org_elements,
+                self.embedding_dim,
+                envs.VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS,
+                owned_pct=owned_pct,
+                skip_empty=skip_empty,
+            )
+        else:
+            self._raw_lookup = build_raw_lookup_op(
+                self.shard_indices.num_org_elements,
+                self.embedding_dim,
+                envs.VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS,
+            )
 
     def lookup_raw(self, ids: torch.Tensor) -> torch.Tensor:
         assert self._finalized and self._raw_lookup is not None

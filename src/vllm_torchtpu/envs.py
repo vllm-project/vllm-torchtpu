@@ -240,6 +240,8 @@ if TYPE_CHECKING:
     VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS: int = 8
     VLLM_TPU_PLE_SKIP_IDLE_ROWS: bool = False
     VLLM_TPU_PLE_HISTORY_ROW_KERNEL: bool = False
+    VLLM_TPU_PLE_SKIP_EMPTY_CHUNKS: bool = False
+    VLLM_TPU_PLE_OWNED_GATHER_PCT: int = 0
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -1287,6 +1289,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gather halts some programs when MSA places that operand in VMEM).
     # Bitwise the XLA gathers.
     "VLLM_TPU_PLE_HISTORY_ROW_KERNEL": env_bool("VLLM_TPU_PLE_HISTORY_ROW_KERNEL"),
+    # Qwen4-exp resident PLE lookup: skip chunks with no ids owned by this
+    # vocab shard via lax.cond, and use direct table[local] when head_dim
+    # matches the 128-element storage segment width (bit-identical, default off).
+    "VLLM_TPU_PLE_SKIP_EMPTY_CHUNKS": env_bool("VLLM_TPU_PLE_SKIP_EMPTY_CHUNKS"),
+    # Qwen4-exp resident PLE table: gather only the ids this vocab shard owns,
+    # compacted into a buffer of this percent of each chunk's ids (0 = off;
+    # chunks owning more fall back to the full masked gather). Bit-identical.
+    "VLLM_TPU_PLE_OWNED_GATHER_PCT": env_nonnegative_int(
+        "VLLM_TPU_PLE_OWNED_GATHER_PCT", 0
+    ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.
