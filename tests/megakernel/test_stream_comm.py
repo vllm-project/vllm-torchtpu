@@ -277,17 +277,19 @@ def test_tworing_consumption_order_and_nesting_guards():
 
 
 @pytest.mark.parametrize(
-    "R,hier,rsag",
+    "R,hier,rsag,scoped",
     [
-        (2, 0, False),
-        (2, 0, True),
-        (8, 0, True),
-        (8, 1, False),
-        (8, 2, False),
-        (8, 3, False),
+        (2, 0, False, False),
+        (2, 0, True, False),
+        (8, 0, True, False),
+        (8, 1, False, False),
+        (8, 2, False, False),
+        (8, 3, False, False),
+        (8, 1, False, True),
+        (8, 2, False, True),
     ],
 )
-def test_allreduce_ring_modes_in_pallas(R: int, hier: int, rsag: bool):
+def test_allreduce_ring_modes_in_pallas(R: int, hier: int, rsag: bool, scoped: bool):
     """Execute `AllReduceRing` across `R` ranks and 2 layers in Pallas."""
     devs = jax.devices("cpu")
     assert len(devs) >= R, (
@@ -306,7 +308,9 @@ def test_allreduce_ring_modes_in_pallas(R: int, hier: int, rsag: bool):
     def pallas_body(x_ref, out_ref, *scr_refs):
         scr = dict(zip(s_names, scr_refs))
         me = lax.axis_index("tp").astype(I32)
-        ar = comm.AllReduceRing(cp.comm, scr, me)
+        ar = comm.AllReduceRing(
+            cp.comm, scr, me, sc=jax.named_scope if scoped else None
+        )
 
         if R > 1:
             barrier = pltpu.get_barrier_semaphore()

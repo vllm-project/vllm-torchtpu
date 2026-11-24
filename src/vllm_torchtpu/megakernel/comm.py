@@ -118,11 +118,17 @@ class AllReduceRing:
         ]
 
     def ar_round(self, slot, rnd_i: int):
+        # Sub-scopes (VLLM_TPU_MK_SCOPES): `arc_start` is the descriptor issue (plus any
+        # store fence in front of it); `arc_wr<i>` the recv-semaphore wait on peer `i`,
+        # which is both the remote data landing and its semaphore signal (one event).
+        sc = self.sc
         descs = self.ar_copies(slot, rnd_i)
-        for d in descs:
-            d.start()
-        for d in descs:
-            d.wait_recv()
+        with sc("arc_start"):
+            for d in descs:
+                d.start()
+        for i, d in enumerate(descs):
+            with sc(f"arc_wr{i}"):
+                d.wait_recv()
 
     def allreduce(self, slot, x, first):
         """Reduce-sum `x [MB, H]` f32 partial across all `R` ranks on `slot`."""
@@ -132,39 +138,42 @@ class AllReduceRing:
         HIER, RSAG, R, CW, HC2 = cp.HIER, cp.RSAG, cp.R, cp.CW, cp.HC2
         send, recv = scr["send"], scr["recv"]
         with sc("ar_pack"):
-            if WAR:
-                val = x[:MR]
-            else:
-                chunks = [x[0:B, j * PC : (j + 1) * PC] for j in range(HPC)]
-                if B * HPC < PR:
-                    chunks.append(jnp.zeros((PR - B * HPC, PC), F32))
-                val = jnp.concatenate(chunks, axis=0)
+            with sc("arp_val"):
+                if WAR:
+                    val = x[:MR]
+                else:
+                    chunks = [x[0:B, j * PC : (j + 1) * PC] for j in range(HPC)]
+                    if B * HPC < PR:
+                        chunks.append(jnp.zeros((PR - B * HPC, PC), F32))
+                    val = jnp.concatenate(chunks, axis=0)
             if self.comm:
 
                 @pl.when(jnp.logical_not(first))
                 def _():
-                    for rnd_i in cp.AR_ROUNDS:
-                        for d in self.ar_copies(slot, rnd_i):
-                            d.wait_send()
+                    with sc("arp_wsend"):
+                        for rnd_i in cp.AR_ROUNDS:
+                            for d in self.ar_copies(slot, rnd_i):
+                                d.wait_send()
 
             c_idx = lax.rem(me, 2)
-            if HIER == 3:
-                send[0, slot] = val.astype(BF16)
-                recv[0, slot, c_idx] = send[0, slot]
-            elif HIER == 2:
-                send[slot, 0] = val[:, :HC2].astype(BF16)
-                send[slot, 1] = val[:, HC2:].astype(BF16)
-                recv[slot, c_idx] = send[slot, c_idx]
-            elif HIER == 1:
-                send[slot] = val.astype(BF16)
-                recv[slot, c_idx] = send[slot]
-            elif RSAG:
-                for j in range(R):
-                    send[slot, j] = val[:, j * CW : (j + 1) * CW].astype(BF16)
-                recv[slot, me] = send[slot, me]
-            else:
-                send[slot] = val.astype(BF16)
-                recv[slot, me] = send[slot]
+            with sc("arp_store"):
+                if HIER == 3:
+                    send[0, slot] = val.astype(BF16)
+                    recv[0, slot, c_idx] = send[0, slot]
+                elif HIER == 2:
+                    send[slot, 0] = val[:, :HC2].astype(BF16)
+                    send[slot, 1] = val[:, HC2:].astype(BF16)
+                    recv[slot, c_idx] = send[slot, c_idx]
+                elif HIER == 1:
+                    send[slot] = val.astype(BF16)
+                    recv[slot, c_idx] = send[slot]
+                elif RSAG:
+                    for j in range(R):
+                        send[slot, j] = val[:, j * CW : (j + 1) * CW].astype(BF16)
+                    recv[slot, me] = send[slot, me]
+                else:
+                    send[slot] = val.astype(BF16)
+                    recv[slot, me] = send[slot]
         if not self.comm:
             return rnd(val)
         with sc("ar_comm"):
