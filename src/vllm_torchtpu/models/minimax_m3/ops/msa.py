@@ -1302,6 +1302,16 @@ def _get_msa_dcp_fp4_op(
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
+        if dcp_lane is not None:
+            # Only the split scoring reads dcp_lane, and only steps of
+            # SPLIT_MIN..SPLIT_MAX rows take it. The warmup's shape-variant
+            # traces then differ in whether the buffer is a graph input at
+            # all, and the live (largest) trace cannot adopt the split-window
+            # buckets compiled by an earlier trace (ShapeSpecializationError
+            # "inputs differ"). Consume it on every step, at one place, so
+            # every trace takes the same inputs in the same order. A (1,)
+            # int op; the value of dcp_rank is unchanged.
+            dcp_rank = dcp_rank + dcp_lane * 0
         if not reuse:
             index_reuse = None
         shared = index_reuse is not None and not full
