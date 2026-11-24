@@ -219,6 +219,29 @@ def _make_inputs(mesh, seed, *, tokens, hidden, e_total):
     return build()
 
 
+def _routed_gating(mesh, seed, *, tokens, e_total, topk, expert_rows):
+    """Gating whose top-k routes `expert_rows[e]` rows to each listed expert
+    and spreads the rest of the tokens * topk routes evenly over the others.
+
+    The routes are laid out column-major over the [tokens, topk] choices, so
+    an expert's contiguous run of at most `tokens` of them lands on distinct
+    tokens. A chosen expert scores ~6 and every other ~0, with noise in both
+    so the router weights still differ.
+    """
+    (axis,) = mesh.axis_names
+    others = [e for e in range(e_total) if e not in expert_rows]
+    rest, extra = divmod(tokens * topk - sum(expert_rows.values()), len(others))
+    counts = dict(expert_rows) | {e: rest + (i < extra) for i, e in enumerate(others)}
+    assert max(counts.values()) <= tokens, counts
+    seq = np.repeat(np.asarray(list(counts)), list(counts.values()))
+    ids = seq.reshape(topk, tokens).T
+    gating = np.random.default_rng(seed).normal(0.0, 0.5, (tokens, e_total))
+    gating[np.arange(tokens)[:, None], ids] += 6.0
+    return jax.device_put(
+        jnp.asarray(gating, jnp.float32), NamedSharding(mesh, P(axis))
+    )
+
+
 def _dense_reference(
     mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk, hash_ids=None
 ):
@@ -602,10 +625,20 @@ def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
     np.testing.assert_array_equal(np.asarray(sharded), np.asarray(replicated))
 
 
+@pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
 @pytest.mark.parametrize(
     "shape,shared_weights",
     [
         pytest.param(dict(SMALL), None, id="small"),
+        # Uniform routing gives every expert a few dozen rows, so each tile of
+        # the 256-row build runs its shortest rung (or, at prod_t16384, the
+        # build has the full height only). These loads put experts on the
+        # 128-, 192- and 256-row rungs too (checked below).
+        pytest.param(
+            dict(SMALL, expert_rows={1: 96, 10: 160, 19: 224}),
+            None,
+            id="small_every_rung",
+        ),
         # The production weights are 6.4GB, so these shapes run against the
         # module's one build of them rather than making their own.
         pytest.param(
@@ -616,7 +649,9 @@ def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
         ),
     ],
 )
-def test_256_row_tiles_track_the_128_row_build(request, shape, shared_weights):
+def test_256_row_tiles_track_the_128_row_build(
+    request, sharded_plan, shape, shared_weights
+):
     """A taller tile changes how rows are grouped, not what each row computes.
 
     Tiles above 128 rows need the scale mirrors stored at 128 lanes
@@ -625,6 +660,10 @@ def test_256_row_tiles_track_the_128_row_build(request, shape, shared_weights):
     has to stay inside the fp8 bands of the dense reference at both heights
     and agree with the 128-row build far inside them. The lowered programs
     are checked to carry each height's kernel, so the comparison is real.
+
+    A tile shorter than 256 rows stages its scales as whole 128-lane rows and
+    part of the next one, so small_every_rung puts experts on each rung of the
+    256-row build's ladder, and the test checks its loads still do.
     """
     mesh = _mesh()
     if shared_weights is not None:
@@ -645,6 +684,36 @@ def test_256_row_tiles_track_the_128_row_build(request, shape, shared_weights):
         hidden=shape["hidden"],
         e_total=shape["e_total"],
     )
+    if "expert_rows" in shape:
+        gating = _routed_gating(
+            mesh,
+            82,
+            tokens=shape["tokens"],
+            e_total=shape["e_total"],
+            topk=shape["topk"],
+            expert_rows=shape["expert_rows"],
+        )
+        # The 256-row build has its whole ladder at this shape, and some
+        # expert's slab rows (each source's run rounded up to ROWBLK) end on
+        # each rung.
+        rungs = kernel.tile_height_rungs(
+            256,
+            host.ragged_stride_bound(
+                shape["tokens"], shape["topk"], shape["e_total"], 256
+            ),
+            shape["e_total"] // EP,
+            EP,
+        )
+        assert rungs == (64, 128, 192, 256), rungs
+        ids = np.argsort(-np.asarray(gating), axis=1)[:, : shape["topk"]]
+        runs = np.stack(
+            [
+                np.bincount(i.ravel(), minlength=shape["e_total"])
+                for i in np.split(ids, EP)
+            ]
+        )
+        rows = (-(-runs // host.ROWBLK) * host.ROWBLK).sum(axis=0)
+        assert {min(r for r in rungs if r >= n) for n in rows} == set(rungs), rows
     args = (x, w1, w2, w1_scale, w2_scale, gating)
     outs, names = {}, {}
     for capacity in (128, 256):
@@ -657,7 +726,7 @@ def test_256_row_tiles_track_the_128_row_build(request, shape, shared_weights):
                 mesh=mesh,
                 capacity=capacity,
                 weight_format=WeightFormat.FP8,
-                sharded_plan=True,
+                sharded_plan=sharded_plan,
             )
 
         names[capacity] = set(
@@ -674,8 +743,9 @@ def test_256_row_tiles_track_the_128_row_build(request, shape, shared_weights):
     for capacity, out in outs.items():
         assert _relative_l2(out, want) < FP8_RELATIVE_BOUND, capacity
         assert _worst_token_relative_l2(out, want) < FP8_TOKEN_BOUND, capacity
-    # Far inside the bands; equal outright where the matmuls accumulate in the
-    # same order at both heights.
+    # Far inside the bands. On v7x the two heights are bit-identical at every
+    # shape and plan above (each row's matmuls accumulate in the same order at
+    # both), so the bound only leaves room for a compiler that reorders them.
     assert _relative_l2(outs[256], outs[128]) < FP8_RELATIVE_BOUND / 10
 
 

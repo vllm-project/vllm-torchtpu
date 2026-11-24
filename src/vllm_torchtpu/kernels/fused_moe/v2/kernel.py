@@ -2344,9 +2344,12 @@ def _build_fused_ep_moe_kernel(
             *biases,
         )
         recv, rscl, _contrib, _contrib_scl = res
-        # Callers index the arrival mirror as [sublanes, tile_m]; the rows of
-        # mirror_lanes are those same bytes in the same order.
-        return recv, (rscl if mirror_rows == 1 else rscl.reshape(-1, tile_m))
+        # The arrival mirror goes out as stored, rows of mirror_lanes. Its
+        # reader takes a flat position (sublane * tile_m + offset), which picks
+        # the same f32 at either grouping, whereas regrouping it to
+        # [sublanes, tile_m] would be a relayout in HBM on every call: the
+        # (8, 128) tiles of a 256-lane array hold different elements.
+        return recv, rscl
 
     return fn
 

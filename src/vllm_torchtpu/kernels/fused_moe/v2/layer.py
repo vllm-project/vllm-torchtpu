@@ -122,10 +122,13 @@ def _combine_arrivals(
     Two tables index two different objects, so each owns its own clamp.
     `pos` is the arrival ROW: a row of `arrivals`, and on the kernel path
     below it is a DMA address. `mirror_pos` is a position in the wire's scale
-    mirror, which is [sublanes, tile_m] because a transport can only address
+    mirror, sublane * tile_m + offset, because a transport can only address
     the mirror a sublane at a time and a sublane holds tile_m f32 whatever is
     written in it -- so a whole source TILE's scales are one sublane and the
-    mirror position is NOT the arrival row.
+    mirror position is NOT the arrival row. The position is flat, so it reads
+    the same f32 however the mirror's rows are grouped: above a lane block the
+    kernel stores and returns a sublane as several rows of 128 lanes
+    (host.mirror_rows_per_tile), and the shape here is whatever it returned.
 
     Where the kernel path applies (kernel.combine_step_tokens) the row gather
     and the weighted sum are one Mosaic call: XLA answers `arrivals[rows]`
@@ -140,15 +143,15 @@ def _combine_arrivals(
     """
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
-    mirror_sublanes, tile_m = arrival_scales.shape
+    scale_rows, scale_lanes = arrival_scales.shape
     hidden = lane_blocks * lanes
     # A gather clamps an out-of-range index to the last one; a DMA does not,
     # and a sublane index clamped on its own would pair the last sublane with
     # the wrong lane. Neither position is ever negative.
     rows = jnp.minimum(pos, recv_rows - 1)
-    shift = pow2_shift(tile_m, "the mirror's lane count")
-    scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
-    row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
+    shift = pow2_shift(scale_lanes, "the mirror's lane count")
+    scl = jnp.minimum(mirror_pos, scale_rows * scale_lanes - 1)
+    row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (scale_lanes - 1)]
     coef = row_scales * topk_weights.astype(jnp.float32)
     if combine_step_tokens(t_local):
         combine = build_combine_kernel(

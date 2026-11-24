@@ -170,13 +170,14 @@ OUT_PARITIES = 2
 # buffered, so the next chunk widens while the current one feeds the MXU.
 WIDENED_BLOCK_BUFFERS = 2
 # The wire's scale mirror carries one f32 per row and is indexed by the
-# TILE the row was computed in: one 128-lane SUBLANE of the mirror holds a
-# whole tile's scales, and a run's scales are the sublanes of the tiles it
-# spans. Mosaic refuses a DMA slice whose offset is not tile-aligned, so a
-# transport can only address a mirror one sublane at a time however the
-# array is shaped or typed -- 512 bytes either way. The only question is how
-# many scales share those bytes: `tile_m` of them here, ROWBLK of them for a
-# [blocks, ROWBLK] mirror.
+# TILE the row was computed in: one SUBLANE of the mirror holds a whole
+# tile's scales, and a run's scales are the sublanes of the tiles it spans.
+# Mosaic refuses a DMA slice whose offset is not tile-aligned, so a
+# transport can only address a mirror a whole 128-lane row at a time however
+# the array is shaped or typed -- 512 bytes either way. A sublane is one such
+# row up to a lane block and tile_m / 128 of them above it
+# (mirror_rows_per_tile); a [blocks, ROWBLK] mirror packs ROWBLK scales into
+# a row's bytes instead.
 
 
 def align_up(v, m):
@@ -1626,6 +1627,8 @@ def vmem_scratch_arrays(
     lane_blocks = row_lane_blocks(hidden)
     # The tile height IS the capacity, and the out pair is in tile units.
     tile_m = capacity
+    # A tile's scales stage as the mirror stores them (mirror_rows_per_tile).
+    mirror_rows = mirror_rows_per_tile(tile_m)
     # A scale table rides the weight slots, not the expert list: it is read
     # only alongside the slab it scales, so it is staged with that slab and
     # is nbuf deep.
@@ -1695,8 +1698,8 @@ def vmem_scratch_arrays(
             "oscl_vm",
             (
                 OUT_PARITIES,
-                mirror_rows_per_tile(capacity),
-                capacity // mirror_rows_per_tile(capacity),
+                mirror_rows,
+                tile_m // mirror_rows,
             ),
             jnp.float32,
         ),
