@@ -1694,3 +1694,33 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
     with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
         _validate_peer_replay_config()
+
+
+def test_set_additional_forward_context_skips_device_move_while_compiling(
+    monkeypatch,
+):
+    """AOT export enters set_forward_context inside an FX trace where
+    num_tokens_across_dp_cpu must remain on CPU so sp_local_sizes().tolist()
+    does not trace a device-to-host to_copy()."""
+    cpu_t = torch.tensor([16], dtype=torch.int32)
+    tpu_sentinel = torch.tensor([16], dtype=torch.int32)
+    moved: list[str] = []
+
+    class _FakeTensor:
+        device = cpu_t.device
+
+        def to(self, dev):
+            moved.append(str(dev))
+            return tpu_sentinel
+
+    dp_meta_compiling = SimpleNamespace(num_tokens_across_dp_cpu=_FakeTensor())
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    TpuPlatform.set_additional_forward_context(dp_metadata=dp_meta_compiling)
+    assert moved == []
+    assert isinstance(dp_meta_compiling.num_tokens_across_dp_cpu, _FakeTensor)
+
+    dp_meta_eager = SimpleNamespace(num_tokens_across_dp_cpu=_FakeTensor())
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    TpuPlatform.set_additional_forward_context(dp_metadata=dp_meta_eager)
+    assert moved == ["tpu"]
+    assert dp_meta_eager.num_tokens_across_dp_cpu is tpu_sentinel

@@ -780,7 +780,7 @@ class TpuPlatform(Platform):
         forwards require tensor arguments to be on device.
         """
         dp_metadata = kwargs.get("dp_metadata")
-        if dp_metadata is not None:
+        if dp_metadata is not None and not torch.compiler.is_compiling():
             t = dp_metadata.num_tokens_across_dp_cpu
             if t.device.type == "cpu":
                 tpu_t = t.to("tpu")
