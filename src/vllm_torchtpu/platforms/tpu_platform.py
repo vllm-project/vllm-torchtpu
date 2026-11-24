@@ -16,10 +16,8 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
-import argparse
 import importlib.util
 import os
-import sys
 import time
 from typing import TYPE_CHECKING, Protocol, Union, cast
 
@@ -32,7 +30,6 @@ import vllm.envs as vllm_envs
 from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
-from vllm.utils.argparse_utils import EnableDisableAction
 
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
@@ -220,91 +217,6 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 
 _dynamic_compile_unwrapped = False
 _tpu_kv_connectors_registered = False
-# Process-global CLI opt-out state: None until a hooked
-# --enable-ep-weight-filter / --disable-ep-weight-filter /
-# --no-enable-ep-weight-filter action actually runs during parse_args()
-# (including --config YAML files). Never reset on parser construction because
-# vLLM's log_non_default_args() builds a throwaway parser after parse_args()
-# and other subcommands (e.g. `vllm bench`) use unhooked EngineArgs parsers.
-_ep_weight_filter_cli_opt_out: bool | None = None
-_EP_WEIGHT_FILTER_CLI_DISABLE_FLAGS = (
-    "--disable-ep-weight-filter",
-    "--no-enable-ep-weight-filter",
-)
-
-
-class _TrackedEnableDisableEpWeightFilterAction(EnableDisableAction):
-    """Records whether CLI arguments explicitly opted out of EP weight filtering."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        global _ep_weight_filter_cli_opt_out
-        super().__call__(parser, namespace, values, option_string)
-        _ep_weight_filter_cli_opt_out = getattr(namespace, self.dest) is False
-
-
-class _TrackedBooleanOptionalEpWeightFilterAction(argparse.BooleanOptionalAction):
-    """Fallback tracker when a parser uses plain BooleanOptionalAction."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        global _ep_weight_filter_cli_opt_out
-        super().__call__(parser, namespace, values, option_string)
-        _ep_weight_filter_cli_opt_out = getattr(namespace, self.dest) is False
-
-
-_TRACKED_EP_WEIGHT_FILTER_ACTION_TYPES = (
-    _TrackedEnableDisableEpWeightFilterAction,
-    _TrackedBooleanOptionalEpWeightFilterAction,
-)
-
-
-def _track_ep_weight_filter_cli_action(parser: "FlexibleArgumentParser") -> None:
-    """Attach opt-out tracking to vLLM's --enable-ep-weight-filter CLI action."""
-    for action in parser._actions:
-        if action.dest != "enable_ep_weight_filter":
-            continue
-        if type(action) is EnableDisableAction:
-            action.__class__ = _TrackedEnableDisableEpWeightFilterAction
-        elif type(action) is argparse.BooleanOptionalAction:
-            action.__class__ = _TrackedBooleanOptionalEpWeightFilterAction
-        elif not isinstance(action, _TRACKED_EP_WEIGHT_FILTER_ACTION_TYPES):
-            logger.warning_once(
-                "Unexpected action class %s for --enable-ep-weight-filter; "
-                "falling back to sys.argv opt-out detection.",
-                type(action).__name__,
-            )
-        break
-
-
-def _is_ep_weight_filter_cli_disabled() -> bool:
-    if _ep_weight_filter_cli_opt_out is not None:
-        return _ep_weight_filter_cli_opt_out
-    # Fallback for entry points (e.g. EngineArgs.add_cli_args) that do not
-    # invoke pre_register_and_update(parser). FlexibleArgumentParser also
-    # accepts underscores in option names, so compare the dashed spelling.
-    return any(
-        arg.replace("_", "-") in _EP_WEIGHT_FILTER_CLI_DISABLE_FLAGS
-        for arg in sys.argv[1:]
-    )
-
-
-def _apply_default_ep_weight_filter(vllm_config: "VllmConfig") -> None:
-    """Default-enable EP weight filtering on TPU for MoE EP without EPLB."""
-    model_config = vllm_config.model_config
-    parallel_config = vllm_config.parallel_config
-    if (
-        model_config is None
-        or not model_config.is_moe
-        or not parallel_config.enable_expert_parallel
-        or parallel_config.enable_eplb
-        or parallel_config.enable_ep_weight_filter
-        or _is_ep_weight_filter_cli_disabled()
-    ):
-        return
-    parallel_config.enable_ep_weight_filter = True
-    logger.info_once(
-        "Defaulting enable_ep_weight_filter=True on TPU for MoE with expert "
-        "parallelism (pass --disable-ep-weight-filter to disable)."
-    )
 
 
 def _configure_torchtpu_eager_mode() -> None:
@@ -607,7 +519,12 @@ class TpuPlatform(Platform):
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
         if parser is not None:
-            _track_ep_weight_filter_cli_action(parser)
+            # Default EP weight filtering on for CLI entry points (`vllm serve`).
+            # Both model loaders gate on MoE + EP (+ non-EPLB for Run:AI), so
+            # this is a no-op for dense or non-EP runs while letting
+            # --disable-ep-weight-filter / --config YAML opt-outs travel cleanly
+            # through EngineArgs and pickled VllmConfig into spawned children.
+            parser.set_defaults(enable_ep_weight_filter=True)
 
     # The "Platform" base class has import_kernels() that tries to import
     # vllm._C, which is not available in the TPU Platform setup.
@@ -964,7 +881,6 @@ class TpuPlatform(Platform):
         # Apply before VllmConfig is pickled so EngineCore and all workers see
         # the same setting.
         apply_eagle_block_drop_override(vllm_config)
-        _apply_default_ep_weight_filter(vllm_config)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(

@@ -1863,16 +1863,24 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
     assert wrapper_configs == [proposer.draft_vllm_config]
 
 
-@pytest.mark.parametrize("draft_tp, draft_filter", [(1, False), (8, True)])
+@pytest.mark.parametrize(
+    "draft_tp, target_tp, draft_filter",
+    [
+        (1, 8, False),
+        (8, 8, True),
+        (1, 1, True),
+    ],
+)
 def test_replicated_draft_load_disables_ep_weight_filter(
-    monkeypatch, draft_tp, draft_filter
+    monkeypatch, draft_tp, target_tp, draft_filter
 ):
-    """A replicated draft forces tp=1 while parallel_config stays at target TP;
-    loading it must turn enable_ep_weight_filter off without mutating the
-    target config. A sharded draft keeps the TP group, so it keeps the filter."""
+    """A draft replicated below target TP (draft_tp=1, target_tp>1) forces tp=1
+    while parallel_config stays at target TP, so loading must disable
+    enable_ep_weight_filter on the active draft config without mutating the
+    target config. Sharded drafts and target_tp=1 drafts keep the filter."""
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
-    proposer = _make_proposer(draft_tp=draft_tp, target_tp=8, method="mtp")
+    proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp, method="mtp")
     proposer.vllm_config.parallel_config.enable_ep_weight_filter = True
     proposer.runner = SimpleNamespace(mesh=object())
     proposer.vllm_config.load_config = object()
@@ -1880,18 +1888,27 @@ def test_replicated_draft_load_disables_ep_weight_filter(
         inductor_compile_config={}
     )
     proposer.speculative_config.draft_model_config = SimpleNamespace(runner_type=None)
-    loaded = {}
+    active_config = [None]
+    observed = {}
+
+    @contextlib.contextmanager
+    def _fake_set_current_vllm_config(cfg):
+        prev = active_config[0]
+        active_config[0] = cfg
+        try:
+            yield
+        finally:
+            active_config[0] = prev
 
     class _Loader:
         def load_model(self, *, vllm_config, model_config):
-            loaded["vllm_config"] = vllm_config
+            observed["current_vllm_config"] = active_config[0]
+            observed["arg_vllm_config"] = vllm_config
             return object()
 
     monkeypatch.setattr(e3, "get_model_loader", lambda _cfg: _Loader())
     monkeypatch.setattr(e3, "set_model_tag", lambda _tag: contextlib.nullcontext())
-    monkeypatch.setattr(
-        e3, "set_current_vllm_config", lambda _cfg: contextlib.nullcontext()
-    )
+    monkeypatch.setattr(e3, "set_current_vllm_config", _fake_set_current_vllm_config)
     monkeypatch.setattr(
         e3,
         "set_vllm_model_wrapper_context",
@@ -1901,8 +1918,13 @@ def test_replicated_draft_load_disables_ep_weight_filter(
 
     proposer._load_draft_model()
 
-    draft_parallel_config = loaded["vllm_config"].parallel_config
-    assert draft_parallel_config.enable_ep_weight_filter is draft_filter
+    # Both model loaders read enable_ep_weight_filter via get_current_vllm_config().
+    assert observed["current_vllm_config"] is not None
+    assert observed["current_vllm_config"] is observed["arg_vllm_config"]
+    assert (
+        observed["current_vllm_config"].parallel_config.enable_ep_weight_filter
+        is draft_filter
+    )
     assert proposer.vllm_config.parallel_config.enable_ep_weight_filter is True
 
 

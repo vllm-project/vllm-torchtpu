@@ -147,10 +147,12 @@ def disable_ep_weight_filter_for_replicated_draft(
 ) -> None:
     """Disable EP weight filtering on a replicated draft's VllmConfig copy.
 
-    ``_force_draft_tp1()`` collapses the TP group to world_size=1 / rank=0
-    while ``parallel_config.tensor_parallel_size`` stays at the target's width;
-    leaving ``enable_ep_weight_filter=True`` causes both model loaders to slice
-    a replicated MoE draft down to TP-rank-0's experts only.
+    When a draft is replicated below the target's TP (``draft_tp == 1`` with
+    ``target_tp > 1``), ``_force_draft_tp1()`` collapses the TP group to
+    world_size=1 / rank=0 while ``parallel_config.tensor_parallel_size`` stays
+    at the target's width; leaving ``enable_ep_weight_filter=True`` causes both
+    model loaders to slice a replicated MoE draft down to TP-rank-0's experts
+    only.
     """
     draft_parallel_config = copy.copy(draft_vllm_config.parallel_config)
     draft_parallel_config.enable_ep_weight_filter = False

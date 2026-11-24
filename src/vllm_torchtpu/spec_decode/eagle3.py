@@ -870,7 +870,7 @@ class Eagle3Proposer:
             _force_draft_tp1() if self._draft_replicated else contextlib.nullcontext()
         )
         self.draft_vllm_config = copy.copy(self.vllm_config)
-        if self._draft_replicated:
+        if self._draft_replicated and not self._draft_tp_matches_target:
             disable_ep_weight_filter_for_replicated_draft(self.draft_vllm_config)
         draft_model_config = copy.copy(self.speculative_config.draft_model_config)
         draft_model_config.runner_type = "draft"

@@ -107,7 +107,6 @@ def load_draft_model(vllm_config: Any, target: Any, mesh: Any) -> nn.Module | No
     )
     from vllm_torchtpu.spec_decode.utils import (
         _force_draft_tp1,
-        disable_ep_weight_filter_for_replicated_draft,
         maybe_share_embeddings,
         maybe_share_lm_head,
         normalize_draft_config,
@@ -151,8 +150,6 @@ def load_draft_model(vllm_config: Any, target: Any, mesh: Any) -> nn.Module | No
     draft_model_config = copy.copy(spec.draft_model_config)
     draft_model_config.runner_type = "draft"
     replicated = draft_tp == 1 and target_tp > 1
-    if replicated:
-        disable_ep_weight_filter_for_replicated_draft(draft_vllm_config)
     with (
         set_model_tag("dflash_head"),
         set_vllm_model_wrapper_context(mesh=mesh),
