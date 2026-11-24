@@ -398,6 +398,24 @@ def test_attention_of_query_halves(tokens, rank):
         np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
 
 
+def test_attention_of_kept_own_candidates_other_topk():
+    """A topk outside `pair_work`'s envelope (its tile's keys fill the lanes
+    at topk 16) attends through the XLA work list, as over the merge."""
+    args, common = _attend_case(8, 0, True, seed=5)
+    q, kv_cache, candidates, *meta = args
+    topk = 8
+    candidates = jnp.concatenate(
+        [candidates[..., :topk], candidates[..., _TOPK : _TOPK + topk]], axis=-1
+    )
+    common = dict(common, topk=topk)
+    want = msa_dcp.msa_attend_dcp(q, kv_cache, candidates, *meta, **common)
+    got = msa_dcp.msa_attend_dcp(
+        q, kv_cache, candidates, *meta, own_first=True, **common
+    )
+    for w, g in zip(want, got):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+
+
 def test_kept_own_candidates_comparison_catches_a_changed_selection():
     """Positive control for the test above: one candidate that loses its
     place in the global top-k changes the outputs it compares."""

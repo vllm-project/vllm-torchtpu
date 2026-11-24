@@ -941,6 +941,21 @@ def _single_tile_words(work_ref, lane, count, groups):
     work_ref[:, union_len:] = row[:, : 2 * groups + 2]
 
 
+def _takes_pair_work(own_first, num_heads, dcp, num_tokens, topk, num_keys):
+    """Whether `msa_attend_dcp` builds its work list in `pair_work`: a pair's
+    decode step attending its kept own candidates, within the kernel's
+    envelope (a tile's `_TILE_ROWS` rows of topk keys fill `_TILE_KEYS`
+    lanes, at most `_PAIR_WORK_MAX_TOKENS` tokens, keys exact in f32)."""
+    return (
+        own_first
+        and num_heads == 1
+        and dcp == 2
+        and 0 < num_tokens <= _PAIR_WORK_MAX_TOKENS
+        and topk * _TILE_ROWS == _TILE_KEYS
+        and num_keys <= _F32_EXACT_KEYS
+    )
+
+
 def pair_work(
     own: jax.Array,
     peer: jax.Array,
@@ -1399,16 +1414,13 @@ def msa_attend_dcp(
     # Page keys (seq * pages_per_seq + logical block) of the selected blocks
     # this rank holds, as `msa.sparse_attention`; [T, G, topk].
     work = None
-    if (
-        own_first
-        and num_heads == 1
-        and dcp == 2
-        and num_tokens <= _PAIR_WORK_MAX_TOKENS
-        and max_num_seqs * pages_per_seq <= _F32_EXACT_KEYS
+    if _takes_pair_work(
+        own_first, num_heads, dcp, num_tokens, topk, max_num_seqs * pages_per_seq
     ):
-        # One kernel: kept page keys and the attention's work list.
+        # One kernel: kept page keys and the attention's work list (and the
+        # pair's query heads in rank order).
         key_base = jnp.where(valid, seq_id * pages_per_seq, -1)[:, None]
-        keys, work, *q_all = pair_work(
+        keys, work, *placed = pair_work(
             candidates[0],
             candidates[1],
             key_base,
@@ -1418,16 +1430,16 @@ def msa_attend_dcp(
         )
         keys = keys[:, None]
         if halves:
-            (q,) = q_all
-            halves = False
-    elif own_first and num_heads == 1:
-        blocks, kept = kept_own_candidates(candidates, topk)
-        mine, selected = (kept & valid[:, None])[:, None], blocks[:, None]
+            (q,) = placed
     else:
-        selected = merge_head_candidates(candidates, topk, interpret)
-        mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
-    if halves:
-        q = _pair_heads(*q, rank)
+        if halves:
+            q = _pair_heads(*q, rank)
+        if own_first and num_heads == 1:
+            blocks, kept = kept_own_candidates(candidates, topk)
+            mine, selected = (kept & valid[:, None])[:, None], blocks[:, None]
+        else:
+            selected = merge_head_candidates(candidates, topk, interpret)
+            mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
     if work is None:
         keys = jnp.where(
             mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1
