@@ -84,7 +84,7 @@ def test_prepare_routed_gmm_inputs_single_sort_matches_three_sorts_with_padded_t
     # 80 routed rows over 65 buckets is counting-sort territory; stand it down
     # so the two arms really run the single sort and the three-sort reference.
     monkeypatch.setattr(
-        fused_moe_gmm, "_counting_sort_positions", lambda *a, **kw: (None, None)
+        fused_moe_gmm, "_counting_sort_positions", lambda *a, **kw: (None, None, None)
     )
     for single_sort in (False, True):
         monkeypatch.setattr(fused_moe_gmm, "_SINGLE_SORT", single_sort)
