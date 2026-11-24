@@ -66,8 +66,8 @@ def solve_triangular_rhs(
         # untouched because their coefficient in the strictly lower block is
         # zero, so each step is one multiply-subtract over B rows held densely
         # in sublanes. A row-by-row chain costs one vreg op per head per
-        # (row, column) pair instead, which made the solve VALU-bound at 8-
-        # and 16-row blocks (few V heads per core).
+        # (row, column) pair instead, making the solve VALU-bound at 8- and
+        # 16-row blocks (few V heads per core).
         x = b_block
         for j in range(l_block.shape[1] - 1):
             x = x - l_block[:, :, j : j + 1] * x[:, j : j + 1, :]
