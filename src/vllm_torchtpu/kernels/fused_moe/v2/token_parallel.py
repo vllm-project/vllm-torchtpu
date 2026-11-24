@@ -105,6 +105,19 @@ class TokenReplicaLayout:
             rows, slot * self.local_rows, self.local_rows, axis=0
         )
 
+    def reduce_split(self, rows: jax.Array, axis: str) -> jax.Array:
+        """Sum per-member partial rows over each group and keep `split`'s slice.
+
+        `restore` of the result is the group's all-reduce of `rows`.
+        """
+        if len(self.groups[0]) == 1:
+            return rows
+        padding = self.local_rows * len(self.groups[0]) - self.input_rows
+        rows = jnp.pad(rows, ((0, padding), (0, 0)))
+        return lax.psum_scatter(
+            rows, axis, scatter_dimension=0, axis_index_groups=self.groups, tiled=True
+        )
+
     def restore(self, rows: jax.Array, axis: str) -> jax.Array:
         if len(self.groups[0]) == 1:
             return rows

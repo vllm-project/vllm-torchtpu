@@ -48,6 +48,8 @@ def test_singleton_preserves_unaligned_inputs_without_traced_operations(groups, 
     assert not graph.jaxpr.eqns
     np.testing.assert_array_equal(identity_path(values, jnp.int32(0)), values)
     assert layout.local_rows == rows
+    graph = jax.make_jaxpr(lambda x: layout.reduce_split(x, "unbound_axis"))(values)
+    assert not graph.jaxpr.eqns
 
 
 @pytest.mark.multichip
@@ -113,6 +115,57 @@ def test_unique_rows_and_original_output_on_every_tp_rank(groups, rows, alignmen
         layout.local_rows * len(layout.groups[0]) - rows
         < len(layout.groups[0]) * alignment
     )
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize(
+    "groups",
+    [
+        ((0, 1), (2, 3), (4, 5), (6, 7)),
+        ((6, 1), (4, 3), (0, 7), (2, 5)),
+        ((7, 1, 4, 2), (6, 0, 5, 3)),
+    ],
+)
+@pytest.mark.parametrize("rows", [1, 7, 24])
+def test_reduce_split_holds_the_split_slice_of_the_group_sum(groups, rows):
+    if len(jax.devices()) != 8:
+        pytest.skip("requires eight devices; CPU virtual devices are sufficient")
+    layout = TokenReplicaLayout.create(
+        ep=8, input_rows=rows, groups=groups, row_alignment=8
+    )
+    mesh = Mesh(np.asarray(jax.devices()), ("d",))
+    partials = np.random.default_rng(0).standard_normal((8 * rows, 4))
+    partials = partials.astype(np.float32)
+    x = jax.device_put(partials, NamedSharding(mesh, P("d")))
+
+    def local(x_l):
+        reduced = layout.reduce_split(x_l, "d")
+        return reduced, layout.restore(reduced, "d")
+
+    fn = jax.jit(
+        jax.shard_map(
+            local,
+            mesh=mesh,
+            in_specs=P("d"),
+            out_specs=(P("d"), P("d")),
+            check_vma=False,
+        )
+    )
+    reduced, restored = (np.asarray(a) for a in fn(x))
+    width, local_rows = len(layout.groups[0]), layout.local_rows
+    for group in layout.groups:
+        total = sum(partials[r * rows : (r + 1) * rows] for r in group)
+        padded = np.pad(total, ((0, local_rows * width - rows), (0, 0)))
+        for slot, r in enumerate(group):
+            np.testing.assert_allclose(
+                restored[r * rows : (r + 1) * rows], total, rtol=1e-6, atol=1e-6
+            )
+            np.testing.assert_allclose(
+                reduced[r * local_rows : (r + 1) * local_rows],
+                padded[slot * local_rows : (slot + 1) * local_rows],
+                rtol=1e-6,
+                atol=1e-6,
+            )
 
 
 @pytest.mark.parametrize(
