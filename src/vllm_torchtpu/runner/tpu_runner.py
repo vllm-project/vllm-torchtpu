@@ -4425,6 +4425,8 @@ class TPUModelRunner(GPUModelRunner):
             if self._phase_timer is not None:
                 self._phase_timer.mark("post_prepare")
             self._record_input_staging_fence()
+            if self._phase_timer is not None:
+                self._phase_timer.mark("fence_record")
             if self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(
                     input_ids, chunk_mm_inputs
@@ -4442,6 +4444,8 @@ class TPUModelRunner(GPUModelRunner):
             assert sizing_input is not None
             num_tokens_padded = sizing_input.shape[0]
             self._token_padding_update(num_tokens_padded)
+            if self._phase_timer is not None:
+                self._phase_timer.mark("model_inputs_get_pad")
             intermediate_tensors = None
             if self._pp_wave is not None:
                 intermediate_tensors = self._pp_wave.start_forward(num_tokens_padded)
@@ -4504,6 +4508,8 @@ class TPUModelRunner(GPUModelRunner):
                 ),
                 self._stage_timing.stage("main_forward"),
             ):
+                if self._phase_timer is not None:
+                    self._phase_timer.mark("enter_contexts")
                 hidden_states, aux_hidden_states = self.forward_model(
                     input_ids=input_ids,
                     positions=self.position_ids,
