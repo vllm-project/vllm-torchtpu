@@ -415,6 +415,7 @@ def _kernel_v3(
     on_pages=None,
     table_width=None,
     pending=None,
+    pair_issue=False,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     groups (``buf.shape[0]``: `_RING_SLOTS`, the select call's
@@ -440,7 +441,9 @@ def _kernel_v3(
     `prologue()` runs at the first step once its page copies are issued, and
     `on_pages(slot)` once a step's pages are in ring slot `slot`, before they
     are scored. With `table_width` (its rows' entries), the block table is
-    `msa_attention.pack_table16`'s.
+    `msa_attention.pack_table16`'s. With `pair_issue` (a packed table),
+    pages g and g + 1 take one load of their word, and the first step issues
+    its whole ahead groups' copies unpredicated.
 
     `pending = (scores, count, store_at)` (with `store` and transposed
     scores) defers each step's last scored chunk: its raw scores go to the
@@ -476,7 +479,7 @@ def _kernel_v3(
         first = (entry & _GROUP_MASK) * pages_per_step
         return seq * pages_per_seq + first, jnp.maximum(seq_pages_ref[seq] - first, 1)
 
-    def copy(base, g, slot):
+    def copy(base, g, slot, word=None):
         col = g
         if pages_per_seq % pages_per_step:
             # Keep the last group's block-table reads in its request's row.
@@ -486,7 +489,8 @@ def _kernel_v3(
         elif table_width is not None and (pages_per_seq | pages_per_step) % 2 == 0:
             # `base` is even: entry g's 16-bit half is static, and pages g and
             # g + 1 read one word (a dynamic half cost ~4 scalar ops per page).
-            word = block_tables_ref[(base >> 1) + g // 2]
+            if word is None:
+                word = block_tables_ref[(base >> 1) + g // 2]
             page = (word >> 16) & 0xFFFF if g % 2 else word & 0xFFFF
         else:
             page = table_entry(base + col)
@@ -508,13 +512,29 @@ def _kernel_v3(
             words.at[pl.ds(0, n)], buf.at[slot, pl.ds(0, n)], sems.at[slot]
         )
 
-    def start(base, live, pages, slot):
+    paired = (
+        pair_issue
+        and not pages_per_seq % pages_per_step
+        and table_width is not None
+        and (pages_per_seq | pages_per_step) % 2 == 0
+    )
+
+    def start(base, live, pages, slot, predicated=True):
         """Start the copies of a group's `pages` that are below its `live`
-        pages, alternate pages on the second DMA queue (priority 1)."""
+        pages (all, if not `predicated`), alternate pages on the second DMA
+        queue (priority 1)."""
+        word = None
         for g in pages:
-            pl.when(g < live)(
-                functools.partial(copy(base, g, slot).start, priority=g % 2)
+            if paired and (g % 2 == 0 or word is None):
+                word = block_tables_ref[(base >> 1) + g // 2]
+            copy_start = functools.partial(
+                copy(base, g, slot, word if paired else None).start,
+                priority=g % 2,
             )
+            if predicated:
+                pl.when(g < live)(copy_start)
+            else:
+                copy_start()
 
     def ahead_group(k):
         """(first entry, live pages) of work item `k`; none past the grid."""
@@ -524,7 +544,19 @@ def _kernel_v3(
     @pl.when(step == 0)
     def _():
         for k in range(ahead):
-            start(*ahead_group(k), range(pages_per_step), k)
+            k_base, k_live = ahead_group(k)
+            if not paired:
+                start(k_base, k_live, range(pages_per_step), k)
+                continue
+            whole = k_live >= pages_per_step
+            pl.when(whole)(
+                functools.partial(
+                    start, k_base, k_live, range(pages_per_step), k, predicated=False
+                )
+            )
+            pl.when(jnp.logical_not(whole))(
+                functools.partial(start, k_base, k_live, range(pages_per_step), k)
+            )
 
     if prologue is not None:
         pl.when(step == 0)(prologue)
@@ -745,6 +777,7 @@ def _kernel_v3_select(
     select: RowSelect,
     writes: msa_write.RunWrites | None = None,
     table_width: int | None = None,
+    pair_issue: bool = False,
 ):
     """`_kernel_v3` with token-major scores kept in VMEM, by page group and
     token row, then reduced by `select` at the last step: a separate kernel
@@ -856,6 +889,7 @@ def _kernel_v3_select(
         on_pages=on_pages,
         table_width=table_width,
         pending=(*pending, store_at),
+        pair_issue=pair_issue,
     )
 
     def pick(width):
@@ -1233,6 +1267,9 @@ def _select_call(
             select=select,
             writes=None if writes is None else writes.layout_only(),
             table_width=table_width,
+            # Above one 8-token tile: -0.2 .. -0.42 us per layer at 24 / 48
+            # tokens (kbench j-4c8cb3c1), slower at 8 (j-ad8a21e1).
+            pair_issue=num_tokens > 8,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(prefetch) + 1,
