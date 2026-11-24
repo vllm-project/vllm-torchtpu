@@ -191,7 +191,7 @@ vllm serve deepseek-ai/DeepSeek-V4-Pro-0813 \
 > export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="MOE_REQUANTIZE_WEIGHT_DTYPE,MOE_REQUANTIZE_BLOCK_SIZE,TPU_ROPE_CACHE_ROW_MAJOR,TPU_MOE_HASH_TABLE_ROW_MAJOR,USE_MOE_FUSED_EP_KERNEL,MOE_FUSED_EP_ENABLE_W4A8,MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE,TPU_MOE_SKIP_PADDED_TOKENS,RAGGED_GATHER_REDUCE_VERSION,LIBTPU_INIT_ARGS"
 > ```
 >
-> When streaming the 805 GiB checkpoint from GCS via `--load-format runai_streamer`, also pass `--model-loader-extra-config '{"memory_limit":4294967296,"concurrency":8}'` to cap per-rank host streamer buffers. See [Multi-Host Serving](../user_guide/multihost.md) for full `mp` and `ray` cluster setup details.
+> When streaming the 805 GiB checkpoint from GCS via `--load-format runai_streamer`, multi-rank TPU hosts automatically default `memory_limit` to `40 GiB // local_ranks` per rank (floored at the largest checkpoint tensor). Pass `--model-loader-extra-config '{"memory_limit":4294967296,"concurrency":8}'` if you want to override that default with a 4 GiB cap or tune the reader concurrency. See [Multi-Host Serving](../user_guide/multihost.md) for full `mp` and `ray` cluster setup details.
 
 **Benchmark Client (`8k` input / `1k` output):**
 
