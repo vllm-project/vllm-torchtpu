@@ -196,8 +196,9 @@ def test_shared_page_attention(dcp, g, path, monkeypatch):
     ]  # fmt: skip
     got = t._attend(q, view, meta, dcp, candidates=cands)
     num_real = sum(t.Q_LENS)
+    # Some ranks hold no selected page of these short contexts.
+    assert max(np.abs(wo[:, :num_real]).max() for wo, _ in want) > 0
     for (wo, wl), (go, gl) in zip(want, got):
-        assert np.abs(wo[:, :num_real]).max() > 0
         np.testing.assert_array_equal(go, wo)
         np.testing.assert_array_equal(gl, wl)
     # Control: the same rows read at row 0 (another layer's) differ.
