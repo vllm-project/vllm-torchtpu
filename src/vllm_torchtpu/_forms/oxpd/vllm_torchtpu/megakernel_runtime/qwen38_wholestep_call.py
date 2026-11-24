@@ -165,16 +165,18 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     return t if not _gdnink_rel_fetch(B) else dataclasses.replace(t, rel_fetch=True)  # q38 L1-GDNINK (GDN-REL-FETCH), same line
 
 
-_SUPPORTED_VMEM_CUTS = frozenset({"vmem64", "ring"})
+_SUPPORTED_VMEM_CUTS = frozenset({"alias", "vmem64", "ring"})
 
 
 def _vmem_cuts(t: Tiles, B: int) -> Tiles:
-    """Apply opt-in `VLLM_TPU_MK_VMEM_CUTS` for `B >= VLLM_TPU_MK_VMEM_CUT_ROWS`.
+    """Apply opt-in `VLLM_TPU_MK_SCRATCH_ALIAS` and `VLLM_TPU_MK_VMEM_CUTS`.
 
-    Supports `vmem64` (scoped limit 62 -> 64 MiB) and `ring` (`VMEM_CUT_RINGS`
-    / `VMEM_CUT_RINGS_AR2D_SS`). Unported core-cut tokens (`io`, `chunk`, `acc`,
-    `lean`) raise `ValueError` rather than silently enabling oversized ring depths.
-    `VLLM_TPU_MK_RINGS` and `VLLM_TPU_MK_RING_S1` still override after this helper.
+    `VLLM_TPU_MK_VMEM_CUTS` runs for `B >= VLLM_TPU_MK_VMEM_CUT_ROWS` and
+    supports `alias` (`Tiles.scratch_alias`), `vmem64` (scoped limit 62 -> 64 MiB),
+    and `ring` (`VMEM_CUT_RINGS` / `VMEM_CUT_RINGS_AR2D_SS`). Unported core-cut
+    tokens (`io`, `chunk`, `acc`, `lean`) raise `ValueError` rather than silently
+    enabling oversized ring depths. `VLLM_TPU_MK_RINGS` and `VLLM_TPU_MK_RING_S1`
+    still override after this helper.
     """
     raw = str(envs.VLLM_TPU_MK_VMEM_CUTS or "")
     cuts = {x.strip() for x in raw.split(",") if x.strip()}
@@ -184,9 +186,13 @@ def _vmem_cuts(t: Tiles, B: int) -> Tiles:
             f"VLLM_TPU_MK_VMEM_CUTS={raw!r} contains unsupported tokens {unknown}; "
             f"supported in oxpd: {sorted(_SUPPORTED_VMEM_CUTS)}"
         )
+    if envs.VLLM_TPU_MK_SCRATCH_ALIAS and not t.scratch_alias:
+        t = dataclasses.replace(t, scratch_alias=True)
     if not cuts or B < int(envs.VLLM_TPU_MK_VMEM_CUT_ROWS):
         return t
     upd: dict[str, Any] = {}
+    if "alias" in cuts:
+        upd["scratch_alias"] = True
     if "vmem64" in cuts:
         upd["vmem_mib"] = 64
     if "ring" in cuts and not (main_kv_dcp() > 1 and B <= 32):

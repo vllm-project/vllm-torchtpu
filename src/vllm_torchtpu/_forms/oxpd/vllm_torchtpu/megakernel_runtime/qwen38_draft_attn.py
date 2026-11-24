@@ -271,8 +271,12 @@ class DraftAttn(nn.Module):
         ops = pack_draft_attn_operands(attn, g, spec, ex)
         self.pack_rows = B  # q38 ATTNWIRE: the rows count the operands were packed at (max of the driver's buckets)
         self.n_w = len(ops)
+        use_param_hold = bool(envs.VLLM_TPU_MK_DRAFT_CLEAN_OPERANDS)
         for i, t in enumerate(ops):
-            self.register_buffer(f"w_{i}", t, persistent=False)
+            if use_param_hold:
+                setattr(self, f"w_{i}", nn.Parameter(t, requires_grad=False))
+            else:
+                self.register_buffer(f"w_{i}", t, persistent=False)
 
     def forward(self, block: torch.Tensor, positions: torch.Tensor, metadata: Any, attn: Any) -> torch.Tensor:
         from typing import cast

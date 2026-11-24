@@ -93,6 +93,7 @@ def test_exact_flip_list_covers_registry():
     separately_tested = {
         "gqa.kv_scatter_vec_ns",
         "ar2d_single_slot",
+        "scratch_alias",
         "moe.dedup_vec",
         "moe.rb_hoist",
     }
