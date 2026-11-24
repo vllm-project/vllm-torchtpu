@@ -372,6 +372,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MAMBA_DECODE_CHECKPOINT: bool = True
     VLLM_TPU_MAMBA_PIN_HIT_CHECKPOINT: bool = False
     VLLM_TPU_PREFIX_LOOKUP_LOG: bool = False
+    VLLM_TPU_ARRIVAL_TOUCH: bool = False
     VLLM_TPU_KV_DECODE_FAST_PATH: bool = False
     VLLM_TPU_KV_LOAD_STARTS_PER_STEP: int = 0
     VLLM_TPU_PROMPT_TOKEN_ARRAY: bool = False
@@ -2542,6 +2543,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and tier hits and what each level held of its blocks
     # (offload/lookup_log.py). Host-only.
     "VLLM_TPU_PREFIX_LOOKUP_LOG": env_bool("VLLM_TPU_PREFIX_LOOKUP_LOG", default=False),
+    # Scheduler: on request arrival (Scheduler.add_request), rotate any
+    # already-cached unreferenced HBM prefix blocks and resident host-tier
+    # offload blocks to the MRU end without modifying ref counts or holding
+    # pins (core/arrival_touch.py). 100% lossless; default off. Host-only.
+    "VLLM_TPU_ARRIVAL_TOUCH": env_bool("VLLM_TPU_ARRIVAL_TOUCH", default=False),
     # Scheduler: a steady decode step skips the per-group KV cache
     # bookkeeping when no group's state can change; the same blocks are
     # allocated, cached and freed (core/kv_decode_fast_path.py). Host-only.

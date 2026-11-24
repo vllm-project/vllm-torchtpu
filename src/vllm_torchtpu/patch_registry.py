@@ -117,6 +117,8 @@ PATCHES = (
     Patch("vllm_torchtpu.offload.lookup_log:patch_prefix_lookup_log", _ENGINE),
     # Pin the cached prefix of waiting requests (inert unless VLLM_TPU_PIN_WAITING_PREFIX).
     Patch("vllm_torchtpu.core.pin_waiting_prefix:patch_pin_waiting_prefix", _ENGINE),
+    # Refresh cached prefix LRU on arrival (inert unless VLLM_TPU_ARRIVAL_TOUCH).
+    Patch("vllm_torchtpu.core.arrival_touch:patch_arrival_touch", _ENGINE),
     # After every patch of the KV cache manager, its groups and the block
     # pool: it checks the functions it encodes as they are installed.
     Patch("vllm_torchtpu.core.kv_decode_fast_path:patch_kv_decode_fast_path", _ENGINE),
