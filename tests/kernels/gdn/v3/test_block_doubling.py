@@ -326,5 +326,303 @@ class BlockDoublingComputeTest(parameterized.TestCase):
             )
 
 
+class BlockDoublingPhaseHooksTest(parameterized.TestCase):
+    @parameterized.parameters(
+        config.GDNPrefillMode.BLOCK_DOUBLING_BF16,
+        config.GDNPrefillMode.BLOCK_DOUBLING_FP8,
+    )
+    def test_streamed_prescaled_gates_and_phase_hook(self, mode):
+        rng = np.random.default_rng(17)
+        n_kq, n_v, chunk, d = 2, 8, 32, 128
+        cfg = _make_cfg(n_kq=n_kq, n_v=n_v, chunk=chunk, d=d, mode=mode)
+        q = jnp.asarray(rng.standard_normal((n_kq, chunk, d)), jnp.float32)
+        k = jnp.asarray(rng.standard_normal((n_kq, chunk, d)), jnp.float32)
+        v = jnp.asarray(rng.standard_normal((n_v, chunk, d)), jnp.float32)
+        state_prev = jnp.asarray(rng.standard_normal((n_v, d, d)), jnp.float32)
+        b_lanes = jnp.asarray(rng.standard_normal((1, chunk, 128)), jnp.float32)
+        a_lanes = jnp.asarray(rng.standard_normal((1, chunk, 128)), jnp.float32)
+        a_log = jnp.asarray(rng.uniform(-2.0, 0.0, (128,)), jnp.float32)
+        dt_bias = jnp.asarray(rng.normal(0.0, 0.5, (128,)), jnp.float32)
+
+        # Reference run with raw Q/K, raw gate inputs, and explicit real_sizes.
+        ref_states: dict[int, jax.Array] = {}
+        ref_out, _ = block_doubling.run_chunk_streamed(
+            load_raw_kq=lambda kqs: (
+                {i: q[i] for i in kqs},
+                {i: k[i] for i in kqs},
+            ),
+            load_raw_v=lambda vs: {i: v[i] for i in vs},
+            cfg=cfg,
+            load_state_v=lambda h: state_prev[h],
+            store_state_v=ref_states.__setitem__,
+            real_sizes=jnp.array([chunk], jnp.int32),
+            b_lanes=b_lanes,
+            a_lanes=a_lanes,
+            a_log=a_log,
+            dt_bias=dt_bias,
+        )
+        self.assertIsNotNone(ref_out)
+
+        # Precomputed gates + prescaled Q/K + real_sizes=None + phase_hook +
+        # streamed output slices.
+        q_scale = d**-0.5
+        inv_q = jax.lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-6)
+        inv_k = jax.lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-6)
+        q_pre = q * (inv_q * jnp.float32(q_scale * 256.0))
+        k_pre = k * (inv_k * jnp.float32(256.0))
+        beta_lanes = jax.nn.sigmoid(b_lanes)
+        glog_lanes = -jnp.exp(a_log.reshape(1, 1, -1)) * jax.nn.softplus(
+            a_lanes + dt_bias.reshape(1, 1, -1)
+        )
+
+        events: list[tuple[block_doubling.BlockDoublingPhase, int, int]] = []
+        got_states: dict[int, jax.Array] = {}
+        got_out_slices: dict[int, list[jax.Array]] = {}
+        out_none, state_none = block_doubling.run_chunk_streamed(
+            load_raw_kq=lambda kqs: (
+                {i: q_pre[i] for i in kqs},
+                {i: k_pre[i] for i in kqs},
+            ),
+            load_raw_v=lambda vs: {i: v[i] for i in vs},
+            cfg=cfg,
+            load_state_v=lambda h: state_prev[h],
+            store_state_v=got_states.__setitem__,
+            gating_log_lanes=glog_lanes,
+            beta_lanes=beta_lanes,
+            kq_prescaled_256=True,
+            store_out_slice=got_out_slices.__setitem__,
+            out_step=4,
+            out_dtype=jnp.dtype(jnp.float32),
+            phase_hook=lambda phase, idx, tot: events.append((phase, idx, tot)),
+        )
+        self.assertIsNone(out_none)
+        self.assertIsNone(state_none)
+        self.assertEqual(sorted(got_out_slices), [0, 4])
+        got_out = jnp.stack(got_out_slices[0] + got_out_slices[4], axis=0)
+        np.testing.assert_allclose(
+            np.asarray(got_out), np.asarray(ref_out), rtol=1e-5, atol=1e-5
+        )
+        for h in range(n_v):
+            np.testing.assert_allclose(
+                np.asarray(got_states[h]),
+                np.asarray(ref_states[h]),
+                rtol=1e-5,
+                atol=1e-5,
+            )
+        phase = block_doubling.BlockDoublingPhase
+        # 1 group of 8 heads (4 paired V heads in front, 8 heads in tail).
+        want_events = (
+            [(phase.GROUP_START, 0, 1)]
+            + [(phase.STATE_FIRST_PAIR, i, 4) for i in range(4)]
+            + [(phase.TAIL_HEAD, i, 8) for i in range(8)]
+            + [(phase.GROUP_END, 0, 1)]
+        )
+        self.assertEqual(events, want_events)
+
+    def test_phase_hook_multi_group_and_unpaired_tail_head(self):
+        phase = block_doubling.BlockDoublingPhase
+        d, chunk = 128, 32
+
+        # 1) Multi-group (n_kq=8, n_v=64 -> 2 groups of 32 heads, 16 pairs/group).
+        cfg_multi = _make_cfg(n_kq=8, n_v=64, chunk=chunk, d=d)
+        events_multi: list[tuple[block_doubling.BlockDoublingPhase, int, int]] = []
+        zeros_1d = jnp.zeros((chunk, d), jnp.float32)
+        zeros_s = jnp.zeros((d, d), jnp.float32)
+        zeros_lanes = jnp.zeros((1, chunk, 128), jnp.float32)
+        block_doubling.run_chunk_streamed(
+            load_raw_kq=lambda kqs: (
+                {i: zeros_1d for i in kqs},
+                {i: zeros_1d for i in kqs},
+            ),
+            load_raw_v=lambda vs: {i: zeros_1d for i in vs},
+            cfg=cfg_multi,
+            load_state_v=lambda h: zeros_s,
+            store_state_v=lambda h, s: None,
+            gating_log_lanes=zeros_lanes,
+            beta_lanes=zeros_lanes,
+            kq_prescaled_256=True,
+            phase_hook=lambda p, idx, tot: events_multi.append((p, idx, tot)),
+        )
+        want_multi = []
+        for g_idx in range(2):
+            want_multi.append((phase.GROUP_START, g_idx, 2))
+            want_multi.extend([(phase.STATE_FIRST_PAIR, i, 16) for i in range(16)])
+            want_multi.extend([(phase.TAIL_HEAD, i, 32) for i in range(32)])
+            want_multi.append((phase.GROUP_END, g_idx, 2))
+        self.assertEqual(events_multi, want_multi)
+
+        # 2) Odd v_per_kq (n_kq=2, n_v=6 -> v_per_kq=3 disables V-head pairing,
+        #    so front visits 6 singleton heads and tail visits 6 heads).
+        cfg_odd = _make_cfg(n_kq=2, n_v=6, chunk=chunk, d=d)
+        events_odd: list[tuple[block_doubling.BlockDoublingPhase, int, int]] = []
+        block_doubling.run_chunk_streamed(
+            load_raw_kq=lambda kqs: (
+                {i: zeros_1d for i in kqs},
+                {i: zeros_1d for i in kqs},
+            ),
+            load_raw_v=lambda vs: {i: zeros_1d for i in vs},
+            cfg=cfg_odd,
+            load_state_v=lambda h: zeros_s,
+            store_state_v=lambda h, s: None,
+            gating_log_lanes=zeros_lanes,
+            beta_lanes=zeros_lanes,
+            kq_prescaled_256=True,
+            phase_hook=lambda p, idx, tot: events_odd.append((p, idx, tot)),
+        )
+        want_odd = (
+            [(phase.GROUP_START, 0, 1)]
+            + [(phase.STATE_FIRST_PAIR, i, 6) for i in range(6)]
+            + [(phase.TAIL_HEAD, i, 6) for i in range(6)]
+            + [(phase.GROUP_END, 0, 1)]
+        )
+        self.assertEqual(events_odd, want_odd)
+
+    @parameterized.parameters(False, True)
+    def test_precomputed_gates_respect_real_sizes_mask(self, kq_prescaled_256):
+        rng = np.random.default_rng(23)
+        n_kq, n_v, chunk, d = 1, 4, 32, 128
+        valid_len = 20
+        cfg = _make_cfg(n_kq=n_kq, n_v=n_v, chunk=chunk, d=d)
+        q_clean = jnp.asarray(rng.standard_normal((n_kq, chunk, d)), jnp.float32)
+        k_clean = jnp.asarray(rng.standard_normal((n_kq, chunk, d)), jnp.float32)
+        if kq_prescaled_256:
+            q_scale = d**-0.5
+            inv_q = jax.lax.rsqrt(jnp.sum(q_clean**2, axis=-1, keepdims=True) + 1e-6)
+            inv_k = jax.lax.rsqrt(jnp.sum(k_clean**2, axis=-1, keepdims=True) + 1e-6)
+            q_clean = q_clean * (inv_q * jnp.float32(q_scale * 256.0))
+            k_clean = k_clean * (inv_k * jnp.float32(256.0))
+        v_clean = jnp.asarray(rng.standard_normal((n_v, chunk, d)), jnp.float32)
+        state_prev = jnp.asarray(rng.standard_normal((n_v, d, d)), jnp.float32)
+        beta_clean = jax.nn.sigmoid(
+            jnp.asarray(rng.standard_normal((1, chunk, 128)), jnp.float32)
+        )
+        glog_clean = -jnp.abs(
+            jnp.asarray(rng.standard_normal((1, chunk, 128)), jnp.float32)
+        )
+        mask_2d = (jnp.arange(chunk) < valid_len)[None, :, None]
+        # Poison padded rows with NaN so any missed masking leaks immediately.
+        q_poison = jnp.where(mask_2d, q_clean, jnp.nan)
+        k_poison = jnp.where(mask_2d, k_clean, jnp.nan)
+        v_poison = jnp.where(mask_2d, v_clean, jnp.nan)
+        glog_poison = jnp.where(mask_2d, glog_clean, jnp.nan)
+        beta_poison = jnp.where(mask_2d, beta_clean, jnp.nan)
+
+        states_masked: dict[int, jax.Array] = {}
+        states_premasked: dict[int, jax.Array] = {}
+        out_masked, _ = block_doubling.run_chunk_streamed(
+            load_raw_kq=lambda kqs: (
+                {i: q_poison[i] for i in kqs},
+                {i: k_poison[i] for i in kqs},
+            ),
+            load_raw_v=lambda vs: {i: v_poison[i] for i in vs},
+            cfg=cfg,
+            load_state_v=lambda h: state_prev[h],
+            store_state_v=states_masked.__setitem__,
+            real_sizes=jnp.array([valid_len], jnp.int32),
+            gating_log_lanes=glog_poison,
+            beta_lanes=beta_poison,
+            kq_prescaled_256=kq_prescaled_256,
+        )
+        out_premasked, _ = block_doubling.run_chunk_streamed(
+            load_raw_kq=lambda kqs: (
+                {i: jnp.where(mask_2d[0], q_clean[i], 0.0) for i in kqs},
+                {i: jnp.where(mask_2d[0], k_clean[i], 0.0) for i in kqs},
+            ),
+            load_raw_v=lambda vs: {
+                i: jnp.where(mask_2d[0], v_clean[i], 0.0) for i in vs
+            },
+            cfg=cfg,
+            load_state_v=lambda h: state_prev[h],
+            store_state_v=states_premasked.__setitem__,
+            real_sizes=jnp.array([valid_len], jnp.int32),
+            gating_log_lanes=jnp.where(mask_2d, glog_clean, 0.0),
+            beta_lanes=jnp.where(mask_2d, beta_clean, 0.0),
+            kq_prescaled_256=kq_prescaled_256,
+        )
+        self.assertIsNotNone(out_masked)
+        self.assertTrue(bool(jnp.all(jnp.isfinite(out_masked))))
+        np.testing.assert_array_equal(np.asarray(out_masked), np.asarray(out_premasked))
+        for h in range(n_v):
+            np.testing.assert_array_equal(
+                np.asarray(states_masked[h]), np.asarray(states_premasked[h])
+            )
+
+        # Must-fail control: omitting real_sizes lets poisoned padded rows leak NaN.
+        states_unmasked: dict[int, jax.Array] = {}
+        out_unmasked, _ = block_doubling.run_chunk_streamed(
+            load_raw_kq=lambda kqs: (
+                {i: q_poison[i] for i in kqs},
+                {i: k_poison[i] for i in kqs},
+            ),
+            load_raw_v=lambda vs: {i: v_poison[i] for i in vs},
+            cfg=cfg,
+            load_state_v=lambda h: state_prev[h],
+            store_state_v=states_unmasked.__setitem__,
+            real_sizes=None,
+            gating_log_lanes=glog_poison,
+            beta_lanes=beta_poison,
+            kq_prescaled_256=kq_prescaled_256,
+        )
+        self.assertIsNotNone(out_unmasked)
+        self.assertTrue(bool(jnp.any(jnp.isnan(out_unmasked))))
+
+    def test_phase_hook_validation_errors(self):
+        cfg = _make_cfg(n_kq=2, n_v=8, chunk=32, d=128)
+        zeros_lanes = jnp.zeros((1, 32, 128), jnp.float32)
+
+        def _dummy_kq(kqs):
+            del kqs
+            return {}, {}
+
+        def _dummy_v(vs):
+            del vs
+            return {}
+
+        def _dummy_load(h):
+            del h
+            return jnp.zeros((128, 128), jnp.float32)
+
+        def _dummy_store(h, s):
+            del h, s
+
+        with self.assertRaisesRegex(ValueError, "both be set or both be None"):
+            block_doubling.run_chunk_streamed(
+                load_raw_kq=_dummy_kq,
+                load_raw_v=_dummy_v,
+                cfg=cfg,
+                load_state_v=_dummy_load,
+                store_state_v=_dummy_store,
+                gating_log_lanes=zeros_lanes,
+            )
+        with self.assertRaisesRegex(ValueError, "both be set or both be None"):
+            block_doubling.run_chunk_streamed(
+                load_raw_kq=_dummy_kq,
+                load_raw_v=_dummy_v,
+                cfg=cfg,
+                load_state_v=_dummy_load,
+                store_state_v=_dummy_store,
+                beta_lanes=zeros_lanes,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot be combined with"):
+            block_doubling.run_chunk_streamed(
+                load_raw_kq=_dummy_kq,
+                load_raw_v=_dummy_v,
+                cfg=cfg,
+                load_state_v=_dummy_load,
+                store_state_v=_dummy_store,
+                gating_log_lanes=zeros_lanes,
+                beta_lanes=zeros_lanes,
+                b_lanes=zeros_lanes,
+            )
+        with self.assertRaisesRegex(ValueError, "b_lanes, a_lanes"):
+            block_doubling.run_chunk_streamed(
+                load_raw_kq=_dummy_kq,
+                load_raw_v=_dummy_v,
+                cfg=cfg,
+                load_state_v=_dummy_load,
+                store_state_v=_dummy_store,
+            )
+
+
 if __name__ == "__main__":
     absltest.main()

@@ -14,6 +14,7 @@
 """Head-grouped BF16 and FP8 block-doubling chunked GDN prefill solver."""
 
 import dataclasses
+import enum
 import math
 from collections.abc import Callable
 from typing import override
@@ -22,6 +23,16 @@ import jax
 import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.gdn.v3 import config, fp8_matmul, triangular_solve
+
+
+class BlockDoublingPhase(enum.StrEnum):
+    """Execution phase reported to a `phase_hook` callback during a chunk."""
+
+    GROUP_START = "group_start"
+    STATE_FIRST_PAIR = "state_first_pair"
+    TAIL_HEAD = "tail_head"
+    GROUP_END = "group_end"
+
 
 _LoadKqScaledFn = Callable[
     [list[int], float, float],
@@ -37,6 +48,7 @@ _LoadVFn = Callable[[list[int]], dict[int, jax.Array]]
 _LoadStateVFn = Callable[[int], jax.Array]
 _StoreStateVFn = Callable[[int, jax.Array], None]
 _StoreOutSliceFn = Callable[[int, list[jax.Array]], None]
+_PhaseHookFn = Callable[[BlockDoublingPhase, int, int], None]
 
 _LOG2_E = 1.0 / math.log(2.0)
 
@@ -128,6 +140,7 @@ class BlockDoublingChunk:
         store_out_slice: _StoreOutSliceFn | None = None,
         out_step: int = 0,
         out_dtype: jnp.dtype | None = None,
+        phase_hook: _PhaseHookFn | None = None,
     ):
         """Initializes decay tables, solver geometry, and streaming callbacks.
 
@@ -144,6 +157,10 @@ class BlockDoublingChunk:
             out_step: Number of value heads per `store_out_slice` call (must be > 0
                 and divide `cfg.num_v_heads` when `store_out_slice` is provided).
             out_dtype: Output dtype cast before calling `store_out_slice`.
+            phase_hook: Optional `(phase, index, total)` callback invoked with
+                `BlockDoublingPhase` (`GROUP_START`, `STATE_FIRST_PAIR`,
+                `TAIL_HEAD`, `GROUP_END`) so fused kernels can interleave
+                independent matrix-unit work into vector-heavy GDN phases.
         """
         if store_out_slice is not None and (
             out_step <= 0 or cfg.num_v_heads % out_step != 0
@@ -162,6 +179,7 @@ class BlockDoublingChunk:
         self._store_out_slice = store_out_slice
         self._out_step = out_step
         self._out_dtype = out_dtype
+        self._phase_hook = phase_hook
         self._out_flushed = 0
         self.num_heads = cfg.num_v_heads
         self.chunk = cfg.chunk_size
@@ -431,7 +449,9 @@ class BlockDoublingChunk:
         cur_kq = -1
         gf_kq: jax.Array | None = None
         g_kq: jax.Array | None = None
-        for pair in pairs:
+        for p_idx, pair in enumerate(pairs):
+            if self._phase_hook is not None:
+                self._phase_hook(BlockDoublingPhase.STATE_FIRST_PAIR, p_idx, len(pairs))
             kq_state = kq_states.pop(pair)
             sc_pair = s_scales.pop(pair, None)
             v_map = self._get_v(list(pair), v_large)
@@ -524,7 +544,9 @@ class BlockDoublingChunk:
 
         # Fuse [state_new; out_new] = [256 K^T * beta_gb; 2048 Q K^T * beta *
         # decay] @ (8 u) into one dot per head so solved u is loaded once.
-        for v in heads:
+        for h_idx, v in enumerate(heads):
+            if self._phase_hook is not None:
+                self._phase_hook(BlockDoublingPhase.TAIL_HEAD, h_idx, len(heads))
             h = hs[v]
             assert h.out_updated_bf16 is not None
             u_limbs = solved.pop_u_limbs(v)
@@ -661,6 +683,7 @@ def run_chunk_per_seq(
     store_out_slice: _StoreOutSliceFn | None = None,
     out_step: int = 0,
     out_dtype: jnp.dtype | None = None,
+    phase_hook: _PhaseHookFn | None = None,
 ) -> tuple[jax.Array | None, jax.Array | None]:
     """Runs one block-doubling chunked GDN step sequentially per head group.
 
@@ -679,6 +702,9 @@ def run_chunk_per_seq(
         store_out_slice: Optional streamed output slice store callback.
         out_step: Value heads per `store_out_slice` call.
         out_dtype: Output dtype when streaming via `store_out_slice`.
+        phase_hook: Optional `(phase, index, total)` callback invoked with
+            `BlockDoublingPhase` (`GROUP_START`, `STATE_FIRST_PAIR`,
+            `TAIL_HEAD`, `GROUP_END`).
 
     Returns:
         `(out, state)` stacked across value heads; either element is `None` when
@@ -702,12 +728,18 @@ def run_chunk_per_seq(
         store_out_slice=store_out_slice,
         out_step=out_step,
         out_dtype=out_dtype,
+        phase_hook=phase_hook,
     )
     outs: dict[int, jax.Array] = {}
     states: dict[int, jax.Array] = {}
-    for grp in _head_groups(cfg):
+    groups = _head_groups(cfg)
+    for g_idx, grp in enumerate(groups):
+        if phase_hook is not None:
+            phase_hook(BlockDoublingPhase.GROUP_START, g_idx, len(groups))
         hs = ctx.front(q_large, k_large, v_large, grp, state_prev)
         ctx.tail(hs, state_prev, outs, states)
+        if phase_hook is not None:
+            phase_hook(BlockDoublingPhase.GROUP_END, g_idx, len(groups))
     out = (
         None
         if store_out_slice is not None
@@ -728,18 +760,24 @@ def run_chunk_streamed(
     cfg: config.GDNConfig,
     load_state_v: _LoadStateVFn,
     store_state_v: _StoreStateVFn,
-    real_sizes: jax.Array,
-    b_lanes: jax.Array,  # [1, chunk, lanes]
-    a_lanes: jax.Array,  # [1, chunk, lanes]
-    a_log: jax.Array,
-    dt_bias: jax.Array,
+    real_sizes: jax.Array | None = None,
+    b_lanes: jax.Array | None = None,  # [1, chunk, lanes]
+    a_lanes: jax.Array | None = None,  # [1, chunk, lanes]
+    a_log: jax.Array | None = None,
+    dt_bias: jax.Array | None = None,
+    gating_log_lanes: jax.Array | None = None,  # [1, chunk, lanes]
+    beta_lanes: jax.Array | None = None,  # [1, chunk, lanes]
+    kq_prescaled_256: bool = False,
     store_out_slice: _StoreOutSliceFn | None = None,
     out_step: int = 0,
     out_dtype: jnp.dtype | None = None,
+    phase_hook: _PhaseHookFn | None = None,
 ) -> tuple[jax.Array | None, jax.Array | None]:
     """Runs one block-doubling step, streaming Q, K, and V per head group.
 
-    L2-normalizes and scales Q and K on demand.
+    L2-normalizes and scales Q and K on demand unless `kq_prescaled_256=True`.
+    Either pass precomputed `(gating_log_lanes, beta_lanes)` or raw gate inputs
+    `(b_lanes, a_lanes, a_log, dt_bias)`.
 
     Args:
         load_raw_kq: Callback returning raw `(q_map, k_map)` for requested K/Q
@@ -749,14 +787,25 @@ def run_chunk_streamed(
         cfg: Active block-doubling GDN configuration.
         load_state_v: Per-head state loader `(v) -> [kq_dim, v_dim]`.
         store_state_v: Per-head state writer `(v, state) -> None`.
-        real_sizes: Valid token count `[1]` used to mask padded rows.
-        b_lanes: Beta pre-activations `[1, chunk, lanes]`.
-        a_lanes: Decay pre-activations `[1, chunk, lanes]`.
-        a_log: Per-head log-decay parameter `[lanes]`.
-        dt_bias: Per-head decay bias parameter `[lanes]`.
+        real_sizes: Optional valid token count `[1]` used to mask padded rows;
+            when `None`, all rows in the chunk are treated as valid.
+        b_lanes: Raw beta pre-activations `[1, chunk, lanes]` when not
+            precomputed.
+        a_lanes: Raw decay pre-activations `[1, chunk, lanes]` when not
+            precomputed.
+        a_log: Per-head log-decay parameter `[lanes]` when not precomputed.
+        dt_bias: Per-head decay bias parameter `[lanes]` when not precomputed.
+        gating_log_lanes: Optional precomputed log-decay gates
+            `[1, chunk, lanes]`.
+        beta_lanes: Optional precomputed sigmoid beta gates `[1, chunk, lanes]`.
+        kq_prescaled_256: Whether `load_raw_kq` already returns L2-normalized
+            Q/K scaled by 256 (with Q also scaled by `1 / sqrt(d_k)`).
         store_out_slice: Optional streamed output writer `(v0, heads) -> None`.
         out_step: Value heads per `store_out_slice` call.
         out_dtype: Output dtype when streaming via `store_out_slice`.
+        phase_hook: Optional `(phase, index, total)` callback invoked with
+            `BlockDoublingPhase` (`GROUP_START`, `STATE_FIRST_PAIR`,
+            `TAIL_HEAD`, `GROUP_END`).
 
     Returns:
         `(out, None)` (recurrent state always streams through `store_state_v`),
@@ -767,12 +816,32 @@ def run_chunk_streamed(
             "Expected active block-doubling mode; got"
             f" mode={cfg.gdn_prefill_mode.value!r}, chunk_size={cfg.chunk_size}."
         )
+    has_precomputed = (gating_log_lanes is not None, beta_lanes is not None)
+    raw_gate_args = (b_lanes, a_lanes, a_log, dt_bias)
+    if any(has_precomputed) and not all(has_precomputed):
+        raise ValueError(
+            "gating_log_lanes and beta_lanes must both be set or both be None."
+        )
+    if all(has_precomputed) and any(arg is not None for arg in raw_gate_args):
+        raise ValueError(
+            "Precomputed (gating_log_lanes, beta_lanes) cannot be combined with"
+            " raw gate inputs (b_lanes, a_lanes, a_log, dt_bias)."
+        )
+    if not all(has_precomputed) and any(arg is None for arg in raw_gate_args):
+        raise ValueError(
+            "b_lanes, a_lanes, a_log, and dt_bias are required unless"
+            " gating_log_lanes and beta_lanes are provided."
+        )
+
     compute = cfg.dtypes.compute
     q_scale = cfg.kq_head_dim**-0.5
-    mask_dtype = jnp.int32 if jnp.dtype(compute).itemsize == 4 else jnp.int16
-    iota = jax.lax.broadcasted_iota(mask_dtype, (cfg.chunk_size, 1), 0)
-    mask_2d = iota < real_sizes[0].astype(mask_dtype)
-    mask_3d = mask_2d[jnp.newaxis, :, :]
+    mask_2d: jax.Array | None = None
+    mask_3d: jax.Array | None = None
+    if real_sizes is not None:
+        mask_dtype = jnp.int32 if jnp.dtype(compute).itemsize == 4 else jnp.int16
+        iota = jax.lax.broadcasted_iota(mask_dtype, (cfg.chunk_size, 1), 0)
+        mask_2d = iota < real_sizes[0].astype(mask_dtype)
+        mask_3d = mask_2d[jnp.newaxis, :, :]
 
     def load_kq_scaled(
         kqs: list[int], scale: float, s_q: float
@@ -790,14 +859,24 @@ def run_chunk_streamed(
         # Derive s_q-scaled Q from scale-scaled Q so L2 normalization runs once.
         ratio_q = jnp.float32(s_q / scale)
         for kq in kqs:
-            qh = jnp.where(mask_2d, qs_raw[kq].astype(compute), 0)
-            kh = jnp.where(mask_2d, ks_raw[kq].astype(compute), 0)
-            qf = qh.astype(jnp.float32)
-            kf = kh.astype(jnp.float32)
-            inv_q = jax.lax.rsqrt(jnp.sum(qf * qf, axis=-1, keepdims=True) + 1e-6)
-            inv_k = jax.lax.rsqrt(jnp.sum(kf * kf, axis=-1, keepdims=True) + 1e-6)
-            q_s = (qf * (inv_q * jnp.float32(q_scale * scale))).astype(compute)
-            k_s = (kf * (inv_k * jnp.float32(scale))).astype(compute)
+            qh = qs_raw[kq]
+            kh = ks_raw[kq]
+            if mask_2d is not None:
+                qh = jnp.where(mask_2d, qh.astype(compute), 0)
+                kh = jnp.where(mask_2d, kh.astype(compute), 0)
+            if kq_prescaled_256:
+                assert scale == _SCALE, (
+                    f"kq_prescaled_256 expects scale={_SCALE}; got {scale}."
+                )
+                q_s = qh.astype(compute)
+                k_s = kh.astype(compute)
+            else:
+                qf = qh.astype(jnp.float32)
+                kf = kh.astype(jnp.float32)
+                inv_q = jax.lax.rsqrt(jnp.sum(qf * qf, axis=-1, keepdims=True) + 1e-6)
+                inv_k = jax.lax.rsqrt(jnp.sum(kf * kf, axis=-1, keepdims=True) + 1e-6)
+                q_s = (qf * (inv_q * jnp.float32(q_scale * scale))).astype(compute)
+                k_s = (kf * (inv_k * jnp.float32(scale))).astype(compute)
             q_s_map[kq] = q_s
             q_oqk_map[kq] = q_s * ratio_q
             k_s_map[kq] = k_s
@@ -806,16 +885,25 @@ def run_chunk_streamed(
 
     def load_v(vs: list[int]) -> dict[int, jax.Array]:
         vs_raw = load_raw_v(vs)
-        return {v: jnp.where(mask_2d, vs_raw[v].astype(compute), 0) for v in vs}
+        if mask_2d is not None:
+            return {v: jnp.where(mask_2d, vs_raw[v].astype(compute), 0) for v in vs}
+        return {v: vs_raw[v].astype(compute) for v in vs}
 
-    b_c = b_lanes.astype(compute)
-    a_c = a_lanes.astype(compute)
-    al_c = a_log.reshape(1, 1, -1).astype(compute)
-    dt_c = dt_bias.reshape(1, 1, -1).astype(compute)
-    beta = jax.nn.sigmoid(b_c)
-    gating_log = -jnp.exp(al_c) * jax.nn.softplus(a_c + dt_c)
-    beta = jnp.where(mask_3d, beta, 0)
-    gating_log = jnp.where(mask_3d, gating_log, 0)
+    if gating_log_lanes is not None and beta_lanes is not None:
+        gating_log = gating_log_lanes.astype(compute)
+        beta = beta_lanes.astype(compute)
+    else:
+        assert b_lanes is not None and a_lanes is not None
+        assert a_log is not None and dt_bias is not None
+        b_c = b_lanes.astype(compute)
+        a_c = a_lanes.astype(compute)
+        al_c = a_log.reshape(1, 1, -1).astype(compute)
+        dt_c = dt_bias.reshape(1, 1, -1).astype(compute)
+        beta = jax.nn.sigmoid(b_c)
+        gating_log = -jnp.exp(al_c) * jax.nn.softplus(a_c + dt_c)
+    if mask_3d is not None:
+        beta = jnp.where(mask_3d, beta, 0)
+        gating_log = jnp.where(mask_3d, gating_log, 0)
 
     return run_chunk_per_seq(
         None,
@@ -832,4 +920,5 @@ def run_chunk_streamed(
         store_out_slice=store_out_slice,
         out_step=out_step,
         out_dtype=out_dtype,
+        phase_hook=phase_hook,
     )
