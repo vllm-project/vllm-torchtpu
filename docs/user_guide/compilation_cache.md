@@ -18,6 +18,7 @@ export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="/path/to/persistent_cache"
    - **Purpose**: Controls the root directory for vLLM Python-level framework tracing artifacts.
    - **Scope**: Stores PyTorch Dynamo FX graph bytecode, Guard expressions, AOTAutograd tracing artifacts (`torch_compile_cache/torch_aot_compile`), and `TpuCompilerAdaptor` metadata pickle handles (`artifact_compile_range_*`).
    - **Note**: `VLLM_CACHE_ROOT` manages Python framework artifacts and is completely independent of the C++ PJRT compiled binary executables managed by `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT`.
+   - **Traced sources**: the cache key hashes every source file Dynamo stepped into while tracing, including functions whose inlining raised into a caller that handled it. The AOT artifact records the same files, so a start that loads it lands in the cache directory of the start that traced it, and the artifact is recompiled when any of those files changes.
    - **Device assignment**: the cache key includes the TPU global device id of every rank (logged at startup as `TPU device ids by rank`), because the compiled executables address their peers by device id. A cache restored onto a slice that binds the ranks to the devices in another order misses and recompiles; an artifact for another binding found in a shared or pinned cache directory raises instead of being replayed.
 
 ## Compilation Debugging & Telemetry
