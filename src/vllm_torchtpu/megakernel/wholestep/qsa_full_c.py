@@ -81,6 +81,28 @@ IR_NEW = "qsa_ir_new"
 FP8_MAX = 448.0
 
 
+
+_LANEPACK_LOGGED = False
+
+
+def _log_lanepack_active(gpp: int) -> None:
+    """VLLM_TPU_MK_QSA_UNION_LANEPACK self-check: one line, once per process on TP rank 0,
+    when a kernel is traced with the packed union (trace time; no runtime cost)."""
+    global _LANEPACK_LOGGED
+    if _LANEPACK_LOGGED:
+        return
+    _LANEPACK_LOGGED = True
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        if get_tensor_model_parallel_rank() != 0:
+            return
+    except Exception:  # no TP group (CPU tests, tools): log
+        pass
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info("LANEPACK active gpp=%d", gpp)
+
 def _scoped(name: str, level: int = 2):
     """Run the method under `ctx.stream.sc(name, level)` (VLLM_TPU_MK_SCOPES)."""
 
@@ -573,6 +595,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         rows_own = gpp == 128  # served 512-token blocks: rank r owns whole rows 2p + r
         if (self.union_lanepack and D == 2 and not self.compressed_dcp and isinstance(r, int)
                 and (rows_own or 128 % (2 * gpp) == 0) and H % 8 == 0):
+            _log_lanepack_active(gpp)
             # Pack: rank r's owned groups of code rows 2p and 2p + 1 form packed row p in
             # ascending id order. gpp = 128: rank r owns all of row 2p + r (a strided row read);
             # gpp | 64: it owns lanes l with (l // gpp) % 2 == r of every row (row 2p's at

@@ -151,3 +151,17 @@ def test_driver_parses_draft_key_slots(monkeypatch):
     assert qd.KEY_SLOTS == 4
     _apply_draft_key_slots("whole=1,wholekeyslots=auto,draftkeyslots=auto")
     assert qd.KEY_SLOTS == wc.KEY_SLOTS_AUTO
+
+
+def test_union_lanepack_logged():
+    class Block:
+        key_slots, union_lanepack = 8, True
+
+    class Spec:
+        layer_type = type("LT", (), {"slots": ()})()
+
+        def all_blocks(self):
+            return [Block()]
+
+    line = wc.mk_options_line(16, Spec(), Tiles(hier=2))
+    assert "union_lanepack=1" in line
