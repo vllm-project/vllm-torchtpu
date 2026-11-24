@@ -25,6 +25,8 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+from vllm_torchtpu.layers.adapter import moe_permute
+
 # The checkpoint config may omit swiglu_beta; SwiGLU-OAI's up-bias is 1.
 _DEFAULT_SWIGLU_BETA = 1.0
 
@@ -128,6 +130,12 @@ class MiniMaxM3MoE(nn.Module):
             shared_experts=self.shared_experts,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
+        )
+        # VLLM_TPU_MOE_EXPERT_PERMUTATION: the router emits physical expert ids.
+        moe_permute.permute_router(
+            self.experts,
+            gate_weight=self.gate.weight,
+            e_score_correction_bias=self.e_score_correction_bias,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

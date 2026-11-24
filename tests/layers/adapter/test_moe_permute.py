@@ -306,3 +306,63 @@ def test_launcher_filter_is_widened(monkeypatch):
     with mp.loading(model):
         mp.widen_external_filter()
     assert builtins._EXOS_MODEL_LOAD_FILTER[3] == linear
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_permuted_router_emits_physical_ids(monkeypatch, seed):
+    torch.manual_seed(seed)
+    num_logical, ep, topk, hidden, inter, tokens = 32, 4, 4, 16, 8, 10
+    local = num_logical // ep
+    perm = _perm(num_logical, seed)
+    x = torch.randn(tokens, hidden, dtype=torch.float64)
+    gw = torch.randn(num_logical, hidden, dtype=torch.float64)
+    gb = torch.randn(num_logical, dtype=torch.float64)
+    w1 = torch.randn(num_logical, hidden, 2 * inter, dtype=torch.float64) * 0.2
+    w2 = torch.randn(num_logical, inter, hidden, dtype=torch.float64) * 0.2
+
+    def route(weight, bias):
+        scores = torch.sigmoid(x @ weight.T)
+        _, ids = torch.topk(scores + bias, topk, dim=-1)
+        w = scores.gather(1, ids)
+        return ids, w / w.sum(-1, keepdim=True)
+
+    ids, w = route(gw, gb)
+    starts = [r * local for r in range(ep)]
+    base = _ep_moe(x, ids, w, [w1[s:s + local] for s in starts],
+                   [w2[s:s + local] for s in starts], starts)
+
+    _setup(monkeypatch, {"moe0": perm})
+    w1_local, w2_local, routers = [], [], []
+    for rank in range(ep):
+        mp._ORDINAL[0] = 0
+        layer = _FakeExperts(num_logical, ep, rank, "model.layers.3.mlp.experts")
+        assert mp.prepare(layer)
+        gate = torch.nn.Parameter(torch.full_like(gw, float("nan")), requires_grad=False)
+        bias = torch.nn.Parameter(torch.full_like(gb, float("nan")), requires_grad=False)
+        assert mp.permute_router(layer, gate_weight=gate, e_score_correction_bias=bias)
+        with pytest.raises(RuntimeError, match="router parameters"):
+            mp.install(layer)  # nothing loaded through the permuting loader yet
+        gate.weight_loader(gate, gw)
+        bias.weight_loader(bias, gb)
+        layer.w13_weight = torch.nn.Parameter(
+            torch.full((local, hidden, 2 * inter), float("nan"), dtype=torch.float64),
+            requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(
+            torch.full((local, inter, hidden), float("nan"), dtype=torch.float64),
+            requires_grad=False)
+        for gid in range(num_logical):
+            layer.weight_loader(layer.w13_weight, w1[gid], "w13", "w1", gid)
+            layer.weight_loader(layer.w2_weight, w2[gid], "w2", "w2", gid)
+        mp.install(layer)
+        w1_local.append(layer.w13_weight.data)
+        w2_local.append(layer.w2_weight.data)
+        routers.append((gate.data, bias.data))
+        # Physical row p holds logical expert inv[p].
+        assert torch.equal(gate.data[torch.tensor(perm)], gw)
+        assert torch.equal(bias.data[torch.tensor(perm)], gb)
+    phys, wp = route(*routers[0])
+    assert torch.equal(phys, torch.tensor(perm)[ids])
+    assert torch.equal(mp.to_physical(layer, phys), phys)  # no second mapping
+    torch.testing.assert_close(wp, w, rtol=0, atol=0)
+    got = _ep_moe(x, phys, wp, w1_local, w2_local, starts)
+    torch.testing.assert_close(got, base, rtol=1e-12, atol=1e-12)

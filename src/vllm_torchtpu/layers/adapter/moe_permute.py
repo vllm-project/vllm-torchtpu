@@ -37,6 +37,15 @@ the same weights are evaluated for every token; only the rank computing each
 (token, expert) pair changes, so the result differs from linear placement only
 by the summation grouping across ranks before the EP all-reduce.
 
+Routing in physical ids: a model whose router is a per-expert linear plus an
+optional per-expert score bias (``permute_router``) loads the router rows in
+physical slot order, so the router itself emits physical ids and no gather
+runs per step. This also keeps the per-layer table out of the traced graph:
+small per-layer tensors registered after load can collapse to one layer's
+value when layers share compiled code, which a per-layer gather would then
+silently use for every layer. Layers without a permuted router fall back to
+the ``_perm_table`` gather.
+
 Loading: the EP weight filters (``--enable-ep-weight-filter``) skip experts that
 are not local under the linear placement, so they are made permutation-aware
 rather than turned off: the expert-id filter is widened to the union of this
@@ -346,11 +355,75 @@ def prepare(layer: Any) -> bool:
     return True
 
 
+def _permuted_experts(module: Any) -> Any:
+    if getattr(module, "_perm_logical_to_physical", None) is not None:
+        return module
+    for m in module.modules():
+        if getattr(m, "_perm_logical_to_physical", None) is not None:
+            return m
+    return None
+
+
+def permute_router(experts: Any, **params: Any) -> bool:
+    """Load the router's per-expert rows (dim 0) in physical slot order.
+
+    ``params`` names the router parameters whose dim 0 is the logical expert
+    (the gate weight ``[E, H]``, the score bias ``[E]``). Their weight loaders
+    are wrapped so physical row ``p`` holds logical expert ``inv[p]``; the
+    router then emits physical ids directly, the same ids the expert weights
+    were loaded under. Call after the experts were created (``prepare`` ran).
+    Returns True when the layer's router is permuted.
+    """
+    layer = _permuted_experts(experts) if ENABLED else None
+    if layer is None:
+        return False
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    perm = layer._perm_logical_to_physical
+    n = len(perm)
+    inv = [0] * n
+    for e, p in enumerate(perm):
+        inv[p] = e
+    inv_t = torch.tensor(inv, dtype=torch.long)
+    loads: dict[str, int] = layer.__dict__.setdefault("_perm_router_loads", {})
+    for name, param in params.items():
+        if param is None or tuple(param.shape)[:1] != (n,):
+            raise ValueError(
+                f"[moe-permute] router parameter {name} has shape "
+                f"{tuple(getattr(param, 'shape', ()))}, expected [{n}, ...]"
+            )
+        original = getattr(param, "weight_loader", default_weight_loader)
+        loads[name] = 0
+
+        def loader(p, loaded, *args, _orig=original, _name=name, **kwargs):
+            if loaded.shape[0] != n:
+                raise ValueError(
+                    f"[moe-permute] router {_name}: checkpoint rows "
+                    f"{loaded.shape[0]} != {n} experts"
+                )
+            _orig(p, loaded.index_select(0, inv_t.to(loaded.device)), *args, **kwargs)
+            loads[_name] += 1
+
+        param.weight_loader = loader
+    layer._perm_router = True
+    return True
+
+
 def install(layer: Any) -> None:
     """Register the logical->physical routing table (after weights load)."""
     perm = getattr(layer, "_perm_logical_to_physical", None)
     if perm is None:
         return
+    if getattr(layer, "_perm_router", False):
+        loads = layer.__dict__.get("_perm_router_loads", {})
+        missing = [k for k, v in loads.items() if v < 1]
+        if not loads or missing:
+            raise RuntimeError(
+                f"[moe-permute] {getattr(layer, 'layer_name', '?')}: router "
+                f"parameters {missing or 'none'} were not loaded through the "
+                "permuting loader; the router would emit logical ids."
+            )
+        _STATS["router"] = _STATS.get("router", 0) + 1
     tracked = write_tracking()
     if tracked:
         _STATS["checked_experts"] += check_complete(layer)
@@ -366,6 +439,11 @@ def install(layer: Any) -> None:
     )
     _STATS["layers"] += 1
     if _STATS["layers"] == 1:
+        logger.info(
+            "[moe-permute] routing in physical ids: router rows permuted at load "
+            "(per-step gather off) for %s",
+            "this layer" if getattr(layer, "_perm_router", False) else "no layer",
+        )
         _, ep, rank = _layer_ep(layer)
         logger.info(
             "[moe-permute] VLLM_TPU_MOE_EXPERT_PERMUTATION=%s on: E=%d ep=%d rank=%d "
@@ -376,9 +454,10 @@ def install(layer: Any) -> None:
         _, ep, rank = _layer_ep(layer)
         logger.info(
             "[moe-permute] load check rank %d/%d: %d/%d permuted layers, "
-            "%d permuted-local experts written, 0 incomplete (checked=%s)",
+            "%d permuted-local experts written, 0 incomplete (checked=%s), "
+            "%d routers permuted",
             rank, ep, _STATS["layers"], _STATS["prepared"],
-            _STATS["checked_experts"], tracked,
+            _STATS["checked_experts"], tracked, _STATS.get("router", 0),
         )
 
 
@@ -388,6 +467,8 @@ def summary() -> dict[str, int]:
 
 def to_physical(layer: Any, topk_ids: torch.Tensor) -> torch.Tensor:
     """Map logical routed ids ``[T, K]`` to physical ids (traced code)."""
+    if getattr(layer, "_perm_router", False):
+        return topk_ids  # the router already emits physical ids
     table = getattr(layer, "_perm_table", None)
     if table is None:
         return topk_ids
