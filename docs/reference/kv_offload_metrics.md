@@ -20,3 +20,13 @@ A hit can come from more than one tier:
 
 - **Blocks in different tiers.** Each tier counts the tokens of its own blocks. For example, the first 1024 tokens of a 2048-token hit are in host DRAM and the other 1024 are in storage: `host` and `disk` each grow by 1024.
 - **Two kinds of cached data for the same tokens.** A hybrid model caches attention KV and linear-attention state, and a hit needs both. Such tokens are counted once, under the slowest tier that holds a part of them: `disk` is slower than `p2p`, and `p2p` is slower than `host`. For example, the attention KV of a 2048-token hit is in host DRAM and its linear-attention state is in storage: `disk` grows by 2048, and `host` does not grow.
+
+## `tpu_raiden_*` Metrics
+
+When `TPU_RAIDEN_TELEMETRY_BACKENDS` is unset (the default) or includes `buffered`, C++ `BufferedMetricsExporter` samples from both the `EngineCore` scheduler (`KVCacheStore` recall, save, eviction, host-pool block, and storage lookup metrics) and TPU worker processes (`KVCacheManager` H2D/D2H DMA, host memory, and storage I/O metrics) are drained onto vLLM's `/metrics` endpoint alongside `vllm:kv_offload_*`. When `TPURaidenOffloadingConnector` runs alone, it drains both processes; under `TPUMultiConnector`, `TPURaidenConnector` drains the worker processes and `TPURaidenOffloadingConnector` drains the scheduler.
+
+- **Lazy initialization.** Buffered gauges (`tpu_raiden_host_pool_blocks`, `tpu_raiden_storage_filesystem_bytes`, `tpu_raiden_host_memory_breakdown_bytes`, `tpu_raiden_buffer_allocated_bytes`) flush onto `/metrics` once the engine runs its first step.
+- **One drain per process.** The C++ sample buffer is process-wide and each read empties it. Under `TPUMultiConnector`, `TPURaidenConnector` reads the worker-process buffer (reporting `KVCacheManager` samples via `TpuKVConnectorStats`) and `TPURaidenOffloadingConnector` reads the scheduler-process buffer, so each sample reaches `/metrics` once.
+- **Standalone Prometheus SHM mode.** Setting `TPU_RAIDEN_TELEMETRY_BACKENDS=prometheus` disables buffered `/metrics` collector registration so metrics are served only from Raiden's standalone shared-memory exporter without duplicate scraping. Setting `TPU_RAIDEN_TELEMETRY_BACKENDS=""` disables Raiden telemetry completely.
+- **Cloud Logging.** `cloud_logging` and `buffered` share one C++ buffer, and a Cloud Logging flush empties it. When `cloud_logging` is set, vLLM does not read the buffer, so `tpu_raiden_*` metrics go to Cloud Logging and not to `/metrics`.
+- **Unknown backends.** A list with an unknown name (for example `buffered,foo`) configures no Raiden backend, matching `tpu_sync`.

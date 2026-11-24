@@ -13,12 +13,18 @@
 # limitations under the License.
 """TPU Multi Connector wrapper for combining disagg and offloading."""
 
+from typing import Protocol, cast
+
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+class _RaidenTelemetryDrainOwner(Protocol):
+    owns_raiden_telemetry_drain: bool
 
 
 class TPUMultiConnector(MultiConnector):
@@ -35,6 +41,7 @@ class TPUMultiConnector(MultiConnector):
 
     def __init__(self, vllm_config, role, kv_cache_config):
         super().__init__(vllm_config, role, kv_cache_config)
+        self._assign_raiden_telemetry_drain_owner()
         # Only a consumer starts from a decode-local hit; on a producer the
         # transfer child always reports False, whatever the other children say.
         if (
@@ -59,6 +66,40 @@ class TPUMultiConnector(MultiConnector):
                 [name for name, ok in capable.items() if not ok],
                 capable,
             )
+
+    def _assign_raiden_telemetry_drain_owner(self) -> None:
+        """Leave exactly one child draining the Raiden C++ sample buffer.
+
+        The buffer is process-wide and every drain resets it, so with two
+        draining children the first one called takes every sample and the
+        other always gets nothing.
+
+        On workers (where both `TPUConnector`/`TPURaidenConnector` and
+        `TPURaidenOffloadingConnector` can drain), keep ownership on
+        `TPUConnector` so non-zero TP ranks still return a `TpuKVConnectorStats`
+        sink for `TPUModelRunner` stage timings. On the scheduler,
+        `TPUConnector.owns_raiden_telemetry_drain` is already `False`, so
+        `TPURaidenOffloadingConnector` keeps the scheduler drain automatically.
+        """
+        owners: list[_RaidenTelemetryDrainOwner] = [
+            cast(_RaidenTelemetryDrainOwner, c)
+            for c in self._connectors
+            if getattr(c, "owns_raiden_telemetry_drain", False)
+        ]
+        if len(owners) <= 1:
+            return
+        # Deferred to avoid circular imports between connector modules.
+        from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+            TPUConnector,
+        )
+
+        keep = next(
+            (c for c in owners if isinstance(c, TPUConnector)),
+            owners[0],
+        )
+        for c in owners:
+            if c is not keep:
+                c.owns_raiden_telemetry_drain = False
 
     def register_runner(self, runner) -> None:
         # torchtpu extension unknown to upstream MultiConnector: forward it to

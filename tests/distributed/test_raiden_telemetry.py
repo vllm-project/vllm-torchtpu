@@ -366,12 +366,54 @@ class TestTpuKVConnectorPromMetricsDynamicMetrics:
             }
         )
 
+    def test_configure_exception_does_not_raise_unbound_local(self):
+        registry = CollectorRegistry()
+        metric_types = {
+            Gauge: partial(Gauge, registry=registry),
+            Counter: partial(Counter, registry=registry),
+            Histogram: partial(Histogram, registry=registry),
+        }
+        with patch(
+            "vllm_torchtpu.distributed.utils.configure_raiden_telemetry",
+            side_effect=RuntimeError("configure boom"),
+        ):
+            metrics = TpuKVConnectorPromMetrics(
+                vllm_config=MagicMock(),
+                metric_types=metric_types,
+                labelnames=["model_name", "engine"],
+                per_engine_labelvalues={0: ["my_model", "0"]},
+            )
+        assert metrics.dynamic_metrics == {}
+
+    def test_prometheus_only_mode_skips_dynamic_collector_registration(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("TPU_RAIDEN_TELEMETRY_BACKENDS", "prometheus")
+        registry = CollectorRegistry()
+        metric_types = {
+            Gauge: partial(Gauge, registry=registry),
+            Counter: partial(Counter, registry=registry),
+            Histogram: partial(Histogram, registry=registry),
+        }
+        with patch(
+            "vllm_torchtpu.distributed.utils.configure_raiden_telemetry"
+        ) as mock_conf:
+            metrics = TpuKVConnectorPromMetrics(
+                vllm_config=MagicMock(),
+                metric_types=metric_types,
+                labelnames=["model_name", "engine"],
+                per_engine_labelvalues={0: ["my_model", "0"]},
+            )
+            mock_conf.assert_not_called()
+        assert metrics.dynamic_metrics == {}
+
 
 class TestTPURaidenConnectorWorkerTelemetry:
     """Tests for TPURaidenConnectorWorker telemetry collection and stats reporting."""
 
     def _create_mock_worker(self, is_producer=True, tp_rank=0):
         worker = MagicMock(spec=TPURaidenConnectorWorker)
+        worker.owns_raiden_telemetry_drain = True
         worker._get_raiden_stats = TPURaidenConnectorWorker._get_raiden_stats.__get__(
             worker
         )

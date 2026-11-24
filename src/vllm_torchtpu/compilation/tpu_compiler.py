@@ -221,10 +221,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     # compiled forwards, which take the same inputs at any depth.
     "TPU_PP_HANDOFF_DEPTH",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
-    # checks, the raiden offload storage tier, offload retry and drain
-    # limits, a weight-load sync cadence, a debug log switch, and the
-    # local-rank offsets, which move a worker to a different chip without
-    # changing the executable it runs.
+    # checks, the raiden offload storage tier, the raiden telemetry backends,
+    # offload retry and drain limits, a weight-load sync cadence, a debug log
+    # switch, and the local-rank offsets, which move a worker to a different
+    # chip without changing the executable it runs.
     "DEBUG_TPU_LOCAL_RANK_OFFSET",
     "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK",
     "RAIDEN_DISABLE_SINGLETON_WORKER",
@@ -233,6 +233,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "RAIDEN_STORAGE_PATH",
     "RAIDEN_STORAGE_PROPERTIES",
     "RAIDEN_STORAGE_TYPE",
+    "TPU_RAIDEN_TELEMETRY_BACKENDS",
     # Compiles the same spec-decode artifacts, just eagerly at startup.
     "SPEC_WARMUP",
     "TORCH_TPU_BASE_PORT",

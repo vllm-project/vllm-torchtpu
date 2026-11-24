@@ -347,6 +347,66 @@ def configure_raiden_telemetry(backends: list[str] | set[str] | None = None) -> 
         logger.warning("Failed to configure TPU Raiden C++ telemetry: %s", e)
 
 
+# Backend names accepted by tpu_sync's
+# `RaidenMetricStore::InitializeFromBackendNames`. It rejects the whole list
+# (configuring no backends) if any token is unknown.
+_RAIDEN_TELEMETRY_BACKEND_NAMES = frozenset({"buffered", "cloud_logging", "prometheus"})
+
+
+def is_raiden_buffered_telemetry_enabled() -> bool:
+    """Whether vLLM should drain the Raiden C++ buffered exporter.
+
+    Mirrors how tpu_sync parses `TPU_RAIDEN_TELEMETRY_BACKENDS`:
+
+    - Unset (`None`) defaults to `"buffered"`.
+    - An empty or whitespace-only string disables all backends.
+    - A list with any unknown token configures no backends at all.
+
+    `"cloud_logging"` shares the single C++ `BufferedMetricsExporter` with
+    `"buffered"`, and `FlushToCloudLogging` drains the same buffer. vLLM
+    therefore drains only when `"buffered"` is set without `"cloud_logging"`;
+    otherwise the per-step drain would take the samples meant for Cloud
+    Logging.
+    """
+    raw = envs.TPU_RAIDEN_TELEMETRY_BACKENDS
+    if raw is None:
+        return True
+    tokens = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    unknown = tuple(sorted(tokens - _RAIDEN_TELEMETRY_BACKEND_NAMES))
+    if unknown:
+        # Tuple arguments so `warning_once` can hash them; per-step drains call
+        # this check repeatedly.
+        logger.warning_once(
+            "Unknown TPU_RAIDEN_TELEMETRY_BACKENDS token(s) %s in %r; "
+            "tpu_sync rejects the whole list, so Raiden telemetry is disabled. "
+            "Valid backends: %s",
+            unknown,
+            raw,
+            tuple(sorted(_RAIDEN_TELEMETRY_BACKEND_NAMES)),
+        )
+        return False
+    return "buffered" in tokens and "cloud_logging" not in tokens
+
+
+def drain_raiden_metric_samples() -> dict[str, list[float]]:
+    """Drains buffered C++ Raiden telemetry samples for the current process."""
+    if not is_raiden_buffered_telemetry_enabled():
+        return {}
+    try:
+        telemetry = get_raiden_telemetry_module()
+        if telemetry is not None and hasattr(telemetry, "get_and_reset_metric_samples"):
+            raiden_samples = telemetry.get_and_reset_metric_samples()
+            if raiden_samples:
+                return {
+                    str(name): list(values)
+                    for name, values in raiden_samples.items()
+                    if values
+                }
+    except Exception as e:
+        logger.warning("Failed to collect TPU Raiden C++ telemetry: %s", e)
+    return {}
+
+
 @dataclasses.dataclass(frozen=True)
 class _GroupMetadata:
     kind: str | None = None

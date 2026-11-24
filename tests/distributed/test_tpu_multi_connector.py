@@ -30,7 +30,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 
 from vllm_torchtpu.distributed.kv_transfer import tpu_multi_connector
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector import TPUConnector
 from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import TPUMultiConnector
+from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
 
 
 class _FakeRaidenChild:
@@ -67,6 +69,26 @@ class _CapableChild(_FakeOffloadChild):
 
 class _IncapableChild(_FakeOffloadChild):
     supports_divergent_local_hybrid_hits = False
+
+
+class _DrainingRaidenChild(TPUConnector):
+    """Real TPUConnector subclass without TPU/Raiden setup."""
+
+    owns_raiden_telemetry_drain = True
+
+    def __init__(self, vllm_config, role, kv_cache_config):
+        self.vllm_config = vllm_config
+        self._role = role
+        self.kv_cache_config = kv_cache_config
+
+
+class _DrainingOffloadChild(TPURaidenOffloadingConnector):
+    """Real TPURaidenOffloadingConnector subclass without TPU/store setup."""
+
+    def __init__(self, vllm_config, role, kv_cache_config):
+        self.vllm_config = vllm_config
+        self._role = role
+        self.kv_cache_config = kv_cache_config
 
 
 def _make_vllm_config(
@@ -229,3 +251,28 @@ class TestTPUMultiConnectorDivergentHitWarning:
         )
 
         assert not log.warning.called
+
+
+class TestTPUMultiConnectorTelemetryDrainOwnership:
+    @pytest.mark.parametrize(
+        "children",
+        [
+            ("_DrainingRaidenChild", "_DrainingOffloadChild"),
+            ("_DrainingOffloadChild", "_DrainingRaidenChild"),
+        ],
+    )
+    def test_init_assigns_worker_drain_owner_to_raiden_child(self, children):
+        connector = TPUMultiConnector(
+            _make_vllm_config(children=children),
+            KVConnectorRole.WORKER,
+            MagicMock(),
+        )
+
+        offload = next(
+            c for c in connector._connectors if isinstance(c, _DrainingOffloadChild)
+        )
+        raiden = next(
+            c for c in connector._connectors if isinstance(c, _DrainingRaidenChild)
+        )
+        assert raiden.owns_raiden_telemetry_drain is True
+        assert offload.owns_raiden_telemetry_drain is False

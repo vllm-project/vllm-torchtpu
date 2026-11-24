@@ -49,9 +49,9 @@ Core mechanisms:
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
@@ -61,12 +61,22 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorTransferResults,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
     config as offloading_config_module,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+    OffloadPromMetrics,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
@@ -90,6 +100,10 @@ from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.distributed import utils as dist_utils
+from vllm_torchtpu.distributed.kv_transfer.raiden.telemetry_utils import (
+    RaidenDynamicPromMetrics,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.metrics import (
     compute_load_tokens_by_source,
@@ -107,6 +121,93 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+_RAIDEN_SAMPLES_KEY = "raiden_samples"
+
+
+@dataclass
+class RaidenOffloadingConnectorStats(OffloadingConnectorStats):
+    """OffloadingConnectorStats extended with buffered C++ Raiden metric samples.
+
+    Carries upstream `OffloadingConnectorStats` sections (`types`, `data`, `info`)
+    unchanged alongside `"raiden_samples": dict[str, list[float]]` drained from
+    both worker (`KVCacheManager`) and scheduler (`KVCacheStore`) processes.
+    Fresh instances enter `reset()` via upstream `__post_init__`, while
+    `record_raiden_samples`, `is_empty`, and `aggregate` also accept pre-built
+    upstream `data` dicts that omit `"raiden_samples"`.
+    """
+
+    def reset(self) -> None:
+        super().reset()
+        self.data[_RAIDEN_SAMPLES_KEY] = {}
+
+    def record_raiden_samples(
+        self, samples: Mapping[str, Sequence[float | int]]
+    ) -> None:
+        raiden_data: dict[str, list[float]] = self.data.setdefault(
+            _RAIDEN_SAMPLES_KEY, {}
+        )
+        for metric_name, values in samples.items():
+            if not values:
+                continue
+            raiden_data.setdefault(str(metric_name), []).extend(
+                float(v) for v in values
+            )
+
+    @classmethod
+    def from_base_stats(
+        cls,
+        base: OffloadingConnectorStats | None,
+        raiden_samples: Mapping[str, Sequence[float | int]] | None = None,
+    ) -> RaidenOffloadingConnectorStats | None:
+        stats = cls()
+        if base is not None and not base.is_empty():
+            stats.aggregate(base)
+        if raiden_samples:
+            stats.record_raiden_samples(raiden_samples)
+        return None if stats.is_empty() else stats
+
+    def is_empty(self) -> bool:
+        return super().is_empty() and not any(
+            self.data.get(_RAIDEN_SAMPLES_KEY, {}).values()
+        )
+
+    def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
+        if other.is_empty():
+            return self
+        super().aggregate(other)
+        other_samples = other.data.get(_RAIDEN_SAMPLES_KEY)
+        if isinstance(other_samples, Mapping):
+            self.record_raiden_samples(other_samples)
+        return self
+
+
+class TPURaidenOffloadingPromMetrics(OffloadPromMetrics):
+    """OffloadPromMetrics extended with dynamic `tpu_raiden_*` collectors."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> None:
+        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+        self._raiden_metrics = RaidenDynamicPromMetrics(
+            metric_types=metric_types,
+            labelnames=labelnames,
+            per_engine_labelvalues=self.per_engine_labelvalues,
+        )
+
+    @property
+    def dynamic_metrics(self) -> dict[str, tuple[str, Any, list[str]]]:
+        return self._raiden_metrics.dynamic_metrics
+
+    def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0) -> None:
+        super().observe(transfer_stats_data, engine_idx=engine_idx)
+        raiden_samples = transfer_stats_data.get(_RAIDEN_SAMPLES_KEY)
+        if isinstance(raiden_samples, Mapping) and raiden_samples:
+            self._raiden_metrics.observe(raiden_samples, engine_idx=engine_idx)
 
 
 def _enqueue_pool_writes(pool_tensors: list[torch.Tensor]) -> None:
@@ -416,6 +517,12 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
 
         return _prefix_aware_load_enabled()
 
+    # Whether this connector drains the process-wide Raiden C++ sample buffer
+    # in `get_kv_connector_stats`. Every drain resets the buffer, so exactly one
+    # connector per process may drain it; `TPUMultiConnector` clears the flag on
+    # the other children.
+    owns_raiden_telemetry_drain: bool = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -437,6 +544,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 "was explicitly set to off. Unset it or set it to '1'."
             )
         os.environ["RAIDEN_DISABLE_SINGLETON_WORKER"] = "1"
+        dist_utils.configure_raiden_telemetry()
 
         # Call through module to preserve PCP-aware patch on build_offloading_config.
         offloading_config = offloading_config_module.build_offloading_config(
@@ -620,3 +728,41 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         self._completed_jobs = {}
         self._fenced_jobs = {}
         return meta
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        samples = (
+            dist_utils.drain_raiden_metric_samples()
+            if self.owns_raiden_telemetry_drain
+            else {}
+        )
+        if self.connector_scheduler is not None:
+            base_stats = self.connector_scheduler.get_stats()
+            return RaidenOffloadingConnectorStats.from_base_stats(base_stats, samples)
+        if self.connector_worker is not None:
+            return RaidenOffloadingConnectorStats.from_base_stats(None, samples)
+        return None
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> KVConnectorStats | None:
+        # `data` is inherited from vLLM's KVConnectorStats dataclass, which a
+        # static checker cannot see through vllm's editable install.
+        if data is not None:
+            return RaidenOffloadingConnectorStats(
+                # pyrefly: ignore[unexpected-keyword]
+                data=data,
+            )
+        return RaidenOffloadingConnectorStats()
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return TPURaidenOffloadingPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )

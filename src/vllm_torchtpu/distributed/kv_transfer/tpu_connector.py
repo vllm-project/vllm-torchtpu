@@ -785,6 +785,25 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
     force_raiden_connector = False
 
     @property
+    def owns_raiden_telemetry_drain(self) -> bool:
+        """Whether this connector's worker drains Raiden C++ telemetry samples.
+
+        Only the Raiden worker drains; the scheduler role and the ZMQ backend
+        never do.
+        """
+        worker = self.connector_worker
+        return (
+            isinstance(worker, TPURaidenConnectorWorker)
+            and worker.owns_raiden_telemetry_drain
+        )
+
+    @owns_raiden_telemetry_drain.setter
+    def owns_raiden_telemetry_drain(self, value: bool) -> None:
+        worker = self.connector_worker
+        if isinstance(worker, TPURaidenConnectorWorker):
+            worker.owns_raiden_telemetry_drain = value
+
+    @property
     def supports_divergent_local_hybrid_hits(self) -> bool:
         """Stage-3 suffix loads also restore the committed Mamba state."""
         return (
@@ -2634,6 +2653,13 @@ class TPURaidenConnectorWorker:
     H2H, H2D, readiness, and completion state.
     """
 
+    # Whether this worker drains the process-wide Raiden C++ sample buffer in
+    # `get_kv_connector_stats`. Every drain resets the buffer, so exactly one
+    # connector per process may drain it; `TPUMultiConnector` keeps ownership
+    # on `TPUConnector` on workers so `TpuKVConnectorStats` remains available
+    # for `TPUModelRunner` stage timings on every TP rank.
+    owns_raiden_telemetry_drain: bool = True
+
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
         assert vllm_config.kv_transfer_config is not None
@@ -2788,20 +2814,14 @@ class TPURaidenConnectorWorker:
         )
 
     def _get_raiden_stats(self):
-        # Get metrics from raiden library
-        try:
-            telemetry = dist_utils.get_raiden_telemetry_module()
-            raiden_samples = {}
-            if telemetry is not None:
-                if hasattr(telemetry, "get_and_reset_metric_samples"):
-                    raiden_samples = telemetry.get_and_reset_metric_samples()
-
-                for metric_name, values in raiden_samples.items():
-                    if metric_name not in self.transfer_stats.data:
-                        self.transfer_stats.data[metric_name] = []
-                    self.transfer_stats.data[metric_name].extend(values)
-        except Exception as e:
-            logger.warning("Failed to collect TPU Raiden C++ telemetry: %s", e)
+        # Drain buffered metrics from the Raiden C++ library when buffered
+        # telemetry is active and this worker owns the drain.
+        if not self.owns_raiden_telemetry_drain:
+            return
+        for metric_name, values in dist_utils.drain_raiden_metric_samples().items():
+            if metric_name not in self.transfer_stats.data:
+                self.transfer_stats.data[metric_name] = []
+            self.transfer_stats.data[metric_name].extend(values)
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         self._get_raiden_stats()

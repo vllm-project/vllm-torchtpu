@@ -338,11 +338,27 @@ case "${ROLE}" in
     fi
 
     # --- Raiden telemetry --------------------------------------------------
-    # With the buffered backend, vLLM exports Raiden's samples as labeled
-    # tpu_raiden_* series; without a backend Raiden records nothing, so at
-    # least one series per engine shows the samples reached /metrics.
+    # Mirrors `is_raiden_buffered_telemetry_enabled`: vLLM exports labeled
+    # tpu_raiden_* series on /metrics only when TPU_RAIDEN_TELEMETRY_BACKENDS
+    # is unset or holds `buffered` without `cloud_logging` and with no unknown
+    # backend names (`buffered`, `cloud_logging`, `prometheus`).
+    raiden_buffered_metrics_enabled() {
+      [[ -z "${TPU_RAIDEN_TELEMETRY_BACKENDS+x}" ]] && return 0
+      awk -v raw="${TPU_RAIDEN_TELEMETRY_BACKENDS}" 'BEGIN {
+        n = split(tolower(raw), parts, ",")
+        for (i = 1; i <= n; i++) {
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", parts[i])
+          if (parts[i] == "") continue
+          if (parts[i] == "buffered") has_buffered = 1
+          else if (parts[i] == "cloud_logging") exit 1
+          else if (parts[i] != "prometheus") exit 1
+        }
+        exit (has_buffered ? 0 : 1)
+      }'
+    }
+
     TELEMETRY_EXIT_CODE=0
-    if [[ ",${TPU_RAIDEN_TELEMETRY_BACKENDS:-}," == *,buffered,* ]]; then
+    if raiden_buffered_metrics_enabled; then
       for endpoint in "${target_prefill_host}:${PREFILL_PORT}" "${target_decode_host}:${DECODE_PORT}"; do
         raiden_series="$(curl -fsS "http://${endpoint}/metrics" 2>/dev/null |
           grep -cE '^tpu_raiden_[A-Za-z0-9_:]+\{' || true)"
