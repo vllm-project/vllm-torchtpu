@@ -1328,7 +1328,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # directly), ple (megakernel programs' PLE/embedding: int32 operands for the n-gram
     # context, context lengths and embedding bounds, trace-time hash constants, a
     # comparison for each token's request), pleconv (the PLE conv taps' step rows as
-    # static shifts instead of gathers). Empty / "0": off.
+    # static shifts instead of gathers, and their history rows in one gather). Empty /
+    # "0": off.
     "VLLM_TPU_MK_IO_LEAN": env_str("VLLM_TPU_MK_IO_LEAN", ""),
     # Whole-step megakernel: per-row-bucket tile / tunable overrides (BUCKET_TUNE in
     # qwen38_wholestep_call). Layout-only entries keep the bytes; see its comments.

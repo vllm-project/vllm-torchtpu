@@ -208,6 +208,23 @@ def short_conv(
     # VLLM_TPU_MK_IO_LEAN=pleconv: each tap's rows of this step as a static shift
     # (`shifted_rows`) instead of a gather at clipped indices; the same rows.
     static_shift = io_lean("pleconv")
+
+    def gathers_history_per_token(distance):  # the branch below that reads `history[req]`
+        return not (fast_history and distance == 0) and not (
+            fast_history and state_len and distance > 0 and requests * distance < token_count
+        )
+
+    distances = [state_len - tap * dilation for tap in range(weight.shape[-1])]
+    per_token = [d for d in distances if gathers_history_per_token(d)]
+    merged_past = {}
+    if static_shift and state_len and len(per_token) > 1:
+        # pleconv: those taps' history rows in ONE gather ([taps, T] indices), the
+        # same rows as one gather per tap.
+        cols = jnp.stack(
+            [jnp.clip(relative - d + state_len, 0, state_len - 1) for d in per_token]
+        )
+        rows = history[safe_slots[req][None, :], cols]
+        merged_past = {d: rows[k] for k, d in enumerate(per_token)}
     accum = jnp.zeros((token_count, channels), jnp.float32)
     for tap in range(weight.shape[-1]):
         distance = state_len - tap * dilation
@@ -241,13 +258,14 @@ def short_conv(
             )
         else:
             # A one-tap convolution has no historical state and only distance 0.
-            past = (
-                history[
+            if distance in merged_past:
+                past = merged_past[distance]
+            elif state_len:
+                past = history[
                     safe_slots[req], jnp.clip(position + state_len, 0, state_len - 1)
                 ]
-                if state_len
-                else jnp.zeros_like(x)
-            )
+            else:
+                past = jnp.zeros_like(x)
             past = jnp.where(has_initial_states[req, None], past, 0)
             value = jnp.where((position >= 0)[:, None], current, past)
         accum = accum + value.astype(jnp.float32) * weight[:, tap].astype(jnp.float32)
