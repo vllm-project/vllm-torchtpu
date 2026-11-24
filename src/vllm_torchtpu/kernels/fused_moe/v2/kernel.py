@@ -139,6 +139,21 @@ def _apply_act(gate, up, act_fn):
     )
 
 
+def input_slots_for(input_key, rows_alloc):
+    """Input slots a four-bit build takes: the tuned INPUT_SLOTS for
+    `input_key` once the bucket's per-shard slab `rows_alloc` reaches its
+    INPUT_SLOTS_MIN_ROWS, else the OUT_PARITIES default.
+
+    The third, interleaved slot is a large-bucket win and a small-bucket loss
+    at the same shape, so the bucket's slab decides, not the shape alone. The
+    slab grows with the global token count, so the same minimum is a smaller
+    tokens-per-shard bucket at a wider EP.
+    """
+    slots = tuned_block_sizes.INPUT_SLOTS.get(input_key, OUT_PARITIES)
+    min_rows = tuned_block_sizes.INPUT_SLOTS_MIN_ROWS.get(input_key, 0)
+    return slots if rows_alloc >= min_rows else OUT_PARITIES
+
+
 def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     """The ascending static tile heights a build emits, ending at tile_m.
 
@@ -734,7 +749,7 @@ def _build_fused_ep_moe_kernel(
     input_key = (pltpu.get_tpu_info().chip_version, tile_m, hidden, inter, rhs_qb)
     interleave_inputs = (
         rhs_packed4
-        and tuned_block_sizes.INPUT_SLOTS.get(input_key, OUT_PARITIES) == 3
+        and input_slots_for(input_key, ragged_rows_alloc) == 3
         and host.TOKEN_GATHER_TILES_PER_WINDOW == 1
     )
     layout_rows = tuned_block_sizes.INPUT_LAYOUT_ROWS.get(input_key)

@@ -238,13 +238,29 @@ def test_weight_depth_uses_the_selected_input_combination(
     assert shallower.fits and shallower.nbuf == 1
 
 
-def _build_input_case(monkeypatch, input_slots, cache_rows, *, g_local=51, limit=None):
+def _build_input_case(
+    monkeypatch,
+    input_slots,
+    cache_rows,
+    *,
+    g_local=51,
+    limit=None,
+    min_rows=None,
+    rows_alloc=128,
+):
     from vllm_torchtpu.kernels.fused_moe.v2 import tuned_block_sizes
 
     info = kernel.pltpu.get_tpu_info_for_chip(kernel.pltpu.ChipVersion.TPU_7X, 1)
     monkeypatch.setattr(kernel.pltpu, "get_tpu_info", lambda: info)
     key = (info.chip_version, 128, 5120, 2560, 512)
     monkeypatch.setattr(tuned_block_sizes, "INPUT_SLOTS", {key: input_slots})
+    # Most cases test the mechanisms' plumbing at a tiny slab, not the
+    # per-bucket gate, so no minimum unless the case asks for one.
+    monkeypatch.setattr(
+        tuned_block_sizes,
+        "INPUT_SLOTS_MIN_ROWS",
+        {} if min_rows is None else {key: min_rows},
+    )
     monkeypatch.setattr(
         tuned_block_sizes,
         "INPUT_LAYOUT_ROWS",
@@ -268,7 +284,7 @@ def _build_input_case(monkeypatch, input_slots, cache_rows, *, g_local=51, limit
         ep=1,
         weight_format=host.WeightFormat.FP4,
         rhs_qb=512,
-        ragged_rows_alloc=128,
+        ragged_rows_alloc=rows_alloc,
         has_w1_bias=True,
         has_w2_bias=True,
     )
@@ -283,6 +299,55 @@ def test_builder_selects_input_mechanisms_independently(
     assert len(selected) == 1
     assert selected[0][:2] == (input_slots, cache_rows)
     assert selected[0][2].fits
+
+
+@pytest.mark.parametrize(
+    "rows_alloc, slots", [(128, host.OUT_PARITIES), (256, 3), (384, 3)]
+)
+def test_builder_applies_the_input_slot_minimum_to_its_own_slab(
+    monkeypatch, rows_alloc, slots
+):
+    """The builder asks the gate with its ragged_rows_alloc: below a tuned
+    minimum it takes the default slots, from the minimum on the tuned third."""
+    _, selected, _ = _build_input_case(
+        monkeypatch, 3, None, min_rows=256, rows_alloc=rows_alloc
+    )
+    assert selected[0][0] == slots
+
+
+# The third, interleaved input slot is chosen per token bucket, not per shape.
+DSV41_INPUT_KEY = (kernel.pltpu.ChipVersion.TPU_7X, 128, 5120, 2560, 512)
+
+
+def _dsv41_rows(tokens_per_shard, ep=8, topk=6, e_total=384, capacity=128):
+    return host.ragged_stride_bound(ep * tokens_per_shard, topk, e_total, capacity)
+
+
+def test_dsv41_small_buckets_take_the_default_input_slots():
+    for tokens in (16, 32, 64, 128, 256, 512):
+        rows = _dsv41_rows(tokens)
+        assert kernel.input_slots_for(DSV41_INPUT_KEY, rows) == host.OUT_PARITIES
+
+
+def test_dsv41_input_slots_switch_between_the_512_and_1024_buckets():
+    rows_1024 = _dsv41_rows(1024)
+    assert kernel.input_slots_for(DSV41_INPUT_KEY, rows_1024) == 3
+    assert kernel.input_slots_for(DSV41_INPUT_KEY, rows_1024 - 1) == host.OUT_PARITIES
+    assert kernel.input_slots_for(DSV41_INPUT_KEY, _dsv41_rows(2048)) == 3
+
+
+def test_untuned_shapes_take_the_default_input_slots():
+    other = (kernel.pltpu.ChipVersion.TPU_7X, 128, 4096, 1024, 512)
+    assert kernel.input_slots_for(other, 10**6) == host.OUT_PARITIES
+
+
+def test_a_tuned_shape_without_a_minimum_takes_its_slots_at_every_bucket(
+    monkeypatch,
+):
+    from vllm_torchtpu.kernels.fused_moe.v2 import tuned_block_sizes
+
+    monkeypatch.setattr(tuned_block_sizes, "INPUT_SLOTS_MIN_ROWS", {})
+    assert kernel.input_slots_for(DSV41_INPUT_KEY, _dsv41_rows(16)) == 3
 
 
 def test_builder_shrinks_weight_depth_with_input3_cache32_and_bias(monkeypatch):
