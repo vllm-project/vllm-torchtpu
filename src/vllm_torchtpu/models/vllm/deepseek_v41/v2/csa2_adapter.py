@@ -325,12 +325,20 @@ def _select_gather_attend(
             page_size=main_page_size,
             onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
         )
+        if following is not None:
+            # Records before the pipeline's next step, so the gather is
+            # issued ahead of it and runs beside it instead of after it.
+            records, following = jax.lax.optimization_barrier((records, following))
+        gathered = gather_csa2_kv_sc(word_banks, scale_banks, records, deep=deep)
         if state is None:
             owners, pending = None, None
             all_scales = jnp.zeros((tokens, 512), jnp.float32)
             all_counts = jnp.zeros((tokens,), jnp.int32)
         else:
             owners, all_scales, all_counts, pending = state
+        update = functools.partial(jax.lax.dynamic_update_slice_in_dim, axis=0)
+        all_scales = update(all_scales, gathered[1], start)
+        all_counts = update(all_counts, counts, start)
 
         def attend(owners, offset, tile_gathered, tile_counts):
             return csa2_attend_rows(
@@ -347,20 +355,10 @@ def _select_gather_attend(
                 **kwargs,
             )
 
-        # Attention runs one tile behind its gather, so its KV is complete.
-        # It goes first: the gather then shares HBM with scoring rather than
-        # with attention, and no attention trails the last scoring.
+        # Attention runs one tile behind its gather: the previous tile's KV
+        # is complete, so it never waits on the gather just started.
         if pending is not None:
             owners = attend(owners, start - pending[1].shape[0], *pending)
-        if following is not None:
-            # The gather and the next tile's scoring are issued after it.
-            records, following, owners = jax.lax.optimization_barrier(
-                (records, following, owners)
-            )
-        gathered = gather_csa2_kv_sc(word_banks, scale_banks, records, deep=deep)
-        update = functools.partial(jax.lax.dynamic_update_slice_in_dim, axis=0)
-        all_scales = update(all_scales, gathered[1], start)
-        all_counts = update(all_counts, counts, start)
         if start + rows < tokens:
             return (owners, all_scales, all_counts, (gathered, counts)), following
         owners = attend(owners, start, gathered, counts)
