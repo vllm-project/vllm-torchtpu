@@ -210,7 +210,7 @@ run_lm_eval() {
     # Turning each redraw into its own line makes every TQDM_MININTERVAL tick
     # visible; stdbuf stops tr holding them in a block buffer. pipefail keeps
     # lm_eval's exit status.
-    lm_eval "${lm_eval_args[@]}" 2>&1 | stdbuf -oL tr '\r' '\n'
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 lm_eval "${lm_eval_args[@]}" 2>&1 | stdbuf -oL tr '\r' '\n'
 
     if [ -f "$baseline" ]; then
         echo "=== Checking Eval Regression for $task ==="
@@ -239,7 +239,7 @@ run_mm_eval() {
 
     echo "Running evalscope for task: $task (limit=$mm_limit/subset, eval-batch-size=$mm_batch_size)..."
     rm -rf "$mm_workdir"
-    evalscope eval \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 evalscope eval \
         --model "$MODEL" \
         --eval-type openai_api \
         --api-url "http://$HOST:$PORT/v1/chat/completions" \
