@@ -16,9 +16,8 @@
 Two long prefixes are interleaved, so the recurrent slot a resumed request
 picks up was last written by the *other* prefix. Attention KV comes back from
 the cache either way; only a real state restore makes the continuation match
-the uncached one. Comparing token ids (optionally allowing a near-tie flip
-within --logprob-atol) rather than an expected answer means a wrong state shows
-up even when it does not change the final answer.
+the uncached one. Comparing token ids rather than an expected answer means a
+wrong state shows up even when it does not change the final answer.
 """
 
 import argparse
@@ -78,48 +77,38 @@ def complete(
     }
 
 
-def matches_reference(ref: dict, cur: dict, logprob_atol: float) -> bool:
-    if cur["tokens"] == ref["tokens"]:
-        return True
-    if logprob_atol <= 0:
-        return False
+def _divergence_diag(ref: dict, cur: dict) -> dict:
+    ref_ids, cur_ids = ref["tokens"], cur["tokens"]
     first = next(
-        (i for i, (a, b) in enumerate(zip(ref["tokens"], cur["tokens"])) if a != b),
+        (i for i, (a, b) in enumerate(zip(ref_ids, cur_ids)) if a != b),
         None,
     )
-    if first is None:
-        return False
-    ref_lps = ref["token_logprobs"]
-    cur_lps = cur["token_logprobs"]
-    ref_tops = ref["top_logprobs"]
-    cur_tops = cur["top_logprobs"]
-    ref_toks = ref["logprob_tokens"]
-    cur_toks = cur["logprob_tokens"]
-    if (
-        min(
-            len(ref_lps),
-            len(cur_lps),
-            len(ref_tops),
-            len(cur_tops),
-            len(ref_toks),
-            len(cur_toks),
-        )
-        <= first
-    ):
-        return False
-    for a, b in zip(ref_lps[:first], cur_lps[:first]):
-        if a is None or b is None or abs(a - b) > logprob_atol:
-            return False
-    ref_tok = ref_toks[first]
-    cur_tok = cur_toks[first]
-    ref_top = ref_tops[first] or {}
-    cur_top = cur_tops[first] or {}
-    if ref_tok not in cur_top or cur_tok not in ref_top:
-        return False
-    return (
-        abs(ref_top[ref_tok] - cur_top[ref_tok]) <= logprob_atol
-        and abs(ref_top[cur_tok] - cur_top[cur_tok]) <= logprob_atol
-    )
+    ref_lps, cur_lps = ref["token_logprobs"], cur["token_logprobs"]
+    prior_end = len(ref_ids) if first is None else first
+    prior_diffs = [
+        abs(a - b)
+        for a, b in zip(ref_lps[:prior_end], cur_lps[:prior_end])
+        if a is not None and b is not None
+    ]
+    diag: dict = {
+        "first_idx": first,
+        "len_ref": len(ref_ids),
+        "len_cur": len(cur_ids),
+        "has_logprobs": bool(ref_lps) and bool(cur_lps),
+        "max_prior_lp_diff": round(max(prior_diffs), 6) if prior_diffs else None,
+        "ref_text": ref["text"],
+        "cur_text": cur["text"],
+    }
+    if first is not None:
+        diag["ref_id"] = ref_ids[first]
+        diag["cur_id"] = cur_ids[first]
+        if first < len(ref["logprob_tokens"]) and first < len(cur["logprob_tokens"]):
+            diag["ref_tok"] = ref["logprob_tokens"][first]
+            diag["cur_tok"] = cur["logprob_tokens"][first]
+        if first < len(ref["top_logprobs"]) and first < len(cur["top_logprobs"]):
+            diag["ref_top"] = ref["top_logprobs"][first]
+            diag["cur_top"] = cur["top_logprobs"][first]
+    return diag
 
 
 def main() -> int:
@@ -132,15 +121,6 @@ def main() -> int:
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--timeout", type=int, default=600)
     p.add_argument(
-        "--logprob-atol",
-        type=float,
-        default=0.0,
-        help="When > 0, accept a warm-round token divergence as a near-tie if "
-        "all prior token logprobs match within this tolerance and both "
-        "competing tokens at the first divergent step appear in each run's "
-        "top-5 logprobs within this tolerance (0 requires exact token ids).",
-    )
-    p.add_argument(
         "--data-parallel-rank",
         type=int,
         help="Hold every request to this DP rank of the engine, with vLLM's "
@@ -152,7 +132,6 @@ def main() -> int:
     headers = {}
     if a.data_parallel_rank is not None:
         headers["X-data-parallel-rank"] = str(a.data_parallel_rank)
-    logprobs = 5 if a.logprob_atol > 0 else None
 
     tags = ["ALPHA", "BRAVO"]
     prompts = {
@@ -176,36 +155,37 @@ def main() -> int:
                     a.max_tokens,
                     a.timeout,
                     headers,
-                    logprobs=logprobs,
+                    logprobs=5,
                 )
             except (urllib.error.URLError, TimeoutError) as exc:
                 print(f"STATE_CONTAMINATION_REQUEST_FAILED {tag} r{rnd}: {exc}")
                 return 1
 
+            diag = None
             if tag not in reference:
                 # Round 1 is uncached: this is the ground truth.
                 reference[tag] = r
                 verdict = "reference"
             else:
-                same = matches_reference(reference[tag], r, a.logprob_atol)
+                same = r["tokens"] == reference[tag]["tokens"]
                 if r["cached_tokens"] > 0:
                     hit_rounds += 1
                     if not same:
                         failures += 1
                 verdict = "match" if same else "DIVERGED"
-            print(
-                json.dumps(
-                    {
-                        "round": rnd,
-                        "prefix": tag,
-                        "prompt_tokens": r["prompt_tokens"],
-                        "cached_tokens": r["cached_tokens"],
-                        "verdict": verdict,
-                        "text": r["text"][:80],
-                    }
-                ),
-                flush=True,
-            )
+                if not same:
+                    diag = _divergence_diag(reference[tag], r)
+            record: dict = {
+                "round": rnd,
+                "prefix": tag,
+                "prompt_tokens": r["prompt_tokens"],
+                "cached_tokens": r["cached_tokens"],
+                "verdict": verdict,
+                "text": r["text"][:80],
+            }
+            if diag is not None:
+                record["diag"] = diag
+            print(json.dumps(record), flush=True)
 
     print(f"STATE_CONTAMINATION_CACHED_ROUNDS {hit_rounds}")
     print(f"STATE_CONTAMINATION_DIVERGENCES {failures}")
