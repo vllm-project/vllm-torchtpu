@@ -50,6 +50,10 @@ _START_UNROLL = 4
 # next ops' weights into (the output projection's 6 MiB fp8 weight). Their
 # calls ask for this, or what they hold and a margin if more.
 _SMALL_BATCH_VMEM_LIMIT_BYTES = 16 * 1024 * 1024
+# fp8 slots per 32-bit word, and words per K or V half of a slot row, of a
+# `words` page ring (`_words_ring`).
+_WORD_PACKING = 4
+_WORD_ROW_LANES = 128
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -80,6 +84,7 @@ def _kernel(
     transposed: bool = False,
     packed_table: bool = False,
     union_page_ref=None,
+    words: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -108,7 +113,12 @@ def _kernel(
     block_start_ref[b + 1] - 1`` of its `tiles_per_step` tiles in a loop
     (the last entry is the call's group count); the query, selection and
     output blocks hold those tiles. With `union_page_ref` (the unions'
-    physical pages, slot for slot) the page table is not read."""
+    physical pages, slot for slot) the page table is not read.
+
+    With `words` (`_words_ring`) the page ring holds each page's 32-bit
+    words as stored, a word row's K and V lane blocks as two rows ``[2 S /
+    4, D]``: K and V are read by strided loads and one bitcast each, in the
+    bitcast's slot order, and enter the MXU as fp8."""
     fp4 = fp4_rows is not None
     if transposed:  # a group's masked scores (`attend_t`)
         *refs, s_scr = refs
@@ -119,6 +129,12 @@ def _kernel(
     pages_per_step = buf_ref.shape[1]
     ring = buf_ref.shape[0]  # prefetched groups + the running one
     num_groups = block_start_ref[pl.num_programs(0)]
+    kv_hbm_dtype = kv_hbm_ref.dtype
+    if words:  # the cache as 32-bit words, a word row's K and V lane blocks
+        # as two rows: [pages, 2 * S / p, 128], in the cache's byte order
+        kv_hbm_ref = kv_hbm_ref.bitcast(jnp.uint32).reshape(
+            kv_hbm_ref.shape[0], -1, _WORD_ROW_LANES
+        )
 
     def group(
         w,
@@ -149,7 +165,11 @@ def _kernel(
         meta = work_meta_ref[w]
         count = work_count_ref[w]
         num_heads, block_q, head_dim = q_ref.shape
-        rows_per_page, packing, row_width = buf_ref.shape[3:]
+        if words:
+            rows_per_page, row_width = buf_ref.shape[2] // 2, 2 * buf_ref.shape[3]
+            packing = _WORD_PACKING
+        else:
+            rows_per_page, packing, row_width = buf_ref.shape[3:]
         page_size = rows_per_page * (msa_fp4.TOKENS_PER_WORD if fp4 else packing)
         half = w % ring
         first = (meta & msa_attention._FIRST_BIT) != 0
@@ -159,13 +179,14 @@ def _kernel(
             """Copies of ``n`` pages from `page` on into slots ``g ..``: every
             copy of a ring slot signals its one semaphore, so a wait sized to
             ``n`` pages waits for any ``n`` of them."""
-            src = kv_hbm_ref.at[
-                pl.ds(page, n), :, :, pl.ds(head_ref[0] * row_width, row_width)
-            ]
+            if words:  # one KV head per row (`_words_ring`)
+                src, dst = kv_hbm_ref.at[pl.ds(page, n)], buf_ref.at[half]
+            else:
+                heads = pl.ds(head_ref[0] * row_width, row_width)
+                src = kv_hbm_ref.at[pl.ds(page, n), :, :, heads]
+                dst = buf_ref.at[half, :, 0]
             copies = [
-                pltpu.make_async_copy(
-                    src, buf_ref.at[half, pl.ds(g, n), 0], sem_ref.at[half, 0]
-                )
+                pltpu.make_async_copy(src, dst.at[pl.ds(g, n)], sem_ref.at[half, 0])
             ]
             if fp4:
                 copies.append(
@@ -343,10 +364,11 @@ def _kernel(
         def attend(width, single):
             """One softmax update over the group's first `width` slots; a
             `single` group (the tile's only one) needs no carried state."""
-            # int4 and fp8 pages unpack in slot order; bf16 in the bitcast's order.
+            # int4 and fp8 pages unpack in slot order; bf16 and `words` pages in
+            # the bitcast's order.
             row_slots = (
                 jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
-                if fp4 or packing == 4
+                if fp4 or (packing == 4 and not words)
                 else msa_attention._bitcast_slots(rows_per_page, packing)
             )  # [S, 1]
             slots = row_slots.T  # [1, S]
@@ -375,6 +397,17 @@ def _kernel(
                     values.append(rows[:, head_dim:])
                     k_scales.append(sk)
                     v_scales.append(sv)
+                elif words:
+                    # K as stored (its stale slots' scores are masked); V's
+                    # stale slots zeroed. The K pushes then wait for no hit
+                    # test (a chain of cross-lane maxima over the group).
+                    k_words = kv_ref[pl.ds(0, rows_per_page, stride=2), :]
+                    v_words = kv_ref[pl.ds(1, rows_per_page, stride=2), :]
+                    rows = pltpu.bitcast(k_words, kv_hbm_dtype)
+                    seen_v = jnp.max(limit, axis=0, keepdims=True)  # [1, 1]
+                    values.append(
+                        msa_attention._word_rows(v_words, packing, seen_v, kv_hbm_dtype)
+                    )
                 elif packing == 4:
                     # The packed [S / 4, 4, 2D] page read as [S, 2D] rows: slot
                     # r * 4 + j at row r * 4 + j, and a cheaper relayout than the
@@ -410,7 +443,7 @@ def _kernel(
             l_cur = jnp.sum(p, axis=1, keepdims=True)
             p_v = p * jnp.concatenate(v_scales, axis=1) if fp4 else p
             pv = jax.lax.dot_general(
-                p_v.astype(v.dtype),
+                p_v.astype(jnp.bfloat16 if words else v.dtype),
                 v,
                 (((1,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
@@ -463,6 +496,25 @@ def _kernel(
 
     b = pl.program_id(0)
     jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
+
+
+def _words_ring(kv_cache, block_q: int, fp4: bool, row_width: int) -> bool:
+    """Whether a call's page ring holds 32-bit words (`_kernel`'s `words`):
+    8-token tiles of an fp8 cache with one KV head of D = 128 per row (a word
+    row's K and V halves are a vreg's lanes each). Read as packed ``[S / 4,
+    4, 2D]`` rows, such a page took a relayout into slot order (~1,200 of a
+    16-page group's ~6,400 instructions, AOT) and an unpack of K and V to
+    bf16; as words it is bitcast in place, and K and V are pushed as fp8
+    weights against bf16 queries and probabilities (exact products, as the
+    block scores' fp8 keys, `msa_indexer.FP8_MXU_KEYS`). The DMA stays one
+    contiguous copy per page."""
+    return (
+        not fp4
+        and block_q == msa_attention.SMALL_BATCH_BLOCK_Q
+        and kv_cache.dtype == jnp.float8_e4m3fn
+        and kv_cache.shape[2] == _WORD_PACKING
+        and kv_cache.shape[3] == row_width == 2 * _WORD_ROW_LANES
+    )
 
 
 def _any_hit(matches, axis):
@@ -652,6 +704,7 @@ def _attention_call(
         page_table = packed_table
     fp4 = scale_rows is not None
     transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
+    words = _words_ring(kv_cache, block_q, fp4, row_width)
     scale_inputs = (scale_cache,) if fp4 else ()
     ring = 1 + (_FP4_PREFETCH if fp4 else 1)
     scale_scratch = (
@@ -697,9 +750,16 @@ def _attention_call(
                     pltpu.VMEM((head_dim, num_heads * block_q), jnp.float32),
                 ]
             ),
-            pltpu.VMEM(
-                (ring, pages_per_step, 1, rows_per_page, packing, row_width),
-                kv_cache.dtype,
+            (
+                pltpu.VMEM(
+                    (ring, pages_per_step, 2 * rows_per_page, row_width // 2),
+                    jnp.uint32,
+                )
+                if words
+                else pltpu.VMEM(
+                    (ring, pages_per_step, 1, rows_per_page, packing, row_width),
+                    kv_cache.dtype,
+                )
             ),
             pltpu.SemaphoreType.DMA((ring, 1)),
             *scale_scratch,
@@ -736,6 +796,7 @@ def _attention_call(
             groups_per_tile=groups_per_tile,
             transposed=transposed,
             packed_table=packed_table is not None,
+            words=words,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,

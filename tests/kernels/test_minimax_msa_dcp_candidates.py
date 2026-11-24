@@ -451,6 +451,22 @@ def test_attention_of_kept_own_candidates(tokens, pages_per_seq, rank, shared):
 
 @pytest.mark.parametrize("tokens", [8, 24, 48])
 @pytest.mark.parametrize("rank", [0, 1])
+def test_attention_of_word_pages(tokens, rank, monkeypatch):
+    """A decode step's fp8 pages read as 32-bit words (`_words_ring`) give the
+    outputs of the packed-rows read, bit for bit."""
+    args, common = _attend_case(tokens, rank, True, seed=tokens + 7 * rank)
+    assert msa_attention_lse._words_ring(args[1], 8, False, 256)
+    got = msa_dcp.msa_attend_dcp(*args, own_first=True, **common)
+    monkeypatch.setattr(msa_attention_lse, "_words_ring", lambda *_: False)
+    jax.clear_caches()
+    want = msa_dcp.msa_attend_dcp(*args, own_first=True, **common)
+    jax.clear_caches()
+    for w, g in zip(want, got):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+
+
+@pytest.mark.parametrize("tokens", [8, 24, 48])
+@pytest.mark.parametrize("rank", [0, 1])
 def test_attention_of_query_halves(tokens, rank):
     """A pair's query heads passed as (this rank's, the other rank's) halves
     give the outputs of the rank-ordered heads, bit for bit."""

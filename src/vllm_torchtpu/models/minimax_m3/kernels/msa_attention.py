@@ -215,13 +215,22 @@ def _page_rows(kv_ref, seen: jax.Array | None) -> jax.Array:
     bitcast of the packed 32-bit words (rows come out in the bitcast's token
     order; `_bitcast_slots` gives the slot of each row).
 
-    With `seen`, slots ``>= seen`` are zeroed in the packed words first: no token of the
-    tile sees them, but p @ v multiplies them by p = 0, and 0 * NaN is NaN,
-    so an unwritten slot holding any bytes would poison the tile.
-    """
-    rows_per_page, packing, width = kv_ref.shape[1:]
-    bits = 32 // packing
+    With `seen`, slots ``>= seen`` are zeroed in the packed words first
+    (`_word_rows`)."""
+    packing = kv_ref.shape[2]
     words = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]
+    return _word_rows(words, packing, seen, kv_ref.dtype).astype(jnp.bfloat16)
+
+
+def _word_rows(words: jax.Array, packing: int, seen: jax.Array | None, dtype):
+    """A page's packed 32-bit words ``[S / p, 2D]`` (word row ``r`` holds slots
+    ``r * p .. r * p + p - 1``) as `dtype` rows ``[S, 2D]`` by one bitcast, in
+    its token order (`_bitcast_slots`). With `seen`, slots ``>= seen`` are
+    zeroed in the words first: no token of the tile sees them, but p @ v
+    multiplies them by p = 0, and 0 * NaN is NaN, so an unwritten slot
+    holding any bytes would poison the tile."""
+    rows_per_page = words.shape[0]
+    bits = 32 // packing
     if seen is not None:
         row = jax.lax.broadcasted_iota(jnp.int32, (rows_per_page, 1), 0)
         keep = jnp.zeros((rows_per_page, 1), jnp.uint32)
@@ -229,7 +238,7 @@ def _page_rows(kv_ref, seen: jax.Array | None) -> jax.Array:
             field = jnp.uint32(((1 << bits) - 1) << (bits * j))
             keep = keep | jnp.where(row * packing + j < seen, field, jnp.uint32(0))
         words = words & keep
-    return pltpu.bitcast(words, kv_ref.dtype).astype(jnp.bfloat16)
+    return pltpu.bitcast(words, dtype)
 
 
 def _bitcast_slots(rows_per_page: int, packing: int) -> jax.Array:
