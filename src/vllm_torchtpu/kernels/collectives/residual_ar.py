@@ -55,17 +55,26 @@ _ROW_ALIGN = 16
 # the call's VMEM stays small.
 _CHUNK_BYTES = 3 << 19
 _SLOTS = 4
+# The fused qkv projection pads its LHS rows to whole 8-bit row tiles, so
+# e4m3 rows feed the MXU too, and holds its whole weight (up to this many
+# chunks) so it lands under the all-reduce: with a 4 x 768 KiB ring the call
+# took 13.2 us instead of 11.1-11.3 (c4 twins j-39b18f37, j-183ba7cf).
+_FP8_ROW_ALIGN = 32
+_QKV_CHUNK_BYTES = _CHUNK_BYTES
+_QKV_SLOTS = 8
 _VMEM_HEADROOM = 2 << 20
 
 
-def _chunks(rows: int, row_bytes: int) -> list[tuple[int, int]]:
-    """(start, size) K-row chunks of ~_CHUNK_BYTES, sizes multiples of 128."""
-    size = max(128, (_CHUNK_BYTES // row_bytes) // 128 * 128)
+def _chunks(
+    rows: int, row_bytes: int, chunk_bytes: int = _CHUNK_BYTES
+) -> list[tuple[int, int]]:
+    """(start, size) K-row chunks of ~chunk_bytes, sizes multiples of 128."""
+    size = max(128, (chunk_bytes // row_bytes) // 128 * 128)
     return [(k, min(size, rows - k)) for k in range(0, rows, size)]
 
 
-def _padded(m: int) -> int:
-    return m + (-m % _ROW_ALIGN)
+def _padded(m: int, align: int = _ROW_ALIGN) -> int:
+    return m + (-m % align)
 
 
 def _pad_rows(v: jax.Array, rows: int) -> jax.Array:
@@ -269,15 +278,85 @@ def _matmul_ar_norm_kernel(
     )
 
 
-def _ring_shape(k: int, nout: int, itemsize: int) -> tuple[list, tuple[int, int, int]]:
-    chunks = _chunks(k, nout * itemsize)
-    return chunks, (min(_SLOTS, len(chunks)), chunks[0][1], nout)
+def _ar_add_norm_matmul_kernel(
+    meta_ref,
+    x_hbm,
+    res_hbm,
+    nw_hbm,
+    s_hbm,
+    w_hbm,
+    y_ref,
+    r_hbm,
+    x_v,
+    res_v,
+    nw_v,
+    s_v,
+    r_v,
+    w_v,
+    acc,
+    red,
+    io_sem,
+    w_sem,
+    *scr,
+    spec,
+    chunks,
+    eps,
+    quant,
+):
+    m, h = x_v.shape
+    ar.prologue(spec)
+    x_in, *rest = _load(
+        [(x_hbm, x_v), (res_hbm, res_v), (nw_hbm, nw_v), (s_hbm, s_v)], io_sem
+    )
+    # The whole weight lands during the all-reduce.
+    ring = _Ring(w_hbm, w_v, w_sem, chunks)
+    x_in.wait()
+    ar.epilogue(
+        spec, meta_ref[0, 0], spec.m, _to_exchange(x_v[...].astype(F32), h), red, scr
+    )
+    for copy in rest:
+        copy.wait()
+    r = (_from_exchange(red[...].astype(F32), m) + res_v[...].astype(F32)).astype(BF16)
+    r_v[...] = r
+    r_out = pltpu.make_async_copy(r_v, r_hbm, io_sem.at[0])
+    r_out.start()
+    rf = r.astype(F32)
+    var = jnp.mean(rf * rf, axis=1, keepdims=True)
+    normed = (rf * lax.rsqrt(var + eps) * _gemma(_row(nw_v))).astype(BF16)
+    lhs = _pad_rows(normed, acc.shape[0])
+    if quant:
+        q, row_scale = _quantize(lhs)
+        ring.contract(q, acc)
+        y = (acc[pl.ds(0, m), :] * row_scale[:m]).astype(BF16).astype(F32)
+        y = (y * _row(s_v)).astype(BF16)
+    else:
+        ring.contract(lhs, acc)
+        y = _project(acc[pl.ds(0, m), :], _row(s_v)).astype(BF16)
+    y_ref[...] = y
+    r_out.wait()
 
 
-def _vmem_bytes(m: int, h: int, spec, info, weight=None) -> int:
+def _ring_shape(
+    k: int, nout: int, itemsize: int, slots: int = _SLOTS, chunk_bytes=_CHUNK_BYTES
+) -> tuple[list, tuple[int, int, int]]:
+    chunks = _chunks(k, nout * itemsize, chunk_bytes)
+    return chunks, (min(slots, len(chunks)), chunks[0][1], nout)
+
+
+def _vmem_bytes(
+    m: int,
+    h: int,
+    spec,
+    info,
+    weight=None,
+    slots=_SLOTS,
+    lhs_align=_ROW_ALIGN,
+    chunk_bytes=_CHUNK_BYTES,
+) -> int:
     """An upper bound of a call's VMEM: the rows, the f32 temporaries, the
-    all-reduce's scratch and, for o_proj (weight = (k, nout)), the weight
-    ring and the accumulator."""
+    all-reduce's scratch and, for a fused projection (weight = (k, nout)),
+    the weight ring of `slots` chunks, its LHS (rows padded to `lhs_align`),
+    the accumulator and, past o_proj's layout, the projection's output."""
     t = functools.partial(ar.tiled_bytes, info=info)
     total = (
         4 * t((m, h), BF16)
@@ -288,14 +367,27 @@ def _vmem_bytes(m: int, h: int, spec, info, weight=None) -> int:
     )
     if weight is not None:
         k, nout = weight
-        _, ring = _ring_shape(k, nout, 1)
-        total += t(ring, FP8) + t((m, k), BF16) + 2 * t((_padded(m), nout), F32)
+        _, ring = _ring_shape(k, nout, 1, slots, chunk_bytes)
+        rows = _padded(m, lhs_align)
+        total += t(ring, FP8) + t((rows, k), BF16) + 2 * t((rows, nout), F32)
+        if lhs_align != _ROW_ALIGN:
+            total += t((m, nout), BF16)
     return total
 
 
-def supported(m: int, h: int, n: int, max_rows: int, weight=None) -> bool:
-    """Whether an all-reduce of [m, h] over n ranks (and, for o_proj, m rows
-    of the e4m3 weight [k, nout] = `weight`) fits one call (m <= max_rows)."""
+def supported(
+    m: int,
+    h: int,
+    n: int,
+    max_rows: int,
+    weight=None,
+    slots=_SLOTS,
+    lhs_align=_ROW_ALIGN,
+    chunk_bytes=_CHUNK_BYTES,
+) -> bool:
+    """Whether an all-reduce of [m, h] over n ranks (and, for a fused
+    projection, m rows of the e4m3 weight [k, nout] = `weight` through a
+    ring of `slots` chunks) fits one call (m <= max_rows)."""
     if not 0 < m <= max_rows or m % 8 or n < 2:
         return False
     if weight is not None and (weight[0] % 128 or weight[1] % 128):
@@ -304,7 +396,11 @@ def supported(m: int, h: int, n: int, max_rows: int, weight=None) -> bool:
     mv, hv = _exchange_shape(m, h)
     if not ar.supported(n, mv, hv, info):
         return False
-    need = _vmem_bytes(m, h, ar.make_spec(n, mv, hv), info, weight) + _VMEM_HEADROOM
+    spec = ar.make_spec(n, mv, hv)
+    need = (
+        _vmem_bytes(m, h, spec, info, weight, slots, lhs_align, chunk_bytes)
+        + _VMEM_HEADROOM
+    )
     return need <= info.vmem_capacity_bytes * ar.VMEM_FRACTION
 
 
@@ -421,6 +517,85 @@ def matmul_ar_norm(
         # The attention heads stay where XLA put them.
         a,
         *(_in_hbm(v) for v in (residual, norm_w, s, w)),
+    )
+
+
+def qkv_supported(m: int, h: int, n: int, max_rows: int, weight) -> bool:
+    """Whether `ar_add_norm_matmul` of [m, h] rows on the e4m3 weight [k,
+    nout] = `weight` fits one call."""
+    return supported(
+        m, h, n, max_rows, weight, _QKV_SLOTS, _FP8_ROW_ALIGN, _QKV_CHUNK_BYTES
+    )
+
+
+def ar_add_norm_matmul(
+    x, residual, norm_w, w, s, rank, n: int, eps: float, quant=False, interpret=False
+):
+    """`ar_add_norm` followed by the projection of its normalized rows on
+    e4m3 w [h, nout] with channel scale s [nout], in one call: the weight
+    streams into VMEM during the all-reduce. Returns (y, r) with y =
+    ``reference_matmul(norm(r), w, s)``, or with `quant` ``e4m3_rows_matmul``
+    of the e4m3 rows and their scales; only the dot's f32 summation order
+    over K can differ from XLA's."""
+    m, h = x.shape
+    k, nout = w.shape
+    info = pltpu.get_tpu_info()
+    spec = ar.make_spec(n, *_exchange_shape(m, h))
+    chunks, ring = _ring_shape(k, nout, w.dtype.itemsize, _QKV_SLOTS, _QKV_CHUNK_BYTES)
+    rows = _padded(m, _FP8_ROW_ALIGN)
+    limit = (
+        _vmem_bytes(
+            m,
+            h,
+            spec,
+            info,
+            (k, nout),
+            _QKV_SLOTS,
+            _FP8_ROW_ALIGN,
+            _QKV_CHUNK_BYTES,
+        )
+        + _VMEM_HEADROOM
+    )
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    return pl.pallas_call(
+        functools.partial(
+            _ar_add_norm_matmul_kernel, spec=spec, chunks=chunks, eps=eps, quant=quant
+        ),
+        # The projection is written in VMEM for the small XLA ops reading it
+        # (written to HBM, each read cost ~0.7 us, j-183ba7cf).
+        out_shape=(
+            jax.ShapeDtypeStruct((m, nout), BF16),
+            _residual_result((m, h), interpret),
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[hbm] * 5,
+            out_specs=[vmem, hbm],
+            scratch_shapes=[
+                pltpu.VMEM(x.shape, x.dtype),
+                pltpu.VMEM(residual.shape, residual.dtype),
+                pltpu.VMEM(norm_w.shape, norm_w.dtype),
+                pltpu.VMEM(s.shape, s.dtype),
+                pltpu.VMEM((m, h), BF16),
+                pltpu.VMEM(ring, w.dtype),
+                pltpu.VMEM((rows, nout), F32),
+                pltpu.VMEM((spec.m, spec.h), BF16),
+                pltpu.SemaphoreType.DMA((4,)),
+                pltpu.SemaphoreType.DMA((ring[0],)),
+                *ar.scratch_shapes(spec),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=limit, collective_id=ar.COLLECTIVE_ID
+        ),
+        name=(
+            f"ar_add_norm_matmul{'_quant' if quant else ''}-m_{m}-k_{k}-n_{nout}-ar_{n}"
+        ),
+        interpret=interpret,
+    )(
+        rank.reshape(1, 1).astype(jnp.int32),
+        *(_in_hbm(v) for v in (x, residual, norm_w, s, w)),
     )
 
 

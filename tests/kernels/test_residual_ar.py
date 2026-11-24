@@ -27,6 +27,8 @@ from vllm_torchtpu.kernels.collectives import residual_ar
 
 N_RANKS = 8
 HIDDEN = 6144
+# qkv_proj's per-rank output width.
+QKV = 1536
 # MiniMax-M3.1 decode rows: c4 b1, c16 b3 (both stack column halves), b4.
 ROWS = (8, 24, 32)
 EPS = 1e-6
@@ -58,6 +60,8 @@ def _worker():
     nw = jnp.asarray(0.1 * rng.standard_normal((HIDDEN,)), jnp.bfloat16)
     wo = jnp.asarray(0.05 * rng.standard_normal((1024, HIDDEN)), jnp.float8_e4m3fn)
     so = jnp.asarray(2.0 ** rng.integers(-3, 3, (HIDDEN,)), jnp.bfloat16)
+    wq = jnp.asarray(0.05 * rng.standard_normal((HIDDEN, QKV)), jnp.float8_e4m3fn)
+    sq = jnp.asarray(2.0 ** rng.integers(-3, 3, (QKV,)), jnp.bfloat16)
 
     def body(x, res, a, rank):
         n_, r_ = k.ar_add_norm(x, res, nw, rank, N_RANKS, EPS)
@@ -68,9 +72,15 @@ def _worker():
         q0, qs0 = k.quantize_rows(n0)
         pr = jax.lax.psum(k.reference_matmul(a, wo, so).astype(jnp.float32), "d")
         o0, r20 = k.reference_add_norm(pr.astype(jnp.bfloat16), res, nw, EPS)
+        y, ry = k.ar_add_norm_matmul(x, res, nw, wq, sq, rank, N_RANKS, EPS)
+        yq, ryq = k.ar_add_norm_matmul(
+            x, res, nw, wq, sq, rank, N_RANKS, EPS, quant=True
+        )
+        y0 = k.reference_matmul(n0, wq, sq)
+        yq0 = k.e4m3_rows_matmul(q0, qs0, wq, sq)
         f32 = jnp.float32
         return [v.astype(f32) for v in (n_, n0, r_, r0, q, q0, qs, qs0, rq, r0)] + [
-            v.astype(f32) for v in (o, o0, r2, r20)
+            v.astype(f32) for v in (o, o0, r2, r20, y, y0, ry, yq, yq0, ryq)
         ]
 
     spec = P("d")
@@ -103,7 +113,10 @@ def _worker():
             put(jnp.asarray(a, jnp.bfloat16)),
             put(ranks),
         )
-        n_, n0, r_, r0, q, q0, qs, qs0, rq, _, o, o0, r2, r20 = map(np.asarray, outs)
+        n_, n0, r_, r0, q, q0, qs, qs0, rq, _, o, o0, r2, r20 = map(
+            np.asarray, outs[:14]
+        )
+        y, y0, ry, yq, yq0, ryq = map(np.asarray, outs[14:])
         result[str(m)] = dict(
             normed=bool(np.array_equal(n_, n0)),
             residual=bool(np.array_equal(r_, r0) and np.array_equal(rq, r0)),
@@ -111,6 +124,10 @@ def _worker():
             # o_proj's K order differs from XLA's dot: bf16 roundings.
             o_proj=float(np.abs(o - o0).max() / np.abs(o0).max()),
             o_proj_residual=float(np.abs(r2 - r20).max() / np.abs(r20).max()),
+            # qkv_proj's K order differs from XLA's dot too.
+            qkv=float(np.abs(y - y0).max() / np.abs(y0).max()),
+            qkv_e4m3=float(np.abs(yq - yq0).max() / np.abs(yq0).max()),
+            qkv_residual=bool(np.array_equal(ry, r0) and np.array_equal(ryq, r0)),
             races=bool(interpret_pallas_call.races.races_found),
         )
     print("RESULT " + json.dumps(result))
@@ -137,6 +154,8 @@ def test_kernels_on_8_devices(on_8_devices, m):
     case = on_8_devices[str(m)]
     assert case["normed"] and case["residual"] and case["e4m3"], case
     assert case["o_proj"] < 2**-6 and case["o_proj_residual"] < 2**-6, case
+    assert case["qkv"] < 2**-6 and case["qkv_e4m3"] < 2**-6, case
+    assert case["qkv_residual"], case
     assert not case["races"], case
 
 

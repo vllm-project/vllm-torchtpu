@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_FUSED_NORM: bool = False
     TPU_MINIMAX_M3_FUSED_RESIDUAL_AR: int = 0
     TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_E4M3: bool = False
+    TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_QKV: bool = False
     TPU_MINIMAX_M3_SP_E4M3_QKV: bool = False
     TPU_MINIMAX_M3_SP_A2A_OPROJ: str = "off"
     TPU_MINIMAX_M3_SP_A2A_E4M3: bool = False
@@ -809,6 +810,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of converting the weight to bf16 inside the dot's fusion.
     "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_E4M3": env_bool(
         "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_E4M3", default=False
+    ),
+    # With it, the FFN-exit call also runs the next layer's qkv_proj, its
+    # e4m3 weight streamed into VMEM during the all-reduce
+    # (kernels/collectives/residual_ar.py `ar_add_norm_matmul`).
+    "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_QKV": env_bool(
+        "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_QKV", default=False
     ),
     # "full" SP with the e4m3 gathers: qkv_proj, a dense layer's MLP gate_up
     # and a model-side shared expert (TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS)

@@ -62,11 +62,12 @@ _SELFTEST_E4M3_REL_TOL = 2**-4
 A = jax.Array
 
 
-def _op_bodies(n: int, max_rows: int, reduce, eps: float, e4m3: bool):
+def _op_bodies(n: int, max_rows: int, reduce, eps: float, e4m3: bool, qkv: bool):
     """op_a / op_b's per-device bodies: the kernels up to max_rows, else the
     unfused math around `reduce` (the armed all-reduce op's). With `e4m3`,
     qkv_proj (and o_proj above the kernels' rows) contract e4m3 rows with
-    per-row scales against the e4m3 weight (e4m3 x e4m3)."""
+    per-row scales against the e4m3 weight (e4m3 x e4m3). With `qkv`, op_a's
+    kernel also runs qkv_proj."""
 
     def proj(v, w, s):
         if e4m3:
@@ -80,6 +81,10 @@ def _op_bodies(n: int, max_rows: int, reduce, eps: float, e4m3: bool):
                 reduce(x, rank), residual, norm_w, eps
             )
             return proj(normed, w, s), r
+        if qkv and kernel.qkv_supported(m, h, n, max_rows, w.shape):
+            return kernel.ar_add_norm_matmul(
+                x, residual, norm_w, w, s, rank, n, eps, quant=e4m3
+            )
         if e4m3:
             q, scale, r = kernel.ar_add_norm(
                 x, residual, norm_w, rank, n, eps, quant=True
@@ -106,7 +111,12 @@ def _make_ops(armed, max_rows: int, eps: float):
     n = int(mesh.size)
     reduce = pallas_all_reduce.reduce_body(n, armed.max_bytes, axis)
     body_a, body_b = _op_bodies(
-        n, max_rows, reduce, eps, envs.TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_E4M3
+        n,
+        max_rows,
+        reduce,
+        eps,
+        envs.TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_E4M3,
+        envs.TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_QKV,
     )
     specs = (P(axis),) * 6
     out_specs = (P(axis), P(axis))
