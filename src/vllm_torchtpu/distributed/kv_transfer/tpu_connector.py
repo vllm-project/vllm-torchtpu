@@ -7085,7 +7085,10 @@ class TPURaidenConnectorWorker:
                 group_of_layer[str(layer_name)] = index
         fa_pages = int(self._max_request_blocks())
         glm_pages = 0
-        if _raiden_glm_dcp_identity():
+        # A row-span GLM transfer (a pipeline producer to a DCP consumer)
+        # touches the same pages of one max-length request as the identity
+        # transfer: max_model_len over the rank-local page times DCP.
+        if _raiden_glm_dcp_identity() or _use_raiden_glm_admission():
             dcp_size = int(
                 self.vllm_config.parallel_config.decode_context_parallel_size
             )
