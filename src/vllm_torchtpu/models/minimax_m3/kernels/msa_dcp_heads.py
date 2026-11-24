@@ -576,15 +576,22 @@ def exchange_head_pages_wait(
 ) -> jax.Array:
     """Retires `exchange_head_pages_start`'s copies (and, unless `direct`,
     forwards the received part to the head's other replicas): the same
-    buffer `exchange_head_pages` returns."""
+    buffer `exchange_head_pages` returns. `future` is the start's outputs
+    followed by the cache the start read."""
     # fwd_sem comes from the start: a peer may forward pages before this
     # rank enters the wait, when a scratch semaphore would not exist yet.
-    out, send_sem, recv_sem, fwd_sem = future
+    # The cache is an operand of the wait only to keep its buffer alive:
+    # the start's copies read it until here, and XLA reuses the buffer of a
+    # value whose last consumer has run (an intermediate cache, e.g. a
+    # slice of the caller's, was overwritten mid-copy).
+    out, send_sem, recv_sem, fwd_sem, src_cache = future
     part = out.shape[2]
     out_shape = jax.ShapeDtypeStruct(out.shape, out.dtype)
 
-    def kernel(live_ref, rank_ref, buf_ref, send_sem, recv_sem, fwd_sem, out_ref):
-        del buf_ref  # aliased to out_ref
+    def kernel(
+        live_ref, rank_ref, buf_ref, send_sem, recv_sem, fwd_sem, src_ref, out_ref
+    ):
+        del buf_ref, src_ref  # aliased to out_ref; kept alive only
         me = rank_ref[0]
         replica = me % replicas
         counts = [live_part(live_ref[0], j, replicas, part) for j in range(replicas)]
@@ -650,6 +657,7 @@ def exchange_head_pages_wait(
                 pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
                 pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
                 pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+                pl.BlockSpec(memory_space=pl.ANY),
             ],
             out_specs=pl.BlockSpec(memory_space=pl.ANY),
         ),
@@ -658,7 +666,7 @@ def exchange_head_pages_wait(
         compiler_params=pltpu.CompilerParams(has_side_effects=True),
         interpret=pltpu.InterpretParams() if interpret else False,
         name="minimax_m3_msa_dcp_exchange_wait",
-    )(live, rank, out, send_sem, recv_sem, fwd_sem)
+    )(live, rank, out, send_sem, recv_sem, fwd_sem, src_cache)
 
 
 def _exchange_pages(
@@ -1045,7 +1053,7 @@ def _head_parallel_attend(
             head_width=head_width,
             direct=exchange_direct(replicas),
             interpret=interpret,
-        )
+        ) + (kv_cache,)
         # The overlapped work starts after the copies.
         future, q, candidates = jax.lax.optimization_barrier((future, q, candidates))
         extra = between(q, candidates)
