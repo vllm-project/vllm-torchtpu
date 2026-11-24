@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 from ..blocks.gdn import GDNBlock
 from ..blocks.hc import HCSublayer
@@ -187,6 +187,8 @@ class Qwen38MoE(MoEBlock):
     the chunk is the largest 128-multiple divisor of `H` up to 1024 (640).
     """
 
+    _emits_xlayer_prefetch: ClassVar[bool] = True
+
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         return _bf16(super().weights(g, ex), ("sh13", "sh2"))
 
@@ -197,6 +199,12 @@ class Qwen38MoE(MoEBlock):
         # `derive_moe_params` reads `g.H` only for the chunk and the `H` field.
         mp = super().plan_params(dataclasses.replace(g, H=1024), ex, plan)
         return dataclasses.replace(mp, H=g.H, CH=ch)
+
+    def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
+        part = super().emit(ctx, l, slot)
+        if part is not None and ctx.xlayer_prefetch is not None:
+            ctx.xlayer_prefetch(ctx, l)
+        return part
 
 
 def segment_spec(

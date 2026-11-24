@@ -667,6 +667,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_GDN_VEC_REC: bool = False
     VLLM_TPU_MK_UNION_SKIP_ROWCOMPACT: bool = False
     VLLM_TPU_MK_INDEXER_FAST_THR: bool = False
+    VLLM_TPU_MK_XLAYER_PREFETCH: bool = False
     # q38 internal-v3 GDN/QSA ports (end)
 
 
@@ -3781,6 +3782,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lax.cond tie-skip + radix-4 tie search, plus T=1 / bounded fori_loop
     # compact_union when union_bounded=False.
     "VLLM_TPU_MK_INDEXER_FAST_THR": env_bool("VLLM_TPU_MK_INDEXER_FAST_THR"),
+    # Cross-layer megakernel prefetch (`Tiles.xlayer_prefetch`, default off; exact):
+    # issue layer `l + 1` GDN pool-state DMAs (`pg_raw`/`pg_craw` and idle `epool`
+    # slots) or QSA HBM table DMAs during layer `l`'s MoE AR2D tail. Honors
+    # VLLM_TPU_MK_LIVE_ROWS, VLLM_TPU_MK_GDN_CKPT_INK (drains pending writes first),
+    # and skips duplicate table prefetch when VLLM_TPU_MK_TABLE_SLIM=2 is active.
+    "VLLM_TPU_MK_XLAYER_PREFETCH": env_bool("VLLM_TPU_MK_XLAYER_PREFETCH"),
     # q38 internal-v3 GDN/QSA ports (end)
 }
 

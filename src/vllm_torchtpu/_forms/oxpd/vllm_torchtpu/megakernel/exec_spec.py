@@ -83,6 +83,8 @@ class Tiles:
     ar2d_any16: bool = False
     # Single-slot scratch/semaphores for synchronous HIER=4 AR2D.
     ar2d_single_slot: bool = False
+    # Issue next-layer input DMAs during preceding layer all-reduce tail (exact).
+    xlayer_prefetch: bool = False
     # Per-block tunables (registered `Tunables` instances keyed by block name).
     blocks: Mapping[str, Any] = TunablesMap()
 
@@ -149,6 +151,7 @@ TILE_NUMERICS: dict[str, NumericsClass] = {
     "scratch_alias": "exact",  # disjoint SwitchSlot VMEM scratch sharing
     "ar2d_any16": "approx",  # selects HIER=4 AR2D for MR>=32, MR%16==0 (MR%64!=0)
     "ar2d_single_slot": "exact",  # 1-slot buffer reuse for synchronous HIER=4 AR2D
+    "xlayer_prefetch": "exact",  # cross-layer DMA prefetch schedule only
 }
 
 

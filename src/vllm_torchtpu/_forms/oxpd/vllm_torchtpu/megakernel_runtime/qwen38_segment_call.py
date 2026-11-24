@@ -136,6 +136,7 @@ def segment_tiles(
         hier=h,
         ar2d_any16=bool(envs.VLLM_TPU_MK_MOE_AR2D_ANY16),
         ar2d_single_slot=bool(envs.VLLM_TPU_MK_AR2D_SINGLE_SLOT),
+        xlayer_prefetch=bool(envs.VLLM_TPU_MK_XLAYER_PREFETCH),
     ).with_blocks(blocks)
 
 
