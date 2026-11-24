@@ -32,6 +32,7 @@ from typing import Any, NamedTuple
 
 import torch
 import torch.nn.functional as F
+from jax.experimental.pallas import tpu as pltpu
 from torch import nn
 from transformers import Qwen4ExpTextConfig
 from vllm.config import VllmConfig
@@ -55,6 +56,7 @@ from vllm_torchtpu.models.qwen4_exp.ops.ple_state import (
     read_ple_state,
     write_ple_state,
 )
+from vllm_torchtpu.tpu_info import get_chip_version
 
 _MASK64 = (1 << 64) - 1
 _MAX_INT64 = (1 << 63) - 1
@@ -310,18 +312,40 @@ class Qwen4ExpPLETable(PLEVocabParallelEmbedding):
         self.embedding_method = embedding_method
         self.output_dtype = torch.get_default_dtype()
         self._weight_chunks: nn.ParameterList | None = None
+        self._chunk_row_counts: tuple[int, ...] = ()
+        self._rows_per_pack: int = 1
 
     def finalize_weights(self, max_elements: int = _MAX_GATHER_ELEMENTS) -> None:
-        """Splits tables over ``max_elements``: TPU gather offsets are 32-bit."""
+        """Splits large tables (32-bit TPU gather offsets) and lane-packs rows."""
         weight = self._parameters.get("weight")
         if weight is None or weight.numel() <= max_elements:
             return
-        chunk_rows = max(1, max_elements // self.embedding_dim)
-        chunks = [
-            nn.Parameter(chunk.clone(), requires_grad=False)
-            for chunk in weight.split(chunk_rows, dim=0)
-        ]
+        num_lanes = pltpu.get_tpu_info_for_chip(get_chip_version(), 1).num_lanes
+        rows_per_pack = num_lanes // math.gcd(self.embedding_dim, num_lanes)
+        raw_chunk_rows = max(1, max_elements // self.embedding_dim)
+        chunk_rows = (
+            (raw_chunk_rows // rows_per_pack) * rows_per_pack
+            if raw_chunk_rows >= rows_per_pack
+            else raw_chunk_rows
+        )
+        chunks = []
+        row_counts = []
+        for chunk in weight.split(chunk_rows, dim=0):
+            row_counts.append(chunk.shape[0])
+            pad = (-chunk.shape[0]) % rows_per_pack
+            if pad:
+                padded = chunk.new_zeros((chunk.shape[0] + pad, self.embedding_dim))
+                padded[: chunk.shape[0]].copy_(chunk)
+                chunk = padded
+            chunks.append(
+                nn.Parameter(
+                    chunk.reshape(-1, rows_per_pack * self.embedding_dim).clone(),
+                    requires_grad=False,
+                )
+            )
         self._weight_chunks = nn.ParameterList(chunks)
+        self._chunk_row_counts = tuple(row_counts)
+        self._rows_per_pack = rows_per_pack
         # Drop the monolithic 6.4 GB parameter so only the chunks stay in HBM.
         self.register_parameter("weight", None)
 
@@ -354,7 +378,7 @@ class Qwen4ExpPLETable(PLEVocabParallelEmbedding):
         return rows.reshape(*ids.shape, self.embedding_dim)
 
     def _gather_rows(self, flat: torch.Tensor) -> torch.Tensor:
-        """Look up and dequantize local rows, using chunked gather for large tables."""
+        """Look up and dequantize local rows, using chunked/packed gather."""
         if self._weight_chunks is None:
             rows = self.embedding_method.embedding(self, flat)
             return self.embedding_method.dequantize(self, rows, self.output_dtype)
@@ -364,13 +388,28 @@ class Qwen4ExpPLETable(PLEVocabParallelEmbedding):
             device=flat.device,
         )
         offset = 0
-        for chunk in self._weight_chunks:
-            end_chunk = offset + chunk.shape[0]
+        for chunk, count in zip(self._weight_chunks, self._chunk_row_counts):
+            end_chunk = offset + count
             in_chunk = (flat >= offset) & (flat < end_chunk)
-            chunk_rows = F.embedding(torch.where(in_chunk, flat - offset, 0), chunk)
-            chunk_rows = self.embedding_method.dequantize(
-                self, chunk_rows, self.output_dtype
-            )
+            safe = torch.where(in_chunk, flat - offset, 0)
+            if self._rows_per_pack > 1:
+                packed = F.embedding(safe // self._rows_per_pack, chunk).view(
+                    -1, self._rows_per_pack, self.embedding_dim
+                )
+                packed = self.embedding_method.dequantize(
+                    self, packed, self.output_dtype
+                )
+                slot = (
+                    (safe % self._rows_per_pack)
+                    .view(-1, 1, 1)
+                    .expand(-1, 1, self.embedding_dim)
+                )
+                chunk_rows = packed.gather(1, slot).squeeze(1)
+            else:
+                chunk_rows = F.embedding(safe, chunk)
+                chunk_rows = self.embedding_method.dequantize(
+                    self, chunk_rows, self.output_dtype
+                )
             rows = rows + chunk_rows.masked_fill(~in_chunk.unsqueeze(-1), 0)
             offset = end_chunk
         return rows

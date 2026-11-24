@@ -24,8 +24,8 @@ import torch
 import torch_tpu  # noqa: F401 - attaches torch.tpu.pallas
 
 # TPU HBM flushes subnormal bf16 and canonicalizes fp8 NaN bit patterns, so
-# raw bytes are stored as 4-bit nibbles (0..15) rather than bit-cast directly.
-_NIBBLES_PER_BYTE = 2
+# raw values are split into 4-bit nibbles (0..15) rather than bit-cast directly.
+_NIBBLE_BITS = 4
 
 
 def read_ple_state(
@@ -157,19 +157,16 @@ def _read_states(
     w_elems, state_elems = _state_elems(
         pool.dtype, window_shape, window_dtype, context_len
     )
-    blocks = _blocks(pool, pages_per_block, state_elems)
-    flat = blocks[block_ids, : _num_rows(blocks, state_elems)].reshape(
-        block_ids.shape[0], -1
-    )
+    pages_needed = _state_pages(pool, pages_per_block, state_elems)
+    offsets = jnp.arange(pages_needed, dtype=block_ids.dtype)
+    page_ids = (block_ids[:, None] * pages_per_block + offsets[None, :]).reshape(-1)
+    # Gather axis 0 directly before reshaping so XLA does not relayout the full pool.
+    flat = pool[page_ids].reshape(block_ids.shape[0], -1)
     if _store_window_directly(pool.dtype, window_dtype):
         window = flat[:, :w_elems].reshape(block_ids.shape[0], *window_shape)
     else:
-        window = _from_bytes(
-            _decode_bytes(flat[:, :w_elems]), window_dtype, window_shape
-        )
-    context = _from_bytes(
-        _decode_bytes(flat[:, w_elems:state_elems]), jnp.int32, (context_len,)
-    )
+        window = _decode_nibbles(flat[:, :w_elems], window_dtype, window_shape)
+    context = _decode_nibbles(flat[:, w_elems:state_elems], jnp.int32, (context_len,))
     return window, context
 
 
@@ -195,20 +192,29 @@ def _write_states(
             f"ngram_context must be int32 [{num_reqs}, n], got "
             f"{context.dtype} {context.shape}."
         )
-    ctx_encoded = _encode_bytes(_to_bytes(context), pool.dtype)
+    ctx_encoded = _encode_nibbles(context, pool.dtype)
     if _store_window_directly(pool.dtype, window.dtype):
         win_encoded = window.reshape(num_reqs, -1)
     else:
-        win_encoded = _encode_bytes(_to_bytes(window), pool.dtype)
+        win_encoded = _encode_nibbles(window, pool.dtype)
     data = jnp.concatenate([win_encoded, ctx_encoded], axis=-1)
-    blocks = _blocks(pool, pages_per_block, data.shape[1])
-    num_rows = _num_rows(blocks, data.shape[1])
-    row_shape = blocks.shape[2:]
-    padded = num_rows * math.prod(row_shape)
-    data = jnp.pad(data, ((0, 0), (0, padded - data.shape[1])))
-    rows = data.reshape(num_reqs, num_rows, *row_shape)
-    blocks = blocks.at[block_ids, :num_rows].set(rows)
-    return blocks.reshape(pool.shape)
+    pages_needed = _state_pages(pool, pages_per_block, data.shape[1])
+    padded_elems = pages_needed * math.prod(pool.shape[1:])
+    pages = jnp.pad(data, ((0, 0), (0, padded_elems - data.shape[1]))).reshape(
+        num_reqs, pages_needed, *pool.shape[1:]
+    )
+
+    # Sequential dynamic_update_slice keeps the pool update in place; a whole-page
+    # scatter copies the full KV pool on TPU.
+    def _update_block(
+        carry: jax.Array, item: tuple[jax.Array, jax.Array]
+    ) -> tuple[jax.Array, None]:
+        block_id, block_pages = item
+        start = (block_id * pages_per_block, *(0,) * (pool.ndim - 1))
+        return jax.lax.dynamic_update_slice(carry, block_pages, start), None
+
+    updated, _ = jax.lax.scan(_update_block, pool, (block_ids, pages))
+    return updated
 
 
 def _pages_per_block(
@@ -233,47 +239,55 @@ def _store_window_directly(pool_dtype: jnp.dtype, window_dtype: jnp.dtype) -> bo
     return pool_dtype == window_dtype and pool_dtype != jnp.float8_e4m3fn
 
 
-def _blocks(pool: jax.Array, pages_per_block: int, state_elems: int) -> jax.Array:
-    """[num_blocks, rows, pack, D] view of the pool, in its own dtype."""
-    num_blocks = pool.shape[0] // pages_per_block
-    blocks = pool.reshape(num_blocks, -1, *pool.shape[-2:])
-    if state_elems > blocks[0].size:
+def _state_pages(pool: jax.Array, pages_per_block: int, state_elems: int) -> int:
+    """Leading pages per block required to store ``state_elems``."""
+    page_elems = math.prod(pool.shape[1:])
+    block_elems = pages_per_block * page_elems
+    if state_elems > block_elems:
         raise ValueError(
             f"PLE state needs {state_elems} elements but a state block has "
-            f"{blocks[0].size}."
+            f"{block_elems}."
         )
-    return blocks
+    return math.ceil(state_elems / page_elems)
 
 
-def _num_rows(blocks: jax.Array, state_elems: int) -> int:
-    return math.ceil(state_elems / (blocks.shape[2] * blocks.shape[3]))
+def _uint_dtype(dtype: jnp.dtype) -> jnp.dtype:
+    return jnp.dtype(f"uint{jax.dtypes.itemsize_bits(dtype)}")
 
 
-def _to_bytes(values: jax.Array) -> jax.Array:
-    return jax.lax.bitcast_convert_type(values, jnp.uint8).reshape(values.shape[0], -1)
+def _nibbles_per_elem(dtype: jnp.dtype) -> int:
+    return jax.dtypes.itemsize_bits(dtype) // _NIBBLE_BITS
 
 
-def _from_bytes(
-    data: jax.Array, dtype: jnp.dtype, item_shape: tuple[int, ...]
-) -> jax.Array:
-    shaped = data.reshape(data.shape[0], *item_shape, jnp.dtype(dtype).itemsize)
-    return jax.lax.bitcast_convert_type(shaped, dtype)
+def _encode_nibbles(values: jax.Array, dtype: jnp.dtype) -> jax.Array:
+    """Split each element into planar 4-bit nibbles (0..15), exact in fp8 and bf16.
 
-
-def _encode_bytes(data: jax.Array, dtype: jnp.dtype) -> jax.Array:
-    """Split each uint8 into two 4-bit nibbles (0..15), exact in fp8 and bf16."""
-    hi = (data >> 4).astype(dtype)
-    lo = (data & 0xF).astype(dtype)
-    return jnp.stack([hi, lo], axis=-1).reshape(data.shape[0], -1)
-
-
-def _decode_bytes(encoded: jax.Array) -> jax.Array:
-    pairs = (
-        jnp.round(encoded.astype(jnp.float32))
-        .astype(jnp.uint8)
-        .reshape(encoded.shape[0], -1, _NIBBLES_PER_BYTE)
+    Concatenating nibble planes instead of interleaving pairs avoids a trailing
+    dim of size 2 that TPU pads out to 128 lanes.
+    """
+    bits = jax.lax.bitcast_convert_type(values, _uint_dtype(values.dtype))
+    flat = bits.reshape(values.shape[0], -1)
+    return jnp.concatenate(
+        [
+            ((flat >> (_NIBBLE_BITS * k)) & 0xF).astype(dtype)
+            for k in range(_nibbles_per_elem(values.dtype))
+        ],
+        axis=-1,
     )
-    return (pairs[..., 0] << 4) | pairs[..., 1]
+
+
+def _decode_nibbles(
+    encoded: jax.Array, dtype: jnp.dtype, item_shape: tuple[int, ...]
+) -> jax.Array:
+    uint_dtype = _uint_dtype(dtype)
+    parts = jnp.split(encoded, _nibbles_per_elem(dtype), axis=-1)
+    acc = jnp.zeros(parts[0].shape, dtype=uint_dtype)
+    for k, part in enumerate(parts):
+        nibble = jnp.round(part.astype(jnp.float32)).astype(uint_dtype)
+        acc = acc | (nibble << (_NIBBLE_BITS * k))
+    return jax.lax.bitcast_convert_type(
+        acc.reshape(encoded.shape[0], *item_shape), dtype
+    )
 
 
 def _state_elems(
@@ -283,11 +297,9 @@ def _state_elems(
     context_len: int,
 ) -> tuple[int, int]:
     window_count = math.prod(window_shape)
-    context_elems = context_len * jnp.dtype(jnp.int32).itemsize * _NIBBLES_PER_BYTE
+    context_elems = context_len * _nibbles_per_elem(jnp.int32)
     if _store_window_directly(pool_dtype, window_dtype):
         window_elems = window_count
     else:
-        window_elems = (
-            window_count * jnp.dtype(window_dtype).itemsize * _NIBBLES_PER_BYTE
-        )
+        window_elems = window_count * _nibbles_per_elem(window_dtype)
     return window_elems, window_elems + context_elems
