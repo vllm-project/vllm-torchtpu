@@ -320,9 +320,9 @@ def test_cli_json_presets_and_validation_errors(
     assert payload["recommended_scope"] == "whole_step"
     assert payload["recommended_moe_mode"] == "masked_on_chip"
     assert payload["build_megakernel"] is True
-    assert payload["vmem_budget_mib"] == resolve_chip_spec(
-        "tpu7x"
-    ).vmem_usable_bytes / (1024 * 1024)
+    assert payload["vmem_budget_mib"] == advisor.fit_vmem_budget_bytes(
+        chip_spec=resolve_chip_spec("tpu7x")
+    ) / (1024 * 1024)
     html_out = tmp_path / "regimes.html"
     assert (
         advisor.main(
@@ -342,7 +342,7 @@ def test_cli_json_presets_and_validation_errors(
     )
     sweep_stdout = capsys.readouterr().out
     assert "Decode Parallelism: TP8 x EP8 x DCP4" in sweep_stdout
-    assert "usable=60.0 MiB" in sweep_stdout
+    assert "limit=62.0 MiB, fit=60.0 MiB" in sweep_stdout
     assert html_out.is_file()
 
     assert (
@@ -1042,7 +1042,7 @@ def test_fit_vmem_budget_bytes_across_chip_specs() -> None:
     v6e = advisor.resolve_chip_spec("tpu6e")
     rp = advisor.default_double_buffer_ring_plan()
 
-    expected_v7x = max(0, (62 << 20) - rp.compiler_spill_reserve_bytes)
+    expected_v7x = max(0, (56 << 20) - rp.compiler_spill_reserve_bytes)
     assert advisor.fit_vmem_budget_bytes(chip_spec=v7x) == expected_v7x
 
     expected_v6e = max(0, (126 << 20) - rp.compiler_spill_reserve_bytes)
@@ -1124,8 +1124,10 @@ def test_custom_chip_spec_vmem_usable_bytes_preserved(tmp_path: Path) -> None:
 
 
 def test_vmem_budget_no_double_spill_subtraction() -> None:
-    """Verify fit_vmem_budget_bytes and vmem_fit_headroom keep 62.0 MiB usable VMEM."""
-    expected_bytes = constants.CORE_LIMITS.vmem_mib << 20
+    """Verify fit_vmem_budget_bytes and vmem_fit_headroom keep 56.0 MiB fit VMEM."""
+    expected_bytes = (
+        constants.CORE_LIMITS.vmem_mib - constants.CORE_LIMITS.fit_vmem_headroom_mib
+    ) << 20
     assert advisor.fit_vmem_budget_bytes() == expected_bytes
     assert advisor.fit_vmem_budget_bytes(Tiles(vmem_mib=62)) == expected_bytes
     rep_fit = advisor.advise(
@@ -1138,9 +1140,7 @@ def test_vmem_budget_no_double_spill_subtraction() -> None:
         advisor.WorkloadSpec(phase="decode", batch=64, tp=8, vmem_fit_headroom=False),
         "tpu7x",
     )
-    assert rep_fit.vmem_budget_mib == resolve_chip_spec("tpu7x").vmem_usable_bytes / (
-        1024 * 1024
-    )
+    assert rep_fit.vmem_budget_mib == expected_bytes / (1024 * 1024)
     assert rep_fit.vmem_budget_mib == rep_std.vmem_budget_mib
 
 
@@ -1159,7 +1159,7 @@ def test_adaptive_ring_contraction_single_pass_wide_batch() -> None:
 
     rep_wide = advisor.advise(
         "qwen3.5-397b",
-        advisor.WorkloadSpec(phase="decode", batch=448, tp=8, ep=8),
+        advisor.WorkloadSpec(phase="decode", batch=397, tp=8, ep=8),
         "tpu7x",
     )
     ws_wide = next(s for s in rep_wide.scopes if s.scope == "whole_step")
@@ -1414,7 +1414,7 @@ def test_regime_entry_uses_recommended_scope_not_hypothetical() -> None:
     assert dec_small.hypothetical_best["step_bound_us"] == whole_sc["step_bound_us"]
 
     q_sweep = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
-    expected_q35_rows = 448
+    expected_q35_rows = 397
     assert q_sweep.max_vmem_tokens == expected_q35_rows
 
 

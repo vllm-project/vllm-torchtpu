@@ -366,6 +366,11 @@ def format_regime_table(
         lines.append(
             "WARNING: Config has no quantization_config block; using default dtype."
         )
+    vmem_limit_mib = (
+        sweep.chip_spec.vmem_usable_bytes / (1 << 20)
+        if sweep.chip_spec is not None
+        else sweep.vmem_budget_mib
+    )
     lines.extend(
         [
             (
@@ -380,7 +385,8 @@ def format_regime_table(
                 f"max_vmem_tokens = {sweep.max_vmem_tokens} tokens, "
                 "an upper bound capped by any declared single-call limit, "
                 "not a served limit on its own "
-                f"(usable={sweep.vmem_budget_mib:.1f} MiB, "
+                f"(limit={vmem_limit_mib:.1f} MiB, "
+                f"fit={sweep.vmem_budget_mib:.1f} MiB, "
                 f"static={sweep.vmem_static_mib:.2f} MiB, "
                 f"slope={per_tok_kib:.1f} KiB/tok "
                 f"[residual={vmem['residual_buffer_bytes'] // 1024}K, "
@@ -480,7 +486,12 @@ def _render_vmem_svg(sweep: AdvisorSweepReport) -> str:
         static_vmem_mib + (residual_per_tok_mib + per_op_per_tok_mib) * tok
         for tok in token_ticks
     )
-    cap_mib = max(sweep.vmem_budget_mib * 1.15, max_total_mib * 1.08)
+    usable_mib = (
+        sweep.chip_spec.vmem_usable_bytes / (1 << 20)
+        if sweep.chip_spec is not None
+        else sweep.vmem_budget_mib
+    )
+    cap_mib = max(usable_mib * 1.15, sweep.vmem_budget_mib * 1.15, max_total_mib * 1.08)
     bar_w = pw / (len(token_ticks) * 1.8)
     parts = [
         (
@@ -493,21 +504,37 @@ def _render_vmem_svg(sweep: AdvisorSweepReport) -> str:
             'stroke="var(--chart-grid, #2D3150)" rx="6"/>'
         ),
     ]
+    if usable_mib > sweep.vmem_budget_mib:
+        y_usable = pad_t + ph - min(1.0, usable_mib / cap_mib) * ph
+        parts.append(
+            f'<line x1="{pad_l}" y1="{y_usable:.1f}" x2="{pad_l + pw}" '
+            f'y2="{y_usable:.1f}" stroke="#94A3B8" stroke-width="1.5" '
+            'stroke-dasharray="4,4"/>'
+        )
     y_cap = pad_t + ph - min(1.0, sweep.vmem_budget_mib / cap_mib) * ph
     parts.append(
         f'<line x1="{pad_l}" y1="{y_cap:.1f}" x2="{pad_l + pw}" y2="{y_cap:.1f}" '
         'stroke="#EF4444" stroke-width="2.5" stroke-dasharray="8,5"/>'
     )
+    headroom_eps_mib = 1e-6
+    has_headroom = abs(usable_mib - sweep.vmem_budget_mib) > headroom_eps_mib
     lbl_text = (
-        f"Usable VMEM Ceiling: {sweep.vmem_budget_mib:.1f} MiB "
-        f"(T_max={sweep.max_vmem_tokens} tokens)"
+        f"Usable VMEM Ceiling: {usable_mib:.1f} MiB | "
+        f"Fit: {sweep.vmem_budget_mib:.1f} MiB (T_max={sweep.max_vmem_tokens})"
+        if has_headroom
+        else (
+            f"Usable VMEM Ceiling: {sweep.vmem_budget_mib:.1f} MiB "
+            f"(T_max={sweep.max_vmem_tokens} tokens)"
+        )
     )
+    box_w = 376 if has_headroom else 296
+    box_x = pad_l + pw - box_w - 4
     parts.append(
-        f'<rect x="{pad_l + pw - 300}" y="{pad_t - 26}" width="296" height="22" '
+        f'<rect x="{box_x}" y="{pad_t - 26}" width="{box_w}" height="22" '
         'fill="var(--card-inner, #1C1E32)" stroke="#EF4444" stroke-width="1.5" rx="4"/>'
     )
     parts.append(
-        f'<text x="{pad_l + pw - 152}" y="{pad_t - 11}" text-anchor="middle" '
+        f'<text x="{box_x + box_w // 2}" y="{pad_t - 11}" text-anchor="middle" '
         f'font-size="11" font-weight="700" fill="#FCA5A5">{lbl_text}</text>'
     )
 
@@ -1239,6 +1266,10 @@ def _render_facts_ledger_card(sweep: AdvisorSweepReport) -> str:
     ici_bw_gb = chip_spec.ici_egress_bw_bytes_per_s / 1e9
     ici_link_gb = chip_spec.ici_link_bw_bytes_per_s / 1e9
     hbm_cap_gb = rec.hbm_capacity_gb
+    vmem_usable_mib = chip_spec.vmem_usable_bytes / (1 << 20)
+    fit_headroom_src = chip_sources.get(
+        "vmem_fit_headroom_bytes", "DERIVED: usable VMEM minus fit headroom"
+    )
 
     num_layers = model_prof.num_layers
     hidden_size = model_prof.hidden_size
@@ -1294,10 +1325,19 @@ def _render_facts_ledger_card(sweep: AdvisorSweepReport) -> str:
         <table class="facts-table">
           <tr>
             <td>Usable VMEM / Core</td>
+            <td><strong>{vmem_usable_mib:.1f} MiB</strong></td>
+            <td>
+              <span class="fact-src">
+                {_esc(chip_sources.get("vmem_usable_bytes", "Hardware Spec"))}
+              </span>
+            </td>
+          </tr>
+          <tr>
+            <td>VMEM Fit Budget / Core</td>
             <td><strong>{sweep.vmem_budget_mib:.1f} MiB</strong></td>
             <td>
               <span class="fact-src">
-                {_esc(chip_sources.get("vmem_capacity_bytes", "Hardware Spec"))}
+                {_esc(fit_headroom_src)}
               </span>
             </td>
           </tr>
