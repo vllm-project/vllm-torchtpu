@@ -564,7 +564,10 @@ def build_qwen35_hf_weights(
     g = torch.Generator().manual_seed(seed)
     key_d, val_d = num_k_heads * d_k, num_v_heads * d_v
     conv_d = 2 * key_d + val_d
-    r = lambda *s, dt=torch.bfloat16: torch.randn(s, generator=g, dtype=dt)  # noqa: E731
+
+    def r(*s: int, dt: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        return torch.randn(s, generator=g, dtype=dt)
+
     w: dict[str, torch.Tensor] = {
         "model.embed_tokens.weight": r(vocab_size, hidden_size),
         "model.norm.weight": r(hidden_size),

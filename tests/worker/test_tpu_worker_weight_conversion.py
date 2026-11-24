@@ -26,7 +26,7 @@ import pytest
 import torch
 from torch import nn
 
-from tests.rl._fakes import Qwen2ForCausalLM, build_qwen2_hf_weights
+from tests.rl._fakes import Qwen2ForCausalLM
 from vllm_torchtpu.rl.weight_conversion import SCHEMA_VERSION, validate_manifest
 from vllm_torchtpu.rl.weight_installer import (
     ShardingCoords,
