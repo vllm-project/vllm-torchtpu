@@ -6389,6 +6389,7 @@ class TPUModelRunner(GPUModelRunner):
                 "_forward_draft",
                 "_run_mtp_fused_loop",
                 "_draft_rows_carry_and_token",
+                "_run_mk_step0_loop_program",
             ):
                 out.append((drafter, name, "x_dp" + name))
         return out
@@ -10701,6 +10702,22 @@ class TPUModelRunner(GPUModelRunner):
             if stack_bucket is not None and envs.VLLM_TPU_SPEC_TAIL_DENSE_STEP0
             else []
         )
+        # VLLM_TPU_MK_DRAFT_STEP0_LOOP_PROGRAM: that program's K tokens are all
+        # [capacity] long (its loop runs at the request capacity), not [p].
+        step0_loop_caps = (
+            sorted(
+                {
+                    int(c)
+                    for c in (
+                        getattr(self, "num_reqs_max_model_len", None),
+                        getattr(self, "num_reqs_most_model_len", None),
+                    )
+                    if c
+                }
+            )
+            if stack_bucket is not None and envs.VLLM_TPU_MK_DRAFT_STEP0_LOOP_PROGRAM
+            else []
+        )
         with self._precompile_timed("async-spec substitution tail"):
             for num_reqs in range(1, self.max_num_reqs + 1):
                 rows = _get_padded_num_reqs_with_upper_limit(
@@ -10748,6 +10765,29 @@ class TPUModelRunner(GPUModelRunner):
                             next_tokens, draft_lengths, num_reqs, steps
                         )
                     )
+                    for cap in step0_loop_caps:
+                        if cap <= steps[0].shape[0]:
+                            continue  # the [p] key above already
+                        cap_steps = [
+                            torch.zeros(cap, dtype=torch.int32).to(self.device)
+                            for _ in range(k)
+                        ]
+                        synchronize_tensors(
+                            _spec_tail_stack_compiled(
+                                next_tokens,
+                                draft_lengths,
+                                num_reqs,
+                                num_reqs,
+                                bound,
+                                num_reqs,
+                                *cap_steps,
+                            )
+                        )
+                        self._spec_tail_stack_keys.add(
+                            _spec_tail_stack_key(
+                                next_tokens, draft_lengths, num_reqs, cap_steps
+                            )
+                        )
                     for cap in dense_step0_caps:
                         if cap < steps[0].shape[0]:
                             continue
