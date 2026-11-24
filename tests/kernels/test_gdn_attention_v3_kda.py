@@ -1767,6 +1767,7 @@ class KdaTilingAndValidationTest(parameterized.TestCase):
             wrapper.fused_conv1d_gdn(**kwargs)
 
 
+@pytest.mark.tpu_test
 class KdaCustomOpWideValueHeadTest(parameterized.TestCase):
     """The fused KDA custom op, not just the kernel, with d_v != d_k and a
     beta scale: the relaxed ABI check, the `head_v_dim` output reshape, the
