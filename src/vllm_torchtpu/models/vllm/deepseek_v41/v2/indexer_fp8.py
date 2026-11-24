@@ -768,7 +768,10 @@ def _select_fp8_indexer_jax(
     if tile_consume is not None:
         output = (output, None)
     pipeline = (
-        indexer.pipeline_score_topk_bounded
+        functools.partial(
+            indexer.pipeline_score_topk_bounded,
+            scheduling_groups=tile_consume is None,
+        )
         if bounded
         else indexer.pipeline_score_topk_unrolled
     )
@@ -825,8 +828,8 @@ def select_fp8_indexer_jax(
     ranges, with ``state`` None at the first call; it returns the new state
     and ``following``. Prefill tiles feed it as their selection completes,
     so its work overlaps the scoring and selection of later tiles.
-    ``following`` is the next tile's scoring input (None if no tile
-    follows): what the consumer gates it on is issued before that scoring.
+    ``following`` is the input of the pipeline's next step (None at the
+    end): what the consumer gates it on is issued before that step.
     """
     arguments = (
         q,

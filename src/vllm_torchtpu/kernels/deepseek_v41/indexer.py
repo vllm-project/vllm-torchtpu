@@ -55,16 +55,21 @@ def pipeline_score_topk_bounded(
     select: Callable[[jax.Array, jax.Array, int | None], Any],
     write: Callable[[int, Any, Any, Any], tuple[Any, Any]],
     output: Any,
+    *,
+    scheduling_groups: bool = True,
 ) -> Any:
     """Bound score lifetime and pair next-tile scoring with current selection.
 
     Callbacks accept an optional scheduling group after their data arguments.
-    Each pair gets a program-unique group so the compiler keeps TensorCore
-    scoring between SparseCore selection start and completion.
+    With ``scheduling_groups``, each pair gets a program-unique group so the
+    compiler keeps TensorCore scoring between SparseCore selection start and
+    completion. A group admits no other work into that window, so a writer
+    that starts SparseCore work of its own runs without groups.
     ``write(tile, selected, output, following)`` returns ``(output,
-    following)``: ``following`` is the next tile's prepared scoring input
-    (None if none follows), and work the writer gates it on is issued before
-    that scoring. Up to ``MAX_UNROLLED_TILES``, ``tile`` is a Python int.
+    following)``: ``following`` is the input of the pipeline's next step,
+    the next tile's prepared scoring or the last tile's scores (None at the
+    end), and work the writer gates it on is issued before that step. Up to
+    ``MAX_UNROLLED_TILES``, ``tile`` is a Python int.
     """
     if num_tiles < 1:
         raise ValueError("The score/top-k pipeline requires at least one tile")
@@ -79,7 +84,9 @@ def pipeline_score_topk_bounded(
         )
 
     group_base = (
-        config.reserve_scheduling_group_ids(num_tiles - 1) if num_tiles > 1 else 0
+        config.reserve_scheduling_group_ids(num_tiles - 1)
+        if num_tiles > 1 and scheduling_groups
+        else None
     )
     # Gate current scores and next preparation on the previous selection
     # so unrolling does not extend every score buffer's lifetime.
@@ -96,7 +103,7 @@ def pipeline_score_topk_bounded(
                     (previous, current, prepared, output)
                 )
                 output, prepared = write(tile - 1, previous, output, prepared)
-            group = group_base + tile
+            group = None if group_base is None else group_base + tile
             following = score(prepared, group)
             previous = select(jnp.int32(tile), current, group)
             current = following
@@ -104,7 +111,7 @@ def pipeline_score_topk_bounded(
             previous, current, output = lax.optimization_barrier(
                 (previous, current, output)
             )
-            output, _ = write(num_tiles - 2, previous, output, None)
+            output, current = write(num_tiles - 2, previous, output, current)
         last = num_tiles - 1
         selected = select(jnp.int32(last), current, None)
         return write(last, selected, output, None)[0]
