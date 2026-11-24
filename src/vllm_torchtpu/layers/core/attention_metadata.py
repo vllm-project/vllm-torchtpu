@@ -865,18 +865,32 @@ def stage_block_table_uploads(
     # was mutated since the last staged walk and the walk's geometry is the
     # same, the previous upload is still exact: skip re-packing (a zero fill
     # plus one sliced copy per group, 59 groups for Qwen4Exp) and the H2D.
-    table_geom: list[tuple[int, int, int]] = []
-    offset = 0
-    for _, _, target_num_blocks in entries:
-        table_geom.append((offset, num_reqs_padded, target_num_blocks))
-        offset += num_reqs_padded * target_num_blocks
-    stage_key = (
-        _BLOCK_TABLE_VERSION[0],
-        tuple(id(bt) for _, bt, _ in entries),
-        ctx.start_index,
-        ctx.num_reqs,
-        tuple(table_geom),
+    # VLLM_TPU_STEADY_METADATA_REUSE: the geometry and stage key follow from
+    # the (cached) entries list, the padded width, the table versions and the
+    # chunk; while none of those changed, keep the previous step's.
+    geom_key = (num_reqs_padded, _BLOCK_TABLE_VERSION[0], ctx.start_index, ctx.num_reqs)
+    memo = (
+        runner.__dict__.get("_stage_geom_memo")
+        if envs.VLLM_TPU_STEADY_METADATA_REUSE
+        else None
     )
+    if memo is not None and memo[0] is entries and memo[1] == geom_key:
+        table_geom, stage_key = memo[2], memo[3]
+    else:
+        table_geom = []
+        offset = 0
+        for _, _, target_num_blocks in entries:
+            table_geom.append((offset, num_reqs_padded, target_num_blocks))
+            offset += num_reqs_padded * target_num_blocks
+        stage_key = (
+            _BLOCK_TABLE_VERSION[0],
+            tuple(id(bt) for _, bt, _ in entries),
+            ctx.start_index,
+            ctx.num_reqs,
+            tuple(table_geom),
+        )
+        if envs.VLLM_TPU_STEADY_METADATA_REUSE:
+            runner._stage_geom_memo = (entries, geom_key, table_geom, stage_key)
     prev = runner.__dict__.get("_block_table_stage_prev")
     reused_key = None
     if (
@@ -1057,13 +1071,39 @@ def _issue_walk_products(
     # (ctx.mamba_state_indices) wins, otherwise the unified layout derives
     # per-group indices — which is what this precompute batches.
     unified_mamba = ctx.mamba_state_indices is None and runner._unified_kv_layout
-    mamba_geom: list[tuple[int, int, int]] = []
-    mamba_entry_indices: list[int] = []
-    if unified_mamba:
-        for i, builder in enumerate(entry_builders):
-            if builder.is_mamba_group:
-                mamba_geom.append((i, table_geom[i][2], builder.target_block_size))
-                mamba_entry_indices.append(i)
+    # VLLM_TPU_STEADY_METADATA_REUSE: kept while the builders and the memoized
+    # table geometry (`stage_block_table_uploads`) are the same objects.
+    memo = (
+        runner.__dict__.get("_walk_geom_memo")
+        if envs.VLLM_TPU_STEADY_METADATA_REUSE
+        else None
+    )
+    if (
+        memo is not None
+        and memo[0] is entry_builders
+        and memo[1] is table_geom
+        and memo[2] == unified_mamba
+    ):
+        mamba_geom, mamba_entry_indices, table_geom_t, mamba_geom_t = memo[3:]
+    else:
+        mamba_geom = []
+        mamba_entry_indices = []
+        if unified_mamba:
+            for i, builder in enumerate(entry_builders):
+                if builder.is_mamba_group:
+                    mamba_geom.append((i, table_geom[i][2], builder.target_block_size))
+                    mamba_entry_indices.append(i)
+        table_geom_t, mamba_geom_t = tuple(table_geom), tuple(mamba_geom)
+        if envs.VLLM_TPU_STEADY_METADATA_REUSE:
+            runner._walk_geom_memo = (
+                entry_builders,
+                table_geom,
+                unified_mamba,
+                mamba_geom,
+                mamba_entry_indices,
+                table_geom_t,
+                mamba_geom_t,
+            )
 
     if len(entries) == 1 and not mamba_geom:
         # Exactly one group with no mamba derivation: the flat upload is
@@ -1082,8 +1122,8 @@ def _issue_walk_products(
     args = (
         staged_dev,
         ctx.seq_lens,
-        tuple(table_geom),
-        tuple(mamba_geom),
+        table_geom_t,
+        mamba_geom_t,
         ctx.mamba_ckpt_window,
     )
     # The upload was reused outright, so the previous walk's table outputs
@@ -1103,8 +1143,8 @@ def _issue_walk_products(
     steady_prev = None
     if steady_bounds is not None and mamba_geom:
         steady_geom = (
-            tuple(table_geom),
-            tuple(mamba_geom),
+            table_geom_t,
+            mamba_geom_t,
             ctx.mamba_ckpt_window,
             stacked,
             bool(envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER),

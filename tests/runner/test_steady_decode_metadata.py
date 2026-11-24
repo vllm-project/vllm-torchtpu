@@ -110,13 +110,16 @@ def _run_equivalence(seed, num_reqs, extra, fast_token_substitution):
 @pytest.mark.parametrize("num_reqs", [1, 4])
 def test_metadata_reuse_matches_full_rebuild(num_reqs):
     """VLLM_TPU_STEADY_METADATA_REUSE: a step that hands back the previous
-    step's metadata objects (positions and seq_lens set in place) equals the
-    flag-off rebuild field for field, unified mamba indices included, and
-    every step a walk was skipped on reused them."""
+    step's metadata objects (positions and seq_lens set in place) and the
+    memoized walk geometry equals the flag-off rebuild field for field,
+    unified mamba indices included, and the reuse ran."""
     wl = Workload(5, num_reqs, max_model_len=8192, churn=0.06, prefill=0.04)
     full = make_runner(max_model_len=8192)
     inc = make_runner(max_model_len=8192)
-    extra = {"VLLM_TPU_STEADY_METADATA_REUSE": "1"}
+    # The cached combined distribution upload (and its views) is what keeps
+    # the request distributions the same objects step to step.
+    full._fast_token_substitution = inc._fast_token_substitution = True
+    reuse_flags = {**HOST_FLAGS, "VLLM_TPU_STEADY_METADATA_REUSE": "1"}
     reuse = inc._steady_metadata_reuse
     hits = []
 
@@ -133,16 +136,31 @@ def test_metadata_reuse_matches_full_rebuild(num_reqs):
         wl.apply(full)
         wl.apply(inc)
         so = wl.scheduler_output()
-        with env(steady=False, extra=extra):
+        with env(steady=False, extra=HOST_FLAGS):
             out_full = run_prepare(full, so, num_decode, num_windowed)
-        with env(steady=True, extra=extra):
+        with env(steady=True, extra=reuse_flags):
             out_inc = run_prepare(inc, so, num_decode, num_windowed)
         _assert_metadata_equal(out_full, out_inc, step)
     cache = inc._steady_decode_cache
     assert sum(hits) > 50, (sum(hits), len(hits))
+    assert "_stage_geom_memo" in inc.__dict__ and "_walk_geom_memo" in inc.__dict__
     # The first steady step after a rebuild re-seeds; every other skip reuses.
     assert len(hits) <= cache.walk_skips
     assert "_steady_metadata" not in full.__dict__
+    assert "_stage_geom_memo" not in full.__dict__
+    # Any other object in a key slot (a later input added to the build but not
+    # to the key would show up here as a stale hit) misses.
+    prev_key = inc._steady_metadata[0]
+    for i in range(len(prev_key) - 1):
+        changed = prev_key[:i] + (object(),) + prev_key[i + 1 :]
+        assert reuse(None, changed) is None, i
+
+
+def test_metadata_reuse_flag_stays_out_of_the_compile_key():
+    from vllm_torchtpu.compilation.tpu_compiler import _TPU_COMPILE_ENV_IGNORED
+
+    assert "VLLM_TPU_STEADY_METADATA_REUSE" in _TPU_COMPILE_ENV_IGNORED
+    assert "VLLM_TPU_HOST_PHASES_CPU" in _TPU_COMPILE_ENV_IGNORED
 
 
 def test_flag_off_is_a_no_op():

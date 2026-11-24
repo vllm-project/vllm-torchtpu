@@ -2626,6 +2626,11 @@ class TPUModelRunner(GPUModelRunner):
             or prev_key[-1] != key[-1]
         ):
             return None
+        logger.info_once(
+            "STEADY_METADATA_REUSE: steady steps keep the previous step's %d "
+            "metadata objects",
+            len(built_objs),
+        )
         positions, seq_lens = self.position_ids, ctx.seq_lens
         for md in built_objs:
             md.input_positions = positions
@@ -4879,11 +4884,19 @@ class TPUModelRunner(GPUModelRunner):
                 ):
                     self._cached_comb_dev = combined.to(self.device, non_blocking=True)
                     self._cached_comb_key = chunk_comb_key
-                combined_device = self._cached_comb_dev
+                    # The same two views every step the upload is reused, so
+                    # VLLM_TPU_STEADY_METADATA_REUSE sees unchanged inputs.
+                    self._cached_comb_views = (
+                        self._cached_comb_dev[0:3],
+                        self._cached_comb_dev[3:6],
+                    )
+                request_distribution, mamba_request_distribution = (
+                    self._cached_comb_views
+                )
             else:
                 combined_device = combined.to(self.device, non_blocking=True)
-            request_distribution = combined_device[0:3]
-            mamba_request_distribution = combined_device[3:6]
+                request_distribution = combined_device[0:3]
+                mamba_request_distribution = combined_device[3:6]
         assert request_distribution is not None
 
         host_phases.mark("prep_host_and_uploads")
