@@ -521,23 +521,6 @@ def _kernel(
         lse_ref[...] = jnp.concatenate(lse_tiles, axis=0)
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "ratio",
-        "kv_heads",
-        "query_block",
-        "kv_tile",
-        "k_scale",
-        "v_scale",
-        "bf16_io",
-        "kv_head_offset",
-        "query_tile",
-        "return_lse",
-        "dcp_world",
-        "dcp_interleave",
-    ),
-)
 def _block_page_table(page_table, nblocks: int, query_block: int):
     """Accept either per-block ``[nblocks, P]`` or per-token ``[tokens, P]`` tables."""
     if page_table.shape[0] == nblocks:
@@ -565,6 +548,23 @@ def _aligned_block_sources(starts, offsets, real, rows, max_tokens, query_block)
     return jnp.clip(source, 0, max(rows - 1, 0)).astype(jnp.int32), filled
 
 
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "ratio",
+        "kv_heads",
+        "query_block",
+        "kv_tile",
+        "k_scale",
+        "v_scale",
+        "bf16_io",
+        "kv_head_offset",
+        "query_tile",
+        "return_lse",
+        "dcp_world",
+        "dcp_interleave",
+    ),
+)
 def block_sparse_gqa_prefill(
     query,
     blocks,
