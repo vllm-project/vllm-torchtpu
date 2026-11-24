@@ -267,13 +267,6 @@ def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
     return mesh_block * g_local + topk_idx % g_local
 
 
-# Local tokens at or above which the activation all-gather is enqueued ahead
-# of the slab scatters. Measured, not chosen: +2.80% at t_local 2048 and
-# -0.01 / -7.81 / -1.92 / -1.94% at 1024 / 256 / 64 / 32, because the scatters
-# lose ~90 us of cover to buy a ~129 us hoist and only the largest shape's
-# plan is long enough to pay for it.
-AGQ_MIN_LOCAL_TOKENS = 1024
-
 # Per-config cache of the shard_map'd MoE callable; a fresh shard_map
 # body would re-trace the whole kernel for every hidden layer.
 _LAYER_SM_CACHE = {}
@@ -302,6 +295,7 @@ def fused_ep_moe_v2(
     rank=None,
     mesh_ep_ranks=None,
     sharded_plan=False,
+    agq_min_local_tokens=1024,
     scoring_fn="softmax",
     score_bias=None,
     hash_topk_ids=None,
@@ -351,6 +345,10 @@ def fused_ep_moe_v2(
     It changes routing-plan construction and, where the slab tables are
     built by run copy (a TensorCore-table chip at prefill sizes), the routing
     payload and how both tables are built; never the core kernel.
+
+    agq_min_local_tokens is the local token count at or above which the
+    activation all-gather is enqueued ahead of the slab scatters. It is a
+    build-time constant.
 
     token_replica_groups lists ordered groups of device-mesh indices whose
     x and gating rows are identical (for example, a TP group). Each member
@@ -481,6 +479,10 @@ def fused_ep_moe_v2(
         row_alignment=U32_SUBLANE_TILE,
     )
     t_local = token_layout.local_rows
+    # agq_min_local_tokens defaults to 1024. Measured, not chosen: +2.80% at
+    # t_local 2048 and -0.01 / -7.81 / -1.92 / -1.94% at 1024 / 256 / 64 / 32,
+    # because the scatters lose ~90 us of cover to buy a ~129 us hoist and
+    # only the largest shape's plan is long enough to pay for it.
     # route pads its outputs to these rows, which the torch op's fake can size
     # without a guard on the token count; compute drops the padding again.
     t_wire = replica_wire_rows(T // ep, len(token_layout.groups[0]), U32_SUBLANE_TILE)
@@ -869,7 +871,7 @@ def fused_ep_moe_v2(
             )
         elif gather_by_sort:
             sort_ids = pairs_g
-            if t_local >= AGQ_MIN_LOCAL_TOKENS:
+            if t_local >= agq_min_local_tokens:
                 sort_ids, q_g = lax.optimization_barrier((sort_ids, q_g))
             token_gather = shard_token_gather_sorted(
                 sort_ids,
@@ -880,7 +882,7 @@ def fused_ep_moe_v2(
                 shard_stride=ragged_stride,
             )
         else:
-            if t_local >= AGQ_MIN_LOCAL_TOKENS:
+            if t_local >= agq_min_local_tokens:
                 slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
             token_gather = shard_token_gather(
                 routing,
@@ -1192,6 +1194,7 @@ def fused_ep_moe_v2(
         scale_by_lookup,
         gather_by_sort,
         tables_by_run_copy,
+        agq_min_local_tokens,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),
