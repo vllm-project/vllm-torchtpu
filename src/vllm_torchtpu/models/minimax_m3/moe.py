@@ -235,12 +235,12 @@ class MiniMaxM3MoE(nn.Module):
         return tuple(pieces)
 
     def forward(
-        self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
-    ) -> torch.Tensor:
+        self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list
+    ) -> torch.Tensor | list[torch.Tensor]:
         """``hidden_states`` may come as e4m3 rows with per-row f32 scales (an
         SP step's e4m3 all-gather), or as a list of such gathered pieces: the
         router and routed experts take them dequantized, a model-side shared
-        expert contracts them as e4m3."""
+        expert contracts them as e4m3, and the output comes per piece."""
         pieces = hidden_states if isinstance(hidden_states, list) else None
         if pieces is not None:
             # Gathered pieces: dequantize and route each as it lands.
@@ -267,7 +267,17 @@ class MiniMaxM3MoE(nn.Module):
         if shared is None:
             return out
         act_fn = self.shared_experts.act_fn
-        return out + _shared_expert(act_fn, hidden_states if e4m3 else x, *shared)
+        if pieces is None or len(pieces) == 1:
+            return out + _shared_expert(act_fn, hidden_states if e4m3 else x, *shared)
+        # Per gathered piece, returned as a list: a piece's reduce-scatter
+        # (model.py `_ffn_sp`) then reads only its own rows' producers
+        # (TPU_MOE_TC_COMBINE_PIECES), with no concatenation in between.
+        rows = out.shape[0] // len(pieces)
+        return [
+            out[i * rows : (i + 1) * rows]
+            + _shared_expert(act_fn, p if e4m3 else x[i * rows : (i + 1) * rows], *shared)
+            for i, p in enumerate(pieces)
+        ]
 
 
 def _shared_expert(

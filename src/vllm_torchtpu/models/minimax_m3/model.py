@@ -375,7 +375,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
             contextlib.nullcontext() if halves else token_padding.padding_of_rows(rows)
         ):
             out = ffn(gathered)
-        out_updates = [tensor_model_parallel_reduce_scatter(o, 0) for o in out.chunk(n)]
+        chunks = out if isinstance(out, list) else out.chunk(n)
+        out_updates = [tensor_model_parallel_reduce_scatter(o, 0) for o in chunks]
         return shard, torch.cat(out_updates)
 
     def _norm_gather_pieces(
