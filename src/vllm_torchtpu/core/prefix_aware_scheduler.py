@@ -91,12 +91,23 @@ prompt's first chunk fits and the step pads to no larger size. The chunk limit
 and every request's tokens stay the same; only the order and grouping of
 prompt chunks change.
 
+vLLM's admission counts as cached both the prompt's prefix in HBM and the
+chunks of a KV connector's tier that follow it, which it loads instead of
+computing. The waiting queue counts only the HBM prefix, so a prompt whose
+earlier turns left HBM for the tier ranks as uncached and waits behind every
+shorter prompt, though admission finds most of it cached. With
+TPU_PREFIX_AWARE_RANK_WITH_TIER set, the queue's count (the order of
+admission and which prompts are short) also takes the tier's chunks after the
+HBM prefix, read once per stay in the queue without changing the tier. Only
+the order of admission changes; every request computes the same tokens.
+
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
     VLLM_TPU_FOLLOW_SHARED_PREFIX=1 (optional)
     TPU_PREFIX_AWARE_SHORT_PROMPTS=first or first-short-step (optional)
     TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX=1 (optional)
     TPU_PREFIX_AWARE_SHORTS_TAKE_OLDEST_CHUNK=1 (optional, with short prompts)
+    TPU_PREFIX_AWARE_RANK_WITH_TIER=1 (optional, with an offloading connector)
 """
 
 import enum
@@ -228,6 +239,11 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
                 "TPU_PREFIX_AWARE_SHORT_PROMPTS and "
                 "TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX."
             )
+        if self._tier is not None and self._tier_warmth:
+            raise NotImplementedError(
+                "TPU_PREFIX_AWARE_RANK_WITH_TIER already counts the tier in the "
+                "window's rank; unset TPU_PREFIX_AWARE_TIER_WARMTH."
+            )
         if self.hold_shared_prefix and not self.kv_cache_manager.enable_caching:
             raise NotImplementedError(
                 "TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX needs prefix caching; use "
@@ -238,7 +254,7 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
             "PrefixAwareScheduler ACTIVE (window=%d, tier_warmth=%s, "
             "follow shared prefix: %s, short prompts first: %s; "
             "hold shared prefix: %s; short step: %s; "
-            "short prompts take the oldest long chunk: %s)",
+            "short prompts take the oldest long chunk: %s; rank with tier: %s)",
             self.WINDOW,
             self._tier_warmth,
             "on" if self.follow_shared_prefix else "off",
@@ -250,6 +266,7 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
             if self.short_step_tokens is None
             else f"{self.short_step_tokens} tokens",
             "on" if self.shorts_take_oldest_chunk else "off",
+            "on" if self._tier is not None else "off",
         )
 
     def _short_prompt_limit(self) -> int:
@@ -316,7 +333,7 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
                 self.waiting.prepend_request(request)
         if self.short_prompt_tokens is not None:
             self._note_admitted_prompts(output)
-        elif self.hold_shared_prefix:
+        elif self.hold_shared_prefix or self._tier is not None:
             self._forget_requests_that_left_waiting()
         if self.follow_shared_prefix:
             self._restore_rejoined_places()
@@ -875,7 +892,11 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
                     "PrefixAwareScheduler: warmth scoring failed; falling back to FCFS."
                 )
             return 0, 0
-        tier_tokens = self._tier_tokens(request, hbm_tokens)
+        tier_tokens = (
+            self._tier_tokens(request, hbm_tokens)
+            if self._tier is None
+            else self._tier_prefix_once(request, hbm_tokens) - hbm_tokens
+        )
         return hbm_tokens + tier_tokens, tier_tokens
 
     def _prefix_warmth(self, request: Request) -> int:

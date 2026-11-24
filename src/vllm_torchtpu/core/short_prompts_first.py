@@ -32,8 +32,19 @@ Two schedulers use it:
 
 from collections.abc import Iterable
 
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    OffloadingConnectorScheduler,
+)
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.kv_offload.base import (
+    LookupResult,
+    OffloadKey,
+    ReqContext,
+    make_offload_key,
+)
 from vllm.v1.request import Request, RequestStatus
+
+from vllm_torchtpu import envs
 
 # Statuses of a waiting request the waiting loop can admit as a new prefill.
 ADMITTABLE_STATUSES = (RequestStatus.WAITING, RequestStatus.PREEMPTED)
@@ -80,6 +91,38 @@ class ShortPromptsFirstScheduler(AsyncScheduler):
         super().__init__(*args, **kwargs)
         self._running_prefill_budget: int | None = None
         self._uncached_by_request: dict[str, int] = {}
+        self._tier = (
+            self._connector_tier() if envs.TPU_PREFIX_AWARE_RANK_WITH_TIER else None
+        )
+        self._tier_prefix_by_request: dict[str, int] = {}
+
+    def _connector_tier(self) -> OffloadingConnectorScheduler:
+        """The offloading KV connector's scheduler side: the tier admission
+        reads past a prompt's prefix in HBM. A multi-connector is searched
+        for its one offloading child."""
+        connector = self.connector
+        children = getattr(connector, "_connectors", None) or (connector,)
+        schedulers = (getattr(child, "connector_scheduler", None) for child in children)
+        tiers: list[OffloadingConnectorScheduler] = [
+            scheduler
+            for scheduler in schedulers
+            if isinstance(scheduler, OffloadingConnectorScheduler)
+        ]
+        if len(tiers) != 1:
+            raise NotImplementedError(
+                "TPU_PREFIX_AWARE_RANK_WITH_TIER needs one offloading KV "
+                "connector; set one in --kv-transfer-config or unset it."
+            )
+        (tier,) = tiers
+        if any(
+            group.sliding_window_size_in_chunks is not None
+            for group in tier.config.kv_group_configs
+        ):
+            raise NotImplementedError(
+                "TPU_PREFIX_AWARE_RANK_WITH_TIER reads the tier as one prefix "
+                "and needs full-attention KV cache groups only; unset it."
+            )
+        return tier
 
     def _reserve_prefill_lookahead(
         self,
@@ -122,7 +165,89 @@ class ShortPromptsFirstScheduler(AsyncScheduler):
         return self._uncached_by_request[request.request_id]
 
     def _look_up_uncached(self, request: Request) -> int:
-        return request.num_tokens - self._cached_prefix_tokens(request)
+        return request.num_tokens - self._admission_cached_tokens(request)
+
+    def _admission_cached_tokens(self, request: Request) -> int:
+        """Prompt tokens of a request that has computed none that its
+        admission would find cached: its prefix in HBM and, with
+        TPU_PREFIX_AWARE_RANK_WITH_TIER, the chunks of the connector's tier
+        that follow it."""
+        cached = self._cached_prefix_tokens(request)
+        if self._tier is None or not self.kv_cache_manager.prefix_cache_lookup_enabled(
+            request
+        ):
+            return cached
+        return self._tier_prefix_once(request, cached)
+
+    def _tier_prefix_once(self, request: Request, hbm_tokens: int) -> int:
+        """Where the prefix admission would find cached ends, given the
+        request's HBM prefix now. The tier is read once per stay in the
+        waiting queue; the HBM prefix is read at every call."""
+        request_id = request.request_id
+        if request_id not in self._tier_prefix_by_request:
+            self._tier_prefix_by_request[request_id] = self._tier_prefix_end(
+                request, hbm_tokens
+            )
+        return max(hbm_tokens, self._tier_prefix_by_request[request_id])
+
+    def _tier_prefix_end(self, request: Request, hbm_tokens: int) -> int:
+        """The HBM prefix, extended by the tier's consecutive chunks after it,
+        counted as the connector's lookup counts them: from the chunk that
+        holds the HBM prefix's end, nothing when a fine-hash HBM prefix ends
+        inside a chunk (vllm_torchtpu's chunk-aligned offload loads), at least
+        one whole chunk, and without a flagged drafter group's last chunk.
+
+        The read pins, reorders and stashes nothing, so the connector's state
+        of the request stays as admission will find it.
+        """
+        tier = self._tier
+        assert tier is not None
+        state = tier._req_status.get(request.request_id)
+        if state is None or request.skip_reading_prefix_cache:
+            return hbm_tokens
+        end = request.num_tokens - 1
+        for group in tier.config.kv_group_configs:
+            chunk_tokens = group.tokens_per_chunk
+            hashes = group.hashes_per_chunk
+            if hashes > 1 and hbm_tokens % chunk_tokens:
+                return hbm_tokens
+            first = hbm_tokens // chunk_tokens
+            last = min(end // chunk_tokens, len(request.block_hashes) // hashes)
+            keys = [
+                make_offload_key(
+                    request.block_hashes[(chunk + 1) * hashes - 1], group.group_idx
+                )
+                for chunk in range(first, last)
+            ]
+            chunks = self._count_tier_chunks(tier, keys, state.req_context)
+            if group.is_eagle_group:
+                chunks = max(chunks - 1, 0)
+            end = min(end, (first + chunks) * chunk_tokens)
+            if end - hbm_tokens < chunk_tokens:
+                return hbm_tokens
+        return max(hbm_tokens, end)
+
+    @staticmethod
+    def _count_tier_chunks(
+        tier: OffloadingConnectorScheduler,
+        keys: list[OffloadKey],
+        req_context: ReqContext,
+    ) -> int:
+        """How many of ``keys``, from the first, a load could serve now or
+        soon. The Raiden store answers with one side-effect-free probe;
+        another manager is asked key by key, as admission asks it."""
+        if not keys:
+            return 0
+        probe = getattr(tier.manager, "probe_warm_chunks", None)
+        if probe is not None:
+            return probe(keys)
+        chunks = 0
+        for key in keys:
+            found = tier.manager.lookup(key, req_context)
+            if found not in (LookupResult.HIT, LookupResult.HIT_PENDING):
+                break
+            chunks += 1
+        return chunks
 
     def _cached_prefix_tokens(self, request: Request) -> int:
         """Prompt tokens of a request that has computed none in the prefix
@@ -139,6 +264,8 @@ class ShortPromptsFirstScheduler(AsyncScheduler):
         waiting = {request.request_id for request in self.waiting}
         for request_id in self._uncached_by_request.keys() - waiting:
             del self._uncached_by_request[request_id]
+        for request_id in self._tier_prefix_by_request.keys() - waiting:
+            del self._tier_prefix_by_request[request_id]
 
     def _free_sequence_slots(self) -> int:
         return (
