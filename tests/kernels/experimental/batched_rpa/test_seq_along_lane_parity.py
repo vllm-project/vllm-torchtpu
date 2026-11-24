@@ -363,3 +363,106 @@ def test_prepared_inputs_and_raw_output_match_default(  # noqa: PLR0913 - the ca
         np.testing.assert_array_equal(
             np.asarray(g, np.float32), np.asarray(w, np.float32)
         )
+
+
+@pytest.mark.parametrize("kv_layout", list(configs.KVLayout))
+@pytest.mark.parametrize("head_dim", [80, 128])
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
+def test_skip_kv_update_ignores_garbage_kv_and_preserves_cache(
+    kv_layout, head_dim, dtype
+):
+    """KV-shared calls ignore NaN K/V inputs and leave the target cache untouched."""
+    rng = np.random.default_rng(7)
+    kv_len, q_len = 32, 4
+    num_kv_heads, num_q_heads = 2, 6
+    page_size, total_pages = 128, 8
+    sm_scale = head_dim**-0.5
+    page_indices = jnp.arange(total_pages, dtype=jnp.int32)
+
+    target_k = jnp.asarray(
+        rng.standard_normal((kv_len, num_kv_heads, head_dim)) * 0.5, dtype
+    )
+    target_v = jnp.asarray(
+        rng.standard_normal((kv_len, num_kv_heads, head_dim)) * 0.5, dtype
+    )
+    cache_shape = wrapper.get_kv_cache_shape(
+        total_pages, page_size, num_kv_heads, head_dim, dtype, kv_layout=kv_layout
+    )
+    _, cache = wrapper.ragged_paged_attention(
+        jnp.zeros((kv_len, num_q_heads, head_dim), jnp.bfloat16),
+        target_k,
+        target_v,
+        jnp.zeros(cache_shape, dtype),
+        jnp.array([kv_len], jnp.int32),
+        page_indices,
+        jnp.array([0, kv_len], jnp.int32),
+        jnp.array([0, 0, 1], jnp.int32),
+        sm_scale=sm_scale,
+        kv_layout=kv_layout,
+    )
+    cache_before = np.asarray(cache.astype(jnp.float32)).copy()
+
+    query = jnp.asarray(
+        rng.standard_normal((q_len, num_q_heads, head_dim)) * 0.5, jnp.bfloat16
+    )
+    kv_lens = jnp.array([kv_len], jnp.int32)
+    cu_q_lens = jnp.array([0, q_len], jnp.int32)
+    dist = jnp.array([0, 0, 1], jnp.int32)
+
+    finite_kv = jnp.ones((q_len, num_kv_heads, head_dim), dtype)
+    nan_kv = jnp.full((q_len, num_kv_heads, head_dim), jnp.nan, dtype)
+    common = dict(sm_scale=sm_scale, kv_layout=kv_layout, skip_kv_update=True)
+    out_finite, cache_finite = wrapper.ragged_paged_attention(
+        query,
+        finite_kv,
+        finite_kv,
+        jnp.copy(cache),
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        dist,
+        **common,
+    )
+    out_nan, cache_nan = wrapper.ragged_paged_attention(
+        query,
+        nan_kv,
+        nan_kv,
+        jnp.copy(cache),
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        dist,
+        **common,
+    )
+    prepared = wrapper.prepare_inputs(
+        query,
+        nan_kv,
+        nan_kv,
+        query.dtype,
+        cache.dtype,
+        kv_layout=kv_layout,
+        page_size=page_size,
+        skip_kv_update=True,
+    )
+    out_prep, cache_prep = wrapper.ragged_paged_attention(
+        query,
+        nan_kv,
+        nan_kv,
+        jnp.copy(cache),
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        dist,
+        prepared_inputs=prepared,
+        **common,
+    )
+    assert np.isfinite(np.asarray(out_nan, np.float32)).all()
+    np.testing.assert_array_equal(
+        np.asarray(out_nan, np.float32), np.asarray(out_finite, np.float32)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(out_prep, np.float32), np.asarray(out_finite, np.float32)
+    )
+    np.testing.assert_array_equal(np.asarray(cache_finite, np.float32), cache_before)
+    np.testing.assert_array_equal(np.asarray(cache_nan, np.float32), cache_before)
+    np.testing.assert_array_equal(np.asarray(cache_prep, np.float32), cache_before)

@@ -1560,27 +1560,30 @@ class PallasAttentionBackendImpl(AttentionImpl):
         else:
             q_len, q_compute_dim = query.shape
 
-        if key is None:
+        assert q_compute_dim == self.head_size * self.num_heads
+        query = query.view(q_len, self.num_heads, self.head_size)
+
+        key_is_placeholder = key is None
+        same_kv = False
+        if key_is_placeholder:
             # KV-shared layers get no K/V from vLLM. The kernel runs with
             # skip_kv_update and reads all K/V from the target layer's cache,
             # so zeros only fill the operand slots.
             assert value is None and self.kv_sharing_target_layer_name is not None
-            key = query.new_zeros(q_len, self.num_kv_heads * self.head_size)
-            value = key
-
-        if key.dim() == 3:
-            k_len = key.shape[0]
-            k_compute_dim = key.shape[1] * key.shape[2]
         else:
-            k_len, k_compute_dim = key.shape
-
-        assert q_compute_dim == self.head_size * self.num_heads
-        assert k_compute_dim == self.head_size * self.num_kv_heads
-
-        query = query.view(q_len, self.num_heads, self.head_size)
-        key = key.view(k_len, self.num_kv_heads, self.head_size)
-        value = value.view(k_len, self.num_kv_heads, self.head_size)
-        assert key.shape == value.shape
+            if key.dim() == 3:
+                k_len = key.shape[0]
+                k_compute_dim = key.shape[1] * key.shape[2]
+            else:
+                k_len, k_compute_dim = key.shape
+            assert k_compute_dim == self.head_size * self.num_kv_heads
+            assert value is not None
+            same_kv = value is key
+            key = key.view(k_len, self.num_kv_heads, self.head_size)
+            value = (
+                key if same_kv else value.view(k_len, self.num_kv_heads, self.head_size)
+            )
+            assert key.shape == value.shape
 
         # A layer whose head_size is narrower than the page it writes into —
         # a DFlash draft layer sharing the target's unified pool, whose page
@@ -1614,18 +1617,38 @@ class PallasAttentionBackendImpl(AttentionImpl):
         )
         if pad_size:
             query = torch.nn.functional.pad(query, (0, pad_size))
+        if key_is_placeholder:
+            kv_placeholder_dtype = (
+                self.kv_cache_quantized_dtype
+                if self.kv_cache_quantized_dtype is not None
+                else query.dtype
+            )
+            key = torch.zeros(
+                (q_len, self.num_kv_heads, self.head_size + pad_size),
+                dtype=kv_placeholder_dtype,
+                device=query.device,
+            )
+            value = key
+        elif pad_size:
+            assert key is not None and value is not None
             key = torch.nn.functional.pad(key, (0, pad_size))
-            value = torch.nn.functional.pad(value, (0, pad_size))
+            value = key if same_kv else torch.nn.functional.pad(value, (0, pad_size))
         if self.kv_cache_quantized_dtype:
             k_scale_value = layer._k_scale_float
             v_scale_value = layer._v_scale_float
             if k_scale_value == 0.0 or v_scale_value == 0.0:
                 raise ValueError("k_scale_float and v_scale_float must be non-zero")
-            key, quantized_value = quantize_kv(
-                self.kv_cache_quantized_dtype, key, value, k_scale_value, v_scale_value
-            )
-            assert quantized_value is not None
-            value = quantized_value
+            if not key_is_placeholder:
+                assert key is not None
+                key, quantized_value = quantize_kv(
+                    self.kv_cache_quantized_dtype,
+                    key,
+                    value,
+                    k_scale_value,
+                    v_scale_value,
+                )
+                assert quantized_value is not None
+                value = quantized_value
 
         sink = self.sinks
         ctx = get_vllm_model_wrapper_context()

@@ -32,6 +32,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackendImpl,
     kv_page_head_padding,
 )
+from vllm_torchtpu.layers.core import quantization as quant_mod
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -174,3 +175,123 @@ def test_forward_keeps_hd64_query_on_its_own_page(cpu_vllm_config):
 def test_forward_pads_hd64_query_in_a_hd128_pool(cpu_vllm_config):
     # A head_dim=64 draft layer writing into a head_dim=128 target's pool.
     assert _forward_query_width(64, pool_heads=4, pool_head_size=128) == 128
+
+
+def _make_fp8_impl(head_size: int, kv_sharing_target: str | None = None):
+    return PallasAttentionBackendImpl(
+        num_heads=8,
+        head_size=head_size,
+        scale=1.0,
+        num_kv_heads=8,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8",
+        kv_cache_quantized_dtype=FP8,
+        kv_sharing_target_layer_name=kv_sharing_target,
+    )
+
+
+def _metadata(q_len: int) -> AttentionMetadata:
+    return AttentionMetadata(
+        input_positions=torch.arange(q_len, dtype=torch.int32),
+        block_tables=torch.zeros(1, dtype=torch.int32),
+        seq_lens=torch.tensor([q_len], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, q_len], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+    )
+
+
+@pytest.mark.parametrize("pool_head_size,expected_width", [(64, 64), (128, 128)])
+def test_forward_kv_shared_fp8_skips_quantize_and_validates_scale(
+    cpu_vllm_config, pool_head_size, expected_width
+):
+    q_len = 3
+    impl = _make_fp8_impl(64, kv_sharing_target="model.layers.0.self_attn.attn")
+    kv_cache = torch.zeros(
+        PallasAttentionBackend.get_kv_cache_shape(2, 16, 8, pool_head_size, FP8),
+        dtype=FP8,
+    )
+    query = torch.ones(q_len, 8 * 64, dtype=BF16)
+    seen = {}
+
+    def fake_kernel(_kv_cache, q, k, v, *_args):
+        seen["kv"] = (k, v)
+        return torch.ones_like(q)
+
+    with (
+        patch.object(
+            PallasAttentionBackendImpl, "_build_rpa_kernel", return_value=fake_kernel
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.attention.synchronize_tensors",
+            lambda *_args, **_kwargs: None,
+        ),
+        patch("vllm_torchtpu.layers.adapter.attention.quantize_kv") as quantize_spy,
+        set_vllm_model_wrapper_context(mesh=SimpleNamespace()),
+    ):
+        layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+        out = impl.forward(layer, query, None, None, kv_cache, _metadata(q_len))
+        assert out.shape == query.shape
+        quantize_spy.assert_not_called()
+        k, v = seen["kv"]
+        assert k is v and k.dtype == FP8 and k.shape == (q_len, 8, expected_width)
+
+        for bad_k, bad_v in ((0.0, 1.0), (1.0, 0.0)):
+            bad_layer = SimpleNamespace(_k_scale_float=bad_k, _v_scale_float=bad_v)
+            with pytest.raises(ValueError, match="non-zero"):
+                impl.forward(bad_layer, query, None, None, kv_cache, _metadata(q_len))
+
+
+def test_forward_k_eq_v_fp8_quantizes_once_with_padding(cpu_vllm_config):
+    q_len = 3
+    impl = _make_fp8_impl(64)
+    kv_cache = torch.zeros(
+        PallasAttentionBackend.get_kv_cache_shape(2, 16, 8, 128, FP8), dtype=FP8
+    )
+    query = torch.ones(q_len, 8 * 64, dtype=BF16)
+    kv = torch.full((q_len, 8 * 64), 2.0, dtype=BF16)
+    seen = {}
+
+    def fake_kernel(_kv_cache, q, k, v, *_args):
+        seen["kv"] = (k, v)
+        return torch.ones_like(q)
+
+    with (
+        patch.object(
+            PallasAttentionBackendImpl, "_build_rpa_kernel", return_value=fake_kernel
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.attention.synchronize_tensors",
+            lambda *_args, **_kwargs: None,
+        ),
+        patch.object(
+            quant_mod,
+            "static_per_tensor_quantize_tensor",
+            wraps=quant_mod.static_per_tensor_quantize_tensor,
+        ) as spy,
+        set_vllm_model_wrapper_context(mesh=SimpleNamespace()),
+    ):
+        impl.forward(
+            SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0),
+            query,
+            kv,
+            kv,
+            kv_cache,
+            _metadata(q_len),
+        )
+        assert spy.call_count == 1
+        k, v = seen["kv"]
+        assert k is v and k.dtype == FP8 and k.shape == (q_len, 8, 128)
+
+        spy.reset_mock()
+        impl.forward(
+            SimpleNamespace(_k_scale_float=1.0, _v_scale_float=2.0),
+            query,
+            kv,
+            kv,
+            kv_cache,
+            _metadata(q_len),
+        )
+        assert spy.call_count == 2
+        k2, v2 = seen["kv"]
+        assert k2 is not v2

@@ -16,6 +16,7 @@
 import dataclasses
 from unittest.mock import MagicMock, patch
 
+import jax
 import jax.numpy as jnp
 import pytest
 
@@ -93,7 +94,6 @@ def test_prepared_inputs_rejects_dynamic_scales(scale):
     q = jnp.zeros((8, 2, 128), jnp.bfloat16)
     kv = jnp.zeros((8, 1, 128), jnp.float8_e4m3fn)
     tpu_info = _create_mock_tpu_info(7, chip_version="v7x")
-    tpu_info.num_sublanes = 8
     with patch("jax.experimental.pallas.tpu.get_tpu_info", return_value=tpu_info):
         prepared = wrapper.prepare_inputs(q, kv, kv, q.dtype, kv.dtype)
         cache = jnp.zeros(
@@ -246,3 +246,117 @@ def test_rpa_configs_rejects_unaligned_bkv_sz_both_layouts(kv_layout):
                 jnp.arange(5, dtype=jnp.int32),
                 jnp.array([4, 4, 4], dtype=jnp.int32),
             )
+
+
+@pytest.mark.parametrize(
+    "kv_layout,is_8bit,per_token_scale",
+    [
+        (configs.KVLayout.HEAD_ALONG_SUBLANE, False, False),
+        (configs.KVLayout.HEAD_ALONG_SUBLANE, True, False),
+        (configs.KVLayout.SEQ_ALONG_LANE, False, False),
+        (configs.KVLayout.SEQ_ALONG_LANE, True, False),
+        (configs.KVLayout.SEQ_ALONG_LANE, True, True),
+    ],
+)
+def test_prepare_inputs_stack_matches_concat_and_skip_kv_update_zeros(
+    kv_layout, is_8bit, per_token_scale
+):
+    kv_dtype = jnp.float8_e4m3fn if is_8bit else jnp.bfloat16
+    tokens, q_heads, kv_heads, head_dim = 19, 6, 3, 80
+    q = (
+        jnp.arange(tokens * q_heads * head_dim, dtype=jnp.float32)
+        .reshape(tokens, q_heads, head_dim)
+        .astype(jnp.bfloat16)
+    )
+    k = (
+        jnp.linspace(-3.0, 3.0, tokens * kv_heads * head_dim, dtype=jnp.float32)
+        .reshape(tokens, kv_heads, head_dim)
+        .astype(kv_dtype)
+    )
+    v = (
+        jnp.linspace(5.0, -2.0, tokens * kv_heads * head_dim, dtype=jnp.float32)
+        .reshape(tokens, kv_heads, head_dim)
+        .astype(kv_dtype)
+    )
+    ks = vs = None
+    if per_token_scale:
+        ks = jnp.linspace(0.5, 1.5, tokens * kv_heads, dtype=jnp.bfloat16).reshape(
+            tokens, kv_heads
+        )
+        vs = jnp.linspace(0.25, 2.0, tokens * kv_heads, dtype=jnp.bfloat16).reshape(
+            tokens, kv_heads
+        )
+
+    tpu_info = _create_mock_tpu_info(7, chip_version="v7x")
+    with patch("jax.experimental.pallas.tpu.get_tpu_info", return_value=tpu_info):
+        q_got, kv_got = wrapper.prepare_inputs(
+            q, k, v, q.dtype, kv_dtype, ks, vs, kv_layout=kv_layout, page_size=128
+        )
+        # Reference packing via concatenate([k_eff, v_eff], axis=-1).
+        k_eff, v_eff = k, v
+        eff_dim = head_dim
+        if ks is not None and vs is not None:
+            ch = jax.dtypes.itemsize_bits(ks.dtype) // jax.dtypes.itemsize_bits(
+                kv_dtype
+            )
+            k_eff = jnp.concatenate(
+                [
+                    k,
+                    jax.lax.bitcast_convert_type(ks, kv_dtype).reshape(
+                        tokens, kv_heads, ch
+                    ),
+                ],
+                axis=-1,
+            )
+            v_eff = jnp.concatenate(
+                [
+                    v,
+                    jax.lax.bitcast_convert_type(vs, kv_dtype).reshape(
+                        tokens, kv_heads, ch
+                    ),
+                ],
+                axis=-1,
+            )
+            eff_dim += ch
+        kv_pack = 4 if is_8bit else 2
+        concat_kv = jnp.concatenate([k_eff, v_eff], axis=-1).reshape(
+            tokens, kv_heads * 2, eff_dim
+        )
+        if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            aligned_d = -(-eff_dim // (8 * kv_pack)) * (8 * kv_pack)
+            kv_ref = (
+                jnp.pad(
+                    concat_kv, ((0, 128 - tokens), (0, 0), (0, aligned_d - eff_dim))
+                )
+                .reshape(128, kv_heads * 2, aligned_d // kv_pack, kv_pack)
+                .transpose(1, 2, 3, 0)
+            )
+        else:
+            aligned_h = -(-(kv_heads * 2) // kv_pack) * kv_pack
+            kv_ref = jnp.pad(
+                concat_kv,
+                ((0, 0), (0, aligned_h - kv_heads * 2), (0, 128 - eff_dim)),
+            ).reshape(tokens, aligned_h // kv_pack, kv_pack, 128)
+        assert jnp.array_equal(
+            jax.lax.bitcast_convert_type(kv_got, jnp.uint8),
+            jax.lax.bitcast_convert_type(kv_ref, jnp.uint8),
+        )
+
+        nan_kv = jnp.full_like(k, jnp.nan)
+        nan_ks = None if ks is None else jnp.full_like(ks, jnp.nan)
+        q_skip, kv_skip = wrapper.prepare_inputs(
+            q,
+            nan_kv,
+            nan_kv,
+            q.dtype,
+            kv_dtype,
+            nan_ks,
+            nan_ks,
+            kv_layout=kv_layout,
+            page_size=128,
+            skip_kv_update=True,
+        )
+        assert jnp.array_equal(q_skip, q_got)
+        assert kv_skip.shape == kv_got.shape and kv_skip.dtype == kv_got.dtype
+        assert not jnp.isnan(kv_skip.astype(jnp.float32)).any()
+        assert jnp.all(kv_skip.astype(jnp.float32) == 0.0)
