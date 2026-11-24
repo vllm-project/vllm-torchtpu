@@ -126,6 +126,8 @@ def segment_tiles(
     if envs.VLLM_TPU_MK_MOE_LOCAL_WN:
         moe_cfg["local_wn"] = True
     blocks: dict[str, dict[str, Any]] = {"moe": moe_cfg}
+    if envs.VLLM_TPU_MK_GDN_VEC_REC:
+        blocks["gdn"] = {"vec_rec": True}
     return Tiles(
         ebank=2 << 20,
         nbe=nbe,

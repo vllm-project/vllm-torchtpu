@@ -50,38 +50,99 @@ def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
         xc = jnp.swapaxes(jnp.broadcast_to(x[:, None, :], (kh, VD, KD)), 1, 2)
         return jnp.broadcast_to(xc[:, None], (kh, expand, KD, VD)).reshape(vh, KD, VD)
 
-    for b in range(B):
-        src = b
+    if gp.vec_rec and B >= 8 and B % 8 == 0:
         if VER:
-            s_, t_ = divmod(b, T)
-            urow_ = scr["ub"][s_, t_ : t_ + 1, :]
-            q = urow_[0, : kh * KD].reshape(kh, KD)
-            k = urow_[0, kh * KD : 2 * kh * KD].reshape(kh, KD)
-            v = urow_[0, 2 * kh * KD :].reshape(vh, VD)
-            src = b if t_ == 0 else b - 1
+            u_all = scr["ub"][:, 0:T, :].reshape(B, QKV)
         else:
-            q = u[b, : kh * KD].reshape(kh, KD)
-            k = u[b, kh * KD : 2 * kh * KD].reshape(kh, KD)
-            v = u[b, 2 * kh * KD :].reshape(vh, VD)
-        q = q * lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + l2_eps)
-        q = q * KD**-0.5
-        k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + l2_eps)
-        qc, kc_ = cols(q), cols(k)
-        beta = rnd(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
-        a = ybuf[b, A_OFF : A_OFF + vh]
-        decay = -jnp.exp(alog) * jax.nn.softplus(a + dtb)
-        sb[...] = (
-            recb[src * vh : (src + 1) * vh].astype(F32) * jnp.exp(decay)[:, None, None]
+            u_all = u[0:B, 0:QKV]
+        q_all = u_all[:, : kh * KD].reshape(B * kh, KD)
+        k_all = u_all[:, kh * KD : 2 * kh * KD].reshape(B * kh, KD)
+        q_all = (
+            q_all
+            * lax.rsqrt(jnp.sum(q_all * q_all, axis=-1, keepdims=True) + l2_eps)
+            * (KD**-0.5)
+        ).reshape(B, kh, KD)
+        k_all = (
+            k_all
+            * lax.rsqrt(jnp.sum(k_all * k_all, axis=-1, keepdims=True) + l2_eps)
+        ).reshape(B, kh, KD)
+        v_all = u_all[:, 2 * kh * KD :].reshape(B, vh, VD)
+        yb_ba = ybuf[0:B, BA : BA + gp.BA_PAD]
+        a_rel = A_OFF - BA
+        beta_all = rnd(jax.nn.sigmoid(yb_ba[:, 0:vh]))
+        eg_all = jnp.exp(
+            -jnp.exp(alog[None, :])
+            * jax.nn.softplus(yb_ba[:, a_rel : a_rel + vh] + dtb[None, :])
         )
-        pred = jnp.sum(sb[...] * kc_, axis=1)
-        delta = (v - pred) * beta[:, None]
-        sb[...] = sb[...] + kc_ * delta[:, None, :]
-        out = rnd(jnp.sum(sb[...] * qc, axis=1))
-        recb[b * vh : (b + 1) * vh] = sb[...].astype(REC)
-        val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
-        val = (gnw[None, :] * val.astype(BF16)).astype(F32)
-        zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-        scr["mix"][b, :Z] = rnd(val * gate_act(gp.gate)(zz)).reshape(Z)
+        outs_list = []
+        if VER:
+            for s_ in range(B // T):
+                b0 = s_ * T
+                st_cur = recb[b0 * vh : (b0 + 1) * vh].astype(F32)
+                for t_ in range(T):
+                    b = b0 + t_
+                    qc, kc_ = cols(q_all[b]), cols(k_all[b])
+                    st_cur = st_cur * eg_all[b, :, None, None]
+                    pred = jnp.sum(st_cur * kc_, axis=1)
+                    delta = (v_all[b] - pred) * beta_all[b, :, None]
+                    st_cur = st_cur + kc_ * delta[:, None, :]
+                    outs_list.append(jnp.sum(st_cur * qc, axis=1))
+                    s_rec = st_cur.astype(REC)
+                    recb[b * vh : (b + 1) * vh] = s_rec
+                    st_cur = s_rec.astype(F32)
+        else:
+            for b in range(B):
+                qc, kc_ = cols(q_all[b]), cols(k_all[b])
+                sb[...] = (
+                    recb[b * vh : (b + 1) * vh].astype(F32)
+                    * eg_all[b, :, None, None]
+                )
+                pred = jnp.sum(sb[...] * kc_, axis=1)
+                delta = (v_all[b] - pred) * beta_all[b, :, None]
+                sb[...] = sb[...] + kc_ * delta[:, None, :]
+                outs_list.append(jnp.sum(sb[...] * qc, axis=1))
+                recb[b * vh : (b + 1) * vh] = sb[...].astype(REC)
+        out_all = rnd(jnp.stack(outs_list, axis=0))
+        val = out_all * lax.rsqrt(
+            jnp.mean(out_all * out_all, axis=-1, keepdims=True) + gp.eps
+        )
+        val = (gnw[None, None, :] * val.astype(BF16)).astype(F32)
+        zz = ybuf[0:B, QKV : QKV + Z].reshape(B, vh, VD)
+        scr["mix"][0:B, 0:Z] = rnd(val * gate_act(gp.gate)(zz)).reshape(B, Z)
+    else:
+        for b in range(B):
+            src = b
+            if VER:
+                s_, t_ = divmod(b, T)
+                urow_ = scr["ub"][s_, t_ : t_ + 1, :]
+                q = urow_[0, : kh * KD].reshape(kh, KD)
+                k = urow_[0, kh * KD : 2 * kh * KD].reshape(kh, KD)
+                v = urow_[0, 2 * kh * KD :].reshape(vh, VD)
+                src = b if t_ == 0 else b - 1
+            else:
+                q = u[b, : kh * KD].reshape(kh, KD)
+                k = u[b, kh * KD : 2 * kh * KD].reshape(kh, KD)
+                v = u[b, 2 * kh * KD :].reshape(vh, VD)
+            q = q * lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + l2_eps)
+            q = q * KD**-0.5
+            k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + l2_eps)
+            qc, kc_ = cols(q), cols(k)
+            beta = rnd(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
+            a = ybuf[b, A_OFF : A_OFF + vh]
+            decay = -jnp.exp(alog) * jax.nn.softplus(a + dtb)
+            sb[...] = (
+                recb[src * vh : (src + 1) * vh].astype(F32)
+                * jnp.exp(decay)[:, None, None]
+            )
+            pred = jnp.sum(sb[...] * kc_, axis=1)
+            delta = (v - pred) * beta[:, None]
+            sb[...] = sb[...] + kc_ * delta[:, None, :]
+            out = rnd(jnp.sum(sb[...] * qc, axis=1))
+            recb[b * vh : (b + 1) * vh] = sb[...].astype(REC)
+            val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
+            val = (gnw[None, :] * val.astype(BF16)).astype(F32)
+            zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
+            scr["mix"][b, :Z] = rnd(val * gate_act(gp.gate)(zz)).reshape(Z)
 
 
 def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
@@ -124,6 +185,175 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
         bac = ybuf[pl.ds(r0, n_pad), BA : BA + BA_PAD]
         zc = ybuf[pl.ds(r0, n_pad), QKV : QKV + Z]
         st = recb.at[s]
+        if gp.vec_rec:
+            q_all = uc[:, : kh * KD].reshape(n_pad * kh, KD)
+            k_all = uc[:, kh * KD : 2 * kh * KD].reshape(n_pad * kh, KD)
+            q_all = (
+                q_all
+                * lax.rsqrt(jnp.sum(q_all * q_all, axis=-1, keepdims=True) + l2_eps)
+                * (KD**-0.5)
+            ).reshape(n_pad, kh, KD)
+            k_all = (
+                k_all
+                * lax.rsqrt(jnp.sum(k_all * k_all, axis=-1, keepdims=True) + l2_eps)
+            ).reshape(n_pad, kh, KD)
+            v_all = uc[:, 2 * kh * KD :].reshape(n_pad, vh, VD)
+            beta_all = rnd(jax.nn.sigmoid(bac[:, 0:vh]))
+            eg_all = jnp.exp(
+                -jnp.exp(alog[None, :])
+                * jax.nn.softplus(bac[:, A_REL : A_REL + vh] + dtb[None, :])
+            )
+            if not HEAD_MAJOR:
+                outs_list = []
+                if VER and n % T == 0:
+                    for sq in range(n // T):
+                        b0 = sq * T
+                        src0 = (n - n // T + sq) * vh
+                        st_cur = st[src0 : src0 + vh].astype(F32)
+                        for t in range(T):
+                            bb = b0 + t
+                            h0 = bb * vh
+                            qc, kc_ = cols(q_all[bb]), cols(k_all[bb])
+                            st_cur = st_cur * eg_all[bb, :, None, None]
+                            pred = jnp.sum(st_cur * kc_, axis=1)
+                            delta = (v_all[bb] - pred) * beta_all[bb, :, None]
+                            st_cur = st_cur + kc_ * delta[:, None, :]
+                            outs_list.append(jnp.sum(st_cur * qc, axis=1))
+                            s_rec = st_cur.astype(REC)
+                            st[h0 : h0 + vh] = s_rec
+                            st_cur = s_rec.astype(F32)
+                else:
+                    for bb in range(n):
+                        h0 = bb * vh
+                        src = (
+                            ((n - n // T + bb // T) if bb % T == 0 else bb - 1) * vh
+                            if VER
+                            else h0
+                        )
+                        qc, kc_ = cols(q_all[bb]), cols(k_all[bb])
+                        sb[...] = st[src : src + vh].astype(F32) * eg_all[bb, :, None, None]
+                        pred = jnp.sum(sb[...] * kc_, axis=1)
+                        delta = (v_all[bb] - pred) * beta_all[bb, :, None]
+                        sb[...] = sb[...] + kc_ * delta[:, None, :]
+                        outs_list.append(jnp.sum(sb[...] * qc, axis=1))
+                        st[h0 : h0 + vh] = sb[...].astype(REC)
+                out_all = rnd(jnp.stack(outs_list, axis=0))
+            elif VER and n % T == 0:
+                outs_by_h: list[list[Any]] = [[None] * n for _ in range(vh)]
+                n_k_cache = min(T, vh)
+                n_q_cache = min(T, max(0, vh - n_k_cache))
+                for sq in range(n // T):
+                    b0 = sq * T
+                    src0 = (n - n // T + sq) * vh
+                    for j in range(kh):
+                        if n_k_cache > 0:
+                            sb[0:n_k_cache] = jnp.swapaxes(
+                                jnp.broadcast_to(
+                                    k_all[b0 : b0 + n_k_cache, j][:, None, :],
+                                    (n_k_cache, VD, KD),
+                                ),
+                                1,
+                                2,
+                            )
+                        if n_q_cache > 0:
+                            sb[n_k_cache : n_k_cache + n_q_cache] = jnp.swapaxes(
+                                jnp.broadcast_to(
+                                    q_all[b0 : b0 + n_q_cache, j][:, None, :],
+                                    (n_q_cache, VD, KD),
+                                ),
+                                1,
+                                2,
+                            )
+                        kc_sq = [
+                            sb[t : t + 1]
+                            if t < n_k_cache
+                            else jnp.swapaxes(
+                                jnp.broadcast_to(
+                                    k_all[b0 + t, j][None, None, :], (1, VD, KD)
+                                ),
+                                1,
+                                2,
+                            )
+                            for t in range(T)
+                        ]
+                        qc_sq = [
+                            sb[n_k_cache + t : n_k_cache + t + 1]
+                            if t < n_q_cache
+                            else jnp.swapaxes(
+                                jnp.broadcast_to(
+                                    q_all[b0 + t, j][None, None, :], (1, VD, KD)
+                                ),
+                                1,
+                                2,
+                            )
+                            for t in range(T)
+                        ]
+                        for e in range(expand):
+                            h = j * expand + e
+                            s_h = st[src0 + h : src0 + h + 1].astype(F32)
+                            for t in range(T):
+                                bb = b0 + t
+                                h0 = bb * vh
+                                kc_h = kc_sq[t]
+                                qc_h = qc_sq[t]
+                                s_h = s_h * eg_all[bb : bb + 1, h : h + 1, None]
+                                pred_h = jnp.sum(s_h * kc_h, axis=1)
+                                delta_h = (
+                                    v_all[bb, h : h + 1] - pred_h
+                                ) * beta_all[bb, h : h + 1, None]
+                                s_h = s_h + kc_h * delta_h[:, None, :]
+                                outs_by_h[h][bb] = jnp.sum(s_h * qc_h, axis=1)
+                                s_rec = s_h.astype(REC)
+                                st[h0 + h : h0 + h + 1] = s_rec
+                                s_h = s_rec.astype(F32)
+                out_all = rnd(
+                    jnp.stack(
+                        [jnp.concatenate(outs_by_h[h], axis=0) for h in range(vh)],
+                        axis=1,
+                    )
+                )
+            else:
+                outs_by_h = [[None] * n for _ in range(vh)]
+                for bb in range(n):
+                    h0 = bb * vh
+                    src = (
+                        ((n - n // T + bb // T) if bb % T == 0 else bb - 1) * vh
+                        if VER
+                        else h0
+                    )
+                    cb = (bb % NCB) * 2 * kh
+                    sb[cb : cb + kh] = colsk(k_all[bb])
+                    sb[cb + kh : cb + 2 * kh] = colsk(q_all[bb])
+                    eg = eg_all[bb, :, None, None]
+                    beta2 = beta_all[bb, :, None]
+                    v = v_all[bb]
+                    for h in range(vh):
+                        j = h // expand
+                        kc_h = sb[cb + j : cb + j + 1]
+                        s_h = st[src + h : src + h + 1].astype(F32) * eg[h : h + 1]
+                        pred_h = jnp.sum(s_h * kc_h, axis=1)
+                        delta_h = (v[h : h + 1] - pred_h) * beta2[h : h + 1]
+                        s_h = s_h + kc_h * delta_h[:, None, :]
+                        qc_h = sb[cb + kh + j : cb + kh + j + 1]
+                        outs_by_h[h][bb] = jnp.sum(s_h * qc_h, axis=1)
+                        st[h0 + h : h0 + h + 1] = s_h.astype(REC)
+                out_all = rnd(
+                    jnp.stack(
+                        [jnp.concatenate(outs_by_h[h], axis=0) for h in range(vh)],
+                        axis=1,
+                    )
+                )
+            if n < n_pad:
+                out_all = jnp.pad(out_all, ((0, n_pad - n), (0, 0), (0, 0)))
+            val = out_all * lax.rsqrt(
+                jnp.mean(out_all * out_all, axis=-1, keepdims=True) + gp.eps
+            )
+            val = (gnw[None, None, :] * val.astype(BF16)).astype(F32)
+            zz = zc.reshape(n_pad, vh, VD)
+            scr["mix"][pl.ds(r0, n_pad), 0:Z] = rnd(
+                val * gate_act(gp.gate)(zz)
+            ).reshape(n_pad, Z)
+            return
         row_i = lax.broadcasted_iota(I32, (n_pad, 1), 0)
         blk = jnp.zeros((n_pad, Z), F32)
         for bb in range(n):
