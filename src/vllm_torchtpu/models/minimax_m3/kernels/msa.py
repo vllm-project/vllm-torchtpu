@@ -109,20 +109,33 @@ def write_caches(
     (default: one per token)."""
     num_tokens = pages.shape[0]
     block_size = page_size(targets[0].cache)
-    max_runs = msa_write.max_write_runs(
-        num_tokens,
-        num_tokens if max_num_seqs is None else max_num_seqs,
-        block_size,
+    return msa_write.write_runs(
+        cache_targets(targets),
+        pages,
+        pos % block_size,
+        max_runs=write_runs_bound(num_tokens, max_num_seqs, block_size),
+        interpret=interpret,
     )
-    targets = [
+
+
+def write_runs_bound(num_tokens: int, max_num_seqs: int | None, block_size: int) -> int:
+    """`msa_write.max_write_runs` of `write_caches` (`max_num_seqs` default:
+    one request per token)."""
+    return msa_write.max_write_runs(
+        num_tokens, num_tokens if max_num_seqs is None else max_num_seqs, block_size
+    )
+
+
+def cache_targets(
+    targets: Sequence[msa_write.Rows | msa_write.SlotValues],
+) -> list[msa_write.Rows | msa_write.SlotValues]:
+    """`write_caches`' targets with 8-bit rows saturated to their cache dtype."""
+    return [
         t
         if isinstance(t, msa_write.SlotValues) or msa_fp4.is_fp4(t.cache)
         else t._replace(rows=_cache_rows(t.cache, t.rows))
         for t in targets
     ]
-    return msa_write.write_runs(
-        targets, pages, pos % block_size, max_runs=max_runs, interpret=interpret
-    )
 
 
 def write_rows(
@@ -168,6 +181,30 @@ def write_fp4(
     the index-key scales are folded into the index pages' last word row
     (`msa_fp4.scales_in_page`).
     """
+    kv_cache, index_cache, scale_cache = write_caches(
+        fp4_targets(
+            kv_cache, index_cache, scale_cache, k, v, index_k, interpret=interpret
+        ),
+        pages,
+        pos,
+        max_num_seqs=max_num_seqs,
+        interpret=interpret,
+    )
+    return kv_cache, index_cache, scale_cache
+
+
+def fp4_targets(
+    kv_cache: jax.Array,
+    index_cache: jax.Array,
+    scale_cache: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    index_k: jax.Array,
+    *,
+    interpret: bool = False,
+) -> list[msa_write.Rows | msa_write.SlotValues]:
+    """`write_fp4`'s rotated, quantized write targets: K/V nibbles, index-key
+    nibbles with their folded scales, then the K/V scales."""
     num_tokens, num_heads, _ = k.shape
     if (
         num_heads > 1
@@ -181,18 +218,11 @@ def write_fp4(
         kv_rows = jnp.concatenate([k_nib, v_nib], axis=-1).reshape(num_tokens, -1)
         scales = jnp.stack([k_scale, v_scale], axis=-1).reshape(num_tokens, -1)
     i_nib, i_scale = msa_fp4.quantize(msa_fp4.rotate_keys(index_k))
-    kv_cache, index_cache, scale_cache = write_caches(
-        [
-            msa_write.Rows(kv_cache, kv_rows, 4),
-            msa_write.Rows(index_cache, i_nib, 4, i_scale),
-            msa_write.SlotValues(scale_cache, scales),
-        ],
-        pages,
-        pos,
-        max_num_seqs=max_num_seqs,
-        interpret=interpret,
-    )
-    return kv_cache, index_cache, scale_cache
+    return [
+        msa_write.Rows(kv_cache, kv_rows, 4),
+        msa_write.Rows(index_cache, i_nib, 4, i_scale),
+        msa_write.SlotValues(scale_cache, scales),
+    ]
 
 
 def sparse_attention(

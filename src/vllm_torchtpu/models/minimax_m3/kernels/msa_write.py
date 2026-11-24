@@ -25,7 +25,7 @@ flight.
 """
 
 import functools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
 import jax
@@ -81,22 +81,32 @@ class _ValuesSpec(NamedTuple):
     num_values: int  # lanes [0, num_values) of the lane values
 
 
-def _kernel(
-    # Scalar prefetch
-    num_runs_ref,  # [1]
-    run_page_ref,  # [R] page of each run
-    run_lo_ref,  # [R] first slot of each run within its page
-    run_hi_ref,  # [R] one past the last slot
-    run_tok0_ref,  # [R] first token of each run
-    *refs,
+class RunOps(NamedTuple):
+    """One write's per-run steps (`_run_ops`), each taking a run and the
+    buffer slot it uses, and its merged pages."""
+
+    in_copies: Callable  # the run's batch rows and pages, HBM -> VMEM
+    out_copies: Callable  # the run's merged pages, VMEM -> its caches
+    merge: Callable  # the run's rows merged into its pages
+    out_bufs: list  # [slots, ...page] merged pages, one buffer per cache
+
+
+def _run_ops(
+    run_refs,
+    refs,
+    *,
     specs: tuple,
     page_size: int,
     num_tokens: int,
     has_lanes: bool,
 ):
-    """In (HBM): each `Rows` target's rows ``[T, W]`` as unsigned ints of its
-    slot width (8 bits for 4-bit slots), the lane values ``[T, 128]`` (if
-    any), then the caches; out: the caches, aliased.
+    """`RunOps` of one write over its refs.
+
+    ``run_refs`` are the run tables ``(page, lo, hi, tok0)`` (`token_runs`);
+    ``refs`` the write's operands in order: in (HBM), each `Rows` target's
+    rows ``[T, W]`` as unsigned ints of its slot width (8 bits for 4-bit
+    slots), the lane values ``[T, 128]`` (if any), then the caches; out: the
+    caches, aliased; then the scratch of `_write_operands`.
 
     A run's tokens ``tok0 + i`` take slots ``lo + i`` of its page: slot ``s``
     reads batch row ``tok0 - lo + s``. Each run copies in a window of
@@ -105,6 +115,7 @@ def _kernel(
     ``S`` of a ``[W / 128, 2S + window + 8, 128]`` staging buffer (Mosaic's
     strided loads need 32-bit 128-lane rows), so slot 0's row there is
     ``S + tok0 - lo - start`` >= 1."""
+    run_page_ref, run_lo_ref, run_hi_ref, run_tok0_ref = run_refs
     num_rows = sum(isinstance(s, _RowsSpec) for s in specs)
     it = iter(refs)
     words_hbm = [next(it) for _ in range(num_rows)]
@@ -215,6 +226,24 @@ def _kernel(
                 words = jnp.where(take, bits[:, :width], words)
             out_buf.bitcast(jnp.uint32)[slot, :, 0, :] = words
 
+    return RunOps(in_copies, out_copies, merge, out_bufs)
+
+
+def _kernel(
+    # Scalar prefetch
+    num_runs_ref,  # [1]
+    run_page_ref,  # [R] page of each run
+    run_lo_ref,  # [R] first slot of each run within its page
+    run_hi_ref,  # [R] one past the last slot
+    run_tok0_ref,  # [R] first token of each run
+    *refs,
+    **kwargs,
+):
+    """`write_runs`: each run's page copied in, merged and copied back, with
+    up to `_DEPTH` runs' copies in flight (`_run_ops`)."""
+    in_copies, out_copies, merge, _ = _run_ops(
+        (run_page_ref, run_lo_ref, run_hi_ref, run_tok0_ref), refs, **kwargs
+    )
     num_runs = num_runs_ref[0]
 
     def start(r, slot):
@@ -285,32 +314,28 @@ def _slot_words(target: Rows) -> tuple[jax.Array, _RowsSpec, int]:
     return words, spec, data_rows * 32 // bits
 
 
-def write_runs(
+class WriteOperands(NamedTuple):
+    """A `write_runs` call's operands (`write_operands`)."""
+
+    runs: tuple  # (count, page, lo, hi, tok0) of each run (`token_runs`)
+    inputs: list  # HBM: each `Rows` target's rows, then the lane values if any
+    caches: list  # the targets' caches (aliased to the outputs)
+    scratch: list  # scratch shapes, `depth` buffer slots
+    vmem_bytes: int  # VMEM the scratch takes
+    kwargs: dict  # `_run_ops` keyword arguments
+
+
+def write_operands(
     targets: Sequence[Rows | SlotValues],
     pages: jax.Array,
     slots: jax.Array,
     *,
     max_runs: int,
-    interpret: bool = False,
-) -> list[jax.Array]:
-    """Write token ``t``'s rows / values of every target at ``(pages[t],
-    slots[t])`` of its cache; returns the caches in `targets` order.
-
-    A `Rows` target's data slots past each run's last token are zeroed: the
-    8-bit decode attention (`msa_attention_lse._kernel`) multiplies a page's
-    unseen values by p = 0 unmasked, and its prefill tiles (`DIRECT_T`) feed
-    the keys to the MXU unmasked, so no slot they read may hold NaN bytes.
-    Any other writer of these caches must keep that invariant.
-
-    The caches share the page geometry (same pages, slots per page). Tokens
-    with a page outside the caches are dropped. Consecutive tokens of a run
-    must take consecutive slots of one page, as a request's new tokens do;
-    a run boundary is wherever that breaks, and no two runs may share a page
-    (the kernel copies a run's page in while earlier runs' pages are still
-    being written back; tokens map to pages by whole blocks, so a request's
-    tokens in one page are one run).
-    `max_runs` bounds the number of runs (see `max_write_runs`).
-    """
+    depth: int = _DEPTH,
+) -> WriteOperands:
+    """`write_runs`' operands, with `depth` page buffer slots (arguments as
+    `write_runs`), for its kernel or one that folds the write in
+    (`_run_ops`)."""
     num_tokens = pages.shape[0]
     num_pages = targets[0].cache.shape[0]
     if any(t.cache.shape[0] != num_pages for t in targets):
@@ -363,48 +388,85 @@ def write_runs(
         inputs.append(jnp.pad(lanes, pad))
     caches = [t.cache for t in targets]
     buffer_rows = 2 * page_size + window + 8
-    scratch = [pltpu.VMEM((_DEPTH, window) + w.shape[1:], w.dtype) for w in words]
+    scratch = [pltpu.VMEM((depth, window) + w.shape[1:], w.dtype) for w in words]
     scratch += [
         pltpu.VMEM((w.shape[1] // _LANES, buffer_rows, _LANES), jnp.uint32)
         for w in words
     ]
     if has_lanes:
-        scratch.append(pltpu.VMEM((_DEPTH, buffer_rows, _LANES), jnp.uint32))
-    pages_scratch = [pltpu.VMEM((_DEPTH,) + c.shape[1:], c.dtype) for c in caches]
+        scratch.append(pltpu.VMEM((depth, buffer_rows, _LANES), jnp.uint32))
+    pages_scratch = [pltpu.VMEM((depth,) + c.shape[1:], c.dtype) for c in caches]
     scratch += pages_scratch + pages_scratch
-    scratch += [pltpu.SemaphoreType.DMA((_DEPTH,))] * 2
+    scratch += [pltpu.SemaphoreType.DMA((depth,))] * 2
     vmem_bytes = sum(
-        (_DEPTH * window * w.dtype.itemsize + buffer_rows * 4) * w.shape[1]
+        (depth * window * w.dtype.itemsize + buffer_rows * 4) * w.shape[1]
         for w in words
     )
-    vmem_bytes += _DEPTH * buffer_rows * _LANES * 4 * has_lanes
-    vmem_bytes += 2 * sum(_DEPTH * c[0].size * c.dtype.itemsize for c in caches)
-    any_spec = pl.BlockSpec(memory_space=pl.ANY)
-    first_cache = 5 + len(inputs)
-    return pl.pallas_call(
-        functools.partial(
-            _kernel,
+    vmem_bytes += depth * buffer_rows * _LANES * 4 * has_lanes
+    vmem_bytes += 2 * sum(depth * c[0].size * c.dtype.itemsize for c in caches)
+    return WriteOperands(
+        (num_runs, run_page, run_lo, run_hi, run_tok0),
+        inputs,
+        caches,
+        scratch,
+        vmem_bytes,
+        dict(
             specs=tuple(specs),
             page_size=page_size,
             num_tokens=padded,
             has_lanes=has_lanes,
         ),
+    )
+
+
+def write_runs(
+    targets: Sequence[Rows | SlotValues],
+    pages: jax.Array,
+    slots: jax.Array,
+    *,
+    max_runs: int,
+    interpret: bool = False,
+) -> list[jax.Array]:
+    """Write token ``t``'s rows / values of every target at ``(pages[t],
+    slots[t])`` of its cache; returns the caches in `targets` order.
+
+    A `Rows` target's data slots past each run's last token are zeroed: the
+    8-bit decode attention (`msa_attention_lse._kernel`) multiplies a page's
+    unseen values by p = 0 unmasked, and its prefill tiles (`DIRECT_T`) feed
+    the keys to the MXU unmasked, so no slot they read may hold NaN bytes.
+    Any other writer of these caches must keep that invariant.
+
+    The caches share the page geometry (same pages, slots per page). Tokens
+    with a page outside the caches are dropped. Consecutive tokens of a run
+    must take consecutive slots of one page, as a request's new tokens do;
+    a run boundary is wherever that breaks, and no two runs may share a page
+    (the kernel copies a run's page in while earlier runs' pages are still
+    being written back; tokens map to pages by whole blocks, so a request's
+    tokens in one page are one run).
+    `max_runs` bounds the number of runs (see `max_write_runs`).
+    """
+    ops = write_operands(targets, pages, slots, max_runs=max_runs)
+    num_runs, *run_tables = ops.runs
+    any_spec = pl.BlockSpec(memory_space=pl.ANY)
+    first_cache = 5 + len(ops.inputs)
+    return pl.pallas_call(
+        functools.partial(_kernel, **ops.kwargs),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
             grid=(1,),
-            in_specs=[any_spec] * (len(inputs) + len(caches)),
-            out_specs=[any_spec] * len(caches),
-            scratch_shapes=scratch,
+            in_specs=[any_spec] * (len(ops.inputs) + len(ops.caches)),
+            out_specs=[any_spec] * len(ops.caches),
+            scratch_shapes=ops.scratch,
         ),
-        out_shape=[jax.ShapeDtypeStruct(c.shape, c.dtype) for c in caches],
-        input_output_aliases={first_cache + i: i for i in range(len(caches))},
+        out_shape=[jax.ShapeDtypeStruct(c.shape, c.dtype) for c in ops.caches],
+        input_output_aliases={first_cache + i: i for i in range(len(ops.caches))},
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=max(32 << 20, vmem_bytes + (16 << 20)),
+            vmem_limit_bytes=max(32 << 20, ops.vmem_bytes + (16 << 20)),
         ),
         interpret=interpret,
         name="minimax_m3_msa_write_runs",
-    )(num_runs[None], run_page, run_lo, run_hi, run_tok0, *inputs, *caches)
+    )(num_runs[None], *run_tables, *ops.inputs, *ops.caches)
 
 
 def token_runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int):

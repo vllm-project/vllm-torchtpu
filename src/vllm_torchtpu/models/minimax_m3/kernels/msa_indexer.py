@@ -385,6 +385,8 @@ def _kernel_v3(
     sems,  # DMA semaphores [R], one per ring slot
     *,
     transposed=False,
+    store=None,
+    after_wait=None,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -401,6 +403,10 @@ def _kernel_v3(
 
     A folded 4-bit page (`msa_fp4.scales_in_page`) is ``S / 8`` word rows of
     int4 keys and one row of f32 slot scales (`_chunk_maxima_t`).
+
+    `store(first, m)`, if given, takes each chunk's maxima ``m [Bq, chunk]``
+    (pages ``first + i`` of the group) in place of `o_ref`; `after_wait(slot)`
+    runs once the step's pages are in ring slot `slot`, before they are scored.
     """
     slots, pages_per_step, rows, head_dim = buf.shape
     ahead = slots - 1
@@ -477,6 +483,16 @@ def _kernel_v3(
         jnp.clip(q_pair, -448, 448).astype(jnp.float8_e4m3fn) if fp8_queries else None
     )
     num_chunks = pages_per_step // chunk
+
+    def put(first, m, rows_major):
+        """Store maxima ``m``: ``[Bq, chunk]`` if `rows_major`, else ``[chunk, Bq]``."""
+        if store is not None:
+            store(first, m if rows_major else m.T)
+        elif transposed:
+            o_ref[:, pl.ds(first, chunk)] = m if rows_major else m.T
+        else:
+            o_ref[pl.ds(first, chunk), :] = m.T if rows_major else m
+
     # The ahead group's descriptors, spread over the first chunks' page pairs
     # (in one chunk they crowd its scalar slots: slower, bench j-9956cd34;
     # `_DMA_ISSUE_CHUNKS` says how many).
@@ -507,10 +523,7 @@ def _kernel_v3(
                 dtype=cache_ref.dtype,
                 folded=folded,
             )  # [Bq, chunk]
-            if transposed:
-                o_ref[:, pl.ds(first, chunk)] = m
-            else:
-                o_ref[pl.ds(first, chunk), :] = m.T
+            put(first, m, rows_major=True)
             return
 
         if folded:
@@ -550,10 +563,7 @@ def _kernel_v3(
             m = _chunk_maxima(q_pair_fp8, page_keys, chunk)
         else:
             m = _chunk_maxima(q_pair, page_keys, chunk)
-        if transposed:
-            o_ref[:, pl.ds(first, chunk)] = m.T
-        else:
-            o_ref[pl.ds(first, chunk), :] = m
+        put(first, m, rows_major=False)
 
     share = per_pair * (chunk // 2)
 
@@ -562,6 +572,8 @@ def _kernel_v3(
         request's last page (their scores are never read) and only issue
         their share of the ahead group's descriptors."""
         wait_pages(live, slot)
+        if after_wait is not None:
+            after_wait(slot)
         for c in range(num_chunks):
             pages = range(
                 min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
@@ -638,9 +650,24 @@ class ClassScores(NamedTuple):
     tile_start: jax.Array  # [max_num_seqs] query row of its first tile
 
 
-def _class_scores(
+class ClassWork(NamedTuple):
+    """One tile class's work list (`class_work`): the scalar-prefetch tables
+    `_kernel_v3` reads and where each tile's rows sit."""
+
+    work: jax.Array  # [items] tile << _TILE_SHIFT | page group within the request
+    tile_info: jax.Array  # [tiles] query row << _ROW_SHIFT | request of each tile
+    seq_pages: jax.Array  # [max_num_seqs] pages of each request
+    q_rows: jax.Array  # [T + q_pad, D] f32 query rows the tiles read
+    tile_seq: jax.Array  # [tiles] request of each tile
+    tile_row0: jax.Array  # [tiles] query row of each tile's first column
+    num_tiles: jax.Array  # tiles in use
+    first_tile: jax.Array  # [max_num_seqs] each request's first tile
+    tile_start: jax.Array  # [max_num_seqs] query row of its first tile
+    group_ends: jax.Array  # [tiles] work items up to each tile's last
+
+
+def class_work(
     index_q,
-    index_cache,
     seq_lens,
     block_tables,
     cu_q_lens,
@@ -649,31 +676,15 @@ def _class_scores(
     block_q,
     max_tiles,
     pages_per_step,
-    kernel,
-    interpret,
-    token_major=False,
-    tile_major=False,
-    scale_cache=None,
-    scale_row=None,
+    page_size,
     q_pad=None,
-):
-    """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
-    column of each token (`ClassScores`); `token_major` (kernel v3) returns
-    them as ``[tiles * block_q, P]`` instead, so a token's scores are one row,
-    and `tile_major` (kernel v3) as ``[tiles, P, block_q]``, so a tile's
-    scores are contiguous.
-    The query rows are padded by ``q_pad >= block_q`` rows (default
-    `block_q`): classes sharing it share one padded copy."""
-    num_tokens, _, head_dim = index_q.shape
-    _, rows_per_page, packing, _ = index_cache.shape
-    page_size = _page_tokens(rows_per_page, index_cache.dtype)
-    fp4 = scale_row is not None
-    if fp4 and kernel == "v1":
-        raise NotImplementedError("4-bit index caches need kernel v2 or v3")
+) -> ClassWork:
+    """The tiles of one class and their work list: every page group of every
+    tile's request (arguments as `_class_scores`)."""
+    num_tokens = index_q.shape[0]
     max_num_seqs = seq_lens.shape[0]
     pages_per_seq = block_tables.shape[0] // max_num_seqs
     num_groups_per_seq = -(-pages_per_seq // pages_per_step)
-    padded_pages = num_groups_per_seq * pages_per_step
 
     tile_seq, tile_row0, first_tile, tile_start, num_tiles = _tiles(
         cu_q_lens, seq_in_class, block_q, max_tiles
@@ -716,6 +727,81 @@ def _class_scores(
         jnp.where(in_tile, (group_ends - groups_per_tile)[None, :], 0), axis=1
     )
     work = (work_tile << _TILE_SHIFT) | jnp.clip(work_group, 0, _GROUP_MASK)
+    return ClassWork(
+        work,
+        tile_info,
+        seq_pages,
+        q_rows,
+        tile_seq,
+        tile_row0,
+        num_tiles,
+        first_tile,
+        tile_start,
+        group_ends,
+    )
+
+
+def _class_scores(
+    index_q,
+    index_cache,
+    seq_lens,
+    block_tables,
+    cu_q_lens,
+    seq_in_class,
+    *,
+    block_q,
+    max_tiles,
+    pages_per_step,
+    kernel,
+    interpret,
+    token_major=False,
+    tile_major=False,
+    scale_cache=None,
+    scale_row=None,
+    q_pad=None,
+):
+    """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
+    column of each token (`ClassScores`); `token_major` (kernel v3) returns
+    them as ``[tiles * block_q, P]`` instead, so a token's scores are one row,
+    and `tile_major` (kernel v3) as ``[tiles, P, block_q]``, so a tile's
+    scores are contiguous.
+    The query rows are padded by ``q_pad >= block_q`` rows (default
+    `block_q`): classes sharing it share one padded copy."""
+    num_tokens, _, head_dim = index_q.shape
+    _, rows_per_page, packing, _ = index_cache.shape
+    page_size = _page_tokens(rows_per_page, index_cache.dtype)
+    fp4 = scale_row is not None
+    if fp4 and kernel == "v1":
+        raise NotImplementedError("4-bit index caches need kernel v2 or v3")
+    max_num_seqs = seq_lens.shape[0]
+    pages_per_seq = block_tables.shape[0] // max_num_seqs
+    num_groups_per_seq = -(-pages_per_seq // pages_per_step)
+    padded_pages = num_groups_per_seq * pages_per_step
+
+    tiles = class_work(
+        index_q,
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        seq_in_class,
+        block_q=block_q,
+        max_tiles=max_tiles,
+        pages_per_step=pages_per_step,
+        page_size=page_size,
+        q_pad=q_pad,
+    )
+    (
+        work,
+        tile_info,
+        seq_pages,
+        q_rows,
+        tile_seq,
+        tile_row0,
+        num_tiles,
+        first_tile,
+        tile_start,
+        group_ends,
+    ) = tiles
 
     def page_block(g):
         def index_map(w, work, tile_info, block_tables, *_):

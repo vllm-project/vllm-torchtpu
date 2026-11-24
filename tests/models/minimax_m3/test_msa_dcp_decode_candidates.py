@@ -1,0 +1,182 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""DCP decode candidates in one kernel, and the cache write folded into it
+(interpret mode), against the write + block scores + local top-k path they
+replace, bit for bit."""
+
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from tests.models.minimax_m3.packing import pack, rounded
+from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_dcp, msa_fp4
+
+PAGE = 128
+HEAD_DIM = 128
+TOPK = 16
+MAX_SEQS = 4
+
+
+def _case(q_lens, ctx_lens, pages_per_seq, cache_kind, pad, seed):
+    rng = np.random.default_rng(seed)
+    num_seqs = len(q_lens)
+    num_real = sum(q_lens)
+    num_pages = MAX_SEQS * pages_per_seq + 8
+    seq_lens = np.zeros(MAX_SEQS, np.int32)
+    seq_lens[:num_seqs] = np.array(ctx_lens) + np.array(q_lens)
+    cu_q = np.full(MAX_SEQS + 1, num_real, np.int32)
+    cu_q[: num_seqs + 1] = np.concatenate([[0], np.cumsum(q_lens)])
+    tables = rng.permutation(np.arange(1, num_pages))[: MAX_SEQS * pages_per_seq]
+    raw = rng.standard_normal((num_pages, PAGE, HEAD_DIM))
+    if cache_kind == "fp4":
+        nib, scale = msa_fp4.quantize(jnp.asarray(raw, jnp.float32))
+        cache = msa_fp4.pack_rows(nib, scale)
+    else:
+        cache = pack(rounded(raw, cache_kind), cache_kind)
+    index_q = jnp.asarray(rng.standard_normal((num_real + pad, 1, HEAD_DIM))).astype(
+        jnp.bfloat16
+    )
+    return (
+        index_q,
+        cache,
+        jnp.asarray(seq_lens),
+        jnp.asarray(tables.astype(np.int32)),
+        jnp.asarray(cu_q),
+        jnp.int32(num_seqs),
+        num_real,
+    )
+
+
+@pytest.mark.parametrize("cache_kind", [jnp.float8_e4m3fn, "fp4", jnp.bfloat16])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens,pages_per_seq,init_blocks,pad",
+    [
+        ([8], [7_000], 40, 0, 0),  # one decode request (c4 b1)
+        ([8, 8, 8], [70_000, 40_000, 3], 300, 0, 0),  # 256-page groups, 3 of 4 live
+        ([8, 23, 8], [9_000, 4_000, 300], 40, 1, 5),  # unaligned tile starts
+        ([120, 8], [5_000, 9_000], 40, 0, 0),  # the most rows of one request
+        # bf16 pages score in 64-row tiles: the last runs past the 128 rows.
+        ([56, 64, 8], [5_000, 9_000, 700], 40, 0, 0),
+    ],
+)
+def test_matches_scores_then_picks(
+    q_lens, ctx_lens, pages_per_seq, init_blocks, pad, rank, cache_kind
+):
+    dcp = 2
+    index_q, cache, seq_lens, tables, cu_q, num_seqs, num_real = _case(
+        q_lens, ctx_lens, pages_per_seq, cache_kind, pad, sum(ctx_lens) + rank
+    )
+    num_tokens = index_q.shape[0]
+    seq_id, pos, _ = msa.token_positions(num_tokens, seq_lens, cu_q)
+    local_lens = msa_dcp.local_seq_lens(seq_lens, block_size=PAGE, rank=rank, dcp=dcp)
+    picks = dict(topk=TOPK, init_blocks=init_blocks, local_blocks=1, rank=rank, dcp=dcp)
+
+    got = msa_dcp.decode_candidates(
+        index_q,
+        cache,
+        local_lens,
+        tables,
+        cu_q,
+        num_seqs,
+        seq_id,
+        pos,
+        **picks,
+        interpret=True,
+    )
+    scores = msa._block_scores(index_q, cache, local_lens, tables, cu_q, num_seqs, True)
+    want = msa_dcp.pack_candidates(
+        *msa_dcp.local_candidates(scores, pos, block_size=PAGE, **picks, interpret=True)
+    )
+
+    assert got.shape == want.shape
+    np.testing.assert_array_equal(
+        np.asarray(got)[:num_real], np.asarray(want)[:num_real]
+    )
+
+
+def _write_caches(cache_kind, num_pages, rng):
+    if cache_kind == "fp4":
+        nibbles = rng.integers(0, 16, (num_pages, PAGE, 3 * HEAD_DIM))
+        kv = msa_fp4.pack_rows(jnp.asarray(nibbles[..., : 2 * HEAD_DIM], jnp.uint8))
+        index = msa_fp4.pack_rows(
+            jnp.asarray(nibbles[..., 2 * HEAD_DIM :], jnp.uint8),
+            jnp.asarray(rng.uniform(0.5, 1.5, (num_pages, PAGE)), jnp.float32),
+        )
+        scales = jnp.asarray(
+            rng.uniform(0.5, 1.5, (num_pages, msa_fp4.scale_rows(1), PAGE)),
+            jnp.float32,
+        )
+        return kv, index, scales
+    dtype = jnp.float8_e4m3fn
+    kv = pack(
+        rounded(rng.standard_normal((num_pages, PAGE, 2 * HEAD_DIM)), dtype), dtype
+    )
+    index = pack(
+        rounded(rng.standard_normal((num_pages, PAGE, HEAD_DIM)), dtype), dtype
+    )
+    return kv, index, None
+
+
+@pytest.mark.parametrize("cache_kind", [jnp.float8_e4m3fn, "fp4"])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens",
+    [
+        ([8], [70_000]),  # one decode request, its last of 3 page groups
+        ([8, 8, 8], [3 * 256 + 124, 9_000, 3]),  # one straddles a block boundary
+        ([8, 23, 8], [9_000, 4_000, 300]),  # unaligned tile starts
+    ],
+)
+def test_folded_write_matches_write_then_candidates(
+    q_lens, ctx_lens, rank, cache_kind, monkeypatch
+):
+    dcp, pages_per_seq, pad = 2, 300, 3
+    rng = np.random.default_rng(sum(ctx_lens) + rank)
+    num_seqs = len(q_lens)
+    num_real = sum(q_lens)
+    num_tokens = num_real + pad
+    num_pages = MAX_SEQS * pages_per_seq + 8
+    seq_lens = np.zeros(MAX_SEQS, np.int32)
+    seq_lens[:num_seqs] = np.array(ctx_lens) + np.array(q_lens)
+    cu_q = np.full(MAX_SEQS + 1, num_real, np.int32)
+    cu_q[: num_seqs + 1] = np.concatenate([[0], np.cumsum(q_lens)])
+    tables = rng.permutation(np.arange(1, num_pages))[: MAX_SEQS * pages_per_seq]
+    meta = [
+        jnp.asarray(a.astype(np.int32))
+        for a in (seq_lens, tables, cu_q, np.array([0, 0, num_seqs]))
+    ]
+    kv, index, scales = _write_caches(cache_kind, num_pages, rng)
+    k, v, index_q = (
+        jnp.asarray(rng.standard_normal((num_tokens, 1, HEAD_DIM)), jnp.bfloat16)
+        for _ in range(3)
+    )
+    index_k = jnp.asarray(rng.standard_normal((num_tokens, HEAD_DIM)), jnp.bfloat16)
+
+    def run():
+        return msa_dcp.msa_write_and_candidates_dcp(
+            k, v, index_q, index_k, kv, index, *meta, topk=TOPK, init_blocks=1,
+            local_blocks=1, rank=rank, dcp=dcp, scale_cache=scales, interpret=True,
+        )  # fmt: skip
+
+    got = run()
+    monkeypatch.setattr(msa_dcp, "decodes_in_one_kernel", lambda *_: False)
+    want = run()
+
+    assert len(got) == len(want)
+    for g, w in zip(got[:-1], want[:-1]):  # the caches
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+    np.testing.assert_array_equal(
+        np.asarray(got[-1])[:num_real], np.asarray(want[-1])[:num_real]
+    )

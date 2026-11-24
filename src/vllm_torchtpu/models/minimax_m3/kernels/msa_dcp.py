@@ -42,6 +42,7 @@ queries of the group's heads along with the query heads.
 """
 
 import functools
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -257,6 +258,32 @@ def _candidates_kernel_t(
     block_out_ref,
     key_ref,
     *,
+    pretransposed=False,
+    **kwargs,
+):
+    """`_candidates_kernel` with the row block transposed in VMEM: columns
+    on sublanes, rows on lanes (``pos_ref [1, rows]``, outputs ``[topk,
+    rows]``). Each pick's max reduces across vregs and sublanes on the VPU
+    instead of across lanes on the XLU, which bound the row-major picks
+    (~310 bundles per pick of a 256 x 128 block in the LLO), over packed keys
+    (`_score_keys`). `pretransposed` scores already come as ``[columns,
+    rows]``."""
+    score_out_ref[...], block_out_ref[...] = _pick_t(
+        rank_ref[0],
+        scores_ref,
+        pos_ref[...],
+        key_ref,
+        pretransposed=pretransposed,
+        **kwargs,
+    )
+
+
+def _pick_t(
+    rank,
+    scores_ref,
+    pos,
+    key_ref,
+    *,
     block_size,
     topk,
     init_blocks,
@@ -266,22 +293,16 @@ def _candidates_kernel_t(
     real_cols,
     pretransposed=False,
 ):
-    """`_candidates_kernel` with the row block transposed in VMEM: columns
-    on sublanes, rows on lanes (``pos_ref [1, rows]``, outputs ``[topk,
-    rows]``). Each pick's max reduces across vregs and sublanes on the VPU
-    instead of across lanes on the XLU, which bound the row-major picks
-    (~310 bundles per pick of a 256 x 128 block in the LLO), over packed keys
-    (`_score_keys`). `pretransposed` scores already come as ``[columns,
-    rows]``.
+    """`_candidates_kernel_t`'s picks of one row block: ``(scores, blocks)``
+    ``[topk, rows]`` for positions ``pos [1, rows]``.
 
     The block keys and scans only the columns its rows can see (the scores
     span max-model-len, mostly past every row's context): a loop bound read
     from its positions, one body for every width."""
-    rank = rank_ref[0]
     num_cols = scores_ref.shape[0 if pretransposed else 1]
-    rows = pos_ref.shape[1]
+    rows = pos.shape[1]
     chunk = _KEY_CHUNK[pretransposed]
-    num_visible = pos_ref[...] // block_size + 1  # [1, rows]
+    num_visible = pos // block_size + 1  # [1, rows]
     # A rank's blocks below n are among its first ceil(n / dcp) columns.
     needed = (jnp.max(num_visible) + dcp - 1) // dcp
     chunks = jnp.clip((needed + chunk - 1) // chunk, 1, num_cols // chunk)
@@ -347,8 +368,7 @@ def _candidates_kernel_t(
         (rank & 1) == 1, jnp.concatenate(picks[::-1]), jnp.concatenate(picks)
     )
     score, col = _key_scores(keys, col_bits)
-    score_out_ref[...] = score
-    block_out_ref[...] = jnp.where(score > _NEG_INF, col * dcp + rank, -1)
+    return score, jnp.where(score > _NEG_INF, col * dcp + rank, -1)
 
 
 # Row blocks of a multiple of this many rows (a vreg's lanes) pick
@@ -518,6 +538,338 @@ def local_candidates(
     if transposed:
         picked_scores, picked_blocks = picked_scores.T, picked_blocks.T
     return picked_scores[:num_tokens], picked_blocks[:num_tokens]
+
+
+class DecodeWrite(NamedTuple):
+    """A write `decode_candidates` folds in: `msa.write_caches`' targets,
+    tokens' pages and slots, its run bound and which target is the index
+    cache the step scores."""
+
+    targets: list[msa_write.Rows | msa_write.SlotValues]
+    pages: jax.Array
+    slots: jax.Array
+    max_runs: int
+    index_target: int
+
+
+def _decode_candidates_kernel(
+    # Scalar prefetch
+    work_ref,  # [items] tile << _TILE_SHIFT | page group (`msa_indexer.class_work`)
+    tile_info_ref,  # [tiles] query row << _ROW_SHIFT | request
+    block_tables_ref,  # [max_num_seqs * pages_per_seq]
+    seq_pages_ref,  # [max_num_seqs] this rank's pages of each request
+    cu_ref,  # [max_num_seqs + 1] query starts
+    rank_ref,  # [1]
+    *refs,
+    pick,
+    write,
+):
+    """`msa_indexer._kernel_v3` (small tiles) with its block maxima kept in
+    VMEM, token-major, then this rank's picks (`_pick_t`) at the last step:
+    the scores never round-trip through HBM, and no gather, padding or
+    second kernel stands between the indexer and the selection. A tile's rows
+    of other requests (aligned tile starts) are left to their own tiles.
+
+    With `write` (`_run_ops` keyword arguments, ``num_inputs`` and
+    ``index_target`` added) the step's cache write runs here too: every run's
+    pages are copied in at the first step; a run is merged and copied back
+    when the first tile of its request scores the group holding its index
+    page, whose ring copy then takes the merged page, and the rest at the
+    last step. Its copies' latency hides under the indexer's page stream.
+
+    Refs after the scalars: run tables (``count``, page, lo, hi, tok0, then
+    each run's request and index page among this rank's, with `write`); in:
+    the tile's query rows ``[Bq, D]``, positions ``[1, R]``, the write's
+    inputs and caches, or the index cache; out: ``[R, 2 * topk]``
+    `pack_candidates` of each row (row = token), then the written caches;
+    scratch: the ring and its semaphores, scores ``[R, P]`` f32, keys ``[P,
+    128]`` int32, then the run flags (SMEM) and the write's scratch."""
+    it = iter(refs)
+    if write is not None:
+        num_runs_ref, *run_tables = (next(it) for _ in range(5))
+        run_seq_ref, run_page_idx_ref = next(it), next(it)
+    q_ref, pos_ref = next(it), next(it)
+    if write is None:
+        cache_ref = next(it)
+    else:
+        write = dict(write)
+        num_inputs, index_target = write.pop("num_inputs"), write.pop("index_target")
+        num_caches = len(write["specs"])
+        write_in = [next(it) for _ in range(num_inputs + num_caches)]
+    out_ref = next(it)
+    if write is not None:
+        write_out = [next(it) for _ in range(num_caches)]
+        cache_ref = write_out[index_target]
+    buf, sems, scores_ref, key_ref = (next(it) for _ in range(4))
+
+    step, last = pl.program_id(0), pl.num_programs(0) - 1
+    entry = work_ref[step]
+    info = tile_info_ref[entry >> msa_indexer._TILE_SHIFT]
+    seq = info & msa_indexer._SEQ_MASK
+    row0 = pl.multiple_of(info >> msa_indexer._ROW_SHIFT, msa_indexer._ROW_ALIGN)
+    block_q = q_ref.shape[0]
+    pages_per_step = buf.shape[1]
+    group = entry & msa_indexer._GROUP_MASK
+    rows = row0 + jax.lax.broadcasted_iota(jnp.int32, (block_q, 1), 0)
+    own = (rows >= cu_ref[seq]) & (rows < cu_ref[seq + 1])
+
+    def store(first, m):
+        cols = pl.ds(pl.multiple_of(group * pages_per_step + first, _LANES), m.shape[1])
+        window = scores_ref.at[pl.ds(row0, block_q), cols]
+        window[...] = jnp.where(own, m, window[...])
+
+    after_wait = None
+    if write is not None:
+        merged_ref = next(it)
+        ops = msa_write._run_ops(run_tables, write_in + write_out + list(it), **write)
+        num_runs = num_runs_ref[0]
+        merged_index = ops.out_bufs[index_target].bitcast(jnp.uint32)
+
+        def runs(fn):
+            jax.lax.fori_loop(0, num_runs, lambda r, c: (fn(r), c)[1], 0)
+
+        @pl.when(step == 0)
+        def _():
+            def start(r):
+                merged_ref[r] = 0
+                for c in ops.in_copies(r, r):
+                    c.start()
+
+            runs(start)
+
+        def settle(r):
+            @pl.when(merged_ref[r] == 0)
+            def _():
+                for c in ops.in_copies(r, r):
+                    c.wait()
+                ops.merge(r, r)
+                for c in ops.out_copies(r, r):
+                    c.start()
+                merged_ref[r] = 1
+
+        # Inlined into each of `_kernel_v3`'s per-slot bodies (3 copies of
+        # the merge): a decode run's merge is a few hundred bundles.
+        def after_wait(slot):
+            first = group * pages_per_step
+
+            def substitute(r):
+                page = run_page_idx_ref[r] - first
+
+                @pl.when(
+                    (run_seq_ref[r] == seq) & (page >= 0) & (page < pages_per_step)
+                )
+                def _():
+                    settle(r)
+                    buf[slot, page] = merged_index[r, :, 0, :]
+
+            runs(substitute)
+
+    msa_indexer._kernel_v3(
+        work_ref,
+        tile_info_ref,
+        block_tables_ref,
+        seq_pages_ref,
+        q_ref,
+        cache_ref,
+        None,
+        buf,
+        sems,
+        store=store,
+        after_wait=after_wait,
+    )
+
+    @pl.when(step == last)
+    def _():
+        if write is not None:
+            runs(settle)
+        for b in range(out_ref.shape[0] // _TRANSPOSED_ROWS):
+            r = pl.ds(b * _TRANSPOSED_ROWS, _TRANSPOSED_ROWS)
+            score, block = _pick_t(
+                rank_ref[0], scores_ref.at[r], pos_ref[:, r], key_ref, **pick
+            )
+            out_ref[r, :] = jnp.concatenate([score, block.astype(jnp.float32)]).T
+        if write is not None:
+
+            def wait_out(r):
+                for c in ops.out_copies(r, r):
+                    c.wait()
+
+            runs(wait_out)
+
+
+def decodes_in_one_kernel(num_tokens: int, index_cache: jax.Array) -> bool:
+    """Whether `decode_candidates` takes a step of `num_tokens` over this index
+    cache: no request can have more rows than the indexer's small tiles take
+    (`msa_indexer.block_scores` scores longer ones in large tiles, with e4m3
+    queries), and the pages are v3's (fp8 or bf16, 4-bit with their scales
+    folded in)."""
+    _, rows_per_page, _, _ = index_cache.shape
+    return num_tokens <= msa.block_score_options()["block_q"] and (
+        not msa_fp4.is_fp4(index_cache)
+        or msa_fp4.scales_in_page(rows_per_page, index_cache.dtype)
+    )
+
+
+def decode_candidates(
+    index_q: jax.Array,
+    index_cache: jax.Array,
+    local_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    num_seqs: jax.Array,
+    seq_id: jax.Array,
+    pos: jax.Array,
+    *,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    rank: int | jax.Array,
+    dcp: int,
+    write: DecodeWrite | None = None,
+    interpret: bool = False,
+) -> jax.Array | tuple[list[jax.Array], jax.Array]:
+    """`pack_candidates` of `local_candidates` over `msa._block_scores` for a
+    decode-sized step (`msa_indexer.is_prefill_step` false) in one kernel
+    (`_decode_candidates_kernel`): ``[T, 2 * topk]``, the same values. With
+    `write` it first writes the step's rows as `msa.write_caches` would (the
+    index target is `index_cache`) and returns ``(caches, candidates)``.
+
+    ``index_q [T, 1, D]`` (rotated for a 4-bit cache), ``local_lens`` this
+    rank's lengths (`local_seq_lens`), ``seq_id`` and ``pos [T]`` the tokens'
+    requests and positions (`msa.token_positions`)."""
+    num_tokens, _, head_dim = index_q.shape
+    _, rows_per_page, _, _ = index_cache.shape
+    if not decodes_in_one_kernel(num_tokens, index_cache):
+        raise NotImplementedError(
+            f"no one-kernel decode of {num_tokens} tokens over {index_cache.shape}"
+        )
+    max_num_seqs = local_lens.shape[0]
+    options = msa.block_score_options(
+        1, msa._wide_decode_scores(index_q, index_cache, local_lens, block_tables, 1)
+    )
+    pages_per_step = options["small_pages_per_step"]
+    transposed = msa_indexer._scores_transposed(1, rows_per_page, index_cache.dtype)
+    tile_cap = options["transposed_tile_q"] if transposed else msa_indexer._SMALL_TILE_Q
+    block_q = min(options["block_q"], tile_cap, -(-num_tokens // 8) * 8)
+    seq_ids = jnp.arange(max_num_seqs, dtype=jnp.int32)
+    block_size = msa.page_size(index_cache)
+    work = msa_indexer.class_work(
+        index_q,
+        local_lens,
+        block_tables,
+        cu_q_lens,
+        seq_ids < num_seqs,
+        block_q=block_q,
+        # Aligned tile starts add up to _ROW_ALIGN - 1 rows per request.
+        max_tiles=(num_tokens + (msa_indexer._ROW_ALIGN - 1) * max_num_seqs) // block_q
+        + max_num_seqs,
+        pages_per_step=pages_per_step,
+        page_size=msa_indexer._page_tokens(rows_per_page, index_cache.dtype),
+    )
+    pages_per_seq = block_tables.shape[0] // max_num_seqs
+    num_cols = -(-pages_per_seq // pages_per_step) * pages_per_step
+    rows = -(-num_tokens // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS
+    # The last tile starts at most at the last token's aligned row and runs
+    # block_q rows; the picks read the first `rows`.
+    score_rows = max(rows, -(-num_tokens // 8) * 8 + block_q)
+    pick = dict(
+        block_size=block_size,
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        dcp=dcp,
+        col_bits=_key_bits(num_cols),
+        real_cols=num_cols,
+    )
+    shift, row_shift = msa_indexer._TILE_SHIFT, msa_indexer._ROW_SHIFT
+    scalars = [
+        work.work,
+        work.tile_info,
+        block_tables,
+        work.seq_pages,
+        cu_q_lens,
+        rank_array(rank),
+    ]
+    q_spec = pl.BlockSpec(
+        (pl.Element(block_q), pl.Element(head_dim)),
+        lambda w, work, tile_info, *_: (
+            pl.multiple_of(
+                tile_info[work[w] >> shift] >> row_shift, msa_indexer._ROW_ALIGN
+            ),
+            0,
+        ),
+    )
+    inputs = [work.q_rows, jnp.pad(pos, (0, rows - num_tokens))[None]]
+    in_specs = [q_spec, pl.BlockSpec((1, rows), lambda w, *_: (0, 0))]
+    out_shape = [jax.ShapeDtypeStruct((rows, 2 * topk), jnp.float32)]
+    out_specs = [pl.BlockSpec((rows, 2 * topk), lambda w, *_: (0, 0))]
+    scratch = [
+        pltpu.VMEM(
+            (msa_indexer._RING_SLOTS, pages_per_step, rows_per_page, head_dim),
+            jnp.uint32,
+        ),
+        pltpu.SemaphoreType.DMA((msa_indexer._RING_SLOTS,)),
+        pltpu.VMEM((score_rows, num_cols), jnp.float32),
+        pltpu.VMEM((num_cols, _TRANSPOSED_ROWS), jnp.int32),
+    ]
+    vmem_bytes = 4 * (
+        msa_indexer._RING_SLOTS * pages_per_step * rows_per_page * head_dim
+        + (score_rows + _TRANSPOSED_ROWS) * num_cols
+    )
+    aliases, write_kwargs = {}, None
+    any_spec = pl.BlockSpec(memory_space=pl.ANY)
+    if write is None:
+        inputs.append(index_cache)
+        in_specs.append(any_spec)
+    else:
+        ops = msa_write.write_operands(
+            write.targets,
+            write.pages,
+            write.slots,
+            max_runs=write.max_runs,
+            depth=write.max_runs,
+        )
+        if ops.caches[write.index_target] is not index_cache:
+            raise ValueError("the write's index target must be the scored cache")
+        num_runs, *run_tables = ops.runs
+        run_tok0 = jnp.minimum(run_tables[-1], num_tokens - 1)
+        run_seq = msa_indexer.lookup(seq_id, run_tok0)
+        run_page_idx = msa_indexer.lookup(pos, run_tok0) // block_size // dcp
+        scalars += [num_runs[None], *run_tables, run_seq, run_page_idx]
+        first_cache = len(scalars) + len(inputs) + len(ops.inputs)
+        inputs += ops.inputs + ops.caches
+        in_specs += [any_spec] * (len(ops.inputs) + len(ops.caches))
+        out_shape += [jax.ShapeDtypeStruct(c.shape, c.dtype) for c in ops.caches]
+        out_specs += [any_spec] * len(ops.caches)
+        aliases = {first_cache + i: 1 + i for i in range(len(ops.caches))}
+        scratch += [pltpu.SMEM((write.max_runs,), jnp.int32), *ops.scratch]
+        vmem_bytes += ops.vmem_bytes
+        write_kwargs = dict(
+            ops.kwargs, num_inputs=len(ops.inputs), index_target=write.index_target
+        )
+    out = pl.pallas_call(
+        functools.partial(_decode_candidates_kernel, pick=pick, write=write_kwargs),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=len(scalars),
+            grid=(jnp.maximum(work.group_ends[-1], 1),),
+            in_specs=in_specs,
+            out_specs=out_specs,
+            scratch_shapes=scratch,
+        ),
+        out_shape=out_shape,
+        input_output_aliases=aliases,
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            disable_bounds_checks=True,
+            vmem_limit_bytes=max(msa_select._VMEM_LIMIT_BYTES, vmem_bytes + (8 << 20)),
+        ),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_decode_candidates",
+    )(*scalars, *inputs)
+    candidates = out[0][:num_tokens]
+    if write is None:
+        return candidates
+    return out[1:], candidates
 
 
 def pack_candidates(scores: jax.Array, blocks: jax.Array) -> jax.Array:
@@ -821,29 +1173,30 @@ def msa_write_and_candidates_dcp(
     fp4 = scale_cache is not None
     scale_row = msa_fp4.index_scale_row(num_heads) if fp4 else None
     if fp4:
-        kv_cache, index_cache, scale_cache = msa.write_fp4(
-            kv_cache,
-            index_cache,
-            scale_cache,
-            k,
-            v,
-            index_k,
-            pages,
-            pos,
-            max_num_seqs=max_num_seqs,
-            interpret=interpret,
+        targets = msa.fp4_targets(
+            kv_cache, index_cache, scale_cache, k, v, index_k, interpret=interpret
         )
         if not index_q_rotated:
             index_q = msa_fp4.rotate_queries(index_q)
     else:
         kv_rows = jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1)
-        kv_cache, index_cache = msa.write_caches(
-            [msa_write.Rows(kv_cache, kv_rows), msa_write.Rows(index_cache, index_k)],
-            pages,
-            pos,
-            max_num_seqs=max_num_seqs,
-            interpret=interpret,
+        targets = [
+            msa_write.Rows(kv_cache, kv_rows),
+            msa_write.Rows(index_cache, index_k),
+        ]
+    # A decode step of one KV head writes its caches inside the indexer kernel
+    # (`decode_candidates`).
+    fold_write = (
+        num_heads == 1
+        and not msa_indexer.is_prefill_step(num_tokens, max_num_seqs)
+        and decodes_in_one_kernel(num_tokens, index_cache)
+    )
+    if not fold_write:
+        kv_cache, index_cache, *rest = msa.write_caches(
+            targets, pages, pos, max_num_seqs=max_num_seqs, interpret=interpret
         )
+        if fp4:
+            (scale_cache,) = rest
     local_lens = local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp)
     candidates = functools.partial(
         local_candidates,
@@ -873,6 +1226,31 @@ def msa_write_and_candidates_dcp(
         if fp4:
             return kv_cache, index_cache, scale_cache, packed
         return kv_cache, index_cache, packed
+    if fold_write:
+        caches, packed = decode_candidates(
+            index_q,
+            index_cache,
+            local_lens,
+            block_tables,
+            cu_q_lens,
+            distribution[2],
+            seq_id,
+            pos,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            rank=rank,
+            dcp=dcp,
+            write=DecodeWrite(
+                msa.cache_targets(targets),
+                pages,
+                pos % block_size,
+                msa.write_runs_bound(num_tokens, max_num_seqs, block_size),
+                index_target=1,
+            ),
+            interpret=interpret,
+        )
+        return (*caches, packed)
     if num_heads == 1:
         scores = msa._block_scores(
             index_q,
