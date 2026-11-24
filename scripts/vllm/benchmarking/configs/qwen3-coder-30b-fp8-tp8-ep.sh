@@ -40,12 +40,4 @@ BENCHMARK_TEMPERATURE=0
 # ablate (defaults to FLASH_ATTN / default RPA v3).
 ATTENTION_BACKEND="CUSTOM"
 
-# Workaround for a libtpu 0.0.42.1 MSA scheduler bug: async-prefetching
-# batched-RPA schedule tensors to S(1) alt-memory halts the kernel. Disabling
-# the large-buffer benefit factor keeps them in HBM. Scoped to this config
-# because it's the only one that currently trips the bug (only surfaces when
-# the torch_tpu bridge fuses RMSNorm + batched-RPA into a single HLO module).
-# To retire: unset this flag and rerun this config after the next libtpu bump.
-export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_alternate_memory_benefit_scaling_factor_for_large_buffers=0"
-
 EVAL_TOLERANCE="0.02"
