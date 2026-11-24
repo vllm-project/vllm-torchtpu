@@ -90,7 +90,8 @@ if [[ "$scenario" == decode_dp16 ]]; then
   done
 fi
 
-python scripts/dsv41_bench/server_steps/run.py \
+# Stagger the starting compile bucket across local ranks during cold startup.
+TPU_PARALLEL_PRECOMPILE=1 python scripts/dsv41_bench/server_steps/run.py \
   --scenario "$scenario" --input "$results/inputs.json" \
   --out "$results/benchmark" \
   --startup-timeout 7200 "${launch_args[@]}"
