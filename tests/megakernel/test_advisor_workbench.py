@@ -759,7 +759,7 @@ def test_workbench_waterfall_card_matches_chain_composition(tmp_path: Path) -> N
             "sub": str(row_idx),
             "tag": f"wf_{row_idx}",
         }
-        for row_idx in range(5)
+        for row_idx in range(4)
     )
     snaps = _run_workbench_ui_runner(tmp_path, sweep_report, steps, phase=True)
     by_tag = {str(s["tag"]): s for s in snaps}
@@ -771,7 +771,7 @@ def test_workbench_waterfall_card_matches_chain_composition(tmp_path: Path) -> N
             str(by_tag["verify_hi"]["waterfallSvg"]),
         )
     ]
-    waterfall_row_count = 5
+    waterfall_row_count = 4
     assert len(svg_deltas) == waterfall_row_count
 
     drawer_core = str(by_tag["wf_0"]["derivDrawer"])
@@ -838,12 +838,19 @@ def test_workbench_waterfall_card_tracks_winner_and_zero_sign(tmp_path: Path) ->
             "tag": "vsmall",
         },
         {
+            "op": "pin_regime",
+            "idx": verify_small_idx,
+            "slot": "B",
+            "tag": "vsmall_b",
+        },
+        {
             "op": "select_topic",
             "kind": "waterfall",
             "scope": "whole_step",
-            "sub": "3",
+            "sub": "2",
             "tag": "wf_zero_row",
         },
+        {"op": "clear_b", "tag": "clear_b_after_zero"},
         {
             "op": "select_topic",
             "kind": "waterfall",
@@ -873,7 +880,7 @@ def test_workbench_waterfall_card_tracks_winner_and_zero_sign(tmp_path: Path) ->
         r'class="tabular">([+-]?[0-9.]+ us)</text>',
         str(by_tag["wf_zero_row"]["waterfallSvg"]),
     )
-    zero_row_idx = 3
+    zero_row_idx = 2
     assert zero_svg[zero_row_idx] == "0.00 us"
     assert "Delta ([A] - [B]): 0.00 us" in str(by_tag["wf_zero_row"]["derivDrawer"])
 

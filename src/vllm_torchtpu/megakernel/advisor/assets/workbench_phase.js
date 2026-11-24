@@ -130,8 +130,6 @@
           'Collective time the HBM stream does not cover (#ctl-coll-hop)'],
         ['Cold Pipeline Fill/Drain', scA.fill_drain_us, scB.fill_drain_us,
           'Cold HBM slot fill + synchronous stage barriers'],
-        ['Multi-Pass HBM Weight Re-stream', scA.repass_spill_us, scB.repass_spill_us,
-          `n_splits=${scA.n_splits} vs ${scB.n_splits} (knob: #ctl-vmem)`],
         ['Dispatch / Boundary Bubble',
           scA.ops_per_step * (evalA.launchGapPriorUs ?? evalA.launchGapLoUs) + (scA.host_head_us || 0),
           scB.ops_per_step * (evalA.launchGapPriorUs ?? evalA.launchGapLoUs) + (scB.host_head_us || 0),
