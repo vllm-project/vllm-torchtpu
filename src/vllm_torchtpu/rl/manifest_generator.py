@@ -109,7 +109,8 @@ def _rule(
 
 
 # ---------------------------------------------------------------------------
-# TP-interleaved fused column helpers (Option 1: __tmp__:* rule chaining)
+# TP-interleaved fused column helpers (sequential rule chaining via __tmp__:*
+# intermediate keys so per-segment repeat/reshape runs before TP concat)
 # ---------------------------------------------------------------------------
 
 
@@ -145,7 +146,12 @@ def _fused_col_rules(
     *,
     flipped: bool,
 ) -> list[dict[str, Any]]:
-    """Build fused column-parallel rules (contiguous TP-sharded via Option 1)."""
+    """Build fused column-parallel rules via ``__tmp__:*`` sequential chaining.
+
+    Each input segment is optionally replicated and reshaped to ``[tp, local_w, ...]``
+    under a temporary ``__tmp__:*`` key before a final rule concatenates all segments
+    along the per-rank width axis so TP sharding stays contiguous.
+    """
     is_matrix = len(tail) == 1
     if tp_size == 1:
         ops: list[OpSpec] = (

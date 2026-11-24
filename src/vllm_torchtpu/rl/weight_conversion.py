@@ -14,8 +14,9 @@
 """Pure-PyTorch 12-op executor, validator, and inverter for ``weight_mapping``.
 
 Implements the Distributed RL Weight Conversion Protocol (zero JAX imports)
-with Option 1 rule chaining (``__tmp__:*`` intermediates) for heterogeneous
-fused TP layers.
+with sequential rule chaining via temporary ``__tmp__:*`` intermediate keys
+so per-segment transforms can feed a final rule for heterogeneous fused TP
+layers.
 """
 
 from __future__ import annotations

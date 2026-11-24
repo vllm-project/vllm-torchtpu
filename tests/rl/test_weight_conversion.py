@@ -256,7 +256,7 @@ def test_tied_keys_dropped_keys_and_chaining_invariants() -> None:
 
 
 def test_chained_rules_gqa_qkv_tp_interleaving() -> None:
-    """Option 1 __tmp__:* chaining for heterogeneous GQA QKV + KV replication."""
+    """Sequential ``__tmp__:*`` rule chaining for GQA QKV + KV replication."""
     g = torch.Generator().manual_seed(99)
     q = torch.randn(8, 16, generator=g, dtype=torch.bfloat16)
     k = torch.randn(2, 16, generator=g, dtype=torch.bfloat16)
