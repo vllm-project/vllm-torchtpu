@@ -157,6 +157,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_COMPRESSED_RUN_WRITE: bool = False
     VLLM_TPU_QSA_SORTFREE_COMPACT: bool = False
     VLLM_TPU_QSA_COMPRESSED_RUN_WRITE_MIN_TOKENS: int = 512
+    VLLM_TPU_QSA_DMA_BATCH_OPT: bool = False
+    VLLM_TPU_QSA_STATE_COALESCE: bool = False
     VLLM_TPU_QSA_COMPRESSED_WRITE: str = ""
     VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
     VLLM_TPU_QSA_BF16_REDUCE_PRECISION: bool = False
@@ -854,6 +856,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # store DMA in flight. Any other value keeps the run / tiled / per-pair
     # choice by row count.
     "VLLM_TPU_QSA_COMPRESSED_WRITE": env_str("VLLM_TPU_QSA_COMPRESSED_WRITE", ""),
+    # Qwen4-exp QSA: expanded TPU v7x DMA batch tables + power-of-two fallback
+    # (tuned_block_sizes.py), sub-128 batched main KV cache writes
+    # (pooled_qsa.write_main_cache), and full-slice bounded DMA fast path
+    # (sparsecore_topk.py). Exact, default off.
+    "VLLM_TPU_QSA_DMA_BATCH_OPT": env_bool("VLLM_TPU_QSA_DMA_BATCH_OPT", default=False),
+    # Qwen4-exp QSA: coalesce null-index DMAs and allow batch=16 in
+    # qsa_state.read_ring_and_tags. Exact, default off.
+    "VLLM_TPU_QSA_STATE_COALESCE": env_bool(
+        "VLLM_TPU_QSA_STATE_COALESCE", default=False
+    ),
     # Qwen4-exp QSA: round to BF16 with lax.reduce_precision instead of the
     # integer bit trick. Same RNE; the boundary stays observable to XLA and
     # fuses into neighbouring ops instead of running as its own fusion.

@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import typed_ldst
 from vllm_torchtpu.kernels.qwen4_exp.cache_regions import region_rows
 from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import get_ring_tag_dma_batch
@@ -24,27 +25,121 @@ def read_ring_and_tags(
     batch = get_ring_tag_dma_batch(
         pool, count, ring_elements=ring_elements, tag_elements=tag_elements
     )
+    if not envs.VLLM_TPU_QSA_STATE_COALESCE:
 
-    def kernel(indices, source, ring_out, tags_out, staged, semaphores):
+        def kernel_plain(indices, source, ring_out, tags_out, staged, semaphores):
+            first = pl.program_id(0) * batch
+            for lane in range(batch):
+                pltpu.make_async_copy(
+                    source.at[jnp.maximum(indices[first + lane], 0), pl.ds(0, tokens)],
+                    staged.at[lane],
+                    semaphores.at[lane],
+                ).start()
+            for lane in range(batch):
+                pltpu.make_async_copy(
+                    source.at[jnp.maximum(indices[first + lane], 0), pl.ds(0, tokens)],
+                    staged.at[lane],
+                    semaphores.at[lane],
+                ).wait()
+                ring_out[lane] = typed_ldst.load_typed(
+                    staged.at[lane, pl.ds(0, ring_tokens)], view_dtype=jnp.bfloat16
+                )
+                tags_out[lane] = typed_ldst.load_typed(
+                    staged.at[lane, pl.ds(ring_tokens, tag_tokens)],
+                    view_dtype=jnp.int32,
+                )
+
+        ring, tags = pl.pallas_call(
+            kernel_plain,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=1,
+                grid=(count // batch,),
+                in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+                out_specs=[
+                    pl.BlockSpec((batch, ring_rows, lanes), lambda i, *_: (i, 0, 0)),
+                    pl.BlockSpec((batch, tag_rows, lanes), lambda i, *_: (i, 0, 0)),
+                ],
+                scratch_shapes=[
+                    pltpu.VMEM((batch, tokens, *payload), pool.dtype),
+                    pltpu.SemaphoreType.DMA((batch,)),
+                ],
+            ),
+            out_shape=[
+                jax.ShapeDtypeStruct((count, ring_rows, lanes), jnp.bfloat16),
+                jax.ShapeDtypeStruct((count, tag_rows, lanes), jnp.int32),
+            ],
+            name="qwen4_exp_ring_tags_batched_read",
+        )(ids, pool)
+        return (
+            ring.reshape(count, -1)[:, :ring_elements],
+            tags.reshape(count, -1)[:, :tag_elements],
+        )
+
+    if batch == 8 and count >= 16 and count % 16 == 0 and tokens <= 8:
+        if not envs.VLLM_TPU_QSA_RING_DMA_BATCH:
+            batch = 16
+
+    def kernel(
+        indices, source, ring_out, tags_out, staged, null_staged, semaphores, null_sem
+    ):
         first = pl.program_id(0) * batch
+        any_null = jnp.bool_(False)
         for lane in range(batch):
+            any_null = any_null | (indices[first + lane] <= 0)
+
+        @pl.when(any_null)
+        def _start_null():
             pltpu.make_async_copy(
-                source.at[jnp.maximum(indices[first + lane], 0), pl.ds(0, tokens)],
-                staged.at[lane],
-                semaphores.at[lane],
+                source.at[0, pl.ds(0, tokens)],
+                null_staged.at[0],
+                null_sem,
             ).start()
+
         for lane in range(batch):
+
+            @pl.when(indices[first + lane] > 0)
+            def start(*, lane=lane):
+                pltpu.make_async_copy(
+                    source.at[indices[first + lane], pl.ds(0, tokens)],
+                    staged.at[lane],
+                    semaphores.at[lane],
+                ).start()
+
+        @pl.when(any_null)
+        def _wait_null():
             pltpu.make_async_copy(
-                source.at[jnp.maximum(indices[first + lane], 0), pl.ds(0, tokens)],
-                staged.at[lane],
-                semaphores.at[lane],
+                source.at[0, pl.ds(0, tokens)],
+                null_staged.at[0],
+                null_sem,
             ).wait()
-            ring_out[lane] = typed_ldst.load_typed(
-                staged.at[lane, pl.ds(0, ring_tokens)], view_dtype=jnp.bfloat16
-            )
-            tags_out[lane] = typed_ldst.load_typed(
-                staged.at[lane, pl.ds(ring_tokens, tag_tokens)], view_dtype=jnp.int32
-            )
+
+        for lane in range(batch):
+            active = indices[first + lane] > 0
+
+            @pl.when(active)
+            def _load_active(*, lane=lane):
+                pltpu.make_async_copy(
+                    source.at[indices[first + lane], pl.ds(0, tokens)],
+                    staged.at[lane],
+                    semaphores.at[lane],
+                ).wait()
+                ring_out[lane] = typed_ldst.load_typed(
+                    staged.at[lane, pl.ds(0, ring_tokens)], view_dtype=jnp.bfloat16
+                )
+                tags_out[lane] = typed_ldst.load_typed(
+                    staged.at[lane, pl.ds(ring_tokens, tag_tokens)],
+                    view_dtype=jnp.int32,
+                )
+
+            @pl.when(~active)
+            def _load_null(*, lane=lane):
+                ring_out[lane] = typed_ldst.load_typed(
+                    null_staged.at[0, pl.ds(0, ring_tokens)], view_dtype=jnp.bfloat16
+                )
+                tags_out[lane] = typed_ldst.load_typed(
+                    null_staged.at[0, pl.ds(ring_tokens, tag_tokens)],
+                    view_dtype=jnp.int32,
+                )
 
     ring, tags = pl.pallas_call(
         kernel,
@@ -58,7 +153,9 @@ def read_ring_and_tags(
             ],
             scratch_shapes=[
                 pltpu.VMEM((batch, tokens, *payload), pool.dtype),
+                pltpu.VMEM((1, tokens, *payload), pool.dtype),
                 pltpu.SemaphoreType.DMA((batch,)),
+                pltpu.SemaphoreType.DMA,
             ],
         ),
         out_shape=[
