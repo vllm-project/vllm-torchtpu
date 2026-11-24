@@ -68,7 +68,9 @@ _COLLECTIVE_ID = 0
 _BLOCK_Q = msa_attention.SMALL_BATCH_BLOCK_Q
 _PAGES_PER_STEP = msa_attention.DEFAULT_PAGES_PER_STEP
 # The largest step the fused call takes (VMEM and the unrolled key stores).
-MAX_TOKENS = 128
+# Steps of more than 128 rows (c48 decode, `msa_dcp._WIDE_GROUP_MIN_TOKENS`)
+# attend in the unfused program's 32-page groups, so they stay bitwise too.
+MAX_TOKENS = 256
 # Smallest scoped-VMEM limit candidate (`tight_vmem`): larger limits cost
 # ~2.5 us per call on v7x.
 _VMEM_LIMIT_BYTES = 32 * 1024 * 1024
@@ -76,23 +78,37 @@ _VMEM_LIMIT_BYTES = 32 * 1024 * 1024
 _INTERPRET: object = True
 
 
+def _pages_per_step(num_tokens: int) -> int:
+    """Pages per attention group, as `msa_dcp._attend_selected` picks them
+    for a decode step of `num_tokens` rows (without TPU_MINIMAX_M3_MSA_DECODE_OPT)."""
+    if num_tokens >= msa_dcp._WIDE_GROUP_MIN_TOKENS:
+        return msa_dcp._SMALL_BATCH_PAGES_PER_STEP
+    return _PAGES_PER_STEP
+
+
 def eligible(num_tokens: int, max_tokens: int, *, dcp: int, kv_heads: int) -> bool:
     """Whether a step of `num_tokens` rows takes the fused call (one KV head
-    per DCP pair, whole 8-row tiles, at most `max_tokens` rows)."""
+    per DCP pair, whole 8-row tiles, at most `max_tokens` rows; a step of
+    wide groups only with the default group options)."""
     return (
         dcp == 2
         and kv_heads == 1
         and 0 < num_tokens <= min(max_tokens, MAX_TOKENS)
         and num_tokens % _BLOCK_Q == 0
+        and (
+            num_tokens < msa_dcp._WIDE_GROUP_MIN_TOKENS
+            or not msa_attention_lse.decode_opt()
+        )
     )
 
 
 def _layout(num_tokens: int, topk: int):
     """Tiles, groups per tile, work-list offsets and length of a step."""
     tiles = num_tokens // _BLOCK_Q
-    groups_per_tile = msa_attention._groups_per_tile(_BLOCK_Q, topk, _PAGES_PER_STEP)
+    pages = _pages_per_step(num_tokens)
+    groups_per_tile = msa_attention._groups_per_tile(_BLOCK_Q, topk, pages)
     offsets, length = msa_attention_lse._work_offsets(
-        tiles, _BLOCK_Q, topk, _PAGES_PER_STEP, tiles
+        tiles, _BLOCK_Q, topk, pages, tiles
     )
     return tiles, groups_per_tile, offsets, length
 
@@ -189,8 +205,9 @@ def _body(
 ):
     num_heads, num_tokens, head_dim = q_ref.shape
     tiles, groups_per_tile, offsets, _ = _layout(num_tokens, topk)
+    pages_per_step = _pages_per_step(num_tokens)
     max_groups = tiles * groups_per_tile
-    union_len = max_groups * _PAGES_PER_STEP
+    union_len = max_groups * pages_per_step
     me = rank_ref[0]
     other = 1 - me
 
@@ -247,7 +264,7 @@ def _body(
         rows_ref,
         work_v,
         block_q=_BLOCK_Q,
-        pages_per_step=_PAGES_PER_STEP,
+        pages_per_step=pages_per_step,
         tiles_per_step=tiles,
         offsets=offsets,
     )
@@ -288,7 +305,7 @@ def _body(
         tiles_per_step=tiles,
         groups_per_tile=groups_per_tile,
         transposed=False,
-        pages_per_step=_PAGES_PER_STEP,
+        pages_per_step=pages_per_step,
         precision=msa_attention_lse.max_free_levers(),
     )
 
@@ -405,6 +422,7 @@ def fused_attend_and_merge(
     local_limit = pos % block_size + 1
     base = jnp.where(valid, seq_id * pages_per_seq, -1)
     tiles, _, _, length = _layout(num_tokens, topk)
+    pages_per_step = _pages_per_step(num_tokens)
     _, rows_per_page, packing, _ = kv_cache.shape
     row_width = 2 * head_dim
     group_heads = 2 * num_heads
@@ -415,7 +433,7 @@ def fused_attend_and_merge(
     hbm = pl.BlockSpec(memory_space=pl.ANY)
     fp4_scratch = (
         [
-            pltpu.VMEM((ring, _PAGES_PER_STEP, 1) + scale_cache.shape[1:], jnp.float32),
+            pltpu.VMEM((ring, pages_per_step, 1) + scale_cache.shape[1:], jnp.float32),
             pltpu.SemaphoreType.DMA((ring, 1)),
         ]
         if fp4
@@ -446,7 +464,7 @@ def fused_attend_and_merge(
             pltpu.VMEM((rows, 1), jnp.float32),
             pltpu.VMEM((rows, head_dim), jnp.float32),
             pltpu.VMEM(
-                (ring, _PAGES_PER_STEP, 1, rows_per_page, packing, row_width),
+                (ring, pages_per_step, 1, rows_per_page, packing, row_width),
                 kv_cache.dtype,
             ),
             pltpu.SemaphoreType.DMA((ring, 1)),

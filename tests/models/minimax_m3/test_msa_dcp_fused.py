@@ -89,6 +89,13 @@ def test_fused_matches_unfused_bitwise_128_rows():
     _run("fp8", ctx, "0", "0")
 
 
+def test_fused_matches_unfused_bitwise_wide_groups():
+    """17 requests, 4-bit (c48 decode past 128 rows): the unfused call's
+    32-page groups, attended in the same groups by the fused call."""
+    ctx = ",".join(str(1500 + 250 * i) for i in range(17))
+    _run("fp4", ctx, "0", "0")
+
+
 def test_eligible():
     e = msa_dcp_fused.eligible
     assert e(8, 32, dcp=2, kv_heads=1)
@@ -98,12 +105,19 @@ def test_eligible():
     assert not e(8, 0, dcp=2, kv_heads=1)  # off
     assert not e(8, 32, dcp=4, kv_heads=1)
     assert not e(8, 32, dcp=8, kv_heads=4)
-    assert not e(256, 512, dcp=2, kv_heads=1)  # past MAX_TOKENS
+    assert not e(264, 512, dcp=2, kv_heads=1)  # past MAX_TOKENS
     assert e(128, 512, dcp=2, kv_heads=1)
+    assert e(256, 512, dcp=2, kv_heads=1)  # c48 decode: 32-page groups
+
+
+def test_eligible_wide_groups_need_default_options(monkeypatch):
+    monkeypatch.setenv("TPU_MINIMAX_M3_MSA_DECODE_OPT", "pps=16")
+    assert msa_dcp_fused.eligible(128, 256, dcp=2, kv_heads=1)
+    assert not msa_dcp_fused.eligible(136, 256, dcp=2, kv_heads=1)
 
 
 @pytest.mark.parametrize("kind", ["fp8", "fp4"])
-@pytest.mark.parametrize("tokens", [8, 16, 32, 128])
+@pytest.mark.parametrize("tokens", [8, 16, 32, 128, 160, 256])
 def test_compiles_for_tpu7x(kind, tokens):
     """Mosaic lowers the fused call at the served shapes (TP 8: 8 query heads
     per rank, top-16, 128-token blocks) within its 32 MiB VMEM limit."""
