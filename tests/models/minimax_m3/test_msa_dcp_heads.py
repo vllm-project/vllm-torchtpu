@@ -98,7 +98,7 @@ def _step(rng, q_lens, ctx_lens, pages_per_seq, num_tokens):
 
 
 def _reference(q, kvs, scs, cands, meta):
-    q_all = jnp.concatenate(q, axis=1)
+    q_all = msa_fp4.rotate_queries(jnp.concatenate(q, axis=1))  # the op rotates q
     cand_all = jnp.stack(cands)
     outs, lses = [], []
     for rank in range(DCP):
@@ -293,6 +293,55 @@ def test_unrotate_to_rows_matches_unrotate_output(num_tokens):
     x = jnp.asarray(rng.standard_normal((HL, num_tokens, HEAD_DIM)), jnp.bfloat16)
     got = msa_dcp_heads.unrotate_to_rows(x, interpret=True)
     want = msa_fp4.unrotate_output(x.transpose(1, 0, 2)).reshape(num_tokens, -1)
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
+    )
+
+
+def _replica_halves(x, rank):
+    """`x [T, ...]`'s rows as the replicas take them: alternate 64-token
+    blocks, ``(rank % 2's, the other replica's)``."""
+    blocks = x.reshape(-1, 2, 64, *x.shape[1:])
+    return blocks[:, rank % 2].reshape(-1, *x.shape[1:]), blocks[
+        :, 1 - rank % 2
+    ].reshape(-1, *x.shape[1:])
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+@pytest.mark.parametrize("num_tokens", [384, 2432])
+def test_rotate_replica_rows_matches_rotate_queries(num_tokens, rank):
+    """Bit for bit, including a partial last grid step (2432 tokens)."""
+    rng = np.random.default_rng(num_tokens + rank)
+    q = jnp.asarray(rng.standard_normal((num_tokens, HL, HEAD_DIM)), jnp.bfloat16)
+    got = msa_dcp_heads.rotate_replica_rows(q, jnp.int32(rank), interpret=True)
+    want = _replica_halves(msa_fp4.rotate_queries(q), rank)
+    for g, w in zip(got, want):
+        assert g.shape == (HL, num_tokens // 2, HEAD_DIM)
+        np.testing.assert_array_equal(
+            np.asarray(g).view(np.uint16),
+            np.asarray(w.transpose(1, 0, 2)).view(np.uint16),
+        )
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("num_tokens", [384, 2432])
+def test_unrotate_replica_rows_matches_unrotate_output(num_tokens, rank):
+    """Bit for bit: own rows from the first heads of a head-major output
+    twice as wide, the partner's from `other`, back in step order."""
+    rng = np.random.default_rng(num_tokens + rank)
+    out = jnp.asarray(
+        rng.standard_normal((2 * HL, num_tokens // 2, HEAD_DIM)), jnp.bfloat16
+    )
+    other = jnp.asarray(
+        rng.standard_normal((HL, num_tokens // 2, HEAD_DIM)), jnp.bfloat16
+    )
+    got = msa_dcp_heads.unrotate_replica_rows(
+        out, other, jnp.int32(rank), interpret=True
+    )
+    halves = (out[:HL], other) if rank % 2 == 0 else (other, out[:HL])
+    rows = jnp.stack(halves).reshape(2, HL, -1, 64, HEAD_DIM)
+    rows = rows.transpose(1, 2, 0, 3, 4).reshape(HL, num_tokens, HEAD_DIM)
+    want = msa_fp4.unrotate_output(rows.transpose(1, 0, 2)).reshape(num_tokens, -1)
     np.testing.assert_array_equal(
         np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
     )

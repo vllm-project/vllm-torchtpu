@@ -28,7 +28,6 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_dcp,
     msa_dcp_heads,
-    msa_fp4,
     msa_indexer,
 )
 
@@ -1065,7 +1064,7 @@ def _get_msa_dcp_heads_step_op(
         )
         out = msa_dcp_heads.attend_and_merge(
             rank,
-            msa_fp4.rotate_queries(q),
+            q,
             kv_cache,
             scale_cache,
             candidates,

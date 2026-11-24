@@ -88,12 +88,133 @@ def _interleave(x: jax.Array, axis: int = 0) -> jax.Array:
     return jnp.swapaxes(x, axis, axis + 1).reshape(shape)
 
 
-def _deinterleave(x: jax.Array, axis: int = 0) -> jax.Array:
-    """Inverse of `_interleave`."""
-    shape = x.shape
-    n = shape[axis] // (2 * _INTERLEAVE_TOKENS)
-    x = x.reshape(shape[:axis] + (2, n, _INTERLEAVE_TOKENS) + shape[axis + 1 :])
-    return jnp.swapaxes(x, axis, axis + 1).reshape(shape)
+# Tokens per replica per grid step of `rotate_replica_rows` and
+# `unrotate_replica_rows` (8 heads x 4096 tokens on one v7x core: 17.1 and
+# 16.6 us, 512-token steps 18.0 and 18.6 us; anvil, 3 reps).
+_REPLICA_BLOCK_TOKENS = 1024
+
+
+def _replica_grid(num_tokens: int) -> tuple[int, int]:
+    """``(pairs, step)``: ``num_tokens`` as `_INTERLEAVE_TOKENS`-token block
+    pairs (one block per replica), `step` pairs per grid step."""
+    pairs = num_tokens // (2 * _INTERLEAVE_TOKENS)
+    if num_tokens != 2 * _INTERLEAVE_TOKENS * pairs:
+        raise ValueError(f"{num_tokens} tokens are no whole block pairs")
+    return pairs, max(1, min(pairs, _REPLICA_BLOCK_TOKENS // _INTERLEAVE_TOKENS))
+
+
+def rotate_replica_rows(
+    q: jax.Array, rank: jax.Array, *, interpret: bool = False
+) -> tuple[jax.Array, jax.Array]:
+    """`msa_fp4.rotate_queries` of ``q [T, Hl, D]`` (bf16), written
+    head-major in the replicas' row order (`_interleave`): ``(own, other)``,
+    each ``[Hl, T / 2, D]``, the alternate `_INTERLEAVE_TOKENS`-token blocks
+    replica ``rank % 2`` attends and those its partner attends. As XLA ops
+    the rotation, the interleave and the replica's half each re-laid all of
+    q out (c64 mixed twin j-c5ebe0af: ~50 us per layer)."""
+    num_tokens, heads, head_dim = q.shape
+    pairs, step = _replica_grid(num_tokens)
+    block = _INTERLEAVE_TOKENS
+    rows = step * block
+
+    def kernel(rank_ref, own_in, other_in, h_ref, own_ref, other_ref):
+        del rank_ref
+        for x_ref, o_ref in ((own_in, own_ref), (other_in, other_ref)):
+            x = x_ref[...].reshape(rows, heads * head_dim)
+            for h in range(heads):
+                y = jnp.dot(
+                    x[:, h * head_dim : (h + 1) * head_dim],
+                    h_ref[...],
+                    preferred_element_type=jnp.float32,
+                )
+                o_ref[h] = (y * (1.0 / head_dim)).astype(o_ref.dtype)
+
+    def half(other):
+        return pl.BlockSpec(
+            (step, None, block, heads * head_dim),
+            lambda i, r: (i, (r[0] + other) % 2, 0, 0),
+        )
+
+    out = pl.BlockSpec((heads, rows, head_dim), lambda i, r: (0, i, 0))
+    shape = jax.ShapeDtypeStruct((heads, num_tokens // 2, head_dim), q.dtype)
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(pl.cdiv(pairs, step),),
+            in_specs=[
+                half(0),
+                half(1),
+                pl.BlockSpec((head_dim, head_dim), lambda i, r: (0, 0)),
+            ],
+            out_specs=[out, out],
+        ),
+        out_shape=[shape, shape],
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_rotate_replica_rows",
+    )(
+        jnp.reshape(rank, (1,)).astype(jnp.int32),
+        q.reshape(pairs, 2, block, heads * head_dim),
+        q.reshape(pairs, 2, block, heads * head_dim),
+        jnp.asarray(msa_fp4.hadamard(head_dim), jnp.bfloat16),
+    )
+
+
+def unrotate_replica_rows(
+    out: jax.Array, other: jax.Array, rank: jax.Array, *, interpret: bool = False
+) -> jax.Array:
+    """Inverse of `rotate_replica_rows` for the attention outputs, unrotated
+    (`msa_fp4.unrotate_output`) as `unrotate_to_rows`: this replica's rows
+    of its own heads (the first ``Hl`` of head-major ``out``, read in place)
+    and the partner's rows of them (``other [Hl, T / 2, D]``) -> token-major
+    ``[T, Hl * D]`` in step order. As XLA ops the replicas' halves and the
+    de-interleave each re-laid the output out (c64 mixed twin j-c5ebe0af:
+    ~30 us per layer)."""
+    heads, half_tokens, head_dim = other.shape
+    num_tokens = 2 * half_tokens
+    pairs, step = _replica_grid(num_tokens)
+    block = _INTERLEAVE_TOKENS
+    rows = step * block
+
+    def kernel(rank_ref, own_ref, other_ref, h_ref, o_ref):
+        j = rank_ref[0] % 2
+        for x_ref, pos in ((own_ref, j), (other_ref, 1 - j)):
+            for h in range(heads):
+                y = jnp.dot(x_ref[h], h_ref[...], preferred_element_type=jnp.float32)
+                y = (y * (1.0 / head_dim)).astype(o_ref.dtype)
+                o_ref[:, pos, :, h * head_dim : (h + 1) * head_dim] = y.reshape(
+                    step, block, head_dim
+                )
+
+    rows_spec = pl.BlockSpec((heads, rows, head_dim), lambda i, r: (0, i, 0))
+    merged = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(pl.cdiv(pairs, step),),
+            in_specs=[
+                rows_spec,
+                rows_spec,
+                pl.BlockSpec((head_dim, head_dim), lambda i, r: (0, 0)),
+            ],
+            out_specs=pl.BlockSpec(
+                (step, 2, block, heads * head_dim), lambda i, r: (i, 0, 0, 0)
+            ),
+        ),
+        out_shape=jax.ShapeDtypeStruct(
+            (pairs, 2, block, heads * head_dim), other.dtype
+        ),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_unrotate_replica_rows",
+    )(
+        jnp.reshape(rank, (1,)).astype(jnp.int32),
+        out,
+        other,
+        jnp.asarray(msa_fp4.hadamard(head_dim).T, jnp.bfloat16),
+    )
+    return merged.reshape(num_tokens, heads * head_dim)
 
 
 def merge_partials(
@@ -1086,9 +1207,10 @@ def _head_parallel_attend(
     interpret,
     first_exchange=None,
 ):
-    """Head-major ``[Hl, T, D]`` attention (rotated basis) of the rows of the
-    requests in ``hp_req`` over their pages of this rank's KV head; other
-    rows are zero. ``tokens`` is `msa.token_positions` of the step.
+    """Token-major ``[T, Hl * D]`` attention of this rank's query heads ``q
+    [T, Hl, D]`` (unrotated) for the rows of the requests in ``hp_req`` over
+    their pages of this rank's KV head; other rows are zero. ``tokens`` is
+    `msa.token_positions` of the step.
 
     Requests are attended in rounds of at most ``pages_per_seq`` logical
     blocks (one max-length request): each round exchanges the live pages
@@ -1102,14 +1224,15 @@ def _head_parallel_attend(
     capacity = block_tables_2d.shape[1]  # logical blocks per round
     replicas = kv_head_replicas
     part = -(-capacity // replicas)  # each replica's share of the buffer
-    # The two replicas of a KV head split the rows (`_replica_rows`): each
-    # attends half the tokens with all the head's query heads.
-    split = replicas == 2 and num_tokens % (2 * _BLOCK_Q) == 0
+    # The two replicas of a KV head split the rows (`rotate_replica_rows`):
+    # each attends alternate blocks of the tokens with all the head's query
+    # heads, its own first.
+    split = replicas == 2 and num_tokens % (2 * _INTERLEAVE_TOKENS) == 0
     rows = num_tokens // replicas if split else num_tokens
     offset = rank % replicas * rows if split else 0
-    interleave = split and num_tokens % (2 * _INTERLEAVE_TOKENS) == 0
-    if interleave:
-        q, candidates = _interleave(q), _interleave(candidates)
+    pair = [(r, r ^ 1) for r in range(dcp)]
+    if split:
+        candidates = _interleave(candidates)
         tokens = tuple(_interleave(x) for x in tokens)
 
     selected = _own_selection(
@@ -1127,7 +1250,11 @@ def _head_parallel_attend(
         seq_id, pos, valid = (
             jax.lax.dynamic_slice_in_dim(x, offset, rows) for x in tokens
         )
-        q = _replica_rows(q, rank, axis=axis, dcp=dcp)
+        own, other = rotate_replica_rows(q, rank, interpret=interpret)
+        # Two arrays the attention reads in place: no concatenated copy.
+        q = (own, jax.lax.ppermute(other, axis, pair))
+    else:
+        q = msa_fp4.rotate_queries(q)
     seq_blocks = -(-seq_lens // (block_size * dcp))
     blocks = jnp.where(hp_req, seq_blocks, 0)
     seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
@@ -1173,7 +1300,7 @@ def _head_parallel_attend(
         lo = cu[jnp.min(jnp.where(in_round, seq_idx, max_num_seqs - 1))]
         hi = cu[jnp.max(jnp.where(in_round, seq_idx + 1, 0))]
         lo, hi = (jnp.clip(x - offset, 0, rows) for x in (lo, hi))
-        if interleave:  # a request's rows are spread over the half
+        if split:  # a request's rows are spread over the half
             lo, hi = 0, rows
         page_table = jnp.arange(dcp * num_pages, dtype=jnp.int32)
 
@@ -1187,6 +1314,7 @@ def _head_parallel_attend(
             k_scale_row=0,
             v_scale_row=1,
             head_major=True,
+            q_head_major=split,
             interpret=interpret,
         )
         if not merge:
@@ -1199,10 +1327,11 @@ def _head_parallel_attend(
         def window_body(i, acc):
             start = jnp.minimum(lo + i * window, rows - window)
 
-            def sl(x):
-                return jax.lax.dynamic_slice_in_dim(x, start, window, 0)
+            def sl(x, axis=0):
+                return jax.lax.dynamic_slice_in_dim(x, start, window, axis)
 
-            out, _ = attend(sl(q), kv, sl(keys), sl(local), sl(limit), page_table)
+            q_rows = jax.tree.map(lambda x: sl(x, 1 if split else 0), q)
+            out, _ = attend(q_rows, kv, sl(keys), sl(local), sl(limit), page_table)
             old = jax.lax.dynamic_slice_in_dim(acc, start, window, 1)
             out = jnp.where(sl(mine)[None, :, None], out, old)  # earlier rounds
             return jax.lax.dynamic_update_slice_in_dim(acc, out, start, 1)
@@ -1225,43 +1354,10 @@ def _head_parallel_attend(
 
     _, acc = jax.lax.cond(first < max_num_seqs, more_rounds, lambda s: s, (first, acc))
     if split:
-        acc = _replica_heads(acc, rank, axis=axis, dcp=dcp)
-    if interleave:
-        acc = _deinterleave(acc, axis=1)
-    return acc
-
-
-def _replica_rows(q, rank, *, axis, dcp):
-    """This replica's half of the rows of ``q [T, Hl, D]`` with both
-    replicas' query heads, ``[T / 2, 2 Hl, D]`` (replica 0's heads first):
-    the half of its own heads it keeps and the partner's (rank ``rank ^ 1``)
-    heads for that half, by one permute of a half."""
-    rows = q.shape[0] // 2
-    j = rank % 2
-    mine = jax.lax.dynamic_slice_in_dim(q, j * rows, rows)
-    theirs = jax.lax.ppermute(
-        jax.lax.dynamic_slice_in_dim(q, (1 - j) * rows, rows),
-        axis,
-        [(r, r ^ 1) for r in range(dcp)],
-    )
-    first, second = jnp.where(j == 0, mine, theirs), jnp.where(j == 0, theirs, mine)
-    return jnp.concatenate([first, second], axis=1)
-
-
-def _replica_heads(out, rank, *, axis, dcp):
-    """Inverse of `_replica_rows` for the head-major output ``[2 Hl, T / 2,
-    D]`` of this replica's rows: its own heads ``[Hl, T, D]`` over every row,
-    the partner's half from the partner."""
-    heads = out.shape[0] // 2
-    j = rank % 2
-    mine = jax.lax.dynamic_slice_in_dim(out, j * heads, heads)
-    theirs = jax.lax.ppermute(
-        jax.lax.dynamic_slice_in_dim(out, (1 - j) * heads, heads),
-        axis,
-        [(r, r ^ 1) for r in range(dcp)],
-    )
-    first, second = jnp.where(j == 0, mine, theirs), jnp.where(j == 0, theirs, mine)
-    return jnp.concatenate([first, second], axis=1)
+        heads = num_q_heads
+        other = jax.lax.ppermute(acc[heads:], axis, pair)
+        return unrotate_replica_rows(acc, other, rank, interpret=interpret)
+    return unrotate_to_rows(acc, interpret=interpret)
 
 
 def attend_and_merge(
@@ -1287,7 +1383,8 @@ def attend_and_merge(
     interpret: bool = False,
 ) -> jax.Array:
     """This rank's (``rank``, ``int32[1]``) attention output ``[T, Hl * D]``
-    (unrotated) for its rotated query heads ``q [T, Hl, D]`` and its packed
+    (unrotated) for its query heads ``q [T, Hl, D]`` (unrotated: this op
+    rotates them, `msa_fp4.rotate_queries`) and its packed
     ``candidates [T, G * 2 * topk]`` (`msa_dcp.msa_write_and_candidates_dcp`);
     4-bit caches. `page_exchange`: `start_first_round_exchange` of this step.
     Runs inside a ``shard_map`` over `axis` (the DCP group)."""
@@ -1304,7 +1401,7 @@ def attend_and_merge(
         num_tokens, max_num_seqs, decode_rows, head_parallel_min_tokens
     ):
         return _dcp_attend(
-            q,
+            msa_fp4.rotate_queries(q),
             kv_cache,
             scale_cache,
             candidates,
@@ -1327,7 +1424,7 @@ def attend_and_merge(
     req = jnp.minimum(req, max_num_seqs - 1)
     src_row = jnp.where(p < cu_d[-1], cu_q_lens[req] + p - cu_d[req], 0)
     dcp_out = _dcp_attend(
-        q[src_row],
+        msa_fp4.rotate_queries(q[src_row]),
         kv_cache,
         scale_cache,
         candidates[src_row],
@@ -1353,7 +1450,6 @@ def attend_and_merge(
         first_exchange=page_exchange,
         **common,
     )
-    hp_out = unrotate_to_rows(hp_out, interpret=interpret)
     dcp_out = dcp_out.reshape(rows, -1)
     num_decode = cu_d[-1]
 
