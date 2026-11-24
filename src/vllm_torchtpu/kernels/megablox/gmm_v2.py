@@ -1089,7 +1089,9 @@ def calculate_tiling(
         num_n_tiles -= 1
         tile_n = align_to(size_n_per_rhs, num_n_tiles * num_lanes) // num_n_tiles
 
-        # Decrease tile_k until total memory fits in vmem limit and tile_k is valid.
+    # Decrease tile_k until total memory fits in vmem limit and tile_k is valid,
+    # also when tile_n stopped exactly at its limit.
+    if _gmm_vmem_estimate(tile_m, tile_n, tile_k) > vmem_limit_bytes:
         while (
             _gmm_vmem_estimate(tile_m, tile_n, tile_k) > vmem_limit_bytes
             or not _is_tile_k_quant_block_compatible(tile_k)

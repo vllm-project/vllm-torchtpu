@@ -864,6 +864,48 @@ def test_calculate_tiling_aligns_compact_scale_tiles(monkeypatch, size_k, fuse_a
     assert blocks % 32 == 0 or tiles.tile_k == size_k, tiles
 
 
+@pytest.mark.parametrize(
+    ("size_k", "rhs_cfgs"),
+    [
+        (
+            16384,
+            InputConfigs(
+                quant_dtype=jnp.float4_e2m1fn,
+                quant_block_size=16,
+                dtype=jnp.uint8,
+                has_scale=True,
+                has_global_scale=True,
+                has_compact_scale=True,
+            ),
+        ),
+        (
+            65536,
+            InputConfigs(quant_dtype=None, quant_block_size=65536, dtype=jnp.bfloat16),
+        ),
+    ],
+    ids=["nvfp4_compact", "bf16"],
+)
+def test_calculate_tiling_splits_k_when_tile_n_stops_at_its_limit(
+    monkeypatch, size_k, rhs_cfgs
+):
+    """With N=512, tile_n starts at its limit (twice the MXU columns), so only
+    a smaller tile_k can bring the estimate under the VMEM limit."""
+    _validation_tpu_info(monkeypatch)
+    dims = Dimensions(
+        size_m=128,
+        size_k=size_k,
+        size_n=512,
+        size_group=8,
+        size_lhs_group=8,
+        size_lhs_sublane=16,
+    )
+    lhs_cfgs = InputConfigs(quant_dtype=None, quant_block_size=512, dtype=jnp.bfloat16)
+
+    tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, 58 * 1024 * 1024)
+
+    assert tiles.tile_n == 512 and tiles.tile_k < size_k, tiles
+
+
 def test_gmm_v2_rejects_compact_scales_without_global_scale(monkeypatch):
     _validation_tpu_info(monkeypatch)
     _, scale = make_nvfp4_rhs(jax.random.key(7), 2, 512, 256)
