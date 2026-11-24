@@ -621,7 +621,8 @@ def _decode_candidates_kernel(
     rows = row0 + jax.lax.broadcasted_iota(jnp.int32, (block_q, 1), 0)
     own = (rows >= cu_ref[seq]) & (rows < cu_ref[seq + 1])
 
-    def store(first, m):
+    def store(first, m, rows_major):
+        m = m if rows_major else m.T
         cols = pl.ds(
             pl.multiple_of(group * pages_per_step + first, m.shape[1]), m.shape[1]
         )
@@ -1105,6 +1106,228 @@ def rotate_folded_queries(index_q: jax.Array, *, interpret: bool = False) -> jax
     )
 
 
+def _prefill_candidates_kernel(
+    # Scalar prefetch
+    work_ref,  # [items] tile << _TILE_SHIFT | page group (`msa_indexer.class_work`)
+    tile_info_ref,  # [tiles] query row << _ROW_SHIFT | request
+    block_tables_ref,  # [max_num_seqs * pages_per_seq]
+    seq_pages_ref,  # [max_num_seqs] this rank's pages of each request
+    cu_ref,  # [max_num_seqs + 1] query rows' starts (heads folded)
+    rank_ref,  # [1]
+    tiles_ref,  # [2] large tiles, small tiles in use
+    small_info_ref,  # [small tiles] query row << _ROW_SHIFT | request
+    # In
+    q_ref,  # [Bq, D] the tile's query rows
+    pos_ref,  # [1, Bq] their positions
+    cache_ref,  # [pages, S / p, p, D] index cache, left in HBM
+    small_ref,  # [small tiles * Bs, 2 * topk] small-class candidates, in HBM
+    # Out
+    out_ref,  # [rows, 2 * topk] candidates of every query row, in HBM
+    # Scratch
+    buf,  # `msa_indexer._kernel_v3`'s ring and semaphores
+    sems,
+    scores_ref,  # [P, Bq] f32 the tile's block maxima
+    key_ref,  # [P, Bq] int32 (`_pick_t`)
+    rows_ref,  # [rows + Bq, 2 * topk] f32 the candidates being assembled
+    small_buf,  # [small tiles * Bs, 2 * topk] f32
+    copy_sems,  # DMA [2]: small-class candidates in, candidates out
+    *,
+    pick,
+):
+    """`msa_indexer._kernel_v3` over the large (prefill-chunk) tiles with each
+    tile's block maxima kept in VMEM, ``[P, Bq]`` as scored, and its rows'
+    picks (`_pick_t`) at the tile's last page group: the scores never
+    round-trip through HBM. The picks land at their query rows (rows of
+    other requests, from aligned tile starts and past a request's end, are
+    left to their own tiles); at the last step the small tiles'
+    `pack_candidates` join them at theirs and rows past the last request
+    take the picks of position 0, so the output is in query-row order with
+    no gather."""
+    tile_shift, row_shift = msa_indexer._TILE_SHIFT, msa_indexer._ROW_SHIFT
+    seq_mask = msa_indexer._SEQ_MASK
+    step, last = pl.program_id(0), pl.num_programs(0) - 1
+    entry = work_ref[step]
+    tile = entry >> tile_shift
+    group = entry & msa_indexer._GROUP_MASK
+    pages_per_step = buf.shape[1]
+    rank = rank_ref[0]
+    small_copy = pltpu.make_async_copy(small_ref, small_buf, copy_sems.at[0])
+
+    @pl.when(step == 0)
+    def _():
+        small_copy.start()
+
+    def store(first, m, rows_major):
+        m = m.T if rows_major else m
+        pages = pl.ds(
+            pl.multiple_of(group * pages_per_step + first, m.shape[0]), m.shape[0]
+        )
+        scores_ref[pages, :] = m
+
+    msa_indexer._kernel_v3(
+        work_ref,
+        tile_info_ref,
+        block_tables_ref,
+        seq_pages_ref,
+        q_ref,
+        cache_ref,
+        None,
+        buf,
+        sems,
+        store=store,
+    )
+
+    def put_rows(info, picked, live=True):
+        """Store ``picked [n, 2 * topk]`` at the query rows from ``info``'s,
+        those of its request only."""
+        seq = info & seq_mask
+        row0 = pl.multiple_of(info >> row_shift, msa_indexer._ROW_ALIGN)
+        rows = row0 + jax.lax.broadcasted_iota(jnp.int32, (picked.shape[0], 1), 0)
+        own = live & (rows >= cu_ref[seq]) & (rows < cu_ref[seq + 1])
+        window = rows_ref.at[pl.ds(row0, picked.shape[0])]
+        window[...] = jnp.where(own, picked, window[...])
+
+    def packed(score, block):
+        return jnp.concatenate([score, block.astype(jnp.float32)]).T
+
+    next_tile = work_ref[jnp.minimum(step + 1, last)] >> tile_shift
+
+    @pl.when((step == last) | (next_tile != tile))
+    def _():
+        score, block = _pick_t(
+            rank, scores_ref, pos_ref[...], key_ref, pretransposed=True, **pick
+        )
+        put_rows(tile_info_ref[tile], packed(score, block), tile < tiles_ref[0])
+
+    @pl.when(step == last)
+    def _():
+        small_copy.wait()
+        small_rows = small_buf.shape[0] // small_info_ref.shape[0]
+
+        def merge(i, carry):
+            first = pl.multiple_of(i * small_rows, small_rows)
+            put_rows(small_info_ref[i], small_buf[pl.ds(first, small_rows)])
+            return carry
+
+        jax.lax.fori_loop(0, tiles_ref[1], merge, 0)
+        # Rows past the last request: a padding token's position is 0, which
+        # sees one block whatever the scores.
+        lanes = _TRANSPOSED_ROWS
+        score, block = _pick_t(
+            rank,
+            scores_ref.at[:, :lanes],
+            jnp.zeros((1, lanes), jnp.int32),
+            key_ref.at[:, :lanes],
+            pretransposed=True,
+            **pick,
+        )
+        pad_row = packed(score, block)[:8]
+        end = cu_ref[cu_ref.shape[0] - 1]
+        num_rows = out_ref.shape[0]
+
+        def fill(i, carry):
+            row0 = pl.multiple_of(i * 8, 8)
+            rows = row0 + jax.lax.broadcasted_iota(jnp.int32, (8, 1), 0)
+            window = rows_ref.at[pl.ds(row0, 8)]
+            window[...] = jnp.where(rows >= end, pad_row, window[...])
+            return carry
+
+        jax.lax.fori_loop(end // 8, -(-num_rows // 8), fill, 0)
+        out = pltpu.make_async_copy(
+            rows_ref.at[pl.ds(0, num_rows)], out_ref, copy_sems.at[1]
+        )
+        out.start()
+        out.wait()
+
+
+def _prefill_candidates(
+    plan: msa_indexer._ClassPlan,
+    index_cache: jax.Array,
+    block_tables: jax.Array,
+    folded_cu: jax.Array,
+    positions,
+    small: msa_indexer.ClassScores,
+    small_packed: jax.Array,
+    num_rows: int,
+    *,
+    pick: dict,
+    rank: jax.Array,
+    interpret: bool,
+) -> jax.Array:
+    """`_prefill_candidates_kernel`: the packed candidates ``[num_rows, 2 *
+    topk]`` of every (heads-folded) query row, the large class's picked in
+    the indexer kernel, the small class's (`small_packed`, as `small` scored
+    them) placed at their rows. `positions(tile_seq, tile_row0, block_q)`
+    gives a class's column positions."""
+    _, rows_per_page, _, head_dim = index_cache.shape
+    work = plan.large_work()
+    block_q, pages_per_step = plan.large_block_q, plan.large_pages_per_step
+    num_cols = plan.large_pages
+    pos = positions(work.tile_seq, work.tile_row0, block_q).reshape(1, -1)
+    shift, row_shift = msa_indexer._TILE_SHIFT, msa_indexer._ROW_SHIFT
+    small_info = (
+        jnp.clip(small.tile_row0, 0, num_rows // 8 * 8) << row_shift
+    ) | small.tile_seq
+    scalars = [
+        work.work,
+        work.tile_info,
+        block_tables,
+        work.seq_pages,
+        folded_cu,
+        rank_array(rank),
+        jnp.stack([work.num_tiles, small.num_tiles]).astype(jnp.int32),
+        small_info,
+    ]
+    q_spec = pl.BlockSpec(
+        (pl.Element(block_q), pl.Element(head_dim)),
+        lambda w, work, tile_info, *_: (
+            pl.multiple_of(
+                tile_info[work[w] >> shift] >> row_shift, msa_indexer._ROW_ALIGN
+            ),
+            0,
+        ),
+    )
+    pos_spec = pl.BlockSpec((1, block_q), lambda w, work, *_: (0, work[w] >> shift))
+    any_spec = pl.BlockSpec(memory_space=pl.ANY)
+    width = small_packed.shape[1]
+    assembled_rows = num_rows + block_q
+    ring = (msa_indexer._RING_SLOTS, pages_per_step, rows_per_page, head_dim)
+    scratch = [
+        pltpu.VMEM(ring, jnp.uint32),
+        pltpu.SemaphoreType.DMA((msa_indexer._RING_SLOTS,)),
+        pltpu.VMEM((num_cols, block_q), jnp.float32),
+        pltpu.VMEM((num_cols, block_q), jnp.int32),
+        pltpu.VMEM((assembled_rows, width), jnp.float32),
+        pltpu.VMEM(small_packed.shape, jnp.float32),
+        pltpu.SemaphoreType.DMA((2,)),
+    ]
+    # [rows, 2 * topk] f32 pads to 128 lanes in VMEM.
+    vmem_bytes = 4 * (
+        ring[0] * ring[1] * ring[2] * ring[3]
+        + 2 * num_cols * block_q
+        + (assembled_rows + small_packed.shape[0]) * _LANES
+        + 2 * block_q * head_dim
+    )
+    return pl.pallas_call(
+        functools.partial(_prefill_candidates_kernel, pick=pick),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=len(scalars),
+            grid=(jnp.maximum(work.group_ends[-1], 1),),
+            in_specs=[q_spec, pos_spec, any_spec, any_spec],
+            out_specs=any_spec,
+            scratch_shapes=scratch,
+        ),
+        out_shape=jax.ShapeDtypeStruct((num_rows, width), jnp.float32),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            disable_bounds_checks=True,
+            vmem_limit_bytes=max(msa_select._VMEM_LIMIT_BYTES, vmem_bytes + (8 << 20)),
+        ),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_prefill_candidates",
+    )(*scalars, work.q_rows, pos, index_cache, small_packed)
+
+
 def _class_candidates(
     folded: jax.Array,
     num_heads: int,
@@ -1115,8 +1338,13 @@ def _class_candidates(
     cu_q_lens: jax.Array,
     num_seqs: jax.Array,
     seq_id: jax.Array,
-    candidates,
     *,
+    block_size: int,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    rank: jax.Array,
+    dcp: int,
     interpret: bool,
     scale_cache: jax.Array | None,
     scale_row: int | None,
@@ -1128,6 +1356,9 @@ def _class_candidates(
     Gathering the classes' ``[P, columns]`` scores to ``[T, P]`` first (a
     concatenate, column gather and transpose, ~110 us per layer at c48)
     moved 32x the bytes, which the transposing pick kernel then turned back.
+    With tile-major large tiles (kernel v3) the large class picks inside its
+    indexer kernel, which also places every row's candidates
+    (`_prefill_candidates`).
 
     ``G > 1`` heads are folded into each request's query rows in (token,
     head) order, as ``index_q [T, G, D]`` lays them out: the block scores are
@@ -1155,38 +1386,80 @@ def _class_candidates(
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     max_num_seqs = q_lens.shape[0]
     seq_of_token = jnp.minimum(seq_id, max_num_seqs - 1)
-    picks, cols = [], []
-    for scored, block_q, transposed in (
-        (plan.small(), plan.small_block_q, not plan.token_major),
-        (plan.large(), plan.large_block_q, True),
-    ):
+    candidates = functools.partial(
+        local_candidates,
+        block_size=block_size,
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        rank=rank,
+        dcp=dcp,
+        interpret=interpret,
+    )
+
+    def positions(tile_seq, tile_row0, block_q):
         # A column's query row sits at offset o of its request's folded rows,
         # token o // G of it: position = len - q_len + o // G. Rows of a tile
         # past its request (never gathered back) stay inside its positions,
         # which bound the candidate scan's width.
-        per_tile = functools.partial(msa_indexer.lookup, index=scored.tile_seq)
-        row = scored.tile_row0[:, None] + jnp.arange(block_q, dtype=jnp.int32)[None, :]
+        per_tile = functools.partial(msa_indexer.lookup, index=tile_seq)
+        row = tile_row0[:, None] + jnp.arange(block_q, dtype=jnp.int32)[None, :]
         offset = row - per_tile(folded_cu[:-1])[:, None]
         q_len = jnp.maximum(per_tile(q_lens), 1)[:, None]
         token = jnp.clip(offset // num_heads, 0, q_len - 1)
-        col_pos = (per_tile(seq_lens)[:, None] - q_len + token).reshape(-1)
+        return (per_tile(seq_lens)[:, None] - q_len + token).reshape(-1)
+
+    def class_picks(scored, block_q, transposed):
         # A class's scores are padded to its worst-case tile count (the large
         # class: 66 tiles of 512 at 8K tokens for ~14 real ones); pick in
         # its live tiles only.
         s, b = candidates(
             scored.scores if transposed else scored.scores[:, None, :],
-            col_pos,
+            positions(scored.tile_seq, scored.tile_row0, block_q),
             live_rows=scored.num_tiles * block_q,
             tile_major=scored.scores.ndim == 3,
         )
-        picks.append(pack_candidates(s, b))
+        return pack_candidates(s, b)
+
+    small = plan.small()
+    small_picks = class_picks(small, plan.small_block_q, not plan.token_major)
+    if plan.large_tile_major and plan.token_major:
+        packed = _prefill_candidates(
+            plan,
+            index_cache,
+            block_tables,
+            folded_cu,
+            positions,
+            small,
+            small_picks,
+            num_tokens * num_heads,
+            pick=dict(
+                block_size=block_size,
+                topk=topk,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                dcp=dcp,
+                col_bits=_key_bits(plan.large_pages),
+                real_cols=plan.large_pages,
+            ),
+            rank=rank,
+            interpret=interpret,
+        )  # [T * G, 2 * topk], (token, head) rows
+        return packed.reshape(num_tokens, -1)
+    picks, cols = [small_picks], []
+    large = plan.large()
+    picks.append(class_picks(large, plan.large_block_q, True))
+    for scored, block_q, picked in (
+        (small, plan.small_block_q, picks[0]),
+        (large, plan.large_block_q, picks[1]),
+    ):
         # Each head's and token's column in this class (`_class_scores`).
         start = msa_indexer.lookup(scored.tile_start, seq_of_token)[None]
         off = rows - start
         col = (
             msa_indexer.lookup(scored.first_tile, seq_of_token)[None] + off // block_q
         ) * block_q
-        cols.append(jnp.clip(col + off % block_q, 0, picks[-1].shape[0] - 1))
+        cols.append(jnp.clip(col + off % block_q, 0, picked.shape[0] - 1))
     # A head's and token's picks: its large-class column if its request is
     # large, else its small-class one.
     col = jnp.where(
@@ -1341,7 +1614,12 @@ def msa_write_and_candidates_dcp(
             cu_q_lens,
             distribution[2],
             seq_id,
-            candidates,
+            block_size=block_size,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            rank=rank,
+            dcp=dcp,
             interpret=interpret,
             scale_cache=scale_cache,
             scale_row=scale_row,

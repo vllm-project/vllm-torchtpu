@@ -404,8 +404,10 @@ def _kernel_v3(
     A folded 4-bit page (`msa_fp4.scales_in_page`) is ``S / 8`` word rows of
     int4 keys and one row of f32 slot scales (`_chunk_maxima_t`).
 
-    `store(first, m)`, if given, takes each chunk's maxima ``m [Bq, chunk]``
-    (pages ``first + i`` of the group) in place of `o_ref`; `after_wait(slot)`
+    `store(first, m, rows_major)`, if given, takes each chunk's maxima (pages
+    ``first + i`` of the group) in place of `o_ref`, as scored: ``m [Bq,
+    chunk]`` if `rows_major` (`_scores_transposed`), else ``[chunk, Bq]``;
+    `after_wait(slot)`
     runs once the step's pages are in ring slot `slot`, before they are scored.
     """
     slots, pages_per_step, rows, head_dim = buf.shape
@@ -487,7 +489,7 @@ def _kernel_v3(
     def put(first, m, rows_major):
         """Store maxima ``m``: ``[Bq, chunk]`` if `rows_major`, else ``[chunk, Bq]``."""
         if store is not None:
-            store(first, m if rows_major else m.T)
+            store(first, m, rows_major)
         elif transposed:
             o_ref[:, pl.ds(first, chunk)] = m if rows_major else m.T
         else:
@@ -945,7 +947,9 @@ def _token_columns(rows, cu_q_lens, first_tile, tile_start, block_q, num_cols):
 
 class _ClassPlan(NamedTuple):
     """`block_scores`' two tile classes. `small()` / `large()` score them
-    (`ClassScores` each); `token_major` is the small class's layout."""
+    (`ClassScores` each); `token_major` is the small class's layout and
+    `large_tile_major` the large one's (kernel v3), whose work list
+    `large_work()` builds unscored (`class_work`)."""
 
     small: Callable
     large: Callable
@@ -955,6 +959,9 @@ class _ClassPlan(NamedTuple):
     max_large: int
     is_large: jax.Array
     token_major: bool
+    large_work: Callable
+    large_pages_per_step: int
+    large_tile_major: bool
 
 
 def is_prefill_step(num_tokens: int, max_num_seqs: int) -> bool:
@@ -1003,6 +1010,9 @@ def class_plan(
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     active = seq_ids < num_seqs
     is_large = active & (q_lens > block_q)
+    # One padded f32 copy of the queries for both classes (~32 us per layer
+    # each at DCP 8, c64 twin j-0a66fa2e).
+    q_pad = max(block_q, large_block_q)
     score = functools.partial(
         _class_scores,
         index_q,
@@ -1013,9 +1023,7 @@ def class_plan(
         interpret=interpret,
         scale_cache=scale_cache,
         scale_row=scale_row,
-        # One padded f32 copy of the queries for both classes (~32 us per
-        # layer each at DCP 8, c64 twin j-0a66fa2e).
-        q_pad=max(block_q, large_block_q),
+        q_pad=q_pad,
     )
     # Large requests have more than block_q tokens each.
     max_large = min(max_num_seqs, num_tokens // (block_q + 1))
@@ -1058,16 +1066,19 @@ def class_plan(
         kernel=small_kernel,
         token_major=token_major,
     )
+    # +1 per request for the partial last tile, plus the up-to-7 rows each
+    # aligned start adds.
+    max_large_tiles = (
+        num_tokens // large_block_q
+        + max_large
+        + -(-(_ROW_ALIGN - 1) * max_large // large_block_q)
+        + 1
+    )
     large = functools.partial(
         score,
         is_large,
         block_q=large_block_q,
-        # +1 per request for the partial last tile, plus the up-to-7 rows
-        # each aligned start adds.
-        max_tiles=num_tokens // large_block_q
-        + max_large
-        + -(-(_ROW_ALIGN - 1) * max_large // large_block_q)
-        + 1,
+        max_tiles=max_large_tiles,
         pages_per_step=pages_per_step,
         kernel=large_kernel,
         # A tile's scores contiguous: its picks read one run, where the
@@ -1076,6 +1087,19 @@ def class_plan(
         tile_major=large_kernel == "v3",
     )
     pages_per_seq = block_tables.shape[0] // max_num_seqs
+    large_work = functools.partial(
+        class_work,
+        index_q,
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        is_large,
+        block_q=large_block_q,
+        max_tiles=max_large_tiles,
+        pages_per_step=pages_per_step,
+        page_size=_page_tokens(index_cache.shape[1], index_cache.dtype),
+        q_pad=q_pad,
+    )
     return _ClassPlan(
         small=small,
         large=large,
@@ -1085,6 +1109,9 @@ def class_plan(
         max_large=max_large,
         is_large=is_large,
         token_major=token_major,
+        large_work=large_work,
+        large_pages_per_step=pages_per_step,
+        large_tile_major=large_kernel == "v3",
     )
 
 
