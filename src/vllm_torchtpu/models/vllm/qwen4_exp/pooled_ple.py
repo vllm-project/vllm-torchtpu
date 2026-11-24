@@ -104,11 +104,11 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         self._finalized = True
 
     def lookup_partial(
-        self, inputs: PLEInputs, valid_tokens: torch.Tensor
+        self, inputs: PLEInputs, valid_tokens: torch.Tensor, *, lean: bool = False
     ) -> torch.Tensor:
         """This rank's raw n-gram rows before `parallel.combine` (resident table)."""
         assert not self.cpu_offload and not self.parallel.across_dp
-        return self.storage.lookup_raw(self._lookup_ids(inputs, valid_tokens))
+        return self.storage.lookup_raw(self._lookup_ids(inputs, valid_tokens, lean=lean))
 
     def bind_history(self, history: torch.Tensor) -> None:
         if history.ndim != 3 or history.shape[1:] != self.state_shape:
@@ -131,13 +131,14 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             )
 
     def _lookup_ids(
-        self, inputs: PLEInputs, valid_tokens: torch.Tensor
+        self, inputs: PLEInputs, valid_tokens: torch.Tensor, *, lean: bool = False
     ) -> torch.Tensor:
+        """``lean``: VLLM_TPU_MK_IO_LEAN=ple (see token_requests and compute_ids)."""
         request, chunk_pos = token_requests(
-            inputs.query_start_loc, inputs.input_ids.shape[0]
+            inputs.query_start_loc, inputs.input_ids.shape[0], compare=lean
         )
         ids = self.ple_embedding.compute_ids(
-            inputs.input_ids, inputs.ngram_context, request, chunk_pos
+            inputs.input_ids, inputs.ngram_context, request, chunk_pos, lean=lean
         )
         # Hash products use int64. The bounded row ids cross an int32 Pallas ABI.
         ids = ids.to(torch.int32)
@@ -193,6 +194,7 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         sequence_parallel: bool = False,
         prefill_ckpt: tuple[torch.Tensor, torch.Tensor] | None = None,
         combined_raw: torch.Tensor | None = None,
+        lean: bool = False,
     ) -> torch.Tensor:
         """``speculative`` is (read_ids, ckpt_ids, windowed) on the unified pool
         with speculative decoding; see ``pooled_short_conv_speculative``.
@@ -204,6 +206,9 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         With ``sequence_parallel`` the hidden states and the returned rows are
         this TP rank's token shard (see ``sequence_parallel``); the lookup,
         values and the convolution still cover every token of the step.
+
+        ``lean`` (VLLM_TPU_MK_IO_LEAN=ple, megakernel programs): the same values
+        from fewer index ops (see token_requests and compute_ids).
         """
         num_tokens = (
             inputs.input_ids.shape[0] if sequence_parallel else hidden_states.shape[0]
@@ -223,7 +228,9 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
                 * self.ple_embedding.heads_per_ngram,
             ).clone()
         else:
-            raw = self.storage.lookup_raw(self._lookup_ids(inputs, valid_tokens))
+            raw = self.storage.lookup_raw(
+                self._lookup_ids(inputs, valid_tokens, lean=lean)
+            )
         if combined_raw is None:
             raw = self.parallel.combine(raw, num_tokens)
         gated = self.gated_values(
@@ -262,7 +269,7 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             )
         if state_indices.shape[0] == 0:
             return torch.zeros_like(hidden_states)
-        request, _ = token_requests(inputs.query_start_loc, num_tokens)
+        request, _ = token_requests(inputs.query_start_loc, num_tokens, compare=lean)
         valid = (
             torch.arange(num_tokens, device=hidden_states.device) < valid_tokens
         ) & (state_indices[request] >= 0)
