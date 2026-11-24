@@ -1051,14 +1051,13 @@ def calculate_tiling(
             # E4M3 block scales stay one byte in VMEM with a global scale.
             scale_bytes = 1 if rhs_cfgs.has_global_scale else 4
             rhs_scale_vmem = num_quant_blocks_per_tile_k * tn * scale_bytes
-        rhs_bias_vmem = 0
-        if rhs_cfgs.has_bias:
-            rhs_bias_vmem = tn * 4
+        # FP32 per-channel inputs of shape [1, tn]: the bias and the global scale.
+        num_per_channel = int(rhs_cfgs.has_bias) + int(rhs_cfgs.has_global_scale)
+        rhs_per_channel_vmem = num_per_channel * tn * 4
         rhs_vmem = fuse_act_factor * (
-            3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
+            3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_per_channel_vmem
         )
         if rhs_cfgs.has_global_scale:
-            rhs_vmem += fuse_act_factor * 2 * tn * 4
             # FP32 dequantization holds an FP32 [tk, tn] weight tile and an
             # FP32 [tk, tn] broadcast of the combined block scales.
             rhs_vmem += fuse_act_factor * 2 * tk * tn * 4
