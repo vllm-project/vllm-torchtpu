@@ -24,7 +24,13 @@ from .common import (
     _reduce_on_mxu,
     _weighted_selector,
 )
-from .tuned import PACKED_FP8_MQA_CONFIG, dense_key_tile, paged_mqa_query_tile
+from .tuned import (
+    PACKED_FP8_LIVE_RUNG,
+    PACKED_FP8_MQA_CONFIG,
+    PACKED_FP8_WIDTH_STEP,
+    dense_key_tile,
+    paged_mqa_query_tile,
+)
 
 
 def _encode_page_table(page_ids, layout, first_bank_rows):
@@ -81,6 +87,14 @@ class _DenseKernel:
         self.half_pages = half_pages if self.half < self.fragments else self.tile_pages
         self.rest_pages = self.tile_pages - self.half_pages
         self.rest_chunk = next(c for c in (8, 6, 4, 2, 1) if self.rest_pages % c == 0)
+        # Fragment counts a tile may score, ascending. A resident tile also
+        # stops at each live rung of its top width step.
+        rung = PACKED_FP8_LIVE_RUNG // self.mxu_size
+        top = self.fragments - PACKED_FP8_WIDTH_STEP // self.mxu_size
+        rungs = range(top + rung, self.fragments, rung) if reuse_keys else ()
+        lower = (self.half,) if self.half < self.fragments else ()
+        rungs = (c for c in rungs if c > self.half)
+        self.counts_ladder = (*lower, *rungs, self.fragments)
         owners = jnp.repeat(jnp.arange(self.q_tile), self.heads)[:, None]
         owners = _head_order(owners, self.q_tile, self.sublanes)[:, 0]
         selector = jnp.arange(self.q_tile)[:, None] == owners[None, :]
@@ -275,8 +289,12 @@ class _QueryBlock:
             scaled = jnp.where(remaining > bound, scaled, -jnp.inf)
             k.scores[self.output_slot(tile), :, pl.ds(column, PAGE_RECORDS)] = scaled
 
-    def emit_tile(self, tile, prefetch, count):
-        """Score the first `count` fragments of `tile`; the rest are -inf."""
+    def emit_tile(self, tile, prefetch, count, bucket):
+        """Score the first `count` fragments of `tile`; the rest are -inf.
+
+        `bucket` (half or full tile) fixes each fragment's head-sum path, so
+        rungs below the full tile reproduce its arithmetic.
+        """
         k = self.k
         metadata, following = self.page_slot(tile + 2), self.key_slot(tile + 2)
         if prefetch:
@@ -303,7 +321,7 @@ class _QueryBlock:
                 # Keyed to the tuned depth, so another issue depth keeps each
                 # fragment's head-sum arithmetic.
                 tuned = fragment + PACKED_FP8_MQA_CONFIG.issue_depth
-                mxu = _reduce_on_mxu(fragment, tuned, count, every=4, drain=4)
+                mxu = _reduce_on_mxu(fragment, tuned, bucket, every=4, drain=4)
                 products = pending.pop(fragment)
                 values = _reduce_heads(
                     products, *self.reduction, sublanes=k.sublanes, use_mxu=mxu
@@ -322,12 +340,18 @@ class _QueryBlock:
         # Every tile takes the masked path: the extra selects are free next
         # to the MXU/VPOP bound, and one emit family halves code.
         k = self.k
-        if k.half >= k.fragments:
-            self.emit_tile(tile, prefetch, k.fragments)
-        else:
-            short = self.maximum_length - tile * k.key_tile <= k.half * k.mxu_size
-            emit = partial(self.emit_tile, tile, prefetch)
-            lax.cond(short, partial(emit, k.half), partial(emit, k.fragments))
+        emit = partial(self.emit_tile, tile, prefetch)
+        ladder = k.counts_ladder
+        branches = [
+            partial(emit, c, k.half if c == k.half else k.fragments) for c in ladder
+        ]
+        if len(branches) == 1:
+            branches[0]()
+            return
+        live = self.maximum_length - tile * k.key_tile
+        # The fewest fragments covering every live key of the query group.
+        index = sum((live > c * k.mxu_size).astype(jnp.int32) for c in ladder[:-1])
+        lax.switch(index, branches)
 
     def step_tile(self, tile, _):
         # Four slots retain the current mask while prefetching metadata

@@ -9,14 +9,16 @@ import pytest
 from vllm_torchtpu.kernels.mla.paged_swa import swa_word_pages, write_swa_word_pool
 
 
+@pytest.mark.parametrize("shift", [0, 128])
 @pytest.mark.parametrize("banked", [False, True])
-def test_publish_shared_word_pool(banked):
+def test_publish_shared_word_pool(banked, shift):
     if jax.default_backend() != "tpu":
         pytest.skip("SparseCore publication requires TPU")
     page_size, rows = 64, 16384
     rng = np.random.default_rng(17)
     original = rng.integers(-(1 << 31), 1 << 31, (rows, 128), dtype=np.int32)
-    records = np.array([-1, 0, 63, 64, 65, 67, 70, rows // 4, rows // 2 - 1], np.int32)
+    last = rows // 2 - 1 - shift
+    records = np.array([-1, 0, 63, 64, 65, 67, 70, rows // 4, last], np.int32)
     values = np.asarray(
         jnp.asarray(rng.standard_normal((len(records), 512)), jnp.bfloat16)
     )
@@ -24,15 +26,17 @@ def test_publish_shared_word_pool(banked):
     expected = original.copy().view(np.uint32).reshape(-1, 512)
     for record, word in zip(records, bits):
         if record >= page_size:
-            shift = int(record % 2) * 16
-            mask = np.uint32(65535 << shift)
-            expected[record // 2] = (expected[record // 2] & ~mask) | (word << shift)
+            # A shift moves each valid record by whole pages.
+            record += shift
+            half = int(record % 2) * 16
+            mask = np.uint32(65535 << half)
+            expected[record // 2] = (expected[record // 2] & ~mask) | (word << half)
     expected = expected.view(np.int32).reshape(rows, 128)
     raw = jax.device_put(original)
     if banked:
         raw = (raw[: rows // 2], raw[rows // 2 :])
     compiled = write_swa_word_pool.lower(
-        raw, jnp.asarray(records), jnp.asarray(values), page_size=page_size
+        raw, jnp.asarray(records), jnp.asarray(values), page_size=page_size, shift=shift
     ).compile()
     memory = compiled.memory_analysis()
     assert memory.alias_size_in_bytes == original.nbytes

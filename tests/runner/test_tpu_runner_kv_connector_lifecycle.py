@@ -128,10 +128,16 @@ def _host_copy(chunks, lengths, spec_logprobs=None):
 
 @pytest.mark.parametrize("is_async", [False, True])
 @pytest.mark.parametrize(
-    "partial_prefill,proposals_needed", [(False, True), (True, False), (True, True)]
+    "partial_prefill,proposals_needed,context_needed",
+    [
+        (False, True, True),
+        (True, False, True),
+        (True, True, True),
+        (True, False, False),
+    ],
 )
 def test_dflash_partial_prefill_saves_context_without_async_draft_bootstrap(
-    is_async, partial_prefill, proposals_needed
+    is_async, partial_prefill, proposals_needed, context_needed
 ):
     events = []
     propose = MagicMock(
@@ -145,6 +151,7 @@ def test_dflash_partial_prefill_saves_context_without_async_draft_bootstrap(
     )
     runner.drafter = runner._async_drafter = drafter
     runner._draft_proposals_needed = proposals_needed
+    runner._draft_context_needed = context_needed
     runner.input_batch.generators = {}
     runner._assemble_async_prefill_bootstrap = MagicMock(
         return_value=([torch.tensor([7, 8])], {0: 0}, None, {"r0": 1})
@@ -166,12 +173,8 @@ def test_dflash_partial_prefill_saves_context_without_async_draft_bootstrap(
     if is_async:
         output = output.get_output()
     assert output.sampled_token_ids == ([[]] if partial_prefill else [[7]])
-    assert events == [
-        "draft" if proposals_needed else "context",
-        "save",
-        "poll",
-        "clear",
-    ]
+    draft = ["draft"] if proposals_needed else ["context"] if context_needed else []
+    assert events == [*draft, "save", "poll", "clear"]
     assert propose.call_count == int(proposals_needed)
     assert runner._assemble_async_prefill_bootstrap.call_count == int(
         is_async and proposals_needed

@@ -1191,10 +1191,6 @@ class TestModelForwardStage:
                 side_effect=lambda h, *a: h,
             ),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
-                side_effect=lambda h, pm: h,
-            ),
-            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
                 side_effect=lambda h, pm: h,
             ),
@@ -1222,10 +1218,6 @@ class TestModelForwardStage:
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.post",
                 side_effect=lambda h, *a: h,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
-                side_effect=lambda h, pm: h,
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
@@ -1273,10 +1265,6 @@ class TestModelForwardStage:
                 side_effect=lambda h, *a: h,
             ),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
-                side_effect=lambda h, pm: h,
-            ),
-            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
                 side_effect=lambda h, pm: h,
             ),
@@ -1308,10 +1296,6 @@ class TestModelForwardStage:
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.post",
                 side_effect=lambda h, *a: h,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
-                side_effect=lambda h, pm: h,
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
@@ -1368,10 +1352,6 @@ class TestModelForwardStage:
                 side_effect=lambda h, *a: h,
             ),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
-                side_effect=lambda h, pm: h,
-            ),
-            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
                 side_effect=lambda h, pm: h,
             ),
@@ -1415,10 +1395,6 @@ class TestModelForwardStage:
             ),
             patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.post") as mock_post,
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
-                side_effect=lambda h, pm: h,
-            ),
-            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
                 side_effect=lambda h, pm: h,
             ),
@@ -1460,10 +1436,6 @@ class TestModelForwardStage:
                 side_effect=lambda h, *a: h,
             ),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
-                side_effect=lambda h, pm: h,
-            ),
-            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",
                 side_effect=lambda h, pm: h,
             ),
@@ -1498,10 +1470,6 @@ class TestModelForwardStage:
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.post",
                 side_effect=lambda h, *a: h,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
-                side_effect=lambda h, pm: h,
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.flat_collapse",

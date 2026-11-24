@@ -764,6 +764,7 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_num_chunks: int = 0
         self._dp_step_max_reqs: int = 0
         self._draft_proposals_needed: bool = True
+        self._draft_context_needed: bool = True
         self._dp_step_has_encoder_inputs = False
         # The coordinated step counter (one per _dp_coordinated_step call,
         # identical on every rank) and the dynamic expert re-layout
@@ -3559,16 +3560,54 @@ class TPUModelRunner(GPUModelRunner):
             num_chunks += 1
         return num_chunks, max_chunk_reqs
 
+    def _chunk_samples(
+        self, scheduler_output: "SchedulerOutput", start: int, end: int
+    ) -> bool:
+        """Whether a request of batch rows [start, end) keeps its sampled
+        token, by sample_tokens' discard rule."""
+        for req_id in self.input_batch.req_ids[start:end]:
+            assert req_id is not None
+            state = self.requests[req_id]
+            count = scheduler_output.num_scheduled_tokens[req_id]
+            if state.num_computed_tokens + count >= state.num_tokens:
+                return True
+        return False
+
+    def _unsampled_logits(self, rows: int) -> torch.Tensor:
+        """Zero logits at the precompiled sampling shape (`_dummy_logits`)."""
+        return torch.zeros(
+            (rows, self.vocab_size), dtype=self._hidden_states_dtype, device=self.device
+        )
+
+    def _reaches_prompt_tail(
+        self, scheduler_output: "SchedulerOutput", rows: int
+    ) -> bool:
+        """Whether a request's scheduled tokens end within its last ``rows``
+        prompt tokens or past the prompt."""
+        for req_id, count in scheduler_output.num_scheduled_tokens.items():
+            index = self.input_batch.req_id_to_index[req_id]
+            end = int(self.input_batch.num_computed_tokens_cpu[index]) + count
+            if end > int(self.input_batch.num_prompt_tokens[index]) - rows:
+                return True
+        return False
+
     def _needs_draft_proposals(self, scheduler_output: "SchedulerOutput") -> bool:
         """DFlash/DSpark candidates are useful only once a prompt is complete."""
         if not isinstance(self.drafter, DFlashProposer):
             return True
-        for req_id, count in scheduler_output.num_scheduled_tokens.items():
-            index = self.input_batch.req_id_to_index[req_id]
-            computed = int(self.input_batch.num_computed_tokens_cpu[index])
-            if computed + count >= int(self.input_batch.num_prompt_tokens[index]):
-                return True
-        return False
+        return self._reaches_prompt_tail(scheduler_output, 1)
+
+    def _needs_draft_context(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Whether this step's draft context rows are ever read.
+
+        A context update writes rows of this step only, and a draft with a
+        context window reads only the last ``context_window`` prompt rows
+        and later ones.
+        """
+        if not isinstance(self.drafter, DFlashProposer):
+            return True
+        window = self.drafter.context_window
+        return window is None or self._reaches_prompt_tail(scheduler_output, window)
 
     def _dp_coordinated_step(
         self,
@@ -3577,9 +3616,11 @@ class TPUModelRunner(GPUModelRunner):
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
         needs_draft_proposals: bool = True,
+        needs_draft_context: bool = True,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         self._draft_proposals_needed = needs_draft_proposals
+        self._draft_context_needed = needs_draft_context
         # Every rank reaches this point once per step, dummy steps included,
         # which is what makes a step-cadenced collection land on all of them
         # at once instead of 32 independent pauses.
@@ -3609,6 +3650,7 @@ class TPUModelRunner(GPUModelRunner):
                 *(int(v) for v in relayout),
                 -int(local_num_tokens),
                 -int(local_num_reqs),
+                int(needs_draft_context),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -3639,6 +3681,7 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_max_reqs = int(t[2].item())
         self._dp_step_has_encoder_inputs = bool(t[3].item())
         self._draft_proposals_needed = bool(t[4].item())
+        self._draft_context_needed = bool(t[10].item())
         return bucket, int(t[1].item())
 
     def _execute_dp_mm_encoder(
@@ -3717,7 +3760,8 @@ class TPUModelRunner(GPUModelRunner):
         if num_chunks > 0 and spec is not None and spec.use_eagle():
             drafter = self._async_drafter
             if isinstance(drafter, DFlashProposer) and not self._draft_proposals_needed:
-                drafter.run_dp_dummy_context(num_chunks)
+                if self._draft_context_needed:
+                    drafter.run_dp_dummy_context(num_chunks)
             else:
                 drafter.run_dp_dummy_draft(num_chunks)
 
@@ -3785,6 +3829,7 @@ class TPUModelRunner(GPUModelRunner):
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
             needs_draft_proposals=self._needs_draft_proposals(scheduler_output),
+            needs_draft_context=self._needs_draft_context(scheduler_output),
         )
         self._dp_step_num_chunks = target_num_chunks
 
@@ -4107,12 +4152,17 @@ class TPUModelRunner(GPUModelRunner):
                         hidden_states, layout_plan, logits_indices
                     )
                 )
+                # A chunk of partial prefills only: sample_tokens discards
+                # each token it samples, so it samples zeros, not the head.
+                samples = self._chunk_samples(scheduler_output, start_index, end_index)
                 if sample_hidden_states is None:
                     hidden_states = sequence_layout_planner.finalize_hidden_states(
                         hidden_states,
                         layout_plan,
                     )
-                    if self._can_use_fused_greedy_head(
+                    if not samples:
+                        logits = self._unsampled_logits(logits_indices.shape[0])
+                    elif self._can_use_fused_greedy_head(
                         scheduler_output, spec_decode_metadata, logits_indices.shape[0]
                     ):
                         logits = GreedyTokenIds(
@@ -4125,7 +4175,9 @@ class TPUModelRunner(GPUModelRunner):
                             hidden_states, logits_indices
                         )
                 else:
-                    if self._can_use_fused_greedy_head(
+                    if not samples:
+                        logits = self._unsampled_logits(sample_hidden_states.shape[0])
+                    elif self._can_use_fused_greedy_head(
                         scheduler_output,
                         spec_decode_metadata,
                         sample_hidden_states.shape[0],
@@ -4856,8 +4908,9 @@ class TPUModelRunner(GPUModelRunner):
         if self._is_async_drafter and combined_selected_tokens:
             if context_only_draft:
                 assert isinstance(self.drafter, DFlashProposer)
-                with self._stage_timing.stage("draft_context_update"):
-                    self.drafter.prepare_prefill_handoff()
+                if self._draft_context_needed:
+                    with self._stage_timing.stage("draft_context_update"):
+                        self.drafter.prepare_prefill_handoff()
             elif is_spec_step:
                 with self._stage_timing.stage("draft_propose"):
                     eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(

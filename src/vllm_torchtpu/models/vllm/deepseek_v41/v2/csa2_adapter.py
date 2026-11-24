@@ -59,9 +59,9 @@ def _publish_main_banked(
 
 
 def _publish_swa(
-    raw: jax.Array, records: jax.Array, values: jax.Array, page_size: int
+    raw: jax.Array, records: jax.Array, values: jax.Array, page_size: int, shift: int
 ) -> jax.Array:
-    return write_swa_word_pool(raw, records, values, page_size=page_size)
+    return write_swa_word_pool(raw, records, values, page_size=page_size, shift=shift)
 
 
 def _publish_swa_banked(
@@ -70,8 +70,11 @@ def _publish_swa_banked(
     records: jax.Array,
     values: jax.Array,
     page_size: int,
+    shift: int,
 ) -> tuple[jax.Array, jax.Array]:
-    return write_swa_word_pool((raw, high), records, values, page_size=page_size)
+    return write_swa_word_pool(
+        (raw, high), records, values, page_size=page_size, shift=shift
+    )
 
 
 def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
@@ -617,13 +620,13 @@ def initialize_csa2_ops() -> None:
         (
             "publish_swa",
             _publish_swa,
-            (P(),) * 3 + (None,),
+            (P(),) * 3 + (None,) * 2,
             lambda r, *_: torch.empty_like(r),
         ),
         (
             "publish_swa_banked",
             _publish_swa_banked,
-            (P(),) * 4 + (None,),
+            (P(),) * 4 + (None,) * 2,
             lambda r, h, *_: (torch.empty_like(r), torch.empty_like(h)),
         ),
         (
@@ -726,15 +729,19 @@ def publish_main(
 
 
 def publish_swa(
-    cache: "PagedCacheRows", records: torch.Tensor, values: torch.Tensor
+    cache: "PagedCacheRows",
+    records: torch.Tensor,
+    values: torch.Tensor,
+    shift: int = 0,
 ) -> None:
+    """Publish ``values`` at ``records + shift`` (see `write_swa_word_pool`)."""
     if cache.raw_hi is None:
         cache.raw.copy_(
-            _ops["publish_swa"](cache.raw, records.int(), values, cache.shape[1])
+            _ops["publish_swa"](cache.raw, records.int(), values, cache.shape[1], shift)
         )
     else:
         low, high = _ops["publish_swa_banked"](
-            cache.raw, cache.raw_hi, records.int(), values, cache.shape[1]
+            cache.raw, cache.raw_hi, records.int(), values, cache.shape[1], shift
         )
         cache.raw.copy_(low)
         cache.raw_hi.copy_(high)

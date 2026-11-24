@@ -37,20 +37,26 @@ def swa_word_pages(
     return raw.reshape(-1, 2 * page_size, 128)
 
 
-@functools.partial(jax.jit, donate_argnums=(0,), static_argnames=("page_size",))
+@functools.partial(jax.jit, donate_argnums=(0,), static_argnames=("page_size", "shift"))
 def write_swa_word_pool(
     raw: jax.Array | tuple[jax.Array, jax.Array],
     records: jax.Array,
     values: jax.Array,
     *,
     page_size: int,
+    shift: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
-    """Publish SWA while preserving the shared flat word-row owner interface."""
+    """Publish SWA while preserving the shared flat word-row owner interface.
+
+    Each valid record lands at ``record + shift``, a whole number of pages.
+    Layers that share records and differ only in their row offset pass the
+    same ``records``, so XLA computes their sort and masks once.
+    """
     swa_word_pages(raw, page_size)
-    return _publish_swa_sc(raw, records, values, page_size)
+    return _publish_swa_sc(raw, records, values, page_size, shift)
 
 
-def _publish_swa_sc(raw, records, values, page_size):
+def _publish_swa_sc(raw, records, values, page_size, shift=0):
     """Publish each token pair once, preserving any unmodified BF16 half."""
     if values.ndim != 2 or values.shape[1] != 512 or values.dtype != jnp.bfloat16:
         raise ValueError("SWA values must be BF16 [N,512]")
@@ -58,6 +64,8 @@ def _publish_swa_sc(raw, records, values, page_size):
         raise ValueError("SWA records must be INT32 [N]")
     if not records.size:
         return raw
+    if shift % page_size:
+        raise ValueError("SWA record shift must be whole pages")
     banks = raw if isinstance(raw, tuple) else (raw,)
     capacity = sum(bank.shape[0] for bank in banks) // 2
     info = pltpu.get_tpu_info().sparse_core
@@ -81,6 +89,9 @@ def _publish_swa_sc(raw, records, values, page_size):
         ids = jnp.pad(ids, (0, padding), constant_values=-1)
         words = jnp.pad(words, ((0, padding), (0, 0)))
         masks = jnp.pad(masks, ((0, padding), (0, 0)))
+    if shift:
+        # A token pair spans four 128-word rows.
+        ids = jnp.where(ids >= 0, ids + 2 * shift, ids)
     return _publish_packed(banks, ids, words, masks, info, raw)
 
 

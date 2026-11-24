@@ -1231,6 +1231,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         csa2_metadata = csa2_bounds = csa2_write_records = None
         swa_published = False
+        # Records at the group's first row offset: layers of one group publish
+        # the same records, so their pack plan is computed once.
+        publish_records, publish_shift = None, 0
         if self._csa2:
             if not isinstance(swa_cache, PagedCacheRows):
                 raise ValueError("CSA2 requires a native shared word-row cache")
@@ -1320,6 +1323,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
             else:
                 _, offset, csa2_metadata, csa2_bounds, csa2_write_records = cached
+                publish_records = csa2_write_records
+                publish_shift = swa_cache.row_offset - offset
                 csa2_metadata, csa2_write_records = _shift_swa_metadata(
                     csa2_metadata,
                     csa2_write_records,
@@ -1596,8 +1601,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if self._csa2:
             assert csa2_write_records is not None
             if not swa_published:
+                if publish_records is None:
+                    publish_records = csa2_write_records
                 csa2_adapter.publish_swa(
-                    swa_cache, csa2_write_records, kv.reshape(-1, 512)
+                    swa_cache, publish_records, kv.reshape(-1, 512), publish_shift
                 )
         else:
             _insert(swa_cache, swa_slots, kv, swa_valid)

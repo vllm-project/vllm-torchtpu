@@ -78,8 +78,12 @@ def test_idle_dp_rank_encodes_before_decoder_pairing():
     assert order == ["encoder", ("decoder", 8), ("decoder", 8), ("draft", 2)]
 
 
-@pytest.mark.parametrize("propose_tokens", [False, True])
-def test_idle_dflash_rank_pairs_context_before_optional_proposals(propose_tokens):
+@pytest.mark.parametrize(
+    "propose_tokens,context", [(False, True), (True, True), (False, False)]
+)
+def test_idle_dflash_rank_pairs_context_before_optional_proposals(
+    propose_tokens, context
+):
     order = []
     drafter = tpu_runner.DFlashProposer.__new__(tpu_runner.DFlashProposer)
     drafter.draft_model = SimpleNamespace()
@@ -92,39 +96,73 @@ def test_idle_dflash_rank_pairs_context_before_optional_proposals(propose_tokens
         speculative_config=SimpleNamespace(use_eagle=lambda: True),
         _async_drafter=drafter,
         _draft_proposals_needed=propose_tokens,
+        _draft_context_needed=context,
     )
     TPUModelRunner._run_dp_idle_pairing(runner, 2048, 2)
-    assert order == ["target", "target", "context", "context"] + (
+    assert order == ["target", "target"] + ["context", "context"] * context + (
         ["proposal", "proposal"] if propose_tokens else []
     )
 
 
 @pytest.mark.parametrize(
-    "computed,scheduled,prompts,needed",
+    "computed,scheduled,prompts,needed,context",
     [
-        ([0], [2048], [4096], False),
-        ([2048], [2048], [4096], True),
-        ([4096], [6], [4096], True),
-        ([0, 4096], [2048, 6], [4096, 4096], True),
-        ([0, 1024], [2048, 2048], [4096, 4096], False),
+        ([0], [2048], [4096], False, False),
+        ([0], [3969], [4096], False, True),
+        ([2048], [2048], [4096], True, True),
+        ([4096], [6], [4096], True, True),
+        ([0, 4096], [2048, 6], [4096, 4096], True, True),
+        ([0, 1024], [2048, 2048], [4096, 4096], False, False),
     ],
 )
-def test_dflash_proposes_only_at_prompt_boundary_or_decode(
-    computed, scheduled, prompts, needed
+@pytest.mark.parametrize("window", [128, None])
+def test_dflash_drafts_only_rows_a_later_draft_reads(
+    computed, scheduled, prompts, needed, context, window
 ):
     ids = [str(i) for i in range(len(computed))]
+    drafter = tpu_runner.DFlashProposer.__new__(tpu_runner.DFlashProposer)
+    drafter.draft_model = SimpleNamespace(context_window=window)
     runner = SimpleNamespace(
-        drafter=tpu_runner.DFlashProposer.__new__(tpu_runner.DFlashProposer),
+        drafter=drafter,
         input_batch=SimpleNamespace(
             req_id_to_index={key: i for i, key in enumerate(ids)},
             num_computed_tokens_cpu=np.array(computed),
             num_prompt_tokens=np.array(prompts),
         ),
     )
+    runner._reaches_prompt_tail = TPUModelRunner._reaches_prompt_tail.__get__(runner)
     output = SimpleNamespace(
         num_scheduled_tokens=dict(zip(ids, scheduled, strict=True))
     )
     assert TPUModelRunner._needs_draft_proposals(runner, output) is needed
+    assert TPUModelRunner._needs_draft_context(runner, output) is (
+        context or window is None
+    )
+
+
+@pytest.mark.parametrize(
+    "computed,scheduled,tokens,samples",
+    [
+        ([0], [2048], [4096], False),
+        ([2048], [2048], [4096], True),
+        ([4096], [1], [4097], True),
+        ([0, 0], [2048, 1024], [4096, 1024], True),
+    ],
+)
+def test_chunk_samples_follows_the_discard_rule(computed, scheduled, tokens, samples):
+    ids = [str(i) for i in range(len(computed))]
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=ids),
+        requests={
+            key: SimpleNamespace(num_computed_tokens=c, num_tokens=t)
+            for key, c, t in zip(ids, computed, tokens, strict=True)
+        },
+    )
+    output = SimpleNamespace(
+        num_scheduled_tokens=dict(zip(ids, scheduled, strict=True))
+    )
+    assert TPUModelRunner._chunk_samples(runner, output, 0, len(ids)) is samples
+    assert not TPUModelRunner._chunk_samples(runner, output, 0, 0)
 
 
 @pytest.mark.parametrize("peer_needs_draft", [False, True])
@@ -137,9 +175,12 @@ def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft)
     )
 
     def reduce(tensor, **kwargs):
-        assert tensor.tolist() == [0] * 10
+        assert tensor.tolist() == [0] * 11
         tensor.copy_(
-            torch.tensor([2048, 2, 1, 0, int(peer_needs_draft), 0, 0, 0, 0, 0])
+            torch.tensor(
+                [2048, 2, 1, 0, int(peer_needs_draft), 0, 0, 0, 0, 0]
+                + [int(peer_needs_draft)]
+            )
         )
 
     with (
@@ -148,10 +189,11 @@ def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft)
     ):
         group.return_value.cpu_group = "cpu-group"
         result = TPUModelRunner._dp_coordinated_step(
-            runner, 0, 0, needs_draft_proposals=False
+            runner, 0, 0, needs_draft_proposals=False, needs_draft_context=False
         )
     assert result == (2048, 2)
     assert runner._draft_proposals_needed is peer_needs_draft
+    assert runner._draft_context_needed is peer_needs_draft
     collective.assert_called_once()
 
 
@@ -174,8 +216,8 @@ def test_dp_step_carries_the_relayout_fields_and_calls_the_controller():
     )
 
     def reduce(tensor, **kwargs):
-        assert tensor.tolist()[5:] == [0x5A5A, -0x5A5A, -3, 0, 0]
-        tensor.copy_(torch.tensor([128, 1, 1, 0, 1, 0x5A5A, -0x5A5A, -2, -128, -1]))
+        assert tensor.tolist()[5:] == [0x5A5A, -0x5A5A, -3, 0, 0, 1]
+        tensor.copy_(torch.tensor([128, 1, 1, 0, 1, 0x5A5A, -0x5A5A, -2, -128, -1, 1]))
 
     with (
         patch("vllm.distributed.parallel_state.get_dp_group") as group,

@@ -237,7 +237,7 @@ def test_ced_aux_hidden_states_propagation(monkeypatch: pytest.MonkeyPatch):
         lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
     monkeypatch.setattr(v2_model, "post", lambda h, *a: h)
-    monkeypatch.setattr(v2_model, "collapse", lambda h, pm: h.mean(dim=1))
+    monkeypatch.setattr(v2_model, "flat_collapse", lambda h, pm: h.mean(dim=1))
 
     m = SimpleNamespace(
         _ced_boundary=2,

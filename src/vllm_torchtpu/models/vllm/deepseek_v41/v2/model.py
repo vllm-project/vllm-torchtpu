@@ -28,7 +28,6 @@ from vllm_torchtpu.utils import synchronize_tensors
 
 from ..common.engram import initialize_engram_gate
 from ..common.mhc import (
-    collapse,
     flat_collapse,
     initialize_delayed_mhc,
     initialize_flat_collapse,
@@ -134,6 +133,16 @@ def _scatter_decoder_rows(
 ) -> torch.Tensor:
     result = tensor.new_zeros((total_rows + 1, tensor.shape[-1]))
     return result.index_copy_(0, indices, tensor)[:-1]
+
+
+def _flat_stream_layout(streams: torch.Tensor) -> torch.Tensor:
+    """``[T, M, D]`` HC streams as ``[T, M * D]`` for a stage boundary.
+
+    The mHC kernels read and write the streams flat. Returned as
+    ``[T, M, D]``, XLA lays the output out in ``T(4,128)`` tiles: a relayout
+    copy of the whole residual (v7, T=2048: 105 us) per stage boundary.
+    """
+    return streams.flatten(1)
 
 
 def _mean_hc_streams(hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1216,7 +1225,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             start_layer, end_layer = split, self._ced_boundary
         stage_sp = self._stage_uses_sequence_parallel(stage)
         carry_stage = stage in ("encoder_middle", "encoder_tail")
-        if stage == "decoder" or carry_stage:
+        if stage == "decoder":
+            # Encoder outputs cross stages flat (see `_flat_stream_layout`).
+            assert encoder_pre_mix is not None
+            hidden_states = inputs_embeds.unflatten(1, (encoder_pre_mix.shape[1], -1))
+        elif carry_stage:
             hidden_states = inputs_embeds
         elif upstream.get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -1274,6 +1287,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             input_ids = upstream.sp_shard(input_ids)
 
         residual, post_mix, res_mix = encoder_carry or (None, None, None)
+        if residual is not None:
+            residual = residual.unflatten(1, (post_mix.shape[1], -1))
         pre_mix: torch.Tensor | None = encoder_pre_mix
         if stage_sp and pre_mix is not None and not carry_stage:
             # CED decoder replay: encoder rows arrive unsharded.
@@ -1328,7 +1343,13 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # this post fused with the Engram injection.
                 assert not aux_hidden_by_layer
                 assert isinstance(hidden_states, torch.Tensor)
-                return hidden_states, residual, post_mix, res_mix, pre_mix
+                return (
+                    hidden_states,
+                    _flat_stream_layout(residual),
+                    post_mix,
+                    res_mix,
+                    pre_mix,
+                )
             if layer is not None:
                 # The last layer has no successor to fold its post into.
                 hidden_states = post(hidden_states, residual, post_mix, res_mix)
@@ -1346,7 +1367,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # output. Publish it before the host selects the SWA replay rows.
                 decoder = self.layers[self._ced_boundary]
                 assert pre_mix is not None
-                normalized = decoder.attn_norm(collapse(hidden_states, pre_mix))
+                normalized = decoder.attn_norm(flat_collapse(hidden_states, pre_mix))
                 decoder.attn.write_encoder_global_kv(
                     normalized, positions, sp_sharded=stage_sp
                 )
@@ -1355,6 +1376,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     for layer_id in self.aux_hidden_state_layers
                     if layer_id in aux_hidden_by_layer
                 ]
+                hidden_states = _flat_stream_layout(hidden_states)
                 if encoder_aux:
                     return hidden_states, pre_mix, encoder_aux
                 return hidden_states, pre_mix
