@@ -878,11 +878,25 @@ def _tile_union(keys_t, tile):
     )
 
 
-def _pair_work_kernel(
-    own_ref, peer_ref, base_ref, keys_ref, work_ref, *, single, groups
-):
+def _pair_work_kernel(own_ref, peer_ref, base_ref, *refs, single, groups, heads):
     """`pair_work` in VMEM: this rank's kept candidates' page keys
-    (`_kept_keys_t`), then each tile's page union (`_tile_union`)."""
+    (`_kept_keys_t`), then each tile's page union (`_tile_union`). With
+    `heads`, the pair's query heads go to their rank-ordered places in HBM by
+    two copies that run under the ranking."""
+    if heads:
+        rank_ref, q_ref, q_peer_ref, keys_ref, work_ref, q_all_ref, sems = refs
+        num_heads = q_ref.shape[0]
+        rank = rank_ref[0]
+        copies = [
+            pltpu.make_async_copy(
+                src, q_all_ref.at[pl.ds(block * num_heads, num_heads)], sems.at[i]
+            )
+            for i, (src, block) in enumerate(((q_ref, rank), (q_peer_ref, 1 - rank)))
+        ]
+        for copy in copies:
+            copy.start()
+    else:
+        keys_ref, work_ref = refs
     num_tokens = keys_ref.shape[0]
     tiles = num_tokens // _TILE_ROWS
     union_len = _TILE_KEYS
@@ -897,10 +911,19 @@ def _pair_work_kernel(
         counts = jnp.where(lane == t, count, counts)
     if not single:  # `_tile_page_lists`' tile counts after the unions
         work_ref[:, tiles * union_len :] = counts[:, :tiles]
-        return
-    # One tile: `msa_attention._single_tile_groups`' meta words and counts, and
-    # the grid's group bounds (`msa_attention_lse._packed_work`), in one row:
-    # lanes [0, G) meta words, [G, 2G) counts, 2G and 2G + 1 the bounds.
+    else:
+        _single_tile_words(work_ref, lane, count, groups)
+    if heads:
+        for copy in copies:
+            copy.wait()
+
+
+def _single_tile_words(work_ref, lane, count, groups):
+    """One tile's `msa_attention._single_tile_groups` meta words and counts,
+    and the grid's group bounds (`msa_attention_lse._packed_work`), after its
+    union in `work_ref`: lanes [0, G) meta words, [G, 2G) counts, 2G and
+    2G + 1 the bounds."""
+    union_len = _TILE_KEYS
     pages_per_step = union_len // groups
     g = lane % groups
     group_count = jnp.clip(count - g * pages_per_step, 0, pages_per_step)
@@ -924,8 +947,9 @@ def pair_work(
     key_base: jax.Array,
     *,
     pages_per_step: int,
+    heads: tuple[jax.Array, jax.Array, jax.Array] | None = None,
     interpret: bool = False,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, ...]:
     """A DCP pair's decode attention inputs from both ranks' packed candidates
     (``own`` this rank's, ``peer`` the other's, ``[T, 2 * topk]``) in one
     kernel: the page keys of this rank's kept candidates ``[T, topk]``
@@ -933,7 +957,12 @@ def pair_work(
     pages_per_seq``, or -1 for a padding token) and the attention's work list
     row (`msa_attention_lse._packed_work` of those keys). XLA built both in
     ~20 dependent small ops between the candidate exchange and the attention
-    (~2 us per layer in the served b8 decode step, j-f07a4a0e)."""
+    (~2 us per layer in the served b8 decode step, j-f07a4a0e).
+
+    With ``heads = (rank, q, q_peer)`` (this rank's and the other rank's
+    head-major query heads ``[Hl, T, D]``) it also returns the pair's heads
+    in rank order ``[2 * Hl, T, D]``, which XLA otherwise concatenates in an
+    op of its own before the attention."""
     num_tokens, width = own.shape
     topk = width // 2
     if topk * _TILE_ROWS != _TILE_KEYS:
@@ -957,16 +986,35 @@ def pair_work(
     # `_packed_work`'s row: [union | meta words | counts | step bounds] for one
     # tile, [unions | tile counts] for several (`in_kernel`).
     width = _TILE_KEYS + 2 * groups + 2 if single else tiles * (_TILE_KEYS + 1)
-    keys, work = pl.pallas_call(
-        functools.partial(_pair_work_kernel, single=single, groups=groups),
-        out_shape=(
-            jax.ShapeDtypeStruct((num_tokens + pad, topk), jnp.int32),
-            jax.ShapeDtypeStruct((1, width), jnp.int32),
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    in_specs = [vmem] * 3
+    out_specs = [vmem] * 2
+    out_shape = [
+        jax.ShapeDtypeStruct((num_tokens + pad, topk), jnp.int32),
+        jax.ShapeDtypeStruct((1, width), jnp.int32),
+    ]
+    scratch_shapes = []
+    operands = [own, peer, key_base]
+    if heads is not None:
+        rank, q, q_peer = heads
+        hbm = pl.BlockSpec(memory_space=pl.ANY)
+        in_specs += [pl.BlockSpec(memory_space=pltpu.SMEM), hbm, hbm]
+        out_specs.append(hbm)
+        out_shape.append(jax.ShapeDtypeStruct((2 * q.shape[0], *q.shape[1:]), q.dtype))
+        scratch_shapes.append(pltpu.SemaphoreType.DMA((2,)))
+        operands += [rank_array(rank), q, q_peer]
+    keys, work, *q_all = pl.pallas_call(
+        functools.partial(
+            _pair_work_kernel, single=single, groups=groups, heads=heads is not None
         ),
+        in_specs=in_specs,
+        out_specs=out_specs,
+        out_shape=out_shape,
+        scratch_shapes=scratch_shapes,
         interpret=interpret,
         name="minimax_m3_msa_dcp_pair_work",
-    )(own, peer, key_base)
-    return keys[:num_tokens], work
+    )(*operands)
+    return keys[:num_tokens], work, *q_all
 
 
 def merge_head_candidates(
@@ -1290,7 +1338,7 @@ def msa_write_and_candidates_dcp(
 
 
 def msa_attend_dcp(
-    q: jax.Array,
+    q: jax.Array | tuple[jax.Array, jax.Array],
     kv_cache: jax.Array,
     candidates: jax.Array,
     seq_lens: jax.Array,
@@ -1326,9 +1374,15 @@ def msa_attend_dcp(
     (``candidates[0]`` is this rank's) and one KV head, the page keys come
     from this rank's kept candidates (`kept_own_candidates`); with
     `lse_bits` and one KV head, the lse comes as its uint32 bits
-    (`msa_attention_lse.msa_sparse_attention_lse`).
+    (`msa_attention_lse.msa_sparse_attention_lse`). A pair (``dcp == 2``,
+    `q_head_major`) may pass ``q = (own, peer)``, this rank's heads and the
+    other rank's, ``[Hl, T, D]`` each: they are placed in rank order by the
+    decode work-list kernel (`pair_work`) or else concatenated.
     """
-    num_tokens = q.shape[1 if q_head_major else 0]
+    halves = isinstance(q, tuple)
+    if halves and not (q_head_major and dcp == 2):
+        raise ValueError("query halves need a head-major pair")
+    num_tokens = (q[0] if halves else q).shape[1 if q_head_major else 0]
     rank = rank_array(rank)[0]
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
@@ -1354,20 +1408,26 @@ def msa_attend_dcp(
     ):
         # One kernel: kept page keys and the attention's work list.
         key_base = jnp.where(valid, seq_id * pages_per_seq, -1)[:, None]
-        keys, work = pair_work(
+        keys, work, *q_all = pair_work(
             candidates[0],
             candidates[1],
             key_base,
             pages_per_step=_small_pages_per_step(num_tokens),
+            heads=(rank, *q) if halves else None,
             interpret=interpret,
         )
         keys = keys[:, None]
+        if halves:
+            (q,) = q_all
+            halves = False
     elif own_first and num_heads == 1:
         blocks, kept = kept_own_candidates(candidates, topk)
         mine, selected = (kept & valid[:, None])[:, None], blocks[:, None]
     else:
         selected = merge_head_candidates(candidates, topk, interpret)
         mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
+    if halves:
+        q = _pair_heads(*q, rank)
     if work is None:
         keys = jnp.where(
             mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1
@@ -1624,18 +1684,24 @@ def merge_partials(
     )(lse.astype(jnp.float32), parts, *([hadamard] if rotated else []))
 
 
-def _gather_heads(q: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Array:
+def _pair_heads(own: jax.Array, peer: jax.Array, rank: jax.Array) -> jax.Array:
+    """A pair's head-major query heads in rank order ``[2 * Hl, T, D]`` from
+    this rank's and the other rank's ``[Hl, T, D]``."""
+    # [own, peer, own] from row `rank * Hl` is the pair's heads in rank order.
+    both = jnp.concatenate([own, peer, own])
+    return jax.lax.dynamic_slice_in_dim(both, rank * own.shape[0], 2 * own.shape[0])
+
+
+def _gather_heads(q: jax.Array, rank: jax.Array, axis: str, dcp: int):
     """The group's head-major query heads ``[dcp * Hl, T, D]`` from this
-    rank's ``q [Hl, T, D]``. A pair swaps its halves by one collective
+    rank's ``q [Hl, T, D]``; a pair's as ``(q, the other rank's q)`` for
+    `msa_attend_dcp` to place. A pair swaps its halves by one collective
     permute: XLA's all-gather of the 16 MB c4 / c16 queries took 158 us per
     layer in the twin (j-094494a7), a permute plus the concatenation ~51 us
     on the same core pair in a standalone bench (j-a7bf7869; all-gather ~90)."""
     if dcp != 2:
         return jax.lax.all_gather(q, axis, axis=0, tiled=True)
-    other = jax.lax.ppermute(q, axis, [(0, 1), (1, 0)])
-    # [q, other, q] from row `rank * Hl` is the pair's heads in rank order.
-    both = jnp.concatenate([q, other, q])
-    return jax.lax.dynamic_slice_in_dim(both, rank * q.shape[0], 2 * q.shape[0])
+    return q, jax.lax.ppermute(q, axis, [(0, 1), (1, 0)])
 
 
 def attend_and_merge(
@@ -1670,7 +1736,7 @@ def attend_and_merge(
     8K tokens (c4 twin, j-c60806bf)."""
     num_heads, num_tokens, head_dim = q.shape
     rank = rank_array(rank)[0]
-    q_all = _gather_heads(q, rank, axis, dcp)
+    q_group = _gather_heads(q, rank, axis, dcp)
     # Decode-sized operands of a pair move by permutes (latency); a prefill
     # step's partials by XLA's all-to-all, which writes them in place.
     small = dcp == 2 and num_tokens <= DCP_SMALL_BATCH_TOKENS
@@ -1686,7 +1752,7 @@ def attend_and_merge(
     else:
         cand_all = jax.lax.all_gather(candidates, axis, axis=0)
     out, lse = msa_attend_dcp(
-        q_all,
+        q_group,
         kv_cache,
         cand_all,
         seq_lens,

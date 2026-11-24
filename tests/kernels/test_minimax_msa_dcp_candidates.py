@@ -383,6 +383,21 @@ def test_attention_of_kept_own_candidates(tokens, rank, shared):
         np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
 
 
+@pytest.mark.parametrize("tokens", [8, 24, 48])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_attention_of_query_halves(tokens, rank):
+    """A pair's query heads passed as (this rank's, the other rank's) halves
+    give the outputs of the rank-ordered heads, bit for bit."""
+    args, common = _attend_case(tokens, rank, True, seed=tokens + rank)
+    q, *rest = args
+    half = q.shape[0] // 2
+    own, peer = q[rank * half : (rank + 1) * half], q[(1 - rank) * half :][:half]
+    want = msa_dcp.msa_attend_dcp(*args, own_first=True, **common)
+    got = msa_dcp.msa_attend_dcp((own, peer), *rest, own_first=True, **common)
+    for w, g in zip(want, got):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+
+
 def test_kept_own_candidates_comparison_catches_a_changed_selection():
     """Positive control for the test above: one candidate that loses its
     place in the global top-k changes the outputs it compares."""
