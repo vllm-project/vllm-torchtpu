@@ -67,13 +67,18 @@ def _sel(cond, x):
 def _flatten_rows(x, g, n):
     """[rows, 128] with g live lanes per row -> the n = rows * g words laid
     end to end, as ceil(n / 128) [1, 128] rows."""
+    return _flatten_row_list([x[d : d + 1] for d in range(x.shape[0])], g, n)
+
+
+def _flatten_row_list(rows, g, n):
+    """`_flatten_rows` of a list of [1, 128] rows."""
     lane = lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
-    flat = [jnp.zeros((1, LANES), x.dtype) for _ in range(-(-n // LANES))]
-    for d in range(x.shape[0]):
+    flat = [jnp.zeros((1, LANES), rows[0].dtype) for _ in range(-(-n // LANES))]
+    for d, x_d in enumerate(rows):
         r, off = divmod(d * g, LANES)
         if r >= len(flat):
             break
-        piece = pltpu.roll(x[d : d + 1], off, 1) if off else x[d : d + 1]
+        piece = pltpu.roll(x_d, off, 1) if off else x_d
         flat[r] = flat[r] + _sel((lane >= off) & (lane < off + g), piece)
         if off + g > LANES:
             flat[r + 1] = flat[r + 1] + _sel(lane < off + g - LANES, piece)
@@ -351,26 +356,32 @@ N_TABLE_OUTS = 1 + 5 + 5 + 1 + 3
 
 def _store_tables(t, outs, *, ep, g):
     seg_o, small_o, kt_o, counts_o = outs[0], outs[1:6], outs[6:11], outs[11]
-    for k, part in enumerate(t["seg"]):
-        seg_o[k] = part[:g, :ep]
+    # Flat, as its scalar-prefetch readers take it: a [3, g, ep] output costs
+    # XLA a synchronous relayout to 1-D in HBM before the first reader.
+    rows = [part[e : e + 1] for part in t["seg"] for e in range(g)]
+    _store_flat(seg_o, _flatten_row_list(rows, ep, 3 * g * ep), 3 * g * ep)
     for o, part, n in zip(small_o, t["small"], _small_sizes(g)):
         o[...] = part[0, :n]
     for o, part in zip(kt_o, t["kernel_tables"]):
         o[...] = part[:g, :ep]
     counts_o[...] = t["counts"][:8, :ep]
     pos_o, mir_o, run_o = outs[12:15]
-    n = ep * g
     for o, flat in ((pos_o, t["plan"][0]), (mir_o, t["plan"][1])):
-        for r, part in enumerate(flat):
-            w = min(LANES, n - r * LANES)
-            o[pl.ds(r * LANES, w)] = part[0, :w]
+        _store_flat(o, flat, ep * g)
     run_o[...] = t["plan"][2][:ep, :g]
+
+
+def _store_flat(o, flat, n):
+    """Store `_flatten_rows`' [1, 128] rows into the 1-D ref o of n words."""
+    for r, part in enumerate(flat):
+        w = min(LANES, n - r * LANES)
+        o[pl.ds(r * LANES, w)] = part[0, :w]
 
 
 def _table_out_shapes(ep, g):
     i32 = jnp.int32
     return (
-        jax.ShapeDtypeStruct((3, g, ep), i32),
+        jax.ShapeDtypeStruct((3 * g * ep,), i32),
         *(jax.ShapeDtypeStruct((n,), i32) for n in _small_sizes(g)),
         *(jax.ShapeDtypeStruct((g, ep), i32) for _ in range(5)),
         jax.ShapeDtypeStruct((8, ep), i32),
@@ -383,7 +394,7 @@ def _table_out_shapes(ep, g):
 def _unpack_tables(outs):
     seg, meta, visit, counts_sc, expert_rows, slab_base = outs[:6]
     return (
-        seg.reshape(-1),
+        seg,
         meta,
         visit,
         counts_sc,
