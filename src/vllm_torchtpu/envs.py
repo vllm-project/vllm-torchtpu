@@ -862,10 +862,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS", 4096
     ),
-    # TPU_MOE_TC_COMBINE on steps of at least 4096 tokens: combine the tokens
-    # in this many consecutive row pieces (one kernel call each), so a
-    # consumer of the first piece (an SP piece's reduce-scatter) can start
-    # while the next is combined. 1 = one call.
+    # TPU_MOE_TC_COMBINE (or TPU_MOE_PAIR_COMBINE) on steps of at least 4096
+    # tokens: combine the tokens in this many consecutive row pieces (one
+    # kernel call each), so a consumer of the first piece (an SP piece's
+    # reduce-scatter) can start while the next is combined. 1 = one call.
     "TPU_MOE_TC_COMBINE_PIECES": env_nonnegative_int("TPU_MOE_TC_COMBINE_PIECES", 1),
     # With TPU_MINIMAX_M3_SP_FFN_PIECES: the attention input is gathered in the
     # same row pieces and qkv_proj runs on each piece as it lands; o_proj's

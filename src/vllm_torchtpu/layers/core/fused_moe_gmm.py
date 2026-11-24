@@ -738,16 +738,25 @@ def moe_gmm(
             gmm2_res = gmm2_res.at[row].set(
                 jnp.where(unwritten, 0, gmm2_res[row]).astype(gmm2_res.dtype)
             )
-        return _add_shared_down(
-            pair_combine.pair_combine(
+        pieces = _pair_combine_pieces(num_tokens, gmm2_res, topk, topk_weights_flat)
+        per = num_tokens // pieces
+        out = []
+        for i in range(pieces):
+            routes = slice(i * per * topk, (i + 1) * per * topk)
+            piece_shared = None
+            if shared_down is not None:
+                act, w2, s2 = shared_down
+                piece_shared = (act[i * per : (i + 1) * per], w2, s2)
+            routed = pair_combine.pair_combine(
                 gmm2_res,
-                argsort_revert_indices,
-                topk_weights_flat,
-                valid_mask_flat,
+                argsort_revert_indices[routes],
+                topk_weights_flat[routes],
+                valid_mask_flat[routes],
                 topk=topk,
-            ).astype(x.dtype),
-            shared_down,
-        )
+            ).astype(x.dtype)
+            # Per piece, so a piece's consumer need not wait for the rest.
+            out.append(_add_shared_down(routed, piece_shared))
+        return out[0] if pieces == 1 else jnp.concatenate(out)
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
     use_local_ragged_combine = (
@@ -924,6 +933,20 @@ def _combine_pieces(num_tokens: int, args: tuple, dtype) -> int:
     if pieces <= 1 or num_tokens < _COMBINE_PIECES_MIN_TOKENS or num_tokens % pieces:
         return 1
     return pieces if tc_combine.supported(num_tokens // pieces, *args, dtype) else 1
+
+
+def _pair_combine_pieces(
+    num_tokens: int, x: jax.Array, topk: int, weights: jax.Array
+) -> int:
+    """`_combine_pieces` for the pair combine: each token's sum is its own, so
+    the pieces' outputs equal one call's."""
+    pieces = envs.TPU_MOE_TC_COMBINE_PIECES
+    if pieces <= 1 or num_tokens < _COMBINE_PIECES_MIN_TOKENS or num_tokens % pieces:
+        return 1
+    ok = pair_combine.supported(
+        num_tokens // pieces, x.shape[0], x.shape[1], topk, x.dtype, weights.dtype
+    )
+    return pieces if ok else 1
 
 
 # MiniMaxM3Mxfp8LinearMethod materializes the bf16 weight from this many rows.

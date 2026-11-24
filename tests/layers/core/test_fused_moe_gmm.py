@@ -429,6 +429,34 @@ def test_moe_gmm_non_ep_pair_combine(monkeypatch, all_padding):
     """TP-sliced experts at a prefill chunk: the pair combine serves, and rows
     the GMM did not write (the last valid row's pair sibling; pair 0, which
     invalid routes read, in an all-padding step) cannot reach a token."""
+    actual, expected = _pair_combine_case(monkeypatch, all_padding)
+    out = np.asarray(actual.astype(jnp.float32))
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(
+        out, expected, rtol=1e-2, atol=1e-2 * np.abs(expected).max()
+    )
+
+
+def test_moe_gmm_non_ep_pair_combine_pieces(monkeypatch):
+    """TPU_MOE_TC_COMBINE_PIECES on the pair combine: one call per row piece,
+    the same output as one call."""
+    whole, _ = _pair_combine_case(monkeypatch, False)
+    monkeypatch.setenv("TPU_MOE_TC_COMBINE_PIECES", "2")
+    monkeypatch.setattr(fused_moe_gmm, "_COMBINE_PIECES_MIN_TOKENS", 0)
+    calls = []
+    pair = fused_moe_gmm.pair_combine.pair_combine
+    monkeypatch.setattr(
+        fused_moe_gmm.pair_combine,
+        "pair_combine",
+        lambda *a, **k: calls.append(a[1].shape) or pair(*a, **k),
+    )
+    pieces, _ = _pair_combine_case(monkeypatch, False, wrap=False)
+    assert calls == [(256,), (256,)]
+    np.testing.assert_array_equal(pieces, whole)
+
+
+def _pair_combine_case(monkeypatch, all_padding, wrap=True):
+    """(moe_gmm's output, the f32 reference) of a TP-sliced pair-combine step."""
     monkeypatch.setenv("TPU_MOE_PAIR_COMBINE", "1")
     monkeypatch.setattr(fused_moe_gmm, "_PAIR_COMBINE_MIN_TOKENS", 0)
     num_tokens, topk, hidden, experts = 128, 4, 256, 16
@@ -457,12 +485,13 @@ def test_moe_gmm_non_ep_pair_combine(monkeypatch, all_padding):
         fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(gmm_outputs)
     )
     monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
-    pair = fused_moe_gmm.pair_combine.pair_combine
-    monkeypatch.setattr(
-        fused_moe_gmm.pair_combine,
-        "pair_combine",
-        lambda *a, **k: pair(*a, **k, interpret=True),
-    )
+    if wrap:
+        pair = fused_moe_gmm.pair_combine.pair_combine
+        monkeypatch.setattr(
+            fused_moe_gmm.pair_combine,
+            "pair_combine",
+            lambda *a, **k: pair(*a, **k, interpret=True),
+        )
     actual = moe_gmm(
         x=jnp.zeros((num_tokens * topk, 1), jnp.bfloat16),
         w1=jnp.zeros((1, 1, 1), jnp.bfloat16),
@@ -495,11 +524,7 @@ def test_moe_gmm_non_ep_pair_combine(monkeypatch, all_padding):
         .reshape(num_tokens, topk, hidden)
         .sum(axis=1)
     )
-    out = np.asarray(actual.astype(jnp.float32))
-    assert np.isfinite(out).all()
-    np.testing.assert_allclose(
-        out, expected, rtol=1e-2, atol=1e-2 * np.abs(expected).max()
-    )
+    return actual, expected
 
 
 def _reference_fused_moe(
