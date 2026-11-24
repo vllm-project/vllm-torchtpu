@@ -151,17 +151,24 @@ def _candidates_kernel(
         s = jnp.where(
             visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s
         )
+        # Column ids as f32 (exact below 2**24): the first of a pick's ties is
+        # one f32 cross-lane min, where an int32 one lowers to two.
+        col_ids = cols.astype(jnp.float32)
         picked_scores, picked_blocks = [], []
         for _ in range(topk):
             best_score = jnp.max(s, axis=1, keepdims=True)
             best = jnp.min(
-                jnp.where(s == best_score, cols, width), axis=1, keepdims=True
+                jnp.where(s == best_score, col_ids, float(width)),
+                axis=1,
+                keepdims=True,
             )
             picked_scores.append(best_score)
             picked_blocks.append(
-                jnp.where(best_score > _NEG_INF, best * dcp + rank, -1)
+                jnp.where(
+                    best_score > _NEG_INF, best.astype(jnp.int32) * dcp + rank, -1
+                )
             )
-            s = jnp.where(cols == best, _NEG_INF, s)
+            s = jnp.where(col_ids == best, _NEG_INF, s)
         score_out_ref[...] = jnp.concatenate(picked_scores, axis=1)
         block_out_ref[...] = jnp.concatenate(picked_blocks, axis=1)
 
