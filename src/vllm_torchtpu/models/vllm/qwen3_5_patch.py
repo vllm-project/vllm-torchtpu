@@ -47,7 +47,7 @@ from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5Model
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
-from vllm_torchtpu.distributed.quantized_collectives import quantized_all_gather
+from vllm_torchtpu.distributed.collectives import quantized_all_gather
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.qwen3_next_patch import all_gather_sharded_stream
 
@@ -95,18 +95,6 @@ def _is_sharded_residual_active(
         and _in_overlap_trace()
         and num_tokens >= layer_any.fp8_overlap_min_tokens
     )
-
-
-def _fp8_all_gather(
-    x: torch.Tensor,
-    num_tokens: int,
-) -> torch.Tensor:
-    """All-gather activations across TP ranks in per-row FP8, trimmed to num_tokens."""
-    # Promote float16 inputs to float32 before quantizing so small per-row
-    # scales do not underflow or overflow their inverse inside quantize_tensor.
-    work_x = x.to(torch.float32) if x.dtype == torch.float16 else x
-    gathered = quantized_all_gather(work_x, get_tp_group(), num_rows=num_tokens)
-    return gathered.to(x.dtype)
 
 
 def _configure_layer(layer: Qwen3_5DecoderLayer) -> None:
@@ -209,7 +197,9 @@ def _overlap_forward(
     else:
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
         if fp8_overlap:
-            hidden_states = _fp8_all_gather(hidden_states, num_tokens)
+            hidden_states = quantized_all_gather(hidden_states, get_tp_group()).narrow(
+                0, 0, num_tokens
+            )
 
     if self.layer_type == "linear_attention":
         attn = self.linear_attn(hidden_states=hidden_states)
@@ -237,7 +227,7 @@ def _overlap_forward(
         logits_loc, _ = mlp.gate(h_loc)
         logits = _narrow_all_gather(logits_loc, num_tokens)
         if fp8_overlap:
-            h = _fp8_all_gather(h_loc, num_tokens)
+            h = quantized_all_gather(h_loc, get_tp_group()).narrow(0, 0, num_tokens)
         else:
             h = _narrow_all_gather(h_loc, num_tokens)
     else:
