@@ -1603,16 +1603,21 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             and self._pcp_streaming_configured
         )
 
-    def _apply_output_projection(
+    def _gated_norm_output(
         self, core_attn_out: torch.Tensor, z: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
+        """``out_proj``'s input: this rank's heads after the gated norm."""
         local_num_v_heads = self.num_v_heads // self.tp_size
         core_attn_out = core_attn_out.view(
             num_tokens, local_num_v_heads, self.head_v_dim
         )
         core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        output, _ = self.out_proj(core_attn_out)
+        return rearrange(core_attn_out, "... h d -> ... (h d)")
+
+    def _apply_output_projection(
+        self, core_attn_out: torch.Tensor, z: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        output, _ = self.out_proj(self._gated_norm_output(core_attn_out, z, num_tokens))
         return output
 
     def _forward_fused_pooled_pcp(
@@ -1662,16 +1667,21 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         hidden_states: torch.Tensor,
         gdn_step_metadata_cache: GdnStepMetadataCache | None = None,
         sp_half: tuple[Any, int] | None = None,
+        output_projection: bool = True,
     ) -> torch.Tensor:
         """``sp_half=(plan, g)``: ``hidden_states`` is token half ``g`` of a
         micro-batched sequence-parallel step (``sequence_parallel.MicroBatchPlan``,
         VLLM_TPU_SP_MICROBATCH_OVERLAP); the core runs it as a step of its own,
-        after the earlier halves wrote their states."""
+        after the earlier halves wrote their states.
+        ``output_projection=False``: return the gated-norm output, this rank's
+        heads, before ``out_proj`` (the caller projects it)."""
         num_tokens = hidden_states.size(0)
         kv_cache = self.kv_cache
         if self._has_active_pooled_pcp_state(kv_cache):
             if sp_half is not None:
                 raise NotImplementedError("GDN PCP streaming with SP micro-batches")
+            if not output_projection:
+                raise NotImplementedError("GDN PCP streaming without out_proj")
             assert kv_cache is not None
             attn_metadata = cast(
                 "dict[str, _GdnAttentionMetadata]", get_forward_context().attn_metadata
@@ -2012,4 +2022,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
+        if not output_projection:
+            return self._gated_norm_output(core_attn_out, z, num_tokens)
         return self._apply_output_projection(core_attn_out, z, num_tokens)

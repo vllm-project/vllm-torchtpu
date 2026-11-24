@@ -896,11 +896,14 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         shared=None,
         decode_token_shard=False,
         write_sink=True,
+        output_projection=True,
     ):
         """Attention output and selected tokens.
 
         ``reduce=False`` returns this TP rank's partial output projection;
-        the caller sums it across TP.
+        the caller sums it across TP. ``output_projection=False`` (implies
+        no reduce) returns the gated attention output of this rank's heads
+        before ``o_proj``; the caller projects it.
 
         ``rows`` (int, -1 for none) limits both to those token rows; the
         caches are still written for every token. Pooled QSA attends only
@@ -924,6 +927,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             decode_token_shard,
             write_sink,
         )
+        if not output_projection:
+            return output, selected
         output = self.o_proj(output)
         if reduce and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)

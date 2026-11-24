@@ -200,6 +200,7 @@ def make_layer(tp, layer_type, attn_hc, mlp_hc, attn_weight, moe_weight):
     layer.attn_hyper_connection = attn_hc
     layer.mlp_hyper_connection = mlp_hc
     layer.mlp = RowwiseMoE(moe_weight)
+    layer.attn_out_full = None
     return layer
 
 
@@ -290,6 +291,133 @@ def test_decoder_layer_sequence_parallel_matches_tp(
     torch.testing.assert_close(joined[rows], replicated[0][rows], rtol=0, atol=atol)
     expected_calls = [("_adaptive_fused_moe_op_sp", TOKENS // 2)] * 2
     assert calls == (expected_calls if split_moe else [])
+
+
+class HeadsAttention(nn.Module):
+    """Rank r owns heads [r * d, (r + 1) * d) of ``block @ core_w`` and the
+    same rows of the output projection ``out_w``, like a TP attention block."""
+
+    decode_token_shard = False
+    replicated_token_shard = False
+
+    def __init__(self, tp, core_w, out_w):
+        super().__init__()
+        self.tp, self.core_w, self.out_w = tp, core_w, out_w
+
+    def _output(self, block, output_projection):
+        d = self.core_w.shape[1] // self.tp.size
+        cols = slice(self.tp.rank * d, (self.tp.rank + 1) * d)
+        heads = torch.tanh(block.float() @ self.core_w[:, cols]).to(block.dtype)
+        if not output_projection:
+            return heads
+        return (heads.float() @ self.out_w[cols]).to(block.dtype)
+
+    def forward(self, block, gdn_step_metadata_cache=None, output_projection=True):
+        return self._output(block, output_projection)
+
+    def forward_with_indices(
+        self,
+        block,
+        positions,
+        metadata,
+        reduce=True,
+        replicated_indexer=False,
+        token_shard=False,
+        decode_token_shard=False,
+        output_projection=True,
+    ):
+        assert reduce is False
+        return self._output(block, output_projection), None
+
+
+@pytest.mark.parametrize("layer_type", ["linear_attention", "full_attention"])
+def test_decoder_layer_exit_all_to_all_matches_tp(tp2, monkeypatch, layer_type):
+    """QWEN4_EXP_PREFILL_SP_EXIT_ALL_TO_ALL: the attention output goes to the
+    token owners by all-to-all and through the replicated output projection;
+    no reduce-scatter. One f32-accumulated sum instead of the bf16 partials'."""
+    heads = 3 * HIDDEN // 2  # wider than hidden, as on the served model
+    torch.random.default_generator.manual_seed(5)
+    attn_hc, mlp_hc = hc_module(), hc_module()
+    core_w = torch.randn(HIDDEN, heads) / HIDDEN**0.5
+    out_w = torch.randn(heads, HIDDEN) / heads**0.5
+    moe_w = torch.randn(HIDDEN, HIDDEN) / HIDDEN**0.5
+    hidden = torch.randn(TOKENS, HC * HIDDEN).bfloat16()
+    input_ids = torch.zeros(TOKENS, dtype=torch.long)
+    valid = torch.arange(TOKENS) < TOKENS - 5
+    hidden[~valid] = float("nan")
+    exchanged = []
+
+    def all_to_all(x):
+        exchanged.append(x.shape)
+        blocks = tp2.exchange(x)
+        return torch.cat([b.chunk(tp2.size, dim=0)[tp2.rank] for b in blocks])
+
+    monkeypatch.setattr(sp, "_all_to_all", all_to_all)
+
+    def run(rank, sequence_parallel):
+        layer = make_layer(tp2, layer_type, attn_hc, mlp_hc, core_w, moe_w)
+        attention = HeadsAttention(tp2, core_w, out_w)
+        if layer_type == "linear_attention":
+            layer.linear_attn = attention
+        else:
+            layer.self_attn = attention
+        if sequence_parallel:
+            layer.attn_out_full = lambda x: (x.float() @ out_w).to(x.dtype)
+        x = tp2.shard(hidden) if sequence_parallel else hidden
+        return layer(
+            x,
+            None,
+            input_ids,
+            None,
+            None,
+            None,
+            None,
+            valid,
+            None,
+            None,
+            sequence_parallel=sequence_parallel,
+        )
+
+    replicated = tp2.run(lambda r: run(r, False))
+    assert exchanged == []
+    monkeypatch.setattr(sp, "reduce", lambda *a: pytest.fail("reduce on the exit"))
+    sharded = tp2.run(lambda r: run(r, True))
+    assert exchanged == [(TOKENS, heads // tp2.size)] * tp2.size
+    joined = torch.cat(sharded, dim=0)
+    torch.testing.assert_close(joined[valid], replicated[0][valid], rtol=0, atol=3e-2)
+
+
+def test_heads_to_token_owners_layout(monkeypatch):
+    """Rank r gets its rows of every rank's heads, ranks' columns in TP order."""
+    tp = SimulatedTP(4)
+    monkeypatch.setattr(sp, "tp_world_size", lambda: tp.size)
+    monkeypatch.setattr(
+        sp,
+        "_all_to_all",
+        lambda x: torch.cat([b.chunk(tp.size, dim=0)[tp.rank] for b in tp.exchange(x)]),
+    )
+    full = torch.arange(8 * 12).reshape(8, 12)  # [tokens, heads of all ranks]
+    got = tp.run(lambda r: sp.heads_to_token_owners(full[:, 3 * r : 3 * (r + 1)]))
+    for r, rows in enumerate(got):
+        torch.testing.assert_close(rows, full[2 * r : 2 * (r + 1)])
+
+
+def test_attn_out_full_names():
+    from vllm_torchtpu.models.vllm.qwen4_exp.model import _attn_out_full_name
+
+    layer = NS(attn_out_full=object())
+    assert _attn_out_full_name(layer, "linear_attn", "out_proj.weight") == (
+        "attn_out_full.weight"
+    )
+    assert _attn_out_full_name(layer, "self_attn", "o_proj.weight") == (
+        "attn_out_full.weight"
+    )
+    assert _attn_out_full_name(layer, "linear_attn", "in_proj_z.weight") is None
+    assert _attn_out_full_name(layer, "self_attn", "q_proj.weight") is None
+    assert (
+        _attn_out_full_name(NS(attn_out_full=None), "self_attn", "o_proj.weight")
+        is None
+    )
 
 
 def test_ple_gate_sequence_parallel_matches_tp(tp2):

@@ -30,6 +30,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -78,6 +79,17 @@ from .pooled_ple import Qwen4ExpPooledPLE
 from .qsa import QSAMetadata, Qwen4ExpQSA
 
 logger = init_logger(__name__)
+
+
+def _attn_out_full_name(layer, family: str, relative: str) -> str | None:
+    """The ``attn_out_full`` parameter (relative to the layer) that checkpoint
+    tensor ``family.relative`` also loads, unsliced, or None."""
+    if getattr(layer, "attn_out_full", None) is None:
+        return None
+    projection = {"linear_attn": "out_proj.", "self_attn": "o_proj."}.get(family)
+    if projection is None or not relative.startswith(projection):
+        return None
+    return "attn_out_full." + relative[len(projection) :]
 
 
 def _hc_prefill_mode_arg(
@@ -329,6 +341,29 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 disable_tp=True,
                 prefix=prefix + ".mlp.shared_expert",
             )
+        self.attn_out_full = None
+        if index < t.num_hidden_layers and sp.exit_all_to_all_enabled(tp.world_size):
+            # Replicated copy of the attention block's TP-sliced output projection
+            # for sequence-parallel steps (QWEN4_EXP_PREFILL_SP_EXIT_ALL_TO_ALL),
+            # with the prefix, quantization and dtype of the projection it copies.
+            if self.layer_type == "linear_attention":
+                width = t.linear_num_value_heads * t.linear_value_head_dim
+                quant_config, params_dtype = cfg.quant_config, None
+                out_prefix = prefix + ".linear_attn.out_proj"
+            else:
+                width = t.num_attention_heads * t.head_dim
+                quant_config, params_dtype = None, torch.bfloat16
+                out_prefix = prefix + ".self_attn.o_proj"
+            self.attn_out_full = ReplicatedLinear(
+                width,
+                t.hidden_size,
+                bias=False,
+                params_dtype=params_dtype,
+                quant_config=quant_config,
+                prefix=out_prefix,
+                return_bias=False,
+                disable_tp=True,
+            )
         qwen_cfg = cfg.additional_config.get("qwen4_exp", {})
         hc_up_tile = int(qwen_cfg.get("hc_prefill_up_tile", 0))
         hc_norm_tile = int(qwen_cfg.get("hc_prefill_norm_tile", 0))
@@ -422,12 +457,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 gdn_step_metadata_cache,
             )
         else:
+            # QWEN4_EXP_PREFILL_SP_EXIT_ALL_TO_ALL: project after the exchange.
+            exit_all_to_all = sequence_parallel and self.attn_out_full is not None
+            unprojected = {"output_projection": False} if exit_all_to_all else {}
             if sequence_parallel:
                 block = sp.gather(block, num_tokens)
             if self.layer_type == "linear_attention":
-                block = sp.reduce(
-                    self.linear_attn(block, gdn_step_metadata_cache), sequence_parallel
-                )
+                block = self.linear_attn(block, gdn_step_metadata_cache, **unprojected)
             else:
                 block = self.self_attn.forward_with_indices(
                     block,
@@ -453,7 +489,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     decode_token_shard=(
                         not sequence_parallel and self.self_attn.decode_token_shard
                     ),
+                    **unprojected,
                 )[0]
+            if exit_all_to_all:
+                block = self.attn_out_full(sp.heads_to_token_owners(block))
+            else:
                 block = sp.reduce(block, sequence_parallel)
         block, residual = self.attn_hyper_connection.combine_mix(
             sp.pad_shard(block, sp_pad), residual, self.mlp_hyper_connection
@@ -1835,6 +1875,14 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     assert layer.ple is not None
                     layer.ple.load_checkpoint([(relative, weight)])
                     continue
+                out_full = _attn_out_full_name(layer, family, relative)
+                if out_full is not None:
+                    # The same tensor, unsliced, into the replicated copy.
+                    target = f"model.layers.{idx}.{out_full}"
+                    param = parameters[target]
+                    loader = getattr(param, "weight_loader", default_weight_loader)
+                    loader(param, weight)
+                    loaded.add(target)
                 if family == "self_attn":
                     layer.self_attn.load_weights([(relative, weight)])
                     continue

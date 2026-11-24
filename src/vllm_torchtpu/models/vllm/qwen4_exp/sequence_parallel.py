@@ -8,7 +8,9 @@ With QWEN4_EXP_PREFILL_SP=1 a step of at least QWEN4_EXP_PREFILL_SP_MIN_TOKENS
 tokens keeps the streams sharded by token across the TP ranks instead:
 
 - the attention block input is all-gathered right before the TP projections,
-- the attention output is reduce-scattered instead of all-reduced, and
+- the attention output is reduce-scattered instead of all-reduced (with
+  QWEN4_EXP_PREFILL_SP_EXIT_ALL_TO_ALL: sent to the token owners by an
+  all-to-all before a replicated output projection), and
 - the MoE runs on the gathered block (its EP kernel takes replicated rows)
   and each rank keeps its own rows of the reduced output.
 
@@ -45,6 +47,7 @@ from collections.abc import Iterable
 import torch
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     model_parallel_is_initialized,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -387,6 +390,41 @@ def all_gather_rows(x: torch.Tensor) -> torch.Tensor:
 def reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
     """This rank's contiguous rows of the sum of every rank's ``x``."""
     return tensor_model_parallel_reduce_scatter(x, 0)
+
+
+def exit_all_to_all_enabled(tp_size: int) -> bool:
+    """QWEN4_EXP_PREFILL_SP_EXIT_ALL_TO_ALL: attention blocks of the
+    sequence-parallel graph end with ``heads_to_token_owners`` and a replicated
+    output projection instead of the TP-sliced one and ``reduce``."""
+    return enabled(tp_size) and bool(envs.QWEN4_EXP_PREFILL_SP_EXIT_ALL_TO_ALL)
+
+
+def _all_to_all(x: torch.Tensor) -> torch.Tensor:
+    """Block ``d`` of the leading axis goes to TP rank ``d``; block ``r`` of the
+    result came from TP rank ``r``."""
+    from torch.distributed import _functional_collectives as funcol
+
+    out = funcol.all_to_all_single(
+        x.contiguous(), None, None, get_tp_group().device_group
+    )
+    if isinstance(out, funcol.AsyncCollectiveTensor):
+        return funcol.wait_tensor(out)
+    return out
+
+
+def heads_to_token_owners(x: torch.Tensor) -> torch.Tensor:
+    """This rank's contiguous rows of every rank's ``x``, ranks' columns side
+    by side: [T, d] (this rank's heads of every token) -> [T / tp, tp * d]
+    (every head of this rank's tokens, in TP rank order, the layout the
+    full output projection's input dimension has)."""
+    tp_size = tp_world_size()
+    received = _all_to_all(x)
+    rows = x.shape[0] // tp_size
+    return (
+        received.reshape(tp_size, rows, x.shape[1])
+        .transpose(0, 1)
+        .reshape(rows, tp_size * x.shape[1])
+    )
 
 
 def chunk_rows(x: torch.Tensor) -> torch.Tensor:

@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_WHOLE_BATCHED_INPUTS: bool = False
     VLLM_TPU_MK_PLE_TRIM: bool = False
     QWEN4_EXP_PREFILL_SP_SHARED_LOCAL: bool = False
+    QWEN4_EXP_PREFILL_SP_EXIT_ALL_TO_ALL: bool = False
     QWEN4_EXP_PREFILL_SP_PAD_HC: bool = False
     VLLM_TPU_SP_MICROBATCH_OVERLAP: bool = False
     VLLM_TPU_SP_MICROBATCH_OVERLAP_FORCE_OFF: bool = False
@@ -1772,6 +1773,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # which decode keeps), so it needs no all-gather or reduce-scatter. Costs one full shared
     # expert of HBM per rank.
     "QWEN4_EXP_PREFILL_SP_SHARED_LOCAL": env_bool("QWEN4_EXP_PREFILL_SP_SHARED_LOCAL"),
+    # With QWEN4_EXP_PREFILL_SP=1: each attention block of a sequence-parallel step
+    # ends with an all-to-all of its output (this rank's heads of every token) to the
+    # token owners and a replicated copy of its output projection (loaded next to the
+    # TP slice, which decode keeps), instead of the TP-sliced projection and a
+    # reduce-scatter: the wire carries the heads' width (768 columns at TP8 on
+    # Qwen3.8) instead of the hidden size (2560). One f32-accumulated sum instead of
+    # the bf16 partials' reduction, so not bit-identical. Costs one full output
+    # projection of HBM per layer and rank. The VLLM_TPU_SP_MICROBATCH_OVERLAP halves
+    # keep the reduce-scatter.
+    "QWEN4_EXP_PREFILL_SP_EXIT_ALL_TO_ALL": env_bool(
+        "QWEN4_EXP_PREFILL_SP_EXIT_ALL_TO_ALL"
+    ),
     # With QWEN4_EXP_PREFILL_SP=1: the sequence-parallel graph pads each
     # rank's shard to the HC kernels' row tile, so buckets whose shard does
     # not divide it (1024 and 3072 at TP8) take sequence parallelism too.
