@@ -104,3 +104,16 @@ def test_class_candidates_match_token_order(dtype, rank, dcp, heads, monkeypatch
     monkeypatch.setattr(msa_indexer, "is_prefill_step", lambda *_: False)
     want = np.asarray(run())
     np.testing.assert_array_equal(got[:num_real], want[:num_real])
+
+
+@pytest.mark.parametrize("num_tokens,heads", [(328, 4), (1300, 2)])
+def test_rotate_folded_queries_matches_rotate_queries(num_tokens, heads):
+    """Bit for bit, including a partial last block of tokens (1300)."""
+    rng = np.random.default_rng(num_tokens)
+    index_q = jnp.asarray(
+        rng.standard_normal((num_tokens, heads, HEAD_DIM)), jnp.bfloat16
+    )
+    got = msa_dcp.rotate_folded_queries(index_q, interpret=True)
+    want = msa_fp4.rotate_queries(index_q).reshape(num_tokens * heads, HEAD_DIM)
+    assert got.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want, np.float32))

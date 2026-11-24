@@ -1042,8 +1042,50 @@ def merge_pair_candidates(candidates: jax.Array, topk: int) -> jax.Array:
     return jnp.stack(picks, axis=1)
 
 
+# Tokens per grid step of `rotate_folded_queries`.
+_FOLD_BLOCK_TOKENS = 512
+
+
+def rotate_folded_queries(index_q: jax.Array, *, interpret: bool = False) -> jax.Array:
+    """`msa_fp4.rotate_queries` of ``index_q [T, G, D]`` (bf16) as the rows
+    `_class_candidates` folds the heads into, ``[T * G, D]`` in (token,
+    head) order, in f32 (the indexer's query rows). As XLA ops the rotation
+    came out head-major and the fold re-laid it out in 2-row tiles (c64
+    mixed twin j-c5ebe0af: ~27 us per layer)."""
+    num_tokens, heads, head_dim = index_q.shape
+    if index_q.dtype != jnp.bfloat16:  # the 6-pass f32 rotation
+        rotated = msa_fp4.rotate_queries(index_q).reshape(num_tokens * heads, -1)
+        return rotated.astype(jnp.float32)
+    block = min(num_tokens, _FOLD_BLOCK_TOKENS)
+
+    def kernel(x_ref, h_ref, o_ref):
+        rows = x_ref.shape[1]
+        for g in range(heads):
+            y = jnp.dot(x_ref[g], h_ref[...], preferred_element_type=jnp.float32)
+            y = (y * (1.0 / head_dim)).astype(index_q.dtype)
+            o_ref[pl.ds(g, rows, stride=heads), :] = y.astype(o_ref.dtype)
+
+    return pl.pallas_call(
+        kernel,
+        grid=(pl.cdiv(num_tokens, block),),
+        in_specs=[
+            pl.BlockSpec((heads, block, head_dim), lambda i: (0, i, 0)),
+            pl.BlockSpec((head_dim, head_dim), lambda i: (0, 0)),
+        ],
+        out_specs=pl.BlockSpec((block * heads, head_dim), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((num_tokens * heads, head_dim), jnp.float32),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+        name="minimax_m3_msa_rotate_folded_queries",
+    )(
+        index_q.transpose(1, 0, 2),
+        jnp.asarray(msa_fp4.hadamard(head_dim), jnp.bfloat16),
+    )
+
+
 def _class_candidates(
-    index_q: jax.Array,
+    folded: jax.Array,
+    num_heads: int,
     index_cache: jax.Array,
     seq_lens: jax.Array,
     local_lens: jax.Array,
@@ -1058,22 +1100,23 @@ def _class_candidates(
     scale_row: int | None,
 ) -> jax.Array:
     """Packed candidates ``[T, G * 2 * topk]`` (`pack_candidates` per head,
-    head-major) of a prefill-sized step: each `msa_indexer` tile class picks
+    head-major) of a prefill-sized step from the ``G = num_heads`` heads'
+    index queries ``folded [T * G, D]``: each `msa_indexer` tile class picks
     in the layout it scored in, and only the picks go back to token order.
     Gathering the classes' ``[P, columns]`` scores to ``[T, P]`` first (a
     concatenate, column gather and transpose, ~110 us per layer at c48)
     moved 32x the bytes, which the transposing pick kernel then turned back.
 
-    ``index_q [T, G, D]``: ``G > 1`` heads are folded into each request's
-    query rows in (token, head) order, as laid out: the block scores are
+    ``G > 1`` heads are folded into each request's query rows in (token,
+    head) order, as ``index_q [T, G, D]`` lays them out: the block scores are
     blind to the row order within a request, and a (head, token) order took
     a row gather of the queries (~45 us per layer at c64's 8K-token mixed
     steps, twin j-a202588d).
     """
-    num_tokens, num_heads, head_dim = index_q.shape
+    num_tokens = folded.shape[0] // num_heads
     rows = jnp.arange(num_tokens * num_heads, dtype=jnp.int32)
     rows = rows.reshape(num_tokens, num_heads).T  # [G, T]: head h of token t
-    folded = index_q.reshape(num_tokens * num_heads, 1, head_dim)
+    folded = folded[:, None]
     folded_cu = num_heads * cu_q_lens
     plan = msa_indexer.class_plan(
         folded,
@@ -1196,12 +1239,12 @@ def msa_write_and_candidates_dcp(
     )
     fp4 = scale_cache is not None
     scale_row = msa_fp4.index_scale_row(num_heads) if fp4 else None
+    rotate = False
     if fp4:
         targets = msa.fp4_targets(
             kv_cache, index_cache, scale_cache, k, v, index_k, interpret=interpret
         )
-        if not index_q_rotated:
-            index_q = msa_fp4.rotate_queries(index_q)
+        rotate = not index_q_rotated
     else:
         kv_rows = jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1)
         targets = [
@@ -1254,9 +1297,15 @@ def msa_write_and_candidates_dcp(
         dcp=dcp,
         interpret=interpret,
     )
-    if msa_indexer.is_prefill_step(num_heads * num_tokens, max_num_seqs):
+    prefill = msa_indexer.is_prefill_step(num_heads * num_tokens, max_num_seqs)
+    if rotate and not prefill:
+        index_q = msa_fp4.rotate_queries(index_q)
+    if prefill:
         packed = _class_candidates(
-            index_q,
+            rotate_folded_queries(index_q, interpret=interpret)
+            if rotate
+            else index_q.reshape(num_tokens * num_heads, -1),
+            num_heads,
             index_cache,
             seq_lens,
             local_lens,
