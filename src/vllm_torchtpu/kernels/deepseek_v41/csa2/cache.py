@@ -219,8 +219,12 @@ def _gather_sc_banked(words, scales, records):
     )
 
 
-def _gather_sc_banked_deep(words, scales, records):
+def _gather_sc_banked_deep(words, scales, records, into=None):
     """``_gather_sc_banked`` with three slots and DMA-zeroed invalid rows.
+
+    ``into`` (owner words [N,128], owner scales [N], static row offset)
+    writes the gathered rows in place at that offset of the owners and
+    returns the owners, instead of returning new arrays.
 
     The gather for step i + 2 is issued while step i's rows are written, so
     two gathers are in flight instead of one. Each 16-id stream is filled by
@@ -325,7 +329,7 @@ def _gather_sc_banked_deep(words, scales, records):
                         for src, dst in ((word_buf, word_out), (scale_buf, scale_out)):
                             copy = pltpu.make_async_copy(
                                 src.at[slot, stream],
-                                dst.at[pl.ds(offset, lanes)],
+                                dst.at[pl.ds(row_offset + offset, lanes)],
                                 write_sem.at[slot, stream],
                             )
                             if wait:
@@ -358,35 +362,37 @@ def _gather_sc_banked_deep(words, scales, records):
             ),
         )(ids_ref)
 
+    row_offset = 0 if into is None else into[2]
+    call = functools.partial(
+        pl.kernel,
+        kernel,
+        scratch_types=(
+            pltpu.VMEM((slots, streams, lanes, 128), jnp.int32),
+            pltpu.VMEM((slots, streams, lanes), jnp.float32),
+            pltpu.SemaphoreType.DMA((slots, streams)),
+            pltpu.SemaphoreType.DMA((slots, streams)),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            use_tc_tiling_on_sc=False,
+            needs_layout_passes=True,
+            disable_bounds_checks=True,
+        ),
+        mesh=mesh,
+        name="csa2_banked_word_scale_gather",
+    )
+    inputs = (words, scales, zero_words, zero_scales, indices)
+    if into is not None:
+        owners = tuple(jax.new_ref(owner) for owner in into[:2])
+        call()(*inputs, *owners)
+        return tuple(owner[...] for owner in owners)
     out, scale_out = cast(
         tuple[jax.Array, jax.Array],
-        pl.kernel(
-            kernel,
+        call(
             out_type=(
                 jax.ShapeDtypeStruct((count, 128), jnp.int32),
                 jax.ShapeDtypeStruct((count,), jnp.float32),
-            ),
-            scratch_types=(
-                pltpu.VMEM((slots, streams, lanes, 128), jnp.int32),
-                pltpu.VMEM((slots, streams, lanes), jnp.float32),
-                pltpu.SemaphoreType.DMA((slots, streams)),
-                pltpu.SemaphoreType.DMA((slots, streams)),
-            ),
-            compiler_params=pltpu.CompilerParams(
-                use_tc_tiling_on_sc=False,
-                needs_layout_passes=True,
-                disable_bounds_checks=True,
-            ),
-            mesh=mesh,
-            name="csa2_banked_word_scale_gather",
-        )(
-            words,
-            # pyrefly: ignore[bad-argument-count]
-            scales,
-            zero_words,
-            zero_scales,
-            indices,
-        ),
+            )
+        )(*inputs),
     )
     return out.reshape(*records.shape, 128), scale_out.reshape(records.shape)
 
