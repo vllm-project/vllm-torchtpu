@@ -557,7 +557,9 @@ class Eagle3Proposer:
         (rows past the chunk's real requests are padding either way)."""
         if out.shape[0] >= rows:
             return out[:rows]
-        return torch.nn.functional.pad(out, (0, 0, 0, rows - out.shape[0]))
+        return torch.nn.functional.pad(
+            out, (0, 0) * (out.ndim - 1) + (0, rows - out.shape[0])
+        )
 
     def _resolve_draft_rows(self) -> bool:
         """Whether draft step 0 runs at each request's last token only.
@@ -687,11 +689,12 @@ class Eagle3Proposer:
     def _set_skip_indexer_writes(self, skip: bool) -> None:
         """Pick the draft QSA ops traced next: without (``skip``) or with the
         indexer cache writes. Only a program's first call reads it."""
-        if self._skip_write_modules is None:
+        if getattr(self, "_skip_write_modules", None) is None:
             assert self.draft_model is not None
+            modules_fn = getattr(self.draft_model, "modules", None)
             self._skip_write_modules = [
                 m
-                for m in self.draft_model.modules()
+                for m in (modules_fn() if callable(modules_fn) else ())
                 if getattr(m, "_shared_skip_ops", None) is not None
             ]
             if envs.VLLM_TPU_MTP_DRAFT_SKIP_INDEXER_WRITES:
