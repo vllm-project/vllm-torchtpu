@@ -1,3 +1,12 @@
 {
-  "_pending": "No measured baseline yet. The baseline is check_regression.py --mode eval --calibrate --task-filter gsm8k over at least two runs of this recipe's own launcher (.buildkite/kubernetes/qwen35_pd.sh serving configs/qwen3.5-397b-fp8-pd-1p1d.sh, the whole GSM8K split through run_qwen35_397b_pd_correctness.sh), committed with a _source block naming those runs and the commit. Until then check_regression.py refuses this file, so the GSM8K gate fails, and the nightly step runs with EVAL_SOFT_FAIL=1 so that only this verdict warns."
+  "_source": {
+    "url": "https://github.com/vllm-project/vllm-torchtpu/blob/4f0afba552c90b2b4a42b1caab1e502248bff4d6/.buildkite/kubernetes/qwen35_pd.sh",
+    "description": "Median of two runs (check_regression.py --mode eval --calibrate --task-filter gsm8k) of this recipe's own launcher, .buildkite/kubernetes/qwen35_pd.sh serving configs/qwen3.5-397b-fp8-pd-1p1d.sh through scripts/vllm/integration/run_qwen35_397b_pd_correctness.sh, on two tpu7x 2x2x1 hosts (8 chips), image vllm-torchtpu-ci/vllm-torchtpu@sha256:deb89b46d464. GSM8K whole test split (1,319 questions), 5-shot, thinking on, strict-match, 64 requests in flight. The runs served trees 87fbc6983b and 95337231eb, whose engines have identical serve arguments and environment (the trees differ in the checks, the CI wiring and lm-eval's client retries, 5 then 1; neither run logged a failed request). Every correctness stage passed in both. Strict-match per run: 0.9742 and 0.9773 (standard errors 0.0044 and 0.0041)."
+  },
+  "gsm8k": {
+    "exact_match,flexible-extract": 0.9749810462471569,
+    "exact_match,strict-match": 0.9757391963608795,
+    "exact_match_stderr,flexible-extract": 0.00429996482845461,
+    "exact_match_stderr,strict-match": 0.004235831795685733
+  }
 }
