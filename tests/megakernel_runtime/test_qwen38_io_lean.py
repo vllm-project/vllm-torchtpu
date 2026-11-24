@@ -242,3 +242,49 @@ def test_cktab_and_conv_are_row_capped(monkeypatch, cap):
 def test_max_rows_registered_default_48(monkeypatch):
     monkeypatch.delenv("VLLM_TPU_MK_IO_LEAN_MAX_ROWS", raising=False)
     assert envs.environment_variables["VLLM_TPU_MK_IO_LEAN_MAX_ROWS"]() == 48
+
+
+def test_self_check_line_and_once(monkeypatch, caplog):
+    import logging
+
+    from vllm_torchtpu.megakernel_runtime import qwen38_io_lean as il
+
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN_MAX_ROWS", 48, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_PLE_TRIM", False, raising=False)
+    assert il.io_lean_line() is None
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "all", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_PLE_TRIM", True, raising=False)
+    assert il.io_lean_line() == (
+        "MK_IO_LEAN levers=ring,cktab,rope,conv,ple,pleconv max_rows=48 ple_trim=1"
+    )
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "", raising=False)
+    assert il.io_lean_line() == "MK_IO_LEAN levers=none max_rows=48 ple_trim=1"
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "rope,ring", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_PLE_TRIM", False, raising=False)
+    assert il.io_lean_line() == "MK_IO_LEAN levers=ring,rope max_rows=48 ple_trim=0"
+    monkeypatch.setattr(il, "_SELF_CHECK_LOGGED", False)
+    with caplog.at_level(logging.INFO):
+        il.log_io_lean_once()
+        il.log_io_lean_once()
+    assert [r.getMessage() for r in caplog.records if "MK_IO_LEAN levers" in r.getMessage()] == [
+        "MK_IO_LEAN levers=ring,rope max_rows=48 ple_trim=0"
+    ]
+
+
+def test_self_check_silent_when_off_or_not_rank0(monkeypatch, caplog):
+    import logging
+
+    from vllm_torchtpu.megakernel_runtime import qwen38_io_lean as il
+
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "", raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_PLE_TRIM", False, raising=False)
+    monkeypatch.setattr(il, "_SELF_CHECK_LOGGED", False)
+    with caplog.at_level(logging.INFO):
+        il.log_io_lean_once()
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "all", raising=False)
+    monkeypatch.setattr(il, "_SELF_CHECK_LOGGED", False)
+    monkeypatch.setattr(il, "_rank0", lambda: False)
+    with caplog.at_level(logging.INFO):
+        il.log_io_lean_once()
+    assert not [r for r in caplog.records if "MK_IO_LEAN levers" in r.getMessage()]

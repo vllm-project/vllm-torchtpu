@@ -46,7 +46,7 @@ from vllm_torchtpu.megakernel.wholestep.qsa_full_b import SEL_IDS
 from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW, UNION_STATS
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
 
-from .qwen38_io_lean import io_lean, ring_columns
+from .qwen38_io_lean import io_lean, log_io_lean_once, ring_columns
 from .qwen38_scatter import scatter_gdn_ckpts_fast
 from .qwen38_segment_call import GDN_META, T_VERIFY, gdn_blocks, ring_depths, segment_tiles
 from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
@@ -548,6 +548,7 @@ def build_wholestep_call(
     export_main = export and not tail
     spec = spec_for(L, n_att, export_main)
     log_mk_options(B, spec, ex.tiles)
+    log_io_lean_once()
     stats = union_stats_on()
     fn, k_specs, _, n_w = make_flat_segment_step(
         mesh,

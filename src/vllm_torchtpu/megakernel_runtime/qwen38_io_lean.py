@@ -64,6 +64,46 @@ def io_lean(lever: str, rows: int | None = None) -> bool:
     return True
 
 
+_SELF_CHECK_LOGGED = False
+
+
+def io_lean_line() -> str | None:
+    """The startup self-check line, or None when no lever and no PLE_TRIM is on."""
+    levers = io_lean_levers()
+    trim = bool(envs.VLLM_TPU_MK_PLE_TRIM)
+    if not levers and not trim:
+        return None
+    names = ",".join(lv for lv in LEVERS if lv in levers) or "none"
+    return (
+        f"MK_IO_LEAN levers={names} max_rows={envs.VLLM_TPU_MK_IO_LEAN_MAX_ROWS} "
+        f"ple_trim={int(trim)}"
+    )
+
+
+def _rank0() -> bool:
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank() == 0
+    except Exception:  # no TP group (CPU tests, tools)
+        return True
+
+
+def log_io_lean_once() -> None:
+    """Rank 0, once per process: which MK_IO_LEAN levers / PLE_TRIM the server runs with
+    (so a served log proves the flags took). Silent when all are off. Logging only."""
+    global _SELF_CHECK_LOGGED
+    if _SELF_CHECK_LOGGED:
+        return
+    _SELF_CHECK_LOGGED = True
+    line = io_lean_line()
+    if line is None or not _rank0():
+        return
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info(line)
+
+
 def ring_columns(tables: Any, n_rows: int, per_layer: int = 3) -> list:
     """VLLM_TPU_MK_IO_LEAN=ring: every QSA layer's ring-id table (flat `[n_rows * W]`, the
     runner's `[n_rows, W]` block table) replaced by its column 0, the only one read
