@@ -759,6 +759,28 @@ def test_key_stream_ring_and_manager_pages_bit_identical(monkeypatch, kw):
     assert not np.array_equal(bad[7], base[7]), "stale-ring scores must change the selection"
 
 
+@pytest.mark.parametrize("key_slots", [3, 4])
+def test_early_loads_bit_identical(monkeypatch, key_slots):
+    """VLLM_TPU_MK_QSA_EARLY_LOADS: table rows copied before the HC mix, request 0's loop
+    loads, the union's table rows and the owned request's first key chunks issued before the
+    projection give bit-identical residuals, completed keys, rings and selected ids. Request
+    0 streams 6 chunks (more than the slots), request 1 one chunk (fewer than the early
+    chunks)."""
+    from vllm_torchtpu.megakernel.wholestep import qsa_full_c
+
+    run = functools.partial(
+        _run_c, long=True, rank_ids=True, ctx=[6000, 100], max_groups=2048, shard=True,
+        union=True, loop=True, xreq=2, skip_idle=True, xmerge=True, key_slots=key_slots,
+        phys=True,
+    )
+    monkeypatch.setattr(qsa_full_c, "EARLY_LOADS", False)
+    late = run()
+    monkeypatch.setattr(qsa_full_c, "EARLY_LOADS", True)
+    early = run()
+    for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new"), (7, "ids")):
+        np.testing.assert_array_equal(early[i], late[i], err_msg=name)
+
+
 def test_step_tokens_match_stock_semantics():
     """Stage C: the completed group's key and the new ring rows equal the stock write
     for

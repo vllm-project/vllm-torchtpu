@@ -389,16 +389,20 @@ class QSAFullIndexedBlock(QSAFullBlock):
         # block (a
         # row offset `o * requests` into a 2-D table is not tile-aligned for 12
         # requests).
-        o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
-        scr = ctx.scr
-        cps = [
-            pltpu.make_async_copy(ctx.extra[src].at[o], scr[dst], scr["qi_tsem"].at[i])
-            for i, (src, dst) in enumerate(((CKTAB, "qi_ckw"), (MTAB, "qi_mtw")))
-        ]
+        cps = self._table_copies(ctx, l)
         for c in cps:
             c.start()
         for c in cps:
             c.wait()
+
+    def _table_copies(self, ctx: Any, l: Any) -> list[Any]:  # noqa: E741
+        """`load_tables`' copies of this layer's table rows into the SMEM windows."""
+        o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
+        scr = ctx.scr
+        return [
+            pltpu.make_async_copy(ctx.extra[src].at[o], scr[dst], scr["qi_tsem"].at[i])
+            for i, (src, dst) in enumerate(((CKTAB, "qi_ckw"), (MTAB, "qi_mtw")))
+        ]
 
     def offset(self, ctx: Any, l: Any) -> Any:  # noqa: E741
         if not self.n_layers:
@@ -517,7 +521,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
     # ------------------------------------------------------------ in kernel
     def _score_request(
         self, ctx: Any, q: int, qr: jax.Array, base: Any = 0, last: bool = True, row0: Any = None,
-        first: bool | None = None, c_off: Any = 0,
+        first: bool | None = None, c_off: Any = 0, issued: Any = False,
     ) -> None:
         """Scores of request `q`'s `T` rows into `qi_s[q*T : (q+1)*T]` (chunk-major).
 
@@ -527,7 +531,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
         first chunk is issued here. `first` (default `q == 0`) marks the first request of the
         rank's run when the indexer is sharded by request (`shard_index`). `compressed_dcp`:
         only this rank's own groups (`qsa_cktab` lists its pages), scored into chunks from
-        `c_off` on."""
+        `c_off` on. `issued` (deep ring): the request's first `key_slots - 1` chunks were
+        already issued (`QSAFullStepBlock` early loads)."""
         scr, T = ctx.scr, ctx.ex.T
         r0 = q * T if row0 is None else row0
         rows = slice(r0, r0 + T)
@@ -540,38 +545,15 @@ class QSAFullIndexedBlock(QSAFullBlock):
             st = ix.score_rows(qr, scr["qi_ck"][...])  # [T, G]
             scr["qi_s"][rows, 0] = st.reshape(T, self.max_groups // 128, 128)
             return
-        CH, NC, W, MP = self.chunk_pages, self.n_chunks, self.ck_lanes, self.mp
+        CH, NC = self.chunk_pages, self.n_chunks
         CG = CH * GPK
-        ring, sems = scr["qi_ring"], scr["qi_ring_sem"]
-        lanes = pl.ds(0, W)
 
         def copies(c: Any, s: Any, qq: int = q) -> list[Any]:
-            if SCORE_ARM == "compute":  # timing arm: no key copies
-                return []
-            tab, qb = self.tables(ctx)[0], base + qq
-            if MP:  # one DMA per manager page of MP contiguous kernel pages
-                return [
-                    pltpu.make_async_copy(
-                        ctx.extra[CK].at[
-                            pl.ds(tab[qb, c * (CH // MP) + m] * MP, MP), :, :, lanes
-                        ],
-                        ring.at[s, pl.ds(m * MP, MP)],
-                        sems.at[s],
-                    )
-                    for m in range(CH // MP)
-                ]
-            return [
-                pltpu.make_async_copy(
-                    ctx.extra[CK].at[tab[qb, c * CH + p], :, :, lanes],
-                    ring.at[s, p],
-                    sems.at[s],
-                )
-                for p in range(CH)
-            ]
+            return self._key_copies(ctx, base + qq, c, s)
 
         first = (q == 0) if first is None else first
         if self.key_slots > 2:
-            self._score_deep(ctx, q, qr, copies, rows, first, last, c_off)
+            self._score_deep(ctx, q, qr, copies, rows, first, last, c_off, issued)
             return
 
         def issue_first() -> None:
@@ -622,6 +604,29 @@ class QSAFullIndexedBlock(QSAFullBlock):
         if self.bounded_chunks:
             scr["qi_cc"][0] = c0 + n_q
 
+    def _key_copies(self, ctx: Any, qb: Any, c: Any, s: Any) -> list[Any]:
+        """Copies of key chunk `c` of table row `qb` into key-ring slot `s`."""
+        if SCORE_ARM == "compute":  # timing arm: no key copies
+            return []
+        CH, W, MP = self.chunk_pages, self.ck_lanes, self.mp
+        ring, sems, tab = ctx.scr["qi_ring"], ctx.scr["qi_ring_sem"], self.tables(ctx)[0]
+        lanes = pl.ds(0, W)
+        if MP:  # one DMA per manager page of MP contiguous kernel pages
+            return [
+                pltpu.make_async_copy(
+                    ctx.extra[CK].at[pl.ds(tab[qb, c * (CH // MP) + m] * MP, MP), :, :, lanes],
+                    ring.at[s, pl.ds(m * MP, MP)],
+                    sems.at[s],
+                )
+                for m in range(CH // MP)
+            ]
+        return [
+            pltpu.make_async_copy(
+                ctx.extra[CK].at[tab[qb, c * CH + p], :, :, lanes], ring.at[s, p], sems.at[s]
+            )
+            for p in range(CH)
+        ]
+
     def _consume(self, ctx: Any, qr: jax.Array, s: Any, rows: slice, col: Any) -> None:
         """Wait for ring slot `s` and score its chunk into score column `col` of `rows`."""
         scr, T = ctx.scr, ctx.ex.T
@@ -648,7 +653,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
 
     def _score_deep(
         self, ctx: Any, q: Any, qr: jax.Array, copies: Any, rows: slice, first: Any, last: Any,
-        c_off: Any,
+        c_off: Any, issued: Any = False,
     ) -> None:
         """`_score_request`'s key stream through a `key_slots`-slot ring (bounded chunks):
         `key_slots - 1` chunks are in flight while one is scored. Chunk `c` of the rank's
@@ -669,7 +674,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 cp.start()
 
         for k in range(KS - 1):  # chunks 0..KS-2 (chunk 0 came with the previous request)
-            cond = k < n_q
+            cond = (k < n_q) & jnp.logical_not(issued)
             if k == 0:
                 if isinstance(first, bool):
                     if not first:

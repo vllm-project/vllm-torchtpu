@@ -41,7 +41,7 @@ outputs for a post-kernel scatter:
 from __future__ import annotations
 
 import functools
-
+import os
 from typing import Any
 
 import jax
@@ -79,6 +79,10 @@ UNION_STATS = (
 UNION_STATS_REQS = 16
 IR_NEW = "qsa_ir_new"
 FP8_MAX = 448.0
+# The layer's table rows are copied before its HC mix and the request loop's first loads
+# (request 0's `xreq_loads`, the owned request's first key chunks) go out before the
+# projection (`QSAFullStepBlock._early`); "0" issues them where they are first needed.
+EARLY_LOADS = os.environ.get("VLLM_TPU_MK_QSA_EARLY_LOADS", "1") != "0"
 
 
 def _scoped(name: str, level: int = 2):
@@ -990,7 +994,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                             )
                             continue
                         full_union(r)
-        self.load_tables(ctx, l)
+        if not self._early_now:  # else waited at the start of `emit` (`_early_loads`)
+            self.load_tables(ctx, l)
         npr = self._shard_rows(ex)[0] if self.shard_index else nreq
         c_off = jax.lax.rem(ctx.me, self.dcp) * (NC // self.dcp) if cdcp else 0
         if cdcp:  # the first swap's credit (when the pair has a request this layer)
@@ -999,11 +1004,14 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             else:
                 self._cdcp_credit(ctx)
 
-        def score_merge(q: Any, qr: Any, ck: Any, gc: Any, first: Any, last: Any) -> None:
+        def score_merge(
+            q: Any, qr: Any, ck: Any, gc: Any, first: Any, last: Any, issued: Any = False
+        ) -> None:
             """Request `q`'s scores (this rank's groups, then the pair's under `compressed_dcp`)
             with the completed group's fresh key in its stale cached column; then selected."""
             self._score_request(
                 ctx, q, qr, self.tab_base(ctx, l), row0=0, first=first, last=last, c_off=c_off,
+                issued=issued,
             )
             if cdcp:
                 self._cdcp_swap(ctx, q)
@@ -1047,6 +1055,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                         # The last request of a run stops the key prefetch (`n_loop`: the
                         # last live one under `skip_idle`).
                         (jax.lax.rem(q, npr) == npr - 1) | (q == n_loop - 1),
+                        # Its first chunks went out in `_early_loads`.
+                        self._early_now & (q == self._run(ctx) * npr),
                     )
 
                 if self.shard_index:
@@ -1056,7 +1066,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 self._recent_tile(ctx, l, q, bank)
                 return carry
 
-            if xl:
+            if xl and not self._early_now:  # else issued in `_early_loads`
 
                 @pl.when(n_loop > 0)
                 def _():
@@ -1355,10 +1365,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         xreq = self.xreq_prefetch
 
         def tab_copy(q: Any) -> Any:
-            o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
-            return pltpu.make_async_copy(
-                ctx.extra[MTAB].at[o, pl.ds(q, 1)], scr["qu_tab"].at[q], scr["qu_tab_sem"].at[q]
-            )
+            return self._tab_copy(ctx, l, q)
 
         def stage_ids(q: Any, bank: Any) -> None:
             """Request `q`'s union ids (physical with `union_phys`) into `qu_row[bank]`."""
@@ -1511,7 +1518,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             return sbase + ua.union_tiles(n_u)
 
         n_loop = self._n_live(ctx) if self.skip_idle else nreq
-        if self.union_phys:  # the table rows of the requests the loop visits, waited there
+        # The table rows of the requests the loop visits, waited there (`_early_loads` issued
+        # them already).
+        if self.union_phys and not self._early_now:
             for q in range(nreq):
                 pl.when(q < n_loop)(lambda q=q: tab_copy(q).start())
         if not xreq:
@@ -1522,6 +1531,14 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
         outs, _ = jax.lax.fori_loop(0, n_loop, req, (zeros, jnp.int32(0)))
         return list(outs)
+
+    def _tab_copy(self, ctx: Any, l: Any, q: Any) -> Any:  # noqa: E741
+        """`union_phys`: request `q`'s main-table row of this layer into `qu_tab[q]`."""
+        o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
+        return pltpu.make_async_copy(
+            ctx.extra[MTAB].at[o, pl.ds(q, 1)], ctx.scr["qu_tab"].at[q],
+            ctx.scr["qu_tab_sem"].at[q],
+        )
 
     def _dcp_group(self, ctx: Any, src: Any, dst: Any, i: int) -> list:
         """Copies `src(j)` -> `dst[j - 1]` of group peer `me ^ j` (j = 1 .. S - 1): every
@@ -1585,10 +1602,67 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         n_rows = self._n_live(ctx) * ex.T if self.union_split and self.skip_idle else ex.MB
         return list(jax.lax.fori_loop(0, n_rows, row, zeros))
 
+    # Trace time: `prefetch` started this layer's table copies (`_tables_inflight`, taken by
+    # the next `emit`), and the `emit` being traced issued the early loads (`_early_now`).
+    _tables_inflight = False
+    _early_now = False
+
+    def _early(self) -> bool:
+        """`EARLY_LOADS` applies: HBM tables, the sharded request loop with its loads issued
+        ahead (`xreq_loads`) and the deep key ring, no compressed-key DCP."""
+        return bool(
+            EARLY_LOADS and self.hbm_tables and self.loop_requests and self.xreq_loads
+            and self.shard_index and self.carrier and self.bounded_chunks
+            and self.key_slots > 2 and not self.compressed_dcp
+        )
+
+    def prefetch(self, ctx: Any, l: Any, slot: Any) -> None:  # noqa: E741
+        if self._early():
+            for c in self._table_copies(ctx, l):
+                c.start()
+            self._tables_inflight = True
+
+    @_scoped("qsa_early")
+    def _early_loads(self, ctx: Any, l: Any) -> None:  # noqa: E741
+        """Wait for the table rows `prefetch` copied, then issue the request loop's first
+        loads: request 0's `xreq_loads` (bank 0), the union attention's main-table rows
+        (`union_phys`) and this rank's first owned request's key chunks 0..KS-2 (ring slots
+        0..KS-2: its stream starts the layer, `first`), as the loop, `_attend_unions` and
+        `_score_deep` would have issued them."""
+        ex, T, KS = ctx.ex, ctx.ex.T, self.key_slots
+        nreq = ex.MB // T
+        for c in self._table_copies(ctx, l):
+            c.wait()
+        n_loop = self._n_live(ctx) if self.skip_idle else nreq
+
+        @pl.when(n_loop > 0)
+        def _():
+            for cp in self._xreq_loads(ctx, l, 0, 0):
+                cp.start()
+
+        if self.union_phys:  # the union attention's table rows (`_attend_unions`)
+            for q in range(nreq):
+                pl.when(q < n_loop)(lambda q=q: self._tab_copy(ctx, l, q).start())
+
+        q0 = self._run(ctx) * self._shard_rows(ex)[0]
+        qb = self.tab_base(ctx, l) + jnp.minimum(q0, nreq - 1)
+        CG = self.chunk_pages * GPK
+        nv = ctx.extra[NVIS][jnp.minimum(q0, nreq - 1) * T + T - 1]
+        n_q = jnp.clip((nv + CG - 1) // CG, 1, self.n_chunks)
+        for k in range(KS - 1):
+
+            @pl.when((q0 < n_loop) & (k < n_q))
+            def _(k=k):
+                for cp in self._key_copies(ctx, qb, k, k):
+                    cp.start()
+
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ex, scr, g = ctx.ex, ctx.scr, ctx.g
         nh, T = self.nh(g, ex), ex.T
         sc = ctx.stream.sc
+        self._early_now, self._tables_inflight = self._tables_inflight, False
+        if self._early_now:
+            self._early_loads(ctx, l)
         with sc("qsa_proj"):
             kv = self._project(ctx, l, slot)
         qx = []
