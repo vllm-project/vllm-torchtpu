@@ -54,32 +54,18 @@ DispatchRegime = Literal["auto", "zero_floor", "compiled_xla", "unfused_eager"]
 SupportStatus = Literal["baseline", "within_core_limits", "declared", "hypothetical"]
 VALID_SOURCE_SCOPES: frozenset[str] = frozenset({"", *get_args(FusionScope)})
 
-SUPPORTED_ONCHIP_FAMILIES: frozenset[str] = frozenset(
-    {"gqa", "mla", "dsa", "gdn", "kda", "dense_mlp", "moe"}
-)
-# Layer families that megakernel/core ships a module package for.
-CORE_MODULE_FAMILIES: frozenset[str] = frozenset({"gqa", "gdn", "moe"})
-# Weight dtypes the megakernel/core kernels read.
-CORE_SUPPORTED_DTYPES: frozenset[str] = frozenset({"fp8", "bf16"})
-# Entries of `ModelProfile.layer_families` that describe stack structure.
-STRUCTURAL_LAYER_TAGS: frozenset[str] = frozenset({"dense_prefix_moe"})
+SUPPORTED_ONCHIP_FAMILIES = constants.SUPPORTED_ONCHIP_FAMILIES
+CORE_MODULE_FAMILIES = constants.CORE_MODULE_FAMILIES
+CORE_SUPPORTED_DTYPES = constants.CORE_SUPPORTED_DTYPES
+STRUCTURAL_LAYER_TAGS = constants.STRUCTURAL_LAYER_TAGS
 
-ModelSupportTier = Literal[
-    "declared", "core_families", "priced_only", "partly_unmodeled"
-]
+ModelSupportTier = Literal["declared", "priced_only"]
 
 SUPPORT_TIER_DESCRIPTIONS: Mapping[ModelSupportTier, str] = {
     "declared": "A megakernel is declared for at least one serving layout.",
-    "core_families": (
-        "Every layer family and weight dtype has a megakernel/core counterpart. "
-        "Not a claim that it was run."
-    ),
     "priced_only": (
         "Priced by the advisor. A layer family or weight dtype has no "
         "megakernel/core counterpart."
-    ),
-    "partly_unmodeled": (
-        "A layer family is not priced, or the model type is not recognized."
     ),
 }
 

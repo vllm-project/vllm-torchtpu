@@ -39,6 +39,8 @@ from .constants import (
     MIN_INTERVAL,
     MULTIMODAL_KEYS,
     PRESETS_DIR,
+    STRUCTURAL_LAYER_TAGS,
+    SUPPORTED_ONCHIP_FAMILIES,
     VALID_LAYER_TOKENS,
     WORD_ALIGN_BYTES,
     CollectiveStepKind,
@@ -50,40 +52,7 @@ class UnsupportedArchitectureError(errors.MegakernelConfigError, ValueError):
     """Raised when a model preset or HuggingFace config is unsupported or malformed."""
 
 
-RECOGNIZED_MODEL_TYPES: frozenset[str] = frozenset(
-    {
-        "deepseek_v2",
-        "deepseek_v3",
-        "deepseek_v4",
-        "glm4_moe",
-        "glm5",
-        "glm_moe",
-        "glm_moe_dsa",
-        "gpt_oss",
-        "kimi_k2",
-        "kimi_k3",
-        "kimi_linear",
-        "llama",
-        "llama4",
-        "llama4_text",
-        "mistral",
-        "mixtral",
-        "qwen2",
-        "qwen2_moe",
-        "qwen3",
-        "qwen3_5",
-        "qwen3_5_moe",
-        "qwen3_5_moe_text",
-        "qwen3_5_text",
-        "qwen3_8",
-        "qwen3_moe",
-        "qwen3_next",
-        "qwen4_exp",
-        "qwen4_exp_text",
-    }
-)
-
-SUPPORTED_MODEL_TYPES: frozenset[str] = RECOGNIZED_MODEL_TYPES
+ONBOARDING_DOC_REF = "src/vllm_torchtpu/megakernel/advisor/README.md (Adding a Model)"
 
 
 @dataclass(frozen=True)
@@ -127,7 +96,6 @@ class ModelProfile:
     kv_dtype: str = "fp8"
     state_dtype: str = "bf16"
     model_type: str = ""
-    architecture_unverified: bool = False
     layer_families: tuple[str, ...] = ()
     has_attn_output_gate: bool = False
     non_homogeneous_reasons: tuple[str, ...] = ()
@@ -187,10 +155,6 @@ def _derive_layer_families(
         families.append("dense_mlp")
     if 0 < moe_layers < profile.num_layers:
         families.append("dense_prefix_moe")
-    if profile.kv_compress_factor < 1.0 and "sparse_csa" not in families:
-        families.append("sparse_csa")
-    if profile.residual_streams > 1 and "hyper_connection" not in families:
-        families.append("hyper_connection")
     return tuple(families)
 
 
@@ -226,10 +190,6 @@ def finalize_model_profile(profile: ModelProfile) -> ModelProfile:
         "fp8" if w_dt_low in ("fp8", "nvfp4", "mxfp4", "fp4", "int8") else w_dt_low
     )
     act_dt = (profile.act_dtype or default_act_dt).lower()
-    mtype = profile.model_type.strip().lower()
-    unverified = profile.architecture_unverified or bool(
-        mtype and mtype not in RECOGNIZED_MODEL_TYPES
-    )
     families = profile.layer_families or _derive_layer_families(
         profile, attn_layers=attn_layers, moe_layers=resolved_moe_layers
     )
@@ -245,7 +205,6 @@ def finalize_model_profile(profile: ModelProfile) -> ModelProfile:
         moe_intermediate_size=moe_inter,
         expert_dtype=exp_dt,
         act_dtype=act_dt,
-        architecture_unverified=unverified,
         layer_families=families,
         non_homogeneous_reasons=reasons,
     )
@@ -311,7 +270,6 @@ class _NormalizedHfConfig:
     model_type: str
     is_multimodal: bool
     has_gdn_kda_heads: bool
-    has_ssm: bool
     num_layers: int
     hidden_size: int
     num_heads: int
@@ -359,11 +317,13 @@ class _NormalizedHfConfig:
     def validate_supported(self, *, require_model_type: bool = False) -> None:
         """Validate that the configuration describes a supported causal LM."""
         _ = require_model_type
-        if not self.model_type or self.model_type not in SUPPORTED_MODEL_TYPES:
-            msg = f"Unsupported architecture model_type {self.model_type!r}"
-            raise UnsupportedArchitectureError(msg)
-        if self.has_ssm and not (self.num_heads or self.has_gdn_kda_heads):
-            msg = "Unmodeled state-space config missing attention and GDN/KDA heads"
+        base_mtype = self.model_type.strip().lower().removesuffix("_text")
+        if not base_mtype or base_mtype not in SUPPORTED_MODEL_TYPES:
+            msg = (
+                f"Unsupported architecture model_type {self.model_type!r}. "
+                f"Supported repositories: {', '.join(SUPPORTED_REPOSITORIES)}. "
+                f"See {ONBOARDING_DOC_REF}."
+            )
             raise UnsupportedArchitectureError(msg)
 
         for key_name, val in (
@@ -402,9 +362,6 @@ class _NormalizedHfConfig:
                     f"Unknown layer_type {tok_s!r}; supported tokens: "
                     f"{sorted(VALID_LAYER_TOKENS)}"
                 )
-                raise UnsupportedArchitectureError(msg)
-            if tok_s == "mamba" and not self.has_gdn_kda_heads:
-                msg = "Layer token 'mamba' requires GDN/KDA head dimensions"
                 raise UnsupportedArchitectureError(msg)
 
     def infer_quant_dtypes(
@@ -547,18 +504,13 @@ def _extract_text_subconfig(
     if raw_map is None or len(raw_map) == 0:
         msg = "Empty HuggingFace config mapping"
         raise UnsupportedArchitectureError(msg)
-    for sub_key in ("text_config", "language_config"):
-        if sub_key in raw_map and _as_mapping(raw_map.get(sub_key)) is None:
-            msg = f"Multimodal config has non-mapping {sub_key!r}"
-            raise UnsupportedArchitectureError(msg)
-    sub_cfg = _as_mapping(raw_map.get("text_config")) or _as_mapping(
-        raw_map.get("language_config")
-    )
+    if "text_config" in raw_map and _as_mapping(raw_map.get("text_config")) is None:
+        msg = "Multimodal config has non-mapping 'text_config'"
+        raise UnsupportedArchitectureError(msg)
+    sub_cfg = _as_mapping(raw_map.get("text_config"))
     tc: Mapping[str, object] = sub_cfg if sub_cfg is not None else raw_map
-    is_multimodal = (
-        "text_config" in raw_map
-        or "language_config" in raw_map
-        or any(k in raw_map for k in MULTIMODAL_KEYS)
+    is_multimodal = "text_config" in raw_map or any(
+        k in raw_map for k in MULTIMODAL_KEYS
     )
     if is_multimodal and not tc.get("hidden_size"):
         msg = "Multimodal config missing extractable text_config.hidden_size"
@@ -582,7 +534,7 @@ def _resolve_linear_schedule(
             )
             raise UnsupportedArchitectureError(msg)
         num_lin = sum(
-            any(k in str(t).lower() for k in ("lin", "gdn", "mamba", "kda"))
+            any(k in str(t).lower() for k in ("lin", "gdn", "kda"))
             for t in raw_layer_types
         )
         if 0 < num_lin < num_layers:
@@ -880,8 +832,6 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
         or lin_map.get("num_value_heads")
         or lin_map.get("num_heads")
     )
-    has_ssm = "ssm_cfg" in tc or "state_size" in tc
-
     raw_layer_types = _as_sequence(tc.get("layer_types"))
 
     num_layers = _int_field(tc, ("num_hidden_layers",))
@@ -901,29 +851,25 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
         ("linear_num_value_heads", "num_value_heads", "num_v_heads", "num_heads"),
     )
 
-    num_experts = _int_field(
-        tc, ("num_experts", "n_routed_experts", "num_local_experts")
-    )
+    num_experts = _int_field(tc, ("num_experts", "n_routed_experts"))
     mlp_only = _as_sequence(tc.get("mlp_only_layers"))
     dense_prefix = _int_field(tc, ("first_k_dense_replace",)) or (
         len(mlp_only) if mlp_only is not None else 0
     )
 
-    ffn_inter = _int_field(
-        tc, ("intermediate_size", "ffn_dim"), default=4 * hidden_size
-    )
+    ffn_inter = _int_field(tc, ("intermediate_size",), default=4 * hidden_size)
     moe_inter = _int_field(
         tc,
-        ("moe_intermediate_size", "latent_moe_dim"),
+        ("moe_intermediate_size",),
         default=ffn_inter * (num_experts > 0),
     )
     num_shared = _int_field(tc, ("n_shared_experts", "num_shared_experts"))
     shared_inter = _int_field(
         tc, ("shared_expert_intermediate_size",), default=num_shared * moe_inter
     )
-    top_k = _int_field(
-        tc, ("num_experts_per_tok", "num_experts_per_token", "num_selected_experts")
-    ) * (num_experts > 0)
+    top_k = _int_field(tc, ("num_experts_per_tok", "num_experts_per_token")) * (
+        num_experts > 0
+    )
     attn_layers = max(0, num_layers - num_linear_layers)
     (
         torch_dt,
@@ -938,7 +884,6 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
         has_explicit_torch_dtype,
         dense_unquantized,
     ) = _extract_quant_fields(tc, raw_cfg, num_layers, attn_layers)
-    kv_compress = _extract_kv_compress_factor(tc)
     index_topk, index_head_dim, index_n_heads, num_indexer_layers = _resolve_dsa_fields(
         tc, num_layers, attn_layers
     )
@@ -947,7 +892,6 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
         model_type=mtype,
         is_multimodal=is_multimodal,
         has_gdn_kda_heads=has_gdn_kda_heads,
-        has_ssm=has_ssm,
         num_layers=num_layers,
         hidden_size=hidden_size,
         num_heads=num_heads,
@@ -998,76 +942,19 @@ def _normalize_hf_config(raw_cfg: Mapping[str, object]) -> _NormalizedHfConfig:
         raw_layer_types=raw_layer_types,
         raw_act_dtype=raw_act_dt,
         weight_block_k=weight_block_k,
-        kv_compress_factor=kv_compress,
-        residual_streams=max(
-            1,
-            _int_field(
-                tc,
-                ("hc_mult", "hc_count", "mhc_num_streams", "residual_streams"),
-                default=1,
-            ),
-        ),
         has_quant_config=has_quant_config,
         has_explicit_torch_dtype=has_explicit_torch_dtype,
         dense_unquantized=dense_unquantized,
     )
 
 
-def _extract_compress_rates_factor(text_cfg: Mapping[str, object]) -> float:
-    """Compute mean KV retention ratio from a `compress_rates` mapping."""
-    raw_rates = _as_mapping(text_cfg.get("compress_rates"))
-    if raw_rates is None or not raw_rates:
-        msg = "compress_rates must be a non-empty mapping of positive numbers"
-        raise UnsupportedArchitectureError(msg)
-    parsed_rates: dict[str, float] = {}
-    for token, entry in raw_rates.items():
-        num = _as_scalar_number(entry)
-        if num is None or num <= 0.0:
-            msg = f"Invalid compress_rates[{token!r}]={entry!r}: expected > 0"
-            raise UnsupportedArchitectureError(msg)
-        parsed_rates[str(token)] = 1.0 / num if num > 1.0 else num
-    raw_layers = _as_sequence(text_cfg.get("layer_types"))
-    if raw_layers is not None and raw_layers:
-        per_layer = [
-            parsed_rates.get(str(layer_token), 1.0) for layer_token in raw_layers
-        ]
-        return min(1.0, sum(per_layer) / len(per_layer))
-    return min(1.0, sum(parsed_rates.values()) / len(parsed_rates))
-
-
-def _extract_kv_compress_factor(tc: Mapping[str, object]) -> float:
-    """Extract average KV cache compression ratio in (0, 1] from HF config."""
-    if "compress_ratios" in tc and tc["compress_ratios"] is not None:
-        raw_ratios = _as_sequence(tc["compress_ratios"])
-        if raw_ratios is None or not raw_ratios:
-            msg = "compress_ratios must be a non-empty sequence of positive numbers"
-            raise UnsupportedArchitectureError(msg)
-        vals: list[float] = []
-        for idx, entry in enumerate(raw_ratios):
-            num = _as_scalar_number(entry)
-            if num is None or num < 0.0:
-                msg = f"Invalid compress_ratios[{idx}]={entry!r}: expected >= 0"
-                raise UnsupportedArchitectureError(msg)
-            vals.append(1.0 if num == 0.0 else (1.0 / num if num > 1.0 else num))
-        return min(1.0, sum(vals) / len(vals))
-    if "compress_rates" in tc and tc["compress_rates"] is not None:
-        return _extract_compress_rates_factor(tc)
-    if "kv_compress_factor" in tc and tc["kv_compress_factor"] is not None:
-        raw_kcf = tc["kv_compress_factor"]
-        num = _as_scalar_number(raw_kcf)
-        if num is None or num <= 0.0 or num > 1.0:
-            msg = f"Invalid kv_compress_factor={raw_kcf!r}: expected value in (0, 1]"
-            raise UnsupportedArchitectureError(msg)
-        return num
-    return 1.0
-
-
 def supports_hf_config(
     raw_cfg: Mapping[str, object], *, require_model_type: bool = False
 ) -> None:
-    """Validate that a HuggingFace config mapping describes a supported causal LM."""
+    """Validate that a HuggingFace config mapping matches a shipped preset."""
     norm = _normalize_hf_config(raw_cfg)
     norm.validate_supported(require_model_type=require_model_type)
+    _adopt_matching_preset_name(norm.to_model_profile(name="model"))
 
 
 def _load_model_presets() -> tuple[
@@ -1122,28 +1009,59 @@ def _load_model_presets() -> tuple[
                 dtype_source=f"preset ({slug})",
             )
         )
+        unmodeled = [
+            fam
+            for fam in presets[slug].layer_families
+            if fam not in SUPPORTED_ONCHIP_FAMILIES and fam not in STRUCTURAL_LAYER_TAGS
+        ]
+        if unmodeled:
+            msg = f"Preset {slug!r} contains unpriced layer families: {unmodeled}"
+            raise UnsupportedArchitectureError(msg)
     aliases: dict[str, str] = {str(k): str(v) for k, v in payload["aliases"].items()}
     return presets, aliases, sources
 
 
-MODEL_PRESETS, REGISTERED_MODEL_ALIASES, MODEL_PRESET_SOURCES = _load_model_presets()
+def _repo_id_from_source(source: str) -> str:
+    """Extract `org/repo` from a preset source string."""
+    for token in source.split():
+        if "/" in token:
+            return token
+    return source
+
+
+def load_model_presets() -> tuple[
+    Mapping[str, ModelProfile], Mapping[str, str], Mapping[str, str]
+]:
+    """Load and validate the shipped model presets, aliases, and sources."""
+    return _load_model_presets()
+
+
+def parse_hf_config_profile(
+    raw_cfg: Mapping[str, object], *, name: str = "model"
+) -> ModelProfile:
+    """Parse a HuggingFace config mapping without enforcing preset identity."""
+    return _normalize_hf_config(raw_cfg).to_model_profile(name=name)
+
+
+MODEL_PRESETS, REGISTERED_MODEL_ALIASES, MODEL_PRESET_SOURCES = load_model_presets()
+SUPPORTED_MODEL_TYPES: frozenset[str] = frozenset(
+    profile.model_type.strip().lower().removesuffix("_text")
+    for profile in MODEL_PRESETS.values()
+    if profile.model_type
+)
+SUPPORTED_REPOSITORIES: tuple[str, ...] = tuple(
+    _repo_id_from_source(MODEL_PRESET_SOURCES[slug]) for slug in MODEL_PRESETS
+)
 
 
 DTYPE_BASIS_PHRASES: Mapping[str, str] = {
     "config": "dtypes from the cited config",
-    "assumed": "assumed serving dtype, cited checkpoint is unquantized",
-    "unverified": "cited config not re-read (gated repository)",
 }
 PRESET_DTYPE_BASES: frozenset[str] = frozenset(DTYPE_BASIS_PHRASES)
 
 
 def load_preset_dtype_basis() -> Mapping[str, str]:
-    """Load each preset's dtype basis from models.json.
-
-    `config`: the dtypes follow the cited config. `assumed`: the cited
-    checkpoint is unquantized and the preset keeps a serving quantization.
-    `unverified`: the cited config was not re-read.
-    """
+    """Load each preset's dtype basis from models.json (`config` only)."""
     payload = json.loads((PRESETS_DIR / "models.json").read_text("utf-8"))
     basis: dict[str, str] = {}
     for slug, entry in payload["presets"].items():
@@ -1741,32 +1659,23 @@ def normalize_preset_name(name: str) -> str:
     return name.lower().replace(".", "_").replace("-", "_")
 
 
-def matching_shipped_preset_name(name: str) -> str | None:
-    """Return the shipped preset slug matching `name` after normalization, if any."""
-    normalized = normalize_preset_name(name)
-    for preset_name in MODEL_PRESETS:
-        if normalize_preset_name(preset_name) == normalized:
-            return preset_name
-    return None
-
-
 def _adopt_matching_preset_name(profile: ModelProfile) -> ModelProfile:
-    """Rename a config-derived profile to the shipped preset with the same geometry.
+    """Rename a config-derived profile to its matching shipped preset or fail closed.
 
-    Applies to profiles built from a config file, a config directory, or a
-    config mapping, so a checkpoint gets the same layouts and declarations
-    whatever its directory is called. When no preset matches and the normalized
-    name equals a shipped preset slug, append `-custom` so config-path
-    declarations and layouts do not attach by name alone. A preset name with
-    dtype overrides, or a caller-supplied name, keeps that preset's
-    declarations.
+    A config whose geometry and config dtypes match no shipped preset raises
+    `UnsupportedArchitectureError` naming the supported repositories and
+    onboarding documentation.
     """
     preset_name = match_preset_by_geometry(profile)
     if preset_name is not None:
         return replace(profile, name=preset_name)
-    if matching_shipped_preset_name(profile.name) is not None:
-        return replace(profile, name=f"{profile.name}-custom")
-    return profile
+    msg = (
+        f"Config {profile.name!r} (model_type={profile.model_type!r}) matches no "
+        "validated preset by geometry and config dtypes. "
+        f"Supported repositories: {', '.join(SUPPORTED_REPOSITORIES)}. "
+        f"See {ONBOARDING_DOC_REF}."
+    )
+    raise UnsupportedArchitectureError(msg)
 
 
 def _resolve_hf_profile(
@@ -1800,12 +1709,14 @@ def model_profile_from_hf_config(  # noqa: PLR0913
     act_dtype: str | None = None,
     state_dtype: str = "bf16",
 ) -> ModelProfile:
-    """Parse and validate a HuggingFace config mapping into a ModelProfile."""
-    return _resolve_hf_profile(
-        raw_cfg,
-        name,
-        (weight_dtype, expert_dtype, "fp8", state_dtype),
-        act_dtype=act_dtype,
+    """Parse and validate a HuggingFace config mapping into a shipped preset profile."""
+    return _adopt_matching_preset_name(
+        _resolve_hf_profile(
+            raw_cfg,
+            name,
+            (weight_dtype, expert_dtype, "fp8", state_dtype),
+            act_dtype=act_dtype,
+        )
     )
 
 
@@ -1937,6 +1848,7 @@ def resolve_model_profile(  # noqa: PLR0913
     msg = (
         f"Unregistered model or missing config path: {target!r}. "
         f"Registered presets: {sorted(MODEL_PRESETS)}; "
-        f"verified HF model_types: {sorted(RECOGNIZED_MODEL_TYPES)}"
+        f"supported repositories: {', '.join(SUPPORTED_REPOSITORIES)}. "
+        f"See {ONBOARDING_DOC_REF}."
     )
     raise UnsupportedArchitectureError(msg)

@@ -23,7 +23,7 @@
         "Sequence-parallel split of token-wise operations between layers",
         "Latent projection tensor-sharded within a chip (TPU_LATENT_PROJ_INTRA_CHIP_TP in the serving recipe)",
         "Draft model forward step",
-        "Draft count that varies with decode batch size (the preset prices one draft count)",
+        "Draft count that varies with decode batch size (the preset prices spec_tokens=7 for single-request serving while multi-request serving uses spec_tokens=3)",
         "Host time between device steps"
       ],
       "decode": {
@@ -135,7 +135,7 @@
         "dcp": 4,
         "spec_tokens": 3,
         "megakernel": {
-          "source": "Decode megakernel on TP8 x EP8 x DCP4: one call serves up to 112 rows, split calls serve up to 800 rows per step, rows up to 12 reshard experts to TP inside the call before switching to EP above 12 rows, split_kv exchanges partial attention across 4 DCP peers, and each expert runs on a masked batch",
+          "source": "Decode megakernel on TP8 x EP8 x DCP4: one call serves up to 112 rows, split calls serve up to 800 rows per step, rows up to 12 reshard experts to TP inside the call before switching to EP above 12 rows (serving recipes may override VLLM_TPU_QWEN35_MK_MODE=ep), split_kv exchanges partial attention across 4 DCP peers, and each expert runs on a masked batch",
           "source_ref": "unpublished",
           "scopes": [
             "whole_step"
@@ -187,13 +187,14 @@
           "tp": 8,
           "ep": 8,
           "megakernel": {
-            "source": "Colocated decode megakernel on TP8 x EP8: one call serves up to 64 rows without splitting, split_kv exchanges partial attention across 4 KV-split peers per KV head (TP8 / 2 KV heads = 4), and each expert runs on a masked batch",
-            "source_ref": "src/vllm_torchtpu/megakernel/core",
+            "source": "Colocated decode megakernel on TP8 x EP8: one call serves up to 64 rows, split calls serve up to 160 rows per step (VLLM_TPU_QWEN35_MK_SPLIT_WIDE=1 with VLLM_TPU_QWEN35_MK_FUSED_POOL_IO_MAX_B=160), split_kv exchanges partial attention across 4 KV-split peers per KV head (TP8 / 2 KV heads = 4), and each expert runs on a masked batch",
+            "source_ref": "unpublished",
             "scopes": [
               "whole_step"
             ],
             "ranks": 8,
             "max_rows": 64,
+            "max_total_rows": 160,
             "phases": [
               "decode",
               "verify"

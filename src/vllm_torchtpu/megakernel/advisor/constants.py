@@ -335,24 +335,12 @@ BITS_FP8 = 8
 BITS_FP4 = 4
 MIN_HEAD_DIM = 8
 
-MULTIMODAL_KEYS: tuple[str, ...] = (
-    "vision_config",
-    "audio_config",
-    "video_config",
-    "mm_projector_type",
-    "image_token_index",
-)
+MULTIMODAL_KEYS: tuple[str, ...] = ("vision_config",)
 
 VALID_LAYER_TOKENS: frozenset[str] = frozenset(
     {
         "attention",
-        "compressed_sparse_attention",
-        "csa",
-        "deepseek_sparse_attention",
         "dense_mlp",
-        "heavily_compressed_attention",
-        "hca",
-        "indexed_attention",
         "dsa",
         "dsa_attention",
         "full_attention",
@@ -361,24 +349,25 @@ VALID_LAYER_TOKENS: frozenset[str] = frozenset(
         "gqa",
         "kda",
         "kda_attention",
-        "kimi_linear",
         "linear_attention",
-        "mamba",
         "mla",
         "mla_attention",
         "mlp",
         "moe",
-        "mtp",
-        "ple",
-        "qwen_sparse_attention",
-        "sliding_attention",
-        "sliding_window_attention",
-        "sparse_mla",
-        "swa",
     }
 )
 
-KDA_MODEL_TYPES: frozenset[str] = frozenset({"kimi_k2", "kimi_k3", "kimi_linear"})
+KDA_MODEL_TYPES: frozenset[str] = frozenset({"kimi_linear"})
+
+SUPPORTED_ONCHIP_FAMILIES: frozenset[str] = frozenset(
+    {"gqa", "mla", "dsa", "gdn", "kda", "dense_mlp", "moe"}
+)
+# Layer families that megakernel/core ships a module package for.
+CORE_MODULE_FAMILIES: frozenset[str] = frozenset({"gqa", "gdn", "moe"})
+# Weight dtypes the megakernel/core kernels read.
+CORE_SUPPORTED_DTYPES: frozenset[str] = frozenset({"fp8", "bf16"})
+# Entries of `ModelProfile.layer_families` that describe stack structure.
+STRUCTURAL_LAYER_TAGS: frozenset[str] = frozenset({"dense_prefix_moe"})
 
 
 @dataclass(frozen=True)
