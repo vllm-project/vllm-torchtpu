@@ -40,6 +40,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.sparse_logits import
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.tuned import (
     PACKED_FP8_MQA_CONFIG,
     PACKED_FP8_RESIDENT_KEYS,
+    PACKED_FP8_WIDTH_STEP,
     dense_key_tile,
     indexer_query_rows,
     paged_mqa_key_tile,
@@ -818,7 +819,8 @@ def select_fp8_indexer_jax(
     # tile covers them, then powers of two up to the full score width.
     # Scoring all 524,288 columns for a 147K-token context (73,728 keys) took
     # 8.9 ms per 2,048-row chunk, against 1.8 ms for 57,344 keys in one tile.
-    widths = list(range(width, PACKED_FP8_RESIDENT_KEYS + 1, 16384)) or [width]
+    step = PACKED_FP8_WIDTH_STEP
+    widths = list(range(width, PACKED_FP8_RESIDENT_KEYS + 1, step)) or [width]
     while widths[-1] < score_width:
         widths.append(min(2 * widths[-1], score_width))
     live = (requests >= 0) & (requests < page_table.shape[0])
