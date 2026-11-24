@@ -58,6 +58,12 @@ x-tests-plugin-defaults: &tests_plugin_defaults
 x-shape-single: &shape_single "${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}"
 x-shape-multi: &shape_multi "${KUBE_SHAPE_MULTI:-tpu7x-standard-4t/2x2x1}"
 
+# The `if` of a step only v7x runs, so v6e's upload leaves it out (as in
+# pipeline_integration.yml). The omni steps use it: tests_omni targets TPU v7x
+# and is not qualified on v6e (32 GB of HBM a chip).
+x-pr-v7x-only: &pr_v7x_only 'build.env("NIGHTLY") != "1" && "${TPU_GENERATION:-v7x}" == "v7x"'
+x-nightly-v7x-only: &nightly_v7x_only 'build.env("NIGHTLY") == "1" && "${TPU_GENERATION:-v7x}" == "v7x"'
+
 steps:
   - group: "Unit Tests on TPU"
     steps:
@@ -139,7 +145,7 @@ steps:
         key: "unit_tests_omni_pr"
         <<: *tpu_step
         depends_on: "build_docker_omni"
-        if: 'build.env("NIGHTLY") != "1"'
+        if: *pr_v7x_only
         env:
           SHAPE: *shape_single
           DOCKER_IMAGE_SUFFIX: "-omni"
@@ -228,7 +234,7 @@ steps:
         key: "unit_tests_omni_nightly"
         <<: *tpu_step
         depends_on: "build_docker_omni"
-        if: 'build.env("NIGHTLY") == "1"'
+        if: *nightly_v7x_only
         env:
           SHAPE: *shape_single
           DOCKER_IMAGE_SUFFIX: "-omni"
@@ -246,7 +252,7 @@ steps:
         key: "unit_tests_omni_multichip_nightly"
         <<: *tpu_step
         depends_on: "build_docker_omni"
-        if: 'build.env("NIGHTLY") == "1"'
+        if: *nightly_v7x_only
         env:
           SHAPE: *shape_multi
           DOCKER_IMAGE_SUFFIX: "-omni"

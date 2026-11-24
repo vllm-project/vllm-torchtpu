@@ -78,7 +78,7 @@ Every test in `tests/` and `tests_omni/` is routed to the appropriate CI hardwar
 | `@pytest.mark.multichip` | Multi-chip pod: v7x 2x2x1 (4 chips, 8 devices); v6e 2x4 (8 chips, 8 devices) with `CI_EXTRAS=tpu-all` or `tpu-v6e` | Tests that need more devices than the single-chip pod has (e.g., TP/EP/DP collectives). |
 | `@pytest.mark.spawns_tpu_workers` | Multi-chip TPU slice | Tests that spawn a `torch.distributed.run` worker group spanning the TPU slice; ordered by `tests/conftest.py` to run before any in-process TPU test in the same `pytest` session. |
 | `@pytest.mark.nightly` | Nightly CI workflow (`NIGHTLY=1`) | Long-running or full-checkpoint tests excluded from per-PR CI gates. Must still be combined with `tpu_test` or `multichip` if TPU hardware is required. |
-| `@pytest.mark.omni` | TPU v7x 1x1x1 (`-omni` image); v6e 1x1 with `CI_EXTRAS=tpu-all` or `tpu-v6e` | Tests that run `vllm-omni` multimodal and diffusion models (`tests_omni/`). |
+| `@pytest.mark.omni` | TPU v7x 1x1x1 (`-omni` image); v7x only, whatever `CI_EXTRAS` is (not qualified on v6e's 32 GB per chip) | Tests that run `vllm-omni` multimodal and diffusion models (`tests_omni/`). |
 
 ---
 
