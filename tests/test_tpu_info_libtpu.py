@@ -334,14 +334,26 @@ def test_get_num_chips_filters_accessible_vfio_tpu_device_ids_without_cap(monkey
     monkeypatch.delenv("TPU_ACCELERATOR_TYPE", raising=False)
     assert tpu_info.get_tpu_type() == "tpu7x"
 
-    # Fail closed if /sys/kernel/iommu_groups/<group>/devices is unreadable.
+    # Fall back to legacy numeric /dev/vfio count when /sys/kernel/iommu_groups
+    # is hidden or unreadable (e.g. restricted GKE/VM containers).
     def _raise_missing_sysfs(_: str):
         raise OSError("missing sysfs")
 
     _patch_vfio_fs(
         monkeypatch,
-        vfio_entries=["0", "1"],
+        vfio_entries=["0", "1", "vfio"],
         iommu_devices_fn=_raise_missing_sysfs,
         open_sysfs_fn=lambda s: io.StringIO("0x1ae0\n"),
+    )
+    assert tpu_info.get_num_chips() == 2
+
+    # When sysfs is readable and only exposes non-TPU devices, still return 0.
+    _patch_vfio_fs(
+        monkeypatch,
+        vfio_entries=["0", "1"],
+        iommu_devices_fn=lambda _: ["0000:00:04.0"],
+        open_sysfs_fn=lambda s: io.StringIO(
+            "0x10de\n" if s.endswith("/vendor") else "0x2330\n"
+        ),
     )
     assert tpu_info.get_num_chips() == 0

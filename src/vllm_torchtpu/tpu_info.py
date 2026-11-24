@@ -250,27 +250,29 @@ def _is_application_pci_function(dev_dir: str, bdf: str, device_id: str) -> bool
     return False
 
 
-def _accessible_vfio_tpu_device_id(group: int) -> str | None:
-    """Return TPU PCI device ID if ``/dev/vfio/<group>`` is an accessible VF/device."""
+def _inspect_vfio_tpu_group(group: int) -> tuple[str | None, bool]:
+    """Inspect ``/dev/vfio/<group>`` and return ``(tpu_device_id, sysfs_readable)``."""
     vfio_path = f"/dev/vfio/{group}"
     try:
         if not stat.S_ISCHR(os.stat(vfio_path).st_mode):
-            return None
+            return None, False
     except OSError:
-        return None
+        return None, False
     if not os.access(vfio_path, os.R_OK | os.W_OK):
-        return None
+        return None, False
 
     sysfs_root = f"/sys/kernel/iommu_groups/{group}/devices"
     try:
         devices = os.listdir(sysfs_root)
     except OSError:
-        return None
+        return None, False
+    sysfs_readable = False
     for bdf in devices:
         dev_dir = os.path.join(sysfs_root, bdf)
         try:
             with open(os.path.join(dev_dir, "vendor"), encoding="ascii") as vf:
                 vendor = vf.read().strip().lower()
+            sysfs_readable = True
             if vendor != TPU_PCI_VENDOR_ID:
                 continue
             with open(os.path.join(dev_dir, "device"), encoding="ascii") as df:
@@ -278,15 +280,10 @@ def _accessible_vfio_tpu_device_id(group: int) -> str | None:
             if device_id in TPU_PCI_DEVICE_ID_TO_TYPE and _is_application_pci_function(
                 dev_dir, bdf, device_id
             ):
-                return device_id
+                return device_id, True
         except (OSError, UnicodeDecodeError):
             continue
-    return None
-
-
-def _is_accessible_vfio_tpu_group(group: int) -> bool:
-    """Return True iff ``/dev/vfio/<group>`` is a read/write TPU compute VFIO node."""
-    return _accessible_vfio_tpu_device_id(group) is not None
+    return None, sysfs_readable
 
 
 def _detect_vfio_tpu_type() -> str | None:
@@ -298,7 +295,7 @@ def _detect_vfio_tpu_type() -> str | None:
     for entry in sorted(vfio_entries):
         if not entry.isdigit():
             continue
-        device_id = _accessible_vfio_tpu_device_id(int(entry))
+        device_id, _ = _inspect_vfio_tpu_group(int(entry))
         if device_id is not None:
             return TPU_PCI_DEVICE_ID_TO_TYPE.get(device_id)
     return None
@@ -314,9 +311,21 @@ def get_num_chips() -> int:
     try:
         vfio_entries = os.listdir("/dev/vfio")
         numeric_entries = [int(entry) for entry in vfio_entries if entry.isdigit()]
-        return sum(
-            1 for group in numeric_entries if _is_accessible_vfio_tpu_group(group)
-        )
+        if not numeric_entries:
+            return 0
+        tpu_count = 0
+        any_sysfs_readable = False
+        for group in numeric_entries:
+            device_id, sysfs_readable = _inspect_vfio_tpu_group(group)
+            if sysfs_readable:
+                any_sysfs_readable = True
+            if device_id is not None:
+                tpu_count += 1
+        if not any_sysfs_readable:
+            # Preserve legacy numeric /dev/vfio count when IOMMU sysfs metadata
+            # is hidden or unreadable (e.g. restricted GKE/VM containers).
+            return len(numeric_entries)
+        return tpu_count
     except FileNotFoundError as e:
         logger.warning("Failed to detect number of TPUs: %s", e)
         return 0

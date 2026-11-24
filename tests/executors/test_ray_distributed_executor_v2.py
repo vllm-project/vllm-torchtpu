@@ -417,8 +417,6 @@ class TestTpuRayDistributedExecutorV2:
                 "TPU_VISIBLE_DEVICES",
                 "TPU_VISIBLE_DEVICE_PATHS",
                 "CLOUD_TPU_TASK_ID",
-                "TPU_CHIPS_PER_HOST_BOUNDS",
-                "TPU_HOST_BOUNDS",
                 "TPU_WORKER_ID",
                 "LWS_WORKER_INDEX",
             }.issubset(excluded_vars)
@@ -910,12 +908,14 @@ class TestTpuRayDistributedExecutorV2:
                 {
                     "NodeID": "node_2",
                     "NodeManagerAddress": host1_ip,
+                    "NodeManagerHostname": "vllm-lws-0-1",
                     "Resources": {"TPU": 4.0},
                     "labels": {"ray.io/tpu-worker-id": "1"},
                 },
                 {
                     "NodeID": "node_1",
                     "NodeManagerAddress": host0_ip,
+                    "NodeManagerHostname": "vllm-lws-0",
                     "Resources": {"TPU": 4.0},
                     "labels": {"ray.io/tpu-worker-id": "0"},
                 },
@@ -1345,30 +1345,44 @@ def test_resolve_slicebuilder_hosts_errors_and_multi_nic_worker_order(monkeypatc
 
     # If local ray.io/tpu-worker-id contradicts LWS_WORKER_INDEX, position is
     # not trusted as LWS_WORKER_INDEX.
+    node0_id = "0" * 56
+    node1_id = "1" * 56
     monkeypatch.setenv("LWS_WORKER_INDEX", "1")
     monkeypatch.setattr(rde2.ray, "is_initialized", lambda: True)
     monkeypatch.setattr(
         rde2.ray,
         "get_runtime_context",
-        lambda: MagicMock(get_node_id=lambda: "node_0"),
+        lambda: MagicMock(get_node_id=lambda: node0_id),
     )
-    monkeypatch.setattr(
-        rde2.ray,
-        "nodes",
-        lambda: [
-            {
-                "NodeID": "node_0",
-                "NodeManagerAddress": "fd00:1::3",
-                "Resources": {"TPU": 8},
-                "labels": {"ray.io/tpu-worker-id": "0"},
-            },
-            {
-                "NodeID": "node_1",
-                "NodeManagerAddress": "fd00:1::1",
-                "Resources": {"TPU": 8},
-                "labels": {"ray.io/tpu-worker-id": "1"},
-            },
-        ],
-    )
+    hostnetwork_nodes = [
+        {
+            "NodeID": node0_id,
+            "NodeManagerAddress": "fd00:1::3",
+            "NodeManagerHostname": "baremetal-node-a",
+            "Resources": {"TPU": 8},
+            "labels": {"ray.io/tpu-worker-id": "0"},
+        },
+        {
+            "NodeID": node1_id,
+            "NodeManagerAddress": "fd00:1::1",
+            "NodeManagerHostname": "baremetal-node-b",
+            "Resources": {"TPU": 8},
+            "labels": {"ray.io/tpu-worker-id": "1"},
+        },
+    ]
+    monkeypatch.setattr(rde2.ray, "nodes", lambda: hostnetwork_nodes)
     executor = RayDistributedExecutorV2.__new__(RayDistributedExecutorV2)
+    assert executor._resolve_slice_host_layout("TPU").ordered_by_worker_id is False
+
+    # On hostNetwork pods where NodeManagerHostname is the physical host name,
+    # remote nodes are probed for LWS_WORKER_INDEX: matching indices enable the
+    # fallback, while a mismatched remote index disables it.
+    monkeypatch.setenv("LWS_WORKER_INDEX", "0")
+    probe_remote = MagicMock()
+    probe_remote.options.return_value.remote.return_value = "node_1_lws_ref"
+    monkeypatch.setattr(rde2.ray, "remote", lambda fn: probe_remote)
+    monkeypatch.setattr(rde2.ray, "get", lambda refs: [1])
+    assert executor._resolve_slice_host_layout("TPU").ordered_by_worker_id is True
+
+    monkeypatch.setattr(rde2.ray, "get", lambda refs: [2])
     assert executor._resolve_slice_host_layout("TPU").ordered_by_worker_id is False

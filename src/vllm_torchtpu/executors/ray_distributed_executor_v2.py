@@ -23,7 +23,10 @@ from typing import Any, cast
 import ray
 import vllm.envs as envs
 from ray.actor import ActorHandle
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.scheduling_strategies import (
+    NodeAffinitySchedulingStrategy,
+    PlacementGroupSchedulingStrategy,
+)
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_ip, get_open_port
@@ -40,6 +43,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.utils import (
+    lws_pod_hostname,
     normalize_ip,
     resolve_lws_hosts_by_ip,
     resolve_slicebuilder_hosts,
@@ -77,22 +81,27 @@ def get_tpu_bundles_for_indices(
 
 logger = init_logger(__name__)
 
-# Excluded when copying the driver's os.environ to Ray workers. Bare-metal K8s
-# device plugins inject single-host TPU_HOST_BOUNDS/TPU_CHIPS_PER_HOST_BOUNDS
-# and pod-wide TPU_VISIBLE_DEVICE_PATHS into every pod even on multi-host LWS;
-# GKE worker pods already receive slice-wide bounds from their own pod env.
+# Excluded when copying the driver's os.environ to Ray workers. RayWorkerProc
+# applies driver_env_vars with os.environ.setdefault, so slice-wide vars like
+# TPU_HOST_BOUNDS / TPU_CHIPS_PER_HOST_BOUNDS remain propagated (for TPU VM
+# setups where they are exported only on the driver), while per-host identity
+# and device-binding vars must be excluded so a remote worker lacking one does
+# not inherit host 0's index or device paths from the driver.
 _TPU_WORKER_SPECIFIC_ENV_VARS: frozenset[str] = frozenset(
     {
         "TPU_VISIBLE_CHIPS",
         "TPU_VISIBLE_DEVICES",
         "TPU_VISIBLE_DEVICE_PATHS",
         "CLOUD_TPU_TASK_ID",
-        "TPU_CHIPS_PER_HOST_BOUNDS",
-        "TPU_HOST_BOUNDS",
         "TPU_WORKER_ID",
         "LWS_WORKER_INDEX",
     }
 )
+
+
+def _read_node_lws_worker_index() -> int | None:
+    """Return this Ray node's LWS_WORKER_INDEX (executed as a remote probe)."""
+    return tpu_envs.LWS_WORKER_INDEX
 
 
 @dataclass(frozen=True)
@@ -138,15 +147,99 @@ class RayDistributedExecutorV2(RayExecutorV2):
             )
         return dp_size, int(dp_rank), world_size * dp_size
 
+    def _verify_lws_worker_indices(
+        self,
+        hosts: list[tuple[int, str, int, str]],
+        hostnames_by_ip: dict[str, str],
+        leader_address: str,
+        current_node_id: str | None,
+    ) -> bool:
+        """Verify every Ray node's ``ray.io/tpu-worker-id`` matches its LWS index."""
+        if len(hosts) != tpu_envs.LWS_GROUP_SIZE:
+            return False
+        try:
+            expected_short_names = [
+                lws_pod_hostname(leader_address, w_id).partition(".")[0]
+                for w_id, _, _, _ in hosts
+            ]
+        except ValueError:
+            return False
+        if all(
+            hostnames_by_ip.get(ip, "").partition(".")[0] == expected_name
+            for (_, ip, _, _), expected_name in zip(hosts, expected_short_names)
+        ):
+            return True
+
+        if not any(":" in ip for _, ip, _, _ in hosts):
+            return False
+
+        lws_by_ip = resolve_lws_hosts_by_ip(leader_address, len(hosts))
+        if all(normalize_ip(ip) in lws_by_ip for _, ip, _, _ in hosts):
+            return all(
+                lws_by_ip[normalize_ip(ip)][0] == w_id for w_id, ip, _, _ in hosts
+            )
+
+        lws_worker_index = tpu_envs.LWS_WORKER_INDEX
+        remote_hosts: list[tuple[int, str, str]] = []
+        for w_id, ip, _, node_id in hosts:
+            if current_node_id is not None and node_id == current_node_id:
+                if lws_worker_index is None or lws_worker_index != w_id:
+                    return False
+            else:
+                if not node_id:
+                    return False
+                remote_hosts.append((w_id, ip, node_id))
+
+        if not remote_hosts:
+            return True
+        if not ray.is_initialized():
+            return False
+
+        try:
+            probe_fn = ray.remote(_read_node_lws_worker_index)
+            refs = [
+                probe_fn.options(
+                    num_cpus=0,
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        node_id=node_id, soft=False
+                    ),
+                ).remote()
+                for _, _, node_id in remote_hosts
+            ]
+            reported_indices = ray.get(refs)
+        except Exception as exc:
+            logger.warning(
+                "RayDistributedExecutorV2 | Failed to verify LWS_WORKER_INDEX on "
+                "remote Ray nodes (%s); disabling multi-NIC LWS worker-index "
+                "fallback.",
+                exc,
+            )
+            return False
+
+        for (w_id, ip, _), reported in zip(remote_hosts, reported_indices):
+            if reported != w_id:
+                logger.warning(
+                    "RayDistributedExecutorV2 | Ray node %s has "
+                    "ray.io/tpu-worker-id=%d but LWS_WORKER_INDEX=%r; disabling "
+                    "multi-NIC LWS worker-index fallback.",
+                    ip,
+                    w_id,
+                    reported,
+                )
+                return False
+        return True
+
     def _resolve_slice_host_layout(self, device_str: str) -> _SliceHostLayout:
         """Resolve slice host order, device counts, ordering source, and hostnames."""
-        hosts: list[tuple[int, str, int]] = []
+        hosts: list[tuple[int, str, int, str]] = []
         hostnames_by_ip: dict[str, str] = {}
         has_worker_id = True
-        current_node_id = (
+        raw_current_node_id = (
             ray.get_runtime_context().get_node_id() if ray.is_initialized() else None
         )
-        local_worker_id: int | None = None
+        current_node_id = (
+            raw_current_node_id if isinstance(raw_current_node_id, str) else None
+        )
         for node in ray.nodes():
             if not node.get("Alive", True):
                 continue
@@ -167,16 +260,12 @@ class RayDistributedExecutorV2(RayExecutorV2):
             if hostname:
                 hostnames_by_ip[node_ip] = hostname
 
+            node_id = str(node.get("NodeID") or "")
             labels = node.get("labels") or node.get("Labels") or {}
             raw_worker_id = labels.get("ray.io/tpu-worker-id")
             if raw_worker_id is not None:
                 try:
                     w_id = int(raw_worker_id)
-                    if (
-                        isinstance(current_node_id, str)
-                        and node.get("NodeID") == current_node_id
-                    ):
-                        local_worker_id = w_id
                 except (ValueError, TypeError):
                     w_id = 0
                     has_worker_id = False
@@ -184,13 +273,13 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 w_id = 0
                 has_worker_id = False
 
-            hosts.append((w_id, node_ip, int(resources[device_str])))
+            hosts.append((w_id, node_ip, int(resources[device_str]), node_id))
 
         ordered_by = "IP"
         ordered_by_worker_id = False
         if has_worker_id and len(hosts) > 0:
             hosts.sort(key=lambda x: (x[0], x[1]))
-            actual_w_ids = [w_id for w_id, _, _ in hosts]
+            actual_w_ids = [w_id for w_id, _, _, _ in hosts]
             expected_w_ids = list(range(len(hosts)))
             if actual_w_ids != expected_w_ids:
                 logger.warning(
@@ -204,15 +293,12 @@ class RayDistributedExecutorV2(RayExecutorV2):
             else:
                 ordered_by = "ray.io/tpu-worker-id"
                 # Ray populates ray.io/tpu-worker-id from TPU_WORKER_ID at
-                # `ray start`. Only treat position as LWS_WORKER_INDEX when the
-                # slice spans the full LWS group and this node's label agrees.
-                lws_worker_index = tpu_envs.LWS_WORKER_INDEX
-                ordered_by_worker_id = not tpu_envs.LWS_LEADER_ADDRESS or (
-                    len(hosts) == tpu_envs.LWS_GROUP_SIZE
-                    and (
-                        local_worker_id is None
-                        or lws_worker_index is None
-                        or local_worker_id == lws_worker_index
+                # `ray start`. Under LWS, verify every node's label agrees with
+                # its LWS pod index before trusting position for DNS fallback.
+                leader_address = tpu_envs.LWS_LEADER_ADDRESS
+                ordered_by_worker_id = not leader_address or (
+                    self._verify_lws_worker_indices(
+                        hosts, hostnames_by_ip, leader_address, current_node_id
                     )
                 )
         else:
@@ -221,13 +307,13 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 lws_by_ip = resolve_lws_hosts_by_ip(
                     tpu_envs.LWS_LEADER_ADDRESS, len(hosts)
                 )
-                if all(normalize_ip(ip) in lws_by_ip for _, ip, _ in hosts):
+                if all(normalize_ip(ip) in lws_by_ip for _, ip, _, _ in hosts):
                     lws_hosts = [
-                        (lws_by_ip[normalize_ip(ip)][0], ip, count)
-                        for _, ip, count in hosts
+                        (lws_by_ip[normalize_ip(ip)][0], ip, count, node_id)
+                        for _, ip, count, node_id in hosts
                     ]
                     lws_hosts.sort(key=lambda x: (x[0], x[1]))
-                    if [w_id for w_id, _, _ in lws_hosts] == list(range(len(hosts))):
+                    if [w_id for w_id, _, _, _ in lws_hosts] == list(range(len(hosts))):
                         hosts = lws_hosts
                         ordered_by = "LWS_LEADER_ADDRESS DNS"
                         ordered_by_worker_id = True
@@ -259,11 +345,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
             "(ordered by %s): %s",
             len(hosts),
             ordered_by,
-            [(w_id, ip) for w_id, ip, _ in hosts],
+            [(w_id, ip) for w_id, ip, _, _ in hosts],
         )
         return _SliceHostLayout(
-            host_order=[ip for _, ip, _ in hosts],
-            chips_per_host={ip: count for _, ip, count in hosts},
+            host_order=[ip for _, ip, _, _ in hosts],
+            chips_per_host={ip: count for _, ip, count, _ in hosts},
             ordered_by_worker_id=ordered_by_worker_id,
             hostnames_by_ip=hostnames_by_ip,
         )
