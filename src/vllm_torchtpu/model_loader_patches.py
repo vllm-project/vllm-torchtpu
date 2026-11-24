@@ -50,7 +50,6 @@ in the allowlist and stay unfiltered.
 
 import functools
 import gc
-import inspect
 import json
 import logging
 import os
@@ -506,6 +505,11 @@ def _prefetch_all_checkpoints_stoppable(
     this rank reads its share of the files, ``sorted_files[rank::world_size]``,
     whole into the page cache in a background thread. Unlike upstream's, the
     thread is registered, so it is stopped before the eviction.
+
+    TODO: drop this copy once upstream's prefetch thread can be stopped. The
+    argument checks and the file split per rank are copied from vLLM's
+    ``weight_utils._prefetch_all_checkpoints``, whose thread has no handle
+    (``threading.Thread(target=_run_prefetch, daemon=True).start()``).
     """
     if num_prefetch_threads < 1:
         raise ValueError("safetensors prefetch num threads must be >= 1")
@@ -546,7 +550,7 @@ def _start_prefetch(
 
     Reads go in file order, in ``block_size`` chunks over ``num_threads``
     threads. The thread can outlive the load it serves, so it is registered:
-    ``_stop_ep_range_prefetch`` stops it once the runner has loaded every
+    ``_stop_prefetch`` stops it once the runner has loaded every
     model, before any page cache eviction, so it cannot read evicted pages
     back in.
     """
@@ -623,7 +627,7 @@ _prefetches: list[tuple[threading.Thread, threading.Event]] = []
 _prefetch_lock = threading.Lock()
 
 
-def _stop_ep_range_prefetch() -> None:
+def _stop_prefetch() -> None:
     """Stop this process's prefetch threads and wait for them to exit.
 
     Every registered thread: the EP range prefetch and the stoppable
@@ -661,24 +665,17 @@ def _evict_one_checkpoint_file(fpath: str, log_level: int) -> float | None:
         return None
 
 
-def _is_first_rank_on_host() -> bool:
-    from vllm.distributed import parallel_state
-
-    try:
-        return parallel_state.get_world_group().local_rank == 0
-    except AssertionError:
-        return True  # distributed state not initialized: a single process
-
-
 def _evict_checkpoint_page_cache(files: list[str]) -> None:
     """Drop clean host page cache for weight files via posix_fadvise.
 
     Every rank evicts, but only the first rank of each host logs at INFO: the
     page cache, and so the result, is the host's.
     """
+    from vllm.distributed.parallel_state import is_local_first_rank
+
     if not files:
         return
-    log_level = logging.INFO if _is_first_rank_on_host() else logging.DEBUG
+    log_level = logging.INFO if is_local_first_rank() else logging.DEBUG
     max_workers = min(len(files), os.cpu_count() or 32)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         sizes = list(
@@ -756,25 +753,15 @@ def _install_stoppable_checkpoint_prefetch() -> None:
     ``safetensors_weights_iterator`` calls ``_prefetch_all_checkpoints``
     through the ``weight_utils`` module global, for the "prefetch" strategy
     and for auto-prefetch on NFS/Lustre. Its thread would keep reading after
-    the eviction. Fails open: if upstream renamed it or changed its
-    parameters, logs a warning and leaves it in place.
+    the eviction. ``test_upstream_whole_file_prefetch_is_replaceable`` fails
+    if the pinned vLLM renames it, changes its parameters or stops calling it
+    through that global.
     """
     global _upstream_prefetch_all_checkpoints
     from vllm.model_executor.model_loader import weight_utils
 
-    upstream = getattr(weight_utils, "_prefetch_all_checkpoints", None)
+    upstream = weight_utils._prefetch_all_checkpoints
     if upstream is _prefetch_all_checkpoints_stoppable:
-        return
-    params = None if upstream is None else list(inspect.signature(upstream).parameters)
-    if params != ["sorted_files", "num_prefetch_threads", "block_size"]:
-        logger.warning(
-            "[tpu-model-loader] vLLM's weight_utils._prefetch_all_checkpoints is "
-            "missing or its parameters changed (%s), so it is not replaced: its "
-            "whole-file prefetch cannot be stopped and may read evicted pages "
-            "back in. Use --safetensors-load-strategy=lazy with "
-            "TPU_EVICT_WEIGHTS_PAGE_CACHE.",
-            params,
-        )
         return
     _upstream_prefetch_all_checkpoints = upstream
     weight_utils._prefetch_all_checkpoints = _prefetch_all_checkpoints_stoppable
@@ -788,38 +775,52 @@ def _install_stoppable_checkpoint_prefetch() -> None:
 _loaded_weight_files: dict[str, None] = {}
 
 
-def _wait_for_every_loader() -> None:
-    """Wait until every rank of this engine has finished loading.
+def _evict_on_every_rank() -> bool:
+    """Whether TPU_EVICT_WEIGHTS_PAGE_CACHE is on for every rank of this engine.
 
-    A barrier over the world group's CPU (gloo) group, bounded by that group's
-    timeout (``--cpu-distributed-timeout-seconds``; torch's default, 30
-    minutes, when unset), read as vLLM read it to create the group:
-    ``get_cpu_distributed_timeout_or_none``, from the current vLLM config, so
-    the caller runs in the engine's config context. Rank 0 enforces it through
-    ``monitored_barrier``, whose error names the first rank that did not
-    arrive. The other ranks are bounded by the same value because the gloo
-    group was created with it. So if a rank failed or stalled before this
-    point, every rank fails within about that time instead of hanging.
+    Each process reads the flag from its own environment, and on a multi-host
+    engine each host starts its own process, so the ranks can disagree. Every
+    rank calls this once it has loaded every model, with the flag on or off,
+    and the ranks agree on the minimum: if a rank has it off, no rank evicts.
+
+    The agreement is an all-reduce over the world group's CPU (gloo) group, so
+    it also waits until every rank has finished loading, bounded by that
+    group's timeout (``--cpu-distributed-timeout-seconds``; torch's default,
+    30 minutes, when unset), read as vLLM read it to create the group:
+    ``get_cpu_distributed_timeout_or_none``, from the current vLLM config. If a
+    rank failed or stalled before this point, every rank fails within about
+    that time instead of hanging.
     """
     from vllm.distributed import parallel_state
     from vllm.distributed.utils import get_cpu_distributed_timeout_or_none
 
+    from vllm_torchtpu import utils
+
+    enabled = int(envs.TPU_EVICT_WEIGHTS_PAGE_CACHE)
     try:
         group = parallel_state.get_world_group()
     except AssertionError:
-        return  # distributed state not initialized: a single process
+        return bool(enabled)  # distributed state not initialized: one process
     if group.world_size <= 1:
-        return
-    timeout = get_cpu_distributed_timeout_or_none() or default_pg_timeout
+        return bool(enabled)
     try:
-        torch.distributed.monitored_barrier(group=group.cpu_group, timeout=timeout)
+        agreed = utils.min_over_group(enabled, group.cpu_group)
     except RuntimeError as e:
+        timeout = get_cpu_distributed_timeout_or_none() or default_pg_timeout
         raise RuntimeError(
-            "TPU_EVICT_WEIGHTS_PAGE_CACHE: not every rank finished loading "
-            f"within {timeout.total_seconds():.0f} s (the CPU group timeout, "
-            "--cpu-distributed-timeout-seconds); a rank failed or stalled during "
-            "the load"
+            "Not every rank of this engine finished loading within "
+            f"{timeout.total_seconds():.0f} s (the CPU group timeout): a rank "
+            "failed or stalled during the load. Look for its error in the logs "
+            "of every host; if the load is only slow, raise "
+            "--cpu-distributed-timeout-seconds."
         ) from e
+    if enabled and not agreed:
+        logger.warning(
+            "[tpu-model-loader] TPU_EVICT_WEIGHTS_PAGE_CACHE is on in this "
+            "process but off on another rank of this engine, so no rank evicts "
+            "the weight page cache. Set it on every host to evict."
+        )
+    return bool(agreed)
 
 
 def evict_loaded_weights_page_cache() -> None:
@@ -831,18 +832,17 @@ def evict_loaded_weights_page_cache() -> None:
     The prefetch threads (``_start_prefetch``) serve no load after this
     point, so every rank stops its own first, with or without eviction.
 
-    With TPU_EVICT_WEIGHTS_PAGE_CACHE (opt-in), every rank of this engine then
-    waits for every other one to finish loading before it evicts, bounded by
-    the CPU group's timeout (``_wait_for_every_loader``). The page cache is
-    shared across a host's ranks, and a slower rank (or, under pipeline
-    parallelism, a later stage's draft load) may still be reading the
-    checkpoint. A rank that never arrives fails the load instead of hanging
-    the others. A second eviction of a file is cheap.
+    Then every rank agrees on TPU_EVICT_WEIGHTS_PAGE_CACHE (opt-in), which
+    also waits for every other rank to finish loading, bounded by the CPU
+    group's timeout (``_evict_on_every_rank``). The page cache is shared
+    across a host's ranks, and a slower rank (or, under pipeline parallelism,
+    a later stage's draft load) may still be reading the checkpoint. A rank
+    that never arrives fails the load instead of hanging the others. If every
+    rank has the flag on, each evicts; a second eviction of a file is cheap.
     """
-    _stop_ep_range_prefetch()
-    if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE:
+    _stop_prefetch()
+    if not _evict_on_every_rank():
         return
-    _wait_for_every_loader()
     if not _loaded_weight_files:
         return
     files = list(_loaded_weight_files)
