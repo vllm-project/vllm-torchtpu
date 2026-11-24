@@ -1231,6 +1231,39 @@ def is_prefill_step(num_tokens: int, max_num_seqs: int) -> bool:
     return num_tokens > max_num_seqs * _SMALL_TILE_Q
 
 
+def kv4_large_block_q(index_cache: jax.Array, num_rows: int, default: int) -> int:
+    """The large class's tile rows: `TPU_MINIMAX_M3_KV4_INDEXER_LARGE_BLOCK_Q`
+    for a 4-bit index cache with folded scales (kernel v3, keys scaled to
+    bf16 per tile) on a step of at least twice that many query rows (read
+    when traced, through `envs`), else `default`."""
+    from vllm_torchtpu import envs
+
+    wide = envs.TPU_MINIMAX_M3_KV4_INDEXER_LARGE_BLOCK_Q
+    folded = msa_fp4.scales_in_page(index_cache.shape[1], index_cache.dtype)
+    if not wide or not folded or num_rows < 2 * wide:
+        return default
+    if wide % _ROW_ALIGN or wide <= _TRANSPOSED_MAX_ROWS:
+        # Tiles of up to _TRANSPOSED_MAX_ROWS rows score transposed, scaling
+        # f32 scores instead of bf16 keys: other bits.
+        raise ValueError(
+            f"TPU_MINIMAX_M3_KV4_INDEXER_LARGE_BLOCK_Q={wide}: want a multiple "
+            f"of {_ROW_ALIGN} above {_TRANSPOSED_MAX_ROWS}"
+        )
+    global _KV4_LARGE_LOGGED
+    if not _KV4_LARGE_LOGGED:
+        _KV4_LARGE_LOGGED = True
+        logger.info(
+            "TPU_MINIMAX_M3_KV4_INDEXER_LARGE_BLOCK_Q=%d: 4-bit MSA indexer prefill "
+            "tiles of %d query rows.",
+            wide,
+            wide,
+        )
+    return wide
+
+
+_KV4_LARGE_LOGGED = False
+
+
 def class_plan(
     index_q: jax.Array,
     index_cache: jax.Array,
@@ -1271,6 +1304,7 @@ def class_plan(
     else:
         check_page_dtype(index_cache.shape[2], index_cache.dtype)
         scale_row = None
+    large_block_q = kv4_large_block_q(index_cache, num_tokens, large_block_q)
     max_num_seqs = seq_lens.shape[0]
     seq_ids = jnp.arange(max_num_seqs, dtype=jnp.int32)
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
