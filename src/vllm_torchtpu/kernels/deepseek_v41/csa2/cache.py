@@ -73,6 +73,23 @@ def gather_csa2_kv_sc(
     return _gather_sc_banked(banks, scale_banks, records)
 
 
+def _subchunks(count: int, cores: int, lanes: int, streams: int, min_steps: int) -> int:
+    """Lane-wide id groups per subcore and grid step: 512 ids, halved while
+    that leaves ``count`` padded and each stream at least ``min_steps`` steps.
+
+    Padding ids are gathered as zero rows and sliced off the output, which
+    copies the whole output (a 4 MiB slice for a 16-token gather).
+    """
+    subchunks = 512 // lanes
+    while (
+        count % (cores * lanes * subchunks)
+        and subchunks // 2 % streams == 0
+        and subchunks // 2 // streams >= min_steps
+    ):
+        subchunks //= 2
+    return subchunks if not count % (cores * lanes * subchunks) else 512 // lanes
+
+
 def _gather_sc_banked(words, scales, records):
     """Masked DMA into shared VMEM; no concatenated HBM cache.
 
@@ -87,9 +104,10 @@ def _gather_sc_banked(words, scales, records):
     assert info is not None
     lanes = info.num_lanes
     cores = info.num_cores * info.num_subcores
-    streams, subchunks = (4 if len(words) == 1 else 2), 512 // lanes
-    block = cores * lanes * subchunks
+    streams = 4 if len(words) == 1 else 2
     count = records.size
+    subchunks = _subchunks(count, cores, lanes, streams, min_steps=1)
+    block = cores * lanes * subchunks
     padding = -count % block
     indices = jnp.pad(records.reshape(-1), (0, padding), constant_values=-1)
     mesh = plsc.VectorSubcoreMesh(
@@ -233,9 +251,10 @@ def _gather_sc_banked_deep(words, scales, records):
     assert info is not None
     lanes = info.num_lanes
     cores = info.num_cores * info.num_subcores
-    streams, subchunks, slots = (4 if len(words) == 1 else 2), 512 // lanes, 3
-    block = cores * lanes * subchunks
+    streams, slots = (4 if len(words) == 1 else 2), 3
     count = records.size
+    subchunks = _subchunks(count, cores, lanes, streams, min_steps=2)
+    block = cores * lanes * subchunks
     padding = -count % block
     indices = jnp.pad(records.reshape(-1), (0, padding), constant_values=-1)
     zero_rows = 2 * cores * streams * lanes
