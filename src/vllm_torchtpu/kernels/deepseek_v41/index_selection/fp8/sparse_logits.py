@@ -144,7 +144,8 @@ def _kernel(
 
     def release(slot):
         src = output(slot)
-        _dma_rows(src, src, write_sem.at[slot], counts[slot], wait=True)
+        # The output copy writes rows of `out` from unaligned query rows.
+        _dma_rows(src, src, write_sem.at[slot], counts[slot], wait=True, block=False)
 
     def visible(row, offset):
         # Window mask in output columns; column zero is union token offset.

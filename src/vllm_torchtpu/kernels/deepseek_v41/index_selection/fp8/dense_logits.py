@@ -116,7 +116,15 @@ class _DenseKernel:
         # -inf padding row copies [6, 8) per query slot.
         for slot in (2 * pair, 2 * pair + 1)[: self.tiles]:
             src = self.scores.at[slot]
-            _dma_rows(src, src, self.write_sem.at[slot], self.counts[slot], wait=True)
+            # `publish` writes rows of `out` from unaligned query rows.
+            _dma_rows(
+                src,
+                src,
+                self.write_sem.at[slot],
+                self.counts[slot],
+                wait=True,
+                block=False,
+            )
         src = self.padding.at[pl.ds(0, 1)]
         dst = self.out.at[pl.ds(0, 1), pl.ds(0, self.key_tile)]
         row = pltpu.make_async_copy(src, dst, self.pad_sem.at[pair])
