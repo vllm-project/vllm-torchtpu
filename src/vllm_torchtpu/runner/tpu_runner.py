@@ -3588,6 +3588,8 @@ class TPUModelRunner(GPUModelRunner):
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
 
+        from vllm_torchtpu.distributed.shm_allreduce import dp_all_reduce_max
+
         # Token/chunk metadata is synchronized on vLLM's CPU DP group. The
         # model forward below receives this result explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
@@ -3613,9 +3615,7 @@ class TPUModelRunner(GPUModelRunner):
             dtype=torch.int64,
             device="cpu",
         )
-        torch.distributed.all_reduce(
-            t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
-        )
+        dp_all_reduce_max(t, get_dp_group(), "step_start")
         self._dp_step_index += 1
         bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
         if controller is not None:

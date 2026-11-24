@@ -200,6 +200,7 @@ if TYPE_CHECKING:
     TPU_GC_POLICY: str = "freeze"
     TPU_GC_COLLECT_EVERY: int = 500
     TPU_GC_TRACE: bool = False
+    VLLM_TPU_SHM_DP_ALLREDUCE: bool = False
 
 
 def env_with_choices(
@@ -1261,6 +1262,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # engine core (generation, duration, wall-clock ns), to line stalls up
     # with collections in the step records. Independent of TPU_GC_POLICY.
     "TPU_GC_TRACE": env_bool("TPU_GC_TRACE", default=False),
+    # EP-DP workers: run the 2 per-step scheduling all-reduces through a shared-
+    # memory table when every DP rank is a process of 1 x86_64 host
+    # (distributed/shm_allreduce.py), else on the gloo group. Same integers.
+    "VLLM_TPU_SHM_DP_ALLREDUCE": env_bool("VLLM_TPU_SHM_DP_ALLREDUCE"),
 }
 
 
