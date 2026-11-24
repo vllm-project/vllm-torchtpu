@@ -106,8 +106,8 @@ def test_proxy_form_runs_stored_copy(name):
     direct = subprocess.run([sys.executable, str(stored), "--help"], env=_env(), capture_output=True, text=True,
                             timeout=300)
     assert direct.returncode == 0, direct.stderr
-    # argparse names the program after argv[0]: the gated run keeps this file's name.
-    assert res.stdout == direct.stdout.replace(stored.name, PROXY.name)
+    # runpy.run_path sets sys.argv[0] to the copy it runs, so argparse names the copy in both runs.
+    assert res.stdout == direct.stdout
 
 
 def test_proxy_form_refuses_unknown_name():
