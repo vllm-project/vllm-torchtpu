@@ -36,6 +36,11 @@ from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
 # (standalone 4-bit 8-token tiles at served-c48-like dispersion: 2.00 -> 1.83
 # ms, j-492a1bb9).
 _STEP_WIDTHS = (4, 8, 16, 24, 32, 48)
+# Units also run at 12 pages, the width of c48-like decode groups (one KV
+# head, 22-34 requests, locality .97: -8..-9 % per call). Calls that run
+# groups alone do not take it: a 64-page head-parallel prefill call
+# (64-token tiles) ran ~5x slower with it in its step bodies.
+_UNIT_STEP_WIDTHS = (4, 8, 12, 16, 24, 32, 48)
 # Tiles per grid step: a step runs the groups of this many tiles in a loop.
 # One step per group paid a per-step cost worth ~2-3% of the call (pool48
 # selections, 1-2 groups a tile; bench j-caec1354).
@@ -773,7 +778,7 @@ def _kernel(
     if unit_groups == 1:
         jax.lax.fori_loop(start, end, loop, 0)
         return
-    widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
+    widths = [n for n in _UNIT_STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
 
     def run_unit(w0, size):
         """Groups ``w0 .. w0 + size - 1`` side by side, after issuing the page
