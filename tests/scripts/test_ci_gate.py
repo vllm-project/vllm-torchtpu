@@ -53,8 +53,8 @@ class TestCiGate(unittest.TestCase):
     def test_green_nightly_build_passes(self) -> None:
         statuses = [
             build(10, "success"),
-            step(10, "unit-tests-general-nightly", "success"),
-            step(10, "unit-tests-general-nightly", "pending"),
+            step(10, "v7x-unit-tests-general-nightly", "success"),
+            step(10, "v7x-unit-tests-general-nightly", "pending"),
             step(10, "unit-tests-cpu-pr", "success"),
         ]
         self.assertEqual(ci_gate.check(SHA, statuses), (f"{BUILDS}10", None))
@@ -65,11 +65,11 @@ class TestCiGate(unittest.TestCase):
             step(11, "unit-tests-cpu-pr", "success"),
             build(10, "failure"),
             step(10, "perf-nightly-qwen3", "failure"),
-            step(10, "unit-tests-general-nightly", "success"),
+            step(10, "v7x-unit-tests-general-nightly", "success"),
         ]
         url, reason = ci_gate.check(SHA, statuses)
         self.assertIsNone(url)
-        self.assertIn("no nightly step ran", reason)
+        self.assertIn("no nightly v7x step ran", reason)
 
     def test_pr_steps_only_rejected(self) -> None:
         statuses = [
@@ -79,14 +79,14 @@ class TestCiGate(unittest.TestCase):
         ]
         url, reason = ci_gate.check(SHA, statuses)
         self.assertIsNone(url)
-        self.assertIn("no nightly step ran", reason)
+        self.assertIn("no nightly v7x step ran", reason)
 
     def test_newest_build_failed_rejected(self) -> None:
         statuses = [
             build(11, "failure"),
-            step(11, "unit-tests-general-nightly", "success"),
+            step(11, "v7x-unit-tests-general-nightly", "success"),
             build(10, "success"),
-            step(10, "unit-tests-general-nightly", "success"),
+            step(10, "v7x-unit-tests-general-nightly", "success"),
         ]
         url, reason = ci_gate.check(SHA, statuses)
         self.assertIsNone(url)
@@ -95,11 +95,33 @@ class TestCiGate(unittest.TestCase):
     def test_nightly_step_failed_on_retry_rejected(self) -> None:
         statuses = [
             build(10, "success"),
-            step(10, "unit-tests-general-nightly", "failure"),
-            step(10, "unit-tests-general-nightly", "success"),
+            step(10, "v7x-unit-tests-general-nightly", "failure"),
+            step(10, "v7x-unit-tests-general-nightly", "success"),
         ]
         url, _ = ci_gate.check(SHA, statuses)
         self.assertIsNone(url)
+
+    def test_v6e_only_nightly_build_rejected(self) -> None:
+        # A green build whose nightly steps ran on CPU and on v6e alone
+        # (CI_EXTRAS=tpu-v6e): none on v7x.
+        statuses = [
+            build(10, "success"),
+            step(10, "unit-tests-cpu-nightly", "success"),
+            step(10, "v6e-unit-tests-general-nightly", "success"),
+            step(10, "v6e-unit-tests-multichip-nightly", "success"),
+        ]
+        url, reason = ci_gate.check(SHA, statuses)
+        self.assertIsNone(url)
+        self.assertIn("no nightly v7x step ran", reason)
+
+    def test_v7x_nightly_step_beside_v6e_passes(self) -> None:
+        # CI_EXTRAS=tpu-all: both generations' nightly steps; v7x's count.
+        statuses = [
+            build(10, "success"),
+            step(10, "v6e-unit-tests-general-nightly", "success"),
+            step(10, "v7x-unit-tests-general-nightly", "success"),
+        ]
+        self.assertEqual(ci_gate.check(SHA, statuses), (f"{BUILDS}10", None))
 
     def test_no_build_rejected(self) -> None:
         url, reason = ci_gate.check(SHA, [])
