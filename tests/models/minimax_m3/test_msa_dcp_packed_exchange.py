@@ -120,3 +120,26 @@ def test_f32_halves_round_trip_every_bit_pattern_class():
     halves = msa._f32_halves(bits.view(torch.float32))
     assert halves.dtype == torch.int16 and halves.shape == (512, 16)
     assert torch.equal(msa._f32_from_halves(halves).view(torch.int32), bits)
+
+
+@pytest.mark.parametrize("dcp,num_tokens", [(2, 8), (2, 24), (4, 5), (2, 130)])
+def test_head_partials_unpack_bit_for_bit(dcp, num_tokens):
+    torch.manual_seed(dcp + num_tokens)
+    heads = 8 * dcp
+    out_bits = torch.randint(-(2**15), 2**15, (heads, num_tokens, 128))
+    out = out_bits.to(torch.int16).view(torch.bfloat16)
+    lse_bits = torch.randint(
+        -(2**31), 2**31 - 1, (heads, num_tokens), dtype=torch.int64
+    )
+    lse_bits = lse_bits.to(torch.int32)
+    special = [0, -(2**31), 0x7F800000, -8388608, 0x7FC00001, 1]
+    lse_bits.view(-1)[: len(special)] = torch.tensor(special, dtype=torch.int32)
+    lse = lse_bits.view(torch.float32)
+    packed = msa.pack_head_partials(out, lse, dcp)
+    assert packed.dtype == torch.int16 and packed.shape[::2] == (dcp, 128)
+    parts, lses = msa.unpack_head_partials(packed, num_tokens, out.dtype)
+    local = heads // dcp
+    assert torch.equal(
+        parts.view(torch.int16), out.view(torch.int16).view(dcp, local, num_tokens, 128)
+    )
+    assert torch.equal(lses.view(torch.int32), lse_bits.view(dcp, local, num_tokens))

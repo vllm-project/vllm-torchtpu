@@ -438,22 +438,23 @@ def _halves(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous().view(torch.int16)
 
 
-def _f32_halves(x: torch.Tensor) -> torch.Tensor:
+def _f32_halves(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """f32 ``[..., n]`` as int16 ``[..., 2n]``: every high half, then every
-    low half (`_f32_from_halves`). An int16 view would interleave them, and
-    joining interleaved halves back lowered to strided slices and relayout
-    copies (~0.9 us per layer at 8 tokens, c4 twin j-73e59e3d); shifts and
-    masks of whole blocks fuse into their neighbours."""
+    low half, along `dim` (`_f32_from_halves`). An int16 view would
+    interleave them, and joining interleaved halves back lowered to strided
+    slices and relayout copies (~0.9 us per layer at 8 tokens, c4 twin
+    j-73e59e3d); shifts and masks of whole blocks fuse into their
+    neighbours."""
     words = x.contiguous().view(torch.int32)
     # Both halves sign-extended into int16 range, so the narrowing is exact.
     low = (words << 16) >> 16
-    return torch.cat([(words >> 16).to(torch.int16), low.to(torch.int16)], dim=-1)
+    return torch.cat([(words >> 16).to(torch.int16), low.to(torch.int16)], dim=dim)
 
 
-def _f32_from_halves(halves: torch.Tensor) -> torch.Tensor:
-    """f32 ``[..., n]`` from `_f32_halves`' ``[..., 2n]`` blocks of high,
-    then low halves (not an interleaved int16 view)."""
-    high, low = halves.to(torch.int32).chunk(2, dim=-1)
+def _f32_from_halves(halves: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """f32 from `_f32_halves`' blocks of high, then low halves along `dim`
+    (not an interleaved int16 view)."""
+    high, low = halves.to(torch.int32).chunk(2, dim=dim)
     return ((high << 16) | (low & 0xFFFF)).view(torch.float32)
 
 
@@ -480,25 +481,42 @@ def exchange_queries_and_candidates(
     return q_all, _f32_from_halves(gathered[..., split:])
 
 
-# The int16 halves of an f32 lse (`pack_head_partials`).
-_LSE_HALVES = 2
-
-
-def pack_head_partials(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+def pack_head_partials(
+    out: torch.Tensor, lse: torch.Tensor, ranks: int
+) -> torch.Tensor:
     """Head-major 16-bit ``out [H, T, D]`` and ``lse [H, T]`` as one int16
-    tensor ``[H, T, D + 2]`` (`unpack_head_partials`)."""
+    tensor of whole ``D``-wide rows, ``[ranks, H / ranks * (T + 2 * W / D),
+    D]`` (`unpack_head_partials`): block ``r`` holds rank ``r``'s heads'
+    output rows, then the high and then the low halves of their lses, each
+    head's padded to ``W``, ``T`` rounded up to a multiple of ``D``. As two
+    lanes past each output row (``[H, T, D + 2]``), the halves cost ~0.6 us
+    of relayout copies per layer at 8 tokens (b1 twin, j-f351ea81)."""
+    num_tokens, head_dim = out.shape[1:]
+    width = -(-num_tokens // head_dim) * head_dim
+    lse = torch.nn.functional.pad(lse.to(torch.float32), (0, width - num_tokens))
     return torch.cat(
-        [_halves(out), _f32_halves(lse.to(torch.float32).unsqueeze(-1))], dim=-1
+        [
+            _halves(out).view(ranks, -1, head_dim),
+            _f32_halves(lse.reshape(ranks, -1, head_dim), dim=1),
+        ],
+        dim=1,
     )
 
 
 def unpack_head_partials(
-    packed: torch.Tensor, dtype: torch.dtype
+    packed: torch.Tensor, num_tokens: int, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    split = packed.shape[-1] - _LSE_HALVES
+    """`pack_head_partials`' ``out [ranks, H / ranks, T, D]`` and ``lse
+    [ranks, H / ranks, T]``."""
+    ranks, rows, head_dim = packed.shape
+    width = -(-num_tokens // head_dim) * head_dim
+    num_heads = rows // (num_tokens + 2 * width // head_dim)
+    split = num_heads * num_tokens
+    out = packed[:, :split].contiguous().view(dtype)
+    lse = _f32_from_halves(packed[:, split:], dim=1)
     return (
-        packed[..., :split].contiguous().view(dtype),
-        _f32_from_halves(packed[..., split:]).squeeze(-1),
+        out.view(ranks, num_heads, num_tokens, head_dim),
+        lse.reshape(ranks, num_heads, width)[..., :num_tokens],
     )
 
 
@@ -524,11 +542,8 @@ def merge_head_partials_a2a(
     ``r`` receives every rank's partial and lse of its own heads, packed
     (`pack_head_partials`), and merges them locally, instead of an lse
     all-gather and a reduce-scatter. Returns ``[T, H / DCP, D]``."""
-    dcp = group.world_size
-    num_heads, num_tokens, _ = out.shape
-    recv = _all_to_all(pack_head_partials(out, lse), group)
-    recv = recv.view(dcp, num_heads // dcp, num_tokens, -1)
-    parts, lses = unpack_head_partials(recv, out.dtype)
+    recv = _all_to_all(pack_head_partials(out, lse, group.world_size), group)
+    parts, lses = unpack_head_partials(recv, out.shape[1], out.dtype)
     return merge_received_partials(parts, lses).transpose(0, 1)
 
 
