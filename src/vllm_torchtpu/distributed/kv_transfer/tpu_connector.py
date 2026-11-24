@@ -17,6 +17,7 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 ``kv_connector_extra_config.use_hma_connector``.
 """
 
+import os
 import dataclasses
 import importlib
 import json
@@ -5859,6 +5860,24 @@ class TPURaidenConnectorWorker:
             else:
                 if _use_raiden_glm_admission():
                     transfer_tags = list(self._stage3_row_geometry)
+                    if os.environ.get("TPU_RAIDEN_SKIP_DRAFT_LAYER_LOAD") == "1":
+                        # A pipeline producer runs no MTP draft, so no source
+                        # registers the draft layer's pools: load only the
+                        # target layers and leave the draft's prompt KV
+                        # unloaded (its drafts then only lose acceptance).
+                        from vllm_torchtpu.distributed.kv_transfer.raiden.tags import (  # noqa: E501
+                            split_layer_tag,
+                        )
+
+                        num_target_layers = int(
+                            self.vllm_config.model_config.hf_text_config.num_hidden_layers
+                        )
+                        transfer_tags = [
+                            tag
+                            for tag in transfer_tags
+                            if (split_layer_tag(tag)[1] is None)
+                            or split_layer_tag(tag)[1] < num_target_layers
+                        ]
                 else:
                     transfer_tags = self._stage3_fa_registration_tags()
                 dst_blocks = list(local_blocks) * len(transfer_tags)
