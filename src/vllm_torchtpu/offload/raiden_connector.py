@@ -54,7 +54,7 @@ import time
 from collections import Counter, OrderedDict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -214,10 +214,22 @@ class WriteBackPolicy:
     chunks only when they near eviction: once one of their blocks is within
     ``window_blocks`` of the head of the free queue (the next blocks to be
     reused), at most ``max_requests_per_step`` requests per step.
+
+    ``granularity="block"`` stores per chunk instead of per request: each
+    step stores only the held chunks whose blocks are within
+    ``window_blocks`` of the head (all of them; ``max_requests_per_step`` is
+    unused), and a held block that leaves the free queue (prefix hit or
+    reallocation) stops being tracked for its old holder without dropping
+    the holder's other chunks. A whole-request flush writes the request's
+    entire chain, mostly still resident in HBM, and pushes useful chains out
+    of the host LRU; per-chunk stores keep the host close to a victim cache
+    of HBM. Pair with ``TPU_RAIDEN_LRU_REFRESH=1`` (refresh a resident key
+    when it is offered again, not every chain on request finish).
     """
 
     window_blocks: int = 1024
     max_requests_per_step: int = 8
+    granularity: str = "request"
 
     @classmethod
     def from_extra_config(cls, extra_config: Mapping) -> WriteBackPolicy | None:
@@ -239,7 +251,15 @@ class WriteBackPolicy:
         written = cls(**options)
         if written.window_blocks <= 0 or written.max_requests_per_step <= 0:
             raise ValueError(f"store_policy options must be positive: {policy!r}")
+        if written.granularity not in ("request", "block"):
+            raise ValueError(
+                f"store_policy granularity must be 'request' or 'block': {policy!r}"
+            )
         return written
+
+    @property
+    def per_block(self) -> bool:
+        return self.granularity == "block"
 
 
 def _allocated_block_ids(scheduler_output: SchedulerOutput) -> set[int]:
@@ -517,6 +537,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             c["held_requests"],
             len(self._wb_owners),
         )
+        if self._write_back is not None and self._write_back.per_block:
+            logger.info(
+                "KV write-back per block: %d chunks stored, %d held blocks left "
+                "the free queue (hit or reuse), %d holders released",
+                c["stored_chunks"],
+                c["blocks_left_queue"],
+                c["released_requests"],
+            )
         if self._offload_stats:
             mgr_stats = getattr(self._raiden_manager, "_stats", None) or {}
             logger.info(
@@ -621,12 +649,148 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             num_scheduled_tokens={},
         )
 
+    def _wb_release(self, req_id: str) -> None:
+        """Per-block write-back: finish a held request with nothing left to
+        store, without the base finish path (which would store every chunk
+        past ``next_stored_chunk_idx``, reallocated blocks included)."""
+        self._wb_unregister(req_id)
+        req_status = self._req_status.get(req_id)
+        if req_status is None:
+            return
+        self.wb_counters["released_requests"] += 1
+        req_status.finished_signaled = True
+        self.manager.on_request_finished(req_status.req_context)
+        if not req_status.transfer_jobs:
+            del self._req_status[req_id]
+
+    def _wb_forget_blocks(self, bids) -> set[str]:
+        """Stop tracking `bids` for their holders; the holders left empty."""
+        emptied: set[str] = set()
+        for bid in bids:
+            for req_id in self._wb_owners.pop(bid, ()):
+                blocks = self._wb_blocks.get(req_id)
+                if blocks is None:
+                    continue
+                blocks.discard(bid)
+                if not blocks:
+                    emptied.add(req_id)
+        return emptied
+
+    def _wb_window_blocks(self) -> dict[str, set[int]]:
+        """Held blocks among the next ``window_blocks`` the free queue hands
+        out, by holder."""
+        policy = self._write_back
+        assert policy is not None and self._block_pool is not None
+        queue = self._block_pool.free_block_queue
+        picked: dict[str, set[int]] = {}
+        block = queue.fake_free_list_head.next_free_block
+        for _ in range(policy.window_blocks):
+            if block is None or block is queue.fake_free_list_tail:
+                break
+            for req_id in self._wb_owners.get(block.block_id, ()):
+                picked.setdefault(req_id, set()).add(block.block_id)
+            block = block.next_free_block
+        return picked
+
+    def _write_back_output_blocks(
+        self, scheduler_output: SchedulerOutput
+    ) -> SchedulerOutput:
+        """Per-block write-back (``granularity="block"``): the scheduler
+        output the base sees stores, for each holder with blocks near the
+        free-queue head, only the chunks of those blocks (`build_connector_meta`
+        limits `prepare_store` to them), and keeps the holder for the rest."""
+        allocated = _allocated_block_ids(scheduler_output)
+        c = self.wb_counters
+        c["steps"] += 1
+        c["allocated_blocks"] += len(allocated)
+        finished = set(scheduler_output.finished_req_ids or ())
+        passed = {r for r in finished if not self._wb_register(r)}
+        # A held block handed out again lost its contents (reallocation) or is
+        # now held by a running request that registers it at its own finish
+        # (prefix hit): either way its old holder no longer stores it.
+        reused = allocated & self._wb_owners.keys()
+        c["blocks_left_queue"] += len(reused)
+        release = self._wb_forget_blocks(reused)
+        allowed: dict[str, set] = {}
+        bpc = self.config.blocks_per_chunk
+        picked = self._wb_window_blocks() if self._block_pool is not None else {}
+        for req_id, bids in picked.items():
+            req_status = self._req_status.get(req_id)
+            if req_status is None:
+                continue
+            keys: set = set()
+            chunk_bids: set[int] = set()
+            for group_state in req_status.group_states:
+                block_ids = group_state.block_ids
+                chunks = {i // bpc for i, b in enumerate(block_ids) if b in bids}
+                for ci in chunks:
+                    if ci < len(group_state.offload_keys):
+                        keys.add(group_state.offload_keys[ci])
+                    chunk_bids.update(
+                        b for b in block_ids[ci * bpc : (ci + 1) * bpc] if b != 0
+                    )
+            if keys:
+                allowed[req_id] = keys
+                c["stored_chunks"] += len(keys)
+            release |= self._wb_forget_blocks(chunk_bids | bids)
+        self._wb_allowed = allowed
+        self._wb_to_release = release - passed
+        c["held_requests"] = len(self._wb_blocks)
+        self._maybe_log_write_back()
+        return dataclasses.replace(
+            scheduler_output,
+            finished_req_ids=passed,
+            num_scheduled_tokens=dict.fromkeys(allowed, 0),
+        )
+
+    def _wb_build_partial(self, scheduler_output: SchedulerOutput):
+        """`super().build_connector_meta` with `prepare_store` limited to the
+        allowed chunks of the per-block holders, whose stored-chunk index is
+        restored afterwards (later chunks of the same holder still store)."""
+        allowed = getattr(self, "_wb_allowed", None) or {}
+        by_ctx: dict[int, set] = {}
+        saved: list[tuple[Any, int]] = []
+        for req_id, keys in allowed.items():
+            req_status = self._req_status.get(req_id)
+            if req_status is None:
+                continue
+            by_ctx[id(req_status.req_context)] = keys
+            saved.extend(
+                (gs, gs.next_stored_chunk_idx) for gs in req_status.group_states
+            )
+        manager = self.manager
+        prepare_store = manager.prepare_store
+
+        def limited(keys, req_context):
+            only = by_ctx.get(id(req_context))
+            if only is not None:
+                keys = [k for k in keys if k in only]
+            return prepare_store(keys, req_context)
+
+        manager.prepare_store = limited
+        try:
+            meta = super().build_connector_meta(scheduler_output)
+        finally:
+            manager.prepare_store = prepare_store
+            for gs, idx in saved:
+                gs.next_stored_chunk_idx = idx
+            self._wb_allowed = {}
+        for req_id in getattr(self, "_wb_to_release", ()) or ():
+            if req_id not in self._wb_blocks or not self._wb_blocks[req_id]:
+                self._wb_release(req_id)
+        self._wb_to_release = set()
+        return meta
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
-        if self._write_back is not None:
-            scheduler_output = self._write_back_output(scheduler_output)
-        meta = super().build_connector_meta(scheduler_output)
+        if self._write_back is not None and self._write_back.per_block:
+            scheduler_output = self._write_back_output_blocks(scheduler_output)
+            meta = self._wb_build_partial(scheduler_output)
+        else:
+            if self._write_back is not None:
+                scheduler_output = self._write_back_output(scheduler_output)
+            meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, OffloadingConnectorMetadata)
 
         manager = self._raiden_manager
