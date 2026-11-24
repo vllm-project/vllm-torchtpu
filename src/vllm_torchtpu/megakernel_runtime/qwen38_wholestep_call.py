@@ -143,7 +143,8 @@ def main_call_options() -> dict:
     """Main whole-step call only (the draft passes its own `skip_idle`): VLLM_TPU_MK_QSA_XMERGE
     (one exchange per QSA layer), VLLM_TPU_MK_WHOLE_SKIP_IDLE (request loops stop after
     the last live request) and VLLM_TPU_MK_QSA_UNION_SPLIT (union tiles split over the ranks
-    sharing a KV head). Empty when all are off, so the spec is unchanged."""
+    sharing a KV head), VLLM_TPU_MK_QSA_EARLY_LOADS and VLLM_TPU_MK_QSA_PAIR_SCORE
+    (`QSAFullStepBlock`). Empty when all are off, so the spec is unchanged."""
     out: dict = {}
     if envs.VLLM_TPU_MK_QSA_XMERGE:
         out["xmerge"] = True
@@ -151,6 +152,10 @@ def main_call_options() -> dict:
         out["skip_idle"] = True
     if envs.VLLM_TPU_MK_QSA_UNION_SPLIT > 1 and UNION_ATTN and main_kv_dcp() == 1:
         out["union_split"] = envs.VLLM_TPU_MK_QSA_UNION_SPLIT
+    if envs.VLLM_TPU_MK_QSA_EARLY_LOADS:
+        out["early_loads"] = True
+    if envs.VLLM_TPU_MK_QSA_PAIR_SCORE:
+        out["pair_score"] = True
     return out
 
 

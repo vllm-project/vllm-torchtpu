@@ -191,6 +191,8 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_QSA_XMERGE: bool = False
     VLLM_TPU_MK_WHOLE_SKIP_IDLE: bool = False
     VLLM_TPU_MK_QSA_UNION_SPLIT: int = 0
+    VLLM_TPU_MK_QSA_EARLY_LOADS: bool = True
+    VLLM_TPU_MK_QSA_PAIR_SCORE: bool = True
     VLLM_TPU_MK_GDN_STATE_PREFETCH: bool = True
     VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_MK_WHOLE_L45: bool = False
@@ -1364,6 +1366,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (`QSAFullIndexedBlock.union_split`; the main-KV DCP combine's math). 0 = off. Not
     # bit-exact: f32 rounding of the combine.
     "VLLM_TPU_MK_QSA_UNION_SPLIT": env_int("VLLM_TPU_MK_QSA_UNION_SPLIT", 0),
+    # Whole-step megakernel (main call): each QSA layer copies its table rows before its HC
+    # mix and issues the request loop's first loads before the projection
+    # (`QSAFullStepBlock.early_loads`). Exact: scheduling only.
+    "VLLM_TPU_MK_QSA_EARLY_LOADS": env_bool("VLLM_TPU_MK_QSA_EARLY_LOADS", default=True),
+    # Whole-step megakernel (main call), at most R / 2 request slots: a core pair scores each
+    # request, half its key chunks each (`QSAFullStepBlock.pair_score`). Exact with the
+    # served replicated indexer state.
+    "VLLM_TPU_MK_QSA_PAIR_SCORE": env_bool("VLLM_TPU_MK_QSA_PAIR_SCORE", default=True),
     # Whole-step megakernel: each GDN layer's pool state copies start before its HC mix
     # (`Qwen38PoolGDN.state_prefetch`). Exact: scheduling only.
     "VLLM_TPU_MK_GDN_STATE_PREFETCH": env_bool(

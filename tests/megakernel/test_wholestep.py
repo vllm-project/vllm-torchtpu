@@ -293,7 +293,8 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
            shared_kv: bool = False, cdcp: bool = False, cdcp_keys: bool = True, ck_fn=None,
            async_dma: bool = False, B: int | None = None, xreq: int = 0,
            skip_idle: bool = False, xmerge: bool = False, key_mp: int = 0, key_slots: int = 2,
-           union_split: int = 0, R: int = 2, geom=None):
+           union_split: int = 0, R: int = 2, geom=None, early_loads: bool = False,
+           pair_score: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -337,7 +338,9 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
                    compressed_dcp=cdcp, xreq_prefetch=xreq, skip_idle=skip_idle,
                    manager_pages=key_mp, key_slots=key_slots,
                    **(dict(xmerge=True) if xmerge else {}),
-                   **(dict(union_split=union_split) if union_split else {}))
+                   **(dict(union_split=union_split) if union_split else {}),
+                   **(dict(early_loads=True) if early_loads else {}),
+                   **(dict(pair_score=True) if pair_score else {}))
     spec = wholestep_spec(
         g_,
         R,
@@ -760,23 +763,19 @@ def test_key_stream_ring_and_manager_pages_bit_identical(monkeypatch, kw):
 
 
 @pytest.mark.parametrize("key_slots", [3, 4])
-def test_early_loads_bit_identical(monkeypatch, key_slots):
+def test_early_loads_bit_identical(key_slots):
     """VLLM_TPU_MK_QSA_EARLY_LOADS: table rows copied before the HC mix, request 0's loop
     loads, the union's table rows and the owned request's first key chunks issued before the
     projection give bit-identical residuals, completed keys, rings and selected ids. Request
     0 streams 6 chunks (more than the slots), request 1 one chunk (fewer than the early
     chunks)."""
-    from vllm_torchtpu.megakernel.wholestep import qsa_full_c
-
     run = functools.partial(
         _run_c, long=True, rank_ids=True, ctx=[6000, 100], max_groups=2048, shard=True,
         union=True, loop=True, xreq=2, skip_idle=True, xmerge=True, key_slots=key_slots,
         phys=True,
     )
-    monkeypatch.setattr(qsa_full_c, "EARLY_LOADS", False)
     late = run()
-    monkeypatch.setattr(qsa_full_c, "EARLY_LOADS", True)
-    early = run()
+    early = run(early_loads=True)
     for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new"), (7, "ids")):
         np.testing.assert_array_equal(early[i], late[i], err_msg=name)
 
@@ -798,12 +797,10 @@ def test_pair_score_bit_identical(monkeypatch):
     run = functools.partial(
         _run_c, long=True, rank_ids=True, ctx=[6000, 100], max_groups=2048, shard=True,
         union=True, loop=True, xreq=2, skip_idle=True, xmerge=True, key_slots=3, R=8, B=8,
-        geom=geom, ck_fn=rising,
+        geom=geom, ck_fn=rising, early_loads=True,
     )
-    monkeypatch.setattr(qsa_full_c, "PAIR_SCORE", False)
     one = run()
-    monkeypatch.setattr(qsa_full_c, "PAIR_SCORE", True)
-    pair = run()
+    pair = run(pair_score=True)
     for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new"), (7, "ids")):
         np.testing.assert_array_equal(pair[i], one[i], err_msg=name)
     half = qsa_full_c.QSAFullStepBlock._half
@@ -813,7 +810,7 @@ def test_pair_score_bit_identical(monkeypatch):
         return c_lo - (n > 0).astype(c_lo.dtype) * jax.lax.rem(ctx.me, 2), n, n_odd
 
     monkeypatch.setattr(qsa_full_c.QSAFullStepBlock, "_half", early)
-    bad = run()
+    bad = run(pair_score=True)
     assert not np.array_equal(bad[7], one[7]), "a missing score column must change the ids"
 
 

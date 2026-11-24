@@ -41,7 +41,7 @@ outputs for a post-kernel scatter:
 from __future__ import annotations
 
 import functools
-import os
+
 from typing import Any
 
 import jax
@@ -79,13 +79,6 @@ UNION_STATS = (
 UNION_STATS_REQS = 16
 IR_NEW = "qsa_ir_new"
 FP8_MAX = 448.0
-# The layer's table rows are copied before its HC mix and the request loop's first loads
-# (request 0's `xreq_loads`, the owned request's first key chunks) go out before the
-# projection (`QSAFullStepBlock._early`); "0" issues them where they are first needed.
-EARLY_LOADS = os.environ.get("VLLM_TPU_MK_QSA_EARLY_LOADS", "1") != "0"
-# Up to R / 2 requests: each request is scored by a core pair (`me`, `me ^ 1`), one half of
-# its key chunks each; the even core selects (`QSAFullStepBlock._paired`). "0": one core.
-PAIR_SCORE = os.environ.get("VLLM_TPU_MK_QSA_PAIR_SCORE", "1") != "0"
 
 
 def _scoped(name: str, level: int = 2):
@@ -125,7 +118,17 @@ def pick_row(rows: jax.Array, idx: Any) -> jax.Array:
 class QSAFullStepBlock(QSAFullIndexedBlock):
     """Stage B + the step's own tokens (compressed key, recent tile, cache-row
     outputs).
+
+    `early_loads` (VLLM_TPU_MK_QSA_EARLY_LOADS; see `_early`): the layer's table rows are
+    copied before its HC mix and the request loop's first loads go out before the
+    projection. `pair_score` (VLLM_TPU_MK_QSA_PAIR_SCORE; see `_paired`): with at most R / 2
+    request slots a core pair (`me`, `me ^ 1`) scores each request, half its key chunks
+    each, and the even core selects. Both are scheduling only.
     """
+
+    def __init__(self, *, early_loads: bool = False, pair_score: bool = False, **kw: Any):
+        super().__init__(**kw)
+        self.early_loads, self.pair_score = bool(early_loads), bool(pair_score)
 
     @_scoped("qsa_score")
     def _score_request(self, ctx: Any, *a: Any, **k: Any) -> Any:
@@ -291,10 +294,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         return ctx.me // self.dcp if self.compressed_dcp else ctx.me
 
     def _paired(self, ex: ExecSpec) -> bool:
-        """`PAIR_SCORE` applies: the merged exchange of the sharded request loop over the deep
+        """`pair_score` applies: the merged exchange of the sharded request loop over the deep
         key ring, no DCP, and at most one request per core pair (`R / 2` request slots)."""
         return bool(
-            PAIR_SCORE and self.shard_index and self.loop_requests and self.xmerge
+            self.pair_score and self.shard_index and self.loop_requests and self.xmerge
             and self.carrier and self.bounded_chunks and self.key_slots > 2
             and not self.compressed_dcp and self.dcp == 1
             and ex.R % 2 == 0 and ex.MB // ex.T <= ex.R // 2
@@ -1701,10 +1704,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
     _early_now = False
 
     def _early(self) -> bool:
-        """`EARLY_LOADS` applies: HBM tables, the sharded request loop with its loads issued
+        """`early_loads` applies: HBM tables, the sharded request loop with its loads issued
         ahead (`xreq_loads`) and the deep key ring, no compressed-key DCP."""
         return bool(
-            EARLY_LOADS and self.hbm_tables and self.loop_requests and self.xreq_loads
+            self.early_loads and self.hbm_tables and self.loop_requests and self.xreq_loads
             and self.shard_index and self.carrier and self.bounded_chunks
             and self.key_slots > 2 and not self.compressed_dcp
         )
