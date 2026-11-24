@@ -32,7 +32,8 @@ Mechanism (engine-core process only; the scheduler and the block pool live there
 from __future__ import annotations
 
 import os
-from collections import Counter
+from collections import Counter, OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -200,3 +201,136 @@ def select_victims(
         seen.add(key)
         keep.append((key, v.block_id))
     return keep, counts
+
+
+def _trim_ordered(mapping: OrderedDict, limit: int) -> None:
+    while len(mapping) > limit:
+        mapping.popitem(last=False)
+
+
+class SupersededCheckpointTracker:
+    """Tracks single-line turn-``t`` recurrent-state checkpoints superseded by turn ``t+1``.
+
+    When a request resumes from checkpoint boundary ``resumed_tokens`` and
+    completes prefill with a strictly deeper prompt checkpoint boundary
+    ``new_tokens > resumed_tokens``, the previous turn's state-group checkpoint
+    keys are no longer needed for that linear continuation. In victim mode,
+    skipping those keys when HBM evicts them keeps host DRAM checkpoint capacity
+    free for active leaves without dropping any shared branch checkpoints:
+
+    * Only state-group checkpoints (caller passes ``MambaSpec`` keys) are tracked;
+      attention KV blocks are never skipped.
+    * Any checkpoint resumed by ``>= 2`` distinct request IDs (a branch/fork
+      junction) is promoted to ``_shared`` and removed from ``_superseded``, so
+      it is **never** skipped.
+    * Aborted/incomplete requests (``completed_prompt=False``) or turns ending
+      within the same checkpoint block (``new_boundary_tokens <= resumed_tokens``)
+      do **not** supersede their resumed checkpoint.
+    * All internal structures are strictly bounded to ``max_entries`` for O(1)
+      memory over long serving runs.
+    """
+
+    def __init__(self, max_entries: int = 65_536) -> None:
+        if max_entries < 1:
+            raise ValueError(f"max_entries must be >= 1, got {max_entries}")
+        self.max_entries = int(max_entries)
+        # req_id -> (resumed_tokens, tuple of state OffloadKeys at that boundary)
+        self._pending: OrderedDict[str, tuple[int, tuple[Any, ...]]] = OrderedDict()
+        # key -> set-size approximation (1 until a 2nd distinct req marks it shared)
+        self._first_owner: OrderedDict[Any, str] = OrderedDict()
+        # Shared branch/fork junction checkpoints (never superseded).
+        self._shared: OrderedDict[Any, None] = OrderedDict()
+        # Keys ready to skip when HBM evicts them as victims.
+        self._superseded: OrderedDict[Any, None] = OrderedDict()
+        self.marked = 0
+        self.skipped = 0
+        self.shared_protected = 0
+
+    def record_resume(
+        self,
+        req_id: str,
+        resumed_tokens: int,
+        state_keys: Iterable[Any],
+    ) -> None:
+        """Record the checkpoint keys that ``req_id`` resumed from on first lookup."""
+        keys = tuple(dict.fromkeys(state_keys))
+        prev = self._pending.get(req_id)
+        if prev is not None:
+            if prev[0] == resumed_tokens and prev[1] == keys:
+                return
+            # Divergent-hit fallback can re-lookup the same request at a smaller
+            # convergent boundary: undo tentative sole-owner entries for keys the
+            # request no longer resumes from.
+            for old_k in prev[1]:
+                if old_k not in keys and self._first_owner.get(old_k) == req_id:
+                    self._first_owner.pop(old_k, None)
+            del self._pending[req_id]
+        if resumed_tokens <= 0 or not keys:
+            return
+        for k in keys:
+            if k in self._shared:
+                self._shared.move_to_end(k)
+                continue
+            owner = self._first_owner.get(k)
+            if owner is None:
+                self._first_owner[k] = req_id
+                _trim_ordered(self._first_owner, self.max_entries)
+            elif owner != req_id:
+                # Distinct second request resumed from this checkpoint: fork junction!
+                self._first_owner.pop(k, None)
+                self._shared[k] = None
+                _trim_ordered(self._shared, self.max_entries)
+                if k in self._superseded:
+                    del self._superseded[k]
+                    self.shared_protected += 1
+        self._pending[req_id] = (resumed_tokens, keys)
+        _trim_ordered(self._pending, self.max_entries)
+
+    def on_request_finished(
+        self,
+        req_id: str,
+        new_boundary_tokens: int,
+        *,
+        completed_prompt: bool,
+    ) -> list[Any]:
+        """Mark single-owner resumed checkpoint keys superseded if ``req_id`` completed
+        prefill past its resumed checkpoint boundary. Returns newly superseded keys."""
+        entry = self._pending.pop(req_id, None)
+        if entry is None:
+            return []
+        resumed_tokens, keys = entry
+        if not completed_prompt or new_boundary_tokens <= resumed_tokens:
+            return []
+        newly: list[Any] = []
+        for k in keys:
+            if k in self._shared:
+                continue
+            if k not in self._superseded:
+                self._superseded[k] = None
+                self.marked += 1
+                newly.append(k)
+            else:
+                self._superseded.move_to_end(k)
+        _trim_ordered(self._superseded, self.max_entries)
+        return newly
+
+    def is_superseded(self, key: Any) -> bool:
+        return key in self._superseded
+
+    def filter_victims(
+        self, keep: list[tuple[Any, int]]
+    ) -> tuple[list[tuple[Any, int]], int]:
+        """Drop superseded checkpoint victims before host-tier admission."""
+        if not self._superseded or not keep:
+            return keep, 0
+        out: list[tuple[Any, int]] = []
+        skipped = 0
+        for key, block_id in keep:
+            if key in self._superseded:
+                del self._superseded[key]
+                self._first_owner.pop(key, None)
+                skipped += 1
+            else:
+                out.append((key, block_id))
+        self.skipped += skipped
+        return out, skipped

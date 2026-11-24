@@ -361,6 +361,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_TIER_CHECK: bool = False
     VLLM_TPU_OFFLOAD_TIER_EVICT_POLICY: str = ""
     VLLM_TPU_OFFLOAD_TIER_SLRU_PROBATION_FRAC: float = 0.25
+    VLLM_TPU_OFFLOAD_TIER_SKIP_SUPERSEDED: bool = False
     VLLM_TPU_OFFLOAD_FP4: bool = False
     VLLM_TPU_OFFLOAD_FP4_SLOTS: int = 256
     VLLM_TPU_OFFLOAD_FP4_GDN: bool = False
@@ -2478,6 +2479,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Only read when VLLM_TPU_OFFLOAD_TIER_EVICT_POLICY enables SLRU. Host-only.
     "VLLM_TPU_OFFLOAD_TIER_SLRU_PROBATION_FRAC": env_float(
         "VLLM_TPU_OFFLOAD_TIER_SLRU_PROBATION_FRAC", 0.25
+    ),
+    # With QWEN4_EXP_HOST_TIER_POLICY=victim: skip saving superseded turn-t
+    # Mamba/GDN/PLE checkpoints to the host tier when a single-line request
+    # resumed from checkpoint t and completed a strictly deeper prompt
+    # checkpoint t+1. Shared fork/branch checkpoints (resumed by >= 2 distinct
+    # requests) are kept. When SLRU is also active on state classes (slru_all),
+    # superseded checkpoints are demoted from protected to probation.
+    # 100% lossless; default off. Host-only.
+    "VLLM_TPU_OFFLOAD_TIER_SKIP_SUPERSEDED": env_bool(
+        "VLLM_TPU_OFFLOAD_TIER_SKIP_SUPERSEDED", default=False
     ),
     # With the tier classes and the victim policy: the main-KV class keeps FP4 (MXFP4:
     # e2m1 values, one power-of-two scale per 32) on the host instead of the FP8 pool
