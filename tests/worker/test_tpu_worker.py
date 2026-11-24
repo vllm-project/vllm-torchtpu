@@ -355,6 +355,37 @@ def test_reset_encoder_cache_clears_the_runner_caches():
     assert (late._query_cache, late._query_uses, late._doc_query_keys) == ({}, {}, {})
 
 
+def test_reset_mm_cache_clears_the_runner_caches():
+    # WorkerBase.reset_mm_cache finds the runner method by name and skips it
+    # silently when it is missing, so call through the worker.
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.mm_budget = MagicMock()
+    runner.late_interaction_runner = LateInteractionRunner(enable_flash=False)
+    late = runner.late_interaction_runner
+    late._query_cache["query"] = torch.zeros(1)
+    late._query_uses["query"] = 1
+    late._doc_query_keys["doc"] = "query"
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.model_runner = runner
+
+    worker.reset_mm_cache()
+
+    runner.mm_budget.reset_cache.assert_called_once_with()
+    assert (late._query_cache, late._query_uses, late._doc_query_keys) == ({}, {}, {})
+
+
+def test_release_late_interaction_query_cache_reaches_the_runner():
+    # Also found by name in WorkerBase.
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.late_interaction_runner = MagicMock()
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.model_runner = runner
+
+    worker.release_late_interaction_query_cache(["query"])
+
+    runner.late_interaction_runner.release_queries.assert_called_once_with(["query"])
+
+
 def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
     """Build a TPUWorker whose MIN reduce across DP engines returns at most peer."""
     budget = utils.HbmBudget(total_limit=0, total_used=0, cap=0, available=local)

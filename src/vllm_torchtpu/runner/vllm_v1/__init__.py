@@ -15,12 +15,17 @@
 
 vLLM v0.34.0 removes Model Runner V1
 (https://github.com/vllm-project/vllm/pull/63373). TPUModelRunner subclasses
-V1's GPUModelRunner and uses its InputBatch, BlockTable, connector mixins and
-NgramProposer, so this package keeps copies of them from vLLM v0.33.0. The
+V1's GPUModelRunner and uses its InputBatch, BlockTable, EC connector mixin
+and NgramProposer, so this package keeps copies of them from vLLM v0.33.0. The
 layout mirrors upstream's vllm/v1/ so each file diffs cleanly against its
 source.
 
-Only imports differ from upstream, except in worker/gpu_model_runner.py,
-which also drops the GPUModelRunner methods TPUModelRunner never reaches.
-Moving TPUModelRunner onto Model Runner V2 would retire this package.
+Only imports differ from upstream, except in two files. worker/gpu_model_runner.py
+keeps only the GPUModelRunner methods TPUModelRunner reaches (including the
+ones vLLM's WorkerBase looks up by name) and drops the GPU-only drafter,
+sampler, CUDA graph and n-gram GPU code. worker/ec_connector_model_runner_mixin.py
+keeps only maybe_save_ec_to_connector. Rules for edits are in
+docs/developers_guide/coding_guidance.md (R-3.1). Moving TPUModelRunner onto
+Model Runner V2 retires this package:
+https://github.com/vllm-project/vllm-torchtpu/issues/3723
 """

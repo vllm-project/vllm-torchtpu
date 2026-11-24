@@ -1324,8 +1324,6 @@ class TestKVCacheManager:
         mock_input_batch.block_table = mock_block_tables
         self.runner.input_batch = mock_input_batch
 
-        cross_layer_connector = MagicMock()
-        cross_layer_connector.prefer_cross_layer_blocks = True
         with (
             patch(
                 "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape",
@@ -1335,14 +1333,6 @@ class TestKVCacheManager:
             patch(
                 "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
                 return_value=False,
-            ),
-            patch(
-                "vllm_torchtpu.runner.vllm_v1.worker.kv_connector_model_runner_mixin.has_kv_transfer_group",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.runner.vllm_v1.worker.kv_connector_model_runner_mixin.get_kv_transfer_group",
-                return_value=cross_layer_connector,
             ),
             patch("vllm_torchtpu.envs.VLLM_TPU_BLOCK_MAJOR_KV", True),
         ):

@@ -220,7 +220,6 @@ from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     fit_rows,
     handoff_seed_tokens,
-    normalize_draft_config,
 )
 from vllm_torchtpu.structured_decoding import StructuredDecodingManager
 from vllm_torchtpu.tpu_info import get_libtpu_version, get_tpu_library_path
@@ -704,11 +703,8 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
-    # pyrefly: ignore[bad-override-mutable-attribute]
     drafter: NgramProposer | DFlashProposer | Eagle3Proposer | None
-    # pyrefly: ignore[bad-override-mutable-attribute]
     rejection_sampler: RejectionSampler | None
-    # pyrefly: ignore[bad-override-mutable-attribute]
     model: torch.nn.Module
     # pyrefly: ignore[bad-override-mutable-attribute]
     input_ids: torch.Tensor
@@ -815,20 +811,11 @@ class TPUModelRunner(GPUModelRunner):
                     sequence_layout_planner.backend_preinit_world_size,
                     len(layout_devices),
                 )
-        # Disable cudagraphs before parent init so its dispatch self-disables.
-        # TPU uses AOT bucket precompile (_precompile_* methods) instead.
+        # Disable CUDA graphs before parent init, which sizes
+        # cudagraph_batch_sizes from these. TPU uses AOT bucket precompile
+        # (_precompile_* methods) instead.
         vllm_config.compilation_config.cudagraph_capture_sizes = []
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-        # DSpark/DFlash checkpoints may spell the mask token dspark_noise_token_id;
-        # the parent __init__ transiently builds an upstream EagleProposer
-        # that raises unless dflash_config.mask_token_id resolves.
-        if (
-            vllm_config.speculative_config is not None
-            and vllm_config.speculative_config.method in ("dflash", "dspark")
-        ):
-            normalize_draft_config(
-                vllm_config.speculative_config.draft_model_config.hf_config
-            )
         with _torch_tpu_wrapper():
             super().__init__(vllm_config, device)
         self.pcp_manager = pcp_manager
@@ -1151,8 +1138,6 @@ class TPUModelRunner(GPUModelRunner):
         # TPU async-scheduling state (passed between execute_model and
         # sample_tokens, mirroring vLLM's async path).
         self.mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
-        # Narrows the inherited attribute to TPU's own ExecuteModelState.
-        # pyrefly: ignore[bad-override-mutable-attribute]
         self.execute_model_state: ExecuteModelState | None = None
         self._pre_async_results: AsyncPreResults | None = None
         self._min_tokens = min_tokens_mask.MinTokensTracker()
@@ -1432,7 +1417,7 @@ class TPUModelRunner(GPUModelRunner):
         # NOT via finished_sending. Without plumbing this, the
         # OffloadingConnector's complete_store is never called, host-pool
         # blocks stay not-ready (ref_cnt=-1), and prefix-reuse lookups defer
-        # forever -> the engine busy-spins / hangs. Mirrors
+        # forever -> the engine busy-spins / hangs. Mirrors vLLM v0.33.0's
         # KVConnectorModelRunnerMixin._get_kv_connector_output.
         worker_meta = kv_connector.build_connector_worker_meta()
         kv_connector_stats = kv_connector.get_kv_connector_stats()
@@ -1447,7 +1432,7 @@ class TPUModelRunner(GPUModelRunner):
                     break
                 if isinstance(stats, MultiKVConnectorStats):
                     stats_to_visit.extend(stats.data.values())
-        # Mirror KVConnectorModelRunnerMixin._get_kv_connector_output:
+        # Mirror vLLM v0.33.0's KVConnectorModelRunnerMixin._get_kv_connector_output:
         # metadata is bound per-step and must be cleared after use.
         kv_connector.clear_connector_metadata()
         return (
@@ -2961,7 +2946,13 @@ class TPUModelRunner(GPUModelRunner):
         )
         # The base implementation uses an advanced-index assignment which
         # TorchTPU functionalizes into a full raw-storage result. Hide only
-        # the copy field from it; block zeroing and state updates stay intact.
+        # the copy field from it; state updates stay intact. The base never
+        # zeroes `new_block_ids_to_zero` on TPU (`_zero_block_ids` needs a
+        # `_kv_block_zeroer`, which only GPU workers build), and none is
+        # needed: the GDN kernels read a new request's state only when
+        # `has_initial_state = (seq_lens - query_lens) > 0`
+        # (kernels/gdn/v3/metadata.py) and use zeros otherwise
+        # (kernels/gdn/v3/vmem_ldst.py).
         base_output = (
             dataclasses.replace(scheduler_output, kv_cache_block_copies=None)
             if use_page_local_copy or use_dense_copy
@@ -2975,7 +2966,7 @@ class TPUModelRunner(GPUModelRunner):
             self._thinking_budget.update_states(
                 scheduler_output, self.input_batch.req_id_to_index, self.requests
             )
-        # Copy after the base zeroes new blocks (the CoW dst is one of them).
+        # Copy after the base updates request state and block tables.
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
         elif use_dense_copy:
