@@ -637,16 +637,25 @@ class TPUModelRunner(GPUModelRunner):
         included, executed before that step's sampled tokens reach the
         host (the consumer pulls as soon as the first token is out).
 
+        Fences every P/D producer the scheduler may register ahead: with
+        TPU_RAIDEN_STAGE3_REGISTER_AHEAD, and always under pipeline
+        parallelism. The producer role includes a P/D child's under
+        TPUMultiConnector, since that child's scheduler decides from it.
+        Producers that register at the finish keep the fence too: without
+        it, their next KV-cache sync (process_send_load, or an offload save
+        fence) could root the drafter's deferred writes on the KV cache
+        tensors (see sample_tokens). Dropping it needs a measurement first.
+
         Decided from the config, not the live connector: the spec-decode
         warmup hides the connector group yet must trace the fenced programs
         that serving runs."""
-        # tpu_connector imports this module.
-        from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
-            stage3_register_ahead_enabled,
-        )
-
-        return self._is_async_drafter and stage3_register_ahead_enabled(
-            self.vllm_config
+        if not self._is_async_drafter or not dist_utils.is_pd_kv_producer(
+            self.vllm_config.kv_transfer_config
+        ):
+            return False
+        return (
+            self.vllm_config.parallel_config.pipeline_parallel_size > 1
+            or dist_utils.get_stage3_register_ahead_enabled()
         )
 
     def __init__(

@@ -768,38 +768,6 @@ def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
     return dist_utils.get_use_raiden_connector()
 
 
-def stage3_register_ahead_enabled(vllm_config: VllmConfig) -> bool:
-    """Whether a Raiden Stage-3 producer with this config publishes a
-    request's send in the step that completes its prompt.
-
-    Always for a pipeline producer, whose last stage would otherwise
-    register several steps late. By TPU_RAIDEN_STAGE3_REGISTER_AHEAD for
-    PCP, TP and DP producers: their finish-time registration rides the
-    step after the finish response, and under async scheduling that
-    step first waits for the next batch's forward (and, with a drafter,
-    for every KV write) before it registers, so the consumer's load
-    parks on the deferred-submit path for a whole prefill step. GLM,
-    DSv4 and Kimi-K3 producers keep finish-time registration.
-
-    Config- and env-only, so that the model runner, which holds no
-    scheduler-side connector, fences its draft KV writes on the same
-    decision. The Stage-3 transport makes every TPUConnector a Raiden one
-    (_use_raiden_connector)."""
-    transfer_config = vllm_config.kv_transfer_config
-    return (
-        transfer_config is not None
-        and bool(transfer_config.is_kv_producer)
-        and _use_raiden_stage3_transport()
-        and not _use_raiden_glm_admission()
-        and not _use_raiden_dsv4_admission()
-        and not _uses_tp_stage3_source(vllm_config)
-        and (
-            _engine_is_pipeline(vllm_config)
-            or dist_utils.get_stage3_register_ahead_enabled()
-        )
-    )
-
-
 class TPUConnector(KVConnectorBase_V1, SupportsHMA):
     force_raiden_connector = False
 
@@ -1585,8 +1553,27 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
 
     def _stage3_register_ahead_enabled(self) -> bool:
         """Whether this producer publishes a request's Stage-3 send in the
-        step that completes its prompt (see stage3_register_ahead_enabled)."""
-        return stage3_register_ahead_enabled(self.vllm_config)
+        step that completes its prompt.
+
+        Always for a pipeline producer, whose last stage would otherwise
+        register several steps late. By TPU_RAIDEN_STAGE3_REGISTER_AHEAD for
+        PCP, TP and DP producers: their finish-time registration rides the
+        step after the finish response, and under async scheduling that
+        step first waits for the next batch's forward (and, with a drafter,
+        for every KV write) before it registers, so the consumer's load
+        parks on the deferred-submit path for a whole prefill step. GLM,
+        DSv4 and Kimi-K3 producers keep finish-time registration."""
+        return (
+            self.is_producer
+            and _use_raiden_stage3_transport()
+            and not _use_raiden_glm_admission()
+            and not _use_raiden_dsv4_admission()
+            and not _uses_tp_stage3_source(self.vllm_config)
+            and (
+                _engine_is_pipeline(self.vllm_config)
+                or dist_utils.get_stage3_register_ahead_enabled()
+            )
+        )
 
     def on_new_request(self, request: "Request") -> None:
         """Truncates the P-side prompt at admission, ahead of the scheduler's

@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The sampled-token copy of a Stage-3 KV producer with a drafter is fenced
-behind every KV write of the step when the producer registers its blocks
-ahead of the finish, so a consumer that pulls on the first token never
-reads deferred draft KV writes. Producers that register at the finish sync
-the KV caches before registering and are not fenced."""
+"""The sampled-token copy of a P/D KV producer with a drafter is fenced
+behind every KV write of the step wherever the scheduler may register the
+producer's blocks ahead of the finish (TPU_RAIDEN_STAGE3_REGISTER_AHEAD, or
+pipeline parallelism), so a consumer that pulls on the first token never
+reads deferred draft KV writes. The producer role includes a P/D child's
+role under TPUMultiConnector. Producers that register at the finish keep the
+fence as well."""
 
 from types import SimpleNamespace
 
@@ -92,12 +94,28 @@ def stage3_env(monkeypatch):
     return set_envs
 
 
+def _transfer_config(role: str = "kv_producer") -> KVTransferConfig:
+    return KVTransferConfig(kv_connector="TPURaidenConnector", kv_role=role)
+
+
+def _multi_config(parent_role: str, *children: tuple[str, str]) -> KVTransferConfig:
+    """A TPUMultiConnector config; each child is (connector, kv_role)."""
+    return KVTransferConfig(
+        kv_connector="TPUMultiConnector",
+        kv_role=parent_role,
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": name, "kv_role": role} for name, role in children
+            ]
+        },
+    )
+
+
 def _runner(
     *,
-    producer: bool = True,
+    transfer_config: KVTransferConfig | None = None,
     method: str | None = "mtp",
     pp_size: int = 1,
-    architecture: str = "Qwen3NextForCausalLM",
 ) -> TPUModelRunner:
     runner = object.__new__(TPUModelRunner)
     runner.speculative_config = (
@@ -108,9 +126,8 @@ def _runner(
         else None
     )
     runner.vllm_config = SimpleNamespace(
-        kv_transfer_config=SimpleNamespace(is_kv_producer=producer),
+        kv_transfer_config=transfer_config or _transfer_config(),
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
-        model_config=SimpleNamespace(architecture=architecture),
     )
     return runner
 
@@ -121,37 +138,26 @@ def test_fence_applies_to_producers_with_a_device_drafter_only(stage3_env):
     assert _runner(method="dflash")._fence_spec_kv_under_token_copy
     assert not _runner(method="ngram")._fence_spec_kv_under_token_copy
     assert not _runner(method=None)._fence_spec_kv_under_token_copy
-    assert not _runner(producer=False)._fence_spec_kv_under_token_copy
+    consumer = _runner(transfer_config=_transfer_config("kv_consumer"))
+    assert not consumer._fence_spec_kv_under_token_copy
     runner = _runner()
     runner.vllm_config.kv_transfer_config = None
     assert not runner._fence_spec_kv_under_token_copy
 
 
-def test_fence_skips_an_offloading_server(stage3_env):
-    # kv_both counts as a KV producer, but without the Raiden Stage-3
-    # transport nothing registers ahead of the finish.
+def test_fence_keeps_finish_time_producers(stage3_env):
+    # Producers that register at the finish keep the fence: an offloading
+    # kv_both server (no Stage-3 transport) and GLM, DSv4 and Kimi-K3
+    # producers. Dropping it is left to a measured change.
     stage3_env(TPU_KV_RESHARD_TRANSPORT="zmq")
-    runner = _runner()
-    runner.vllm_config.kv_transfer_config = KVTransferConfig(
+    offload = KVTransferConfig(
         kv_connector="TPURaidenOffloadingConnector", kv_role="kv_both"
     )
-    assert runner.vllm_config.kv_transfer_config.is_kv_producer
-    assert not runner._fence_spec_kv_under_token_copy
-
-
-@pytest.mark.parametrize("pp_size", (1, 2))
-def test_fence_skips_glm_producers(stage3_env, pp_size):
+    assert _runner(transfer_config=offload)._fence_spec_kv_under_token_copy
     stage3_env(TPU_USE_RAIDEN_KV_CACHE_MANAGER=True, TPU_RAIDEN_GLM_ADMISSION=True)
-    assert not _runner(pp_size=pp_size)._fence_spec_kv_under_token_copy
-
-
-def test_fence_skips_dsv4_and_kimi_k3_producers(stage3_env):
-    stage3_env(TPU_USE_RAIDEN_KV_CACHE_MANAGER=True, TPU_RAIDEN_DSV4_ADMISSION=True)
-    assert not _runner()._fence_spec_kv_under_token_copy
-    stage3_env(TPU_USE_RAIDEN_KV_CACHE_MANAGER=True, TPU_RAIDEN_KIMIK3_ADMISSION=True)
     assert _runner()._fence_spec_kv_under_token_copy
-    runner = _runner(architecture="KimiK3ForConditionalGeneration")
-    assert not runner._fence_spec_kv_under_token_copy
+    stage3_env(TPU_USE_RAIDEN_KV_CACHE_MANAGER=True, TPU_RAIDEN_DSV4_ADMISSION=True)
+    assert _runner()._fence_spec_kv_under_token_copy
 
 
 def test_fence_follows_the_register_ahead_flag(stage3_env):
@@ -161,6 +167,33 @@ def test_fence_follows_the_register_ahead_flag(stage3_env):
 
 
 def test_fence_applies_to_pipeline_producers_without_the_flag(stage3_env):
-    # A pipeline producer registers ahead whatever the flag says.
+    # A pipeline producer registers ahead whatever the flag says. On this
+    # branch platforms/pp_validation.py rejects speculative decoding with
+    # pipeline parallelism, so such an engine cannot start here; the case
+    # guards the predicate for branches that allow a drafter on a pipeline
+    # producer (main's prefill-only MTP).
     stage3_env(TPU_RAIDEN_STAGE3_REGISTER_AHEAD=False)
     assert _runner(pp_size=2)._fence_spec_kv_under_token_copy
+
+
+def test_fence_follows_a_pd_child_producer_under_a_multi_connector(stage3_env):
+    # vLLM builds each child's KVTransferConfig from its own entry, so a
+    # kv_producer Raiden child registers ahead even under a kv_consumer
+    # parent.
+    child_producer = _multi_config("kv_consumer", ("TPURaidenConnector", "kv_producer"))
+    assert _runner(transfer_config=child_producer)._fence_spec_kv_under_token_copy
+    # A kv_both parent was fenced before; it still is.
+    parent_both = _multi_config("kv_both", ("TPURaidenConnector", "kv_consumer"))
+    assert _runner(transfer_config=parent_both)._fence_spec_kv_under_token_copy
+
+
+def test_offload_child_alone_adds_no_fence(stage3_env):
+    # An offload tier child does not send to a P/D peer: a decode engine
+    # (kv_consumer parent and Raiden child) with a kv_both offload tier stays
+    # unfenced.
+    decode = _multi_config(
+        "kv_consumer",
+        ("TPURaidenConnector", "kv_consumer"),
+        ("TPURaidenOffloadingConnector", "kv_both"),
+    )
+    assert not _runner(transfer_config=decode)._fence_spec_kv_under_token_copy

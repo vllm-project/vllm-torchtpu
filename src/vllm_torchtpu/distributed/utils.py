@@ -1,7 +1,12 @@
+from typing import TYPE_CHECKING
+
 from vllm.utils.network_utils import get_ip
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.config import KVTransferConfig
 
 logger = init_logger(__name__)
 
@@ -112,6 +117,32 @@ def get_stage3_register_ahead_enabled() -> bool:
     next batch's forward (default on). Pipeline producers always register
     ahead."""
     return bool(envs.TPU_RAIDEN_STAGE3_REGISTER_AHEAD)
+
+
+# The connectors that send a request's KV blocks to a P/D peer.
+_PD_CONNECTORS = ("TPURaidenConnector", "TPUConnector")
+
+
+def is_pd_kv_producer(kv_transfer_config: "KVTransferConfig | None") -> bool:
+    """Whether this engine sends KV to a P/D peer: by its own role, or under
+    TPUMultiConnector by the role in a P/D child's entry. vLLM's
+    MultiConnector builds each child's KVTransferConfig from its own entry,
+    so the child's scheduler decides from that role, whatever the parent's
+    role says."""
+    if kv_transfer_config is None:
+        return False
+    if kv_transfer_config.is_kv_producer:
+        return True
+    if kv_transfer_config.kv_connector != "TPUMultiConnector":
+        return False
+    children = (kv_transfer_config.kv_connector_extra_config or {}).get(
+        "connectors"
+    ) or []
+    return any(
+        child.get("kv_connector") in _PD_CONNECTORS
+        and child.get("kv_role") in ("kv_producer", "kv_both")
+        for child in children
+    )
 
 
 def get_stage3_deferred_submit_enabled() -> bool:
