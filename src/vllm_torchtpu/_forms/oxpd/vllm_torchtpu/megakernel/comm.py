@@ -24,7 +24,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from .ops import BF16, F32, rnd
-from .vmem import CommParams
+from .vmem import AR2D_TILE_ROWS, CommParams, ar2d_row_dims
 
 
 class AllReduceRing:
@@ -125,16 +125,23 @@ class AllReduceRing:
             d.wait_recv()
 
     def _allreduce_ar2d(self, slot, val):
-        """E7 2D-torus AR2D all-reduce (`HIER=4`, R=8, AR_C%512==0, AR_R%64==0).
+        """E7 2D-torus AR2D all-reduce (`HIER=4`, R=8, AR_C%512==0).
 
         Matches `fused_moe_decode_kernel.py:_ar2d_exchange`: 2x less inter-chip
-        ICI traffic than `HIER=2` (0.75 vs 1.50 * MR * H BF16), 100% 1-hop torus
-        links (`me^2` / `me^4`, zero diagonal `me^6`), and 35% less VMEM.
+        ICI traffic than `HIER=2` (0.75 vs 1.50 * MR * H BF16 when AR_R%64==0),
+        100% 1-hop torus links (`me^2` / `me^4`, zero diagonal `me^6`).
+        When `ar2d_any16` is enabled (`AR_R >= 32, AR_R % 16 == 0`), odd halves /
+        quarters are zero-padded to whole bf16 tiles (`AR2D_TILE_ROWS=16`). When
+        `AR2D_SINGLE_SLOT` is enabled, uses slot 0 (synchronous drains ensure
+        happens-before safety across consecutive exchanges).
         """
         cp, scr, me, sc = self.cp, self.scr, self.me, self.sc
         AR_R, AR_C = cp.AR_R, cp.AR_C
         half, part = AR_C // 2, AR_C // 4
-        rh, rq = AR_R // 2, AR_R // 4
+        rh, ar_r_p, rq, rh_p = ar2d_row_dims(AR_R)
+        pad_r = ar_r_p > AR_R
+        pad_q = rh_p > rh
+        s = 0 if cp.AR2D_SINGLE_SLOT else slot
         c = lax.rem(me, 2)
         yb = lax.rem(me // 2, 2)
         xb = me // 4
@@ -147,36 +154,46 @@ class AllReduceRing:
             return pltpu.make_async_remote_copy(
                 src_ref=src,
                 dst_ref=dst,
-                send_sem=scr["ar_ssem"].at[stream_i, slot, 0],
-                recv_sem=scr["ar_rsem"].at[stream_i, slot, 0],
+                send_sem=scr["ar_ssem"].at[stream_i, s, 0],
+                recv_sem=scr["ar_rsem"].at[stream_i, s, 0],
                 device_id=(peer,),
                 device_id_type=pl.DeviceIdType.MESH,
             )
 
         def rows(bit, n: int):
-            return pl.ds(pl.multiple_of(bit * n, 16), n)
+            return pl.ds(pl.multiple_of(bit * n, AR2D_TILE_ROWS), n)
 
         with sc("ar_pack"):
-            send[slot, 0] = jnp.where(c == 0, val[:, half:], val[:, :half]).astype(BF16)
+            mate_half = jnp.where(c == 0, val[:, half:], val[:, :half]).astype(BF16)
+            if pad_r:
+                send[s, 0, :AR_R] = mate_half
+            else:
+                send[s, 0] = mate_half
             own_half = jnp.where(c == 0, val[:, :half], val[:, half:])
         with sc("ar_comm"):
-            d_s1 = copy(send.at[slot, 0], recv.at[slot], 0, me ^ 1)
+            s1_src = send.at[s, 0, pl.ds(0, AR_R)] if pad_r else send.at[s, 0]
+            d_s1 = copy(s1_src, recv.at[s], 0, me ^ 1)
             d_s1.start()
             d_s1.wait_recv()
         with sc("ar_sum"):
-            v_a = own_half + recv[slot].astype(F32)
-            send[slot, 1] = v_a.astype(BF16)
+            v_a = own_half + recv[s].astype(F32)
+            v_a_p = (
+                jnp.pad(v_a, ((0, ar_r_p - AR_R), (0, 0))) if pad_r else v_a
+            )
+            send[s, 1] = v_a_p.astype(BF16)
         with sc("ar_comm"):
+            s2_d0 = s2_send.at[s, 0, pl.ds(0, rh)] if pad_q else s2_send.at[s, 0]
+            s2_d1 = s2_send.at[s, 1, pl.ds(0, rh)] if pad_q else s2_send.at[s, 1]
             d_r1 = [
                 copy(
-                    send.at[slot, 1, rows(1 - xb, rh), pl.ds(0, part)],
-                    s2_send.at[slot, 0],
+                    send.at[s, 1, rows(1 - xb, rh), pl.ds(0, part)],
+                    s2_d0,
                     1,
                     me ^ 4,
                 ),
                 copy(
-                    send.at[slot, 1, rows(1 - yb, rh), pl.ds(part, part)],
-                    s2_send.at[slot, 1],
+                    send.at[s, 1, rows(1 - yb, rh), pl.ds(part, part)],
+                    s2_d1,
                     2,
                     me ^ 2,
                 ),
@@ -186,27 +203,31 @@ class AllReduceRing:
             for d in d_r1:
                 d.wait_recv()
         with sc("ar_sum"):
+            r1_0 = s2_send[s, 0, :rh] if pad_q else s2_send[s, 0]
+            r1_1 = s2_send[s, 1, :rh] if pad_q else s2_send[s, 1]
             v_b0 = (
-                jnp.where(xb == 0, v_a[:rh, :part], v_a[rh:, :part])
-                + s2_send[slot, 0].astype(F32)
+                jnp.where(xb == 0, v_a_p[:rh, :part], v_a_p[rh:, :part])
+                + r1_0.astype(F32)
             )
             v_b1 = (
-                jnp.where(yb == 0, v_a[:rh, part:], v_a[rh:, part:])
-                + s2_send[slot, 1].astype(F32)
+                jnp.where(yb == 0, v_a_p[:rh, part:], v_a_p[rh:, part:])
+                + r1_1.astype(F32)
             )
-            s2_send[slot, 2] = v_b0.astype(BF16)
-            s2_send[slot, 3] = v_b1.astype(BF16)
+            v_b0_p = jnp.pad(v_b0, ((0, rh_p - rh), (0, 0))) if pad_q else v_b0
+            v_b1_p = jnp.pad(v_b1, ((0, rh_p - rh), (0, 0))) if pad_q else v_b1
+            s2_send[s, 2] = v_b0_p.astype(BF16)
+            s2_send[s, 3] = v_b1_p.astype(BF16)
         with sc("ar_comm"):
             d_r2 = [
                 copy(
-                    s2_send.at[slot, 2, rows(1 - yb, rq)],
-                    s2_recv.at[slot, 0],
+                    s2_send.at[s, 2, rows(1 - yb, rq)],
+                    s2_recv.at[s, 0],
                     3,
                     me ^ 2,
                 ),
                 copy(
-                    s2_send.at[slot, 3, rows(1 - xb, rq)],
-                    s2_recv.at[slot, 1],
+                    s2_send.at[s, 3, rows(1 - xb, rq)],
+                    s2_recv.at[s, 1],
                     4,
                     me ^ 4,
                 ),
@@ -217,24 +238,24 @@ class AllReduceRing:
                 d.wait_recv()
         with sc("ar_sum"):
             c0 = (
-                jnp.where(yb == 0, v_b0[:rq], v_b0[rq:]) + s2_recv[slot, 0].astype(F32)
+                jnp.where(yb == 0, v_b0_p[:rq], v_b0_p[rq:]) + s2_recv[s, 0].astype(F32)
             ).astype(BF16)
             c1 = (
-                jnp.where(xb == 0, v_b1[:rq], v_b1[rq:]) + s2_recv[slot, 1].astype(F32)
+                jnp.where(xb == 0, v_b1_p[:rq], v_b1_p[rq:]) + s2_recv[s, 1].astype(F32)
             ).astype(BF16)
-            ar2d_bf[slot, 0, rows(yb, rq)] = c0
-            ar2d_bf[slot, 1, rows(xb, rq)] = c1
+            ar2d_bf[s, 0, rows(yb, rq)] = c0
+            ar2d_bf[s, 1, rows(xb, rq)] = c1
         with sc("ar_comm"):
             d_r3 = [
                 copy(
-                    ar2d_bf.at[slot, 0, rows(yb, rq)],
-                    ar2d_bf.at[slot, 0, rows(yb, rq)],
+                    ar2d_bf.at[s, 0, rows(yb, rq)],
+                    ar2d_bf.at[s, 0, rows(yb, rq)],
                     5,
                     me ^ 2,
                 ),
                 copy(
-                    ar2d_bf.at[slot, 1, rows(xb, rq)],
-                    ar2d_bf.at[slot, 1, rows(xb, rq)],
+                    ar2d_bf.at[s, 1, rows(xb, rq)],
+                    ar2d_bf.at[s, 1, rows(xb, rq)],
                     6,
                     me ^ 4,
                 ),
@@ -243,34 +264,41 @@ class AllReduceRing:
                 d.start()
             for d in d_r3:
                 d.wait_recv()
+            r4_s0 = ar2d_bf.at[s, 0, pl.ds(0, rh)] if pad_q else ar2d_bf.at[s, 0]
+            r4_s1 = ar2d_bf.at[s, 1, pl.ds(0, rh)] if pad_q else ar2d_bf.at[s, 1]
             d_r4 = [
                 copy(
-                    ar2d_bf.at[slot, 0],
-                    ag_send.at[slot, rows(xb, rh), pl.ds(0, part)],
+                    r4_s0,
+                    ag_send.at[s, rows(xb, rh), pl.ds(0, part)],
                     7,
                     me ^ 4,
                 ),
                 copy(
-                    ar2d_bf.at[slot, 1],
-                    ag_send.at[slot, rows(yb, rh), pl.ds(part, part)],
+                    r4_s1,
+                    ag_send.at[s, rows(yb, rh), pl.ds(part, part)],
                     8,
                     me ^ 2,
                 ),
             ]
             for d in d_r4:
                 d.start()
-            ag_send[slot, rows(xb, rh), pl.ds(0, part)] = ar2d_bf[slot, 0]
-            ag_send[slot, rows(yb, rh), pl.ds(part, part)] = ar2d_bf[slot, 1]
+            ag_send[s, rows(xb, rh), pl.ds(0, part)] = (
+                ar2d_bf[s, 0, :rh] if pad_q else ar2d_bf[s, 0]
+            )
+            ag_send[s, rows(yb, rh), pl.ds(part, part)] = (
+                ar2d_bf[s, 1, :rh] if pad_q else ar2d_bf[s, 1]
+            )
             for d in d_r4:
                 d.wait_recv()
-            d_s3 = copy(ag_send.at[slot], ag_recv.at[slot, c], 9, me ^ 1)
+            s3_src = ag_send.at[s, pl.ds(0, AR_R)] if pad_r else ag_send.at[s]
+            d_s3 = copy(s3_src, ag_recv.at[s, c], 9, me ^ 1)
             d_s3.start()
-            ag_recv[slot, c] = ag_send[slot]
+            ag_recv[s, c] = ag_send[s, :AR_R] if pad_r else ag_send[s]
             d_s3.wait_recv()
             for d in (d_s1, *d_r1, *d_r2, *d_r3, *d_r4, d_s3):
                 d.wait_send()
         with sc("ar_sum"):
-            return jnp.concatenate([ag_recv[slot, 0], ag_recv[slot, 1]], axis=-1).astype(
+            return jnp.concatenate([ag_recv[s, 0], ag_recv[s, 1]], axis=-1).astype(
                 F32
             )
 

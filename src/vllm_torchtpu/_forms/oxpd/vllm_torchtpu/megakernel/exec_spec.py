@@ -77,6 +77,10 @@ class Tiles:
     dense_acc_pair: bool = False  # Unrolled / paired dense matmul accumulation
     dmm_unroll: int = 0  # Max tiles to fully unroll in dmatmul (0: never)
     rel_fetch: bool = False  # Trace-time-decoded dense refills (fetch_rel/flush_rel)
+    # Generalize HIER=4 AR2D from MR%64==0 to MR>=32 and MR%16==0.
+    ar2d_any16: bool = False
+    # Single-slot scratch/semaphores for synchronous HIER=4 AR2D.
+    ar2d_single_slot: bool = False
     # Per-block tunables (registered `Tunables` instances keyed by block name).
     blocks: Mapping[str, Any] = TunablesMap()
 
@@ -140,6 +144,8 @@ TILE_NUMERICS: dict[str, NumericsClass] = {
     "dense_acc_pair": "approx",  # paired dense accumulation
     "dmm_unroll": "approx",  # unrolled dense matmul accumulation
     "rel_fetch": "exact",  # trace-time-decoded dense refills (scheduling)
+    "ar2d_any16": "approx",  # selects HIER=4 AR2D for MR>=32, MR%16==0 (MR%64!=0)
+    "ar2d_single_slot": "exact",  # 1-slot buffer reuse for synchronous HIER=4 AR2D
 }
 
 

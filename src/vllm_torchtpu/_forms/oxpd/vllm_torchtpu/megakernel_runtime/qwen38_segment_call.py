@@ -87,7 +87,13 @@ def moe_e7_hier(B: int, default_hier: int) -> int:
     ar2d_on = bool(envs.VLLM_TPU_MK_MOE_E7 or envs.VLLM_TPU_MK_MOE_AR2D)
     exact_on = bool(envs.VLLM_TPU_MK_MOE_E7 or envs.VLLM_TPU_MK_MOE_EXACT_WIDTH)
     min_tok = int(envs.VLLM_TPU_MK_MOE_AR2D_MIN_TOKENS)
-    if ar2d_on and min_tok > 0 and B >= min_tok and rup(B, 8) % 64 == 0:
+    mr = rup(B, 8)
+    ar2d_rows_ok = (
+        (mr >= 32 and mr % 16 == 0)
+        if envs.VLLM_TPU_MK_MOE_AR2D_ANY16
+        else (mr % 64 == 0)
+    )
+    if ar2d_on and min_tok > 0 and B >= min_tok and ar2d_rows_ok:
         return 4
     if exact_on:
         return 5
@@ -115,9 +121,15 @@ def segment_tiles(
             "exact_width": exact_width,
         }
     }
-    return Tiles(ebank=2 << 20, nbe=nbe, nbd=nbd, vmem_mib=62, hier=h).with_blocks(
-        blocks
-    )
+    return Tiles(
+        ebank=2 << 20,
+        nbe=nbe,
+        nbd=nbd,
+        vmem_mib=62,
+        hier=h,
+        ar2d_any16=bool(envs.VLLM_TPU_MK_MOE_AR2D_ANY16),
+        ar2d_single_slot=bool(envs.VLLM_TPU_MK_AR2D_SINGLE_SLOT),
+    ).with_blocks(blocks)
 
 
 # Per GDN layer: state ids, slot read offsets, ckpt ids, query start loc, seq lens

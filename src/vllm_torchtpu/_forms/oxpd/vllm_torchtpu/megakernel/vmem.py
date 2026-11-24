@@ -140,6 +140,17 @@ class CommParams:
     AR_ROUNDS: tuple[int, ...]
     AR_PEERS: int
     N_HIER3: int = 3
+    AR2D_SINGLE_SLOT: bool = False
+
+
+AR2D_TILE_ROWS: int = 16  # bf16 packed tile height required by Mosaic TPU v7x DMA
+
+
+def ar2d_row_dims(ar_r: int) -> tuple[int, int, int, int]:
+    """Return `(rh, ar_r_p, rq, rh_p)` row-split sizes aligned to `AR2D_TILE_ROWS`."""
+    rh = rup((ar_r + 1) // 2, AR2D_TILE_ROWS)
+    rq = rup((rh + 1) // 2, AR2D_TILE_ROWS)
+    return rh, 2 * rh, rq, 2 * rq
 
 
 @dataclass(frozen=True)
@@ -261,10 +272,18 @@ def build_scratch(
         AR_R, AR_C = min(AR_R, 8), 128 * max(R, 2)
         if HIER in (4, 5):
             HIER = 0
+    ar2d_any16 = bool(tiles.ar2d_any16)
+    ar2d_single_slot = bool(tiles.ar2d_single_slot)
     if HIER == 4:
-        # E7 2D-torus AR2D: R=8, AR_C%512==0 (part=AR_C/4 multiple of 128), AR_R%64==0.
-        if not (R == 8 and AR_C % 512 == 0 and AR_R % 64 == 0):
+        # E7 2D-torus AR2D: R=8, AR_C%512==0 (part=AR_C/4 multiple of 128).
+        ar2d_rows_ok = (
+            (AR_R >= 32 and AR_R % 16 == 0) if ar2d_any16 else (AR_R % 64 == 0)
+        )
+        if not (R == 8 and AR_C % 512 == 0 and ar2d_rows_ok):
             HIER = 2 if (R == 8 and (AR_C // 2) % 128 == 0) else 0
+    ar2d_single = HIER == 4 and ar2d_single_slot
+    ar2d_slots = 1 if ar2d_single else 2
+    _, ar2d_arp, _, _ = ar2d_row_dims(AR_R) if HIER == 4 else (0, AR_R, 0, 0)
     if HIER == 5:
         # E7 exact-width 2-round RS+AG: uneven 128-lane tile ownership, zero padding.
         if not (R >= 2 and AR_C % 128 == 0 and AR_C // 128 >= R):
@@ -323,8 +342,10 @@ def build_scratch(
         "send": pltpu.VMEM(
             (N_HIER3, 2, AR_R, AR_C)
             if HIER == 3
+            else (ar2d_slots, 2, ar2d_arp, HC2)
+            if HIER == 4
             else (2, 2, AR_R, HC2)
-            if HIER in (2, 4)
+            if HIER == 2
             else (2, AR_R, AR_C)
             if HIER == 5
             else (2, R, AR_R, CW)
@@ -335,7 +356,7 @@ def build_scratch(
         "recv": pltpu.VMEM(
             (N_HIER3, 2, 2, AR_R, AR_C)
             if HIER == 3
-            else (2, AR_R, HC2)
+            else (ar2d_slots, AR_R, HC2)
             if HIER == 4
             else (2, R, AR_R, CW)
             if HIER == 5
@@ -348,8 +369,8 @@ def build_scratch(
             else (2, R, AR_R, AR_C),
             BF16,
         ),
-        "ar_ssem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), 2, AR_PEERS)),
-        "ar_rsem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), 2, AR_PEERS)),
+        "ar_ssem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), ar2d_slots, AR_PEERS)),
+        "ar_rsem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), ar2d_slots, AR_PEERS)),
         "fn": pltpu.VMEM((1, H), F32),
         "fn_sem": pltpu.SemaphoreType.DMA(()),
     }
@@ -364,12 +385,12 @@ def build_scratch(
         scratch["ag_recv"] = pltpu.VMEM((2, AR_R, AR_C), BF16)
     elif HIER == 4:
         part = AR_C // 4
-        rh, rq = AR_R // 2, AR_R // 4
-        scratch["ag_send"] = pltpu.VMEM((2, AR_R, HC2), BF16)
-        scratch["ag_recv"] = pltpu.VMEM((2, 2, AR_R, HC2), BF16)
-        scratch["s2_send"] = pltpu.VMEM((2, 4, rh, part), BF16)
-        scratch["s2_recv"] = pltpu.VMEM((2, 2, rq, part), BF16)
-        scratch["ar2d_bf"] = pltpu.VMEM((2, 2, rh, part), BF16)
+        rh, ar_r_p, rq, rh_p = ar2d_row_dims(AR_R)
+        scratch["ag_send"] = pltpu.VMEM((ar2d_slots, ar_r_p, HC2), BF16)
+        scratch["ag_recv"] = pltpu.VMEM((ar2d_slots, 2, AR_R, HC2), BF16)
+        scratch["s2_send"] = pltpu.VMEM((ar2d_slots, 4, rh_p, part), BF16)
+        scratch["s2_recv"] = pltpu.VMEM((ar2d_slots, 2, rq, part), BF16)
+        scratch["ar2d_bf"] = pltpu.VMEM((ar2d_slots, 2, rh_p, part), BF16)
     elif HIER == 1:
         scratch["ag_send"] = pltpu.VMEM((2, AR_R, AR_C), BF16)
         scratch["ag_recv"] = pltpu.VMEM((2, 4, AR_R, AR_C), BF16)
@@ -508,6 +529,7 @@ def build_scratch(
         AR_ROUNDS=AR_ROUNDS,
         AR_PEERS=AR_PEERS,
         N_HIER3=N_HIER3,
+        AR2D_SINGLE_SLOT=ar2d_single,
     )
     core_plan = CorePlan(
         plan=p,

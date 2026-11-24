@@ -137,6 +137,15 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     hier = os.environ.get("VLLM_TPU_MK_HIER", "")
     if hier:
         t = dataclasses.replace(t, hier=int(hier))
+    # VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE: 128+ rows under main-KV DCP-2 drop one more
+    # expert ring slot (2 MiB) unless AR2D single-slot already saves that margin.
+    if (
+        envs.VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE
+        and main_kv_dcp() > 1
+        and B >= 128
+        and not (t.hier == 4 and t.ar2d_single_slot)
+    ):
+        t = dataclasses.replace(t, nbe=max(2, t.nbe - 1))
     # VLLM_TPU_MK_ROW_BUCKET: each expert's e13 / e2 on its gathered routed rows (PIPE_EP;
     # bitwise vs the dense loop, aligned [8, 128] tile loads). No-op up to 16 rows.
     if envs.VLLM_TPU_MK_ROW_BUCKET:
@@ -145,12 +154,75 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     # from 8 rows up.
     if envs.VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC and B >= 8:
         t = t.with_blocks({"moe": {"dedup_vec": True}})
+    t = _vmem_cuts(t, B)
     # VLLM_TPU_MK_RINGS=nbe:nbd (bench sweeps): override the ring depths.
     rings = os.environ.get("VLLM_TPU_MK_RINGS", "") or _ring_s1(B)  # q38 L1-IDX RING-S1 (per bucket, S1 on)
     if rings:
         nbe, nbd = (int(x) for x in rings.split(":"))
         t = dataclasses.replace(t, nbe=nbe, nbd=nbd)
     return t if not _gdnink_rel_fetch(B) else dataclasses.replace(t, rel_fetch=True)  # q38 L1-GDNINK (GDN-REL-FETCH), same line
+
+
+_SUPPORTED_VMEM_CUTS = frozenset({"vmem64", "ring"})
+
+
+def _vmem_cuts(t: Tiles, B: int) -> Tiles:
+    """Apply opt-in `VLLM_TPU_MK_VMEM_CUTS` for `B >= VLLM_TPU_MK_VMEM_CUT_ROWS`.
+
+    Supports `vmem64` (scoped limit 62 -> 64 MiB) and `ring` (`VMEM_CUT_RINGS`
+    / `VMEM_CUT_RINGS_AR2D_SS`). Unported core-cut tokens (`io`, `chunk`, `acc`,
+    `lean`) raise `ValueError` rather than silently enabling oversized ring depths.
+    `VLLM_TPU_MK_RINGS` and `VLLM_TPU_MK_RING_S1` still override after this helper.
+    """
+    raw = str(envs.VLLM_TPU_MK_VMEM_CUTS or "")
+    cuts = {x.strip() for x in raw.split(",") if x.strip()}
+    unknown = sorted(cuts - _SUPPORTED_VMEM_CUTS)
+    if unknown:
+        raise ValueError(
+            f"VLLM_TPU_MK_VMEM_CUTS={raw!r} contains unsupported tokens {unknown}; "
+            f"supported in oxpd: {sorted(_SUPPORTED_VMEM_CUTS)}"
+        )
+    if not cuts or B < int(envs.VLLM_TPU_MK_VMEM_CUT_ROWS):
+        return t
+    upd: dict[str, Any] = {}
+    if "vmem64" in cuts:
+        upd["vmem_mib"] = 64
+    if "ring" in cuts and not (main_kv_dcp() > 1 and B <= 32):
+        # Keep deeper AR2D_SS rings gated off under main_kv_dcp > 1: with dcp=2,
+        # B=96 (12,3) and B=128 (9,3) exceed scoped VMEM, while B=128 (6,3) fits.
+        if (
+            t.hier == 4
+            and t.ar2d_single_slot
+            and main_kv_dcp() <= 1
+            and B in VMEM_CUT_RINGS_AR2D_SS
+        ):
+            upd["nbe"], upd["nbd"] = VMEM_CUT_RINGS_AR2D_SS[B]
+        elif B in VMEM_CUT_RINGS:
+            upd["nbe"], upd["nbd"] = VMEM_CUT_RINGS[B]
+    return dataclasses.replace(t, **upd) if upd else t
+
+
+# (expert, dense) ring slots per bucket under opt-in `ring` cut (`VLLM_TPU_MK_VMEM_CUTS`).
+# Note: in `oxpd`, verify scoped VMEM headroom before setting `ring` at large `B` when
+# `io`/`chunk`/`acc`/`lean` cuts are not present (see also `VLLM_TPU_MK_RING_S1`).
+VMEM_CUT_RINGS: dict[int, tuple[int, int]] = {
+    24: (12, 8),
+    32: (12, 7),
+    48: (12, 4),
+    64: (12, 4),
+    80: (12, 3),
+    96: (9, 3),
+    128: (6, 3),
+}
+
+# Opt-in extra ring depths unlocked ONLY when `hier == 4` (AR2D_ANY16) AND
+# `VLLM_TPU_MK_AR2D_SINGLE_SLOT=1` and `main_kv_dcp() <= 1`.
+VMEM_CUT_RINGS_AR2D_SS: dict[int, tuple[int, int]] = {
+    64: (12, 5),
+    80: (12, 4),
+    96: (12, 3),
+    128: (9, 3),
+}
 
 
 def _wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
