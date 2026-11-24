@@ -119,7 +119,7 @@ def _get_pallas_mesh_fn() -> Any:
     if jax.default_backend() != "tpu":
         return None
     try:
-        from torch_tpu._internal.pallas import get_pallas_mesh
+        from torch.tpu.pallas import get_pallas_mesh
     except ImportError:
         return None
     return get_pallas_mesh
