@@ -72,6 +72,7 @@ from vllm_torchtpu.core.runner_slot_mamba import (
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kv_cache_materializer import (
+    DeviceKVCacheAllocator,
     build_kernel_block_size_by_group_id,
     can_share_attention_cache,
     format_kv_cache_layout_summary,
@@ -95,7 +96,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
-from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -1370,11 +1370,13 @@ class KVCacheManager:
         block_major = unified_block_major_enabled(self.runner.vllm_config)
         if block_major:
             self._check_block_major_pool_supported()
+        # Every cache is zero-filled on the device and flushed once, below.
+        allocator = DeviceKVCacheAllocator(self.runner.device)
         materialized = materialize_kv_cache_tensors(
             kv_cache_config=kv_cache_config,
             attn_groups=self.runner.attn_groups,
             kernel_block_sizes=kernel_block_sizes,
-            device=self.runner.device,
+            allocator=allocator,
             cache_dtype=self.runner.kv_cache_dtype,
             block_major=block_major,
         )
@@ -1399,14 +1401,32 @@ class KVCacheManager:
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
+        # For hybrid models with spec decoding on the unified pool, keep a
+        # per-block device buffer of mamba read offsets (num_accepted - 1
+        # from each request's last verify step), indexed by manager block
+        # id. The GDN kernel reads a request's initial state from checkpoint
+        # `offset` of its state block, which is how rejected draft tokens
+        # are rolled back (by selecting the checkpoint of the last accepted
+        # token, never by copying state). The offsets follow the state
+        # block through the align-mode seed copies (see
+        # `_collect_mamba_state_seed_copies`).
+        if (
+            self.runner._unified_kv_layout
+            and kv_cache_config.has_mamba_layers
+            and self.runner.speculative_config is not None
+        ):
+            self.runner.mamba_slot_read_offsets = allocator.allocate(
+                (kv_cache_config.num_blocks,), torch.int32
+            )
+
         if self.runner._unified_kv_layout:
-            # Flush the pool zero-fill before any compiled execution. PJRT
+            # Flush the zero fill of every array above (pools or direct attention
+            # caches, and the mamba read offsets) before any compiled execution. PJRT
             # only donates quiescent buffers: a pending write at enqueue time
             # makes every donated pool parameter fall back to a fresh
             # pool-sized output copy (a 2x-pool transient that OOMs at high
             # gpu_memory_utilization).
-            if self.runner.kv_cache_raw_tensors:
-                synchronize_tensors(self.runner.kv_cache_raw_tensors)
+            allocator.synchronize()
             # Same rule for the seed-copy program: compile it while the pools
             # are quiescent, before any dummy forward leaves writes pending.
             self.runner._precompile_mamba_state_seed_copies()
@@ -1437,24 +1457,6 @@ class KVCacheManager:
                 kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
             if hasattr(kv_connector, "register_runner"):
                 kv_connector.register_runner(self.runner)
-
-        # For hybrid models with spec decoding on the unified pool, keep a
-        # per-block device buffer of mamba read offsets (num_accepted - 1
-        # from each request's last verify step), indexed by manager block
-        # id. The GDN kernel reads a request's initial state from checkpoint
-        # `offset` of its state block, which is how rejected draft tokens
-        # are rolled back (by selecting the checkpoint of the last accepted
-        # token, never by copying state). The offsets follow the state
-        # block through the align-mode seed copies (see
-        # `_collect_mamba_state_seed_copies`).
-        if (
-            self.runner._unified_kv_layout
-            and kv_cache_config.has_mamba_layers
-            and self.runner.speculative_config is not None
-        ):
-            self.runner.mamba_slot_read_offsets = torch.zeros(
-                kv_cache_config.num_blocks, dtype=torch.int32
-            ).to(self.runner.device)
 
         if not self.runner.enforce_eager:
             self.runner._precompile_substitute_placeholder_token()
@@ -1672,6 +1674,10 @@ class KVCacheManager:
             for module in self.runner.vllm_config.compilation_config.static_forward_context.values()  # noqa: E501
         )
 
+        # Every array below is zero-filled on the device and flushed once,
+        # after the allocation loop.
+        allocator = DeviceKVCacheAllocator(self.runner.device)
+
         # ---- Block-major KV Cache Initialization (VLLM_TPU_BLOCK_MAJOR_KV) ----
         # Bundles all attention layer fragments into a single contiguous array in HBM:
         #   [num_blocks, num_layers, page_size, K2/p, p, head_dim]
@@ -1756,15 +1762,13 @@ class KVCacheManager:
             )[1:]
             page_bytes = math.prod(page_shape) * sample_spec.dtype.itemsize
             indices = block_major_layer_indices(kv_cache_config, page_bytes)
-            bundle = torch.zeros(
+            bundle = allocator.allocate(
                 (kv_cache_config.num_blocks, len(set(indices.values())), *page_shape),
-                dtype=sample_spec.dtype,
-                device=self.runner.device,
+                sample_spec.dtype,
             )
             # Kernels donate the full bundle; views serve metadata and DMA
             # registration, retaining the native descriptor's byte offsets.
             self.runner._kv_cache_bundle = bundle
-            synchronize_tensors(bundle, wait=True)
             for name, index in indices.items():
                 self.runner._kv_cache_bundle_layer_index[name] = index
                 bundle_view_by_name[name] = bundle[:, index]
@@ -1776,7 +1780,11 @@ class KVCacheManager:
 
         if _is_ds_v4:
             self.ds_v4._initialize_ds_v4_kv_cache(
-                kv_cache_config, _per_layer_spec, kv_caches, kv_cache_config.num_blocks
+                kv_cache_config,
+                _per_layer_spec,
+                kv_caches,
+                kv_cache_config.num_blocks,
+                allocator,
             )
 
         # Pure-attention HMA groups overlay native placement regions. The
@@ -1790,9 +1798,6 @@ class KVCacheManager:
                 tuple[torch.Tensor, ...],
             ],
         ] = {}
-        # Caches allocated on the device below (shared attention regions, then
-        # per-layer attention and mamba caches), flushed after the loop.
-        device_caches: list[torch.Tensor] = []
 
         def allocate_attention_region(
             region: tuple[int, int],
@@ -1818,13 +1823,9 @@ class KVCacheManager:
                     f"budget: region={region}, allocated={allocated_bytes}, "
                     f"required={required_bytes}, budget={budget}"
                 )
-            # Allocate on the device: a host tensor staged through `.to()` costs
-            # about twice the cache size in host RAM per worker.
             caches = tuple(
-                torch.zeros(shape, dtype=dtype, device=self.runner.device)
-                for shape, dtype in geometry
+                allocator.allocate(shape, dtype) for shape, dtype in geometry
             )
-            device_caches.extend(caches)
             if native_caches is not None:
                 native_caches[key] = caches
             return caches
@@ -1871,9 +1872,8 @@ class KVCacheManager:
                     num_blocks=kv_cache_config.num_blocks,
                     kernel_block_size=kernel_block_size,
                     attn_backend=backend_cls,
-                    device=self.runner.device,
+                    allocator=allocator,
                 )
-            device_caches.extend(shared_attention_caches.values())
 
         for kv_cache_tensor in [] if _is_ds_v4 else kv_cache_config.kv_cache_tensors:
             # Each descriptor names layers within the whole backing allocation;
@@ -1903,12 +1903,7 @@ class KVCacheManager:
                         zip(kv_cache_spec.shapes, kv_cache_spec.dtypes)
                     ):
                         cache_shape = (mamba_num_blocks, *shape)
-                        mamba_states.append(
-                            torch.zeros(
-                                cache_shape, dtype=dtype, device=self.runner.device
-                            )
-                        )
-                    device_caches.extend(mamba_states)
+                        mamba_states.append(allocator.allocate(cache_shape, dtype))
                     kv_caches[layer_name] = tuple(mamba_states)
                 elif isinstance(kv_cache_spec, MLAAttentionSpec):
                     attn_module = self.runner.vllm_config.compilation_config.static_forward_context.get(  # noqa: E501
@@ -1993,11 +1988,30 @@ class KVCacheManager:
                 else:
                     raise NotImplementedError
 
-        # torch_tpu defers a device zero-fill until first use. Flush these caches
-        # so the precompile below sees them in HBM, as the unified path flushes
-        # its pool (where PJRT donates only buffers with no pending write).
-        if device_caches:
-            synchronize_tensors(device_caches)
+        # Compact pool counterpart of the read-offset buffer allocated in
+        # `_initialize_unified_kv_cache`, indexed over the mamba slot pool
+        # rather than the unified pool's blocks: here checkpoint `offset` of a
+        # request is the slot `base_slot + offset`.
+        if (
+            allocated_mamba_num_blocks is not None
+            and self.runner.speculative_config is not None
+        ):
+            if self.runner._uniform_mamba_layout:
+                raise NotImplementedError(
+                    "Speculative decoding with mamba layers requires the "
+                    "compact mamba slot layout (unsupported with "
+                    "kv_transfer_config / uniform mamba layout)."
+                )
+            self.runner.mamba_slot_read_offsets = allocator.allocate(
+                (allocated_mamba_num_blocks,), torch.int32
+            )
+
+        # torch_tpu defers a device zero-fill until first use. Flush every array
+        # allocated above (the block-major bundle, the DeepSeek-V4 arrays and
+        # the mamba read offsets included) so the precompile below sees them in
+        # HBM, as the unified path flushes its pool (where PJRT donates only
+        # buffers with no pending write).
+        allocator.synchronize()
 
         self._add_shared_kv_cache_aliases(kv_caches)
 
@@ -2085,24 +2099,6 @@ class KVCacheManager:
             self.runner._init_mamba_slot_pool(allocated_mamba_num_blocks)
             owns_mamba_slots = True
         check_runner_slot_groups(kv_cache_config, runner_owns_slots=owns_mamba_slots)
-
-        # Compact pool counterpart of the read-offset buffer allocated in
-        # `initialize_kv_cache`, indexed over the mamba slot pool rather
-        # than the unified pool's blocks: here checkpoint `offset` of a
-        # request is the slot `base_slot + offset`.
-        if (
-            allocated_mamba_num_blocks is not None
-            and self.runner.speculative_config is not None
-        ):
-            if self.runner._uniform_mamba_layout:
-                raise NotImplementedError(
-                    "Speculative decoding with mamba layers requires the "
-                    "compact mamba slot layout (unsupported with "
-                    "kv_transfer_config / uniform mamba layout)."
-                )
-            self.runner.mamba_slot_read_offsets = torch.zeros(
-                allocated_mamba_num_blocks, dtype=torch.int32
-            ).to(self.runner.device)
 
         static_ctx = self.runner.vllm_config.compilation_config.static_forward_context
         for layer_name, (_, split) in attn_subpage_layout.items():

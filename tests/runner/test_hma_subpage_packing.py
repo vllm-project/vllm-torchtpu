@@ -60,6 +60,7 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
 from vllm_torchtpu.kv_cache_materializer import (
+    DeviceKVCacheAllocator,
     can_share_attention_cache,
     materialize_shared_attention_cache,
 )
@@ -476,7 +477,7 @@ def test_shared_cache_materializer_rejects_non_multiple_block_sizes():
             num_blocks=4,
             kernel_block_size=256,
             attn_backend=BACKEND,
-            device=torch.device("cpu"),
+            allocator=DeviceKVCacheAllocator(torch.device("cpu")),
         )
 
 
@@ -502,7 +503,7 @@ def test_shared_pool_uses_the_kernel_block_size_not_the_region_minimum():
         num_blocks=4,
         kernel_block_size=256,
         attn_backend=BACKEND,
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
     )
     assert pool.shape[:2] == (4, 256)
     assert pool.numel() * pool.element_size() == 4 * page_bytes
@@ -611,7 +612,7 @@ def test_each_subpage_writes_its_own_half_of_the_pool_block(
         num_blocks=4,
         kernel_block_size=256,
         attn_backend=BACKEND,
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
     )
     assert tuple(pool_torch.shape) == (4, 256, 2, 2048)
 
@@ -725,7 +726,7 @@ def _initialize_kv_cache(
     shared_kv_cache_layers: dict[str, str] | None = None,
 ) -> SimpleNamespace:
     monkeypatch.setattr(
-        "vllm_torchtpu.runner.kv_cache_manager.synchronize_tensors",
+        "vllm_torchtpu.kv_cache_materializer.synchronize_tensors",
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
@@ -979,7 +980,7 @@ def test_batched_rpa_on_shared_packed_pool_matches_separate_caches_and_ref(
         num_blocks=num_blocks,
         kernel_block_size=kernel_block_size,
         attn_backend=BACKEND,
-        device=torch.device("cpu"),
+        allocator=DeviceKVCacheAllocator(torch.device("cpu")),
     )
     shared_pool = jnp.zeros(tuple(pool_torch.shape), dtype=jnp.bfloat16)
 
