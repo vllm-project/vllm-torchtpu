@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -24,7 +25,9 @@ import torch
 from vllm_omni.diffusion.diffusion_engine import DiffusionExecutionMode
 from vllm_omni.diffusion.sched import StepScheduler
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import OutputMessage
+from vllm_omni.engine.orchestrator import OrchestratorBase
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -47,14 +50,6 @@ def _pil_to_tensor(image: Any) -> torch.Tensor:
     return torch.from_numpy(np.asarray(image, dtype=np.float32) / 255.0)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "Co-batched step execution of 2 Qwen-Image requests on TPU returns a black "
-        "image (relative L2 1.0 against the monolithic run of the same requests)."
-    ),
-)
 def test_diffusion_step_execution_and_continuous_batching(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -97,8 +92,29 @@ def test_diffusion_step_execution_and_continuous_batching(
 
     monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", _spy_execute_stepwise)
 
+    orchestrators: list[OrchestratorBase] = []
+    orig_create_orchestrator = AsyncOmniEngine._create_orchestrator
+
+    def _spy_create_orchestrator(
+        self_engine: AsyncOmniEngine,
+        **orchestrator_kwargs: Any,
+    ) -> OrchestratorBase:
+        orchestrator = orig_create_orchestrator(self_engine, **orchestrator_kwargs)
+        orchestrators.append(orchestrator)
+        return orchestrator
+
+    monkeypatch.setattr(
+        AsyncOmniEngine,
+        "_create_orchestrator",
+        _spy_create_orchestrator,
+    )
+
     omni_step = Omni(model=model_dir, step_execution=True, max_num_seqs=2)
     try:
+        assert len(orchestrators) == 1, (
+            f"Expected 1 orchestrator, observed {len(orchestrators)}"
+        )
+        orchestrator = orchestrators[0]
         engine = omni_step.engine.stage_clients[0]._engine
         assert engine.execution_mode == DiffusionExecutionMode.STEP_BATCH, (
             f"Expected STEP_BATCH mode, got {engine.execution_mode}"
@@ -132,7 +148,12 @@ def test_diffusion_step_execution_and_continuous_batching(
                 scheduler_output.scheduled_request_ids
             ):
                 abort_triggered = True
-                omni_step.abort("req_abort")
+                asyncio.run(
+                    omni_step.engine.abort_async(
+                        ["req_abort"],
+                        timeout=ABORT_CLEANUP_TIMEOUT_S,
+                    )
+                )
             return result
 
         monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", _abort_spy)
@@ -166,18 +187,11 @@ def test_diffusion_step_execution_and_continuous_batching(
 
         assert abort_triggered, "Mid-generation abort was never triggered"
         assert not abort_output_seen, "Aborted request unexpectedly produced output"
-        abort_deadline = time.monotonic() + ABORT_CLEANUP_TIMEOUT_S
-        while (
-            "req_abort" in omni_step.engine.request_states
-            or engine.scheduler.get_request_state("req_abort") is not None
-        ) and time.monotonic() < abort_deadline:
-            time.sleep(0.05)
-        assert "req_abort" not in omni_step.engine.request_states, (
-            f"Aborted request still in orchestrator request_states after "
-            f"{ABORT_CLEANUP_TIMEOUT_S}s"
+        assert "req_abort" not in orchestrator.request_states, (
+            "Aborted request still in orchestrator request_states after abort"
         )
         assert engine.scheduler.get_request_state("req_abort") is None, (
-            f"Aborted request still in StepScheduler after {ABORT_CLEANUP_TIMEOUT_S}s"
+            "Aborted request still in StepScheduler after abort"
         )
         assert keep_output is not None, (
             "Surviving peer request produced engine_outputs=None after peer abort"

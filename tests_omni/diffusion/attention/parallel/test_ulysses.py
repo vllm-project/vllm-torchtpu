@@ -147,14 +147,6 @@ IMAGE_ONLY_CASES = [
             joint_len=0,
         ),
         id="mask_sp_padding",
-        marks=pytest.mark.xfail(
-            strict=True,
-            raises=AssertionError,
-            reason=(
-                "2D SP key padding mask falls back to TpuSDPAImpl broadcast mask "
-                "which produces NaNs in bf16 on torch_tpu"
-            ),
-        ),
     ),
 ]
 
