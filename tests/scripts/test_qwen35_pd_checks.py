@@ -162,3 +162,189 @@ def test_cli_leg_check_exit_codes(tmp_path, capsys):
         )
         == 2
     )
+
+
+def _serve(monkeypatch, bodies: dict[str, str], completions: list[dict] | None = None):
+    """Route the checks' HTTP calls to canned /metrics bodies and completions."""
+
+    def get(url: str, timeout: float = 30) -> str:
+        if url not in bodies:
+            raise OSError(f"no route to {url}")
+        return bodies[url]
+
+    sent = list(completions or [])
+
+    def post(url: str, body: dict, timeout: float = 1800) -> dict:
+        if not sent:
+            raise OSError("proxy refused")
+        return sent.pop(0)
+
+    monkeypatch.setattr(checks, "_get", get)
+    monkeypatch.setattr(checks, "_post", post)
+
+
+_DECODE = ["http://d:7200/metrics", "http://d:7201/metrics"]
+
+
+def _spec(drafts: float, tokens: float, accepted: float) -> str:
+    return _metrics(
+        spec_decode_num_drafts_total=drafts,
+        spec_decode_num_draft_tokens_total=tokens,
+        spec_decode_num_accepted_tokens_total=accepted,
+    )
+
+
+@pytest.mark.parametrize(
+    "accepted,rc", [(2250, 0), (1980, 0), (1950, 1), (1500, 1)], ids=str
+)
+def test_cmd_mtp_holds_the_rate_floor(monkeypatch, accepted, rc):
+    # 2 servers x 1000 drafts x 3 tokens; floor 0.66 = 3960 of 6000 accepted.
+    _serve(monkeypatch, {u: _spec(1000, 3000, accepted) for u in _DECODE})
+    assert checks.main(["mtp", "--metrics", *_DECODE, "--min-rate", "0.66"]) == rc
+
+
+def test_cmd_mtp_fails_without_drafts_and_cannot_measure_a_dead_server(monkeypatch):
+    _serve(monkeypatch, {u: _metrics() for u in _DECODE})
+    assert checks.main(["mtp", "--metrics", *_DECODE, "--min-rate", "0.66"]) == 1
+    _serve(monkeypatch, {_DECODE[0]: _spec(1000, 3000, 2250)})
+    assert checks.main(["mtp", "--metrics", *_DECODE, "--min-rate", "0.66"]) == 2
+
+
+def _sources(transfer: float, compute: float, hit: float) -> str:
+    return _metrics(
+        prompt_tokens_by_source_total__external_kv_transfer=transfer,
+        prompt_tokens_by_source_total__local_compute=compute,
+        prompt_tokens_by_source_total__local_cache_hit=hit,
+    )
+
+
+@pytest.mark.parametrize(
+    "transfer,compute,rc",
+    [(9000, 100, 0), (9000, 500, 0), (9000, 600, 1), (0, 100, 1)],
+    ids=str,
+)
+def test_cmd_transfer_needs_a_transfer_and_bounds_decode_compute(
+    monkeypatch, transfer, compute, rc
+):
+    # Per server: 9000 transferred + 500 reused; 5% of 10000 is 500.
+    _serve(monkeypatch, {u: _sources(transfer, compute, 500) for u in _DECODE})
+    args = ["transfer", "--decode-metrics", *_DECODE, "--max-compute-pct", "5"]
+    assert checks.main(args) == rc
+
+
+def test_cmd_transfer_cannot_measure_without_the_counters(monkeypatch):
+    _serve(monkeypatch, {u: _metrics() for u in _DECODE})
+    args = ["transfer", "--decode-metrics", *_DECODE, "--max-compute-pct", "5"]
+    assert checks.main(args) == 2
+
+
+_PREFILL = "http://p:8000/metrics"
+
+
+def _completion(cached: int) -> dict:
+    return {
+        "choices": [{"text": " 4242"}],
+        "usage": {
+            "prompt_tokens": 8000,
+            "prompt_tokens_details": {"cached_tokens": cached},
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "decode_hit,prefill_hit,last_cached,rc",
+    [
+        (7680, 6912, 7680, 0),
+        (0, 6912, 7680, 1),  # decode never reused its own prefix cache
+        (7680, 0, 7680, 1),  # prefill never hit its cache
+        (7680, 6912, 0, 1),  # the repeat reported no cached tokens
+    ],
+    ids=["good", "no_decode_hit", "no_prefill_hit", "no_cached_tokens"],
+)
+def test_cmd_prefix_hit_needs_both_legs_to_reuse_the_prefix(
+    monkeypatch, decode_hit, prefill_hit, last_cached, rc
+):
+    bodies = {u: _sources(9000, 10, decode_hit / 2) for u in _DECODE}
+    bodies[_PREFILL] = _metrics(prefix_cache_hits_total=prefill_hit)
+    _serve(
+        monkeypatch, bodies, [_completion(0), _completion(0), _completion(last_cached)]
+    )
+    args = ["prefix-hit", "--proxy", "http://x:8100", "--model", "m", "--repeats", "3"]
+    args += ["--prefill-metrics", _PREFILL, "--decode-metrics", *_DECODE]
+    assert checks.main(args) == rc
+
+
+def test_cmd_prefix_hit_fails_on_a_refused_request(monkeypatch):
+    _serve(monkeypatch, {}, [_completion(0)])
+    args = ["prefix-hit", "--proxy", "http://x:8100", "--model", "m", "--repeats", "2"]
+    args += ["--prefill-metrics", _PREFILL, "--decode-metrics", *_DECODE]
+    assert checks.main(args) == 1
+
+
+_GSM8K = "gsm8k"
+_STRICT = "exact_match,strict-match"
+
+
+def _eval_dir(tmp_path, *, result=True, effective=1319, row="PASS"):
+    out = tmp_path / "eval"
+    (out / "model").mkdir(parents=True)
+    if result:
+        body = {
+            "results": {
+                _GSM8K: {_STRICT: 0.97, "exact_match_stderr,strict-match": 0.004}
+            },
+            "n-samples": {_GSM8K: {"original": 1319, "effective": effective}},
+        }
+        (out / "model" / "results_2026.json").write_text(json.dumps(body))
+    if row:
+        (out / f"eval_check_{_GSM8K}.md").write_text(
+            f"| `{_GSM8K}` | {_STRICT} | 0.9700 | 0.9700 | 0.0057 | 0.0200 "
+            f"| +0.0000 | {row} |\n"
+        )
+    return out
+
+
+_MEASURED = {_GSM8K: {_STRICT: 0.97}}
+_PENDING = {"_pending": "not measured yet"}
+
+
+@pytest.mark.parametrize(
+    "kwargs,log,baseline,reason",
+    [
+        ({}, "", _MEASURED, None),
+        ({"row": "FAIL"}, "", _MEASURED, None),  # a regression is the gate's verdict
+        ({"row": None}, "", _PENDING, None),  # pending: no gated row to print
+        ({"result": False}, "", _MEASURED, "lm-eval wrote no result"),
+        ({"effective": 100}, "", _MEASURED, "ran 100 of its 1319 samples"),
+        (
+            {},
+            "WARNING API request failed, retrying\n",
+            _MEASURED,
+            "1 lm-eval request(s) failed",
+        ),
+        (
+            {"row": None},
+            "",
+            _MEASURED,
+            "the gate printed no exact_match,strict-match row",
+        ),
+    ],
+    ids=[
+        "ran",
+        "ran_regressed",
+        "pending",
+        "no_result",
+        "partial",
+        "retried",
+        "no_row",
+    ],
+)
+def test_eval_failures_needs_a_whole_split_with_no_failed_request(
+    tmp_path, kwargs, log, baseline, reason
+):
+    out = _eval_dir(tmp_path, **kwargs)
+    failures = checks.eval_failures(str(out), _GSM8K, _STRICT, log, baseline)
+    if reason is None:
+        assert failures == []
+    else:
+        assert any(reason in f for f in failures), failures

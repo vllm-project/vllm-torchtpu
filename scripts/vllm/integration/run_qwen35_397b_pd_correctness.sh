@@ -26,9 +26,13 @@
 # Stage 2  prefix_hit   qwen35_pd_checks.py prefix-hit
 #   One ~8k-token prompt, sent once more than decode has API servers: decode
 #   serves the repeat from its own prefix cache, prefill hits its own.
-# Stage 3  gsm8k        run_eval_flow.sh with the config's PD_EVAL_FLOW_ARGS
-#   The whole GSM8K test split through the proxy, against the config's
-#   baseline (a missing or pending baseline fails).
+# Stage 3  gsm8k        run_eval_flow.sh --run-lm-eval, the config's
+#                       PD_EVAL_FLOW_ARGS, then qwen35_pd_checks.py eval-ran
+#   The config's LM_EVAL_TASKS (GSM8K) through the proxy against its
+#   baselines; a missing or pending baseline fails unless EVAL_SOFT_FAIL=1.
+#   The stage also fails when lm-eval wrote no result, ran less than the
+#   whole split, logged a failed request, or (baseline measured) the gate
+#   printed no row.
 # Stage 4  transfer     qwen35_pd_checks.py transfer
 #   Over the whole run, decode received prompt KV from prefill and computed
 #   at most PD_MAX_DECODE_COMPUTE_PCT percent of its prompt tokens itself.
@@ -36,7 +40,9 @@
 #   Decode's MTP acceptance rate is at least PD_MIN_MTP_ACCEPTANCE_RATE.
 # Stage 6  legs         qwen35_pd_checks.py leg-check
 #   Every worker of both legs ran the PD_KERNEL_PAGE_TOKENS kernel page, and
-#   neither leg logged a Raiden layout-fingerprint mismatch.
+#   neither leg logged a Raiden layout-fingerprint mismatch. Waits
+#   LEG_STATUS_SETTLE_S (15 s) first: the engine pods refresh their status
+#   every 10 s.
 #
 # Exit status: 0 every stage passed, 1 a stage failed or could not measure, 2
 # no stage was run.
@@ -78,7 +84,7 @@ config_values="$(
   # shellcheck source=/dev/null
   source "scripts/vllm/benchmarking/configs/${CONFIG}.sh" >&2 || exit 1
   printf '%s\n' "${MODEL}" "${PD_KERNEL_PAGE_TOKENS}" "${PD_MIN_MTP_ACCEPTANCE_RATE}" \
-    "${PD_MAX_DECODE_COMPUTE_PCT}" "${PD_EVAL_FLOW_ARGS[*]}"
+    "${PD_MAX_DECODE_COMPUTE_PCT}" "${PD_EVAL_FLOW_ARGS[*]}" "${LM_EVAL_TASKS}"
 )" || { echo "ERROR: ${CONFIG} did not load" >&2; exit 2; }
 {
   read -r MODEL
@@ -86,7 +92,11 @@ config_values="$(
   read -r MIN_MTP_RATE
   read -r MAX_DECODE_COMPUTE_PCT
   read -r -a EVAL_FLOW_ARGS
+  read -r -a EVAL_TASKS
 } <<<"${config_values}"
+EVAL_DIR="${LOG_DIR}/eval"
+# The metric the gate reads for every task here (lm-eval gsm8k's regex filter).
+EVAL_METRIC="exact_match,strict-match"
 
 read -r -a decode_servers <<<"${DECODE_URLS}"
 decode_metrics=()
@@ -107,8 +117,28 @@ stage() {
 }
 
 # shellcheck disable=SC2317  # run through stage
+eval_stage() {
+  local rc=0 task flow_log="${LOG_DIR}/eval_flow.log"
+  # --run-lm-eval here, not from the config: without it run_eval_flow.sh runs
+  # nothing and exits 0. run_benchmarks.sh sources the config to read the
+  # model and the eval settings, and the config wants a role.
+  PD_ROLE=prefill bash scripts/vllm/benchmarking/run_eval_flow.sh \
+    --config "${CONFIG}" --run-lm-eval "${EVAL_FLOW_ARGS[@]}" --skip-benchmark \
+    --skip-db-upload --results-dir "${EVAL_DIR}" --host "${PROXY_HOST}" --port "${PROXY_PORT}" \
+    2>&1 | tee "${flow_log}"
+  rc="${PIPESTATUS[0]}"
+  for task in "${EVAL_TASKS[@]}"; do
+    "${checks[@]}" eval-ran --results-dir "${EVAL_DIR}" --task "${task}" \
+      --metric "${EVAL_METRIC}" --flow-log "${flow_log}" \
+      --baseline "scripts/vllm/benchmarking/baselines/eval/${CONFIG}.${task}.baseline.json" || rc=1
+  done
+  return "${rc}"
+}
+
+# shellcheck disable=SC2317  # run through stage
 leg_checks() {
   local rc=0 status
+  sleep "${LEG_STATUS_SETTLE_S:-15}"
   for status in ${PREFILL_LEG_STATUS}; do
     "${checks[@]}" leg-check --status "${status}" --name prefill --page "${KERNEL_PAGE}" || rc=1
   done
@@ -123,11 +153,7 @@ stage completions python3 .buildkite/kubernetes/check_completions.py \
 stage prefix_hit "${checks[@]}" prefix-hit --proxy "${proxy}" --model "${MODEL}" \
   --repeats "$((${#decode_servers[@]} + 1))" \
   --prefill-metrics "${PREFILL_URL}/metrics" --decode-metrics "${decode_metrics[@]}"
-# run_benchmarks.sh sources the config to read the model and the eval
-# settings, and the config wants a role.
-stage gsm8k env PD_ROLE=prefill bash scripts/vllm/benchmarking/run_eval_flow.sh \
-  --config "${CONFIG}" "${EVAL_FLOW_ARGS[@]}" --skip-benchmark --skip-db-upload \
-  --host "${PROXY_HOST}" --port "${PROXY_PORT}"
+stage gsm8k eval_stage
 stage transfer "${checks[@]}" transfer --decode-metrics "${decode_metrics[@]}" \
   --max-compute-pct "${MAX_DECODE_COMPUTE_PCT}"
 stage mtp "${checks[@]}" mtp --metrics "${decode_metrics[@]}" --min-rate "${MIN_MTP_RATE}"

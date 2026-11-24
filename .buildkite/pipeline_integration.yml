@@ -324,14 +324,16 @@ steps:
       # (8 chips): boot, the kernel page and Raiden layout of both legs, a
       # transfer and prefix-cache hit, MTP acceptance and the whole GSM8K split
       # against the recipe's baseline. Nightly only, as the DSv4 pair above: a
-      # cold boot of this checkpoint compiles for over an hour. soft_fail while
-      # the label says its baselines are pending (check_regression.py refuses a
-      # pending baseline, so GSM8K cannot pass until one is measured);
+      # cold boot of this checkpoint compiles for over an hour. EVAL_SOFT_FAIL
+      # while the label says its baselines are pending: check_regression.py
+      # refuses a pending baseline, so the GSM8K verdict warns until one is
+      # measured, and every other check still decides the step.
       # tests/models/qwen3_5/test_qwen3_5_recipe.py holds the two together.
       - label: "Integration: Nightly qwen35-397b-pd-1p1d-correctness (baselines pending)"
         key: "integration_nightly_qwen35_397b_pd_1p1d_correctness"
         if: 'build.env("NIGHTLY") == "1"'
-        soft_fail: true
+        env:
+          EVAL_SOFT_FAIL: "1"
         <<: *integration_step
         plugins:
           - *kube_plugin

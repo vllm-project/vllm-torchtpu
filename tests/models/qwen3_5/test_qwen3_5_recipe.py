@@ -20,7 +20,8 @@ through the per-pod launcher's dry run and compare the serve arguments, the
 --additional-config sections and the environment with the entries, allowing
 only the variables listed here with the reason each is not in the entries.
 They also hold the CI wiring to the recipe: every gated eval has a baseline
-file, a pending baseline is visible on the CI step, and the manifest asks for
+file, a pending baseline is visible on the CI step (which then lets only the
+eval verdict warn), and the manifest asks for
 the chips the instantiation serves.
 """
 
@@ -31,6 +32,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import shlex
 import subprocess
 import sys
@@ -103,9 +105,18 @@ RECIPE_ONLY: dict[str, Any] = {
     "VLLM_TARGET_DEVICE": "tpu",
     "VLLM_DP_MASTER_IP": {"prefill": "127.0.0.1", "decode": None},
     "OMP_NUM_THREADS": "8",
+    "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    "VLLM_LOGGING_LEVEL": "INFO",
+    "TPU_PREMAPPED_BUFFER_SIZE": "17179869184",
+    # An envs.py variable (default zmq) the entries leave to the deployment
+    # with the Raiden ports: their generator classed it as per-pod wiring.
+    "TPU_KV_RESHARD_TRANSPORT": "raiden",
     # A departure: CI boots both legs from a cold compile cache.
     "VLLM_ENGINE_READY_TIMEOUT_S": "7200",
 }
+# RECIPE_ONLY names that are envs.py variables all the same, with the reason
+# the entries do not carry them.
+PACKAGE_VARIABLES_LEFT_TO_THE_DEPLOYMENT = {"TPU_KV_RESHARD_TRANSPORT"}
 
 # Per pod, so the entries do not record them: the one-host pod shape, the
 # Raiden ports and identities, and the address this pod advertises.
@@ -124,12 +135,8 @@ WIRING: dict[str, Any] = {
     "TPU_PROCESS_ADDRESSES": "",
     "TPU_PROCESS_PORT": "",
     "TPU_WORKER_HOSTNAMES": "",
-    "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-    "VLLM_LOGGING_LEVEL": "INFO",
-    "TPU_KV_RESHARD_TRANSPORT": "raiden",
     "TPU_KV_TRANSFER_PORT": "9100",
     "TPU_SIDE_CHANNEL_PORT": "9600",
-    "TPU_PREMAPPED_BUFFER_SIZE": "17179869184",
     "TPU_KV_TRANSFER_NAMESPACE": {"prefill": "prefill", "decode": "decode"},
     "TPU_RAIDEN_ENGINE_ID": {"prefill": "prefill-engine", "decode": "decode-engine"},
     "TPU_RAIDEN_RESHARD_PORT_BASE": {"prefill": "27000", "decode": "28000"},
@@ -267,21 +274,30 @@ def _expected_leg(layout: str, tradeoffs: str, role: str):
     return positional, flags, sections, env
 
 
+# (config, role, layout, trade-off arm, parameters passed): the recipe with
+# each parameter value, and each CI instantiation as the nightly serves it,
+# with nothing passed, against the gate entry and arm it claims.
 LEGS = [
-    (role, layout, tradeoffs)
+    (RECIPE, role, layout, tradeoffs, True)
     for layout in GATES
     for tradeoffs in ARMS
+    for role in ("prefill", "decode")
+] + [
+    ("qwen3.5-397b-fp8-pd-1p1d", role, "dp4tp2", "on", False)
     for role in ("prefill", "decode")
 ]
 
 
 @pytest.mark.parametrize(
-    "role,layout,tradeoffs", LEGS, ids=["-".join(leg) for leg in LEGS]
+    "config,role,layout,tradeoffs,pass_params",
+    LEGS,
+    ids=[f"{c}-{r}-{lay}-{t}" for c, r, lay, t, _ in LEGS],
 )
-def test_recipe_renders_the_gate_entries_legs(role, layout, tradeoffs, tmp_path):
-    rendered = _render(
-        role, tmp_path=tmp_path, PD_DECODE_LAYOUT=layout, PD_TRADEOFFS=tradeoffs
-    )
+def test_recipe_renders_the_gate_entries_legs(
+    config, role, layout, tradeoffs, pass_params, tmp_path
+):
+    params = {"PD_DECODE_LAYOUT": layout, "PD_TRADEOFFS": tradeoffs}
+    rendered = _render(role, config, tmp_path, **(params if pass_params else {}))
     positional, flags = _flags(rendered["serve_args"])
     sections = flags.pop("--additional-config")
     exp_positional, exp_flags, exp_sections, exp_env = _expected_leg(
@@ -334,7 +350,8 @@ def test_recipe_only_variables_are_not_package_variables_and_are_documented():
     text = (CONFIGS / f"{RECIPE}.sh").read_text()
     header = text[: text.index("\nPD_ROLE=")]
     for name in RECIPE_ONLY:
-        assert name not in envs.environment_variables, name
+        declared = name in envs.environment_variables
+        assert declared == (name in PACKAGE_VARIABLES_LEFT_TO_THE_DEPLOYMENT), name
         assert name in header, f"{name} is not in the config's header"
 
 
@@ -405,8 +422,22 @@ def test_gated_evals_have_baselines_and_pending_ones_show_on_the_step(config, ma
         "PD_EVAL_FLOW_ARGS",
         "LM_EVAL_GEN_KWARGS",
         "PD_DECODE_LAYOUT",
+        "EXTRA_LM_EVAL_MODEL_ARGS",
     )
     flow_args = values["PD_EVAL_FLOW_ARGS"].split()
+    # One attempt per request: the proxy does not retry, so a failed hop must
+    # fail its request rather than be resent by the client (last key wins).
+    model_args = dict(
+        a.split("=", 1) for a in values["EXTRA_LM_EVAL_MODEL_ARGS"].split(",")
+    )
+    assert model_args["max_retries"] == "1"
+    # The stages ask for lm-eval themselves; the config cannot turn it off.
+    stages = (
+        REPO / "scripts" / "vllm" / "integration" / "run_qwen35_397b_pd_correctness.sh"
+    ).read_text()
+    assert re.search(
+        r"run_eval_flow\.sh \\\n\s+--config \"\$\{CONFIG\}\" --run-lm-eval ", stages
+    )
     # The gate's whole split, and no silently skipped baseline.
     assert flow_args[flow_args.index("--lm-eval-limit") + 1] == "none"
     assert "--require-baselines" in flow_args
@@ -450,13 +481,14 @@ def test_gated_evals_have_baselines_and_pending_ones_show_on_the_step(config, ma
             assert check_regression.primary_stderr(body[task], metric.name) is not None
 
     step = _pipeline_step(manifest)
+    # Never the whole step: boot, page, transfer and MTP stay hard.
+    assert "soft_fail" not in step
     if pending:
-        assert step.get("soft_fail") is True, (
-            f"pending baselines {pending}; step must soft_fail"
+        assert step.get("env", {}).get("EVAL_SOFT_FAIL") == "1", (
+            f"pending baselines {pending}: the step must set EVAL_SOFT_FAIL=1"
         )
         assert "(baselines pending)" in step["label"]
     else:
-        assert "soft_fail" not in step, "every baseline is measured; drop soft_fail"
         assert "pending" not in step["label"]
 
 

@@ -166,13 +166,20 @@ write_status() {
     --log "$serve_log" --out "$run_dir/status/leg_status.json" >/dev/null
 }
 write_status
+# Every 10 s; the correctness stages wait longer than that before they read it.
 (while kill -0 "$serve_pid" 2>/dev/null; do sleep 10; write_status; done) &
 python3 -m http.server "$STATUS_PORT" --bind 0.0.0.0 --directory "$run_dir/status" \
   >/dev/null 2>&1 &
+status_pid=$!
 
+# A decode engine that dies ends this pod with its exit code, which fails the
+# role's Job (backoffLimit 0) and so the JobSet: the prefill head does not wait
+# it out.
 if [[ "$role" == decode || "$INDEX" != "0" ]]; then
-  wait "$serve_pid"
-  exit $?
+  serve_rc=0
+  wait "$serve_pid" || serve_rc=$?
+  kill "$status_pid" 2>/dev/null || true
+  exit "$serve_rc"
 fi
 
 proxy_pid=""
@@ -181,6 +188,7 @@ cleanup() {
   if [[ -n "$proxy_pid" ]]; then
     kill "$proxy_pid" 2>/dev/null || true
   fi
+  kill "$status_pid" 2>/dev/null || true
   kill "$serve_pid" 2>/dev/null || true
   wait "$serve_pid" 2>/dev/null || true
 }
@@ -232,10 +240,11 @@ env "${correctness_env[@]}" bash scripts/vllm/integration/run_qwen35_397b_pd_cor
 if [[ -n "${ARTIFACTS_DIR:-}" ]]; then
   cp "$run_dir/proxy.log" "$run_dir/status/leg_status.json" "$ARTIFACTS_DIR/" 2>/dev/null || true
 fi
-# A failed upload decides the step only when the work itself passed. Outside
-# Buildkite (no agent: a deployment running this launcher itself) the results
-# stay in ARTIFACTS_DIR for the caller to collect.
-if command -v buildkite-agent >/dev/null; then
+# Inside a Buildkite job the upload is part of the step, and a failed upload
+# decides it when the work itself passed (as k3_1p1d.sh). Elsewhere (a
+# deployment running this launcher itself, whose image may still carry the
+# agent) the results stay in ARTIFACTS_DIR for the caller to collect.
+if [[ -n "${BUILDKITE_JOB_ID:-}" ]]; then
   if ! publish_results && [[ "$rc" -eq 0 ]]; then
     rc=1
   fi

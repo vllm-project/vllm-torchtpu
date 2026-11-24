@@ -19,15 +19,22 @@ serving a different configuration from the one it claims, or while dropping
 requests that a retry hid, so the run also checks:
 
   leg-status   (on each engine's pod) the engine's own log: the kernel page
-               every worker settled on, and Raiden layout-fingerprint
-               mismatches. Written as JSON, which the decode pod serves over
-               HTTP for the prefill head to read.
+               list each worker's platform logged at start-up (one entry, 128,
+               when the Qwen3.5 config hook pins the page), and Raiden
+               layout-fingerprint mismatches. Written as JSON, which each pod
+               serves over HTTP for the prefill head to read.
   leg-check    a leg-status file or URL against the expected kernel page and
                zero mismatches.
-  prefix-hit   one long prompt sent through the proxy more times than decode
-               has API servers, so at least two land on one decode rank: the
-               repeat must be served from decode's own prefix cache, and
-               prefill must hit its own.
+  prefix-hit   one long prompt sent through the proxy once more than decode
+               has API servers, so at least two land on one decode rank
+               whatever the proxy's policy (vllm-router's consistent hash
+               sends them all to one): the repeat must be served from
+               decode's own prefix cache, and prefill must hit its own.
+  eval-ran     the eval stage measured something: lm-eval wrote a result for
+               the task on its whole split, no request failed (a failed
+               request lm-eval retried would leave the score intact), and,
+               unless the baseline is still pending, the gate printed a row
+               for it.
   transfer     the decode leg received prompt KV from prefill and computed
                almost none of its prompt tokens itself. Every answer would
                still be right, only slower, if the connector gave up and
@@ -45,6 +52,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pathlib
 import re
 import sys
 import urllib.request
@@ -252,6 +260,73 @@ def cmd_prefix_hit(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+_REQUEST_FAILED_RE = re.compile(r"API request failed", re.IGNORECASE)
+
+
+def _latest_result(results_dir: str, task: str) -> dict | None:
+    """The newest lm-eval results file under ``results_dir`` that reports
+    ``task``, or None."""
+    found = []
+    for path in pathlib.Path(results_dir).rglob("results_*.json"):
+        try:
+            body = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if task in (body.get("results") or {}):
+            found.append((path.stat().st_mtime, body))
+    return max(found, key=lambda item: item[0])[1] if found else None
+
+
+def eval_failures(
+    results_dir: str, task: str, metric: str, flow_log: str, baseline: dict
+) -> list[str]:
+    """Why an eval stage measured nothing, or nothing whole. Empty when it
+    measured the task on its whole split with no failed request."""
+    failures = []
+    body = _latest_result(results_dir, task)
+    if body is None:
+        return [f"lm-eval wrote no result for {task} under {results_dir}"]
+    if not isinstance(body["results"][task].get(metric), (int, float)):
+        failures.append(f"the {task} result has no {metric}")
+    samples = (body.get("n-samples") or {}).get(task) or {}
+    original, effective = samples.get("original"), samples.get("effective")
+    if not isinstance(original, int) or not isinstance(effective, int):
+        failures.append(f"the {task} result does not say how many samples ran")
+    elif effective != original:
+        failures.append(f"{task} ran {effective} of its {original} samples")
+    failed = len(_REQUEST_FAILED_RE.findall(flow_log))
+    if failed:
+        failures.append(f"{failed} lm-eval request(s) failed")
+    if "_pending" not in baseline:
+        check = pathlib.Path(results_dir) / f"eval_check_{task}.md"
+        row = re.compile(
+            rf"^\| `{re.escape(task)}` \| {re.escape(metric)} \|.*\| (PASS|FAIL) \|$",
+            re.M,
+        )
+        if not check.exists() or not row.search(check.read_text()):
+            failures.append(f"the gate printed no {metric} row for {task}")
+    return failures
+
+
+def cmd_eval_ran(args: argparse.Namespace) -> int:
+    try:
+        with open(args.flow_log, errors="replace") as f:
+            flow_log = f.read()
+        with open(args.baseline) as f:
+            baseline = json.load(f)
+    except (OSError, ValueError) as error:
+        print(f"EVAL_RAN could not read its inputs: {error}")
+        return 2
+    failures = eval_failures(
+        args.results_dir, args.task, args.metric, flow_log, baseline
+    )
+    for failure in failures:
+        print(f"EVAL_RAN_FAIL {failure}")
+    if not failures:
+        print(f"EVAL_RAN {args.task}: whole split, no failed request")
+    return 1 if failures else 0
+
+
 def cmd_transfer(args: argparse.Namespace) -> int:
     try:
         bodies = [_get(url) for url in args.decode_metrics]
@@ -323,6 +398,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--prefill-metrics", required=True)
     p.add_argument("--decode-metrics", nargs="+", required=True)
     p.set_defaults(func=cmd_prefix_hit)
+
+    p = sub.add_parser("eval-ran")
+    p.add_argument("--results-dir", required=True)
+    p.add_argument("--task", required=True)
+    p.add_argument("--metric", required=True)
+    p.add_argument("--flow-log", required=True)
+    p.add_argument("--baseline", required=True)
+    p.set_defaults(func=cmd_eval_ran)
 
     p = sub.add_parser("transfer")
     p.add_argument("--decode-metrics", nargs="+", required=True)

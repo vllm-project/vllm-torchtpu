@@ -42,9 +42,11 @@
 #   RAIDEN_EXPECTED_WORKERS_TIMEOUT_S, RAIDEN_NUMA_POLICY,
 #   RUNAI_STREAMER_MEMORY_LIMIT, TORCH_TPU_INTERNAL_ENABLE_REASSOCIATE_NORM_WEIGHTS,
 #   VLLM_ALLOW_LONG_MAX_MODEL_LEN, VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
-#   VLLM_TARGET_DEVICE, VLLM_DP_MASTER_IP, OMP_NUM_THREADS
-# plus the one-host pod environment and the Raiden ports and identities,
-# which are per pod and so not recorded either.
+#   VLLM_TARGET_DEVICE, VLLM_DP_MASTER_IP, OMP_NUM_THREADS,
+#   TPU_PREMAPPED_BUFFER_SIZE, XLA_PYTHON_CLIENT_PREALLOCATE, VLLM_LOGGING_LEVEL
+# and TPU_KV_RESHARD_TRANSPORT (an envs.py variable the records leave to the
+# deployment with the Raiden ports), plus the one-host pod environment and the
+# Raiden ports and identities, which are per pod and so not recorded either.
 #
 # Departures from the measured runs that CI forces, one per line:
 #   VLLM_ENGINE_READY_TIMEOUT_S 7200, not 2700: CI boots both legs from a
@@ -131,8 +133,8 @@ _validation="$_repo/src/vllm_torchtpu/models/qwen3_5/validation"
 # strict-match, as the records were measured. 100 samples cannot resolve a
 # transfer fault: their stderr is about 1.6 pp, the whole split's about 0.4 pp.
 # --require-baselines: a missing baseline file fails the gate rather than
-# skipping it.
-PD_EVAL_FLOW_ARGS=(--run-lm-eval --lm-eval-limit none --require-baselines)
+# skipping it. The correctness stages add --run-lm-eval themselves.
+PD_EVAL_FLOW_ARGS=(--lm-eval-limit none --require-baselines)
 LM_EVAL_TASKS="gsm8k"
 # As every Qwen3.5 config. With 1,319 questions the stderr term of the
 # allowed drop is about 1.0 pp, so this 2 pp floor decides (check_regression.py).
@@ -142,9 +144,12 @@ EVAL_TOLERANCE="0.02"
 # thinking model can write mid-reasoning; the output budget is the records'
 # GSM8K runs' (16,384 tokens). Greedy.
 LM_EVAL_GEN_KWARGS='{"chat_template_kwargs":{"enable_thinking":true},"until":["</s>","<|im_end|>"],"max_gen_toks":16384,"temperature":0,"top_p":1,"do_sample":false}'
-# 64 requests in flight, as the records' GSM8K runs; long thinking answers
-# need more than lm-eval's default request timeout.
-EXTRA_LM_EVAL_MODEL_ARGS="num_concurrent=64,timeout=1800,max_retries=5"
+# 64 requests in flight, the records' GSM8K eval concurrency; long thinking
+# answers need more than lm-eval's default request timeout. One attempt per
+# request: the proxy runs without retries so that a failed prefill or decode
+# hop fails its request, and a client retry would hide it behind a score
+# that still passes.
+EXTRA_LM_EVAL_MODEL_ARGS="num_concurrent=64,timeout=1800,max_retries=1"
 # The kernel page both legs must run (models/qwen3_5/hooks.py), read from
 # every worker's log.
 PD_KERNEL_PAGE_TOKENS=128
@@ -245,6 +250,8 @@ export TPU_HOST_BOUNDS=1,1,1
 export TPU_TOPOLOGY=2x2x1
 export MEGASCALE_COORDINATOR_ADDRESS='' MEGASCALE_NUM_SLICES='' MEGASCALE_PORT='' MEGASCALE_SLICE_ID=''
 export TPU_PROCESS_ADDRESSES='' TPU_PROCESS_PORT='' TPU_WORKER_HOSTNAMES=''
+# As the records' runs: no JAX client preallocation, INFO logs (the kernel
+# page and fingerprint checks read them).
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export VLLM_LOGGING_LEVEL=INFO
 # A cold compile of both legs takes over an hour.
@@ -252,9 +259,12 @@ export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 
 # Raiden wiring. Per pod, so the entries do not record it; the measured runs'
 # values, which differ between the two roles so they do not collide.
-export TPU_KV_RESHARD_TRANSPORT=raiden
 export TPU_KV_TRANSFER_PORT=9100
 export TPU_SIDE_CHANNEL_PORT=9600
+# What the records' runs set beside it: Raiden as the KV reshard transport
+# (envs.py's default is zmq; the records leave it to the deployment) and its
+# 16 GiB premapped host buffer.
+export TPU_KV_RESHARD_TRANSPORT=raiden
 export TPU_PREMAPPED_BUFFER_SIZE=17179869184
 
 # ---- Per role and decode layout -----------------------------------------------
