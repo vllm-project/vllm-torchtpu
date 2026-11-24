@@ -407,3 +407,58 @@ def test_dcp_op_refuses_unsupported_path(dcp_op):
         assert op.index_reuse is False
     finally:
         del SERVED["c64_bf16"]
+
+
+def test_dcp_op_split_scoring_on_reuse_step(monkeypatch):
+    """Served c64 layout (DCP 4, two KV heads per group) with the split index
+    scoring (TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS) and a shared scale
+    row: on an index-reuse step the Full layer takes the split ops and leaves
+    its candidates in the step's dict, the Shared layer consumes them; outputs
+    match the reuse-off op's (symbolic token dim)."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.distributed import dcp as dcp_mod
+
+    msa_ops = _ops()
+    shape = dict(dcp=4, heads=8, reps=2, g=2, seqs=64, pps=1024, pages=256, fp4=1)
+    monkeypatch.setattr(envs, "TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS", 512, raising=False)
+    monkeypatch.setattr(envs, "TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MIN_TOKENS", 1, raising=False)
+    monkeypatch.setattr(dcp_mod, "get_dcp_group", lambda: _Group(shape["dcp"]))
+    monkeypatch.setattr(msa_ops, "get_tp_group", lambda: _Group(8))
+    calls = []
+    real_split = msa_ops._get_msa_dcp_split_ops
+
+    def spy(*a, **kw):
+        score, merge = real_split(*a, **kw)
+
+        def score_spy(*args):
+            calls.append("split")
+            return score(*args)
+
+        return score_spy, merge
+
+    monkeypatch.setattr(msa_ops, "_get_msa_dcp_split_ops", spy)
+    ops = {}
+    for reuse in (False, True):
+        ops[reuse] = msa_ops.get_msa_dcp_op(
+            SCALE / (5 if reuse else 7), TOPK, 0, 1, shape["dcp"], shape["reps"],
+            fp4=True, decode_rows=4, scale_row0=4,
+            **({"index_reuse": True} if reuse else {}),
+        )  # fmt: skip
+    msa_ops.get_msa_dcp_op.cache_clear()
+    assert ops[True].index_reuse is True
+    mode, seed = _mode()
+    with mode:
+        num = seed.shape[0]
+        lane = {"dcp_lane": _empty((1,), I32)}
+        want = _layer_call(ops[False], shape, num, lane)
+        assert calls == ["split"]
+        step = {}
+        full = _layer_call(ops[True], shape, num, {"index_reuse": step, "full": True, **lane})
+        assert calls == ["split", "split"]
+        assert set(step) == {"candidates"}
+        assert step["candidates"].shape == (num, shape["g"] * 2 * TOPK)
+        shared = _layer_call(ops[True], shape, num, {"index_reuse": step, "full": False, **lane})
+        assert calls == ["split", "split"]  # the Shared layer scores nothing
+    for got in (full, shared):
+        assert got.shape == want.shape and got.dtype == want.dtype
+        assert any(isinstance(d, torch.SymInt) for d in got.shape)
