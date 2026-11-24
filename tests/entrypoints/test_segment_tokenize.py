@@ -363,6 +363,7 @@ def test_renderer_patch_routes_and_falls_back(monkeypatch):
     hf = _glm_tokenizer()
     cls = renderer_base.BaseRenderer
     saved = cls.__dict__["_tokenize_prompt"]
+    saved_validate = cls.__dict__["validate_token_ids"]
     monkeypatch.setenv("VLLM_TPU_SEGMENT_TOKENIZE", "1")
     try:
         st.patch_renderer_segment_tokenize()
@@ -418,5 +419,82 @@ def test_renderer_patch_routes_and_falls_back(monkeypatch):
         assert len(calls) == 2
     finally:
         cls._tokenize_prompt = saved
+        cls.validate_token_ids = saved_validate
         cls._tpu_segment_tokenize = False
         assert envs.VLLM_TPU_SEGMENT_TOKENIZE is True
+
+
+def test_validation_skips_only_the_lists_it_tokenized(monkeypatch):
+    pytest.importorskip("vllm")
+    from vllm.renderers import base as renderer_base
+
+    from vllm_torchtpu import segment_tokenize as st
+
+    hf = _glm_tokenizer()
+    cls = renderer_base.BaseRenderer
+    saved = cls.__dict__["_tokenize_prompt"]
+    saved_validate = cls.__dict__["validate_token_ids"]
+    validated = []
+
+    def validate(self, token_ids, *, parameter=None):
+        validated.append(list(token_ids))
+
+    monkeypatch.setenv("VLLM_TPU_SEGMENT_TOKENIZE", "1")
+    monkeypatch.setattr(st, "_INSTANCES", {})
+    try:
+        cls.validate_token_ids = validate
+        st.patch_renderer_segment_tokenize()
+
+        class P:
+            def get_encode_kwargs(self):
+                return dict(truncation=False, max_length=None, add_special_tokens=False)
+
+        class R:
+            _tokenize_prompt = cls._tokenize_prompt
+            validate_token_ids = cls.validate_token_ids
+
+            def get_tokenizer(self):
+                return hf
+
+            def _wants_offsets(self, prompt, params):
+                return False
+
+            def _build_tokens_prompt(self, ids, prompt, offset_mapping=None):
+                return {"prompt_token_ids": list(ids)}
+
+        r = R()
+        text = "[gMASK]<sop><|user|>hello world<|assistant|>"
+        ids = r._tokenize_prompt({"prompt": text}, P())["prompt_token_ids"]
+        r.validate_token_ids(ids)
+        assert validated == []
+        # Validated once: a second check of the same list runs vLLM's.
+        r.validate_token_ids(ids)
+        # A copy, or the list grown or cut, is not the tokenizer's output.
+        again = r._tokenize_prompt({"prompt": text}, P())["prompt_token_ids"]
+        r.validate_token_ids(list(again))
+        again.append(7)
+        r.validate_token_ids(again)
+        assert len(validated) == 3
+    finally:
+        cls._tokenize_prompt = saved
+        cls.validate_token_ids = saved_validate
+        cls._tpu_segment_tokenize = False
+
+
+def test_tokenized_ids_are_bounded(monkeypatch):
+    from vllm_torchtpu.segment_tokenize import TokenizedIds
+
+    monkeypatch.setattr(TokenizedIds, "MAX_IDS", 1000)
+
+    lists = TokenizedIds()
+    kept = [[i] for i in range(TokenizedIds.MAX_LISTS + 10)]
+    for ids in kept:
+        lists.add(ids)
+    assert not lists.take(kept[0])
+    assert lists.take(kept[-1])
+    lists = TokenizedIds()
+    big = [[0] * (TokenizedIds.MAX_IDS // 2) for _ in range(3)]
+    for ids in big:
+        lists.add(ids)
+    assert lists._ids <= TokenizedIds.MAX_IDS
+    assert not lists.take(big[0]) and lists.take(big[2])

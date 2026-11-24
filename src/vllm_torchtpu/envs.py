@@ -1351,6 +1351,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # API server: tokenize chat prompts piecewise between added tokens and
     # cache message-body pieces across turns (segment_tokenize.py). Exact;
     # falls back to full tokenization for ineligible tokenizers/requests.
+    # The id lists it produces skip vLLM's vocabulary validation.
     "VLLM_TPU_SEGMENT_TOKENIZE": env_bool("VLLM_TPU_SEGMENT_TOKENIZE"),
     # Token budget of that cache (~12 B/token: id pointers plus piece text).
     "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS": env_int(

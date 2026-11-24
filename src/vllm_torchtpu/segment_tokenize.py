@@ -445,8 +445,56 @@ def get_segment_tokenizer(tokenizer: Any, max_cached_tokens: int, max_prompts: i
         return seg
 
 
+class TokenizedIds:
+    """The id lists the segment tokenizer handed out that vLLM has not
+    validated yet, by identity: a list another stage copied, truncated or
+    extended is not one of them and is validated as usual. A list that never
+    reaches validation (a request rejected before it) is let go once newer
+    lists exceed the bounds."""
+
+    MAX_LISTS = 256
+    MAX_IDS = 1 << 24
+
+    def __init__(self):
+        self._lists: OrderedDict[int, tuple[list[int], int]] = OrderedDict()
+        self._ids = 0
+        self._lock = threading.Lock()
+
+    def add(self, ids: list[int]) -> None:
+        with self._lock:
+            self._forget(id(ids))
+            self._lists[id(ids)] = (ids, len(ids))
+            self._ids += len(ids)
+            while len(self._lists) > 1 and (
+                len(self._lists) > self.MAX_LISTS or self._ids > self.MAX_IDS
+            ):
+                self._forget(next(iter(self._lists)))
+
+    def take(self, ids) -> bool:
+        """Whether ``ids`` is a list handed out here and unchanged in length;
+        it is forgotten either way."""
+        with self._lock:
+            entry = self._forget(id(ids))
+        return entry is not None and entry[0] is ids and entry[1] == len(ids)
+
+    def _forget(self, key: int) -> tuple[list[int], int] | None:
+        entry = self._lists.pop(key, None)
+        if entry is not None:
+            self._ids -= entry[1]
+        return entry
+
+
+def _tokenized_ids(renderer) -> TokenizedIds:
+    ids = renderer.__dict__.get("_tpu_tokenized_ids")
+    if ids is None:
+        with _INSTANCES_LOCK:
+            ids = renderer.__dict__.setdefault("_tpu_tokenized_ids", TokenizedIds())
+    return ids
+
+
 def patch_renderer_segment_tokenize() -> None:
-    """Route eligible ``BaseRenderer._tokenize_prompt`` calls through the cache.
+    """Route eligible ``BaseRenderer._tokenize_prompt`` calls through the cache,
+    and skip ``BaseRenderer.validate_token_ids`` for the id lists it produced.
 
     Must run before the renderer is constructed: ``BaseRenderer.__init__``
     binds ``self._tokenize_prompt`` into its async wrapper.
@@ -480,12 +528,25 @@ def patch_renderer_segment_tokenize() -> None:
         ):
             # Over-long prompt: keep the tokenizer's own truncation semantics.
             return orig(self, prompt, params)
-        return self._build_tokens_prompt(ids, prompt, offset_mapping=None)
+        tokens_prompt = self._build_tokens_prompt(ids, prompt, offset_mapping=None)
+        _tokenized_ids(self).add(tokens_prompt["prompt_token_ids"])
+        return tokens_prompt
+
+    validate = cls.validate_token_ids
+
+    def validate_token_ids(self, token_ids, *, parameter=None):
+        # Ids this tokenizer produced are in its vocabulary; checking that
+        # costs two passes over a prompt of up to a million ids.
+        if _tokenized_ids(self).take(token_ids):
+            return
+        validate(self, token_ids, parameter=parameter)
 
     cls._tokenize_prompt = _tokenize_prompt
+    cls.validate_token_ids = validate_token_ids
     cls._tpu_segment_tokenize = True
     logger.info(
         "VLLM_TPU_SEGMENT_TOKENIZE: patched BaseRenderer._tokenize_prompt "
-        "(prefix reuse over %d recent prompts)",
+        "(prefix reuse over %d recent prompts) and validate_token_ids (its own "
+        "id lists skip the vocabulary check)",
         max_prompts,
     )
