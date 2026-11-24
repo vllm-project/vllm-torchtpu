@@ -441,24 +441,27 @@ def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
     """Global selection ``[T, topk]`` (``-1`` padded) from every rank's
     packed candidates ``[dcp, T, 2 * topk]``, in `msa_select.select_blocks`'s
     order: score descending, ties to the lower block."""
-    dcp, num_tokens, _ = candidates.shape
-    scores = candidates[..., :topk]
-    blocks = candidates[..., topk:].astype(jnp.int32)
-    s = scores.transpose(1, 0, 2).reshape(num_tokens, dcp * topk)
-    b = blocks.transpose(1, 0, 2).reshape(num_tokens, dcp * topk)
+    s = candidates[..., :topk]
+    b = candidates[..., topk:].astype(jnp.int32)
     # The real candidates (score > -inf) are distinct blocks: a rank picks
     # distinct columns and ranks hold disjoint blocks. So each one's place in
     # the order is the number of real candidates ahead of it, and the merge
     # is two dense compare-reduce fusions instead of topk dependent steps.
-    # Their [rows, dcp * topk, dcp * topk] operands stay fused into the
-    # reductions (dcp * topk <= 128 lanes per row at the served shapes).
+    # Their [dcp, T, topk, dcp, topk] operands stay fused into the
+    # reductions, over the candidates as they arrive: gathered into rows
+    # [T, dcp * topk] first, each operand took a relayout copy (~0.25 us per
+    # layer at 24 tokens, b3 decode twin j-f351ea81).
     real = s > _NEG_INF
-    s_i, b_i = s[:, :, None], b[:, :, None]
-    s_j, b_j = s[:, None, :], b[:, None, :]
-    ahead = real[:, None, :] & ((s_j > s_i) | ((s_j == s_i) & (b_j < b_i)))
-    place = jnp.where(real, jnp.sum(ahead, axis=2, dtype=jnp.int32), topk)
-    slot = jnp.arange(topk, dtype=jnp.int32)[None, None, :]
-    return jnp.max(jnp.where(place[:, :, None] == slot, b_i, -1), axis=1)
+
+    def others(x):  # x[r', t, k'] at [:, t, :, r', k']
+        return jnp.moveaxis(x, 0, 1)[None, :, None]
+
+    s_i, b_i = s[..., None, None], b[..., None, None]
+    s_j, b_j = others(s), others(b)
+    ahead = others(real) & ((s_j > s_i) | ((s_j == s_i) & (b_j < b_i)))
+    place = jnp.where(real, jnp.sum(ahead, axis=(3, 4), dtype=jnp.int32), topk)
+    slot = jnp.arange(topk, dtype=jnp.int32)
+    return jnp.max(jnp.where(place[..., None] == slot, b[..., None], -1), axis=(0, 2))
 
 
 def _merge_kernel(c_ref, o_ref, *, topk: int):
