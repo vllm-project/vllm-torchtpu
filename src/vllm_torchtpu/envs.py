@@ -1851,7 +1851,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # half of the DCP op (query and candidate exchange, candidate merge, work
     # list, sparse attention, partial exchange, LSE merge) as one Pallas call
     # with remote DMAs between the pair
-    # (`models.minimax_m3.kernels.msa_dcp_fused`; bitwise equal). At most 128;
+    # (`models.minimax_m3.kernels.msa_dcp_fused`; bitwise equal). At most 256;
     # 0 (default) keeps the unfused program.
     "TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS", 0
