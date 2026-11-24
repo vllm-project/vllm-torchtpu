@@ -77,6 +77,7 @@ class MoEParams:
     skip_pad: bool = False
     exact_width: bool = False
     local_wn: bool = False
+    RB_HOIST: bool = False
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,8 @@ class MoETunables:
     exact_width: bool = False
     # Rank-local 128-lane `wn` scratch and wcol scan on EP (`VLLM_TPU_MK_MOE_LOCAL_WN`).
     local_wn: bool = False
+    # Hoist row-bucket gather row / small one-hot gather matrix outside the K-tile loop.
+    rb_hoist: bool = False
 
     # `exact`: moving the field keeps hidden states and caches bit-identical
     # (scheduling only); `approx`: changes or may change the arithmetic.
@@ -131,6 +134,7 @@ class MoETunables:
         "topk_lanes": "approx",  # Batcher odd-even lane top-k
         "moe_unroll": "approx",  # unrolled expert tiles (not exact on TPU, bisect)
         "row_bucket": "approx",  # routed-row blocks (bitwise up to signed zeros)
+        "rb_hoist": "exact",  # hoist gather_mat/rbpreT load outside K-tile loop
         "dedup_vec": "exact",  # same hit list and order as the scalar dedup
         "skip_pad": "approx",  # masks padded rows >= n_valid (exact on real rows)
         "exact_width": "approx",  # slices active MR rows when MR < MB (exact on 0:MR; padding rows untouched)
@@ -277,4 +281,5 @@ def derive_moe_params(
         skip_pad=bool(tt.skip_pad),
         exact_width=bool(tt.exact_width),
         local_wn=local_wn,
+        RB_HOIST=bool(rb and tt.rb_hoist),
     )

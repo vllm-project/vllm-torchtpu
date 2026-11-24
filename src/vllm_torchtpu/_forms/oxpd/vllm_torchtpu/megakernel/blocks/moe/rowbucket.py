@@ -143,12 +143,18 @@ def experts_piped_ep_rb(m: MoEEmit, l_idx, n_hit):
 
                 lax.fori_loop(0, (cnt + (GC - 1)) // GC, blk, 0)
 
-        def gather_mat(e, G, r0):
-            """One-hot `P [G, MB]`: P[j, r] = 1 iff row r is expert e's routed row r0 + j."""
+        def gather_row(e):
+            """Aligned `[8, 128]` row-code load (`aligned_row`, preserving 4f47747ebf)."""
             e_idx = lax.bitwise_and(e, 127) if mp.local_wn else e
-            crow = aligned_row(scr["rbpreT"], e_idx, MB)  # [1, MB]
+            return aligned_row(scr["rbpreT"], e_idx, MB)  # [1, MB]
+
+        def gather_mat_from_crow(crow, G, r0):
             want = (lax.broadcasted_iota(I32, (G, MB), 0) + r0).astype(F32)
             return jnp.where(crow == want, 1.0, 0.0).astype(BF16)
+
+        def gather_mat(e, G, r0):
+            """One-hot `P [G, MB]`: P[j, r] = 1 iff row r is expert e's routed row r0 + j."""
+            return gather_mat_from_crow(gather_row(e), G, r0)
 
         def code_col(e):
             """Row codes of expert e as a column `[MR, 1]` (f32 ints, -1 = not routed)."""
@@ -168,12 +174,18 @@ def experts_piped_ep_rb(m: MoEEmit, l_idx, n_hit):
                 keepdims=True,
             )
 
-        def e13_tile(e, cnt, t, w13):
+        def e13_tile(e, cnt, t, w13, crow=None, p_small=None):
             k0 = t * TK13
 
             def body(G, r0):
                 rows = pl.ds(r0, G)
-                xg = stream.mm(gather_mat(e, G, r0), xb[:, k0 : k0 + TK13]).astype(BF16)
+                if p_small is not None and G == G0 and isinstance(r0, int) and r0 == 0:
+                    pm = p_small
+                elif crow is not None:
+                    pm = gather_mat_from_crow(crow, G, r0)
+                else:
+                    pm = gather_mat(e, G, r0)
+                xg = stream.mm(pm, xb[:, k0 : k0 + TK13]).astype(BF16)
                 mm13 = _mm(stream, xg, w13[...])
                 if DIRECT0 and t == 0:
                     acc13[rows, :BN] = mm13
@@ -255,9 +267,11 @@ def experts_piped_ep_rb(m: MoEEmit, l_idx, n_hit):
         # Expert 0's gate/up.
         e0 = scr["elist"][0]
         c0 = count(e0)
+        crow0 = gather_row(e0) if mp.RB_HOIST else None
+        p0 = gather_mat_from_crow(crow0, G0, 0) if mp.RB_HOIST else None
         for t in range(T13):
             w13 = etake(m, "e13", t)
-            e13_tile(e0, c0, t, w13)
+            e13_tile(e0, c0, t, w13, crow0, p0)
             if mp.group_rel:
                 if t % 2 == 1:
                     egive_group(m, [(t - 1, t - 1), (t, t)], l_idx)
@@ -276,6 +290,8 @@ def experts_piped_ep_rb(m: MoEEmit, l_idx, n_hit):
             s_nxt = (i + 1) % NSS
             base_w2 = i * TE + T13
             base_nxt13 = (i + 1) * TE
+            crow_n = gather_row(e_n) if mp.RB_HOIST else None
+            p_n = gather_mat_from_crow(crow_n, G0, 0) if mp.RB_HOIST else None
             for s_step in range(T2):
                 u2 = base_w2 + s_step
                 t0, t1 = 2 * s_step, 2 * s_step + 1
@@ -283,10 +299,10 @@ def experts_piped_ep_rb(m: MoEEmit, l_idx, n_hit):
                 w2 = etake(m, "e2", u2)
                 w13_0 = etake(m, "e13", u13_0)
                 e2_tile(c, s_step, w2)
-                e13_tile(e_n, c_n, t0, w13_0)
+                e13_tile(e_n, c_n, t0, w13_0, crow_n, p_n)
                 rel([(u2, T13 + s_step), (u13_0, t0)], l_idx)
                 w13_1 = etake(m, "e13", u13_1)
-                e13_tile(e_n, c_n, t1, w13_1)
+                e13_tile(e_n, c_n, t1, w13_1, crow_n, p_n)
                 egive(m, u13_1, l_idx, t1)
             finish(e, c, s_cur)
             es_wait(m, i + 1)

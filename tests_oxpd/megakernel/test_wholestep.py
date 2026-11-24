@@ -49,6 +49,8 @@ def _run(
     T: int = 4,
     zero: tuple[str, ...] = (),
     identical_experts: bool = False,
+    hc_fp8: bool = False,
+    hc_fused: bool = False,
 ):
     R = 2
     ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
@@ -66,9 +68,17 @@ def _run(
         zero=zero,
         identical_experts=identical_experts,
     )
+    if hc_fp8:  # the reference sees the FP8-rounded HC weights
+        for name in ("moe", "qsa_full", "gdn"):
+            for k in ("down", "inj", "up"):
+                w = d["hc"][name][k]
+                q, sc = wi._fp8_columns(w)
+                d["hc"][name][k] = (q.astype(jnp.float32) * sc[..., None, :]).astype(w.dtype)
     ref, kv_ref = wi.wholestep_reference(G, ex, d, L)
-    spec = wholestep_spec(G, R, L=L, qsa=dict(budget=BUDGET))
-    w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
+    spec = wholestep_spec(
+        G, R, L=L, qsa=dict(budget=BUDGET), hc_fp8=hc_fp8, hc_fused=hc_fused
+    )
+    w_mk, states = wi.pack_wholestep(spec, G, ex, d, L, hc_fp8=hc_fp8)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
         mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states

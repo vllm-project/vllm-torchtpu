@@ -632,6 +632,8 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_QSA_WRITE_KVAL: bool = False
     # Megakernel MoE row-bucketing (default off; aligned [8, 128] tile loads)
     VLLM_TPU_MK_ROW_BUCKET: bool = False
+    VLLM_TPU_MK_HC_FP8: bool = False
+    VLLM_TPU_MK_HC_MOE_FUSED: bool = False
     # Megakernel all-reduce / MoE E7 collectives & dedup (all default off)
     VLLM_TPU_MK_AR_HIER_SMALL: bool = False
     VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC: bool = False
@@ -3639,6 +3641,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whole-step megakernel MoE routed-row bucketing (PIPE_EP, >16 rows): each expert runs
     # its matmuls on its gathered routed rows via aligned [8, 128] `rbpreT` tile loads.
     "VLLM_TPU_MK_ROW_BUCKET": env_bool("VLLM_TPU_MK_ROW_BUCKET", False),
+    # Whole-step megakernel target layers: stream HC mix weights (hdn / hup) as FP8
+    # E4M3 with per-output-column f32 scales (`HCSublayer.fp8_weights`). Default off.
+    "VLLM_TPU_MK_HC_FP8": env_bool("VLLM_TPU_MK_HC_FP8", False),
+    # Whole-step megakernel HC + MoE sublayer pipeline fusion (default off): packs
+    # FP8 HC up-projections into 2 bank-filling [384, 5120] streams (-180 static
+    # ring DMAs at L=45), fuses 4-branch HC up-mix in 512-col registers with zero
+    # scr['acc'] round-trips, and hoists MoE row-bucket gather matrices once per expert.
+    "VLLM_TPU_MK_HC_MOE_FUSED": env_bool("VLLM_TPU_MK_HC_MOE_FUSED", False),
     # Whole-step megakernel small-bucket all-reduce: hier=1 (2-round flat over
     # chips) up to B<=8, even when E7 / EXACT_WIDTH picks default hier=5.
     "VLLM_TPU_MK_AR_HIER_SMALL": env_bool("VLLM_TPU_MK_AR_HIER_SMALL", False),

@@ -242,6 +242,8 @@ class Qwen38WholeStep(nn.Module):
                 n_layers=n_att,
                 **indexed_options(),
             ),
+            hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
+            hc_fused=envs.VLLM_TPU_MK_HC_MOE_FUSED,
         )
         ex = ExecSpec(
             R=R,
