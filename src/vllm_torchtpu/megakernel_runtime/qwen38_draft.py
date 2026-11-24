@@ -372,12 +372,18 @@ class MkDraft(nn.Module):
             kind.pool_index = self.n_w
 
     def step(self, hidden: torch.Tensor, positions: torch.Tensor, T: int,
-             metadata: dict) -> tuple[torch.Tensor, torch.Tensor]:
+             metadata: dict, query_start_loc: torch.Tensor | None = None,
+             seq_lens: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """`(residual, tokens)` of one draft step on the fused input `hidden`
-        `[rows, hc*H]` (`Qwen4ExpMTP.fuse_inputs`), `T` rows per request."""
+        `[rows, hc*H]` (`Qwen4ExpMTP.fuse_inputs`), `T` rows per request.
+        `query_start_loc` / `seq_lens` stand in for the metadata's when the forward
+        context holds another step's (VLLM_TPU_MK_DRAFT_STEP0_LOOP_PROGRAM: step 0
+        traced under the loop's metadata); the block tables are the same."""
         md = metadata[self.attn_prefix]
-        starts = md.query_start_loc.to(torch.int32)
-        seq = md.seq_lens.to(torch.int32)
+        if query_start_loc is None:
+            query_start_loc = md.query_start_loc
+        starts = query_start_loc.to(torch.int32)
+        seq = (md.seq_lens if seq_lens is None else seq_lens).to(torch.int32)
         context = seq - (starts[1:] - starts[:-1])
         args = [getattr(self, f"w_{i}") for i in range(self.n_w)] + [
             self.pool,
