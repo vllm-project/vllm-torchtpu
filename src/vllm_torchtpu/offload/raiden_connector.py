@@ -449,6 +449,23 @@ def _build_tier_check(connector_worker, kv_caches, group_regions) -> TierCheck:
     return TierCheck(regions, live, rank)
 
 
+def divergent_hits_restore_state(
+    kv_cache_config: KVCacheConfig, offloaded_group_ids: Iterable[int]
+) -> bool:
+    """Whether every load from this host tier restores every prefix-cacheable
+    recurrent-state (Mamba/GDN/PLE) group at its ending boundary
+    (``VLLM_TPU_OFFLOAD_DIVERGENT_HITS``)."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    state = {
+        gid
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups)
+        if group.kv_cache_spec.prefix_cacheable
+        and isinstance(group.kv_cache_spec, MambaSpec)
+    }
+    return bool(state) and state <= set(offloaded_group_ids)
+
+
 @dataclass
 class _ParkedStore:
     """A store job parked until every worker rank acknowledges the device fence."""
@@ -479,6 +496,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             self.manager
         )
         self._fence_pending: dict[int, _ParkedStore] = {}
+        # VLLM_TPU_OFFLOAD_DIVERGENT_HITS: every tier load restores the state
+        # groups at its boundary (read by supports_divergent_local_hybrid_hits).
+        self._restores_state = divergent_hits_restore_state(
+            kv_cache_config, [g.group_idx for g in self.config.kv_group_configs]
+        )
         # With the tier classes a drain that times out stops the engine: the
         # source blocks are about to be reused under a live DMA, and a save
         # that lands later would publish their new bytes under the old hash.
@@ -508,6 +530,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         # share pool regions).
         self._fp4_busy: Counter[int] = Counter()
         self._fp4_deferred_loads: list[tuple] = []
+
+    @property
+    def restores_state_with_every_load(self) -> bool:
+        """Every tier load restores each state group at its boundary."""
+        return bool(self.__dict__.get("_restores_state", False))
 
     def host_resident_tokens(self, request: Request, num_local_tokens: int) -> int:
         """Prompt tokens past ``num_local_tokens`` that every offloaded group
@@ -1054,6 +1081,17 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         for; these pages are opaque bytes to this connector.
         """
         return None
+
+    @property
+    def supports_divergent_local_hybrid_hits(self) -> bool:
+        """Enable divergent local hybrid hits when ``VLLM_TPU_OFFLOAD_DIVERGENT_HITS=1``
+        and the host tier offloads every prefix-cacheable state group."""
+        if not tpu_envs.VLLM_TPU_OFFLOAD_DIVERGENT_HITS:
+            return False
+        scheduler = self.__dict__.get("connector_scheduler")
+        return bool(
+            scheduler is not None and scheduler.restores_state_with_every_load
+        )
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:

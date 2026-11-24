@@ -363,6 +363,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_FP4_SLOTS: int = 256
     VLLM_TPU_OFFLOAD_FP4_GDN: bool = False
     VLLM_TPU_OFFLOAD_FP4_GDN_SLOTS: int = 0
+    VLLM_TPU_OFFLOAD_DIVERGENT_HITS: bool = False
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TPU_MAMBA_CHECKPOINT_RETENTION: bool = True
     VLLM_TPU_MAMBA_DECODE_CHECKPOINT: bool = True
@@ -2474,6 +2475,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # HBM staging slots per GDN region for VLLM_TPU_OFFLOAD_FP4_GDN (0: as
     # VLLM_TPU_OFFLOAD_FP4_SLOTS).
     "VLLM_TPU_OFFLOAD_FP4_GDN_SLOTS": env_int("VLLM_TPU_OFFLOAD_FP4_GDN_SLOTS", 0),
+    # Prefill with the host tier (TPURaidenOffloadingConnector) on a hybrid model:
+    # report "divergent local hybrid hits", so the local prefix hit is the
+    # attention groups' cached run (core/divergent_hybrid_hits.py) even when HBM
+    # keeps no recurrent-state checkpoint at its end, and the host tier's load
+    # supplies the state at the boundary it restores. A pure PD producer child of
+    # the multi connector never loads and does not veto. 100% lossless; host-only.
+    "VLLM_TPU_OFFLOAD_DIVERGENT_HITS": env_bool(
+        "VLLM_TPU_OFFLOAD_DIVERGENT_HITS", default=False
+    ),
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(

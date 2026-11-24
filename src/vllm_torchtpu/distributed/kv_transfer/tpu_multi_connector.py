@@ -15,6 +15,15 @@
 
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 
+from vllm_torchtpu import envs as tpu_envs
+
+
+def _pure_producer(connector) -> bool:
+    """A child configured ``kv_role="kv_producer"``: it hands KV off and never
+    reports external tokens to load (the PD prefill's Raiden child)."""
+    config = getattr(connector, "_kv_transfer_config", None)
+    return getattr(config, "kv_role", None) == "kv_producer"
+
 
 class TPUMultiConnector(MultiConnector):
     """MultiConnector combining TPURaidenConnector (disaggregation) with
@@ -27,6 +36,18 @@ class TPUMultiConnector(MultiConnector):
     the connector is instantiated, so children injected at init time would
     be invisible to them.
     """
+
+    @property
+    def supports_divergent_local_hybrid_hits(self) -> bool:
+        """With ``VLLM_TPU_OFFLOAD_DIVERGENT_HITS=1``, ignore pure ``kv_producer``
+        children (which never load) when checking divergent hybrid-hit support.
+        Flag off keeps upstream ``MultiConnector`` behavior."""
+        if not tpu_envs.VLLM_TPU_OFFLOAD_DIVERGENT_HITS:
+            return super().supports_divergent_local_hybrid_hits
+        loaders = [c for c in self._connectors if not _pure_producer(c)]
+        return bool(loaders) and all(
+            c.supports_divergent_local_hybrid_hits for c in loaders
+        )
 
     def register_runner(self, runner) -> None:
         # torchtpu extension unknown to upstream MultiConnector: forward it to
