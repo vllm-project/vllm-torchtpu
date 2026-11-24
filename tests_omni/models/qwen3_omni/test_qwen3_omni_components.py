@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Component-wise TPU vs CPU tests for the Qwen3-Omni thinker audio encoder."""
+"""TPU vs. float32 CPU parity tests for the Qwen3-Omni Audio Encoder."""
 
 from __future__ import annotations
 
@@ -19,9 +19,6 @@ from collections.abc import Callable, Iterator
 
 import pytest
 import torch
-
-pytest.importorskip("vllm_omni", reason="vllm_omni is required for omni model tests")
-
 from transformers import Qwen3OmniMoeAudioEncoderConfig
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoder as HfQwen3OmniMoeAudioEncoder,
@@ -31,44 +28,56 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     _get_feat_extract_output_lengths,
 )
 
-from tests_omni.omni_test_utils import assert_all_loaded, assert_parity
+from tests_omni.omni_test_utils import (
+    assert_all_loaded,
+    assert_parity,
+    restore_class_attrs,
+)
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
-    _AUDIO_CHUNK_LENGTHS_PATCHED,
+    _padded_audio_forward,
     maybe_patch_qwen3_omni_thinker,
 )
 
 pytestmark = [pytest.mark.omni]
 
-# Production chunking geometry (num_mel_bins 128, n_window 50 -> 100-frame
-# windows, n_window_infer 800, three stride-2 convolutions) on a tiny encoder.
 AUDIO_CONFIG = Qwen3OmniMoeAudioEncoderConfig(
-    d_model=256,
-    encoder_layers=1,
+    num_mel_bins=128,
+    d_model=128,
+    encoder_layers=2,
     encoder_attention_heads=4,
-    encoder_ffn_dim=512,
+    encoder_ffn_dim=256,
+    downsample_hidden_size=64,
     output_dim=128,
-    downsample_hidden_size=32,
+    n_window=50,
+    n_window_infer=400,
 )
 
-# 79 frames (< 100) exercises a single sub-window clip; 800 frames (8 s) is the
-# exact 100-frame multiple the patch fixes; 801 takes the partial-window branch
-# across two attention segments; [800, 801] exercises multi-clip batching in a
-# single forward call.
-PARITY_CLIP_LENGTHS = [
-    pytest.param([79], id="79"),
-    pytest.param([800], id="800"),
-    pytest.param([801], id="801"),
-    pytest.param([800, 801], id="800_801"),
+# Exercises all 5 buckets (8, 16, 32, 64, 128), sub-second odd/even CNN widths
+# ([50], [79]), multi-clip packing ([800, 801], [801, 800], [2000, 2000]), and
+# >128 multi-pass splits with dead-segment isolation ([12801, 200], [25601, 200]).
+PARITY_CASES = [
+    pytest.param([50], {8}, id="50"),
+    pytest.param([79], {8}, id="79"),
+    pytest.param([800], {8}, id="800"),
+    pytest.param([801], {16}, id="801"),
+    pytest.param([800, 801], {32}, id="800_801"),
+    pytest.param([801, 800], {32}, id="801_800"),
+    pytest.param([2000, 2000], {64}, id="2000_2000"),
+    pytest.param([12800], {128}, id="12800"),
+    pytest.param([12801, 200], {128, 8}, id="12801_200"),
+    pytest.param([25601, 200], {128, 8}, id="25601_200"),
 ]
 
-# (max relative L2, max abs) vs float32 HF CPU reference (~2.5x measured on TPU v6e).
+# (max relative L2, max abs) vs float32 HF CPU reference on TPU v6e and v7x.
 ATTN_LIMITS = (1.0e-2, 3.0e-3)
 LAYER_LIMITS = (8.0e-3, 5.5e-2)
 END_TO_END_LIMITS = (1.5e-2, 3.5e-3)
 
+_PATCHED_ATTRS = ("forward", "_tpu_enforce_eager")
 
-def _make_mel_features(n_frames: int) -> torch.Tensor:
-    generator = torch.Generator().manual_seed(0)
+
+def _make_mel_features(n_frames: int, seed: int = 0) -> torch.Tensor:
+    generator = torch.Generator().manual_seed(seed)
     return torch.randn(AUDIO_CONFIG.num_mel_bins, n_frames, generator=generator)
 
 
@@ -87,14 +96,13 @@ def encoders(
 
     cls = Qwen3OmniMoeAudioEncoder
     upstream_forward = cls.forward
-    orig_get_cnn_lengths = cls._get_cnn_output_lengths
-    assert not getattr(upstream_forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
-    try:
+    assert upstream_forward is not _padded_audio_forward
+    with restore_class_attrs(cls, _PATCHED_ATTRS):
         assert (
             maybe_patch_qwen3_omni_thinker(["Qwen3OmniMoeForConditionalGeneration"])
             is True
         )
-        assert getattr(cls.forward, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
+        assert cls.forward is _padded_audio_forward
 
         torch.manual_seed(0)
         ref = HfQwen3OmniMoeAudioEncoder(AUDIO_CONFIG).eval()
@@ -104,9 +112,6 @@ def encoders(
         assert_all_loaded(loaded, tpu)
         tpu = tpu.to(device="tpu", dtype=torch.bfloat16)
         yield tpu, ref, upstream_forward
-    finally:
-        cls.forward = upstream_forward
-        cls._get_cnn_output_lengths = orig_get_cnn_lengths
 
 
 @pytest.mark.xfail(
@@ -128,7 +133,9 @@ def test_upstream_forward_miscounts_exact_window_multiples(encoders) -> None:
             exc
         ), str(exc)
         raise
-    assert out.shape[0] == int(_get_feat_extract_output_lengths(800))
+    assert out.shape[0] == int(
+        _get_feat_extract_output_lengths(torch.tensor([800])).item()
+    )
 
 
 @torch.no_grad()
@@ -169,25 +176,28 @@ def test_audio_encoder_layer_matches_cpu_reference(encoders) -> None:
     )
 
 
-@pytest.mark.parametrize("clip_lengths", PARITY_CLIP_LENGTHS)
+@pytest.mark.parametrize(("clip_lengths", "expected_buckets"), PARITY_CASES)
 @torch.no_grad()
-def test_audio_encoder_matches_cpu_reference(encoders, clip_lengths: list[int]) -> None:
+def test_audio_encoder_matches_cpu_reference(
+    encoders, clip_lengths: list[int], expected_buckets: set[int]
+) -> None:
     tpu, ref, _ = encoders
-    features = torch.cat([_make_mel_features(n) for n in clip_lengths], dim=1)
+    features = torch.cat(
+        [_make_mel_features(n, seed=idx) for idx, n in enumerate(clip_lengths)],
+        dim=1,
+    )
     ref_lens = torch.tensor(clip_lengths, dtype=torch.long)
     reference = ref(features, ref_lens).last_hidden_state
 
+    feats_tpu = features.to(device="tpu", dtype=torch.bfloat16)
     feature_lens = torch.tensor(clip_lengths, dtype=torch.long, device="tpu")
     aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
-    out = tpu(
-        features.to(device="tpu", dtype=torch.bfloat16),
-        feature_lens,
-        aftercnn_lens,
-    )
+    out = tpu(feats_tpu, feature_lens, aftercnn_lens)
+
     expected_tokens = int(_get_feat_extract_output_lengths(ref_lens).sum())
-    assert feature_lens.device.type == "tpu"
     assert out.device.type == "tpu"
     assert out.shape == (expected_tokens, AUDIO_CONFIG.output_dim)
+    assert expected_buckets.issubset(getattr(tpu, "_tpu_compiled_buckets", {}))
     assert_parity(
         out,
         reference,
@@ -195,3 +205,18 @@ def test_audio_encoder_matches_cpu_reference(encoders, clip_lengths: list[int]) 
         max_rel_l2=END_TO_END_LIMITS[0],
         max_abs=END_TO_END_LIMITS[1],
     )
+
+
+@pytest.mark.parametrize("clip_lengths", [[], [0]])
+@torch.no_grad()
+def test_audio_encoder_empty_inputs_on_tpu(encoders, clip_lengths: list[int]) -> None:
+    tpu, _, _ = encoders
+    assert not hasattr(tpu, "output_dim")
+    feats_tpu = torch.zeros(
+        (AUDIO_CONFIG.num_mel_bins, 0), device="tpu", dtype=torch.bfloat16
+    )
+    feature_lens = torch.tensor(clip_lengths, dtype=torch.long, device="tpu")
+    out = tpu(feats_tpu, feature_lens)
+    assert out.device.type == "tpu"
+    assert out.dtype == torch.bfloat16
+    assert out.shape == (0, AUDIO_CONFIG.output_dim)
