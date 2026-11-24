@@ -3,6 +3,7 @@
 """Packed FP8 indexer: candidate preparation, scoring, selection and op registration."""
 
 import functools
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import jax
@@ -56,6 +57,10 @@ from .indexer_select import (
 
 if TYPE_CHECKING:
     from .indexer_cache import PackedFP8IndexCacheRows
+
+# consume(start, rows, state, following) -> (state, following); see
+# `select_fp8_indexer_tiles`.
+SelectionConsumer = Callable[[int, jax.Array, Any, Any], tuple[Any, Any]]
 
 _query_op = None
 _write_op = None
@@ -417,8 +422,11 @@ def _score_and_select_candidates(
             lambda tile: tile * query_chunk_size,
             score,
             select,
-            lambda tile, src, dst: jax.lax.dynamic_update_slice_in_dim(
-                dst, src, tile * query_chunk_size, axis=0
+            lambda tile, src, dst, following: (
+                jax.lax.dynamic_update_slice_in_dim(
+                    dst, src, tile * query_chunk_size, axis=0
+                ),
+                following,
             ),
             jnp.full((num_queries, k), -1, jnp.int32),
         )
@@ -457,11 +465,19 @@ def _select_fp8_indexer_jax(
     score_width: int,
     *,
     prefill_chunk_rows: int | None = None,
-) -> tuple[jax.Array, jax.Array]:
+    consume: "SelectionConsumer | None" = None,
+) -> tuple[jax.Array, ...]:
+    """Selected indices and published candidates; see `select_fp8_indexer_tiles`."""
+
+    def finish(selected, published):
+        if consume is None:
+            return selected, published
+        return selected, published, consume(0, selected, None, None)[0]
+
     layout = PackedFP8Layout(*layout_args)
     tokens, width = q.shape[0], score_width
     if tokens == 0:
-        return jnp.empty((0, min(topk, width)), jnp.int32), candidates
+        return finish(jnp.empty((0, min(topk, width)), jnp.int32), candidates)
     if q.shape[1:] != (32, 128) or width < 1:
         raise ValueError(
             "Packed FP8 model scorer requires H32/D128 and nonempty context"
@@ -689,7 +705,7 @@ def _select_fp8_indexer_jax(
         return output[inverse][:tokens], published[inverse][:tokens]
 
     if not stream_select or chunk_rows is None or chunk_rows > rows or padded != tokens:
-        return select_serial()
+        return finish(*select_serial())
 
     def select(tile, scores, group):
         row_lengths = jax.lax.dynamic_slice_in_dim(
@@ -719,11 +735,30 @@ def _select_fp8_indexer_jax(
             )
         return selected
 
-    def write(tile, selected, output):
+    # Batch-wide short-context bypass: every visible key, as in the reference.
+    # A select rather than a cond keeps the scoring path free of branches.
+    short = jnp.minimum(batch_max.max(), width) <= topk
+    ids = jnp.arange(topk, dtype=jnp.int32)
+    visible = jnp.where(ids < lengths[:tokens, None], ids, -1)
+    num_tiles = padded // chunk_rows
+    bounded = prefill_chunk_rows is not None or publish_rows
+    # Unrolled tiles have static row offsets, so each tile's selection feeds
+    # the consumer while later tiles are still scored and selected.
+    unrolled = not bounded or num_tiles <= indexer.MAX_UNROLLED_TILES
+    tile_consume = consume if unrolled else None
+
+    def write(tile, selected, output, following):
         update = functools.partial(
             jax.lax.dynamic_update_slice_in_dim, start_index=tile * chunk_rows, axis=0
         )
-        return jax.tree.map(update, output, selected)
+        if tile_consume is None:
+            return jax.tree.map(update, output, selected), following
+        output, state = output
+        start = tile * chunk_rows
+        rows = selected[0] if publish_rows else selected
+        rows = jnp.where(short, visible[start : start + chunk_rows], rows)
+        state, following = tile_consume(start, rows, state, following)
+        return (jax.tree.map(update, output, selected), state), following
 
     # Grouped requests need neither sorting nor output reordering, so no
     # runtime branch to the serial path: a branch costs an overlay load at its
@@ -731,13 +766,18 @@ def _select_fp8_indexer_jax(
     output = jnp.full((tokens, topk), -1, jnp.int32)
     if publish_rows:
         output = (output, jnp.full(candidates.shape, -1, jnp.int32))
+    if tile_consume is not None:
+        output = (output, None)
     pipeline = (
-        indexer.pipeline_score_topk_bounded
-        if prefill_chunk_rows is not None or publish_rows
+        functools.partial(
+            indexer.pipeline_score_topk_bounded,
+            scheduling_groups=tile_consume is None,
+        )
+        if bounded
         else indexer.pipeline_score_topk_unrolled
     )
     selected = pipeline(
-        padded // chunk_rows,
+        num_tiles,
         lambda tile: tile * chunk_rows,
         lambda start, group: score(
             start, chunk_rows, inputs, pipelined=True, group=group
@@ -746,19 +786,22 @@ def _select_fp8_indexer_jax(
         write,
         output,
     )
+    state = None
+    if tile_consume is not None:
+        selected, state = selected
     published = candidates
     if publish_rows:
         selected, published = selected
         published = jnp.where(valid_requests[:, None], published, -1)
-    # Batch-wide short-context bypass: every visible key, as in the reference.
-    # A select rather than a cond keeps the scoring path free of branches.
-    short = jnp.minimum(batch_max.max(), width) <= topk
-    ids = jnp.arange(topk, dtype=jnp.int32)
-    visible = jnp.where(ids < lengths[:tokens, None], ids, -1)
-    return jnp.where(short, visible, selected), published
+    selected = jnp.where(short, visible, selected)
+    if consume is None:
+        return selected, published
+    if tile_consume is None:
+        return finish(selected, published)
+    return selected, published, state
 
 
-def select_fp8_indexer_jax(
+def select_fp8_indexer_tiles(
     q: jax.Array,
     banks: tuple[jax.Array, ...],
     page_table: jax.Array,
@@ -775,8 +818,20 @@ def select_fp8_indexer_jax(
     sparse_logits: bool,
     unordered: bool,
     score_width: int,
-) -> tuple[jax.Array, jax.Array]:
-    """Select exact FP8 scores with a bounded, overlapped prefill working set."""
+    *,
+    consume: "SelectionConsumer | None" = None,
+) -> tuple[jax.Array, ...]:
+    """Select exact FP8 scores with a bounded, overlapped prefill working set.
+
+    Returns selected [T, topk] logical indices and published candidates. With
+    ``consume``, a third result is its final state: every selected row reaches
+    ``consume(start, rows, state, following)`` exactly once, in ascending row
+    ranges, with ``state`` None at the first call; it returns the new state
+    and ``following``. Prefill tiles feed it as their selection completes,
+    so its work overlaps the scoring and selection of later tiles.
+    ``following`` is the input of the pipeline's next step (None at the
+    end): what the consumer gates it on is issued before that step.
+    """
     arguments = (
         q,
         banks,
@@ -813,7 +868,7 @@ def select_fp8_indexer_jax(
         or topk > width
         or jax.default_backend() != "tpu"
     ):
-        return _select_fp8_indexer_jax(*arguments, score_width)
+        return _select_fp8_indexer_jax(*arguments, score_width, consume=consume)
 
     # Score only the batch's live keys: 16,384-key steps while one resident K
     # tile covers them, then powers of two up to the full score width.
@@ -832,10 +887,54 @@ def select_fp8_indexer_jax(
         branch,
         [
             functools.partial(
-                _select_fp8_indexer_jax, *arguments, w, prefill_chunk_rows=chunk
+                _select_fp8_indexer_jax,
+                *arguments,
+                w,
+                prefill_chunk_rows=chunk,
+                consume=consume,
             )
             for w in widths
         ],
+    )
+
+
+def select_fp8_indexer_jax(
+    q: jax.Array,
+    banks: tuple[jax.Array, ...],
+    page_table: jax.Array,
+    weights: jax.Array,
+    lengths: jax.Array,
+    candidates: jax.Array,
+    requests: jax.Array,
+    batch_max: jax.Array,
+    query_start_loc: jax.Array,
+    layout_args: tuple[int, ...],
+    topk: int,
+    block_size: int,
+    candidate_write: bool,
+    sparse_logits: bool,
+    unordered: bool,
+    score_width: int,
+) -> tuple[jax.Array, jax.Array]:
+    """The registered selection op: `select_fp8_indexer_tiles` without a
+    consumer, whose signature holds only arrays and plain values."""
+    return select_fp8_indexer_tiles(
+        q,
+        banks,
+        page_table,
+        weights,
+        lengths,
+        candidates,
+        requests,
+        batch_max,
+        query_start_loc,
+        layout_args,
+        topk,
+        block_size,
+        candidate_write,
+        sparse_logits,
+        unordered,
+        score_width,
     )
 
 

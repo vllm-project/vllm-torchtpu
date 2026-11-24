@@ -2,6 +2,7 @@
 
 import contextlib
 import dataclasses
+import functools
 import math
 from collections.abc import Callable
 from typing import Any, cast
@@ -1660,6 +1661,47 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         weights = cast(torch.Tensor, weights)
                         keys_meta = metadata[indexer.k_cache.prefix]
                         index_cache = indexer.k_cache.kv_cache
+                        attend = None
+                        if (
+                            count
+                            and tiled
+                            and stage_cache is not None
+                            and self._source_attends
+                        ):
+                            main_cache = source.kv_cache
+                            pages = self._compressed_pages(
+                                main_cache, source_meta, stage_cache
+                            )
+                            if pages is not None:
+                                starts = source_meta.query_start_loc
+                                assert q is not None and csa2_metadata is not None
+                                assert csa2_bounds is not None
+                                # Selection, KV gather and attention of this
+                                # source layer in one program.
+                                attend = functools.partial(
+                                    csa2_adapter.select_attention,
+                                    lengths=lengths,
+                                    swa_valid=swa_valid,
+                                    q=q,
+                                    swa=swa_cache,
+                                    main=main_cache,
+                                    pages=pages,
+                                    main_starts=starts,
+                                    starts=swa.query_start_loc,
+                                    positions=positions,
+                                    sink=self.attn_sink,
+                                    cos_sin=self._tpu_rope_cache,
+                                    metadata=csa2_metadata,
+                                    bounds=csa2_bounds,
+                                    topk=indexer.indexer_op.topk_tokens,
+                                    block_size=max(
+                                        1, indexer.indexer_op.candidate_block_size
+                                    ),
+                                    score_width=max(1, capacity),
+                                    ratio=self.compress_ratio,
+                                    scale=self.scale,
+                                    non_causal=non_causal,
+                                )
                         selected = self._select_paged_indices(
                             qr,
                             positions,
@@ -1670,7 +1712,18 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             lengths,
                             swa_valid,
                             query_start_loc=keys_meta.query_start_loc,
+                            attend=attend,
                         )
+                        if attend is not None:
+                            result, main_records = selected
+                            stage_cache[comp_key] = (
+                                main_cache,
+                                pages,
+                                starts,
+                                main_records,
+                            )
+                            output.copy_(result)
+                            return None
                     if stage_cache is None or not tiled:
                         # Keep the persistent buffer's physical shape across compile
                         # buckets when not sharing stage-scoped main_records directly.
@@ -1710,22 +1763,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     (selected >= 0) & (selected < lengths) & swa_valid[:, None]
                 )
                 if tiled:
-                    if self._fp8_kv:
-                        pages_key = (
-                            "compressed_pages",
-                            self.compressed_cache_prefix,
-                        )
-                        pages = (
-                            stage_cache.get(pages_key)
-                            if stage_cache is not None
-                            else None
-                        )
-                        if pages is None:
-                            pages = main_cache.pages(_block_table(source_meta))
-                            if stage_cache is not None and pages is not None:
-                                stage_cache[pages_key] = pages
-                    else:
-                        pages = None
+                    pages = (
+                        self._compressed_pages(main_cache, source_meta, stage_cache)
+                        if self._fp8_kv
+                        else None
+                    )
                     if pages is not None:
                         # SparseMLA resolves pages itself (Pallas), avoiding a
                         # [tokens, topk] XLA gather of the block table here.
@@ -1814,6 +1856,30 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         output.copy_(result.masked_fill(swa_invalid_3d, 0))
         return None
 
+    @property
+    def _source_attends(self):
+        """Whether this layer's selection drives its attention in one program:
+        CSA2 with every query selected on this rank, from the full context."""
+        indexer = self.indexer
+        return (
+            self._csa2
+            and indexer is not None
+            and not self._all_indices_fit
+            and get_tensor_model_parallel_world_size() == 1
+            and indexer.indexer_op.candidate_blocks is None
+            and not indexer.indexer_op.candidate_write
+        )
+
+    def _compressed_pages(self, main_cache, source_meta, stage_cache):
+        """Physical main-KV pages of the block table, shared within a stage."""
+        pages_key = ("compressed_pages", self.compressed_cache_prefix)
+        pages = stage_cache.get(pages_key) if stage_cache is not None else None
+        if pages is None:
+            pages = main_cache.pages(_block_table(source_meta))
+            if stage_cache is not None and pages is not None:
+                stage_cache[pages_key] = pages
+        return pages
+
     def _select_paged_indices(
         self,
         qr,
@@ -1825,11 +1891,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         lengths,
         swa_valid,
         query_start_loc=None,
+        attend=None,
     ):
         """Select logical indices from the already-published Index-K cache.
 
         ``query_start_loc``: request row boundaries of ``qr``, which spare the
-        FP8 indexer from deriving them from ``requests``.
+        FP8 indexer from deriving them from ``requests``. ``attend`` (see
+        `_source_attends`) takes the dense selection's inputs instead and
+        its result is returned.
         """
         indexer = self.indexer
         count = qr.shape[0]
@@ -1941,6 +2010,18 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
             weights_part = weights_part.float() * q_scale.squeeze(-1)
 
+        if attend is not None:
+            assert not split and offsets_part is not None
+            return attend(
+                q_part,
+                index_cache,
+                records,
+                weights_part,
+                lengths_part,
+                requests_part,
+                batch_max,
+                offsets_part,
+            )
         selected, published = indexer.indexer_op(
             q_part,
             weights_part,

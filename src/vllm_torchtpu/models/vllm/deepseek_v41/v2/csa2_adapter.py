@@ -14,12 +14,14 @@ from vllm_torchtpu.kernels.attention_preprocessing import rope_gather
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
 from vllm_torchtpu.kernels.deepseek_v41 import output_projection
 from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
+    gather_csa2_kv_sc,
     prepare_main_records,
     prepare_swa_metadata,
     publish_csa2_kv,
 )
 from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2 import csa2
 from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
+    csa2_attend_rows,
     csa2_gather_chunk_size,
     csa2_pipeline_chunks,
 )
@@ -216,12 +218,192 @@ def _gather_attend(
     )
 
 
+def _select_gather_attend(
+    index_q: jax.Array,
+    index_banks: tuple[jax.Array, ...],
+    index_table: jax.Array,
+    weights: jax.Array,
+    index_lengths: jax.Array,
+    candidates: jax.Array,
+    requests: jax.Array,
+    batch_max: jax.Array,
+    index_starts: jax.Array,
+    lengths: jax.Array,
+    swa_valid: jax.Array,
+    q: jax.Array,
+    raw: jax.Array,
+    high: jax.Array | None,
+    scales: jax.Array,
+    high_scales: jax.Array | None,
+    pages: jax.Array,
+    main_starts: jax.Array,
+    swa: jax.Array,
+    swa_high: jax.Array | None,
+    starts: jax.Array,
+    positions: jax.Array,
+    sink: jax.Array,
+    cos_sin: jax.Array,
+    metadata: jax.Array,
+    bounds: jax.Array,
+    layout_args: tuple[int, ...],
+    topk: int,
+    block_size: int,
+    score_width: int,
+    main_page_size: int,
+    swa_page_size: int,
+    ratio: int,
+    scale: float,
+    non_causal: bool,
+    bq: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Index selection, KV gather and attention of a source layer in one program.
+
+    Each indexer tile's selection is gathered and attended while later tiles
+    are still scored (TensorCore) and selected (SparseCore), so the gather
+    overlaps scoring instead of following the whole selection. Returns the
+    attention output, the main records [T,512] for stage reuse, and the
+    gathered words, scales and valid counts, as `_gather_attend` does.
+    """
+    from .indexer_fp8 import select_fp8_indexer_tiles
+
+    tokens = q.shape[0]
+    swa_pages = swa_word_pages(
+        swa if swa_high is None else (swa, swa_high), swa_page_size
+    )
+    word_banks = raw if high is None else (raw, high)
+    scale_banks = scales if high_scales is None else (scales, high_scales)
+    rope = _inverse_rope(cos_sin, positions)
+    sink = sink.astype(jnp.float32)
+    kwargs = dict(
+        swa_metadata=metadata,
+        swa_bounds=bounds if non_causal else None,
+        scale=scale,
+        compress_ratio=ratio,
+        bq=bq,
+    )
+    deep = envs.TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER
+
+    def mask(start, selected):
+        end = start + selected.shape[0]
+        valid = (
+            (selected >= 0)
+            & (selected < lengths[start:end])
+            & swa_valid[start:end, None]
+        )
+        return jnp.where(valid, selected, -1)
+
+    def consume(start, selected, state, following):
+        selected = mask(start, selected)
+        if state is None and selected.shape[0] == tokens:
+            output, words, gathered_scales, counts = _gather_attend(
+                q,
+                raw,
+                high,
+                scales,
+                high_scales,
+                selected,
+                pages,
+                main_starts,
+                swa,
+                swa_high,
+                starts,
+                positions,
+                sink,
+                cos_sin,
+                metadata,
+                bounds,
+                main_page_size,
+                swa_page_size,
+                ratio,
+                scale,
+                non_causal,
+                bq,
+            )
+            return (output, words, gathered_scales, counts), following
+        rows = selected.shape[0]
+        records, counts = prepare_main_records(
+            selected,
+            pages,
+            jnp.clip(main_starts - start, 0, rows),
+            page_size=main_page_size,
+            onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
+        )
+        if following is not None:
+            # Records before the pipeline's next step, so the gather is
+            # issued ahead of it and runs beside it instead of after it.
+            records, following = jax.lax.optimization_barrier((records, following))
+        gathered = gather_csa2_kv_sc(word_banks, scale_banks, records, deep=deep)
+        if state is None:
+            owners, pending = None, None
+            all_scales = jnp.zeros((tokens, 512), jnp.float32)
+            all_counts = jnp.zeros((tokens,), jnp.int32)
+        else:
+            owners, all_scales, all_counts, pending = state
+        update = functools.partial(jax.lax.dynamic_update_slice_in_dim, axis=0)
+        all_scales = update(all_scales, gathered[1], start)
+        all_counts = update(all_counts, counts, start)
+
+        def attend(owners, offset, tile_gathered, tile_counts):
+            return csa2_attend_rows(
+                q,
+                tile_gathered,
+                tile_counts,
+                owners,
+                swa_pages,
+                starts,
+                positions,
+                sink,
+                rope,
+                offset=offset,
+                **kwargs,
+            )
+
+        # Attention runs one tile behind its gather: the previous tile's KV
+        # is complete, so it never waits on the gather just started.
+        if pending is not None:
+            owners = attend(owners, start - pending[1].shape[0], *pending)
+        if start + rows < tokens:
+            return (owners, all_scales, all_counts, (gathered, counts)), following
+        owners = attend(owners, start, gathered, counts)
+        return (*owners, all_scales, all_counts), following
+
+    selected, _, (output, words, gathered_scales, counts) = select_fp8_indexer_tiles(
+        index_q,
+        index_banks,
+        index_table,
+        weights,
+        index_lengths,
+        candidates,
+        requests,
+        batch_max,
+        index_starts,
+        layout_args,
+        topk,
+        block_size,
+        False,
+        False,
+        True,
+        score_width,
+        consume=consume,
+    )
+    return output, mask(0, selected), words, gathered_scales, counts
+
+
 def _fake_gather_attend(q, raw, high, scales, high_scales, *_):
     return (
         torch.empty_like(q),
         raw.new_empty((q.shape[0], 512, 128)),
         scales.new_empty((q.shape[0], 512)),
         raw.new_empty((q.shape[0],)),
+    )
+
+
+def _fake_select_gather_attend(index_q, index_banks, index_table, weights, *rest):
+    q, raw, high, scales = rest[7:11]
+    return (
+        torch.empty_like(q),
+        raw.new_empty((q.shape[0], 512)),
+        *_fake_gather_attend(q, raw, high, scales, None)[1:],
     )
 
 
@@ -457,6 +639,12 @@ def initialize_csa2_ops() -> None:
             _fake_gather_attend,
         ),
         (
+            "select_gather_attend",
+            _select_gather_attend,
+            (P(),) * 26 + (None,) * 10,
+            _fake_select_gather_attend,
+        ),
+        (
             "project",
             _project,
             (P(),) * 3,
@@ -478,6 +666,7 @@ def initialize_csa2_ops() -> None:
         "publish_main_banked": 4,
         "publish_swa_banked": 2,
         "gather_attend": 4,
+        "select_gather_attend": 5,
     }
     donated = {
         "prepare_publish_swa": (0,),
@@ -549,6 +738,10 @@ def publish_swa(
         cache.raw_hi.copy_(high)
 
 
+def _attention_bq(tokens: int) -> int:
+    return 6 if tokens <= 384 else 16
+
+
 def attention(
     q: torch.Tensor,
     swa: "PagedCacheRows",
@@ -570,7 +763,7 @@ def attention(
 
     if not q.shape[0]:
         return q
-    bq = 6 if q.shape[0] <= 384 else 16
+    bq = _attention_bq(q.shape[0])
     if not records.shape[1]:
         return _ops["attend_swa"](
             q,
@@ -653,6 +846,91 @@ def attention(
         non_causal,
         bq,
     )
+
+
+def select_attention(
+    index_q: torch.Tensor,
+    index_cache: Any,
+    index_table: torch.Tensor,
+    weights: torch.Tensor,
+    index_lengths: torch.Tensor,
+    requests: torch.Tensor,
+    batch_max: torch.Tensor,
+    index_starts: torch.Tensor,
+    lengths: torch.Tensor,
+    swa_valid: torch.Tensor,
+    q: torch.Tensor,
+    swa: "PagedCacheRows",
+    main: "PagedCacheRows",
+    pages: torch.Tensor,
+    main_starts: torch.Tensor,
+    starts: torch.Tensor,
+    positions: torch.Tensor,
+    sink: torch.Tensor,
+    cos_sin: torch.Tensor,
+    metadata: torch.Tensor,
+    bounds: torch.Tensor,
+    *,
+    topk: int,
+    block_size: int,
+    score_width: int,
+    ratio: int,
+    scale: float,
+    non_causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A source layer's index selection and attention (`_select_gather_attend`).
+
+    The index arguments are those of the packed FP8 indexer's dense selection.
+    Returns the attention output and the main records, whose gathered KV is
+    published to the stage's gathered-KV cache for the layers that reuse it.
+    """
+    from . import attention_kernels
+
+    assert main.scale is not None
+    output, records, words, scales, counts = _ops["select_gather_attend"](
+        index_q,
+        index_cache.banks,
+        index_table.int(),
+        weights,
+        index_lengths.flatten().int(),
+        index_lengths.new_empty((index_q.shape[0], 0), dtype=torch.int32),
+        requests.int(),
+        batch_max.reshape(1).int(),
+        index_starts.int(),
+        lengths.int(),
+        swa_valid,
+        q,
+        main.raw,
+        main.raw_hi,
+        main.scale,
+        main.scale_hi,
+        pages.int(),
+        main_starts.int(),
+        swa.raw,
+        swa.raw_hi,
+        starts.int(),
+        positions.int(),
+        sink,
+        cos_sin,
+        metadata.int(),
+        bounds.int(),
+        index_cache._layout_args(),
+        topk,
+        block_size,
+        score_width,
+        main.shape[1],
+        swa.shape[1],
+        ratio,
+        scale,
+        non_causal,
+        _attention_bq(q.shape[0]),
+    )
+    cache = attention_kernels._active_gathered_kv
+    if cache is not None:
+        cache.put(
+            main, records, ("csa2", main.shape[1]), (words, scales), valid_counts=counts
+        )
+    return output, records
 
 
 def project(
