@@ -242,6 +242,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PLE_HISTORY_ROW_KERNEL: bool = False
     VLLM_TPU_PLE_SKIP_EMPTY_CHUNKS: bool = False
     VLLM_TPU_PLE_OWNED_GATHER_PCT: int = 0
+    VLLM_TPU_PLE_CONV_HISTORY_FAST: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -1299,6 +1300,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_PLE_OWNED_GATHER_PCT": env_nonnegative_int(
         "VLLM_TPU_PLE_OWNED_GATHER_PCT", 0
     ),
+    # Qwen4-exp PLE short conv (request-owned history): skip history at tap
+    # distance 0 and gather only each request's first `distance` history rows
+    # for the others when requests * distance < token_count (bit-identical).
+    "VLLM_TPU_PLE_CONV_HISTORY_FAST": env_bool("VLLM_TPU_PLE_CONV_HISTORY_FAST"),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.
