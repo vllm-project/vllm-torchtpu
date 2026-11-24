@@ -263,6 +263,7 @@ def _build_kda(monkeypatch, *, speculative_config=None):
     return layer, vllm_config, built
 
 
+@pytest.mark.tpu_test
 def test_kda_construction_wires_wide_value_heads_and_state(monkeypatch):
     """The real constructor: projections sized for d_v != d_k, the op built
     with the config's beta scale, the layer registered under its prefix, and
@@ -285,6 +286,7 @@ def test_kda_construction_wires_wide_value_heads_and_state(monkeypatch):
     )
 
 
+@pytest.mark.tpu_test
 def test_kda_construction_rejects_speculative_decoding(monkeypatch):
     with pytest.raises(NotImplementedError, match="speculative"):
         _build_kda(monkeypatch, speculative_config=SimpleNamespace())
@@ -301,6 +303,7 @@ class _Fn(nn.Module):
         return self.fn(x), None
 
 
+@pytest.mark.tpu_test
 def test_kda_forward_feeds_the_op_wide_value_shapes(monkeypatch):
     """forward splits the projections into the op's inputs at d_v != d_k
     widths, hands it both caches, and reshapes its [T, heads, d_v] output."""
