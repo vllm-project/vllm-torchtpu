@@ -283,6 +283,7 @@ if TYPE_CHECKING:
     TPU_PP_WARM_FIRST: bool = False
     TPU_PP_WARM_FIRST_AGING: float = 10000.0
     TPU_PP_WARM_FIRST_TIER: bool = False
+    TPU_PP_WARM_FIRST_WINDOW: int = 0
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
@@ -2166,6 +2167,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # nothing (offload/raiden_connector.py host_tier_hit_tokens). Off: only the
     # local prefix cache counts. Host-only.
     "TPU_PP_WARM_FIRST_TIER": env_bool("TPU_PP_WARM_FIRST_TIER", default=False),
+    # Maximum number of waiting requests ordered by TPU_PP_WARM_FIRST each
+    # step. 0 keeps the default window of 128; positive values scan up to that
+    # many waiting requests; -1 scans the full waiting queue (unbounded).
+    # Host-only.
+    "TPU_PP_WARM_FIRST_WINDOW": env_int("TPU_PP_WARM_FIRST_WINDOW", 0),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,
