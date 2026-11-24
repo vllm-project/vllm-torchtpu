@@ -1,0 +1,1 @@
+"""q38 oxk form root (Q38_FORM=oxk): vllm_torchtpu/ below is q38 K3-ox.1 1ea5a165a7:src/vllm_torchtpu/_forms/oxpd/vllm_torchtpu byte for byte (= 859e11f16e, the HIX points; w3 + 4 default-off overlay commits). Never imported by any form."""

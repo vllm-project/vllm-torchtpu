@@ -1,0 +1,1 @@
+"""q38 d1121 form root (Q38_FORM=d1121): vllm_torchtpu/ below is d8f139fa:src/vllm_torchtpu (= caojx/qwen38-flash-1121) byte for byte, without its _forms/ and with __init__.py = its _bl_init.py (the default-form init body those runs executed). Never imported by any form."""
