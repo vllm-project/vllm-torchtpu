@@ -400,9 +400,12 @@ def _kernel(
                 store_out(out)
 
         def store_lse(lse):  # [rows, 1], or [rows, rows] equal along the lanes
+            rows = lse.shape[0]
+            if rows > _LANES:
+                lse_ref[...] = lse[:, :1].T.reshape(lse_ref.shape)
+                return
             # Lane-dense row: each row's value picked off the diagonal by a
             # sublane sum (a transpose was the finish's critical path).
-            rows = lse.shape[0]
             eye = jax.lax.broadcasted_iota(
                 jnp.int32, (rows, rows), 0
             ) == jax.lax.broadcasted_iota(jnp.int32, (rows, rows), 1)
@@ -712,10 +715,8 @@ def _kernel(
             store_lse(jnp.log(l_new[:, : l_new.shape[0]]))
 
         def empty():
-            write(
-                jnp.zeros((num_heads * block_q, head_dim), jnp.float32),
-                jnp.full((num_heads * block_q, 1), -jnp.inf, jnp.float32),
-            )
+            put(jnp.zeros((num_heads * block_q, head_dim), jnp.float32))
+            lse_ref[...] = jnp.full(lse_ref.shape, -jnp.inf, jnp.float32)
 
         def alone():
             """The group's body at its own width, as a unit of one."""
