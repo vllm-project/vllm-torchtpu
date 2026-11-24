@@ -987,35 +987,49 @@ def _install_stoppable_checkpoint_prefetch() -> None:
 _loaded_weight_files: dict[str, None] = {}
 
 
-def _wait_for_every_loader() -> None:
-    """Wait until every rank of this engine has finished loading.
+def _evict_on_every_rank() -> bool:
+    """Whether TPU_EVICT_WEIGHTS_PAGE_CACHE is on for every rank of this engine.
 
-    A barrier over the world group's CPU (gloo) group, bounded by that group's
-    timeout (``--cpu-distributed-timeout-seconds``; torch's default, 30
-    minutes, when unset). Rank 0 enforces it through ``monitored_barrier``,
-    whose error names the first rank that did not arrive. The other ranks are
-    bounded by the same value because the gloo group was created with it. So
-    if a rank failed or stalled before this point, every rank fails within
-    about that time instead of hanging.
+    Each process reads the flag from its own environment, and on a multi-host
+    engine each host starts its own process, so the ranks can disagree. Every
+    rank calls this once it has loaded every model, with the flag on or off,
+    and the ranks agree on the minimum: if a rank has it off, no rank evicts.
+
+    The agreement is an all-reduce over the world group's CPU (gloo) group, so
+    it also waits until every rank has finished loading, bounded by that
+    group's timeout (``--cpu-distributed-timeout-seconds``; torch's default,
+    30 minutes, when unset). If a rank failed or stalled before this point,
+    every rank fails within about that time instead of hanging.
     """
     from vllm.distributed import parallel_state
 
+    from vllm_torchtpu import utils
+
+    enabled = int(envs.TPU_EVICT_WEIGHTS_PAGE_CACHE)
     try:
         group = parallel_state.get_world_group()
     except AssertionError:
-        return  # distributed state not initialized: a single process
+        return bool(enabled)  # distributed state not initialized: one process
     if group.world_size <= 1:
-        return
-    timeout = group.cpu_timeout or default_pg_timeout
+        return bool(enabled)
     try:
-        torch.distributed.monitored_barrier(group=group.cpu_group, timeout=timeout)
+        agreed = utils.min_over_group(enabled, group.cpu_group)
     except RuntimeError as e:
+        timeout = group.cpu_timeout or default_pg_timeout
         raise RuntimeError(
-            "TPU_EVICT_WEIGHTS_PAGE_CACHE: not every rank finished loading "
-            f"within {timeout.total_seconds():.0f} s (the CPU group timeout, "
-            "--cpu-distributed-timeout-seconds); a rank failed or stalled during "
-            "the load"
+            "Not every rank of this engine finished loading within "
+            f"{timeout.total_seconds():.0f} s (the CPU group timeout): a rank "
+            "failed or stalled during the load. Look for its error in the logs "
+            "of every host; if the load is only slow, raise "
+            "--cpu-distributed-timeout-seconds."
         ) from e
+    if enabled and not agreed:
+        logger.warning(
+            "[tpu-model-loader] TPU_EVICT_WEIGHTS_PAGE_CACHE is on in this "
+            "process but off on another rank of this engine, so no rank evicts "
+            "the weight page cache. Set it on every host to evict."
+        )
+    return bool(agreed)
 
 
 def evict_loaded_weights_page_cache() -> None:
@@ -1027,18 +1041,17 @@ def evict_loaded_weights_page_cache() -> None:
     The prefetch threads (``_start_prefetch``) serve no load after this
     point, so every rank stops its own first, with or without eviction.
 
-    With TPU_EVICT_WEIGHTS_PAGE_CACHE (opt-in), every rank of this engine then
-    waits for every other one to finish loading before it evicts, bounded by
-    the CPU group's timeout (``_wait_for_every_loader``). The page cache is
-    shared across a host's ranks, and a slower rank (or, under pipeline
-    parallelism, a later stage's draft load) may still be reading the
-    checkpoint. A rank that never arrives fails the load instead of hanging
-    the others. A second eviction of a file is cheap.
+    Then every rank agrees on TPU_EVICT_WEIGHTS_PAGE_CACHE (opt-in), which
+    also waits for every other rank to finish loading, bounded by the CPU
+    group's timeout (``_evict_on_every_rank``). The page cache is shared
+    across a host's ranks, and a slower rank (or, under pipeline parallelism,
+    a later stage's draft load) may still be reading the checkpoint. A rank
+    that never arrives fails the load instead of hanging the others. If every
+    rank has the flag on, each evicts; a second eviction of a file is cheap.
     """
     _stop_ep_range_prefetch()
-    if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE:
+    if not _evict_on_every_rank():
         return
-    _wait_for_every_loader()
     if not _loaded_weight_files:
         return
     files = list(_loaded_weight_files)

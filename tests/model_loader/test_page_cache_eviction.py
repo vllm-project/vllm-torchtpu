@@ -170,85 +170,79 @@ def test_disabled_still_stops_prefetch(evicted, monkeypatch):
     assert evicted == []
 
 
-def test_eviction_waits_for_every_loader(evicted, monkeypatch):
-    # Stop, then wait for every rank's loads, then evict. A rank with no
-    # files still waits, so every rank enters the wait.
+@pytest.mark.parametrize("agreed", [True, False], ids=["every-rank-on", "a-rank-off"])
+def test_eviction_waits_for_every_loader(evicted, monkeypatch, agreed):
+    # Stop, then agree on the flag, which waits for every rank's loads, then
+    # evict only if every rank has the flag on. A rank with no files still
+    # joins the agreement, so every rank enters it.
     order: list[str] = []
+
+    def agree():
+        order.append("agree")
+        return agreed
+
     monkeypatch.setattr(mlp, "_stop_ep_range_prefetch", lambda: order.append("stop"))
-    monkeypatch.setattr(mlp, "_wait_for_every_loader", lambda: order.append("wait"))
+    monkeypatch.setattr(mlp, "_evict_on_every_rank", agree)
     monkeypatch.setattr(
         mlp, "_evict_checkpoint_page_cache", lambda files: order.append("evict")
     )
     mlp.evict_loaded_weights_page_cache()
-    assert order == ["stop", "wait"]
+    assert order == ["stop", "agree"]
     order.clear()
     mlp._loaded_weight_files.update(dict.fromkeys(["a"]))
     mlp.evict_loaded_weights_page_cache()
-    assert order == ["stop", "wait", "evict"]
+    assert order == ["stop", "agree", "evict"] if agreed else ["stop", "agree"]
 
 
-def test_wait_for_every_loader_without_distributed_state():
-    # A single process has no world group: nothing to wait for.
-    mlp._wait_for_every_loader()
-
-
-def _group(cpu_timeout):
-    return SimpleNamespace(
-        world_size=2, cpu_group=object(), cpu_timeout=cpu_timeout, local_rank=0
-    )
+@pytest.mark.parametrize("flag", [True, False])
+def test_agreement_without_distributed_state(monkeypatch, flag):
+    # A single process has no world group: its own flag decides.
+    monkeypatch.setattr(envs, "TPU_EVICT_WEIGHTS_PAGE_CACHE", flag, raising=False)
+    assert mlp._evict_on_every_rank() is flag
 
 
 @pytest.mark.parametrize(
     "cpu_timeout, expected_s",
-    [(datetime.timedelta(seconds=12), 12.0), (None, 1800.0)],
+    [(datetime.timedelta(seconds=12), 12), (None, 1800)],
     ids=["cpu-distributed-timeout", "torch-default"],
 )
-def test_wait_for_every_loader_uses_the_cpu_group_timeout(
-    monkeypatch, cpu_timeout, expected_s
+def test_load_fails_fast_when_a_rank_never_arrives(
+    evicted, monkeypatch, cpu_timeout, expected_s
 ):
-    # The CPU group's timeout (None: torch's 30-minute default) bounds the wait.
-    from vllm.distributed import parallel_state
-
-    calls = []
-
-    def barrier(group, timeout):
-        calls.append((group, timeout.total_seconds()))
-
-    group = _group(cpu_timeout)
-    monkeypatch.setattr(parallel_state, "get_world_group", lambda: group)
-    monkeypatch.setattr(mlp.torch.distributed, "monitored_barrier", barrier)
-    mlp._wait_for_every_loader()
-    assert calls == [(group.cpu_group, expected_s)]
-
-
-def test_load_fails_fast_when_a_rank_never_arrives(evicted, monkeypatch):
     # A rank that failed or stalled before the end of loading fails the load
-    # (the barrier's error, naming a rank that did not arrive, is chained),
-    # not a hang.
+    # with the CPU group's timeout (None: torch's 30-minute default) in the
+    # message and the collective's error chained, not a hang.
     from vllm.distributed import parallel_state
 
-    def barrier(group, timeout):
-        raise RuntimeError("Rank 1 failed to pass monitoredBarrier")
+    from vllm_torchtpu import utils
 
-    group = _group(datetime.timedelta(seconds=12))
+    def all_reduce(value, cpu_group):
+        raise RuntimeError("Timed out waiting for recv operation to complete")
+
+    group = SimpleNamespace(world_size=2, cpu_group=object(), cpu_timeout=cpu_timeout)
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: group)
-    monkeypatch.setattr(mlp.torch.distributed, "monitored_barrier", barrier)
+    monkeypatch.setattr(utils, "min_over_group", all_reduce)
     mlp._loaded_weight_files.update(dict.fromkeys(["a"]))
     with pytest.raises(
-        RuntimeError, match="not every rank finished loading within 12 s"
-    ):
+        RuntimeError, match=f"finished loading within {expected_s} s"
+    ) as info:
         mlp.evict_loaded_weights_page_cache()
+    assert "Timed out" in str(info.value.__cause__)
     assert evicted == []
 
 
 # The CPU group's timeout in the two-rank test below.
 _GLOO_TIMEOUT_S = 3
-# Per case: when each rank arrives at the loader wait, in seconds after the
-# case starts (None: never), and the outcome expected on each rank.
+# Per case: when each rank arrives at the agreement, in seconds after the case
+# starts (None: never), each rank's TPU_EVICT_WEIGHTS_PAGE_CACHE, and the
+# outcome expected on each rank ("on" and "off": the agreed flag).
 _TWO_RANK_CASES = {
-    "rank1-late": ((0, 1), ("ok", "ok")),
-    "rank1-absent": ((0, None), ("RuntimeError", "absent")),
-    "rank0-absent": ((None, 0), ("absent", "RuntimeError")),
+    "rank1-late": ((0, 1), (True, True), ("on", "on")),
+    "flag-off-on-rank1": ((0, 0), (True, False), ("off", "off")),
+    "flag-off-everywhere": ((0, 0), (False, False), ("off", "off")),
+    "rank1-absent": ((0, None), (True, True), ("RuntimeError", "absent")),
+    "rank0-absent": ((None, 0), (True, True), ("absent", "RuntimeError")),
+    "rank1-absent-flag-off": ((0, None), (False, False), ("RuntimeError", "absent")),
 }
 
 
@@ -258,7 +252,8 @@ def _loader_wait_rank(rank, init_file, out_file):
     Each case has its own gloo group, made as vLLM makes the world group's
     CPU group: with the CPU timeout. A rank absent from a case waits for the
     next case on the default group instead, so it stays up until the other
-    rank's wait has ended. Writes the outcomes to ``out_file``.
+    rank's agreement has ended. Writes the outcomes, with the warnings each
+    rank logged, to ``out_file``.
     """
     from vllm.distributed import parallel_state
 
@@ -277,11 +272,13 @@ def _loader_wait_rank(rank, init_file, out_file):
         for _ in _TWO_RANK_CASES
     ]
     outcomes = {}
-    for cpu_group, (case, (arrivals, _)) in zip(cpu_groups, _TWO_RANK_CASES.items()):
-        group = SimpleNamespace(
-            world_size=2, cpu_group=cpu_group, cpu_timeout=timeout, local_rank=rank
-        )
+    cases = _TWO_RANK_CASES.items()
+    for cpu_group, (case, (arrivals, flags, _)) in zip(cpu_groups, cases):
+        group = SimpleNamespace(world_size=2, cpu_group=cpu_group, cpu_timeout=timeout)
         parallel_state.get_world_group = lambda group=group: group
+        envs.TPU_EVICT_WEIGHTS_PAGE_CACHE = flags[rank]
+        logger = _RecordingLogger()
+        mlp.logger = logger
         torch.distributed.barrier()
         if arrivals[rank] is None:
             outcomes[case] = {"outcome": "absent"}
@@ -289,8 +286,7 @@ def _loader_wait_rank(rank, init_file, out_file):
         time.sleep(arrivals[rank])
         start = time.monotonic()
         try:
-            mlp._wait_for_every_loader()
-            outcome = {"outcome": "ok"}
+            outcome = {"outcome": "on" if mlp._evict_on_every_rank() else "off"}
         except Exception as e:
             outcome = {
                 "outcome": type(e).__name__,
@@ -298,6 +294,9 @@ def _loader_wait_rank(rank, init_file, out_file):
                 "cause": repr(e.__cause__),
             }
         outcome["elapsed_s"] = time.monotonic() - start
+        outcome["warnings"] = [
+            msg for level, msg in logger.records if level == logging.WARNING
+        ]
         outcomes[case] = outcome
     torch.distributed.barrier()
     with open(out_file, "w") as f:
@@ -339,23 +338,25 @@ def two_rank_outcomes(tmp_path_factory):
 )
 @pytest.mark.parametrize("case", list(_TWO_RANK_CASES))
 def test_two_rank_loader_wait(two_rank_outcomes, case):
-    """A real gloo barrier: a late rank passes; an absent one fails every rank.
+    """A real gloo all-reduce agrees on the flag and waits for every rank.
 
-    ``monitored_barrier`` enforces its timeout on rank 0 only, so the
-    rank0-absent case shows the gloo group's own timeout bounds rank 1.
+    A late rank passes; a rank with the flag off turns eviction off on every
+    rank, and the rank that had it on warns; a rank that never arrives fails
+    every other rank within the CPU group's timeout, with the flag on or off.
     """
     outcomes = two_rank_outcomes[case]
-    _, expected = _TWO_RANK_CASES[case]
+    _, flags, expected = _TWO_RANK_CASES[case]
     assert [o["outcome"] for o in outcomes] == list(expected), outcomes
-    for rank, outcome in enumerate(outcomes):
+    for flag, outcome in zip(flags, outcomes):
+        if outcome["outcome"] == "absent":
+            continue
         if outcome["outcome"] == "RuntimeError":
             assert f"loading within {_GLOO_TIMEOUT_S} s" in outcome["message"]
             assert outcome["elapsed_s"] < _GLOO_TIMEOUT_S + 5, outcomes
-            if rank == 0:
-                # monitored_barrier's error, chained, names the absent rank.
-                assert "Rank 1" in outcome["cause"], outcomes
-        elif outcome["outcome"] == "ok":
+        else:
             assert outcome["elapsed_s"] < _GLOO_TIMEOUT_S, outcomes
+        warned = flag and outcome["outcome"] == "off"
+        assert len(outcome["warnings"]) == warned, outcomes
 
 
 class _RecordingLogger:

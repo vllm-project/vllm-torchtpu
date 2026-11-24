@@ -1086,10 +1086,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_BLOCK_MAJOR_KV": env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
     # With DefaultModelLoader (dense and MoE models), evict the host page cache
     # of the checkpoint weight files (posix_fadvise DONTNEED) once the runner
-    # has loaded every model (target and draft). Every rank of this engine's
-    # world group first waits for the others (one engine: separate engines on a
-    # host, such as data-parallel replicas run as separate engines, are not
-    # coordinated), bounded by the CPU group's timeout
+    # has loaded every model (target and draft). The ranks of this engine's
+    # world group agree on the flag, on or off: if a rank has it off, no rank
+    # evicts. The agreement waits for every rank (one engine: separate engines
+    # on a host, such as data-parallel replicas run as separate engines, are
+    # not coordinated), bounded by the CPU group's timeout
     # (--cpu-distributed-timeout-seconds; 30 min when unset); if a rank never
     # arrives, every rank fails the load. Every prefetch thread is stopped
     # first: the EP range prefetch (either way) and upstream's whole-file
