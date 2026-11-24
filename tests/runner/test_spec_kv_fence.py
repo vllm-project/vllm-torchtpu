@@ -13,15 +13,18 @@
 # limitations under the License.
 
 """The sampled-token copy of a Stage-3 KV producer with a drafter is fenced
-behind every KV write of the step, so a consumer that pulls on the first
-token (the producer registered its blocks ahead of the finish) never reads
-deferred draft KV writes."""
+behind every KV write of the step when the producer registers its blocks
+ahead of the finish, so a consumer that pulls on the first token never
+reads deferred draft KV writes. Producers that register at the finish sync
+the KV caches before registering and are not fenced."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
 
+import pytest
 import torch
+from vllm.config import KVTransferConfig
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
 
@@ -66,7 +69,36 @@ def test_fence_pending_device_work_rearms_ready_event(monkeypatch):
     assert state.chunks_tpu is None
 
 
-def _runner(*, producer: bool, method: str | None) -> TPUModelRunner:
+@pytest.fixture
+def stage3_env(monkeypatch):
+    """Sets envs over a non-GLM Raiden Stage-3 producer's: the Raiden
+    transport, register-ahead at its default (on) and no finish-time
+    admission (GLM, DSv4, Kimi-K3)."""
+
+    def set_envs(**overrides):
+        values = {
+            "TPU_KV_RESHARD_TRANSPORT": "raiden",
+            "TPU_RAIDEN_STAGE3_REGISTER_AHEAD": True,
+            "TPU_USE_RAIDEN_KV_CACHE_MANAGER": False,
+            "TPU_RAIDEN_GLM_ADMISSION": False,
+            "TPU_RAIDEN_DSV4_ADMISSION": False,
+            "TPU_RAIDEN_KIMIK3_ADMISSION": False,
+            **overrides,
+        }
+        for name, value in values.items():
+            monkeypatch.setattr(tpu_envs, name, value, raising=False)
+
+    set_envs()
+    return set_envs
+
+
+def _runner(
+    *,
+    producer: bool = True,
+    method: str | None = "mtp",
+    pp_size: int = 1,
+    architecture: str = "Qwen3NextForCausalLM",
+) -> TPUModelRunner:
     runner = object.__new__(TPUModelRunner)
     runner.speculative_config = (
         SimpleNamespace(
@@ -76,28 +108,59 @@ def _runner(*, producer: bool, method: str | None) -> TPUModelRunner:
         else None
     )
     runner.vllm_config = SimpleNamespace(
-        kv_transfer_config=SimpleNamespace(is_kv_producer=producer)
+        kv_transfer_config=SimpleNamespace(is_kv_producer=producer),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
+        model_config=SimpleNamespace(architecture=architecture),
     )
     return runner
 
 
-def test_fence_applies_to_producers_with_a_device_drafter_only():
-    assert _runner(producer=True, method="mtp")._fence_spec_kv_under_token_copy
-    assert _runner(producer=True, method="eagle3")._fence_spec_kv_under_token_copy
-    assert _runner(producer=True, method="dflash")._fence_spec_kv_under_token_copy
-    assert not _runner(producer=True, method="ngram")._fence_spec_kv_under_token_copy
-    assert not _runner(producer=True, method=None)._fence_spec_kv_under_token_copy
-    assert not _runner(producer=False, method="mtp")._fence_spec_kv_under_token_copy
-    runner = _runner(producer=True, method="mtp")
-    runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
+def test_fence_applies_to_producers_with_a_device_drafter_only(stage3_env):
+    assert _runner(method="mtp")._fence_spec_kv_under_token_copy
+    assert _runner(method="eagle3")._fence_spec_kv_under_token_copy
+    assert _runner(method="dflash")._fence_spec_kv_under_token_copy
+    assert not _runner(method="ngram")._fence_spec_kv_under_token_copy
+    assert not _runner(method=None)._fence_spec_kv_under_token_copy
+    assert not _runner(producer=False)._fence_spec_kv_under_token_copy
+    runner = _runner()
+    runner.vllm_config.kv_transfer_config = None
     assert not runner._fence_spec_kv_under_token_copy
 
 
-def test_fence_follows_the_register_ahead_flag():
-    runner = _runner(producer=True, method="mtp")
-    with patch(
-        "vllm_torchtpu.runner.tpu_runner.dist_utils.get_stage3_register_ahead_enabled",
-        return_value=False,
-    ):
-        assert not runner._fence_spec_kv_under_token_copy
-    assert runner._fence_spec_kv_under_token_copy
+def test_fence_skips_an_offloading_server(stage3_env):
+    # kv_both counts as a KV producer, but without the Raiden Stage-3
+    # transport nothing registers ahead of the finish.
+    stage3_env(TPU_KV_RESHARD_TRANSPORT="zmq")
+    runner = _runner()
+    runner.vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="TPURaidenOffloadingConnector", kv_role="kv_both"
+    )
+    assert runner.vllm_config.kv_transfer_config.is_kv_producer
+    assert not runner._fence_spec_kv_under_token_copy
+
+
+@pytest.mark.parametrize("pp_size", (1, 2))
+def test_fence_skips_glm_producers(stage3_env, pp_size):
+    stage3_env(TPU_USE_RAIDEN_KV_CACHE_MANAGER=True, TPU_RAIDEN_GLM_ADMISSION=True)
+    assert not _runner(pp_size=pp_size)._fence_spec_kv_under_token_copy
+
+
+def test_fence_skips_dsv4_and_kimi_k3_producers(stage3_env):
+    stage3_env(TPU_USE_RAIDEN_KV_CACHE_MANAGER=True, TPU_RAIDEN_DSV4_ADMISSION=True)
+    assert not _runner()._fence_spec_kv_under_token_copy
+    stage3_env(TPU_USE_RAIDEN_KV_CACHE_MANAGER=True, TPU_RAIDEN_KIMIK3_ADMISSION=True)
+    assert _runner()._fence_spec_kv_under_token_copy
+    runner = _runner(architecture="KimiK3ForConditionalGeneration")
+    assert not runner._fence_spec_kv_under_token_copy
+
+
+def test_fence_follows_the_register_ahead_flag(stage3_env):
+    assert _runner()._fence_spec_kv_under_token_copy
+    stage3_env(TPU_RAIDEN_STAGE3_REGISTER_AHEAD=False)
+    assert not _runner()._fence_spec_kv_under_token_copy
+
+
+def test_fence_applies_to_pipeline_producers_without_the_flag(stage3_env):
+    # A pipeline producer registers ahead whatever the flag says.
+    stage3_env(TPU_RAIDEN_STAGE3_REGISTER_AHEAD=False)
+    assert _runner(pp_size=2)._fence_spec_kv_under_token_copy

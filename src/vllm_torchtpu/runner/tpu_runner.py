@@ -635,14 +635,18 @@ class TPUModelRunner(GPUModelRunner):
         """A KV producer whose Stage-3 registration is published ahead of
         the finish must have every KV write of a step, the drafter's
         included, executed before that step's sampled tokens reach the
-        host (the consumer pulls as soon as the first token is out)."""
-        if not self._is_async_drafter:
-            return False
-        transfer_config = self.vllm_config.kv_transfer_config
-        return (
-            transfer_config is not None
-            and bool(transfer_config.is_kv_producer)
-            and dist_utils.get_stage3_register_ahead_enabled()
+        host (the consumer pulls as soon as the first token is out).
+
+        Decided from the config, not the live connector: the spec-decode
+        warmup hides the connector group yet must trace the fenced programs
+        that serving runs."""
+        # tpu_connector imports this module.
+        from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+            stage3_register_ahead_enabled,
+        )
+
+        return self._is_async_drafter and stage3_register_ahead_enabled(
+            self.vllm_config
         )
 
     def __init__(
