@@ -1285,3 +1285,164 @@ def test_fused_scale_buffers_are_fresh_bases_aliased_by_the_parameters():
         assert buf in dict(layer.named_buffers())
         assert isinstance(weight, torch.nn.Parameter) and not weight.requires_grad
         assert weight.shape == ref.shape and weight.data_ptr() == table.data_ptr()
+
+
+def test_shared_fold_op_is_cached_apart_and_forwards_the_rows(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.kernels.fused_moe import v2
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    built = []
+
+    def build(name, fn, **kwargs):
+        built.append((fn, kwargs))
+        return Mock()
+
+    monkeypatch.setattr(bridge, "jax_op", build)
+    kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
+    args = (None, 2, True, "silu", None, False)
+    plain = bridge._build_op(*args)
+    folded = bridge._build_op(*args, has_shared_partial=True)
+    assert folded is not plain
+    assert bridge._build_op(*args, has_shared_partial=True) is folded
+    (plain_fn, plain_kw), (fold_fn, fold_kw) = built
+    plain_specs = plain_kw["input_partition_specs"]
+    assert fold_kw["input_partition_specs"] == plain_specs + plain_specs[:1]
+    x = jnp.ones((8, 8), dtype=jnp.bfloat16)
+    shared = jnp.full((8, 8), 2.0, dtype=jnp.bfloat16)
+    operands = (
+        x,
+        None,
+        None,
+        None,
+        None,
+        jnp.zeros((8, 4)),
+        jnp.zeros((1, 1), dtype=jnp.int32),
+    )
+    assert fold_fn(*operands, shared) is x
+    assert kernel.call_args.kwargs["shared_partial"] is shared
+    plain_fn(*operands)
+    assert "shared_partial" not in kernel.call_args.kwargs
+
+
+@pytest.mark.parametrize(
+    "enabled,overrides,staged",
+    [
+        pytest.param(False, {}, False, id="env-off"),
+        pytest.param(True, {}, True, id="plain"),
+        pytest.param(
+            True,
+            dict(e_score_correction_bias=torch.zeros(4 * _STUB_EP)),
+            False,
+            id="score-bias",
+        ),
+    ],
+)
+def test_prebuild_stages_the_shared_fold_op(enabled, overrides, staged):
+    layer = _layer(**overrides)
+
+    def build(*_args, has_shared_partial=False, **_kwargs):
+        return "fold-op" if has_shared_partial else "op"
+
+    with patch.object(envs, "MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT", enabled):
+        assert _prebuild(layer, build_op=build) == "op"
+    expected = "fold-op" if staged else None
+    assert getattr(layer, bridge._SHARED_FOLD_OP_ATTR, None) == expected
+
+
+def test_forward_hands_a_folded_shared_expert_its_rows():
+    seen = []
+    owner = SimpleNamespace()
+    setattr(
+        owner, bridge.FUSED_MOE_EP_OP_ATTR, lambda *args: seen.append(args) or args[0]
+    )
+    setattr(owner, bridge.FUSED_MOE_EP_SHARED_ATTR, lambda x: x + 1)
+    hidden = torch.zeros(1, 8)
+    weights = torch.empty(0)
+    scales = torch.ones(1, 1)
+    bridge.fused_moe_ep(owner, hidden, weights, weights, scales, scales, hidden)
+    assert len(seen[0]) == 8
+    assert torch.equal(seen[0][-1], hidden + 1)
+
+
+def _fold_runner():
+    """A runner `fold_shared_experts` admits, shaped as vLLM builds Qwen's."""
+    owner = SimpleNamespace(moe_kernel=None)
+    setattr(owner, bridge.FUSED_MOE_EP_OP_ATTR, "op")
+    routed = torch.nn.Module()
+    routed.quant_method = owner
+    setattr(routed, bridge._SHARED_FOLD_OP_ATTR, "fold-op")
+    shared = torch.nn.Module()
+    shared._layer = torch.nn.Linear(8, 8)
+    runner = VllmMoERunner.__new__(VllmMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.routed_experts = routed
+    runner._shared_experts = shared
+    runner.shared_expert_gate = None
+    runner.routed_input_transform = None
+    runner.routed_output_transform = None
+    runner.routed_scaling_factor = 1.0
+    runner.moe_config = SimpleNamespace(
+        is_sequence_parallel=False, skip_final_all_reduce=False
+    )
+    return runner
+
+
+def test_fold_hands_the_shared_expert_to_the_op():
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as upstream
+
+    folded, refused = _fold_runner(), _fold_runner()
+    refused.routed_scaling_factor = 2.5
+    model, draft = torch.nn.Module(), torch.nn.Module()
+    model.folded, model.refused = folded, refused
+    draft.folded = folded
+    owner, mlp = folded._quant_method, folded.shared_experts._layer
+    assert bridge.fold_shared_experts(model, draft) == 1
+    assert getattr(owner, bridge.FUSED_MOE_EP_OP_ATTR) == "fold-op"
+    assert getattr(owner, bridge.FUSED_MOE_EP_SHARED_ATTR) is mlp
+    assert folded.shared_experts is None
+    assert folded._forward_entry is upstream._moe_forward
+    assert any(p is mlp.weight for p in model.parameters())
+    assert getattr(refused._quant_method, bridge.FUSED_MOE_EP_OP_ATTR) == "op"
+    assert refused.shared_experts is not None
+
+
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        (
+            lambda r: setattr(r._quant_method, bridge.FUSED_MOE_EP_OP_ATTR, None),
+            "not armed",
+        ),
+        (lambda r: setattr(r, "_shared_experts", None), "no shared expert"),
+        (
+            lambda r: delattr(r.routed_experts, bridge._SHARED_FOLD_OP_ATTR),
+            "score bias",
+        ),
+        (lambda r: setattr(r, "shared_expert_gate", torch.nn.Linear(8, 1)), "gate"),
+        (
+            lambda r: setattr(r, "routed_input_transform", torch.nn.Identity()),
+            "input transform",
+        ),
+        (
+            lambda r: setattr(r, "routed_output_transform", torch.nn.Identity()),
+            "output transform",
+        ),
+        (lambda r: setattr(r, "routed_scaling_factor", 2.5), "routed_scaling"),
+        (
+            lambda r: setattr(r.moe_config, "is_sequence_parallel", True),
+            "sequence-parallel",
+        ),
+        (
+            lambda r: setattr(r.moe_config, "skip_final_all_reduce", True),
+            "skip_final_all_reduce",
+        ),
+    ],
+)
+def test_shared_fold_refusals(change, reason):
+    runner = _fold_runner()
+    assert bridge._shared_fold_refusal(runner) is None
+    change(runner)
+    assert reason in bridge._shared_fold_refusal(runner)

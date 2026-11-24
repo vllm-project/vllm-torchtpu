@@ -113,6 +113,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
+    MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
@@ -898,6 +899,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
+    # Hand an armed layer's TP-partial shared-expert output to the fused EP
+    # program, which reduces it while the activation all-gather is in flight
+    # instead of the runner all-reducing it after the layer. Delete once it is
+    # measured on serving and made the default.
+    "MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT": env_bool(
+        "MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT"
+    ),
     # Keep the fused EP MoE mesh in EP-rank order and do the activation
     # all-gather outside the kernel's program, over a process group in
     # ascending device-id order, so the SparseCore gather gets its

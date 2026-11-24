@@ -119,6 +119,12 @@ _RANK_BUFFER: Any = None
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
 
+# Under MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT: the op that also takes the shared
+# expert's TP-partial output, staged on the routed layer by prebuild, and the
+# shared-expert module `fold_shared_experts` hands to the quant method.
+_SHARED_FOLD_OP_ATTR = "_fused_moe_ep_shared_fold_op"
+FUSED_MOE_EP_SHARED_ATTR = "_fused_moe_ep_shared_expert"
+
 
 def _squeeze_channel_scale(
     scale: torch.Tensor, experts: int, channels: int
@@ -183,14 +189,20 @@ def _build_op(
     sorted_gather=None,
     w1_scales_expert_second_minor=False,
     w2_scales_expert_second_minor=False,
+    has_shared_partial=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
     `sorted_gather` is `ep_sorted_gather_group()`'s (group, positions), or
     None for the single fused program. With it the op is a `_SortedGatherOp`.
+    `has_shared_partial` appends the kernel's `shared_partial` operand; it is
+    built for the single fused program without a score bias or hash ids only.
     """
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
+    assert not has_shared_partial or not (
+        has_score_bias or has_hash_ids or sorted_gather is not None
+    )
     key = (
         topk,
         renormalize,
@@ -207,6 +219,7 @@ def _build_op(
         None if sorted_gather is None else sorted_gather[1],
         w1_scales_expert_second_minor,
         w2_scales_expert_second_minor,
+        has_shared_partial,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -309,6 +322,18 @@ def _build_op(
             hash_topk_ids=hash_ids.astype(jnp.int32),
         )
 
+    def moe_with_shared(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        shared: jax.Array,
+    ) -> jax.Array:
+        return call(x, w1, w2, w1_scale, w2_scale, gating, rank, shared_partial=shared)
+
     assert not (has_score_bias and has_hash_ids)
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
@@ -323,6 +348,7 @@ def _build_op(
         (spec,) * 7
         + ((PartitionSpec(),) if has_score_bias else ())
         + ((spec,) if has_hash_ids else ())
+        + ((spec,) if has_shared_partial else ())
     )
     # Stock jax_op. It used to size its outputs from the export's avals, where
     # a shard_map result is recorded as replicated, so this rank's 2048 rows
@@ -334,13 +360,16 @@ def _build_op(
         fn = moe_with_score_bias
     elif has_hash_ids:
         fn = moe_with_hash_ids
+    elif has_shared_partial:
+        fn = moe_with_shared
     else:
         fn = moe
     op = jax_op(
         name,
         fn,
         mesh=mesh,
-        # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
+        # x, w1, w2, w1_scale, w2_scale, gating, rank
+        # [, score_bias | hash_ids | shared]
         # -- and the single output is sharded on axis 0 like x.
         input_partition_specs=input_specs,
         output_partition_specs=spec,
@@ -582,8 +611,13 @@ def fused_moe_ep(
     thing on the layer -- prebuild built the op's signature around that.
     Getting it wrong is a torch arity error at the first call, not a wrong
     answer.
+
+    On a layer `fold_shared_experts` armed, the output also carries the shared
+    expert's, summed over the TP group: the op is handed the shared expert's
+    TP-partial output for these rows.
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
+    shared_expert = getattr(owner, FUSED_MOE_EP_SHARED_ATTR, None)
     if w1.dtype == torch.float4_e2m1fn_x2:
         # FP4 scales are already [E, K/block, N]. Even a single block must
         # retain its axis; the per-channel helper would incorrectly drop it.
@@ -601,6 +635,8 @@ def fused_moe_ep(
     if envs.TPU_MOE_SKIP_PADDED_TOKENS:
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
     extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
+    if shared_expert is not None:
+        extra += (shared_expert(hidden_states),)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
 
 
@@ -996,7 +1032,7 @@ def prebuild_fused_moe_ep(
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
-    op = _build_op(
+    build_args = (
         mesh,
         topk,
         renormalize,
@@ -1009,6 +1045,8 @@ def prebuild_fused_moe_ep(
         has_score_bias,
         routed_scale,
         has_hash_ids,
+    )
+    build_kw = dict(
         token_replica_groups=token_replica_groups,
         sorted_gather=sorted_gather,
         # Only FP4 has [E, blocks, N] scale tables.
@@ -1017,6 +1055,12 @@ def prebuild_fused_moe_ep(
         w2_scales_expert_second_minor=weight_format == "fp4"
         and _scales_expert_second_minor(w2_scale),
     )
+    op = _build_op(*build_args, **build_kw)
+    if envs.MOE_FUSED_EP_V2_FOLD_SHARED_EXPERT and not (
+        has_score_bias or has_hash_ids or sorted_gather is not None
+    ):
+        fold_op = _build_op(*build_args, **build_kw, has_shared_partial=True)
+        setattr(layer, _SHARED_FOLD_OP_ATTR, fold_op)
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
@@ -1050,6 +1094,78 @@ def prebuild_fused_moe_ep(
             envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
         )
     return op
+
+
+def fold_shared_experts(
+    model: torch.nn.Module, draft_model: torch.nn.Module | None = None
+) -> int:
+    """Hand each admitted MoE runner's shared expert to its fused EP op.
+
+    The op then adds the shared expert's output, summed over the TP group, to
+    its own, and the runner neither runs nor all-reduces the shared expert.
+    Called once after weight load, before the forward is compiled. Returns how
+    many runners were folded.
+    """
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    runners = {
+        id(module): module
+        for net in (model, draft_model)
+        if net is not None
+        for module in net.modules()
+        if isinstance(module, MoERunner)
+    }
+    refused: dict[str, int] = {}
+    for runner in runners.values():
+        reason = _shared_fold_refusal(runner)
+        if reason is None:
+            _fold_shared_expert(runner)
+        else:
+            refused[reason] = refused.get(reason, 0) + 1
+    folded = len(runners) - sum(refused.values())
+    logger.info(
+        "Fused EP MoE: shared expert folded into the op on %d of %d MoE "
+        "layers; refused: %s",
+        folded,
+        len(runners),
+        refused or "none",
+    )
+    return folded
+
+
+def _shared_fold_refusal(runner) -> str | None:
+    """Why `runner`'s shared expert stays with the runner, or None."""
+    if not fused_moe_ep_supported(runner._quant_method):
+        return "the fused EP kernel is not armed"
+    if runner.shared_experts is None:
+        return "no shared expert"
+    if getattr(runner.routed_experts, _SHARED_FOLD_OP_ATTR, None) is None:
+        return "the op takes a score bias, hash ids or a sorted gather"
+    if runner.shared_expert_gate is not None:
+        return "the runner applies a shared-expert gate"
+    if runner.routed_input_transform is not None:
+        return "a routed input transform feeds the experts other rows"
+    if runner.routed_output_transform is not None:
+        return "a routed output transform would apply to the shared expert"
+    if runner.routed_scaling_factor != 1.0:
+        return "routed_scaling_factor would scale the shared expert"
+    if runner.moe_config.is_sequence_parallel:
+        return "sequence-parallel MoE"
+    if runner.moe_config.skip_final_all_reduce:
+        return "skip_final_all_reduce: the model reduces the output itself"
+    return None
+
+
+def _fold_shared_expert(runner) -> None:
+    layer = runner.routed_experts
+    owner = runner._quant_method
+    shared_expert = runner.shared_experts._layer
+    setattr(owner, FUSED_MOE_EP_OP_ATTR, getattr(layer, _SHARED_FOLD_OP_ATTR))
+    setattr(owner, FUSED_MOE_EP_SHARED_ATTR, shared_expert)
+    # Keeps it in the model's module tree once the runner lets go of it.
+    layer.register_module(FUSED_MOE_EP_SHARED_ATTR, shared_expert)
+    runner._shared_experts = None
+    runner._forward_entry = runner._select_forward()
 
 
 def fused_moe_ep_unsupported_reason(
