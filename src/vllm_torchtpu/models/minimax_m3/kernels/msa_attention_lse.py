@@ -286,6 +286,14 @@ def _kernel(
             keys, values, masks, k_scales, v_scales = [], [], [], [], []
             for g, kv_ref in enumerate(kv_refs[:width]):
                 page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
+                if not fp4 and packing == 4:
+                    k_rows, v_rows, mask = _fp8_page(
+                        kv_ref, page, selected, local_page, local_limit, slots, head_dim
+                    )
+                    keys.append(k_rows)
+                    values.append(v_rows)
+                    masks.append(mask)
+                    continue
                 is_selected = jnp.max(
                     (selected == page).astype(jnp.int32), axis=1, keepdims=True
                 )
@@ -307,12 +315,6 @@ def _kernel(
                     values.append(rows[:, head_dim:])
                     k_scales.append(sk)
                     v_scales.append(sv)
-                elif packing == 4:
-                    # The packed [S / 4, 4, 2D] page read as [S, 2D] rows: slot
-                    # r * 4 + j at row r * 4 + j, and a cheaper relayout than the
-                    # 32-bit words' bitcast (16 vs 30 bundles a page, AOT).
-                    rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
-                    values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
                 else:
                     rows = msa_attention._page_rows(kv_ref, seen)
                     values.append(rows[:, head_dim:])
@@ -395,6 +397,35 @@ def _kernel(
 
     b = pl.program_id(0)
     jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
+
+
+def _fp8_page(kv_ref, page, selected, local_page, local_limit, slots, head_dim):
+    """An fp8 page's bf16 ``[S, D]`` keys and values and its ``[Bq, S]`` mask
+    for `_kernel`'s `attend`, with no cross-lane reduction: those (which rows
+    selected the page, and the last slot any row sees, to zero the value rows
+    past it) ran one after another per page and bound the step (8-token decode
+    tiles at 24-40 pages, 0.03 us per page, bench 20261124-132116-6dd1).
+
+    Which rows selected the page comes out of a ``[Bq, K] x [K, S]`` count on
+    the MXU, already broadcast over the slots. A slot no row sees has p = 0,
+    so only its value rows' NaNs matter (0 * NaN is NaN in p @ v): they read
+    as 0, as do the values past the last seen slot that `_page_rows` zeroes,
+    and every other value is unchanged."""
+    page_size = slots.shape[1]
+    hits = jax.lax.dot_general(
+        (selected == page).astype(jnp.bfloat16),
+        jnp.ones((selected.shape[1], page_size), jnp.bfloat16),
+        (((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )  # [Bq, S]: how many of the row's picks are this page
+    limit = jnp.where(local_page == page, local_limit, page_size)  # [Bq, 1]
+    mask = (slots < limit) & (hits > 0) & (page >= 0)
+    # The packed [S / 4, 4, 2D] page read as [S, 2D] rows: slot r * 4 + j at
+    # row r * 4 + j, and a cheaper relayout than the 32-bit words' bitcast
+    # (16 vs 30 bundles a page, AOT).
+    rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
+    values = rows[:, head_dim:]
+    return rows[:, :head_dim], jnp.where(jnp.isnan(values), 0, values), mask
 
 
 def _attention_call(

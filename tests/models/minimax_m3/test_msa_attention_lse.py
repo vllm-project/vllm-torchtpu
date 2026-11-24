@@ -200,8 +200,9 @@ def test_lse_empty_batch():
     assert out.shape == (0, Q_PER_KV, HEAD_DIM) and lse.shape == (0, Q_PER_KV)
 
 
+@pytest.mark.parametrize("block_q", [16, 8])
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
-def test_lse_unselected_nan_pages_do_not_leak(dtype):
+def test_lse_unselected_nan_pages_do_not_leak(dtype, block_q):
     """Bytes no token may see hold NaN (pages nobody selects, slots past a
     local page's newest token): masked scores and zeroed value rows keep
     them out, as they must for page-buffer slots past a group's pages."""
@@ -229,6 +230,7 @@ def test_lse_unselected_nan_pages_do_not_leak(dtype):
         jnp.asarray(local_limit),
         jnp.asarray(table),
         sm_scale=SCALE,
+        block_q=block_q,
         interpret=True,
     )
     assert np.isfinite(np.asarray(got[0].astype(jnp.float32))).all()
