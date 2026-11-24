@@ -7,3 +7,11 @@ mkdir -p "$results"
 # releases the TPU before the next check starts.
 python -m pytest -q tests/kernels/fused_moe/test_fused_ep_moe_v2.py \
   -k row_padded_flat_scales --junitxml="$results/kernel-scales.xml"
+python -m pytest -q tests/kernels/fused_moe/test_fused_ep_moe_v2.py \
+  -k routing_plan_kernel --junitxml="$results/kernel-routing-plan.xml"
+python -m pytest -q tests/kernels/fused_moe/test_fused_ep_moe_v2_plan_kernel.py \
+  -k lowered_for_tpu --junitxml="$results/kernel-plan-lowered.xml"
+python -m pytest -q tests/kernels/deepseek_v41/test_candidate_block_scores.py \
+  --junitxml="$results/kernel-block-max.xml"
+python -m pytest -q tests/kernels/fused_moe/test_direct_all_gather.py \
+  --junitxml="$results/kernel-direct-all-gather.xml"

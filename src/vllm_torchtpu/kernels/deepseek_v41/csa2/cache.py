@@ -218,8 +218,10 @@ def _gather_sc_banked_deep(words, scales, records):
 
     The gather for step i + 2 is issued while step i's rows are written, so
     two gathers are in flight instead of one. Each 16-id stream is filled by
-    one masked gather per bank plus a masked gather of a zero row for negative
+    one masked gather per bank plus a masked gather of zero rows for negative
     ids, so every staged row has exactly one writer and no slot is cleared.
+    Each negative id in flight reads its own zero row (per gather in flight,
+    core, stream and lane): reads that all hit one row queue behind each other.
     Copies of one slot and stream share a semaphore; with one semaphore per
     source, kind and slot, three- and four-slot versions hung on v7x.
     """
@@ -236,8 +238,9 @@ def _gather_sc_banked_deep(words, scales, records):
     count = records.size
     padding = -count % block
     indices = jnp.pad(records.reshape(-1), (0, padding), constant_values=-1)
-    zero_words = jnp.zeros((8, 128), jnp.int32)
-    zero_scales = jnp.zeros((8,), jnp.float32)
+    zero_rows = 2 * cores * streams * lanes
+    zero_words = jnp.zeros((zero_rows, 128), jnp.int32)
+    zero_scales = jnp.zeros((zero_rows,), jnp.float32)
     mesh = plsc.VectorSubcoreMesh(
         num_cores=info.num_cores,
         num_subcores=info.num_subcores,
@@ -282,8 +285,16 @@ def _gather_sc_banked_deep(words, scales, records):
                                 jnp.where(own, local, -1),
                             )
                         )
+                    first_zero = ((step % 2 * cores + core) * streams + stream) * lanes
+                    zero_ids = first_zero + jax.lax.broadcasted_iota(
+                        jnp.int32, (lanes,), 0
+                    )
                     targets.append(
-                        (zero_word_ref, zero_scale_ref, jnp.where(selected < 0, 0, -1))
+                        (
+                            zero_word_ref,
+                            zero_scale_ref,
+                            jnp.where(selected < 0, zero_ids, -1),
+                        )
                     )
                     for word_src, scale_src, rows in targets:
                         indexed = plsc.Indices(rows, ignored_value=-1)

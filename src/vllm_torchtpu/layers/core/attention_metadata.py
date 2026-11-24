@@ -655,6 +655,14 @@ def stage_block_table_uploads(
             delta_key, ctx, entries, entry_builders, num_reqs_padded
         )
     verify = staged_dev is not None and envs.TPU_VERIFY_INCREMENTAL_BLOCK_TABLE
+    # A dummy walk's table is all zeros for a given length, so its device copy
+    # is kept and reused (the stager warms once, on that upload); like the
+    # stager's, it only feeds the products program, which never donates it.
+    kept_dummy = None
+    keep = is_dummy and (len(entries) > 1 or mamba_geom)
+    if keep and envs.TPU_DP_IDLE_DUMMY_KEEP_BLOCK_TABLE:
+        kept_dummy = runner.__dict__.setdefault("_kept_dummy_block_tables", {})
+        staged_dev = kept_dummy.get(offset)
 
     if staged_dev is None or verify:
         total = offset
@@ -686,6 +694,8 @@ def stage_block_table_uploads(
             runner._registered_h2d_sources.discard(id(flat))
         else:
             staged_dev = stage_h2d_upload(runner, flat)
+            if kept_dummy is not None:
+                kept_dummy[offset] = staged_dev
             if stager is not None and is_dummy:
                 stager.warm(staged_dev)
             elif stager is not None and delta_key is not None:

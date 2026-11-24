@@ -407,6 +407,7 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_RELOAD_MODULES",
         "TPU_MOE_ROUTER_TOPK",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
+        "MOE_FUSED_EP_V2_PLAN_KERNEL",
         "MOE_FUSED_EP_PREPROCESS_BACKEND",
         "TPU_MOE_EPLB_DYNAMIC",
         "TPU_MOE_EPLB_WINDOW_STEPS",
@@ -1002,15 +1003,16 @@ class TpuPlatform(Platform):
 
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
             dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
-            if scheduler_config.scheduler_cls != dp_sched_cls:
-                assert scheduler_config.scheduler_cls is None, (
-                    "Cannot have DP_SCHED_ENABLED enabled and also a custom "
-                    "scheduler being provided."
-                )
+            if scheduler_config.scheduler_cls is None:
                 scheduler_config.scheduler_cls = dp_sched_cls
                 logger.info(
                     "Enabled TpuDpScheduler (DP_SCHED_ENABLED=1) for DP=%d.",
                     parallel_config.data_parallel_size,
+                )
+            elif scheduler_config.scheduler_cls != dp_sched_cls:
+                logger.warning(
+                    "DP scheduler is off: scheduler %s is configured.",
+                    scheduler_config.scheduler_cls,
                 )
 
         kv_transfer_config = vllm_config.kv_transfer_config
@@ -1228,14 +1230,14 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     scheduler_config = vllm_config.scheduler_config
     if not envs.TPU_PP_DYNAMIC_CHUNKS:
         return
-    if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
-        logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")
-        return
     if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
         logger.warning(
             "Pipeline chunk sizing is off: scheduler %s is configured.",
             scheduler_config.scheduler_cls,
         )
+        return
+    if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
+        logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")
         return
     if not scheduler_config.enable_chunked_prefill:
         logger.warning("Pipeline chunk sizing is off: chunked prefill is disabled.")
