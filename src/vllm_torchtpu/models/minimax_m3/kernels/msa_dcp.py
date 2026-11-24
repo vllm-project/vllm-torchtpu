@@ -678,20 +678,24 @@ def _class_candidates(
             opt.cond,
         )
 
-        def large_rows(p):
-            picks, col = class_picks(p.large(), p.large_block_q, True)
-            return picks[col.reshape(-1)]
+        # The branches return the picks (padded to the default branch's
+        # columns) and each row's column; the gather back to token order
+        # stays outside, as without the option: inside, the conditional
+        # waits for the gather (offloaded to the SparseCore), +60-75 us per
+        # layer at 8K tokens (bench j-84225507).
+        rows_base = plan.large().scores.shape[1]
 
-        large = jax.lax.cond(
+        def large_picks(p):
+            picks, col = class_picks(p.large(), p.large_block_q, True)
+            return jnp.pad(picks, ((0, rows_base - picks.shape[0]), (0, 0))), col
+
+        large_p, large_col = jax.lax.cond(
             jnp.sum(plan.is_large.astype(jnp.int32)) <= opt.cond,
-            lambda: large_rows(fast),
-            lambda: large_rows(plan),
+            lambda: large_picks(fast),
+            lambda: large_picks(plan),
         )
-        packed = jnp.where(
-            jnp.broadcast_to(is_large_tok, small_col.shape).reshape(-1, 1),
-            large,
-            small_picks[small_col.reshape(-1)],
-        )
+        col = jnp.where(is_large_tok, small_picks.shape[0] + large_col, small_col)
+        packed = jnp.concatenate([small_picks, large_p], axis=0)[col.reshape(-1)]
     else:
         large_picks, large_col = class_picks(plan.large(), plan.large_block_q, True)
         # A head's and token's picks: its large-class column if its request
