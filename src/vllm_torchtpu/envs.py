@@ -322,6 +322,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_KV4_SHARED_SCALES: bool = False
     TPU_SPEC_VERIFY_COARSE_PAD: bool = False
     TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES: bool = False
+    TPU_MINIMAX_M3_KV4_INDEXER_LARGE_BLOCK_Q: int = 0
 
 
 def env_with_choices(
@@ -2154,6 +2155,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # program mid-serving. Rows past num_reqs are never read; same values.
     "TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES": env_bool(
         "TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES", default=False
+    ),
+    # MiniMax M3 4-bit index caches (--kv-cache-dtype int4_per_token_head):
+    # query rows per tile of the MSA indexer's large (prefill) class, instead
+    # of its default 512, on steps of at least twice that many query rows.
+    # A 4-bit page's keys are unpacked and scaled to bf16 once per tile that
+    # scores it, so wider tiles unpack each page fewer times (the fp8 cache
+    # converts its keys cheaper). Each page maximum is still one dot of the
+    # same keys and query: bitwise. 0 (default) = off.
+    "TPU_MINIMAX_M3_KV4_INDEXER_LARGE_BLOCK_Q": env_nonnegative_int(
+        "TPU_MINIMAX_M3_KV4_INDEXER_LARGE_BLOCK_Q", 0
     ),
 }
 
