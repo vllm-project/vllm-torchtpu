@@ -57,8 +57,9 @@ from .indexer_select import (
 if TYPE_CHECKING:
     from .indexer_cache import PackedFP8IndexCacheRows
 
-# consume(start, rows, state) -> state; see `select_fp8_indexer_jax`.
-SelectionConsumer = Callable[[int, jax.Array, Any], Any]
+# consume(start, rows, state, following) -> (state, following); see
+# `select_fp8_indexer_jax`.
+SelectionConsumer = Callable[[int, jax.Array, Any, Any], tuple[Any, Any]]
 
 _query_op = None
 _write_op = None
@@ -420,8 +421,11 @@ def _score_and_select_candidates(
             lambda tile: tile * query_chunk_size,
             score,
             select,
-            lambda tile, src, dst: jax.lax.dynamic_update_slice_in_dim(
-                dst, src, tile * query_chunk_size, axis=0
+            lambda tile, src, dst, following: (
+                jax.lax.dynamic_update_slice_in_dim(
+                    dst, src, tile * query_chunk_size, axis=0
+                ),
+                following,
             ),
             jnp.full((num_queries, k), -1, jnp.int32),
         )
@@ -467,7 +471,7 @@ def _select_fp8_indexer_jax(
     def finish(selected, published):
         if consume is None:
             return selected, published
-        return selected, published, consume(0, selected, None)
+        return selected, published, consume(0, selected, None, None)[0]
 
     layout = PackedFP8Layout(*layout_args)
     tokens, width = q.shape[0], score_width
@@ -742,17 +746,18 @@ def _select_fp8_indexer_jax(
     unrolled = not bounded or num_tiles <= indexer.MAX_UNROLLED_TILES
     tile_consume = consume if unrolled else None
 
-    def write(tile, selected, output):
+    def write(tile, selected, output, following):
         update = functools.partial(
             jax.lax.dynamic_update_slice_in_dim, start_index=tile * chunk_rows, axis=0
         )
         if tile_consume is None:
-            return jax.tree.map(update, output, selected)
+            return jax.tree.map(update, output, selected), following
         output, state = output
         start = tile * chunk_rows
         rows = selected[0] if publish_rows else selected
         rows = jnp.where(short, visible[start : start + chunk_rows], rows)
-        return jax.tree.map(update, output, selected), tile_consume(start, rows, state)
+        state, following = tile_consume(start, rows, state, following)
+        return (jax.tree.map(update, output, selected), state), following
 
     # Grouped requests need neither sorting nor output reordering, so no
     # runtime branch to the serial path: a branch costs an overlay load at its
@@ -816,9 +821,12 @@ def select_fp8_indexer_jax(
 
     Returns selected [T, topk] logical indices and published candidates. With
     ``consume``, a third result is its final state: every selected row reaches
-    ``consume(start, rows, state)`` exactly once, in ascending row ranges, with
-    ``state`` None at the first call. Prefill tiles feed it as their selection
-    completes, so its work overlaps the scoring and selection of later tiles.
+    ``consume(start, rows, state, following)`` exactly once, in ascending row
+    ranges, with ``state`` None at the first call; it returns the new state
+    and ``following``. Prefill tiles feed it as their selection completes,
+    so its work overlaps the scoring and selection of later tiles.
+    ``following`` is the next tile's scoring input (None if no tile
+    follows): what the consumer gates it on is issued before that scoring.
     """
     arguments = (
         q,

@@ -289,7 +289,7 @@ def _select_gather_attend(
         )
         return jnp.where(valid, selected, -1)
 
-    def consume(start, selected, state):
+    def consume(start, selected, state, following):
         selected = mask(start, selected)
         if state is None and selected.shape[0] == tokens:
             output, words, gathered_scales, counts = _gather_attend(
@@ -316,7 +316,7 @@ def _select_gather_attend(
                 non_causal,
                 bq,
             )
-            return output, words, gathered_scales, counts
+            return (output, words, gathered_scales, counts), following
         rows = selected.shape[0]
         records, counts = prepare_main_records(
             selected,
@@ -325,6 +325,10 @@ def _select_gather_attend(
             page_size=main_page_size,
             onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
         )
+        if following is not None:
+            # Records before the next tile's scoring, so the gather starts
+            # beside that scoring instead of after it.
+            records, following = jax.lax.optimization_barrier((records, following))
         gathered = gather_csa2_kv_sc(word_banks, scale_banks, records, deep=deep)
         if state is None:
             owners = None
@@ -352,7 +356,7 @@ def _select_gather_attend(
             *owners,
             update(all_scales, gathered[1]),
             update(all_counts, counts),
-        )
+        ), following
 
     selected, _, (output, words, gathered_scales, counts) = select_fp8_indexer_jax(
         index_q,
