@@ -19,6 +19,7 @@ from .common import (
     QueryTile,
     _dma_rows,
     _head_order,
+    _head_weights,
     _next_query_tile,
     _reduce_heads,
     _reduce_on_mxu,
@@ -65,6 +66,7 @@ class _DenseKernel:
         self.queries, keys, self.scores, self.counts, self.pages, self.padding = (
             buffers[:6]
         )
+        self.expanded = buffers[6]
         self.read_sem, self.write_sem, self.q_sem, self.page_sem, self.pad_sem = (
             semaphores[:5]
         )
@@ -184,6 +186,9 @@ class _DenseKernel:
         for slot in range(8):
             self.counts[slot] = zero
         self.padding[...] = jnp.full(self.padding.shape, -jnp.inf, jnp.float32)
+        # Every row's selector weights in one pass, not one MXU pass per group.
+        weights = self.weights[...]
+        self.expanded[...] = _head_weights(weights, self.q_tile, sublanes=self.sublanes)
         self.copy_queries(initial[0], 0, zero=True)
         tiles = tuple(self.live_tiles(q) for q in initial)
         ready = jnp.int32(-1) if self.reuse_keys else zero
@@ -401,7 +406,8 @@ class _QueryBlock:
         k.copy_queries(query, q_slot, wait=True)
         rows = k.row_ids(query)
         weight = jnp.concatenate([k.weights[r][:, None] for r in rows])
-        selector = _weighted_selector(k.selector, k.weights, rows, sublanes=k.sublanes)
+        expanded = jnp.concatenate([k.expanded[r][None, :] for r in rows])
+        selector = _weighted_selector(k.selector, expanded)
         self.reduction = (_head_order(weight, k.q_tile, k.sublanes), selector)
         queries = k.queries[pl.ds(q_slot * k.q_tile, k.q_tile)]
         queries = queries.reshape(k.q_tile * k.heads, k.dim)
@@ -520,6 +526,7 @@ def fp8_paged_mqa_logits(
             pltpu.SMEM((8,), jnp.int32),
             pltpu.SMEM((4 * page_count,), jnp.int32),
             pltpu.VMEM((tile, config.key_tile), jnp.float32),
+            pltpu.VMEM((weights.shape[0], tile * heads), jnp.float32),
         ),
         tuple(dma(s) for s in ((config.key_buffers,), (4, tile), (2,), (4,), (2,))),
     )

@@ -17,6 +17,7 @@ from .common import (
     QueryTile,
     _dma_rows,
     _head_order,
+    _head_weights,
     _next_query_tile,
     _reduce_heads,
     _reduce_on_mxu,
@@ -224,8 +225,9 @@ def _kernel(
             query_rows = rows(query)
             weight = jnp.concatenate([weights[r][:, None] for r in query_rows])
             head_weights = _head_order(weight, q_tile, sublanes)
+            group_weights = jnp.concatenate([weights[r][None, :] for r in query_rows])
             mxu_selector = _weighted_selector(
-                selector, weights, query_rows, sublanes=sublanes
+                selector, _head_weights(group_weights, q_tile, sublanes=sublanes)
             )
             # A short group's resident second row is the next group's query;
             # its scores are never published and K limits ignore it.
