@@ -36,7 +36,6 @@ bucket) and made inside one custom op that takes both weight sets, so every
 bucket's graph has the same inputs.
 """
 
-import functools
 from typing import Any
 
 import jax
@@ -284,7 +283,7 @@ def tp_dense_routed(x, topk_weights, topk_ids, w, s, *, fs):
 def _op_body(hidden_states: jax.Array, w1: jax.Array, w2: jax.Array, w1_scale: jax.Array,
              w2_scale: jax.Array, topk_weights: jax.Array, topk_ids: jax.Array,
              experts_start: jax.Array, logical_ids: jax.Array, tw: jax.Array,
-             ts: jax.Array, *, topk: int, activation: str, fs: int) -> jax.Array:
+             ts: jax.Array, topk: int, activation: str, fs: int) -> jax.Array:
     from vllm_torchtpu.layers.core.fused_moe_gmm import (
         fused_moe_func,
         resolve_onehot_permute_threshold,
@@ -311,13 +310,12 @@ def get_op(*, topk: int, fs: int, activation: str = "silu"):
         return op
     from torch_tpu._internal import pallas
 
-    fn = functools.partial(_op_body, topk=topk, activation=activation, fs=fs)
-    op = pallas.jax_op(f"pallas::fused_moe_tp_dense_{len(_OPS)}", fn)
-
-    def _fake(hidden_states, *args, **kwargs):
-        return torch.empty_like(hidden_states)
-
-    op.register_fake(_fake)
+    # Statics go in as trailing call arguments (as moe_redundant's assign op).
+    op = pallas.jax_op(f"pallas::fused_moe_tp_dense_{len(_OPS)}", _op_body)
+    op.register_fake(
+        lambda hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids,
+        experts_start, logical_ids, tw, ts, topk, activation, fs: torch.empty_like(hidden_states)
+    )
     _OPS[key] = op
     return op
 
@@ -328,4 +326,4 @@ def fused_moe(layer: Any, kwargs: dict, logical_ids: torch.Tensor) -> torch.Tens
     return op(kwargs["hidden_states"], kwargs["w1"], kwargs["w2"], kwargs["w1_scale"],
               kwargs["w2_scale"], kwargs["topk_weights"], kwargs["topk_ids"],
               kwargs["experts_start"], logical_ids.to(torch.int32), layer._tpd_w,
-              layer._tpd_s)
+              layer._tpd_s, kwargs["topk"], kwargs["activation"], layer._tpd_fs)
