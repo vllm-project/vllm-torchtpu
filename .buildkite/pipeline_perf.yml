@@ -227,8 +227,7 @@ steps:
       # The v7x-16 step below is a two-host slice, so it goes through
       # run_multihost.sh and the JobSets in manifests/. It depends on nothing but
       # the image: the fleet places the JobSet in a 2x2x2 slice of its own, and
-      # Kueue starts it once the 2x2x2 queue's kept slice, which it never
-      # lends, is free.
+      # Kueue starts it once a 2x2x2 slice is free.
       - label: "Perf/Eval: Nightly deepseek-v4-pro-dp16-ep (TPU v7x-16)"
         # Without build_docker this submits a sixteen-chip workload against a tag
         # that was never pushed and holds the fleet in ImagePullBackOff.

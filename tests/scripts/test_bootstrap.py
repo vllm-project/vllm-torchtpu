@@ -363,6 +363,12 @@ class TestBootstrapUnits(unittest.TestCase):
                 "nightly",
                 (1, "nightly"),
             ),
+            # Started by hand on main: still the nightly.
+            (
+                {"NIGHTLY": "1", "BUILDKITE_SOURCE": "ui", "BUILDKITE_BRANCH": "main"},
+                "nightly",
+                (1, "nightly"),
+            ),
             # NIGHTLY=1 off main: a manual full suite or a release gate.
             (
                 {
