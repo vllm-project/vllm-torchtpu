@@ -124,8 +124,6 @@ def resolve_pcp_topology_order(vllm_config) -> dict[str, list[list[int]]] | None
     # highest-bandwidth link, which on v7 is the intra-chip core axis.
     mesh_shape = (dp_size, pcp_size, tp_size)
 
-    import torch
-
     from vllm_torchtpu import envs as tpu_envs
 
     if not tpu_envs.TPU_PCP_TOPOLOGY_AWARE_MESH:
@@ -134,13 +132,10 @@ def resolve_pcp_topology_order(vllm_config) -> dict[str, list[list[int]]] | None
             "(device-order PCP/TP layout)."
         )
         return None
-    if not hasattr(torch.tpu, "topology_aware_mesh"):
-        raise RuntimeError(
-            "torch.tpu.topology_aware_mesh is not available in the installed "
-            "torch_tpu (needs >= 0.1.1.dev20260813160135); set "
-            "TPU_PCP_TOPOLOGY_AWARE_MESH=0 to use the device-order layout."
-        )
-    mesh = torch.tpu.topology_aware_mesh(mesh_shape)
+
+    from torch.tpu.distributed import topology_aware_mesh
+
+    mesh = topology_aware_mesh(mesh_shape)
 
     # Keyed by vLLM group_name so the caller can look up the groups for the
     # axis it is building. A ring is mesh[d, :, t] -- reading down the pcp

@@ -14,11 +14,25 @@
 """Tests for topology-aware ordering of the PCP group."""
 
 from types import SimpleNamespace
+from unittest.mock import create_autospec
 
 import numpy
 import pytest
+from torch.tpu.distributed import topology_aware_mesh as _REAL_TOPOLOGY_AWARE_MESH
 
 from vllm_torchtpu.distributed import pcp_rank_order as order_mod
+
+
+def _patch_topology_aware_mesh(monkeypatch, *, side_effect=None, return_value=None):
+    import torch.tpu.distributed
+
+    mock_fn = create_autospec(
+        _REAL_TOPOLOGY_AWARE_MESH,
+        side_effect=side_effect,
+        return_value=return_value,
+    )
+    monkeypatch.setattr(torch.tpu.distributed, "topology_aware_mesh", mock_fn)
+    return mock_fn
 
 
 def _config(**kwargs):
@@ -61,13 +75,8 @@ def test_raises_when_data_parallel_replicas_are_present():
 
 def test_propagates_the_error_when_the_mesh_call_fails(monkeypatch):
     """A missing API or dead process group must not be papered over."""
-    import torch
-
-    def _boom(_shape):
-        raise RuntimeError("topology_aware_mesh exploded")
-
-    monkeypatch.setattr(
-        torch, "tpu", SimpleNamespace(topology_aware_mesh=_boom), raising=False
+    _patch_topology_aware_mesh(
+        monkeypatch, side_effect=RuntimeError("topology_aware_mesh exploded")
     )
     with pytest.raises(RuntimeError, match="exploded"):
         order_mod.resolve_pcp_topology_order(_config())
@@ -75,15 +84,8 @@ def test_propagates_the_error_when_the_mesh_call_fails(monkeypatch):
 
 def test_raises_when_the_mesh_is_not_a_permutation(monkeypatch):
     """A duplicated rank would silently drop a worker from the groups."""
-    import torch
-
     mesh = numpy.array([0, 1, 2, 3, 4, 5, 6, 6]).reshape(1, 8, 1)
-    monkeypatch.setattr(
-        torch,
-        "tpu",
-        SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
-        raising=False,
-    )
+    _patch_topology_aware_mesh(monkeypatch, return_value=mesh)
     with pytest.raises(RuntimeError, match="not a permutation"):
         order_mod.resolve_pcp_topology_order(_config())
 
@@ -92,15 +94,8 @@ def test_raises_when_the_mesh_is_not_a_permutation(monkeypatch):
 
 
 def test_returns_both_axes_from_one_mesh(monkeypatch):
-    import torch
-
     mesh = numpy.array([[[0, 1], [6, 7], [4, 5], [2, 3]]])
-    monkeypatch.setattr(
-        torch,
-        "tpu",
-        SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
-        raising=False,
-    )
+    _patch_topology_aware_mesh(monkeypatch, return_value=mesh)
     got = order_mod.resolve_pcp_topology_order(_config(pcp=4, tp=2))
 
     assert got == {
@@ -120,15 +115,8 @@ def test_returns_both_axes_from_one_mesh(monkeypatch):
 
 def test_matches_the_order_measured_on_hardware(monkeypatch):
     """pcp=8 tp=1, job j-64748dc1 on a v7 2x2x1 host."""
-    import torch
-
     mesh = numpy.array([0, 1, 6, 7, 4, 5, 2, 3]).reshape(1, 8, 1)
-    monkeypatch.setattr(
-        torch,
-        "tpu",
-        SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
-        raising=False,
-    )
+    _patch_topology_aware_mesh(monkeypatch, return_value=mesh)
     got = order_mod.resolve_pcp_topology_order(_config(pcp=8, tp=1))
 
     assert got["pcp"] == [[0, 1, 6, 7, 4, 5, 2, 3]]
