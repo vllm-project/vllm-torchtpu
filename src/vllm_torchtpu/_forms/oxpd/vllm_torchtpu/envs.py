@@ -664,6 +664,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_WHOLE_MAX_ROWS: int = 96
     VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE: bool = False
     VLLM_TPU_MK_REL_FETCH_LARGE: bool = False
+    VLLM_TPU_MK_GDN_VEC_REC: bool = False
     # q38 internal-v3 GDN/QSA ports (end)
 
 
@@ -3760,6 +3761,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # incompatible with VLLM_TPU_MK_L47_FOLD=1 (L=45 partial last cycle asserts
     # rel_fetch off in planner.py). Preserves VLLM_TPU_MK_GDN_INK bit 2 (all B).
     "VLLM_TPU_MK_REL_FETCH_LARGE": env_bool("VLLM_TPU_MK_REL_FETCH_LARGE"),
+    # Whole-step / segment megakernel: vectorize GDN conv_step across sequence
+    # chunks and gdn_rec / gdn_rec_chunked L2-norm, beta, decay, and output
+    # norm/gate writes (wired via GDNTunables.vec_rec). Default off.
+    "VLLM_TPU_MK_GDN_VEC_REC": env_bool("VLLM_TPU_MK_GDN_VEC_REC"),
     # q38 internal-v3 GDN/QSA ports (end)
 }
 

@@ -124,23 +124,50 @@ def conv_step(ctx: Any, gp: GDNParams, o: Any, slot: Any, ybuf: Any) -> Any:
         u = None
         if VER:
             us = []
-            for s in range(NS):
-                convb[s, 3 : 3 + T, :] = ybuf[s * T : (s + 1) * T, 0:QKV]
-                w = [convb[s, k : k + T, :] for k in range(4)]
-                u_ = rnd(
-                    jax.nn.silu(
-                        w[0] * taps[0]
-                        + w[1] * taps[1]
-                        + w[2] * taps[2]
-                        + w[3] * taps[3]
+            if gp.vec_rec and GCH and NS >= 2 and NS % 2 == 0 and (2 * T) % 8 == 0:
+                sc_chunk = 4 if NS % 4 == 0 else 2
+                t0, t1, t2, t3 = [t[None, :, :] for t in taps]
+                for s0 in range(0, NS, sc_chunk):
+                    x_seq = ybuf[s0 * T : (s0 + sc_chunk) * T, 0:QKV].reshape(
+                        sc_chunk, T, QKV
                     )
-                )
-                if GCH:
-                    us.append(u_)
-                else:
-                    scr["ub"][s, 0:T, :] = u_
-            if GCH:
+                    cb = convb[s0 : s0 + sc_chunk, :, :]
+                    seq_buf = jnp.concatenate([cb[:, 0:3, :], x_seq], axis=1)
+                    if gp.HR > 3 + T:
+                        cb_new = jnp.concatenate(
+                            [seq_buf, cb[:, 3 + T :, :]], axis=1
+                        )
+                    else:
+                        cb_new = seq_buf
+                    convb[s0 : s0 + sc_chunk, :, :] = cb_new
+                    u_chunk = rnd(
+                        jax.nn.silu(
+                            seq_buf[:, 0:T, :] * t0
+                            + seq_buf[:, 1 : 1 + T, :] * t1
+                            + seq_buf[:, 2 : 2 + T, :] * t2
+                            + x_seq * t3
+                        )
+                    ).reshape(sc_chunk * T, QKV)
+                    us.append(u_chunk)
                 u = jnp.concatenate(us, axis=0)
+            else:
+                for s in range(NS):
+                    convb[s, 3 : 3 + T, :] = ybuf[s * T : (s + 1) * T, 0:QKV]
+                    w = [convb[s, k : k + T, :] for k in range(4)]
+                    u_ = rnd(
+                        jax.nn.silu(
+                            w[0] * taps[0]
+                            + w[1] * taps[1]
+                            + w[2] * taps[2]
+                            + w[3] * taps[3]
+                        )
+                    )
+                    if GCH:
+                        us.append(u_)
+                    else:
+                        scr["ub"][s, 0:T, :] = u_
+                if GCH:
+                    u = jnp.concatenate(us, axis=0)
         else:
             x = ybuf[0:B, 0:QKV]
             s0 = convb[0:B, :]
