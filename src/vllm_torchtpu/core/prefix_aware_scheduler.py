@@ -51,6 +51,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu.core import reuse_aware_eviction
 from vllm_torchtpu.core.eviction_aware_connector import EvictionAwareConnector
 from vllm_torchtpu.core.external_prefix_probe import ExternalPrefixProbe
 from vllm_torchtpu.runner.utils import PAW_MAX_WAIT_S_KEY
@@ -94,6 +95,11 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
         self._paw_max_wait_s = _max_wait_from_config(getattr(self, "vllm_config", None))
+        # Before the connector sees the block pool: contiguous_alloc keeps a
+        # reference to the free queue this replaces.
+        kvm = getattr(self, "kv_cache_manager", None)
+        if kvm is not None and reuse_aware_eviction.enabled():
+            reuse_aware_eviction.install(kvm)
         connector = getattr(self, "connector", None)
         self._paw_probe = (
             connector if isinstance(connector, ExternalPrefixProbe) else None

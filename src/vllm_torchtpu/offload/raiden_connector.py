@@ -439,12 +439,27 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         if req_status is None:
             return False
         blocks_per_chunk = self.config.blocks_per_chunk
+        # VLLM_TPU_EVICT_DECODE_FIRST puts decode-output blocks at the head of
+        # the free queue, so they are reused within a step or two: holding the
+        # request on them would drop it before its prompt chunks are stored.
+        # With offload_prompt_only they are never stored anyway.
+        prompt_only = bool(tpu_envs.VLLM_TPU_EVICT_DECODE_FIRST) and getattr(
+            self.config, "offload_prompt_only", False
+        )
         blocks: set[int] = set()
-        for group_state in req_status.group_states:
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
             # Only blocks of keyed (full) chunks can be stored; the partial
             # tail block has no hash, so the pool reuses it first.
             start = group_state.next_stored_chunk_idx * blocks_per_chunk
-            end = len(group_state.offload_keys) * blocks_per_chunk
+            num_chunks = len(group_state.offload_keys)
+            if prompt_only:
+                num_chunks = min(
+                    num_chunks,
+                    req_status.req.num_prompt_tokens // group_config.tokens_per_chunk,
+                )
+            end = num_chunks * blocks_per_chunk
             blocks.update(b for b in group_state.block_ids[start:end] if b != 0)
         if not blocks:
             return False
