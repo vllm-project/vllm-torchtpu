@@ -83,7 +83,7 @@ import os
 import socket
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
@@ -399,6 +399,11 @@ class RaidenOffloadingManager(OffloadingManager):
         # Keep the store time of every key the store holds (host-tier class
         # telemetry: occupancy, stores, evictions, the oldest entry).
         track_held: bool = False,
+        # Optional scan-resistant eviction policy layered over stock KVCacheStore
+        # LRU ("" / "lru": off; "slru" / "slru_all": two-segment SLRU via
+        # offload/slru.py).
+        slru_probation_frac: float | None = None,
+        slru_promote_hits: int = 1,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -548,6 +553,34 @@ class RaidenOffloadingManager(OffloadingManager):
         self._held: dict[OffloadKey, float] | None = {} if track_held else None
         self._held_stored = 0
         self._held_evicted = 0
+
+        # Scan-resistant SLRU controller (default OFF: None). All reads/writes
+        # run under self._eviction_lock; NEVER hold the lock across calls into
+        # self._store so a synchronous eviction callback cannot deadlock.
+        self._slru = None
+        if slru_probation_frac is not None:
+            from vllm_torchtpu.offload.slru import SlruTracker
+
+            self._slru = SlruTracker(
+                offload_logical_blocks_capacity,
+                slru_probation_frac,
+                promote_hits=slru_promote_hits,
+            )
+            if not self._supports_eviction_callback:
+                logger.warning(
+                    "TPURaidenOffloadingConnector: SLRU enabled without "
+                    "set_eviction_callback(); shadow eviction tracking will prune "
+                    "stale entries lazily on rescue misses."
+                )
+            logger.info(
+                "TPURaidenOffloadingConnector: SLRU eviction enabled for %s "
+                "(capacity=%d, protected_cap=%d, probation_frac=%.2f, promote_hits=%d)",
+                raiden_job_name,
+                offload_logical_blocks_capacity,
+                self._slru.protected_cap,
+                slru_probation_frac,
+                slru_promote_hits,
+            )
 
     # -- sub-hash / block-id expansion ----------------------------------
 
@@ -763,6 +796,8 @@ class RaidenOffloadingManager(OffloadingManager):
         # been asked about them, so the pool may still hold the same hash,
         # pinned by an in-flight job, and a release would drop that job's pin.
         skip = (self._block_status.REMOTE, self._block_status.SHARED_STORAGE)
+        slru = self.__dict__.get("_slru")
+        touched_keys: list[OffloadKey] = []
         for key in keys:
             sub_hashes = self._sub_hashes(key)
             held = [
@@ -772,6 +807,12 @@ class RaidenOffloadingManager(OffloadingManager):
             ]
             if held:
                 self._store.release(held)
+                if slru is not None and len(held) == len(sub_hashes):
+                    touched_keys.append(key)
+        if slru is not None and touched_keys:
+            with self._eviction_lock:
+                for key in touched_keys:
+                    slru.record_hit(key)
 
     def prepare_load(self, keys, req_context: ReqContext) -> LoadStoreSpec:
         keys = list(keys)
@@ -868,6 +909,13 @@ class RaidenOffloadingManager(OffloadingManager):
                 local.append(sub_hash)
         if local:
             self._store.release(local)
+            slru = self.__dict__.get("_slru")
+            if slru is not None:
+                local_set = set(local)
+                with self._eviction_lock:
+                    for key in spec.keys:
+                        if all(h in local_set for h in self._sub_hashes(key)):
+                            slru.record_lru_refresh(key)
 
     def held_stats(self) -> tuple[int, int, int, float | None]:
         """Keys held, keys stored and evicted since startup, and the store time
@@ -876,6 +924,78 @@ class RaidenOffloadingManager(OffloadingManager):
         with self._eviction_lock:
             oldest = next(iter(self._held.values()), None)
             return len(self._held), self._held_stored, self._held_evicted, oldest
+
+    def slru_stats(self):
+        """Point-in-time ``SlruStats``, or ``None`` when SLRU is disabled."""
+        slru = self.__dict__.get("_slru")
+        if slru is None:
+            return None
+        with self._eviction_lock:
+            return slru.stats()
+
+    def demote_keys(self, keys: Iterable[OffloadKey]) -> int:
+        """Demote any protected SLRU keys back to probation (no-op if SLRU off)."""
+        slru = self.__dict__.get("_slru")
+        if slru is None:
+            return 0
+        demoted = 0
+        with self._eviction_lock:
+            for key in keys:
+                if slru.demote(key):
+                    demoted += 1
+        return demoted
+
+    def _slru_rescue_before_insert(self, keys: list[OffloadKey]) -> None:
+        """Refresh protected entries sitting near the LRU tail right before
+        ``insert()`` so one-shot probation entries are evicted instead.
+
+        Uses pin-balanced ``lookup`` + ``release`` (Δpin == 0, never holding
+        ``_eviction_lock`` across C++ ``KVCacheStore`` calls).
+        """
+        slru = self.__dict__.get("_slru")
+        if slru is None or not keys:
+            return
+        exclude: set[OffloadKey] = set(keys) | self._inflight_store_keys
+        for admission in self._admissions.values():
+            exclude.update(admission.keys)
+        with self._eviction_lock:
+            new_count = sum(1 for key in keys if not slru.contains(key))
+            if new_count <= 0:
+                return
+            to_rescue = slru.rescue_candidates(
+                new_count,
+                exclude=exclude,
+                max_rescues=max(64, new_count * 16),
+            )
+        if not to_rescue:
+            return
+        skip = (self._block_status.REMOTE, self._block_status.SHARED_STORAGE)
+        factor = self._device_block_size_factor
+        sub_hashes = self._expand_keys(to_rescue)
+        key_ok = [True] * len(to_rescue)
+        pos = 0
+        total = len(sub_hashes)
+        while pos < total:
+            matched = self._store.lookup(sub_hashes[pos:])
+            local_hashes: list[bytes] = []
+            try:
+                for sub_hash, block in matched:
+                    if block.status in skip:
+                        break
+                    local_hashes.append(sub_hash)
+            finally:
+                if local_hashes:
+                    self._store.release(local_hashes)
+            pos += len(local_hashes)
+            if pos < total:
+                key_ok[pos // factor] = False
+                pos += 1
+        with self._eviction_lock:
+            for key, ok in zip(to_rescue, key_ok):
+                if ok:
+                    slru.mark_rescued(key)
+                else:
+                    slru.mark_missing(key)
 
     def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
         # The Raiden directory is the sole authority on what is stored: probe
@@ -925,6 +1045,13 @@ class RaidenOffloadingManager(OffloadingManager):
             self._block_status.HOST_AND_HBM,
             self._block_status.REMOTE,
         )
+        host_statuses = (
+            self._block_status.HOST,
+            self._block_status.HOST_AND_HBM,
+        )
+        slru = self.__dict__.get("_slru")
+        rehit_keys: list[OffloadKey] = []
+        skip_release = (self._block_status.REMOTE, self._block_status.SHARED_STORAGE)
         for key in keys:
             if key in self._inflight_store_keys:
                 continue
@@ -933,8 +1060,24 @@ class RaidenOffloadingManager(OffloadingManager):
             if len(matches) == len(sub_hashes) and all(
                 block.status in resident_statuses for _, block in matches
             ):
+                if slru is not None and all(
+                    block.status in host_statuses for _, block in matches
+                ):
+                    held = [
+                        h
+                        for h, blk in self._store.lookup(sub_hashes)
+                        if blk.status not in skip_release
+                    ]
+                    if held:
+                        self._store.release(held)
+                        if len(held) == len(sub_hashes):
+                            rehit_keys.append(key)
                 continue
             keys_to_store.append(key)
+        if slru is not None and rehit_keys:
+            with self._eviction_lock:
+                for key in rehit_keys:
+                    slru.record_hit(key)
         return keys_to_store
 
     def prepare_victim_store(self, keys) -> list[OffloadKey]:
@@ -973,6 +1116,9 @@ class RaidenOffloadingManager(OffloadingManager):
                 key, sub_idx = parsed
                 if self._held is not None and self._held.pop(key, None) is not None:
                     self._held_evicted += 1
+                slru = self.__dict__.get("_slru")
+                if slru is not None:
+                    slru.on_evict(key)
                 sub_indices = self._evicted_sub_hashes.setdefault(key, set())
                 if not sub_indices:
                     # Report eviction on the first sub-block loss: the logical
@@ -1064,6 +1210,8 @@ class RaidenOffloadingManager(OffloadingManager):
             )
             for dev_id in device_ids
         ]
+        if self.__dict__.get("_slru") is not None:
+            self._slru_rescue_before_insert(keys)
         if not self._store.insert(sub_hashes, slices, on_host=False):
             # Atomically rolled back inside Raiden; no DMA save was issued.
             logger.warning(
@@ -1129,6 +1277,13 @@ class RaidenOffloadingManager(OffloadingManager):
         self._admissions[job_id] = admission
         for sub_hash in to_save:
             self._hash_to_admission[sub_hash] = admission
+        slru = self.__dict__.get("_slru")
+        if slru is not None:
+            saved_set = set(to_save)
+            with self._eviction_lock:
+                for key in keys:
+                    if any(h in saved_set for h in self._sub_hashes(key)):
+                        slru.record_insert(key)
 
     def submit_load_job(
         self,
@@ -1271,13 +1426,16 @@ class RaidenOffloadingManager(OffloadingManager):
             self._store.release(held)
         if admission.op == AdmissionOp.STORE:
             self._inflight_store_keys.difference_update(admission.keys)
-            if success and self._held is not None:
+            slru = self.__dict__.get("_slru")
+            if success and (self._held is not None or slru is not None):
                 now = time.time()
                 with self._eviction_lock:
                     for key in admission.keys:
-                        if key not in self._held:
+                        if self._held is not None and key not in self._held:
                             self._held[key] = now
                             self._held_stored += 1
+                        if slru is not None:
+                            slru.record_insert(key)
             saved = set(admission.saved_sub_hashes)
             self._finished.append(
                 FinishedJob(
@@ -1296,6 +1454,20 @@ class RaidenOffloadingManager(OffloadingManager):
                 )
             )
         else:
+            slru = self.__dict__.get("_slru")
+            if success and slru is not None:
+                local_keys = [
+                    key
+                    for key in admission.keys
+                    if all(
+                        h not in admission.remote_sub_hashes
+                        for h in self._sub_hashes(key)
+                    )
+                ]
+                if local_keys:
+                    with self._eviction_lock:
+                        for key in local_keys:
+                            slru.record_hit(key)
             self._finished.append(
                 FinishedJob(
                     job_id=admission.job_id,
@@ -2798,7 +2970,18 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         check: bool | None = None,
     ) -> TieredOffloadingManager:
         """One manager per class (stores injected by tests), under one composite."""
+        from vllm_torchtpu.offload.slru import (
+            normalize_evict_policy,
+            validate_probation_frac,
+        )
         from vllm_torchtpu.offload.tier_classes import TieredOffloadingManager
+
+        policy = normalize_evict_policy(envs.VLLM_TPU_OFFLOAD_TIER_EVICT_POLICY)
+        probation_frac: float | None = None
+        if policy in ("slru", "slru_all"):
+            probation_frac = validate_probation_frac(
+                envs.VLLM_TPU_OFFLOAD_TIER_SLRU_PROBATION_FRAC
+            )
 
         plan = self.tier_plan
         assert plan is not None
@@ -2806,6 +2989,9 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         managers = []
         for tier_class in plan.classes:
             capacity = plan.capacity(tier_class)
+            use_slru = policy == "slru_all" or (
+                policy == "slru" and not tier_class.per_checkpoint
+            )
             managers.append(
                 RaidenOffloadingManager(
                     kernel_physical_blocks_capacity=capacity * factor,
@@ -2818,6 +3004,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     key_namespace=self.key_namespace,
                     device_row_stride=tier_class.rows_per_page,
                     track_held=True,
+                    slru_probation_frac=probation_frac if use_slru else None,
+                    slru_promote_hits=2 if tier_class.per_checkpoint else 1,
                     store=None if stores is None else stores[tier_class.index],
                     store_types=store_types,
                 )
@@ -2957,6 +3145,19 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     ),
                     dict(storage.properties) or "none",
                 )
+            from vllm_torchtpu.offload.slru import (
+                normalize_evict_policy,
+                validate_probation_frac,
+            )
+
+            evict_policy = normalize_evict_policy(
+                envs.VLLM_TPU_OFFLOAD_TIER_EVICT_POLICY
+            )
+            slru_frac = (
+                validate_probation_frac(envs.VLLM_TPU_OFFLOAD_TIER_SLRU_PROBATION_FRAC)
+                if evict_policy in ("slru", "slru_all")
+                else None
+            )
             self._manager = RaidenOffloadingManager(
                 kernel_physical_blocks_capacity=self.kernel_physical_blocks_capacity,
                 offload_logical_blocks_capacity=self.offload_logical_blocks_capacity,
@@ -2969,6 +3170,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 kv_pool_group=self.kv_pool_group,
                 key_namespace=self.key_namespace,
                 secondary_backend_configs=secondary_backend_configs,
+                slru_probation_frac=slru_frac,
             )
         return self._manager
 

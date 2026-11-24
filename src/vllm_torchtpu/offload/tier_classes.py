@@ -537,6 +537,15 @@ class TieredOffloadingManager(OffloadingManager):
         for c, (ks, _) in self._split(keys).items():
             self._managers[c].touch(ks, req_context)
 
+    def demote_keys(self, keys: Iterable[OffloadKey]) -> int:
+        """Demote any SLRU-protected keys back to probation (0 when SLRU off)."""
+        total = 0
+        for c, (ks, _) in self._split(keys).items():
+            fn = getattr(self._managers[c], "demote_keys", None)
+            if callable(fn):
+                total += int(fn(ks))
+        return total
+
     def prepare_load(self, keys, req_context: ReqContext) -> LoadStoreSpec:
         keys = list(keys)
         taken: list[tuple[int, RaidenLoadStoreSpec]] = []
@@ -869,11 +878,20 @@ class TieredOffloadingManager(OffloadingManager):
                 )
             age = "n/a" if oldest is None else f"{now - oldest:.0f}"
             stamp = "n/a" if oldest is None else f"{oldest:.1f}"
+            slru_s = ""
+            slru_fn = getattr(self._managers[c.index], "slru_stats", None)
+            if callable(slru_fn):
+                st = slru_fn()
+                if st is not None:
+                    slru_s = (
+                        f" slru={st.protected}/{st.probation}"
+                        f"(r={st.rescues},p={st.promotes},d={st.demotes})"
+                    )
             parts.append(
                 f"tier[{c.name}] held={held}/{self._plan.capacity(c)} "
                 f"stored={stored} evicted={evicted}{rate} "
                 f"oldest_stored_at={stamp} oldest_age_s={age} "
-                f"load_keys={self._load_keys[c.index]}"
+                f"load_keys={self._load_keys[c.index]}{slru_s}"
             )
         self._telemetry_last = (now, [(s[1], s[2]) for s in stats])
         return " ".join(parts)

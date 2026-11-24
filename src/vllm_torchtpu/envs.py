@@ -359,6 +359,8 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_TIER_CLASS_RATIO: float = 4.7
     VLLM_TPU_OFFLOAD_TIER_KEY_ROWS: bool = False
     VLLM_TPU_OFFLOAD_TIER_CHECK: bool = False
+    VLLM_TPU_OFFLOAD_TIER_EVICT_POLICY: str = ""
+    VLLM_TPU_OFFLOAD_TIER_SLRU_PROBATION_FRAC: float = 0.25
     VLLM_TPU_OFFLOAD_FP4: bool = False
     VLLM_TPU_OFFLOAD_FP4_SLOTS: int = 256
     VLLM_TPU_OFFLOAD_FP4_GDN: bool = False
@@ -2458,6 +2460,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # back to the host on every store and load. Host-only.
     "VLLM_TPU_OFFLOAD_TIER_CHECK": env_bool(
         "VLLM_TPU_OFFLOAD_TIER_CHECK", default=False
+    ),
+    # Host-tier eviction policy layered over Raiden's stock KVCacheStore LRU
+    # (offload/slru.py). Empty or "lru" (default): untouched C++ LRU. "slru":
+    # scan-resistant Segmented LRU on attention (token-block) classes / flat
+    # store. "slru_all": SLRU on all classes (state checkpoints require 2 reuse
+    # hits to promote so single-line turn-t checkpoints stay in probation).
+    # 100% lossless; requires no custom tpu_sync wheel. Host-only.
+    "VLLM_TPU_OFFLOAD_TIER_EVICT_POLICY": env_with_choices(
+        "VLLM_TPU_OFFLOAD_TIER_EVICT_POLICY",
+        "",
+        ["", "lru", "slru", "slru_all"],
+        case_sensitive=False,
+    ),
+    # Fraction of each SLRU-managed host-tier class reserved for probation
+    # (strictly in (0, 1); default 0.25 -> 25% probation, 75% protected).
+    # Only read when VLLM_TPU_OFFLOAD_TIER_EVICT_POLICY enables SLRU. Host-only.
+    "VLLM_TPU_OFFLOAD_TIER_SLRU_PROBATION_FRAC": env_float(
+        "VLLM_TPU_OFFLOAD_TIER_SLRU_PROBATION_FRAC", 0.25
     ),
     # With the tier classes and the victim policy: the main-KV class keeps FP4 (MXFP4:
     # e2m1 values, one power-of-two scale per 32) on the host instead of the FP8 pool
