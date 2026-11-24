@@ -27,9 +27,9 @@ import torch
 from vllm.distributed.parallel_state import get_dp_group
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed.collectives import quantized_all_gather
 from vllm_torchtpu.distributed.hier_reduce_scatter import moe_combine_reduce_scatter
 from vllm_torchtpu.distributed.pcp import get_pcp_group
-from vllm_torchtpu.distributed.quantized_collectives import quantized_all_gather
 from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
 from vllm_torchtpu.logger import init_logger
 
