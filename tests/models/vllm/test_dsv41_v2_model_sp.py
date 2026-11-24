@@ -649,8 +649,8 @@ def test_forward_stage_decoder_and_encoder_paths(monkeypatch: pytest.MonkeyPatch
         lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
     monkeypatch.setattr(v2_model, "post", lambda h, *a: h)
-    monkeypatch.setattr(v2_model, "collapse", lambda h, pm: h)
-    monkeypatch.setattr(v2_model, "flat_collapse", lambda h, pm: h)
+    # The decoder takes its streams flat and views them [T, 4, D].
+    monkeypatch.setattr(v2_model, "flat_collapse", lambda h, pm: h.flatten(1))
 
     out_dec = v2_model.DeepseekV41Model._forward_stage(
         model,
@@ -780,7 +780,6 @@ def test_forward_stage_pipeline_parallel_and_aux_hidden_states(
     monkeypatch.setattr(v2_model.upstream.envs, "VLLM_MOE_SKIP_PADDING", True)
     monkeypatch.setattr(v2_model.upstream, "sp_padding_mask", lambda mask, h: mask)
     monkeypatch.setattr(v2_model, "post", lambda h, *a: h)
-    monkeypatch.setattr(v2_model, "collapse", lambda h, pm: h)
     monkeypatch.setattr(v2_model, "flat_collapse", lambda h, pm: h)
 
     inter_tensors = {
@@ -1367,7 +1366,7 @@ def test_early_split_preserves_delayed_carry(monkeypatch, rows):
             if self.index in (1, 2):
                 residual = residual + ids[:, None, None] / (11 + self.index)
             pre_mix = torch.sigmoid(residual.mean(-1))
-            hidden = torch.tanh(v2_model.collapse(residual, pre_mix))
+            hidden = torch.tanh(v2_model.flat_collapse(residual, pre_mix))
             post_mix = torch.full_like(pre_mix[..., None], 0.3)
             res_mix = torch.eye(2)[None].expand(hidden.shape[0], -1, -1) * 0.7
             return hidden, residual, post_mix, res_mix, pre_mix, None
