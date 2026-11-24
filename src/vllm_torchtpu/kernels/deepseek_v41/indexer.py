@@ -21,6 +21,8 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
 QUERY_TILE = 32
 KEY_TILE = 128
 HEAD_DIM = 128
+# The bounded pipeline unrolls up to this many tiles; more run in a loop.
+MAX_UNROLLED_TILES = 16
 
 
 def pipeline_score_topk_unrolled(
@@ -61,7 +63,7 @@ def pipeline_score_topk_bounded(
     """
     if num_tiles < 1:
         raise ValueError("The score/top-k pipeline requires at least one tile")
-    if num_tiles > 16:
+    if num_tiles > MAX_UNROLLED_TILES:
         return pipeline_score_topk(
             num_tiles,
             prepare,

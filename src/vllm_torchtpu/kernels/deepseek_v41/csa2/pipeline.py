@@ -3,6 +3,7 @@
 
 import functools
 from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -83,6 +84,45 @@ def csa2_pipeline(
         deep_gather=deep_gather,
     )
     return output, gathered_words, gathered_scales
+
+
+def csa2_attend_rows(
+    q: jax.Array,
+    gathered: tuple[jax.Array, jax.Array],
+    counts: jax.Array,
+    owners: tuple[jax.Array, jax.Array] | None,
+    swa: jax.Array | tuple[jax.Array, jax.Array],
+    starts: jax.Array,
+    positions: jax.Array,
+    sink: jax.Array,
+    rope: jax.Array,
+    *,
+    offset: int,
+    **kwargs: Any,
+) -> tuple[jax.Array, jax.Array]:
+    """Attention of query rows from ``offset``, written into whole-T owners.
+
+    ``gathered`` holds the rows' KV words and scales. Without ``owners`` the
+    call allocates them; only these rows are written. Returns the owners
+    (attention output, gathered KV words) for the next row range.
+    """
+    end = offset + counts.shape[0]
+    destinations = (
+        dict(new_owners=True) if owners is None else dict(out=owners[0], kv_out=owners[1])
+    )
+    return csa2(
+        q,
+        *gathered,
+        swa,
+        jnp.clip(starts - offset, 0, end - offset),
+        positions[offset:end],
+        sink,
+        rope[offset:end],
+        main_lengths=counts,
+        query_offset=offset,
+        **destinations,
+        **kwargs,
+    )
 
 
 def csa2_pipeline_chunks(
@@ -184,26 +224,19 @@ def csa2_pipeline_chunks(
             if next_ids is not None
             else None
         )
-        chunk_words, chunk_scales = current
-        scale_chunks.append(chunk_scales)
+        scale_chunks.append(current[1])
         count_chunks.append(counts)
-        destinations = (
-            dict(new_owners=True)
-            if owners is None
-            else dict(out=owners[0], kv_out=owners[1])
-        )
-        previous = csa2(
+        previous = csa2_attend_rows(
             q,
-            chunk_words,
-            chunk_scales,
+            current,
+            counts,
+            owners,
             swa,
-            jnp.clip(starts - offset, 0, end - offset),
-            positions[offset:end],
+            starts,
+            positions,
             sink,
-            rope[offset:end],
-            main_lengths=counts,
-            query_offset=offset,
-            **destinations,
+            rope,
+            offset=offset,
             **kwargs,
         )
         if following is not None:
