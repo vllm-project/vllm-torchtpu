@@ -630,7 +630,7 @@ def _packed_work(selected, block_q, pages_per_step):
     slice of its work list, not one per array (each an XLA op of ~1.3 us,
     x 4 calls x G per layer). Step ``b``'s first group is its
     ``tiles_per_step * b``-th tile's; the last entry is the group count."""
-    pages, meta, ends, counts = jax.vmap(
+    pages, meta, _, counts = jax.vmap(
         functools.partial(
             msa_attention._work_list, block_q=block_q, pages_per_step=pages_per_step
         )
@@ -640,12 +640,7 @@ def _packed_work(selected, block_q, pages_per_step):
     groups_per_tile = msa_attention._groups_per_tile(
         block_q, selected.shape[2], pages_per_step
     )
-    if num_tiles == 1:
-        # From the groups' counts: the group count `ends` is a rank-0 value
-        # per call here (see `msa_attention._single_tile_work`).
-        live = msa_attention._single_tile_live(counts)
-    else:
-        live = jnp.arange(meta.shape[1], dtype=jnp.int32)[None] < ends[:, None]
+    live = msa_attention._live_groups(meta, counts)
     tile = jnp.where(live, msa_attention._meta_tile(meta, groups_per_tile), num_tiles)
     bounds = jnp.arange(0, num_tiles + 1, tiles_per_step, dtype=jnp.int32)
     starts = jnp.sum(tile[:, None, :] < bounds[None, :, None], axis=2, dtype=jnp.int32)

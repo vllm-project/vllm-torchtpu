@@ -293,6 +293,59 @@ def test_single_tile_work_list_matches_general_path(pages_cap, drop):
         np.testing.assert_array_equal(count, np.asarray(two[3])[:groups])
 
 
+def _work_list_reference(selected, block_q, pages_per_step):
+    """`_work_list`'s unions, and its groups' meta words and counts, by
+    plain loops over the tiles."""
+    num_tokens, topk = selected.shape
+    groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
+    unions, metas, counts = [], [], []
+    for tile in range(num_tokens // block_q):
+        rows = selected[tile * block_q : (tile + 1) * block_q]
+        union = sorted(set(rows[rows >= 0].tolist()))
+        unions += union + [-1] * (groups_per_tile * pages_per_step - len(union))
+        groups = max(-(-len(union) // pages_per_step), 1)
+        for group in range(groups):
+            metas.append(
+                ((tile * groups_per_tile + group) << 2)
+                | (group == 0)
+                | (group == groups - 1) << 1
+            )
+            counts.append(min(pages_per_step, len(union) - group * pages_per_step))
+    return np.array(unions), np.array(metas), np.array(counts)
+
+
+@pytest.mark.parametrize("num_tokens", [16, 24, 64])
+@pytest.mark.parametrize("pages_cap", [1, 40, 4000])
+@pytest.mark.parametrize("drop", [0.0, 0.5, 1.0])
+def test_multi_tile_work_list_matches_reference(num_tokens, pages_cap, drop):
+    """A decode batch of several tiles: the groups of `_work_list` are the
+    plain loops' (`_work_list_reference`), and `_live_groups` finds exactly
+    them from the entries."""
+    block_q, topk, pages_per_step = 8, 16, 16
+    rng = np.random.default_rng(num_tokens + pages_cap + int(drop * 10))
+    for _ in range(10):
+        selected = rng.integers(0, pages_cap, size=(num_tokens, topk)).astype(np.int32)
+        selected[rng.random(selected.shape) < drop] = -1
+        selected[block_q : 2 * block_q] = -1  # an empty tile
+        union, meta, num_groups, count = (
+            np.asarray(x)
+            for x in msa_attention._work_list(
+                jnp.asarray(selected), block_q, pages_per_step
+            )
+        )
+        want_union, want_meta, want_count = _work_list_reference(
+            selected, block_q, pages_per_step
+        )
+        assert int(num_groups) == len(want_meta)
+        np.testing.assert_array_equal(union, want_union)
+        np.testing.assert_array_equal(meta[: len(want_meta)], want_meta)
+        np.testing.assert_array_equal(count[: len(want_count)], want_count)
+        np.testing.assert_array_equal(
+            np.asarray(msa_attention._live_groups(meta, count)),
+            np.arange(meta.shape[0]) < int(num_groups),
+        )
+
+
 def test_fp4_lse_small_tiles_match_default_tiles():
     """The DCP attention's 8-token tiles (small batches) on a 4-bit cache give
     the 16-token tiles' output and lse."""

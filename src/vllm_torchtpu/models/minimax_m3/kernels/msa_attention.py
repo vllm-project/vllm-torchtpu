@@ -429,12 +429,14 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     groups_in_tile = jnp.maximum(-(-pages_in_tile // pages_per_step), 1)
     ends = jnp.cumsum(groups_in_tile)
     starts = ends - groups_in_tile
-    # Group w's tile, first group and end from compares against every tile's
-    # range ([groups, tiles], fused into reductions): no gathers.
+    # Group w's tile, first group and tile's pages from compares against
+    # every tile's range ([groups, tiles], fused into reductions): no
+    # gathers, and not the group count ``ends[-1]``, a rank-0 value that goes
+    # through scalar memory (~0.6 us per layer in the b3 decode twin,
+    # j-f351ea81).
     w = jnp.arange(num_tiles * groups_per_tile, dtype=jnp.int32)[:, None]
     tile = jnp.sum(starts[None, 1:] <= w, axis=1, dtype=jnp.int32)
     start = jnp.max(jnp.where(starts[None, :] <= w, starts[None, :], 0), axis=1)
-    end = jnp.min(jnp.where(ends[None, :] > w, ends[None, :], ends[-1]), axis=1)
     tile_pages = jnp.max(
         jnp.where((starts[None, :] <= w) & (ends[None, :] > w), pages_in_tile, 0),
         axis=1,
@@ -442,10 +444,13 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     w = w[:, 0]
     group = jnp.clip(w - start, 0, groups_per_tile - 1)
     count = jnp.clip(tile_pages - group * pages_per_step, 0, pages_per_step)
+    first = w == start
+    # A group (`_live_groups`) is its tile's last if no page is left after it.
+    last = ((count > 0) | first) & ((group + 1) * pages_per_step >= tile_pages)
     meta = (
         ((tile * groups_per_tile + group) << _ROW_SHIFT)
-        | jnp.where(w == start, _FIRST_BIT, 0)
-        | jnp.where(w + 1 == end, _LAST_BIT, 0)
+        | jnp.where(first, _FIRST_BIT, 0)
+        | jnp.where(last, _LAST_BIT, 0)
     )
     return padded.reshape(-1), meta.astype(jnp.int32), ends[-1], count
 
@@ -480,6 +485,14 @@ def _single_tile_live(count: jax.Array) -> jax.Array:
     while they hold a page."""
     first = jnp.arange(count.shape[-1], dtype=jnp.int32) == 0
     return (count > 0) | first
+
+
+def _live_groups(meta: jax.Array, count: jax.Array) -> jax.Array:
+    """Which entries of `_work_list` work lists (meta words and counts, any
+    leading axes) are groups, from the entries alone: a tile's first group,
+    and its others that hold a page. No group count, a rank-0 value per call
+    (see `_single_tile_work`)."""
+    return (count > 0) | ((meta & _FIRST_BIT) != 0)
 
 
 def _attention_call(
