@@ -4161,6 +4161,8 @@ class TPUModelRunner(GPUModelRunner):
             pt.mark("update_states")
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
+        if self._phase_timer is not None:
+            self._phase_timer.mark("flush_disjoint")
         if scheduler_output.total_num_scheduled_tokens == 0:
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
@@ -4202,6 +4204,8 @@ class TPUModelRunner(GPUModelRunner):
             local_any_decode=self._any_decode(scheduler_output),
         )
         self._dp_step_num_chunks = target_num_chunks
+        if self._phase_timer is not None:
+            self._phase_timer.mark("batch_setup")
         if isinstance(self._pp_wave, PPRing) and not self._pp_is_first:
             # Post this step's receives first, so the previous stage can send
             # while this one prepares its inputs.
