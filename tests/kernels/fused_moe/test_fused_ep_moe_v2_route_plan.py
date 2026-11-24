@@ -72,6 +72,16 @@ GEOMETRIES = [
 ]
 ROUTINGS = ["uniform", "skewed", "padded", "all_mine"]
 
+# The chip the SMEM budget is checked against off TPU, where get_tpu_info()
+# has no chip to read: v7x, where the budget's headroom was measured.
+V7X_INFO = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+SMEM_BUDGET = V7X_INFO.smem_capacity_bytes - route_plan.SMEM_HEADROOM_BYTES
+# Per case, above the multichip lane's --timeout=600 and the child process's
+# own limit, so a slow interpreted case fails on the child's timeout with its
+# output rather than on pytest's.
+CASE_TIMEOUT_S = 1500
+CHILD_TIMEOUT_S = 1200
+
 
 def _selections(ep, g_local, t_local, topk, routing, seed):
     """[ep * t_local, topk] distinct expert ids per row; e_total marks padding."""
@@ -229,7 +239,7 @@ def _run_in_cpu_child(ep, g_local, t_local, topk, routing, seed):
         env=env,
         capture_output=True,
         text=True,
-        timeout=1200,
+        timeout=CHILD_TIMEOUT_S,
     )
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-5000:]
 
@@ -264,6 +274,7 @@ def _run(ep, g_local, t_local, topk, routing, seed):
         block=block,
         tile_m=cap,
         shard_stride=stride,
+        info=None if tpu else V7X_INFO,
     )
     rank = jnp.arange(ep, dtype=jnp.int32).reshape(ep, 1)
 
@@ -321,8 +332,7 @@ def test_route_plan_refuses_shapes_over_the_smem_budget(ep, t_local, supported):
     smem = route_plan.route_plan_smem_bytes(
         ep=ep, e_total=e_total, t_local=t_local, topk=topk, shard_stride=stride
     )
-    budget = route_plan.SMEM_CAPACITY_BYTES - route_plan.SMEM_HEADROOM_BYTES
-    assert (smem <= budget) == supported, smem
+    assert (smem <= SMEM_BUDGET) == supported, smem
     assert (
         route_plan.route_plan_supported(
             ep=ep,
@@ -332,6 +342,7 @@ def test_route_plan_refuses_shapes_over_the_smem_budget(ep, t_local, supported):
             block=host.routing_block(t_local, topk),
             tile_m=cap,
             shard_stride=stride,
+            info=V7X_INFO,
         )
         == supported
     )
@@ -352,7 +363,7 @@ def test_route_plan_refuses_pairs_past_the_bitmask(topk, supported):
     smem = route_plan.route_plan_smem_bytes(
         ep=ep, e_total=e_total, t_local=t_local, topk=topk, shard_stride=stride
     )
-    assert smem <= route_plan.SMEM_CAPACITY_BYTES - route_plan.SMEM_HEADROOM_BYTES
+    assert smem <= SMEM_BUDGET
     assert (
         route_plan.route_plan_supported(
             ep=ep,
@@ -362,12 +373,14 @@ def test_route_plan_refuses_pairs_past_the_bitmask(topk, supported):
             block=host.routing_block(t_local, topk),
             tile_m=cap,
             shard_stride=stride,
+            info=V7X_INFO,
         )
         == supported
     )
 
 
 @pytest.mark.multichip
+@pytest.mark.timeout(CASE_TIMEOUT_S)
 @pytest.mark.parametrize("ep,g_local,t_local,topk", GEOMETRIES)
 @pytest.mark.parametrize("routing", ROUTINGS)
 def test_route_plan_matches_the_xla_tables(ep, g_local, t_local, topk, routing):

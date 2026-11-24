@@ -65,13 +65,12 @@ BF16_EXACT_MAX = 256
 # f32 accumulates integers exactly below 2**24.
 F32_EXACT_MAX = 1 << 24
 WORD_BITS = 32
-# Scalar memory per TensorCore on v7x. The kernel's SMEM scratch (the gathered
-# pairs and the two slab tables) grows with ep * t_local * topk; a shape over
-# the budget fails to compile, so route_plan_supported refuses it and the layer
-# keeps XLA. The headroom covers what route_plan_smem_bytes leaves out
-# (register spill slots, small-array padding, the rank prefetch): at EP32,
-# t_local=256 the compiler reported 5.2 KiB over against 1.6 KiB estimated.
-SMEM_CAPACITY_BYTES = 1 << 20
+# The kernel's SMEM scratch (the gathered pairs and the two slab tables) grows
+# with ep * t_local * topk; a shape over the chip's SMEM fails to compile, so
+# route_plan_supported refuses it and the layer keeps XLA. The headroom covers
+# what route_plan_smem_bytes leaves out (register spill slots, small-array
+# padding, the rank prefetch): at EP32, t_local=256 on v7x (1 MiB SMEM) the
+# compiler reported 5.2 KiB over against 1.6 KiB estimated.
 SMEM_HEADROOM_BYTES = 32 << 10
 
 # DMA semaphore slots.
@@ -119,9 +118,20 @@ def route_plan_smem_bytes(*, ep, e_total, t_local, topk, shard_stride):
     return words * np.dtype(np.int32).itemsize
 
 
-def route_plan_supported(*, ep, e_total, t_local, topk, block, tile_m, shard_stride):
-    """Whether the kernel covers this shape; the layer keeps XLA otherwise."""
+def route_plan_supported(
+    *, ep, e_total, t_local, topk, block, tile_m, shard_stride, info=None
+):
+    """Whether the kernel covers this shape; the layer keeps XLA otherwise.
+
+    The SMEM budget is this chip's (pltpu.get_tpu_info()) unless `info` is
+    given, which is read only once every other condition holds.
+    """
     T = ep * t_local
+
+    def smem_budget():
+        chip = info if info is not None else pltpu.get_tpu_info()
+        return chip.smem_capacity_bytes - SMEM_HEADROOM_BYTES
+
     return bool(
         1 < ep <= LANES
         and e_total % ep == 0
@@ -145,7 +155,7 @@ def route_plan_supported(*, ep, e_total, t_local, topk, block, tile_m, shard_str
             topk=topk,
             shard_stride=shard_stride,
         )
-        <= SMEM_CAPACITY_BYTES - SMEM_HEADROOM_BYTES
+        <= smem_budget()
     )
 
 
