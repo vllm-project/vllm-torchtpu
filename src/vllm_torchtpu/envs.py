@@ -422,6 +422,8 @@ if TYPE_CHECKING:
     VLLM_TPU_VERIFY_SHARD_TOPK: int = 0
     VLLM_TPU_VERIFY_SHARD_CHECK: int = 0
     VLLM_TPU_DRAFT_SEED_FUSED: bool = False
+    VLLM_TPU_DRAFT_SEED_DEVICE_INDICES: bool = False
+    VLLM_TPU_DRAFT_LOAD_INDEXED_SHARDS: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
@@ -2688,6 +2690,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Async draft seed + input shift/scatter + gather pad as one program
     # (eagle3._async_seed_inputs_impl).
     "VLLM_TPU_DRAFT_SEED_FUSED": env_bool("VLLM_TPU_DRAFT_SEED_FUSED"),
+    # Build int64 seed/gather index vectors on-device from int32 H2D uploads so
+    # their layout matches XLA-produced index vectors ({0:T(256)}).
+    "VLLM_TPU_DRAFT_SEED_DEVICE_INDICES": env_bool(
+        "VLLM_TPU_DRAFT_SEED_DEVICE_INDICES", default=False
+    ),
+    # Load only safetensors shards whose keys belong to the draft model when an
+    # index file is present (model_loader_patches.py).
+    "VLLM_TPU_DRAFT_LOAD_INDEXED_SHARDS": env_bool(
+        "VLLM_TPU_DRAFT_LOAD_INDEXED_SHARDS", default=False
+    ),
     "VLLM_TPU_CPU_PIN_RESERVE": env_nonnegative_int("VLLM_TPU_CPU_PIN_RESERVE", 2),
     # Log each worker's thread CPU placement every N seconds (0 = off).
     "VLLM_TPU_CPU_PROBE_S": env_float("VLLM_TPU_CPU_PROBE_S", 0.0),

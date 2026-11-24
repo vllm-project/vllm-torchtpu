@@ -48,6 +48,8 @@ tensors (ModelOpt NVFP4, needed globally by FlashInfer backends) are not
 in the allowlist and stay unfiltered.
 """
 
+import contextlib
+import dataclasses
 import functools
 import gc
 import json
@@ -661,6 +663,267 @@ def _evict_checkpoint_page_cache(files: list[str]) -> None:
         evicted_count,
         evicted_gb,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class _DraftShardFilterContext:
+    shared_keys: tuple[str, ...] = ()
+    speculative_method: str | None = None
+
+
+_draft_load_tls = threading.local()
+
+
+def _current_draft_load_context() -> _DraftShardFilterContext | None:
+    stack = getattr(_draft_load_tls, "stack", None)
+    return stack[-1] if stack else None
+
+
+@contextlib.contextmanager
+def draft_weight_load_context(
+    shared_keys: tuple[str, ...] = (),
+    speculative_method: str | None = None,
+):
+    """Propagates draft weight-sharing context to model loader shard filters."""
+    stack = getattr(_draft_load_tls, "stack", None)
+    if stack is None:
+        stack = []
+        _draft_load_tls.stack = stack
+    stack.append(
+        _DraftShardFilterContext(
+            shared_keys=tuple(shared_keys),
+            speculative_method=speculative_method,
+        )
+    )
+    try:
+        yield
+    finally:
+        stack.pop()
+
+
+def _read_safetensors_index_weight_map(
+    candidates: list[str],
+    index_file: str,
+) -> dict[str, str] | None:
+    """Loads ``weight_map`` from the first readable safetensors index file."""
+    seen: set[str] = set()
+    for folder in candidates:
+        if not folder:
+            continue
+        index_path = os.path.join(folder, index_file)
+        if index_path in seen:
+            continue
+        seen.add(index_path)
+        try:
+            if os.path.isfile(index_path):
+                with open(index_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                weight_map = data.get("weight_map") if isinstance(data, dict) else None
+                if isinstance(weight_map, dict):
+                    return weight_map
+        except Exception as exc:
+            logger.debug(
+                "Draft indexed shard filter: failed reading %s: %s",
+                index_path,
+                exc,
+            )
+    return None
+
+
+def _is_draft_checkpoint_key(
+    key: str,
+    *,
+    shared_keys: tuple[str, ...],
+    keep_embed: bool,
+    keep_lm_head: bool,
+) -> bool:
+    if shared_keys and any(sk in key for sk in shared_keys):
+        return False
+    if key.startswith(("mtp.", "model.mtp.")):
+        return True
+    if keep_embed and "embed_tokens" in key:
+        return True
+    if keep_lm_head and "lm_head" in key:
+        return True
+    return False
+
+
+def _filter_draft_safetensors_files(
+    hf_weights_files: list[str],
+    *,
+    hf_folder: str | None,
+    index_file: str,
+    model_or_path: str,
+    model: typing.Any = None,
+) -> list[str]:
+    """Filters ``hf_weights_files`` to shards containing draft tensors."""
+    if len(hf_weights_files) <= 1:
+        return hf_weights_files
+
+    first_dir = os.path.dirname(hf_weights_files[0]) if hf_weights_files else ""
+    candidates = [c for c in (hf_folder, first_dir, model_or_path) if c]
+    weight_map = _read_safetensors_index_weight_map(candidates, index_file)
+    if not weight_map:
+        return hf_weights_files
+
+    if not any(k.startswith(("mtp.", "model.mtp.")) for k in weight_map):
+        return hf_weights_files
+
+    ctx = _current_draft_load_context()
+    shared_keys = ctx.shared_keys if ctx is not None else ()
+    keep_embed = getattr(model, "has_own_embed_tokens", True) and not any(
+        "embed_tokens" in sk for sk in shared_keys
+    )
+    keep_lm_head = getattr(model, "has_own_lm_head", True) and not any(
+        "lm_head" in sk for sk in shared_keys
+    )
+
+    wanted_files = {
+        wf
+        for k, wf in weight_map.items()
+        if _is_draft_checkpoint_key(
+            k,
+            shared_keys=shared_keys,
+            keep_embed=keep_embed,
+            keep_lm_head=keep_lm_head,
+        )
+    }
+    if not wanted_files:
+        return hf_weights_files
+
+    wanted_basenames = {os.path.basename(wf) for wf in wanted_files}
+    kept: list[str] = []
+    for path in hf_weights_files:
+        rel = os.path.relpath(path, hf_folder) if hf_folder else None
+        if (
+            (rel is not None and rel in wanted_files)
+            or path in wanted_files
+            or os.path.basename(path) in wanted_basenames
+        ):
+            kept.append(path)
+
+    if not kept:
+        logger.warning(
+            "Draft indexed shard filter matched 0/%d files; falling back to all shards.",
+            len(hf_weights_files),
+        )
+        return hf_weights_files
+
+    if len(kept) < len(hf_weights_files):
+        logger.info(
+            "Draft indexed shard filter: loading %d/%d shards (skipped %d target-only shards).",
+            len(kept),
+            len(hf_weights_files),
+            len(hf_weights_files) - len(kept),
+        )
+    return kept
+
+
+def patch_draft_indexed_shard_loading() -> None:
+    """Filter draft model loads to only shards referenced in safetensors index.
+
+    Guarded dynamically by ``envs.VLLM_TPU_DRAFT_LOAD_INDEXED_SHARDS``.
+    """
+    from vllm.config import ModelConfig
+    from vllm.model_executor.model_loader import default_loader as dl
+    from vllm.model_executor.model_loader import runai_streamer_loader as rsl
+
+    if not getattr(dl.DefaultModelLoader, "_tpu_draft_indexed_shard_patch", False):
+        dl_orig_prepare = dl.DefaultModelLoader._prepare_weights
+        dl_orig_load = typing.cast(
+            Callable[..., None], dl.DefaultModelLoader.load_weights
+        )
+
+        def dl_load_weights(
+            self, model: torch.nn.Module, model_config: ModelConfig
+        ) -> None:
+            prev = getattr(self, "_draft_shard_filter_state", None)
+            self._draft_shard_filter_state = (model, model_config)
+            try:
+                return dl_orig_load(self, model, model_config)
+            finally:
+                self._draft_shard_filter_state = prev
+
+        def dl_prepare_weights(self, *args, **kwargs):
+            res = dl_orig_prepare(self, *args, **kwargs)
+            if not envs.VLLM_TPU_DRAFT_LOAD_INDEXED_SHARDS:
+                return res
+            if not (isinstance(res, tuple) and len(res) >= 4):
+                return res
+            hf_folder, hf_weights_files, use_safetensors, index_file = res
+            if not use_safetensors or len(hf_weights_files) <= 1:
+                return res
+            state = getattr(self, "_draft_shard_filter_state", None)
+            model, model_config = state if state is not None else (None, None)
+            is_draft = (
+                getattr(model_config, "runner_type", None) == "draft"
+                if model_config is not None
+                else _current_draft_load_context() is not None
+            )
+            if not is_draft:
+                return res
+            model_name_or_path = (
+                args[0] if args else kwargs.get("model_name_or_path", "")
+            )
+            filtered = _filter_draft_safetensors_files(
+                hf_weights_files,
+                hf_folder=hf_folder,
+                index_file=index_file,
+                model_or_path=model_name_or_path,
+                model=model,
+            )
+            return (hf_folder, filtered, use_safetensors, index_file)
+
+        dl.DefaultModelLoader.load_weights = dl_load_weights
+        dl.DefaultModelLoader._prepare_weights = dl_prepare_weights
+        dl.DefaultModelLoader._tpu_draft_indexed_shard_patch = True
+
+    if not getattr(
+        rsl.RunaiModelStreamerLoader, "_tpu_draft_indexed_shard_patch", False
+    ):
+        rsl_orig_prepare = rsl.RunaiModelStreamerLoader._prepare_weights
+        rsl_orig_load = typing.cast(
+            Callable[..., None], rsl.RunaiModelStreamerLoader.load_weights
+        )
+
+        def rsl_load_weights(
+            self, model: torch.nn.Module, model_config: ModelConfig
+        ) -> None:
+            prev = getattr(self, "_draft_shard_filter_state", None)
+            self._draft_shard_filter_state = (model, model_config)
+            try:
+                return rsl_orig_load(self, model, model_config)
+            finally:
+                self._draft_shard_filter_state = prev
+
+        def rsl_prepare_weights(self, *args, **kwargs):
+            hf_weights_files = rsl_orig_prepare(self, *args, **kwargs)
+            if (
+                not envs.VLLM_TPU_DRAFT_LOAD_INDEXED_SHARDS
+                or len(hf_weights_files) <= 1
+            ):
+                return hf_weights_files
+            state = getattr(self, "_draft_shard_filter_state", None)
+            model, model_config = state if state is not None else (None, None)
+            is_draft = (
+                getattr(model_config, "runner_type", None) == "draft"
+                if model_config is not None
+                else _current_draft_load_context() is not None
+            )
+            if not is_draft:
+                return hf_weights_files
+            model_or_path = args[0] if args else kwargs.get("model_or_path", "")
+            return _filter_draft_safetensors_files(
+                hf_weights_files,
+                hf_folder=None,
+                index_file="model.safetensors.index.json",
+                model_or_path=model_or_path,
+                model=model,
+            )
+
+        rsl.RunaiModelStreamerLoader.load_weights = rsl_load_weights
+        rsl.RunaiModelStreamerLoader._prepare_weights = rsl_prepare_weights
+        rsl.RunaiModelStreamerLoader._tpu_draft_indexed_shard_patch = True
 
 
 def patch_default_model_loader_page_cache() -> None:

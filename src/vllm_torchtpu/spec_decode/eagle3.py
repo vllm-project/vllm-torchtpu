@@ -211,6 +211,35 @@ def _async_draft_seed(*args: torch.Tensor):
     return fn(*args)
 
 
+def _device_int64_indices_impl(indices_i32: torch.Tensor) -> torch.Tensor:
+    """Cast an int32 index vector to int64 inside a compiled TPU region.
+
+    H2D int64 tensors arrive on TPU with layout ``{0:T(256)(128)(2,1)}``,
+    whereas XLA-produced int64 index vectors (``_async_draft_seed``,
+    ``_async_seed_inputs``) carry ``{0:T(256)}``. Producing sync/bootstrap
+    index vectors and precompile dummies through this region aligns every
+    caller to the same on-device XLA layout.
+    """
+    return indices_i32.to(torch.int64)
+
+
+_device_int64_indices_compiled = _static_shape_args(
+    torch.compile(backend="tpu", fullgraph=True, dynamic=False)(
+        _device_int64_indices_impl
+    )
+)
+
+
+def _device_int64_indices(indices_i32: torch.Tensor) -> torch.Tensor:
+    """`_device_int64_indices_compiled` on TPU, the eager impl on CPU (tests)."""
+    fn = (
+        _device_int64_indices_compiled
+        if indices_i32.device.type == "tpu"
+        else _device_int64_indices_impl
+    )
+    return fn(indices_i32)
+
+
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -1204,6 +1233,8 @@ class Eagle3Proposer:
             "eagle_head"
         )
         self.draft_vllm_config.compilation_config = draft_compilation_config
+        from vllm_torchtpu.model_loader_patches import draft_weight_load_context
+
         with (
             set_model_tag("eagle_head"),
             set_vllm_model_wrapper_context(
@@ -1211,6 +1242,9 @@ class Eagle3Proposer:
             ),
             set_current_vllm_config(self.draft_vllm_config),
             draft_tp1_ctx,
+            draft_weight_load_context(
+                speculative_method=self.speculative_config.method,
+            ),
         ):
             if (
                 target_model is not None
@@ -1284,9 +1318,15 @@ class Eagle3Proposer:
                     if not any(key in name for key in shared_keys)
                 )
 
+            from vllm_torchtpu.model_loader_patches import draft_weight_load_context
+
             cast(Any, model).load_weights = load_weights
             try:
-                model_loader.load_weights(model, draft_model_config)
+                with draft_weight_load_context(
+                    shared_keys=shared_keys,
+                    speculative_method=self.speculative_config.method,
+                ):
+                    model_loader.load_weights(model, draft_model_config)
             finally:
                 del cast(Any, model).load_weights
             if base_loader._has_online_quant(model):
@@ -2230,9 +2270,20 @@ class Eagle3Proposer:
         # The async (next_tokens_device) path recomputes last_token_indices
         # fully on-device below, only the sync / device_seed paths consume this H2D.
         if next_tokens_device is None:
-            last_token_indices = torch.from_numpy(last_token_indices_np).to(
-                runner.device
-            )
+            if envs.VLLM_TPU_DRAFT_SEED_DEVICE_INDICES:
+                last_token_indices = (
+                    _device_int64_indices(
+                        torch.from_numpy(
+                            last_token_indices_np.astype(np.int32)
+                        ).to(runner.device)
+                    )
+                    if device_seed is not None
+                    else cast(torch.Tensor, None)
+                )
+            else:
+                last_token_indices = torch.from_numpy(last_token_indices_np).to(
+                    runner.device
+                )
 
         discard_set = set(discard_sampled_tokens_req_indices)
         req_ids = runner.input_batch.req_ids[start : start + num_reqs]
@@ -2421,13 +2472,21 @@ class Eagle3Proposer:
         if next_tokens_device is None and device_seed is None:
             # Pure sync: build the padded index + values on the host (free H2D,
             # no recompile), then scatter at the constant [p] shape.
-            lti_p_np = np.full(p, last_token_indices_np[-1], dtype=np.int64)
+            lti_dtype = (
+                np.int32 if envs.VLLM_TPU_DRAFT_SEED_DEVICE_INDICES else np.int64
+            )
+            lti_p_np = np.full(p, last_token_indices_np[-1], dtype=lti_dtype)
             lti_p_np[:num_reqs] = last_token_indices_np
             ntids_p_np = np.full(
                 p, next_token_ids_np[-1], dtype=next_token_ids_np.dtype
             )
             ntids_p_np[:num_reqs] = next_token_ids_np
-            last_token_indices = torch.from_numpy(lti_p_np).to(runner.device)
+            lti_dev = torch.from_numpy(lti_p_np).to(runner.device)
+            last_token_indices = (
+                _device_int64_indices(lti_dev)
+                if envs.VLLM_TPU_DRAFT_SEED_DEVICE_INDICES
+                else lti_dev
+            )
             next_token_ids = torch.from_numpy(ntids_p_np).to(runner.device)
             draft_input_ids = self._draft_seed_input_ids(
                 chunk.input_ids, last_token_indices, next_token_ids
@@ -2443,9 +2502,17 @@ class Eagle3Proposer:
             if next_tokens_device is not None:
                 gather_indices = _maybe_pad_dim0(last_token_indices[:p], p)
             else:
-                padded_lti_np = np.zeros(p, dtype=np.int64)
+                lti_dtype = (
+                    np.int32 if envs.VLLM_TPU_DRAFT_SEED_DEVICE_INDICES else np.int64
+                )
+                padded_lti_np = np.zeros(p, dtype=lti_dtype)
                 padded_lti_np[:num_reqs] = last_token_indices_np
-                gather_indices = torch.from_numpy(padded_lti_np).to(runner.device)
+                gather_dev = torch.from_numpy(padded_lti_np).to(runner.device)
+                gather_indices = (
+                    _device_int64_indices(gather_dev)
+                    if envs.VLLM_TPU_DRAFT_SEED_DEVICE_INDICES
+                    else gather_dev
+                )
 
         draft_input_ids, gather_indices = (
             chunk.sequence_layout_plan.localize_token_tensor_and_gather_indices(
@@ -3086,7 +3153,13 @@ class Eagle3Proposer:
                     if p > T:
                         continue
                     ids = torch.zeros(T, dtype=torch.int32).to(runner.device)
-                    lti = torch.zeros(p, dtype=torch.int64).to(runner.device)
+                    lti = (
+                        _device_int64_indices(
+                            torch.zeros(p, dtype=torch.int32).to(runner.device)
+                        )
+                        if envs.VLLM_TPU_DRAFT_SEED_DEVICE_INDICES
+                        else torch.zeros(p, dtype=torch.int64).to(runner.device)
+                    )
                     nti = torch.zeros(p, dtype=torch.int32).to(runner.device)
                     out = self._draft_seed_input_ids(ids, lti, nti)
                     synchronize_tensors(out)
