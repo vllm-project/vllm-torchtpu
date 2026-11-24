@@ -929,11 +929,32 @@ def _get_msa_dcp_fp4_op(
         )
 
     score_op.register_fake(_score_fake)
+    # A one-KV-head group's long steps may attend head-parallel
+    # (TPU_MINIMAX_M3_DCP_SINGLE_HEAD_HP): the choice is made inside the JAX
+    # op on the step's static row count, so the torch graph has one call.
+    single_head_hp = kv_heads == 1 and dcp > 1 and envs.TPU_MINIMAX_M3_DCP_SINGLE_HEAD_HP
     attend_merge_op = (
-        _get_msa_dcp_attend_merge_op(sm_scale, topk, dcp, True, suffix)
+        _get_msa_dcp_attend_merge_op(
+            sm_scale,
+            topk,
+            dcp,
+            True,
+            suffix,
+            hp=(kv_head_replicas, decode_rows) if single_head_hp else None,
+        )
         if kv_heads == 1
         else None
     )
+    if single_head_hp:
+        logger.warning(
+            "TPU_MINIMAX_M3_DCP_SINGLE_HEAD_HP=1: MSA DCP group of one KV head "
+            "(dcp %d, %d replicas) attends steps of >= %d tokens head-parallel "
+            "(row split %s), chosen inside the attend-merge op.",
+            dcp,
+            kv_head_replicas,
+            msa_dcp_heads.HEAD_PARALLEL_MIN_TOKENS,
+            bool(envs.TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT),
+        )
     attend_op = None
     if kv_heads == 1 and _packed_collectives_enabled():
         attend_op = pallas.jax_op(
@@ -947,22 +968,6 @@ def _get_msa_dcp_fp4_op(
         if kv_heads > 1
         else None
     )
-    # A one-head group's long steps may take the head-parallel op too
-    # (TPU_MINIMAX_M3_DCP_SINGLE_HEAD_HP); its other steps keep the paths below.
-    single_head_hp_op = None
-    if kv_heads == 1 and dcp > 1 and envs.TPU_MINIMAX_M3_DCP_SINGLE_HEAD_HP:
-        single_head_hp_op = _get_msa_dcp_heads_op(
-            sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix
-        )
-        logger.warning(
-            "TPU_MINIMAX_M3_DCP_SINGLE_HEAD_HP=1: MSA DCP group of one KV head "
-            "(dcp %d, %d replicas) attends steps of >= %d tokens head-parallel "
-            "(row split %s).",
-            dcp,
-            kv_head_replicas,
-            msa_dcp_heads.HEAD_PARALLEL_MIN_TOKENS,
-            bool(envs.TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT),
-        )
     early_q_op = early_dec_op = None
     if kv_heads > 1 and early:
         early_q_op = _get_msa_dcp_heads_op(
@@ -1054,22 +1059,6 @@ def _get_msa_dcp_fp4_op(
                 metadata.query_start_loc,
                 metadata.request_distribution,
             )
-        # A one-KV-head group reads q head-major [Hl, T, D]; the head-parallel
-        # op takes it token-major and returns [T, Hl, D] like the merge.
-        if single_head_hp_op is not None and not msa_dcp_heads.uses_dcp_attention(
-            q.shape[1], metadata.seq_lens.shape[0], decode_rows
-        ):
-            return single_head_hp_op(
-                dcp_rank,
-                q.transpose(0, 1).contiguous(),
-                kv_cache,
-                scale_cache,
-                candidates,
-                metadata.seq_lens,
-                metadata.block_tables,
-                metadata.query_start_loc,
-                metadata.request_distribution,
-            )
         if heads_op is not None:
             return heads_op(
                 dcp_rank,
@@ -1094,6 +1083,7 @@ def _get_msa_dcp_fp4_op(
                 metadata.query_start_loc,
                 scale_cache,
                 hadamard,
+                *((metadata.request_distribution,) if single_head_hp else ()),
             )
         # TPU_MINIMAX_M3_DCP_EARLY_Q_GATHER (query heads gathered ahead of the
         # scoring op) or the packed DCP collectives: attend, then merge.
@@ -1124,26 +1114,119 @@ def _get_msa_dcp_fp4_op(
     return op
 
 
+# Head-parallel attend-merge programs traced so far (one per step size).
+_SINGLE_HEAD_HP_TRACES: list[int] = []
+
+
+def _single_head_attend_and_merge(
+    rank: jax.Array,
+    q: jax.Array,
+    kv_cache: jax.Array,
+    candidates: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    scale_cache: jax.Array,
+    hadamard: jax.Array,
+    distribution: jax.Array,
+    *,
+    axis: str,
+    dcp: int,
+    sm_scale: float,
+    topk: int,
+    kv_head_replicas: int,
+    decode_rows: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """`msa_dcp.attend_and_merge` for a 4-bit one-KV-head group, except that
+    a step `msa_dcp_heads.uses_dcp_attention` does not take attends
+    head-parallel (`msa_dcp_heads.attend_and_merge`, whose decode rows keep
+    the DCP attention). The step's row count is static here, so each compiled
+    step size runs one of the two paths."""
+    num_heads, num_tokens, head_dim = q.shape
+    if msa_dcp_heads.uses_dcp_attention(num_tokens, seq_lens.shape[0], decode_rows):
+        return msa_dcp.attend_and_merge(
+            rank,
+            q,
+            kv_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            cu_q_lens,
+            scale_cache,
+            hadamard,
+            axis=axis,
+            dcp=dcp,
+            sm_scale=sm_scale,
+            topk=topk,
+            interpret=interpret,
+        )
+    _SINGLE_HEAD_HP_TRACES.append(num_tokens)
+    logger.warning(
+        "MSA DCP one-head head-parallel attend traced: %d tokens (%d programs)",
+        num_tokens,
+        len(_SINGLE_HEAD_HP_TRACES),
+    )
+    out = msa_dcp_heads.attend_and_merge(
+        rank,
+        q.transpose(1, 0, 2),
+        kv_cache,
+        scale_cache,
+        candidates,
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        distribution,
+        axis=axis,
+        dcp=dcp,
+        kv_head_replicas=kv_head_replicas,
+        sm_scale=sm_scale,
+        topk=topk,
+        decode_rows=decode_rows,
+        rs_out_precision=envs.TPU_DCP_RS_OUT_PRECISION,
+        interpret=interpret,
+    )
+    return out.reshape(num_tokens, num_heads * head_dim)
+
+
 def _get_msa_dcp_attend_merge_op(
-    sm_scale: float, topk: int, dcp: int, fp4: bool, suffix: str
+    sm_scale: float,
+    topk: int,
+    dcp: int,
+    fp4: bool,
+    suffix: str,
+    hp: tuple[int, int] | None = None,
 ) -> Callable[..., torch.Tensor]:
     """The attention half of the DCP op over one KV head, as one SPMD op over
     the DCP mesh (`msa_dcp.attend_and_merge`): this rank's head-major
     queries and its candidates in, its heads' merged output ``[T, Hl * D]``
-    out. With `fp4` it also takes the scale cache and the hadamard."""
+    out. With `fp4` it also takes the scale cache and the hadamard. With
+    `hp` = ``(kv_head_replicas, decode_rows)`` (4-bit only) it also takes the
+    request distribution, and long steps attend head-parallel
+    (`_single_head_attend_and_merge`)."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
 
+    assert hp is None or fp4
     mesh = get_or_create_dcp_mesh()
     sharded, replicated = PartitionSpec(DCP_AXIS_NAME), PartitionSpec()
     # rank, q, kv_cache, candidates | seq_lens, block_tables, query_start_loc
-    # | (scale_cache, hadamard)
+    # | (scale_cache, hadamard) | (distribution)
     specs = (sharded,) * 4 + (replicated,) * 3 + ((sharded, replicated) if fp4 else ())
+    if hp is None:
+        fn = functools.partial(msa_dcp.attend_and_merge, axis=DCP_AXIS_NAME)
+    else:
+        specs += (replicated,)
+        fn = functools.partial(
+            _single_head_attend_and_merge,
+            axis=DCP_AXIS_NAME,
+            kv_head_replicas=hp[0],
+            decode_rows=hp[1],
+        )
     body = jax.shard_map(
         functools.partial(
-            msa_dcp.attend_and_merge,
-            axis=DCP_AXIS_NAME,
+            fn,
             dcp=dcp,
             sm_scale=sm_scale,
             topk=topk,
@@ -1196,10 +1279,38 @@ def _get_msa_dcp_attend_merge_op(
             hadamard,
         )
 
+    def _attend_hp_jax(
+        dcp_rank: jax.Array,
+        q: jax.Array,
+        kv_cache: jax.Array,
+        candidates: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        scale_cache: jax.Array,
+        hadamard: jax.Array,
+        distribution: jax.Array,
+    ) -> jax.Array:
+        return run(
+            dcp_rank,
+            q,
+            kv_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            scale_cache,
+            hadamard,
+            distribution,
+        )
+
+    name = f"pallas::minimax_m3_msa_dcp_attend_merge_{suffix}_fp4{int(fp4)}"
+    if hp is not None:
+        name += f"_hp{hp[0]}r{hp[1]}"
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
-        f"pallas::minimax_m3_msa_dcp_attend_merge_{suffix}_fp4{int(fp4)}",
-        _attend_fp4_jax if fp4 else _attend_jax,
+        name,
+        _attend_hp_jax if hp is not None else _attend_fp4_jax if fp4 else _attend_jax,
         mesh=mesh,
         input_partition_specs=specs,
         # A sequence, one spec per output (a bare spec reads as its axes).
