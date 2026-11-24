@@ -417,7 +417,7 @@ def test_regime_table_surfaces_pct_headroom_and_low_roi_tag() -> None:
         entry for label, entry in by_label.items() if "Preset Prefill Window" in label
     )
     assert preset_window.recommended_scope == "per_op"
-    assert preset_window.fastest_scope == "single_layer"
+    assert preset_window.fastest_scope == "layer_group"
     assert preset_window.recommended_moe_mode == "grouped_on_chip"
 
     table_txt = advisor.format_regime_table(sweep)
