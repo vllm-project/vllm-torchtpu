@@ -466,6 +466,7 @@ def _select_fp8_indexer_jax(
     *,
     prefill_chunk_rows: int | None = None,
     consume: "SelectionConsumer | None" = None,
+    records: "tuple[jax.Array, jax.Array, int] | None" = None,
 ) -> tuple[jax.Array, ...]:
     """Selected indices and published candidates; see `select_fp8_indexer_tiles`."""
 
@@ -719,6 +720,16 @@ def _select_fp8_indexer_jax(
                 k=topk,
                 block_size=select_block,
                 publish=candidates.shape[1] if publish_rows else 0,
+                records=None
+                if tile_records is None
+                else (
+                    tile_records[0],
+                    jax.lax.dynamic_slice_in_dim(
+                        tile_records[1], tile * chunk_rows, chunk_rows
+                    ),
+                    short.astype(jnp.int32).reshape(1),
+                    tile_records[2],
+                ),
                 scheduling_group_id=group,
             )
         selected = select_topk(
@@ -746,6 +757,20 @@ def _select_fp8_indexer_jax(
     # the consumer while later tiles are still scored and selected.
     unrolled = not bounded or num_tiles <= indexer.MAX_UNROLLED_TILES
     tile_consume = consume if unrolled else None
+    # The SparseCore selection also resolves the consumer's records: the
+    # TensorCore then has no page lookup between a tile's selection and its
+    # gather.
+    tile_records = (
+        records
+        if tile_consume is not None
+        and records is not None
+        and block_select
+        and not publish_rows
+        and block_topk.records_fit(
+            chunk_rows, capacity, topk, select_block, records[0].size
+        )
+        else None
+    )
 
     def write(tile, selected, output, following):
         update = functools.partial(
@@ -755,8 +780,12 @@ def _select_fp8_indexer_jax(
             return jax.tree.map(update, output, selected), following
         output, state = output
         start = tile * chunk_rows
-        rows = selected[0] if publish_rows else selected
-        rows = jnp.where(short, visible[start : start + chunk_rows], rows)
+        if tile_records is not None:
+            selected, physical, counts = selected
+            rows = (physical, counts[:, 0])
+        else:
+            rows = selected[0] if publish_rows else selected
+            rows = jnp.where(short, visible[start : start + chunk_rows], rows)
         state, following = tile_consume(start, rows, state, following)
         return (jax.tree.map(update, output, selected), state), following
 
@@ -820,6 +849,7 @@ def select_fp8_indexer_tiles(
     score_width: int,
     *,
     consume: "SelectionConsumer | None" = None,
+    records: "tuple[jax.Array, jax.Array, int] | None" = None,
 ) -> tuple[jax.Array, ...]:
     """Select exact FP8 scores with a bounded, overlapped prefill working set.
 
@@ -831,6 +861,10 @@ def select_fp8_indexer_tiles(
     so its work overlaps the scoring and selection of later tiles.
     ``following`` is the input of the pipeline's next step (None at the
     end): what the consumer gates it on is issued before that step.
+    With ``records`` (page table [R, C], row requests [T], page size), tiles
+    selected on SparseCore pass ``rows`` as (physical records, valid counts),
+    `csa2.cache.prepare_main_records` of the (short-bypassed) selection;
+    other row ranges pass the selected indices.
     """
     arguments = (
         q,
@@ -892,6 +926,7 @@ def select_fp8_indexer_tiles(
                 w,
                 prefill_chunk_rows=chunk,
                 consume=consume,
+                records=records,
             )
             for w in widths
         ],
