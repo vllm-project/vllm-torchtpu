@@ -78,6 +78,18 @@ class GDNConfig:
     window_size: int = 1
     # Indicate the use of unified pool.
     is_shared: bool = False
+    # Hardware vector/MXU geometry populated by the TPU wrapper.
+    num_lanes: int = 128
+    mxu_column_size: int = 256
+
+    @property
+    def pair_v_heads(self) -> bool:
+        """Whether chunked state matmuls pair sibling V heads along MXU columns."""
+        return (
+            self.v_per_kq_head % 2 == 0
+            and self.v_head_dim % self.num_lanes == 0
+            and 2 * self.v_head_dim <= self.mxu_column_size
+        )
 
     @property
     def conv_hbm_offset(self) -> int:
