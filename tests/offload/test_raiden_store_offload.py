@@ -4173,90 +4173,12 @@ class TestDivergedHybridHitLookup(unittest.TestCase):
     ATTN, MAMBA = 0, 1
 
     def setUp(self):
-        import torch
-        from vllm import SamplingParams
-        from vllm.utils.hashing import sha256
-        from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
-        from vllm.v1.kv_cache_interface import (
-            FullAttentionSpec,
-            KVCacheConfig,
-            KVCacheGroupSpec,
-            MambaSpec,
-        )
-        from vllm.v1.kv_offload.base import OffloadingKVEventsConfig
-        from vllm.v1.request import Request
-
-        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
-
         self.store = FakeKVCacheStore()
         self.manager = make_manager(self.store)
-        attn = FullAttentionSpec(
-            block_size=self.BLOCK, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+        self.scheduler = _make_real_scheduler(
+            self.manager, block_size=self.BLOCK, hybrid=True
         )
-        mamba = MambaSpec(
-            block_size=self.BLOCK,
-            shapes=((2, 8),),
-            dtypes=(torch.bfloat16,),
-            mamba_cache_mode="align",
-        )
-        kv_cache_config = KVCacheConfig(
-            num_blocks=64,
-            kv_cache_tensors=[],
-            kv_cache_groups=[
-                KVCacheGroupSpec(["attn"], attn),
-                KVCacheGroupSpec(["gdn"], mamba),
-            ],
-        )
-        # Only the fields the scheduler reads; the store spec's sizing and
-        # control plane play no part in a lookup.
-        spec = SimpleNamespace(
-            config=SimpleNamespace(
-                groups=[
-                    SimpleNamespace(
-                        group_id=self.ATTN,
-                        tokens_per_block=self.BLOCK,
-                        sliding_window_size_in_chunks=None,
-                    ),
-                    SimpleNamespace(
-                        group_id=self.MAMBA,
-                        tokens_per_block=self.BLOCK,
-                        sliding_window_size_in_chunks=1,
-                    ),
-                ]
-            ),
-            blocks_per_chunk=1,
-            tokens_per_block=[self.BLOCK, self.BLOCK],
-            tokens_per_hash=self.BLOCK,
-            offload_prompt_only=False,
-            extra_config={},
-            kv_events_config=OffloadingKVEventsConfig(
-                enable_kv_cache_events=False, self_describing_kv_events=False
-            ),
-            get_manager=lambda: self.manager,
-        )
-        vllm_config = SimpleNamespace(
-            cache_config=SimpleNamespace(
-                prefix_cache_retention_interval=None, enable_prefix_caching=True
-            ),
-            speculative_config=None,
-            parallel_config=SimpleNamespace(
-                world_size=2, decode_context_parallel_size=1
-            ),
-        )
-        self.scheduler = TPURaidenOffloadingScheduler(
-            spec, vllm_config, kv_cache_config
-        )
-        self._scheduler_args = (spec, vllm_config, kv_cache_config)
-        init_none_hash(sha256)
-        params = SamplingParams(max_tokens=1)
-        params.update_from_generation_config({}, 2)
-        self.request = Request(
-            "req",
-            list(range(self.PROMPT)),
-            params,
-            None,
-            block_hasher=get_request_block_hasher(self.BLOCK, sha256),
-        )
+        self.request = _make_hashed_request("req", self.PROMPT, self.BLOCK)
         self.scheduler.on_new_request(self.request)
 
     def _key(self, group: int, chunk: int):
@@ -4277,7 +4199,9 @@ class TestDivergedHybridHitLookup(unittest.TestCase):
         # synchronous would let the step's forward read blocks still in flight.
         from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
-        spec, vllm_config, kv_cache_config = self._scheduler_args
+        spec, vllm_config, kv_cache_config = _make_scheduler_args(
+            self.manager, block_size=self.BLOCK, hybrid=True
+        )
         spec = SimpleNamespace(
             **{**vars(spec), "extra_config": {"sync_load_budget_bytes": 1}}
         )
@@ -4370,6 +4294,506 @@ class TestDenseDpIndex(unittest.TestCase):
         job_name, _, _, data_replica_idx = kwargs["raiden_id"]
         self.assertEqual(data_replica_idx, 2)
         self.assertEqual(job_name, "vllm-offload-engine-dp2")
+
+
+def _make_scheduler_args(manager, *, block_size: int = 16, hybrid: bool = False):
+    """Arguments of TPURaidenOffloadingScheduler for a full-attention model,
+    with a Mamba group as well if `hybrid`."""
+    import torch
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+    from vllm.v1.kv_offload.base import OffloadingKVEventsConfig
+
+    attn = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+    )
+    groups = [KVCacheGroupSpec(["attn"], attn)]
+    tokens_per_block = [block_size]
+    spec_groups = [
+        SimpleNamespace(
+            group_id=0, tokens_per_block=block_size, sliding_window_size_in_chunks=None
+        )
+    ]
+    if hybrid:
+        mamba = MambaSpec(
+            block_size=block_size,
+            shapes=((2, 8),),
+            dtypes=(torch.bfloat16,),
+            mamba_cache_mode="align",
+        )
+        groups.append(KVCacheGroupSpec(["gdn"], mamba))
+        tokens_per_block.append(block_size)
+        spec_groups.append(
+            SimpleNamespace(
+                group_id=1, tokens_per_block=block_size, sliding_window_size_in_chunks=1
+            )
+        )
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+    )
+    # Only the fields the scheduler reads; the store spec's sizing and
+    # control plane play no part in a lookup.
+    spec = SimpleNamespace(
+        config=SimpleNamespace(groups=spec_groups),
+        blocks_per_chunk=1,
+        tokens_per_block=tokens_per_block,
+        tokens_per_hash=block_size,
+        offload_prompt_only=False,
+        extra_config={},
+        kv_events_config=OffloadingKVEventsConfig(
+            enable_kv_cache_events=False, self_describing_kv_events=False
+        ),
+        get_manager=lambda: manager,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            prefix_cache_retention_interval=None, enable_prefix_caching=True
+        ),
+        speculative_config=None,
+        parallel_config=SimpleNamespace(world_size=2, decode_context_parallel_size=1),
+    )
+    return spec, vllm_config, kv_cache_config
+
+
+def _make_real_scheduler(manager, *, block_size: int = 16, hybrid: bool = False):
+    from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+    return TPURaidenOffloadingScheduler(
+        *_make_scheduler_args(manager, block_size=block_size, hybrid=hybrid)
+    )
+
+
+def _make_hashed_request(
+    req_id: str, prompt_tokens: int, block_size: int = 16, first_token: int = 0
+):
+    from vllm import SamplingParams
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.request import Request
+
+    init_none_hash(sha256)
+    params = SamplingParams(max_tokens=4)
+    params.update_from_generation_config({}, 2)
+    return Request(
+        req_id,
+        list(range(first_token, first_token + prompt_tokens)),
+        params,
+        None,
+        block_hasher=get_request_block_hasher(block_size, sha256),
+    )
+
+
+class TestHitSourcesBySource(unittest.TestCase):
+    """Hit source attribution across HBM, host, P2P, and disk."""
+
+    BLOCK = 16
+
+    def test_mixed_host_p2p_disk_prefix_hit_split(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        store = FakeKVCacheStore()
+        manager = make_global_manager(store)
+        sched = _make_real_scheduler(manager, block_size=self.BLOCK)
+        req = _make_hashed_request("req", 5 * self.BLOCK + 1, self.BLOCK)
+        sched.on_new_request(req)
+
+        k = [make_offload_key(req.block_hashes[i], 0) for i in range(5)]
+        # Chunk 0 is local HBM hit; chunk 1 is HOST; chunk 2 is P2P;
+        # chunks 3 and 4 are SHARED_STORAGE (disk).
+        seed_host_entries(store, k[1])
+        seed_global_entries(store, k[2])
+        seed_storage_entries(store, k[3])
+        seed_storage_entries(store, k[4])
+
+        ext_tokens, _ = sched.get_num_new_matched_tokens(req, self.BLOCK)
+        self.assertEqual(ext_tokens, 4 * self.BLOCK)
+
+        blocks = [KVCacheBlock(bid) for bid in (10, 11, 12, 13, 14)]
+        sched.update_state_after_alloc(req, KVCacheBlocks(blocks=(blocks,)), ext_tokens)
+        self.assertEqual(
+            sched.get_external_cache_hit_sources(req, ext_tokens),
+            {
+                CacheHitSource.HOST: self.BLOCK,
+                CacheHitSource.P2P: self.BLOCK,
+                CacheHitSource.DISK: 2 * self.BLOCK,
+            },
+        )
+
+    def test_concurrent_promotion_to_host_before_prepare_load_updates_source(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        store = FakeKVCacheStore()
+        manager = make_global_manager(store)
+        sched = _make_real_scheduler(manager, block_size=self.BLOCK)
+        req = _make_hashed_request("req", 2 * self.BLOCK + 1, self.BLOCK)
+        sched.on_new_request(req)
+
+        k0 = make_offload_key(req.block_hashes[0], 0)
+        seed_global_entries(store, k0)
+        ext_tokens, _ = sched.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(ext_tokens, self.BLOCK)
+
+        # Before prepare_load runs, a concurrent request lands k0 in host DRAM.
+        seed_host_entries(store, k0)
+        blocks = [KVCacheBlock(10), KVCacheBlock(11)]
+        sched.update_state_after_alloc(req, KVCacheBlocks(blocks=(blocks,)), ext_tokens)
+        self.assertEqual(
+            sched.get_external_cache_hit_sources(req, ext_tokens),
+            {CacheHitSource.HOST: self.BLOCK},
+        )
+
+    def test_hybrid_hit_deduplicates_overlapping_groups(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        store = FakeKVCacheStore()
+        manager = make_manager(store)
+        sched = _make_real_scheduler(manager, block_size=self.BLOCK, hybrid=True)
+
+        req = _make_hashed_request("req", 3 * self.BLOCK + 1, self.BLOCK)
+        sched.on_new_request(req)
+        k_attn0 = make_offload_key(req.block_hashes[0], 0)
+        k_attn1 = make_offload_key(req.block_hashes[1], 0)
+        k_mamba1 = make_offload_key(req.block_hashes[1], 1)
+        for key in (k_attn0, k_attn1, k_mamba1):
+            seed_storage_entries(store, key)
+
+        ext_tokens, _ = sched.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(ext_tokens, 2 * self.BLOCK)
+
+        attn_blocks = [KVCacheBlock(10), KVCacheBlock(11)]
+        mamba_null = KVCacheBlock(0)
+        mamba_null.is_null = True
+        mamba_blocks = [mamba_null, KVCacheBlock(21)]
+        sched.update_state_after_alloc(
+            req, KVCacheBlocks(blocks=(attn_blocks, mamba_blocks)), ext_tokens
+        )
+        # Hybrid Attention + Mamba over [0, 32) counts 32 tokens, not 48.
+        self.assertEqual(
+            sched.get_external_cache_hit_sources(req, ext_tokens),
+            {CacheHitSource.DISK: 2 * self.BLOCK},
+        )
+
+    def test_hybrid_hit_with_mixed_recurrent_state_counts_in_its_slowest_tier(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        store = FakeKVCacheStore()
+        manager = make_manager(store)
+        sched = _make_real_scheduler(manager, block_size=self.BLOCK, hybrid=True)
+        req = _make_hashed_request("req", 3 * self.BLOCK + 1, self.BLOCK)
+        sched.on_new_request(req)
+
+        # Attention chunks 0 and 1 are in host DRAM. The recurrent state at the
+        # end of chunk 1 has three sub-blocks in host DRAM and one on disk.
+        for chunk in (0, 1):
+            seed_host_entries(store, make_offload_key(req.block_hashes[chunk], 0))
+        *in_host, on_disk = sub_hashes(make_offload_key(req.block_hashes[1], 1))
+        for sub_hash in in_host:
+            store.entries[sub_hash] = _Entry(status=FakeBlockStatus.HOST)
+        store.storage_entries.add(on_disk)
+
+        ext_tokens, _ = sched.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(ext_tokens, 2 * self.BLOCK)
+        mamba_null = KVCacheBlock(0)
+        mamba_null.is_null = True
+        sched.update_state_after_alloc(
+            req,
+            KVCacheBlocks(
+                blocks=(
+                    [KVCacheBlock(10), KVCacheBlock(11)],
+                    [mamba_null, KVCacheBlock(21)],
+                )
+            ),
+            ext_tokens,
+        )
+        # Restoring the state needs its disk sub-block, so the whole hit counts
+        # as disk.
+        self.assertEqual(
+            sched.get_external_cache_hit_sources(req, ext_tokens),
+            {CacheHitSource.DISK: 2 * self.BLOCK},
+        )
+
+    def test_unpinned_load_reports_unspecified(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        store = FakeKVCacheStore()
+        manager = make_manager(store)
+        sched = _make_real_scheduler(manager, block_size=self.BLOCK)
+        req = _make_hashed_request("req", 2 * self.BLOCK + 1, self.BLOCK)
+        sched.on_new_request(req)
+        seed_host_entries(store, make_offload_key(req.block_hashes[0], 0))
+        ext_tokens, _ = sched.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(ext_tokens, self.BLOCK)
+
+        # The host pool evicts the key before prepare_load pins it.
+        store.entries.clear()
+        sched.update_state_after_alloc(
+            req,
+            KVCacheBlocks(blocks=([KVCacheBlock(10), KVCacheBlock(11)],)),
+            ext_tokens,
+        )
+        self.assertEqual(
+            sched.get_external_cache_hit_sources(req, ext_tokens),
+            {CacheHitSource.EXTERNAL_UNSPECIFIED: self.BLOCK},
+        )
+
+    def test_request_without_offload_hit_returns_empty_sources(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+        store = FakeKVCacheStore()
+        manager = make_manager(store)
+        sched = _make_real_scheduler(manager, block_size=self.BLOCK)
+        req = _make_hashed_request("req", 2 * self.BLOCK + 1, self.BLOCK)
+        sched.on_new_request(req)
+        ext_tokens, _ = sched.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(ext_tokens, 0)
+
+        sched.update_state_after_alloc(
+            req, KVCacheBlocks(blocks=([KVCacheBlock(10), KVCacheBlock(11)],)), 0
+        )
+        self.assertEqual(sched.get_external_cache_hit_sources(req, 0), {})
+
+    def test_two_requests_in_one_step_keep_their_own_sources(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        store = FakeKVCacheStore()
+        manager = make_manager(store)
+        sched = _make_real_scheduler(manager, block_size=self.BLOCK)
+        num_tokens = 2 * self.BLOCK + 1
+        host_req = _make_hashed_request("host_req", num_tokens, self.BLOCK)
+        disk_req = _make_hashed_request(
+            "disk_req", num_tokens, self.BLOCK, first_token=1000
+        )
+        seed_host_entries(store, make_offload_key(host_req.block_hashes[0], 0))
+        seed_storage_entries(store, make_offload_key(disk_req.block_hashes[0], 0))
+
+        # Both requests are admitted before the step's build_connector_meta.
+        for req, block_ids in ((host_req, (10, 11)), (disk_req, (12, 13))):
+            sched.on_new_request(req)
+            ext_tokens, _ = sched.get_num_new_matched_tokens(req, 0)
+            self.assertEqual(ext_tokens, self.BLOCK)
+            blocks = [KVCacheBlock(block_id) for block_id in block_ids]
+            sched.update_state_after_alloc(
+                req, KVCacheBlocks(blocks=(blocks,)), ext_tokens
+            )
+        self.assertEqual(
+            sched.get_external_cache_hit_sources(host_req, self.BLOCK),
+            {CacheHitSource.HOST: self.BLOCK},
+        )
+        self.assertEqual(
+            sched.get_external_cache_hit_sources(disk_req, self.BLOCK),
+            {CacheHitSource.DISK: self.BLOCK},
+        )
+
+    def test_mixed_sub_block_sources_within_single_key_preserve_host_tokens(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        store = FakeKVCacheStore()
+        manager = make_global_manager(store)
+        sched = _make_real_scheduler(manager, block_size=self.BLOCK)
+        req = _make_hashed_request("mixed_sub_req", 2 * self.BLOCK + 1, self.BLOCK)
+        sched.on_new_request(req)
+
+        # Single 16-token OffloadKey with factor=4 (4 tokens per sub-block):
+        # s0, s1 (8 tokens) in HOST; s2 (4 tokens) in REMOTE (P2P);
+        # s3 (4 tokens) in SHARED_STORAGE (DISK).
+        k0 = make_offload_key(req.block_hashes[0], 0)
+        s0, s1, s2, s3 = sub_hashes(k0)
+        store.entries[s0] = _Entry(status=FakeBlockStatus.HOST)
+        store.entries[s1] = _Entry(status=FakeBlockStatus.HOST)
+        store.global_entries[s2] = FakeRaidenBlockId(
+            raiden_id=object(), host_block_id=102, status=FakeBlockStatus.REMOTE
+        )
+        store.storage_entries.add(s3)
+
+        ext_tokens, _ = sched.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(ext_tokens, self.BLOCK)
+
+        sched.update_state_after_alloc(
+            req,
+            KVCacheBlocks(blocks=([KVCacheBlock(10), KVCacheBlock(11)],)),
+            ext_tokens,
+        )
+        self.assertEqual(sched.get_external_cache_hit_sources(req, 0), {})
+        self.assertEqual(
+            sched.get_external_cache_hit_sources(req, ext_tokens),
+            {
+                CacheHitSource.HOST: 8,
+                CacheHitSource.P2P: 4,
+                CacheHitSource.DISK: 4,
+            },
+        )
+
+    def test_split_uses_group_ids_when_a_group_is_not_offloaded(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        store = FakeKVCacheStore()
+        manager = make_manager(store)
+        spec, vllm_config, kv_cache_config = _make_scheduler_args(
+            manager, block_size=self.BLOCK
+        )
+        # vLLM offloads only the prefix-cacheable groups. With a group that is
+        # not offloaded in front, the offloaded group has id 1 and is first in
+        # the scheduler's group configs.
+        groups = kv_cache_config.kv_cache_groups
+        groups.insert(0, groups[0])
+        spec.config.groups[0].group_id = 1
+        sched = TPURaidenOffloadingScheduler(spec, vllm_config, kv_cache_config)
+        req = _make_hashed_request("req", 2 * self.BLOCK + 1, self.BLOCK)
+        sched.on_new_request(req)
+
+        # Chunk 0 has three sub-blocks in host DRAM and one on disk.
+        *in_host, on_disk = sub_hashes(make_offload_key(req.block_hashes[0], 1))
+        for sub_hash in in_host:
+            store.entries[sub_hash] = _Entry(status=FakeBlockStatus.HOST)
+        store.storage_entries.add(on_disk)
+
+        ext_tokens, _ = sched.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(ext_tokens, self.BLOCK)
+        blocks = (
+            [KVCacheBlock(20), KVCacheBlock(21)],
+            [KVCacheBlock(10), KVCacheBlock(11)],
+        )
+        sched.update_state_after_alloc(req, KVCacheBlocks(blocks=blocks), ext_tokens)
+        self.assertEqual(
+            sched.get_external_cache_hit_sources(req, ext_tokens),
+            {CacheHitSource.HOST: 12, CacheHitSource.DISK: 4},
+        )
+
+    def test_connectors_forward_the_hit_split_hooks_to_the_scheduler(self):
+        """vLLM's scheduler calls the hooks on the connector it holds."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorBase_V1,
+        )
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import (
+            TPUMultiConnector,
+        )
+        from vllm_torchtpu.offload.raiden_connector import (
+            TPURaidenOffloadingConnector,
+            TPURaidenOffloadingScheduler,
+        )
+
+        for through_multi_connector in (False, True):
+            with self.subTest(through_multi_connector=through_multi_connector):
+                store = FakeKVCacheStore()
+                manager = make_manager(store)
+                spec, vllm_config, kv_cache_config = _make_scheduler_args(
+                    manager, block_size=self.BLOCK
+                )
+                # __init__ would create the Raiden store, so set only the two
+                # attributes that the hooks read.
+                offload = object.__new__(TPURaidenOffloadingConnector)
+                offload._kv_cache_config = kv_cache_config
+                offload.connector_scheduler = TPURaidenOffloadingScheduler(
+                    spec, vllm_config, kv_cache_config
+                )
+                connector = offload
+                if through_multi_connector:
+                    # The first child has no hit, so the offload child is chosen.
+                    no_hit = MagicMock(spec=KVConnectorBase_V1)
+                    no_hit.get_num_new_matched_tokens.return_value = (0, False)
+                    connector = object.__new__(TPUMultiConnector)
+                    connector._connectors = [no_hit, offload]
+                    connector._requests_to_connector = {}
+
+                req = _make_hashed_request("req", 2 * self.BLOCK + 1, self.BLOCK)
+                connector.on_new_request(req)
+                host_key, disk_key = (
+                    make_offload_key(block_hash, 0) for block_hash in req.block_hashes
+                )
+                seed_host_entries(store, host_key)
+                seed_storage_entries(store, disk_key)
+                ext_tokens, _ = connector.get_num_new_matched_tokens(req, 0)
+                self.assertEqual(ext_tokens, 2 * self.BLOCK)
+
+                blocks = [KVCacheBlock(block_id) for block_id in (10, 11, 12)]
+                connector.update_state_after_alloc(
+                    req, KVCacheBlocks(blocks=(blocks,)), ext_tokens
+                )
+                self.assertEqual(
+                    connector.get_external_cache_hit_sources(req, ext_tokens),
+                    {CacheHitSource.HOST: self.BLOCK, CacheHitSource.DISK: self.BLOCK},
+                )
+
+
+class TestPrepareLoadKeySources(unittest.TestCase):
+    """prepare_load returns the tier of each sub-block of each key it accepts."""
+
+    def test_load_from_the_host_pool_is_all_host(self):
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        store = FakeKVCacheStore()
+        manager = make_manager(store)
+        keys = [_key(0), _key(1)]
+        for key in keys:
+            seed_host_entries(store, key)
+
+        spec = manager.prepare_load(keys, _ctx())
+
+        all_host = ((CacheHitSource.HOST, 4),)
+        self.assertEqual(spec.key_sources, {_key(0): all_host, _key(1): all_host})
+
+    def test_key_sources_name_the_tier_of_each_sub_block(self):
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        store = FakeKVCacheStore()
+        manager = make_global_manager(store)
+        in_host, on_peer, on_disk, mixed = (_key(n) for n in range(4))
+        seed_host_entries(store, in_host)
+        seed_global_entries(store, on_peer)
+        seed_storage_entries(store, on_disk)
+        s0, s1, s2, s3 = sub_hashes(mixed)
+        store.entries[s0] = _Entry(status=FakeBlockStatus.HOST)
+        store.entries[s1] = _Entry(status=FakeBlockStatus.HOST)
+        store.global_entries[s2] = FakeRaidenBlockId(
+            raiden_id=object(), host_block_id=102, status=FakeBlockStatus.REMOTE
+        )
+        store.storage_entries.add(s3)
+        keys = [in_host, on_peer, on_disk, mixed]
+        for key in keys:
+            self.assertEqual(manager.lookup(key, _ctx()), LookupResult.HIT)
+
+        spec = manager.prepare_load(keys, _ctx())
+
+        host, p2p, disk = CacheHitSource.HOST, CacheHitSource.P2P, CacheHitSource.DISK
+        self.assertEqual(
+            spec.key_sources,
+            {
+                in_host: ((host, 4),),
+                on_peer: ((p2p, 4),),
+                on_disk: ((disk, 4),),
+                mixed: ((host, 2), (p2p, 1), (disk, 1)),
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -304,7 +304,7 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
 
     import numpy as np
     from jax.sharding import Mesh
-    from torch_tpu._internal.pallas import get_pallas_mesh
+    from torch.tpu.pallas import get_pallas_mesh
 
     if stages > 1:
         # The EP group is one pipeline stage.

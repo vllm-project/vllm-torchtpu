@@ -710,6 +710,9 @@ def test_scale_slab_lookup_and_scatter_are_bit_exact(
     body and fail here.
     """
     monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
+    # At prefill sizes the run copy builds both tables instead; it is held off
+    # so the lookup and the scatter are what is compared.
+    monkeypatch.setattr(layer, "slab_run_copy_pays", lambda *_a, **_k: False)
     mesh = _mesh()
     if shared_weights is not None:
         w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
@@ -780,12 +783,14 @@ def test_token_gather_sort_and_scatter_are_bit_exact(
     """The token-gather table built by sort gives the layer the scatter's output.
 
     The scatter form is forced by declaring the sort keys too wide for int32;
-    the TensorCore builds are forced on, as in the lookup test. The two forced
-    builds must lower to different programs, so the agreement is not vacuous:
-    were the choice ever dropped from the layer's shard_map cache key, the
-    second build would reuse the first one's body and fail here.
+    the TensorCore builds are forced on, as in the lookup test, and the run
+    copy is held off, so the sort and the scatter are what is compared. The
+    two forced builds must lower to different programs, so the agreement is not
+    vacuous: were the choice ever dropped from the layer's shard_map cache key,
+    the second build would reuse the first one's body and fail here.
     """
     monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
+    monkeypatch.setattr(layer, "slab_run_copy_pays", lambda *_a, **_k: False)
     mesh = _mesh()
     if shared_weights is not None:
         w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
@@ -833,6 +838,87 @@ def test_token_gather_sort_and_scatter_are_bit_exact(
         programs[fits] = jax.jit(run).lower(*args).as_text()
         outs[fits] = np.asarray(run(*args))
     assert programs[True] != programs[False]
+    np.testing.assert_array_equal(outs[True], outs[False])
+
+
+@pytest.mark.parametrize(
+    "shape,shared_weights",
+    [
+        pytest.param(dict(SMALL), None, id="small"),
+        # The production weights are 6.4GB, so these shapes run against the
+        # module's one build of them rather than making their own.
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[0]), "production_weights", id="prod_t2048"
+        ),
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[1]), "production_weights", id="prod_t16384"
+        ),
+    ],
+)
+def test_slab_run_copy_and_sort_lookup_are_bit_exact(
+    request, monkeypatch, shape, shared_weights
+):
+    """Both slab tables by run copy give the layer the sort + lookup's output.
+
+    The run copy changes the routing payload (expert-sorted token numbers and a
+    scale per pair) and builds both tables from it; the tables differ from the
+    lookup's only on the ROWBLK padding rows, which the kernel never commits.
+    The TensorCore builds are forced on and the run copy's gate is forced each
+    way so each shape runs both forms; the lowered programs are checked to
+    really differ, so the agreement is not vacuous.
+    """
+    monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
+    mesh = _mesh()
+    if shared_weights is not None:
+        w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
+    else:
+        w1, w2, w1_scale, w2_scale = _make_weights(
+            mesh,
+            70,
+            hidden=shape["hidden"],
+            inter=shape["inter"],
+            e_total=shape["e_total"],
+            weight_format=WeightFormat.FP8,
+        )
+    x, gating = _make_inputs(
+        mesh,
+        71,
+        tokens=shape["tokens"],
+        hidden=shape["hidden"],
+        e_total=shape["e_total"],
+    )
+
+    def make_run():
+        # A fresh function per build: jax.jit caches the trace by function, and
+        # the threshold is read while tracing, so reusing one `run` would lower
+        # the first build's program again.
+        def run(*args):
+            return fused_ep_moe_v2(
+                *args,
+                topk=shape["topk"],
+                renormalize=True,
+                mesh=mesh,
+                capacity=CAPACITY,
+                weight_format=WeightFormat.FP8,
+                sharded_plan=True,
+            )
+
+        return run
+
+    args = (x, w1, w2, w1_scale, w2_scale, gating)
+    outs, has_copy = {}, {}
+    for on in (False, True):
+        monkeypatch.setattr(layer, "slab_run_copy_pays", lambda *_a, on=on, **_k: on)
+        layer._LAYER_SM_CACHE.clear()
+        jax.clear_caches()
+        run = make_run()
+        has_copy[on] = (
+            "fused_ep_moe_v2_slab_runs" in jax.jit(run).lower(*args).as_text()
+        )
+        outs[on] = np.asarray(run(*args))
+    layer._LAYER_SM_CACHE.clear()
+    jax.clear_caches()
+    assert has_copy == {False: False, True: True}, has_copy
     np.testing.assert_array_equal(outs[True], outs[False])
 
 

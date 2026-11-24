@@ -201,10 +201,10 @@ def test_toy_plugin_serves_on_cpu_with_torch_tpu_installed(
     def get_pallas_mesh(**_kwargs: Any) -> Any:
         raise AssertionError("torch_tpu's get_pallas_mesh called off TPU")
 
-    for name in ("torch_tpu", "torch_tpu._internal", "torch_tpu._internal.pallas"):
+    for name in ("torch.tpu", "torch.tpu.pallas"):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     monkeypatch.setattr(
-        sys.modules["torch_tpu._internal.pallas"],
+        sys.modules["torch.tpu.pallas"],
         "get_pallas_mesh",
         get_pallas_mesh,
         raising=False,
