@@ -435,12 +435,169 @@ class TestBootstrapUnits(unittest.TestCase):
                 "other",
                 (2, None),
             ),
+            (
+                {
+                    "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-vllm",
+                    "BUILDKITE_BRANCH": "main",
+                    "BUILDKITE_SOURCE": "schedule",
+                },
+                "other",
+                (2, None),
+            ),
+            (
+                {
+                    "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-vllm",
+                    "BUILDKITE_BRANCH": "main",
+                    "BUILDKITE_SOURCE": "ui",
+                },
+                "other",
+                (2, None),
+            ),
+            (
+                {
+                    "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-vllm",
+                    "BUILDKITE_BRANCH": "main",
+                    "BUILDKITE_SOURCE": "api",
+                },
+                "other",
+                (2, None),
+            ),
+            (
+                {
+                    "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-ci",
+                    "CI_SUITE": "vllm-canary",
+                    "BUILDKITE_BRANCH": "main",
+                    "BUILDKITE_SOURCE": "ui",
+                },
+                "other",
+                (2, None),
+            ),
+            (
+                {
+                    "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-torchtpu",
+                    "BUILDKITE_BRANCH": "main",
+                    "BUILDKITE_SOURCE": "schedule",
+                },
+                "nightly",
+                (1, None),
+            ),
+            (
+                {
+                    "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-tpu-sync",
+                    "BUILDKITE_BRANCH": "main",
+                    "BUILDKITE_SOURCE": "api",
+                },
+                "nightly",
+                (1, None),
+            ),
+            (
+                {
+                    "TORCH_TPU_VERSION_OVERRIDE": "0.2.0.dev1",
+                    "BUILDKITE_BRANCH": "main",
+                    "BUILDKITE_SOURCE": "ui",
+                },
+                "nightly",
+                (1, None),
+            ),
+            (
+                {
+                    "TPU_SYNC_TORCH_VERSION_OVERRIDE": "0.0.1.dev1",
+                    "BUILDKITE_BRANCH": "main",
+                    "BUILDKITE_SOURCE": "ui",
+                },
+                "nightly",
+                (1, None),
+            ),
         ):
             with self.subTest(env=env):
                 build_ctx = ctx(env)
                 kind = bp.build_kind(build_ctx)
                 self.assertEqual(kind, expected_kind)
                 self.assertEqual(bp.PRIORITIES[kind], expected_prio)
+
+        # Canary leg resolution, normalization, precedence, and override validation.
+        for leg_env, expected_leg in (
+            ({}, None),
+            ({"TORCHTPU_NIGHTLY": "1"}, "torch-tpu"),
+            ({"TORCHTPU_NIGHTLY_LEG": "torch-tpu"}, "torch-tpu"),
+            ({"TORCHTPU_NIGHTLY_LEG": "torch_tpu"}, "torch-tpu"),
+            ({"TORCHTPU_NIGHTLY_LEG": "tpu-sync"}, "tpu-sync"),
+            ({"TORCHTPU_NIGHTLY_LEG": "tpu_sync"}, "tpu-sync"),
+            ({"TORCHTPU_NIGHTLY_LEG": "tpu-sync-torch"}, "tpu-sync"),
+            ({"TORCH_TPU_VERSION_OVERRIDE": "0.2.0.dev1"}, "torch-tpu"),
+            ({"TPU_SYNC_TORCH_VERSION_OVERRIDE": "0.0.1.dev1"}, "tpu-sync"),
+            (
+                {
+                    "TORCHTPU_NIGHTLY": "1",
+                    "TPU_SYNC_TORCH_VERSION_OVERRIDE": "0.0.1.dev1",
+                },
+                "tpu-sync",
+            ),
+            (
+                {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-torchtpu"},
+                "torch-tpu",
+            ),
+            (
+                {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-tpu-sync"},
+                "tpu-sync",
+            ),
+            (
+                {
+                    "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-tpu-sync",
+                    "TORCHTPU_NIGHTLY_LEG": "torch_tpu",
+                    "TORCH_TPU_VERSION_OVERRIDE": "0.2.0.dev9",
+                },
+                "torch-tpu",
+            ),
+        ):
+            with self.subTest(leg_env=leg_env):
+                c = ctx(leg_env)
+                self.assertEqual(c.canary_leg, expected_leg)
+                self.assertEqual(c.is_torchtpu_canary, expected_leg is not None)
+
+        for bad_leg_env, err_regex in (
+            (
+                {"TORCHTPU_NIGHTLY_LEG": "bogus"},
+                r"ERROR: unsupported TORCHTPU_NIGHTLY_LEG 'bogus'; "
+                r"expected torch-tpu or tpu-sync",
+            ),
+            (
+                {
+                    "TORCH_TPU_VERSION_OVERRIDE": "0.2.0.dev1",
+                    "TPU_SYNC_TORCH_VERSION_OVERRIDE": "0.0.1.dev1",
+                },
+                r"set only one version override per build",
+            ),
+            (
+                {
+                    "TORCHTPU_NIGHTLY_LEG": "torch-tpu",
+                    "TORCH_TPU_VERSION_OVERRIDE": "0.2.0.dev1",
+                    "TPU_SYNC_TORCH_VERSION_OVERRIDE": "0.0.1.dev1",
+                },
+                r"set only one version override per build",
+            ),
+            (
+                {
+                    "TORCHTPU_NIGHTLY_LEG": "tpu-sync",
+                    "TORCH_TPU_VERSION_OVERRIDE": "0.2.0.dev1",
+                },
+                r"TORCH_TPU_VERSION_OVERRIDE is set, "
+                r"but selected canary leg is 'tpu-sync'",
+            ),
+            (
+                {
+                    "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-torchtpu",
+                    "TPU_SYNC_TORCH_VERSION_OVERRIDE": "0.0.1.dev1",
+                },
+                r"TPU_SYNC_TORCH_VERSION_OVERRIDE is set, "
+                r"but selected canary leg is 'torch-tpu'",
+            ),
+        ):
+            with (
+                self.subTest(bad_leg_env=bad_leg_env),
+                self.assertRaisesRegex(bp.BootstrapError, err_regex),
+            ):
+                ctx(bad_leg_env)
 
         # SKIP_TPU_CI="" and "0" are treated as unset; non-zero fails clearly.
         for unset_val in ("", "0"):
@@ -454,7 +611,7 @@ class TestBootstrapUnits(unittest.TestCase):
         with self.assertRaisesRegex(
             bp.BootstrapError,
             r"ERROR: CI_LANES was removed; set CI_SUITE=<name> "
-            r"\(suites: default full perf integration\)",
+            r"\(suites: default full perf vllm-canary\)",
         ):
             ctx({"CI_LANES": "perf"})
         for shape_var in ("KUBE_SHAPE_SINGLE", "KUBE_SHAPE_MULTI"):
@@ -781,14 +938,14 @@ class TestBootstrapUnits(unittest.TestCase):
                     )
                 )
 
-        # 3. CI_SUITE override beats integration, skip-tpu-ci, release, and PR labels;
-        # unknown CI_SUITE (including removed cpu-only) raises.
+        # 3. CI_SUITE override beats vllm-canary, skip-tpu-ci, release, and PR labels;
+        # legacy CI_SUITE=integration aliases vllm-canary; unknown CI_SUITE raises.
         self.assertEqual(
             bp.choose_suite(
                 ctx(
                     {
                         "CI_SUITE": "perf",
-                        "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration",
+                        "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-vllm",
                         "BUILDKITE_PULL_REQUEST": "10",
                         "BUILDKITE_PULL_REQUEST_LABELS": "skip-tpu-ci",
                     }
@@ -796,11 +953,15 @@ class TestBootstrapUnits(unittest.TestCase):
             ),
             bp.SUITES["perf"],
         )
+        self.assertEqual(
+            bp.choose_suite(ctx({"CI_SUITE": "integration"})),
+            bp.SUITES["vllm-canary"],
+        )
         for bad_suite in ("bogus", "cpu-only"):
             with self.assertRaisesRegex(
                 bp.BootstrapError,
                 rf"ERROR: unknown CI_SUITE '{bad_suite}'; "
-                r"suites are: default full perf integration",
+                r"suites are: default full perf vllm-canary",
             ):
                 bp.choose_suite(ctx({"CI_SUITE": bad_suite}))
 
@@ -891,14 +1052,24 @@ class TestBootstrapUnits(unittest.TestCase):
                     expected_name,
                 )
 
-        self.assertEqual(
-            bp.choose_suite(
-                ctx({"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"})
+        for slug_env, expected_suite in (
+            ({"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-vllm"}, "vllm-canary"),
+            ({"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"}, "vllm-canary"),
+            (
+                {
+                    "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-torchtpu",
+                    "NIGHTLY": "1",
+                },
+                "default",
             ),
-            bp.SUITES["integration"],
-        )
+            ({"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-tpu-sync"}, "default"),
+        ):
+            self.assertEqual(
+                bp.choose_suite(ctx(slug_env)),
+                bp.SUITES[expected_suite],
+            )
         self.assertEqual(
-            bp.SUITES["integration"].stages,
+            bp.SUITES["vllm-canary"].stages,
             ((*bp.SUITES["full"].stages[0], "promote"),),
         )
         pm_skip = replace(
@@ -933,7 +1104,7 @@ class TestBootstrapUnits(unittest.TestCase):
         # 5. Every suite in SUITES maps to existing .buildkite/pipeline_<lane>.yml.
         self.assertEqual(
             set(bp.SUITES),
-            {"default", "full", "perf", "integration"},
+            {"default", "full", "perf", "vllm-canary"},
         )
         for suite in bp.SUITES.values():
             self.assertTrue(suite.about)
@@ -1236,8 +1407,72 @@ class TestBootstrapUnits(unittest.TestCase):
                 missing.stdout,
             )
 
+            # 5b. `bootstrap_dev.sh` resolves, normalizes, and validates canary legs.
+            log_path.unlink(missing_ok=True)
+            for dev_leg_env, expected_dev_leg in (
+                ({}, None),
+                ({"TORCHTPU_NIGHTLY_LEG": "tpu_sync"}, "tpu-sync"),
+                ({"TORCH_TPU_VERSION_OVERRIDE": "0.2.0.dev3"}, "torch-tpu"),
+            ):
+                if log_path.exists():
+                    log_path.unlink()
+                dev_ok = subprocess.run(
+                    ["bash", str(_SCRIPTS_DIR / "bootstrap_dev.sh")],
+                    cwd=_REPO_ROOT,
+                    env={**env, **dev_leg_env},
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                dev_events = [
+                    json.loads(line)
+                    for line in log_path.read_text(encoding="utf-8").splitlines()
+                ]
+                if expected_dev_leg is None:
+                    self.assertNotIn("Using canary leg:", dev_ok.stdout)
+                    self.assertFalse(
+                        any(
+                            e.get("meta", [None])[0] == "TORCHTPU_NIGHTLY_LEG"
+                            for e in dev_events
+                        )
+                    )
+                else:
+                    self.assertIn(
+                        f"Using canary leg: {expected_dev_leg}", dev_ok.stdout
+                    )
+                    self.assertIn(
+                        {"meta": ["TORCHTPU_NIGHTLY_LEG", expected_dev_leg]},
+                        dev_events,
+                    )
+
+            for bad_dev_env, expected_dev_err in (
+                (
+                    {"TORCHTPU_NIGHTLY_LEG": "bogus"},
+                    "unsupported TORCHTPU_NIGHTLY_LEG 'bogus'",
+                ),
+                (
+                    {
+                        "TORCH_TPU_VERSION_OVERRIDE": "0.2.0.dev1",
+                        "TPU_SYNC_TORCH_VERSION_OVERRIDE": "0.0.1.dev1",
+                    },
+                    "set only one version override per build",
+                ),
+            ):
+                log_path.unlink(missing_ok=True)
+                bad_dev = subprocess.run(
+                    ["bash", str(_SCRIPTS_DIR / "bootstrap_dev.sh")],
+                    cwd=_REPO_ROOT,
+                    env={**env, **bad_dev_env},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(bad_dev.returncode, 1)
+                self.assertIn(expected_dev_err, bad_dev.stderr)
+                self.assertFalse(log_path.exists())
+
             # 6. `bootstrap.py upload-stages <stage> [<stage> ...]` CLI uploads a stage.
-            log_path.unlink()
+            log_path.unlink(missing_ok=True)
             upload_cli = subprocess.run(
                 [
                     sys.executable,
@@ -1586,7 +1821,28 @@ class TestBootstrapUnits(unittest.TestCase):
             for _, content, _ in fx.uploads:
                 self.assertNotIn('build.env("NIGHTLY")', content)
 
-        # torchtpu-nightly schedule runs default suite at priority 1 (one stage).
+        # Wheel canaries publish normalized TORCHTPU_NIGHTLY_LEG ('torch-tpu' or
+        # 'tpu-sync') across slug profiles, legacy TORCHTPU_NIGHTLY=1, explicit
+        # TORCHTPU_NIGHTLY_LEG spellings, and standalone version overrides.
+        canary_torchtpu = self._run_bootstrap(
+            {
+                "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-torchtpu",
+                "NIGHTLY": "1",
+                "BUILDKITE_SOURCE": "schedule",
+                "BUILDKITE_BRANCH": "main",
+            }
+        )
+        self.assertIn(("TORCHTPU_NIGHTLY_LEG", "torch-tpu"), canary_torchtpu.meta)
+        self.assertTrue(
+            canary_torchtpu.annotations[0][2].startswith(
+                "CI suite: default [NIGHTLY=1]: "
+            )
+        )
+        self.assertEqual(
+            [u[0] for u in canary_torchtpu.uploads],
+            ["verify", "integration", *_TESTS, "cpu", "build"],
+        )
+
         torchtpu_nightly = self._run_bootstrap(
             {
                 "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-torchtpu-nightly",
@@ -1599,23 +1855,115 @@ class TestBootstrapUnits(unittest.TestCase):
             torchtpu_nightly.meta[:2],
             [("JOB_PRIORITY", "1"), ("VLLM_COMMIT_HASH", self.pinned)],
         )
+        self.assertIn(("TORCHTPU_NIGHTLY_LEG", "torch-tpu"), torchtpu_nightly.meta)
         self.assertEqual(
             [u[0] for u in torchtpu_nightly.uploads],
             ["verify", "integration", *_TESTS, "cpu", "build"],
         )
 
-        # Integration pipeline resolves upstream vLLM HEAD and uploads promote lane.
-        integ = self._run_bootstrap(
+        # Standalone version overrides and non-canonical TORCHTPU_NIGHTLY_LEG
+        # spellings normalize and do not skip on a docs-only HEAD commit.
+        for canary_env, expected_leg in (
+            (
+                {
+                    "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-tpu-sync",
+                    "BUILDKITE_SOURCE": "api",
+                    "BUILDKITE_BRANCH": "main",
+                },
+                "tpu-sync",
+            ),
+            (
+                {
+                    "TORCHTPU_NIGHTLY_LEG": "tpu-sync-torch",
+                    "BUILDKITE_SOURCE": "ui",
+                    "BUILDKITE_BRANCH": "main",
+                },
+                "tpu-sync",
+            ),
+            (
+                {
+                    "TORCH_TPU_VERSION_OVERRIDE": "0.2.0.dev5",
+                    "BUILDKITE_SOURCE": "ui",
+                    "BUILDKITE_BRANCH": "main",
+                },
+                "torch-tpu",
+            ),
+            (
+                {
+                    "TPU_SYNC_TORCH_VERSION_OVERRIDE": "0.0.1.dev5",
+                    "BUILDKITE_SOURCE": "ui",
+                    "BUILDKITE_BRANCH": "main",
+                },
+                "tpu-sync",
+            ),
+        ):
+            with self.subTest(canary_env=canary_env):
+                rec_leg = self._run_bootstrap(canary_env, files=[".github/CODEOWNERS"])
+                self.assertEqual(rec_leg.meta[0], ("JOB_PRIORITY", "1"))
+                self.assertIn(("TORCHTPU_NIGHTLY_LEG", expected_leg), rec_leg.meta)
+                self.assertEqual(
+                    [u[0] for u in rec_leg.uploads],
+                    ["verify", "integration", *_TESTS, "cpu", "build"],
+                )
+
+        # vLLM HEAD canary (canonical slug, legacy slug, and CI_SUITE=vllm-canary
+        # / integration across schedule, UI, and API on main) runs at priority 2
+        # (unclassed), resolves upstream vLLM HEAD, never skips on a docs-only
+        # main commit, and uploads the promote lane.
+        for vllm_env in (
+            {
+                "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-vllm",
+                "BUILDKITE_BRANCH": "main",
+                "BUILDKITE_SOURCE": "schedule",
+            },
+            {
+                "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-vllm",
+                "BUILDKITE_BRANCH": "main",
+                "BUILDKITE_SOURCE": "ui",
+            },
+            {
+                "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-vllm",
+                "BUILDKITE_BRANCH": "main",
+                "BUILDKITE_SOURCE": "api",
+            },
             {
                 "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration",
-                "BUILDKITE_SOURCE": "schedule",
-            }
-        )
-        self.assertIn(("VLLM_COMMIT_HASH", "upstream999"), integ.meta)
-        self.assertEqual(
-            [u[0] for u in integ.uploads],
-            ["promote", "verify", "perf", "integration", *_TESTS, "cpu", "build"],
-        )
+                "BUILDKITE_BRANCH": "main",
+                "BUILDKITE_SOURCE": "ui",
+            },
+            {
+                "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-ci",
+                "CI_SUITE": "vllm-canary",
+                "BUILDKITE_BRANCH": "main",
+                "BUILDKITE_SOURCE": "ui",
+            },
+            {
+                "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-ci",
+                "CI_SUITE": "integration",
+                "BUILDKITE_BRANCH": "main",
+                "BUILDKITE_SOURCE": "api",
+            },
+        ):
+            with self.subTest(vllm_env=vllm_env):
+                vllm_canary = self._run_bootstrap(vllm_env, files=["README.md"])
+                self.assertEqual(vllm_canary.meta[0], ("JOB_PRIORITY", "2"))
+                self.assertNotIn("WORKLOAD_PRIORITY", {k for k, _ in vllm_canary.meta})
+                self.assertIn(("VLLM_COMMIT_HASH", "upstream999"), vllm_canary.meta)
+                self.assertTrue(
+                    vllm_canary.annotations[0][2].startswith("CI suite: vllm-canary: ")
+                )
+                self.assertEqual(
+                    [u[0] for u in vllm_canary.uploads],
+                    [
+                        "promote",
+                        "verify",
+                        "perf",
+                        "integration",
+                        *_TESTS,
+                        "cpu",
+                        "build",
+                    ],
+                )
 
         # [skip ci] and docs-only PRs exit 0 before uploading any pipeline steps.
         self.assertEqual(
@@ -2086,13 +2434,13 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         perf_sched = self._run_bootstrap({"CI_SUITE": "perf"})
         nightly = self._run_bootstrap({"NIGHTLY": "1", "BUILDKITE_SOURCE": "schedule"})
-        integ = self._run_bootstrap(
-            {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"}
+        vllm_canary = self._run_bootstrap(
+            {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-vllm"}
         )
 
         bk_bin = shutil.which("bk")
         if bk_bin is not None:
-            for lane in bp.SUITES["integration"].stages[0]:
+            for lane in bp.SUITES["vllm-canary"].stages[0]:
                 subprocess.run(
                     [
                         bk_bin,
@@ -2118,7 +2466,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     ("skip_tpu_ci", list(reversed(skip_fx.uploads))),
                     ("ci_suite_perf", list(reversed(perf_sched.uploads))),
                     ("nightly", list(reversed(nightly.uploads))),
-                    ("integration", list(reversed(integ.uploads))),
+                    ("vllm_canary", list(reversed(vllm_canary.uploads))),
                 ):
                     steps: list[Any] = []
                     for _, content, _ in uploads:
@@ -2288,7 +2636,9 @@ class TestBootstrapUnits(unittest.TestCase):
             for env in (
                 {"BUILDKITE_BRANCH": "releases/v0.32.0"},
                 {"BUILDKITE_TAG": "v0.32.0"},
+                {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-canary-vllm"},
                 {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"},
+                {"CI_SUITE": "vllm-canary"},
             ):
                 with self.subTest(extra=extra, env=env):
                     refused = self._run_bootstrap(
@@ -2298,7 +2648,7 @@ class TestBootstrapUnits(unittest.TestCase):
                         refused.annotations[-1][:2], ("error", "ci-tpu-generations")
                     )
                     self.assertIn(
-                        "refused on a merge-queue, release or integration build",
+                        "refused on a merge-queue, release or vLLM-canary build",
                         refused.annotations[-1][2],
                     )
                     self.assertEqual(refused.uploads, [])

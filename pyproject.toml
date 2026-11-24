@@ -54,7 +54,7 @@ dependencies = [
     # qwen4_exp/ accepts only indexed_attention, hence the floor. vLLM 0.33.0
     # takes transformers>=5.16.1,<5.21.0 and vllm-omni 0.32.0rc1 takes
     # >=5.16.1,<5.20.0. No upper bound in base dependencies, so upstream vLLM
-    # HEAD canary builds (vllm-torchtpu-integration) can resolve. Monitored for
+    # HEAD canary builds (vllm-torchtpu-canary-vllm) can resolve. Monitored for
     # potential structured-output spec-decode divergence (#1093) on
     # transformers>=5.17.
     "transformers>=5.18.0",
