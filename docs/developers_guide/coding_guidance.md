@@ -178,6 +178,7 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
     which `TPUModelRunner` is built on. This package keeps copies of the V1
     pieces it still uses, taken from vLLM v0.33.0 with the code TPU never
     reaches removed. Rules for edits there:
+
     - Change a copy only to keep it working against the pinned vLLM, to
       remove code TPU no longer reaches, or to fix a TPU bug, and say which
       in the PR.

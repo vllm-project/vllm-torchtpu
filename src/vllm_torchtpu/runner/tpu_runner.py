@@ -811,8 +811,7 @@ class TPUModelRunner(GPUModelRunner):
                     sequence_layout_planner.backend_preinit_world_size,
                     len(layout_devices),
                 )
-        # Disable CUDA graphs before parent init, which sizes
-        # cudagraph_batch_sizes from these. TPU uses AOT bucket precompile
+        # TPU does not use CUDA graphs; it precompiles AOT buckets
         # (_precompile_* methods) instead.
         vllm_config.compilation_config.cudagraph_capture_sizes = []
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
@@ -2949,10 +2948,13 @@ class TPUModelRunner(GPUModelRunner):
         # the copy field from it; state updates stay intact. The base never
         # zeroes `new_block_ids_to_zero` on TPU (`_zero_block_ids` needs a
         # `_kv_block_zeroer`, which only GPU workers build), and none is
-        # needed: the GDN kernels read a new request's state only when
-        # `has_initial_state = (seq_lens - query_lens) > 0`
+        # needed. A request with no history: the GDN kernels read its state
+        # only when `has_initial_state = (seq_lens - query_lens) > 0`
         # (kernels/gdn/v3/metadata.py) and use zeros otherwise
-        # (kernels/gdn/v3/vmem_ldst.py).
+        # (kernels/gdn/v3/vmem_ldst.py). A request with history that moves
+        # to a new state block (mamba align mode):
+        # `_collect_mamba_state_seed_copies` stages a copy from the previous
+        # block, which `_flush_mamba_state_seed_copies` runs before the forward.
         base_output = (
             dataclasses.replace(scheduler_output, kv_cache_block_copies=None)
             if use_page_local_copy or use_dense_copy
@@ -2966,7 +2968,6 @@ class TPUModelRunner(GPUModelRunner):
             self._thinking_budget.update_states(
                 scheduler_output, self.input_batch.req_id_to_index, self.requests
             )
-        # Copy after the base updates request state and block tables.
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
         elif use_dense_copy:

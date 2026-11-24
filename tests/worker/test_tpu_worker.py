@@ -338,9 +338,9 @@ def test_initialize_from_config_updates_num_gpu_blocks():
     worker.model_runner.initialize_kv_cache.assert_called_once_with(kv_cache_config)
 
 
-def test_reset_encoder_cache_clears_the_runner_caches():
+def _worker_with_late_interaction_entries():
+    """A worker whose runner holds one query in each late-interaction cache."""
     runner = TPUModelRunner.__new__(TPUModelRunner)
-    runner.encoder_cache = {"mm_hash": torch.zeros(1)}
     runner.late_interaction_runner = LateInteractionRunner(enable_flash=False)
     late = runner.late_interaction_runner
     late._query_cache["query"] = torch.zeros(1)
@@ -348,6 +348,12 @@ def test_reset_encoder_cache_clears_the_runner_caches():
     late._doc_query_keys["doc"] = "query"
     worker = TPUWorker.__new__(TPUWorker)
     worker.model_runner = runner
+    return worker, runner, late
+
+
+def test_reset_encoder_cache_clears_the_runner_caches():
+    worker, runner, late = _worker_with_late_interaction_entries()
+    runner.encoder_cache = {"mm_hash": torch.zeros(1)}
 
     worker.reset_encoder_cache()
 
@@ -358,15 +364,8 @@ def test_reset_encoder_cache_clears_the_runner_caches():
 def test_reset_mm_cache_clears_the_runner_caches():
     # WorkerBase.reset_mm_cache finds the runner method by name and skips it
     # silently when it is missing, so call through the worker.
-    runner = TPUModelRunner.__new__(TPUModelRunner)
+    worker, runner, late = _worker_with_late_interaction_entries()
     runner.mm_budget = MagicMock()
-    runner.late_interaction_runner = LateInteractionRunner(enable_flash=False)
-    late = runner.late_interaction_runner
-    late._query_cache["query"] = torch.zeros(1)
-    late._query_uses["query"] = 1
-    late._doc_query_keys["doc"] = "query"
-    worker = TPUWorker.__new__(TPUWorker)
-    worker.model_runner = runner
 
     worker.reset_mm_cache()
 

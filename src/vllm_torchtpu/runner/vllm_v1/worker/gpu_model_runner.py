@@ -34,7 +34,6 @@ from vllm.compilation.breakable_cudagraph import (
 )
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import (
-    CUDAGraphMode,
     VllmConfig,
 )
 from vllm.config.cache import CacheConfig
@@ -89,9 +88,6 @@ from vllm.utils.torch_utils import (
     async_tensor_h2d,
     kv_cache_dtype_str_to_dtype,
 )
-from vllm.v1.attention.backends.utils import (
-    reorder_batch_to_split_decodes_and_prefills,
-)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -115,6 +111,9 @@ from vllm.v1.worker.utils import (
 )
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.vllm_v1.utils import (
+    reorder_batch_to_split_decodes_and_prefills,
+)
 from vllm_torchtpu.runner.vllm_v1.worker.block_table import SlotMappingMode
 from vllm_torchtpu.runner.vllm_v1.worker.ec_connector_model_runner_mixin import (
     ECConnectorModelRunnerMixin,
@@ -330,17 +329,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             # Blocking (sleep) event to avoid busy-polling the CUDA driver lock;
             # under TP contention that spin can balloon and make the rank a straggler.
             self.prepare_inputs_event = torch.cuda.Event(blocking=True)
-
-        # self.cudagraph_batch_sizes sorts in ascending order.
-        if (
-            self.compilation_config.cudagraph_capture_sizes
-            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-        ):
-            self.cudagraph_batch_sizes = sorted(
-                self.compilation_config.cudagraph_capture_sizes
-            )
-        else:
-            self.cudagraph_batch_sizes = []
 
         # Encoder timing registry for observability
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}

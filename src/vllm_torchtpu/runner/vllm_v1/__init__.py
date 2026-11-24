@@ -16,7 +16,8 @@
 vLLM v0.34.0 removes Model Runner V1
 (https://github.com/vllm-project/vllm/pull/63373). TPUModelRunner subclasses
 V1's GPUModelRunner and uses its InputBatch, BlockTable, EC connector mixin
-and NgramProposer, so this package keeps copies of them from vLLM v0.33.0. The
+and NgramProposer, so this package keeps copies of them from vLLM v0.33.0;
+utils.py holds the v0.33.0 helpers the copies call that v0.34.0 deletes. The
 layout mirrors upstream's vllm/v1/ so each file diffs cleanly against its
 source.
 
