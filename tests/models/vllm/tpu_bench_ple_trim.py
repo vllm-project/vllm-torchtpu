@@ -56,7 +56,7 @@ def loop(body, n):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tokens", type=int, nargs="+", default=[4, 16, 64])
+    ap.add_argument("--tokens", type=int, nargs="+", default=[4, 8, 16, 24, 32, 48, 64])
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--chain", type=int, nargs=2, default=[8, 40])
     a = ap.parse_args()
@@ -91,15 +91,38 @@ def main():
             back = red[T:].astype(jnp.uint8).reshape(T, RAW // 4, 4)
             return red[:T][None], jax.lax.bitcast_convert_type(back, jnp.uint32)[None]
 
+        def words(e, w):
+            # The current merge: the embedding's BF16 pairs and the raw words as ONE
+            # u32 all-reduce of [T, H/2 + RAW/4] (same bytes as the two collectives),
+            # then -0.0 canonicalized to +0.0 as the float sum of one owner and zeros.
+            ew = jax.lax.bitcast_convert_type(e[0].reshape(T, H // 2, 2), jnp.uint32)
+            red = jax.lax.psum(jnp.concatenate([ew, w[0]], axis=1), "tp")
+            eb = jax.lax.bitcast_convert_type(red[:, : H // 2], jnp.bfloat16).reshape(T, H)
+            eb = jnp.where(eb == 0, jnp.zeros((), eb.dtype), eb)
+            return eb[None], red[:, H // 2 :][None]
+
         sm = lambda f: shard_map(f, mesh, (spec, spec), (spec, spec))
         e_s, w_s = jax.jit(sm(separate))(emb, raw)
         e_m, w_m = jax.jit(sm(merged))(emb, raw)
+        e_w, w_w = jax.jit(sm(words))(emb, raw)
         res["merge_bitwise"] = bool(
             np.array_equal(np.asarray(e_s).view(np.uint16), np.asarray(e_m).view(np.uint16))
             and np.array_equal(np.asarray(w_s), np.asarray(w_m))
             and np.array_equal(np.asarray(w_m)[0], raw_full)
         )
-        for name, f in (("separate", separate), ("merged", merged)):
+        res["words_bitwise"] = bool(
+            np.array_equal(np.asarray(e_s).view(np.uint16), np.asarray(e_w).view(np.uint16))
+            and np.array_equal(np.asarray(w_s), np.asarray(w_w))
+            and np.array_equal(np.asarray(w_w)[0], raw_full)
+        )
+        # Negative control: without the canonicalization the -0.0 entries differ.
+        res["words_raw_neg0_differs"] = bool(
+            not np.array_equal(
+                np.asarray(e_s).view(np.uint16),
+                np.asarray(full_bf)[None].repeat(R, 0).view(np.uint16),
+            )
+        )
+        for name, f in (("separate", separate), ("merged", merged), ("words", words)):
             ts = []
             for n in a.chain:
                 fn = jax.jit(sm(loop(f, n)))
@@ -148,7 +171,7 @@ def main():
     print("SUMMARY", json.dumps(out), flush=True)
     # key_bitwise is informational: the column-sharded projection is NOT bitwise on
     # v7x (the MXU reduction differs with N), so VLLM_TPU_MK_PLE_TRIM does not use it.
-    assert all(r["merge_bitwise"] for r in out.values()), out
+    assert all(r["merge_bitwise"] and r["words_bitwise"] for r in out.values()), out
 
 
 if __name__ == "__main__":

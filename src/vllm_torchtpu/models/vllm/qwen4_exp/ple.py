@@ -115,7 +115,7 @@ def head_vocab_sizes(
 
 
 def token_requests(
-    query_start_loc: torch.Tensor, num_tokens: int
+    query_start_loc: torch.Tensor, num_tokens: int, *, compare: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Each token's request and its offset within that request's chunk.
 
@@ -123,9 +123,27 @@ def token_requests(
     kda_attention_op._token_sequence_ids measured as cheaper on TPU than a
     [num_tokens, num_reqs] comparison. Starts at or past ``num_tokens`` land
     in a dropped overflow slot, and batch padding maps to the last request.
+
+    ``compare`` (VLLM_TPU_MK_IO_LEAN=ple, the megakernel programs' small decode
+    steps): the same request ids as one [num_tokens, num_reqs - 1] comparison
+    and row sum, ``min(#{r >= 1: start_r <= t}, num_reqs - 1)``, instead of a
+    scatter, a scan and their index ops. Equal for every input: token ``t`` is
+    below ``num_tokens``, so a start clamped to ``num_tokens`` lands at or
+    before ``t`` exactly when the unclamped one does, and the cumsum of the
+    marks at ``t`` counts those starts (repeats included).
     """
     num_reqs = query_start_loc.numel() - 1
     query_start_loc = query_start_loc.to(torch.int32)
+    if compare:
+        positions = torch.arange(
+            num_tokens, dtype=torch.int32, device=query_start_loc.device
+        )
+        request = (
+            (query_start_loc[1:num_reqs].unsqueeze(0) <= positions.unsqueeze(1))
+            .sum(-1, dtype=torch.int32)
+            .clamp(max=num_reqs - 1)
+        )
+        return request, positions - query_start_loc[request]
     starts = query_start_loc[1:num_reqs].clamp(max=num_tokens)
     # Keep the overflow slot inside a tensor op: a symbolic `num_tokens + 1`
     # would otherwise escape as a scalar output across the host PLE boundary.
@@ -152,6 +170,7 @@ def ngram_ids(
     *,
     eos_token_id: int,
     heads_per_ngram: int,
+    narrow_context: bool = False,
 ) -> torch.Tensor:
     """Table rows for every head of every token, shape [num_tokens, heads].
 
@@ -161,7 +180,9 @@ def ngram_ids(
     ``_ple_ngram_ids_kernel``, reading in-step predecessors as static shifts.
     """
     tokens = input_ids.long()
-    context = ngram_context.long()
+    # `narrow_context` (VLLM_TPU_MK_IO_LEAN=ple): gather the int32 context, then
+    # widen the gathered tokens (the same values as widening first).
+    context = ngram_context if narrow_context else ngram_context.long()
     num_tokens = tokens.shape[0]
     context_len = context.shape[-1]
 
@@ -176,6 +197,8 @@ def ngram_ids(
         from_context = context[
             request, (context_len - shift + chunk_pos).clamp(0, context_len - 1)
         ]
+        if narrow_context:
+            from_context = from_context.long()
         token = torch.where(chunk_pos >= shift, from_step, from_context)
         token = torch.where(crossed, eos, token)
         crossed = crossed | (token == eos_token_id)
@@ -209,32 +232,45 @@ def merged_embed_all_reduce(
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """One all-reduce for the token embedding and PLE raw n-gram rows.
 
-    ``embed`` is this rank's masked vocab-parallel lookup (zeros for tokens it does
-    not own) and each ``raws[i]`` its raw rows before ``PLEParallel.combine``
-    (zeros for rows it does not own). Every embedding element and every raw byte
-    has exactly one non-zero owner, so the reduced values are the owner's: the
-    embedding rows keep their own BF16 lanes (the same per-element sum as their
-    own all-reduce) and each raw byte travels as an integer-valued BF16 lane
-    (0..255, exact), appended as extra rows of the same width.
+    ``embed`` is this rank's masked vocab-parallel lookup [tokens, width] (zeros
+    for tokens it does not own) and each ``raws[i]`` its raw rows before
+    ``PLEParallel.combine`` (zeros for rows it does not own), first dim tokens.
+    Every token's embedding row and every raw word has exactly one non-zero
+    owner, so an integer sum returns the owner's bits. Each token's embedding
+    pairs and raw bytes travel as int32 words of one [tokens, words] row: the
+    same bytes as the two separate collectives, in one.
+
+    The separate float all-reduce adds the owner's value to +0.0 from every
+    other rank, which turns an owned -0.0 into +0.0 and leaves every other
+    value as it is; the integer sum keeps -0.0, so it is mapped to +0.0 after.
     """
     if embed.dtype != torch.bfloat16:
-        raise ValueError("merged_embed_all_reduce carries raw bytes in BF16 lanes")
-    width = embed.shape[-1]
-    lanes = [r.contiguous().view(torch.uint8).reshape(-1).to(embed.dtype) for r in raws]
-    sizes = [lane.numel() for lane in lanes]
-    flat = torch.cat(lanes)
-    pad = (-flat.numel()) % width
-    if pad:
-        flat = F.pad(flat, (0, pad))
-    rows = embed.numel() // width
-    out = all_reduce(torch.cat([embed.reshape(rows, width), flat.reshape(-1, width)]))
-    tail = out[rows:].reshape(-1)
-    combined, start = [], 0
-    for raw, size in zip(raws, sizes, strict=True):
-        part = tail[start : start + size].to(torch.uint8)
-        combined.append(part.view(raw.dtype).reshape(raw.shape))
-        start += size
-    return out[:rows].reshape(embed.shape), combined
+        raise ValueError("merged_embed_all_reduce carries BF16 embedding pairs")
+    tokens, width = embed.shape
+    if width % 2:
+        raise ValueError(f"embedding width {width} is not a whole number of int32 words")
+    parts = [embed.contiguous().view(torch.int32)]
+    sizes = []
+    for raw in raws:
+        if raw.shape[0] != tokens:
+            raise ValueError(f"raw rows {tuple(raw.shape)} do not have {tokens} tokens")
+        flat = raw.contiguous().view(torch.uint8).reshape(tokens, -1)
+        sizes.append(flat.shape[1])
+        pad = (-flat.shape[1]) % 4
+        if pad:
+            flat = F.pad(flat, (0, pad))
+        parts.append(flat.view(torch.int32))
+    out = all_reduce(torch.cat(parts, dim=1))
+    words = width // 2
+    embedding = out[:, :words].contiguous().view(torch.bfloat16)
+    embedding = torch.where(embedding == 0, torch.zeros_like(embedding), embedding)
+    combined, start = [], words
+    for raw, size, part in zip(raws, sizes, parts[1:], strict=True):
+        n = part.shape[1]
+        flat = out[:, start : start + n].contiguous().view(torch.uint8)[:, :size]
+        combined.append(flat.contiguous().view(raw.dtype).reshape(raw.shape))
+        start += n
+    return embedding, combined
 
 
 def dilated_short_conv(
@@ -470,8 +506,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_context: torch.Tensor,
         request: torch.Tensor,
         chunk_pos: torch.Tensor,
+        *,
+        lean: bool = False,
     ) -> torch.Tensor:
-        """Hash rows independently of resident or host table lookup."""
+        """Hash rows independently of resident or host table lookup.
+
+        ``lean`` (VLLM_TPU_MK_IO_LEAN=ple): the hash constants as trace-time ints
+        and the n-gram context in int32 (no int64 operands to split per step);
+        the same int64 hash math and the same ids."""
         if ngram_context.shape[-1] != self.ngram_size - 1:
             raise ValueError(
                 f"ngram_context has {ngram_context.shape[-1]} tokens per "
@@ -479,7 +521,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"{self.ngram_size - 1}."
             )
         consts = getattr(self, "_hash_constants", None)
-        if envs.VLLM_TPU_MK_PLE_TRIM and consts is not None:
+        if lean and ngram_context.dtype == torch.int64:
+            # Token ids (EOS included) are below the vocabulary size, < 2**31: the
+            # int32 copy is exact and the gathers below read one word per token.
+            ngram_context = ngram_context.to(torch.int32)
+        if (envs.VLLM_TPU_MK_PLE_TRIM or lean) and consts is not None:
             multipliers, sizes, offsets = consts
         else:
             multipliers, sizes, offsets = (
@@ -497,6 +543,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             offsets,
             eos_token_id=self.eos_token_id,
             heads_per_ngram=self.heads_per_ngram,
+            narrow_context=ngram_context.dtype == torch.int32 and lean,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

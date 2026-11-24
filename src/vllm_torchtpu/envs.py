@@ -1325,7 +1325,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # once from the flat table, no [requests, cols] relayout), cktab (the manager-page key
     # table built at its final width), rope (one rope-table gather for both row sets), conv
     # (the GDN checkpoint scatter reads the conv windows from the kernel's history
-    # directly). Empty / "0": off.
+    # directly), ple (megakernel programs' PLE/embedding: int32 operands for the n-gram
+    # context, context lengths and embedding bounds, trace-time hash constants, a
+    # comparison for each token's request), pleconv (the PLE conv taps' step rows as
+    # static shifts instead of gathers). Empty / "0": off.
     "VLLM_TPU_MK_IO_LEAN": env_str("VLLM_TPU_MK_IO_LEAN", ""),
     # Whole-step megakernel: per-row-bucket tile / tunable overrides (BUCKET_TUNE in
     # qwen38_wholestep_call). Layout-only entries keep the bytes; see its comments.
@@ -1784,10 +1787,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen3.8 whole-step megakernel: build the QSA layers' page tables and read their rings
     # for all layers at once (one ring-read call) instead of per layer; same values.
     "VLLM_TPU_MK_WHOLE_BATCHED_INPUTS": env_bool("VLLM_TPU_MK_WHOLE_BATCHED_INPUTS"),
-    # Qwen4Exp PLE decode trims, same bytes: on steps of <= 8 tokens the head
-    # groups' n-gram rows ride the token-embedding all-reduce as integer-valued
-    # BF16 lanes (one collective instead of two), and the n-gram hash constants
-    # are trace-time Python ints instead of int64 buffers.
+    # Qwen4Exp PLE decode trims in the megakernel programs, same bytes: the head
+    # groups' n-gram rows and the token embedding ride ONE int32 all-reduce (each
+    # token's embedding pairs and raw words; same bytes as the two collectives, every
+    # word has one owner, owned -0.0 mapped to +0.0 as the float sum does), on every
+    # bucket (no token-count branch), and the n-gram hash constants are trace-time
+    # Python ints instead of int64 buffers.
     "VLLM_TPU_MK_PLE_TRIM": env_bool("VLLM_TPU_MK_PLE_TRIM"),
     # With QWEN4_EXP_PREFILL_SP_MOE=1: the shared expert of sequence-parallel steps runs on
     # this rank's own rows with a replicated copy of its weights (loaded next to the TP slices,

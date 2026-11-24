@@ -83,7 +83,8 @@ def test_merged_embed_all_reduce_matches_the_separate_collectives() -> None:
 
 
 def test_merged_head_embed_reads_only_fields_the_installed_vllm_embedding_has() -> None:
-    """za8d: `_merged_head_embed` read `emb.reduce_results`, which the pinned vLLM's
+    """za8d: `_merged_head_embed` (now with `_embed_layout_plain` / `_embed_part`) read
+    `emb.reduce_results`, which the pinned vLLM's
     VocabParallelEmbedding does not set, and the AttributeError inside the whole-step
     trace disabled the megakernel. Every field it reads directly must be set by the
     installed class (optional ones go through getattr with the pinned default)."""
@@ -105,7 +106,11 @@ def test_merged_head_embed_reads_only_fields_the_installed_vllm_embedding_has() 
         have |= set(re.findall(r"self\.([a-z_]+)\s*(?::[^=\n]+)?=", src_cls))
     have |= {n for n, _ in inspect.getmembers(VocabParallelEmbedding)}
     have.add("weight")  # registered by the quant method's create_weights
-    src = inspect.getsource(qwen4_model.Qwen4ExpBackbone._merged_head_embed)
+    bb = qwen4_model.Qwen4ExpBackbone
+    src = "".join(
+        inspect.getsource(f)
+        for f in (bb._embed_layout_plain, bb._embed_part, bb._mk_embed, bb._merged_head_embed)
+    )
     direct = set(re.findall(r"\bemb\.([a-z_]+)", src))
     optional = set(re.findall(r'getattr\(emb, "([a-z_]+)"', src))
     assert not (direct - have), (sorted(direct - have), [c.__module__ + "." + c.__qualname__ for c in VocabParallelEmbedding.__mro__])
@@ -127,6 +132,9 @@ def test_merged_head_embed_tolerates_an_embedding_without_reduce_results(monkeyp
     )
     layer = SimpleNamespace(ple=None)
     backbone = SimpleNamespace(embed_tokens=emb, layers=[layer, layer, layer])
+    backbone._embed_layout_plain = qwen4_model.Qwen4ExpBackbone._embed_layout_plain.__get__(
+        backbone
+    )
     monkeypatch.setattr(qwen4_model, "get_tp_group", lambda: object())
     ids = torch.zeros(4, dtype=torch.int32)
     out = qwen4_model.Qwen4ExpBackbone._merged_head_embed(

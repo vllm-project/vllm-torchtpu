@@ -47,7 +47,8 @@ VLLM_CONTRACT = [
     (
         "vllm.model_executor.layers.vocab_parallel_embedding.VocabParallelEmbedding",
         {"tp_size", "shard_indices", "quant_method"},
-        "qwen4_exp/model.py Qwen4ExpBackbone._merged_head_embed (VLLM_TPU_MK_PLE_TRIM)",
+        "qwen4_exp/model.py Qwen4ExpBackbone._merged_head_embed / _embed_part "
+        "(VLLM_TPU_MK_PLE_TRIM, VLLM_TPU_MK_IO_LEAN=ple)",
     ),
     (
         "vllm.model_executor.layers.vocab_parallel_embedding.ParallelLMHead",
@@ -94,7 +95,11 @@ def test_megakernel_reads_optional_vllm_fields_through_getattr():
     from vllm_torchtpu.megakernel_runtime import qwen38_draft
     from vllm_torchtpu.models.vllm.qwen4_exp import model as qwen4_model
 
-    merged = inspect.getsource(qwen4_model.Qwen4ExpBackbone._merged_head_embed)
+    bb = qwen4_model.Qwen4ExpBackbone
+    merged = "".join(
+        inspect.getsource(f)
+        for f in (bb._embed_layout_plain, bb._embed_part, bb._mk_embed, bb._merged_head_embed)
+    )
     for field in ("reduce_results", "parallel_group", "use_fused_embedding"):
         assert f'getattr(emb, "{field}"' in merged, field
         assert f"emb.{field}" not in merged, field

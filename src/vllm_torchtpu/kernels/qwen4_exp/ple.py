@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.megakernel_runtime.qwen38_io_lean import io_lean
 
 
 def compact_rows(table, ids, *, head_dim: int):
@@ -152,6 +153,21 @@ def resident_lookup(
     )
 
 
+def shifted_rows(x, distance: int):
+    """``x[clip(t - distance, 0, T - 1)]`` for every row ``t`` of ``x`` [T, C], with a
+    static ``distance >= 0``: row 0 repeated ``min(distance, T)`` times, then the
+    first ``T - distance`` rows. Pure data movement, so XLA can fuse it into its
+    consumer instead of issuing a gather."""
+    token_count = x.shape[0]
+    assert distance >= 0, distance
+    if distance == 0:
+        return x
+    head = jnp.broadcast_to(x[:1], (min(distance, token_count),) + x.shape[1:])
+    if distance >= token_count:
+        return head
+    return jnp.concatenate([head, x[: token_count - distance]], axis=0)
+
+
 def short_conv(
     x,
     weight,
@@ -189,11 +205,17 @@ def short_conv(
     # VLLM_TPU_PLE_CONV_HISTORY_FAST: request-owned history starts at packed
     # position zero, so taps read history only for each request's first rows.
     fast_history = request_owned_history and envs.VLLM_TPU_PLE_CONV_HISTORY_FAST
+    # VLLM_TPU_MK_IO_LEAN=pleconv: each tap's rows of this step as a static shift
+    # (`shifted_rows`) instead of a gather at clipped indices; the same rows.
+    static_shift = io_lean("pleconv")
     accum = jnp.zeros((token_count, channels), jnp.float32)
     for tap in range(weight.shape[-1]):
         distance = state_len - tap * dilation
         position = relative - distance
-        current = x[jnp.clip(t - distance, 0, token_count - 1)]
+        if static_shift:
+            current = shifted_rows(x, distance)
+        else:
+            current = x[jnp.clip(t - distance, 0, token_count - 1)]
         if fast_history and distance == 0:
             # Packed positions are nonnegative, so distance 0 reads no history.
             value = current

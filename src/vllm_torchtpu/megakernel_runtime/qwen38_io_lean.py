@@ -15,6 +15,13 @@
 
 Every lever computes the same values as the code it replaces (integer indexing and data
 movement only); it only changes how many XLA ops the call spends around the kernel.
+
+`ple` and `pleconv` trim the per-layer-embedding (PLE) ops the megakernel programs run
+before the head kernels: `ple` (megakernel programs only) feeds the n-gram hash and the
+embedding mask int32 operands and trace-time hash constants instead of int64 operands,
+and finds each token's request with one comparison; `pleconv` reads each conv tap's
+rows of the step as a static shift instead of a gather (every program that runs the PLE
+conv op).
 """
 
 from __future__ import annotations
@@ -26,7 +33,7 @@ import jax.numpy as jnp
 
 from vllm_torchtpu import envs
 
-LEVERS = ("ring", "cktab", "rope", "conv")
+LEVERS = ("ring", "cktab", "rope", "conv", "ple", "pleconv")
 
 
 def io_lean_levers(raw: str | None = None) -> frozenset[str]:
