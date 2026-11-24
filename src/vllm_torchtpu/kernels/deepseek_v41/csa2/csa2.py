@@ -130,7 +130,7 @@ def _csa2_kernel_impl(
     bounds_ref,
     # Inputs
     q_hbm,  # [T', H, 512], BF16; this call's T queries start at query_offset
-    kv_hbm,  # [T, 512, 128], INT32, or None for SWA-only attention
+    kv_hbm,  # [T, 512, 128] or, with kv_owner, [T', 512, 128]; INT32 or None
     scales_hbm,
     swa_hbm,
     sink_ref,
@@ -141,6 +141,7 @@ def _csa2_kernel_impl(
     non_causal: bool,
     query_offset: int,
     owners: str,
+    kv_owner: bool,
     uniform_tiles: bool,
     accumulators,
 ) -> None:
@@ -148,15 +149,16 @@ def _csa2_kernel_impl(
 
     Output rows land at query_offset onward. With ``owners`` "new" or
     "aliased", the main KV rows are also copied to the matching rows of the
-    [T', 512, 128] output, which "aliased" updates in place.
+    [T', 512, 128] output, which "aliased" updates in place, unless
+    ``kv_owner``: main KV and scales are then already owners, read at
+    query_offset, and only the attention output is an owner.
     """
+    owned = 1 if owners == "none" or kv_owner else 2
     if owners == "aliased":
-        _, _, out_hbm, kv_out_hbm, *scratch = refs
-    elif owners == "new":
-        out_hbm, kv_out_hbm, *scratch = refs
-    else:
-        out_hbm, *scratch = refs
-        kv_out_hbm = None
+        refs = refs[owned:]
+    out_hbm, *scratch = refs
+    kv_out_hbm = scratch.pop(0) if owned == 2 else None
+    kv_offset = query_offset if kv_owner else 0
     (
         q_buf,  # [4, bq, H, 512], BF16
         kv_buf,
@@ -226,10 +228,10 @@ def _csa2_kernel_impl(
     def input_copies(tile, bank):
         sources = ((q_hbm, q_buf, query_offset),)
         if has_main:
-            sources += ((kv_hbm, kv_buf, 0),)
+            sources += ((kv_hbm, kv_buf, kv_offset),)
         if not resident_metadata:
             if has_main:
-                sources += ((scales_hbm, scales_buf, 0),)
+                sources += ((scales_hbm, scales_buf, kv_offset),)
             sources += ((rope_hbm, rope_buf, 0),)
         return tuple(
             pltpu.make_async_copy(
@@ -392,7 +394,7 @@ def _csa2_kernel_impl(
         main_scale_ref = (
             None
             if not has_main
-            else scales_hbm.at[rows(tile)]
+            else scales_hbm.at[rows(tile, kv_offset)]
             if resident_metadata
             else scales_buf.at[sb]
         )
@@ -767,9 +769,11 @@ def _csa2_kernel(
     non_causal: bool,
     query_offset: int,
     owners: str,
+    kv_owner: bool,
 ) -> None:
     """Use the uniform tile pipeline only after checking every request boundary."""
-    q_buf = refs[4 if owners == "aliased" else 2 if owners == "new" else 1]
+    owned = 1 if owners == "none" or kv_owner else 2
+    q_buf = refs[2 * owned if owners == "aliased" else owned]
     bq, heads = q_buf.shape[1], q_hbm.shape[1]
     batch, tokens = pages_ref.shape[1], positions_ref.shape[0]
     mxu_heads = pl.cdiv(heads, 16) * 16
@@ -802,6 +806,7 @@ def _csa2_kernel(
             non_causal=non_causal,
             query_offset=query_offset,
             owners=owners,
+            kv_owner=kv_owner,
             uniform_tiles=uniform,
             accumulators=accumulators,
         )
@@ -821,7 +826,14 @@ def _csa2_kernel(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("scale", "compress_ratio", "bq", "query_offset", "new_owners"),
+    static_argnames=(
+        "scale",
+        "compress_ratio",
+        "bq",
+        "query_offset",
+        "new_owners",
+        "kv_owner",
+    ),
 )
 def csa2(
     q: jax.Array,
@@ -843,6 +855,7 @@ def csa2(
     out: jax.Array | None = None,
     kv_out: jax.Array | None = None,
     new_owners: bool = False,
+    kv_owner: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Ragged CSA2 attention with FP32 scales and independent SWA visibility.
 
@@ -860,7 +873,10 @@ def csa2(
     owners and ``(out, kv_out)`` is returned, so a chunked caller needs no
     output update or gathered-KV concatenation. ``new_owners`` instead
     returns two newly allocated owners of those shapes; only this call's rows
-    are written.
+    are written. With ``kv_owner``, main KV [T',512,128] and scales [T',512]
+    are owners holding this call's rows at query_offset too: nothing is
+    copied, and ``out`` alone (no ``kv_out``) or ``new_owners`` gives the
+    attention owner, which is returned alone.
 
     ``main_kv=None`` (with ``main_kv_scale=None``) is SWA-only attention, the
     layers whose compress ratio is 0: the window is the whole key set and the
@@ -871,8 +887,10 @@ def csa2(
         raise ValueError("CSA2 main KV and its scales are given together")
     non_causal = swa_bounds is not None
     destinations = out is not None
-    if destinations != (kv_out is not None):
+    if destinations != (kv_out is not None) and not kv_owner:
         raise ValueError("CSA2 out and kv_out must be given together")
+    if kv_owner and (kv_out is not None or not has_main):
+        raise ValueError("CSA2 KV owners take no kv_out and require main KV")
     if destinations and new_owners:
         raise ValueError("CSA2 new_owners excludes out and kv_out")
     if not has_main and (destinations or new_owners):
@@ -888,8 +906,8 @@ def csa2(
     if destinations and (
         out.shape != q.shape
         or out.dtype != q.dtype
-        or kv_out.shape != (q.shape[0], 512, 128)
-        or kv_out.dtype != jnp.int32
+        or not kv_owner
+        and (kv_out.shape != (q.shape[0], 512, 128) or kv_out.dtype != jnp.int32)
     ):
         raise ValueError("CSA2 out must match q and kv_out must be INT32 [T',512,128]")
     if heads < 8 or heads > 128 or heads % 8:
@@ -933,10 +951,11 @@ def csa2(
         main_lengths = jnp.zeros((tokens,), jnp.int32)
     elif main_lengths is None:
         main_lengths = jnp.minimum((positions + 1) // compress_ratio, 512)
+    main_rows = q.shape[0] if kv_owner else tokens
     main_specs = (
         (
-            (main_kv, (tokens, 512, 128), jnp.int32),
-            (main_kv_scale, (tokens, 512), jnp.float32),
+            (main_kv, (main_rows, 512, 128), jnp.int32),
+            (main_kv_scale, (main_rows, 512), jnp.float32),
         )
         if has_main
         else ()
@@ -960,6 +979,8 @@ def csa2(
     ):
         raise ValueError("SWA bounds must be INT32 [B,2]")
     if not tokens:
+        if kv_owner:
+            return out if destinations else jnp.zeros_like(q)
         if new_owners:
             return jnp.zeros_like(q), jnp.zeros((q.shape[0], 512, 128), jnp.int32)
         return (out, kv_out) if destinations else jnp.zeros_like(q)
@@ -1006,18 +1027,19 @@ def csa2(
     out_shape = pltpu.HBM(shape=q.shape, dtype=q.dtype)
     out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
     aliases = {}
-    if owners != "none":
+    if owners != "none" and not kv_owner:
         out_shape = (
             out_shape,
             jax.ShapeDtypeStruct((q.shape[0], 512, 128), jnp.int32),
         )
         out_specs = (out_specs, out_specs)
     if destinations:
-        spaces += (pltpu.HBM, pltpu.HBM)
-        inputs += (out, kv_out)
+        owned = (out,) if kv_owner else (out, kv_out)
+        spaces += (pltpu.HBM,) * len(owned)
+        inputs += owned
         # Operand indices count the five scalar-prefetch operands.
-        first = len(scalars) + len(jax.tree.leaves(inputs)) - 2
-        aliases = {first: 0, first + 1: 1}
+        first = len(scalars) + len(jax.tree.leaves(inputs)) - len(owned)
+        aliases = {first + i: i for i in range(len(owned))}
     # BlockSpec alone does not prevent an upstream whole-owner memory-space copy.
     inputs = jax.tree.map(pltpu.with_memory_space_constraint, inputs, spaces)
 
@@ -1028,6 +1050,7 @@ def csa2(
             non_causal=non_causal,
             query_offset=query_offset,
             owners=owners,
+            kv_owner=kv_owner,
         ),
         out_shape=out_shape,
         input_output_aliases=aliases,

@@ -42,18 +42,25 @@ def encode_csa2_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
     return jax.lax.bitcast_convert_type(words, jnp.int32), scales
 
 
-@functools.partial(jax.jit, static_argnames=("deep",))
+@functools.partial(jax.jit, static_argnames=("deep", "rows", "row_offset"))
 def gather_csa2_kv_sc(
     words: jax.Array | tuple[jax.Array, jax.Array],
     scales: jax.Array | tuple[jax.Array, jax.Array],
     records: jax.Array,
+    owners: tuple[jax.Array, jax.Array] | None = None,
     *,
     deep: bool = False,
+    rows: int | None = None,
+    row_offset: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """SparseCore producer; invalid rows are zeroed once before any reuse.
 
     ``deep`` keeps three staging slots in flight and zeroes invalid rows with
     a masked DMA instead of clearing every slot with vector stores.
+    With deep ``owners`` (words [N,128], scales [N]) or ``rows`` (N, to
+    allocate them), the T x 512 gathered rows are written from ``row_offset``
+    of flat owners, which are returned: a chunked caller then needs no copy
+    into whole-T owners.
     """
     banks = words if isinstance(words, tuple) else (words,)
     scale_banks = scales if isinstance(scales, tuple) else (scales,)
@@ -70,6 +77,12 @@ def gather_csa2_kv_sc(
             raise ValueError("CSA2 scale banks must be nonempty FP32 [records]")
     if records.ndim != 2 or records.shape[1] != 512 or records.dtype != jnp.int32:
         raise ValueError("CSA2 selection IDs must be INT32 [T,512]")
+    into = owners if owners is not None else rows
+    if into is not None:
+        total = rows if owners is None else owners[0].shape[0]
+        if not deep or not records.size or row_offset + records.size > total:
+            raise ValueError("CSA2 owner gathers are deep, nonempty and in bounds")
+        return _gather_sc_banked_deep(banks, scale_banks, records, into, row_offset)
     if not records.size:
         return jnp.zeros((*records.shape, 128), jnp.int32), jnp.zeros(
             records.shape, jnp.float32
@@ -219,12 +232,12 @@ def _gather_sc_banked(words, scales, records):
     )
 
 
-def _gather_sc_banked_deep(words, scales, records, into=None):
+def _gather_sc_banked_deep(words, scales, records, into=None, row_offset=0):
     """``_gather_sc_banked`` with three slots and DMA-zeroed invalid rows.
 
-    ``into`` (owner words [N,128], owner scales [N], static row offset)
-    writes the gathered rows in place at that offset of the owners and
-    returns the owners, instead of returning new arrays.
+    ``into`` writes the gathered rows from ``row_offset`` of [N,128] word and
+    [N] scale owners and returns them: owners to update in place, or N to
+    allocate new ones (only these rows are written).
 
     The gather for step i + 2 is issued while step i's rows are written, so
     two gathers are in flight instead of one. Each 16-id stream is filled by
@@ -362,7 +375,6 @@ def _gather_sc_banked_deep(words, scales, records, into=None):
             ),
         )(ids_ref)
 
-    row_offset = 0 if into is None else into[2]
     call = functools.partial(
         pl.kernel,
         kernel,
@@ -381,19 +393,22 @@ def _gather_sc_banked_deep(words, scales, records, into=None):
         name="csa2_banked_word_scale_gather",
     )
     inputs = (words, scales, zero_words, zero_scales, indices)
-    if into is not None:
-        owners = tuple(jax.new_ref(owner) for owner in into[:2])
+    if isinstance(into, tuple):
+        owners = tuple(jax.new_ref(owner) for owner in into)
         call()(*inputs, *owners)
         return tuple(owner[...] for owner in owners)
+    rows = count if into is None else into
     out, scale_out = cast(
         tuple[jax.Array, jax.Array],
         call(
             out_type=(
-                jax.ShapeDtypeStruct((count, 128), jnp.int32),
-                jax.ShapeDtypeStruct((count,), jnp.float32),
+                jax.ShapeDtypeStruct((rows, 128), jnp.int32),
+                jax.ShapeDtypeStruct((rows,), jnp.float32),
             )
         )(*inputs),
     )
+    if into is not None:
+        return out, scale_out
     return out.reshape(*records.shape, 128), scale_out.reshape(records.shape)
 
 

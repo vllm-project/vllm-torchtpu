@@ -98,20 +98,24 @@ def csa2_attend_rows(
     rope: jax.Array,
     *,
     offset: int,
+    kv_owner: bool = False,
     **kwargs: Any,
-) -> tuple[jax.Array, jax.Array]:
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Attention of query rows from ``offset``, written into whole-T owners.
 
     ``gathered`` holds the rows' KV words and scales. Without ``owners`` the
     call allocates them; only these rows are written. Returns the owners
-    (attention output, gathered KV words) for the next row range.
+    (attention output, gathered KV words) for the next row range. With
+    ``kv_owner``, ``gathered`` is already the whole-T KV owner pair holding
+    these rows, and ``owners`` and the result are the attention output alone.
     """
     end = offset + counts.shape[0]
-    destinations = (
-        dict(new_owners=True)
-        if owners is None
-        else dict(out=owners[0], kv_out=owners[1])
-    )
+    if owners is None:
+        destinations = dict(new_owners=True)
+    elif kv_owner:
+        destinations = dict(out=owners)
+    else:
+        destinations = dict(out=owners[0], kv_out=owners[1])
     return csa2(
         q,
         *gathered,
@@ -122,6 +126,7 @@ def csa2_attend_rows(
         rope[offset:end],
         main_lengths=counts,
         query_offset=offset,
+        kv_owner=kv_owner,
         **destinations,
         **kwargs,
     )
