@@ -9,6 +9,8 @@ import jax
 import jax.numpy as jnp
 import torch
 
+from vllm_torchtpu.tracing.named_scope import scoped
+
 from .cache import (
     _has_hi_bank,
     gather_cache_pieces,
@@ -585,6 +587,7 @@ def initialize_paged_attention():
     )
 
 
+@scoped("paged_attention")
 def paged_attention(
     q,
     swa,

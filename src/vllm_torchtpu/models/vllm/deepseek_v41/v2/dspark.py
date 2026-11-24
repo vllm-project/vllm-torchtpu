@@ -32,6 +32,11 @@ from vllm_torchtpu.layers.adapter.fused_moe_ep import mark_dspark_draft_moe
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tracing.named_scope import (
+    initialize_named_scopes,
+    named_scope,
+    scoped,
+)
 
 from ..common.mhc import (
     collapse,
@@ -143,6 +148,7 @@ class DSparkDeepseekV41Model(nn.Module):
         self._boundary_collapse = initialize_collapse()
 
         initialize_paged_attention()
+        initialize_named_scopes()
 
         assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_config
@@ -270,6 +276,7 @@ class DSparkDeepseekV41Model(nn.Module):
             for layer in cast(Iterable[DeepseekV41DecoderLayer], self.layers)
         ]
 
+    @scoped("dspark_context_kv")
     def precompute_and_store_context_kv(
         self,
         target_hidden_states: torch.Tensor,
@@ -300,17 +307,18 @@ class DSparkDeepseekV41Model(nn.Module):
         hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
         residual = post_mix = res_mix = pre_mix = None
-        with stage_attention_cache_scope():
-            for layer in self.layers:
-                hidden_states, residual, post_mix, res_mix, pre_mix, _ = layer(
-                    hidden_states,
-                    positions,
-                    input_ids,
-                    pre_mix,
-                    post_mix,
-                    res_mix,
-                    residual,
-                )
+        with stage_attention_cache_scope(), named_scope("dspark_draft"):
+            for i, layer in enumerate(self.layers):
+                with named_scope(f"draft_layer_{i}"):
+                    hidden_states, residual, post_mix, res_mix, pre_mix, _ = layer(
+                        hidden_states,
+                        positions,
+                        input_ids,
+                        pre_mix,
+                        post_mix,
+                        res_mix,
+                        residual,
+                    )
         hidden_states = post(hidden_states, residual, post_mix, res_mix)
         assert pre_mix is not None
         if (
@@ -414,6 +422,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             self._decode_logits = initialize_logits_head()
         return self._sample_decode
 
+    @scoped("dspark_sample")
     def _sample_decode(
         self, hidden: torch.Tensor, input_ids: torch.Tensor, block_size: int
     ) -> torch.Tensor | None:
