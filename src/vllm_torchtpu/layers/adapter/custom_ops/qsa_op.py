@@ -20,6 +20,7 @@ from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     pooled_qsa_shared_step,
     pooled_qsa_step,
     pooled_qsa_token_select_step,
+    token_shard_unpermute,
 )
 from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_step
 
@@ -427,6 +428,32 @@ def build_pooled_qsa_shared_op(with_rows: bool):
     return run
 
 
+@functools.cache
+def _unpermute_op():
+    op = pallas.jax_op("qwen4_exp::token_shard_unpermute", token_shard_unpermute)
+
+    @op.register_fake
+    def fake(gathered, starts, context, size):
+        return torch.empty_like(gathered)
+
+    return op
+
+
+def _token_shard_step_order(gathered, starts, context, world: int, unpermute):
+    """The all-gathered token-shard blocks in step order.
+
+    Under VLLM_TPU_QSA_INDEXER_BALANCED_SHARD the shards wider than the
+    request slots hold the balanced layout (``balanced_token_shard_plan``);
+    narrower ones (decode buckets) keep the contiguous one.
+    """
+    tokens, slots = gathered.shape[0], context.shape[0]
+    if unpermute is None or tokens % world or tokens // world <= slots:
+        return gathered
+    # No logging here: Dynamo traces this function (full graph).
+    # token_shard_unpermute logs when JAX traces it.
+    return unpermute(gathered, starts, context, size=world)
+
+
 def _all_gather_ranks(x: torch.Tensor, group) -> torch.Tensor:
     """``[...]`` on every rank -> ``[ranks, ...]`` in rank order."""
     return group.all_gather(x.unsqueeze(0).contiguous(), dim=0)
@@ -805,6 +832,8 @@ def build_pooled_qsa_token_shard_op(tp_group):
     world = int(tp_group.world_size)
     select = _token_select_op()
     _, attend = _shard_ops(False)
+    # Built here: Dynamo traces run() and does not see functools.cache hits.
+    unpermute = _unpermute_op() if envs.VLLM_TPU_QSA_INDEXER_BALANCED_SHARD else None
 
     def run(*args, shard_index, kv_heads, **kwargs):
         tokens, slots = args[0].shape[0], args[12].shape[0]
@@ -834,7 +863,13 @@ def build_pooled_qsa_token_shard_op(tp_group):
             args[14],
             args[12],
             pool,
-            _all_gather_ranks(blocks, tp_group).reshape(tokens, -1),
+            _token_shard_step_order(
+                _all_gather_ranks(blocks, tp_group).reshape(tokens, -1),
+                args[11],
+                args[12],
+                world,
+                unpermute,
+            ),
             kv_heads=kv_heads,
             compress_ratio=kwargs["compress_ratio"],
             token_topk=kwargs["token_topk"],
@@ -1697,6 +1732,8 @@ def build_pooled_qsa_token_shard_dcp_op(tp_group, pair_group, size: int):
     world = int(tp_group.world_size)
     _, select, attend, combine = _dcp_ops()
     merge = _dcp_merge_setup()
+    # Built here: Dynamo traces run() and does not see functools.cache hits.
+    unpermute = _unpermute_op() if envs.VLLM_TPU_QSA_INDEXER_BALANCED_SHARD else None
 
     def run(*args, shard_index, dcp_rank, kv_heads, **kwargs):
         check = kwargs.pop("merge_check", None)
@@ -1729,7 +1766,15 @@ def build_pooled_qsa_token_shard_dcp_op(tp_group, pair_group, size: int):
             args[14],
             args[12],
             pool,
-            _all_gather_ranks(blocks, tp_group).reshape(-1, blocks.shape[-1])[:tokens],
+            _token_shard_step_order(
+                _all_gather_ranks(blocks, tp_group).reshape(-1, blocks.shape[-1])[
+                    :tokens
+                ],
+                args[11],
+                args[12],
+                world,
+                unpermute,
+            ),
             dcp_rank,
             kv_heads=kv_heads,
             compress_ratio=kwargs["compress_ratio"],

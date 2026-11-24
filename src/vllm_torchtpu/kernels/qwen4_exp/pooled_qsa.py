@@ -2,6 +2,7 @@
 """QSA over one donated pool, with independent group-native block tables."""
 
 import dataclasses
+import functools
 import math
 from typing import ClassVar
 
@@ -1157,6 +1158,203 @@ def token_shard_step(starts, context, shard_index, rows):
     return base, sub_starts, (context + before).astype(context.dtype)
 
 
+# Indexer cost of one request segment of a shard, in rows: each 128-row query
+# block of a segment costs about this many rows on top of its rows (StreamIdx
+# at BKV 2048: ~22 us per block, ~0.45 us per row), all scaled by the keys the
+# segment streams. Used only to choose a layout; the selection never depends
+# on it.
+_SEGMENT_BLOCK_ROWS = 48
+
+
+@dataclasses.dataclass(frozen=True)
+class BalancedShardPlan:
+    """Row layout of ``balanced_token_shard_plan`` (int32 arrays).
+
+    Short requests (verify / decode rows) go whole to one shard; every other
+    row, padding included, fills the shards' remaining rows in step order
+    ("long ranks"). ``count[s, i]`` / ``offset[s, i]``: rows of request ``i``
+    in shard ``s`` and the first one's offset in the request; ``prefix[s, i]``:
+    shard ``s`` rows of the requests before ``i``; ``fill[s]``: first long rank
+    of shard ``s``; ``long_begin`` ``[R + 1]``: each request's first long rank
+    (the padding's last); ``short_rows``: rows of all short requests.
+    """
+
+    width: int
+    short: jax.Array
+    shard_of: jax.Array
+    count: jax.Array
+    offset: jax.Array
+    prefix: jax.Array
+    fill: jax.Array
+    long_begin: jax.Array
+    short_rows: jax.Array
+
+
+jax.tree_util.register_dataclass(
+    BalancedShardPlan,
+    data_fields=[
+        "short",
+        "shard_of",
+        "count",
+        "offset",
+        "prefix",
+        "fill",
+        "long_begin",
+        "short_rows",
+    ],
+    meta_fields=["width"],
+)
+
+
+def _shard_plan(short, shard_of, starts, width, size):
+    """``BalancedShardPlan`` for given short requests and their shards, and
+    whether every shard's short rows fit in ``width``."""
+    starts = starts.astype(jnp.int32)
+    n = starts[1:] - starts[:-1]
+    short_n = jnp.where(short, n, 0)
+    load = (
+        jnp.zeros((size,), jnp.int32)
+        .at[jnp.where(short, shard_of, size)]
+        .add(short_n, mode="drop")
+    )
+    zero = jnp.zeros((1,), jnp.int32)
+    fill = jnp.concatenate([zero, jnp.cumsum(width - load).astype(jnp.int32)])
+    short_before = jnp.concatenate([zero, jnp.cumsum(short_n).astype(jnp.int32)])
+    long_begin = starts - short_before
+    first = long_begin[None, :-1]
+    lo = jnp.clip(first, fill[:-1, None], fill[1:, None])
+    hi = jnp.clip(first + n[None], fill[:-1, None], fill[1:, None])
+    mine = short[None] & (shard_of[None] == jnp.arange(size)[:, None])
+    count = jnp.where(short[None], jnp.where(mine, n[None], 0), hi - lo)
+    offset = jnp.where(short[None], 0, jnp.clip(lo - first, 0, n[None]))
+    prefix = jnp.concatenate(
+        [jnp.zeros((size, 1), jnp.int32), jnp.cumsum(count, axis=1).astype(jnp.int32)],
+        axis=1,
+    )
+    plan = BalancedShardPlan(
+        width,
+        short,
+        shard_of,
+        count.astype(jnp.int32),
+        offset.astype(jnp.int32),
+        prefix,
+        fill,
+        long_begin,
+        short_before[-1],
+    )
+    return plan, jnp.all(load <= width)
+
+
+def _plan_cost(plan, context):
+    """Modelled indexer time of each shard (arbitrary units)."""
+    rows = plan.count.astype(jnp.float32)
+    blocks = jnp.ceil(rows / 128.0)
+    keys = context[None].astype(jnp.float32) + plan.offset.astype(jnp.float32) + rows
+    cost = (_SEGMENT_BLOCK_ROWS * blocks + rows) * keys
+    return jnp.sum(jnp.where(rows > 0, cost, 0.0), axis=1)
+
+
+def balanced_token_shard_plan(starts, context, tokens, size):
+    """The rank-balanced token shard layout of a step, or the contiguous one.
+
+    ``token_shard_step`` gives shard ``s`` rows ``[s * W, (s + 1) * W)``; the
+    runner orders decode / verify requests first, so shard 0 indexes every
+    verify request (one query block each) while the other shards index only
+    prefill rows, and every rank waits for shard 0 at the selection
+    all-gather. Here each short request (at most ``min(127, W // 8)`` rows)
+    goes whole to one shard, round-robin from the longest context, and the
+    other rows fill each shard to ``W`` rows in step order. Every row keeps
+    its request, causal length and keys, so its selection is unchanged. Falls
+    back to the contiguous layout (``token_shard_step``'s) when the short
+    requests do not fit or the modelled slowest shard is not faster.
+    """
+    width = tokens // size
+    starts = starts.astype(jnp.int32)
+    n = starts[1:] - starts[:-1]
+    slots = len(n)
+    threshold = max(1, min(127, width // 8))
+    short = (n > 0) & (n <= threshold)
+    ctx = context.astype(jnp.int32)
+    index = jnp.arange(slots)
+    ahead = short[None, :] & (
+        (ctx[None, :] > ctx[:, None])
+        | ((ctx[None, :] == ctx[:, None]) & (index[None, :] < index[:, None]))
+    )
+    shard_of = (jnp.sum(ahead, axis=1) % size).astype(jnp.int32)
+    balanced, fits = _shard_plan(short, shard_of, starts, width, size)
+    contiguous, _ = _shard_plan(jnp.zeros_like(short), shard_of, starts, width, size)
+    use = fits & (
+        jnp.max(_plan_cost(balanced, ctx)) < jnp.max(_plan_cost(contiguous, ctx))
+    )
+    return jax.tree_util.tree_map(
+        lambda a, b: jnp.where(use, a, b), balanced, contiguous
+    )
+
+
+def balanced_shard_rows(plan, starts, context, shard_index):
+    """Shard ``shard_index`` (int32 ``[1]``) of ``plan``: ``(rows, sub_starts,
+    sub_context)``, its ``W`` step rows in step order and their ragged batch
+    (each request's rows in the shard see the keys they see in the step)."""
+    s = shard_index.reshape(()).astype(jnp.int32)
+    starts = starts.astype(jnp.int32)
+    slots = plan.count.shape[1]
+    prefix, offset = plan.prefix[s], plan.offset[s]
+    p = jnp.arange(plan.width, dtype=jnp.int32)
+    req = jnp.sum(prefix[None, 1:] <= p[:, None], axis=1)
+    safe = jnp.minimum(req, slots - 1)
+    row = starts[safe] + offset[safe] + (p - prefix[safe])
+    pad_rank = jnp.maximum(plan.fill[s], plan.long_begin[-1]) + (p - prefix[-1])
+    rows = jnp.where(req < slots, row, pad_rank + plan.short_rows)
+    return rows.astype(jnp.int32), prefix, (context + offset).astype(context.dtype)
+
+
+def balanced_shard_positions(plan, starts, tokens):
+    """``[tokens]``: each step row's index in the rank-major concatenation of
+    ``plan``'s shards."""
+    starts = starts.astype(jnp.int32)
+    slots = len(starts) - 1
+    t = jnp.arange(tokens, dtype=jnp.int32)
+    req = jnp.sum(starts[None, 1:] <= t[:, None], axis=1)  # slots: padding
+    safe = jnp.minimum(req, slots - 1)
+    short = (req < slots) & plan.short[safe]
+    rank = t - (starts[req] - plan.long_begin[req])
+    size = len(plan.fill) - 1
+    shard = jnp.sum(plan.fill[None, 1:size] <= rank[:, None], axis=1)
+    shard = jnp.where(short, plan.shard_of[safe], shard)
+    within = jnp.where(
+        short,
+        t - starts[safe],
+        rank - jnp.maximum(plan.long_begin[req], plan.fill[shard]),
+    )
+    return (shard * plan.width + plan.prefix[shard, req] + within).astype(jnp.int32)
+
+
+def token_shard_unpermute(
+    gathered: jax.Array, starts: jax.Array, context: jax.Array, size: int
+) -> jax.Array:
+    """Step-ordered rows of the rank-major all-gather of the balanced shards
+    (VLLM_TPU_QSA_INDEXER_BALANCED_SHARD)."""
+    tokens = gathered.shape[0]
+    # Runs once per traced bucket (JAX trace time, outside Dynamo): the
+    # served log's proof that the balanced path is in the graph.
+    _balanced_logger().warning(
+        "QSA indexer: rank-balanced token shard active "
+        "(VLLM_TPU_QSA_INDEXER_BALANCED_SHARD, %d tokens, TP %d, %d slots)",
+        tokens,
+        size,
+        len(context),
+    )
+    plan = balanced_token_shard_plan(starts, context, tokens, size)
+    return gathered[balanced_shard_positions(plan, starts, tokens)]
+
+
+@functools.cache
+def _balanced_logger():
+    from vllm_torchtpu.logger import init_logger
+
+    return init_logger(__name__)
+
+
 def _compressed_expansion(logical_pages: int, physical_pages: int, slot: int):
     """StreamIndex ``table_expansion`` for a compressed block table (see
     ``compressed_kernel_pages``): kernel page ``k`` of column ``c`` is
@@ -1999,17 +2197,36 @@ def _pooled_qsa(
         assert rows is None, "the token shard covers the all-token prefill path"
         index, size = token_shard
         width = len(iq) // size
-        base, sub_starts, sub_context = token_shard_step(starts, context, index, width)
+        if (
+            envs.VLLM_TPU_QSA_INDEXER_BALANCED_SHARD
+            and width > len(context)
+            and width * size == len(iq)
+        ):
+            # VLLM_TPU_QSA_INDEXER_BALANCED_SHARD: rank-balanced layout;
+            # caller restores step order via token_shard_unpermute.
+            plan = balanced_token_shard_plan(starts, context, len(iq), size)
+            shard_rows, sub_starts, sub_context = balanced_shard_rows(
+                plan, starts, context, index
+            )
+            sub_iq = iq[shard_rows]
+            sub_lengths = lengths[shard_rows]
+            sub_req = req[shard_rows]
+        else:
+            base, sub_starts, sub_context = token_shard_step(
+                starts, context, index, width
+            )
 
-        def own(x):
-            return jax.lax.dynamic_slice_in_dim(x, base, width)
+            def own(x):
+                return jax.lax.dynamic_slice_in_dim(x, base, width)
+
+            sub_iq, sub_lengths, sub_req = own(iq), own(lengths), own(req)
 
         blocks = select_blocks(
-            own(iq),
+            sub_iq,
             pool,
-            own(lengths),
+            sub_lengths,
             compressed_table,
-            own(req),
+            sub_req,
             sub_starts,
             sub_context,
             ratio=compress_ratio,

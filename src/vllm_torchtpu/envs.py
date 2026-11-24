@@ -166,6 +166,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_INDEXER_MIXED_ONLY: bool = False
     VLLM_TPU_QSA_INDEXER_DENSE_STEP: bool = False
     VLLM_TPU_QSA_INDEXER_TAIL_SKIP: int = 0
+    VLLM_TPU_QSA_INDEXER_BALANCED_SHARD: bool = False
     VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: bool = False
     VLLM_TPU_QWEN4_NGRAM_WINDOW: str = ""
     VLLM_TPU_QWEN4_FUSED_PREP: bool = False
@@ -921,6 +922,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # make every rank read pool page 0.
     "VLLM_TPU_QSA_INDEXER_TAIL_SKIP": env_int(
         "VLLM_TPU_QSA_INDEXER_TAIL_SKIP", 0
+    ),
+    # With VLLM_TPU_QSA_INDEXER_TOKEN_SHARD (main-KV layouts, shards wider than
+    # the request slots): balance the shards instead of giving each rank a
+    # contiguous 1/TP of the rows (round-robin short verify requests from
+    # longest context, exact bitwise selection; default off).
+    "VLLM_TPU_QSA_INDEXER_BALANCED_SHARD": env_bool(
+        "VLLM_TPU_QSA_INDEXER_BALANCED_SHARD", default=False
     ),
     # Qwen4-exp QSA decode/verify attention: run the decode rows (and the
     # decode prefix of mixed steps) on the fused sparse GQA decode kernel
