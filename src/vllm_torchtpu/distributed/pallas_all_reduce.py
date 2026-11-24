@@ -185,23 +185,28 @@ def all_reduce_add_norm(ranks, x: torch.Tensor, res: torch.Tensor, w: torch.Tens
     return op(x, res, w.reshape(1, -1).to(torch.float32), armed.rank)
 
 
-def _norm_selftest(op, rank, n: int, hidden: int, device, rows: int, eps: float) -> dict:
-    """Exact integer partials (the all-reduce is exact) -> normed / new_res
-    against a numpy f64 reference: max abs error in bf16 ulps of the result."""
+def _norm_selftest(op, ar_op, rank, n: int, hidden: int, device, rows: int,
+                   eps: float) -> dict:
+    """normed / new_res of the fused op against the armed all-reduce op's own
+    result (qar rounds its payload, so the sum is not exact) followed by the
+    add + norm in numpy f64: new_res bitwise, normed max error in bf16 ulps."""
     x = _selftest_inputs(n, rows, hidden)
     me = int(rank.reshape(-1)[0].item())
     rng = np.random.default_rng(7)
     res = np.round(rng.standard_normal((rows, hidden)) * 4).astype(np.float32)
     w = (1.0 + rng.standard_normal(hidden) * 0.1).astype(np.float32)
     to_dev = lambda a, dt: torch.from_numpy(a).to(device).to(dt)
-    normed, new_res = op(to_dev(x[me], torch.bfloat16), to_dev(res, torch.bfloat16),
-                         to_dev(w.reshape(1, -1), torch.float32), rank)
-    nr = (x.sum(0) + res).astype(np.float64)  # small integers: exact in bf16
+    xd, rd = to_dev(x[me], torch.bfloat16), to_dev(res, torch.bfloat16)
+    normed, new_res = op(xd, rd, to_dev(w.reshape(1, -1), torch.float32), rank)
+    ar = ar_op(xd, rank)
+    want_res = (ar.to(torch.float32) + rd.to(torch.float32)).to(torch.bfloat16)
+    nr = want_res.to(torch.float32).cpu().numpy().astype(np.float64)
     ref = nr / np.sqrt((nr * nr).mean(-1, keepdims=True) + eps) * w
     got = normed.to(torch.float32).cpu().numpy().astype(np.float64)
     ulp = np.maximum(np.abs(ref), 1e-30) * 2.0**-8
-    return dict(rank=me, res_ok=bool(np.array_equal(new_res.to(torch.float32).cpu().numpy(), nr)),
-                ulps=float(np.max(np.abs(got - ref) / ulp)),
+    err = np.where(ref == 0, np.abs(got) / 2.0**-126, np.abs(got - ref) / ulp)
+    return dict(rank=me, res_ok=bool(torch.equal(new_res.cpu(), want_res.cpu())),
+                ulps=float(np.max(err)),
                 digest=float((got.reshape(-1) * np.arange(1, got.size + 1)).sum()))
 
 
@@ -421,7 +426,7 @@ def arm(hidden: int, device: torch.device) -> bool:
             nop = _make_norm_op(mesh, max_bytes, direct_rows, qar_min_rows, eps)
             seen = []
             for rows in (qar_min_rows, 24):  # the fused kernel and the XLA form
-                seen += _gather(_norm_selftest(nop, rank, n, hidden, device, rows, eps))
+                seen += _gather(_norm_selftest(nop, op, rank, n, hidden, device, rows, eps))
             if (not all(r["res_ok"] for r in seen) or max(r["ulps"] for r in seen) > 2.0
                     or len({r["digest"] for r in seen[:n]}) != 1):
                 raise RuntimeError(f"qar add_norm: self-test failed: {seen}")
