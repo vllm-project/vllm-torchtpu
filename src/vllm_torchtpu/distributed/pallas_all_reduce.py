@@ -110,6 +110,7 @@ def _norm_body(n: int, max_bytes: int, axis: str, direct_rows: int, qar_min_rows
     in one fused kernel call, smaller ones all-reduce as `_body` then add +
     norm in XLA (same rounding points)."""
     ar = _body(n, max_bytes, axis, direct_rows, 0, 0, None)
+    in_kernel = envs.TPU_TP_QAR_FUSE_NORM != "xla"
 
     def body(x, res, w, rank):
         rows, hidden = x.shape
@@ -117,10 +118,12 @@ def _norm_body(n: int, max_bytes: int, axis: str, direct_rows: int, qar_min_rows
             if -rows not in _QAR_TRACED:
                 _QAR_TRACED.add(-rows)
                 logger.warning(
-                    "tp_all_reduce: qar_all_reduce+add_norm lowered for [%d, %d]",
-                    rows, hidden,
+                    "tp_all_reduce: qar_all_reduce+add_norm (%s) lowered for [%d, %d]",
+                    "kernel" if in_kernel else "xla", rows, hidden,
                 )
-            return qar.all_reduce_v2_add_norm(x, res, w[0], eps, rank, qar_tab)
+            if in_kernel:
+                return qar.all_reduce_v2_add_norm(x, res, w[0], eps, rank, qar_tab)
+            return qar.add_norm_reference(qar.all_reduce_v2(x, rank, qar_tab), res, w[0], eps)
         return qar.add_norm_reference(ar(x, rank), res, w[0], eps)
 
     return body
@@ -161,7 +164,7 @@ def request_add_norm(eps: float) -> bool:
     all-reduce un-reduced and call `all_reduce_add_norm` (arm() then builds
     the op for eps; if arming fails the call returns None and the model
     falls back to all-reduce + norm)."""
-    if not envs.TPU_TP_QAR_FUSE_NORM or envs.TPU_TP_QAR_MIN_TOKENS <= 0:
+    if envs.TPU_TP_QAR_FUSE_NORM in ("", "0") or envs.TPU_TP_QAR_MIN_TOKENS <= 0:
         return False
     _NORM_EPS.add(float(eps))
     return True
@@ -422,9 +425,9 @@ def arm(hidden: int, device: torch.device) -> bool:
                 raise RuntimeError(f"qar add_norm: self-test failed: {seen}")
             _NORM_OPS[eps] = nop
             logger.warning(
-                "tp_all_reduce: TPU_TP_QAR_FUSE_NORM=1: all-reduce + residual add + RMSNorm"
+                "tp_all_reduce: TPU_TP_QAR_FUSE_NORM=%s: all-reduce + residual add + RMSNorm"
                 " fused (eps %g); self-test passed (max %.3f bf16 ulp)",
-                eps, max(r["ulps"] for r in seen),
+                envs.TPU_TP_QAR_FUSE_NORM, eps, max(r["ulps"] for r in seen),
             )
     qdq_min_rows = _qdq_min_rows()
     if qdq_min_rows and qar_min_rows <= 0:

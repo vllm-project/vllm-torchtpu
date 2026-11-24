@@ -89,7 +89,7 @@ if TYPE_CHECKING:
     TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS: int = 0
     TPU_TP_AR_QDQ_ROWS: int = 0
     TPU_TP_QAR_MIN_TOKENS: int = 0
-    TPU_TP_QAR_FUSE_NORM: bool = False
+    TPU_TP_QAR_FUSE_NORM: str = "0"
     TPU_TP_AR_QDQ_MIN_TOKENS: int = 0
     TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS: int = 0
     TPU_MOE_TC_COMBINE: bool = False
@@ -881,8 +881,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # RMSNorm in the qar kernel's last stage, as each row half lands, instead
     # of a separate XLA pass over the all-reduce output. Smaller all-reduces
     # do the same add + norm in XLA inside the op. Same rounding points as
-    # fused_add_rms_norm; the variance sums in another order. Default off.
-    "TPU_TP_QAR_FUSE_NORM": lambda: os.environ.get("TPU_TP_QAR_FUSE_NORM", "0") == "1",
+    # fused_add_rms_norm; the variance sums in another order. "xla": the qar
+    # sizes run the unfused kernel and the add + norm in XLA inside the same
+    # op (the norm as XLA fuses it from JAX, not from the torch graph).
+    # "0" (default) = off, "1" = in-kernel epilogue.
+    "TPU_TP_QAR_FUSE_NORM": lambda: os.environ.get("TPU_TP_QAR_FUSE_NORM", "0"),
     "TPU_TP_AR_QDQ_MIN_TOKENS": env_int("TPU_TP_AR_QDQ_MIN_TOKENS", 0),
     # Pallas TP all-reduces of at most this many rows (a multiple of 8) run
     # the one-shot kernel: each rank pushes its whole activation to every
