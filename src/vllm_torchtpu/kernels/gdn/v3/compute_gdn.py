@@ -13,6 +13,9 @@
 # limitations under the License.
 """Chunked and recurrent GDN compute."""
 
+from collections.abc import Callable, Sequence
+from typing import NamedTuple, overload
+
 import jax
 import jax.numpy as jnp
 
@@ -374,6 +377,244 @@ def recurrent_gdn_per_seq(
     return jnp.stack(out_list, axis=0), jnp.stack(state_list, axis=0)
 
 
+class _RecurrentStep(NamedTuple):
+    """Precomputed per-token inputs for one recurrent GDN step."""
+
+    k: jax.Array
+    kq: jax.Array
+    qk_dot: jax.Array
+    v: jax.Array
+    beta: jax.Array
+    gating: jax.Array
+
+
+def _make_in_memory_state_io(
+    state_prev: jax.Array,
+    cfg: config.GDNConfig,
+) -> tuple[
+    Callable[[int, int], jax.Array],
+    Callable[[int, int, int, jax.Array], None],
+    Callable[[], jax.Array],
+]:
+    """Adapts an in-memory `state_prev` tensor to per-head streaming callbacks."""
+    ckpts: list[list[list[jax.Array]]] = [
+        [[] for _ in range(cfg.window_size)] for _ in range(cfg.seq_tile_size)
+    ]
+
+    def load_head(s: int, v: int) -> jax.Array:
+        return state_prev[s, v]
+
+    def store_ckpt(s: int, v: int, w_idx: int, state_j: jax.Array) -> None:
+        del v
+        ckpts[s][w_idx].append(state_j)
+
+    def collect_states() -> jax.Array:
+        return jnp.stack(
+            [
+                jnp.stack(
+                    [jnp.stack(ckpts[s][w], axis=0) for w in range(cfg.window_size)],
+                    axis=0,
+                )
+                for s in range(cfg.seq_tile_size)
+            ],
+            axis=0,
+        )
+
+    return load_head, store_ckpt, collect_states
+
+
+def _prepare_recurrent_steps(
+    real_sizes: jax.Array,
+    q_compact: jax.Array,
+    k_compact: jax.Array,
+    v_compact: jax.Array,
+    b_compact: jax.Array,
+    a_compact: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    cfg: config.GDNConfig,
+) -> list[_RecurrentStep]:
+    """Precomputes masked, normalized per-token inputs for recurrent GDN."""
+    mask_dtype = get_mask_dtype(cfg.dtypes.compute)
+    iota = jax.lax.broadcasted_iota(
+        mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1, 1), 2
+    )
+    mask = iota < real_sizes.reshape(-1, 1, 1, 1, 1).astype(mask_dtype)
+
+    a_log = a_log.reshape(1, 1, 1, -1).astype(cfg.dtypes.compute)
+    dt_bias = dt_bias.reshape(1, 1, 1, -1).astype(cfg.dtypes.compute)
+    q_scale = cfg.kq_head_dim**-0.5
+
+    steps: list[_RecurrentStep] = []
+    for c_idx in range(cfg.chunk_size):
+        mask_c = mask[:, :, c_idx]
+        q_c = jnp.where(mask_c, q_compact[:, :, c_idx].astype(cfg.dtypes.compute), 0)
+        k_c = jnp.where(mask_c, k_compact[:, :, c_idx].astype(cfg.dtypes.compute), 0)
+        v_c = jnp.where(mask_c, v_compact[:, :, c_idx].astype(cfg.dtypes.compute), 0)
+        q_c = l2_norm(q_c) * q_scale
+        k_c = l2_norm(k_c)
+
+        b_c = b_compact[:, :, c_idx].astype(cfg.dtypes.compute)
+        a_c = a_compact[:, :, c_idx].astype(cfg.dtypes.compute)
+        beta_c = jnp.where(mask_c, jax.nn.sigmoid(b_c), 0)
+        # Masked gating_c evaluates to exp(0) = 1 (no decay on invalid tokens).
+        gating_c = jnp.where(
+            mask_c, -jnp.exp(a_log) * jax.nn.softplus(a_c + dt_bias), 0
+        )
+        gating_c = jnp.exp(gating_c)
+        beta_curr = fused_transpose_broadcast(beta_c, src_dim=3, dst_dim=1)[
+            :, : cfg.num_v_heads
+        ]
+        gating_curr = fused_transpose_broadcast(gating_c, src_dim=3, dst_dim=1)[
+            :, : cfg.num_v_heads
+        ]
+        # Concatenate [k, q] along axis=2 so each token step issues one MXU dot
+        # instead of two dependent contractions against the recurrent state.
+        kq_c = jnp.concat([k_c, q_c], axis=2)
+        qk_dot_c = jnp.sum(q_c * k_c, axis=-1, keepdims=True, dtype=jnp.float32)
+        steps.append(
+            _RecurrentStep(
+                k=k_c,
+                kq=kq_c,
+                qk_dot=qk_dot_c,
+                v=v_c,
+                beta=beta_curr,
+                gating=gating_curr,
+            )
+        )
+    return steps
+
+
+def _run_single_token_recurrent(
+    step: _RecurrentStep,
+    load_head: Callable[[int, int], jax.Array],
+    store_ckpt: Callable[[int, int, int, jax.Array], None],
+    cfg: config.GDNConfig,
+    sub_block_heads: int,
+) -> jax.Array:
+    """Streams single-token decode `sub_block_heads` value heads at a time.
+
+    Bounding live head state to `sub_block_heads` (default 2) keeps vector
+    register usage O(sub_block_heads) instead of O(num_v_heads), preventing
+    register spills when packed state formats unpack heads on the fly.
+    """
+    dot_dims = (((2,), (1,)), ((0,), (0,)))
+    seq_outs: list[jax.Array] = []
+    for s in range(cfg.seq_tile_size):
+        k_t_per_kq = [
+            fused_transpose_broadcast(
+                step.k[s : s + 1, kq_idx : kq_idx + 1], src_dim=3, dst_dim=2
+            )[0, 0]
+            for kq_idx in range(cfg.num_kq_heads)
+        ]
+        head_outs: list[jax.Array] = []
+        for sub0 in range(0, cfg.num_v_heads, sub_block_heads):
+            sub_blk = min(sub_block_heads, cfg.num_v_heads - sub0)
+            state_upd_list = [
+                load_head(s, sub0 + j) * step.gating[s, sub0 + j]
+                for j in range(sub_blk)
+            ]
+            kq_sub = jnp.stack(
+                [step.kq[s, (sub0 + j) // cfg.v_per_kq_head] for j in range(sub_blk)],
+                axis=0,
+            )
+            kq_proj = jax.lax.dot_general(
+                kq_sub,
+                jnp.stack(state_upd_list, axis=0),
+                dimension_numbers=dot_dims,
+                preferred_element_type=jnp.float32,
+            ).astype(cfg.dtypes.compute)
+
+            for j in range(sub_blk):
+                v = sub0 + j
+                kq_idx = v // cfg.v_per_kq_head
+                v_updated_j = kq_proj[j, :1, :]
+                out_decayed_j = kq_proj[j, 1:, :]
+                v_new_j = step.beta[s, v] * (step.v[s, v] - v_updated_j)
+                out_j = (
+                    out_decayed_j.astype(jnp.float32)
+                    + step.qk_dot[s, kq_idx] * v_new_j.astype(jnp.float32)
+                ).astype(cfg.dtypes.compute)
+                head_outs.append(out_j)
+                state_j = state_upd_list[j] + k_t_per_kq[kq_idx] * v_new_j
+                store_ckpt(s, v, 0, state_j)
+
+        seq_outs.append(jnp.concatenate(head_outs, axis=0)[jnp.newaxis])
+    return jnp.stack(seq_outs, axis=0)
+
+
+def _run_multi_token_recurrent(
+    steps: Sequence[_RecurrentStep],
+    state_prev: jax.Array | None,
+    load_head: Callable[[int, int], jax.Array],
+    store_ckpt: Callable[[int, int, int, jax.Array], None],
+    cfg: config.GDNConfig,
+) -> jax.Array:
+    """Runs multi-token recurrent steps token-outer across all value heads.
+
+    Running tokens on the outer loop lets all `(seq, head)` contractions
+    execute independently within each token step, hiding MXU latency that
+    otherwise stalls head-outer streaming across consecutive tokens, while
+    still loading and storing through the per-head callbacks so packed state
+    formats can plug in without changing this loop.
+
+    Args:
+        steps: Precomputed per-token recurrent inputs.
+        state_prev: Optional prior state `[seq, num_v_heads, kq_dim, v_dim]`.
+        load_head: Per-head loader `(s, v) -> [kq_dim, v_dim]` when
+            `state_prev` is `None`.
+        store_ckpt: Per-head checkpoint writer `(s, v, w_idx, state)` called in
+            ascending head order per `(s, w_idx)`.
+        cfg: GDN kernel configuration.
+
+    Returns:
+        Stacked outputs `[seq, chunk_size, num_v_heads, v_head_dim]`.
+    """
+    if state_prev is not None:
+        state = state_prev
+    else:
+        state = jnp.stack(
+            [
+                jnp.stack([load_head(s, v) for v in range(cfg.num_v_heads)], axis=0)
+                for s in range(cfg.seq_tile_size)
+            ],
+            axis=0,
+        )
+    batch_dot_dims = (((3,), (2,)), ((0, 1), (0, 1)))
+    ckpt_base = cfg.chunk_size - cfg.window_size
+    out_list: list[jax.Array] = []
+    for c_idx, step in enumerate(steps):
+        state_updated = state * step.gating
+        kq_merged = jnp.repeat(step.kq, cfg.v_per_kq_head, axis=1)
+        kq_proj = jax.lax.dot_general(
+            kq_merged,
+            state_updated,
+            dimension_numbers=batch_dot_dims,
+            preferred_element_type=jnp.float32,
+        ).astype(cfg.dtypes.compute)
+        v_updated = kq_proj[:, :, :1, :]
+        out_decayed = kq_proj[:, :, 1:, :]
+        v_new = step.beta * (step.v - v_updated)
+        qk_dot = jnp.repeat(step.qk_dot, cfg.v_per_kq_head, axis=1)
+        out = (
+            out_decayed.astype(jnp.float32) + qk_dot * v_new.astype(jnp.float32)
+        ).astype(cfg.dtypes.compute)
+        k_curr_t = jnp.repeat(
+            fused_transpose_broadcast(step.k, src_dim=3, dst_dim=2),
+            cfg.v_per_kq_head,
+            axis=1,
+        )
+        state = state_updated + k_curr_t * v_new
+        out_list.append(out[:, :, 0, :])
+        if c_idx >= ckpt_base:
+            w_idx = c_idx - ckpt_base
+            for s in range(cfg.seq_tile_size):
+                for v in range(cfg.num_v_heads):
+                    store_ckpt(s, v, w_idx, state[s, v])
+    return jnp.stack(out_list, axis=1)
+
+
+@overload
 def recurrent_gdn(
     real_sizes: jax.Array,
     q_compact: jax.Array,
@@ -385,135 +626,125 @@ def recurrent_gdn(
     a_log: jax.Array,
     dt_bias: jax.Array,
     cfg: config.GDNConfig,
-) -> tuple[jax.Array, jax.Array]:
-    """Perform recurrent GDN over input [seq, num_heads, chunk, 1, head_dim].
+    *,
+    load_head_fn: None = None,
+    store_ckpt_head_fn: None = None,
+    sub_block_heads: int = 2,
+) -> tuple[jax.Array, jax.Array]: ...
 
-    The returned state has one checkpoint per window position: [seq,
-    window_size, num_v_heads, kq_head_dim, v_head_dim]. Positions >=
-    real_sizes repeat the last valid state; they are never written back to
-    HBM.
+
+@overload
+def recurrent_gdn(
+    real_sizes: jax.Array,
+    q_compact: jax.Array,
+    k_compact: jax.Array,
+    v_compact: jax.Array,
+    b_compact: jax.Array,
+    a_compact: jax.Array,
+    state_prev: None,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    cfg: config.GDNConfig,
+    *,
+    load_head_fn: Callable[[int, int], jax.Array],
+    store_ckpt_head_fn: Callable[[int, int, int, jax.Array], None],
+    sub_block_heads: int = 2,
+) -> tuple[jax.Array, None]: ...
+
+
+def recurrent_gdn(
+    real_sizes: jax.Array,
+    q_compact: jax.Array,
+    k_compact: jax.Array,
+    v_compact: jax.Array,
+    b_compact: jax.Array,
+    a_compact: jax.Array,
+    state_prev: jax.Array | None,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    cfg: config.GDNConfig,
+    *,
+    load_head_fn: Callable[[int, int], jax.Array] | None = None,
+    store_ckpt_head_fn: Callable[[int, int, int, jax.Array], None] | None = None,
+    sub_block_heads: int = 2,
+) -> tuple[jax.Array, jax.Array | None]:
+    """Performs recurrent GDN, streaming single-token decode in value-head sub-blocks.
+
+    Single-token decode (`chunk_size == 1`) streams `sub_block_heads` value
+    heads at a time in `_run_single_token_recurrent`. Multi-token verify
+    windows (`chunk_size > 1`) run token-outer across all value heads in
+    `_run_multi_token_recurrent`.
+
+    Args:
+        real_sizes: Valid token counts per sequence `[seq]`.
+        q_compact: Query tensor `[seq, num_kq_heads, chunk, 1, kq_head_dim]`.
+        k_compact: Key tensor `[seq, num_kq_heads, chunk, 1, kq_head_dim]`.
+        v_compact: Value tensor `[seq, num_v_heads, chunk, 1, v_head_dim]`.
+        b_compact: Beta-gate pre-activations
+            `[seq, 1, chunk, 1, padded_v_heads]`.
+        a_compact: Decay-gate pre-activations
+            `[seq, 1, chunk, 1, padded_v_heads]`.
+        state_prev: In-memory prior state
+            `[seq, num_v_heads, kq_dim, v_dim]`, or `None` to stream per-head
+            state via `load_head_fn` and `store_ckpt_head_fn`.
+        a_log: Per-head log-decay parameter.
+        dt_bias: Per-head decay bias parameter.
+        cfg: GDN kernel configuration.
+        load_head_fn: Per-head loader `(s, v) -> [kq_dim, v_dim]` when
+            `state_prev` is `None`.
+        store_ckpt_head_fn: Per-head checkpoint writer `(s, v, w_idx, state)`
+            when `state_prev` is `None`.
+        sub_block_heads: Number of value heads kept live in registers at once
+            on single-token decode (`chunk_size == 1`).
+
+    Returns:
+        `(out, states)` when `state_prev` is provided (with `states` shaped
+        `[seq, window_size, num_v_heads, kq_head_dim, v_head_dim]`), or
+        `(out, None)` when streaming via callbacks.
     """
+    if sub_block_heads <= 0:
+        raise ValueError(f"sub_block_heads must be positive; got {sub_block_heads}")
+    if not (1 <= cfg.window_size <= cfg.chunk_size):
+        raise ValueError(
+            "recurrent_gdn requires 1 <= cfg.window_size <= cfg.chunk_size; "
+            f"got window_size={cfg.window_size}, chunk_size={cfg.chunk_size}."
+        )
+    if state_prev is not None:
+        if load_head_fn is not None or store_ckpt_head_fn is not None:
+            raise ValueError(
+                "load_head_fn and store_ckpt_head_fn cannot be combined with "
+                "state_prev."
+            )
+        load_head, store_ckpt, collect_states = _make_in_memory_state_io(
+            state_prev, cfg
+        )
+    else:
+        if load_head_fn is None or store_ckpt_head_fn is None:
+            raise ValueError(
+                "load_head_fn and store_ckpt_head_fn are required when "
+                "state_prev is None."
+            )
+        load_head = load_head_fn
+        store_ckpt = store_ckpt_head_fn
+        collect_states = None
 
-    mask_dtype = get_mask_dtype(cfg.dtypes.compute)
-    iota = jax.lax.broadcasted_iota(
-        mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1, 1), 2
+    steps = _prepare_recurrent_steps(
+        real_sizes,
+        q_compact,
+        k_compact,
+        v_compact,
+        b_compact,
+        a_compact,
+        a_log,
+        dt_bias,
+        cfg,
     )
-    mask = iota < real_sizes.reshape(-1, 1, 1, 1, 1).astype(mask_dtype)
-
-    # [seqs, num_kq_heads, chunk, 1, kq_head_dim]
-    q_compact = jnp.where(mask, q_compact.astype(cfg.dtypes.compute), 0)
-    k_compact = jnp.where(mask, k_compact.astype(cfg.dtypes.compute), 0)
-    # [seqs, num_v_heads, chunk, 1, v_head_dim]
-    v_compact = jnp.where(mask, v_compact.astype(cfg.dtypes.compute), 0)
-
-    b_compact = b_compact.astype(cfg.dtypes.compute)
-    a_compact = a_compact.astype(cfg.dtypes.compute)
-
-    a_log = a_log.reshape(1, 1, 1, 1, -1).astype(cfg.dtypes.compute)
-    dt_bias = dt_bias.reshape(1, 1, 1, 1, -1).astype(cfg.dtypes.compute)
-
-    # [seqs, num_kq_heads, chunk, 1, kq_head_dim]
-    q_compact = l2_norm(q_compact)
-    q_scale = cfg.kq_head_dim**-0.5
-    q_compact *= q_scale
-    k_compact = l2_norm(k_compact)
-    k_compact_t = fused_transpose_broadcast(k_compact, src_dim=4, dst_dim=3)
-
-    beta = jax.nn.sigmoid(b_compact)
-    gating_log = -jnp.exp(a_log) * jax.nn.softplus(a_compact + dt_bias)
-
-    beta = jnp.where(mask, beta, 0)
-    # NOTE: Masked gating_log will evaluate to jnp.exp(0)=1. gating (decay) must
-    # be masked to 1 since it signifies that strength of state from previous row
-    # will be 1 (i.e., no decay) if current row is invalid.
-    gating_log = jnp.where(mask, gating_log, 0)
-    gating_log = jnp.exp(gating_log)
-
-    beta = fused_transpose_broadcast(beta, src_dim=4, dst_dim=1)
-    beta = beta[:, : cfg.num_v_heads]
-    gating_log = fused_transpose_broadcast(gating_log, src_dim=4, dst_dim=1)
-    gating_log = gating_log[:, : cfg.num_v_heads]
-
-    if cfg.chunk_size == 1 and cfg.window_size == 1:
-        # Optimized decode path: fused [k, q] projection against state.
-        # Shapes:
-        #   q_compact:    [B, n_kq, 1, 1, d_k] -> q_curr:      [B, n_v, 1, d_k]
-        #   k_compact:    [B, n_kq, 1, 1, d_k] -> k_curr:      [B, n_v, 1, d_k]
-        #   k_compact_t:  [B, n_kq, 1, d_k, 1] -> k_curr_t:    [B, n_v, d_k, 1]
-        #   v_compact:    [B, n_v, 1, 1, d_v]  -> v_curr:      [B, n_v, 1, d_v]
-        #   beta:         [B, n_v, 1, 1, 1]    -> beta_curr:   [B, n_v, 1, 1]
-        #   gating_log:   [B, n_v, 1, 1, 1]    -> gating_curr: [B, n_v, 1, 1]
-        q_curr = jnp.repeat(q_compact[:, :, 0, 0, :], cfg.v_per_kq_head, axis=1)
-        q_curr = jnp.expand_dims(q_curr, axis=2)
-
-        k_curr = jnp.repeat(k_compact[:, :, 0, 0, :], cfg.v_per_kq_head, axis=1)
-        k_curr = jnp.expand_dims(k_curr, axis=2)
-
-        k_curr_t = jnp.repeat(k_compact_t[:, :, 0, :, 0], cfg.v_per_kq_head, axis=1)
-        k_curr_t = jnp.expand_dims(k_curr_t, axis=3)
-
-        v_curr = jnp.expand_dims(v_compact[:, :, 0, 0, :], axis=2)
-        beta_curr = beta[:, :, 0, 0, 0].reshape(
-            cfg.seq_tile_size, cfg.num_v_heads, 1, 1
+    if cfg.chunk_size == 1:
+        out_arr = _run_single_token_recurrent(
+            steps[0], load_head, store_ckpt, cfg, sub_block_heads
         )
-        gating_curr = gating_log[:, :, 0, 0, 0].reshape(
-            cfg.seq_tile_size, cfg.num_v_heads, 1, 1
+    else:
+        out_arr = _run_multi_token_recurrent(
+            steps, state_prev, load_head, store_ckpt, cfg
         )
-
-        # 1. State decay update
-        state_updated = state_prev * gating_curr
-
-        # 2. Fused [k, q] projection against state
-        b_size, n_v_heads = cfg.seq_tile_size, cfg.num_v_heads
-        kq_merged = jnp.concat([k_curr, q_curr], axis=2)  # [B, n_v, 2, d_k]
-        kq_merged_flat = kq_merged.reshape(-1, 2, cfg.kq_head_dim)
-        state_updated_flat = state_updated.reshape(-1, cfg.kq_head_dim, cfg.v_head_dim)
-
-        kq_proj_flat = jax.lax.dot_general(
-            kq_merged_flat,
-            state_updated_flat,
-            dimension_numbers=(((2,), (1,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
-        ).astype(cfg.dtypes.compute)  # [B * n_v, 2, d_v]
-        kq_proj = kq_proj_flat.reshape(b_size, n_v_heads, 2, cfg.v_head_dim)
-
-        v_updated = kq_proj[:, :, :1, :]
-        out_decayed = kq_proj[:, :, 1:, :]
-
-        # 3. Output difference
-        v_diff = v_curr - v_updated
-        v_new = beta_curr * v_diff
-
-        qk_dot = jnp.sum(q_curr * k_curr, axis=-1, keepdims=True)  # [B, n_v, 1, 1]
-        out = out_decayed + qk_dot * v_new  # [B, n_v, 1, d_v]
-
-        # 4. State rank-1 update
-        state_new = k_curr_t * v_new  # [B, n_v, d_k, d_v]
-        new_recurrent_state = state_updated + state_new
-
-        # Match Pallas output shape [B, 1, n_v, d_v]:
-        out = out.swapaxes(1, 2)
-        # Output single checkpoint per sequence, matching [seq, window_size, ...]
-        return out, jnp.expand_dims(new_recurrent_state, axis=1)
-
-    out_list = []
-    new_state_list = []
-
-    for idx in range(cfg.seq_tile_size):
-        out, state = recurrent_gdn_per_seq(
-            q_compact[idx],
-            k_compact[idx],
-            k_compact_t[idx],
-            v_compact[idx],
-            gating_log[idx],
-            beta[idx],
-            state_prev[idx],
-            cfg,
-        )
-        out_list.append(out)
-        new_state_list.append(state)
-
-    out = jnp.stack(out_list, axis=0)
-    new_recurrent_state = jnp.stack(new_state_list, axis=0)
-
-    return out, new_recurrent_state
+    return out_arr, (None if collect_states is None else collect_states())
