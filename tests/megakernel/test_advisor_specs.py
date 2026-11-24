@@ -1410,8 +1410,10 @@ def test_row_tiles_follow_jax_sublane_tiling() -> None:
         )
         for fp4_label in ("mxfp4", "nvfp4", "fp4"):
             assert spec.matmul_row_tile(fp4_label) == expected_fp4_tile
-        for accepted_dtype in constants.DTYPE_BYTES:
+        for accepted_dtype in set(constants.DTYPE_BYTES) - constants.KV_ONLY_DTYPES:
             assert accepted_dtype in spec.matmul_row_tile_by_dtype
+        for kv_only_dtype in constants.KV_ONLY_DTYPES:
+            assert kv_only_dtype not in spec.matmul_row_tile_by_dtype
 
 
 def test_chip_fields_without_jax_source_are_enumerated() -> None:

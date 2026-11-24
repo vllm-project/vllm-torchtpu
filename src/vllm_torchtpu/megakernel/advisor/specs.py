@@ -23,13 +23,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, TypedDict, get_args
 
 from ..core import errors
-from . import chips, constants
+from . import chips, constants, models
 from .constants import (
     COLLECTIVE_PATH_XLA,
     EFFICIENCY_BRACKETS,
     GAIN_BASIS_ESTIMATE,
     MEASUREMENTS_SCHEMA,
+    TURBOQUANT_DEFAULT_PAGE_SIZE,
     VALID_COLLECTIVE_PATHS,
+    ExecutionMode,
     GainBasis,
 )
 from .models import (
@@ -43,6 +45,10 @@ if TYPE_CHECKING:
     from .chips import ChipSpec
 
 DTYPE_BYTES = constants.DTYPE_BYTES
+HostTableBreakSpec = models.HostTableBreakSpec
+HyperConnectionSpec = models.HyperConnectionSpec
+SparseAttnSpec = models.SparseAttnSpec
+SparseCacheOwner = models.SparseCacheOwner
 
 FusionScope = Literal["per_op", "single_layer", "layer_group", "whole_step"]
 Phase = Literal["decode", "verify", "prefill", "mixed"]
@@ -544,6 +550,9 @@ class WorkloadSpec:
     per_op_step_us: float | None = None
     step_coverage: float | None = None
     batch_explicit: bool = False
+    execution: ExecutionMode = "full"
+    host_table_hbm_overrides: tuple[tuple[str, bool], ...] = ()
+    kv_page_size: int = TURBOQUANT_DEFAULT_PAGE_SIZE
 
     def __post_init__(self) -> None:
         """Enforce non-negative finite scalar lengths and overhead inputs."""
@@ -593,6 +602,15 @@ class WorkloadSpec:
                 "WorkloadSpec.step_coverage must be in (0, 1], "
                 f"got {self.step_coverage!r}"
             )
+            raise errors.MegakernelConfigError(msg)
+        if self.execution not in ("full", "ced"):
+            msg = (
+                "WorkloadSpec.execution must be 'full' or 'ced', "
+                f"got {self.execution!r}"
+            )
+            raise errors.MegakernelConfigError(msg)
+        if isinstance(self.kv_page_size, bool) or self.kv_page_size < 1:
+            msg = f"WorkloadSpec.kv_page_size must be >= 1, got {self.kv_page_size!r}"
             raise errors.MegakernelConfigError(msg)
 
 

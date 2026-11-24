@@ -53,9 +53,24 @@ DTYPE_BYTES: Mapping[str, float] = {
     "fp8_e5m2": 1.0,
     "int8": 1.0,
     "int4": 0.5,
+    "int4_per_token_head": 0.5,
+    "turboquant_4bit_nc": 0.5,
     "nvfp4": 0.5625,
     "mxfp4": 0.53125,
     "fp4": 0.5625,
+}
+
+KV_ONLY_DTYPES: frozenset[str] = frozenset(
+    {"int4_per_token_head", "turboquant_4bit_nc"}
+)
+
+KV_DTYPE_ALIASES: Mapping[str, str] = {
+    "auto": "bf16",
+    "bfloat16": "bf16",
+    "float16": "fp16",
+    "float32": "fp32",
+    "fp8_e4m3": "fp8",
+    "fp8_e4m3fn": "fp8",
 }
 
 EFFICIENCY_BRACKETS: Mapping[str, tuple[float, float]] = {
@@ -277,6 +292,7 @@ MULTIMODAL_KEYS: tuple[str, ...] = ("vision_config",)
 VALID_LAYER_TOKENS: frozenset[str] = frozenset(
     {
         "attention",
+        "csa",
         "dense_mlp",
         "dsa",
         "dsa_attention",
@@ -284,6 +300,7 @@ VALID_LAYER_TOKENS: frozenset[str] = frozenset(
         "gated_deltanet",
         "gdn",
         "gqa",
+        "indexed_attention",
         "kda",
         "kda_attention",
         "linear_attention",
@@ -291,20 +308,42 @@ VALID_LAYER_TOKENS: frozenset[str] = frozenset(
         "mla_attention",
         "mlp",
         "moe",
+        "msa",
+        "qsa",
     }
 )
 
 KDA_MODEL_TYPES: frozenset[str] = frozenset({"kimi_linear"})
 
 SUPPORTED_ONCHIP_FAMILIES: frozenset[str] = frozenset(
-    {"gqa", "mla", "dsa", "gdn", "kda", "dense_mlp", "moe"}
+    {
+        "gqa",
+        "mla",
+        "dsa",
+        "qsa",
+        "csa",
+        "msa",
+        "gdn",
+        "kda",
+        "dense_mlp",
+        "moe",
+        "hyper_connection",
+        "mhc",
+    }
 )
 # Layer families that megakernel/core ships a module package for.
 CORE_MODULE_FAMILIES: frozenset[str] = frozenset({"gqa", "gdn", "moe"})
 # Weight dtypes the megakernel/core kernels read.
 CORE_SUPPORTED_DTYPES: frozenset[str] = frozenset({"fp8", "bf16"})
 # Entries of `ModelProfile.layer_families` that describe stack structure.
-STRUCTURAL_LAYER_TAGS: frozenset[str] = frozenset({"dense_prefix_moe"})
+STRUCTURAL_LAYER_TAGS: frozenset[str] = frozenset({"dense_prefix_moe", "fusion_break"})
+
+SparseAttnKind = Literal["qsa", "csa", "msa"]
+SparseCacheReplication = Literal["kv_head_group", "per_rank", "tp_sharded"]
+HyperConnectionKind = Literal["lowrank", "mhc"]
+HostTableShardAxis = Literal["tp", "dp_local", "tp_dp_local"]
+DcpSpan = Literal["kv_heads", "tp_group"]
+ExecutionMode = Literal["full", "ced"]
 
 
 @dataclass(frozen=True)
@@ -561,3 +600,23 @@ DCP_LSE_MERGE_VEC_OPS: float = 6.0
 # and gathered sparse-KV buffer write+read (2x) across standalone kernel boundaries.
 PER_OP_INDEXER_SCORE_ROUNDTRIP_BYTES: float = 2.0 * FP32_BYTES
 PER_OP_DSA_KV_ROUNDTRIP_FACTOR: float = 2.0
+
+# 128-point Sylvester Hadamard butterfly ops (7 stages * 128 elements = 896 ops/head).
+HADAMARD_128_VEC_OPS_PER_HEAD: int = 896
+# 1 folded FP32 scale word per 128-token index page -> 4 B/token overhead.
+INT4_INDEX_SCALE_OVERHEAD_BYTES: int = 4
+# 8 FP32 scale rows * 128 lanes / 128 tokens per page -> 32 B/stored token.
+INT4_SCALE_PAGE_BYTES_PER_TOK: int = 32
+# Packed 4-bit TurboQuant page layout parameters (6-byte header, 128-byte words).
+TURBOQUANT_HEADER_BYTES: int = 6
+TURBOQUANT_WORD_BYTES: int = 128
+TURBOQUANT_SUBLANE_WORDS: int = 8
+TURBOQUANT_DEFAULT_PAGE_SIZE: int = 64
+# Sinkhorn row/column normalization vector ops per S*S entry per iteration.
+SINKHORN_VEC_OPS_PER_ENTRY_ITER: int = 6
+HC_SUBLAYERS_PER_LAYER: int = 2
+MHC_DYNAMIC_PROJ_TERMS: int = 2
+MXFP4_BLOCK_K: int = 32
+PLE_PADDED_ROWS_PER_SHARD: int = 2_500_012
+PLE_SHARD_DIVISOR: int = 16
+ENGRAM_SCALE_BLOCK_SIZE: int = 32

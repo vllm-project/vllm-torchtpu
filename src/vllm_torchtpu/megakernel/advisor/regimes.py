@@ -403,7 +403,15 @@ def _with_preset_prefill(
     moved_list: list[tuple[str, WorkloadSpec]] = []
     for lbl, workload in workloads:
         if workload.phase == "prefill":
-            moved_list.append((lbl, _with_layout(workload, pre)))
+            moved_list.append(
+                (
+                    lbl,
+                    replace(
+                        _with_layout(workload, pre),
+                        batch=_round_dp_batch(workload.batch, pre.dp),
+                    ),
+                )
+            )
         elif sat is not None and lbl.startswith("Decode Saturated"):
             moved_list.append(
                 (
@@ -963,7 +971,7 @@ def _sweep_layer_group_search(
         search_wl = replace(
             base_workload,
             phase="prefill",
-            batch=1,
+            batch=_round_dp_batch(1, prefill_rec.dp),
             isl=first_window,
             osl=0,
             context=first_window,
@@ -979,7 +987,7 @@ def _sweep_layer_group_search(
         search_wl = replace(
             base_workload,
             phase="decode",
-            batch=max(1, base_workload.batch),
+            batch=_round_dp_batch(max(1, base_workload.batch), decode_rec.dp),
             tp=decode_rec.tp,
             ep=decode_rec.ep,
             dp=decode_rec.dp,

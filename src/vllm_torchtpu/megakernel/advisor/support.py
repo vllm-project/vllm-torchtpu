@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from .constants import (
@@ -44,6 +45,7 @@ from .specs import (
     SupportStatus,
     WorkloadSpec,
 )
+from .vmem import active_fusion_break_layers
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -280,6 +282,35 @@ def classify_model_support_tier(
     return ("priced_only", notes)
 
 
+def _workload_with_declared_overrides(
+    workload: WorkloadSpec, declaration: Mapping[str, object] | None
+) -> WorkloadSpec:
+    """Merge declared `host_table_hbm_overrides` when workload carries none."""
+    if workload.host_table_hbm_overrides or declaration is None:
+        return workload
+    match declaration.get("host_table_hbm_overrides"):
+        case dict() as ov_map:
+            return replace(
+                workload,
+                host_table_hbm_overrides=tuple(
+                    (str(k), bool(v)) for k, v in ov_map.items()
+                ),
+            )
+        case list() | tuple() as ov_seq:
+            pairs_list: list[tuple[str, bool]] = []
+            for item in ov_seq:
+                match item:
+                    case [tbl_name, tbl_hbm]:
+                        pairs_list.append((str(tbl_name), bool(tbl_hbm)))
+                    case _:
+                        continue
+            if pairs_list:
+                return replace(workload, host_table_hbm_overrides=tuple(pairs_list))
+        case _:
+            pass
+    return workload
+
+
 def evaluate_support(
     scope: FusionScope,
     profile: ModelProfile,
@@ -323,7 +354,15 @@ def evaluate_support(
         or (declaration is None and not profile.is_periodic)
         or profile.ar_slots_per_layer > CORE_LIMITS.max_ar_slots_per_layer
     )
+    eff_workload = _workload_with_declared_overrides(workload, declaration)
+    has_active_break = scope == "whole_step" and bool(
+        active_fusion_break_layers(profile, eff_workload)
+    )
     checks = (
+        (
+            has_active_break,
+            "fusion_break",
+        ),
         (
             scope in ("single_layer", "layer_group"),
             "scope_without_core_counterpart",

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import math
+from itertools import pairwise
 from math import ceil, gcd, log2
 from typing import TYPE_CHECKING
 
@@ -31,13 +32,15 @@ from .constants import (
     EXPERT_SLOT_DEFAULT_BYTES,
     FP32_BYTES,
     GROUPED_MOE_MODES,
+    KV_DTYPE_ALIASES,
+    KV_ONLY_DTYPES,
     MIN_VMEM_MIB,
     VALID_DMA_BUFFERS,
     WIDE_DENSE_RING_SLOTS,
     WIDE_EXPERT_RING_SLOTS,
     WORD_ALIGN_BYTES,
 )
-from .models import dsa_query_gather_dim, has_dsa_profile
+from .models import HostTableBreakSpec, dsa_query_gather_dim, has_dsa_profile
 from .specs import FusionScope, RingPlan, WorkloadSpec, default_double_buffer_ring_plan
 
 if TYPE_CHECKING:
@@ -131,6 +134,75 @@ def compute_all_reduce_transfer_cost(
     return transfer_time_s, base_latency_s, hop_count, nominal_volume_bytes
 
 
+def wide_dcp_kv_heads_per_rank(
+    num_kv_heads: int, tp: int, dcp: int, dcp_span: str = "kv_heads"
+) -> int:
+    """Return local KV head groups stored per rank under standard or Wide-DCP."""
+    if num_kv_heads <= 0:
+        return 0
+    eff_tp = max(1, tp)
+    eff_dcp = max(1, dcp)
+    if dcp_span == "tp_group":
+        return min(num_kv_heads, max(1, ceil(num_kv_heads * eff_dcp / eff_tp)))
+    kv_split_tp = min(eff_dcp, eff_tp)
+    return max(1, ceil(num_kv_heads / max(1, eff_tp // kv_split_tp)))
+
+
+def effective_host_table_hbm_resident(
+    table: HostTableBreakSpec, workload: WorkloadSpec
+) -> bool:
+    """Return whether `table` is HBM-resident after applying workload overrides."""
+    for name, is_hbm in workload.host_table_hbm_overrides:
+        if name == table.name:
+            return bool(is_hbm)
+    return table.hbm_resident
+
+
+def active_fusion_break_layers(
+    profile: ModelProfile, workload: WorkloadSpec
+) -> tuple[int, ...]:
+    """Return sorted 0-based layer indices that force fusion-break boundaries."""
+    breaks: set[int] = set()
+    for table in profile.host_tables:
+        if not effective_host_table_hbm_resident(table, workload):
+            for lyr in table.layers:
+                if 0 < lyr < profile.num_layers:
+                    breaks.add(lyr)
+    if (
+        workload.execution == "ced"
+        and profile.ced_boundary > 0
+        and workload.phase in ("prefill", "mixed")
+        and 0 < profile.ced_boundary < profile.num_layers
+    ):
+        breaks.add(profile.ced_boundary)
+    return tuple(sorted(breaks))
+
+
+def fusion_break_layer_groups(
+    num_layers: int, break_layers: tuple[int, ...]
+) -> tuple[int, ...]:
+    """Partition `num_layers` at sorted `break_layers` into contiguous group sizes."""
+    if not break_layers or num_layers <= 1:
+        return ()
+    valid_cuts = sorted({lyr for lyr in break_layers if 0 < lyr < num_layers})
+    if not valid_cuts:
+        return ()
+    bounds = (0, *valid_cuts, num_layers)
+    return tuple(hi - lo for lo, hi in pairwise(bounds))
+
+
+def _dcp_divides_mesh(profile: ModelProfile, eff_tp: int, dcp: int, pcp: int) -> bool:
+    """Return whether `dcp` satisfies the profile's `dcp_span` divisibility rule."""
+    if profile.dcp_span == "tp_group":
+        if eff_tp % dcp != 0:
+            return False
+        if profile.num_kv_heads > 0:
+            replicas = max(1, eff_tp // profile.num_kv_heads)
+            return replicas % dcp == 0 or dcp % replicas == 0
+        return True
+    return (eff_tp * pcp) % dcp == 0
+
+
 def compute_per_token_vmem_bytes(
     profile: ModelProfile, workload: WorkloadSpec
 ) -> dict[str, int]:
@@ -151,11 +223,22 @@ def compute_per_token_vmem_bytes(
     )
 
     # 1. On-chip residual (F32 4*streams*H), norm (BF16 2*H), staging (6*H)
-    streams = max(1, profile.residual_streams)
+    hc = profile.hyper_connection
+    streams = max(1, hc.num_streams if hc is not None else profile.residual_streams)
+    hc_scratch_bytes = (
+        (
+            2 * hc.lowrank_dim * BF16_BYTES
+            if hc.kind == "lowrank"
+            else 4 * streams * streams * FP32_BYTES
+        )
+        if hc is not None
+        else 0
+    )
     residual_buffer_bytes = (
         (4 * streams + 2) * hidden
         + (6 * hidden if tp > 1 else 0)
         + shared_indexer_spine_bytes
+        + hc_scratch_bytes
     )
 
     # 2. Attention per_op per-token scratch (sharded across TP ranks)
@@ -165,10 +248,24 @@ def compute_per_token_vmem_bytes(
             profile.q_lora_rank + profile.kv_lora_rank + profile.qk_rope_head_dim
         ) + 6 * (nh_local * profile.head_dim)
     else:
-        nkv_local = max(1, ceil(profile.num_kv_heads / max(1, tp // kv_split)))
+        nkv_local = (
+            wide_dcp_kv_heads_per_rank(profile.num_kv_heads, tp, dcp, "tp_group")
+            if profile.dcp_span == "tp_group"
+            else max(1, ceil(profile.num_kv_heads / max(1, tp // kv_split)))
+        )
         attn_scratch_bytes = 2 * (2 * nh_local + 2 * nkv_local) * profile.head_dim + (
             4 * nh_local * profile.head_dim
         )
+    if profile.o_lora_rank > 0:
+        attn_scratch_bytes += profile.o_groups * profile.o_lora_rank * BF16_BYTES
+    if profile.sparse_attn is not None:
+        sp = profile.sparse_attn
+        attn_scratch_bytes += sp.index_heads * sp.index_dim * BF16_BYTES + (
+            WORD_ALIGN_BYTES * ceil((sp.window_tokens + sp.select_tokens) / kv_split)
+        )
+    kv_norm = KV_DTYPE_ALIASES.get(profile.kv_dtype.lower(), profile.kv_dtype.lower())
+    if kv_norm in KV_ONLY_DTYPES:
+        attn_scratch_bytes += 2 * profile.head_dim * FP32_BYTES
     if has_dsa:
         query_gather_dim = dsa_query_gather_dim(profile)
         attn_scratch_bytes += (
@@ -351,16 +448,24 @@ def validate_advise_inputs(
     tp, pp, dp, ep = workload.tp, workload.pp, workload.dp, workload.ep
     kv_split, dcp, pcp = workload.kv_split, workload.dcp, workload.pcp
     eff_tp = max(tp, dcp) if tp == 1 else tp
-    dtypes = (
-        profile.weight_dtype,
-        profile.expert_dtype,
-        profile.kv_dtype,
-        profile.state_dtype,
+    kv_dt = KV_DTYPE_ALIASES.get(profile.kv_dtype.lower(), profile.kv_dtype.lower())
+    non_kv_dtypes = tuple(
+        dt.lower()
+        for dt in (
+            profile.weight_dtype,
+            profile.expert_dtype or profile.weight_dtype,
+            profile.state_dtype,
+            *((profile.act_dtype,) if profile.act_dtype else ()),
+            *((profile.expert_act_dtype,) if profile.expert_act_dtype else ()),
+        )
+    )
+    dtypes_ok = kv_dt in DTYPE_BYTES and all(
+        dt in DTYPE_BYTES and dt not in KV_ONLY_DTYPES for dt in non_kv_dtypes
     )
     parallel_ok = (
         (eff_tp * dp * pcp) % ep == 0
         and eff_tp % kv_split == 0
-        and eff_tp % dcp == 0
+        and _dcp_divides_mesh(profile, eff_tp, dcp, pcp)
         and pp <= profile.num_layers
     )
     expert_ok = (
@@ -387,13 +492,7 @@ def validate_advise_inputs(
             )
         )
     )
-    if not (
-        parallel_ok
-        and expert_ok
-        and tiles_ok
-        and layers_ok
-        and all(d.lower() in DTYPE_BYTES for d in dtypes)
-    ):
+    if not (parallel_ok and expert_ok and tiles_ok and layers_ok and dtypes_ok):
         msg = "Invalid parallelism, layers, or dtype"
         raise errors.MegakernelConfigError(msg)
 
@@ -464,7 +563,7 @@ def _mesh_divisibility_reasons(
             and eff_tp % profile.linear_key_heads != 0
         ):
             reasons.append("linear_k_heads_not_divisible_by_tp")
-    if eff_tp % dcp != 0:
+    if not _dcp_divides_mesh(profile, eff_tp, dcp, pcp):
         reasons.append("dcp_not_dividing_tp")
     if profile.num_experts > 0 and (
         profile.num_experts % ep != 0 or not (1 <= profile.top_k <= profile.num_experts)
@@ -642,10 +741,12 @@ def _scope_vmem_and_ops(
             )
     elif scope == "whole_step" and no_whole_step:
         feasible = False
-        reason = (
-            plan_error
-            or "Bounded by layer groups, single layers, or unmodeled layer family"
-        )
+        if plan_error:
+            reason = plan_error
+        elif scope_context.has_fusion_break:
+            reason = "Fusion break at host-table or CED boundary"
+        else:
+            reason = "Bounded by layer groups, single layers, or unmodeled layer family"
 
     if scope == "per_op":
         static_vmem_bytes = max(1 << 20, single_layer_dense_staging)
@@ -699,3 +800,6 @@ def _scope_vmem_and_ops(
         res[7],
         res[8],
     )
+
+
+compute_scope_vmem_and_ops = _scope_vmem_and_ops
