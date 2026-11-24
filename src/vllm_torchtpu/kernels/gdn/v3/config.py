@@ -21,6 +21,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
+
 
 # Row granule of a 2D bf16 qkv tile (see `GDNConfig.qkv_2d`): one packed bf16
 # sublane tile, so every DMA offset and size is aligned to it.
@@ -325,6 +327,11 @@ class GDNConfig:
                 if head_groups * b * b <= 256:
                     return b
             return 2
+        if envs.VLLM_TPU_GDN_DIRECT_SOLVE:
+            # Direct RHS solve (`solve_triangular_rhs`) updates the whole [B, n]
+            # block per step; below 8 sublanes it burns the same VALU work while
+            # issuing more matmuls and padding to 8 sublanes in VMEM.
+            return 16 if head_groups <= 1 else 8
         # GDN: between-block updates scale as 1 / B. B must divide the chunk
         # (a power of two): 3 head groups (24 value heads, e.g. Qwen3.8 at
         # TP2) would otherwise get B = 5, which no chunk splits into.
@@ -406,6 +413,12 @@ class GDNConfig:
             suffix += "_log"
         if self.uses_factored_window:
             suffix += "_fact"
+        if (
+            envs.VLLM_TPU_GDN_DIRECT_SOLVE
+            and not self.is_kda
+            and not self.use_recurrent
+        ):
+            suffix += "_ds"
         return (
             f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
             f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
