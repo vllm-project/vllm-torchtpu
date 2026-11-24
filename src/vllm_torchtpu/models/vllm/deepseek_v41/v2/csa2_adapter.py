@@ -326,7 +326,7 @@ def _select_gather_attend(
             onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
         )
         if following is not None:
-            # Records before the pipeline's next step, so the gather is
+            # Records before the next tile's scoring, so the gather is
             # issued ahead of it and runs beside it instead of after it.
             records, following = jax.lax.optimization_barrier((records, following))
         gathered = gather_csa2_kv_sc(word_banks, scale_banks, records, deep=deep)
