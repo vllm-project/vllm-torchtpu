@@ -77,11 +77,14 @@
   }
   function rowFloor(dtype, chipObj) {
     const c = chipObj || CHIP;
-    const dt = String(dtype || 'fp8').toLowerCase();
+    const dt = String(dtype || '').toLowerCase();
     const map = c.matmul_row_tile_by_dtype || {};
-    if (map[dt]) return map[dt];
-    const hasFp8 = c.native_ocp_fp8 !== false;
-    return (hasFp8 && (dt === 'fp8' || dt.includes('fp4'))) ? 32 : 16;
+    if (Object.prototype.hasOwnProperty.call(map, dt) && map[dt] > 0) {
+      return map[dt];
+    }
+    throw new Error(
+      `Chip '${c.name || 'unknown'}' has no matmul_row_tile_by_dtype entry for dtype='${dtype}'`
+    );
   }
   function allReduceCost(msgBytes, effTp, collLatS, chipObj, wl) {
     const c = chipObj || CHIP;
