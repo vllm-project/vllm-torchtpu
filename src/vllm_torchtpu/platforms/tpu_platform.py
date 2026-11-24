@@ -19,6 +19,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 import importlib.util
 import os
 import time
+import uuid
 from typing import TYPE_CHECKING, Protocol, Union, cast
 
 import portpicker
@@ -321,13 +322,43 @@ def _patch_api_server_kernel_reload_endpoint() -> None:
     )
 
 
-def _validate_peer_replay_config() -> None:
-    """Fail fast on TPU_PRECOMPILE_PEER_REPLAY with vLLM's compile cache off.
+def _validate_peer_replay_config(vllm_config: "VllmConfig | None" = None) -> None:
+    """Fail fast on invalid peer-replay settings.
 
     Peer replay hands a compiled range to the host's other ranks through the
     compile cache (TpuCompilerAdaptor saves and replays the cache artifact),
     so with VLLM_DISABLE_COMPILE_CACHE=1 there is nothing to replay.
+    `additional_config.peer_replay_scheduler` selects `'static'` (default) or
+    `'claims'` and requires both `TPU_PARALLEL_PRECOMPILE=1` and
+    `TPU_PRECOMPILE_PEER_REPLAY=1`.
     """
+    from vllm_torchtpu.runner.utils import (
+        PEER_REPLAY_RUN_ID_KEY,
+        get_peer_replay_scheduler,
+    )
+
+    scheduler = get_peer_replay_scheduler(vllm_config)
+    if scheduler is not None:
+        if scheduler not in ("static", "claims"):
+            raise ValueError(
+                "additional_config.peer_replay_scheduler must be 'static' or "
+                f"'claims', got {scheduler!r}"
+            )
+        if scheduler == "claims" and not (
+            envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY
+        ):
+            raise ValueError(
+                "additional_config.peer_replay_scheduler='claims' requires "
+                "TPU_PARALLEL_PRECOMPILE=1 and TPU_PRECOMPILE_PEER_REPLAY=1."
+            )
+        if (
+            scheduler == "claims"
+            and vllm_config is not None
+            and isinstance(vllm_config.additional_config, dict)
+        ):
+            vllm_config.additional_config.setdefault(
+                PEER_REPLAY_RUN_ID_KEY, uuid.uuid4().hex[:12]
+            )
     if not (envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY):
         return
     # Parse it now, so a bad value fails the launch rather than the precompile
@@ -847,7 +878,7 @@ class TpuPlatform(Platform):
             "Use --data-parallel-size and --enable-expert-parallel instead."
         )
         _validate_phased_profiling_config(vllm_config)
-        _validate_peer_replay_config()
+        _validate_peer_replay_config(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "

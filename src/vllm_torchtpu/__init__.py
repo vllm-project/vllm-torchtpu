@@ -541,6 +541,20 @@ def _patch_vllm_compile_all_ranges() -> None:
             return
 
         from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+        from vllm_torchtpu.runner.utils import get_peer_replay_scheduler
+
+        scheduler = (
+            get_peer_replay_scheduler(pairs[0][0].vllm_config if pairs else None)
+            or "static"
+        )
+        if scheduler == "claims":
+            from vllm_torchtpu.compilation.peer_replay import compile_claimed
+
+            # Without claims, fall back to the rotated order, which never waits
+            # on a peer: the static deal below can hang a pipeline leg.
+            if not compile_claimed(pairs, compile_entry):
+                compile_rotated(pairs, local_rank)
+            return
 
         host = host_slot()
         if host is None:

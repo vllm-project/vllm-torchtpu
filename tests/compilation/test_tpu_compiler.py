@@ -1153,7 +1153,7 @@ class TestTpuCompilerCache:
         assert path == os.path.join(b.cache_dir, key)
         assert os.path.samefile(path, os.path.join(a.cache_dir, key))
         assert sorted(os.listdir(tmp_path / "hash")) == ["rank_0_0", "rank_1_0"]
-        assert os.listdir(b.cache_dir) == [key]
+        assert sorted(os.listdir(b.cache_dir)) == [key, f"{key}.fp"]
 
     def test_a_compiled_bucket_runs_from_its_saved_artifact(
         self, tmp_path, monkeypatch
@@ -1499,6 +1499,49 @@ class TestTpuCompilerCache:
         key, path, _ = handle
         assert a.cache_dir is not None
         assert os.path.samefile(path, os.path.join(a.cache_dir, key))
+
+    def test_replay_from_peer_tries_later_candidates_and_honors_allowed_dirs(
+        self, tmp_path, monkeypatch
+    ):
+        """When the first peer's artifact belongs to another graph (or is
+        excluded by allowed_dirs), _replay_from_peer skips it without
+        unpickling and replays a matching peer's artifact instead."""
+        import pickle
+
+        import torch
+
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+
+        (r0, r1, r2, r3), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=4
+        )
+        other_graph = torch.fx.symbolic_trace(lambda x: x * 3 - 1)
+        same_graph = torch.fx.symbolic_trace(lambda x: x + 1)
+
+        compile(r0, graph=other_graph)
+        compile(r1, graph=same_graph)
+
+        real_load = pickle.load
+        loaded_paths = []
+
+        def spy_load(f, *a, **kw):
+            loaded_paths.append(getattr(f, "name", None))
+            return real_load(f, *a, **kw)
+
+        monkeypatch.setattr(pickle, "load", spy_load)
+        fn, _ = compile(r2, graph=same_graph)
+        assert compiled == [0, 1]
+        assert fn() == "entry-from-rank-1"
+        # r0's mismatched artifact was rejected by its .fp sidecar before pickle.load.
+        assert len(loaded_paths) == 1
+        assert "rank_1_0" in (loaded_paths[0] or "")
+
+        # With allowed_dirs={"rank_0_0"}, r3 ignores r1's matching artifact
+        # and skips r0's non-matching artifact, so r3 compiles locally.
+        with wait_for_peer_artifact(0.0, allowed_dirs={"rank_0_0"}):
+            compile(r3, graph=same_graph)
+        assert compiled == [0, 1, 3]
+        assert replayed == ["entry-from-rank-1"]
 
 
 def test_deserialize_entry_does_not_copy_the_entry():
