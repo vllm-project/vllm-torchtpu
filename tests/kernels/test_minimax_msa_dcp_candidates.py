@@ -26,6 +26,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
@@ -94,11 +96,11 @@ def test_decode_step_returns_token_rows() -> None:
     )
 
 
-# Transposed picks (up to 768 columns; as four column blocks up to 32 rows,
-# two up to 64) and row-major ones.
+# Transposed picks: four column blocks up to 32 rows, two up to 64, one above
+# (4 and 24 rows leave lanes spare, 32 and 64 fill them).
 @pytest.mark.parametrize("width", [256, 512, 768, 1024])
 @pytest.mark.parametrize("rank", [0, 1])
-@pytest.mark.parametrize("tokens", [8, 24, 48, 72])
+@pytest.mark.parametrize("tokens", [4, 24, 32, 48, 64, 72])
 @pytest.mark.parametrize("ties", [True, False])
 def test_packed_pick_matches_local_candidates(width, rank, tokens, ties) -> None:
     rng = np.random.default_rng(width + rank + tokens)
@@ -111,8 +113,44 @@ def test_packed_pick_matches_local_candidates(width, rank, tokens, ties) -> None
     scores = jnp.asarray(values, jnp.float32)
     pos = jnp.asarray(rng.integers(0, 2 * _BLOCK * width, tokens), jnp.int32)
     want = msa_dcp.pack_candidates(*_pick(scores[:, None, :], pos, rank))
-    pick = msa_dcp._PackedPick(_BLOCK, _TOPK, 1, 2, 2)
-    got = pick(scores, pos[:, None], jnp.asarray(rank, jnp.int32))
+    got = _run_pick(msa_dcp._PackedPick(_BLOCK, _TOPK, 1, 2, 2), scores, pos, rank)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def _run_pick(pick, scores, pos, rank):
+    """`pick` in an interpret-mode kernel, as the select kernel runs it."""
+
+    def kernel(rank_ref, s_ref, pos_ref, o_ref):
+        o_ref[...] = pick(s_ref[...], pos_ref[...], rank_ref[0])
+
+    return pl.pallas_call(
+        kernel,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)] + [pl.BlockSpec()] * 2,
+        out_shape=jax.ShapeDtypeStruct((scores.shape[0], 2 * pick.topk), jnp.float32),
+        interpret=True,
+    )(jnp.asarray([rank], jnp.int32), scores, pos[:, None])
+
+
+# One vreg of picks (folded), three (not a power of two: unfolded), four.
+@pytest.mark.parametrize("topk", [8, 24, 32])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_packed_pick_other_topk(topk, rank) -> None:
+    rng = np.random.default_rng(topk + rank)
+    tokens, width = 8, 512
+    scores = jnp.asarray(rng.integers(-3, 4, (tokens, width)), jnp.float32)
+    pos = jnp.asarray(rng.integers(0, 2 * _BLOCK * width, tokens), jnp.int32)
+    want = msa_dcp.pack_candidates(
+        *msa_dcp._pick(
+            scores,
+            pos[:, None] // _BLOCK + 1,
+            rank,
+            topk=topk,
+            init_blocks=1,
+            local_blocks=2,
+            dcp=2,
+        )
+    )
+    got = _run_pick(msa_dcp._PackedPick(_BLOCK, topk, 1, 2, 2), scores, pos, rank)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
