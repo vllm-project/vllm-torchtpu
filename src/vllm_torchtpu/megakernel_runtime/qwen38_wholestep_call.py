@@ -375,6 +375,7 @@ def build_wholestep_call(
                 **main_call_options(),
             ),
             hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
+            gdn_prefetch=envs.VLLM_TPU_MK_GDN_STATE_PREFETCH,
         )
 
     spec = spec_for(L, n_att)

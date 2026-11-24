@@ -246,6 +246,7 @@ class HCSublayer(Block):
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         s = ctx.stream
+        self.inner.prefetch(self._inner_ctx(ctx), l, slot)
         with s.segment(lazy=False):
             if self.mix:
                 mixed = self._mix(ctx, slot)

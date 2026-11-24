@@ -210,6 +210,10 @@ class Block:
     def on_layer_start(self, ctx: Any, lyr: Any, slot: Any) -> None:
         """Executed at the start of layer `lyr` alongside `smalls` double-buffering."""
 
+    def prefetch(self, ctx: Any, l: Any, slot: Any) -> None:  # noqa: E741
+        """Start the input DMAs `emit` will wait on, before the wrapping sublayer's
+        input mix (`HCSublayer`), so their latency hides under the mix."""
+
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         raise NotImplementedError
 

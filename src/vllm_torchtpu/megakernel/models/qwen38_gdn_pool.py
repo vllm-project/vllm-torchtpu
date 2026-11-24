@@ -66,6 +66,9 @@ CONV_ROWS = 16  # pool rows holding the conv history (rounded to a power of two)
 # verify bucket; "0": off (states staged in `pg_rec`).
 CHUNK_GATHER = os.environ.get("VLLM_TPU_MK_GDN_CHUNK_GATHER", "auto")
 CHUNK_GATHER_AUTO_ROWS = 32
+# Staging buffers with `Qwen38PoolGDN.state_prefetch`: up to this many requests' copies go
+# out before the HC mix.
+PREFETCH_BUFS = 8
 
 
 def _chunk_gather(gp: GDNParams, ex: ExecSpec) -> bool:
@@ -195,7 +198,15 @@ class _ChunkIn:
 
 
 class Qwen38PoolGDN(Qwen38GDN):
-    """`Qwen38GDN` whose input states come straight from the unified pool."""
+    """`Qwen38GDN` whose input states come straight from the unified pool.
+
+    `state_prefetch` (VLLM_TPU_MK_GDN_STATE_PREFETCH; the block under an `HCSublayer`,
+    which calls `prefetch`): the whole-state gather's first requests' pool copies, one per
+    staging buffer, start before the layer's HC mix instead of in `gdn_pool_gather`."""
+
+    def __init__(self, *, state_prefetch: bool = False, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.state_prefetch = bool(state_prefetch)
 
     def states(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
         return []
@@ -218,12 +229,12 @@ class Qwen38PoolGDN(Qwen38GDN):
         raw = not (ex.resolved_tiles.lean_scratch and _chunk_gather(gp, ex))
         # One whole ref per staged block: a typed view of a sliced ref is not
         # supported everywhere, a view of a whole scratch ref is.
-        for b in range(2):
+        for b in range(self._bufs(gp, ex)):
             for j in range(SSM_BLOCKS if raw else 0):
                 scr[f"pg_raw{b}{j}"] = pltpu.VMEM((SSM_ROWS, 1, 4, 256), f8)
             scr[f"pg_craw{b}"] = pltpu.VMEM((CONV_ROWS, 1, 4, 256), f8)
         scr.update(
-            pg_sem=pltpu.SemaphoreType.DMA((2, SSM_BLOCKS + 1)),
+            pg_sem=pltpu.SemaphoreType.DMA((self._bufs(gp, ex), SSM_BLOCKS + 1)),
             pg_conv=pltpu.VMEM((ex.NS, rup(3 + ex.T, 8), lay.QKV), F32),
         )
         if _chunk_gather(gp, ex):
@@ -257,13 +268,39 @@ class Qwen38PoolGDN(Qwen38GDN):
         )
         return cps
 
+    # Requests whose pool copies the last traced `prefetch` started (trace time; the
+    # next `_gather` takes them).
+    _inflight = 0
+
+    def _bufs(self, gp: GDNParams, ex: ExecSpec) -> int:
+        """Staging buffers the scratch holds: request `s` stages in `s % bufs`."""
+        if not self.state_prefetch or _chunk_gather(gp, ex):
+            return 2
+        return max(2, min(ex.NS, PREFETCH_BUFS))
+
+    @staticmethod
+    def _staged(scr: Any) -> int:
+        """Staging buffers present in `scr` (`_bufs` of the plan that built it)."""
+        return sum(1 for k in scr if k.startswith("pg_craw"))
+
+    def prefetch(self, ctx: Any, l: Any, slot: Any) -> None:  # noqa: E741
+        """Start the whole-state gather's first requests' copies, one per staging buffer."""
+        if not self.state_prefetch or _chunk_gather(ctx.block_params(self.name), ctx.ex):
+            return
+        o, nb = ctx.stream.sp.block_ord(l, self.name), self._staged(ctx.scr)
+        self._inflight = min(ctx.ex.NS, nb)
+        for s in range(self._inflight):
+            for c in self._copies(ctx, o, s, s % nb):
+                c.start()
+
     def _gather(self, ctx: Any, o: Any, direct: bool = False, ssm: bool = True) -> None:
         """Layer `o`'s pool states -> `pg_rec` (`REC`) / `pg_conv` (f32 history rows).
 
         `direct`: the states go to each request's first `recb` row group instead
         (the slot `rec_in` would copy them to), once the previous GDN layer's
         `recb` write-back has drained; `gdn_in` then skips both. `ssm=False` (chunk
-        gather): only the conv history; the chunks read their states (`_ChunkIn`)."""
+        gather): only the conv history; the chunks read their states (`_ChunkIn`).
+        The first `_inflight` requests' copies are already in flight (`prefetch`)."""
         ex, scr = ctx.ex, ctx.scr
         lay = self.lin_in_layout(ctx.g, ex)
         vh, KD, VD, QKV = lay.vh, lay.KD, lay.VD, lay.QKV
@@ -284,16 +321,20 @@ class Qwen38PoolGDN(Qwen38GDN):
         elif ssm:
             rec_dst, rec_stride = scr["pg_rec"], vh
         scr["pg_conv"][...] = jnp.zeros(scr["pg_conv"].shape, F32)
+        started, self._inflight = self._inflight, 0
+        nb = self._staged(scr)
         pending = self._copies(ctx, o, 0, 0, ssm)
-        for c in pending:
-            c.start()
+        if started == 0:
+            for c in pending:
+                c.start()
         nxt = pending
         for s in range(NS):
-            buf = s % 2
+            buf = s % nb
             if s + 1 < NS:
-                nxt = self._copies(ctx, o, s + 1, 1 - buf, ssm)
-                for c in nxt:
-                    c.start()
+                nxt = self._copies(ctx, o, s + 1, (s + 1) % nb, ssm)
+                if s + 1 >= started:
+                    for c in nxt:
+                        c.start()
             for c in pending:
                 c.wait()
             keep = ctx.extra[HAS_STATE][o, s] != 0

@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_QSA_XMERGE: bool = False
     VLLM_TPU_MK_WHOLE_SKIP_IDLE: bool = False
     VLLM_TPU_MK_QSA_UNION_SPLIT: int = 0
+    VLLM_TPU_MK_GDN_STATE_PREFETCH: bool = True
     VLLM_TPU_MK_WHOLE_L47: bool = False
     VLLM_TPU_MK_WHOLE_L45: bool = False
     VLLM_TPU_HC_PREFILL_UP_T: bool = False
@@ -1363,6 +1364,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (`QSAFullIndexedBlock.union_split`; the main-KV DCP combine's math). 0 = off. Not
     # bit-exact: f32 rounding of the combine.
     "VLLM_TPU_MK_QSA_UNION_SPLIT": env_int("VLLM_TPU_MK_QSA_UNION_SPLIT", 0),
+    # Whole-step megakernel: each GDN layer's pool state copies start before its HC mix
+    # (`Qwen38PoolGDN.state_prefetch`). Exact: scheduling only.
+    "VLLM_TPU_MK_GDN_STATE_PREFETCH": env_bool(
+        "VLLM_TPU_MK_GDN_STATE_PREFETCH", default=True
+    ),
     # Whole-step megakernel: also run the last QSA layer (model layer 47) in the whole-step
     # call, as a one-layer kernel after layers 3..46, its step tokens written with theirs;
     # the stock L47 attention core and last segment kernel are skipped.

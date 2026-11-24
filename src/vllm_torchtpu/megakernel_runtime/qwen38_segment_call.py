@@ -183,7 +183,10 @@ def build_segment_call(
         interpret=interpret,
     )
     pool_gdn = pool_gdn and has_gdn
-    spec = qwen38.segment_spec(g, R, L=L, head=head, pool_gdn=pool_gdn)
+    spec = qwen38.segment_spec(
+        g, R, L=L, head=head, pool_gdn=pool_gdn,
+        gdn_prefetch=envs.VLLM_TPU_MK_GDN_STATE_PREFETCH,
+    )
     fn, _, _, n_w = make_flat_segment_step(mesh, spec, ex)
     # `flat_smalls`: the packer passed "smalls" as `[L * S / 128, 128]` (no
     # size-1 tiling dim, so torch_tpu does not re-lay it out on every call).

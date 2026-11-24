@@ -30,6 +30,7 @@ as in the checkpoint; routed experts are FP8 with per-channel scales.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from dataclasses import dataclass
 from typing import Any
 
@@ -206,17 +207,21 @@ def segment_spec(
     head: bool = False,
     pool_gdn: bool = False,
     qsa_attn: dict[str, Any] | None = None,
+    gdn_prefetch: bool = False,
 ) -> ModelSpec:
     """`ModelSpec` of one segment kernel (`L` kernel layers, QSA o_proj first).
 
     `head=True`: `L` linear-attention layers and no QSA output projection (the
     layers before the first QSA layer). `pool_gdn=True`: the GDN layers read
-    their states from the model's unified pool (`qwen38_gdn_pool`).
+    their states from the model's unified pool (`qwen38_gdn_pool`), with
+    `gdn_prefetch` their copies started before the HC mix.
     `qsa_attn`: options of `QSASparseAttnBlock`; the QSA sparse attention runs
     in-kernel from the paged pool instead of arriving as `qsa_attn`.
     """
     if pool_gdn:
-        from .qwen38_gdn_pool import Qwen38PoolGDN as gdn_cls
+        from .qwen38_gdn_pool import Qwen38PoolGDN
+
+        gdn_cls: Any = functools.partial(Qwen38PoolGDN, state_prefetch=gdn_prefetch)
     else:
         gdn_cls = Qwen38GDN
     gi = g.inner(R, L, head)

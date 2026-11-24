@@ -23,6 +23,7 @@ has the HC(MoE) sublayer. `L = 48` is the full model; the prototype uses `L = 8`
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 from ..blocks.hc import HCSublayer
@@ -51,12 +52,14 @@ def wholestep_spec(
     first: str = "gdn",
     tail: dict[str, Any] | None = None,
     hc_fp8: bool = False,
+    gdn_prefetch: bool = False,
 ) -> ModelSpec:
     """`L` (a multiple of `att_every`) layers starting at a group boundary (layer 0 =
     GDN).
 
     `hc_fp8`: FP8 mix weights for the layers' HC(mixer) and HC(MoE) sublayers
     (`HCSublayer(fp8_weights=True)`); the tail's HC (`tail`) stays BF16.
+    `gdn_prefetch` (`pool_gdn`): `Qwen38PoolGDN(state_prefetch=True)`.
 
     `indexed`: `QSAFullIndexedBlock` options (`max_groups`, `pages_per_seq`) — the
     indexer,
@@ -69,7 +72,9 @@ def wholestep_spec(
         g.att_every,
     )
     if pool_gdn:
-        from ..models.qwen38_gdn_pool import Qwen38PoolGDN as gdn_cls
+        from ..models.qwen38_gdn_pool import Qwen38PoolGDN
+
+        gdn_cls: Any = functools.partial(Qwen38PoolGDN, state_prefetch=gdn_prefetch)
     else:
         gdn_cls = Qwen38GDN
     gi = g.inner(R, L)  # L = 1: one QSA layer, no GDN

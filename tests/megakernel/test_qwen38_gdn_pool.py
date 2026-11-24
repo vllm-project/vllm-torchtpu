@@ -121,7 +121,9 @@ def test_pool_gdn_segment_matches_reference(fresh: bool):
         np.testing.assert_allclose(rec_mk[:, l], rec_ref, atol=2e-2, rtol=2e-2)
 
 
-def _wide_pool_step(monkeypatch, chunk_gather: str, has_state: np.ndarray):
+def _wide_pool_step(
+    monkeypatch, chunk_gather: str, has_state: np.ndarray, state_prefetch: bool = True
+):
     """Residual and checkpoints of a WIDE (chunked-state) pool segment step."""
     from vllm_torchtpu.megakernel.models import qwen38_gdn_pool
 
@@ -130,7 +132,7 @@ def _wide_pool_step(monkeypatch, chunk_gather: str, has_state: np.ndarray):
     B, NL = NS * T, L - 1
     ex = ExecSpec(R=R, B=B, T=T, ctx=128, interpret=True, tiles=TILES)
     assert ex.WIDE
-    spec = qwen38.segment_spec(G, R, L=L, pool_gdn=True)
+    spec = qwen38.segment_spec(G, R, L=L, pool_gdn=True, gdn_prefetch=state_prefetch)
     inp = random_segment_inputs(jax.random.PRNGKey(5), G, ex, L, gain=0.25)
     rng = np.random.default_rng(3)
     nmb = 1 + NL * NS
@@ -169,3 +171,14 @@ def test_pool_gdn_chunk_gather_is_exact(monkeypatch):
     chunked = _wide_pool_step(monkeypatch, "1", has_state)
     for k in staged:
         np.testing.assert_array_equal(chunked[k], staged[k], err_msg=k)
+
+
+def test_pool_gdn_state_prefetch_is_exact(monkeypatch):
+    """The whole-state gather's requests' copies started before the HC mix (one per staging
+    buffer, `Qwen38PoolGDN.prefetch`) == started in the gather, bitwise, over 6 requests."""
+    NL, NS = qwen38.SEGMENT_LAYERS - 1, 6
+    has_state = (np.arange(NL * NS).reshape(NL, NS) % 3 != 1).astype(np.int32)
+    late = _wide_pool_step(monkeypatch, "0", has_state, state_prefetch=False)
+    early = _wide_pool_step(monkeypatch, "0", has_state, state_prefetch=True)
+    for k in late:
+        np.testing.assert_array_equal(early[k], late[k], err_msg=k)
