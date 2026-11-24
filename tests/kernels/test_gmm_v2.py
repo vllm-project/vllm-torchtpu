@@ -635,3 +635,56 @@ def test_gmm_v2_mlp_matches_two_gmms(batch_size, group_sizes):
         np.asarray(actual[:num_rows].astype(jnp.float32)),
         np.asarray(expected[:num_rows].astype(jnp.float32)),
     )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fuse_act", ["swigluoai", None])
+@pytest.mark.parametrize(
+    "batch_size, group_sizes",
+    [
+        # 16- and 32-row fp8 buckets.
+        (32, [0, 2, 0, 1, 0, 0, 3, 0, 0, 0, 20, 0, 0, 1, 0, 0]),
+        (96, [2, 0, 17, 0, 1, 0, 0, 30, 0, 0, 0, 40, 0, 0, 0, 2]),
+        # Decode tiles: the 16/32/48 fp8 buckets loop, the 128-row one does not.
+        (128, [3, 0, 14, 0, 1, 30, 0, 0, 44, 0, 0, 0, 2, 0, 0, 1]),
+    ],
+)
+def test_gmm_fp8_ntile_loop_matches_unrolled(
+    monkeypatch, fuse_act, batch_size, group_sizes
+):
+    """The fp8-feed matmul as a loop over MXU column tiles must equal the fully
+    unrolled form bit for bit."""
+    _require_tpu()
+    import vllm_torchtpu.kernels.megablox.gmm_v2 as gmm_v2_module
+
+    in_size, out_size, num_groups, block_size = 1024, 1024, 16, 128
+    keys = jax.random.split(jax.random.key(0), 3)
+    fp4_values = jnp.asarray(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.5, -1, -1.5, -2, -3, -4, -6, 0], jnp.float32
+    )
+    idx = jax.random.randint(keys[0], (num_groups, in_size, out_size), 0, 16)
+    rhs = fp4_values[idx].astype(jnp.float4_e2m1fn)
+    rhs_scale = jax.random.uniform(
+        keys[1], (num_groups, in_size // block_size, 1, out_size), jnp.float32, 0.5, 2
+    )
+    lhs = jax.random.normal(keys[2], (batch_size, in_size), jnp.bfloat16)
+    group_sizes = jnp.asarray(group_sizes, dtype=jnp.int32)
+    num_rows = int(group_sizes.sum())
+
+    def run():
+        jax.clear_caches()
+        out = gmm_v2(
+            lhs,
+            rhs,
+            group_sizes,
+            rhs_scale=rhs_scale,
+            zero_initialize=False,
+            fuse_act=fuse_act,
+            maybe_quantize_lhs=False,
+        )
+        return np.asarray(out[:num_rows].astype(jnp.float32))
+
+    looped = run()
+    monkeypatch.setattr(gmm_v2_module, "_fp8_ntile_loop_ok", lambda *_: False)
+    unrolled = run()
+    np.testing.assert_array_equal(looped, unrolled)
