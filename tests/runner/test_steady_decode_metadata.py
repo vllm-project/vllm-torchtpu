@@ -116,9 +116,7 @@ def test_metadata_reuse_matches_full_rebuild(num_reqs):
     # Blocks as long as the served ones' runs between crossings (a crossing
     # bumps the block-table version and rebuilds), plus some churn.
     blocks = {"attn_block": 256, "mamba_block": 256}
-    wl = Workload(
-        5, num_reqs, max_model_len=8192, churn=0.02, prefill=0.02, **blocks
-    )
+    wl = Workload(5, num_reqs, max_model_len=8192, churn=0.02, prefill=0.02, **blocks)
     full = make_runner(max_model_len=8192, **blocks)
     inc = make_runner(max_model_len=8192, **blocks)
     # The cached combined distribution upload (and its views) is what keeps

@@ -79,7 +79,11 @@ def test_thread_usage_logs_deltas_since_the_previous_call(monkeypatch):
     snaps = iter(
         [
             {1: ("step", 0, 0, 0), 2: ("busy", 0, 0, 0), 3: ("idle", 0, 0, 0)},
-            {1: ("step", 4_000_000, 1_000_000, 9), 2: ("busy", 8_000_000, 0, 3), 3: ("idle", 1, 0, 1)},
+            {
+                1: ("step", 4_000_000, 1_000_000, 9),
+                2: ("busy", 8_000_000, 0, 3),
+                3: ("idle", 1, 0, 1),
+            },
         ]
     )
     monkeypatch.setattr(host_phases, "_read_threads", lambda: next(snaps))
@@ -89,8 +93,12 @@ def test_thread_usage_logs_deltas_since_the_previous_call(monkeypatch):
     clock = iter([5_000_000, 15_000_000])
     monkeypatch.setattr(host_phases.time, "perf_counter_ns", lambda: next(clock))
     lines = []
-    monkeypatch.setattr(host_phases.logger, "info", lambda fmt, *a: lines.append(fmt % a))
+    monkeypatch.setattr(
+        host_phases.logger, "info", lambda fmt, *a: lines.append(fmt % a)
+    )
     host_phases.log_thread_usage("rank=0")
     host_phases.log_thread_usage("rank=0")
     # Busiest first; the calling thread is starred; idle threads are left out.
-    assert lines == ["HOSTTHREADS rank=0 wall_ms=10 threads=3 busy/2=8/0/3 *step/1=4/1/9"]
+    assert lines == [
+        "HOSTTHREADS rank=0 wall_ms=10 threads=3 busy/2=8/0/3 *step/1=4/1/9"
+    ]
