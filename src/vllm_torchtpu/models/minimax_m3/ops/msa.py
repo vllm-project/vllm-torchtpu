@@ -1054,12 +1054,14 @@ def _get_msa_dcp_fp4_op(
                 metadata.query_start_loc,
                 metadata.request_distribution,
             )
+        # A one-KV-head group reads q head-major [Hl, T, D]; the head-parallel
+        # op takes it token-major and returns [T, Hl, D] like the merge.
         if single_head_hp_op is not None and not msa_dcp_heads.uses_dcp_attention(
-            q.shape[0], metadata.seq_lens.shape[0], decode_rows
+            q.shape[1], metadata.seq_lens.shape[0], decode_rows
         ):
             return single_head_hp_op(
                 dcp_rank,
-                q,
+                q.transpose(0, 1).contiguous(),
                 kv_cache,
                 scale_cache,
                 candidates,
