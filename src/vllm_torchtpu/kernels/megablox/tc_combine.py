@@ -28,6 +28,7 @@ residual all-reduces.
 """
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -44,6 +45,9 @@ TOKEN_BLOCK = 256
 _VMEM_LIMIT_BYTES = 60 * 1024 * 1024
 # Shared-expert epilogue: output columns per MXU product / store.
 _SHARED_N_CHUNK = 512
+# Shared expert's product computed before the block's tile wait (overlaps the
+# tile DMAs; one more bf16 [TB, H] scratch). TPU_MOE_TC_COMBINE_SHARED_EARLY.
+_SHARED_EARLY = os.environ.get("TPU_MOE_TC_COMBINE_SHARED_EARLY", "0") == "1"
 # VMEM limit when the shared expert's down weight is resident.
 _SHARED_VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 
@@ -84,6 +88,7 @@ def supported_shared(
         + shared_k * hidden * 2  # resident down weight
         + 2 * TOKEN_BLOCK * shared_k * 2  # activation blocks
         + 2 * hidden * 2  # scale
+        + (TOKEN_BLOCK * hidden * 2 if _SHARED_EARLY else 0)  # early product
     )
     return vmem <= _SHARED_VMEM_LIMIT_BYTES - 6 * 1024 * 1024
 
@@ -148,8 +153,13 @@ def _kernel(
     topk: int,
     shared: bool = False,
     routed_scale: float = 1.0,
+    early: bool = False,
 ):
-    if shared:
+    sbuf = None
+    if shared and early:
+        (act_ref, ws_hbm, wscale_ref, out_ref, buf, acc, sems, ws_vmem, ws_sem,
+         sbuf) = rest
+    elif shared:
         # act_ref VMEM [TB, Ks]; ws_hbm ANY [Ks, H] bf16; wscale_ref VMEM [1, H]
         act_ref, ws_hbm, wscale_ref, out_ref, buf, acc, sems, ws_vmem, ws_sem = rest
     else:
@@ -197,6 +207,19 @@ def _kernel(
     def wait(i, c):
         tile_copy(b, 0, parity).wait()
         return c
+
+    if early:
+        # The shared down projection does not need this block's tiles: run
+        # it while their DMAs (issued during the previous block) land.
+        @pl.when(b == 0)
+        def _():
+            pltpu.make_async_copy(ws_hbm, ws_vmem, ws_sem.at[0]).wait()
+
+        act0 = act_ref[...]
+        for n0 in range(0, buf.shape[-1], _SHARED_N_CHUNK):
+            sl0 = slice(n0, n0 + _SHARED_N_CHUNK)
+            s0 = jnp.dot(act0, ws_vmem[:, sl0], preferred_element_type=jnp.float32)
+            sbuf[:, sl0] = s0.astype(jnp.bfloat16) * wscale_ref[:, sl0]
 
     lax.fori_loop(0, n, wait, 0)
 
@@ -279,15 +302,20 @@ def _kernel(
     def _():
         acc[...] = jnp.zeros_like(acc)
 
-    @pl.when(b == 0)
-    def _():
-        pltpu.make_async_copy(ws_hbm, ws_vmem, ws_sem.at[0]).wait()
+    if not early:
 
-    act = act_ref[...]
+        @pl.when(b == 0)
+        def _():
+            pltpu.make_async_copy(ws_hbm, ws_vmem, ws_sem.at[0]).wait()
+
+        act = act_ref[...]
     for n0 in range(0, hidden, _SHARED_N_CHUNK):
         sl = slice(n0, n0 + _SHARED_N_CHUNK)
-        s = jnp.dot(act, ws_vmem[:, sl], preferred_element_type=jnp.float32)
-        s = s.astype(jnp.bfloat16) * wscale_ref[:, sl]
+        if early:
+            s = sbuf[:, sl]
+        else:
+            s = jnp.dot(act, ws_vmem[:, sl], preferred_element_type=jnp.float32)
+            s = s.astype(jnp.bfloat16) * wscale_ref[:, sl]
         r = acc[:, sl].astype(jnp.bfloat16)
         if routed_scale != 1.0:
             r = r * jnp.asarray(routed_scale, jnp.bfloat16)
@@ -315,7 +343,7 @@ def tc_combine(
 
 
 @functools.partial(
-    jax.jit, static_argnames=("topk", "routed_scale", "interpret")
+    jax.jit, static_argnames=("topk", "routed_scale", "early", "interpret")
 )
 def tc_combine_shared(
     x: jax.Array,
@@ -329,6 +357,7 @@ def tc_combine_shared(
     *,
     topk: int,
     routed_scale: float = 1.0,
+    early: bool | None = None,
     interpret=False,
 ) -> jax.Array:
     """`tc_combine` with the shared expert's down projection in its output
@@ -343,12 +372,13 @@ def tc_combine_shared(
         shared_w.astype(jnp.bfloat16),
         shared_scale.astype(jnp.bfloat16).reshape(1, -1),
         float(routed_scale),
+        _SHARED_EARLY if early is None else bool(early),
     )
     return _tc_combine(x, pos, weights, valid, group_sizes, shared, topk, interpret)
 
 
 def _shared_epilogue(routed, shared):
-    act, w, scale, routed_scale = shared
+    act, w, scale, routed_scale = shared[:4]
     s = jnp.dot(act, w, preferred_element_type=jnp.float32).astype(jnp.bfloat16)
     s = s * scale
     r = routed.astype(jnp.bfloat16)
@@ -387,7 +417,7 @@ def _tc_combine(x, pos, weights, valid, group_sizes, shared, topk, interpret):
     vmem_limit = _VMEM_LIMIT_BYTES
     kernel_kw = {"maxt": maxt, "topk": topk}
     if shared is not None:
-        act, ws, wscale, routed_scale = shared
+        act, ws, wscale, routed_scale, early = shared
         shared_k = act.shape[1]
         in_specs += [
             pl.BlockSpec((token_block, shared_k), lambda b, *_: (b, 0)),
@@ -398,9 +428,11 @@ def _tc_combine(x, pos, weights, valid, group_sizes, shared, topk, interpret):
             pltpu.VMEM((shared_k, hidden), jnp.bfloat16),
             pltpu.SemaphoreType.DMA((1,)),
         ]
+        if early:
+            scratch.append(pltpu.VMEM((token_block, hidden), jnp.bfloat16))
         operands += [act, ws, wscale]
         vmem_limit = _SHARED_VMEM_LIMIT_BYTES
-        kernel_kw.update(shared=True, routed_scale=routed_scale)
+        kernel_kw.update(shared=True, routed_scale=routed_scale, early=early)
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=3,
         grid=(nb,),

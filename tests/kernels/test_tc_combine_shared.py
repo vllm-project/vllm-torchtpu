@@ -66,6 +66,7 @@ def _unfused(y, pos, w, valid, gs, act, ws, scale, routed_scale):
     return routed + shared
 
 
+@pytest.mark.parametrize("early", [False, True])
 @pytest.mark.parametrize(
     "t,local,routed_scale,empty_block",
     [
@@ -75,11 +76,11 @@ def _unfused(y, pos, w, valid, gs, act, ws, scale, routed_scale):
         (1024, 8, 2.0, False),
     ],
 )
-def test_shared_combine_matches_unfused(t, local, routed_scale, empty_block):
+def test_shared_combine_matches_unfused(t, local, routed_scale, empty_block, early):
     h, ks = 1024, 384
     args = _inputs(t, local, h, ks, seed=t + local, empty_block=empty_block)
     got = K.tc_combine_shared(
-        *args, topk=TOPK, routed_scale=routed_scale, interpret=True
+        *args, topk=TOPK, routed_scale=routed_scale, early=early, interpret=True
     )
     want = _unfused(*args, routed_scale)
     g = np.asarray(got.astype(jnp.float32))
