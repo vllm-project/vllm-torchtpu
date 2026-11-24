@@ -578,13 +578,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         # it's a behavior change, not just a refactor.
         from vllm_torchtpu.layers.adapter.dense_fp4_dual import dual_operands
 
-        # The dual layout's steps run its own kernel call, routed outside.
         route = getattr(layer, _DENSE_ROUTE_ATTR, None)
         fused_route = None
-        if (
-            not enable_pipelined_collective_and_compute()
-            and dual_operands(layer) is None
-        ):
+        if not enable_pipelined_collective_and_compute():
             fused_route = moe_routing.fused_dense_route(layer, router_logits, route)
         if fused_route is not None:
             topk_weights, topk_ids = fused_route

@@ -238,6 +238,56 @@ def test_dual_layout_matches_ep(monkeypatch, m, with_shared):
     np.testing.assert_allclose(out, ref, rtol=0, atol=1e-2 * np.abs(ref).max())
 
 
+@pytest.mark.parametrize("m", [8, 32])
+def test_dual_layout_fused_routing_matches_routing_first(monkeypatch, m):
+    """A dual-layout step routed in the kernel (global ids on the TP-sliced
+    copy) equals the same step routed first."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    monkeypatch.setattr(wrapper, "_DENSE_FP4_MAX_TOKENS", 32)
+    monkeypatch.setattr(wrapper, "_DUAL_LAYOUT_MAX_TOKENS", 32)
+    jax.clear_caches()
+    e, num_global, topk = 8, 16, 4
+    x, w1, w2, s1, s2, _, _ = _inputs(m, 1024, 1024, e, topk, seed=m)
+    tp_experts = wrapper.TpSlicedExperts(
+        *_inputs(m, 1024, 256, num_global, topk, seed=m + 1)[1:5]
+    )
+    rng = np.random.default_rng(m + 2)
+    scores = jax.nn.sigmoid(jnp.asarray(rng.normal(size=(m, num_global)), jnp.float32))
+    choice = scores + jnp.asarray(rng.normal(size=(1, num_global)) * 0.1, jnp.float32)
+    route = kernel.Route(topk, 2.0, "bfloat16")
+    weights, ids = wrapper.route_from_scores(scores, choice, route)
+    shared = _shared(1024, 128, seed=m)
+    assert kernel.can_use_dense_expert_fp4(
+        x, *tp_experts, activation="swigluoai", shared=shared
+    )
+    want = _moe(x, w1, w2, s1, s2, weights, ids, e, topk, shared, tp_experts=tp_experts)
+    got = wrapper.fused_moe_func(
+        x,
+        w1,
+        w2,
+        s1,
+        s2,
+        None,
+        None,
+        scores,
+        choice,
+        jnp.asarray(e, jnp.int32),
+        topk=topk,
+        activation="swigluoai",
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=wrapper.resolve_onehot_permute_threshold(),
+        skip_padded_tokens=True,
+        shared=shared,
+        tp_experts=tp_experts,
+        route=route,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(got, np.float32), np.asarray(want, np.float32)
+    )
+
+
 # TP-sliced (every expert local) and EP ranks owning experts [e, 2e) of 2e;
 # the 40-row step routes in the kernel's sparse-row mode; top-8 too.
 @pytest.mark.parametrize(

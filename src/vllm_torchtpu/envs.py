@@ -950,7 +950,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # EP MoE layers with fp4 experts also keep a TP-sliced copy of every
     # routed expert (layers/adapter/dense_fp4_dual.py), built at load by an
     # all-to-all; steps of up to this many tokens run the dense fp4 kernel on
-    # it (fused_moe_gmm.fused_moe_func). 0 disables it.
+    # it (fused_moe_gmm.fused_moe_func). 0 disables it. Needs
+    # TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS=0 (arm_dense_fp4_dual refuses both).
     "TPU_MOE_DUAL_LAYOUT_MAX_TOKENS": env_nonnegative_int(
         "TPU_MOE_DUAL_LAYOUT_MAX_TOKENS", 0
     ),

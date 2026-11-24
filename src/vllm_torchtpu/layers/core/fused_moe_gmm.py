@@ -1119,7 +1119,7 @@ def fused_moe_func(
             sparse_rows=sparse_rows,
         )
     )
-    if route is not None and not dense_fp4:
+    if route is not None and not (dense_fp4 or dual):
         topk_weights, topk_ids = route_from_scores(topk_weights, topk_ids, route)
         route = None
     if shared is not None and activation != "swigluoai":
@@ -1155,6 +1155,21 @@ def fused_moe_func(
     packing_factor = get_packing_factor(w1.dtype, rhs_quant_dtype)
     padded_hidden_size *= packing_factor
 
+    if route is not None and dual:
+        # The TP-sliced copy holds every expert: global ids are local.
+        logger.info_once("Selected dense fp4 decode MoE on TP-sliced experts, routed")
+        return _add_shared_down(
+            dense_expert_moe_fp4(
+                hidden_states,
+                *tp_experts,
+                topk_weights,
+                topk_ids,
+                activation=activation,
+                shared=shared,
+                route=route,
+            ),
+            shared_down,
+        )
     if route is not None:
         logger.info_once("Selected dense-expert fp4 decode MoE with fused routing")
         return _add_shared_down(

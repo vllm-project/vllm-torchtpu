@@ -30,6 +30,7 @@ from typing import Any
 import jax
 import torch
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -145,6 +146,7 @@ def arm_dense_fp4_dual(model: torch.nn.Module, what: str = "model") -> int:
 
     from vllm_torchtpu.layers.adapter.dense_fp4_shared import shared_operands
     from vllm_torchtpu.layers.adapter.fused_moe import prebuild_fused_moe_kernel
+    from vllm_torchtpu.layers.adapter.quantization.nvfp4 import _DENSE_ROUTE_ATTR
 
     ep_group = get_ep_group()
     runners = [m for m in model.modules() if isinstance(m, MoERunner)]
@@ -156,6 +158,19 @@ def arm_dense_fp4_dual(model: torch.nn.Module, what: str = "model") -> int:
         if not _admit(runner, ep_group):
             continue
         layer = runner.routed_experts
+        if (
+            envs.TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS > 0
+            and shared_operands(layer) is not None
+        ):
+            # Steps the model's shared expert serves (model_side_shared) read
+            # the shared and the dual weights in another order than steps the
+            # routed op serves, and vLLM's warmup cannot hand compiled buckets
+            # between the two traces (ShapeSpecializationError).
+            raise ValueError(
+                "The dual expert layout (TPU_MOE_DUAL_LAYOUT_MAX_TOKENS) needs "
+                "the shared expert in the routed op: set "
+                "TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS=0."
+            )
         sends_op, received_op = _ops(ep_group.world_size)
         sends = sends_op(
             layer.w13_weight,
@@ -165,13 +180,19 @@ def arm_dense_fp4_dual(model: torch.nn.Module, what: str = "model") -> int:
         )
         copy = received_op(*_exchange(*sends))
         del sends
-        prebuild_fused_moe_kernel(
-            topk=layer.moe_config.experts_per_token,
-            activation=runner._quant_method._tpu_activation_str,
-            use_ep=True,
-            with_shared=shared_operands(layer) is not None,
-            with_dual=True,
-        )
+        # Steps the dense fp4 kernel routes itself pass the layer's route.
+        layer_route = getattr(layer, _DENSE_ROUTE_ATTR, None)
+        # A fixed order: op names come from a counter, and must match on
+        # every rank.
+        for route in (None,) if layer_route is None else (None, layer_route):
+            prebuild_fused_moe_kernel(
+                topk=layer.moe_config.experts_per_token,
+                activation=runner._quant_method._tpu_activation_str,
+                use_ep=True,
+                with_shared=shared_operands(layer) is not None,
+                with_dual=True,
+                route=route,
+            )
         for name, tensor in zip(_DUAL_BUFFERS, copy):
             layer.register_buffer(name, tensor, persistent=False)
             copy_bytes += tensor.numel() * tensor.element_size()
