@@ -144,7 +144,7 @@ def test_eviction_stops_prefetch_before_evicting(tmp_path, monkeypatch):
 
 def test_stop_without_prefetch_is_a_no_op(monkeypatch):
     monkeypatch.setattr(mlp, "_prefetches", [])
-    mlp._stop_ep_range_prefetch()
+    mlp._stop_prefetch()
     assert not mlp._prefetches
 
 
@@ -181,7 +181,7 @@ def test_eviction_waits_for_every_loader(evicted, monkeypatch, agreed):
         order.append("agree")
         return agreed
 
-    monkeypatch.setattr(mlp, "_stop_ep_range_prefetch", lambda: order.append("stop"))
+    monkeypatch.setattr(mlp, "_stop_prefetch", lambda: order.append("stop"))
     monkeypatch.setattr(mlp, "_evict_on_every_rank", agree)
     monkeypatch.setattr(
         mlp, "_evict_checkpoint_page_cache", lambda files: order.append("evict")
@@ -388,9 +388,7 @@ def test_eviction_logs_at_info_once_per_host(tmp_path, monkeypatch, local_rank, 
     advice = []
     monkeypatch.setattr(os, "posix_fadvise", lambda fd, off, n, a: advice.append(a))
     monkeypatch.setattr(
-        parallel_state,
-        "get_world_group",
-        lambda: SimpleNamespace(local_rank=local_rank),
+        parallel_state, "_WORLD", SimpleNamespace(local_rank=local_rank)
     )
     logger = _RecordingLogger()
     monkeypatch.setattr(mlp, "logger", logger)
@@ -428,7 +426,7 @@ def test_stop_during_header_scan_skips_reads(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "pread", recording_pread)
     mlp._start_ep_range_prefetch(paths, set(), None, num_threads=1, block_size=64)
     assert in_scan.wait(timeout=5.0)
-    mlp._stop_ep_range_prefetch()
+    mlp._stop_prefetch()
     assert scanned == paths[:1]
     assert reads == []
 
@@ -447,7 +445,7 @@ def test_ended_prefetch_threads_are_dropped(tmp_path, monkeypatch):
     mlp._start_ep_range_prefetch([str(path)], set(), None, num_threads=1, block_size=64)
     assert [t for t, _ in mlp._prefetches] != [first]
     assert len(mlp._prefetches) == 1
-    mlp._stop_ep_range_prefetch()
+    mlp._stop_prefetch()
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +620,7 @@ def test_whole_file_prefetch_stops_before_eviction(
     )
     ((thread, _),) = mlp._prefetches
     assert first_read.wait(timeout=5.0)
-    mlp._stop_ep_range_prefetch()
+    mlp._stop_prefetch()
     assert not thread.is_alive()
     assert not mlp._prefetches
     assert reads == [0]

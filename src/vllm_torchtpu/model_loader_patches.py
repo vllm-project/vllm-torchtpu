@@ -747,7 +747,7 @@ def _start_prefetch(
 
     Reads go in file order, in ``block_size`` chunks over ``num_threads``
     threads. The thread can outlive the load it serves, so it is registered:
-    ``_stop_ep_range_prefetch`` stops it once the runner has loaded every
+    ``_stop_prefetch`` stops it once the runner has loaded every
     model, before any page cache eviction, so it cannot read evicted pages
     back in.
     """
@@ -824,7 +824,7 @@ _prefetches: list[tuple[threading.Thread, threading.Event]] = []
 _prefetch_lock = threading.Lock()
 
 
-def _stop_ep_range_prefetch() -> None:
+def _stop_prefetch() -> None:
     """Stop this process's prefetch threads and wait for them to exit.
 
     Every registered thread: the EP range prefetch and the stoppable
@@ -862,24 +862,17 @@ def _evict_one_checkpoint_file(fpath: str, log_level: int) -> float | None:
         return None
 
 
-def _is_first_rank_on_host() -> bool:
-    from vllm.distributed import parallel_state
-
-    try:
-        return parallel_state.get_world_group().local_rank == 0
-    except AssertionError:
-        return True  # distributed state not initialized: a single process
-
-
 def _evict_checkpoint_page_cache(files: list[str]) -> None:
     """Drop clean host page cache for weight files via posix_fadvise.
 
     Every rank evicts, but only the first rank of each host logs at INFO: the
     page cache, and so the result, is the host's.
     """
+    from vllm.distributed.parallel_state import is_local_first_rank
+
     if not files:
         return
-    log_level = logging.INFO if _is_first_rank_on_host() else logging.DEBUG
+    log_level = logging.INFO if is_local_first_rank() else logging.DEBUG
     max_workers = min(len(files), os.cpu_count() or 32)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         sizes = list(
@@ -1043,7 +1036,7 @@ def evict_loaded_weights_page_cache() -> None:
     that never arrives fails the load instead of hanging the others. If every
     rank has the flag on, each evicts; a second eviction of a file is cheap.
     """
-    _stop_ep_range_prefetch()
+    _stop_prefetch()
     if not _evict_on_every_rank():
         return
     if not _loaded_weight_files:
