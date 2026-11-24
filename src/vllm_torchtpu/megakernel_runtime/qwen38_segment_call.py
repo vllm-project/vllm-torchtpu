@@ -136,7 +136,16 @@ def gdn_blocks(
         # offsets come from one vector gather: per-layer `off[st]` lowered to scalar
         # dynamic slices, two vector->scalar stalls of ~34 us per step (xprof j-30c70bee
         # fusion.1614/1615); stacking the table per layer would copy 33 x 113728 int32.
-        st, ck, qsl, seq = (jnp.stack([lay[k] for lay in metas]) for k in (0, 2, 3, 4))
+        def stacked(k):
+            first = metas[0][k]
+            if all(lay[k] is first for lay in metas):
+                # One operand shared by every layer (VLLM_TPU_MK_STACKED_MAMBA_OPERANDS
+                # passes query_start_loc / seq_lens once): broadcast it, the same rows
+                # as stacking it n times, without an n-way concatenate.
+                return jnp.broadcast_to(first, (len(metas),) + first.shape)
+            return jnp.stack([lay[k] for lay in metas])
+
+        st, ck, qsl, seq = (stacked(k) for k in (0, 2, 3, 4))
         idx = metas[0][1][jax.vmap(lambda s: _fit(s, NS))(st)]
         return jax.vmap(one)(idx, ck, qsl, seq)
     layers = [(off[_fit(st, NS)], ck, qsl, seq) for st, off, ck, qsl, seq in metas]

@@ -464,6 +464,18 @@ def _wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     return segment_tiles(B)
 
 
+def unstack_meta(meta: Any, n_gdn: int) -> list:
+    """`stacked_meta` (VLLM_TPU_MK_STACKED_MAMBA_OPERANDS): the six stacked GDN-metadata
+    operands `(state_stack [G, NS], ckpt_stack [G, NS, W], rows [n_gdn], read_offsets,
+    query_start_loc, seq_lens)` as the per-layer list `(state, read_offsets, ckpt,
+    query_start_loc, seq_lens)` x n_gdn the call takes otherwise: two gathers of the
+    walk's stacks instead of 5 x n_gdn operands (and the stack of them `gdn_blocks`
+    builds)."""
+    st_stack, ck_stack, rows, ro, qsl, seq = meta
+    st, ck = st_stack[rows], ck_stack[rows]
+    return [x for o in range(n_gdn) for x in (st[o], ro, ck[o], qsl, seq)]
+
+
 def build_wholestep_call(
     mesh: Any,
     g: Any,
@@ -727,9 +739,7 @@ def build_wholestep_call(
         meta = args[i + 1 : i + 1 + n_meta]
         i += 1 + n_meta
         if stacked_meta:
-            st_stack, ck_stack, rows, ro, qsl, seq = meta
-            st, ck = st_stack[rows], ck_stack[rows]
-            meta = [x for o in range(n_gdn) for x in (st[o], ro, ck[o], qsl, seq)]
+            meta = unstack_meta(meta, n_gdn)
         tables = args[i : i + n_tab]
         i += n_tab
         positions, starts, context, trig = args[i : i + 4]
