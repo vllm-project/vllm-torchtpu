@@ -666,6 +666,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_REL_FETCH_LARGE: bool = False
     VLLM_TPU_MK_GDN_VEC_REC: bool = False
     VLLM_TPU_MK_UNION_SKIP_ROWCOMPACT: bool = False
+    VLLM_TPU_MK_INDEXER_FAST_THR: bool = False
     # q38 internal-v3 GDN/QSA ports (end)
 
 
@@ -3773,6 +3774,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_MK_UNION_SKIP_ROWCOMPACT": env_bool(
         "VLLM_TPU_MK_UNION_SKIP_ROWCOMPACT"
     ),
+    # Whole-step QSA indexer thresholds & union compaction (default off; exact):
+    # radix-4 packed 2-bit/step threshold bisection (three 10-bit int32 counters,
+    # 16 S-reductions vs 31 plain / 46 un-packed VLLM_TPU_MK_SELECT_RADIX=2 for
+    # S <= 1023 -> up to 523K tokens), fused (bits > thr) + (bits == thr) tail,
+    # lax.cond tie-skip + radix-4 tie search, plus T=1 / bounded fori_loop
+    # compact_union when union_bounded=False.
+    "VLLM_TPU_MK_INDEXER_FAST_THR": env_bool("VLLM_TPU_MK_INDEXER_FAST_THR"),
     # q38 internal-v3 GDN/QSA ports (end)
 }
 

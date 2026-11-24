@@ -525,7 +525,9 @@ class _LeanMixin(_ProbeMixin):
                 scr["qu_cd"][q, :, pl.ds(r * KU + j0, w)] = codes
 
         if not self.union_bounded:
-            ids, codes, nu = ua.compact_union(code, KU, consts)
+            ids, codes, nu = ua.compact_union(
+                code, KU, consts, t1=(ctx.ex.T == 1), fast=self.fast_thr
+            )
             put(0, KU, ids, codes)
             scr["qu_n"][q, r] = jnp.sum(nu)
             return
@@ -589,7 +591,7 @@ class _LeanMixin(_ProbeMixin):
             sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0, n)].reshape(n, S, 128), I32)
             bits = jnp.where(ids < nv, sc, -1)
             with ctx.stream.sc("qsa_thr", 2):
-                thr, tmax = ix.thresholds(bits, ids, nv, K, G)
+                thr, tmax = ix.thresholds(bits, ids, nv, K, G, fast=self.fast_thr)
             scr["qi_th"][pl.ds(lo, n)] = jnp.broadcast_to(thr, (n, 1, 128))
             scr["qi_tm"][pl.ds(lo, n)] = jnp.broadcast_to(tmax, (n, 1, 128))
             scr["qi_nv"][pl.ds(lo, n)] = jnp.broadcast_to(nv, (n, 1, 128))

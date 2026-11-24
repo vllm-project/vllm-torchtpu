@@ -156,6 +156,8 @@ class _IdxMixin:
 
     # ------------------------------------------------------------ S2P radix-2
     def _idx_thresholds(self, bits: jax.Array, ids: jax.Array, nv: jax.Array, K: int, G: int):
+        if self.fast_thr and bits.shape[1] <= 1023:
+            return ix.thresholds(bits, ids, nv, K, G, fast=True)
         if self.radix_bits == 2:
             return thresholds_radix2(bits, ids, nv, K, G)
         return ix.thresholds(bits, ids, nv, K, G)

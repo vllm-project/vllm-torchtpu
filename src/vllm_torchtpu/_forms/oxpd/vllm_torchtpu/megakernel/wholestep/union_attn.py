@@ -70,7 +70,12 @@ def union_consts(S: int, KU: int) -> tuple:
 
 
 def compact_union(
-    code: jax.Array, KU: int, consts: tuple
+    code: jax.Array,
+    KU: int,
+    consts: tuple,
+    *,
+    t1: bool = False,
+    fast: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Ascending union of the groups with a nonzero row code, as lane-major `[1, KU]`
     ids and
@@ -84,18 +89,24 @@ def compact_union(
     16 rows, j-c89e9978; 512 per pass still 62.4, j-bfd3a7f8); each slot's code is
     gathered from its group's sublane row by the
     same one-hot matmul (codes <= 15 are exact in BF16).
+
+    `fast` (`VLLM_TPU_MK_INDEXER_FAST_THR`): when `t1=True` (`T == 1`), skips the `Cg`
+    code-gather matmul (every live code is `1`); when `KU > W`, runs only the live
+    prefix `ceil(n / W)` windows in a `jax.lax.fori_loop` instead of all `KU // W`.
     """
     U, Us, jcol0, srow, lane = consts
     S, W = code.shape[0], jcol0.shape[0]
+    assert KU % W == 0, f"union window {W} must divide KU={KU}"
     sel = code > 0
     P = jnp.dot(sel.astype(F32).astype(BF16), U, preferred_element_type=F32)
     c_row = jnp.transpose(jnp.broadcast_to(P[:, 127:128], (S, 128)))[0:1, :]
     O_row = exclusive_prefix(c_row, Us)
     E_row = O_row + c_row
-    Pb, codeb = P.astype(BF16), code.astype(F32).astype(BF16)
+    Pb = P.astype(BF16)
+    codeb = None if (t1 and fast) else code.astype(F32).astype(BF16)
     n = jnp.sum(sel.astype(I32), axis=(0, 1), keepdims=True)
-    ids_out, codes_out = [], []
-    for j0 in range(0, KU, W):
+
+    def _do_chunk(j0: Any) -> tuple[jax.Array, jax.Array]:
         jcol = jcol0 + j0
         jf = jcol.astype(F32)
         r_j = jnp.sum((E_row <= jf).astype(I32), axis=1, keepdims=True)
@@ -104,17 +115,45 @@ def compact_union(
         Pg = jnp.dot(oh, Pb, preferred_element_type=F32)
         O_rj = jnp.sum(jnp.where(hit, O_row, 0.0), axis=1, keepdims=True)
         lane_j = jnp.sum((Pg <= jf - O_rj).astype(I32), axis=1, keepdims=True)
-        Cg = jnp.dot(oh, codeb, preferred_element_type=F32)
-        code_j = jnp.sum(jnp.where(lane == lane_j, Cg, 0.0), axis=1, keepdims=True)
         live = jcol < n
         ids = jnp.where(live, r_j * 128 + lane_j, 0).astype(F32)
-        codes = jnp.where(live, code_j, 0.0)
-        ids_out.append(
-            jnp.transpose(jnp.broadcast_to(ids, (W, 128)))[0:1, :].astype(I32)
+        id_row = jnp.transpose(jnp.broadcast_to(ids, (W, 128)))[0:1, :].astype(I32)
+        if codeb is None:
+            # Cast to F32 before transpose so Mosaic never transposes a bool (i1) array.
+            codes = jnp.where(live, 1.0, 0.0)
+            cd_row = jnp.transpose(jnp.broadcast_to(codes, (W, 128)))[0:1, :].astype(I32)
+        else:
+            Cg = jnp.dot(oh, codeb, preferred_element_type=F32)
+            code_j = jnp.sum(jnp.where(lane == lane_j, Cg, 0.0), axis=1, keepdims=True)
+            codes = jnp.where(live, code_j, 0.0)
+            cd_row = jnp.transpose(jnp.broadcast_to(codes, (W, 128)))[0:1, :].astype(I32)
+        return id_row, cd_row
+
+    if fast and KU > W:
+        n_chunks = jnp.minimum((jnp.sum(n) + W - 1) // W, KU // W)
+        n_rep = KU // W
+        chunk_id = jax.lax.broadcasted_iota(I32, (1, KU), 1) // W
+
+        def _loop_body(c: Any, carry: Any) -> Any:
+            ids_acc, cds_acc = carry
+            id_row, cd_row = _do_chunk(c * W)
+            mask = chunk_id == c
+            id_full = jnp.concatenate([id_row] * n_rep, axis=1)
+            cd_full = jnp.concatenate([cd_row] * n_rep, axis=1)
+            return (
+                jnp.where(mask, id_full, ids_acc),
+                jnp.where(mask, cd_full, cds_acc),
+            )
+
+        ids_acc, cds_acc = jax.lax.fori_loop(
+            0, n_chunks, _loop_body, (jnp.zeros((1, KU), I32), jnp.zeros((1, KU), I32))
         )
-        codes_out.append(
-            jnp.transpose(jnp.broadcast_to(codes, (W, 128)))[0:1, :].astype(I32)
-        )
+        return ids_acc, cds_acc, n
+    ids_out, codes_out = [], []
+    for j0 in range(0, KU, W):
+        id_row, cd_row = _do_chunk(j0)
+        ids_out.append(id_row)
+        codes_out.append(cd_row)
     cat = lambda xs: xs[0] if len(xs) == 1 else jnp.concatenate(xs, axis=1)  # noqa: E731
     return cat(ids_out), cat(codes_out), n
 

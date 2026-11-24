@@ -87,6 +87,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         dcp: int = 1,
         compressed_dcp: bool = False,
         skip_rowcompact: bool = False,
+        fast_thr: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -177,6 +178,10 @@ class QSAFullIndexedBlock(QSAFullBlock):
         # 5x (`W = 640 -> 128`). For `compressed_dcp=False`, `union_lean=True`
         # strictly supersedes this by folding `qsa_selx` into the union exchange.
         self.skip_rowcompact = bool(skip_rowcompact) and bool(union_attn)
+        # `fast_thr` (VLLM_TPU_MK_INDEXER_FAST_THR, exact): radix-4 packed thresholds
+        # (`indexer.thresholds(..., fast=True)`, 16 S-reductions via 10-bit counters)
+        # and T=1 / bounded `compact_union`.
+        self.fast_thr = bool(fast_thr)
         self.dcp = max(int(dcp), 1)
         assert self.dcp in (1, 2), dcp
         assert self.dcp == 1 or union_attn, "main-KV DCP is implemented on the union path"
@@ -564,7 +569,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         bits = jnp.where(
             ids < nv, pltpu.bitcast(scr["qi_s"][...].reshape(MB, S, 128), I32), -1
         )
-        thr, tmax = ix.thresholds(bits, ids, nv, K, G)
+        thr, tmax = ix.thresholds(bits, ids, nv, K, G, fast=self.fast_thr)
         scr["qi_th"][...] = jnp.broadcast_to(thr, (MB, 1, 128))
         scr["qi_tm"][...] = jnp.broadcast_to(tmax, (MB, 1, 128))
         scr["qi_nv"][...] = jnp.broadcast_to(nv, (MB, 1, 128))

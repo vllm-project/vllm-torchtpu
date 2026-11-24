@@ -110,6 +110,7 @@ def indexed_options() -> dict:
         loop_requests=LOOP_REQUESTS, union_phys=UNION_ATTN and UNION_PHYS, dcp=main_kv_dcp(),
         compressed_dcp=compressed_dcp(),
         **({"skip_rowcompact": True} if UNION_ATTN and envs.VLLM_TPU_MK_UNION_SKIP_ROWCOMPACT else {}),
+        **({"fast_thr": True} if envs.VLLM_TPU_MK_INDEXER_FAST_THR else {}),
         **_d08s1_options(), **_idx_options(), **_selloop_options(), **_union_pipe_options(),  # q38 L1-D08S1 / L1-IDX / L1-SELLOOP, q38 L2-UAPIPE
     )
 
