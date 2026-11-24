@@ -317,6 +317,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     "QWEN4_EXP_POOL_SIZING",
     "QWEN4_EXP_POOL_GRAPH_COPIES",
     "QWEN4_EXP_POOL_HEADROOM_BYTES",
+    # Host-side step bookkeeping and host timers: no compiled program reads them.
+    "VLLM_TPU_HOST_PHASES_CPU",
+    "VLLM_TPU_STEADY_METADATA_REUSE",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
