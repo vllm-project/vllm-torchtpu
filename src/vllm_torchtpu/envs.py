@@ -253,6 +253,7 @@ if TYPE_CHECKING:
     MOE_ADAPTIVE_SKIP_UNROUTED: bool = False
     MOE_ADAPTIVE_PREFILL_RUNGS: bool = False
     MOE_ADAPTIVE_COMBINE_LANDED: bool = False
+    MOE_ADAPTIVE_SC_SLAB_SCATTER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -1978,6 +1979,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Adaptive fused EP MoE: land the whole arrival buffer in VMEM with a few
     # contiguous DMAs on combine when it fits (default off).
     "MOE_ADAPTIVE_COMBINE_LANDED": env_bool("MOE_ADAPTIVE_COMBINE_LANDED"),
+    # Adaptive fused EP MoE: build the two per-layer slab tables (token
+    # numbers and activation row scales) with one SparseCore scatter kernel
+    # instead of TensorCore scatters (adaptive_fused_moe/sc_slab_scatter.py).
+    "MOE_ADAPTIVE_SC_SLAB_SCATTER": env_bool("MOE_ADAPTIVE_SC_SLAB_SCATTER"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the
