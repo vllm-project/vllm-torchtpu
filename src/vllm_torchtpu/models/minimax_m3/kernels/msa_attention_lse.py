@@ -41,8 +41,10 @@ _STEP_WIDTHS = (4, 8, 16, 24, 32, 48)
 TILES_PER_STEP = 4
 # Groups whose pages are in flight ahead of the running one: 4-bit groups
 # (a page and a scale page each) gain from 2 (bench j-caec1354: c64 shared
-# 2206 -> 2026, forced 2150 -> 2075 us per call), 8/16-bit ones do not.
+# 2206 -> 2026, forced 2150 -> 2075 us per call), and so do `words` groups
+# (`_words_ring`, kbench j-5f9952c4); other 8/16-bit ones do not.
 _FP4_PREFETCH = 2
+_WORDS_PREFETCH = 2
 # Page copies a group's start loop issues per iteration (`_kernel`).
 _START_UNROLL = 4
 # 8-token tiles (decode-sized DCP batches) hold a few MiB of pages and
@@ -737,7 +739,7 @@ def _attention_call(
     transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
     words = _words_ring(kv_cache, block_q, fp4, row_width)
     scale_inputs = (scale_cache,) if fp4 else ()
-    ring = 1 + (_FP4_PREFETCH if fp4 else 1)
+    ring = 1 + (_FP4_PREFETCH if fp4 else _WORDS_PREFETCH if words else 1)
     scale_scratch = (
         (
             pltpu.VMEM((ring, pages_per_step, 1) + scale_cache.shape[1:], jnp.float32),
