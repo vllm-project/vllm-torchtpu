@@ -99,7 +99,7 @@ _MAX_FREE_SCORE_BOUND = 75.0
 MXU_MASK = True
 _MASK_BIAS = 1e30
 # 4-bit calls of prefill size take their tokens' page limits from a table the
-# caller builds (`_page_limits`), spread over a group's slots by one matmul:
+# caller builds (`_page_limits`), each page's broadcast over its slots:
 # comparing every page against the tile's selections, with a lane reduction
 # each, cost ~12 % of a 4-bit 8-token call (r9 kernel bench j-ecb17102).
 LIMIT_TABLE = True
@@ -107,7 +107,8 @@ _LIMIT_TABLE_MIN_TOKENS = msa_attention.SMALL_BATCH_TOKENS
 # Calls without the table (decode) compute the same [Bq, W] limits in the
 # kernel, once per group: one compare per selection column against the
 # group's pages instead of a compare and a lane reduction per page (13 % of
-# a c64 decode call, kernel bench j-0a524278), then the same spread matmul.
+# a c64 decode call, kernel bench j-0a524278), pages along the lanes as the
+# table's (transposing a [W, Bq] form was the head of a group's critical path).
 # The per-page lane reductions were the critical path of 8-bit decode groups
 # too (AOT pre-delay schedule, 32 pages: 2,649 -> 1,990 cycles).
 KERNEL_LIMITS = True
@@ -190,24 +191,20 @@ def _kernel(
     fp4 = fp4_rows is not None
     spreads = limited or kernel_limits
     units = unit_groups > 1
-    tail = refs[len(refs) - (9 if fp4 else 7) - units - spreads :]
+    tail = refs[len(refs) - (9 if fp4 else 7) - units :]
     o_ref, lse_ref, m_ref, l_ref, acc_ref, buf_ref, sem_ref = tail[:7]
     # Units: the groups whose page copies are issued, ``[0, issued_ref[0])``.
     issued_ref = tail[9 if fp4 else 7] if units else None
     scale_hbm_ref = refs[0] if fp4 else None
     scale_buf_ref, scale_sem_ref = tail[7:9] if fp4 else (None, None)
     # `limited`: each union slot's limit per token (`_page_limits`, blocked
-    # per grid step) and the one-hot that spreads a page's over its slots.
+    # per grid step).
     limit_ref = refs[1] if limited else None
-    spread_ref = tail[-1] if spreads else None
     pages_per_step = buf_ref.shape[1]
     ring = buf_ref.shape[0]  # prefetched groups + the running one
     steps = pl.num_programs(0) if steps_per_call is None else steps_per_call
     num_groups = block_start_ref[steps]
     row_width = buf_ref.shape[-1]
-    ring_page_size = buf_ref.shape[3] * (
-        msa_fp4.TOKENS_PER_WORD if fp4 else buf_ref.shape[4]
-    )
 
     def page_copies(half, g, page, n=1):
         """Copies of ``n`` pages from `page` on into slots ``g ..``: every
@@ -256,14 +253,6 @@ def _kernel(
             return carry
 
         jax.lax.fori_loop(done, count, start1, 0)
-
-    def fill_spread():
-        if spreads:
-            key = jax.lax.broadcasted_iota(jnp.int32, spread_ref.shape, 1)
-            slot = jax.lax.broadcasted_iota(jnp.int32, spread_ref.shape, 0)
-            spread_ref[...] = jnp.where(key // ring_page_size == slot, 1, 0).astype(
-                spread_ref.dtype
-            )
 
     def group(
         w,
@@ -351,7 +340,6 @@ def _kernel(
 
             @pl.when(w == 0)
             def _first():
-                fill_spread()
                 for d in range(ring - 1):
                     pl.when(d < num_groups)(functools.partial(start_group, d, d))
 
@@ -413,7 +401,14 @@ def _kernel(
 
         def write(out, lse):
             put(out)
-            lse_ref[...] = lse.T.reshape(lse_ref.shape)  # lane-dense row
+            # Lane-dense row: each row's value picked off the diagonal by a
+            # sublane sum (a transpose was the finish's critical path).
+            rows = lse.shape[0]
+            eye = jax.lax.broadcasted_iota(
+                jnp.int32, (rows, rows), 0
+            ) == jax.lax.broadcasted_iota(jnp.int32, (rows, rows), 1)
+            row = jnp.sum(jnp.where(eye, lse, 0.0), axis=0, keepdims=True)
+            lse_ref[...] = row.reshape(lse_ref.shape)
 
         def finish(m, denom, acc):
             """Output and lse from a tile's softmax state (log2 units, ``m``
@@ -578,19 +573,18 @@ def _kernel(
 
         def group_limits(width, selected, local_page, local_limit):
             """Each token's limit on the group's first `width` pages, ``[Bq,
-            W]`` (as `_page_limits`): the pages down the sublanes, one compare
+            W]`` (as `_page_limits`): the pages along the lanes, one compare
             per selection column."""
-            slot = jax.lax.broadcasted_iota(jnp.int32, (width, 1), 0)
-            pages = jnp.zeros((width, 1), jnp.int32)
+            slot = jax.lax.broadcasted_iota(jnp.int32, (1, width), 1)
+            pages = jnp.zeros((1, width), jnp.int32)
             for g in range(width):
                 page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
                 pages = jnp.where(slot == g, page, pages)
-            sel_t = selected.T  # [K, Bq]
-            hit = sel_t[0:1] == pages
-            for k in range(1, sel_t.shape[0]):
-                hit = hit | (sel_t[k : k + 1] == pages)  # [W, Bq]
-            limit = jnp.where(pages == local_page.T, local_limit.T, page_size)
-            return jnp.where((pages >= 0) & hit, limit, 0).T
+            hit = selected[:, 0:1] == pages
+            for k in range(1, selected.shape[1]):
+                hit = hit | (selected[:, k : k + 1] == pages)  # [Bq, W]
+            limit = jnp.where(pages == local_page, local_limit, page_size)
+            return jnp.where((pages >= 0) & hit, limit, 0)
 
         def attend(width, single):
             """One softmax update over the group's first `width` slots; a
@@ -608,7 +602,11 @@ def _kernel(
                 if fp4
                 else msa_attention._bitcast_slots(rows_per_page, packing)
             )  # [S, 1]
-            slots = row_slots.T  # [1, S]
+            slots = (
+                jax.lax.broadcasted_iota(jnp.int32, (1, page_size), 1)
+                if fp4
+                else row_slots.T
+            )  # [1, S]
             selected = selected_ref[...]
             local_page = local_page_ref[...]
             local_limit = local_limit_ref[...]
@@ -620,21 +618,10 @@ def _kernel(
                 ]  # [Bq, pages_per_step]
             elif kernel_limits:
                 limits = group_limits(width, selected, local_page, local_limit)
-            if spreads:  # the group's [Bq, W] limits spread over its W x S slots
-                limit = jax.lax.dot_general(
-                    limits[:, :width].astype(spread_ref.dtype),
-                    spread_ref[:width, : width * page_size],
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )  # [Bq, W * S]
-                if fp4:
-                    spot = jax.lax.broadcasted_iota(
-                        jnp.int32, (1, width * page_size), 1
-                    )
-                    spot = spot % page_size
-                else:  # each key's slot in the bitcast's row order
-                    spot = jnp.tile(slots, (1, width))
-                masks.append(spot.astype(jnp.float32) < limit)
+            if spreads:  # each page's [Bq, 1] limit broadcast over its S slots
+                lim = limits[:, :width]
+                for g in range(width):
+                    masks.append(slots < lim[:, g : g + 1])
             for g, kv_ref in enumerate(kv_refs[:width]):
                 if not spreads:
                     page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
@@ -702,12 +689,14 @@ def _kernel(
 
         def fold(l_cur, pv):
             """A unit's group's `update` (`MAX_FREE`), after its earlier groups'."""
-            single = first & last
-            pl.when(first & jnp.logical_not(last))(init_state)
-            pl.when(single)(lambda: finish(0.0, l_cur, pv))
-            pl.when(jnp.logical_not(single))(
-                lambda: update(0.0, 0.0, l_cur, pv, False, finish)
-            )
+            # Straight-line: every group carries its tile's sums and writes
+            # its output (a later group of the tile overwrites it).
+            carry = jnp.logical_not(first)
+            l_new = jnp.where(carry, l_ref[...], 0.0) + l_cur
+            acc_new = jnp.where(carry, acc_ref[...], 0.0) + pv
+            l_ref[...] = l_new
+            acc_ref[...] = acc_new
+            finish(0.0, l_new, acc_new)
 
         def empty():
             write(
@@ -822,7 +811,6 @@ def _kernel(
             for g in groups:
                 g.empty()
 
-    pl.when(start == 0)(fill_spread)
     # The step's trailing groups of no page (padding tiles of a bucketed
     # batch) run alone, as `empty`: in a unit each would cost a body.
     real_end = jax.lax.while_loop(
@@ -1001,11 +989,7 @@ def _attention_call(
         pl.BlockSpec((tiles_per_step,) + x.shape[1:], lambda b, *_: (b, 0, 0, 0))
         for x in limits
     ]
-    page_size = msa_attention.page_tokens(kv_cache)
     kernel_limits = _kernel_limits(kv_cache) and not limited and not transposed
-    spread = (
-        _spread_scratch(pages_per_step, page_size) if limited or kernel_limits else []
-    )
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=4,
         grid=(calls * num_steps,),
@@ -1043,8 +1027,7 @@ def _attention_call(
             scale_cache if fp4 else None,
             transposed,
             _unit_groups(transposed, tiles, inline_issue),
-        )
-        + spread,
+        ),
     )
     num_inputs = 4 + 4 + len(qs) + len(scale_inputs) + len(limits)
     return pl.pallas_call(
@@ -1104,23 +1087,13 @@ def _attention_call(
 
 def _kernel_limits(kv_cache) -> bool:
     """`KERNEL_LIMITS` for a cache whose `attend` needs no per-page ``seen``
-    (4- and 8-bit; 16-bit pages zero their unseen slots by it) and whose page
-    limits the bf16 spread matmul carries exactly (at most 256 slots)."""
-    return (
-        KERNEL_LIMITS
-        and jnp.dtype(kv_cache.dtype).itemsize == 1
-        and msa_attention.page_tokens(kv_cache) <= 256
-    )
+    (4- and 8-bit; 16-bit pages zero their unseen slots by it)."""
+    return KERNEL_LIMITS and jnp.dtype(kv_cache.dtype).itemsize == 1
 
 
 def _transposed(block_q: int, fp4: bool) -> bool:
     """Whether a call's tiles run `attend_t` (else `attend`)."""
     return (not fp4 or FP4_TRANSPOSED) and block_q >= msa_attention.DEFAULT_BLOCK_Q
-
-
-def _spread_scratch(pages_per_step, page_size):
-    """`_kernel`'s one-hot that spreads a group's page limits over its slots."""
-    return [pltpu.VMEM((pages_per_step, pages_per_step * page_size), jnp.bfloat16)]
 
 
 def _unit_groups(transposed: bool, num_tiles: int, inline_issue: bool) -> int:
@@ -1362,11 +1335,6 @@ def planned_attention(
             scale_cache if fp4 else None,
             transposed=False,
             unit_groups=_unit_groups(False, num_tiles, False),
-        )
-        + (
-            _spread_scratch(pages_per_step, msa_attention.page_tokens(kv_cache))
-            if _kernel_limits(kv_cache)
-            else []
         )
         + [
             pltpu.VMEM((num_tokens, topk), jnp.int32),
