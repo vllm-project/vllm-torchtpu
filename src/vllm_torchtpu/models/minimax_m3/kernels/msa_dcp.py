@@ -42,7 +42,8 @@ queries of the group's heads along with the query heads.
 """
 
 import functools
-from typing import NamedTuple
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -1155,10 +1156,16 @@ def msa_write_and_candidates_dcp(
     dcp: int,
     scale_cache: jax.Array | None = None,
     index_q_rotated: bool = False,
+    after_write: Callable[[jax.Array, jax.Array | None], Any] | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, ...]:
     """First half of the DCP forward: write this rank's tokens, score its
     blocks and pick its candidates.
+
+    `after_write(kv_cache, scale_cache)` (a step that writes its caches before
+    the indexer) starts work on the written caches that is to run under the
+    indexer (`msa_dcp_heads.start_first_round_exchange`); its result is
+    returned last, ordered after the indexer.
 
     With 4-bit caches (`msa_fp4`, one KV head per rank) pass `scale_cache`;
     it is returned updated after `index_cache`. `index_q` is then rotated
@@ -1218,6 +1225,24 @@ def msa_write_and_candidates_dcp(
         )
         if fp4:
             (scale_cache,) = rest
+    pending = ()
+    if after_write is not None:
+        if fold_write:
+            raise ValueError("after_write needs the write ahead of the indexer")
+        # The barriers keep the started work ahead of the indexer and its
+        # completion behind it: XLA would otherwise schedule the two halves
+        # of an async exchange back to back.
+        index_q, started = jax.lax.optimization_barrier(
+            (index_q, after_write(kv_cache, scale_cache))
+        )
+        pending = (started,)
+
+    def done(*outs):
+        if not pending:
+            return outs
+        outs, started = jax.lax.optimization_barrier((outs, pending[0]))
+        return (*outs, started)
+
     local_lens = local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp)
     candidates = functools.partial(
         local_candidates,
@@ -1245,8 +1270,8 @@ def msa_write_and_candidates_dcp(
             scale_row=scale_row,
         )
         if fp4:
-            return kv_cache, index_cache, scale_cache, packed
-        return kv_cache, index_cache, packed
+            return done(kv_cache, index_cache, scale_cache, packed)
+        return done(kv_cache, index_cache, packed)
     if fold_write:
         caches, packed = decode_candidates(
             index_q,
@@ -1303,8 +1328,8 @@ def msa_write_and_candidates_dcp(
     packed = pack_candidates(cand_scores, cand_blocks)  # [G * T, 2 * topk]
     packed = packed.reshape(num_heads, num_tokens, -1).transpose(1, 0, 2)
     if fp4:
-        return kv_cache, index_cache, scale_cache, packed.reshape(num_tokens, -1)
-    return kv_cache, index_cache, packed.reshape(num_tokens, -1)
+        return done(kv_cache, index_cache, scale_cache, packed.reshape(num_tokens, -1))
+    return done(kv_cache, index_cache, packed.reshape(num_tokens, -1))
 
 
 def msa_attend_dcp(

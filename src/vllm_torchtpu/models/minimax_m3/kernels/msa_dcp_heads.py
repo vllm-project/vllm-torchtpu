@@ -34,6 +34,7 @@ normalizes in one pass instead of merging bf16 partials.
 """
 
 import functools
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -528,6 +529,208 @@ def live_part(live: jax.Array, replica, replicas: int, part: int) -> jax.Array:
     return jnp.clip((live - replica + replicas - 1) // replicas, 0, part)
 
 
+def _interpret_params(interpret: bool):
+    return pltpu.InterpretParams(uninitialized_memory="zero") if interpret else False
+
+
+class PageExchange(NamedTuple):
+    """`start_head_page_exchange`'s pages in flight: the output buffer the
+    other ranks copy into and the copies' semaphores, for
+    `finish_head_page_exchange`. The forwards' receive semaphore is an
+    output of the start too: a replica partner may forward before this rank
+    enters its finish call, whose scratch would not be live yet."""
+
+    out: jax.Array
+    send_sem: jax.Array
+    recv_sem: jax.Array
+    fwd_sem: jax.Array
+
+
+def _remote(src, dst, send_sem, recv_sem, device, axis):
+    return pltpu.make_async_remote_copy(
+        src,
+        dst,
+        send_sem,
+        recv_sem,
+        device_id={axis: device},
+        device_id_type=pl.DeviceIdType.MESH,
+    )
+
+
+def _page_wait(sem, page):
+    """A loop body that retires one page's copy on `sem` (equal-sized copies
+    on one semaphore: any wait retires one)."""
+
+    def wait(i, carry):
+        pltpu.make_async_copy(page, page, sem).wait()
+        return carry
+
+    return wait
+
+
+def _exchange_counts(live, rank, replicas, part):
+    counts = [live_part(live, j, replicas, part) for j in range(replicas)]
+    replica = rank % replicas
+    mine = jnp.where(replica == 0, counts[0], counts[-1])
+    for j in range(1, replicas - 1):
+        mine = jnp.where(replica == j, counts[j], mine)
+    return counts, mine
+
+
+def start_head_page_exchange(
+    kv_cache: jax.Array,
+    pages: jax.Array,
+    live: jax.Array,
+    rank: jax.Array,
+    *,
+    axis: str,
+    dcp: int,
+    replicas: int,
+    head_width: int,
+    interpret: bool = False,
+) -> PageExchange:
+    """The sending half of `exchange_head_pages`: every rank starts the
+    remote copies of its live pages and returns with them in flight, so the
+    step's independent work (the indexer) runs while the pages move;
+    `finish_head_page_exchange` waits for them. Arguments as
+    `exchange_head_pages`."""
+    _, rows, packing, _ = kv_cache.shape
+    num_pages = pages.shape[0]
+    part = num_pages // replicas
+    if kv_cache.dtype != jnp.uint8:
+        raise ValueError(f"4-bit (uint8) caches only, got {kv_cache.dtype}")
+
+    def kernel(
+        pages_ref, live_ref, rank_ref, kv_ref, out_ref, send_sem, recv_sem, fwd_sem
+    ):
+        del fwd_sem  # signalled by the partner's forwards (finish)
+        me = rank_ref[0]
+        counts, _ = _exchange_counts(live_ref[0], me, replicas, part)
+        barrier = pltpu.get_barrier_semaphore()
+        for d in range(dcp):
+            pl.semaphore_signal(
+                barrier,
+                inc=1,
+                device_id={axis: jnp.int32(d)},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+        # Every rank has entered the call: its output buffer is live.
+        pl.semaphore_wait(barrier, dcp)
+
+        def send(i, carry):
+            for d in range(dcp):
+                head, j = divmod(d, replicas)
+
+                def go(d=d, head=head, j=j):
+                    columns = pl.ds(head * head_width, head_width)
+                    src = kv_ref.at[pages_ref[j * part + i], :, :, columns]
+                    dst = out_ref.at[j, me, i]
+                    _remote(src, dst, send_sem, recv_sem, d, axis).start()
+
+                pl.when(i < counts[j])(go)
+            return carry
+
+        jax.lax.fori_loop(0, jnp.max(jnp.stack(counts)), send, 0)
+
+    any_ = pl.BlockSpec(memory_space=pl.ANY)
+    sem = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
+    started = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(1,),
+            in_specs=[any_],
+            out_specs=(any_, sem, sem, sem),
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct(
+                (replicas, dcp, part, rows, packing, head_width), kv_cache.dtype
+            ),
+            pltpu.SemaphoreType.DMA(()),
+            pltpu.SemaphoreType.DMA(()),
+            pltpu.SemaphoreType.DMA(()),
+        ),
+        # No side-effect flag: the finish consumes every output, and torch_tpu's
+        # SPMD partitioner refuses side-effect custom calls without a sharding.
+        compiler_params=pltpu.CompilerParams(collective_id=_EXCHANGE_COLLECTIVE_ID),
+        # Semaphores that outlive a call: interpret mode zero-initializes them.
+        interpret=_interpret_params(interpret),
+        name="minimax_m3_msa_dcp_exchange_head_pages_start",
+    )(pages, live, rank, kv_cache)
+    return PageExchange(*started)
+
+
+def finish_head_page_exchange(
+    started: PageExchange,
+    pages: jax.Array,
+    live: jax.Array,
+    rank: jax.Array,
+    *,
+    axis: str,
+    dcp: int,
+    replicas: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """The receiving half of `exchange_head_pages`: waits for this rank's
+    pages of `started`, forwards them to the head's other replicas (one
+    chip's cores at c64), waits for theirs and for its own sends."""
+    num_pages = pages.shape[0]
+    part = num_pages // replicas
+
+    def kernel(live_ref, rank_ref, buf_ref, send_ref, recv_ref, fwd_sem, out_ref):
+        del buf_ref  # aliased to out_ref
+        me = rank_ref[0]
+        replica = me % replicas
+        counts, mine = _exchange_counts(live_ref[0], me, replicas, part)
+        page = out_ref.at[0, 0, 0]
+        jax.lax.fori_loop(0, mine * dcp, _page_wait(recv_ref, page), 0)
+
+        # Forward the received pages to the head's other replicas, a bounded
+        # number in flight.
+        def forwards(i, op):
+            for k in range(1, replicas):
+                peer = me - replica + (replica + k) % replicas
+                for src in range(dcp):
+                    p = out_ref.at[replica, src, i]
+                    op(_remote(p, p, send_ref, fwd_sem, peer, axis))
+
+        ahead = _EXCHANGE_PAGES_IN_FLIGHT
+
+        def step(i, carry):
+            forwards(i, lambda c: c.start())
+            pl.when(i >= ahead)(lambda: forwards(i - ahead, lambda c: c.wait_send()))
+            return carry
+
+        def drain(i, carry):
+            forwards(i, lambda c: c.wait_send())
+            return carry
+
+        jax.lax.fori_loop(0, mine, step, 0)
+        jax.lax.fori_loop(jnp.maximum(mine - ahead, 0), mine, drain, 0)
+        theirs = sum(counts) - mine
+        jax.lax.fori_loop(0, theirs * dcp, _page_wait(fwd_sem, page), 0)
+        # This rank's own sends (one per live page and destination).
+        sent = sum(counts[j] * (dcp // replicas) for j in range(replicas))
+        jax.lax.fori_loop(0, sent, _page_wait(send_ref, page), 0)
+
+    any_ = pl.BlockSpec(memory_space=pl.ANY)
+    sem = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=(1,),
+            in_specs=[any_, sem, sem, sem],
+            out_specs=any_,
+        ),
+        out_shape=jax.ShapeDtypeStruct(started.out.shape, started.out.dtype),
+        input_output_aliases={2: 0},
+        # Semaphores that outlive a call: interpret mode zero-initializes them.
+        interpret=_interpret_params(interpret),
+        name="minimax_m3_msa_dcp_exchange_head_pages_finish",
+    )(live, rank, *started)
+
+
 def exchange_head_pages(
     kv_cache: jax.Array,
     pages: jax.Array,
@@ -675,6 +878,7 @@ def _exchange_pages(
     head_width,
     axis,
     interpret,
+    started=None,
 ):
     """Every rank's ``pages [L]`` of the KV head each rank owns:
     ``(kv [L * dcp, S / 8, 4, 2 * D], scales [L * dcp, SCALE_ROWS, 128])``,
@@ -685,7 +889,8 @@ def _exchange_pages(
     The pages move by `exchange_head_pages`. The ``replicas`` ranks of a KV
     head each receive a ``1 / replicas`` part of the scales over an
     all-to-all and share them with an all-gather inside the replica group
-    (one chip's cores at c64)."""
+    (one chip's cores at c64). `started` (`start_head_page_exchange` of
+    these `pages` and `live`) has the pages in flight already."""
     num_pages = pages.shape[0]
     part = num_pages // replicas
     _, rows, packing, _ = kv_cache.shape
@@ -695,17 +900,20 @@ def _exchange_pages(
             f"cache rows {kv_cache.shape} do not hold {heads} KV heads of "
             f"{head_width} columns"
         )
-    recv = exchange_head_pages(
-        kv_cache,
-        pages,
-        live.reshape(1),
-        rank.reshape(1),
-        axis=axis,
-        dcp=dcp,
-        replicas=replicas,
-        head_width=head_width,
-        interpret=interpret,
-    )
+    common = dict(axis=axis, dcp=dcp, replicas=replicas, interpret=interpret)
+    if started is None:
+        recv = exchange_head_pages(
+            kv_cache,
+            pages,
+            live.reshape(1),
+            rank.reshape(1),
+            head_width=head_width,
+            **common,
+        )
+    else:
+        recv = finish_head_page_exchange(
+            started, pages, live.reshape(1), rank.reshape(1), **common
+        )
     # Destination rank d = h * replicas + j gets part j of head h.
     sc = scale_cache[pages][:, : 2 * heads]  # K/V rows of every head
     sc = sc.reshape(replicas, part, heads, 2, sc.shape[-1])
@@ -756,6 +964,108 @@ def _own_selection(
     return selected
 
 
+def _plan_round(first, hp_req, blocks, capacity):
+    """The requests of `_head_parallel_attend`'s round from request `first`
+    on: ``(csum, in_round, base, total, next first)``."""
+    max_num_seqs = hp_req.shape[0]
+    seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
+    csum = jnp.cumsum(jnp.where(seq_idx >= first, blocks, 0))
+    # A request never exceeds the buffer (the block table's width); always
+    # admitting `first` keeps the rounds moving if that ever broke.
+    in_round = hp_req & (seq_idx >= first) & ((csum <= capacity) | (seq_idx == first))
+    base = csum - blocks  # the request's first logical block in the buffer
+    total = jnp.max(jnp.where(in_round, csum, 0))
+    nxt = jnp.min(
+        jnp.where((seq_idx >= first) & ~in_round & hp_req, seq_idx, max_num_seqs)
+    )
+    return csum, in_round, base, total, nxt
+
+
+def _round_pages(plan, block_tables_2d, replicas):
+    """The page buffer of a round: buffer page b holds logical block ``l = b
+    % part * replicas + b // part``: logical block ``s - base[q]`` of request
+    ``q`` (0 past the round's blocks)."""
+    csum, _, base, total, _ = plan
+    max_num_seqs, capacity = block_tables_2d.shape
+    part = -(-capacity // replicas)
+    buf = jnp.arange(part * replicas, dtype=jnp.int32)
+    logical = buf % part * replicas + buf // part
+    q_of = jnp.searchsorted(csum, logical, side="right", method="compare_all")
+    q_of = jnp.minimum(q_of, max_num_seqs - 1)
+    j = jnp.clip(logical - base[q_of], 0, capacity - 1)
+    return jnp.where(logical < total, block_tables_2d[q_of, j], 0)
+
+
+def _request_classes(cu_q_lens, distribution, decode_rows):
+    """``(dcp_req, hp_req)``: the step's live decode-sized requests (at most
+    `decode_rows` rows) and the longer ones `attend_and_merge` attends
+    head-parallel."""
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    live = (seq_idx < distribution[2]) & (q_lens > 0)
+    return live & (q_lens <= decode_rows), live & (q_lens > decode_rows)
+
+
+def head_parallel_step(
+    num_tokens: int,
+    max_num_seqs: int,
+    decode_rows: int,
+    min_tokens: int = HEAD_PARALLEL_MIN_TOKENS,
+) -> bool:
+    """Whether `attend_and_merge` attends a step of `num_tokens` rows' long
+    requests head-parallel (else every row takes the DCP attention)."""
+    return num_tokens >= max(min_tokens, 2 * max_num_seqs * decode_rows)
+
+
+def start_first_round_exchange(
+    kv_cache: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    rank: jax.Array,
+    *,
+    num_tokens: int,
+    axis: str,
+    dcp: int,
+    kv_head_replicas: int,
+    decode_rows: int,
+    head_parallel_min_tokens: int = HEAD_PARALLEL_MIN_TOKENS,
+    interpret: bool = False,
+) -> PageExchange | None:
+    """The page exchange of `attend_and_merge`'s first head-parallel round,
+    started (`start_head_page_exchange`) as soon as the step's rows are in
+    the cache: it depends on the block tables only, and in the c64 mixed
+    twin it ran exposed after the indexer (135 us per layer, j-c5ebe0af).
+    None for a step `attend_and_merge` attends without head-parallel rounds.
+    Pass the result to `attend_and_merge` as ``page_exchange``."""
+    max_num_seqs = seq_lens.shape[0]
+    if not head_parallel_step(
+        num_tokens, max_num_seqs, decode_rows, head_parallel_min_tokens
+    ):
+        return None
+    rank = msa_dcp.rank_array(rank)[0]
+    _, hp_req = _request_classes(cu_q_lens, distribution, decode_rows)
+    block_tables_2d = block_tables.reshape(max_num_seqs, -1)
+    blocks = jnp.where(hp_req, -(-seq_lens // (msa.page_size(kv_cache) * dcp)), 0)
+    first = jnp.min(
+        jnp.where(hp_req, jnp.arange(max_num_seqs, dtype=jnp.int32), max_num_seqs)
+    )
+    plan = _plan_round(first, hp_req, blocks, block_tables_2d.shape[1])
+    return start_head_page_exchange(
+        kv_cache,
+        _round_pages(plan, block_tables_2d, kv_head_replicas),
+        plan[3].reshape(1),
+        rank.reshape(1),
+        axis=axis,
+        dcp=dcp,
+        replicas=kv_head_replicas,
+        head_width=kv_cache.shape[3] // (dcp // kv_head_replicas),
+        interpret=interpret,
+    )
+
+
 def _head_parallel_attend(
     q,
     kv_cache,
@@ -774,6 +1084,7 @@ def _head_parallel_attend(
     sm_scale,
     topk,
     interpret,
+    first_exchange=None,
 ):
     """Head-major ``[Hl, T, D]`` attention (rotated basis) of the rows of the
     requests in ``hp_req`` over their pages of this rank's KV head; other
@@ -782,7 +1093,8 @@ def _head_parallel_attend(
     Requests are attended in rounds of at most ``pages_per_seq`` logical
     blocks (one max-length request): each round exchanges the live pages
     of one page buffer and attends the round's rows in windows of one
-    kernel call."""
+    kernel call. `first_exchange` (`start_first_round_exchange`) has the
+    first round's pages in flight."""
     num_tokens, num_q_heads, head_dim = q.shape
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
@@ -826,30 +1138,12 @@ def _head_parallel_attend(
     limit = pos % block_size + 1
 
     def plan_round(first):
-        csum = jnp.cumsum(jnp.where(seq_idx >= first, blocks, 0))
-        # A request never exceeds the buffer (the block table's width); always
-        # admitting `first` keeps the rounds moving if that ever broke.
-        in_round = (
-            hp_req & (seq_idx >= first) & ((csum <= capacity) | (seq_idx == first))
-        )
-        base = csum - blocks  # the request's first logical block in the buffer
-        total = jnp.max(jnp.where(in_round, csum, 0))
-        nxt = jnp.min(
-            jnp.where((seq_idx >= first) & ~in_round & hp_req, seq_idx, max_num_seqs)
-        )
-        return csum, in_round, base, total, nxt
+        return _plan_round(first, hp_req, blocks, capacity)
 
-    def attend_round(plan, acc, merge):
-        csum, in_round, base, total, _ = plan
+    def attend_round(plan, acc, merge, started=None):
+        _, in_round, base, total, _ = plan
         num_pages = part * replicas
-        # Buffer page b holds logical block l = b % part * replicas + b //
-        # part: logical block s - base[q] of request q.
-        buf = jnp.arange(num_pages, dtype=jnp.int32)
-        logical = buf % part * replicas + buf // part
-        q_of = jnp.searchsorted(csum, logical, side="right", method="compare_all")
-        q_of = jnp.minimum(q_of, max_num_seqs - 1)
-        j = jnp.clip(logical - base[q_of], 0, capacity - 1)
-        pages = jnp.where(logical < total, block_tables_2d[q_of, j], 0)
+        pages = _round_pages(plan, block_tables_2d, replicas)
         kv, sc = _exchange_pages(
             kv_cache,
             scale_cache,
@@ -861,6 +1155,7 @@ def _head_parallel_attend(
             head_width=2 * head_dim,
             axis=axis,
             interpret=interpret,
+            started=started,
         )
 
         def slot(base, block):
@@ -916,7 +1211,7 @@ def _head_parallel_attend(
 
     first = jnp.min(jnp.where(hp_req, seq_idx, max_num_seqs))
     plan = plan_round(first)
-    acc = attend_round(plan, None, merge=False)
+    acc = attend_round(plan, None, merge=False, started=first_exchange)
     first = plan[4]
 
     # Further rounds sit under a cond: a while loop that reads the cache
@@ -988,12 +1283,13 @@ def attend_and_merge(
     decode_rows: int,
     rs_out_precision: bool,
     head_parallel_min_tokens: int = HEAD_PARALLEL_MIN_TOKENS,
+    page_exchange: PageExchange | None = None,
     interpret: bool = False,
 ) -> jax.Array:
     """This rank's (``rank``, ``int32[1]``) attention output ``[T, Hl * D]``
     (unrotated) for its rotated query heads ``q [T, Hl, D]`` and its packed
     ``candidates [T, G * 2 * topk]`` (`msa_dcp.msa_write_and_candidates_dcp`);
-    4-bit caches.
+    4-bit caches. `page_exchange`: `start_first_round_exchange` of this step.
     Runs inside a ``shard_map`` over `axis` (the DCP group)."""
     num_tokens = q.shape[0]
     # The rank is an input: torch_tpu's SPMD partitioner refuses the
@@ -1004,7 +1300,9 @@ def attend_and_merge(
     )
     max_num_seqs = seq_lens.shape[0]
     rows = max_num_seqs * decode_rows
-    if num_tokens < max(head_parallel_min_tokens, 2 * rows):
+    if not head_parallel_step(
+        num_tokens, max_num_seqs, decode_rows, head_parallel_min_tokens
+    ):
         return _dcp_attend(
             q,
             kv_cache,
@@ -1016,11 +1314,8 @@ def attend_and_merge(
             rs_out_precision=rs_out_precision,
             **common,
         ).reshape(num_tokens, -1)
-    seq_idx = jnp.arange(max_num_seqs, dtype=jnp.int32)
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    live = (seq_idx < distribution[2]) & (q_lens > 0)
-    dcp_req = live & (q_lens <= decode_rows)
-    hp_req = live & (q_lens > decode_rows)
+    dcp_req, hp_req = _request_classes(cu_q_lens, distribution, decode_rows)
 
     # The decode requests' rows, compacted: their own cu_q_lens.
     cu_d = jnp.concatenate(
@@ -1055,6 +1350,7 @@ def attend_and_merge(
         hp_req,
         tokens,
         kv_head_replicas=kv_head_replicas,
+        first_exchange=page_exchange,
         **common,
     )
     hp_out = unrotate_to_rows(hp_out, interpret=interpret)
