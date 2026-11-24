@@ -236,8 +236,9 @@ class MoEBlock(Block):
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
         mp: MoEParams = plan.block_params[self.name]
         nb_picks = rup(ex.B * mp.TOPK, 128)
+        wn_cols = 128 if mp.local_wn else mp.E
         scr: dict[str, Any] = {
-            "wn": pltpu.VMEM((ex.MR, mp.E), F32),
+            "wn": pltpu.VMEM((ex.MR, wn_cols), F32),
             "sg": pltpu.VMEM((ex.MB, 128), F32),
             "hitv": pltpu.VMEM((ex.MR, 128), I32),
             "hits": pltpu.SMEM((ex.MR, 128), I32),

@@ -113,14 +113,19 @@ def segment_tiles(
     h = moe_e7_hier(B, DEFAULT_HIER) if hier is None else hier
     skip_pad = bool(envs.VLLM_TPU_MK_MOE_E7 or envs.VLLM_TPU_MK_MOE_SKIP_PAD)
     exact_width = bool(envs.VLLM_TPU_MK_MOE_E7 or envs.VLLM_TPU_MK_MOE_EXACT_WIDTH)
-    blocks: dict[str, dict[str, Any]] = {
-        "moe": {
-            "pipe_ep": PIPE_EP,
-            "moe_unroll": True,
-            "skip_pad": skip_pad,
-            "exact_width": exact_width,
-        }
+    moe_cfg: dict[str, Any] = {
+        "pipe_ep": PIPE_EP,
+        "moe_unroll": True,
+        "skip_pad": skip_pad,
+        "exact_width": exact_width,
     }
+    if envs.VLLM_TPU_MK_MOE_DIRECT_STORE:
+        moe_cfg["r2_direct_store"] = True
+    if envs.VLLM_TPU_MK_MOE_TOPK_LANES:
+        moe_cfg["topk_lanes"] = True
+    if envs.VLLM_TPU_MK_MOE_LOCAL_WN:
+        moe_cfg["local_wn"] = True
+    blocks: dict[str, dict[str, Any]] = {"moe": moe_cfg}
     return Tiles(
         ebank=2 << 20,
         nbe=nbe,
