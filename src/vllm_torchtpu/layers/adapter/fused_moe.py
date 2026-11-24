@@ -291,3 +291,127 @@ def fused_moe_gmm(
         topk_ids,
         experts_start,
     )
+
+
+# Shared-expert-in-combine variant (TPU_MINIMAX_M3_SHARED_IN_COMBINE): the op
+# also takes the shared expert's activation [T, Ks], its e4m3/bf16 down weight
+# [Ks, H] and per-channel scale [H], and returns routed + shared.
+_fused_moe_shared_kernel_cache: dict[tuple, Callable] = {}
+
+
+def _get_fused_moe_shared_custom_op(
+    *,
+    topk: int,
+    activation: str,
+    use_ep: bool,
+    rhs_quant_dtype=None,
+    skip_padded_tokens: bool | None = None,
+):
+    if skip_padded_tokens is None:
+        skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
+    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    op = _fused_moe_shared_kernel_cache.get(cache_key)
+    if op is not None:
+        return op
+    kernel_instance_id = _allocate_kernel_instance_id()
+    wrapped_fn = functools.partial(
+        _fused_moe_shared_func,
+        topk=topk,
+        activation=activation,
+        use_ep=use_ep,
+        use_sparse_core=envs.USE_MOE_SPARSE_CORE,
+        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+    op = pallas.jax_op(f"pallas::fused_moe_shared_kernel_{kernel_instance_id}", wrapped_fn)
+
+    def _fake(hidden_states, *args, **kwargs):
+        return torch.empty_like(hidden_states)
+
+    op.register_fake(_fake)
+    _fused_moe_shared_kernel_cache[cache_key] = op
+    return op
+
+
+def _fused_moe_shared_func(
+    hidden_states,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    topk_weights,
+    topk_ids,
+    experts_start,
+    shared_act,
+    shared_w,
+    shared_scale,
+    **kwargs,
+):
+    return fused_moe_func(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        None,
+        None,
+        topk_weights,
+        topk_ids,
+        experts_start,
+        shared_act=shared_act,
+        shared_w=shared_w,
+        shared_scale=shared_scale,
+        **kwargs,
+    )
+
+
+def prebuild_fused_moe_shared_kernel(**kwargs) -> None:
+    """Build the shared-in-combine op outside a traced forward."""
+    _get_fused_moe_shared_custom_op(**kwargs)
+
+
+def fused_moe_gmm_shared(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    experts_start: torch.Tensor | None,
+    shared_act: torch.Tensor,
+    shared_w: torch.Tensor,
+    shared_scale: torch.Tensor,
+    topk: int,
+    activation: str,
+    rhs_quant_dtype=None,
+    skip_padded_tokens: bool | None = None,
+) -> torch.Tensor:
+    """``fused_moe_gmm`` (no biases) plus the shared expert's down projection
+    ``bf16(shared_act @ bf16(shared_w)) * shared_scale``, added with the
+    roundings of the separate add (the routed scale is applied to the routing
+    weights, so the routed output enters the sum unscaled)."""
+    use_ep = experts_start is not None
+    op = _get_fused_moe_shared_custom_op(
+        topk=topk,
+        activation=activation,
+        use_ep=use_ep,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+    if experts_start is None:
+        experts_start = torch.zeros((), dtype=torch.int32, device=hidden_states.device)
+    return op(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        experts_start,
+        shared_act,
+        shared_w,
+        shared_scale,
+    )

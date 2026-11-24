@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_E4M3_QKV: bool = False
     TPU_MINIMAX_M3_SP_A2A_OPROJ: str = "off"
     TPU_MINIMAX_M3_SP_A2A_E4M3: bool = False
+    TPU_MINIMAX_M3_SHARED_IN_COMBINE: bool = False
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -866,6 +867,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # contract the gathered e4m3 rows against their e4m3 weight (e4m3 x e4m3,
     # f32 accumulation) instead of dequantizing both to bf16.
     "TPU_MINIMAX_M3_SP_E4M3_QKV": env_bool("TPU_MINIMAX_M3_SP_E4M3_QKV", default=False),
+    # "full" SP steps whose MoE combine runs on the TensorCore
+    # (TPU_MOE_TC_COMBINE): the shared expert's down_proj runs inside the
+    # combine's output pass (kernels/megablox/tc_combine.tc_combine_shared),
+    # so its [T, hidden] partial never round-trips HBM. Same roundings as the
+    # unfused graph; only the K=384 dot's accumulation order may differ.
+    "TPU_MINIMAX_M3_SHARED_IN_COMBINE": env_bool(
+        "TPU_MINIMAX_M3_SHARED_IN_COMBINE", default=False
+    ),
     # "full" SP: instead of reduce-scattering o_proj's per-rank partial sums
     # (bf16 [T, hidden]), all-to-all the attention output (bf16 [T, heads/TP x
     # head_dim], 1/6 of the bytes) so each rank holds every head of its token
