@@ -923,12 +923,9 @@ class TpuPlatform(Platform):
         # also check each layer's typed ModelArchitectureConfig view.
         if layout is VllmKVCacheLayout.LBHNC and vllm_config.model_config is not None:
             arch_config = vllm_config.model_config.model_arch_config
-            has_hd64_layer = vllm_config.model_config.get_head_size() == 64 or (
-                arch_config is not None
-                and any(
-                    arch_config[i].head_size == 64
-                    for i in range(arch_config.total_num_hidden_layers)
-                )
+            has_hd64_layer = vllm_config.model_config.get_head_size() == 64 or any(
+                arch_config[i].head_size == 64
+                for i in range(arch_config.total_num_hidden_layers)
             )
             if has_hd64_layer:
                 raise NotImplementedError(

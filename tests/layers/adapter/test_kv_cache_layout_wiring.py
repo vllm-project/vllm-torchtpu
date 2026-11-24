@@ -617,6 +617,60 @@ def test_default_layout_accepts_a_layout_blind_kernel_entry(nhd, monkeypatch):
     assert "kv_layout" not in bound.keywords
 
 
+def _build_mixed_shared_pool(
+    *,
+    num_blocks: int,
+    block_size: int,
+    swa_heads: int,
+    swa_hd: int,
+    glob_heads: int,
+    glob_hd: int,
+    dtype: torch.dtype,
+    sliding_window: int,
+) -> tuple[torch.Tensor, tuple[int, ...], tuple[int, ...], int, int, int]:
+    swa_b = page_bytes(BATCHED, swa_heads, swa_hd, dtype, block_size=block_size)
+    glob_b = page_bytes(BATCHED, glob_heads, glob_hd, dtype, block_size=block_size)
+    pool_b = max(swa_b, glob_b)
+    swa_split, glob_split = pool_b // swa_b, pool_b // glob_b
+    swa_native = BATCHED.get_kv_cache_shape(
+        num_blocks * swa_split, block_size, swa_heads, swa_hd, dtype
+    )
+    glob_native = BATCHED.get_kv_cache_shape(
+        num_blocks * glob_split, block_size, glob_heads, glob_hd, dtype
+    )
+    pool = materialize_shared_attention_cache(
+        layer_specs=[
+            (
+                "swa",
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=swa_heads,
+                    head_size=swa_hd,
+                    dtype=dtype,
+                    sliding_window=sliding_window,
+                    page_size_padded=pool_b,
+                ),
+            ),
+            (
+                "glob",
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=glob_heads,
+                    head_size=glob_hd,
+                    dtype=dtype,
+                    page_size_padded=pool_b,
+                ),
+            ),
+        ],
+        tensor_size=num_blocks * pool_b,
+        num_blocks=num_blocks,
+        kernel_block_size=block_size,
+        attn_backend=BATCHED,
+        device=torch.device("cpu"),
+    )
+    return pool, swa_native, glob_native, swa_split, glob_split, pool_b
+
+
 @pytest.mark.parametrize("block_size", [128, 256])
 @pytest.mark.parametrize(
     "swa_heads,swa_hd,glob_heads,glob_hd",
@@ -637,45 +691,17 @@ def test_shared_pool_seq_along_lane_traces_kernel_without_transpose(
 
     num_blocks = 8
     with _layout_env(monkeypatch, "HND"):
-        swa_b = page_bytes(BATCHED, swa_heads, swa_hd, FP8, block_size=block_size)
-        glob_b = page_bytes(BATCHED, glob_heads, glob_hd, FP8, block_size=block_size)
-        pool_b = max(swa_b, glob_b)
-        swa_split, glob_split = pool_b // swa_b, pool_b // glob_b
-        swa_native = BATCHED.get_kv_cache_shape(
-            num_blocks * swa_split, block_size, swa_heads, swa_hd, FP8
-        )
-        glob_native = BATCHED.get_kv_cache_shape(
-            num_blocks * glob_split, block_size, glob_heads, glob_hd, FP8
-        )
-        pool = materialize_shared_attention_cache(
-            layer_specs=[
-                (
-                    "swa",
-                    SlidingWindowSpec(
-                        block_size=block_size,
-                        num_kv_heads=swa_heads,
-                        head_size=swa_hd,
-                        dtype=FP8,
-                        sliding_window=1024,
-                        page_size_padded=pool_b,
-                    ),
-                ),
-                (
-                    "glob",
-                    FullAttentionSpec(
-                        block_size=block_size,
-                        num_kv_heads=glob_heads,
-                        head_size=glob_hd,
-                        dtype=FP8,
-                        page_size_padded=pool_b,
-                    ),
-                ),
-            ],
-            tensor_size=num_blocks * pool_b,
-            num_blocks=num_blocks,
-            kernel_block_size=block_size,
-            attn_backend=BATCHED,
-            device=torch.device("cpu"),
+        pool, swa_native, glob_native, swa_split, glob_split, pool_b = (
+            _build_mixed_shared_pool(
+                num_blocks=num_blocks,
+                block_size=block_size,
+                swa_heads=swa_heads,
+                swa_hd=swa_hd,
+                glob_heads=glob_heads,
+                glob_hd=glob_hd,
+                dtype=FP8,
+                sliding_window=1024,
+            )
         )
         kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[
             get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
@@ -760,7 +786,7 @@ def test_get_shared_pool_shape_and_seq_along_lane_predicate(monkeypatch):
 @pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "swa_heads,swa_hd,glob_heads,glob_hd",
-    [(2, 256, 1, 512), (2, 128, 2, 256)],
+    [(2, 256, 1, 512), (2, 80, 1, 160), (2, 128, 2, 256)],
 )
 def test_shared_pool_seq_along_lane_matches_separate_caches_on_tpu(
     hnd, swa_heads, swa_hd, glob_heads, glob_hd
@@ -775,49 +801,19 @@ def test_shared_pool_seq_along_lane_matches_separate_caches_on_tpu(
     from vllm_torchtpu.layers.adapter import attention as adapter
 
     bs, nblk = 128, 8
-    swa_b = page_bytes(BATCHED, swa_heads, swa_hd, BF16, block_size=bs)
-    glob_b = page_bytes(BATCHED, glob_heads, glob_hd, BF16, block_size=bs)
-    pool_b = max(swa_b, glob_b)
-    swa_s, glob_s = pool_b // swa_b, pool_b // glob_b
-    pool_t = materialize_shared_attention_cache(
-        layer_specs=[
-            (
-                "swa",
-                SlidingWindowSpec(
-                    block_size=bs,
-                    num_kv_heads=swa_heads,
-                    head_size=swa_hd,
-                    dtype=BF16,
-                    sliding_window=192,
-                    page_size_padded=pool_b,
-                ),
-            ),
-            (
-                "glob",
-                FullAttentionSpec(
-                    block_size=bs,
-                    num_kv_heads=glob_heads,
-                    head_size=glob_hd,
-                    dtype=BF16,
-                    page_size_padded=pool_b,
-                ),
-            ),
-        ],
-        tensor_size=nblk * pool_b,
+    pool_t, swa_native, glob_native, swa_s, glob_s, _ = _build_mixed_shared_pool(
         num_blocks=nblk,
-        kernel_block_size=bs,
-        attn_backend=BATCHED,
-        device=torch.device("cpu"),
+        block_size=bs,
+        swa_heads=swa_heads,
+        swa_hd=swa_hd,
+        glob_heads=glob_heads,
+        glob_hd=glob_hd,
+        dtype=BF16,
+        sliding_window=192,
     )
     shared = jnp.zeros(tuple(pool_t.shape), dtype=jnp.bfloat16)
-    sep_swa = jnp.zeros(
-        BATCHED.get_kv_cache_shape(nblk * swa_s, bs, swa_heads, swa_hd, BF16),
-        dtype=jnp.bfloat16,
-    )
-    sep_glob = jnp.zeros(
-        BATCHED.get_kv_cache_shape(nblk * glob_s, bs, glob_heads, glob_hd, BF16),
-        dtype=jnp.bfloat16,
-    )
+    sep_swa = jnp.zeros(swa_native, dtype=jnp.bfloat16)
+    sep_glob = jnp.zeros(glob_native, dtype=jnp.bfloat16)
     mesh = jax.sharding.Mesh(np.asarray(jax.devices("tpu")[:1]), ("model",))
     rng = np.random.default_rng(0)
     pre_len, tot_len = bs + 16, bs + 17

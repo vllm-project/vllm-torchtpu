@@ -238,7 +238,7 @@ def _build_mock_cpu_runner(
     *,
     block_size: int = 16,
     kv_cache_dtype: torch.dtype = torch.bfloat16,
-    kv_cache_layout: str | None = None,
+    kv_cache_layout: str = "LBNHC",
 ) -> MagicMock:
     """Construct a CPU-backed `TPUModelRunner` mock wired to a real `KVCacheManager`."""
     model_config = ModelConfig(
@@ -252,8 +252,7 @@ def _build_mock_cpu_runner(
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
     )
-    if kv_cache_layout is not None:
-        cache_config.kv_cache_layout = kv_cache_layout
+    cache_config.kv_cache_layout = kv_cache_layout
     scheduler_config = SchedulerConfig(
         max_num_seqs=16,
         max_model_len=1024,

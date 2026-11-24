@@ -291,7 +291,9 @@ class TestTpuPlatform:
         vllm_config.model_config.hf_config = None
         # Set in ModelConfig.__post_init__, so the spec has no such attribute.
         vllm_config.model_config.runner_type = "generate"
-        vllm_config.model_config.model_arch_config = None
+        arch_config = MagicMock(total_num_hidden_layers=1)
+        arch_config.__getitem__.return_value.head_size = 128
+        vllm_config.model_config.model_arch_config = arch_config
         vllm_config.cache_config = CacheConfig()
         vllm_config.cache_config.block_size = None
         vllm_config.cache_config.enable_prefix_caching = False

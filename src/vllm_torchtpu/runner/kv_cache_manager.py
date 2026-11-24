@@ -357,7 +357,6 @@ class KVCacheManager:
                 if (
                     attn_module.attn_type == AttentionType.DECODER
                     and attn_module.head_size == 64
-                    and self.runner.cache_config.kv_cache_layout is not None
                     and self.runner.cache_config.get_resolved_kv_cache_layout()
                     is VllmKVCacheLayout.LBHNC
                 ):
