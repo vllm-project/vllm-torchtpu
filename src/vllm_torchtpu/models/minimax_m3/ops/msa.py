@@ -1375,7 +1375,6 @@ def _get_msa_dcp_fp4_op(
         elif (
             split_score_op is not None
             and dcp_lane is not None
-            and index_reuse is None
             and max(1, envs.TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MIN_TOKENS)
             <= k.shape[0]
             <= split_max
@@ -1385,7 +1384,10 @@ def _get_msa_dcp_fp4_op(
         ):
             # Index heads of every TP rank (rank i holds head
             # i // kv_head_replicas), this rank's write and its part of the
-            # pages for all heads, then every part to every rank.
+            # pages for all heads, then every part to every rank. Also the
+            # Full layers of an index-reuse step (Shared layers took the
+            # branch above): the merged candidates equal the score op's bit
+            # for bit, so the reuse selection is unchanged.
             tp_group = get_tp_group()
             index_q = tp_group.all_gather(index_q.contiguous(), dim=1)[
                 :, ::kv_head_replicas
@@ -1432,8 +1434,8 @@ def _get_msa_dcp_fp4_op(
                 dcp_rank,
                 q.contiguous(),
             )
-            if index_reuse is not None and kv_heads > 1:
-                index_reuse["candidates"] = candidates
+        if index_reuse is not None and not shared and kv_heads > 1:
+            index_reuse["candidates"] = candidates
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
         scale_cache.copy_(new_scale_cache)
