@@ -49,7 +49,6 @@ logger = init_logger(__name__)
 
 MAX_TOKENS: int = int(envs.TPU_MOE_TP_DENSE_FP4_MAX_TOKENS)
 ENABLED: bool = MAX_TOKENS > 0
-INT_WORDS: bool = bool(envs.TPU_MOE_TP_DENSE_FP4_INT_WORDS)
 QB = 128
 ROW_ALIGN = 8
 
@@ -253,21 +252,19 @@ def finalize(layer: Any, ep_w13_scale: torch.Tensor, activation: str) -> None:
     if _STATS["layers"] == 1:
         logger.info(
             "[moe-tp-dense] TPU_MOE_TP_DENSE_FP4_MAX_TOKENS=%d on: E=%d ep=%d rank=%d "
-            "slice I/ep=%d w13/s13/w2/s2=%s packed w=%s %s s=%s bytes/layer=%d row_align=%d first_layer=%s "
-            "TPU_MOE_TP_DENSE_FP4_INT_WORDS=%s",
-            MAX_TOKENS, E, ep, st["rank"], i_s, shapes, list(w.shape), w.dtype, list(s.shape), nbytes,
-            ROW_ALIGN, getattr(layer, "layer_name", "?"), INT_WORDS)
+            "slice I/ep=%d w13/s13/w2/s2=%s packed w=%s s=%s bytes/layer=%d row_align=%d first_layer=%s",
+            MAX_TOKENS, E, ep, st["rank"], i_s, shapes, list(w.shape), list(s.shape), nbytes,
+            ROW_ALIGN, getattr(layer, "layer_name", "?"))
 
 
 _PACK_OP = None
 
 
 def _pack_jax(w13: jax.Array, s13: jax.Array, w2: jax.Array, s2: jax.Array) -> tuple[jax.Array, jax.Array]:
-    from vllm_torchtpu.kernels.experimental.moe_tp_dense_fp4 import pack, pack_words
+    from vllm_torchtpu.kernels.experimental.moe_tp_dense_fp4 import pack
 
-    w, s = pack(w13, s13.reshape(s13.shape[0], s13.shape[1], -1), w2,
+    return pack(w13, s13.reshape(s13.shape[0], s13.shape[1], -1), w2,
                 s2.reshape(s2.shape[0], s2.shape[1], -1))
-    return pack_words(w, s) if INT_WORDS else (w, s)
 
 
 def _pack_op():

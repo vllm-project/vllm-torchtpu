@@ -139,48 +139,8 @@ def pack(w1, s1, w2, s2):
     return jnp.concatenate([w1, w2r], axis=1), jnp.concatenate([s1, s2r], axis=1)
 
 
-# Int-word layout (pack_words): the fp4 record stored as int32 words so the fp4 -> e4m3 decode is four integer
-# ops per word instead of a generic float conversion per element. For each 128-row block, word row a byte j holds
-# row 4a+j in its low nibble and row 64+4a+j in its high nibble. Moving the nibble's 3 magnitude bits to bits 2-4
-# and the sign to bit 7 gives the e4m3 code of the fp4 value times 2^-6 (normals and the 0.5 subnormal alike); the
-# 2^6 goes into the f32 block scales, so every product and partial sum is bitwise the fp4 record's.
-_WR = QB // 8
-
-
-def _i32(v):
-    return jnp.int32(v - (1 << 32) if v >= 1 << 31 else v)
-
-
-def _decode_words(wb):
-    lo = ((wb & _i32(0x07070707)) << 2) | ((wb & _i32(0x08080808)) << 4)
-    hi = ((wb >> 2) & _i32(0x1C1C1C1C)) | (wb & _i32(0x80808080))
-    return jnp.concatenate([pltpu.bitcast(lo, jnp.float8_e4m3fn), pltpu.bitcast(hi, jnp.float8_e4m3fn)], axis=0)
-
-
-_FP4_MAG = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-
-
-def _fp4_codes(w):
-    v = w.astype(jnp.float32)
-    a = jnp.abs(v)
-    idx = sum((a >= (lo + hi) / 2).astype(jnp.int32) for lo, hi in zip(_FP4_MAG[:-1], _FP4_MAG[1:]))
-    return idx | (jnp.signbit(v).astype(jnp.int32) << 3)
-
-
-def pack_words(W, S):
-    """Packed (W [E,R,C] fp4, S f32) -> (int32 words [E,R/8,C], S * 64); one expert at a time."""
-    e, r, c = W.shape
-
-    def one(w):
-        q = _fp4_codes(w).reshape(r // QB, 2, _WR, 4, c)
-        byte = q[:, 0] | (q[:, 1] << 4)  # [blk, a, j, c]
-        return sum(byte[:, :, j] << (8 * j) for j in range(4)).reshape(r // 8, c).astype(jnp.int32)
-
-    return lax.map(one, W), S * 64.0
-
-
 def _kernel_packed(hit_ref, nhit_ref, x_ref, gw_hbm, w_hbm, s_hbm, out_ref, wv, sv, gwv, acc, sem,
-            *, slots, fs, k, nch, compute, act, words=False):
+            *, slots, fs, k, nch, compute, act):
     f2 = 2 * fs
     nh = nhit_ref[0]
     acc[...] = jnp.zeros_like(acc)
@@ -200,11 +160,6 @@ def _kernel_packed(hit_ref, nhit_ref, x_ref, gw_hbm, w_hbm, s_hbm, out_ref, wv, 
 
     x = x_ref[...]
 
-    def wblock(w, r0):
-        if words:
-            return _decode_words(w[r0 // 8:r0 // 8 + _WR, :])
-        return w[r0:r0 + QB, :].astype(jnp.float8_e4m3fn)
-
     def body(t, carry):
         @pl.when(t + slots - 1 < nh)
         def _():
@@ -219,7 +174,8 @@ def _kernel_packed(hit_ref, nhit_ref, x_ref, gw_hbm, w_hbm, s_hbm, out_ref, wv, 
         s = sv.at[slot]
         g = jnp.zeros((x.shape[0], f2), jnp.float32)
         for kb in range(k // QB):
-            blk = jnp.matmul(x[:, kb * QB:(kb + 1) * QB], wblock(w, kb * QB), preferred_element_type=jnp.float32)
+            blk = jnp.matmul(x[:, kb * QB:(kb + 1) * QB], w[kb * QB:(kb + 1) * QB, :].astype(jnp.float8_e4m3fn),
+                             preferred_element_type=jnp.float32)
             g = g + blk * s[kb:kb + 1, :]
         h = _act(g, fs, act)
         h = (h * gwv[slot][:, 0:1]).astype(x.dtype)
@@ -228,7 +184,8 @@ def _kernel_packed(hit_ref, nhit_ref, x_ref, gw_hbm, w_hbm, s_hbm, out_ref, wv, 
             part = jnp.zeros((x.shape[0], f2), jnp.float32)
             for kb in range(nkb):
                 r0 = k + j * fs + kb * QB
-                blk = jnp.matmul(h[:, kb * QB:(kb + 1) * QB], wblock(w, r0), preferred_element_type=jnp.float32)
+                blk = jnp.matmul(h[:, kb * QB:(kb + 1) * QB], w[r0:r0 + QB, :].astype(jnp.float8_e4m3fn),
+                                 preferred_element_type=jnp.float32)
                 srow = k // QB + j * nkb + kb
                 part = part + blk * s[srow:srow + 1, :]
             acc[:, j * f2:(j + 1) * f2] += part
@@ -239,16 +196,13 @@ def _kernel_packed(hit_ref, nhit_ref, x_ref, gw_hbm, w_hbm, s_hbm, out_ref, wv, 
 
 
 def tp_dense_moe_packed(x, gw, W, S, hit, nhit, *, fs, slots=3, compute=True, act="silu", interpret=False):
-    """W fp4 (pack) or int32 words (pack_words, scales from it); the layout follows W's dtype."""
     mp, k = x.shape
     e, rows, f2 = W.shape
-    words = W.dtype == jnp.int32
-    nch = ((rows * 8 if words else rows) - k) // fs
+    nch = (rows - k) // fs
     n = nch * f2
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     vm = pl.BlockSpec(memory_space=pltpu.VMEM)
-    kern = functools.partial(_kernel_packed, slots=slots, fs=fs, k=k, nch=nch, compute=compute, act=act,
-                             words=words)
+    kern = functools.partial(_kernel_packed, slots=slots, fs=fs, k=k, nch=nch, compute=compute, act=act)
     extra = {"interpret": pltpu.InterpretParams()} if interpret else {}
     return pl.pallas_call(
         kern, **extra,
@@ -265,7 +219,7 @@ def tp_dense_moe_packed(x, gw, W, S, hit, nhit, *, fs, slots=3, compute=True, ac
                 pltpu.SemaphoreType.DMA((slots, 3)),
             ]),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=48 << 20),
-        name=f"tp_dense_moe_{'words' if words else 'packed'}-e{e}-m{mp}-fs{fs}",
+        name=f"tp_dense_moe_packed-e{e}-m{mp}-fs{fs}",
     )(hit, nhit, x, gw, W, S)
 
 

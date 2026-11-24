@@ -14,10 +14,9 @@
 """TP-sliced fp4 decode MoE, dense over tokens and sparse over hit experts (prototype, not wired)."""
 from vllm_torchtpu.kernels.experimental.moe_tp_dense_fp4.kernel import (
     pack,
-    pack_words,
     reference,
     tp_dense_moe,
     tp_dense_moe_packed,
 )
 
-__all__ = ["pack", "pack_words", "reference", "tp_dense_moe", "tp_dense_moe_packed"]
+__all__ = ["pack", "reference", "tp_dense_moe", "tp_dense_moe_packed"]
