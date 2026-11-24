@@ -365,6 +365,11 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return self.model.get_draft_kv_cache_layer_names()
 
+    @property
+    def context_window(self) -> int:
+        """Trailing context rows a draft forward reads: all its KV is SWA."""
+        return max(layer.attn.window_size for layer in self.model.layers)
+
     def precompute_and_store_context_kv(
         self,
         hidden_states: torch.Tensor,

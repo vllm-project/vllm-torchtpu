@@ -125,6 +125,11 @@ class DFlashProposer:
         """Tokens per request in a draft forward (see _query_block_size)."""
         return self._query_block_size(self.speculative_config.num_speculative_tokens)
 
+    @property
+    def context_window(self) -> int | None:
+        """Trailing context rows a draft forward reads; None reads them all."""
+        return getattr(self.draft_model, "context_window", None)
+
     def _get_static_attn_tensors(
         self, padded_num_reqs: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
