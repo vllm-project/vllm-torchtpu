@@ -13,13 +13,13 @@
 # limitations under the License.
 
 # Copied from vLLM v0.33.0 tests/v1/spec_decode/test_ngram.py, which v0.34.0
-# deletes with the code it tests; points at the in-tree copies.
+# deletes with the code it tests; points at the in-tree copies. Builds a
+# stand-in config instead of a VllmConfig for facebook/opt-125m: in this repo
+# that would run the TPU platform's config checks and fetch the model config,
+# and NgramProposer reads only the fields set here.
+from types import SimpleNamespace
+
 import numpy as np
-from vllm.config import (
-    ModelConfig,
-    SpeculativeConfig,
-    VllmConfig,
-)
 
 from vllm_torchtpu.runner.vllm_v1.spec_decode.ngram_proposer import (
     NgramProposer,
@@ -78,19 +78,20 @@ def test_find_longest_matched_ngram_and_propose_tokens():
 
 def test_ngram_proposer():
     def get_ngram_proposer(min_n: int, max_n: int, k: int) -> NgramProposer:
-        # Dummy model config. Just to set max_model_len.
-        model_config = ModelConfig(model="facebook/opt-125m")
-        return NgramProposer(
-            vllm_config=VllmConfig(
-                model_config=model_config,
-                speculative_config=SpeculativeConfig(
-                    prompt_lookup_min=min_n,
-                    prompt_lookup_max=max_n,
-                    num_speculative_tokens=k,
-                    method="ngram",
-                ),
-            )
+        # Upstream's values: opt-125m's max_model_len and SchedulerConfig's
+        # default max_num_seqs.
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=2048),
+            speculative_config=SimpleNamespace(
+                prompt_lookup_min=min_n,
+                prompt_lookup_max=max_n,
+                num_speculative_tokens=k,
+                method="ngram",
+            ),
+            scheduler_config=SimpleNamespace(max_num_seqs=128),
+            parallel_config=SimpleNamespace(tensor_parallel_size=1),
         )
+        return NgramProposer(vllm_config=vllm_config)  # type: ignore[arg-type]
 
     # No match.
     token_ids_cpu = np.array([[1, 2, 3, 4, 5]])
