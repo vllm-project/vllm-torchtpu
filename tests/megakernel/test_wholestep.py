@@ -766,13 +766,14 @@ def test_key_stream_ring_and_manager_pages_bit_identical(monkeypatch, kw):
 def test_early_loads_bit_identical(key_slots):
     """VLLM_TPU_MK_QSA_EARLY_LOADS: table rows copied before the HC mix, request 0's loop
     loads, the union's table rows and the owned request's first key chunks issued before the
-    projection give bit-identical residuals, completed keys, rings and selected ids. Request
+    projection, and the completed-group stores waited after the request loop, give
+    bit-identical residuals, completed keys, rings and selected ids. Request
     0 streams 6 chunks (more than the slots), request 1 one chunk (fewer than the early
     chunks)."""
     run = functools.partial(
         _run_c, long=True, rank_ids=True, ctx=[6000, 100], max_groups=2048, shard=True,
         union=True, loop=True, xreq=2, skip_idle=True, xmerge=True, key_slots=key_slots,
-        phys=True,
+        phys=True, async_dma=True,
     )
     late = run()
     early = run(early_loads=True)

@@ -121,7 +121,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
     `early_loads` (VLLM_TPU_MK_QSA_EARLY_LOADS; see `_early`): the layer's table rows are
     copied before its HC mix and the request loop's first loads go out before the
-    projection. `pair_score` (VLLM_TPU_MK_QSA_PAIR_SCORE; see `_paired`): with at most R / 2
+    projection; with `async_dma` the loop's completed-group stores are waited once after it
+    (`_late_stores`). `pair_score` (VLLM_TPU_MK_QSA_PAIR_SCORE; see `_paired`): with at most R / 2
     request slots a core pair (`me`, `me ^ 1`) scores each request, half its key chunks
     each, and the even core selects. Both are scheduling only.
     """
@@ -199,6 +200,11 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qx_old", pltpu.VMEM((2, MICRO, 1, 4, 256), f8)),
             ScratchReq("qx_sem", pltpu.SemaphoreType.DMA((6,))),
         ] if self.xreq_loads else []) + ([
+            # `early_loads` with the request loop's async DMAs: each request's completed key
+            # and ring rows keep their own slot until the loop's end (`_store_waits`).
+            ScratchReq("qc_ckq", pltpu.VMEM((nreq, 1, ix.IDX_DIM), BF16)),
+            ScratchReq("qc_rnewq", pltpu.VMEM((nreq, 8, ix.IDX_DIM), BF16)),
+        ] if self.early_loads and self.loop_requests and self.async_dma else []) + ([
             # `_paired`: the odd core's score-column copies to the even core (send, recv).
             ScratchReq("qp_sem", pltpu.SemaphoreType.DMA((2,))),
         ] if self._paired(ex) else []) + (self._shard_scratch(ex) if self.shard_index else []) + (
@@ -698,7 +704,6 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             self.rot,
             pltpu.bitcast,
         )
-        scr["qc_ck"][...] = ck.astype(BF16)
         # Ring: lane l keeps the newest position = l (mod 8) below end = ctx + T.
         end = c0 + T
         lane = jax.lax.broadcasted_iota(I32, (8, 1), 0)
@@ -706,8 +711,16 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         cur_rows = jnp.zeros((8, ix.IDX_DIM), F32)
         for t in range(T):
             cur_rows = jnp.where(p_l == c0 + t, raw_q[t : t + 1], cur_rows)
-        scr["qc_rnew"][...] = jnp.where(p_l >= c0, cur_rows, ring).astype(BF16)
+        rnew = jnp.where(p_l >= c0, cur_rows, ring).astype(BF16)
         o = ctx.stream.sp.block_ord(l, self.name)
+        if self._late_stores:  # waited after the request loop (`_store_waits`)
+            scr["qc_ckq"][q] = ck.astype(BF16)
+            scr["qc_rnewq"][q] = rnew
+            for cp in self._new_group_stores(ctx, o, q):
+                cp.start()
+            return ck, p3 // 4
+        scr["qc_ck"][...] = ck.astype(BF16)
+        scr["qc_rnew"][...] = rnew
         stores = [
             pltpu.make_async_copy(src, ctx.O[dst].at[o, q], scr["qc_sem"].at[2 + i])
             if self.async_dma
@@ -722,6 +735,25 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             for cp in stores:
                 cp.wait()
         return ck, p3 // 4
+
+    def _new_group_stores(self, ctx: Any, o: Any, q: Any) -> list[Any]:
+        """`_late_stores`: request `q`'s completed key and ring rows, from its own slots."""
+        scr = ctx.scr
+        return [
+            pltpu.make_async_copy(scr[src].at[q], ctx.O[dst].at[o, q], scr["qc_sem"].at[2 + i])
+            for i, (src, dst) in enumerate((("qc_ckq", CK_NEW), ("qc_rnewq", RING_NEW)))
+        ]
+
+    def _store_waits(self, ctx: Any, l: Any, n: Any) -> None:  # noqa: E741
+        """Wait for the `n` requests' `_late_stores` copies (one size per semaphore)."""
+        o = ctx.stream.sp.block_ord(l, self.name)
+
+        def body(i: Any, carry: Any) -> Any:
+            for cp in self._new_group_stores(ctx, o, 0):
+                cp.wait()
+            return carry
+
+        jax.lax.fori_loop(0, n, body, 0)
 
     @_scoped("qsa_recent")
     def _recent_micro(self, ctx: Any, l: Any, q: Any) -> Any:
@@ -1168,7 +1200,11 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 def _():
                     issue_loads(0, 0)
 
+            self._late_stores = self._early_now and self.async_dma
             jax.lax.fori_loop(0, n_loop, req, 0)
+            if self._late_stores:
+                self._store_waits(ctx, l, n_loop)
+                self._late_stores = False
             if self.shard_index:
                 self._exchange_selection(ctx)
         elif self.shard_index:
@@ -1702,6 +1738,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
     # the next `emit`), and the `emit` being traced issued the early loads (`_early_now`).
     _tables_inflight = False
     _early_now = False
+    # Trace time: the request loop being traced defers its completed-group stores' waits.
+    _late_stores = False
 
     def _early(self) -> bool:
         """`early_loads` applies: HBM tables, the sharded request loop with its loads issued
