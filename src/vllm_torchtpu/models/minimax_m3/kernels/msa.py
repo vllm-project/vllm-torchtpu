@@ -20,6 +20,7 @@ blocks) into the selection, and keeps the ``topk`` best blocks. Attention then
 runs over the selected blocks only (`msa_attention.msa_sparse_attention`).
 """
 
+import functools
 from collections.abc import Sequence
 
 import jax
@@ -507,14 +508,21 @@ def fold_index_heads(
     num_tokens, num_heads, head_dim = index_q.shape
     seq_id, _, valid = token_positions(num_tokens, seq_lens, cu_q_lens)
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
+    # ``lookup``: per-row reads of the small cu table by a one-hot sum. A
+    # plain ``cu[idx]`` lowers to a compare/select chain over one scalar
+    # operand per table entry: four such fusions cost ~17 us each in the c64
+    # decode indexer (T 256, 33 entries; profile j-e26f1497).
+    if "lookup" in index_fold_opt():
+        cu = functools.partial(msa_indexer.lookup, cu_q_lens)
+    else:
+        cu = cu_q_lens.__getitem__
+    cu_seq = cu(seq_id)
+    q_len = cu(seq_id + 1) - cu_seq
     head = jnp.arange(num_heads, dtype=jnp.int32)[:, None]
     num_real = cu_q_lens[-1]
     rows = jnp.where(
         valid[None],
-        num_heads * cu_q_lens[seq_id][None]
-        + head * q_len[None]
-        + (tok - cu_q_lens[seq_id])[None],
+        num_heads * cu_seq[None] + head * q_len[None] + (tok - cu_seq)[None],
         # Padding tokens after the last request, one unique row each.
         num_heads * num_real + head * (num_tokens - num_real) + (tok - num_real)[None],
     )
@@ -528,15 +536,14 @@ def fold_index_heads(
             ).astype(jnp.int32),
             cu_q_lens.shape[0] - 2,
         )
-        off = r - num_heads * cu_q_lens[req]
-        r_len = jnp.maximum(cu_q_lens[req + 1] - cu_q_lens[req], 1)
+        cu_req = cu(req)
+        off = r - num_heads * cu_req
+        r_len = jnp.maximum(cu(req + 1) - cu_req, 1)
         pad = r >= num_heads * num_real
         pad_off = r - num_heads * num_real
         pad_len = jnp.maximum(num_tokens - num_real, 1)
         src_head = jnp.where(pad, pad_off // pad_len, off // r_len)
-        src_tok = jnp.where(
-            pad, num_real + pad_off % pad_len, cu_q_lens[req] + off % r_len
-        )
+        src_tok = jnp.where(pad, num_real + pad_off % pad_len, cu_req + off % r_len)
         folded = index_q.reshape(num_tokens * num_heads, head_dim)[
             src_tok * num_heads + src_head
         ]
@@ -555,7 +562,8 @@ _index_fold_logged = False
 def index_fold_opt() -> str:
     """`TPU_MINIMAX_M3_INDEX_FOLD_OPT`: ``gather`` folds the index heads by a
     gather instead of a scatter, ``compose`` takes the unfolded scores from
-    `block_scores`' own gather; ``+``-joined. Same values either way."""
+    `block_scores`' own gather, ``lookup`` reads the cu table per row by a
+    one-hot sum; ``+``-joined. Same values either way."""
     global _index_fold_logged
     from vllm_torchtpu import envs
 
