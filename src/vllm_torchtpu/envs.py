@@ -302,6 +302,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_MAX_FREE: bool = False
     TPU_MINIMAX_M3_MSA_MXU_MASK: bool = False
     TPU_MINIMAX_M3_KV4_SHARED_SCALES: bool = False
+    TPU_SPEC_VERIFY_COARSE_PAD: bool = False
+    TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES: bool = False
 
 
 def env_with_choices(
@@ -2004,6 +2006,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # same page DMA, other rows): bitwise. Default off.
     "TPU_MINIMAX_M3_KV4_SHARED_SCALES": env_bool(
         "TPU_MINIMAX_M3_KV4_SHARED_SCALES", default=False
+    ),
+    # Spec decode: pad a verify chunk's logits rows (padded_logits_length,
+    # the length of every verify-row tensor) to a coarse ladder (powers of
+    # two from 8 up to the token bucket of a full batch of verify windows)
+    # instead of the token buckets, so the verify / sampler programs do not
+    # multiply with TPU_TOKEN_BUCKET_EXTRA. The backbone keeps the token
+    # buckets; a full-logits verify runs the LM head at the token-bucket rows
+    # and pads the logits; eager uniforms are drawn at the token-bucket rows.
+    # Same tokens.
+    "TPU_SPEC_VERIFY_COARSE_PAD": env_bool("TPU_SPEC_VERIFY_COARSE_PAD", default=False),
+    # Upload upstream InputBatch's sampling metadata (temperature, top_p,
+    # top_k, penalties) at full length instead of [:num_reqs]: on TPU each
+    # new live request count compiled an eager copy_ + as_strided_inverse
+    # program mid-serving. Rows past num_reqs are never read; same values.
+    "TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES": env_bool(
+        "TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES", default=False
     ),
 }
 
