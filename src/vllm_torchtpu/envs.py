@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_QSA_SELECT_NVIS: int = 0
     VLLM_TPU_MK_AR_HIER_SMALL: bool = False
     VLLM_TPU_MK_QSA_XMERGE: bool = False
+    VLLM_TPU_MK_QSA_UNION_LANEPACK: bool = False
     VLLM_TPU_MK_UATTN_LITE: bool = False
     VLLM_TPU_MK_WHOLE_SKIP_IDLE: bool = False
     VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS: str = ""
@@ -1386,6 +1387,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP): the selection exchange and the union exchange of each QSA layer go out as one
     # all-gather (`QSAFullIndexedBlock.xmerge`). Exact: same int32 payloads, one transfer.
     "VLLM_TPU_MK_QSA_XMERGE": env_bool("VLLM_TPU_MK_QSA_XMERGE"),
+    # Whole-step megakernel QSA ranged union (`select_nvis` >= 2) under main-KV DCP2 without
+    # compressed-key DCP: each pair rank's union packs the lanes it owns from two adjacent code
+    # rows into one (`_nvis_union`), scanning half the rows instead of all of them under an
+    # owner mask. Exact: same union ids, codes, order and count. Read by `QSAFullIndexedBlock`.
+    "VLLM_TPU_MK_QSA_UNION_LANEPACK": env_bool("VLLM_TPU_MK_QSA_UNION_LANEPACK"),
     # Whole-step megakernel union attention: per-tile op cuts (`attend_request`'s `lite`): one
     # code-expand matmul per tile instead of two, and under main-KV DCP one select for V's NaN
     # sanitize + scale with no length mask. Exact: same scores, p and PV terms bit for bit.

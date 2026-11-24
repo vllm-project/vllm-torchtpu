@@ -569,7 +569,47 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 jnp.concatenate(codes, axis=0), tot, row_of, KU, consts, store
             )
 
-        n = jax.lax.fori_loop(0, (m + 1) // 2, it, jnp.zeros((), I32))
+        H = CM // 2
+        rows_own = gpp == 128  # served 512-token blocks: rank r owns whole rows 2p + r
+        if (self.union_lanepack and D == 2 and not self.compressed_dcp and isinstance(r, int)
+                and (rows_own or 128 % (2 * gpp) == 0) and H % 8 == 0):
+            # Pack: rank r's owned groups of code rows 2p and 2p + 1 form packed row p in
+            # ascending id order. gpp = 128: rank r owns all of row 2p + r (a strided row read);
+            # gpp | 64: it owns lanes l with (l // gpp) % 2 == r of every row (row 2p's at
+            # packed lanes [0, 64), row 2p + 1's at [64, 128)). Four CM-row chunks pack into
+            # one 2 * CM-row chunk: half the iterations, same ids, codes and order.
+            def itp(i: Any, tot: Any) -> Any:
+                codes, bases = [], []
+                for k in range(4):
+                    c = 4 * i + k
+                    base = jnp.where(c < m, base_of(c), 0)
+                    b8 = pl.multiple_of(base, 8)
+                    if rows_own:
+                        pk = scr["qu_code"][pl.ds(b8 + r, H, stride=2)]
+                    else:
+                        ev = scr["qu_code"][pl.ds(b8, H, stride=2)]
+                        od = scr["qu_code"][pl.ds(b8 + 1, H, stride=2)]
+                        pk = ua.lane_pack(ev, od, r, gpp, pltpu.roll)
+                    codes.append(pk * jnp.where(c < m, 1, 0))
+                    bases.append(base)
+
+                def row_of(rj: Any) -> Any:
+                    b = bases[3]
+                    for k in (2, 1, 0):
+                        b = jnp.where(rj < (k + 1) * H, bases[k], b)
+                    return b + 2 * jax.lax.rem(rj, H) + (r if rows_own else 0)
+
+                def id_of(rj: Any, lj: Any) -> Any:
+                    return ua.lane_pack_id(row_of(rj), lj, r, gpp)
+
+                return ua.compact_union_chunk(
+                    jnp.concatenate(codes, axis=0), tot, row_of, KU, consts, store,
+                    None if rows_own else id_of,
+                )
+
+            n = jax.lax.fori_loop(0, (m + 3) // 4, itp, jnp.zeros((), I32))
+        else:
+            n = jax.lax.fori_loop(0, (m + 1) // 2, it, jnp.zeros((), I32))
         if self.compressed_dcp:
             ref = scr["qu_id"].at[q, :, pl.ds(at, KU)]
             ref[...] = self._cdcp_gid(ctx, ref[...])
@@ -1044,11 +1084,30 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     # Under `compressed_dcp` both pair ranks hold the request: each builds only
                     # its own union (the one it attends), and `_exchange_unions` sends it to the
                     # ranks of the same pair rank.
+                    pack = (self.union_lanepack and D == 2 and not cdcp and S // 2 % 8 == 0
+                            and (gpp == 128 or 128 % (2 * gpp) == 0))
+
                     def full_union(r: Any) -> None:
-                        code = code_all if D == 1 else jnp.where(
-                            jax.lax.rem(gidx // gpp, D) == r, code_all, 0
-                        )
-                        ids, codes, nu = ua.compact_union(code, KU, ua.union_consts(S, KU))
+                        if pack:  # `_nvis_union`'s pack over all S rows: S / 2 packed rows
+                            if gpp == 128:
+                                code = scr["qu_code"][pl.ds(r, S // 2, stride=2)]
+                            else:
+                                code = ua.lane_pack(
+                                    scr["qu_code"][pl.ds(0, S // 2, stride=2)],
+                                    scr["qu_code"][pl.ds(1, S // 2, stride=2)],
+                                    r, gpp, pltpu.roll,
+                                )
+                            ids, codes, nu = ua.compact_union(
+                                code, KU, ua.union_consts(S // 2, KU)
+                            )
+                            ids = ua.unpack_union_ids(ids, nu, r, gpp)
+                        else:
+                            code = code_all if D == 1 else jnp.where(
+                                jax.lax.rem(gidx // gpp, D) == r, code_all, 0
+                            )
+                            ids, codes, nu = ua.compact_union(
+                                code, KU, ua.union_consts(S, KU)
+                            )
                         if cdcp:
                             ids = self._cdcp_gid(ctx, ids)
                         at = pl.multiple_of(r * KU, 128) if cdcp else r * KU

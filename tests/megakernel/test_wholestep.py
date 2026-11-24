@@ -294,7 +294,8 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
            async_dma: bool = False, B: int | None = None, xreq: int = 0,
            skip_idle: bool = False, xmerge: bool = False, key_mp: int = 0, key_slots: int = 2,
            req_async: int = 0, nvis_balance: bool = False, uattn_lite: bool = False,
-           key_lanes: int = 0, export: bool = False):
+           key_lanes: int = 0, export: bool = False, select_nvis: int = 0,
+           nvis_rows: tuple | None = None):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -340,7 +341,9 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
                    **(dict(xmerge=True) if xmerge else {}),
                    **(dict(req_async=req_async) if req_async else {}),
                    **(dict(nvis_balance=True) if nvis_balance else {}),
-                   **(dict(uattn_lite=True) if uattn_lite else {}))
+                   **(dict(uattn_lite=True) if uattn_lite else {}),
+                   **(dict(select_nvis=select_nvis) if select_nvis else {}),
+                   **(dict(nvis_rows=nvis_rows) if nvis_rows else {}))
     spec = wholestep_spec(
         G,
         R,
@@ -506,6 +509,54 @@ def test_dcp2_union_attention_matches_replicated(monkeypatch):
     with pytest.raises(AssertionError):
         close(_run_c(long=True, rank_ids=True, union=True, shard=True, shared_kv=True, dcp=2,
                      dcp_pool=False))
+
+
+@pytest.mark.parametrize("nvis", [3, 1])
+def test_dcp2_union_lanepack_bit_identical(monkeypatch, nvis):
+    """VLLM_TPU_MK_QSA_UNION_LANEPACK: under main-KV DCP-2 each pair rank's union scans only
+    its packed rows — the ranged union (`select_nvis` 3) and the full-row one (`select_nvis`
+    1) — so the step is bit-identical to the masked scan: residual, selection ids, compressed
+    keys and ring. Negative control (ranged): the packed union's ids shifted by two rows."""
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+    from vllm_torchtpu.models.vllm.qwen4_exp import pool_layout
+
+    monkeypatch.setenv(pool_layout.MAIN_KV_DCP_ENV, "2")
+    kw = dict(long=True, rank_ids=True, union=True, shard=True, shared_kv=True, dcp=2,
+              select_nvis=nvis, nvis_rows=(16, 16), max_groups=8192, ctx=[30001, 9000])
+    calls = []
+    if nvis >= 2:  # packed ranged union: `compact_union_chunk` gets the 7th (`id_of`) arg
+        name, packed = "compact_union_chunk", lambda a, k: len(a) > 6 or "id_of" in k
+    else:  # packed full union: its ids go through `unpack_union_ids`
+        name, packed = "unpack_union_ids", lambda a, k: True
+    orig = getattr(ua, name)
+
+    def spy(*a, **k):
+        calls.append(packed(a, k))
+        return orig(*a, **k)
+
+    monkeypatch.setattr(ua, name, spy)
+    monkeypatch.setenv("VLLM_TPU_MK_QSA_UNION_LANEPACK", "0")
+    off = _run_c(**kw)
+    assert not any(calls)  # the masked union ran
+    calls.clear()
+    monkeypatch.setenv("VLLM_TPU_MK_QSA_UNION_LANEPACK", "1")
+    on = _run_c(**kw)
+    assert calls and all(calls)  # the packed union ran
+    assert np.isfinite(on[0]).all()
+    for i in (0, 3, 4, 7):  # residual, compressed keys, ring, selection ids
+        np.testing.assert_array_equal(on[i], off[i])
+    if nvis < 2:
+        return
+    chunk = orig
+
+    def shifted(code, tot, row_of, KU, consts, store, id_of=None):
+        return chunk(code, tot, lambda rj: row_of(rj) + 2, KU, consts, store,
+                     None if id_of is None else lambda rj, lj: id_of(rj, lj) + 256)
+
+    monkeypatch.setattr(ua, "compact_union_chunk", shifted)
+    jax.clear_caches()  # same spec as `on`: retrace so the shifted ids are compiled in
+    bad = _run_c(**kw)
+    assert not np.array_equal(bad[0], off[0])
 
 
 @pytest.mark.parametrize("long", [False, True])

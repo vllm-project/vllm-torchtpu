@@ -206,7 +206,7 @@ def test_union_chunks_match_full(nv, D, dense):
         assert int(tot) == int(np.sum(want[2]))
 
 
-def _union_chunk_eager(code, tot, bases, CM, KU, consts, store):
+def _union_chunk_eager(code, tot, bases, CM, KU, consts, store, row_of=None, id_of=None):
     """`compact_union_chunk` outside a kernel: `pl.when` as a Python condition."""
     from jax.experimental import pallas as pl
 
@@ -219,9 +219,124 @@ def _union_chunk_eager(code, tot, bases, CM, KU, consts, store):
 
     pl.when = when
     try:
-        return ua.compact_union_chunk(
-            code, tot,
-            lambda rj: jnp.where(rj < CM, bases[0] + rj, bases[1] + rj - CM), KU, consts, store,
-        )
+        row_of = row_of or (lambda rj: jnp.where(rj < CM, bases[0] + rj, bases[1] + rj - CM))
+        return ua.compact_union_chunk(code, tot, row_of, KU, consts, store, id_of)
     finally:
         pl.when = orig
+
+
+def _lanepack_union(code, nv, r, gpp, KU, CM, S, rr=None):
+    """`_nvis_union`'s lane-packed chunk loop outside a kernel (`jnp.roll` for `pltpu.roll`).
+    `rr`: rank whose ids the packed lanes are mapped back with (negative control)."""
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+
+    rr = r if rr is None else rr
+    H = CM // 2
+    m, base = _plan(nv, CM, S, gpp, 1)
+    out = {"ids": np.zeros((1, KU), np.int32), "codes": np.zeros((1, KU), np.int32)}
+
+    def store(j0, ids, codes):
+        W = ids.shape[1]
+        out["ids"][:, j0:j0 + W] += np.asarray(ids)
+        out["codes"][:, j0:j0 + W] += np.asarray(codes)
+
+    tot = jnp.zeros((), jnp.int32)
+    consts = ua.union_chunk_consts(2 * CM, KU)
+    for i in range((m + 3) // 4):
+        parts, bases = [], []
+        for k in range(4):
+            c = 4 * i + k
+            bs = int(base(c)) if c < m else 0
+            if gpp == 128:  # whole rows: rank r's are 2p + r
+                parts.append(code[bs + r:bs + CM:2] * (c < m))
+            else:
+                ev = jnp.asarray(code[bs:bs + CM:2])
+                od = jnp.asarray(code[bs + 1:bs + CM:2])
+                parts.append(np.asarray(ua.lane_pack(ev, od, r, gpp, jnp.roll)) * (c < m))
+            bases.append(bs)
+
+        def row_of(rj, bases=bases):
+            b = bases[3]
+            for k in (2, 1, 0):
+                b = jnp.where(rj < (k + 1) * H, bases[k], b)
+            return b + 2 * jax.lax.rem(rj, H) + (rr if gpp == 128 else 0)
+
+        tot = _union_chunk_eager(
+            jnp.asarray(np.concatenate(parts, 0)), tot, bases, CM, KU, consts, store,
+            row_of=row_of, id_of=None if gpp == 128 else (
+                lambda rj, lj, row_of=row_of: ua.lane_pack_id(row_of(rj), lj, rr, gpp)),
+        )
+    return out["ids"], out["codes"], int(tot)
+
+
+@pytest.mark.parametrize("nv,gpp,dense", [(25000, 32, 0.05), (50000, 32, 0.02),
+                                          (9000, 32, 0.9), (16384, 16, 0.1),
+                                          (40000, 64, 0.03), (0, 32, 0.5), (65536, 32, 0.004),
+                                          (25000, 128, 0.05), (50000, 128, 0.02),
+                                          (9000, 128, 0.9), (65536, 128, 0.004)])
+def test_union_lanepack_matches_masked(nv, gpp, dense):
+    """VLLM_TPU_MK_QSA_UNION_LANEPACK: each DCP2 pair rank's union over its lane-packed rows
+    (half the chunks) equals its owner-masked union: same ids, codes, order and count."""
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+
+    S, KU, CM, D = 512, 2048, 64, 2
+    rng = np.random.default_rng(nv + gpp)
+    code = rng.integers(1, 16, (S, 128)) * (rng.random((S, 128)) < dense)
+    gid = np.arange(S)[:, None] * 128 + np.arange(128)[None]
+    code = np.where(gid < nv, code, 0).astype(np.int32)
+    for r in range(D):
+        own = np.where((gid // gpp) % D == r, code, 0)
+        if (own > 0).sum() > KU:  # the union is at most T * budget wide
+            keep = np.cumsum((own > 0).ravel()).reshape(S, 128) <= KU
+            own = np.where(keep, own, 0)
+            code = np.where((gid // gpp) % D == r, own, code)
+        want = ua.compact_union(jnp.asarray(own), KU, ua.union_consts(S, KU))
+        ids, codes, tot = _lanepack_union(code, nv, r, gpp, KU, CM, S)
+        np.testing.assert_array_equal(ids, want[0])
+        np.testing.assert_array_equal(codes, want[1])
+        assert tot == int(np.sum(want[2]))
+
+
+@pytest.mark.parametrize("gpp", [32, 128])
+def test_union_lanepack_wrong_rank_ids_caught(gpp):
+    """Negative control: mapping rank 1's packed rows back with rank 0's ids is caught."""
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+
+    S, KU, CM, nv = 512, 2048, 64, 25000
+    rng = np.random.default_rng(7)
+    gid = np.arange(S)[:, None] * 128 + np.arange(128)[None]
+    code = rng.integers(1, 16, (S, 128)) * (rng.random((S, 128)) < 0.05)
+    code = np.where(gid < nv, code, 0).astype(np.int32)
+    own = np.where((gid // gpp) % 2 == 1, code, 0)
+    want = ua.compact_union(jnp.asarray(own), KU, ua.union_consts(S, KU))
+    ids, codes, _ = _lanepack_union(code, nv, 1, gpp, KU, CM, S, rr=0)
+    np.testing.assert_array_equal(codes, want[1])  # same codes, same order
+    assert not np.array_equal(ids, want[0])
+
+
+@pytest.mark.parametrize("nv,gpp,dense", [(25000, 128, 0.05), (65536, 128, 0.004),
+                                          (50000, 32, 0.02), (9000, 16, 0.9)])
+def test_full_union_lanepack_matches_masked(nv, gpp, dense):
+    """VLLM_TPU_MK_QSA_UNION_LANEPACK on the full-row union (`full_union`): `compact_union`
+    over a pair rank's S / 2 packed rows, ids unpacked, equals its owner-masked union over S."""
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+
+    S, KU = 512, 2048
+    rng = np.random.default_rng(nv + 3 * gpp)
+    code = rng.integers(1, 16, (S, 128)) * (rng.random((S, 128)) < dense)
+    gid = np.arange(S)[:, None] * 128 + np.arange(128)[None]
+    code = np.where(gid < nv, code, 0).astype(np.int32)
+    for r in range(2):
+        own = np.where((gid // gpp) % 2 == r, code, 0)
+        want = ua.compact_union(jnp.asarray(own), KU, ua.union_consts(S, KU))
+        if gpp == 128:
+            packed = jnp.asarray(code[r::2])
+        else:
+            packed = ua.lane_pack(jnp.asarray(code[0::2]), jnp.asarray(code[1::2]), r, gpp,
+                                  jnp.roll)
+        ids, codes, n = ua.compact_union(packed, KU, ua.union_consts(S // 2, KU))
+        np.testing.assert_array_equal(ua.unpack_union_ids(ids, n, r, gpp), want[0])
+        np.testing.assert_array_equal(codes, want[1])
+        assert int(np.sum(n)) == int(np.sum(want[2]))
+        if r == 1 and int(np.sum(n)):  # negative control: unpacked as the other rank
+            assert not np.array_equal(ua.unpack_union_ids(ids, n, 0, gpp), want[0])

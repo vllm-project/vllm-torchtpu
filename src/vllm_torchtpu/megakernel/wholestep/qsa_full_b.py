@@ -294,6 +294,13 @@ class QSAFullIndexedBlock(QSAFullBlock):
         # 3: also the bisection `NVIS_DIGIT` bits per pass (fewer dependent count passes).
         self.nvis_digit = NVIS_DIGIT if self.select_nvis and int(select_nvis) >= 3 else 1
         self.nvis_rows = tuple(int(x) for x in nvis_rows)
+        # VLLM_TPU_MK_QSA_UNION_LANEPACK (default off; exact): under main-KV DCP2 without
+        # `compressed_dcp`, the ranged union of pair rank r packs the lanes it owns from two
+        # adjacent code rows into one row (`_nvis_union`), so each of the D unions scans half
+        # the rows instead of the whole visible range under a mask. Same ids, codes and order.
+        self.union_lanepack = os.environ.get(
+            "VLLM_TPU_MK_QSA_UNION_LANEPACK", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
         # VLLM_TPU_MK_QSA_THR_FAST (default off; exact): the full-scan selection's
         # thresholds skip the id passes unless a tie is truncated (t), stop the value
         # passes once the count at `lo` is exactly the budget (e), and scan only the
