@@ -250,6 +250,9 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_ADAPTIVE_2D_CHANNEL_SCALES: bool = False
     MOE_ADAPTIVE_AG_LEAD_AXIS: bool = False
+    MOE_ADAPTIVE_SKIP_UNROUTED: bool = False
+    MOE_ADAPTIVE_PREFILL_RUNGS: bool = False
+    MOE_ADAPTIVE_COMBINE_LANDED: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -1965,6 +1968,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of gathering in {2,0,1} and relayouting the whole [T, H/128,
     # 128] block (~140 us per layer at 8K tokens on tpu7x).
     "MOE_ADAPTIVE_AG_LEAD_AXIS": env_bool("MOE_ADAPTIVE_AG_LEAD_AXIS"),
+    # Adaptive fused EP MoE: token-padding rows (NaN-masked router logits) and
+    # other rows that route nowhere are dropped from the dispatch instead of
+    # landing on expert 0 (default off).
+    "MOE_ADAPTIVE_SKIP_UNROUTED": env_bool("MOE_ADAPTIVE_SKIP_UNROUTED"),
+    # Adaptive fused EP MoE: emit the tail-tile height rungs on prefill-sized
+    # builds too (default off).
+    "MOE_ADAPTIVE_PREFILL_RUNGS": env_bool("MOE_ADAPTIVE_PREFILL_RUNGS"),
+    # Adaptive fused EP MoE: land the whole arrival buffer in VMEM with a few
+    # contiguous DMAs on combine when it fits (default off).
+    "MOE_ADAPTIVE_COMBINE_LANDED": env_bool("MOE_ADAPTIVE_COMBINE_LANDED"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the
