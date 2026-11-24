@@ -727,7 +727,6 @@ def _resolve_flags_and_verdict(
     flags_list = [
         flag
         for cond, flag in (
-            (profile.architecture_unverified, "architecture_unverified"),
             (
                 best.n_splits > _summed_calls(best, scope_context),
                 "multi_call_unmodeled",

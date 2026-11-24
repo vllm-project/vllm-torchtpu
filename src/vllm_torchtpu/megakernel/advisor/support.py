@@ -234,19 +234,18 @@ def exceeds_default_buckets(workload: WorkloadSpec, rows_per_call: int) -> bool:
     return rows_per_call > tops.get(workload.phase, rows_per_call)
 
 
-def _core_gaps(profile: ModelProfile) -> tuple[bool, bool, bool]:
-    """Return `(unmodeled, family_gap, dtype_gap)` for `profile`.
+def _core_gaps(profile: ModelProfile) -> tuple[bool, bool]:
+    """Return `(family_gap, dtype_gap)` for `profile`.
 
-    `unmodeled` marks a layer family the advisor does not price. `family_gap`
-    marks a priced family, and `dtype_gap` a weight dtype, that megakernel/core
-    has no module or kernel for. Structural tags are not families.
+    `family_gap` marks a priced family, and `dtype_gap` a weight dtype, that
+    megakernel/core has no module or kernel for. Structural tags are not
+    families.
     """
     families = [
         family
         for family in profile.layer_families
         if family not in STRUCTURAL_LAYER_TAGS
     ]
-    unmodeled = any(family not in SUPPORTED_ONCHIP_FAMILIES for family in families)
     family_gap = any(
         family in SUPPORTED_ONCHIP_FAMILIES and family not in CORE_MODULE_FAMILIES
         for family in families
@@ -258,7 +257,7 @@ def _core_gaps(profile: ModelProfile) -> tuple[bool, bool, bool]:
             profile.expert_dtype or profile.weight_dtype,
         )
     )
-    return unmodeled, family_gap, dtype_gap
+    return family_gap, dtype_gap
 
 
 def classify_model_support_tier(
@@ -267,11 +266,8 @@ def classify_model_support_tier(
     """Return the model's support tier and its deployment's unmodeled notes.
 
     `declared`: deployments.json holds a sourced megakernel block for the
-    model. `core_families`: every layer family and weight dtype has a
-    megakernel/core counterpart. `priced_only`: the advisor prices every
-    family, but a family or dtype has no core counterpart.
-    `partly_unmodeled`: a layer family is not priced, or the model type is
-    not recognized.
+    model. `priced_only`: the advisor prices every layer family, without a
+    declared megakernel block.
     """
     deployment = _find_deployment_preset(profile.name)
     notes = deployment.unmodeled_notes if deployment is not None else ()
@@ -281,12 +277,7 @@ def classify_model_support_tier(
         for _role, layout in deployment.named_layouts()
     ):
         return ("declared", notes)
-    unmodeled, family_gap, dtype_gap = _core_gaps(profile)
-    if unmodeled or profile.architecture_unverified:
-        return ("partly_unmodeled", notes)
-    if family_gap or dtype_gap:
-        return ("priced_only", notes)
-    return ("core_families", notes)
+    return ("priced_only", notes)
 
 
 def evaluate_support(
@@ -315,8 +306,8 @@ def evaluate_support(
         (mk for layout, mk in rank_matches if _same_layout(layout, workload)),
         None,
     )
-    has_unmodeled, family_gap, dtype_gap = (
-        _core_gaps(profile) if declaration is None else (False, False, False)
+    family_gap, dtype_gap = (
+        _core_gaps(profile) if declaration is None else (False, False)
     )
     # Declared rank counts restrict a model. Without a declaration for this scope
     # and phase, the core rank grid applies.
@@ -354,10 +345,8 @@ def evaluate_support(
             "chip_without_core_budget",
         ),
         (ctx.ep_dp > 1 and not attention_dp_in_call, "all_to_all_not_in_core"),
-        (has_unmodeled, "unmodeled_layer_family"),
         (family_gap, "family_not_in_core"),
         (dtype_gap, "dtype_not_in_core"),
-        (profile.architecture_unverified, "model_type_unrecognized"),
         (planner_bad, "planner_rejected"),
         (
             scope == "whole_step"

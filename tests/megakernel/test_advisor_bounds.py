@@ -25,10 +25,6 @@ import pytest
 
 from tests.megakernel.core.megakernel_fakes import TINY_TILES, make_fake_model_spec
 from tests.megakernel.test_advisor_specs import (
-    DEEPSEEK_V3_CFG,
-    DEEPSEEK_V4_CFG,
-    HOMOGENEOUS_DSA_CFG,
-    QWEN4_EXP_CFG,
     QWEN35_397B_CFG,
 )
 from vllm_torchtpu.megakernel import advisor
@@ -59,34 +55,6 @@ from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.core.exec_spec import MAX_BATCH_ROWS, ExecSpec, Tiles
 from vllm_torchtpu.megakernel.core.profile import _NUMERICS_GRID_R
 
-QWEN35_08B_CFG = {
-    "model_type": "qwen3_5",
-    "num_hidden_layers": 24,
-    "hidden_size": 1024,
-    "intermediate_size": 3584,
-    "num_attention_heads": 8,
-    "num_key_value_heads": 2,
-    "head_dim": 256,
-    "full_attention_interval": 4,
-    "linear_num_key_heads": 16,
-    "linear_num_value_heads": 16,
-    "linear_key_head_dim": 128,
-    "linear_value_head_dim": 128,
-    "linear_conv_kernel_dim": 4,
-    "top_k": 50,
-    "quantization_config": {"quant_method": "fp8"},
-}
-MIXTRAL_8X7B_CFG = {
-    "model_type": "mixtral",
-    "num_hidden_layers": 32,
-    "hidden_size": 4096,
-    "intermediate_size": 14336,
-    "num_attention_heads": 32,
-    "num_key_value_heads": 8,
-    "num_local_experts": 8,
-    "num_experts_per_tok": 2,
-    "torch_dtype": "bfloat16",
-}
 REPORTED_FLOOR_ROUNDING_STEP_US = 0.01
 STRICT_VECTOR_DIFF_TOLERANCE_US = 2 * REPORTED_FLOOR_ROUNDING_STEP_US
 ROW_BLOCKER = "rows_exceed_core_max_batch_rows"
@@ -142,8 +110,8 @@ def without_declared_megakernels(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_per_token_vmem_live_interval_and_sharding() -> None:
-    """Verify per-token live VMEM interval math and TP/EP sharding on Kimi-K3.1-Pro."""
-    pk3 = advisor.resolve_model_profile("kimi-k3.1-pro")
+    """Verify per-token live VMEM interval math and TP/EP sharding on Kimi-K3."""
+    pk3 = advisor.resolve_model_profile("kimi-k3")
     wl_grp = advisor.WorkloadSpec(
         phase="verify",
         batch=16,
@@ -203,40 +171,46 @@ def test_multi_tpu_vmem_and_fp8_dtype_physics() -> None:
     rep_v6e_tp8 = advisor.advise(p397, advisor.WorkloadSpec(tp=8, batch=4), cv6e)
     assert rep_v6e_tp8.hbm_fits is False
 
-    pmix = advisor.model_profile_from_hf_config(MIXTRAL_8X7B_CFG, name="mixtral-8x7b")
-    assert pmix.num_moe_layers == MIXTRAL_8X7B_CFG["num_hidden_layers"]
-    assert pmix.moe_intermediate_size == MIXTRAL_8X7B_CFG["intermediate_size"]
-    ffn_dim_test = 2048
-    p_ffn = advisor.model_profile_from_hf_config(
-        {
-            "model_type": "mixtral",
-            "num_hidden_layers": 2,
-            "hidden_size": 512,
-            "ffn_dim": ffn_dim_test,
-            "num_attention_heads": 8,
-            "num_local_experts": 4,
-            "num_experts_per_tok": 2,
-        }
-    )
-    assert p_ffn.intermediate_size == ffn_dim_test
-    assert p_ffn.moe_intermediate_size == ffn_dim_test
+    pglm = advisor.resolve_model_profile("glm-5.2")
+    expected_glm_moe_layers = 75
+    expected_glm_moe_inter = 2048
+    assert pglm.num_moe_layers == expected_glm_moe_layers
+    assert pglm.moe_intermediate_size == expected_glm_moe_inter
+    with pytest.raises(advisor.UnsupportedArchitectureError):
+        advisor.model_profile_from_hf_config(
+            {
+                "model_type": "mixtral",
+                "num_hidden_layers": 32,
+                "hidden_size": 4096,
+                "intermediate_size": 14336,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+            }
+        )
 
 
 def test_deepseek_v3_mla_kv_split_physics() -> None:
-    """Verify DeepSeek-V3 MLA parameter sizing and kv_split HBM savings."""
+    """Verify MLA parameter sizing and kv_split HBM savings on GLM-5.2."""
     c7x = advisor.resolve_chip_spec("tpu7x")
-    pdsv3 = advisor.model_profile_from_hf_config(DEEPSEEK_V3_CFG, name="deepseek-v3")
-    assert pdsv3.head_dim == DEEPSEEK_V3_CFG["qk_nope_head_dim"]
-    assert (
-        pdsv3.shared_expert_intermediate_size
-        == DEEPSEEK_V3_CFG["moe_intermediate_size"]
-    )
-    assert pdsv3.num_moe_layers == (
-        DEEPSEEK_V3_CFG["num_hidden_layers"] - DEEPSEEK_V3_CFG["first_k_dense_replace"]
-    )
+    pdsv3 = advisor.resolve_model_profile("glm-5.2")
+    expected_head_dim = 256
+    expected_shared_inter = 2048
+    expected_moe_layers = 75
+    assert pdsv3.head_dim == expected_head_dim
+    assert pdsv3.shared_expert_intermediate_size == expected_shared_inter
+    assert pdsv3.num_moe_layers == expected_moe_layers
     assert pdsv3.is_periodic is False
     pdsv3_dense_only = dataclasses.replace(
-        pdsv3, num_moe_layers=0, num_experts=0, top_k=0, intermediate_size=0
+        pdsv3,
+        num_moe_layers=0,
+        num_experts=0,
+        top_k=0,
+        intermediate_size=0,
+        index_topk=0,
+        index_head_dim=0,
+        index_n_heads=0,
+        num_indexer_layers=0,
+        layer_families=("mla",),
     )
     r_mla_only = advisor.advise(
         pdsv3_dense_only, advisor.WorkloadSpec(tp=8, batch=1, context=4096), c7x
@@ -303,8 +277,29 @@ def test_asymptotic_decode_intensity_and_vmem_fit_headroom() -> None:
     """Verify `asymptotic_decode_intensity`, `fit_vmem_budget_bytes`, `w_crit_gb`."""
     assert advisor.fit_vmem_budget_bytes() == 62 << 20
     assert advisor.fit_vmem_budget_bytes(Tiles(vmem_mib=62)) == 62 << 20
-    p08 = advisor.model_profile_from_hf_config(
-        QWEN35_08B_CFG, name="qwen35-0.8b", state_dtype="fp32"
+    p08 = models.finalize_model_profile(
+        dataclasses.replace(
+            advisor.resolve_model_profile("qwen3.5-397b"),
+            name="qwen3.5-397b-small-state",
+            num_layers=24,
+            num_attention_layers=6,
+            num_linear_layers=18,
+            hidden_size=1024,
+            intermediate_size=3584,
+            num_attention_heads=8,
+            num_kv_heads=2,
+            linear_key_heads=16,
+            linear_value_heads=16,
+            num_experts=0,
+            top_k=0,
+            num_moe_layers=0,
+            moe_intermediate_size=0,
+            shared_expert_intermediate_size=0,
+            has_attn_output_gate=False,
+            weight_block_k=0,
+            state_dtype="fp32",
+            layer_families=("gqa", "gdn", "dense_mlp"),
+        )
     )
     r_b16 = advisor.advise(
         p08,
@@ -366,19 +361,53 @@ def test_asymptotic_decode_intensity_and_vmem_fit_headroom() -> None:
 
 def test_all_four_fusion_scopes_reachable() -> None:
     """Prove `whole_step`, `single_layer`, `stage`, and `per_op` each win."""
-    p08 = advisor.model_profile_from_hf_config(QWEN35_08B_CFG, name="qwen35-0.8b")
     p397 = advisor.model_profile_from_hf_config(QWEN35_397B_CFG, name="qwen35-397b")
-    pllama = advisor.resolve_model_profile("llama-3.1-405b")
+    p08 = models.finalize_model_profile(
+        dataclasses.replace(
+            p397,
+            name="dense-small-gdn",
+            num_layers=24,
+            num_attention_layers=6,
+            num_linear_layers=18,
+            hidden_size=1024,
+            intermediate_size=3584,
+            num_attention_heads=8,
+            num_kv_heads=2,
+            linear_key_heads=16,
+            linear_value_heads=16,
+            num_experts=0,
+            top_k=0,
+            num_moe_layers=0,
+            moe_intermediate_size=0,
+            shared_expert_intermediate_size=0,
+            has_attn_output_gate=False,
+            weight_block_k=0,
+            layer_families=("gqa", "gdn", "dense_mlp"),
+        )
+    )
+    pllama = models.finalize_model_profile(
+        advisor.ModelProfile(
+            name="dense-large-gqa",
+            num_layers=126,
+            hidden_size=16384,
+            intermediate_size=53248,
+            num_attention_heads=128,
+            num_kv_heads=8,
+            head_dim=128,
+            weight_dtype="fp8",
+            expert_dtype="fp8",
+        )
+    )
 
-    # 1. `whole_step` (`whole_step`) wins on 397B TP8 decode and 0.8B prefill.
+    # 1. `whole_step` wins on 397B TP8 x EP8 decode and small dense prefill.
     r_dec = advisor.advise(
-        p397, advisor.WorkloadSpec(phase="decode", batch=16, tp=8), "tpu7x"
+        p397, advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=8), "tpu7x"
     )
     assert r_dec.recommended_scope == "whole_step"
     assert r_dec.recommended_moe_mode == "masked_on_chip"
     assert r_dec.build_megakernel is True
     r_b32 = advisor.advise(
-        p397, advisor.WorkloadSpec(phase="decode", batch=32, tp=8), "tpu7x"
+        p397, advisor.WorkloadSpec(phase="decode", batch=32, tp=8, ep=8), "tpu7x"
     )
     assert r_b32.recommended_scope == "whole_step"
     assert r_b32.recommended_moe_mode == "grouped_on_chip"
@@ -913,47 +942,6 @@ def test_core_limits_literals_match_megakernel_core() -> None:
     )
 
 
-def test_unknown_model_type_is_hypothetical() -> None:
-    """Verify an unrecognized HF model_type is hypothetical and never recommended."""
-    cfg = {
-        "model_type": "brand_new_2027_arch",
-        "num_hidden_layers": 32,
-        "hidden_size": 4096,
-        "intermediate_size": 11008,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-    }
-    with pytest.raises(advisor.UnsupportedArchitectureError):
-        advisor.model_profile_from_hf_config(cfg, name="brand-new-2027")
-
-    model_profile = advisor.ModelProfile(
-        name="brand-new-2027",
-        model_type="brand_new_2027_arch",
-        num_layers=32,
-        num_attention_layers=32,
-        num_moe_layers=0,
-        hidden_size=4096,
-        intermediate_size=11008,
-        num_attention_heads=32,
-        num_kv_heads=8,
-        head_dim=128,
-        weight_dtype="fp8",
-        expert_dtype="fp8",
-        architecture_unverified=True,
-    )
-    report = advisor.advise(
-        model_profile, advisor.WorkloadSpec(phase="decode", batch=16, tp=8), "tpu7x"
-    )
-    whole = next(s for s in report.scopes if s.scope == "whole_step")
-    assert report.recommended_scope == "per_op"
-    assert report.fastest_scope == "whole_step"
-    assert whole.support == "hypothetical"
-    assert "model_type_unrecognized" in whole.blockers
-    assert report.hypothetical_best is not None
-    assert report.hypothetical_best["scope"] == "whole_step"
-
-
 @pytest.mark.usefixtures("without_declared_megakernels")
 @pytest.mark.parametrize(
     ("workload", "chip", "expected_blocker"),
@@ -1096,10 +1084,10 @@ def test_strict_floor_not_above_uniform_estimate() -> None:
 
 def test_fused_core_is_max_of_hbm_and_compute_plus_comm() -> None:
     """Verify fused critical path uses max(hbm_time_s, t_matmul + comm_s)."""
-    model_profile = advisor.resolve_model_profile("qwen3.5-0.8b")
+    model_profile = advisor.resolve_model_profile("kimi-k3")
     report = advisor.advise(
         model_profile,
-        advisor.WorkloadSpec(phase="prefill", batch=1, isl=512, chunk_size=512, tp=8),
+        advisor.WorkloadSpec(phase="decode", batch=256, tp=32, ep=32),
         "tpu7x",
     )
     whole = next(s for s in report.scopes if s.scope == "whole_step")
@@ -1165,7 +1153,7 @@ def test_whole_step_bound_pays_collectives_after_router() -> None:
 
 
 def test_achievable_upper_band_never_inverts_below_achievable_or_floor() -> None:
-    """Verify step_achievable_upper_us (Row 7) and CSA/HC bounds (Rows 8, 9)."""
+    """Verify step_achievable_upper_us never inverts below achievable or floor."""
     model_profile = advisor.resolve_model_profile("qwen3.5-397b")
     report = advisor.advise(
         model_profile,
@@ -1180,38 +1168,6 @@ def test_achievable_upper_band_never_inverts_below_achievable_or_floor() -> None
         assert scope.step_achievable_upper_us >= max(
             scope.step_achievable_us, scope.step_upper_us
         )
-
-    p_ds4 = models.model_profile_from_hf_config(
-        DEEPSEEK_V4_CFG, name="deepseek-v4-hf", weight_dtype="fp8"
-    )
-    c7x = advisor.resolve_chip_spec("tpu7x")
-    wl_ds4 = advisor.WorkloadSpec(
-        phase="decode", batch=128, context=160000, dp=16, tp=1, ep=16
-    )
-    ctx_ds4 = _build_scope_context(p_ds4, wl_ds4, c7x)
-    expected_ds4_kv_read_gb = (
-        p_ds4.num_layers
-        * (wl_ds4.batch // wl_ds4.dp)
-        * wl_ds4.context
-        * (2 * p_ds4.num_kv_heads * p_ds4.head_dim)
-        * constants.DTYPE_BYTES[p_ds4.kv_dtype]
-        * p_ds4.kv_compress_factor
-        / 1e9
-    )
-    assert ctx_ds4.kv_cache_read_bytes / 1e9 == pytest.approx(
-        expected_ds4_kv_read_gb, abs=0.01
-    )
-
-    p_q4 = models.model_profile_from_hf_config(
-        QWEN4_EXP_CFG, name="qwen4-exp-hf", weight_dtype="fp8"
-    )
-    parts_q4 = advisor.compute_per_token_vmem_bytes(
-        p_q4, advisor.WorkloadSpec(phase="decode", batch=16, tp=8)
-    )
-    expected_qwen4_residual_bytes = (
-        4 * max(1, p_q4.residual_streams) + 2 + 6
-    ) * p_q4.hidden_size
-    assert parts_q4["residual_buffer_bytes"] == expected_qwen4_residual_bytes
 
 
 def test_gain_split_sums_to_total_and_fact_part_ignores_priors() -> None:
@@ -1619,7 +1575,7 @@ def test_per_op_vmem_overflow_marks_infeasible() -> None:
 @pytest.mark.usefixtures("without_declared_megakernels")
 def test_recommended_scope_metrics_and_hbm_oom_zero_tps() -> None:
     """Verify summary metrics follow recommended scope and zero out on HBM OOM."""
-    prof_bad = advisor.resolve_model_profile("qwen3.5-0.8b")
+    prof_bad = advisor.resolve_model_profile("qwen3.5-397b")
     rep_bad = advisor.advise(
         prof_bad, advisor.WorkloadSpec(phase="decode", batch=16, tp=2), "tpu7x"
     )
@@ -1630,13 +1586,13 @@ def test_recommended_scope_metrics_and_hbm_oom_zero_tps() -> None:
     )
     assert float(rep_bad.metrics["throughput_tok_s_per_chip"]["value"]) == 0.0
     cmp_res = advisor.verdict.compare_parallelism_candidates(
-        "qwen3.5-0.8b",
-        (advisor.ParallelLayout(tp=2, ep=1), advisor.ParallelLayout(tp=8, ep=1)),
+        "qwen3.5-397b",
+        (advisor.ParallelLayout(tp=2, ep=1), advisor.ParallelLayout(tp=8, ep=8)),
         chip="tpu7x",
     )
-    assert cmp_res["best_step_layout"] == "TP8"
-    assert cmp_res["best_throughput_layout"] == "TP8"
-    assert cmp_res["verdict"] == "TP8"
+    assert cmp_res["best_step_layout"] == "TP8 x EP8"
+    assert cmp_res["best_throughput_layout"] == "TP8 x EP8"
+    assert cmp_res["verdict"] == "TP8 x EP8"
 
     pk3 = advisor.resolve_model_profile("kimi-k3")
     rep_k3 = advisor.advise(
@@ -1673,9 +1629,9 @@ def test_recommended_scope_metrics_and_hbm_oom_zero_tps() -> None:
         ),
         ("qwen3.5-397b", advisor.WorkloadSpec(phase="decode", batch=64, tp=8, ep=8)),
         (
-            "qwen3.5-0.8b",
+            "glm-5.2",
             advisor.WorkloadSpec(
-                phase="prefill", batch=1, isl=512, chunk_size=512, tp=8
+                phase="prefill", batch=1, isl=512, chunk_size=512, tp=16
             ),
         ),
     ],
@@ -1779,7 +1735,7 @@ def test_vector_unit_fp4_dequant_floor() -> None:
 
 def test_gdn_linear_head_divisibility_reasons() -> None:
     """Verify linear attention head divisibility rejection and replication rules."""
-    base_prof = advisor.resolve_model_profile("qwen3.5-0.8b")
+    base_prof = advisor.resolve_model_profile("qwen3.5-397b")
     bad_v_prof = dataclasses.replace(
         base_prof, linear_value_heads=18, linear_key_heads=16
     )
@@ -2024,17 +1980,19 @@ def test_quantization_ridge_tokens_and_tp_invariance() -> None:
     r_bf16_v6 = cv6e.peak_flops("bf16", "bf16") / cv6e.hbm_bw_bytes_per_s
     assert math.ceil(r_bf16_v6 / 1.0) == expected_tokens_bf16_v6
 
-    cfg_divisible = {
-        "model_type": "llama",
-        "num_hidden_layers": 8,
-        "hidden_size": 4096,
-        "intermediate_size": 11008,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 16,
-        "torch_dtype": "bfloat16",
-        "quantization_config": {"quant_method": "fp8"},
-    }
-    prof_div = advisor.models.model_profile_from_hf_config(cfg_divisible)
+    prof_div = models.finalize_model_profile(
+        advisor.ModelProfile(
+            name="dense-tp-invariant",
+            num_layers=8,
+            hidden_size=4096,
+            intermediate_size=11008,
+            num_attention_heads=32,
+            num_kv_heads=16,
+            head_dim=128,
+            weight_dtype="fp8",
+            expert_dtype="fp8",
+        )
+    )
     wl8 = advisor.specs.WorkloadSpec(phase="decode", batch=16, tp=8, context=0)
     wl16 = advisor.specs.WorkloadSpec(phase="decode", batch=16, tp=16, context=0)
     rep8 = advisor.advise(prof_div, wl8, c7x)
@@ -2071,20 +2029,7 @@ def test_subchannel_quantization_vpu_bottleneck() -> None:
     wl_prefill = advisor.specs.WorkloadSpec(
         phase="prefill", batch=1, isl=2048, osl=0, tp=8
     )
-    cfg_w128 = {
-        "model_type": "qwen2",
-        "num_hidden_layers": 4,
-        "hidden_size": 2048,
-        "intermediate_size": 4096,
-        "num_attention_heads": 16,
-        "num_key_value_heads": 16,
-        "quantization_config": {
-            "quant_method": "fp8",
-            "weight_block_size": [128, 128],
-            "activation_scheme": "none",
-        },
-    }
-    prof_w128 = advisor.models.model_profile_from_hf_config(cfg_w128)
+    prof_w128 = advisor.resolve_model_profile("qwen3.5-397b", act_dtype="bf16")
     expected_block_k = 128
     assert prof_w128.weight_block_k == expected_block_k
     ctx_w128 = _build_scope_context(prof_w128, wl_prefill, c7x)
@@ -2477,13 +2422,22 @@ def test_declaration_matches_full_layout() -> None:
     ws_v16 = next(s for s in rep_v16.scopes if s.scope == "whole_step")
     assert ws_v16.support == "declared"
 
+    expected_v20_splits = 2
     wl_verify_20 = advisor.WorkloadSpec(
         phase="verify", spec_tokens=3, tp=8, ep=8, dcp=1, batch=20
     )
     rep_v20 = advisor.advise(model_profile, wl_verify_20, chip_spec)
     ws_v20 = next(s for s in rep_v20.scopes if s.scope == "whole_step")
-    assert ws_v20.support == "hypothetical"
-    assert "rows_exceed_core_max_batch_rows" in ws_v20.blockers
+    assert ws_v20.support == "declared"
+    assert ws_v20.n_splits == expected_v20_splits
+
+    wl_verify_41 = advisor.WorkloadSpec(
+        phase="verify", spec_tokens=3, tp=8, ep=8, dcp=1, batch=41
+    )
+    rep_v41 = advisor.advise(model_profile, wl_verify_41, chip_spec)
+    ws_v41 = next(s for s in rep_v41.scopes if s.scope == "whole_step")
+    assert ws_v41.support == "hypothetical"
+    assert "rows_exceed_core_max_batch_rows" in ws_v41.blockers
 
     wl_v20_dcp = advisor.WorkloadSpec(
         phase="verify", spec_tokens=3, tp=8, ep=8, dcp=4, batch=20
@@ -3499,7 +3453,34 @@ def test_homogeneous_dsa_profile_gated_without_core_family(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify all-full DSA VMEM/DCP layout, core gating, and dcp_gather pricing."""
-    profile = models.model_profile_from_hf_config(HOMOGENEOUS_DSA_CFG, name="homo-dsa")
+    profile = models.finalize_model_profile(
+        advisor.ModelProfile(
+            name="homo-dsa",
+            model_type="glm_moe_dsa",
+            num_layers=32,
+            num_attention_layers=32,
+            num_moe_layers=32,
+            hidden_size=4096,
+            intermediate_size=8192,
+            moe_intermediate_size=1024,
+            shared_expert_intermediate_size=1024,
+            num_attention_heads=32,
+            num_kv_heads=32,
+            head_dim=128,
+            q_lora_rank=1024,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            num_experts=64,
+            top_k=8,
+            index_topk=2048,
+            index_head_dim=128,
+            index_n_heads=16,
+            num_indexer_layers=32,
+            weight_dtype="bf16",
+            expert_dtype="bf16",
+        )
+    )
     assert profile.is_periodic
     assert profile.layer_families == ("dsa", "moe")
     workload = advisor.WorkloadSpec(
@@ -3611,50 +3592,42 @@ def test_homogeneous_dsa_profile_gated_without_core_family(
 
 
 def test_support_separates_core_module_families_from_physics_modeled() -> None:
-    """Verify whole_step support separates core module families from priced models."""
+    """Verify whole_step support separates declared models from priced-only models."""
     default_workload = advisor.WorkloadSpec(phase="decode", batch=4, context=4096, tp=8)
 
-    mistral_profile = advisor.resolve_model_profile("mistral-large")
-    assert "dense_mlp" in mistral_profile.layer_families
-    assert mistral_profile.weight_dtype in specs.CORE_SUPPORTED_DTYPES
-    mistral_report = advisor.advise("mistral-large", default_workload, "tpu7x")
-    mistral_whole_step = _whole_step_of(mistral_report)
-    assert "family_not_in_core" in mistral_whole_step.blockers
-    assert "dtype_not_in_core" not in mistral_whole_step.blockers
-    assert "unmodeled_layer_family" not in mistral_whole_step.blockers
+    glm_profile = advisor.resolve_model_profile("glm-5.2")
+    assert "dsa" in glm_profile.layer_families
+    assert "dense_prefix_moe" in glm_profile.layer_families
+    assert glm_profile.weight_dtype in specs.CORE_SUPPORTED_DTYPES
+    glm_report = advisor.advise("glm-5.2", default_workload, "tpu7x")
+    glm_whole_step = _whole_step_of(glm_report)
+    assert "family_not_in_core" in glm_whole_step.blockers
+    assert "dtype_not_in_core" not in glm_whole_step.blockers
+    assert "planner_rejected" in glm_whole_step.blockers
 
-    gpt_oss_profile = advisor.resolve_model_profile("gpt-oss-120b")
+    kimi_profile = advisor.resolve_model_profile("kimi-k3")
+    assert kimi_profile.expert_dtype not in specs.CORE_SUPPORTED_DTYPES
+    kimi_undeclared_whole = _whole_step_of(
+        advisor.advise("kimi-k3", default_workload, "tpu7x")
+    )
+    assert "dtype_not_in_core" in kimi_undeclared_whole.blockers
+    assert "family_not_in_core" in kimi_undeclared_whole.blockers
+
+    qwen_profile = advisor.resolve_model_profile("qwen3.5-397b")
     assert all(
-        family in specs.CORE_MODULE_FAMILIES
-        for family in gpt_oss_profile.layer_families
+        family in specs.CORE_MODULE_FAMILIES for family in qwen_profile.layer_families
     )
-    assert gpt_oss_profile.expert_dtype not in specs.CORE_SUPPORTED_DTYPES
-    gpt_oss_whole_step = _whole_step_of(
-        advisor.advise("gpt-oss-120b", default_workload, "tpu7x")
+    assert qwen_profile.weight_dtype in specs.CORE_SUPPORTED_DTYPES
+    assert qwen_profile.expert_dtype in specs.CORE_SUPPORTED_DTYPES
+    qwen_prefill_whole = _whole_step_of(
+        advisor.advise(
+            "qwen3.5-397b",
+            advisor.WorkloadSpec(phase="prefill", batch=1, isl=64, tp=8, ep=8),
+            "tpu7x",
+        )
     )
-    assert "dtype_not_in_core" in gpt_oss_whole_step.blockers
-    assert "family_not_in_core" not in gpt_oss_whole_step.blockers
-
-    qwen3_profile = advisor.resolve_model_profile("qwen3-30b-a3b")
-    assert all(
-        family in specs.CORE_MODULE_FAMILIES for family in qwen3_profile.layer_families
-    )
-    assert qwen3_profile.weight_dtype in specs.CORE_SUPPORTED_DTYPES
-    assert qwen3_profile.expert_dtype in specs.CORE_SUPPORTED_DTYPES
-    qwen3_whole_step = _whole_step_of(
-        advisor.advise("qwen3-30b-a3b", default_workload, "tpu7x")
-    )
-    assert "family_not_in_core" not in qwen3_whole_step.blockers
-    assert "dtype_not_in_core" not in qwen3_whole_step.blockers
-
-    deepseek_profile = advisor.resolve_model_profile("deepseek-v3")
-    assert "dense_prefix_moe" in deepseek_profile.layer_families
-    deepseek_whole_step = _whole_step_of(
-        advisor.advise("deepseek-v3", default_workload, "tpu7x")
-    )
-    assert "family_not_in_core" in deepseek_whole_step.blockers
-    assert "unmodeled_layer_family" not in deepseek_whole_step.blockers
-    assert "planner_rejected" in deepseek_whole_step.blockers
+    assert "family_not_in_core" not in qwen_prefill_whole.blockers
+    assert "dtype_not_in_core" not in qwen_prefill_whole.blockers
 
     decode_layout = advisor.DEPLOYMENT_PRESETS["kimi-k3"].decode
     assert decode_layout is not None
@@ -3674,9 +3647,6 @@ def test_support_separates_core_module_families_from_physics_modeled() -> None:
     expected_tiers: tuple[tuple[str, specs.ModelSupportTier], ...] = (
         ("kimi-k3", "declared"),
         ("qwen3.5-397b", "declared"),
-        ("qwen3-30b-a3b", "core_families"),
-        ("mistral-large", "priced_only"),
-        ("gpt-oss-120b", "priced_only"),
         ("glm-5.2", "priced_only"),
     )
     classified_tiers: dict[str, tuple[specs.ModelSupportTier, tuple[str, ...]]] = {}
@@ -3692,29 +3662,13 @@ def test_support_separates_core_module_families_from_physics_modeled() -> None:
         == advisor.DEPLOYMENT_PRESETS["kimi-k3"].unmodeled_notes
     )
     assert classified_tiers["kimi-k3"][1] != ()
-    assert classified_tiers["mistral-large"][1] == ()
+    assert classified_tiers["glm-5.2"][1] == ()
     expected_kimi_tier, expected_kimi_notes = classified_tiers["kimi-k3"]
     assert kimi_report.support_tier == expected_kimi_tier
     assert kimi_report.unmodeled_notes == expected_kimi_notes
-    expected_mistral_tier, expected_mistral_notes = classified_tiers["mistral-large"]
-    assert mistral_report.support_tier == expected_mistral_tier
-    assert mistral_report.unmodeled_notes == expected_mistral_notes
-
-
-def test_support_tier_classifies_partly_unmodeled() -> None:
-    """Verify configs with an unmodeled layer family resolve as partly_unmodeled."""
-    default_workload = advisor.WorkloadSpec(phase="decode", batch=4, context=4096, tp=8)
-    deepseek_v4_profile = models.model_profile_from_hf_config(
-        DEEPSEEK_V4_CFG, name="deepseek-v4-hc"
-    )
-    assert "hyper_connection" in deepseek_v4_profile.layer_families
-    deepseek_v4_tier, deepseek_v4_notes = support.classify_model_support_tier(
-        deepseek_v4_profile
-    )
-    assert deepseek_v4_tier == "partly_unmodeled"
-    assert deepseek_v4_notes == ()
-    deepseek_v4_report = advisor.advise(deepseek_v4_profile, default_workload, "tpu7x")
-    assert deepseek_v4_report.support_tier == "partly_unmodeled"
+    expected_glm_tier, expected_glm_notes = classified_tiers["glm-5.2"]
+    assert glm_report.support_tier == expected_glm_tier
+    assert glm_report.unmodeled_notes == expected_glm_notes
 
 
 def test_core_sync_checks_bucket_cap_and_module_families(

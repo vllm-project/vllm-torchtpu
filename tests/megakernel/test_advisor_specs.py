@@ -954,8 +954,9 @@ def test_config_path_honors_quantization_ignore_list() -> None:
 
 
 def test_config_path_resolves_to_matching_preset(tmp_path: Path) -> None:
-    """Verify config file and directory paths resolve to matching shipped presets."""
-    snapshots = _load_config_snapshots()
+    """Verify shipped config paths resolve and unmatched configs fail closed."""
+    all_snapshots = _load_config_snapshots()
+    snapshots = _load_preset_snapshots()
     config_files: dict[str, Path] = {}
     for index, (preset_name, snapshot_payload) in enumerate(snapshots.items()):
         checkpoint_dir = tmp_path / f"checkpoint-{index}"
@@ -1016,17 +1017,20 @@ def test_config_path_resolves_to_matching_preset(tmp_path: Path) -> None:
     neutral_dir.mkdir(parents=True, exist_ok=True)
     neutral_file = neutral_dir / "config.json"
     neutral_file.write_text(json.dumps(requantized_kimi), encoding="utf-8")
-    requantized_profile = advisor.resolve_model_profile(str(neutral_file))
-    assert requantized_profile.expert_dtype == "nvfp4"
-    assert models.match_preset_by_geometry(requantized_profile) is None
-    assert requantized_profile.name != "kimi-k3"
-    requantized_report = advisor.advise(requantized_profile, workload, chip="tpu7x")
-    requantized_whole_step = next(
-        scope_estimate
-        for scope_estimate in requantized_report.scopes
-        if scope_estimate.scope == "whole_step"
-    )
-    assert requantized_whole_step.support != "declared"
+    with pytest.raises(models.UnsupportedArchitectureError):
+        advisor.resolve_model_profile(str(neutral_file))
+
+    for neg_index, neg_name in enumerate(sorted(NEGATIVE_CONTROL_SNAPSHOTS)):
+        neg_dir = tmp_path / f"neg-{neg_index}"
+        neg_dir.mkdir(parents=True, exist_ok=True)
+        neg_file = neg_dir / "config.json"
+        neg_file.write_text(
+            json.dumps(all_snapshots[neg_name]["config"]), encoding="utf-8"
+        )
+        with pytest.raises(models.UnsupportedArchitectureError):
+            advisor.resolve_model_profile(str(neg_file))
+        with pytest.raises(models.UnsupportedArchitectureError):
+            advisor.resolve_model_profile(str(neg_dir))
 
 
 def test_declared_blocks_cite_openable_source() -> None:
@@ -1167,6 +1171,37 @@ def test_perturbed_supported_config_fails_closed() -> None:
             advisor.resolve_model_profile(perturbed)
         with pytest.raises(models.UnsupportedArchitectureError):
             models.model_profile_from_hf_config(perturbed)
+
+
+def test_colocated_qwen35_split_rows_declared_up_to_160() -> None:
+    """Verify colocated Qwen3.5 TP8 x EP8 admits split calls up to 160 rows."""
+    expected_max_rows = 64
+    expected_max_total_rows = 160
+    expected_splits = 2
+    q35_dep = advisor.DEPLOYMENT_PRESETS["qwen3.5-397b"]
+    coloc_mk = q35_dep.megakernel_layouts[0].megakernel
+    assert coloc_mk is not None
+    assert coloc_mk["source_ref"] == "unpublished"
+    assert coloc_mk["max_rows"] == expected_max_rows
+    assert coloc_mk["max_total_rows"] == expected_max_total_rows
+
+    profile = models.resolve_model_profile("qwen3.5-397b")
+    chip = advisor.resolve_chip_spec("tpu7x")
+    wl_128 = advisor.WorkloadSpec(
+        phase="verify", spec_tokens=3, batch=32, tp=8, ep=8, dcp=1
+    )
+    rep_128 = advisor.advise(profile, wl_128, chip)
+    ws_128 = next(s for s in rep_128.scopes if s.scope == "whole_step")
+    assert ws_128.support == "declared"
+    assert ws_128.n_splits == expected_splits
+
+    wl_164 = advisor.WorkloadSpec(
+        phase="verify", spec_tokens=3, batch=41, tp=8, ep=8, dcp=1
+    )
+    rep_164 = advisor.advise(profile, wl_164, chip)
+    ws_164 = next(s for s in rep_164.scopes if s.scope == "whole_step")
+    assert ws_164.support == "hypothetical"
+    assert "rows_exceed_core_max_batch_rows" in ws_164.blockers
 
 
 def test_builtin_chip_facts_follow_jax_tpu_info(
