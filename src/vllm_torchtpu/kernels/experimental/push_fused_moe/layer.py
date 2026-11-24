@@ -90,7 +90,12 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     weight_form,
     weight_format_of_dtype,
 )
-from vllm_torchtpu.kernels.fused_moe.v2.kernel import combine_step_tokens, rowquant_fp8
+from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
+    _absmax_rows,
+    _quant_apply,
+    _row_scale,
+    combine_step_tokens,
+)
 from vllm_torchtpu.kernels.fused_moe.v2.layer import (
     SCORING_FNS,
     _apply_scoring_fn,
@@ -102,7 +107,15 @@ from vllm_torchtpu.kernels.fused_moe.v2.layer import (
 )
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
-from vllm_torchtpu.kernels.quantized_matmul.shared_expert import fp8_swiglu_mlp
+from vllm_torchtpu.kernels.quantized_matmul.shared_expert import (
+    fp8_swiglu_mlp,
+    is_supported,
+    silu_and_mul_with_clamp,
+)
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    get_max_min,
+    xla_quantized_matmul,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -173,6 +186,34 @@ def _combine_arrivals_fs(
         run_rows=runs is not None,
     )
     return combine(arrivals, arrival_scales, scl, topk_weights, rows, runs or ())
+
+
+def _shared_expert(x, row_max, w13, s13, w2, s2, *, limit):
+    """`fp8_swiglu_mlp`, reusing `row_max` = max|x| per row [t, 1] (the
+    routed quantization's) where it runs unfused, so x is reduced once.
+
+    The unfused branch is `xla_quantized_matmul`'s floating-point gate-up
+    with `quantize_block`'s steps on the given maximum: the same values, bit
+    for bit."""
+    if (
+        row_max is None
+        or not jnp.issubdtype(w13.dtype, jnp.floating)
+        or is_supported(x, w13, s13, w2, s2)
+    ):
+        return fp8_swiglu_mlp(x, w13, s13, w2, s2, limit=limit)
+    fp8_max, fp8_min = get_max_min(w13.dtype)
+    scale = row_max / fp8_max
+    scale = jnp.where(scale == 0, 1.0, scale)
+    x_q = (x / scale).clip(fp8_min, fp8_max).astype(w13.dtype)
+    gate_up = lax.dot_general(
+        x_q,
+        w13,
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    gate_up = gate_up * scale.astype(jnp.float32) * jnp.expand_dims(s13, 0)
+    gate, up = jnp.split(gate_up.astype(x.dtype), 2, axis=-1)
+    return xla_quantized_matmul(silu_and_mul_with_clamp(gate, up, limit), w2, s2)
 
 
 def _to_slots(topk_idx, expert_slot, row_base, *, onehot=False):
@@ -660,11 +701,14 @@ def fused_ep_moe_push(
             x_l = lax.optimization_barrier(x_l)
         rows_bf16 = x_l.astype(jnp.bfloat16)
         if form.quantized_activations:
-            q_l, row_scale_l = rowquant_fp8(rows_bf16)
+            # v2's rowquant_fp8, keeping the row maximum for the shared expert.
+            row_max = _absmax_rows(rows_bf16)
+            row_scale_l, sinv, usable = _row_scale(row_max)
+            q_l = _quant_apply(rows_bf16, sinv.astype(rows_bf16.dtype), usable)
         else:
-            q_l, row_scale_l = rows_bf16, None
+            q_l, row_scale_l, row_max = rows_bf16, None, None
         q_l = q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK)
-        return gate_l, hash_l, q_l, row_scale_l
+        return gate_l, hash_l, q_l, row_scale_l, row_max
 
     def select_local(
         gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l, keep=None
@@ -753,12 +797,14 @@ def fused_ep_moe_push(
         shared_l=None,
         tail_start=None,
         run_start=None,
+        shared_row_max=None,
     ):
         """Dispatch tables, SparseCore pre-push, plan, kernel and combine.
 
         `pre_tables`, where the exchange kernel already built them, are
         build_push_tables' outputs; `shared_l`, the shared expert computed on
-        `x_l` between the pre-push and the kernel."""
+        `x_l` between the pre-push and the kernel, reusing `shared_row_max`
+        (x_l's row maxima, or None) to quantize x_l."""
         me = rank_l[0, 0]
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
@@ -847,7 +893,7 @@ def fused_ep_moe_push(
         barriered_runs = () if slim_prepush_barrier else tuple(runs)
         # The shared expert's rows come out of the same barrier as the
         # pre-push operands, so it cannot be scheduled ahead of them.
-        shared_x = (x_l,) if shared_l is not None else ()
+        shared_x = (x_l, shared_row_max) if shared_l is not None else ()
         (
             q_sorted,
             seg,
@@ -881,7 +927,7 @@ def fused_ep_moe_push(
         if shared_l is not None:
             assert shared_limit is not None
             with jax.named_scope("moe_shared_expert"):
-                shared_out = (fp8_swiglu_mlp(*shared_x, *shared_l, limit=shared_limit),)
+                shared_out = (_shared_expert(*shared_x, *shared_l, limit=shared_limit),)
         plan_kw = dict(
             e_total=e_total,
             ep=ep,
@@ -1078,7 +1124,12 @@ def fused_ep_moe_push(
             shared_l,
             bias_it,
         ) = unpack_operands(scales_gating_biases)
-        gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
+        gate_l, hash_l, q_l, row_scale_l, row_max = quantize_local(
+            x_l, rank_l, gate_l, hash_l
+        )
+        # The routed rows' maxima are x_l's own where the rows are not split
+        # out of a replica group and need no cast.
+        own_rows = len(token_layout.groups[0]) == 1 and x_l.dtype == jnp.bfloat16
         tail_start = run_start = keep = None
         if drop_repeated_tail or drop_repeated_runs:
             me = rank_l[0, 0]
@@ -1169,6 +1220,7 @@ def fused_ep_moe_push(
             shared_l,
             tail_start,
             run_start,
+            row_max if own_rows else None,
         )
 
     bias_args = tuple(b for b in (w1_bias, w2_bias) if b is not None)
