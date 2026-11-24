@@ -160,8 +160,9 @@ def test_post_load_hook_selects_and_pads(monkeypatch, n_out, copy):
         parallel_state, "_TP", SimpleNamespace(rank_in_group=0, world_size=1)
     )
     monkeypatch.setenv("TPU_FP8_LINEAR_PALLAS_SITES", "proj")
-    # only measured (K, N) shapes are routed; register this toy one
+    # only measured (K, N) shapes on a tuned TPU are routed; register this toy one
     monkeypatch.setitem(fp8_skinny.TUNED, (32, 128), ("n", 128, 1))
+    monkeypatch.setattr(fp8_skinny, "_on_tuned_generation", lambda: True)
     config = fp8_mod.VllmFp8Config.from_config(
         {
             "quant_method": "fp8",
@@ -219,6 +220,23 @@ def test_post_load_hook_selects_and_pads(monkeypatch, n_out, copy):
     other.quant_method.process_weights_after_loading(other)
     assert not hasattr(other, FP8_PALLAS_N_ATTR), "untuned shapes stay on XLA"
     monkeypatch.setitem(fp8_skinny.TUNED, (32, 128), ("n", 128, 1))
+    # A TPU generation TUNED was not measured on: the load-time check refuses the
+    # layer as supports() would at call time, so no padded copy is built.
+    monkeypatch.setattr(fp8_skinny, "_on_tuned_generation", lambda: False)
+    off_gen = ReplicatedLinear(
+        32,
+        n_out,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        prefix="proj",
+        disable_tp=True,
+    )
+    off_gen.weight.weight_loader(off_gen.weight, src)
+    off_gen.quant_method.process_weights_after_loading(off_gen)
+    assert not hasattr(off_gen, FP8_PALLAS_N_ATTR), "untuned TPU stays on XLA"
+    assert not hasattr(off_gen, "weight_pallas")
+    monkeypatch.setattr(fp8_skinny, "_on_tuned_generation", lambda: True)
     if copy:
         assert layer.weight_pallas.shape == (32, 128)
         raw = layer.weight_pallas.view(torch.uint8)

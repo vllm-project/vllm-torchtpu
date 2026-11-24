@@ -79,7 +79,8 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
-from vllm_torchtpu.kernels.quantized_matmul.fp8_skinny import TUNED, padded_n
+from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
+from vllm_torchtpu.kernels.quantized_matmul.fp8_skinny import padded_n
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -1422,9 +1423,10 @@ def _fp8_linear_pallas_refusal(
 
     Returns:
       None when the weight is FP8 E4M3 in K-major layout, the scale holds one
-      value per output column, and `(n_in, padded_n(n_out))` is in
-      `fp8_skinny.TUNED`. Otherwise a short reason for the load-time warning,
-      for example "the weight shape [2048, 4096] (width padded to 128) is not in
+      value per output column, and `fp8_skinny.weight_refusal` accepts
+      `(n_in, padded_n(n_out))`, the same check the call-time router makes
+      through `fp8_skinny.supports`. Otherwise a short reason for the load-time
+      warning, for example "the weight shape [2048, 4096] is not in
       fp8_skinny.TUNED".
     """
     if keep_vllm_layout:
@@ -1436,12 +1438,7 @@ def _fp8_linear_pallas_refusal(
         )
     if weight.dtype != torch.float8_e4m3fn:
         return f"the weight dtype {weight.dtype} is not float8_e4m3fn"
-    if (n_in, padded_n(n_out)) not in TUNED:  # measured shapes only
-        return (
-            f"the weight shape [{n_in}, {padded_n(n_out)}] (width padded to 128) "
-            "is not in fp8_skinny.TUNED"
-        )
-    return None
+    return fp8_skinny.weight_refusal(n_in, padded_n(n_out))
 
 
 @register_weight_loader_v2_supported_method

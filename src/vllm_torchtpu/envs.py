@@ -1332,8 +1332,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FUSED_ADD_RMSNORM_QUANT": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT"),
     # Comma-separated layer-prefix suffixes, matched on a "." boundary, for
     # example "self_attn.o_proj". A per-channel FP8 dense linear whose prefix
-    # matches, and whose weight shape is in fp8_skinny.TUNED, runs calls of at
-    # most 16 rows as the weight-streaming Pallas kernel
+    # matches, and whose weight shape is in fp8_skinny.TUNED (TPU v7x only),
+    # runs calls of at most 16 rows as the weight-streaming Pallas kernel
     # (kernels/quantized_matmul/fp8_skinny.py) and other calls on XLA. Empty, the
     # default, keeps XLA for every linear. The kernel accumulates in float32, so
     # its outputs differ slightly from XLA's fp8 x fp8 dot. A matched layer whose
