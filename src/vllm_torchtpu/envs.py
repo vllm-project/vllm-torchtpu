@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_PLE_TRIM: bool = False
     QWEN4_EXP_PREFILL_SP_SHARED_LOCAL: bool = False
     QWEN4_EXP_PREFILL_SP_EXIT_ALL_TO_ALL: bool = False
+    QWEN4_EXP_PREFILL_SP_GATHER_FP8: bool = False
     QWEN4_EXP_PREFILL_SP_PAD_HC: bool = False
     VLLM_TPU_SP_MICROBATCH_OVERLAP: bool = False
     VLLM_TPU_SP_MICROBATCH_OVERLAP_FORCE_OFF: bool = False
@@ -1785,6 +1786,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "QWEN4_EXP_PREFILL_SP_EXIT_ALL_TO_ALL": env_bool(
         "QWEN4_EXP_PREFILL_SP_EXIT_ALL_TO_ALL"
     ),
+    # With QWEN4_EXP_PREFILL_SP=1: the all-gather of each attention block's input on
+    # sequence-parallel steps carries float8_e4m3fn values with one f32 scale per row
+    # (the MoE dispatch's row quantization) and restores them to BF16 on arrival:
+    # about half the bytes, but the attention projections read FP8-rounded inputs
+    # (accuracy-gated). The VLLM_TPU_SP_MICROBATCH_OVERLAP halves keep the BF16 gather.
+    "QWEN4_EXP_PREFILL_SP_GATHER_FP8": env_bool("QWEN4_EXP_PREFILL_SP_GATHER_FP8"),
     # With QWEN4_EXP_PREFILL_SP=1: the sequence-parallel graph pads each
     # rank's shard to the HC kernels' row tile, so buckets whose shard does
     # not divide it (1024 and 3072 at TP8) take sequence parallelism too.

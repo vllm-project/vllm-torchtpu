@@ -56,6 +56,7 @@ from vllm.distributed import (
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -64,6 +65,8 @@ logger = init_logger(__name__)
 ROW_ALIGNMENT = 8
 # Decode buckets (the megakernel's, <= 64 rows) must never take this path.
 MIN_TOKENS_FLOOR = 1024
+# Lanes an FP8 wire row (``fp8_wire_rows``) appends for its f32 scale: one lane tile.
+FP8_WIRE_SCALE_LANES = 128
 
 
 def enabled(tp_size: int) -> bool:
@@ -448,6 +451,35 @@ def gather(x: torch.Tensor, num_tokens) -> torch.Tensor:
         return all_gather_rows(x).narrow(0, 0, num_tokens)
     parts = [all_gather_rows(part) for part in group_rows(x, groups)]
     return torch.cat(parts).narrow(0, 0, num_tokens)
+
+
+def fp8_wire_rows(x: torch.Tensor) -> torch.Tensor:
+    """[rows, H] -> int8 [rows, H + FP8_WIRE_SCALE_LANES] for one collective:
+    each row's float8_e4m3fn values, then the bytes of its f32 scale."""
+    values, scale = quantize_tensor(x, torch.float8_e4m3fn, axis=-1)
+    pad = torch.zeros(
+        (x.shape[0], FP8_WIRE_SCALE_LANES - 4), dtype=torch.int8, device=x.device
+    )
+    return torch.cat([values.view(torch.int8), scale.view(torch.int8), pad], dim=1)
+
+
+def fp8_wire_restore(rows: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """``fp8_wire_rows``'s rows back to ``dtype`` (the scale applied in
+    ``dtype``, so nothing wider than the result is materialized)."""
+    width = rows.shape[1] - FP8_WIRE_SCALE_LANES
+    values = rows[:, :width].view(torch.float8_e4m3fn)
+    scale = rows[:, width : width + 4].contiguous().view(torch.float32)
+    return values.to(dtype) * scale.to(dtype)
+
+
+def gather_attention_input(x: torch.Tensor, num_tokens) -> torch.Tensor:
+    """``gather`` of an attention block's input; with
+    QWEN4_EXP_PREFILL_SP_GATHER_FP8 the rows travel as ``fp8_wire_rows``
+    (FP8 values and a per-row scale in one all-gather) and arrive restored to
+    ``x``'s dtype. Not exact."""
+    if not envs.QWEN4_EXP_PREFILL_SP_GATHER_FP8:
+        return gather(x, num_tokens)
+    return fp8_wire_restore(gather(fp8_wire_rows(x), num_tokens), x.dtype)
 
 
 def reduce(x: torch.Tensor, sequence_parallel: bool) -> torch.Tensor:

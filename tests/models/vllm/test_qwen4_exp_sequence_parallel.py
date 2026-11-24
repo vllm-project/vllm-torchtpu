@@ -420,6 +420,37 @@ def test_attn_out_full_names():
     )
 
 
+@pytest.mark.parametrize("fp8", [False, True])
+def test_gather_attention_input(tp2, monkeypatch, fp8):
+    """QWEN4_EXP_PREFILL_SP_GATHER_FP8: every row comes back within FP8 E4M3
+    rounding of its own scale (one all-gather); NaN rows stay their own."""
+    monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP_GATHER_FP8", fp8, raising=False)
+    gathered = []
+    gather = sp.gather
+    monkeypatch.setattr(
+        sp, "gather", lambda x, n: gathered.append(x.dtype) or gather(x, n)
+    )
+    torch.random.default_generator.manual_seed(6)
+    width = 256
+    full = torch.randn(TOKENS, width) * torch.logspace(-3, 2, TOKENS)[:, None]
+    full = full.bfloat16()
+    full[3] = float("nan")
+    got = tp2.run(lambda r: sp.gather_attention_input(tp2.shard(full), TOKENS))
+    torch.testing.assert_close(got[0], got[1], rtol=0, atol=0, equal_nan=True)
+    out = got[0]
+    assert out.dtype == full.dtype and out.shape == full.shape
+    if not fp8:
+        torch.testing.assert_close(out, full, rtol=0, atol=0, equal_nan=True)
+        return
+    assert gathered == [torch.int8] * tp2.size
+    assert out[3].isnan().all() and not out[torch.arange(TOKENS) != 3].isnan().any()
+    err = (out.float() - full.float()).abs()
+    # E4M3 keeps 3 mantissa bits: half a step is 1/16 of the value's octave.
+    bound = full.float().abs().amax(-1, keepdim=True) / 16
+    assert (err <= bound)[torch.arange(TOKENS) != 3].all()
+    assert (err > 0).any()
+
+
 def test_ple_gate_sequence_parallel_matches_tp(tp2):
     from vllm_torchtpu.models.vllm.qwen4_exp.ple import Qwen4ExpPLELayer
 

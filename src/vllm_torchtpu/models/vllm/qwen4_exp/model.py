@@ -461,7 +461,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             exit_all_to_all = sequence_parallel and self.attn_out_full is not None
             unprojected = {"output_projection": False} if exit_all_to_all else {}
             if sequence_parallel:
-                block = sp.gather(block, num_tokens)
+                block = sp.gather_attention_input(block, num_tokens)
             if self.layer_type == "linear_attention":
                 block = self.linear_attn(block, gdn_step_metadata_cache, **unprojected)
             else:
