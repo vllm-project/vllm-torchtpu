@@ -453,7 +453,9 @@ def test_attention_of_kept_own_candidates(tokens, pages_per_seq, rank, shared):
 @pytest.mark.parametrize("rank", [0, 1])
 def test_attention_of_word_pages(tokens, rank, monkeypatch):
     """A decode step's fp8 pages read as 32-bit words (`_words_ring`) give the
-    outputs of the packed-rows read, bit for bit."""
+    outputs of the packed-rows read, bit for bit. In interpret mode the host
+    computes the bf16 x fp8 products: this checks the slot order, masks and
+    hit tests, not the MXU's fp8 weights (on device: kbench j-a248f63b)."""
     args, common = _attend_case(tokens, rank, True, seed=tokens + 7 * rank)
     assert msa_attention_lse._words_ring(args[1], 8, False, 256)
     got = msa_dcp.msa_attend_dcp(*args, own_first=True, **common)

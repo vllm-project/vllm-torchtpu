@@ -376,12 +376,18 @@ def _kernel(
             local_page = local_page_ref[...]
             local_limit = local_limit_ref[...]
             keys, values, masks, k_scales, v_scales = [], [], [], [], []
+            if words:  # each row's limits across a page's lanes (`_lane_limits`)
+                lane_limits = _lane_limits(selected, local_page, local_limit, page_size)
             for g, kv_ref in enumerate(kv_refs[:width]):
                 page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
-                is_selected = _any_hit(selected == page, axis=1)
-                limit = jnp.where(local_page == page, local_limit, page_size)
-                limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
-                seen = jnp.max(limit)
+                if words:
+                    limit = lane_limits(page)  # [Bq, S]
+                    seen = jnp.max(limit, axis=0, keepdims=True)  # [1, S]
+                else:
+                    is_selected = _any_hit(selected == page, axis=1)
+                    limit = jnp.where(local_page == page, local_limit, page_size)
+                    limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
+                    seen = jnp.max(limit)
                 if fp4:
                     # Stale or unwritten slots hold finite int4 values and
                     # scales that `_fp4_page` reads as 0 when non-finite, so
@@ -399,14 +405,12 @@ def _kernel(
                     v_scales.append(sv)
                 elif words:
                     # K as stored (its stale slots' scores are masked); V's
-                    # stale slots zeroed. The K pushes then wait for no hit
-                    # test (a chain of cross-lane maxima over the group).
+                    # stale slots zeroed. K's pushes do not wait on the limits.
                     k_words = kv_ref[pl.ds(0, rows_per_page, stride=2), :]
                     v_words = kv_ref[pl.ds(1, rows_per_page, stride=2), :]
                     rows = pltpu.bitcast(k_words, kv_hbm_dtype)
-                    seen_v = jnp.max(limit, axis=0, keepdims=True)  # [1, 1]
                     values.append(
-                        msa_attention._word_rows(v_words, packing, seen_v, kv_hbm_dtype)
+                        msa_attention._word_rows(v_words, packing, seen, kv_hbm_dtype)
                     )
                 elif packing == 4:
                     # The packed [S / 4, 4, 2D] page read as [S, 2D] rows: slot
@@ -514,7 +518,34 @@ def _words_ring(kv_cache, block_q: int, fp4: bool, row_width: int) -> bool:
         and kv_cache.dtype == jnp.float8_e4m3fn
         and kv_cache.shape[2] == _WORD_PACKING
         and kv_cache.shape[3] == row_width == 2 * _WORD_ROW_LANES
+        # A page's slots fill a vreg's lanes (`_lane_limits`).
+        and kv_cache.shape[1] * _WORD_PACKING == _WORD_ROW_LANES
     )
+
+
+def _lane_limits(selected, local_page, local_limit, page_size):
+    """`attend`'s visible-slot limit of each row for a page, as a full
+    ``[Bq, S]`` tile (``S`` = a vreg's lanes): ``page -> limit``, the row's
+    `local_limit` on its local page, all of the page if it selected it, else
+    0. The hit test is a 0/1 matmul against ones, whose product lands on
+    every lane: the cross-lane maximum and lane broadcast per page it
+    replaces queued on the XLU behind the softmax's reductions."""
+    block_q, topk = selected.shape
+    ones = jnp.ones((topk, page_size), jnp.bfloat16)
+    local_page = jnp.broadcast_to(local_page, (block_q, page_size))
+    local_limit = jnp.broadcast_to(local_limit, (block_q, page_size))
+
+    def limits(page):
+        hits = jax.lax.dot_general(
+            (selected == page).astype(jnp.bfloat16),
+            ones,
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )  # [Bq, S]: the row's selections equal to `page`, on every lane
+        limit = jnp.where(local_page == page, local_limit, page_size)
+        return jnp.where((page >= 0) & (hits > 0), limit, 0)
+
+    return limits
 
 
 def _any_hit(matches, axis):
