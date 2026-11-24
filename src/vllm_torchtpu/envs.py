@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_MOE_PADDING_MASK_ON_DEVICE: bool = False
     TPU_DP_IDLE_DUMMY_KEEP_BLOCK_TABLE: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -889,6 +890,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # Keep one device MoE token padding mask per (valid, padded) row pair and
+    # reuse it, instead of building the mask on the host and copying it
+    # synchronously before every forward. The mask's values are the same.
+    "TPU_MOE_PADDING_MASK_ON_DEVICE": env_bool("TPU_MOE_PADDING_MASK_ON_DEVICE"),
     # A dummy walk uploads its all-zero block table once per layout and reuses
     # the device copy, instead of zeroing and uploading a full-length host
     # buffer every idle step; that zeroing made an idle rank late to the forward.

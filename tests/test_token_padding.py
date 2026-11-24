@@ -22,6 +22,61 @@ def test_local_suffix_update():
     assert mask.get_local_padding_mask(8).sum().item() == 0
 
 
+@pytest.mark.parametrize(
+    "valid,padded", [(3, 6), (2, 2), (0, 6), (0, 8), (5, 8), (3, 6)]
+)
+def test_on_device_mask_matches_host_write(valid, padded):
+    host = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
+    device = TokenPaddingState(
+        local_padding_mask=torch.ones(8, dtype=torch.bool), on_device=True
+    )
+    host.update(valid, padded)
+    device.update(valid, padded)
+    assert torch.equal(device.local_padding_mask, host.local_padding_mask)
+
+
+def test_on_device_mask_is_built_once_per_pair():
+    state = TokenPaddingState(
+        local_padding_mask=torch.zeros(8, dtype=torch.bool), on_device=True
+    )
+    state.update(3, 6)
+    first = state.local_padding_mask
+    state.update(0, 8)
+    assert state.get_local_padding_mask(8).tolist() == [True] * 8
+    state.update(3, 6)
+    assert state.local_padding_mask is first
+    assert sorted(state._pair_masks) == [(0, 8), (3, 6)]
+    assert first.tolist() == [False] * 3 + [True] * 3 + [False] * 2
+
+
+def test_on_device_mask_is_never_written_after_use():
+    state = TokenPaddingState(
+        local_padding_mask=torch.zeros(8, dtype=torch.bool), on_device=True
+    )
+    state.update(3, 6)
+    in_flight = state.get_local_padding_mask(8)
+    state.update(0, 8)
+    assert in_flight.tolist() == [False] * 3 + [True] * 3 + [False] * 2
+
+
+def test_on_device_mask_stops_caching_past_its_bound(monkeypatch):
+    monkeypatch.setattr(token_padding, "_MAX_PAIR_MASKS", 1)
+    state = TokenPaddingState(
+        local_padding_mask=torch.zeros(8, dtype=torch.bool), on_device=True
+    )
+    for valid, padded in [(3, 6), (0, 8), (5, 8)]:
+        state.update(valid, padded)
+    assert list(state._pair_masks) == [(3, 6)]
+    assert state.get_local_padding_mask(8).tolist() == [False] * 5 + [True] * 3
+
+
+def test_create_reads_the_on_device_switch(monkeypatch):
+    monkeypatch.setenv("TPU_MOE_PADDING_MASK_ON_DEVICE", "1")
+    assert TokenPaddingState.create(8, torch.device("cpu")).on_device
+    monkeypatch.delenv("TPU_MOE_PADDING_MASK_ON_DEVICE")
+    assert not TokenPaddingState.create(8, torch.device("cpu")).on_device
+
+
 def test_dummy_batch_is_all_padding():
     state = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
     state.update(0, 6)
