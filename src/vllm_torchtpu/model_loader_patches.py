@@ -161,10 +161,56 @@ def _compute_local_expert_ids() -> set[int] | None:
     return local_ids
 
 
+def _compute_pp_layer_skip():
+    """A predicate dropping decoder-layer tensors outside this PP stage, or None.
+
+    On only under TPU_RUNAI_PP_LAYER_FILTER=1 and pipeline_parallel_size > 1.
+    A stage builds PPMissingLayer for the other stages' layers and its
+    load_weights skips their tensors anyway, but the stock Run:AI path still
+    streams the whole checkpoint on every stage. Only ``layers.<i>.`` tensors
+    with i < num_hidden_layers are dropped: embeddings, final norm, lm_head
+    and any MTP layer (index >= num_hidden_layers) are still fetched.
+    """
+    if os.environ.get("TPU_RUNAI_PP_LAYER_FILTER") != "1":
+        return None
+    import re
+
+    from vllm.config import get_current_vllm_config
+    from vllm.distributed import get_pp_group
+    from vllm.distributed.utils import get_pp_indices
+
+    vllm_config = get_current_vllm_config()
+    pp_size = int(vllm_config.parallel_config.pipeline_parallel_size)
+    if pp_size <= 1:
+        return None
+    num_layers = int(vllm_config.model_config.hf_text_config.num_hidden_layers)
+    pp_rank = get_pp_group().rank_in_group
+    start, end = get_pp_indices(num_layers, pp_rank, pp_size)
+    layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+    logger.info(
+        "[sharded-pp-load] stage %d/%d fetches decoder layers [%d, %d) of %d",
+        pp_rank,
+        pp_size,
+        start,
+        end,
+        num_layers,
+    )
+
+    def skip(name: str) -> bool:
+        match = layer_re.search(name)
+        if match is None:
+            return False
+        index = int(match.group(1))
+        return index < num_layers and not start <= index < end
+
+    return skip
+
+
 def _sharded_runai_weights_iterator(
     hf_weights_files: list[str],
-    local_expert_ids: set[int],
+    local_expert_ids: set[int] | None,
     use_tqdm_on_load: bool,
+    pp_skip=None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream only this rank's tensors from the safetensors files.
 
@@ -216,7 +262,10 @@ def _sharded_runai_weights_iterator(
         for path, meta in zip(hf_weights_files, metas):
             pos = meta.offset
             for tensor_meta, size in zip(meta.tensors_metadata, meta.read_sizes):
-                if _should_skip(tensor_meta.name, local_expert_ids):
+                if (
+                    local_expert_ids is not None
+                    and _should_skip(tensor_meta.name, local_expert_ids)
+                ) or (pp_skip is not None and pp_skip(tensor_meta.name)):
                     skipped += 1
                     skipped_bytes += size
                     # A zero-byte skip leaves the byte stream contiguous, so
@@ -330,7 +379,14 @@ def patch_runai_sharded_expert_streaming() -> None:
                 "full-checkpoint streaming"
             )
             local_expert_ids = None
-        if local_expert_ids is None:
+        try:
+            pp_skip = _compute_pp_layer_skip()
+        except Exception:
+            logger.exception(
+                "[sharded-pp-load] stage filter setup failed; streaming every layer"
+            )
+            pp_skip = None
+        if local_expert_ids is None and pp_skip is None:
             return original_get_iterator(self, model_or_path, revision)
         if getattr(self, "_is_distributed", False):
             # Per-rank fetch plans differ, so the streamer's cross-rank
@@ -343,7 +399,10 @@ def patch_runai_sharded_expert_streaming() -> None:
             )
         hf_weights_files = self._prepare_weights(model_or_path, revision)
         return _sharded_runai_weights_iterator(
-            hf_weights_files, local_expert_ids, self.load_config.use_tqdm_on_load
+            hf_weights_files,
+            local_expert_ids,
+            self.load_config.use_tqdm_on_load,
+            pp_skip=pp_skip,
         )
 
     rsl.RunaiModelStreamerLoader._get_weights_iterator = _get_weights_iterator
