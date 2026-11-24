@@ -1176,7 +1176,10 @@ def _exchange_pages(
             started, pages, live.reshape(1), rank.reshape(1), **common
         )
     # Destination rank d = h * replicas + j gets part j of head h.
-    sc = scale_cache[pages][:, : 2 * heads]  # K/V rows of every head
+    # K/V rows of every head, gathered as rows of the pages' tiles.
+    scale_rows = scale_cache.shape[1]
+    row = pages[:, None] * scale_rows + jnp.arange(2 * heads, dtype=jnp.int32)
+    sc = scale_cache.reshape(-1, scale_cache.shape[-1])[row.reshape(-1)]
     sc = sc.reshape(replicas, part, heads, 2, sc.shape[-1])
     # [dcp, part * 2, lanes]: a [.., 2, lanes] block pads its (8, 128) tiles
     # four times over.
