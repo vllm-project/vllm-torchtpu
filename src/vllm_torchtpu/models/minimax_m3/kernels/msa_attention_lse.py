@@ -1039,7 +1039,7 @@ def _attention_call(
             kv_cache,
             scale_cache if fp4 else None,
             transposed,
-            _unit_groups(transposed, tiles, inline_issue),
+            _unit_groups(transposed, tiles),
         ),
     )
     num_inputs = 4 + 4 + len(qs) + len(scale_inputs) + len(limits)
@@ -1055,7 +1055,7 @@ def _attention_call(
             limited=limited,
             kernel_limits=kernel_limits,
             packed_stores=packed_stores,
-            unit_groups=_unit_groups(transposed, tiles, inline_issue),
+            unit_groups=_unit_groups(transposed, tiles),
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -1109,36 +1109,33 @@ def _transposed(block_q: int, fp4: bool) -> bool:
     return (not fp4 or FP4_TRANSPOSED) and block_q >= msa_attention.DEFAULT_BLOCK_Q
 
 
-def _unit_groups(transposed: bool, num_tiles: int, inline_issue: bool) -> int:
+def _unit_groups(transposed: bool, num_tiles: int) -> int:
     """`_kernel`'s ``unit_groups`` for a call of `num_tiles` tiles
     (`DECODE_UNIT_GROUPS`). None for one tile (twin c16 1-request decode
-    7.6 -> 14.5 us per layer with units, j-6852856d), nor for calls that
-    issue a wide group's next copies inside its body (`inline_issue`, one
-    KV head: c48), whose groups are wide and throughput-bound as served
-    (bucket-padded c48 decode at rho .9, kernel bench: +3-8 % as units,
-    b8 / b9 / b10; c48 twin b34 +0.54 ms/step, j-fa0ca313)."""
-    if transposed or not MAX_FREE or num_tiles == 1 or inline_issue:
+    7.6 -> 14.5 us per layer with units, j-6852856d). Calls of one KV head
+    (c48) run units too since their groups' folds are straight-line: 4-bit
+    8-token tiles, kernel bench at rho .9-.97, b8 -9 %, b10 -5 %, b22 -15 %,
+    b34 -13 % (at rho .5: -2..-5 %)."""
+    if transposed or not MAX_FREE or num_tiles == 1:
         return 1
     return DECODE_UNIT_GROUPS
 
 
-def _decode_units(transposed: bool, inline_issue: bool) -> bool:
+def _decode_units(transposed: bool) -> bool:
     """Whether calls of several tiles run units (`_unit_groups`)."""
-    return _unit_groups(transposed, 2, inline_issue) > 1
+    return _unit_groups(transposed, 2) > 1
 
 
-def _decode_tiles_per_step(
-    block_q: int, fp4: bool, q_per_kv: int, inline_issue: bool
-) -> int | None:
+def _decode_tiles_per_step(block_q: int, fp4: bool, q_per_kv: int) -> int | None:
     """The most tiles a grid step takes in calls of `attend` tiles that run
     units (`UNIT_TILES_PER_STEP`, `_UNIT_STEP_ROWS`), else None."""
-    if not _decode_units(_transposed(block_q, fp4), inline_issue):
+    if not _decode_units(_transposed(block_q, fp4)):
         return None
     return max(1, min(UNIT_TILES_PER_STEP, _UNIT_STEP_ROWS // (block_q * q_per_kv)))
 
 
 def token_multiple(
-    num_tokens: int, block_q: int, q_per_kv: int, dtype, fp4: bool, inline_issue: bool
+    num_tokens: int, block_q: int, q_per_kv: int, dtype, fp4: bool
 ) -> int:
     """The multiple a call of `num_tokens` pads its tokens to: whole tiles,
     and for `attend` tiles running units of several tiles whole output
@@ -1146,7 +1143,7 @@ def token_multiple(
     (`_decode_tiles_per_step`). A single tile is a step of its own: padding
     it would only add pad and slice ops (twin c16 1-request decode, +7.5 us
     per layer)."""
-    units = _decode_tiles_per_step(block_q, fp4, q_per_kv, inline_issue)
+    units = _decode_tiles_per_step(block_q, fp4, q_per_kv)
     if num_tokens <= block_q or units is None:
         return block_q
     return math.lcm(block_q, _merged_store_rows(block_q, q_per_kv, dtype))
@@ -1349,7 +1346,7 @@ def planned_attention(
             kv_cache,
             scale_cache if fp4 else None,
             transposed=False,
-            unit_groups=_unit_groups(False, num_tiles, False),
+            unit_groups=_unit_groups(False, num_tiles),
         )
         + [
             pltpu.VMEM((num_tokens, topk), jnp.int32),
@@ -1373,7 +1370,7 @@ def planned_attention(
             sm_scale=sm_scale,
             tiles_per_step=tiles_per_step,
             groups_per_tile=groups_per_tile,
-            unit_groups=_unit_groups(False, num_tiles, False),
+            unit_groups=_unit_groups(False, num_tiles),
             kernel_limits=_kernel_limits(kv_cache),
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
@@ -1444,7 +1441,7 @@ def call_work_spec(num_tokens, num_q_heads, dtype, topk, block_q, pages_per_step
         num_tiles,
         block_q,
         align,
-        _decode_tiles_per_step(block_q, False, num_q_heads, False),
+        _decode_tiles_per_step(block_q, False, num_q_heads),
     )
     groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
     sections, length = _work_layout(
@@ -1810,9 +1807,7 @@ def _chunk_work(
         block_q,
         pages_per_step,
         align=_merged_store_rows(block_q, num_q_heads // num_heads, dtype, packed),
-        most=_decode_tiles_per_step(
-            block_q, fp4, num_q_heads // num_heads, num_heads == 1
-        )
+        most=_decode_tiles_per_step(block_q, fp4, num_q_heads // num_heads)
         or (
             PREFILL_TILES_PER_STEP_4BIT
             if fp4
@@ -2045,7 +2040,7 @@ def msa_sparse_attention_lse(
     leaf = jax.tree.leaves(q)[0]
     q_per_kv = sum(x.shape[0 if q_head_major else 1] for x in jax.tree.leaves(q))
     multiple = token_multiple(
-        num_tokens, block_q, q_per_kv, leaf.dtype, scale_cache is not None, True
+        num_tokens, block_q, q_per_kv, leaf.dtype, scale_cache is not None
     )
     q, selected, local_page, local_limit = _pad_tokens(
         q, selected, local_page, local_limit, multiple, q_head_major
@@ -2129,7 +2124,6 @@ def msa_sparse_attention_lse_heads(
         num_q_heads // num_heads,
         q.dtype,
         scale_cache is not None,
-        num_heads == 1,
     )
     q, selected, local_page, local_limit = _pad_tokens(
         q, selected, local_page, local_limit, multiple, q_head_major
