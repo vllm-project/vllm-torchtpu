@@ -766,3 +766,23 @@ def test_a_graph_slicing_this_ranks_rows_is_never_replayed_by_another_rank(
     assert _fingerprint_at_rank(monkeypatch, replicated, 0) == _fingerprint_at_rank(
         monkeypatch, replicated, 1
     )
+
+
+def test_code_layout_overrides_disabled_by_default_and_bounded(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    assert envs.TPU_NO_CODE_FUNCTIONS_MAX_TOKENS == 0
+    assert tpu_compiler.code_layout_overrides(4) == {}
+    assert tpu_compiler.code_layout_overrides(None) == {}
+
+    monkeypatch.setattr(envs, "TPU_NO_CODE_FUNCTIONS_MAX_TOKENS", 64, raising=False)
+    assert tpu_compiler.code_layout_overrides(None) == {}
+    assert tpu_compiler.code_layout_overrides(64) == {
+        "xla_tpu_enable_deduplicated_calls": "DISABLED"
+    }
+    assert tpu_compiler.code_layout_overrides(16) == {
+        "xla_tpu_enable_deduplicated_calls": "DISABLED"
+    }
+    assert tpu_compiler.code_layout_overrides(65) == {}
+    assert tpu_compiler.code_layout_overrides(256) == {}

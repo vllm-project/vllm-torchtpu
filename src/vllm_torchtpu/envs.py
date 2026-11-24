@@ -290,6 +290,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
+    TPU_NO_CODE_FUNCTIONS_MAX_TOKENS: int = 0
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -2174,6 +2175,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per host and the others wait for its artifact. Off compiles every bucket
     # on every rank, sharing only through the Tier-2 cache.
     "TPU_PRECOMPILE_PEER_REPLAY": env_bool("TPU_PRECOMPILE_PEER_REPLAY", default=False),
+    # Compile every program whose token bucket is at most this many tokens
+    # without XLA's shared code functions (HLO functions), so its layers' code
+    # runs in program order instead of reloading shared functions' overlays.
+    # Larger buckets keep the compiler's choice. 0 disables the override.
+    "TPU_NO_CODE_FUNCTIONS_MAX_TOKENS": env_nonnegative_int(
+        "TPU_NO_CODE_FUNCTIONS_MAX_TOKENS", 0
+    ),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
