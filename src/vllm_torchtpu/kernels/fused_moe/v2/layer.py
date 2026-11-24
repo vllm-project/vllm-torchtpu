@@ -24,6 +24,14 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.fused_moe.v2 import combine_small
+from vllm_torchtpu.kernels.fused_moe.v2.direct_all_gather import (
+    direct_all_gather,
+    direct_all_gather_to_hbm,
+    supports_direct_all_gather,
+    supports_direct_all_gather_to_hbm,
+)
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -59,6 +67,11 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     build_fused_ep_moe_kernel,
     combine_step_tokens,
     rowquant_fp8,
+)
+from vllm_torchtpu.kernels.fused_moe.v2.plan_kernel import (
+    PlanShape,
+    plan_kernel_fits,
+    routing_plan,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.preprocessing import PreprocessTopology
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import (
@@ -182,6 +195,23 @@ def _combine_arrivals(
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
     hidden = lane_blocks * lanes
+    if envs.MOE_FUSED_EP_V2_COMBINE_ONE_CALL and combine_small.fits(
+        t_local=t_local,
+        topk=topk,
+        tile_m=tile_m,
+        scale_dtype=arrival_scales.dtype,
+    ):
+        combine = combine_small.build_one_call_combine(
+            t_local=t_local,
+            topk=topk,
+            recv_rows=recv_rows,
+            lane_blocks=lane_blocks,
+            mirror_sublanes=mirror_sublanes,
+            tile_m=tile_m,
+            wire_dtype=arrivals.dtype,
+            out_dtype=out_dtype,
+        )
+        return combine(arrivals, arrival_scales, pos, mirror_pos, topk_weights)
     # A gather clamps an out-of-range index to the last one; a DMA does not,
     # and a sublane index clamped on its own would pair the last sublane with
     # the wrong lane. Neither position is ever negative.
@@ -378,6 +408,7 @@ def fused_ep_moe_v2(
     routed=None,
     gather_positions=None,
     preprocess_topology: PreprocessTopology | None = None,
+    plan_kernel: bool = False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -419,6 +450,9 @@ def fused_ep_moe_v2(
     sharded_plan computes the same kernel operands from the two complementary
     1/ep slices their consumers read, plus one small expert-count all-gather.
     It changes routing-plan construction only, never the core kernel.
+    plan_kernel builds that sharded plan in one Pallas kernel (plan_kernel.py)
+    where plan_kernel_fits admits the shape, with the same kernel operands;
+    other shapes, and the SparseCore pair scatter, keep the XLA plan.
 
     token_replica_groups lists ordered groups of device-mesh indices whose
     x and gating rows are identical (for example, a TP group). Each member
@@ -551,6 +585,7 @@ def fused_ep_moe_v2(
                 )
     (ax,) = mesh.axis_names
     ep = mesh.shape[ax]
+    single_host = len({d.process_index for d in mesh.devices.flat}) == 1
     if mesh_ep_ranks is not None:
         mesh_ep_ranks = tuple(int(rank) for rank in mesh_ep_ranks)
         if tuple(sorted(mesh_ep_ranks)) != tuple(range(ep)):
@@ -652,6 +687,46 @@ def fused_ep_moe_v2(
                 "hash_topk_ids are expert ids and must be an integer dtype; "
                 f"got {jnp.dtype(hash_topk_ids.dtype).name}"
             )
+    from vllm_torchtpu.kernels.fused_moe.v2.preprocessing import (
+        supports_activation_gather,
+    )
+    from vllm_torchtpu.kernels.fused_moe.v2.scatter import can_scatter_pair
+
+    use_split_sc = (
+        preprocess_topology is not None
+        and stage == "fused"
+        and weight_format == WeightFormat.FP4
+        and supports_activation_gather(t_local * hidden)
+        and can_scatter_pair(
+            T * topk,
+            ragged_stride,
+            act_scale_slab_rows(ragged_stride) * HIDDEN_LANE_BLOCK,
+        )
+    )
+
+    layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
+    plan_shape = PlanShape(
+        ep=ep,
+        e_total=e_total,
+        topk=topk,
+        t_local=t_local,
+        block=block,
+        tile_m=capacity,
+        shard_stride=ragged_stride,
+        scale_at=layout[0],
+        count_at=layout[1],
+        width=layout[2],
+    )
+    # The plan kernel stands in for the sharded XLA plan, not for the
+    # SparseCore pair scatter, which builds the token gather and scale slab
+    # its own way.
+    use_plan_kernel = (
+        plan_kernel
+        and bool(sharded_plan)
+        and form.quantized_activations
+        and not use_split_sc
+        and plan_kernel_fits(plan_shape)
+    )
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -666,9 +741,9 @@ def fused_ep_moe_v2(
         has_w2_bias=has_w2_bias,
         pad_scale_rows=pad_scale_rows,
         logical_intermediate_size=logical_intermediate_size,
+        **({"packed_tables": True} if use_plan_kernel else {}),
     )
 
-    layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
     wire_width = _exchange_layout(t_wire, topk, e_total, form.quantized_activations)[-1]
 
     def unpack_operands(scales_gating_biases):
@@ -868,6 +943,81 @@ def fused_ep_moe_v2(
         )
         return topk_weights, packed, local_blocks, block_hist, row_routes
 
+    def finish(
+        q_g,
+        kernel_tables,
+        token_gather,
+        scale_slab,
+        expert_rows,
+        slab_base,
+        visit,
+        counts,
+        pos,
+        mirror_pos,
+        topk_weights,
+        row_routes,
+        rank_l,
+        w1_l,
+        w2_l,
+        w1s_l,
+        w2s_l,
+        bias_it,
+        out_dtype,
+        updated_load,
+    ):
+        """Kernel and combine from the routing plan's tables."""
+        recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
+        # The bias tables are per expert and per output channel on every
+        # weight format, so they take one layout: [G, N].
+        w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
+        w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
+        arrivals, arrival_scales = kfn(
+            kernel_tables,
+            token_gather,
+            expert_rows,
+            slab_base,
+            q_g,
+            scale_slab,
+            w1_l,
+            w2_l,
+            w1s_l,
+            w2s_l,
+            w1b_k,
+            w2b_k,
+            recv_rows=recv_rows,
+            visit=visit,
+            counts=counts,
+            rank=rank_l,
+        )
+        combined = _combine_arrivals(
+            arrivals,
+            arrival_scales,
+            pos,
+            mirror_pos,
+            topk_weights,
+            out_dtype,
+        )
+        # A row that routed nowhere read arrival rows nobody wrote; its weight is
+        # zero, but zero times an unwritten NaN is not.
+        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        out = token_layout.restore(combined, ax)
+        return out if updated_load is None else (out, updated_load)
+
+    def step_load(exchange, expert_load_l):
+        """The accumulator plus the step's rows per physical slot in EP-rank
+        order, summed over every source rank: identical on every shard, so
+        the accumulator stays replicated."""
+        if expert_load_l is None:
+            return None
+        rows_by_dest = _unpack_routing_exchange(
+            exchange, layout, t_local, topk, e_total
+        )[2]
+        return expert_load_l + _unpermute_load_to_ep_rank_order(
+            rows_by_dest.sum(axis=0).astype(jnp.int32),
+            g_local=g_local,
+            mesh_ep_ranks=mesh_ep_ranks,
+        )
+
     def compute_local(
         q_g,
         exchange,
@@ -885,22 +1035,42 @@ def fused_ep_moe_v2(
         expert_load_l=None,
     ):
         """Plan, kernel and combine over the gathered rows and payload."""
+        updated_load = step_load(exchange, expert_load_l)
+        if use_plan_kernel:
+            plan = routing_plan(exchange, rank_l, plan_shape)
+            token_gather = plan.token_gather
+            if gather_positions is not None:
+                head = token_gather[:ragged_stride]
+                src = head // t_local
+                head = jnp.asarray(gather_positions, jnp.int32)[src] * t_local + (
+                    head - src * t_local
+                )
+                token_gather = token_gather.at[:ragged_stride].set(head)
+            return finish(
+                q_g,
+                (plan.packed,),
+                token_gather,
+                plan.scale_slab,
+                None,
+                None,
+                None,
+                plan.count_lanes,
+                plan.pos,
+                plan.mirror_pos,
+                topk_weights,
+                row_routes,
+                rank_l,
+                w1_l,
+                w2_l,
+                w1s_l,
+                w2s_l,
+                bias_it,
+                out_dtype,
+                updated_load,
+            )
         me = rank_l[0, 0]
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
-        )
-        # The step's rows per physical slot in EP-rank order, summed over every
-        # source rank: identical on every shard, so the accumulator stays
-        # replicated.
-        updated_load = (
-            None
-            if expert_load_l is None
-            else expert_load_l
-            + _unpermute_load_to_ep_rank_order(
-                rows_by_dest.sum(axis=0).astype(jnp.int32),
-                g_local=g_local,
-                mesh_ep_ranks=mesh_ep_ranks,
-            )
         )
         gathered = GatheredPairs(
             expert_blocks=pairs_g.reshape(T * topk // block, block),
@@ -1003,11 +1173,6 @@ def fused_ep_moe_v2(
         else:
             scale_slab = None
         expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
-        recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
-        # The bias tables are per expert and per output channel on every
-        # weight format, so they take one layout: [G, N].
-        w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
-        w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
         # The empty experts drop out of the visit list, so an empty
         # expert's weight slab never streams. How MANY are visited is a
         # row of the count table rather than its own reduction, so this
@@ -1027,25 +1192,6 @@ def fused_ep_moe_v2(
         # HBM->SMEM DMA at the head of the kernel, and the prefetch also has to
         # fit in 1 MB of SMEM.
         kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
-        arrivals, arrival_scales = kfn(
-            kernel_tables,
-            token_gather,
-            expert_rows,
-            slab_base,
-            q_g,
-            scale_slab,
-            w1_l,
-            w2_l,
-            w1s_l,
-            w2s_l,
-            w1b_k,
-            w2b_k,
-            recv_rows=recv_rows,
-            visit=visit,
-            counts=counts,
-            rank=rank_l,
-        )
-
         # The destination's own table: one arrival row per selection slot.
         pos = (
             cast(ShardRoutingTables, routing).pos
@@ -1065,36 +1211,28 @@ def fused_ep_moe_v2(
                 (t_local, topk),
             )
         )
-        combined = _combine_arrivals(
-            arrivals,
-            arrival_scales,
+        return finish(
+            q_g,
+            kernel_tables,
+            token_gather,
+            scale_slab,
+            expert_rows,
+            slab_base,
+            visit,
+            counts,
             pos,
             mirror_pos,
             topk_weights,
+            row_routes,
+            rank_l,
+            w1_l,
+            w2_l,
+            w1s_l,
+            w2s_l,
+            bias_it,
             out_dtype,
+            updated_load,
         )
-        # A row that routed nowhere read arrival rows nobody wrote; its weight is
-        # zero, but zero times an unwritten NaN is not.
-        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
-        out = token_layout.restore(combined, ax)
-        return out if updated_load is None else (out, updated_load)
-
-    from vllm_torchtpu.kernels.fused_moe.v2.preprocessing import (
-        supports_activation_gather,
-    )
-    from vllm_torchtpu.kernels.fused_moe.v2.scatter import can_scatter_pair
-
-    use_split_sc = (
-        preprocess_topology is not None
-        and stage == "fused"
-        and weight_format == WeightFormat.FP4
-        and supports_activation_gather(t_local * hidden)
-        and can_scatter_pair(
-            T * topk,
-            ragged_stride,
-            act_scale_slab_rows(ragged_stride) * HIDDEN_LANE_BLOCK,
-        )
-    )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
@@ -1133,13 +1271,14 @@ def fused_ep_moe_v2(
                     compiler_options={"sparse_core_config": {"core_ids": [0]}},
                 )(packed).reshape(ep, layout[-1])
         else:
-            q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
+            direct_tokens = uses_direct_token_gather(q_l)
+            q_g = gather_tokens(q_l, direct_tokens)
             topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
                 gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
             )
-            exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
-                ep, layout[-1]
-            )
+            # The direct token copy takes core 1 and the routing exchange core 0:
+            # issued together, this placement ends first.
+            exchange = gather_exchange(packed, route_core=0 if direct_tokens else 1)
         return compute_local(
             q_g,
             exchange,
@@ -1156,6 +1295,41 @@ def fused_ep_moe_v2(
             x_l.dtype,
             expert_load_l,
         )
+
+    def uses_direct_token_gather(q_l):
+        return 0 < t_local <= envs.MOE_DIRECT_TOKEN_AG_MAX_TOKENS and (
+            supports_direct_all_gather_to_hbm(
+                ep, q_l.size * q_l.dtype.itemsize, single_host
+            )
+        )
+
+    def gather_tokens(q_l, direct):
+        """Every shard's token rows [ep * t_local, ...], in rank order.
+
+        Small buckets take one round of SparseCore remote copies on core 1 in
+        place of XLA's barrier-separated stages. Same rows.
+        """
+        if direct:
+            return direct_all_gather_to_hbm(
+                q_l, ax, ep, core_id=1, name="moe_direct_token_ag"
+            )
+        return lax.all_gather(q_l, ax, axis=0, tiled=True)
+
+    def gather_exchange(packed, route_core=1):
+        """The routing exchange [ep, width]: every shard's packed routing row.
+
+        Where supports_direct_all_gather admits the exchange, each shard
+        writes its row to every peer in one round of remote copies, in place
+        of XLA's SparseCore all-gather, which passes the rows around a ring.
+        Same rows in the same order.
+        """
+        if supports_direct_all_gather(
+            ep, packed.size * packed.dtype.itemsize, single_host
+        ):
+            gathered = direct_all_gather(packed, ax, ep, route_core)
+        else:
+            gathered = lax.all_gather(packed, ax, axis=0, tiled=True)
+        return gathered.reshape(ep, layout[-1])
 
     def route_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """stage="route": the wire rows, router weights and payload."""
@@ -1184,9 +1358,7 @@ def fused_ep_moe_v2(
         )
         topk_weights = topk_weights[:t_local]
         packed = packed[:, : layout[-1]]
-        exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
-            ep, layout[-1]
-        )
+        exchange = gather_exchange(packed)
         local_blocks = packed[0, : t_local * topk].reshape(
             t_local * topk // block, block
         )
@@ -1277,6 +1449,7 @@ def fused_ep_moe_v2(
         mesh_ep_ranks,
         token_layout,
         bool(sharded_plan),
+        use_plan_kernel,
         x.dtype,
         w1.dtype,
         w2.dtype,

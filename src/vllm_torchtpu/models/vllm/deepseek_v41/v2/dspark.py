@@ -33,6 +33,7 @@ from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41Mo
 from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.logger import init_logger
 
+from ..common import vocab_parallel_head
 from ..common.mhc import (
     collapse,
     initialize_delayed_mhc,
@@ -398,6 +399,17 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         if not (tp_size == 1 and sample_from_anchor and block_size == 5):
             return None
         assert self.lm_head is not None
+        if vocab_parallel_head.is_vocab_parallel(self.lm_head):
+            # The shared head holds only this rank's vocab rows: the fused
+            # sampler's full-vocab Pallas head cannot read it. Draft logits go
+            # through compute_logits, which runs the vocab-parallel head.
+            logger.info(
+                "DSpark draft head: vocab-parallel, weight %s of vocab %d; "
+                "fused draft sampler off",
+                tuple(self.lm_head.weight.shape),
+                self.lm_head.vocab_parallel_vocab,
+            )
+            return None
         weight = cast(torch.Tensor, self.lm_head.weight)
         markov = self.model.markov_head
         if not (
@@ -446,6 +458,10 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Base logits U_k = lm_head(norm(head_hidden))."""
         assert self.lm_head is not None
+        if vocab_parallel_head.is_vocab_parallel(self.lm_head):
+            return vocab_parallel_head.logits(
+                self.lm_head, self.model.norm(hidden_states)
+            )
         return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

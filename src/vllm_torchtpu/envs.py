@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
 
 import functools
+import math
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -103,7 +104,12 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_PREPROCESS_BACKEND: str = "native"
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
+    MOE_FUSED_EP_V2_PLAN_KERNEL: bool = False
+    MOE_FUSED_EP_V2_COMBINE_ONE_CALL: bool = False
+    MOE_DIRECT_TOKEN_AG_MAX_TOKENS: int = 0
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_FUSED_EP_V2_WEIGHT_DMA_PRIORITY: int = 1
+    MOE_FUSED_EP_V2_LIVE_ROWS_ONLY: bool = False
     TPU_MOE_EPLB_DYNAMIC: bool = False
     TPU_MOE_EPLB_MODE: str = "decode_only"
     TPU_MOE_EPLB_WINDOW_STEPS: int = 16
@@ -195,11 +201,22 @@ if TYPE_CHECKING:
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
+    VLLM_TPU_SEGMENT_TOKENIZE: bool = False
+    VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
+    VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS: int = 0
+    VLLM_TPU_DETOK_PRIME_SUFFIX: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     TPU_GC_POLICY: str = "freeze"
     TPU_GC_COLLECT_EVERY: int = 500
     TPU_GC_TRACE: bool = False
+    VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    VLLM_TPU_DP_PROMPT_BACKLOG: bool = False
+    VLLM_TPU_DP_PROMPT_BACKLOG_MARGIN: float = 1.0
+    VLLM_TPU_DP_PREFIX_AFFINITY: bool = False
+    VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS: int = 4096
+    VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN: int = 2
+    VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE: int = 65536
 
 
 def env_with_choices(
@@ -315,6 +332,20 @@ def env_nonnegative_int(env_name: str, default: int) -> Callable[[], int]:
     return _get_nonnegative_int_env
 
 
+def env_positive_int(env_name: str, default: int) -> Callable[[], int]:
+    """Integer knob that must be greater than zero, for sizes and steps that
+    always have a value. A value of zero or less raises."""
+    parse_int = env_int(env_name, default)
+
+    def _get_positive_int_env() -> int:
+        value = parse_int()
+        if value <= 0:
+            raise ValueError(f"Invalid value '{value}' for {env_name}: must be > 0.")
+        return value
+
+    return _get_positive_int_env
+
+
 def env_float(env_name: str, default: float) -> Callable[[], float]:
     """Float knob with a default. An unparseable value raises."""
 
@@ -330,6 +361,21 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
             ) from exc
 
     return _get_float_env
+
+
+def env_nonnegative_float(env_name: str, default: float) -> Callable[[], float]:
+    """Float knob that must be finite and not negative."""
+    parse = env_float(env_name, default)
+
+    def _get_nonnegative_float_env() -> float:
+        value = parse()
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be finite and >= 0."
+            )
+        return value
+
+    return _get_nonnegative_float_env
 
 
 def env_str(env_name: str, default: str) -> Callable[[], str]:
@@ -927,12 +973,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MOE_FUSED_EP_PREPROCESS_BACKEND", "native", ["native", "topology"]
     ),
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
+    # Build fused EP MoE v2's routing plan in one Pallas kernel
+    # (fused_moe/v2/plan_kernel.py) instead of the XLA plan, where the shape
+    # fits it (the decode buckets, with the sharded plan); the expert kernel
+    # then reads the plan kernel's packed tables.
+    "MOE_FUSED_EP_V2_PLAN_KERNEL": env_bool("MOE_FUSED_EP_V2_PLAN_KERNEL"),
+    # Run fused EP MoE v2's small-t combine (decode) as one Pallas call
+    # (fused_moe/v2/combine_small.py) instead of the XLA epilogue.
+    "MOE_FUSED_EP_V2_COMBINE_ONE_CALL": env_bool("MOE_FUSED_EP_V2_COMBINE_ONE_CALL"),
+    # Fused EP MoE v2 three-slot input stream: fetch and wait only each
+    # tile's live token rows instead of all tile_m rows.
+    "MOE_FUSED_EP_V2_LIVE_ROWS_ONLY": env_bool("MOE_FUSED_EP_V2_LIVE_ROWS_ONLY"),
+    # Fused EP MoE v2 gathers the fp8 token rows with one round of SparseCore
+    # remote copies straight into every peer's output (direct_all_gather_to_hbm)
+    # instead of XLA's offloaded all-gather, for buckets of at most this many
+    # local tokens (0: never).
+    "MOE_DIRECT_TOKEN_AG_MAX_TOKENS": env_int("MOE_DIRECT_TOKEN_AG_MAX_TOKENS", 0),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the
     # kernel.
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
+    ),
+    # DMA priority of fused EP MoE v2's weight refills (kernel.WEIGHT_DMA_PRIORITY).
+    # 0 puts them on the token gather's queue, which at decode shapes shortens
+    # the weight wait of each call; 1 keeps them apart.
+    "MOE_FUSED_EP_V2_WEIGHT_DMA_PRIORITY": env_int(
+        "MOE_FUSED_EP_V2_WEIGHT_DMA_PRIORITY", 1
     ),
     # MOE_FUSED_EP_KERNEL_IMPL=push: how many destination expert-visit
     # positions the SparseCore pushes before the TensorCore MoE kernel starts
@@ -1236,6 +1304,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    # API server: tokenize chat prompts piecewise between added tokens and
+    # cache message-body pieces across turns (segment_tokenize.py). Exact;
+    # falls back to full tokenization for ineligible tokenizers/requests.
+    "VLLM_TPU_SEGMENT_TOKENIZE": env_bool("VLLM_TPU_SEGMENT_TOKENIZE"),
+    # Token budget of that cache (~12 B/token: id pointers plus piece text).
+    "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS", 33554432
+    ),
+    # Recent prompts whose ids a new prompt reuses up to the last added token
+    # they share (segment_tokenize.py). 0 keeps no prompts: every prompt is
+    # split and looked up piece by piece.
+    "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS": env_nonnegative_int(
+        "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS", 0
+    ),
+    # API server: prime each request's decode stream with the shortest prompt
+    # suffix of 4 to 23 tokens that decodes to whole characters, instead of
+    # the whole prompt (detok_prime_suffix.py). Same text out. A rollout
+    # switch: remove it and keep the patch on once serving runs confirm it.
+    "VLLM_TPU_DETOK_PRIME_SUFFIX": env_bool("VLLM_TPU_DETOK_PRIME_SUFFIX"),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
@@ -1261,6 +1348,38 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # engine core (generation, duration, wall-clock ns), to line stalls up
     # with collections in the step records. Independent of TPU_GC_POLICY.
     "TPU_GC_TRACE": env_bool("TPU_GC_TRACE", default=False),
+    # SrptPrefillScheduler: consecutive steps a running prefill chunk may go
+    # without getting one KV block of tokens before it moves ahead of the
+    # other prefill chunks and is no longer held (0 disables hold-back).
+    # Prefixed with VLLM_ so vLLM's Ray worker env propagation
+    # copies it automatically to DP/Ray engine-core actors.
+    "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
+        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
+    ),
+    # Data-parallel engine choice (core/dp_prompt_backlog.py): engines
+    # publish their pending prompt tokens, and the front end moves a request
+    # off vLLM's choice when that engine's pending prompt tokens exceed the
+    # least backlogged engine's by more than MARGIN times the prompt.
+    "VLLM_TPU_DP_PROMPT_BACKLOG": env_bool("VLLM_TPU_DP_PROMPT_BACKLOG", default=False),
+    "VLLM_TPU_DP_PROMPT_BACKLOG_MARGIN": env_nonnegative_float(
+        "VLLM_TPU_DP_PROMPT_BACKLOG_MARGIN", 1.0
+    ),
+    # Data-parallel front end: send a request to the least loaded engine that
+    # took its longest remembered prompt prefix (core/dp_prefix_affinity.py),
+    # so that engine's prefix cache serves it, unless that engine is more than
+    # LOAD_MARGIN requests busier than the least loaded one.
+    "VLLM_TPU_DP_PREFIX_AFFINITY": env_bool(
+        "VLLM_TPU_DP_PREFIX_AFFINITY", default=False
+    ),
+    "VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS": env_positive_int(
+        "VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS", 4096
+    ),
+    "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN": env_nonnegative_int(
+        "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN", 2
+    ),
+    "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE": env_positive_int(
+        "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE", 65536
+    ),
 }
 
 
