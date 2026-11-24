@@ -26,6 +26,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.megablox import tc_combine
 
 # The checkpoint config may omit swiglu_beta; SwiGLU-OAI's up-bias is 1.
 _DEFAULT_SWIGLU_BETA = 1.0
@@ -160,16 +161,19 @@ class MiniMaxM3MoE(nn.Module):
             q8, row_scale = hidden_states
             hidden_states = (q8.float() * row_scale).to(torch.bfloat16)
         router_logits, _ = self.gate(hidden_states)
-        if self._shared_in_combine():
+        if self._shared_in_combine(hidden_states.shape[0]):
             return self._forward_shared_in_combine(hidden_states, router_logits)
         return self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
-    def _shared_in_combine(self) -> bool:
+    def _shared_in_combine(self, num_tokens: int) -> bool:
         """TPU_MINIMAX_M3_SHARED_IN_COMBINE on a step whose layer reduces the
         MoE output itself (SP steps: the runner would return shared + routed
         unreduced), with the plain GMM path, routing weights carrying the
-        routed scale, and an e4m3 per-channel shared down_proj."""
-        if not envs.TPU_MINIMAX_M3_SHARED_IN_COMBINE:
+        routed scale, an e4m3 per-channel shared down_proj, and a token count
+        the TensorCore combine tiles (other steps keep the runner's graph)."""
+        if not envs.TPU_MINIMAX_M3_SHARED_IN_COMBINE or not envs.TPU_MOE_TC_COMBINE:
+            return False
+        if num_tokens % tc_combine.TOKEN_BLOCK:
             return False
         runner = self.experts
         if not runner.moe_config.skip_final_all_reduce:

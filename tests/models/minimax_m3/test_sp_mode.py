@@ -728,6 +728,8 @@ def test_armed_rank(monkeypatch):
 
 
 # ------------------------------------------------ shared expert in combine
+from vllm_torchtpu.kernels.megablox import tc_combine  # noqa: E402
+
 class _RoutedQM:
     """Routed experts' quant method stand-in: routed = tanh(x A) B, and the
     shared-in-combine entry adds the shared down_proj like the kernel's
@@ -751,6 +753,8 @@ class _RoutedQM:
 
 def _moe_with_shared(monkeypatch, on):
     monkeypatch.setattr(envs, "TPU_MINIMAX_M3_SHARED_IN_COMBINE", on, raising=False)
+    monkeypatch.setattr(envs, "TPU_MOE_TC_COMBINE", True, raising=False)
+    monkeypatch.setattr(tc_combine, "TOKEN_BLOCK", 32)
     tp = _TP(1)
     tp.local.rank = 0
     moe = _moe(("sc",), 0, tp)
@@ -794,14 +798,18 @@ def test_shared_in_combine_matches_runner(monkeypatch):
 
 def test_shared_in_combine_gates(monkeypatch):
     moe, _ = _moe_with_shared(monkeypatch, True)
-    assert moe._shared_in_combine()
+    assert moe._shared_in_combine(T)
+    assert not moe._shared_in_combine(T + 8)  # not whole combine blocks
+    monkeypatch.setattr(envs, "TPU_MOE_TC_COMBINE", False)
+    assert not moe._shared_in_combine(T)
+    monkeypatch.setattr(envs, "TPU_MOE_TC_COMBINE", True)
     moe.experts.moe_config.skip_final_all_reduce = False  # not an SP step
-    assert not moe._shared_in_combine()
+    assert not moe._shared_in_combine(T)
     moe.experts.moe_config.skip_final_all_reduce = True
     moe.experts.routed_scaling_factor = 2.0
-    assert not moe._shared_in_combine()
+    assert not moe._shared_in_combine(T)
     moe.experts.routed_scaling_factor = 1.0
     moe.shared_experts.down_proj.weight = moe.shared_experts.down_proj.weight.to(torch.bfloat16)
-    assert not moe._shared_in_combine()
+    assert not moe._shared_in_combine(T)
     moe, _ = _moe_with_shared(monkeypatch, False)
-    assert not moe._shared_in_combine()
+    assert not moe._shared_in_combine(T)
