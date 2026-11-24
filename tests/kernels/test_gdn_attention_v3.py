@@ -636,6 +636,82 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                     )
                     self.assertEqual(got, expected, msg=label)
 
+    def test_mixed_tile_target_caps_chunk_at_64(self):
+        """Caps mixed chunks at 64 when < 256 prefill tokens remain."""
+        # (label, batch_size, active_num_seqs, window_size, expected)
+        cases = [
+            # Exact 255 / 256 threshold boundary at w=1 (n=16 -> 15 decodes).
+            ("threshold_255_caps", 270, 16, 1, 64),
+            ("threshold_256_uncapped", 271, 16, 1, 128),
+            # Exact has_prefill_tokens boundary: batch_size == n * w vs +1.
+            ("decode_exact_w1", 16, 16, 1, 128),
+            ("decode_plus_one_w1", 17, 16, 1, 64),
+            ("verify_exact_w4", 64, 16, 4, 128),
+            ("verify_plus_one_w4", 65, 16, 4, 64),
+            # Fragmented mixed batches (< 256 remaining prefill tokens).
+            ("ragged_b248_n16", 248, 16, 1, 64),  # 233 < 256
+            ("mixed_b512_n280", 512, 280, 1, 64),  # 233 < 256
+            # Verify bucket: 63 verify windows + 132-token prefill.
+            ("verify_w4_b384_n64", 384, 64, 4, 64),  # 132 < 256
+            ("verify_w4_b1024_n64", 1024, 64, 4, 128),  # 772 >= 256
+            # Mixed batches with >= 256 remaining prefill tokens stay at 128.
+            ("mixed_b1024_n64", 1024, 64, 1, 128),  # 961 >= 256
+            ("mixed_b1024_n329", 1024, 329, 1, 128),  # 696 >= 256
+            ("mixed_b2048_n32", 2048, 32, 1, 128),  # 2017 >= 256
+            # In an 8-slot bucket, b=256 (249 < 256) caps at 64; b >= 384 stays 128.
+            ("lone_b256_n8_caps", 256, 8, 1, 64),  # 249 < 256
+            ("lone_b384_n8_uncapped", 384, 8, 1, 128),  # 377 >= 256
+            ("lone_b768_n8_uncapped", 768, 8, 1, 128),  # 761 >= 256
+            # Single-sequence prefills and pure decode/verify buckets stay at 128.
+            ("single_b256", 256, 1, 1, 128),
+            ("single_b1024", 1024, 1, 1, 128),
+            ("decode_b64_n64", 64, 64, 1, 128),
+            ("verify_w4_b256_n64", 256, 64, 4, 128),
+        ]
+        for label, b, n, w, expected in cases:
+            with self.subTest(label=label):
+                got = tiling.mixed_tile_target(b, n, w)
+                self.assertEqual(got, expected, msg=label)
+
+    def test_get_tile_sizes_takes_min_of_vmem_fit_and_mixed_tile_target(self):
+        """mixed_tile_size = min(mixed_tile_target, VMEM fit) unless overridden."""
+        d_k, d_v, kernel_size = 128, 128, 4
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        with use_abstract_mesh(mesh):
+            limit_64mib = config.GDNConfig.get_vmem_limit_bytes()
+
+            def mixed_tile(n_kq, n_v, b, n, w=1, override=None):
+                return tiling.get_tile_sizes(
+                    batch_size=b,
+                    num_seqs=n,
+                    padded_batch_size=b,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    kernel_size=kernel_size,
+                    conv_state_dim_size=2 * n_kq * d_k + n_v * d_v,
+                    act_out_dtype=jnp.dtype(jnp.bfloat16),
+                    recurrent_state_dtype=jnp.dtype(jnp.float32),
+                    num_lanes=128,
+                    decode_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(w),
+                    mixed_vmem_limit_bytes=limit_64mib,
+                    window_size=w,
+                    mixed_tile_size=override,
+                )[1]
+
+            # Fragmented mixed step: VMEM fits 128, but target caps at 64 (w=1 & w=4).
+            self.assertEqual(mixed_tile(2, 8, 248, 16, w=1), 64)
+            self.assertEqual(mixed_tile(8, 32, 384, 64, w=4), 64)
+            # High head count on 64 MiB VMEM: VMEM caps at 64 even when target is 128.
+            self.assertEqual(mixed_tile(8, 64, 8192, 1, w=1), 64)
+            # Unfragmented batch where VMEM fits 128 stays at 128.
+            self.assertEqual(mixed_tile(2, 8, 1024, 64, w=1), 128)
+            # Explicit mixed_tile_size bypasses the heuristic.
+            self.assertEqual(mixed_tile(2, 8, 248, 16, w=1, override=128), 128)
+
 
 class GDNStatePipelineRaceTest(parameterized.TestCase):
     """CPU interpret-mode checks of the state DMA pipeline."""
