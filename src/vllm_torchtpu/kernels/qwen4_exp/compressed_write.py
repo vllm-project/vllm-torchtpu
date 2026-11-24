@@ -21,6 +21,36 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
+def _compact_indices(mask: jax.Array, size: int, fill_value: int) -> jax.Array:
+    """Exact sort-free equivalent of ``jnp.nonzero(mask, size=size, fill_value=fill_value)[0]``.
+
+    Replaces the O(n log n) bitonic sort inside XLA's ``nonzero`` lowering with
+    a prefix-sum + ``unique_indices=True`` scatter (ascending active indices,
+    padded with ``fill_value``).
+    """
+    n = mask.shape[0]
+    lanes = jnp.arange(n, dtype=jnp.int32)
+    mask_b = mask.astype(jnp.bool_)
+    slots = jnp.cumsum(mask_b.astype(jnp.int32)) - 1
+    keep = mask_b & (slots < size)
+    dest = jnp.where(keep, slots, size + lanes)
+    out = jnp.full((size + n,), fill_value, dtype=jnp.int32)
+    return out.at[dest].set(lanes, unique_indices=True)[:size]
+
+
+def _nonzero_indices(mask: jax.Array, size: int, fill_value: int) -> jax.Array:
+    """Return ascending active indices padded with ``fill_value``.
+
+    Opt-in sort-free path via ``VLLM_TPU_QSA_SORTFREE_COMPACT=1`` (default off).
+    """
+    from vllm_torchtpu import envs
+
+    if envs.VLLM_TPU_QSA_SORTFREE_COMPACT:
+        return _compact_indices(mask, size, fill_value)
+    (idx,) = jnp.nonzero(mask, size=size, fill_value=fill_value)
+    return idx
+
+
 def writer_capacity(tokens: int, requests: int, ratio: int) -> int:
     """Upper bound on the pairs one step writes.
 
@@ -41,18 +71,18 @@ def write_runs(view, pair, write, mask, values, requests, ratio):
     tokens = len(pair)
     packing, width = view.shape[1:]
     cap = writer_capacity(tokens, requests, ratio)
-    (idx,) = jnp.nonzero(write, size=cap, fill_value=tokens)
+    idx = _nonzero_indices(write, cap, tokens)
     valid = idx < tokens
     safe = jnp.minimum(idx, tokens - 1)
     pairs = jnp.where(valid, pair[safe], 0).astype(jnp.int32)
     halves = jnp.where(valid[:, None], mask[safe], False)
     rows = values[safe]
     partial = valid & ~(halves[:, 0] & halves[:, 1])
-    (partial_list,) = jnp.nonzero(partial, size=cap, fill_value=0)
+    partial_list = _nonzero_indices(partial, cap, 0)
     previous = jnp.concatenate([jnp.full((1,), -2, jnp.int32), pairs[:-1]])
     prev_valid = jnp.concatenate([jnp.zeros((1,), bool), valid[:-1]])
     start = valid & ~(prev_valid & (pairs == previous + 1))
-    (run_off,) = jnp.nonzero(start, size=cap, fill_value=0)
+    run_off = _nonzero_indices(start, cap, 0)
     num_valid = jnp.sum(valid).astype(jnp.int32)
     num_runs = jnp.sum(start).astype(jnp.int32)
     run_end = jnp.where(

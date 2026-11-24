@@ -155,6 +155,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_RING_SELECT: bool = False
     VLLM_TPU_QSA_RING_DMA_BATCH: int = 0
     VLLM_TPU_QSA_COMPRESSED_RUN_WRITE: bool = False
+    VLLM_TPU_QSA_SORTFREE_COMPACT: bool = False
     VLLM_TPU_QSA_COMPRESSED_RUN_WRITE_MIN_TOKENS: int = 512
     VLLM_TPU_QSA_COMPRESSED_WRITE: str = ""
     VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
@@ -838,6 +839,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_COMPRESSED_RUN_WRITE": env_bool(
         "VLLM_TPU_QSA_COMPRESSED_RUN_WRITE", default=False
     ),
+    # Qwen4-exp QSA: replace jnp.nonzero bitonic sort inside compressed_write
+    # with prefix-sum scatter compaction (exact, default off).
+    "VLLM_TPU_QSA_SORTFREE_COMPACT": env_bool("VLLM_TPU_QSA_SORTFREE_COMPACT"),
     # With VLLM_TPU_QSA_COMPRESSED_RUN_WRITE: steps with fewer key rows keep the
     # tiled writer (the run writer is slower on decode-sized steps).
     "VLLM_TPU_QSA_COMPRESSED_RUN_WRITE_MIN_TOKENS": env_nonnegative_int(
