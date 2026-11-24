@@ -19,7 +19,13 @@ from vllm_torchtpu.kernels.qwen4_exp.pool import (
 
 
 @functools.cache
-def build_raw_lookup_op(local_rows: int, head_dim: int, chunk_tokens: int = 8):
+def build_raw_lookup_op(
+    local_rows: int,
+    head_dim: int,
+    chunk_tokens: int = 8,
+    owned_pct: int = 0,
+    skip_empty: bool = False,
+):
     """The shard's first row is the int32[1] operand ``vocab_start``, not part
     of the op: a rank-specific op name or constant would make every TP rank
     trace a different graph (TPU_PRECOMPILE_PEER_REPLAY could not share it).
@@ -34,9 +40,15 @@ def build_raw_lookup_op(local_rows: int, head_dim: int, chunk_tokens: int = 8):
             local_rows=local_rows,
             head_dim=head_dim,
             chunk_tokens=chunk_tokens,
+            owned_pct=owned_pct,
+            skip_empty=skip_empty,
         )
 
     suffix = "" if chunk_tokens == 8 else f"_c{chunk_tokens}"
+    if owned_pct:
+        suffix += f"_own{owned_pct}"
+    if skip_empty:
+        suffix += "_se"
     op = pallas.jax_op(f"qwen4_exp::ple_raw_lookup_{local_rows}_{head_dim}{suffix}", fn)
 
     @op.register_fake
