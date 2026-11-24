@@ -41,7 +41,27 @@ git commit --amend --signoff --no-edit
 git push origin HEAD --force-with-lease
 ```
 
-### 2. Clone and Install Dependencies
+### 2. Google Cloud Authentication
+<!-- TODO: Once torch_tpu and vllm-torchtpu are open-sourced, torch_tpu will be installable directly from PyPI without GCP authentication. -->
+We authenticate with Google Cloud to access the Torch TPU Virtual Registry (`https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/`), which contains `torch-tpu`, `torch`, and other TPU dependencies.
+
+Check your active account:
+
+```bash
+gcloud auth list
+```
+
+If needed, log in:
+
+```bash
+gcloud auth login
+gcloud auth application-default login
+```
+
+> [!TIP] Troubleshooting Stale Credentials
+> A common cause of authentication errors when using `keyring` with `uv` is an existing `~/.netrc` file containing stale credentials. Open `~/.netrc` and delete any expired block associated with `us-python.pkg.dev`.
+
+### 3. Clone and Install Dependencies
 
 Clone the repository:
 
@@ -57,10 +77,13 @@ git clone git@github.com:vllm-project/vllm-torchtpu.git && cd vllm-torchtpu
 uv venv --python 3.12 ~/uv_venv
 source ~/uv_venv/bin/activate
 
+# Configure index authentication
+export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken"
+uv tool install keyring --with keyrings.google-artifactregistry-auth
 export UV_TORCH_BACKEND=cpu
 
 # Install vllm-torchtpu and dependencies in editable mode
-VLLM_TARGET_DEVICE="empty" uv pip install -e .
+VLLM_TARGET_DEVICE="empty" uv pip install --pre -e .
 ```
 
 #### Option B: Using `pip`
@@ -70,11 +93,16 @@ python3.12 -m venv ~/pip_venv --symlinks
 source ~/pip_venv/bin/activate
 pip install --upgrade pip
 
+# Install keyring plugin for persistent auth
+pip install keyring keyrings.google-artifactregistry-auth
+# TODO: Replace with the public index once torch_tpu is open-sourced
+export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+
 # Install vllm-torchtpu and dependencies in editable mode
-VLLM_TARGET_DEVICE="empty" pip install --extra-index-url https://download.pytorch.org/whl/cpu -e .
+VLLM_TARGET_DEVICE="empty" pip install --pre -e .
 ```
 
-### 3. [Optional] Developing with vLLM Source
+### 4. [Optional] Developing with vLLM Source
 If you are developing or debugging vLLM core in tandem with `vllm-torchtpu`:
 
 ```bash
@@ -85,7 +113,7 @@ git clone --depth 1 --branch v0.29.0 https://github.com/vllm-project/vllm.git ..
 VLLM_TARGET_DEVICE="empty" uv pip install --no-deps -e ../vllm
 ```
 
-### 4. Pre-commit Hooks
+### 5. Pre-commit Hooks
 Make sure to activate your configured virtual environment before installing and running `pre-commit`:
 
 ```bash
