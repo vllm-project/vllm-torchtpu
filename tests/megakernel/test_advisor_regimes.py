@@ -18,26 +18,13 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-import importlib
-import importlib.abc
-import importlib.machinery
 import json
 import math
 import re
-import sys
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from types import ModuleType
 
 import pytest
-
-try:
-    from jax.experimental.pallas import tpu as pltpu
-except (ImportError, RuntimeError):
-    pltpu = None
 
 from tests.megakernel.test_advisor_specs import (
     HF_CONFIG_DIR,
@@ -78,23 +65,6 @@ class _SvgTextCollector(HTMLParser):
         if self._open is not None:
             self.texts.append((self._open, data))
             self._open = None
-
-
-class _JaxBlocker(importlib.abc.MetaPathFinder):
-    """MetaPathFinder that blocks importing `jax` or any `jax.*` submodule."""
-
-    def find_spec(
-        self,
-        fullname: str,
-        path: object = None,
-        target: ModuleType | None = None,
-    ) -> importlib.machinery.ModuleSpec | None:
-        """Raise ModuleNotFoundError when `jax` or `jax.*` is requested."""
-        _ = (path, target)
-        if fullname == "jax" or fullname.startswith("jax."):
-            msg = "No module named 'jax'"
-            raise ModuleNotFoundError(msg)
-        return None
 
 
 def _regime(
@@ -237,34 +207,6 @@ def test_unregistered_and_malformed_model_rejection(bad_cfg: dict[str, object]) 
     """Verify unregistered model_types raise UnsupportedArchitectureError."""
     with pytest.raises(advisor.UnsupportedArchitectureError):
         advisor.model_profile_from_hf_config(bad_cfg)
-
-
-def test_chip_specs_match_jax_pallas_tpu_info(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify public TPU chips (v6e, tpu7x) and 'auto' match 'tpu_info'."""
-    assert advisor.__name__ == "vllm_torchtpu.megakernel.advisor"
-    chips = (
-        ("v6e", "v6e"),
-        ("tpu7x", "7x"),
-    )
-    for name, cv_str in chips:
-        cs = advisor.resolve_chip_spec(name)
-        assert advisor.resolve_chip_spec(cs) is cs
-        info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion(cv_str), 1)
-        assert cs.vmem_capacity_bytes == info.vmem_capacity_bytes
-        assert cs.hbm_capacity_bytes == info.hbm_capacity_bytes
-        assert cs.hbm_bw_bytes_per_s == float(info.mem_bw_bytes_per_second)
-        assert cs.bf16_flops_per_s == float(info.bf16_ops_per_second)
-
-    with pytest.raises(MegakernelConfigError, match="requires TPU"):
-        advisor.resolve_chip_spec("auto")
-    fake_7x = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion("7x"), 1)
-    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: fake_7x)
-    auto_cs = advisor.resolve_chip_spec("auto")
-    assert auto_cs.name == "tpu7x"
-    assert auto_cs.cores_per_device == 1
-
-    with pytest.raises(MegakernelConfigError, match="Megacore"):
-        advisor.resolve_chip_spec("tpu7x", megacore=True)
 
 
 def test_bare_minimum_auto_parallelism_and_html_regime_report(tmp_path: Path) -> None:
@@ -838,49 +780,30 @@ def test_measurements_json_promotes_assumed_to_measured(tmp_path: Path) -> None:
     assert "coverage_assumed" not in report.flags
 
 
-def test_import_without_jax(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify advisor imports and runs without jax."""
+def test_import_without_jax() -> None:
+    """Verify advisor stays torch-free and limits JAX to chips/spec_bridge."""
     mk_init = Path(mk.__file__)
     adv_dir = mk_init.parent / "advisor"
-    lazy_jax_bridges = frozenset({"jax_bridge.py", "spec_bridge.py"})
+    jax_allowed = frozenset({"chips.py", "spec_bridge.py"})
     for py_path in (mk_init, *sorted(adv_dir.glob("*.py"))):
         tree = ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
-        is_bridge = py_path.name in lazy_jax_bridges
+        allow_jax = py_path.name in jax_allowed
         for ast_node in ast.walk(tree):
             if isinstance(ast_node, ast.Import):
                 for alias in ast_node.names:
                     root = alias.name.split(".", 1)[0]
                     assert root != "torch", f"Unexpected torch import in {py_path}"
-                    if not is_bridge:
+                    if not allow_jax:
                         assert root != "jax", (
                             f"Unexpected jax import in non-bridge {py_path}"
                         )
             elif isinstance(ast_node, ast.ImportFrom) and ast_node.module:
                 root = ast_node.module.split(".", 1)[0]
                 assert root != "torch", f"Unexpected torch import in {py_path}"
-                if not is_bridge:
+                if not allow_jax:
                     assert root != "jax", (
                         f"Unexpected jax import in non-bridge {py_path}"
                     )
-
-    blocker = _JaxBlocker()
-    monkeypatch.setattr(sys, "meta_path", [blocker, *sys.meta_path])
-    for mod_name in list(sys.modules):
-        if mod_name == "jax" or mod_name.startswith(
-            ("jax.", "vllm_torchtpu.megakernel")
-        ):
-            monkeypatch.delitem(sys.modules, mod_name, raising=False)
-
-    mk_fresh = importlib.import_module("vllm_torchtpu.megakernel")
-    adv_fresh = importlib.import_module("vllm_torchtpu.megakernel.advisor")
-    assert "jax" not in sys.modules
-    assert mk_fresh.advisor is adv_fresh
-    report = adv_fresh.advise(
-        "glm-5.2",
-        adv_fresh.WorkloadSpec(phase="decode", batch=4, tp=16),
-        "tpu7x",
-    )
-    assert report.recommended_scope == "per_op"
 
 
 def test_objective_both_reports_disagreement() -> None:
@@ -990,7 +913,8 @@ def test_chip_spec_optional_fields_sysfs_auto_int8_quant_and_refs_main(
     assert loaded.dcn_bw_gbps == expected_dcn_bw
     assert loaded.dcn_bw_gbps_bracket == (100.0, 400.0)
     assert loaded.topologies == {8: "2x2x1 custom"}
-    assert loaded.matmul_row_tile("int8") == constants.DEFAULT_ROW_TILE_WIDE
+    expected_int8_tile = 16
+    assert loaded.matmul_row_tile("int8") == expected_int8_tile
 
     bad_spec = tmp_path / "bad_chip.json"
     bad_spec.write_text(

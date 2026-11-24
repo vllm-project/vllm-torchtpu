@@ -6,7 +6,7 @@ The `vllm_torchtpu.megakernel.advisor` package evaluates whether a model and ser
 
 ### 1. Prior Estimate (`estimate`)
 
-Evaluate HBM fit, the ideal-kernel VMEM token ceiling, roofline step floor, and uncertainty bands without a TPU or `jax` installation:
+Evaluate HBM fit, the ideal-kernel VMEM token ceiling, roofline step floor, and uncertainty bands on CPU without an attached TPU or PyTorch runtime:
 
 ```bash
 python -m vllm_torchtpu.megakernel.advisor estimate \
