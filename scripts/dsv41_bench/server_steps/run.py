@@ -164,6 +164,12 @@ def main() -> None:
         "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT",
     ):
         env.pop(key, None)
+    # Opt-in for iteration (workbench): torch_tpu's executable cache is keyed
+    # by HLO content, so unchanged graphs skip compilation across launches.
+    # vLLM's dynamo cache stays per launch: it is filed by rank role.
+    tier3_root = os.environ.get("DSV41_BENCH_TIER3_CACHE_ROOT")
+    if tier3_root:
+        env["TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"] = tier3_root
     env.update(
         VLLM_DISABLE_COMPILE_CACHE="1",
         JAX_ENABLE_COMPILATION_CACHE="false",
@@ -266,7 +272,7 @@ def main() -> None:
     manifest = {
         "scenario": args.scenario,
         "compile_sizes": buckets,
-        "cache_mode": "disabled",
+        "cache_mode": "tier3" if tier3_root else "disabled",
         "serialization": "enabled",
         "engram_transfer": "raw_dma",
         "tier2": "disabled (public and internal)",
