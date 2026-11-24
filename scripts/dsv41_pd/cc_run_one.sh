@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 重启 P（给定 P_ENV / P_EXTRA）后跑一轮 AgentX：TAG=... DURATION=3600 P_ENV=... P_EXTRA=... bash cc_run_one.sh
 set -uo pipefail
-W=/zzlfs/temu/vllm-torchtpu-attnbal/scripts/dsv41_pd
+W=$(cd "$(dirname "$0")" && pwd)
 ROLES=prefill P_ENV="${P_ENV:-}" P_EXTRA="${P_EXTRA:-}" bash $W/cc_start_pd.sh
 T=$(cat /zzlfs/temu/logs/.cc_T); P=/zzlfs/temu/logs/prefill-cc-$T.log; sleep 30
 for i in $(seq 1 300); do

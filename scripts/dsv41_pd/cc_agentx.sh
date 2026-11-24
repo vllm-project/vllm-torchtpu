@@ -4,7 +4,7 @@
 #   CONC=512 DURATION=900 TAG=base PROF_AT=1500 bash cc_agentx.sh
 set -uo pipefail
 P=${P_HOST:-10.128.0.62}; D=${D_HOST:-10.128.0.39}
-W=/zzlfs/temu/vllm-torchtpu-attnbal/scripts/dsv41_pd
+W=$(cd "$(dirname "$0")" && pwd)
 TAG=${TAG:-run}; T=$(date +%m%d-%H%M)
 PLOG=/zzlfs/temu/logs/proxy-cc-$TAG-$T.log
 ssh -o BatchMode=yes $P 'pkill -f "[t]oy_proxy_server.py" ; true'; sleep 2

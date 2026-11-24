@@ -3,7 +3,7 @@
 #   ROLES="prefill decode" bash cc_start_pd.sh ；额外环境变量 P_ENV / D_ENV 原样加在对应启动命令前。
 set -uo pipefail
 P=${P_HOST:-10.128.0.62}; D=${D_HOST:-10.128.0.39}; ROLES=${ROLES:-"prefill decode"}
-W=/zzlfs/temu/vllm-torchtpu-attnbal; S=$W/scripts/dsv41_pd/start_1p1d_epic.sh
+W=$(cd "$(dirname "$0")/../.." && pwd); S=$W/scripts/dsv41_pd/start_1p1d_epic.sh
 T=$(date +%m%d-%H%M); echo $T > /zzlfs/temu/logs/.cc_T
 COMMON="TMPDIR=/var/tmp/epic-tmp VLLM_CACHE_ROOT=/var/tmp/epic-vllm-cache CODE_DIR=$W VLLM_LOGGING_PREFIX='%(created).3f ' TPU_DSPARK_SAMPLED_DRAFT=1 TPU_DP_ATTN_WORK_LOG=/var/tmp/dpwork-$T"
 PROF="--profiler-config.profiler torch --profiler-config.torch_profiler_dir /var/tmp/xprof --profiler-config.ignore_frontend true"

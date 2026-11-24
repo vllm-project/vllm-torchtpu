@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 最终 A/B：AgentX c512 3600s；每组都先重启 P（冷前缀缓存），D 只清前缀缓存。
 set -uo pipefail
-W=/zzlfs/temu/vllm-torchtpu-attnbal/scripts/dsv41_pd
+W=$(cd "$(dirname "$0")" && pwd)
 run() {  # $1=tag  $2=P_ENV  $3=P_EXTRA
   ROLES=prefill P_ENV="$2" P_EXTRA="$3" bash $W/cc_start_pd.sh
   T=$(cat /zzlfs/temu/logs/.cc_T); P=/zzlfs/temu/logs/prefill-cc-$T.log; sleep 30
