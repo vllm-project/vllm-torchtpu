@@ -91,47 +91,37 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
     return jnp.concat(vreg_list, axis=-1).reshape(new_shape)
 
 
-def load_and_select_states(
+def load_and_select_conv_state(
     metadata_ref: memory_ref.MetadataRef,
     p_id: jax.Array,
     conv_state_in_slot_ref: jax.Ref,
-    recurrent_in_slot_ref: jax.Ref,
     carry_conv_scratch_ref: jax.Ref | None,
-    carry_recurrent_scratch_ref: jax.Ref | None,
     cfg: config.GDNConfig,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Load correct states from HBM or prior tile, and masks invalid states.
+) -> tuple[jax.Array, jax.Array]:
+    """Loads and selects convolution state from HBM or the carry scratchpad.
 
-    Reference metadata to select the appropriate prior states. If `is_first_tile`
-    is True, it selects states read from HBM. If it is False, it selects
-    carry states from previous tile. If `has_initial_state` is False, states are
-    zero initialized.
+    On a sequence's first tile (or when no carry scratchpad is passed), selects HBM
+    state if `has_initial_state` is True and zeros otherwise; on later tiles with a
+    carry scratchpad, selects the carry scratchpad even for fresh sequences.
 
     Args:
         metadata_ref: Metadata reference containing grid and sequence mappings.
         p_id: Current Pallas program ID.
         conv_state_in_slot_ref: Convolution state read from HBM of shape
             [seq_tile_size, 1, prev_kernel_size, 1, dim_size].
-        recurrent_in_slot_ref: Recurrent state read from HBM as uint32 words,
-            of shape [seq_tile_size, 1, num_v_heads, kq_head_dim // packing,
-            v_head_dim].
-        carry_conv_scratch_ref: Optional inter-tile convolution carry of shape
-            [seq_tile_size, prev_kernel_size, 1, dim_size].
-        carry_recurrent_scratch_ref: Optional inter-tile recurrent state carry of
-            shape [seq_tile_size, num_v_heads, kq_head_dim, v_head_dim].
+        carry_conv_scratch_ref: Inter-tile convolution carry of shape
+            [seq_tile_size, prev_kernel_size, 1, dim_size], or None when tiles
+            do not carry state across steps (for example, batched decode).
         cfg: GDN configuration object.
 
     Returns:
-        real_sizes: Valid token count per sequence tile of shape [seq_tile_size].
-        prev_conv_state: Selected convolution state of shape [seq_tile_size,
-        prev_kernel_size, 1, dim_size] in float32.
-        prev_recurrent_state: Selected recurrent state of shape [seq_tile_size,
-        num_v_heads, kq_head_dim, v_head_dim].
+        real_sizes: Valid token count per sequence tile of shape
+            [seq_tile_size].
+        prev_conv_state: Selected convolution state of shape
+            [seq_tile_size, prev_kernel_size, 1, dim_size] in float32.
     """
-
     real_sizes_list = []
     prev_conv_state_list = []
-    prev_recurrent_state_list = []
 
     for idx in range(cfg.seq_tile_size):
         s_idx = metadata_ref.p_id_to_s_idx[p_id, idx]
@@ -147,6 +137,49 @@ def load_and_select_states(
             prev_tile_conv = carry_conv_scratch_ref[idx]
             prev_conv_state = jnp.where(is_first_tile, prev_conv_state, prev_tile_conv)
 
+        real_sizes_list.append(real_sizes)
+        prev_conv_state_list.append(prev_conv_state)
+
+    real_sizes = jnp.stack(real_sizes_list, axis=0)
+    prev_conv_state = jnp.stack(prev_conv_state_list, axis=0)
+    return real_sizes, prev_conv_state
+
+
+def load_and_select_recurrent_state(
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    recurrent_in_slot_ref: jax.Ref,
+    carry_recurrent_scratch_ref: jax.Ref | None,
+    cfg: config.GDNConfig,
+) -> jax.Array:
+    """Loads and selects recurrent state from HBM or the carry scratchpad.
+
+    On a sequence's first tile (or when no carry scratchpad is passed), selects HBM
+    state if `has_initial_state` is True and zeros otherwise; on later tiles with a
+    carry scratchpad, selects the carry scratchpad even for fresh sequences.
+
+    Args:
+        metadata_ref: Metadata reference containing grid and sequence mappings.
+        p_id: Current Pallas program ID.
+        recurrent_in_slot_ref: Recurrent state read from HBM as uint32 words,
+            of shape [seq_tile_size, 1, num_v_heads, kq_head_dim // packing,
+            v_head_dim].
+        carry_recurrent_scratch_ref: Inter-tile recurrent state carry of shape
+            [seq_tile_size, num_v_heads, kq_head_dim, v_head_dim], or None when
+            tiles do not carry state across steps (for example, batched decode).
+        cfg: GDN configuration object.
+
+    Returns:
+        Selected recurrent state of shape
+        [seq_tile_size, num_v_heads, kq_head_dim, v_head_dim] in float32.
+    """
+    prev_recurrent_state_list = []
+
+    for idx in range(cfg.seq_tile_size):
+        s_idx = metadata_ref.p_id_to_s_idx[p_id, idx]
+        is_first_tile = metadata_ref.p_id_is_first_tile[p_id, idx]
+        has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
+
         # Unpack the uint32 words to the state dtype, then upcast because
         # compute runs in fp32.
         hbm_recurrent_state = pltpu.bitcast(
@@ -160,15 +193,9 @@ def load_and_select_states(
                 is_first_tile, prev_recurrent_state, prev_tile_recurrent_scratch
             )
 
-        real_sizes_list.append(real_sizes)
-        prev_conv_state_list.append(prev_conv_state)
         prev_recurrent_state_list.append(prev_recurrent_state)
 
-    real_sizes = jnp.stack(real_sizes_list, axis=0)
-    prev_conv_state = jnp.stack(prev_conv_state_list, axis=0)
-    prev_recurrent_state = jnp.stack(prev_recurrent_state_list, axis=0)
-
-    return real_sizes, prev_conv_state, prev_recurrent_state
+    return jnp.stack(prev_recurrent_state_list, axis=0)
 
 
 def load_activation_as_compact(
