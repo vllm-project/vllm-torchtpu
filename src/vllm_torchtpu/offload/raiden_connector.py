@@ -513,6 +513,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         )
         if victim.host_tier_policy() == "victim":
             self._enable_victim_policy(spec, vllm_config)
+        self._superseded_tracker: victim.SupersededCheckpointTracker | None = None
+        if tpu_envs.VLLM_TPU_OFFLOAD_TIER_SKIP_SUPERSEDED:
+            self._superseded_tracker = victim.SupersededCheckpointTracker()
+            logger.info(
+                "TPURaidenOffloadingConnector: superseded turn checkpoint skip "
+                "enabled (VLLM_TPU_OFFLOAD_TIER_SKIP_SUPERSEDED=1, victim=%s)",
+                bool(self.__dict__.get("_victim", False)),
+            )
         # VLLM_TPU_OFFLOAD_FP4 (offload/fp4.py): per step a token; the step's victim
         # main-class stores (saved once every worker acknowledged their quantize) and
         # the slots its dequantizes free.
@@ -632,6 +640,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         tel = self.telemetry
         for name, n in counts.items():
             tel[name] = tel.get(name, 0) + n
+        if keep:
+            tracker = self.__dict__.get("_superseded_tracker")
+            if tracker is not None:
+                keep, ck_skipped = tracker.filter_victims(keep)
+                if ck_skipped:
+                    tel["ck_skip_superseded"] = (
+                        tel.get("ck_skip_superseded", 0) + ck_skipped
+                    )
         if keep:
             manager = self._raiden_manager
             source = dict(keep)
@@ -753,14 +769,87 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             self.__dict__["_telemetry_next"] = now + period
             logger.info("%s", self.telemetry_line())
 
+    def _state_checkpoint_keys_at(
+        self, req_id: str, boundary_tokens: int
+    ) -> list[OffloadKey]:
+        """State-group offload keys anchored at ``boundary_tokens`` for ``req_id``."""
+        if boundary_tokens <= 0:
+            return []
+        req_status = self._req_status.get(req_id)
+        if req_status is None:
+            return []
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        keys: list[OffloadKey] = []
+        for g, gs in zip(self.config.kv_group_configs, req_status.group_states):
+            if not isinstance(g.kv_cache_spec, MambaSpec):
+                continue
+            tpc = g.tokens_per_chunk
+            if tpc <= 0 or boundary_tokens % tpc != 0:
+                continue
+            idx = boundary_tokens // tpc - 1
+            if 0 <= idx < len(gs.offload_keys):
+                keys.append(gs.offload_keys[idx])
+        return keys
+
+    def _state_checkpoint_tpc(self) -> int:
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        tpcs = [
+            g.tokens_per_chunk
+            for g in self.config.kv_group_configs
+            if isinstance(g.kv_cache_spec, MambaSpec) and g.tokens_per_chunk > 0
+        ]
+        return max(tpcs) if tpcs else 0
+
     def get_num_new_matched_tokens(self, request, num_computed_tokens, *args, **kwargs):
         out = super().get_num_new_matched_tokens(request, num_computed_tokens, *args, **kwargs)
+        tracker = self.__dict__.get("_superseded_tracker")
+        if tracker is not None and out[0] is not None:
+            total_hit = int(num_computed_tokens) + int(out[0])
+            if total_hit > 0:
+                state_keys = self._state_checkpoint_keys_at(
+                    request.request_id, total_hit
+                )
+                tracker.record_resume(request.request_id, total_hit, state_keys)
+            else:
+                tracker.record_resume(request.request_id, 0, ())
         if lookup_log.enabled():
             try:
                 lookup_log.log_lookup(self, request, num_computed_tokens, out[0])
             except Exception:  # a diagnostic must never fail a schedule pass
                 logger.exception("prefix-lookup: line failed for %s", request.request_id)
         return out
+
+    def request_finished(self, request: Request, *args, **kwargs):
+        tracker = self.__dict__.get("_superseded_tracker")
+        if tracker is not None:
+            prompt = int(
+                getattr(
+                    request,
+                    "num_prompt_tokens",
+                    getattr(request, "num_tokens", 0),
+                )
+                or 0
+            )
+            computed = int(getattr(request, "num_computed_tokens", 0) or 0)
+            completed_prompt = prompt > 0 and computed >= prompt
+            tpc = self._state_checkpoint_tpc()
+            new_boundary = (max(prompt - 1, 0) // tpc) * tpc if tpc > 0 else 0
+            newly = tracker.on_request_finished(
+                request.request_id,
+                new_boundary,
+                completed_prompt=completed_prompt,
+            )
+            if newly:
+                demote_fn = getattr(self._raiden_manager, "demote_keys", None)
+                if callable(demote_fn):
+                    demoted = int(demote_fn(newly))
+                    if demoted:
+                        self.telemetry["ck_demote_superseded"] = (
+                            self.telemetry.get("ck_demote_superseded", 0) + demoted
+                        )
+        return super().request_finished(request, *args, **kwargs)
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
