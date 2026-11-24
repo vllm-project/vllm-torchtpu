@@ -183,7 +183,7 @@ class MiniMaxM3MoE(nn.Module):
             and down.weight.dtype == torch.float8_e4m3fn
             and getattr(down, "weight_scale", None) is not None
             and down.weight_scale.dim() == 1
-            and down.bias is None
+            and getattr(down, "bias", None) is None
         )
 
     def _forward_shared_in_combine(

@@ -725,3 +725,83 @@ def test_armed_rank(monkeypatch):
         assert pallas_all_reduce.armed_rank([0, 1]) is None
     monkeypatch.setattr(pallas_all_reduce, "_ARMED", None)
     assert pallas_all_reduce.armed_rank([0, 1, 2, 3]) is None
+
+
+# ------------------------------------------------ shared expert in combine
+class _RoutedQM:
+    """Routed experts' quant method stand-in: routed = tanh(x A) B, and the
+    shared-in-combine entry adds the shared down_proj like the kernel's
+    epilogue (tc_combine._shared_epilogue)."""
+
+    def __init__(self, experts):
+        self.experts = experts
+        self.calls = 0
+
+    def shared_in_combine_supported(self):
+        return True
+
+    def apply_monolithic_shared(self, layer, x, router_logits, act, w, scale):
+        from vllm_torchtpu.kernels.megablox import tc_combine
+
+        self.calls += 1
+        routed = self.experts.routed_only(x, router_logits)
+        shared = (_jnp(act), _jnp(w).astype(jnp.bfloat16), _jnp(scale).reshape(1, -1), 1.0)
+        return _torch(tc_combine._shared_epilogue(_jnp(routed), shared))
+
+
+def _moe_with_shared(monkeypatch, on):
+    monkeypatch.setattr(envs, "TPU_MINIMAX_M3_SHARED_IN_COMBINE", on, raising=False)
+    tp = _TP(1)
+    tp.local.rank = 0
+    moe = _moe(("sc",), 0, tp)
+    shared = _mlp(("sc",), 0, tp)
+    shared.down_proj.reduce_results = False
+    moe.shared_experts = shared
+    ex = moe.experts
+
+    def routed_only(x, router_logits):
+        gate = torch.sigmoid(router_logits).mean(-1, keepdim=True)
+        return ((torch.tanh(x @ ex.a).float() * gate).to(torch.bfloat16)) @ ex.b
+
+    def runner(hidden_states, router_logits):
+        # The runner's SP-step result: shared + routed, unreduced.
+        ex.inputs.append(hidden_states)
+        return shared(hidden_states) + routed_only(hidden_states, router_logits)
+
+    ex.routed_only = routed_only
+    ex.__call__ = runner
+    moe.experts = types.SimpleNamespace(
+        moe_config=types.SimpleNamespace(skip_final_all_reduce=True),
+        routed_scaling_factor=1.0,
+        routed_only=routed_only,
+        inputs=ex.inputs,
+    )
+    moe.experts.routed_experts = types.SimpleNamespace(quant_method=_RoutedQM(moe.experts))
+    return moe, runner
+
+
+def test_shared_in_combine_matches_runner(monkeypatch):
+    """The SP-step MoE with the shared down_proj handed to the combine equals
+    the runner's shared + routed sum bit for bit (same roundings)."""
+    moe, runner = _moe_with_shared(monkeypatch, True)
+    x = _input()
+    router_logits, _ = moe.gate(x)
+    want = runner(x, router_logits)
+    got = moe(x)
+    assert moe.experts.routed_experts.quant_method.calls == 1
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+def test_shared_in_combine_gates(monkeypatch):
+    moe, _ = _moe_with_shared(monkeypatch, True)
+    assert moe._shared_in_combine()
+    moe.experts.moe_config.skip_final_all_reduce = False  # not an SP step
+    assert not moe._shared_in_combine()
+    moe.experts.moe_config.skip_final_all_reduce = True
+    moe.experts.routed_scaling_factor = 2.0
+    assert not moe._shared_in_combine()
+    moe.experts.routed_scaling_factor = 1.0
+    moe.shared_experts.down_proj.weight = moe.shared_experts.down_proj.weight.to(torch.bfloat16)
+    assert not moe._shared_in_combine()
+    moe, _ = _moe_with_shared(monkeypatch, False)
+    assert not moe._shared_in_combine()
