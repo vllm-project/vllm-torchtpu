@@ -253,6 +253,7 @@ def test_verify_chunk_passes_the_flags_to_both_samplers(use_top_k, use_top_p):
         sample_from_logits_func=_record(calls),
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
         rejection_sampler=_RejectionSampler(rejection_sampler),
+        drafter=None,
     )
     md = SimpleNamespace(
         bonus_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
@@ -336,6 +337,7 @@ def _verify_runner(top_k, top_p, samples, rejections):
         method = getattr(TPUModelRunner, name).__wrapped__
         setattr(runner, name, MethodType(method, runner))
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=1)
+    runner.drafter = None
     return runner
 
 
@@ -409,6 +411,7 @@ def _capture_warmup_requests(monkeypatch):
     runner = SimpleNamespace(
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
         kv_cache_config=SimpleNamespace(num_blocks=64, kv_cache_groups=[None]),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=0),
         max_model_len=64,
         max_num_tokens=64,
         max_num_reqs=4,
@@ -530,6 +533,8 @@ def _sample_tokens_runner(spec_decode_metadata_list, params_by_start, calls):
         _update_mamba_slot_read_offsets=lambda *args: None,
         _update_num_xla_graphs=lambda *args: None,
         _stage_timing=MagicMock(),
+        _min_tokens_batch_state=lambda: {},
+        drafter=None,
     )
     runner._stage_timing.take_samples.return_value = ([], [])
     for name in (

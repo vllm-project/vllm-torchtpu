@@ -6530,6 +6530,8 @@ class TPUModelRunner(GPUModelRunner):
                             accept_u=warm_accept_u,
                             recover_u=warm_recover_u,
                             do_sampling=True,
+                            draft_logits=None,
+                            draft_valid=None,
                             use_top_k=use_top_k,
                             use_top_p=use_top_p,
                         )
