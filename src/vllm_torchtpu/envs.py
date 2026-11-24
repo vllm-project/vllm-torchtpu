@@ -186,6 +186,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_DRAFT: bool = False
     VLLM_TPU_MK_DRAFT_LOOP: bool = False
     VLLM_TPU_MK_DRAFT_ROWS_FRESH: bool = False
+    VLLM_TPU_MK_DRAFT_STEP0_LOOP_PROGRAM: bool = False
     VLLM_TPU_MK_QSEL_ASYNC: bool = False
     VLLM_TPU_MK_QSA_XREQ_PREFETCH: int = 0
     VLLM_TPU_MK_QSA_REQ_ASYNC: int = 0
@@ -1356,6 +1357,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and at p == capacity its outputs feed the loop as they are (a full-length
     # [:rows] view still costs torch_tpu an execute_as_strided program). Same values.
     "VLLM_TPU_MK_DRAFT_ROWS_FRESH": env_bool("VLLM_TPU_MK_DRAFT_ROWS_FRESH"),
+    # With VLLM_TPU_MK_DRAFT (not VLLM_TPU_MK_DRAFT_LOOP): MK draft step 0 and the
+    # stock fused loop's steps 1..K-1 traced as one compiled program
+    # (mtp_fused_loop._MkDraftStep0LoopProgram), one host launch per decode step for
+    # the whole draft instead of two. The loop runs at the chunk's request capacity;
+    # a chunk the program cannot take, or a step shape warmup did not compile, runs
+    # the two programs. Same math. Needs MOE_FUSED_EP_SORTED_GATHER (refuses to start
+    # without it): every Pallas kernel of one program must share a device assignment,
+    # and only that flag keeps the draft MoE's EP mesh in the rank order of the MK
+    # draft kernel's mesh.
+    "VLLM_TPU_MK_DRAFT_STEP0_LOOP_PROGRAM": env_bool(
+        "VLLM_TPU_MK_DRAFT_STEP0_LOOP_PROGRAM"
+    ),
     # Whole-step QSA selection: the per-row id copies into SMEM and the new group's
     # loads / stores are issued together and waited once instead of in start-wait
     # pairs (distinct destinations; same bytes).

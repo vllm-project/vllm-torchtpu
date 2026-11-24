@@ -405,15 +405,18 @@ class Qwen4ExpMTP(nn.Module):
                     attention._selection_rows, shared_step0_rows(source, rows, num_tokens)
                 )
 
-    def mk_draft_step(self, input_ids, positions, hidden_states, rows_per_request: int):
+    def mk_draft_step(self, input_ids, positions, hidden_states, rows_per_request: int,
+                      query_start_loc=None, seq_lens=None):
         """VLLM_TPU_MK_DRAFT: `(next hidden carry, greedy tokens int32)` of one draft
         step: `forward(...)` then `compute_logits(...).argmax(-1)` as one kernel call
-        (the input fusion stays here)."""
+        (the input fusion stays here). `query_start_loc` / `seq_lens`: see
+        `MkDraft.step`."""
         mk = self.model.mk_draft
         assert mk is not None
         hidden = self.model.fuse_inputs(input_ids, hidden_states, None)
         metadata = get_forward_context().attn_metadata
-        return mk.step(hidden, positions, rows_per_request, metadata)
+        return mk.step(hidden, positions, rows_per_request, metadata,
+                       query_start_loc=query_start_loc, seq_lens=seq_lens)
 
     def compute_logits(self, hidden_states, spec_step_idx: int = 0):
         return self.logits_processor(self.lm_head, hidden_states)
