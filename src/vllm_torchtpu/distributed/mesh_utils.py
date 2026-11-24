@@ -32,6 +32,7 @@ other stages launch theirs.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -62,6 +63,25 @@ class CpGroupLayout:
 
 _LAYOUT_CACHE: dict[tuple[int, tuple[int, ...], int, int], CpGroupLayout] = {}
 _WORLD_DEVICE_IDS: tuple[int, ...] | None = None
+_HOST_OF_RANK: tuple[int, ...] | None = None
+
+
+class SliceHostOrderError(RuntimeError):
+    """Ranks were bound to TPU hosts out of the order libtpu numbers their
+    devices in. `host_order` lists the binding's host positions sorted by
+    device id, which is the order a rebinding should use."""
+
+    def __init__(self, host_order: Sequence[int], device_ids: Sequence[int]):
+        super().__init__(tuple(host_order), tuple(device_ids))
+        self.host_order = tuple(host_order)
+        self.device_ids = tuple(device_ids)
+
+    def __str__(self) -> str:
+        return (
+            "Ranks are bound to TPU hosts out of device order: TPU device ids "
+            f"by rank {list(self.device_ids)}, hosts in device order "
+            f"{list(self.host_order)}."
+        )
 
 
 def _get_current_global_rank() -> int:
@@ -149,6 +169,37 @@ def world_device_ids() -> tuple[int, ...]:
             "init (record_world_device_ids)."
         )
     return ()
+
+
+def hosts_in_device_order(
+    device_ids: Sequence[int], host_of_rank: Sequence[int]
+) -> tuple[int, ...]:
+    """The hosts of `host_of_rank`, sorted by the lowest TPU global device id
+    any of their ranks holds. libtpu numbers devices by physical position, so
+    this is the slice's physical host order."""
+    lowest: dict[int, int] = {}
+    for host, device_id in zip(host_of_rank, device_ids, strict=True):
+        lowest[host] = min(device_id, lowest.get(host, device_id))
+    return tuple(sorted(lowest, key=lowest.__getitem__))
+
+
+def expect_hosts_in_device_order(host_of_rank: Sequence[int]) -> None:
+    """Hold this process's slice to binding ranks in device order:
+    `check_hosts_in_device_order` then raises unless the hosts, numbered by
+    `host_of_rank[rank]` in binding order, are sorted by device id. Set by an
+    executor that can rebind ranks to hosts, before distributed init."""
+    global _HOST_OF_RANK
+    _HOST_OF_RANK = tuple(int(host) for host in host_of_rank)
+
+
+def check_hosts_in_device_order(device_ids: Sequence[int]) -> None:
+    """Raise SliceHostOrderError if an expectation is set and `device_ids`
+    (the world map, in rank order) breaks it."""
+    if _HOST_OF_RANK is None:
+        return
+    host_order = hosts_in_device_order(device_ids, _HOST_OF_RANK)
+    if list(host_order) != sorted(host_order):
+        raise SliceHostOrderError(host_order, device_ids)
 
 
 def get_cp_group_layout(group: Any | None) -> CpGroupLayout:
