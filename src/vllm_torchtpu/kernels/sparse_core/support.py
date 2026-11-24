@@ -27,6 +27,7 @@ _SC_KERNEL_CHIPS = frozenset(
         pltpu.ChipVersion.TPU_V6E,
         pltpu.ChipVersion.TPU_7,
         pltpu.ChipVersion.TPU_7X,
+        pltpu.ChipVersion.TPU_8T,
     }
 )
 
@@ -44,7 +45,7 @@ def get_sparse_core_info(tpu_info: pltpu.TpuInfo | None = None):
         return None
     if info.chip_version not in _SC_KERNEL_CHIPS:
         logger.info_once(
-            "SparseCore kernels are only validated on TPU v5p, v6e, 7, and 7x, "
+            "SparseCore kernels are only validated on TPU v5p, v6e, 7, 7x, and 8t, "
             "got TPU %s; falling back to TensorCore.",
             info.chip_version,
         )
