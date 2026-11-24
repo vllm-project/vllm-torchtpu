@@ -235,10 +235,35 @@ def load_activation_as_large(
     b_vmem_ref: jax.Ref,
     a_vmem_ref: jax.Ref,
     cfgs: config.GDNConfig,
+    qkv_pad_vmem_ref: jax.Ref | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Load activations from VMEM as a large layout."""
+    """Loads activations from VMEM as a large layout.
 
-    qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
+    Args:
+        qkv_vreg: Post-Conv1D Q/K/V activations in vector registers.
+        qkv_vmem_ref: Tile Q/K/V VMEM buffer.
+        b_vmem_ref: Tile beta-gate VMEM buffer.
+        a_vmem_ref: Tile alpha-gate VMEM buffer.
+        cfgs: GDN kernel configuration.
+        qkv_pad_vmem_ref: Optional odd-column scratchpad for bank-conflict-free
+            strided per-head Q/K/V loads; falls back to `qkv_vmem_ref` when
+            `None`.
+
+    Returns:
+        `(q_large, k_large, v_large, b_large, a_large)` stacked across
+        sequences.
+    """
+    if qkv_pad_vmem_ref is not None:
+        # Write into the odd-column scratchpad so strided per-head loads below
+        # hit distinct VMEM banks instead of colliding on `qkv_vmem_ref`'s even
+        # width.
+        qkv_pad_vmem_ref[:, :, :, : cfgs.dim_size] = qkv_vreg.astype(
+            qkv_pad_vmem_ref.dtype
+        )
+        qkv_src_ref = qkv_pad_vmem_ref
+    else:
+        qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
+        qkv_src_ref = qkv_vmem_ref
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     kq_lanes = cfgs.num_kq_heads * (cfgs.kq_head_dim // num_lanes)
@@ -248,7 +273,7 @@ def load_activation_as_large(
     v_large_list = []
     a_large_list = []
     for idx in range(cfgs.seq_tile_size):
-        qkv_slot = qkv_vmem_ref.at[idx]
+        qkv_slot = qkv_src_ref.at[idx]
         q_large_list.append(
             load_strided_heads(qkv_slot, cfgs.num_kq_heads, cfgs.kq_head_dim)
         )
