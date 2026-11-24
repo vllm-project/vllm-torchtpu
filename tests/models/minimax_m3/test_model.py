@@ -33,12 +33,14 @@ from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 import vllm_torchtpu.models.minimax_m3.attention as attention_mod
+from tests.models.minimax_m3.mxfp8 import mxfp8_dequantized
 from vllm_torchtpu.layers import register_layers
 from vllm_torchtpu.layers.adapter.quantization import _MODEL_QUANT_CONFIGS
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4MoEMethod
 from vllm_torchtpu.models.minimax_m3.hooks import TPUMiniMaxM3Config
 from vllm_torchtpu.models.minimax_m3.model import MiniMaxM3SparseForCausalLM
 from vllm_torchtpu.models.minimax_m3.quant import (
+    MXFP8_KERNEL_MAX_ROWS,
     MiniMaxM3Mxfp8LinearMethod,
     MiniMaxM3Nvfp4MoEMethod,
     MiniMaxM3QuantConfig,
@@ -364,7 +366,8 @@ def test_checkpoint_loads_and_mxfp8_dequantizes(tiny_model, monkeypatch) -> None
         ),
     )
 
-    # Linears: the fused qkv holds [q | k | v | index_q | index_k] dequantized.
+    # Linears: the fused qkv holds [q | k | v | index_q | index_k] in e4m3,
+    # K-major, with bf16 block scales that dequantize it exactly.
     attn.qkv_proj.quant_method.process_weights_after_loading(attn.qkv_proj)
     p = f"{_LM}.layers.0.self_attn"
     expected = torch.cat(
@@ -375,8 +378,22 @@ def test_checkpoint_loads_and_mxfp8_dequantizes(tiny_model, monkeypatch) -> None
             for proj in ("q_proj", "k_proj", "v_proj", "index_q_proj", "index_k_proj")
         ]
     )
-    torch.testing.assert_close(attn.qkv_proj.weight, expected.T)
-    assert not hasattr(attn.qkv_proj, "weight_scale")
-    x = torch.randn(3, HIDDEN, dtype=torch.bfloat16)
-    out, _ = attn.qkv_proj(x)
-    torch.testing.assert_close(out, x @ expected.T)
+    qkv = attn.qkv_proj
+    assert qkv.weight.dtype == torch.float8_e4m3fn
+    assert qkv.weight_scale.dtype == torch.bfloat16
+    assert qkv.weight_scale.shape == (HIDDEN // 32, qkv.weight.shape[1])
+    torch.testing.assert_close(
+        mxfp8_dequantized(qkv.weight, qkv.weight_scale), expected.T, rtol=0, atol=0
+    )
+    # Decode-sized inputs run the kernel (its CPU reference here); larger ones
+    # dequantize the weight in the graph.
+    for rows in (3, MXFP8_KERNEL_MAX_ROWS + 1):
+        x = torch.randn(rows, HIDDEN, dtype=torch.bfloat16)
+        out, _ = qkv(x)
+        torch.testing.assert_close(out, x @ expected.T)
+
+    # The shared expert is marked to stay bf16 (dequantized, flipped).
+    gate_up = moe.shared_experts.gate_up_proj
+    gate_up.quant_method.process_weights_after_loading(gate_up)
+    assert gate_up.weight.dtype == torch.bfloat16
+    assert not hasattr(gate_up, "weight_scale")

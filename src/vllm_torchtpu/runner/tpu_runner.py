@@ -5798,6 +5798,7 @@ class TPUModelRunner(GPUModelRunner):
 
     def _initialize_quantization_kernels(self):
         from vllm_torchtpu.layers.adapter.linear_common import (
+            _get_mxfp8_matmul_op,
             _get_quantized_matmul_fp4_op,
             _get_quantized_matmul_op,
         )
@@ -5805,8 +5806,9 @@ class TPUModelRunner(GPUModelRunner):
         with set_current_vllm_config(self.vllm_config):
             # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
             _get_quantized_matmul_op()
-            # Same for the NVFP4 W4A16 matmul op.
+            # Same for the NVFP4 W4A16 and MXFP8 matmul ops.
             _get_quantized_matmul_fp4_op()
+            _get_mxfp8_matmul_op()
 
     def _initialize_attention_kernels(self, force: bool = False) -> None:
         """Pre-build Pallas RPA and custom attention kernels before torch.compile."""
@@ -8200,6 +8202,7 @@ class TPUModelRunner(GPUModelRunner):
         from vllm.compilation.wrapper import reset_compile_wrapper
 
         from vllm_torchtpu.layers.adapter.linear_common import (
+            _get_mxfp8_matmul_op,
             _get_quantized_matmul_fp4_op,
             _get_quantized_matmul_op,
         )
@@ -8218,8 +8221,9 @@ class TPUModelRunner(GPUModelRunner):
             self._initialize_attention_kernels()
             # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
             _get_quantized_matmul_op()
-            # Same for the NVFP4 W4A16 matmul op.
+            # Same for the NVFP4 W4A16 and MXFP8 matmul ops.
             _get_quantized_matmul_fp4_op()
+            _get_mxfp8_matmul_op()
 
             # Compile backbone here so XLA materializes the FP8 activation
             # slab; vLLM's post-probe sees the real HBM. Cache writes are

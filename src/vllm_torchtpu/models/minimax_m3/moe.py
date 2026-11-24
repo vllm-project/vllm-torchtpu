@@ -25,6 +25,8 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+from vllm_torchtpu.models.minimax_m3.quant import MXFP8_DEQUANTIZE_ATTR
+
 # The checkpoint config may omit swiglu_beta; SwiGLU-OAI's up-bias is 1.
 _DEFAULT_SWIGLU_BETA = 1.0
 
@@ -109,6 +111,10 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.shared_experts",
             reduce_results=False,
         )
+        # bf16: XLA hides gate_up's weight copy behind attention and fuses
+        # down_proj with the expert combine; measured faster than e4m3 here.
+        for linear in (self.shared_experts.gate_up_proj, self.shared_experts.down_proj):
+            setattr(linear, MXFP8_DEQUANTIZE_ATTR, True)
         limit, alpha, beta = swiglu_params(config)
         self.experts = FusedMoEFactory(
             num_experts=num_experts,

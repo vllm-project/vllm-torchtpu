@@ -23,6 +23,9 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+from vllm_torchtpu.kernels.quantized_matmul.mxfp8_matmul import (
+    mxfp8_matmul as mxfp8_matmul_jax,
+)
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.logger import init_logger
 
@@ -253,6 +256,40 @@ def quantized_matmul_fp4(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_fp4_op()(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
+
+
+_mxfp8_matmul_op: Callable | None = None
+_mxfp8_matmul_op_lock = Lock()
+
+
+def _get_mxfp8_matmul_op() -> Callable:
+    global _mxfp8_matmul_op
+    if _mxfp8_matmul_op is not None:
+        return _mxfp8_matmul_op
+
+    with _mxfp8_matmul_op_lock:
+        if _mxfp8_matmul_op is not None:
+            return _mxfp8_matmul_op
+
+        op = pallas.jax_op("pallas::mxfp8_matmul", mxfp8_matmul_jax)
+
+        def _fake_mxfp8_matmul(
+            x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor
+        ) -> torch.Tensor:
+            del scale
+            return torch.empty(x.shape[0], w.shape[1], dtype=x.dtype, device=x.device)
+
+        op.register_fake(_fake_mxfp8_matmul)
+        _mxfp8_matmul_op = op
+        return op
+
+
+def mxfp8_matmul(x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Torch entry for the MXFP8-weight matmul (`kernels/quantized_matmul/
+    mxfp8_matmul.py`): `w` is e4m3 `[n_in, n_out]`, `scale` its bf16
+    power-of-two scales `[n_in // 32, n_out]`."""
+    out_2d = _get_mxfp8_matmul_op()(x.reshape(-1, x.shape[-1]), w, scale)
+    return out_2d.reshape(*x.shape[:-1], w.shape[-1])
 
 
 def sharded_quantized_matmul(

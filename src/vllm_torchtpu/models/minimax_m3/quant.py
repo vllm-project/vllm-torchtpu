@@ -14,9 +14,10 @@
 """MiniMax M3 checkpoint quantization: MXFP8 linears, NVFP4 routed experts.
 
 The checkpoint's `quant_method: mxfp8` config also carries the routed experts'
-compressed-tensors NVFP4 scheme (`moe_quant_algo`). MXFP8 linears are
-dequantized to bf16 at load: an e4m3 value times a power-of-two scale is exact
-in bf16, so this keeps the checkpoint's numerics. The experts reuse the TPU
+compressed-tensors NVFP4 scheme (`moe_quant_algo`). MXFP8 linears keep their
+e4m3 weights, which at decode `mxfp8_matmul` moves at half the bytes of bf16
+and dequantizes in VMEM. An e4m3 value times a power-of-two scale is exact in
+bf16, so every path keeps the checkpoint's numerics. The experts reuse the TPU
 NVFP4 MoE path after renaming the compressed-tensors tensors to ModelOpt's.
 """
 
@@ -34,6 +35,12 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 
+from vllm_torchtpu.kernels.quantized_matmul import mxfp8_matmul as mxfp8_kernel
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+    mxfp8_matmul,
+)
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
     VllmNvfp4Config,
     VllmNvfp4MoEMethod,
@@ -43,7 +50,7 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedLinearMethod,
 )
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 QUANT_METHOD = "mxfp8"
 MXFP8_BLOCK = 32
@@ -56,6 +63,14 @@ _KERNEL_SWIGLU = (1.702, 7.0, 1.0)
 # `language_model.model.dspark.<module>`; the draft model builds them as
 # `model.<module>`.
 _DSPARK_PREFIX = ("language_model.model.dspark.", "model.")
+
+# Set on an MXFP8 linear, by the module that owns it and before loading, to
+# dequantize its weight to bf16 at load and run it unquantized.
+MXFP8_DEQUANTIZE_ATTR = "_tpu_mxfp8_dequantize_at_load"
+# Token rows up to which `mxfp8_matmul` runs (when its VMEM fits). Above it the
+# matmul is compute bound and the weight is dequantized in the graph for XLA's
+# bf16 matmul.
+MXFP8_KERNEL_MAX_ROWS = 256
 
 # Compressed-tensors NVFP4 expert tensor suffix -> ModelOpt parameter suffix.
 CT_TO_MODELOPT_EXPERT_SUFFIX = {
@@ -75,7 +90,10 @@ def dequantize_mxfp8(weight: torch.Tensor, scale_e8m0: torch.Tensor) -> torch.Te
 
 @register_weight_loader_v2_supported_method
 class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
-    """Loads e4m3 weights with ``[1, 32]`` e8m0 scales, runs in bf16."""
+    """Loads e4m3 weights with ``[1, 32]`` e8m0 scales and keeps them in e4m3:
+    ``weight`` becomes K-major ``[n_in, n_out]`` and ``weight_scale`` the bf16
+    scales ``[n_in // 32, n_out]`` that `mxfp8_matmul` reads. A layer marked
+    with `MXFP8_DEQUANTIZE_ATTR` is dequantized to bf16 and runs unquantized."""
 
     def create_weights(
         self,
@@ -124,12 +142,35 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        weight = dequantize_mxfp8(layer.weight.data, layer.weight_scale.data)
-        del layer.weight_scale
+        if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
+            return  # already processed; reload paths re-enter this hook
+        if getattr(layer, MXFP8_DEQUANTIZE_ATTR, False):
+            weight = dequantize_mxfp8(layer.weight.data, layer.weight_scale.data)
+            del layer.weight_scale
+            replace_parameter(
+                layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
+            )
+            VllmUnquantizedLinearMethod().process_weights_after_loading(layer)
+            return
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            raise NotImplementedError(
+                "MXFP8 linears run K-major; a raw [n_out, n_in] consumer must "
+                f"set {MXFP8_DEQUANTIZE_ATTR}."
+            )
+        # [n_out, n_in] e4m3 -> K-major [n_in, n_out].
+        weight = fresh_buffer(layer.weight.data.transpose(0, 1))
+        # e8m0 -> bf16 2 ** (e - 127), exact; [n_in // 32, n_out].
+        scale = torch.exp2(layer.weight_scale.data.to(torch.float32) - _E8M0_BIAS)
+        scale = fresh_buffer(scale.to(torch.bfloat16).transpose(0, 1))
         replace_parameter(
             layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
         )
-        VllmUnquantizedLinearMethod().process_weights_after_loading(layer)
+        replace_parameter(
+            layer, "weight_scale", torch.nn.Parameter(scale, requires_grad=False)
+        )
+        setattr(layer, WEIGHT_FLIPPED_ATTR, True)
+        if layer.weight.device.type == "tpu":
+            synchronize_tensors([layer.weight, layer.weight_scale])
 
     def apply(
         self,
@@ -137,7 +178,24 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return VllmUnquantizedLinearMethod().apply(layer, x, bias)
+        if getattr(layer, MXFP8_DEQUANTIZE_ATTR, False):
+            return VllmUnquantizedLinearMethod().apply(layer, x, bias)
+        if bias is not None:
+            # A bf16 add after the kernel's rounding would differ from the
+            # unquantized path's addmm; MiniMax-M3's linears have no bias.
+            raise NotImplementedError("MXFP8 linears with a bias are not supported.")
+        weight, scale = layer.weight, layer.weight_scale
+        # Shapes are static at trace time, so each token bucket takes one path.
+        rows = x.numel() // x.shape[-1]
+        if 0 < rows <= MXFP8_KERNEL_MAX_ROWS and mxfp8_kernel.fits(rows, *weight.shape):
+            out = mxfp8_matmul(x, weight, scale)
+        else:
+            n_in, n_out = weight.shape
+            dequantized = weight.to(torch.bfloat16).view(
+                n_in // MXFP8_BLOCK, MXFP8_BLOCK, n_out
+            ) * scale.unsqueeze(1)
+            out = torch.matmul(x, dequantized.view(n_in, n_out))
+        return out
 
 
 class MiniMaxM3Nvfp4MoEMethod(VllmNvfp4MoEMethod):

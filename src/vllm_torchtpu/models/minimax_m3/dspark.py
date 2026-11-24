@@ -60,7 +60,7 @@ from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP
-from vllm_torchtpu.models.minimax_m3.quant import QUANT_METHOD
+from vllm_torchtpu.models.minimax_m3.quant import MXFP8_DEQUANTIZE_ATTR, QUANT_METHOD
 from vllm_torchtpu.spec_decode.vocab_parallel_argmax import (
     MAX_VOCAB_FOR_FLOAT_IDS,
     reduce_shard_argmax_pairs,
@@ -166,6 +166,10 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        # bf16 (with the MLP, see MiniMaxM3DSparkDecoderLayer); `_context_kv`
+        # also slices qkv_proj's K/V columns as a plain matrix.
+        for linear in (self.qkv_proj, self.o_proj):
+            setattr(linear, MXFP8_DEQUANTIZE_ATTR, True)
 
 
 class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
@@ -198,6 +202,10 @@ class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
             quant_config,
             prefix=f"{prefix}.mlp",
         )
+        # The whole draft stays bf16: measured, its e4m3 MLP weights took the
+        # VMEM that XLA prefetches its attention weights into, a net loss.
+        for linear in (self.mlp.gate_up_proj, self.mlp.down_proj):
+            setattr(linear, MXFP8_DEQUANTIZE_ATTR, True)
         hidden_size, eps = config.hidden_size, config.rms_norm_eps
         self.input_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
         self.post_attention_layernorm = GemmaRMSNorm(hidden_size, eps=eps)
