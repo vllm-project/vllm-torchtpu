@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
     TPU_MOE_VALID_COUNT_FROM_SORT: bool = False
+    TPU_MOE_ONEHOT_COMBINE_FLAT: bool = False
     TPU_MOE_BOUNDED_ONEHOT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
@@ -287,6 +288,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
     TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT: bool = False
+    TPU_MINIMAX_M3_DCP_LSE_PLANES: bool = False
+    TPU_MINIMAX_M3_NORM_WEIGHT_HOIST: bool = False
     TPU_MINIMAX_M3_DCP_MERGE_KERNEL_MIN_CANDIDATES: int = 64
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
     TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
@@ -922,6 +925,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # base contraction (the sentinel bucket's base) instead of a separate
     # sum over group_sizes; the one-hot combine's row mask uses it. Exact.
     "TPU_MOE_VALID_COUNT_FROM_SORT": env_bool("TPU_MOE_VALID_COUNT_FROM_SORT"),
+    # The dense one-hot MoE combine (`fused_moe_gmm._flat_onehot_combine`)
+    # builds its [T, T * topk] matrix from the flat revert indices with one
+    # small contraction instead of reshaping them to [T, topk] (a lane
+    # relayout). Same values.
+    "TPU_MOE_ONEHOT_COMBINE_FLAT": env_bool("TPU_MOE_ONEHOT_COMBINE_FLAT"),
     # Run the EP one-hot MoE permute and combine as Pallas kernels that visit
     # only the 128-slot blocks of the valid local prefix (about 1/EP of the
     # routed slots) instead of dense one-hot matmuls over every slot, where
@@ -1878,6 +1886,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # a middle axis. Same values; avoids a slow XLA layout at some row counts.
     "TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT": env_bool(
         "TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT", default=False
+    ),
+    # MiniMax M3 DCP 2 decode partial exchange (`msa_dcp._exchange_partials`):
+    # each f32 LSE rides as a low-half lane plane and a high-half lane plane
+    # instead of interleaved uint16 pairs, so the receiver rebuilds it from
+    # two contiguous lane slices instead of a stride-2 lane slice (~5 us per
+    # layer at c48 T=96). Same bits.
+    "TPU_MINIMAX_M3_DCP_LSE_PLANES": env_bool(
+        "TPU_MINIMAX_M3_DCP_LSE_PLANES", default=False
+    ),
+    # MiniMax M3: the Gemma RMSNorm ``1 + w`` FP32 weights and the q/k norm
+    # tables are computed once after loading (`norm_hoist`), not per forward.
+    # Same values.
+    "TPU_MINIMAX_M3_NORM_WEIGHT_HOIST": env_bool(
+        "TPU_MINIMAX_M3_NORM_WEIGHT_HOIST", default=False
     ),
     # MiniMax M3 DCP candidate merges of at least this many candidates per
     # token (DCP * top-k) run as the Pallas merge kernel, smaller ones as the

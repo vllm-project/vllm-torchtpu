@@ -599,6 +599,34 @@ def prepare_routed_gmm_inputs(
     return out
 
 
+def _flat_onehot_combine(
+    revert: jax.Array, topk_weights: jax.Array, valid_mask: jax.Array
+) -> jax.Array:
+    """The dense combine matrix ``[T, T * topk]`` of `moe_gmm`'s one-hot
+    unpermute, ``sum_k onehot(revert[t, k]) * w[t, k] * valid[t, k]``, without
+    reshaping the flat revert indices to ``[T, topk]`` (TPU_MOE_ONEHOT_COMBINE_FLAT):
+    that reshape is a lane relayout of a tiny int array (2.3 us per MoE layer
+    at c48 T=96, j-224a8aae). Instead ``W[t, i]`` (route ``i = t * topk + k``'s
+    weight, a static one-hot) contracts with ``P[j, i] = (revert[i] == j)``,
+    whose revert indices stay on lanes. `revert` is a permutation, so every
+    output is one product (or none) accumulated in f32: the same bf16 values
+    as the reshaped form. Needs `topk_weights` in the routed rows' dtype."""
+    num_tokens, topk = topk_weights.shape
+    m = revert.size
+    dtype = topk_weights.dtype
+    slots = (
+        jnp.arange(num_tokens, dtype=jnp.int32)[:, None] * topk
+        + jnp.arange(topk, dtype=jnp.int32)[None, :]
+    )
+    spread = jax.nn.one_hot(slots, m, dtype=dtype)
+    weights = (spread * topk_weights[..., None] * valid_mask[..., None]).sum(axis=1)
+    lanes = jnp.arange(m, dtype=jnp.int32)
+    perm = (revert.reshape(1, m) == lanes[:, None]).astype(dtype)
+    return jnp.einsum(
+        "ti,ji->tj", weights, perm, preferred_element_type=jnp.float32
+    ).astype(dtype)
+
+
 def moe_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -783,6 +811,15 @@ def moe_gmm(
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
             computed = jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < valid_count[0]
             gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
+            if envs.TPU_MOE_ONEHOT_COMBINE_FLAT and topk_weights.dtype == gmm2_res.dtype:
+                logger.warning_once(
+                    "TPU_MOE_ONEHOT_COMBINE_FLAT=1 on: dense MoE combine one-hot "
+                    "from the flat revert indices"
+                )
+                combine = _flat_onehot_combine(
+                    argsort_revert_indices, topk_weights, valid_mask
+                )
+                return (combine @ gmm2_res).astype(x.dtype)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(
                 revert_indices, argsort_revert_indices.size, dtype=gmm2_res.dtype

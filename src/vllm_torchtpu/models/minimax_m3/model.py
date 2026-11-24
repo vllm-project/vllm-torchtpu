@@ -43,7 +43,7 @@ from vllm.model_executor.models.utils import (
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.minimax_m3 import sp_o_proj
+from vllm_torchtpu.models.minimax_m3 import norm_hoist, sp_o_proj
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse, sp_norm
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
@@ -190,7 +190,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         ``e4m3_out`` returns the gathered e4m3 rows and their scales."""
         fused = envs.TPU_MINIMAX_M3_SP_FUSED_NORM and _fits_sp_norm(shard)
         if update is not None and fp8 and fused:
-            weight = norm.weight.float() + 1.0
+            weight = norm_hoist.gemma_weight(norm)
             shard, q, scale = self._add_norm_quant(shard, update, weight)
         else:
             if update is not None:
@@ -549,6 +549,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def process_weights_after_loading(self) -> None:
+        """Model-level post-load hook (vLLM calls it after the per-layer
+        quant finalize): TPU_MINIMAX_M3_NORM_WEIGHT_HOIST."""
+        if envs.TPU_MINIMAX_M3_NORM_WEIGHT_HOIST:
+            norm_hoist.hoist(self.model)
 
     def compute_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's vocab shard of ``compute_logits`` (pad columns
