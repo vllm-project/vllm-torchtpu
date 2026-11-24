@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for batched RPA config and block size calculations across TPU generations."""
 
+import dataclasses
 from unittest.mock import MagicMock, patch
 
 import jax.numpy as jnp
@@ -25,6 +26,7 @@ def _create_mock_tpu_info(
     generation: int,
     chip_version: str = "v8i",
     num_lanes: int = 128,
+    num_sublanes: int = 8,
     mxu_column_size: int = 128,
     vmem_capacity_bytes: int = 64 * 1024 * 1024,
     fp8_ops_per_second: int = 2,
@@ -34,6 +36,7 @@ def _create_mock_tpu_info(
     mock.generation = generation
     mock.chip_version = chip_version
     mock.num_lanes = num_lanes
+    mock.num_sublanes = num_sublanes
     mock.mxu_column_size = mxu_column_size
     mock.vmem_capacity_bytes = vmem_capacity_bytes
     mock.fp8_ops_per_second = fp8_ops_per_second
@@ -108,4 +111,138 @@ def test_prepared_inputs_rejects_dynamic_scales(scale):
                 jnp.array([0, 0, 1], jnp.int32),
                 prepared_inputs=prepared,
                 **{scale: jnp.ones((8, 1), jnp.float32)},
+            )
+
+
+def test_swa_decode_bkv_capped_at_half_window_prefill_uncapped():
+    """Decode SWA caps bkv_sz at half the sliding window; prefill stays unchanged."""
+    swa_cfg = configs.ModelConfigs(
+        num_q_heads=16,
+        num_kv_heads=1,
+        head_dim=256,
+        mask_value=-1e9,
+        sliding_window=1024,
+    )
+    full_cfg = configs.ModelConfigs(
+        num_q_heads=16,
+        num_kv_heads=1,
+        head_dim=256,
+        mask_value=-1e9,
+        sliding_window=None,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=8,
+        page_size=128,
+        total_q_tokens=2048,
+        num_page_indices=64 * 8,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.float8_e4m3fn,
+        dtype_out=jnp.bfloat16,
+    )
+    vmem_limit = 64 * 1024 * 1024
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
+    ):
+        swa_dec, swa_pre = wrapper.calculate_block_sizes(swa_cfg, serve_cfg, vmem_limit)
+        full_dec, full_pre = wrapper.calculate_block_sizes(
+            full_cfg, serve_cfg, vmem_limit
+        )
+        # Window sizes without A/B data keep the VMEM-driven decode tile.
+        other_w_dec, _ = wrapper.calculate_block_sizes(
+            dataclasses.replace(swa_cfg, sliding_window=128), serve_cfg, vmem_limit
+        )
+    assert full_dec.bkv_sz > 512
+    assert swa_dec.bkv_sz == 512
+    assert swa_pre == full_pre
+    assert other_w_dec == full_dec
+
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(6, chip_version="v6e", mxu_column_size=256),
+    ):
+        v6e_swa_dec, _ = wrapper.calculate_block_sizes(swa_cfg, serve_cfg, vmem_limit)
+        v6e_full_dec, _ = wrapper.calculate_block_sizes(full_cfg, serve_cfg, vmem_limit)
+    assert v6e_swa_dec == v6e_full_dec
+
+
+def test_head_along_sublane_large_page_size_aligns_bkv_default():
+    """When page_size > mxu_column_size, bkv_default aligns up to page_size."""
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=8,
+        num_kv_heads=2,
+        head_dim=256,
+        mask_value=-1e9,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=8,
+        page_size=256,
+        total_q_tokens=512,
+        num_page_indices=32 * 8,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.float8_e4m3fn,
+        dtype_out=jnp.bfloat16,
+    )
+    vmem_limit = 16 * 1024 * 1024
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(6, chip_version="v6e", mxu_column_size=128),
+    ):
+        decode_blocks, prefill_blocks = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, vmem_limit
+        )
+    assert decode_blocks.bkv_sz % 256 == 0 and decode_blocks.bkv_sz >= 256
+    assert prefill_blocks.bkv_sz % 256 == 0 and prefill_blocks.bkv_sz >= 256
+
+
+@pytest.mark.parametrize(
+    "kv_layout",
+    [configs.KVLayout.HEAD_ALONG_SUBLANE, configs.KVLayout.SEQ_ALONG_LANE],
+)
+def test_rpa_configs_rejects_unaligned_bkv_sz_both_layouts(kv_layout):
+    """RpaConfigs rejects caller-supplied bkv_sz not divisible by page_size."""
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        mask_value=-1e9,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=4,
+        page_size=128,
+        total_q_tokens=4,
+        num_page_indices=32,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.bfloat16,
+        dtype_out=jnp.bfloat16,
+        kv_layout=kv_layout,
+    )
+    unaligned_block = configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=320, batch_size=4)
+    cfgs = configs.RpaConfigs(
+        block=unaligned_block,
+        model=model_cfg,
+        serve=serve_cfg,
+        mode=configs.RpaCase.DECODE,
+        vmem_limit_bytes=64 * 1024 * 1024,
+    )
+    q = jnp.zeros((4, 8, 128), dtype=jnp.bfloat16)
+    kv = jnp.zeros((4, 2, 128), dtype=jnp.bfloat16)
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
+    ):
+        kv_cache_shape = wrapper.get_kv_cache_shape(
+            8, 128, 2, 128, jnp.bfloat16, kv_layout=kv_layout
+        )
+        kv_cache = jnp.zeros(kv_cache_shape, dtype=jnp.bfloat16)
+        with pytest.raises(NotImplementedError, match="aligned to page_size"):
+            cfgs.validate_inputs(
+                q,
+                kv,
+                kv,
+                kv_cache,
+                jnp.ones((4,), dtype=jnp.int32),
+                jnp.arange(32, dtype=jnp.int32),
+                jnp.arange(5, dtype=jnp.int32),
+                jnp.array([4, 4, 4], dtype=jnp.int32),
             )
