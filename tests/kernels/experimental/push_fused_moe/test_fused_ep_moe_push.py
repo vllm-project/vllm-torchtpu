@@ -607,11 +607,12 @@ RUN_SHAPES = {**SERVED_SHAPES, "g25t512": (25, 512, 6)}
 def test_served_dims_drop_repeated_runs_is_bit_exact(shape, hash_routed, fused_runs):
     """Rows repeating the row before them take their run's first result: the
     layer's output is the one without the switch bit for bit, on shards with
-    no runs, one run, a run ending before the tail, and runs that break on
-    the gating alone, scored and hash-routed, with replicated experts whose
-    copy a row picks by its own index; the load accumulator counts one
-    routed row per run. `fused_runs` has the combine kernel zero unrouted rows
-    and copy each run's result onto its repeats (where the kernel applies)."""
+    no runs, one run, a run ending before the tail, runs that break on the
+    gating alone, and a run equal only once quantized, scored and
+    hash-routed, with replicated experts whose copy a row picks by its own
+    index; the load accumulator counts one routed row per run. `fused_runs`
+    has the combine kernel zero unrouted rows and copy each run's result onto
+    its repeats (where the kernel applies)."""
     g_local, rows, topk = RUN_SHAPES[shape]
     mesh = _mesh()
     e_total = EP * g_local
@@ -641,7 +642,19 @@ def test_served_dims_drop_repeated_runs_is_bit_exact(shape, hash_routed, fused_r
     lo = 5 * rows
     x[lo : lo + rows] = x[lo]
     gating[lo : lo + rows : 2] = gating[lo]
-    routed_rows = EP * rows - sum(
+    # Shard 6: a run whose x differs below FP8 resolution (one element at
+    # 1e-7 vs 2e-7 of the row's peak): the routed rows are equal, so it
+    # routes once too.
+    near = slice(6 * rows + 10, 6 * rows + 30)
+    x[near] = x[near.start]
+    gating[near] = gating[near.start]
+    peak = np.abs(x[near.start].astype(np.float32))
+    col = (int(peak.argmax()) + 1) % SERVED_HIDDEN
+    x[near, col] = peak.max() * 2e-7
+    x[near.start, col] = peak.max() * 1e-7
+    assert (x[near.start] != x[near.start + 1]).any()
+    routed_rows = EP * rows - (near.stop - near.start - 1)
+    routed_rows -= sum(
         end - start - 1 for spans in runs.values() for start, end in spans
     )
     shard = NamedSharding(mesh, P(AXIS))

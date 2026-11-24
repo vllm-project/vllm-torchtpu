@@ -40,6 +40,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu.kernels.experimental.push_fused_moe import repeats
 from vllm_torchtpu.kernels.experimental.push_fused_moe.host import (
     build_routing_tables_sharded,
     local_sort_activations,
@@ -299,14 +300,15 @@ def _repeated_tail_start(rows):
     return jnp.max(jnp.where(same, -1, idx)) + 1
 
 
-def _repeated_run_starts(rows):
+def _repeated_run_starts(rows, repeats_prev=None):
     """Per row, the index of the first row of its run of equal rows.
 
     `rows` are [t, ...] arrays read together: a row repeats the one before it
-    when it matches it bit for bit in every array.
+    when it matches it bit for bit in every array, and in `repeats_prev` [t]
+    (another array's comparison, already made) where given.
     """
     t = rows[0].shape[0]
-    same = jnp.ones((t - 1,), jnp.bool_)
+    same = jnp.ones((t - 1,), jnp.bool_) if repeats_prev is None else repeats_prev[1:]
     for a in rows:
         if jnp.issubdtype(a.dtype, jnp.floating):
             a = lax.bitcast_convert_type(
@@ -416,22 +418,22 @@ def fused_ep_moe_push(
     routing exchange with one barrier phase, not two; `early_scale_scatter`
     lets the scale-slab scatter run under the in-op shared expert (1: not
     held behind it; 2: nor behind the SparseCore pre-push);
-    `drop_repeated_tail` routes only the first of the trailing rows that
-    repeat this shard's last row bit for bit (x, gating, hash ids and a
-    per-row score bias) and copies its result onto the others, so a
-    bucket's padding rows, which are all alike, cost one row instead of
-    loading the experts they all select. Each row's FFN, wire quantization
-    and combine are per row, and an expert's replicas hold the same weights,
-    so the copied result is the one the row would have computed; the
-    dropped rows are left out of `expert_load`. `drop_repeated_runs` does
-    the same for every run of rows that repeat the row before them, not
-    only the trailing one, so padding rows that differ from the last row
-    but come in runs still cost one row per run. `fused_runs` (with
-    `drop_repeated_runs`) has the combine kernel zero unrouted rows and copy
-    each run's first result onto its repeats itself
-    (kernel._build_combine_fs_kernel `run_rows`), instead of an XLA select
-    and gather over [rows, hidden] after it; the same values, bit for bit.
-    The caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
+    `drop_repeated_tail` routes only the first of the trailing rows that repeat
+    this shard's last row bit for bit in what routing reads (the quantized row
+    and its scale where activations are quantized, else x; gating, hash ids and
+    a per-row score bias) and copies its result onto the others, so a bucket's
+    padding rows, which are all alike, cost one row instead of loading the
+    experts they all select. Each row's FFN, wire quantization and combine are
+    per row, and an expert's replicas hold the same weights, so the copied
+    result is the one the row would have computed; the dropped rows are left out
+    of `expert_load`. `drop_repeated_runs` does the same for every run of rows
+    that repeat the row before them, not only the trailing one, so padding rows
+    that differ from the last row but come in runs still cost one row per run.
+    `fused_runs` (with `drop_repeated_runs`) has the combine kernel zero
+    unrouted rows and copy each run's first result onto its repeats itself
+    (kernel._build_combine_fs_kernel `run_rows`), instead of an XLA select and
+    gather over [rows, hidden] after it; the same values, bit for bit. The
+    caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -1133,14 +1135,29 @@ def fused_ep_moe_push(
         tail_start = run_start = keep = None
         if drop_repeated_tail or drop_repeated_runs:
             me = rank_l[0, 0]
-            row_inputs = [token_layout.split(x_l, me), gate_l]
+            q_repeats = None
+            # Shifted compares of q_l lower badly in XLA (a 1.44 ms slice at
+            # 2048 rows), so runs read q_l only through repeats.py.
+            if form.quantized_activations and (
+                drop_repeated_tail or repeats.supports(q_l)
+            ):
+                # The routed experts read a row's FP8 values and scale, so rows
+                # equal there route to equal results. q_l keeps its rows on the
+                # major axis, where repeats.py compares them in place.
+                row_inputs = [row_scale_l, gate_l]
+                if drop_repeated_runs:
+                    q_repeats = repeats.repeats_previous_row(q_l)
+                else:
+                    row_inputs.insert(0, q_l.reshape(t_local, -1))
+            else:
+                row_inputs = [token_layout.split(x_l, me), gate_l]
             if hash_l is not None:
                 row_inputs.append(hash_l)
             if row_bias:
                 row_inputs.append(token_layout.split(score_bias_l, me))
             rows = lax.broadcasted_iota(jnp.int32, (t_local, 1), 0)
             if drop_repeated_runs:
-                run_start = _repeated_run_starts(row_inputs)
+                run_start = _repeated_run_starts(row_inputs, q_repeats)
                 keep = rows == run_start[:, None]
             else:
                 tail_start = _repeated_tail_start(row_inputs)
