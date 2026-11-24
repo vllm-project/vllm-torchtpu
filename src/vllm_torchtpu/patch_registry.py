@@ -144,6 +144,10 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch(
+        "vllm_torchtpu.model_loader_patches:patch_draft_indexed_shard_loading",
+        _ACTIVE,
+    ),
+    Patch(
         "vllm_torchtpu.model_loader_patches:patch_default_model_loader_page_cache",
         _ACTIVE,
     ),
