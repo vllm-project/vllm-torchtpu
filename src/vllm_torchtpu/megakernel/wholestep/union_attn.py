@@ -137,13 +137,15 @@ def compact_union(
 
 
 def compact_union_chunk(code: jax.Array, tot: jax.Array, row_of, KU: int, consts: tuple,
-                        store) -> tuple:
+                        store, id_of=None) -> tuple:
     """One row chunk of `compact_union` (`VLLM_TPU_MK_QSA_SELECT_NVIS`): the coded lanes of
     `code [CR, 128]` take union slots `[tot, tot + count)` (`tot`: scalar int32 count of the
     chunks before it, which hold lower ids). For each `UNION_CHUNK` slot window that meets
     that range, `store(j0, ids, codes)` gets the window's `[1, W]` int32 ids / codes (0
     outside the range; chunks add up). `row_of(r)`: sublane row of the chunk's row `r`.
-    Same integer arithmetic as `compact_union`. Returns the new `tot`."""
+    `id_of(r, l)` (optional): group id of the chunk's row `r`, lane `l` (default `row_of(r)
+    * 128 + l`), for chunks whose lanes are not their groups' lanes (`_nvis_union`'s lane
+    pack). Same integer arithmetic as `compact_union`. Returns the new `tot`."""
     U, tri, jcol0, srow, lane = consts
     CR, W = code.shape[0], jcol0.shape[0]
     sel = code > 0
@@ -170,7 +172,8 @@ def compact_union_chunk(code: jax.Array, tot: jax.Array, row_of, KU: int, consts
             Cg = jnp.dot(oh, codeb, preferred_element_type=F32)
             code_j = jnp.sum(jnp.where(lane == lane_j, Cg, 0.0), axis=1, keepdims=True)
             live = (jcol >= tot) & (jcol < tot + n)
-            ids = jnp.where(live, row_of(r_j) * 128 + lane_j, 0).astype(F32)
+            gid = row_of(r_j) * 128 + lane_j if id_of is None else id_of(r_j, lane_j)
+            ids = jnp.where(live, gid, 0).astype(F32)
             codes = jnp.where(live, code_j, 0.0)
             store(
                 j0,
@@ -179,6 +182,41 @@ def compact_union_chunk(code: jax.Array, tot: jax.Array, row_of, KU: int, consts
             )
 
     return tot + n
+
+
+def lane_pack(ev: jax.Array, od: jax.Array, r: int, gpp: int, roll) -> jax.Array:
+    """Main-KV DCP2 lane pack (VLLM_TPU_MK_QSA_UNION_LANEPACK): pair rank `r` owns the lanes
+    `l` with `(l // gpp) % 2 == r` of every code row (`128 % (2 * gpp) == 0`). Returns the
+    `[H, 128]` rows whose lanes `[0, 64)` are `ev`'s owned lanes and `[64, 128)` `od`'s, each
+    in ascending lane order (`ev` / `od`: code rows 2p / 2p + 1). `roll`: `pltpu.roll` in a
+    kernel (`jnp.roll` semantics). Integer selects only: exact."""
+    lane = jax.lax.broadcasted_iota(I32, ev.shape, 1)
+    out = None
+    for off, x in ((0, ev), (64, od)):
+        for b in range(64 // gpp):  # owned block b: lanes [(2b + r) gpp, +gpp) -> off + b gpp
+            sh = (off + b * gpp - (2 * b + r) * gpp) % 128
+            y = roll(x, sh, 1) if sh else x
+            lo = off + b * gpp
+            inb = (lane >= lo) & (lane < lo + gpp)
+            out = jnp.where(inb, y, 0) if out is None else jnp.where(inb, y, out)
+    return out
+
+
+def lane_pack_id(row: jax.Array, lane: jax.Array, r: int, gpp: int) -> jax.Array:
+    """Group id of `lane_pack` lane `lane` of the packed row whose even source row is
+    `row`: source row `row + lane // 64`, owned block `(lane % 64) // gpp` of rank `r`."""
+    lw = jax.lax.rem(lane, 64)
+    src = (2 * (lw // gpp) + r) * gpp + jax.lax.rem(lw, gpp)
+    return (row + lane // 64) * 128 + src
+
+
+def unpack_union_ids(ids: jax.Array, n: jax.Array, r: int, gpp: int) -> jax.Array:
+    """Group ids of a `compact_union` over pair rank `r`'s packed rows (`ids [1, KU]` packed
+    positions, `n` the count): packed row p is code row 2p + r (`gpp` = 128) or `lane_pack`'s
+    rows 2p / 2p + 1. Slots past `n` stay 0."""
+    prow, plane = ids // 128, jax.lax.rem(ids, 128)
+    gid = (2 * prow + r) * 128 + plane if gpp == 128 else lane_pack_id(2 * prow, plane, r, gpp)
+    return jnp.where(jax.lax.broadcasted_iota(I32, ids.shape, 1) < n, gid, 0)
 
 
 def physical_ids(ids: jax.Array, tab: jax.Array, per_page: int, dcp: int = 1) -> jax.Array:
