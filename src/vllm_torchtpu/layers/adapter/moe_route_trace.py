@@ -115,9 +115,6 @@ def record(layer: Any, topk_ids: torch.Tensor) -> None:
     if row is None or _ring is None:
         return
     assert _ctr is not None and _tok is not None and _num_experts is not None
-    if topk_ids.shape[0] < MIN_TOKENS:
-        # Static per bucket: smaller buckets compile without the trace ops.
-        return
     ids = topk_ids.flatten().to(torch.int32)
     counts = torch.zeros(_num_experts, dtype=torch.int32, device=ids.device)
     counts = counts.index_add(0, ids.to(torch.int64), torch.ones_like(ids))
@@ -167,6 +164,8 @@ def dump() -> None:
         pad = _pad.cpu().numpy() if _pad is not None else None
         for s in range(step - new, step):
             slot = s % RING
+            if int(tok[slot]) < MIN_TOKENS:
+                continue
             npad = int(pad[slot]) if pad is not None else -1
             for r in range(n):
                 logger.info(
