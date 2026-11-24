@@ -226,7 +226,39 @@ class GDNConfig:
         )
         return int(fraction * pltpu.get_tpu_info().vmem_capacity_bytes)
 
+    def qkv_pad_scratch_shape(self, num_lanes: int) -> tuple[int, int, int, int] | None:
+        """Returns an odd-column VMEM scratch shape for conflict-free Q/K/V loads.
+
+        Strided per-head loads step by one row per token. When the row width is an
+        even multiple of `num_lanes` (for example 80 columns), consecutive tokens
+        land in the same VMEM bank and each 8-token load splits into partial loads
+        and merges. Adding one unused spacer column (80 -> 81) spreads 8 tokens
+        across all 8 banks so each loads in one instruction.
+
+        Args:
+            num_lanes: TPU vector lane count.
+
+        Returns:
+            `(seq_tile_size, chunk_size, 1, (cols + 1) * num_lanes)`, or `None` when
+            KDA is active, chunked strided loads are not used, head dims are not
+            multiples of `num_lanes`, or `dim_size // num_lanes` is already odd.
+        """
+        if (
+            self.is_kda
+            or self.mode != GDNMode.PER_SEQ
+            or self.use_recurrent
+            or self.dim_size % num_lanes != 0
+            or self.kq_head_dim % num_lanes != 0
+            or self.v_head_dim % num_lanes != 0
+        ):
+            return None
+        cols = self.dim_size // num_lanes
+        if cols % 2 != 0:
+            return None
+        return (self.seq_tile_size, self.chunk_size, 1, (cols + 1) * num_lanes)
+
     def get_scratch_shape_dict(self) -> dict[str, Any]:
+        """Returns Pallas VMEM scratch shape specs for inter-tile carries."""
         conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)
         recurrent_shape = (
             self.seq_tile_size,

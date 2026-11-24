@@ -2365,3 +2365,53 @@ class GDNAttentionTest(parameterized.TestCase):
                     np.testing.assert_allclose(
                         rec_out[slot], rec_ref[slot], rtol=3e-2, atol=3e-2
                     )
+
+    @parameterized.named_parameters(
+        dict(testcase_name="even_cols_padded", n_kq=2, n_v=8),
+        dict(testcase_name="odd_cols_fallback", n_kq=3, n_v=3),
+    )
+    def test_qkv_pad_scratch_padded_and_fallback_prefill(self, n_kq: int, n_v: int):
+        """Chunked GDN prefill matches reference with and without odd-col spacer."""
+        rng = np.random.default_rng(109 + n_v)
+        d_k, d_v, kernel_size, tok = 128, 128, 4, 32
+        dim = (2 * n_kq + n_v) * d_k
+        qkv = jnp.asarray(rng.standard_normal((tok, dim)), jnp.bfloat16)
+        b = jnp.asarray(rng.standard_normal((tok, n_v)), jnp.bfloat16)
+        a = jnp.asarray(rng.standard_normal((tok, n_v)), jnp.bfloat16)
+        conv_init = jnp.asarray(
+            rng.standard_normal((2, kernel_size - 1, dim)), jnp.float32
+        )
+        rec_init = jnp.asarray(rng.standard_normal((2, n_v, d_k, d_v)), jnp.float32)
+        conv_w = jnp.asarray(rng.standard_normal((dim, 1, kernel_size)), jnp.float32)
+        conv_b = jnp.asarray(rng.standard_normal((dim,)), jnp.float32)
+        a_log = jnp.asarray(rng.uniform(0.0, 1.0, (n_v,)), jnp.float32)
+        dt_bias = jnp.asarray(rng.uniform(-3.0, -1.0, (n_v,)), jnp.float32)
+        common = dict(
+            qkv=qkv,
+            b=b,
+            a=a,
+            conv_weight=conv_w,
+            conv_bias=conv_b,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=jnp.array([0, tok], dtype=jnp.int32),
+            state_indices=jnp.array([1], dtype=jnp.int32),
+            distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
+            seq_lens=jnp.array([tok + 16], dtype=jnp.int32),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+        (conv_ref, rec_ref), out_ref = gdn_attention_ref(
+            states=(conv_init, rec_init), **common
+        )
+        (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+            states=(conv_init.copy(), rec_init.copy()),
+            mixed_tile_size=16,
+            **common,
+        )
+        np.testing.assert_allclose(out, out_ref, rtol=2e-2, atol=2e-2)
+        np.testing.assert_allclose(conv_out[1], conv_ref[1], rtol=2e-2, atol=2e-2)
+        np.testing.assert_allclose(rec_out[1], rec_ref[1], rtol=3e-2, atol=3e-2)

@@ -51,6 +51,7 @@ def inner_kernel(
     weights_ref: memory_ref.WeightRefs,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
+    qkv_pad_scratch_ref: jax.Ref | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -77,6 +78,11 @@ def inner_kernel(
             convolution carry.
         carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
             recurrent state carry.
+        qkv_pad_scratch_ref: Optional VMEM scratch reference holding this tile's
+            Q/K/V widened to an odd number of lane-width columns
+            (`cfg.qkv_pad_scratch_shape`) so strided per-head loads hit distinct
+            VMEM banks instead of colliding on `qkv_slot_ref`'s even HBM width.
+            Falls back to `qkv_slot_ref` when `None`.
         cfg: GDN configuration object.
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
@@ -186,6 +192,7 @@ def inner_kernel(
                 b_vmem_ref=b_slot_ref,
                 a_vmem_ref=a_slot_ref,
                 cfgs=cfg,
+                qkv_pad_vmem_ref=qkv_pad_scratch_ref,
             )
         )
 
@@ -228,6 +235,7 @@ def outer_kernel(
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    qkv_pad_scratch_ref: jax.Array | None = None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -271,6 +279,7 @@ def outer_kernel(
         weights_ref,
         carry_conv_scratch_ref,
         carry_recurrent_scratch_ref,
+        qkv_pad_scratch_ref,
     )
     state_allocs = (conv_in_alloc, recurrent_in_alloc)
     out_allocs = (out_alloc, conv_out_alloc, recurrent_out_alloc)
@@ -718,9 +727,26 @@ def fused_conv1d_gdn(
                 prefill_ckpt_indices=prefill_ckpt_indices,
             )
 
+        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
         state_spec = jax.tree.map(lambda _: hbm_spec, in_states)
         scratch_shapes = cfg.get_scratch_shape_dict()
+        qpad_shape = cfg.qkv_pad_scratch_shape(num_lanes)
+        if qpad_shape is not None and not tiling.fits_qkv_pad_scratch(
+            cfg, qpad_shape, vmem_limit_bytes, num_lanes
+        ):
+            logger.info_once(
+                "Skipping odd-column Q/K/V VMEM scratchpad %s for chunk_size=%d,"
+                " num_v_heads=%d (exceeds vmem_limit_bytes=%d).",
+                qpad_shape,
+                cfg.chunk_size,
+                cfg.num_v_heads,
+                vmem_limit_bytes,
+            )
+            qpad_shape = None
+        scratch_shapes["qkv_pad_scratch_ref"] = (
+            None if qpad_shape is None else pltpu.VMEM(qpad_shape, jnp.float32)
+        )
 
         # Step 7: Handle case where write needs to be done in existing out.
         input_output_aliases = {}
@@ -739,8 +765,6 @@ def fused_conv1d_gdn(
             out_shape = in_act
             in_out_spec = hbm_spec
             input_output_aliases[act_pos] = 0
-
-        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
 
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),

@@ -15,8 +15,12 @@
 
 """Dynamic tiling heuristics and VMEM memory estimation for Fused Conv1D-GDN."""
 
+import math
+
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+
+from vllm_torchtpu.kernels.gdn.v3 import config
 
 # Cap decode tiles at 16 sequences: larger tiles increase per-slot state DMA
 # descriptors and register spills without reducing per-slot compute.
@@ -232,6 +236,46 @@ def get_vmem_estimate_bytes(
         + weights_bytes
         + intermediate_bytes
     )
+
+
+def fits_qkv_pad_scratch(
+    cfg: config.GDNConfig,
+    qpad_shape: tuple[int, int, int, int],
+    vmem_limit_bytes: int,
+    num_lanes: int,
+) -> bool:
+    """Returns whether sequential chunked prefill has VMEM headroom for padding.
+
+    Args:
+        cfg: Chunked prefill GDN configuration.
+        qpad_shape: Candidate float32 odd-column scratch shape from
+            `GDNConfig.qkv_pad_scratch_shape`.
+        vmem_limit_bytes: Target per-core VMEM budget in bytes.
+        num_lanes: TPU vector lane count.
+    """
+    qpad_bytes = math.prod(qpad_shape) * 4
+    vmem_est = get_vmem_estimate_bytes(
+        tile_b=cfg.seq_tile_size,
+        chunk_sz=cfg.chunk_size,
+        n_kq=cfg.num_kq_heads,
+        n_v=cfg.num_v_heads,
+        d_k=cfg.kq_head_dim,
+        d_v=cfg.v_head_dim,
+        kernel_size=cfg.kernel_size,
+        act_out_bytes=jnp.dtype(cfg.dtypes.act_out).itemsize,
+        rec_state_bytes=jnp.dtype(cfg.dtypes.recurrent_state).itemsize,
+        num_lanes=num_lanes,
+        conv_state_dim_size=cfg.dim_size,
+        is_decode=False,
+        window_size=cfg.window_size,
+    )
+    # Sequential chunked prefill keeps one f32 working state live alongside
+    # `carry_recurrent_scratch_ref`; require that working-state margin so adding
+    # the spacer never causes a compile-time VMEM OOM on tight tiles.
+    working_state_bytes = (
+        cfg.seq_tile_size * cfg.num_v_heads * cfg.kq_head_dim * cfg.v_head_dim * 4
+    )
+    return vmem_est + working_state_bytes + qpad_bytes <= vmem_limit_bytes
 
 
 def calculate_decode_tile_size(
