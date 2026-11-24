@@ -222,6 +222,33 @@ def test_file_cli_does_not_echo_and_skips_binary(
     assert secret_token not in out
 
 
+def test_file_cli_names_all_five_reference_kinds(
+    checker: types.ModuleType,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """File CLI output names all five matched kinds without echoing tokens."""
+    job_token = "j-" + "0123abcd"
+    path_token = "google" + "3"
+    dirty = tmp_path / "hits.py"
+    dirty.write_text(f"# job {job_token}\n# path {path_token}\n", encoding="utf-8")
+
+    assert checker.main([str(dirty)]) == 1
+    out = capsys.readouterr().out
+    assert f"{dirty}:1:" in out
+    assert f"{dirty}:2:" in out
+    for kind in (
+        "internal link",
+        "tracker ID",
+        "internal job ID",
+        "internal code path",
+        "internal host",
+    ):
+        assert kind in out
+    assert job_token not in out
+    assert path_token not in out
+
+
 def test_pr_event_cli_allows_clean_event_and_rejects_malformed(
     checker: types.ModuleType,
     tmp_path: pathlib.Path,

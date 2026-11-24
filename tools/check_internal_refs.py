@@ -170,7 +170,10 @@ def _run_files(filenames: Sequence[str]) -> int:
     if not hits:
         return 0
     for path, line_no in hits:
-        print(f"{path}:{line_no}: internal link, tracker ID, or internal host (R-7.12)")
+        print(
+            f"{path}:{line_no}: internal link, tracker ID, internal job ID, "
+            "internal code path, or internal host (R-7.12)"
+        )
     return 1
 
 

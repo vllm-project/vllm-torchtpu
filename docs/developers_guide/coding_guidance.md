@@ -424,8 +424,7 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   (such as ops and errors in public `openxla/xla` or pinned `jax`, e.g.,
   `tpu.matmul` in `jax/_src/pallas/mosaic/lowering.py`, and errors observable
   from pinned public PyPI `libtpu`), executable calls to public OpenXLA ops,
-  and HLO or trace evidence requested by other rules (`P-1`, `P-2`, `P-9`,
-  `P-13`) are allowed.
+  and HLO or trace evidence that another rule asks for are allowed.
 
 ## 8. Tests
 
