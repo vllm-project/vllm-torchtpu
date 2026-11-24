@@ -21,24 +21,22 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import jax.numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
+
 from ..core import errors
-from . import jax_bridge
 from .constants import (
     ALLOWED_CHIP_SPEC_KEYS,
     BRACKET_LEN,
     CALIBRATION_DIR,
     CHIP_ALIASES,
     DEFAULT_COLLECTIVE_LATENCY_US_BRACKET,
-    DEFAULT_ROW_TILE_FP8,
-    DEFAULT_ROW_TILE_WIDE,
     DEFAULT_SOURCES_7X,
     DEFAULT_SOURCES_PUBLIC,
     GOOGLE_PCI_VENDOR_ID,
     MEGACORE_CORES,
     PCI_DEVICE_TO_CHIP,
     REQUIRED_CHIP_SPEC_KEYS,
-    ROW_TILES_7X,
-    ROW_TILES_V6E,
     SUPPORTED_CHIPS,
     SYSFS_PCI_DEVICES_DIR,
     TPU6E_TOPOLOGIES,
@@ -52,12 +50,13 @@ __all__ = [
     "SUPPORTED_CHIPS",
     "ChipSpec",
     "UnsupportedChipError",
+    "build_builtin_chip_spec",
     "detect_tpu_from_sysfs",
     "load_chip_spec_file",
     "load_public_calibration",
+    "probe_jax_tpu_info",
     "public_calibration_path",
     "resolve_chip_spec",
-    "verify_chip_spec_against_jax",
 ]
 
 if TYPE_CHECKING:
@@ -130,7 +129,6 @@ class ChipSpec:
     matmul_row_tile_by_dtype: Mapping[str, int] | None = None
     topologies: Mapping[int, str] = field(default_factory=lambda: TPU7X_TOPOLOGIES)
     sources: Mapping[str, str] | None = None
-    tpu_info: object = None
     vector_f32_ops_per_s: float = 0.0
     scalar_mem_capacity_bytes: int = 1_048_576
     pcie_bw_bytes_per_s: float = 32.0e9
@@ -175,39 +173,65 @@ class ChipSpec:
         table = self.matmul_row_tile_by_dtype or {}
         if dt in table:
             return table[dt]
-        if dt in ("fp8", "nvfp4", "mxfp4", "fp4") and self.native_ocp_fp8:
-            return DEFAULT_ROW_TILE_FP8
-        return DEFAULT_ROW_TILE_WIDE
+        msg = (
+            f"Chip {self.name!r} has no matmul_row_tile_by_dtype entry for "
+            f"dtype={dtype!r}; known dtypes: {sorted(table)}"
+        )
+        raise UnsupportedChipError(msg)
 
     def lhs_row_floor(self, dtype: str) -> int:
         """Alias for `matmul_row_tile(dtype)` kept for caller compatibility."""
         return self.matmul_row_tile(dtype)
 
 
-BUILTIN_CHIP_SPECS: Mapping[str, ChipSpec] = {
-    "tpu7x": ChipSpec(
-        name="tpu7x",
-        cores_per_device=1,
-        vmem_capacity_bytes=67_108_864,
-        vmem_usable_bytes=67_108_864 - USABLE_VMEM_RESERVE_BYTES,
-        hbm_capacity_bytes=103_000_000_000,
-        hbm_bw_bytes_per_s=3_700_000_000_000.0,
-        bf16_flops_per_s=1_155_000_000_000_000.0,
-        fp8_flops_per_s=2_300_000_000_000_000.0,
-        int8_flops_per_s=1_155_000_000_000_000.0,
-        native_ocp_fp8=True,
+@dataclass(frozen=True)
+class _HandwrittenChipParams:
+    """Non-JAX chip parameters that JAX `TpuInfo` does not expose."""
+
+    chip_version: pltpu.ChipVersion
+    ici_egress_bw_bytes_per_s: float
+    ici_link_bw_bytes_per_s: float
+    collective_latency_s: float
+    collective_latency_us_bracket: tuple[float, float]
+    dcn_bw_gbps: float
+    dcn_bw_gbps_bracket: tuple[float, float]
+    min_slice_cores: int
+    topologies: Mapping[int, str]
+    sources: Mapping[str, str]
+    pcie_bw_bytes_per_s: float
+    torus_ndim: int
+    vector_registers_per_core: int = 0
+    vector_register_bytes: int = 0
+    vector_loads_per_cycle: int = 0
+    vector_stores_per_cycle: int = 0
+    vector_port_ops_per_cycle: int = 0
+    clock_hz: float = 0.0
+
+
+JAX_ROW_TILE_DTYPES: Mapping[str, jnp.dtype] = {
+    "bf16": jnp.dtype(jnp.bfloat16),
+    "fp16": jnp.dtype(jnp.float16),
+    "fp8": jnp.dtype(jnp.float8_e4m3fn),
+    "fp8_e4m3": jnp.dtype(jnp.float8_e4m3fn),
+    "fp8_e4m3fn": jnp.dtype(jnp.float8_e4m3fn),
+    "fp8_e5m2": jnp.dtype(jnp.float8_e5m2),
+    "int8": jnp.dtype(jnp.int8),
+    "fp32": jnp.dtype(jnp.float32),
+}
+ASSUMED_FP4_DTYPES: tuple[str, ...] = ("int4", "mxfp4", "nvfp4", "fp4")
+
+BUILTIN_CHIP_PARAMS: Mapping[str, _HandwrittenChipParams] = {
+    "tpu7x": _HandwrittenChipParams(
+        chip_version=pltpu.ChipVersion.TPU_7X,
         ici_egress_bw_bytes_per_s=300.0e9,
         ici_link_bw_bytes_per_s=100.0e9,
         collective_latency_s=1.0e-6,
         collective_latency_us_bracket=DEFAULT_COLLECTIVE_LATENCY_US_BRACKET,
+        dcn_bw_gbps=100.0,
+        dcn_bw_gbps_bracket=(50.0, 200.0),
         min_slice_cores=8,
-        devices_per_chip=2,
-        supports_megacore=False,
-        matmul_row_tile_by_dtype=ROW_TILES_7X,
         topologies=TPU7X_TOPOLOGIES,
         sources=DEFAULT_SOURCES_7X,
-        vector_f32_ops_per_s=1_155_000_000_000_000.0 / 128.0,
-        scalar_mem_capacity_bytes=1_048_576,
         pcie_bw_bytes_per_s=32.0e9,
         torus_ndim=3,
         vector_registers_per_core=64,
@@ -217,31 +241,157 @@ BUILTIN_CHIP_SPECS: Mapping[str, ChipSpec] = {
         vector_port_ops_per_cycle=4,
         clock_hz=2.2e9,
     ),
-    "v6e": ChipSpec(
-        name="v6e",
-        cores_per_device=1,
-        vmem_capacity_bytes=134_217_728,
-        vmem_usable_bytes=134_217_728 - USABLE_VMEM_RESERVE_BYTES,
-        hbm_capacity_bytes=34_400_000_000,
-        hbm_bw_bytes_per_s=1_640_000_000_000.0,
-        bf16_flops_per_s=920_000_000_000_000.0,
-        fp8_flops_per_s=920_000_000_000_000.0,
-        int8_flops_per_s=1_840_000_000_000_000.0,
-        native_ocp_fp8=False,
+    "v6e": _HandwrittenChipParams(
+        chip_version=pltpu.ChipVersion.TPU_V6E,
         ici_egress_bw_bytes_per_s=400.0e9,
         ici_link_bw_bytes_per_s=100.0e9,
         collective_latency_s=1.0e-6,
         collective_latency_us_bracket=DEFAULT_COLLECTIVE_LATENCY_US_BRACKET,
+        dcn_bw_gbps=100.0,
+        dcn_bw_gbps_bracket=(50.0, 200.0),
         min_slice_cores=1,
-        supports_megacore=False,
-        matmul_row_tile_by_dtype=ROW_TILES_V6E,
         topologies=TPU6E_TOPOLOGIES,
         sources=DEFAULT_SOURCES_PUBLIC,
-        vector_f32_ops_per_s=920_000_000_000_000.0 / 128.0,
-        scalar_mem_capacity_bytes=1_048_576,
         pcie_bw_bytes_per_s=32.0e9,
         torus_ndim=2,
     ),
+}
+
+
+def _build_row_tiles(info: pltpu.TpuInfo, *, native_ocp_fp8: bool) -> dict[str, int]:
+    """Read JAX sublane row tiles and apply the explicit 4-bit ASSUMED rule."""
+    tiles = {
+        label: int(info.get_sublane_tiling(jax_dt))
+        for label, jax_dt in JAX_ROW_TILE_DTYPES.items()
+    }
+    fp4_tile = tiles["fp8"] if native_ocp_fp8 else tiles["bf16"]
+    for label in ASSUMED_FP4_DTYPES:
+        tiles[label] = fp4_tile
+    return tiles
+
+
+def _build_jax_sources(
+    *, fp8_raw: float, int8_raw: float, num_lanes: int
+) -> dict[str, str]:
+    """Build provenance source strings for all JAX-sourced and JAX-derived fields."""
+    fp8_src = (
+        "FACT: jax.experimental.pallas.tpu tpu_info.fp8_ops_per_second"
+        if fp8_raw > 0.0
+        else (
+            "DERIVED: jax.experimental.pallas.tpu "
+            "tpu_info.fp8_ops_per_second=0; falls back to bf16 rate"
+        )
+    )
+    int8_src = (
+        "FACT: jax.experimental.pallas.tpu tpu_info.int8_ops_per_second"
+        if int8_raw > 0.0
+        else (
+            "DERIVED: jax.experimental.pallas.tpu "
+            "tpu_info.int8_ops_per_second=0; falls back to bf16 rate"
+        )
+    )
+    return {
+        "cores_per_device": "FACT: jax.experimental.pallas.tpu tpu_info.num_cores",
+        "devices_per_chip": (
+            "FACT: jax.experimental.pallas.tpu "
+            "ChipVersion.num_physical_tensor_cores_per_chip"
+        ),
+        "supports_megacore": (
+            "FACT: jax.experimental.pallas.tpu ChipVersion.supports_megacore"
+        ),
+        "vmem_capacity_bytes": (
+            "FACT: jax.experimental.pallas.tpu tpu_info.vmem_capacity_bytes"
+        ),
+        "hbm_capacity_bytes": (
+            "FACT: jax.experimental.pallas.tpu tpu_info.hbm_capacity_bytes"
+        ),
+        "hbm_bw_bytes_per_s": (
+            "FACT: jax.experimental.pallas.tpu tpu_info.mem_bw_bytes_per_second"
+        ),
+        "bf16_flops_per_s": (
+            "FACT: jax.experimental.pallas.tpu tpu_info.bf16_ops_per_second"
+        ),
+        "fp8_flops_per_s": fp8_src,
+        "int8_flops_per_s": int8_src,
+        "native_ocp_fp8": (
+            "DERIVED: jax.experimental.pallas.tpu tpu_info "
+            "(fp8_ops_per_second > bf16_ops_per_second)"
+        ),
+        "matmul_row_tile_by_dtype": (
+            "FACT: jax.experimental.pallas.tpu tpu_info.get_sublane_tiling "
+            "(bf16, fp16, fp8, int8, fp32); ASSUMED: mxfp4/nvfp4/fp4 use "
+            "fp8 tile when native_ocp_fp8 else bf16 tile"
+        ),
+        "vector_f32_ops_per_s": (
+            "DERIVED: jax.experimental.pallas.tpu tpu_info "
+            f"(bf16_ops_per_second / num_lanes={num_lanes})"
+        ),
+        "scalar_mem_capacity_bytes": (
+            "FACT: jax.experimental.pallas.tpu tpu_info.smem_capacity_bytes"
+        ),
+    }
+
+
+def build_builtin_chip_spec(name: str) -> ChipSpec:
+    """Build a built-in ChipSpec from live JAX Pallas `get_tpu_info_for_chip`."""
+    params = BUILTIN_CHIP_PARAMS.get(name)
+    if params is None:
+        msg = (
+            f"Unknown built-in chip={name!r}; supported: {sorted(BUILTIN_CHIP_PARAMS)}"
+        )
+        raise UnsupportedChipError(msg)
+    ver = params.chip_version
+    info = pltpu.get_tpu_info_for_chip(ver, 1)
+    bf16_flops = float(info.bf16_ops_per_second)
+    fp8_raw = float(info.fp8_ops_per_second or 0)
+    int8_raw = float(info.int8_ops_per_second or 0)
+    fp8_flops = fp8_raw if fp8_raw > 0.0 else bf16_flops
+    int8_flops = int8_raw if int8_raw > 0.0 else bf16_flops
+    native_fp8 = fp8_flops > bf16_flops
+    vmem_cap = int(info.vmem_capacity_bytes)
+    num_lanes = int(info.num_lanes)
+    sources = {
+        **params.sources,
+        **_build_jax_sources(fp8_raw=fp8_raw, int8_raw=int8_raw, num_lanes=num_lanes),
+    }
+    return ChipSpec(
+        name=name,
+        cores_per_device=int(info.num_cores),
+        vmem_capacity_bytes=vmem_cap,
+        vmem_usable_bytes=vmem_cap - USABLE_VMEM_RESERVE_BYTES,
+        hbm_capacity_bytes=int(info.hbm_capacity_bytes),
+        hbm_bw_bytes_per_s=float(info.mem_bw_bytes_per_second),
+        bf16_flops_per_s=bf16_flops,
+        fp8_flops_per_s=fp8_flops,
+        int8_flops_per_s=int8_flops,
+        native_ocp_fp8=native_fp8,
+        ici_egress_bw_bytes_per_s=params.ici_egress_bw_bytes_per_s,
+        ici_link_bw_bytes_per_s=params.ici_link_bw_bytes_per_s,
+        collective_latency_s=params.collective_latency_s,
+        collective_latency_us_bracket=params.collective_latency_us_bracket,
+        dcn_bw_gbps=params.dcn_bw_gbps,
+        dcn_bw_gbps_bracket=params.dcn_bw_gbps_bracket,
+        min_slice_cores=params.min_slice_cores,
+        devices_per_chip=int(ver.num_physical_tensor_cores_per_chip),
+        supports_megacore=bool(ver.supports_megacore),
+        matmul_row_tile_by_dtype=_build_row_tiles(info, native_ocp_fp8=native_fp8),
+        topologies=params.topologies,
+        sources=sources,
+        vector_f32_ops_per_s=bf16_flops / float(num_lanes),
+        scalar_mem_capacity_bytes=int(info.smem_capacity_bytes),
+        pcie_bw_bytes_per_s=params.pcie_bw_bytes_per_s,
+        torus_ndim=params.torus_ndim,
+        vector_registers_per_core=params.vector_registers_per_core,
+        vector_register_bytes=params.vector_register_bytes,
+        vector_loads_per_cycle=params.vector_loads_per_cycle,
+        vector_stores_per_cycle=params.vector_stores_per_cycle,
+        vector_port_ops_per_cycle=params.vector_port_ops_per_cycle,
+        clock_hz=params.clock_hz,
+    )
+
+
+BUILTIN_CHIP_SPECS: Mapping[str, ChipSpec] = {
+    chip_name: build_builtin_chip_spec(chip_name) for chip_name in BUILTIN_CHIP_PARAMS
 }
 
 
@@ -273,7 +423,8 @@ def _parse_row_tiles(
 ) -> Mapping[str, int]:
     """Parse optional `matmul_row_tile_by_dtype` mapping, rejecting non-dicts."""
     if "matmul_row_tile_by_dtype" not in raw:
-        return ROW_TILES_7X if native_fp8 else ROW_TILES_V6E
+        ref_chip = BUILTIN_CHIP_SPECS["tpu7x" if native_fp8 else "v6e"]
+        return dict(ref_chip.matmul_row_tile_by_dtype or {})
     val = raw["matmul_row_tile_by_dtype"]
     if type(val) is not dict:
         msg = (
@@ -520,6 +671,15 @@ def detect_tpu_from_sysfs(
     return None
 
 
+def probe_jax_tpu_info() -> tuple[str, int] | None:
+    """Probe TPU device version and core count from JAX Pallas if available."""
+    try:
+        info = pltpu.get_tpu_info()
+        return str(info.chip_version.value).lower(), int(info.num_cores)
+    except (AttributeError, RuntimeError, ValueError):
+        return None
+
+
 def _detect_auto_chip(raw: str) -> tuple[str, int | None]:
     """Detect TPU chip type and core count from sysfs or JAX probe."""
     if raw != "auto":
@@ -527,7 +687,7 @@ def _detect_auto_chip(raw: str) -> tuple[str, int | None]:
     sysfs_chip = detect_tpu_from_sysfs()
     if sysfs_chip is not None:
         return sysfs_chip, None
-    probed = jax_bridge.probe_jax_tpu_info()
+    probed = probe_jax_tpu_info()
     if probed is None:
         msg = "chip='auto' requires TPU"
         raise errors.MegakernelConfigError(msg)
@@ -583,11 +743,6 @@ def resolve_chip_spec(
         else (1 + int(megacore))
     )
     return _scale_megacore(base, num_cores, ici_bw_gbps, collective_latency_us)
-
-
-def verify_chip_spec_against_jax(spec: ChipSpec) -> list[str]:
-    """Compare a built-in ChipSpec against jax.experimental.pallas.tpu if available."""
-    return jax_bridge.verify_chip_spec_against_jax(spec)
 
 
 def public_calibration_path(

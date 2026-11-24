@@ -23,13 +23,14 @@ import re
 from pathlib import Path
 from unittest import mock
 
+import jax.numpy as jnp
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import (
     chips,
     constants,
-    jax_bridge,
     models,
     specs,
 )
@@ -112,17 +113,35 @@ def test_single_core_escape_hatch() -> None:
     assert chip_spec.vmem_capacity_bytes == expected_capacity_vmem
 
 
-def test_auto_chip_detect_tpu7x_two_cores_per_chip_no_error() -> None:
-    """Verify --chip auto resolves tpu7x cleanly even when JAX sees 2 cores/chip."""
+def test_auto_chip_detect_tpu7x_two_cores_per_chip_no_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify --chip auto detection, CPU error, and Megacore rejection."""
     with (
         mock.patch.object(chips, "detect_tpu_from_sysfs", return_value=None),
-        mock.patch.object(jax_bridge, "probe_jax_tpu_info", return_value=("7x", 2)),
+        mock.patch.object(chips, "probe_jax_tpu_info", return_value=("7x", 2)),
     ):
         chip_spec = chips.resolve_chip_spec("auto")
     assert chip_spec.name == "tpu7x"
     assert chip_spec.cores_per_device == 1
     expected_devices = 2
     assert chip_spec.devices_per_chip == expected_devices
+
+    with (
+        mock.patch.object(chips, "detect_tpu_from_sysfs", return_value=None),
+        pytest.raises(errors.MegakernelConfigError, match="requires TPU"),
+    ):
+        chips.resolve_chip_spec("auto")
+
+    fake_7x = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: fake_7x)
+    with mock.patch.object(chips, "detect_tpu_from_sysfs", return_value=None):
+        auto_cs = chips.resolve_chip_spec("auto")
+    assert auto_cs.name == "tpu7x"
+    assert auto_cs.cores_per_device == 1
+
+    with pytest.raises(errors.MegakernelConfigError, match="Megacore"):
+        chips.resolve_chip_spec("tpu7x", megacore=True)
 
 
 def test_all_preset_chips_load() -> None:
@@ -279,7 +298,7 @@ def test_tpu7x_int8_peak_equals_bf16_rate() -> None:
 
 def test_chip_sources_cover_every_field() -> None:
     """Verify every built-in ChipSpec value field has a prefixed source entry."""
-    skip = {"name", "topologies", "sources", "tpu_info"}
+    skip = {"name", "topologies", "sources"}
     value_fields = {f.name for f in dataclasses.fields(chips.ChipSpec)} - skip
     for name, spec in chips.BUILTIN_CHIP_SPECS.items():
         assert spec.sources is not None, f"{name} missing sources"
@@ -291,23 +310,6 @@ def test_chip_sources_cover_every_field() -> None:
             assert src_val.startswith(SOURCE_PREFIXES), (
                 f"{name}.{key} source missing class prefix: {src_val!r}"
             )
-
-
-def test_jax_bridge_checks_every_exposed_field() -> None:
-    """Verify verify_chip_spec_against_jax checks all 6 tpu_info fields."""
-    for name in ("tpu7x", "v6e"):
-        cs = chips.resolve_chip_spec(name)
-        assert chips.verify_chip_spec_against_jax(cs) == []
-
-    for name in ("v5p", "v5e", "v4"):
-        with pytest.raises(chips.UnsupportedChipError):
-            chips.resolve_chip_spec(name)
-
-    bad_7x = dataclasses.replace(
-        chips.resolve_chip_spec("tpu7x"), int8_flops_per_s=2.31e15
-    )
-    mismatches = chips.verify_chip_spec_against_jax(bad_7x)
-    assert any("int8_flops_per_s" in m for m in mismatches)
 
 
 def test_dense_prefix_predicate_matches_non_homogeneous_reasons() -> None:
@@ -1089,3 +1091,107 @@ def test_perturbed_supported_config_fails_closed() -> None:
             advisor.resolve_model_profile(perturbed)
         with pytest.raises(models.UnsupportedArchitectureError):
             models.model_profile_from_hf_config(perturbed)
+
+
+def test_builtin_chip_facts_follow_jax_tpu_info(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify build_builtin_chip_spec reads live JAX TpuInfo and stays JSON-clean."""
+    real_get = pltpu.get_tpu_info_for_chip
+    delta_bw = 123_000_000_000.0
+    delta_bf16 = 45_000_000_000_000.0
+
+    def _perturbed(
+        chip_version: pltpu.ChipVersion, cores_per_device: int
+    ) -> pltpu.TpuInfo:
+        """Return real TpuInfo with perturbed bandwidth and BF16 FLOP/s."""
+        info = real_get(chip_version, cores_per_device)
+        return dataclasses.replace(
+            info,
+            mem_bw_bytes_per_second=info.mem_bw_bytes_per_second + delta_bw,
+            bf16_ops_per_second=info.bf16_ops_per_second + delta_bf16,
+        )
+
+    monkeypatch.setattr(pltpu, "get_tpu_info_for_chip", _perturbed)
+    baseline_info = real_get(pltpu.ChipVersion.TPU_7X, 1)
+    built = chips.build_builtin_chip_spec("tpu7x")
+    assert built.hbm_bw_bytes_per_s == pytest.approx(
+        float(baseline_info.mem_bw_bytes_per_second) + delta_bw
+    )
+    assert built.bf16_flops_per_s == pytest.approx(
+        float(baseline_info.bf16_ops_per_second) + delta_bf16
+    )
+    assert built.vector_f32_ops_per_s == pytest.approx(
+        built.bf16_flops_per_s / float(baseline_info.num_lanes)
+    )
+    assert "tpu_info" not in {f.name for f in dataclasses.fields(chips.ChipSpec)}
+    assert json.dumps(dataclasses.asdict(built))
+    with pytest.raises(chips.UnsupportedChipError, match="matmul_row_tile_by_dtype"):
+        built.matmul_row_tile("unknown_dtype")
+
+
+def test_row_tiles_follow_jax_sublane_tiling() -> None:
+    """Verify built-in row tiles match JAX get_sublane_tiling and 4-bit rule."""
+    jax_dtypes = {
+        "bf16": jnp.dtype(jnp.bfloat16),
+        "fp16": jnp.dtype(jnp.float16),
+        "fp8": jnp.dtype(jnp.float8_e4m3fn),
+        "int8": jnp.dtype(jnp.int8),
+        "fp32": jnp.dtype(jnp.float32),
+    }
+    chip_versions = {
+        "tpu7x": pltpu.ChipVersion.TPU_7X,
+        "v6e": pltpu.ChipVersion.TPU_V6E,
+    }
+    for chip_name, version in chip_versions.items():
+        spec = chips.BUILTIN_CHIP_SPECS[chip_name]
+        info = pltpu.get_tpu_info_for_chip(version, 1)
+        assert spec.matmul_row_tile_by_dtype is not None
+        for label, jax_dt in jax_dtypes.items():
+            expected_tile = int(info.get_sublane_tiling(jax_dt))
+            assert spec.matmul_row_tile(label) == expected_tile
+        expected_fp4_tile = (
+            spec.matmul_row_tile("fp8")
+            if spec.native_ocp_fp8
+            else spec.matmul_row_tile("bf16")
+        )
+        for fp4_label in ("mxfp4", "nvfp4", "fp4"):
+            assert spec.matmul_row_tile(fp4_label) == expected_fp4_tile
+        for accepted_dtype in constants.DTYPE_BYTES:
+            assert accepted_dtype in spec.matmul_row_tile_by_dtype
+
+
+def test_chip_fields_without_jax_source_are_enumerated() -> None:
+    """Verify non-JAX chip source fields match the exact hand-written enumeration."""
+    expected_non_jax_fields = {
+        "vmem_usable_bytes",
+        "ici_egress_bw_bytes_per_s",
+        "ici_link_bw_bytes_per_s",
+        "collective_latency_s",
+        "collective_latency_us_bracket",
+        "dcn_bw_gbps",
+        "dcn_bw_gbps_bracket",
+        "min_slice_cores",
+        "pcie_bw_bytes_per_s",
+        "torus_ndim",
+        "vector_registers_per_core",
+        "vector_register_bytes",
+        "vector_loads_per_cycle",
+        "vector_stores_per_cycle",
+        "vector_port_ops_per_cycle",
+        "clock_hz",
+    }
+    skip_fields = {"name", "topologies", "sources"}
+    value_fields = {f.name for f in dataclasses.fields(chips.ChipSpec)} - skip_fields
+    for chip_name, spec in chips.BUILTIN_CHIP_SPECS.items():
+        assert spec.sources is not None
+        non_jax_fields = {
+            field_name
+            for field_name in value_fields
+            if "jax.experimental.pallas.tpu" not in spec.sources.get(field_name, "")
+        }
+        assert non_jax_fields == expected_non_jax_fields, (
+            f"{chip_name} non-JAX source fields mismatch: "
+            f"extra={sorted(non_jax_fields - expected_non_jax_fields)}, "
+            f"missing={sorted(expected_non_jax_fields - non_jax_fields)}"
+        )

@@ -65,8 +65,6 @@ EFFICIENCY_BRACKETS: Mapping[str, tuple[float, float]] = {
 MEGACORE_CORES = 2
 BRACKET_LEN = 2
 USABLE_VMEM_RESERVE_BYTES = 2 << 20
-DEFAULT_ROW_TILE_FP8 = 32
-DEFAULT_ROW_TILE_WIDE = 16
 GOOGLE_PCI_VENDOR_ID = "0x1ae0"
 SYSFS_PCI_DEVICES_DIR = Path("/sys/bus/pci/devices")
 PCI_DEVICE_TO_CHIP: Mapping[str, str] = {
@@ -137,18 +135,6 @@ TPU6E_TOPOLOGIES: Mapping[int, str] = {
     64: "8x8 (16 hosts, 64 chips, 64 cores)",
 }
 
-ROW_TILES_7X: Mapping[str, int] = {
-    "fp8": DEFAULT_ROW_TILE_FP8,
-    "nvfp4": DEFAULT_ROW_TILE_FP8,
-    "mxfp4": DEFAULT_ROW_TILE_FP8,
-    "fp4": DEFAULT_ROW_TILE_FP8,
-    "bf16": DEFAULT_ROW_TILE_WIDE,
-    "fp16": DEFAULT_ROW_TILE_WIDE,
-    "int8": DEFAULT_ROW_TILE_WIDE,
-    "fp32": DEFAULT_ROW_TILE_WIDE,
-}
-ROW_TILES_V6E: Mapping[str, int] = dict.fromkeys(ROW_TILES_7X, DEFAULT_ROW_TILE_WIDE)
-
 CHIP_ALIASES: Mapping[str, str] = {
     "7x": "tpu7x",
     "v7x": "tpu7x",
@@ -159,35 +145,8 @@ CHIP_ALIASES: Mapping[str, str] = {
 }
 
 DEFAULT_SOURCES_7X: Mapping[str, str] = {
-    "cores_per_device": (
-        "FACT: jax.experimental.pallas.tpu tpu_info (7x dual-core: 1 core/device)"
-    ),
-    "devices_per_chip": (
-        "FACT: Google Cloud TPU v7x Ironwood docs (2 logical devices/chip)"
-    ),
-    "vmem_capacity_bytes": (
-        "FACT: jax.experimental.pallas.tpu tpu_info (7x: 64 MiB/core)"
-    ),
     "vmem_usable_bytes": (
         "CHOSEN: 64 MiB physical minus 2 MiB compiler reserve (62 MiB/core)"
-    ),
-    "hbm_capacity_bytes": (
-        "FACT: jax.experimental.pallas.tpu tpu_info (7x: 103 GB/core)"
-    ),
-    "hbm_bw_bytes_per_s": (
-        "FACT: jax.experimental.pallas.tpu tpu_info (7x: 3.70 TB/s/core)"
-    ),
-    "bf16_flops_per_s": (
-        "FACT: jax.experimental.pallas.tpu tpu_info (7x: 1.155 PF/s/core)"
-    ),
-    "fp8_flops_per_s": (
-        "FACT: jax.experimental.pallas.tpu tpu_info (7x: 2.30 PF/s/core)"
-    ),
-    "int8_flops_per_s": (
-        "DERIVED: jax.experimental.pallas.tpu tpu_info int8=0 on 7x; bf16 rate"
-    ),
-    "native_ocp_fp8": (
-        "FACT: jax.experimental.pallas.tpu tpu_info (7x native OCP FP8)"
     ),
     "ici_egress_bw_bytes_per_s": (
         "ASSUMED: 300 GB/s/core unidirectional ICI egress prior"
@@ -209,18 +168,6 @@ DEFAULT_SOURCES_7X: Mapping[str, str] = {
     ),
     "min_slice_cores": (
         "FACT: smallest TPU v7x 2x2x1 cube topology has 4 chips (8 cores)"
-    ),
-    "supports_megacore": (
-        "FACT: TPU v7x exposes independent logical cores (supports_megacore=False)"
-    ),
-    "matmul_row_tile_by_dtype": (
-        "FACT: TPU v7x matmul LHS unpadded row tile floor (32 FP8/FP4, 16 BF16/INT8)"
-    ),
-    "vector_f32_ops_per_s": (
-        "DERIVED: public (8, 128) 32-bit vector rate (bf16_flops / 128.0)"
-    ),
-    "scalar_mem_capacity_bytes": (
-        "FACT: jax.experimental.pallas.tpu tpu_info (1 MiB on-chip scalar memory/core)"
     ),
     "pcie_bw_bytes_per_s": ("ASSUMED: 32 GB/s host-to-device PCIe bandwidth prior"),
     "torus_ndim": ("FACT: 3D torus interconnect topology"),
@@ -257,24 +204,9 @@ DEFAULT_SOURCES_7X: Mapping[str, str] = {
 }
 
 DEFAULT_SOURCES_PUBLIC: Mapping[str, str] = {
-    "cores_per_device": "FACT: jax.experimental.pallas.tpu tpu_info (1 core/device)",
-    "devices_per_chip": (
-        "FACT: Google Cloud TPU architecture docs (devices per physical chip)"
-    ),
-    "vmem_capacity_bytes": "FACT: jax.experimental.pallas.tpu tpu_info",
     "vmem_usable_bytes": (
         "CHOSEN: physical VMEM capacity minus 2 MiB compiler reserve"
     ),
-    "hbm_capacity_bytes": "FACT: jax.experimental.pallas.tpu tpu_info",
-    "hbm_bw_bytes_per_s": "FACT: jax.experimental.pallas.tpu tpu_info",
-    "bf16_flops_per_s": "FACT: jax.experimental.pallas.tpu tpu_info",
-    "fp8_flops_per_s": (
-        "DERIVED: jax.experimental.pallas.tpu tpu_info (bf16 rate when fp8=0)"
-    ),
-    "int8_flops_per_s": (
-        "DERIVED: jax.experimental.pallas.tpu tpu_info (bf16 rate when int8=0)"
-    ),
-    "native_ocp_fp8": "FACT: jax.experimental.pallas.tpu tpu_info native OCP FP8",
     "ici_egress_bw_bytes_per_s": (
         "ASSUMED: Cloud TPU interconnect unidirectional ICI egress prior"
     ),
@@ -296,12 +228,6 @@ DEFAULT_SOURCES_PUBLIC: Mapping[str, str] = {
         "ASSUMED: [50.0, 200.0] Gbps/chip host DCN prior (12.5 GB/s)"
     ),
     "min_slice_cores": "FACT: minimum slice core count from Cloud TPU topology docs",
-    "supports_megacore": "FACT: Cloud TPU Megacore support flag per generation",
-    "matmul_row_tile_by_dtype": "FACT: matmul LHS unpadded row tile floor per dtype",
-    "vector_f32_ops_per_s": ("DERIVED: public 32-bit vector rate (bf16_flops / 128.0)"),
-    "scalar_mem_capacity_bytes": (
-        "FACT: jax.experimental.pallas.tpu tpu_info on-chip scalar memory"
-    ),
     "pcie_bw_bytes_per_s": ("ASSUMED: 32 GB/s nominal host-to-device PCIe bandwidth"),
     "torus_ndim": ("FACT: torus interconnect dimension from topology docs"),
     "vector_registers_per_core": (
