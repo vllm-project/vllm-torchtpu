@@ -20,6 +20,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels import pallas_util
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
     kernel,
@@ -44,13 +45,15 @@ def prepare_inputs(
     _, actual_num_kv_heads, actual_kv_head_dim = k.shape
     num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
 
-    q_packing = utils.get_dtype_packing(q_dtype)
-    kv_packing = utils.get_dtype_packing(kv_dtype)
+    q_packing = pallas_util.get_dtype_packing(q_dtype)
+    kv_packing = pallas_util.get_dtype_packing(kv_dtype)
 
-    aligned_num_q_heads_per_kv_head = utils.align_to(num_q_heads_per_kv_head, q_packing)
+    aligned_num_q_heads_per_kv_head = pallas_util.align_to(
+        num_q_heads_per_kv_head, q_packing
+    )
     num_lanes = pltpu.get_tpu_info().num_lanes
     num_sublanes = pltpu.get_tpu_info().num_sublanes
-    aligned_q_head_dim = utils.align_to(actual_q_head_dim, num_lanes)
+    aligned_q_head_dim = pallas_util.align_to(actual_q_head_dim, num_lanes)
 
     # Compute aligned kv head dimension, accounting for per-token scale if
     # present.
@@ -59,15 +62,15 @@ def prepare_inputs(
             scale_bits = jax.dtypes.itemsize_bits(k_scale.dtype)
             kv_bits = jax.dtypes.itemsize_bits(kv_dtype)
             num_scale_channels = max(1, scale_bits // kv_bits)
-            aligned_kv_head_dim = utils.align_to(
+            aligned_kv_head_dim = pallas_util.align_to(
                 actual_kv_head_dim + num_scale_channels, num_sublanes * kv_packing
             )
         else:
-            aligned_kv_head_dim = utils.align_to(
+            aligned_kv_head_dim = pallas_util.align_to(
                 actual_kv_head_dim, num_sublanes * kv_packing
             )
     else:
-        aligned_kv_head_dim = utils.align_to(actual_kv_head_dim, num_lanes)
+        aligned_kv_head_dim = pallas_util.align_to(actual_kv_head_dim, num_lanes)
 
     # queries: (T, H, D) -> (T, H_kv, G, D)
     o_hbm_alias_q_hbm = (
@@ -98,7 +101,7 @@ def prepare_inputs(
 
     # Pad keys and values head_dim
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
-    num_kv_heads_x2_aligned = utils.align_to(actual_num_kv_heads_x2, kv_packing)
+    num_kv_heads_x2_aligned = pallas_util.align_to(actual_num_kv_heads_x2, kv_packing)
 
     if k_scale is not None and v_scale is not None:
         k_scale = k_scale.reshape(total_q_tokens, actual_num_kv_heads)
@@ -126,7 +129,7 @@ def prepare_inputs(
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         num_lanes = pltpu.get_tpu_info().num_lanes
         align_tokens = max(num_lanes, page_size)
-        padded_total_tokens = utils.align_to(total_q_tokens, align_tokens)
+        padded_total_tokens = pallas_util.align_to(total_q_tokens, align_tokens)
         new_kv_hbm = (
             jnp.pad(
                 jnp.concatenate([k, v], axis=-1).reshape(
@@ -185,7 +188,7 @@ def get_kv_cache_shape(
 ):
     chip_info = pltpu.get_tpu_info_for_chip(chip_version, 1)
     num_lanes, num_sublanes = chip_info.num_lanes, chip_info.num_sublanes
-    kv_packing = utils.get_dtype_packing(kv_dtype)
+    kv_packing = pallas_util.get_dtype_packing(kv_dtype)
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         num_scale_channels = 0
         if use_per_token_scale:
@@ -197,16 +200,16 @@ def get_kv_cache_shape(
         return (
             total_num_pages,
             actual_num_kv_heads * 2,
-            utils.align_to(base_dim, num_sublanes * kv_packing) // kv_packing,
+            pallas_util.align_to(base_dim, num_sublanes * kv_packing) // kv_packing,
             kv_packing,
             page_size,
         )
     return (
         total_num_pages,
         page_size,
-        utils.align_to(actual_num_kv_heads * 2, kv_packing) // kv_packing,
+        pallas_util.align_to(actual_num_kv_heads * 2, kv_packing) // kv_packing,
         kv_packing,
-        utils.align_to(actual_head_dim, num_lanes),
+        pallas_util.align_to(actual_head_dim, num_lanes),
     )
 
 
@@ -236,8 +239,8 @@ def calculate_block_sizes(
     mxu_column_size = tpu_info.mxu_column_size
 
     # Calculate aligned model dimensions.
-    aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
-    aligned_num_q_heads_per_kv_head = utils.align_to(
+    aligned_head_dim = pallas_util.align_to(model_cfgs.head_dim, num_lanes)
+    aligned_num_q_heads_per_kv_head = pallas_util.align_to(
         model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q
     )
     aligned_num_q_heads = aligned_num_q_heads_per_kv_head * model_cfgs.num_kv_heads
@@ -246,7 +249,7 @@ def calculate_block_sizes(
         aligned_num_kv_heads_x2 = model_cfgs.num_kv_heads * 2
     else:
         bkv_stride = pl.cdiv(model_cfgs.num_kv_heads * 2, serve_cfgs.packing_kv)
-        if utils.has_bank_conflicts(bkv_stride):
+        if pallas_util.has_bank_conflicts(bkv_stride):
             bkv_stride += 1
         aligned_num_kv_heads_x2 = bkv_stride * serve_cfgs.packing_kv
 
@@ -265,9 +268,11 @@ def calculate_block_sizes(
     if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         num_scale_channels = serve_cfgs.scale_channels
         base_dim = physical_kv_head_dim + num_scale_channels
-        aligned_kv_head_dim_val = utils.align_to(base_dim, num_sublanes * packing_kv)
+        aligned_kv_head_dim_val = pallas_util.align_to(
+            base_dim, num_sublanes * packing_kv
+        )
     else:
-        aligned_kv_head_dim_val = utils.align_to(model_cfgs.head_dim, num_lanes)
+        aligned_kv_head_dim_val = pallas_util.align_to(model_cfgs.head_dim, num_lanes)
 
     def calculate_vmem_usage(batch_size: int, bq_sz: int, bkv_sz: int) -> int:
         """Given tile size, calculate VMEM usage of the kernel."""
@@ -383,7 +388,7 @@ def calculate_block_sizes(
         if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # SEQ-ALONG-LANE does not support intra-page DMA offset.
             # TODO(kyuyeunk): Reduce granularity to lane size.
-            bkv_default = utils.align_to(bkv_default, serve_cfgs.page_size)
+            bkv_default = pallas_util.align_to(bkv_default, serve_cfgs.page_size)
         bkv_sz = bkv_stride = bkv_default
         if fixed_bq_sz is None:
             bq_sz = bq_stride = bkv_sz
@@ -779,9 +784,9 @@ def ragged_paged_attention(
     lse_hbm_init: jax.Array | None = None
     if return_lse:
         num_lanes = pltpu.get_tpu_info().num_lanes
-        q_packing = utils.get_dtype_packing(queries.dtype)
+        q_packing = pallas_util.get_dtype_packing(queries.dtype)
         num_q_heads_per_kv_head = num_q_heads // num_kv_heads
-        aligned_num_q_heads_per_kv_head = utils.align_to(
+        aligned_num_q_heads_per_kv_head = pallas_util.align_to(
             num_q_heads_per_kv_head, q_packing
         )
         max_tokens = queries.shape[0]

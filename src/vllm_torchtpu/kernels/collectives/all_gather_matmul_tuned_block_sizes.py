@@ -13,7 +13,7 @@
 # limitations under the License.
 """All-gather matmul kernel's tuned block sizes."""
 
-import jax
+from vllm_torchtpu.kernels.pallas_util import get_tpu_version
 
 # key:
 #    - tpu_version
@@ -35,17 +35,6 @@ TUNED_BLOCK_SIZES = {
     (6, 8192, 51200, 5120, "bfloat16", 8): (1280, 5120),
     # keep-sorted end
 }
-
-
-def get_tpu_version() -> int:
-    """Returns the numeric version of the TPU, or -1 if not on TPU."""
-    kind = jax.devices()[0].device_kind
-    if "TPU" not in kind:
-        return -1
-    if kind.endswith(" lite"):
-        kind = kind[: -len(" lite")]
-    assert kind[:-1] == "TPU v", kind
-    return int(kind[-1])
 
 
 def get_key(

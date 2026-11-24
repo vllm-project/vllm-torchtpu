@@ -18,7 +18,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
+from vllm_torchtpu.kernels import pallas_util
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs
 
 
 def _stitch_decode_lane(
@@ -178,7 +179,7 @@ def stitch_new_kv_lane(
     """
     bkv_sz_cache = bkv_sz_frm_cache.astype(jnp.int32)
     new_tok_offset = new_kv_len_start.astype(jnp.int32) % cfgs.kv_token_align
-    cache_end = utils.align_to(bkv_sz_cache, cfgs.kv_token_align)
+    cache_end = pallas_util.pl_align_to(bkv_sz_cache, cfgs.kv_token_align)
 
     vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
 

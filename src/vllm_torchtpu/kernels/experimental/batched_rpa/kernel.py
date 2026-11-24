@@ -22,6 +22,7 @@ import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu.kernels import pallas_util
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     bref_override,
     configs,
@@ -52,14 +53,14 @@ def strided_load_bkv(
     kv_ref = pltpu.annotate(kv_ref, no_hazard_no_deps=True)
 
     if cfgs.serve.packing_kv == 1:
-        k = utils.strided_load(
+        k = pallas_util.strided_load(
             kv_ref,
             start,
             cfgs.bkv_sz * cfgs.bkv_stride,
             cfgs.bkv_stride,
             dtype=cfgs.serve.dtype_kv,
         )
-        v = utils.strided_load(
+        v = pallas_util.strided_load(
             kv_ref,
             start + 1,
             cfgs.bkv_sz * cfgs.bkv_stride,
@@ -70,7 +71,7 @@ def strided_load_bkv(
             v = jnp.where(valid_mask, v, jnp.zeros_like(v))
         return [(k, v)]
 
-    kv = utils.strided_load(
+    kv = pallas_util.strided_load(
         kv_ref, start, cfgs.bkv_sz * cfgs.bkv_stride, cfgs.bkv_stride
     )
     if valid_mask is not None:
@@ -94,7 +95,7 @@ def calculate_and_store_out(
     cfgs: configs.RpaConfigs,
 ):
     def _accum(b_idx: int | jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
-        batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
+        batch_l = pallas_util.broadcast_minor(batch_l, batch_acc.shape)
 
         if (
             cfgs.serve.dtype_out == jnp.float32
@@ -111,7 +112,7 @@ def calculate_and_store_out(
         pad_width[-1][-1] = cfgs.aligned_q_head_dim - cfgs.compute_kv_head_dim
         out = jnp.pad(out, pad_width, constant_values=0)
         out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
-        utils.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
+        pallas_util.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
 
     def _stage_lse(b_idx: int, batch_m: jax.Array, batch_l: jax.Array):
         assert lse_o_vref is not None
@@ -121,7 +122,7 @@ def calculate_and_store_out(
         lse_val = pltpu.bitcast(
             lse_val.astype(cfgs.serve.dtype_out), jnp.uint32
         ).reshape(lse_ref.shape)
-        utils.strided_store(lse_ref, 0, lse_ref.shape[0], 1, lse_val)
+        pallas_util.strided_store(lse_ref, 0, lse_ref.shape[0], 1, lse_val)
 
     if cfgs.fuse_accum:
         for b in range(cfgs.batch_size):
@@ -502,7 +503,7 @@ def rpa_body(
     # Step 2b: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
-    q_loaded = utils.strided_load(
+    q_loaded = pallas_util.strided_load(
         q_ref,
         0,
         cfgs.batch_size * cfgs.model.num_kv_heads * cfgs.bq_sz * q_p,
@@ -548,8 +549,8 @@ def rpa_body(
                 v_head_ref = v_slice.reshape(target_shape)
 
                 # Load as uint32 to avoid dtype conversion during strided load
-                k_head_u32 = utils.strided_load(k_head_ref, 0, pack_dim, 1)
-                v_head_u32 = utils.strided_load(v_head_ref, 0, pack_dim, 1)
+                k_head_u32 = pallas_util.strided_load(k_head_ref, 0, pack_dim, 1)
+                v_head_u32 = pallas_util.strided_load(v_head_ref, 0, pack_dim, 1)
                 if valid is not None:
                     # HND packs channels of one token together. Mask the words
                     # before unpacking, including any co-located V scale channels.
@@ -956,7 +957,7 @@ def rpa_kernel(
                     if jax.typeof(h).memory_space == pltpu.HBM:
                         element_size = s.shape[0] // cfgs.max_steps_ub
                         read_size = element_size * (num_steps + prefix_steps)
-                        read_size = utils.align_to(read_size, 1024)
+                        read_size = pallas_util.pl_align_to(read_size, 1024)
                         read_size = jnp.minimum(read_size, s.shape[0])
 
                         src_off = element_size * aligned_start_step

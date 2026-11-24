@@ -21,7 +21,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import utils
+from vllm_torchtpu.kernels import pallas_util
 
 
 @dataclasses.dataclass(frozen=True)
@@ -201,11 +201,11 @@ class ServingConfigs:
 
     @property
     def packing_q(self) -> int:
-        return utils.get_dtype_packing(self.dtype_q)
+        return pallas_util.get_dtype_packing(self.dtype_q)
 
     @property
     def packing_kv(self) -> int:
-        return utils.get_dtype_packing(self.dtype_kv)
+        return pallas_util.get_dtype_packing(self.dtype_kv)
 
     @property
     def scale_channels(self) -> int:
@@ -318,7 +318,7 @@ class RpaConfigs:
         when the window itself is not."""
         num_lanes = pltpu.get_tpu_info().num_lanes
         entries = self.page_window_entries
-        return utils.align_to(entries, num_lanes) + (
+        return pallas_util.align_to(entries, num_lanes) + (
             num_lanes if entries % num_lanes else 0
         )
 
@@ -344,24 +344,24 @@ class RpaConfigs:
     def bkv_stride(self) -> int:
         bkv_stride = pl.cdiv(self.model.num_kv_heads * 2, self.serve.packing_kv)
 
-        if utils.has_bank_conflicts(bkv_stride):
+        if pallas_util.has_bank_conflicts(bkv_stride):
             bkv_stride += 1
         return bkv_stride
 
     @property
     def aligned_q_head_dim(self) -> int:
         num_lanes = pltpu.get_tpu_info().num_lanes
-        return utils.align_to(self.model.head_dim, num_lanes)
+        return pallas_util.align_to(self.model.head_dim, num_lanes)
 
     # Actual head dimension used for compute, does not include scale factors.
     @property
     def compute_kv_head_dim(self) -> int:
         num_lanes = pltpu.get_tpu_info().num_lanes
         num_sublanes = pltpu.get_tpu_info().num_sublanes
-        kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
+        kv_packing = pallas_util.get_dtype_packing(self.serve.dtype_kv)
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            return utils.align_to(self.model.head_dim, num_sublanes * kv_packing)
-        return utils.align_to(self.model.head_dim, num_lanes)
+            return pallas_util.align_to(self.model.head_dim, num_sublanes * kv_packing)
+        return pallas_util.align_to(self.model.head_dim, num_lanes)
 
     # Head dimension used for storing kv in VMEM, includes scale factors if
     # per_token_scale is enabled.
@@ -369,7 +369,7 @@ class RpaConfigs:
     def aligned_kv_head_dim(self) -> int:
         num_lanes = pltpu.get_tpu_info().num_lanes
         num_sublanes = pltpu.get_tpu_info().num_sublanes
-        kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
+        kv_packing = pallas_util.get_dtype_packing(self.serve.dtype_kv)
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             total_head_dim = self.model.head_dim
@@ -380,28 +380,30 @@ class RpaConfigs:
             # scale is not enabled, self.serve.scale_channels is 0.
             total_head_dim += self.serve.scale_channels
 
-            return utils.align_to(total_head_dim, num_sublanes * kv_packing)
+            return pallas_util.align_to(total_head_dim, num_sublanes * kv_packing)
 
-        return utils.align_to(self.model.head_dim, num_lanes)
+        return pallas_util.align_to(self.model.head_dim, num_lanes)
 
     @property
     def aligned_num_kv_heads_x2(self) -> int:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.model.num_kv_heads * 2
         packing_kv = self.serve.packing_kv
-        return utils.align_to(self.model.num_kv_heads * 2, packing_kv)
+        return pallas_util.align_to(self.model.num_kv_heads * 2, packing_kv)
 
     @property
     def aligned_num_q_heads_per_kv_head(self) -> int:
         packing_q = self.serve.packing_q
-        return utils.align_to(self.model.num_q_heads_per_kv_head, packing_q)
+        return pallas_util.align_to(self.model.num_q_heads_per_kv_head, packing_q)
 
     @property
     def kv_hbm_stride(self) -> int:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.model.num_kv_heads * 2
-        kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
-        return utils.align_to(self.model.num_kv_heads * 2, kv_packing) // kv_packing
+        kv_packing = pallas_util.get_dtype_packing(self.serve.dtype_kv)
+        return (
+            pallas_util.align_to(self.model.num_kv_heads * 2, kv_packing) // kv_packing
+        )
 
     @property
     def fuse_accum(self) -> bool:
@@ -414,31 +416,31 @@ class RpaConfigs:
         else:
             num_elements = self.aligned_num_kv_heads_x2 * self.aligned_kv_head_dim
         # Calculate byte size using bits to account for subbyte dtypes like fp4.
-        kv_dtype_bytes = utils.get_dtype_bits(self.serve.dtype_kv)
-        return int(num_elements * kv_dtype_bytes) >> 3  # 8 bits per byte
+        kv_dtype_bits = pallas_util.get_dtype_bitwidth(self.serve.dtype_kv)
+        return int(num_elements * kv_dtype_bits) >> 3  # 8 bits per byte
 
     @property
     def q_bytes_per_token(self) -> int:
-        q_dtype_bytes = utils.get_dtype_bits(self.serve.dtype_q)
+        q_dtype_bits = pallas_util.get_dtype_bitwidth(self.serve.dtype_q)
         return (
             int(
                 self.model.num_kv_heads
                 * self.aligned_num_q_heads_per_kv_head
                 * self.aligned_q_head_dim
-                * q_dtype_bytes
+                * q_dtype_bits
             )
             >> 3
         )
 
     @property
     def o_bytes_per_token(self) -> int:
-        out_dtype_bytes = utils.get_dtype_bits(self.serve.dtype_out)
+        out_dtype_bits = pallas_util.get_dtype_bitwidth(self.serve.dtype_out)
         return (
             int(
                 self.model.num_kv_heads
                 * self.aligned_num_q_heads_per_kv_head
                 * self.aligned_q_head_dim
-                * out_dtype_bytes
+                * out_dtype_bits
             )
             >> 3
         )
