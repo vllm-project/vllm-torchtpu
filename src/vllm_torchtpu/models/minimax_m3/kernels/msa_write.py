@@ -210,8 +210,8 @@ def _kernel(
                 words = jnp.where(take, merged, words)
             if spec.scale_lane is not None:  # last word row: one scale per slot (lane)
                 bits = by_slot[spec.scale_lane : spec.scale_lane + 1]
-                if width > _LANES:
-                    bits = jnp.pad(bits, ((0, 0), (0, width - _LANES)))
+                if width > bits.shape[1]:  # wide rows, or pages of < 128 slots
+                    bits = jnp.pad(bits, ((0, 0), (0, width - bits.shape[1])))
                 lane = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
                 take = (row == rows - 1) & (lane >= lo) & (lane < hi)
                 words = jnp.where(take, bits[:, :width], words)
@@ -349,7 +349,11 @@ def write_runs(
             raise ValueError("write_runs targets must share their page size")
         page_size = size
     has_lanes = lane_values is not None or bool(scale_lanes)
-    if has_lanes and page_size != _LANES:
+    # Folded scales fill a page's first S lanes, so S <= 128 slots will do
+    # (an index page of one DCP lane's share, TPU_MINIMAX_M3_DCP_INDEX_DEDUP).
+    if (lane_values is not None and page_size != _LANES) or (
+        scale_lanes and page_size > _LANES
+    ):
         raise ValueError(f"per-slot values need {_LANES}-slot pages, got {page_size}")
     window = _window(page_size)
     padded = max(-(-num_tokens // _ROW_ALIGN) * _ROW_ALIGN, window)

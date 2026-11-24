@@ -302,6 +302,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_MAX_FREE: bool = False
     TPU_MINIMAX_M3_MSA_MXU_MASK: bool = False
     TPU_MINIMAX_M3_KV4_SHARED_SCALES: bool = False
+    TPU_MINIMAX_M3_DCP_INDEX_DEDUP: bool = False
 
 
 def env_with_choices(
@@ -2004,6 +2005,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # same page DMA, other rows): bitwise. Default off.
     "TPU_MINIMAX_M3_KV4_SHARED_SCALES": env_bool(
         "TPU_MINIMAX_M3_KV4_SHARED_SCALES", default=False
+    ),
+    # MiniMax M3, DCP narrower than TP with 4-bit caches: store the MSA
+    # index-key cache once per TP group instead of once per DCP group. Each
+    # of the tp / dcp DCP lanes keeps 1 / lanes of every block's tokens and
+    # scores every lane's index heads on them; per-head candidates swap over
+    # the lane group (`msa_dcp.merge_lane_candidates`). Same selection, bit
+    # for bit; -32 B (DCP 4) / -48 B (DCP 2) per rank-token per layer.
+    "TPU_MINIMAX_M3_DCP_INDEX_DEDUP": env_bool(
+        "TPU_MINIMAX_M3_DCP_INDEX_DEDUP", default=False
     ),
 }
 

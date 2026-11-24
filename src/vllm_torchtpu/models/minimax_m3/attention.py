@@ -103,10 +103,18 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # MLAAttentionSpec budgets one row of row_width per token; a shard
         # stores 1 / token_shards of the rows, budgeted as a narrower row.
-        # A 4-bit (uint8) row takes row_width / 2 bytes.
-        width = self.row_width // 2 if self.dtype == torch.uint8 else self.row_width
-        if self.scales_in_page:  # + one f32 scale per token
-            width += 4
+        if self.dtype == torch.uint8:
+            # 4-bit: the exact page bytes of `kv_cache_shape` (row_width / 2
+            # per token, + 4 for folded scales; a shard page keeps a whole
+            # 128-lane scale row) over the block's tokens.
+            rows = self.block_size // self.token_shards // 8 + self.scales_in_page
+            return MLAAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=rows * 4 * self.row_width // self.block_size,
+                dtype=self.dtype,
+            )
+        width = self.row_width
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
@@ -119,9 +127,10 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
         if self.dtype == torch.uint8:
             # 4-bit: 8 tokens per 32-bit word of 4 bytes (`kernels.msa_fp4`),
             # plus the scale row when the page carries its scales.
-            if self.scales_in_page and self.row_width != tokens:
+            if self.scales_in_page and self.row_width < tokens:
                 raise NotImplementedError(
-                    f"folded scales need a {tokens}-wide row, got {self.row_width}"
+                    f"folded scales need a row of at least {tokens} lanes, got "
+                    f"{self.row_width}"
                 )
             return (num_blocks, tokens // 8 + self.scales_in_page, 4, self.row_width)
         if self.token_shards == 1:
@@ -339,11 +348,14 @@ class MiniMaxM3SparseAttention(nn.Module):
         self.kv_cache = MiniMaxM3Cache(
             2 * self.head_dim * self.dcp_kv_heads, dtype, prefix=f"{prefix}.attn"
         )
+        # DCP lanes sharing this rank's blocks' index keys, each keeping a
+        # 1 / lanes share of them (TPU_MINIMAX_M3_DCP_INDEX_DEDUP).
+        self.index_lanes = self._index_lanes(tp_size, dtype)
         self.index_cache = MiniMaxM3Cache(
             self.index_head_dim,
             dtype,
             prefix=f"{prefix}.attn.index_cache",
-            token_shards=self.index_shards,
+            token_shards=self.index_shards * self.index_lanes,
             # One DMA per page in the indexer instead of a page plus a scale page.
             scales_in_page=True,
         )
@@ -414,6 +426,8 @@ class MiniMaxM3SparseAttention(nn.Module):
             reuse_kwargs = {"index_reuse": True} if plan is not None else {}
             if self.scale_row0:
                 reuse_kwargs["scale_row0"] = self.scale_row0
+            if self.index_lanes > 1:
+                reuse_kwargs["index_lanes"] = self.index_lanes
             self.msa_op = get_msa_dcp_op(
                 *msa_config,
                 self.dcp_size,
@@ -431,6 +445,17 @@ class MiniMaxM3SparseAttention(nn.Module):
                 _dcp_rank_tensor(get_dcp_rank(), str(torch.get_default_device())),
                 persistent=False,
             )
+            if self.index_lanes > 1:
+                from vllm_torchtpu.distributed.dcp import get_dcp_lane_group
+
+                self.register_buffer(
+                    "index_lane",
+                    _dcp_rank_tensor(
+                        int(get_dcp_lane_group().rank_in_group),
+                        str(torch.get_default_device()),
+                    ),
+                    persistent=False,
+                )
             if self.fp4:  # each rank rotates its own query heads (get_msa_dcp_op)
                 self.register_buffer(
                     "hadamard",
@@ -454,6 +479,36 @@ class MiniMaxM3SparseAttention(nn.Module):
             eps,
             self.q_head_major,
         )
+
+    def _index_lanes(self, tp_size: int, dtype: torch.dtype) -> int:
+        """``tp / dcp`` with TPU_MINIMAX_M3_DCP_INDEX_DEDUP under DCP with
+        4-bit caches (`msa_dcp.index_lane_layout`), else 1."""
+        if not envs.TPU_MINIMAX_M3_DCP_INDEX_DEDUP:
+            return 1
+        lanes = tp_size // self.dcp_size if self.dcp_size > 1 else 1
+        block_size = get_current_vllm_config().cache_config.block_size
+        reason = None
+        if lanes == 1:
+            reason = "needs --decode-context-parallel-size between 1 and TP"
+        elif dtype != torch.uint8:
+            reason = "needs --kv-cache-dtype int4_per_token_head"
+        elif block_size % (16 * lanes):
+            # A lane's 4-bit page: an even number of 8-token word rows.
+            reason = f"needs block size {block_size} to be a multiple of {16 * lanes}"
+        if reason is not None:
+            logger.warning_once(
+                "TPU_MINIMAX_M3_DCP_INDEX_DEDUP %s; the index cache stays whole "
+                "per DCP group.",
+                reason,
+            )
+            return 1
+        logger.info_once(
+            "MiniMax M3 MSA index cache: once per TP group, %d DCP lanes of "
+            "%d tokens per block (TPU_MINIMAX_M3_DCP_INDEX_DEDUP).",
+            lanes,
+            block_size // lanes,
+        )
+        return lanes
 
     def _scale_page_share(self, layer_id: int | None) -> int:
         """Layers per scale page: `msa_fp4.layers_per_scale_page` with
@@ -540,6 +595,8 @@ class MiniMaxM3SparseAttention(nn.Module):
                 # Every rank scores all index heads on its share of the keys.
                 index_q = get_tp_group().all_gather(index_q.contiguous(), dim=1)
             extra = {"dcp_rank": self.dcp_rank} if self.dcp_size > 1 else {}
+            if self.index_lanes > 1:
+                extra["index_lane"] = self.index_lane
             if self.scale_cache is not None:
                 extra["scale_cache"] = self.scale_cache.kv_cache
                 if self.dcp_size > 1:

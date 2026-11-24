@@ -166,7 +166,15 @@ def _folded_keys(words: jax.Array) -> tuple[jax.Array, jax.Array]:
     ``[S / 8 + 1, D]`` words -> (unscaled bf16 keys ``[S, D]``, the per-slot
     scales of the last word row as a ``[1, S]`` f32 lane vector)."""
     keys = pltpu.bitcast(words[:-1], jnp.int4).astype(jnp.bfloat16)
-    return keys, pltpu.bitcast(words[-1:], jnp.float32)
+    return keys, _slot_scales(words[-1:], keys.shape[0])
+
+
+def _slot_scales(row: jax.Array, page_size: int) -> jax.Array:
+    """A folded page's last word row -> its ``[1, S]`` f32 slot scales. A
+    page of fewer slots than lanes (an index page of one DCP lane's share,
+    TPU_MINIMAX_M3_DCP_INDEX_DEDUP) uses the row's first ``S`` lanes."""
+    scales = pltpu.bitcast(row, jnp.float32)
+    return scales if scales.shape[-1] == page_size else scales[:, :page_size]
 
 
 def _scale_rows_to_column(rows: list[jax.Array]) -> jax.Array:
@@ -453,7 +461,9 @@ def _chunk_maxima_t(
             # partner is not.
             pair.append(_transposed_keys(buf, p, live, dtype, folded, side == 1))
             if folded:
-                s = pltpu.bitcast(buf[p, rows - 1 :], jnp.float32)  # [1, S]
+                s = _slot_scales(
+                    buf[p, rows - 1 :], (rows - 1) * msa_fp4.TOKENS_PER_WORD
+                )  # [1, S]
                 # Stale VMEM past the request's end, unwritten slots: scale 0.
                 scale_rows[side].append(jnp.where(jnp.isfinite(s) & (p < live), s, 0.0))
         keys.append(jnp.concatenate(pair, axis=1))
@@ -510,7 +520,9 @@ def _chunk_maxima_t4(q_quad, buf, first, chunk, live, issue) -> jax.Array:
             parts.append(
                 pltpu.bitcast(buf[p, : rows - 1], jnp.int4).astype(jnp.float8_e4m3fn)
             )
-            s = pltpu.bitcast(buf[p, rows - 1 :], jnp.float32)  # [1, S]
+            s = _slot_scales(
+                buf[p, rows - 1 :], (rows - 1) * msa_fp4.TOKENS_PER_WORD
+            )  # [1, S]
             scale_rows[side].append(jnp.where(jnp.isfinite(s) & (p < live), s, 0.0))
         keys.append(jnp.concatenate(parts, axis=1))
     page_size = keys[0].shape[0]
@@ -779,7 +791,7 @@ def _kernel_v3(
             # get scale 0.
             scale_rows = jnp.concatenate(
                 [
-                    pltpu.bitcast(buf[slot, first + j, rows - 1 :], jnp.float32)
+                    _slot_scales(buf[slot, first + j, rows - 1 :], page_size)
                     for j in range(chunk)
                 ],
                 axis=0,
@@ -896,6 +908,7 @@ def _kernel_v3(
         counts = list(range(1, num_chunks + 1))
     live_chunks = jnp.minimum(-(-live // chunk), num_chunks)
     next_is_full = next_live >= pages_per_step
+
     for slot in range(slots):
         for i, n in enumerate(counts):
             lo = counts[i - 1] if i else 0
@@ -908,7 +921,6 @@ def _kernel_v3(
                 functools.partial(body, slot, n)
             )
     if defer:
-
         pl.when(step == num_steps - 1)(flush_pending)
 
 

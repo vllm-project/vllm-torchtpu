@@ -125,6 +125,45 @@ def get_dcp_kv_head_group(head_ranks: int) -> Any | None:
     return _KV_HEAD_GROUPS[head_ranks]
 
 
+_LANE_GROUP: list[Any] = []
+
+
+def get_dcp_lane_group() -> Any:
+    """The ranks of this rank's TP group at its DCP position in each of the
+    group's DCP groups (TP ranks ``r, r + dcp, r + 2 * dcp, ...``; rank in
+    group = lane index), e.g. the MSA index lanes of
+    TPU_MINIMAX_M3_DCP_INDEX_DEDUP. Built once and collectively: every rank
+    must first call this at the same point."""
+    if not _LANE_GROUP:
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import (
+            get_tp_group,
+            get_world_group,
+            init_model_parallel_group,
+        )
+
+        group = get_dcp_group()
+        assert group is not None, "DCP group is not initialized"
+        dcp = int(group.world_size)
+        _validate_dcp_rank_alignment(group, dcp)
+        tp = int(get_tp_group().world_size)
+        world = get_world_group()
+        size = int(world.world_size)
+        _LANE_GROUP.append(
+            init_model_parallel_group(
+                [
+                    list(range(base + r, base + tp, dcp))
+                    for base in range(0, size, tp)
+                    for r in range(dcp)
+                ],
+                world.local_rank,
+                dist.get_backend(world.device_group),
+                group_name="dcp_lane",
+            )
+        )
+    return _LANE_GROUP[0]
+
+
 def _single_device_dcp_mesh(axis_names: tuple[str, str]) -> Any:
     """The mesh before distributed init: one device, both axes length 1."""
     import jax

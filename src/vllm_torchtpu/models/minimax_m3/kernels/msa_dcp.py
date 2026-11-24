@@ -695,6 +695,160 @@ def _write_tokens(
     return kv_cache, index_cache, None
 
 
+def index_lane_layout(
+    block_size: int, rank: int | jax.Array, dcp: int, lanes: int, lane: int | jax.Array
+) -> tuple[int, jax.Array, int]:
+    """``(block_size, rank, dcp)`` of the index cache of DCP lane `lane` of
+    ``lanes`` (TPU_MINIMAX_M3_DCP_INDEX_DEDUP).
+
+    TP ranks ``lane * dcp + rank`` (one per DCP group, ``lanes = tp / dcp``)
+    hold the same blocks of the one shared index-key head. Splitting each
+    block into ``lanes`` sub-blocks of ``block_size / lanes`` tokens, lane
+    ``l`` of DCP rank ``r`` keeping sub-block ``l``, is the DCP layout of
+    sub-blocks over ``dcp * lanes`` ranks: sub-block ``s = b * lanes + l``
+    sits on rank ``s % (dcp * lanes) = r * lanes + l`` in page
+    ``block_tables[s // (dcp * lanes)] = block_tables[b // dcp]``, the page
+    of its block. So the index cache stores each key once per TP group, and
+    a block's score is the max of its sub-blocks' (exact).
+    """
+    if block_size % lanes:
+        raise ValueError(f"block size {block_size} is not a multiple of {lanes} lanes")
+    return (
+        block_size // lanes,
+        rank_array(rank)[0] * lanes + rank_array(lane)[0],
+        (dcp * lanes),
+    )
+
+
+def _write_tokens_lanes(
+    k: jax.Array,
+    v: jax.Array,
+    index_k: jax.Array,
+    kv_cache: jax.Array,
+    index_cache: jax.Array,
+    scale_cache: jax.Array | None,
+    pages: jax.Array,
+    block_tables_2d: jax.Array,
+    seq_id: jax.Array,
+    pos: jax.Array,
+    valid: jax.Array,
+    *,
+    rank: jax.Array,
+    dcp: int,
+    lanes: int,
+    lane: int | jax.Array,
+    max_num_seqs: int,
+    interpret: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+    """`_write_tokens` with the index keys at their lane's sub-block pages
+    (`index_lane_layout`): K/V (and their scales) as without lanes, the
+    index keys (the same rows and folded scales) in a second write."""
+    sub_block, sub_rank, sub_dcp = index_lane_layout(
+        msa.page_size(kv_cache), rank, dcp, lanes, lane
+    )
+    if msa.page_size(index_cache) != sub_block:
+        raise ValueError(
+            f"index pages of {msa.page_size(index_cache)} tokens, expected "
+            f"{sub_block} ({lanes} lanes)"
+        )
+    index_pages = owner_pages(
+        block_tables_2d,
+        seq_id,
+        pos,
+        valid,
+        block_size=sub_block,
+        rank=sub_rank,
+        dcp=sub_dcp,
+    )
+    if scale_cache is not None:
+        num_tokens = k.shape[0]
+        scale_pages, row0 = msa_fp4.split_scales(scale_cache)
+        k_nib, k_scale = msa_fp4.quantize(msa_fp4.rotate_keys(k))
+        v_nib, v_scale = msa_fp4.quantize(msa_fp4.rotate_keys(v))
+        i_nib, i_scale = msa_fp4.quantize(msa_fp4.rotate_keys(index_k))
+        kv_rows = jnp.concatenate([k_nib, v_nib], axis=-1).reshape(num_tokens, -1)
+        scales = jnp.stack([k_scale, v_scale], axis=-1).reshape(num_tokens, -1)
+        kv_cache, scale_pages = msa.write_caches(
+            [
+                msa_write.Rows(kv_cache, kv_rows, 4),
+                msa_write.SlotValues(scale_pages, scales, row0),
+            ],
+            pages,
+            pos,
+            max_num_seqs=max_num_seqs,
+            interpret=interpret,
+        )
+        (index_cache,) = msa.write_caches(
+            [msa_write.Rows(index_cache, i_nib, 4, i_scale)],
+            index_pages,
+            pos,
+            max_num_seqs=max_num_seqs,
+            interpret=interpret,
+        )
+        return kv_cache, index_cache, msa_fp4.with_row0(scale_pages, row0)
+    kv_rows = jnp.concatenate([k, v], axis=-1).reshape(k.shape[0], -1)
+    (kv_cache,) = msa.write_caches(
+        [msa_write.Rows(kv_cache, kv_rows)],
+        pages,
+        pos,
+        max_num_seqs=max_num_seqs,
+        interpret=interpret,
+    )
+    (index_cache,) = msa.write_caches(
+        [msa_write.Rows(index_cache, index_k)],
+        index_pages,
+        pos,
+        max_num_seqs=max_num_seqs,
+        interpret=interpret,
+    )
+    return kv_cache, index_cache, None
+
+
+def merge_lane_candidates(candidates: jax.Array, topk: int) -> jax.Array:
+    """One rank's candidates ``[T, G * 2 * topk]`` (`pack_candidates` per
+    head, head-major) from its ``lanes`` index lanes' candidates of the same
+    heads, ``[lanes, T, G * 2 * topk]`` (TPU_MINIMAX_M3_DCP_INDEX_DEDUP).
+
+    Lane ``l`` scored sub-block ``l`` of every block (`index_lane_layout`),
+    so its candidate scores are partial maxima ``s_l(b)`` and a block's score
+    is ``S(b) = max_l s_l(b)``. A block of the top-k under ``S`` (score
+    descending, ties to the lower block) is in the top-k of a lane ``l``
+    where ``S(b) = s_l(b)``: any block ahead of it there is ahead of it
+    under ``S``. Its largest listed partial is then ``S(b)``, and a block
+    outside that top-k lists at most its own ``S``, so it cannot pass one
+    inside. Deduplicating by block, keeping the largest score, and taking
+    the top-k is thus exactly `local_candidates` over whole-block scores,
+    including the order, forced scores and ``(-inf, -1)`` padding."""
+    lanes, num_tokens, width = candidates.shape
+    num_heads = width // (2 * topk)
+    c = candidates.reshape(lanes, num_tokens, num_heads, 2, topk)
+    # [T, G, lanes * topk] per field.
+    s = c[:, :, :, 0].transpose(1, 2, 0, 3).reshape(num_tokens, num_heads, -1)
+    b = c[:, :, :, 1].transpose(1, 2, 0, 3).reshape(num_tokens, num_heads, -1)
+    b = b.astype(jnp.int32)
+    n = s.shape[-1]
+    real = s > _NEG_INF
+    s_i, b_i = s[..., :, None], b[..., :, None]
+    s_j, b_j = s[..., None, :], b[..., None, :]
+    same = real[..., None, :] & (b_j == b_i)
+    best = jnp.max(jnp.where(same, s_j, _NEG_INF), axis=-1)  # S(b) of each entry
+    idx = jnp.arange(n, dtype=jnp.int32)
+    earlier = same & (idx[None, :] < idx[:, None])
+    keep = real & ~jnp.any(earlier, axis=-1)
+    m_i, m_j = best[..., :, None], best[..., None, :]
+    ahead = keep[..., None, :] & ((m_j > m_i) | ((m_j == m_i) & (b_j < b_i)))
+    place = jnp.where(keep, jnp.sum(ahead, axis=-1, dtype=jnp.int32), topk)
+    slot = jnp.arange(topk, dtype=jnp.int32)
+    hit = place[..., :, None] == slot  # [T, G, n, topk]
+    found = jnp.any(hit, axis=-2)
+    out_s = jnp.where(
+        found, jnp.max(jnp.where(hit, best[..., :, None], _NEG_INF), axis=-2), _NEG_INF
+    )
+    out_b = jnp.where(found, jnp.max(jnp.where(hit, b[..., :, None], -1), axis=-2), -1)
+    packed = jnp.concatenate([out_s, out_b.astype(jnp.float32)], axis=-1)
+    return packed.reshape(num_tokens, width)
+
+
 def msa_write_dcp(
     k: jax.Array,
     v: jax.Array,
@@ -765,9 +919,18 @@ def msa_write_and_candidates_dcp(
     dcp: int,
     scale_cache: jax.Array | None = None,
     interpret: bool = False,
+    lanes: int = 1,
+    lane: int | jax.Array = 0,
 ) -> tuple[jax.Array, ...]:
     """First half of the DCP forward: write this rank's tokens, score its
     blocks and pick its candidates.
+
+    With ``lanes > 1`` (TPU_MINIMAX_M3_DCP_INDEX_DEDUP, `index_lane_layout`)
+    the index cache holds lane `lane`'s ``1 / lanes`` share of each of this
+    rank's blocks, ``index_q [T, lanes * G, D]`` holds the index heads of
+    every lane, and the candidates are this share's, per head of every lane:
+    `merge_lane_candidates` of the lanes' candidates of a head is that
+    head's candidates over whole blocks, bit for bit.
 
     With 4-bit caches (`msa_fp4`, one KV head per rank) pass `scale_cache`;
     it is returned updated after `index_cache`.
@@ -780,7 +943,13 @@ def msa_write_and_candidates_dcp(
     index_cache, candidates [T, G * 2 * topk] f32)``: `pack_candidates` per
     head, head-major.
     """
-    num_tokens, num_heads, _ = k.shape
+    num_tokens, kv_heads, _ = k.shape
+    num_heads = index_q.shape[1]
+    if num_heads != lanes * kv_heads:
+        raise ValueError(
+            f"{lanes} index lanes of {kv_heads} KV heads need {lanes * kv_heads} "
+            f"index heads, got {num_heads}."
+        )
     rank = rank_array(rank)[0]
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
@@ -796,22 +965,47 @@ def msa_write_and_candidates_dcp(
         dcp=dcp,
     )
     fp4 = scale_cache is not None
-    scale_row = msa_fp4.index_scale_row(num_heads) if fp4 else None
-    kv_cache, index_cache, scale_cache = _write_tokens(
-        k,
-        v,
-        index_k,
-        kv_cache,
-        index_cache,
-        scale_cache,
-        pages,
-        pos,
-        max_num_seqs=max_num_seqs,
-        interpret=interpret,
-    )
+    scale_row = msa_fp4.index_scale_row(kv_heads) if fp4 else None
+    if lanes == 1:
+        kv_cache, index_cache, scale_cache = _write_tokens(
+            k,
+            v,
+            index_k,
+            kv_cache,
+            index_cache,
+            scale_cache,
+            pages,
+            pos,
+            max_num_seqs=max_num_seqs,
+            interpret=interpret,
+        )
+    else:
+        kv_cache, index_cache, scale_cache = _write_tokens_lanes(
+            k,
+            v,
+            index_k,
+            kv_cache,
+            index_cache,
+            scale_cache,
+            pages,
+            block_tables_2d,
+            seq_id,
+            pos,
+            valid,
+            rank=rank,
+            dcp=dcp,
+            lanes=lanes,
+            lane=lane,
+            max_num_seqs=max_num_seqs,
+            interpret=interpret,
+        )
     if fp4:
         index_q = msa_fp4.rotate_queries(index_q)
-    local_lens = local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp)
+    # This rank's block count, in index pages: a lane's page holds
+    # block_size / lanes tokens, so the length scales down with it.
+    local_lens = (
+        local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp) // lanes
+    )
     candidates = functools.partial(
         local_candidates,
         block_size=block_size,
@@ -822,7 +1016,8 @@ def msa_write_and_candidates_dcp(
         dcp=dcp,
         interpret=interpret,
     )
-    if msa_indexer.is_prefill_step(num_heads * num_tokens, max_num_seqs):
+    # The step's class as without lanes (`kv_heads` index heads per lane).
+    if msa_indexer.is_prefill_step(kv_heads * num_tokens, max_num_seqs):
         packed = _class_candidates(
             index_q,
             index_cache,

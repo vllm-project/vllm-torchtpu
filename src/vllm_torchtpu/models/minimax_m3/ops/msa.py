@@ -600,9 +600,18 @@ def get_msa_dcp_op(
     decode_rows: int = 1,
     index_reuse: bool = False,
     scale_row0: int = 0,
+    index_lanes: int = 1,
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_op` for a KV head's context split over ``dcp`` ranks
     (`kernels.msa_dcp`).
+
+    ``index_lanes > 1`` (4-bit caches; TPU_MINIMAX_M3_DCP_INDEX_DEDUP): the
+    index cache holds this rank's DCP lane's share of each block
+    (`msa_dcp.index_lane_layout`); the op then also takes ``index_lane``
+    (an ``int32[1]`` buffer, like ``dcp_rank``), gathers every lane's index
+    queries, and swaps per-head candidates with the other lanes
+    (`msa_dcp.merge_lane_candidates`): the same selection, the index keys
+    stored once per TP group.
 
     With ``index_reuse`` (`models.minimax_m3.index_reuse`) the op also
     takes ``index_reuse`` (a dict shared by a decode step's layers) and
@@ -659,9 +668,14 @@ def get_msa_dcp_op(
             decode_rows,
             index_reuse,
             scale_row0,
+            **({"index_lanes": index_lanes} if index_lanes > 1 else {}),
         )
     if scale_row0:
         raise ValueError("shared scale pages need 4-bit caches")
+    if index_lanes > 1:
+        raise ValueError(
+            "index lanes (TPU_MINIMAX_M3_DCP_INDEX_DEDUP) need 4-bit caches"
+        )
 
     def _score_jax(
         k: jax.Array,
@@ -1031,10 +1045,11 @@ def _get_msa_dcp_fp4_op(
     decode_rows: int,
     index_reuse: bool = False,
     scale_row0: int = 0,
+    index_lanes: int = 1,
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_dcp_op` for 4-bit caches."""
     kv_heads = max(1, dcp // kv_head_replicas)
-    from vllm_torchtpu.distributed.dcp import get_dcp_group
+    from vllm_torchtpu.distributed.dcp import get_dcp_group, get_dcp_lane_group
 
     def _score_jax(
         k: jax.Array,
@@ -1051,6 +1066,38 @@ def _get_msa_dcp_fp4_op(
         dcp_rank: jax.Array,
         q: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+        return _score_impl(
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            scale_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            dcp_rank,
+            q,
+        )
+
+    def _score_impl(
+        k,
+        v,
+        index_q,
+        index_k,
+        kv_cache,
+        index_cache,
+        scale_cache,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        dcp_rank,
+        q,
+        **lanes: Any,
+    ):
         # This rank's queries are rotated here, a 1 / DCP share of the
         # group's heads: inside a JAX op the rotation leaves the rope
         # fusions that produce q alone (a torch matmul on q re-laid them
@@ -1073,6 +1120,7 @@ def _get_msa_dcp_fp4_op(
                 rank=dcp_rank,
                 dcp=dcp,
                 scale_cache=msa_fp4.with_row0(scale_cache, scale_row0),
+                **lanes,
             )
         )
         return (
@@ -1145,6 +1193,8 @@ def _get_msa_dcp_fp4_op(
     ).replace(".", "p")
     if scale_row0:  # one op set per row of a shared scale page
         suffix += f"_sr{scale_row0}"
+    if index_lanes > 1:  # an op set of its own (TPU_MINIMAX_M3_DCP_INDEX_DEDUP)
+        suffix += f"_il{index_lanes}"
     early = msa_dcp_heads.early_q_gather_enabled()
     attend_rot_op = None
     if early and kv_heads == 1:
@@ -1187,6 +1237,11 @@ def _get_msa_dcp_fp4_op(
         )
 
     score_op.register_fake(_score_fake)
+    lanes_score_op = lane_merge_op = None
+    if index_lanes > 1:
+        lanes_score_op, lane_merge_op = _index_lane_ops(
+            _score_impl, topk, index_lanes, suffix
+        )
     attend_merge_op = (
         _get_msa_dcp_attend_merge_op(
             sm_scale, topk, dcp, True, suffix, scale_row0=scale_row0
@@ -1250,7 +1305,11 @@ def _get_msa_dcp_fp4_op(
     # Full layer's local candidates, which the op gathers and merges into
     # the Full layer's selection (no scoring or top-k).
     reuse = index_reuse and _reuse_supported(
-        kv_heads > 1 or (attend_rot_op is None and not _packed_collectives_enabled()),
+        index_lanes == 1
+        and (
+            kv_heads > 1
+            or (attend_rot_op is None and not _packed_collectives_enabled())
+        ),
         "4-bit caches",
         dcp,
         kv_heads,
@@ -1287,12 +1346,15 @@ def _get_msa_dcp_fp4_op(
         hadamard: torch.Tensor,
         index_reuse: dict | None = None,
         full: bool = True,
+        index_lane: torch.Tensor | None = None,
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
         if not reuse:
             index_reuse = None
         shared = index_reuse is not None and not full
+        if lanes_score_op is not None and index_lane is None:
+            raise ValueError("an op with index lanes needs index_lane")
         if shared and am_given_op is not None:
             # Shared layer, one KV head: write (and rotate this rank's
             # queries), then attend over the Full layer's selection.
@@ -1360,6 +1422,35 @@ def _get_msa_dcp_fp4_op(
                 q.contiguous(),
             )
             candidates = index_reuse["candidates"]
+        elif lanes_score_op is not None:
+            # Index lanes: every lane's index heads score this lane's share
+            # of the keys; each lane gets back its heads' candidates.
+            if kv_heads > 1:
+                k, v, index_q = gather_group_kv(
+                    k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
+                )
+            lane_group = get_dcp_lane_group()
+            index_q = lane_group.all_gather(index_q.contiguous(), dim=1)
+            new_kv_cache, new_index_cache, new_scale_cache, partial, q = lanes_score_op(
+                k,
+                v,
+                index_q,
+                index_k,
+                kv_cache,
+                index_cache,
+                scale_cache,
+                metadata.seq_lens,
+                metadata.block_tables,
+                metadata.query_start_loc,
+                metadata.request_distribution,
+                dcp_rank,
+                index_lane,
+                q.contiguous(),
+            )
+            num_tokens = partial.shape[0]
+            # Block l of the leading axis: lane l's heads' candidates.
+            partial = partial.view(num_tokens, index_lanes, -1).transpose(0, 1)
+            candidates = lane_merge_op(_all_to_all(partial, lane_group))
         else:
             if kv_heads > 1:
                 k, v, index_q = gather_group_kv(
@@ -1490,6 +1581,83 @@ def _get_msa_dcp_fp4_op(
 
     op.index_reuse = reuse
     return op
+
+
+def _index_lane_ops(
+    score_jax: Callable[..., Any], topk: int, lanes: int, suffix: str
+) -> tuple[Any, Any]:
+    """The scoring op of `_get_msa_dcp_fp4_op` with `lanes` index lanes
+    (`msa_dcp.index_lane_layout`; it takes the lane after the DCP rank and
+    returns candidates for every lane's heads) and the lane merge
+    (`msa_dcp.merge_lane_candidates`)."""
+
+    def _score_lanes_jax(
+        k: jax.Array,
+        v: jax.Array,
+        index_q: jax.Array,
+        index_k: jax.Array,
+        kv_cache: jax.Array,
+        index_cache: jax.Array,
+        scale_cache: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+        dcp_rank: jax.Array,
+        index_lane: jax.Array,
+        q: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+        return score_jax(
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            scale_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            dcp_rank,
+            q,
+            lanes=lanes,
+            lane=index_lane,
+        )
+
+    score_op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_dcp_fp4_score_lanes_{suffix}",
+        _score_lanes_jax,
+        donate_argnums=(
+            _SHARD_KV_CACHE_ARG,
+            _SHARD_INDEX_CACHE_ARG,
+            _DCP_SCALE_CACHE_ARG,
+        ),
+    )
+
+    def _score_fake(k, v, index_q, index_k, kv_cache, index_cache, scale_cache, *args):
+        return (
+            torch.empty_like(kv_cache),
+            torch.empty_like(index_cache),
+            torch.empty_like(scale_cache),
+            torch.empty(
+                (k.shape[0], index_q.shape[1] * 2 * topk),
+                dtype=torch.float32,
+                device=k.device,
+            ),
+            torch.empty_like(args[-1]),
+        )
+
+    score_op.register_fake(_score_fake)
+
+    def _merge_jax(candidates: jax.Array) -> jax.Array:
+        return msa_dcp.merge_lane_candidates(candidates, topk)
+
+    merge_op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_dcp_lane_merge_t{topk}_il{lanes}", _merge_jax
+    )
+    merge_op.register_fake(lambda c: c.new_empty((c.shape[1], c.shape[2])))
+    return score_op, merge_op
 
 
 def _fused_decode_op(
