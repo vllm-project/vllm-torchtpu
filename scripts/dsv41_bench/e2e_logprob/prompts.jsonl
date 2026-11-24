@@ -1,0 +1,32 @@
+{"id": "math-00", "messages": [{"role": "user", "content": "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?"}]}
+{"id": "math-01", "messages": [{"role": "user", "content": "Weng earns $12 an hour for babysitting. Yesterday, she just did 50 minutes of babysitting. How much did she earn?"}]}
+{"id": "math-02", "messages": [{"role": "user", "content": "Betty is saving money for a new wallet which costs $100. Betty has only half of the money she needs. Her parents decided to give her $15 for that purpose, and her grandparents twice as much as her parents. How much more money does Betty need to buy the wallet?"}]}
+{"id": "math-03", "messages": [{"role": "user", "content": "Julie is reading a 120-page book. Yesterday, she was able to read 12 pages and today, she read twice as many pages as yesterday. If she wants to read half of the remaining pages tomorrow, how many pages should she read?"}]}
+{"id": "math-04", "messages": [{"role": "user", "content": "James writes a 3-page letter to 2 different friends twice a week. How many pages does he write a year?"}]}
+{"id": "math-05", "messages": [{"role": "user", "content": "Mark has a garden with flowers. He planted one row of 10 flowers, two rows of 15 flowers each, and three rows of 8 flowers each. How many flowers are in his garden?"}]}
+{"id": "math-06", "messages": [{"role": "user", "content": "A tank can hold 240 liters of water. It is currently 3/8 full. How many more liters are needed to fill it completely?"}]}
+{"id": "math-07", "messages": [{"role": "user", "content": "A train travels at 60 km/h for 2.5 hours, then at 80 km/h for 1.5 hours. What is the total distance covered?"}]}
+{"id": "math-08", "messages": [{"role": "user", "content": "Sara buys 4 notebooks at $2.50 each and 3 pens at $1.20 each. She pays with a $20 bill. How much change does she get?"}]}
+{"id": "math-09", "messages": [{"role": "user", "content": "A factory produces 1250 widgets per day. If 3% are defective, how many good widgets are produced in a 6-day week?"}]}
+{"id": "math-10", "messages": [{"role": "user", "content": "Tom's age is 3 times his sister's age. In 5 years, the sum of their ages will be 34. How old is Tom now?"}]}
+{"id": "math-11", "messages": [{"role": "user", "content": "A rectangular garden is 12 meters long and 8 meters wide. A path 1 meter wide runs around the outside. What is the area of the path?"}]}
+{"id": "math-12", "messages": [{"role": "user", "content": "A recipe calls for 2.5 cups of flour for 12 cookies. How many cups are needed for 30 cookies?"}]}
+{"id": "math-13", "messages": [{"role": "user", "content": "An item costs $80. It is discounted by 25%, and then a further 10% is taken off the discounted price. What is the final price?"}]}
+{"id": "math-14", "messages": [{"role": "user", "content": "A car uses 8 liters of fuel per 100 km. How much fuel does it need for a 350 km trip?"}]}
+{"id": "math-15", "messages": [{"role": "user", "content": "Marie has 3 boxes with 24 apples each. She gives 18 apples to her neighbor and sells the rest at $0.75 each. How much money does she earn?"}]}
+{"id": "math-16", "messages": [{"role": "user", "content": "A swimming pool is filled by two pipes. The first fills it in 6 hours, the second in 12 hours. How long does it take with both open?"}]}
+{"id": "math-17", "messages": [{"role": "user", "content": "If 5 workers can build a wall in 12 days, how many days would 8 workers take at the same rate?"}]}
+{"id": "math-18", "messages": [{"role": "user", "content": "A number is increased by 20% and then decreased by 20%. What is the net percentage change?"}]}
+{"id": "math-19", "messages": [{"role": "user", "content": "Alex runs 3 laps on a 400 m track every morning. How many kilometers does he run in 30 days?"}]}
+{"id": "math-20", "messages": [{"role": "user", "content": "A bag has 4 red, 6 blue and 10 green marbles. What is the probability of drawing a blue marble?"}]}
+{"id": "math-21", "messages": [{"role": "user", "content": "The sum of three consecutive even integers is 84. What is the largest of them?"}]}
+{"id": "math-22", "messages": [{"role": "user", "content": "A bookstore sells 45 books on Monday and 15% more on Tuesday. How many books are sold on Tuesday?"}]}
+{"id": "math-23", "messages": [{"role": "user", "content": "A cube has an edge length of 5 cm. What is its total surface area?"}]}
+{"id": "misc-00", "messages": [{"role": "user", "content": "Explain in two sentences why the sky appears blue."}]}
+{"id": "misc-01", "messages": [{"role": "user", "content": "Write a Python function that returns the sum of the even numbers in a list."}]}
+{"id": "misc-02", "messages": [{"role": "user", "content": "Summarize the plot of Romeo and Juliet in three sentences."}]}
+{"id": "misc-03", "messages": [{"role": "user", "content": "What is the difference between a process and a thread?"}]}
+{"id": "misc-04", "messages": [{"role": "user", "content": "List three causes of the French Revolution."}]}
+{"id": "misc-05", "messages": [{"role": "user", "content": "Translate 'The weather is nice today' into French and German."}]}
+{"id": "misc-06", "messages": [{"role": "user", "content": "What are the main trade-offs of quantization in large language model inference?"}]}
+{"id": "misc-07", "messages": [{"role": "user", "content": "Describe how a binary search works on a sorted array."}]}
