@@ -62,6 +62,11 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.kernel import (
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.router_ops import (
     pallas_select,
 )
+from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.sc_slab_scatter import (
+    SC_MIN_PAIRS,
+    sc_slab_scatter_available,
+    sc_slab_tables,
+)
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.token_parallel import (
     TokenReplicaLayout,
 )
@@ -574,40 +579,59 @@ def adaptive_fused_moe(
         # either way; only the queue moves.
         if t_local >= AGQ_MIN_LOCAL_TOKENS:
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
-        token_gather = shard_token_gather(
-            routing, me, shard_stride=ragged_stride, rows=slab_row
-        )
-        # The kernel DMA-aligns each logical expert window down by as much as
-        # 127 int32 rows and always copies a full fixed window. Pad after the
-        # scatter (rather than enlarging its destination) so the off-shard
-        # sentinel remains out of range and cannot write a live padding row.
-        token_gather = jnp.pad(token_gather, (0, token_gather_window_rows(capacity)))
-        # The activation row scale, scattered onto the slab row each routed
-        # pair computes on. It exists only where the rows were quantized.
-        #
-        # The slab is built flat and handed over in the dense lane-block
-        # view, which is the same bytes in the same order and so costs
-        # nothing. A column would cost a copy of the whole slab: [rows, 1]
-        # is padded out to a full lane block on the way to the kernel, and
-        # that copy is the largest single piece of glue above a thousand
-        # rows. The kernel rebuilds the column a tile at a time instead.
-        #
-        # The scatter runs the length of the view rather than of the slab.
-        # Those extra elements are past the slab's last row, so a pair the
-        # rebase sent past the end lands on one of them instead of being
-        # dropped; nothing reads them, and the slab's own rows are the same
-        # either way.
-        if form.quantized_activations:
-            scale_bits = jnp.repeat(cast(jax.Array, scale_bits_g), topk)
-            scale_rows = act_scale_slab_rows(ragged_stride)
-            scale_slab = lax.bitcast_convert_type(
-                jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
-                .at[slab_row]
-                .add(scale_bits, mode="drop"),
-                jnp.float32,
-            ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
+        if (
+            envs.MOE_ADAPTIVE_SC_SLAB_SCATTER
+            and T * topk >= SC_MIN_PAIRS
+            and sc_slab_scatter_available()
+        ):
+            # MOE_ADAPTIVE_SC_SLAB_SCATTER: both slab tables from one
+            # SparseCore scatter, the same values on every row read below.
+            token_gather, scale_slab = sc_slab_tables(
+                slab_row,
+                scale_bits_g if form.quantized_activations else None,
+                n_tokens=T,
+                topk=topk,
+                shard_stride=ragged_stride,
+                window_rows=token_gather_window_rows(capacity),
+                scale_rows=act_scale_slab_rows(ragged_stride),
+            )
         else:
-            scale_slab = None
+            token_gather = shard_token_gather(
+                routing, me, shard_stride=ragged_stride, rows=slab_row
+            )
+            # The kernel DMA-aligns each logical expert window down by as much as
+            # 127 int32 rows and always copies a full fixed window. Pad after the
+            # scatter (rather than enlarging its destination) so the off-shard
+            # sentinel remains out of range and cannot write a live padding row.
+            token_gather = jnp.pad(
+                token_gather, (0, token_gather_window_rows(capacity))
+            )
+            # The activation row scale, scattered onto the slab row each routed
+            # pair computes on. It exists only where the rows were quantized.
+            #
+            # The slab is built flat and handed over in the dense lane-block
+            # view, which is the same bytes in the same order and so costs
+            # nothing. A column would cost a copy of the whole slab: [rows, 1]
+            # is padded out to a full lane block on the way to the kernel, and
+            # that copy is the largest single piece of glue above a thousand
+            # rows. The kernel rebuilds the column a tile at a time instead.
+            #
+            # The scatter runs the length of the view rather than of the slab.
+            # Those extra elements are past the slab's last row, so a pair the
+            # rebase sent past the end lands on one of them instead of being
+            # dropped; nothing reads them, and the slab's own rows are the same
+            # either way.
+            if form.quantized_activations:
+                scale_bits = jnp.repeat(cast(jax.Array, scale_bits_g), topk)
+                scale_rows = act_scale_slab_rows(ragged_stride)
+                scale_slab = lax.bitcast_convert_type(
+                    jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
+                    .at[slab_row]
+                    .add(scale_bits, mode="drop"),
+                    jnp.float32,
+                ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
+            else:
+                scale_slab = None
         expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
         recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
         # The bias tables are per expert and per output channel on every
@@ -711,6 +735,7 @@ def adaptive_fused_moe(
         _prefill_rungs(),
         _combine_landed(),
         bool(envs.MOE_ADAPTIVE_SKIP_UNROUTED),
+        bool(envs.MOE_ADAPTIVE_SC_SLAB_SCATTER),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
