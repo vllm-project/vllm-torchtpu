@@ -328,31 +328,11 @@ def _select_gather_attend(
             # Records before the pipeline's next step, so the gather is
             # issued ahead of it and runs beside it instead of after it.
             records, following = jax.lax.optimization_barrier((records, following))
-        if state is None:
-            out, owners, pending = None, None, None
-            all_counts = jnp.zeros((tokens,), jnp.int32)
-        else:
-            out, *owners, all_counts, pending = state
-            # The attention that read these owners precedes their update.
-            owners, out = jax.lax.optimization_barrier((tuple(owners), out))
-        # Tiles gather into whole-T owners, which attention and later layers
-        # read in place: no per-tile copy into a reuse buffer.
-        owners = gather_csa2_kv_sc(
-            word_banks,
-            scale_banks,
-            records,
-            owners,
-            deep=True,
-            rows=None if owners else tokens * 512,
-            row_offset=start * 512,
-        )
-        kv = (owners[0].reshape(tokens, 512, 128), owners[1].reshape(tokens, 512))
-        all_counts = jax.lax.dynamic_update_slice_in_dim(all_counts, counts, start, 0)
 
-        def attend(out, offset, tile_counts):
+        def attend(out, owners, offset, tile_counts):
             return csa2_attend_rows(
                 q,
-                kv,
+                (owners[0].reshape(tokens, 512, 128), owners[1].reshape(tokens, 512)),
                 tile_counts,
                 out,
                 swa_pages,
@@ -365,13 +345,32 @@ def _select_gather_attend(
                 **kwargs,
             )
 
-        # Attention runs one tile behind the gather and reads the updated
-        # owners, so its rows are complete and no reader overlaps a writer.
-        if pending is not None:
-            out = attend(out, start - pending.shape[0], pending)
+        if state is None:
+            out, owners = None, None
+            all_counts = jnp.zeros((tokens,), jnp.int32)
+        else:
+            out, *owners, all_counts, pending = state
+            # Attention runs one tile behind the gather, on rows complete in
+            # the owners, and reads them before this tile's gather updates
+            # them in place.
+            out = attend(out, owners, start - pending.shape[0], pending)
+            owners, out = jax.lax.optimization_barrier((tuple(owners), out))
+        # Tiles gather into whole-T owners, which attention and later layers
+        # read in place: no per-tile copy into a reuse buffer.
+        owners = gather_csa2_kv_sc(
+            word_banks,
+            scale_banks,
+            records,
+            owners,
+            deep=True,
+            rows=None if owners else tokens * 512,
+            row_offset=start * 512,
+        )
+        all_counts = jax.lax.dynamic_update_slice_in_dim(all_counts, counts, start, 0)
         if start + rows < tokens:
             return (out, *owners, all_counts, counts), following
-        out = attend(out, start, counts)
+        out = attend(out, owners, start, counts)
+        kv = (owners[0].reshape(tokens, 512, 128), owners[1].reshape(tokens, 512))
         return (out, *kv, all_counts), following
 
     selected, _, (output, words, gathered_scales, counts) = select_fp8_indexer_tiles(
