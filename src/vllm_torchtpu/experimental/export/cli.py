@@ -549,7 +549,7 @@ def run_export_from_args(
             and cache_cfg.num_gpu_blocks_override is None
         ):
             exportable.fit_num_blocks_to_hbm(
-                cache_cfg.gpu_memory_utilization, kv_cache_memory_bytes
+                cache_cfg.resolved_gpu_memory_utilization, kv_cache_memory_bytes
             )
 
     weights = (

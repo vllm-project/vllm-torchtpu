@@ -404,7 +404,7 @@ def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
     worker = TPUWorker.__new__(TPUWorker)
     worker.cache_config = SimpleNamespace(
         kv_cache_memory_bytes=None,
-        gpu_memory_utilization=0.9,
+        resolved_gpu_memory_utilization=0.9,
         num_gpu_blocks_override=None,
     )
     worker.parallel_config = SimpleNamespace(

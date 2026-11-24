@@ -1148,6 +1148,7 @@ def _mock_vllm_config(
             num_gpu_blocks_override=None,
             kv_cache_memory_bytes=None,
             gpu_memory_utilization=0.9,
+            resolved_gpu_memory_utilization=0.9,
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         parallel_config=SimpleNamespace(

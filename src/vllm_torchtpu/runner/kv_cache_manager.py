@@ -1005,7 +1005,8 @@ class KVCacheManager:
         if kv_cache_memory_bytes := self.runner.cache_config.kv_cache_memory_bytes:
             return kv_cache_memory_bytes
         budget = utils.compute_hbm_budget(
-            [self.runner.device], self.runner.cache_config.gpu_memory_utilization
+            [self.runner.device],
+            self.runner.cache_config.resolved_gpu_memory_utilization,
         )
         return utils.min_across_ep_dp(
             self.runner.vllm_config.parallel_config,

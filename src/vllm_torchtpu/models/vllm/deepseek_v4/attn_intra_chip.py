@@ -464,6 +464,9 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
             tp_rank=rank,
             tp_size=size,
         )
+        # Upstream declares wo_a as its grouped layer; the chip pair shards it
+        # as a plain column-parallel linear instead.
+        # pyrefly: ignore[bad-assignment]
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
