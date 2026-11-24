@@ -61,6 +61,15 @@ def paged_mqa_key_tile(width: int, page_size: int, cap: int) -> int:
 # group; in the full prefill indexer the reloads cost 7.2 ms per 2,048 rows.
 PACKED_FP8_RESIDENT_KEYS = 98304
 
+# Prefill width branches grow in 16,384-key steps, so a resident tile's live
+# keys sit in its top step; the tile stops at the first rung covering them.
+# Each rung is another unrolled copy of the scorer: at width 81,920 and 73K
+# live keys, 8,192-key rungs score a 256-row tile in 226 us against 246 for
+# the whole tile, while 4,096-key rungs (1.75x the code) run at 241 us next
+# to the SparseCore top-k.
+PACKED_FP8_WIDTH_STEP = 16384
+PACKED_FP8_LIVE_RUNG = 8192
+
 
 def dense_key_tile(width: int, page_size: int, resident: bool) -> int:
     """K tile for dense scoring; one tile covers the width when it can stay."""
