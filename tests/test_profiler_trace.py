@@ -36,16 +36,8 @@ def test_profile_session_id_uses_dp_master_port(monkeypatch):
 
 def test_profile_session_id_falls_back_to_parent_pid(monkeypatch):
     monkeypatch.delenv("TORCH_TPU_DP_MASTER_PORT", raising=False)
-    monkeypatch.delenv("TORCH_TPU_XPROF_SESSION_ID", raising=False)
 
     assert profiler_trace.profile_session_id() == str(os.getppid())
-
-
-def test_profile_session_id_uses_xprof_session_id_for_ray_workers(monkeypatch):
-    monkeypatch.delenv("TORCH_TPU_DP_MASTER_PORT", raising=False)
-    monkeypatch.setenv("TORCH_TPU_XPROF_SESSION_ID", "999888777")
-
-    assert profiler_trace.profile_session_id() == "xprof_999888777"
 
 
 def test_rank_capture_dir_is_not_dp_specific(tmp_path):

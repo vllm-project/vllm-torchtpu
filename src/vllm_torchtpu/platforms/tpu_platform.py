@@ -19,6 +19,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 import importlib.util
 import os
 import time
+import uuid
 from typing import TYPE_CHECKING, Protocol, Union, cast
 
 import portpicker
@@ -330,8 +331,12 @@ def _validate_peer_replay_config(vllm_config: "VllmConfig | None" = None) -> Non
     `'claims'` and requires both `TPU_PARALLEL_PRECOMPILE=1` and
     `TPU_PRECOMPILE_PEER_REPLAY=1`.
     """
-    extra = getattr(vllm_config, "additional_config", None) if vllm_config else None
-    scheduler = extra.get("peer_replay_scheduler") if isinstance(extra, dict) else None
+    from vllm_torchtpu.runner.utils import (
+        PEER_REPLAY_RUN_ID_KEY,
+        get_peer_replay_scheduler,
+    )
+
+    scheduler = get_peer_replay_scheduler(vllm_config)
     if scheduler is not None:
         if scheduler not in ("static", "claims"):
             raise ValueError(
@@ -344,6 +349,14 @@ def _validate_peer_replay_config(vllm_config: "VllmConfig | None" = None) -> Non
             raise ValueError(
                 "additional_config.peer_replay_scheduler='claims' requires "
                 "TPU_PARALLEL_PRECOMPILE=1 and TPU_PRECOMPILE_PEER_REPLAY=1."
+            )
+        if (
+            scheduler == "claims"
+            and vllm_config is not None
+            and isinstance(vllm_config.additional_config, dict)
+        ):
+            vllm_config.additional_config.setdefault(
+                PEER_REPLAY_RUN_ID_KEY, uuid.uuid4().hex[:12]
             )
     if not (envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY):
         return

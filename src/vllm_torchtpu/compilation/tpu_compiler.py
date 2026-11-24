@@ -651,20 +651,20 @@ class TpuCompilerAdaptor(CompilerInterface):
                 was_wrapped=was_wrapped,
                 fingerprint=fingerprint,
             )
-            # Write-then-rename: a crash or a full disk partway through
-            # pickling a 400 MB entry would otherwise leave a truncated file
-            # that the next run reads back as a corrupt artifact.
-            # The temp name is PID-unique, like _link_artifact's: two writers
-            # of the same path must not interleave into one temp file.
-            with open(tmp_path, "wb") as f:
-                pickle.dump(payload, f)
-            os.replace(tmp_path, path)
             if fingerprint is not None:
                 fp_tmp = f"{path}{_FP_SUFFIX}.{os.getpid()}.tmp"
                 with contextlib.suppress(OSError):
                     with open(fp_tmp, "w") as f:
                         f.write(fingerprint)
                     os.replace(fp_tmp, path + _FP_SUFFIX)
+            # Write-then-rename: a crash or a full disk partway through
+            # pickling a 400 MB entry would otherwise leave a truncated file
+            # that the next run reads back as a corrupt artifact.
+            # Write the .fp sidecar before moving `path` into place so any
+            # peer discovering `path` already sees its sidecar.
+            with open(tmp_path, "wb") as f:
+                pickle.dump(payload, f)
+            os.replace(tmp_path, path)
             logger.info("[TpuCompilerAdaptor] Saved compiled artifact to %s", path)
             return True
         except Exception as e:
@@ -751,10 +751,6 @@ class TpuCompilerAdaptor(CompilerInterface):
             return None
         return os.path.dirname(rank_path), rank_dir, prefix
 
-    def rank_dir_name(self) -> str | None:
-        parsed = self.parse_cache_dir(self.cache_dir)
-        return parsed[1] if parsed is not None else None
-
     def _peer_paths(self, key: str, allowed_dirs: set[str] | None = None) -> list[str]:
         """Where the other ranks have saved their artifact for `key`.
 
@@ -770,22 +766,21 @@ class TpuCompilerAdaptor(CompilerInterface):
             return []
         cache_hash_dir, _, prefix = parsed
         assert self.cache_dir is not None
-        own = os.path.normpath(self.cache_dir)
+        mine = os.path.join(os.path.normpath(self.cache_dir), key)
+        if allowed_dirs is not None:
+            return sorted(
+                p
+                for rank_dir in allowed_dirs
+                for p in (os.path.join(cache_hash_dir, rank_dir, prefix, key),)
+                if p != mine and os.path.exists(p)
+            )
         pattern = os.path.join(
             glob.escape(cache_hash_dir),
             "rank_*_*",
             glob.escape(prefix),
             glob.escape(key),
         )
-        mine = os.path.join(own, key)
-        paths = sorted(p for p in glob.glob(pattern) if p != mine)
-        if allowed_dirs is None:
-            return paths
-        return [
-            p
-            for p in paths
-            if os.path.basename(os.path.dirname(os.path.dirname(p))) in allowed_dirs
-        ]
+        return sorted(p for p in glob.glob(pattern) if p != mine)
 
     def _mark_failed(self, key: str, fingerprint: str) -> None:
         """Tell this host's waiting ranks that this rank will not save `key`.
@@ -838,7 +833,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             with open(fp_path) as f:
                 peer_fp = f.read().strip()
         except OSError:
-            return True
+            return False
         if peer_fp == fingerprint:
             return True
         logger.warning(

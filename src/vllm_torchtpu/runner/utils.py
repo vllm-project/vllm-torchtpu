@@ -49,6 +49,7 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_prefill_only_kv_len_threshold"
 )
 PEER_REPLAY_SCHEDULER_KEY = "peer_replay_scheduler"
+PEER_REPLAY_RUN_ID_KEY = "_peer_replay_run_id"
 
 # Diagnostics-only / scheduling knobs: they never change the compiled graph, so
 # `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the TPU
@@ -58,8 +59,25 @@ HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
         PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
         PEER_REPLAY_SCHEDULER_KEY,
+        PEER_REPLAY_RUN_ID_KEY,
     }
 )
+
+
+def get_peer_replay_scheduler(vllm_config: Any) -> str | None:
+    """Return `additional_config[PEER_REPLAY_SCHEDULER_KEY]`, or `None`."""
+    if vllm_config is None:
+        return None
+    extra = vllm_config.additional_config
+    return extra.get(PEER_REPLAY_SCHEDULER_KEY) if isinstance(extra, dict) else None
+
+
+def get_peer_replay_run_id(vllm_config: Any) -> str | None:
+    """Return the per-start claim run token from `additional_config`, or `None`."""
+    if vllm_config is None:
+        return None
+    extra = vllm_config.additional_config
+    return extra.get(PEER_REPLAY_RUN_ID_KEY) if isinstance(extra, dict) else None
 
 
 class InferencePhase(Enum):

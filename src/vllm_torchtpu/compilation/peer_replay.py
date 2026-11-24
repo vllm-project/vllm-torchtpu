@@ -18,16 +18,20 @@ import itertools
 import os
 import shutil
 import time
+import uuid
 from collections.abc import Callable
 from typing import Any
 
-from vllm_torchtpu import envs, profiler_trace
+from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import tpu_compiler
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.utils import get_peer_replay_run_id
 
 logger = init_logger(__name__)
 
 _claim_call_counter = itertools.count(1)
+_pruned_claims_roots: set[str] = set()
+_DEFAULT_RUN_ID = uuid.uuid4().hex[:12]
 _STALE_CLAIM_AGE_S = 86400.0
 
 
@@ -53,7 +57,7 @@ def _build_claim_dirs(
     to rotated compilation).
     """
     call_id = str(next(_claim_call_counter))
-    run_id = profiler_trace.profile_session_id(include_starttime=True)
+    run_id = get_peer_replay_run_id(pairs[0][0].vllm_config) or _DEFAULT_RUN_ID
     claim_dirs: dict[int, str] = {}
     own_rank_dirs: dict[int, str] = {}
     for backend, _ in pairs:
@@ -61,9 +65,7 @@ def _build_claim_dirs(
         if bid in claim_dirs:
             continue
         compiler = backend.vllm_backend.compiler_manager.compiler
-        parsed = tpu_compiler.TpuCompilerAdaptor.parse_cache_dir(
-            getattr(compiler, "cache_dir", None)
-        )
+        parsed = tpu_compiler.TpuCompilerAdaptor.parse_cache_dir(compiler.cache_dir)
         fingerprint = tpu_compiler._graph_fingerprint(backend.graph)
         if parsed is None or fingerprint is None:
             logger.warning_once(
@@ -74,7 +76,8 @@ def _build_claim_dirs(
         cache_hash_dir, rank_dir, prefix = parsed
         own_rank_dirs[bid] = rank_dir
         claims_root = os.path.join(cache_hash_dir, "peer_claims")
-        if call_id == "1":
+        if claims_root not in _pruned_claims_roots:
+            _pruned_claims_roots.add(claims_root)
             _prune_old_claims(claims_root)
         cdir = os.path.join(
             claims_root,
@@ -166,7 +169,7 @@ def compile_claimed(
 
     def claim_path(backend: Any, entry: Any) -> str:
         r = entry.compile_range
-        sg = getattr(backend, "piecewise_compile_index", 0)
+        sg = backend.piecewise_compile_index
         return os.path.join(claim_dirs[id(backend)], f"{r.start}_{r.end}_sg{sg}")
 
     pending = [(b, e) for b, e in pairs if not e.compiled]
@@ -199,7 +202,7 @@ def compile_claimed(
             continue
         owner = _read_claim_owner(claim_path(backend, entry))
         allowed = {owner} if owner else None
-        wait = 0.0 if not owner or owner == own_rank_dirs[id(backend)] else wait_s
+        wait = wait_s if owner else 0.0
         with tpu_compiler.wait_for_peer_artifact(wait, allowed_dirs=allowed):
             compile_entry(backend, entry)
 

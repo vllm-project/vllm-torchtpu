@@ -97,6 +97,7 @@ def _compile(
     # In vLLM's order: smallest range first.
     backend = SimpleNamespace(
         graph=object(),
+        vllm_config=None,
         range_entries={
             Range(s, s): piecewise_backend.RangeEntry(compile_range=Range(s, s))
             for s in SIZES
@@ -321,6 +322,7 @@ def _compile_deferred(
             backends.append(
                 SimpleNamespace(
                     graph=object(),
+                    vllm_config=None,
                     range_entries=entries,
                     _tpu_trace=trace_idx,
                     vllm_backend=SimpleNamespace(
@@ -417,13 +419,24 @@ def test_peer_replay_claims_list_schedules_and_respects_claim_wait(
     """peer_replay_scheduler='claims' claims unclaimed ranges via O_EXCL files
     (recording rank_<r>_<dp> dir names and subgraph index) and replays
     peer-claimed ranges with bounded wait."""
-    from vllm_torchtpu import profiler_trace
+    from vllm_torchtpu.runner.utils import PEER_REPLAY_RUN_ID_KEY
 
     monkeypatch.setenv("TPU_PRECOMPILE_BIGGEST_FIRST", "1")
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", "42")
     monkeypatch.setattr(tpu_compiler, "_graph_fingerprint", lambda graph: "fp" * 16)
+
+    def _read_owner(path: str) -> str:
+        with open(path) as f:
+            return f.read().strip()
+
+    monkeypatch.setattr(peer_replay, "_read_claim_owner", _read_owner)
     cache_dir = str(tmp_path / "hash1" / "rank_0_1" / "backbone")
-    vllm_config = SimpleNamespace(additional_config={"peer_replay_scheduler": "claims"})
+    vllm_config = SimpleNamespace(
+        additional_config={
+            "peer_replay_scheduler": "claims",
+            PEER_REPLAY_RUN_ID_KEY: "test_run",
+        }
+    )
 
     def _run_claim_rank(pre_claim: dict[int, str] | None = None):
         _host(monkeypatch, 8)
@@ -467,7 +480,7 @@ def test_peer_replay_claims_list_schedules_and_respects_claim_wait(
                 tmp_path
                 / "hash1"
                 / "peer_claims"
-                / profiler_trace.profile_session_id(include_starttime=True)
+                / "test_run"
                 / "backbone"
                 / ("fp" * 12)
                 / "1"
@@ -478,13 +491,13 @@ def test_peer_replay_claims_list_schedules_and_respects_claim_wait(
         compile_all_ranges(backend)
         return calls
 
-    calls = _run_claim_rank(pre_claim={256: "rank_0_0", 16: "rank_0_1"})
+    calls = _run_claim_rank(pre_claim={256: "rank_0_0", 16: ""})
     # 64 is unclaimed -> rank_0_1 claims and compiles it (wait=0, allowed_dirs=None).
-    # 16 was claimed by rank_0_1 -> waits 0 with allowed_dirs={"rank_0_1"}.
+    # 16 has an empty claim file -> wait=0.0, allowed_dirs=None (immediate fallback).
     # 256 was claimed by rank_0_0 -> waits up to 42s with allowed_dirs={"rank_0_0"}.
     assert calls == [
         (64, 0.0, None),
-        (16, 0.0, {"rank_0_1"}),
+        (16, 0.0, None),
         (256, 42.0, {"rank_0_0"}),
     ]
 
@@ -587,9 +600,9 @@ def test_peer_replay_claims_real_compilers_two_ranks_and_deferred_subgraphs(
     compile_all_ranges, monkeypatch, tmp_path
 ):
     """End-to-end test with real TpuCompilerAdaptor instances:
-    1) Two ranks (including across DP engines sharing TORCH_TPU_DP_MASTER_PORT)
-       compile each range once, and a waiter waits for the claim owner even
-       when another rank already saved an artifact for the same key.
+    1) Two ranks sharing one frontend run token compile each range once, and a
+       waiter waits for the claim owner even when another rank already saved
+       an artifact for the same key.
     2) compile_deferred with two subgraphs sharing a range and fingerprint
        claims and compiles both without colliding on one claim file.
     """
@@ -597,14 +610,16 @@ def test_peer_replay_claims_real_compilers_two_ranks_and_deferred_subgraphs(
 
     import torch
 
+    from vllm_torchtpu.runner.utils import PEER_REPLAY_RUN_ID_KEY
+
     _host(monkeypatch, 2)
     monkeypatch.setenv("LOCAL_RANK", "0")
     monkeypatch.setenv("TPU_PRECOMPILE_BIGGEST_FIRST", "1")
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", "5")
-    monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "29511")
     monkeypatch.setattr(tpu_compiler, "_PEER_POLL_S", 0.01)
 
     replayed_calls = []
+    owner_entered = threading.Event()
     gate = threading.Event()
     compiled_by_rank: list[tuple[str, int]] = []
 
@@ -625,7 +640,10 @@ def test_peer_replay_claims_real_compilers_two_ranks_and_deferred_subgraphs(
             graph=graph,
             _tpu_trace=0,
             vllm_config=SimpleNamespace(
-                additional_config={"peer_replay_scheduler": "claims"}
+                additional_config={
+                    "peer_replay_scheduler": "claims",
+                    PEER_REPLAY_RUN_ID_KEY: "dp_e2e_run",
+                }
             ),
             range_entries={
                 Range(s, s): piecewise_backend.RangeEntry(compile_range=Range(s, s))
@@ -650,6 +668,7 @@ def test_peer_replay_claims_real_compilers_two_ranks_and_deferred_subgraphs(
         # Identify caller via thread name or call order.
         name = threading.current_thread().name
         if name == "owner-r0":
+            owner_entered.set()
             gate.wait(timeout=2.0)
         size = (
             int(inputs[0].shape[0]) if hasattr(inputs[0], "shape") else int(inputs[0])
@@ -714,9 +733,19 @@ def test_peer_replay_claims_real_compilers_two_ranks_and_deferred_subgraphs(
     t0 = threading.Thread(target=run_r0, name="owner-r0")
     t1 = threading.Thread(target=run_r1, name="waiter-r1")
     t0.start()
-    time.sleep(0.05)  # Let r0 claim 64 before r1 runs; r0 blocks on gate.
+    assert owner_entered.wait(timeout=2.0)
     t1.start()
-    time.sleep(0.05)  # r1 is waiting on r0 even though rank_2_0 has an artifact.
+    # Wait deterministically until waiter-r1 enters _replay_from_peer.
+    waiter_polled = threading.Event()
+    orig_peer_paths = tpu_compiler.TpuCompilerAdaptor._peer_paths
+
+    def spy_peer_paths(self, key, allowed_dirs=None):
+        if threading.current_thread().name == "waiter-r1":
+            waiter_polled.set()
+        return orig_peer_paths(self, key, allowed_dirs=allowed_dirs)
+
+    monkeypatch.setattr(tpu_compiler.TpuCompilerAdaptor, "_peer_paths", spy_peer_paths)
+    assert waiter_polled.wait(timeout=2.0)
     gate.set()
     t0.join(timeout=5.0)
     t1.join(timeout=5.0)
@@ -724,6 +753,15 @@ def test_peer_replay_claims_real_compilers_two_ranks_and_deferred_subgraphs(
     # Range 64 was compiled only once (by owner-r0) and replayed by waiter-r1.
     assert [c for c in compiled_by_rank if c[0] != "MainThread"] == [("owner-r0", 64)]
     assert "entry-owner-r0" in replayed_calls
+    fp0 = tpu_compiler._graph_fingerprint(graph0)
+    assert fp0 is not None
+    claims_run_dir = (
+        tmp_path / "hash1" / "peer_claims" / "dp_e2e_run" / "backbone" / fp0[:24]
+    )
+    claim_files_part1 = {
+        p.name: p.read_text() for p in claims_run_dir.rglob("64_64_sg0")
+    }
+    assert claim_files_part1 == {"64_64_sg0": "rank_0_0"}
 
     # Part 2: compile_deferred with two subgraphs sharing a range and fingerprint.
     compiled_by_rank.clear()
@@ -741,3 +779,121 @@ def test_peer_replay_claims_real_compilers_two_ranks_and_deferred_subgraphs(
     assert len(compiled_by_rank) == 2
     assert e0.compiled
     assert e1.compiled
+    sg0_files = list(claims_run_dir.rglob("32_32_sg0"))
+    sg1_files = list(claims_run_dir.rglob("32_32_sg1"))
+    assert len(sg0_files) == 1
+    assert len(sg1_files) == 1
+    assert sg0_files[0].read_text() == "rank_0_0"
+    assert sg1_files[0].read_text() == "rank_0_0"
+
+
+def test_peer_replay_prunes_each_cache_root_once_per_process(
+    compile_all_ranges, monkeypatch, tmp_path
+):
+    """Stale claim directories are pruned once per cache root (not only on call 1)."""
+    from vllm_torchtpu.runner.utils import PEER_REPLAY_RUN_ID_KEY
+
+    _host(monkeypatch, 2)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(tpu_compiler, "_graph_fingerprint", lambda graph: "fp" * 16)
+    monkeypatch.setattr(peer_replay, "_claim_call_counter", itertools.count(1))
+    monkeypatch.setattr(peer_replay, "_pruned_claims_roots", set())
+
+    stale_cutoff = time.time() - peer_replay._STALE_CLAIM_AGE_S - 60.0
+    for root in ("profile_cache", "torch_compile_cache"):
+        stale = tmp_path / root / "hash1" / "peer_claims" / "old_run"
+        stale.mkdir(parents=True)
+        os.utime(stale, (stale_cutoff, stale_cutoff))
+
+    vllm_config = SimpleNamespace(
+        additional_config={
+            "peer_replay_scheduler": "claims",
+            PEER_REPLAY_RUN_ID_KEY: "fresh_run",
+        }
+    )
+
+    for root in ("profile_cache", "torch_compile_cache"):
+        backend = SimpleNamespace(
+            graph=object(),
+            vllm_config=vllm_config,
+            range_entries={
+                Range(16, 16): piecewise_backend.RangeEntry(compile_range=Range(16, 16))
+            },
+            vllm_backend=SimpleNamespace(
+                compiler_manager=SimpleNamespace(
+                    compile=lambda *a, **k: (lambda *x: x),
+                    disable_cache=False,
+                    compiler=SimpleNamespace(
+                        cache_dir=str(
+                            tmp_path / root / "hash1" / "rank_0_0" / "backbone"
+                        )
+                    ),
+                ),
+                inductor_config={},
+                is_encoder=False,
+            ),
+            compilation_config=None,
+            piecewise_compile_index=0,
+            total_piecewise_compiles=1,
+            _log_compile_start=lambda compile_range: None,
+        )
+        compile_all_ranges(backend)
+
+    assert not (
+        tmp_path / "profile_cache" / "hash1" / "peer_claims" / "old_run"
+    ).exists()
+    assert not (
+        tmp_path / "torch_compile_cache" / "hash1" / "peer_claims" / "old_run"
+    ).exists()
+
+
+def test_peer_replay_skips_artifact_without_fp_sidecar_and_writes_fp_first(
+    monkeypatch, tmp_path
+):
+    """Artifacts missing a `.fp` sidecar are skipped without unpickling, and
+    `_save_handle` writes `.fp` before moving the artifact into place."""
+    import pickle
+
+    import torch
+
+    graph = torch.fx.symbolic_trace(lambda x: x + 1)
+
+    class Entry:
+        def __call__(self, *a):
+            return "ok"
+
+        def serialize(self):
+            return "entry"
+
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "1")
+    monkeypatch.setattr(tpu_compiler, "_tpu_backend", lambda g, i: Entry())
+    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", lambda e: (lambda *a: e))
+
+    # 1) _save_handle writes .fp before os.replace moves the artifact path.
+    r0 = tpu_compiler.TpuCompilerAdaptor()
+    r0.initialize_cache(cache_dir=str(tmp_path / "hash1" / "rank_0_0" / "backbone"))
+    order: list[str] = []
+    orig_replace = os.replace
+
+    def spy_replace(src, dst):
+        order.append(os.path.basename(dst))
+        return orig_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", spy_replace)
+    r0.compile(graph, [torch.zeros(4, 4)], {}, Range(4, 4), key="range_4_4")
+    assert order == ["range_4_4.fp", "range_4_4"]
+
+    # 2) _replay_from_peer skips an artifact missing its .fp sidecar (no unpickle).
+    os.remove(tmp_path / "hash1" / "rank_0_0" / "backbone" / "range_4_4.fp")
+    r1 = tpu_compiler.TpuCompilerAdaptor()
+    r1.initialize_cache(cache_dir=str(tmp_path / "hash1" / "rank_1_0" / "backbone"))
+    unpickled = []
+    orig_load = pickle.load
+    monkeypatch.setattr(
+        pickle, "load", lambda f: unpickled.append(f.name) or orig_load(f)
+    )
+    fp = tpu_compiler._graph_fingerprint(graph)
+    assert fp is not None
+    with tpu_compiler.wait_for_peer_artifact(0.0):
+        assert r1._replay_from_peer("range_4_4", graph, False, fp) is None
+    assert unpickled == []
