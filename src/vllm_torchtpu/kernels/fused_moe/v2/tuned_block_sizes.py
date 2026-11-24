@@ -29,11 +29,11 @@ INPUT_SLOTS: dict[tuple[pltpu.ChipVersion, int, int, int, int], int] = {
     (pltpu.ChipVersion.TPU_7X, 128, 5120, 2560, 512): 3,
 }
 # The smallest per-shard slab (host.ragged_stride_bound of the token bucket)
-# at which INPUT_SLOTS applies. Three interleaved input slots pay at
-# prefill-sized buckets and cost at decode ones. DeepSeek-V4.1 shape on v7x,
-# 3 slots vs 2, per MoE call (CDK j-937d73db-7043-48e4-b758, bit-identical):
-# 32..512 tokens per shard +73%..+6% (even routing), 1024 -2.5%, 2048 -5.3%.
-# 49,664 rows is the 1024-tokens-per-shard bucket at EP8, top-6, 384 experts.
+# at which INPUT_SLOTS applies. Three interleaved input slots pay at large
+# buckets and cost at small ones. Measured at the DeepSeek-V4.1 shape on v7x,
+# EP8, 3 slots vs 2 per MoE call, outputs bit-identical: 32..512 tokens per
+# shard +73%..+6% (even routing), 1024 -2.5%, 2048 -5.3%. 49,664 rows is the
+# 1024-tokens-per-shard bucket at EP8, top-6, 384 experts.
 INPUT_SLOTS_MIN_ROWS: dict[tuple[pltpu.ChipVersion, int, int, int, int], int] = {
     (pltpu.ChipVersion.TPU_7X, 128, 5120, 2560, 512): 49664,
 }

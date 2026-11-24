@@ -144,8 +144,10 @@ def input_slots_for(input_key, rows_alloc):
     `input_key` once the bucket's per-shard slab `rows_alloc` reaches its
     INPUT_SLOTS_MIN_ROWS, else the OUT_PARITIES default.
 
-    The third, interleaved slot is a prefill-bucket win and a decode-bucket
-    loss at the same shape, so the bucket decides, not the shape alone.
+    The third, interleaved slot is a large-bucket win and a small-bucket loss
+    at the same shape, so the bucket's slab decides, not the shape alone. The
+    slab grows with the global token count, so the same minimum is a smaller
+    tokens-per-shard bucket at a wider EP.
     """
     slots = tuned_block_sizes.INPUT_SLOTS.get(input_key, OUT_PARITIES)
     min_rows = tuned_block_sizes.INPUT_SLOTS_MIN_ROWS.get(input_key, 0)
