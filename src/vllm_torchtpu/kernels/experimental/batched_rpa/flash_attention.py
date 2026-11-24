@@ -28,7 +28,7 @@ def flash_attention_qk_softmax(
     l_prev: jax.Array,  # [KV, TQ, 128]
     is_last_k: SmemWrapper,  # [steps, B]
     *,
-    custom_mask: jax.Array,
+    custom_mask: list[jax.Array],
     cfgs: configs.RpaConfigs,
     bq_start: int,
     k_scale: jax.Array | float | None = None,  # [B, KV, S]

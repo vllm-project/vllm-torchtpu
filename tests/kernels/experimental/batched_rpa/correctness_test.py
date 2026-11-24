@@ -223,6 +223,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         nan_kv_seq_idx: int | None = None,
         nan_new_seq_idx: int | None = None,
         mask_invalid_v: bool | None = None,
+        use_causal_mask: bool = True,
     ):
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # Tokens live on the lane dim, so page_size must be a multiple of 128.
@@ -348,6 +349,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             "q_scale": q_scale,
             "k_scale": k_scale,
             "v_scale": v_scale,
+            "use_causal_mask": use_causal_mask,
         }
 
         expected, expected_kv_cache = ref_ragged_paged_attention(
@@ -698,6 +700,71 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             configs.KVLayout.HEAD_ALONG_SUBLANE,
             configs.KVLayout.SEQ_ALONG_LANE,
         ],
+    )
+    def test_ragged_paged_attention_non_causal_spec_decode(self, dtype, kv_layout):
+        # DFlash draft blocks: K + 1 = 16 queries per sequence attend to every KV
+        # position, including the block's own later tokens. KV lengths cross
+        # page and KV-tile boundaries, so the last tile is often partial.
+        q_len = 16
+        seq_lens = [
+            (q_len, kv_len) for kv_len in (16, 17, 129, 256, 257, 597, 1107, 1328)
+        ]
+        self._test_ragged_paged_attention(
+            seq_lens,
+            (32, 8),
+            128,
+            16,
+            dtype,
+            dtype,
+            1000,
+            bq_sz=q_len,
+            bq_csz=q_len,
+            kv_layout=kv_layout,
+            distribution=jnp.array([len(seq_lens)] * 3, dtype=jnp.int32),
+            decode_query_size=q_len,
+            use_causal_mask=False,
+        )
+
+    @parameterized.product(
+        dtype=[jnp.float32, jnp.bfloat16],
+        block_sizes=[
+            # (bq_sz, bkv_sz, bq_csz)
+            (64, 256, 32),
+            (60, 48, 30),
+        ],
+        kv_layout=[
+            configs.KVLayout.HEAD_ALONG_SUBLANE,
+            configs.KVLayout.SEQ_ALONG_LANE,
+        ],
+    )
+    def test_ragged_paged_attention_non_causal_mixed(
+        self, dtype, block_sizes, kv_layout
+    ):
+        # Ragged prefill and decode in the MIXED stage. Early Q tiles of a
+        # prefill must now visit KV tiles past their diagonal.
+        seq_lens = [(192, 328), (1, 129), (64, 64), (7, 300), (130, 515), (1, 18)]
+        bq_sz, bkv_sz, bq_csz = block_sizes
+        self._test_ragged_paged_attention(
+            seq_lens,
+            (32, 8),
+            128,
+            16,
+            dtype,
+            dtype,
+            1000,
+            bq_sz=bq_sz,
+            bkv_sz=bkv_sz,
+            bq_csz=bq_csz,
+            kv_layout=kv_layout,
+            use_causal_mask=False,
+        )
+
+    @parameterized.product(
+        dtype=[jnp.float32, jnp.bfloat16],
+        kv_layout=[
+            configs.KVLayout.HEAD_ALONG_SUBLANE,
+            configs.KVLayout.SEQ_ALONG_LANE,
+        ],
         q_len=[1, 4],
     )
     def test_ragged_paged_attention_nan_kv_stays_in_its_sequence(
@@ -735,9 +802,10 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             configs.KVLayout.SEQ_ALONG_LANE,
         ],
         q_len=[1, 4],
+        use_causal_mask=[True, False],
     )
     def test_nan_cached_kv_does_not_poison_partial_tiles(
-        self, kv_dtype, kv_layout, q_len
+        self, kv_dtype, kv_layout, q_len, use_causal_mask
     ):
         seq_lens = [(q_len, length) for length in (129, 2048, 8, 7, 257, 259, 8, 511)]
         self._test_ragged_paged_attention(
@@ -756,6 +824,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             decode_query_size=q_len,
             nan_kv_seq_idx=1,
             mask_invalid_v=True,
+            use_causal_mask=use_causal_mask,
         )
 
     @parameterized.product(
