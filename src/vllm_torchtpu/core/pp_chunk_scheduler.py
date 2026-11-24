@@ -95,6 +95,7 @@ class TpuPipelineChunkScheduler(Scheduler):
             envs.TPU_PP_WARM_FIRST,
             float(envs.TPU_PP_WARM_FIRST_AGING),
             envs.TPU_PP_WARM_FIRST_TIER,
+            int(envs.TPU_PP_WARM_FIRST_WINDOW),
         )
         self._cost: StepCostModel | None = None
         self._step_limit: int | None = None
@@ -121,11 +122,26 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._step_pairs += float(tokens) * prefix
         self._step_squares += float(tokens) * tokens
 
-    def _init_warm_first(self, enabled: bool, aging: float, tier: bool = False) -> None:
+    def _init_warm_first(
+        self,
+        enabled: bool,
+        aging: float,
+        tier: bool = False,
+        window: int = 0,
+    ) -> None:
         if aging < 0:
             raise ValueError(f"TPU_PP_WARM_FIRST_AGING must be >= 0, got {aging}")
+        if window < -1:
+            raise ValueError(
+                f"TPU_PP_WARM_FIRST_WINDOW must be >= -1, got {window}"
+            )
         self._warm_first = enabled
         self._warm_first_aging = aging
+        self._warm_first_window: int | None = (
+            None
+            if window == -1
+            else (_WARM_FIRST_WINDOW if window == 0 else window)
+        )
         # The connector whose host pool counts as cached (TPU_PP_WARM_FIRST_TIER).
         self._tier = _host_tier(self.connector) if enabled and tier else None
         if enabled and tier and self._tier is None:
@@ -143,10 +159,15 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._wf_lookups = 0
         self._wf_log_t = time.monotonic()
         if enabled:
+            window_desc = (
+                "all"
+                if self._warm_first_window is None
+                else str(self._warm_first_window)
+            )
             logger.info(
                 "Pipeline chunk scheduler: warm-first waiting order "
-                "(window %d, aging %g tokens/s, host tier %s)",
-                _WARM_FIRST_WINDOW,
+                "(window %s, aging %g tokens/s, host tier %s)",
+                window_desc,
                 aging,
                 "counted" if self._tier is not None else "not counted",
             )
@@ -183,7 +204,8 @@ class TpuPipelineChunkScheduler(Scheduler):
         return uncached
 
     def _order_waiting(self, now: float) -> None:
-        """Orders the first _WARM_FIRST_WINDOW waiting requests warm first.
+        """Orders the first TPU_PP_WARM_FIRST_WINDOW waiting requests warm first
+        (default 128; -1 scans the full waiting queue).
 
         Requests that resume work (``_started``) stay at the head in their
         order. The fresh ones follow, by uncached prompt tokens less
@@ -197,7 +219,7 @@ class TpuPipelineChunkScheduler(Scheduler):
         queue = self.waiting
         if self.policy != SchedulingPolicy.FCFS or len(queue) < 2:
             return
-        window = list(islice(queue, _WARM_FIRST_WINDOW))
+        window = list(islice(queue, self._warm_first_window))
         started = [r for r in window if _started(r)]
         fresh = [r for r in window if not _started(r)]
         rate = self._warm_first_aging
