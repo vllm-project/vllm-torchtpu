@@ -442,9 +442,15 @@ class TestRunnerIntegration:
         logits[0, 5], logits[0, 0], logits[0, 2] = 3.0, 2.8, 2.5
         runner = _penalized_runner(logits)
         runner.scheduler_config.async_scheduling = True
-        runner._modify_prev_results = TPUModelRunner._modify_prev_results.__get__(
-            runner
-        )
+        modify_prev_results = TPUModelRunner._modify_prev_results.__get__(runner)
+        rollbacks: list[AsyncPreResults] = []
+
+        def counting_modify_prev_results():
+            if runner._pre_async_results is not None:
+                rollbacks.append(runner._pre_async_results)
+            modify_prev_results()
+
+        runner._modify_prev_results = counting_modify_prev_results
         request = runner.requests["r0"]
         request.output_token_ids.append(0)
         runner._pre_async_results = AsyncPreResults(
@@ -455,10 +461,53 @@ class TestRunnerIntegration:
             req_id_to_index_copy={"r0": 0},
             copy_state=_host_copy_state([torch.tensor([[5]])], [1]),
         )
+        previous = runner._pre_async_results
         out = run_sample_tokens(runner).get_output()
         assert out.sampled_token_ids == [[0]]
         # The previous step's token, then this step's placeholder.
         assert request.output_token_ids == [5, 0]
+        # The step's later _modify_prev_results call does not roll back again.
+        assert rollbacks == [previous]
+
+    def test_async_step_samples_before_the_wait_when_no_penalized_token_is_in_flight(
+        self,
+    ):
+        """Async scheduling: the previous step sampled only `other`, which has
+        no penalty, so the output of the penalized `r0` holds no placeholder.
+        The step applies the penalty before it waits for the previous step's
+        copy."""
+        logits = torch.zeros(1, 8)
+        logits[0, 4], logits[0, 2] = 3.0, 2.5
+        runner = _penalized_runner(logits)
+        runner.scheduler_config.async_scheduling = True
+        runner._modify_prev_results = TPUModelRunner._modify_prev_results.__get__(
+            runner
+        )
+        other = SimpleNamespace(req_id="other", output_token_ids=[0])
+        previous_copy = _host_copy_state([torch.tensor([[5]])], [1])
+        runner._pre_async_results = AsyncPreResults(
+            req_ids=["other"],
+            next_tokens_tpu=torch.tensor([5]),
+            request_seq_lens=[(0, other, 1, "other")],
+            discard_sampled_tokens_req_indices=[],
+            req_id_to_index_copy={"other": 0},
+            copy_state=previous_copy,
+        )
+        events: list[str] = []
+        previous_copy.copy_ready_event.synchronize.side_effect = lambda: (
+            events.append("wait")
+        )
+        apply_penalty = runner._repetition_penalty.apply
+
+        def recording_apply(*args, **kwargs):
+            events.append("penalty")
+            return apply_penalty(*args, **kwargs)
+
+        runner._repetition_penalty.apply = recording_apply
+        out = run_sample_tokens(runner).get_output()
+        assert out.sampled_token_ids == [[2]]
+        assert events == ["penalty", "wait"]
+        assert other.output_token_ids == [5]
 
     def test_speculative_decoding_skips_penalty_with_warning(self):
         """Speculative decoding logs warning_once, applies nothing and keeps

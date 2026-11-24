@@ -5748,10 +5748,18 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 request_seq_lens.append((i, req_state, seq_len, req_id))
 
-        if rep_pen and self._pre_async_results is not None:
-            # Async scheduling: the last output id of a request the previous
-            # step sampled is still a placeholder. Put that step's tokens in
-            # before the seen-token bitmasks read the outputs.
+        if (
+            rep_pen
+            and self._pre_async_results is not None
+            and not self.input_batch.repetition_penalties_reqs.isdisjoint(
+                self._pre_async_results.req_id_to_index_copy
+            )
+        ):
+            # Async scheduling: the last output id of a penalized request that
+            # the previous step sampled is still a placeholder. Put that step's
+            # tokens in before the seen-token bitmasks read the outputs. This
+            # waits for the previous step's D2H copy before any of this step's
+            # sampling is enqueued.
             self._modify_prev_results()
             self._pre_async_results = None
         tb_step = None
