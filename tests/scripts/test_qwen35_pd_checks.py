@@ -285,16 +285,17 @@ _GSM8K = "gsm8k"
 _STRICT = "exact_match,strict-match"
 
 
-def _eval_dir(tmp_path, *, result=True, effective=1319, row="PASS"):
+def _eval_dir(
+    tmp_path, *, result=True, effective=1319, row="PASS", samples=True, strict=True
+):
     out = tmp_path / "eval"
     (out / "model").mkdir(parents=True)
     if result:
-        body = {
-            "results": {
-                _GSM8K: {_STRICT: 0.97, "exact_match_stderr,strict-match": 0.004}
-            },
-            "n-samples": {_GSM8K: {"original": 1319, "effective": effective}},
-        }
+        metric = _STRICT if strict else "exact_match,flexible-extract"
+        stderr = metric.replace("exact_match,", "exact_match_stderr,")
+        body: dict = {"results": {_GSM8K: {metric: 0.97, stderr: 0.004}}}
+        if samples:
+            body["n-samples"] = {_GSM8K: {"original": 1319, "effective": effective}}
         (out / "model" / "results_2026.json").write_text(json.dumps(body))
     if row:
         (out / f"eval_check_{_GSM8K}.md").write_text(
@@ -316,6 +317,10 @@ _PENDING = {"_pending": "not measured yet"}
         ({"row": None}, "", _PENDING, None),  # pending: no gated row to print
         ({"result": False}, "", _MEASURED, "lm-eval wrote no result"),
         ({"effective": 100}, "", _MEASURED, "ran 100 of its 1319 samples"),
+        # Without n-samples a short split cannot be told from the whole one.
+        ({"samples": False}, "", _MEASURED, "does not say how many samples ran"),
+        # A result scored on another filter is not the gate's metric.
+        ({"strict": False}, "", _PENDING, "has no exact_match,strict-match"),
         (
             {},
             "WARNING API request failed, retrying\n",
@@ -335,6 +340,8 @@ _PENDING = {"_pending": "not measured yet"}
         "pending",
         "no_result",
         "partial",
+        "no_sample_count",
+        "no_strict_match",
         "retried",
         "no_row",
     ],

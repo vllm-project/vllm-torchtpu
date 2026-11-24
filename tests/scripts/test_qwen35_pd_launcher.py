@@ -65,7 +65,15 @@ class _Ok(BaseHTTPRequestHandler):
 @pytest.fixture
 def engines() -> Iterator[None]:
     """Stand-ins for the engines' and the proxy's HTTP endpoints."""
-    servers = [ThreadingHTTPServer(("127.0.0.1", port), _Ok) for port in _ENGINE_PORTS]
+    servers = []
+    for port in _ENGINE_PORTS:
+        try:
+            servers.append(ThreadingHTTPServer(("127.0.0.1", port), _Ok))
+        except OSError as error:
+            pytest.fail(
+                f"port {port} is taken ({error}); this test serves the ports "
+                "the recipe and the launcher use"
+            )
     for server in servers:
         threading.Thread(target=server.serve_forever, daemon=True).start()
     yield

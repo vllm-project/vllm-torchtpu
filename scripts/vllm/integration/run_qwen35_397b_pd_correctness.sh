@@ -116,7 +116,7 @@ stage() {
   echo "STAGE ${name} rc=${stage_rc[${name}]} in $((SECONDS - start))s"
 }
 
-# shellcheck disable=SC2317  # run through stage
+# shellcheck disable=SC2317,SC2329  # run through stage
 eval_stage() {
   local rc=0 task flow_log="${LOG_DIR}/eval_flow.log"
   # --run-lm-eval here, not from the config: without it run_eval_flow.sh runs
@@ -135,7 +135,7 @@ eval_stage() {
   return "${rc}"
 }
 
-# shellcheck disable=SC2317  # run through stage
+# shellcheck disable=SC2317,SC2329  # run through stage
 leg_checks() {
   local rc=0 status
   sleep "${LEG_STATUS_SETTLE_S:-15}"

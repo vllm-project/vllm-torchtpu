@@ -48,6 +48,8 @@ _COPIED = [
     f"scripts/vllm/benchmarking/configs/{_CONFIG}.sh",
     str(_BASELINE),
 ]
+# Explicit, so the scenarios do not depend on what the committed file holds.
+_PENDING = {"_pending": "not measured yet"}
 _MEASURED = {
     "_source": {"url": "https://example.invalid/run", "description": "a test"},
     "gsm8k": {
@@ -260,7 +262,7 @@ def test_a_good_pair_passes_every_stage_on_the_whole_split(sandbox):
     "knobs,baseline,env,failed",
     [
         # A pending baseline fails the gate unless the step asks it to warn.
-        ("", None, {}, "gsm8k"),
+        ("", _PENDING, {}, "gsm8k"),
         ("", _MEASURED, {"FAKE_SCORE": "0.90"}, "gsm8k"),
         ("", _MEASURED, {"FAKE_LM_EVAL": "noresults"}, "gsm8k"),
         ("", _MEASURED, {"FAKE_LM_EVAL": "partial"}, "gsm8k"),
@@ -290,7 +292,7 @@ def test_a_failing_stage_fails_the_script(sandbox, knobs, baseline, env, failed)
 
 
 def test_a_pending_baseline_only_warns_under_eval_soft_fail(sandbox):
-    proc, stages = _run(sandbox, EVAL_SOFT_FAIL="1")
+    proc, stages = _run(sandbox, baseline=_PENDING, EVAL_SOFT_FAIL="1")
     assert proc.returncode == 0, proc.stdout[-3000:]
     assert set(stages.values()) == {0}
     assert "baseline is pending" in proc.stdout

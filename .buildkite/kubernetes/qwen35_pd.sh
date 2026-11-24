@@ -183,7 +183,7 @@ if [[ "$role" == decode || "$INDEX" != "0" ]]; then
 fi
 
 proxy_pid=""
-# shellcheck disable=SC2317  # invoked via the EXIT trap
+# shellcheck disable=SC2317,SC2329  # invoked via the EXIT trap
 cleanup() {
   if [[ -n "$proxy_pid" ]]; then
     kill "$proxy_pid" 2>/dev/null || true

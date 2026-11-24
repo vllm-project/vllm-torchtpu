@@ -448,7 +448,7 @@ def test_gated_evals_have_baselines_and_pending_ones_show_on_the_step(config, ma
     assert gen_kwargs["chat_template_kwargs"] == gsm8k["chat_template_kwargs"]
 
     check_regression = _check_regression()
-    baselines = [
+    evals = [
         BASELINES / "eval" / f"{config}.{t}.baseline.json"
         for t in values["LM_EVAL_TASKS"].split()
     ]
@@ -457,10 +457,9 @@ def test_gated_evals_have_baselines_and_pending_ones_show_on_the_step(config, ma
         BASELINES / "perf" / "v7x" / f"{config}.baseline.json",
     ]
     assert sum(p.exists() for p in perf) == 1, f"one perf baseline for {config}: {perf}"
-    baselines += [p for p in perf if p.exists()]
 
-    pending = []
-    for path in baselines:
+    pending = {}
+    for path in evals + [p for p in perf if p.exists()]:
         assert path.exists(), (
             f"{path.name} is missing: the gate would have nothing to check"
         )
@@ -469,26 +468,32 @@ def test_gated_evals_have_baselines_and_pending_ones_show_on_the_step(config, ma
         if "_pending" in body:
             assert isinstance(body["_pending"], str) and body["_pending"].strip()
             assert refusal and "pending" in refusal
-            pending.append(path.name)
+            pending[path] = body
             continue
         assert refusal is None, f"{path.name}: {refusal}"
         source = body.get("_source", {})
         assert source.get("url") and source.get("description"), path.name
-        if path.parent.name == "eval" or path.parent.parent.name == "eval":
+        if path in evals:
             task = path.name.split(".")[-3]
             metric = check_regression.primary_metric(body[task])
             assert metric is not None
             assert check_regression.primary_stderr(body[task], metric.name) is not None
 
+    # The step runs the evals only (the stages pass --skip-benchmark), so its
+    # verdict follows the eval baselines: soft while one is pending, hard once
+    # every one is measured. Never the whole step: boot, completions, the
+    # prefix hit, transfer, MTP and the legs stay hard either way.
     step = _pipeline_step(manifest)
-    # Never the whole step: boot, page, transfer and MTP stay hard.
     assert "soft_fail" not in step
-    if pending:
-        assert step.get("env", {}).get("EVAL_SOFT_FAIL") == "1", (
-            f"pending baselines {pending}: the step must set EVAL_SOFT_FAIL=1"
+    eval_soft = step.get("env", {}).get("EVAL_SOFT_FAIL", "0")
+    pending_evals = [p.name for p in evals if p in pending]
+    if pending_evals:
+        assert eval_soft == "1", (
+            f"pending baselines {pending_evals}: the step must set EVAL_SOFT_FAIL=1"
         )
         assert "(baselines pending)" in step["label"]
     else:
+        assert eval_soft == "0", "every eval baseline is measured: gate it hard"
         assert "pending" not in step["label"]
 
 
