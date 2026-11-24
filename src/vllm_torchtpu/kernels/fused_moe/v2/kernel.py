@@ -397,6 +397,95 @@ def expert_ffn_blockscale(
     return acc2, mid_scale
 
 
+# Output columns the bf16-dequant four-bit body dequantizes and contracts at
+# a time: the width of its [K, chunk] bf16 staging buffer.
+FP4_DEQUANT_CHUNK = host.FP4_DEQUANT_CHUNK
+
+
+def dequant_contract(lhs, read_block, scales, *, qb, n_out, chunk, stage):
+    """lhs @ W, W a block-scaled weight dequantized one output chunk at a time.
+
+    For each chunk of `chunk` output columns, every contraction block is read
+    (`read_block(b, n_start, n_end)` -> the block's columns as f32 values of
+    the stored element type), multiplied by its scales and rounded to bf16
+    into `stage` ([K, >= chunk] bf16 ref, or None to concatenate as values);
+    then ONE full-K bf16 dot contracts the chunk. The block scale is folded
+    into the weight instead of applied to a [rows, chunk] f32 partial after
+    every K=qb dot, so the matrix unit sees K = the whole contraction and the
+    vector unit's per-block work scales with qb rows, not with the tile.
+
+    Blocks are read chunk-major and in block order, the order
+    `expert_ffn_blockscale` reads them in, so a streamed slab's first-read
+    wait and last-read retire land on the same reads.
+    """
+    k_rows = lhs.shape[-1]
+    n_blocks = k_rows // qb
+    outs = []
+    for n_start in range(0, n_out, chunk):
+        n_end = min(n_start + chunk, n_out)
+        width = n_end - n_start
+        parts = []
+        for b in range(n_blocks):
+            w = read_block(b, n_start, n_end) * scales[b : b + 1, n_start:n_end]
+            w = w.astype(jnp.bfloat16)
+            if stage is None:
+                parts.append(w)
+            else:
+                stage[pl.ds(b * qb, qb), pl.ds(0, width)] = w
+        rhs = (
+            jnp.concatenate(parts, axis=0)
+            if stage is None
+            else stage[pl.ds(0, k_rows), pl.ds(0, width)]
+        )
+        outs.append(
+            lax.dot_general(lhs, rhs, DN, preferred_element_type=jnp.float32)
+        )
+    return jnp.concatenate(outs, axis=-1) if len(outs) > 1 else outs[0]
+
+
+def expert_ffn_dequant(
+    act_q,
+    act_scale,
+    w1_block,
+    w2_block,
+    w1s_blocks,
+    w2s_blocks,
+    *,
+    qb=QB4,
+    act_fn="silu",
+    w1b=None,
+    chunk=FP4_DEQUANT_CHUNK,
+    stage=None,
+):
+    """One expert's FFN on block-scaled weights, dequantized to bf16.
+
+    The same layer as expert_ffn_blockscale, contracted differently: each
+    weight chunk is dequantized with its block scales folded in and
+    contracted in one full-K bf16 dot (dequant_contract); the fp8 token rows
+    widen to bf16 exactly and their row scale is applied to the gate/up
+    accumulator, and the intermediate goes into the down matmul as bf16
+    rather than requantized to fp8. The difference from the fp8 body is the
+    bf16 rounding of each dequantized weight, which is the weight the
+    grouped-matmul path contracts, and no intermediate requantization.
+
+    w1_block / w2_block return a weight k-block's columns as f32. Returns
+    the down matmul's accumulator and None: it is already the true value.
+    """
+    inter = w1s_blocks.shape[-1] // 2
+    hidden = w2s_blocks.shape[-1]
+    act = act_q.astype(jnp.bfloat16)
+    acc1 = dequant_contract(
+        act, w1_block, w1s_blocks, qb=qb, n_out=2 * inter, chunk=chunk, stage=stage
+    )
+    mid, _ = _intermediate_rows(
+        acc1, act_scale, inter, w1s=None, act_fn=act_fn, w1b=w1b, requantize=False
+    )
+    acc2 = dequant_contract(
+        mid, w2_block, w2s_blocks, qb=qb, n_out=hidden, chunk=chunk, stage=stage
+    )
+    return acc2, None
+
+
 def expert_ffn_bf16(act, w1, w2, act_fn="silu", w1b=None):
     """One expert's FFN on unquantized sixteen-bit weights.
 
@@ -534,8 +623,11 @@ def _build_fused_ep_moe_kernel(
     act_fn="silu",
     has_w1_bias=False,
     has_w2_bias=False,
+    fp4_body="blockscale",
 ):
     """Build the pallas_call and the function that invokes it."""
+    if fp4_body not in host.FP4_BODIES:
+        raise ValueError(f"fp4_body must be one of {host.FP4_BODIES}; got {fp4_body!r}")
     if act_fn not in ACT_FNS:
         raise NotImplementedError(
             f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
@@ -547,6 +639,10 @@ def _build_fused_ep_moe_kernel(
     # of the wire is the weight format's, not a literal here.
     form = host.weight_form(weight_format)
     rhs_packed4 = weight_format == host.WeightFormat.FP4
+    # Only the four-bit format has a second body; every other format ignores
+    # the choice, and it is normalized so their cache keys do not split.
+    fp4_body = fp4_body if rhs_packed4 else "blockscale"
+    dequant_body = fp4_body == "dequant"
     # The weight prefetch distance and the slot count it needs are chosen
     # below, once the shapes they are sized against have been checked: they
     # are a property of THIS build and not of the process, so everything
@@ -643,6 +739,7 @@ def _build_fused_ep_moe_kernel(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        fp4_body=fp4_body,
     )
     prefetch_distance = slots.distance
     nbuf = slots.nbuf
@@ -862,6 +959,8 @@ def _build_fused_ep_moe_kernel(
         ls_vm = next(it) if has_act_scale else None
         out_vm = next(it)
         oscl_vm = next(it)  # [parities, tile blocks, ROWBLK] f32
+        # The "dequant" body's bf16 weight-chunk staging, last in the list.
+        dq_vm = next(it) if dequant_body else None
         token_gather_sem0, token_gather_sem1 = (next(it) for _ in range(2))
         lhs_sems, w1_sems, w2_sems = (next(it) for _ in range(3))
         w1s_sems = next(it) if has_scales else None
@@ -1575,17 +1674,38 @@ def _build_fused_ep_moe_kernel(
                                 else None
                             ),
                         )
-                        acc2, mid_scale = expert_ffn_blockscale(
-                            act_rows,
-                            act_scales,
-                            w1_block,
-                            w2_block,
-                            w1s_blocks,
-                            w2s_blocks,
-                            qb=rhs_qb,
-                            act_fn=act_fn,
-                            w1b=w1b_row,
-                        )
+                        if dequant_body:
+                            # fp4 -> fp8 -> f32 is exact, so the readers'
+                            # fp8 blocks carry the stored values unchanged.
+                            acc2, mid_scale = expert_ffn_dequant(
+                                act_rows,
+                                act_scales,
+                                lambda b, n0, n1: w1_block(b, n0, n1).astype(
+                                    jnp.float32
+                                ),
+                                lambda b, n0, n1: w2_block(b, n0, n1).astype(
+                                    jnp.float32
+                                ),
+                                w1s_blocks,
+                                w2s_blocks,
+                                qb=rhs_qb,
+                                act_fn=act_fn,
+                                w1b=w1b_row,
+                                chunk=FP4_DEQUANT_CHUNK,
+                                stage=dq_vm,
+                            )
+                        else:
+                            acc2, mid_scale = expert_ffn_blockscale(
+                                act_rows,
+                                act_scales,
+                                w1_block,
+                                w2_block,
+                                w1s_blocks,
+                                w2s_blocks,
+                                qb=rhs_qb,
+                                act_fn=act_fn,
+                                w1b=w1b_row,
+                            )
                     elif weight_format == host.WeightFormat.INT8:
                         assert w1s_vm is not None
                         w1_chunk, w2_chunk = _int8_chunk_readers(slot)
@@ -1901,6 +2021,7 @@ def _build_fused_ep_moe_kernel(
                 rhs_qb=rhs_qb,
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
+                fp4_body=fp4_body,
             )
         ]
         + [
@@ -2002,6 +2123,7 @@ def _build_fused_ep_moe_kernel(
             f"{format_tag}"
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
+            f"{'_dq' if dequant_body else ''}"
             f"_g{g_local}_c{capacity}_nb{nbuf}"
         )
         return pl.pallas_call(

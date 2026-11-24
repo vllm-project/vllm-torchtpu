@@ -527,6 +527,46 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 "NVFP4 GMM W4A16 enabled: block-%d", requant_block or self.group_size
             )
 
+    def fused_ep_apply_shared(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_partial: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """The fused EP layer with the TP-partial shared expert folded in.
+
+        Returns routed + the replica-group sum of `shared_partial`, already
+        reduced, or None when this layer has no shared-folding op armed (the
+        caller then takes the ordinary path).
+        """
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            fused_moe_ep,
+            fused_moe_ep_shared_op,
+            fused_moe_ep_supported,
+            score_bias_operand,
+        )
+
+        shared_op = fused_moe_ep_shared_op(layer)
+        if (
+            shared_op is None
+            or self._use_adaptive_fused_moe
+            or not fused_moe_ep_supported(self)
+        ):
+            return None
+        return fused_moe_ep(
+            self,
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer._tpu_fused_w13_scale,
+            layer._tpu_fused_w2_scale,
+            router_logits,
+            score_bias_operand(layer),
+            shared_partial=shared_partial,
+            shared_op=shared_op,
+        )
+
     def apply_monolithic(
         self,
         layer: RoutedExperts,

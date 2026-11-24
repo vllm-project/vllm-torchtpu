@@ -22,7 +22,10 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
-from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+    fused_moe_ep_shared_op,
+    fused_moe_ep_supported,
+)
 from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
 
 # Taken once at import, outside any trace: the MoE forward is traced by
@@ -145,7 +148,60 @@ class VllmMoERunner(MoERunner):
             return hidden_states, router_logits
         return super()._maybe_dispatch(hidden_states, router_logits)
 
+    def _folds_shared_expert(self) -> bool:
+        """Whether this layer's TP-partial shared expert rides the fused EP op.
+
+        Static per layer: MOE_FUSED_EP_FOLD_SHARED armed a shared-folding op
+        on the routed experts at weight load, and the quant method can call
+        it. The op then returns routed + the replica-group sum of the shared
+        output, already reduced, so the separate shared all-reduce (and its
+        half that duplicates the op's replica gather) is skipped.
+        """
+        return (
+            self._shared_experts is not None
+            and envs.USE_MOE_FUSED_EP_KERNEL
+            and not self.moe_config.is_sequence_parallel
+            and self.moe_config.pcp_size <= 1
+            and fused_moe_ep_supported(self._quant_method)
+            and fused_moe_ep_shared_op(self.routed_experts) is not None
+            and hasattr(self._quant_method, "fused_ep_apply_shared")
+        )
+
+    def _apply_quant_method(
+        self,
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids=None,
+        shared_experts_overlapping=False,
+    ):
+        if shared_experts_overlapping or not self._folds_shared_expert():
+            return super()._apply_quant_method(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids=input_ids,
+                shared_experts_overlapping=shared_experts_overlapping,
+            )
+        from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+            SharedExpertsOrder,
+        )
+
+        self._maybe_apply_shared_experts(
+            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+        )
+        shared = self._shared_experts.output
+        fused = self._quant_method.fused_ep_apply_shared(
+            self.routed_experts, hidden_states, router_logits, shared
+        )
+        assert fused is not None, "shared-folding fused EP op vanished"
+        # The shared term is inside `fused`, reduced; report no shared output
+        # so nothing adds or all-reduces it again (_maybe_combine below).
+        return None, fused
+
     def _maybe_combine(self, shared_output, hidden_states):
+        if shared_output is None and self._folds_shared_expert():
+            return hidden_states
         if self._fused_ep_owns_pcp_collectives():
             # The fused program has already pushed and summed routed rows
             # back onto their token-owning PCP rank. Preserve upstream's

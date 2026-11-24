@@ -144,6 +144,9 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
+    MOE_FUSED_EP_V2_FP4_BODY: str = "blockscale"
+    MOE_FUSED_EP_LOCAL_DISPATCH: bool = False
+    MOE_FUSED_EP_FOLD_SHARED: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
@@ -1189,6 +1192,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ascending device-id order, so the SparseCore gather gets its
     # N-dimensional algorithm without moving the program's DeviceAssignment.
     "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
+    # The four-bit FFN body of fused EP MoE v2: "blockscale" (fp8 dots, one
+    # per qb-deep weight block, block scale on the f32 partial) or "dequant"
+    # (each weight chunk dequantized to bf16 with its block scales folded in,
+    # one full-K bf16 dot per chunk). See kernels/fused_moe/v2/host.FP4_BODIES.
+    "MOE_FUSED_EP_V2_FP4_BODY": lambda: os.getenv(
+        "MOE_FUSED_EP_V2_FP4_BODY", "blockscale"
+    ),
+    # With TP-replicated MoE inputs in two replica groups (TP x DP2 + EP),
+    # quantize the own group's rows locally and exchange only the other
+    # group's in the fused EP dispatch, instead of a flat all-gather.
+    "MOE_FUSED_EP_LOCAL_DISPATCH": env_bool("MOE_FUSED_EP_LOCAL_DISPATCH"),
+    # Fold a TP-partial shared expert into the fused EP op: reduce-scatter it
+    # beside the routed rows and pay one replica all-gather for both, instead
+    # of a separate shared-expert all-reduce.
+    "MOE_FUSED_EP_FOLD_SHARED": env_bool("MOE_FUSED_EP_FOLD_SHARED"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the

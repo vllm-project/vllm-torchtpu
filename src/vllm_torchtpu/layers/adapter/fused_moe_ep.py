@@ -118,6 +118,16 @@ _RANK_BUFFER: Any = None
 # (`Fp8Config.get_quant_method`), so this is per-layer state without a registry
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
+# Where prebuild records, on the LAYER, the variant of the op that also takes
+# the TP-partial shared expert output (MOE_FUSED_EP_FOLD_SHARED). The runner
+# owns the shared expert, so it is the runner that decides to use it; see
+# `fused_moe_ep_shared_op`.
+FUSED_MOE_EP_SHARED_OP_ATTR = "_fused_moe_ep_shared_op"
+
+
+def fused_moe_ep_shared_op(layer: Any) -> Any:
+    """The shared-folding op prebuild armed for this layer, or None."""
+    return getattr(layer, FUSED_MOE_EP_SHARED_OP_ATTR, None)
 
 
 def _squeeze_channel_scale(
@@ -181,6 +191,9 @@ def _build_op(
     *,
     token_replica_groups=None,
     sorted_gather=None,
+    local_dispatch=False,
+    fp4_body="blockscale",
+    has_shared=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -203,6 +216,9 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         None if sorted_gather is None else sorted_gather[1],
+        local_dispatch,
+        fp4_body,
+        has_shared,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -244,6 +260,8 @@ def _build_op(
             mesh_ep_ranks=mesh_expert_order,
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
+            local_dispatch=local_dispatch,
+            fp4_body=fp4_body,
             **bias_kw,
             **routing_kw,
         )
@@ -303,7 +321,44 @@ def _build_op(
             hash_topk_ids=hash_ids.astype(jnp.int32),
         )
 
+    def moe_shared(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        shared: jax.Array,
+    ) -> jax.Array:
+        return call(x, w1, w2, w1_scale, w2_scale, gating, rank, shared_partial=shared)
+
+    def moe_with_score_bias_shared(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        score_bias: jax.Array,
+        shared: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            score_bias=score_bias.astype(jnp.float32),
+            shared_partial=shared,
+        )
+
     assert not (has_score_bias and has_hash_ids)
+    # The shared fold rides the single fused program only.
+    assert not (has_shared and (has_hash_ids or sorted_gather is not None))
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
     # every shard for its own tokens, so it is replicated where the other
@@ -317,6 +372,7 @@ def _build_op(
         (spec,) * 7
         + ((PartitionSpec(),) if has_score_bias else ())
         + ((spec,) if has_hash_ids else ())
+        + ((spec,) if has_shared else ())
     )
     # Stock jax_op. It used to size its outputs from the export's avals, where
     # a shard_map result is recorded as replicated, so this rank's 2048 rows
@@ -324,7 +380,9 @@ def _build_op(
     # JaxCallable with that one line replaced, was the way around it. Torchtpu
     # takes output_partition_specs itself now, which is the same information
     # without a copy of anyone's source.
-    if has_score_bias:
+    if has_shared:
+        fn = moe_with_score_bias_shared if has_score_bias else moe_shared
+    elif has_score_bias:
         fn = moe_with_score_bias
     elif has_hash_ids:
         fn = moe_with_hash_ids
@@ -561,6 +619,8 @@ def fused_moe_ep(
     router_logits: torch.Tensor,
     score_bias: torch.Tensor | None = None,
     hash_ids: torch.Tensor | None = None,
+    shared_partial: torch.Tensor | None = None,
+    shared_op: Any = None,
 ) -> torch.Tensor:
     """Run one MoE layer through the fused EP kernel.
 
@@ -577,7 +637,13 @@ def fused_moe_ep(
     Getting it wrong is a torch arity error at the first call, not a wrong
     answer.
     """
-    op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
+    if shared_partial is not None:
+        # `shared_op` is fused_moe_ep_shared_op(layer): the variant whose
+        # signature ends in the shared expert's TP-partial output.
+        assert shared_op is not None
+        op = shared_op
+    else:
+        op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
     if w1.dtype == torch.float4_e2m1fn_x2:
         # FP4 scales are already [E, K/block, N]. Even a single block must
         # retain its axis; the per-channel helper would incorrectly drop it.
@@ -594,7 +660,7 @@ def fused_moe_ep(
     )
     if envs.TPU_MOE_SKIP_PADDED_TOKENS:
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
-    extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
+    extra = tuple(t for t in (score_bias, hash_ids, shared_partial) if t is not None)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
 
 
@@ -931,7 +997,16 @@ def prebuild_fused_moe_ep(
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
-    op = _build_op(
+    replica_width = len(token_replica_groups[0]) if token_replica_groups else 1
+    local_dispatch = bool(
+        envs.MOE_FUSED_EP_LOCAL_DISPATCH
+        and sorted_gather is None
+        and replica_width > 1
+        and token_replica_groups is not None
+        and len(token_replica_groups) == 2
+    )
+    fp4_body = envs.MOE_FUSED_EP_V2_FP4_BODY if weight_format == "fp4" else "blockscale"
+    op_args = (
         mesh,
         topk,
         renormalize,
@@ -944,9 +1019,33 @@ def prebuild_fused_moe_ep(
         has_score_bias,
         routed_scale,
         has_hash_ids,
+    )
+    op_kw = dict(
         token_replica_groups=token_replica_groups,
         sorted_gather=sorted_gather,
+        local_dispatch=local_dispatch,
+        fp4_body=fp4_body,
     )
+    op = _build_op(*op_args, **op_kw)
+    # The shared-folding variant, armed beside the plain op: whether a layer
+    # HAS a shared expert is the runner's knowledge, not the quant method's,
+    # so the runner picks it (VllmMoERunner._apply_quant_method).
+    shared_op = None
+    if (
+        envs.MOE_FUSED_EP_FOLD_SHARED
+        and replica_width > 1
+        and not has_hash_ids
+        and sorted_gather is None
+    ):
+        shared_op = _build_op(*op_args, **op_kw, has_shared=True)
+    setattr(layer, FUSED_MOE_EP_SHARED_OP_ATTR, shared_op)
+    if local_dispatch or fp4_body != "blockscale" or shared_op is not None:
+        logger.info_once(
+            "Fused EP MoE options | local_dispatch=%s fp4_body=%s fold_shared=%s",
+            local_dispatch,
+            fp4_body,
+            shared_op is not None,
+        )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "

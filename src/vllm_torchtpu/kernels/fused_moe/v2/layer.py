@@ -280,6 +280,9 @@ def fused_ep_moe_v2(
     stage="fused",
     routed=None,
     gather_positions=None,
+    shared_partial=None,
+    local_dispatch=False,
+    fp4_body="blockscale",
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -341,6 +344,24 @@ def fused_ep_moe_v2(
     shard's q concatenated on axis 0, and returns what "fused" returns.
     gather_positions[i] is the block of q_g holding mesh index i's rows;
     None means mesh order.
+
+    shared_partial [tokens, hidden], sharded like x, is this shard's partial
+    sum of a term every replica of a token owes the output -- the
+    tensor-parallel shared expert's down projection. It is reduced across
+    each token replica group and added to the routed result inside the one
+    replica gather the layer already pays (`restore_with_partial`), instead
+    of a separate all-reduce around the layer. With singleton groups it is
+    added as is. Stage "fused" only.
+
+    local_dispatch (stage "fused", fp8 rows, two token replica groups):
+    every member of a replica group holds the group's whole input, so each
+    shard quantizes every share of its own group and only the other group's
+    shares travel (`TokenReplicaLayout.local_dispatch_rows`). The flat
+    activation all-gather moves 2 * width - 1 shares per shard; this moves
+    width. Falls back to the flat gather where the layout does not qualify.
+
+    fp4_body selects the four-bit FFN body ("blockscale" or "dequant", see
+    host.FP4_BODIES); other formats ignore it.
 
     hash_topk_ids [tokens, topk] i32 replaces the router's selection with
     expert ids the caller already chose -- DeepSeek-V4's bottom layers look
@@ -435,6 +456,21 @@ def fused_ep_moe_v2(
         row_alignment=U32_SUBLANE_TILE,
     )
     t_local = token_layout.local_rows
+    local_dispatch = bool(
+        local_dispatch
+        and stage == "fused"
+        and form.quantized_activations
+        and token_layout.width > 1
+        and len(token_layout.groups) == 2
+    )
+    if shared_partial is not None:
+        if stage != "fused":
+            raise ValueError('shared_partial is taken on stage "fused" only')
+        if shared_partial.shape != x.shape:
+            raise ValueError(
+                f"shared_partial must be shaped like x {tuple(x.shape)}; got "
+                f"{tuple(shared_partial.shape)}"
+            )
     # route pads its outputs to these rows, which the torch op's fake can size
     # without a guard on the token count; compute drops the padding again.
     t_wire = replica_wire_rows(T // ep, len(token_layout.groups[0]), U32_SUBLANE_TILE)
@@ -490,6 +526,7 @@ def fused_ep_moe_v2(
         act_fn=act_fn,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        fp4_body=fp4_body,
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -632,8 +669,14 @@ def fused_ep_moe_v2(
         w2s_l,
         bias_it,
         out_dtype,
+        positions=None,
+        shared_l=None,
     ):
-        """Plan, kernel and combine over the gathered rows and payload."""
+        """Plan, kernel and combine over the gathered rows and payload.
+
+        `positions` [ep] i32, where given, is the block of q_g holding each
+        mesh rank's rows (local dispatch's rank-dependent layout); `shared_l`
+        is folded into the replica gather (see `shared_partial`)."""
         me = rank_l[0, 0]
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
@@ -691,6 +734,13 @@ def fused_ep_moe_v2(
             token_gather = jnp.asarray(gather_positions, jnp.int32)[src] * t_local + (
                 token_gather - src * t_local
             )
+        elif positions is not None:
+            # Same remap as gather_positions, with a table that depends on
+            # which replica group this shard is in, so it is data. The
+            # off-shard sentinel (>= T) is left where it is.
+            src = jnp.minimum(token_gather // t_local, ep - 1)
+            moved = positions[src] * t_local + (token_gather - src * t_local)
+            token_gather = jnp.where(token_gather < T, moved, token_gather)
         # The kernel DMA-aligns each logical expert window down by as much as
         # 127 int32 rows and always copies a full fixed window. Pad after the
         # scatter (rather than enlarging its destination) so the off-shard
@@ -791,15 +841,61 @@ def fused_ep_moe_v2(
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        if shared_l is not None:
+            return token_layout.restore_with_partial(combined, shared_l, ax)
         return token_layout.restore(combined, ax)
+
+    def quantize_group(x_l, rank_l, gate_l, hash_l):
+        """quantize_local for local dispatch: every share of this group.
+
+        Every share goes through the same split, barrier and row quant, at a
+        static slot, on every member of the group, so the share a member
+        computes for a peer is bit-identical to the one that peer computes
+        for itself -- the row scale it ships in the routing payload is the
+        one the rows were quantized with.
+        """
+        me = rank_l[0, 0]
+        width = token_layout.width
+        qs, scales = [], []
+        for s in range(width):
+            rows = lax.optimization_barrier(
+                token_layout.split_slot(x_l, jnp.int32(s))
+            ).astype(jnp.bfloat16)
+            q, sc = rowquant_fp8(rows)
+            qs.append(q.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK))
+            scales.append(sc)
+        slot = jnp.asarray(token_layout.slots, dtype=jnp.int32)[me]
+        q_all = jnp.stack(qs)
+        q_l = lax.dynamic_index_in_dim(q_all, slot, 0, keepdims=False)
+        row_scale_l = lax.dynamic_index_in_dim(jnp.stack(scales), slot, 0, keepdims=False)
+        gate_l = token_layout.split(gate_l, me, fill_value=-jnp.inf)
+        if hash_l is not None:
+            hash_l = token_layout.split(hash_l, me)
+        own = q_all.reshape(width * t_local, *q_all.shape[2:])
+        return gate_l, hash_l, q_l, row_scale_l, own
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
+        if shared_partial is not None:
+            *scales_gating_biases, shared_l = scales_gating_biases
+        else:
+            shared_l = None
         w1s_l, w2s_l, gate_l, hash_l, score_bias_l, bias_it = unpack_operands(
             scales_gating_biases
         )
-        gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
-        q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
+        positions = None
+        if local_dispatch:
+            gate_l, hash_l, q_l, row_scale_l, own = quantize_group(
+                x_l, rank_l, gate_l, hash_l
+            )
+            q_g, positions = token_layout.local_dispatch_rows(
+                own, q_l, rank_l[0, 0], ax
+            )
+        else:
+            gate_l, hash_l, q_l, row_scale_l = quantize_local(
+                x_l, rank_l, gate_l, hash_l
+            )
+            q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
             gate_l, hash_l, score_bias_l, row_scale_l
         )
@@ -820,6 +916,8 @@ def fused_ep_moe_v2(
             w2s_l,
             bias_it,
             x_l.dtype,
+            positions=positions,
+            shared_l=shared_l,
         )
 
     def route_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -912,6 +1010,9 @@ def fused_ep_moe_v2(
     if routed is not None:
         args += tuple(routed)
         in_specs += (P(ax),) * len(routed)
+    if shared_partial is not None:
+        args += (shared_partial,)
+        in_specs += (P(ax),)
     NS = jax.sharding.NamedSharding
     args = tuple(jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
     # local_fn closes over config-static values only -- the per-call data
@@ -946,6 +1047,9 @@ def fused_ep_moe_v2(
         float(routed_scaling_factor),
         stage,
         gather_positions,
+        shared_partial is not None and shared_partial.dtype,
+        local_dispatch,
+        fp4_body,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),

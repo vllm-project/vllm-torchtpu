@@ -93,17 +93,43 @@ class TokenReplicaLayout:
         local_rows = (local_rows + alignment - 1) // alignment * alignment
         return cls(groups, tuple(slots), input_rows, local_rows)
 
+    @property
+    def width(self) -> int:
+        return len(self.groups[0])
+
+    @property
+    def group_of(self) -> tuple[int, ...]:
+        """The index of the replica group each mesh rank belongs to."""
+        owner = [0] * sum(len(g) for g in self.groups)
+        for g, group in enumerate(self.groups):
+            for rank in group:
+                owner[rank] = g
+        return tuple(owner)
+
+    @property
+    def slot_groups(self) -> tuple[tuple[int, ...], ...]:
+        """For each slot, the ranks holding that slot, in group order."""
+        return tuple(
+            tuple(group[s] for group in self.groups) for s in range(self.width)
+        )
+
+    def split_slot(
+        self, rows: jax.Array, slot: jax.Array, *, fill_value: float = 0
+    ) -> jax.Array:
+        """Slot `slot`'s contiguous share of the replicated rows."""
+        padding = self.local_rows * self.width - self.input_rows
+        rows = jnp.pad(rows, ((0, padding), (0, 0)), constant_values=fill_value)
+        return lax.dynamic_slice_in_dim(
+            rows, slot * self.local_rows, self.local_rows, axis=0
+        )
+
     def split(
         self, rows: jax.Array, rank: jax.Array, *, fill_value: float = 0
     ) -> jax.Array:
         if len(self.groups[0]) == 1:
             return rows
-        padding = self.local_rows * len(self.groups[0]) - self.input_rows
-        rows = jnp.pad(rows, ((0, padding), (0, 0)), constant_values=fill_value)
         slot = jnp.asarray(self.slots, dtype=jnp.int32)[rank]
-        return lax.dynamic_slice_in_dim(
-            rows, slot * self.local_rows, self.local_rows, axis=0
-        )
+        return self.split_slot(rows, slot, fill_value=fill_value)
 
     def restore(self, rows: jax.Array, axis: str) -> jax.Array:
         if len(self.groups[0]) == 1:
@@ -112,3 +138,67 @@ class TokenReplicaLayout:
             rows, axis, axis=0, tiled=True, axis_index_groups=self.groups
         )
         return gathered[: self.input_rows]
+
+    def restore_with_partial(
+        self, rows: jax.Array, partial: jax.Array, axis: str
+    ) -> jax.Array:
+        """`restore(rows)` plus the group-wide sum of `partial`, in one gather.
+
+        `partial` is [input_rows, ...] and holds one replica's partial sum of
+        a term every replica owes the output -- a tensor-parallel shared
+        expert's down projection, say. Summing it with an all-reduce and then
+        gathering `rows` pays the gather twice: an all-reduce is a
+        reduce-scatter plus an all-gather. Here the reduce-scatter lands each
+        slot's share of the sum beside the rows that slot owns, and the one
+        gather `restore` already pays carries both.
+        """
+        if self.width == 1:
+            return rows + partial.astype(rows.dtype)
+        padding = self.local_rows * self.width - self.input_rows
+        partial = jnp.pad(partial, ((0, padding),) + ((0, 0),) * (partial.ndim - 1))
+        share = lax.psum_scatter(
+            partial,
+            axis,
+            scatter_dimension=0,
+            axis_index_groups=self.groups,
+            tiled=True,
+        )
+        return self.restore(rows + share.astype(rows.dtype), axis)
+
+    def local_dispatch_rows(
+        self, own_rows: jax.Array, mine: jax.Array, rank: jax.Array, axis: str
+    ) -> tuple[jax.Array, jax.Array]:
+        """Every shard's wire rows without re-gathering the ones held already.
+
+        Every member of a replica group holds the group's whole input, so it
+        can produce every slot's wire rows itself (`own_rows`, [width *
+        local_rows, ...] in slot order); a flat all-gather of `mine` (this
+        shard's [local_rows, ...]) moves width - 1 of those shares again.
+        Only the other group's rows have to travel: one share crosses from
+        the same-slot shard of that group, then the group gathers the
+        crossed shares among itself.
+
+        Returns (rows, positions): rows [2 * width * local_rows, ...] with
+        this group's shares first, and positions [ep] i32, the block of rows
+        holding mesh rank m's share. Two groups only.
+        """
+        if len(self.groups) != 2:
+            raise ValueError("local dispatch needs exactly two replica groups")
+        group = jnp.asarray(self.group_of, dtype=jnp.int32)[rank]
+        crossed = lax.all_gather(
+            mine, axis, axis=0, tiled=False, axis_index_groups=self.slot_groups
+        )
+        foreign = lax.dynamic_index_in_dim(crossed, 1 - group, 0, keepdims=False)
+        foreign = lax.all_gather(
+            foreign, axis, axis=0, tiled=True, axis_index_groups=self.groups
+        )
+        width = self.width
+        table = [
+            [
+                self.slots[m] if self.group_of[m] == g else width + self.slots[m]
+                for m in range(len(self.slots))
+            ]
+            for g in range(2)
+        ]
+        positions = jnp.asarray(table, dtype=jnp.int32)[group]
+        return jnp.concatenate([own_rows, foreign], axis=0), positions

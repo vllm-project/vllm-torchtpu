@@ -168,6 +168,14 @@ OUT_PARITIES = 2
 # k-block to fp8, an integer contraction chunk to bf16 -- is double-
 # buffered, so the next chunk widens while the current one feeds the MXU.
 WIDENED_BLOCK_BUFFERS = 2
+# The four-bit FFN bodies. "blockscale" contracts each qb-deep k-block as its
+# own fp8 dot and applies the block scale to the f32 partial; "dequant" folds
+# the block scales into a bf16 copy of each output chunk of the weight and
+# contracts it in one full-K dot (kernel.expert_ffn_dequant).
+FP4_BODIES = ("blockscale", "dequant")
+# Output columns the "dequant" body stages at a time: its staging buffer is
+# [max(hidden, inter), FP4_DEQUANT_CHUNK] bf16.
+FP4_DEQUANT_CHUNK = 512
 # The wire's scale mirror carries one f32 per row and is indexed by the
 # TILE the row was computed in: one 128-lane SUBLANE of the mirror holds a
 # whole tile's scales, and a run's scales are the sublanes of the tiles it
@@ -1362,6 +1370,7 @@ def vmem_scratch_arrays(
     rhs_qb=QB4,
     has_w1_bias=False,
     has_w2_bias=False,
+    fp4_body="blockscale",
 ):
     """The kernel's VMEM scratch buffers, as (name, shape, dtype).
 
@@ -1452,11 +1461,22 @@ def vmem_scratch_arrays(
             form.wire_dtype,
         ),
         ("oscl_vm", (OUT_PARITIES, 1, capacity), jnp.float32),
+        *(
+            [("dq_vm", (max(hidden, inter), FP4_DEQUANT_CHUNK), jnp.bfloat16)]
+            if weight_format == WeightFormat.FP4 and fp4_body == "dequant"
+            else []
+        ),
     ]
 
 
 def vmem_tile_body_arrays(
-    capacity, hidden, inter, *, weight_format=WeightFormat.FP8, rhs_qb=QB4
+    capacity,
+    hidden,
+    inter,
+    *,
+    weight_format=WeightFormat.FP8,
+    rhs_qb=QB4,
+    fp4_body="blockscale",
 ):
     """What one tile body keeps live, as (name, shape, dtype).
 
@@ -1489,7 +1509,14 @@ def vmem_tile_body_arrays(
     # concatenates the chunk list into one [tile_m, inter] bf16 array while
     # the chunks that feed it are still live. The requantizing path does not,
     # because it quantizes straight out of the chunk list into mid_q.
-    if form.quantized_activations:
+    dequant = weight_format == WeightFormat.FP4 and fp4_body == "dequant"
+    if dequant:
+        # The bf16-dequant body contracts the bf16 intermediate directly, so
+        # it concatenates the chunks like the unquantized formats do; its
+        # weight blocks are staged in dq_vm, a declared scratch.
+        arrays.append(("mid_concat", (tile_m, inter), jnp.bfloat16))
+        arrays.append(("act_bf16", (tile_m, hidden), jnp.bfloat16))
+    elif form.quantized_activations:
         arrays.append(("mid_q", (tile_m, inter), FP8))
     else:
         arrays.append(("mid_concat", (tile_m, inter), jnp.bfloat16))
@@ -1502,7 +1529,11 @@ def vmem_tile_body_arrays(
     # sixteen-bit wire ships down_bf16 itself and materializes nothing.
     if form.wire_dtype is FP8:
         arrays.append(("wire_rows", (tile_m, hidden), FP8))
-    if weight_format == WeightFormat.FP4:
+    if dequant:
+        arrays.append(
+            ("dequant_block", (WIDENED_BLOCK_BUFFERS, rhs_qb, FP4_DEQUANT_CHUNK), jnp.float32)
+        )
+    elif weight_format == WeightFormat.FP4:
         arrays.append(
             (
                 "widened_weight_block",
@@ -1532,6 +1563,7 @@ def vmem_estimate_bytes(
     has_w1_bias=False,
     has_w2_bias=False,
     info=None,
+    fp4_body="blockscale",
 ):
     """VMEM one built kernel occupies, from the arrays it declares.
 
@@ -1557,9 +1589,15 @@ def vmem_estimate_bytes(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        fp4_body=fp4_body,
     )
     arrays += vmem_tile_body_arrays(
-        capacity, hidden, inter, weight_format=weight_format, rhs_qb=rhs_qb
+        capacity,
+        hidden,
+        inter,
+        weight_format=weight_format,
+        rhs_qb=rhs_qb,
+        fp4_body=fp4_body,
     )
     return sum(array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)
 
@@ -1596,6 +1634,7 @@ def fit_weight_slots(
     has_w2_bias=False,
     info=None,
     limit=None,
+    fp4_body="blockscale",
 ):
     """The deepest prefetch schedule this shape's VMEM leaves room for.
 
@@ -1638,6 +1677,7 @@ def fit_weight_slots(
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
                 info=info,
+                fp4_body=fp4_body,
             ),
             limit,
         )
