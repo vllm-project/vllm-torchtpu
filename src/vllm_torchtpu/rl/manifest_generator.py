@@ -14,12 +14,11 @@
 """Model-agnostic ``weight_mapping`` manifest generator via layer reflection.
 
 Walks ``model.named_parameters(remove_duplicate=False)`` and dispatches each
-parameter by its exact owning vLLM/TorchTPU module class (patterned on PR #3363's
-``param_layout.py``), resolving HF source keys via ``hf_to_vllm_mapper`` and
-``packed_modules_mapping``. Fails closed with ``NotImplementedError`` on
-unsupported layers, quantization, PP/PCP/DCP > 1, EPLB, LoRA, DP vocab parallel,
-custom expert placement, active vision/MTP, or unclaimed parameters. Pure PyTorch
-only (zero JAX imports).
+parameter by its exact owning vLLM/TorchTPU module class, resolving HF source
+keys via ``hf_to_vllm_mapper`` and ``packed_modules_mapping``. Fails closed
+with ``NotImplementedError`` on unsupported layers, quantization, PP/PCP/DCP > 1,
+EPLB, LoRA, speculative decoding, DP vocab parallel, custom expert placement,
+active vision/MTP, or unclaimed parameters. Pure PyTorch only (zero JAX imports).
 """
 
 from __future__ import annotations
@@ -33,6 +32,7 @@ import torch
 
 from vllm_torchtpu.rl.weight_conversion import (
     SCHEMA_VERSION,
+    TMP_KEY_PREFIX,
     OpSpec,
     validate_manifest,
 )
@@ -177,7 +177,7 @@ def _fused_col_rules(
     for idx, (src_k, size, rep) in enumerate(
         zip(src_keys, seg_sizes, reps, strict=True)
     ):
-        tmp_k = f"__tmp__:{name}:seg{idx}"
+        tmp_k = f"{TMP_KEY_PREFIX}{name}:seg{idx}"
         seg_ops: list[OpSpec] = []
         if rep > 1:
             num_groups = _exact_div(tp_size, rep, f"{name} seg[{idx}] tp/rep")
@@ -229,7 +229,10 @@ def _fused_col_rules(
 
 
 def _check_supported(
-    model: torch.nn.Module, parallel_config: Any, model_config: Any
+    model: torch.nn.Module,
+    parallel_config: Any,
+    model_config: Any,
+    vllm_config: Any = None,
 ) -> None:
     if parallel_config is not None:
         for attr, label in (
@@ -265,6 +268,13 @@ def _check_supported(
         if getattr(model_config, "enable_mtp", False):
             raise NotImplementedError("MTP is not supported.")
 
+    if vllm_config is not None:
+        if getattr(vllm_config, "lora_config", None) is not None:
+            raise NotImplementedError(
+                "LoRA (vllm_config.lora_config) is not supported."
+            )
+        if getattr(vllm_config, "speculative_config", None) is not None:
+            raise NotImplementedError("Speculative decoding is not supported.")
     if getattr(model, "lora_config", None):
         raise NotImplementedError("LoRA (model.lora_config) is not supported.")
     model_qc = getattr(model, "quant_config", None)
@@ -311,11 +321,9 @@ def _check_supported(
                 "only unquantized bf16/fp16/fp32 are supported."
             )
         leaf_lower = parts[-1].lower()
-        if leaf_lower in (
-            "scales",
-            "weight_scale",
-            "input_scale",
-        ) or leaf_lower.endswith(("_scale", "_scale_inv", "_scales")):
+        if leaf_lower == "scales" or leaf_lower.endswith(
+            ("_scale", "_scale_inv", "_scales")
+        ):
             raise NotImplementedError(
                 f"Quantization scale parameter {name!r} is not supported."
             )
@@ -601,13 +609,15 @@ def _gdn_rule(
             seg_s = sizes
         else:
             src_keys, seg_s = [to_hf(name)], [sum(sizes)]
-        return _fused_col_rules(name, src_keys, seg_s, [1], 1, tail, flipped=flipped)
+        return _fused_col_rules(
+            name, src_keys, seg_s, [1] * len(src_keys), 1, tail, flipped=flipped
+        )
 
     rules: list[dict[str, Any]] = []
     if packed_leaves and len(packed_leaves) == 2 and len(sizes) == 4:
         qkv_src = to_hf(f"{pfx}{packed_leaves[0]}.{leaf}")
         z_src = to_hf(f"{pfx}{packed_leaves[1]}.{leaf}")
-        raw = [f"__tmp__:{name}:raw{i}" for i in range(3)]
+        raw = [f"{TMP_KEY_PREFIX}{name}:raw{i}" for i in range(3)]
         rules.append(
             _rule([qkv_src], raw, [{"split": {"axis": 0, "sizes": sizes[:3]}}])
         )
@@ -615,7 +625,7 @@ def _gdn_rule(
     elif packed_leaves and len(packed_leaves) == len(sizes):
         seg_inputs = [to_hf(f"{pfx}{s}.{leaf}") for s in packed_leaves]
     else:
-        raw = [f"__tmp__:{name}:raw{i}" for i in range(len(sizes))]
+        raw = [f"{TMP_KEY_PREFIX}{name}:raw{i}" for i in range(len(sizes))]
         rules.append(
             _rule([to_hf(name)], raw, [{"split": {"axis": 0, "sizes": sizes}}])
         )
@@ -814,13 +824,14 @@ def generate_manifest_dict(
     parallel_config: Any = None,
     model_config: Any = None,
     *,
+    vllm_config: Any = None,
     tp_size: int | None = None,
     dp_size: int | None = None,
     ep_size: int | None = None,
     expert_axis_grouped: bool = True,
 ) -> dict[str, Any]:
     """Generate a validated ``weight_mapping`` manifest dict for ``model``."""
-    _check_supported(model, parallel_config, model_config)
+    _check_supported(model, parallel_config, model_config, vllm_config=vllm_config)
     tp, _, ep = _resolve_parallel(model, parallel_config, tp_size, dp_size, ep_size)
     to_hf = _make_to_hf_key(model)
     packed = _collect_packed_mapping(model)
@@ -908,6 +919,7 @@ def generate_manifest(
     parallel_config: Any = None,
     model_config: Any = None,
     *,
+    vllm_config: Any = None,
     tp_size: int | None = None,
     dp_size: int | None = None,
     ep_size: int | None = None,
@@ -919,6 +931,7 @@ def generate_manifest(
             model,
             parallel_config=parallel_config,
             model_config=model_config,
+            vllm_config=vllm_config,
             tp_size=tp_size,
             dp_size=dp_size,
             ep_size=ep_size,

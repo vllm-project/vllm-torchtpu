@@ -510,21 +510,6 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(vocab_size, hidden_size, tp_size=tp_size)
 
 
-def slice_global_to_local(
-    tensor: torch.Tensor,
-    sharding: list[str | None],
-    *,
-    ranks: dict[str, int],
-    world_sizes: dict[str, int],
-) -> torch.Tensor:
-    out = tensor
-    for axis, ax_name in enumerate(sharding):
-        if ax_name is not None and world_sizes[ax_name] > 1:
-            chunk = out.shape[axis] // world_sizes[ax_name]
-            out = out.narrow(axis, ranks[ax_name] * chunk, chunk)
-    return out.contiguous()
-
-
 def build_qwen2_hf_weights(
     *,
     vocab_size: int = 64,

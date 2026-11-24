@@ -374,21 +374,21 @@ def test_apply_converted_weights_tpu_sync_and_fresh_buffer() -> None:
 
 
 def test_resolve_sharding_coords_bijective_when_moe_tp_gt_tp() -> None:
-    from vllm_torchtpu.worker.tpu_worker import _resolve_sharding_coords
+    import vllm_torchtpu.worker.tpu_worker as tw_mod
 
-    ep_group = SimpleNamespace(world_size=2, rank_in_group=1)
-    tp_group = SimpleNamespace(world_size=2, rank_in_group=0)
-    dp_group = SimpleNamespace(world_size=2, rank_in_group=1)
     seen = set()
     for g_rank in range(8):
         worker = _make_worker(
             nn.Module(), rank=g_rank, tp_size=2, dp_size=4, enable_ep=True, ep_size=2
         )
+        tp_rank = g_rank % 2
+        dp_rank = g_rank // 2
+        ep_rank = g_rank // 4
+        tp_group = SimpleNamespace(world_size=2, rank_in_group=tp_rank)
+        dp_group = SimpleNamespace(world_size=4, rank_in_group=dp_rank)
+        ep_group = SimpleNamespace(world_size=2, rank_in_group=ep_rank)
         with (
-            patch(
-                "vllm.distributed.parallel_state.model_parallel_is_initialized",
-                return_value=True,
-            ),
+            patch.object(tw_mod, "model_parallel_is_initialized", return_value=True),
             patch(
                 "vllm.distributed.parallel_state.get_tp_group", return_value=tp_group
             ),
@@ -399,35 +399,7 @@ def test_resolve_sharding_coords_bijective_when_moe_tp_gt_tp() -> None:
                 "vllm.distributed.parallel_state.get_ep_group", return_value=ep_group
             ),
         ):
-            coords = _resolve_sharding_coords(worker)
+            coords = tw_mod._resolve_sharding_coords(worker)
             seen.add((coords.ep_rank, coords.moe_tp_rank))
             assert coords.ep_size == 2 and coords.moe_tp_size == 4
     assert len(seen) == 8
-
-
-@pytest.mark.parametrize("tp_size,flipped", [(1, False), (2, False), (2, True)])
-def test_load_from_hf_end_to_end(tp_size: int, flipped: bool) -> None:
-    hf = build_qwen2_hf_weights(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_heads=4,
-        num_kv_heads=2,
-        tie_word_embeddings=True,
-    )
-    for r in range(tp_size):
-        model = Qwen2ForCausalLM(
-            vocab_size=32,
-            hidden_size=16,
-            intermediate_size=32,
-            num_heads=4,
-            num_kv_heads=2,
-            tp_size=tp_size,
-            tie_word_embeddings=True,
-            flipped=flipped,
-        )
-        worker = _make_worker(model, rank=r, tp_size=tp_size)
-        worker.load_from_hf(hf)
-        expected_emb = hf["model.embed_tokens.weight"].chunk(tp_size, dim=0)[r]
-        assert torch.equal(model.model.embed_tokens.weight.data, expected_emb)
-        assert torch.equal(model.lm_head.weight.data, expected_emb)

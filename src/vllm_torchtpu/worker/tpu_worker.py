@@ -1020,6 +1020,7 @@ class TPUWorker(WorkerBase):
             self.get_model(),
             parallel_config=self.parallel_config,
             model_config=self.model_config,
+            vllm_config=getattr(self, "vllm_config", None),
             expert_axis_grouped=expert_axis_grouped,
         )
 
@@ -1063,22 +1064,6 @@ class TPUWorker(WorkerBase):
 
         if updated_tensors and any(t.device.type == "tpu" for t in updated_tensors):
             utils.synchronize_tensors(updated_tensors, wait=True)
-
-    def load_from_hf(
-        self,
-        hf_weights: Mapping[str, torch.Tensor],
-        manifest_json: str | None = None,
-    ) -> None:
-        """Convert HF weights via the manifest protocol and install them in-place."""
-        from vllm_torchtpu.rl.weight_conversion import from_hf
-
-        manifest_str = (
-            manifest_json
-            if manifest_json is not None
-            else self.get_weight_mapping_manifest()
-        )
-        converted = from_hf(manifest_str, hf_weights)
-        self.apply_converted_weights(converted, manifest_json=manifest_str)
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         if not has_kv_transfer_group():

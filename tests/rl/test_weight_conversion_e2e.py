@@ -19,28 +19,19 @@ populated via:
 1. ``collective_rpc("get_weight_mapping_manifest")``
 2. Pure-PyTorch ``from_hf(dst_rule, hf_weights)``
 3. ``collective_rpc("apply_converted_weights", args=(converted, dst_rule))``
-   (or ``collective_rpc("load_from_hf", ...)``)
 
 produces identical greedy tokens and matching logprobs compared to a baseline
 ``LLM(...)`` loaded through standard vLLM ``load_model()``.
 
 Run via pytest (on a TPU host):
     pytest tests/rl/test_weight_conversion_e2e.py -v
-
-Run standalone (with custom model / TP / EP):
-    python tests/rl/test_weight_conversion_e2e.py \\
-        --model Qwen/Qwen2.5-0.5B --tp-size 1
-    python tests/rl/test_weight_conversion_e2e.py \\
-        --model Qwen/Qwen3.5-35B-A3B --tp-size 4 --enable-ep
 """
 
 from __future__ import annotations
 
-import argparse
 import gc
 import glob
 import importlib.util
-import json
 import os
 from pathlib import Path
 from typing import Any
@@ -181,7 +172,6 @@ def run_e2e_parity(
     max_tokens: int = 16,
     gpu_memory_utilization: float = 0.6,
     max_logprob_diff: float = 0.05,
-    use_load_from_hf: bool = False,
     prompts: list[str] | None = None,
 ) -> None:
     """Run baseline vs dummy+converted-weights E2E parity check on TPU."""
@@ -228,20 +218,17 @@ def run_e2e_parity(
         assert len(manifests) == tensor_parallel_size
         dst_rule = manifests[0]
         assert isinstance(dst_rule, str)
-        validate_manifest(json.loads(dst_rule))
+        validate_manifest(dst_rule)
         for rank_idx, rank_manifest in enumerate(manifests[1:], start=1):
             assert rank_manifest == dst_rule, (
                 f"Worker rank {rank_idx} returned a different manifest than rank 0"
             )
 
-        if use_load_from_hf:
-            rl_llm.collective_rpc("load_from_hf", args=(hf_weights, dst_rule))
-        else:
-            converted_weights = from_hf(dst_rule, hf_weights)
-            rl_llm.collective_rpc(
-                "apply_converted_weights",
-                args=(converted_weights, dst_rule),
-            )
+        converted_weights = from_hf(dst_rule, hf_weights)
+        rl_llm.collective_rpc(
+            "apply_converted_weights",
+            args=(converted_weights, dst_rule),
+        )
 
         converted_outputs = rl_llm.generate(
             test_prompts, sampling_params=sampling_params
@@ -266,14 +253,12 @@ def run_e2e_parity(
     not _HAS_TORCH_TPU,
     reason="TPU hardware / torch_tpu is required for Tier 2 E2E test",
 )
-@pytest.mark.parametrize("use_load_from_hf", [False, True])
-def test_qwen2_5_weight_conversion_e2e(use_load_from_hf: bool) -> None:
+def test_qwen2_5_weight_conversion_e2e() -> None:
     """Verify Qwen2.5 dense parity via dummy load + weight conversion RPC."""
     run_e2e_parity(
         model=DEFAULT_MODEL,
         tensor_parallel_size=DEFAULT_TP_SIZE,
         enable_expert_parallel=False,
-        use_load_from_hf=use_load_from_hf,
     )
 
 
@@ -294,82 +279,3 @@ def test_qwen3_5_moe_weight_conversion_e2e() -> None:
         tensor_parallel_size=MOE_TP_SIZE,
         enable_expert_parallel=DEFAULT_ENABLE_EP,
     )
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Tier 2 TPU E2E parity test for the Distributed RL Weight "
-            "Conversion Protocol."
-        )
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=DEFAULT_MODEL,
-        help="HF model ID or local checkpoint directory.",
-    )
-    parser.add_argument(
-        "--tp-size",
-        type=int,
-        default=DEFAULT_TP_SIZE,
-        help="Tensor parallel size.",
-    )
-    parser.add_argument(
-        "--enable-ep",
-        action="store_true",
-        default=DEFAULT_ENABLE_EP,
-        help="Enable expert parallelism for MoE models.",
-    )
-    parser.add_argument(
-        "--max-model-len",
-        type=int,
-        default=256,
-        help="Maximum sequence length for the engine.",
-    )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=16,
-        help="Number of tokens to generate per prompt.",
-    )
-    parser.add_argument(
-        "--gpu-memory-utilization",
-        type=float,
-        default=0.6,
-        help="HBM utilization fraction for vLLM.",
-    )
-    parser.add_argument(
-        "--max-logprob-diff",
-        type=float,
-        default=0.05,
-        help="Maximum allowed absolute difference in chosen-token logprobs.",
-    )
-    parser.add_argument(
-        "--use-load-from-hf",
-        action="store_true",
-        help="Use worker load_from_hf() RPC instead of host-side from_hf().",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = _parse_args()
-    run_e2e_parity(
-        model=args.model,
-        tensor_parallel_size=args.tp_size,
-        enable_expert_parallel=args.enable_ep,
-        max_model_len=args.max_model_len,
-        max_tokens=args.max_tokens,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_logprob_diff=args.max_logprob_diff,
-        use_load_from_hf=args.use_load_from_hf,
-    )
-    print(
-        f"PASS: RL weight conversion E2E parity verified for {args.model} "
-        f"(tp={args.tp_size}, ep={args.enable_ep})."
-    )
-
-
-if __name__ == "__main__":
-    main()

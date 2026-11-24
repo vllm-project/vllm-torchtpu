@@ -28,10 +28,8 @@ from vllm_torchtpu.rl import (
     SCHEMA_VERSION,
     execute_manifest,
     from_hf,
-    from_hf_impl,
     invert_manifest,
     to_hf,
-    to_hf_impl,
     validate_manifest,
 )
 
@@ -197,9 +195,11 @@ def test_cardinalities_and_api_wrappers() -> None:
     )
     dst, _ = _round_trip(m, {"a": a, "b": b})
     assert dst["c"].shape == (2, 4) and dst["d"].shape == (6, 4)
-    assert torch.equal(from_hf_impl(m, {"a": a, "b": b}, mesh=object())["c"], dst["c"])
+    assert torch.equal(
+        from_hf(json.dumps(m), {"a": a, "b": b}, mesh=object())["c"], dst["c"]
+    )
     inv = invert_manifest(m)
-    assert torch.equal(to_hf_impl(inv, dst)["a"], a)
+    assert torch.equal(execute_manifest(inv, dst)["a"], a)
     with pytest.raises(TypeError, match="from_hf expects dst_rule to be str"):
         from_hf(m, {"a": a, "b": b})  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="to_hf expects src_rule to be str"):

@@ -21,7 +21,6 @@ thin.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -157,8 +156,7 @@ def stage_converted_weights(
     ``converted_weights`` is sliced, validated for shape/dtype, and verified to
     equal the primary parameter's shard (raising ``ValueError`` on mismatch).
     """
-    manifest = json.loads(manifest_json)
-    validate_manifest(manifest)
+    manifest = validate_manifest(manifest_json)
     sharding_by_key = extract_sharding_map(manifest)
 
     unique_params = dict(model.named_parameters(remove_duplicate=True))
@@ -178,11 +176,7 @@ def stage_converted_weights(
             + ", ".join(details)
         )
 
-    staged: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
-    primary_by_param_id: dict[int, tuple[str, torch.Tensor]] = {}
-
-    # 1. Stage primary parameters in canonical unique_params order.
-    for key, param in unique_params.items():
+    def _slice_and_validate(key: str, param: torch.nn.Parameter) -> torch.Tensor:
         if key not in sharding_by_key:
             raise ValueError(
                 f"Parameter {key!r} is missing a rule/sharding entry in manifest"
@@ -190,24 +184,19 @@ def stage_converted_weights(
         tensor = converted_weights[key]
         shard = slice_tensor_for_shard(key, tensor, sharding_by_key[key], coords)
         _validate_shard_matches_param(key, param, shard, tensor, sharding_by_key[key])
+        return shard
+
+    staged: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
+    primary_by_param_id: dict[int, tuple[str, torch.Tensor]] = {}
+
+    for key, param in unique_params.items():
+        shard = _slice_and_validate(key, param)
         primary_by_param_id[id(param)] = (key, shard)
         staged.append((param, shard))
 
-    # 2. Verify any provided tied aliases match their primary parameter shard.
-    alias_keys = sorted(provided_keys - set(unique_params.keys()))
-    for alias_key in alias_keys:
-        if alias_key not in sharding_by_key:
-            raise ValueError(
-                f"Parameter {alias_key!r} is missing a rule/sharding entry in manifest"
-            )
+    for alias_key in sorted(provided_keys - set(unique_params.keys())):
         param = all_params[alias_key]
-        tensor = converted_weights[alias_key]
-        alias_shard = slice_tensor_for_shard(
-            alias_key, tensor, sharding_by_key[alias_key], coords
-        )
-        _validate_shard_matches_param(
-            alias_key, param, alias_shard, tensor, sharding_by_key[alias_key]
-        )
+        alias_shard = _slice_and_validate(alias_key, param)
         primary_key, primary_shard = primary_by_param_id[id(param)]
         if not torch.equal(alias_shard, primary_shard):
             raise ValueError(

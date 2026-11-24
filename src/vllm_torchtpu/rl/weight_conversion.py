@@ -29,6 +29,7 @@ from typing import Any, TypeGuard
 import torch
 
 SCHEMA_VERSION = "weight_mapping"
+TMP_KEY_PREFIX = "__tmp__:"
 
 
 class OpName(str, Enum):
@@ -434,10 +435,8 @@ def invert_manifest(manifest: RuleSpec) -> dict[str, Any]:
 def execute_manifest(
     manifest: RuleSpec,
     src_weights: Mapping[str, torch.Tensor],
-    mesh: Any = None,
 ) -> dict[str, torch.Tensor]:
     """Execute a ``weight_mapping`` manifest over PyTorch tensors (with chaining)."""
-    del mesh
     spec = _parse_manifest(manifest)
     dropped = set(spec["dropped_keys"])
     out: dict[str, torch.Tensor] = {}
@@ -475,7 +474,7 @@ def execute_manifest(
 
     for k in intermediates:
         out.pop(k, None)
-    for k in [k for k in out if k.startswith("__tmp__:")]:
+    for k in [k for k in out if k.startswith(TMP_KEY_PREFIX)]:
         out.pop(k, None)
 
     for src_k, dst_k in spec["tied_keys"]:
@@ -484,34 +483,18 @@ def execute_manifest(
     return out
 
 
-def from_hf_impl(
-    dst_rule: RuleSpec,
-    hf_weights: Mapping[str, torch.Tensor],
-    mesh: Any = None,
-) -> dict[str, torch.Tensor]:
-    """Convert HuggingFace weights using a parsed or JSON ``weight_mapping`` rule."""
-    return execute_manifest(dst_rule, hf_weights, mesh=mesh)
-
-
 def from_hf(
     dst_rule: str,
     hf_weights: Mapping[str, torch.Tensor],
     mesh: Any = None,
 ) -> dict[str, torch.Tensor]:
     """Convert HuggingFace weights using a serialized JSON ``dst_rule`` string."""
+    del mesh
     if not isinstance(dst_rule, str):
         raise TypeError(
             f"from_hf expects dst_rule to be str, got {type(dst_rule).__name__}"
         )
-    return from_hf_impl(dst_rule, hf_weights, mesh=mesh)
-
-
-def to_hf_impl(
-    src_rule: RuleSpec,
-    src_weights: Mapping[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    """Convert target-framework weights back to HF format using an inverted rule."""
-    return execute_manifest(src_rule, src_weights)
+    return execute_manifest(dst_rule, hf_weights)
 
 
 def to_hf(
@@ -523,4 +506,4 @@ def to_hf(
         raise TypeError(
             f"to_hf expects src_rule to be str, got {type(src_rule).__name__}"
         )
-    return to_hf_impl(src_rule, src_weights)
+    return execute_manifest(src_rule, src_weights)

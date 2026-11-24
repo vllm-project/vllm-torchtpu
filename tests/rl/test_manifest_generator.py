@@ -33,7 +33,6 @@ from tests.rl._fakes import (
     RoutedExperts,
     build_qwen2_hf_weights,
     build_qwen35_hf_weights,
-    slice_global_to_local,
 )
 from vllm_torchtpu.rl.manifest_generator import (
     generate_manifest,
@@ -45,6 +44,7 @@ from vllm_torchtpu.rl.weight_conversion import (
     to_hf,
     validate_manifest,
 )
+from vllm_torchtpu.rl.weight_installer import slice_tensor_for_shard
 
 
 def _rule_map(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -127,11 +127,11 @@ def test_qwen2_dense_parity_and_roundtrip(
             tp_size // kv_rep, dim=0
         )[r // kv_rep]
         ref_qkv = torch.cat([q_w, k_w, v_w], dim=0).transpose(0, 1).contiguous()
-        act_qkv = slice_global_to_local(
+        act_qkv = slice_tensor_for_shard(
+            "model.layers.0.self_attn.qkv_proj.weight",
             converted["model.layers.0.self_attn.qkv_proj.weight"],
             rules["model.layers.0.self_attn.qkv_proj.weight"]["sharding"],
-            ranks={"tp": r},
-            world_sizes={"tp": tp_size},
+            {"tp": (r, tp_size)},
         )
         assert torch.equal(act_qkv, ref_qkv)
 
@@ -175,11 +175,11 @@ def test_qwen35_moe_2d_parity_and_roundtrip(
 
     # Check padded & transposed RoutedExperts shard on rank (0, 0)
     w13 = converted["model.layers.0.mlp.experts.w13_weight"]
-    local_w13 = slice_global_to_local(
+    local_w13 = slice_tensor_for_shard(
+        "model.layers.0.mlp.experts.w13_weight",
         w13,
         rules["model.layers.0.mlp.experts.w13_weight"]["sharding"],
-        ranks={"ep": 0, "moe_tp": 0},
-        world_sizes={"ep": ep_size, "moe_tp": moe_tp_size},
+        {"ep": (0, ep_size), "moe_tp": (0, moe_tp_size)},
     )
     assert local_w13.shape == model.model.layers[0].mlp.experts.w13_weight.shape
 
@@ -441,7 +441,7 @@ def test_fail_closed_model_and_runtime_guards(monkeypatch: pytest.MonkeyPatch) -
     with pytest.raises(NotImplementedError, match="Quantized method"):
         generate_manifest(m_gdn)
 
-    # PR #3363 runtime guards: _tpu_dp_vocab, placement, fused shared, env var
+    # Runtime guards: _tpu_dp_vocab, placement, fused shared, env var
     m_vocab = Qwen2ForCausalLM()
     m_vocab.model.embed_tokens._tpu_dp_vocab = True
     with pytest.raises(NotImplementedError, match="_tpu_dp_vocab"):
