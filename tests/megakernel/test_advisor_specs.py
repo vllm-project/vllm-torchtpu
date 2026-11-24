@@ -1276,6 +1276,7 @@ def test_chip_fields_without_jax_source_are_enumerated() -> None:
     """Verify non-JAX chip source fields match the exact hand-written enumeration."""
     expected_non_jax_fields = {
         "vmem_usable_bytes",
+        "vmem_fit_headroom_bytes",
         "ici_egress_bw_bytes_per_s",
         "ici_link_bw_bytes_per_s",
         "collective_latency_s",

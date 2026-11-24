@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import json
 import math
 from pathlib import Path
 from typing import Literal
@@ -51,6 +52,7 @@ from vllm_torchtpu.megakernel.advisor.verdict import (
 )
 from vllm_torchtpu.megakernel.advisor.vmem import _mesh_divisibility_reasons
 from vllm_torchtpu.megakernel.core import runtime as core_runtime
+from vllm_torchtpu.megakernel.core.dma import vmem as core_vmem
 from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.core.exec_spec import MAX_BATCH_ROWS, ExecSpec, Tiles
 from vllm_torchtpu.megakernel.core.profile import _NUMERICS_GRID_R
@@ -275,8 +277,11 @@ def test_deepseek_v3_mla_kv_split_physics() -> None:
 
 def test_asymptotic_decode_intensity_and_vmem_fit_headroom() -> None:
     """Verify `asymptotic_decode_intensity`, `fit_vmem_budget_bytes`, `w_crit_gb`."""
-    assert advisor.fit_vmem_budget_bytes() == 62 << 20
-    assert advisor.fit_vmem_budget_bytes(Tiles(vmem_mib=62)) == 62 << 20
+    expected_fit_bytes = (
+        constants.CORE_LIMITS.vmem_mib - constants.CORE_LIMITS.fit_vmem_headroom_mib
+    ) << 20
+    assert advisor.fit_vmem_budget_bytes() == expected_fit_bytes
+    assert advisor.fit_vmem_budget_bytes(Tiles(vmem_mib=62)) == expected_fit_bytes
     p08 = models.finalize_model_profile(
         dataclasses.replace(
             advisor.resolve_model_profile("qwen3.5-397b"),
@@ -344,8 +349,10 @@ def test_asymptotic_decode_intensity_and_vmem_fit_headroom() -> None:
         ),
         "tpu7x",
     )
-    # 64 MiB physical minus 2 MiB reserve
-    expected_vmem_mib = float(constants.DEFAULT_USABLE_VMEM_MIB)
+    # 62 MiB usable limit minus 6 MiB core-planner fit headroom
+    expected_vmem_mib = float(
+        constants.DEFAULT_USABLE_VMEM_MIB - constants.CORE_LIMITS.fit_vmem_headroom_mib
+    )
     assert r_alias.vmem_budget_mib == expected_vmem_mib
     assert r_no_alias.vmem_budget_mib == advisor.fit_vmem_budget_bytes() / (1 << 20)
     cx_alias = next(s for s in r_alias.scopes if s.scope == "whole_step")
@@ -417,11 +424,11 @@ def test_all_four_fusion_scopes_reachable() -> None:
     assert r_08_pre.fastest_scope == "whole_step"
     assert r_08_pre.recommended_moe_mode == "dense_mlp"
 
-    # 2. `single_layer` (`layer`) wins in the B=488 VMEM cliff band on tpu7x,
-    # whereas v6e (TP16) and v5p Megacore (TP8) keep `whole_step` in 1 pass.
+    # 2. `single_layer` (`layer`) wins in the B=432 VMEM cliff band on tpu7x
+    # (56 MiB fit budget), whereas v6e (TP16) keeps `whole_step` in 1 pass.
     r_cliff_7x = advisor.advise(
         p397,
-        advisor.WorkloadSpec(phase="decode", batch=488, context=1024, tp=8),
+        advisor.WorkloadSpec(phase="decode", batch=432, context=1024, tp=8),
         "tpu7x",
     )
     assert r_cliff_7x.fastest_scope == "single_layer"
@@ -499,12 +506,14 @@ def test_vmem_budget_override_and_dma_buffers_triple_buffering() -> None:
     cx_2 = next(s for s in rep_2buf.scopes if s.scope == "whole_step")
     cx_3 = next(s for s in rep_3buf.scopes if s.scope == "whole_step")
     cx_vmem = next(s for s in rep_custom_vmem.scopes if s.scope == "whole_step")
-    # 64 MiB physical minus 2 MiB reserve
-    expected_vmem_mib = float(constants.DEFAULT_USABLE_VMEM_MIB)
-    custom_vmem_mib = 58.0  # Custom VMEM budget in MiB
+    # 62 MiB usable limit minus 6 MiB core-planner fit headroom
+    expected_vmem_mib = float(
+        constants.DEFAULT_USABLE_VMEM_MIB - constants.CORE_LIMITS.fit_vmem_headroom_mib
+    )
+    custom_vmem_mib = 58.0  # Explicit override above 56 MiB default fit budget
     assert rep_2buf.vmem_budget_mib == expected_vmem_mib
     assert rep_custom_vmem.vmem_budget_mib == custom_vmem_mib
-    assert cx_vmem.max_vmem_tokens < cx_2.max_vmem_tokens
+    assert cx_vmem.max_vmem_tokens > cx_2.max_vmem_tokens
     assert cx_3.vmem_static_mib > cx_2.vmem_static_mib
     assert cx_3.max_vmem_tokens < cx_2.max_vmem_tokens
     assert cx_3.step_bound_us >= cx_2.step_bound_us
@@ -545,8 +554,10 @@ def test_advise_from_model_spec_and_planner() -> None:
         moe_mode="grouped_on_chip",
         dp=4,
     )
-    # 64 MiB physical minus 2 MiB reserve
-    expected_vmem_mib = float(constants.DEFAULT_USABLE_VMEM_MIB)
+    # 62 MiB usable limit minus 6 MiB core-planner fit headroom
+    expected_vmem_mib = float(
+        constants.DEFAULT_USABLE_VMEM_MIB - constants.CORE_LIMITS.fit_vmem_headroom_mib
+    )
     assert rep_def.recommended_scope == "whole_step"
     assert rep_def.vmem_budget_mib == expected_vmem_mib
 
@@ -685,8 +696,8 @@ def test_whole_step_tiles_overflow_and_reads_weights_once() -> None:
         _preset_workload(
             dep.decode,
             phase="verify",
-            batch=(448 // (dep.decode.spec_tokens + 1))
-            + 4,  # Ideal VMEM rows for Qwen 3.5
+            batch=(397 // (dep.decode.spec_tokens + 1))
+            + 4,  # Ideal VMEM rows for Qwen 3.5 at 56 MiB fit budget
             spec_tokens=dep.decode.spec_tokens,
             moe_mode="grouped_on_chip",
         ),
@@ -888,14 +899,16 @@ def test_unchunked_pp_prefill_preserves_window() -> None:
         "tpu7x",
     )
     assert rep_half_window.active_tokens == isl_tokens // 2
-    assert rep_half_window.fastest_scope == "single_layer"
+    # At the 56 MiB fit budget single_layer splits to 5 tiles (t_max=482), so
+    # layer_group ties per_op on floor and beats it on step_upper_us.
+    assert rep_half_window.fastest_scope == "layer_group"
     per_op_half = next(
         scope for scope in rep_half_window.scopes if scope.scope == "per_op"
     )
-    single_half = next(
-        scope for scope in rep_half_window.scopes if scope.scope == "single_layer"
+    group_half = next(
+        scope for scope in rep_half_window.scopes if scope.scope == "layer_group"
     )
-    pure_diff_us = per_op_half.step_bound_us - single_half.step_bound_us
+    pure_diff_us = per_op_half.step_bound_us - group_half.step_bound_us
     expected_gain_pct = round(
         100.0 * pure_diff_us / max(1e-6, per_op_half.step_bound_us), 2
     )
@@ -903,7 +916,7 @@ def test_unchunked_pp_prefill_preserves_window() -> None:
         float(rep_half_window.metrics["compiler_proof_gain_pct"]["value"])
         == expected_gain_pct
     )
-    assert single_half.step_upper_us < per_op_half.step_upper_us
+    assert group_half.step_upper_us < per_op_half.step_upper_us
 
     rep_microbatched = advisor.advise(
         model_profile,
@@ -933,12 +946,20 @@ def test_core_limits_literals_match_megakernel_core() -> None:
     assert lim.verified_ranks == constants.CORE_LIMITS.verified_ranks
     assert lim.chip_kinds == constants.CORE_LIMITS.chip_kinds
     assert lim.max_ar_slots_per_layer == constants.CORE_LIMITS.max_ar_slots_per_layer
-    assert (lim.nbd, lim.nbe, lim.bank, lim.ebank, lim.vmem_mib) == (
+    assert (
+        lim.nbd,
+        lim.nbe,
+        lim.bank,
+        lim.ebank,
+        lim.vmem_mib,
+        lim.fit_vmem_headroom_mib,
+    ) == (
         tiles_default.nbd,
         tiles_default.nbe,
         tiles_default.bank,
         tiles_default.ebank,
         tiles_default.vmem_mib,
+        core_vmem.FIT_VMEM_HEADROOM_MIB,
     )
 
 
@@ -1335,7 +1356,7 @@ def test_in_call_passes_stay_flagged_under_row_limit() -> None:
     favoring_gap_us = 500.0
     rows_per_req = 4
     two_calls = 2
-    qwen35_ideal_vmem_rows = 448
+    qwen35_ideal_vmem_rows = 397
     limit = two_calls * qwen35_ideal_vmem_rows
     requests = (limit + qwen35_ideal_vmem_rows) // rows_per_req
     report, split = _verify_whole_step(requests, limit, favoring_gap_us)
@@ -1483,7 +1504,7 @@ def test_rows_above_default_buckets_flagged() -> None:
 
 @pytest.mark.usefixtures("without_declared_megakernels")
 def test_ffn_scratch_includes_fp32_bytes() -> None:
-    """Verify FFN scratch uses FP32 bytes so Qwen3.5-397B VMEM cap is 448 rows."""
+    """Verify FFN scratch uses FP32 bytes so Qwen3.5-397B VMEM cap is 397 rows."""
     model_profile = advisor.resolve_model_profile("qwen3.5-397b")
     workload = advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=8)
     chip = advisor.resolve_chip_spec("tpu7x")
@@ -1496,7 +1517,7 @@ def test_ffn_scratch_includes_fp32_bytes() -> None:
     )
     report = advisor.advise(model_profile, workload, chip)
     whole = next(s for s in report.scopes if s.scope == "whole_step")
-    qwen35_ideal_vmem_rows = 448
+    qwen35_ideal_vmem_rows = 397
     assert whole.t_vmem_max == qwen35_ideal_vmem_rows
 
 
@@ -3810,3 +3831,59 @@ def test_declared_layout_collectives_shared_symmetrically_across_scopes() -> Non
     assert single_layer.comm_us == whole_step.comm_us
     assert per_op.comm_us >= whole_step.comm_us
     assert whole_step.step_bound_us < per_op.step_bound_us
+
+
+def test_fit_budget_matches_core_planner(tmp_path: Path) -> None:
+    """Verify VMEM fit budget matches core planner, override, and custom JSON."""
+    core_budget = core_vmem.fit_vmem_budget_bytes(Tiles())
+    mib = float(1 << 20)
+    tpu7x = advisor.resolve_chip_spec("tpu7x")
+
+    assert advisor.fit_vmem_budget_bytes() == core_budget
+    assert advisor.fit_vmem_budget_bytes(Tiles()) == core_budget
+    assert advisor.fit_vmem_budget_bytes(chip_spec=tpu7x) == core_budget
+
+    default_rep = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(phase="decode", batch=4, tp=8, ep=8),
+        tpu7x,
+    )
+    assert default_rep.vmem_budget_mib == pytest.approx(core_budget / mib)
+
+    explicit_mib = 58.0
+    explicit_rep = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(
+            phase="decode", batch=4, tp=8, ep=8, vmem_budget_mib=explicit_mib
+        ),
+        tpu7x,
+    )
+    assert explicit_rep.vmem_budget_mib == pytest.approx(explicit_mib)
+
+    custom_usable_mib = 62.0
+    custom_spec_path = tmp_path / "custom_tpu7x.json"
+    custom_spec_path.write_text(
+        json.dumps(
+            {
+                "name": "tpu7x",
+                "cores_per_device": 1,
+                "vmem_capacity_bytes": 64 << 20,
+                "vmem_usable_bytes": 62 << 20,
+                "hbm_capacity_bytes": 103_000_000_000,
+                "hbm_bw_bytes_per_s": 3_700_000_000_000.0,
+                "bf16_flops_per_s": 1_155_000_000_000_000.0,
+                "fp8_flops_per_s": 2_300_000_000_000_000.0,
+                "ici_egress_bw_bytes_per_s": 300.0e9,
+                "ici_link_bw_bytes_per_s": 100.0e9,
+            }
+        ),
+        encoding="utf-8",
+    )
+    custom_chip = advisor.resolve_chip_spec("tpu7x", chip_spec_path=custom_spec_path)
+    assert advisor.fit_vmem_budget_bytes(chip_spec=custom_chip) == 62 << 20
+    custom_rep = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(phase="decode", batch=4, tp=8, ep=8),
+        custom_chip,
+    )
+    assert custom_rep.vmem_budget_mib == pytest.approx(custom_usable_mib)

@@ -30,6 +30,7 @@ try:
     from ..core import profile as core_profile
     from ..core import spec as core_spec
     from ..core.collectives import params as collectives_params
+    from ..core.dma import vmem as core_vmem
     from ..core.profiles import default as default_profiles
     from ..core.runtime import policy as runtime_policy
 except (ImportError, RuntimeError):
@@ -39,6 +40,7 @@ except (ImportError, RuntimeError):
     core_profile = None
     core_spec = None
     collectives_params = None
+    core_vmem = None
     default_profiles = None
     runtime_policy = None
     core_modules = None
@@ -179,6 +181,7 @@ def verify_core_limits_sync() -> list[str]:
         or core_profile is None
         or core_spec is None
         or collectives_params is None
+        or core_vmem is None
         or default_profiles is None
         or runtime_policy is None
         or core_modules is None
@@ -207,6 +210,11 @@ def verify_core_limits_sync() -> list[str]:
         ("bank", CORE_LIMITS.bank, tiles.bank),
         ("ebank", CORE_LIMITS.ebank, tiles.ebank),
         ("vmem_mib", CORE_LIMITS.vmem_mib, tiles.vmem_mib),
+        (
+            "fit_vmem_headroom_mib",
+            CORE_LIMITS.fit_vmem_headroom_mib,
+            core_vmem.FIT_VMEM_HEADROOM_MIB,
+        ),
         (
             "default_decode_bucket_top",
             CORE_LIMITS.default_decode_bucket_top,

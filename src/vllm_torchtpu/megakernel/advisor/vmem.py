@@ -23,6 +23,7 @@ from ..core import errors
 from .constants import (
     ARENA_ALIGN_RESERVE_BYTES,
     BF16_BYTES,
+    CORE_LIMITS,
     DEFAULT_USABLE_VMEM_MIB,
     DENSE_SLOT_DEFAULT_BYTES,
     DOUBLE_BUFFER_SLOTS,
@@ -50,25 +51,40 @@ def fit_vmem_budget_bytes(
     tiles: Tiles | None = None,
     ring_plan: RingPlan | None = None,
     chip_spec: ChipSpec | None = None,
+    *,
+    vmem_budget_mib: float | None = None,
+    apply_ring_reserve: bool = True,
 ) -> int:
-    """Return usable scratchpad budget bytes after subtracting RingPlan reserve.
+    """Return scratchpad fit budget bytes matching the core planner rule.
 
-    Args:
-        tiles: Optional execution tiles specifying vmem_mib.
-        ring_plan: Optional RingPlan reserve to deduct.
-        chip_spec: Optional target ChipSpec to derive usable VMEM limit.
-
-    Returns:
-        Usable VMEM budget in bytes.
+    An explicit ``vmem_budget_mib`` is used as the fit budget directly without
+    subtracting the chip's planner headroom. Otherwise the limit (``tiles.vmem_mib``
+    when given, else ``chip_spec.vmem_usable_bytes`` or the mirrored core limit)
+    has the chip's fit headroom (or mirrored core headroom when no chip is given)
+    subtracted. The optional ``RingPlan`` reserve applies after that when enabled,
+    and the result is capped at ``chip_spec.vmem_usable_bytes`` when a chip is given.
     """
     rp = ring_plan or default_double_buffer_ring_plan()
-    if tiles is not None and tiles.vmem_mib > 0:
-        vmem_mib = tiles.vmem_mib
-    elif chip_spec is not None:
-        vmem_mib = chip_spec.vmem_usable_bytes >> 20
+    if vmem_budget_mib is not None:
+        fit_base = int(vmem_budget_mib * (1 << 20))
     else:
-        vmem_mib = DEFAULT_USABLE_VMEM_MIB
-    return max(0, (vmem_mib << 20) - rp.compiler_spill_reserve_bytes)
+        if tiles is not None and tiles.vmem_mib > 0:
+            limit_bytes = tiles.vmem_mib << 20
+        elif chip_spec is not None:
+            limit_bytes = chip_spec.vmem_usable_bytes
+        else:
+            limit_bytes = DEFAULT_USABLE_VMEM_MIB << 20
+        headroom_bytes = (
+            chip_spec.vmem_fit_headroom_bytes
+            if chip_spec is not None
+            else CORE_LIMITS.fit_vmem_headroom_mib << 20
+        )
+        fit_base = max(0, limit_bytes - headroom_bytes)
+    reserve = rp.compiler_spill_reserve_bytes if apply_ring_reserve else 0
+    vmem_raw = max(0, fit_base - reserve)
+    if chip_spec is not None:
+        return min(chip_spec.vmem_usable_bytes, vmem_raw)
+    return vmem_raw
 
 
 def compute_all_reduce_transfer_cost(

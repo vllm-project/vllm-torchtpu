@@ -30,6 +30,7 @@ from .constants import (
     BRACKET_LEN,
     CALIBRATION_DIR,
     CHIP_ALIASES,
+    CORE_LIMITS,
     DEFAULT_COLLECTIVE_LATENCY_US_BRACKET,
     DEFAULT_SOURCES_7X,
     DEFAULT_SOURCES_PUBLIC,
@@ -139,6 +140,7 @@ class ChipSpec:
     vector_stores_per_cycle: int = 0
     vector_port_ops_per_cycle: int = 0
     clock_hz: float = 0.0
+    vmem_fit_headroom_bytes: int = 0
 
     @property
     def vector_load_cap_bytes_per_s(self) -> float:
@@ -206,6 +208,7 @@ class _HandwrittenChipParams:
     vector_stores_per_cycle: int = 0
     vector_port_ops_per_cycle: int = 0
     clock_hz: float = 0.0
+    vmem_fit_headroom_bytes: int = 0
 
 
 JAX_ROW_TILE_DTYPES: Mapping[str, jnp.dtype] = {
@@ -240,6 +243,7 @@ BUILTIN_CHIP_PARAMS: Mapping[str, _HandwrittenChipParams] = {
         vector_stores_per_cycle=2,
         vector_port_ops_per_cycle=4,
         clock_hz=2.2e9,
+        vmem_fit_headroom_bytes=CORE_LIMITS.fit_vmem_headroom_mib << 20,
     ),
     "v6e": _HandwrittenChipParams(
         chip_version=pltpu.ChipVersion.TPU_V6E,
@@ -387,6 +391,7 @@ def build_builtin_chip_spec(name: str) -> ChipSpec:
         vector_stores_per_cycle=params.vector_stores_per_cycle,
         vector_port_ops_per_cycle=params.vector_port_ops_per_cycle,
         clock_hz=params.clock_hz,
+        vmem_fit_headroom_bytes=params.vmem_fit_headroom_bytes,
     )
 
 
@@ -592,6 +597,9 @@ def load_chip_spec_file(
             raw.get("vector_port_ops_per_cycle", 0), "vector_port_ops_per_cycle"
         ),
         clock_hz=_json_number(raw.get("clock_hz", 0.0), "clock_hz"),
+        vmem_fit_headroom_bytes=_json_int(
+            raw.get("vmem_fit_headroom_bytes", 0), "vmem_fit_headroom_bytes"
+        ),
     )
 
 
@@ -636,6 +644,7 @@ def _scale_megacore(
         cores_per_device=total_cores,
         vmem_capacity_bytes=vmem_cap,
         vmem_usable_bytes=vmem_usable,
+        vmem_fit_headroom_bytes=base.vmem_fit_headroom_bytes * num_cores,
         hbm_capacity_bytes=base.hbm_capacity_bytes * num_cores,
         hbm_bw_bytes_per_s=base.hbm_bw_bytes_per_s * num_cores,
         bf16_flops_per_s=base.bf16_flops_per_s * num_cores,

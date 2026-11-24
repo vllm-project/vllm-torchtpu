@@ -89,6 +89,7 @@ OPTIONAL_CHIP_SPEC_KEYS: frozenset[str] = frozenset(
         "name",
         "cores_per_device",
         "vmem_usable_bytes",
+        "vmem_fit_headroom_bytes",
         "fp8_flops_per_s",
         "int8_flops_per_s",
         "native_ocp_fp8",
@@ -151,6 +152,10 @@ DEFAULT_SOURCES_7X: Mapping[str, str] = {
     "vmem_usable_bytes": (
         "CHOSEN: 64 MiB physical minus 2 MiB compiler reserve (62 MiB/core)"
     ),
+    "vmem_fit_headroom_bytes": (
+        "FACT: megakernel/core/dma/vmem.py FIT_VMEM_HEADROOM_MIB=6 "
+        "(6 MiB non-scratch headroom below 62 MiB limit; 56 MiB fit budget)"
+    ),
     "ici_egress_bw_bytes_per_s": (
         "ASSUMED: 300 GB/s/core unidirectional ICI egress prior"
     ),
@@ -209,6 +214,9 @@ DEFAULT_SOURCES_7X: Mapping[str, str] = {
 DEFAULT_SOURCES_PUBLIC: Mapping[str, str] = {
     "vmem_usable_bytes": (
         "CHOSEN: physical VMEM capacity minus 2 MiB compiler reserve"
+    ),
+    "vmem_fit_headroom_bytes": (
+        "CHOSEN: 0 (no core-planner VMEM headroom reserve configured on this chip)"
     ),
     "ici_egress_bw_bytes_per_s": (
         "ASSUMED: Cloud TPU interconnect unidirectional ICI egress prior"
@@ -301,7 +309,7 @@ STRUCTURAL_LAYER_TAGS: frozenset[str] = frozenset({"dense_prefix_moe"})
 
 @dataclass(frozen=True)
 class CoreLimits:
-    """Verified limits mirrored from `megakernel/core/exec_spec.py` and `profile.py`."""
+    """Verified limits mirrored from `megakernel/core` exec, profile, and VMEM specs."""
 
     max_batch_rows: int = 128
     verified_ranks: tuple[int, ...] = (1, 2, 4, 8, 16)
@@ -312,6 +320,7 @@ class CoreLimits:
     bank: int = 2 << 20
     ebank: int = 1 << 20
     vmem_mib: int = 62
+    fit_vmem_headroom_mib: int = 6
     default_decode_bucket_top: int = 32
     default_verify_bucket_top: int = 64
 

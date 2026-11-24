@@ -102,6 +102,7 @@ from .vmem import (
     _scope_vmem_and_ops,
     compute_all_reduce_transfer_cost,
     compute_per_token_vmem_bytes,
+    fit_vmem_budget_bytes,
 )
 
 if TYPE_CHECKING:
@@ -2130,19 +2131,15 @@ class _ScopeContext:
 
 
 def _vmem_budget_bytes(workload: WorkloadSpec, chip_spec: ChipSpec) -> int:
-    """Return usable VMEM bytes: user budget, Tiles budget, or chip default."""
-    vmem_usable = chip_spec.vmem_usable_bytes
-    tiles = workload.tiles
+    """Return scratchpad fit budget bytes via the shared core-headroom rule."""
     rp = workload.ring_plan or default_double_buffer_ring_plan(workload.dma_buffers)
-    base_vmem_bytes = (
-        int(workload.vmem_budget_mib * (1 << 20))
-        if workload.vmem_budget_mib is not None
-        else (tiles.vmem_mib << 20 if tiles else vmem_usable)
+    return fit_vmem_budget_bytes(
+        tiles=workload.tiles,
+        ring_plan=rp,
+        chip_spec=chip_spec,
+        vmem_budget_mib=workload.vmem_budget_mib,
+        apply_ring_reserve=bool(workload.vmem_fit_headroom),
     )
-    vmem_raw = (
-        base_vmem_bytes - rp.compiler_spill_reserve_bytes * workload.vmem_fit_headroom
-    )
-    return min(vmem_usable, max(0, vmem_raw))
 
 
 def _first_slot_bytes(workload: WorkloadSpec, layer_dense_weight_bytes: int) -> float:
