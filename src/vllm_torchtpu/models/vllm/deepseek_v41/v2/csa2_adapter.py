@@ -331,32 +331,38 @@ def _select_gather_attend(
             records, following = jax.lax.optimization_barrier((records, following))
         gathered = gather_csa2_kv_sc(word_banks, scale_banks, records, deep=deep)
         if state is None:
-            owners = None
+            owners, pending = None, None
             all_scales = jnp.zeros((tokens, 512), jnp.float32)
             all_counts = jnp.zeros((tokens,), jnp.int32)
         else:
-            *owners, all_scales, all_counts = state
-        owners = csa2_attend_rows(
-            q,
-            gathered,
-            counts,
-            owners,
-            swa_pages,
-            starts,
-            positions,
-            sink,
-            rope,
-            offset=start,
-            **kwargs,
-        )
-        update = functools.partial(
-            jax.lax.dynamic_update_slice_in_dim, start_index=start, axis=0
-        )
-        return (
-            *owners,
-            update(all_scales, gathered[1]),
-            update(all_counts, counts),
-        ), following
+            owners, all_scales, all_counts, pending = state
+        update = functools.partial(jax.lax.dynamic_update_slice_in_dim, axis=0)
+        all_scales = update(all_scales, gathered[1], start)
+        all_counts = update(all_counts, counts, start)
+
+        def attend(owners, offset, tile_gathered, tile_counts):
+            return csa2_attend_rows(
+                q,
+                tile_gathered,
+                tile_counts,
+                owners,
+                swa_pages,
+                starts,
+                positions,
+                sink,
+                rope,
+                offset=offset,
+                **kwargs,
+            )
+
+        # Attention runs one tile behind its gather: the previous tile's KV
+        # is complete, so it never waits on the gather just started.
+        if pending is not None:
+            owners = attend(owners, start - pending[1].shape[0], *pending)
+        if start + rows < tokens:
+            return (owners, all_scales, all_counts, (gathered, counts)), following
+        owners = attend(owners, start, gathered, counts)
+        return (*owners, all_scales, all_counts), following
 
     selected, _, (output, words, gathered_scales, counts) = select_fp8_indexer_jax(
         index_q,
