@@ -304,6 +304,10 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S: float = 0.0
     VLLM_TPU_PREFILL_SRPT: bool = False
     VLLM_TPU_PREFILL_SRPT_AGING_TOKENS_PER_S: float = 256.0
+    VLLM_TPU_PREFILL_DECODE_CADENCE: int = 0
+    VLLM_TPU_PREFILL_CADENCE_MAX_WAIT_S: float = 10.0
+    VLLM_TPU_PREFILL_COALESCE_TOKENS: int = 0
+    VLLM_TPU_PREFILL_COALESCE_MAX_WAIT_S: float = 0.5
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS: int = 0
@@ -2007,6 +2011,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (0: pure shortest-remaining first, no starvation bound).
     "VLLM_TPU_PREFILL_SRPT_AGING_TOKENS_PER_S": env_nonnegative_float(
         "VLLM_TPU_PREFILL_SRPT_AGING_TOKENS_PER_S", 256.0
+    ),
+    # PrefillSpacingScheduler decode-priority cadence: after a step that runs
+    # prefill while requests decode, run this many decode-only steps per full
+    # step of prefill tokens (max_num_batched_tokens; a partial prefill step
+    # owes its share, rounded up) before the next prefill step. 0 (default)
+    # turns it off.
+    "VLLM_TPU_PREFILL_DECODE_CADENCE": env_nonnegative_int(
+        "VLLM_TPU_PREFILL_DECODE_CADENCE", 0
+    ),
+    # With VLLM_TPU_PREFILL_DECODE_CADENCE or VLLM_TPU_PREFILL_COALESCE_TOKENS:
+    # neither defers prefill while a waiting prompt not started yet arrived
+    # more than this many seconds ago (TTFT starvation bound; running chunks
+    # keep the cadence). 0 turns the bound off.
+    "VLLM_TPU_PREFILL_CADENCE_MAX_WAIT_S": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_CADENCE_MAX_WAIT_S", 10.0
+    ),
+    # PrefillSpacingScheduler: while requests decode, hold prefill until the
+    # pending prefill tokens (admissible waiting prompts, uncached, plus the
+    # running chunks' tokens left) reach this many, so short prompts run
+    # together as one full chunk. 0 (default) turns it off.
+    "VLLM_TPU_PREFILL_COALESCE_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_PREFILL_COALESCE_TOKENS", 0
+    ),
+    # With VLLM_TPU_PREFILL_COALESCE_TOKENS: stop holding once the oldest
+    # pending prompt arrived this many seconds ago.
+    "VLLM_TPU_PREFILL_COALESCE_MAX_WAIT_S": env_nonnegative_float(
+        "VLLM_TPU_PREFILL_COALESCE_MAX_WAIT_S", 0.5
     ),
     # MiniMax M3 DCP steps of at most this many tokens merge the attention
     # partials with one packed all-to-all instead of an LSE all-gather plus an
