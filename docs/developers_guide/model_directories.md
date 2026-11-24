@@ -63,9 +63,8 @@ The `detect-missing-init --create` pre-commit hook (`.pre-commit-config.yaml`)
 adds an `__init__.py` to any folder that holds a Python file. A new folder under
 `models/` therefore becomes a package, and so a model directory, as soon as it
 holds a `.py` file. Give it a `register()`; if the model is still registered
-elsewhere, a no-op `register()` whose docstring says where (as
-`models/qwen4_exp/__init__.py` does) keeps the order unchanged. The test above
-fails in CI for a folder without one.
+elsewhere, a no-op `register()` whose docstring says where keeps the order
+unchanged. The test above fails in CI for a folder without one.
 
 ## Optional behaviour
 
