@@ -347,6 +347,78 @@ def decode_opt() -> DecodeOpt:
             opt.defer,
         )
     return opt
+class PrefillOpt(NamedTuple):
+    """`TPU_MINIMAX_M3_INDEXER_PREFILL_OPT` for the large (prefill) class."""
+
+    # Each query tile scores the pages up to the last one its own rows can
+    # see, not every page of its request: a request's early tiles skip the
+    # pages of its later tokens. The scores of the pages scored are the same
+    # bits; the pages skipped are past every row of the tile, which the
+    # callers mask (`block_scores`).
+    causal: bool = False
+    # Pages per dot (0: `_v3_chunk`'s default).
+    chunk: int = 0
+    # One body per count of scored chunks, not per power of two (a group's
+    # last chunks past its live pages are not scored).
+    every_count: bool = False
+    # Query rows per large tile (0: DEFAULT_LARGE_BLOCK_Q). Each page's keys
+    # are unpacked and scaled once per tile, so taller tiles do that work for
+    # more rows; the scores are the same bits (one dot per score either way).
+    block_q: int = 0
+    # With `cond<K>`, `block_q` (and `pps<N>` pages per grid step) apply only
+    # to DCP prefill steps (`msa_dcp._class_candidates`) with at most K large
+    # requests, under a two-branch conditional; the large class then pads to
+    # K requests' tiles instead of every request's (one partial tile each),
+    # so its columns and their XLA glue shrink too. Other steps run the
+    # default tiles.
+    cond: int = 0
+    pps: int = 0
+
+
+_PREFILL_OPT_LOGGED = False
+
+
+def prefill_opt() -> PrefillOpt:
+    """Parse `TPU_MINIMAX_M3_INDEXER_PREFILL_OPT` (read through envs, at trace
+    time): ``causal``, ``chunk<N>``, comma- or ``+``-separated."""
+    global _PREFILL_OPT_LOGGED
+    from vllm_torchtpu import envs
+
+    spec = envs.TPU_MINIMAX_M3_INDEXER_PREFILL_OPT
+    opt = PrefillOpt()
+    for item in filter(None, (x.strip() for x in spec.replace("+", ",").split(","))):
+        if item == "causal":
+            opt = opt._replace(causal=True)
+        elif item.startswith("chunk") and item[5:] in ("8", "16", "32", "64"):
+            opt = opt._replace(chunk=int(item[5:]))
+        elif item == "counts":
+            opt = opt._replace(every_count=True)
+        elif item.startswith("bq") and item[2:] in ("256", "512", "1024", "2048"):
+            opt = opt._replace(block_q=int(item[2:]))
+        elif item.startswith("cond") and item[4:].isdigit() and int(item[4:]) > 0:
+            opt = opt._replace(cond=int(item[4:]))
+        elif item.startswith("pps") and item[3:] in ("32", "64", "128"):
+            opt = opt._replace(pps=int(item[3:]))
+        else:
+            raise ValueError(
+                f"TPU_MINIMAX_M3_INDEXER_PREFILL_OPT: unknown item {item!r} in {spec!r}"
+            )
+    if spec and not _PREFILL_OPT_LOGGED:
+        _PREFILL_OPT_LOGGED = True
+        logger.info(
+            "TPU_MINIMAX_M3_INDEXER_PREFILL_OPT=%s on: MSA indexer prefill tiles "
+            "run causal=%s chunk=%d counts=%s block_q=%d cond=%d pps=%d.",
+            spec,
+            opt.causal,
+            opt.chunk,
+            opt.every_count,
+            opt.block_q,
+            opt.cond,
+            opt.pps,
+        )
+    return opt
+
+
 # Folded 4-bit and fp8 tiles of up to this many rows score transposed
 # (`_chunk_maxima_t`, maxima across lanes); larger ones score token-major
 # (maxima across sublanes), a folded page with its slot scales folded into
@@ -532,9 +604,13 @@ def _chunk_maxima_t4(q_quad, buf, first, chunk, live, issue) -> jax.Array:
     return jnp.concatenate([m[i * block_q : (i + 1) * block_q] for i in range(4)], axis=1)
 
 
-def _v3_chunk(pages_per_step: int, block_q: int, page_size: int) -> int:
+def _v3_chunk(
+    pages_per_step: int, block_q: int, page_size: int, max_chunk: int = 0
+) -> int:
     """Pages per dot of `_kernel_v3`: the f32 ``[chunk / 2 * S, 2 Bq]``
-    product within twice `_MAX_SCORE_ELEMS`."""
+    product within twice `_MAX_SCORE_ELEMS`; `max_chunk` (if set) instead."""
+    if max_chunk:
+        return min(max_chunk, pages_per_step)
     chunk = min(_PAGES_PER_CHUNK, pages_per_step)
     while chunk > 2 and chunk * page_size * block_q > 2 * _MAX_SCORE_ELEMS:
         chunk //= 2
@@ -546,7 +622,7 @@ def _kernel_v3(
     work_ref,  # [groups] tile << _TILE_SHIFT | page group within the request
     tile_seq_ref,  # [tiles] request of each tile
     block_tables_ref,  # [max_num_seqs * pages_per_seq]
-    seq_pages_ref,  # [max_num_seqs] pages of each request
+    seq_pages_ref,  # [max_num_seqs] pages of each request ([tiles] if per_tile)
     # In
     q_ref,  # [Bq, D]
     cache_ref,  # [pages, S / p, p, D] index cache, left in HBM
@@ -566,6 +642,8 @@ def _kernel_v3(
     tail=0,
     every_count=False,
     token_scores=0,
+    per_tile=0,
+    max_chunk=0,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -588,8 +666,10 @@ def _kernel_v3(
     block_q = q_ref.shape[0]
     folded = msa_fp4.scales_in_page(rows, cache_ref.dtype)
     page_size = _page_tokens(rows, cache_ref.dtype)
-    chunk = _v3_chunk(pages_per_step, block_q, page_size)
-    pages_per_seq = block_tables_ref.shape[0] // seq_pages_ref.shape[0]
+    chunk = _v3_chunk(pages_per_step, block_q, page_size, max_chunk)
+    # With `per_tile`, `seq_pages_ref` holds each tile's pages (`_class_scores`
+    # causal) and `per_tile` is the block table's pages per request.
+    pages_per_seq = per_tile or block_tables_ref.shape[0] // seq_pages_ref.shape[0]
     step, num_steps = pl.program_id(0), pl.num_programs(0)
     # The pages as 32-bit words: a dense VMEM layout, so each key vreg is one
     # load (a packed [S / p, p, D] page tiles VMEM in (p, D) tiles).
@@ -600,7 +680,8 @@ def _kernel_v3(
         entry = work_ref[w]
         seq = tile_seq_ref[entry >> _TILE_SHIFT] & _SEQ_MASK
         first = (entry & _GROUP_MASK) * pages_per_step
-        return seq * pages_per_seq + first, jnp.maximum(seq_pages_ref[seq] - first, 1)
+        pages = seq_pages_ref[entry >> _TILE_SHIFT] if per_tile else seq_pages_ref[seq]
+        return seq * pages_per_seq + first, jnp.maximum(pages - first, 1)
 
     def copy(base, g, slot):
         col = g
@@ -984,6 +1065,9 @@ def _class_scores(
     scale_row=None,
     q_pad=None,
     fp8_q=False,
+    tile_lens_fn=None,
+    max_chunk=0,
+    every_count=False,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token (`ClassScores`); `token_major` (kernel v3) returns
@@ -1021,9 +1105,16 @@ def _class_scores(
 
     # Work list: every page group of every tile's request.
     seq_pages = -(-seq_lens // page_size)
+    tile_pages = lookup(seq_pages, tile_seq)
+    if tile_lens_fn is not None:
+        # `tile_lens_fn(tile_seq, tile_row0)`: per tile, a length whose page
+        # count is the pages its rows can see (kernel v3 only).
+        tile_pages = jnp.clip(
+            -(-tile_lens_fn(tile_seq, tile_row0) // page_size), 1, tile_pages
+        ).astype(jnp.int32)
     groups_per_tile = jnp.where(
         jnp.arange(max_tiles) < num_tiles,
-        jnp.maximum(-(-lookup(seq_pages, tile_seq) // pages_per_step), 1),
+        jnp.maximum(-(-tile_pages // pages_per_step), 1),
         0,
     )
     group_ends = jnp.cumsum(groups_per_tile)
@@ -1103,7 +1194,7 @@ def _class_scores(
             raise NotImplementedError(
                 "kernel v3 reads 4-bit pages with folded scales only"
             )
-        chunk = _v3_chunk(pages_per_step, block_q, page_size)
+        chunk = _v3_chunk(pages_per_step, block_q, page_size, max_chunk)
         if pages_per_step % chunk or chunk % 2:
             raise NotImplementedError(
                 f"kernel v3 pairs pages in chunks of up to {_PAGES_PER_CHUNK}: "
@@ -1126,6 +1217,13 @@ def _class_scores(
             ):
                 dopt = dopt._replace(defer=False)
         defer_scratch = []
+        if max_chunk and chunk * page_size * block_q > 2 * _MAX_SCORE_ELEMS:
+            # Wider dots than the default: room for their f32 products.
+            params = pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                disable_bounds_checks=True,
+                vmem_limit_bytes=3 * chunk * page_size * block_q * 4 + (16 << 20),
+            )
         if dopt.defer:
             out_specs = pl.BlockSpec(out_shape.shape, lambda w, *_: (0, 0))
             defer_scratch = [
@@ -1152,9 +1250,11 @@ def _class_scores(
                 noclamp=dopt.noclamp,
                 full_bodies=dopt.full,
                 tail=dopt.tail,
-                every_count=dopt.every_count,
+                every_count=dopt.every_count or every_count,
                 token_scores=dopt.token_scores,
                 defer=dopt.defer,
+                per_tile=pages_per_seq if tile_lens_fn is not None else 0,
+                max_chunk=max_chunk,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
@@ -1174,7 +1274,14 @@ def _class_scores(
             compiler_params=params,
             interpret=interpret,
             name="minimax_m3_msa_block_scores",
-        )(work, tile_info, block_tables, seq_pages, q_rows, index_cache)
+        )(
+            work,
+            tile_info,
+            block_tables,
+            tile_pages if tile_lens_fn is not None else seq_pages,
+            q_rows,
+            index_cache,
+        )
     else:
         kernel_fn = _KERNELS[kernel]
         if fp4:
@@ -1209,6 +1316,22 @@ def _class_scores(
     return ClassScores(
         scores_t, col, tile_seq, tile_row0, num_tiles, first_tile, tile_start
     )
+
+
+def _large_opts(large_kernel: str, tile_lens_fn) -> dict:
+    """`TPU_MINIMAX_M3_INDEXER_PREFILL_OPT` arguments of the large class
+    (none when off: the default program is unchanged)."""
+    if large_kernel != "v3":
+        return {}
+    opt = prefill_opt()
+    out = {}
+    if opt.causal and tile_lens_fn is not None:
+        out["tile_lens_fn"] = tile_lens_fn
+    if opt.chunk:
+        out["max_chunk"] = opt.chunk
+    if opt.every_count:
+        out["every_count"] = True
+    return out
 
 
 class _ClassPlan(NamedTuple):
@@ -1250,6 +1373,8 @@ def class_plan(
     transposed_tile_q: int = _SMALL_TILE_Q_TRANSPOSED,
     interpret: bool = False,
     fp8_q: bool = False,
+    large_tile_lens_fn: Callable | None = None,
+    large_max_requests: int = 0,
 ) -> _ClassPlan:
     """`block_scores`' tile classes, unscored (arguments as `block_scores`)."""
     num_tokens, num_heads, _ = index_q.shape
@@ -1288,6 +1413,9 @@ def class_plan(
     )
     # Large requests have more than block_q tokens each.
     max_large = min(max_num_seqs, num_tokens // (block_q + 1))
+    if large_max_requests:
+        # The caller guarantees at most this many large requests.
+        max_large = min(max_large, large_max_requests)
     # Kernel v3 reads 4-bit pages with folded scales only.
     unfolded_fp4 = scale_row is not None
     small_kernel = "v2" if kernel == "v3" and unfolded_fp4 else kernel
@@ -1342,6 +1470,7 @@ def class_plan(
         # fp8 queries on the prefill tiles only: the decode tiles are bound by
         # the key stream into the MXU, not its rate, and gain nothing.
         fp8_q=fp8_q,
+        **_large_opts(large_kernel, large_tile_lens_fn),
     )
     pages_per_seq = block_tables.shape[0] // max_num_seqs
     return _ClassPlan(
