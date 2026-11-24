@@ -15,7 +15,7 @@
 _IN_FLIGHT: (host devices, interpret) the replicas of a KV head splitting the
 query tiles, and the page exchange copying straight to every replica with a
 different number of pages in flight, give the same output bits as the
-defaults, at DCP 4 and DCP 8."""
+defaults, at DCP 2, DCP 4 and DCP 8."""
 
 import os
 import subprocess
@@ -106,7 +106,7 @@ _E2E = textwrap.dedent(
 )
 
 
-@pytest.mark.parametrize("dcp,nreq", [(4, 1), (8, 1), (4, 2)])
+@pytest.mark.parametrize("dcp,nreq", [(2, 1), (4, 1), (8, 1), (2, 2), (4, 2)])
 def test_row_split_same_bits(dcp, nreq):
     r = subprocess.run(
         [sys.executable, "-c", _E2E, str(dcp), str(nreq)],

@@ -268,6 +268,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
     TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
     TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
+    TPU_MINIMAX_M3_DCP_SINGLE_HEAD_HP: bool = False
     TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_INDEX_FOLD_OPT: str = ""
     TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT: int = 8
@@ -1735,6 +1736,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # group (one chip's cores). Same outputs bit for bit.
     "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT": env_bool(
         "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT", default=False
+    ),
+    # MiniMax M3 DCP group of ONE KV head (c48: TP 8, DCP 2, the group is
+    # the head's two replicas): steps that `msa_dcp_heads.uses_dcp_attention`
+    # does not take attend their prefill rows head-parallel
+    # (`msa_dcp_heads.attend_and_merge`) instead of the per-rank DCP kernel
+    # over half the pages plus the partials' merge. With
+    # TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT the two replicas then split the query
+    # tiles over all of the head's pages.
+    "TPU_MINIMAX_M3_DCP_SINGLE_HEAD_HP": env_bool(
+        "TPU_MINIMAX_M3_DCP_SINGLE_HEAD_HP", default=False
     ),
     # MiniMax M3 DCP attention over several KV heads (`msa_dcp_heads`): steps
     # of at most this many rows merge the ranks' partials by one all-to-all

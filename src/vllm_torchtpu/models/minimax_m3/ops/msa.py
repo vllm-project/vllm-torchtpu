@@ -947,6 +947,22 @@ def _get_msa_dcp_fp4_op(
         if kv_heads > 1
         else None
     )
+    # A one-head group's long steps may take the head-parallel op too
+    # (TPU_MINIMAX_M3_DCP_SINGLE_HEAD_HP); its other steps keep the paths below.
+    single_head_hp_op = None
+    if kv_heads == 1 and dcp > 1 and envs.TPU_MINIMAX_M3_DCP_SINGLE_HEAD_HP:
+        single_head_hp_op = _get_msa_dcp_heads_op(
+            sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix
+        )
+        logger.warning(
+            "TPU_MINIMAX_M3_DCP_SINGLE_HEAD_HP=1: MSA DCP group of one KV head "
+            "(dcp %d, %d replicas) attends steps of >= %d tokens head-parallel "
+            "(row split %s).",
+            dcp,
+            kv_head_replicas,
+            msa_dcp_heads.HEAD_PARALLEL_MIN_TOKENS,
+            bool(envs.TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT),
+        )
     early_q_op = early_dec_op = None
     if kv_heads > 1 and early:
         early_q_op = _get_msa_dcp_heads_op(
@@ -1030,6 +1046,20 @@ def _get_msa_dcp_fp4_op(
             return early_q_op(
                 dcp_rank,
                 q_all,
+                kv_cache,
+                scale_cache,
+                candidates,
+                metadata.seq_lens,
+                metadata.block_tables,
+                metadata.query_start_loc,
+                metadata.request_distribution,
+            )
+        if single_head_hp_op is not None and not msa_dcp_heads.uses_dcp_attention(
+            q.shape[0], metadata.seq_lens.shape[0], decode_rows
+        ):
+            return single_head_hp_op(
+                dcp_rank,
+                q,
                 kv_cache,
                 scale_cache,
                 candidates,
