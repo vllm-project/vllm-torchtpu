@@ -308,13 +308,19 @@ def _selftest(
 def _qar_selftest(op, rank, n: int, hidden: int, device, rows: int) -> dict:
     """One qar all-reduce of known partials: rel L2 against the exact sum and a
     digest of the bits (the caller requires every rank's digest to agree)."""
-    gen = torch.Generator().manual_seed(1234)
-    parts = torch.randn((n, rows, hidden), generator=gen).to(torch.bfloat16)
+    # Host-side math in numpy: ATen's CPU thread pool is invalid in some
+    # worker processes (forward_run twins: "Invalid thread pool").
+    rng = np.random.default_rng(1234)
+    u = rng.standard_normal((n, rows, hidden), dtype=np.float32).view(np.uint32)
+    bits = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)  # bf16, RNE
+    parts = (bits.astype(np.uint32) << 16).view(np.float32)
     me = int(rank.reshape(-1)[0].item())
-    out = op(parts[me].to(device), rank).float().cpu()
-    exact = parts.double().sum(0)
-    rel = float((out.double() - exact).norm() / exact.norm())
-    digest = float((out.double() * torch.arange(1, out.numel() + 1).view(out.shape)).sum())
+    mine = torch.from_numpy(bits[me].view(np.int16)).view(torch.bfloat16)
+    out = op(mine.to(device), rank).cpu().view(torch.int16).numpy().view(np.uint16)
+    out = (out.astype(np.uint32) << 16).view(np.float32).astype(np.float64)
+    exact = parts.astype(np.float64).sum(0)
+    rel = float(np.linalg.norm(out - exact) / np.linalg.norm(exact))
+    digest = float((out.reshape(-1) * np.arange(1, out.size + 1, dtype=np.float64)).sum())
     return dict(rank=me, rel=rel, digest=digest)
 
 

@@ -45,7 +45,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import pallas_all_reduce
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.minimax_m3 import sp_o_proj
+from vllm_torchtpu.models.minimax_m3 import quant, sp_o_proj
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse, sp_norm
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
@@ -125,6 +125,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif quant.fp8_norm_applies(self.self_attn.qkv_proj, hidden_states.shape[0]):
+            hidden_states, residual = quant.fused_add_rms_norm_e4m3(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+            )
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         if attn_rs:
