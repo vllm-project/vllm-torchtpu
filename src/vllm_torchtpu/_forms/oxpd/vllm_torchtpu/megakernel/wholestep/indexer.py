@@ -106,17 +106,98 @@ def score_rows(qr: jax.Array, ck: jax.Array) -> jax.Array:
     return (jnp.maximum(st, 0.0) * IDX_DIM**-0.5).reshape(T, IDX_HEADS, -1).sum(axis=1)
 
 
-def thresholds(bits: jax.Array, ids: jax.Array, nv: jax.Array, K: int, G: int):
+def thresholds(
+    bits: jax.Array,
+    ids: jax.Array,
+    nv: jax.Array,
+    K: int,
+    G: int,
+    *,
+    fast: bool = False,
+):
     """Per-row `(thr, tmax)` [R, 1, 1] for bit patterns `bits [R, S, 128]` (-1 =
-    invisible)."""
+    invisible).
+
+    `fast` (VLLM_TPU_MK_INDEXER_FAST_THR, when `S = bits.shape[1] <= 1023`): packs
+    three 10-bit per-lane counters into `int32` to cut `S`-reductions to 15+1
+    (radix-4, 2 bits/step, vs 31 plain or 46 un-packed radix-2), fuses
+    `(bits > thr)` and `(bits == thr)` into one reduction, skips the tie search
+    via `lax.cond` unless a row truncates a tie, and uses radix-4 packed tie
+    bisection. Bit-exact against the plain passes."""
     cnt = lambda m: jnp.sum(m.astype(I32), axis=(1, 2), keepdims=True)  # noqa: E731
     over = nv > K
+    use_fast = bool(fast) and bits.shape[1] <= 1023
     lo = jnp.zeros(nv.shape, I32)
-    for b in range(30, -1, -1):
-        cand = lo | (1 << b)
-        lo = jnp.where(cnt(bits >= cand) >= K, cand, lo)
+    if use_fast:
+        # Three 10-bit counters per int32 lane (`S <= 1023` guarantees no carry and
+        # bits 30/31 stay 0 so there is no signed overflow).
+        for b in range(29, -1, -2):
+            c1 = lo | (1 << b)
+            c2 = lo | (2 << b)
+            c3 = lo | (3 << b)
+            w = (
+                (bits >= c1).astype(I32)
+                + ((bits >= c2).astype(I32) << 10)
+                + ((bits >= c3).astype(I32) << 20)
+            )
+            s1 = jnp.sum(w, axis=1, keepdims=True)
+            n1 = jnp.sum(s1 & 0x3FF, axis=2, keepdims=True)
+            n2 = jnp.sum((s1 >> 10) & 0x3FF, axis=2, keepdims=True)
+            n3 = jnp.sum(s1 >> 20, axis=2, keepdims=True)
+            lo = jnp.where(
+                n3 >= K, c3, jnp.where(n2 >= K, c2, jnp.where(n1 >= K, c1, lo))
+            )
+        lo = jnp.where(cnt(bits >= (lo | 1)) >= K, lo | 1, lo)
+    else:
+        for b in range(30, -1, -1):
+            cand = lo | (1 << b)
+            lo = jnp.where(cnt(bits >= cand) >= K, cand, lo)
     thr = jnp.where(over, lo, 0)
     eq = bits == thr
+    if use_fast:
+        s_ge = jnp.sum(
+            (bits > thr).astype(I32) + (eq.astype(I32) << 10),
+            axis=1,
+            keepdims=True,
+        )
+        need = K - jnp.sum(s_ge & 0x3FF, axis=2, keepdims=True)
+        eq_cnt = jnp.sum((s_ge >> 10) & 0x3FF, axis=2, keepdims=True)
+        nb = int(G - 1).bit_length()
+
+        def ties_fast() -> jax.Array:
+            t = jnp.zeros(nv.shape, I32)
+            top = nb
+            if top % 2:
+                cand = t | (1 << (top - 1))
+                t = jnp.where(cnt(eq & (ids < cand)) < need, cand, t)
+                top -= 1
+            for b in range(top - 2, -1, -2):
+                c1 = t | (1 << b)
+                c2 = t | (2 << b)
+                c3 = t | (3 << b)
+                w = (
+                    (eq & (ids < c1)).astype(I32)
+                    + ((eq & (ids < c2)).astype(I32) << 10)
+                    + ((eq & (ids < c3)).astype(I32) << 20)
+                )
+                s1 = jnp.sum(w, axis=1, keepdims=True)
+                n1 = jnp.sum(s1 & 0x3FF, axis=2, keepdims=True)
+                n2 = jnp.sum((s1 >> 10) & 0x3FF, axis=2, keepdims=True)
+                n3 = jnp.sum(s1 >> 20, axis=2, keepdims=True)
+                t = jnp.where(
+                    n3 < need,
+                    c3,
+                    jnp.where(n2 < need, c2, jnp.where(n1 < need, c1, t)),
+                )
+            return t
+
+        trunc = over & (eq_cnt > need)
+        t = jax.lax.cond(
+            jnp.max(trunc.astype(I32)) > 0,
+            ties_fast,
+            lambda: jnp.zeros(nv.shape, I32),
+        )
+        return thr, jnp.where(trunc, t, G)
     need = K - cnt(bits > thr)
     t = jnp.zeros(nv.shape, I32)
     for b in range(int(G - 1).bit_length() - 1, -1, -1):

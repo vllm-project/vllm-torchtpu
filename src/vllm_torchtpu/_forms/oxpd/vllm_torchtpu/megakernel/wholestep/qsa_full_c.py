@@ -534,7 +534,14 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 ids_h = ids[:h]
                 sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0 + o, h)].reshape(h, S, 128), I32)
                 with ctx.stream.sc("qsa_thr", 2):
-                    thr, tmax = ix.thresholds(jnp.where(ids_h < nv_h, sc, -1), ids_h, nv_h, K, G)
+                    thr, tmax = ix.thresholds(
+                        jnp.where(ids_h < nv_h, sc, -1),
+                        ids_h,
+                        nv_h,
+                        K,
+                        G,
+                        fast=self.fast_thr,
+                    )
                 scr["qi_th"][pl.ds(lo + o, h)] = jnp.broadcast_to(thr, (h, 1, 128))
                 scr["qi_tm"][pl.ds(lo + o, h)] = jnp.broadcast_to(tmax, (h, 1, 128))
                 with ctx.stream.sc("qsa_cdcp_thx", 2):
@@ -551,7 +558,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0, n)].reshape(n, S, 128), I32)
                 bits = jnp.where(ids < nv, sc, -1)
                 with ctx.stream.sc("qsa_thr", 2):
-                    thr, tmax = ix.thresholds(bits, ids, nv, K, G)
+                    thr, tmax = ix.thresholds(bits, ids, nv, K, G, fast=self.fast_thr)
                 scr["qi_th"][pl.ds(lo, n)] = jnp.broadcast_to(thr, (n, 1, 128))
                 scr["qi_tm"][pl.ds(lo, n)] = jnp.broadcast_to(tmax, (n, 1, 128))
             scr["qi_nv"][pl.ds(lo, n)] = jnp.broadcast_to(nv, (n, 1, 128))
@@ -644,7 +651,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                         code = code_all if D == 1 else jnp.where(
                             jax.lax.rem(gidx // gpp, D) == r, code_all, 0
                         )
-                        ids, codes, nu = ua.compact_union(code, KU, ua.union_consts(S, KU))
+                        ids, codes, nu = ua.compact_union(
+                            code, KU, ua.union_consts(S, KU), t1=(T == 1), fast=self.fast_thr
+                        )
                         if cdcp:
                             ids = self._cdcp_gid(ctx, ids)
                         at = pl.multiple_of(r * KU, 128) if cdcp else r * KU
