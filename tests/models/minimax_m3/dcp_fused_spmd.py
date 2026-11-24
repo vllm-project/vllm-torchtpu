@@ -92,10 +92,11 @@ def caches(fp4, pages, rng):
 
 
 def main():
-    if len(sys.argv) > 5 and sys.argv[5] == "maxfree":
+    modes = set(sys.argv[5].split(",")) if len(sys.argv) > 5 else set()
+    if "maxfree" in modes:
         # Both calls run the max-free softmax (TPU_MINIMAX_M3_MSA_MAX_FREE).
         msa_attention_lse.configure_max_free(0.0, enabled=True, mxu_mask=True)
-    shared = len(sys.argv) > 5 and sys.argv[5] == "shared"
+    shared = "shared" in modes
     fp4 = sys.argv[1] == "fp4"
     ctx = [int(x) for x in sys.argv[2].split(",")]
     pad, control = int(sys.argv[3]), sys.argv[4] == "1"

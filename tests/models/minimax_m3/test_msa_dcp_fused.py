@@ -96,6 +96,14 @@ def test_fused_matches_unfused_bitwise_wide_groups():
     _run("fp4", ctx, "0", "0")
 
 
+def test_fused_matches_unfused_bitwise_wide_groups_shared_max_free():
+    """The c48 combination: 17 requests past 128 rows on 4-bit caches, the
+    layer's scales on a shared scale page (TPU_MINIMAX_M3_KV4_SHARED_SCALES)
+    and the max-free softmax: the fused call matches the unfused one."""
+    ctx = ",".join(str(1500 + 250 * i) for i in range(17))
+    _run("fp4", ctx, "0", "0", "shared,maxfree")
+
+
 def test_eligible():
     e = msa_dcp_fused.eligible
     assert e(8, 32, dcp=2, kv_heads=1)
