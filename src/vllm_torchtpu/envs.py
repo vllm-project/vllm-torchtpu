@@ -301,6 +301,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_MSA_PREFILL_FP8_OPT: str = ""
     TPU_MINIMAX_M3_MSA_MAX_FREE: bool = False
     TPU_MINIMAX_M3_MSA_MXU_MASK: bool = False
+    TPU_MINIMAX_M3_KV4_SHARED_SCALES: bool = False
 
 
 def env_with_choices(
@@ -1992,6 +1993,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Lossy. Prefill steps are unchanged.
     "TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE": env_str(
         "TPU_MINIMAX_M3_MSA_INDEX_REUSE_DECODE", ""
+    ),
+    # MiniMax M3 4-bit MSA caches (--kv-cache-dtype int4_per_token_head)
+    # under DCP: consecutive layers share one f32 scale page (`msa_fp4.
+    # layers_per_scale_page`: 8 // (2 * KV heads per rank), so 4 layers at
+    # DCP 2 and 2 at DCP 4), each layer's K/V scale rows at its own offset.
+    # A page of 8 f32 rows padded every layer's 2 or 4 scale rows; sharing
+    # cuts 24 (DCP 2) or 16 (DCP 4) bytes per token per layer from the KV
+    # pool (+9.7% / +4.2% tokens). Same stored values and kernel reads (the
+    # same page DMA, other rows): bitwise. Default off.
+    "TPU_MINIMAX_M3_KV4_SHARED_SCALES": env_bool(
+        "TPU_MINIMAX_M3_KV4_SHARED_SCALES", default=False
     ),
 }
 

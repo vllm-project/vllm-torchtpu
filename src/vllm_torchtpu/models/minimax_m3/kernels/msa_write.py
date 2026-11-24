@@ -64,11 +64,13 @@ class Rows(NamedTuple):
 
 
 class SlotValues(NamedTuple):
-    """Per-slot f32 ``values [T, n]`` into rows ``[0, n)`` of an f32 ``[pages,
-    rows, S]`` cache, lane = slot."""
+    """Per-slot f32 ``values [T, n]`` into rows ``[row0, row0 + n)`` of an f32
+    ``[pages, rows, S]`` cache, lane = slot; the page's other rows keep their
+    values (a scale page shared by several layers)."""
 
     cache: jax.Array
     values: jax.Array
+    row0: int = 0
 
 
 class _RowsSpec(NamedTuple):
@@ -79,7 +81,8 @@ class _RowsSpec(NamedTuple):
 
 
 class _ValuesSpec(NamedTuple):
-    num_values: int  # lanes [0, num_values) of the lane values
+    num_values: int  # lanes [row0, row0 + num_values) of the lane values
+    row0: int = 0  # = their first row in the page
 
 
 def _kernel(
@@ -169,7 +172,9 @@ def _kernel(
                 rows, lanes = page.shape
                 row = jax.lax.broadcasted_iota(jnp.int32, page.shape, 0)
                 lane = jax.lax.broadcasted_iota(jnp.int32, page.shape, 1)
-                take = (row < spec.num_values) & (lane >= lo) & (lane < hi)
+                take = (row < spec.row0 + spec.num_values) & (lane >= lo) & (lane < hi)
+                if spec.row0:
+                    take &= row >= spec.row0
                 values = pltpu.bitcast(by_slot[:rows], jnp.float32)
                 out_buf[slot] = jnp.where(take, values, page)
                 continue
@@ -317,10 +322,17 @@ def write_runs(
             if lane_values is not None:
                 raise ValueError("write_runs takes at most one SlotValues target")
             n = target.values.shape[1]
-            specs.append(_ValuesSpec(n))
+            if target.row0 + n > min(target.cache.shape[1], _LANES):
+                raise ValueError(
+                    f"rows [{target.row0}, {target.row0 + n}) past the "
+                    f"{target.cache.shape[1]} rows of {target.cache.shape}"
+                )
+            specs.append(_ValuesSpec(n, target.row0))
             lane_values = jax.lax.bitcast_convert_type(
                 target.values.astype(jnp.float32), jnp.uint32
             )
+            if target.row0:  # value i at lane (= page row) row0 + i
+                lane_values = jnp.pad(lane_values, ((0, 0), (target.row0, 0)))
             size = target.cache.shape[2]
         else:
             w, spec, size = _slot_words(target)

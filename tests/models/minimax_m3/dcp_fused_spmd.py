@@ -14,7 +14,12 @@
 """Worker of `test_msa_dcp_fused.py` on a 2-device CPU platform: the fused
 DCP decode attention call against `msa_dcp.attend_and_merge`, bit for bit.
 
-    dcp_fused_spmd.py <fp8|fp4> <ctx,ctx,...> <padding rows> <control 0|1> [maxfree]
+    dcp_fused_spmd.py <fp8|fp4> <ctx,ctx,...> <padding rows> <control 0|1> [maxfree|shared]
+
+``shared`` (4-bit): the fused call reads the layer's K/V scales at rows 6 / 7
+of a scale page shared with three other layers (whose rows hold other
+values; TPU_MINIMAX_M3_KV4_SHARED_SCALES) and must match the unfused call
+over the layer's own page.
 
 8 verify rows per request over the given contexts, then the padding rows.
 """
@@ -90,6 +95,7 @@ def main():
     if len(sys.argv) > 5 and sys.argv[5] == "maxfree":
         # Both calls run the max-free softmax (TPU_MINIMAX_M3_MSA_MAX_FREE).
         msa_attention_lse.configure_max_free(0.0, enabled=True, mxu_mask=True)
+    shared = len(sys.argv) > 5 and sys.argv[5] == "shared"
     fp4 = sys.argv[1] == "fp4"
     ctx = [int(x) for x in sys.argv[2].split(",")]
     pad, control = int(sys.argv[3]), sys.argv[4] == "1"
@@ -122,11 +128,16 @@ def main():
         extra, extra_specs = (jnp.concatenate(scale), hadamard), (sh, rep)
     base = (jnp.arange(DCP, dtype=jnp.int32), qh, jnp.concatenate(kv))
 
-    def run(fn, cand):
-        out = jax.shard_map(
-            lambda *a: fn(
+    def run(fn, cand, row0=0):
+        def body(*a):
+            if row0:
+                a = (*a[:7], msa_fp4.with_row0(a[7], row0), *a[8:])
+            return fn(
                 *a, axis="dcp", dcp=DCP, sm_scale=SCALE, topk=TOPK, interpret=True
-            ),
+            )
+
+        out = jax.shard_map(
+            body,
             mesh=mesh,
             in_specs=(sh,) * 4 + (rep,) * 3 + extra_specs,
             out_specs=sh,
@@ -136,7 +147,15 @@ def main():
 
     cand = jnp.concatenate(cands)
     want = run(msa_dcp.attend_and_merge, cand)
-    got = run(msa_dcp_fused.fused_attend_and_merge, cand)
+    if shared:
+        own = extra[0]  # [2 * pages, 8, S]: rows 0 / 1 hold this layer's scales
+        page = jnp.asarray(rng.uniform(0.5, 3.0, own.shape), jnp.float32)
+        page = page.at[:, 6:8].set(own[:, :2])
+        extra = (page, extra[1])
+        got = run(msa_dcp_fused.fused_attend_and_merge, cand, row0=6)
+        assert np.array_equal(got, run(msa_dcp.attend_and_merge, cand, row0=6))
+    else:
+        got = run(msa_dcp_fused.fused_attend_and_merge, cand)
     rows = np.arange(DCP * num_tokens) % num_tokens
     assert np.isfinite(want).all(), "non-finite"
     assert np.abs(want[rows < num_real]).max() > 0, "all-zero output"
