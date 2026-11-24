@@ -1413,6 +1413,29 @@ def _prefill_vmem_bytes(plan, index_cache, small_rows: int, num_rows: int) -> in
     )
 
 
+def _prefill_chunk(plan, index_cache) -> int:
+    """`_kernel_v3`'s pages per dot over the large tiles."""
+    page_size = msa_indexer._page_tokens(index_cache.shape[1], index_cache.dtype)
+    return msa_indexer._v3_chunk(
+        plan.large_pages_per_step, plan.large_block_q, page_size
+    )
+
+
+def _prefill_fits(plan, index_cache, small_rows: int, num_rows: int) -> bool:
+    """Whether `_prefill_candidates` takes the step: tile-major large and
+    token-major small tiles, key columns in whole insert steps (whole dots
+    each) and VMEM within `_PREFILL_VMEM_BYTES`."""
+    step_cols = 8 * _INSERT_UNROLL
+    return (
+        plan.large_tile_major
+        and plan.token_major
+        and plan.large_pages % step_cols == 0
+        and step_cols % _prefill_chunk(plan, index_cache) == 0
+        and _prefill_vmem_bytes(plan, index_cache, small_rows, num_rows)
+        <= _PREFILL_VMEM_BYTES
+    )
+
+
 def _prefill_candidates(
     plan: msa_indexer._ClassPlan,
     index_cache: jax.Array,
@@ -1465,14 +1488,7 @@ def _prefill_candidates(
     width = small_packed.shape[1]
     assembled_rows = num_rows + block_q
     ring = (msa_indexer._RING_SLOTS, pages_per_step, rows_per_page, head_dim)
-    page_size = msa_indexer._page_tokens(rows_per_page, index_cache.dtype)
-    chunk = msa_indexer._v3_chunk(pages_per_step, block_q, page_size)
-    step_cols = 8 * _INSERT_UNROLL
-    if num_cols % step_cols or step_cols % chunk:
-        raise NotImplementedError(
-            f"{num_cols} key columns, {chunk}-page dots: the picks scan whole "
-            f"steps of {step_cols} columns"
-        )
+    chunk = _prefill_chunk(plan, index_cache)
     scratch = [
         pltpu.VMEM(ring, jnp.uint32),
         pltpu.SemaphoreType.DMA((msa_indexer._RING_SLOTS,)),
@@ -1599,14 +1615,7 @@ def _class_candidates(
 
     small = plan.small()
     small_picks = class_picks(small, plan.small_block_q, not plan.token_major)
-    if (
-        plan.large_tile_major
-        and plan.token_major
-        and _prefill_vmem_bytes(
-            plan, index_cache, small_picks.shape[0], num_tokens * num_heads
-        )
-        <= _PREFILL_VMEM_BYTES
-    ):
+    if _prefill_fits(plan, index_cache, small_picks.shape[0], num_tokens * num_heads):
         packed = _prefill_candidates(
             plan,
             index_cache,

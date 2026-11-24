@@ -24,18 +24,9 @@ from tests.models.minimax_m3.test_msa_dcp_classes import HEAD_DIM, TOPK, _caches
 from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_indexer
 
 
-@pytest.mark.parametrize(
-    "dtype,rank,dcp,heads",
-    [
-        (jnp.float8_e4m3fn, 0, 2, 1),
-        ("int4", 1, 2, 1),
-        (jnp.bfloat16, 1, 2, 1),
-        # DCP 4 at 2 KV heads (c64): the heads fold into the query rows.
-        ("int4", 3, 4, 2),
-        (jnp.float8_e4m3fn, 2, 4, 2),
-    ],
-)
-def test_mixed_step_matches_token_order(dtype, rank, dcp, heads, monkeypatch):
+def _mixed_step(dtype, rank, dcp, heads):
+    """A run of `msa_write_and_candidates_dcp` over a mixed step, and its
+    real rows."""
     rng = np.random.default_rng(10 * dcp + rank)
     # Two decode requests, then a chunk of 3+ large tiles starting at row 21;
     # the chunk's context spans 3 page groups of 128 pages on every rank.
@@ -80,6 +71,22 @@ def test_mixed_step_matches_token_order(dtype, rank, dcp, heads, monkeypatch):
             interpret=True,
         )[-1]
 
+    return run, num_real
+
+
+@pytest.mark.parametrize(
+    "dtype,rank,dcp,heads",
+    [
+        (jnp.float8_e4m3fn, 0, 2, 1),
+        ("int4", 1, 2, 1),
+        (jnp.bfloat16, 1, 2, 1),
+        # DCP 4 at 2 KV heads (c64): the heads fold into the query rows.
+        ("int4", 3, 4, 2),
+        (jnp.float8_e4m3fn, 2, 4, 2),
+    ],
+)
+def test_mixed_step_matches_token_order(dtype, rank, dcp, heads, monkeypatch):
+    run, num_real = _mixed_step(dtype, rank, dcp, heads)
     got = np.asarray(run())
     monkeypatch.setattr(msa_indexer, "is_prefill_step", lambda *_: False)
     want = np.asarray(run())
@@ -87,3 +94,13 @@ def test_mixed_step_matches_token_order(dtype, rank, dcp, heads, monkeypatch):
     # Padding rows hold the picks of position 0: block 0 on rank 0.
     blocks = got[num_real:, TOPK : 2 * TOPK]
     assert np.all((blocks == -1) | (blocks == 0))
+
+
+def test_over_vmem_budget_picks_in_their_own_kernel(monkeypatch):
+    """A step past `_PREFILL_VMEM_BYTES` picks its large tiles in their own
+    kernel and gathers the classes' picks: the same candidates."""
+    run, num_real = _mixed_step("int4", 1, 4, 2)
+    got = np.asarray(run())
+    monkeypatch.setattr(msa_dcp, "_PREFILL_VMEM_BYTES", 0)
+    want = np.asarray(run())
+    np.testing.assert_array_equal(got[:num_real], want[:num_real])
