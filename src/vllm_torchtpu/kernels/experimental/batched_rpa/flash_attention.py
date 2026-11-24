@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
 from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
+
+_LOG2E = math.log2(math.e)
 
 
 def flash_attention_qk_softmax(
@@ -28,7 +32,7 @@ def flash_attention_qk_softmax(
     l_prev: jax.Array,  # [KV, TQ, 128]
     is_last_k: SmemWrapper,  # [steps, B]
     *,
-    custom_mask: jax.Array,
+    custom_mask: list[jax.Array] | None,
     cfgs: configs.RpaConfigs,
     bq_start: int,
     k_scale: jax.Array | float | None = None,  # [B, KV, S]
@@ -63,7 +67,8 @@ def flash_attention_qk_softmax(
         )
     qk = qk.reshape(b, k_heads, tq, s)
 
-    qk *= cfgs.model.sm_scale
+    use_exp2 = cfgs.model.soft_cap is None and not cfgs.serve.return_lse
+    qk *= cfgs.model.sm_scale * (_LOG2E if use_exp2 else 1.0)
     if cfgs.serve.scale_q is not None:
         qk *= cfgs.serve.scale_q
     if k_scale is not None:
@@ -76,13 +81,15 @@ def flash_attention_qk_softmax(
     if cfgs.model.soft_cap is not None:
         qk = cfgs.model.soft_cap * jnp.tanh(qk / cfgs.model.soft_cap)
 
-    qk_masked = []
-    for b_idx in range(cfgs.block.batch_size):
-        mask_b = custom_mask[b_idx]
-        qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
-    qk = jnp.stack(qk_masked, axis=0)
+    if custom_mask is not None:
+        qk_masked = []
+        for b_idx in range(cfgs.block.batch_size):
+            mask_b = custom_mask[b_idx]
+            qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
+        qk = jnp.stack(qk_masked, axis=0)
 
     m_curr = jnp.max(qk, axis=-1, keepdims=True)
+    exp_fn = jnp.exp2 if use_exp2 else jnp.exp
 
     alpha_list = []
     m_next_list = []
@@ -90,13 +97,13 @@ def flash_attention_qk_softmax(
     for b_idx in range(cfgs.block.batch_size):
         m_curr_b = m_curr[b_idx]
         m_next_b = jnp.maximum(m_prev, m_curr_b)
-        alpha_b = jnp.exp(m_prev - m_next_b)
+        alpha_b = exp_fn(m_prev - m_next_b)
         alpha_list.append(alpha_b)
         m_next_list.append(m_next_b)
         m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
-    p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
+    p = exp_fn(qk - utils.broadcast_minor(m_next, qk.shape))
     p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
     l_next_list = []

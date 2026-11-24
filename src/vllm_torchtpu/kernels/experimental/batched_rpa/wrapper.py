@@ -13,6 +13,7 @@
 # limitations under the License.
 """Wrapper for RPA kernel to match expected interface."""
 
+import math
 from typing import cast
 
 import jax
@@ -495,6 +496,79 @@ def calculate_block_sizes(
         decode_batch_size, decode_query_size, max_bkv_sz=decode_max_bkv_sz
     )
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size)
+
+    # On TPU v7x (64 MiB VMEM) with head_dim=256, batch_size=2 caps prefill
+    # tiles at 256x256. Dropping to batch_size=1 fits 512x512 (bq_c_sz=64) with
+    # chunked Q/O VMEM streaming, halving schedule steps and bypassing masks on
+    # strictly causal prefix tiles. Gated to measured safe configurations.
+    if (
+        tpu_info.generation == 7
+        and tpu_info.vmem_capacity_bytes >= 64 * 1024 * 1024
+        and serve_cfgs.total_q_tokens >= 256
+        and serve_cfgs.kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE
+        and serve_cfgs.dtype_q == jnp.bfloat16
+        and serve_cfgs.dtype_kv == jnp.bfloat16
+        and model_cfgs.head_dim == 256
+        and model_cfgs.sliding_window is None
+        and model_cfgs.soft_cap is None
+        and not serve_cfgs.per_token_scale
+        and not serve_cfgs.return_lse
+        and not serve_cfgs.skip_kv_update
+        and serve_cfgs.scale_q is None
+        and serve_cfgs.scale_k is None
+        and serve_cfgs.scale_v is None
+        and serve_cfgs.cp_group_size is None
+        and serve_cfgs.attention_scope == configs.AttentionScope.FULL
+        and serve_cfgs.page_size > 0
+        and 512 % serve_cfgs.page_size == 0
+        and prefill_block_sizes.bq_sz < 512
+    ):
+        max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
+        eff_bkv = min(512, max(256, (max_seq_len // 256) * 256))
+        if eff_bkv % serve_cfgs.page_size == 0:
+            candidate = configs.BlockSizes(
+                bq_sz=512,
+                bq_c_sz=64,
+                bkv_sz=eff_bkv,
+                batch_size=1,
+            )
+            cand_cfgs = configs.RpaConfigs(
+                block=candidate,
+                model=model_cfgs,
+                serve=serve_cfgs,
+                vmem_limit_bytes=vmem_limit_bytes,
+                mode=configs.RpaCase.MIXED,
+            )
+            q_tile_bytes = (
+                math.prod(cand_cfgs.q_vmem_shape)
+                * jnp.dtype(serve_cfgs.dtype_q).itemsize
+            )
+            o_tile_bytes = (
+                math.prod(cand_cfgs.q_vmem_shape)
+                * jnp.dtype(serve_cfgs.dtype_out).itemsize
+            )
+            kv_tile_bytes = (
+                math.prod(cand_cfgs.kv_vmem_shape)
+                * jnp.dtype(serve_cfgs.dtype_kv).itemsize
+            )
+            lm_bytes = (
+                2
+                * math.prod(cand_cfgs.lm_scratch_shape)
+                * jnp.dtype(serve_cfgs.dtype_out).itemsize
+            )
+            acc_bytes = (
+                math.prod(cand_cfgs.acc_scratch_shape)
+                * jnp.dtype(serve_cfgs.dtype_out).itemsize
+            )
+            static_vmem_bytes = (
+                configs.NUM_INPUT_SLOTS * q_tile_bytes
+                + configs.NUM_OUTPUT_SLOTS * o_tile_bytes
+                + configs.NUM_INPUT_SLOTS * kv_tile_bytes
+                + lm_bytes
+                + acc_bytes
+            )
+            if static_vmem_bytes <= int(vmem_limit_bytes * 0.70):
+                prefill_block_sizes = candidate
 
     return decode_block_sizes, prefill_block_sizes
 

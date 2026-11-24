@@ -246,3 +246,63 @@ def test_rpa_configs_rejects_unaligned_bkv_sz_both_layouts(kv_layout):
                 jnp.arange(5, dtype=jnp.int32),
                 jnp.array([4, 4, 4], dtype=jnp.int32),
             )
+
+
+def test_mixed_b1_512_selection_and_guards():
+    """v7x 64MiB bf16 head_dim=256 prefill uses b1-512x512-c64; guards reject unsafe configs."""
+    base_model = configs.ModelConfigs(
+        num_q_heads=12,
+        num_kv_heads=2,
+        head_dim=256,
+        mask_value=-1e9,
+    )
+    base_serve = configs.ServingConfigs(
+        num_seqs=16,
+        page_size=64,
+        total_q_tokens=2048,
+        num_page_indices=16 * 144,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.bfloat16,
+        dtype_out=jnp.bfloat16,
+    )
+    vmem_64m = 64 * 1024 * 1024
+    v7x_info = _create_mock_tpu_info(7, chip_version="v7x", vmem_capacity_bytes=vmem_64m)
+    with patch("jax.experimental.pallas.tpu.get_tpu_info", return_value=v7x_info):
+        _, pre = wrapper.calculate_block_sizes(base_model, base_serve, vmem_64m)
+    assert pre == configs.BlockSizes(bq_sz=512, bq_c_sz=64, bkv_sz=512, batch_size=1)
+
+    # Guard rejections: must fall back to default batch_size=2.
+    rejected_cases = [
+        (
+            _create_mock_tpu_info(6, chip_version="v6e", vmem_capacity_bytes=16 * 1024 * 1024),
+            base_model,
+            base_serve,
+            16 * 1024 * 1024,
+        ),
+        (v7x_info, base_model, dataclasses.replace(base_serve, total_q_tokens=128), vmem_64m),
+        (v7x_info, dataclasses.replace(base_model, head_dim=128), base_serve, vmem_64m),
+        (v7x_info, dataclasses.replace(base_model, sliding_window=1024), base_serve, vmem_64m),
+        (v7x_info, dataclasses.replace(base_model, soft_cap=30.0), base_serve, vmem_64m),
+        (
+            v7x_info,
+            base_model,
+            dataclasses.replace(base_serve, dtype_kv=jnp.float8_e4m3fn),
+            vmem_64m,
+        ),
+        (v7x_info, base_model, dataclasses.replace(base_serve, return_lse=True), vmem_64m),
+        (v7x_info, base_model, dataclasses.replace(base_serve, skip_kv_update=True), vmem_64m),
+        (v7x_info, base_model, dataclasses.replace(base_serve, scale_k=0.5), vmem_64m),
+        # TP=1 (24 Q heads, 4 KV heads) exceeds 70% static VMEM at b1-512x512.
+        (
+            v7x_info,
+            dataclasses.replace(base_model, num_q_heads=24, num_kv_heads=4),
+            base_serve,
+            vmem_64m,
+        ),
+    ]
+    for tpu_info, m_cfg, s_cfg, vmem in rejected_cases:
+        with patch("jax.experimental.pallas.tpu.get_tpu_info", return_value=tpu_info):
+            _, pre_rej = wrapper.calculate_block_sizes(m_cfg, s_cfg, vmem)
+        assert pre_rej.batch_size != 1 or pre_rej.bq_sz != 512, (
+            f"Expected guard rejection, got {pre_rej} for {m_cfg} / {s_cfg}"
+        )
