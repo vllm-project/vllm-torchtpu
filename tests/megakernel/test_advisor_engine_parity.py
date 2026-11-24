@@ -244,7 +244,7 @@ def _valid_workloads_for_model(
             osl=128,
             tp=tp_base,
             ep=ep_valid,
-            vmem_fit_headroom=0.95,
+            vmem_fit_headroom=True,
         ),
         advisor.WorkloadSpec(
             phase="decode",
@@ -2083,3 +2083,105 @@ def test_sublayer_mesh_label_engine_parity(tmp_path: Path) -> None:
         assert rec["sublayer_label"] == layout.submodule_label(), (
             f"{preset_slug} {role_tag} auto owner groups"
         )
+
+
+def test_engine_parity_vmem_fit_headroom(tmp_path: Path) -> None:
+    """Verify JS/Python parity on default headroom, explicit override, custom JSON."""
+    js_runtime = shutil.which("node") or shutil.which("gjs")
+    if js_runtime is None:
+        msg = "Neither node nor gjs runtime found; install nodejs"
+        raise RuntimeError(msg)
+
+    runner_path = Path(__file__).with_name("advisor_engine_runner.js")
+    engine_path = Path(models.__file__).parent / "assets" / "workbench_engine.js"
+    model_name = "qwen3.5-397b"
+    prof_dict = dataclasses.asdict(models.resolve_model_profile(model_name))
+    tpu7x = advisor.resolve_chip_spec("tpu7x")
+
+    custom_spec_path = tmp_path / "custom_tpu7x_parity.json"
+    custom_spec_path.write_text(
+        json.dumps(
+            {
+                "name": "tpu7x",
+                "cores_per_device": 1,
+                "vmem_capacity_bytes": 64 << 20,
+                "vmem_usable_bytes": 62 << 20,
+                "hbm_capacity_bytes": 103_000_000_000,
+                "hbm_bw_bytes_per_s": 3_700_000_000_000.0,
+                "bf16_flops_per_s": 1_155_000_000_000_000.0,
+                "fp8_flops_per_s": 2_300_000_000_000_000.0,
+                "ici_egress_bw_bytes_per_s": 300.0e9,
+                "ici_link_bw_bytes_per_s": 100.0e9,
+            }
+        ),
+        encoding="utf-8",
+    )
+    custom_chip = advisor.resolve_chip_spec("tpu7x", chip_spec_path=custom_spec_path)
+
+    default_fit_mib = 56.0
+    explicit_fit_mib = 58.0
+    custom_usable_mib = 62.0
+    cases = (
+        (
+            tpu7x,
+            advisor.WorkloadSpec(phase="decode", batch=4, tp=8, ep=8),
+            default_fit_mib,
+        ),
+        (
+            tpu7x,
+            advisor.WorkloadSpec(
+                phase="decode", batch=4, tp=8, ep=8, vmem_budget_mib=explicit_fit_mib
+            ),
+            explicit_fit_mib,
+        ),
+        (
+            custom_chip,
+            advisor.WorkloadSpec(phase="decode", batch=4, tp=8, ep=8),
+            custom_usable_mib,
+        ),
+    )
+
+    batch_items: list[_BatchScenarioItem] = []
+    expected_refs: list[_EvalParityResult] = []
+    payload_items: list[dict[str, object]] = []
+    for chip_case, wl_case, expected_mib in cases:
+        py_rep = advisor.advise(model_name, wl_case, chip_case)
+        assert py_rep.vmem_budget_mib == pytest.approx(expected_mib)
+        batch_items.append(
+            {"only_validate": False, "model_name": model_name, "wl": wl_case}
+        )
+        expected_refs.append(_python_reference_eval(model_name, wl_case, chip_case))
+        payload_items.append(
+            {
+                "params": {
+                    "only_validate": False,
+                    "profile": prof_dict,
+                    "chip": dataclasses.asdict(chip_case),
+                    "wl": dataclasses.asdict(wl_case),
+                }
+            }
+        )
+
+    in_json = tmp_path / "vmem_headroom_in.json"
+    out_json = tmp_path / "vmem_headroom_out.json"
+    in_json.write_text(
+        json.dumps(
+            {
+                "engine_path": str(engine_path),
+                "seed_data": {
+                    "chip_spec": dataclasses.asdict(tpu7x),
+                    **workbench_engine.build_engine_seed_defaults(),
+                },
+                "items": payload_items,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _run_engine_runner(js_runtime, runner_path, in_json, out_json)
+    out_records = json.loads(out_json.read_text(encoding="utf-8"))
+    assert len(out_records) == len(cases)
+    for (_, _, expected_mib), rec in zip(cases, out_records, strict=True):
+        assert rec["eval"]["full"]["vmemBudgetMib"] == pytest.approx(
+            expected_mib, abs=0.01
+        )
+    _verify_parity_records(batch_items, expected_refs, out_records)

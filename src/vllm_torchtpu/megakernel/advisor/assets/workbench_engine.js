@@ -904,6 +904,7 @@
     const recRwBytes = 2.0 * lLin * batchLocal *
       (zDim * kd + qkvLin * (p.linear_conv_kernel || 0)) * bwSt;
     const vmemUsable = ch.vmem_usable_bytes;
+    const vmemHeadroom = ch.vmem_fit_headroom_bytes || 0;
     const rawVmemMib = wl.vmemMib !== undefined
       ? wl.vmemMib : (wl.vmem_budget_mib !== undefined
       ? wl.vmem_budget_mib : undefined);
@@ -912,7 +913,11 @@
     const fitHead = Boolean(wl.vmemFitHeadroom || wl.vmem_fit_headroom);
     const baseVmemBytes = (rawVmemMib !== undefined && rawVmemMib !== null)
       ? Math.trunc(rawVmemMib * 1048576)
-      : (wl.tiles ? (wl.tiles.vmem_mib * 1048576) : vmemUsable);
+      : Math.max(
+        0,
+        (wl.tiles && wl.tiles.vmem_mib > 0
+          ? (wl.tiles.vmem_mib * 1048576) : vmemUsable) - vmemHeadroom
+      );
     const vmemBudget = Math.min(
       vmemUsable, Math.max(0, baseVmemBytes - (fitHead ? spillRes : 0))
     );
