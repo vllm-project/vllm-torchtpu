@@ -265,9 +265,7 @@ def test_late_store_job_skips_the_fence():
     mgr.drain_jobs.assert_called_once_with({7})
 
 
-def test_late_store_under_staging_is_cancelled_not_packed():
-    """Staged packs run after the forward: a late store must be cancelled by
-    the flush instead of packing reallocated blocks."""
+def _staged_late_step(num_rows, taken=0):
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
         OffloadingConnectorMetadata,
     )
@@ -287,7 +285,9 @@ def test_late_store_under_staging_is_cancelled_not_packed():
     mgr.poll_finished_jobs.return_value = []
     s._raiden_manager = mgr
     s.manager = mgr
-    s._staged = StagedTransferScheduler(mgr, 8, 1)
+    s._staged = StagedTransferScheduler(mgr, num_rows, 1)
+    if taken:
+        s._staged.rows.take(taken)  # rows busy with other transfers
     job = SimpleNamespace(
         req_id="r",
         src_spec=GPULoadStoreSpec([6], group_sizes=[1], block_indices=[1]),
@@ -309,6 +309,68 @@ def test_late_store_under_staging_is_cancelled_not_packed():
         OffloadingConnectorScheduler, "build_connector_meta", lambda self, o: meta
     ):
         res = s.build_connector_meta(out)
+    return s, mgr, keys, res
+
+
+def test_late_store_under_staging_packs_before_forward():
+    """Late store with staging: rows now, an urgent pack (worker
+    start_load_kv, before the forward), fenced, and not cancelled by the flush
+    of its reused block; the save launches from the rows after the fence."""
+    s, mgr, keys, res = _staged_late_step(num_rows=8)
     assert res.staging_packs == {}
+    assert len(res.staging_urgent_packs) == 1
+    (part_id, (blocks, rows)), = res.staging_urgent_packs.items()
+    assert blocks == [6] and len(rows) == 1
+    assert part_id in res.fence_job_ids
+    mgr.on_store_job_cancelled.assert_not_called()
+    # Every rank retires the fence: the save reads the rows.
+    s._staged.on_fenced({part_id: 1})
+    mgr.submit_store_job.assert_called_once_with(part_id, [keys[1]], rows)
+
+
+def test_late_store_under_staging_without_rows_is_cancelled():
+    s, mgr, keys, res = _staged_late_step(num_rows=2, taken=2)
+    assert res.staging_urgent_packs == {} and res.staging_packs == {}
     mgr.submit_store_job.assert_not_called()
     mgr.on_store_job_cancelled.assert_called_once_with([keys[1]])
+
+
+def test_worker_start_load_kv_packs_urgent_rows_first():
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnector,
+    )
+
+    from vllm_torchtpu.offload.raiden_connector import (
+        RaidenOffloadingConnectorMetadata,
+        TPURaidenOffloadingConnector,
+    )
+
+    c = TPURaidenOffloadingConnector.__new__(TPURaidenOffloadingConnector)
+    c._staging = MagicMock()
+    order = []
+    c._staging.pack.side_effect = lambda b, r: order.append(("pack", b, r))
+    c._connector_metadata = RaidenOffloadingConnectorMetadata(
+        load_jobs={},
+        store_jobs={},
+        jobs_to_flush=set(),
+        staging_urgent_packs={11: ([6, 9], [0, 1])},
+    )
+    with patch.object(
+        OffloadingConnector,
+        "start_load_kv",
+        lambda self, fc, **kw: order.append(("base",)),
+    ), patch(
+        "vllm_torchtpu.offload.raiden_connector._enqueue_pool_writes",
+        side_effect=lambda t: order.append(("enqueue",)),
+    ):
+        c.start_load_kv(None)
+    assert order == [("base",), ("pack", [6, 9], [0, 1]), ("enqueue",)]
+    # Nothing urgent: no pack.
+    c._connector_metadata = RaidenOffloadingConnectorMetadata(
+        load_jobs={}, store_jobs={}, jobs_to_flush=set()
+    )
+    with patch.object(
+        OffloadingConnector, "start_load_kv", lambda self, fc, **kw: None
+    ):
+        c.start_load_kv(None)
+    assert len(order) == 3

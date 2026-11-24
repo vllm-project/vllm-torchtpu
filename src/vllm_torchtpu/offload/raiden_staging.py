@@ -574,6 +574,9 @@ class _Part:
     # load: queued -> launched -> unpacking.
     state: str = "queued"
     acks: int = 0
+    # Store packed before the step's forward (late store of blocks this step
+    # reallocates): its rows already hold the data, so a flush never cancels it.
+    urgent: bool = False
 
 
 @dataclass
@@ -592,6 +595,9 @@ class StagedStepOutput:
 
     # part id -> (device blocks, rows) to pack before the part's save fence.
     packs: dict[int, tuple[list[int], list[int]]] = field(default_factory=dict)
+    # part id -> (device blocks, rows) to pack before this step's forward
+    # (worker start_load_kv); fenced like `packs`.
+    urgent_packs: dict[int, tuple[list[int], list[int]]] = field(default_factory=dict)
     # part id -> (rows, device blocks) to unpack; acked as `unpacked_jobs`.
     unpacks: dict[int, tuple[list[int], list[int]]] = field(default_factory=dict)
     finished_store_job_ids: list[int] = field(default_factory=list)
@@ -682,6 +688,37 @@ class StagedTransferScheduler:
             job.outstanding.add(part.part_id)
             self._store_queue.append(part.part_id)
 
+    def add_urgent_store_job(
+        self,
+        job_id: int,
+        keys: list[OffloadKey],
+        device_block_ids: list[int],
+        out: StagedStepOutput,
+    ) -> bool:
+        """A store whose source blocks are reallocated this step: its parts
+        take rows now, ahead of queued loads and stores, and pack before the
+        step's forward overwrites the blocks (`out.urgent_packs`). False, with
+        nothing queued, when the rows do not fit: the caller cancels it."""
+        parts = self._split(job_id, True, keys, device_block_ids)
+        need = sum(len(p.keys) for p in parts)
+        if need > self.rows.num_free:
+            for part in parts:
+                del self._parts[part.part_id]
+            self.stats["store_urgent_no_rows"] += 1
+            return False
+        job = _BaseJob(job_id=job_id, is_store=True)
+        self._jobs[job_id] = job
+        for part in parts:
+            rows = self.rows.take(len(part.keys))
+            assert rows is not None
+            part.rows = rows
+            part.state = "fencing"
+            part.urgent = True
+            job.outstanding.add(part.part_id)
+            out.urgent_packs[part.part_id] = (list(part.device_block_ids), list(rows))
+        self.stats["store_urgent_parts"] += len(parts)
+        return True
+
     def add_load_job(
         self,
         job_id: int,
@@ -730,6 +767,8 @@ class StagedTransferScheduler:
                 continue
             for part_id in list(job.outstanding):
                 part = self._parts[part_id]
+                if part.urgent:
+                    continue
                 if part.state == "queued":
                     self._store_queue.remove(part_id)
                     del self._parts[part_id]

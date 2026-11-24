@@ -187,6 +187,12 @@ class RaidenOffloadingConnectorMetadata(OffloadingConnectorMetadata):
     staging_unpacks: dict[int, tuple[list[int], list[int]]] = field(
         default_factory=dict
     )
+    # Part id -> (device blocks, staging rows) to pack in start_load_kv, before
+    # this step's forward overwrites the blocks (write-back late_store); their
+    # ids are in fence_job_ids too.
+    staging_urgent_packs: dict[int, tuple[list[int], list[int]]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -424,15 +430,6 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 row_bytes,
                 self._staged.max_part_rows,
             )
-            if self._write_back is not None and self._write_back.late_store:
-                # A staged pack runs after the step's forward, so a block
-                # reallocated this step cannot be packed in time: the flush
-                # cancels late stores (safe), and late_store does nothing.
-                logger.warning(
-                    "TPURaidenOffloadingConnector: store_policy late_store has "
-                    "no effect with staging_blocks (packs run after the "
-                    "forward); reallocated chunks are not stored"
-                )
 
     def attach_block_pool(self, block_pool) -> None:
         """`EvictionAwareConnector`: the scheduler's block pool, whose free
@@ -877,14 +874,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 scheduler_output = self._write_back_output(scheduler_output)
             meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, OffloadingConnectorMetadata)
+        urgent_reqs = getattr(self, "_wb_urgent", None) or set()
+        self._wb_urgent = set()
         if self._staged is not None:
-            return self._build_staged_meta(meta, self._staged)
+            return self._build_staged_meta(meta, self._staged, urgent_reqs)
 
         manager = self._raiden_manager
 
         # Park new store jobs: wait for all ranks to complete device fence.
-        urgent_reqs = getattr(self, "_wb_urgent", None) or set()
-        self._wb_urgent = set()
         new_fence_ids: set[int] = set()
         for job_id, job in meta.store_jobs.items():
             src_spec, dst_spec = job.src_spec, job.dst_spec
@@ -1184,7 +1181,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         return max(0, min(hit_end, limit) - num_local_tokens)
 
     def _build_staged_meta(
-        self, meta: OffloadingConnectorMetadata, staged: StagedTransferScheduler
+        self,
+        meta: OffloadingConnectorMetadata,
+        staged: StagedTransferScheduler,
+        urgent_reqs: set[str] | frozenset[str] = frozenset(),
     ) -> RaidenOffloadingConnectorMetadata:
         """`build_connector_meta` with staging rows between HBM and Raiden.
 
@@ -1193,13 +1193,24 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         into rows as soon as rows are free, and ship an unpack in the step
         that echoes them finished. A flushed store needs no drain: once
         launched it reads its own rows, never the reused blocks.
+
+        A write-back late store (`urgent_reqs`: its blocks are reallocated this
+        step) takes rows at once and packs in the workers' start_load_kv,
+        before the forward; without free rows it queues and the flush cancels
+        it, as any store of reused blocks.
         """
         out = StagedStepOutput()
         for job_id, job in meta.store_jobs.items():
             src_spec, dst_spec = job.src_spec, job.dst_spec
             assert isinstance(src_spec, GPULoadStoreSpec)
             assert isinstance(dst_spec, RaidenLoadStoreSpec)
-            staged.add_store_job(job_id, dst_spec.keys, src_spec.block_ids.tolist())
+            blocks = src_spec.block_ids.tolist()
+            if job.req_id in urgent_reqs and staged.add_urgent_store_job(
+                job_id, dst_spec.keys, blocks, out
+            ):
+                self.wb_counters["late_store_jobs"] += 1
+                continue
+            staged.add_store_job(job_id, dst_spec.keys, blocks)
         for job_id, job in meta.load_jobs.items():
             src_spec, dst_spec = job.src_spec, job.dst_spec
             assert isinstance(src_spec, RaidenLoadStoreSpec)
@@ -1218,12 +1229,13 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             store_jobs={},  # pyrefly: ignore[unexpected-keyword]
             # pyrefly: ignore[unexpected-keyword]
             jobs_to_flush=meta.jobs_to_flush,
-            fence_job_ids=set(out.packs),
+            fence_job_ids=set(out.packs) | set(out.urgent_packs),
             finished_store_job_ids=out.finished_store_job_ids,
             finished_load_jobs=out.finished_load_jobs,
             failed_load_req_ids=out.failed_load_req_ids,
             staging_packs=out.packs,
             staging_unpacks=out.unpacks,
+            staging_urgent_packs=out.urgent_packs,
         )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
@@ -1557,6 +1569,26 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         self._staging.unpack(rows, blocks)
         _enqueue_pool_writes(self._staging.pools)
         self._pending_unpacks.append((set(meta.staging_unpacks), _record_fence_event()))
+
+    def start_load_kv(self, forward_context, **kwargs) -> None:
+        super().start_load_kv(forward_context, **kwargs)
+        meta = self._connector_metadata
+        if (
+            isinstance(meta, RaidenOffloadingConnectorMetadata)
+            and meta.staging_urgent_packs
+        ):
+            # Late stores: pack the reallocated blocks into their rows before
+            # this step's forward is enqueued (in-order device queue), so the
+            # rows hold the old contents. The save fence is recorded with the
+            # other packs in get_transfer_results.
+            assert self._staging is not None
+            blocks: list[int] = []
+            rows: list[int] = []
+            for part_blocks, part_rows in meta.staging_urgent_packs.values():
+                blocks.extend(part_blocks)
+                rows.extend(part_rows)
+            self._staging.pack(blocks, rows)
+            _enqueue_pool_writes([self._staging.tensor])
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         # Load failures only travel in get_transfer_results().failed_recving.
