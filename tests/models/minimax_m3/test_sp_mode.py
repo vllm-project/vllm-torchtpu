@@ -874,3 +874,57 @@ def test_armed_rank(monkeypatch):
         assert pallas_all_reduce.armed_rank([0, 1]) is None
     monkeypatch.setattr(pallas_all_reduce, "_ARMED", None)
     assert pallas_all_reduce.armed_rank([0, 1, 2, 3]) is None
+
+
+# ------------------------------------------------------- e4m3 shared expert
+def _shared_moe():
+    moe = _moe(("m",), 0, _TP(1))
+    mlp = object.__new__(MiniMaxM3MLP)
+    nn.Module.__init__(mlp)
+    mlp.gate_up_proj = _Linear(H, 64, ("sh", "gu"))
+    mlp.down_proj = _Linear(32, H, ("sh", "dn"))
+    mlp.act_fn = lambda gu: torch.tanh(gu[..., :32].float()).to(gu.dtype) * gu[..., 32:]
+    moe.shared_experts = mlp
+    # The MoE runner calls the shared expert on the bf16 hidden states.
+    moe.experts = lambda hidden_states, router_logits: mlp(hidden_states)
+    return moe, mlp
+
+
+def test_e4m3_shared_expert(monkeypatch):
+    monkeypatch.setattr(quant, "_e4m3_matmul", lambda *a: _jax_call(quant._e4m3_rows_matmul, *a))
+    moe, mlp = _shared_moe()
+    x = _input()
+    q8, scale = mm._quantize_rows(x)
+    deq = (q8.float() * scale).to(torch.bfloat16)
+    monkeypatch.setattr(envs, "TPU_MINIMAX_M3_SP_E4M3_SHARED", False, raising=False)
+    off = moe((q8, scale))
+    assert len(mlp.gate_up_proj.inputs) == 1
+    torch.testing.assert_close(mlp.gate_up_proj.inputs[0], deq)
+    monkeypatch.setattr(envs, "TPU_MINIMAX_M3_SP_E4M3_SHARED", True, raising=False)
+    on = moe((q8, scale))
+    # gate_up took the e4m3 rows (apply_e4m3_rows), not the linear's forward.
+    assert len(mlp.gate_up_proj.inputs) == 1
+    assert "_e4m3_rows" not in mlp.__dict__
+    assert _rel(on, off) < 2e-2
+    # A bf16 input (non-SP step) keeps the bf16 path even with the switch on.
+    moe(x)
+    assert len(mlp.gate_up_proj.inputs) == 2 and mlp.gate_up_proj.inputs[1] is x
+
+
+def test_e4m3_shared_expert_dynamo(monkeypatch):
+    """The e4m3 rows handed to the shared expert trace under Dynamo
+    (fullgraph) and leave no attribute behind."""
+    monkeypatch.setattr(
+        quant,
+        "_e4m3_matmul",
+        lambda q, rs, w, ws: ((q.float() @ w.float()) * rs * ws.float()).to(torch.bfloat16),
+    )
+    monkeypatch.setattr(envs, "TPU_MINIMAX_M3_SP_E4M3_SHARED", True, raising=False)
+    moe, mlp = _shared_moe()
+    q8, scale = mm._quantize_rows(_input())
+    want = moe((q8, scale))
+    torch._dynamo.reset()
+    got = torch.compile(lambda a, b: moe((a, b)), backend="eager", fullgraph=True)(q8, scale)
+    torch.testing.assert_close(got, want)
+    assert "_e4m3_rows" not in mlp.__dict__
+    assert len(mlp.gate_up_proj.inputs) == 0
