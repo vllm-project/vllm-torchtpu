@@ -42,6 +42,10 @@ _CHUNK_ROWS = 256
 _TILES_PER_CHUNK = _CHUNK_ROWS // TILE_ROWS
 TOKEN_BLOCK = 256
 _VMEM_LIMIT_BYTES = 60 * 1024 * 1024
+# Shared-expert epilogue: output columns per MXU product / store.
+_SHARED_N_CHUNK = 512
+# VMEM limit when the shared expert's down weight is resident.
+_SHARED_VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 
 
 def max_tiles(token_block: int, topk: int, num_experts: int) -> int:
@@ -61,6 +65,27 @@ def supported(num_tokens: int, hidden: int, topk: int, num_experts: int, dtype) 
         + 2 * TOKEN_BLOCK * hidden * 2  # output blocks
     )
     return vmem <= _VMEM_LIMIT_BYTES - 8 * 1024 * 1024
+
+
+def supported_shared(
+    num_tokens: int, hidden: int, topk: int, num_experts: int, dtype, shared_k: int
+) -> bool:
+    """`supported` plus the shared expert's resident bf16 down weight
+    [shared_k, hidden] and double-buffered activation blocks."""
+    if not supported(num_tokens, hidden, topk, num_experts, dtype):
+        return False
+    if shared_k % 128 or hidden % _SHARED_N_CHUNK:
+        return False
+    tiles = max_tiles(TOKEN_BLOCK, topk, num_experts)
+    vmem = (
+        2 * tiles * TILE_ROWS * hidden * 2
+        + TOKEN_BLOCK * hidden * 4
+        + 2 * TOKEN_BLOCK * hidden * 2
+        + shared_k * hidden * 2  # resident down weight
+        + 2 * TOKEN_BLOCK * shared_k * 2  # activation blocks
+        + 2 * hidden * 2  # scale
+    )
+    return vmem <= _SHARED_VMEM_LIMIT_BYTES - 6 * 1024 * 1024
 
 
 def _plan(pos, valid, group_sizes, num_tokens: int, topk: int, token_block: int):
@@ -118,16 +143,28 @@ def _kernel(
     row_ref,  # VMEM [TB, k]
     w_ref,  # VMEM [TB, k]
     x_hbm,  # ANY [Mx, H]
-    out_ref,  # VMEM [TB, H]
-    buf,  # VMEM [2, maxt * 16, H]
-    acc,  # VMEM [TB, H] f32
-    sems,  # DMA [2]
-    *,
+    *rest,
     maxt: int,
     topk: int,
+    shared: bool = False,
+    routed_scale: float = 1.0,
 ):
+    if shared:
+        # act_ref VMEM [TB, Ks]; ws_hbm ANY [Ks, H] bf16; wscale_ref VMEM [1, H]
+        act_ref, ws_hbm, wscale_ref, out_ref, buf, acc, sems, ws_vmem, ws_sem = rest
+    else:
+        out_ref, buf, acc, sems = rest
     b = pl.program_id(0)
     nb = pl.num_programs(0)
+
+    if shared:
+        # The shared expert's down weight stays in VMEM for the whole grid
+        # (sequential, one core): one DMA at the first block.
+        @pl.when(b == 0)
+        def _():
+            cp = pltpu.make_async_copy(ws_hbm, ws_vmem, ws_sem.at[0])
+            cp.start()
+            cp.wait()
 
     def tile_copy(block, i, parity):
         t = tiles_ref[block * maxt + i]
@@ -223,13 +260,36 @@ def _kernel(
 
     lax.fori_loop(0, n_chunks, chunk, 0)
 
+    if not shared:
+
+        @pl.when(n_chunks == 0)
+        def _():
+            out_ref[...] = jnp.zeros_like(out_ref)
+
+        @pl.when(n_chunks > 0)
+        def _():
+            out_ref[...] = acc[...].astype(out_ref.dtype)
+
+        return
+
+    # Shared expert down projection fused into the output pass, rounded as
+    # the unfused graph rounds: routed = bf16(acc) * routed_scale (bf16),
+    # shared = bf16(act @ W) * w_scale (bf16), out = bf16(routed + shared).
     @pl.when(n_chunks == 0)
     def _():
-        out_ref[...] = jnp.zeros_like(out_ref)
+        acc[...] = jnp.zeros_like(acc)
 
-    @pl.when(n_chunks > 0)
-    def _():
-        out_ref[...] = acc[...].astype(out_ref.dtype)
+    act = act_ref[...]
+    for n0 in range(0, hidden, _SHARED_N_CHUNK):
+        sl = slice(n0, n0 + _SHARED_N_CHUNK)
+        s = jnp.dot(act, ws_vmem[:, sl], preferred_element_type=jnp.float32)
+        s = s.astype(jnp.bfloat16) * wscale_ref[:, sl]
+        r = acc[:, sl].astype(jnp.bfloat16)
+        if routed_scale != 1.0:
+            r = r * jnp.asarray(routed_scale, jnp.bfloat16)
+        out_ref[:, sl] = (r.astype(jnp.float32) + s.astype(jnp.float32)).astype(
+            out_ref.dtype
+        )
 
 
 @functools.partial(jax.jit, static_argnames=("topk", "interpret"))
@@ -247,6 +307,53 @@ def tc_combine(
     accumulation, bf16 out. `x` rows [0, sum(group_sizes)) are the GMM output
     grouped by local expert (sizes `group_sizes`), tokens ascending within a
     group; `pos`, `weights`, `valid` are flat [T * topk] in token-major order."""
+    return _tc_combine(x, pos, weights, valid, group_sizes, None, topk, interpret)
+
+
+@functools.partial(
+    jax.jit, static_argnames=("topk", "routed_scale", "interpret")
+)
+def tc_combine_shared(
+    x: jax.Array,
+    pos: jax.Array,
+    weights: jax.Array,
+    valid: jax.Array,
+    group_sizes: jax.Array,
+    shared_act: jax.Array,
+    shared_w: jax.Array,
+    shared_scale: jax.Array,
+    *,
+    topk: int,
+    routed_scale: float = 1.0,
+    interpret=False,
+) -> jax.Array:
+    """`tc_combine` with the shared expert's down projection in its output
+    pass: bf16(bf16(combine) * routed_scale + bf16(shared_act @ shared_w) *
+    shared_scale), the roundings of the unfused graph (combine, routed scale,
+    shared down_proj with its per-channel power-of-two scale, bf16 add).
+
+    `shared_act` [T, Ks] bf16, `shared_w` [Ks, H] (cast to bf16), and
+    `shared_scale` [H]. The shared [T, H] partial never round-trips HBM."""
+    shared = (
+        shared_act.astype(jnp.bfloat16),
+        shared_w.astype(jnp.bfloat16),
+        shared_scale.astype(jnp.bfloat16).reshape(1, -1),
+        float(routed_scale),
+    )
+    return _tc_combine(x, pos, weights, valid, group_sizes, shared, topk, interpret)
+
+
+def _shared_epilogue(routed, shared):
+    act, w, scale, routed_scale = shared
+    s = jnp.dot(act, w, preferred_element_type=jnp.float32).astype(jnp.bfloat16)
+    s = s * scale
+    r = routed.astype(jnp.bfloat16)
+    if routed_scale != 1.0:
+        r = r * jnp.asarray(routed_scale, jnp.bfloat16)
+    return (r.astype(jnp.float32) + s.astype(jnp.float32)).astype(jnp.bfloat16)
+
+
+def _tc_combine(x, pos, weights, valid, group_sizes, shared, topk, interpret):
     num_tokens = pos.shape[0] // topk
     hidden = x.shape[1]
     num_experts = group_sizes.shape[0]
@@ -262,38 +369,63 @@ def tc_combine(
     w = weights.reshape(num_tokens, topk)
     if w.dtype != jnp.bfloat16:
         w = w.astype(jnp.float32)
+    in_specs = [
+        pl.BlockSpec((token_block, topk), lambda b, *_: (b, 0)),
+        pl.BlockSpec((token_block, topk), lambda b, *_: (b, 0)),
+        pl.BlockSpec(memory_space=pl.ANY),
+    ]
+    scratch = [
+        pltpu.VMEM((2, maxt * TILE_ROWS, hidden), x.dtype),
+        pltpu.VMEM((token_block, hidden), jnp.float32),
+        pltpu.SemaphoreType.DMA((2,)),
+    ]
+    operands = [tiles, counts, valid_rows, rows, w, x]
+    vmem_limit = _VMEM_LIMIT_BYTES
+    kernel_kw = {"maxt": maxt, "topk": topk}
+    if shared is not None:
+        act, ws, wscale, routed_scale = shared
+        shared_k = act.shape[1]
+        in_specs += [
+            pl.BlockSpec((token_block, shared_k), lambda b, *_: (b, 0)),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec((1, hidden), lambda b, *_: (0, 0)),
+        ]
+        scratch += [
+            pltpu.VMEM((shared_k, hidden), jnp.bfloat16),
+            pltpu.SemaphoreType.DMA((1,)),
+        ]
+        operands += [act, ws, wscale]
+        vmem_limit = _SHARED_VMEM_LIMIT_BYTES
+        kernel_kw.update(shared=True, routed_scale=routed_scale)
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=3,
         grid=(nb,),
-        in_specs=[
-            pl.BlockSpec((token_block, topk), lambda b, *_: (b, 0)),
-            pl.BlockSpec((token_block, topk), lambda b, *_: (b, 0)),
-            pl.BlockSpec(memory_space=pl.ANY),
-        ],
+        in_specs=in_specs,
         out_specs=pl.BlockSpec((token_block, hidden), lambda b, *_: (b, 0)),
-        scratch_shapes=[
-            pltpu.VMEM((2, maxt * TILE_ROWS, hidden), x.dtype),
-            pltpu.VMEM((token_block, hidden), jnp.float32),
-            pltpu.SemaphoreType.DMA((2,)),
-        ],
+        scratch_shapes=scratch,
     )
     combine = pl.pallas_call(
-        functools.partial(_kernel, maxt=maxt, topk=topk),
+        functools.partial(_kernel, **kernel_kw),
         grid_spec=grid_spec,
         out_shape=jax.ShapeDtypeStruct((num_tokens, hidden), jnp.bfloat16),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+            vmem_limit_bytes=vmem_limit,
         ),
         interpret=interpret,
-        name="tc_moe_combine",
+        name="tc_moe_combine" if shared is None else "tc_moe_combine_shared",
     )
+
+    def fallback():
+        out = _gather_combine(x, pos, weights, valid, topk)
+        return out if shared is None else _shared_epilogue(out, shared)
+
     # A block needs more tiles than the buffer holds only if some expert's
     # rows are not in token order; then take the plain gather.
     return lax.cond(
         jnp.any(counts > maxt),
-        lambda: _gather_combine(x, pos, weights, valid, topk),
-        lambda: combine(tiles, counts, valid_rows, rows, w, x),
+        fallback,
+        lambda: combine(*operands),
     )
 
 
