@@ -2462,3 +2462,154 @@ class GDNAttentionTest(parameterized.TestCase):
                     np.testing.assert_allclose(
                         rec_out[slot], rec_ref[slot], rtol=3e-2, atol=3e-2
                     )
+
+
+class GDNBf16MxuOptimizationTest(parameterized.TestCase):
+    """Tests for MXU XOR-DnC tri_inv, head-group scaling, and bf16 QKV path."""
+
+    @parameterized.parameters(
+        (2, 6, 1),
+        (4, 12, 1),
+        (8, 24, 2),
+        (16, 48, 4),
+        (4, 32, 2),
+    )
+    def test_select_head_groups(self, n_kq: int, n_v: int, expected: int):
+        self.assertEqual(compute_gdn.select_head_groups(n_kq, n_v), expected)
+
+    @parameterized.parameters(4, 16, 64, 128)
+    def test_tri_inv_xor_dnc_matches_float64_oracle(self, bt: int):
+        rng = np.random.default_rng(42 + bt)
+        raw = rng.standard_normal((4, bt, bt)).astype(np.float64) * (0.35 / np.sqrt(bt))
+        strict_lower = np.tril(raw, k=-1)
+        expected = np.linalg.inv(np.eye(bt, dtype=np.float64)[None] + strict_lower)
+
+        actual = np.asarray(
+            compute_gdn.tri_inv_xor_dnc(jnp.asarray(strict_lower, dtype=jnp.float32)),
+            dtype=np.float64,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=2e-2, atol=2e-2)
+        # Must-fail positive control: perturbed output fails the tolerance.
+        perturbed = actual.copy()
+        perturbed[0, bt - 1, 0] += 0.25
+        with self.assertRaises(AssertionError):
+            np.testing.assert_allclose(perturbed, expected, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.tpu_test
+    @parameterized.named_parameters(
+        ("tp4_12h", 4, 12, 512, False),
+        ("tp2_24h", 8, 24, 1024, False),
+        ("tp2_24h_prefill_ckpt", 8, 24, 1024, True),
+        ("tp1_48h", 16, 48, 512, False),
+    )
+    def test_bf16_qkv_mxu_prefill_and_mixed(
+        self, n_kq: int, n_v: int, batch_size: int, with_prefill_ckpt: bool
+    ):
+        d_k = d_v = 128
+        kernel_size = 4
+        dim = 2 * n_kq * d_k + n_v * d_v
+        num_seqs = 16
+        num_decodes = 5  # forces non-zero r_off mod 16 for the prefill seq
+        prefill_len = batch_size - num_decodes - 7  # partial tail chunk
+        active_seqs = num_decodes + 1
+
+        k0, k1, k2, k3, k4, k5, k6, k7 = jax.random.split(jax.random.key(123 + n_v), 8)
+        qkv = jax.random.normal(k0, (batch_size, dim), dtype=jnp.bfloat16) * 0.2
+        b = jax.random.normal(k1, (batch_size, n_v), dtype=jnp.bfloat16) * 0.5
+        a = jax.random.normal(k2, (batch_size, n_v), dtype=jnp.bfloat16) * 0.5 - 2.0
+        init_conv = (
+            jax.random.normal(k3, (num_seqs + 1, kernel_size - 1, dim), dtype=jnp.float32)
+            * 0.1
+        )
+        init_rec = (
+            jax.random.normal(k4, (num_seqs + 1, n_v, d_k, d_v), dtype=jnp.float32) * 0.05
+        )
+        conv_weight = jax.random.normal(k5, (dim, 1, kernel_size), dtype=jnp.float32) * 0.2
+        a_log = jax.random.normal(k6, (n_v,), dtype=jnp.float32) * 0.3 - 1.0
+        dt_bias = jax.random.normal(k7, (n_v,), dtype=jnp.float32) * 0.3
+
+        query_start_loc = jnp.array(
+            list(range(num_decodes + 1))
+            + [num_decodes + prefill_len] * (num_seqs - num_decodes),
+            dtype=jnp.int32,
+        )
+        state_indices = jnp.arange(num_seqs, dtype=jnp.int32)
+        distribution = jnp.array(
+            [num_decodes, num_decodes, active_seqs], dtype=jnp.int32
+        )
+        seq_lens = jnp.array(
+            [12] * num_decodes
+            + [prefill_len + 12]
+            + [0] * (num_seqs - active_seqs),
+            dtype=jnp.int32,
+        )
+
+        common_kwargs = dict(
+            qkv=qkv,
+            b=b,
+            a=a,
+            conv_weight=conv_weight,
+            conv_bias=None,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+        (conv_ref, rec_ref), out_ref = gdn_attention_ref(
+            states=(init_conv, init_rec),
+            **common_kwargs,
+        )
+
+        prefill_ckpt_offsets = None
+        prefill_ckpt_indices = None
+        ckpt_slot = num_seqs
+        ckpt_offset = 192
+        if with_prefill_ckpt:
+            prefill_ckpt_offsets = jnp.zeros((num_seqs,), dtype=jnp.int32).at[
+                num_decodes
+            ].set(ckpt_offset)
+            prefill_ckpt_indices = jnp.full((num_seqs,), -1, dtype=jnp.int32).at[
+                num_decodes
+            ].set(ckpt_slot)
+
+        (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+            states=(init_conv.copy(), init_rec.copy()),
+            prefill_ckpt_offsets=prefill_ckpt_offsets,
+            prefill_ckpt_indices=prefill_ckpt_indices,
+            **common_kwargs,
+        )
+        valid_tokens = num_decodes + prefill_len
+        np.testing.assert_allclose(
+            out[:valid_tokens], out_ref[:valid_tokens], rtol=3e-2, atol=3e-2
+        )
+        for s in range(active_seqs):
+            slot = int(state_indices[s])
+            np.testing.assert_allclose(
+                conv_out[slot], conv_ref[slot], rtol=2e-2, atol=2e-2
+            )
+            np.testing.assert_allclose(
+                rec_out[slot], rec_ref[slot], rtol=3e-2, atol=3e-2
+            )
+        if with_prefill_ckpt:
+            # Verify the mid-prefill checkpoint matches a truncated reference run.
+            q_trunc = query_start_loc.at[num_decodes + 1 :].set(
+                num_decodes + ckpt_offset
+            )
+            seq_trunc = seq_lens.at[num_decodes].set(ckpt_offset + 12)
+            (conv_ck_ref, rec_ck_ref), _ = gdn_attention_ref(
+                states=(init_conv, init_rec),
+                **{**common_kwargs, "query_start_loc": q_trunc, "seq_lens": seq_trunc},
+            )
+            np.testing.assert_allclose(
+                conv_out[ckpt_slot], conv_ck_ref[num_decodes], rtol=2e-2, atol=2e-2
+            )
+            np.testing.assert_allclose(
+                rec_out[ckpt_slot], rec_ck_ref[num_decodes], rtol=3e-2, atol=3e-2
+            )

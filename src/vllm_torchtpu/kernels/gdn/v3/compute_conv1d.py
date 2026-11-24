@@ -57,7 +57,29 @@ def causal_conv1d(
     # kernel iterate each rows and perform masking to fetch correct values.
     # NOTE: lhs[:, : prev_kernel_size] can be skipped since they were loaded from
     # previous conv states.
-    real_sizes = real_sizes.reshape(-1, 1, 1, 1)
+    real_sizes_4d = real_sizes.reshape(-1, 1, 1, 1)
+    if cfg.window_size == 1 and cfg.chunk_size > 1:
+        last_row = cfg.chunk_size
+        full_state = lhs[:, last_row : last_row + cfg.prev_kernel_size]
+
+        def _tail_state(_):
+            st = full_state
+            for c_idx in range(1, last_row):
+                st = jnp.where(
+                    c_idx == real_sizes_4d,
+                    lhs[:, c_idx : c_idx + cfg.prev_kernel_size],
+                    st,
+                )
+            return st
+
+        new_conv_state = jax.lax.cond(
+            jnp.all(real_sizes >= cfg.chunk_size),
+            lambda _: full_state,
+            _tail_state,
+            None,
+        )
+        return jnp.stack(out_list, axis=1), new_conv_state[:, jnp.newaxis]
+
     state_list = []
     # NOTE: Even though for loop is invoked multiple times, since they are
     # static loops, compiler will perform loop fusion.
@@ -68,7 +90,7 @@ def causal_conv1d(
         new_conv_state = lhs[:, last_row : last_row + cfg.prev_kernel_size]
         for c_idx in range(1, last_row):
             new_conv_state = jnp.where(
-                c_idx == real_sizes,
+                c_idx == real_sizes_4d,
                 lhs[:, c_idx : c_idx + cfg.prev_kernel_size],
                 new_conv_state,
             )

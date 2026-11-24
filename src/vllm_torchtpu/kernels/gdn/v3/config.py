@@ -230,6 +230,7 @@ class GDNConfig:
     # default 0.80 budget is not enough; those get a higher limit and the
     # wrapper sizes the tile against the same factor.
     DEFAULT_VMEM_FRACTION: ClassVar[float] = 0.80
+    FAST_GDN_VMEM_FRACTION: ClassVar[float] = 0.85
     WINDOWED_VMEM_FRACTION: ClassVar[float] = 0.90
     # 64 MiB TPU v7x VMEM capacity where dynamic tile timings were calibrated;
     # capping heuristic sizing here prevents larger-VMEM chips from picking
@@ -251,6 +252,7 @@ class GDNConfig:
         cls,
         window_size: int = 1,
         vmem_capacity_bytes: int | None = None,
+        vmem_fraction: float | None = None,
     ) -> int:
         """Return the VMEM limit for a kernel keeping window_size checkpoints."""
         capacity = (
@@ -258,9 +260,14 @@ class GDNConfig:
             if vmem_capacity_bytes is None
             else vmem_capacity_bytes
         )
-        fraction = (
-            cls.WINDOWED_VMEM_FRACTION if window_size > 1 else cls.DEFAULT_VMEM_FRACTION
-        )
+        if vmem_fraction is not None:
+            fraction = vmem_fraction
+        else:
+            fraction = (
+                cls.WINDOWED_VMEM_FRACTION
+                if window_size > 1
+                else cls.DEFAULT_VMEM_FRACTION
+            )
         return int(fraction * capacity)
 
     @classmethod

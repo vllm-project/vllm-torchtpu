@@ -108,8 +108,11 @@ def compute_per_seq_metadata(
     """
     max_seqs = seq_lens.size
     max_tokens = cfg.batch_size
+    extra_per_seq = 2 if prefill_ckpt_offsets is not None else 1
+    tight_tiles = extra_per_seq * max_seqs + max_tokens // max(cfg.chunk_size, 1)
+    max_tiles = max(1, min(max_tokens, pl.cdiv(tight_tiles, 128) * 128))
     all_seqs = jnp.arange(max_seqs)
-    all_tokens = jnp.arange(max_tokens)
+    all_tiles = jnp.arange(max_tiles)
 
     # Shift to ensure first element is for start_seq.
     query_start_loc = jnp.roll(query_start_loc, shift=-start_seq)
@@ -171,10 +174,10 @@ def compute_per_seq_metadata(
     # kernel only checks value up-to p_id_to_s_idx[num_tiles-1], padded value
     # will not impact kernel execution.
     p_id_to_s_idx = jnp.repeat(
-        all_seqs, s_idx_to_num_tiles, total_repeat_length=max_tokens
+        all_seqs, s_idx_to_num_tiles, total_repeat_length=max_tiles
     )
     # Map program id (p_id) to tile id of a sequence.
-    p_id_to_t_id = all_tokens - s_idx_to_start_p_id[p_id_to_s_idx]
+    p_id_to_t_id = all_tiles - s_idx_to_start_p_id[p_id_to_s_idx]
     if ckpt_split_row is not None and s_idx_to_num_pre_ckpt_tiles is not None:
         num_pre_ckpt_tiles = s_idx_to_num_pre_ckpt_tiles[p_id_to_s_idx]
         is_pre_ckpt = p_id_to_t_id < num_pre_ckpt_tiles

@@ -627,3 +627,158 @@ def create_allocs(
         conv_out_alloc,
         recurrent_out_alloc,
     )
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Bf16BlockQkvBufferedRef(BaseBufferedRef):
+    """Dynamic in-bounds bf16 block-of-16 QKV buffered ref (PER_SEQ & BATCHED)."""
+
+    def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
+        slot = self.current_copy_in_slot
+        sem = self.sem_recvs.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
+        p_id = grid_indices[0]
+
+        if self.cfg.mode == config.GDNMode.PER_SEQ:
+            r_base = self.metadata_ref.p_id_to_r_base[p_id, 0]
+            r_size = self.metadata_ref.p_id_to_r_size[p_id, 0]
+            raw_start = r_base // 16
+            end_blk = (r_base + r_size + 15) // 16
+            start_blk = jnp.where(r_size > 0, raw_start, 0)
+            num_blks = jnp.where(r_size > 0, end_blk - raw_start, 0)
+            pltpu.make_async_copy(
+                src_ref.at[pl.ds(start_blk, num_blks)],
+                vmem_ref.at[pl.ds(0, num_blks)],
+                sem,
+            ).start()
+        else:
+            r_base_0 = self.metadata_ref.p_id_to_r_base[p_id, 0]
+            r_size_0 = self.metadata_ref.p_id_to_r_size[p_id, 0]
+            blk_0 = r_base_0 // 16
+            need_0 = r_size_0 > 0
+            for idx in range(self.cfg.seq_tile_size):
+                r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
+                r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+                raw_start = r_base // 16
+                if idx == 0:
+                    need = need_0
+                else:
+                    same_as_0 = (raw_start == blk_0) & need_0
+                    need = (r_size > 0) & (~same_as_0)
+                start_blk = jnp.where(need, raw_start, 0)
+                num_blks = jnp.where(need, 1, 0)
+                pltpu.make_async_copy(
+                    src_ref.at[pl.ds(start_blk, num_blks)],
+                    vmem_ref.at[pl.ds(idx, num_blks)],
+                    sem,
+                ).start()
+
+    def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
+        slot = self.current_wait_in_slot
+        sem = self.sem_recvs.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
+        p_id = grid_indices[0]
+
+        if self.cfg.mode == config.GDNMode.PER_SEQ:
+            r_base = self.metadata_ref.p_id_to_r_base[p_id, 0]
+            r_size = self.metadata_ref.p_id_to_r_size[p_id, 0]
+            start_blk = r_base // 16
+            end_blk = (r_base + r_size + 15) // 16
+            num_blks = jnp.where(r_size > 0, end_blk - start_blk, 0)
+            wait_ref = vmem_ref.at[pl.ds(0, num_blks)]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+        else:
+            r_base_0 = self.metadata_ref.p_id_to_r_base[p_id, 0]
+            r_size_0 = self.metadata_ref.p_id_to_r_size[p_id, 0]
+            blk_0 = r_base_0 // 16
+            need_0 = r_size_0 > 0
+            total_blks = jnp.int32(0)
+            for idx in range(self.cfg.seq_tile_size):
+                r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
+                r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+                raw_start = r_base // 16
+                if idx == 0:
+                    need = need_0
+                else:
+                    same_as_0 = (raw_start == blk_0) & need_0
+                    need = (r_size > 0) & (~same_as_0)
+                total_blks = total_blks + jnp.where(need, 1, 0)
+            wait_ref = vmem_ref.at[pl.ds(0, total_blks)]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+
+
+def create_allocs_bf16_qkv(
+    metadata_ref: MetadataRef,
+    qkv_ref: jax.Ref,
+    b_ref: jax.Ref,
+    a_ref: jax.Ref,
+    out_ref: jax.Ref,
+    conv_state_ref: jax.Ref,
+    recurrent_state_ref: jax.Ref,
+    cfg: config.GDNConfig,
+) -> tuple[
+    Bf16BlockQkvBufferedRef,
+    InBufferedRef,
+    InBufferedRef,
+    StateInBufferedRef,
+    StateInBufferedRef,
+    OutBufferedRef,
+    StateOutBufferedRef,
+    StateOutBufferedRef,
+]:
+    """Like create_allocs, but streams QKV natively from bf16[T//16, 16, dim]."""
+    (
+        _,
+        b_alloc,
+        a_alloc,
+        conv_in_alloc,
+        recurrent_in_alloc,
+        out_alloc,
+        conv_out_alloc,
+        recurrent_out_alloc,
+    ) = create_allocs(
+        metadata_ref=metadata_ref,
+        qkv_ref=qkv_ref,
+        b_ref=b_ref,
+        a_ref=a_ref,
+        out_ref=out_ref,
+        conv_state_ref=conv_state_ref,
+        recurrent_state_ref=recurrent_state_ref,
+        cfg=cfg,
+    )
+    pipeline_mode = pl.Buffered(buffer_count=cfg.num_buffers, use_lookahead=False)
+    if cfg.mode == config.GDNMode.PER_SEQ:
+        max_blks = min(cfg.batch_size // 16, cfg.chunk_size // 16 + 1)
+        qkv_block_shape = (max_blks, 16, cfg.dim_size)
+    else:
+        qkv_block_shape = (cfg.seq_tile_size, 16, cfg.dim_size)
+
+    qkv_spec = pl.BlockSpec(
+        block_shape=qkv_block_shape,
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i,),
+        pipeline_mode=pipeline_mode,
+    )
+    qkv_alloc = Bf16BlockQkvBufferedRef.input(
+        spec=qkv_spec,
+        dtype_or_type=qkv_ref,
+        buffer_count=pipeline_mode.buffer_count,
+        use_lookahead=pipeline_mode.use_lookahead,
+        cfg=cfg,
+        metadata_ref=metadata_ref,
+    )
+    return (
+        qkv_alloc,
+        b_alloc,
+        a_alloc,
+        conv_in_alloc,
+        recurrent_in_alloc,
+        out_alloc,
+        conv_out_alloc,
+        recurrent_out_alloc,
+    )
