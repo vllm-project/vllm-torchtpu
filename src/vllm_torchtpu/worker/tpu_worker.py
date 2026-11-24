@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 import torch
 import torch.profiler
 import torch_tpu  # noqa: F401
+from torch._dynamo.utils import counters as dynamo_counters
 from torch.compiler._cache import CacheArtifactManager
 from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -96,10 +97,15 @@ def _release_free_host_heap() -> None:
         logger.info("Released free host heap via glibc malloc_trim.")
 
 
-# TODO: Remove this function and its call in compile_or_warm_up_model() once
+# TODO(https://github.com/pytorch/pytorch/issues/206390): Remove this constant,
+# _drop_traced_module_refs(), and its call in compile_or_warm_up_model() once
 # torch's aot_module_simplified stops attaching the traced module's zero_grad,
-# named_parameters and named_buffers to the forward it returns; the first check
-# in test_drop_traced_module_refs_frees_compile_time_graphs then fails.
+# named_parameters and named_buffers to the forward it returns; the
+# graph-liveness check in test_drop_traced_module_refs_frees_compile_time_graphs
+# then fails.
+_AOT_TRACED_MODULE_ATTRS = ("zero_grad", "named_parameters", "named_buffers")
+
+
 def _drop_traced_module_refs() -> None:
     """Drop the traced modules that aot_autograd leaves on compiled forwards.
 
@@ -110,6 +116,13 @@ def _drop_traced_module_refs() -> None:
     compile-time graph, with its fake tensors and stack traces, in host memory
     for the life of the worker.
     """
+    # Every compile path that reaches `aot_module_simplified` increments
+    # `counters["aot_autograd"]["ok"]` in `AotAutograd.__call__`, while cached
+    # artifact replays (`deserialize_bundled_cache_entry`) do not. Skip the
+    # full-heap scan when no fresh AOTAutograd compiles ran in this worker
+    # (including profile_run).
+    if not dynamo_counters["aot_autograd"]["ok"]:
+        return
     dropped = 0
     for obj in gc.get_objects():
         # type(), not isinstance(): isinstance() reads __class__, which some
@@ -119,16 +132,11 @@ def _drop_traced_module_refs() -> None:
         ):
             continue
         attrs = obj.__dict__
-        for name in [name for name, value in attrs.items() if _holds_module(value)]:
-            del attrs[name]
-            dropped += 1
+        for name in _AOT_TRACED_MODULE_ATTRS:
+            if name in attrs:
+                del attrs[name]
+                dropped += 1
     logger.info("Dropped %d traced-module references from compiled forwards.", dropped)
-
-
-def _holds_module(value: object) -> bool:
-    if isinstance(value, types.MethodType):
-        value = value.__self__
-    return isinstance(value, torch.nn.Module)
 
 
 class TPUWorker(WorkerBase):

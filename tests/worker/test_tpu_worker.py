@@ -25,6 +25,7 @@ import pytest
 import torch
 from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
+from torch._dynamo.utils import counters as dynamo_counters
 from vllm.config import ParallelConfig
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
@@ -321,9 +322,10 @@ class TestProfileCaptureAndMerge:
                 gc.enable()
 
 
-def test_drop_traced_module_refs_frees_compile_time_graphs():
+def test_drop_traced_module_refs_frees_compile_time_graphs(monkeypatch):
     """aot_autograd's convenience methods keep the traced graph alive; dropping
-    them frees it and leaves the compiled forward working."""
+    only those three attributes frees it while preserving other attributes."""
+    monkeypatch.setitem(dynamo_counters["aot_autograd"], "ok", 0)
 
     class _Affine(torch.nn.Module):
         def __init__(self):
@@ -340,18 +342,49 @@ def test_drop_traced_module_refs_frees_compile_time_graphs():
         compiled = aot_autograd(fw_compiler=lambda gm, _: make_boxed_func(gm.forward))(
             graph, [x]
         )
+    assert dynamo_counters["aot_autograd"]["ok"] > 0
     expected = compiled(x)[0]
     del graph
     gc.collect()
     # Nothing but aot_autograd's convenience methods holds the graph now.
     assert graph_ref() is not None
 
+    # Unrelated nn.Module-holding attributes on the compiled forwards and
+    # matching attribute names on non-aot_module_simplified functions must stay.
+    unrelated = torch.nn.Linear(2, 2)
+    compiled.extra_module = unrelated
+    compiled.extra_method = unrelated.forward
+    compiled.__wrapped__.extra_method = unrelated.forward
+
+    def _decoy() -> None:
+        return None
+
+    for attr in ("zero_grad", "named_parameters", "named_buffers"):
+        _decoy.__dict__[attr] = getattr(unrelated, attr)
+
     _drop_traced_module_refs()
     gc.collect()
 
     assert graph_ref() is None
-    assert "zero_grad" not in compiled.__dict__
+    for fn in (compiled, compiled.__wrapped__):
+        for attr in ("zero_grad", "named_parameters", "named_buffers"):
+            assert attr not in fn.__dict__
+    for attr in ("zero_grad", "named_parameters", "named_buffers"):
+        assert _decoy.__dict__[attr] == getattr(unrelated, attr)
+    assert compiled.extra_module is unrelated
+    assert compiled.extra_method == unrelated.forward
+    assert compiled.__wrapped__.extra_method == unrelated.forward
     assert torch.equal(compiled(x)[0], expected)
+
+
+def test_drop_traced_module_refs_skips_heap_scan_without_aot_compiles(monkeypatch):
+    """Skip gc.get_objects() when no fresh aot_autograd compiles ran."""
+    monkeypatch.setitem(dynamo_counters["aot_autograd"], "ok", 0)
+
+    with patch("vllm_torchtpu.worker.tpu_worker.gc.get_objects") as get_objects:
+        _drop_traced_module_refs()
+
+    get_objects.assert_not_called()
 
 
 def test_compile_or_warm_up_drops_traced_modules_before_freezing_the_heap():
@@ -359,12 +392,10 @@ def test_compile_or_warm_up_drops_traced_modules_before_freezing_the_heap():
     worker = SimpleNamespace(
         model_runner=SimpleNamespace(capture_model=lambda: None),
         compilation_config=SimpleNamespace(compilation_time=0.0),
-        speculative_config=None,
     )
     calls = []
 
     with (
-        patch("vllm_torchtpu.worker.tpu_worker.set_torch_threads_for_runtime"),
         patch(
             "vllm_torchtpu.worker.tpu_worker._drop_traced_module_refs",
             side_effect=lambda: calls.append("drop"),
