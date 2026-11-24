@@ -31,11 +31,36 @@
     tp_not_power_of_two: 'TP must be a power of 2',
     attn_heads_not_divisible_by_tp: 'Attention heads % TP != 0',
     kv_heads_not_divisible_by_tp: 'KV heads % TP != 0',
-    dcp_not_dividing_tp: 'DCP must divide effective TP',
+    dcp_not_dividing_tp: 'DCP must divide effective TP (or TP*PCP for kv_heads span)',
     experts_not_divisible_by_ep: 'E % EP != 0',
     ep_exceeds_slice_ranks: 'EP exceeds TP*DP*PCP slice ranks',
     pp_exceeds_layers: 'PP exceeds model num_layers',
-    invalid_dimensions: 'Dimensions must be positive'
+    invalid_dimensions: 'Dimensions must be positive',
+    fusion_break: 'Host-table or CED fusion break blocks whole_step'
+  };
+  const BLOCKER_LABELS = {
+    fusion_break: 'Fusion break at host-table or CED boundary',
+    scope_without_core_counterpart: 'No core kernel counterpart for scope',
+    rows_exceed_core_max_batch_rows: 'Rows exceed core batch ceiling',
+    rank_count_outside_core_grid: 'Rank count outside core grid',
+    layout_not_declared: 'Serving layout not declared',
+    chip_without_core_budget: 'Chip without core budget',
+    all_to_all_not_in_core: 'Cross-rank all-to-all not in core',
+    family_not_in_core: 'Layer family not in core',
+    dtype_not_in_core: 'Weight dtype not in core',
+    planner_rejected: 'Core planner rejected topology',
+    row_limit_not_stated: 'Row limit exceeds default buckets'
+  };
+  const FAMILY_LABELS = {
+    qsa: 'QSA (block-sparse)',
+    csa: 'CSA2 + SWA',
+    msa: 'MSA (Lightning Indexer)',
+    hyper_connection: 'HyperConnection (4-stream low-rank)',
+    mhc: 'mHC (Sinkhorn manifold)'
+  };
+  const KV_DTYPE_LABELS = {
+    int4_per_token_head: 'INT4 per-token-head (Hadamard)',
+    turboquant_4bit_nc: 'TurboQuant 4-bit (non-coherent)'
   };
   const STATE = { pinA: 0, pinB: -1, customDirty: false, hwDirty: false,
   meshDirty: false, calibrated: false, dispatchRegime: 'compiled_xla',
@@ -510,8 +535,10 @@
   const achSave = perOp.step_achievable_us - sc.step_achievable_us;
   const achSavePct = perOp.step_achievable_us > 1e-6
     ? (achSave / perOp.step_achievable_us) * 100 : 0;
+  const formatBlocker = b => BLOCKER_LABELS[b] ? `${b} (${BLOCKER_LABELS[b]})` : b;
   const supTxt = escH(sc.support || 'baseline') +
-    ((sc.blockers && sc.blockers.length) ? ` (${escH(sc.blockers.join(', '))})` : '');
+    ((sc.blockers && sc.blockers.length)
+      ? ` (${escH(sc.blockers.map(formatBlocker).join('; '))})` : '');
   const execCard = `<div class="wb-exec-card">` +
   `<div class="wb-exec-row"><span>Inspecting Scope</span>` +
   `<strong>${escH(sc.scope)} (${sc.step_achievable_us.toFixed(1)} us)</strong></div>` +

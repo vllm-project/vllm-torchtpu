@@ -78,6 +78,7 @@ def build_engine_seed_defaults() -> dict[str, object]:
                         ),
                         "collectives": mk.get("collectives"),
                         "expert_mode_by_rows": mk.get("expert_mode_by_rows"),
+                        "host_table_hbm_overrides": mk.get("host_table_hbm_overrides"),
                         "source": str(mk.get("source", "")),
                     }
                 )
@@ -146,6 +147,19 @@ def build_engine_seed_defaults() -> dict[str, object]:
         "per_op_collective_call_factor": (constants.PER_OP_COLLECTIVE_CALL_FACTOR),
         "min_step_ops_for_explicit_norm": (constants.MIN_STEP_OPS_FOR_EXPLICIT_NORM),
         "floor_tie_epsilon_us": constants.FLOOR_TIE_EPSILON_US,
+        "kv_only_dtypes": sorted(constants.KV_ONLY_DTYPES),
+        "kv_dtype_aliases": dict(constants.KV_DTYPE_ALIASES),
+        "hadamard_128_vec_ops_per_head": constants.HADAMARD_128_VEC_OPS_PER_HEAD,
+        "int4_index_scale_overhead_bytes": constants.INT4_INDEX_SCALE_OVERHEAD_BYTES,
+        "int4_scale_page_bytes_per_tok": constants.INT4_SCALE_PAGE_BYTES_PER_TOK,
+        "turboquant_header_bytes": constants.TURBOQUANT_HEADER_BYTES,
+        "turboquant_word_bytes": constants.TURBOQUANT_WORD_BYTES,
+        "turboquant_sublane_words": constants.TURBOQUANT_SUBLANE_WORDS,
+        "turboquant_default_page_size": constants.TURBOQUANT_DEFAULT_PAGE_SIZE,
+        "sinkhorn_vec_ops_per_entry_iter": constants.SINKHORN_VEC_OPS_PER_ENTRY_ITER,
+        "hc_sublayers_per_layer": constants.HC_SUBLAYERS_PER_LAYER,
+        "mhc_dynamic_proj_terms": constants.MHC_DYNAMIC_PROJ_TERMS,
+        "cores_per_host": constants.CORES_PER_HOST,
         "workload_defaults": {
             "batch": wl_default.batch,
             "isl": wl_default.isl,
@@ -157,6 +171,9 @@ def build_engine_seed_defaults() -> dict[str, object]:
             "dcp": wl_default.dcp,
             "pcp": wl_default.pcp,
             "kv_split": wl_default.kv_split,
+            "execution": wl_default.execution,
+            "kv_page_size": wl_default.kv_page_size,
+            "host_table_hbm_overrides": list(wl_default.host_table_hbm_overrides),
         },
     }
 

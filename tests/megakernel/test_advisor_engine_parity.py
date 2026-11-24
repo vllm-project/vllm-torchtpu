@@ -34,6 +34,7 @@ from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import (
     constants,
     models,
+    specs,
     support,
     workbench_engine,
 )
@@ -2185,3 +2186,360 @@ def test_engine_parity_vmem_fit_headroom(tmp_path: Path) -> None:
             expected_mib, abs=0.01
         )
     _verify_parity_records(batch_items, expected_refs, out_records)
+
+
+def _build_primitive_parity_cases() -> list[
+    tuple[str, advisor.ModelProfile, advisor.WorkloadSpec, bool]
+]:
+    """Build primitive parity scenarios for sparse attn, HC, 4-bit KV, and breaks."""
+    qsa_ple = specs.HostTableBreakSpec(
+        name="ple",
+        layers=(1,),
+        table_bytes_total=51_200_245_760,
+        h2d_bytes_per_token=2560.0,
+        hbm_resident=True,
+        shard_axis="tp",
+        state_bytes_per_request=184_320,
+        dense_proj_params=32_768_000,
+    )
+    qsa_prof = models.finalize_model_profile(
+        models.ModelProfile(
+            name="qsa-hc-parity",
+            num_layers=48,
+            num_attention_layers=12,
+            num_linear_layers=36,
+            linear_key_heads=16,
+            linear_value_heads=32,
+            linear_key_dim=128,
+            linear_value_dim=128,
+            hidden_size=2560,
+            intermediate_size=1024,
+            num_attention_heads=32,
+            num_kv_heads=2,
+            head_dim=256,
+            num_experts=512,
+            top_k=10,
+            moe_intermediate_size=1024,
+            shared_expert_intermediate_size=1024,
+            weight_dtype="bf16",
+            expert_dtype="fp8",
+            act_dtype="bf16",
+            expert_act_dtype="fp8",
+            kv_dtype="bf16",
+            state_dtype="fp32",
+            sparse_attn=specs.SparseAttnSpec(
+                kind="qsa",
+                select_tokens=2051,
+                index_heads=4,
+                index_kv_heads=1,
+                index_dim=128,
+                index_compress_ratio=4,
+            ),
+            hyper_connection=specs.HyperConnectionSpec(
+                kind="lowrank",
+                num_streams=4,
+                lowrank_dim=64,
+                has_final_mixer=True,
+            ),
+            host_tables=(qsa_ple,),
+        )
+    )
+    csa_kv_owners = (
+        specs.SparseCacheOwner(2, 2.0, 512, 1.0, 4.0, "per_rank", (2, 3, 4, 5, 6, 7)),
+        specs.SparseCacheOwner(
+            8, 2.0, 512, 1.0, 4.0, "per_rank", (8, 9, 10, 11, 12, 13)
+        ),
+        specs.SparseCacheOwner(
+            14, 2.0, 512, 1.0, 4.0, "per_rank", (14, 15, 16, 17, 18, 19)
+        ),
+        specs.SparseCacheOwner(
+            20, 1.0, 512, 1.0, 4.0, "per_rank", tuple(range(20, 40))
+        ),
+    )
+    csa_idx_owners = (
+        specs.SparseCacheOwner(2, 2.0, 128, 1.0, 4.0, "per_rank", (2, 3, 4, 5, 6, 7)),
+        specs.SparseCacheOwner(
+            8, 2.0, 128, 1.0, 4.0, "per_rank", (8, 9, 10, 11, 12, 13)
+        ),
+        specs.SparseCacheOwner(
+            14, 2.0, 128, 1.0, 4.0, "per_rank", (14, 15, 16, 17, 18, 19)
+        ),
+        specs.SparseCacheOwner(20, 1.0, 128, 1.0, 4.0, "per_rank", (20, 21, 22, 23)),
+        specs.SparseCacheOwner(
+            24, 1.0, 128, 1.0, 4.0, "per_rank", (24, 25, 26, 27), 16384
+        ),
+        specs.SparseCacheOwner(
+            28, 1.0, 128, 1.0, 4.0, "per_rank", (28, 29, 30, 31), 16384
+        ),
+        specs.SparseCacheOwner(
+            32, 1.0, 128, 1.0, 4.0, "per_rank", (32, 33, 34, 35), 16384
+        ),
+        specs.SparseCacheOwner(
+            36, 1.0, 128, 1.0, 4.0, "per_rank", (36, 37, 38, 39), 16384
+        ),
+    )
+    eng_l1 = specs.HostTableBreakSpec(
+        "engram_l1",
+        (1,),
+        101_377_628_352,
+        6336.0,
+        hbm_resident=False,
+        shard_axis="dp_local",
+    )
+    eng_l14 = specs.HostTableBreakSpec(
+        "engram_l14",
+        (14,),
+        101_380_404_048,
+        6336.0,
+        hbm_resident=False,
+        shard_axis="dp_local",
+    )
+    csa_prof = models.finalize_model_profile(
+        models.ModelProfile(
+            name="csa-mhc-ced-parity",
+            num_layers=40,
+            hidden_size=5120,
+            intermediate_size=2304,
+            num_attention_heads=64,
+            num_kv_heads=1,
+            head_dim=512,
+            q_lora_rank=1280,
+            o_lora_rank=1024,
+            o_groups=8,
+            num_experts=384,
+            top_k=6,
+            moe_intermediate_size=2304,
+            shared_expert_intermediate_size=2304,
+            weight_dtype="fp8",
+            expert_dtype="mxfp4",
+            weight_block_k=32,
+            act_dtype="fp8",
+            kv_dtype="fp8",
+            ced_boundary=20,
+            sparse_attn=specs.SparseAttnSpec(
+                kind="csa",
+                window_tokens=128,
+                window_bytes_per_token=1024.0,
+                window_layers=tuple(range(40)),
+                select_tokens=512,
+                index_heads=32,
+                index_kv_heads=1,
+                index_dim=128,
+                kv_owners=csa_kv_owners,
+                index_owners=csa_idx_owners,
+                shared_kv_mqa=True,
+                kv_owner_ring_bytes_per_req=12_288,
+            ),
+            hyper_connection=specs.HyperConnectionSpec(
+                kind="mhc", num_streams=4, sinkhorn_iters=20
+            ),
+            host_tables=(eng_l1, eng_l14),
+        )
+    )
+    msa_prof = models.finalize_model_profile(
+        models.ModelProfile(
+            name="msa-wide-dcp-parity",
+            num_layers=60,
+            hidden_size=6144,
+            intermediate_size=12288,
+            num_attention_heads=64,
+            num_kv_heads=4,
+            head_dim=128,
+            num_experts=128,
+            num_moe_layers=57,
+            top_k=4,
+            moe_intermediate_size=3072,
+            shared_expert_intermediate_size=3072,
+            weight_dtype="fp8",
+            expert_dtype="nvfp4",
+            act_dtype="fp8",
+            kv_dtype="int4_per_token_head",
+            dcp_span="tp_group",
+            sparse_attn=specs.SparseAttnSpec(
+                kind="msa",
+                window_tokens=128,
+                select_tokens=2048,
+                index_heads=4,
+                index_kv_heads=1,
+                index_dim=128,
+            ),
+        )
+    )
+    tq_128 = models.finalize_model_profile(
+        dataclasses.replace(
+            models.resolve_model_profile("qwen3.5-397b"),
+            name="tq-128-parity",
+            head_dim=128,
+            kv_dtype="turboquant_4bit_nc",
+        )
+    )
+    tq_256 = models.finalize_model_profile(
+        dataclasses.replace(
+            models.resolve_model_profile("qwen3.5-397b"),
+            name="tq-256-parity",
+            kv_dtype="turboquant_4bit_nc",
+        )
+    )
+    glm_prof = models.resolve_model_profile("glm-5.2")
+    return [
+        (
+            "qsa_decode_hbm_ple",
+            qsa_prof,
+            advisor.WorkloadSpec(phase="decode", batch=16, context=8192, tp=8, ep=8),
+            False,
+        ),
+        (
+            "qsa_prefill_offload_ple",
+            qsa_prof,
+            advisor.WorkloadSpec(
+                phase="prefill",
+                batch=1,
+                isl=4096,
+                tp=8,
+                ep=8,
+                host_table_hbm_overrides=(("ple", False),),
+            ),
+            False,
+        ),
+        (
+            "csa_decode_engram_offload",
+            csa_prof,
+            advisor.WorkloadSpec(
+                phase="decode", batch=8, context=32768, tp=1, dp=8, ep=8
+            ),
+            False,
+        ),
+        (
+            "csa_decode_engram_first_hbm",
+            csa_prof,
+            advisor.WorkloadSpec(
+                phase="decode",
+                batch=8,
+                context=32768,
+                tp=1,
+                dp=8,
+                ep=8,
+                host_table_hbm_overrides=(("engram_l1", True),),
+            ),
+            False,
+        ),
+        (
+            "csa_prefill_ced",
+            csa_prof,
+            advisor.WorkloadSpec(
+                phase="prefill",
+                execution="ced",
+                batch=8,
+                isl=8192,
+                tp=1,
+                dp=8,
+                ep=8,
+                host_table_hbm_overrides=(("engram_l1", True), ("engram_l14", True)),
+            ),
+            False,
+        ),
+        (
+            "msa_wide_dcp4_int4",
+            msa_prof,
+            advisor.WorkloadSpec(
+                phase="decode", batch=8, context=16384, tp=8, ep=8, dcp=4
+            ),
+            False,
+        ),
+        (
+            "tq_128_page64",
+            tq_128,
+            advisor.WorkloadSpec(
+                phase="decode", batch=8, context=8192, tp=8, ep=8, kv_page_size=64
+            ),
+            False,
+        ),
+        (
+            "tq_128_page16",
+            tq_128,
+            advisor.WorkloadSpec(
+                phase="decode", batch=8, context=8192, tp=8, ep=8, kv_page_size=16
+            ),
+            False,
+        ),
+        (
+            "tq_256_page64",
+            tq_256,
+            advisor.WorkloadSpec(
+                phase="decode", batch=8, context=8192, tp=8, ep=8, kv_page_size=64
+            ),
+            False,
+        ),
+        (
+            "glm_wide_dcp_pcp2_dcp16",
+            glm_prof,
+            advisor.WorkloadSpec(
+                phase="prefill", batch=1, isl=4096, tp=8, ep=16, pcp=2, dcp=16
+            ),
+            False,
+        ),
+        (
+            "glm_invalid_pcp1_dcp16",
+            glm_prof,
+            advisor.WorkloadSpec(phase="decode", batch=8, tp=8, ep=8, pcp=1, dcp=16),
+            True,
+        ),
+        (
+            "msa_invalid_tp_group_dcp16",
+            msa_prof,
+            advisor.WorkloadSpec(
+                phase="prefill", batch=1, isl=4096, tp=8, ep=8, pcp=2, dcp=16
+            ),
+            True,
+        ),
+    ]
+
+
+def test_js_engine_parity_sparse_hc_wide_dcp_hadamard_and_fusion_breaks(
+    tmp_path: Path,
+) -> None:
+    """Verify Python vs JS parity for sparse attn, HC, 4-bit KV, and fusion breaks."""
+    chip_spec = advisor.resolve_chip_spec("tpu7x")
+    chip_dict = dataclasses.asdict(chip_spec)
+    cases = _build_primitive_parity_cases()
+    items: list[dict[str, object]] = [
+        {
+            "params": {
+                "only_validate": only_val,
+                "profile": dataclasses.asdict(prof),
+                "chip": chip_dict,
+                "wl": dataclasses.asdict(wl),
+            }
+        }
+        for _, prof, wl, only_val in cases
+    ]
+    records = _run_engine_runner_batch(
+        tmp_path, "sparse_hc_primitives", items, chip_dict
+    )
+    for (tag, prof, wl, only_val), rec in zip(cases, records, strict=True):
+        got = cast("dict[str, object]", rec["eval"])
+        exp_inv = list(advisor.validate_workload(prof, chip_spec, wl))
+        assert list(cast("list[str]", got["invalid_reasons"])) == exp_inv, tag
+        if only_val:
+            continue
+        report = advisor.advise(prof, wl, chip_spec)
+        raw_steps = advisor.compute_scope_raw_step_us(prof, wl, chip=chip_spec.name)
+        full = cast("dict[str, object]", got["full"])
+        scopes_map = cast("dict[str, dict[str, object]]", got["scopes"])
+        assert full["fastestScope"] == report.fastest_scope, tag
+        assert full["recScope"] == report.recommended_scope, tag
+        assert float(str(full["hbmUsedBytes"])) / 1e9 == pytest.approx(
+            report.hbm_used_gb, abs=1e-2
+        ), tag
+        for sc in report.scopes:
+            got_sc = scopes_map[sc.scope]
+            lbl = f"{tag} {sc.scope}"
+            assert got_sc["feasible"] is sc.feasible, lbl
+            assert got_sc["reason"] == sc.reason, lbl
+            assert got_sc["ops_per_step"] == sc.ops_per_step, lbl
+            assert got_sc["t_vmem_max"] == sc.t_vmem_max, lbl
+            assert got_sc["n_splits"] == sc.n_splits, lbl
+            assert got_sc["rawStepUs"] == pytest.approx(
+                raw_steps[sc.scope], rel=1e-6, abs=1e-9
+            ), lbl
+            _assert_scope_parity_fields(got_sc, sc, lbl)

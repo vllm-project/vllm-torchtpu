@@ -313,11 +313,13 @@
       ? ''
       : `; lowest floor: ${winner.scope} [${winner.support || 'baseline'}] ` +
         `${winner.step_bound_us} us`;
+    const shownBlockers = (shown.blockers && shown.blockers.length)
+      ? `; blockers: ${shown.blockers.join(', ')}` : '';
     const verdictText = isOom
       ? `OOM > 80% HBM (${hbmGigabytes} GB)`
       : `${shown.scope} [${shownSupport}]` +
         (showsWinner ? ` (${evaluated.moeModeRec})` : '') +
-        `, floor=${shown.step_bound_us} us${lowestFloor}`;
+        `, floor=${shown.step_bound_us} us${shownBlockers}${lowestFloor}`;
     const tooltip = esc(
       `${cell.phase} ${cell.unit}=${cell.tokenCount}, context=${cell.contextLabel}` +
       ` -> ${verdictText}`

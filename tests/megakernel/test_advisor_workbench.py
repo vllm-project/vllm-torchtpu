@@ -1944,3 +1944,54 @@ def test_phase_trace_converter_accepts_two_op_explicit_step(
             one_op_launch_gap is None
             or one_op_launch_gap.get("unit") != "us_per_sublayer_boundary"
         )
+
+
+def test_workbench_renders_sparse_hc_and_fusion_break_labels() -> None:
+    """Verify report.py and workbench JS expose sparse/HC/4-bit/fusion_break labels."""
+    eng_table = specs.HostTableBreakSpec(
+        name="engram_l1",
+        layers=(1,),
+        table_bytes_total=101_377_628_352,
+        h2d_bytes_per_token=6336.0,
+        hbm_resident=False,
+        shard_axis="dp_local",
+    )
+    prof = models.finalize_model_profile(
+        models.ModelProfile(
+            name="sparse-ui-test",
+            num_layers=40,
+            hidden_size=4096,
+            num_attention_heads=32,
+            num_kv_heads=8,
+            head_dim=128,
+            kv_dtype="turboquant_4bit_nc",
+            sparse_attn=specs.SparseAttnSpec(
+                kind="msa",
+                window_tokens=128,
+                select_tokens=2048,
+                index_heads=4,
+                index_dim=128,
+            ),
+            hyper_connection=specs.HyperConnectionSpec(
+                kind="mhc", num_streams=4, sinkhorn_iters=20
+            ),
+            host_tables=(eng_table,),
+        )
+    )
+    sweep = advisor.advise_regimes(
+        prof,
+        "tpu7x",
+        options=advisor.RegimeSweepOptions(
+            base_workload=advisor.WorkloadSpec(phase="decode", batch=8, tp=8)
+        ),
+    )
+    html_text = advisor.render_advisor_html(sweep)
+    for token in (
+        "MSA (Lightning Indexer)",
+        "mHC (Sinkhorn manifold)",
+        "TurboQuant 4-bit (non-coherent)",
+        "Fusion break at host-table or CED boundary",
+        "BLOCKER_LABELS",
+        "KV_DTYPE_LABELS",
+    ):
+        assert token in html_text

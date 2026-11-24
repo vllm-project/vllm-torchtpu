@@ -73,6 +73,20 @@ SUPPORT_TIER_BADGE_CLASSES: dict[str, str] = {
     "declared": "badge badge-whole_step",
     "priced_only": "badge badge-single_layer",
 }
+FAMILY_BADGE_LABELS: dict[str, str] = {
+    "qsa": "QSA (block-sparse)",
+    "csa": "CSA2 + SWA",
+    "msa": "MSA (Lightning Indexer)",
+    "hyper_connection": "HyperConnection (4-stream low-rank)",
+    "mhc": "mHC (Sinkhorn manifold)",
+}
+KV_DTYPE_LABELS: dict[str, str] = {
+    "int4_per_token_head": "INT4 per-token-head (Hadamard)",
+    "turboquant_4bit_nc": "TurboQuant 4-bit (non-coherent)",
+}
+BLOCKER_LABELS: dict[str, str] = {
+    "fusion_break": "Fusion break at host-table or CED boundary",
+}
 
 
 def _format_sweep_support_lines(sweep: AdvisorSweepReport) -> list[str]:
@@ -1345,11 +1359,22 @@ def _render_facts_ledger_card(sweep: AdvisorSweepReport) -> str:
     num_kv = model_prof.num_kv_heads
     head_dim = model_prof.head_dim
     attn_geom_text = f"NH={num_attn}, NKV={num_kv}, HD={head_dim}"
-    if has_dsa_profile(model_prof):
+    if model_prof.sparse_attn is not None:
+        sp = model_prof.sparse_attn
+        sp_lbl = FAMILY_BADGE_LABELS.get(sp.kind, sp.kind)
+        attn_geom_text += (
+            f", {sp_lbl} (win={sp.window_tokens}, top-k={sp.select_tokens})"
+        )
+    elif has_dsa_profile(model_prof):
         attn_geom_text += (
             f", top-k={model_prof.index_topk} "
             f"({model_prof.num_indexer_layers} indexer layers)"
         )
+    if model_prof.hyper_connection is not None:
+        hc_key = (
+            "mhc" if model_prof.hyper_connection.kind == "mhc" else "hyper_connection"
+        )
+        attn_geom_text += f", {FAMILY_BADGE_LABELS[hc_key]}"
     num_exp = model_prof.num_experts
     top_k = model_prof.top_k
     moe_desc = (
@@ -1505,7 +1530,7 @@ def _render_facts_ledger_card(sweep: AdvisorSweepReport) -> str:
               <strong>
                 weight={model_prof.weight_dtype},
                 expert={model_prof.expert_dtype},
-                kv={model_prof.kv_dtype}
+                kv={KV_DTYPE_LABELS.get(model_prof.kv_dtype, model_prof.kv_dtype)}
               </strong>
               {warning_badge}
             </td>
