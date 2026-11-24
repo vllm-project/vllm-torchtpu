@@ -68,6 +68,10 @@ _SWIGLU_LIMIT = 7.0
 _SWIGLU_ALPHA = 1.703125
 # VMEM for the kernel's small operands.
 _VMEM_HEADROOM = 1 << 20
+# The call's VMEM limit over its planned bytes: the rest stays free for XLA
+# to keep the next ops' prefetches (the next layer's qkv weight) in VMEM
+# across the call; a limit of all of VMEM left it none (c4 twin j-de6ab234).
+_VMEM_MARGIN = 4 << 20
 
 
 class Route(NamedTuple):
@@ -923,7 +927,12 @@ def dense_expert_moe_fp4(
                 *route_scratch,
             ],
         ),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=info.vmem_capacity_bytes),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=min(
+                info.vmem_capacity_bytes,
+                _vmem_bytes(mk, h, chunk, i_s, slots, sparse_rows) + _VMEM_MARGIN,
+            )
+        ),
         name=f"dense_expert_moe_fp4-e_{experts}-m_{mp}-h_{h}-i_{i}-c_{chunk}"
         + (f"-s_{i_s}" if i_s else "")
         + ("-sparse" if sparse_rows else "")
