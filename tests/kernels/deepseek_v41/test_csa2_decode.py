@@ -38,6 +38,28 @@ def test_long_decode_traces(benchmark):
     assert traced.out_avals[0].shape == inputs["q"].shape
 
 
+@pytest.mark.cpu_test
+def test_tile_trim_traces_its_own_program(benchmark, monkeypatch):
+    host = benchmark.make_inputs(2, 128, 8, varied_counts=True)
+    inputs = jax.tree.map(jnp.asarray, host)
+    mesh = jax.sharding.AbstractMesh(
+        (1,),
+        ("core",),
+        abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+    )
+
+    def trace(trim):
+        monkeypatch.setenv("TPU_CSA2_TILE_TRIM", trim)
+        # csa2 reads the switch at trace time, so a cached trace would hide it.
+        jax.clear_caches()
+        with jax.sharding.use_abstract_mesh(mesh):
+            return jax.make_jaxpr(lambda data: csa2(**data, bq=16))(inputs)
+
+    trimmed, untrimmed = trace("1"), trace("0")
+    assert trimmed.out_avals[0].shape == inputs["q"].shape
+    assert str(trimmed) != str(untrimmed)
+
+
 def test_long_decode_matches_reference(benchmark):
     if jax.default_backend() != "tpu":
         pytest.skip("Async MXU operations require TPU")

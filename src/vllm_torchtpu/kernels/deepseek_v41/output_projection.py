@@ -18,12 +18,14 @@ output. Every quantization is per row, so tiling does not change any bits.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import get_tpu_version
 from vllm_torchtpu.layers.core.quantization import FP8_E4M3_MAX
 
@@ -467,6 +469,27 @@ def _tile(
         out_copy(windows - 1).wait()
 
 
+# Headroom over the scratch buffers for Mosaic's internal scratch.
+VMEM_FIT_MARGIN = 2 * 1024**2
+
+
+def _vmem_bytes(scratch) -> int:
+    """VMEM bytes of the scratch buffers, each padded to whole tiles of
+    (8 x 32-bit packing) sublanes by 128 lanes. Entries without a numeric
+    dtype (semaphores) are skipped."""
+    total = 0
+    for buf in scratch:
+        if not hasattr(getattr(buf, "dtype", None), "itemsize"):
+            continue
+        dims = list(buf.shape) if len(buf.shape) > 1 else [1, *buf.shape]
+        itemsize = buf.dtype.itemsize
+        sublanes = 8 * max(1, 4 // itemsize)
+        dims[-1] = -(-dims[-1] // 128) * 128
+        dims[-2] = -(-dims[-2] // sublanes) * sublanes
+        total += math.prod(dims) * itemsize
+    return total
+
+
 def _call(x, wa, sa, wb, sb, out, *, tokens: int, count: int, start: int | None):
     """``count`` tiles of ``tokens`` rows as grid steps (start None), or one
     tile at a static ``start``, written into ``out`` (fresh when None)."""
@@ -483,35 +506,41 @@ def _call(x, wa, sa, wb, sb, out, *, tokens: int, count: int, start: int | None)
     inputs = (x, wa, sa, wb, sb) + (() if out is None else (out,))
     inputs = tuple(pltpu.with_memory_space_constraint(a, hbm) for a in inputs)
     f32, fp8 = jnp.float32, wa.dtype
+    scratch = (
+        pltpu.VMEM((group_depth, rows, HEADS_PER_GROUP, head_dim), x.dtype),
+        pltpu.VMEM((group_depth, reduction, width), fp8),
+        pltpu.VMEM((2, rows, reduction), fp8),
+        pltpu.VMEM((2, rows, 1), f32),
+        pltpu.VMEM((rows, features), x.dtype),
+        pltpu.VMEM((rows, 1), f32),
+        pltpu.VMEM((rows, k), fp8),
+        pltpu.VMEM((rows, 1), f32),
+        pltpu.VMEM((window_depth, k, WINDOW), fp8),
+        pltpu.VMEM((1, features), f32),
+        pltpu.VMEM((n,), f32),
+        pltpu.VMEM((2, rows, WINDOW), x.dtype),
+        pltpu.SemaphoreType.DMA((group_depth,)),
+        pltpu.SemaphoreType.DMA((group_depth,)),
+        pltpu.SemaphoreType.DMA((window_depth,)),
+        pltpu.SemaphoreType.DMA((2,)),
+        pltpu.SemaphoreType.DMA((2,)),
+    )
+    vmem_limit = VMEM_LIMIT_BYTES
+    if envs.TPU_DEEPSEEK_V41_OPROJ_VMEM_FIT:
+        # A 64 MiB limit makes XLA evict every live buffer around the call;
+        # reserving only what the kernel allocates keeps them resident.
+        vmem_limit = min(VMEM_LIMIT_BYTES, _vmem_bytes(scratch) + VMEM_FIT_MARGIN)
     return pl.pallas_call(
         functools.partial(_kernel, tokens=tokens, start=start),
         out_shape=jax.ShapeDtypeStruct((padded, n), x.dtype),
         grid=(count,),
         in_specs=(pl.BlockSpec(memory_space=hbm),) * len(inputs),
         out_specs=pl.BlockSpec(memory_space=hbm),
-        scratch_shapes=(
-            pltpu.VMEM((group_depth, rows, HEADS_PER_GROUP, head_dim), x.dtype),
-            pltpu.VMEM((group_depth, reduction, width), fp8),
-            pltpu.VMEM((2, rows, reduction), fp8),
-            pltpu.VMEM((2, rows, 1), f32),
-            pltpu.VMEM((rows, features), x.dtype),
-            pltpu.VMEM((rows, 1), f32),
-            pltpu.VMEM((rows, k), fp8),
-            pltpu.VMEM((rows, 1), f32),
-            pltpu.VMEM((window_depth, k, WINDOW), fp8),
-            pltpu.VMEM((1, features), f32),
-            pltpu.VMEM((n,), f32),
-            pltpu.VMEM((2, rows, WINDOW), x.dtype),
-            pltpu.SemaphoreType.DMA((group_depth,)),
-            pltpu.SemaphoreType.DMA((group_depth,)),
-            pltpu.SemaphoreType.DMA((window_depth,)),
-            pltpu.SemaphoreType.DMA((2,)),
-            pltpu.SemaphoreType.DMA((2,)),
-        ),
+        scratch_shapes=scratch,
         input_output_aliases={} if out is None else {5: 0},
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=VMEM_LIMIT_BYTES,
+            vmem_limit_bytes=vmem_limit,
         ),
         name="fused_output_projection",
     )(*inputs)

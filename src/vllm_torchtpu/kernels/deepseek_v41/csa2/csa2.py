@@ -13,6 +13,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
+
 
 class _UniformTiles:
     # Metadata-only view used after the uniform-boundary guard has passed.
@@ -20,7 +22,7 @@ class _UniformTiles:
         self.bq = bq
 
 
-def _fill_query_tiles(starts, tiles, total_tokens, bq):
+def _fill_query_tiles(starts, tiles, total_tokens, bq, *, walk_all=True, padding=True):
     batch = starts.shape[0] - 1
 
     def request_body(request, first):
@@ -41,8 +43,23 @@ def _fill_query_tiles(starts, tiles, total_tokens, bq):
         lax.fori_loop(0, count, tile_body, None)
         return first + count
 
-    # A final synthetic request covers output padding without an HBM clear pass.
-    return lax.fori_loop(0, batch + 1, request_body, jnp.int32(0))
+    if walk_all:
+        # A final synthetic request covers output padding without an HBM clear pass.
+        return lax.fori_loop(0, batch + int(padding), request_body, jnp.int32(0))
+    # Starts are non-decreasing, so every slot from the first one starting at
+    # starts[batch] is empty and adds no tile; stop there instead of walking all B.
+    last = starts[batch]
+
+    def more(carry):
+        request, _ = carry
+        return (request < batch) & (starts[jnp.minimum(request, batch)] < last)
+
+    def next_request(carry):
+        request, first = carry
+        return request + 1, request_body(request, first)
+
+    _, count = lax.while_loop(more, next_request, (jnp.int32(0), jnp.int32(0)))
+    return request_body(batch, count) if padding else count
 
 
 def build_query_tiles(
@@ -143,6 +160,7 @@ def _csa2_kernel_impl(
     owners: str,
     uniform_tiles: bool,
     accumulators,
+    trim: bool = False,
 ) -> None:
     """Persistent attention with one steady tile body and rotating buffers.
 
@@ -190,6 +208,26 @@ def _csa2_kernel_impl(
     resident_metadata = rope_buf is None
     has_main = kv_hbm is not None
     tiles_ref = tile_scratch
+    ragged = not uniform_tiles and not fixed_tiles
+    # `trim` (ragged tiles only): no tiles for output padding rows, a tile list that
+    # stops at the last request, and tile 0's copies started before the list is built.
+    # Padding rows are zeroed by DMA only without KV owners: with owners a padding
+    # tile also copies its KV rows, and skipping it costs more than it saves.
+    pad = ragged and trim and bq > 1 and kv_out_hbm is None
+    early = ragged and trim
+    early_started = False
+
+    def fill():
+        tiles = _fill_query_tiles(
+            plan_ref,
+            tiles_ref,
+            tokens,
+            bq,
+            walk_all=not trim,
+            padding=not pad,
+        )
+        return tokens if bq == 1 else tiles
+
     if uniform_tiles:
         count = tokens // bq
         tiles_ref = _UniformTiles(bq)
@@ -204,10 +242,9 @@ def _csa2_kernel_impl(
             return None
 
         lax.fori_loop(0, count, tile_body, None)
-    else:
-        count = _fill_query_tiles(plan_ref, tiles_ref, tokens, bq)
-        if bq == 1:
-            count = tokens
+    elif not early:
+        # `early` fills the list after starting tile 0's copies (below).
+        count = fill()
     mxu_heads = pl.cdiv(heads, 16) * 16
 
     def safe_tile(tile):
@@ -645,109 +682,181 @@ def _csa2_kernel_impl(
         if not first_tile:
             output_copy(tile - 1, 1 - bank).start()
 
-    for i in range(4):
+    def pipeline(after_start=None, guarded=False):
+        # `guarded` (pad path) runs the pipeline even with count == 0 and skips only
+        # the tile-0 and last-tile work, so no branch jumps over the whole pipeline.
+        def tile_work(body):
+            return pl.when(count > 0)(body) if guarded else body()
 
-        @pl.when(i < count)
-        def _(*, i=i):
-            start(i, i)
+        for i in range(4):
+            # With `early`, tile 0's copies are already in flight.
+            @pl.when(i < count if not early or i else (count > 0) & ~early_started)
+            def _(*, i=i):
+                start(i, i)
 
-    for copy in (*input_copies(0, 0), *swa_copies(0, 0)):
-        copy.wait()
-    prepare(0, 0, 0)
+        if after_start is not None:
+            after_start()
 
-    # compute(0) prepares and stages tile 1 before the next iteration.
-    @pl.when(count > 1)
-    def _():
-        for copy in swa_copies(1, 1):
-            copy.wait()
+        @tile_work
+        def _():
+            for copy in (*input_copies(0, 0), *swa_copies(0, 0)):
+                copy.wait()
+            prepare(0, 0, 0)
 
-    if kv_out_hbm is not None:
-        kv_copy(0, 0).start()
-    compute(0, 0, 0)
-    if kv_out_hbm is not None:
-        kv_copy(0, 0).wait()
+            # compute(0) prepares and stages tile 1 before the next iteration.
+            @pl.when(count > 1)
+            def _():
+                for copy in swa_copies(1, 1):
+                    copy.wait()
 
-    @pl.when(count > 4)
-    def _():
-        start(4, 0)
+            if kv_out_hbm is not None:
+                kv_copy(0, 0).start()
+            compute(0, 0, 0)
+            if kv_out_hbm is not None:
+                kv_copy(0, 0).wait()
 
-    def step(tile, *, steady, last=False, bank=None, input_bank=None):
-        sb = tile & 3 if input_bank is None else input_bank
-        bank = tile & 1 if bank is None else bank
-        for copy in input_copies(tile, sb):
-            copy.wait()
+        @pl.when(count > 4)
+        def _():
+            start(4, 0)
 
-        if kv_out_hbm is not None:
-            kv_copy(tile, sb).start()
-
-        def wait_next():
-            for copy in swa_copies(tile + 1, (sb + 1) & 3):
+        def step(tile, *, steady, last=False, bank=None, input_bank=None):
+            sb = tile & 3 if input_bank is None else input_bank
+            bank = tile & 1 if bank is None else bank
+            for copy in input_copies(tile, sb):
                 copy.wait()
 
-        if steady:
-            wait_next()
-        else:
-            pl.when(tile + 1 < count)(wait_next)
+            if kv_out_hbm is not None:
+                kv_copy(tile, sb).start()
 
-        @pl.when(tile >= 3)
+            def wait_next():
+                for copy in swa_copies(tile + 1, (sb + 1) & 3):
+                    copy.wait()
+
+            if steady:
+                wait_next()
+            else:
+                pl.when(tile + 1 < count)(wait_next)
+
+            @pl.when(tile >= 3)
+            def _():
+                output_copy(tile - 3, 1 - bank).wait()
+
+            refill = ()
+            if steady:
+                # Index the refill DMAs while the vector units are busy; each DMA
+                # start orders the scalar work after it.
+                refill = (*input_copies(tile + 4, sb), *swa_copies(tile + 4, sb))
+            compute(tile, bank, sb, steady=not last)
+            if kv_out_hbm is not None:
+                # The next input DMA reuses this KV buffer.
+                kv_copy(tile, sb).wait()
+
+            if steady:
+                for copy in refill:
+                    copy.start()
+            else:
+                pl.when(tile + 4 < count)(lambda: start(tile + 4, sb))
+
+        # Four-tile groups give each input and output buffer a static bank.
+        end = max(count - 4, 1) if isinstance(count, int) else jnp.maximum(count - 4, 1)
+
+        def quartet(k, unused):
+            for j in range(4):
+                step(
+                    1 + 4 * k + j, steady=True, bank=(1 + j) & 1, input_bank=(1 + j) & 3
+                )
+
+        quartets = (end - 1) // 4
+        lax.fori_loop(0, quartets, quartet, None)
+        end = 1 + 4 * quartets
+        if uniform_tiles:
+            for tile in range(end, count - 1):
+                step(tile, steady=False)
+        else:
+            lax.fori_loop(
+                end,
+                jnp.maximum(count - 1, end),
+                lambda tile, _: step(tile, steady=False),
+                None,
+                unroll=False,
+            )
+
+        # Every staged RHS must be consumed before the kernel returns.
+        @pl.when(count > 1)
         def _():
-            output_copy(tile - 3, 1 - bank).wait()
+            step(count - 1, steady=False, last=True)
 
-        refill = ()
-        if steady:
-            # Index the refill DMAs while the vector units are busy; each DMA
-            # start orders the scalar work after it.
-            refill = (*input_copies(tile + 4, sb), *swa_copies(tile + 4, sb))
-        compute(tile, bank, sb, steady=not last)
-        if kv_out_hbm is not None:
-            # The next input DMA reuses this KV buffer.
-            kv_copy(tile, sb).wait()
+        @pl.when(count >= 3)
+        def _():
+            output_copy(count - 3, (count - 1) % 2).wait()
 
-        if steady:
-            for copy in refill:
-                copy.start()
-        else:
-            pl.when(tile + 4 < count)(lambda: start(tile + 4, sb))
+        @tile_work
+        def _():
+            finish(count - 1, (count - 1) % 2)
+            output_copy(count - 1, (count - 1) % 2).start()
 
-    # Four-tile groups give each input and output buffer a static bank.
-    end = max(count - 4, 1) if isinstance(count, int) else jnp.maximum(count - 4, 1)
+            @pl.when(count >= 2)
+            def _():
+                output_copy(count - 2, (count - 2) % 2).wait()
 
-    def quartet(k, unused):
-        for j in range(4):
-            step(1 + 4 * k + j, steady=True, bank=(1 + j) & 1, input_bank=(1 + j) & 3)
+            output_copy(count - 1, (count - 1) % 2).wait()
 
-    quartets = (end - 1) // 4
-    lax.fori_loop(0, quartets, quartet, None)
-    end = 1 + 4 * quartets
-    if uniform_tiles:
-        for tile in range(end, count - 1):
-            step(tile, steady=False)
-    else:
-        lax.fori_loop(
-            end,
-            jnp.maximum(count - 1, end),
-            lambda tile, _: step(tile, steady=False),
-            None,
-            unroll=False,
+    if early:
+        # Tile 0 is request 0's first tile whenever request 0 is non-empty: write its
+        # three fields (the fill rewrites the same values) and start its copies.
+        early_started = plan_ref[1] > plan_ref[0]
+
+        @pl.when(early_started)
+        def _():
+            tiles_ref[0] = 0
+            tiles_ref[1] = plan_ref[0]
+            tiles_ref[2] = jnp.minimum(bq, plan_ref[1] - plan_ref[0])
+            # A traced index keeps safe_tile from reading the unfilled count.
+            start(jnp.int32(0), 0)
+
+        count = fill()
+    if not pad:
+        pipeline()
+        return
+
+    # `pad`: rows [starts[B], T) get the zeros a padding tile's finish() would write.
+    zero_rows = min(tokens, 16)
+    first_pad = plan_ref[batch]
+    pad_copies = pl.cdiv(tokens - first_pad, zero_rows)
+
+    def zero_copy(zero, sems, k):
+        row = first_pad + k * zero_rows
+        size = jnp.minimum(zero_rows, tokens - row)
+        return pltpu.make_async_copy(
+            zero.at[pl.ds(0, size)],
+            out_hbm.at[pl.ds(query_offset + row, size)],
+            sems.at[0],
         )
 
-    # Every staged RHS must be consumed before the kernel returns.
-    @pl.when(count > 1)
-    def _():
-        step(count - 1, steady=False, last=True)
+    def padded(zero, sems):
+        def start_padding():
+            @pl.when(pad_copies > 0)
+            def _():
+                zero[...] = jnp.zeros(zero.shape, zero.dtype)
+                lax.fori_loop(
+                    0, pad_copies, lambda k, _: zero_copy(zero, sems, k).start(), None
+                )
 
-    @pl.when(count >= 3)
-    def _():
-        output_copy(count - 3, (count - 1) % 2).wait()
+        # Overlay placement: a branch over the whole pipeline made its join (the call's
+        # last bundles) its own instruction overlay, loaded too late (+6.9 us/call).
+        pipeline(after_start=start_padding, guarded=True)
 
-    finish(count - 1, (count - 1) % 2)
-    output_copy(count - 1, (count - 1) % 2).start()
+        @pl.when(pad_copies > 0)
+        def _():
+            lax.fori_loop(
+                0, pad_copies, lambda k, _: zero_copy(zero, sems, k).wait(), None
+            )
 
-    @pl.when(count >= 2)
-    def _():
-        output_copy(count - 2, (count - 2) % 2).wait()
-
-    output_copy(count - 1, (count - 1) % 2).wait()
+    pl.run_scoped(
+        padded,
+        pltpu.VMEM((zero_rows, heads, 512), out_hbm.dtype),
+        pltpu.SemaphoreType.DMA((1,)),
+    )
 
 
 def _csa2_kernel(
@@ -767,6 +876,7 @@ def _csa2_kernel(
     non_causal: bool,
     query_offset: int,
     owners: str,
+    trim: bool = False,
 ) -> None:
     """Use the uniform tile pipeline only after checking every request boundary."""
     q_buf = refs[4 if owners == "aliased" else 2 if owners == "new" else 1]
@@ -804,6 +914,7 @@ def _csa2_kernel(
             owners=owners,
             uniform_tiles=uniform,
             accumulators=accumulators,
+            trim=trim,
         )
 
     if tokens != batch * bq:
@@ -1028,6 +1139,7 @@ def csa2(
             non_causal=non_causal,
             query_offset=query_offset,
             owners=owners,
+            trim=envs.TPU_CSA2_TILE_TRIM,
         ),
         out_shape=out_shape,
         input_output_aliases=aliases,

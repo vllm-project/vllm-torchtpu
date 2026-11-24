@@ -157,6 +157,7 @@ _SHAPES = {
     "dsv41_swa_parity": _TPU_2,
     "dsv41_benchmark_scripts_cpu": "cpu",
     "dsv41_kernel_config_cpu": "cpu",
+    "dsv41_serving_cpu": "cpu",
     "dsv41_stage_model": "cpu",
     "dsv41_flash_dp8_ep_gsm8k": _TPU_8,
     "dsv41_decode_kernel_parity": _TPU_8,
