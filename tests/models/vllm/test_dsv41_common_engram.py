@@ -74,6 +74,58 @@ def test_ready_rows_packed_scales_match_tpu_and_cpu(tokens, heads):
     torch._dynamo.reset()
 
 
+def test_engram_gate_fake_binds_int_sized_rows():
+    """Rows sized by an int graph input reach only the fused gate (the
+    ``dummy_hashes`` mask on v7x-16 decode). After vLLM concretizes a bucket,
+    AOT re-symbolizes those ints; the gate's fake must tie them to the hidden
+    rows, or torch_tpu's static compile meets a free SymInt (E40-E50)."""
+    from torch._functorch.aot_autograd import aot_module_simplified
+    from vllm.compilation.piecewise_backend import create_concrete_args
+
+    common_engram.initialize_engram_gate()
+    gate = common_engram._ENGRAM_GATE_OP
+    tokens, heads, dim, k_dim = 64, 4, 128, 256
+    free: list[torch.SymInt] = []
+
+    def backend(graph, _example_inputs):
+        def record(_aot_graph, aot_inputs):
+            free.extend(
+                value
+                for value in aot_inputs
+                if isinstance(value, torch.SymInt) and value.node.expr.free_symbols
+            )
+            return lambda *_: [torch.empty(0)]
+
+        aot_module_simplified(
+            graph, create_concrete_args(graph, tokens), fw_compiler=record
+        )
+        return lambda *_: [torch.empty(0)]
+
+    def stage(input_ids, rows, hidden, w, w_scale, q_weight, k_weight):
+        num_tokens = input_ids.shape[0]
+        mask = torch.zeros(num_tokens, dtype=torch.bool)
+        return gate(
+            rows[:num_tokens], w, w_scale, hidden, q_weight, k_weight, mask, 1e-6, 1e-6
+        )
+
+    inputs = (
+        torch.zeros(tokens, dtype=torch.int64),
+        torch.zeros(tokens, k_dim, dtype=torch.bfloat16),
+        torch.zeros(tokens, heads, dim, dtype=torch.bfloat16),
+        torch.zeros(k_dim, (heads + 1) * dim, dtype=torch.float8_e4m3fn),
+        torch.ones((heads + 1) * dim),
+        torch.ones(heads, dim),
+        torch.ones(heads, dim),
+    )
+    for tensor in inputs[:3]:
+        torch._dynamo.mark_dynamic(tensor, 0)
+    try:
+        torch.compile(stage, backend=backend, fullgraph=True)(*inputs)
+    finally:
+        torch._dynamo.reset()
+    assert not free, free
+
+
 @pytest.fixture(autouse=True)
 def setup_torch_accelerator(monkeypatch: pytest.MonkeyPatch):
     """Enable CPU execution for upstream Engram constructor checks."""

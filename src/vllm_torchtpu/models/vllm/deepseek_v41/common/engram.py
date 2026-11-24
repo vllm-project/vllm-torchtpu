@@ -627,9 +627,28 @@ def initialize_engram_gate() -> None:
                 x, w, w_scale, hidden, q_weight, k_weight, mask, eps=eps, clamp=clamp
             )
 
+        def fake(
+            x: torch.Tensor,
+            w: torch.Tensor,
+            w_scale: torch.Tensor,
+            hidden: torch.Tensor,
+            q_weight: torch.Tensor,
+            k_weight: torch.Tensor,
+            mask: torch.Tensor | None,
+            *_: float,
+        ) -> torch.Tensor:
+            # The row contract, stated where every trace runs it: AOT turns
+            # each int graph input into a fresh SymInt, and one that sizes a
+            # tensor only this op reads (dummy_hashes' mask) stays free unless
+            # tied here; torch_tpu's static compile then fails on it.
+            torch._check(x.shape[0] == hidden.shape[0])
+            if mask is not None:
+                torch._check(mask.shape[0] == hidden.shape[0])
+            return torch.empty_like(hidden)
+
         # A per-rank kernel, like quantized_matmul: no mesh.
         op = pallas.jax_op("pallas::dsv41_engram_gate", call)
-        op.register_fake(lambda x, w, w_scale, hidden, *_: torch.empty_like(hidden))
+        op.register_fake(fake)
         _ENGRAM_GATE_OP = op
 
 
