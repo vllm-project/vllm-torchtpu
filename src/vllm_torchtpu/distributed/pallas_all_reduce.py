@@ -221,13 +221,65 @@ def _rs_body(axis: str, min_rows: int, tab: np.ndarray):
     return body
 
 
-def _make_rs_op(mesh, min_rows: int):
+def hier_applies(rows: int, hidden: int, min_rows: int) -> bool:
+    """Whether a [rows, hidden] bf16 row reduce-scatter over 8 ranks runs
+    hierrs_tc (row-streaming kernel from 24 MiB, micro-batched below)."""
+    from vllm_torchtpu.kernels.collectives.hierrs_tc import dispatch, wrapper
+
+    if not (0 < min_rows <= rows and wrapper.is_supported_by_hierrs_tc(8, rows, hidden)):
+        return False
+    return not (rows * hidden * 2 >= dispatch.STREAM_MIN_BYTES) or dispatch.supports_stream(
+        rows, hidden, 2
+    )
+
+
+def _chip_perm(devices) -> tuple[int, ...] | None:
+    """hierrs_tc's chip_perm for a mesh in ``devices`` order (``_ChipCore``):
+    ``perm[k]`` is the mesh chip (mesh indices 2m, 2m + 1) on physical chip k,
+    chips sorted by ICI coordinates; None when that is the identity. Raises if
+    mesh indices 2m, 2m + 1 are not one chip's two cores."""
+    chips = sorted({d.coords for d in devices})
+    mesh_chips = []
+    for m in range(len(devices) // 2):
+        a, b = devices[2 * m], devices[2 * m + 1]
+        if a.coords != b.coords or a.core_on_chip == b.core_on_chip:
+            raise ValueError(f"mesh indices {2 * m}, {2 * m + 1} are not one chip: {devices}")
+        mesh_chips.append(chips.index(a.coords))
+    perm = tuple(mesh_chips.index(k) for k in range(len(mesh_chips)))
+    return None if perm == tuple(range(len(perm))) else perm
+
+
+def _hier_rs_body(axis: str, min_rows: int, chip_perm):
+    from vllm_torchtpu.kernels.collectives.hierrs_tc import dispatch
+
+    local = dispatch.make_reduce_scatter_fn(
+        None, tuple(range(8)), axis_name=axis, chip_perm=chip_perm
+    ).local
+
+    def body(x, rank):
+        del rank
+        rows, hidden = x.shape
+        if hier_applies(rows, hidden, min_rows):
+            if rows not in _QRS_TRACED:
+                _QRS_TRACED.add(rows)
+                logger.warning("tp_reduce_scatter: hierrs_tc lowered for [%d, %d]", rows, hidden)
+            return local(x)
+        return lax.psum_scatter(x, axis, scatter_dimension=0, tiled=True)
+
+    return body
+
+
+def _make_rs_op(mesh, min_rows: int, hier: bool = False):
     axis = mesh.axis_names[0]
     n = int(mesh.size)
-    tab = qrs.layout_table(_qar_devices(mesh))
+    devices = _qar_devices(mesh)
+    if hier:
+        body = _hier_rs_body(axis, min_rows, _chip_perm(devices))
+    else:
+        body = _rs_body(axis, min_rows, qrs.layout_table(devices))
     specs = (P(axis), P(axis))
     sharded = jax.shard_map(
-        _rs_body(axis, min_rows, tab),
+        body,
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
@@ -242,7 +294,7 @@ def _make_rs_op(mesh, min_rows: int):
 
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
-        "pallas::tp_qar_reduce_scatter",
+        "pallas::tp_hier_reduce_scatter" if hier else "pallas::tp_qar_reduce_scatter",
         fn,
         mesh=mesh,
         input_partition_specs=specs,
@@ -263,6 +315,18 @@ def _qrs_selftest(op, rank, n: int, hidden: int, device, rows: int) -> dict:
     exact = parts.double().sum(0)[me * c : (me + 1) * c]
     rel = float((out.double() - exact).norm() / exact.norm())
     return dict(rank=me, rel=rel)
+
+
+def _hier_selftest(op, rank, n: int, hidden: int, device, rows: int) -> dict:
+    """Integer partials (exact in bf16 in any order: chunk placement must be
+    bitwise) and random partials (rel L2 of this rank's chunk)."""
+    me = int(rank.reshape(-1)[0].item())
+    c = rows // n
+    ints = _selftest_inputs(n, rows, hidden)
+    got = op(torch.from_numpy(ints[me]).to(torch.bfloat16).to(device), rank)
+    exact_ok = bool(np.array_equal(got.float().cpu().numpy(), ints.sum(0)[me * c : (me + 1) * c]))
+    out = _qrs_selftest(op, rank, n, hidden, device, rows)
+    return dict(rank=me, rel=out["rel"], exact=exact_ok)
 
 
 def _refusal() -> str | None:
@@ -420,6 +484,27 @@ def arm(hidden: int, device: torch.device) -> bool:
                 "tp_reduce_scatter: qar_reduce_scatter (int8 ICI payload) on SP row"
                 " reduce-scatters of >= %d rows (TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS);"
                 " self-test passed: %s", rs_min, [round(r["rel"], 4) for r in seen],
+            )
+    if envs.TPU_MINIMAX_M3_SP_HIER_RS:
+        rs_min = envs.TPU_MINIMAX_M3_SP_HIER_RS_MIN_TOKENS
+        test_rows = max(-(-rs_min // 1024) * 1024, 1024)
+        if rs_op is not None:
+            raise ValueError("TPU_MINIMAX_M3_SP_HIER_RS and TPU_MINIMAX_M3_SP_QRS are exclusive")
+        if not rank_ordered:
+            logger.warning("tp_reduce_scatter: hierrs_tc not armed: mesh index != TP rank"
+                           " on some rank")
+        elif n != 8 or not hier_applies(test_rows, hidden, rs_min):
+            logger.warning("tp_reduce_scatter: hierrs_tc not armed: %d ranks, hidden %d,"
+                           " min rows %d", n, hidden, rs_min)
+        else:
+            rs_op = _make_rs_op(mesh, rs_min, hier=True)
+            seen = _gather(_hier_selftest(rs_op, rank, n, hidden, device, test_rows))
+            if not all(r["exact"] for r in seen) or max(r["rel"] for r in seen) >= 0.01:
+                raise RuntimeError(f"hierrs_tc reduce-scatter: self-test failed: {seen}")
+            logger.info(
+                "tp_reduce_scatter: hierrs_tc (hierarchical TensorCore, bf16) on SP row"
+                " reduce-scatters of >= %d rows (TPU_MINIMAX_M3_SP_HIER_RS_MIN_TOKENS);"
+                " self-test passed: %s", rs_min, [round(r["rel"], 5) for r in seen],
             )
     _ARMED = _Armed(
         ranks=tuple(int(r) for r in tp.ranks),

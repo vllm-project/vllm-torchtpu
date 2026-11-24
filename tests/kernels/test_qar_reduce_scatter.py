@@ -197,14 +197,43 @@ def test_compiles_for_tpu7x(rows):
         f.lower(x, r).compile()
 
 
-def _rs_op():
+def _rs_op(hier=False):
     pytest.importorskip("torch_tpu")
     from vllm_torchtpu.distributed import pallas_all_reduce as par
 
-    return par._make_rs_op(_mesh(), 4096)
+    return par._make_rs_op(_mesh(), 4096, hier=hier)
 
 
-def test_rs_op_fake_symbolic():
+@pytest.mark.parametrize("rows", [8192, 3072])
+def test_hier_compiles_for_tpu7x(rows):
+    """hierrs_tc (TPU_MINIMAX_M3_SP_HIER_RS) on the served rank-ordered mesh
+    (chip_perm) compiles deviceless for tpu7x 2x2x1 at hidden 6144."""
+    from jax.experimental import topologies
+    from jax.sharding import NamedSharding
+
+    from vllm_torchtpu.distributed import pallas_all_reduce as par
+
+    try:
+        topo = topologies.get_topology_desc("tpu7x:2x2x1", "tpu")
+    except Exception as e:  # no libtpu
+        pytest.skip(f"no deviceless tpu7x topology: {e}")
+    byid = {d.id: d for d in topo.devices}
+    devs = [byid[i] for i in (0, 1, 4, 5, 6, 7, 2, 3)]
+    mesh = Mesh(np.array(devs), ("x",))
+    cores = [par._ChipCore(int(d.id), tuple(int(c) for c in d.coords[:3]), int(d.core_on_chip))
+             for d in devs]
+    body = par._hier_rs_body("x", 1024, par._chip_perm(cores))
+    f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P("x"), P("x")), out_specs=P("x"),
+                              check_vma=False))
+    sh = NamedSharding(mesh, P("x"))
+    x = jax.ShapeDtypeStruct((8 * rows, 6144), jnp.bfloat16, sharding=sh)
+    r = jax.ShapeDtypeStruct((8, 1), jnp.int32, sharding=sh)
+    with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+        f.lower(x, r).compile()
+
+
+@pytest.mark.parametrize("hier", [False, True])
+def test_rs_op_fake_symbolic(hier):
     """The torch op's fake: [T, H] -> [T / 8, H] with a symbolic T under
     FakeTensorMode (nothing lowers)."""
     import torch
@@ -215,7 +244,7 @@ def test_rs_op_fake_symbolic():
         StatelessSymbolicContext,
     )
 
-    op = _rs_op()
+    op = _rs_op(hier)
     mode = FakeTensorMode(shape_env=ShapeEnv())
     seed = mode.from_tensor(
         torch.empty(64),
@@ -229,12 +258,13 @@ def test_rs_op_fake_symbolic():
     assert isinstance(out.shape[0], torch.SymInt)
 
 
-def test_rs_op_dynamo_meta():
+@pytest.mark.parametrize("hier", [False, True])
+def test_rs_op_dynamo_meta(hier):
     """torch.compile(fullgraph=True) over meta tensors with a dynamic token
     dim, as Dynamo traces the SP step in warmup."""
     import torch
 
-    op = _rs_op()
+    op = _rs_op(hier)
     x = torch.empty((8 * 512, 512), dtype=torch.bfloat16, device="meta")
     r = torch.empty((1, 1), dtype=torch.int32, device="meta")
     torch._dynamo.mark_dynamic(x, 0)

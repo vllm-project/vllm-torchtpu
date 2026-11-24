@@ -63,6 +63,8 @@ _SP_ENV = {
     "TPU_MINIMAX_M3_SP_A2A_E4M3": False,
     "TPU_MINIMAX_M3_SP_QRS": False,
     "TPU_MINIMAX_M3_SP_QRS_MIN_TOKENS": 2048,
+    "TPU_MINIMAX_M3_SP_HIER_RS": False,
+    "TPU_MINIMAX_M3_SP_HIER_RS_MIN_TOKENS": 8192,
 }
 # The production config this port targets.
 _TARGET = dict(
@@ -543,6 +545,73 @@ def test_qrs_key_off_never_touches_op(tp, monkeypatch):
     tp.calls.clear()
     _forward(tp, monkeypatch, "full")
     assert tp.calls.count("rs") == 4
+
+
+def _exact_rs(tp):
+    """Stand-in for the armed bf16 hierrs_tc op: the f32 chunk sum (logged as "hier")."""
+
+    def reduce_scatter(ranks, x):
+        assert list(ranks) == list(range(tp.n)) and x.dim() == 2
+        if tp.rank == 0:
+            tp.calls.append("hier")
+        return sum(tp._exchange(x.float())).chunk(tp.n, 0)[tp.rank].to(x.dtype)
+
+    return reduce_scatter
+
+
+@pytest.mark.parametrize("mode", ["full", "attn"])
+def test_hier_rs_takes_every_sp_reduce_scatter(tp, monkeypatch, mode):
+    """TPU_MINIMAX_M3_SP_HIER_RS: every SP reduce-scatter goes through the
+    armed op (none through XLA's); with an exact-sum op the result matches
+    the plain path to bf16 rounding."""
+    want = _plain(tp, monkeypatch)
+    kw = dict(_TARGET, TPU_MINIMAX_M3_SP_MODE=mode, TPU_MINIMAX_M3_SP_HIER_RS=True)
+    if mode == "attn":
+        kw["TPU_MINIMAX_M3_SP_A2A_OPROJ"] = "off"
+    _set_env(monkeypatch, **kw)
+    monkeypatch.setattr(mm, "get_tp_group", tp.group)
+    monkeypatch.setattr(pallas_all_reduce, "reduce_scatter", _exact_rs(tp))
+    tp.calls.clear()
+    outs, _ = _forward(tp, monkeypatch, mode, aux=(0, 2, 4))
+    for got in outs[1:]:
+        torch.testing.assert_close(got[0], outs[0][0], rtol=0, atol=0)
+    assert "rs" not in tp.calls
+    assert tp.calls.count("hier") == 4
+    assert _rel(outs[0][0], want[0]) < 6e-2, _rel(outs[0][0], want[0])
+
+
+def test_hier_rs_key_off_never_touches_op(tp, monkeypatch):
+    _set_env(monkeypatch, **dict(_TARGET, TPU_MINIMAX_M3_SP_HIER_RS=False))
+    monkeypatch.setattr(pallas_all_reduce, "reduce_scatter", _boom)
+    tp.calls.clear()
+    _forward(tp, monkeypatch, "full")
+    assert tp.calls.count("rs") == 4
+
+
+def test_hier_applies():
+    ha = pallas_all_reduce.hier_applies
+    assert ha(8192, 6144, 1024) and ha(1024, 6144, 1024) and ha(3072, 6144, 1024)
+    assert not ha(512, 6144, 1024)  # below the minimum
+    assert not ha(8192, 6144, 0)  # off
+    assert not ha(1028, 6144, 8)  # rows not a multiple of 8 ranks
+
+
+def test_chip_perm_rank_mesh():
+    """Served rank mesh (device ids 0,1,4,5,6,7,2,3 on a 2x2 grid, chip =
+    coords, id = 2 * chip + core in x-major order): chips (0,0),(0,1),(1,1),
+    (1,0) at mesh chips 0..3 -> physical chip k (coords sorted) is on mesh chip
+    perm[k]."""
+    cc = pallas_all_reduce._ChipCore
+    coords = {0: (0, 0, 0), 1: (0, 0, 0), 2: (1, 0, 0), 3: (1, 0, 0),
+              4: (0, 1, 0), 5: (0, 1, 0), 6: (1, 1, 0), 7: (1, 1, 0)}
+    mk = lambda ids: [cc(i, coords[i], i % 2) for i in ids]  # noqa: E731
+    # ids in order: mesh chips (0,0) (1,0) (0,1) (1,1)
+    assert pallas_all_reduce._chip_perm(mk(range(8))) == (0, 2, 1, 3)
+    assert pallas_all_reduce._chip_perm(mk((0, 1, 4, 5, 2, 3, 6, 7))) is None
+    # sorted chips: (0,0,0) (0,1,0) (1,0,0) (1,1,0); mesh chips: (0,0) (0,1) (1,1) (1,0)
+    assert pallas_all_reduce._chip_perm(mk((0, 1, 4, 5, 6, 7, 2, 3))) == (0, 1, 3, 2)
+    with pytest.raises(ValueError):
+        pallas_all_reduce._chip_perm(mk((0, 2, 1, 3, 4, 5, 6, 7)))
 
 
 def test_pallas_reduce_scatter_gate(monkeypatch):

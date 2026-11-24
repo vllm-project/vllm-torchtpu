@@ -94,6 +94,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_FP8_CAST_SKIP: str = "shared_experts.gate_up_proj"
     TPU_MINIMAX_M3_FP8_CAST_IN_TORCH: bool = False
     TPU_MINIMAX_M3_FP8_CAST_NORM: bool = False
+    TPU_MINIMAX_M3_SP_HIER_RS: bool = False
+    TPU_MINIMAX_M3_SP_HIER_RS_MIN_TOKENS: int = 8192
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -941,6 +943,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of a bf16 copy and a separate cast pass).
     "TPU_MINIMAX_M3_FP8_CAST_NORM": env_bool(
         "TPU_MINIMAX_M3_FP8_CAST_NORM", default=False
+    ),
+    # Sequence-parallel row reduce-scatters (TPU_MINIMAX_M3_SP_MODE) of at
+    # least TPU_MINIMAX_M3_SP_HIER_RS_MIN_TOKENS rows run the hierarchical
+    # TensorCore reduce-scatter (kernels/collectives/hierrs_tc: on-chip d2d
+    # leg, then a 2-step chip hypercube with both ICI links busy) instead of
+    # XLA's SparseCore one; bf16 on the wire, bf16 sums in another order (not
+    # bitwise, ~0.31% vs 0.37% rel L2 against an f32 sum). Needs the Pallas
+    # all-reduce armed (TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES > 0) on a
+    # rank-ordered tpu7x 2x2x1 TP8 group; exclusive with TPU_MINIMAX_M3_SP_QRS.
+    # exos microbench (hidden 6144): standalone 0.442 vs 0.489 ms at 8192
+    # rows, 0.061 vs 0.069 at 1024; inside an SP layer composition only 8192
+    # rows gain (-0.01..-0.066 ms per layer; 6144 rows +0.05..+0.085, 2048-4096
+    # flat), hence the 8192 default minimum. Off: the reduce-scatters are
+    # unchanged.
+    "TPU_MINIMAX_M3_SP_HIER_RS": env_bool("TPU_MINIMAX_M3_SP_HIER_RS", default=False),
+    "TPU_MINIMAX_M3_SP_HIER_RS_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_SP_HIER_RS_MIN_TOKENS", 8192
     ),
     # EP steps of up to this many tokens with fp4 (NVFP4) experts run the
     # permutation-free dense-expert kernel (kernels/experimental/
