@@ -23,9 +23,11 @@ that, TpuDeviceCommunicator.all_reduce of the TP group sends every 2-D bf16
 tensor through one torch op. Inside it the token count is static (torch_tpu
 exports one program per count): the kernel serves views up to the byte cap,
 and a larger tensor (a prefill chunk) takes a psum over the same mesh, which
-XLA lowers as it lowers the usual all-reduce. The kernel's output bits can
-differ from XLA's all-reduce: it sums in f32 in rank order and rounds once;
-every rank gets the same bits.
+XLA lowers as it lowers the usual all-reduce, except tensors up to
+TPU_TP_PAIR_ALL_REDUCE_MAX_BYTES, which take the chip-pairs-first kernel
+(kernels/collectives/pair_all_reduce.py). The kernels' output bits can differ
+from XLA's all-reduce: they sum in f32 (the pair kernel after rounding each
+chip's partial to bf16) and round once; every rank gets the same bits.
 """
 
 import dataclasses
@@ -43,6 +45,7 @@ from vllm.distributed import parallel_state
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
+from vllm_torchtpu.kernels.collectives import pair_all_reduce
 from vllm_torchtpu.kernels.collectives import tp_all_reduce as kernel
 from vllm_torchtpu.logger import init_logger
 
@@ -51,6 +54,8 @@ logger = init_logger(__name__)
 # A wrong rank or mesh hangs the self-test's barrier: dump every stack and exit.
 SELFTEST_TIMEOUT_S = 300
 _SELFTEST_ROWS = (8, 24)
+# Row counts the pair kernel's self-test may take (4, 2 and 1 row blocks).
+_PAIR_SELFTEST_ROWS = (64, 96, 80, 112, 128, 192, 256)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,29 +69,38 @@ class _Armed:
     rank_ordered: bool = False
     mesh: Any = None
     max_bytes: int = 0
+    # The chip-pairs-first kernel: its byte cap (0: off) and topology table.
+    pair_max_bytes: int = 0
+    pair_table: Any = None
 
 
 _ARMED: _Armed | None = None
 
 
-def reduce_body(n: int, max_bytes: int, axis: str):
+def reduce_body(n: int, max_bytes: int, axis: str, pair_max_bytes=0, pair_table=None):
     """The op's per-device all-reduce of (x, rank), for use under shard_map
-    over the op's mesh (axis `axis`, n devices)."""
+    over the op's mesh (axis `axis`, n devices): the direct kernel up to
+    max_bytes of view, the pair kernel up to pair_max_bytes (with its
+    topology table), else psum."""
 
     def body(x, rank):
         rows, hidden = x.shape
         if 0 < kernel.view_bytes(rows, hidden, n) <= max_bytes:
             return kernel.all_reduce(x, rank, n)
+        if x.size * x.dtype.itemsize <= pair_max_bytes and pair_all_reduce.supported(
+            rows, hidden, n
+        ):
+            return pair_all_reduce.all_reduce(x, rank, pair_table)
         return lax.psum(x, axis)
 
     return body
 
 
-def _make_op(mesh, max_bytes: int):
+def _make_op(mesh, max_bytes: int, pair_max_bytes=0, pair_table=None):
     axis = mesh.axis_names[0]
     specs = (P(axis), P(axis))
     sharded = jax.shard_map(
-        reduce_body(int(mesh.size), max_bytes, axis),
+        reduce_body(int(mesh.size), max_bytes, axis, pair_max_bytes, pair_table),
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
@@ -168,12 +182,12 @@ def _selftest_inputs(n: int, rows: int, hidden: int) -> np.ndarray:
 
 
 def _selftest(
-    op, rank: torch.Tensor, mesh_index: int, n: int, hidden: int, device
+    op, rank: torch.Tensor, mesh_index: int, n: int, hidden: int, device, rows_list
 ) -> list:
     failures = []
     faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
     try:
-        for rows in _SELFTEST_ROWS:
+        for rows in rows_list:
             x = _selftest_inputs(n, rows, hidden)
             mine = torch.from_numpy(x[mesh_index]).to(torch.bfloat16).to(device)
             got = op(mine, rank).to(torch.float32).cpu().numpy()
@@ -222,9 +236,30 @@ def arm(hidden: int, device: torch.device) -> bool:
     if sorted(s["mesh_index"] for s in seen) != list(range(tp.world_size)):
         raise RuntimeError(f"tp_all_reduce: mesh indices are not 0..n-1: {seen}")
     n = int(mesh.size)
-    op = _make_op(mesh, max_bytes)
+    pair_max_bytes = envs.TPU_TP_PAIR_ALL_REDUCE_MAX_BYTES
+    pair_table = None
+    rows_list = _SELFTEST_ROWS
+    if pair_max_bytes > 0:
+        # Raises on a mesh that is not a tpu7x 2x2x1 (the flag asks for it).
+        pair_table = pair_all_reduce.topology_table(d.id for d in mesh.devices.flat)
+        pair_max_bytes = min(pair_max_bytes, pair_all_reduce.MAX_BYTES)
+        # The rows that reach the pair kernel under these caps, up to three.
+        pair_rows = [
+            r
+            for r in _PAIR_SELFTEST_ROWS
+            if kernel.view_bytes(r, hidden, n) > max_bytes
+            and r * hidden * 2 <= pair_max_bytes
+            and pair_all_reduce.supported(r, hidden, n)
+        ][:3]
+        if not pair_rows:
+            raise RuntimeError(
+                "tp_all_reduce: TPU_TP_PAIR_ALL_REDUCE_MAX_BYTES admits no "
+                f"self-test rows above the {max_bytes} B direct cap"
+            )
+        rows_list = _SELFTEST_ROWS + tuple(pair_rows)
+    op = _make_op(mesh, max_bytes, pair_max_bytes, pair_table)
     rank = torch.tensor([[mesh_index]], dtype=torch.int32, device=device)
-    failures = _gather(_selftest(op, rank, mesh_index, n, hidden, device))
+    failures = _gather(_selftest(op, rank, mesh_index, n, hidden, device, rows_list))
     if any(failures):
         raise RuntimeError(
             f"tp_all_reduce: self-test failed (rows per rank): {failures}"
@@ -242,12 +277,16 @@ def arm(hidden: int, device: torch.device) -> bool:
         mesh=mesh,
         max_bytes=max_bytes,
         rank_ordered=all(s["mesh_index"] == i for i, s in enumerate(seen)),
+        pair_max_bytes=pair_max_bytes,
+        pair_table=pair_table,
     )
     logger.info(
-        "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views",
+        "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B "
+        "views, chip-pairs-first up to %d B",
         n,
         mesh_index,
         max_bytes,
+        pair_max_bytes,
     )
     return True
 

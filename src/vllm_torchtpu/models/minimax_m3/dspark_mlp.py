@@ -151,6 +151,8 @@ def _make_reducing_op(armed, eps: float | None = None, pre_ar: bool = False):
     mesh = armed.mesh
     axis = mesh.axis_names[0]
     n = int(mesh.size)
+    # Without the pair all-reduce: the draft MLP's reductions were not
+    # measured with it.
     reduce = pallas_all_reduce.reduce_body(n, armed.max_bytes, axis)
     body = _mlp_body(eps, n, reduce, pre_ar)
     nargs = 6 if eps is None else 8

@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     TPU_MOE_BOUNDED_ONEHOT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
+    TPU_TP_PAIR_ALL_REDUCE_MAX_BYTES: int = 0
     TPU_MOE_TC_COMBINE: bool = False
     TPU_MOE_PAIR_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -1011,6 +1012,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES", 0
     ),
+    # With the Pallas all-reduce armed: bf16 [rows, hidden] tensors above its
+    # byte cap and up to this many bytes take the chip-pairs-first all-reduce
+    # (kernels/collectives/pair_all_reduce.py) instead of XLA's, on a tpu7x
+    # 2x2x1 at TP8 (arming refuses other topologies). 0 (default): off. At
+    # hidden 6144 it beats XLA's TensorCore all-reduce from 64 to 256 rows
+    # (192 rows: 33.2 vs 41.0 us); 3145728 admits 256 rows.
+    "TPU_TP_PAIR_ALL_REDUCE_MAX_BYTES": env_int("TPU_TP_PAIR_ALL_REDUCE_MAX_BYTES", 0),
     # Expert-parallel MoE combine of large batches on the TensorCore
     # (kernels/megablox/tc_combine.py) instead of the SparseCore
     # gather-reduce, where its shape admits it.

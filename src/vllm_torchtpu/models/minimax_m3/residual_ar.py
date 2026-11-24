@@ -109,7 +109,9 @@ def _make_ops(armed, max_rows: int, eps: float):
     mesh = armed.mesh
     axis = mesh.axis_names[0]
     n = int(mesh.size)
-    reduce = pallas_all_reduce.reduce_body(n, armed.max_bytes, axis)
+    reduce = pallas_all_reduce.reduce_body(
+        n, armed.max_bytes, axis, armed.pair_max_bytes, armed.pair_table
+    )
     body_a, body_b = _op_bodies(
         n,
         max_rows,
