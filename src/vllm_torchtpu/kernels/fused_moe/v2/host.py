@@ -200,6 +200,14 @@ def token_gather_smem_bytes(tile_m):
     return 2 * token_gather_window_rows(tile_m) * jnp.dtype(jnp.int32).itemsize
 
 
+def mirror_lane_tiles(tile_m):
+    """Lane blocks one scale-mirror sublane spans: 1 up to a 128-row tile.
+
+    Above that the mirror and its staging are laid out [..., tiles, 128] so
+    the sublane axis stays untiled (see the kernel builder)."""
+    return 1 if tile_m <= HIDDEN_LANE_BLOCK else tile_m // HIDDEN_LANE_BLOCK
+
+
 def mirror_run_tiles(run_start, run_rows, tile_m):
     """Mirror sublanes a run owns: the source tiles its rows fall in."""
     shift = pow2_shift(tile_m, "tile_m")
@@ -1460,7 +1468,13 @@ def vmem_scratch_arrays(
             (OUT_PARITIES, tile_m, lane_blocks, HIDDEN_LANE_BLOCK),
             form.wire_dtype,
         ),
-        ("oscl_vm", (OUT_PARITIES, 1, capacity), jnp.float32),
+        (
+            "oscl_vm",
+            (OUT_PARITIES, 1, capacity)
+            if mirror_lane_tiles(capacity) == 1
+            else (OUT_PARITIES, 1, mirror_lane_tiles(capacity), HIDDEN_LANE_BLOCK),
+            jnp.float32,
+        ),
         *(
             [("dq_vm", (max(hidden, inter), FP4_DEQUANT_CHUNK), jnp.bfloat16)]
             if weight_format == WeightFormat.FP4 and fp4_body == "dequant"
@@ -1499,6 +1513,27 @@ def vmem_tile_body_arrays(
     """
     form = weight_form(weight_format)
     tile_m = capacity
+    dequant = weight_format == WeightFormat.FP4 and fp4_body == "dequant"
+    if dequant:
+        # The bf16-dequant body (kernel.expert_ffn_dequant) keeps no
+        # full-width f32 accumulator: a gate chunk and its up chunk, the
+        # activated bf16 intermediate, the token rows widened to bf16, one
+        # f32 down chunk at a time, the bf16 down projection and its fp8
+        # wire rows. Its weight chunks are staged in dq_vm, a declared
+        # scratch, one dequantized block value at a time.
+        return [
+            ("gate_up_chunk", (tile_m, 2 * FP4_DEQUANT_CHUNK), jnp.float32),
+            ("mid_concat", (tile_m, inter), jnp.bfloat16),
+            ("act_bf16", (tile_m, hidden), jnp.bfloat16),
+            ("down_chunk", (tile_m, FP4_DEQUANT_CHUNK), jnp.float32),
+            ("down_bf16", (tile_m, hidden), jnp.bfloat16),
+            ("wire_rows", (tile_m, hidden), FP8),
+            (
+                "dequant_block",
+                (WIDENED_BLOCK_BUFFERS, rhs_qb, FP4_DEQUANT_CHUNK),
+                jnp.float32,
+            ),
+        ]
     arrays: list[tuple[str, tuple[int, ...], Any]] = [
         ("acc1", (tile_m, 2 * inter), jnp.float32),
         ("mid_chunks", (tile_m, inter), jnp.bfloat16),
@@ -1509,14 +1544,7 @@ def vmem_tile_body_arrays(
     # concatenates the chunk list into one [tile_m, inter] bf16 array while
     # the chunks that feed it are still live. The requantizing path does not,
     # because it quantizes straight out of the chunk list into mid_q.
-    dequant = weight_format == WeightFormat.FP4 and fp4_body == "dequant"
-    if dequant:
-        # The bf16-dequant body contracts the bf16 intermediate directly, so
-        # it concatenates the chunks like the unquantized formats do; its
-        # weight blocks are staged in dq_vm, a declared scratch.
-        arrays.append(("mid_concat", (tile_m, inter), jnp.bfloat16))
-        arrays.append(("act_bf16", (tile_m, hidden), jnp.bfloat16))
-    elif form.quantized_activations:
+    if form.quantized_activations:
         arrays.append(("mid_q", (tile_m, inter), FP8))
     else:
         arrays.append(("mid_concat", (tile_m, inter), jnp.bfloat16))
@@ -1529,11 +1557,7 @@ def vmem_tile_body_arrays(
     # sixteen-bit wire ships down_bf16 itself and materializes nothing.
     if form.wire_dtype is FP8:
         arrays.append(("wire_rows", (tile_m, hidden), FP8))
-    if dequant:
-        arrays.append(
-            ("dequant_block", (WIDENED_BLOCK_BUFFERS, rhs_qb, FP4_DEQUANT_CHUNK), jnp.float32)
-        )
-    elif weight_format == WeightFormat.FP4:
+    if weight_format == WeightFormat.FP4:
         arrays.append(
             (
                 "widened_weight_block",

@@ -67,11 +67,11 @@ def test_expert_ffn_dequant_matches_reference_formula():
     w2, s2 = _weights(rng, inter, hidden, qb)
     act = jnp.asarray(rng.integers(-4, 5, size=(rows, hidden)), jnp.float8_e4m3fn)
     act_scale = jnp.asarray(2.0 ** rng.integers(-6, -2, size=(rows, 1)), jnp.float32)
-    acc2, mid_scale = K.expert_ffn_dequant(
+    down, mid_scale = K.expert_ffn_dequant(
         act, act_scale, _reader(w1, qb), _reader(w2, qb), jnp.asarray(s1),
         jnp.asarray(s2), qb=qb, act_fn="silu", chunk=128, stage=None,
     )
-    assert mid_scale is None
+    assert mid_scale is None and down.dtype == jnp.bfloat16
     a = np.asarray(act.astype(jnp.float32))
     acc1 = (a @ (w1 * np.repeat(s1, qb, axis=0))) * np.asarray(act_scale)
     gate, up = jnp.asarray(acc1[:, :inter]), jnp.asarray(acc1[:, inter:])
@@ -80,7 +80,34 @@ def test_expert_ffn_dequant_matches_reference_formula():
     # The intermediate is no longer integer-valued, so the down matmul's f32
     # sum order (XLA vs numpy) shows at ~1e-5; the contraction itself is
     # pinned bit-exact by the test above.
-    np.testing.assert_allclose(np.asarray(acc2), want, rtol=1e-4, atol=1e-3)
+    np.testing.assert_allclose(
+        np.asarray(down.astype(jnp.float32)), want, rtol=8e-3, atol=1e-3
+    )
+
+
+def test_gate_up_slab_is_first_read_at_gate_block0_and_last_at_up_last_block():
+    """The streamed slab's wait (first read) and retire (last read) points."""
+    hidden, inter, qb, chunk = 256, 256, 64, 128
+    rng = np.random.default_rng(2)
+    w1, s1 = _weights(rng, hidden, 2 * inter, qb)
+    w2, s2 = _weights(rng, inter, hidden, qb)
+    reads = []
+
+    def rec(w):
+        def read(b, n0, n1):
+            reads.append((b, n0, n1))
+            return jnp.asarray(w[b * qb : (b + 1) * qb, n0:n1])
+        return read
+
+    K.expert_ffn_dequant(
+        jnp.ones((8, hidden), jnp.float8_e4m3fn), None, rec(w1), _reader(w2, qb),
+        jnp.asarray(s1), jnp.asarray(s2), qb=qb, chunk=chunk, stage=None,
+    )
+    assert reads[0] == (0, 0, chunk)
+    assert reads[-1] == (hidden // qb - 1, 2 * inter - chunk, 2 * inter)
+    # every (block, column) of the slab is read exactly once
+    cols = sorted({(b, n0) for b, n0, _ in reads})
+    assert len(cols) == len(reads) == (hidden // qb) * (2 * inter // chunk)
 
 
 class _Info:
@@ -97,8 +124,10 @@ def test_minimax_shape_fits_one_weight_slot_with_the_dequant_stage():
     base = host.fit_weight_slots(16, 128, 6144, 3072, **kw)
     dq = host.fit_weight_slots(16, 128, 6144, 3072, fp4_body="dequant", **kw)
     assert base.fits and dq.fits and dq.nbuf == base.nbuf == 1
-    stage = 6144 * host.FP4_DEQUANT_CHUNK * 2
-    assert dq.vmem_bytes - base.vmem_bytes >= stage
+    # The bf16-dequant body keeps no full-width f32 accumulator, which is
+    # what makes room for a 256-row tile beside the one weight slot.
+    dq256 = host.fit_weight_slots(16, 256, 6144, 3072, fp4_body="dequant", **kw)
+    assert dq256.fits and dq256.nbuf == 1
     names = [n for n, _, _ in host.vmem_scratch_arrays(
         16, 128, 6144, 3072, nbuf=1, weight_format=host.WeightFormat.FP4,
         rhs_qb=128, fp4_body="dequant")]

@@ -76,6 +76,16 @@ logger = init_logger(__name__)
 # is not free to change here alone.
 _TILE_M = 128
 
+
+def _tile_m() -> int:
+    """MOE_FUSED_EP_TILE_M, refused unless a power-of-two multiple of 128."""
+    tile = envs.MOE_FUSED_EP_TILE_M
+    if tile < _TILE_M or tile % _TILE_M or tile & (tile - 1):
+        raise ValueError(
+            f"MOE_FUSED_EP_TILE_M={tile} must be a power-of-two multiple of {_TILE_M}"
+        )
+    return tile
+
 # SMEM used by the resident routing tables and Mosaic's scalar working set,
 # excluding the two fixed token-gather windows. Measured by subtracting the
 # former full token-gather scalar-prefetch table at the allocation boundary.
@@ -194,6 +204,7 @@ def _build_op(
     local_dispatch=False,
     fp4_body="blockscale",
     has_shared=False,
+    tile_m=_TILE_M,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -219,6 +230,7 @@ def _build_op(
         local_dispatch,
         fp4_body,
         has_shared,
+        tile_m,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -251,7 +263,7 @@ def _build_op(
             topk=topk,
             renormalize=renormalize,
             mesh=mesh,
-            capacity=_TILE_M,
+            capacity=tile_m,
             block=None,
             ragged_stride=None,
             weight_format=WeightFormat(weight_format),
@@ -899,7 +911,7 @@ def prebuild_fused_moe_ep(
         ep_sorted_gather_group() if envs.MOE_FUSED_EP_SORTED_GATHER else None
     )
 
-    gather_bytes = token_gather_smem_bytes(_TILE_M)
+    gather_bytes = token_gather_smem_bytes(_tile_m())
     needed_smem = _SMEM_OVERHEAD_BYTES + gather_bytes
     smem = _smem_capacity_bytes()
     if needed_smem > smem:
@@ -1025,6 +1037,7 @@ def prebuild_fused_moe_ep(
         sorted_gather=sorted_gather,
         local_dispatch=local_dispatch,
         fp4_body=fp4_body,
+        tile_m=_tile_m(),
     )
     op = _build_op(*op_args, **op_kw)
     # The shared-folding variant, armed beside the plain op: whether a layer
@@ -1057,7 +1070,7 @@ def prebuild_fused_moe_ep(
         ep,
         pcp,
         topk,
-        _TILE_M,
+        _tile_m(),
         sharded_plan,
         weight_format,
         rhs_qb,

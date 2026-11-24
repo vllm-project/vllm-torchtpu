@@ -402,44 +402,49 @@ def expert_ffn_blockscale(
 FP4_DEQUANT_CHUNK = host.FP4_DEQUANT_CHUNK
 
 
+def _dequant_chunk(read_block, scales, *, qb, k_rows, n_start, n_end, stage):
+    """Weight columns [n_start, n_end) dequantized to bf16, [k_rows, width].
+
+    Every contraction block is read (`read_block(b, n_start, n_end)` -> f32
+    values of the stored element type), multiplied by its block scales and
+    rounded to bf16 -- into `stage` ([K, >= width] bf16 ref) when given, else
+    concatenated as a value.
+    """
+    width = n_end - n_start
+    parts = []
+    for b in range(k_rows // qb):
+        w = (read_block(b, n_start, n_end) * scales[b : b + 1, n_start:n_end]).astype(
+            jnp.bfloat16
+        )
+        if stage is None:
+            parts.append(w)
+        else:
+            stage[pl.ds(b * qb, qb), pl.ds(0, width)] = w
+    if stage is None:
+        return jnp.concatenate(parts, axis=0)
+    return stage[pl.ds(0, k_rows), pl.ds(0, width)]
+
+
 def dequant_contract(lhs, read_block, scales, *, qb, n_out, chunk, stage):
     """lhs @ W, W a block-scaled weight dequantized one output chunk at a time.
 
-    For each chunk of `chunk` output columns, every contraction block is read
-    (`read_block(b, n_start, n_end)` -> the block's columns as f32 values of
-    the stored element type), multiplied by its scales and rounded to bf16
-    into `stage` ([K, >= chunk] bf16 ref, or None to concatenate as values);
-    then ONE full-K bf16 dot contracts the chunk. The block scale is folded
-    into the weight instead of applied to a [rows, chunk] f32 partial after
-    every K=qb dot, so the matrix unit sees K = the whole contraction and the
-    vector unit's per-block work scales with qb rows, not with the tile.
-
-    Blocks are read chunk-major and in block order, the order
-    `expert_ffn_blockscale` reads them in, so a streamed slab's first-read
-    wait and last-read retire land on the same reads.
+    For each chunk of `chunk` output columns the weight is dequantized to
+    bf16 with its block scales folded in (_dequant_chunk), then ONE full-K
+    bf16 dot contracts it. The block scale lands on the weight instead of on
+    a [rows, chunk] f32 partial after every K=qb dot, so the matrix unit
+    sees K = the whole contraction, and the dequant is per weight element --
+    independent of the tile height -- where the per-block scale-accumulate
+    was per output element of every block.
     """
     k_rows = lhs.shape[-1]
-    n_blocks = k_rows // qb
     outs = []
     for n_start in range(0, n_out, chunk):
         n_end = min(n_start + chunk, n_out)
-        width = n_end - n_start
-        parts = []
-        for b in range(n_blocks):
-            w = read_block(b, n_start, n_end) * scales[b : b + 1, n_start:n_end]
-            w = w.astype(jnp.bfloat16)
-            if stage is None:
-                parts.append(w)
-            else:
-                stage[pl.ds(b * qb, qb), pl.ds(0, width)] = w
-        rhs = (
-            jnp.concatenate(parts, axis=0)
-            if stage is None
-            else stage[pl.ds(0, k_rows), pl.ds(0, width)]
+        rhs = _dequant_chunk(
+            read_block, scales, qb=qb, k_rows=k_rows, n_start=n_start,
+            n_end=n_end, stage=stage,
         )
-        outs.append(
-            lax.dot_general(lhs, rhs, DN, preferred_element_type=jnp.float32)
-        )
+        outs.append(lax.dot_general(lhs, rhs, DN, preferred_element_type=jnp.float32))
     return jnp.concatenate(outs, axis=-1) if len(outs) > 1 else outs[0]
 
 
@@ -454,6 +459,7 @@ def expert_ffn_dequant(
     qb=QB4,
     act_fn="silu",
     w1b=None,
+    w2b=None,
     chunk=FP4_DEQUANT_CHUNK,
     stage=None,
 ):
@@ -461,29 +467,66 @@ def expert_ffn_dequant(
 
     The same layer as expert_ffn_blockscale, contracted differently: each
     weight chunk is dequantized with its block scales folded in and
-    contracted in one full-K bf16 dot (dequant_contract); the fp8 token rows
-    widen to bf16 exactly and their row scale is applied to the gate/up
-    accumulator, and the intermediate goes into the down matmul as bf16
-    rather than requantized to fp8. The difference from the fp8 body is the
-    bf16 rounding of each dequantized weight, which is the weight the
-    grouped-matmul path contracts, and no intermediate requantization.
+    contracted in one full-K bf16 dot; the fp8 token rows widen to bf16
+    exactly and their row scale is applied to the gate/up accumulator; the
+    intermediate goes into the down matmul as bf16 rather than requantized
+    to fp8. What differs from the fp8 body is the bf16 rounding of each
+    dequantized weight -- the weight the grouped-matmul path contracts --
+    and no intermediate requantization.
 
-    w1_block / w2_block return a weight k-block's columns as f32. Returns
-    the down matmul's accumulator and None: it is already the true value.
+    The gate/up matmul runs a gate chunk and its up chunk back to back and
+    activates them at once, and the down matmul casts each output chunk to
+    bf16 as it lands, so no full-width f32 accumulator is ever live: that is
+    what lets a 256-row tile fit beside one expert's weight slot. Blocks are
+    still read in block order within each chunk, the gate/up slab's first
+    read is gate chunk 0 block 0 and its last is the last up chunk's last
+    block, so a streamed slab's wait and retire land where the reader
+    expects them.
+
+    w1_block / w2_block return a weight k-block's columns as f32. w2b, the
+    down bias, is added to each f32 chunk before the bf16 cast. Returns the
+    down projection in bf16 (already the true value) and None.
     """
     inter = w1s_blocks.shape[-1] // 2
     hidden = w2s_blocks.shape[-1]
     act = act_q.astype(jnp.bfloat16)
-    acc1 = dequant_contract(
-        act, w1_block, w1s_blocks, qb=qb, n_out=2 * inter, chunk=chunk, stage=stage
+
+    def gate_up(c0, c1):
+        g = lax.dot_general(
+            act,
+            _dequant_chunk(w1_block, w1s_blocks, qb=qb, k_rows=hidden,
+                           n_start=c0, n_end=c1, stage=stage),
+            DN, preferred_element_type=jnp.float32,
+        )
+        u = lax.dot_general(
+            act,
+            _dequant_chunk(w1_block, w1s_blocks, qb=qb, k_rows=hidden,
+                           n_start=inter + c0, n_end=inter + c1, stage=stage),
+            DN, preferred_element_type=jnp.float32,
+        )
+        if act_scale is not None:
+            g, u = g * act_scale, u * act_scale
+        if w1b is not None:
+            g = g + w1b[:, c0:c1]
+            u = u + w1b[:, inter + c0 : inter + c1]
+        return _apply_act(g, u, act_fn).astype(jnp.bfloat16)
+
+    mid = jnp.concatenate(
+        [gate_up(c0, min(c0 + chunk, inter)) for c0 in range(0, inter, chunk)], axis=-1
     )
-    mid, _ = _intermediate_rows(
-        acc1, act_scale, inter, w1s=None, act_fn=act_fn, w1b=w1b, requantize=False
-    )
-    acc2 = dequant_contract(
-        mid, w2_block, w2s_blocks, qb=qb, n_out=hidden, chunk=chunk, stage=stage
-    )
-    return acc2, None
+    downs = []
+    for n_start in range(0, hidden, chunk):
+        n_end = min(n_start + chunk, hidden)
+        d = lax.dot_general(
+            mid,
+            _dequant_chunk(w2_block, w2s_blocks, qb=qb, k_rows=inter,
+                           n_start=n_start, n_end=n_end, stage=stage),
+            DN, preferred_element_type=jnp.float32,
+        )
+        if w2b is not None:
+            d = d + w2b[:, n_start:n_end]
+        downs.append(d.astype(jnp.bfloat16))
+    return jnp.concatenate(downs, axis=-1), None
 
 
 def expert_ffn_bf16(act, w1, w2, act_fn="silu", w1b=None):
@@ -825,6 +868,15 @@ def _build_fused_ep_moe_kernel(
             "a tail tile reads a full window past the shard's last row"
         )
     tile_m = capacity  # the tile height IS the capacity
+    # A scale-mirror sublane holds one tile's tile_m f32. Above one lane
+    # block, an [n, tile_m] f32 HBM array tiles (8, 128) across two or more
+    # lane tiles, and a slice at an arbitrary sublane is then not expressible;
+    # so the mirror is laid out [n, tile_m / 128, 128], which leaves its
+    # sublane axis untiled -- the same reason the row staging is 3-D.
+    mirror_lane_tiles = host.mirror_lane_tiles(tile_m)
+    mirror_minor = (
+        (tile_m,) if mirror_lane_tiles == 1 else (mirror_lane_tiles, HIDDEN_LANE_BLOCK)
+    )
     tile_blocks = tile_m // ROWBLK
     # The mirror's unit is a tile, the run tables' unit is a block, and the
     # kernel converts between them with a shift.
@@ -1691,6 +1743,11 @@ def _build_fused_ep_moe_kernel(
                                 qb=rhs_qb,
                                 act_fn=act_fn,
                                 w1b=w1b_row,
+                                w2b=(
+                                    cast(jax.Ref, w2b_vm)[pl.ds(e, 1), :]
+                                    if has_w2_bias
+                                    else None
+                                ),
                                 chunk=FP4_DEQUANT_CHUNK,
                                 stage=dq_vm,
                             )
@@ -1757,7 +1814,7 @@ def _build_fused_ep_moe_kernel(
                         ),
                         w2b=(
                             cast(jax.Ref, w2b_vm)[pl.ds(e, 1), :]
-                            if has_w2_bias
+                            if has_w2_bias and not dequant_body
                             else None
                         ),
                         wire_dtype=form.wire_dtype,
@@ -1766,13 +1823,27 @@ def _build_fused_ep_moe_kernel(
                     wire_rows_staged = wire_rows.reshape(
                         height, lane_blocks, HIDDEN_LANE_BLOCK
                     )
-                    wire_scales_staged = wire_scales.reshape(1, height)
+                    if mirror_lane_tiles == 1:
+                        wire_scales_staged = wire_scales.reshape(1, height)
+                    else:
+                        # The split mirror is stored whole: pad a short rung's
+                        # scales to the tile; rows past the live ones are never
+                        # read.
+                        wire_scales_staged = jnp.pad(
+                            wire_scales.reshape(1, height),
+                            ((0, 0), (0, tile_m - height)),
+                        ).reshape(1, *mirror_minor)
 
                     def store_parity(static_parity):
                         """Stage the tile's rows and scales in one out_vm
                         slot."""
-                        if full:
-                            out_vm[static_parity] = wire_rows_staged
+                        if full or mirror_lane_tiles > 1:
+                            if full:
+                                out_vm[static_parity] = wire_rows_staged
+                            else:
+                                out_vm[static_parity, pl.ds(0, height)] = (
+                                    wire_rows_staged
+                                )
                             oscl_vm[static_parity] = wire_scales_staged
                         else:
                             out_vm[static_parity, pl.ds(0, height)] = wire_rows_staged
@@ -2096,12 +2167,15 @@ def _build_fused_ep_moe_kernel(
         out_shape = [
             jax.ShapeDtypeStruct((recv_rows, lane_blocks, HIDDEN_LANE_BLOCK), wire),
             jax.ShapeDtypeStruct(
-                (host.arrival_mirror_rows(recv_rows, ep * g_local, tile_m), tile_m),
+                (
+                    host.arrival_mirror_rows(recv_rows, ep * g_local, tile_m),
+                    *mirror_minor,
+                ),
                 jnp.float32,
             ),
             jax.ShapeDtypeStruct((contrib_rows, lane_blocks, HIDDEN_LANE_BLOCK), wire),
             jax.ShapeDtypeStruct(
-                (host.contrib_mirror_rows(contrib_rows, g_local, tile_m), tile_m),
+                (host.contrib_mirror_rows(contrib_rows, g_local, tile_m), *mirror_minor),
                 jnp.float32,
             ),
         ]
@@ -2231,7 +2305,7 @@ def _build_fused_ep_moe_kernel(
             *biases,
         )
         recv, rscl, _contrib, _contrib_scl = res
-        return recv, rscl
+        return recv, rscl.reshape(rscl.shape[0], tile_m)
 
     return fn
 

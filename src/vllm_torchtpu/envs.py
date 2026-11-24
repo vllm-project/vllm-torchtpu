@@ -147,6 +147,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_FP4_BODY: str = "blockscale"
     MOE_FUSED_EP_LOCAL_DISPATCH: bool = False
     MOE_FUSED_EP_FOLD_SHARED: bool = False
+    MOE_FUSED_EP_TILE_M: int = 128
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
@@ -1207,6 +1208,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # beside the routed rows and pay one replica all-gather for both, instead
     # of a separate shared-expert all-reduce.
     "MOE_FUSED_EP_FOLD_SHARED": env_bool("MOE_FUSED_EP_FOLD_SHARED"),
+    # Tile height (rows per FFN tile) of fused EP MoE v2. A power of two and
+    # a multiple of 128; 256 pays off with MOE_FUSED_EP_V2_FP4_BODY=dequant,
+    # whose weight dequant is per tile and independent of its height.
+    "MOE_FUSED_EP_TILE_M": lambda: int(os.getenv("MOE_FUSED_EP_TILE_M", "128")),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the
