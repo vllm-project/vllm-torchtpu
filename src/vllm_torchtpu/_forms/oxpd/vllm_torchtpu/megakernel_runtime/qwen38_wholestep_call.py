@@ -162,6 +162,8 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     if rings:
         nbe, nbd = (int(x) for x in rings.split(":"))
         t = dataclasses.replace(t, nbe=nbe, nbd=nbd)
+    if envs.VLLM_TPU_MK_REL_FETCH_LARGE and B >= 48:
+        t = dataclasses.replace(t, rel_fetch=True)
     return t if not _gdnink_rel_fetch(B) else dataclasses.replace(t, rel_fetch=True)  # q38 L1-GDNINK (GDN-REL-FETCH), same line
 
 

@@ -660,6 +660,11 @@ if TYPE_CHECKING:
     # q38 PORT-BL UNION (ported from Benliang Wang, 2ce02bb1a)
     VLLM_TPU_QSA_DECODE_RPA_UNION_O1S: int = 0
     VLLM_TPU_RPA_SCHEDULE_HBM_O1S: bool = False
+    # q38 internal-v3 GDN/QSA ports (begin)
+    VLLM_TPU_MK_WHOLE_MAX_ROWS: int = 96
+    VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE: bool = False
+    VLLM_TPU_MK_REL_FETCH_LARGE: bool = False
+    # q38 internal-v3 GDN/QSA ports (end)
 
 
 def env_with_choices(
@@ -3741,6 +3746,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # every QSA decode RPA call; this one leaves the MTP draft, D14 and prefill programs alone (PORT-BL rule 3).
     # Changes the traced program, so hashed. Default off.
     "VLLM_TPU_RPA_SCHEDULE_HBM_O1S": env_bool("VLLM_TPU_RPA_SCHEDULE_HBM_O1S"),
+    # q38 internal-v3 GDN/QSA ports (begin)
+    # Largest whole-step bucket: default 96, at most 128 (the megakernel's row limit);
+    # 0 = default (96). Under main-KV DCP-2/4 above 96 rows, also consider
+    # VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE=1 (or explicit VLLM_TPU_MK_RINGS).
+    "VLLM_TPU_MK_WHOLE_MAX_ROWS": env_nonnegative_int("VLLM_TPU_MK_WHOLE_MAX_ROWS", 96),
+    # Main-KV DCP > 1 whole-step buckets of 128+ rows: one fewer expert ring slot
+    # (nbe - 1, >= 2, saving 2 MiB w1/w3 + 1 MiB w2 VMEM) so the plan fits scoped VMEM.
+    # Scheduling only. Default off.
+    "VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE": env_bool("VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE"),
+    # Default-off: enable exact `Tiles.rel_fetch=True` (trace-time-decoded dense
+    # ring refills) on whole-step buckets B >= 48 (48..128; bit-exact). Note:
+    # incompatible with VLLM_TPU_MK_L47_FOLD=1 (L=45 partial last cycle asserts
+    # rel_fetch off in planner.py). Preserves VLLM_TPU_MK_GDN_INK bit 2 (all B).
+    "VLLM_TPU_MK_REL_FETCH_LARGE": env_bool("VLLM_TPU_MK_REL_FETCH_LARGE"),
+    # q38 internal-v3 GDN/QSA ports (end)
 }
 
 
