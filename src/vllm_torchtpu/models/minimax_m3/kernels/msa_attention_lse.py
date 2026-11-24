@@ -33,6 +33,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels import tight_vmem
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import page_table as page_table_lib
 
 logger = init_logger(__name__)
 
@@ -719,7 +720,9 @@ def _kernel(
                 kv_head = group_head(group)
 
                 def start(g, carry):
-                    page = page_table_ref[work_page_ref[base + g]]
+                    page = page_table_lib.load(
+                        page_table_ref, work_page_ref[base + g]
+                    )
                     for copy in page_copies(
                         stream_at(half, g), (half, g), page, kv_head
                     ):
@@ -755,7 +758,9 @@ def _kernel(
                 kv_head = group_head(group)
 
                 def start(g, queue=0):
-                    page = page_table_ref[work_page_ref[base + g]]
+                    page = page_table_lib.load(
+                        page_table_ref, work_page_ref[base + g]
+                    )
                     for copy in page_copies(
                         (half, pl.ds(g, 1), 0), (half, 0), page, kv_head
                     ):
@@ -815,7 +820,10 @@ def _kernel(
             def _fill():
                 def start(i, carry):
                     for copy in page_copies(
-                        (i,), cache_sem, page_table_ref[cache_ref[i]], head_ref[0]
+                        (i,),
+                        cache_sem,
+                        page_table_lib.load(page_table_ref, cache_ref[i]),
+                        head_ref[0],
                     ):
                         copy.start()
                     return carry
@@ -1346,7 +1354,7 @@ def _pair_loop(
         kv_head = group_head(group_id)
 
         def one(g, queue=0):
-            page = page_table_ref[work_page_ref[base + g]]
+            page = page_table_lib.load(page_table_ref, work_page_ref[base + g])
             for copy in copies(slot, slot, page, kv_head, g=g):
                 copy.start(priority=queue)
 
@@ -2253,7 +2261,7 @@ def _chunked_call(
             packed[:, :union_len],
             num_tiles=step // block_q,
             cache_size=cache_size,
-            key_bound=page_table.shape[0],
+            key_bound=page_table_lib.num_keys(page_table),
             tile_pages=page_cache_tile_pages,
         )
         packed = jnp.concatenate(

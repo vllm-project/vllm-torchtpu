@@ -59,6 +59,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_dcp,
     msa_fp4,
 )
+from vllm_torchtpu.models.minimax_m3.kernels import page_table as page_table_lib
 
 FUSED_ENV = "TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS"
 # The fused call's barrier semaphore (the DCP pair's exchange kernels and the
@@ -495,7 +496,7 @@ def fused_attend_and_merge(
         name="minimax_m3_msa_dcp_fused_decode",
     )(
         rank,
-        block_tables.reshape(-1),
+        page_table_lib.prefetch(block_tables, kv_cache.shape[0]),
         jnp.zeros((2,), jnp.int32),
         jnp.zeros((1,), jnp.int32),
         q,

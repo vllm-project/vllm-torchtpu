@@ -40,6 +40,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import page_table as page_table_lib
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
     check_page_dtype,
     unpack_page,
@@ -649,7 +650,8 @@ def _kernel_v3(
     folded = msa_fp4.scales_in_page(rows, cache_ref.dtype)
     page_size = _page_tokens(rows, cache_ref.dtype)
     chunk = _v3_chunk(pages_per_step, block_q, page_size)
-    pages_per_seq = block_tables_ref.shape[0] // seq_pages_ref.shape[0]
+    num_keys = page_table_lib.num_keys(block_tables_ref)
+    pages_per_seq = num_keys // seq_pages_ref.shape[0]
     step, num_steps = pl.program_id(0), pl.num_programs(0)
     # The pages as 32-bit words: a dense VMEM layout, so each key vreg is one
     # load (a packed [S / p, p, D] page tiles VMEM in (p, D) tiles).
@@ -662,14 +664,26 @@ def _kernel_v3(
         first = (entry & _GROUP_MASK) * pages_per_step
         return seq * pages_per_seq + first, jnp.maximum(seq_pages_ref[seq] - first, 1)
 
-    def copy(base, g, slot):
-        col = g
+    # A group's pages in one half of a packed table: one half test per group.
+    run_safe = page_table_lib.run_safe(block_tables_ref, pages_per_seq, pages_per_step)
+
+    def page(base, g, run=None):
+        if run_safe:
+            if run is None:
+                run = page_table_lib.run_start(block_tables_ref, base)
+            return page_table_lib.load_run(block_tables_ref, run, g)
+        return page_table_lib.load(block_tables_ref, base + g)
+
+    def copy(base, g, slot, run=None):
         if pages_per_seq % pages_per_step and not noclamp:
             # Keep the last group's block-table reads in its request's row.
             first = base % pages_per_seq
             col = jnp.minimum(first + g, pages_per_seq - 1) - first
+            index = page_table_lib.load(block_tables_ref, base + col)
+        else:
+            index = page(base, g, run)
         return pltpu.make_async_copy(
-            words.at[block_tables_ref[base + col]],
+            words.at[index],
             buf.at[slot, g],
             sems.at[slot],
         )
@@ -700,9 +714,11 @@ def _kernel_v3(
         """Start the copies of a group's `pages` that are below its `live`
         pages, alternate pages on the second DMA queue (priority 1). With
         `full` (static) every page is live: no predicates."""
+        # The group's table run, set up once for all its page reads.
+        run = page_table_lib.run_start(block_tables_ref, base) if run_safe else None
         if full:
             for g in pages:
-                copy(base, g, slot).start(priority=g % 2)
+                copy(base, g, slot, run).start(priority=g % 2)
             return
         if fast_issue:
             full = live >= pages_per_step
@@ -713,19 +729,19 @@ def _kernel_v3(
                 # inside its block-table row.
                 for g in pages:
                     pltpu.make_async_copy(
-                        words.at[block_tables_ref[base + g]],
+                        words.at[page(base, g, run)],
                         buf.at[slot, g],
                         sems.at[slot],
                     ).start(priority=g % 2)
 
             for g in pages:
                 pl.when((g < live) & jnp.logical_not(full))(
-                    functools.partial(copy(base, g, slot).start, priority=g % 2)
+                    functools.partial(copy(base, g, slot, run).start, priority=g % 2)
                 )
             return
         for g in pages:
             pl.when(g < live)(
-                functools.partial(copy(base, g, slot).start, priority=g % 2)
+                functools.partial(copy(base, g, slot, run).start, priority=g % 2)
             )
 
     def ahead_group(k):
@@ -1089,6 +1105,8 @@ def _class_scores(
     max_num_seqs = seq_lens.shape[0]
     pages_per_seq = block_tables.shape[0] // max_num_seqs
     num_groups_per_seq = -(-pages_per_seq // pages_per_step)
+    # The kernels' SMEM table (16-bit with TPU_MINIMAX_M3_PT16).
+    table = page_table_lib.prefetch(block_tables, index_cache.shape[0])
     padded_pages = num_groups_per_seq * pages_per_step
 
     tile_seq, tile_row0, first_tile, tile_start, num_tiles = _tiles(
@@ -1140,7 +1158,8 @@ def _class_scores(
             col = jnp.minimum(
                 (entry & _GROUP_MASK) * pages_per_step + g, pages_per_seq - 1
             )
-            return (block_tables[seq * pages_per_seq + col], 0, 0, 0)
+            page = page_table_lib.load(block_tables, seq * pages_per_seq + col)
+            return (page, 0, 0, 0)
 
         return pl.BlockSpec((1, rows_per_page, packing, head_dim), index_map)
 
@@ -1267,7 +1286,7 @@ def _class_scores(
             compiler_params=params,
             interpret=interpret,
             name="minimax_m3_msa_block_scores",
-        )(work, tile_info, block_tables, seq_pages, q_rows, index_cache)
+        )(work, tile_info, table, seq_pages, q_rows, index_cache)
     else:
         kernel_fn = _KERNELS[kernel]
         if fp4:
@@ -1282,7 +1301,7 @@ def _class_scores(
         )(
             work,
             tile_info,
-            block_tables,
+            table,
             q_rows,
             *([index_cache] * pages_per_step),
             *([scale_cache] * (pages_per_step if fp4 else 0)),
