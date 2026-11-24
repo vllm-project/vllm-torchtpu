@@ -848,50 +848,54 @@ def attend_pages(
 
         def attend():
             cache_len = cache_ref[r]
-            col = jax.lax.broadcasted_iota(jnp.int32, (1, keys), 1)
-            row_k = jax.lax.broadcasted_iota(jnp.int32, (keys, 1), 0)
-            q_tok = jax.lax.broadcasted_iota(jnp.int32, (rows, 1), 0) // num_heads
+            # Window row page_rows * c + j is page c's word row j: its keys'
+            # positions are the page's first block plus a per-lane offset.
+            lane = jax.lax.broadcasted_iota(jnp.int32, (1, page_rows), 1)
+            tok = jax.lax.broadcasted_iota(jnp.int32, (q_block, 1), 0)
             # [L * S * words, width] u32: one word row each, `packing` entries
             # (token-head h's K and V at 2h, 2h + 1), lowest bits first.
             kv_u32 = buf.at[slot].bitcast(jnp.uint32).reshape(keys, width)[...]
             # [Q, H, D] -> [Q * H, D]: row q * H + h is token q, head h.
             qv = q_buf[slot].reshape(rows, head_dim).astype(mxu_dtype)
 
-            def key_positions(index, half):
-                """Global position of half `half` of each word row ``index``."""
-                pos = jnp.zeros(index.shape, jnp.int32)
-                for c in range(num_cols):
-                    token_head = (index - c * page_rows) * halves + half
-                    block = (
-                        blocks_ref[r * num_cols + c]
-                        + token_head // page_size * head_ranks
-                    )
-                    pos = jnp.where(
-                        index // page_rows == c,
-                        block * page_size + token_head % page_size,
-                        pos,
-                    )
-                return pos
+            def key_positions(half):
+                """[1, keys] global position of half `half` of each word row."""
+                token_head = lane * halves + half
+                offset = (
+                    token_head // page_size * head_ranks * page_size
+                    + token_head % page_size
+                )
+                return jnp.concatenate(
+                    [
+                        blocks_ref[r * num_cols + c] * page_size + offset
+                        for c in range(num_cols)
+                    ],
+                    axis=1,
+                )
 
             scores, values = [], []
             for half in range(halves):
-                k_pos = key_positions(col, half)
+                k_pos = key_positions(half)
+                # Visibility depends on the query token only, not on its head:
+                # [Q, keys], broadcast over the heads below.
                 visible = (
                     (k_pos < cache_len)
-                    & (cache_len + q_tok - k_pos < sliding_window)
-                    & (q_tok < qlen_ref[r])
+                    & (cache_len + tok - k_pos < sliding_window)
+                    & (tok < qlen_ref[r])
                 )
                 # Masked keys must hold finite values (the cache is
                 # zero-initialised and writes clip): an add, unlike a select,
-                # would carry a NaN score through.
+                # would carry a NaN score through. The same holds for their
+                # values, so P = 0 there needs no mask on V.
                 bias = jnp.where(visible, 0.0, _NEG_INF)
                 k = unpack(kv_u32, 2 * half)[:, :head_dim].astype(mxu_dtype)
-                v = unpack(kv_u32, 2 * half + 1)[:, :head_dim].astype(jnp.float32)
-                values.append(jnp.where(key_positions(row_k, half) < cache_len, v, 0.0))
+                values.append(
+                    unpack(kv_u32, 2 * half + 1)[:, :head_dim].astype(jnp.float32)
+                )
                 s = jax.lax.dot_general(
                     qv, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-                )
-                scores.append(s * k_mult + bias)
+                ).reshape(q_block, num_heads, keys)
+                scores.append(s * k_mult + bias[:, None, :])
             m = functools.reduce(
                 jnp.maximum, [jnp.max(s, axis=-1, keepdims=True) for s in scores]
             )
@@ -899,12 +903,15 @@ def attend_pages(
             probs = [jnp.exp(s - m_safe) for s in scores]
             denom = functools.reduce(
                 jnp.add, [jnp.sum(p, axis=-1, keepdims=True) for p in probs]
-            )
+            ).reshape(rows, 1)
+            m_safe = m_safe.reshape(rows, 1)
             safe = jnp.where(denom > 0, denom, 1.0)
             out = functools.reduce(
                 jnp.add,
                 [
-                    jnp.dot(p, v, preferred_element_type=jnp.float32)
+                    jnp.dot(
+                        p.reshape(rows, keys), v, preferred_element_type=jnp.float32
+                    )
                     for p, v in zip(probs, values)
                 ],
             )
