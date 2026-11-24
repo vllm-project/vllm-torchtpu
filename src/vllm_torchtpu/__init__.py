@@ -1647,6 +1647,54 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     )
 
 
+def _align_raiden_num_blocks(
+    original, configs, vllm_config, kv_cache_specs, available_memory
+):
+    """Round KV num_blocks down to a multiple of TPU_KV_NUM_BLOCKS_ALIGN (16).
+
+    tpu-sync's KVCacheManager checks that every registered storage's on-device
+    size is a whole number of rows at its major dimension. DSv4.1 has a 1-D
+    INT32 storage of num_blocks * 64 words, and the device pads 1-D INT32
+    arrays to 1024-element tiles, so the check only passes when num_blocks is
+    a multiple of 16. Any other num_blocks (e.g. after Engram's HBM table takes
+    part of the KV budget) fails the D/P startup with "Layer N on-device size
+    ... is not a whole number of blocks at major dimension ...". When the
+    Raiden KV cache manager is in use and the user did not pin the block count,
+    resolve the configs again with the rounded-down count, so every tensor
+    size follows it.
+    """
+    import os
+
+    from vllm_torchtpu import envs
+
+    align = int(os.environ.get("TPU_KV_NUM_BLOCKS_ALIGN", "16"))
+    cache_config = vllm_config.cache_config
+    if (
+        align <= 1
+        or not envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER
+        or cache_config.num_gpu_blocks_override is not None
+        or not configs
+    ):
+        return configs
+    num_blocks = min(int(c.num_blocks) for c in configs)
+    if num_blocks % align == 0 or num_blocks < align:
+        return configs
+    aligned = num_blocks - num_blocks % align
+    cache_config.num_gpu_blocks_override = aligned
+    try:
+        configs = original(vllm_config, kv_cache_specs, available_memory)
+    finally:
+        cache_config.num_gpu_blocks_override = None
+    logger.info(
+        "Raiden KV cache: num_blocks %d -> %d (multiple of %d for tpu-sync "
+        "storage row alignment)",
+        num_blocks,
+        aligned,
+        align,
+    )
+    return configs
+
+
 def _patch_vllm_merge_dsv41_swa_groups() -> None:
     """Give identical DeepSeek-V4.1 SWA layers one KV cache group.
 
@@ -1671,6 +1719,9 @@ def _patch_vllm_merge_dsv41_swa_groups() -> None:
         @functools.wraps(original)
         def patched(vllm_config, kv_cache_specs, available_memory):
             configs = original(vllm_config, kv_cache_specs, available_memory)
+            configs = _align_raiden_num_blocks(
+                original, configs, vllm_config, kv_cache_specs, available_memory
+            )
             return [merge_swa_groups(config) for config in configs]
 
         # pyrefly: ignore[missing-attribute]
