@@ -79,7 +79,7 @@ def vmem_bytes(n: int, rows: int, slots: int, rank_dim: int, vocab_shard: int):
     chunk = chunk_lanes(vocab_shard)
     return (
         _BUFFERS * (rank_dim + rows_p) * chunk * 2  # shard and logits chunks
-        + 6 * rows_p * chunk * 4  # f32 temporaries of one chunk
+        + 6 * rows_p * chunk * 4  # f32 temporaries, running best and column
         + rows * _ROWS * rank_dim * 2  # embedding tiles
         + (slots * (n + 1) + 1) * rows_p * _LANES * 4  # pair and id tiles
         + (2 << 20)  # headroom for Mosaic's own scratch
@@ -119,6 +119,8 @@ def _call(n: int, rows: int, slots: int, rank_dim: int, vocab: int, vocab_shard:
         out_ref,  # VMEM [rows_p, 128] int32
         w2_buf,
         logits_buf,
+        best_v,
+        at_v,
         emb_tiles,
         send,
         recv,
@@ -196,8 +198,12 @@ def _call(n: int, rows: int, slots: int, rank_dim: int, vocab: int, vocab_shard:
                 emb = jnp.where(emb_row == r, row, emb)
             emb = emb.astype(BF16)
 
+            # Per lane position, the best score over the chunks so far and its
+            # column: the cross-lane reduction runs once a slot, not per chunk.
+            best_v[...] = jnp.full(best_v.shape, -jnp.inf, F32)
+            at_v[...] = jnp.zeros(at_v.shape, I32)
+
             def chunk_step(c, carry, s=s, emb=emb):
-                best, at = carry
                 g = s * chunks + c
                 buf = g % _BUFFERS
                 for copy in loads(s, c, buf):
@@ -215,24 +221,20 @@ def _call(n: int, rows: int, slots: int, rank_dim: int, vocab: int, vocab_shard:
                 logits = logits_buf[buf, :rows_c].astype(F32)
                 scores = logits + bias.astype(BF16).astype(F32)
                 scores = scores.astype(BF16).astype(F32)
-                top = jnp.max(scores, axis=1, keepdims=True)
-                top_at = jnp.min(
-                    jnp.where(scores == top, lane, big), axis=1, keepdims=True
-                )
-                # Strictly greater: an earlier chunk keeps a tie (first index).
-                # A chunk whose max is NaN is skipped (NaN > x is false).
-                better = top > best
-                return (
-                    jnp.where(better, top, best),
-                    jnp.where(better, top_at + c * chunk, at),
-                )
+                # Strictly greater: an earlier chunk keeps a tie (first index);
+                # a NaN score never replaces one.
+                better = scores > best_v[...]
+                best_v[...] = jnp.where(better, scores, best_v[...])
+                at_v[...] = jnp.where(better, lane + c * chunk, at_v[...])
+                return carry
 
-            init = (
-                jnp.full((rows_c, 1), -jnp.inf, F32),
-                jnp.zeros((rows_c, 1), I32),
+            lax.fori_loop(0, chunks, chunk_step, 0)
+            lanes_best = best_v[...]
+            best = jnp.max(lanes_best, axis=1, keepdims=True)
+            at = jnp.min(
+                jnp.where(lanes_best == best, at_v[...], big), axis=1, keepdims=True
             )
-            best, at = lax.fori_loop(0, chunks, chunk_step, init)
-            # A NaN matches no lane: its row's id stays a real one of the shard.
+            # A row with no finite score picks column 0; clamped to a real id.
             gid = (jnp.minimum(at, valid - 1) + first_id).astype(F32)
             send[s, :rows_c] = jnp.where(pair_lane[:rows_c] == 0, best, gid)
 
@@ -257,8 +259,8 @@ def _call(n: int, rows: int, slots: int, rank_dim: int, vocab: int, vocab_shard:
 
             # The lowest id among the maxima: the shards hold increasing ids
             # by TP rank, so this is the first rank torch.argmax picks over the
-            # rank-major gathered pairs, whatever the mesh order. Clipped: with
-            # a NaN max no id matches, and the next slot DMAs this id's row.
+            # rank-major gathered pairs, whatever the mesh order. Clipped only
+            # to keep the next slot's embedding DMA in range.
             pairs = recv[s]
             maxima = pairs[:, :, 0:1]
             top = jnp.max(maxima, axis=0)
@@ -288,6 +290,8 @@ def _call(n: int, rows: int, slots: int, rank_dim: int, vocab: int, vocab_shard:
             scratch_shapes=[
                 pltpu.VMEM((_BUFFERS, rank_dim, chunk), BF16),
                 pltpu.VMEM((_BUFFERS, rows_p, chunk), BF16),
+                pltpu.VMEM((rows_c, chunk), F32),
+                pltpu.VMEM((rows_c, chunk), I32),
                 pltpu.VMEM((rows, _ROWS, rank_dim), BF16),
                 pltpu.VMEM((slots, rows_p, _LANES), F32),
                 pltpu.VMEM((slots, n, rows_p, _LANES), F32),

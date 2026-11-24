@@ -1238,7 +1238,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
     # Run a vocab-parallel DSpark draft's greedy Markov chain as one Pallas
     # call (spec_decode/markov_argmax_chain.py) instead of one all-gather and
-    # a chain of small ops per draft slot. Same ids; 0 keeps the per-slot loop.
+    # a chain of small ops per draft slot. Same ids (but on rows with NaN
+    # logits); 0 keeps the per-slot loop.
     "VLLM_TPU_DSPARK_MARKOV_CHAIN": env_bool(
         "VLLM_TPU_DSPARK_MARKOV_CHAIN", default=True
     ),

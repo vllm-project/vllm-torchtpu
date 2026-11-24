@@ -46,7 +46,8 @@ logger = init_logger(__name__)
 SELFTEST_TIMEOUT_S = 900
 # Of the TensorCore's VMEM, what the kernel may declare.
 _VMEM_SHARE = 0.75
-_SELFTEST_ROWS = (1, 3)
+# Row counts whose math rows (padded to 8) are 8, 16 and 24, beside max_rows.
+_SELFTEST_ROWS = (1, 9, 17)
 
 
 def _make_op(mesh):
@@ -147,7 +148,10 @@ def _selftest(
     generator = torch.Generator().manual_seed(0)
     faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
     try:
-        for rows in (*_SELFTEST_ROWS, chain.max_rows):
+        for rows in (
+            *(r for r in _SELFTEST_ROWS if r < chain.max_rows),
+            chain.max_rows,
+        ):
             full = torch.randn(rows, slots, vocab, generator=generator)
             prev = torch.randint(0, vocab, (rows,), generator=generator)
             full = full.to(dtype=w2.dtype, device=w2.device)

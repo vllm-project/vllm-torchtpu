@@ -147,9 +147,11 @@ def _worker():
         want = _reference(logits, w2, w1, prev)
         same = all(np.array_equal(out[d], out[0]) for d in range(N_RANKS))
         if kind == "nan":
-            # Rows 0-1 meet NaNs: any real id will do; row 2 has none.
+            # Rows 0-1 meet NaNs: any real id will do from row 0's slot 2 and
+            # in row 1; row 0's slots before it and row 2 match.
             ok = (out[0] >= 0).all() and (out[0] < w2.shape[0]).all()
-            exact = same and ok and np.array_equal(out[0][2], want[2])
+            clean = np.array_equal(out[0][0, :2], want[0, :2])
+            exact = same and ok and clean and np.array_equal(out[0][2], want[2])
         else:
             exact = same and np.array_equal(out[0], want)
         result[_key(rows, vocab_shard, kind, pad)] = dict(
