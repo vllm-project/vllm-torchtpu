@@ -647,3 +647,37 @@ def test_pending_or_metadata_only_baseline_is_refused(tmp_path, monkeypatch, cap
 
         assert _run_cli(monkeypatch, mode, results_dir, metadata_only) == 3
         assert "no entries besides metadata" in capsys.readouterr().err
+
+
+def test_check_eval_reads_the_run_under_the_baselines_metric():
+    """A run reporting several filters is compared on the one the baseline
+    was calibrated on, and fails when it lacks that one."""
+    run = {
+        "gsm8k": {
+            "exact_match,strict-match": 0.50,
+            "exact_match_stderr,strict-match": 0.004,
+            "exact_match,flexible-extract": 0.97,
+            "exact_match_stderr,flexible-extract": 0.004,
+        }
+    }
+    flexible = {
+        "gsm8k": {
+            "exact_match,flexible-extract": 0.97,
+            "exact_match_stderr,flexible-extract": 0.004,
+        }
+    }
+    result = check_regression.check_eval(run, flexible, tolerance=0.02)
+    assert not result
+    assert result.rows[0].metric == "exact_match,flexible-extract"
+    assert result.rows[0].actual == 0.97
+
+    strict = {
+        "gsm8k": {
+            "exact_match,strict-match": 0.97,
+            "exact_match_stderr,strict-match": 0.004,
+        }
+    }
+    only_flexible = {"gsm8k": dict(flexible["gsm8k"])}
+    result = check_regression.check_eval(only_flexible, strict, tolerance=0.02)
+    assert result.failed_count == 1
+    assert result.rows[0].metric == "(no exact_match,strict-match in result)"

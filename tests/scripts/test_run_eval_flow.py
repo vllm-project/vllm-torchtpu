@@ -85,6 +85,8 @@ def sandbox(tmp_path: pathlib.Path) -> pathlib.Path:
         _FAKE_LM_EVAL.format(python=sys.executable, metric=_METRIC),
     )
     _executable(bin_dir / "stdbuf", _FAKE_STDBUF)
+    # `vllm bench serve` for a run that benchmarks: writes no result cell.
+    _executable(bin_dir / "vllm", "#!/bin/bash\nexit 0\n")
     # run_benchmarks.sh only checks that a vllm package can be found.
     stub = tmp_path / "stub"
     (stub / "vllm").mkdir(parents=True)
@@ -107,7 +109,13 @@ def _write_baseline(root: pathlib.Path, body: dict) -> None:
     path.write_text(json.dumps(body))
 
 
-def _run(root: pathlib.Path, *flags: str, score: float = 0.9, **env: str):
+def _run(
+    root: pathlib.Path,
+    *flags: str,
+    score: float = 0.9,
+    benchmark: bool = False,
+    **env: str,
+):
     tmp = root.parent
     run_env = dict(os.environ)
     run_env.update(
@@ -133,8 +141,7 @@ def _run(root: pathlib.Path, *flags: str, score: float = 0.9, **env: str):
             _CONFIG,
             "--results-dir",
             str(results),
-            "--run-lm-eval",
-            "--skip-benchmark",
+            *(() if benchmark else ("--run-lm-eval", "--skip-benchmark")),
             "--skip-db-upload",
             "--host",
             "127.0.0.1",
@@ -216,3 +223,24 @@ def test_measured_baseline_gates_both_ways(sandbox):
     proc, _ = _run(sandbox, *gate, score=0.85)
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "::error::Eval regression check failed for toy_task" in proc.stdout
+
+
+def test_required_perf_baseline_missing_fails_the_benchmark(sandbox):
+    """With the benchmark on and no perf baseline file, --require-baselines
+    fails the run; without it the perf check is skipped, as before."""
+    (sandbox / _BENCH / "configs" / f"{_CONFIG}.sh").write_text(
+        """MODEL="toy/model"
+RANDOM_RANGE_RATIO="0.0"
+EVAL_TOLERANCE="0.01"
+ISL_OSL_CONFIGS="8:8"
+CONCURRENCY_OPTIONS="1"
+NUM_PROMPTS=1
+"""
+    )
+    proc, _ = _run(sandbox, benchmark=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "No perf baseline" not in proc.stdout
+
+    proc, _ = _run(sandbox, "--require-baselines", benchmark=True)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "::error::No perf baseline at" in proc.stdout

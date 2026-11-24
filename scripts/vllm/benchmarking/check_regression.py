@@ -414,12 +414,20 @@ def check_eval(
             rows.append(EvalRow(task, "(no result)", "FAIL", **defaults))
             continue
 
-        r = primary_metric(results[task])
-        if b is None or r is None:
+        if b is None:
             rows.append(EvalRow(task, "(no acc)", "SKIP", **defaults))
             continue
+        # The run's value under the baseline's own metric: a run that reports
+        # several (gsm8k's strict-match and flexible-extract) must not be
+        # compared on another one than the baseline was calibrated on.
+        actual = results[task].get(metric_name)
+        if not isinstance(actual, (int, float)):
+            rows.append(
+                EvalRow(task, f"(no {metric_name} in result)", "FAIL", **defaults)
+            )
+            continue
 
-        delta = r.value - b.value
+        delta = actual - b.value
         # Epsilon guards the exactly-at-tolerance case against binary
         # floating-point error (e.g. 0.88 - 0.90 = -0.020000000000000018).
         status = "PASS" if delta >= -allowed_drop - FLOAT_EPSILON else "FAIL"
@@ -428,7 +436,7 @@ def check_eval(
                 task,
                 metric_name,
                 status,
-                actual=r.value,
+                actual=actual,
                 baseline=b.value,
                 delta=delta,
                 **defaults,
