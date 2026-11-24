@@ -286,6 +286,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_WRITE_RUNS_IN_KERNEL_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS: int = 0
+    TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MIN_TOKENS: int = 0
     TPU_MINIMAX_M3_MSA_PREFILL_ADAPTIVE: str = ""
     TPU_MINIMAX_M3_DCP_MERGE_LANE_SELECT: bool = False
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
@@ -1875,6 +1876,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # off.
     "TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS", 0
+    ),
+    # With TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MAX_TOKENS: split only steps of at
+    # least this many tokens (the split pays two TP all-gathers per layer, a
+    # loss on small steps); smaller steps keep the default scoring. 0
+    # (default) = no lower bound.
+    "TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MIN_TOKENS", 0
     ),
     # MiniMax M3 4-bit MSA prefill attention with a page cache:
     # "<threshold>:<block_q>:<tile_pages>" runs a call whose selections hold

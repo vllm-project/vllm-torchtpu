@@ -1303,7 +1303,9 @@ def _get_msa_dcp_fp4_op(
             split_score_op is not None
             and dcp_lane is not None
             and index_reuse is None
-            and 0 < k.shape[0] <= split_max
+            and max(1, envs.TPU_MINIMAX_M3_MSA_INDEX_SPLIT_MIN_TOKENS)
+            <= k.shape[0]
+            <= split_max
             and not msa_indexer.is_prefill_step(
                 kv_heads * k.shape[0], metadata.seq_lens.shape[0]
             )
