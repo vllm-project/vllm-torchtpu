@@ -139,6 +139,7 @@ if TYPE_CHECKING:
     VLLM_TPU_GDN_PREFILL_BF16_QKV_2D: bool = False
     VLLM_TPU_GDN_PREFILL_DENSE_CONV: bool = False
     VLLM_TPU_GDN_PREFILL_QKV_FROM_PROJ: bool = False
+    VLLM_TPU_GDN_DIRECT_SOLVE: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_TOPK_STATS: int = 0
@@ -727,6 +728,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the PER_SEQ kernel DMA the q|k|v columns from it, instead of copying the
     # [tokens, qkv] slice out at the op boundary (as_strided.qkv_ref).
     "VLLM_TPU_GDN_PREFILL_QKV_FROM_PROJ": env_bool("VLLM_TPU_GDN_PREFILL_QKV_FROM_PROJ"),
+    # Chunked GDN v3 prefill direct-solve stack (Caslyn Tonelli, upstream 4-PR
+    # stack ed54e5b64e..fab1042538): factor K @ K^T by KQ head group, project
+    # [K; Q] against state before the triangular solve, pair sibling V heads
+    # (256-col MXU when v_per_kq_head is even and v_head_dim % 128 == 0), and
+    # solve (I + L) @ x = v_diff directly without materializing T^-1.
+    # Default off keeps the stock invert_triangular_matrix path unchanged.
+    "VLLM_TPU_GDN_DIRECT_SOLVE": env_bool("VLLM_TPU_GDN_DIRECT_SOLVE", default=False),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.

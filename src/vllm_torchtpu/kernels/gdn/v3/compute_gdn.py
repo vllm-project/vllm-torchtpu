@@ -15,6 +15,7 @@
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.gdn.v3 import config
 
 
@@ -86,6 +87,224 @@ def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     return jnp.concatenate(x_blocks, axis=1)
 
 
+def solve_triangular_rhs(
+    strict_lower: jax.Array, rhs: jax.Array, block_size: int
+) -> jax.Array:
+    """Solves the unit lower-triangular system (I + L) @ x = rhs in blocks.
+
+    Ported from Caslyn Tonelli's GDN v3 direct-solve stack (`fab1042538`).
+
+    Args:
+        strict_lower: L, the strictly lower-triangular part of the system
+            matrix, [num_heads, chunk, chunk]. Its diagonal and upper triangle
+            must be zero; the unit diagonal is implicit.
+        rhs: Right-hand side [num_heads, chunk, n].
+        block_size: Diagonal block size B. Blocks are solved in order; each
+            block first removes the coupling to the already-solved rows with
+            one matmul and then runs a dense in-block forward substitution.
+
+    Returns:
+        x with the dtype of `strict_lower`.
+    """
+    out_dtype = strict_lower.dtype
+    chunk = strict_lower.shape[-1]
+    block_size = min(block_size, chunk)
+    num_blocks = (chunk + block_size - 1) // block_size
+    rhs_f32 = rhs.astype(jnp.float32)
+
+    def local_forward_sub(l_block: jax.Array, b_block: jax.Array) -> jax.Array:
+        # Column-oriented (right-looking) substitution over the whole dense
+        # [num_heads, B, n] block: after step j, row j is final and the rows
+        # below it have column j's contribution removed. Rows <= j are
+        # untouched because their coefficient in the strictly lower block is
+        # zero, so each step is one multiply-subtract over B rows held densely
+        # in sublanes.
+        x = b_block
+        for j in range(l_block.shape[1] - 1):
+            x = x - l_block[:, :, j : j + 1] * x[:, j : j + 1, :]
+        return x
+
+    x_blocks = []
+    for i in range(num_blocks):
+        start = i * block_size
+        end = min((i + 1) * block_size, chunk)
+        target_b = rhs_f32[:, start:end, :]
+        if i > 0:
+            solved_x = jnp.concatenate(x_blocks, axis=1)
+            prev_sum = jax.lax.dot(
+                strict_lower[:, start:end, :start],
+                solved_x,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+            target_b = target_b - prev_sum
+
+        l_block = strict_lower[:, start:end, start:end].astype(jnp.float32)
+        x_blocks.append(local_forward_sub(l_block, target_b).astype(out_dtype))
+
+    return jnp.concatenate(x_blocks, axis=1)
+
+
+def _pack_v_head_pairs(x: jax.Array, v_per_kq_head: int) -> jax.Array:
+    """Packs the two V-head halves of each KQ head group along the lane axis."""
+    half_v = v_per_kq_head // 2
+    group_starts = range(0, x.shape[0], v_per_kq_head)
+    first_half = jnp.concat([x[s : s + half_v] for s in group_starts], axis=0)
+    second_half = jnp.concat(
+        [x[s + half_v : s + v_per_kq_head] for s in group_starts], axis=0
+    )
+    return jnp.concat([first_half, second_half], axis=-1)
+
+
+def _unpack_v_head_pairs(x_pairs: jax.Array, v_per_kq_head: int) -> jax.Array:
+    """Unpacks V-head pairs from the lane axis back to the head axis."""
+    half_v = v_per_kq_head // 2
+    first_half, second_half = jnp.split(x_pairs, 2, axis=-1)
+    heads = []
+    for s in range(0, x_pairs.shape[0], half_v):
+        heads += [first_half[s : s + half_v], second_half[s : s + half_v]]
+    return jnp.concat(heads, axis=0)
+
+
+def _dot_kq_with_v_heads(
+    kq_operand: jax.Array,  # [num_kq_heads, ...]
+    v_operand: jax.Array,  # [num_v_heads, ..., v_head_dim]
+    dimension_numbers: jax.lax.DotDimensionNumbers,
+) -> jax.Array:
+    """Contracts a per-KQ-head operand with a per-V-head operand.
+
+    When the number of V heads per KQ head is even and v_head_dim % 128 == 0,
+    V heads are packed in pairs along the lane axis so each matmul fills
+    2 * v_head_dim MXU columns; otherwise V heads are contracted individually.
+    """
+    v_per_kq_head = v_operand.shape[0] // kq_operand.shape[0]
+    pair_v_heads = v_per_kq_head % 2 == 0 and v_operand.shape[-1] % 128 == 0
+    kq_repeats = v_per_kq_head // 2 if pair_v_heads else v_per_kq_head
+    kq_operand = jnp.repeat(kq_operand, kq_repeats, axis=0)
+    if pair_v_heads:
+        v_operand = _pack_v_head_pairs(v_operand, v_per_kq_head)
+    out = jax.lax.dot(
+        kq_operand,
+        v_operand,
+        dimension_numbers=dimension_numbers,
+        preferred_element_type=jnp.float32,
+    )
+    if pair_v_heads:
+        out = _unpack_v_head_pairs(out, v_per_kq_head)
+    return out
+
+
+def _chunk_intra_direct(
+    q_large: jax.Array,  # [heads_kq, chunk, kq_head_dim]
+    k_large: jax.Array,  # [heads_kq, chunk, kq_head_dim]
+    g_cum_sum_log: jax.Array,  # [heads_v, chunk, 1]
+    g_cum_sum_log_t: jax.Array,  # [heads_v, 1, chunk]
+    beta_t: jax.Array,  # [heads_v, 1, chunk]
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, ...]:
+    """State-independent intra-chunk prep for the direct-solve GDN path.
+
+    Factorizes K @ K^T once per KQ head group (`ed54e5b64e`) and omits the
+    triangular inverse buffer `t_inv` (`fab1042538`).
+    """
+    # [heads_v, chunk, chunk]
+    g_cum_sum_diff_log = g_cum_sum_log - g_cum_sum_log_t
+    gating_map = jnp.exp(g_cum_sum_diff_log)
+    # [heads_v, chunk, 1]
+    gating_backward = jnp.exp(-g_cum_sum_diff_log[..., -1:])
+    # [heads_v, chunk, 1]
+    gating_forward = jnp.exp(g_cum_sum_log)
+    # [heads_v, 1, 1]
+    gating_last = gating_forward[:, -1:]
+
+    mask_dtype = get_mask_dtype(cfg.dtypes.compute)
+    iota_r = jax.lax.broadcasted_iota(mask_dtype, gating_map.shape, 1)
+    iota_c = jax.lax.broadcasted_iota(mask_dtype, gating_map.shape, 2)
+    strictly_lower_mask = iota_r > iota_c
+    lower_mask = iota_r >= iota_c
+    # [heads_v, chunk, chunk]
+    gating_map_masked = jnp.where(strictly_lower_mask, gating_map, 0)
+
+    # Contract K @ K^T once per KQ head before repeating across V heads.
+    # [heads_kq, chunk, chunk]
+    k_k_t = jax.lax.dot(
+        k_large,
+        k_large,
+        dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+        preferred_element_type=jnp.float32,
+    ).astype(cfg.dtypes.compute)
+
+    # Strictly lower-triangular part L of the column-scaled system T = I + L.
+    # [heads_v, chunk, chunk]
+    beta_k_k_t = jnp.repeat(k_k_t, cfg.v_per_kq_head, axis=0) * beta_t
+    gating_beta_k_k_t = gating_map_masked * beta_k_k_t
+
+    # [heads_kq, chunk, chunk]
+    out_qk = jax.lax.dot(
+        q_large,
+        k_large,
+        dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+        preferred_element_type=jnp.float32,
+    ).astype(cfg.dtypes.compute)
+    # NOTE: must perform repeat after matmul to reduce required compute.
+    # [heads_v, chunk, chunk]
+    out_qk = jnp.repeat(out_qk, cfg.v_per_kq_head, axis=0)
+    out_qk *= gating_map
+    out_qk = jnp.where(lower_mask, out_qk, 0)
+
+    return gating_beta_k_k_t, gating_forward, gating_backward, gating_last, out_qk
+
+
+def _chunk_inter_direct(
+    q_large: jax.Array,  # [num_kq_heads, chunk, kq_head_dim]
+    k_large: jax.Array,  # [num_kq_heads, chunk, kq_head_dim]
+    v_large: jax.Array,  # [num_v_heads, chunk, v_head_dim]
+    beta_large: jax.Array,  # [num_v_heads, chunk, 1]
+    gating_beta_k_k_t: jax.Array,  # [num_v_heads, chunk, chunk]
+    gating_forward: jax.Array,  # [num_v_heads, chunk, 1]
+    gating_backward: jax.Array,  # [num_v_heads, chunk, 1]
+    gating_last: jax.Array,  # [num_v_heads, 1, 1]
+    out_qk: jax.Array,  # [num_v_heads, chunk, chunk]
+    state_prev: jax.Array,  # [num_v_heads, kq_head_dim, v_head_dim]
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """State-dependent part of one chunk using direct triangular solve."""
+    # Project unscaled [K; Q] against state_prev before solve (`bbaac5dd58`).
+    # [num_kq_heads, 2 * chunk, kq_head_dim]
+    merged_kq = jnp.concat([k_large, q_large], axis=1)
+    # [num_v_heads, 2 * chunk, v_head_dim]
+    kq_state = _dot_kq_with_v_heads(merged_kq, state_prev, (((2,), (1,)), ((0,), (0,))))
+    # [num_v_heads, chunk, v_head_dim]
+    k_state, q_state = jnp.split(kq_state, 2, axis=1)
+    out_updated = q_state * gating_forward
+
+    # Solve (I + L) @ x = v_diff directly in fp32 without T^-1 (`fab1042538`).
+    v_diff = v_large - k_state * gating_forward
+    u_ws = (
+        solve_triangular_rhs(
+            gating_beta_k_k_t, v_diff, block_size=cfg.triangular_block_size
+        )
+        * beta_large
+    )
+
+    # Absorb gating_backward into u_ws so sibling V heads share unscaled K.
+    u_ws_gated = u_ws * gating_backward
+    # [num_v_heads, kq_head_dim, v_head_dim]
+    state_new = _dot_kq_with_v_heads(k_large, u_ws_gated, (((1,), (1,)), ((0,), (0,))))
+    state_updated = state_prev * gating_last
+    state = state_updated + state_new
+
+    # [num_v_heads, chunk, v_head_dim]
+    out_new = jax.lax.dot(
+        out_qk,
+        u_ws,
+        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+        preferred_element_type=jnp.float32,
+    )
+    out = out_updated + out_new
+    return out, state
+
+
 def fused_transpose_broadcast(x: jax.Array, src_dim: int, dst_dim: int) -> jax.Array:
     """Perform 1D transpose where results are broadcasted along src_dim."""
     assert x.shape[dst_dim] == 1
@@ -132,6 +351,14 @@ def chunked_gdn_per_seq(
 
     # [num_v_heads, 1, chunk]
     g_cum_sum_log_t = fused_transpose_broadcast(g_cum_sum_log, src_dim=1, dst_dim=2)
+    if envs.VLLM_TPU_GDN_DIRECT_SOLVE:
+        beta_t = fused_transpose_broadcast(beta_large, src_dim=1, dst_dim=2)
+        parts = _chunk_intra_direct(
+            q_large, k_large, g_cum_sum_log, g_cum_sum_log_t, beta_t, cfg
+        )
+        return _chunk_inter_direct(
+            q_large, k_large, v_large, beta_large, *parts, state_prev, cfg
+        )
     # [num_v_heads, chunk, chunk]
     g_cum_sum_diff_log = g_cum_sum_log - g_cum_sum_log_t
     gating_map = jnp.exp(g_cum_sum_diff_log)
