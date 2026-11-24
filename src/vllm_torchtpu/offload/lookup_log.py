@@ -25,9 +25,14 @@ Fields, in scheduler blocks of ``block`` tokens unless named ``*_tokens``:
   class gives the boundaries where every one of its groups has a checkpoint (the last 8). A hit cut short because one
   class lacked its partner shows as classes that disagree.
 
-The HBM side is read in ``KVCacheManager.get_computed_blocks`` (the scheduler's local lookup, which runs just before
-the connector's) and kept on the request; the tier side is probed without pinning, so the line moves nothing in either
-LRU. Host only.
+- ``tier_runs`` (tier classes only): per attention class, the runs ``[start, end)`` of the prompt's blocks up to
+  ``cap`` that every group of the class holds, each block probed on its own without pins (the last 8 runs). A split
+  chain (head only in HBM, tail and checkpoint in the tier) shows a run starting past block 0.
+
+The HBM side is read in ``KVCacheManager.get_computed_blocks`` (and ``get_computed_blocks_for_connector`` when
+``VLLM_TPU_OFFLOAD_DIVERGENT_HITS`` is enabled) and kept on the request; the tier side is probed key by key without
+pinning, so eviction gaps do not truncate ``tier_attn`` / ``tier_ckpts`` and the line moves nothing in either LRU.
+Host only.
 
 The same flag writes one ``tier-restore`` line per host-tier load job, when the job ends (``RestoreLog``). A request's
 load is one job; a request loaded again after preemption gets another job and another line. Times are ``time.time()``
@@ -160,6 +165,43 @@ def record_hbm(manager, request) -> None:
     setattr(request, _HBM_ATTR, hbm_presence(manager.block_pool, request.block_hashes, kinds[0], kinds[1], cap))
 
 
+def is_key_host_resident(manager, key) -> bool:
+    """Return True if every sub-hash of ``key`` is resident in the local host pool.
+
+    Probes one key at a time without pinning so LRU order is untouched and an
+    absent block does not truncate subsequent keys (``KVCacheStore.lookup`` stops
+    at the first miss). Supports both flat ``RaidenOffloadingManager`` and
+    per-class ``TieredOffloadingManager`` managers defensively.
+    """
+    class_of = getattr(manager, "class_of", None)
+    managers = getattr(manager, "managers", None)
+    if callable(class_of) and managers is not None:
+        try:
+            class_manager = managers[class_of(key)]
+        except (KeyError, IndexError, TypeError):
+            return False
+        hrp = getattr(class_manager, "host_resident_prefix", None)
+        if callable(hrp):
+            return hrp([key]) == 1
+        manager = class_manager
+    sub_hashes_fn = getattr(manager, "_sub_hashes", None)
+    probe_fn = getattr(manager, "_probe", None)
+    block_status = getattr(manager, "_block_status", None)
+    if not (
+        callable(sub_hashes_fn) and callable(probe_fn) and block_status is not None
+    ):
+        return False
+    subs = list(sub_hashes_fn(key))
+    if not subs:
+        return False
+    host_statuses = (block_status.HOST, block_status.HOST_AND_HBM)
+    matched = probe_fn(subs)
+    if len(matched) < len(subs):
+        return False
+    resident = {h for h, blk in matched if blk.status in host_statuses}
+    return all(s in resident for s in subs)
+
+
 def log_lookup(sched, request, local_tokens: int, tier_tokens: int | None) -> None:
     """Writes the line once per request, after the connector's lookup."""
     if getattr(request, _LOGGED_ATTR, False):
@@ -179,25 +221,32 @@ def log_lookup(sched, request, local_tokens: int, tier_tokens: int | None) -> No
         keys = list(gs.offload_keys[:cap])
         (state_keys if isinstance(g.kv_cache_spec, MambaSpec) else attn_keys).append(keys)
     manager = sched._raiden_manager
-    flat = [k for keys in attn_keys + state_keys for k in keys]
-    found = {h for h, blk in manager._probe([s for k in flat for s in manager._sub_hashes(k)])
-             if blk.status in (manager._block_status.HOST, manager._block_status.HOST_AND_HBM)}
+    cache: dict[object, bool] = {}
+
+    def key_resident(k) -> bool:
+        hit = cache.get(k)
+        if hit is None:
+            hit = is_key_host_resident(manager, k)
+            cache[k] = hit
+        return hit
 
     def present(group_keys):
         n = min((len(k) for k in group_keys), default=0)
-        return [bool(group_keys) and all(all(s in found for s in manager._sub_hashes(keys[i])) for keys in group_keys)
+        return [bool(group_keys) and all(key_resident(keys[i]) for keys in group_keys)
                 for i in range(n)]
-
-    from vllm_torchtpu.offload.tier_classes import TieredOffloadingManager
 
     hbm = getattr(request, _HBM_ATTR, None) or (None, None)
     line = {"req_id": request.request_id, "num_tokens": request.num_tokens, "block": block, "cap": cap,
             "local_tokens": local_tokens, "tier_tokens": tier_tokens,
             "junction_tokens": getattr(request, "shared_prefix_boundary", 0)}
     line.update(summarize(hbm[0], hbm[1], present(attn_keys), present(state_keys), local_tokens // block, cap))
-    if isinstance(manager, TieredOffloadingManager):
+    if (
+        getattr(manager, "classes", None) is not None
+        and getattr(manager, "managers", None) is not None
+    ):
         keys_of = {g.group_idx: list(gs.offload_keys[:cap]) for g, gs in zip(configs, req_status.group_states)}
         line["tier_class"] = class_presence(manager, keys_of, local_tokens // block)
+        line["tier_runs"] = class_runs(manager, keys_of)
     setattr(request, _LOGGED_ATTR, True)
     logger.info("prefix-lookup %s", json.dumps(line, separators=(",", ":")))
 
@@ -223,29 +272,59 @@ def class_presence(manager, keys_of: dict[int, list], local_blocks: int) -> dict
     return out
 
 
+def class_runs(manager, keys_of: dict[int, list]) -> dict:
+    """Per attention class, the runs ``[start, end)`` of a request's blocks held by every group of the class, probed
+    per block without pins (the last ``_LAST`` runs)."""
+    out: dict = {}
+    for tier_class, class_manager in zip(manager.classes, manager.managers):
+        if tier_class.per_checkpoint:
+            continue
+        groups = [keys_of[g] for g in tier_class.groups if g in keys_of]
+        if not groups:
+            continue
+        runs: list[list[int]] = []
+        start = None
+        n = min(len(keys) for keys in groups)
+        for b in range(n):
+            held = all(class_manager.host_resident_prefix([keys[b]]) == 1 for keys in groups)
+            if held and start is None:
+                start = b
+            elif not held and start is not None:
+                runs.append([start, b])
+                start = None
+        if start is not None:
+            runs.append([start, n])
+        out[tier_class.name] = runs[-_LAST:]
+    return out
+
+
 def patch_prefix_lookup_log() -> None:
-    """Wraps KVCacheManager.get_computed_blocks to record the HBM side and Scheduler.add_request to write the
-    arrival line. Inert unless the flag is set."""
+    """Wraps KVCacheManager.get_computed_blocks (and get_computed_blocks_for_connector when present) to record the HBM
+    side and Scheduler.add_request to write the arrival line. Inert unless the flag is set."""
     if not enabled():
         return
     _patch_request_arrival()
     from vllm.v1.core.kv_cache_manager import KVCacheManager
 
-    original = KVCacheManager.get_computed_blocks
-    if getattr(original, _PATCH_FLAG, False):
-        return
+    patched = False
+    for name in ("get_computed_blocks", "get_computed_blocks_for_connector"):
+        original = getattr(KVCacheManager, name, None)
+        if original is None or getattr(original, _PATCH_FLAG, False):
+            continue
 
-    def get_computed_blocks(self, request):
-        out = original(self, request)
-        try:
-            record_hbm(self, request)
-        except Exception:  # a diagnostic must never fail a schedule pass
-            logger.exception("prefix-lookup: HBM presence failed for %s", request.request_id)
-        return out
+        def wrapped(self, request, _original=original):
+            out = _original(self, request)
+            try:
+                record_hbm(self, request)
+            except Exception:  # a diagnostic must never fail a schedule pass
+                logger.exception("prefix-lookup: HBM presence failed for %s", request.request_id)
+            return out
 
-    setattr(get_computed_blocks, _PATCH_FLAG, True)
-    KVCacheManager.get_computed_blocks = get_computed_blocks
-    logger.info("Applied TPU patch: per-request prefix lookup line (VLLM_TPU_PREFIX_LOOKUP_LOG).")
+        setattr(wrapped, _PATCH_FLAG, True)
+        setattr(KVCacheManager, name, wrapped)
+        patched = True
+    if patched:
+        logger.info("Applied TPU patch: per-request prefix lookup line (VLLM_TPU_PREFIX_LOOKUP_LOG).")
 
 
 def arrival_fields(scheduler, request) -> dict:
