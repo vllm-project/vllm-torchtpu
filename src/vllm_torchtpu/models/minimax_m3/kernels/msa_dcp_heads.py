@@ -847,6 +847,41 @@ def hp_round_factor() -> int:
     return factor
 
 
+HP_ROUND_LADDER_ENV = "TPU_MINIMAX_M3_DCP_HP_ROUND_LADDER"
+_round_ladder_logged = False
+
+
+def hp_round_ladder(block_size: int, dcp: int, replicas: int, capacity: int) -> list[int]:
+    """Smaller head-parallel round buffers, in logical blocks per rank
+    (multiples of ``replicas``, below ``capacity``), from
+    TPU_MINIMAX_M3_DCP_HP_ROUND_LADDER ("<tokens>/<tokens>/...": the step's
+    prefill requests' summed context each rung holds; read at trace time
+    through `envs`). Empty -> none."""
+    global _round_ladder_logged
+    from vllm_torchtpu import envs
+
+    spec = envs.TPU_MINIMAX_M3_DCP_HP_ROUND_LADDER.replace(",", "/")
+    rungs = set()
+    for tok in filter(None, (x.strip() for x in spec.split("/"))):
+        blocks = -(-int(tok) // (block_size * dcp))
+        blocks = -(-blocks // replicas) * replicas
+        if 0 < blocks < capacity:
+            rungs.add(blocks)
+    rungs = sorted(rungs)
+    if rungs and not _round_ladder_logged:
+        _round_ladder_logged = True
+        init_logger(__name__).warning(
+            "%s=%s: head-parallel MSA prefill steps whose prefill requests fit "
+            "one round of %s logical blocks per rank (of %d) exchange and attend "
+            "in that smaller buffer.",
+            HP_ROUND_LADDER_ENV,
+            spec,
+            rungs,
+            capacity,
+        )
+    return rungs
+
+
 HP_ROW_SPLIT_ENV = "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT"
 _row_split_logged = False
 
@@ -957,7 +992,7 @@ def _head_parallel_attend(
     limit = pos % block_size + 1
     head_width = 2 * head_dim
 
-    def plan_round(first):
+    def plan_round(first, capacity=capacity):
         csum = jnp.cumsum(jnp.where(seq_idx >= first, blocks, 0))
         # A request never exceeds the buffer (the block table's width); always
         # admitting `first` keeps the rounds moving if that ever broke.
@@ -971,7 +1006,7 @@ def _head_parallel_attend(
         )
         return csum, in_round, base, total, nxt
 
-    def round_pages(plan):
+    def round_pages(plan, part=part):
         csum, _, base, total, _ = plan
         num_pages = part * replicas
         # Buffer page b holds logical block l = b % part * replicas + b //
@@ -983,10 +1018,10 @@ def _head_parallel_attend(
         j = jnp.clip(logical - base[q_of], 0, width - 1)
         return jnp.where(logical < total, block_tables_2d[q_of, j], 0)
 
-    def attend_round(plan, acc, merge, selected, future=None, deps=()):
+    def attend_round(plan, acc, merge, selected, future=None, deps=(), part=part):
         csum, in_round, base, total, _ = plan
         num_pages = part * replicas
-        pages = round_pages(plan)
+        pages = round_pages(plan, part)
         sel_block = jnp.maximum(selected, 0)
 
         def slot(base, block):
@@ -1070,7 +1105,65 @@ def _head_parallel_attend(
 
         return jax.lax.fori_loop(0, -(-(hi - lo) // window), window_body, acc)
 
+    def more_rounds_from(first, acc, selected):
+        # Further rounds sit under a cond: a while loop that reads the cache
+        # makes XLA copy the whole cache ahead of it (0.45 ms per layer at
+        # c64).
+        def more_rounds(state):
+            def body(s):
+                plan = plan_round(s[0])
+                return plan[4], attend_round(plan, s[1], merge=True, selected=selected)
+
+            return jax.lax.while_loop(lambda s: s[0] < max_num_seqs, body, state)
+
+        _, acc = jax.lax.cond(
+            first < max_num_seqs, more_rounds, lambda s: s, (first, acc)
+        )
+        return acc
+
     first = jnp.min(jnp.where(hp_req, seq_idx, max_num_seqs))
+    rungs = [] if exchange_async() else hp_round_ladder(
+        block_size, dcp, replicas, part * replicas
+    )
+    if rungs:
+        # TPU_MINIMAX_M3_DCP_HP_ROUND_LADDER: a step whose prefill requests
+        # all fit the smallest rung that holds them attends in one round of
+        # that buffer (a `lax.switch` in the same program). The full buffer
+        # would also take them in one round, with the same pages in the same
+        # order: a key's slot ``(j * dcp + src) * part + i`` orders like ``(j,
+        # src, i)`` whatever ``part``, so the kernel's sorts, unions and
+        # page cache see the same sequence and the output is the same bits.
+        # The scales' gather, all-to-all, all-gather and padding (static, the
+        # whole buffer) shrink with it.
+        extra = None if between is None else between(q, candidates)
+        selected = _own_selection(
+            candidates,
+            dcp=dcp,
+            replicas=replicas,
+            topk=topk,
+            axis=axis,
+            interpret=interpret,
+        )
+        need = jnp.sum(blocks)
+        branch = sum((need > r).astype(jnp.int32) for r in rungs)
+
+        def rung(r):
+            def run(selected):
+                plan = plan_round(first, capacity=r)
+                return attend_round(
+                    plan, None, merge=False, selected=selected, part=r // replicas
+                )
+
+            return run
+
+        def full(selected):
+            plan = plan_round(first)
+            acc = attend_round(plan, None, merge=False, selected=selected)
+            return more_rounds_from(plan[4], acc, selected)
+
+        acc = jax.lax.switch(branch, [rung(r) for r in rungs] + [full], selected)
+        return acc if between is None else (acc, extra)
+
     plan = plan_round(first)
     future, extra = None, None
     if between is not None and exchange_async():
@@ -1107,18 +1200,7 @@ def _head_parallel_attend(
         future=future,
         deps=() if future is None else (extra,),
     )
-    first = plan[4]
-
-    # Further rounds sit under a cond: a while loop that reads the cache
-    # makes XLA copy the whole cache ahead of it (0.45 ms per layer at c64).
-    def more_rounds(state):
-        def body(s):
-            plan = plan_round(s[0])
-            return plan[4], attend_round(plan, s[1], merge=True, selected=selected)
-
-        return jax.lax.while_loop(lambda s: s[0] < max_num_seqs, body, state)
-
-    _, acc = jax.lax.cond(first < max_num_seqs, more_rounds, lambda s: s, (first, acc))
+    acc = more_rounds_from(plan[4], acc, selected)
     return acc if between is None else (acc, extra)
 
 
