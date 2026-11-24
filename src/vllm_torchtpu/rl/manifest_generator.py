@@ -245,7 +245,9 @@ def _check_supported(
         if int(getattr(eplb_cfg, "num_redundant_experts", 0) or 0) > 0:
             raise NotImplementedError("EPLB redundant experts are not supported.")
 
-    ep_env = os.environ.get("TPU_EXPERT_PLACEMENT", "").strip().lower()
+    from vllm_torchtpu import envs
+
+    ep_env = str(envs.TPU_EXPERT_PLACEMENT or "").strip().lower()
     if ep_env and ep_env not in ("0", "false", "no", "linear"):
         raise NotImplementedError(f"TPU_EXPERT_PLACEMENT={ep_env!r} is not supported.")
 
