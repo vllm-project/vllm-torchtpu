@@ -466,6 +466,12 @@ def write_main_cache(
     )
 
 
+# VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT replaces the per-row gather from this many
+# key rows up. Decode and draft steps have fewer rows; there the shift select's
+# cond and shifted copies cost more than the gather they replace.
+_PAIR_SHIFT_MIN_ROWS = 128
+
+
 def _pair_values_by_shift(keys, local, mask, ratio):
     """``keys[clip(local)]`` for the rows ``mask`` keeps, without a gather.
 
@@ -538,7 +544,11 @@ def compressed_pairs(
         - context[req, None]
     )
     mask = (local >= starts[req, None]) & (local < starts[req + 1, None])
-    if envs.VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT and len(local) == len(keys):
+    if (
+        envs.VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT
+        and len(local) == len(keys)
+        and len(keys) >= _PAIR_SHIFT_MIN_ROWS
+    ):
         values = _pair_values_by_shift(keys, local, mask, ratio)
     else:
         values = keys[jnp.clip(local, 0, len(keys) - 1)]
