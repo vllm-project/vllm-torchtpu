@@ -12,22 +12,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU static-shape bucketing patch for ``Qwen3OmniMoeAudioEncoder``.
+"""TPU static-shape bucketing patches for Qwen3-Omni Thinker audio and vision encoders.
 
-Fixes two TPU issues in pinned ``vllm-omni==0.32.0rc1``
-(``Qwen3OmniMoeAudioEncoder.forward``):
-1. Evaluates 100-frame window counts with integer division on CPU to avoid TPU
-   float32 reciprocal rounding on exact multiples of 100 frames
-   (see upstream ``vllm-omni#9010``).
-2. Splits clips longer than 128 windows along 128-window (``16 * n_window_infer``)
-   boundaries, packs consecutive clips into power-of-2 window buckets
-   ``(8, 16, 32, 64, 128)``, and compiles one fused TPU graph per bucket via
-   ``torch.compile(..., backend="tpu", fullgraph=True, dynamic=False)``.
+1. **Audio encoder (``Qwen3OmniMoeAudioEncoder``)**:
+   Evaluates 100-frame window counts with integer division on CPU (avoiding TPU
+   float32 reciprocal rounding on exact multiples of 100 frames; see upstream
+   ``vllm-omni#9010``), splits clips longer than 128 windows along 128-window
+   (``16 * n_window_infer``) boundaries, packs consecutive clips into power-of-2
+   window buckets ``(8, 16, 32, 64, 128)``, and compiles one fused TPU graph per
+   bucket via ``torch.compile(..., backend="tpu", fullgraph=True, dynamic=False)``.
+2. **Vision encoder (``Qwen3Omni_VisionTransformer``)**:
+   Packs consecutive image/video items into ViT passes of at most ``16,384``
+   patches, splits larger videos along the frame axis, and pads each pass and
+   its ``cu_seqlens`` to a static ``(2048, 4096, 8192, 16384)``-patch bucket.
 
 TODO: retire the 0.32.0rc1 ``xfail`` test in ``test_qwen3_omni_components.py`` once
 vLLM-Omni is bumped to >= 0.33.0rc1 (vllm-omni#9010), and remove this module
-once upstream supports native static audio encoder bucketing on TPU (tracked
-upstream in vllm-project/vllm-omni#7452 and vllm-project/vllm-omni#9566).
+once upstream supports native static audio and vision encoder bucketing on TPU
+(tracked upstream in vllm-project/vllm-omni#7452 and vllm-project/vllm-omni#9566).
 """
 
 from __future__ import annotations
@@ -61,6 +63,11 @@ _AUDIO_CHUNK_BUCKETS: tuple[int, ...] = (8, 16, 32, 64, 128)
 _CU_SEQLENS_BLOCK_SIZE = 128
 # Reserve 1 leading ``0`` entry plus up to 1 trailing ``padded_total`` sentinel.
 _CU_SEQLENS_RESERVED_ENTRIES = 2
+# Static ViT patch buckets (512, 1024, 2048, 4096 merged tokens at
+# spatial_merge_size=2). The Thinker calls self.visual(pixel_values, grid_thw)
+# directly, bypassing MMEncoderManager, which also does not pad patches or
+# cu_seqlens to a static shape.
+_VISION_PATCH_BUCKETS: tuple[int, ...] = (2048, 4096, 8192, 16384)
 
 
 class _AudioSlice(NamedTuple):
@@ -70,6 +77,20 @@ class _AudioSlice(NamedTuple):
     frame_len: int
     num_chunks: int
     valid_tokens: int
+
+
+def _select_bucket(val: int, buckets: tuple[int, ...], align: int) -> int:
+    for b in buckets:
+        if val <= b:
+            return b
+    return cdiv(val, align) * align
+
+
+def _pad_rows(x: torch.Tensor, target_rows: int) -> torch.Tensor:
+    pad = target_rows - x.shape[0]
+    if pad <= 0:
+        return x
+    return F.pad(x, (0, 0, 0, pad))
 
 
 def _pad_cu_seqlens(
@@ -203,29 +224,29 @@ def _split_audio_clips(
     return slices
 
 
-def _group_audio_slices(
-    slices: list[_AudioSlice],
-    max_bucket: int,
-    window_aftercnn: int,
-) -> list[list[_AudioSlice]]:
-    """Greedily pack slices into groups fitting ``max_bucket`` and ``cu_seqlens``."""
-    groups: list[list[_AudioSlice]] = []
-    cur_group: list[_AudioSlice] = []
-    cur_chunks = 0
+def _group_slices(
+    slices: list[Any], costs: list[tuple[int, int]], max_bucket: int
+) -> list[list[Any]]:
+    """Greedily pack slices into groups fitting ``max_bucket`` and ``cu_seqlens``.
+
+    ``costs`` gives each slice's ``(bucket units, cu_seqlens entries)``.
+    """
+    groups: list[list[Any]] = []
+    cur_group: list[Any] = []
+    cur_units = 0
     cur_cu_entries = _CU_SEQLENS_RESERVED_ENTRIES
-    for item in slices:
-        item_cu_entries = cdiv(item.valid_tokens, window_aftercnn) + 1
+    for item, (units, cu_entries) in zip(slices, costs, strict=True):
         if (
-            cur_chunks + item.num_chunks > max_bucket
-            or cur_cu_entries + item_cu_entries > _CU_SEQLENS_BLOCK_SIZE
+            cur_units + units > max_bucket
+            or cur_cu_entries + cu_entries > _CU_SEQLENS_BLOCK_SIZE
         ) and cur_group:
             groups.append(cur_group)
             cur_group = []
-            cur_chunks = 0
+            cur_units = 0
             cur_cu_entries = _CU_SEQLENS_RESERVED_ENTRIES
         cur_group.append(item)
-        cur_chunks += item.num_chunks
-        cur_cu_entries += item_cu_entries
+        cur_units += units
+        cur_cu_entries += cu_entries
     if cur_group:
         groups.append(cur_group)
     return groups
@@ -418,7 +439,11 @@ def _padded_audio_forward(
         max_bucket,
         tokens_per_chunk,
     )
-    groups = _group_audio_slices(slices, max_bucket, window_aftercnn)
+    groups = _group_slices(
+        slices,
+        [(s.num_chunks, cdiv(s.valid_tokens, window_aftercnn) + 1) for s in slices],
+        max_bucket,
+    )
 
     is_tpu = device.type == "tpu"
     use_compiled = is_tpu and not self._tpu_enforce_eager
@@ -458,6 +483,75 @@ def _patch_audio_encoder(
     return True
 
 
+def _padded_vit_forward(
+    self: Any,
+    x: torch.Tensor,
+    grid_thw: torch.Tensor | list[list[int]],
+) -> torch.Tensor:
+    """Run ``Qwen3Omni_VisionTransformer.forward`` over static patch buckets.
+
+    Upstream ``prepare_encoder_metadata`` and ``forward_with_encoder_metadata``
+    still do all the encoding. Follows the audio forward's steps:
+    - Splits each item along the frame axis into pieces that fit the largest
+      bucket and the ``cu_seqlens`` budget (exact: each frame is its own
+      attention segment), then packs consecutive pieces with ``_group_slices``.
+    - Pads each pass's patches, ``grid_thw`` and ``cu_seqlens`` to a
+      ``_VISION_PATCH_BUCKETS`` shape and slices the valid tokens afterwards.
+    """
+    x_dev = x.to(device=self.device, dtype=self.dtype)
+    merge_size = self.spatial_merge_size
+    merge_unit = merge_size**2
+    max_bucket = _VISION_PATCH_BUCKETS[-1]
+    max_frames = _CU_SEQLENS_BLOCK_SIZE - _CU_SEQLENS_RESERVED_ENTRIES
+
+    pieces: list[list[int]] = []
+    for t, h, w in torch.as_tensor(grid_thw).tolist():
+        chunk_t = min(max(1, max_bucket // (h * w)), max_frames)
+        pieces.extend([min(chunk_t, t - t0), h, w] for t0 in range(0, t, chunk_t))
+    groups = _group_slices(pieces, [(t * h * w, t) for t, h, w in pieces], max_bucket)
+
+    outputs: list[torch.Tensor] = []
+    px = 0
+    for group in groups:
+        valid_tokens = sum(t * h * w for t, h, w in group)
+        # The processor's max_pixels keeps one frame <= 16384 patches; align=512
+        # is a bounded fallback if a caller overrides max_pixels.
+        target_tokens = _select_bucket(
+            valid_tokens, _VISION_PATCH_BUCKETS, align=max(512, merge_unit)
+        )
+        pad_tokens = target_tokens - valid_tokens
+        pad_grid = [[pad_tokens // merge_unit, merge_size, merge_size]]
+        metadata = self.prepare_encoder_metadata(
+            torch.tensor(group + pad_grid * (pad_tokens > 0), dtype=torch.int32)
+        )
+        valid_frames = sum(t for t, _, _ in group)
+        cu_list = metadata["cu_seqlens"].detach().cpu().tolist()[: valid_frames + 1]
+        metadata["cu_seqlens"] = _pad_cu_seqlens(cu_list, target_tokens, x_dev.device)
+        metadata["max_seqlen"] = None
+
+        merged_all = self.forward_with_encoder_metadata(
+            _pad_rows(x_dev[px : px + valid_tokens], target_tokens), metadata
+        )
+        # Cut the deferred TorchTPU graph before the valid-token slice so the ViT
+        # compiles once per bucket shape rather than once per valid_tokens length.
+        if merged_all.device.type == "tpu":
+            synchronize_tensors(merged_all, wait=False)
+        outputs.append(merged_all[: valid_tokens // merge_unit])
+        px += valid_tokens
+
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+
+
+def _patch_vision_encoder(vit_cls: type[Any]) -> bool:
+    """Install frame chunking and static bucketing on Qwen3Omni_VisionTransformer."""
+    orig_forward = vit_cls.forward
+    if orig_forward is _padded_vit_forward:
+        return False
+    vit_cls._tpu_orig_forward = orig_forward
+    vit_cls.forward = _padded_vit_forward
+    return True
+
+
 def maybe_patch_qwen3_omni_thinker(
     architectures: list[str] | None = None,
     *,
@@ -467,15 +561,14 @@ def maybe_patch_qwen3_omni_thinker(
     if not architectures or not _QWEN3_OMNI_ARCHS.intersection(architectures):
         return False
 
-    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
-        Qwen3OmniMoeAudioEncoder,
+    from vllm_omni.model_executor.models.qwen3_omni import (
+        qwen3_omni_moe_thinker as thinker_mod,
     )
 
     patched = _patch_audio_encoder(
-        Qwen3OmniMoeAudioEncoder, enforce_eager=enforce_eager
+        thinker_mod.Qwen3OmniMoeAudioEncoder, enforce_eager=enforce_eager
     )
+    patched = _patch_vision_encoder(thinker_mod.Qwen3Omni_VisionTransformer) or patched
     if patched:
-        logger.info(
-            "Applied TPU patch: Qwen3-Omni Thinker audio encoder static bucketing."
-        )
+        logger.info("Applied TPU patch: Qwen3-Omni Thinker audio and vision encoders.")
     return patched

@@ -13,11 +13,20 @@
 # limitations under the License.
 """Numerical-parity, image-metric, and patch-isolation helpers for Omni tests."""
 
+from __future__ import annotations
+
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
+from unittest.mock import patch
 
 import numpy as np
 import torch
+import torch.nn as nn
+from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.attention import mm_encoder_attention
+from vllm.model_executor.layers.conv import Conv3dLayer
+from vllm.model_executor.layers.linear import LinearBase
+from vllm.v1.attention.ops.vit_attn_wrappers import torch_sdpa_wrapper
 
 _MISSING = object()
 
@@ -147,3 +156,51 @@ def assert_all_loaded(loaded: set[str], module: torch.nn.Module) -> None:
     assert not missing, (
         f"vllm-omni parameters not loaded from checkpoint: {sorted(missing)[:10]}"
     )
+
+
+def init_test_weights(module: nn.Module, seed: int = 0) -> None:
+    """Seed vLLM CustomOp layers (``LinearBase``, ``Conv3dLayer``) deterministically."""
+    generator = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for submodule in module.modules():
+            if isinstance(submodule, (LinearBase, Conv3dLayer)):
+                for param in submodule.parameters(recurse=False):
+                    if param.dim() > 1:
+                        param.copy_(
+                            torch.randn(param.shape, generator=generator) * 0.02
+                        )
+                    else:
+                        param.zero_()
+
+
+@contextmanager
+def native_ops_on_cpu(*modules: nn.Module) -> Generator[None]:
+    """Run the vLLM ``CustomOp`` layers of ``modules`` with their native CPU ops."""
+    for module in modules:
+        for submodule in module.modules():
+            if isinstance(submodule, CustomOp):
+                submodule._forward_method = submodule.forward_native
+    with patch.object(
+        mm_encoder_attention, "vit_torch_sdpa_wrapper", torch_sdpa_wrapper
+    ):
+        yield
+
+
+@contextmanager
+def isolate_thinker_patch_targets() -> Generator[None]:
+    """Snapshot and restore Qwen3-Omni Thinker patch targets across a test."""
+    from vllm_omni.model_executor.models.qwen3_omni import (
+        qwen3_omni_moe_thinker as thinker_mod,
+    )
+
+    with (
+        restore_class_attrs(
+            thinker_mod.Qwen3OmniMoeAudioEncoder,
+            ("forward", "_tpu_enforce_eager"),
+        ),
+        restore_class_attrs(
+            thinker_mod.Qwen3Omni_VisionTransformer,
+            ("forward", "_tpu_orig_forward"),
+        ),
+    ):
+        yield
