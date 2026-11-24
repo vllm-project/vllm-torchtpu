@@ -237,6 +237,13 @@ class _IdxMixin:
         b = ctx._idx_tslot
         return ctx.scr["qi_ckw"].at[b], ctx.scr["qi_mtw"].at[b]
 
+    def prefetch_next(self, ctx: Any, l: Any) -> None:  # noqa: E741
+        """Skip `QSAFullIndexedBlock.prefetch_next` when TSLIM double-buffered table
+        prefetch (`table_prefetch=True`) already manages layer-to-layer SMEM table DMAs."""
+        if self.table_prefetch:
+            return
+        super().prefetch_next(ctx, l)
+
     def load_tables(self, ctx: Any, l: Any) -> None:  # noqa: E741
         """Prefetch: QSA layer o's window rows are in slot o % 2; layer 0 copies and waits its own, every layer waits
         its own and then starts layer o + 1's copies into the other slot (layer o - 1's, which is done)."""

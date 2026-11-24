@@ -348,6 +348,14 @@ class Qwen38PoolGDNInk(Qwen38PoolGDN, _InkBlockEmit):
             cp.start()
             cp.wait()
 
+    def prefetch_next(self, ctx: Any, l: Any) -> None:  # noqa: E741
+        """Drain prior GDN layer's in-flight pool checkpoint writes before refilling
+        the shared staging ring (`pg_raw`/`pg_craw`) with layer `l`'s gather DMAs."""
+        if "gdn_state" not in ctx.skip:
+            with ctx.sc("gdn_ckpt_drain"):
+                drain(ctx)
+        super().prefetch_next(ctx, l)
+
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         if "gdn_state" not in ctx.skip:
             with ctx.sc("gdn_ckpt_drain"):

@@ -292,22 +292,39 @@ class QSAFullIndexedBlock(QSAFullBlock):
             return ctx.scr["qi_ckw"], ctx.scr["qi_mtw"]
         return (ctx.extra[CKTAB] if self.carrier else None), ctx.extra[MTAB]
 
+    def _table_copies(self, ctx: Any, l: Any) -> list[Any]:  # noqa: E741
+        """Async copies staging layer `l`'s table rows into SMEM windows (`hbm_tables`)."""
+        # HBM tables are [layers, requests, cols]: a layer is one whole leading-dim
+        # block (a row offset `o * requests` into a 2-D table is not tile-aligned for 12
+        # requests).
+        o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
+        scr = ctx.scr
+        return [
+            pltpu.make_async_copy(ctx.extra[src].at[o], scr[dst], scr["qi_tsem"].at[i])
+            for i, (src, dst) in enumerate(((CKTAB, "qi_ckw"), (MTAB, "qi_mtw")))
+        ]
+
+    def prefetch_next(self, ctx: Any, l: Any) -> None:  # noqa: E741
+        if not self.hbm_tables:
+            return
+        for c in self._table_copies(ctx, l):
+            c.start()
+
     def load_tables(self, ctx: Any, l: Any) -> None:  # noqa: E741
         """Copy this layer's table rows into the SMEM windows (`hbm_tables` only)."""
         if not self.hbm_tables:
             return
-        # HBM tables are [layers, requests, cols]: a layer is one whole leading-dim
-        # block (a
-        # row offset `o * requests` into a 2-D table is not tile-aligned for 12
-        # requests).
-        o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
-        scr = ctx.scr
-        cps = [
-            pltpu.make_async_copy(ctx.extra[src].at[o], scr[dst], scr["qi_tsem"].at[i])
-            for i, (src, dst) in enumerate(((CKTAB, "qi_ckw"), (MTAB, "qi_mtw")))
-        ]
-        for c in cps:
-            c.start()
+        cps = self._table_copies(ctx, l)
+        if ctx.xlayer_prefetch is not None:
+
+            @pl.when(l == 0)
+            def _():
+                for c in cps:
+                    c.start()
+
+        else:
+            for c in cps:
+                c.start()
         for c in cps:
             c.wait()
 

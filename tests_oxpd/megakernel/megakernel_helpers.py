@@ -401,6 +401,7 @@ EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
     ("kv_ering", "gqa.kv_ering", True, (2, 4), {}),
     ("gqa_qv", "gqa.gqa_qv", True, (2, 4), {}),
     ("rel_fetch", "rel_fetch", True, (2, 4), {}),
+    ("xlayer_prefetch", "xlayer_prefetch", True, (2, 4), {}),
     ("bounds_checks", "bounds_checks", True, (2, 4), {}),
     ("vmem_mib", "vmem_mib", 48, (2, 4), {}),
     ("smem_mib", "smem_mib", 2, (2, 4), {}),

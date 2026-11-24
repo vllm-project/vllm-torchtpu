@@ -210,6 +210,9 @@ class Block:
     def on_layer_start(self, ctx: Any, lyr: Any, slot: Any) -> None:
         """Executed at the start of layer `lyr` alongside `smalls` double-buffering."""
 
+    def prefetch_next(self, ctx: Any, l: Any) -> None:  # noqa: E741
+        """Optionally prefetch layer `l` inputs during layer `l - 1`'s AR tail."""
+
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         raise NotImplementedError
 
