@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_E4M3_QKV: bool = False
     TPU_MINIMAX_M3_SP_A2A_OPROJ: str = "off"
     TPU_MINIMAX_M3_SP_A2A_E4M3: bool = False
+    TPU_MINIMAX_M3_SP_A2A_OPROJ_MIN_TOKENS: int = 0
     TPU_MINIMAX_M3_SP_FFN_PIECES: int = 1
     TPU_MOE_TC_COMBINE_PIECES: int = 1
     TPU_MINIMAX_M3_SP_ATTN_PIECES: bool = False
@@ -832,6 +833,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-to-all as e4m3 rows with power-of-two row scales, and o_proj
     # contracts e4m3 x e4m3 (a change to o_proj's input precision).
     "TPU_MINIMAX_M3_SP_A2A_E4M3": env_bool("TPU_MINIMAX_M3_SP_A2A_E4M3", default=False),
+    # TPU_MINIMAX_M3_SP_A2A_OPROJ only on SP steps of at least this many
+    # tokens; smaller SP steps (decode-sized ones, which read the whole
+    # gathered weight for few rows) reduce-scatter o_proj's partial sums.
+    "TPU_MINIMAX_M3_SP_A2A_OPROJ_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_SP_A2A_OPROJ_MIN_TOKENS", 0
+    ),
     # "full" SP steps of at least TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS
     # tokens norm and all-gather each layer's FFN input per row piece of the
     # token shard (the FFN's entry work starts on a piece as it lands), run

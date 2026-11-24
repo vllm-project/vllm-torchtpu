@@ -53,12 +53,16 @@ def mark(o_proj: nn.Module) -> None:
         setattr(o_proj, PREPARE_ATTR, True)
 
 
-def applies(o_proj: nn.Module) -> bool:
-    """Whether this o_proj takes the all-to-all path: prepared after loading
-    from an e4m3 [K/TP, N] weight with a per-channel scale, and the TP rank
-    tensor it indexes blocks by is armed (else the reduce-scatter path runs
-    on the prepared weight)."""
+def applies(o_proj: nn.Module, num_tokens: int) -> bool:
+    """Whether this o_proj takes the all-to-all path on an SP step of
+    ``num_tokens`` tokens: prepared after loading from an e4m3 [K/TP, N]
+    weight with a per-channel scale, the step at least
+    TPU_MINIMAX_M3_SP_A2A_OPROJ_MIN_TOKENS, and the TP rank tensor it
+    indexes blocks by is armed (else the reduce-scatter path runs on the
+    prepared weight)."""
     if mode() == "off" or not getattr(o_proj, PREPARED_ATTR, False):
+        return False
+    if num_tokens < envs.TPU_MINIMAX_M3_SP_A2A_OPROJ_MIN_TOKENS:
         return False
     return pallas_all_reduce.armed_rank(get_tp_group().ranks) is not None
 

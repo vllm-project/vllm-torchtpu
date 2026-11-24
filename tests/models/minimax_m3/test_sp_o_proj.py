@@ -83,7 +83,7 @@ def _prepared(monkeypatch, mode, w8, scale):
         monkeypatch.setattr(sp_o_proj, "_all_gather_cpu", lambda t, g=gathers: next(g))
         sp_o_proj.prepare(m)
         _as_rank(monkeypatch, r)
-        assert sp_o_proj.applies(m)
+        assert sp_o_proj.applies(m, 8192)
         mods.append(m)
     return mods, rescaled
 
@@ -103,7 +103,15 @@ def test_needs_the_armed_rank(monkeypatch, ranks):
     _, w8, scale, _ = ranks
     mods, _ = _prepared(monkeypatch, "gather", w8, scale)
     monkeypatch.setattr(sp_o_proj.pallas_all_reduce, "armed_rank", lambda ranks: None)
-    assert not sp_o_proj.applies(mods[0])
+    assert not sp_o_proj.applies(mods[0], 8192)
+
+
+def test_small_steps_reduce_scatter(monkeypatch, ranks):
+    _, w8, scale, _ = ranks
+    mods, _ = _prepared(monkeypatch, "gather", w8, scale)
+    monkeypatch.setenv("TPU_MINIMAX_M3_SP_A2A_OPROJ_MIN_TOKENS", "1024")
+    assert not sp_o_proj.applies(mods[0], 384)
+    assert sp_o_proj.applies(mods[0], 1024)
 
 
 @pytest.mark.parametrize("mode", ["gather", "replicate"])

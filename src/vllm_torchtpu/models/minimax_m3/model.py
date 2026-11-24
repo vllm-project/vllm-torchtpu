@@ -259,7 +259,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 update = self._attention_halves(positions, rows, halves)
                 shard = update + _halves_rows(hidden_states, self.tp_size)
                 update = None
-            elif sp_o_proj.applies(o_proj):
+            elif sp_o_proj.applies(o_proj, hidden_states.shape[0]):
                 attn = self.self_attn(positions, normed, project=False, half=whole)
                 rows = sp_o_proj.local_rows(hidden_states)
                 shard = sp_o_proj.sp_o_proj(o_proj, attn) + rows
@@ -284,7 +284,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             layer_input = shard
             if halves is not None:
                 update = self._attention_halves(positions, normed, halves)
-            elif sp_o_proj.applies(o_proj):
+            elif sp_o_proj.applies(o_proj, shard.shape[0] * self.tp_size):
                 attn = self.self_attn(positions, normed, project=False, half=whole)
                 pieces = (
                     _ffn_pieces(shard.shape[0], self.tp_size)
@@ -558,7 +558,7 @@ class MiniMaxM3Model(nn.Module):
             and envs.TPU_MINIMAX_M3_SP_ATTN_PIECES
             and envs.TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES
             and _ffn_pieces(num_tokens // self.tp_size, self.tp_size) == 2
-            and sp_o_proj.applies(self.layers[0].self_attn.o_proj)
+            and sp_o_proj.applies(self.layers[0].self_attn.o_proj, num_tokens)
         )
 
     def forward(
