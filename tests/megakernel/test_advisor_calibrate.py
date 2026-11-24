@@ -431,9 +431,9 @@ def _write_xplane_dir(root: Path, captures: Mapping[str, bytes]) -> Path:
     return root
 
 
-def _advise_qwen3_30b_decode(meas_path: Path) -> advisor.AdvisorReport:
-    """Run `advisor.advise` for Qwen3-30B-A3B decode on tpu7x with calibration."""
-    profile = advisor.resolve_model_profile("Qwen/Qwen3-30B-A3B-FP8")
+def _advise_qwen35_397b_decode(meas_path: Path) -> advisor.AdvisorReport:
+    """Run `advisor.advise` for Qwen3.5-397B decode on tpu7x with calibration."""
+    profile = advisor.resolve_model_profile("Qwen/Qwen3.5-397B-A17B-FP8")
     chip = advisor.resolve_chip_spec("tpu7x")
     return advisor.advise(
         profile,
@@ -571,7 +571,7 @@ def test_calibrate_perfetto_extracts_launch_gap_and_collectives(
             "--chip",
             "tpu7x",
             "--model",
-            "Qwen/Qwen3-30B-A3B-FP8",
+            "Qwen/Qwen3.5-397B-A17B-FP8",
             "--batch",
             str(req_batch),
             "--tp",
@@ -619,7 +619,7 @@ def test_calibrate_perfetto_extracts_launch_gap_and_collectives(
     assert step_time["p50"] == pytest.approx(100.0)
     assert step_time["n"] == expected_steady_steps
 
-    report = _advise_qwen3_30b_decode(out_json)
+    report = _advise_qwen35_397b_decode(out_json)
     assert report.confidence == "validated_end_to_end"
     assert report.metrics["launch_gap_us"]["tag"] == "MEASURED"
     assert report.metrics["launch_gap_us"]["value"] == pytest.approx(2.5)
@@ -637,7 +637,7 @@ def test_calibrate_xplane_roundtrip_with_in_repo_parser(tmp_path: Path) -> None:
     single_pb.write_bytes(_build_synthetic_xspace_bytes(time_shift_us=0))
 
     out_single = tmp_path / "xplane_single_measurements.json"
-    opts = advisor.CalibrateOptions(chip="tpu7x", model="Qwen/Qwen3-30B-A3B-FP8")
+    opts = advisor.CalibrateOptions(chip="tpu7x", model="Qwen/Qwen3.5-397B-A17B-FP8")
     payload = advisor.calibrate_trace(single_pb, out_single, options=opts)
     assert out_single.is_file()
     assert payload["schema"] == constants.MEASUREMENTS_SCHEMA
@@ -667,7 +667,7 @@ def test_calibrate_xplane_roundtrip_with_in_repo_parser(tmp_path: Path) -> None:
     expected_multi_rank_gaps = 2 * (3 * 3)  # 18 gaps across 2 ranks with 9 gaps each
     assert multi_payload["launch_gap_us"]["n"] == expected_multi_rank_gaps
 
-    report = _advise_qwen3_30b_decode(out_multi)
+    report = _advise_qwen35_397b_decode(out_multi)
     assert report.confidence == "validated_end_to_end"
     assert report.metrics["launch_gap_us"]["tag"] == "MEASURED"
     assert report.metrics["collective_call_us_xla"]["tag"] == "MEASURED"
