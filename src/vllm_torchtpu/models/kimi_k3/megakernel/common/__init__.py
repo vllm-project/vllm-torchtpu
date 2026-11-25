@@ -12,4 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/common/__init__.py
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# src/vllm_torchtpu/megakernel/common/__init__.py
+"""Shared Kimi-K3 megakernel arena pool, collective, and aliasing helpers."""
+
+from __future__ import annotations
+
+import importlib
+from typing import TYPE_CHECKING
+
+from .constants import GIB_BYTES, MIB_BYTES
+
+if TYPE_CHECKING:
+    from types import ModuleType
+
+    from . import pool_alias
+
+
+def __getattr__(name: str) -> ModuleType:
+    """Lazily load ``pool_alias`` to skip its import-time lowering registration.
+
+    Args:
+        name: Attribute requested on ``common``.
+
+    Returns:
+        Lazily imported submodule.
+
+    Raises:
+        AttributeError: If ``name`` is not a lazily exposed submodule.
+    """
+    if name == "pool_alias":
+        return importlib.import_module(".pool_alias", __name__)
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)
+
+
+__all__ = [
+    "GIB_BYTES",
+    "MIB_BYTES",
+    "pool_alias",
+]

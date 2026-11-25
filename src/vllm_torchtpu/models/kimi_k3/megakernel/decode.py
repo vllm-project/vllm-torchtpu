@@ -92,11 +92,14 @@ logger = init_logger(__name__)
 
 
 class KimiDecoder:
-    """The decode role's :class:`MegakernelProgram` over ``ops`` and, when
-    ``config`` speculates, the DSpark ``draft`` (None: plain steps only). Slot 0
-    is the null slot padding rows use; slots below ``sub_base`` are the regular
-    ones (live requests plus those whose release is in flight). ``spec_shapes``
-    holds the compiled (padded request count, verify rows per request) pairs."""
+    """Decode program implementing ``runtime_shim.program`` over ``ops`` and ``draft``.
+
+    When ``config`` speculates, drives the DSpark ``draft`` (None: plain steps
+    only). Slot 0 is the null slot padding rows use; slots below ``sub_base``
+    are the regular ones (live requests plus those whose release is in flight).
+    ``spec_shapes`` holds the compiled (padded request count, verify rows per
+    request) pairs.
+    """
 
     WIDTH = DecodeOps.VERIFY_ROWS  # tokens per row of a step's result
 
@@ -179,7 +182,7 @@ class KimiDecoder:
         self.stats = {"plans": 0, "enters": 0, "chained": 0, "plain": 0, "batched": 0}
         self._group: dict[str, tuple[int, int]] = {}  # request -> (DP group, context)
         # Import each transferred request's DSpark ring: with a DSpark
-        # speculative config the transfer carries one (backend.draft_ring_rows).
+        # speculative config the transfer carries one (pools.DRAFT_ROWS).
         # (The MLA draft keeps its context in its own pools: no ring.)
         self._ring = draft is not None and getattr(draft, "imports_ring", True)
         self._ring_reports = 4
