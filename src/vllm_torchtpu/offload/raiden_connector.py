@@ -1224,6 +1224,9 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                     f"num_blocks={num_blocks}"
                 )
                 rows = storage_bytes // page_size_bytes
+                if os.environ.get("QWEN4_EXP_DEBUG_OFFLOAD_SCHED_ROWS", "0") == "1":
+                    # Debug only: view the scheduler's pages only (not the key region).
+                    rows = num_blocks
             else:
                 assert storage_bytes % num_blocks == 0, (
                     "KV pool storage must hold whole scheduler blocks: "
@@ -1231,11 +1234,17 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 )
                 page_size_bytes = storage_bytes // num_blocks
                 rows = num_blocks
-            int8_view = (
-                torch.empty(0, dtype=torch.int8, device=device)
-                .set_(storage)
-                .view(rows, page_size_bytes)
-            )
+            if rows * page_size_bytes == storage_bytes:
+                int8_view = (
+                    torch.empty(0, dtype=torch.int8, device=device)
+                    .set_(storage)
+                    .view(rows, page_size_bytes)
+                )
+            else:
+                # A leading part of the storage (debug: scheduler pages only).
+                int8_view = torch.empty(0, dtype=torch.int8, device=device).set_(
+                    storage, 0, (rows, page_size_bytes), (page_size_bytes, 1)
+                )
             pool_tensors.append(
                 CanonicalKVCacheTensor(
                     tensor=int8_view, page_size_bytes=page_size_bytes
