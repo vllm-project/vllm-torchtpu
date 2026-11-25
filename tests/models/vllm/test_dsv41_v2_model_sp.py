@@ -435,8 +435,8 @@ def test_ced_dispatches_encoder_before_host_bucket_coordination(monkeypatch):
         assert all(a is b for a, b in zip(tensors, (hidden, mix, auxiliary)))
         order.append("dispatch")
 
-    def coordinate(plan, count):
-        assert plan is None and count == 4
+    def coordinate(plan, count, agreed):
+        assert plan is None and count == 4 and agreed is None
         order.append("coordinate")
         return plan
 

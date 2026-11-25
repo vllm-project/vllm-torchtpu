@@ -11,7 +11,7 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
@@ -43,7 +43,7 @@ from vllm.distributed.kv_transfer import (
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats,
 )
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import (
@@ -82,6 +82,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm_torchtpu import envs, expert_relayout, gc_policy, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.distributed import dp_step
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
@@ -766,6 +767,14 @@ class TPUModelRunner(GPUModelRunner):
         self._draft_proposals_needed: bool = True
         self._draft_context_needed: bool = True
         self._dp_step_has_encoder_inputs = False
+        # The one-step-ahead agreement (dp_step.py), created at the first
+        # lockstep step; the bound this rank published for its next step; and
+        # whether a step is open (between _dp_coordinated_step and
+        # _dp_end_step) and was agreed one step ahead.
+        self._dp_agreement: dp_step.StepAgreement | None = None
+        self._dp_next_bound: dp_step.StepShape | None = None
+        self._dp_step_open = False
+        self._dp_step_agreed_ahead = False
         # The coordinated step counter (one per _dp_coordinated_step call,
         # identical on every rank) and the dynamic expert re-layout
         # controller the worker arms after warm-up (expert_relayout.py).
@@ -3514,34 +3523,25 @@ class TPUModelRunner(GPUModelRunner):
         # EP combine reduces partial expert outputs across DP engines; those
         # ranks must enter the same collectives with matching token buckets.
         # Non-EP DP engines remain independently schedulable.
-        return (
-            utils.get_dp_size(self.parallel_config) > 1
-            and self.parallel_config.enable_expert_parallel
-        )
+        return dp_step.lockstep_enabled(self.parallel_config)
 
-    def _count_input_chunks(
-        self, scheduler_output: "SchedulerOutput"
-    ) -> tuple[int, int]:
+    def _count_input_chunks(self, tokens_per_req: Sequence[int]) -> tuple[int, int]:
         """Match _prepare_inputs chunking without staging any tensors.
 
+        `tokens_per_req` holds each request's scheduled tokens in batch order.
         Returns (num_chunks, max_chunk_reqs). The second value is the exact
         maximum request count of any chunk — a most-model-len chunk holds up
         to num_reqs_most_model_len requests, which can exceed
         num_reqs_max_model_len, so no batch-level clamp is a safe substitute.
         """
-        if scheduler_output.total_num_scheduled_tokens == 0:
-            return 0, 0
-
-        num_reqs = self.input_batch.num_reqs
+        num_reqs = len(tokens_per_req)
         start_index = 0
         num_chunks = 0
         max_chunk_reqs = 0
         while start_index < num_reqs:
             use_max_model_len = self.most_model_len is None
             for i in range(start_index, num_reqs):
-                req_id = self.input_batch.req_ids[i]
-                assert req_id is not None
-                num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                num_tokens = tokens_per_req[i]
                 if (
                     not use_max_model_len
                     and self.most_model_len is not None
@@ -3618,71 +3618,121 @@ class TPUModelRunner(GPUModelRunner):
         needs_draft_proposals: bool = True,
         needs_draft_context: bool = True,
     ) -> "tuple[int | None, int]":
-        """Return the DP-wide padded token bucket and forward chunk count."""
+        """Return the DP-wide padded token bucket and forward chunk count.
+
+        Opens the step that `_dp_end_step` closes after its last launch.
+        """
         self._draft_proposals_needed = needs_draft_proposals
         self._draft_context_needed = needs_draft_context
-        # Every rank reaches this point once per step, dummy steps included,
-        # which is what makes a step-cadenced collection land on all of them
-        # at once instead of 32 independent pauses.
-        gc_policy.on_coordinated_step()
+        self._dp_step_open = True
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
-        from vllm.distributed.parallel_state import get_dp_group
-
-        # Token/chunk metadata is synchronized on vLLM's CPU DP group. The
-        # model forward below receives this result explicitly as
+        # The model forward below receives the agreed shape explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
-        # The last five fields belong to the dynamic expert re-layout
-        # (expert_relayout.py): its plan hash twice (max and -min say whether
-        # every rank solved the same plan), -staged generation (the max is
-        # -the slowest rank's), and -tokens and -requests (the min over ranks,
-        # for `step_phase`). The vector's length is the same on every rank.
-        controller = self._expert_relayout
-        relayout = controller.fields() if controller is not None else (0, 0, 0)
-        t = torch.tensor(
-            [
+        agreement = self._dp_step_agreement()
+        agreed = agreement.begin(
+            dp_step.StepShape.local(
                 int(local_num_tokens),
                 int(local_num_chunks),
                 int(local_num_reqs),
-                int(has_encoder_inputs),
-                int(needs_draft_proposals),
-                *(int(v) for v in relayout),
-                -int(local_num_tokens),
-                -int(local_num_reqs),
-                int(needs_draft_context),
-            ],
-            dtype=torch.int64,
-            device="cpu",
+                encoder=has_encoder_inputs,
+                proposals=needs_draft_proposals,
+                context=needs_draft_context,
+            )
         )
-        torch.distributed.all_reduce(
-            t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
-        )
+        if not agreement.synchronous:
+            logger.info_once(
+                "DP lockstep: steps are agreed one step ahead, after the "
+                "previous step's launches"
+            )
+        self._dp_step_agreed_ahead = not agreement.synchronous
         self._dp_step_index += 1
-        bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
+        bucket = _get_padded_token_len(self.num_tokens_paddings, agreed.tokens)
+        controller = self._expert_relayout
         if controller is not None:
+            # The dynamic expert re-layout's fields (expert_relayout.py) ride
+            # the previous step's closing all-reduce.
             controller.on_step(
                 self._dp_step_index,
-                (int(t[5].item()), int(t[6].item()), int(t[7].item())),
+                agreement.relayout,
                 phase=expert_relayout.step_phase(
                     bucket,
-                    max_tokens=int(t[0].item()),
-                    min_tokens=-int(t[8].item()),
-                    num_chunks=int(t[1].item()),
-                    max_reqs=int(t[2].item()),
-                    min_reqs=-int(t[9].item()),
+                    max_tokens=agreed.tokens,
+                    min_tokens=agreed.min_tokens,
+                    num_chunks=agreed.chunks,
+                    max_reqs=agreed.reqs,
+                    min_reqs=agreed.min_reqs,
                     max_num_reqs=int(self.max_num_reqs),
                 ),
             )
         # Spec-decode draft forwards size themselves off the step's DP-wide
         # max per-chunk request count (see DFlashProposer), riding this same
-        # all-reduce instead of paying the theoretical max bucket or a
+        # agreement instead of paying the theoretical max bucket or a
         # second collective.
-        self._dp_step_max_reqs = int(t[2].item())
-        self._dp_step_has_encoder_inputs = bool(t[3].item())
-        self._draft_proposals_needed = bool(t[4].item())
-        self._draft_context_needed = bool(t[10].item())
-        return bucket, int(t[1].item())
+        self._dp_step_max_reqs = agreed.reqs
+        self._dp_step_has_encoder_inputs = agreed.encoder
+        self._draft_proposals_needed = agreed.proposals
+        self._draft_context_needed = agreed.context
+        return bucket, agreed.chunks
+
+    def _dp_end_step(self) -> None:
+        """Close the open step after its last launch; idle steps included."""
+        if not self._dp_step_open:
+            return
+        self._dp_step_open = False
+        self._dp_step_agreed_ahead = False
+        # Every rank reaches this point once per step, which is what makes a
+        # step-cadenced collection land on all of them at once instead of 32
+        # independent pauses, while the device runs the step just launched.
+        gc_policy.on_coordinated_step()
+        if not self._dp_lockstep_enabled():
+            return
+        controller = self._expert_relayout
+        self._dp_step_agreement().end(
+            self._dp_next_bound,
+            controller.fields() if controller is not None else (0, 0, 0),
+        )
+
+    def _publish_dp_agreed_rows(self, num_tokens: int) -> None:
+        """Tell the model, in a step agreed one step ahead, that every DP
+        rank runs each of this forward's stages at `num_tokens` rows."""
+        if self._dp_step_agreed_ahead:
+            get_forward_context().additional_kwargs[dp_step.AGREED_ROWS] = num_tokens
+
+    def _dp_step_agreement(self) -> dp_step.StepAgreement:
+        if self._dp_agreement is None:
+            from vllm.distributed.parallel_state import get_dp_group
+
+            # vLLM's CPU DP group.
+            self._dp_agreement = dp_step.StepAgreement(get_dp_group().cpu_group)
+        return self._dp_agreement
+
+    def _dp_bound_next_step(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> dp_step.StepShape | None:
+        """This rank's bound on its next lockstep step (dp_step.py).
+
+        A scheduler without the admission gate, or one that announced new
+        work, leaves the next step unbounded.
+        """
+        if not self._dp_lockstep_enabled() or getattr(
+            scheduler_output, dp_step.NEXT_STEP_UNBOUNDED, True
+        ):
+            return None
+        scheduled = scheduler_output.num_scheduled_tokens
+        spec = self.speculative_config
+        return dp_step.decode_bound(
+            (
+                (
+                    state.num_computed_tokens + scheduled.get(req_id, 0),
+                    state.num_prompt_tokens,
+                )
+                for req_id, state in self.requests.items()
+            ),
+            1 + (spec.num_speculative_tokens if spec is not None else 0),
+            self._count_input_chunks,
+        )
 
     def _execute_dp_mm_encoder(
         self, scheduler_output: "SchedulerOutput | None" = None
@@ -3788,6 +3838,9 @@ class TPUModelRunner(GPUModelRunner):
             )
         # Update cached state
         self._update_states(scheduler_output)
+        # Published after this step's launches, by this step or, on a step
+        # with nothing scheduled, by the idle step that runs instead.
+        self._dp_next_bound = self._dp_bound_next_step(scheduler_output)
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
@@ -3821,7 +3874,10 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output
         )
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
-            scheduler_output
+            [
+                scheduler_output.num_scheduled_tokens[req_id]
+                for req_id in self.input_batch.req_ids[: self.input_batch.num_reqs]
+            ]
         )
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
             scheduler_output.total_num_scheduled_tokens,
@@ -4076,6 +4132,7 @@ class TPUModelRunner(GPUModelRunner):
                 ),
                 self._stage_timing.stage("main_forward"),
             ):
+                self._publish_dp_agreed_rows(num_tokens_padded)
                 hidden_states, aux_hidden_states = self.forward_model(
                     input_ids=input_ids,
                     positions=self.position_ids,
@@ -4584,6 +4641,14 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def sample_tokens(
+        self, grammar_output: "GrammarOutput | None"
+    ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
+        output = self._sample_tokens(grammar_output)
+        # The step's last launch (the draft) is behind it.
+        self._dp_end_step()
+        return output
+
+    def _sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
         if self.execute_model_state is None:
@@ -5607,6 +5672,7 @@ class TPUModelRunner(GPUModelRunner):
                 kv_cache_bundle=self._kv_cache_bundle,
             ),
         ):
+            self._publish_dp_agreed_rows(num_tokens)
             if self.supports_mm_inputs and self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(input_ids, None)
             if profiling:

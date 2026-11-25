@@ -197,7 +197,7 @@ def test_ced_forward_skips_sp_all_gather_on_empty_replay_plan(monkeypatch):
     monkeypatch.setattr(
         v2_model,
         "coordinate_decoder_replay",
-        lambda plan, count: SimpleNamespace(
+        lambda plan, count, agreed: SimpleNamespace(
             indices=(),
             padded_num_tokens=4,
             query_start_loc=(0, 0),

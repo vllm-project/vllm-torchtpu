@@ -18,6 +18,7 @@ from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
 from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed import dp_step
 from vllm_torchtpu.kernels.experimental import decode_preparation
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
     initialize_shifted_mhc,
@@ -957,7 +958,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             else None
         )
         if context.dp_metadata is not None:
-            plan = coordinate_decoder_replay(plan, positions.shape[0])
+            plan = coordinate_decoder_replay(
+                plan,
+                positions.shape[0],
+                context.additional_kwargs.get(dp_step.AGREED_ROWS),
+            )
         if plan is not None and plan.padded_num_tokens == 0:
             # The scheduler ignores logits for incomplete prefills. The
             # encoder has still published every global KV row for this chunk;

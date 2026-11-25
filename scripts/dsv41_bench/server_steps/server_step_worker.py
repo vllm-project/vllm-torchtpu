@@ -229,7 +229,8 @@ class Recorder:
         coordinate = runner._dp_coordinated_step
 
         def dp_coordinated_step(*args: Any, **kwargs: Any) -> Any:
-            # The DP-wide host all-reduce that every rank enters once a step.
+            # Before the step's launches: a local check of the shape agreed one
+            # step ahead, or the DP-wide all-reduce of a step that changes it.
             started = time.perf_counter_ns()
             result = coordinate(*args, **kwargs)
             if self.enabled and self.pending is not None:
@@ -237,6 +238,16 @@ class Recorder:
             return result
 
         runner._dp_coordinated_step = dp_coordinated_step
+        end_step = runner._dp_end_step
+
+        def dp_end_step() -> None:
+            # After the step's launches: the all-reduce agreeing the next step.
+            started = time.perf_counter_ns()
+            end_step()
+            if self.enabled and self.pending is not None:
+                self.pending["dp_agree_ns"] = [started, time.perf_counter_ns()]
+
+        runner._dp_end_step = dp_end_step
         if scenario.name == "decode":
             drafter = runner.drafter
             prepare = drafter._prepare_dflash_inputs
