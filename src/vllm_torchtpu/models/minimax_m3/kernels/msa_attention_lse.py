@@ -223,25 +223,35 @@ def _kernel(
                 if packing == 4
                 else msa_attention._bitcast_slots(rows_per_page, packing)
             )  # [S, 1]
-            sel_t = selected_ref[...].T  # [K, Bq]
-            local_page = local_page_ref[...].T  # [1, Bq]
-            local_limit = local_limit_ref[...].T
+
+            # Rows are head-major (h * Bq + t): every head shares a token's
+            # selection, tiled across the heads once rather than per page.
+            def by_row(x):
+                return jnp.tile(x.T, (1, num_heads))
+
+            sel_rows = by_row(selected_ref[...])  # [K, rows]
+            local_page = by_row(local_page_ref[...])  # [1, rows]
+            local_limit = by_row(local_limit_ref[...])
             keys, values, masks = [], [], []
             for g, kv_ref in enumerate(kv_refs[:width]):
                 page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
-                hit = jnp.max((sel_t == page).astype(jnp.int32), axis=0, keepdims=True)
+                hit = jnp.max(
+                    (sel_rows == page).astype(jnp.int32), axis=0, keepdims=True
+                )
                 limit = jnp.where(local_page == page, local_limit, page_size)
-                limit = jnp.where(page >= 0, limit * hit, 0)  # [1, Bq]
-                seen = jnp.max(limit)
+                limit = jnp.where(page >= 0, limit * hit, 0)  # [1, rows]
                 if packing == 4:
+                    # A slot no row sees gets p = 0, so only a NaN value (fp8
+                    # has no infinities) could reach p @ v: zeroing NaNs keeps
+                    # a reduction over the page's limits off the critical path.
                     rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
-                    values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
+                    v_rows = rows[:, head_dim:]
+                    values.append(jnp.where(jnp.isnan(v_rows), 0, v_rows))
                 else:
-                    rows = msa_attention._page_rows(kv_ref, seen)
+                    rows = msa_attention._page_rows(kv_ref, jnp.max(limit))
                     values.append(rows[:, head_dim:])
                 keys.append(rows[:, :head_dim])
-                # Rows are head-major (h * Bq + t): every head shares a token's mask.
-                masks.append(row_slots < jnp.tile(limit, (1, num_heads)))  # [S, rows]
+                masks.append(row_slots < limit)  # [S, rows]
             k = jnp.concatenate(keys, axis=0)
             v = jnp.concatenate(values, axis=0)
             mask = jnp.concatenate(masks, axis=0)
@@ -381,7 +391,8 @@ def _kernel(
                 acc_ref[...] = acc_new
 
         # Slots past the group's pages hold stale bytes: their limits are 0, so
-        # their scores are masked and their value rows zeroed.
+        # their scores are masked (p = 0) and their value rows zeroed (fp8:
+        # only NaN rows, the one value p = 0 does not cancel).
         # Run at the narrowest width holding the group's pages. A step costs per
         # score column, filled or not (~2.3 us at 16 pages, ~1.1 us at 4, twin
         # standalone j-952e8a64), and a 16-token tile's union is ~8-12 of its
